@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>ZigOS — live</title>
+<style>
+  :root { --bg:#11131a; --card:#161824; --line:#2a2f40;
+          --text:#c8d0e0; --dim:#888aa0; --accent:#f7c948;
+          --good:#7ec07e; --warn:#f59e6e; --bad:#e15858; }
+  * { box-sizing: border-box; }
+  body { font-family: ui-monospace, Menlo, Consolas, monospace;
+         background: var(--bg); color: var(--text); margin: 0;
+         padding: 32px; min-height: 100vh; }
+  header { display:flex; justify-content:space-between; align-items:baseline;
+           border-bottom:1px solid var(--line); padding-bottom:16px; margin-bottom:24px; }
+  h1 { color: var(--accent); margin:0; font-size:22px; }
+  .pulse { color: var(--good); font-size:11px; }
+  .pulse.stale { color: var(--bad); }
+  .grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+          gap:16px; }
+  .card { background: var(--card); border:1px solid var(--line);
+          border-radius:10px; padding:18px 20px; }
+  .label { color: var(--dim); font-size:11px; letter-spacing:0.08em;
+           text-transform:uppercase; margin-bottom:6px; }
+  .big { font-size:28px; color: var(--accent); }
+  .row { display:flex; justify-content:space-between; padding:4px 0;
+         border-top:1px dashed var(--line); }
+  .row:first-of-type { border-top:none; }
+  .row span:first-child { color: var(--dim); }
+  .row span:last-child { color: var(--text); }
+  .bar { height:6px; background:var(--line); border-radius:3px;
+         margin-top:8px; overflow:hidden; }
+  .bar > div { height:100%; background:var(--good); transition:width 0.4s; }
+  .bar > div.warn { background:var(--warn); }
+  .bar > div.bad { background:var(--bad); }
+  .procs { width:100%; border-collapse:collapse; font-size:12px; margin-top:8px; }
+  .procs th { color: var(--dim); text-align:left; font-weight:normal;
+              border-bottom:1px solid var(--line); padding:4px 6px;
+              text-transform:uppercase; font-size:10px; letter-spacing:0.05em; }
+  .procs td { padding:3px 6px; border-bottom:1px dotted var(--line); }
+  .procs tr:last-child td { border-bottom:none; }
+  .st { font-weight:600; }
+  .st-running { color: var(--good); }
+  .st-ready { color: #6db4d6; }
+  .st-sleep { color: var(--warn); }
+  .st-zombie { color: var(--bad); }
+  .wide { grid-column: 1 / -1; }
+  .log { width:100%; max-height:280px; overflow-y:auto; margin-top:8px;
+         padding:10px 12px; background:#0c0e16; border:1px solid var(--line);
+         border-radius:6px; font-size:11px; line-height:1.45;
+         color:#a8b0c8; white-space:pre; font-family: ui-monospace, monospace; }
+  footer { color: var(--dim); font-size:11px; margin-top:32px;
+           border-top:1px solid var(--line); padding-top:14px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>ZigOS — live state</h1>
+  <span class="pulse" id="pulse">●</span>
+</header>
+
+<div class="grid">
+  <div class="card">
+    <div class="label">Uptime</div>
+    <div class="big" id="uptime">—</div>
+    <div class="row"><span>ticks</span><span id="ticks">—</span></div>
+  </div>
+
+  <div class="card">
+    <div class="label">Memory</div>
+    <div class="big" id="mem-pct">—%</div>
+    <div class="bar"><div id="mem-bar" style="width:0"></div></div>
+    <div class="row"><span>used</span><span id="mem-used">—</span></div>
+    <div class="row"><span>free</span><span id="mem-free">—</span></div>
+    <div class="row"><span>total</span><span id="mem-total">—</span></div>
+  </div>
+
+  <div class="card">
+    <div class="label">Wall clock</div>
+    <div class="big" id="time-iso">—</div>
+    <div class="row"><span>epoch sec</span><span id="time-sec">—</span></div>
+    <div class="row"><span>usec</span><span id="time-usec">—</span></div>
+  </div>
+
+  <div class="card">
+    <div class="label">Display</div>
+    <div class="big" id="screen">—</div>
+    <div class="row"><span>resolution</span><span id="screen-detail">—</span></div>
+  </div>
+
+  <div class="card wide">
+    <div class="label">Processes <span id="proc-count" style="color:var(--accent)"></span></div>
+    <table class="procs">
+      <thead><tr>
+        <th>PID</th><th>PPID</th><th>TGID</th><th>PGID</th><th>SID</th>
+        <th>STATE</th><th>PRIO</th><th>CPU</th><th>TICKS</th><th>NAME</th>
+      </tr></thead>
+      <tbody id="proc-body"></tbody>
+    </table>
+  </div>
+
+  <div class="card wide">
+    <div class="label">Recent kernel log <span id="log-info" style="color:var(--dim);text-transform:none;letter-spacing:0;font-size:10px"></span></div>
+    <div class="log" id="log-body">—</div>
+  </div>
+</div>
+
+<footer>
+  Polling <code>/api/all</code> + <code>/api/procs</code> + <code>/api/log</code> every 1s · Served by
+  <code>httpd.elf</code> on ZigOS ·
+  <a href="/api/all" style="color:var(--accent)">raw all</a> ·
+  <a href="/api/procs" style="color:var(--accent)">raw procs</a> ·
+  <a href="/api/log" style="color:var(--accent)">raw log</a>
+</footer>
+
+<script>
+const fmtBytes = b => {
+  if (b < 1024) return b + " B";
+  if (b < 1024*1024) return (b/1024).toFixed(1) + " KiB";
+  return (b/1024/1024).toFixed(2) + " MiB";
+};
+const fmtUptime = s => {
+  const d = Math.floor(s/86400), h = Math.floor((s%86400)/3600),
+        m = Math.floor((s%3600)/60), sec = s%60;
+  if (d) return `${d}d ${h}h ${m}m`;
+  if (h) return `${h}h ${m}m ${sec}s`;
+  if (m) return `${m}m ${sec}s`;
+  return `${sec}s`;
+};
+const fmtTime = sec => {
+  const d = new Date(sec * 1000);
+  return d.toISOString().slice(11,19) + " UTC";
+};
+
+let pulseTimer = null;
+function pulse(stale) {
+  const el = document.getElementById('pulse');
+  el.classList.toggle('stale', stale);
+  el.textContent = stale ? '○' : '●';
+}
+
+async function tick() {
+  try {
+    const [allR, procR, logR] = await Promise.all([
+      fetch('/api/all',   { cache: 'no-store' }),
+      fetch('/api/procs', { cache: 'no-store' }),
+      fetch('/api/log',   { cache: 'no-store' }),
+    ]);
+    if (!allR.ok || !procR.ok) throw new Error('http err');
+    const j = await allR.json();
+    const pj = await procR.json();
+    const logTxt = logR.ok ? await logR.text() : '';
+
+    document.getElementById('uptime').textContent = fmtUptime(j.uptime.seconds);
+    document.getElementById('ticks').textContent = j.uptime.ticks.toLocaleString();
+    document.getElementById('mem-pct').textContent = j.mem.used_pct + '%';
+    const bar = document.getElementById('mem-bar');
+    bar.style.width = j.mem.used_pct + '%';
+    bar.className = j.mem.used_pct > 85 ? 'bad' : (j.mem.used_pct > 65 ? 'warn' : '');
+    document.getElementById('mem-used').textContent =
+      fmtBytes(j.mem.total_bytes - j.mem.free_bytes);
+    document.getElementById('mem-free').textContent = fmtBytes(j.mem.free_bytes);
+    document.getElementById('mem-total').textContent = fmtBytes(j.mem.total_bytes);
+    document.getElementById('time-iso').textContent = fmtTime(j.time.sec);
+    document.getElementById('time-sec').textContent = j.time.sec;
+    document.getElementById('time-usec').textContent = j.time.usec.toLocaleString();
+    document.getElementById('screen').textContent = j.screen.w + '×' + j.screen.h;
+    document.getElementById('screen-detail').textContent = j.screen.w + ' × ' + j.screen.h + ' px';
+
+    const procs = pj.procs || [];
+    document.getElementById('proc-count').textContent = '(' + procs.length + ')';
+    const tbody = document.getElementById('proc-body');
+    tbody.innerHTML = procs.map(p => {
+      // Highlight session escapees: pid != sid means this process is in a
+      // session that was created by some setsid call (most likely a daemon).
+      const sidCell = (p.pid !== p.sid && p.pid === p.pgid && p.sid === p.pgid)
+        ? `<td title="session leader (escaped via setsid)">${p.sid} ★</td>`
+        : `<td>${p.sid}</td>`;
+      return `<tr>
+         <td>${p.pid}</td>
+         <td>${p.ppid}</td>
+         <td>${p.tgid}</td>
+         <td>${p.pgid}</td>
+         ${sidCell}
+         <td class="st st-${p.state}">${p.state}</td>
+         <td>${p.priority}</td>
+         <td>${p.cpu}</td>
+         <td>${p.ticks.toLocaleString()}</td>
+         <td>${p.name || '?'}</td>
+       </tr>`;
+    }).join('');
+    // Log panel: tail-style — show last ~80 lines, auto-scroll to bottom
+    // when the user is already there (sticky bottom). Don't fight a manual
+    // scroll position.
+    const logEl = document.getElementById('log-body');
+    if (logTxt) {
+      const lines = logTxt.split('\n');
+      const TAIL = 80;
+      const tail = lines.length > TAIL ? lines.slice(-TAIL).join('\n') : logTxt;
+      const stuckBottom =
+        logEl.scrollTop + logEl.clientHeight >= logEl.scrollHeight - 8;
+      logEl.textContent = tail;
+      if (stuckBottom) logEl.scrollTop = logEl.scrollHeight;
+      document.getElementById('log-info').textContent =
+        '· ' + lines.length + ' lines in ring · showing last ' + Math.min(TAIL, lines.length);
+    }
+
+    pulse(false);
+  } catch (e) {
+    pulse(true);
+    console.warn('tick failed', e);
+  }
+}
+tick();
+setInterval(tick, 1000);
+</script>
+</body>
+</html>

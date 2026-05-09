@@ -1,0 +1,624 @@
+// POSIX-style signals on x86_64 long mode.
+//
+// Delivery model: per-PCB pending/mask u32 bitmasks. `send` sets a bit (and
+// wakes the target if it's parked); the kernel's exit-to-user transitions
+// (syscall return, IRQ-return-to-user, exception-return-to-user) walk the
+// pending set, pick the lowest-numbered non-blocked signal, and either apply
+// the default action (term/core/ignore/stop/cont) or set up a handler frame
+// on the user stack so sysret/iretq lands inside the user's handler.
+//
+// The handler frame is `[trampoline RA | MContext]` — when the handler ret's
+// it pops the trampoline RA, jumps to libc's __sigreturn, which issues the
+// `sigreturn` syscall. The kernel's sigreturn handler reads the MContext
+// from user RSP and rewrites the saved kernel-stack frame so the next
+// sysret restores all GPRs + RIP + RFLAGS + user RSP to pre-signal values.
+//
+// Three trap-frame shapes are involved:
+//   SyscallFrame — saved by the per-CPU LSTAR stub at `call doSyscall` time.
+//                  Fewer fields (rdi/rsi/rdx are the syscall args, restored
+//                  via the matching pop sequence on return).
+//   IrqFrame    — saved by isr_irq0; full 15 GPRs + iretq frame.
+//   ExcFrame    — saved by isr_common_exc; same as IRQ plus int_no + err_code.
+//
+// All three share the same delivery primitive: write MContext to user stack,
+// rewrite the trap frame's RIP/RSP/RDI/RSI/RDX, return. The handler's RAX
+// is undefined on entry (the handler doesn't observe it; it observes its
+// args via rdi/rsi/rdx per SysV).
+
+const std = @import("std");
+const process = @import("process.zig");
+const debug = @import("../debug/debug.zig");
+const smp = @import("../cpu/smp.zig");
+const memmap = @import("../mm/memmap.zig");
+const config = @import("../config.zig");
+
+pub const NSIG: u32 = config.NSIG;
+
+// Standard POSIX signal numbers (Linux/x86_64 ABI). Keep these literal — the
+// libc-side mirror in lib/signal.zig must match exactly.
+pub const SIGHUP: u32 = 1;
+pub const SIGINT: u32 = 2;
+pub const SIGQUIT: u32 = 3;
+pub const SIGILL: u32 = 4;
+pub const SIGTRAP: u32 = 5;
+pub const SIGABRT: u32 = 6;
+pub const SIGBUS: u32 = 7;
+pub const SIGFPE: u32 = 8;
+pub const SIGKILL: u32 = 9;
+pub const SIGUSR1: u32 = 10;
+pub const SIGSEGV: u32 = 11;
+pub const SIGUSR2: u32 = 12;
+pub const SIGPIPE: u32 = 13;
+pub const SIGALRM: u32 = 14;
+pub const SIGTERM: u32 = 15;
+pub const SIGCHLD: u32 = 17;
+pub const SIGCONT: u32 = 18;
+pub const SIGSTOP: u32 = 19;
+pub const SIGTSTP: u32 = 20;
+
+pub const SIG_DFL: u64 = 0;
+pub const SIG_IGN: u64 = 1;
+
+pub const SA_RESTART: u32 = 0x10000000;
+pub const SA_NODEFER: u32 = 0x40000000;
+pub const SA_RESETHAND: u32 = 0x80000000;
+
+pub const SIG_BLOCK: u32 = 0;
+pub const SIG_UNBLOCK: u32 = 1;
+pub const SIG_SETMASK: u32 = 2;
+
+pub const Action = enum(u8) { term, core, ignore, stop, cont };
+
+/// Default action per signal — POSIX-mandated. Slot 0 unused. Anything past
+/// the standard set defaults to `term`. Stop/cont are accepted but currently
+/// no-op (job control isn't wired up yet — the scheduler has no .stopped state).
+pub const default_actions: [NSIG]Action = blk: {
+    var a: [NSIG]Action = [_]Action{.term} ** NSIG;
+    a[0] = .ignore;
+    a[SIGHUP] = .term;
+    a[SIGINT] = .term;
+    a[SIGQUIT] = .core;
+    a[SIGILL] = .core;
+    a[SIGTRAP] = .core;
+    a[SIGABRT] = .core;
+    a[SIGBUS] = .core;
+    a[SIGFPE] = .core;
+    a[SIGKILL] = .term;
+    a[SIGUSR1] = .term;
+    a[SIGSEGV] = .core;
+    a[SIGUSR2] = .term;
+    a[SIGPIPE] = .term;
+    a[SIGALRM] = .term;
+    a[SIGTERM] = .term;
+    a[16] = .ignore;
+    a[SIGCHLD] = .ignore;
+    a[SIGCONT] = .cont;
+    a[SIGSTOP] = .stop;
+    a[SIGTSTP] = .stop;
+    break :blk a;
+};
+
+/// User-installed disposition for a signal. `handler` is SIG_DFL (0),
+/// SIG_IGN (1), or a u64 user-space function pointer. `restorer` is the
+/// libc trampoline that issues sigreturn on handler return — kernel pushes
+/// it as the handler's return address.
+pub const SigAction = extern struct {
+    handler: u64 = SIG_DFL,
+    flags: u32 = 0,
+    mask: u32 = 0,
+    restorer: u64 = 0,
+};
+
+/// Magic word at the head of every kernel-pushed MContext. The sigreturn
+/// syscall refuses to act on anything else — bogus `mov $62, %eax; syscall`
+/// from a malicious app shouldn't be able to forge an arbitrary register
+/// state. ASCII "ZOSMCTX_" (little-endian).
+pub const MCONTEXT_MAGIC: u64 = 0x5F58_5443_4D53_4F5A;
+
+/// Saved user state stored on the user stack at signal delivery and read back
+/// by sigreturn. The handler receives a pointer to this as its 3rd arg
+/// (`void *ucontext`) — well-behaved handlers leave it alone, and SysV
+/// signature handlers that take `(int signo, siginfo_t *info, ucontext_t *uc)`
+/// can cast and inspect it.
+pub const MContext = extern struct {
+    magic: u64,
+    saved_mask: u32,
+    signo: u32,
+    rax: u64,
+    rbx: u64,
+    rcx: u64,
+    rdx: u64,
+    rsi: u64,
+    rdi: u64,
+    rbp: u64,
+    rsp: u64,
+    r8: u64,
+    r9: u64,
+    r10: u64,
+    r11: u64,
+    r12: u64,
+    r13: u64,
+    r14: u64,
+    r15: u64,
+    rip: u64,
+    rflags: u64,
+};
+
+/// Mirror of the syscall-asm trampoline's saved frame at `call doSyscall`.
+/// Field order must match the push sequence in syscall_entry.zig — first
+/// field = lowest address = last push. Alignment: 15 pushes + 520 FXSAVE
+/// = 640, +call = 648 mod 16 = 8.
+pub const SyscallFrame = extern struct {
+    r10: u64,
+    r9: u64,
+    r8: u64,
+    rdx: u64, // user's syscall arg3 (pre-shuffle)
+    rsi: u64, // user's syscall arg2
+    rdi: u64, // user's syscall arg1
+    r15: u64,
+    r14: u64,
+    r13: u64,
+    r12: u64,
+    rbp: u64,
+    rbx: u64,
+    rcx: u64, // saved user RIP (syscall instruction stashes it here)
+    r11: u64, // saved user RFLAGS
+    // Saved user RSP. Pushed to the kernel stack as the FIRST push at syscall
+    // entry (so it lands at the HIGHEST address among the 15 pushes — matches
+    // the trailing position in this struct). Popped back into %rsp as the
+    // LAST step before sysretq.
+    //
+    // Why on the kernel stack instead of per_cpu_asm.user_rsp_save?
+    // per_cpu_asm is per-CPU, not per-thread. If a thread blocks mid-syscall
+    // (futex/pipe/waitpid), schedule() runs another thread on the same CPU;
+    // that thread's syscall entry overwrites user_rsp_save with ITS user RSP.
+    // When the original thread is rescheduled, sysret reads the OVERWRITTEN
+    // value and lands on the wrong stack. Symptom: threadtest's main thread
+    // crashed with RSP pointing into a worker's mmap'd thread stack.
+    // Putting user_rsp on the kernel stack ties its lifetime to the kernel
+    // stack itself, which IS per-thread (kstack_pool[pid]).
+    user_rsp: u64,
+};
+
+/// Mirror of isr_irq0's saved frame at `call handleIRQ0`. The leading 15 GPRs
+/// match the push order in idt.zig; the trailing 5 are the iretq frame the
+/// CPU pushed on entry. Used for IRQ-return-to-user signal delivery.
+pub const IrqFrame = extern struct {
+    r15: u64,
+    r14: u64,
+    r13: u64,
+    r12: u64,
+    r11: u64,
+    r10: u64,
+    r9: u64,
+    r8: u64,
+    rdi: u64,
+    rsi: u64,
+    rbp: u64,
+    rbx: u64,
+    rdx: u64,
+    rcx: u64,
+    rax: u64,
+    rip: u64,
+    cs: u64,
+    rflags: u64,
+    rsp: u64,
+    ss: u64,
+};
+
+/// Mirror of isr_common_exc's saved frame. Same as IrqFrame but with the
+/// stub-pushed (int_no, error_code) sandwiched between GPRs and iretq.
+pub const ExcFrame = extern struct {
+    r15: u64,
+    r14: u64,
+    r13: u64,
+    r12: u64,
+    r11: u64,
+    r10: u64,
+    r9: u64,
+    r8: u64,
+    rdi: u64,
+    rsi: u64,
+    rbp: u64,
+    rbx: u64,
+    rdx: u64,
+    rcx: u64,
+    rax: u64,
+    int_no: u64,
+    error_code: u64,
+    rip: u64,
+    cs: u64,
+    rflags: u64,
+    rsp: u64,
+    ss: u64,
+};
+
+const USER_BASE: u64 = memmap.USER_VA_FLOOR;
+const USER_END: u64 = memmap.USER_SPACE_END;
+
+fn validateUserRange(addr: u64, len: u64) bool {
+    if (addr < USER_BASE) return false;
+    if (addr +% len > USER_END) return false;
+    if (addr +% len < addr) return false;
+    return true;
+}
+
+pub fn isCatchable(signo: u32) bool {
+    return signo != SIGKILL and signo != SIGSTOP;
+}
+
+fn pidIndexOfPcb(pcb: *const process.PCB) usize {
+    const base = @intFromPtr(&process.procs[0]);
+    const off = @intFromPtr(pcb) - base;
+    return off / @sizeOf(process.PCB);
+}
+
+/// Mark `signo` pending on `target` and wake the target if it's parked. Idempotent
+/// — sending the same signal twice between deliveries collapses to one bit.
+/// Returns false on bad inputs (out-of-range pid/signo, dead target). Returns
+/// true even if the target's disposition makes the signal a no-op (SIG_IGN /
+/// default-ignore) — caller can't observe the difference.
+pub fn send(target: u8, signo: u32) bool {
+    if (target >= process.MAX_PROCS) return false;
+    if (signo == 0 or signo >= NSIG) return false;
+    const pcb = &process.procs[target];
+    if (pcb.state == .unused or pcb.state == .zombie) return false;
+
+    // Catchable signals that are explicitly ignored short-circuit — no need
+    // to wake the target or set a pending bit. SIGKILL/SIGSTOP can't be
+    // ignored, so they always set the bit.
+    if (isCatchable(signo)) {
+        const sa = &pcb.sigactions[signo];
+        if (sa.handler == SIG_IGN) return true;
+        if (sa.handler == SIG_DFL and default_actions[signo] == .ignore) return true;
+    }
+
+    pcb.pending_signals |= (@as(u32, 1) << @intCast(signo));
+
+    // Make sure parked processes notice. wake() is a no-op for .running and
+    // .ready, so this is safe to call unconditionally.
+    if (pcb.state == .sleeping or pcb.wait_kind != .none) {
+        process.wake(target);
+    }
+    return true;
+}
+
+fn pickSignal(pcb: *const process.PCB) ?u32 {
+    const deliverable = pcb.pending_signals & ~pcb.signal_mask;
+    if (deliverable == 0) return null;
+    var s: u32 = 1;
+    while (s < NSIG) : (s += 1) {
+        if ((deliverable & (@as(u32, 1) << @intCast(s))) != 0) return s;
+    }
+    return null;
+}
+
+fn applyDefault(pcb: *process.PCB, signo: u32) void {
+    const action = default_actions[signo];
+    switch (action) {
+        .ignore, .stop, .cont => {
+            // .stop/.cont currently no-op — job control needs a .stopped
+            // scheduler state we don't have yet.
+        },
+        .term, .core => {
+            const status: u32 = 0xDEAD0000 | signo;
+            const pid: u8 = @intCast(pidIndexOfPcb(pcb));
+            if (smp.myCpu().current_pid) |cur| {
+                if (cur == pid) {
+                    // Self-kill on the current syscall/IRQ/exception path.
+                    // destroyCurrentWithStatus tears down the address space
+                    // and clears cpu.current_pid, but it doesn't unwind the
+                    // kernel stack we got here on — if we just `return`, the
+                    // syscall asm pops registers and sysrets into freed user
+                    // memory under kernel CR3 → triple fault. Match sys_exit:
+                    // switch back to this CPU's scheduler context (the boot
+                    // context running desktop.run / apEntry) so the kstack
+                    // we're on gets dropped and CPU returns to the scheduler.
+                    process.destroyCurrentWithStatus(status);
+                    process.schedule();
+                    unreachable;
+                }
+            }
+            process.killProcessWithStatus(pid, status);
+        },
+    }
+}
+
+fn applyHandlerMaskUpdate(pcb: *process.PCB, signo: u32, sa: *const SigAction) void {
+    pcb.saved_signal_mask = pcb.signal_mask;
+    pcb.signal_mask |= sa.mask;
+    if ((sa.flags & SA_NODEFER) == 0) {
+        pcb.signal_mask |= (@as(u32, 1) << @intCast(signo));
+    }
+    pcb.in_signal_handler = true;
+}
+
+/// Try to deliver one pending signal at syscall-return. Mutates `frame` so
+/// sysret lands in the handler. `retval` is the dispatcher's return value;
+/// when no handler runs we return it back unchanged so the asm path can
+/// place it in user RAX. When a handler IS invoked, the user observes the
+/// handler — the original retval is preserved in MContext.rax and restored
+/// by sigreturn.
+///
+/// Loops because: (1) SIG_IGN and default-ignore disposed signals get
+/// dropped silently and we should re-check for the next pending one;
+/// (2) default-action term/core kills the process and the call doesn't
+/// return (handled by the early `if cur == pid` branch in applyDefault).
+pub fn deliverFromSyscallFrame(pcb: *process.PCB, frame: *SyscallFrame, retval: u32) u32 {
+    if (pcb.in_signal_handler) return retval;
+    while (true) {
+        const sig = pickSignal(pcb) orelse return retval;
+        pcb.pending_signals &= ~(@as(u32, 1) << @intCast(sig));
+
+        if (!isCatchable(sig)) {
+            applyDefault(pcb, sig);
+            return retval;
+        }
+
+        const sa = &pcb.sigactions[sig];
+        if (sa.handler == SIG_IGN) continue;
+        if (sa.handler == SIG_DFL) {
+            applyDefault(pcb, sig);
+            // If applyDefault killed us, control already left the function.
+            // For ignore/stop/cont we keep checking pending.
+            continue;
+        }
+
+        // User handler. The saved user RSP lives at frame.user_rsp (per-thread,
+        // pushed onto the kernel stack at syscall entry — see SyscallFrame
+        // doc and syscall_entry.zig). Push MContext + trampoline RA at the
+        // user's stack and rewrite frame.user_rsp so sysret lands on the
+        // handler's freshly-prepared frame.
+        const old_user_rsp = frame.user_rsp;
+        const mctx_va = (old_user_rsp -% @sizeOf(MContext)) & ~@as(u64, 0xF);
+        const ra_va = mctx_va -% 8;
+        if (!validateUserRange(ra_va, @sizeOf(MContext) + 8)) {
+            // User stack is hosed (recursive overflow into guard, e.g.) —
+            // can't deliver. Force terminate with a recognizable status.
+            process.destroyCurrentWithStatus(0xDEAD0000 | sig);
+            return retval;
+        }
+
+        const mctx_ptr: *MContext = @ptrFromInt(mctx_va);
+        mctx_ptr.* = .{
+            .magic = MCONTEXT_MAGIC,
+            .saved_mask = pcb.signal_mask,
+            .signo = sig,
+            .rax = retval,
+            .rbx = frame.rbx,
+            .rcx = frame.rcx,
+            .rdx = frame.rdx,
+            .rsi = frame.rsi,
+            .rdi = frame.rdi,
+            .rbp = frame.rbp,
+            .rsp = old_user_rsp,
+            .r8 = frame.r8,
+            .r9 = frame.r9,
+            .r10 = frame.r10,
+            .r11 = frame.r11,
+            .r12 = frame.r12,
+            .r13 = frame.r13,
+            .r14 = frame.r14,
+            .r15 = frame.r15,
+            .rip = frame.rcx, // syscall instruction stashed user RIP in RCX
+            .rflags = frame.r11,
+        };
+        const ra_ptr: *u64 = @ptrFromInt(ra_va);
+        ra_ptr.* = sa.restorer;
+
+        // Rewrite the saved syscall frame so the asm-side pop sequence loads
+        // handler args into user RDI/RSI/RDX and sysret jumps to handler.
+        frame.rcx = sa.handler; // sysret RIP
+        frame.r11 = (mctx_ptr.rflags & ~@as(u64, 0x100)) | 0x202; // clear TF, ensure IF
+        frame.rdi = sig;
+        frame.rsi = 0;
+        frame.rdx = mctx_va;
+        frame.user_rsp = ra_va;
+
+        applyHandlerMaskUpdate(pcb, sig, sa);
+        if ((sa.flags & SA_RESETHAND) != 0) sa.handler = SIG_DFL;
+
+        // Handler entry doesn't observe RAX — return value is irrelevant.
+        return 0;
+    }
+}
+
+/// Deliver one pending signal on IRQ-return-to-user. Modifies the iretq
+/// portion of `frame` plus the rdi/rsi/rdx GPR slots so iretq lands in the
+/// handler.
+pub fn deliverFromIrqFrame(pcb: *process.PCB, frame: *IrqFrame) void {
+    if (pcb.in_signal_handler) return;
+    while (true) {
+        const sig = pickSignal(pcb) orelse return;
+        pcb.pending_signals &= ~(@as(u32, 1) << @intCast(sig));
+
+        if (!isCatchable(sig)) {
+            applyDefault(pcb, sig);
+            return;
+        }
+
+        const sa = &pcb.sigactions[sig];
+        if (sa.handler == SIG_IGN) continue;
+        if (sa.handler == SIG_DFL) {
+            applyDefault(pcb, sig);
+            continue;
+        }
+
+        const old_user_rsp = frame.rsp;
+        const mctx_va = (old_user_rsp -% @sizeOf(MContext)) & ~@as(u64, 0xF);
+        const ra_va = mctx_va -% 8;
+        if (!validateUserRange(ra_va, @sizeOf(MContext) + 8)) {
+            process.destroyCurrentWithStatus(0xDEAD0000 | sig);
+            return;
+        }
+
+        const mctx_ptr: *MContext = @ptrFromInt(mctx_va);
+        mctx_ptr.* = .{
+            .magic = MCONTEXT_MAGIC,
+            .saved_mask = pcb.signal_mask,
+            .signo = sig,
+            .rax = frame.rax,
+            .rbx = frame.rbx,
+            .rcx = frame.rcx,
+            .rdx = frame.rdx,
+            .rsi = frame.rsi,
+            .rdi = frame.rdi,
+            .rbp = frame.rbp,
+            .rsp = old_user_rsp,
+            .r8 = frame.r8,
+            .r9 = frame.r9,
+            .r10 = frame.r10,
+            .r11 = frame.r11,
+            .r12 = frame.r12,
+            .r13 = frame.r13,
+            .r14 = frame.r14,
+            .r15 = frame.r15,
+            .rip = frame.rip,
+            .rflags = frame.rflags,
+        };
+        const ra_ptr: *u64 = @ptrFromInt(ra_va);
+        ra_ptr.* = sa.restorer;
+
+        frame.rip = sa.handler;
+        frame.rsp = ra_va;
+        frame.rflags = (frame.rflags & ~@as(u64, 0x100)) | 0x202;
+        frame.rdi = sig;
+        frame.rsi = 0;
+        frame.rdx = mctx_va;
+
+        // iretq-canary refresh (task #230). We just legitimately rewrote the
+        // saved RIP/RSP/RFLAGS plus the rdi/rsi/rdx GPR slots to redirect
+        // iretq into the user signal handler. Without this refresh, the
+        // canary check at schedule() would false-positive on these
+        // deliberate changes. Refresh re-syncs the snap with the post-mutate
+        // state.
+        @import("../debug/iretq_canary.zig").refresh();
+
+        applyHandlerMaskUpdate(pcb, sig, sa);
+        if ((sa.flags & SA_RESETHAND) != 0) sa.handler = SIG_DFL;
+        return;
+    }
+}
+
+/// Synchronous signal raised from an exception handler (PF/UD/DE/etc.). If
+/// the user has a handler installed, deliver to it via the exception trap
+/// frame. Otherwise return false so the caller can fall through to the
+/// existing crash-log + kill path.
+///
+/// `signo` is the signal we're raising on the user's behalf. `frame` is the
+/// exception trap frame whose RIP/RSP/RDI/RSI/RDX we may rewrite to redirect
+/// to the user handler.
+pub fn deliverFromExcFrame(pcb: *process.PCB, frame: *ExcFrame, signo: u32) bool {
+    if (signo == 0 or signo >= NSIG) return false;
+
+    const sa = &pcb.sigactions[signo];
+    // Fast paths: SIG_IGN on a synchronous signal is dangerous — the faulting
+    // instruction will just refault. Match Linux: treat as default action
+    // (i.e. don't actually ignore #SEGV/#FPE/etc.).
+    if (sa.handler == SIG_DFL or sa.handler == SIG_IGN) return false;
+    if (!isCatchable(signo)) return false;
+    if (pcb.in_signal_handler) {
+        // Nested fault inside a handler — we'd loop forever. Force-kill with
+        // the synchronous-signal status; matches Linux's "force_sig" path
+        // when the user already has the signal blocked or is mid-handler.
+        return false;
+    }
+
+    const old_user_rsp = frame.rsp;
+    const mctx_va = (old_user_rsp -% @sizeOf(MContext)) & ~@as(u64, 0xF);
+    const ra_va = mctx_va -% 8;
+    if (!validateUserRange(ra_va, @sizeOf(MContext) + 8)) return false;
+
+    const mctx_ptr: *MContext = @ptrFromInt(mctx_va);
+    mctx_ptr.* = .{
+        .magic = MCONTEXT_MAGIC,
+        .saved_mask = pcb.signal_mask,
+        .signo = signo,
+        .rax = frame.rax,
+        .rbx = frame.rbx,
+        .rcx = frame.rcx,
+        .rdx = frame.rdx,
+        .rsi = frame.rsi,
+        .rdi = frame.rdi,
+        .rbp = frame.rbp,
+        .rsp = old_user_rsp,
+        .r8 = frame.r8,
+        .r9 = frame.r9,
+        .r10 = frame.r10,
+        .r11 = frame.r11,
+        .r12 = frame.r12,
+        .r13 = frame.r13,
+        .r14 = frame.r14,
+        .r15 = frame.r15,
+        .rip = frame.rip,
+        .rflags = frame.rflags,
+    };
+    const ra_ptr: *u64 = @ptrFromInt(ra_va);
+    ra_ptr.* = sa.restorer;
+
+    frame.rip = sa.handler;
+    frame.rsp = ra_va;
+    frame.rflags = (frame.rflags & ~@as(u64, 0x100)) | 0x202;
+    frame.rdi = signo;
+    frame.rsi = 0;
+    frame.rdx = mctx_va;
+
+    applyHandlerMaskUpdate(pcb, signo, sa);
+    if ((sa.flags & SA_RESETHAND) != 0) sa.handler = SIG_DFL;
+    return true;
+}
+
+/// Implementation of the sigreturn syscall. Reads MContext from user RSP
+/// (where the sigreturn-trampoline `syscall` left it after the handler's
+/// `ret` popped the trampoline RA), validates it, restores the saved frame
+/// + signal mask, and returns the user's saved rax. The kernel asm path
+/// will place that in user RAX via the normal syscall return.
+pub fn sigreturn(pcb: *process.PCB, frame: *SyscallFrame) u32 {
+    // user_rsp now lives on the kernel stack as part of the SyscallFrame —
+    // it's the handler's RSP at the moment it called sys_sigreturn, which
+    // points at the MContext we pushed in deliverFromSyscallFrame.
+    const user_rsp = frame.user_rsp;
+    if (!validateUserRange(user_rsp, @sizeOf(MContext))) {
+        debug.klog("[sig] sigreturn: user rsp 0x{X} out of range\n", .{user_rsp});
+        process.destroyCurrentWithStatus(0xDEAD000B);
+        return 0;
+    }
+    const mctx_ptr: *const MContext = @ptrFromInt(user_rsp);
+    if (mctx_ptr.magic != MCONTEXT_MAGIC) {
+        debug.klog("[sig] sigreturn: bad MContext magic 0x{X} at 0x{X}\n", .{ mctx_ptr.magic, user_rsp });
+        process.destroyCurrentWithStatus(0xDEAD000B);
+        return 0;
+    }
+
+    // Rewrite the saved syscall frame so sysret restores the pre-signal
+    // user state. RAX is the syscall return value, which the asm path takes
+    // from doSyscall's return — so we return mctx.rax to the caller and let
+    // them stash it in %rax.
+    frame.rbx = mctx_ptr.rbx;
+    frame.rdx = mctx_ptr.rdx;
+    frame.rsi = mctx_ptr.rsi;
+    frame.rdi = mctx_ptr.rdi;
+    frame.rbp = mctx_ptr.rbp;
+    frame.r8 = mctx_ptr.r8;
+    frame.r9 = mctx_ptr.r9;
+    frame.r10 = mctx_ptr.r10;
+    frame.r12 = mctx_ptr.r12;
+    frame.r13 = mctx_ptr.r13;
+    frame.r14 = mctx_ptr.r14;
+    frame.r15 = mctx_ptr.r15;
+    frame.rcx = mctx_ptr.rip;
+    frame.r11 = mctx_ptr.rflags;
+    frame.user_rsp = mctx_ptr.rsp;
+
+    pcb.signal_mask = mctx_ptr.saved_mask;
+    pcb.in_signal_handler = false;
+
+    return @truncate(mctx_ptr.rax);
+}
+
+/// True if the calling process has any pending non-blocked signal whose
+/// disposition isn't ignore. Used by sigsuspend / pause to decide whether
+/// to park or return immediately.
+pub fn hasDeliverable(pcb: *const process.PCB) bool {
+    return pickSignal(pcb) != null;
+}

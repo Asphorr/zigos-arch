@@ -1,0 +1,21 @@
+# Zig build artifacts
+.zig-cache/
+zig-out/
+
+# Generated disk images and bootloader artifacts
+*.img
+esp.img
+disk.tar
+
+# Logs (kernel serial output, debug captures)
+*.log
+serial.log
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# Claude Code internal state (plans, conversation IDs)
+.claude/
