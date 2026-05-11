@@ -565,21 +565,27 @@ export fn handleException(rsp: u64) callconv(.c) void {
         serial.print("  R10=0x{X:0>16} R11=0x{X:0>16} R12=0x{X:0>16} R13=0x{X:0>16}\n", .{ stack[5], stack[4], stack[3], stack[2] });
         serial.print("  R14=0x{X:0>16} R15=0x{X:0>16}\n", .{ stack[1], stack[0] });
 
-        // Code bytes at RIP (up to next page boundary, capped at 16). RIP must
-        // be mapped (we got here by executing it), so the first byte is safe.
-        // Cap at the page boundary to avoid touching an unmapped following page.
+        // Code bytes at RIP (up to next page boundary, capped at 16). For
+        // most exceptions RIP is mapped (we got here by executing it), but
+        // for #PF on instruction fetch (vec=14, error_code bit 4 set) the
+        // page IS the unmapped one — dereffing here would double-fault.
+        // Walk the PT first; if not mapped, skip the dump.
         if (saved_rip != 0) {
-            const rip_page_end = (saved_rip & ~@as(u64, 0xFFF)) + 0x1000;
-            const safe_len: u64 = @min(16, rip_page_end - saved_rip);
-            const code: [*]const u8 = @ptrFromInt(saved_rip);
-            serial.print("  Code:", .{});
-            for (0..@intCast(safe_len)) |i| serial.print(" {X:0>2}", .{code[i]});
-            serial.print("\n", .{});
-            // Decode the faulting instruction so the user doesn't have to
-            // pull up objdump just to figure out what we hit.
-            serial.print("  Insn: ", .{});
-            @import("../debug/disasm.zig").printOne(code[0..@intCast(safe_len)]);
-            serial.print("\n", .{});
+            if (!@import("../mm/paging.zig").isMapped(saved_rip)) {
+                serial.print("  Code:  <RIP page not mapped — likely instruction-fetch #PF>\n", .{});
+            } else {
+                const rip_page_end = (saved_rip & ~@as(u64, 0xFFF)) + 0x1000;
+                const safe_len: u64 = @min(16, rip_page_end - saved_rip);
+                const code: [*]const u8 = @ptrFromInt(saved_rip);
+                serial.print("  Code:", .{});
+                for (0..@intCast(safe_len)) |i| serial.print(" {X:0>2}", .{code[i]});
+                serial.print("\n", .{});
+                // Decode the faulting instruction so the user doesn't have to
+                // pull up objdump just to figure out what we hit.
+                serial.print("  Insn: ", .{});
+                @import("../debug/disasm.zig").printOne(code[0..@intCast(safe_len)]);
+                serial.print("\n", .{});
+            }
         }
 
         // RBP-walked backtrace
@@ -771,7 +777,9 @@ export fn handleException(rsp: u64) callconv(.c) void {
     // NMI broadcast (task #247) — solicit a snapshot from every other
     // CPU BEFORE entering the gdb stub. The stub blocks waiting for a
     // connection that often never comes; if we put broadcast after the
-    // stub call, the NMI never fires.
+    // stub call, the NMI never fires. Halt the receivers so they can't
+    // continue on corrupt post-exception state.
+    @import("../debug/kdbg.zig").nmi_halt_after_snapshot = true;
     @import("../debug/kdbg.zig").broadcastNMI();
 
     serial.print("\n  SYSTEM HALTED.\n", .{});
@@ -1010,6 +1018,22 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
         @import("../time/smi.zig").tick();
     }
 
+    // Per-CPU tick — counted on EVERY IRQ0 (including soft yields) so the
+    // watchdog peer-check sees forward progress regardless of cause. Bumped
+    // BEFORE the peer check so a CPU that's only running soft yields still
+    // shows up alive. cli is held throughout handleIRQ0 so a plain += is
+    // safe; peer reads use volatile.
+    cpu.irq_tick_count +%= 1;
+    @import("../debug/watchdog.zig").peerCheck(cpu);
+
+    // Per-CPU execution trail — record where this CPU was interrupted.
+    // Dumped from panic / watchdog autopsy so we can see recent execution
+    // history even when stack walking is impossible (corrupt rbp, leaf
+    // function freeze, NMI-handler-never-returned). saved_rip is at
+    // stack[15] (15 GPRs pushed before RIP). 128-entry per-CPU ring,
+    // ~1.3s of history at 100 Hz.
+    @import("../debug/exectrail.zig").recordIrq(frame_for_validate[15]);
+
     const stack: [*]const u64 = @ptrFromInt(rsp);
     const saved_cs = stack[16]; // 15 GPRs [0..14] + RIP [15] + CS [16]
     const from_user = (saved_cs & 3) != 0;
@@ -1063,13 +1087,14 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
     }
     bisectPoint("after BSP wallclock", frame_for_validate, irq_snap);
 
-    // CFS preemption check — every CPU, every real timer tick (not soft
-    // yields). Bumps current's vruntime by ticks consumed since slice
-    // start and sets cpu.pending_soft_yield if a same-band candidate has
-    // smaller vruntime + the slice has run long enough. handleIRQ0's
-    // existing schedule path consumes pending_soft_yield via the
-    // "from_user or was_soft_yield" branch below — we want the natural
-    // preempt to fire for vruntime reasons too, so we reach in here.
+    // CFS preemption check — re-enabled 2026-05-10 after the wake-race
+    // fixes (project_wake_race_fixes.md) resolved the shell-freeze. The
+    // input freeze was orphan-sleep, not checkPreempt contamination.
+    // checkPreempt fires every tick on every CPU and accountRunningTick
+    // mutates vruntime + slice_start_tick — required for CFS per-tick
+    // fairness accounting; without it, vruntime is only updated at
+    // preempt boundaries (via setState's .running→non-running path) which
+    // works but is less timely.
     if (!was_soft_yield) process.checkPreempt();
     bisectPoint("after checkPreempt", frame_for_validate, irq_snap);
 

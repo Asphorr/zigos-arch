@@ -303,6 +303,7 @@ pub fn build(b: *std.Build) void {
         .{ "logd.elf", "app/logd.zig" },
         .{ "sleep.elf", "app/sleep.zig" },
         .{ "taskset.elf", "app/taskset.zig" },
+        .{ "nice.elf", "app/nice.zig" },
         .{ "yes.elf", "app/yes.zig" },
         .{ "iretq_spin.elf", "app/iretq_spin.zig" },
         .{ "wget.elf", "app/wget.zig" },
@@ -317,10 +318,12 @@ pub fn build(b: *std.Build) void {
         .{ "mkdir.elf", "app/mkdir.zig" },
         .{ "rmdir.elf", "app/rmdir.zig" },
         .{ "rm.elf", "app/rm.zig" },
+        .{ "touch.elf", "app/touch.zig" },
         .{ "shutdown.elf", "app/shutdown.zig" },
         .{ "dmesg.elf", "app/dmesg.zig" },
         .{ "about.elf", "app/about.zig" },
         .{ "tg.elf", "app/tg.zig" },
+        .{ "redteam.elf", "app/redteam.zig" },
     };
 
     inline for (gui_apps) |entry| {
@@ -557,6 +560,24 @@ pub fn build(b: *std.Build) void {
     const sym_step = b.step("sym", "Generate KERNEL.SYM");
     sym_step.dependOn(&install_sym.step);
 
+    // --- KERNEL.LINE (DWARF line-table dump for source-level backtraces) ---
+    // Pre-resolves every kernel RIP to (file, line) at build time so the
+    // in-kernel autopsy can print `sysFoo+0xN at file.zig:123` without
+    // shipping the full DWARF info. Same lifetime semantics as KERNEL.SYM.
+    const mklines = b.addSystemCommand(&.{
+        "bash", "-c",
+        \\objdump --dwarf=decodedline "$1" | LC_ALL=C python3 tools/gen_kernel_lines.py "$2"
+        ,
+        "mklines",
+    });
+    mklines.addArtifactArg(kernel);
+    const lines_lazy = mklines.addOutputFileArg("KERNEL.LINE");
+    const install_lines = b.addInstallBinFile(lines_lazy, "KERNEL.LINE");
+    b.getInstallStep().dependOn(&install_lines.step);
+
+    const lines_step = b.step("lines", "Generate KERNEL.LINE (DWARF line table)");
+    lines_step.dependOn(&install_lines.step);
+
     // --- Generate BUILD.ID file (matches the build_id option embedded in kernel) ---
     // Written as 16 ASCII hex chars (uppercase, no newline) so it parses identically
     // on the kernel side. Lives in zig-out/bin so mktar picks it up.
@@ -641,6 +662,7 @@ pub fn build(b: *std.Build) void {
         \\  [ -f "$f" ] && cp "$f" $STAGE/bin/
         \\done
         \\[ -f zig-out/bin/KERNEL.SYM ] && cp zig-out/bin/KERNEL.SYM $STAGE/
+        \\[ -f zig-out/bin/KERNEL.LINE ] && cp zig-out/bin/KERNEL.LINE $STAGE/
         \\[ -f zig-out/bin/BUILD.ID ] && cp zig-out/bin/BUILD.ID $STAGE/
         \\[ -f doom1.wad ] && cp doom1.wad $STAGE/share/
         \\for f in www/*; do
@@ -700,15 +722,16 @@ pub fn build(b: *std.Build) void {
         \\# Phase 1-2 dev). app.elf next so the shell is always loadable.
         \\# Then tiny + CLI staples + GUI apps.
         \\tar cf ../../disk.tar \
-        \\  BUILD.ID KERNEL.SYM \
+        \\  BUILD.ID KERNEL.SYM KERNEL.LINE \
         \\  app.elf \
         \\  gui_demo.elf pipetest.elf sigtest.elf \
-        \\  cat.elf ls.elf wc.elf echo.elf grep.elf head.elf sleep.elf taskset.elf yes.elf iretq_spin.elf \
-        \\  ps.elf dmesg.elf mkdir.elf rmdir.elf rm.elf shutdown.elf beep.elf \
+        \\  cat.elf ls.elf wc.elf echo.elf grep.elf head.elf sleep.elf taskset.elf nice.elf yes.elf iretq_spin.elf \
+        \\  ps.elf dmesg.elf mkdir.elf rmdir.elf rm.elf touch.elf shutdown.elf beep.elf \
         \\  sysmon.elf calc.elf settings.elf files.elf about.elf tg.elf \
         \\  paint.elf editor.elf doom.elf gpu_test.elf vulkan_triangle.elf \
         \\  venus_test.elf vulkan_cube.elf doom_real.elf \
-        \\  mmaptest.elf threadtest.elf threadbrot.elf forktest.elf daemontest.elf logd.elf photo.elf wallpaper.elf
+        \\  mmaptest.elf threadtest.elf threadbrot.elf forktest.elf daemontest.elf logd.elf photo.elf wallpaper.elf \
+        \\  redteam.elf
         \\echo "[tar] rebuilt"
         ,
     });

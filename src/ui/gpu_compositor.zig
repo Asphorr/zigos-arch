@@ -126,6 +126,28 @@ const COMPOSITOR_READBACK_MEM: u64 = 341;
 const COMPOSITOR_READBACK_BUFFER_2: u64 = 342;
 const COMPOSITOR_READBACK_MEM_2: u64 = 343;
 
+// Task A — Phase 1: secondary command ring. A 64 KB HOST3D blob laid
+// out as:
+//   [head:u32 @ 0][tail:u32 @ 4][status:u32 @ 8][pad @ 12]
+//   [buffer @ 16, 32 KB] [extra @ 32784, ~32 KB]
+// Buffer size MUST be a power of 2 (vkr_ring asserts util_is_power_of_two_nonzero).
+// After vkCreateRingMESA the host spins up a dedicated thread that drains
+// commands from this ring instead of going through ctrl_vq SUBMIT_3D.
+// Phase 1 creates the ring and verifies the host accepts it; Phase 2
+// would actually emit per-frame commands through it.
+const COMPOSITOR_RING: u64 = 500;
+const RING_TOTAL_SIZE: u64 = 64 * 1024;
+const RING_HEAD_OFFSET: u64 = 0;
+const RING_TAIL_OFFSET: u64 = 4;
+const RING_STATUS_OFFSET: u64 = 8;
+const RING_BUFFER_OFFSET: u64 = 16;
+const RING_BUFFER_SIZE: u64 = 32 * 1024; // power of 2
+const RING_EXTRA_OFFSET: u64 = RING_BUFFER_OFFSET + RING_BUFFER_SIZE;
+const RING_EXTRA_SIZE: u64 = RING_TOTAL_SIZE - RING_EXTRA_OFFSET;
+var ring_kvirt: ?[*]volatile u8 = null;
+var ring_res_id: u32 = 0;
+var ring_created: bool = false;
+
 // Step 9.4: per-window Venus image slots. Each visible app window
 // gets its own Venus VkImage (LINEAR + SAMPLED + TRANSFER_DST), backed
 // by a HOST3D blob with udmabuf so the kernel can write through the
@@ -821,6 +843,70 @@ fn submitFireAndForget(cs: *venus.CmdStream) bool {
     return virtio_gpu.submit3D(COMPOSITOR_CTX_ID, cs.bytes());
 }
 
+/// Task A Phase 1: allocate a 64 KB HOST3D blob, lay out the ring
+/// regions, zero them, and call vkCreateRingMESA. After this returns
+/// true the host has a dedicated thread polling our ring tail.
+///
+/// Phase 1 stops here — we don't actually write commands to the ring
+/// yet. Phase 2 would replace per-frame submit3D() with ring writes.
+fn setupCommandRing() bool {
+    if (reply_ring == null) return false; // need Venus reply ring up first
+
+    const res_id = virtio_gpu.alloc3DResourceId();
+    // Anonymous virgl blob (blob_id=0) — virgl_renderer manages the
+    // backing memory directly. Same recipe as the reply ring.
+    if (!virtio_gpu.resourceCreateBlob(COMPOSITOR_CTX_ID, res_id, BLOB_MEM_HOST3D, 1, 0, RING_TOTAL_SIZE)) {
+        debug.klog("[gpu-comp] ring: resourceCreateBlob FAILED\n", .{});
+        return false;
+    }
+    if (!virtio_gpu.ctxAttachResource(COMPOSITOR_CTX_ID, res_id)) {
+        debug.klog("[gpu-comp] ring: ctxAttachResource FAILED\n", .{});
+        return false;
+    }
+    const phys = virtio_gpu.resourceMapBlob(res_id, @intCast(RING_TOTAL_SIZE)) orelse {
+        debug.klog("[gpu-comp] ring: resourceMapBlob FAILED\n", .{});
+        return false;
+    };
+    const kvirt: [*]volatile u8 = @ptrFromInt(paging.physToVirt(phys));
+    // Zero the entire ring region (vkr_ring expects head=0, status=0 at create).
+    for (0..RING_TOTAL_SIZE) |i| kvirt[i] = 0;
+
+    // Call vkCreateRingMESA via Venus.
+    scratch_cs.reset();
+    venus.encodeCreateRing(
+        &scratch_cs,
+        COMPOSITOR_RING,
+        res_id,
+        0, // region offset within the resource
+        RING_TOTAL_SIZE,
+        50_000, // idleTimeout: 50 ms — host thread sleeps after this much idle
+        RING_HEAD_OFFSET,
+        RING_TAIL_OFFSET,
+        RING_STATUS_OFFSET,
+        RING_BUFFER_OFFSET,
+        RING_BUFFER_SIZE,
+        RING_EXTRA_OFFSET,
+        RING_EXTRA_SIZE,
+    );
+    if (!submitFireAndForget(&scratch_cs)) {
+        debug.klog("[gpu-comp] ring: vkCreateRingMESA submit FAILED\n", .{});
+        return false;
+    }
+
+    ring_kvirt = kvirt;
+    ring_res_id = res_id;
+    ring_created = true;
+    debug.klog("[gpu-comp] ring: created (res={d} phys=0x{X} total={d} buf={d}) — Phase 1 ok\n", .{ res_id, phys, RING_TOTAL_SIZE, RING_BUFFER_SIZE });
+
+    // Sanity: read back head/tail/status (should all be 0).
+    const head_ptr: *align(1) const volatile u32 = @ptrCast(kvirt + RING_HEAD_OFFSET);
+    const tail_ptr: *align(1) const volatile u32 = @ptrCast(kvirt + RING_TAIL_OFFSET);
+    const status_ptr: *align(1) const volatile u32 = @ptrCast(kvirt + RING_STATUS_OFFSET);
+    debug.klog("[gpu-comp] ring: post-create head={d} tail={d} status=0x{X}\n", .{ head_ptr.*, tail_ptr.*, status_ptr.* });
+
+    return true;
+}
+
 /// Step 5/9.1: stand up the rendering objects so each frame can submit
 /// one render pass and the kernel can read the rendered pixels back
 /// through an SHM-backed VkBuffer.
@@ -853,6 +939,11 @@ fn setupVulkanRender() bool {
     //    through SHM BAR — vkCmdCopyImageToBuffer untiles for us.
     {
         scratch_cs.reset();
+        // BATCH 1: render image + memory + bind. Three Venus fire-and-
+        // forget cmds in one ctrl_vq round-trip. Equivalent to what
+        // vkExecuteCommandStreamsMESA gives you at the protocol level —
+        // simpler here because all cmds live in the same scratch_cs.
+        // Host's dispatch loop runs them in order within one stream.
         venus.encodeCreateImageExportable(
             &scratch_cs,
             COMPOSITOR_DEVICE,
@@ -862,17 +953,6 @@ fn setupVulkanRender() bool {
             venus.VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | venus.VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
             COMPOSITOR_RENDER_IMAGE,
         );
-        if (!submitFireAndForget(&scratch_cs)) {
-            debug.klog("[gpu-comp] vkCreateImage submit FAILED\n", .{});
-            return false;
-        }
-    }
-
-    // 2. Allocate Exportable memory + bind the image. Same Venus-allocated
-    //    path as the original — slow for kernel CPU access at 8 MB, but
-    //    only Vulkan touches it directly.
-    {
-        scratch_cs.reset();
         venus.encodeAllocateMemoryExportable(
             &scratch_cs,
             COMPOSITOR_DEVICE,
@@ -880,16 +960,9 @@ fn setupVulkanRender() bool {
             0,
             COMPOSITOR_RENDER_MEM,
         );
-        if (!submitFireAndForget(&scratch_cs)) {
-            debug.klog("[gpu-comp] vkAllocateMemory submit FAILED\n", .{});
-            return false;
-        }
-    }
-    {
-        scratch_cs.reset();
         venus.encodeBindImageMemory(&scratch_cs, COMPOSITOR_DEVICE, COMPOSITOR_RENDER_IMAGE, COMPOSITOR_RENDER_MEM, 0);
         if (!submitFireAndForget(&scratch_cs)) {
-            debug.klog("[gpu-comp] vkBindImageMemory submit FAILED\n", .{});
+            debug.klog("[gpu-comp] batch1 (render image + mem + bind) FAILED\n", .{});
             return false;
         }
     }
@@ -906,27 +979,15 @@ fn setupVulkanRender() bool {
     while (bi < 2) : (bi += 1) {
         const mem_handle = readback_mem_handles[bi];
         const buf_handle = readback_buf_handles[bi];
+        // BATCH 2: per-readback mem alloc + buffer create + bind, one
+        // ctrl_vq round-trip per readback (was three).
         {
             scratch_cs.reset();
             venus.encodeAllocateMemoryExportable(&scratch_cs, COMPOSITOR_DEVICE, RENDER_PX_BYTES, 0, mem_handle);
-            if (!submitFireAndForget(&scratch_cs)) {
-                debug.klog("[gpu-comp] readback[{d}] vkAllocateMemoryExportable FAILED\n", .{bi});
-                return false;
-            }
-        }
-        {
-            scratch_cs.reset();
             venus.encodeCreateBufferExportable(&scratch_cs, COMPOSITOR_DEVICE, RENDER_PX_BYTES, venus.VK_BUFFER_USAGE_TRANSFER_DST_BIT, buf_handle);
-            if (!submitFireAndForget(&scratch_cs)) {
-                debug.klog("[gpu-comp] readback[{d}] vkCreateBuffer FAILED\n", .{bi});
-                return false;
-            }
-        }
-        {
-            scratch_cs.reset();
             venus.encodeBindBufferMemory(&scratch_cs, COMPOSITOR_DEVICE, buf_handle, mem_handle, 0);
             if (!submitFireAndForget(&scratch_cs)) {
-                debug.klog("[gpu-comp] readback[{d}] vkBindBufferMemory FAILED\n", .{bi});
+                debug.klog("[gpu-comp] readback[{d}] batch (mem+buf+bind) FAILED\n", .{bi});
                 return false;
             }
         }
@@ -946,12 +1007,32 @@ fn setupVulkanRender() bool {
         readback_res_ids[bi] = res_id;
         readback_pixel_bufs[bi] = @ptrFromInt(paging.physToVirt(phys));
         debug.klog("[gpu-comp] readback[{d}] res={d} phys=0x{X} (HOST3D blob+udmabuf)\n", .{ bi, res_id, phys });
+
+        // C: probe memory properties. memoryTypeBits tells us which host
+        // Vulkan memory types can import this resource as VkDeviceMemory.
+        // If zero, the resource can't be imported — that would be a red
+        // flag that the dma-buf export isn't actually usable. Also a
+        // sanity check that the Venus reply ring + flag plumbing works
+        // for OUT-param queries.
+        if (reply_ring) |ring| {
+            scratch_cs.reset();
+            venus.encodeGetMemoryResourceProperties(&scratch_cs, COMPOSITOR_DEVICE, res_id);
+            for (0..32) |i| ring[i] = 0;
+            if (virtio_gpu.submit3D(COMPOSITOR_CTX_ID, scratch_cs.bytes())) {
+                const r = venus.readGetMemoryResourcePropertiesReply(ring);
+                debug.klog("[gpu-comp] readback[{d}] mem props: VkResult={d} typeBits=0x{X}\n", .{ bi, r.result, r.type_bits });
+            } else {
+                debug.klog("[gpu-comp] readback[{d}] mem props probe submit FAILED\n", .{bi});
+            }
+        }
     }
     // Legacy alias for the kernel-side rep movsq fallback (only fires
     // when scanout promotion fails). Points at buffer 0.
     render_pixel_buf = readback_pixel_bufs[0];
 
-    // 4. Create image view, render pass, framebuffer.
+    // BATCH 3: image view + render pass + framebuffer + cmd pool +
+    // cmd buf + fence + source image + source mem + source bind.
+    // Nine cmds, all fire-and-forget, in one ctrl_vq round-trip.
     {
         scratch_cs.reset();
         venus.encodeCreateImageView(
@@ -962,21 +1043,7 @@ fn setupVulkanRender() bool {
             venus.VK_IMAGE_ASPECT_COLOR_BIT,
             COMPOSITOR_RENDER_VIEW,
         );
-        if (!submitFireAndForget(&scratch_cs)) {
-            debug.klog("[gpu-comp] vkCreateImageView submit FAILED\n", .{});
-            return false;
-        }
-    }
-    {
-        scratch_cs.reset();
         venus.encodeCreateRenderPass(&scratch_cs, COMPOSITOR_DEVICE, venus.VK_FORMAT_B8G8R8A8_UNORM, COMPOSITOR_RENDER_PASS);
-        if (!submitFireAndForget(&scratch_cs)) {
-            debug.klog("[gpu-comp] vkCreateRenderPass submit FAILED\n", .{});
-            return false;
-        }
-    }
-    {
-        scratch_cs.reset();
         venus.encodeCreateFramebuffer(
             &scratch_cs,
             COMPOSITOR_DEVICE,
@@ -986,64 +1053,14 @@ fn setupVulkanRender() bool {
             RENDER_H,
             COMPOSITOR_FRAMEBUFFER,
         );
-        if (!submitFireAndForget(&scratch_cs)) {
-            debug.klog("[gpu-comp] vkCreateFramebuffer submit FAILED\n", .{});
-            return false;
-        }
-    }
-
-    // 5. Command pool, command buffer, fence.
-    {
-        scratch_cs.reset();
         venus.encodeCreateCommandPool(&scratch_cs, COMPOSITOR_DEVICE, 0, COMPOSITOR_CMD_POOL);
-        if (!submitFireAndForget(&scratch_cs)) {
-            debug.klog("[gpu-comp] vkCreateCommandPool submit FAILED\n", .{});
-            return false;
-        }
-    }
-    {
-        scratch_cs.reset();
         venus.encodeAllocateCommandBuffers(&scratch_cs, COMPOSITOR_DEVICE, COMPOSITOR_CMD_POOL, COMPOSITOR_CMD_BUF);
-        if (!submitFireAndForget(&scratch_cs)) {
-            debug.klog("[gpu-comp] vkAllocateCommandBuffers submit FAILED\n", .{});
-            return false;
-        }
-    }
-    {
-        scratch_cs.reset();
         venus.encodeCreateFence(&scratch_cs, COMPOSITOR_DEVICE, 0, COMPOSITOR_FENCE);
-        if (!submitFireAndForget(&scratch_cs)) {
-            debug.klog("[gpu-comp] vkCreateFence submit FAILED\n", .{});
-            return false;
-        }
-    }
-
-    // 5b. Source image — a SAMPLED LINEAR exportable image the kernel
-    //     pre-fills with a checkerboard via the dma-buf-mapped memory,
-    //     then the per-frame fragment shader samples through a descriptor
-    //     set. Step 8 will replace this with real per-app window FBs
-    //     imported via cross-context dma-buf.
-    {
-        scratch_cs.reset();
         venus.encodeCreateImageSampledLinear(&scratch_cs, COMPOSITOR_DEVICE, SOURCE_W, SOURCE_H, venus.VK_FORMAT_B8G8R8A8_UNORM, COMPOSITOR_SOURCE_IMAGE);
-        if (!submitFireAndForget(&scratch_cs)) {
-            debug.klog("[gpu-comp] source vkCreateImage submit FAILED\n", .{});
-            return false;
-        }
-    }
-    {
-        scratch_cs.reset();
         venus.encodeAllocateMemoryExportable(&scratch_cs, COMPOSITOR_DEVICE, SOURCE_PX_BYTES, 0, COMPOSITOR_SOURCE_MEM);
-        if (!submitFireAndForget(&scratch_cs)) {
-            debug.klog("[gpu-comp] source vkAllocateMemory submit FAILED\n", .{});
-            return false;
-        }
-    }
-    {
-        scratch_cs.reset();
         venus.encodeBindImageMemory(&scratch_cs, COMPOSITOR_DEVICE, COMPOSITOR_SOURCE_IMAGE, COMPOSITOR_SOURCE_MEM, 0);
         if (!submitFireAndForget(&scratch_cs)) {
-            debug.klog("[gpu-comp] source vkBindImageMemory submit FAILED\n", .{});
+            debug.klog("[gpu-comp] batch3 (view+pass+fb+cmdpool+cmdbuf+fence+source) FAILED\n", .{});
             return false;
         }
     }
@@ -1136,26 +1153,19 @@ fn setupVulkanRender() bool {
             return false;
         }
     }
+    // BATCH 4: descriptor set layout + descriptor pool. Two FAF cmds,
+    // one round-trip.
     {
         scratch_cs.reset();
         venus.encodeCreateDescriptorSetLayoutSampler(&scratch_cs, COMPOSITOR_DEVICE, COMPOSITOR_DESC_SET_LAYOUT);
-        if (!submitFireAndForget(&scratch_cs)) {
-            debug.klog("[gpu-comp] vkCreateDescriptorSetLayout submit FAILED\n", .{});
-            return false;
-        }
-    }
-    {
-        // Pool sized for 2 sets (background + focused window). When this
-        // proves out, scale to N=4+ for full per-window architecture.
-        scratch_cs.reset();
         // Pool sized for: 2 legacy sets (background + focused-overlay,
-        // currently disabled) + MAX_WINDOW_SLOTS for per-window
-        // textures (step 9.4). Each set has 1 combined image sampler,
-        // so descriptorCount == max_sets.
+        // currently disabled) + MAX_WINDOW_SLOTS for per-window textures
+        // (step 9.4). Each set has 1 combined image sampler, so
+        // descriptorCount == max_sets.
         const pool_size: u32 = 2 + @as(u32, MAX_WINDOW_SLOTS);
         venus.encodeCreateDescriptorPoolN(&scratch_cs, COMPOSITOR_DEVICE, COMPOSITOR_DESC_POOL, pool_size, pool_size);
         if (!submitFireAndForget(&scratch_cs)) {
-            debug.klog("[gpu-comp] vkCreateDescriptorPool submit FAILED\n", .{});
+            debug.klog("[gpu-comp] batch4 (desc set layout + pool) FAILED\n", .{});
             return false;
         }
     }
@@ -1196,22 +1206,16 @@ fn setupVulkanRender() bool {
         }
     }
 
-    // 5d. Per-window source image #1 (focused window). Mirrors the
-    //     background image's setup with FOCUSED_W × FOCUSED_H dims.
+    // BATCH 5: focused image + mem + bind. Three FAF cmds, one round-trip.
     {
         scratch_cs.reset();
         venus.encodeCreateImageSampledLinear(&scratch_cs, COMPOSITOR_DEVICE, FOCUSED_W, FOCUSED_H, venus.VK_FORMAT_B8G8R8A8_UNORM, COMPOSITOR_FOCUSED_IMAGE);
-        if (!submitFireAndForget(&scratch_cs)) return false;
-    }
-    {
-        scratch_cs.reset();
         venus.encodeAllocateMemoryExportable(&scratch_cs, COMPOSITOR_DEVICE, FOCUSED_PX_BYTES, 0, COMPOSITOR_FOCUSED_MEM);
-        if (!submitFireAndForget(&scratch_cs)) return false;
-    }
-    {
-        scratch_cs.reset();
         venus.encodeBindImageMemory(&scratch_cs, COMPOSITOR_DEVICE, COMPOSITOR_FOCUSED_IMAGE, COMPOSITOR_FOCUSED_MEM, 0);
-        if (!submitFireAndForget(&scratch_cs)) return false;
+        if (!submitFireAndForget(&scratch_cs)) {
+            debug.klog("[gpu-comp] batch5 (focused image+mem+bind) FAILED\n", .{});
+            return false;
+        }
     }
     const focused_res_id = virtio_gpu.alloc3DResourceId();
     if (!virtio_gpu.resourceCreateBlob(
@@ -1288,28 +1292,14 @@ fn setupVulkanRender() bool {
         if (!submitFireAndForget(&scratch_cs)) return false;
     }
 
-    // 6. Shaders + pipeline layout (descriptor set + push constants) +
-    //    graphics pipeline. Vert: fullscreen triangle. Frag: samples
-    //    `texSampler` (set 0 binding 0) at gl_FragCoord/pc.size with a
-    //    time-driven UV warp (push constant t).
+    // BATCH 6: shaders + pipeline layout + graphics pipeline. Four FAF
+    // cmds. Shader modules inline their SPIR-V (~500 bytes total here),
+    // pipeline encoder is ~500 bytes. Total ~1.2 KB — well within 4 KB
+    // scratch_cs. If shaders grow, split into two batches.
     {
         scratch_cs.reset();
         venus.encodeCreateShaderModule(&scratch_cs, COMPOSITOR_DEVICE, &shaders.vert_spv, COMPOSITOR_VERT_MODULE);
-        if (!submitFireAndForget(&scratch_cs)) {
-            debug.klog("[gpu-comp] vkCreateShaderModule(vert) submit FAILED\n", .{});
-            return false;
-        }
-    }
-    {
-        scratch_cs.reset();
         venus.encodeCreateShaderModule(&scratch_cs, COMPOSITOR_DEVICE, &shaders.frag_spv, COMPOSITOR_FRAG_MODULE);
-        if (!submitFireAndForget(&scratch_cs)) {
-            debug.klog("[gpu-comp] vkCreateShaderModule(frag) submit FAILED\n", .{});
-            return false;
-        }
-    }
-    {
-        scratch_cs.reset();
         venus.encodeCreatePipelineLayoutFull(
             &scratch_cs,
             COMPOSITOR_DEVICE,
@@ -1318,13 +1308,6 @@ fn setupVulkanRender() bool {
             32, // vec4 rect + vec4 uv_scale
             COMPOSITOR_PIPELINE_LAYOUT,
         );
-        if (!submitFireAndForget(&scratch_cs)) {
-            debug.klog("[gpu-comp] vkCreatePipelineLayout(full) submit FAILED\n", .{});
-            return false;
-        }
-    }
-    {
-        scratch_cs.reset();
         venus.encodeCreateGraphicsPipelinesFullscreen(
             &scratch_cs,
             COMPOSITOR_DEVICE,
@@ -1337,7 +1320,7 @@ fn setupVulkanRender() bool {
             COMPOSITOR_PIPELINE,
         );
         if (!submitFireAndForget(&scratch_cs)) {
-            debug.klog("[gpu-comp] vkCreateGraphicsPipelines submit FAILED\n", .{});
+            debug.klog("[gpu-comp] batch6 (shaders+pipeline-layout+pipeline) FAILED\n", .{});
             return false;
         }
     }
@@ -1621,6 +1604,54 @@ fn setupBlobScanout(n_blobs: u32) bool {
     return true;
 }
 
+/// Wrap COMPOSITOR_RENDER_MEM (the VkDeviceMemory bound to the render
+/// image) as a HOST3D blob and arm it as the scanout. The render image
+/// renders directly into this memory each frame; the host's
+/// dpy_gl_scanout_dmabuf path imports it as a dma-buf for display.
+///
+/// This is the vulkan_cube pattern (image-backed memory as the blob),
+/// chosen because dma-buf export of Venus-allocated memory works
+/// reliably when the memory backs a VkImage but appears to fail
+/// silently when it backs a VkBuffer (step 9 zerocopy used the buffer
+/// path → black screen on Hyper-V/synthvid).
+///
+/// Single-buffer scanout — host reads while Vulkan writes → some
+/// tearing. The May 8 working state had this exact characteristic.
+/// Page-flip (n=2) would require two render images + per-frame
+/// framebuffer ping-pong — left for a follow-up.
+var render_scanout_res_id: u32 = 0;
+fn renderImageAsScanout() bool {
+    const w = virtio_gpu.width;
+    const h = virtio_gpu.height;
+    const fb_size_bytes: u64 = @as(u64, w) * h * 4;
+
+    const res_id = virtio_gpu.alloc3DResourceId();
+    if (!virtio_gpu.resourceCreateBlob(COMPOSITOR_CTX_ID, res_id, BLOB_MEM_HOST3D, 5, COMPOSITOR_RENDER_MEM, fb_size_bytes)) {
+        debug.klog("[gpu-comp] renderImageAsScanout: resourceCreateBlob FAILED\n", .{});
+        return false;
+    }
+    if (!virtio_gpu.ctxAttachResource(COMPOSITOR_CTX_ID, res_id)) {
+        debug.klog("[gpu-comp] renderImageAsScanout: ctxAttachResource FAILED\n", .{});
+        return false;
+    }
+    const phys = virtio_gpu.resourceMapBlob(res_id, @intCast(fb_size_bytes)) orelse {
+        debug.klog("[gpu-comp] renderImageAsScanout: resourceMapBlob FAILED\n", .{});
+        return false;
+    };
+    const kvirt: [*]volatile u32 = @ptrFromInt(paging.physToVirt(phys));
+
+    var res_ids = [_]u32{ res_id, 0 };
+    var virts = [_][*]volatile u32{ kvirt, undefined };
+    if (!virtio_gpu.armBlobScanout(res_ids[0..1], virts[0..1], 1)) {
+        debug.klog("[gpu-comp] renderImageAsScanout: armBlobScanout FAILED\n", .{});
+        return false;
+    }
+    virtio_gpu.dropOriginal2DScanout();
+    render_scanout_res_id = res_id;
+    debug.klog("[gpu-comp] renderImageAsScanout: ok res={d} phys=0x{X}\n", .{ res_id, phys });
+    return true;
+}
+
 var frame_counter: u64 = 0;
 
 /// Per-frame Venus cmd_type → args length lookup. Only the cmd_types that
@@ -1894,6 +1925,12 @@ fn run() noreturn {
             if (setupVulkanRender()) {
                 vulkan_render_ready = true;
                 debug.klog("[gpu-comp] Vulkan render path ready\n", .{});
+
+                // Task A Phase 1: experimentally create a Venus command ring.
+                // Doesn't replace any per-frame work yet — just verifies the
+                // protocol round-trip works and gives us SHM-mapped head/tail/
+                // status/buffer/extra regions to play with.
+                _ = setupCommandRing();
                 // Promote the readback HOST3D blob to scanout. After
                 // this, vkCmdCopyImageToBuffer's destination IS the
                 // host's display source: no kernel BAR→scanout memcpy,
@@ -1901,6 +1938,15 @@ fn run() noreturn {
                 // The blob is real udmabuf (VKR_DEBUG=udmabuf forces
                 // memfd→udmabuf for Venus exports), so the host's
                 // dpy_gl_scanout_dmabuf path consumes it directly.
+                // Promote the readback HOST3D blob pair to scanout.
+                // vkCmdCopyImageToBuffer's destination IS the host's
+                // display source — no kernel BAR→scanout memcpy needed
+                // and flushUnconditional skips TRANSFER_TO_HOST_2D.
+                //
+                // Requires guest RAM backed by `-object memory-backend-memfd`
+                // so virglrenderer can convert the Venus-allocated
+                // VkDeviceMemory into a real udmabuf-fd (via
+                // VKR_DEBUG=udmabuf). See run-uefi-ext2.sh.
                 if (readback_res_ids[0] != 0 and readback_res_ids[1] != 0) {
                     if (readback_pixel_bufs[0]) |rb_a| {
                         if (readback_pixel_bufs[1]) |rb_b| {
@@ -1942,6 +1988,20 @@ fn run() noreturn {
     var frame_no: u32 = 0;
     var fps_last_tick: u64 = 0;
     var fps_frames: u32 = 0;
+    // Frame-interval histogram. Each bucket counts frames whose
+    // interval (time since previous frame_start) fell in a given band.
+    // Log-scale bands so we capture both sub-frame stutter (4ms) and
+    // dropped frames (64+ms) in one printout.
+    //   bucket 0: 0..4ms      (very fast, possibly back-to-back wakes)
+    //   bucket 1: 4..8ms      (faster than 60Hz)
+    //   bucket 2: 8..16ms     (60-125Hz range)
+    //   bucket 3: 16..24ms    (~60Hz target band)
+    //   bucket 4: 24..33ms    (30-45Hz, mild stutter)
+    //   bucket 5: 33..50ms    (idle wake from kernelSleepMs(33))
+    //   bucket 6: 50..100ms   (visible stutter)
+    //   bucket 7: 100ms+      (frame drop)
+    var interval_hist: [8]u32 = .{0} ** 8;
+    var prev_frame_tsc: u64 = 0;
     while (true) : (frame_no += 1) {
         // Sleep until something asks for a frame. Idle desktop = ~30 Hz
         // wake-and-recheck, no work; active desktop = woken sub-ms by
@@ -1956,6 +2016,24 @@ fn run() noreturn {
         @atomicStore(u32, &pending_wakes, 0, .seq_cst);
 
         const perf = @import("../debug/perf.zig");
+        // Frame-start timestamp + interval bucketing. Done AFTER the
+        // sleep wait so the interval reflects "renderable frame to
+        // renderable frame", which is what the user actually perceives.
+        const apic = @import("../time/apic.zig");
+        const frame_start_tsc = apic.readTsc();
+        if (prev_frame_tsc != 0) {
+            const interval_ms = apic.tscToMs(frame_start_tsc -% prev_frame_tsc);
+            const bucket: usize = if (interval_ms < 4) 0
+                else if (interval_ms < 8) 1
+                else if (interval_ms < 16) 2
+                else if (interval_ms < 24) 3
+                else if (interval_ms < 33) 4
+                else if (interval_ms < 50) 5
+                else if (interval_ms < 100) 6
+                else 7;
+            interval_hist[bucket] +%= 1;
+        }
+        prev_frame_tsc = frame_start_tsc;
 
         if (vulkan_render_ready) {
             // 1. Sample-source fill — the fragment shader reads from
@@ -2004,8 +2082,15 @@ fn run() noreturn {
             _ = syncBackBufferToScreen();
         }
 
-        // 4. ONE flush per frame.
-        if (virtio_gpu.active) virtio_gpu.flushUnconditional();
+        // 4. ONE flush per frame. Wrapped in comp_flush so we can tell
+        // whether host vblank actually back-pressures here (~16ms) or
+        // returns instantly (instant return = tearing source — page
+        // flip happens mid-display-refresh).
+        if (virtio_gpu.active) {
+            const t = perf.enter();
+            defer perf.leave(.comp_flush, t);
+            virtio_gpu.flushUnconditional();
+        }
 
         fps_frames += 1;
         const now = process.tick_count;
@@ -2013,9 +2098,14 @@ fn run() noreturn {
         if (now -% fps_last_tick >= 500) {
             const elapsed_ms: u64 = (now -% fps_last_tick) * 10;
             const fps = if (elapsed_ms > 0) (@as(u64, fps_frames) * 1000) / elapsed_ms else 0;
-            debug.klog("[gpu-comp] frame {d}, ~{d} fps over {d} ms (vulkan={d})\n", .{ frame_no, fps, elapsed_ms, @intFromBool(vulkan_render_ready) });
+            debug.klog("[gpu-comp] frame {d}, ~{d} fps over {d} ms (vulkan={d}) | intervals <4ms={d} <8={d} <16={d} <24={d} <33={d} <50={d} <100={d} 100+={d}\n", .{
+                frame_no, fps, elapsed_ms, @intFromBool(vulkan_render_ready),
+                interval_hist[0], interval_hist[1], interval_hist[2], interval_hist[3],
+                interval_hist[4], interval_hist[5], interval_hist[6], interval_hist[7],
+            });
             fps_last_tick = now;
             fps_frames = 0;
+            interval_hist = .{0} ** 8;
         }
 
         // No artificial sleep — flushUnconditional's RESOURCE_FLUSH

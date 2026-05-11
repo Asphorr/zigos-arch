@@ -43,6 +43,7 @@ pub const Kind = enum(u8) {
     interrupts,
     mounts,
     sessions,
+    sched,
     pid_cmdline,
     pid_status,
 };
@@ -60,6 +61,7 @@ const STATIC_FILES = [_]StaticFile{
     .{ .name = "interrupts", .kind = .interrupts },
     .{ .name = "mounts", .kind = .mounts },
     .{ .name = "sessions", .kind = .sessions },
+    .{ .name = "sched", .kind = .sched },
 };
 
 const PER_PID_FILES = [_]StaticFile{
@@ -129,6 +131,7 @@ pub fn read(inode: u32, offset: u32, buf: [*]u8, count: u32) u32 {
         .interrupts => renderInterrupts(rendered),
         .mounts => renderMounts(rendered),
         .sessions => renderSessions(rendered),
+        .sched => renderSched(rendered),
         .pid_cmdline => renderPidCmdline(pid, rendered),
         .pid_status => renderPidStatus(pid, rendered),
     };
@@ -322,6 +325,87 @@ fn renderSessions(buf: []u8) usize {
             }
         }
     }
+    return n;
+}
+
+/// /proc/sched — per-CPU runqueue snapshot. Lets you SEE what the CFS
+/// scheduler is doing instead of inferring from log silence:
+///   - rq depth per priority band (interactive / normal / background)
+///   - per-band min_vruntime (CFS fairness floor)
+///   - migrations in/out (Phase 4 load balancer + sysSetAffinity activity)
+///   - schedule() invocation counter (work pressure proxy)
+///   - currently dispatched pid + name
+///
+/// One section per alive CPU, plus a `global:` summary at the bottom
+/// counting alive PCBs by state.
+fn renderSched(buf: []u8) usize {
+    var n: usize = 0;
+    var c: u8 = 0;
+    while (c < smp.MAX_CPUS) : (c += 1) {
+        const cpu = &smp.cpus[c];
+        if (!cpu.alive) continue;
+        const rq = &cpu.runqueue;
+
+        // Header + dispatched pid (if any).
+        const cur_pid: i32 = if (cpu.current_pid) |p| @intCast(p) else -1;
+        const cur_name: []const u8 = if (cur_pid >= 0)
+            process.procs[@intCast(cur_pid)].name[0..process.procs[@intCast(cur_pid)].name_len]
+        else
+            "<idle>";
+        n += fmt(buf[n..], "cpu{d}:\n  current_pid:    {d} ({s})\n", .{ c, cur_pid, cur_name });
+
+        // Schedule + migration counters (atomic loads — counters are bumped
+        // from cross-CPU paths in some cases).
+        const sched_n = @atomicLoad(u64, &cpu.schedule_count, .monotonic);
+        const mig_in = @atomicLoad(u64, &cpu.migrations_in, .monotonic);
+        const mig_out = @atomicLoad(u64, &cpu.migrations_out, .monotonic);
+        n += fmt(buf[n..],
+            "  schedule_count: {d}\n  migrations_in:  {d}\n  migrations_out: {d}\n",
+            .{ sched_n, mig_in, mig_out },
+        );
+
+        // Runqueue snapshot. nr_runnable is the cheap-audit total; the
+        // per-band counts come from each PriQueue. They should sum to
+        // nr_runnable — divergence means rq audit drift (also logged
+        // via process.rqAudit at 1/64 schedule cadence).
+        n += fmt(buf[n..],
+            "  rq nr_runnable: {d}  (interactive={d} normal={d} background={d})\n",
+            .{ rq.nr_runnable, rq.interactive.count, rq.normal.count, rq.background.count },
+        );
+
+        // Per-band min_vruntime — the CFS fairness floor that woken
+        // sleepers are bumped near (sleeper-bonus) and that migrated
+        // tasks are translated against.
+        n += fmt(buf[n..],
+            "  min_vruntime:   interactive={d} normal={d} background={d}\n",
+            .{ rq.min_vruntime[2], rq.min_vruntime[1], rq.min_vruntime[0] },
+        );
+
+        if (n + 256 > buf.len) break; // leave headroom for global section
+    }
+
+    // Global PCB-by-state summary.
+    var by_state = [_]u32{0} ** 6;
+    var total_alive: u32 = 0;
+    var i: u8 = 0;
+    while (i < process.MAX_PROCS) : (i += 1) {
+        const s = process.procs[i].state;
+        const idx: usize = @intFromEnum(s);
+        by_state[idx] += 1;
+        if (s != .unused) total_alive += 1;
+    }
+    n += fmt(buf[n..],
+        "global:\n  alive: {d}  unused: {d}  loading: {d}  ready: {d}  running: {d}  sleeping: {d}  zombie: {d}\n",
+        .{
+            total_alive,
+            by_state[@intFromEnum(process.State.unused)],
+            by_state[@intFromEnum(process.State.loading)],
+            by_state[@intFromEnum(process.State.ready)],
+            by_state[@intFromEnum(process.State.running)],
+            by_state[@intFromEnum(process.State.sleeping)],
+            by_state[@intFromEnum(process.State.zombie)],
+        },
+    );
     return n;
 }
 

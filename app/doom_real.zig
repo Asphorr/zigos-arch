@@ -186,20 +186,13 @@ export fn _start() linksection(".text.entry") callconv(.c) void {
     fb = win.fb;
     libc.setCursorVisible(false);
 
-    // Probe both possible WAD locations and pick whichever exists. Order
-    // matters: ext2 is the new primary FS (run-uefi-ext2.sh swaps disk.img
-    // out for ext2.img on IDE2), so /ext2/share/doom1.wad is the modern
-    // path. /fat/doom1.wad is the legacy path used when booting with
-    // FAT32 disk.img still on IDE2.
-    //
-    // Without the probe, hardcoding /fat/ panics doom on the ext2 boot
-    // path: D_FindIWAD returns NULL → I_Error("can't find IWAD") →
-    // vsnprintf NULL-derefs (separate libc bug, but the proximate cause
-    // is just "wrong path").
+    // ext2 is now mounted as root, so /share/doom1.wad is the canonical
+    // path. The /ext2/ and /fat/ prefixes are kept as fallbacks for legacy
+    // disk images still mounted under those prefixes.
     const wad_path: [*:0]const u8 = blk: {
+        if (libc.fsize("/share/doom1.wad")) |_| break :blk "/share/doom1.wad";
         if (libc.fsize("/ext2/share/doom1.wad")) |_| break :blk "/ext2/share/doom1.wad";
         if (libc.fsize("/fat/doom1.wad")) |_| break :blk "/fat/doom1.wad";
-        // Last-ditch: cwd-relative. Some setups put it next to the binary.
         break :blk "doom1.wad";
     };
     var argv = [_][*:0]u8{

@@ -19,6 +19,14 @@ const smp = @import("smp.zig");
 const signals = @import("../proc/signals.zig");
 const errno = @import("../proc/errno.zig");
 const sched_asm = @import("../proc/sched_asm.zig");
+const apic = @import("../time/apic.zig");
+
+/// Slow-syscall sentinel threshold: any single syscall taking longer than
+/// this prints `[slow-sc]` with sys#, pid, dt, args. 5ms catches the
+/// "single submit blocks for seconds" class without spamming for normal
+/// blocking primitives (those have their `perf_gap_cyc` adjustment so
+/// only on-CPU time counts). Tunable; raise if too noisy in practice.
+const SLOW_SYSCALL_THRESHOLD_MS: u64 = 5;
 
 const E_INVAL: u32 = errno.err(.EINVAL);
 const E_NOENT: u32 = errno.err(.ENOENT);
@@ -52,8 +60,27 @@ fn validateUserPtr(ptr: usize, len: usize) bool {
     if (ptr < USER_SPACE_START or ptr >= USER_SPACE_END) return false;
     if (len > 0 and ptr + len > USER_SPACE_END) return false;
     if (len > 0 and ptr + len < ptr) return false; // overflow
+    // Instrument the slow part — prefault + per-page PT walk. Cheap range
+    // checks above don't need bracketing; the meaningful cost starts here.
+    const sp = @import("../debug/syscall_perf.zig").scope(.user_ptr_walk);
+    defer sp.end();
     if (len > 0) process.prefaultUserRange(ptr, len);
+    // prefaultUserRange only maps pages inside registered lazy_regions; a
+    // pointer to scratch user-VA stays unmapped and the kernel's @memcpy
+    // would #PF in supervisor mode. Verify every page is actually present
+    // before letting the syscall body dereference it. Found by redteam
+    // fuzzer hitting sysGetcwd with a random user-range pointer.
+    if (len > 0 and !process.allCurrentUserPagesMapped(ptr, len)) return false;
     return true;
+}
+
+/// validateUserPtr + alignment check. Use whenever the caller is about to
+/// `@ptrFromInt` to `*T` or `[*]T` with `@alignOf(T) > 1` — Zig's runtime
+/// safety panics on misaligned cast (separate bug class from null/unmapped).
+/// Found by redteam fuzzer hitting sysSigprocmask with an unaligned u32 ptr.
+fn validateUserPtrAligned(ptr: usize, len: usize, comptime align_to: usize) bool {
+    if (align_to > 1 and ptr & (align_to - 1) != 0) return false;
+    return validateUserPtr(ptr, len);
 }
 
 export fn doSyscall(sys_num: u32, arg1: u32, arg2: u32, arg3: u32, frame_raw: *anyopaque) callconv(.c) u32 {
@@ -71,6 +98,11 @@ export fn doSyscall(sys_num: u32, arg1: u32, arg2: u32, arg3: u32, frame_raw: *a
             @import("../debug/serial.zig").print("[sc-entry] sys#{d}\n", .{sys_num});
         }
     }
+    // Execution trail — record syscall entry into the per-CPU ring so
+    // the autopsy can show "the last 32 things this CPU did" instead of
+    // just the final stack frame. Encoded as a sentinel RIP, decoded
+    // back to a syscall number by the trail dumper.
+    @import("../debug/exectrail.zig").recordSyscall(sys_num);
     // Snap-clear: the LSTAR stub just pushed 15 SyscallFrame qwords starting
     // at top-8 down, naturally overwriting the iretq slots at top-40..top.
     // Any iretq_canary snapshot taken at the previous user-mode IRQ entry is
@@ -101,6 +133,10 @@ export fn doSyscall(sys_num: u32, arg1: u32, arg2: u32, arg3: u32, frame_raw: *a
         }
     }
     const t_enter = perf.enter();
+    // Reset per-syscall phase tracker. Instrumented hot paths (validateUserPtr,
+    // virtio_gpu wait, vfs read, ...) accumulate cycles into named phases;
+    // dumped on slow-sc threshold so the operator sees WHERE the time went.
+    @import("../debug/syscall_perf.zig").reset();
     defer {
         // Subtract any descheduled-time gap recorded by blocking primitives
         // (yield/sleep) so the syscall counter reflects CPU time, not wall.
@@ -110,6 +146,23 @@ export fn doSyscall(sys_num: u32, arg1: u32, arg2: u32, arg3: u32, frame_raw: *a
         const dt = t_end -% adjusted_t_enter;
         perf.leave(.syscall, adjusted_t_enter);
         perf.syscallSample(sys_num, dt);
+
+        // Slow-syscall sentinel. tscToMs returns 0 until APIC calibration
+        // completes, which suppresses early-boot noise naturally. We log
+        // CPU time (gap-adjusted), so a deliberate sleep(1s) won't fire —
+        // only a syscall that ran on-CPU for >threshold does, which is the
+        // signal we actually want for "what's blocking ctrl_lock for 10s".
+        const dt_ms = apic.tscToMs(dt);
+        if (dt_ms >= SLOW_SYSCALL_THRESHOLD_MS) {
+            const cur_pid = process.getCurrentPid();
+            debug.klog(
+                "[slow-sc] sys#{d} pid={d} dt={d}ms args=0x{x} 0x{x} 0x{x}\n",
+                .{ sys_num, cur_pid, dt_ms, arg1, arg2, arg3 },
+            );
+            // Per-phase breakdown — only fires when at least one
+            // instrumented site recorded something.
+            @import("../debug/syscall_perf.zig").dump();
+        }
     }
 
     // Cast the asm-supplied frame pointer to its strongly-typed form. Field
@@ -292,9 +345,11 @@ const SYSCALLS = [_]SyscallSpec{
     .{ .num = 98, .name = "set_wallpaper",            .handler = wrap(sysSetWallpaper) },
     .{ .num = 99, .name = "set_affinity",             .handler = wrap(sysSetAffinity) },
     .{ .num = 100, .name = "get_affinity",            .handler = wrap(sysGetAffinity) },
+    .{ .num = 101, .name = "set_nice",                .handler = wrap(sysSetNice) },
+    .{ .num = 102, .name = "get_nice",                .handler = wrap(sysGetNice) },
 };
 
-const MAX_SYSCALL: u32 = 100;
+const MAX_SYSCALL: u32 = 102;
 const dispatch: [MAX_SYSCALL + 1]?Handler = blk: {
     var t: [MAX_SYSCALL + 1]?Handler = [_]?Handler{null} ** (MAX_SYSCALL + 1);
     for (SYSCALLS) |s| t[s.num] = s.handler;
@@ -392,7 +447,7 @@ fn sysGetKeyState(arg1: u32) u32 {
 /// poll_event (apps must pick one — mixing both will lose events).
 fn sysPollEvent(buf_ptr: u32) u32 {
     if (buf_ptr == 0) return 0;
-    if (!validateUserPtr(buf_ptr, @sizeOf(desktop.Event))) return 0;
+    if (!validateUserPtrAligned(buf_ptr, @sizeOf(desktop.Event), @alignOf(desktop.Event))) return 0;
     var ev: desktop.Event = .{ .kind = 0 };
     const cur: u8 = @intCast(process.getCurrentPid());
     if (!desktop.popEvent(cur, &ev)) return 0;
@@ -543,6 +598,8 @@ fn doSyscallInner(sys_num: u32, arg1: u32, arg2: u32, arg3: u32, frame: *signals
         98 => sysSetWallpaper(arg1, arg2, arg3),
         99 => sysSetAffinity(arg1, arg2),
         100 => sysGetAffinity(arg1),
+        101 => sysSetNice(arg1, arg2),
+        102 => sysGetNice(arg1),
         else => E_NOSYS,
     };
 }
@@ -694,7 +751,7 @@ fn sysSetWallpaper(buf_ptr: u32, w: u32, h: u32) u32 {
         return E_INVAL;
     }
     const total: usize = @as(usize, w) * @as(usize, h) * 4;
-    if (!validateUserPtr(buf_ptr, total)) {
+    if (!validateUserPtrAligned(buf_ptr, total, 4)) {
         debug.klog("[sysSetWallpaper] EFAULT validateUserPtr({d} bytes)\n", .{total});
         return E_FAULT;
     }
@@ -715,7 +772,7 @@ fn sysSetWallpaper(buf_ptr: u32, w: u32, h: u32) u32 {
 
 fn sysAudioWrite(buf_ptr: u32, num_samples: u32) u32 {
     if (num_samples == 0 or num_samples > 8192) return E_INVAL;
-    if (!validateUserPtr(buf_ptr, num_samples * 4)) return E_FAULT; // stereo i16 = 4 bytes/sample
+    if (!validateUserPtrAligned(buf_ptr, num_samples * 4, 2)) return E_FAULT; // stereo i16 = 4 bytes/sample, 2-byte aligned
     const sound = @import("../driver/sound.zig");
     if (!sound.isReady()) return E_INVAL;
     const src: [*]const i16 = @ptrFromInt(@as(usize, buf_ptr));
@@ -1096,9 +1153,12 @@ fn sysMprotect(va: u32, len: u32, prot: u32) u32 {
 fn sysSleep(ms: u32) u32 {
     const cur_pid = smp.myCpu().current_pid orelse return E_FAULT;
     const pcb = &process.procs[cur_pid];
-    // Convert ms to ticks (100 Hz timer -> 10ms per tick)
-    const ticks = (ms + 9) / 10; // round up
-    pcb.wake_tick = process.tick_count + ticks;
+    // Convert ms to ticks (100 Hz timer -> 10ms per tick). Widen to u64
+    // BEFORE the +9 add — `(ms + 9) / 10` in u32 overflows for any
+    // ms > 0xFFFFFFF6, which trivially-fuzzable input triggers.
+    // Caught by redteam fuzzer hitting sysSleep with random u32.
+    const ticks = (@as(u64, ms) + 9) / 10;
+    pcb.wake_tick = process.tick_count +% ticks;
     process.setState(cur_pid, .sleeping);
     // Force the scheduler to actually deschedule us. Same alignment dance as
     // sys#07 — see comments there. wakeExpired() flips us back to .ready once
@@ -1332,7 +1392,7 @@ fn sysPresent() u32 {
 }
 
 fn sysGetMouse(buf_ptr: u32) u32 {
-    if (!validateUserPtr(buf_ptr, 20)) return E_FAULT; // 5 u32s = 20 bytes
+    if (!validateUserPtrAligned(buf_ptr, 20, 4)) return E_FAULT; // 5 u32s = 20 bytes
     const pid: u8 = @intCast(process.getCurrentPid());
     const buf: [*]u32 = @ptrFromInt(@as(usize, buf_ptr));
     desktop.getMouseRelative(pid, buf);
@@ -1363,7 +1423,7 @@ fn sysDestroyWindow() u32 {
 }
 
 fn sysMeminfo(buf_ptr: u32) u32 {
-    if (!validateUserPtr(buf_ptr, 8)) return E_FAULT;
+    if (!validateUserPtrAligned(buf_ptr, 8, 4)) return E_FAULT;
     const buf: [*]u32 = @ptrFromInt(@as(usize, buf_ptr));
     buf[0] = pmm.freeFrameCount();
     buf[1] = pmm.freeFrameCount() + 1024; // approximate total (free + kernel used)
@@ -1384,7 +1444,7 @@ fn sysListDir(buf_ptr: u32, buf_size: u32) u32 {
     const entry_size: u32 = @sizeOf(FileEntry);
     const max_entries = buf_size / entry_size;
     if (max_entries == 0) return E_INVAL;
-    if (!validateUserPtr(buf_ptr, buf_size)) return E_FAULT;
+    if (!validateUserPtrAligned(buf_ptr, buf_size, @alignOf(FileEntry))) return E_FAULT;
     const entries: [*]FileEntry = @ptrFromInt(@as(usize, buf_ptr));
 
     // Dispatch by cwd → mount table. Previously hardcoded to FAT32 root,
@@ -1613,6 +1673,23 @@ fn sysExec(name_ptr: u32, name_len: u32) u32 {
                     // child still escapes (e.g. a daemon double-fork).
                     child_pcb.pgid = parent.pgid;
                     child_pcb.sid = parent.sid;
+                    // CFS: inherit nice + pinned_cpu so `taskset CPU prog`
+                    // and `nice N prog` (which fork → set → exec) actually
+                    // affect the new program's slot, not just the short-
+                    // lived nice/taskset wrapper. Without this, the
+                    // wrapper's setaffinity/setnice was a no-op for the
+                    // actual workload.
+                    //
+                    // pinned_cpu inheritance is two-step: loadAndStart
+                    // already called assignInitialCpu (which saw the
+                    // default pinned_cpu=0xFF and picked min-load CPU),
+                    // so we now have to migrate the child to the actual
+                    // pin destination if it differs.
+                    child_pcb.nice = parent.nice;
+                    child_pcb.pinned_cpu = parent.pinned_cpu;
+                    if (parent.pinned_cpu != 0xFF and child_pcb.assigned_cpu != parent.pinned_cpu) {
+                        _ = process.migrate(@intCast(p), parent.pinned_cpu);
+                    }
                 } else {
                     @import("../debug/debug.zig").klog("[sysExec] WARN: child_pid == parent_pid={d} — inheritance skipped\n", .{process.getCurrentPid()});
                 }
@@ -1663,7 +1740,7 @@ fn populateArgv(
 }
 
 fn sysGetScreenSize(buf_ptr: u32) u32 {
-    if (!validateUserPtr(buf_ptr, 8)) return E_FAULT;
+    if (!validateUserPtrAligned(buf_ptr, 8, 4)) return E_FAULT;
     const buf: [*]u32 = @ptrFromInt(@as(usize, buf_ptr));
     const gfx = @import("../ui/gfx.zig");
     buf[0] = gfx.screen_w;
@@ -1782,7 +1859,7 @@ fn sysGpuCtxDestroy() u32 {
 
 fn sysGpuGetCapsetInfo(index: u32, buf_ptr: u32) u32 {
     // Returns [capset_id: u32, max_version: u32, max_size: u32] to user buffer
-    if (!validateUserPtr(buf_ptr, 12)) {
+    if (!validateUserPtrAligned(buf_ptr, 12, 4)) {
         debug.klog("[gpu] capset_info[{d}] FAIL: bad user ptr 0x{X}\n", .{ index, buf_ptr });
         return E_INVAL;
     }
@@ -1907,7 +1984,7 @@ fn sysGpuCreateGuestBlob(size: u32, out_resource_id_ptr: u32) u32 {
     const virtio_gpu = @import("../driver/virtio_gpu.zig");
     if (!virtio_gpu.has_blob) return E_INVAL;
     if (size == 0 or size > 32 * 1024 * 1024) return E_INVAL;
-    if (!validateUserPtr(out_resource_id_ptr, 4)) return E_FAULT;
+    if (!validateUserPtrAligned(out_resource_id_ptr, 4, 4)) return E_FAULT;
 
     const pcb = process.currentPCB() orelse return E_FAULT;
     if (!pcb.gpu_has_ctx) return E_INVAL;
@@ -1965,7 +2042,7 @@ fn sysGpuResourceCreate3D(params_ptr: u32) u32 {
 
     const pcb = process.currentPCB() orelse return E_FAULT;
     if (!pcb.gpu_has_ctx) return E_INVAL;
-    if (!validateUserPtr(params_ptr, 20)) return E_FAULT;
+    if (!validateUserPtrAligned(params_ptr, 20, 4)) return E_FAULT;
 
     const params: [*]const u32 = @ptrFromInt(@as(usize, params_ptr));
     const resource_id = virtio_gpu.alloc3DResourceId();
@@ -2001,7 +2078,7 @@ fn sysGpuTransferToHost3D(resource_id: u32, params_ptr: u32) u32 {
 
     const pcb = process.currentPCB() orelse return E_FAULT;
     if (!pcb.gpu_has_ctx) return E_INVAL;
-    if (!validateUserPtr(params_ptr, 12)) return E_FAULT;
+    if (!validateUserPtrAligned(params_ptr, 12, 4)) return E_FAULT;
 
     // params: [width, height, stride]
     const params: [*]const u32 = @ptrFromInt(@as(usize, params_ptr));
@@ -2027,7 +2104,7 @@ fn sysGpuTransferFromHost3D(resource_id: u32, params_ptr: u32) u32 {
 
     const pcb = process.currentPCB() orelse return E_FAULT;
     if (!pcb.gpu_has_ctx) return E_INVAL;
-    if (!validateUserPtr(params_ptr, 12)) return E_FAULT;
+    if (!validateUserPtrAligned(params_ptr, 12, 4)) return E_FAULT;
 
     // params: [width, height, stride]
     const params: [*]const u32 = @ptrFromInt(@as(usize, params_ptr));
@@ -2049,7 +2126,7 @@ fn sysGpuTransferFromHost3D(resource_id: u32, params_ptr: u32) u32 {
 fn sysGpuSetScanoutBlob(resource_id: u32, params_ptr: u32) u32 {
     const virtio_gpu = @import("../driver/virtio_gpu.zig");
     if (!virtio_gpu.has_virgl) return E_INVAL;
-    if (!validateUserPtr(params_ptr, 20)) return E_FAULT;
+    if (!validateUserPtrAligned(params_ptr, 20, 4)) return E_FAULT;
 
     const params: [*]const u32 = @ptrFromInt(@as(usize, params_ptr));
     if (!virtio_gpu.setScanoutBlob(
@@ -2069,7 +2146,7 @@ fn sysGpuSetScanoutBlob(resource_id: u32, params_ptr: u32) u32 {
 fn sysGpuResourceFlush(resource_id: u32, params_ptr: u32) u32 {
     const virtio_gpu = @import("../driver/virtio_gpu.zig");
     if (!virtio_gpu.has_virgl) return E_INVAL;
-    if (!validateUserPtr(params_ptr, 8)) return E_FAULT;
+    if (!validateUserPtrAligned(params_ptr, 8, 4)) return E_FAULT;
 
     const params: [*]const u32 = @ptrFromInt(@as(usize, params_ptr));
     if (!virtio_gpu.resourceFlush(resource_id, params[0], params[1])) return E_INVAL;
@@ -2078,7 +2155,7 @@ fn sysGpuResourceFlush(resource_id: u32, params_ptr: u32) u32 {
 }
 
 fn sysGetWindowSize(buf_ptr: u32) u32 {
-    if (!validateUserPtr(buf_ptr, 8)) return E_FAULT;
+    if (!validateUserPtrAligned(buf_ptr, 8, 4)) return E_FAULT;
     const buf: [*]u32 = @ptrFromInt(@as(usize, buf_ptr));
     const pid: u8 = @intCast(process.getCurrentPid());
     desktop.getWindowContentSize(pid, buf);
@@ -2145,6 +2222,8 @@ pub fn isr_syscall() callconv(.naked) void {
 
 fn sysChdir(path_ptr: u32) u32 {
     const pcb = process.currentPCB() orelse return E_FAULT;
+    // Pre-cast guard: same null-cast safety check as sysMkdir.
+    if (!validateUserPtr(path_ptr, 1)) return E_INVAL;
 
     // Read NUL-terminated path from user space.
     var path_buf: [256]u8 = undefined;
@@ -2306,6 +2385,12 @@ fn sysGetcwd(buf_ptr: u32, size: u32) u32 {
 
 fn sysMkdir(path_ptr: u32) u32 {
     const pcb = process.currentPCB() orelse return E_FAULT;
+    // Pre-cast guard. `[*]const u8 = @ptrFromInt(0)` triggers Zig's runtime
+    // null-cast safety check before we ever reach the per-byte
+    // validateUserPtr in the loop below — caught by redteam fuzzer hitting
+    // sysMkdir with arg1=0. Validate at least the first byte upfront so the
+    // cast itself is safe.
+    if (!validateUserPtr(path_ptr, 1)) return E_INVAL;
 
     // Read path from user space
     var path_buf: [256]u8 = undefined;
@@ -2325,18 +2410,23 @@ fn sysMkdir(path_ptr: u32) u32 {
     var resolve_buf: [256]u8 = undefined;
     const resolved = vfs.resolvePath(pcb, path_buf[0..path_len], &resolve_buf) orelse return E_NOENT;
 
-    // Only FAT32 supports mkdir
-    if (resolved.fs != .fat32) return E_INVAL;
-
-    const fat32 = @import("../fs/fat32.zig");
-    if (fat32.createDirectory(resolved.path)) {
-        return 0;
+    switch (resolved.fs) {
+        .fat32 => {
+            const fat32 = @import("../fs/fat32.zig");
+            return if (fat32.createDirectory(resolved.path)) 0 else E_INVAL;
+        },
+        .ext2 => {
+            const ext2 = @import("../fs/ext2/ext2.zig");
+            return if (ext2.mkdirPath(resolved.path)) 0 else E_INVAL;
+        },
+        else => return E_INVAL,
     }
-    return E_INVAL;
 }
 
 fn sysReaddir(path_ptr: u32, buf_ptr: u32, buf_size: u32) u32 {
     const pcb = process.currentPCB() orelse return E_FAULT;
+    // Pre-cast guard: same null-cast safety check as sysMkdir.
+    if (!validateUserPtr(path_ptr, 1)) return E_INVAL;
 
     // Read path from user space
     var path_buf: [256]u8 = undefined;
@@ -2351,7 +2441,7 @@ fn sysReaddir(path_ptr: u32, buf_ptr: u32, buf_size: u32) u32 {
     }
 
     if (path_len == 0 or path_len >= 256) return E_NAMETOOLONG;
-    if (!validateUserPtr(buf_ptr, buf_size)) return E_FAULT;
+    if (!validateUserPtrAligned(buf_ptr, buf_size, @alignOf(FileEntry))) return E_FAULT;
 
     const entry_size: u32 = @sizeOf(FileEntry);
     const max_entries = buf_size / entry_size;
@@ -2423,7 +2513,10 @@ fn sysUnlink(path_ptr: u32, path_len: u32) u32 {
             return E_INVAL;
         },
         .procfs => return 0xFFFFFFFF,
-        .ext2 => return E_INVAL, // Phase 2 will implement unlink
+        .ext2 => {
+            const ext2 = @import("../fs/ext2/ext2.zig");
+            return if (ext2.unlinkPath(resolved.path)) 0 else E_INVAL;
+        },
     }
 }
 
@@ -2439,7 +2532,7 @@ fn sysStat(path_ptr: u32, path_len: u32, stat_buf_ptr: u32) u32 {
 
     if (path_len == 0 or path_len > 256) return E_NAMETOOLONG;
     if (!validateUserPtr(path_ptr, path_len)) return E_FAULT;
-    if (!validateUserPtr(stat_buf_ptr, @sizeOf(FileStat))) return E_INVAL;
+    if (!validateUserPtrAligned(stat_buf_ptr, @sizeOf(FileStat), @alignOf(FileStat))) return E_INVAL;
 
     // Read path from user space
     var path_buf: [256]u8 = undefined;
@@ -2510,7 +2603,7 @@ fn sysRename(old_path_ptr: u32, old_len: u32, new_path_ptr: u32) u32 {
     if (!validateUserPtr(old_path_ptr, old_len)) return E_FAULT;
 
     // Read new path length from user space (stored at new_path_ptr as u32)
-    if (!validateUserPtr(new_path_ptr, 4)) return E_FAULT;
+    if (!validateUserPtrAligned(new_path_ptr, 4, 4)) return E_FAULT;
     const new_len_ptr: *const u32 = @ptrFromInt(@as(usize, new_path_ptr));
     const new_len = new_len_ptr.*;
 
@@ -2591,7 +2684,10 @@ fn sysRmdir(path_ptr: u32, path_len: u32) u32 {
             return E_INVAL;
         },
         .procfs => return 0xFFFFFFFF,
-        .ext2 => return E_INVAL, // Phase 2 will implement rmdir
+        .ext2 => {
+            const ext2 = @import("../fs/ext2/ext2.zig");
+            return if (ext2.rmdirPath(resolved.path)) 0 else E_INVAL;
+        },
     }
 }
 
@@ -2661,6 +2757,56 @@ fn sysGetAffinity(target_pid: u32) u32 {
     return @as(u32, pin) + 1;
 }
 
+/// sched_setnice(target_pid, new_nice) — Linux-style nice(2) for a single
+/// thread. Range -20..19; out-of-range is clamped (Linux returns EINVAL,
+/// but our ABI prefers "best effort within band" since unprivileged
+/// userspace is the only caller).
+///   target_pid == 0 → self.
+///   target_pid > 0  → another thread, must share our tgid.
+/// `new_nice` is encoded as i32 over the wire (cast to i8 internally).
+/// Returns 0 on success, E_INVAL/E_PERM/E_FAULT on error.
+fn sysSetNice(target_pid: u32, new_nice: u32) u32 {
+    const me_pcb = process.currentPCB() orelse return E_FAULT;
+    const me_pid: u8 = @intCast(process.getCurrentPid());
+
+    const target: u8 = if (target_pid == 0) me_pid else blk: {
+        if (target_pid >= process.MAX_PROCS) return E_INVAL;
+        break :blk @intCast(target_pid);
+    };
+
+    if (process.procs[target].tgid != me_pcb.tgid) return E_PERM;
+
+    // Decode i32-over-u32 → i8 with clamp. Userspace passes the signed
+    // value bit-cast to u32; we sign-extend through i32 first.
+    const nice_i32: i32 = @bitCast(new_nice);
+    const clamped: i8 = if (nice_i32 < -20) -20 else if (nice_i32 > 19) 19 else @intCast(nice_i32);
+    process.procs[target].nice = clamped;
+    return 0;
+}
+
+/// sched_getnice(target_pid) — read current nice value as a u32 over the
+/// wire (sign-extended from i8). target_pid == 0 = self; others gated on
+/// same-tgid.
+///
+/// Encoding: returns nice + 21 (so 1..40 = nice -20..+19) so the success
+/// space is disjoint from the error sentinel 0xFFFFFFFF. Caller subtracts
+/// 21 to recover. (Linux returns 20-nice; we use a different offset to
+/// keep "0 = error" reserved if we ever reuse that.)
+fn sysGetNice(target_pid: u32) u32 {
+    const me_pcb = process.currentPCB() orelse return 0xFFFFFFFF;
+    const me_pid: u8 = @intCast(process.getCurrentPid());
+
+    const target: u8 = if (target_pid == 0) me_pid else blk: {
+        if (target_pid >= process.MAX_PROCS) return 0xFFFFFFFF;
+        break :blk @intCast(target_pid);
+    };
+
+    if (process.procs[target].tgid != me_pcb.tgid) return 0xFFFFFFFF;
+
+    const nice = process.procs[target].nice;
+    return @intCast(@as(i32, nice) + 21);
+}
+
 // --- Process tree + IPC syscalls (Task #73) ---
 
 /// waitpid(pid, status_ptr) — block until a child of the calling process has
@@ -2697,6 +2843,10 @@ fn sysWaitpid(target_pid: u32, status_ptr: u32) u32 {
         if (process.findZombieChild(me, target_pid)) |zpid| {
             const status = process.procs[zpid].exit_status;
             if (status_ptr != 0) {
+                // != 0 guards the cast against null; aligned variant also
+                // catches misaligned u32 (Zig safety panics on @ptrFromInt
+                // to *u32 with non-4-byte-aligned int) and unmapped pages.
+                if (!validateUserPtrAligned(status_ptr, 4, 4)) return E_FAULT;
                 const sp: *u32 = @ptrFromInt(@as(usize, status_ptr));
                 sp.* = status;
             }
@@ -2740,12 +2890,12 @@ fn sysSigaction(signum: u32, new_ptr: u32, old_ptr: u32) u32 {
     const slot = &pcb.sigactions[signum];
 
     if (old_ptr != 0) {
-        if (!validateUserPtr(old_ptr, @sizeOf(signals.SigAction))) return E_INVAL;
+        if (!validateUserPtrAligned(old_ptr, @sizeOf(signals.SigAction), @alignOf(signals.SigAction))) return E_INVAL;
         const op: *signals.SigAction = @ptrFromInt(@as(usize, old_ptr));
         op.* = slot.*;
     }
     if (new_ptr != 0) {
-        if (!validateUserPtr(new_ptr, @sizeOf(signals.SigAction))) return E_INVAL;
+        if (!validateUserPtrAligned(new_ptr, @sizeOf(signals.SigAction), @alignOf(signals.SigAction))) return E_INVAL;
         const np: *const signals.SigAction = @ptrFromInt(@as(usize, new_ptr));
         // SIGKILL / SIGSTOP keep their default disposition no matter what.
         if (signum == signals.SIGKILL or signum == signals.SIGSTOP) return 0;
@@ -2760,12 +2910,12 @@ fn sysSigaction(signum: u32, new_ptr: u32, old_ptr: u32) u32 {
 fn sysSigprocmask(how: u32, set_ptr: u32, old_ptr: u32) u32 {
     const pcb = process.currentPCB() orelse return E_FAULT;
     if (old_ptr != 0) {
-        if (!validateUserPtr(old_ptr, 4)) return E_FAULT;
+        if (!validateUserPtrAligned(old_ptr, 4, 4)) return E_FAULT;
         const op: *u32 = @ptrFromInt(@as(usize, old_ptr));
         op.* = pcb.signal_mask;
     }
     if (set_ptr != 0) {
-        if (!validateUserPtr(set_ptr, 4)) return E_FAULT;
+        if (!validateUserPtrAligned(set_ptr, 4, 4)) return E_FAULT;
         const sp: *const u32 = @ptrFromInt(@as(usize, set_ptr));
         const new_set = sp.*;
         const filter = ~((@as(u32, 1) << @intCast(signals.SIGKILL)) |
@@ -2783,7 +2933,7 @@ fn sysSigprocmask(how: u32, set_ptr: u32, old_ptr: u32) u32 {
 /// sigpending(*set) — write the bitmap of pending-but-blocked signals.
 fn sysSigpending(set_ptr: u32) u32 {
     if (set_ptr == 0) return E_INVAL;
-    if (!validateUserPtr(set_ptr, 4)) return E_FAULT;
+    if (!validateUserPtrAligned(set_ptr, 4, 4)) return E_FAULT;
     const pcb = process.currentPCB() orelse return E_FAULT;
     const sp: *u32 = @ptrFromInt(@as(usize, set_ptr));
     sp.* = pcb.pending_signals & pcb.signal_mask;
@@ -2799,7 +2949,7 @@ fn sysSigpending(set_ptr: u32) u32 {
 /// POSIX would track a "saved mask" flag; deferred until a real user shows up.
 fn sysSigsuspend(mask_ptr: u32) u32 {
     if (mask_ptr == 0) return E_INVAL;
-    if (!validateUserPtr(mask_ptr, 4)) return E_FAULT;
+    if (!validateUserPtrAligned(mask_ptr, 4, 4)) return E_FAULT;
     const pcb = process.currentPCB() orelse return E_FAULT;
     const mp: *const u32 = @ptrFromInt(@as(usize, mask_ptr));
     const filter = ~((@as(u32, 1) << @intCast(signals.SIGKILL)) |
@@ -2887,9 +3037,9 @@ fn sysNetResolve(host_ptr: u32, host_len: u32, ip_out_ptr: u32) u32 {
 fn sysNetHttpGet(url_ptr: u32, url_len: u32, req_ptr: u32) u32 {
     if (url_len == 0 or url_len > 1024) return E_NAMETOOLONG;
     if (!validateUserPtr(url_ptr, url_len)) return E_FAULT;
-    if (!validateUserPtr(req_ptr, 8)) return E_FAULT;
 
     const HttpReq = extern struct { buf_ptr: u32, buf_len: u32 };
+    if (!validateUserPtrAligned(req_ptr, @sizeOf(HttpReq), @alignOf(HttpReq))) return E_FAULT;
     const req: *const HttpReq = @ptrFromInt(@as(usize, req_ptr));
     if (req.buf_len == 0 or req.buf_len > 1024 * 1024) return E_INVAL;
     if (!validateUserPtr(req.buf_ptr, req.buf_len)) return E_FAULT;
@@ -3039,12 +3189,19 @@ const ProcInfoUser = extern struct {
     start_tick: u64 align(1) = 0,
     // Threads + sessions/groups. Appended after the accounting block so
     // older readers that don't know about these fields still see the same
-    // header layout. _pad2 keeps struct size a multiple of 8 for any
-    // future appended u64 not to misalign.
+    // header layout.
     tgid: u8 = 0,
     pgid: u8 = 0,
     sid: u8 = 0,
-    _pad2: [5]u8 = .{ 0, 0, 0, 0, 0 },
+    // CFS scheduler fields (added 2026-05-10). Consume the prior _pad2
+    // slack — old readers saw zeros here, new readers get the actual
+    // nice/affinity/vruntime values for top-style displays.
+    nice: i8 = 0,
+    assigned_cpu: u8 = 0xFF, // current per-CPU rq this PCB is enqueued on
+    pinned_cpu: u8 = 0xFF,   // sched_setaffinity pin (0xFF = unpinned)
+    _pad2: [2]u8 = .{ 0, 0 },
+    vruntime: u64 align(1) = 0,
+    _pad3: [4]u8 = .{ 0, 0, 0, 0 }, // pad to 88 bytes (multiple of 8)
 };
 
 /// process_list(buf, max) — fill the user buffer with one ProcInfoUser per
@@ -3083,6 +3240,10 @@ fn sysProcessList(buf_ptr: u32, max_entries: u32) u32 {
             .tgid = pcb.tgid,
             .pgid = pcb.pgid,
             .sid = pcb.sid,
+            .nice = pcb.nice,
+            .assigned_cpu = pcb.assigned_cpu,
+            .pinned_cpu = pcb.pinned_cpu,
+            .vruntime = pcb.vruntime,
         };
 
         const off = count * ENTRY_SIZE;
@@ -3165,7 +3326,7 @@ const UsbInfoUser = extern struct {
 /// MSC device is connected. Either way the struct is zero-initialised first
 /// so callers can read `present` to be sure.
 fn sysUsbInfo(info_ptr: u32) u32 {
-    if (!validateUserPtr(info_ptr, @sizeOf(UsbInfoUser))) return E_INVAL;
+    if (!validateUserPtrAligned(info_ptr, @sizeOf(UsbInfoUser), @alignOf(UsbInfoUser))) return E_INVAL;
     const dst: *UsbInfoUser = @ptrFromInt(@as(usize, info_ptr));
     dst.* = .{ .present = 0, .block_size = 0, .block_count = 0 };
     if (!xhci.hasMscDevice()) return E_INVAL;
@@ -3230,7 +3391,7 @@ fn sysAlarm(seconds: u32) u32 {
 /// (two u32s) into the user buffer. Returns 0 on success, 0xFFFFFFFF if the
 /// pipe pool or fd table is full.
 fn sysPipe(fds_ptr: u32) u32 {
-    if (!validateUserPtr(fds_ptr, 8)) return E_FAULT;
+    if (!validateUserPtrAligned(fds_ptr, 8, 4)) return E_FAULT;
     const pcb = process.currentPCB() orelse return E_FAULT;
 
     const id = pipe.alloc() orelse return E_INVAL;
@@ -3294,7 +3455,7 @@ fn sysExecAs(name_ptr: u32, name_len: u32, remap_ptr: u32) u32 {
     var remap: [FD_REMAP_MAX]FdRemap = undefined;
     var n_remap: usize = 0;
     if (remap_ptr != 0) {
-        if (!validateUserPtr(remap_ptr, FD_REMAP_MAX * @sizeOf(FdRemap))) return E_INVAL;
+        if (!validateUserPtrAligned(remap_ptr, FD_REMAP_MAX * @sizeOf(FdRemap), @alignOf(FdRemap))) return E_INVAL;
         const src: [*]const FdRemap = @ptrFromInt(@as(usize, remap_ptr));
         while (n_remap < FD_REMAP_MAX) : (n_remap += 1) {
             if (src[n_remap].parent_fd == FD_SENTINEL) break;

@@ -133,6 +133,31 @@ pub const CpuLocal = struct {
     /// retires the cross-CPU CAS scan. See src/proc/runqueue.zig.
     runqueue: @import("../proc/runqueue.zig").Rq align(64) = .{},
 
+    /// Migration counters — bumped by `process.migrate` when this cpu is
+    /// the source (migrations_out) or the destination (migrations_in) of
+    /// a load-balancer move or sysSetAffinity-driven shift. Read by
+    /// /proc/sched. Monotonic, never reset; cumulative since boot.
+    migrations_in: u64 = 0,
+    migrations_out: u64 = 0,
+    /// Total schedule() invocations on this cpu. Bumped at the top of
+    /// schedule(); read by /proc/sched. The existing perf counter tracks
+    /// the same number but isn't exposed via a stable name — this one
+    /// is the canonical source for /proc/sched.
+    schedule_count: u64 = 0,
+
+    /// Incremented on every IRQ0 firing on this CPU (real or soft yield).
+    /// Watchdog peers compare deltas: if a peer's tick stops advancing for
+    /// N seconds, that CPU is wedged with cli — broadcast NMI + autopsy.
+    /// Without this, silent freezes (kernel running but cli'd in tight
+    /// loop, 100% CPU, no log output) leave us blind. Bumped under cli, no
+    /// atomic needed for self-write; readers from peer CPUs use volatile.
+    irq_tick_count: u64 = 0,
+    /// Watchdog scratch — last `peer.irq_tick_count` snapshot taken by this
+    /// CPU's watchdog check, and how many consecutive 1s windows the peer
+    /// hasn't advanced. Threshold-cross fires the watchdog autopsy.
+    watchdog_peer_last_tick: u64 = 0,
+    watchdog_peer_strikes: u8 = 0,
+
     // Tripwire (task #226 lite). LAST field of CpuLocal. If anything writes
     // past the end of cpus[N] — overflow from neighboring data, wild
     // pointer that lands here, sched_lock-state-write that overran — the

@@ -391,6 +391,13 @@ pub fn setRangeWriteCombining(phys: u64, size: u64) void {
 fn ensureMapped(phys: usize, size: usize, cache_flag: u64) void {
     if (pml4_addr == 0) return;
     if (phys + size <= PHYSMAP_SIZE) return; // covered by physmap
+    // Slow path: phys is above the 512 GB physmap window. Drivers calling
+    // mapMMIO/mapDataMMIO then dereferencing physToVirt(phys) WILL #PF —
+    // the slow path writes pml4[0] (low identity) which Phase 3 has
+    // dropped, and physToVirt() targets PML4[256] which we don't extend.
+    // Fix when this fires: bump PHYSMAP_SIZE + extend pdpt_physmap, or
+    // teach this path to write into the physmap range properly.
+    debug.klog("[paging] WARN: ensureMapped phys=0x{X} size=0x{X} above PHYSMAP_SIZE=0x{X} — caller will #PF on physToVirt\n", .{ phys, size, PHYSMAP_SIZE });
     const pml4: [*]volatile u64 = @ptrFromInt(physToVirt(pml4_addr));
 
     var addr = phys & ~@as(usize, 0x1FFFFF); // Align down to 2MB

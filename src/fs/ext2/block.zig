@@ -247,6 +247,46 @@ pub fn allocBlock(self: *Mount) ?u32 {
     return null;
 }
 
+/// Release one fs block back to its group's bitmap, bumping
+/// `free_blocks_count` in both the BGD entry and the superblock. No-op
+/// (returns false) if the block was already free — that's caller-side
+/// double-free, surfaced as a klog so the bug is loud rather than silent
+/// corruption. Reserved blocks (block_num == 0, or below first_data_block)
+/// are likewise rejected.
+pub fn freeBlock(self: *Mount, block_num: u32) bool {
+    if (block_num == 0 or block_num >= self.sb.blocks_count) return false;
+    if (block_num < self.sb.first_data_block) return false;
+    const rel: u32 = block_num - self.sb.first_data_block;
+    const group: u32 = rel / self.sb.blocks_per_group;
+    if (group >= self.bgd_count) return false;
+    const block_in_group: u32 = rel % self.sb.blocks_per_group;
+    const byte_idx: u32 = block_in_group / 8;
+    const bit: u3 = @intCast(block_in_group % 8);
+    const mask: u8 = @as(u8, 1) << bit;
+
+    const bgd = &self.bgd[group];
+    const bitmap_lba = blockLba(self, bgd.block_bitmap);
+    if (!ensureCacheLoaded(self, bitmap_lba)) return false;
+    const cache_off_base = (bitmap_lba - self.cache_base_lba) * SECTOR_SIZE;
+    const slice = self.cache_buf[cache_off_base .. cache_off_base + self.block_size];
+
+    if (slice[byte_idx] & mask == 0) {
+        debug.klog("[ext2] freeBlock: double-free of block {d} (bitmap bit clear)\n", .{block_num});
+        return false;
+    }
+    slice[byte_idx] &= ~mask;
+    var s: u32 = 0;
+    while (s < self.sectors_per_block) : (s += 1) {
+        const sec_off: u32 = cache_off_base + s * SECTOR_SIZE;
+        self.write_sector(bitmap_lba + s, @as([*]const u8, @ptrCast(&self.cache_buf)) + sec_off);
+    }
+    bgd.free_blocks_count +%= 1;
+    self.sb.free_blocks_count +%= 1;
+    if (!writeBgdTable(self)) return false;
+    if (!writeSuperblock(self)) return false;
+    return true;
+}
+
 fn allocBlockInGroup(self: *Mount, group: u32) ?u32 {
     const bgd = &self.bgd[group];
 

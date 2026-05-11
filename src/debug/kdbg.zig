@@ -755,6 +755,13 @@ pub const AutopsyOpts = struct {
 //   - Auto: a watchdog timer detects "no scheduler progress for N ticks"
 //     and broadcasts to capture the wedge state. (TODO: wire up watchdog.)
 
+/// Set to true by the panic path before broadcastNMI; receivers halt after
+/// snapshot instead of IRETing back. Without this the panicking CPU's
+/// `cli; hlt` only stops itself; other CPUs continue running on (now
+/// possibly-corrupt) state and can later trigger a second cascading panic
+/// while the first victim is still wedged in the panic handler.
+pub var nmi_halt_after_snapshot: bool = false;
+
 pub fn nmiSnapshot(rsp: u64, saved_rip: u64, saved_cs: u64) void {
     // Do NOT enter the panic critical section here — the caller of
     // broadcastNMI() likely holds it, and we'd deadlock waiting forever.
@@ -774,6 +781,13 @@ pub fn nmiSnapshot(rsp: u64, saved_rip: u64, saved_cs: u64) void {
         serial.print(" fn={s}+0x{X}\n", .{ r.name, r.offset });
     } else {
         serial.print("\n", .{});
+    }
+
+    // Panic-path receivers stop here; non-panic diagnostic callers
+    // (spinlock contention reporter, etc.) IRET back to whatever they
+    // were doing.
+    if (nmi_halt_after_snapshot) {
+        while (true) asm volatile ("cli; hlt");
     }
 }
 
@@ -848,6 +862,41 @@ pub fn enterCritical() void {
 /// parses it without quoting. Same `vec` + same `rip_sym` across boots =
 /// same crash signature (build_id is informational metadata, not part of
 /// the dedup key — repro across rebuilds should still match).
+/// Decode the call-site immediately preceding the saved RIP and, if it's
+/// a `call <something>`, print the resolved target. Zig's runtime safety
+/// checks (integer overflow, out-of-bounds index, misaligned ptr cast,
+/// reached unreachable, etc.) compile to a `call <Panic.helper>` and
+/// execution stops there; the autopsy's saved RIP is the byte AFTER the
+/// call (the return address). Without this annotation the user has to
+/// objdump kernel.elf around RIP to figure out which safety check fired
+/// — e.g. an alignment panic at +0xfe1 hides that the actual `call
+/// integerOverflow` was at +0xfdc and a different safety check at +0xfe1.
+fn printPanicCallSite(rip: u64) void {
+    if (rip < 0xFFFFFFFF80000000 + 5) return;
+    if (!looksLikeKernelText(rip - 5)) return;
+
+    const ip_call: [*]const u8 = @ptrFromInt(rip - 5);
+    // Only handle the most common form: E8 disp32 (near relative call,
+    // 5 bytes). Indirect calls (FF /2) and far calls don't appear in
+    // compiler-generated safety stubs.
+    if (ip_call[0] != 0xE8) return;
+
+    const lo = @as(u32, ip_call[1]);
+    const lo2 = @as(u32, ip_call[2]) << 8;
+    const lo3 = @as(u32, ip_call[3]) << 16;
+    const lo4 = @as(u32, ip_call[4]) << 24;
+    const disp32: i32 = @bitCast(lo | lo2 | lo3 | lo4);
+    // disp is relative to the instruction AFTER the call, which is `rip`
+    // itself (the saved return address). Sign-extend to i64, wrap-add.
+    const sign_extended: u64 = @bitCast(@as(i64, disp32));
+    const target = rip +% sign_extended;
+
+    if (!looksLikeKernelText(target)) return;
+    if (symbols.resolveKernel(target)) |r| {
+        serial.print("[kdbg] PanicCall:{s}+0x{X} (call at RIP-5)\n", .{ r.name, r.offset });
+    }
+}
+
 pub fn crashSummary(opts: AutopsyOpts) void {
     const build_options = @import("build_options");
     const build_id = build_options.build_id;
@@ -877,6 +926,15 @@ pub fn crashSummary(opts: AutopsyOpts) void {
         if (looksLikeKernelText(rip)) {
             if (symbols.resolveKernel(rip)) |r| {
                 rip_sym_slice = std.fmt.bufPrint(&rip_sym_buf, "{s}+0x{X}", .{ r.name, r.offset }) catch "(fmt-fail)";
+            } else if (symbols.resolveKernelNearest(rip)) |r| {
+                // Bound by 16 KB — anything farther is more likely a wild RIP
+                // than a real "near sysFoo" hit, and a misleading annotation
+                // is worse than a bare hex address.
+                if (r.offset < 0x4000) {
+                    rip_sym_slice = std.fmt.bufPrint(&rip_sym_buf, "(near {s}+0x{X})", .{ r.name, r.offset }) catch "(fmt-fail)";
+                } else {
+                    rip_sym_slice = std.fmt.bufPrint(&rip_sym_buf, "0x{X:0>16}", .{rip}) catch "(fmt-fail)";
+                }
             } else {
                 rip_sym_slice = std.fmt.bufPrint(&rip_sym_buf, "0x{X:0>16}", .{rip}) catch "(fmt-fail)";
             }
@@ -884,6 +942,12 @@ pub fn crashSummary(opts: AutopsyOpts) void {
             rip_sym_slice = std.fmt.bufPrint(&rip_sym_buf, "wild=0x{X:0>16}", .{rip}) catch "(fmt-fail)";
         }
         serial.print("[kdbg] RIP:      {s}\n", .{rip_sym_slice});
+        // DWARF source-line annotation. Cheap binary search; harmless if
+        // KERNEL.LINE wasn't loaded (returns null, line below is skipped).
+        if (@import("dwarf_line.zig").lookup(rip)) |loc| {
+            serial.print("[kdbg] Source:   {s}:{d}\n", .{ loc.file, loc.line });
+        }
+        printPanicCallSite(rip);
     } else {
         serial.print("[kdbg] RIP:      (not provided)\n", .{});
     }
@@ -944,6 +1008,11 @@ pub fn crashAutopsy(opts: AutopsyOpts) void {
     }
     if (opts.user_rbp) |rbp| walkUserStack(rbp, opts.app_syms);
     dumpAll();
+    // Per-CPU execution trail — last 32 IRQ/syscall samples per alive CPU.
+    // Recent execution history when the stack walk isn't useful (corrupt
+    // rbp, leaf-function freeze, NMI handler that never returned).
+    serial.print("\n[kdbg] ====== exec trails ======\n", .{});
+    @import("exectrail.zig").dumpAll(32);
     serial.print("[kdbg] ===== END AUTOPSY (cpu{d}) =====\n\n", .{cpu_id});
 }
 

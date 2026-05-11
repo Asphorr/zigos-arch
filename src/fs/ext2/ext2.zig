@@ -11,6 +11,8 @@ const layout = @import("layout.zig");
 const block = @import("block.zig");
 const inode = @import("inode.zig");
 const path_cache = @import("../path_cache.zig");
+const time = @import("../../time/time.zig");
+const debug = @import("../../debug/debug.zig");
 
 /// Path-cached `walkPath`. Saves the full root → leaf directory walk on
 /// repeat opens of the same path (httpd serving static files, shell
@@ -62,12 +64,11 @@ pub fn readFile(handle: Handle, buf: [*]u8, count: u32) usize {
 pub fn closeFile(_: Handle) void {}
 
 /// Overwrite or extend an existing file's contents at `handle.current_offset`.
-/// Returns the number of bytes written. Allocates new direct blocks via the
-/// block bitmap when the write extends past the current allocation.
-///
-/// Phase 2 limits — calls past the 12 direct-block boundary (= 48 KB at
-/// 4 KB blocks) stop writing rather than fall over into the indirect tree.
-/// /etc/zigos.conf and the editor's 32 KB buffer both fit comfortably.
+/// Returns the number of bytes written. Allocates new data + indirect-tree
+/// blocks via the block bitmap as needed, walking direct → single indirect
+/// → double indirect → triple indirect (4 TB cap at 4 KB blocks). Returns
+/// short if the filesystem fills up mid-write — caller's responsibility to
+/// retry / propagate.
 pub fn writeFile(handle: *Handle, src: [*]const u8, count: u32) u32 {
     if (count == 0) return 0;
     const m = block.getMount() orelse return 0;
@@ -80,27 +81,19 @@ pub fn writeFile(handle: *Handle, src: [*]const u8, count: u32) u32 {
     while (done < count) {
         const file_off: u64 = handle.current_offset + done;
         const logical: u32 = @intCast(file_off / bs);
-        if (logical >= layout.N_DIRECT) break; // Indirect blocks not supported yet
         const in_block_off: u32 = @intCast(file_off % bs);
         const can: u32 = bs - in_block_off;
         const remain: u32 = count - done;
         const take: u32 = if (remain < can) remain else can;
 
-        // Get or allocate the physical block for this logical slot.
-        var phys = ino.block[logical];
-        if (phys == 0) {
-            const new_block = block.allocBlock(m) orelse break;
-            phys = new_block;
-            ino.block[logical] = phys;
-            // `blocks` is in 512-B units, includes data + indirect blocks.
-            ino.blocks += @intCast(m.sectors_per_block);
-            // Zero the rest of the block we won't immediately overwrite — the
-            // bitmap allocator hands out whatever was last on disk. Source
-            // from the module-level zero block (BSS, not stack) so this
-            // path doesn't add 4 KB to an already-tight kernel stack.
-            if (in_block_off != 0 or take != bs) {
-                _ = block.writeBlock(m, phys, block.zero_block[0..bs]);
-            }
+        // Detect first-use of this logical slot so we know whether to
+        // pre-zero the block (alloc returns whatever was last on disk).
+        const was_unallocated = (inode.blockMapLookup(&ino, logical) == null);
+        const phys = inode.ensurePhysicalBlock(m, &ino, logical) orelse break;
+        if (was_unallocated and (in_block_off != 0 or take != bs)) {
+            // Zero the slack we won't immediately overwrite. zero_block
+            // lives in BSS so this doesn't burn 4 KB of kernel stack.
+            _ = block.writeBlock(m, phys, block.zero_block[0..bs]);
         }
 
         const ok = if (in_block_off == 0 and take == bs)
@@ -116,6 +109,11 @@ pub fn writeFile(handle: *Handle, src: [*]const u8, count: u32) u32 {
     if (new_end > inode.fileSize(&ino)) {
         ino.size = @truncate(new_end);
     }
+    if (done > 0) {
+        const sec: u32 = @truncate(time.now().sec);
+        ino.mtime = sec;
+        ino.ctime = sec;
+    }
     if (!inode.writeInode(handle.inum, &ino)) return 0;
 
     handle.current_offset = new_end;
@@ -123,15 +121,442 @@ pub fn writeFile(handle: *Handle, src: [*]const u8, count: u32) u32 {
     return done;
 }
 
-/// Reset an existing file's logical size to zero. Block pointers are kept
-/// (storage leak until full unlink is added in a later phase) — the next
-/// write reuses them via writeFile's `phys != 0` branch. Cheap and good
-/// enough for editor save and config rewrite, where files are tiny.
+// =============================================================================
+// Phase 2 — file creation
+// =============================================================================
+
+/// Path-based wrapper matching fat32.createFile's shape — splits `path`
+/// into parent dir + leaf name, walks the parent, then delegates to the
+/// inum-based createFile below. Returns the new inum + an open Handle so
+/// the caller (vfs.openFlags O_CREATE) can install an FD pointing at it
+/// immediately, no second walk needed.
+pub fn createFilePath(path: []const u8) ?Handle {
+    if (path.len == 0 or path.len > 255) return null;
+    // Find the last '/' — split point between parent and leaf.
+    var slash_idx: usize = 0;
+    var found = false;
+    var i: usize = path.len;
+    while (i > 0) {
+        i -= 1;
+        if (path[i] == '/') {
+            slash_idx = i;
+            found = true;
+            break;
+        }
+    }
+    const parent_path: []const u8 = if (!found or slash_idx == 0) "" else path[0..slash_idx];
+    const leaf: []const u8 = if (!found) path else path[slash_idx + 1 ..];
+    if (leaf.len == 0) return null;
+
+    const parent_inum = if (parent_path.len == 0) layout.ROOT_INO else (cachedWalk(parent_path) orelse return null);
+    const new_inum = createFile(parent_inum, leaf) orelse return null;
+    const ino = inode.readInode(new_inum) orelse return null;
+    return .{ .inum = new_inum, .file_size = inode.fileSize(&ino) };
+}
+
+/// Create a new regular file `name` inside `parent_inum`. Returns the new
+/// inum on success, null on bitmap-full / name-already-exists / parent-
+/// not-a-directory. Initializes the inode with mode S_IFREG|0o644,
+/// links_count=1, size=0, current epoch timestamps. Updates the path
+/// cache (via invalidateAll — conservative; ext2 mutations are rare).
+pub fn createFile(parent_inum: u32, name: []const u8) ?u32 {
+    if (name.len == 0 or name.len > 255) return null;
+    if (containsSlash(name)) return null;
+    const m = block.getMount() orelse return null;
+    var parent = inode.readInode(parent_inum) orelse return null;
+    if (!inode.isDir(&parent)) return null;
+    if (lookupInDir(&parent, name) != null) return null;
+
+    const new_inum = inode.allocInode(false) orelse return null;
+    var new_ino: layout.Inode = std.mem.zeroes(layout.Inode);
+    const t = time.now();
+    const sec: u32 = @truncate(t.sec);
+    new_ino.mode = layout.S_IFREG | 0o644;
+    new_ino.uid = 0;
+    new_ino.gid = 0;
+    new_ino.links_count = 1;
+    new_ino.size = 0;
+    new_ino.blocks = 0;
+    new_ino.atime = sec;
+    new_ino.ctime = sec;
+    new_ino.mtime = sec;
+    new_ino.dtime = 0;
+    if (!inode.writeInode(new_inum, &new_ino)) {
+        _ = inode.freeInode(new_inum, false);
+        return null;
+    }
+
+    if (!dirInsert(m, parent_inum, &parent, name, new_inum, layout.FT_REG_FILE)) {
+        // Roll back inode alloc on directory-insert failure.
+        _ = inode.freeInode(new_inum, false);
+        return null;
+    }
+    // Bump parent mtime/ctime — directory contents changed.
+    parent.mtime = sec;
+    parent.ctime = sec;
+    if (!inode.writeInode(parent_inum, &parent)) return null;
+
+    // Parent's path → inum mapping is unchanged, but a fresh path with
+    // this `name` suffix needs to resolve. invalidateAll is the conservative
+    // hammer; ext2 mutations are rare so the cache rebuild cost is fine.
+    path_cache.invalidateAll();
+    return new_inum;
+}
+
+/// Insert a directory entry into `dir_inum` (dir_ino read in by caller, may
+/// be mutated for size/block changes). Walks each block of the directory,
+/// looks for slack space in any existing entry, splits it. If no slack in
+/// any existing block, allocates a new block and lays the entry as the
+/// sole resident.
+fn dirInsert(m: *block.Mount, dir_inum: u32, dir_ino: *layout.Inode, name: []const u8, child_inum: u32, file_type: u8) bool {
+    const bs = m.block_size;
+    const needed: u16 = layout.dirEntryAlign(@intCast(name.len));
+    if (needed > bs) return false; // pathological — name fills whole block
+
+    const total = inode.fileSize(dir_ino);
+    var lblock: u32 = 0;
+    var dir_buf: [4096]u8 align(8) = undefined;
+    _ = dir_inum;
+    while (@as(u64, lblock) * bs < total) : (lblock += 1) {
+        if (!inode.readInodeBlock(dir_ino, lblock, dir_buf[0..bs])) return false;
+        var off: u32 = 0;
+        while (off + layout.DIR_ENTRY_HDR <= bs) {
+            const e = std.mem.bytesAsValue(layout.DirEntry, dir_buf[off .. off + 8]);
+            if (e.rec_len == 0) break; // malformed
+            const tight: u16 = if (e.inode == 0)
+                layout.DIR_ENTRY_HDR // empty entry — all of rec_len is slack
+            else
+                layout.dirEntryAlign(e.name_len);
+            if (e.rec_len >= tight + needed) {
+                // Split this entry: shrink to tight, append new entry in slack.
+                const new_off: u32 = off + tight;
+                const slack: u16 = e.rec_len - tight;
+                e.rec_len = tight;
+                // Construct new entry in-place.
+                const ne = std.mem.bytesAsValue(layout.DirEntry, dir_buf[new_off .. new_off + 8]);
+                ne.inode = child_inum;
+                ne.rec_len = slack;
+                ne.name_len = @intCast(name.len);
+                ne.file_type = file_type;
+                @memcpy(dir_buf[new_off + 8 .. new_off + 8 + name.len], name);
+                // Resolve the physical block for this logical and write the
+                // whole block back.
+                const phys = inode.blockMapLookup(dir_ino, lblock) orelse return false;
+                if (!block.writeBlock(m, phys, dir_buf[0..bs])) return false;
+                return true;
+            }
+            off += e.rec_len;
+        }
+    }
+
+    // No slack in any existing block — extend the directory by one block.
+    const new_lblock = @as(u32, @intCast(total / bs));
+    const new_phys = inode.ensurePhysicalBlock(m, dir_ino, new_lblock) orelse return false;
+    @memset(dir_buf[0..bs], 0);
+    const e = std.mem.bytesAsValue(layout.DirEntry, dir_buf[0..8]);
+    e.inode = child_inum;
+    e.rec_len = @intCast(bs);
+    e.name_len = @intCast(name.len);
+    e.file_type = file_type;
+    @memcpy(dir_buf[8 .. 8 + name.len], name);
+    if (!block.writeBlock(m, new_phys, dir_buf[0..bs])) return false;
+    dir_ino.size = @intCast(total + bs);
+    return true;
+}
+
+inline fn containsSlash(name: []const u8) bool {
+    for (name) |c| if (c == '/') return true;
+    return false;
+}
+
+/// Create an empty directory at `path`. Allocates a fresh inode marked
+/// S_IFDIR, allocates one data block populated with "." (self-link) and
+/// ".." (parent-link) dirents, inserts the entry into the parent dir, and
+/// bumps the parent's links_count by 1 to account for the new ".." back-
+/// pointer. Returns true on success.
+pub fn mkdirPath(path: []const u8) bool {
+    if (path.len == 0 or path.len > 255) return false;
+    var slash_idx: usize = 0;
+    var found = false;
+    var i: usize = path.len;
+    while (i > 0) {
+        i -= 1;
+        if (path[i] == '/') {
+            slash_idx = i;
+            found = true;
+            break;
+        }
+    }
+    const parent_path: []const u8 = if (!found or slash_idx == 0) "" else path[0..slash_idx];
+    const leaf: []const u8 = if (!found) path else path[slash_idx + 1 ..];
+    if (leaf.len == 0 or leaf.len > 255) return false;
+    if (containsSlash(leaf)) return false;
+
+    const m = block.getMount() orelse return false;
+    const parent_inum = if (parent_path.len == 0) layout.ROOT_INO else (cachedWalk(parent_path) orelse return false);
+    var parent = inode.readInode(parent_inum) orelse return false;
+    if (!inode.isDir(&parent)) return false;
+    if (lookupInDir(&parent, leaf) != null) return false;
+
+    const new_inum = inode.allocInode(true) orelse return false;
+
+    // Initialize the new directory inode.
+    var new_ino: layout.Inode = std.mem.zeroes(layout.Inode);
+    const t = time.now();
+    const sec: u32 = @truncate(t.sec);
+    new_ino.mode = layout.S_IFDIR | 0o755;
+    new_ino.links_count = 2; // self ("." entry) + parent's pointer to us
+    new_ino.atime = sec;
+    new_ino.ctime = sec;
+    new_ino.mtime = sec;
+    new_ino.size = 0; // bumped to bs once we lay the . / .. block
+
+    // Allocate the directory's first data block + write the . and ..
+    // dirents that every dir starts with. Going through ensurePhysicalBlock
+    // bumps new_ino.blocks for us.
+    const data_block = inode.ensurePhysicalBlock(m, &new_ino, 0) orelse {
+        _ = inode.freeInode(new_inum, true);
+        return false;
+    };
+
+    const bs = m.block_size;
+    var blkbuf: [4096]u8 align(8) = undefined;
+    @memset(blkbuf[0..bs], 0);
+    // "." entry — points to self.
+    const dot = std.mem.bytesAsValue(layout.DirEntry, blkbuf[0..8]);
+    const dot_rec: u16 = layout.dirEntryAlign(1);
+    dot.inode = new_inum;
+    dot.rec_len = dot_rec;
+    dot.name_len = 1;
+    dot.file_type = layout.FT_DIR;
+    blkbuf[8] = '.';
+    // ".." entry — points to parent. Stretches to end of block.
+    const dotdot = std.mem.bytesAsValue(layout.DirEntry, blkbuf[dot_rec .. dot_rec + 8]);
+    dotdot.inode = parent_inum;
+    dotdot.rec_len = @intCast(bs - dot_rec);
+    dotdot.name_len = 2;
+    dotdot.file_type = layout.FT_DIR;
+    blkbuf[dot_rec + 8] = '.';
+    blkbuf[dot_rec + 9] = '.';
+    if (!block.writeBlock(m, data_block, blkbuf[0..bs])) {
+        // Roll back: free the data block + inode. freeAllBlocks handles
+        // the data block since ensurePhysicalBlock already wired it in.
+        inode.freeAllBlocks(m, &new_ino);
+        _ = inode.freeInode(new_inum, true);
+        return false;
+    }
+    new_ino.size = @intCast(bs);
+
+    if (!inode.writeInode(new_inum, &new_ino)) {
+        inode.freeAllBlocks(m, &new_ino);
+        _ = inode.freeInode(new_inum, true);
+        return false;
+    }
+
+    if (!dirInsert(m, parent_inum, &parent, leaf, new_inum, layout.FT_DIR)) {
+        inode.freeAllBlocks(m, &new_ino);
+        _ = inode.freeInode(new_inum, true);
+        return false;
+    }
+    parent.links_count += 1; // the new dir's ".." points back to parent
+    parent.mtime = sec;
+    parent.ctime = sec;
+    if (!inode.writeInode(parent_inum, &parent)) return false;
+
+    path_cache.invalidateAll();
+    return true;
+}
+
+/// Remove an empty directory at `path`. Refuses non-empty dirs (anything
+/// besides "." and ".." present), regular files, or "/" (root). Frees the
+/// directory's data block + inode and decrements the parent's links_count
+/// by 1.
+pub fn rmdirPath(path: []const u8) bool {
+    if (path.len == 0 or path.len > 255) return false;
+    var slash_idx: usize = 0;
+    var found = false;
+    var i: usize = path.len;
+    while (i > 0) {
+        i -= 1;
+        if (path[i] == '/') {
+            slash_idx = i;
+            found = true;
+            break;
+        }
+    }
+    const parent_path: []const u8 = if (!found or slash_idx == 0) "" else path[0..slash_idx];
+    const leaf: []const u8 = if (!found) path else path[slash_idx + 1 ..];
+    if (leaf.len == 0) return false;
+    // "/" can't be removed.
+    if (parent_path.len == 0 and leaf.len == 0) return false;
+
+    const parent_inum = if (parent_path.len == 0) layout.ROOT_INO else (cachedWalk(parent_path) orelse return false);
+    var parent = inode.readInode(parent_inum) orelse return false;
+    if (!inode.isDir(&parent)) return false;
+    const child_inum = lookupInDir(&parent, leaf) orelse return false;
+    const child = inode.readInode(child_inum) orelse return false;
+    if (!inode.isDir(&child)) return false;
+    if (!dirIsEmpty(&child)) return false;
+
+    return unlinkInDir(parent_inum, leaf, .dir_only);
+}
+
+/// Returns true if `dir_ino` contains nothing besides "." and ".." (the
+/// two synthetic entries every directory has).
+fn dirIsEmpty(dir_ino: *const layout.Inode) bool {
+    const m = block.getMount() orelse return false;
+    const bs = m.block_size;
+    const total = inode.fileSize(dir_ino);
+    var lblock: u32 = 0;
+    var dir_buf: [4096]u8 align(8) = undefined;
+    while (@as(u64, lblock) * bs < total) : (lblock += 1) {
+        if (!inode.readInodeBlock(dir_ino, lblock, dir_buf[0..bs])) return false;
+        var off: u32 = 0;
+        while (off + layout.DIR_ENTRY_HDR <= bs) {
+            const e = std.mem.bytesAsValue(layout.DirEntry, dir_buf[off .. off + 8]);
+            if (e.rec_len == 0) break;
+            if (e.inode != 0 and e.name_len > 0) {
+                const name = dir_buf[off + 8 .. off + 8 + e.name_len];
+                if (!isDotEntry(name)) return false;
+            }
+            off += e.rec_len;
+        }
+    }
+    return true;
+}
+
+/// Remove a regular file at `path` — drops the dirent from its parent and
+/// (if links_count was 1) releases every data + indirect block plus the
+/// inode bitmap bit. Returns true on success. Refuses to operate on
+/// directories — use rmdir for those.
+pub fn unlinkPath(path: []const u8) bool {
+    if (path.len == 0 or path.len > 255) return false;
+    var slash_idx: usize = 0;
+    var found = false;
+    var i: usize = path.len;
+    while (i > 0) {
+        i -= 1;
+        if (path[i] == '/') {
+            slash_idx = i;
+            found = true;
+            break;
+        }
+    }
+    const parent_path: []const u8 = if (!found or slash_idx == 0) "" else path[0..slash_idx];
+    const leaf: []const u8 = if (!found) path else path[slash_idx + 1 ..];
+    if (leaf.len == 0) return false;
+
+    const parent_inum = if (parent_path.len == 0) layout.ROOT_INO else (cachedWalk(parent_path) orelse return false);
+    return unlinkInDir(parent_inum, leaf, .file_only);
+}
+
+const UnlinkPolicy = enum { file_only, dir_only };
+
+/// Lower-level unlink: caller has parent_inum + leaf already resolved.
+/// `policy` selects whether we expect a regular file (unlink) or a
+/// directory (rmdir). Cross-violations return false.
+pub fn unlinkInDir(parent_inum: u32, name: []const u8, policy: UnlinkPolicy) bool {
+    const m = block.getMount() orelse return false;
+    var parent = inode.readInode(parent_inum) orelse return false;
+    if (!inode.isDir(&parent)) return false;
+    const child_inum = lookupInDir(&parent, name) orelse return false;
+    var child = inode.readInode(child_inum) orelse return false;
+    switch (policy) {
+        .file_only => if (inode.isDir(&child)) return false,
+        .dir_only => if (!inode.isDir(&child)) return false,
+    }
+    // For dir_only: caller (rmdir) must have already verified the dir is
+    // empty — we don't re-check here.
+
+    if (!dirRemove(m, &parent, name)) return false;
+
+    const t = time.now();
+    const sec: u32 = @truncate(t.sec);
+
+    // For directories, always free — caller (rmdir) already verified empty,
+    // and the only remaining "links" are the self-reference via "." plus
+    // the parent reference we're now removing. Nothing else can hold a
+    // hardlink to a directory (POSIX forbids it).
+    const free_inode_now = (policy == .dir_only) or (child.links_count <= 1);
+
+    if (free_inode_now) {
+        inode.freeAllBlocks(m, &child);
+        var dead: layout.Inode = std.mem.zeroes(layout.Inode);
+        dead.dtime = sec;
+        if (!inode.writeInode(child_inum, &dead)) return false;
+        _ = inode.freeInode(child_inum, policy == .dir_only);
+    } else {
+        child.links_count -= 1;
+        child.ctime = sec;
+        if (!inode.writeInode(child_inum, &child)) return false;
+    }
+
+    // Removing a directory drops the parent's links_count by 1 (the back-
+    // pointer from the removed dir's ".." into us is gone).
+    if (policy == .dir_only and parent.links_count > 0) {
+        parent.links_count -= 1;
+    }
+    parent.mtime = sec;
+    parent.ctime = sec;
+    if (!inode.writeInode(parent_inum, &parent)) return false;
+
+    path_cache.invalidateAll();
+    return true;
+}
+
+/// Remove the dirent for `name` from `dir_ino`. If it's the first entry in
+/// its block, set inode=0 (logical-delete in-place). Otherwise merge its
+/// slot into the previous entry by bumping prev.rec_len. Returns false if
+/// the name isn't found.
+fn dirRemove(m: *block.Mount, dir_ino: *layout.Inode, name: []const u8) bool {
+    const bs = m.block_size;
+    const total = inode.fileSize(dir_ino);
+    var lblock: u32 = 0;
+    var dir_buf: [4096]u8 align(8) = undefined;
+    while (@as(u64, lblock) * bs < total) : (lblock += 1) {
+        if (!inode.readInodeBlock(dir_ino, lblock, dir_buf[0..bs])) return false;
+        var off: u32 = 0;
+        var prev_off: i64 = -1;
+        while (off + layout.DIR_ENTRY_HDR <= bs) {
+            const e = std.mem.bytesAsValue(layout.DirEntry, dir_buf[off .. off + 8]);
+            if (e.rec_len == 0) break;
+            if (e.inode != 0 and e.name_len == name.len) {
+                const ent_name = dir_buf[off + 8 .. off + 8 + e.name_len];
+                if (std.mem.eql(u8, ent_name, name)) {
+                    if (prev_off < 0) {
+                        // First entry in block — null its inode but keep rec_len so
+                        // the dir walker still strides past it.
+                        e.inode = 0;
+                    } else {
+                        // Merge: prev.rec_len absorbs this entry's slot.
+                        const prev_e = std.mem.bytesAsValue(layout.DirEntry, dir_buf[@intCast(prev_off) .. @as(usize, @intCast(prev_off)) + 8]);
+                        prev_e.rec_len += e.rec_len;
+                    }
+                    const phys = inode.blockMapLookup(dir_ino, lblock) orelse return false;
+                    return block.writeBlock(m, phys, dir_buf[0..bs]);
+                }
+            }
+            prev_off = @intCast(off);
+            off += e.rec_len;
+        }
+    }
+    return false;
+}
+
+/// Reset an existing file's logical size to zero AND release every data /
+/// indirect-tree block back to the bitmap. After this the file is empty
+/// AND occupies zero physical blocks — the next write re-allocates via
+/// ensurePhysicalBlock. Used by VFS open(O_TRUNC) and (future) unlink.
 pub fn truncate(inum: u32) bool {
+    const m = block.getMount() orelse return false;
     var ino = inode.readInode(inum) orelse return false;
     if (!inode.isReg(&ino)) return false;
+    inode.freeAllBlocks(m, &ino);
     ino.size = 0;
     ino.dir_acl = 0; // size-high bits, kept in sync
+    const sec: u32 = @truncate(time.now().sec);
+    ino.mtime = sec;
+    ino.ctime = sec;
     return inode.writeInode(inum, &ino);
 }
 

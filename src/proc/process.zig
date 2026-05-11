@@ -121,6 +121,16 @@ pub const PCB = struct {
     fd_table: [MAX_FDS]FileDesc = initFdTable(),
     // Sleep support
     wake_tick: u64 = 0,
+    // Race-free wake handshake. wake() sets this BEFORE clearing wait_kind /
+    // setStating .ready, so a blockOn that just set wait_kind but hasn't yet
+    // setState(.sleeping) can detect the race after setState and roll back.
+    // Without this, the wake() can land between blockOn's wait_kind store and
+    // its setState — wake clears wait_kind and sees state==.running (no-op),
+    // then blockOn's setState sleeps the task with no waker. Reproduced as
+    // "shell stops accepting input after a few keystrokes" / "calc clicks
+    // dead" — both apps eventually call blockOn (via pipe.read or sysSleep)
+    // and lose a wake to this race. Atomic for cross-CPU visibility.
+    wake_pending: bool = false,
     // Process name (for window titles / icon matching)
     name: [16]u8 = [_]u8{0} ** 16,
     name_len: u8 = 0,
@@ -287,18 +297,26 @@ pub const PCB = struct {
     exit_requested: bool = false,
 
     // --- CFS-style vruntime (scheduler rewrite, post-Phase 7) -------------
-    // Accumulated CPU "fair-share" time in ticks. Bumped by checkPreempt
-    // each tick this PCB is currently running (uniform weight = 1 for now;
-    // a future nice/weight implementation would scale the increment).
-    // Pickers select the lowest vruntime within each priority band. Per-
-    // band min_vruntime tracks the floor so newly-woken tasks can be
-    // bumped near the front of the line via the SLEEPER_CREDIT bonus.
+    // Accumulated CPU "fair-share" time in ticks. Bumped by accountRunningTick
+    // each tick this PCB is currently running, scaled by the inverse of its
+    // weight so that lower-nice (higher-priority) tasks accumulate vruntime
+    // slower → get picked more often within their band. Pickers select the
+    // lowest vruntime within each priority band.
     vruntime: u64 = 0,
     // Tick at which the current run-slice began (set by schedule() when
     // this PCB transitions to .running). On the next preempt or
     // checkPreempt firing, `tick_count - slice_start_tick` is the slice
     // length used for ideal_runtime gating.
     slice_start_tick: u64 = 0,
+    // Linux-style nice value, range -20..19 (defaults to 0). Lower = more
+    // CPU share, higher = less. Maps to a weight via NICE_WEIGHTS; vruntime
+    // increment per tick = NICE_0_WEIGHT / weight[20+nice]. So nice=-20
+    // (weight 88761) consumes vruntime ~12× slower than nice=0 (weight
+    // 1024); nice=19 (weight 15) consumes ~68× faster. Within a priority
+    // band, this lets userspace fine-tune CPU share without changing the
+    // band. setpriority(#47) still picks the BAND; sysSetNice (#101) picks
+    // the WEIGHT within the band.
+    nice: i8 = 0,
 
     // --- Accounting (process accounting infra) ----------------------------
     // Counters maintained by scheduler / page-fault handler / syscall
@@ -513,6 +531,31 @@ const SCHED_LATENCY: u64 = 6;
 const MIN_GRANULARITY: u64 = 1;
 const SLEEPER_CREDIT: u64 = 3;
 
+/// Linux-style nice → weight table (kernel/sched/core.c sched_prio_to_weight[]).
+/// Indexed by `nice + 20` (so range -20..19 maps to indices 0..39).
+/// The ratio between adjacent nice levels is ~1.25 (so each nice level changes
+/// CPU share by ~25%), and nice=0 has weight NICE_0_WEIGHT (1024 on Linux —
+/// our canonical "1 unit of vruntime per tick" baseline).
+const NICE_0_WEIGHT: u64 = 1024;
+const NICE_WEIGHTS = [40]u64{
+    // nice -20..-11
+    88761, 71755, 56483, 46273, 36291, 29154, 23254, 18705, 14949, 11916,
+    // nice -10..-1
+     9548,  7620,  6100,  4904,  3906,  3121,  2501,  1991,  1586,  1277,
+    // nice 0..9
+     1024,   820,   655,   526,   423,   335,   272,   215,   172,   137,
+    // nice 10..19
+      110,    87,    70,    56,    45,    36,    29,    23,    18,    15,
+};
+
+/// Map a nice value (-20..19, clamped) to its weight. Out-of-range nice is
+/// clamped to the nearest endpoint.
+inline fn niceToWeight(nice: i8) u64 {
+    const clamped: i8 = if (nice < -20) -20 else if (nice > 19) 19 else nice;
+    const idx: usize = @intCast(@as(i32, clamped) + 20);
+    return NICE_WEIGHTS[idx];
+}
+
 /// Cursor kept around for diagnostic continuity; load-balancer-driven
 /// assignInitialCpu picks min effective load now, no round-robin needed.
 var next_assignment_cpu: u8 = 0;
@@ -636,16 +679,19 @@ pub fn migrate(pid: u8, new_cpu: u8) bool {
         removed = true;
     }
     if (removed) {
-        // CFS vruntime translation: subtract the source band's floor and
-        // add the destination's. Preserves the task's "fairness debt"
-        // relative to its new rq (Linux place_entity-style). Without
-        // this, a task migrated onto an empty rq would either steal
-        // CPU forever (its vruntime is huge relative to floor=0) or
-        // get starved (vruntime tiny relative to a hot rq's floor).
+        // CFS vruntime translation: preserve the task's "fairness debt"
+        // (lag above the source floor) and re-anchor on the destination
+        // floor. Linux place_entity-style. Saturating subtract: if
+        // vruntime < old_floor (e.g., a task that fell behind while
+        // sleeping), treat lag as 0 — the task is effectively at the
+        // floor anyway. Without saturation, wrapping `-%` underflows
+        // to ~u64-max and the task gets stuck never being picked
+        // (vruntime > everyone else's, picker always passes it over).
         const band: usize = @intFromEnum(pcb.priority);
         const old_floor = old_rq.min_vruntime[band];
         const new_floor = new_rq.min_vruntime[band];
-        pcb.vruntime = pcb.vruntime -% old_floor +% new_floor;
+        const lag: u64 = if (pcb.vruntime > old_floor) pcb.vruntime - old_floor else 0;
+        pcb.vruntime = new_floor +% lag;
 
         const target_q = switch (pcb.priority) {
             .interactive => &new_rq.interactive,
@@ -655,6 +701,11 @@ pub fn migrate(pid: u8, new_cpu: u8) bool {
         target_q.pushBack(pid);
         new_rq.nr_runnable +%= 1;
     }
+
+    // Migration accounting (exposed via /proc/sched). Bump under both
+    // rq locks so /proc/sched readers see a coherent in/out pair.
+    smp.cpus[old_cpu].migrations_out +%= 1;
+    smp.cpus[new_cpu].migrations_in +%= 1;
 
     pcb.assigned_cpu = new_cpu;
     return true;
@@ -839,8 +890,16 @@ fn rqEnter(pid: usize, from_sleep: bool) void {
     } else if (from_sleep) {
         // Sleeper bonus: bump near floor so the woken task gets to run
         // soon, but cap at its own historical vruntime so a long-running
-        // task that briefly slept doesn't get a free reset.
-        const credited = floor -% SLEEPER_CREDIT;
+        // task that briefly slept doesn't get a free reset. Saturating
+        // subtract: if floor < SLEEPER_CREDIT (e.g., a band that hasn't
+        // been touched yet — interactive on cpu1 before any task ran
+        // there), credited stays at 0. Wrapping `-%` would underflow to
+        // ~u64-max and immediately set vruntime to that, starving the
+        // task forever (picker always sees it as worst-vruntime). This
+        // bug surfaced as "editor stops accepting input after a few
+        // chars" once the editor migrated to cpu1 and tried to wake
+        // there.
+        const credited: u64 = if (floor > SLEEPER_CREDIT) floor - SLEEPER_CREDIT else 0;
         if (pcb.vruntime < credited) pcb.vruntime = credited;
     }
     // Demote-to-ready (state .running → .ready in schedule()) leaves
@@ -892,8 +951,30 @@ pub fn setState(pid: usize, new_state: State) void {
     if (pid >= MAX_PROCS) return;
     const pcb = &procs[pid];
     const state_ptr: *u8 = @as(*u8, @ptrCast(&pcb.state));
-    const old_byte = @atomicLoad(u8, state_ptr, .acquire);
-    if (old_byte == @intFromEnum(new_state)) return;
+
+    // Atomically claim the state transition via CAS. Without this, two
+    // concurrent setState calls (e.g., cpu0's wakeExpired doing
+    // .sleeping→.ready while cpu1's killProcess does .running→.zombie)
+    // could both pass the load-then-decide check based on the same
+    // pre-transition state, then race in the rq op block: rqLeave runs
+    // before rqEnter, finds no entry to remove, doesn't decrement, then
+    // rqEnter adds and increments → permanent nr_runnable / queue
+    // drift, and the pid gets stuck in .ready but invisible to the
+    // picker (or vice versa).
+    //
+    // The CAS loop ensures exactly one setState call wins each transition
+    // for a given old→new pair. Concurrent calls either find their
+    // expected-old already changed and return (no-op) or retry. After
+    // the CAS succeeds, only THIS caller does the rq ops for THIS
+    // specific old→new transition.
+    var old_byte: u8 = @atomicLoad(u8, state_ptr, .acquire);
+    const new_byte: u8 = @intFromEnum(new_state);
+    while (true) {
+        if (old_byte == new_byte) return; // already in this state
+        const cas = @cmpxchgStrong(u8, state_ptr, old_byte, new_byte, .acq_rel, .acquire);
+        if (cas == null) break; // we own this transition
+        old_byte = cas.?;        // someone else changed state — retry with their value
+    }
     const old_state: State = @enumFromInt(old_byte);
     const was_ready = (old_state == .ready);
     const is_ready = (new_state == .ready);
@@ -906,15 +987,11 @@ pub fn setState(pid: usize, new_state: State) void {
     // CFS: leaving .running for ANY reason (.ready preempt, .sleeping
     // block, .zombie exit) is a slice-end. Flush accumulated ticks
     // into vruntime now so the next picker sees a fair value.
-    // Schedule() calls accountRunningTick directly for the .running→
-    // .ready path; this catches all other exits (blockOn, sysExit,
-    // killProcess) without each callsite re-implementing it.
     if (old_state == .running and new_state != .running) {
         accountRunningTick(pid, false);
     }
 
     if (was_ready and !is_ready) rqLeave(pid);
-    @atomicStore(u8, state_ptr, @intFromEnum(new_state), .release);
     if (!was_ready and is_ready) {
         rqEnter(pid, from_sleep);
         maybePreemptOnWake(pid);
@@ -942,6 +1019,10 @@ fn accountRunningTick(pid: usize, commit_slice_start: bool) void {
         return;
     }
     const delta = now - start;
+    // TRIAGE: nice scaling temporarily disabled — just bump vruntime by
+    // delta to isolate whether the multiply/divide was the problem.
+    // const weight = niceToWeight(pcb.nice);
+    // const weighted_delta = (delta * NICE_0_WEIGHT) / weight;
     pcb.vruntime +%= delta;
     if (commit_slice_start) pcb.slice_start_tick = now;
 
@@ -1813,7 +1894,19 @@ pub fn pickNext(exclude_pid: ?u8) ?usize {
 // writing to a corpse PCB. That guard catches anything this IPI sync misses.
 var kill_kick_vector: ?u8 = null;
 
+/// Per-CPU kill-kick (and any wake-IPI reusing this vector) receive count.
+/// Read by debug CLI to compare against virtio_gpu_wake_ipis_sent — if
+/// sent grows but receive doesn't grow on cpu1, IPI delivery is broken
+/// under the current hypervisor. If both grow but cube still hangs, the
+/// broken link is later in the schedule()/iretq path.
+pub var kick_handler_runs: [smp.MAX_CPUS]u64 = blk: {
+    var x: [smp.MAX_CPUS]u64 = undefined;
+    for (&x) |*c| c.* = 0;
+    break :blk x;
+};
 fn killKickHandler() callconv(.c) void {
+    const cpu_id = smp.myCpu().cpu_id;
+    if (cpu_id < smp.MAX_CPUS) kick_handler_runs[cpu_id] +%= 1;
     // Receiving CPU: force a reschedule. The currently-running task may be
     // the kill target — schedule() will demote it through the normal path
     // and pick anything else (idle if nothing's ready). After this, the
@@ -1834,6 +1927,53 @@ pub fn initKillKickIpi() void {
     idt.registerIrq(v, killKickHandler);
     kill_kick_vector = v;
     debug.klog("[kill] IPI vector 0x{X} registered for kill-kick\n", .{v});
+}
+
+/// Expose the kill-kick vector to non-process callers (e.g. drivers
+/// wanting to wake other CPUs from `sti; hlt`). Returns null before
+/// `initKillKickIpi()` has run.
+pub fn kickVector() ?u8 {
+    return kill_kick_vector;
+}
+
+// =============================================================================
+// Wake-only IPI vector — distinct from kill-kick because the latter calls
+// schedule() which demotes the receiver's current task. For "wake the CPU
+// out of hlt so it re-checks an in-memory flag" (e.g. virtio-gpu completion
+// while a syscall waits in sti+hlt) we need the OPPOSITE: do not preempt
+// the woken task; let iretq restore its hlt+1 RIP and let the wait loop
+// re-poll. A no-op handler does exactly that.
+// =============================================================================
+
+var wake_ipi_vector: ?u8 = null;
+pub var wake_handler_runs: [smp.MAX_CPUS]u64 = blk: {
+    var x: [smp.MAX_CPUS]u64 = undefined;
+    for (&x) |*c| c.* = 0;
+    break :blk x;
+};
+fn wakeOnlyHandler() callconv(.c) void {
+    const cpu_id = smp.myCpu().cpu_id;
+    if (cpu_id < smp.MAX_CPUS) wake_handler_runs[cpu_id] +%= 1;
+    // Intentionally empty — the IRQ delivery itself is the work. By NOT
+    // calling schedule(), we don't demote the receiver's current task.
+    // iretq pops the original kernel frame; if the receiver was in hlt,
+    // execution resumes at hlt+1 and any wait loop above re-checks its
+    // condition.
+}
+
+pub fn initWakeIpi() void {
+    const idt = @import("../cpu/idt.zig");
+    const v = idt.allocDynVector() orelse {
+        debug.klog("[wake] no dyn vector free — wake-IPI disabled\n", .{});
+        return;
+    };
+    idt.registerIrq(v, wakeOnlyHandler);
+    wake_ipi_vector = v;
+    debug.klog("[wake] IPI vector 0x{X} registered for wake-only\n", .{v});
+}
+
+pub fn wakeVector() ?u8 {
+    return wake_ipi_vector;
 }
 
 /// Block until no CPU has `cpu.current_pid == pid`. Used by killProcess
@@ -1914,6 +2054,11 @@ pub fn schedule() void {
     // outgoing task's iretq frame got scribbled before we got here, we
     // catch it with schedule on the call stack.
     @import("../debug/iretq_canary.zig").check(@src());
+
+    // Per-CPU schedule counter (exposed via /proc/sched). Done before
+    // the audit / exit_requested branches so callers that bail early
+    // still count toward "this cpu reached schedule()".
+    smp.myCpu().schedule_count +%= 1;
 
     // Phase 1 rq audit (drift detector). Run every 64th schedule call so
     // it stays off the hot path — the audit itself is cheap (sum of
@@ -2169,11 +2314,61 @@ pub fn wakeExpired() void {
             and procs[i].wake_tick != 0
             and tick_count >= procs[i].wake_tick)
         {
-            setState(i, .ready);
+            // ORDER MATTERS: clear wake_tick BEFORE setState. setState
+            // routes through rqEnter — once the pid is in the rq, an AP
+            // (or this CPU on its next schedule()) can pick it, dispatch
+            // it, run it, and call sysSleep AGAIN (fresh wake_tick) all
+            // before our `wake_tick = 0` line if it came after setState.
+            // That clobbers the fresh wake_tick to 0 → orphan sleep on
+            // the NEXT block. Reproduced as "shell freezes after a few
+            // keystrokes" — shell wakes from sysSleep, runs briefly,
+            // calls pipe.read → blockOn, then wakeExpired's stale
+            // wake_tick=0 store hits AFTER the new sleep. Clearing
+            // wake_tick first means the worst-case race re-wakes us on
+            // the next tick (we'd be sleeping with wake_tick=0 briefly,
+            // skipped by wakeExpired guard, but the fresh sysSleep would
+            // overwrite it before any harm).
             procs[i].wake_tick = 0;
+            setState(i, .ready);
+        } else if (procs[i].state == .sleeping
+            and tick_count -% wake_dbg_last_log >= 200)
+        {
+            // DBG: this PCB is sleeping but wakeExpired isn't waking it.
+            // Three cases — all suspect:
+            //   (a) wait_kind=.none AND wake_tick=0  : orphan sleep — no
+            //       waker registered. Likely a wake-races-blockOn race
+            //       where wake() ran before blockOn() set wait_kind, so
+            //       wake cleared wait_kind=.none then state was set to
+            //       .sleeping with no further waker.
+            //   (b) wait_kind=.none AND wake_tick>now : sleep still pending
+            //       (legitimate). Logged for completeness.
+            //   (c) wait_kind!=.none (pipe/futex/waitpid/etc) AND no wake
+            //       observed for >200 ticks : the explicit-waker path
+            //       (pipe.write→process.wake / futex_wake / etc) didn't
+            //       fire OR raced against blockOn the same way as (a).
+            if (procs[i].wait_kind == .none) {
+                if (procs[i].wake_tick == 0) {
+                    debug.klog("[wake-skip] pid={d} state=sleeping wait=none wake_tick=0 (orphan sleep)\n", .{i});
+                    wake_dbg_last_log = tick_count;
+                } else if (tick_count < procs[i].wake_tick) {
+                    debug.klog("[wake-skip] pid={d} state=sleeping wait=none wake_tick={d} now={d} delta_future={d}\n", .{
+                        i, procs[i].wake_tick, tick_count, procs[i].wake_tick - tick_count,
+                    });
+                    wake_dbg_last_log = tick_count;
+                }
+            } else {
+                // wait_kind != .none — explicit waker should fire. Log so
+                // we can correlate against pipe/futex/waitpid event flow.
+                debug.klog("[wake-skip] pid={d} state=sleeping wait_kind={d} wait_target=0x{x} (explicit waker not firing)\n", .{
+                    i, @intFromEnum(procs[i].wait_kind), procs[i].wait_target,
+                });
+                wake_dbg_last_log = tick_count;
+            }
         }
     }
 }
+
+var wake_dbg_last_log: u64 = 0;
 
 /// Deliver SIGALRM to any process whose `alarm()` deadline has come due.
 /// Called from the BSP timer IRQ alongside wakeExpired. Per-process — each
@@ -2226,20 +2421,54 @@ pub fn kernelSleepMs(ms: u32) void {
 pub fn blockOn(kind: WaitKind, target: u32) void {
     const cur = smp.myCpu().current_pid orelse return;
     const pcb = &procs[cur];
+    // Wake-pending handshake. Clear FIRST so any wake() that runs strictly
+    // after this point sets the flag and is observed by the re-check below.
+    @atomicStore(bool, &pcb.wake_pending, false, .release);
     pcb.wait_kind = kind;
     pcb.wait_target = target;
     setState(cur, .sleeping);
+    // Race check: did a wake() land between our wake_pending=false and the
+    // setState above? If so, the wake's clear-of-wait_kind and the setState
+    // (.sleeping) check raced; either way, the wake event has been delivered
+    // and we must NOT yield, or this task sleeps with no further waker. Roll
+    // back to .running and return as if no block happened.
+    if (@atomicLoad(bool, &pcb.wake_pending, .acquire)) {
+        pcb.wait_kind = .none;
+        pcb.wait_target = 0;
+        setState(cur, .running);
+        if (cur < 8) blockon_dbg_rollback +%= 1;
+        return;
+    }
+    if (cur < 8) {
+        blockon_dbg_yield +%= 1;
+        // Rate-limited: log entry so we can correlate against later wake-skip
+        if (tick_count -% blockon_dbg_last_log >= 200) {
+            blockon_dbg_last_log = tick_count;
+            debug.klog("[blockOn] pid={d} kind={d} target=0x{x} yields={d} rollbacks={d}\n", .{
+                cur, @intFromEnum(kind), target, blockon_dbg_yield, blockon_dbg_rollback,
+            });
+        }
+    }
     smp.myCpu().pending_soft_yield = true;
     @import("sched_asm.zig").softYield();
     pcb.wait_kind = .none;
     pcb.wait_target = 0;
 }
 
+var blockon_dbg_yield: u64 = 0;
+var blockon_dbg_rollback: u64 = 0;
+var blockon_dbg_last_log: u64 = 0;
+
 /// Called by pipe.write when waking a blocked reader, by pipe.read when waking
 /// a blocked writer, and by killProcess/destroyCurrent when waking a parent
 /// blocked in waitpid.
 pub fn wake(pid: u8) void {
     if (pid >= MAX_PROCS) return;
+    // Set wake_pending BEFORE clearing wait_kind / setStating .ready so a
+    // racing blockOn (running on the target's own CPU between its wait_kind
+    // store and its setState) can detect us via the re-check after setState.
+    // Without this, the wake is silently lost and the task sleeps forever.
+    @atomicStore(bool, &procs[pid].wake_pending, true, .release);
     procs[pid].wait_kind = .none;
     procs[pid].wait_target = 0;
     // pipe.read / pipe.write park themselves with state=.sleeping so the
@@ -3008,6 +3237,27 @@ pub fn prefaultUserRange(addr: usize, len: usize) void {
 /// Phase 3: each PTE address is a *physical* frame number — dereferencing it
 /// directly used to work via the legacy PML4[0] low identity. After the
 /// drop, every walk hop must go through the kernel physmap.
+/// True if every 4 KB page in [addr, addr+len) of the current process's
+/// address space has a present USER PTE (or sits under an inherited 1GB/2MB
+/// page). Use after `prefaultUserRange` to confirm a user pointer is safe
+/// to dereference from kernel context — prefault only maps pages registered
+/// in lazy_regions, leaving pointers to scratch user VAs unmapped, and the
+/// kernel's bare `@memcpy` then page-faults. validateUserPtr in syscall.zig
+/// chains prefault → this helper to refuse the call cleanly.
+pub fn allCurrentUserPagesMapped(addr: usize, len: usize) bool {
+    if (len == 0) return true;
+    const cur = smp.myCpu().current_pid orelse return false;
+    const pcb = &procs[cur];
+    const pd = pcb.page_directory orelse return false;
+
+    var page = addr & ~@as(usize, 0xFFF);
+    const end = addr + len;
+    while (page < end) : (page += 0x1000) {
+        if (!pageHasRealMapping(pd, page)) return false;
+    }
+    return true;
+}
+
 fn pageHasRealMapping(pml4: [*]align(4096) u64, va: usize) bool {
     const PRESENT: u64 = 1;
     const USER: u64 = 1 << 2;

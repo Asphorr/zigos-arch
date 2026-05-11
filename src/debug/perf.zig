@@ -33,6 +33,11 @@ pub const Phase = enum(u8) {
     comp_fill_src,
     comp_vk_render,
     comp_corner_blit,
+    /// Compositor's per-frame flushUnconditional call. Separate from
+    /// global flush_rect so we can see if it's actually blocking on
+    /// host vblank (~16ms) or returning instantly (the latter would
+    /// be a tearing source — comment claims vsync, code may differ).
+    comp_flush,
 };
 
 const PHASE_COUNT: usize = @typeInfo(Phase).@"enum".fields.len;
@@ -51,6 +56,7 @@ pub const phase_name: [PHASE_COUNT][]const u8 = .{
     "comp_fill_src",
     "comp_vk_render",
     "comp_corner_blit",
+    "comp_flush",
 };
 
 pub const Counter = struct {

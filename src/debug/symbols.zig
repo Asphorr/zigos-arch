@@ -170,9 +170,42 @@ pub fn resolveKernel(addr: u64) ?ResolveResult {
     return resolve(&table, addr);
 }
 
+/// Find the symbol with the largest `entry.addr <= addr`, even when addr
+/// falls past that symbol's known range (typical for compiler-generated
+/// panic trampolines: `call outOfBounds` / `call integerOverflow` /
+/// `call incorrectAlignment` clusters get emitted AFTER the function
+/// epilogue and aren't covered by the function's `entry.size`). Returns
+/// null only when addr precedes every known symbol. Caller is expected
+/// to bound the offset (a 100 KB offset isn't really "near" anything).
+pub fn resolveKernelNearest(addr: u64) ?ResolveResult {
+    const table = kernel_table orelse return null;
+    return nearest(&table, addr);
+}
+
 /// Resolve a user address using a per-process symbol table
 pub fn resolveUser(table: *const SymTable, addr: u64) ?ResolveResult {
     return resolve(table, addr);
+}
+
+fn nearest(table: *const SymTable, addr: u64) ?ResolveResult {
+    if (table.count == 0) return null;
+    const entries = table.entries[0..table.count];
+
+    var lo: u32 = 0;
+    var hi: u32 = table.count;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (entries[mid].addr <= addr) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    if (lo == 0) return null;
+    const idx = lo - 1;
+    const entry = entries[idx];
+    const name = getName(table, entry.name_off);
+    return .{ .name = name, .offset = addr - entry.addr };
 }
 
 /// Binary search: find the largest entry.addr <= target. Returns the result

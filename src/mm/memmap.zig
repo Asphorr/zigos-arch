@@ -42,8 +42,15 @@ pub const KERNEL_VIRT_BASE: usize = 0xFFFFFFFF80000000;
 /// 0..PHYSMAP_SIZE at VA `PHYSMAP_BASE..PHYSMAP_BASE+PHYSMAP_SIZE`. The
 /// canonical "kernel can read/write any phys frame" view in Phase 2+. Use
 /// `paging.physToVirt(p)` rather than the bare constant whenever possible.
+///
+/// Sized to cover the full 512 GB span addressable by one PML4 slot (one
+/// 4 KB PDPT page = 512 × 1 GB entries). Smaller windows leave high-phys
+/// MMIO BARs unmapped (e.g. xHCI BAR at ~481 GB under `-cpu host` with
+/// 39-bit maxphyaddr) and the bare physToVirt() result page-faults.
+/// `pdpt_physmap` in src/boot/boot.asm and uefi/uefi_boot.zig must fill
+/// all 512 entries to match.
 pub const PHYSMAP_BASE: usize = 0xFFFF800000000000;
-pub const PHYSMAP_SIZE: usize = 0x1000000000; // 64 GB
+pub const PHYSMAP_SIZE: usize = 0x8000000000; // 512 GB (full PML4 slot)
 
 extern var _kernel_end: u8;
 

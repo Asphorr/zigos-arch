@@ -4,8 +4,10 @@
 //   PID    process slot id (matches what waitpid / kill take)
 //   PPID   parent process slot id (0 = kernel-spawned)
 //   STATE  unused / ready / running / sleep / zombie
-//   PRIO   background / normal / interactive
+//   PRIO   background / normal / interactive (CFS priority band)
+//   NI     nice value (-20..+19; lower = more CPU share within band)
 //   CPU    last CPU the process was scheduled on
+//   PIN    sched_setaffinity pin (cN if pinned, '-' if unpinned)
 //   CPU%   lifetime CPU usage (cpu_ticks / process_uptime_ticks)
 //   PF     user-mode page faults handled
 //   SYS    total syscalls dispatched
@@ -40,6 +42,65 @@ fn padField(s: []const u8, width: usize) void {
         var i: usize = s.len;
         while (i < width) : (i += 1) libc.printChar(' ');
     }
+}
+
+fn padSignedNice(nice: i8, width: usize) void {
+    var buf: [4]u8 = undefined;
+    var len: usize = 0;
+    var v: u32 = if (nice < 0) @intCast(@as(i32, -@as(i32, nice))) else @intCast(@as(i32, nice));
+    if (nice < 0) {
+        buf[0] = '-';
+        len = 1;
+    } else if (nice > 0) {
+        buf[0] = '+';
+        len = 1;
+    }
+    if (v == 0) {
+        buf[len] = '0';
+        len += 1;
+    } else {
+        var tmp: [3]u8 = undefined;
+        var t: usize = 0;
+        while (v > 0) : (t += 1) {
+            tmp[t] = '0' + @as(u8, @intCast(v % 10));
+            v /= 10;
+        }
+        var k: usize = 0;
+        while (k < t) : (k += 1) {
+            buf[len] = tmp[t - 1 - k];
+            len += 1;
+        }
+    }
+    if (len < width) {
+        var i: usize = len;
+        while (i < width) : (i += 1) libc.printChar(' ');
+    }
+    libc.print(buf[0..len]);
+}
+
+fn padPin(pinned_cpu: u8, width: usize) void {
+    var buf: [4]u8 = undefined;
+    var len: usize = 0;
+    if (pinned_cpu == 0xFF) {
+        buf[0] = '-';
+        len = 1;
+    } else {
+        buf[0] = 'c';
+        len = 1;
+        if (pinned_cpu < 10) {
+            buf[1] = '0' + pinned_cpu;
+            len = 2;
+        } else {
+            buf[1] = '0' + (pinned_cpu / 10);
+            buf[2] = '0' + (pinned_cpu % 10);
+            len = 3;
+        }
+    }
+    if (len < width) {
+        var i: usize = len;
+        while (i < width) : (i += 1) libc.printChar(' ');
+    }
+    libc.print(buf[0..len]);
 }
 
 fn padNum(n: u32, width: usize) void {
@@ -106,7 +167,9 @@ export fn _start() linksection(".text.entry") callconv(.c) void {
     padField("PPID", 5);
     padField("STATE", 8);
     padField("PRIO", 5);
+    padField("NI", 4);
     padField("CPU", 4);
+    padField("PIN", 4);
     padField("CPU%", 5);
     padField("PF", 6);
     padField("SYS", 7);
@@ -133,7 +196,11 @@ export fn _start() linksection(".text.entry") callconv(.c) void {
         libc.print("\x1b[0m ");
         padField(prioName(p.priority), 4);
         libc.printChar(' ');
+        padSignedNice(p.nice, 3);
+        libc.printChar(' ');
         padNum(p.last_cpu, 3);
+        libc.printChar(' ');
+        padPin(p.pinned_cpu, 3);
         libc.printChar(' ');
 
         // CPU% = cpu_ticks / process_uptime_ticks * 100. Process uptime

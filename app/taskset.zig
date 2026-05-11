@@ -120,19 +120,20 @@ fn cmdSpawn(cpu: i32, prog_argv_start: u32) void {
         libc.exit();
     }
     if (r == 0) {
-        // Child — pin self to the requested CPU, then exec.
-        // Pinning before exec means the new program lands on the right
-        // CPU on its first dispatch (sysExec preserves pgid/sid; affinity
-        // is on the PCB which is the same slot, so it's preserved too).
+        // Child — pin self to the requested CPU, then exec. sysExec is
+        // posix_spawn-style: the kernel inherits our pinned_cpu into the
+        // new program's PCB (handled in sysExec), so by setting affinity
+        // on self BEFORE exec, the spawned program lands on the right
+        // CPU. After exec returns we exit so the shell's waitpid on this
+        // wrapper returns; the spawned grandchild runs independently.
         if (libc.sched_setaffinity(0, cpu) != 0) {
             libc.print("taskset: child sched_setaffinity failed\n");
             libc.exit();
         }
         const ec = libc.exec(exec_buf[0..written]);
-        // Only reached if exec failed.
-        libc.print("taskset: exec failed (rc=");
-        printU32(ec);
-        libc.print(")\n");
+        if (ec == 0xFFFFFFFF) {
+            libc.print("taskset: exec failed (program not found?)\n");
+        }
         libc.exit();
     }
     // Parent — wait for child so the shell sees the right exit status.

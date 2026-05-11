@@ -54,6 +54,22 @@ pub const CMD_vkCreateBuffer: u32 = 50;
 pub const CMD_vkCmdCopyImageToBuffer: u32 = 116;
 pub const CMD_vkSetReplyCommandStreamMESA: u32 = 178;
 pub const CMD_vkSeekReplyCommandStreamMESA: u32 = 179;
+pub const CMD_vkExecuteCommandStreamsMESA: u32 = 180;
+pub const CMD_vkCreateRingMESA: u32 = 188;
+pub const CMD_vkDestroyRingMESA: u32 = 189;
+pub const CMD_vkNotifyRingMESA: u32 = 190;
+pub const CMD_vkWriteRingExtraMESA: u32 = 191;
+pub const CMD_vkGetMemoryResourcePropertiesMESA: u32 = 192;
+pub const CMD_vkResetFenceResourceMESA: u32 = 244;
+pub const CMD_vkWaitSemaphoreResourceMESA: u32 = 245;
+pub const CMD_vkImportSemaphoreResourceMESA: u32 = 246;
+pub const CMD_vkSubmitVirtqueueSeqnoMESA: u32 = 251;
+pub const CMD_vkWaitVirtqueueSeqnoMESA: u32 = 252;
+pub const CMD_vkWaitRingSeqnoMESA: u32 = 253;
+pub const CMD_vkCopyImageToMemoryMESA: u32 = 297;
+pub const CMD_vkCopyMemoryToImageMESA: u32 = 298;
+pub const CMD_vkWriteSamplerDescriptorMESA: u32 = 335;
+pub const CMD_vkWriteResourceDescriptorMESA: u32 = 336;
 
 pub const CMD_FLAG_GENERATE_REPLY: u32 = 0x00000001;
 
@@ -168,6 +184,235 @@ pub const CmdStream = struct {
         self.pos = 0;
     }
 };
+
+// ============================================================================
+// MESA extension encoders (Venus-specific protocol commands)
+// ============================================================================
+
+/// One sub-stream reference for `vkExecuteCommandStreamsMESA`. Points at
+/// a region inside a SHM-backed virtio-gpu resource that contains an
+/// already-encoded Venus command stream. Wire layout: u32 resourceId +
+/// size_t offset + size_t size (size_t = u64 in our ABI).
+pub const CommandStreamDesc = struct {
+    resource_id: u32,
+    offset: u64,
+    size: u64,
+};
+
+/// Run multiple pre-built Venus command streams in one Venus dispatch.
+/// Each `streams[i]` references a (resource_id, offset, size) tuple
+/// pointing at a SHM-backed virtio-gpu resource that already holds an
+/// encoded Venus command stream. The host's dispatch decoder runs each
+/// stream's commands in order.
+///
+/// For the compositor's setup path we use simpler in-place scratch_cs
+/// batching (multiple encoded commands in one stream, one submit) which
+/// is equivalent to vkExecuteCommandStreamsMESA but doesn't require
+/// allocating separate SHM resources. This encoder is here for future
+/// uses: e.g. pre-recorded per-frame streams that get triggered many
+/// times without re-encoding.
+pub fn encodeExecuteCommandStreams(
+    cs: *CmdStream,
+    streams: []const CommandStreamDesc,
+    flags: u32,
+) void {
+    cs.cmdHeader(CMD_vkExecuteCommandStreamsMESA, 0);
+    cs.writeU32(@intCast(streams.len));
+    // pStreams: array of VkCommandStreamDescriptionMESA
+    cs.writePresent();
+    cs.writeU64(streams.len);
+    for (streams) |s| {
+        cs.writeU32(s.resource_id);
+        cs.writeU64(s.offset);
+        cs.writeU64(s.size);
+    }
+    cs.writeNull(); // pReplyPositions = NULL (no per-stream reply offsets)
+    cs.writeU32(0); // dependencyCount
+    cs.writeNull(); // pDependencies = NULL
+    cs.writeU32(flags); // VkCommandStreamExecutionFlagsMESA
+}
+
+pub const VK_STRUCTURE_TYPE_MEMORY_RESOURCE_PROPERTIES_MESA: u32 = 1000384001;
+pub const VK_STRUCTURE_TYPE_COPY_IMAGE_TO_MEMORY_INFO_MESA: u32 = 1000384003;
+pub const VK_STRUCTURE_TYPE_RING_CREATE_INFO_MESA: u32 = 1000384000;
+
+/// Register a Venus secondary command ring. The ring is a SHM-backed
+/// virtio-gpu resource laid out as:
+///   [head u32] [tail u32] [status u32] [buffer ...] [extra ...]
+/// at the offsets the caller supplies. After creation, the guest writes
+/// Venus commands to the buffer region at `tail` (atomically bumping
+/// tail), and the host has a dedicated thread that drains commands from
+/// `head` to `tail`. status is a bitmask of ALIVE/FATAL/IDLE.
+///
+/// Fire-and-forget at the protocol level (reply is just an ack — no
+/// fields). idleTimeout in microseconds; host thread sleeps after that
+/// many µs of an empty ring.
+pub fn encodeCreateRing(
+    cs: *CmdStream,
+    ring_id: u64,
+    resource_id: u32,
+    region_offset: u64,
+    region_size: u64,
+    idle_timeout_us: u64,
+    head_offset: u64,
+    tail_offset: u64,
+    status_offset: u64,
+    buffer_offset: u64,
+    buffer_size: u64,
+    extra_offset: u64,
+    extra_size: u64,
+) void {
+    cs.cmdHeader(CMD_vkCreateRingMESA, 0);
+    cs.writeU64(ring_id);
+    cs.writePresent(); // pCreateInfo
+    cs.writeU32(VK_STRUCTURE_TYPE_RING_CREATE_INFO_MESA);
+    cs.writeNull(); // pNext
+    cs.writeU32(0); // flags
+    cs.writeU32(resource_id);
+    cs.writeU64(region_offset);
+    cs.writeU64(region_size);
+    cs.writeU64(idle_timeout_us);
+    cs.writeU64(head_offset);
+    cs.writeU64(tail_offset);
+    cs.writeU64(status_offset);
+    cs.writeU64(buffer_offset);
+    cs.writeU64(buffer_size);
+    cs.writeU64(extra_offset);
+    cs.writeU64(extra_size);
+}
+
+pub fn encodeDestroyRing(cs: *CmdStream, ring_id: u64) void {
+    cs.cmdHeader(CMD_vkDestroyRingMESA, 0);
+    cs.writeU64(ring_id);
+}
+
+/// Wake the host's ring thread. Use after writing commands + bumping tail.
+/// Optional — the host thread polls but may sleep on `idle_timeout`; an
+/// explicit notify cuts wake latency to ~µs.
+pub fn encodeNotifyRing(cs: *CmdStream, ring_id: u64, seqno: u32, flags: u32) void {
+    cs.cmdHeader(CMD_vkNotifyRingMESA, 0);
+    cs.writeU64(ring_id);
+    cs.writeU32(seqno);
+    cs.writeU32(flags);
+}
+
+/// Write a u32 value into the ring's `extra` region at the given offset.
+/// Used for seqno completion tracking — host runs the cmds preceding
+/// this write, then writes the value. Guest polls extra[offset] to see
+/// when the seqno has been reached.
+pub fn encodeWriteRingExtra(cs: *CmdStream, ring_id: u64, offset: u64, value: u32) void {
+    cs.cmdHeader(CMD_vkWriteRingExtraMESA, 0);
+    cs.writeU64(ring_id);
+    cs.writeU64(offset);
+    cs.writeU32(value);
+}
+
+/// Block until the ring's seqno (in the extra region) reaches the given
+/// value. Host-side wait — saves a guest poll loop, but goes through
+/// ctrl_vq so it's only worth using when the wait is expected to be long.
+pub fn encodeWaitRingSeqno(cs: *CmdStream, ring_id: u64, seqno: u64) void {
+    cs.cmdHeader(CMD_vkWaitRingSeqnoMESA, CMD_FLAG_GENERATE_REPLY);
+    cs.writeU64(ring_id);
+    cs.writeU64(seqno);
+}
+
+/// Host-direct image → memory copy. Unlike vkCmdCopyImageToBuffer this
+/// is NOT a command buffer cmd — it's a synchronous Venus call, the
+/// host does the copy and writes the result inline into the reply
+/// stream's blob storage (allocated from the reply encoder, not a
+/// caller-provided pointer).
+///
+/// Caveat for our use case: the destination is the REPLY STREAM, not
+/// the scanout blob. To use this productively for the compositor's
+/// scanout path we'd need to either (a) make the reply stream large
+/// enough to hold a full frame (8MB at 1920×1080) AND switch it to
+/// point at the scanout blob before this call, or (b) kernel-memcpy
+/// from reply-stream → scanout-blob after the call. Neither is faster
+/// than the existing vkCmdCopyImageToBuffer path that writes directly
+/// into the scanout blob's memory (since the readback VkBuffer is
+/// bound to that same memory).
+///
+/// Keeping the encoder around for: vkCopyMemoryToImage-style uploads
+/// of small textures, debug dumps of host-only Vulkan resources, etc.
+pub fn encodeCopyImageToMemoryMESA(
+    cs: *CmdStream,
+    device_id: u64,
+    src_image_id: u64,
+    src_image_layout: u32,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    data_size: u64,
+) void {
+    cs.cmdHeader(CMD_vkCopyImageToMemoryMESA, CMD_FLAG_GENERATE_REPLY);
+    cs.writeU64(device_id);
+    // pCopyImageToMemoryInfo: full struct
+    cs.writePresent();
+    cs.writeU32(VK_STRUCTURE_TYPE_COPY_IMAGE_TO_MEMORY_INFO_MESA);
+    cs.writeNull(); // pNext
+    cs.writeU32(0); // flags
+    cs.writeU64(src_image_id);
+    cs.writeU32(src_image_layout);
+    cs.writeU32(0); // memoryRowLength = 0 (tightly packed)
+    cs.writeU32(0); // memoryImageHeight = 0
+    // VkImageSubresourceLayers
+    cs.writeU32(1); // aspectMask = COLOR
+    cs.writeU32(0); // mipLevel
+    cs.writeU32(0); // baseArrayLayer
+    cs.writeU32(1); // layerCount
+    // VkOffset3D
+    cs.writeU32(x);
+    cs.writeU32(y);
+    cs.writeU32(0); // z
+    // VkExtent3D
+    cs.writeU32(w);
+    cs.writeU32(h);
+    cs.writeU32(1); // depth
+    // dataSize + array_size (must match)
+    cs.writeU64(data_size);
+    cs.writeU64(data_size);
+}
+
+/// Query the memory properties of a virtio-gpu resource. Returns the
+/// memoryTypeBits mask — a bitmask of host memory types compatible with
+/// importing this resource. The reply encoder pattern is the same as
+/// vkCreateInstance: set CMD_FLAG_GENERATE_REPLY and read from the reply
+/// ring after submit. Reply layout:
+///   u32 cmd_type (192 = vkGetMemoryResourcePropertiesMESA_EXT)
+///   u32 VkResult
+///   u64 simple_pointer = 1
+///   u32 sType (must be 1000384001)
+///   u64 pNext = 0
+///   u32 memoryTypeBits  <-- this is what we want
+pub fn encodeGetMemoryResourceProperties(
+    cs: *CmdStream,
+    device_id: u64,
+    resource_id: u32,
+) void {
+    cs.cmdHeader(CMD_vkGetMemoryResourcePropertiesMESA, CMD_FLAG_GENERATE_REPLY);
+    cs.writeU64(device_id);
+    cs.writeU32(resource_id);
+    // pMemoryResourceProperties: partial struct (sType + pNext only)
+    cs.writePresent();
+    cs.writeU32(VK_STRUCTURE_TYPE_MEMORY_RESOURCE_PROPERTIES_MESA);
+    cs.writeNull(); // pNext
+}
+
+/// Parse the vkGetMemoryResourcePropertiesMESA reply from the reply ring.
+/// Returns (VkResult, memoryTypeBits). Caller must have zeroed and
+/// Seek(0)'d the reply ring before submit.
+pub fn readGetMemoryResourcePropertiesReply(ring: [*]volatile u8) struct { result: i32, type_bits: u32 } {
+    // ring[0..4]   = cmd_type (192)
+    // ring[4..8]   = VkResult
+    // ring[8..16]  = simple_pointer (= 1)
+    // ring[16..20] = sType
+    // ring[20..28] = pNext
+    // ring[28..32] = memoryTypeBits
+    const result_ptr: *align(1) const volatile i32 = @ptrCast(ring + 4);
+    const type_bits_ptr: *align(1) const volatile u32 = @ptrCast(ring + 28);
+    return .{ .result = result_ptr.*, .type_bits = type_bits_ptr.* };
+}
 
 // ============================================================================
 // Setup-time encoders (called once per resource lifetime)

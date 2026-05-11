@@ -150,6 +150,25 @@ pub fn maskEntry(entry_addr: usize, mask_it: bool) void {
     e.vector_control = if (mask_it) 1 else 0;
 }
 
+/// Re-point an already-armed MSI-X entry at `dest_apic_id`. Use this to
+/// steer completion IRQs to the CPU that's about to wait on them — when
+/// MSI-X fires on the same CPU as the `sti; hlt` waiter, completion
+/// arrives in microseconds; when it fires elsewhere, the waiter sleeps
+/// until the next 10ms LAPIC tick.
+///
+/// Caller must ensure no concurrent IRQs against this entry are in
+/// flight (e.g., hold the device's command lock). The mask bit gates
+/// writes per spec — stale entries can't fire mid-write.
+///
+/// `data` (the IDT vector) is preserved by reading it back; only the
+/// destination address is rewritten.
+pub fn retargetEntry(entry_addr: usize, dest_apic_id: u32) void {
+    const e: *volatile TableEntry = @ptrFromInt(entry_addr);
+    const data = e.data;
+    const new_addr: u64 = 0xFEE00000 | (@as(u64, dest_apic_id) << 12);
+    writeEntry(entry_addr, new_addr, data, false);
+}
+
 /// Flip the MSI-X enable bit (and clear function-level mask) in the cap
 /// header so the device starts emitting MSI-X messages. Also clears
 /// legacy INTx by setting bit 10 of PCI command register — without this,

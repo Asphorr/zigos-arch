@@ -232,6 +232,8 @@ pub fn execute(cmd: []const u8) void {
     } else if (std.mem.eql(u8, cmd, "perf reset")) {
         @import("debug/perf.zig").resetAll();
         vga.print("perf counters cleared\n", .{});
+    } else if (std.mem.eql(u8, cmd, "ipi")) {
+        cmdIpi();
     } else {
         printErr("Unknown command: {s}\n", .{cmd});
         vga.fg = .DarkGray;
@@ -889,6 +891,25 @@ fn cmdPerf() void {
     printSection("Performance counters");
     vga.print("(also dumped to serial)\n", .{});
     @import("debug/perf.zig").dumpAll();
+}
+
+fn cmdIpi() void {
+    const vgpu = @import("driver/virtio_gpu.zig");
+    const proc = @import("proc/process.zig");
+    printSection("Wake-IPI delivery audit");
+    vga.print("virtio-gpu MSI-X received per CPU:\n", .{});
+    for (vgpu.virtio_gpu_irq_per_cpu, 0..) |c, i| {
+        vga.print("  cpu{d}: {d}\n", .{ i, c });
+    }
+    vga.print("wake-IPIs sent from MSI-X handler: {d}\n", .{vgpu.virtio_gpu_wake_ipis_sent});
+    vga.print("wake-only handler runs per CPU (no schedule, just irq):\n", .{});
+    for (proc.wake_handler_runs, 0..) |c, i| {
+        vga.print("  cpu{d}: {d}\n", .{ i, c });
+    }
+    vga.print("kick-vector handler runs per CPU (calls schedule):\n", .{});
+    for (proc.kick_handler_runs, 0..) |c, i| {
+        vga.print("  cpu{d}: {d}\n", .{ i, c });
+    }
 }
 
 fn cmdBt() void {

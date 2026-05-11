@@ -200,13 +200,15 @@ _start:
     jnz .fill_pdpt_low
     pop edi
 
-    ; Fill pdpt_physmap[0..63] with 1 GB huge pages (kernel-only physmap).
-    ; Same shape as pdpt_low but flags = 0x83 (P+RW+PS, no USER).
+    ; Fill pdpt_physmap[0..511] with 1 GB huge pages (kernel-only physmap).
+    ; Full 512 GB PML4 slot so high-phys MMIO BARs (xHCI at ~481 GB on
+    ; -cpu host with 39-bit maxphyaddr) are reachable via physToVirt().
+    ; Must match memmap.PHYSMAP_SIZE (512 GB) and uefi/uefi_boot.zig.
     push edi
     mov edi, pdpt_physmap
     xor edx, edx
     mov eax, 0x00000083                 ; phys=0 | PS | RW | P  (no USER)
-    mov ecx, 64
+    mov ecx, 512
 .fill_pdpt_physmap:
     mov [edi], eax
     mov [edi + 4], edx

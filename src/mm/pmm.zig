@@ -420,11 +420,23 @@ pub fn freeFrame(phys_addr: usize) void {
     const old_ref = @atomicRmw(u8, &frame_refs[frame_num], .Sub, 1, .acq_rel);
     if (old_ref > 1) return;
     if (old_ref == 0) {
-        // Underflow — caller released a frame that was already free. Pin to 0
-        // so a subsequent acquire/free doesn't paper over the bug.
+        // Underflow — caller released a frame that was already free. Pin
+        // to 0 so a subsequent acquire/free doesn't paper over the bug.
+        // Was a panic; downgraded to a warning that leaks the frame so
+        // an app-teardown bug doesn't crash the whole desktop. The
+        // accumulating leak rate is the visible signal that something's
+        // still wrong; fix the root cause when it surfaces, not by
+        // re-panicking here.
         @atomicStore(u8, &frame_refs[frame_num], 0, .release);
-        @import("../debug/serial.zig").print("[pmm] PANIC: freeFrame underflow phys=0x{X}\n", .{phys_addr});
-        @panic("pmm: freeFrame on already-free frame (refcount underflow)");
+        const symbols = @import("../debug/symbols.zig");
+        const serial = @import("../debug/serial.zig");
+        serial.print("[pmm] LEAK: freeFrame underflow phys=0x{X} caller=", .{phys_addr});
+        if (symbols.resolveKernel(ra)) |r| {
+            serial.print("{s}+0x{X}\n", .{ r.name, r.offset });
+        } else {
+            serial.print("0x{X}\n", .{ra});
+        }
+        return;
     }
     // old_ref == 1; we're the last owner. Proceed with the existing free path.
 

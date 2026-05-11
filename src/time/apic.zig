@@ -121,6 +121,14 @@ pub fn tscToMs(delta: u64) u64 {
     return delta * 10 / tsc_per_quantum;
 }
 
+/// TSC ticks per 10ms LAPIC quantum, or 0 if calibration hasn't run yet.
+/// Callers building wall-clock TSC deadlines should multiply by the
+/// number of quanta they want and fall back to a conservative baseline
+/// when the return value is 0.
+pub fn tscPerQuantum() u64 {
+    return tsc_per_quantum;
+}
+
 inline fn rdtsc() u64 {
     var lo: u32 = undefined;
     var hi: u32 = undefined;
@@ -420,6 +428,30 @@ fn initLAPIC() void {
 /// once at the end of apic.init() so the timer-source decision is in one
 /// obvious place when debugging "why is sleep weird on this machine."
 var calibrated_via_hpet: bool = false;
+/// True if Hyper-V frequency MSRs supplied calibration directly. Skips
+/// the 10 ms HPET gate when running under QEMU/KVM with `hv-frequencies`.
+var calibrated_via_hyperv: bool = false;
+
+/// Hyper-V-direct calibration. Reads HV_X64_MSR_TSC_FREQUENCY +
+/// HV_X64_MSR_APIC_FREQUENCY (one rdmsr each, no busy-wait gate).
+/// Returns true on success.
+fn calibrateTimerHyperv() bool {
+    const hyperv = @import("../cpu/hyperv.zig");
+    if (!hyperv.hasFrequencyMsrs()) return false;
+
+    const tsc_hz = hyperv.tscFrequencyHz();
+    const apic_hz = hyperv.apicFrequencyHz();
+    if (tsc_hz == 0 or apic_hz == 0) return false;
+
+    // 100 Hz quantum = 10 ms. LAPIC count-down uses divider 16 (DCR=0x03);
+    // effective tick rate = apic_hz / 16, so per-quantum count = apic_hz / 1600.
+    tsc_per_quantum = tsc_hz / 100;
+    apic_timer_count = @intCast(apic_hz / 1600);
+    calibrated_via_hyperv = true;
+
+    debug.klog("[apic] Hyper-V calibration: TSC={d} Hz APIC={d} Hz → {d} TSC / {d} LAPIC ticks per 10ms\n", .{ tsc_hz, apic_hz, tsc_per_quantum, apic_timer_count });
+    return true;
+}
 
 /// HPET-based calibration. Returns true on success.
 fn calibrateTimerHpet() bool {
@@ -453,6 +485,7 @@ fn calibrateTimerHpet() bool {
 }
 
 fn calibrateTimer() void {
+    if (calibrateTimerHyperv()) return;
     if (calibrateTimerHpet()) return;
     debug.klog("[apic] HPET unavailable — falling back to PIT Channel 2\n", .{});
     calibrateTimerPit();
@@ -582,7 +615,7 @@ pub fn init() bool {
 
     apic_active = true;
     debug.klog("[apic] timer config: source={s} mode={s} freq=100Hz\n", .{
-        if (calibrated_via_hpet) "HPET" else "PIT",
+        if (calibrated_via_hyperv) "Hyper-V" else if (calibrated_via_hpet) "HPET" else "PIT",
         if (tsc_deadline_active) "TSC-deadline" else "LAPIC-count",
     });
     return true;

@@ -126,6 +126,14 @@ pub const Queue = struct {
         return @ptrFromInt(paging.physToVirt(self.used_phys + 4 + @as(usize, i) * 8 + 4));
     }
 
+    /// Tail u16 in the avail-ring buffer, used only when VIRTIO_F_EVENT_IDX
+    /// is negotiated. Driver writes the usedIdx value AT WHICH it wants the
+    /// next interrupt; the device suppresses earlier notifications. Per
+    /// spec the field lives at `avail_phys + 4 + queue_size * 2`.
+    pub fn usedEvent(self: *Queue) *volatile u16 {
+        return @ptrFromInt(paging.physToVirt(self.avail_phys + 4 + @as(usize, self.queue_size) * 2));
+    }
+
     /// Allocate ring memory, chain the descriptor free-list, and program
     /// the device with the ring addresses via the common-config registers.
     /// `cc_base` is the kernel VA of the device's common-config region;

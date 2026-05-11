@@ -19,6 +19,16 @@ const events_mod = @import("events.zig");
 pub const Event = events_mod.Event;
 pub const EventKind = events_mod.EventKind;
 
+// DBG: input-pipeline diagnostic counters. Bumped from desktop's drain
+// loop when chars get dropped. Read by manual klog dumps when input
+// behavior is unexpected. Rate-limited so we don't flood the log.
+var dbg_focus_drop_count: u64 = 0;
+var dbg_event_queue_full: u64 = 0;
+var dbg_kbpipe_drop: u64 = 0;
+var dbg_last_focus_drop_log: u64 = 0;
+var dbg_last_qfull_log: u64 = 0;
+var dbg_last_kbpipe_log: u64 = 0;
+
 // --- Window management (storage, z-stack, focus, hit-testing) ---
 const wm = @import("desktop/window.zig");
 const Window = wm.Window;
@@ -756,7 +766,9 @@ fn launchShortcut(idx: usize) void {
         // spawn app.elf (Ring 3) with stdin/stdout/stderr wired to those
         // pipes. The shell is now a real user process — the desktop just
         // forwards keystrokes and drains stdout each frame.
-        const off: i32 = @intCast(wm.window_count * 30);
+        // window_count is u8; widen before the multiply or `9 * 30 = 270`
+        // overflows u8 arithmetic and Zig's runtime safety panics.
+        const off: i32 = @intCast(@as(u32, wm.window_count) * 30);
         const nw: u32 = TERM_COLS * FONT_W + BORDER * 2;
         const nh: u32 = TERM_ROWS * FONT_H + TITLEBAR_H;
         if (createWindow("Terminal", 80 + off, 40 + off, nw, nh)) |ni| {
@@ -1514,7 +1526,17 @@ fn handleKeyboard(w: *Window, ch: u8) bool {
             ch == keyboard.KEY_DELETE;
         if (!is_printable and !is_line_edit and !is_nav) return false;
         const buf = [_]u8{ch};
-        _ = @import("../proc/pipe.zig").tryWrite(w.kb_pipe, &buf);
+        const written = @import("../proc/pipe.zig").tryWrite(w.kb_pipe, &buf);
+        if (written == 0) {
+            // pipe full / closed — char dropped before reaching shell
+            dbg_kbpipe_drop +%= 1;
+            if (process.tick_count -% dbg_last_kbpipe_log >= 100) {
+                dbg_last_kbpipe_log = process.tick_count;
+                debug.klog("[kbd-drop] kb_pipe write dropped pid={d} pipe_id={d} ch=0x{X} drops={d}\n", .{
+                    w.shell_pid, w.kb_pipe, ch, dbg_kbpipe_drop,
+                });
+            }
+        }
         return false;
     }
 
@@ -1676,7 +1698,9 @@ fn executeMenuItem(idx: i8) void {
     switch (context_menu.ctx) {
         .desktop_bg => switch (@as(u8, @intCast(idx))) {
             0 => { // New Terminal
-                const off: i32 = @intCast(wm.window_count * 30);
+                // window_count is u8; widen before the multiply or `9 * 30 = 270`
+        // overflows u8 arithmetic and Zig's runtime safety panics.
+        const off: i32 = @intCast(@as(u32, wm.window_count) * 30);
                 const nw: u32 = TERM_COLS * FONT_W + BORDER * 2;
                 const nh: u32 = TERM_ROWS * FONT_H + TITLEBAR_H;
                 if (createWindow("Terminal", 80 + off, 40 + off, nw, nh)) |ni| {
@@ -1685,7 +1709,9 @@ fn executeMenuItem(idx: i8) void {
                 }
             },
             1 => { // Run App...
-                const off: i32 = @intCast(wm.window_count * 30);
+                // window_count is u8; widen before the multiply or `9 * 30 = 270`
+        // overflows u8 arithmetic and Zig's runtime safety panics.
+        const off: i32 = @intCast(@as(u32, wm.window_count) * 30);
                 const nw: u32 = TERM_COLS * FONT_W + BORDER * 2;
                 const nh: u32 = TERM_ROWS * FONT_H + TITLEBAR_H;
                 if (createWindow("Terminal", 80 + off, 40 + off, nw, nh)) |ni| {
@@ -1858,8 +1884,12 @@ fn handleMouseEvents() DirtyKind {
     }
 
     if (left_down and !was_down) {
-        // Check dock click first
-        if (dock.inDockZone(my)) {
+        // A window covering the click position takes priority over the
+        // dock — fullscreen apps (e.g. doom at 640×400 dragged over the
+        // dock strip) would otherwise have their clicks eaten by dock
+        // shortcut hit-testing, silently launching pinned apps.
+        const window_hit = windowAt(mx, my);
+        if (window_hit == null and dock.inDockZone(my)) {
             if (dock.clickAt(mx)) |action| {
                 switch (action) {
                     .shortcut => |si| launchShortcut(si),
@@ -1874,7 +1904,7 @@ fn handleMouseEvents() DirtyKind {
                 }
                 result = .full;
             }
-        } else if (windowAt(mx, my)) |clicked_idx| {
+        } else if (window_hit) |clicked_idx| {
             // Stable slot ID — bringToFront only mutates z_stack, so the
             // slot we got from windowAt stays valid for the rest of this
             // click handler regardless of z-order shuffles.
@@ -2398,7 +2428,24 @@ pub fn run() void {
         //     the user-space shell keeps reading from fd 0 unchanged.
         // No focus → drop keystrokes silently. (Used to be: drop for
         // GUI focus, terminal-focus path drains via legacy.)
-        if (slot_used[wm.focused] and windows[wm.focused].visible and !windows[wm.focused].minimized) {
+        const focus_ok = slot_used[wm.focused] and windows[wm.focused].visible and !windows[wm.focused].minimized;
+        // DBG: when focus check fails AND there are pending keys, log so
+        // we know chars are being dropped at the desktop drain. Rate-limit
+        // to once per 100 ticks.
+        if (!focus_ok and keyboard.hasData()) {
+            dbg_focus_drop_count +%= 1;
+            if (process.tick_count -% dbg_last_focus_drop_log >= 100) {
+                dbg_last_focus_drop_log = process.tick_count;
+                debug.klog("[kbd-drop] focus invalid (focused={d} slot_used={any} visible={any} minimized={any}) — drop_count={d}\n", .{
+                    wm.focused,
+                    slot_used[wm.focused],
+                    if (slot_used[wm.focused]) windows[wm.focused].visible else false,
+                    if (slot_used[wm.focused]) windows[wm.focused].minimized else false,
+                    dbg_focus_drop_count,
+                });
+            }
+        }
+        if (focus_ok) {
             const w = &windows[wm.focused];
             const is_terminal = w.term != null;
             while (keyboard.pop()) |ch| {
@@ -2414,12 +2461,62 @@ pub fn run() void {
                     (@as(u32, @intFromBool(keyboard.ctrl_held)) << 1) |
                     (@as(u32, @intFromBool(keyboard.alt_held)) << 2) |
                     (@as(u32, @intFromBool(keyboard.caps_lock)) << 3);
+                // DBG: pre-push queue depth (tail to head distance).
+                const pre_count: u8 = (w.events.head -% w.events.tail) & 31;
                 w.events.push(.{ .kind = kind, .a = ch, .b = mods });
+                const post_count: u8 = (w.events.head -% w.events.tail) & 31;
+                if (pre_count == post_count) {
+                    // push() did NOT advance head — queue full, event dropped
+                    dbg_event_queue_full +%= 1;
+                    if (process.tick_count -% dbg_last_qfull_log >= 100) {
+                        dbg_last_qfull_log = process.tick_count;
+                        const target_pid = if (is_terminal) w.shell_pid else w.owner_pid;
+                        var t_state: u8 = 0xFF;
+                        var t_assigned: u8 = 0xFF;
+                        var t_vruntime: u64 = 0;
+                        var t_wait: u8 = 0xFF;
+                        if (target_pid < process.MAX_PROCS) {
+                            const tp = &process.procs[target_pid];
+                            t_state = @intFromEnum(tp.state);
+                            t_assigned = tp.assigned_cpu;
+                            t_vruntime = tp.vruntime;
+                            t_wait = @intFromEnum(tp.wait_kind);
+                        }
+                        debug.klog("[kbd-drop] events FULL pid={d} term={any} drops={d} kb_drop={d} state={d} cpu={d} wait={d} vruntime={d}\n", .{
+                            target_pid,
+                            is_terminal,
+                            dbg_event_queue_full,
+                            @atomicLoad(u64, &keyboard.dbg_push_dropped, .monotonic),
+                            t_state,
+                            t_assigned,
+                            t_wait,
+                            t_vruntime,
+                        });
+                        // Per-CPU rq snapshot — see if shell is even in the rq
+                        // and if any band has a stuck-huge floor (would explain
+                        // CFS picker passing it over every time).
+                        const smp_mod = @import("../cpu/smp.zig");
+                        var ci: u8 = 0;
+                        while (ci < smp_mod.MAX_CPUS) : (ci += 1) {
+                            if (!smp_mod.cpus[ci].alive) continue;
+                            const rq = &smp_mod.cpus[ci].runqueue;
+                            debug.klog("[kbd-drop]  cpu{d}: nr_run={d} (i={d} n={d} bg={d}) min_vr i={d} n={d} bg={d} sched={d}\n", .{
+                                ci,
+                                rq.nr_runnable,
+                                rq.interactive.count, rq.normal.count, rq.background.count,
+                                rq.min_vruntime[2], rq.min_vruntime[1], rq.min_vruntime[0],
+                                @atomicLoad(u64, &smp_mod.cpus[ci].schedule_count, .monotonic),
+                            });
+                        }
+                    }
+                }
 
                 if (is_terminal) {
                     if (ch == 0x1B) continue; // ESC: terminals ignore
                     if (ch == 0x14) { // Ctrl+T: spawn new terminal
-                        const off: i32 = @intCast(wm.window_count * 30);
+                        // window_count is u8; widen before the multiply or `9 * 30 = 270`
+        // overflows u8 arithmetic and Zig's runtime safety panics.
+        const off: i32 = @intCast(@as(u32, wm.window_count) * 30);
                         const nw: u32 = TERM_COLS * FONT_W + BORDER * 2;
                         const nh: u32 = TERM_ROWS * FONT_H + TITLEBAR_H;
                         if (createWindow("Terminal", 80 + off, 40 + off, nw, nh)) |ni| {

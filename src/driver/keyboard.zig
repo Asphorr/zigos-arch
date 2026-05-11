@@ -266,7 +266,14 @@ var global_buffer: [32]u8 = [_]u8{0} ** 32;
 var global_head: usize = 0;
 var global_tail: usize = 0;
 
+// Diagnostic counters for input-pipeline debugging. Read by /proc/sched
+// or dumped on demand via klog. Atomic so any IRQ context is safe.
+pub var dbg_push_total: u64 = 0;
+pub var dbg_push_dropped: u64 = 0;
+
 pub fn push(ch: u8) void {
+    @import("std").debug.assert(true); // suppress unused-import warning if any
+    _ = @atomicRmw(u64, &dbg_push_total, .Add, 1, .monotonic);
     // Ctrl+C (literal byte 0x03) from ANY source — PS/2 handleScancode, USB
     // xhci.processKeyboardReport, future kbd drivers — delivers SIGINT
     // *directly* at IRQ time to the focused window's signal target.
@@ -295,6 +302,8 @@ pub fn push(ch: u8) void {
     if (next != tail) {
         buffer[head] = ch;
         head = next;
+    } else {
+        _ = @atomicRmw(u64, &dbg_push_dropped, .Add, 1, .monotonic);
     }
 }
 

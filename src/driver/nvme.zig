@@ -432,25 +432,31 @@ fn writeSqe(s: [*]volatile u32, opcode: u8, cid: u16, nsid: u32, prp1: u64, prp2
 }
 
 fn waitCompletion(c: *const Controller, cq_phys: usize, head_ptr: *u16, phase_ptr: *bool, qid: u16, use_irq: bool) bool {
+    _ = use_irq;
     const cq: [*]volatile CqEntry = @ptrFromInt(paging.physToVirt(cq_phys));
-    var spin: u32 = 0;
+    // rdtsc-based deadline. The old sti+hlt path relied on the LAPIC timer
+    // to wake hlt every 10ms — if LAPIC IRQ delivery to this CPU stops
+    // working (which redteam tripped on the secondary controller), hlt
+    // parks forever and no post-hlt counter helps. Pause-spin with an
+    // rdtsc deadline is bounded regardless of interrupt state.
+    //
+    // NVMe normal completion latency is <100µs; pause-spinning for that
+    // long is essentially free (~hundreds of µs of CPU). The MSI-X retarget
+    // logic above is now a no-op for waking us but still ensures the IRQ
+    // handler runs on the right CPU when the device completes.
+    const t_start = @import("../debug/perf.zig").rdtsc();
+    // ~2s at 1 GHz min TSC freq — generous on any modern CPU.
+    const TIMEOUT_CYC: u64 = 2_000_000_000;
     while (true) {
-        // For the MSI-X path, mask IRQs across the phase check so the
-        // sti+hlt shadow guarantees atomicity. Without the cli below, the
-        // window between the phase check and `sti; hlt` is interrupt-
-        // observable: an MSI-X arriving in that window is consumed by the
-        // dummy handler, hlt then reaches with nothing pending, and AP
-        // sleeps until the next 100 Hz timer (~10 ms). A 0.x % miss rate
-        // there inflates avg_wait per sector by 10-30x — exactly the
-        // pattern we measured on app loads (paint 226 µs, files 1700 µs).
-        if (use_irq) asm volatile ("cli" ::: .{ .memory = true });
+        if (@import("../debug/perf.zig").rdtsc() -% t_start > TIMEOUT_CYC) {
+            debug.klog("[nvme] waitCompletion timeout (qid={d} head={d} csts=0x{x})\n", .{ qid, head_ptr.*, r32(c, REG_CSTS) });
+            return false;
+        }
 
         // QEMU's NVMe iothread writes completions on a different host
         // CPU; the guest's L1 keeps a stale (zero) copy of the cache line
         // unless we explicitly invalidate it. clflush + mfence guarantees
-        // each load goes to actual memory. Still required even with
-        // MSI-X — the LAPIC interrupt delivery is a separate memory write
-        // and doesn't snoop the CQ's cache line for us.
+        // each load goes to actual memory.
         const slot_addr = cq_phys + @as(usize, head_ptr.*) * @sizeOf(CqEntry);
         asm volatile ("clflush (%[ptr])"
             :
@@ -460,7 +466,6 @@ fn waitCompletion(c: *const Controller, cq_phys: usize, head_ptr: *u16, phase_pt
         const status_word = cq[head_ptr.*].status;
         const phase_bit = (status_word & 1) != 0;
         if (phase_bit == phase_ptr.*) {
-            if (use_irq) asm volatile ("sti" ::: .{ .memory = true });
             const sc = status_word >> 1;
             head_ptr.* = (head_ptr.* + 1) % Q_DEPTH;
             // Phase flips each time the head wraps the queue.
@@ -472,20 +477,7 @@ fn waitCompletion(c: *const Controller, cq_phys: usize, head_ptr: *u16, phase_pt
             }
             return true;
         }
-        if (use_irq) {
-            // sti + hlt is atomic (sti shadow); we won't miss an IRQ
-            // delivered between the two. With cli above guarding the
-            // phase check, the entire check-then-sleep is atomic w.r.t.
-            // IRQ delivery — no missed wake.
-            asm volatile ("sti; hlt" ::: .{ .memory = true });
-        } else {
-            asm volatile ("pause");
-            spin += 1;
-            if (spin > 50_000_000) {
-                debug.klog("[nvme] command timeout (qid={d} head={d} csts=0x{x})\n", .{ qid, head_ptr.*, r32(c, REG_CSTS) });
-                return false;
-            }
-        }
+        asm volatile ("pause");
     }
 }
 

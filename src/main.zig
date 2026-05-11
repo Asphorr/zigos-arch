@@ -306,6 +306,10 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     // PIT-based calibration would silently produce tsc_per_quantum=0).
     @import("time/hpet.zig").init();
     blog.ok("HPET");
+    // Hyper-V enlightenment detection. When QEMU exposes the frequency
+    // MSRs (`-cpu host,hv-frequencies`) apic.calibrateTimer() reads them
+    // directly instead of running the 10 ms HPET gate.
+    @import("cpu/hyperv.zig").detect();
     if (@import("time/apic.zig").init()) {
         blog.ok("Local APIC + IOAPIC");
     } else {
@@ -324,6 +328,13 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     blog.ok("DR-sync IPI vector");
     @import("proc/process.zig").initKillKickIpi();
     blog.ok("Kill-kick IPI vector");
+    @import("proc/process.zig").initWakeIpi();
+    blog.ok("Wake-only IPI vector");
+    // Cross-CPU hang detector. Each CPU watches the next; if a peer's
+    // IRQ0 tick stops advancing for ~3s, broadcast NMI + autopsy. Arm
+    // AFTER smp.init() so cpu.alive[] is populated.
+    @import("debug/watchdog.zig").arm();
+    blog.ok("Hang watchdog");
     // C.1 supersedes the iretq RIP watchpoints — uses the same DR0-DR3 slots
     // for rotating kernel_esp watch (per-PCB write detection), driven by
     // handleIRQ0 every KESP_REROTATE_TICKS. The smoking gun for the wild-RIP
@@ -350,6 +361,8 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     blog.ok("Build-ID stamp");
     @import("debug/symbols.zig").loadKernelSymbols();
     blog.ok("Kernel symbols loaded");
+    @import("debug/dwarf_line.zig").init();
+    blog.ok("Kernel line table loaded");
 
     // ---- Phase 5: Lockdown -----------------------------------------------
     blog.phase(.lockdown, "\u{2295}", "Lockdown"); // ⊕
@@ -533,8 +546,23 @@ pub fn panic(msg: []const u8, _: ?*std.builtin.StackTrace, ret_addr: ?usize) nor
         }
         const frame: [*]const usize = @ptrFromInt(rbp);
         const addr: u64 = @intCast(frame[1]);
+        const dwarf = @import("debug/dwarf_line.zig");
         if (sym.resolveKernel(addr)) |r| {
-            serial.print("    [{d}] {s}+0x{X} (0x{X:0>16})\n", .{ depth, r.name, r.offset, addr });
+            if (dwarf.lookup(addr)) |loc| {
+                serial.print("    [{d}] {s}+0x{X} at {s}:{d} (0x{X:0>16})\n", .{ depth, r.name, r.offset, loc.file, loc.line, addr });
+            } else {
+                serial.print("    [{d}] {s}+0x{X} (0x{X:0>16})\n", .{ depth, r.name, r.offset, addr });
+            }
+        } else if (sym.resolveKernelNearest(addr)) |r| {
+            if (r.offset < 0x4000) {
+                if (dwarf.lookup(addr)) |loc| {
+                    serial.print("    [{d}] (near {s}+0x{X}) at {s}:{d} (0x{X:0>16})\n", .{ depth, r.name, r.offset, loc.file, loc.line, addr });
+                } else {
+                    serial.print("    [{d}] (near {s}+0x{X}) (0x{X:0>16})\n", .{ depth, r.name, r.offset, addr });
+                }
+            } else {
+                serial.print("    [{d}] 0x{X:0>16}\n", .{ depth, addr });
+            }
         } else {
             serial.print("    [{d}] 0x{X:0>16}\n", .{ depth, addr });
         }
@@ -546,7 +574,11 @@ pub fn panic(msg: []const u8, _: ?*std.builtin.StackTrace, ret_addr: ?usize) nor
     // NMI broadcast (task #247) — solicit a snapshot from every other CPU
     // before we halt. Reveals "what was the OTHER CPU doing when we
     // paniced" — critical for SMP race investigations. Each NMI handler
-    // dumps a one-line state digest with per-cpu prefix, IRETs back.
+    // dumps a one-line state digest with per-cpu prefix, then halts (the
+    // halt-after flag prevents the receivers from continuing on potentially-
+    // corrupt state — without it cpu0 keeps running the desktop loop after
+    // cpu1 panicked, which then trips a second cascading panic).
+    @import("debug/kdbg.zig").nmi_halt_after_snapshot = true;
     @import("debug/kdbg.zig").broadcastNMI();
 
     // Slab cache forensics — which subsystems were live at crash time.

@@ -43,6 +43,7 @@ export fn _start() linksection(".text.entry") callconv(.c) void {
     fa.drawTextOpaque(&canvas, 10, 134, "Ticks:", 0xCCCCCC, BG, &fa.default_16);
     fa.drawTextOpaque(&canvas, 10, 156, "Frames:", 0xCCCCCC, BG, &fa.default_16);
     fa.drawTextOpaque(&canvas, 10, 184, "Screen:", 0xCCCCCC, BG, &fa.default_16);
+    fa.drawTextOpaque(&canvas, 10, 206, "Procs:", 0xCCCCCC, BG, &fa.default_16);
     // Screen size (static)
     var cx: u32 = fa.drawNumOpaque(&canvas, 110, 184, scr.w, 0x88CCFF, BG, &fa.default_16);
     fa.drawCharOpaque(&canvas, cx, 184, 'x', 0x88CCFF, BG, &fa.default_16);
@@ -115,6 +116,36 @@ export fn _start() linksection(".text.entry") callconv(.c) void {
         canvas.fillRect(110, 156, vis_w -| 120, fa.default_16.line_height, BG);
         cx = fa.drawNumOpaque(&canvas, 110, 156, used, 0xFF8888, BG, &fa.default_16);
         fa.drawTextOpaque(&canvas, cx, 156, " used", 0xFF8888, BG, &fa.default_16);
+
+        // Process summary — uses sysProcessList (#78). Shows alive count
+        // plus a quick state breakdown so the user can see if the system
+        // is mostly idle (sleeping) vs busy (running/ready).
+        var pl_buf: [32]libc.ProcInfo = undefined;
+        const pl_n = libc.processList(&pl_buf);
+        var n_run: u32 = 0;
+        var n_rdy: u32 = 0;
+        var n_slp: u32 = 0;
+        var k: u32 = 0;
+        while (k < pl_n) : (k += 1) {
+            switch (pl_buf[k].state) {
+                libc.PROC_STATE_RUNNING => n_run += 1,
+                libc.PROC_STATE_READY => n_rdy += 1,
+                libc.PROC_STATE_SLEEPING => n_slp += 1,
+                else => {},
+            }
+        }
+        canvas.fillRect(110, 206, vis_w -| 120, fa.default_16.line_height, BG);
+        cx = fa.drawNumOpaque(&canvas, 110, 206, pl_n, 0x88FF88, BG, &fa.default_16);
+        fa.drawTextOpaque(&canvas, cx, 206, " (", 0xCCCCCC, BG, &fa.default_16);
+        cx += fa.default_16.size_px * 2;
+        cx = fa.drawNumOpaque(&canvas, cx, 206, n_run, 0x88FF88, BG, &fa.default_16);
+        fa.drawTextOpaque(&canvas, cx, 206, "R ", 0x88FF88, BG, &fa.default_16);
+        cx += fa.default_16.size_px * 2;
+        cx = fa.drawNumOpaque(&canvas, cx, 206, n_rdy, 0x88CCFF, BG, &fa.default_16);
+        fa.drawTextOpaque(&canvas, cx, 206, "Q ", 0x88CCFF, BG, &fa.default_16);
+        cx += fa.default_16.size_px * 2;
+        cx = fa.drawNumOpaque(&canvas, cx, 206, n_slp, 0xFFCC88, BG, &fa.default_16);
+        fa.drawTextOpaque(&canvas, cx, 206, "S)", 0xFFCC88, BG, &fa.default_16);
 
         libc.sleep(10);
     }

@@ -6,6 +6,15 @@ const debug = @import("../debug/debug.zig");
 const idt = @import("../cpu/idt.zig");
 const msix = @import("../time/msix.zig");
 const SpinLock = @import("../proc/spinlock.zig").SpinLock;
+const apic = @import("../time/apic.zig");
+const perf = @import("../debug/perf.zig");
+
+/// Slow-submit threshold for sendCmdViaPhys. When wait exceeds this, log
+/// the cmd_type (first u32 of cmd_phys, per virtio-gpu spec) + lengths
+/// so we can see *which* particular command is the bottleneck. 50ms is
+/// well above normal (real cmds <1ms, blob page-flips ~16ms vsync) so
+/// it only fires for genuinely pathological waits.
+const SLOW_GPU_SUBMIT_THRESHOLD_MS: u64 = 50;
 
 // Serialises all access to the control virtqueue. Without this, BSP rendering
 // (flushRect/transferToHost called from the desktop) races with AP syscalls
@@ -32,12 +41,50 @@ var use_msix: bool = false;
 /// from main.zig right after the global sti.
 pub var msix_safe_to_use: bool = false;
 pub var virtio_gpu_irq_count: u64 = 0;
+/// True iff VIRTIO_F_RING_EVENT_IDX was negotiated. When set, sendCmdViaPhys
+/// writes the target usedIdx into ctrl_vq.usedEvent() before HLT so the
+/// device knows exactly when to fire MSI-X — workaround for QEMU's
+/// re-entrancy guard silently dropping unconditional notifications.
+var use_event_idx: bool = false;
+
+/// MSI-X table entry kernel-virtual address, captured at arm time so
+/// sendCmdViaPhys can re-target the entry to the calling CPU's APIC ID
+/// before each wait. Steering MSI-X to the same CPU as the `sti; hlt`
+/// waiter cuts cmd latency from ~10ms (next LAPIC tick) to ~µs (real
+/// completion IRQ on the waiting CPU). 0 means "not armed".
+var msix_entry_addr: usize = 0;
 
 /// Catch-all MSI-X handler. Just bumps a counter — the real check
 /// (used_idx advance) happens in the next iteration of sendCmd's
 /// `sti; hlt` loop. Same shape as `nvmeIrqHandler`.
+/// MSI-X target landing breakdown (read at any time via virtioGpuIrqStats).
+/// Even with `retargetEntry` writing the correct destination APIC ID,
+/// QEMU/KVM/Hyper-V routes all virtio-gpu MSI-X to cpu0 in practice.
+/// Kept as a counter (not periodic log) so the CLI can sample on demand.
+pub var virtio_gpu_irq_per_cpu: [4]u64 = .{ 0, 0, 0, 0 };
+/// IPIs we sent from the MSI-X handler to wake other CPUs from sti+hlt.
+/// Compared against process.kill_kick handler invocations to determine
+/// whether IPI delivery is the broken link. (See process.kickHandlerCount.)
+pub var virtio_gpu_wake_ipis_sent: u64 = 0;
 fn virtioGpuIrqHandler() callconv(.c) void {
     virtio_gpu_irq_count +%= 1;
+    const smp_mod = @import("../cpu/smp.zig");
+    const cpu_id = smp_mod.myCpu().cpu_id;
+    if (cpu_id < 4) virtio_gpu_irq_per_cpu[cpu_id] +%= 1;
+    const process = @import("../proc/process.zig");
+    // Use the wake-only vector (no schedule() call). kill_kick_vector's
+    // handler calls schedule() which actively de-prioritises the receiver's
+    // current task via pickNext(exclude=current) — wrong for our case where
+    // the current task is precisely the one that should re-check usedIdx.
+    if (process.wakeVector()) |v| {
+        for (0..smp_mod.MAX_CPUS) |cid| {
+            if (cid == cpu_id) continue;
+            const cl = &smp_mod.cpus[cid];
+            if (!cl.alive) continue;
+            apic.sendIPI(cl.lapic_id, v);
+            virtio_gpu_wake_ipis_sent +%= 1;
+        }
+    }
 }
 
 // --- Virtio PCI modern (MMIO-based) ---
@@ -92,6 +139,14 @@ const CMD_RESOURCE_UNMAP_BLOB: u32 = 0x0209;
 // Cursor commands (sent via cursor queue, fire-and-forget)
 const CMD_UPDATE_CURSOR: u32 = 0x0300;
 const CMD_MOVE_CURSOR: u32 = 0x0301;
+
+// Bit 0 of CtrlHdr.flags. When set on a command, QEMU does not write a
+// response until virglrenderer's fence callback for that fence_id fires.
+// For RESOURCE_FLUSH this means the response is gated on the host display
+// backend's frame-done event — the implicit vblank-sync our zero-copy
+// scanout has otherwise been missing. Caller must also fill in a unique
+// CtrlHdr.fence_id.
+const VIRTIO_GPU_FLAG_FENCE: u32 = 1;
 
 const RESP_OK_NODATA: u32 = 0x1100;
 const RESP_OK_DISPLAY_INFO: u32 = 0x1101;
@@ -425,6 +480,11 @@ pub var blob_front: u32 = 0; // which blob is currently scanned out
 // touching the blob we just promoted.
 var original_2d_resource_id: u32 = 0;
 
+// Monotonic counter for VIRTIO_GPU_FLAG_FENCE cmds. Only the FENCE-flagged
+// RESOURCE_FLUSH path consumes this currently — used to gate the response
+// on host display backend's frame-done callback (vblank sync).
+var fence_id_next: u64 = 0;
+
 // --- MMIO register helpers ---
 
 fn ccRead8(off: u32) u8 {
@@ -489,6 +549,10 @@ fn notifyQueue(qi: u16, vq: *const Virtqueue) void {
 /// both need. Before this existed, each in-place builder duplicated ~25
 /// lines of identical descriptor-chain + wait-loop code.
 fn sendCmdViaPhys(cmd_len: u32, resp_len: u32) bool {
+    // Bracket the entire submit-and-wait so per-syscall latency attribution
+    // can show "sysGpuSubmit3D dt=900ms = 870ms gpu_wait + 30ms misc".
+    const sp = @import("../debug/syscall_perf.zig").scope(.gpu_wait);
+    defer sp.end();
     if (ctrl_vq.num_free < 2) return false;
 
     const d0_idx = ctrl_vq.free_head;
@@ -513,7 +577,54 @@ fn sendCmdViaPhys(cmd_len: u32, resp_len: u32) bool {
     asm volatile ("" ::: .{ .memory = true });
     ctrl_vq.availIdx().* = ai +% 1;
 
+    // Re-target MSI-X to the calling CPU's APIC ID BEFORE notifying the
+    // host. Hyper-V halts a vCPU while it's in HLT — virtual LAPIC stops
+    // ticking, so the only thing that wakes our `sti; hlt` is the actual
+    // completion IRQ. If MSI-X is hardwired to cpu0 and we're waiting on
+    // cpu1, the wake never arrives directly; cube only resumes when some
+    // other CPU IPIs/NMIs cpu1 (e.g. spinlock NMI broadcast at ~50ms),
+    // so wait_ms ends up dominated by that side-channel rather than real
+    // host time. ctrl_lock serializes submitters, so retarget is race-free
+    // — whoever holds the lock owns the MSI-X destination for this submit.
+    if (msix_entry_addr != 0) {
+        const my_cpu = @import("../cpu/smp.zig").myCpu();
+        const my_apic_id: u32 = my_cpu.lapic_id;
+        @import("../time/msix.zig").retargetEntry(msix_entry_addr, my_apic_id);
+        // One-shot diagnostic: confirm we're actually retargeting with a
+        // sane lapic_id (not 0 from uninit). Also dump the post-retarget
+        // entry contents so we can see whether QEMU honored the rewrite.
+        const dbg_state = struct {
+            var seen: [4]bool = .{ false, false, false, false };
+        };
+        if (my_cpu.cpu_id < 4 and !dbg_state.seen[my_cpu.cpu_id]) {
+            dbg_state.seen[my_cpu.cpu_id] = true;
+            const e_ptr: [*]const volatile u32 = @ptrFromInt(msix_entry_addr);
+            debug.klog(
+                "[gpu-msix-retarget] cpu={d} lapic_id={d} entry: addr_lo=0x{X} addr_hi=0x{X} data=0x{X} vc=0x{X}\n",
+                .{ my_cpu.cpu_id, my_apic_id, e_ptr[0], e_ptr[1], e_ptr[2], e_ptr[3] },
+            );
+        }
+    }
+
+    // EVENT_IDX: tell the device "fire MSI-X when usedIdx reaches THIS value".
+    // last_used_idx is the value we last consumed; we want a notification
+    // when usedIdx advances past it. Spec: device fires when
+    // `usedIdx == used_event + 1`. So write last_used_idx into used_event
+    // and the very next response triggers an IRQ. Must be written BEFORE
+    // notifyQueue so the device sees it before processing the cmd.
+    if (use_event_idx) {
+        ctrl_vq.usedEvent().* = ctrl_vq.last_used_idx;
+        asm volatile ("" ::: .{ .memory = true });
+    }
+
     notifyQueue(0, &ctrl_vq);
+
+    // Bookend the wait in TSC so we can attribute slow submits to the
+    // specific cmd_type (first u32 of cmd_phys per virtio-gpu spec).
+    // Without this, all we see is "ctrl_lock held for 10s" — no clue
+    // whether it was SUBMIT_3D, RESOURCE_CREATE_3D, TRANSFER_TO_HOST,
+    // or a fence wait that triggered it.
+    const wait_start_tsc = perf.rdtsc();
 
     // Wait for the host to advance used_idx. Two paths:
     //   * MSI-X armed (post-init): `sti; hlt` until either our handler
@@ -524,7 +635,41 @@ fn sendCmdViaPhys(cmd_len: u32, resp_len: u32) bool {
     //     way too long; real cmds complete in <1 ms.
     //   * Polled (init phase, before MSI-X is wired): legacy `pause`
     //     spin with a 10M-iteration cap.
+    // Hoisted out of the blk so the slow-submit log can include it.
+    var hlt_iters: u32 = 0;
+    // Adaptive spin-poll BEFORE falling to MSI-X-driven hlt. Workaround for
+    // CVE-2024-3446's mem_reentrancy_guard side-effect: QEMU's virtio
+    // devices silently drop virtio_notify() calls when the host re-enters
+    // the device's MMIO region during command processing — common for
+    // SUBMIT_3D where Venus touches blob/dma-buf regions. Empirically,
+    // wake_during(cpu0=0,cpu1=0) on every slow submit confirms the
+    // notification never fires; the host updates usedIdx (visible to memory
+    // polling within ms) but never raises the IRQ.
+    //
+    // Linux NVMe/virtio drivers use the same adaptive-spin pattern for
+    // the same class of issue. Polling the in-memory usedIdx directly
+    // is reliable; the IRQ path is not. ~100ms is plenty for any
+    // realistic Venus batch (observed max ~75ms, p99 ~511ms for the
+    // largest 2D flushes — those still complete via fall-through hlt).
+    var phase_a_pause_iters: u64 = 0;
+    var phase_a_done_via_poll: bool = false;
+    if (use_msix and msix_safe_to_use) {
+        const tsc_per_q = apic.tscPerQuantum();
+        if (tsc_per_q > 0) {
+            const deadline = perf.rdtsc() +% (tsc_per_q * 10); // 100ms
+            while (perf.rdtsc() < deadline) : (phase_a_pause_iters +%= 1) {
+                if (ctrl_vq.last_used_idx != ctrl_vq.usedIdx().*) {
+                    phase_a_done_via_poll = true;
+                    break;
+                }
+                asm volatile ("pause");
+            }
+        }
+    }
+    const wake_runs_before_cpu0 = @import("../proc/process.zig").wake_handler_runs[0];
+    const wake_runs_before_cpu1 = @import("../proc/process.zig").wake_handler_runs[1];
     const got_response: bool = blk: {
+        if (phase_a_done_via_poll) break :blk true;
         if (use_msix and msix_safe_to_use) {
             // cli-around-check + atomic sti;hlt — without the cli, an MSI-X
             // arriving in the window between the comparison and the sti;hlt
@@ -534,21 +679,27 @@ fn sendCmdViaPhys(cmd_len: u32, resp_len: u32) bool {
             // 22ms (= 2 cmds for blob page-flip) and burning ~21% of
             // wall time on the desktop CPU. Same pattern as
             // nvme.waitCompletion. See log analysis 2026-05-09.
-            var hlt_count: u32 = 0;
+            //
+            // Timeout: 100 hlts ≈ 1s on the default 10ms LAPIC period.
+            // (TSC-based timeout was tried 2026-05-10 to harden against
+            // suspected hlt-not-waking edge cases, but it interacted
+            // badly with vulkan_cube's hot path — sys#31 max went from
+            // ~100M cyc to ~32B cyc. Reverted; iteration count is what
+            // shipped working for ~80fps cube on 2026-05-08.)
             while (true) {
                 asm volatile ("cli" ::: .{ .memory = true });
                 if (ctrl_vq.last_used_idx != ctrl_vq.usedIdx().*) {
                     asm volatile ("sti" ::: .{ .memory = true });
                     break :blk true;
                 }
-                if (hlt_count >= 100) {
+                if (hlt_iters >= 100) {
                     asm volatile ("sti" ::: .{ .memory = true });
                     break :blk false;
                 }
                 // sti shadows the next instruction: an IRQ pending across
                 // the cli is held until after hlt commits, then wakes us.
                 asm volatile ("sti; hlt" ::: .{ .memory = true });
-                hlt_count += 1;
+                hlt_iters += 1;
             }
         } else {
             var timeout: u32 = 10000000;
@@ -559,17 +710,43 @@ fn sendCmdViaPhys(cmd_len: u32, resp_len: u32) bool {
         }
     };
 
-    // Free descriptors regardless of timeout. Only advance last_used_idx if
-    // the host actually moved — otherwise a single stuck command poisons
-    // every future cmd by leaving our cursor permanently ahead.
-    if (got_response) ctrl_vq.last_used_idx +%= 1;
+    // Free descriptors regardless of timeout. On timeout we re-sync our
+    // cursor to the host's actual usedIdx — the original "leave it stale
+    // to avoid poisoning" comment had the failure mode backwards: when
+    // the host completes our cmd AFTER we time out, usedIdx advances and
+    // the NEXT caller sees `last != used`, returns true immediately
+    // without waiting, and reads a stale resp_phys for our (already-
+    // dead) cmd. Re-syncing on timeout costs nothing if usedIdx hasn't
+    // moved, and prevents the cascade if it has.
+    if (got_response) {
+        ctrl_vq.last_used_idx +%= 1;
+    } else {
+        ctrl_vq.last_used_idx = ctrl_vq.usedIdx().*;
+    }
     d1.next = ctrl_vq.free_head;
     d0.next = d1_idx;
     ctrl_vq.free_head = d0_idx;
     ctrl_vq.num_free += 2;
 
+    // Slow-submit breadcrumb. Read cmd_type AFTER the wait so a partially-
+    // initialised cmd buffer can't fault us in the hot path; the cmd has
+    // been DMA-visible to the host since notifyQueue, so the read here
+    // reflects what we actually submitted.
+    const wait_dt = perf.rdtsc() -% wait_start_tsc;
+    const wait_ms = apic.tscToMs(wait_dt);
+    if (wait_ms >= SLOW_GPU_SUBMIT_THRESHOLD_MS) {
+        const cmd_virt: [*]const volatile u32 = @ptrFromInt(paging.physToVirt(cmd_phys));
+        const cmd_type = cmd_virt[0];
+        const wake_d_cpu0 = @import("../proc/process.zig").wake_handler_runs[0] -% wake_runs_before_cpu0;
+        const wake_d_cpu1 = @import("../proc/process.zig").wake_handler_runs[1] -% wake_runs_before_cpu1;
+        debug.klog(
+            "[slow-gpu] cmd_type=0x{X} cmd_len={d} resp_len={d} wait={d}ms hlt_iters={d} poll_iters={d} via_poll={any} wake_during(cpu0={d},cpu1={d}) ok={any}\n",
+            .{ cmd_type, cmd_len, resp_len, wait_ms, hlt_iters, phase_a_pause_iters, phase_a_done_via_poll, wake_d_cpu0, wake_d_cpu1, got_response },
+        );
+    }
+
     if (!got_response) {
-        debug.klog("[virtio-gpu] Command timeout!\n", .{});
+        debug.klog("[virtio-gpu] Command timeout (usedIdx now {d})\n", .{ctrl_vq.last_used_idx});
         return false;
     }
     return true;
@@ -825,8 +1002,19 @@ fn transferToHost(resource_id: u32, x: u32, y: u32, w: u32, h: u32) bool {
 }
 
 fn resourceFlushCmd(resource_id: u32, x: u32, y: u32, w: u32, h: u32) bool {
+    // FENCE-flagged: QEMU holds the response until virglrenderer's fence
+    // callback for this fence_id fires, which for display commands ties
+    // to host display backend's frame-done. On a vsync'd backend this
+    // gives implicit vblank sync → eliminates tearing on the zero-copy
+    // SET_SCANOUT_BLOB path. On a non-vsync'd backend the fence fires
+    // immediately and behavior is unchanged.
+    fence_id_next +%= 1;
     var cmd = ResourceFlush{
-        .hdr = .{ .cmd_type = CMD_RESOURCE_FLUSH },
+        .hdr = .{
+            .cmd_type = CMD_RESOURCE_FLUSH,
+            .flags = VIRTIO_GPU_FLAG_FENCE,
+            .fence_id = fence_id_next,
+        },
         .r = .{ .x = x, .y = y, .width = w, .height = h },
         .resource_id = resource_id,
         .padding = 0,
@@ -924,6 +1112,17 @@ pub fn init(xres: u32, yres: u32) bool {
     if (dev_features_0 & (@as(u32, 1) << VIRTIO_GPU_F_EDID) != 0) {
         driver_features_0 |= @as(u32, 1) << VIRTIO_GPU_F_EDID;
     }
+    // VIRTIO_F_RING_EVENT_IDX (bit 29) — negotiate so the driver can suppress
+    // unnecessary interrupts AND control exactly which usedIdx triggers the
+    // next IRQ via the avail-ring `used_event` slot. Workaround for
+    // CVE-2024-3446's mem_reentrancy_guard side-effect: by going through the
+    // event_idx notification path in QEMU, we may bypass the silent-drop
+    // class that hits unconditional MSI-X delivery for SUBMIT_3D.
+    var have_event_idx: bool = false;
+    if (dev_features_0 & (@as(u32, 1) << 29) != 0) {
+        driver_features_0 |= @as(u32, 1) << 29;
+        have_event_idx = true;
+    }
 
     // Transport features (word 1): VIRTIO_F_VERSION_1 = bit 0 of word 1 (global bit 32)
     var driver_features_1: u32 = 0;
@@ -937,10 +1136,12 @@ pub fn init(xres: u32, yres: u32) bool {
     ccWrite32(CC_DRIVER_FEATURE, driver_features_1);
     ccWrite8(CC_DEVICE_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK);
 
-    if (has_virgl) debug.klog("[virtio-gpu] 3D features: VIRGL{s}{s}\n", .{
+    if (has_virgl) debug.klog("[virtio-gpu] 3D features: VIRGL{s}{s}{s}\n", .{
         if (has_blob) " BLOB" else "",
         if (has_context_init) " CTX_INIT" else "",
+        if (have_event_idx) " EVENT_IDX" else "",
     });
+    use_event_idx = have_event_idx;
 
     // Check FEATURES_OK
     if (ccRead8(CC_DEVICE_STATUS) & STATUS_FEATURES_OK == 0) {
@@ -1027,8 +1228,9 @@ pub fn init(xres: u32, yres: u32) bool {
             ccWrite16(CC_QUEUE_MSIX_VECTOR, 0);
             if (ccRead16(CC_QUEUE_MSIX_VECTOR) == 0) {
                 use_msix = true;
-                debug.klog("[virtio-gpu] MSI-X armed: IDT vec=0x{X} dest=0x{X}\n", .{
-                    armed.vector.irq_vector, armed.vector.addr,
+                msix_entry_addr = armed.entry_addr;
+                debug.klog("[virtio-gpu] MSI-X armed: IDT vec=0x{X} dest=0x{X} entry=0x{X}\n", .{
+                    armed.vector.irq_vector, armed.vector.addr, armed.entry_addr,
                 });
             } else {
                 debug.klog("[virtio-gpu] MSI-X vector write rejected, polled mode\n", .{});

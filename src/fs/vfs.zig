@@ -238,12 +238,13 @@ pub fn openFlags(pcb: *process.PCB, name: []const u8, flags: u32) ?u32 {
             return @intCast(fd_idx);
         },
         .ext2 => {
-            const handle = ext2.openFile(resolved.path) orelse return null;
-            // O_TRUNC on an existing file: drop size to 0 (block pointers
-            // stay; writeFile reuses them, no allocator round-trip).
-            if (flags & O_TRUNC != 0) _ = ext2.truncate(handle.inum);
-            const start_offset: u32 = if (flags & O_APPEND != 0) @intCast(handle.file_size) else 0;
-            if (allocFd(pcb)) |fd_idx| {
+            // Try open existing first.
+            if (ext2.openFile(resolved.path)) |handle| {
+                // O_TRUNC on an existing file: free all data + indirect-tree
+                // blocks and reset size to 0. The next writeFile re-allocates.
+                if (flags & O_TRUNC != 0) _ = ext2.truncate(handle.inum);
+                const start_offset: u32 = if (flags & O_APPEND != 0) @intCast(handle.file_size) else 0;
+                const fd_idx = allocFd(pcb) orelse return null;
                 pcb.fd_table[fd_idx] = .{
                     .in_use = true,
                     .inode = handle.inum,
@@ -252,6 +253,21 @@ pub fn openFlags(pcb: *process.PCB, name: []const u8, flags: u32) ?u32 {
                     .fs_type = .ext2,
                 };
                 return @intCast(fd_idx);
+            }
+
+            // Not found — create if O_CREATE flag set.
+            if (flags & O_CREATE != 0) {
+                if (ext2.createFilePath(resolved.path)) |handle| {
+                    const fd_idx = allocFd(pcb) orelse return null;
+                    pcb.fd_table[fd_idx] = .{
+                        .in_use = true,
+                        .inode = handle.inum,
+                        .offset = 0,
+                        .flags = 2,
+                        .fs_type = .ext2,
+                    };
+                    return @intCast(fd_idx);
+                }
             }
             return null;
         },
@@ -561,6 +577,11 @@ pub fn loadFileFresh(name: []const u8) ?FreshFile {
     const perf = @import("../debug/perf.zig");
     const serial = @import("../debug/serial.zig");
     const nvme = @import("../driver/nvme.zig");
+    // Per-syscall latency attribution — sysExec, sysExecAs, sysFsize, etc.
+    // all bottom out here. Brackets the disk read so slow-sc shows the
+    // disk-vs-other split instead of just total ms.
+    const sp = @import("../debug/syscall_perf.zig").scope(.disk_read);
+    defer sp.end();
     const t0 = perf.rdtsc();
     const size = fileSize(name) orelse return null;
     const t1 = perf.rdtsc();

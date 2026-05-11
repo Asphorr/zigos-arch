@@ -1495,7 +1495,14 @@ pub const ProcInfo = extern struct {
     tgid: u8 = 0,
     pgid: u8 = 0,
     sid: u8 = 0,
-    _pad2: [5]u8 = .{ 0, 0, 0, 0, 0 },
+    // CFS scheduler fields (added 2026-05-10) — see cpu/syscall.zig
+    // ProcInfoUser for the kernel-side mirror this must match.
+    nice: i8 = 0,
+    assigned_cpu: u8 = 0xFF,
+    pinned_cpu: u8 = 0xFF,
+    _pad2: [2]u8 = .{ 0, 0 },
+    vruntime: u64 align(1) = 0,
+    _pad3: [4]u8 = .{ 0, 0, 0, 0 },
 };
 
 /// Fill `buf` with one ProcInfo per active (non-unused) process slot.
@@ -1694,4 +1701,40 @@ pub fn sched_getaffinity(pid: u32) i32 {
     if (r == 0xFFFFFFFF) return -2;
     if (r == 0) return AFFINITY_UNPINNED;
     return @intCast(r - 1);
+}
+
+// --- Nice values (within-band CPU share) ---
+//
+// Lower nice = more CPU share, higher nice = less. Range -20..19; out-of-
+// range values clamp at the kernel side. Affects vruntime accumulation
+// rate within a priority band; cross-band scheduling is unchanged
+// (interactive ALWAYS beats normal beats background — that's setpriority(),
+// syscall #47, not nice).
+
+/// sched_setnice(pid, value) — set pid's nice value (-20..19).
+/// pid==0 = self. Returns 0 on success, -1 on error (E_INVAL/E_PERM).
+pub fn sched_setnice(pid: u32, value: i32) i32 {
+    const r = syscall(101, pid, @bitCast(value));
+    if (r == 0) return 0;
+    return -1;
+}
+
+/// sched_getnice(pid) — read pid's nice value. Returns -20..19, or
+/// -100 on error (we use -100 because -1 is a valid nice value).
+///
+/// Kernel uses offset-by-21 encoding (1..40 = nice -20..+19, 0xFFFFFFFF =
+/// error). Caller subtracts 21 to recover.
+pub fn sched_getnice(pid: u32) i32 {
+    const r = syscall(102, pid, 0);
+    if (r == 0xFFFFFFFF) return -100;
+    return @as(i32, @intCast(r)) - 21;
+}
+
+/// nice(inc) — POSIX nice(2): adjust calling thread's nice by `inc` and
+/// return the new nice value (or -100 on error).
+pub fn nice(inc: i32) i32 {
+    const cur = sched_getnice(0);
+    if (cur == -100) return -100;
+    if (sched_setnice(0, cur + inc) != 0) return -100;
+    return sched_getnice(0);
 }

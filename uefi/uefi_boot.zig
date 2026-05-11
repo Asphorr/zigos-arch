@@ -774,8 +774,12 @@ pub fn main() uefi.Status {
         pdpt_low[i] = @as(u64, i) * 0x40000000 | 0x87; // P + RW + USER + PS(1GB)
     }
 
-    // pdpt_physmap[0..63] → 1GB pages at the same phys, supervisor only.
-    for (0..64) |i| {
+    // pdpt_physmap[0..511] → 1GB pages identity-mapped within the PML4[256]
+    // window, supervisor only. Fills the full 512 GB PML4 slot so any phys
+    // address up to the architecture limit (maxphyaddr ≤ 39 bits = 512 GB on
+    // current Hyper-V/KVM hosts) is reachable via paging.physToVirt(p).
+    // Must match memmap.PHYSMAP_SIZE and src/boot/boot.asm fill loop.
+    for (0..512) |i| {
         pdpt_physmap[i] = @as(u64, i) * 0x40000000 | 0x83; // P + RW + PS(1GB), no USER
     }
 
