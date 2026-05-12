@@ -66,7 +66,7 @@ pub const CpuLocal = struct {
     current_pid: ?usize = null,
     idle_pid: ?usize = null,
     gdt_entries: [7]u64 = undefined,
-    gdt_ptr: GdtPtr = undefined,
+    gdt_ptr: gdt.GdtPtr = undefined,
     tss: gdt.Tss64 = .{},
     isr_stack: [16384]u8 align(16) = [_]u8{0} ** 16384,
     /// True from the moment apEntry starts running on this AP. Set BEFORE
@@ -236,17 +236,6 @@ pub export var per_cpu_user_rsp: [MAX_CPUS]u64 = [_]u64{0} ** MAX_CPUS;
 // Cold, protected: written only by gdt.setTssRsp0 inside a CR0.WP-cleared
 // window. Lives in .kdata_protected (page-aligned, RO post-boot).
 pub export var per_cpu_asm: [MAX_CPUS]PerCpuAsm linksection(".kdata_protected") = [_]PerCpuAsm{.{}} ** MAX_CPUS;
-
-// Must match gdt.zig's gdt_ptr type exactly
-const GdtPtr = packed struct {
-    limit: u16,
-    base: u64,
-};
-
-const GdtPtrWritable = struct {
-    limit: u16,
-    base: u64,
-};
 
 pub var cpus: [MAX_CPUS]CpuLocal = [_]CpuLocal{.{}} ** MAX_CPUS;
 pub var cpu_count: u8 = 1;
@@ -533,6 +522,12 @@ export fn apEntry() callconv(.c) noreturn {
     const label = std.fmt.bufPrint(&label_buf, "AP{d}", .{my_id}) catch "AP?";
     @import("syscall_entry.zig").verifyMsrs(label);
 
+    // SMEP/UMIP + SMAP. AP's kstack is allocated in the physmap (high-VA,
+    // U/S=0) from the start, so SMAP enable is safe immediately — unlike
+    // BSP which has to wait for paging.dropLowIdentity.
+    @import("protect.zig").applyEarlyCr4();
+    @import("protect.zig").enableSmapPerCpu();
+
     // Enable our LAPIC
     apic.initLAPICForAP();
 
@@ -607,26 +602,9 @@ fn initPerCpuGdt(cpu: *CpuLocal) void {
         .base = @intFromPtr(&cpu.gdt_entries),
     };
 
-    // Load GDT + segments + TSS
-    asm volatile (
-        \\ lgdt (%[gdt])
-        \\ pushq $0x08
-        \\ leaq 1f(%%rip), %%rax
-        \\ pushq %%rax
-        \\ lretq
-        \\ 1:
-        \\ movw $0x10, %%ax
-        \\ movw %%ax, %%ds
-        \\ movw %%ax, %%es
-        \\ movw %%ax, %%fs
-        \\ movw %%ax, %%gs
-        \\ movw %%ax, %%ss
-        \\ movw $0x28, %%ax
-        \\ ltr %%ax
-        :
-        : [gdt] "r" (&cpu.gdt_ptr),
-        : .{ .rax = true }
-    );
+    // Load GDT + segments + TSS via the shared helper (same ritual as
+    // gdt.init() runs for the BSP early-boot path).
+    gdt.loadAndReload(&cpu.gdt_ptr);
 }
 
 // --- Async app loading (offload file I/O to AP) ---

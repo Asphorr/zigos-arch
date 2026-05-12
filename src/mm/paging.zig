@@ -564,6 +564,74 @@ pub fn dropLowIdentity() void {
     flushTLB();
 }
 
+/// Walk the kernel master PML4 and count how many leaf pages exist at each
+/// granularity (1 GB / 2 MB / 4 KB) across the kernel's high-half range
+/// (PML4[256] physmap + PML4[511] kernel image). Each unique leaf consumes
+/// one TLB entry — smaller numbers = smaller TLB working set.
+///
+/// Per-slot output:
+///   `[paging] kernel TLB map: PML4[256] physmap=A×1GB+B×2MB+C×4KB
+///             PML4[511] image=A×1GB+B×2MB+C×4KB`
+///
+/// Healthy boot baseline (no splits yet):
+///   physmap=64×1GB (or up to 512 if physmap is fully populated, kernel-only)
+///   image=1×1GB
+/// After typical kernel init (guard pages, kdata RO, write-watches), expect
+/// a handful of 2 MB and 4 KB pages — anything >100 4KB pages suggests
+/// unnecessary splits worth investigating.
+const MapStats = struct {
+    pages_1g: u32 = 0,
+    pages_2m: u32 = 0,
+    pages_4k: u32 = 0,
+};
+
+fn auditSlot(pml4_entry: u64, stats: *MapStats) void {
+    if (pml4_entry & PRESENT == 0) return;
+    const pdpt_phys = pml4_entry & PAGE_MASK;
+    const pdpt: [*]const u64 = @ptrFromInt(physToVirt(pdpt_phys));
+    var i: usize = 0;
+    while (i < 512) : (i += 1) {
+        const e = pdpt[i];
+        if (e & PRESENT == 0) continue;
+        if (e & PAGE_SIZE_FLAG != 0) {
+            stats.pages_1g += 1;
+            continue;
+        }
+        const pd: [*]const u64 = @ptrFromInt(physToVirt(e & PAGE_MASK));
+        var j: usize = 0;
+        while (j < 512) : (j += 1) {
+            const pde = pd[j];
+            if (pde & PRESENT == 0) continue;
+            if (pde & PAGE_SIZE_FLAG != 0) {
+                stats.pages_2m += 1;
+                continue;
+            }
+            const pt: [*]const u64 = @ptrFromInt(physToVirt(pde & PAGE_MASK));
+            var k: usize = 0;
+            while (k < 512) : (k += 1) {
+                if (pt[k] & PRESENT != 0) stats.pages_4k += 1;
+            }
+        }
+    }
+}
+
+pub fn dumpKernelMappingStats() void {
+    if (pml4_addr == 0) return;
+    const pml4: [*]const u64 = @ptrFromInt(physToVirt(pml4_addr));
+    var physmap_stats: MapStats = .{};
+    var image_stats: MapStats = .{};
+    auditSlot(pml4[256], &physmap_stats);
+    auditSlot(pml4[511], &image_stats);
+    const serial = @import("../debug/serial.zig");
+    serial.print(
+        "[paging] kernel TLB map: PML4[256] physmap={d}x1GB+{d}x2MB+{d}x4KB PML4[511] image={d}x1GB+{d}x2MB+{d}x4KB\n",
+        .{
+            physmap_stats.pages_1g, physmap_stats.pages_2m, physmap_stats.pages_4k,
+            image_stats.pages_1g,   image_stats.pages_2m,   image_stats.pages_4k,
+        },
+    );
+}
+
 // --- 4KB-granular page protection ---
 //
 // `splitToPte` walks the kernel master PML4 down to the 4KB leaf PTE for

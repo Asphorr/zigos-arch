@@ -56,12 +56,13 @@ export fn _start() linksection(".text.entry") callconv(.c) void {
     }
     _ = libc.munmap(buf2);
 
-    // File-backed: open ls.elf (lives in /tar/, our default cwd), map the
-    // first 4 KB, and verify the ELF magic at offset 0. Confirms the
-    // file-backed branch reads the correct bytes into the kernel buffer
-    // and the page-fault handler copies them into the user page on touch.
-    const fd = libc.open("ls.elf") orelse {
-        libc.print("\x1b[31m[mmaptest] open(ls.elf) failed\x1b[0m\n");
+    // File-backed: open /bin/ls.elf (post-ext2 migration; cwd is "/", apps
+    // moved from /tar/ to /bin/), map the first 4 KB, and verify the ELF
+    // magic at offset 0. Confirms the file-backed branch reads the correct
+    // bytes into the kernel buffer and the page-fault handler copies them
+    // into the user page on touch.
+    const fd = libc.open("/bin/ls.elf") orelse {
+        libc.print("\x1b[31m[mmaptest] open(/bin/ls.elf) failed\x1b[0m\n");
         libc.exit();
     };
     const fmap = libc.mmapFile(fd, 0, 4096) orelse {

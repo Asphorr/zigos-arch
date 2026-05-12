@@ -314,6 +314,15 @@ pub const RespCapsetInfo = extern struct {
     padding: u32 = 0,
 };
 
+// Response for CMD_RESOURCE_CREATE_BLOB. Device may emit either RESP_OK_NODATA
+// (no body beyond CtrlHdr) or RESP_OK_RESOURCE_UUID (CtrlHdr + 16-byte UUID).
+// resourceCreateBlob only inspects hdr.cmd_type, but we size the receive buf
+// to the larger variant so the device-side write never truncates.
+const RespResourceUuid = extern struct {
+    hdr: CtrlHdr = .{},
+    uuid: [16]u8 = @splat(0),
+};
+
 const GetCapset = extern struct {
     hdr: CtrlHdr = .{},
     capset_id: u32 = 0,
@@ -425,7 +434,20 @@ var notify_base: usize = 0; // MMIO address of notify region
 var notify_off_multiplier: u32 = 0;
 var ctrl_vq: Virtqueue = .{};
 var cursor_vq: Virtqueue = .{};
-var cursor_cmd_phys: usize = 0; // Pre-allocated page for cursor commands
+// Cursor command ring. Single-page (4 KB) carved into CURSOR_RING_SIZE
+// UpdateCursor slots. Each sendCursorCmd writes into a fresh slot and
+// hands its physical address to the device; the previous in-flight slot
+// is left untouched while the host DMA-reads it. Sized to MAX_QUEUE_SIZE
+// so the cursor virtqueue's own free-descriptor accounting (num_free)
+// guarantees we never wrap a slot whose previous use is still pending.
+var cursor_cmd_phys: usize = 0;
+const CURSOR_RING_SIZE: u32 = MAX_QUEUE_SIZE;
+comptime {
+    if (CURSOR_RING_SIZE * @sizeOf(UpdateCursor) > 4096) {
+        @compileError("cursor ring exceeds one PMM frame");
+    }
+}
+var cursor_ring_idx: u32 = 0;
 const CURSOR_RESOURCE_ID: u32 = 100;
 pub var active: bool = false;
 pub var hw_cursor_active: bool = false;
@@ -574,7 +596,7 @@ fn sendCmdViaPhys(cmd_len: u32, resp_len: u32) bool {
 
     const ai = ctrl_vq.availIdx().*;
     ctrl_vq.availRing(ai % ctrl_vq.queue_size).* = d0_idx;
-    asm volatile ("" ::: .{ .memory = true });
+    asm volatile ("" ::: .{ .memory = true }); // compiler barrier; x86 TSO handles CPU ordering
     ctrl_vq.availIdx().* = ai +% 1;
 
     // Re-target MSI-X to the calling CPU's APIC ID BEFORE notifying the
@@ -614,7 +636,7 @@ fn sendCmdViaPhys(cmd_len: u32, resp_len: u32) bool {
     // notifyQueue so the device sees it before processing the cmd.
     if (use_event_idx) {
         ctrl_vq.usedEvent().* = ctrl_vq.last_used_idx;
-        asm volatile ("" ::: .{ .memory = true });
+        asm volatile ("" ::: .{ .memory = true }); // compiler barrier; x86 TSO handles CPU ordering
     }
 
     notifyQueue(0, &ctrl_vq);
@@ -1648,8 +1670,16 @@ fn sendCursorCmd(cmd_type: u32, x: u32, y: u32, resource_id: u32) void {
     defer cursor_lock.releaseIrqRestore(flags);
     if (cursor_vq.num_free == 0) return;
 
-    // Write command to cursor command page
-    const cmd: *volatile UpdateCursor = @ptrFromInt(paging.physToVirt(cursor_cmd_phys));
+    // Pick the next ring slot and compute its phys addr. Each in-flight
+    // descriptor owns its slot until the host completes; the next call
+    // writes into a different slot, so the host never sees a torn struct
+    // even when sendCursorCmd is invoked back-to-back faster than the
+    // host can drain.
+    const slot = cursor_ring_idx % CURSOR_RING_SIZE;
+    cursor_ring_idx +%= 1;
+    const slot_offset = slot * @sizeOf(UpdateCursor);
+    const slot_phys = cursor_cmd_phys + slot_offset;
+    const cmd: *volatile UpdateCursor = @ptrFromInt(paging.physToVirt(slot_phys));
     cmd.hdr.cmd_type = cmd_type;
     cmd.hdr.flags = 0;
     cmd.hdr.fence_id = 0;
@@ -1671,14 +1701,14 @@ fn sendCursorCmd(cmd_type: u32, x: u32, y: u32, resource_id: u32) void {
     cursor_vq.free_head = @intCast(d.next);
     cursor_vq.num_free -= 1;
 
-    d.addr = cursor_cmd_phys;
+    d.addr = slot_phys;
     d.len = @sizeOf(UpdateCursor);
     d.flags = 0; // No WRITE flag, no NEXT — fire and forget
     d.next = 0;
 
     const ai = cursor_vq.availIdx().*;
     cursor_vq.availRing(ai % cursor_vq.queue_size).* = d_idx;
-    asm volatile ("" ::: .{ .memory = true });
+    asm volatile ("" ::: .{ .memory = true }); // compiler barrier; x86 TSO handles CPU ordering
     cursor_vq.availIdx().* = ai +% 1;
 
     // Notify cursor queue (uses cached notify_off — see notifyQueue helper).
@@ -1816,13 +1846,15 @@ pub fn resourceCreateBlob(ctx_id: u32, resource_id: u32, blob_mem: u32, blob_fla
         .blob_id = blob_id,
         .size = size,
     };
-    // Response can be resp_resource_uuid (40 bytes) for blob resources
-    var resp_buf: [48]u8 align(4) = @splat(0);
+    // Response variant is either RESP_OK_NODATA (CtrlHdr only) or
+    // RESP_OK_RESOURCE_UUID — size for the larger one so the device write
+    // never truncates, even though we only inspect cmd_type below.
+    var resp_buf: [@sizeOf(RespResourceUuid)]u8 align(4) = @splat(0);
     if (!sendCmd(
         @as([*]const u8, @ptrCast(&cmd)),
         @sizeOf(ResourceCreateBlob),
         &resp_buf,
-        48,
+        @sizeOf(RespResourceUuid),
     )) {
         debug.klog("[virtio-gpu] createBlob timeout\n", .{});
         return false;

@@ -2,9 +2,19 @@ const io = @import("../io.zig");
 const acpi = @import("../time/acpi.zig");
 const paging = @import("../mm/paging.zig");
 const debug = @import("../debug/debug.zig");
+const SpinLock = @import("../proc/spinlock.zig").SpinLock;
 
 const CONFIG_ADDR: u16 = 0x0CF8;
 const CONFIG_DATA: u16 = 0x0CFC;
+
+// Serializes config-space access. Necessary because configWrite16's RMW
+// (read 32-bit slot → patch 16 bits → write back) is non-atomic, and
+// because the BAR-sizing dance in getBarSize / BAR-rewrite in assignBar64
+// briefly leaves the BAR in an all-FFs or partially-written state — any
+// concurrent reader on another CPU must not observe that intermediate.
+// Legacy port-I/O config access is also inherently non-atomic at the
+// 0xCF8/0xCFC pair, so locking is the only way to make it safe across SMP.
+var pci_lock: SpinLock = .{};
 
 // MCFG-derived ECAM (Enhanced Configuration Access Mechanism). When
 // present, replaces the legacy 0xCF8/0xCFC port pair with memory-mapped
@@ -45,11 +55,15 @@ inline fn ecamPtr(bus: u8, dev: u8, func: u8, offset: u16) ?*volatile u32 {
     if (ecam_base == 0) return null;
     if (bus < ecam_start_bus or bus > ecam_end_bus) return null;
     const rel_bus: u64 = @as(u64, bus - ecam_start_bus);
-    const addr: u64 = ecam_base +
-        (rel_bus << 20) |
+    // Parens matter: `+` binds tighter than `|` in Zig, so without the outer
+    // parens this would parse as `(ecam_base + (rel_bus << 20)) | ...`. That
+    // happens to produce the same result when ecam_base has zero bits in
+    // the OR'd ranges (q35's 0xB0000000 satisfies that), but bites silently
+    // on any ECAM base with set bits in the bus/dev/func/offset slots.
+    const addr: u64 = ecam_base + ((rel_bus << 20) |
         (@as(u64, dev) << 15) |
         (@as(u64, func) << 12) |
-        @as(u64, offset & 0xFFC);
+        @as(u64, offset & 0xFFC));
     // ecam_base is a phys address (from MCFG); deref through the physmap so
     // ECAM works without the legacy low identity map.
     return @ptrFromInt(paging.physToVirt(addr));
@@ -64,8 +78,12 @@ pub const PciDevice = struct {
     class_code: u8,
     subclass: u8,
     prog_if: u8,
+    // PCI header type byte (offset 0x0E). Bit 7 = multi-function indicator;
+    // bits 0-6 = header layout (0 = endpoint, 1 = PCI-PCI bridge, 2 = CardBus).
+    // Cached here so `enumerate` doesn't have to re-read 0x0C to decide
+    // whether to scan funcs 1-7 of a slot.
+    header_type: u8,
     bar0: usize, // Full 64-bit BAR address (handles UEFI high mappings)
-    bar1: usize,
     irq_line: u8,
 };
 
@@ -77,7 +95,7 @@ pub const PciDevice = struct {
 // drivers (nvme, virtio_sound) had hand-rolled bus walks because
 // `findByClass` only returned the first match. With the cache:
 //   - one walk total, logged in one place ("[pci] devices:" block)
-//   - findByClass / findByVendorDevice / findAllByClass / forEachDevice
+//   - findByClass / findByVendorDevice / findAllByClass / allDevices
 //     all return cache results, so adding a driver doesn't add a walk
 //   - drivers stop duplicating the "vendor==0xFFFF / multi-function /
 //     readBar64 / read IRQ line" boilerplate
@@ -102,8 +120,15 @@ var bound: [MAX_DEVICES]bool = [_]bool{false} ** MAX_DEVICES;
 pub fn enumerate() void {
     if (device_count != 0) return;
     debug.klog("[pci] enumerating bus...\n", .{});
-    var bus: u16 = 0;
-    while (bus < 256) : (bus += 1) {
+    // When MCFG is present it describes the full PCI tree; buses outside
+    // [start_bus, end_bus] simply do not exist on this platform, so we cap
+    // the scan to that range. Saves 65536 - small × 1 µs per legacy-IO
+    // config read, ~ms of boot under ECAM. Without MCFG, fall back to the
+    // legacy 0..256 sweep.
+    const first_bus: u16 = if (ecam_base != 0) ecam_start_bus else 0;
+    const last_bus: u16 = if (ecam_base != 0) @as(u16, ecam_end_bus) + 1 else 256;
+    var bus: u16 = first_bus;
+    while (bus < last_bus) : (bus += 1) {
         var dev_idx: u8 = 0;
         while (dev_idx < 32) : (dev_idx += 1) {
             var func: u8 = 0;
@@ -125,11 +150,10 @@ pub fn enumerate() void {
                         debug.klog("[pci] cache full (>{d}); ignoring further devices\n", .{MAX_DEVICES});
                         return;
                     }
-                    if (func == 0) {
-                        // Multi-function: bit 23 of header_type@0x0C set?
-                        const header = configRead(@truncate(bus), dev_idx, 0, 0x0C);
-                        if (header & 0x00800000 == 0) break;
-                    }
+                    // Multi-function indicator lives in bit 7 of the header
+                    // type, which `readDevice` already cached. Skip funcs
+                    // 1..7 for single-function devices.
+                    if (func == 0 and (d.header_type & 0x80) == 0) break;
                 } else {
                     if (func == 0) break;
                 }
@@ -139,9 +163,10 @@ pub fn enumerate() void {
     debug.klog("[pci] {d} device(s) cached\n", .{device_count});
 }
 
-/// Iterate cached devices. Caller's `cb` is called once per device.
-pub fn forEachDevice(comptime Ctx: type, ctx: *Ctx, cb: *const fn (*Ctx, PciDevice) void) void {
-    for (devices[0..device_count]) |d| cb(ctx, d);
+/// Read-only view of the cached device list. Use with a plain for loop:
+///   `for (pci.allDevices()) |d| { ... }`
+pub fn allDevices() []const PciDevice {
+    return devices[0..device_count];
 }
 
 /// Fill `out` with every cached device matching (class, subclass, prog_if).
@@ -283,8 +308,15 @@ pub fn deviceCount() usize {
 }
 
 // --- Config space access ---
+//
+// Public APIs (configRead/configWrite/configRead16/configWrite16) lock
+// pci_lock for the entire op so each call is atomic with respect to other
+// CPUs. The `*Unlocked` siblings are for sequences inside this file that
+// already hold pci_lock across multiple ops (e.g. getBarSize's size-probe
+// dance, assignBar64's BAR write-with-decode-disabled). External callers
+// must use the locked variants — they're the only public ones.
 
-pub fn configRead(bus: u8, dev: u8, func: u8, offset: u8) u32 {
+fn configReadUnlocked(bus: u8, dev: u8, func: u8, offset: u8) u32 {
     if (ecamPtr(bus, dev, func, offset)) |p| return p.*;
     const addr: u32 = @as(u32, 1) << 31 |
         @as(u32, bus) << 16 |
@@ -295,7 +327,7 @@ pub fn configRead(bus: u8, dev: u8, func: u8, offset: u8) u32 {
     return io.inl(CONFIG_DATA);
 }
 
-pub fn configWrite(bus: u8, dev: u8, func: u8, offset: u8, value: u32) void {
+fn configWriteUnlocked(bus: u8, dev: u8, func: u8, offset: u8, value: u32) void {
     if (ecamPtr(bus, dev, func, offset)) |p| {
         p.* = value;
         return;
@@ -309,19 +341,43 @@ pub fn configWrite(bus: u8, dev: u8, func: u8, offset: u8, value: u32) void {
     io.outl(CONFIG_DATA, value);
 }
 
-pub fn configRead16(bus: u8, dev: u8, func: u8, offset: u8) u16 {
-    const val32 = configRead(bus, dev, func, offset & 0xFC);
+fn configRead16Unlocked(bus: u8, dev: u8, func: u8, offset: u8) u16 {
+    const val32 = configReadUnlocked(bus, dev, func, offset & 0xFC);
     const shift: u5 = @truncate((offset & 2) * 8);
     return @truncate(val32 >> shift);
 }
 
-pub fn configWrite16(bus: u8, dev: u8, func: u8, offset: u8, value: u16) void {
+fn configWrite16Unlocked(bus: u8, dev: u8, func: u8, offset: u8, value: u16) void {
     const aligned = offset & 0xFC;
-    var val32 = configRead(bus, dev, func, aligned);
+    var val32 = configReadUnlocked(bus, dev, func, aligned);
     const shift: u5 = @truncate((offset & 2) * 8);
     val32 &= ~(@as(u32, 0xFFFF) << shift);
     val32 |= @as(u32, value) << shift;
-    configWrite(bus, dev, func, aligned, val32);
+    configWriteUnlocked(bus, dev, func, aligned, val32);
+}
+
+pub fn configRead(bus: u8, dev: u8, func: u8, offset: u8) u32 {
+    const flags = pci_lock.acquireIrqSave();
+    defer pci_lock.releaseIrqRestore(flags);
+    return configReadUnlocked(bus, dev, func, offset);
+}
+
+pub fn configWrite(bus: u8, dev: u8, func: u8, offset: u8, value: u32) void {
+    const flags = pci_lock.acquireIrqSave();
+    defer pci_lock.releaseIrqRestore(flags);
+    configWriteUnlocked(bus, dev, func, offset, value);
+}
+
+pub fn configRead16(bus: u8, dev: u8, func: u8, offset: u8) u16 {
+    const flags = pci_lock.acquireIrqSave();
+    defer pci_lock.releaseIrqRestore(flags);
+    return configRead16Unlocked(bus, dev, func, offset);
+}
+
+pub fn configWrite16(bus: u8, dev: u8, func: u8, offset: u8, value: u16) void {
+    const flags = pci_lock.acquireIrqSave();
+    defer pci_lock.releaseIrqRestore(flags);
+    configWrite16Unlocked(bus, dev, func, offset, value);
 }
 
 // --- Device scanning ---
@@ -337,6 +393,10 @@ fn readDevice(bus: u8, dev: u8, func: u8) ?PciDevice {
     const subclass: u8 = @truncate(class_reg >> 16);
     const prog_if: u8 = @truncate(class_reg >> 8);
 
+    // Header-type byte lives at byte 2 of the dword at offset 0x0C.
+    const hdr_reg = configRead(bus, dev, func, 0x0C);
+    const header_type: u8 = @truncate(hdr_reg >> 16);
+
     const irq = configRead(bus, dev, func, 0x3C);
 
     return .{
@@ -348,8 +408,8 @@ fn readDevice(bus: u8, dev: u8, func: u8) ?PciDevice {
         .class_code = class_code,
         .subclass = subclass,
         .prog_if = prog_if,
+        .header_type = header_type,
         .bar0 = readBar64(bus, dev, func, 0x10),
-        .bar1 = readBar64(bus, dev, func, 0x18), // Skip BAR1 if BAR0 is 64-bit
         .irq_line = @truncate(irq),
     };
 }
@@ -386,22 +446,27 @@ pub fn allocMmio64(size: u64, alignment: u64) u64 {
 /// Manually assign a 64-bit BAR base. Used when firmware (OVMF) leaves the
 /// BAR unassigned. Disables MEM decode during the write to avoid stray
 /// decodes from a partially-written BAR. Preserves type/prefetchable bits.
+/// Held under pci_lock for the entire sequence so concurrent readers on
+/// other CPUs don't observe the decode-disabled / half-written state.
 pub fn assignBar64(bus: u8, dev: u8, func: u8, bar_idx: u8, base: u64) void {
+    const flags = pci_lock.acquireIrqSave();
+    defer pci_lock.releaseIrqRestore(flags);
+
     const cmd_off: u8 = 0x04;
-    const orig_cmd = configRead16(bus, dev, func, cmd_off);
+    const orig_cmd = configRead16Unlocked(bus, dev, func, cmd_off);
 
     // Clear MEM decode (bit 1) during BAR write
-    configWrite16(bus, dev, func, cmd_off, orig_cmd & ~@as(u16, 0x02));
+    configWrite16Unlocked(bus, dev, func, cmd_off, orig_cmd & ~@as(u16, 0x02));
 
     const bar_off: u8 = 0x10 + bar_idx * 4;
-    const orig_lo = configRead(bus, dev, func, bar_off);
+    const orig_lo = configReadUnlocked(bus, dev, func, bar_off);
     const new_lo: u32 = (@as(u32, @truncate(base)) & 0xFFFFFFF0) | (orig_lo & 0x0F);
     const new_hi: u32 = @truncate(base >> 32);
-    configWrite(bus, dev, func, bar_off, new_lo);
-    configWrite(bus, dev, func, bar_off + 4, new_hi);
+    configWriteUnlocked(bus, dev, func, bar_off, new_lo);
+    configWriteUnlocked(bus, dev, func, bar_off + 4, new_hi);
 
     // Re-enable MEM decode + bus master + I/O space (preserve original other bits)
-    configWrite16(bus, dev, func, cmd_off, orig_cmd | 0x07);
+    configWrite16Unlocked(bus, dev, func, cmd_off, orig_cmd | 0x07);
 }
 
 /// Find a cached PCI device by class/subclass/prog_if. After
@@ -425,13 +490,28 @@ pub fn findByVendorDevice(vendor: u16, device: u16) ?PciDevice {
     return null;
 }
 
-/// Get the size of a BAR by writing all-ones and reading back.
+/// Get the size of a BAR by writing all-ones and reading back. The probe
+/// momentarily writes 0xFFFFFFFF into the BAR — on real hardware that can
+/// cause spurious decode hits during the window, so we disable MEM-decode
+/// (bit 1 of command register) across the whole sequence the way Linux's
+/// __pci_read_base does. The entire probe runs under pci_lock so a
+/// concurrent reader on another CPU can't observe the all-FFs state.
 pub fn getBarSize(dev: PciDevice, bar_idx: u8) u32 {
+    const flags = pci_lock.acquireIrqSave();
+    defer pci_lock.releaseIrqRestore(flags);
+
+    const cmd_off: u8 = 0x04;
+    const orig_cmd = configRead16Unlocked(dev.bus, dev.dev, dev.func, cmd_off);
+    configWrite16Unlocked(dev.bus, dev.dev, dev.func, cmd_off, orig_cmd & ~@as(u16, 0x02));
+
     const offset: u8 = 0x10 + bar_idx * 4;
-    const original = configRead(dev.bus, dev.dev, dev.func, offset);
-    configWrite(dev.bus, dev.dev, dev.func, offset, 0xFFFFFFFF);
-    const size_mask = configRead(dev.bus, dev.dev, dev.func, offset);
-    configWrite(dev.bus, dev.dev, dev.func, offset, original); // Restore
+    const original = configReadUnlocked(dev.bus, dev.dev, dev.func, offset);
+    configWriteUnlocked(dev.bus, dev.dev, dev.func, offset, 0xFFFFFFFF);
+    const size_mask = configReadUnlocked(dev.bus, dev.dev, dev.func, offset);
+    configWriteUnlocked(dev.bus, dev.dev, dev.func, offset, original); // Restore
+
+    configWrite16Unlocked(dev.bus, dev.dev, dev.func, cmd_off, orig_cmd);
+
     if (size_mask == 0 or size_mask == 0xFFFFFFFF) return 0;
     // For MMIO BARs: mask lower 4 bits, invert, add 1
     const masked = size_mask & 0xFFFFFFF0;

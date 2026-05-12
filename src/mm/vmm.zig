@@ -277,6 +277,11 @@ pub fn unmapUserPage(pml4: [*]align(4096) u64, virt: usize) ?usize {
     const frame = pt[pt_idx] & PAGE_MASK;
     pt[pt_idx] = 0;
 
+    // Local-only invalidate. Callers that unmap a batch of pages should
+    // issue ONE `tlb.shootdownAll()` after the whole batch — broadcasting
+    // per-page would multiply IPI cost N× for the same effect. Single-
+    // page callers must still call shootdownAll themselves (this routine
+    // doesn't know batch boundaries).
     asm volatile ("invlpg (%[addr])"
         :
         : [addr] "r" (virt),

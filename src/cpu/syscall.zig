@@ -71,6 +71,10 @@ fn validateUserPtr(ptr: usize, len: usize) bool {
     // before letting the syscall body dereference it. Found by redteam
     // fuzzer hitting sysGetcwd with a random user-range pointer.
     if (len > 0 and !process.allCurrentUserPagesMapped(ptr, len)) return false;
+    // Validation succeeded — caller is about to deref. STAC unlocks user
+    // memory access for the remainder of this syscall; doSyscall's defer
+    // CLACs on exit. Cheap: with SMAP off this is a noop branch.
+    @import("protect.zig").allowUserAccess();
     return true;
 }
 
@@ -137,6 +141,11 @@ export fn doSyscall(sys_num: u32, arg1: u32, arg2: u32, arg3: u32, frame_raw: *a
     // virtio_gpu wait, vfs read, ...) accumulate cycles into named phases;
     // dumped on slow-sc threshold so the operator sees WHERE the time went.
     @import("../debug/syscall_perf.zig").reset();
+    // SMAP: ensure AC is cleared on syscall exit even if validateUserPtr
+    // already STAC'd. The bracketing is per-syscall, not per-access — once
+    // a syscall has unlocked user access for one buffer it stays unlocked
+    // until return, but no other kernel path runs with AC=1.
+    defer @import("protect.zig").disallowUserAccess();
     defer {
         // Subtract any descheduled-time gap recorded by blocking primitives
         // (yield/sleep) so the syscall counter reflects CPU time, not wall.
@@ -969,6 +978,12 @@ fn sysMunmap(va: u32, len: u32) u32 {
     while (page < end) : (page += 0x1000) {
         if (vmm.unmapUserPage(pd, page)) |frame| pmm.freeFrame(frame);
     }
+    // Single cross-CPU TLB shootdown for the whole range. unmapUserPage
+    // only does a local invlpg per page; without this call, other CPUs
+    // would still cache the freed pages' translations and could read /
+    // write into now-recycled PMM frames. Doing it once at batch end
+    // rather than inside unmapUserPage cuts the IPI count by len/4096×.
+    @import("tlb.zig").shootdownAll();
 
     // Compact the lazy_regions array. heap_lazy_idx is sbrk's pointer; if it
     // happens to be above the removed slot, shift it down by one to keep

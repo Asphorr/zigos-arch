@@ -10,24 +10,21 @@
 //     pre-kernel page setup also handles >4GB FB locations — see
 //     `project_kstack_guards_uefi_skip.md` / 64GB 1GB-page mapping).
 //   - Multiboot: QEMU's `-kernel` loader doesn't pass framebuffer info,
-//     so we probe the Bochs VGA Adapter (BGA, 0x1234:0x1111). The BGA
-//     framebuffer BAR is always 32-bit (< 4 GB), already covered by
-//     boot.asm's 4 GB 2 MB-page identity map; `paging.mapMMIO` would be
-//     a no-op here anyway since paging.init hasn't run yet. Cache
-//     attribute on the FB stays write-back, which is fine for QEMU.
+//     and probing BGA on virtio-vga-gl is a trap — the registers respond
+//     so detection succeeds, but writes hit memory that never scans out.
+//     Multiboot stays in VGA text mode until `tryVirtioGpu` upgrades it
+//     mid-Phase-2 once PMM/paging/heap are ready.
 //
 // Returns true if a framebuffer was set up and `gfx.screen_w/h` are non-zero.
 // On false, callers fall back to VGA text mode rendering.
 
 const gfx = @import("gfx.zig");
-const bga = @import("bga.zig");
 const virtio_gpu = @import("../driver/virtio_gpu.zig");
 const boot_info_mod = @import("../boot/boot_info.zig");
+const paging = @import("../mm/paging.zig");
 const serial = @import("../debug/serial.zig");
 
 pub var active: bool = false;
-pub var via_bga: bool = false;
-pub var via_virtio_gpu: bool = false;
 
 pub fn init(boot_info: *const boot_info_mod.BootInfo) bool {
     // UEFI path — bootloader already has GOP up; just adopt it.
@@ -38,8 +35,7 @@ pub fn init(boot_info: *const boot_info_mod.BootInfo) bool {
             // kernel physmap. Phase 3 dropped PML4[0], so a raw phys
             // pointer would fault on the first fillRect once the desktop
             // takes over. The physmap covers all phys < 64 GB.
-            const paging = @import("../mm/paging.zig");
-            const ptr: [*]volatile u32 = @ptrFromInt(paging.physToVirt(@as(usize, @intCast(fb.base))));
+            const ptr: [*]volatile u32 = @ptrFromInt(paging.physToVirt(@as(usize, fb.base)));
             gfx.setScreen(ptr, fb.width, fb.height);
             // gfx primitives (fillRect/drawString) write to `target`, not
             // `screen`. Point target at the live FB so boot_screen draws
@@ -47,36 +43,23 @@ pub fn init(boot_info: *const boot_info_mod.BootInfo) bool {
             // (no PMM, no place to put one).
             gfx.useFramebuffer();
             active = true;
-            via_bga = false;
             serial.print("[early-fb] UEFI GOP {d}x{d} fb=0x{X}\n", .{ fb.width, fb.height, fb.base });
             return true;
         }
     }
 
-    // Multiboot path: NO BGA attempt here. The Bochs VGA register set
-    // responds on QEMU's virtio-vga-gl (so detection succeeds) but the
-    // device scans out from its own virtio-gpu resource, not BGA's
-    // framebuffer — writes go into memory that's never displayed and the
-    // entire boot screen is invisible. Multiboot starts in VGA text mode
-    // (also invisible on virtio-vga-gl, but cheap and harmless) and gets
-    // upgraded to a real graphical framebuffer mid-Phase-2 by
-    // tryVirtioGpu() once PMM/paging/heap are ready.
+    // Multiboot: no early FB. Boot continues in VGA text mode; tryVirtioGpu
+    // upgrades to graphical once PMM/heap are up.
     serial.print("[early-fb] multiboot: no early framebuffer; awaiting tryVirtioGpu\n", .{});
-    active = false;
-    via_bga = false;
     return false;
 }
 
-/// Called by desktop.zig right before it brings up virtio-gpu so the
-/// scanout transitions cleanly from BGA to virtio. UEFI-supplied FBs are
-/// left alone (the GOP framebuffer is replaced by virtio_gpu.framebuffer
-/// when desktop calls gfx.setScreen on it — no teardown needed).
-pub fn handoffToVirtioGpu() void {
-    if (!active) return;
-    if (via_bga) bga.disable();
+/// Release the early framebuffer's claim on `active`. Called before
+/// virtio-gpu takes over (so `tryVirtioGpu`'s `if (active)` gate clears),
+/// and from the panic path so the panic screen can repaint the FB without
+/// `tryVirtioGpu` short-circuiting on a stale flag.
+pub fn release() void {
     active = false;
-    via_bga = false;
-    via_virtio_gpu = false;
 }
 
 /// Multiboot post-Phase-2 upgrade path. UEFI already has GOP via init();
@@ -104,7 +87,6 @@ pub fn tryVirtioGpu() bool {
     // direct-to-resource writes need a TRANSFER+FLUSH to actually display.
     gfx.post_blit_fn = &virtio_gpu.flush;
     active = true;
-    via_virtio_gpu = true;
     serial.print("[early-fb] upgraded to virtio-gpu {d}x{d}\n", .{ virtio_gpu.width, virtio_gpu.height });
     return true;
 }

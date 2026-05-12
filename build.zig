@@ -297,6 +297,7 @@ pub fn build(b: *std.Build) void {
         .{ "mmaptest.elf", "app/mmaptest.zig" },
         .{ "threadtest.elf", "app/threadtest.zig" },
         .{ "threadbrot.elf", "app/threadbrot.zig" },
+        .{ "synctest.elf", "app/synctest.zig" },
         .{ "sigtest.elf", "app/sigtest.zig" },
         .{ "forktest.elf", "app/forktest.zig" },
         .{ "daemontest.elf", "app/daemontest.zig" },
@@ -730,7 +731,7 @@ pub fn build(b: *std.Build) void {
         \\  sysmon.elf calc.elf settings.elf files.elf about.elf tg.elf \
         \\  paint.elf editor.elf doom.elf gpu_test.elf vulkan_triangle.elf \
         \\  venus_test.elf vulkan_cube.elf doom_real.elf \
-        \\  mmaptest.elf threadtest.elf threadbrot.elf forktest.elf daemontest.elf logd.elf photo.elf wallpaper.elf \
+        \\  mmaptest.elf threadtest.elf threadbrot.elf synctest.elf forktest.elf daemontest.elf logd.elf photo.elf wallpaper.elf \
         \\  redteam.elf
         \\echo "[tar] rebuilt"
         ,

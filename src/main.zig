@@ -217,6 +217,13 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     @import("cpu/syscall_entry.zig").init();
     @import("cpu/syscall_entry.zig").verifyMsrs("BSP");
     blog.ok("Syscall/sysret MSRs");
+    // SMEP/UMIP — safe to enable on BSP now. SMAP is deferred until
+    // desktop.taskEntry has dropped the low-half identity map, because
+    // the UEFI boot stack lives at low-VA with the USER bit set and
+    // enabling SMAP here #PFs on the next push.
+    @import("cpu/protect.zig").detectFeatures();
+    @import("cpu/protect.zig").applyEarlyCr4();
+    blog.ok("SMEP/UMIP (SMAP deferred to post-PML4[0] drop)");
     // Capture the FPU/SSE "init" state used to seed every new process. Must
     // run after enableSSE() (CR0/CR4 already set) and before process.create()
     // can be called.
@@ -309,7 +316,7 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     // Hyper-V enlightenment detection. When QEMU exposes the frequency
     // MSRs (`-cpu host,hv-frequencies`) apic.calibrateTimer() reads them
     // directly instead of running the 10 ms HPET gate.
-    @import("cpu/hyperv.zig").detect();
+    @import("virt/hyperv.zig").detect();
     if (@import("time/apic.zig").init()) {
         blog.ok("Local APIC + IOAPIC");
     } else {
@@ -407,6 +414,13 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
         pmm.freeFrameCount() * 4 / 1024,
         @import("cpu/smp.zig").aliveCpuCount(),
     });
+
+    // Audit the kernel's page-table mapping granularity. Surfaces TLB
+    // working-set size and detects over-splitting (every 2 MB or 4 KB
+    // page = extra TLB pressure). Healthy baseline: a couple of 1 GB
+    // entries, a handful of 2 MB, double-digit 4 KB. Order: run AFTER
+    // guard pages + kdata RO + write-watches so all splits are visible.
+    @import("mm/paging.zig").dumpKernelMappingStats();
 
     // Hold the finished boot panel for ~1.2 s so the user can actually see
     // the all-OK state before desktop wipes the framebuffer with its splash.
@@ -593,7 +607,7 @@ pub fn panic(msg: []const u8, _: ?*std.builtin.StackTrace, ret_addr: ?usize) nor
     // because BGA is scanning out its own buffer instead of the text mode
     // memory at 0xB8000.
     @import("ui/boot_screen.zig").disable();
-    @import("ui/early_fb.zig").handoffToVirtioGpu();
+    @import("ui/early_fb.zig").release();
 
     @import("debug/panic_screen.zig").draw(.{
         .int_no = 255,

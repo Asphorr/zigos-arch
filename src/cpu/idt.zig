@@ -14,6 +14,7 @@ const elf_loader = @import("../proc/elf_loader.zig");
 const apic = @import("../time/apic.zig");
 const symbols = @import("../debug/symbols.zig");
 const signals = @import("../proc/signals.zig");
+const memmap = @import("../mm/memmap.zig");
 
 // x86_64 IDT entry: 16 bytes (128 bits)
 const Entry = packed struct(u128) {
@@ -109,6 +110,9 @@ pub fn init() void {
     setGate(32, @intFromPtr(&isr_irq0), 0x8E);
     setGate(33, @intFromPtr(&isr_irq1), 0x8E);
     setGate(44, @intFromPtr(&isr_irq12), 0x8E); // Mouse
+
+    // TLB shootdown IPI (vector 0x50). Receiver: full local TLB flush + ack.
+    setGate(@import("tlb.zig").TLB_VECTOR, @intFromPtr(&isr_tlb_shootdown), 0x8E);
 
     // Syscall (DPL=3: callable from Ring 3)
     setGate(128, @intFromPtr(&syscall.isr_syscall), 0xEE);
@@ -241,6 +245,10 @@ export fn handleException(rsp: u64) callconv(.c) void {
     const t = @import("../debug/perf.zig").enter();
     defer @import("../debug/perf.zig").leave(.exception, t);
     asm volatile ("cli");
+    // SMAP: an exception during a syscall body inherits AC=1 from the
+    // syscall; clear it so kernel-mode handler code runs with SMAP
+    // enforcement. IRET pops RFLAGS so AC is restored on return.
+    @import("protect.zig").disallowUserAccess();
 
     // Sanity-check the rsp arg: a non-canonical or NULL pointer here means
     // the IRQ stub's leaq fed us garbage (e.g., TSS.RSP0 was clobbered or
@@ -742,6 +750,31 @@ export fn handleException(rsp: u64) callconv(.c) void {
             if (error_code & 16 != 0) "instruction-fetch" else "",
             cr2,
         });
+        // SMAP-violation classifier — supervisor #PF on a present page in
+        // user-VA range almost certainly means kernel touched user memory
+        // without STAC (i.e. outside an active syscall validateUserPtr
+        // bracket). Names the bug class so we don't have to puzzle over
+        // "kernel-mode #PF on a present page".
+        const protect = @import("protect.zig");
+        if (protect.smap_enabled and
+            (error_code & 4) == 0 and
+            (error_code & 1) != 0 and
+            cr2 >= memmap.USER_SPACE_START and cr2 < memmap.USER_SPACE_END and
+            (error_code & 16) == 0)
+        {
+            serial.print("  [SMAP] kernel touched user page without STAC — validate user pointer first\n", .{});
+        }
+        // SMEP-violation classifier — supervisor instruction-fetch #PF on
+        // a present user-VA page = kernel jumped into user .text. Usually
+        // means RIP got corrupted via stack overflow / wild-write / ROP.
+        if (protect.smep_enabled and
+            (error_code & 4) == 0 and
+            (error_code & 1) != 0 and
+            cr2 >= memmap.USER_SPACE_START and cr2 < memmap.USER_SPACE_END and
+            (error_code & 16) != 0)
+        {
+            serial.print("  [SMEP] kernel tried to fetch from user page — corrupted RIP / ROP\n", .{});
+        }
     }
 
     // Stack backtrace with symbol resolution (follow RBP chain)
@@ -792,7 +825,7 @@ export fn handleException(rsp: u64) callconv(.c) void {
     // Stub still serves debugger sessions; user just sees the panic
     // UI while waiting.
     @import("../ui/boot_screen.zig").disable();
-    @import("../ui/early_fb.zig").handoffToVirtioGpu();
+    @import("../ui/early_fb.zig").release();
     @import("../debug/panic_screen.zig").draw(.{
         .int_no = int_no,
         .crash_rip = saved_rip,
@@ -917,6 +950,11 @@ inline fn bisectPoint(comptime label: []const u8, frame: [*]const u64, snap: @im
 }
 
 export fn handleIRQ0(rsp: u64) callconv(.c) void {
+    // SMAP: timer IRQ during a syscall body inherits AC=1; clear it so the
+    // scheduler / schedulable kernel work runs with SMAP enforcement. IRET
+    // pops RFLAGS so AC is restored on return.
+    @import("protect.zig").disallowUserAccess();
+
     // KASAN: same invariant as handleException — the saved-state region
     // must be on a live kstack. If we entered IRQ0 on a kstack whose owner
     // already exited, the body has been poisoned by markPcbDead and we trip
@@ -1200,6 +1238,7 @@ fn rearmTimerForCurrent(cpu: *@import("smp.zig").CpuLocal) void {
 }
 
 export fn handleIRQ1() callconv(.c) void {
+    @import("protect.zig").disallowUserAccess();
     const t = @import("../debug/perf.zig").enter();
     defer @import("../debug/perf.zig").leave(.irq1_kbd, t);
     const scancode = io.inb(0x60);
@@ -1208,6 +1247,7 @@ export fn handleIRQ1() callconv(.c) void {
 }
 
 export fn handleIRQ12() callconv(.c) void {
+    @import("protect.zig").disallowUserAccess();
     const t = @import("../debug/perf.zig").enter();
     defer @import("../debug/perf.zig").leave(.irq12_mouse, t);
     mouse.handleIRQ();
@@ -1446,6 +1486,45 @@ fn isr_spurious() callconv(.naked) void {
     asm volatile ("iretq"); // No EOI for spurious interrupts
 }
 
+// TLB-shootdown IPI stub (vector 0x50). Same caller-saved pattern as
+// isr_irq1; handler just does cr3 reload + ack decrement + eoi, so a full
+// fxsave isn't strictly required, but the alignment math is easier if we
+// match the IRQ stubs' shape. Alignment: 40 + 72 + 512 = 624B ≡ 0 mod 16 ✓
+fn isr_tlb_shootdown() callconv(.naked) void {
+    asm volatile (
+        \\ pushq %%rax
+        \\ pushq %%rcx
+        \\ pushq %%rdx
+        \\ pushq %%rdi
+        \\ pushq %%rsi
+        \\ pushq %%r8
+        \\ pushq %%r9
+        \\ pushq %%r10
+        \\ pushq %%r11
+        \\ subq $512, %%rsp
+        \\ fxsaveq (%%rsp)
+        \\ test $0xF, %%rsp
+        \\ jnz isr_tlb_shootdown_align_panic
+        \\ call handleTlbShootdown
+        \\ fxrstorq (%%rsp)
+        \\ addq $512, %%rsp
+        \\ popq %%r11
+        \\ popq %%r10
+        \\ popq %%r9
+        \\ popq %%r8
+        \\ popq %%rsi
+        \\ popq %%rdi
+        \\ popq %%rdx
+        \\ popq %%rcx
+        \\ popq %%rax
+        \\ iretq
+    );
+}
+
+pub export fn isr_tlb_shootdown_align_panic() callconv(.c) noreturn {
+    @panic("isr_tlb_shootdown: RSP misaligned at call handleTlbShootdown");
+}
+
 // --- Dynamic IRQ vectors (MSI-X) ---------------------------------------------
 // 16 reusable vectors above the legacy IRQ block. Drivers call
 // `idt.registerIrq(vec, handler)` after parking a free vector via
@@ -1479,6 +1558,7 @@ pub fn registerIrq(vec: u8, handler: DynHandler) void {
 }
 
 export fn handleDynIrq(vec: u32) callconv(.c) void {
+    @import("protect.zig").disallowUserAccess();
     const t = @import("../debug/perf.zig").enter();
     defer @import("../debug/perf.zig").leave(.dynirq, t);
     const idx: usize = @intCast(vec - DYN_IRQ_BASE);

@@ -8,21 +8,35 @@
 ; absolute jump after long mode is enabled.
 ;
 ; THREE mappings live in CR3 once we're done here:
-;   PML4[0]    → pdpt_low      : 64×1GB pages, identity-maps phys 0..64 GB.
+;   PML4[0]    → pdpt_low      : 4×1GB pages, identity-maps phys 0..4 GB.
 ;                                USER bit set so per-process PML4[0..255]
 ;                                inheritance keeps working for lazy-fault
 ;                                paths. desktop.taskEntry zeroes this entry
 ;                                in the kernel master post-init once nothing
-;                                still walks low identity.
-;   PML4[256]  → pdpt_physmap  : 64×1GB pages at VA 0xFFFF800000000000 →
-;                                phys 0..64 GB, supervisor-only. The canonical
+;                                still walks low identity. Width is 4 GB on
+;                                purpose: kernel image + boot stack + page
+;                                tables + multiboot info all sit well under
+;                                1 GB phys, so anything above 4 GB faulting
+;                                here is a pointer-corruption signal rather
+;                                than a silent walk.
+;   PML4[256]  → pdpt_physmap  : 512×1GB pages at VA 0xFFFF800000000000 →
+;                                phys 0..512 GB, supervisor-only. The canonical
 ;                                "kernel can reach any phys page" view.
 ;                                physToVirt(p) returns PHYSMAP_BASE + p.
+;                                Goes all the way to 512 GB because some MMIO
+;                                BARs (e.g. xHCI at ~481 GB on -cpu host with
+;                                39-bit maxphyaddr) land high.
 ;   PML4[511]  → pdpt_high     : one 1GB page at slot 510 (0xFFFFFFFF80000000),
 ;                                supervisor-only, covers the kernel image.
 ;
 ; The physmap entries strip USER so user processes inheriting kernel high
 ; halves can't see them. (Per-process PML4[0] is still sandboxed by vmm.)
+;
+; Boot stack: lives at `stack_top` in .bss.boot (low phys, < 16 MB). Used
+; during _start and early kmain. The BSP transitions to its per-CPU kstack
+; (high VA, allocated in kernel init) via enterFirstTask BEFORE
+; desktop.taskEntry drops PML4[0]; once dropped, the boot stack is
+; unreachable. No code path returns to use it again.
 [BITS 32]
 
 ; Multiboot1 header
@@ -49,9 +63,10 @@ align 4096
 
 ; 4-level page tables — three sibling PDPTs, see header for layout.
 ;
-; pdpt_low      : PML4[0]   → 64×1GB identity (0..64 GB), USER bit set.
-;                              See header for why USER is set + when it's
-;                              dropped post-init.
+; pdpt_low      : PML4[0]   → 4×1GB identity (0..4 GB), USER bit set.
+;                              See header for why USER is set + why the width
+;                              is deliberately small + when the whole entry
+;                              is dropped post-init.
 ; pdpt_physmap  : PML4[256] → 64×1GB at VA 0xFFFF800000000000 → phys 0..64 GB,
 ;                              supervisor-only. The kernel's phys-frame view.
 ; pdpt_high     : PML4[511] → 1 GB at slot 510 (VA 0xFFFFFFFF80000000) →
@@ -181,15 +196,18 @@ _start:
     or  eax, 0x03                       ; Present + R/W (NO USER)
     mov dword [pml4 + 511 * 8], eax
 
-    ; Fill pdpt_low[0..63] with 1 GB huge pages (low identity map).
+    ; Fill pdpt_low[0..3] with 1 GB huge pages (low identity map).
     ; PDPTE layout: phys[51:30]<<30 | PS (bit 7) | USER (bit 2) | RW | P
-    ; Phys advances 0x40000000 per entry. EAX wraps every 4 entries (every
-    ; 4 GB), so ADC carries into EDX which holds the high 32 bits.
+    ; Width is 4 GB on purpose — anything we need during early boot lives
+    ; in low phys (kernel image + boot stack + page tables + multiboot
+    ; info all under 16 MB typically); a stray pointer landing above 4 GB
+    ; faulting here is a signal, not a hazard. Entries [4..511] stay zero
+    ; from the rep-stosd zero-fill earlier.
     push edi
     mov edi, pdpt_low
     xor edx, edx                        ; high 32 bits of entry
     mov eax, 0x00000087                 ; phys=0 | PS | USER | RW | P
-    mov ecx, 64                         ; 64 × 1 GB = 64 GB
+    mov ecx, 4                          ; 4 × 1 GB = 4 GB
 .fill_pdpt_low:
     mov [edi], eax
     mov [edi + 4], edx
@@ -207,7 +225,7 @@ _start:
     push edi
     mov edi, pdpt_physmap
     xor edx, edx
-    mov eax, 0x00000083                 ; phys=0 | PS | RW | P  (no USER)
+    mov eax, 0x00000183                 ; phys=0 | G | PS | RW | P  (no USER)
     mov ecx, 512
 .fill_pdpt_physmap:
     mov [edi], eax
@@ -223,8 +241,18 @@ _start:
     ; The kernel image lives in 0..64 MB, so one 1 GB page at this slot
     ; covers the whole image (and 1 GB of low phys for kernel use).
     ; Slot 510 because (0xFFFFFFFF80000000 >> 30) & 0x1FF = 510.
-    ; Flags: P+RW+PS, no USER (kernel-only).
-    mov dword [pdpt_high + 510 * 8],     0x00000083
+    ; Flags: G+P+RW+PS, no USER (kernel-only). G=1 (bit 8) makes the
+    ; entry survive CR3 reloads — kernel TLB persists across user
+    ; context switches once CR4.PGE is on. Useless without CR4.PGE;
+    ; protect.applyEarlyCr4 enables PGE at kernel init.
+    ;
+    ; Note: when applyEarlyCr4 flips CR4.PGE from 0→1, the act of writing
+    ; CR4 with a PGE toggle flushes the entire TLB (Intel SDM Vol 3
+    ; §4.10.4.1). So the pre-PGE TLB entries (which were treated as
+    ; non-global despite our G=1 bit) get nuked and subsequent walks
+    ; repopulate them with proper global semantics. No explicit flush
+    ; needed at the PGE turn-on site.
+    mov dword [pdpt_high + 510 * 8],     0x00000183
     mov dword [pdpt_high + 510 * 8 + 4], 0
 
     ; --- Enable PAE (CR4.PAE = bit 5) + SSE (bits 9, 10) ---

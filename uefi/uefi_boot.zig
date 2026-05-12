@@ -779,14 +779,17 @@ pub fn main() uefi.Status {
     // address up to the architecture limit (maxphyaddr ≤ 39 bits = 512 GB on
     // current Hyper-V/KVM hosts) is reachable via paging.physToVirt(p).
     // Must match memmap.PHYSMAP_SIZE and src/boot/boot.asm fill loop.
+    // G=1 (0x100) — global bit so the kernel physmap TLB entries survive
+    // CR3 reloads. Inert until CR4.PGE is enabled (protect.applyEarlyCr4).
     for (0..512) |i| {
-        pdpt_physmap[i] = @as(u64, i) * 0x40000000 | 0x83; // P + RW + PS(1GB), no USER
+        pdpt_physmap[i] = @as(u64, i) * 0x40000000 | 0x183; // G + P + RW + PS(1GB), no USER
     }
 
     // pdpt_high[510] = phys 0..1GB at VA 0xFFFFFFFF80000000.
     // Kernel image (linker.ld places it here) lives in this window.
     // Slot index: (0xFFFFFFFF80000000 >> 30) & 0x1FF = 510.
-    pdpt_high[510] = 0x83; // P + RW + PS(1GB) at phys 0, supervisor only
+    // G=1 (0x100) so kernel image entries survive CR3 reloads (needs PGE).
+    pdpt_high[510] = 0x183; // G + P + RW + PS(1GB) at phys 0, supervisor only
 
     // Load new page tables
     asm volatile ("movq %[val], %%cr3"

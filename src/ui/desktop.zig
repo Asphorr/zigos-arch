@@ -2108,6 +2108,9 @@ pub fn taskEntry() callconv(.c) noreturn {
     // driver/walker sweep done in Phase 2. Per-process address spaces own
     // their own PML4[0] independently, so user processes are unaffected.
     @import("../mm/paging.zig").dropLowIdentity();
+    // BSP is now off the UEFI low-half boot stack; safe to enable SMAP
+    // (kstack is high-VA / U/S=0, so the next push won't #PF).
+    @import("../cpu/protect.zig").enableSmapPerCpu();
     // enterFirstTask cli'd before swapping us onto desktop's kstack —
     // re-enable IRQs now that RSP is on the high-VA kstack and the
     // legacy low identity is gone.
@@ -2134,7 +2137,7 @@ pub fn run() void {
     // device in a known state. UEFI's GOP framebuffer is replaced by
     // virtio_gpu.framebuffer below — no explicit teardown needed.
     @import("boot_screen.zig").disable();
-    @import("early_fb.zig").handoffToVirtioGpu();
+    @import("early_fb.zig").release();
     @import("vga.zig").bg = .Black;
     @import("vga.zig").fg = .Black;
     @import("vga.zig").clear();

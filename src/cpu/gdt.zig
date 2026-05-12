@@ -32,11 +32,6 @@ comptime {
 // 7 GDT entries: null, kcode, kdata, ucode, udata, tss_low, tss_high
 var entries: [7]u64 = undefined;
 
-var gdt_ptr: packed struct {
-    limit: u16,
-    base: u64,
-} = undefined;
-
 // Hardware `lgdt m16:64` reads exactly limit (offset 0, 2 bytes) + base
 // (offset 2, 8 bytes). `packed` keeps `base` at byte offset 2; if a
 // refactor drops `packed`, Zig aligns u64 and `base` jumps to offset 8 —
@@ -44,9 +39,15 @@ var gdt_ptr: packed struct {
 // faults silently. Comptime offset check catches it. (We don't assert
 // @sizeOf because Zig may round the backing integer up to 16 bytes; the
 // trailing pad bytes are after `base` and lgdt ignores them.)
+pub const GdtPtr = packed struct {
+    limit: u16,
+    base: u64,
+};
 comptime {
-    if (@offsetOf(@TypeOf(gdt_ptr), "base") != 2) @compileError("gdt_ptr.base must be at offset 2");
+    if (@offsetOf(GdtPtr, "base") != 2) @compileError("GdtPtr.base must be at offset 2");
 }
+
+var gdt_ptr: GdtPtr = undefined;
 
 var tss: Tss64 = .{};
 
@@ -162,6 +163,37 @@ pub fn loadIdt() void {
     idt_mod.loadIdtForAP();
 }
 
+/// Install a GDT and reload all segment registers + TSS in one shot.
+/// Used by both the BSP early-boot path (`init`) and per-CPU GDT setup
+/// (`smp.initPerCpuGdt`) — same hardware ritual, single source of truth.
+///
+/// The asm: `lgdt` loads the table, the push-RIP-then-lretq trick reloads
+/// CS (mov-to-CS is illegal in long mode), then we reload the data segs
+/// to 0x10 (kdata) and load TR with 0x28 (the TSS descriptor at index 5).
+/// The whole sequence assumes the GDT layout produced by `init` /
+/// `initPerCpuGdt`: index 1 = kcode, 2 = kdata, 5 = TSS.
+pub fn loadAndReload(ptr: *const GdtPtr) void {
+    asm volatile (
+        \\ lgdt (%[gdt])
+        \\ pushq $0x08
+        \\ leaq 1f(%%rip), %%rax
+        \\ pushq %%rax
+        \\ lretq
+        \\ 1:
+        \\ movw $0x10, %%ax
+        \\ movw %%ax, %%ds
+        \\ movw %%ax, %%es
+        \\ movw %%ax, %%fs
+        \\ movw %%ax, %%gs
+        \\ movw %%ax, %%ss
+        \\ movw $0x28, %%ax
+        \\ ltr %%ax
+        :
+        : [gdt] "r" (ptr),
+        : .{ .rax = true }
+    );
+}
+
 pub fn makeEntry(base: u32, limit: u32, access: u8, flags: u4) u64 {
     const f: u64 = flags;
     return @as(u64, limit & 0xFFFF) |
@@ -196,23 +228,5 @@ pub fn init() void {
         .base = @intFromPtr(&entries),
     };
 
-    asm volatile (
-        \\ lgdt (%[gdt])
-        \\ pushq $0x08
-        \\ leaq 1f(%%rip), %%rax
-        \\ pushq %%rax
-        \\ lretq
-        \\ 1:
-        \\ movw $0x10, %%ax
-        \\ movw %%ax, %%ds
-        \\ movw %%ax, %%es
-        \\ movw %%ax, %%fs
-        \\ movw %%ax, %%gs
-        \\ movw %%ax, %%ss
-        \\ movw $0x28, %%ax
-        \\ ltr %%ax
-        :
-        : [gdt] "r" (&gdt_ptr),
-        : .{ .rax = true }
-    );
+    loadAndReload(&gdt_ptr);
 }

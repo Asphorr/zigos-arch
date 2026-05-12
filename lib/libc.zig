@@ -710,29 +710,69 @@ pub fn getWindowSize() WindowSize {
     return .{ .w = buf[0], .h = buf[1] };
 }
 
-// --- Free-list malloc/free with boundary tags ---
+// --- Heap allocator: thread-safe boundary-tag with magic-protected blocks --
 //
-// Each allocation is preceded by a 16-byte Block header carrying both this
-// block's size AND the previous block's size — Knuth boundary tags. Backward
-// coalesce becomes O(1): on free we look at `block.prev_size` to find the
-// predecessor instead of walking from heap_start.
+// Each allocation is preceded by a 16-byte Block header carrying:
+//   - this block's size (multiple of 16, includes header)
+//   - a magic word (MAGIC_ALLOC when in-use, MAGIC_FREE when on the free list)
+//   - the preceding block's size (Knuth boundary tag — backward coalesce is
+//     O(1): on free we look at `prev_size` instead of walking from heap_start)
 //
-// realloc tries three strategies before falling back to malloc-copy-free:
-//   1. Already big enough → split off remainder
+// Thread safety: `heap_lock` (Mutex) wraps every public API. Uncontended path
+// is a single atomic CAS; contended falls into the futex.
+//
+// Block magic is the main corruption canary. `free()` validates it before
+// touching anything, catching:
+//   - free(ptr_not_from_malloc): random memory rarely has MAGIC_ALLOC at -16
+//   - free(ptr + offset): mid-block frees, rejected by the alignment check
+//   - free(ptr); free(ptr): second free sees MAGIC_FREE, returns silently
+//   - buffer overflow scribbling the next block's header: magic mismatch
+//
+// Allocation policy is next-fit-with-hint: each malloc starts the free-list
+// scan from where the last successful alloc landed, wrapping at heap_end.
+// Spreads allocations out (reduces fragmentation vs first-fit) and skips
+// the "long prefix of used blocks" walk-cost as the heap fills.
+//
+// realloc tries three strategies before fall-back:
+//   1. Already big enough → shrink in place + split remainder
 //   2. Next block is free and combined size fits → merge in place
-//   3. Otherwise: malloc + memcpy + free
+//   3. malloc + memcpy + free
+// All three run under a single heap_lock acquire so the source bytes can't
+// be racily reused between the strategy-3 malloc and free.
+
+const BLOCK_MAGIC_ALLOC: u32 = 0xA110_CA7E; // "ALLOCATE"
+const BLOCK_MAGIC_FREE: u32 = 0xFEED_5EED; // "FEED-SEED"
+
+/// Pattern written into freed payload when HEAP_DEBUG_FILL is true. 0xDD
+/// catches use-after-free by ensuring re-reads of freed data return junk
+/// rather than the previously-stored value. Off by default — adds a memset
+/// per free.
+const FREE_FILL: u8 = 0xDD;
+const HEAP_DEBUG_FILL: bool = false;
 
 const Block = extern struct {
     size: u32, // total block size including this 16-byte header (multiple of 16)
-    is_free: u32, // 0 = used, 1 = free
+    magic: u32, // BLOCK_MAGIC_ALLOC or BLOCK_MAGIC_FREE; 0 on a defensively-invalidated block
     prev_size: u32, // size of preceding block in the same sbrk chunk; 0 = first
     _pad: u32 = 0,
 };
 const HEADER_SIZE: usize = @sizeOf(Block); // 16 bytes
 const MIN_SPLIT: usize = HEADER_SIZE + 16; // don't split if remainder smaller
 
+pub const HeapStats = extern struct {
+    used_bytes: u64,
+    free_bytes: u64,
+    total_bytes: u64,
+    blocks: u32,
+};
+
 var heap_start: usize = 0; // address of first block (set on first sbrk)
 var heap_end: usize = 0; // one past last block (== sbrk top)
+var heap_hint: usize = 0; // next-fit cursor; wraps to heap_start at heap_end
+var heap_lock: Mutex = .{};
+var heap_used: usize = 0;
+var heap_free: usize = 0;
+var heap_blocks: u32 = 0;
 
 inline fn alignUp(x: usize, a: usize) usize {
     return (x + a - 1) & ~(a - 1);
@@ -749,38 +789,73 @@ inline fn linkPrevSize(addr: usize, new_size: u32) void {
     }
 }
 
+/// Validate a user-supplied pointer and return the matching Block, or null
+/// if it's clearly not a live allocation. Catches OOB pointers, mid-block
+/// frees, double-frees (MAGIC_FREE), and non-malloc pointers (random magic).
+inline fn blockFromUser(user_addr: usize) ?*Block {
+    if (user_addr < heap_start + HEADER_SIZE or user_addr >= heap_end) return null;
+    if ((user_addr & 15) != 0) return null; // malloc payloads are always 16-aligned
+    const block: *Block = @ptrFromInt(user_addr - HEADER_SIZE);
+    if (block.magic != BLOCK_MAGIC_ALLOC) return null;
+    return block;
+}
+
 fn growHeap(min_bytes: usize) ?usize {
     const min_request: usize = 65536;
     const raw = if (min_bytes < min_request) min_request else min_bytes;
     const request = alignUp(raw, 4096);
     const ptr = sbrk(@intCast(request)) orelse return null;
     const addr = @intFromPtr(ptr);
-    if (heap_start == 0) heap_start = addr;
+    if (heap_start == 0) {
+        heap_start = addr;
+        heap_hint = addr;
+    }
     // Head of new sbrk chunk: prev_size = 0. We don't try to coalesce across
     // gaps between sbrk chunks — current sbrk impl makes them contiguous in
     // practice, but the safe behavior is to treat each chunk as its own
     // boundary-tag chain.
     const block: *Block = @ptrFromInt(addr);
-    block.* = .{ .size = @intCast(request), .is_free = 1, .prev_size = 0 };
+    block.* = .{ .size = @intCast(request), .magic = BLOCK_MAGIC_FREE, .prev_size = 0 };
     heap_end = addr + request;
+    heap_free += request;
+    heap_blocks += 1;
     return addr;
 }
 
-pub fn malloc(size: usize) ?[*]u8 {
+fn mallocLocked(size: usize) ?[*]u8 {
     if (size == 0) return null;
     const need = alignUp(size, 16) + HEADER_SIZE;
 
-    var addr = heap_start;
+    // Next-fit pass 1: start from hint, sweep to heap_end.
+    var addr = if (heap_hint != 0) heap_hint else heap_start;
     while (addr != 0 and addr < heap_end) {
         const block: *Block = @ptrFromInt(addr);
-        if (block.is_free != 0 and block.size >= need) {
+        if (block.size == 0) break; // corrupted; bail to grow path rather than spin
+        if (block.magic == BLOCK_MAGIC_FREE and block.size >= need) {
+            return claimBlock(addr, need);
+        }
+        addr += block.size;
+    }
+    // Pass 2: wrap from heap_start to original hint.
+    addr = heap_start;
+    while (addr != 0 and addr < heap_hint) {
+        const block: *Block = @ptrFromInt(addr);
+        if (block.size == 0) break;
+        if (block.magic == BLOCK_MAGIC_FREE and block.size >= need) {
             return claimBlock(addr, need);
         }
         addr += block.size;
     }
 
+    // No fit — grow.
     const new_addr = growHeap(need) orelse return null;
     return claimBlock(new_addr, need);
+}
+
+pub fn malloc(size: usize) ?[*]u8 {
+    heap_lock.lock();
+    defer heap_lock.unlock();
+    return mallocLocked(size);
 }
 
 fn claimBlock(addr: usize, need: usize) [*]u8 {
@@ -791,46 +866,93 @@ fn claimBlock(addr: usize, need: usize) [*]u8 {
         const next_block: *Block = @ptrFromInt(next_addr);
         next_block.* = .{
             .size = original_size - @as(u32, @intCast(need)),
-            .is_free = 1,
+            .magic = BLOCK_MAGIC_FREE,
             .prev_size = @intCast(need),
         };
         block.size = @intCast(need);
         linkPrevSize(next_addr, next_block.size);
+        heap_blocks += 1;
     }
-    block.is_free = 0;
+    block.magic = BLOCK_MAGIC_ALLOC;
+    heap_used += block.size;
+    heap_free -= block.size;
+    heap_hint = addr + block.size;
+    if (heap_hint >= heap_end) heap_hint = heap_start;
     return @ptrFromInt(addr + HEADER_SIZE);
 }
 
-pub fn free(ptr: ?[*]u8) void {
+fn freeLocked(ptr: ?[*]u8) void {
     const p = ptr orelse return;
     const user_addr = @intFromPtr(p);
-    if (user_addr < heap_start + HEADER_SIZE or user_addr >= heap_end) return;
+    var block = blockFromUser(user_addr) orelse return; // bad ptr, double-free, or corruption
     var block_addr = user_addr - HEADER_SIZE;
-    var block: *Block = @ptrFromInt(block_addr);
-    if (block.is_free != 0) return; // double-free guard
-    block.is_free = 1;
 
-    // Coalesce forward (with the immediately-following block, if free).
+    block.magic = BLOCK_MAGIC_FREE;
+    heap_used -= block.size;
+    heap_free += block.size;
+
+    if (HEAP_DEBUG_FILL) {
+        const payload: [*]u8 = @ptrFromInt(user_addr);
+        @memset(payload[0 .. block.size - HEADER_SIZE], FREE_FILL);
+    }
+
+    // Forward coalesce (this block + immediately-following block, if free).
     const next_addr = block_addr + block.size;
     if (next_addr < heap_end) {
         const next_block: *Block = @ptrFromInt(next_addr);
-        if (next_block.is_free != 0) {
+        if (next_block.magic == BLOCK_MAGIC_FREE) {
             block.size += next_block.size;
+            next_block.magic = 0; // defensive: kill the absorbed header
+            heap_blocks -= 1;
+            if (heap_hint == next_addr) heap_hint = block_addr;
         }
     }
 
-    // Coalesce backward — O(1) via boundary tag.
+    // Backward coalesce — O(1) via boundary tag.
     if (block.prev_size != 0) {
         const prev_addr = block_addr - block.prev_size;
         const prev_block: *Block = @ptrFromInt(prev_addr);
-        if (prev_block.is_free != 0) {
+        if (prev_block.magic == BLOCK_MAGIC_FREE) {
             prev_block.size += block.size;
+            block.magic = 0; // defensive
+            heap_blocks -= 1;
+            if (heap_hint == block_addr) heap_hint = prev_addr;
             block_addr = prev_addr;
             block = prev_block;
         }
     }
 
     linkPrevSize(block_addr, block.size);
+}
+
+pub fn free(ptr: ?[*]u8) void {
+    heap_lock.lock();
+    defer heap_lock.unlock();
+    freeLocked(ptr);
+}
+
+/// Return the usable payload size for `ptr` (i.e. block.size - header).
+/// Returns 0 for null or invalid pointers (silent — caller's responsibility
+/// to know what they passed).
+pub fn malloc_usable_size(ptr: ?[*]u8) usize {
+    const p = ptr orelse return 0;
+    const user_addr = @intFromPtr(p);
+    heap_lock.lock();
+    defer heap_lock.unlock();
+    const block = blockFromUser(user_addr) orelse return 0;
+    return block.size - HEADER_SIZE;
+}
+
+/// Snapshot of current heap state. Consistent under heap_lock.
+pub fn malloc_stats() HeapStats {
+    heap_lock.lock();
+    defer heap_lock.unlock();
+    return .{
+        .used_bytes = heap_used,
+        .free_bytes = heap_free,
+        .total_bytes = heap_end - heap_start,
+        .blocks = heap_blocks,
+    };
 }
 
 pub fn calloc(nmemb: usize, size: usize) ?[*]u8 {
@@ -847,43 +969,57 @@ pub fn realloc(old_ptr: ?[*]u8, new_size: usize) ?[*]u8 {
     }
     const old = old_ptr orelse return malloc(new_size);
     const old_user_addr = @intFromPtr(old);
-    if (old_user_addr < heap_start + HEADER_SIZE or old_user_addr >= heap_end) return null;
-    const block_addr = old_user_addr - HEADER_SIZE;
-    const block: *Block = @ptrFromInt(block_addr);
-    const need = alignUp(new_size, 16) + HEADER_SIZE;
 
-    // Strategy 1: current block is already big enough.
+    heap_lock.lock();
+    defer heap_lock.unlock();
+
+    const block = blockFromUser(old_user_addr) orelse return null;
+    const need = alignUp(new_size, 16) + HEADER_SIZE;
+    const block_addr = old_user_addr - HEADER_SIZE;
+
+    // Strategy 1: shrink in place.
     if (block.size >= need) {
         if (block.size >= need + MIN_SPLIT) {
             const remainder_addr = block_addr + need;
             const remainder: *Block = @ptrFromInt(remainder_addr);
             remainder.* = .{
                 .size = block.size - @as(u32, @intCast(need)),
-                .is_free = 1,
+                .magic = BLOCK_MAGIC_FREE,
                 .prev_size = @intCast(need),
             };
             linkPrevSize(remainder_addr, remainder.size);
+            heap_used -= remainder.size;
+            heap_free += remainder.size;
+            heap_blocks += 1;
             block.size = @intCast(need);
         }
         return @ptrFromInt(old_user_addr);
     }
 
-    // Strategy 2: try merging with the next block if it's free + fits.
+    // Strategy 2: merge with next free block if combined fits.
     const next_addr = block_addr + block.size;
     if (next_addr < heap_end) {
         const next_block: *Block = @ptrFromInt(next_addr);
-        if (next_block.is_free != 0 and block.size + next_block.size >= need) {
-            const merged_size = block.size + next_block.size;
+        if (next_block.magic == BLOCK_MAGIC_FREE and block.size + next_block.size >= need) {
+            const absorbed_size = next_block.size;
+            const merged_size = block.size + absorbed_size;
+            heap_used += absorbed_size;
+            heap_free -= absorbed_size;
+            heap_blocks -= 1;
+            next_block.magic = 0; // defensive
             block.size = merged_size;
             if (block.size >= need + MIN_SPLIT) {
                 const remainder_addr = block_addr + need;
                 const remainder: *Block = @ptrFromInt(remainder_addr);
                 remainder.* = .{
                     .size = block.size - @as(u32, @intCast(need)),
-                    .is_free = 1,
+                    .magic = BLOCK_MAGIC_FREE,
                     .prev_size = @intCast(need),
                 };
                 linkPrevSize(remainder_addr, remainder.size);
+                heap_used -= remainder.size;
+                heap_free += remainder.size;
+                heap_blocks += 1;
                 block.size = @intCast(need);
             } else {
                 linkPrevSize(block_addr, block.size);
@@ -892,12 +1028,14 @@ pub fn realloc(old_ptr: ?[*]u8, new_size: usize) ?[*]u8 {
         }
     }
 
-    // Strategy 3: fall back to malloc + copy + free.
+    // Strategy 3: malloc + memcpy + freeLocked. We hold heap_lock across the
+    // entire op so the source bytes can't be racily reused between the
+    // mallocLocked and freeLocked calls — `old` stays valid until we say so.
     const old_payload = block.size - HEADER_SIZE;
-    const new_ptr = malloc(new_size) orelse return null;
+    const new_ptr = mallocLocked(new_size) orelse return null;
     const copy_len = if (old_payload < new_size) old_payload else new_size;
     @memcpy(new_ptr[0..copy_len], old[0..copy_len]);
-    free(old);
+    freeLocked(old);
     return new_ptr;
 }
 
@@ -1668,6 +1806,150 @@ pub const Mutex = extern struct {
             // Was 2 (had waiters). Reset to 0 and wake one.
             @atomicStore(u32, &self.state, 0, .release);
             _ = syscall3(85, @truncate(@intFromPtr(&self.state)), 1, 1); // WAKE, n=1
+        }
+    }
+};
+
+// --- pthread_cond ---------------------------------------------------------
+//
+// Sequence-counter condvar (Linux pthreads-style). `seq` is bumped on every
+// signal/broadcast; waiters sample it before releasing the mutex and pass
+// the sample to FUTEX_WAIT. If a signal lands between unlock and wait the
+// kernel sees `seq != sampled` and returns EAGAIN — no sleep, no missed
+// wake. Waiters re-acquire `mu` before returning, matching pthread semantics.
+//
+// `wait` can spuriously return (signal that races multiple waiters, etc.);
+// callers MUST recheck their predicate in a loop, the standard contract.
+
+pub const Cond = extern struct {
+    seq: u32 = 0,
+
+    /// Atomically release `mu`, wait for a signal/broadcast, re-acquire `mu`.
+    pub fn wait(self: *Cond, mu: *Mutex) void {
+        const sampled = @atomicLoad(u32, &self.seq, .acquire);
+        mu.unlock();
+        _ = syscall3(85, @truncate(@intFromPtr(&self.seq)), 0, sampled); // WAIT
+        mu.lock();
+    }
+
+    /// Wake one waiter (no-op if none).
+    pub fn signal(self: *Cond) void {
+        _ = @atomicRmw(u32, &self.seq, .Add, 1, .release);
+        _ = syscall3(85, @truncate(@intFromPtr(&self.seq)), 1, 1); // WAKE n=1
+    }
+
+    /// Wake all waiters. No FUTEX_REQUEUE optimization yet (kernel only
+    /// supports WAIT/WAKE) so this is a thundering herd — every woken
+    /// thread tries to re-acquire `mu` and most go back to sleep on its
+    /// futex. Fine for v1; add REQUEUE if/when contention shows up.
+    pub fn broadcast(self: *Cond) void {
+        _ = @atomicRmw(u32, &self.seq, .Add, 1, .release);
+        _ = syscall3(85, @truncate(@intFromPtr(&self.seq)), 1, 0xFFFFFFFF); // WAKE n=∞
+    }
+};
+
+// --- pthread_rwlock -------------------------------------------------------
+//
+// Single-word reader-writer lock: bit 31 = writer holds, bits 0..30 = reader
+// count. Writer-prefers-readers stampede on unlock (FUTEX_WAKE all) — could
+// starve writers under heavy reader churn. Fairness left for v2.
+
+pub const RwLock = extern struct {
+    state: u32 = 0,
+
+    const WRITER_BIT: u32 = 0x80000000;
+    const READER_MASK: u32 = 0x7FFFFFFF;
+
+    pub fn lockShared(self: *RwLock) void {
+        while (true) {
+            const cur = @atomicLoad(u32, &self.state, .acquire);
+            if (cur & WRITER_BIT == 0) {
+                // Try to add a reader. CAS protects against concurrent writers
+                // grabbing the bit between our load and increment.
+                if (@cmpxchgWeak(u32, &self.state, cur, cur + 1, .acquire, .acquire) == null) return;
+                continue;
+            }
+            // Writer holds — sleep until state changes.
+            _ = syscall3(85, @truncate(@intFromPtr(&self.state)), 0, cur); // WAIT
+        }
+    }
+
+    pub fn unlockShared(self: *RwLock) void {
+        const prev = @atomicRmw(u32, &self.state, .Sub, 1, .release);
+        // If we were the last reader, wake any writer waiting.
+        if ((prev & READER_MASK) == 1) {
+            _ = syscall3(85, @truncate(@intFromPtr(&self.state)), 1, 1); // WAKE n=1
+        }
+    }
+
+    pub fn lockExclusive(self: *RwLock) void {
+        while (true) {
+            const cur = @atomicLoad(u32, &self.state, .acquire);
+            if (cur == 0) {
+                if (@cmpxchgWeak(u32, &self.state, 0, WRITER_BIT, .acquire, .acquire) == null) return;
+                continue;
+            }
+            _ = syscall3(85, @truncate(@intFromPtr(&self.state)), 0, cur); // WAIT
+        }
+    }
+
+    pub fn unlockExclusive(self: *RwLock) void {
+        @atomicStore(u32, &self.state, 0, .release);
+        // Wake all — could be N readers (let them all in), or one of M
+        // waiting writers (first to CAS wins, others re-sleep).
+        _ = syscall3(85, @truncate(@intFromPtr(&self.state)), 1, 0xFFFFFFFF);
+    }
+};
+
+// --- pthread_sem ----------------------------------------------------------
+//
+// Counting semaphore. `wait` decrements (blocks if zero), `post` increments
+// (wakes one waiter). Bounded-queue producer/consumer is the canonical use.
+
+pub const Sem = extern struct {
+    count: u32 = 0,
+
+    pub fn init(self: *Sem, value: u32) void {
+        @atomicStore(u32, &self.count, value, .release);
+    }
+
+    pub fn wait(self: *Sem) void {
+        while (true) {
+            const cur = @atomicLoad(u32, &self.count, .acquire);
+            if (cur > 0) {
+                if (@cmpxchgWeak(u32, &self.count, cur, cur - 1, .acquire, .acquire) == null) return;
+                continue;
+            }
+            _ = syscall3(85, @truncate(@intFromPtr(&self.count)), 0, 0); // WAIT, val=0
+        }
+    }
+
+    pub fn post(self: *Sem) void {
+        _ = @atomicRmw(u32, &self.count, .Add, 1, .release);
+        _ = syscall3(85, @truncate(@intFromPtr(&self.count)), 1, 1); // WAKE n=1
+    }
+};
+
+// --- Once -----------------------------------------------------------------
+//
+// Call-once primitive for lazy init. The first caller to CAS state 0→1 runs
+// `f`; concurrent callers block until state hits 2 (done). Cheap fast-path
+// after init: single atomic load, no syscall.
+
+pub const Once = extern struct {
+    state: u32 = 0, // 0=fresh, 1=in-progress, 2=done
+
+    pub fn call(self: *Once, f: *const fn () void) void {
+        if (@atomicLoad(u32, &self.state, .acquire) == 2) return;
+        if (@cmpxchgStrong(u32, &self.state, 0, 1, .acquire, .acquire) == null) {
+            f();
+            @atomicStore(u32, &self.state, 2, .release);
+            _ = syscall3(85, @truncate(@intFromPtr(&self.state)), 1, 0xFFFFFFFF); // WAKE all
+            return;
+        }
+        // Someone else is initializing — wait for state==2.
+        while (@atomicLoad(u32, &self.state, .acquire) != 2) {
+            _ = syscall3(85, @truncate(@intFromPtr(&self.state)), 0, 1); // WAIT, val=1
         }
     }
 };

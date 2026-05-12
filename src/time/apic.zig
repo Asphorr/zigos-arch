@@ -436,7 +436,7 @@ var calibrated_via_hyperv: bool = false;
 /// HV_X64_MSR_APIC_FREQUENCY (one rdmsr each, no busy-wait gate).
 /// Returns true on success.
 fn calibrateTimerHyperv() bool {
-    const hyperv = @import("../cpu/hyperv.zig");
+    const hyperv = @import("../virt/hyperv.zig");
     if (!hyperv.hasFrequencyMsrs()) return false;
 
     const tsc_hz = hyperv.tscFrequencyHz();

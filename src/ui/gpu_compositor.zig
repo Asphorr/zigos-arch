@@ -1883,6 +1883,9 @@ pub fn taskEntry() callconv(.c) noreturn {
     // Same Phase-3 ritual as desktop.taskEntry: BSP is now on its high-VA
     // kernel task stack, drop the legacy low identity then re-enable IRQs.
     paging.dropLowIdentity();
+    // BSP off the UEFI low-half boot stack — enable SMAP now (mirror of
+    // desktop.taskEntry; boot_mode=9 takes this path instead).
+    @import("../cpu/protect.zig").enableSmapPerCpu();
     asm volatile ("sti");
     run();
     asm volatile ("ud2");
