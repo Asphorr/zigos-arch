@@ -1,15 +1,30 @@
 #!/usr/bin/env python3
-# Convert a BDF bitmap font into a Zig [128][H]uN array. Width/height are auto-
+# Convert a BDF bitmap font into a Zig [256][H]uN array. Width/height are auto-
 # detected from FONTBOUNDINGBOX and dictate the row type:
 #   W <=  8 -> u8
 #   W <= 16 -> u16
 # Rows are MSB-justified into the chosen integer (leftmost pixel is the highest
-# bit), matching how the existing drawChar16 / drawChar32 helpers iterate. Only
-# ASCII (0x20..0x7E) is emitted; non-printable entries are zeroed.
+# bit), matching how the existing drawChar16 / drawChar32 helpers iterate.
+#
+# Slots 0x20..0x7E carry ASCII directly. Slots 0x80..0x85 carry a hand-picked
+# subset of Unicode block elements remapped from their U+25xx codepoints — see
+# EXTRA_GLYPHS. This lets ASCII-art-style apps emit byte literals (e.g. "\x80")
+# without needing UTF-8 decode in the terminal.
 #
 # Usage: python3 tools/bdf_to_zig.py <bdf-file> <out.zig> <font-name>
 
 import sys
+
+# Block element codepoints to extract from the BDF and the byte slots they live
+# at in the generated atlas. Kept compact (6 entries) so the atlas stays small.
+EXTRA_GLYPHS = {
+    0x2588: (0x80, "FULL BLOCK"),       # █
+    0x2591: (0x81, "LIGHT SHADE"),      # ░
+    0x2592: (0x82, "MEDIUM SHADE"),     # ▒
+    0x2593: (0x83, "DARK SHADE"),       # ▓
+    0x2580: (0x84, "UPPER HALF BLOCK"), # ▀
+    0x2584: (0x85, "LOWER HALF BLOCK"), # ▄
+}
 
 
 def parse_bdf(path):
@@ -37,7 +52,9 @@ def parse_bdf(path):
             in_bitmap = True
             rows = []
         elif line.strip() == "ENDCHAR":
-            if encoding is not None and bbx is not None and 0 <= encoding < 128:
+            if encoding is not None and bbx is not None and (
+                0 <= encoding < 128 or encoding in EXTRA_GLYPHS
+            ):
                 glyphs[encoding] = (bbx, rows)
             encoding = None
             bbx = None
@@ -109,21 +126,24 @@ def emit_zig(font_name, font_bbx, glyphs, out_path):
     lines.append(
         f"// Each character is {fh} rows of {storage_type}: top {fw} bits are pixels, MSB = leftmost."
     )
-    lines.append("// Indexed by ASCII code; non-printable entries are zeroed.")
+    lines.append("// Indexed by byte value 0x00..0xFF. ASCII at its native code; selected")
+    lines.append("// Unicode block elements remapped to 0x80..0x85 (see EXTRA_GLYPHS in the")
+    lines.append("// generator). All other slots are zeroed.")
     lines.append("")
     lines.append(f"pub const char_w: u32 = {fw};")
     lines.append(f"pub const char_h: u32 = {fh};")
     lines.append(f"pub const advance: u32 = {fw + 1}; // {fw}px + 1px spacing")
     lines.append("")
-    lines.append(f"pub const data: [128][{fh}]{storage_type} = init: {{")
+    lines.append(f"pub const data: [256][{fh}]{storage_type} = init: {{")
     lines.append(
-        f"    var d: [128][{fh}]{storage_type} = "
-        f"[_][{fh}]{storage_type}{{[_]{storage_type}{{0}} ** {fh}}} ** 128;"
+        f"    var d: [256][{fh}]{storage_type} = "
+        f"[_][{fh}]{storage_type}{{[_]{storage_type}{{0}} ** {fh}}} ** 256;"
     )
     lines.append("")
 
+    # ASCII glyphs at their native byte values.
     for cp in sorted(glyphs):
-        if cp < 0x20 or cp > 0x7E:
+        if not (0x20 <= cp <= 0x7E):
             continue
         rendered = glyphs[cp]
         full_mask = (1 << storage_bits) - 1
@@ -132,6 +152,20 @@ def emit_zig(font_name, font_bbx, glyphs, out_path):
         ch = chr(cp)
         display = ch if ch not in ("'", "\\") else "\\" + ch
         lines.append(f"    d[0x{cp:02X}] = .{{ {bytes_str} }}; // '{display}'")
+
+    # Block elements remapped to the 0x80..0x85 range (the byte slot is what
+    # callers index by; the comment shows the source codepoint).
+    lines.append("")
+    lines.append("    // --- Unicode block elements (remapped from U+25xx) ---")
+    for cp, (slot, name) in sorted(EXTRA_GLYPHS.items(), key=lambda x: x[1][0]):
+        if cp not in glyphs:
+            lines.append(f"    // (skipped) 0x{slot:02X} <- U+{cp:04X} {name}: not present in BDF")
+            continue
+        rendered = glyphs[cp]
+        full_mask = (1 << storage_bits) - 1
+        shifted = [(v << msb_shift) & full_mask for v in rendered]
+        bytes_str = ", ".join(f"0x{b:0{hex_width}X}" for b in shifted)
+        lines.append(f"    d[0x{slot:02X}] = .{{ {bytes_str} }}; // U+{cp:04X} {name}")
 
     lines.append("")
     lines.append("    break :init d;")
@@ -159,9 +193,10 @@ def main():
 
     emit_zig(font_name, font_bbx, rendered, out_path)
     ascii_count = sum(1 for cp in rendered if 0x20 <= cp <= 0x7E)
+    extra_count = sum(1 for cp in rendered if cp in EXTRA_GLYPHS)
     print(
-        f"[bdf->zig] {ascii_count} ASCII glyphs ({fw}x{fh}, u{storage_bits}) "
-        f"from {bdf_path} -> {out_path}"
+        f"[bdf->zig] {ascii_count} ASCII + {extra_count} block-element glyphs "
+        f"({fw}x{fh}, u{storage_bits}) from {bdf_path} -> {out_path}"
     )
 
 

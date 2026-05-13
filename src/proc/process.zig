@@ -2,6 +2,7 @@ const vga = @import("../ui/vga.zig");
 const gdt = @import("../cpu/gdt.zig");
 const debug = @import("../debug/debug.zig");
 const vmm = @import("../mm/vmm.zig");
+const pcid_mod = @import("../cpu/pcid.zig");
 const heap = @import("../mm/heap.zig");
 const pmm = @import("../mm/pmm.zig");
 const symbols = @import("../debug/symbols.zig");
@@ -254,6 +255,13 @@ pub const PCB = struct {
     // restores from here on switch-in so each thread's sysret pops
     // the right user RSP.
     user_rsp_save: u64 = 0,
+
+    // PCID for this address space (CR4.PCIDE). 0 = no tagging (kernel
+    // tasks or PCID feature unavailable). User PCBs get a non-zero PCID
+    // from `pcid.alloc` when their page_dir_phys is assigned and free it
+    // on destroyAddressSpace. The schedule path uses pcid + the per-CPU
+    // generation tracker to set CR3 bit 63 (preserve-TLB) on reloads.
+    pcid: u16 = 0,
 
     // iretq-frame snapshot tripwire (task #230). Captured by
     // debug.iretq_canary.capture() at IRQ/exception entry; checked at
@@ -1420,6 +1428,7 @@ pub fn forkCurrent(frame: *signals.SyscallFrame) ?usize {
     };
     procs[i].page_directory = child_pml4;
     procs[i].page_dir_phys = child_pml4_phys;
+    procs[i].pcid = pcid_mod.alloc();
 
     // Per-AS state — fork has its own AS so lazy regions and brk/mmap state
     // are inherited as values (not aliased through tgid like clone does).
@@ -1573,6 +1582,7 @@ pub fn setCurrent(pid: usize) void {
 /// us inline (kernel-mode IRQs don't switch stacks); we resume after hlt
 /// and yield, repeat.
 fn kernelIdle() callconv(.c) noreturn {
+    const mwait = @import("../cpu/mwait.zig");
     while (true) {
         // Drain any pending async app load (file-read offload). Used to be
         // serviced by apEntry's scheduler-context loop, but per-CPU idle
@@ -1581,7 +1591,18 @@ fn kernelIdle() callconv(.c) noreturn {
         // CAS pending->loading inside apProcessLoadQueue prevents two
         // idles from racing on the same request.
         smp.apProcessLoadQueue();
-        asm volatile ("sti; hlt");
+        if (mwait.mwait_supported) {
+            // sti + monitor + mwait. MWAIT(EAX=C1 hint, ECX[0]=1) wakes on
+            // either a write to the monitored line or an interrupt — IRQs
+            // break it just like HLT, with the added bonus of letting the
+            // CPU drop into C1/C1E. The monitored word is per-CPU; future
+            // wake-from-kernel paths can bump it to wake without an IPI.
+            const cpu = smp.myCpu();
+            asm volatile ("sti");
+            mwait.idleWait(&cpu.idle_monitor_word);
+        } else {
+            asm volatile ("sti; hlt");
+        }
         schedule();
     }
 }
@@ -2220,9 +2241,9 @@ pub fn schedule() void {
         procs[next].last_cpu = cpu.cpu_id;
         gdt.setTssRsp0(next, procs[next].kernel_stack_top);
         if (procs[next].page_dir_phys != 0) {
-            vmm.switchAddressSpace(procs[next].page_dir_phys);
+            pcid_mod.loadCr3(procs[next].page_dir_phys, procs[next].pcid, cpu.cpu_id);
         } else {
-            vmm.switchAddressSpace(paging.getKernelPageDirPhys());
+            pcid_mod.loadCr3(paging.getKernelPageDirPhys(), 0, cpu.cpu_id);
         }
         writeFsBase(procs[next].fs_base);
 
@@ -2570,6 +2591,10 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp) void {
             vmm.destroyAddressSpace(pd, lead.page_dir_phys);
             lead.page_directory = null;
             lead.page_dir_phys = 0;
+            if (lead.pcid != 0) {
+                pcid_mod.free(lead.pcid);
+                lead.pcid = 0;
+            }
         }
         closePipeFds(my_tgid);
         freeElfBuf(lead);

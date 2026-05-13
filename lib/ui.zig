@@ -114,39 +114,61 @@ pub fn drawRect1px(canvas: *Canvas, x: u32, y: u32, w: u32, h: u32, color: u32) 
     canvas.drawVLine(x + w - 1, y, h, color);
 }
 
-/// Soft drop shadow — 6 progressively-lighter 1px stripes below + right
-/// of the rect, approximating a fuzzy shadow without alpha blending. The
-/// closest stripe is only ~7% darker than `surrounding_bg`, the outermost
-/// ~0.5%; the eye smooths the discrete steps into a gentle gradient.
+/// Soft drop shadow — 16-step Gaussian alpha falloff for right + bottom
+/// edges plus a 2D Gaussian corner blob at the bottom-right. Uses real
+/// src-over alpha blending so it composites correctly over any underlying
+/// pixel, not just `surrounding_bg`.
 ///
-/// Each stripe extends one pixel further past the corner than the previous
-/// one, which tapers the shadow into a soft quarter-circle at the lower-
-/// right corner instead of a hard staircase.
+/// Matches `src/ui/desktop.zig`'s window-shadow algorithm (alphas + curve)
+/// so cards/dialogs visually agree with the window-manager drop shadow.
+/// Asymmetric (no top/left shadow) — macOS-style "lit from upper-left"
+/// rather than material-design all-around elevation.
 ///
-/// `surrounding_bg` is the color the shadow fades into — pass the app's
-/// background so the gradient blends naturally.
+/// `surrounding_bg` is kept for API compatibility but unused — real alpha
+/// blending samples the actual destination pixel, so the caller's bg
+/// assumption no longer matters.
 pub fn drawShadow(canvas: *Canvas, x: u32, y: u32, w: u32, h: u32, surrounding_bg: u32) void {
-    // Denominators tuned so layer 0 ≈ 7% darker, layer 5 ≈ 0.5%. Quadratic
-    // falloff (each step roughly doubles the distance) sells the "soft"
-    // look better than a linear ramp because the eye is more sensitive to
-    // small contrast differences than large ones.
-    const denominators = [6]u32{ 14, 22, 36, 60, 100, 180 };
-    inline for (denominators, 0..) |den, i| {
-        const ii: u32 = @intCast(i);
-        const c = lerpColor(surrounding_bg, 0x000000, 1, den);
-        // Bottom stripe: extends `ii+1` pixels past the right edge so the
-        // corner ramp from "card pixel" to "background" goes through every
-        // layer, not just the innermost.
-        if (y + h + ii < canvas.height) {
-            const want_w = w + ii + 1;
-            const max_w = canvas.width -| x;
-            canvas.fillRect(x, y + h + ii, @min(want_w, max_w), 1, c);
-        }
-        // Right stripe: same idea, extended down.
-        if (x + w + ii < canvas.width) {
-            const want_h = h + ii + 1;
-            const max_h = canvas.height -| y;
-            canvas.fillRect(x + w + ii, y, 1, @min(want_h, max_h), c);
+    _ = surrounding_bg;
+    const SHADOW_W: u32 = 16;
+    // Peak ~7.8% — kept in sync with src/ui/desktop.zig's window-manager
+    // shadow so in-app cards visually agree with the surrounding window
+    // frame. Old peak 0x28 was too inky on small surfaces.
+    const SHADOW_MAX: u32 = 0x14;
+    const shadow_alphas = [SHADOW_W]u8{
+        0x14, 0x12, 0x10, 0x0D, 0x0B, 0x09, 0x07, 0x05,
+        0x04, 0x03, 0x02, 0x02, 0x01, 0x01, 0x01, 0x01,
+    };
+
+    // Bottom edge — horizontal rows below the rect, full width. The corner
+    // blob below will reinforce the bottom-right joint so the corner doesn't
+    // look hollow vs the straight edges.
+    var si: u32 = 0;
+    while (si < SHADOW_W) : (si += 1) {
+        const row_y = y + h + si;
+        if (row_y >= canvas.height) break;
+        const max_w = canvas.width -| x;
+        canvas.fillRectAlpha(x, row_y, @min(w, max_w), 1, 0x000000, shadow_alphas[si]);
+    }
+    // Right edge — vertical cols to the right of the rect, full height.
+    si = 0;
+    while (si < SHADOW_W) : (si += 1) {
+        const col_x = x + w + si;
+        if (col_x >= canvas.width) break;
+        const max_h = canvas.height -| y;
+        canvas.fillRectAlpha(col_x, y, 1, @min(h, max_h), 0x000000, shadow_alphas[si]);
+    }
+    // Bottom-right corner — 2D Gaussian. Divide by SHADOW_MAX (not 255) so
+    // corner darkness matches edge darkness at equal distance from the rect,
+    // producing a continuous round shadow instead of a too-light hollow.
+    var sy: u32 = 0;
+    while (sy < SHADOW_W) : (sy += 1) {
+        var sx: u32 = 0;
+        while (sx < SHADOW_W) : (sx += 1) {
+            const a_combined: u32 = (@as(u32, shadow_alphas[sx]) * @as(u32, shadow_alphas[sy])) / SHADOW_MAX;
+            if (a_combined == 0) continue;
+            const px = x + w + sx;
+            const py = y + h + sy;
+            canvas.blendPixel(@intCast(px), @intCast(py), 0x000000, @intCast(a_combined));
         }
     }
 }

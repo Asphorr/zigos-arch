@@ -457,10 +457,16 @@ fn waitCompletion(c: *const Controller, cq_phys: usize, head_ptr: *u16, phase_pt
         // CPU; the guest's L1 keeps a stale (zero) copy of the cache line
         // unless we explicitly invalidate it. clflush + mfence guarantees
         // each load goes to actual memory.
-        const slot_addr = cq_phys + @as(usize, head_ptr.*) * @sizeOf(CqEntry);
+        //
+        // clflush takes a *virtual* address — the CPU walks paging to find
+        // the cache line. Passing cq_phys directly used to work back when
+        // PML4[0] held the 1:1 low-identity map, but that was dropped in
+        // Phase 3 (see project_phase3_pml4_drop). Use the already-translated
+        // virtual cq pointer instead.
+        const slot_vaddr = @intFromPtr(&cq[head_ptr.*]);
         asm volatile ("clflush (%[ptr])"
             :
-            : [ptr] "r" (slot_addr),
+            : [ptr] "r" (slot_vaddr),
             : .{ .memory = true });
         asm volatile ("mfence" ::: .{ .memory = true });
         const status_word = cq[head_ptr.*].status;

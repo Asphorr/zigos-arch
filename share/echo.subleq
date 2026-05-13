@@ -1,0 +1,14 @@
+; echo.subleq — read one char at a time and echo it back.
+; Halts when input reads a 0 byte (EOF).
+
+loop:
+    -1   in    halt   ; INPUT into 'in'; if input was 0, branch to halt
+    in   -1    next   ; OUTPUT 'in' (printable chars fall through, c is next)
+next:
+    Z    Z     loop   ; clear Z; branch to loop
+
+halt:
+    Z    Z     -1     ; halt
+
+in:  .word 0
+Z:   .word 0

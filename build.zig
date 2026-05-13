@@ -298,6 +298,7 @@ pub fn build(b: *std.Build) void {
         .{ "threadtest.elf", "app/threadtest.zig" },
         .{ "threadbrot.elf", "app/threadbrot.zig" },
         .{ "synctest.elf", "app/synctest.zig" },
+        .{ "babel.elf", "app/babel.zig" },
         .{ "sigtest.elf", "app/sigtest.zig" },
         .{ "forktest.elf", "app/forktest.zig" },
         .{ "daemontest.elf", "app/daemontest.zig" },
@@ -323,6 +324,9 @@ pub fn build(b: *std.Build) void {
         .{ "shutdown.elf", "app/shutdown.zig" },
         .{ "dmesg.elf", "app/dmesg.zig" },
         .{ "about.elf", "app/about.zig" },
+        .{ "fastfetch.elf", "app/fastfetch.zig" },
+        .{ "zigtop.elf", "app/zigtop.zig" },
+        .{ "sigil.elf", "app/sigil.zig" },
         .{ "tg.elf", "app/tg.zig" },
         .{ "redteam.elf", "app/redteam.zig" },
     };
@@ -728,10 +732,10 @@ pub fn build(b: *std.Build) void {
         \\  gui_demo.elf pipetest.elf sigtest.elf \
         \\  cat.elf ls.elf wc.elf echo.elf grep.elf head.elf sleep.elf taskset.elf nice.elf yes.elf iretq_spin.elf \
         \\  ps.elf dmesg.elf mkdir.elf rmdir.elf rm.elf touch.elf shutdown.elf beep.elf \
-        \\  sysmon.elf calc.elf settings.elf files.elf about.elf tg.elf \
+        \\  sysmon.elf calc.elf settings.elf files.elf about.elf fastfetch.elf zigtop.elf sigil.elf tg.elf \
         \\  paint.elf editor.elf doom.elf gpu_test.elf vulkan_triangle.elf \
         \\  venus_test.elf vulkan_cube.elf doom_real.elf \
-        \\  mmaptest.elf threadtest.elf threadbrot.elf synctest.elf forktest.elf daemontest.elf logd.elf photo.elf wallpaper.elf \
+        \\  mmaptest.elf threadtest.elf threadbrot.elf synctest.elf babel.elf forktest.elf daemontest.elf logd.elf photo.elf wallpaper.elf \
         \\  redteam.elf
         \\echo "[tar] rebuilt"
         ,

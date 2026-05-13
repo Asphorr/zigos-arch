@@ -176,6 +176,7 @@ pub fn loadAndStart(elf_buf: [*]align(4) u8, file_size: usize, elf_buf_pages: u3
     const pcb = process.getPCB(pid);
     pcb.page_directory = pd;
     pcb.page_dir_phys = pd_phys;
+    pcb.pcid = @import("../cpu/pcid.zig").alloc();
     pcb.elf_buf = elf_buf;
     pcb.elf_buf_pages = elf_buf_pages;
     pcb.stack_base = stack_base;
@@ -256,6 +257,7 @@ pub fn loadAndExecute(elf_buf: [*]align(4) u8, file_size: usize, elf_buf_pages: 
     const pcb = process.getPCB(pid);
     pcb.page_directory = pd;
     pcb.page_dir_phys = pd_phys;
+    pcb.pcid = @import("../cpu/pcid.zig").alloc();
     pcb.elf_buf = elf_buf;
     pcb.elf_buf_pages = elf_buf_pages;
     pcb.stack_base = stack_base;
@@ -305,8 +307,9 @@ pub fn loadAndExecute(elf_buf: [*]align(4) u8, file_size: usize, elf_buf_pages: 
     const proc_info = process.getProcessInfo(pid);
     gdt.setTssRsp0(pid, proc_info.kernel_stack_top);
 
-    // Switch to the new address space
-    vmm.switchAddressSpace(pd_phys);
+    // Switch to the new address space (PCID-tagged so subsequent reloads
+    // can preserve this process's TLB across context switches).
+    @import("../cpu/pcid.zig").loadCr3(pd_phys, pcb.pcid, @import("../cpu/smp.zig").myCpu().cpu_id);
 
     debug.klog("[elf] Entering Ring 3\n", .{});
     // Synchronously wait for the loaded process to exit. schedule() may pick

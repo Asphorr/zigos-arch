@@ -3,9 +3,14 @@
 # Loads zig-out/bin/kernel32.elf directly via QEMU's -kernel.
 # No sudo, no esp.img rebuild — boots in seconds.
 #
-# Disk layout (post-Phase 2 ext2 migration):
-#   IDE0 = disk.tar  — tarfs fallback at `/tar/` for legacy paths
-#   IDE2 = ext2.img  — root filesystem at `/`, contains /bin /etc /share /KERNEL.SYM /BUILD.ID
+# Disk layout (NVMe migration 2026-05-14 — was IDE 0/2):
+#   nvm_tar  = disk.tar  — tarfs fallback at `/tar/` for legacy paths
+#   nvm_ext2 = ext2.img  — root filesystem at `/`, contains /bin /etc /share /KERNEL.SYM /BUILD.ID
+#
+# block.zig's init() probes NVMe first, so the kernel auto-picks NVMe and
+# skips the legacy IDE driver entirely. Moved off IDE because the ATA
+# driver had unbounded waitReady/waitBsy loops that wedged cpu1 under
+# concurrent reads (caught by watchdog).
 #
 # Both are rebuilt by the default `zig build` so they stay in sync with
 # the kernel + apps. tarfs is kept around during the migration window so
@@ -28,7 +33,9 @@ VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json \
     -device e1000,netdev=net0 -netdev user,id=net0,hostfwd=tcp::8080-:8080 \
     -audiodev none,id=snd0 -machine pcspk-audiodev=snd0 -device AC97,audiodev=snd0 \
     -device virtio-sound-pci,audiodev=snd0 \
-    -drive file=disk.tar,format=raw,index=0,if=ide \
-    -drive file=ext2.img,format=raw,index=2,if=ide \
+    -drive file=disk.tar,format=raw,if=none,id=nvm_tar \
+    -device nvme,drive=nvm_tar,serial=zigos-tarfs \
+    -drive file=ext2.img,format=raw,if=none,id=nvm_ext2 \
+    -device nvme,drive=nvm_ext2,serial=zigos-ext2 \
     -serial file:serial.log \
     -kernel zig-out/bin/kernel32.elf "$@"

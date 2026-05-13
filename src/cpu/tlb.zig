@@ -22,6 +22,7 @@ const apic = @import("../time/apic.zig");
 const smp = @import("smp.zig");
 const debug = @import("../debug/debug.zig");
 const perf = @import("../debug/perf.zig");
+const pcid = @import("pcid.zig");
 
 // Slow-shootdown threshold (cycles). At Kaby Lake 2.4 GHz nominal TSC,
 // 2.5M cycles ≈ 1 ms — well above the few-μs IPI round-trip budget.
@@ -83,10 +84,16 @@ pub export fn handleTlbShootdown() callconv(.c) void {
 /// stale TLB entries on another CPU (unmap, mprotect tighten, COW write).
 /// Also flushes the calling CPU's TLB on the way out.
 ///
+/// `affected_pcid` is the PCID of the address space whose page tables
+/// just got modified. Pass 0 if the caller isn't running on a tagged
+/// PCID (kernel-only modifications). When non-zero, we bump the global
+/// PCID generation so peer CPUs holding stale TLB entries for that PCID
+/// lazy-flush on their next CR3 load of it (gen mismatch in pcid.loadCr3).
+///
 /// Single-CPU systems (no APs yet) skip the IPI broadcast and just do a
 /// local flush. Same fast-path when called from a CPU before SMP brings
 /// up the other cores.
-pub fn shootdownAll() void {
+pub fn shootdownAll(affected_pcid: u16) void {
     const me_full = apic.getLapicId();
     const me: u8 = if (me_full < smp.MAX_CPUS) @intCast(me_full) else 0;
     const t_enter = perf.rdtsc();
@@ -132,8 +139,14 @@ pub fn shootdownAll() void {
 
     const t_acked = perf.rdtsc();
 
-    // Local flush.
+    // Local flush + PCID generation bump so peer CPUs running on a
+    // different PCID (and therefore unaffected by their handler's
+    // flushLocalTlb of the loaded PCID) still see a gen mismatch when
+    // they next pcid.loadCr3 this PCID, and force-flush at that point.
     flushLocalTlb();
+    if (affected_pcid != 0) {
+        pcid.bumpAfterShootdown(affected_pcid, me);
+    }
 
     shootdown_lock.store(0, .release);
 

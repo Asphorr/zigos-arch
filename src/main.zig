@@ -224,6 +224,22 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     @import("cpu/protect.zig").detectFeatures();
     @import("cpu/protect.zig").applyEarlyCr4();
     blog.ok("SMEP/UMIP (SMAP deferred to post-PML4[0] drop)");
+    // Machine Check Exception: probe MCG_CAP, enable all banks, set
+    // CR4.MCE so vector 18 actually delivers. Per-CPU init for APs lives
+    // in smp.apEntry. Must run after detectFeatures (shares the cpuid
+    // helper) and before any code that could fault on an MC bank state.
+    @import("cpu/mce.zig").detect();
+    blog.ok("MCE banks enabled");
+    // MWAIT/MONITOR: detect support so kernelIdle can swap `sti; hlt`
+    // for `sti; monitor; mwait` (faster IPI wake + deeper C-states).
+    // No CR bits to flip — the instructions are gated purely on CPUID.
+    @import("cpu/mwait.zig").detect();
+    blog.ok("MWAIT/MONITOR detected");
+    // PMU (Performance Monitoring Unit) — sets up PMC0 for cycles, PMI
+    // routed via LAPIC LVT.PMI to vector 0xFE. Sampling profiler can be
+    // armed from the kernel via pmu.start(...) at any later point.
+    @import("cpu/pmu.zig").detect();
+    blog.ok("PMU detected");
     // Capture the FPU/SSE "init" state used to seed every new process. Must
     // run after enableSSE() (CR0/CR4 already set) and before process.create()
     // can be called.

@@ -158,6 +158,14 @@ pub const CpuLocal = struct {
     watchdog_peer_last_tick: u64 = 0,
     watchdog_peer_strikes: u8 = 0,
 
+    /// MONITOR target for `kernelIdle`. MWAIT sleeps until either the
+    /// monitored cache line is written or an interrupt fires; future
+    /// cross-CPU "wake idle without IPI" paths can bump this word
+    /// instead of sending a TLB-shootdown-class IPI. Aligned to 64 B so
+    /// it occupies its own cache line (no spurious wakes from neighbor
+    /// writes). Field unused unless `mwait.mwait_supported` is true.
+    idle_monitor_word: u32 align(64) = 0,
+
     // Tripwire (task #226 lite). LAST field of CpuLocal. If anything writes
     // past the end of cpus[N] — overflow from neighboring data, wild
     // pointer that lands here, sched_lock-state-write that overran — the
@@ -527,6 +535,8 @@ export fn apEntry() callconv(.c) noreturn {
     // BSP which has to wait for paging.dropLowIdentity.
     @import("protect.zig").applyEarlyCr4();
     @import("protect.zig").enableSmapPerCpu();
+    @import("mce.zig").perCpuInit();
+    @import("pmu.zig").perCpuInit();
 
     // Enable our LAPIC
     apic.initLAPICForAP();
@@ -650,9 +660,10 @@ pub fn pollAppLoad() ?u32 {
     // Switch to the kernel page directory before reading the AP-allocated
     // buffer (whose virt = phys, identity-mapped in the kernel PD), then
     // restore.
-    const vmm_mod = @import("../mm/vmm.zig");
+    const pcid_mod = @import("pcid.zig");
     const caller_pd = if (process.currentPCB()) |pcb| pcb.page_dir_phys else 0;
-    vmm_mod.switchAddressSpace(paging.getKernelPageDirPhys());
+    const caller_pcid: u16 = if (process.currentPCB()) |pcb| pcb.pcid else 0;
+    pcid_mod.loadCr3(paging.getKernelPageDirPhys(), 0, myCpu().cpu_id);
 
     const fsize = load_req.file_size;
     var pid: u32 = 0xFFFFFFFF;
@@ -695,8 +706,9 @@ pub fn pollAppLoad() ?u32 {
     load_req.file_size = 0;
 
     // Restore caller's CR3 before returning so the desktop's main loop continues
-    // executing in whatever address space it expected.
-    if (caller_pd != 0) vmm_mod.switchAddressSpace(caller_pd);
+    // executing in whatever address space it expected (PCID-aware so caller's
+    // TLB survives the excursion).
+    if (caller_pd != 0) pcid_mod.loadCr3(caller_pd, caller_pcid, myCpu().cpu_id);
 
     load_req.result_pid = pid;
     @atomicStore(LoadState, &load_req.state, .idle, .release);
@@ -723,12 +735,14 @@ pub fn apProcessLoadQueue() void {
     const t_start = perf.rdtsc();
     serial.print("[smp] AP reading: {s}\n", .{name});
 
-    // Save caller's CR3, switch to kernel PML4 for I/O, restore at end.
-    const vmm = @import("../mm/vmm.zig");
+    // Save caller's CR3 (including PCID bits 11:0), switch to kernel PML4
+    // for I/O, restore at end via pcid.restoreSaved so the caller's TLB
+    // is preserved if it had a tagged address space loaded.
+    const pcid_mod = @import("pcid.zig");
     const caller_pd: u64 = asm volatile ("mov %%cr3, %[r]"
         : [r] "=r" (-> u64),
     );
-    vmm.switchAddressSpace(paging.getKernelPML4Phys());
+    pcid_mod.loadCr3(paging.getKernelPML4Phys(), 0, myCpu().cpu_id);
     const t_after_cr3 = perf.rdtsc();
 
     // PMM-allocate, read into the new buffer, hand the pointer to BSP via
@@ -765,8 +779,9 @@ pub fn apProcessLoadQueue() void {
     );
 
     // Restore caller's CR3 before signaling BSP — keeps the caller's
-    // address space intact across this excursion.
-    vmm.switchAddressSpace(caller_pd);
+    // address space intact across this excursion (PCID-aware: TLB
+    // preserved if generation matches).
+    pcid_mod.restoreSaved(caller_pd, myCpu().cpu_id);
 
     // Signal BSP that disk I/O is done — BSP will create the process
     @atomicStore(LoadState, &load_req.state, .loaded, .release);

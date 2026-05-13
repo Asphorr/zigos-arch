@@ -67,6 +67,44 @@ pub const Canvas = struct {
         }
     }
 
+    /// Fill a rect with src-over alpha-blended color. `alpha` is 0..255
+    /// (0 = transparent, 255 = fully `color`). Same blend math as
+    /// `blendPixel` but the bounds check + index base hoist out of the
+    /// inner loop, so it's ~3x faster for big fills (drop shadows, etc.).
+    pub fn fillRectAlpha(self: *Canvas, rx: u32, ry: u32, rw: u32, rh: u32, color: u32, alpha: u8) void {
+        if (alpha == 0) return;
+        const a: u32 = alpha;
+        const inv: u32 = 255 - a;
+        const sr = (color >> 16) & 0xFF;
+        const sg = (color >> 8) & 0xFF;
+        const sb = color & 0xFF;
+        const sra = sr * a;
+        const sga = sg * a;
+        const sba = sb * a;
+        for (0..rh) |row| {
+            const y2 = ry + @as(u32, @intCast(row));
+            if (y2 >= self.height) break;
+            const base = y2 * self.width;
+            for (0..rw) |col| {
+                const x2 = rx + @as(u32, @intCast(col));
+                if (x2 >= self.width) break;
+                const idx = base + x2;
+                if (alpha == 255) {
+                    self.fb[idx] = color;
+                    continue;
+                }
+                const dst = self.fb[idx];
+                const dr = (dst >> 16) & 0xFF;
+                const dg = (dst >> 8) & 0xFF;
+                const db = dst & 0xFF;
+                const r = (sra + dr * inv + 127) / 255;
+                const g = (sga + dg * inv + 127) / 255;
+                const b = (sba + db * inv + 127) / 255;
+                self.fb[idx] = (r << 16) | (g << 8) | b;
+            }
+        }
+    }
+
     pub fn drawRect(self: *Canvas, rx: u32, ry: u32, rw: u32, rh: u32, color: u32) void {
         self.drawHLine(rx, ry, rw, color);
         if (rh > 1) self.drawHLine(rx, ry + rh - 1, rw, color);

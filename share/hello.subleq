@@ -1,0 +1,25 @@
+; hello.subleq — print "Hello, World!\n" using unrolled output.
+; Each instruction sends one char to OUT (-1). After the last char,
+; fall through to the halt instruction which jumps to PC=-1.
+
+    msg+0  -1
+    msg+1  -1
+    msg+2  -1
+    msg+3  -1
+    msg+4  -1
+    msg+5  -1
+    msg+6  -1
+    msg+7  -1
+    msg+8  -1
+    msg+9  -1
+    msg+10 -1
+    msg+11 -1
+    msg+12 -1
+    msg+13 -1
+halt:
+    Z Z -1
+
+msg:
+    .asciz "Hello, World!\n"
+Z:
+    .word 0

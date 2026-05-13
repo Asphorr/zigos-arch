@@ -2020,3 +2020,27 @@ pub fn nice(inc: i32) i32 {
     if (sched_setnice(0, cur + inc) != 0) return -100;
     return sched_getnice(0);
 }
+
+// --- Clipboard ---
+//
+// Single system-wide clipboard buffer in the kernel. Any app can put
+// bytes in via `setClipboard` and any app can read them out via
+// `getClipboard`. No MIME or format negotiation — bytes are bytes.
+
+pub const CLIPBOARD_MAX: u32 = 64 * 1024;
+
+/// Copy `data` into the kernel clipboard. Returns the number of bytes
+/// actually written (which is `data.len` on success). Passing an empty
+/// slice clears the clipboard.
+pub fn setClipboard(data: []const u8) u32 {
+    if (data.len > CLIPBOARD_MAX) return 0;
+    return syscall(103, @intCast(@intFromPtr(data.ptr)), @intCast(data.len));
+}
+
+/// Read the current clipboard contents into `dest`. Returns the actual
+/// length of the clipboard contents — if it's larger than `dest.len`,
+/// only `dest.len` bytes were written (compare return value to know).
+pub fn getClipboard(dest: []u8) u32 {
+    if (dest.len == 0) return syscall(104, 0, 0);
+    return syscall(104, @intCast(@intFromPtr(dest.ptr)), @intCast(dest.len));
+}

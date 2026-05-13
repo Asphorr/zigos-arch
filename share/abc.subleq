@@ -1,0 +1,18 @@
+; abc.subleq — demonstrate char literals + .word data declarations.
+; Prints "A B C\n" then halts.
+
+    a -1
+    sp -1
+    b -1
+    sp -1
+    c -1
+    nl -1
+halt:
+    Z Z -1
+
+a:   .word 'A'
+b:   .word 'B'
+c:   .word 'C'
+sp:  .word ' '
+nl:  .word '\n'
+Z:   .word 0

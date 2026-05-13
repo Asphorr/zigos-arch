@@ -559,6 +559,23 @@ pub fn eoi() void {
     lapicWrite(LAPIC_EOI, 0);
 }
 
+// LAPIC LVT.PMI (Performance Monitor Interrupt) — register 0x340. Masked
+// at boot; pmu.start() programs it with a vector + clears the mask.
+const LAPIC_LVT_PMI: u32 = 0x340;
+const LVT_MASK_BIT: u32 = 1 << 16;
+
+/// Program LVT.PMI with `vector` and unmask. Called from pmu.start when
+/// sampling begins. Vector must be a free IDT slot wired to the PMI ISR.
+pub fn programLvtPmi(vector: u8) void {
+    lapicWrite(LAPIC_LVT_PMI, vector);
+}
+
+/// Mask the LVT.PMI entry. Safe to call before pmu.start; matches the
+/// boot default. Used by pmu.stop and per-CPU init's "until activated".
+pub fn maskLvtPmi() void {
+    lapicWrite(LAPIC_LVT_PMI, LVT_MASK_BIT);
+}
+
 pub fn enableIRQ(irq: u8) void {
     if (irq >= 24) return;
     const vector: u8 = switch (irq) {

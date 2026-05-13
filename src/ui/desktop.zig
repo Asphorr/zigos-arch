@@ -725,6 +725,19 @@ fn renderScene() void {
         background.render();
         shortcuts.render();
     }
+    // Full scene re-render — background.render() above wiped the entire
+    // back buffer to wallpaper, so each visible window must re-blend its
+    // drop shadow. Setting shadow_dirty=true here covers .full and .drag
+    // paths (both call renderScene); content-only updates (.gui_only /
+    // .text_only) call renderWindow directly *without* clearing first,
+    // so they correctly leave the existing back-buffer shadow alone.
+    {
+        var si: u8 = 0;
+        while (si < wm.z_count) : (si += 1) {
+            const idx = z_stack[si];
+            if (windows[idx].visible) windows[idx].shadow_dirty = true;
+        }
+    }
     // Render in z-order, bottom→top, so the topmost window paints last
     // and any focus highlight / cursor lands above its neighbors.
     // Skip a window if any opaque window above fully contains it — its
@@ -916,6 +929,52 @@ fn renderFullscreenGui(fb: [*]volatile u32, src_w: u32, src_h: u32, stride: u32)
     }
 }
 
+/// Re-render every visible window above `target` in z-order whose outer
+/// rect (including shadow) overlaps `target`. Called from partial-render
+/// paths (`.gui_only`) after the target window has been stamped into the
+/// back buffer — without this, the target's paint clobbers z-higher
+/// neighbors in the overlap region because renderWindow doesn't itself
+/// know about stacking order.
+///
+/// Shadow alpha is included by widening the overlap test on the lower
+/// + right edges by the SHADOW_W constant (16) used in renderWindow.
+fn repaintZAboveOverlapping(target: u8) void {
+    if (target >= MAX_WINDOWS or !slot_used[target]) return;
+    const t = &windows[target];
+    const SHADOW_PAD: i32 = 16;
+    const t_left: i32 = t.x - @as(i32, BORDER);
+    const t_top: i32 = t.y - @as(i32, BORDER);
+    const t_right: i32 = t.x + @as(i32, @intCast(t.width)) + @as(i32, BORDER) + SHADOW_PAD;
+    const t_bot: i32 = t.y + @as(i32, @intCast(t.height)) + @as(i32, BORDER) + SHADOW_PAD;
+
+    var zi: u8 = 0;
+    while (zi < wm.z_count and z_stack[zi] != target) : (zi += 1) {}
+    if (zi >= wm.z_count) return;
+    zi += 1;
+    while (zi < wm.z_count) : (zi += 1) {
+        const ai = z_stack[zi];
+        const aw = &windows[ai];
+        if (!aw.visible or aw.minimized) continue;
+        const a_left: i32 = aw.x - @as(i32, BORDER);
+        const a_top: i32 = aw.y - @as(i32, BORDER);
+        const a_right: i32 = aw.x + @as(i32, @intCast(aw.width)) + @as(i32, BORDER) + SHADOW_PAD;
+        const a_bot: i32 = aw.y + @as(i32, @intCast(aw.height)) + @as(i32, BORDER) + SHADOW_PAD;
+        const overlaps = a_right > t_left and a_left < t_right and a_bot > t_top and a_top < t_bot;
+        if (!overlaps) continue;
+        // Do NOT set shadow_dirty here. Re-blending the 7.8% alpha shadow
+        // over its previous frame on every .gui_only tick accumulates to
+        // black (see [[project_shadow_dirty_flag]] / window-shadow-
+        // accumulation-fix). The chrome+content repaint below covers the
+        // overlap clobber; the existing shadow pixels from the last full
+        // render stay in the back buffer wherever the target didn't write,
+        // which is the common case for "focused terminal above an updating
+        // GUI app". A stale-shadow strip only appears in the (rarer) case
+        // where the target's rect actually intersects this window's shadow
+        // band, and gets fully refreshed on the next renderScene pass.
+        renderWindow(ai);
+    }
+}
+
 fn renderWindow(idx: u8) void {
     const w = &windows[idx];
     if (!w.visible or w.minimized) return;
@@ -976,18 +1035,27 @@ fn renderWindow(idx: u8) void {
     saveCornerPixels(w.x - @as(i32, BORDER), w.y - @as(i32, BORDER), w.width + BORDER * 2, w.height + BORDER * 2);
 
     // Soft drop shadow — 16-step gaussian falloff for right + bottom edges
-    // plus a 2D corner blob at the bottom-right. Lower max alpha (~16%)
+    // plus a 2D corner blob at the bottom-right. Lower max alpha (~7.8%)
     // and longer tail give a modern "lifted" feel rather than the old
     // inky hard-edged shadow. Top + left intentionally have no shadow:
     // we're going for macOS-style asymmetric drop shadow, not material-
     // design all-around elevation.
+    //
+    // Gated on `w.shadow_dirty` so content-only redraws don't re-blend
+    // over the previous frame's shadow (which would accumulate to black
+    // after ~30 frames on a 60fps app like sysmon).
+    if (w.shadow_dirty) shadow_blk: {
     const wx_r: i32 = w.x + @as(i32, @intCast(w.width));
     const wy_b: i32 = w.y + @as(i32, @intCast(w.height));
     const SHADOW_W: u32 = 16;
-    const SHADOW_MAX: u32 = 0x28; // ~16% peak opacity
+    // Peak ~7.8% (halved from the old 16%). The old values landed too dark
+    // on small windows (sysmon, calc) against the dark desktop bg — the
+    // inner layers >0x1B made the band look inky. New curve keeps the
+    // lifted feel but stays subtle even on a black-ish wallpaper.
+    const SHADOW_MAX: u32 = 0x14;
     const shadow_alphas = [SHADOW_W]u8{
-        0x28, 0x24, 0x20, 0x1B, 0x16, 0x12, 0x0E, 0x0B,
-        0x08, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x01,
+        0x14, 0x12, 0x10, 0x0D, 0x0B, 0x09, 0x07, 0x05,
+        0x04, 0x03, 0x02, 0x02, 0x01, 0x01, 0x01, 0x01,
     };
 
     // Bottom edge — horizontal rows below the window
@@ -1017,6 +1085,9 @@ fn renderWindow(idx: u8) void {
             const soff = @as(u32, @intCast(py)) * gfx.target_w + @as(u32, @intCast(px));
             gfx.target[soff] = gfx.blendPixel(gfx.target[soff], (a_combined << 24));
         }
+    }
+        w.shadow_dirty = false;
+        break :shadow_blk;
     }
 
     // Border (1px) — flashes red while a terminal's bell_phase counts down.
@@ -2625,8 +2696,19 @@ pub fn run() void {
                         w.width + BORDER * 2 + 4,
                         w.height + TITLEBAR_H + BORDER * 2 + 4,
                     );
-                    // Re-render just this window into the back buffer
-                    if (backbuf != null) renderWindow(gi);
+                    if (backbuf != null) {
+                        renderWindow(gi);
+                        // Re-paint any visible windows z-above `gi` that overlap
+                        // its rect. renderWindow stamps pixels into the back
+                        // buffer at the window's screen position regardless of
+                        // z-order — without this loop, a background-spawned GUI
+                        // updating its FB clobbers the focused terminal above
+                        // it in the overlap area (visible as flicker on each
+                        // cursor blink). renderScene's bottom→top iteration
+                        // handles this correctly; `.gui_only` was the partial-
+                        // render path that skipped it.
+                        repaintZAboveOverlapping(gi);
+                    }
                     if (dirty == .none or dirty == .cursor_only) dirty = .gui_only;
                 }
             }
@@ -2825,7 +2907,17 @@ pub fn createGuiWindow(pid: u8, fb: [*]volatile u32, fb_backs: [3]?[*]volatile u
         windows[slot].title_len = @intCast(title.len);
     }
     pushZTop(slot);
-    if (auto_focus) setFocused(slot);
+    if (auto_focus) {
+        setFocused(slot);
+    } else if (slot_used[wm.focused] and wm.focused != slot) {
+        // Background-spawn (e.g. `files` launched from a focused shell).
+        // We DON'T steal input focus (shell keeps the cursor), and the
+        // visual stacking should match: shell stays on top so the user
+        // can keep typing without the spawn occluding it. Re-pushing the
+        // focused window puts it back at z-top — new window settles
+        // immediately below.
+        pushZTop(wm.focused);
+    }
     startAnimation(slot, .opening);
     // Publish an initial resize event so apps can lay out for the actual
     // window size (which may be smaller than the allocation if the

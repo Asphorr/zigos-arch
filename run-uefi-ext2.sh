@@ -67,9 +67,11 @@ VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json \
     -audiodev none,id=snd0 -device AC97,audiodev=snd0 \
     -device virtio-sound-pci,audiodev=snd0 \
     -device intel-hda -device hda-duplex,audiodev=snd0 \
-    -drive file=disk.tar,format=raw,index=0,if=ide \
+    -drive file=disk.tar,format=raw,if=none,id=nvm_tar \
+    -device nvme,drive=nvm_tar,serial=zigos-tarfs \
     -drive file=fat:rw:zig-out/esp,index=1,if=ide \
-    -drive file=ext2.img,format=raw,index=2,if=ide \
+    -drive file=ext2.img,format=raw,if=none,id=nvm_ext2 \
+    -device nvme,drive=nvm_ext2,serial=zigos-ext2 \
     -serial file:serial.log "$@"
 
 # Post-mortem: parse [crash-fp] lines into crashes/db.csv and warn on dups.

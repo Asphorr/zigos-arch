@@ -114,6 +114,10 @@ pub fn init() void {
     // TLB shootdown IPI (vector 0x50). Receiver: full local TLB flush + ack.
     setGate(@import("tlb.zig").TLB_VECTOR, @intFromPtr(&isr_tlb_shootdown), 0x8E);
 
+    // PMI (Performance Monitor Interrupt). LAPIC LVT.PMI delivers to this
+    // vector when PMC0 overflows. Stub forwards saved RIP to pmu.onSample.
+    setGate(@import("pmu.zig").PMI_VECTOR, @intFromPtr(&isr_pmi), 0x8E);
+
     // Syscall (DPL=3: callable from Ring 3)
     setGate(128, @intFromPtr(&syscall.isr_syscall), 0xEE);
 
@@ -283,6 +287,17 @@ export fn handleException(rsp: u64) callconv(.c) void {
     if (int_no == 2) {
         @import("../debug/kdbg.zig").nmiSnapshot(rsp, saved_rip, saved_cs);
         return;
+    }
+
+    // Machine Check (vector 18). Walk MC banks, log + clear; resume on
+    // recoverable status, panic only when PCC (processor-context-corrupt)
+    // is set. Without this dispatch the generic exception path treats
+    // every #MC as a panic, losing the per-bank decode.
+    if (int_no == 18) {
+        const outcome = @import("mce.zig").handle();
+        if (outcome == .recovered) return;
+        // Fatal — fall through to the standard panic dump below.
+        serial.print("[mce] FATAL: PCC set on at least one bank — kernel state corrupt\n", .{});
     }
 
     // Wild-RIP hunt (task #224). Same idea as handleIRQ0: validate the saved
@@ -1523,6 +1538,52 @@ fn isr_tlb_shootdown() callconv(.naked) void {
 
 pub export fn isr_tlb_shootdown_align_panic() callconv(.c) noreturn {
     @panic("isr_tlb_shootdown: RSP misaligned at call handleTlbShootdown");
+}
+
+// PMI (Performance Monitoring Interrupt) stub — vector 0xFE. LAPIC's
+// LVT.PMI delivers here when PMC0 overflows. Same caller-saved + fxsave
+// shape as isr_tlb_shootdown. Reads the saved RIP off the iretq frame
+// to hand to pmu.onSample for one-line "where did the sample land" log
+// output. Alignment: 8 (RIP arg) + 40 (5 pushes after rsp align test)
+// + ... — we just compute RIP from the frame and call.
+fn isr_pmi() callconv(.naked) void {
+    asm volatile (
+        \\ pushq %%rax
+        \\ pushq %%rcx
+        \\ pushq %%rdx
+        \\ pushq %%rdi
+        \\ pushq %%rsi
+        \\ pushq %%r8
+        \\ pushq %%r9
+        \\ pushq %%r10
+        \\ pushq %%r11
+        \\ subq $512, %%rsp
+        \\ fxsaveq (%%rsp)
+        \\ test $0xF, %%rsp
+        \\ jnz isr_pmi_align_panic
+        \\ movq 584(%%rsp), %%rdi
+        \\ call handlePmi
+        \\ fxrstorq (%%rsp)
+        \\ addq $512, %%rsp
+        \\ popq %%r11
+        \\ popq %%r10
+        \\ popq %%r9
+        \\ popq %%r8
+        \\ popq %%rsi
+        \\ popq %%rdi
+        \\ popq %%rdx
+        \\ popq %%rcx
+        \\ popq %%rax
+        \\ iretq
+    );
+}
+
+pub export fn isr_pmi_align_panic() callconv(.c) noreturn {
+    @panic("isr_pmi: RSP misaligned at call handlePmi");
+}
+
+export fn handlePmi(rip: u64) callconv(.c) void {
+    @import("pmu.zig").onSample(rip);
 }
 
 // --- Dynamic IRQ vectors (MSI-X) ---------------------------------------------

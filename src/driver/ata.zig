@@ -159,7 +159,7 @@ fn testDmaRead(port: u16, drive_head: u8, bm_base: u16) bool {
     io.outb(bm_base, 0x08);
 
     // Send READ DMA for LBA 0, count 1
-    waitBsy(port);
+    _ = waitBsy(port);
     io.outb(port + 6, drive_head);
     io.outb(port + 2, 1); // 1 sector
     io.outb(port + 3, 0); // LBA 0
@@ -381,13 +381,30 @@ fn readSectorsDMA(port: u16, drive_head: u8, lba: u32, count: u8, dest: [*]u8, b
 
 // === PIO operations (kept as fallback) ===
 
-fn waitReady(port: u16) void {
-    while ((io.inb(port + 7) & 0x80) != 0) {}
-    while ((io.inb(port + 7) & 0x08) == 0) {}
+// 1M port reads ≈ ~1s on legacy IDE bus (each inb is ~1µs). Anything past
+// that and the drive is presumed dead — return false so callers bail
+// instead of wedging cpu1 until the watchdog (~3s).
+const ATA_WAIT_LIMIT: u32 = 1_000_000;
+
+fn waitReady(port: u16) bool {
+    var n: u32 = ATA_WAIT_LIMIT;
+    while (n > 0) : (n -= 1) {
+        if ((io.inb(port + 7) & 0x80) == 0) break;
+    }
+    if (n == 0) return false;
+    n = ATA_WAIT_LIMIT;
+    while (n > 0) : (n -= 1) {
+        if ((io.inb(port + 7) & 0x08) != 0) return true;
+    }
+    return false;
 }
 
-fn waitBsy(port: u16) void {
-    while ((io.inb(port + 7) & 0x80) != 0) {}
+fn waitBsy(port: u16) bool {
+    var n: u32 = ATA_WAIT_LIMIT;
+    while (n > 0) : (n -= 1) {
+        if ((io.inb(port + 7) & 0x80) == 0) return true;
+    }
+    return false;
 }
 
 fn readSectorPort(port: u16, drive_head: u8, lba: u32, dest: [*]u8) void {
@@ -397,7 +414,10 @@ fn readSectorPort(port: u16, drive_head: u8, lba: u32, dest: [*]u8) void {
     io.outb(port + 4, @as(u8, @truncate(lba >> 8)));
     io.outb(port + 5, @as(u8, @truncate(lba >> 16)));
     io.outb(port + 7, 0x20); // READ SECTORS
-    waitReady(port);
+    if (!waitReady(port)) {
+        @memset(dest[0..512], 0);
+        return;
+    }
     const dest_u16: [*]align(1) u16 = @ptrCast(dest);
     for (0..256) |i| dest_u16[i] = io.inw(port);
 }
@@ -412,8 +432,13 @@ fn readSectorsPort(port: u16, drive_head: u8, lba: u32, count: u8, dest: [*]u8) 
     io.outb(port + 7, 0x20); // READ SECTORS
     const dest_u16: [*]align(1) u16 = @ptrCast(dest);
     for (0..n) |s| {
-        waitReady(port);
         const off = s * 256;
+        if (!waitReady(port)) {
+            // Zero the remainder so callers see consistent (empty) data
+            // rather than uninitialized memory from the previous sector.
+            @memset(dest[off * 2 .. n * 512], 0);
+            return;
+        }
         for (0..256) |i| dest_u16[off + i] = io.inw(port);
     }
 }
@@ -425,10 +450,10 @@ fn writeSectorPort(port: u16, drive_head: u8, lba: u32, src: [*]const u8) void {
     io.outb(port + 4, @as(u8, @truncate(lba >> 8)));
     io.outb(port + 5, @as(u8, @truncate(lba >> 16)));
     io.outb(port + 7, 0x30); // WRITE SECTORS
-    waitReady(port);
+    if (!waitReady(port)) return;
     const src_u16: [*]align(1) const u16 = @ptrCast(src);
     for (0..256) |i| io.outb16(port, src_u16[i]);
     // Flush cache
     io.outb(port + 7, 0xE7);
-    waitBsy(port);
+    _ = waitBsy(port);
 }

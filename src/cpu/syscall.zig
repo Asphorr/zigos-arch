@@ -356,9 +356,11 @@ const SYSCALLS = [_]SyscallSpec{
     .{ .num = 100, .name = "get_affinity",            .handler = wrap(sysGetAffinity) },
     .{ .num = 101, .name = "set_nice",                .handler = wrap(sysSetNice) },
     .{ .num = 102, .name = "get_nice",                .handler = wrap(sysGetNice) },
+    .{ .num = 103, .name = "set_clipboard",           .handler = wrap(sysSetClipboard) },
+    .{ .num = 104, .name = "get_clipboard",           .handler = wrap(sysGetClipboard) },
 };
 
-const MAX_SYSCALL: u32 = 102;
+const MAX_SYSCALL: u32 = 104;
 const dispatch: [MAX_SYSCALL + 1]?Handler = blk: {
     var t: [MAX_SYSCALL + 1]?Handler = [_]?Handler{null} ** (MAX_SYSCALL + 1);
     for (SYSCALLS) |s| t[s.num] = s.handler;
@@ -609,6 +611,8 @@ fn doSyscallInner(sys_num: u32, arg1: u32, arg2: u32, arg3: u32, frame: *signals
         100 => sysGetAffinity(arg1),
         101 => sysSetNice(arg1, arg2),
         102 => sysGetNice(arg1),
+        103 => sysSetClipboard(arg1, arg2),
+        104 => sysGetClipboard(arg1, arg2),
         else => E_NOSYS,
     };
 }
@@ -983,7 +987,9 @@ fn sysMunmap(va: u32, len: u32) u32 {
     // would still cache the freed pages' translations and could read /
     // write into now-recycled PMM frames. Doing it once at batch end
     // rather than inside unmapUserPage cuts the IPI count by len/4096×.
-    @import("tlb.zig").shootdownAll();
+    // Pass the caller's PCID so peer CPUs holding stale entries for it
+    // get a gen mismatch on their next reload (forces flush).
+    @import("tlb.zig").shootdownAll(lead.pcid);
 
     // Compact the lazy_regions array. heap_lazy_idx is sbrk's pointer; if it
     // happens to be above the removed slot, shift it down by one to keep
@@ -1626,7 +1632,8 @@ fn sysExec(name_ptr: u32, name_len: u32) u32 {
 
     // Switch to kernel PD -- user PD doesn't map all kernel memory
     const caller_pd = if (process.currentPCB()) |pcb| pcb.page_dir_phys else 0;
-    vmm.switchAddressSpace(paging.getKernelPageDirPhys());
+    const caller_pcid = if (process.currentPCB()) |pcb| pcb.pcid else 0;
+    @import("pcid.zig").loadCr3(paging.getKernelPageDirPhys(), 0, @import("smp.zig").myCpu().cpu_id);
 
     var pid: u32 = 0xFFFFFFFF;
     if (vfs.loadFileFresh(name_buf[0..fname_len])) |fresh| {
@@ -1717,8 +1724,10 @@ fn sysExec(name_ptr: u32, name_len: u32) u32 {
         }
     }
 
-    // Switch back to caller's PD
-    if (caller_pd != 0) vmm.switchAddressSpace(caller_pd);
+    // Switch back to caller's PD (PCID-aware so caller's TLB is preserved).
+    if (caller_pd != 0) {
+        @import("pcid.zig").loadCr3(caller_pd, caller_pcid, @import("smp.zig").myCpu().cpu_id);
+    }
 
     return pid;
 }
@@ -2820,6 +2829,51 @@ fn sysGetNice(target_pid: u32) u32 {
 
     const nice = process.procs[target].nice;
     return @intCast(@as(i32, nice) + 21);
+}
+
+// --- Clipboard (syscalls #103, #104) ---
+//
+// Single global byte buffer + length. Set overwrites previous contents;
+// Get copies current contents into a user buffer and returns the actual
+// length (caller passes max_len; we copy min(actual, max_len) so the
+// user can detect truncation by comparing return value to their buffer
+// size). No notifications, no MIME types, no multi-format — minimal
+// shape for "editor copy → editor paste" and "shell `wc -l`-style
+// paste into another window" to work. Future expansion (MIME, history)
+// stays additive.
+
+pub const CLIPBOARD_MAX: u32 = 64 * 1024;
+var clipboard_buf: [CLIPBOARD_MAX]u8 = [_]u8{0} ** CLIPBOARD_MAX;
+var clipboard_len: u32 = 0;
+var clipboard_lock: @import("../proc/spinlock.zig").SpinLock = .{};
+
+fn sysSetClipboard(buf_ptr: u32, len: u32) u32 {
+    if (len == 0) {
+        clipboard_lock.acquire();
+        defer clipboard_lock.release();
+        clipboard_len = 0;
+        return 0;
+    }
+    if (len > CLIPBOARD_MAX) return E_INVAL;
+    if (!validateUserPtr(buf_ptr, len)) return E_FAULT;
+    const src: [*]const u8 = @ptrFromInt(@as(usize, buf_ptr));
+    clipboard_lock.acquire();
+    defer clipboard_lock.release();
+    @memcpy(clipboard_buf[0..len], src[0..len]);
+    clipboard_len = len;
+    return len;
+}
+
+fn sysGetClipboard(buf_ptr: u32, max_len: u32) u32 {
+    clipboard_lock.acquire();
+    defer clipboard_lock.release();
+    const actual = clipboard_len;
+    if (actual == 0 or max_len == 0) return 0;
+    const copy_n = @min(actual, max_len);
+    if (!validateUserPtr(buf_ptr, copy_n)) return E_FAULT;
+    const dst: [*]u8 = @ptrFromInt(@as(usize, buf_ptr));
+    @memcpy(dst[0..copy_n], clipboard_buf[0..copy_n]);
+    return actual;
 }
 
 // --- Process tree + IPC syscalls (Task #73) ---

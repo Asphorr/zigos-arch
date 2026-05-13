@@ -176,6 +176,13 @@ pub const Window = struct {
     /// legacy console-fd consumers, via `desktop.popCharEvent` from
     /// `sysRead`/`vfs.read`). See ui/events.zig for the event model.
     events: events_mod.EventQueue = .{},
+    /// True when the back buffer's shadow region needs to be re-blended.
+    /// Set on geometry change (full redraw / drag) by renderScene; cleared
+    /// after renderWindow blends the shadow. Without this gate, every
+    /// content-update redraw (.gui_only / .text_only) would re-blend the
+    /// shadow on top of the previous frame's shadow → accumulation to
+    /// black after ~30 frames.
+    shadow_dirty: bool = true,
 };
 
 pub const ResizeEdge = enum { right, bottom, bottom_right };
