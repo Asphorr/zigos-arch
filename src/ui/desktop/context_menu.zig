@@ -9,11 +9,12 @@
 // would create a circular import with desktop.
 
 const gfx = @import("../gfx.zig");
+const aa_font = @import("../aa_font.zig");
 const dirty_rects = @import("dirty.zig");
 
 pub const Context = enum { none, desktop_bg, titlebar };
 
-pub const desktop_items = [_][]const u8{ "New Terminal", "Run App...", "About ZigOS" };
+pub const desktop_items = [_][]const u8{ "New Terminal", "Run App...", "Arrange Icons", "About ZigOS" };
 pub const titlebar_items = [_][]const u8{ "Close", "Minimize" };
 
 const ITEM_H: u32 = 28;
@@ -36,12 +37,13 @@ pub fn currentItems() []const []const u8 {
 }
 
 fn menuWidth(items: []const []const u8) u32 {
-    var max_len: u32 = 0;
+    const atlas = aa_font.getDefault16();
+    var max_w: u32 = 0;
     for (items) |item| {
-        const l: u32 = @intCast(item.len);
-        if (l > max_len) max_len = l;
+        const w = atlas.measure(item);
+        if (w > max_w) max_w = w;
     }
-    return max_len * 8 + PAD_X * 2; // 8px per char (gfx.drawString uses 8x16 font)
+    return max_w + PAD_X * 2;
 }
 
 fn clampPos(mw_u: u32, mh_u: u32) [2]i32 {
@@ -136,6 +138,8 @@ pub fn render() void {
     gfx.fillGlass(cx, cy, mw, mh, CR, 0x402C2C30, 6);
     gfx.fillRoundedRectAlpha(cx - 1, cy - 1, mw + 2, mh + 2, CR + 1, 0x20FFFFFF);
 
+    const atlas = aa_font.getDefault16();
+    const text_y_offset: i32 = @intCast((ITEM_H -| atlas.line_height) / 2);
     for (0..count) |i| {
         const item_y = cy + @as(i32, @intCast(PAD_Y + @as(u32, @intCast(i)) * ITEM_H));
         const hovered = (hover >= 0 and @as(u32, @intCast(hover)) == i);
@@ -144,13 +148,7 @@ pub fn render() void {
             gfx.fillRoundedRect(cx + 4, item_y + 1, mw -| 8, ITEM_H -| 2, 4, 0x4488CC);
         }
 
-        gfx.drawString(
-            cx + @as(i32, PAD_X),
-            item_y + 6,
-            items[i],
-            0xFFFFFF,
-            if (hovered) @as(u32, 0x4488CC) else 0,
-        );
+        aa_font.drawText(cx + @as(i32, PAD_X), item_y + text_y_offset, items[i], 0xFFFFFF, atlas);
 
         if (i + 1 < count) {
             gfx.drawHLine(cx + @as(i32, PAD_X), item_y + @as(i32, ITEM_H) - 1, mw -| PAD_X * 2, 0x3A3A3E);

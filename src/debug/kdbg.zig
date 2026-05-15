@@ -1040,12 +1040,23 @@ fn printFlags(entry: u64) void {
 /// Walk a user PD's mapping for `virt` and print each level. Called from
 /// the crash handler so we can answer "what's actually mapped at CR2?"
 /// without sprinkling klog through vmm.zig.
-pub fn walkUserPT(pml4_phys: u64, virt: u64) void {
-    serial.print("[kdbg] PT walk for virt=0x{X:0>16} (CR3=0x{X}):\n", .{ virt, pml4_phys });
+pub fn walkUserPT(pml4_phys_raw: u64, virt: u64) void {
+    serial.print("[kdbg] PT walk for virt=0x{X:0>16} (CR3=0x{X}):\n", .{ virt, pml4_phys_raw });
 
-    if (pml4_phys == 0) {
+    if (pml4_phys_raw == 0) {
         serial.print("  CR3=0 — no address space\n", .{});
         return;
+    }
+
+    // Callers usually pass CR3 directly, which carries PCID in bits 0..11
+    // when CR4.PCIDE=1 (always, on ZigOS post-PCID rollout). Mask down to
+    // the PML4 phys page — without this the [*]const u64 cast below
+    // hits Zig's alignment safety check ("incorrect alignment") on the
+    // first `pml4[idx]` deref. That was the cascade-panic source on the
+    // 2026-05-14 photo.elf #PF: CR3=0x7CB00F → PCID=0xF, phys=0x7CB000.
+    const pml4_phys = pml4_phys_raw & PAGE_MASK;
+    if (pml4_phys != pml4_phys_raw) {
+        serial.print("  (masked CR3 flags/PCID: phys=0x{X:0>16})\n", .{pml4_phys});
     }
 
     const pml4_idx = (virt >> 39) & 0x1FF;
@@ -1054,6 +1065,16 @@ pub fn walkUserPT(pml4_phys: u64, virt: u64) void {
     const pt_idx = (virt >> 12) & 0x1FF;
 
     const paging = @import("../mm/paging.zig");
+
+    // Belt-and-suspenders: refuse any level pointer that isn't 8-aligned.
+    // Phys-page-aligned values masked above should always satisfy this,
+    // but a corrupted CR3 (e.g. accidental kernel-image-vs-CR3 confusion)
+    // could still reach here. Better to print "(misaligned)" than to
+    // re-panic inside the panic path.
+    if (!checkAligned(pml4_phys)) {
+        serial.print("  PML4 phys misaligned — skipping walk\n", .{});
+        return;
+    }
     const pml4: [*]const u64 = @ptrFromInt(paging.physToVirt(pml4_phys));
     const pml4e = pml4[pml4_idx];
     serial.print("  PML4[{d}]=0x{X:0>16} ", .{ pml4_idx, pml4e });
@@ -1061,25 +1082,44 @@ pub fn walkUserPT(pml4_phys: u64, virt: u64) void {
     serial.print("\n", .{});
     if (pml4e & PRESENT == 0) return;
 
-    const pdpt: [*]const u64 = @ptrFromInt(paging.physToVirt(pml4e & PAGE_MASK));
+    const pdpt_phys = pml4e & PAGE_MASK;
+    if (!checkAligned(pdpt_phys)) {
+        serial.print("  PDPT phys misaligned — skipping walk\n", .{});
+        return;
+    }
+    const pdpt: [*]const u64 = @ptrFromInt(paging.physToVirt(pdpt_phys));
     const pdpte = pdpt[pdpt_idx];
     serial.print("  PDPT[{d}]=0x{X:0>16} ", .{ pdpt_idx, pdpte });
     printFlags(pdpte);
     serial.print("\n", .{});
     if (pdpte & PRESENT == 0 or pdpte & PAGE_SIZE_FLAG != 0) return;
 
-    const pd: [*]const u64 = @ptrFromInt(paging.physToVirt(pdpte & PAGE_MASK));
+    const pd_phys = pdpte & PAGE_MASK;
+    if (!checkAligned(pd_phys)) {
+        serial.print("  PD phys misaligned — skipping walk\n", .{});
+        return;
+    }
+    const pd: [*]const u64 = @ptrFromInt(paging.physToVirt(pd_phys));
     const pde = pd[pd_idx];
     serial.print("  PD[{d}]=0x{X:0>16} ", .{ pd_idx, pde });
     printFlags(pde);
     serial.print("\n", .{});
     if (pde & PRESENT == 0 or pde & PAGE_SIZE_FLAG != 0) return;
 
-    const pt: [*]const u64 = @ptrFromInt(paging.physToVirt(pde & PAGE_MASK));
+    const pt_phys = pde & PAGE_MASK;
+    if (!checkAligned(pt_phys)) {
+        serial.print("  PT phys misaligned — skipping walk\n", .{});
+        return;
+    }
+    const pt: [*]const u64 = @ptrFromInt(paging.physToVirt(pt_phys));
     const pte = pt[pt_idx];
     serial.print("  PT[{d}]=0x{X:0>16} ", .{ pt_idx, pte });
     printFlags(pte);
     serial.print("\n", .{});
+}
+
+inline fn checkAligned(phys: u64) bool {
+    return (phys & 0xFFF) == 0;
 }
 
 // === User stack walk =======================================================

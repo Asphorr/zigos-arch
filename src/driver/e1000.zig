@@ -28,6 +28,7 @@ const paging = @import("../mm/paging.zig");
 const msix = @import("../time/msix.zig");
 const debug = @import("../debug/debug.zig");
 const net = @import("../net/net.zig");
+const iommu = @import("../cpu/iommu.zig");
 
 const E1000_VENDOR: u16 = 0x8086;
 
@@ -241,6 +242,12 @@ pub fn init() bool {
 
     pci.bindDevice(d);
 
+    // IOMMU Phase 3: flip onto own SL page table NOW, before any DMA
+    // can happen. Every allocation that hardware will see must be
+    // dmaMap'd explicitly below — anything else faults. No-op when
+    // the IOMMU isn't running, safe to call unconditionally.
+    _ = iommu.enableIsolation(d.bus, d.dev, d.func);
+
     // Reset: pulse CTRL.RST. The device clears it once self-test finishes.
     mmioWrite(REG_CTRL, mmioRead(REG_CTRL) | CTRL_RST);
     var spin: u32 = 0;
@@ -312,6 +319,8 @@ pub fn init() bool {
         debug.klog("[e1000] RX buf alloc failed\n", .{});
         return false;
     };
+    _ = iommu.dmaMap(d.bus, d.dev, d.func, rx_desc_phys, 4096, .{});
+    _ = iommu.dmaMap(d.bus, d.dev, d.func, rx_buffers, BUF_PAGES * 4096, .{});
     @memset(@as([*]u8, @ptrFromInt(paging.physToVirt(rx_desc_phys)))[0 .. NUM_RX_DESC * @sizeOf(RxDesc)], 0);
     var di: u32 = 0;
     while (di < NUM_RX_DESC) : (di += 1) {
@@ -338,6 +347,8 @@ pub fn init() bool {
     const tx_desc_phys = pmm.allocContiguous(1) orelse return false;
     tx_descs = @ptrFromInt(paging.physToVirt(tx_desc_phys));
     tx_buffers = pmm.allocContiguous(BUF_PAGES) orelse return false;
+    _ = iommu.dmaMap(d.bus, d.dev, d.func, tx_desc_phys, 4096, .{});
+    _ = iommu.dmaMap(d.bus, d.dev, d.func, tx_buffers, BUF_PAGES * 4096, .{});
     @memset(@as([*]u8, @ptrFromInt(paging.physToVirt(tx_desc_phys)))[0 .. NUM_TX_DESC * @sizeOf(TxDesc)], 0);
     di = 0;
     while (di < NUM_TX_DESC) : (di += 1) {

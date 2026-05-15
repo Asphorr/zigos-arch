@@ -358,9 +358,15 @@ const SYSCALLS = [_]SyscallSpec{
     .{ .num = 102, .name = "get_nice",                .handler = wrap(sysGetNice) },
     .{ .num = 103, .name = "set_clipboard",           .handler = wrap(sysSetClipboard) },
     .{ .num = 104, .name = "get_clipboard",           .handler = wrap(sysGetClipboard) },
+    .{ .num = 105, .name = "cpu_stats",               .handler = wrap(sysCpuStats) },
+    .{ .num = 106, .name = "net_info",                .handler = wrap(sysNetInfo) },
+    .{ .num = 107, .name = "tls_connect",             .handler = wrap(sysTlsConnect) },
+    .{ .num = 108, .name = "tls_send",                .handler = wrap(sysTlsSend) },
+    .{ .num = 109, .name = "tls_recv",                .handler = wrap(sysTlsRecv) },
+    .{ .num = 110, .name = "tls_close",               .handler = wrap(sysTlsClose) },
 };
 
-const MAX_SYSCALL: u32 = 104;
+const MAX_SYSCALL: u32 = 110;
 const dispatch: [MAX_SYSCALL + 1]?Handler = blk: {
     var t: [MAX_SYSCALL + 1]?Handler = [_]?Handler{null} ** (MAX_SYSCALL + 1);
     for (SYSCALLS) |s| t[s.num] = s.handler;
@@ -613,6 +619,12 @@ fn doSyscallInner(sys_num: u32, arg1: u32, arg2: u32, arg3: u32, frame: *signals
         102 => sysGetNice(arg1),
         103 => sysSetClipboard(arg1, arg2),
         104 => sysGetClipboard(arg1, arg2),
+        105 => sysCpuStats(arg1, arg2),
+        106 => sysNetInfo(arg1),
+        107 => sysTlsConnect(arg1),
+        108 => sysTlsSend(arg1, arg2, arg3),
+        109 => sysTlsRecv(arg1, arg2, arg3),
+        110 => sysTlsClose(arg1),
         else => E_NOSYS,
     };
 }
@@ -987,9 +999,15 @@ fn sysMunmap(va: u32, len: u32) u32 {
     // would still cache the freed pages' translations and could read /
     // write into now-recycled PMM frames. Doing it once at batch end
     // rather than inside unmapUserPage cuts the IPI count by len/4096×.
-    // Pass the caller's PCID so peer CPUs holding stale entries for it
-    // get a gen mismatch on their next reload (forces flush).
-    @import("tlb.zig").shootdownAll(lead.pcid);
+    // For range==1 page, use INVPCID type-0 (single-page) so peer CPUs
+    // only lose that one TLB entry; for larger ranges, use type-1
+    // (whole-PCID flush) which is cheaper than emitting N type-0 calls.
+    const tlb = @import("tlb.zig");
+    if ((end - start) == 0x1000) {
+        tlb.shootdownPage(lead.pcid, start);
+    } else {
+        tlb.shootdownAll(lead.pcid);
+    }
 
     // Compact the lazy_regions array. heap_lazy_idx is sbrk's pointer; if it
     // happens to be above the removed slot, shift it down by one to keep
@@ -1167,6 +1185,20 @@ fn sysMprotect(va: u32, len: u32, prot: u32) u32 {
         // fine, the region's prot field is updated so the eventual fault-in
         // sees the new bits.
         _ = vmm.changePageProt(pd, page, new_flags);
+    }
+
+    // Cross-CPU TLB shootdown. changePageProt only does a local invlpg per
+    // page; without this, another CPU's TLB still caches the OLD prot bits
+    // and an mprotect(RW→RO) wouldn't actually block writes from that CPU
+    // until its TLB happens to evict the entry.
+    // Single-page case uses type-0 INVPCID (surgical, leaves the rest of
+    // the PCID's TLB intact); ranges fall through to the whole-PCID type-1
+    // flush.
+    const tlb = @import("tlb.zig");
+    if (len_pg == 0x1000) {
+        tlb.shootdownPage(pcb.pcid, start);
+    } else {
+        tlb.shootdownAll(pcb.pcid);
     }
     return 0;
 }
@@ -1447,7 +1479,72 @@ fn sysMeminfo(buf_ptr: u32) u32 {
     if (!validateUserPtrAligned(buf_ptr, 8, 4)) return E_FAULT;
     const buf: [*]u32 = @ptrFromInt(@as(usize, buf_ptr));
     buf[0] = pmm.freeFrameCount();
-    buf[1] = pmm.freeFrameCount() + 1024; // approximate total (free + kernel used)
+    buf[1] = pmm.managedFrameCount();
+    return 0;
+}
+
+/// Per-CPU tick stats — `(irq_ticks, idle_ticks)` u64 pair per alive CPU,
+/// packed sequentially. Caller passes a buffer sized for `max_cpus` entries
+/// (16 bytes each); we fill up to the alive count and return the actual
+/// count written. Returns E_FAULT on bad user pointer or buf too small.
+///
+/// Used by sysmon / top-style tools: compute `(d_irq - d_idle) / d_irq * 100`
+/// across two snapshots to get instantaneous utilization per CPU.
+const CpuStat = extern struct {
+    irq_ticks: u64,
+    idle_ticks: u64,
+};
+
+fn sysCpuStats(buf_ptr: u32, max_cpus: u32) u32 {
+    if (max_cpus == 0) return E_INVAL;
+    const byte_len: u32 = max_cpus * @sizeOf(CpuStat);
+    if (!validateUserPtrAligned(buf_ptr, byte_len, @alignOf(CpuStat))) return E_FAULT;
+    const buf: [*]CpuStat = @ptrFromInt(@as(usize, buf_ptr));
+    var written: u32 = 0;
+    for (&smp.cpus) |*c| {
+        if (!c.alive) continue;
+        if (written >= max_cpus) break;
+        buf[written] = .{
+            .irq_ticks = c.irq_tick_count,
+            .idle_ticks = c.idle_tick_count,
+        };
+        written += 1;
+    }
+    return written;
+}
+
+/// Snapshot of the active L3 configuration, copied out in one shot so
+/// userspace doesn't need to syscall once per field. `dhcp_configured`
+/// distinguishes a real DHCP lease from the static SLIRP fallback.
+const NetInfo = extern struct {
+    local_ip: [4]u8,
+    gateway_ip: [4]u8,
+    dns_ip: [4]u8,
+    subnet_mask: [4]u8,
+    mac: [6]u8,
+    /// Padding so `dhcp_configured` lands on a natural alignment boundary
+    /// — extern structs don't auto-pad and we want a stable wire layout.
+    _pad: [2]u8 = .{ 0, 0 },
+    dhcp_configured: u32,
+    dhcp_lease_secs: u32,
+    nic_present: u32,
+};
+
+fn sysNetInfo(buf_ptr: u32) u32 {
+    if (!validateUserPtrAligned(buf_ptr, @sizeOf(NetInfo), @alignOf(NetInfo))) return E_FAULT;
+    const net = @import("../net/net.zig");
+    const nic = @import("../driver/nic.zig");
+    const info: *NetInfo = @ptrFromInt(@as(usize, buf_ptr));
+    info.* = .{
+        .local_ip = net.local_ip,
+        .gateway_ip = net.gateway_ip,
+        .dns_ip = net.dns_ip,
+        .subnet_mask = net.subnet_mask,
+        .mac = nic.getMac(),
+        .dhcp_configured = if (net.dhcp_configured) 1 else 0,
+        .dhcp_lease_secs = net.dhcp_lease_secs,
+        .nic_present = if (nic.isReady()) 1 else 0,
+    };
     return 0;
 }
 
@@ -3623,5 +3720,85 @@ fn sysUsleep(usec: u32) u32 {
     while (time.monotonicNanos() < target) {
         asm volatile ("pause");
     }
+    return 0;
+}
+
+// === TLS 1.3 syscalls (107-110) ======================================
+//
+// Userspace wrappers around the kernel TlsConn pool. The kernel does
+// the full handshake (X25519, HKDF, AEAD record framing) + cert
+// verification + Mozilla NSS trust anchor lookup. Apps only push and
+// pull plaintext.
+
+const tls_conn = @import("../crypto/tls/conn.zig");
+
+/// On-wire layout of the tls_connect args struct (kernel & userspace
+/// agree). Packed into a single user pointer because syscalls have a
+/// 3-arg limit and we need ip + port + variable-length SNI.
+const TlsConnectArgs = extern struct {
+    ip: [4]u8,
+    port: u16,
+    _pad: u16,
+    sni_ptr: u32,
+    sni_len: u32,
+};
+
+/// tls_connect(args_ptr) — open a TLS 1.3 connection. Performs the
+/// TCP handshake, full TLS 1.3 handshake (X25519/ChaCha20-Poly1305),
+/// certificate validation against Mozilla NSS, and CertificateVerify
+/// check. Returns the kernel-side TLS slot id on success, or
+/// 0xFFFFFFFF on any failure. Blocks for the duration of the
+/// handshake (typically <2s on local network, longer on real
+/// internet).
+fn sysTlsConnect(args_ptr: u32) u32 {
+    if (!validateUserPtrAligned(args_ptr, @sizeOf(TlsConnectArgs), @alignOf(TlsConnectArgs))) return E_FAULT;
+    var args: TlsConnectArgs = undefined;
+    const args_src: [*]const u8 = @ptrFromInt(@as(usize, args_ptr));
+    @memcpy(@as([*]u8, @ptrCast(&args))[0..@sizeOf(TlsConnectArgs)], args_src[0..@sizeOf(TlsConnectArgs)]);
+
+    if (args.port == 0 or args.sni_len > 255) return E_INVAL;
+    if (!validateUserPtr(args.sni_ptr, args.sni_len)) return E_FAULT;
+
+    var sni_buf: [256]u8 = undefined;
+    const sni_src: [*]const u8 = @ptrFromInt(@as(usize, args.sni_ptr));
+    @memcpy(sni_buf[0..args.sni_len], sni_src[0..args.sni_len]);
+
+    const slot = tls_conn.tlsConnect(args.ip, args.port, sni_buf[0..args.sni_len]) orelse return E_INVAL;
+    return @as(u32, slot);
+}
+
+/// tls_send(slot, buf, len) — encrypt `len` bytes as one TLS 1.3
+/// application_data record and send it. Returns bytes sent (= len on
+/// success), or 0xFFFFFFFF on failure.
+fn sysTlsSend(slot: u32, buf_ptr: u32, buf_len: u32) u32 {
+    if (slot > 255) return E_INVAL;
+    if (buf_len == 0) return 0;
+    if (buf_len > 16 * 1024) return E_INVAL;
+    if (!validateUserPtr(buf_ptr, buf_len)) return E_FAULT;
+    const buf: [*]const u8 = @ptrFromInt(@as(usize, buf_ptr));
+    const sent = tls_conn.tlsSend(@intCast(slot), buf[0..buf_len]);
+    if (sent < 0) return E_INVAL;
+    return @intCast(sent);
+}
+
+/// tls_recv(slot, buf, len) — drain up to `len` bytes of plaintext
+/// from the conn. Blocks until at least one record arrives or the
+/// peer closes. Returns bytes read (>0), 0 on graceful close, or
+/// 0xFFFFFFFF on error. Use tls_status (TODO) to disambiguate.
+fn sysTlsRecv(slot: u32, buf_ptr: u32, buf_len: u32) u32 {
+    if (slot > 255) return E_INVAL;
+    if (buf_len == 0) return 0;
+    if (!validateUserPtr(buf_ptr, buf_len)) return E_FAULT;
+    const buf: [*]u8 = @ptrFromInt(@as(usize, buf_ptr));
+    const got = tls_conn.tlsRecv(@intCast(slot), buf[0..buf_len]);
+    if (got < 0) return E_INVAL;
+    return @intCast(got);
+}
+
+/// tls_close(slot) — send TLS close_notify alert, tear down TCP,
+/// release the slot. Idempotent.
+fn sysTlsClose(slot: u32) u32 {
+    if (slot > 255) return 0;
+    tls_conn.tlsClose(@intCast(slot));
     return 0;
 }

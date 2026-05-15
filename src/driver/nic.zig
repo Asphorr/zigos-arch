@@ -43,6 +43,18 @@ pub fn isReady() bool {
     };
 }
 
+/// Human-readable driver name. Stable across the backend's lifetime —
+/// once `init()` picks a driver we never swap. Used by /proc/netinfo and
+/// any userspace tool that wants to print which NIC is in use.
+pub fn name() []const u8 {
+    return switch (backend) {
+        .none => "(none)",
+        .virtio => "virtio-net",
+        .igc => "Intel I225/I226",
+        .e1000 => "e1000",
+    };
+}
+
 pub fn getMac() [6]u8 {
     return switch (backend) {
         .none => [_]u8{ 0, 0, 0, 0, 0, 0 },

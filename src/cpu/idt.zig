@@ -600,6 +600,11 @@ export fn handleException(rsp: u64) callconv(.c) void {
                 const rip_page_end = (saved_rip & ~@as(u64, 0xFFF)) + 0x1000;
                 const safe_len: u64 = @min(16, rip_page_end - saved_rip);
                 const code: [*]const u8 = @ptrFromInt(saved_rip);
+                // User RIP is below the kernel half — bracket the read with
+                // STAC/CLAC so SMAP doesn't double-fault us here.
+                const is_user_rip = saved_rip < 0xFFFF800000000000;
+                const protect_mod = @import("protect.zig");
+                if (is_user_rip) protect_mod.allowUserAccess();
                 serial.print("  Code:", .{});
                 for (0..@intCast(safe_len)) |i| serial.print(" {X:0>2}", .{code[i]});
                 serial.print("\n", .{});
@@ -608,13 +613,18 @@ export fn handleException(rsp: u64) callconv(.c) void {
                 serial.print("  Insn: ", .{});
                 @import("../debug/disasm.zig").printOne(code[0..@intCast(safe_len)]);
                 serial.print("\n", .{});
+                if (is_user_rip) protect_mod.disallowUserAccess();
             }
         }
 
-        // RBP-walked backtrace
+        // RBP-walked backtrace. The RBP comes from user space, so reading
+        // through it needs STAC. Without it SMAP traps the kernel on the
+        // first frame[1] dereference and we never see the backtrace.
         var bt_frames: u32 = 0;
         if (saved_rbp > 0x100000 and saved_rbp < 0x600000) {
             serial.print("  Backtrace (rbp):\n", .{});
+            const protect_bt = @import("protect.zig");
+            protect_bt.allowUserAccess();
             var rbp: usize = @intCast(saved_rbp);
             var depth: u32 = 0;
             while (rbp >= 0x100000 and rbp < 0x600000 and depth < 16) : (depth += 1) {
@@ -629,6 +639,7 @@ export fn handleException(rsp: u64) callconv(.c) void {
                 if (next_rbp <= rbp or next_rbp >= 0x600000) break; // sanity: must climb
                 rbp = next_rbp;
             }
+            protect_bt.disallowUserAccess();
         }
 
         // Stack-scan fallback when the rbp walk is short or empty (e.g.,
@@ -640,6 +651,8 @@ export fn handleException(rsp: u64) callconv(.c) void {
             const stack_page_end = (saved_rsp & ~@as(u64, 0xFFF)) + 0x1000;
             const sp: [*]const u64 = @ptrFromInt(saved_rsp);
             const max_words: u64 = @min(64, (stack_page_end - saved_rsp) / 8);
+            const protect_ss = @import("protect.zig");
+            protect_ss.allowUserAccess();
             var printed: u32 = 0;
             var prev: u64 = 0;
             for (0..@intCast(max_words)) |i| {
@@ -655,6 +668,7 @@ export fn handleException(rsp: u64) callconv(.c) void {
                     }
                 }
             }
+            protect_ss.disallowUserAccess();
             if (printed == 0) serial.print("    (no resolvable candidates)\n", .{});
         }
 
@@ -677,6 +691,8 @@ export fn handleException(rsp: u64) callconv(.c) void {
                 const stack_page_end = (saved_rsp & ~@as(u64, 0xFFF)) + 0x1000;
                 const sp: [*]const u8 = @ptrFromInt(saved_rsp);
                 const dump_bytes: u64 = @min(64, stack_page_end - saved_rsp);
+                const protect_sh = @import("protect.zig");
+                protect_sh.allowUserAccess();
                 var off: u64 = 0;
                 while (off < dump_bytes) : (off += 16) {
                     serial.print("    [SP+0x{X:0>3}] ", .{off});
@@ -686,6 +702,7 @@ export fn handleException(rsp: u64) callconv(.c) void {
                     }
                     serial.print("\n", .{});
                 }
+                protect_sh.disallowUserAccess();
             }
             // Provenance: who handed out the frame that backs CR2's page?
             // Useful when CR2 is a "real" user VA (not near-NULL like 0x25).
@@ -1077,6 +1094,15 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
     // shows up alive. cli is held throughout handleIRQ0 so a plain += is
     // safe; peer reads use volatile.
     cpu.irq_tick_count +%= 1;
+    // Charge this tick as "idle" if the CPU was running its kernel idle PCB
+    // at the moment of the IRQ. The /proc/cpustat consumer subtracts idle
+    // from total to get utilization. Done under the same cli as irq_tick,
+    // so a reader on another CPU never sees idle > irq.
+    if (cpu.current_pid) |pid| {
+        if (pid < process.procs.len and process.procs[pid].is_idle) {
+            cpu.idle_tick_count +%= 1;
+        }
+    }
     @import("../debug/watchdog.zig").peerCheck(cpu);
 
     // Per-CPU execution trail — record where this CPU was interrupted.

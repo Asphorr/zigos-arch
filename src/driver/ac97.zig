@@ -7,6 +7,7 @@ const pmm = @import("../mm/pmm.zig");
 const paging = @import("../mm/paging.zig");
 const debug = @import("../debug/debug.zig");
 const SpinLock = @import("../proc/spinlock.zig").SpinLock;
+const iommu = @import("../cpu/iommu.zig");
 
 /// Serializes everything that touches `bdl_phys` / `buf_phys` / the PCM-out
 /// register sequence. Audio entry points are called from syscall context
@@ -61,6 +62,11 @@ pub fn init() bool {
     // I/O + MEM + bus master, INTx kept (AC97 has no MSI cap).
     pci.bindDeviceLegacyIrq(dev);
 
+    // IOMMU Phase 3: switch to own SL page table before any DMA. BDL and
+    // audio buffers are mapped after their allocation below; the device
+    // reads them once we write PO_BDBAR and the PCM channel kicks off.
+    _ = iommu.enableIsolation(dev.bus, dev.dev, dev.func);
+
     // Read I/O BARs (mask off type bit)
     const bar0_raw = pci.configRead(dev.bus, dev.dev, dev.func, 0x10);
     const bar1_raw = pci.configRead(dev.bus, dev.dev, dev.func, 0x14);
@@ -102,10 +108,12 @@ pub fn init() bool {
     // Allocate BDL page (physically contiguous)
     bdl_phys = pmm.allocFrame() orelse return false;
     @memset(@as([*]u8, @ptrFromInt(paging.physToVirt(bdl_phys)))[0..4096], 0);
+    _ = iommu.dmaMap(dev.bus, dev.dev, dev.func, bdl_phys, 4096, .{});
 
     // Allocate audio buffer (4 contiguous pages = 16KB)
     buf_phys = pmm.allocContiguous(BUF_PAGES) orelse return false;
     @memset(@as([*]u8, @ptrFromInt(paging.physToVirt(buf_phys)))[0 .. BUF_PAGES * 4096], 0);
+    _ = iommu.dmaMap(dev.bus, dev.dev, dev.func, buf_phys, BUF_PAGES * 4096, .{});
 
     // Reset PCM out channel
     io.outb(nabm_base + PO_CR, 0x02); // reset

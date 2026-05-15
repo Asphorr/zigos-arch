@@ -57,7 +57,15 @@ inline fn restoreIrq(flags: u64) void {
 
 // Bitmap: 1 bit per 4KB frame. Initialized to all-used in init().
 var bitmap: [BITMAP_SIZE]u32 = undefined;
+/// Misnamed for historical reasons — this is the *currently free* frame
+/// count, decremented on alloc and incremented on free. The post-init
+/// snapshot is held in `managed_frames` so /proc/meminfo can report a
+/// stable "total" without subtracting current usage from a moving target.
 var total_frames: u32 = 0;
+/// Snapshot of the free-frame count at the moment PMM init finishes —
+/// effectively the size of the usable PMM pool (free + about-to-be-allocated
+/// kernel structures). Stable for the lifetime of the OS; used by meminfo.
+var managed_frames: u32 = 0;
 var next_free_word: usize = 0; // Hint: start scanning from here
 
 // Per-frame reference count for COW. Lockstep invariant: frame_refs[i] == 0 ⟺
@@ -192,6 +200,12 @@ pub fn init(info: *const boot_info.BootInfo) void {
         // alloc otherwise overwrites them and kernel halts on wild CR3.
         markRegionUsed(memmap.UEFI_PT_BASE, memmap.UEFI_PT_SIZE);
     }
+
+    // Lock in the post-markings free-frame count as the static "total" we
+    // hand back from meminfo. Reservations done after this point (e.g.
+    // KASAN shadow when enabled) will be accounted for as "used" against
+    // this baseline rather than disappearing from the total.
+    managed_frames = total_frames;
 }
 
 /// Internal: scan the bitmap for one free frame, mark it used, and return
@@ -551,6 +565,13 @@ pub fn freeContiguous(phys_addr: usize, count: u32) void {
 
 pub fn freeFrameCount() u32 {
     return total_frames;
+}
+
+/// Total frames managed by PMM, snapshotted at end of init(). Stable for
+/// the OS lifetime — every later alloc/free moves frames between "free"
+/// and "in use" but never changes this number.
+pub fn managedFrameCount() u32 {
+    return managed_frames;
 }
 
 /// Add a reference to a frame currently in use. Used by COW: cloneAddressSpace

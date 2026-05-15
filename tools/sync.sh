@@ -2,25 +2,24 @@
 # Sync local files to VM, build, and optionally create ESP image
 # Usage: bash sync.sh [esp]
 
-VM="feroupc@172.20.220.60"
-KEY="$HOME/.ssh/hyperv_vm"
-ZIG="/opt/zig-x86_64-linux-0.15.2/zig"
-SSH="ssh -i $KEY -o StrictHostKeyChecking=no $VM"
-SCP="scp -i $KEY -o StrictHostKeyChecking=no"
+# Uses the `zigvm` ssh alias (set up by ~/.claude/.../zigvm-fix-ip.ps1) so the
+# IP can be rewritten on Hyper-V subnet drift without editing this script.
+VM="zigvm"
+REMOTE_DIR="~/zigos-arch"
+ZIG="~/Загрузки/zig-x86_64-linux-0.15.2/zig"
 
 echo "=== Syncing source files to VM ==="
-$SCP -r src/ "$VM:~/zigos-sse2/src/"
-$SCP -r app/ "$VM:~/zigos-sse2/app/"
-$SCP -r lib/ "$VM:~/zigos-sse2/lib/"
-$SCP -r boot/ "$VM:~/zigos-sse2/boot/"
-$SCP build.zig "$VM:~/zigos-sse2/build.zig"
+scp -r src/ "$VM:$REMOTE_DIR/src/"
+scp -r app/ "$VM:$REMOTE_DIR/app/"
+scp -r lib/ "$VM:$REMOTE_DIR/lib/"
+scp build.zig "$VM:$REMOTE_DIR/build.zig"
 
 echo "=== Building on VM ==="
-$SSH "cd ~/zigos-sse2 && $ZIG build -Doptimize=ReleaseSafe 2>&1" | tail -5
+ssh "$VM" "cd $REMOTE_DIR && $ZIG build -Doptimize=ReleaseSafe 2>&1" | tail -5
 
 if [ "$1" = "esp" ]; then
     echo "=== Creating ESP image ==="
-    $SSH 'export PATH=/usr/bin:/usr/sbin:$PATH && cd ~/zigos-sse2 && \
+    ssh "$VM" 'export PATH=/usr/bin:/usr/sbin:$PATH && cd ~/zigos-arch && \
         dd if=/dev/zero of=zig-out/bin/esp.img bs=1M count=34 2>/dev/null && \
         printf "o\nn\np\n1\n2048\n\nt\nef\na\nw\n" | fdisk zig-out/bin/esp.img 2>/dev/null && \
         LOOP=$(sudo losetup -f --show -o 1048576 --sizelimit 34603008 zig-out/bin/esp.img) && \

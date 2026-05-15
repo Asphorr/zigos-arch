@@ -22,6 +22,7 @@ const paging = @import("../mm/paging.zig");
 const debug = @import("../debug/debug.zig");
 const process = @import("../proc/process.zig");
 const spinlock = @import("../proc/spinlock.zig");
+const iommu = @import("../cpu/iommu.zig");
 
 // --- Constants ---
 
@@ -499,6 +500,10 @@ pub fn init() bool {
     // Bus-master + MEM/IO + INTx-disable (uses MSI-X via virtio common cap).
     pci.bindDevice(dev_found);
 
+    // IOMMU Phase 3: own SL page table; map virtqueues + scratch
+    // buffers + TX pool entries as they're allocated below.
+    _ = iommu.enableIsolation(dev_found.bus, dev_found.dev, dev_found.func);
+
     const common_cap = pci.findVirtioCap(dev_found, VIRTIO_PCI_CAP_COMMON_CFG) orelse {
         debug.klog("[virtio-snd] No common config cap\n", .{});
         return false;
@@ -561,15 +566,24 @@ pub fn init() bool {
     // Re-call setupQueue for tx_vq on its real index.
     if (!setupQueue(VQ_TX, &tx_vq)) return false;
 
+    // Map both virtqueue rings (desc/avail share one frame; used has its own).
+    _ = iommu.dmaMap(dev_found.bus, dev_found.dev, dev_found.func, ctrl_vq.desc_phys, 4096, .{});
+    _ = iommu.dmaMap(dev_found.bus, dev_found.dev, dev_found.func, ctrl_vq.used_phys, 4096, .{});
+    _ = iommu.dmaMap(dev_found.bus, dev_found.dev, dev_found.func, tx_vq.desc_phys, 4096, .{});
+    _ = iommu.dmaMap(dev_found.bus, dev_found.dev, dev_found.func, tx_vq.used_phys, 4096, .{});
+
     // Allocate scratch buffers used by the control round-trip.
     ctrl_cmd_phys = pmm.allocFrame() orelse return false;
     ctrl_resp_phys = pmm.allocFrame() orelse return false;
+    _ = iommu.dmaMap(dev_found.bus, dev_found.dev, dev_found.func, ctrl_cmd_phys, 4096, .{});
+    _ = iommu.dmaMap(dev_found.bus, dev_found.dev, dev_found.func, ctrl_resp_phys, 4096, .{});
     @memset(@as([*]u8, @ptrFromInt(paging.physToVirt(ctrl_cmd_phys)))[0..4096], 0);
     @memset(@as([*]u8, @ptrFromInt(paging.physToVirt(ctrl_resp_phys)))[0..4096], 0);
 
     // Allocate TX pool — one PMM frame per slot, sliced into hdr/payload/status.
     for (0..NUM_TX_BUFS) |i| {
         const frame = pmm.allocFrame() orelse return false;
+        _ = iommu.dmaMap(dev_found.bus, dev_found.dev, dev_found.func, frame, 4096, .{});
         @memset(@as([*]u8, @ptrFromInt(paging.physToVirt(frame)))[0..4096], 0);
         // Layout in the frame:
         //   [0   .. 16)    : SndPcmXfer header (4 bytes really, padded)

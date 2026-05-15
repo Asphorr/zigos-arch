@@ -48,6 +48,7 @@ pub fn build(b: *std.Build) void {
     };
     const build_options = b.addOptions();
     build_options.addOption(u64, "build_id", build_id_value);
+    build_options.addOption(bool, "kasan_enabled", kasan_enabled);
     build_options.addOption(bool, "kcsan_enabled", kcsan_enabled);
 
     // --- 1. KERNEL ---
@@ -253,6 +254,26 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // HTTP/1.1 client + JSON parser. Both sit on top of libc (TLS / TCP
+    // syscalls for http; malloc for json). Userspace apps import either
+    // via the standard gui_imports tuple below.
+    const http_mod = b.createModule(.{
+        .root_source_file = b.path("lib/http.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "libc", .module = libc_mod },
+        },
+    });
+    const json_mod = b.createModule(.{
+        .root_source_file = b.path("lib/json.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "libc", .module = libc_mod },
+        },
+    });
+
     // Helper to create a user-space app executable
     const gui_imports: []const std.Build.Module.Import = &.{
         .{ .name = "libc", .module = libc_mod },
@@ -260,6 +281,8 @@ pub fn build(b: *std.Build) void {
         .{ .name = "font", .module = font_mod },
         .{ .name = "ui", .module = ui_mod },
         .{ .name = "font_atlas", .module = font_atlas_mod },
+        .{ .name = "http", .module = http_mod },
+        .{ .name = "json", .module = json_mod },
     };
 
     // --- 2. USER APPS ---
@@ -282,7 +305,8 @@ pub fn build(b: *std.Build) void {
         .{ "gui_demo.elf", "app/gui_demo.zig" },
         .{ "sysmon.elf", "app/sysmon.zig" },
         .{ "calc.elf", "app/calc.zig" },
-        .{ "settings.elf", "app/settings.zig" },
+        // settings.elf moved below — it needs stb_image for the wallpaper
+        // picker's thumbnail decode, which isn't wired into gui_imports.
         .{ "paint.elf", "app/paint.zig" },
         .{ "files.elf", "app/files.zig" },
         .{ "editor.elf", "app/editor.zig" },
@@ -329,6 +353,10 @@ pub fn build(b: *std.Build) void {
         .{ "sigil.elf", "app/sigil.zig" },
         .{ "tg.elf", "app/tg.zig" },
         .{ "redteam.elf", "app/redteam.zig" },
+        .{ "netstat.elf", "app/netstat.zig" },
+        .{ "httpsget.elf", "app/httpsget.zig" },
+        .{ "curl.elf", "app/curl.zig" },
+        .{ "jq.elf", "app/jq.zig" },
     };
 
     inline for (gui_apps) |entry| {
@@ -437,6 +465,35 @@ pub fn build(b: *std.Build) void {
         "-DSTBI_NO_THREAD_LOCALS",
     };
 
+    // --- SETTINGS (uses stb_image for the wallpaper-picker thumbnail
+    //     decode; moved here so it can link against vendor/photo_lib.c
+    //     and import the translate-c stb module) ---
+    const settings_exe = b.addExecutable(.{
+        .name = "settings.elf",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("app/settings.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "libc", .module = libc_mod },
+                .{ .name = "graphics", .module = graphics_mod },
+                .{ .name = "font", .module = font_mod },
+                .{ .name = "ui", .module = ui_mod },
+                .{ .name = "font_atlas", .module = font_atlas_mod },
+                .{ .name = "stb", .module = stb_mod },
+                .{ .name = "stb_shims", .module = stb_shims_mod },
+            },
+        }),
+    });
+    settings_exe.setLinkerScript(b.path("app/linker.ld"));
+    settings_exe.root_module.addCSourceFile(.{
+        .file = b.path("vendor/photo_lib.c"),
+        .flags = stb_cflags,
+    });
+    settings_exe.root_module.addIncludePath(b.path("vendor"));
+    settings_exe.root_module.addSystemIncludePath(b.path("doom_src/include"));
+    b.installArtifact(settings_exe);
+
     // --- PHOTO VIEWER ---
     const photo = b.addExecutable(.{
         .name = "photo.elf",
@@ -448,6 +505,9 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "libc", .module = libc_mod },
                 .{ .name = "stb", .module = stb_mod },
                 .{ .name = "stb_shims", .module = stb_shims_mod },
+                .{ .name = "graphics", .module = graphics_mod },
+                .{ .name = "ui", .module = ui_mod },
+                .{ .name = "font_atlas", .module = font_atlas_mod },
             },
         }),
     });

@@ -25,6 +25,7 @@ const msix = @import("../time/msix.zig");
 const debug = @import("../debug/debug.zig");
 const net = @import("../net/net.zig");
 const virtio = @import("virtio.zig");
+const iommu = @import("../cpu/iommu.zig");
 const SpinLock = @import("../proc/spinlock.zig").SpinLock;
 
 const VirtqDesc = virtio.VirtqDesc;
@@ -57,6 +58,11 @@ const TX_QUEUE: u16 = 1;
 // availIdx + ring doorbell" sequence.
 var tx_lock: SpinLock = .{};
 var rx_lock: SpinLock = .{};
+// PCI BDF captured at init so per-send TX-buf dmaMap calls don't need to
+// re-walk the PCI cache. Zero before init.
+var pci_bus: u8 = 0;
+var pci_dev: u8 = 0;
+var pci_func: u8 = 0;
 
 // MMIO bases (modern transport).
 var common_cfg: usize = 0;
@@ -170,6 +176,14 @@ pub fn init() bool {
     }
 
     pci.bindDevice(dev_found);
+    pci_bus = dev_found.bus;
+    pci_dev = dev_found.dev;
+    pci_func = dev_found.func;
+
+    // IOMMU Phase 3: flip onto own SL page table before any virtqueue
+    // is set up. Every buffer hardware touches must be explicitly
+    // dmaMap'd below. No-op when IOMMU isn't running.
+    _ = iommu.enableIsolation(pci_bus, pci_dev, pci_func);
 
     // Find modern PCI caps.
     const common_cap = pci.findVirtioCap(dev_found, virtio.CAP_COMMON_CFG) orelse {
@@ -276,6 +290,14 @@ pub fn init() bool {
         return false;
     }
 
+    // Map the per-virtqueue ring pages — desc/avail share one frame
+    // (desc_phys), used ring lives on its own frame (used_phys). The
+    // device DMA-reads/writes both during normal queue operation.
+    _ = iommu.dmaMap(pci_bus, pci_dev, pci_func, rx_vq.desc_phys, 4096, .{});
+    _ = iommu.dmaMap(pci_bus, pci_dev, pci_func, rx_vq.used_phys, 4096, .{});
+    _ = iommu.dmaMap(pci_bus, pci_dev, pci_func, tx_vq.desc_phys, 4096, .{});
+    _ = iommu.dmaMap(pci_bus, pci_dev, pci_func, tx_vq.used_phys, 4096, .{});
+
     // DRIVER_OK — device may now begin queue activity.
     ccWrite8(virtio.CC_DEVICE_STATUS, virtio.STATUS_ACKNOWLEDGE | virtio.STATUS_DRIVER | virtio.STATUS_FEATURES_OK | virtio.STATUS_DRIVER_OK);
 
@@ -294,6 +316,11 @@ pub fn init() bool {
     while (rx_count < NUM_RX_BUFS and rx_count < rx_vq.queue_size) : (rx_count += 1) {
         const buf_phys = pmm.allocFrame() orelse break;
         rx_bufs[rx_count] = buf_phys;
+        // Map the RX buf into the device's IOVA space so it can DMA the
+        // received packet into it. Device-writable only would suffice
+        // but we default to RW for simplicity (no harm — the buffer is
+        // ours).
+        _ = iommu.dmaMap(pci_bus, pci_dev, pci_func, buf_phys, 4096, .{});
         const d = rx_vq.descPtr(rx_count);
         d.addr = buf_phys;
         d.len = BUF_SIZE;
@@ -355,6 +382,10 @@ pub fn send(data: []const u8) bool {
             tx_vq.num_free += 1;
             return false;
         };
+        // Map the freshly-allocated TX buf into the device's IOVA space
+        // before the device sees its address. tx_bufs[di] persists for
+        // the lifetime of the descriptor slot, so we map once and reuse.
+        _ = iommu.dmaMap(pci_bus, pci_dev, pci_func, tx_bufs[di], 4096, .{});
     }
 
     // virtio-net header (10 bytes, all zeros = no offload) + packet data.

@@ -27,6 +27,11 @@ const paging = @import("../mm/paging.zig");
 const debug = @import("../debug/debug.zig");
 const hpet = @import("../time/hpet.zig");
 const SpinLock = @import("../proc/spinlock.zig").SpinLock;
+const iommu = @import("../cpu/iommu.zig");
+
+var pci_bus: u8 = 0;
+var pci_dev: u8 = 0;
+var pci_func: u8 = 0;
 
 // PCI class for HDA controllers (subclass 03 prog_if 0).
 const HDA_CLASS: u8 = 0x04;
@@ -276,6 +281,13 @@ pub fn init() bool {
 
     // Bus master + MEM (HDA is MMIO; INTx kept disabled — Phase 1 is polled).
     pci.bindDevice(dev);
+    pci_bus = dev.bus;
+    pci_dev = dev.dev;
+    pci_func = dev.func;
+
+    // IOMMU Phase 3: flip onto own SL page table before any DMA. CORB/
+    // RIRB and stream buffers are mapped as they're allocated below.
+    _ = iommu.enableIsolation(dev.bus, dev.dev, dev.func);
 
     const bar0 = pci.mapBar(dev, 0, 0x4000) orelse {
         debug.klog("[hda] mapBar failed\n", .{});
@@ -362,6 +374,7 @@ pub fn init() bool {
 fn streamSetup() bool {
     stream_buf_phys = pmm.allocContiguous(STREAM_PAGES) orelse return false;
     stream_buf_virt = @ptrFromInt(paging.physToVirt(stream_buf_phys));
+    _ = iommu.dmaMap(pci_bus, pci_dev, pci_func, stream_buf_phys, STREAM_PAGES * 4096, .{});
     stream_buf_size = STREAM_PAGES * 4096;
     @memset(stream_buf_virt[0..stream_buf_size], 0);
 
@@ -369,6 +382,7 @@ fn streamSetup() bool {
         pmm.freeContiguous(stream_buf_phys, STREAM_PAGES);
         return false;
     };
+    _ = iommu.dmaMap(pci_bus, pci_dev, pci_func, stream_bdl_phys, 4096, .{});
     const bdl: [*]volatile u64 = @ptrFromInt(paging.physToVirt(stream_bdl_phys));
     const half: u64 = stream_buf_size / 2;
     bdl[0] = @as(u64, stream_buf_phys);
@@ -458,9 +472,11 @@ pub fn isReady() bool {
 fn setupCorbRirb() bool {
     const corb_phys = allocPage() orelse return false;
     corb_virt = @ptrFromInt(paging.physToVirt(corb_phys));
+    _ = iommu.dmaMap(pci_bus, pci_dev, pci_func, corb_phys, 4096, .{});
 
     const rirb_phys = allocPage() orelse return false;
     rirb_virt = @ptrFromInt(paging.physToVirt(rirb_phys));
+    _ = iommu.dmaMap(pci_bus, pci_dev, pci_func, rirb_phys, 4096, .{});
 
     // Stop both rings before reconfiguring.
     w8(REG_CORBCTL, 0);

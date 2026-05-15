@@ -476,6 +476,44 @@ pub fn meminfo() MemInfo {
     return .{ .free_frames = buf[0], .total_frames = buf[1] };
 }
 
+/// Per-CPU tick counters used to compute utilization. Caller takes two
+/// snapshots `dt` apart and computes `((irq_d - idle_d) * 100) / irq_d`
+/// for each CPU to get instantaneous CPU usage in percent.
+pub const CpuStat = extern struct {
+    irq_ticks: u64,
+    idle_ticks: u64,
+};
+
+/// Fill `out` with stats for up to `out.len` alive CPUs. Returns how many
+/// were written. On error returns a u32 in the errno band (>0xFFFFFFF0).
+pub fn cpuStats(out: []CpuStat) u32 {
+    if (out.len == 0) return 0;
+    return syscall(105, @truncate(@intFromPtr(out.ptr)), @truncate(out.len));
+}
+
+/// Snapshot of the kernel's active L3 config + NIC presence. Layout
+/// mirrors src/cpu/syscall.zig:NetInfo — keep both in sync when adding
+/// fields.
+pub const NetInfo = extern struct {
+    local_ip: [4]u8,
+    gateway_ip: [4]u8,
+    dns_ip: [4]u8,
+    subnet_mask: [4]u8,
+    mac: [6]u8,
+    _pad: [2]u8 = .{ 0, 0 },
+    dhcp_configured: u32,
+    dhcp_lease_secs: u32,
+    nic_present: u32,
+};
+
+/// Pull the current network configuration into `out`. Returns 0 on
+/// success, E_FAULT on bad pointer. Static fields like `mac` are stable
+/// for the lifetime of the kernel; `local_ip`/`gateway_ip`/`dns_ip` may
+/// change on DHCP renewal (none today, but planned).
+pub fn netInfo(out: *NetInfo) u32 {
+    return syscall(106, @truncate(@intFromPtr(out)), 0);
+}
+
 // --- Configuration ---
 
 pub const Config = struct {
@@ -1592,6 +1630,67 @@ pub fn tcpAccept(listener_slot: u8) ?u8 {
     const result = syscall(77, @as(u32, listener_slot), 0);
     if (result == 0xFFFFFFFF) return null;
     return @truncate(result);
+}
+
+// ---- TLS 1.3 syscalls (107-110) -----------------------------------------
+// Kernel does the entire TLS handshake (X25519, ChaCha20-Poly1305, RSA-PSS
+// or ECDSA CertificateVerify) plus Mozilla NSS trust anchor lookup. From
+// userspace this looks just like the tcp* API but with handshake-blocking
+// connect and encrypted application data.
+
+const TlsConnectArgs = extern struct {
+    ip: [4]u8,
+    port: u16,
+    _pad: u16,
+    sni_ptr: u32,
+    sni_len: u32,
+};
+
+/// Open a TLS 1.3 connection to `ip:port` with the given SNI hostname.
+/// Returns a slot id (0..3) or null on any failure. Blocks for the
+/// full handshake (typically < 2 s on the local network).
+pub fn tlsConnect(ip: [4]u8, port: u16, sni: []const u8) ?u8 {
+    var args: TlsConnectArgs = .{
+        .ip = ip,
+        .port = port,
+        ._pad = 0,
+        .sni_ptr = @truncate(@intFromPtr(sni.ptr)),
+        .sni_len = @intCast(sni.len),
+    };
+    const result = syscall(107, @truncate(@intFromPtr(&args)), 0);
+    // Treat any errno-band value as failure — without this, an
+    // E_NOSYS (0xFFFFFFF3) silently passes through @truncate as
+    // slot 0xF3 = 243, and the app marches on with a bogus slot.
+    if (isErr(result)) return null;
+    return @truncate(result);
+}
+
+/// Encrypt `data` and send it over the TLS conn. Returns bytes sent (=
+/// data.len on success), or null on failure.
+pub fn tlsSend(slot: u8, data: []const u8) ?usize {
+    if (data.len == 0) return 0;
+    if (data.len > 16 * 1024) return null;
+    const result = syscall3(108, @as(u32, slot), @truncate(@intFromPtr(data.ptr)), @intCast(data.len));
+    if (isErr(result)) return null;
+    return @intCast(result);
+}
+
+/// Decrypt and drain up to `buf.len` bytes of plaintext from the
+/// connection. Blocks until at least one record arrives or the peer
+/// closes. Returns:
+///   > 0 bytes read
+///   = 0 peer sent close_notify (graceful EOF)
+///   null error (corrupt record, AEAD tag mismatch, etc.)
+pub fn tlsRecv(slot: u8, buf: []u8) ?usize {
+    if (buf.len == 0) return 0;
+    const result = syscall3(109, @as(u32, slot), @truncate(@intFromPtr(buf.ptr)), @intCast(buf.len));
+    if (isErr(result)) return null;
+    return @intCast(result);
+}
+
+/// Send TLS close_notify alert + tear down TCP. Idempotent.
+pub fn tlsClose(slot: u8) void {
+    _ = syscall(110, @as(u32, slot), 0);
 }
 
 // --- Process inspection ---

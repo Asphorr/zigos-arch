@@ -6,6 +6,12 @@ const process = @import("../proc/process.zig");
 const keyboard = @import("keyboard.zig");
 const mouse = @import("mouse.zig");
 const msix = @import("../time/msix.zig");
+const iommu = @import("../cpu/iommu.zig");
+
+// PCI BDF captured at init for per-device-attach iommu.dmaMap calls.
+var pci_bus: u8 = 0;
+var pci_dev: u8 = 0;
+var pci_func: u8 = 0;
 
 // --- xHCI TRB Types ---
 const TRB_NORMAL = 1;
@@ -319,6 +325,15 @@ pub fn init() bool {
 
     // Bus master + MEM/IO + INTx-disable (xHCI uses MSI-X for event ring).
     pci.bindDevice(dev);
+    pci_bus = dev.bus;
+    pci_dev = dev.dev;
+    pci_func = dev.func;
+
+    // IOMMU Phase 3: flip onto own SL page table before any DMA setup.
+    // The xHCI controller starts DMA on USBCMD.RS below — everything it
+    // touches between here and that point must be dmaMap'd. Plus every
+    // per-device structure allocated during enumeration.
+    _ = iommu.enableIsolation(dev.bus, dev.dev, dev.func);
 
     // Map MMIO region. mmio_base stores the physmap-translated VA so
     // `mmio_base + off` is directly dereferenceable; hardware never sees
@@ -460,6 +475,7 @@ pub fn init() bool {
     dcbaa_phys = dcbaa_page;
     const dcbaa_ptr: [*]u8 = @ptrFromInt(paging.physToVirt(dcbaa_page));
     @memset(dcbaa_ptr[0..4096], 0);
+    _ = iommu.dmaMap(pci_bus, pci_dev, pci_func, dcbaa_phys, 4096, .{});
     writeReg64(op_base + DCBAAP, dcbaa_phys);
     debug.klog("[xhci] DCBAA at 0x{x}\n", .{dcbaa_phys});
 
@@ -468,6 +484,7 @@ pub fn init() bool {
         debug.klog("[xhci] Failed to allocate command ring\n", .{});
         return false;
     };
+    _ = iommu.dmaMap(pci_bus, pci_dev, pci_func, cmd_ring.phys, 4096, .{});
     // Write CRCR: physical address | cycle bit
     writeReg64(op_base + CRCR, cmd_ring.phys | 1);
     debug.klog("[xhci] Command ring at 0x{x}\n", .{cmd_ring.phys});
@@ -475,6 +492,7 @@ pub fn init() bool {
     // --- Allocate Event Ring (4 contiguous pages = 1024 TRBs) ---
     const evt_phys = pmm.allocContiguous(4) orelse return false;
     @memset(@as([*]u8, @ptrFromInt(paging.physToVirt(evt_phys)))[0..4096 * 4], 0);
+    _ = iommu.dmaMap(pci_bus, pci_dev, pci_func, evt_phys, 4096 * 4, .{});
     evt_ring = .{
         .trbs = @ptrFromInt(paging.physToVirt(evt_phys)),
         .phys = evt_phys,
@@ -490,6 +508,7 @@ pub fn init() bool {
         return false;
     };
     erst_phys = erst_page;
+    _ = iommu.dmaMap(pci_bus, pci_dev, pci_func, erst_phys, 4096, .{});
     const erst: [*]volatile u32 = @ptrFromInt(paging.physToVirt(erst_page));
     @memset(@as([*]u8, @ptrFromInt(paging.physToVirt(erst_page)))[0..4096], 0);
     erst[0] = @truncate(evt_ring.phys); // Base address low
@@ -561,6 +580,7 @@ fn scanAndEnumerate() void {
         return;
     };
     @memset(@as([*]u8, @ptrFromInt(paging.physToVirt(scratch_phys)))[0..4096], 0);
+    _ = iommu.dmaMap(pci_bus, pci_dev, pci_func, scratch_phys, 4096, .{});
 
     evt_dequeue = 0;
     evt_cycle = true;
@@ -727,6 +747,12 @@ fn enumerateDevice(port: u8, speed: u8) void {
     const input_ctx_phys = pmm.allocFrame() orelse return;
     const dev_ctx_phys = pmm.allocFrame() orelse return;
     const tr_phys = pmm.allocFrame() orelse return;
+    // Map per-device DMA targets before the controller touches them.
+    // input_ctx is read by ADDRESS_DEVICE / CONFIGURE_ENDPOINT; dev_ctx
+    // and tr (transfer ring) are read/written on every URB.
+    _ = iommu.dmaMap(pci_bus, pci_dev, pci_func, input_ctx_phys, 4096, .{});
+    _ = iommu.dmaMap(pci_bus, pci_dev, pci_func, dev_ctx_phys, 4096, .{});
+    _ = iommu.dmaMap(pci_bus, pci_dev, pci_func, tr_phys, 4096, .{});
 
     @memset(@as([*]u8, @ptrFromInt(paging.physToVirt(input_ctx_phys)))[0..4096], 0);
     @memset(@as([*]u8, @ptrFromInt(paging.physToVirt(dev_ctx_phys)))[0..4096], 0);
@@ -916,6 +942,7 @@ fn enumerateDevice(port: u8, speed: u8) void {
         // Allocate large interrupt transfer ring (16 pages, no Link TRB)
         const intr_ring = initTransferRing() orelse return;
         const intr_tr_phys = intr_ring.phys;
+        _ = iommu.dmaMap(pci_bus, pci_dev, pci_func, intr_tr_phys, 4096, .{});
 
         // Configure Endpoint Input Context
         @memset(@as([*]u8, @ptrFromInt(paging.physToVirt(input_ctx_phys)))[0..4096], 0);
@@ -960,6 +987,7 @@ fn enumerateDevice(port: u8, speed: u8) void {
         // Allocate per-device data buffer page
         const dev_data_phys = pmm.allocFrame() orelse return;
         @memset(@as([*]u8, @ptrFromInt(paging.physToVirt(dev_data_phys)))[0..4096], 0);
+        _ = iommu.dmaMap(pci_bus, pci_dev, pci_func, dev_data_phys, 4096, .{});
 
         // Save device state
         const di = device_count;
@@ -1003,6 +1031,8 @@ fn enumerateDevice(port: u8, speed: u8) void {
         // Allocate bulk transfer rings (16 pages each, linear)
         const bulk_in_ring = initTransferRing() orelse return;
         const bulk_out_ring_r = initTransferRing() orelse return;
+        _ = iommu.dmaMap(pci_bus, pci_dev, pci_func, bulk_in_ring.phys, 4096, .{});
+        _ = iommu.dmaMap(pci_bus, pci_dev, pci_func, bulk_out_ring_r.phys, 4096, .{});
 
         // Configure Endpoint Input Context for both bulk endpoints
         @memset(@as([*]u8, @ptrFromInt(paging.physToVirt(input_ctx_phys)))[0..4096], 0);
@@ -1049,6 +1079,7 @@ fn enumerateDevice(port: u8, speed: u8) void {
         // Allocate data buffer page for MSC
         const msc_data_phys = pmm.allocFrame() orelse return;
         @memset(@as([*]u8, @ptrFromInt(paging.physToVirt(msc_data_phys)))[0..4096], 0);
+        _ = iommu.dmaMap(pci_bus, pci_dev, pci_func, msc_data_phys, 4096, .{});
 
         const di = device_count;
         devices[di] = .{

@@ -2,6 +2,10 @@ const libc = @import("libc");
 const gfx = @import("graphics");
 const ui = @import("ui");
 const fa = @import("font_atlas");
+const stb = @import("stb");
+comptime {
+    _ = @import("stb_shims");
+}
 
 const BG: u32 = 0x1E1E2E;
 const SECTION_COLOR: u32 = 0x8888CC;
@@ -12,7 +16,6 @@ const STATUS_BAD: u32 = 0xFF6666;
 
 const CONF_PATH = "/etc/zigos.conf";
 const WP_DIR = "/share/";
-const MAX_WP_CHOICES: u32 = 4;
 
 var sel_resolution: u8 = 1; // default to 1080p
 var sel_background: u8 = 0;
@@ -20,16 +23,14 @@ var sel_theme: u8 = 0;
 var sel_mouse_speed: u8 = 1;
 var sel_dock_pos: u8 = 0;
 
-// Wallpaper state. `sel_wp_idx` is 0 = "None", 1..MAX_WP_CHOICES = wp_files[idx-1].
-var sel_wp_idx: u8 = 0;
+// Wallpaper state. `sel_wp_path` is the full path of the picked image
+// ("" = no wallpaper / gradient background). Cached image dimensions
+// drive the status line.
+var sel_wp_path_buf: [256]u8 = undefined;
+var sel_wp_path_len: u32 = 0;
 var sel_wp_w: u32 = 0;
 var sel_wp_h: u32 = 0;
 var sel_wp_kind: enum { none, exact, letterbox, mismatch, broken } = .none;
-
-// Loaded from /share/ at startup.
-var wp_files: [MAX_WP_CHOICES][32]u8 = undefined;
-var wp_file_lens: [MAX_WP_CHOICES]u8 = undefined;
-var wp_count: u32 = 0;
 
 var alloc_w: u32 = 0;
 var alloc_h: u32 = 0;
@@ -43,9 +44,26 @@ const bg_colors = [4]u32{ 0x2D5F8A, 0x5F2D8A, 0x2D8A5F, 0x8A2D2D };
 var theme_btns: [2]ui.Button = undefined;
 var speed_btns: [3]ui.Button = undefined;
 var dock_btns: [2]ui.Button = undefined;
-var wp_btns: [MAX_WP_CHOICES + 1]ui.Button = undefined; // [0]=None, [1..]=files
-var wp_apply_btn: ui.Button = undefined;
+var wp_choose_btn: ui.Button = undefined;
+var wp_clear_btn: ui.Button = undefined;
 var apply_btn: ui.Button = undefined;
+
+// --- Wallpaper picker state ------------------------------------------------
+//
+// `wp_picker` opens when the user clicks Choose Wallpaper...; it browses
+// folders, shows thumbnails, returns a picked filename. Thumbnails for
+// the currently-shown directory live in `wp_thumbs` (decoded from disk
+// via stb_image, scaled down to ImagePicker.thumb_w/h). Pixel buffers
+// are owned here and freed on folder change / dismiss.
+
+const MAX_THUMBS: u32 = ui.ImagePicker.cols * ui.ImagePicker.rows;
+var wp_picker: ui.ImagePicker = undefined;
+var wp_picker_active: bool = false;
+var wp_thumbs: [MAX_THUMBS]ui.Thumbnail = undefined;
+var wp_thumb_count: u32 = 0;
+var wp_thumb_pixels: [MAX_THUMBS]?[*]u8 = .{null} ** MAX_THUMBS;
+var wp_thumb_names: [MAX_THUMBS][32]u8 = undefined;
+var wp_thumb_name_lens: [MAX_THUMBS]u8 = undefined;
 
 // --- Config persistence -----------------------------------------------------
 //
@@ -99,22 +117,11 @@ fn parseU8(s: []const u8) ?u8 {
 
 fn applyKv(key: []const u8, val_str: []const u8) void {
     if (eql(key, "wallpaper")) {
-        // Match against scanned files; default to "none" if no match.
-        sel_wp_idx = 0;
-        if (val_str.len == 0) return;
-        // The conf stores absolute path "/share/foo.png"; compare basename.
-        var base = val_str;
-        const slash_pos = lastIndexOf(val_str, '/');
-        if (slash_pos) |p| base = val_str[p + 1 ..];
-        var i: u32 = 0;
-        while (i < wp_count) : (i += 1) {
-            const fname = wp_files[i][0..wp_file_lens[i]];
-            if (eql(fname, base)) {
-                sel_wp_idx = @intCast(i + 1);
-                refreshWallpaperStatus();
-                return;
-            }
-        }
+        sel_wp_path_len = 0;
+        if (val_str.len == 0 or val_str.len >= sel_wp_path_buf.len) return;
+        @memcpy(sel_wp_path_buf[0..val_str.len], val_str);
+        sel_wp_path_len = @intCast(val_str.len);
+        refreshWallpaperStatus();
         return;
     }
     const val = parseU8(val_str) orelse return;
@@ -177,16 +184,7 @@ fn saveConf() void {
     pos = writeKv(&buf, pos, "theme", sel_theme);
     pos = writeKv(&buf, pos, "mouse_speed", sel_mouse_speed);
     pos = writeKv(&buf, pos, "dock_pos", sel_dock_pos);
-    // Wallpaper line: empty if "None" selected, full /share/ path otherwise.
-    if (sel_wp_idx == 0) {
-        pos = writeKvStr(&buf, pos, "wallpaper", "");
-    } else {
-        const fname = wp_files[sel_wp_idx - 1][0..wp_file_lens[sel_wp_idx - 1]];
-        var path_buf: [128]u8 = undefined;
-        @memcpy(path_buf[0..WP_DIR.len], WP_DIR);
-        @memcpy(path_buf[WP_DIR.len..][0..fname.len], fname);
-        pos = writeKvStr(&buf, pos, "wallpaper", path_buf[0 .. WP_DIR.len + fname.len]);
-    }
+    pos = writeKvStr(&buf, pos, "wallpaper", sel_wp_path_buf[0..sel_wp_path_len]);
     const fd = libc.openFlags(CONF_PATH, libc.O_TRUNC) orelse return;
     defer libc.close(fd);
     _ = libc.fwrite(fd, buf[0..pos]);
@@ -199,25 +197,11 @@ fn endsWith(s: []const u8, suf: []const u8) bool {
     return eql(s[s.len - suf.len ..], suf);
 }
 
-/// Scan /share/ at startup, pick up to MAX_WP_CHOICES PNG/JPG/BMP files.
-fn scanWallpapers() void {
-    var entries: [32]libc.FileEntry = undefined;
-    const n = libc.readdir(WP_DIR, &entries);
-    if (n == 0) return;
-    var out: u32 = 0;
-    var i: u32 = 0;
-    while (i < n and out < MAX_WP_CHOICES) : (i += 1) {
-        const e = &entries[i];
-        if (e.flags & libc.FE_FLAG_IS_DIR != 0) continue;
-        const name = e.name[0..e.name_len];
-        if (name.len > wp_files[0].len) continue;
-        if (!(endsWith(name, ".png") or endsWith(name, ".jpg") or
-            endsWith(name, ".bmp"))) continue;
-        @memcpy(wp_files[out][0..name.len], name);
-        wp_file_lens[out] = @intCast(name.len);
-        out += 1;
-    }
-    wp_count = out;
+fn isImageName(name: []const u8) bool {
+    return endsWith(name, ".png") or endsWith(name, ".PNG") or
+        endsWith(name, ".jpg") or endsWith(name, ".JPG") or
+        endsWith(name, ".jpeg") or endsWith(name, ".JPEG") or
+        endsWith(name, ".bmp") or endsWith(name, ".BMP");
 }
 
 /// Read the first 24 bytes of a file and parse PNG IHDR width/height.
@@ -242,18 +226,13 @@ fn peekPngDims(path: []const u8) ?struct { w: u32, h: u32 } {
 
 /// Re-classify the currently-selected wallpaper against the screen.
 fn refreshWallpaperStatus() void {
-    if (sel_wp_idx == 0) {
+    if (sel_wp_path_len == 0) {
         sel_wp_w = 0;
         sel_wp_h = 0;
         sel_wp_kind = .none;
         return;
     }
-    const fname = wp_files[sel_wp_idx - 1][0..wp_file_lens[sel_wp_idx - 1]];
-    var path_buf: [128]u8 = undefined;
-    @memcpy(path_buf[0..WP_DIR.len], WP_DIR);
-    @memcpy(path_buf[WP_DIR.len..][0..fname.len], fname);
-    const path = path_buf[0 .. WP_DIR.len + fname.len];
-
+    const path = sel_wp_path_buf[0..sel_wp_path_len];
     if (peekPngDims(path)) |dims| {
         sel_wp_w = dims.w;
         sel_wp_h = dims.h;
@@ -268,8 +247,191 @@ fn refreshWallpaperStatus() void {
     } else {
         sel_wp_w = 0;
         sel_wp_h = 0;
-        sel_wp_kind = .broken;
+        // For .jpg / .bmp we don't have a dim-peek implementation. Don't
+        // mark broken — caller can still apply, wallpaper.elf will report
+        // the real dims after decoding.
+        sel_wp_kind = .letterbox;
     }
+}
+
+// --- Wallpaper picker plumbing ---------------------------------------------
+
+fn freeWallpaperThumbs() void {
+    var i: u32 = 0;
+    while (i < MAX_THUMBS) : (i += 1) {
+        if (wp_thumb_pixels[i]) |px| {
+            libc.free(@as([*]u8, @ptrCast(px)));
+            wp_thumb_pixels[i] = null;
+        }
+    }
+    wp_thumb_count = 0;
+}
+
+/// Decode (or rather, decode + scale-down) every image in `dir` into the
+/// `wp_thumbs` slots. Caps at MAX_THUMBS — extras are ignored this turn;
+/// a real implementation would page. RGBA byte order, scaled to
+/// THUMB_W × THUMB_H (preserving aspect via inner letterbox).
+fn scanWallpaperThumbs(dir: []const u8) void {
+    freeWallpaperThumbs();
+    var entries: [128]libc.FileEntry = undefined;
+    const n = libc.readdir(dir, &entries);
+    var slot: u32 = 0;
+    var i: u32 = 0;
+    while (i < n and slot < MAX_THUMBS) : (i += 1) {
+        const e = &entries[i];
+        if ((e.flags & libc.FE_FLAG_IS_DIR) != 0) continue;
+        const name = e.name[0..e.name_len];
+        if (!isImageName(name)) continue;
+
+        const decoded = decodeThumb(dir, name);
+        @memcpy(wp_thumb_names[slot][0..name.len], name);
+        wp_thumb_name_lens[slot] = @intCast(name.len);
+        wp_thumb_pixels[slot] = decoded.pixels;
+        wp_thumbs[slot] = .{
+            .name = wp_thumb_names[slot][0..wp_thumb_name_lens[slot]],
+            .pixels = if (decoded.pixels) |p| @ptrCast(p) else null,
+            .w = decoded.w,
+            .h = decoded.h,
+        };
+        slot += 1;
+    }
+    wp_thumb_count = slot;
+}
+
+const DecodedThumb = struct { pixels: ?[*]u8, w: u32, h: u32 };
+
+/// File-read scratch buffer reused across decodeThumb calls. Reallocates
+/// only when a file is larger than the current capacity. Avoids the
+/// per-call malloc(16MB)/free churn that fragmented the heap (see crash
+/// autopsy 2026-05-14), but also doesn't pin 16 MB up-front the way an
+/// always-on slab would — on 128 MB QEMU, holding 16 MB just for thumbs
+/// plus wallpaper.elf's own buffer was enough to wedge cpu1 in mapUserPage
+/// under PMM pressure (watchdog crash 2026-05-14, build 6A05B817).
+const FILE_BUF_HARD_CAP: usize = 16 * 1024 * 1024;
+var thumb_file_buf: ?[*]u8 = null;
+var thumb_file_cap: usize = 0;
+
+fn ensureThumbFileBuf(want: usize) ?[*]u8 {
+    if (want == 0 or want > FILE_BUF_HARD_CAP) return null;
+    if (thumb_file_buf) |b| {
+        if (want <= thumb_file_cap) return b;
+        libc.free(b);
+        thumb_file_buf = null;
+        thumb_file_cap = 0;
+    }
+    const round_up: usize = ((want + 65535) / 65536) * 65536; // 64 KB grain
+    const opt = libc.malloc(round_up) orelse return null;
+    thumb_file_buf = opt;
+    thumb_file_cap = round_up;
+    return opt;
+}
+
+fn decodeThumb(dir: []const u8, name: []const u8) DecodedThumb {
+    // Build full path.
+    var path: [320]u8 = undefined;
+    if (dir.len + name.len >= path.len) return .{ .pixels = null, .w = 0, .h = 0 };
+    @memcpy(path[0..dir.len], dir);
+    @memcpy(path[dir.len..][0..name.len], name);
+    const full = path[0 .. dir.len + name.len];
+
+    // stat → exact size, malloc just enough (grow-on-demand). Avoids
+    // pinning 16 MB for a 1 MB PNG.
+    var st: libc.FileStat = undefined;
+    if (!libc.stat(full, &st)) return .{ .pixels = null, .w = 0, .h = 0 };
+    const want: usize = @as(usize, st.file_size);
+    const file_buf = ensureThumbFileBuf(want + 4096) orelse return .{ .pixels = null, .w = 0, .h = 0 };
+    const fd = libc.open(full) orelse return .{ .pixels = null, .w = 0, .h = 0 };
+    defer libc.close(fd);
+    var total: usize = 0;
+    while (total < thumb_file_cap) {
+        const remaining = thumb_file_cap - total;
+        const chunk = if (remaining > 65536) 65536 else remaining;
+        const got = libc.fread(fd, file_buf[total .. total + chunk]);
+        if (got == 0) break;
+        total += got;
+    }
+
+    // stb decode → full-res RGBA.
+    var iw: c_int = 0;
+    var ih: c_int = 0;
+    var ich: c_int = 0;
+    const px = stb.stbi_load_from_memory(file_buf, @intCast(total), &iw, &ih, &ich, 4);
+    if (px == null or iw <= 0 or ih <= 0) return .{ .pixels = null, .w = 0, .h = 0 };
+    const src_w: u32 = @intCast(iw);
+    const src_h: u32 = @intCast(ih);
+
+    // Scale-down to thumb dimensions while preserving aspect.
+    const max_w: u32 = ui.ImagePicker.thumb_w;
+    const max_h: u32 = ui.ImagePicker.thumb_h;
+    var dst_w: u32 = src_w;
+    var dst_h: u32 = src_h;
+    if (dst_w > max_w or dst_h > max_h) {
+        const fx = (max_w * 256) / dst_w;
+        const fy = (max_h * 256) / dst_h;
+        const f = @min(fx, fy);
+        dst_w = (dst_w * f) / 256;
+        dst_h = (dst_h * f) / 256;
+        if (dst_w == 0) dst_w = 1;
+        if (dst_h == 0) dst_h = 1;
+    }
+
+    const dst_size: usize = @as(usize, dst_w) * @as(usize, dst_h) * 4;
+    const dst_opt = libc.malloc(dst_size);
+    if (dst_opt == null) {
+        stb.stbi_image_free(px);
+        return .{ .pixels = null, .w = 0, .h = 0 };
+    }
+    const dst = dst_opt.?;
+    var y: u32 = 0;
+    while (y < dst_h) : (y += 1) {
+        const sy = (y * src_h) / dst_h;
+        const drow = y * dst_w * 4;
+        const srow = sy * src_w * 4;
+        var x: u32 = 0;
+        while (x < dst_w) : (x += 1) {
+            const sx = (x * src_w) / dst_w;
+            dst[drow + x * 4 + 0] = px[srow + sx * 4 + 0];
+            dst[drow + x * 4 + 1] = px[srow + sx * 4 + 1];
+            dst[drow + x * 4 + 2] = px[srow + sx * 4 + 2];
+            dst[drow + x * 4 + 3] = px[srow + sx * 4 + 3];
+        }
+    }
+    stb.stbi_image_free(px);
+    return .{ .pixels = dst, .w = dst_w, .h = dst_h };
+}
+
+fn commitPickerSelection() void {
+    const name_opt = wp_picker.selectedName();
+    if (name_opt) |name| {
+        const dir = wp_picker.currentDir();
+        if (dir.len + name.len < sel_wp_path_buf.len) {
+            @memcpy(sel_wp_path_buf[0..dir.len], dir);
+            @memcpy(sel_wp_path_buf[dir.len..][0..name.len], name);
+            sel_wp_path_len = @intCast(dir.len + name.len);
+            refreshWallpaperStatus();
+            saveConf();
+            applyWallpaperAndNotify("Wallpaper applied", "Wallpaper apply failed");
+        }
+    }
+}
+
+/// Spawn wallpaper.elf, wait for it, and report the real outcome. Previously
+/// the notification fired the instant we exec'd, which made silent failures
+/// (PMM exhaustion, kvmalloc fragmentation) invisible: the user saw
+/// "Wallpaper applied" while the kernel still held the old wallpaper.
+fn applyWallpaperAndNotify(ok_msg: []const u8, fail_msg: []const u8) void {
+    const pid = libc.exec("wallpaper.elf");
+    if (pid == 0 or pid == 0xFFFFFFFF) {
+        libc.notify(fail_msg);
+        return;
+    }
+    var status: u32 = 0xFFFFFFFF;
+    const reaped = libc.waitpid(pid, &status);
+    if (reaped != pid or status != 0) {
+        libc.notify(fail_msg);
+        return;
+    }
+    libc.notify(ok_msg);
 }
 
 // --- Layout -----------------------------------------------------------------
@@ -306,30 +468,15 @@ fn computeLayout(w: u32, h: u32) void {
     dock_btns[1] = .{ .x = m + 96, .y = y, .w = 80, .h = bh, .label = "Top" };
     y += section_h;
 
-    // Wallpaper section: row of buttons (None + scanned files), then a
-    // status line + Apply Wallpaper button beneath.
-    wp_btns[0] = .{ .x = m, .y = y, .w = 60, .h = bh, .label = "None" };
-    var wp_x: u32 = m + 66;
-    var i: u32 = 0;
-    while (i < MAX_WP_CHOICES) : (i += 1) {
-        if (i < wp_count) {
-            // Button label points into wp_files (stable for app lifetime).
-            wp_btns[i + 1] = .{
-                .x = wp_x,
-                .y = y,
-                .w = 86,
-                .h = bh,
-                .label = wp_files[i][0..wp_file_lens[i]],
-            };
-        } else {
-            // Empty slot — render off-screen so it doesn't fire on click.
-            wp_btns[i + 1] = .{ .x = 9999, .y = y, .w = 0, .h = 0, .label = "" };
-        }
-        wp_x += 90;
-    }
-    y += bh + 28; // leave room for the status text under buttons
-    wp_apply_btn = .{ .x = vis_w -| 130, .y = y - bh - 5, .w = 120, .h = bh, .label = "Apply Wallpaper" };
-    y += section_h - bh - 28;
+    // Wallpaper section — single "Choose Wallpaper..." button on the
+    // left, "Clear" button next to it. Status text drops to a row below
+    // with proper breathing room (the old row-of-thumb-buttons design
+    // made the status overlap the buttons themselves).
+    wp_choose_btn = .{ .x = m, .y = y, .w = 180, .h = bh, .label = "Choose Wallpaper..." };
+    wp_clear_btn = .{ .x = m + 186, .y = y, .w = 70, .h = bh, .label = "Clear" };
+    // Status line sits a full row below the buttons. section_h reserves
+    // the room.
+    y += section_h + 4;
 
     apply_btn = .{ .x = vis_w / 2 -| 65, .y = y, .w = 130, .h = 32, .label = "Apply" };
 }
@@ -427,17 +574,18 @@ export fn _start() linksection(".text.entry") callconv(.c) void {
     var init_w = scr.w / 4;
     if (init_w < 460) init_w = 460;
     if (init_w > 540) init_w = 540;
-    // 6 sections (was 5) + apply button + breathing room.
-    const init_h: u32 = 46 + 60 * 6 + 50;
+    // 6 sections + status row under the wallpaper buttons + apply button.
+    // Bumped from the old layout by +24 so the status text gets its own
+    // row instead of overlapping the wp buttons.
+    const init_h: u32 = 46 + 60 * 6 + 24 + 56;
     alloc_w = @min(init_w * 2, scr.w);
     alloc_h = @min(init_h * 2, scr.h);
     while (alloc_w * alloc_h > 524288) {
         if (alloc_w > alloc_h) alloc_w -= 16 else alloc_h -= 16;
     }
 
-    scanWallpapers();
     loadConf();
-    refreshWallpaperStatus(); // applyKv may have set sel_wp_idx
+    refreshWallpaperStatus(); // applyKv may have set sel_wp_path
     ui.setDarkMode(sel_theme == 1);
 
     computeLayout(init_w, init_h);
@@ -463,7 +611,29 @@ export fn _start() linksection(".text.entry") callconv(.c) void {
                     libc.exit();
                 },
                 .key_char => {
-                    if (@as(u8, @truncate(ev.a)) == 0x1B) {
+                    const ch: u8 = @truncate(ev.a);
+                    if (wp_picker_active) {
+                        switch (wp_picker.handleKey(ch)) {
+                            .cancel => {
+                                wp_picker_active = false;
+                                freeWallpaperThumbs();
+                                needs_redraw = true;
+                            },
+                            .ok => {
+                                commitPickerSelection();
+                                wp_picker_active = false;
+                                freeWallpaperThumbs();
+                                needs_redraw = true;
+                            },
+                            .folder_changed => {
+                                scanWallpaperThumbs(wp_picker.currentDir());
+                                wp_picker.setThumbnails(wp_thumbs[0..wp_thumb_count]);
+                                wp_picker.acknowledgeFolderChange();
+                                needs_redraw = true;
+                            },
+                            .none => {},
+                        }
+                    } else if (ch == 0x1B) {
                         libc.destroyWindow();
                         libc.exit();
                     }
@@ -493,57 +663,99 @@ export fn _start() linksection(".text.entry") callconv(.c) void {
         }
 
         const left_now = (cur_btns & 1) != 0;
-        for (&res_btns, 0..) |*btn, i| {
-            if (btn.update(cur_mx, cur_my, left_now, prev_left)) {
-                sel_resolution = @intCast(i);
+
+        // Picker is modal — when active, it consumes the click and the
+        // base-settings widgets stop receiving updates.
+        if (wp_picker_active) {
+            switch (wp_picker.handleClick(cur_mx, cur_my, left_now, prev_left)) {
+                .cancel => {
+                    wp_picker_active = false;
+                    freeWallpaperThumbs();
+                    needs_redraw = true;
+                },
+                .ok => {
+                    commitPickerSelection();
+                    wp_picker_active = false;
+                    freeWallpaperThumbs();
+                    needs_redraw = true;
+                },
+                .folder_changed => {
+                    scanWallpaperThumbs(wp_picker.currentDir());
+                    wp_picker.setThumbnails(wp_thumbs[0..wp_thumb_count]);
+                    wp_picker.acknowledgeFolderChange();
+                    needs_redraw = true;
+                },
+                .none => {
+                    if (left_now != prev_left) needs_redraw = true;
+                },
+            }
+            prev_left = left_now;
+            if (!needs_redraw) {
+                libc.sleep(10);
+                continue;
+            }
+        } else {
+            for (&res_btns, 0..) |*btn, i| {
+                if (btn.update(cur_mx, cur_my, left_now, prev_left)) {
+                    sel_resolution = @intCast(i);
+                    needs_redraw = true;
+                }
+            }
+            for (&bg_btns, 0..) |*btn, i| {
+                if (btn.update(cur_mx, cur_my, left_now, prev_left)) {
+                    sel_background = @intCast(i);
+                    needs_redraw = true;
+                }
+            }
+            for (&theme_btns, 0..) |*btn, i| {
+                if (btn.update(cur_mx, cur_my, left_now, prev_left)) {
+                    sel_theme = @intCast(i);
+                    ui.setDarkMode(i == 1);
+                    needs_redraw = true;
+                }
+            }
+            for (&speed_btns, 0..) |*btn, i| {
+                if (btn.update(cur_mx, cur_my, left_now, prev_left)) {
+                    sel_mouse_speed = @intCast(i);
+                    needs_redraw = true;
+                }
+            }
+            for (&dock_btns, 0..) |*btn, i| {
+                if (btn.update(cur_mx, cur_my, left_now, prev_left)) {
+                    sel_dock_pos = @intCast(i);
+                    needs_redraw = true;
+                }
+            }
+            if (wp_choose_btn.update(cur_mx, cur_my, left_now, prev_left)) {
+                const start_dir: []const u8 = if (sel_wp_path_len > 0) blk: {
+                    var i: i32 = @as(i32, @intCast(sel_wp_path_len)) - 1;
+                    while (i > 0 and sel_wp_path_buf[@intCast(i)] != '/') : (i -= 1) {}
+                    if (i > 0) break :blk sel_wp_path_buf[0 .. @as(usize, @intCast(i)) + 1];
+                    break :blk WP_DIR;
+                } else WP_DIR;
+                wp_picker = ui.ImagePicker.init(vis_w, vis_h, start_dir);
+                scanWallpaperThumbs(wp_picker.currentDir());
+                wp_picker.setThumbnails(wp_thumbs[0..wp_thumb_count]);
+                wp_picker_active = true;
                 needs_redraw = true;
             }
-        }
-        for (&bg_btns, 0..) |*btn, i| {
-            if (btn.update(cur_mx, cur_my, left_now, prev_left)) {
-                sel_background = @intCast(i);
-                needs_redraw = true;
-            }
-        }
-        for (&theme_btns, 0..) |*btn, i| {
-            if (btn.update(cur_mx, cur_my, left_now, prev_left)) {
-                sel_theme = @intCast(i);
-                ui.setDarkMode(i == 1);
-                needs_redraw = true;
-            }
-        }
-        for (&speed_btns, 0..) |*btn, i| {
-            if (btn.update(cur_mx, cur_my, left_now, prev_left)) {
-                sel_mouse_speed = @intCast(i);
-                needs_redraw = true;
-            }
-        }
-        for (&dock_btns, 0..) |*btn, i| {
-            if (btn.update(cur_mx, cur_my, left_now, prev_left)) {
-                sel_dock_pos = @intCast(i);
-                needs_redraw = true;
-            }
-        }
-        for (&wp_btns, 0..) |*btn, i| {
-            if (btn.update(cur_mx, cur_my, left_now, prev_left)) {
-                sel_wp_idx = @intCast(i);
+            if (wp_clear_btn.update(cur_mx, cur_my, left_now, prev_left)) {
+                sel_wp_path_len = 0;
                 refreshWallpaperStatus();
+                saveConf();
+                // Clear talks to the kernel directly. Going via
+                // wallpaper.elf would only see an empty `wallpaper=` line
+                // in conf and exit cleanly without telling the kernel to
+                // drop its current wallpaper.
+                if (libc.setWallpaperClear()) {
+                    libc.notify("Wallpaper cleared");
+                } else {
+                    libc.notify("Wallpaper clear failed");
+                }
                 needs_redraw = true;
             }
         }
-        if (wp_apply_btn.update(cur_mx, cur_my, left_now, prev_left)) {
-            // Persist + spawn wallpaper.elf to do the heavy decode + push.
-            saveConf();
-            if (sel_wp_idx == 0) {
-                _ = libc.exec("wallpaper.elf");
-                libc.notify("Wallpaper cleared");
-            } else {
-                _ = libc.exec("wallpaper.elf");
-                libc.notify("Wallpaper applied");
-            }
-            needs_redraw = true;
-        }
-        if (apply_btn.update(cur_mx, cur_my, left_now, prev_left)) {
+        if (!wp_picker_active and apply_btn.update(cur_mx, cur_my, left_now, prev_left)) {
             libc.setConfig(libc.Config.resolution, sel_resolution);
             libc.setConfig(libc.Config.background, sel_background);
             libc.setConfig(libc.Config.theme, sel_theme);
@@ -585,18 +797,17 @@ export fn _start() linksection(".text.entry") callconv(.c) void {
         for (dock_btns, 0..) |btn, i|
             btn.drawStyled(&canvas, if (sel_dock_pos == i) .primary else .default, BG);
 
-        // Wallpaper section (the new one).
+        // Wallpaper section — single Choose... button + Clear, status
+        // text on its own row beneath with proper breathing.
         fa.drawTextOpaque(&canvas, 12, 42 + section_h * 5, "Wallpaper", LABEL_COLOR, BG, &fa.default_16);
-        for (wp_btns, 0..) |btn, i| {
-            // Hide empty slots (label "" with w=0).
-            if (btn.w == 0) continue;
-            btn.drawStyled(&canvas, if (sel_wp_idx == i) .primary else .default, BG);
-        }
-        // Status line under the buttons.
-        drawWallpaperStatus(&canvas, 12, 42 + section_h * 5 + 26 + 4);
-        wp_apply_btn.drawStyled(&canvas, .primary, BG);
+        wp_choose_btn.drawStyled(&canvas, .default, BG);
+        wp_clear_btn.drawStyled(&canvas, .default, BG);
+        drawWallpaperStatus(&canvas, 12, 42 + section_h * 5 + 26 + 14);
 
         apply_btn.drawStyled(&canvas, .primary, BG);
+
+        // Picker overlay paints LAST so it sits above every base widget.
+        if (wp_picker_active) wp_picker.draw(&canvas, BG);
 
         libc.present();
         libc.sleep(10);

@@ -45,6 +45,10 @@ pub const ANSI_PALETTE: [16]u32 = .{
 pub const ATTR_DEFAULT: u8 = 0x07;
 pub const ATTR_BOLD: u8 = 0x10;
 pub const ATTR_INVERSE: u8 = 0x20;
+/// Cell foreground is a 24-bit RGB value pulled from the per-cell
+/// `fg_rgb_buf` rather than `ANSI_PALETTE[attr & 0x0F]`. Set by the
+/// SGR `38;2;r;g;b` (truecolor) parser; cleared by `39` (default fg).
+pub const ATTR_RGB_FG: u8 = 0x40;
 
 // --- Terminal behavior tunables ---
 pub const TAB_WIDTH: u8 = 8;

@@ -217,12 +217,59 @@ pub const McfgSegment = extern struct {
     _reserved: u32 align(1),
 };
 
+// --- DMAR (signature "DMAR") -----------------------------------------------
+// DMA Remapping Reporting — describes the Intel VT-d remapping units in the
+// system. The table header is followed by a 16-byte DMAR-specific header
+// (host address width + flags) and then a stream of variable-length
+// remapping structures (DRHD, RMRR, ATSR, RHSA, ANDD) each prefixed by
+// `{type:u16, length:u16}`.
+//
+// Reference: Intel VT-d spec §8.
+
+pub const Dmar = extern struct {
+    header: SdtHeader,
+    /// Bits[7:0] of MaxPhysAddrWidth minus 1. e.g. 47 = 48-bit phys.
+    host_addr_width: u8,
+    /// Bit 0 = INTR_REMAP (interrupt remapping supported), bit 1 = X2APIC_OPT_OUT.
+    flags: u8,
+    _reserved: [10]u8,
+    // followed by DmarRemappingHeader entries until header.length is exhausted
+};
+
+pub const DmarRemappingHeader = extern struct {
+    /// 0 = DRHD, 1 = RMRR, 2 = ATSR, 3 = RHSA, 4 = ANDD
+    entry_type: u16 align(1),
+    length: u16 align(1),
+};
+
+pub const DmarType = enum(u16) {
+    drhd = 0,
+    rmrr = 1,
+    atsr = 2,
+    rhsa = 3,
+    andd = 4,
+};
+
+/// DRHD: DMA Remapping Hardware Definition — one VT-d unit's MMIO base +
+/// the PCI device-scope list it covers. `flags` bit 0 = INCLUDE_PCI_ALL,
+/// meaning this DRHD is the catch-all for every PCI device on `segment`
+/// that isn't claimed by another DRHD.
+pub const DmarDrhd = extern struct {
+    header: DmarRemappingHeader,
+    flags: u8,
+    _reserved: u8,
+    segment: u16 align(1),
+    register_base: u64 align(1),
+    // followed by variable-length device-scope entries
+};
+
 // --- Module state ----------------------------------------------------------
 
 var fadt: ?*align(1) const Fadt = null;
 var madt: ?*align(1) const Madt = null;
 var hpet: ?*align(1) const Hpet = null;
 var mcfg: ?*align(1) const Mcfg = null;
+var dmar: ?*align(1) const Dmar = null;
 
 /// FADT.flags bit 10 = RESET_REG_SUP. When set, FADT.reset_reg is a valid
 /// Generic Address pointing at a register; writing FADT.reset_value to it
@@ -274,6 +321,25 @@ pub fn getMcfg() ?*align(1) const Mcfg {
     return mcfg;
 }
 
+pub fn getDmar() ?*align(1) const Dmar {
+    return dmar;
+}
+
+/// Walk every DMAR sub-entry. Caller cases on `header.entry_type` and
+/// casts to the appropriate concrete struct (DmarDrhd / etc.).
+pub fn forEachDmarEntry(comptime Ctx: type, ctx: *Ctx, cb: *const fn (*Ctx, *align(1) const DmarRemappingHeader) void) void {
+    const d = dmar orelse return;
+    const base: usize = @intFromPtr(d) + @sizeOf(Dmar);
+    const end: usize = @intFromPtr(d) + d.header.length;
+    var p: usize = base;
+    while (p + @sizeOf(DmarRemappingHeader) <= end) {
+        const h: *align(1) const DmarRemappingHeader = @ptrFromInt(p);
+        if (h.length == 0) break;
+        cb(ctx, h);
+        p += h.length;
+    }
+}
+
 // --- Checksum + validation --------------------------------------------------
 
 fn checksumOk(bytes: [*]const u8, len: usize) bool {
@@ -293,16 +359,36 @@ fn checksumOk(bytes: [*]const u8, len: usize) bool {
 fn validateRsdp(addr: u64) ?*align(1) const Rsdp {
     if (addr == 0) return null;
     const r: *align(1) const Rsdp = @ptrFromInt(paging.physToVirt(addr));
-    if (!std.mem.eql(u8, &r.signature, "RSD PTR ")) return null;
-    if (!checksumOk(@ptrCast(r), 20)) return null;
+    if (!std.mem.eql(u8, &r.signature, "RSD PTR ")) {
+        // Diagnostic: dump the first 16 bytes at this address so we can
+        // tell "wrong address" from "address was clobbered" failures.
+        const bytes: [*]const u8 = @ptrCast(r);
+        debug.klog(
+            "[acpi]   RSDP@0x{x} sig mismatch; bytes={x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}\n",
+            .{ addr, bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7] },
+        );
+        return null;
+    }
+    if (!checksumOk(@ptrCast(r), 20)) {
+        debug.klog("[acpi]   RSDP@0x{x} 1.0 checksum failed (rev={d})\n", .{ addr, r.revision });
+        return null;
+    }
     if (r.revision >= 2) {
-        // r.length lives at offset 20 — outside the 1.0 checksum we just
-        // verified. A corrupt/spoofed RSDP could carry a garbage length
-        // (e.g. 0x80000000) that would walk checksumOk off the end of
-        // mapped memory and fault. Real RSDPs are <= 36 bytes; cap at
-        // 256 for headroom against future spec extensions.
-        if (r.length < @sizeOf(Rsdp) or r.length > 256) return null;
-        if (!checksumOk(@ptrCast(r), r.length)) return null;
+        // ACPI 2.0+ RSDP is exactly 36 bytes per spec. Don't use
+        // @sizeOf(Rsdp) here — Zig rounds extern-struct size up to its
+        // alignment (8 for the u64 xsdt_address), so @sizeOf == 40 and
+        // would falsely reject the spec-correct length 36. i440fx OVMF
+        // happens to report 40 (struct-aligned); q35 OVMF reports the
+        // spec-correct 36.
+        const RSDP_MIN_BYTES: u32 = 36;
+        if (r.length < RSDP_MIN_BYTES or r.length > 256) {
+            debug.klog("[acpi]   RSDP@0x{x} length {d} out of range\n", .{ addr, r.length });
+            return null;
+        }
+        if (!checksumOk(@ptrCast(r), r.length)) {
+            debug.klog("[acpi]   RSDP@0x{x} extended checksum failed\n", .{addr});
+            return null;
+        }
     }
     return r;
 }
@@ -342,6 +428,8 @@ fn dispatchTable(hdr: *align(1) const SdtHeader) void {
         hpet = @ptrCast(hdr);
     } else if (std.mem.eql(u8, &hdr.signature, "MCFG")) {
         mcfg = @ptrCast(hdr);
+    } else if (std.mem.eql(u8, &hdr.signature, "DMAR")) {
+        dmar = @ptrCast(hdr);
     }
 }
 
@@ -426,11 +514,12 @@ pub fn init(boot_rsdp: u64) void {
         return;
     }
 
-    debug.klog("[acpi] ready: FADT={s} MADT={s} HPET={s} MCFG={s}\n", .{
+    debug.klog("[acpi] ready: FADT={s} MADT={s} HPET={s} MCFG={s} DMAR={s}\n", .{
         if (fadt != null) "yes" else "no",
         if (madt != null) "yes" else "no",
         if (hpet != null) "yes" else "no",
         if (mcfg != null) "yes" else "no",
+        if (dmar != null) "yes" else "no",
     });
 }
 

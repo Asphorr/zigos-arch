@@ -44,6 +44,9 @@ pub const Kind = enum(u8) {
     mounts,
     sessions,
     sched,
+    net_info,
+    net_sock,
+    net_arp,
     pid_cmdline,
     pid_status,
 };
@@ -62,6 +65,9 @@ const STATIC_FILES = [_]StaticFile{
     .{ .name = "mounts", .kind = .mounts },
     .{ .name = "sessions", .kind = .sessions },
     .{ .name = "sched", .kind = .sched },
+    .{ .name = "netinfo", .kind = .net_info },
+    .{ .name = "netsock", .kind = .net_sock },
+    .{ .name = "netarp", .kind = .net_arp },
 };
 
 const PER_PID_FILES = [_]StaticFile{
@@ -123,6 +129,7 @@ pub fn read(inode: u32, offset: u32, buf: [*]u8, count: u32) u32 {
     const rendered: []u8 = render_buf[0..];
     const kind: Kind = @enumFromInt(@as(u8, @intCast((inode >> 8) & 0xFF)));
     const pid: u8 = @intCast(inode & 0xFF);
+    const net = @import("../net/net.zig");
     const len = switch (kind) {
         .meminfo => renderMeminfo(rendered),
         .uptime => renderUptime(rendered),
@@ -132,6 +139,9 @@ pub fn read(inode: u32, offset: u32, buf: [*]u8, count: u32) u32 {
         .mounts => renderMounts(rendered),
         .sessions => renderSessions(rendered),
         .sched => renderSched(rendered),
+        .net_info => net.renderProcInfo(rendered),
+        .net_sock => net.renderProcSock(rendered),
+        .net_arp => net.renderProcArp(rendered),
         .pid_cmdline => renderPidCmdline(pid, rendered),
         .pid_status => renderPidStatus(pid, rendered),
     };

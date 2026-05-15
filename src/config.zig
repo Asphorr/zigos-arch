@@ -20,7 +20,7 @@ pub const MAX_FDS: u32 = 16;
 pub const MAX_LAZY_REGIONS: u8 = 16;
 
 /// Per-process kernel stack body size. Plus KSTACK_GUARD_SIZE below it.
-pub const KSTACK_SIZE: usize = 16 * 1024; // 16 KB — wider 64-bit frames need it
+pub const KSTACK_SIZE: usize = 64 * 1024; // 64 KB — std.crypto.Certificate.rsa modpow uses Modulus(4096) Fe arrays (512 B each, several live in flight) + AEAD scratch + cert chain walk; deep TLS syscalls peak well past 16 KB. 32 KB still wasn't enough — hex-dump after a second crash showed RSA modulus bytes (0xCAAF53D8...) sitting on the kstack where doSyscall's saved RIP should have been. Was 16 KB. Linux uses 16 KB but offloads crypto to worker threads with their own kstacks — a cleaner future fix.
 /// Bottom 4 KB of each kernel-stack slot is unmapped so a stack overflow
 /// page-faults instead of silently corrupting the next slot.
 pub const KSTACK_GUARD_SIZE: usize = 4 * 1024;

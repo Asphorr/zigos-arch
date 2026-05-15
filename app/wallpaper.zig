@@ -15,14 +15,22 @@ const CONF_PATH = "/etc/zigos.conf";
 const CONF_KEY = "wallpaper";
 
 /// Allocate-and-read entire file. Returns the slice (caller frees) or null.
+/// Sizes the malloc to the file's actual size + a 4 KB pad, not max_bytes,
+/// so a 1 MB PNG doesn't reserve 16 MB of user heap (peak RAM matters on
+/// 128 MB QEMU — see crash autopsy 2026-05-14, [pf-fail] PID=6).
 fn readEntireFile(path: []const u8, max_bytes: usize) ?[]u8 {
+    var st: libc.FileStat = undefined;
+    if (!libc.stat(path, &st)) return null;
+    const want: usize = @as(usize, st.file_size);
+    if (want == 0 or want > max_bytes) return null;
     const fd = libc.open(path) orelse return null;
     defer libc.close(fd);
-    const buf_ptr = libc.malloc(max_bytes) orelse return null;
-    const buf = buf_ptr[0..max_bytes];
+    const cap: usize = want + 4096;
+    const buf_ptr = libc.malloc(cap) orelse return null;
+    const buf = buf_ptr[0..cap];
     var total: usize = 0;
-    while (total < max_bytes) {
-        const remaining = max_bytes - total;
+    while (total < cap) {
+        const remaining = cap - total;
         const chunk = if (remaining > 65536) 65536 else remaining;
         const n = libc.fread(fd, buf[total..][0..chunk]);
         if (n == 0) break;
@@ -128,23 +136,23 @@ export fn _start() linksection(".text.entry") callconv(.c) void {
                     }
                 }
                 if (match) {
-                    _ = libc.setWallpaperClear();
-                    libc.exit();
+                    const ok = libc.setWallpaperClear();
+                    libc.exitWith(if (ok) 0 else 1);
                 }
             }
         }
     }
 
     // Read /etc/zigos.conf, look up `wallpaper=`.
-    const conf = readEntireFile(CONF_PATH, 4096) orelse libc.exit();
+    const conf = readEntireFile(CONF_PATH, 4096) orelse libc.exitWith(1);
     defer libc.free(conf.ptr);
 
     var path_buf: [128]u8 = undefined;
     const path_len = confLookup(conf, CONF_KEY, &path_buf);
-    if (path_len == 0) libc.exit(); // no wallpaper configured — nothing to do
+    if (path_len == 0) libc.exit(); // no wallpaper configured — nothing to do, success
 
     const path = path_buf[0..path_len];
-    if (path.len == 0) libc.exit();
-    _ = decodeAndPush(path);
-    libc.exit();
+    if (path.len == 0) libc.exitWith(1);
+    const ok = decodeAndPush(path);
+    libc.exitWith(if (ok) 0 else 1);
 }

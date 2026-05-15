@@ -50,6 +50,11 @@ pub const EscState = enum(u8) { idle, esc, csi };
 pub const TerminalData = struct {
     text_buf: [TERM_COLS * TERM_ROWS]u8,
     attr_buf: [TERM_COLS * TERM_ROWS]u8,
+    /// Per-cell 24-bit foreground RGB. Only consulted when the matching
+    /// `attr_buf[i] & ATTR_RGB_FG` flag is set; otherwise the cell renders
+    /// via `ANSI_PALETTE[attr & 0x0F]`. Costs 8 KB per terminal at the
+    /// default 80×25 grid — worth it for actually-orange logos.
+    fg_rgb_buf: [TERM_COLS * TERM_ROWS]u32,
     text_row: u16,
     text_col: u16,
     cmd_buf: [128]u8,
@@ -60,6 +65,7 @@ pub const TerminalData = struct {
     history_idx: u8,
     scroll_buf: [SCROLL_LINES * TERM_COLS]u8,
     scroll_attr_buf: [SCROLL_LINES * TERM_COLS]u8,
+    scroll_fg_rgb_buf: [SCROLL_LINES * TERM_COLS]u32,
     scroll_write: u16,
     scroll_count: u16,
     scroll_view: u16,
@@ -67,10 +73,17 @@ pub const TerminalData = struct {
     // `esc` = saw \x1b, awaiting `[`; `csi` = inside `\x1b[...<final>`,
     // accumulating numeric args separated by `;`.
     esc_state: EscState,
-    csi_args: [4]u16,
+    // 8 slots so truecolor SGR (`38;2;R;G;B` = 5 args) and 256-color
+    // (`38;5;N` = 3 args) parse cleanly with headroom. 4 silently truncated
+    // truecolor sequences mid-parse — the dropped digits got accumulated
+    // into the previous arg and corrupted it (gray-Z bug, 2026-05-14).
+    csi_args: [8]u16,
     csi_arg_count: u8,
     csi_has_arg: bool,
     cur_attr: u8,
+    /// Most-recent truecolor fg, in 0x00RRGGBB. Only meaningful when
+    /// `cur_attr & ATTR_RGB_FG` is set; SGR `38;2;...` writes both.
+    cur_fg_rgb: u32,
     bell_phase: u8,
     cursor_blink_anchor: u64,
     /// Deferred-wrap flag (xterm-style auto-margin). When a printable char
@@ -185,7 +198,7 @@ pub const Window = struct {
     shadow_dirty: bool = true,
 };
 
-pub const ResizeEdge = enum { right, bottom, bottom_right };
+pub const ResizeEdge = enum { left, right, top, bottom, top_left, top_right, bottom_left, bottom_right };
 
 pub fn defaultWindow() Window {
     return .{
@@ -285,6 +298,7 @@ pub fn allocTerminalData() ?*TerminalData {
     td.* = .{
         .text_buf = [_]u8{' '} ** (TERM_COLS * TERM_ROWS),
         .attr_buf = [_]u8{ATTR_DEFAULT} ** (TERM_COLS * TERM_ROWS),
+        .fg_rgb_buf = [_]u32{0} ** (TERM_COLS * TERM_ROWS),
         .text_row = 0,
         .text_col = 0,
         .cmd_buf = [_]u8{0} ** 128,
@@ -295,14 +309,16 @@ pub fn allocTerminalData() ?*TerminalData {
         .history_idx = 0,
         .scroll_buf = [_]u8{' '} ** (SCROLL_LINES * TERM_COLS),
         .scroll_attr_buf = [_]u8{ATTR_DEFAULT} ** (SCROLL_LINES * TERM_COLS),
+        .scroll_fg_rgb_buf = [_]u32{0} ** (SCROLL_LINES * TERM_COLS),
         .scroll_write = 0,
         .scroll_count = 0,
         .scroll_view = 0,
         .esc_state = .idle,
-        .csi_args = [_]u16{0} ** 4,
+        .csi_args = [_]u16{0} ** 8,
         .csi_arg_count = 0,
         .csi_has_arg = false,
         .cur_attr = ATTR_DEFAULT,
+        .cur_fg_rgb = 0,
         .bell_phase = 0,
         .cursor_blink_anchor = 0,
         .pending_wrap = false,
@@ -411,14 +427,45 @@ pub fn isOnMinimizeBtn(idx: u8, mx: i32, my: i32) bool {
     return (dx * dx + dy * dy <= @as(i32, BTN_RADIUS * BTN_RADIUS));
 }
 
+pub fn isOnMaximizeBtn(idx: u8, mx: i32, my: i32) bool {
+    const w = &windows[idx];
+    const cx = w.x + 60;
+    const cy = w.y + @as(i32, TITLEBAR_H / 2);
+    const dx = mx - cx;
+    const dy = my - cy;
+    return (dx * dx + dy * dy <= @as(i32, BTN_RADIUS * BTN_RADIUS));
+}
+
 pub fn isOnResizeEdge(idx: u8, mx: i32, my: i32) ?ResizeEdge {
     const w = &windows[idx];
     const right = w.x + @as(i32, @intCast(w.width));
     const bot = w.y + @as(i32, @intCast(w.height));
-    const near_right = (mx >= right - RESIZE_ZONE and mx <= right + 2 and my >= w.y + @as(i32, TITLEBAR_H) and my <= bot + 2);
-    const near_bottom = (my >= bot - RESIZE_ZONE and my <= bot + 2 and mx >= w.x and mx <= right + 2);
+    const left = w.x;
+    const top = w.y;
+
+    // Each edge band extends RESIZE_ZONE pixels INSIDE the window plus
+    // 2 pixels OUTSIDE so users can grab edges that sit right against
+    // the screen border. Corner detection wins over single-edge so
+    // grabbing a corner gets the diagonal cursor / behavior.
+    const near_left = (mx >= left - 2 and mx <= left + RESIZE_ZONE and my >= top and my <= bot + 2);
+    const near_right = (mx >= right - RESIZE_ZONE and mx <= right + 2 and my >= top and my <= bot + 2);
+    const near_bottom = (my >= bot - RESIZE_ZONE and my <= bot + 2 and mx >= left and mx <= right + 2);
+
+    // Top edge resize would compete with the titlebar (drag-to-move) at
+    // the same Y range. Reserve the top band for resize ONLY when the
+    // cursor is at the actual top pixel row of the window — anywhere
+    // further inside falls back to titlebar-drag semantics. This keeps
+    // grabbing the top-edge possible without breaking "drag window by
+    // its titlebar" which is the common case.
+    const top_for_resize = (my >= top - 2 and my <= top + 1 and mx >= left and mx <= right + 2);
+
+    if (near_left and top_for_resize) return .top_left;
+    if (near_right and top_for_resize) return .top_right;
+    if (near_left and near_bottom) return .bottom_left;
     if (near_right and near_bottom) return .bottom_right;
+    if (near_left) return .left;
     if (near_right) return .right;
+    if (top_for_resize) return .top;
     if (near_bottom) return .bottom;
     return null;
 }

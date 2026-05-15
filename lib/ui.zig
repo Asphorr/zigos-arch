@@ -873,3 +873,706 @@ pub const Dialog = struct {
         return .none;
     }
 };
+
+// --- Folder picker --------------------------------------------------------
+
+pub const FolderPickerAction = enum {
+    /// Nothing happened this frame. Default each frame.
+    none,
+    /// User clicked the Cancel button (or pressed Esc — caller forwards
+    /// the key). App should `dismiss()` the picker.
+    cancel,
+    /// User clicked the OK button with a directory selected. App should
+    /// read `currentPath()` and `dismiss()`.
+    ok,
+    /// User clicked a directory in the list (or pressed Enter on the
+    /// selected row). Picker has already navigated into it — nothing for
+    /// caller to do beyond marking the window dirty for the next frame.
+    navigated,
+};
+
+/// Modal-overlay folder browser, same caller-owned-state pattern as
+/// `Dialog`. App init's once, calls `draw(canvas, bg)` every frame while
+/// the picker is up, and feeds clicks to `handleClick(mx, my, left_now,
+/// left_prev)`. Returns `FolderPickerAction.ok` once the user has
+/// confirmed; caller then reads `currentPath()` and dismisses.
+///
+/// Filesystem access is via `libc.readdir` — works against ext2, fat32,
+/// and tarfs uniformly. The picker only shows directory entries (filters
+/// on `FE_FLAG_IS_DIR`); files are hidden because the use case is "pick
+/// where to read/write from", not "pick a file".
+///
+/// Backing arrays live inline so callers can keep the picker on the
+/// stack or as a struct field without managing allocations.
+pub const FolderPicker = struct {
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    title: []const u8,
+
+    /// Current directory we're browsing, NUL-paddable absolute path.
+    path_buf: [256]u8,
+    path_len: u32,
+
+    /// Subdirectory entries inside `path_buf`. Capped at MAX_ENTRIES;
+    /// directories beyond that are silently dropped. Boot ZigOS root
+    /// has ~10 entries so this is plenty for a long time.
+    entries: [MAX_ENTRIES]libc.FileEntry,
+    entry_count: u32,
+    /// Index into `entries[]` of the highlighted row, or -1 if no
+    /// selection yet. Drives the "OK uses this directory" decision —
+    /// when -1, OK picks `path_buf` itself (i.e., the directory the
+    /// list is showing).
+    selected: i32,
+    /// Scroll offset (in rows). Bumped when the keyboard or list-click
+    /// moves the selection off the visible window.
+    scroll: u32,
+
+    up_btn: Button,
+    cancel_btn: Button,
+    ok_btn: Button,
+
+    pub const MAX_ENTRIES: u32 = 128;
+    pub const padding: u32 = 14;
+    pub const row_h: u32 = 22;
+    pub const btn_h: u32 = 28;
+    pub const btn_w: u32 = 90;
+    pub const btn_gap: u32 = 10;
+    pub const min_w: u32 = 360;
+    pub const min_h: u32 = 280;
+
+    /// Visible row count in the list area — derived from `h`.
+    pub fn visibleRows(self: FolderPicker) u32 {
+        const list_h = self.listHeight();
+        return list_h / row_h;
+    }
+
+    fn listHeight(self: FolderPicker) u32 {
+        // h - top padding - title + bar - up-button row - bottom padding - button row - inner gaps
+        const overhead: u32 = padding + Canvas.CH16 + 8 + btn_h + 8 + btn_h + padding;
+        return self.h -| overhead;
+    }
+
+    pub fn init(canvas_w: u32, canvas_h: u32, start_path: []const u8) FolderPicker {
+        const w: u32 = @min(canvas_w -| 60, 480);
+        const h: u32 = @min(canvas_h -| 80, 380);
+        const x = (canvas_w -| w) / 2;
+        const y = (canvas_h -| h) / 4;
+
+        var fp: FolderPicker = .{
+            .x = x,
+            .y = y,
+            .w = if (w < min_w) min_w else w,
+            .h = if (h < min_h) min_h else h,
+            .title = "Choose folder",
+            .path_buf = undefined,
+            .path_len = 0,
+            .entries = undefined,
+            .entry_count = 0,
+            .selected = -1,
+            .scroll = 0,
+            .up_btn = .{ .x = x + padding, .y = y + padding + Canvas.CH16 + 6, .w = 80, .h = btn_h, .label = "Up" },
+            .cancel_btn = .{ .x = x + w - padding - btn_w * 2 - btn_gap, .y = y + h - padding - btn_h, .w = btn_w, .h = btn_h, .label = "Cancel" },
+            .ok_btn = .{ .x = x + w - padding - btn_w, .y = y + h - padding - btn_h, .w = btn_w, .h = btn_h, .label = "Open" },
+        };
+        fp.setPath(start_path);
+        return fp;
+    }
+
+    /// Switch the picker to a new directory and re-read its entries.
+    /// No-op when the path is empty or longer than 254 bytes. Resets the
+    /// selection + scroll so the user sees the top of the new list.
+    pub fn setPath(self: *FolderPicker, p: []const u8) void {
+        if (p.len == 0 or p.len > 254) return;
+        // Canonicalize: ensure trailing slash so concatenation works.
+        @memcpy(self.path_buf[0..p.len], p);
+        self.path_len = @intCast(p.len);
+        if (self.path_buf[self.path_len - 1] != '/') {
+            self.path_buf[self.path_len] = '/';
+            self.path_len += 1;
+        }
+        self.refresh();
+    }
+
+    /// Re-read `path_buf` from disk. Called automatically by `setPath`
+    /// and `navigateUp`; apps can call it manually after creating files
+    /// they expect to show up.
+    pub fn refresh(self: *FolderPicker) void {
+        var tmp: [MAX_ENTRIES]libc.FileEntry = undefined;
+        const n = libc.readdir(self.path_buf[0..self.path_len], &tmp);
+        var kept: u32 = 0;
+        var i: u32 = 0;
+        while (i < n and kept < MAX_ENTRIES) : (i += 1) {
+            // Show only directories. Files clutter the picker; the use
+            // case is "pick a place", not "pick a file".
+            if ((tmp[i].flags & libc.FE_FLAG_IS_DIR) == 0) continue;
+            // Hide "." and ".." — Up button handles parent navigation
+            // explicitly so users can't trip over the convention.
+            const name = tmp[i].name[0..tmp[i].name_len];
+            if (name.len == 1 and name[0] == '.') continue;
+            if (name.len == 2 and name[0] == '.' and name[1] == '.') continue;
+            self.entries[kept] = tmp[i];
+            kept += 1;
+        }
+        self.entry_count = kept;
+        self.selected = -1;
+        self.scroll = 0;
+    }
+
+    /// Pop one path component, refresh. No-op when already at "/".
+    pub fn navigateUp(self: *FolderPicker) void {
+        // Strip the trailing slash, then strip back to the previous one.
+        if (self.path_len <= 1) return;
+        self.path_len -= 1; // drop trailing '/'
+        while (self.path_len > 0 and self.path_buf[self.path_len - 1] != '/') {
+            self.path_len -= 1;
+        }
+        if (self.path_len == 0) {
+            self.path_buf[0] = '/';
+            self.path_len = 1;
+        }
+        self.refresh();
+    }
+
+    /// Append `name` (one path component) to `path_buf` and refresh.
+    /// Truncates silently if the result would exceed 254 bytes — the
+    /// user just stays in the current directory.
+    pub fn navigateInto(self: *FolderPicker, name: []const u8) void {
+        if (self.path_len + name.len + 1 >= self.path_buf.len) return;
+        @memcpy(self.path_buf[self.path_len..][0..name.len], name);
+        self.path_len += @intCast(name.len);
+        self.path_buf[self.path_len] = '/';
+        self.path_len += 1;
+        self.refresh();
+    }
+
+    /// Caller treats this as the chosen folder once `handleClick` /
+    /// `handleKey` returns `.ok`.
+    pub fn currentPath(self: FolderPicker) []const u8 {
+        return self.path_buf[0..self.path_len];
+    }
+
+    /// Update button visual state + dispatch the click. Same calling
+    /// convention as `Button.update`: caller tracks `left_prev`. Returns
+    /// the action to take — most often `.none` (no click) or
+    /// `.navigated` (clicked a directory row, picker moved into it).
+    pub fn handleClick(self: *FolderPicker, mx: i32, my: i32, left_now: bool, left_prev: bool) FolderPickerAction {
+        if (self.up_btn.update(mx, my, left_now, left_prev)) {
+            self.navigateUp();
+            return .navigated;
+        }
+        if (self.cancel_btn.update(mx, my, left_now, left_prev)) return .cancel;
+        if (self.ok_btn.update(mx, my, left_now, left_prev)) return .ok;
+
+        // Row hit-test. Only fires on the falling edge — matches Button.
+        if (!left_now and left_prev) {
+            const list_x = self.x + padding;
+            const list_y = self.up_btn.y + self.up_btn.h + 6;
+            const list_w = self.w -| (padding * 2);
+            const list_h = self.listHeight();
+            const inside = mx >= @as(i32, @intCast(list_x)) and mx < @as(i32, @intCast(list_x + list_w)) and
+                my >= @as(i32, @intCast(list_y)) and my < @as(i32, @intCast(list_y + list_h));
+            if (inside) {
+                const rel_y: u32 = @intCast(my - @as(i32, @intCast(list_y)));
+                const row: u32 = rel_y / row_h + self.scroll;
+                if (row < self.entry_count) {
+                    // Single-click = select. Double-click would navigate
+                    // but we don't have tick tracking at the picker level
+                    // — instead, treat clicking the already-selected row
+                    // as the navigate gesture.
+                    if (self.selected == @as(i32, @intCast(row))) {
+                        const name = self.entries[row].name[0..self.entries[row].name_len];
+                        self.navigateInto(name);
+                        return .navigated;
+                    } else {
+                        self.selected = @intCast(row);
+                        return .none;
+                    }
+                }
+            }
+        }
+        return .none;
+    }
+
+    /// Forward a key press. Up/Down move the selection; Enter navigates
+    /// into the selected row; Backspace = Up; Esc = cancel. Returns the
+    /// matching action so the caller can dismiss without an explicit
+    /// button click.
+    pub fn handleKey(self: *FolderPicker, ch: u8) FolderPickerAction {
+        switch (ch) {
+            0x1B => return .cancel, // Esc
+            8, 0x7F => {
+                self.navigateUp();
+                return .navigated;
+            },
+            '\n', '\r' => {
+                if (self.selected >= 0 and @as(u32, @intCast(self.selected)) < self.entry_count) {
+                    const row: u32 = @intCast(self.selected);
+                    const name = self.entries[row].name[0..self.entries[row].name_len];
+                    self.navigateInto(name);
+                    return .navigated;
+                }
+                return .ok;
+            },
+            // Arrow keys arrive as the bare scancode in some paths;
+            // accept them but don't require them. 0x91 = down, 0x92 = up
+            // in the kernel's keymap (see input dispatch).
+            0x91 => {
+                if (self.entry_count == 0) return .none;
+                const next: i32 = if (self.selected < 0) 0 else @min(self.selected + 1, @as(i32, @intCast(self.entry_count - 1)));
+                self.selected = next;
+                self.scrollIntoView();
+                return .none;
+            },
+            0x92 => {
+                if (self.entry_count == 0) return .none;
+                const next: i32 = if (self.selected <= 0) 0 else self.selected - 1;
+                self.selected = next;
+                self.scrollIntoView();
+                return .none;
+            },
+            else => return .none,
+        }
+    }
+
+    fn scrollIntoView(self: *FolderPicker) void {
+        if (self.selected < 0) return;
+        const sel: u32 = @intCast(self.selected);
+        const visible = self.visibleRows();
+        if (sel < self.scroll) {
+            self.scroll = sel;
+        } else if (sel >= self.scroll + visible) {
+            self.scroll = sel - visible + 1;
+        }
+    }
+
+    pub fn draw(self: FolderPicker, canvas: *Canvas, surrounding_bg: u32) void {
+        // Drop shadow + card surface — same vocabulary as Dialog so the
+        // two read as part of the same OS look.
+        drawShadow(canvas, self.x, self.y, self.w, self.h, surrounding_bg);
+        canvas.fillRect(self.x, self.y, self.w, self.h, palette.card_bg);
+        drawRect1px(canvas, self.x, self.y, self.w, self.h, palette.card_border);
+        canvas.roundCorners(self.x, self.y, self.w, self.h, surrounding_bg);
+
+        // Title
+        const atlas = fa.getDefault16();
+        const title_y = self.y + padding;
+        fa.drawTextCentered(canvas, @intCast(self.x), @intCast(title_y), self.w, self.title, palette.text_strong, atlas);
+
+        // Up button
+        self.up_btn.drawStyled(canvas, .default, palette.card_bg);
+
+        // Current path crumb to the right of Up button
+        const crumb_x = self.up_btn.x + self.up_btn.w + 12;
+        const crumb_y = self.up_btn.y + (btn_h -| atlas.line_height) / 2;
+        canvas.drawText16Fg(crumb_x, crumb_y, self.path_buf[0..self.path_len], palette.text_normal);
+
+        // Entry list region with a subtle inset frame
+        const list_x = self.x + padding;
+        const list_y = self.up_btn.y + self.up_btn.h + 6;
+        const list_w = self.w -| (padding * 2);
+        const list_h = self.listHeight();
+        canvas.fillRect(list_x, list_y, list_w, list_h, palette.card_bg);
+        drawRect1px(canvas, list_x, list_y, list_w, list_h, palette.card_border);
+
+        // Rows
+        const visible = self.visibleRows();
+        var ri: u32 = 0;
+        while (ri < visible and self.scroll + ri < self.entry_count) : (ri += 1) {
+            const entry_idx = self.scroll + ri;
+            const row_y = list_y + ri * row_h;
+            const sel = (self.selected >= 0 and @as(u32, @intCast(self.selected)) == entry_idx);
+            if (sel) {
+                canvas.fillRect(list_x + 1, row_y, list_w -| 2, row_h, palette.btn_primary_top);
+            }
+            const name = self.entries[entry_idx].name[0..self.entries[entry_idx].name_len];
+            const text_color: u32 = if (sel) palette.card_bg else palette.text_normal;
+            // Folder glyph (lo-fi) + name
+            canvas.drawText16Fg(list_x + 8, row_y + (row_h -| atlas.line_height) / 2, "[D]", if (sel) palette.card_bg else palette.text_muted);
+            canvas.drawText16Fg(list_x + 36, row_y + (row_h -| atlas.line_height) / 2, name, text_color);
+        }
+
+        // Empty-state hint when the directory has no subfolders
+        if (self.entry_count == 0) {
+            const empty_msg = "(no subfolders)";
+            const empty_y = list_y + (list_h -| atlas.line_height) / 2;
+            fa.drawTextCentered(canvas, @intCast(list_x), @intCast(empty_y), list_w, empty_msg, palette.text_muted, atlas);
+        }
+
+        // Cancel + OK buttons
+        self.cancel_btn.drawStyled(canvas, .default, palette.card_bg);
+        self.ok_btn.drawStyled(canvas, .primary, palette.card_bg);
+    }
+};
+
+// --- Image picker (thumbnails) -------------------------------------------
+
+pub const ImagePickerAction = enum {
+    none,
+    /// User clicked Cancel or pressed Esc. Caller should `dismiss()` the
+    /// picker and discard the selection.
+    cancel,
+    /// User clicked OK with an image selected. Caller reads
+    /// `selectedName()` / current path and dismisses.
+    ok,
+    /// Folder changed (via the embedded folder picker's OK). Caller must
+    /// re-decode thumbnails for the new directory and update `thumbs`
+    /// before the next draw, then call `acknowledgeFolderChange()`.
+    folder_changed,
+};
+
+/// Caller-decoded thumbnail. Pixels are RGBA8 (one byte per channel),
+/// already scaled to roughly `thumb_w × thumb_h`. The picker doesn't
+/// own them — caller keeps them alive for the picker's lifetime (or at
+/// least until the next folder change).
+pub const Thumbnail = struct {
+    /// Filename (display label + identity). The caller derives the full
+    /// path by joining `currentDir()` + this name.
+    name: []const u8,
+    /// RGBA8 pixel data, already scaled to fit the thumbnail cell.
+    /// `null` = caller failed to decode; the picker renders a "broken"
+    /// placeholder for that slot.
+    pixels: ?[*]const u8 = null,
+    /// Source dimensions of `pixels` (what they were scaled to). The
+    /// picker centers them in the cell so any aspect ratio is fine.
+    w: u32 = 0,
+    h: u32 = 0,
+};
+
+/// Modal-overlay image picker — grid of thumbnails with a folder browse
+/// button. Same state-machine pattern as Dialog and FolderPicker, but
+/// rendering thumbnails requires the caller to decode them first (this
+/// library is libc/image-decoder-agnostic on purpose). Caller supplies
+/// the slice via `setThumbnails`; picker draws them in a 3×3 grid.
+///
+/// Typical wallpaper-picker flow:
+///   1. `pick = ImagePicker.init(w, h, "/share/");`
+///   2. Decode every image in /share/ into Thumbnail{} entries.
+///   3. `pick.setThumbnails(thumbs);`
+///   4. Each frame: `pick.draw(canvas, bg);`
+///   5. On click: `pick.handleClick(mx, my, left_now, left_prev)`.
+///      - `.folder_changed` → re-decode thumbnails for the new dir,
+///        call `setThumbnails(...)`, call `acknowledgeFolderChange()`.
+///      - `.ok` → read `pick.selectedName()` + join with
+///        `pick.currentDir()` to get the chosen path.
+///      - `.cancel` → drop the picker.
+pub const ImagePicker = struct {
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    title: []const u8,
+
+    /// Directory the thumbnails live in. Caller passes this into
+    /// `init`; updated by the embedded folder picker when the user
+    /// browses elsewhere.
+    dir_buf: [256]u8,
+    dir_len: u32,
+
+    /// Caller-owned slice. Empty = picker shows "no images" placeholder.
+    thumbs: []const Thumbnail,
+    selected: i32,
+
+    /// Embedded folder picker, only rendered when `browsing == true`.
+    /// We host it as a nested overlay so the image-picker stays modal
+    /// to its parent app and the folder-picker stays modal to the
+    /// image-picker — both dismiss back to the layer below.
+    browsing: bool,
+    folder_picker: FolderPicker,
+
+    /// Set when the embedded folder picker returned OK and the caller
+    /// hasn't yet refreshed `thumbs` for the new path. Caller reads
+    /// `currentDir()`, re-decodes, calls `setThumbnails` +
+    /// `acknowledgeFolderChange`.
+    folder_pending: bool,
+
+    browse_btn: Button,
+    cancel_btn: Button,
+    ok_btn: Button,
+
+    pub const padding: u32 = 16;
+    pub const cell_w: u32 = 130;
+    pub const cell_h: u32 = 110;
+    pub const cell_gap: u32 = 10;
+    pub const thumb_w: u32 = cell_w - 16;
+    pub const thumb_h: u32 = cell_h - 28; // leave room for filename below
+    pub const cols: u32 = 3;
+    pub const rows: u32 = 3;
+    pub const btn_h: u32 = 28;
+    pub const btn_w: u32 = 90;
+    pub const btn_gap: u32 = 10;
+
+    pub fn idealWidth() u32 {
+        return padding * 2 + cols * cell_w + (cols - 1) * cell_gap;
+    }
+    pub fn idealHeight() u32 {
+        // padding + title + breadcrumb row + rows * cell_h + breathing + btn row + padding
+        return padding + Canvas.CH16 + 10 + btn_h + 10 + rows * cell_h + (rows - 1) * cell_gap + 14 + btn_h + padding;
+    }
+
+    pub fn init(canvas_w: u32, canvas_h: u32, start_dir: []const u8) ImagePicker {
+        const wantw = idealWidth();
+        const wanth = idealHeight();
+        const w: u32 = @min(canvas_w -| 40, wantw);
+        const h: u32 = @min(canvas_h -| 40, wanth);
+        const x = (canvas_w -| w) / 2;
+        const y = (canvas_h -| h) / 6;
+
+        var ip: ImagePicker = .{
+            .x = x,
+            .y = y,
+            .w = w,
+            .h = h,
+            .title = "Choose image",
+            .dir_buf = undefined,
+            .dir_len = 0,
+            .thumbs = &[_]Thumbnail{},
+            .selected = -1,
+            .browsing = false,
+            .folder_picker = undefined,
+            .folder_pending = false,
+            .browse_btn = .{
+                .x = x + w - padding - 90,
+                .y = y + padding + Canvas.CH16 + 6,
+                .w = 90,
+                .h = btn_h,
+                .label = "Browse...",
+            },
+            .cancel_btn = .{
+                .x = x + w - padding - btn_w * 2 - btn_gap,
+                .y = y + h - padding - btn_h,
+                .w = btn_w,
+                .h = btn_h,
+                .label = "Cancel",
+            },
+            .ok_btn = .{
+                .x = x + w - padding - btn_w,
+                .y = y + h - padding - btn_h,
+                .w = btn_w,
+                .h = btn_h,
+                .label = "Apply",
+            },
+        };
+        ip.setDir(start_dir);
+        return ip;
+    }
+
+    pub fn currentDir(self: ImagePicker) []const u8 {
+        return self.dir_buf[0..self.dir_len];
+    }
+
+    pub fn setDir(self: *ImagePicker, p: []const u8) void {
+        if (p.len == 0 or p.len >= self.dir_buf.len) return;
+        @memcpy(self.dir_buf[0..p.len], p);
+        self.dir_len = @intCast(p.len);
+        if (self.dir_buf[self.dir_len - 1] != '/') {
+            self.dir_buf[self.dir_len] = '/';
+            self.dir_len += 1;
+        }
+        self.selected = -1;
+    }
+
+    /// Hand the picker a fresh slice of thumbnails (e.g. after a folder
+    /// change). Slice is owned by the caller; picker holds a reference.
+    pub fn setThumbnails(self: *ImagePicker, thumbs: []const Thumbnail) void {
+        self.thumbs = thumbs;
+        if (self.selected >= @as(i32, @intCast(thumbs.len))) self.selected = -1;
+    }
+
+    pub fn selectedName(self: ImagePicker) ?[]const u8 {
+        if (self.selected < 0) return null;
+        const idx: usize = @intCast(self.selected);
+        if (idx >= self.thumbs.len) return null;
+        return self.thumbs[idx].name;
+    }
+
+    /// Caller calls after refreshing thumbs in response to a
+    /// `.folder_changed` action.
+    pub fn acknowledgeFolderChange(self: *ImagePicker) void {
+        self.folder_pending = false;
+    }
+
+    pub fn handleClick(self: *ImagePicker, mx: i32, my: i32, left_now: bool, left_prev: bool) ImagePickerAction {
+        // Nested folder picker takes input precedence when open.
+        if (self.browsing) {
+            switch (self.folder_picker.handleClick(mx, my, left_now, left_prev)) {
+                .ok => {
+                    self.setDir(self.folder_picker.currentPath());
+                    self.browsing = false;
+                    self.folder_pending = true;
+                    return .folder_changed;
+                },
+                .cancel => {
+                    self.browsing = false;
+                    return .none;
+                },
+                else => return .none,
+            }
+        }
+
+        if (self.browse_btn.update(mx, my, left_now, left_prev)) {
+            self.folder_picker = FolderPicker.init(self.w + self.x * 2, self.h + self.y * 2, self.currentDir());
+            // Re-center the folder picker on the parent canvas rather
+            // than over the image-picker itself.
+            self.folder_picker.x = self.x + (self.w -| self.folder_picker.w) / 2;
+            self.folder_picker.y = self.y + (self.h -| self.folder_picker.h) / 2;
+            // Re-anchor the buttons too since they're computed from x/y.
+            self.folder_picker.up_btn.x = self.folder_picker.x + FolderPicker.padding;
+            self.folder_picker.up_btn.y = self.folder_picker.y + FolderPicker.padding + Canvas.CH16 + 6;
+            self.folder_picker.cancel_btn.x = self.folder_picker.x + self.folder_picker.w - FolderPicker.padding - FolderPicker.btn_w * 2 - FolderPicker.btn_gap;
+            self.folder_picker.cancel_btn.y = self.folder_picker.y + self.folder_picker.h - FolderPicker.padding - FolderPicker.btn_h;
+            self.folder_picker.ok_btn.x = self.folder_picker.x + self.folder_picker.w - FolderPicker.padding - FolderPicker.btn_w;
+            self.folder_picker.ok_btn.y = self.folder_picker.y + self.folder_picker.h - FolderPicker.padding - FolderPicker.btn_h;
+            self.browsing = true;
+            return .none;
+        }
+        if (self.cancel_btn.update(mx, my, left_now, left_prev)) return .cancel;
+        if (self.ok_btn.update(mx, my, left_now, left_prev)) return .ok;
+
+        // Cell hit-test — only on falling edge so the click feel matches
+        // Button.update.
+        if (!left_now and left_prev) {
+            const gx = self.gridX();
+            const gy = self.gridY();
+            const grid_w = cols * cell_w + (cols - 1) * cell_gap;
+            const grid_h = rows * cell_h + (rows - 1) * cell_gap;
+            const inside = mx >= @as(i32, @intCast(gx)) and mx < @as(i32, @intCast(gx + grid_w)) and
+                my >= @as(i32, @intCast(gy)) and my < @as(i32, @intCast(gy + grid_h));
+            if (inside) {
+                const rel_x: u32 = @intCast(mx - @as(i32, @intCast(gx)));
+                const rel_y: u32 = @intCast(my - @as(i32, @intCast(gy)));
+                const col_w_total = cell_w + cell_gap;
+                const row_h_total = cell_h + cell_gap;
+                const col = rel_x / col_w_total;
+                const row = rel_y / row_h_total;
+                if (col < cols and row < rows and (rel_x % col_w_total) < cell_w and (rel_y % row_h_total) < cell_h) {
+                    const idx = row * cols + col;
+                    if (idx < self.thumbs.len) {
+                        self.selected = @intCast(idx);
+                    }
+                }
+            }
+        }
+        return .none;
+    }
+
+    pub fn handleKey(self: *ImagePicker, ch: u8) ImagePickerAction {
+        if (self.browsing) {
+            switch (self.folder_picker.handleKey(ch)) {
+                .ok => {
+                    self.setDir(self.folder_picker.currentPath());
+                    self.browsing = false;
+                    self.folder_pending = true;
+                    return .folder_changed;
+                },
+                .cancel => {
+                    self.browsing = false;
+                    return .none;
+                },
+                else => return .none,
+            }
+        }
+        if (ch == 0x1B) return .cancel;
+        if (ch == '\n' or ch == '\r') return if (self.selected >= 0) .ok else .none;
+        return .none;
+    }
+
+    fn gridX(self: ImagePicker) u32 {
+        return self.x + padding;
+    }
+    fn gridY(self: ImagePicker) u32 {
+        return self.y + padding + Canvas.CH16 + 6 + btn_h + 14;
+    }
+
+    pub fn draw(self: ImagePicker, canvas: *Canvas, surrounding_bg: u32) void {
+        // Card surface — same vocabulary as Dialog/FolderPicker.
+        drawShadow(canvas, self.x, self.y, self.w, self.h, surrounding_bg);
+        canvas.fillRect(self.x, self.y, self.w, self.h, palette.card_bg);
+        drawRect1px(canvas, self.x, self.y, self.w, self.h, palette.card_border);
+        canvas.roundCorners(self.x, self.y, self.w, self.h, surrounding_bg);
+
+        const atlas = fa.getDefault16();
+        const title_y = self.y + padding;
+        fa.drawTextCentered(canvas, @intCast(self.x), @intCast(title_y), self.w, self.title, palette.text_strong, atlas);
+
+        // Browse + breadcrumb row
+        self.browse_btn.drawStyled(canvas, .default, palette.card_bg);
+        const crumb_y = self.browse_btn.y + (btn_h -| atlas.line_height) / 2;
+        canvas.drawText16Fg(self.x + padding, crumb_y, self.dir_buf[0..self.dir_len], palette.text_muted);
+
+        // Thumbnail grid
+        const gx = self.gridX();
+        const gy = self.gridY();
+        const grid_count = cols * rows;
+        var i: u32 = 0;
+        while (i < grid_count) : (i += 1) {
+            const col = i % cols;
+            const row = i / cols;
+            const cx = gx + col * (cell_w + cell_gap);
+            const cy = gy + row * (cell_h + cell_gap);
+
+            const is_sel = (self.selected >= 0 and @as(u32, @intCast(self.selected)) == i);
+            // Cell frame — slight tint, selected gets the primary color.
+            if (is_sel) {
+                canvas.fillRect(cx, cy, cell_w, cell_h, palette.btn_primary_top);
+            } else {
+                drawRect1px(canvas, cx, cy, cell_w, cell_h, palette.card_border);
+            }
+
+            if (i < self.thumbs.len) {
+                const t = self.thumbs[i];
+                // Thumbnail centered in the top region.
+                const tcell_x = cx + 8;
+                const tcell_y = cy + 6;
+                if (t.pixels) |px| {
+                    const draw_w = @min(t.w, thumb_w);
+                    const draw_h = @min(t.h, thumb_h);
+                    const off_x = (thumb_w -| draw_w) / 2;
+                    const off_y = (thumb_h -| draw_h) / 2;
+                    blitThumb(canvas, px, t.w, t.h, tcell_x + off_x, tcell_y + off_y, draw_w, draw_h);
+                } else {
+                    // Broken / not yet decoded — placeholder X.
+                    canvas.fillRect(tcell_x, tcell_y, thumb_w, thumb_h, palette.card_border);
+                    fa.drawTextCentered(canvas, @intCast(tcell_x), @intCast(tcell_y + thumb_h / 2 - atlas.line_height / 2), thumb_w, "?", palette.text_muted, atlas);
+                }
+                // Filename label below.
+                const label_color: u32 = if (is_sel) palette.card_bg else palette.text_normal;
+                const label_y = cy + thumb_h + 10;
+                fa.drawTextCentered(canvas, @intCast(cx), @intCast(label_y), cell_w, t.name, label_color, atlas);
+            }
+        }
+
+        if (self.thumbs.len == 0) {
+            const empty = "(no images in this folder)";
+            const em_y = gy + (rows * cell_h + (rows - 1) * cell_gap) / 2 - atlas.line_height / 2;
+            fa.drawTextCentered(canvas, @intCast(gx), @intCast(em_y), cols * cell_w + (cols - 1) * cell_gap, empty, palette.text_muted, atlas);
+        }
+
+        // Buttons
+        self.cancel_btn.drawStyled(canvas, .default, palette.card_bg);
+        const ok_style: ButtonStyle = if (self.selected >= 0) .primary else .default;
+        self.ok_btn.drawStyled(canvas, ok_style, palette.card_bg);
+
+        // Nested folder picker overlays everything else when active.
+        if (self.browsing) self.folder_picker.draw(canvas, surrounding_bg);
+    }
+};
+
+fn blitThumb(canvas: *Canvas, src: [*]const u8, sw: u32, sh: u32, dx: u32, dy: u32, dw: u32, dh: u32) void {
+    if (dw == 0 or dh == 0 or sw == 0 or sh == 0) return;
+    var y: u32 = 0;
+    while (y < dh) : (y += 1) {
+        const sy: u32 = (y * sh) / dh;
+        const src_row = @as(usize, sy) * sw * 4;
+        var x: u32 = 0;
+        while (x < dw) : (x += 1) {
+            const sx: u32 = (x * sw) / dw;
+            const sidx = src_row + @as(usize, sx) * 4;
+            const r: u32 = src[sidx + 0];
+            const g: u32 = src[sidx + 1];
+            const b: u32 = src[sidx + 2];
+            canvas.putPixel(@intCast(dx + x), @intCast(dy + y), (r << 16) | (g << 8) | b);
+        }
+    }
+}

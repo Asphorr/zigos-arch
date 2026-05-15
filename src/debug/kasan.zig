@@ -84,6 +84,18 @@ pub fn isShadowAddr(addr: usize) bool {
 pub fn init() void {
     const pmm = @import("../mm/pmm.zig");
     const debug = @import("debug.zig");
+    const build_options = @import("build_options");
+
+    // Build-time opt-out. Compile-time-folded so the shadow alloc and the
+    // hot-path callers (allocFrame's unpoison, etc.) compile away entirely
+    // when the flag is off. On 128 MB QEMU the 32 MB shadow is the single
+    // biggest user of contiguous PMM; disabling it frees the room needed
+    // for big-bitmap user apps (wallpaper.elf, photo.elf) to run without
+    // hitting fragmentation.
+    if (!build_options.kasan_enabled) {
+        debug.klog("[kasan] disabled at build time (-Dkasan=false); skipping shadow alloc\n", .{});
+        return;
+    }
 
     const num_pages: u32 = @intCast(SHADOW_SIZE >> 12);
     debug.klog("[kasan] init: requesting {d} contiguous pages ({d} KB)\n", .{ num_pages, SHADOW_SIZE >> 10 });

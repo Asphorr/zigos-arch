@@ -462,17 +462,19 @@ fn tryComplete(buf: *[MAX_LINE]u8, len: *usize, pos: *usize) void {
 
 // --- Help registry ---
 //
-// Tree-shaped: bare `help` lists the top-level categories with one-line
-// summaries; `help <category>` expands that category's entries. Adding
-// a new command means appending one line to `help_entries` — never
-// touching the printers.
+// Tree-shaped: bare `help` shows all categories with their entries inline.
+// `help <category>` re-prints just that category. `help <command>` prints
+// the long-form (synopsis + description + example) for commands that have
+// one registered, otherwise falls back to the one-line summary.
 //
-// Categories are kept short (4-6) so the bare-help screen always fits
-// without scrolling. If we cross 8 categories that's the trigger to
-// re-bucket rather than silently let it grow into an unscannable wall.
+// Adding a new command = one line in `help_entries`. Adding a long-form
+// entry = one line in `help_long`. Categories are colored so the eye can
+// chunk the bare-help screen without re-reading every word.
 
 const HelpCategory = struct {
     name: []const u8,
+    /// ANSI SGR color number (no escape framing — just the digits).
+    color: []const u8,
     summary: []const u8,
 };
 
@@ -482,110 +484,258 @@ const HelpEntry = struct {
     summary: []const u8,
 };
 
+const HelpLong = struct {
+    /// Bare command name (no args) — what the user types after `help`.
+    name: []const u8,
+    synopsis: []const u8,
+    description: []const u8,
+    /// One or more example lines. Each line is prefixed with "  " on print.
+    example: []const u8,
+};
+
 const help_categories = [_]HelpCategory{
-    .{ .name = "builtins", .summary = "shell built-ins (help, clear, cd, pwd, exit)" },
-    .{ .name = "tools",    .summary = "command-line utilities (ls, cat, echo, wc, grep, head)" },
-    .{ .name = "syntax",   .summary = "pipelines and redirection" },
-    .{ .name = "keys",     .summary = "input editing keys" },
+    .{ .name = "builtins",   .color = "36", .summary = "shell built-ins" },
+    .{ .name = "filesystem", .color = "33", .summary = "files and directories" },
+    .{ .name = "text",       .color = "32", .summary = "text processing" },
+    .{ .name = "process",    .color = "35", .summary = "process control" },
+    .{ .name = "system",     .color = "96", .summary = "system info and devices" },
+    .{ .name = "network",    .color = "34", .summary = "TCP, DNS, HTTP" },
+    .{ .name = "syntax",     .color = "37", .summary = "pipelines and redirection" },
+    .{ .name = "keys",       .color = "90", .summary = "line-editing keys" },
 };
 
 const help_entries = [_]HelpEntry{
-    .{ .category = "builtins", .name = "help [cat]",        .summary = "list categories, or expand one" },
-    .{ .category = "builtins", .name = "clear",             .summary = "clear the screen" },
-    .{ .category = "builtins", .name = "cd [path]",         .summary = "change directory (no arg = /)" },
-    .{ .category = "builtins", .name = "pwd",               .summary = "print working directory" },
-    .{ .category = "builtins", .name = "q, exit",           .summary = "leave the shell" },
+    .{ .category = "builtins",   .name = "help [target]",       .summary = "list everything, or expand a category/command" },
+    .{ .category = "builtins",   .name = "clear",               .summary = "clear the screen" },
+    .{ .category = "builtins",   .name = "cd [path]",           .summary = "change directory (no arg = /)" },
+    .{ .category = "builtins",   .name = "pwd",                 .summary = "print working directory" },
+    .{ .category = "builtins",   .name = "q, exit",             .summary = "leave the shell" },
 
-    .{ .category = "tools",    .name = "ls",                .summary = "list files in the current directory" },
-    .{ .category = "tools",    .name = "cat [file]",        .summary = "print a file (or stdin if no arg)" },
-    .{ .category = "tools",    .name = "echo <text>",       .summary = "print text + newline" },
-    .{ .category = "tools",    .name = "wc",                .summary = "count bytes/lines on stdin" },
-    .{ .category = "tools",    .name = "grep <pattern>",    .summary = "filter stdin lines containing pattern" },
-    .{ .category = "tools",    .name = "head [N]",          .summary = "first N lines from stdin (default 10)" },
-    .{ .category = "tools",    .name = "pipetest",          .summary = "pipe round-trip self-test" },
+    .{ .category = "filesystem", .name = "ls",                  .summary = "list files in the current directory" },
+    .{ .category = "filesystem", .name = "mkdir <dir>",         .summary = "create a directory" },
+    .{ .category = "filesystem", .name = "rmdir <dir>",         .summary = "remove an empty directory" },
+    .{ .category = "filesystem", .name = "rm <file>",           .summary = "remove a file" },
+    .{ .category = "filesystem", .name = "touch <file>",        .summary = "create an empty file / update mtime" },
 
-    .{ .category = "syntax",   .name = "cmd1 | cmd2 | cmd3", .summary = "pipeline (up to 4 stages)" },
-    .{ .category = "syntax",   .name = "cmd > file",         .summary = "redirect stdout to file (truncate)" },
-    .{ .category = "syntax",   .name = "cmd >> file",        .summary = "redirect stdout to file (append)" },
-    .{ .category = "syntax",   .name = "cmd < file",         .summary = "read stdin from file" },
+    .{ .category = "text",       .name = "cat [file]",          .summary = "print a file (or stdin if no arg)" },
+    .{ .category = "text",       .name = "echo <text>",         .summary = "print text + newline" },
+    .{ .category = "text",       .name = "grep <pattern>",      .summary = "filter stdin lines containing pattern" },
+    .{ .category = "text",       .name = "head [N]",            .summary = "first N lines from stdin (default 10)" },
+    .{ .category = "text",       .name = "wc",                  .summary = "count bytes/lines on stdin" },
 
-    .{ .category = "keys",     .name = "left/right",         .summary = "move cursor by character" },
-    .{ .category = "keys",     .name = "home/end",           .summary = "jump to start/end of line" },
-    .{ .category = "keys",     .name = "del/backspace",      .summary = "delete character" },
-    .{ .category = "keys",     .name = "up/down",            .summary = "navigate command history" },
-    .{ .category = "keys",     .name = "tab",                .summary = "tab completion" },
+    .{ .category = "process",    .name = "ps",                  .summary = "list running processes" },
+    .{ .category = "process",    .name = "sleep <seconds>",     .summary = "sleep for N seconds" },
+    .{ .category = "process",    .name = "yes [text]",          .summary = "spam text forever (pipe-able)" },
+    .{ .category = "process",    .name = "nice <prio> <cmd>",   .summary = "run cmd at low priority" },
+    .{ .category = "process",    .name = "taskset <mask> <cmd>",.summary = "pin cmd to CPU set" },
+
+    .{ .category = "system",     .name = "fastfetch",           .summary = "system summary with logo" },
+    .{ .category = "system",     .name = "sysmon",              .summary = "live CPU + memory bars (window)" },
+    .{ .category = "system",     .name = "zigtop",              .summary = "top-style process viewer" },
+    .{ .category = "system",     .name = "dmesg",               .summary = "print the kernel log" },
+    .{ .category = "system",     .name = "about",               .summary = "build/version info" },
+    .{ .category = "system",     .name = "shutdown",            .summary = "halt the machine" },
+    .{ .category = "system",     .name = "usbinfo",             .summary = "list USB devices" },
+    .{ .category = "system",     .name = "usbcat <ep>",         .summary = "read from a USB bulk endpoint" },
+    .{ .category = "system",     .name = "usbwrite <ep>",       .summary = "write to a USB bulk endpoint" },
+
+    .{ .category = "network",    .name = "wget <url>",          .summary = "download to stdout" },
+    .{ .category = "network",    .name = "nslookup <host>",     .summary = "resolve a hostname" },
+    .{ .category = "network",    .name = "nc <host> <port>",    .summary = "TCP connect, bidirectional stdio" },
+    .{ .category = "network",    .name = "httpd [-d]",          .summary = "static-file server on :8080" },
+    .{ .category = "network",    .name = "netstat",             .summary = "interfaces, sockets, ARP cache" },
+
+    .{ .category = "syntax",     .name = "a | b | c",           .summary = "pipeline (up to 4 stages)" },
+    .{ .category = "syntax",     .name = "cmd > file",          .summary = "redirect stdout (truncate)" },
+    .{ .category = "syntax",     .name = "cmd >> file",         .summary = "redirect stdout (append)" },
+    .{ .category = "syntax",     .name = "cmd < file",          .summary = "read stdin from file" },
+
+    .{ .category = "keys",       .name = "left/right",          .summary = "move cursor by character" },
+    .{ .category = "keys",       .name = "home/end",            .summary = "jump to start/end of line" },
+    .{ .category = "keys",       .name = "del/backspace",       .summary = "delete character" },
+    .{ .category = "keys",       .name = "up/down",             .summary = "navigate command history" },
+    .{ .category = "keys",       .name = "tab",                 .summary = "complete command or filename" },
+};
+
+const help_long = [_]HelpLong{
+    .{ .name = "ls",        .synopsis = "ls",                .description = "List files in the current directory. Bytes for files, '<dir>' marker for directories.", .example = "ls\nls | grep .txt" },
+    .{ .name = "cat",       .synopsis = "cat [file]",        .description = "Print a file to stdout. With no argument, copies stdin to stdout (Ctrl+C to stop).", .example = "cat /etc/motd\necho hello | cat" },
+    .{ .name = "echo",      .synopsis = "echo <text>",       .description = "Print the arguments separated by spaces, followed by a newline.", .example = "echo hello world > greeting.txt" },
+    .{ .name = "grep",      .synopsis = "grep <pattern>",    .description = "Read stdin, write lines that contain pattern (literal substring, no regex yet).", .example = "dmesg | grep CPU\nls | grep .elf" },
+    .{ .name = "head",      .synopsis = "head [N]",          .description = "Copy the first N lines of stdin to stdout (default N = 10).", .example = "dmesg | head 20" },
+    .{ .name = "wc",        .synopsis = "wc",                .description = "Read stdin and print line, word, and byte counts.", .example = "cat README | wc\nls | wc" },
+    .{ .name = "ps",        .synopsis = "ps",                .description = "List processes: pid, state (R/Q/S/Z), CPU, command.", .example = "ps" },
+    .{ .name = "dmesg",     .synopsis = "dmesg",             .description = "Dump the kernel ring buffer (boot log + runtime klog).", .example = "dmesg | grep -- '[CPU'\ndmesg | head 50" },
+    .{ .name = "fastfetch", .synopsis = "fastfetch",         .description = "Print a system summary: kernel build, uptime, CPU, memory, color test.", .example = "fastfetch" },
+    .{ .name = "nc",        .synopsis = "nc <host> <port>",  .description = "Open a TCP connection and bridge stdin/stdout to it. Host can be IPv4 or a name (resolved via DNS).", .example = "nc 10.0.2.2 80\necho 'GET / HTTP/1.0\\r\\n\\r\\n' | nc example.com 80" },
 };
 
 /// Width of the left column (command name) when expanding a category.
 /// Sized so the longest registered name still leaves a clean gap before
 /// the summary. Recompute here if we add any name longer than ~22 chars.
-const HELP_COL_W: usize = 22;
+const HELP_COL_W: usize = 24;
 
-/// Bare `help`: print categories + a usage hint at the bottom. ANSI
-/// bold for category names, dim for their summaries; matches what the
-/// expanded view does for command names so the eye reads the two
-/// screens consistently.
+/// Width of the framed rule line printed above each category. 36 cells
+/// wide so 80-col terminals have plenty of trailing room and shorter
+/// names get a consistent visual block.
+const RULE_W: usize = 36;
+
+/// Print a colored rule line, like `\x1b[36m-- builtins -----...\x1b[0m`.
+/// The 3-char "-- " prefix + name + space + trailing dashes always sums
+/// to RULE_W, so all rules look like a single column from the eye's view.
+fn printRule(color: []const u8, name: []const u8) void {
+    libc.print("\x1b[");
+    libc.print(color);
+    libc.print("m-- ");
+    libc.print(name);
+    libc.printChar(' ');
+    var used: usize = 4 + name.len;
+    while (used < RULE_W) : (used += 1) libc.printChar('-');
+    libc.print("\x1b[0m\n");
+}
+
+/// Pad with spaces from `col` to `width`. Caller already wrote `col` chars.
+fn padTo(col: usize, width: usize) void {
+    var i: usize = col;
+    while (i < width) : (i += 1) libc.printChar(' ');
+}
+
+/// Print one `  name  summary` row for a help entry.
+fn printEntryRow(name: []const u8, summary: []const u8) void {
+    libc.print("  \x1b[1m");
+    libc.print(name);
+    libc.print("\x1b[0m");
+    padTo(2 + name.len, 2 + HELP_COL_W);
+    libc.print("\x1b[2m");
+    libc.print(summary);
+    libc.print("\x1b[0m\n");
+}
+
+/// Print every entry under `cat_name` in registration order.
+fn printCategoryBody(cat_name: []const u8) void {
+    for (help_entries) |e| {
+        if (!equals(e.category, cat_name)) continue;
+        printEntryRow(e.name, e.summary);
+    }
+}
+
+/// Lookup helpers — return null on miss; callers branch on the option.
+fn findCategory(name: []const u8) ?HelpCategory {
+    for (help_categories) |c| {
+        if (equals(name, c.name)) return c;
+    }
+    return null;
+}
+
+fn findLong(name: []const u8) ?HelpLong {
+    for (help_long) |l| {
+        if (equals(name, l.name)) return l;
+    }
+    return null;
+}
+
+fn findEntry(name: []const u8) ?HelpEntry {
+    for (help_entries) |e| {
+        // Match against the first whitespace-delimited token of e.name so
+        // "cat" matches the registered "cat [file]".
+        var end: usize = 0;
+        while (end < e.name.len and e.name[end] != ' ' and e.name[end] != ',') : (end += 1) {}
+        if (equals(name, e.name[0..end])) return e;
+    }
+    return null;
+}
+
+/// Bare `help`: print all categories framed inline. The whole tree fits
+/// in roughly 60 lines; the user can also pipe through `head` if they
+/// only want the top sections.
 fn printHelpRoot() void {
-    libc.print("\x1b[1mZigOS shell help\x1b[0m\n");
-    libc.print("  Use \x1b[1mhelp <category>\x1b[0m to expand a section.\n\n");
-    libc.print("\x1b[1mCategories\x1b[0m\n");
+    libc.print("\x1b[1;36m=== ZigOS shell help ===\x1b[0m\n");
+    libc.print("  \x1b[2mhelp <category>\x1b[0m to re-print one section\n");
+    libc.print("  \x1b[2mhelp <command>\x1b[0m  for synopsis + example\n");
+    libc.print("  \x1b[2mTab\x1b[0m completes commands and filenames\n\n");
     for (help_categories) |cat| {
-        libc.print("  \x1b[1m");
-        libc.print(cat.name);
-        libc.print("\x1b[0m");
-        // Pad to column width
-        var i: usize = cat.name.len;
-        while (i < 12) : (i += 1) libc.printChar(' ');
-        libc.print("\x1b[2m");
-        libc.print(cat.summary);
+        printRule(cat.color, cat.name);
+        printCategoryBody(cat.name);
+        libc.printChar('\n');
+    }
+    libc.print("\x1b[2mTip: type `help <command>` for any of: ");
+    for (help_long, 0..) |l, i| {
+        if (i > 0) libc.print(", ");
+        libc.print(l.name);
+    }
+    libc.print(".\x1b[0m\n");
+}
+
+/// `help <category>`: re-print just that section with its rule.
+fn printHelpCategory(cat: HelpCategory) void {
+    printRule(cat.color, cat.name);
+    libc.print("  \x1b[2m");
+    libc.print(cat.summary);
+    libc.print("\x1b[0m\n\n");
+    printCategoryBody(cat.name);
+}
+
+/// `help <command>`: long-form for registered commands; one-liner fallback
+/// for entries that only have a summary registered.
+fn printHelpCommand(long: HelpLong) void {
+    libc.print("\x1b[1m");
+    libc.print(long.synopsis);
+    libc.print("\x1b[0m\n\n  ");
+    libc.print(long.description);
+    libc.print("\n\n\x1b[2mExample:\x1b[0m\n");
+    // example field may contain multiple lines separated by '\n'. Indent each.
+    var start: usize = 0;
+    for (long.example, 0..) |c, i| {
+        if (c == '\n') {
+            libc.print("  \x1b[36m");
+            libc.print(long.example[start..i]);
+            libc.print("\x1b[0m\n");
+            start = i + 1;
+        }
+    }
+    if (start < long.example.len) {
+        libc.print("  \x1b[36m");
+        libc.print(long.example[start..]);
         libc.print("\x1b[0m\n");
     }
 }
 
-/// `help <category>`: expand one category. Falls back to the root view
-/// with a "no such category" hint if the name doesn't match.
-fn printHelpCategory(name: []const u8) void {
-    // Match category by name.
-    var found: ?HelpCategory = null;
-    for (help_categories) |cat| {
-        if (equals(name, cat.name)) {
-            found = cat;
-            break;
-        }
-    }
-    if (found == null) {
-        libc.print("\x1b[31mhelp: no such category '");
-        libc.print(name);
-        libc.print("'\x1b[0m\n\n");
-        printHelpRoot();
-        return;
-    }
+/// Print "command — summary" for an entry that has no long-form registered.
+fn printHelpShort(e: HelpEntry) void {
     libc.print("\x1b[1m");
-    libc.print(found.?.name);
+    libc.print(e.name);
     libc.print("\x1b[0m  \x1b[2m");
-    libc.print(found.?.summary);
+    libc.print(e.summary);
     libc.print("\x1b[0m\n");
-    for (help_entries) |e| {
-        if (!equals(e.category, name)) continue;
-        libc.print("  \x1b[1m");
-        libc.print(e.name);
-        libc.print("\x1b[0m");
-        var i: usize = e.name.len;
-        while (i < HELP_COL_W) : (i += 1) libc.printChar(' ');
-        libc.print("\x1b[2m");
-        libc.print(e.summary);
-        libc.print("\x1b[0m\n");
-    }
+    libc.print("\n  \x1b[2m(no long-form yet — `help ");
+    libc.print(e.category);
+    libc.print("` for siblings)\x1b[0m\n");
 }
 
 /// Top-level `help` dispatcher. `arg` is the trimmed argument (empty for
-/// bare `help`).
+/// bare `help`). Resolution order: category > long-form command > short
+/// entry > error.
 fn runHelp(arg: []const u8) void {
     if (arg.len == 0) {
         printHelpRoot();
-    } else {
-        printHelpCategory(arg);
+        return;
     }
+    if (findCategory(arg)) |cat| {
+        printHelpCategory(cat);
+        return;
+    }
+    if (findLong(arg)) |long| {
+        printHelpCommand(long);
+        return;
+    }
+    if (findEntry(arg)) |e| {
+        printHelpShort(e);
+        return;
+    }
+    libc.print("\x1b[31mhelp: no such topic '");
+    libc.print(arg);
+    libc.print("'\x1b[0m\n");
+    libc.print("\x1b[2mTry bare `help` for the index.\x1b[0m\n");
 }
 
 /// `cd [path]` built-in. With no argument, jumps to the default home (`/`,

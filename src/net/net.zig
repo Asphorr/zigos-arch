@@ -37,7 +37,6 @@ const TCP_SYN: u8 = 0x02;
 const TCP_RST: u8 = 0x04;
 const TCP_PSH: u8 = 0x08;
 const TCP_ACK: u8 = 0x10;
-const TCP_WINDOW: u16 = 4096;
 const TCP_MAX_CONNS = 16;
 const TCP_MAX_LISTENERS = 4;
 const TCP_RX_BUF_SIZE = 8192;
@@ -47,14 +46,39 @@ const TCP_NO_LISTENER: u8 = 0xFF;
 // Per-listener ring of accepted-but-not-yet-handed-out connection slots.
 const TCP_ACCEPT_RING_SIZE: u8 = 4;
 
-// Network config (QEMU user-mode networking)
-const GUEST_IP = [_]u8{ 10, 0, 2, 15 };
-const GATEWAY_IP = [_]u8{ 10, 0, 2, 2 };
-const DNS_SERVER = [_]u8{ 10, 0, 2, 3 };
+// Active network config. Initial values match QEMU SLIRP — the user-mode
+// networking DHCP server offers exactly these — so the stack still works
+// without DHCP (e.g. if `dhcp.acquire` is skipped or times out). Replaced
+// at boot by `applyDhcpLease()` once DHCP completes.
+pub var local_ip: [4]u8 = .{ 10, 0, 2, 15 };
+pub var gateway_ip: [4]u8 = .{ 10, 0, 2, 2 };
+pub var dns_ip: [4]u8 = .{ 10, 0, 2, 3 };
+pub var subnet_mask: [4]u8 = .{ 255, 255, 255, 0 };
+/// True once `applyDhcpLease()` has been called at least once. `false`
+/// means we're running on the static SLIRP defaults — visible to netstat /
+/// fastfetch / etc.
+pub var dhcp_configured: bool = false;
+/// Seconds remaining on the current lease, when known. 0 = unknown / static.
+pub var dhcp_lease_secs: u32 = 0;
 
 // ARP cache
 var gateway_mac: [6]u8 = .{ 0, 0, 0, 0, 0, 0 };
 var gateway_mac_valid: bool = false;
+
+/// Called by the DHCP module on a successful lease. Replaces the active
+/// triple; also invalidates the cached gateway MAC because the new gateway
+/// might be on a different L2 host. Subnet mask is stored for future
+/// route-table work but unused today (we route everything via the gateway).
+pub fn applyDhcpLease(new_ip: [4]u8, new_gw: [4]u8, new_mask: [4]u8, new_dns: [4]u8, lease_secs: u32) void {
+    local_ip = new_ip;
+    gateway_ip = new_gw;
+    subnet_mask = new_mask;
+    dns_ip = new_dns;
+    dhcp_configured = true;
+    dhcp_lease_secs = lease_secs;
+    gateway_mac_valid = false;
+    gateway_mac = .{ 0, 0, 0, 0, 0, 0 };
+}
 
 // IP identification counter
 var ip_id: u16 = 1;
@@ -103,6 +127,23 @@ fn internetChecksum(data: []const u8) u16 {
     return @intCast(~sum & 0xFFFF);
 }
 
+/// True if the address is in 127.0.0.0/8. Loopback bypasses ARP and the
+/// NIC entirely — packets are stamped with src = dst (so both endpoints
+/// see themselves as the peer 127.x address) and re-injected into the RX
+/// dispatcher. Without the src-rewrite, the 4-tuple TCP conn lookup on
+/// the originator side wouldn't match the reply (it would see src=
+/// local_ip but its `remote_ip` is 127.x).
+pub fn isLoopback(ip: [4]u8) bool {
+    return ip[0] == 127;
+}
+
+/// Pick the IP to stamp as src on an outbound packet. For loopback we
+/// mirror the destination so the receive side's conn-tuple match works
+/// in both directions.
+fn outboundSrcIp(dst_ip: [4]u8) [4]u8 {
+    return if (isLoopback(dst_ip)) dst_ip else local_ip;
+}
+
 fn buildIPv4Header(buf: []u8, protocol: u8, dst_ip: [4]u8, payload_len: u16) void {
     const total_len: u16 = IPV4_HDR_SIZE + payload_len;
     buf[0] = 0x45;
@@ -116,11 +157,26 @@ fn buildIPv4Header(buf: []u8, protocol: u8, dst_ip: [4]u8, payload_len: u16) voi
     buf[9] = protocol;
     buf[10] = 0;
     buf[11] = 0;
-    @memcpy(buf[12..16], &GUEST_IP);
+    const src_ip = outboundSrcIp(dst_ip);
+    @memcpy(buf[12..16], &src_ip);
     @memcpy(buf[16..20], &dst_ip);
     const csum = internetChecksum(buf[0..IPV4_HDR_SIZE]);
     buf[10] = @intCast(csum >> 8);
     buf[11] = @intCast(csum & 0xFF);
+}
+
+/// Final send-side hop: loopback addresses bypass the NIC and recurse
+/// straight into the RX dispatcher; everything else hits the wire.
+/// Used by udpSend and sendTcpPacket so the loopback policy lives in
+/// exactly one place. Caller has already built the full Ethernet+IP+L4
+/// frame in `pkt`.
+fn dispatchPacket(dst_ip: [4]u8, pkt: []u8) bool {
+    if (isLoopback(dst_ip)) {
+        const vptr: [*]volatile u8 = @ptrCast(pkt.ptr);
+        handleRxFrame(vptr[0..pkt.len]);
+        return true;
+    }
+    return nic.send(pkt);
 }
 
 fn tcpChecksum(src_ip: [4]u8, dst_ip: [4]u8, tcp_data: []const u8) u16 {
@@ -169,12 +225,36 @@ pub fn udpUnlisten(slot: u8) void {
     if (slot < 4) udp_listeners[slot].active = false;
 }
 
+/// True if a packet has been buffered and not yet consumed. Caller can
+/// then read via `udpData()` and free the buffer via `udpConsume()`.
+/// Three-step (has/data/consume) instead of one-shot so the buffer stays
+/// pinned during the caller's parse — handleUdpPacket only writes when
+/// `!has_data`, so leaving has_data true keeps subsequent packets out.
+pub fn udpHasData(slot: u8) bool {
+    if (slot >= udp_listeners.len) return false;
+    return udp_listeners[slot].has_data;
+}
+
+pub fn udpData(slot: u8) []const u8 {
+    if (slot >= udp_listeners.len) return &[_]u8{};
+    const l = &udp_listeners[slot];
+    if (!l.has_data) return &[_]u8{};
+    return l.data[0..l.data_len];
+}
+
+pub fn udpConsume(slot: u8) void {
+    if (slot >= udp_listeners.len) return;
+    udp_listeners[slot].has_data = false;
+}
+
 pub fn udpSend(dst_ip: [4]u8, dst_port: u16, src_port: u16, payload: []const u8) bool {
-    if (!arpResolveGateway()) return false;
     if (payload.len > 1400) return false;
+    const loop = isLoopback(dst_ip);
+    if (!loop and !arpResolveGateway()) return false;
     var pkt: [1514]u8 = undefined;
     const src_mac = nic.getMac();
-    buildEthHeader(&pkt, gateway_mac, src_mac, ETHERTYPE_IPV4);
+    const dst_mac = if (loop) src_mac else gateway_mac;
+    buildEthHeader(&pkt, dst_mac, src_mac, ETHERTYPE_IPV4);
     const udp_total: u16 = @intCast(UDP_HDR_SIZE + payload.len);
     buildIPv4Header(pkt[ETH_HDR_SIZE..], IPPROTO_UDP, dst_ip, udp_total);
     const udp = pkt[ETH_HDR_SIZE + IPV4_HDR_SIZE ..];
@@ -185,7 +265,44 @@ pub fn udpSend(dst_ip: [4]u8, dst_port: u16, src_port: u16, payload: []const u8)
     udp[7] = 0; // checksum optional for IPv4
     @memcpy(udp[UDP_HDR_SIZE..][0..payload.len], payload);
     const total: usize = ETH_HDR_SIZE + IPV4_HDR_SIZE + udp_total;
-    return nic.send(pkt[0..total]);
+    return dispatchPacket(dst_ip, pkt[0..total]);
+}
+
+/// L2/L3 broadcast send: dst MAC = ff:ff:ff:ff:ff:ff, src IP = 0.0.0.0,
+/// dst IP = 255.255.255.255. Bypasses `arpResolveGateway()` because DHCP
+/// DISCOVER runs before we know the gateway. Used by `dhcp.zig` only —
+/// every other UDP send path should go through `udpSend()`.
+pub fn udpSendBroadcast(src_port: u16, dst_port: u16, payload: []const u8) bool {
+    if (payload.len > 1400) return false;
+    var pkt: [1514]u8 = undefined;
+    const src_mac = nic.getMac();
+    buildEthHeader(&pkt, BROADCAST_MAC, src_mac, ETHERTYPE_IPV4);
+
+    const udp_total: u16 = @intCast(UDP_HDR_SIZE + payload.len);
+    const ip = pkt[ETH_HDR_SIZE..];
+    ip[0] = 0x45;
+    ip[1] = 0;
+    writeU16BE(ip[2..4], IPV4_HDR_SIZE + udp_total);
+    writeU16BE(ip[4..6], ip_id);
+    ip_id +%= 1;
+    ip[6] = 0x40;
+    ip[7] = 0;
+    ip[8] = 64;
+    ip[9] = IPPROTO_UDP;
+    ip[10] = 0; ip[11] = 0;
+    @memset(ip[12..16], 0);    // src = 0.0.0.0
+    @memset(ip[16..20], 0xFF); // dst = 255.255.255.255
+    const csum = internetChecksum(ip[0..IPV4_HDR_SIZE]);
+    ip[10] = @intCast(csum >> 8);
+    ip[11] = @intCast(csum & 0xFF);
+
+    const udp = pkt[ETH_HDR_SIZE + IPV4_HDR_SIZE ..];
+    writeU16BE(udp[0..2], src_port);
+    writeU16BE(udp[2..4], dst_port);
+    writeU16BE(udp[4..6], udp_total);
+    udp[6] = 0; udp[7] = 0;
+    @memcpy(udp[UDP_HDR_SIZE..][0..payload.len], payload);
+    return nic.send(pkt[0 .. ETH_HDR_SIZE + IPV4_HDR_SIZE + udp_total]);
 }
 
 fn handleUdpPacket(ip_data: []volatile u8, ihl: usize) void {
@@ -274,7 +391,7 @@ pub fn resolve(hostname: []const u8) ?[4]u8 {
     qlen += 2;
 
     debug.klog("[dns] Sending query for {s} on port {d}, len={d}\n", .{ hostname, dns_local_port -% 1, qlen });
-    if (!udpSend(DNS_SERVER, DNS_PORT, dns_local_port -% 1, query[0..qlen])) {
+    if (!udpSend(dns_ip, DNS_PORT, dns_local_port -% 1, query[0..qlen])) {
         debug.klog("[dns] UDP send failed\n", .{});
         return null;
     }
@@ -411,10 +528,12 @@ fn enqueueAccepted(lst: *TcpListener, conn_slot: u8) void {
 }
 
 fn sendTcpPacket(conn: *TcpConn, flags: u8, payload: ?[]const u8, include_mss: bool) bool {
-    if (!arpResolveGateway()) return false;
+    const loop = isLoopback(conn.remote_ip);
+    if (!loop and !arpResolveGateway()) return false;
     var pkt: [1514]u8 = undefined;
     const src_mac = nic.getMac();
-    buildEthHeader(&pkt, gateway_mac, src_mac, ETHERTYPE_IPV4);
+    const dst_mac = if (loop) src_mac else gateway_mac;
+    buildEthHeader(&pkt, dst_mac, src_mac, ETHERTYPE_IPV4);
 
     const tcp_hdr_len: u16 = if (include_mss) 24 else 20;
     const payload_len: u16 = if (payload) |p| @intCast(p.len) else 0;
@@ -427,7 +546,13 @@ fn sendTcpPacket(conn: *TcpConn, flags: u8, payload: ?[]const u8, include_mss: b
     writeU32BE(tcp[8..12], if (flags & TCP_ACK != 0) conn.rcv_nxt else 0);
     tcp[12] = if (include_mss) (6 << 4) else (5 << 4); // data offset
     tcp[13] = flags;
-    writeU16BE(tcp[14..16], TCP_WINDOW);
+    // Advertise the actual current free space in the receive ring. Static
+    // 4 KB used to silently truncate streams when the app was slow to drain
+    // (peer happily kept sending, packets after the ring fill were dropped).
+    // Now: if the app drained from 8 KB→4 KB, the next ACK we send tells the
+    // peer the window is 4 KB; if it's full, the peer back-pressures.
+    const free_window: u16 = @intCast(TCP_RX_BUF_SIZE - conn.rx_count);
+    writeU16BE(tcp[14..16], free_window);
     tcp[16] = 0;
     tcp[17] = 0; // checksum placeholder
     tcp[18] = 0;
@@ -444,9 +569,12 @@ fn sendTcpPacket(conn: *TcpConn, flags: u8, payload: ?[]const u8, include_mss: b
         @memcpy(tcp[off..][0..p.len], p);
     }
 
-    // TCP checksum
+    // TCP checksum uses the IP-layer src/dst — for loopback that's the
+    // mirrored 127.x address, not local_ip. Matches what buildIPv4Header
+    // just stamped so the receiver's pseudo-header checksum validates.
     const tcp_total: usize = tcp_hdr_len + payload_len;
-    const csum = tcpChecksum(GUEST_IP, conn.remote_ip, tcp[0..tcp_total]);
+    const src_for_csum = outboundSrcIp(conn.remote_ip);
+    const csum = tcpChecksum(src_for_csum, conn.remote_ip, tcp[0..tcp_total]);
     tcp[16] = @intCast(csum >> 8);
     tcp[17] = @intCast(csum & 0xFF);
 
@@ -457,7 +585,7 @@ fn sendTcpPacket(conn: *TcpConn, flags: u8, payload: ?[]const u8, include_mss: b
     conn.last_tx_len = @intCast(total);
     conn.last_send_tick = process.tick_count;
 
-    return nic.send(pkt[0..total]);
+    return dispatchPacket(conn.remote_ip, pkt[0..total]);
 }
 
 pub fn tcpConnect(dst_ip: [4]u8, dst_port: u16) ?u8 {
@@ -536,6 +664,34 @@ fn tryAcceptIncomingSyn(ip_data: []volatile u8, local_port: u16, remote_port: u1
     conn.snd_una = conn.snd_iss;
     conn.rcv_nxt = peer_seq +% 1; // peer's SYN consumes one seq number
     conn.listener_slot = listenerSlotIndex(lst);
+
+    // Parse the incoming SYN's options for MSS so subsequent server-side
+    // sends respect what the peer advertised. Without this we'd cap our
+    // segment payloads at the default 536 even when the peer (e.g. a
+    // local Linux client) is happy to take 1460. Same option-walk shape
+    // as the client-side parser in the .syn_sent branch of
+    // handleTcpPacket — kept in sync by hand.
+    const tcp = ip_data[20..]; // assume ihl=20; SYN with options never extends ihl
+    if (tcp.len >= TCP_HDR_SIZE) {
+        const data_offset = @as(usize, tcp[12] >> 4) * 4;
+        if (data_offset > 20 and data_offset <= tcp.len) {
+            var opt_pos: usize = 20;
+            while (opt_pos + 1 < data_offset) {
+                const kind = tcp[opt_pos];
+                if (kind == 0) break;
+                if (kind == 1) { opt_pos += 1; continue; }
+                if (opt_pos + 1 >= data_offset) break;
+                const olen = tcp[opt_pos + 1];
+                if (olen < 2) break;
+                if (kind == 2 and olen == 4 and opt_pos + 4 <= data_offset) {
+                    conn.peer_mss = readU16BE(tcp[opt_pos + 2 ..][0..2]);
+                    if (conn.peer_mss > 1460) conn.peer_mss = 1460;
+                    if (conn.peer_mss < 100) conn.peer_mss = 536;
+                }
+                opt_pos += olen;
+            }
+        }
+    }
 
     if (!sendTcpPacket(conn, TCP_SYN | TCP_ACK, null, true)) {
         conn.active = false;
@@ -616,6 +772,16 @@ pub fn tcpRecv(slot: u8, buf: []u8) usize {
         buf[i] = conn.rx_buf[(read_pos + i) % TCP_RX_BUF_SIZE];
     }
     conn.rx_count -= avail;
+
+    // If the drain re-opened a meaningful chunk of the receive window,
+    // tell the peer with an empty ACK. Without this, a sender that
+    // throttled against a 0-window advertisement would sit idle until
+    // the next normal ACK we send (which only happens when the peer
+    // sends more data — chicken-and-egg). 25% of the ring is the
+    // threshold; smaller drains piggyback on the next data-driven ACK.
+    if (conn.state == .established and avail >= TCP_RX_BUF_SIZE / 4) {
+        _ = sendTcpPacket(conn, TCP_ACK, null, false);
+    }
     return avail;
 }
 
@@ -838,7 +1004,7 @@ fn tcpTick() void {
                 c.state = .closed;
                 continue;
             }
-            _ = nic.send(c.last_tx[0..c.last_tx_len]);
+            _ = dispatchPacket(c.remote_ip, c.last_tx[0..c.last_tx_len]);
             c.retransmit_count += 1;
             c.last_send_tick = process.tick_count;
         }
@@ -1024,12 +1190,12 @@ fn handleArpPacket(data: []volatile u8) void {
     const op = @as(u16, arp[6]) << 8 | @as(u16, arp[7]);
 
     if (op == ARP_REPLY) {
-        if (arp[24] == GUEST_IP[0] and arp[25] == GUEST_IP[1] and
-            arp[26] == GUEST_IP[2] and arp[27] == GUEST_IP[3])
+        if (arp[24] == local_ip[0] and arp[25] == local_ip[1] and
+            arp[26] == local_ip[2] and arp[27] == local_ip[3])
         {
             const sender_ip = arp[14..18];
-            if (sender_ip[0] == GATEWAY_IP[0] and sender_ip[1] == GATEWAY_IP[1] and
-                sender_ip[2] == GATEWAY_IP[2] and sender_ip[3] == GATEWAY_IP[3])
+            if (sender_ip[0] == gateway_ip[0] and sender_ip[1] == gateway_ip[1] and
+                sender_ip[2] == gateway_ip[2] and sender_ip[3] == gateway_ip[3])
             {
                 for (0..6) |j| gateway_mac[j] = arp[8 + j];
                 gateway_mac_valid = true;
@@ -1037,8 +1203,8 @@ fn handleArpPacket(data: []volatile u8) void {
         }
     } else if (op == ARP_REQUEST) {
         const target_ip = arp[24..28];
-        if (target_ip[0] == GUEST_IP[0] and target_ip[1] == GUEST_IP[1] and
-            target_ip[2] == GUEST_IP[2] and target_ip[3] == GUEST_IP[3])
+        if (target_ip[0] == local_ip[0] and target_ip[1] == local_ip[1] and
+            target_ip[2] == local_ip[2] and target_ip[3] == local_ip[3])
         {
             var reply: [ETH_HDR_SIZE + ARP_HDR_SIZE]u8 = undefined;
             const src_mac = nic.getMac();
@@ -1051,7 +1217,7 @@ fn handleArpPacket(data: []volatile u8) void {
             r[4] = 6; r[5] = 4;
             r[6] = 0; r[7] = 2;
             @memcpy(r[8..14], &src_mac);
-            @memcpy(r[14..18], &GUEST_IP);
+            @memcpy(r[14..18], &local_ip);
             @memcpy(r[18..24], &sender_mac);
             for (0..4) |j| r[24 + j] = arp[14 + j];
             _ = nic.send(&reply);
@@ -1061,6 +1227,8 @@ fn handleArpPacket(data: []volatile u8) void {
 
 fn processReceivedPacket(data: []volatile u8) void {
     if (data.len < ETH_HDR_SIZE) return;
+    rx_frame_count +%= 1;
+    rx_frame_total_bytes +%= data.len;
     const ethertype = @as(u16, data[12]) << 8 | @as(u16, data[13]);
     switch (ethertype) {
         ETHERTYPE_ARP => handleArpPacket(data),
@@ -1074,6 +1242,13 @@ fn processReceivedPacket(data: []volatile u8) void {
 /// of going via nic.recv() / net.poll(). Side-effects (ARP/ICMP replies,
 /// TCP ACKs) reach the wire via nic.send() which holds tx_lock IrqSave —
 /// safe to call with IRQs disabled.
+/// RX-frame counter. Incremented by every NIC IRQ callback regardless
+/// of the protocol/conn the frame belongs to. Useful to distinguish
+/// "frames not arriving" from "frames arriving but our TCP dispatcher
+/// dropping them". Lives on BSS so it's safe to read from anywhere.
+pub var rx_frame_count: u64 = 0;
+pub var rx_frame_total_bytes: u64 = 0;
+
 pub fn handleRxFrame(data: []volatile u8) void {
     processReceivedPacket(data);
 }
@@ -1095,9 +1270,9 @@ fn arpResolveGateway() bool {
     a[0] = 0; a[1] = 1; a[2] = 0x08; a[3] = 0x00;
     a[4] = 6; a[5] = 4; a[6] = 0; a[7] = 1;
     @memcpy(a[8..14], &src_mac);
-    @memcpy(a[14..18], &GUEST_IP);
+    @memcpy(a[14..18], &local_ip);
     @memset(a[18..24], 0);
-    @memcpy(a[24..28], &GATEWAY_IP);
+    @memcpy(a[24..28], &gateway_ip);
     _ = nic.send(pkt[0 .. ETH_HDR_SIZE + ARP_HDR_SIZE]);
 
     // 2-second tick deadline; 10ms sleep between polls so ARP doesn't lock
@@ -1150,6 +1325,111 @@ fn buildIcmpEchoRequest(buf: []u8, dst_mac: [6]u8, dst_ip: [4]u8, seq: u16) usiz
     icmp[2] = @intCast(csum >> 8);
     icmp[3] = @intCast(csum & 0xFF);
     return ETH_HDR_SIZE + IPV4_HDR_SIZE + icmp_len;
+}
+
+// === procfs renderers ===
+//
+// Procfs delegates `/proc/netinfo`, `/proc/netsock`, and `/proc/netarp`
+// to these. Keeping the formatting here (instead of in procfs.zig) lets
+// the renderers reach private fields like tcp_conns / udp_listeners /
+// gateway_mac without exposing them publicly.
+
+fn maskPrefixLen(mask: [4]u8) u8 {
+    var bits: u8 = 0;
+    for (mask) |b| {
+        var bit: u8 = 0x80;
+        while (bit != 0) : (bit >>= 1) {
+            if (b & bit != 0) bits += 1 else return bits;
+        }
+    }
+    return bits;
+}
+
+fn fmtBuf(buf: []u8, pos: *usize, comptime f: []const u8, args: anytype) void {
+    const out = std.fmt.bufPrint(buf[pos.*..], f, args) catch return;
+    pos.* += out.len;
+}
+
+pub fn renderProcInfo(buf: []u8) usize {
+    var n: usize = 0;
+    const mac = nic.getMac();
+    fmtBuf(buf, &n, "nic:    {s}  mac {x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}\n", .{
+        nic.name(), mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+    });
+    fmtBuf(buf, &n, "ip:     {d}.{d}.{d}.{d}/{d}  via {d}.{d}.{d}.{d}\n", .{
+        local_ip[0], local_ip[1], local_ip[2], local_ip[3], maskPrefixLen(subnet_mask),
+        gateway_ip[0], gateway_ip[1], gateway_ip[2], gateway_ip[3],
+    });
+    fmtBuf(buf, &n, "dns:    {d}.{d}.{d}.{d}\n", .{
+        dns_ip[0], dns_ip[1], dns_ip[2], dns_ip[3],
+    });
+    if (dhcp_configured) {
+        fmtBuf(buf, &n, "lease:  DHCP, {d}s remaining\n", .{dhcp_lease_secs});
+    } else {
+        fmtBuf(buf, &n, "lease:  static (no DHCP)\n", .{});
+    }
+    if (!nic.isReady()) {
+        fmtBuf(buf, &n, "state:  DOWN — no NIC backend\n", .{});
+    }
+    return n;
+}
+
+fn stateName(s: TcpState) []const u8 {
+    return switch (s) {
+        .closed => "CLOSED",
+        .listen => "LISTEN",
+        .syn_sent => "SYN_SENT",
+        .syn_received => "SYN_RCVD",
+        .established => "ESTABLISHED",
+        .fin_wait_1 => "FIN_WAIT_1",
+        .fin_wait_2 => "FIN_WAIT_2",
+        .time_wait => "TIME_WAIT",
+        .close_wait => "CLOSE_WAIT",
+        .last_ack => "LAST_ACK",
+    };
+}
+
+pub fn renderProcSock(buf: []u8) usize {
+    var n: usize = 0;
+    fmtBuf(buf, &n, "proto  local           remote               state\n", .{});
+    // TCP listeners: synthesise rows from tcp_listeners (no per-listener
+    // counters yet so just print the bind port).
+    for (tcp_listeners) |l| {
+        if (!l.active) continue;
+        fmtBuf(buf, &n, "tcp    *:{d:<11}    *:*                  LISTEN\n", .{l.port});
+    }
+    // Active TCP connections.
+    for (tcp_conns) |c| {
+        if (!c.active) continue;
+        fmtBuf(buf, &n, "tcp    *:{d:<11}    {d}.{d}.{d}.{d}:{d:<5}  {s}\n", .{
+            c.local_port,
+            c.remote_ip[0], c.remote_ip[1], c.remote_ip[2], c.remote_ip[3],
+            c.remote_port,
+            stateName(c.state),
+        });
+    }
+    // UDP listeners (we don't separately track sends, only bound recv ports).
+    for (udp_listeners) |l| {
+        if (!l.active) continue;
+        fmtBuf(buf, &n, "udp    *:{d:<11}    *:*                  -\n", .{l.port});
+    }
+    return n;
+}
+
+pub fn renderProcArp(buf: []u8) usize {
+    var n: usize = 0;
+    fmtBuf(buf, &n, "ip              mac                state\n", .{});
+    if (gateway_mac_valid) {
+        fmtBuf(buf, &n, "{d}.{d}.{d}.{d:<8}  {x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}  cached (gateway)\n", .{
+            gateway_ip[0], gateway_ip[1], gateway_ip[2], gateway_ip[3],
+            gateway_mac[0], gateway_mac[1], gateway_mac[2], gateway_mac[3], gateway_mac[4], gateway_mac[5],
+        });
+    } else {
+        fmtBuf(buf, &n, "{d}.{d}.{d}.{d:<8}  --:--:--:--:--:--  pending (gateway)\n", .{
+            gateway_ip[0], gateway_ip[1], gateway_ip[2], gateway_ip[3],
+        });
+    }
+    return n;
 }
 
 pub fn pingCommand(ip_str: []const u8) void {

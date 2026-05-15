@@ -23,6 +23,7 @@
 const std = @import("std");
 const io = @import("../io.zig");
 const pci = @import("pci.zig");
+const iommu = @import("../cpu/iommu.zig");
 const pmm = @import("../mm/pmm.zig");
 const paging = @import("../mm/paging.zig");
 const msix = @import("../time/msix.zig");
@@ -260,6 +261,16 @@ fn initController(c: *Controller, dev: pci.PciDevice, idx: usize) bool {
     w32(c, REG_ACQ_LO, @truncate(a_cq));
     w32(c, REG_ACQ_HI, @truncate(a_cq >> 32));
 
+    // IOMMU Phase 3: switch this device onto its own isolated SL page
+    // table and explicitly map the admin queues BEFORE CC.EN flips. From
+    // CC.EN onward the controller can DMA to anything we've mapped (and
+    // ONLY that) — an OOB write hits the fault recording register.
+    // Order matters: enableIsolation MUST precede the dmaMap calls (a
+    // no-op when IOMMU isn't running; safe to call unconditionally).
+    _ = iommu.enableIsolation(dev.bus, dev.dev, dev.func);
+    _ = iommu.dmaMap(dev.bus, dev.dev, dev.func, a_sq, 4096, .{});
+    _ = iommu.dmaMap(dev.bus, dev.dev, dev.func, a_cq, 4096, .{});
+
     // Set SQ/CQ entry sizes, leave CSS=NVM, MPS=0 (4 KiB), then enable.
     w32(c, REG_CC, CC_IOSQES_64 | CC_IOCQES_16);
     w32(c, REG_CC, CC_IOSQES_64 | CC_IOCQES_16 | CC_EN);
@@ -273,10 +284,12 @@ fn initController(c: *Controller, dev: pci.PciDevice, idx: usize) bool {
 
     c.next_cid = 1;
     c.bounce_buf = pmm.allocContiguous(1) orelse return false;
+    _ = iommu.dmaMap(dev.bus, dev.dev, dev.func, c.bounce_buf, 4096, .{});
 
     // Step 1: list active namespaces. NSID 0 is "no specific NS" for the
     // CNS=2 query. Result is a u32[1024] table of NSIDs (zero-terminated).
     const ns_list_phys = pmm.allocContiguous(1) orelse return false;
+    _ = iommu.dmaMap(dev.bus, dev.dev, dev.func, ns_list_phys, 4096, .{});
     @memset(@as([*]u8, @ptrFromInt(paging.physToVirt(ns_list_phys)))[0..4096], 0);
     if (!adminCommand(c, .{
         .opcode = ADMIN_IDENTIFY,
@@ -327,6 +340,8 @@ fn initController(c: *Controller, dev: pci.PciDevice, idx: usize) bool {
     @memset(@as([*]u8, @ptrFromInt(paging.physToVirt(io_cq)))[0..4096], 0);
     c.io_sq = io_sq;
     c.io_cq = io_cq;
+    _ = iommu.dmaMap(dev.bus, dev.dev, dev.func, io_sq, 4096, .{});
+    _ = iommu.dmaMap(dev.bus, dev.dev, dev.func, io_cq, 4096, .{});
 
     // Create I/O completion queue first — the SQ creation command needs
     // to reference an existing CQ. cdw11 layout: IV[31:16] | IEN[1] | PC[0].

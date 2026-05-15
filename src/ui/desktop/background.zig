@@ -11,7 +11,7 @@
 
 const gfx = @import("../gfx.zig");
 const conf = @import("config.zig");
-const heap = @import("../../mm/heap.zig");
+const vmalloc = @import("../../mm/vmalloc.zig");
 const debug = @import("../../debug/debug.zig");
 
 const bg_presets = [4][2]u32{
@@ -66,10 +66,15 @@ pub fn allocateWallpaper(w: u32, h: u32) bool {
 
     const bytes: usize = @as(usize, w) * @as(usize, h) * 4;
     clearWallpaper();
-    const new_buf = heap.kvmalloc(bytes, 64) orelse {
-        debug.klog("[wallpaper] kvmalloc({d} MB) failed — too fragmented for {d} contiguous pages\n", .{
+    // vmalloc rather than heap.kvmalloc: a 6+ MB wallpaper needs 1500+
+    // contiguous frames from PMM, which can't be served on a fragmented
+    // heap. vmalloc returns a virtually-contiguous region backed by
+    // individually-allocated frames, so the only requirement is that
+    // PMM has enough total free pages — order doesn't matter. Wallpaper
+    // bytes are CPU-read-only (no DMA), making vmalloc the right fit.
+    const new_buf = vmalloc.alloc(bytes) orelse {
+        debug.klog("[wallpaper] vmalloc({d} MB) failed — PMM exhausted?\n", .{
             bytes / (1024 * 1024),
-            (bytes + 4095) / 4096,
         });
         return false;
     };
@@ -86,7 +91,7 @@ pub fn allocateWallpaper(w: u32, h: u32) bool {
 pub fn clearWallpaper() void {
     if (wp_pixels) |p| {
         const old_buf: [*]u8 = @ptrCast(p);
-        heap.kfreeAuto(old_buf);
+        vmalloc.free(old_buf);
     }
     wp_pixels = null;
     wp_w = 0;

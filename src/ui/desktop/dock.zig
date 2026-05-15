@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const gfx = @import("../gfx.zig");
+const aa_font = @import("../aa_font.zig");
 const icons = @import("../icons.zig");
 const layout = @import("layout.zig");
 const dirty_rects = @import("dirty.zig");
@@ -21,7 +22,6 @@ const DOCK_ICON_SIZE = layout.DOCK_ICON_SIZE;
 const DOCK_ICON_PAD = layout.DOCK_ICON_PAD;
 const DOCK_PILL_PAD = layout.DOCK_PILL_PAD;
 const DOCK_MARGIN_BOTTOM = layout.DOCK_MARGIN_BOTTOM;
-const FONT_W: u32 = 9;
 
 const BtnInfo = struct { x: i32, idx: u8, is_shortcut: bool };
 
@@ -168,10 +168,12 @@ pub fn renderTooltip() void {
     }
     if (name.len == 0) return;
 
-    const tip_w: u32 = @as(u32, @intCast(name.len)) * FONT_W + 16;
-    const tip_h: u32 = 24;
+    const atlas = aa_font.getDefault16();
+    const text_w = atlas.measure(name);
+    const tip_w: u32 = text_w + 16;
+    const tip_h: u32 = atlas.line_height + 10;
     const tip_x: i32 = btn.x + @as(i32, DOCK_ICON_SIZE / 2) - @as(i32, @intCast(tip_w / 2));
-    const tip_y: i32 = pill_y - @as(i32, tip_h) - 6;
+    const tip_y: i32 = pill_y - @as(i32, @intCast(tip_h)) - 6;
 
     // Track painted region so partial-blit paths flush the tooltip.
     const ux: u32 = if (tip_x < 0) 0 else @intCast(tip_x);
@@ -180,7 +182,8 @@ pub fn renderTooltip() void {
 
     gfx.fillRoundedRectAlpha(tip_x + 1, tip_y + 1, tip_w, tip_h, 6, 0x30000000);
     gfx.fillGlass(tip_x, tip_y, tip_w, tip_h, 6, 0x38222228, 5);
-    gfx.drawString(tip_x + 8, tip_y + 4, name, 0xFFFFFF, 0);
+    const text_y_offset: i32 = @intCast((tip_h -| atlas.line_height) / 2);
+    aa_font.drawText(tip_x + 8, tip_y + text_y_offset, name, 0xFFFFFF, atlas);
 }
 
 fn itemAt(mx: i32) ?u8 {

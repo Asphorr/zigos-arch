@@ -18,6 +18,7 @@ const dirty_rects = @import("dirty.zig");
 const process = @import("../../proc/process.zig");
 const keyboard = @import("../../driver/keyboard.zig");
 const pipe = @import("../../proc/pipe.zig");
+const events = @import("../events.zig");
 
 const Window = wm.Window;
 const AnimationType = wm.AnimationType;
@@ -178,6 +179,16 @@ pub fn advance() void {
                 w.width = w.anim_start_w;
                 w.height = w.anim_start_h;
                 w.minimized = true;
+            } else if (atype == .fullscreening or atype == .unfullscreening) {
+                // Maximize / un-maximize finished — let the owning app
+                // react to its new size. Without this, GUI apps stay
+                // laid-out for their pre-maximize dimensions and waste
+                // the extra screen estate (or render off-canvas).
+                w.events.push(.{
+                    .kind = @intFromEnum(events.EventKind.resize),
+                    .a = w.width,
+                    .b = w.height,
+                });
             }
         }
     }

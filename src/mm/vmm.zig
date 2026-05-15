@@ -73,8 +73,10 @@ pub fn createAddressSpace(phys_out: *usize) ?[*]align(4096) u64 {
     // Inherit the kernel high-half mappings by reference. Any kernel-side
     // change (e.g., installWriteWatch splitting a 1 GB page) propagates to
     // every process automatically because we share the underlying PDPT pages.
+    // [256] = physmap, [258] = vmalloc arena, [511] = kernel image.
     const kernel_pml4: [*]const u64 = @ptrFromInt(paging.physToVirt(paging.getKernelPML4Phys()));
     pml4[256] = kernel_pml4[256];
+    pml4[258] = kernel_pml4[258];
     pml4[511] = kernel_pml4[511];
 
     phys_out.* = alloc.phys;
@@ -377,8 +379,10 @@ pub fn cloneAddressSpace(parent_pml4: [*]align(4096) u64, phys_out: *usize) ?[*]
     phys_out.* = pml4_alloc.phys;
 
     // Kernel-half by-reference inheritance (same as createAddressSpace).
+    // [256] = physmap, [258] = vmalloc arena, [511] = kernel image.
     const kernel_pml4: [*]const u64 = @ptrFromInt(paging.physToVirt(paging.getKernelPML4Phys()));
     child_pml4[256] = kernel_pml4[256];
+    child_pml4[258] = kernel_pml4[258];
     child_pml4[511] = kernel_pml4[511];
 
     // PML4[0]: child gets a private PDPT. Two cases:

@@ -55,6 +55,7 @@ const windowAt = wm.windowAt;
 const isInTitlebar = wm.isInTitlebar;
 const isOnCloseBtn = wm.isOnCloseBtn;
 const isOnMinimizeBtn = wm.isOnMinimizeBtn;
+const isOnMaximizeBtn = wm.isOnMaximizeBtn;
 const isOnResizeEdge = wm.isOnResizeEdge;
 const focusNextVisible = wm.focusNextVisible;
 const cycleFocus = wm.cycleFocus;
@@ -194,10 +195,15 @@ const BELL_FLASH_FRAMES = theme.BELL_FLASH_FRAMES;
 const CURSOR_BLINK_HALF_TICKS = theme.CURSOR_BLINK_HALF_TICKS;
 const BELL_FLASH_COLOR = theme.BELL_FLASH_COLOR;
 
-inline fn cellColors(attr: u8) struct { fg: u32, bg: u32 } {
-    const idx: u8 = attr & 0x0F;
-    const palette_idx: u8 = if ((attr & ATTR_BOLD) != 0) (idx | 0x08) else idx;
-    var fg = ANSI_PALETTE[palette_idx];
+inline fn cellColors(attr: u8, fg_rgb: u32) struct { fg: u32, bg: u32 } {
+    var fg: u32 = undefined;
+    if ((attr & theme.ATTR_RGB_FG) != 0) {
+        fg = fg_rgb;
+    } else {
+        const idx: u8 = attr & 0x0F;
+        const palette_idx: u8 = if ((attr & ATTR_BOLD) != 0) (idx | 0x08) else idx;
+        fg = ANSI_PALETTE[palette_idx];
+    }
     var bg: u32 = WINDOW_BG;
     if ((attr & ATTR_INVERSE) != 0) {
         const swap = fg;
@@ -233,6 +239,13 @@ var drag_oy: i32 = 0;
 var drag_old_x: i32 = 0;
 var drag_old_y: i32 = 0;
 var prev_buttons: u8 = 0;
+/// Double-click detection on the titlebar — when the same window's
+/// titlebar is clicked twice within DOUBLE_CLICK_TICKS, toggle maximize.
+/// 80 ticks matches the desktop-shortcut DOUBLE_CLICK_TICKS so users
+/// don't have two different "double-click windows" in their muscle memory.
+var last_titlebar_click_idx: i32 = -1;
+var last_titlebar_click_tick: u32 = 0;
+const TITLEBAR_DOUBLE_CLICK_TICKS: u32 = 80;
 
 // Resize state
 var resizing: bool = false;
@@ -395,7 +408,7 @@ fn putCharIdle(w: *Window, t: *TerminalData, c: u8) void {
 fn putCharAfterEsc(t: *TerminalData, c: u8) void {
     if (c == '[') {
         t.esc_state = .csi;
-        t.csi_args = [_]u16{0} ** 4;
+        t.csi_args = [_]u16{0} ** 8;
         t.csi_arg_count = 0;
         t.csi_has_arg = false;
     } else {
@@ -467,23 +480,55 @@ fn dispatchCsi(w: *Window, t: *TerminalData, final: u8, n_args: u8) void {
 fn sgr(t: *TerminalData, n_args: u8) void {
     if (n_args == 0) {
         t.cur_attr = ATTR_DEFAULT;
+        t.cur_fg_rgb = 0;
         return;
     }
     var i: u8 = 0;
     while (i < n_args) : (i += 1) {
         const arg = t.csi_args[i];
         switch (arg) {
-            0 => t.cur_attr = ATTR_DEFAULT,
+            0 => {
+                t.cur_attr = ATTR_DEFAULT;
+                t.cur_fg_rgb = 0;
+            },
             1 => t.cur_attr |= ATTR_BOLD,
             7 => t.cur_attr |= ATTR_INVERSE,
             22 => t.cur_attr &= ~ATTR_BOLD,
             27 => t.cur_attr &= ~ATTR_INVERSE,
-            30...37 => t.cur_attr = (t.cur_attr & 0xF0) | @as(u8, @intCast(arg - 30)),
+            30...37 => {
+                // Palette index — clear the truecolor flag so the cell
+                // renders via ANSI_PALETTE again.
+                t.cur_attr = (t.cur_attr & 0xF0 & ~theme.ATTR_RGB_FG) | @as(u8, @intCast(arg - 30));
+            },
             // Bright fg (90..97) maps to bold + base color, mirroring how most
             // terminals render the "bright" series.
-            90...97 => t.cur_attr = ((t.cur_attr & 0xF0) | @as(u8, @intCast(arg - 90))) | ATTR_BOLD,
-            // 39 = default fg; 38 = 256/truecolor (out of scope, skip args we'd need).
-            39 => t.cur_attr = (t.cur_attr & 0xF0) | (ATTR_DEFAULT & 0x0F),
+            90...97 => t.cur_attr = ((t.cur_attr & 0xF0 & ~theme.ATTR_RGB_FG) | @as(u8, @intCast(arg - 90))) | ATTR_BOLD,
+            // 39 = default fg.
+            39 => {
+                t.cur_attr = (t.cur_attr & 0xF0 & ~theme.ATTR_RGB_FG) | (ATTR_DEFAULT & 0x0F);
+                t.cur_fg_rgb = 0;
+            },
+            // 38;2;R;G;B = 24-bit truecolor fg. Consumes the next 4 args
+            // (the `2` selector + R/G/B). `38;5;N` (256-color) consumes
+            // 2 args; we don't expand the 256-color cube yet, just step
+            // over the selector + index so following args parse cleanly.
+            38 => {
+                if (i + 1 >= n_args) break;
+                const sub = t.csi_args[i + 1];
+                if (sub == 2) {
+                    if (i + 4 >= n_args) break;
+                    const r: u32 = @intCast(t.csi_args[i + 2] & 0xFF);
+                    const g: u32 = @intCast(t.csi_args[i + 3] & 0xFF);
+                    const b: u32 = @intCast(t.csi_args[i + 4] & 0xFF);
+                    t.cur_fg_rgb = (r << 16) | (g << 8) | b;
+                    t.cur_attr |= theme.ATTR_RGB_FG;
+                    i += 4;
+                } else if (sub == 5) {
+                    // 256-color: skip the index for now; future-proof.
+                    if (i + 2 >= n_args) break;
+                    i += 2;
+                }
+            },
             else => {},
         }
     }
@@ -496,6 +541,7 @@ fn eraseDisplay(t: *TerminalData, mode: u16) void {
             for (cur_idx..TERM_COLS * TERM_ROWS) |i| {
                 t.text_buf[i] = ' ';
                 t.attr_buf[i] = t.cur_attr;
+                t.fg_rgb_buf[i] = t.cur_fg_rgb;
             }
         },
         1 => {
@@ -503,11 +549,13 @@ fn eraseDisplay(t: *TerminalData, mode: u16) void {
             for (0..end) |i| {
                 t.text_buf[i] = ' ';
                 t.attr_buf[i] = t.cur_attr;
+                t.fg_rgb_buf[i] = t.cur_fg_rgb;
             }
         },
         2, 3 => {
             @memset(&t.text_buf, ' ');
             @memset(&t.attr_buf, t.cur_attr);
+            @memset(&t.fg_rgb_buf, t.cur_fg_rgb);
         },
         else => {},
     }
@@ -521,6 +569,7 @@ fn eraseLine(t: *TerminalData, mode: u16) void {
             for (t.text_col..TERM_COLS) |c| {
                 t.text_buf[row_start + c] = ' ';
                 t.attr_buf[row_start + c] = t.cur_attr;
+                t.fg_rgb_buf[row_start + c] = t.cur_fg_rgb;
             }
         },
         1 => {
@@ -528,12 +577,14 @@ fn eraseLine(t: *TerminalData, mode: u16) void {
             for (0..@min(end, TERM_COLS)) |c| {
                 t.text_buf[row_start + c] = ' ';
                 t.attr_buf[row_start + c] = t.cur_attr;
+                t.fg_rgb_buf[row_start + c] = t.cur_fg_rgb;
             }
         },
         2 => {
             for (0..TERM_COLS) |c| {
                 t.text_buf[row_start + c] = ' ';
                 t.attr_buf[row_start + c] = t.cur_attr;
+                t.fg_rgb_buf[row_start + c] = t.cur_fg_rgb;
             }
         },
         else => {},
@@ -544,6 +595,11 @@ inline fn writeCell(t: *TerminalData, row: u16, col: u16, ch: u8, attr: u8) void
     if (textIdx(row, col)) |idx| {
         t.text_buf[idx] = ch;
         t.attr_buf[idx] = attr;
+        // Mirror cur_fg_rgb so renderers can pull per-cell RGB when the
+        // truecolor flag is set. Cheap (one u32 store) and means the
+        // erase/scroll memcpy paths don't need parallel "rgb propagation"
+        // for the common case where a cell is just rewritten in place.
+        t.fg_rgb_buf[idx] = t.cur_fg_rgb;
     }
 }
 
@@ -560,28 +616,33 @@ fn putStringOnWindow(window_idx: u8, data: []const u8) void {
 fn scrollWindow(w: *Window) void {
     const t = w.term orelse return;
     // Save top row (and its attrs) to the scrollback ring so colored output
-    // remains colored when the user scrolls up later.
+    // remains colored when the user scrolls up later. fg_rgb_buf travels
+    // alongside attr_buf so truecolor-set cells preserve their hue in
+    // scrollback view.
     if (t.scroll_write >= SCROLL_LINES) t.scroll_write = 0;
     const sb_off = @as(u32, t.scroll_write) * TERM_COLS;
     @memcpy(t.scroll_buf[sb_off..][0..TERM_COLS], t.text_buf[0..TERM_COLS]);
     @memcpy(t.scroll_attr_buf[sb_off..][0..TERM_COLS], t.attr_buf[0..TERM_COLS]);
+    @memcpy(t.scroll_fg_rgb_buf[sb_off..][0..TERM_COLS], t.fg_rgb_buf[0..TERM_COLS]);
     t.scroll_write = @intCast((@as(u32, t.scroll_write) + 1) % SCROLL_LINES);
     if (t.scroll_count < SCROLL_LINES) t.scroll_count += 1;
     // Auto-scroll to live on new output
     t.scroll_view = 0;
 
-    // Shift all rows up by one (both text and attrs).
+    // Shift all rows up by one (text + attrs + fg_rgb).
     var row: u32 = 0;
     while (row < TERM_ROWS - 1) : (row += 1) {
         const dst = row * TERM_COLS;
         const src = (row + 1) * TERM_COLS;
         @memcpy(t.text_buf[dst..][0..TERM_COLS], t.text_buf[src..][0..TERM_COLS]);
         @memcpy(t.attr_buf[dst..][0..TERM_COLS], t.attr_buf[src..][0..TERM_COLS]);
+        @memcpy(t.fg_rgb_buf[dst..][0..TERM_COLS], t.fg_rgb_buf[src..][0..TERM_COLS]);
     }
     // Clear last row's chars + reset its attrs to current SGR state, so newly
     // written cells inherit any in-flight SGR (e.g. mid-color block).
     @memset(t.text_buf[(TERM_ROWS - 1) * TERM_COLS ..][0..TERM_COLS], ' ');
     @memset(t.attr_buf[(TERM_ROWS - 1) * TERM_COLS ..][0..TERM_COLS], t.cur_attr);
+    @memset(t.fg_rgb_buf[(TERM_ROWS - 1) * TERM_COLS ..][0..TERM_COLS], t.cur_fg_rgb);
     t.text_row = @intCast(TERM_ROWS - 1);
 }
 
@@ -640,7 +701,7 @@ fn toggleFullscreen(idx: u8) void {
     if (w.anim_type != .none) return; // Already animating
 
     if (w.fullscreen) {
-        // Exit fullscreen — animate back to saved geometry
+        // Exit maximize — animate back to saved geometry.
         w.fullscreen = false;
         startAnimation(idx, .unfullscreening);
         w.anim_end_x = w.saved_x;
@@ -648,17 +709,31 @@ fn toggleFullscreen(idx: u8) void {
         w.anim_end_w = w.saved_w;
         w.anim_end_h = w.saved_h;
     } else {
-        // Enter fullscreen — save geometry, animate to full screen
+        // Enter maximize — fill the area between menubar and dock, NOT
+        // the entire screen. Keep window chrome (titlebar + traffic-
+        // light buttons) visible so the user can un-maximize, close,
+        // minimize. For GUI apps with a fixed framebuffer allocation
+        // (gui_alloc_w/h), cap the size at the allocation so we don't
+        // ask the app to render past its FB. Apps that handle resize
+        // events grow naturally; others stay at their max alloc size
+        // centered.
         w.saved_x = w.x;
         w.saved_y = w.y;
         w.saved_w = w.width;
         w.saved_h = w.height;
         w.fullscreen = true;
         startAnimation(idx, .fullscreening);
-        w.anim_end_x = 0;
-        w.anim_end_y = 0;
-        w.anim_end_w = gfx.screen_w;
-        w.anim_end_h = gfx.screen_h;
+
+        const usable_h: u32 = @as(u32, @intCast(gfx.screen_h)) -| MENUBAR_H -| TASKBAR_H;
+        var target_w: u32 = gfx.screen_w;
+        var target_h: u32 = usable_h;
+        if (w.gui_alloc_w > 0 and target_w > w.gui_alloc_w) target_w = w.gui_alloc_w;
+        if (w.gui_alloc_h > 0 and target_h > w.gui_alloc_h + TITLEBAR_H) target_h = w.gui_alloc_h + TITLEBAR_H;
+
+        w.anim_end_x = @intCast((gfx.screen_w -| target_w) / 2);
+        w.anim_end_y = @intCast(MENUBAR_H + (usable_h -| target_h) / 2);
+        w.anim_end_w = target_w;
+        w.anim_end_h = target_h;
     }
 }
 
@@ -719,12 +794,11 @@ fn isCoveredByUpper(z_pos: u8, idx: u8) bool {
 
 fn renderScene() void {
     render_tick +%= 1;
-    // Skip background/dock when a fullscreen window is on top
-    const has_fullscreen = slot_used[wm.focused] and windows[wm.focused].fullscreen and windows[wm.focused].visible;
-    if (!has_fullscreen) {
-        background.render();
-        shortcuts.render();
-    }
+    // Maximized windows now keep menubar + dock visible (they only fill
+    // the usable area between them), so the background + shortcuts paint
+    // unconditionally — they're never fully occluded by a single window.
+    background.render();
+    shortcuts.render();
     // Full scene re-render — background.render() above wiped the entire
     // back buffer to wallpaper, so each visible window must re-blend its
     // drop shadow. Setting shadow_dirty=true here covers .full and .drag
@@ -752,17 +826,20 @@ fn renderScene() void {
         if (isCoveredByUpper(k, i)) continue;
         renderWindow(i);
     }
-    if (!has_fullscreen) {
-        const focused_title: ?[]const u8 = if (slot_used[wm.focused] and windows[wm.focused].visible)
-            windows[wm.focused].title[0..windows[wm.focused].title_len]
-        else
-            null;
-        menubar.render(focused_title);
-        dock.render();
-        dock.renderTooltip();
-    }
+    const focused_title: ?[]const u8 = if (slot_used[wm.focused] and windows[wm.focused].visible)
+        windows[wm.focused].title[0..windows[wm.focused].title_len]
+    else
+        null;
+    menubar.render(focused_title);
+    dock.render();
+    dock.renderTooltip();
     toast.render();
     context_menu.render();
+    // Drag ghost (semi-transparent icon following the cursor) renders
+    // last so it floats above windows, menubar, dock, toast, and any
+    // context menu. The cursor itself paints after renderScene returns
+    // and stays on top of the ghost.
+    shortcuts.renderDragGhost();
     // Damage signal for the GPU compositor (mode 9). MUST be at the end
     // of renderScene so the compositor's wake reads a fully-painted
     // backbuf. Calling it at the top would race: compositor wakes,
@@ -914,21 +991,6 @@ fn roundSmallCorners(x: i32, y: i32, w: u32, h: u32, bg: u32) void {
     gfx.putPixel(right, bot - 1, bg);
 }
 
-/// Render a GUI framebuffer scaled to fill the entire screen (nearest-neighbor).
-fn renderFullscreenGui(fb: [*]volatile u32, src_w: u32, src_h: u32, stride: u32) void {
-    const dst_w = gfx.screen_w;
-    const dst_h = gfx.screen_h;
-    for (0..dst_h) |dy| {
-        const sy = @as(u32, @intCast(dy)) * src_h / dst_h;
-        const dst_row = @as(u32, @intCast(dy)) * dst_w;
-        const src_row = sy * stride;
-        for (0..dst_w) |dx| {
-            const sx = @as(u32, @intCast(dx)) * src_w / dst_w;
-            gfx.target[dst_row + @as(u32, @intCast(dx))] = fb[src_row + sx];
-        }
-    }
-}
-
 /// Re-render every visible window above `target` in z-order whose outer
 /// rect (including shadow) overlaps `target`. Called from partial-render
 /// paths (`.gui_only`) after the target window has been stamped into the
@@ -980,50 +1042,13 @@ fn renderWindow(idx: u8) void {
     if (!w.visible or w.minimized) return;
     const is_focused = (idx == wm.focused);
 
-    // Fullscreen: skip all chrome, scale content to fill screen
-    if (w.fullscreen and w.anim_type == .none) {
-        addDirtyRect(0, 0, gfx.screen_w, gfx.screen_h);
-        // Read the published back buffer if the app has presented at
-        // least once (cube-style streaming apps need the no-tear
-        // guarantee). Otherwise read gui_fb directly — apps that don't
-        // call libc.present() (Files, editor, sysmon) still render.
-        const pub_idx = w.gui_fb_pub.load(.acquire);
-        const active_back: ?[*]volatile u32 = if (w.has_presented) w.gui_fb_backs[pub_idx] else w.gui_fb;
-        if (active_back orelse w.gui_fb) |fb| {
-            renderFullscreenGui(fb, w.gui_w, w.gui_h, if (w.gui_alloc_w > 0) w.gui_alloc_w else w.gui_w);
-        } else if (w.term) |t| {
-            // Fullscreen terminal — black background, per-cell colored chars.
-            gfx.fillRect(0, 0, gfx.screen_w, gfx.screen_h, WINDOW_BG);
-            const pad: u32 = 8;
-            const max_cols = (gfx.screen_w - pad * 2) / FONT_W;
-            const max_rows = (gfx.screen_h - pad * 2) / FONT_H;
-            for (0..@min(max_rows, TERM_ROWS)) |row| {
-                const py: i32 = @intCast(pad + row * FONT_H);
-                var col: u32 = 0;
-                while (col < TERM_COLS and col < max_cols) : (col += 1) {
-                    const cell_idx = row * TERM_COLS + col;
-                    const ch = t.text_buf[cell_idx];
-                    if (ch == ' ') continue;
-                    const colors = cellColors(t.attr_buf[cell_idx]);
-                    drawTermChar(
-                        @intCast(pad + col * FONT_W),
-                        py,
-                        ch,
-                        colors.fg,
-                        colors.bg,
-                    );
-                }
-            }
-            // Cursor (blinks; off when in the dark phase of the cycle)
-            const blink_on = ((process.tick_count -% t.cursor_blink_anchor) / CURSOR_BLINK_HALF_TICKS) & 1 == 0;
-            if (blink_on) {
-                const cx: i32 = @intCast(pad + @as(u32, t.text_col) * FONT_W);
-                const cy: i32 = @intCast(pad + @as(u32, t.text_row) * FONT_H);
-                gfx.fillRect(cx, cy, FONT_W, FONT_H, TERM_FG);
-            }
-        }
-        return;
-    }
+    // Maximized windows render through the same chrome path as normal
+    // windows — they're just laid out in the usable area. The old
+    // fullscreen-scaling shortcut here was the source of the "ruins
+    // UI for non-Doom apps" complaint: scaling a 480-px window to
+    // 1920 px gave blurry pixel slop. Now the app's framebuffer renders
+    // at its own resolution (centered if alloc-capped) inside the
+    // maximized window frame.
 
     // Mark this window's region as dirty for partial GPU flush.
     // Padding of 20 covers the 16-px soft shadow plus 1-px border on each side.
@@ -1229,15 +1254,18 @@ fn renderWindow(idx: u8) void {
 
                 var line_ptr: []const u8 = undefined;
                 var attr_ptr: []const u8 = undefined;
+                var rgb_ptr: []const u32 = undefined;
                 if (line_idx < t.scroll_count) {
                     const ring_idx = (@as(u32, t.scroll_write) + SCROLL_LINES - t.scroll_count + line_idx) % SCROLL_LINES;
                     line_ptr = t.scroll_buf[ring_idx * TERM_COLS ..][0..TERM_COLS];
                     attr_ptr = t.scroll_attr_buf[ring_idx * TERM_COLS ..][0..TERM_COLS];
+                    rgb_ptr = t.scroll_fg_rgb_buf[ring_idx * TERM_COLS ..][0..TERM_COLS];
                 } else {
                     const tb_row = line_idx - @as(u32, t.scroll_count);
                     if (tb_row < TERM_ROWS) {
                         line_ptr = t.text_buf[tb_row * TERM_COLS ..][0..TERM_COLS];
                         attr_ptr = t.attr_buf[tb_row * TERM_COLS ..][0..TERM_COLS];
+                        rgb_ptr = t.fg_rgb_buf[tb_row * TERM_COLS ..][0..TERM_COLS];
                     } else {
                         continue;
                     }
@@ -1246,8 +1274,12 @@ fn renderWindow(idx: u8) void {
                 var col: u32 = 0;
                 while (col < TERM_COLS and col < max_cols) : (col += 1) {
                     const ch = line_ptr[col];
-                    if (ch != ' ') {
-                        const colors = cellColors(attr_ptr[col]);
+                    const attr = attr_ptr[col];
+                    // Render anything that has a glyph OR a non-default bg
+                    // (inverse mode paints the bg even on a space — fastfetch's
+                    // memory bar and color swatches rely on this).
+                    if (ch != ' ' or (attr & ATTR_INVERSE) != 0) {
+                        const colors = cellColors(attr, rgb_ptr[col]);
                         drawTermChar(
                             w.x + @as(i32, @intCast(TERM_PAD + col * FONT_W)),
                             content_y + @as(i32, @intCast(row * FONT_H)),
@@ -1267,8 +1299,9 @@ fn renderWindow(idx: u8) void {
                 while (col < TERM_COLS and col < max_cols) : (col += 1) {
                     const cell_idx = row * TERM_COLS + col;
                     const ch = t.text_buf[cell_idx];
-                    if (ch != ' ') {
-                        const colors = cellColors(t.attr_buf[cell_idx]);
+                    const attr = t.attr_buf[cell_idx];
+                    if (ch != ' ' or (attr & ATTR_INVERSE) != 0) {
+                        const colors = cellColors(attr, t.fg_rgb_buf[cell_idx]);
                         drawTermChar(
                             w.x + @as(i32, @intCast(TERM_PAD + col * FONT_W)),
                             content_y + @as(i32, @intCast(row * FONT_H)),
@@ -1342,12 +1375,15 @@ fn renderTerminalRow(idx: u8) void {
     gfx.fillRect(w.x, py, w.width, FONT_H, WINDOW_BG);
 
     // Draw characters on this row, per-cell color from attr_buf.
+    // Space cells render too when inverse mode is on, so colored bg shows
+    // (used by fastfetch's truecolor bar via fg+inverse swap).
     var col: u32 = 0;
     while (col < TERM_COLS and col < max_cols) : (col += 1) {
         const cell_idx = row * TERM_COLS + col;
         const ch = t.text_buf[cell_idx];
-        if (ch != ' ') {
-            const colors = cellColors(t.attr_buf[cell_idx]);
+        const attr = t.attr_buf[cell_idx];
+        if (ch != ' ' or (attr & ATTR_INVERSE) != 0) {
+            const colors = cellColors(attr, t.fg_rgb_buf[cell_idx]);
             drawTermChar(
                 w.x + @as(i32, @intCast(TERM_PAD + col * FONT_W)),
                 py,
@@ -1800,7 +1836,11 @@ fn executeMenuItem(idx: i8) void {
                     }
                 }
             },
-            2 => showNotification("ZigOS v0.1 - Zig 0.13.0 x86"),
+            2 => { // Arrange Icons — snap any displaced shortcut back to grid
+                shortcuts.resetPositions();
+                markDirtyFull();
+            },
+            3 => showNotification("ZigOS v0.1 - Zig 0.13.0 x86"),
             else => {},
         },
         .titlebar => switch (@as(u8, @intCast(idx))) {
@@ -1996,27 +2036,53 @@ fn handleMouseEvents() DirtyKind {
                 startAnimation(idx, .minimizing);
                 focusNextVisible();
                 result = .full;
+            } else if (isOnMaximizeBtn(idx, mx, my)) {
+                toggleFullscreen(idx);
+                result = .full;
             } else if (isOnResizeEdge(idx, mx, my)) |edge| {
                 resizing = true;
                 resize_win = idx;
                 resize_edge = edge;
             } else if (isInTitlebar(idx, mx, my)) {
-                dragging = true;
-                drag_win = idx;
-                drag_ox = mx - windows[idx].x;
-                drag_oy = my - windows[idx].y;
+                // Double-click titlebar = maximize toggle. Tracked per-
+                // window so clicking on different titlebars in quick
+                // succession doesn't fire a phantom toggle.
+                const now_tick: u32 = @truncate(process.tick_count);
+                const idx_signed: i32 = @intCast(idx);
+                if (last_titlebar_click_idx == idx_signed and (now_tick -% last_titlebar_click_tick) < TITLEBAR_DOUBLE_CLICK_TICKS) {
+                    toggleFullscreen(idx);
+                    last_titlebar_click_idx = -1;
+                    result = .full;
+                } else {
+                    last_titlebar_click_idx = idx_signed;
+                    last_titlebar_click_tick = now_tick;
+                    // Drag-on-maximized = restore + drag, like macOS/Win.
+                    // Computing drag_ox/oy from saved geometry keeps the
+                    // cursor inside the titlebar after the restore so
+                    // there's no visual snap.
+                    if (windows[idx].fullscreen) {
+                        toggleFullscreen(idx);
+                        // Recompute drag offset against the restored size,
+                        // not the current (still-maximized) frame.
+                        const restore_w = windows[idx].saved_w;
+                        drag_ox = @as(i32, @intCast(restore_w / 2));
+                        drag_oy = @as(i32, TITLEBAR_H / 2);
+                        windows[idx].x = mx - drag_ox;
+                        windows[idx].y = my - drag_oy;
+                    } else {
+                        drag_ox = mx - windows[idx].x;
+                        drag_oy = my - windows[idx].y;
+                    }
+                    dragging = true;
+                    drag_win = idx;
+                }
             }
         } else {
-            // Check desktop icon click
-            const now: u32 = @truncate(process.tick_count);
-            const click = shortcuts.handleClick(mx, my, now);
-            switch (click.result) {
-                .launch => {
-                    launchShortcut(click.launch_idx);
-                    result = .full;
-                },
-                .selected => result = .full,
-                .miss => {},
+            // Mouse-down on desktop background: capture press for the
+            // shortcut module. Click/launch/drop fires on mouse-up;
+            // drag-start fires on mouse-move past threshold.
+            if (shortcuts.handleMouseDown(mx, my)) {
+                result = .full;
             }
             // Check resize edge top-down through z_stack so the topmost
             // window's edge wins.
@@ -2052,6 +2118,30 @@ fn handleMouseEvents() DirtyKind {
             });
         }
         resizing = false;
+
+        // Mouse-up routing for the shortcut icon module. An active
+        // drag wins unconditionally (drop anywhere — including over a
+        // window — so the user can park icons next to the focused app
+        // even when it's taking up most of the screen). A static
+        // press only counts when the release lands back over the
+        // desktop, matching the macOS "press-then-drag-off cancels".
+        const dragging_icon = shortcuts.isDragging();
+        if (dragging_icon or windowAt(mx, my) == null) {
+            const now: u32 = @truncate(process.tick_count);
+            const r = shortcuts.handleMouseUp(mx, my, now);
+            switch (r.result) {
+                .launch => {
+                    launchShortcut(r.launch_idx);
+                    result = .full;
+                },
+                .selected, .drop => result = .full,
+                .miss => {},
+            }
+        } else {
+            // Released over a window with no active drag — drop any
+            // pending press so it doesn't latch.
+            shortcuts.cancelDrag();
+        }
     }
 
     if (dragging and left_down) {
@@ -2072,32 +2162,94 @@ fn handleMouseEvents() DirtyKind {
         }
     }
 
+    // Shortcut icon drag: track cursor + promote press → drag once
+    // motion exceeds threshold. Mark .drag so the ghost trail is
+    // repainted each frame. Skipped while a window-drag is in flight
+    // so the two can't fight over the cursor.
+    if (!dragging and !resizing) {
+        if (shortcuts.handleMouseMove(mx, my, left_down)) {
+            if (result != .full) result = .drag;
+            markDirtyFull();
+        }
+    }
+
     if (resizing and left_down) {
         const w = &windows[resize_win];
-        const new_right = mx + 2;
-        const new_bot = my + 2;
+        const right_anchor = w.x + @as(i32, @intCast(w.width));
+        const bot_anchor = w.y + @as(i32, @intCast(w.height));
+
+        const grows_right = (resize_edge == .right or resize_edge == .bottom_right or resize_edge == .top_right);
+        const grows_bottom = (resize_edge == .bottom or resize_edge == .bottom_right or resize_edge == .bottom_left);
+        const grows_left = (resize_edge == .left or resize_edge == .top_left or resize_edge == .bottom_left);
+        const grows_top = (resize_edge == .top or resize_edge == .top_left or resize_edge == .top_right);
+
         var changed = false;
-        if (resize_edge == .right or resize_edge == .bottom_right) {
-            var new_w: u32 = @max(MIN_WIN_W, @as(u32, @intCast(@max(new_right - w.x, @as(i32, MIN_WIN_W)))));
-            // Cap at allocated FB width for GUI windows
+
+        if (grows_right) {
+            var new_w: u32 = @max(MIN_WIN_W, @as(u32, @intCast(@max(mx + 2 - w.x, @as(i32, MIN_WIN_W)))));
             if (w.gui_alloc_w > 0) new_w = @min(new_w, w.gui_alloc_w);
             if (new_w != w.width) {
                 w.width = new_w;
                 if (w.gui_fb != null) w.gui_w = new_w;
                 changed = true;
             }
+        } else if (grows_left) {
+            // Resizing from left: cursor x = new left edge. Width grows
+            // by (right_anchor - mx); x moves to mx. Clamp to MIN_WIN_W
+            // so we don't let x overrun the right anchor.
+            const new_x_raw = mx;
+            const new_x_max = right_anchor - @as(i32, MIN_WIN_W);
+            const new_x_clamped: i32 = if (new_x_raw > new_x_max) new_x_max else new_x_raw;
+            const min_y_for_left: i32 = MENUBAR_H;
+            _ = min_y_for_left;
+            var new_w: u32 = @intCast(right_anchor - new_x_clamped);
+            if (w.gui_alloc_w > 0 and new_w > w.gui_alloc_w) {
+                // Allocation-capped: stop at the alloc ceiling, with x
+                // adjusted so the right edge stays put.
+                new_w = w.gui_alloc_w;
+            }
+            const new_x_final: i32 = right_anchor - @as(i32, @intCast(new_w));
+            if (new_x_final != w.x or new_w != w.width) {
+                w.x = new_x_final;
+                w.width = new_w;
+                if (w.gui_fb != null) w.gui_w = new_w;
+                changed = true;
+            }
         }
-        if (resize_edge == .bottom or resize_edge == .bottom_right) {
-            var new_h: u32 = @max(MIN_WIN_H, @as(u32, @intCast(@max(new_bot - w.y, @as(i32, MIN_WIN_H)))));
-            // Cap at allocated FB height + titlebar for GUI windows
+
+        if (grows_bottom) {
+            var new_h: u32 = @max(MIN_WIN_H, @as(u32, @intCast(@max(my + 2 - w.y, @as(i32, MIN_WIN_H)))));
             if (w.gui_alloc_h > 0) new_h = @min(new_h, w.gui_alloc_h + TITLEBAR_H);
             if (new_h != w.height) {
                 w.height = new_h;
                 if (w.gui_fb != null) w.gui_h = new_h -| TITLEBAR_H;
                 changed = true;
             }
+        } else if (grows_top) {
+            // Resizing from top: never let the titlebar slide under the
+            // menubar — clamp new y to MENUBAR_H.
+            var new_y_raw = my;
+            if (new_y_raw < @as(i32, MENUBAR_H)) new_y_raw = @as(i32, MENUBAR_H);
+            const new_y_max = bot_anchor - @as(i32, MIN_WIN_H);
+            const new_y_clamped: i32 = if (new_y_raw > new_y_max) new_y_max else new_y_raw;
+            var new_h: u32 = @intCast(bot_anchor - new_y_clamped);
+            if (w.gui_alloc_h > 0 and new_h > w.gui_alloc_h + TITLEBAR_H) {
+                new_h = w.gui_alloc_h + TITLEBAR_H;
+            }
+            const new_y_final: i32 = bot_anchor - @as(i32, @intCast(new_h));
+            if (new_y_final != w.y or new_h != w.height) {
+                w.y = new_y_final;
+                w.height = new_h;
+                if (w.gui_fb != null) w.gui_h = new_h -| TITLEBAR_H;
+                changed = true;
+            }
         }
+
         if (changed) {
+            // De-maximize on user-driven resize so the maximize toggle
+            // reflects reality (clicking maximize again should re-snap
+            // to usable area, not restore to some stale saved geometry).
+            if (w.fullscreen) w.fullscreen = false;
             result = .full;
             markDirtyFull();
         }
@@ -2723,8 +2875,8 @@ pub fn run() void {
             if (slot_used[wm.focused]) {
                 const fw = &windows[wm.focused];
                 if (fw.cursor_hidden_by_app) {
-                    if (!vgpu_cur.cursor_hidden) vgpu_cur.hideCursor();
-                } else if (fw.fullscreen and fw.gui_fb != null) {
+                    // Explicit app override — Doom etc. set this and they
+                    // want the cursor gone regardless of window state.
                     if (!vgpu_cur.cursor_hidden) vgpu_cur.hideCursor();
                 } else if (fw.gui_fb == null and vgpu_cur.cursor_hidden) {
                     vgpu_cur.showCursor();
@@ -3259,13 +3411,12 @@ pub fn getWindowContentSize(pid: u8, buf: [*]u32) void {
     for (z_stack[0..wm.z_count]) |i| {
         if (windows[i].owner_pid == pid and windows[i].visible) {
             const w = &windows[i];
-            if (w.fullscreen) {
-                buf[0] = gfx.screen_w;
-                buf[1] = gfx.screen_h;
-            } else {
-                buf[0] = w.width -| (BORDER * 2);
-                buf[1] = w.height -| (TITLEBAR_H + BORDER);
-            }
+            // Maximize no longer means "fill the screen ignoring chrome"
+            // — the window has real width/height like any other, so the
+            // content size is derived the normal way regardless of the
+            // fullscreen flag.
+            buf[0] = w.width -| (BORDER * 2);
+            buf[1] = w.height -| (TITLEBAR_H + BORDER);
             return;
         }
     }

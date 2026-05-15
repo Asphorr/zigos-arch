@@ -272,6 +272,8 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     blog.ok("Kernel heap");
     kasan.init();
     blog.ok("KASAN shadow");
+    @import("mm/vmalloc.zig").init();
+    blog.ok("vmalloc arena");
     @import("debug/symbols.zig").init();
     @import("debug/kcsan.zig").init();
     blog.ok("KCSAN runtime");
@@ -319,6 +321,14 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     // instead of re-walking the bus per init() call.
     @import("driver/pci.zig").enumerate();
     blog.ok("PCI bus enumeration");
+    // IOMMU (Intel VT-d) — pass-through phase. Programs every PCI
+    // device's context entry as Translation-Type=pass-through so the
+    // IOMMU is on but DMA addresses are 1:1. Buys us fault-recording
+    // for off-the-rails DMA without changing driver semantics. No-op
+    // when no DMAR table is present (no -device intel-iommu in QEMU,
+    // or BIOS-mode boot on real hardware).
+    @import("cpu/iommu.zig").init();
+    blog.ok("IOMMU (VT-d pass-through)");
     // SMI / scheduler stall detector. Reads FADT.pm_tmr_blk for sampling.
     // Has to come after acpi.init (FADT cached) but before apic.init starts
     // the BSP IRQ0 — IRQ0's first tick will sample PM_TMR for baseline.
@@ -338,6 +348,11 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     } else {
         blog.warn("Local APIC + IOAPIC", "falling back to legacy PIC+PIT", .{});
     }
+    // IOMMU fault MSI — couldn't be armed during iommu.init() because the
+    // LAPIC wasn't running yet. Now that it is, hardware can deliver
+    // fault-event MSIs to our IDT vector instead of accumulating silently
+    // in FSTS/FRR.
+    @import("cpu/iommu.zig").armFaultMsi();
     // Wall-clock time: latch boot epoch from RTC + HPET.
     @import("time/time.zig").init();
     blog.ok("Wall-clock epoch");
@@ -420,11 +435,50 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     }
     if (nic.init()) {
         blog.ok("Network interface");
+        // Acquire a DHCP lease so we don't depend on the QEMU-SLIRP-only
+        // hardcoded IP/gateway/DNS triple. Total deadline is 5s (500 ticks
+        // @ 100 Hz) split across up to 3 DISCOVER attempts. Failure is
+        // soft: we fall back to the static SLIRP defaults still set in
+        // src/net/net.zig so QEMU SLIRP keeps working.
+        const dhcp = @import("net/dhcp.zig");
+        const net = @import("net/net.zig");
+        const proc = @import("proc/process.zig");
+        if (dhcp.acquire(proc.tick_count + 500)) {
+            blog.okNote("DHCP lease", "{d}.{d}.{d}.{d} via {d}.{d}.{d}.{d}", .{
+                net.local_ip[0], net.local_ip[1], net.local_ip[2], net.local_ip[3],
+                net.gateway_ip[0], net.gateway_ip[1], net.gateway_ip[2], net.gateway_ip[3],
+            });
+        } else {
+            blog.skip("DHCP lease", "no server reply, using static SLIRP defaults", .{});
+        }
     } else {
         blog.skip("Network interface", "no NIC found", .{});
     }
     @import("driver/sound.zig").init();
     blog.ok("Sound");
+
+    // TLS step-1 spike: confirm std.crypto.{Sha256, ChaCha20Poly1305, X25519}
+    // compile and execute freestanding in the kernel. If this fails to
+    // build, the "hand-roll TLS on std.crypto primitives" plan is dead and
+    // we'd pivot to vendoring BearSSL. Output goes through klog → serial,
+    // not the boot panel — it's a one-shot diagnostic, not a routine boot
+    // step. Remove this call once TLS infrastructure is wired in for real.
+    @import("crypto/spike.zig").run();
+
+    // Mozilla NSS root CA bundle — decode all 150-ish trust anchors at
+    // boot so the TLS chain walker can resolve issuer DNs at handshake
+    // time. Done once; idempotent if called again.
+    @import("crypto/tls/trust_store.zig").init();
+
+    // TLS step-2 probe: send a real ClientHello to 1.1.1.1:443, parse the
+    // ServerHello, derive the X25519 shared secret. Validates our message
+    // construction + parser against a real TLS 1.3 server's response.
+    // Needs networking; gated on NIC presence (DHCP already ran above).
+    if (nic.isReady()) {
+        @import("crypto/tls/probe.zig").run();
+    } else {
+        @import("debug/debug.zig").klog("[tls] skipping probe — no NIC\n", .{});
+    }
 
     blog.done("Boot complete -- {d} MB RAM free, {d} CPUs online", .{
         pmm.freeFrameCount() * 4 / 1024,

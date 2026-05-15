@@ -588,6 +588,41 @@ pub fn drawIcon32(x: i32, y: i32, icon: *const [16][16]u32) void {
     }
 }
 
+/// Like `drawIcon32` but blends each non-transparent pixel onto the
+/// existing FB content at `alpha` (0..255). Used for drag-ghost preview:
+/// the icon follows the cursor at ~63% opacity, so the user sees both
+/// the desktop underneath AND what they're moving.
+pub fn drawIcon32Alpha(x: i32, y: i32, icon: *const [16][16]u32, alpha: u8) void {
+    if (alpha == 0) return;
+    for (0..16) |row| {
+        const py0 = y + @as(i32, @intCast(row * 2));
+        const py1 = py0 + 1;
+        for (0..16) |col| {
+            const color = icon[row][col];
+            if (color == 0x00000000) continue;
+            const argb: u32 = (@as(u32, alpha) << 24) | (color & 0x00FFFFFF);
+            const px0 = x + @as(i32, @intCast(col * 2));
+            const px1 = px0 + 1;
+            if (px0 >= 0 and py0 >= 0 and px0 < @as(i32, @intCast(target_w)) and py0 < @as(i32, @intCast(target_h))) {
+                const off = @as(u32, @intCast(py0)) * target_w + @as(u32, @intCast(px0));
+                target[off] = blendPixel(target[off], argb);
+            }
+            if (px1 >= 0 and py0 >= 0 and px1 < @as(i32, @intCast(target_w)) and py0 < @as(i32, @intCast(target_h))) {
+                const off = @as(u32, @intCast(py0)) * target_w + @as(u32, @intCast(px1));
+                target[off] = blendPixel(target[off], argb);
+            }
+            if (px0 >= 0 and py1 >= 0 and px0 < @as(i32, @intCast(target_w)) and py1 < @as(i32, @intCast(target_h))) {
+                const off = @as(u32, @intCast(py1)) * target_w + @as(u32, @intCast(px0));
+                target[off] = blendPixel(target[off], argb);
+            }
+            if (px1 >= 0 and py1 >= 0 and px1 < @as(i32, @intCast(target_w)) and py1 < @as(i32, @intCast(target_h))) {
+                const off = @as(u32, @intCast(py1)) * target_w + @as(u32, @intCast(px1));
+                target[off] = blendPixel(target[off], argb);
+            }
+        }
+    }
+}
+
 pub fn drawIcon16(x: i32, y: i32, icon: *const [16][16]u32) void {
     for (0..16) |row| {
         const py = y + @as(i32, @intCast(row));

@@ -3133,6 +3133,9 @@ pub fn handleUserPageFault(cr2: usize, error_code: u64) bool {
         const va_aligned = cr2 & ~@as(usize, 0xFFF);
         const frame = vmm.allocAndMapUserPage(pd, va_aligned, vmm.protToMapFlags(r.prot)) orelse {
             @import("../debug/kdbg.zig").pfEvent(@intCast(cur), cr2, @truncate(error_code), 0, false);
+            debug.klog("[pf-fail] PID={d} cr2=0x{X} — region[{d}] matched (0x{X}..0x{X}) but allocAndMapUserPage failed\n", .{
+                cur, cr2, i, r.start, r.end,
+            });
             return false;
         };
         @import("../debug/kdbg.zig").pfEvent(@intCast(cur), cr2, @truncate(error_code), 0, true);
@@ -3202,6 +3205,27 @@ pub fn handleUserPageFault(cr2: usize, error_code: u64) bool {
             lead.acct_peak_rss = lead.acct_current_rss;
         }
         return true;
+    }
+    // No region matched. Diagnostic: dump lazy region table so we can see
+    // whether the fault address is past the heap end, in an unexpected
+    // gap between regions, or in territory we never mapped. Throttled
+    // per-pid (one dump per crashing PCB) so a wild pointer in a loop
+    // doesn't drown serial.
+    const dbg2 = struct {
+        var dumped: [MAX_PROCS]bool = [_]bool{false} ** MAX_PROCS;
+    };
+    if (cur < MAX_PROCS and !dbg2.dumped[cur]) {
+        dbg2.dumped[cur] = true;
+        debug.klog("[pf-miss] PID={d} cr2=0x{X} err=0x{X} — no lazy region matches; user_brk=0x{X}, heap_idx={d}, count={d}\n", .{
+            cur, cr2, error_code, lead.user_brk, lead.heap_lazy_idx, lead.lazy_count,
+        });
+        var j: u8 = 0;
+        while (j < lead.lazy_count) : (j += 1) {
+            const r = lead.lazy_regions[j];
+            debug.klog("[pf-miss]   region[{d}] start=0x{X} end=0x{X} prot=0x{X}\n", .{
+                j, r.start, r.end, r.prot,
+            });
+        }
     }
     return false;
 }

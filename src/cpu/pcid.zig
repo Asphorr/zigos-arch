@@ -136,10 +136,69 @@ pub fn restoreSaved(saved_cr3: u64, cpu_id: u8) void {
 /// TLB entries for this PCID will see the gen mismatch on their next
 /// `loadCr3(pcid, ...)` and flush. Also catches the local CPU up so its
 /// next reload (post-flushLocalTlb) sets bit 63 = 1.
+///
+/// Kept as belt-and-suspenders even when INVPCID is in use: INVPCID
+/// type 1 explicitly flushes the named PCID's entries on the peer CPU,
+/// so the lazy-flush mechanism is redundant in that path. The cost is
+/// one atomic increment per shootdown — cheap enough to keep as
+/// defense against a stray entry slipping past the INVPCID issue.
 pub fn bumpAfterShootdown(pcid: u16, cpu_id: u8) void {
     if (!protect.pcid_supported or pcid == 0 or pcid >= MAX_PCID) return;
     const new_gen = global_gen[pcid].fetchAdd(1, .acq_rel) + 1;
     if (cpu_id < smp.MAX_CPUS) {
         local_gen[cpu_id][pcid] = new_gen;
     }
+}
+
+// ---------------------------------------------------------------------------
+// INVPCID — selective TLB invalidation
+// ---------------------------------------------------------------------------
+//
+// INVPCID gives us per-(PCID, VA) and per-PCID flushes without the
+// blunt-instrument cost of `mov cr3, cr3` (which flushes all non-global
+// entries for the currently-loaded PCID and leaves other PCIDs' entries
+// stale).
+//
+// The descriptor is a 16-byte memory operand: bits[11:0] of the first
+// qword carry the PCID, bits[63:12] are reserved (must be zero); the
+// second qword is the linear address (only used by type 0). The "type"
+// is passed in a register operand (1..3 are the documented values).
+//
+// Spec ref: Intel SDM Vol 2 — INVPCID instruction.
+
+pub const InvpcidType = enum(u64) {
+    /// Type 0: invalidate one (PCID, linear-address) mapping. Cheapest;
+    /// other entries for the same PCID survive.
+    address = 0,
+    /// Type 1: invalidate all entries for the named PCID (except globals).
+    /// Drop-in replacement for `mov cr3, cr3` that doesn't touch other
+    /// PCIDs' TLB working sets on the target CPU.
+    single_context = 1,
+    /// Type 2: invalidate all entries across all PCIDs INCLUDING globals.
+    /// Kernel-mapping changes only.
+    all_with_globals = 2,
+    /// Type 3: invalidate all entries across all PCIDs EXCEPT globals.
+    /// Equivalent to a CR3 toggle that lands back on the same PML4.
+    all_except_globals = 3,
+};
+
+const InvpcidDescriptor = extern struct {
+    pcid_and_reserved: u64,
+    linear_address: u64,
+};
+
+/// Issue an INVPCID. Caller is responsible for checking
+/// `protect.invpcid_supported`; this function does NOT gate on it
+/// (#UD on unsupported CPUs).
+pub inline fn invpcid(t: InvpcidType, p: u16, va: u64) void {
+    var desc: InvpcidDescriptor = .{
+        .pcid_and_reserved = @as(u64, p) & 0xFFF,
+        .linear_address = va,
+    };
+    const ty: u64 = @intFromEnum(t);
+    asm volatile ("invpcid (%[d]), %[t]"
+        :
+        : [d] "r" (&desc),
+          [t] "r" (ty),
+        : .{ .memory = true });
 }

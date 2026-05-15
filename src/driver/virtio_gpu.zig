@@ -5,6 +5,7 @@ const paging = @import("../mm/paging.zig");
 const debug = @import("../debug/debug.zig");
 const idt = @import("../cpu/idt.zig");
 const msix = @import("../time/msix.zig");
+const iommu = @import("../cpu/iommu.zig");
 const SpinLock = @import("../proc/spinlock.zig").SpinLock;
 const apic = @import("../time/apic.zig");
 const perf = @import("../debug/perf.zig");
@@ -434,6 +435,13 @@ var notify_base: usize = 0; // MMIO address of notify region
 var notify_off_multiplier: u32 = 0;
 var ctrl_vq: Virtqueue = .{};
 var cursor_vq: Virtqueue = .{};
+
+// PCI BDF cached at init so the lazy paths (initCursor, resourceCreate*Blob,
+// late framebuffer attaches) can call iommu.dmaMap without re-walking the
+// PCI cache. Same pattern as virtio_net / xhci / hda.
+var pci_bus: u8 = 0;
+var pci_dev: u8 = 0;
+var pci_func: u8 = 0;
 // Cursor command ring. Single-page (4 KB) carved into CURSOR_RING_SIZE
 // UpdateCursor slots. Each sendCursorCmd writes into a fresh slot and
 // hands its physical address to the device; the previous in-flight slot
@@ -1067,6 +1075,13 @@ pub fn init(xres: u32, yres: u32) bool {
     // Bus master + MEM/IO + INTx-disable (virtio uses MSI-X for the
     // controlq/cursorq via the common cap below).
     pci.bindDevice(dev_found);
+    pci_bus = dev_found.bus;
+    pci_dev = dev_found.dev;
+    pci_func = dev_found.func;
+
+    // Switch to isolated DMA. Every subsequent DMA buffer must be
+    // dmaMap'd before the device touches it, or the IOMMU faults.
+    _ = iommu.enableIsolation(pci_bus, pci_dev, pci_func);
 
     // Parse PCI capabilities to find common config + notify region.
     const common_cap = pci.findVirtioCap(dev_found, VIRTIO_PCI_CAP_COMMON_CFG) orelse {
@@ -1180,10 +1195,16 @@ pub fn init(xres: u32, yres: u32) bool {
         ccWrite8(CC_DEVICE_STATUS, 0x80);
         return false;
     }
+    // Map the queue rings into our IOVA space. Desc/avail share one page,
+    // used has its own.
+    _ = iommu.dmaMap(pci_bus, pci_dev, pci_func, ctrl_vq.desc_phys, 4096, .{});
+    _ = iommu.dmaMap(pci_bus, pci_dev, pci_func, ctrl_vq.used_phys, 4096, .{});
 
     // Allocate command buffer (4 contiguous pages for large scatter-gather lists)
     cmd_phys = pmm.allocContiguous(CMD_PAGES) orelse return false;
     resp_phys = pmm.allocFrame() orelse return false;
+    _ = iommu.dmaMap(pci_bus, pci_dev, pci_func, cmd_phys, CMD_PAGES * 4096, .{});
+    _ = iommu.dmaMap(pci_bus, pci_dev, pci_func, resp_phys, 4096, .{});
 
     // Driver OK
     ccWrite8(CC_DEVICE_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK);
@@ -1227,6 +1248,16 @@ pub fn init(xres: u32, yres: u32) bool {
     for (0..fb_size) |i| fb_u8[i] = 0;
 
     debug.klog("[virtio-gpu] FB: {d}x{d} ({d} pages)\n", .{ width, height, fb_num_pages });
+
+    // Map every FB page into the device's IOVA space. allocGuestFB picks
+    // scattered phys frames (one per page), so we iterate rather than
+    // assuming contiguity.
+    {
+        var pi: u32 = 0;
+        while (pi < fb_num_pages) : (pi += 1) {
+            _ = iommu.dmaMap(pci_bus, pci_dev, pci_func, fb_page_phys[pi], 4096, .{});
+        }
+    }
 
     // Create display resources
     current_resource_id = 1;
@@ -1399,6 +1430,14 @@ pub fn changeMode(new_w: u32, new_h: u32) bool {
     debug.klog("[virtio-gpu] Unref resource {d}...\n", .{current_resource_id});
     _ = resourceUnref(current_resource_id);
 
+    // Unmap old FB pages from device IOVA before they go back to PMM.
+    {
+        var pi: u32 = 0;
+        while (pi < fb_num_pages) : (pi += 1) {
+            iommu.dmaUnmap(pci_bus, pci_dev, pci_func, fb_page_phys[pi], 4096);
+        }
+    }
+
     // Free old guest FB pages
     debug.klog("[virtio-gpu] Freeing old FB...\n", .{});
     paging.freeGuestFB(fb_num_pages);
@@ -1412,6 +1451,14 @@ pub fn changeMode(new_w: u32, new_h: u32) bool {
     framebuffer = fb_virt;
     width = new_w;
     height = new_h;
+
+    // Map new FB pages into device IOVA.
+    {
+        var pi: u32 = 0;
+        while (pi < fb_num_pages) : (pi += 1) {
+            _ = iommu.dmaMap(pci_bus, pci_dev, pci_func, fb_page_phys[pi], 4096, .{});
+        }
+    }
 
     // Zero new FB
     const fb_u8: [*]volatile u8 = @ptrCast(fb_virt);
@@ -1568,13 +1615,17 @@ pub fn initCursor() bool {
         debug.klog("[virtio-gpu] Failed to setup cursor queue\n", .{});
         return false;
     }
+    _ = iommu.dmaMap(pci_bus, pci_dev, pci_func, cursor_vq.desc_phys, 4096, .{});
+    _ = iommu.dmaMap(pci_bus, pci_dev, pci_func, cursor_vq.used_phys, 4096, .{});
 
     // Allocate cursor command page
     cursor_cmd_phys = pmm.allocFrame() orelse return false;
     @memset(@as([*]u8, @ptrFromInt(paging.physToVirt(cursor_cmd_phys)))[0..4096], 0);
+    _ = iommu.dmaMap(pci_bus, pci_dev, pci_func, cursor_cmd_phys, 4096, .{});
 
     // Allocate cursor image: 64x64 RGBA = 16384 bytes = 4 contiguous pages
     const cursor_img_phys = pmm.allocContiguous(4) orelse return false;
+    _ = iommu.dmaMap(pci_bus, pci_dev, pci_func, cursor_img_phys, 4 * 4096, .{});
 
     // Zero and draw cursor into the 64x64 RGBA buffer
     const pixels: [*]volatile u32 = @ptrFromInt(paging.physToVirt(cursor_img_phys));
@@ -1978,6 +2029,11 @@ pub fn transferToHost3D(ctx_id: u32, resource_id: u32, w: u32, h: u32, stride: u
 pub fn resourceCreateGuestBlob(ctx_id: u32, resource_id: u32, blob_flags: u32, phys_base: u64, size: u64) bool {
     debug.klog("[virtio-gpu] createGuestBlob: ctx={d} res={d} flags={d} phys=0x{X} size={d}\n",
         .{ ctx_id, resource_id, blob_flags, phys_base, size });
+
+    // Map the guest-blob backing into the device's IOVA before the host
+    // starts reading/writing through it. Caller passes a contiguous phys
+    // range so one dmaMap call covers it.
+    _ = iommu.dmaMap(pci_bus, pci_dev, pci_func, phys_base, size, .{});
 
     const cmd_dst: [*]volatile u8 = @ptrFromInt(paging.physToVirt(cmd_phys));
     @memset(cmd_dst[0..4096], 0);

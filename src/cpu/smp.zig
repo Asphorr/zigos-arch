@@ -152,6 +152,11 @@ pub const CpuLocal = struct {
     /// loop, 100% CPU, no log output) leave us blind. Bumped under cli, no
     /// atomic needed for self-write; readers from peer CPUs use volatile.
     irq_tick_count: u64 = 0,
+    /// Counts only the IRQ0 firings that interrupted an idle PCB on this CPU.
+    /// `(irq_tick_count - idle_tick_count) / irq_tick_count` over a window
+    /// gives instantaneous CPU usage — what htop/top draw. Updated under the
+    /// same cli as `irq_tick_count` so the pair stays monotonic to readers.
+    idle_tick_count: u64 = 0,
     /// Watchdog scratch — last `peer.irq_tick_count` snapshot taken by this
     /// CPU's watchdog check, and how many consecutive 1s windows the peer
     /// hasn't advanced. Threshold-cross fires the watchdog autopsy.
