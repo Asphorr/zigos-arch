@@ -40,7 +40,22 @@ pub const Error = error{
     BadCert,
     UnsupportedAlgorithm,
     BadEcPoint,
+    BadTime,
 } || asn1.Error;
+
+/// Calendar date+time as parsed from an X.509 Validity field. Always UTC.
+/// We keep it in this generic form rather than converting to a Unix
+/// epoch here so x509.zig stays time.zig-agnostic — callers that care
+/// about absolute time (chain validity check, audit logging) do the
+/// conversion themselves.
+pub const Time = struct {
+    year: u16,
+    month: u8,
+    day: u8,
+    hour: u8,
+    minute: u8,
+    second: u8,
+};
 
 pub const KeyAlgorithm = enum {
     ecdsa_p256,
@@ -103,7 +118,52 @@ pub const Certificate = struct {
     /// extensions. SAN / KeyUsage / BasicConstraints etc. live in here
     /// — callers walk on demand.
     extensions_tlv: []const u8,
+
+    /// notBefore / notAfter from the Validity field, parsed from
+    /// UTCTime (pre-2050) or GeneralizedTime (post-2050). Used by the
+    /// chain verifier to reject expired or not-yet-valid certs.
+    not_before: Time,
+    not_after: Time,
 };
+
+/// Parse a Validity TIME element — either UTCTime (tag 0x17, 13 bytes
+/// "YYMMDDHHMMSSZ") or GeneralizedTime (tag 0x18, 15 bytes
+/// "YYYYMMDDHHMMSSZ"). Anything else (local-time variants, fractional
+/// seconds, +/-HHMM offsets) is rejected — RFC 5280 says certificates
+/// MUST use the Z-terminated form.
+fn parseTime(p: *asn1.Parser) Error!Time {
+    const v = try p.takeAny();
+    var year: u16 = 0;
+    var idx: usize = 0;
+    if (v.tag == 0x17) {
+        // UTCTime: YY MM DD HH MM SS Z
+        if (v.value.len != 13 or v.value[12] != 'Z') return Error.BadTime;
+        const yy = try twoDigit(v.value[0..2]);
+        // RFC 5280 §4.1.2.5.1: YY < 50 → 20YY, else 19YY.
+        year = if (yy < 50) 2000 + @as(u16, yy) else 1900 + @as(u16, yy);
+        idx = 2;
+    } else if (v.tag == 0x18) {
+        // GeneralizedTime: YYYY MM DD HH MM SS Z
+        if (v.value.len != 15 or v.value[14] != 'Z') return Error.BadTime;
+        const y1 = try twoDigit(v.value[0..2]);
+        const y2 = try twoDigit(v.value[2..4]);
+        year = @as(u16, y1) * 100 + @as(u16, y2);
+        idx = 4;
+    } else return Error.BadTime;
+
+    const month = try twoDigit(v.value[idx .. idx + 2]);
+    const day = try twoDigit(v.value[idx + 2 .. idx + 4]);
+    const hour = try twoDigit(v.value[idx + 4 .. idx + 6]);
+    const minute = try twoDigit(v.value[idx + 6 .. idx + 8]);
+    const second = try twoDigit(v.value[idx + 8 .. idx + 10]);
+    if (month < 1 or month > 12 or day < 1 or day > 31 or hour > 23 or minute > 59 or second > 60) return Error.BadTime;
+    return .{ .year = year, .month = month, .day = day, .hour = hour, .minute = minute, .second = second };
+}
+
+fn twoDigit(s: []const u8) Error!u8 {
+    if (s.len < 2 or s[0] < '0' or s[0] > '9' or s[1] < '0' or s[1] > '9') return Error.BadTime;
+    return (s[0] - '0') * 10 + (s[1] - '0');
+}
 
 pub fn parse(der: []const u8) Error!Certificate {
     var top = asn1.Parser.init(der);
@@ -132,7 +192,9 @@ pub fn parse(der: []const u8) Error!Certificate {
     _ = try tbs.takeInteger(); // serialNumber
     _ = try tbs.takeSequence(); // signature (algorithm) — repeated of outer
     const issuer_tlv = (try asn1.takeTlv(&tbs, 0x30)).encoded;
-    _ = try tbs.takeSequence(); // validity
+    var validity = try tbs.takeSequence();
+    const not_before = try parseTime(&validity);
+    const not_after = try parseTime(&validity);
     const subject_tlv = (try asn1.takeTlv(&tbs, 0x30)).encoded;
 
     // SubjectPublicKeyInfo ::= SEQUENCE {
@@ -207,5 +269,7 @@ pub fn parse(der: []const u8) Error!Certificate {
         .signature = sig_bits,
         .public_key = pk,
         .extensions_tlv = extensions_tlv,
+        .not_before = not_before,
+        .not_after = not_after,
     };
 }

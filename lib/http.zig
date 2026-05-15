@@ -46,6 +46,7 @@ pub const Error = error{
     TooManyHeaders,
     ResponseTooLarge,
     BadChunk,
+    StreamClosed,
 };
 
 pub const MAX_HEADERS: usize = 32;
@@ -243,11 +244,25 @@ pub fn post(url: []const u8, content_type: []const u8, body: []const u8, buf: []
 
 pub fn send(req: Request, buf: []u8) Error!Response {
     // Redirects rewrite the URL; we keep a local stable copy so the next
-    // sendOnce can safely reuse `buf` for its own response.
+    // sendOnce can safely reuse `buf` for its own response. Also: if the
+    // caller passed a bare "host.com/path" with no scheme, default to
+    // https — most real-world URLs are TLS now, and the alternative
+    // (UnsupportedScheme) is a confusing first-touch failure.
     var url_storage: [MAX_URL]u8 = undefined;
-    if (req.url.len > url_storage.len) return Error.BadUrl;
-    @memcpy(url_storage[0..req.url.len], req.url);
-    var current: []const u8 = url_storage[0..req.url.len];
+    const has_scheme = std.mem.startsWith(u8, req.url, "http://") or std.mem.startsWith(u8, req.url, "https://");
+    var current_len: usize = 0;
+    if (!has_scheme) {
+        const prefix = "https://";
+        if (req.url.len + prefix.len > url_storage.len) return Error.BadUrl;
+        @memcpy(url_storage[0..prefix.len], prefix);
+        @memcpy(url_storage[prefix.len .. prefix.len + req.url.len], req.url);
+        current_len = prefix.len + req.url.len;
+    } else {
+        if (req.url.len > url_storage.len) return Error.BadUrl;
+        @memcpy(url_storage[0..req.url.len], req.url);
+        current_len = req.url.len;
+    }
+    var current: []const u8 = url_storage[0..current_len];
 
     var redirects: u8 = 0;
     while (true) {
@@ -273,6 +288,363 @@ pub fn send(req: Request, buf: []u8) Error!Response {
         @memcpy(url_storage[0..loc.len], loc);
         current = url_storage[0..loc.len];
     }
+}
+
+// ---------------------------------------------------------------------
+// Streaming API. For when the response body is large (multi-MB
+// downloads), unknown ahead of time, or needs to be processed
+// incrementally (parse-as-you-fetch).
+//
+// Usage:
+//   var stream: http.Stream = undefined;
+//   try http.openStream(.{ .url = "https://example.com/big.bin" }, &hdr_buf, &stream);
+//   defer stream.close();
+//   const r = stream.response();
+//   if (r.status != 200) ... ;
+//   var chunk: [4096]u8 = undefined;
+//   while (true) {
+//       const n = try stream.readChunk(&chunk);
+//       if (n == 0) break;
+//       // ... do something with chunk[0..n]
+//   }
+//
+// Differences from send():
+//   - No automatic redirect chasing. Caller inspects status; if 3xx,
+//     pulls Location header, closes stream, opens a new one.
+//   - Response.body field is always empty (body is delivered via
+//     readChunk).
+//   - header_buf must outlive the Stream — response.headers point
+//     into it.
+
+const STAGE_SIZE: usize = 8 * 1024;
+
+const BodyMode = enum {
+    content_length, // bounded by Content-Length header
+    chunked, // Transfer-Encoding: chunked
+    eof, // HTTP/1.0 style — body ends at conn close
+    none, // HEAD / 204 / 304 — no body
+};
+
+const ChunkedState = enum {
+    reading_size, // parsing "<hex>\r\n" line
+    in_chunk_data, // delivering chunk payload bytes
+    after_chunk_crlf, // skipping CRLF after a chunk's payload
+    after_zero, // last chunk seen; consuming trailer lines until blank
+    finished,
+};
+
+pub const Stream = struct {
+    conn: Conn,
+    response_data: Response,
+    mode: BodyMode,
+
+    /// Staging buffer holding unread bytes. Residual body bytes from
+    /// the header recv get copied here at open; refilled from `conn`
+    /// when empty. Sized to cover one max-size TLS record + a chunk
+    /// size line, comfortably.
+    stage: [STAGE_SIZE]u8,
+    stage_pos: usize,
+    stage_len: usize,
+
+    cl_remaining: u64,
+    chunked: ChunkedState,
+    chunk_remaining: u32,
+
+    eof_seen: bool,
+    closed: bool,
+
+    pub fn response(self: *const Stream) *const Response {
+        return &self.response_data;
+    }
+
+    pub fn readChunk(self: *Stream, out: []u8) Error!usize {
+        if (self.closed) return Error.StreamClosed;
+        if (out.len == 0) return 0;
+        return switch (self.mode) {
+            .none => 0,
+            .content_length => self.readClBody(out),
+            .chunked => self.readChunkedBody(out),
+            .eof => self.readEofBody(out),
+        };
+    }
+
+    pub fn close(self: *Stream) void {
+        if (self.closed) return;
+        self.closed = true;
+        self.conn.close();
+    }
+
+    // ---- Internals ----
+
+    /// Ensure stage has at least one byte, recvving from conn if
+    /// needed. Returns false on conn EOF (stage stays empty).
+    fn fillStage(self: *Stream) Error!bool {
+        if (self.stage_pos < self.stage_len) return true;
+        if (self.eof_seen) return false;
+        self.stage_pos = 0;
+        const n = try self.conn.recv(self.stage[0..]);
+        self.stage_len = n;
+        if (n == 0) {
+            self.eof_seen = true;
+            return false;
+        }
+        return true;
+    }
+
+    /// Pop one byte from stage. Caller must ensure fillStage returned true.
+    fn popByte(self: *Stream) u8 {
+        const b = self.stage[self.stage_pos];
+        self.stage_pos += 1;
+        return b;
+    }
+
+    fn readClBody(self: *Stream, out: []u8) Error!usize {
+        if (self.cl_remaining == 0) return 0;
+        if (!try self.fillStage()) return Error.BadResponse; // EOF mid-body
+        const stage_avail = self.stage_len - self.stage_pos;
+        const want = @min(@min(out.len, stage_avail), @as(usize, @intCast(@min(self.cl_remaining, @as(u64, 0xFFFFFFFF)))));
+        @memcpy(out[0..want], self.stage[self.stage_pos .. self.stage_pos + want]);
+        self.stage_pos += want;
+        self.cl_remaining -= want;
+        return want;
+    }
+
+    fn readEofBody(self: *Stream, out: []u8) Error!usize {
+        if (!try self.fillStage()) return 0;
+        const stage_avail = self.stage_len - self.stage_pos;
+        const want = @min(out.len, stage_avail);
+        @memcpy(out[0..want], self.stage[self.stage_pos .. self.stage_pos + want]);
+        self.stage_pos += want;
+        return want;
+    }
+
+    /// Decode chunked body incrementally. Each call emits up to
+    /// out.len bytes of decoded payload, walking through size lines
+    /// and CRLF separators in between as needed. Returns 0 at the
+    /// end-of-stream "0\r\n\r\n" terminator.
+    fn readChunkedBody(self: *Stream, out: []u8) Error!usize {
+        var written: usize = 0;
+        while (written < out.len) {
+            switch (self.chunked) {
+                .reading_size => {
+                    // Read hex digits until we see CR; then expect LF.
+                    var size: u32 = 0;
+                    var saw_digit = false;
+                    while (true) {
+                        if (!try self.fillStage()) return Error.BadChunk;
+                        const c = self.popByte();
+                        if (c == '\r') {
+                            if (!try self.fillStage()) return Error.BadChunk;
+                            if (self.popByte() != '\n') return Error.BadChunk;
+                            break;
+                        }
+                        // ';' starts chunk extension — ignore until CR.
+                        if (c == ';') {
+                            while (true) {
+                                if (!try self.fillStage()) return Error.BadChunk;
+                                const x = self.popByte();
+                                if (x == '\r') {
+                                    if (!try self.fillStage()) return Error.BadChunk;
+                                    if (self.popByte() != '\n') return Error.BadChunk;
+                                    break;
+                                }
+                            }
+                            break;
+                        }
+                        const d: ?u8 = if (c >= '0' and c <= '9')
+                            c - '0'
+                        else if (c >= 'a' and c <= 'f')
+                            c - 'a' + 10
+                        else if (c >= 'A' and c <= 'F')
+                            c - 'A' + 10
+                        else
+                            null;
+                        if (d) |dv| {
+                            if (size > 0x0FFFFFFF) return Error.BadChunk;
+                            size = size * 16 + dv;
+                            saw_digit = true;
+                        } else return Error.BadChunk;
+                    }
+                    if (!saw_digit) return Error.BadChunk;
+                    if (size == 0) {
+                        self.chunked = .after_zero;
+                    } else {
+                        self.chunk_remaining = size;
+                        self.chunked = .in_chunk_data;
+                    }
+                },
+                .in_chunk_data => {
+                    if (!try self.fillStage()) return Error.BadChunk;
+                    const stage_avail = self.stage_len - self.stage_pos;
+                    const want = @min(@min(out.len - written, stage_avail), @as(usize, self.chunk_remaining));
+                    @memcpy(out[written .. written + want], self.stage[self.stage_pos .. self.stage_pos + want]);
+                    self.stage_pos += want;
+                    written += want;
+                    self.chunk_remaining -= @intCast(want);
+                    if (self.chunk_remaining == 0) self.chunked = .after_chunk_crlf;
+                    if (written == out.len) return written;
+                },
+                .after_chunk_crlf => {
+                    if (!try self.fillStage()) return Error.BadChunk;
+                    if (self.popByte() != '\r') return Error.BadChunk;
+                    if (!try self.fillStage()) return Error.BadChunk;
+                    if (self.popByte() != '\n') return Error.BadChunk;
+                    self.chunked = .reading_size;
+                },
+                .after_zero => {
+                    // Drain trailer headers (lines ending in CRLF) until a
+                    // blank CRLF line marks end of message.
+                    if (!try self.fillStage()) {
+                        self.chunked = .finished;
+                        return written;
+                    }
+                    const first = self.popByte();
+                    if (first == '\r') {
+                        if (!try self.fillStage()) {
+                            self.chunked = .finished;
+                            return written;
+                        }
+                        if (self.popByte() != '\n') return Error.BadChunk;
+                        self.chunked = .finished;
+                        return written;
+                    }
+                    // Non-blank — eat rest of line, then loop to read the next.
+                    while (true) {
+                        if (!try self.fillStage()) {
+                            self.chunked = .finished;
+                            return written;
+                        }
+                        const x = self.popByte();
+                        if (x == '\r') {
+                            if (!try self.fillStage()) {
+                                self.chunked = .finished;
+                                return written;
+                            }
+                            if (self.popByte() != '\n') return Error.BadChunk;
+                            break;
+                        }
+                    }
+                },
+                .finished => return written,
+            }
+        }
+        return written;
+    }
+};
+
+pub fn openStream(req: Request, header_buf: []u8, stream: *Stream) Error!void {
+    // Normalize URL same as send(): default to https:// when no scheme.
+    var url_storage: [MAX_URL]u8 = undefined;
+    const has_scheme = std.mem.startsWith(u8, req.url, "http://") or std.mem.startsWith(u8, req.url, "https://");
+    var url_slice: []const u8 = undefined;
+    if (!has_scheme) {
+        const prefix = "https://";
+        if (req.url.len + prefix.len > url_storage.len) return Error.BadUrl;
+        @memcpy(url_storage[0..prefix.len], prefix);
+        @memcpy(url_storage[prefix.len .. prefix.len + req.url.len], req.url);
+        url_slice = url_storage[0 .. prefix.len + req.url.len];
+    } else {
+        if (req.url.len > url_storage.len) return Error.BadUrl;
+        @memcpy(url_storage[0..req.url.len], req.url);
+        url_slice = url_storage[0..req.url.len];
+    }
+    const url = try parseUrl(url_slice);
+
+    var conn = try Conn.open(url);
+    errdefer conn.close();
+
+    try sendRequestLine(&conn, req.method, url, req.headers, req.body);
+
+    // Recv until we see \r\n\r\n.
+    var total: usize = 0;
+    var header_end: usize = 0;
+    {
+        var scanned: usize = 0;
+        while (true) {
+            if (total >= header_buf.len) return Error.ResponseTooLarge;
+            const n = try conn.recv(header_buf[total..]);
+            if (n == 0) return Error.BadResponse;
+            total += n;
+            const scan_start: usize = if (scanned >= 3) scanned - 3 else 0;
+            var i = scan_start;
+            while (i + 4 <= total) : (i += 1) {
+                if (header_buf[i] == '\r' and header_buf[i + 1] == '\n' and header_buf[i + 2] == '\r' and header_buf[i + 3] == '\n') {
+                    header_end = i + 4;
+                    break;
+                }
+            }
+            if (header_end != 0) break;
+            scanned = total;
+        }
+    }
+
+    var resp: Response = .{
+        .status = 0,
+        .status_text = "",
+        .headers_buf = undefined,
+        .n_headers = 0,
+        .body = "",
+    };
+    try parseStatusAndHeaders(header_buf[0..header_end], &resp);
+
+    // Initialize the stream value in place.
+    stream.* = .{
+        .conn = conn,
+        .response_data = resp,
+        .mode = undefined,
+        .stage = undefined,
+        .stage_pos = 0,
+        .stage_len = 0,
+        .cl_remaining = 0,
+        .chunked = .reading_size,
+        .chunk_remaining = 0,
+        .eof_seen = false,
+        .closed = false,
+    };
+
+    // Copy any residual body bytes (the ones that landed past the
+    // header terminator) into the stage so readChunk sees them first.
+    const residual = total - header_end;
+    if (residual > 0) {
+        if (residual > stream.stage.len) {
+            // Headers ate into a too-small header_buf — pathological.
+            // Drop residual to keep semantics simple; caller will recv
+            // body again from conn (and miss those bytes — error).
+            return Error.ResponseTooLarge;
+        }
+        @memcpy(stream.stage[0..residual], header_buf[header_end..total]);
+        stream.stage_len = residual;
+    }
+
+    // Decide body framing.
+    if (req.method == .HEAD or resp.status == 204 or resp.status == 304) {
+        stream.mode = .none;
+        return;
+    }
+    const te = resp.getHeader("Transfer-Encoding");
+    const is_chunked = te != null and containsIgnoreCase(te.?, "chunked");
+    if (is_chunked) {
+        stream.mode = .chunked;
+        return;
+    }
+    if (resp.getHeader("Content-Length")) |v| {
+        if (parseU64(stripSpaces(v))) |cl| {
+            stream.mode = .content_length;
+            stream.cl_remaining = cl;
+            return;
+        }
+    }
+    stream.mode = .eof;
+}
+
+fn parseU64(s: []const u8) ?u64 {
+    if (s.len == 0) return null;
+    var v: u64 = 0;
+    for (s) |c| {
+        if (c < '0' or c > '9') return null;
+        v = v *% 10 +% (c - '0');
+    }
+    return v;
 }
 
 // ---------------------------------------------------------------------

@@ -18,6 +18,7 @@
 const std = @import("std");
 const asn1 = @import("../asn1.zig");
 const x509 = @import("../x509.zig");
+const time = @import("../../time/time.zig");
 
 const EcdsaP256Sha256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
 const EcdsaP384Sha384 = std.crypto.sign.ecdsa.EcdsaP384Sha384;
@@ -228,6 +229,43 @@ fn dnsNameMatches(cert_name: []const u8, hostname: []const u8) bool {
     }
 
     return eqlCaseInsensitive(cert_name, hostname);
+}
+
+/// Reject the cert if the current wall-clock isn't inside its
+/// [notBefore, notAfter] window. Returns true on OK, false on expired
+/// or not-yet-valid. If the RTC hasn't initialized (time.now() returns
+/// {0,0}), we skip the check — better to let TLS proceed than to fail
+/// every connection on a system without a battery-backed clock.
+pub fn checkValidity(cert: x509.Certificate) bool {
+    const now = time.now();
+    if (now.sec == 0) return true;
+    const not_before_epoch = timeToUnix(cert.not_before);
+    const not_after_epoch = timeToUnix(cert.not_after);
+    if (now.sec < not_before_epoch) return false;
+    if (now.sec > not_after_epoch) return false;
+    return true;
+}
+
+/// Convert x509.Time (UTC calendar) → Unix epoch seconds. Uses the
+/// same days-from-civil algorithm as src/time/time.zig (Howard
+/// Hinnant), inlined here to avoid a kernel-internal time-module
+/// dependency cycle.
+fn timeToUnix(t: x509.Time) u64 {
+    const days = daysFromCivil(t.year, t.month, t.day);
+    if (days < 0) return 0;
+    const secs_in_day: u64 = @as(u64, t.hour) * 3600 + @as(u64, t.minute) * 60 + @as(u64, t.second);
+    return @as(u64, @intCast(days)) * 86400 + secs_in_day;
+}
+
+fn daysFromCivil(year: u16, month: u8, day: u8) i64 {
+    const y_adj: i64 = if (month <= 2) @as(i64, year) - 1 else @as(i64, year);
+    const era: i64 = @divFloor(if (y_adj >= 0) y_adj else y_adj - 399, 400);
+    const yoe: u64 = @intCast(y_adj - era * 400);
+    const m: u64 = @intCast(month);
+    const d: u64 = @intCast(day);
+    const doy: u64 = (153 * (if (m > 2) m - 3 else m + 9) + 2) / 5 + d - 1;
+    const doe: u64 = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + @as(i64, @intCast(doe)) - 719468;
 }
 
 fn eqlCaseInsensitive(a: []const u8, b: []const u8) bool {

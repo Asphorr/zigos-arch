@@ -178,7 +178,26 @@ pub fn tlsConnect(ip: [4]u8, port: u16, sni: []const u8) ?u8 {
     // 5. Read ServerHello record header + body.
     var hdr: [5]u8 = undefined;
     if (readAtLeast(tcp_slot, &hdr, 5, process.tick_count + 3000) != 5) return null;
-    if (hdr[0] != @intFromEnum(types.ContentType.handshake)) return null;
+    if (hdr[0] != @intFromEnum(types.ContentType.handshake)) {
+        // Most common cause: server replied with a TLS Alert (type 21)
+        // instead of a Handshake (type 22). Two-byte alert payload =
+        // {level, description}. Decode + log so we can tell apart e.g.
+        // protocol_version (70), handshake_failure (40), unrecognized_name
+        // (112), inappropriate_fallback (86), or close_notify (0).
+        if (hdr[0] == @intFromEnum(types.ContentType.alert)) {
+            const alen: usize = (@as(usize, hdr[3]) << 8) | @as(usize, hdr[4]);
+            if (alen == 2) {
+                var ab: [2]u8 = undefined;
+                _ = readAtLeast(tcp_slot, &ab, 2, process.tick_count + 200);
+                debug.klog("[tls-conn] server alert level={d} desc={d}\n", .{ ab[0], ab[1] });
+            } else {
+                debug.klog("[tls-conn] server alert len={d}\n", .{alen});
+            }
+        } else {
+            debug.klog("[tls-conn] unexpected record type 0x{x:0>2}\n", .{hdr[0]});
+        }
+        return null;
+    }
     const body_len: usize = (@as(usize, hdr[3]) << 8) | @as(usize, hdr[4]);
     if (body_len > body_buf.len) return null;
     if (readAtLeast(tcp_slot, body_buf[0..body_len], body_len, process.tick_count + 500) != body_len) return null;
@@ -357,6 +376,18 @@ pub fn tlsConnect(ip: [4]u8, port: u16, sni: []const u8) ?u8 {
             return null;
         }
         debug.klog("[tls-conn] hostname OK — leaf cert SAN covers SNI\n", .{});
+
+        // 9c. Time validity. Only enforced on trust-anchored chains for
+        //     the same reason as SAN matching — self-signed test certs
+        //     might be issued with quirky dates and we don't want to
+        //     break the local-test-server workflow. The RTC supplies
+        //     the time; if the RTC is unset, checkValidity returns true
+        //     and we skip silently.
+        if (!cert_verify.checkValidity(leaf)) {
+            debug.klog("[tls-conn] leaf cert NOT in validity window — refusing\n", .{});
+            return null;
+        }
+        debug.klog("[tls-conn] cert validity OK\n", .{});
     }
 
     // 10. Capture transcript hash after server Finished, build + send

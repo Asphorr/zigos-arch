@@ -1,20 +1,24 @@
-// curl — fetch a URL and dump the body to stdout.
+// curl — fetch a URL and dump the body to stdout. Streaming version;
+// arbitrary response size, decoded one chunk at a time.
 //
 // Usage:
-//   curl <url>
-//   curl -i <url>      (include headers in output)
-//   curl -L <url>      (follow redirects — default on)
-//   curl --no-follow <url>  (return the 3xx response itself)
+//   curl <url>          GET, body to stdout
+//   curl -i <url>       include status line + headers in output
+//   curl -L <url>       follow 3xx redirects (absolute Location only)
 //
-// Built on lib/http.zig, which routes to TLS for https:// and plain
-// TCP for http://. The whole response materializes into a 64 KiB
-// buffer; bigger payloads return ResponseTooLarge.
+// Built on lib/http.zig streaming API. We hold a 16 KiB header_buf for
+// the response head and a 4 KiB read window for the body; total
+// footprint is ~28 KiB no matter how big the response.
 
 const libc = @import("libc");
 const http = @import("http");
 
-const BUF_SIZE: usize = 64 * 1024;
-var resp_buf: [BUF_SIZE]u8 = undefined;
+const HEADER_BUF_SIZE: usize = 16 * 1024;
+const BODY_CHUNK: usize = 4096;
+const MAX_FOLLOWS: u8 = 5;
+
+var header_buf: [HEADER_BUF_SIZE]u8 = undefined;
+var url_storage: [http.MAX_URL]u8 = undefined;
 
 fn copyArg(idx: u32, buf: []u8) ?[]u8 {
     const n = libc.getArgv(idx, buf);
@@ -41,22 +45,22 @@ fn errorName(err: http.Error) []const u8 {
         error.BufferTooSmall => "buffer too small",
         error.TooManyRedirects => "too many redirects",
         error.TooManyHeaders => "too many headers",
-        error.ResponseTooLarge => "response exceeds 64 KiB buffer",
+        error.ResponseTooLarge => "response headers exceed buffer",
         error.BadChunk => "bad chunked encoding",
+        error.StreamClosed => "stream closed",
     };
 }
 
 export fn _start() linksection(".text.entry") callconv(.c) void {
     if (libc.getArgc() < 2) {
         libc.print("\x1b[31mcurl: missing URL\x1b[0m\n");
-        libc.print("usage: curl [-i] [--no-follow] <url>\n");
+        libc.print("usage: curl [-i] [-L] <url>\n");
         libc.exit();
     }
 
     var show_headers = false;
-    var follow = true;
+    var follow = false;
     var url_arg: ?[]u8 = null;
-    var url_buf: [http.MAX_URL]u8 = undefined;
 
     var i: u32 = 1;
     while (i < libc.getArgc()) : (i += 1) {
@@ -66,33 +70,63 @@ export fn _start() linksection(".text.entry") callconv(.c) void {
             show_headers = true;
         } else if (streq(arg, "-L") or streq(arg, "--location")) {
             follow = true;
-        } else if (streq(arg, "--no-follow")) {
-            follow = false;
         } else {
-            if (arg.len > url_buf.len) {
+            if (arg.len > url_storage.len) {
                 libc.print("\x1b[31mcurl: URL too long\x1b[0m\n");
                 libc.exit();
             }
-            @memcpy(url_buf[0..arg.len], arg);
-            url_arg = url_buf[0..arg.len];
+            @memcpy(url_storage[0..arg.len], arg);
+            url_arg = url_storage[0..arg.len];
         }
     }
 
-    const url = url_arg orelse {
+    const initial_url = url_arg orelse {
         libc.print("\x1b[31mcurl: missing URL\x1b[0m\n");
         libc.exit();
     };
 
-    const resp = http.send(.{
-        .method = .GET,
-        .url = url,
-        .follow_redirects = follow,
-    }, &resp_buf) catch |err| {
-        libc.print("\x1b[31mcurl: ");
-        libc.print(errorName(err));
-        libc.print("\x1b[0m\n");
-        libc.exit();
-    };
+    // Redirect loop. Re-opens a fresh stream per hop because TLS conns
+    // and chunked decoders aren't resumable.
+    var current_url: []const u8 = initial_url;
+    var follows: u8 = 0;
+    var stream: http.Stream = undefined;
+
+    while (true) {
+        http.openStream(.{ .url = current_url }, &header_buf, &stream) catch |err| {
+            libc.print("\x1b[31mcurl: ");
+            libc.print(errorName(err));
+            libc.print("\x1b[0m\n");
+            libc.exit();
+        };
+
+        const resp = stream.response();
+        if (follow and resp.status >= 300 and resp.status < 400 and resp.status != 304) {
+            const loc = resp.getHeader("Location") orelse {
+                break;
+            };
+            // Only absolute redirects in v1 — relative ones need URL
+            // composition.
+            const is_abs = (loc.len >= 7 and (loc[0] == 'h' or loc[0] == 'H'));
+            if (!is_abs or loc.len > url_storage.len) {
+                break;
+            }
+            follows += 1;
+            if (follows > MAX_FOLLOWS) {
+                stream.close();
+                libc.print("\x1b[31mcurl: too many redirects\x1b[0m\n");
+                libc.exit();
+            }
+            // Save loc into url_storage; header_buf gets reused next hop.
+            @memcpy(url_storage[0..loc.len], loc);
+            current_url = url_storage[0..loc.len];
+            stream.close();
+            continue;
+        }
+        break;
+    }
+
+    defer stream.close();
+    const resp = stream.response();
 
     if (show_headers) {
         libc.print("HTTP/1.1 ");
@@ -109,11 +143,25 @@ export fn _start() linksection(".text.entry") callconv(.c) void {
         libc.print("\r\n");
     }
 
-    _ = libc.fwrite(1, resp.body);
-    if (resp.body.len > 0 and resp.body[resp.body.len - 1] != '\n') libc.printChar('\n');
+    var total: usize = 0;
+    var last_byte: u8 = 0;
+    var chunk: [BODY_CHUNK]u8 = undefined;
+    while (true) {
+        const n = stream.readChunk(&chunk) catch |err| {
+            libc.print("\n\x1b[31mcurl: ");
+            libc.print(errorName(err));
+            libc.print("\x1b[0m\n");
+            libc.exit();
+        };
+        if (n == 0) break;
+        _ = libc.fwrite(1, chunk[0..n]);
+        last_byte = chunk[n - 1];
+        total += n;
+    }
+    if (total > 0 and last_byte != '\n') libc.printChar('\n');
 
     libc.print("\x1b[2m--- ");
-    libc.printNum(@intCast(resp.body.len));
+    libc.printNum(@intCast(total));
     libc.print(" bytes, status ");
     libc.printNum(resp.status);
     libc.print(" ---\x1b[0m\n");

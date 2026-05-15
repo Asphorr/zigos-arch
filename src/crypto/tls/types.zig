@@ -39,8 +39,10 @@ pub const CipherSuite = enum(u16) {
 /// don't panic on parse.
 pub const ExtensionType = enum(u16) {
     server_name = 0,
+    alpn = 16,
     supported_groups = 10,
     signature_algorithms = 13,
+    record_size_limit = 28,
     supported_versions = 43,
     psk_key_exchange_modes = 45,
     key_share = 51,

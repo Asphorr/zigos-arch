@@ -18,7 +18,7 @@ const libc = @import("libc");
 const http = @import("http");
 const json = @import("json");
 
-const BUF_SIZE: usize = 64 * 1024;
+const BUF_SIZE: usize = 256 * 1024;
 var resp_buf: [BUF_SIZE]u8 = undefined;
 
 fn copyArg(idx: u32, buf: []u8) ?[]u8 {
@@ -150,8 +150,10 @@ export fn _start() linksection(".text.entry") callconv(.c) void {
         path_opt = p;
     }
 
-    const resp = http.get(url, &resp_buf) catch {
-        libc.print("\x1b[31mjq: http GET failed\x1b[0m\n");
+    const resp = http.get(url, &resp_buf) catch |err| {
+        libc.print("\x1b[31mjq: http GET failed: ");
+        libc.print(@errorName(err));
+        libc.print("\x1b[0m\n");
         libc.exit();
     };
 

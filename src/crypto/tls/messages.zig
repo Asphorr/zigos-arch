@@ -210,6 +210,29 @@ pub fn buildClientHello(buf: []u8, p: ClientHelloParams) usize {
     writeU16(buf, &pos, 32);
     writeBytes(buf, &pos, &p.x25519_pub);
 
+    // -- psk_key_exchange_modes: [psk_dhe_ke] --
+    // RFC 8446 §4.2.9. We don't offer PSK identities, but advertising
+    // support for the DHE-PSK mode signals to picky implementations that
+    // we're a conformant TLS 1.3 client. Cloudflare's edge appears to
+    // gate on this when fingerprint-screening unknown clients.
+    writeU16(buf, &pos, @intFromEnum(types.ExtensionType.psk_key_exchange_modes));
+    writeU16(buf, &pos, 2); // ext_len: 1 (list_len) + 1 (mode)
+    writeU8(buf, &pos, 1); // modes list_len
+    writeU8(buf, &pos, 1); // psk_dhe_ke
+
+    // -- application_layer_protocol_negotiation: [http/1.1] --
+    // RFC 7301. Without ALPN, modern HTTPS endpoints (Cloudflare,
+    // CloudFront, etc.) may treat the conn as a bot probe. We speak
+    // HTTP/1.1 only — offer just that so the server doesn't try to
+    // upgrade us to h2.
+    writeU16(buf, &pos, @intFromEnum(types.ExtensionType.alpn));
+    const alpn_proto = "http/1.1";
+    const alpn_total_len: u16 = @intCast(2 + 1 + alpn_proto.len); // list_len + name_len + name
+    writeU16(buf, &pos, alpn_total_len);
+    writeU16(buf, &pos, @intCast(1 + alpn_proto.len)); // protocol_name_list length
+    writeU8(buf, &pos, @intCast(alpn_proto.len));
+    writeBytes(buf, &pos, alpn_proto);
+
     // Backpatch extensions block length, then the handshake length.
     backpatchU16(buf, ext_len_at, pos - ext_start);
     backpatchU24(buf, hs_len_at, pos - body_start);
