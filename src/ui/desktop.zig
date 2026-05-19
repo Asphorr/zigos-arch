@@ -247,12 +247,9 @@ var drag_old_x: i32 = 0;
 var drag_old_y: i32 = 0;
 var prev_buttons: u8 = 0;
 /// Double-click detection on the titlebar — when the same window's
-/// titlebar is clicked twice within DOUBLE_CLICK_TICKS, toggle maximize.
-/// 80 ticks matches the desktop-shortcut DOUBLE_CLICK_TICKS so users
-/// don't have two different "double-click windows" in their muscle memory.
-var last_titlebar_click_idx: i32 = -1;
-var last_titlebar_click_tick: u32 = 0;
-const TITLEBAR_DOUBLE_CLICK_TICKS: u32 = 80;
+/// Titlebar double-click → maximize was removed: too many drags
+/// triggered it inadvertently. Maximize is reachable via the window's
+/// maximize button and F10.
 
 // Resize state
 var resizing: bool = false;
@@ -728,14 +725,17 @@ fn toggleFullscreen(idx: u8) void {
             w.gui_h = w.saved_h -| TITLEBAR_H;
         }
     } else {
-        // Enter maximize — fill the area between menubar and dock, NOT
-        // the entire screen. Keep window chrome (titlebar + traffic-
-        // light buttons) visible so the user can un-maximize, close,
-        // minimize. For GUI apps with a fixed framebuffer allocation
-        // (gui_alloc_w/h), cap the size at the allocation so we don't
-        // ask the app to render past its FB. Apps that handle resize
-        // events grow naturally; others stay at their max alloc size
-        // centered.
+        // Enter maximize — fill the entire area between menubar and
+        // dock. Keep window chrome (titlebar + traffic-light buttons)
+        // visible so the user can un-maximize, close, minimize.
+        //
+        // For GUI apps with a fixed FB allocation (gui_alloc_w/h)
+        // smaller than the content area: the GPU compositor scales
+        // the FB via uv_scale push constant (gpu_compositor.zig:1819)
+        // so the window draws filled. The 2D blit fallback caps
+        // vis_w/vis_h to gui_alloc to avoid reading past the FB —
+        // unused chrome-region pixels show whatever the background
+        // pass painted, which is fine for the rare fallback case.
         w.saved_x = w.x;
         w.saved_y = w.y;
         w.saved_w = w.width;
@@ -744,13 +744,11 @@ fn toggleFullscreen(idx: u8) void {
         startAnimation(idx, .fullscreening);
 
         const usable_h: u32 = @as(u32, @intCast(gfx.screen_h)) -| MENUBAR_H -| TASKBAR_H;
-        var target_w: u32 = gfx.screen_w;
-        var target_h: u32 = usable_h;
-        if (w.gui_alloc_w > 0 and target_w > w.gui_alloc_w) target_w = w.gui_alloc_w;
-        if (w.gui_alloc_h > 0 and target_h > w.gui_alloc_h + TITLEBAR_H) target_h = w.gui_alloc_h + TITLEBAR_H;
+        const target_w: u32 = gfx.screen_w;
+        const target_h: u32 = usable_h;
 
-        w.anim_end_x = @intCast((gfx.screen_w -| target_w) / 2);
-        w.anim_end_y = @intCast(MENUBAR_H + (usable_h -| target_h) / 2);
+        w.anim_end_x = 0;
+        w.anim_end_y = @intCast(MENUBAR_H);
         w.anim_end_w = target_w;
         w.anim_end_h = target_h;
         // Mirror drag-resize (desktop.zig:2227,2259): bump gui_w/gui_h
@@ -1262,8 +1260,14 @@ fn renderWindow(idx: u8) void {
         // pre-date the triple-buffer change (none should exist post-
         // sysCreateWindow change; defensive fallback).
 
-        const vis_w = @min(w.gui_w, w.width);
-        const vis_h = @min(w.gui_h, content_h);
+        // Cap visible region to the FB's actual extent. With maximize
+        // now allowed past gui_alloc_w/h (GPU shader handles scaling
+        // via uv_scale), 2D blit must not read past the FB or it walks
+        // off each row into the next via the smaller stride.
+        const fb_w: u32 = if (w.gui_alloc_w > 0) @min(w.gui_w, w.gui_alloc_w) else w.gui_w;
+        const fb_h: u32 = if (w.gui_alloc_h > 0) @min(w.gui_h, w.gui_alloc_h) else w.gui_h;
+        const vis_w = @min(fb_w, w.width);
+        const vis_h = @min(fb_h, content_h);
         const stride = if (w.gui_alloc_w > 0) w.gui_alloc_w else w.gui_w;
         var row: u32 = 0;
         while (row < vis_h) : (row += 1) {
@@ -2101,38 +2105,26 @@ fn handleMouseEvents() DirtyKind {
                 resize_win = idx;
                 resize_edge = edge;
             } else if (isInTitlebar(idx, mx, my)) {
-                // Double-click titlebar = maximize toggle. Tracked per-
-                // window so clicking on different titlebars in quick
-                // succession doesn't fire a phantom toggle.
-                const now_tick: u32 = @truncate(process.tick_count);
-                const idx_signed: i32 = @intCast(idx);
-                if (last_titlebar_click_idx == idx_signed and (now_tick -% last_titlebar_click_tick) < TITLEBAR_DOUBLE_CLICK_TICKS) {
+                // Titlebar press = start drag. Maximize is reachable via the
+                // window's maximize button and F10 — the prior double-click
+                // maximize fired too eagerly on regular drags and was removed.
+                // Drag-on-maximized = restore + drag, like macOS/Win.
+                // Computing drag_ox/oy from saved geometry keeps the
+                // cursor inside the titlebar after the restore so
+                // there's no visual snap.
+                if (windows[idx].fullscreen) {
                     toggleFullscreen(idx);
-                    last_titlebar_click_idx = -1;
-                    result = .full;
+                    const restore_w = windows[idx].saved_w;
+                    drag_ox = @as(i32, @intCast(restore_w / 2));
+                    drag_oy = @as(i32, TITLEBAR_H / 2);
+                    windows[idx].x = mx - drag_ox;
+                    windows[idx].y = my - drag_oy;
                 } else {
-                    last_titlebar_click_idx = idx_signed;
-                    last_titlebar_click_tick = now_tick;
-                    // Drag-on-maximized = restore + drag, like macOS/Win.
-                    // Computing drag_ox/oy from saved geometry keeps the
-                    // cursor inside the titlebar after the restore so
-                    // there's no visual snap.
-                    if (windows[idx].fullscreen) {
-                        toggleFullscreen(idx);
-                        // Recompute drag offset against the restored size,
-                        // not the current (still-maximized) frame.
-                        const restore_w = windows[idx].saved_w;
-                        drag_ox = @as(i32, @intCast(restore_w / 2));
-                        drag_oy = @as(i32, TITLEBAR_H / 2);
-                        windows[idx].x = mx - drag_ox;
-                        windows[idx].y = my - drag_oy;
-                    } else {
-                        drag_ox = mx - windows[idx].x;
-                        drag_oy = my - windows[idx].y;
-                    }
-                    dragging = true;
-                    drag_win = idx;
+                    drag_ox = mx - windows[idx].x;
+                    drag_oy = my - windows[idx].y;
                 }
+                dragging = true;
+                drag_win = idx;
             }
         } else {
             // Mouse-down on desktop background: capture press for the

@@ -345,6 +345,18 @@ fn enableIsaPin(isa_irq: u8, vector: u8) void {
     });
 }
 
+/// Mask an ISA IRQ at the IOAPIC. The redirection-table mask bit (bit 16)
+/// stops the line from delivering regardless of upstream chipset state —
+/// used to kill QEMU's spurious i8042 IRQ1 storm when the i8042
+/// controller-config-byte mask is ignored. Preserves polarity/trigger
+/// from MADT; re-writes vector + mask bit.
+pub fn maskIsaIrq(isa_irq: u8, vector: u8) void {
+    const e = isaPinElectrical(isa_irq);
+    const gsi = isaToGsi(isa_irq);
+    ioapicSetEntry(gsi, vector, true, e.polarity_low, e.trigger_level);
+    debug.klog("[apic] ISA IRQ{d} -> GSI{d} masked at IOAPIC\n", .{ isa_irq, gsi });
+}
+
 fn initIOAPIC() void {
     const ver = ioapicRead(IOAPIC_VER_REG);
     const max_entries: u8 = @truncate((ver >> 16) & 0xFF);

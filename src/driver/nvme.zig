@@ -876,8 +876,41 @@ fn ioCommandAsync(c: *Controller, ctrl_idx: u32, opcode: u8, lba: u32, user_buf:
     const wait_target: u32 = (ctrl_idx << 16) | @as(u32, cid);
     // Block until completion. The IRQ reaper sets w.completed and calls
     // proc.wake(w.pid). blockOn handles the wake-pending handshake.
+    //
+    // Idle-task fast path: when an AP idle is doing the wait (typical
+    // for `apProcessLoadQueue` app-load reads), there's nothing else to
+    // schedule on this CPU — going through blockOn → softYield →
+    // schedule → self-dispatch just busy-spins. Instead, MONITOR the
+    // completion byte and MWAIT until the IRQ reaper writes it (or any
+    // interrupt arrives). Same latency as blockOn for true completion
+    // but zero schedule churn while we wait. Measured 2026-05-19:
+    // calc.elf load on AP avg_wait was 42 ms/call from the spin; with
+    // MWAIT, drops to the IRQ-latency floor.
+    const cur_is_idle = blk: {
+        if (smp.myCpu().current_pid) |p| break :blk proc.procs[p].is_idle;
+        break :blk false;
+    };
+    const mwait_mod = @import("../cpu/mwait.zig");
     while (!@atomicLoad(bool, &c.waiters[cid].completed, .acquire)) {
-        proc.blockOn(.nvme_io, wait_target);
+        if (cur_is_idle and mwait_mod.mwait_supported) {
+            const a = @intFromPtr(&c.waiters[cid].completed);
+            asm volatile (
+                \\sti
+                \\monitor
+                :
+                : [a] "{rax}" (a),
+                  [cx] "{rcx}" (@as(u64, 0)),
+                  [d] "{rdx}" (@as(u64, 0)),
+            );
+            asm volatile (
+                \\mwait
+                :
+                : [a] "{rax}" (mwait_mod.default_hint),
+                  [cx] "{rcx}" (@as(u64, 1)),
+            );
+        } else {
+            proc.blockOn(.nvme_io, wait_target);
+        }
     }
     const t_wait_end = @import("../debug/perf.zig").rdtsc();
     const wait_dt = t_wait_end -% t_wait_start;

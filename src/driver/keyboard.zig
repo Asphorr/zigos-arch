@@ -136,8 +136,13 @@ pub fn disableIRQ1() void {
     _ = ps2Wait();
     io.outb(0x60, config);
     ps2_present = false; // input ring stays drained from here on
-    debug.klog("[kbd] PS/2 IRQ1 masked (USB keyboard active)\n", .{});
+    debug.klog("[kbd] PS/2 IRQ1 masked at i8042 (USB keyboard active)\n", .{});
     asm volatile ("sti");
+    // Belt-and-braces: also mask at the IOAPIC. QEMU's i8042 emulation
+    // ignores the controller-config-byte mask and keeps asserting IRQ1
+    // at ~7500/sec (measured 2026-05-19). The IOAPIC redirection-entry
+    // mask bit stops delivery regardless of upstream chipset state.
+    @import("../time/apic.zig").maskIsaIrq(1, 0x21);
 }
 
 /// Re-enable keyboard IRQ after mouse init may have changed the PS/2 config.
