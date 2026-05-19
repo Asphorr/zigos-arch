@@ -27,8 +27,8 @@ const WIN_H: u32 = Q_HEIGHT * SCALE;
 var fb: [*]volatile u32 = undefined;
 var start_ticks: u32 = 0;
 
-// C globals exported by sys_zigos.c
-extern var vid: extern struct {
+// C globals exported by sys_zigos.c / screen.c
+const Viddef = extern struct {
     buffer: ?[*]u8,
     colormap: ?[*]u8,
     colormap16: ?[*]u16,
@@ -47,6 +47,7 @@ extern var vid: extern struct {
     maxwarpheight: c_int,
     direct: ?[*]u8,
 };
+extern var vid: Viddef;
 extern var zq_palette: [768]u8;
 extern var zq_dirty: c_int;
 
@@ -72,6 +73,55 @@ export fn zq_print(s: ?[*:0]const u8) void {
         while (str[n] != 0) : (n += 1) {}
         libc.print(str[0..n]);
     }
+}
+
+// Premultiplied 8→24 palette LUT, kept in sync with zq_palette[768] which
+// sys_zigos.c writes from VID_SetPalette / VID_ShiftPalette. Rebuilt
+// lazily on first present after a palette change so the hot path is just
+// one indirect load per pixel.
+var palette_lut: [256]u32 = [_]u32{0} ** 256;
+var palette_lut_built: bool = false;
+
+fn rebuildPaletteLut() void {
+    for (0..256) |i| {
+        const r: u32 = zq_palette[i * 3 + 0];
+        const g: u32 = zq_palette[i * 3 + 1];
+        const b: u32 = zq_palette[i * 3 + 2];
+        palette_lut[i] = (0xFF << 24) | (r << 16) | (g << 8) | b;
+    }
+    palette_lut_built = true;
+}
+
+// Called from sys_zigos.c VID_Update. Expands the 320x200 8bpp palettized
+// `vid.buffer` to our 640x400 RGBA window FB (nearest-neighbor 2× scale),
+// then presents. Q1's "dirty" optimization (vrect_t list) is ignored —
+// the rect tracking is fine-grained but our compositor presents whole
+// windows, so a full blit is cheaper than walking N rects.
+export fn zq_present() void {
+    // VID_SetPalette / VID_ShiftPalette toggle zq_dirty. Rebuild LUT once
+    // per palette change, not per frame.
+    if (!palette_lut_built or zq_dirty != 0) {
+        rebuildPaletteLut();
+        zq_dirty = 0;
+    }
+    const src = vid.buffer orelse return;
+    // 2× nearest-neighbor expand into the output FB.
+    var y: u32 = 0;
+    while (y < Q_HEIGHT) : (y += 1) {
+        const src_row = y * Q_WIDTH;
+        const dst_row_a = (y * SCALE) * WIN_W;
+        const dst_row_b = dst_row_a + WIN_W;
+        var x: u32 = 0;
+        while (x < Q_WIDTH) : (x += 1) {
+            const px = palette_lut[src[src_row + x]];
+            const dx = x * SCALE;
+            fb[dst_row_a + dx] = px;
+            fb[dst_row_a + dx + 1] = px;
+            fb[dst_row_b + dx] = px;
+            fb[dst_row_b + dx + 1] = px;
+        }
+    }
+    libc.present();
 }
 
 // ============================================================

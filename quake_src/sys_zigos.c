@@ -50,9 +50,12 @@ void VID_Init(unsigned char *palette) {
 
 void VID_Shutdown(void) {}
 
+// Defined in app/quake1.zig — 8bpp→RGBA blit + 2x scale + present.
+extern void zq_present(void);
+
 void VID_Update(vrect_t *rects) {
     (void)rects;
-    zq_dirty = 1;
+    zq_present();
 }
 
 void VID_SetPalette(unsigned char *palette) {
