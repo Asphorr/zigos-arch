@@ -280,6 +280,14 @@ pub fn close(fd: u32) void {
     _ = syscall(12, fd, 0);
 }
 
+/// Reposition the fd's cursor. whence: 0=SET (absolute), 1=CUR (relative
+/// to current offset). Returns new offset, or null on failure.
+pub fn seek(fd: u32, offset: u32, whence: u32) ?u32 {
+    const r = syscall3(111, fd, offset, whence);
+    if (r == 0xFFFFFFFF) return null;
+    return r;
+}
+
 /// Change the calling process's working directory. Returns true on success.
 /// Path may be absolute (starting with '/') or relative to the current cwd.
 /// Examples: `chdir("/tar/")`, `chdir("/fat/sub")`, `chdir("foo")`.

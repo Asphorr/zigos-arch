@@ -54,8 +54,8 @@ VKR_DEBUG=udmabuf \
 LD_LIBRARY_PATH=/usr/local/lib/x86_64-linux-gnu \
 VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json \
     ~/qemu-master/build/qemu-system-x86_64 \
-    -m 128 -accel kvm -cpu host,hv-time,hv-frequencies -smp 2 -no-reboot \
-    -object memory-backend-memfd,id=mem1,size=128M \
+    -m 256 -accel kvm -cpu host,hv-time,hv-frequencies -smp 2 -no-reboot \
+    -object memory-backend-memfd,id=mem1,size=256M \
     -machine pcspk-audiodev=snd0,memory-backend=mem1 \
     -vga none \
     -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd \

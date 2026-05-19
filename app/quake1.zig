@@ -422,9 +422,19 @@ const CUint = u32;
 const CLong = i64;
 const CUlong = u64;
 
+// IMPORTANT: do NOT use @memcpy / @memset inside these — Zig lowers
+// those builtins to `call memcpy` / `call memset`, which recurses into
+// us infinitely (jmp <self>). Lifted from doom_real.zig where this was
+// already done right.
 export fn memcpy(dest: ?[*]u8, src: ?[*]const u8, n: usize) ?[*]u8 {
     if (dest == null or src == null) return dest;
-    @memcpy(dest.?[0..n], src.?[0..n]);
+    const d = dest.?;
+    const s = src.?;
+    const words = n / 8;
+    const d64: [*]align(1) u64 = @ptrCast(d);
+    const s64: [*]align(1) const u64 = @ptrCast(s);
+    for (0..words) |i| d64[i] = s64[i];
+    for (words * 8..n) |i| d[i] = s[i];
     return dest;
 }
 
@@ -433,7 +443,12 @@ export fn memmove(dest: ?[*]u8, src: ?[*]const u8, n: usize) ?[*]u8 {
     const d = dest.?;
     const s = src.?;
     if (@intFromPtr(d) < @intFromPtr(s)) {
-        @memcpy(d[0..n], s[0..n]);
+        // Forward, hand-rolled (same reason as memcpy above).
+        const words = n / 8;
+        const d64: [*]align(1) u64 = @ptrCast(d);
+        const s64: [*]align(1) const u64 = @ptrCast(s);
+        for (0..words) |i| d64[i] = s64[i];
+        for (words * 8..n) |i| d[i] = s[i];
     } else {
         var i = n;
         while (i > 0) {
@@ -447,7 +462,11 @@ export fn memmove(dest: ?[*]u8, src: ?[*]const u8, n: usize) ?[*]u8 {
 export fn memset(dest: ?[*]u8, c_val: c_int, n: usize) ?[*]u8 {
     if (dest) |d| {
         const byte: u8 = @truncate(@as(CUint, @bitCast(c_val)));
-        @memset(d[0..n], byte);
+        const word: u64 = @as(u64, byte) * 0x0101010101010101;
+        const words = n / 8;
+        const d64: [*]align(1) u64 = @ptrCast(d);
+        for (0..words) |i| d64[i] = word;
+        for (words * 8..n) |i| d[i] = byte;
     }
     return dest;
 }
@@ -893,23 +912,33 @@ export fn fputc(c: c_int, fp: ?*anyopaque) c_int {
 }
 
 // ============================================================
-// File I/O — FILE* backed by libc.open/fread (memory-resident copy)
+// File I/O — streaming FILE* (kernel fd + cursor, no preload)
 // ============================================================
+//
+// Doom's wrapper used libc.mmapFile to slurp doom1.wad (4 MB) on open.
+// For Q1's 18 MB pak0.pak that pinned ~18 MB of physical frames for
+// the lifetime of the file handle — Q1 walks the PAK linearly during
+// COM_LoadPackFile, so every page faulted in but nothing got dropped,
+// leaving the OS effectively out of RAM by Host_Init's end.
+//
+// Streaming model: FILE* holds {kernel_fd, size, pos}. fread issues a
+// real sysFread; fseek issues sysSeek (new syscall #111). No buffer
+// retained between calls. Q1's read pattern (header + per-entry
+// fseek+fread) is naturally low-memory.
 
 const FILE = extern struct {
-    data: ?[*]u8,
-    size: u32,
-    pos: u32,
-    mode: u8,
+    fd: u32, // kernel file descriptor (0xFFFFFFFF = invalid)
+    size: u32, // total file size from fsize (cached)
+    pos: u32, // user-side cursor; kernel cursor is kept in sync
+    mode: u8, // 0=closed, 1=stream-read, 2=write-only console sink
     at_eof: u8,
-    is_mmap: u8 = 0,
-    _pad: u8 = 0,
+    _pad: [2]u8 = .{ 0, 0 },
 };
 
 const MAX_FILES_OPEN = 16;
-var file_pool: [MAX_FILES_OPEN]FILE = [_]FILE{.{ .data = null, .size = 0, .pos = 0, .mode = 0, .at_eof = 0 }} ** MAX_FILES_OPEN;
-var stdout_file: FILE = .{ .data = null, .size = 0, .pos = 0, .mode = 2, .at_eof = 0 };
-var stderr_file: FILE = .{ .data = null, .size = 0, .pos = 0, .mode = 2, .at_eof = 0 };
+var file_pool: [MAX_FILES_OPEN]FILE = [_]FILE{.{ .fd = 0xFFFFFFFF, .size = 0, .pos = 0, .mode = 0, .at_eof = 0 }} ** MAX_FILES_OPEN;
+var stdout_file: FILE = .{ .fd = 0xFFFFFFFF, .size = 0, .pos = 0, .mode = 2, .at_eof = 0 };
+var stderr_file: FILE = .{ .fd = 0xFFFFFFFF, .size = 0, .pos = 0, .mode = 2, .at_eof = 0 };
 
 export const stdin: *FILE = &stderr_file;
 export const stdout: *FILE = &stdout_file;
@@ -922,93 +951,50 @@ export fn fopen(path: ?[*:0]const u8, mode: ?[*:0]const u8) ?*FILE {
     var plen: usize = 0;
     while (p[plen] != 0) plen += 1;
 
+    const sz = libc.fsize(p[0..plen]) orelse return null;
     const fd = libc.open(p[0..plen]) orelse return null;
-
-    var data: [*]u8 = undefined;
-    var size: u32 = 0;
-    var is_mmap: u8 = 0;
-    if (libc.fsize(p[0..plen])) |sz| {
-        if (sz > 0) {
-            if (libc.mmapFile(fd, 0, sz)) |buf| {
-                data = buf.ptr;
-                size = @intCast(sz);
-                is_mmap = 1;
-            }
-        }
-    }
-    if (is_mmap == 0) {
-        const chunk: u32 = 65536;
-        var total: u32 = 0;
-        var capacity: u32 = if (libc.fsize(p[0..plen])) |sz| sz + chunk else 64 * 1024;
-        var buf = libc.malloc(capacity) orelse {
-            libc.close(fd);
-            return null;
-        };
-        while (true) {
-            if (total + chunk > capacity) {
-                const new_cap = capacity * 2;
-                const new_buf = libc.malloc(new_cap) orelse break;
-                @memcpy(new_buf[0..total], buf[0..total]);
-                capacity = new_cap;
-                buf = new_buf;
-            }
-            const n = libc.fread(fd, buf[total..][0..chunk]);
-            if (n == 0) break;
-            total += n;
-        }
-        data = buf;
-        size = total;
-    }
-    libc.close(fd);
 
     for (&file_pool) |*slot| {
         if (slot.mode == 0) {
-            slot.data = data;
-            slot.size = size;
+            slot.fd = fd;
+            slot.size = sz;
             slot.pos = 0;
             slot.mode = 1;
             slot.at_eof = 0;
-            slot.is_mmap = is_mmap;
             return slot;
         }
     }
-    if (is_mmap != 0) {
-        const aligned: usize = (@as(usize, size) + 0xFFF) & ~@as(usize, 0xFFF);
-        _ = libc.munmap(data[0..aligned]);
-    }
+    libc.close(fd);
     return null;
 }
 
 export fn fclose(fp: ?*FILE) c_int {
     if (fp) |f| {
         if (f == &stdout_file or f == &stderr_file) return 0;
-        if (f.is_mmap != 0) {
-            if (f.data) |d| {
-                const aligned: usize = (@as(usize, f.size) + 0xFFF) & ~@as(usize, 0xFFF);
-                _ = libc.munmap(d[0..aligned]);
-            }
+        if (f.mode != 0 and f.fd != 0xFFFFFFFF) {
+            libc.close(f.fd);
         }
         f.mode = 0;
-        f.data = null;
-        f.is_mmap = 0;
+        f.fd = 0xFFFFFFFF;
     }
     return 0;
 }
 
 export fn fread(ptr: ?[*]u8, size: usize, nmemb: usize, fp: ?*FILE) usize {
-    if (ptr == null or fp == null) return 0;
+    if (ptr == null or fp == null or size == 0 or nmemb == 0) return 0;
     const f = fp.?;
-    if (f.data == null or f.mode == 0) return 0;
-    const total = size * nmemb;
-    const avail = f.size - f.pos;
-    const to_read = if (total < avail) @as(u32, @intCast(total)) else avail;
+    if (f.mode != 1 or f.fd == 0xFFFFFFFF) return 0;
+    const total: usize = size * nmemb;
+    const avail: usize = @as(usize, f.size) -| @as(usize, f.pos);
+    const to_read: u32 = @intCast(@min(total, avail));
     if (to_read == 0) {
         f.at_eof = 1;
         return 0;
     }
-    @memcpy(ptr.?[0..to_read], f.data.?[f.pos..][0..to_read]);
-    f.pos += to_read;
-    return to_read / size;
+    const got = libc.fread(f.fd, ptr.?[0..to_read]);
+    if (got < to_read) f.at_eof = 1;
+    f.pos += got;
+    return got / size;
 }
 
 export fn fwrite(ptr: ?[*]const u8, size: usize, nmemb: usize, fp: ?*FILE) usize {
@@ -1025,15 +1011,19 @@ export fn fwrite(ptr: ?[*]const u8, size: usize, nmemb: usize, fp: ?*FILE) usize
 export fn fseek(fp: ?*FILE, offset: c_long, whence: c_int) c_int {
     if (fp == null) return -1;
     const f = fp.?;
+    if (f.mode != 1 or f.fd == 0xFFFFFFFF) return -1;
     var new_pos: i64 = switch (whence) {
-        0 => offset,
-        1 => @as(i64, f.pos) + offset,
-        2 => @as(i64, f.size) + offset,
+        0 => offset, // SEEK_SET
+        1 => @as(i64, f.pos) + offset, // SEEK_CUR
+        2 => @as(i64, f.size) + offset, // SEEK_END
         else => return -1,
     };
     if (new_pos < 0) new_pos = 0;
     if (new_pos > @as(i64, f.size)) new_pos = @as(i64, f.size);
-    f.pos = @intCast(new_pos);
+    const np: u32 = @intCast(new_pos);
+    // Sync kernel cursor. SEEK_SET on the kernel side is `whence=0`.
+    _ = libc.seek(f.fd, np, 0) orelse return -1;
+    f.pos = np;
     f.at_eof = 0;
     return 0;
 }
@@ -1055,6 +1045,9 @@ export fn ferror(fp: ?*FILE) c_int {
 
 export fn rewind(fp: ?*FILE) void {
     if (fp) |f| {
+        if (f.mode == 1 and f.fd != 0xFFFFFFFF) {
+            _ = libc.seek(f.fd, 0, 0);
+        }
         f.pos = 0;
         f.at_eof = 0;
     }
@@ -1066,25 +1059,19 @@ export fn fflush(fp: ?*FILE) c_int {
 }
 
 export fn fgetc(fp: ?*FILE) c_int {
-    if (fp == null) return -1;
-    const f = fp.?;
-    if (f.data == null or f.pos >= f.size) {
-        f.at_eof = 1;
-        return -1;
-    }
-    const ch = f.data.?[f.pos];
-    f.pos += 1;
-    return ch;
+    var ch: [1]u8 = .{0};
+    const n = fread(&ch, 1, 1, fp);
+    if (n == 0) return -1;
+    return @as(c_int, ch[0]);
 }
 
 export fn fgets(s: ?[*]u8, size: c_int, fp: ?*FILE) ?[*]u8 {
     if (s == null or fp == null or size <= 0) return null;
     const buf = s.?;
-    const f = fp.?;
     var i: usize = 0;
     const max: usize = @intCast(size - 1);
     while (i < max) {
-        const ch = fgetc(f);
+        const ch = fgetc(fp);
         if (ch == -1) break;
         buf[i] = @intCast(ch);
         i += 1;

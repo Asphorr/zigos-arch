@@ -157,12 +157,17 @@ pub fn loadAndStart(elf_buf: [*]align(4) u8, file_size: usize, elf_buf_pages: u3
         }
     }
 
-    // User stack: 64KB (16 pages) lazily allocated via the page-fault handler.
-    // Pages get backed on first touch, so 64KB stacks cost 0 RSS until used.
-    // Top stays at 0x500000 so process.create's initial RSP (0x4FFFF8) is
-    // just below it; first push triggers fault-in for the top page.
+    // User stack: 256KB (64 pages) lazily allocated via the page-fault
+    // handler. Pages back on first touch so unused stack costs 0 RSS.
+    // Top stays at 0x500000 so process.create's initial RSP (0x4FFFF8)
+    // is just below it; first push triggers fault-in for the top page.
+    //
+    // Was 64KB (16 pages) until 2026-05-20 — Quake 1's COM_LoadPackFile
+    // allocates `dpackfile_t info[MAX_FILES_IN_PACK]` on the stack
+    // (2048 * 64B = 128KB), which overflowed and #PF'd. Bumping
+    // universally rather than per-app since the cost is RSS-free.
     const stack_top: usize = 0x500000;
-    const stack_pages: usize = 16;
+    const stack_pages: usize = 64;
     const stack_base: usize = stack_top - stack_pages * PAGE_SIZE;
 
     const entry: usize = @intCast(header.entry);

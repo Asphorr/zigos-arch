@@ -372,9 +372,10 @@ const SYSCALLS = [_]SyscallSpec{
     .{ .num = 108, .name = "tls_send",                .handler = wrap(sysTlsSend) },
     .{ .num = 109, .name = "tls_recv",                .handler = wrap(sysTlsRecv) },
     .{ .num = 110, .name = "tls_close",               .handler = wrap(sysTlsClose) },
+    .{ .num = 111, .name = "seek",                    .handler = wrap(sysSeek) },
 };
 
-const MAX_SYSCALL: u32 = 110;
+const MAX_SYSCALL: u32 = 111;
 const dispatch: [MAX_SYSCALL + 1]?Handler = blk: {
     var t: [MAX_SYSCALL + 1]?Handler = [_]?Handler{null} ** (MAX_SYSCALL + 1);
     for (SYSCALLS) |s| t[s.num] = s.handler;
@@ -633,6 +634,7 @@ fn doSyscallInner(sys_num: u32, arg1: u32, arg2: u32, arg3: u32, frame: *signals
         108 => sysTlsSend(arg1, arg2, arg3),
         109 => sysTlsRecv(arg1, arg2, arg3),
         110 => sysTlsClose(arg1),
+        111 => sysSeek(arg1, arg2, arg3),
         else => E_NOSYS,
     };
 }
@@ -1287,6 +1289,27 @@ fn sysFwrite(fd: u32, buf_ptr: u32, count: u32) u32 {
 fn sysClose(fd: u32) u32 {
     const pcb = process.currentPCB() orelse return E_FAULT;
     return vfs.close(pcb, fd);
+}
+
+/// Reposition an fd's read/write cursor. whence: 0=SET (absolute),
+/// 1=CUR (relative to current offset). SEEK_END is intentionally
+/// omitted — file_size lookup is fs-specific and userland can get it
+/// via sysFsize for the rare case it matters. Quake's pak loader only
+/// needs SEEK_SET.
+///
+/// Returns the new offset on success, or 0xFFFFFFFF on bad fd / overflow.
+fn sysSeek(fd: u32, offset: u32, whence: u32) u32 {
+    const pcb = process.currentPCB() orelse return E_FAULT;
+    if (fd >= pcb.fd_table.len or !pcb.fd_table[fd].in_use) return 0xFFFFFFFF;
+    if (fd < 3) return 0xFFFFFFFF;
+    const fd_entry = &pcb.fd_table[fd];
+    const new_off: u32 = switch (whence) {
+        0 => offset,
+        1 => fd_entry.offset +% offset,
+        else => return 0xFFFFFFFF,
+    };
+    fd_entry.offset = new_off;
+    return new_off;
 }
 
 // --- Graphics syscalls ---
