@@ -805,7 +805,7 @@ pub fn build(b: *std.Build) void {
         \\
         \\# Skip rebuild if every input file is older than the image.
         \\if [ -f $IMG ]; then
-        \\  newest=$(ls -t zig-out/bin/*.elf zig-out/bin/KERNEL.SYM zig-out/bin/BUILD.ID doom1.wad www/* share/* 2>/dev/null | head -1 || true)
+        \\  newest=$( { ls -t zig-out/bin/*.elf zig-out/bin/KERNEL.SYM zig-out/bin/BUILD.ID doom1.wad www/* 2>/dev/null; find share -type f -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2; } | head -1 || true)
         \\  if [ -n "$newest" ] && [ "$newest" -ot $IMG ]; then
         \\    echo "[ext2] up-to-date"
         \\    exit 0
@@ -824,9 +824,11 @@ pub fn build(b: *std.Build) void {
         \\for f in www/*; do
         \\  [ -f "$f" ] && cp "$f" $STAGE/share/
         \\done
-        \\for f in share/*; do
-        \\  [ -f "$f" ] && cp "$f" $STAGE/share/
-        \\done
+        \\# Recursive copy so nested data dirs land at the right path —
+        \\# e.g. share/quake/id1/pak0.pak → /share/quake/id1/pak0.pak.
+        \\if [ -d share ]; then
+        \\  cp -r share/. $STAGE/share/
+        \\fi
         \\printf "ext2 read test, hello from /etc/motd\n" > $STAGE/etc/motd
         \\# Pre-touch /var/log/messages so logd can O_APPEND it (ext2 driver
         \\# has no createFile yet, so files must exist before first open).

@@ -87,10 +87,54 @@ void VID_SetDefaultMode(void) {}
 // INPUT (key/mouse delivery into Quake's Key_Event + IN_Move)
 // ============================================================
 
+// Input bridge: Zig side scans physical key/mouse state, posts Q1-format
+// events into its own ringbuffer, and exposes them through zq_next_key /
+// zq_get_mouse. Keeping the loop here (in C) lets us touch Q1's cl.* and
+// usercmd_t directly without re-declaring them as Zig extern types.
+extern void zq_poll_keys(void);
+extern int zq_next_key(int *down_out); // returns Q1 key, 0 if empty
+extern void zq_get_mouse_delta(int *dx, int *dy);
+
+extern cvar_t sensitivity;
+extern cvar_t m_yaw;
+extern cvar_t m_pitch;
+
 void IN_Init(void) {}
 void IN_Shutdown(void) {}
-void IN_Commands(void) {}
-void IN_Move(usercmd_t *cmd) { (void)cmd; }
+
+void IN_Commands(void) {
+    // Per-frame input poll — read physical state, generate press/release
+    // events for keys + mouse buttons. Mouse motion is read separately
+    // by IN_Move below.
+    zq_poll_keys();
+}
+
+void Sys_SendKeyEvents(void) {
+    int down;
+    int key;
+    while ((key = zq_next_key(&down)) != 0) {
+        Key_Event(key, down);
+    }
+}
+
+void IN_Move(usercmd_t *cmd) {
+    (void)cmd;
+    int dx, dy;
+    zq_get_mouse_delta(&dx, &dy);
+    if (dx == 0 && dy == 0) return;
+
+    // Standard Q1 mouse-look formula. sensitivity / m_yaw / m_pitch are
+    // cvars set by Q1's defaults (3.0 / 0.022 / 0.022 respectively at
+    // startup). We always operate in mouselook mode; classic Q1 toggled
+    // this via in_mlook but always-on matches modern shooter expectations.
+    const float fx = (float)dx * sensitivity.value;
+    const float fy = (float)dy * sensitivity.value;
+    cl.viewangles[YAW]   -= m_yaw.value   * fx;
+    cl.viewangles[PITCH] += m_pitch.value * fy;
+    if (cl.viewangles[PITCH] >  80.0f) cl.viewangles[PITCH] =  80.0f;
+    if (cl.viewangles[PITCH] < -70.0f) cl.viewangles[PITCH] = -70.0f;
+}
+
 void IN_ClearStates(void) {}
 
 // ============================================================
@@ -209,7 +253,8 @@ double Sys_FloatTime(void) {
 char *Sys_ConsoleInput(void) { return NULL; }
 
 void Sys_Sleep(void) {}
-void Sys_SendKeyEvents(void) {}
+// Sys_SendKeyEvents moved next to IN_Commands above — needs the same
+// zq_next_key/Key_Event glue, so colocated for readability.
 
 // FP-precision controls are x87-only on i386; on x86_64 SSE these are
 // no-ops. We use SSE for FP, so leaving these empty is correct.

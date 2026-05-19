@@ -28,6 +28,7 @@ pub const list = [_]Shortcut{
     .{ .name = "Sigil", .cmd = "/bin/sigil.elf", .icon = &icons.sigil },
     .{ .name = "Telegram", .cmd = "/bin/tg.elf", .icon = &icons.tg },
     .{ .name = "Doom", .cmd = "/bin/doom_real.elf", .icon = &icons.doom },
+    .{ .name = "Quake", .cmd = "/bin/quake1.elf", .icon = &icons.quake },
 };
 
 /// Subset of `list` indices that appear permanently in the dock. The

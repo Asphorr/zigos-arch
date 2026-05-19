@@ -19,3 +19,4 @@ Thumbs.db
 
 # Claude Code internal state (plans, conversation IDs)
 .claude/
+share/quake/

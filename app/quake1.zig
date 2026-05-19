@@ -75,6 +75,186 @@ export fn zq_print(s: ?[*:0]const u8) void {
     }
 }
 
+// ============================================================
+// Input — zq_poll_keys / zq_next_key / zq_get_mouse_delta
+// (driven by sys_zigos.c IN_Commands + Sys_SendKeyEvents + IN_Move)
+// ============================================================
+
+// Q1 key codes — must match quake_src/keys.h
+const K_TAB: u8 = 9;
+const K_ENTER: u8 = 13;
+const K_ESCAPE: u8 = 27;
+const K_SPACE: u8 = 32;
+const K_BACKSPACE: u8 = 127;
+const K_UPARROW: u8 = 128;
+const K_DOWNARROW: u8 = 129;
+const K_LEFTARROW: u8 = 130;
+const K_RIGHTARROW: u8 = 131;
+const K_ALT: u8 = 132;
+const K_CTRL: u8 = 133;
+const K_SHIFT: u8 = 134;
+const K_F1: u8 = 135;
+const K_INS: u8 = 147;
+const K_DEL: u8 = 148;
+const K_PGDN: u8 = 149;
+const K_PGUP: u8 = 150;
+const K_HOME: u8 = 151;
+const K_END: u8 = 152;
+const K_MOUSE1: u8 = 200;
+const K_MOUSE2: u8 = 201;
+const K_MOUSE3: u8 = 202;
+
+// Scancodes we sample each tick. Letter rows + number row + special
+// keys + arrows. Anything not here is invisible to Q1.
+const poll_scancodes = [_]u8{
+    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B,
+    0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16,
+    0x17, 0x18, 0x19, 0x1C, 0x1D, 0x1E, 0x1F, 0x20, 0x21, 0x22, 0x23,
+    0x24, 0x25, 0x26, 0x2A, 0x2C, 0x2D, 0x2E, 0x2F, 0x30, 0x31, 0x32,
+    0x36, 0x38, 0x39, 0x3B, 0x3C, 0x3D, 0x3E, 0x3F, 0x40, 0x41, 0x42,
+    0x43, 0x44, 0x47, 0x48, 0x49, 0x4B, 0x4D, 0x4F, 0x50, 0x51, 0x52,
+    0x53, 0x57, 0x58,
+};
+
+fn scancodeToQ1Key(sc: u8) u8 {
+    return switch (sc) {
+        0x01 => K_ESCAPE,
+        0x02 => '1',
+        0x03 => '2',
+        0x04 => '3',
+        0x05 => '4',
+        0x06 => '5',
+        0x07 => '6',
+        0x08 => '7',
+        0x09 => '8',
+        0x0A => '9',
+        0x0B => '0',
+        0x0C => '-',
+        0x0D => '=',
+        0x0E => K_BACKSPACE,
+        0x0F => K_TAB,
+        0x10 => 'q',
+        0x11 => 'w',
+        0x12 => 'e',
+        0x13 => 'r',
+        0x14 => 't',
+        0x15 => 'y',
+        0x16 => 'u',
+        0x17 => 'i',
+        0x18 => 'o',
+        0x19 => 'p',
+        0x1C => K_ENTER,
+        0x1D => K_CTRL,
+        0x1E => 'a',
+        0x1F => 's',
+        0x20 => 'd',
+        0x21 => 'f',
+        0x22 => 'g',
+        0x23 => 'h',
+        0x24 => 'j',
+        0x25 => 'k',
+        0x26 => 'l',
+        0x2A, 0x36 => K_SHIFT,
+        0x2C => 'z',
+        0x2D => 'x',
+        0x2E => 'c',
+        0x2F => 'v',
+        0x30 => 'b',
+        0x31 => 'n',
+        0x32 => 'm',
+        0x38 => K_ALT,
+        0x39 => K_SPACE,
+        0x3B => K_F1,
+        0x3C => K_F1 + 1,
+        0x3D => K_F1 + 2,
+        0x3E => K_F1 + 3,
+        0x3F => K_F1 + 4,
+        0x40 => K_F1 + 5,
+        0x41 => K_F1 + 6,
+        0x42 => K_F1 + 7,
+        0x43 => K_F1 + 8,
+        0x44 => K_F1 + 9,
+        0x47 => K_HOME,
+        0x48 => K_UPARROW,
+        0x49 => K_PGUP,
+        0x4B => K_LEFTARROW,
+        0x4D => K_RIGHTARROW,
+        0x4F => K_END,
+        0x50 => K_DOWNARROW,
+        0x51 => K_PGDN,
+        0x52 => K_INS,
+        0x53 => K_DEL,
+        0x57 => K_F1 + 10,
+        0x58 => K_F1 + 11,
+        else => 0,
+    };
+}
+
+const KeyEvent = struct { key: u8, down: u8 };
+var key_queue: [128]KeyEvent = undefined;
+var key_head: u32 = 0;
+var key_tail: u32 = 0;
+
+fn pushKey(key: u8, down: bool) void {
+    if (key == 0) return;
+    const next = (key_head + 1) % 128;
+    if (next == key_tail) return; // full, drop
+    key_queue[key_head] = .{ .key = key, .down = @intFromBool(down) };
+    key_head = next;
+}
+
+var prev_key_state: [256]bool = [_]bool{false} ** 256;
+var prev_mouse_buttons: u32 = 0;
+var accum_dx: i32 = 0;
+var accum_dy: i32 = 0;
+
+export fn zq_poll_keys() void {
+    // 1) Sample physical keys, emit press/release transitions
+    for (poll_scancodes) |sc| {
+        const q1_key = scancodeToQ1Key(sc);
+        if (q1_key == 0) continue;
+        const held = libc.keyHeld(sc);
+        if (held != prev_key_state[q1_key]) {
+            pushKey(q1_key, held);
+            prev_key_state[q1_key] = held;
+        }
+    }
+    // 2) Drain readable text from the char ring (typed chars not covered
+    //    by scancodes — only useful for console input, which Q1 doesn't
+    //    need for gameplay).
+    while (libc.readChar() != 0) {}
+    // 3) Sample mouse — accumulate motion, emit transitions for buttons
+    const ms = libc.getMouse();
+    accum_dx +%= ms.dx;
+    accum_dy +%= ms.dy;
+    const btn = ms.buttons;
+    const cur_l = (btn & 1) != 0;
+    const cur_r = (btn & 2) != 0;
+    const cur_m = (btn & 4) != 0;
+    const prev_l = (prev_mouse_buttons & 1) != 0;
+    const prev_r = (prev_mouse_buttons & 2) != 0;
+    const prev_m = (prev_mouse_buttons & 4) != 0;
+    if (cur_l != prev_l) pushKey(K_MOUSE1, cur_l);
+    if (cur_r != prev_r) pushKey(K_MOUSE2, cur_r);
+    if (cur_m != prev_m) pushKey(K_MOUSE3, cur_m);
+    prev_mouse_buttons = btn;
+}
+
+export fn zq_next_key(down_out: *c_int) c_int {
+    if (key_tail == key_head) return 0;
+    const ev = key_queue[key_tail];
+    key_tail = (key_tail + 1) % 128;
+    down_out.* = ev.down;
+    return @intCast(ev.key);
+}
+
+export fn zq_get_mouse_delta(dx: *c_int, dy: *c_int) void {
+    dx.* = accum_dx;
+    dy.* = accum_dy;
+    accum_dx = 0;
+    accum_dy = 0;
+}
+
 // Premultiplied 8→24 palette LUT, kept in sync with zq_palette[768] which
 // sys_zigos.c writes from VID_SetPalette / VID_ShiftPalette. Rebuilt
 // lazily on first present after a palette change so the hot path is just
