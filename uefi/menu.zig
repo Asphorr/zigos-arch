@@ -82,6 +82,8 @@ pub const TEST_ENTRIES = [_]Entry{
     .{ .label = "Stress: Phase 3 cleanup", .desc = "Spawn/kill/reap user processes. Hunts phys-vs-physmap-VA confusion in destroyAddressSpace, freeElfBuf, lazy_regions cleanup.", .boot_mode = 5, .badge = "STRESS", .badge_color = COLOR_BADGE_STRESS },
     .{ .label = "Stress: kill race", .desc = "Spawn kernel worker on cpu1, kill from cpu0. Hunts setTssRsp0 mismatch (scheduler picks pid mid-kill, expected_kstack_tops cleared between pickNext and dispatch).", .boot_mode = 6, .badge = "STRESS", .badge_color = COLOR_BADGE_STRESS },
     .{ .label = "Stress: async exec race", .desc = "Async requestAppLoad spawn-kill churn. Hunts wild kernel RIP=0x46 at switchTo+0x0 — fired when files.elf launched editor.elf with rapid task migration cpu0->cpu1->cpu0.", .boot_mode = 8, .badge = "STRESS", .badge_color = COLOR_BADGE_STRESS },
+    .{ .label = "Stress: wake-IPI", .desc = "Cross-CPU wake latency: cpu0 driver wakes a cpu1 worker N times, histograms latency. Hunts the bug where setState(.ready) on a remote CPU's PCB doesn't IPI it out of idle.", .boot_mode = 10, .badge = "STRESS", .badge_color = COLOR_BADGE_STRESS },
+    .{ .label = "Stress: I/O chain", .desc = "Concurrent NVMe loadFileFresh from N workers + virtio-gpu flushRect on main. Hunts the 2026-05-19 cpu1-wedge / watchdog trip — determines code-bug vs host-SMI.", .boot_mode = 11, .badge = "STRESS", .badge_color = COLOR_BADGE_STRESS },
     .{ .label = "Test: panic UI", .desc = "Trigger a controlled @panic after boot to render the panic screen for visual review. Switch trigger kind (PF / UD / panic) by editing src/test/panic_test.zig.", .boot_mode = 7, .badge = "DEMO", .badge_color = COLOR_BADGE_INFO },
     .{ .label = "< Back", .desc = "Return to the main boot menu.", .boot_mode = BOOT_MODE_BACK, .badge = "BACK", .badge_color = COLOR_BADGE_INFO },
 };
@@ -288,15 +290,37 @@ fn drawEntry(fb: Fb, panel_x: u32, ey: u32, panel_w: u32, entry: Entry, is_sel: 
     const text_color = if (is_sel) COLOR_SEL_TEXT else COLOR_TEXT;
     const desc_color = if (is_sel) COLOR_SEL_DESC else COLOR_DIM;
     aa.drawText(fb, @intCast(panel_x + 60), @intCast(ey + 10), entry.label, text_color, &aa.default_16);
-    aa.drawText(fb, @intCast(panel_x + 60), @intCast(ey + 30), entry.desc, desc_color, &aa.default_16);
 
     // Mode badge — right-aligned, vertically centered inside the 52 px
-    // selection box. Uses an HStack just for the keycap-pill rendering so
-    // we don't duplicate fill/border/center-text math.
+    // selection box. Computed BEFORE drawing the description so the
+    // description can be truncated to whatever space remains.
     const badge_h: u32 = 22;
     const badge_w = aa.default_16.measure(entry.badge) + 12;
     const badge_x = panel_x + panel_w - 24 - badge_w - 8;
     const badge_y = ey + (ENTRY_H - 8 -| badge_h) / 2;
+
+    // Description column: left of badge with a small gap. Truncate with
+    // "..." if the full text doesn't fit. Without this, long descs
+    // (e.g. the wake-IPI entry's ~180 chars) overflow past the badge and
+    // out of the panel — see screenshot in feedback_desc_overflow.
+    const desc_x = panel_x + 60;
+    const desc_avail: u32 = if (badge_x > desc_x + 12) badge_x - desc_x - 12 else 0;
+    const desc_full = entry.desc;
+    if (aa.default_16.measure(desc_full) <= desc_avail) {
+        aa.drawText(fb, @intCast(desc_x), @intCast(ey + 30), desc_full, desc_color, &aa.default_16);
+    } else {
+        const ell = "...";
+        const ell_w = aa.default_16.measure(ell);
+        const budget: u32 = if (desc_avail > ell_w) desc_avail - ell_w else 0;
+        var end: usize = desc_full.len;
+        while (end > 0) : (end -= 1) {
+            if (aa.default_16.measure(desc_full[0..end]) <= budget) break;
+        }
+        aa.drawText(fb, @intCast(desc_x), @intCast(ey + 30), desc_full[0..end], desc_color, &aa.default_16);
+        const drawn_w = aa.default_16.measure(desc_full[0..end]);
+        aa.drawText(fb, @intCast(desc_x + drawn_w), @intCast(ey + 30), ell, desc_color, &aa.default_16);
+    }
+
     var bs = layout.HStack.init(fb, badge_x, badge_y, badge_h);
     bs.badge(entry.badge, COLOR_BADGE_TEXT, entry.badge_color, &aa.default_16);
 }
@@ -314,6 +338,8 @@ fn modeShortName(mode: u32) []const u8 {
         6 => "stress kill",
         7 => "panic test",
         8 => "stress async-exec",
+        10 => "stress wake-ipi",
+        11 => "stress io-chain",
         else => "?",
     };
 }
@@ -572,9 +598,16 @@ fn showImpl(
     // Bumped from 420 → 480 once the AA atlas swap landed: SF Pro Text's
     // line_height (~20 px) is larger than the bitmap's 16, so the crash
     // strip + HW info couldn't both fit between the title-bar accent and
-    // the entries without overlap. The extra 60 px gives the strips room
-    // and Tests submenu's 6 entries enough vertical real estate.
-    const panel_h: u32 = 480;
+    // the entries without overlap.
+    //
+    // Now grows dynamically with entries.len: the Tests submenu added a
+    // 7th entry (wake-IPI) and the fixed 480 left the footer key-cap
+    // row drawn over the last entry. `overhead` is the non-entry
+    // vertical space (title strip + gap + footer + countdown bar area).
+    const min_panel_h: u32 = 480;
+    const overhead_h: u32 = 60 + 7 + 80;
+    const needed_h: u32 = @as(u32, @intCast(entries.len)) * ENTRY_H + overhead_h;
+    const panel_h: u32 = @max(min_panel_h, needed_h);
     const panel_x = (fb.w - panel_w) / 2;
     const panel_y = (fb.h - panel_h) / 2 + 40;
     // Crash on previous boot disables auto-boot — the user clearly needs to

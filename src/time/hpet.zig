@@ -155,8 +155,16 @@ pub fn readNanos() u64 {
         ctr = (@as(u64, wraps) << 32) | @as(u64, cur32);
         @atomicStore(u32, &wrap_state_lock, 0, .release);
     }
-    const product: u128 = @as(u128, ctr) * @as(u128, period_fs);
-    return @intCast(product / 1_000_000);
+    // ctr * period_fs / 1_000_000, but in u64 to avoid pulling __udivti3
+    // (compiler-rt 128-bit divide isn't linked by the KASAN pipeline's
+    // manual `ld` step). Split: whole-ns per tick + sub-ns remainder.
+    // For HPET 100MHz period_fs = 10_000_000 → period_ns_whole = 10,
+    // remainder = 0 — the second term is a no-op.
+    // Safe from overflow: ctr * 10_000 fits u64 for ~5800 years uptime at
+    // 100MHz; ctr * (period_fs % 1_000_000) is bounded by ctr * 999_999.
+    const period_ns_whole = period_fs / 1_000_000;
+    const period_ns_rem = period_fs % 1_000_000;
+    return ctr *% period_ns_whole +% (ctr *% period_ns_rem) / 1_000_000;
 }
 
 /// Microseconds since init. Convenient for short-duration timing.

@@ -38,6 +38,7 @@ echo "[kasan] stage 1/6: zig build-obj → IR"
 cat > "$WORK/build_options.zig" <<'BOEOF'
 pub const build_id: u64 = 0;
 pub const kcsan_enabled: bool = false;
+pub const kasan_enabled: bool = true;
 BOEOF
 
 "$ZIG" build-obj \

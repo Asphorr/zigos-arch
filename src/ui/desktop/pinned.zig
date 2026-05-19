@@ -29,3 +29,17 @@ pub const list = [_]Shortcut{
     .{ .name = "Telegram", .cmd = "/bin/tg.elf", .icon = &icons.tg },
     .{ .name = "Doom", .cmd = "/bin/doom_real.elf", .icon = &icons.doom },
 };
+
+/// Subset of `list` indices that appear permanently in the dock. The
+/// desktop sidebar shows the full launcher (all of `list`); the dock is
+/// reserved for the "system tray" of always-useful tools plus the running
+/// windows. Keeps the two surfaces from being identical lists shown twice.
+///
+/// Indices are into `list` above, so launching and tooltip lookup paths
+/// don't need any extra indirection.
+pub const dock_indices = [_]u8{
+    0, // Terminal
+    3, // Files
+    4, // Settings
+    5, // Monitor
+};

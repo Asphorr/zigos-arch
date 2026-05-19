@@ -341,8 +341,11 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     blog.ok("HPET");
     // Hyper-V enlightenment detection. When QEMU exposes the frequency
     // MSRs (`-cpu host,hv-frequencies`) apic.calibrateTimer() reads them
-    // directly instead of running the 10 ms HPET gate.
+    // directly instead of running the 10 ms HPET gate. enableHypercalls()
+    // installs the hypercall thunk page so tlb.shootdownAll can issue
+    // HvCallFlushVirtualAddressSpace instead of IPI fan-out.
     @import("virt/hyperv.zig").detect();
+    @import("virt/hyperv.zig").enableHypercalls();
     if (@import("time/apic.zig").init()) {
         blog.ok("Local APIC + IOAPIC");
     } else {
@@ -359,6 +362,13 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     // SMP: boot additional CPUs
     @import("cpu/smp.zig").init();
     blog.ok("SMP (additional CPUs)");
+    // Static aliasing audit: assert no two alive CPUs share idle_pid /
+    // current_pid / tss.rsp0 right at the end of SMP init. If they do,
+    // the per-CPU bring-up itself is buggy and we'd rather panic with
+    // the colliding pair named than diagnose a wild dispatch in some
+    // downstream driver init.
+    @import("debug/cpu_alias.zig").checkAtBoot();
+    blog.ok("Cross-CPU alias audit");
     // DR-watchpoint cross-CPU sync via IPI — must come AFTER smp.init()
     // (so cpu.alive[] is populated) and BEFORE any arm() that needs cross-CPU
     // semantics. See project_iretq_race_ipi_fix.md.
@@ -432,6 +442,13 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     if (!keyboard.ps2_present and (!xhci_up or !xhci.hasUsbKeyboard())) {
         blog.skip("Input devices", "no PS/2 nor USB HID keyboard found", .{});
         serial.print("[boot] WARNING: no keyboard input source detected — system will boot but won't be interactive.\n", .{});
+    }
+    // If a USB keyboard came up alongside PS/2, drop PS/2 IRQ1 — QEMU's
+    // i8042 emulation otherwise spuriously asserts IRQ1 at ~2200/sec on
+    // an idle guest, costing ~4 % of one CPU in handleIRQ1 + EOI for
+    // no input. USB is the real input path; PS/2 is dead weight.
+    if (keyboard.ps2_present and xhci_up and xhci.hasUsbKeyboard()) {
+        keyboard.disableIRQ1();
     }
     if (nic.init()) {
         blog.ok("Network interface");
@@ -538,6 +555,8 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
         6 => @intFromPtr(&@import("test/stress_kill_race.zig").taskEntry),
         7 => @intFromPtr(&@import("test/panic_test.zig").taskEntry),
         8 => @intFromPtr(&@import("test/stress_async_exec.zig").taskEntry),
+        10 => @intFromPtr(&@import("test/stress_wake_ipi.zig").taskEntry),
+        11 => @intFromPtr(&@import("test/stress_io_chain.zig").taskEntry),
         // Mode 9 (GPU compositor) boots the regular desktop; the desktop
         // detects boot_mode==9 and spawns ui/gpu_compositor.zig as a
         // side-by-side kernel task so they share one screen.
@@ -549,6 +568,22 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
 
 pub fn panic(msg: []const u8, _: ?*std.builtin.StackTrace, ret_addr: ?usize) noreturn {
     asm volatile ("cli");
+    // Publish crash to Hyper-V crash MSRs FIRST — five wrmsrs, no allocations,
+    // no locks. On real Hyper-V the host surfaces these as a BugCheck entry
+    // in Event Viewer (source: "Hyper-V-Hypervisor"), so the crash is
+    // readable post-mortem even if our own NVRAM write or serial print dies
+    // mid-autopsy. No-op when crash MSRs aren't exposed.
+    {
+        const hyperv = @import("virt/hyperv.zig");
+        const ret_u64: u64 = if (ret_addr) |a| @intCast(a) else 0;
+        const rsp_u64 = asm volatile ("movq %%rsp, %[ret]"
+            : [ret] "=r" (-> u64),
+        );
+        // P0 = sentinel marking "ZigOS @panic" (low 32 = bug code).
+        // P1 = ret_addr (panic origin). P2 = rsp. P3/P4 = first/second
+        // 8 bytes of the panic message, LE-packed.
+        hyperv.writeCrash(0x5A49474F_53504E43, ret_u64, rsp_u64, hyperv.packMsg(msg, 0), hyperv.packMsg(msg, 8));
+    }
     // Persist crash to NVRAM FIRST — before anything that might double-fault
     // (serial print can spuriously fail if the IO port state is corrupt;
     // VGA might be detached; the autopsy walks page tables). The earlier
@@ -578,6 +613,18 @@ pub fn panic(msg: []const u8, _: ?*std.builtin.StackTrace, ret_addr: ?usize) nor
     // step would otherwise re-acquire). Other CPUs spin-wait or steal
     // after timeout. Output stays per-CPU sequential, not byte-interleaved.
     @import("debug/kdbg.zig").enterCritical();
+
+    // Halt peers FIRST, before any serial output. Without this, the
+    // panic banner / crashSummary / backtrace below byte-interleave with
+    // whatever peer CPUs were klog'ing (slow-sc traces, perf dumps,
+    // heartbeats) and the autopsy log is illegible at the moment we
+    // need it most. broadcastNMI waits ~50 ms for peer snapshots to
+    // land and halt; after it returns we have exclusive serial access.
+    // Each peer still prints its own [nmi-snap cpuN] line before halting
+    // so we don't lose the "what was the other CPU doing" signal.
+    @import("debug/kdbg.zig").nmi_halt_after_snapshot = true;
+    @import("debug/kdbg.zig").broadcastNMI();
+
     serial.print("\n!!! KERNEL PANIC !!!\n", .{});
 
     // Snapshot RSP for the stack-overflow heuristic in classifyCrash before
@@ -655,15 +702,25 @@ pub fn panic(msg: []const u8, _: ?*std.builtin.StackTrace, ret_addr: ?usize) nor
         rbp = next;
     }
 
-    // NMI broadcast (task #247) — solicit a snapshot from every other CPU
-    // before we halt. Reveals "what was the OTHER CPU doing when we
-    // paniced" — critical for SMP race investigations. Each NMI handler
-    // dumps a one-line state digest with per-cpu prefix, then halts (the
-    // halt-after flag prevents the receivers from continuing on potentially-
-    // corrupt state — without it cpu0 keeps running the desktop loop after
-    // cpu1 panicked, which then trips a second cascading panic).
-    @import("debug/kdbg.zig").nmi_halt_after_snapshot = true;
-    @import("debug/kdbg.zig").broadcastNMI();
+    // (NMI broadcast moved up — peers halted before any serial output so
+    // the autopsy log isn't byte-interleaved.)
+
+    // Dump every registered lock with holder + return-address. Catches
+    // the "wedge because X held the lock and slept" class of bugs that
+    // the wedged-CPU snapshot alone doesn't reveal.
+    @import("proc/spinlock.zig").dumpAllLocks();
+
+    // Per-PID syscall ring of whatever was running on this CPU. Last
+    // 8 syscalls leading up to the panic — often points right at the
+    // class of operation that triggered the fault (heavy fread loop,
+    // mid-fork, etc.).
+    {
+        const process = @import("proc/process.zig");
+        const cpu = @import("cpu/smp.zig").myCpu();
+        if (cpu.current_pid) |cur| {
+            process.dumpSyscallRing(@intCast(cur));
+        }
+    }
 
     // Slab cache forensics — which subsystems were live at crash time.
     // No-op when no caches were ever created.

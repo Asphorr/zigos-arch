@@ -88,10 +88,13 @@ fn validateUserPtrAligned(ptr: usize, len: usize, comptime align_to: usize) bool
 }
 
 export fn doSyscall(sys_num: u32, arg1: u32, arg2: u32, arg3: u32, frame_raw: *anyopaque) callconv(.c) u32 {
+    // Per-CPU breadcrumb — stamp BEFORE everything else so even if we panic
+    // mid-syscall, the autopsy reflects what this CPU was doing.
+    @import("../debug/breadcrumb.zig").stamp(.syscall_entry, sys_num);
     // Unconditional, first-line, no-allocation entry trace — if we ever stop
     // seeing [sc-entry] for a process, doSyscall isn't being reached, so the
     // wedge is in syscall_entry.zig's per-CPU entry stub (RSP swap, RIP-rel
-    // load of syscall_stack_top) before we get here. Pre-PCB-lookup so a
+    // load of cpus[N].tss.rsp0) before we get here. Pre-PCB-lookup so a
     // corrupted PCB can't suppress it.
     {
         const enter_state = struct {
@@ -122,6 +125,11 @@ export fn doSyscall(sys_num: u32, arg1: u32, arg2: u32, arg3: u32, frame_raw: *a
         // syscall numbers count — they still cost dispatch overhead and
         // we want sysmon to show "this app is hammering syscalls".
         pcb.acct_syscall_count +%= 1;
+        // Diagnostic ring: last 8 syscall numbers. Dumped on panic /
+        // watchdog wedge to answer "what was this PID doing leading up
+        // to the freeze?". Truncate sys_num to u16 (current max is
+        // ~120, leaves headroom).
+        process.recordSyscall(pcb, @truncate(sys_num));
     }
     // First-occurrence per (PID, syscall) trace — surfaces "is this process
     // making any syscalls at all" at near-zero runtime cost.
@@ -764,11 +772,14 @@ fn sysGetsid(arg_pid: u32) u32 {
 fn sysSetWallpaper(buf_ptr: u32, w: u32, h: u32) u32 {
     const background = @import("../ui/desktop/background.zig");
     const dirty = @import("../ui/desktop/dirty.zig");
-    debug.klog("[sysSetWallpaper] buf=0x{X} w={d} h={d}\n", .{ buf_ptr, w, h });
+    const pmm_diag = @import("../mm/pmm.zig");
+    const free_entry = pmm_diag.freeFrameCount();
+    debug.klog("[sysSetWallpaper] buf=0x{X} w={d} h={d} pmm_free={d}\n", .{ buf_ptr, w, h, free_entry });
     if (w == 0 and h == 0 and buf_ptr == 0) {
         background.clearWallpaper();
         dirty.force_full_kind = true;
-        debug.klog("[sysSetWallpaper] cleared\n", .{});
+        desktop.wake.requestWake();
+        debug.klog("[sysSetWallpaper] cleared pmm_free={d} delta={d}\n", .{ pmm_diag.freeFrameCount(), pmm_diag.freeFrameCount() -% free_entry });
         return 0;
     }
     if (w == 0 or h == 0 or w > 4096 or h > 4096) {
@@ -780,10 +791,20 @@ fn sysSetWallpaper(buf_ptr: u32, w: u32, h: u32) u32 {
         debug.klog("[sysSetWallpaper] EFAULT validateUserPtr({d} bytes)\n", .{total});
         return E_FAULT;
     }
+    const free_before_clear = pmm_diag.freeFrameCount();
+    // allocateWallpaper internally calls clearWallpaper() first; we want
+    // to see frees + allocs broken apart, so do clear here explicitly.
+    background.clearWallpaper();
+    const free_after_clear = pmm_diag.freeFrameCount();
     if (!background.allocateWallpaper(w, h)) {
         debug.klog("[sysSetWallpaper] ENOMEM allocateWallpaper({d}x{d})\n", .{ w, h });
         return E_NOMEM;
     }
+    const free_after_alloc = pmm_diag.freeFrameCount();
+    debug.klog("[wallpaper-diag] before_clear={d} after_clear={d} (freed={d}) after_alloc={d} (consumed={d})\n", .{
+        free_before_clear, free_after_clear, free_after_clear -% free_before_clear,
+        free_after_alloc, free_after_clear -% free_after_alloc,
+    });
     const dst = background.wallpaperSlice() orelse {
         debug.klog("[sysSetWallpaper] wallpaperSlice() null after alloc\n", .{});
         return E_INVAL;
@@ -791,6 +812,7 @@ fn sysSetWallpaper(buf_ptr: u32, w: u32, h: u32) u32 {
     const src: [*]const u32 = @ptrFromInt(@as(usize, buf_ptr));
     @memcpy(dst, src[0..dst.len]);
     dirty.force_full_kind = true;
+    desktop.wake.requestWake();
     debug.klog("[sysSetWallpaper] OK installed {d}x{d}, force_full=true\n", .{ w, h });
     return 0;
 }
@@ -833,6 +855,9 @@ fn sysSetConfig(key: u32, value: u32) u32 {
         },
         255 => { // apply
             desktop.config_changed = true;
+            // Wake the event-driven compositor so the apply path runs
+            // promptly instead of waiting for the next input event.
+            desktop.wake.requestWake();
         },
         else => return 0xFFFFFFFF,
     }
@@ -914,7 +939,9 @@ fn sysMmap(len: u32, fd: u32, offset: u32) u32 {
         if (!pcb.fd_table[fd].in_use) return E_INVAL;
 
         const num_pages: u32 = @intCast(len_pg / 0x1000);
-        const buf_phys = pmm.allocContiguous(num_pages) orelse return E_NOMEM;
+        // User-driven fd-backed mmap — respect the PMM reserve so a
+        // big mmap can't deplete the kernel emergency pool.
+        const buf_phys = pmm.allocContiguousUser(num_pages) orelse return E_NOMEM;
         const buf_ptr: [*]u8 = @ptrFromInt(paging.physToVirt(buf_phys));
 
         const saved_off = pcb.fd_table[fd].offset;
@@ -1033,11 +1060,12 @@ fn sysMunmap(va: u32, len: u32) u32 {
 
     // File-backed mmap allocates a per-region kernel buffer; release it after
     // the user-side teardown so a fault hitting the just-removed region (e.g.
-    // a stale TLB entry) can't read freed memory.
+    // a stale TLB entry) can't read freed memory. `source` is a physmap virt
+    // pointer (see sysMmap line 942) — translate back to phys for PMM.
     if (removed.buf_owned) {
         if (removed.source) |src| {
-            const base: usize = @intFromPtr(src);
-            pmm.freeContiguous(base, removed.buf_pages);
+            const phys = paging.virtToPhys(@intFromPtr(src)).?;
+            pmm.freeContiguous(phys, removed.buf_pages);
         }
     }
 
@@ -1341,7 +1369,7 @@ fn sysCreateWindow(alloc_width_in: u32, alloc_height: u32, display_wh: u32) u32 
     // compositor samples. No PMM allocation, no triple-buffer copy.
     var gpu_slot: ?u8 = null;
     var kern_fb: [*]volatile u32 = undefined;
-    var kern_fb_backs: [3]?[*]volatile u32 = .{ null, null, null };
+    const kern_fb_backs: [3]?[*]volatile u32 = .{ null, null, null };
     {
         const gpu_comp = @import("../ui/gpu_compositor.zig");
         if (gpu_comp.isReady()) {
@@ -1374,10 +1402,19 @@ fn sysCreateWindow(alloc_width_in: u32, alloc_height: u32, display_wh: u32) u32 
         // and skips PMM unmap for slot-backed windows.
     } else {
         // Legacy PMM path — compositor not ready or slot alloc failed.
-        // Allocate 4× pages for the race-free triple-buffer scheme.
-        const total_pages: u32 = num_pages * 4;
-        const phys_base = pmm.allocContiguous(total_pages) orelse {
-            debug.klog("[sysCW] reject: pmm.allocContiguous({d} pages = {d} KB) FAILED\n", .{ total_pages, total_pages * 4 });
+        // Allocate ONLY the front buffer (num_pages). Triple back-buffers
+        // (3 × num_pages) are allocated lazily on first sysPresent in
+        // desktop.snapshotGuiFb. Apps that never call sysPresent (sysmon,
+        // any direct-fb GUI app relying on auto-refresh) save 3× their
+        // framebuffer in PMM — at 1920×1080 alloc that's 24 MB saved per
+        // such window. On a 95 MB system that's the difference between
+        // "OOM at three apps" and "OOM at six". Compositor's renderWindow
+        // handles `gui_fb_backs[i] == null` by falling back to gui_fb
+        // (see desktop.zig: `if (w.has_presented) backs[pub] else
+        // gui_fb`), so visual output is identical until the app actually
+        // presents.
+        const phys_base = pmm.allocContiguous(num_pages) orelse {
+            debug.klog("[sysCW] reject: pmm.allocContiguous({d} pages = {d} KB) FAILED\n", .{ num_pages, num_pages * 4 });
             return E_INVAL;
         };
         for (0..num_pages) |i| {
@@ -1393,19 +1430,12 @@ fn sysCreateWindow(alloc_width_in: u32, alloc_height: u32, display_wh: u32) u32 
             const ptr: [*]u8 = @ptrFromInt(paging.physToVirt(phys));
             @memset(ptr[0..4096], 0);
         }
-        for (0..(num_pages * 3)) |i| {
-            const phys = phys_base + (num_pages + i) * 4096;
-            const ptr: [*]u8 = @ptrFromInt(paging.physToVirt(phys));
-            @memset(ptr[0..4096], 0);
-        }
         paging.registerGuiFB(pid, phys_base);
         asm volatile ("movq %%cr3, %%rax\n movq %%rax, %%cr3" ::: .{ .rax = true });
         kern_fb = @ptrFromInt(paging.physToVirt(phys_base));
-        kern_fb_backs = .{
-            @ptrFromInt(paging.physToVirt(phys_base + num_pages * 4096)),
-            @ptrFromInt(paging.physToVirt(phys_base + 2 * num_pages * 4096)),
-            @ptrFromInt(paging.physToVirt(phys_base + 3 * num_pages * 4096)),
-        };
+        // kern_fb_backs stays { null, null, null } — snapshotGuiFb will
+        // populate on first present (or skip cleanly on alloc failure,
+        // leaving the compositor on the gui_fb fallback path).
     }
 
     if (desktop.createGuiWindow(pid, kern_fb, kern_fb_backs, fb_pixels, disp_w, disp_h, alloc_width, alloc_height, auto_focus, gpu_slot) == null) {
@@ -1722,6 +1752,11 @@ fn sysExec(name_ptr: u32, name_len: u32) u32 {
             hex[k * 2 + 1] = hexchars[name_buf[k] & 0x0F];
         }
         @import("../debug/debug.zig").klog("[sysExec] name='{s}' hex={s}\n", .{ name_buf[0..actual_len], hex[0 .. hexlen * 2] });
+        // PMM diagnostic: free frames at every exec. If this drifts down
+        // across runs of the same app, something isn't getting freed on
+        // exit (process teardown or kernel-side caches).
+        const pmm_diag = @import("../mm/pmm.zig");
+        @import("../debug/debug.zig").klog("[pmm-diag] exec free={d}/{d}\n", .{ pmm_diag.freeFrameCount(), pmm_diag.managedFrameCount() });
     }
 
     // Split on first space: "editor.elf myfile.txt" -> filename + arg
@@ -3438,21 +3473,31 @@ fn sysShutdown(mode: u32) u32 {
 
     // Best-effort: flush dirty FS caches before yanking the power.
     if (fat32.isInitialized()) fat32.flushAll();
+    // Then commit any in-flight NVMe writes to non-volatile storage —
+    // without this, the device write cache can lose recent writes on
+    // power-off even after fat32.flushAll has drained the OS-side caches.
+    @import("../driver/nvme.zig").flushAll();
 
     if (mode == 1) {
         // Reboot path, preferred order:
-        //   1. ACPI reset register (FADT.reset_reg + reset_value). Modern
+        //   1. Hyper-V reset MSR — clean hypervisor-mediated reset on QEMU
+        //      with `-cpu host,hv-reset` or real Hyper-V. Synchronous; we
+        //      don't return if the host honors it. Skipped when the MSR
+        //      isn't exposed.
+        //   2. ACPI reset register (FADT.reset_reg + reset_value). Modern
         //      Intel ME / AMD PSP hold reset state in a way only ACPI's
         //      preferred reset path clears cleanly. No-op when the BIOS
         //      didn't fill in FADT.reset_reg (older systems).
-        //   2. PCI reset register (port 0xCF9, bit 1 = system reset,
+        //   3. PCI reset register (port 0xCF9, bit 1 = system reset,
         //      bit 2 pulsed = full reset) — modern QEMU honors this.
-        //   3. 8042 keyboard controller pulse — bare-metal fallback that
+        //   4. 8042 keyboard controller pulse — bare-metal fallback that
         //      works on every PC since the AT, but is occasionally
         //      ignored by VMs.
         // Each attempt does nothing if the previous already triggered;
         // the kernel just keeps writing reset registers until something
         // takes.
+        const hyperv = @import("../virt/hyperv.zig");
+        _ = hyperv.tryReset();
         acpi.tryReset();
         io.outb(0xCF9, 0x06);
         var spin: u32 = 0;

@@ -155,30 +155,38 @@ pub fn enableSmapPerCpu() void {
     if (cur != want) wrmsr(MSR_SFMASK, want);
 }
 
-/// Save CR4 and temporarily clear SMEP. Used to bracket calls into
-/// UEFI runtime services — firmware code lives in the low-half
-/// identity map with U/S=1, so SMEP traps `call` to those pages.
-/// Returns the original CR4; pass it back to `restoreCr4` to undo.
+/// Save CR4 and temporarily clear SMEP **and** SMAP. Used to bracket
+/// calls into UEFI runtime services — firmware code AND data live in
+/// the low-half identity map with U/S=1, so SMEP traps `call` to those
+/// pages and SMAP traps the firmware's reads of its own data structs.
+/// Returns the original CR4; pass it back to `endNonSmepCall` to undo.
 /// Linux uses the same pattern in efi_call_phys_prolog / _epilog.
+///
+/// Sentinel: returning 0 means "neither was on, nothing to restore".
+/// We OR a high bit on a non-zero CR4 to distinguish "real saved CR4"
+/// from "no-op". Caller treats the returned value as opaque.
 pub fn beginNonSmepCall() u64 {
-    if (!smep_enabled) return 0;
+    if (!smep_enabled and !smap_enabled) return 0;
     const cr4 = asm volatile ("mov %%cr4, %[ret]"
         : [ret] "=r" (-> u64),
     );
-    const cleared = cr4 & ~(@as(u64, 1) << 20);
+    var cleared = cr4;
+    if (smep_enabled) cleared &= ~(@as(u64, 1) << 20);
+    if (smap_enabled) cleared &= ~(@as(u64, 1) << 21);
     asm volatile ("mov %[val], %%cr4"
         :
         : [val] "r" (cleared),
     );
-    return cr4;
+    return cr4 | (@as(u64, 1) << 63);
 }
 
-/// Restore CR4 after `beginNonSmepCall`. No-op if SMEP was never on.
+/// Restore CR4 after `beginNonSmepCall`. No-op if neither was on.
 pub fn endNonSmepCall(saved: u64) void {
-    if (!smep_enabled or saved == 0) return;
+    if (saved == 0) return;
+    const real = saved & ~(@as(u64, 1) << 63);
     asm volatile ("mov %[val], %%cr4"
         :
-        : [val] "r" (saved),
+        : [val] "r" (real),
     );
 }
 

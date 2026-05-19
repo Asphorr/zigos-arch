@@ -59,7 +59,18 @@ const LABEL_COL_W: i32 = 96;
 pub fn draw(info: PanicInfo) void {
     if (gfx.screen_w > 0 and gfx.screen_h > 0) {
         drawGraphical(info);
-        if (gfx.post_blit_fn) |flush| flush();
+        if (gfx.post_blit_fn) |flush| {
+            // Skip the GPU post-blit when virtio_gpu's ctrl_lock is already
+            // held — typically because we're panicking on an IRQ that
+            // interrupted desktop mid-sendCmd. flush()'s sendCmd would
+            // re-enter the Mutex, hit the recursive-acquire detector, and
+            // cascade panics until the watchdog NMI fires. The panel is
+            // still drawn into the framebuffer; on UEFI GOP it's directly
+            // visible. On virtio-gpu the user sees the last desktop frame
+            // — acceptable, serial has the full autopsy.
+            const vgpu = @import("../driver/virtio_gpu.zig");
+            if (!vgpu.ctrlLockBusy()) flush();
+        }
     }
     if (vga.available) drawVga(info);
 }

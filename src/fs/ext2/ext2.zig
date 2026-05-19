@@ -695,7 +695,10 @@ fn walkPath(path: []const u8) ?u32 {
 
 fn lookupInDir(dir_ino: *const layout.Inode, name: []const u8) ?u32 {
     const m = block.getMount() orelse return null;
-    var block_buf: [4096]u8 align(4) = undefined;
+    // Per-task scratch slot (4KB). Replaces a stack-local `[4096]u8` that
+    // was tripping the deep-kstack watchpoint with 0xAA-fill noise and
+    // eating significant frame depth on already-deep fs paths.
+    const block_buf: *[4096]u8 = @import("../../proc/process.zig").currentIoScratch();
     const total = inode.fileSize(dir_ino);
     var lblock: u32 = 0;
     while (@as(u64, lblock) * m.block_size < total) : (lblock += 1) {

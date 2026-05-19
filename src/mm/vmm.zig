@@ -137,7 +137,10 @@ pub fn mapUserPage(pml4: [*]align(4096) u64, virt: usize, phys: usize, flags: u6
     // Phase 3: per-process PML4[0]'s PDPT is fully user-owned (created
     // empty by createAddressSpace; kernel master's PML4[0] is zero). No
     // aliasing of kernel low-half tables, so no COW comparison needed.
-    const pd = resolveOrAlloc(pdpt, pdpt_idx) orelse return;
+    const pd = resolveOrAlloc(pdpt, pdpt_idx) orelse {
+        @import("../debug/debug.zig").klog("[pmm-diag] mapUserPage PD alloc FAILED virt=0x{X} free={d}\n", .{ virt, @import("pmm.zig").freeFrameCount() });
+        return;
+    };
 
     // --- Level 3: PD → PT ---
     var pt: [*]u64 = undefined;
@@ -156,7 +159,10 @@ pub fn mapUserPage(pml4: [*]align(4096) u64, virt: usize, phys: usize, flags: u6
     } else if (pd[pd_idx] & PRESENT != 0) {
         pt = tableFromEntry(pd[pd_idx]);
     } else {
-        const alloc = allocZeroedTable() orelse return;
+        const alloc = allocZeroedTable() orelse {
+            @import("../debug/debug.zig").klog("[pmm-diag] mapUserPage PT alloc FAILED virt=0x{X} free={d}\n", .{ virt, @import("pmm.zig").freeFrameCount() });
+            return;
+        };
         pd[pd_idx] = makeEntry(alloc.phys, PRESENT | READ_WRITE | USER);
         pt = alloc.ptr;
     }
@@ -213,7 +219,11 @@ pub fn protToMapFlags(prot: u8) u64 {
 /// resolution path wants — typically `protToMapFlags(region.prot)`. PRESENT
 /// is set inside `mapUserPage`; callers don't need to include it.
 pub fn allocAndMapUserPage(pml4: [*]align(4096) u64, virt: usize, flags: u64) ?usize {
-    const frame = pmm.allocFrame() orelse return null;
+    // User-data frame: respects the PMM reserve so a user-driven lazy
+    // fault can't eat into the kernel emergency pool. Returning null
+    // here propagates up to handleUserPageFault → SIGSEGV, killing the
+    // offending process cleanly instead of wedging the kernel.
+    const frame = pmm.allocFrameUser() orelse return null;
     mapUserPage(pml4, virt, frame, flags);
     const ptr: [*]u8 = @ptrFromInt(paging.physToVirt(frame));
     @memset(ptr[0..4096], 0);

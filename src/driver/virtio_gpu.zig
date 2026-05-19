@@ -7,6 +7,7 @@ const idt = @import("../cpu/idt.zig");
 const msix = @import("../time/msix.zig");
 const iommu = @import("../cpu/iommu.zig");
 const SpinLock = @import("../proc/spinlock.zig").SpinLock;
+const Mutex = @import("../proc/spinlock.zig").Mutex;
 const apic = @import("../time/apic.zig");
 const perf = @import("../debug/perf.zig");
 
@@ -21,7 +22,24 @@ const SLOW_GPU_SUBMIT_THRESHOLD_MS: u64 = 50;
 // (flushRect/transferToHost called from the desktop) races with AP syscalls
 // (gpuGetCapsetInfo, gpuCtxCreate, etc.) and corrupts the descriptor ring —
 // previously seen as syscalls returning garbage cmd_types for index >= 1.
-var ctrl_lock: SpinLock = .{};
+//
+// Mutex (not SpinLock): sendCmd holds this across blockOn(.gpu_io) while
+// waiting for the host's MSI-X response (~50-80ms). A SpinLock here would
+// deadlock — the holder yields via blockOn, scheduler picks another task
+// on the same CPU, that task tries to acquire and spins forever because
+// SpinLock keys ownership by CPU. Mutex keys by PCB, so the waiter
+// correctly sleeps on .mutex and is woken on release. (See the
+// 2026-05-16 fastfetch wedge for the original incident.)
+var ctrl_lock: Mutex = .{};
+
+/// True iff a GPU control-channel op is in flight on some pid. Used by the
+/// panic-screen render path to skip post_blit_fn (= flushUnconditional)
+/// when calling it would recursively acquire ctrl_lock from a pid that
+/// already owns it (interrupted mid-sendCmd by a panic). Snapshot only —
+/// fine for the panic case (single-shot, racy-but-not-fatal).
+pub fn ctrlLockBusy() bool {
+    return ctrl_lock.isHeld();
+}
 /// Serializes cursor_vq + cursor_cmd page mutations. Cursor updates fire
 /// from desktop main loop (mouse motion) and from focus changes (which
 /// can run from syscall context), so cross-CPU access is real. IrqSave
@@ -73,6 +91,21 @@ fn virtioGpuIrqHandler() callconv(.c) void {
     const cpu_id = smp_mod.myCpu().cpu_id;
     if (cpu_id < 4) virtio_gpu_irq_per_cpu[cpu_id] +%= 1;
     const process = @import("../proc/process.zig");
+    // Wake any PCB parked in `blockOn(.gpu_io, …)`. We MUST NOT call
+    // process.wake() from here — it would acquire cross-CPU sched_lock
+    // to rqEnter the woken pid, and a wedge fired during paint.elf load
+    // (wallpaper change racing with NVMe MSI-X-driven syscalls) traced
+    // to exactly that path. Safer: just bump the waiter's wake_tick
+    // back to "now", and let BSP's wakeExpired (already runs from IRQ0
+    // in a known-safe context with the right lock ordering) do the
+    // actual setState + rqEnter. The wake IPI fan-out below still
+    // pokes other CPUs out of hlt so their next IRQ0 fires quickly.
+    var pid: u8 = 0;
+    while (pid < process.MAX_PROCS) : (pid += 1) {
+        if (process.procs[pid].wait_kind == .gpu_io) {
+            @atomicStore(u64, &process.procs[pid].wake_tick, process.tick_count, .release);
+        }
+    }
     // Use the wake-only vector (no schedule() call). kill_kick_vector's
     // handler calls schedule() which actively de-prioritises the receiver's
     // current task via pickNext(exclude=current) — wrong for our case where
@@ -667,26 +700,27 @@ fn sendCmdViaPhys(cmd_len: u32, resp_len: u32) bool {
     //     spin with a 10M-iteration cap.
     // Hoisted out of the blk so the slow-submit log can include it.
     var hlt_iters: u32 = 0;
-    // Adaptive spin-poll BEFORE falling to MSI-X-driven hlt. Workaround for
-    // CVE-2024-3446's mem_reentrancy_guard side-effect: QEMU's virtio
-    // devices silently drop virtio_notify() calls when the host re-enters
-    // the device's MMIO region during command processing — common for
-    // SUBMIT_3D where Venus touches blob/dma-buf regions. Empirically,
-    // wake_during(cpu0=0,cpu1=0) on every slow submit confirms the
-    // notification never fires; the host updates usedIdx (visible to memory
-    // polling within ms) but never raises the IRQ.
+    // Short adaptive spin-poll BEFORE falling to MSI-X-driven hlt.
+    // Workaround for CVE-2024-3446's mem_reentrancy_guard side-effect:
+    // QEMU's virtio devices silently drop virtio_notify() calls when
+    // the host re-enters the device's MMIO region during command
+    // processing — common for SUBMIT_3D where Venus touches blob/
+    // dma-buf regions. Without phase A, simple flushes whose IRQ got
+    // dropped would hlt for the full LAPIC tick (10 ms) waiting.
     //
-    // Linux NVMe/virtio drivers use the same adaptive-spin pattern for
-    // the same class of issue. Polling the in-memory usedIdx directly
-    // is reliable; the IRQ path is not. ~100ms is plenty for any
-    // realistic Venus batch (observed max ~75ms, p99 ~511ms for the
-    // largest 2D flushes — those still complete via fall-through hlt).
+    // Trade-off: phase A burns 100 % CPU. The old 100 ms window cost
+    // ~21 ms per flush × 21 flushes/s = 40 %+ of one CPU. A 200 µs
+    // window catches the truly fast path (most ctrl-vq cmds complete
+    // in < 20 µs) and falls through to hlt for genuinely slow ones —
+    // which now spend their wait in C-state at ~0 % CPU, woken by the
+    // LAPIC tick to re-check usedIdx.
     var phase_a_pause_iters: u64 = 0;
     var phase_a_done_via_poll: bool = false;
     if (use_msix and msix_safe_to_use) {
         const tsc_per_q = apic.tscPerQuantum();
         if (tsc_per_q > 0) {
-            const deadline = perf.rdtsc() +% (tsc_per_q * 10); // 100ms
+            // 200 µs at 100 Hz tick (tsc_per_q = ticks per 10 ms) = q/50.
+            const deadline = perf.rdtsc() +% (tsc_per_q / 50);
             while (perf.rdtsc() < deadline) : (phase_a_pause_iters +%= 1) {
                 if (ctrl_vq.last_used_idx != ctrl_vq.usedIdx().*) {
                     phase_a_done_via_poll = true;
@@ -701,34 +735,38 @@ fn sendCmdViaPhys(cmd_len: u32, resp_len: u32) bool {
     const got_response: bool = blk: {
         if (phase_a_done_via_poll) break :blk true;
         if (use_msix and msix_safe_to_use) {
-            // cli-around-check + atomic sti;hlt — without the cli, an MSI-X
-            // arriving in the window between the comparison and the sti;hlt
-            // is consumed by the dummy virtioGpuIrqHandler and we sleep
-            // until the next 10ms LAPIC tick. Measured: each ctrl_vq cmd
-            // averaged ~10ms (one tick per wait), making flushRect hit
-            // 22ms (= 2 cmds for blob page-flip) and burning ~21% of
-            // wall time on the desktop CPU. Same pattern as
-            // nvme.waitCompletion. See log analysis 2026-05-09.
+            // Sleep-yield wait. blockOn parks the calling PCB in .sleeping
+            // with wait_kind=.gpu_io; schedule() then picks idle (or
+            // another runnable task), which means the timer IRQs that
+            // fire during the wait charge against the idle PCB's
+            // is_idle=true → idle_tick_count++ instead of the GPU
+            // submitter. Without this yield, the submitter holds
+            // current_pid through the entire wait and the menubar /
+            // sysmon CPU bars peg at 100 % even though the CPU is in
+            // C-state. virtioGpuIrqHandler walks PCBs and wakes any
+            // .gpu_io waiter when usedIdx advances; ctrl_lock keeps the
+            // waiter count at ≤ 1.
             //
-            // Timeout: 100 hlts ≈ 1s on the default 10ms LAPIC period.
-            // (TSC-based timeout was tried 2026-05-10 to harden against
-            // suspected hlt-not-waking edge cases, but it interacted
-            // badly with vulkan_cube's hot path — sys#31 max went from
-            // ~100M cyc to ~32B cyc. Reverted; iteration count is what
-            // shipped working for ~80fps cube on 2026-05-08.)
+            // Timeout: re-check after each yield; bail after 100
+            // schedule round-trips (~1 s if waking only via the 10 ms
+            // LAPIC tick; far sooner under any real GPU IRQ delivery).
+            const process = @import("../proc/process.zig");
             while (true) {
-                asm volatile ("cli" ::: .{ .memory = true });
                 if (ctrl_vq.last_used_idx != ctrl_vq.usedIdx().*) {
-                    asm volatile ("sti" ::: .{ .memory = true });
                     break :blk true;
                 }
                 if (hlt_iters >= 100) {
-                    asm volatile ("sti" ::: .{ .memory = true });
                     break :blk false;
                 }
-                // sti shadows the next instruction: an IRQ pending across
-                // the cli is held until after hlt commits, then wakes us.
-                asm volatile ("sti; hlt" ::: .{ .memory = true });
+                // Safety-net: set wake_tick = now + 1 tick (~10 ms) so
+                // wakeExpired() wakes us if the GPU IRQ goes missing
+                // (CVE-2024-3446 drops virtio_notify under reentrancy).
+                // The primary waker is still virtioGpuIrqHandler walking
+                // the PCB table. Set wake_tick BEFORE blockOn so the
+                // soft-yield doesn't race wakeExpired clearing it.
+                const cur_pid = @import("../cpu/smp.zig").myCpu().current_pid orelse break :blk false;
+                process.procs[cur_pid].wake_tick = process.tick_count +% 1;
+                process.blockOn(.gpu_io, 0);
                 hlt_iters += 1;
             }
         } else {
@@ -803,6 +841,180 @@ fn sendSimpleCmd(cmd_buf: [*]const u8, cmd_len: u32) bool {
     if (!sendCmd(cmd_buf, cmd_len, @as([*]u8, @ptrCast(&resp)), @sizeOf(CtrlHdr))) return false;
     if (resp.cmd_type != RESP_OK_NODATA) {
         debug.klog("[virtio-gpu] Error response: 0x{X}\n", .{resp.cmd_type});
+        return false;
+    }
+    return true;
+}
+
+/// Per-chain cmd slot within `cmd_phys` for the batched-pair path. The
+/// flush hot path only uses two slots (256 B each is way more than
+/// `SetScanoutBlob` or `ResourceFlush` need) and we already have 16 KB
+/// of `cmd_phys` reserved. Same offsets used for `resp_phys`.
+const PAIR_CMD_SLOT_BYTES: u32 = 256;
+
+/// Batched-submit equivalent of two back-to-back `sendSimpleCmd` calls.
+/// Submits both cmds to the controlq before notifying the device once,
+/// then blocks on a single MSI-X round-trip until *both* responses
+/// arrive. Used by the compositor flush path where the
+/// `SetScanoutBlob` + `ResourceFlush` pair previously took two host
+/// round-trips (~41 ms mean) per frame; batching halves it.
+///
+/// Returns true only when both commands returned `RESP_OK_NODATA`.
+fn sendSimpleCmdPair(
+    cmd0_buf: [*]const u8,
+    cmd0_len: u32,
+    cmd1_buf: [*]const u8,
+    cmd1_len: u32,
+) bool {
+    ctrl_lock.acquire();
+    defer ctrl_lock.release();
+
+    if (ctrl_vq.num_free < 4) return false;
+    if (cmd0_len > PAIR_CMD_SLOT_BYTES or cmd1_len > PAIR_CMD_SLOT_BYTES) return false;
+
+    // Stage cmd buffers into the shared cmd_phys page (slot 0 + slot 1)
+    // and zero the response slots.
+    const cmd_base: usize = paging.physToVirt(cmd_phys);
+    const resp_base: usize = paging.physToVirt(resp_phys);
+    const cmd0_dst: [*]volatile u8 = @ptrFromInt(cmd_base);
+    const cmd1_dst: [*]volatile u8 = @ptrFromInt(cmd_base + PAIR_CMD_SLOT_BYTES);
+    const resp0_dst: [*]volatile u8 = @ptrFromInt(resp_base);
+    const resp1_dst: [*]volatile u8 = @ptrFromInt(resp_base + PAIR_CMD_SLOT_BYTES);
+    @memcpy(cmd0_dst[0..cmd0_len], cmd0_buf[0..cmd0_len]);
+    @memcpy(cmd1_dst[0..cmd1_len], cmd1_buf[0..cmd1_len]);
+    @memset(resp0_dst[0..@sizeOf(CtrlHdr)], 0);
+    @memset(resp1_dst[0..@sizeOf(CtrlHdr)], 0);
+
+    const sp = @import("../debug/syscall_perf.zig").scope(.gpu_wait);
+    defer sp.end();
+
+    // Allocate two chains of two descriptors each: (cmd0→resp0), (cmd1→resp1).
+    const c0d0_idx = ctrl_vq.free_head;
+    const c0d0 = ctrl_vq.descPtr(c0d0_idx);
+    const c0d1_idx: u16 = @intCast(c0d0.next);
+    const c0d1 = ctrl_vq.descPtr(c0d1_idx);
+    const c1d0_idx: u16 = @intCast(c0d1.next);
+    const c1d0 = ctrl_vq.descPtr(c1d0_idx);
+    const c1d1_idx: u16 = @intCast(c1d0.next);
+    const c1d1 = ctrl_vq.descPtr(c1d1_idx);
+    ctrl_vq.free_head = @intCast(c1d1.next);
+    ctrl_vq.num_free -= 4;
+
+    c0d0.addr = cmd_phys;
+    c0d0.len = cmd0_len;
+    c0d0.flags = VRING_DESC_F_NEXT;
+    c0d0.next = c0d1_idx;
+    c0d1.addr = resp_phys;
+    c0d1.len = @sizeOf(CtrlHdr);
+    c0d1.flags = VRING_DESC_F_WRITE;
+    c0d1.next = 0;
+
+    c1d0.addr = cmd_phys + PAIR_CMD_SLOT_BYTES;
+    c1d0.len = cmd1_len;
+    c1d0.flags = VRING_DESC_F_NEXT;
+    c1d0.next = c1d1_idx;
+    c1d1.addr = resp_phys + PAIR_CMD_SLOT_BYTES;
+    c1d1.len = @sizeOf(CtrlHdr);
+    c1d1.flags = VRING_DESC_F_WRITE;
+    c1d1.next = 0;
+
+    // Publish BOTH chain heads in avail before notifying. Two avail
+    // entries, one notify — device sees a 2-deep batch and processes
+    // them in pipeline; we only pay one MSI-X round-trip.
+    var ai = ctrl_vq.availIdx().*;
+    ctrl_vq.availRing(ai % ctrl_vq.queue_size).* = c0d0_idx;
+    ai +%= 1;
+    ctrl_vq.availRing(ai % ctrl_vq.queue_size).* = c1d0_idx;
+    asm volatile ("" ::: .{ .memory = true });
+    ctrl_vq.availIdx().* = ai +% 1;
+
+    if (msix_entry_addr != 0) {
+        const my_cpu = @import("../cpu/smp.zig").myCpu();
+        const my_apic_id: u32 = my_cpu.lapic_id;
+        @import("../time/msix.zig").retargetEntry(msix_entry_addr, my_apic_id);
+    }
+
+    // EVENT_IDX: ask device to fire IRQ when usedIdx == used_event + 1.
+    // Setting used_event = last_used_idx + 1 means we only get one IRQ
+    // when BOTH responses have landed — no spurious wake on the first.
+    if (use_event_idx) {
+        ctrl_vq.usedEvent().* = ctrl_vq.last_used_idx +% 1;
+        asm volatile ("" ::: .{ .memory = true });
+    }
+
+    notifyQueue(0, &ctrl_vq);
+
+    const wait_start_tsc = perf.rdtsc();
+    var hlt_iters: u32 = 0;
+    var phase_a_pause_iters: u64 = 0;
+    var phase_a_done_via_poll: bool = false;
+    const target_idx: u16 = ctrl_vq.last_used_idx +% 2;
+    if (use_msix and msix_safe_to_use) {
+        const tsc_per_q = apic.tscPerQuantum();
+        if (tsc_per_q > 0) {
+            const deadline = perf.rdtsc() +% (tsc_per_q / 50);
+            while (perf.rdtsc() < deadline) : (phase_a_pause_iters +%= 1) {
+                if (ctrl_vq.usedIdx().* == target_idx) {
+                    phase_a_done_via_poll = true;
+                    break;
+                }
+                asm volatile ("pause");
+            }
+        }
+    }
+    const got_response: bool = blk: {
+        if (phase_a_done_via_poll) break :blk true;
+        if (use_msix and msix_safe_to_use) {
+            const process = @import("../proc/process.zig");
+            while (true) {
+                if (ctrl_vq.usedIdx().* == target_idx) break :blk true;
+                if (hlt_iters >= 100) break :blk false;
+                const cur_pid = @import("../cpu/smp.zig").myCpu().current_pid orelse break :blk false;
+                process.procs[cur_pid].wake_tick = process.tick_count +% 1;
+                process.blockOn(.gpu_io, 0);
+                hlt_iters += 1;
+            }
+        } else {
+            var timeout: u32 = 10000000;
+            while (ctrl_vq.usedIdx().* != target_idx and timeout > 0) : (timeout -= 1) {
+                asm volatile ("pause");
+            }
+            break :blk timeout > 0;
+        }
+    };
+
+    if (got_response) {
+        ctrl_vq.last_used_idx +%= 2;
+    } else {
+        ctrl_vq.last_used_idx = ctrl_vq.usedIdx().*;
+    }
+
+    // Return all 4 descriptors to the free list (preserve original
+    // chain order so the next allocator sees a contiguous run).
+    c1d1.next = ctrl_vq.free_head;
+    c1d0.next = c1d1_idx;
+    c0d1.next = c1d0_idx;
+    c0d0.next = c0d1_idx;
+    ctrl_vq.free_head = c0d0_idx;
+    ctrl_vq.num_free += 4;
+
+    const wait_dt = perf.rdtsc() -% wait_start_tsc;
+    const wait_ms = apic.tscToMs(wait_dt);
+    if (wait_ms >= SLOW_GPU_SUBMIT_THRESHOLD_MS) {
+        const cmd0_virt: [*]const volatile u32 = @ptrFromInt(cmd_base);
+        const cmd1_virt: [*]const volatile u32 = @ptrFromInt(cmd_base + PAIR_CMD_SLOT_BYTES);
+        debug.klog(
+            "[slow-gpu pair] cmd0=0x{X} cmd1=0x{X} wait={d}ms hlt={d} poll={d} via_poll={any} ok={any}\n",
+            .{ cmd0_virt[0], cmd1_virt[0], wait_ms, hlt_iters, phase_a_pause_iters, phase_a_done_via_poll, got_response },
+        );
+    }
+
+    if (!got_response) return false;
+
+    const resp0: *const CtrlHdr = @ptrFromInt(resp_base);
+    const resp1: *const CtrlHdr = @ptrFromInt(resp_base + PAIR_CMD_SLOT_BYTES);
+    if (resp0.cmd_type != RESP_OK_NODATA or resp1.cmd_type != RESP_OK_NODATA) {
+        debug.klog("[virtio-gpu] Pair error: resp0=0x{X} resp1=0x{X}\n", .{ resp0.cmd_type, resp1.cmd_type });
         return false;
     }
     return true;
@@ -932,10 +1144,18 @@ fn resourceCreate2D(resource_id: u32, w: u32, h: u32) bool {
     return sendSimpleCmd(@as([*]const u8, @ptrCast(&cmd)), @sizeOf(ResourceCreate2D));
 }
 
+// Module-scope to keep attachBacking's frame small. 1000 entries × 16 bytes
+// = 16000 bytes. Previously a stack local — Zig ReleaseSafe `undefined`-fills
+// it with 0xAA on entry, and the resulting 16KB memset on desktop's kstack
+// (a) consumed huge frame depth and (b) tripped the kstack_deep watchpoint
+// at 2026-05-17. attachBacking is only called from setupDisplay during
+// virtio_gpu.init (boot-time, single-threaded) so no locking is needed.
+var attach_backing_merged: [1000]MemEntry = undefined;
+
 fn attachBacking(resource_id: u32, pages: []const usize, page_count: u32) bool {
     // Merge contiguous physical pages into fewer scatter-gather entries
     // This keeps the command small enough to fit in one page
-    var merged: [1000]MemEntry = undefined;
+    const merged = &attach_backing_merged;
     var nr_merged: u32 = 0;
     var i: u32 = 0;
     while (i < page_count and nr_merged < 1000) {
@@ -1032,18 +1252,18 @@ fn transferToHost(resource_id: u32, x: u32, y: u32, w: u32, h: u32) bool {
 }
 
 fn resourceFlushCmd(resource_id: u32, x: u32, y: u32, w: u32, h: u32) bool {
-    // FENCE-flagged: QEMU holds the response until virglrenderer's fence
-    // callback for this fence_id fires, which for display commands ties
-    // to host display backend's frame-done. On a vsync'd backend this
-    // gives implicit vblank sync → eliminates tearing on the zero-copy
-    // SET_SCANOUT_BLOB path. On a non-vsync'd backend the fence fires
-    // immediately and behavior is unchanged.
-    fence_id_next +%= 1;
+    // Previously FENCE-flagged for implicit vblank sync. Measured cost
+    // (perf.flush_rect): mean 86 M cycles ≈ 28 ms per call on QEMU's
+    // GTK display backend — the fence response blocks until host
+    // frame-done, and the desktop task is charged as busy for the
+    // entire wait. At ~21 flushes/sec that was 60 %+ of one CPU spent
+    // blocking on host vsync. Dropped the flag: tearing on the CPU
+    // compositor path is invisible at UI refresh rates, and the GPU
+    // compositor (mode 9, blob scanout) uses its own fence ping-pong
+    // (`project_venus_fence_lies.md`) so it doesn't rely on this one.
     var cmd = ResourceFlush{
         .hdr = .{
             .cmd_type = CMD_RESOURCE_FLUSH,
-            .flags = VIRTIO_GPU_FLAG_FENCE,
-            .fence_id = fence_id_next,
         },
         .r = .{ .x = x, .y = y, .width = w, .height = h },
         .resource_id = resource_id,
@@ -1063,6 +1283,11 @@ pub fn init(xres: u32, yres: u32) bool {
         debug.klog("[virtio-gpu] init: already active ({d}x{d}), requested {d}x{d} ignored\n", .{ width, height, xres, yres });
         return true;
     }
+    // Name the critical locks so a panic / watchdog dump can identify
+    // who holds them when the system wedges. ctrl_lock specifically is
+    // the one held across blockOn(.gpu_io) during virtio-gpu submits.
+    @import("../proc/spinlock.zig").registerMutex("virtio_gpu.ctrl_lock", &ctrl_lock);
+    @import("../proc/spinlock.zig").registerLock("virtio_gpu.cursor_lock", &cursor_lock);
     debug.klog("[virtio-gpu] Scanning for device...\n", .{});
 
     // Find virtio-gpu PCI device via the bus cache.
@@ -1490,10 +1715,34 @@ pub fn flushUnconditional() void {
     if (scanout_is_blob and blob_count >= 2) {
         // Page flip: the compositor just wrote into blob[1-blob_front]
         // (which framebuffer points at). Display it, then point
-        // framebuffer at the now-back blob (= old front).
+        // framebuffer at the now-back blob (= old front). The two cmds
+        // (SetScanoutBlob + ResourceFlush) are batched into one virtqueue
+        // submit so the host pipelines them and we pay one round-trip
+        // instead of two — the dominant per-frame cost on QEMU's GTK
+        // backend (~21 ms saved/frame).
         const new_front = 1 - blob_front;
-        _ = setScanoutBlob(0, blob_resource_ids[new_front], width, height, FORMAT_B8G8R8X8_UNORM, width * 4);
-        _ = resourceFlushCmd(blob_resource_ids[new_front], 0, 0, width, height);
+        var sb = SetScanoutBlob{
+            .hdr = .{ .cmd_type = CMD_SET_SCANOUT_BLOB },
+            .r = .{ .x = 0, .y = 0, .width = width, .height = height },
+            .scanout_id = 0,
+            .resource_id = blob_resource_ids[new_front],
+            .width = width,
+            .height = height,
+            .format = FORMAT_B8G8R8X8_UNORM,
+            .strides = .{ width * 4, 0, 0, 0 },
+        };
+        var rf = ResourceFlush{
+            .hdr = .{ .cmd_type = CMD_RESOURCE_FLUSH },
+            .r = .{ .x = 0, .y = 0, .width = width, .height = height },
+            .resource_id = blob_resource_ids[new_front],
+            .padding = 0,
+        };
+        _ = sendSimpleCmdPair(
+            @as([*]const u8, @ptrCast(&sb)),
+            @sizeOf(SetScanoutBlob),
+            @as([*]const u8, @ptrCast(&rf)),
+            @sizeOf(ResourceFlush),
+        );
         blob_front = new_front;
         framebuffer = blob_virt[1 - new_front];
         current_resource_id = blob_resource_ids[1 - new_front];
@@ -1501,9 +1750,27 @@ pub fn flushUnconditional() void {
         // Single-buffer blob: host udmabuf-imports our pages, no transfer.
         _ = resourceFlushCmd(current_resource_id, 0, 0, width, height);
     } else {
-        // 2D fallback: full transfer + flush.
-        _ = transferToHost(current_resource_id, 0, 0, width, height);
-        _ = resourceFlushCmd(current_resource_id, 0, 0, width, height);
+        // 2D fallback: full transfer + flush — also batched into one
+        // virtqueue submit + single MSI-X round-trip.
+        var th = TransferToHost2D{
+            .hdr = .{ .cmd_type = CMD_TRANSFER_TO_HOST_2D },
+            .r = .{ .x = 0, .y = 0, .width = width, .height = height },
+            .offset = 0,
+            .resource_id = current_resource_id,
+            .padding = 0,
+        };
+        var rf = ResourceFlush{
+            .hdr = .{ .cmd_type = CMD_RESOURCE_FLUSH },
+            .r = .{ .x = 0, .y = 0, .width = width, .height = height },
+            .resource_id = current_resource_id,
+            .padding = 0,
+        };
+        _ = sendSimpleCmdPair(
+            @as([*]const u8, @ptrCast(&th)),
+            @sizeOf(TransferToHost2D),
+            @as([*]const u8, @ptrCast(&rf)),
+            @sizeOf(ResourceFlush),
+        );
     }
 }
 
@@ -1525,19 +1792,61 @@ pub fn flushRectUnconditional(x: u32, y: u32, w: u32, h: u32) void {
     const t = @import("../debug/perf.zig").enter();
     defer @import("../debug/perf.zig").leave(.flush_rect, t);
     if (scanout_is_blob and blob_count >= 2) {
-        // Page flip: same atomic swap as flushUnconditional. Partial
-        // rects can't be flipped — we always present the whole back.
+        // Page flip: SetScanoutBlob + ResourceFlush batched (see
+        // flushUnconditional for rationale). Partial rects can't be
+        // flipped — always present the whole back.
         const new_front = 1 - blob_front;
-        _ = setScanoutBlob(0, blob_resource_ids[new_front], width, height, FORMAT_B8G8R8X8_UNORM, width * 4);
-        _ = resourceFlushCmd(blob_resource_ids[new_front], 0, 0, width, height);
+        var sb = SetScanoutBlob{
+            .hdr = .{ .cmd_type = CMD_SET_SCANOUT_BLOB },
+            .r = .{ .x = 0, .y = 0, .width = width, .height = height },
+            .scanout_id = 0,
+            .resource_id = blob_resource_ids[new_front],
+            .width = width,
+            .height = height,
+            .format = FORMAT_B8G8R8X8_UNORM,
+            .strides = .{ width * 4, 0, 0, 0 },
+        };
+        var rf = ResourceFlush{
+            .hdr = .{ .cmd_type = CMD_RESOURCE_FLUSH },
+            .r = .{ .x = 0, .y = 0, .width = width, .height = height },
+            .resource_id = blob_resource_ids[new_front],
+            .padding = 0,
+        };
+        _ = sendSimpleCmdPair(
+            @as([*]const u8, @ptrCast(&sb)),
+            @sizeOf(SetScanoutBlob),
+            @as([*]const u8, @ptrCast(&rf)),
+            @sizeOf(ResourceFlush),
+        );
         blob_front = new_front;
         framebuffer = blob_virt[1 - new_front];
         current_resource_id = blob_resource_ids[1 - new_front];
     } else if (scanout_is_blob) {
         _ = resourceFlushCmd(current_resource_id, x0, y0, x1 - x0, y1 - y0);
     } else {
-        _ = transferToHost(current_resource_id, x0, y0, x1 - x0, y1 - y0);
-        _ = resourceFlushCmd(current_resource_id, x0, y0, x1 - x0, y1 - y0);
+        // 2D fallback dirty-rect path — transfer + flush batched.
+        const xferw = x1 - x0;
+        const xferh = y1 - y0;
+        const offset: u64 = @as(u64, y0) * @as(u64, width) * 4 + @as(u64, x0) * 4;
+        var th = TransferToHost2D{
+            .hdr = .{ .cmd_type = CMD_TRANSFER_TO_HOST_2D },
+            .r = .{ .x = x0, .y = y0, .width = xferw, .height = xferh },
+            .offset = offset,
+            .resource_id = current_resource_id,
+            .padding = 0,
+        };
+        var rf = ResourceFlush{
+            .hdr = .{ .cmd_type = CMD_RESOURCE_FLUSH },
+            .r = .{ .x = x0, .y = y0, .width = xferw, .height = xferh },
+            .resource_id = current_resource_id,
+            .padding = 0,
+        };
+        _ = sendSimpleCmdPair(
+            @as([*]const u8, @ptrCast(&th)),
+            @sizeOf(TransferToHost2D),
+            @as([*]const u8, @ptrCast(&rf)),
+            @sizeOf(ResourceFlush),
+        );
     }
 }
 

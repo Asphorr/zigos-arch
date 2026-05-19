@@ -1597,6 +1597,10 @@ pub fn pollHID() void {
     if (mouse_ever_worked and !hasTabletDevice() and process.tick_count > mouse_event_tick + MOUSE_WATCHDOG_TICKS) {
         mouse_needs_reset = true;
         mouse_event_tick = process.tick_count;
+        // Wake the event-driven compositor so the reset actually runs.
+        // Without this, a wedged mouse would never recover because no
+        // other input event can fire while the mouse is stuck.
+        @import("../ui/desktop/wake.zig").requestWake();
     }
 }
 
@@ -1744,7 +1748,9 @@ fn processMouseReport(data: [*]volatile const u8) void {
     const dx: i32 = @as(i32, @as(i8, @bitCast(data[1])));
     const dy: i32 = @as(i32, @as(i8, @bitCast(data[2])));
 
+    const prev_buttons = mouse.buttons;
     mouse.buttons = buttons & 0x07;
+    const buttons_changed = mouse.buttons != prev_buttons;
 
     if (dx != 0 or dy != 0) {
         // Apply speed
@@ -1765,6 +1771,10 @@ fn processMouseReport(data: [*]volatile const u8) void {
         if (mouse.x >= mouse.screen_w) mouse.x = mouse.screen_w - 1;
         if (mouse.y >= mouse.screen_h) mouse.y = mouse.screen_h - 1;
         mouse.moved = true;
+    } else if (buttons_changed) {
+        // Click without motion — still needs to wake the event-driven
+        // compositor so the click reaches the focused window.
+        mouse.moved = true;
     }
 }
 
@@ -1774,6 +1784,10 @@ fn processTabletReport(data: [*]volatile const u8) void {
     const abs_y: u32 = @as(u32, data[3]) | (@as(u32, data[4]) << 8);
     // QEMU usb-tablet HID descriptor: byte 5 is signed -127..127 wheel delta.
     const wheel_delta: i32 = @as(i32, @as(i8, @bitCast(data[5])));
+
+    const prev_buttons = mouse.buttons;
+    const prev_x = mouse.x;
+    const prev_y = mouse.y;
 
     mouse.buttons = buttons & 0x07;
 
@@ -1785,7 +1799,14 @@ fn processTabletReport(data: [*]volatile const u8) void {
     if (mouse.x >= mouse.screen_w) mouse.x = mouse.screen_w - 1;
     if (mouse.y >= mouse.screen_h) mouse.y = mouse.screen_h - 1;
     if (wheel_delta != 0) mouse.wheel +%= wheel_delta;
-    mouse.moved = true;
+    // Only flag `moved` when state actually changed. QEMU's usb-tablet
+    // emits a HID report at ~125 Hz regardless of motion; with the
+    // event-driven compositor's wake floor removed, an unconditional
+    // moved=true would resume the desktop on every tick (10 ms) and
+    // negate the whole event-driven idle win.
+    if (mouse.x != prev_x or mouse.y != prev_y or mouse.buttons != prev_buttons or wheel_delta != 0) {
+        mouse.moved = true;
+    }
 }
 
 // HID Usage ID to ASCII (simplified boot keyboard mapping)

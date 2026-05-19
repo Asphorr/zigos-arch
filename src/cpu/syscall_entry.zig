@@ -2,10 +2,18 @@
 // Replaces int 0x80 with native syscall instruction (40% faster).
 //
 // Per-CPU dispatch without GS_BASE: each CPU has its own LSTAR target — a
-// dedicated naked entry stub that addresses its slot in `per_cpu_asm[]` with
-// a RIP-relative load whose displacement is baked in at assembly time. The
-// linker resolves `per_cpu_asm + N*sizeof(PerCpuAsm)` to a fixed address, so
-// the stub never reads any MSR or register to find its per-CPU data.
+// dedicated naked entry stub that loads the kernel stack pointer from
+// `cpus[N].tss.rsp0`, the same TSS field the CPU hardware reads on every
+// IDT-gate entry. The stub does a two-instruction indirect load:
+//
+//   movq cpus_base(%rip), %r11   ; base = &cpus[0], stamped in smp.init()
+//   movq <off>(%r11), %rsp       ; off = N*sizeOf(CpuLocal)+offsetOf(tss)+4
+//
+// Indirect (not RIP-relative direct) because CpuLocal isn't extern-
+// compatible — see smp.zig cpus_base comment. One extra cycle on the
+// syscall hot path, negligible. Both the syscall path and the IDT-gate
+// path now land on the same kstack by construction — no `per_cpu_asm`
+// mirror to drift.
 //
 // The previous design read `%gs:0` / `%gs:8` and depended on `swapgs` having
 // been issued correctly on every kernel↔user CPL transition (8 sites across
@@ -18,6 +26,7 @@
 
 const syscall = @import("syscall.zig");
 const smp = @import("smp.zig");
+const gdt = @import("gdt.zig");
 const apic = @import("../time/apic.zig");
 const std = @import("std");
 
@@ -143,27 +152,46 @@ fn wrmsr(msr: u32, value: u64) void {
 //
 // Each stub is an independent naked function. The CPU's per-CPU slots
 // are addressed as RIP-relative references to `per_cpu_user_rsp` (hot,
-// unprotected) and `per_cpu_asm` (cold, in .kdata_protected) plus
-// comptime-computed byte offsets. No GS_BASE, no swapgs, no MSR reads.
+// unprotected) and `cpus[N].tss.rsp0` (the canonical TSS field the CPU
+// hardware reads on every IDT-gate entry). No GS_BASE, no swapgs, no
+// MSR reads, no duplicated state to keep in sync.
+//
+// Reading directly from the TSS field that the hardware itself reads
+// eliminates the "two fields out of sync" desync class (cpu-alias FAIL
+// on tss.rsp0 vs per_cpu_asm.syscall_stack_top, 2026-05-17): the syscall
+// path and the IDT-gate path land on the *same* kstack by construction.
 //
 // Layout invariants (enforced in smp.zig comptime):
-//   per_cpu_user_rsp[N]              = per_cpu_user_rsp + N*8
-//   per_cpu_asm[N].syscall_stack_top = per_cpu_asm + N*sizeof(PerCpuAsm) (offset 0)
+//   per_cpu_user_rsp[N]    = per_cpu_user_rsp + N*8
+//   cpus[N].tss.rsp0       = cpus + N*sizeof(CpuLocal) + offsetOf(tss) + 4
+// The smp.zig assert guarantees the 8-byte read doesn't straddle a cache
+// line, so a same-CPU setTssRsp0 update is observed atomically here.
 
 extern fn doSyscall(num: u32, arg1: u32, arg2: u32, arg3: u32, frame: *anyopaque) callconv(.c) u32;
 
 fn CpuEntry(comptime cpu_id: u8) type {
     const off_user_rsp_str = std.fmt.comptimePrint("{d}", .{@as(usize, cpu_id) * 8});
-    const off_stack_top_str = std.fmt.comptimePrint("{d}", .{@as(usize, cpu_id) * @sizeOf(smp.PerCpuAsm)});
+    const tss_rsp0_off = @as(usize, cpu_id) * @sizeOf(smp.CpuLocal)
+        + @offsetOf(smp.CpuLocal, "tss")
+        + @offsetOf(gdt.Tss64, "rsp0");
+    const off_tss_rsp0_str = std.fmt.comptimePrint("{d}", .{tss_rsp0_off});
     return struct {
         pub fn entry() callconv(.naked) noreturn {
             asm volatile (
             // Save user RSP into this CPU's user_rsp slot — TRANSIENT bridge
             // only. The persistent copy goes onto the kernel stack two lines
-            // below. Lives in unprotected per_cpu_user_rsp so the syscall
-            // entry doesn't trap on the page-protected per_cpu_asm.
+            // below.
                 "movq %%rsp, per_cpu_user_rsp+" ++ off_user_rsp_str ++ "(%%rip)\n" ++
-                    "movq per_cpu_asm+" ++ off_stack_top_str ++ "(%%rip), %%rsp\n" ++
+                    // Two-step indirect load to cpus[N].tss.rsp0. We can't
+                    // safely scratch any GPR — rcx/r11 hold user RIP/RFLAGS
+                    // for sysret, rax holds syscall_num, rdi/rsi/rdx/r10
+                    // hold user args, callee-saves are user-owned. So we
+                    // use RSP itself as the scratch: SYSCALL/SFMASK cleared
+                    // IF, no IRQ can land between the two loads, and step 2
+                    // overwrites RSP with the real kernel stack top before
+                    // any push happens.
+                    "movq cpus_base(%%rip), %%rsp\n" ++          // rsp = &cpus[0]
+                    "movq " ++ off_tss_rsp0_str ++ "(%%rsp), %%rsp\n" ++ // rsp = cpus[N].tss.rsp0
                     // PUSH user RSP FIRST — ends up at the highest address among the
                     // 15 pushes, matching SyscallFrame.user_rsp's trailing position.
                     // Lifetime is now tied to the kernel stack (per-thread), so it
@@ -227,7 +255,7 @@ fn CpuEntry(comptime cpu_id: u8) type {
                     // pop %rsp loads from [%rsp] into %rsp — gives user_rsp directly.
                     // The post-pop RSP increment is overwritten by the load, so the
                     // 8 bytes of "leak" on the kernel stack don't matter (next
-                    // syscall resets RSP from per_cpu_asm.syscall_stack_top).
+                    // syscall resets RSP from cpus[N].tss.rsp0).
                     "pop %%rsp\n" ++
                     "sysretq\n");
         }

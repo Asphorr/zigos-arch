@@ -34,7 +34,7 @@ const memmap = @import("../mm/memmap.zig");
 pub const REGION_LO: usize = 0x0;
 
 /// Highest address covered by the shadow. 256 MB ceiling — covers kernel
-/// image, heap, guest FB, back buffer, kstack pool, per_cpu_asm, and the
+/// image, heap, guest FB, back buffer, kstack pool, per-CPU TSS, and the
 /// bulk of PMM-allocated kernel pages including GUI framebuffers and
 /// per-process page tables. Shadow size = 32 MB. Anything above this
 /// (LAPIC, HPET, PCI BARs ≥ 4 GB) MUST be handled in denylisted code, or

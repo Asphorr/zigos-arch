@@ -1392,14 +1392,15 @@ fn stateName(s: TcpState) []const u8 {
 pub fn renderProcSock(buf: []u8) usize {
     var n: usize = 0;
     fmtBuf(buf, &n, "proto  local           remote               state\n", .{});
-    // TCP listeners: synthesise rows from tcp_listeners (no per-listener
-    // counters yet so just print the bind port).
-    for (tcp_listeners) |l| {
+    // By-pointer iteration: `for (tcp_conns) |c|` would copy the entire
+    // ~156 KB array onto the kstack, overflowing pid 4 (netstat)'s 64 KB
+    // kstack slot into pid 2 (desktop)'s adjacent slot — caught by DR2
+    // hwbp on kesp+48 (netstat-desktop crash, 2026-05-19).
+    for (&tcp_listeners) |*l| {
         if (!l.active) continue;
         fmtBuf(buf, &n, "tcp    *:{d:<11}    *:*                  LISTEN\n", .{l.port});
     }
-    // Active TCP connections.
-    for (tcp_conns) |c| {
+    for (&tcp_conns) |*c| {
         if (!c.active) continue;
         fmtBuf(buf, &n, "tcp    *:{d:<11}    {d}.{d}.{d}.{d}:{d:<5}  {s}\n", .{
             c.local_port,
@@ -1408,8 +1409,7 @@ pub fn renderProcSock(buf: []u8) usize {
             stateName(c.state),
         });
     }
-    // UDP listeners (we don't separately track sends, only bound recv ports).
-    for (udp_listeners) |l| {
+    for (&udp_listeners) |*l| {
         if (!l.active) continue;
         fmtBuf(buf, &n, "udp    *:{d:<11}    *:*                  -\n", .{l.port});
     }

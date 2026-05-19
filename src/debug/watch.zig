@@ -88,6 +88,12 @@ pub const WatchEntry = struct {
     /// large garbage values (0xAAAAAAAAAAAAAAAA, 0x4141..., etc.) —
     /// every value that physically cannot be a real RIP.
     noncanon_check: bool = false,
+    /// Skip-value filter: when non-zero, suppresses the hit if the
+    /// post-write value at addr EQUALS this. Used to skip Zig's
+    /// undefined-init pattern (0xAAAAAAAAAAAAAAAA) on the deep-kstack
+    /// watch — these come from `var X: [N]u8 = undefined` stack-locals
+    /// in fs code, NOT from the wild writer we're hunting (which zeros).
+    skip_value: u64 = 0,
     /// Optional predicate: if non-null, called with the writer RIP AND the
     /// watched address, suppresses the hit when it returns true. Both args
     /// are needed because some watch types must validate not just "who
@@ -286,6 +292,31 @@ pub fn armValueThreshold(
     broadcastSync();
 }
 
+/// Watch `addr` for writes; suppress hits where the post-write value
+/// EQUALS `skip_value`. Used to catch RA-flip corruption on a parked
+/// task's saved RIP slot — the one legit value (callq's pushed RA)
+/// is the just-observed `*addr` at arm time; anything else is the bug.
+pub fn armSkipValue(
+    slot: u2,
+    addr: u64,
+    len: Len,
+    policy: Policy,
+    label: []const u8,
+    skip_value: u64,
+) void {
+    entries[slot] = .{
+        .armed = true,
+        .addr = addr,
+        .kind = .write,
+        .len = len,
+        .policy = policy,
+        .label = label,
+        .skip_value = skip_value,
+    };
+    applyLocal();
+    broadcastSync();
+}
+
 /// Watch the CS slot of an iretq frame. Fires only when the written
 /// value is NOT a valid CS (neither 0x08 nor 0x23). Catches both wild
 /// scrambled writes AND the shifted-frame-write race where the post-
@@ -357,6 +388,11 @@ pub fn onDebugException(rsp: u64, saved_rip: u64) bool {
             const p: *const u64 = @ptrFromInt(@as(usize, @intCast(e.addr)));
             const v = p.*;
             if (v >= e.value_threshold) continue;
+        }
+        if (e.skip_value != 0) {
+            const p: *const u64 = @ptrFromInt(@as(usize, @intCast(e.addr)));
+            const v = p.*;
+            if (v == e.skip_value) continue;
         }
         // CS-slot filter: legit iretq frames always have CS=0x08 or 0x23.
         // Any other value is corruption (including 0x0 from shifted-frame
@@ -503,8 +539,99 @@ fn printHit(slot: u8, e: *const WatchEntry, rsp: u64, saved_rip: u64, full: bool
 // one timer tick (~10ms), avoiding the IPI heisendetector that masked the
 // race with the per-IRQ arm/disarm design.
 
+// 50 = every ~500ms at 100Hz. Was briefly 1 during the 2026-05-17 netstat
+// hunt to catch a fast-window kesp+48 corruption; restored after the
+// IST=1 structural fix landed (per-tick arming combined with the rest of
+// the diagnostic stack was costing ~1ms per IRQ0 and starving the
+// compositor). Bump back to 1 only while actively re-hunting that class.
 pub const KESP_REROTATE_TICKS: u32 = 50;
-pub const KESP_WATCHED_PIDS = [_]u8{ 3, 4, 5, 6 };
+// Pid 2 = desktop, pid 3 = shell. Dropped 4 and 5 from the field-watch list
+// to free DR slots 2 and 3 for the NEW kesp+48 MEMORY watches added below
+// (netstat-desktop bug 2026-05-17: save_trace proves kernel_esp field is
+// NOT being corrupted — it's the kstack memory at *(kesp+48) that gets
+// zeroed between save and dispatch. The field watch wouldn't catch that;
+// a memory watch on the saved-RIP slot will).
+// Pid 2 = desktop, pid 3 = shell. Field watch on procs[].kernel_esp
+// (slot 0,1) stays armed — catches switchTo writing a cross-PCB value.
+//
+// 2026-05-17: KESP_PLUS48 (memory watch on kstack at kesp+48) is
+// disabled. For a *running* task, its previous saved-kesp+48 address
+// gets organically rewritten by ordinary stack push/pop activity
+// (caught schedule's own `pushfq` writing RFLAGS=0x6 → false positive
+// crash). pcb_invariants.checkPcb catches the SLEEPING/READY case via
+// the same saved-RIP-text-range check, so this watch was redundant.
+pub const KESP_WATCHED_PIDS = [_]u8{ 2, 3 };
+pub const KESP_PLUS48_WATCHED_PIDS = [_]u8{};
+
+// 2026-05-19 attempt: re-enabled the deep canary on pid 2 at
+// `top - 0x1000` to hunt the AAAA / 0x0 kesp+48 corruption. Boot
+// showed the corruption hit pid 3 (not pid 2), and at `kesp+48`
+// (= top - 0xF38) not at top - 0x1000. Also the observed value flip
+// is one canonical kernel RA → another canonical kernel RA (e.g.
+// schedule's callq RA flipped to schedule:2363's RA — cross-CPU
+// stack aliasing signature) so the deep canary's filter wouldn't
+// fire anyway. Replaced by save_trace-driven HWBP with dynamic
+// skip_value (= just-observed legit RA) on both pid 2 and pid 3
+// kesp+48. See save_trace.zig.
+pub const KSTACK_DEEP_WATCHED_PIDS = [_]u8{};
+// 0x1000 (4KB deep). Syscall entry uses ~640B immediately (15 GPRs + 520B
+// FXSAVE), and nested call frames can stack more on top — 0x100 from top
+// was too shallow (FXSAVE write tripped it). 0x1000 is well below any
+// realistic kernel call chain depth but above the kstack bottom (16KB
+// total), leaving plenty of margin.
+pub const KSTACK_DEEP_OFFSET_FROM_TOP: usize = 0x1000;
+
+/// Whitelist for the deep-kstack watch. Two whitelisted categories:
+///
+/// 1. IRQ/syscall/exception entry stubs — always push 15 GPRs + 512B
+///    FXSAVE = ~650B on the preempted task's kstack. When caller's
+///    RSP is already deep, the entry's FXSAVE lands on our watched
+///    address — legitimate, not the wild writer.
+///
+/// 2. Any writer whose RSP at the moment of write is INSIDE the same
+///    kstack as the watched address. This catches the "stack-local
+///    buffer + memcpy/memset into it" pattern (ext2 readInodeBytes
+///    + readBlock copy disk data into a stack `[4096]u8`, fat32 etc.).
+///    A wild cross-stack writer (e.g. destroyCurrent's bulk @memset
+///    on netstat exit) would have its RSP on a DIFFERENT kstack
+///    (netstat's), so the filter doesn't suppress those.
+///
+/// True wild writers (cross-PCB bulk-wipe, dangling pointer writes
+/// from arbitrary kernel code) fail both checks and fire.
+fn isLegitDeepKstackWriter(rip: u64, addr: u64) bool {
+    const r = symbols.resolveKernel(rip) orelse return false;
+    // Category 1: entry stubs.
+    if (std.mem.eql(u8, r.name, "cpu.idt.isr_irq0")) return true;
+    if (std.mem.eql(u8, r.name, "isr_common_exc")) return true;
+    if (std.mem.eql(u8, r.name, "handleException")) return true;
+    if (std.mem.eql(u8, r.name, "handleIRQ0")) return true;
+    if (std.mem.eql(u8, r.name, "handleDynIrq")) return true;
+    if (std.mem.startsWith(u8, r.name, "cpu.syscall_entry.CpuEntry(")) return true;
+    if (std.mem.startsWith(u8, r.name, "cpu.idt.DynIrqStub(")) return true;
+
+    // Category 2: writer's RSP is in the same kstack as the watched
+    // address (= "this task is writing to its own stack-local buffer").
+    const process = @import("../proc/process.zig");
+    const config = @import("../config.zig");
+    const writer_rsp = asm volatile ("movq %%rsp, %[ret]"
+        : [ret] "=r" (-> u64),
+    );
+    // Find the watched kstack: addr is in kstack_pool, which pid owns it?
+    const pool_base = @intFromPtr(&process.kstack_pool[0]);
+    const pool_total = config.MAX_PROCS * config.KSTACK_SLOT_SIZE;
+    if (addr >= pool_base and addr < pool_base + pool_total) {
+        const slot_off = addr - pool_base;
+        const slot_idx = slot_off / config.KSTACK_SLOT_SIZE;
+        const slot_base = pool_base + slot_idx * config.KSTACK_SLOT_SIZE;
+        const slot_end = slot_base + config.KSTACK_SLOT_SIZE;
+        // Writer RSP in same slot = same-kstack legit writer.
+        if (writer_rsp >= slot_base and writer_rsp < slot_end) return true;
+    }
+    return false;
+}
+// Kernel VA base — any value written at *(kesp+48) below this is wild
+// (legit values are kernel .text RAs which all sit above KERNEL_VIRT_BASE).
+const KERNEL_VIRT_BASE: u64 = 0xFFFFFFFF80000000;
 
 /// Predicate: is this kernel_esp write legitimate?
 ///
@@ -575,12 +702,33 @@ fn isLegitKernelEspWriter(rip: u64, addr: u64) bool {
     if (expected_top < window) return false;
     const allow_lo = expected_top - window;
     const v = @as(*const u64, @ptrFromInt(addr)).*;
-    return v >= allow_lo and v < expected_top;
+    if (v >= allow_lo and v < expected_top) return true;
+
+    // ALSO accept: value is inside some CPU's per-CPU isr_stack range. With
+    // IRQ0 + dyn IRQs on TSS.IST=1, the CPU's IRQ-time RSP lives in
+    // cpu.isr_stack[]. If the task was preempted mid-IRQ-handler, switchTo's
+    // save writes that IST1 RSP into the PCB. Later switchTo resumes from
+    // that IST1 address — works because the iretq frame on IST1 still has
+    // the task's original kstack RSP. Without this whitelist branch, every
+    // such legit save would trip the watch.
+    for (0..smp.MAX_CPUS) |i| {
+        const cpu = &smp.cpus[i];
+        if (i > 0 and !cpu.alive) continue;
+        const isr_lo = @intFromPtr(&cpu.isr_stack);
+        const isr_hi = isr_lo + cpu.isr_stack.len;
+        if (v >= isr_lo and v < isr_hi) return true;
+    }
+    return false;
 }
 
-/// Pin DR0-DR3 to KESP_WATCHED_PIDS' kernel_esp slots. Idempotent — safe
-/// to re-arm every tick. Doesn't broadcast IPI; relies on handleIRQ0's
-/// lazy applyLocal sync (~10ms) on each CPU. The arm itself is BSP-only.
+/// Pin DR0-DR3 to KESP_WATCHED_PIDS' kernel_esp slots + KESP_PLUS48_WATCHED_PIDS'
+/// memory at *(kesp+48). Idempotent — safe to re-arm every tick. Doesn't
+/// broadcast IPI; relies on handleIRQ0's lazy applyLocal sync (~10ms) on
+/// each CPU. The arm itself is BSP-only.
+///
+/// Slot layout:
+///   slot 0..KESP_WATCHED_PIDS.len-1   : kernel_esp FIELD watch (cross-stack alias detector)
+///   slot KESP_WATCHED_PIDS.len..      : kesp+48 MEMORY watch (saved-RIP zeroing detector)
 pub fn rotateKernelEspWatches() void {
     const process = @import("../proc/process.zig");
     var any_change = false;
@@ -598,6 +746,81 @@ pub fn rotateKernelEspWatches() void {
             .policy = .panic_dump,
             .label = "kesp",
             .whitelist_fn = &isLegitKernelEspWriter,
+        };
+        any_change = true;
+    }
+    // Memory watch on *(kesp+48) for the netstat-desktop saved-RIP corruption
+    // hunt. value_threshold = KERNEL_VIRT_BASE means: fire iff post-write
+    // value < KERNEL_VIRT_BASE. Legit writes are `call`-push of a kernel RA
+    // (above KERNEL_VIRT_BASE → suppressed). Wild writes like memset(0),
+    // user-mode garbage, or stale-pointer junk land below → fire with
+    // writer's RIP in the autopsy.
+    const base_slot: u2 = @intCast(KESP_WATCHED_PIDS.len);
+    for (KESP_PLUS48_WATCHED_PIDS, 0..) |pid, j| {
+        const slot: u2 = base_slot + @as(u2, @intCast(j));
+        const e = &entries[slot];
+        const kesp = @atomicLoad(usize, &process.procs[pid].kernel_esp, .acquire);
+        // Bounds-check: kesp must be inside the pid's kstack body OR we
+        // skip arming (would otherwise fire on legit unrelated writes).
+        const top = @atomicLoad(usize, &process.expected_kstack_tops[pid], .acquire);
+        const want_addr: u64 = blk: {
+            if (top == 0) break :blk 0;
+            const body_lo = top -| @import("../config.zig").KSTACK_SIZE;
+            const cand = kesp +% 48;
+            if (cand < body_lo or cand + 8 > top) break :blk 0;
+            break :blk cand;
+        };
+        if (want_addr == 0) {
+            if (e.armed) {
+                e.armed = false;
+                any_change = true;
+            }
+            continue;
+        }
+        if (e.armed and e.addr == want_addr and e.value_threshold == KERNEL_VIRT_BASE) continue;
+        e.* = .{
+            .armed = true,
+            .addr = want_addr,
+            .kind = .write,
+            .len = .eight,
+            .policy = .panic_dump,
+            .label = "kesp+48",
+            .value_threshold = KERNEL_VIRT_BASE,
+        };
+        any_change = true;
+    }
+    // Deep-kstack watch — slot KESP_WATCHED_PIDS.len + KESP_PLUS48_WATCHED_PIDS.len
+    // and onwards. Arms one address per watched pid at `kstack_top - OFFSET`.
+    // No value threshold: ANY write to this address is interesting (no legit
+    // writer should reach this deep into a live task's kstack).
+    const deep_base: u2 = @intCast(KESP_WATCHED_PIDS.len + KESP_PLUS48_WATCHED_PIDS.len);
+    for (KSTACK_DEEP_WATCHED_PIDS, 0..) |pid, k| {
+        const slot: u2 = deep_base + @as(u2, @intCast(k));
+        const e = &entries[slot];
+        const top = @atomicLoad(usize, &process.expected_kstack_tops[pid], .acquire);
+        const want_addr: u64 = if (top == 0) 0 else top - KSTACK_DEEP_OFFSET_FROM_TOP;
+        if (want_addr == 0) {
+            if (e.armed) {
+                e.armed = false;
+                any_change = true;
+            }
+            continue;
+        }
+        if (e.armed and e.addr == want_addr and e.whitelist_fn != null) continue;
+        e.* = .{
+            .armed = true,
+            .addr = want_addr,
+            .kind = .write,
+            .len = .eight,
+            .policy = .panic_dump,
+            .label = "kstack_deep",
+            .value_threshold = 0, // fire on ANY value
+            .whitelist_fn = &isLegitDeepKstackWriter,
+            // skip_value intentionally 0 (no skip). The AAAA pattern
+            // IS the bug we're hunting for pid 2 (2026-05-19) — older
+            // "Zig undefined-init noise" rationale doesn't apply here
+            // because the depth + isLegitDeepKstackWriter filter
+            // already gates same-stack writers.
         };
         any_change = true;
     }

@@ -728,6 +728,29 @@ pub fn enableIsolation(bus: u8, dev: u8, func: u8) bool {
 /// For non-isolated devices this is a no-op (the shared identity-map
 /// already covers `[0, IDENTITY_MAP_SPAN)`). `len` rounds up to 4 KB.
 pub fn dmaMap(bus: u8, dev: u8, func: u8, phys: u64, len: u64, prot: Prot) bool {
+    // Tripwire (netstat-desktop kstack-corruption hunt 2026-05-17): if a
+    // driver hands us a phys that lies inside the kernel kstack pool,
+    // mapping it for DMA would let the device clobber another task's
+    // saved context — exactly the wild-RIP=0 symptom. IOMMU isolation
+    // can't catch this on its own because the kernel is explicitly
+    // authorizing the mapping. Caller's RIP in the panic backtrace
+    // identifies the buggy driver call site.
+    {
+        const process_mod = @import("../proc/process.zig");
+        const KERNEL_VIRT_BASE: u64 = 0xFFFFFFFF80000000;
+        const ks_va = @intFromPtr(&process_mod.kstack_pool);
+        const ks_phys_start = ks_va - KERNEL_VIRT_BASE;
+        const ks_phys_end = ks_phys_start + @sizeOf(@TypeOf(process_mod.kstack_pool));
+        const req_end = phys + len;
+        if (phys < ks_phys_end and req_end > ks_phys_start) {
+            debug.klog("\n[iommu-tripwire] !!! dmaMap into kstack range !!!\n", .{});
+            debug.klog("[iommu-tripwire]   device={X:0>2}:{X:0>2}.{X}\n", .{ bus, dev, func });
+            debug.klog("[iommu-tripwire]   phys=0x{X} len=0x{X} prot={any}\n", .{ phys, len, prot });
+            debug.klog("[iommu-tripwire]   kstack_pool phys=[0x{X}..0x{X})\n", .{ ks_phys_start, ks_phys_end });
+            debug.klog("[iommu-tripwire]   caller RA=0x{X}\n", .{@returnAddress()});
+            @panic("dmaMap target hits kstack_pool — driver is mapping a kstack frame for DMA");
+        }
+    }
     if (!translation_active) return true; // IOMMU off — driver can DMA freely
     const d = findDevice(bus, dev, func) orelse return false;
     if (!d.isolated) return true; // Shared identity-map already covers it.

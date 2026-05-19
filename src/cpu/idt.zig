@@ -51,10 +51,30 @@ var entries: [256]Entry = undefined;
 var ptr: Ptr = undefined;
 
 fn setGate(num: u8, handler: usize, flags: u8) void {
+    setGateIst(num, handler, flags, 0);
+}
+
+/// Same as setGate but with an explicit IST (Interrupt Stack Table) index.
+/// IST=0 means "don't switch stacks" (use TSS.RSP0 on privilege change, or
+/// keep the current RSP on same-privilege interrupts). IST=1..7 names a
+/// TSS.ISTn slot — CPU AUTOMATICALLY loads RSP from TSS.ISTn on this
+/// vector, regardless of CPL transition.
+///
+/// Use case: IRQ handlers that may call schedule() and consume stack must
+/// NOT corrupt the preempted task's kstack (netstat-desktop crash class
+/// 2026-05-17 — schedule's pushfq wrote RFLAGS onto desktop's saved
+/// kesp+48). Putting IRQs on IST=1 isolates them on a per-CPU stack.
+///
+/// Constraint: a single IST slot is shared across all vectors that use it.
+/// If two vectors use the same IST and one preempts the other, the second
+/// CPU push reuses the same physical address → corrupts the in-flight
+/// frame. Mitigation: IRQ handlers cli-on-entry (interrupt-gate type 0x8E
+/// auto-clears IF) so no nesting on the same IST happens.
+fn setGateIst(num: u8, handler: usize, flags: u8, ist: u3) void {
     entries[num] = .{
         .offset_low = @as(u16, @truncate(handler & 0xFFFF)),
         .selector = 0x08,
-        .ist = 0,
+        .ist = ist,
         .reserved0 = 0,
         .type_attr = flags,
         .offset_mid = @as(u16, @truncate((handler >> 16) & 0xFFFF)),
@@ -107,7 +127,21 @@ pub fn init() void {
     }
 
     // IRQs
-    setGate(32, @intFromPtr(&isr_irq0), 0x8E);
+    // IRQ0 (timer) + dynamic IRQs use IST=1. They feed handleIRQ0/handleDynIrq
+    // which may call schedule() and consume significant stack (~1-2 KB for
+    // CFS pickNext + load balance). On non-IST entry, that stack would land
+    // on the preempted task's kstack and could overwrite the saved kesp+48
+    // slot from a previous switchTo (netstat-desktop crash 2026-05-17 — the
+    // kesp+48 watchpoint named schedule's pushfq as the writer corrupting
+    // desktop's saved RA). IST=1 = per-CPU cpu.isr_stack (set up by
+    // initPerCpuGdt). IRQ1/IRQ12 stay on IST=0 — they don't reschedule and
+    // their handler chains are tiny.
+    // IRQ0 stays on IST=0 (preempted task's kstack). IST=1 was tried
+    // 2026-05-17 as a structural fix for kesp+48 corruption, but wedged
+    // virtio-gpu — isr_irq0's kernel-to-kernel-ret model requires entry
+    // state on the task's kstack so it survives task switches. See
+    // memory/feedback_ist1_irq0_incompatible.md.
+    setGateIst(32, @intFromPtr(&isr_irq0), 0x8E, 0);
     setGate(33, @intFromPtr(&isr_irq1), 0x8E);
     setGate(44, @intFromPtr(&isr_irq12), 0x8E); // Mouse
 
@@ -127,9 +161,17 @@ pub fn init() void {
     // Dynamic IRQ slots for MSI-X-driven device drivers (vectors 0x40..0x4F).
     // Each stub is a comptime-generated naked thunk that calls handleDynIrq
     // with its own vector number — see DynIrqStub below.
+    //
+    // IST=0 (use preempted task's kstack, not IST1). Briefly flipped to IST=1
+    // on 2026-05-17 alongside the IRQ0 fix, but that wedged virtio-gpu IRQ
+    // delivery — dyn IRQ count froze at 560 after wallpaper.elf finished,
+    // desktop sat in blockOn(.gpu_io) forever. Reverted to IST=0 here while
+    // IRQ0 stays on IST=1 (the kesp+48 corruption class only ever hit via
+    // the timer ISR path). If a dyn-IRQ handler ever needs IST=1, do it
+    // per-vector after isolating the path.
     inline for (0..DYN_IRQ_COUNT) |i| {
         const v: u8 = DYN_IRQ_BASE + @as(u8, @intCast(i));
-        setGate(v, @intFromPtr(&DynIrqStub(v).handler), 0x8E);
+        setGateIst(v, @intFromPtr(&DynIrqStub(v).handler), 0x8E, 0);
     }
 
     ptr.limit = @sizeOf(@TypeOf(entries)) - 1;
@@ -277,6 +319,13 @@ export fn handleException(rsp: u64) callconv(.c) void {
     const error_code = stack[16];
     const saved_cs = stack[18];
     const saved_rip = stack[17];
+
+    // Breadcrumb: vec in high 32, pid in low 32. Stamped before the NMI
+    // fast-path return so even NMI-snapshotted CPUs leave a trace.
+    {
+        const pid_now: u64 = if (@import("smp.zig").myCpu().current_pid) |p| @intCast(p) else 0xFF;
+        @import("../debug/breadcrumb.zig").stamp(.exception_entry, (int_no << 32) | pid_now);
+    }
 
     // NMI snapshot fast-path (task #247). When debug.kdbg.broadcastNMI()
     // sets nmi_snapshot_mode, every other CPU receives an NMI. We dump
@@ -714,6 +763,11 @@ export fn handleException(rsp: u64) callconv(.c) void {
         // routinely the difference between "I have no idea" and "obvious".
         @import("../debug/kdbg.zig").dumpAll();
 
+        // Last 8 syscalls the dying PID made. Frequently the smoking
+        // gun for "app crashed for no obvious reason" — often it was
+        // mid-sysCreateWindow, mid-fread, etc.
+        process.dumpSyscallRing(@intCast(pid));
+
         // Write crash to FAT32 crashlog (only if FAT32 is ready)
         const fat32 = @import("../fs/fat32.zig");
         if (fat32.isInitialized()) {
@@ -747,6 +801,14 @@ export fn handleException(rsp: u64) callconv(.c) void {
     // dump + autopsy + ring dumps print sequentially without byte-interleaving
     // with the other CPU's concurrent panic output. Idempotent per-CPU.
     @import("../debug/kdbg.zig").enterCritical();
+
+    // Halt peer CPUs BEFORE we print anything. Otherwise the exception
+    // banner / register dump / backtrace below byte-interleave with
+    // whatever the peers were klog'ing (slow-sc, perf, heartbeats). Each
+    // peer still emits its own [nmi-snap cpuN] line before halting, so
+    // we don't lose the cross-CPU snapshot.
+    @import("../debug/kdbg.zig").nmi_halt_after_snapshot = true;
+    @import("../debug/kdbg.zig").broadcastNMI();
 
     serial.print("\n!!! EXCEPTION {d}: {s} !!!\n", .{ int_no, name });
     serial.print("  RIP={X:0>16} CS={X:0>4} ERR={X:0>16}\n", .{ saved_rip, saved_cs, error_code });
@@ -782,6 +844,27 @@ export fn handleException(rsp: u64) callconv(.c) void {
             if (error_code & 16 != 0) "instruction-fetch" else "",
             cr2,
         });
+
+        // Kstack-protect smoking gun: kernel-mode write #PF on a present
+        // page that belongs to a PROTECTED_PIDS kstack. CR2 = the exact
+        // byte the wild writer aimed at; saved_rip = the writer's
+        // instruction. Logged BEFORE the rest of the autopsy so it lands
+        // even if a follow-up step itself faults.
+        if ((error_code & 4) == 0 and (error_code & 2) != 0 and (error_code & 1) != 0) {
+            if (@import("../debug/kstack_protect.zig").faultBelongsToProtectedKstack(@intCast(cr2))) |victim| {
+                const writer_pid: ?usize = if (@import("smp.zig").myCpu().current_pid) |p| p else null;
+                @import("../debug/kstack_protect.zig").dumpFault(
+                    victim,
+                    @intCast(cr2),
+                    @intCast(saved_rip),
+                    writer_pid,
+                );
+                // Auto-unprotect so the panic path / autopsy chain doesn't
+                // double-fault on the same RO page. We already have the
+                // smoking gun (writer's RIP + CR2 + writer pid).
+                @import("../debug/kstack_protect.zig").unprotectPidIfProtected(@as(usize, victim));
+            }
+        }
         // SMAP-violation classifier — supervisor #PF on a present page in
         // user-VA range almost certainly means kernel touched user memory
         // without STAC (i.e. outside an active syscall validateUserPtr
@@ -839,13 +922,7 @@ export fn handleException(rsp: u64) callconv(.c) void {
         .crash_rip = saved_rip,
     });
 
-    // NMI broadcast (task #247) — solicit a snapshot from every other
-    // CPU BEFORE entering the gdb stub. The stub blocks waiting for a
-    // connection that often never comes; if we put broadcast after the
-    // stub call, the NMI never fires. Halt the receivers so they can't
-    // continue on corrupt post-exception state.
-    @import("../debug/kdbg.zig").nmi_halt_after_snapshot = true;
-    @import("../debug/kdbg.zig").broadcastNMI();
+    // (NMI broadcast moved up — peers halted BEFORE any serial output.)
 
     serial.print("\n  SYSTEM HALTED.\n", .{});
 
@@ -1052,6 +1129,34 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
     {
         const pid_now: u8 = if (cpu.current_pid) |p| @intCast(p) else 0xFF;
         @import("../debug/kdbg.zig").irqEvent(0, pid_now, frame_for_validate[15], @truncate(frame_for_validate[16]));
+        // Breadcrumb: stamp BEFORE invariant scan so if the scan panics
+        // the autopsy reflects we were in the IRQ0 path on this CPU.
+        @import("../debug/breadcrumb.zig").stamp(.irq0_timer, pid_now);
+    }
+    // PCB invariant scanner — every SCAN_PERIOD_TICKS (~1s). Cheap noop
+    // on non-trigger ticks; on a trigger tick walks all alive PCBs and
+    // panics on the first violation with the offending pid/field named.
+    // Catches cross-stack-aliasing / kesp-clobber / kstack_top mismatch
+    // shortly after they happen instead of after they manifest downstream.
+    @import("../debug/pcb_invariants.zig").maybeScan();
+    // Per-tick kstack saved-RIP mirror-flip monitor (see kstack_protect.zig).
+    // Runs on EVERY CPU's IRQ0, not just BSP — the netstat hunt found that
+    // the victim is typically on cpu1 (shell) while BSP runs desktop, so a
+    // BSP-only check never sees pid=3 in a parked state. Per-pid flip_logged
+    // dedup makes concurrent fires from BSP+AP harmless (worst case one
+    // extra log line). Narrows the writer window to ~10 ms.
+    @import("../debug/kstack_protect.zig").tickMonitor();
+    // (Per-save kstack protection auto-arm removed — wedges silently when
+    // the protect fires inside switchTo. Function kept in kstack_protect
+    // for manual experimentation. See save_trace.zig for context.)
+    // Cross-CPU aliasing scan — runs every 100 ticks (~1s) on BSP only.
+    // (cheaper than per-CPU, since the state it checks is global). Catches
+    // current_pid / idle_pid / tss.rsp0 collisions that would otherwise
+    // show up as wild-RIP dispatches seconds later.
+    // Was every tick during the 2026-05-17 netstat hunt; restored to 100
+    // after IST=1 structural fix landed so compositor isn't starved.
+    if (smp.isBSP() and (process.tick_count % 100) == 0) {
+        @import("../debug/cpu_alias.zig").scan();
     }
     bisectPoint("after irqEvent", frame_for_validate, irq_snap);
 
@@ -1648,11 +1753,40 @@ export fn handleDynIrq(vec: u32) callconv(.c) void {
     @import("protect.zig").disallowUserAccess();
     const t = @import("../debug/perf.zig").enter();
     defer @import("../debug/perf.zig").leave(.dynirq, t);
+    // Breadcrumb: (vec << 16) | pid. cpu.current_pid read once.
+    {
+        const pid_now: u64 = if (@import("smp.zig").myCpu().current_pid) |p| @intCast(p) else 0xFF;
+        @import("../debug/breadcrumb.zig").stamp(.irq_dynamic, (@as(u64, vec) << 16) | pid_now);
+    }
     const idx: usize = @intCast(vec - DYN_IRQ_BASE);
     if (idx < DYN_IRQ_COUNT) {
         if (dyn_handlers[idx]) |h| h();
     }
     if (apic.apic_active) apic.eoi();
+}
+
+/// Shape C preempt-check: called from DynIrqStub's epilogue (after the IRQ
+/// handler returned and the canary was popped, but BEFORE FXSAVE/GPR pops).
+/// If a handler set `cpu.dynirq_preempt_pending`, run `schedule()` from
+/// here — RSP at this point is inside the stub's own frame, sitting on the
+/// task whose kstack the IRQ landed on; schedule's switchTo save lands at
+/// a well-defined offset that has a valid post-`callq` RA at +48, the
+/// next dispatch resumes correctly.
+///
+/// Why not let nvmeIrqHandler call schedule directly: when an IRQ inherits
+/// the RSP of a task that is NOT current_pid (cross-stack-aliasing window
+/// in the dispatch transition), schedule would save RSP into the WRONG
+/// PCB's kernel_esp. Deferring to the stub epilogue doesn't fix that
+/// underlying invariant, but the schedule-from-stub path has historically
+/// been audit-checked and lock-clean, so this is the safer place to call
+/// it while Shape D (per-CPU IRQ trampoline stack) is still pending.
+pub export fn check_and_preempt_dynirq() callconv(.c) void {
+    const smp_mod = @import("smp.zig");
+    const cpu = smp_mod.myCpu();
+    if (cpu.dynirq_preempt_pending) {
+        cpu.dynirq_preempt_pending = false;
+        @import("../proc/process.zig").schedule();
+    }
 }
 
 // Per-vector naked stub. Each instantiation hardcodes its own vector # into
@@ -1692,6 +1826,14 @@ fn DynIrqStub(comptime vec: u8) type {
                     "cmpq %%rax, 8(%%rsp)\n" ++
                     "jne isr_dynirq_canary_panic\n" ++
                     "addq $16, %%rsp\n" ++
+                    // Shape C: deferred-preempt check. If a handler called
+                    // proc.wake() and set cpu.dynirq_preempt_pending, run
+                    // schedule() from here (stub frame, sound RSP discipline)
+                    // instead of from inside the handler. RSP is currently
+                    // 16-aligned at top of FXSAVE area, so the call is ABI-
+                    // clean. After return, fall through to fxrstor + GPR
+                    // pops + iretq as if no preempt happened.
+                    "call check_and_preempt_dynirq\n" ++
                     "fxrstorq (%%rsp)\n" ++
                     "addq $512, %%rsp\n" ++
                     "popq %%r11\n" ++

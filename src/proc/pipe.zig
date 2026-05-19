@@ -27,6 +27,15 @@ pub const Pipe = struct {
     in_use: bool = false,
     blocked_reader_pid: u8 = 0xFF, // 0xFF = none
     blocked_writer_pid: u8 = 0xFF,
+    /// Set on pipes whose read end is drained by the desktop loop's
+    /// non-blocking tryRead poll (terminal window out_pipes). When a
+    /// write lands on such a pipe, the desktop's event-driven sleep
+    /// needs an explicit wake — without this, the shell's stdout
+    /// would queue bytes that the desktop never sees until the next
+    /// keyboard/mouse event. Set by `setDesktopDrain(id)` after the
+    /// pipe is wired into a window. Default false; process-to-process
+    /// pipes never touch this path.
+    wake_desktop_on_write: bool = false,
 };
 
 pub var pipes: [MAX_PIPES]Pipe = [_]Pipe{.{}} ** MAX_PIPES;
@@ -46,6 +55,15 @@ pub fn alloc() ?u8 {
         }
     }
     return null;
+}
+
+/// Mark a pipe as a desktop-drain pipe. Writes will trigger an explicit
+/// compositor wake so the desktop's poll loop runs and pulls the bytes
+/// out. Idempotent.
+pub fn setDesktopDrain(id: u8) void {
+    if (id >= MAX_PIPES) return;
+    if (!pipes[id].in_use) return;
+    pipes[id].wake_desktop_on_write = true;
 }
 
 /// Read up to `out.len` bytes from pipe `id`. Blocks if the ring is empty and
@@ -166,6 +184,7 @@ pub fn write(id: u8, data: []const u8) usize {
                 p.blocked_reader_pid = 0xFF;
                 process.wake(r);
             }
+            if (p.wake_desktop_on_write) @import("../ui/desktop/wake.zig").requestWake();
             continue;
         }
 
@@ -211,6 +230,7 @@ pub fn tryWrite(id: u8, data: []const u8) usize {
             process.wake(r);
         }
     }
+    if (written > 0 and p.wake_desktop_on_write) @import("../ui/desktop/wake.zig").requestWake();
     return written;
 }
 

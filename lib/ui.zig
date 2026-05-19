@@ -13,6 +13,12 @@ const libc = @import("libc");
 
 pub const Canvas = gfx.Canvas;
 
+/// Corner radius used by all card/panel surfaces (Dialog, FolderPicker,
+/// ImagePicker, future card-style sections). macOS sits around 10-12 px
+/// for sheets and panels; we use 10 because at lower DPI it reads as
+/// "rounded" without eating too much usable area on small panels.
+pub const PANEL_RADIUS: u32 = 10;
+
 pub const Palette = struct {
     card_bg: u32,
     card_border: u32,
@@ -242,7 +248,7 @@ pub const Button = struct {
 
     pub fn drawRounded(self: Button, canvas: *Canvas, color: u32, text_color: u32, bg: u32) void {
         self.draw(canvas, color, text_color);
-        canvas.roundCorners(self.x, self.y, self.w, self.h, bg);
+        canvas.roundCornersRadius(self.x, self.y, self.w, self.h, buttonRadius(self.h), bg);
     }
 
     /// macOS-style pill: vertical gradient + 1px border + rounded corners. `bg` is
@@ -302,9 +308,61 @@ pub const Button = struct {
         // `pressed` nudges the label 1px down for a tactile feel.
         const label_y = if (self.state == .pressed) text_y + 1 else text_y;
         fa.drawTextCentered(canvas, @intCast(self.x), @intCast(label_y), self.w, self.label, text_color, atlas);
-        canvas.roundCorners(self.x, self.y, self.w, self.h, bg);
+        canvas.roundCornersRadius(self.x, self.y, self.w, self.h, buttonRadius(self.h), bg);
     }
 };
+
+/// Pick a corner radius that scales with the button height. macOS uses
+// --- Card ---
+//
+// macOS Settings-style rounded panel. Apps group related controls inside
+// a Card with a section label above it. The Card paints the background
+// + rounded corners; the caller positions controls inside the card area
+// using HPAD/VPAD insets.
+//
+// Hairlines are optional dividers between rows within a card — use when
+// the card holds multiple logical rows that should read as separate.
+//
+// Buttons drawn INSIDE a card should pass `palette.card_bg` as their
+// corner-clip bg (not the window bg), or the AA corner pixels will
+// blend toward the wrong color and look fringey against the card.
+
+pub const Card = struct {
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+
+    pub const HPAD: u32 = 14;
+    pub const VPAD: u32 = 12;
+
+    pub fn drawBg(self: Card, canvas: *Canvas, surrounding_bg: u32) void {
+        canvas.fillRect(self.x, self.y, self.w, self.h, palette.card_bg);
+        canvas.roundCornersRadius(self.x, self.y, self.w, self.h, PANEL_RADIUS, surrounding_bg);
+    }
+
+    /// 1-px hairline divider at absolute y, inset by HPAD on both sides.
+    /// Use between rows inside a card that holds multiple logical sections.
+    pub fn hairline(self: Card, canvas: *Canvas, y: u32) void {
+        canvas.fillRect(self.x + HPAD, y, self.w -| 2 * HPAD, 1, palette.card_border);
+    }
+
+    /// X coordinate for content inset on the left edge.
+    pub fn innerX(self: Card) u32 {
+        return self.x + HPAD;
+    }
+
+    /// X coordinate for right-anchored content of width `w`.
+    pub fn innerRightX(self: Card, w: u32) u32 {
+        return self.x + self.w -| HPAD -| w;
+    }
+};
+
+/// ~6 px on a 24 px button and ~8-10 px on larger ones. We cap at 10 so
+/// big call-to-action buttons don't go pill-shaped.
+inline fn buttonRadius(h: u32) u32 {
+    return @min(@max(h / 4, 4), 10);
+}
 
 // --- Checkbox ---
 //
@@ -437,24 +495,25 @@ pub const Toggle = struct {
     }
 
     pub fn draw(self: Toggle, canvas: *Canvas, bg: u32) void {
-        // Track: blue gradient when on, grey when off.
+        // Track: blue gradient when on, grey when off. Full pill shape —
+        // radius = H/2 rounds it into the macOS toggle look (was a
+        // 1px-chamfer rect before).
         const track_top: u32 = if (self.on) palette.btn_primary_top else palette.btn_default_top;
         const track_bot: u32 = if (self.on) palette.btn_primary_bot else palette.btn_default_bot;
         const lit_top = if (self.state == .hover) lerpColor(track_top, 0xFFFFFF, 1, 8) else track_top;
         const lit_bot = if (self.state == .hover) lerpColor(track_bot, 0xFFFFFF, 1, 10) else track_bot;
         verticalGradient(canvas, self.x, self.y, W, H, lit_top, lit_bot);
         drawRect1px(canvas, self.x, self.y, W, H, if (self.on) palette.btn_primary_border else palette.btn_default_border);
-        canvas.roundCorners(self.x, self.y, W, H, bg);
-        // Round inner edge too — pill look.
-        const r: u32 = H / 2 - 1;
-        _ = r;
+        canvas.roundCornersRadius(self.x, self.y, W, H, H / 2, bg);
 
-        // Thumb: white circle that slides between left and right.
+        // Thumb: white circle that slides between left and right. Radius
+        // = thumb_d/2 makes it a true circle with AA edge against the
+        // (gradient) track behind it.
         const thumb_d: u32 = H - THUMB_PAD * 2;
         const thumb_y = self.y + THUMB_PAD;
         const thumb_x = if (self.on) self.x + W - THUMB_PAD - thumb_d else self.x + THUMB_PAD;
         canvas.fillRect(thumb_x, thumb_y, thumb_d, thumb_d, 0xFFFFFF);
-        canvas.roundCorners(thumb_x, thumb_y, thumb_d, thumb_d, lit_top);
+        canvas.roundCornersRadius(thumb_x, thumb_y, thumb_d, thumb_d, thumb_d / 2, lit_top);
     }
 };
 
@@ -850,7 +909,7 @@ pub const Dialog = struct {
         // Card body
         canvas.fillRect(self.x, self.y, self.w, self.h, palette.card_bg);
         drawRect1px(canvas, self.x, self.y, self.w, self.h, palette.card_border);
-        canvas.roundCorners(self.x, self.y, self.w, self.h, surrounding_bg);
+        canvas.roundCornersRadius(self.x, self.y, self.w, self.h, PANEL_RADIUS, surrounding_bg);
 
         // Title
         const atlas = fa.getDefault16();
@@ -1153,7 +1212,7 @@ pub const FolderPicker = struct {
         drawShadow(canvas, self.x, self.y, self.w, self.h, surrounding_bg);
         canvas.fillRect(self.x, self.y, self.w, self.h, palette.card_bg);
         drawRect1px(canvas, self.x, self.y, self.w, self.h, palette.card_border);
-        canvas.roundCorners(self.x, self.y, self.w, self.h, surrounding_bg);
+        canvas.roundCornersRadius(self.x, self.y, self.w, self.h, PANEL_RADIUS, surrounding_bg);
 
         // Title
         const atlas = fa.getDefault16();
@@ -1490,7 +1549,7 @@ pub const ImagePicker = struct {
         drawShadow(canvas, self.x, self.y, self.w, self.h, surrounding_bg);
         canvas.fillRect(self.x, self.y, self.w, self.h, palette.card_bg);
         drawRect1px(canvas, self.x, self.y, self.w, self.h, palette.card_border);
-        canvas.roundCorners(self.x, self.y, self.w, self.h, surrounding_bg);
+        canvas.roundCornersRadius(self.x, self.y, self.w, self.h, PANEL_RADIUS, surrounding_bg);
 
         const atlas = fa.getDefault16();
         const title_y = self.y + padding;
@@ -1576,3 +1635,147 @@ fn blitThumb(canvas: *Canvas, src: [*]const u8, sw: u32, sh: u32, dx: u32, dy: u
         }
     }
 }
+
+// =============================================================================
+// VStack / HStack — immediate-mode flow layout
+// =============================================================================
+//
+// Apps that hand-position widgets at hardcoded `x=12, y=42 + section_h * N`
+// coordinates break every time a font swap or padding tweak changes the
+// vertical rhythm — see UEFI menu's AA-font cutover for the canonical
+// disaster. These stacks let the caller declare a flow and the cursor
+// walks through it: each item asks for its own intrinsic height (text
+// rows pull line_height from the atlas; fixed-height items declare their
+// own).
+//
+// Design:
+//   * `gap(px)`     — explicit spacing between items
+//   * `reserve(h)`  — claim `h` rows, return the y at which the slot
+//                     starts; use to place any widget (Button, custom
+//                     graphic) without per-widget API
+//   * `text(...)`   — drop-in for AA labels; advances by line_height
+//   * `button(...)` — convenience that builds a Button at the cursor
+//                     and advances — caller still calls .draw / .update
+//
+// Right-anchored items (top-right close buttons, etc.) compute their x
+// from `stack.x + stack.w - N` directly; reverse-cursor support adds
+// API complexity for a handful of real call sites and isn't worth it.
+
+pub const VStack = struct {
+    canvas: *Canvas,
+    x: u32,
+    y: u32,
+    w: u32,
+
+    pub fn init(canvas: *Canvas, x: u32, y: u32, w: u32) VStack {
+        return .{ .canvas = canvas, .x = x, .y = y, .w = w };
+    }
+
+    pub fn cursor(self: *const VStack) u32 {
+        return self.y;
+    }
+
+    pub fn gap(self: *VStack, px: u32) void {
+        self.y += px;
+    }
+
+    pub fn skipTo(self: *VStack, target_y: u32) void {
+        self.y = target_y;
+    }
+
+    /// Reserve `h` rows of vertical space. Returns the y at which the
+    /// slot begins; advances the cursor by `h`. Use to place arbitrary
+    /// widgets:
+    ///   const y = v.reserve(28);
+    ///   var btn = ui.Button{ .x = v.x, .y = y, .w = 100, .h = 28, .label = "OK" };
+    ///   btn.drawStyled(&canvas, .primary, BG);
+    pub fn reserve(self: *VStack, h: u32) u32 {
+        const yy = self.y;
+        self.y += h;
+        return yy;
+    }
+
+    /// Left-aligned AA text. Cursor advances by `atlas.line_height`.
+    pub fn text(self: *VStack, str: []const u8, color: u32, atlas: *const fa.FontAtlas) void {
+        fa.drawText(self.canvas, @intCast(self.x), @intCast(self.y), str, color, atlas);
+        self.y += atlas.line_height;
+    }
+
+    /// Horizontally-centered text within the stack's width.
+    pub fn textCentered(self: *VStack, str: []const u8, color: u32, atlas: *const fa.FontAtlas) void {
+        const tw = atlas.measure(str);
+        const cx = self.x + (self.w -| tw) / 2;
+        fa.drawText(self.canvas, @intCast(cx), @intCast(self.y), str, color, atlas);
+        self.y += atlas.line_height;
+    }
+
+    /// Text with opaque background paint — use when drawing over an
+    /// arbitrary surface (wallpaper, gradient) where AA bleed from the
+    /// transparent path would show through.
+    pub fn textOpaque(self: *VStack, str: []const u8, fg: u32, bg: u32, atlas: *const fa.FontAtlas) void {
+        fa.drawTextOpaque(self.canvas, self.x, self.y, str, fg, bg, atlas);
+        self.y += atlas.line_height;
+    }
+
+    /// 1-px horizontal rule. `inset` shrinks both ends symmetrically.
+    pub fn rule(self: *VStack, inset: u32, color: u32) void {
+        self.canvas.fillRect(self.x + inset, self.y, self.w -| 2 * inset, 1, color);
+        self.y += 1;
+    }
+
+    /// Construct a Button at the current cursor with the stack's left
+    /// edge, returning it so the caller can drive .draw / .update. The
+    /// cursor advances by `h`. For multi-button rows, use HStack.
+    pub fn button(self: *VStack, lbl: []const u8, w: u32, h: u32) Button {
+        const yy = self.y;
+        self.y += h;
+        return Button{ .x = self.x, .y = yy, .w = w, .h = h, .label = lbl };
+    }
+};
+
+pub const HStack = struct {
+    canvas: *Canvas,
+    x: u32,
+    y: u32,
+    h: u32,
+
+    pub fn init(canvas: *Canvas, x: u32, y: u32, h: u32) HStack {
+        return .{ .canvas = canvas, .x = x, .y = y, .h = h };
+    }
+
+    pub fn cursor(self: *const HStack) u32 {
+        return self.x;
+    }
+
+    pub fn gap(self: *HStack, px: u32) void {
+        self.x += px;
+    }
+
+    pub fn skipTo(self: *HStack, target_x: u32) void {
+        self.x = target_x;
+    }
+
+    /// Reserve `w` columns; returns the x at which the slot begins.
+    /// Use to place widgets — same pattern as VStack.reserve.
+    pub fn reserve(self: *HStack, w: u32) u32 {
+        const xx = self.x;
+        self.x += w;
+        return xx;
+    }
+
+    /// Vertically-centered label. Cursor advances by measured width.
+    pub fn label(self: *HStack, str: []const u8, color: u32, atlas: *const fa.FontAtlas) void {
+        const ty: u32 = self.y + (self.h -| atlas.line_height) / 2;
+        fa.drawText(self.canvas, @intCast(self.x), @intCast(ty), str, color, atlas);
+        self.x += atlas.measure(str);
+    }
+
+    /// Construct a Button at the current cursor using the stack's height
+    /// and a caller-given width. Cursor advances by `w`.
+    pub fn button(self: *HStack, lbl: []const u8, w: u32) Button {
+        const xx = self.x;
+        self.x += w;
+        return Button{ .x = xx, .y = self.y, .w = w, .h = self.h, .label = lbl };
+    }
+};
+

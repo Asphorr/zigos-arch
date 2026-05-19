@@ -45,16 +45,15 @@ fn testHeapCanaryIntegrity() void {
 
 // --- Test 2: Per-CPU LSTAR points at this CPU's entry stub ---
 // The kernel no longer uses GS_BASE for per-CPU lookup. Each CPU's syscall
-// LSTAR points at its own entry stub in syscall_entry.zig, with the stub
-// addressing per_cpu_asm[N] via a RIP-relative load whose displacement is
-// resolved by the linker. The trampoline switches RSP to per_cpu_asm[N].
-// syscall_stack_top, which is updated on every context switch by
-// gdt.setTssRsp0 to the current process's kstack — so syscalls always run
-// on the per-process kernel stack, not a shared buffer.
+// LSTAR points at its own entry stub in syscall_entry.zig; the stub loads
+// RSP directly from `cpus[N].tss.rsp0` — the canonical TSS field the CPU
+// hardware reads on every IDT-gate entry — so the syscall path and the
+// IDT-gate path land on the same per-process kstack by construction.
+// gdt.setTssRsp0 writes only this one field; the previous duplicated
+// `per_cpu_asm[N].syscall_stack_top` mirror is gone.
 fn testPerCpuGsBase() void {
     // syscall_entry.verifyMsrs() already panics on STAR/LSTAR mismatch; if we
-    // got here init() ran without trapping. The PerCpuAsm slot itself starts
-    // zeroed; syscall_stack_top is set on first context switch.
+    // got here init() ran without trapping.
     const cpu = smp.myCpu();
     _ = cpu;
 }

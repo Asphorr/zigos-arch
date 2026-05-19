@@ -435,6 +435,82 @@ pub const Canvas = struct {
         }
     }
 
+    /// Round all four corners with a configurable radius, with
+    /// per-pixel anti-aliasing on the curve edge. Pixels fully outside
+    /// the rounded shape are overwritten with `bg`; pixels straddling
+    /// the curve are alpha-blended with `bg` proportional to how much
+    /// of the pixel sits outside.
+    ///
+    /// `bg` is the surrounding background — the rounded shape replaces
+    /// what's already drawn there.
+    ///
+    /// Algorithm: in each corner's r×r region, compute d² from the
+    /// pixel center to the corner's circle center (offset r from the
+    /// rect corner). The AA transition band is where d ∈ [r-0.5, r+0.5];
+    /// in d² space this is [r²-r, r²+r] (dropping the 0.25, visually
+    /// identical at r ≥ 4). Outside that band: full clear or untouched.
+    /// Inside that band: linear interpolation on d² gives the alpha,
+    /// which we feed through shapes.blendPx for the source-over blend.
+    /// Integer math throughout — no sqrt.
+    pub fn roundCornersRadius(self: *Canvas, bx: u32, by: u32, bw: u32, bh: u32, radius: u32, bg: u32) void {
+        if (bw == 0 or bh == 0 or radius == 0) return;
+        // Clamp radius to half of the smaller side so the four corners
+        // don't overlap (a 10x4 rect with radius=6 would otherwise wrap
+        // around itself).
+        const r: u32 = @min(radius, @min(bw / 2, bh / 2));
+        if (r == 0) return;
+        const r_i: i32 = @intCast(r);
+        const r_sq: i32 = r_i * r_i;
+        // Widen the AA band from ±r (= 1 px in d-space) to ±3r/2 (= ~1.5 px).
+        // Original gives only ~2r alpha steps along each corner — at r=6
+        // that's 12 distinct values, and the human eye reads the small step
+        // count as "staircase" against the gradient inside the button.
+        // The 1.5× band gives ~50% more gradation, smoothing the curve at
+        // the cost of slightly softer / blurrier edges. Tunable: drop back
+        // to ±r if you want crisp 1-px-perfect coverage instead.
+        const half_band: i32 = @divTrunc(3 * r_i, 2);
+        const inner: i32 = r_sq - half_band;
+        const outer: i32 = r_sq + half_band;
+        const denom: i32 = outer - inner;
+        const bg_rgb: u32 = bg & 0x00FFFFFF;
+        var dy: u32 = 0;
+        while (dy < r) : (dy += 1) {
+            const py_i: i32 = r_i - @as(i32, @intCast(dy));
+            var dx: u32 = 0;
+            while (dx < r) : (dx += 1) {
+                const px_i: i32 = r_i - @as(i32, @intCast(dx));
+                const d_sq: i32 = px_i * px_i + py_i * py_i;
+                if (d_sq <= inner) continue; // fully inside the rounded shape
+                if (d_sq >= outer) {
+                    // Fully outside — overwrite with bg.
+                    setPx(self, bx + dx, by + dy, bg);
+                    setPx(self, bx + bw - 1 - dx, by + dy, bg);
+                    setPx(self, bx + dx, by + bh - 1 - dy, bg);
+                    setPx(self, bx + bw - 1 - dx, by + bh - 1 - dy, bg);
+                    continue;
+                }
+                // Transition band — alpha-blend bg over existing pixel.
+                const a_i32: i32 = @divTrunc((d_sq - inner) * 255, denom);
+                const a: u32 = @intCast(@max(@min(a_i32, 255), 0));
+                const src: u32 = (a << 24) | bg_rgb;
+                blendPxAt(self, bx + dx, by + dy, src);
+                blendPxAt(self, bx + bw - 1 - dx, by + dy, src);
+                blendPxAt(self, bx + dx, by + bh - 1 - dy, src);
+                blendPxAt(self, bx + bw - 1 - dx, by + bh - 1 - dy, src);
+            }
+        }
+    }
+
+    inline fn setPx(self: *Canvas, x: u32, y: u32, color: u32) void {
+        if (x < self.width and y < self.height) self.fb[y * self.width + x] = color;
+    }
+
+    inline fn blendPxAt(self: *Canvas, x: u32, y: u32, src: u32) void {
+        if (x >= self.width or y >= self.height) return;
+        const idx = y * self.width + x;
+        self.fb[idx] = shapes.blendPx(self.fb[idx], src);
+    }
+
     // ===== Triangles, polygons, AA lines, circles, ellipses =================
     //
     // Thin wrappers around lib/shapes.zig — bind self.fb / .width / .height

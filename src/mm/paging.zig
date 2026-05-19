@@ -458,33 +458,65 @@ pub const GUI_FB_USER_BASE: usize = 0x08000000; // user-space GUI FB virtual add
 
 const MAX_PROCS = @import("../config.zig").MAX_PROCS;
 
-// Track per-PID GUI FB phys base. Index = pid; entry = 0 means "no FB".
+// Track per-PID GUI FB phys allocations. Front buffer (mapped to user)
+// and each back buffer (kernel-only, lazily allocated) are tracked
+// independently so each can live in its own non-contiguous PMM region.
+// 0 in any slot = "not allocated".
 var gui_fb_phys_base: [MAX_PROCS]usize = [_]usize{0} ** MAX_PROCS;
+var gui_fb_back_phys: [MAX_PROCS][3]usize = [_][3]usize{[_]usize{0} ** 3} ** MAX_PROCS;
 
-/// Record the base physical address of a process's GUI framebuffer so
-/// `unmapGuiFB` can release it later.
+/// Record the base physical address of a process's GUI front buffer.
+/// Called once per sysCreateWindow; front buffer is dual-owner (user
+/// PML4 + kernel desktop ref).
 pub fn registerGuiFB(pid: u8, phys_base: usize) void {
     if (pid < MAX_PROCS) gui_fb_phys_base[pid] = phys_base;
 }
 
-/// Free a process's GUI FB back to the PMM. The first `num_user_pages` are
-/// front-buffer pages mapped in the user PML4 — they're dual-owned (user PML4
-/// holds one ref bumped at sysCreateWindow time, kernel desktop holds the
-/// other), so we drop the kernel ref via per-frame releaseFrame; the user
-/// ref drops when destroyAddressSpace walks the PML4 on process exit.
-/// The remainder (`total_pages - num_user_pages`) are kernel-only back
-/// buffers, single-owner — bulk freeContiguous reclaims them in one go.
-pub fn unmapGuiFB(pid: u8, num_user_pages: u32, total_pages: u32) void {
-    if (pid >= MAX_PROCS or gui_fb_phys_base[pid] == 0) return;
-    const phys_base = gui_fb_phys_base[pid];
-    var i: u32 = 0;
-    while (i < num_user_pages) : (i += 1) {
-        pmm.releaseFrame(phys_base + i * 4096);
+/// Record the base physical address of a lazily-allocated back buffer
+/// slot (0..2). Single-owner (kernel only). Called from
+/// desktop.snapshotGuiFb's first-touch path.
+pub fn registerGuiFBBack(pid: u8, slot: u8, phys_base: usize) void {
+    if (pid >= MAX_PROCS or slot >= 3) return;
+    gui_fb_back_phys[pid][slot] = phys_base;
+}
+
+/// Atomically take the phys for a back-buffer slot, clearing the entry.
+/// Returns 0 if the slot wasn't allocated. Used by the reclaim path
+/// (desktop.reclaimBackBuffers) so freeContiguous and the registry
+/// stay in sync — if reclaim called freeContiguous directly without
+/// clearing the registry, unmapGuiFB on window destroy would
+/// double-free.
+pub fn takeGuiFbBackPhys(pid: u8, slot: u8) usize {
+    if (pid >= MAX_PROCS or slot >= 3) return 0;
+    const phys = gui_fb_back_phys[pid][slot];
+    gui_fb_back_phys[pid][slot] = 0;
+    return phys;
+}
+
+/// Free a process's GUI FB back to the PMM. Front buffer pages are
+/// dual-owned (user PML4 + kernel desktop) so we drop the kernel ref
+/// via per-frame releaseFrame; the user ref drops when
+/// destroyAddressSpace walks the PML4. Each back-buffer slot, if
+/// allocated, is a separate single-owner contiguous block reclaimed
+/// in one freeContiguous call.
+pub fn unmapGuiFB(pid: u8, num_pages_per_buf: u32) void {
+    if (pid >= MAX_PROCS) return;
+    const front = gui_fb_phys_base[pid];
+    if (front != 0) {
+        var i: u32 = 0;
+        while (i < num_pages_per_buf) : (i += 1) {
+            pmm.releaseFrame(front + i * 4096);
+        }
+        gui_fb_phys_base[pid] = 0;
     }
-    if (total_pages > num_user_pages) {
-        pmm.freeContiguous(phys_base + num_user_pages * 4096, total_pages - num_user_pages);
+    var s: u8 = 0;
+    while (s < 3) : (s += 1) {
+        const back = gui_fb_back_phys[pid][s];
+        if (back != 0) {
+            pmm.freeContiguous(back, num_pages_per_buf);
+            gui_fb_back_phys[pid][s] = 0;
+        }
     }
-    gui_fb_phys_base[pid] = 0;
 }
 
 // --- Back buffer ---
@@ -739,10 +771,33 @@ pub fn installWriteWatch(virt: usize) ?usize {
     return virt & ~@as(usize, 0xFFF);
 }
 
+/// Same as `installWriteWatch` but skips the local TLB flush. Use when
+/// batching many PTE changes — the caller issues one cross-CPU
+/// `tlb.shootdownAll(0)` after the batch instead of an invlpg per page
+/// (which would only flush the local CPU anyway).
+pub fn installWriteWatchNoFlush(virt: usize) ?usize {
+    const pte = splitToPte(virt) orelse return null;
+    pte.* &= ~READ_WRITE;
+    return virt & ~@as(usize, 0xFFF);
+}
+
 /// Toggle the R/W bit for a previously-split page. The split is permanent;
 /// only the R/W bit flips. Used by the trap handler to step past the
 /// legitimate writer (count++) without disarming the watch.
 pub fn setWriteWatchRW(virt: usize, allow_write: bool) void {
+    setWriteWatchRWNoFlush(virt, allow_write);
+    asm volatile ("invlpg (%[a])"
+        :
+        : [a] "r" (virt),
+        : .{ .memory = true });
+}
+
+/// Same as `setWriteWatchRW` but skips the local invlpg — companion to
+/// `installWriteWatchNoFlush`. The caller must issue a cross-CPU
+/// `tlb.shootdownAll(0)` after the batch of PTE writes; without that,
+/// peer CPUs keep stale TLB entries and the protection toggle is inert
+/// on them.
+pub fn setWriteWatchRWNoFlush(virt: usize, allow_write: bool) void {
     if (pml4_addr == 0) return;
     const pml4: [*]u64 = @ptrFromInt(physToVirt(pml4_addr));
     const pml4_idx = (virt >> 39) & 0x1FF;
@@ -760,20 +815,20 @@ pub fn setWriteWatchRW(virt: usize, allow_write: bool) void {
     } else {
         pt[pt_idx] &= ~READ_WRITE;
     }
-    asm volatile ("invlpg (%[a])"
-        :
-        : [a] "r" (virt),
-        : .{ .memory = true });
 }
 
 // --- Hardened-data section (.kdata_protected) page-protection ---
 //
-// per_cpu_asm and (future) other fragile structs live in a page-aligned
-// linker section whose pages are marked RO after boot. Wild writes (PMM
-// double-allocation aliasing, ELF-buffer overrun, wild kernel pointer)
-// hit #PF cleanly with the writer's RIP captured in the saved frame.
-// Legitimate writers (gdt.setTssRsp0) bracket their writes with
-// `unlockKdata` / `lockKdata`; CR0.WP=1 ensures the toggle is honored.
+// Page-aligned linker section whose pages are marked RO after boot. Wild
+// writes (PMM double-allocation aliasing, ELF-buffer overrun, wild kernel
+// pointer) hit #PF cleanly with the writer's RIP captured in the saved
+// frame. Legitimate writers bracket their stores with `unlockKdata` /
+// `lockKdata`; CR0.WP=1 ensures the toggle is honored.
+//
+// (The historical user of this section — per_cpu_asm.syscall_stack_top —
+// was retired when the syscall LSTAR stub was rewired to load RSP from
+// cpus[N].tss.rsp0 directly. Section + helpers retained for future
+// protected structures.)
 
 extern var __kdata_protected_start: u8;
 extern var __kdata_protected_end: u8;

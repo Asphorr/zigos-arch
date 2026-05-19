@@ -57,15 +57,22 @@ pub fn peerCheck(self: *smp.CpuLocal) void {
     // 2-CPU system this just toggles cpu0↔cpu1.
     const peer = nextAlivePeer(self) orelse return;
 
-    // False-positive guard: if peer is currently in its idle PCB, it's
-    // legitimately not advancing — TSC-deadline mode lets idle APs sleep
-    // until the next sleeper expiry, which can be seconds or longer. A
-    // wedged CPU stuck in cli'd kernel code would still have current_pid
-    // pointing at the real (non-idle) process it was running, so we
-    // distinguish on that. Reset strikes too so the next non-idle window
-    // starts fresh.
+    // False-positive guard: if peer is currently in its idle PCB AND
+    // its runqueue is empty, it's legitimately not advancing —
+    // TSC-deadline mode lets idle APs sleep until the next sleeper
+    // expiry, which can be seconds or longer.
+    //
+    // BUT — "idle with a ready task on the rq" is the real wedge we
+    // want to catch. That happens when setState(.ready) added a task
+    // to the peer's runqueue but no wake-IPI fired, so the peer
+    // stays in deep idle while work piles up. Symptom from the
+    // 2026-05-16 session: cpu1 stuck at 0% with `nr_run=1 (i=1)`
+    // and PID 3's event queue overflowing; OS kept running on cpu0
+    // and watchdog never saw it as a wedge because the old guard
+    // matched on idle_pid alone. Now we require an empty rq too.
     if (peer.current_pid != null and peer.idle_pid != null and
-        peer.current_pid.?  == peer.idle_pid.?)
+        peer.current_pid.? == peer.idle_pid.? and
+        peer.runqueue.nr_runnable == 0)
     {
         self.watchdog_peer_last_tick = peer.irq_tick_count;
         self.watchdog_peer_strikes = 0;
@@ -102,6 +109,16 @@ fn nextAlivePeer(self: *smp.CpuLocal) ?*smp.CpuLocal {
 }
 
 fn fire(self: *smp.CpuLocal, peer: *smp.CpuLocal) void {
+    // FIRST broadcast NMI with halt-after so peers stop running BEFORE we
+    // print the autopsy. Otherwise the wedge log byte-interleaves with
+    // whatever the peer was klog'ing (slow-sc, perf, etc.) and the
+    // crash summary becomes illegible — exactly what we saw in the
+    // 2026-05-16 wallpaper/paint wedge. The peer's own snapshot still
+    // gets dumped via nmiSnapshot before it halts, just on top of the
+    // critical section we'll claim below.
+    kdbg.nmi_halt_after_snapshot = true;
+    kdbg.broadcastNMI();
+
     serial.print("\n!!! WATCHDOG: cpu{d} wedged !!! (last tick=0x{X}, observed unchanged for ~{d}s by cpu{d})\n", .{
         peer.cpu_id,
         self.watchdog_peer_last_tick,
@@ -110,9 +127,8 @@ fn fire(self: *smp.CpuLocal, peer: *smp.CpuLocal) void {
     });
 
     // Same shape as a real panic: persist crash hint to NVRAM, dump
-    // crashSummary, broadcast NMI to all peers (with halt-after so the
-    // wedged CPU's snapshot RIP captures the actual stuck instruction
-    // and no CPU continues running on possibly-corrupt state).
+    // crashSummary. Peers are already halted by the NMI above so the
+    // output below has exclusive serial-port access.
     {
         const nvram = @import("../boot/uefi_nvram.zig");
         const bo = @import("build_options");
@@ -135,8 +151,43 @@ fn fire(self: *smp.CpuLocal, peer: *smp.CpuLocal) void {
         .msg = "watchdog: peer CPU wedged",
     });
 
-    kdbg.nmi_halt_after_snapshot = true;
-    kdbg.broadcastNMI();
+    // Wedge-victim context dump. The peer's [nmi-snap cpuN] line above
+    // already printed its current RIP + PCB name + wait_kind, but
+    // those rings tell us "what was it doing leading up to the wedge"
+    // (last N IRQs / syscalls / RIPs). Together they distinguish
+    // "stuck in tight loop X" from "blocked in syscall Y forever".
+    serial.print("[wedge] peer cpu{d} context follows:\n", .{peer.cpu_id});
+    @import("exectrail.zig").dump(peer.cpu_id, 32);
+    // Decode the peer's current PCB if any.
+    if (peer.current_pid) |peer_pid| {
+        const process = @import("../proc/process.zig");
+        if (peer_pid < process.MAX_PROCS) {
+            const pcb = &process.procs[peer_pid];
+            const name_slice = pcb.name[0..@min(pcb.name_len, pcb.name.len)];
+            serial.print("[wedge] peer pid={d} name='{s}' state={d} wait_kind={d} wait_target=0x{X} kernel_esp=0x{X:0>16} kstack_top=0x{X:0>16}\n", .{
+                peer_pid, name_slice,
+                @intFromEnum(pcb.state),
+                @intFromEnum(pcb.wait_kind),
+                pcb.wait_target,
+                pcb.kernel_esp,
+                pcb.kernel_stack_top,
+            });
+            // Last 8 syscalls the wedged PID made. Often the smoking
+            // gun: "stuck doing sys#10 (fread)", "looping on sys#08
+            // (sleep)", "blocked in sys#92 (fork) then sys#41 (clone)".
+            process.dumpSyscallRing(@intCast(peer_pid));
+        }
+    }
+
+    // Dump every registered lock. Wedges often trace to one CPU
+    // holding a lock the other is spinning on; this names the holder
+    // by symbol so we don't have to puzzle over raw return addresses.
+    @import("../proc/spinlock.zig").dumpAllLocks();
+
+    // Last-N kdbg ring entries (sched / irq / proc events across all
+    // CPUs). The sched ring especially captures "who picked what when"
+    // which often pinpoints a race window the rest of the dump doesn't.
+    kdbg.dumpAll();
 
     serial.print("  SYSTEM HALTED (watchdog).\n", .{});
     while (true) asm volatile ("cli; hlt");

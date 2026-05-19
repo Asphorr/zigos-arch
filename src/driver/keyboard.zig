@@ -93,6 +93,53 @@ pub fn initPS2() bool {
     return true;
 }
 
+/// Mask PS/2 IRQ1 in the i8042 controller config and disable port 1
+/// (keyboard) entirely. Called when a USB keyboard is up and PS/2 input
+/// is redundant — QEMU's i8042 emulation otherwise spuriously asserts
+/// IRQ1 at ~2200/sec on an idle system (the IRQ-status-bit-stuck class
+/// of i8042 quirks), burning ~4 % of one CPU in handleIRQ1 + EOI for
+/// nothing.
+///
+/// We don't disable IRQ12 (mouse) here — if the user has a PS/2 mouse
+/// alongside a USB keyboard, dropping IRQ12 would silently kill mouse
+/// input. The mouse path has its own enable/disable knob.
+pub fn disableIRQ1() void {
+    if (!ps2_present) return;
+    asm volatile ("cli");
+    // Drain anything sitting in port 1's data buffer so it can't latch
+    // the IRQ line again after we mask.
+    ps2Flush();
+    // Disable port 1 entirely (keyboard clock off).
+    if (!ps2Wait()) {
+        asm volatile ("sti");
+        return;
+    }
+    io.outb(0x64, 0xAD);
+    // Read controller config and clear "IRQ1 enable" (bit 0). Leave the
+    // mouse-side bits (bit 1, bit 5) untouched — if the user has a PS/2
+    // touchpad alongside a USB keyboard, dropping IRQ12 would silently
+    // kill input.
+    if (!ps2Wait()) {
+        asm volatile ("sti");
+        return;
+    }
+    io.outb(0x64, 0x20);
+    if (!ps2WaitOutput()) {
+        asm volatile ("sti");
+        return;
+    }
+    var config = io.inb(0x60);
+    config &= ~@as(u8, 0x01); // clear IRQ1 enable
+    config |= 0x10; // set "disable keyboard clock"
+    _ = ps2Wait();
+    io.outb(0x64, 0x60);
+    _ = ps2Wait();
+    io.outb(0x60, config);
+    ps2_present = false; // input ring stays drained from here on
+    debug.klog("[kbd] PS/2 IRQ1 masked (USB keyboard active)\n", .{});
+    asm volatile ("sti");
+}
+
 /// Re-enable keyboard IRQ after mouse init may have changed the PS/2 config.
 /// Disables interrupts during config byte read/write to prevent mouse IRQ
 /// from stealing the data byte.

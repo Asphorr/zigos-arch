@@ -6,6 +6,7 @@ const keyboard = @import("../driver/keyboard.zig");
 const vga = @import("vga.zig");
 const cli = @import("../cli.zig");
 const paging = @import("../mm/paging.zig");
+const pmm = @import("../mm/pmm.zig");
 const debug = @import("../debug/debug.zig");
 const elf_loader = @import("../proc/elf_loader.zig");
 const gdt = @import("../cpu/gdt.zig");
@@ -124,9 +125,15 @@ const context_menu = @import("desktop/context_menu.zig");
 // Pending-app-launch ring — see desktop/launch_queue.zig.
 const launch_queue = @import("desktop/launch_queue.zig");
 
+// Compositor wake primitive — event-driven sleep / wake; replaces the
+// legacy "wake every 80 ms" floor in shouldResumeDesktop. See module
+// doc-comment for the model.
+pub const wake = @import("desktop/wake.zig");
+
 pub fn showNotification(text: []const u8) void {
     toast.show(text);
     dirty_rects_mod.force_full_kind = true;
+    wake.requestWake();
     sound.notify();
 }
 
@@ -354,7 +361,10 @@ fn putCharOnWindow(w: *Window, c: u8) void {
 fn putCharIdle(w: *Window, t: *TerminalData, c: u8) void {
     switch (c) {
         '\x1b' => t.esc_state = .esc,
-        '\x07' => t.bell_phase = BELL_FLASH_FRAMES,
+        '\x07' => {
+            t.bell_phase = BELL_FLASH_FRAMES;
+            wake.requestWake();
+        },
         '\t' => {
             const next = (@as(u32, t.text_col) / TAB_WIDTH + 1) * TAB_WIDTH;
             t.text_col = @intCast(@min(next, TERM_COLS - 1));
@@ -708,6 +718,15 @@ fn toggleFullscreen(idx: u8) void {
         w.anim_end_y = w.saved_y;
         w.anim_end_w = w.saved_w;
         w.anim_end_h = w.saved_h;
+        // Mirror drag-resize: update gui_w/gui_h so the renderWindow
+        // blit doesn't crop content. Without this, vis_w/vis_h stay
+        // stuck at the maximized size after un-fullscreen, but w.width
+        // is now back to saved, so the blit overruns and reads past
+        // the live region (or just shows stale max-size content).
+        if (w.gui_fb != null) {
+            w.gui_w = w.saved_w;
+            w.gui_h = w.saved_h -| TITLEBAR_H;
+        }
     } else {
         // Enter maximize — fill the area between menubar and dock, NOT
         // the entire screen. Keep window chrome (titlebar + traffic-
@@ -734,6 +753,19 @@ fn toggleFullscreen(idx: u8) void {
         w.anim_end_y = @intCast(MENUBAR_H + (usable_h -| target_h) / 2);
         w.anim_end_w = target_w;
         w.anim_end_h = target_h;
+        // Mirror drag-resize (desktop.zig:2227,2259): bump gui_w/gui_h
+        // to the new target so renderWindow's `vis_w = min(gui_w,
+        // w.width)` doesn't crop the blit. Without this, w.width grows
+        // to target_w but gui_w stays at the original (e.g. 480), and
+        // the compositor only blits the upper-left 480-wide column of
+        // an 864-wide window — the right strip + lower rows show
+        // wallpaper through. The app discovers the new size by polling
+        // getWindowSize() (already returns w.width/height) and repaints
+        // to fill the expanded gui_fb region within its alloc cap.
+        if (w.gui_fb != null) {
+            w.gui_w = target_w;
+            w.gui_h = target_h -| TITLEBAR_H;
+        }
     }
 }
 
@@ -956,6 +988,12 @@ fn spawnShellOnWindow(wi: u8) void {
     windows[wi].kb_pipe = kb_pipe;
     windows[wi].out_pipe = out_pipe;
     windows[wi].shell_pid = @intCast(pid);
+    // Event-driven compositor: out_pipe is drained by the desktop loop's
+    // tryRead poll, not by a blocking read. Tell pipe.write to wake the
+    // compositor when the shell writes to it; otherwise the desktop
+    // sleeps through stdout bytes until something else (input, animation)
+    // wakes it.
+    pipe.setDesktopDrain(out_pipe);
 }
 
 
@@ -1051,10 +1089,11 @@ fn renderWindow(idx: u8) void {
     // maximized window frame.
 
     // Mark this window's region as dirty for partial GPU flush.
-    // Padding of 20 covers the 16-px soft shadow plus 1-px border on each side.
+    // Padding of 28 covers the 24-px soft shadow plus 1-px border plus
+    // a few pixels of slack on each side.
     const dx: u32 = if (w.x < 0) 0 else @intCast(w.x);
     const dy: u32 = if (w.y < 0) 0 else @intCast(w.y);
-    addDirtyRect(dx -| 1, dy -| 1, w.width + 20, w.height + 20);
+    addDirtyRect(dx -| 1, dy -| 1, w.width + 28, w.height + 28);
 
     // Save corner pixels from back buffer BEFORE drawing (for transparent rounded corners)
     saveCornerPixels(w.x - @as(i32, BORDER), w.y - @as(i32, BORDER), w.width + BORDER * 2, w.height + BORDER * 2);
@@ -1072,15 +1111,20 @@ fn renderWindow(idx: u8) void {
     if (w.shadow_dirty) shadow_blk: {
     const wx_r: i32 = w.x + @as(i32, @intCast(w.width));
     const wy_b: i32 = w.y + @as(i32, @intCast(w.height));
-    const SHADOW_W: u32 = 16;
-    // Peak ~7.8% (halved from the old 16%). The old values landed too dark
-    // on small windows (sysmon, calc) against the dark desktop bg — the
-    // inner layers >0x1B made the band look inky. New curve keeps the
-    // lifted feel but stays subtle even on a black-ish wallpaper.
-    const SHADOW_MAX: u32 = 0x14;
+    // 24-step two-tier falloff. Inner 8 px are the "core" shadow (close
+    // contact, fairly visible — peak ~9.4%). Middle 8 px soften to a
+    // half-strength haze. Outer 8 px stretch out a long, very-faint
+    // tail (≤2%) so the window feels lifted rather than glued to the
+    // wallpaper. Same asymmetric layout as before (bottom + right only).
+    const SHADOW_W: u32 = 24;
+    const SHADOW_MAX: u32 = 0x18;
     const shadow_alphas = [SHADOW_W]u8{
-        0x14, 0x12, 0x10, 0x0D, 0x0B, 0x09, 0x07, 0x05,
-        0x04, 0x03, 0x02, 0x02, 0x01, 0x01, 0x01, 0x01,
+        // inner (close contact)
+        0x18, 0x16, 0x14, 0x12, 0x10, 0x0E, 0x0C, 0x0A,
+        // mid (softening)
+        0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x03, 0x02,
+        // outer (long faint tail)
+        0x02, 0x02, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
     };
 
     // Bottom edge — horizontal rows below the window
@@ -1152,11 +1196,24 @@ fn renderWindow(idx: u8) void {
     const sep_color: u32 = if (is_focused) @as(u32, 0xB0B0B0) else @as(u32, 0x707070);
     gfx.drawHLine(w.x, w.y + @as(i32, TITLEBAR_H) - 1, w.width, sep_color);
 
-    // Traffic light buttons (macOS-style, left side)
+    // Traffic light buttons (macOS-style, left side). When the window is
+    // unfocused they all turn a uniform muted gray — same trick macOS uses
+    // to signal "input doesn't go here right now". The eye-catching red/
+    // amber/green is reserved for the active window.
     const btn_cy = w.y + @as(i32, TITLEBAR_H / 2);
-    gfx.drawFilledCircle(w.x + 16, btn_cy, BTN_RADIUS, BTN_CLOSE);
-    gfx.drawFilledCircle(w.x + 38, btn_cy, BTN_RADIUS, BTN_MINIMIZE);
-    gfx.drawFilledCircle(w.x + 60, btn_cy, BTN_RADIUS, BTN_MAXIMIZE);
+    const btn_close_col: u32 = if (is_focused) BTN_CLOSE else @as(u32, 0x636368);
+    const btn_min_col: u32 = if (is_focused) BTN_MINIMIZE else @as(u32, 0x636368);
+    const btn_max_col: u32 = if (is_focused) BTN_MAXIMIZE else @as(u32, 0x636368);
+    gfx.drawFilledCircle(w.x + 16, btn_cy, BTN_RADIUS, btn_close_col);
+    gfx.drawFilledCircle(w.x + 38, btn_cy, BTN_RADIUS, btn_min_col);
+    gfx.drawFilledCircle(w.x + 60, btn_cy, BTN_RADIUS, btn_max_col);
+    if (is_focused) {
+        // 1-px specular highlight on the upper-left of each light — sells
+        // the "rounded gem" feel that flat circles miss.
+        gfx.fillRectAlpha(w.x + 14, btn_cy - 3, 2, 1, 0x60FFFFFF);
+        gfx.fillRectAlpha(w.x + 36, btn_cy - 3, 2, 1, 0x60FFFFFF);
+        gfx.fillRectAlpha(w.x + 58, btn_cy - 3, 2, 1, 0x60FFFFFF);
+    }
 
     // Centered title — SF Pro Display 24px AA. Title bar gradient is already
     // painted; aa_font draws via per-pixel alpha blend so we just stamp glyphs
@@ -2265,8 +2322,9 @@ fn blitWindowBounds(idx: u8) void {
     const w = &windows[idx];
     const bx: u32 = if (w.x < @as(i32, BORDER)) 0 else @intCast(w.x - @as(i32, BORDER));
     const by: u32 = if (w.y < @as(i32, BORDER)) 0 else @intCast(w.y - @as(i32, BORDER));
-    // Include shadow area (3px right, 3px down)
-    gfx.blitRectToScreen(bx, by, w.width + BORDER * 2 + 4, w.height + BORDER * 2 + 4);
+    // Include shadow tail (24 px right + down) plus borders. Without this,
+    // partial flushes during drag leave shadow ghosts at the old position.
+    gfx.blitRectToScreen(bx, by, w.width + BORDER * 2 + 26, w.height + BORDER * 2 + 26);
 }
 
 fn changeResolution(new_w: u16, new_h: u16) void {
@@ -2338,6 +2396,13 @@ pub fn taskEntry() callconv(.c) noreturn {
     // re-enable IRQs now that RSP is on the high-VA kstack and the
     // legacy low identity is gone.
     asm volatile ("sti");
+    // Now that we're a scheduled task with a current_pid, it's safe to
+    // flip NVMe controllers into async I/O mode. Pre-enterFirstTask
+    // reads (ext2 superblock + symbol/line table loads in main.zig)
+    // used the sync polled path; post-this-line reads (every userspace
+    // file load via vfs.loadFileFresh) go through submit-and-yield with
+    // Q_DEPTH=16-way parallelism.
+    @import("../driver/nvme.zig").enableAsync();
     run();
     asm volatile ("ud2");
     unreachable;
@@ -2346,6 +2411,15 @@ pub fn taskEntry() callconv(.c) noreturn {
 pub fn run() void {
     @import("../cpu/smp.zig").assertBSP("desktop.run");
     debug.klog("[desktop] Starting graphical desktop...\n", .{});
+
+    // Register the back-buffer reclaim callback with PMM. When an
+    // allocation fails (typically photo / image decode demand-paging
+    // into a region bigger than free PMM), handleUserPageFault calls
+    // pmm.tryReclaim → us → free the back-buffer slots of every GUI
+    // window. Apps lose tear-free presents until their next sysPresent
+    // call (lazy realloc), but the system avoids OOM-killing the
+    // user's working process.
+    pmm.registerReclaim(reclaimBackBuffers);
 
     // Wipe the VGA text framebuffer to black before the mode switch.
     // Without this, the host display backend mid-transitions the legacy
@@ -2530,6 +2604,13 @@ pub fn run() void {
 
     while (true) {
         frame_count +%= 1;
+        // Clear event-driven wake flags. We're running because either
+        // wake.isDue() told the timer to switch us in (atomic flag /
+        // self-wake due), or one of the input checks fired. Either way,
+        // we own this iteration — drain both channels before doing any
+        // work so producers during the iteration re-arm cleanly for the
+        // next wake.
+        wake.consume();
         // Inject typematic repeats (held keys past the initial delay) into
         // the keyboard ring before we read from it. Cheap: returns immediately
         // unless a key is actually due for repeat.
@@ -2558,6 +2639,11 @@ pub fn run() void {
 
         // Toast: advance the slide-in / countdown one tick.
         if (toast.tick()) dirty_rects_mod.force_full_kind = true;
+        // Toast keeps animating until its timer drains — request a
+        // self-wake so the next tick brings us back to advance the
+        // slide-in / fade-out. ~2 ticks (~50 Hz) is plenty for a 200-
+        // frame countdown; 1 tick would be 100 Hz, more than needed.
+        if (toast.isActive()) wake.requestSelfWake(process.tick_count + 2);
 
         // Reset mouse transfer ring if watchdog flagged it (must run outside IRQ)
         if (xhci.mouse_needs_reset) {
@@ -2588,18 +2674,28 @@ pub fn run() void {
                 last_blink_phase = curr_phase;
                 if (dirty == .none) dirty = .text_only;
             }
+            // Self-wake at the start of the next half-period so the blink
+            // toggle fires on time even with no other compositor activity.
+            const next_phase_tick = (curr_phase + 1) * CURSOR_BLINK_HALF_TICKS;
+            wake.requestSelfWake(next_phase_tick);
         }
 
         // Bell flash: each terminal with a non-zero bell_phase counts down
         // one frame; while active, mark dirty=.full so the red border re-renders.
+        var any_bell_active = false;
         for (z_stack[0..wm.z_count]) |wi| {
             if (windows[wi].term) |tt| {
                 if (tt.bell_phase > 0) {
                     tt.bell_phase -= 1;
                     dirty = .full;
+                    if (tt.bell_phase > 0) any_bell_active = true;
                 }
             }
         }
+        // Bell needs to count down on subsequent ticks even with no other
+        // wake source. Pace at ~50 Hz (every 2 ticks) — the flash totals
+        // only BELL_FLASH_FRAMES so this drains within ~10 wakeups.
+        if (any_bell_active) wake.requestSelfWake(process.tick_count + 2);
 
         var cursor_moved = false;
 
@@ -2824,14 +2920,36 @@ pub fn run() void {
             advanceAnimations();
             dirty = .full;
             markDirtyFull();
+            // Animations want a follow-up frame as long as any is still
+            // ticking. Pace at 1 tick (~100 Hz upper bound; on 100 Hz
+            // timer that's "every frame"). Animation totals are short
+            // (~6 frames) so this drains in <100 ms.
+            if (hasActiveAnimations()) wake.requestSelfWake(process.tick_count + 1);
         }
 
         // Auto-refresh: mark all visible GUI windows for re-composite every frame
         gui_windows_active = hasGuiWindows();
         if (gui_windows_active) {
+            // Auto-refresh fallback for apps that don't call sysPresent
+            // (sysmon, settings, etc.). Throttled per-window to ~20 Hz
+            // so a flurry of compositor wakes (cursor blink, mouse
+            // hover, keyboard input) doesn't trigger a re-composite +
+            // virtio-gpu flush of every GUI window each time. Apps that
+            // DO call sysPresent bypass this entirely — markGuiPresent
+            // sets gui_present_pending directly without consulting the
+            // throttle, so cube / fastfetch / anything performance-
+            // sensitive still gets full submission rate.
+            //
+            // Threshold: 5 ticks ≈ 50 ms ≈ 20 Hz. Sysmon's actual
+            // content updates at 2 Hz so 20 Hz is 10× more than needed;
+            // mouse hover-tracking-against-GUI-apps still feels instant.
+            const AUTO_REFRESH_INTERVAL_TICKS: u64 = 5;
             for (z_stack[0..wm.z_count]) |gi| {
-                if (windows[gi].gui_fb != null and windows[gi].visible) {
-                    windows[gi].gui_present_pending = true;
+                const w = &windows[gi];
+                if (w.gui_fb == null or !w.visible) continue;
+                if (process.tick_count -% w.last_auto_refresh_tick >= AUTO_REFRESH_INTERVAL_TICKS) {
+                    w.gui_present_pending = true;
+                    w.last_auto_refresh_tick = process.tick_count;
                 }
             }
         }
@@ -3177,26 +3295,37 @@ pub fn destroyGuiWindow(pid: u8) void {
     if (@import("../driver/virtio_gpu.zig").cursor_hidden) {
         @import("../driver/virtio_gpu.zig").showCursor();
     }
+    var any_window_for_pid = false;
     // Iterate slots (not z_stack) since removeWindow mutates z_stack and
     // we'd skip entries with a live z_stack iteration.
     for (0..MAX_WINDOWS) |k| {
         const i: u8 = @intCast(k);
         if (!slot_used[i]) continue;
         if (windows[i].owner_pid != pid) continue;
+        any_window_for_pid = true;
         debug.klog("[desktop] GUI window destroyed for PID {d}\n", .{pid});
         if (windows[i].gui_fb != null) {
             const aw = if (windows[i].gui_alloc_w > 0) windows[i].gui_alloc_w else windows[i].gui_w;
             const ah = if (windows[i].gui_alloc_h > 0) windows[i].gui_alloc_h else windows[i].gui_h;
             const fb_size = aw * ah * 4;
             const num_pages = (fb_size + 4095) / 4096;
-            // 4× pages: front + 3× back. Race-free triple buffer
-            // rotation; see Window.gui_fb_backs doc.
-            const total_pages: u32 = if (windows[i].gui_fb_backs[0] != null) num_pages * 4 else num_pages;
-            paging.unmapGuiFB(pid, num_pages, total_pages);
+            // unmapGuiFB iterates internally over front + any lazily-
+            // allocated back-buffer slots (tracked per-PID in paging.zig).
+            // Each slot was sized num_pages, so we just pass that.
+            const free_before = pmm.freeFrameCount();
+            paging.unmapGuiFB(pid, num_pages);
+            const free_after = pmm.freeFrameCount();
+            debug.klog("[fb-diag] pid={d} unmapGuiFB num_pages={d} free {d}->{d} (returned={d})\n", .{
+                pid, num_pages, free_before, free_after, free_after -% free_before,
+            });
         }
         removeWindow(i);
         dirty_rects_mod.force_full_kind = true;
         markDirtyFull();
+    }
+    if (any_window_for_pid) wake.requestWake();
+    if (!any_window_for_pid) {
+        debug.klog("[fb-diag] destroyGuiWindow pid={d}: NO window matched owner_pid\n", .{pid});
     }
 }
 
@@ -3206,6 +3335,13 @@ pub fn markGuiPresent(pid: u8) void {
     for (z_stack[0..wm.z_count]) |i| {
         if (windows[i].owner_pid == pid and windows[i].gui_fb != null) {
             windows[i].gui_present_pending = true;
+            // Event-driven compositor wake: a GUI app pushed a new
+            // frame, the desktop loop has work to do (re-composite
+            // this window, blit the dirty rect). In legacy mode this
+            // is a no-op gated by the 3-tick GUI floor; in event-
+            // driven mode this is the only thing that brings the
+            // compositor back from sleep.
+            wake.requestWake();
             return;
         }
     }
@@ -3218,7 +3354,17 @@ pub fn markGuiPresent(pid: u8) void {
 /// (which is what produced the cube's flashing artifact pre-fix). The copy
 /// is ~80 µs for a 320×240 window, scaling linearly with pixel count;
 /// negligible at the rate sysPresent fires.
+/// In-flight snapshotGuiFb counter. Bumped at the top of snapshotGuiFb,
+/// released at the bottom. reclaimBackBuffers spin-waits this to zero
+/// before freeing back-buffer phys frames — without this, reclaim could
+/// race with a mid-memcpy snapshot from another CPU, writing through a
+/// pointer we just freed and clobbering whoever PMM hands the frame to
+/// next.
+var presenting_count: u32 = 0;
+
 pub fn snapshotGuiFb(pid: u8) void {
+    _ = @atomicRmw(u32, &presenting_count, .Add, 1, .acquire);
+    defer _ = @atomicRmw(u32, &presenting_count, .Sub, 1, .release);
     for (z_stack[0..wm.z_count]) |i| {
         const w = &windows[i];
         if (w.owner_pid == pid) {
@@ -3234,6 +3380,34 @@ pub fn snapshotGuiFb(pid: u8) void {
             // compositor), the in-flight slot is never overwritten.
             const cur_pub = w.gui_fb_pub.load(.acquire);
             const next: u32 = (cur_pub + 1) % 3;
+            // Lazy back-buffer alloc. sysCreateWindow leaves all three
+            // backs unallocated; we only create them when an app
+            // actually calls sysPresent. Apps that never present
+            // (sysmon, settings, many tools that rely on auto-refresh)
+            // save 3× their framebuffer permanently. First-present pays
+            // a one-shot pmm.allocContiguous(num_pages) per slot.
+            //
+            // If alloc fails (low memory), we silently skip the present:
+            // has_presented stays false, the compositor's renderWindow
+            // falls back to reading gui_fb directly. Visually
+            // indistinguishable; only loses the tear-free property under
+            // 60fps+ presenters (cube etc.) — which is a fair trade for
+            // not crashing the present syscall under memory pressure.
+            if (w.gui_fb_backs[next] == null) {
+                const num_pages: u32 = @intCast((@as(usize, n) * 4 + 4095) / 4096);
+                if (pmm.allocContiguous(num_pages)) |back_phys| {
+                    const back_kv: [*]volatile u32 = @ptrFromInt(paging.physToVirt(back_phys));
+                    const back_u8: [*]volatile u8 = @ptrCast(back_kv);
+                    @memset(back_u8[0 .. num_pages * 4096], 0);
+                    w.gui_fb_backs[next] = back_kv;
+                    paging.registerGuiFBBack(pid, @intCast(next), back_phys);
+                } else {
+                    // PMM exhausted — leave has_presented=false and let
+                    // the compositor read gui_fb directly. App keeps
+                    // running; only the tear-free property is lost.
+                    return;
+                }
+            }
             const next_buf = w.gui_fb_backs[next] orelse return;
             const dst: [*]u32 = @ptrCast(@volatileCast(next_buf));
             const src: [*]const u32 = @ptrCast(@volatileCast(front));
@@ -3246,6 +3420,89 @@ pub fn snapshotGuiFb(pid: u8) void {
             return;
         }
     }
+}
+
+/// PMM reclaim callback — drops the lazily-allocated back-buffer slots
+/// of every GUI window, returning the freed frames to the PMM. Called
+/// from pmm.tryReclaim when an allocation fails (typically from
+/// handleUserPageFault on the OOM path). Returns frames actually freed.
+///
+/// Race safety: NULL the kernel pointer first so any new snapshotGuiFb
+/// sees null and lazily reallocates. Then spin-wait `presenting_count`
+/// to zero — guarantees no in-flight memcpy is still writing through a
+/// pointer we already nulled. Only then do we hand the phys back to
+/// PMM. Without the spin, a concurrent snapshotGuiFb on another CPU
+/// could write 8 MB into a frame PMM already reassigned, corrupting
+/// arbitrary kernel state.
+///
+/// `has_presented` is cleared so renderWindow falls back to reading
+/// gui_fb directly (the existing fallback path). The next sysPresent
+/// will lazily reallocate the slot.
+pub fn reclaimBackBuffers(needed_frames: u32) u32 {
+    var freed_frames: u32 = 0;
+    // Phase 1: null all reclaimable back-buffer kernel pointers + take
+    // their phys. Doing all the NULL writes first means by the time we
+    // start the spin-wait, no new snapshotGuiFb call can latch a
+    // pointer that we then free.
+    var pending_phys: [MAX_WINDOWS * 3]usize = [_]usize{0} ** (MAX_WINDOWS * 3);
+    var pending_pages: u32 = 0;
+    var pending_count: usize = 0;
+    for (0..MAX_WINDOWS) |k| {
+        const i: u8 = @intCast(k);
+        if (!slot_used[i]) continue;
+        const w = &windows[i];
+        if (w.gui_fb == null) continue;
+        const aw = if (w.gui_alloc_w > 0) w.gui_alloc_w else w.gui_w;
+        const ah = if (w.gui_alloc_h > 0) w.gui_alloc_h else w.gui_h;
+        const npages_this: u32 = (aw * ah * 4 + 4095) / 4096;
+        var slot: u8 = 0;
+        while (slot < 3) : (slot += 1) {
+            if (w.gui_fb_backs[slot] == null) continue;
+            // NULL the kernel pointer first (atomic with respect to
+            // snapshotGuiFb's pointer load). Even if a snapshot
+            // already loaded the pointer, the spin-wait below handles
+            // it.
+            w.gui_fb_backs[slot] = null;
+            const phys = paging.takeGuiFbBackPhys(w.owner_pid, slot);
+            if (phys != 0) {
+                pending_phys[pending_count] = phys;
+                pending_count += 1;
+                pending_pages = npages_this;
+                freed_frames += npages_this;
+            }
+        }
+        // Force compositor onto the gui_fb fallback path. The next
+        // sysPresent will lazily reallocate the slot.
+        w.has_presented = false;
+        if (freed_frames >= needed_frames) break;
+    }
+    if (pending_count == 0) return 0;
+
+    // Phase 2: spin-wait for any in-flight snapshotGuiFb to finish.
+    // Bounded by snapshotGuiFb's memcpy time — fullscreen 1920×1080
+    // RGBA is ~8 MB, memcpy at ~5 GB/s is ~1.6 ms worst case. The
+    // `pause` lets the other CPU make progress instead of cache-
+    // ping-ponging us.
+    var spin_iters: u32 = 0;
+    while (@atomicLoad(u32, &presenting_count, .acquire) > 0) {
+        asm volatile ("pause");
+        spin_iters += 1;
+        if (spin_iters > 10_000_000) {
+            // Sanity bound — if we somehow miss a decrement, don't
+            // hang forever. Log + bail; the deferred free might race
+            // a snapshot, but at this point the system is in a worse
+            // state than a single torn 8 MB write.
+            debug.klog("[reclaim] WARN snapshotGuiFb drain timeout, freeing anyway\n", .{});
+            break;
+        }
+    }
+
+    // Phase 3: now safe — actually return the frames to PMM.
+    var i: usize = 0;
+    while (i < pending_count) : (i += 1) {
+        pmm.freeContiguous(pending_phys[i], pending_pages);
+    }
+    return freed_frames;
 }
 
 pub fn focusedPid() u8 {
@@ -3441,16 +3698,22 @@ fn hasGuiWindows() bool {
 }
 
 /// Called by timer IRQ handler to decide when to return control to the desktop.
-/// Checks for input events, periodic rendering interval, and config changes.
+/// In event-driven mode, the floor wakeups (DESKTOP_INTERVAL + GUI 3-tick) are
+/// dropped — the loop sleeps until an explicit wake.requestWake / requestSelfWake
+/// fires, or input/config arrives. Flip wake.event_driven=false to restore the
+/// legacy fixed-rate polling if a wake source is missed.
 pub fn shouldResumeDesktop() bool {
+    if (wake.isDue(process.tick_count)) return true;
     if (keyboard.hasData()) return true;
     if (keyboard.repeatDue(process.tick_count)) return true;
     if (mouse.moved) return true;
-    if (process.tick_count - last_desktop_tick >= DESKTOP_INTERVAL) return true;
     if (config_changed) return true;
-    if (toast.isActive()) return true;
-    // Wake every 3 ticks (~30ms) when GUI apps are running for smooth updates
-    if (gui_windows_active and process.tick_count - last_desktop_tick >= 3) return true;
+    if (!wake.event_driven) {
+        // Legacy fallback: unconditional rate-based wake.
+        if (process.tick_count - last_desktop_tick >= DESKTOP_INTERVAL) return true;
+        if (toast.isActive()) return true;
+        if (gui_windows_active and process.tick_count - last_desktop_tick >= 3) return true;
+    }
     return false;
 }
 

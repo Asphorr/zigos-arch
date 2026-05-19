@@ -171,6 +171,45 @@ pub const CpuLocal = struct {
     /// writes). Field unused unless `mwait.mwait_supported` is true.
     idle_monitor_word: u32 align(64) = 0,
 
+    /// Set by IRQ handlers (currently nvmeIrqHandler) that wake tasks and
+    /// want a reschedule on the way out without calling `schedule()` from
+    /// within the IRQ context (which leaves the handler running on whatever
+    /// kstack the IRQ inherited — a known cross-stack-aliasing risk; mirror-
+    /// flip caught nvme corrupting pid 2's kesp+48 via this path on
+    /// 2026-05-19). `DynIrqStub`'s epilogue calls `check_and_preempt_dynirq`
+    /// which observes this flag, clears it, and calls `schedule()` from the
+    /// stub's frame instead. Net effect: ~50µs wake-latency preserved
+    /// without the cross-stack hazard.
+    dynirq_preempt_pending: bool = false,
+
+    /// Bracket-marker for the schedule() transient demote window. Set to the
+    /// outgoing pid right before `setState(prev, .ready)` in schedule(),
+    /// cleared inside save_trace_record once switchTo's `movq %rsp, (%rdi)`
+    /// has updated procs[prev].kernel_esp. While set, the pid's PCB has
+    /// state=.ready but kernel_esp is STALE — *(kesp+48) still reflects the
+    /// previous save's slot, which the still-running prev task is busily
+    /// overwriting with whatever its current code path is doing (often
+    /// 0xAAAAAAAAAAAAAAAA from Zig's ReleaseSafe undefined-init pattern).
+    /// pcb_invariants and kstack_protect.tickMonitor skip the saved-RIP
+    /// validation when any CPU has this set for the inspected pid, otherwise
+    /// they false-fire on transient stack residue.
+    ///   0xFFFF = no transient in progress on this CPU.
+    /// 2026-05-19: introduced after pcb-invariant panic'd on
+    /// pid=2 *(kesp+48)=AAAA during NVMe async I/O schedule-from-IRQ paths.
+    scheduling_out_pid: u16 = 0xFFFF,
+
+    /// Mirror of `scheduling_out_pid` for the INBOUND direction. Set after
+    /// pickNext's `ready→running` CAS succeeds, cleared inside
+    /// `setCurrentPid` once `cpu.current_pid` is updated. Between those
+    /// two points the invariant "state==.running ⇔ some cpu owns it"
+    /// transiently breaks: the pid's state byte says .running, but no
+    /// CPU yet reports it as current. `pcb_invariants` skips its
+    /// running-but-no-owner check when any CPU has this set for the
+    /// inspected pid. 0xFFFF = no inbound transient on this CPU.
+    /// 2026-05-19: introduced after pcb-invariant panic'd on pid=4
+    /// during normal sysSleep/wake cycling, caught by cross-CPU scan.
+    dispatching_in_pid: u16 = 0xFFFF,
+
     // Tripwire (task #226 lite). LAST field of CpuLocal. If anything writes
     // past the end of cpus[N] — overflow from neighboring data, wild
     // pointer that lands here, sched_lock-state-write that overran — the
@@ -214,43 +253,48 @@ pub fn verifyEndCanary() void {
     @panic("CpuLocal end-canary clobbered — wild write into per-CPU slot");
 }
 
-/// Per-CPU storage for syscall_entry.zig's fast path.
+/// Per-CPU storage for syscall_entry.zig's fast path. Just one slot now:
+/// the LSTAR stub also needs a transient place to spill the user RSP
+/// before it switches to the kernel stack (cpus[N].tss.rsp0). The
+/// kernel-stack-top itself lives in `cpus[N].tss.rsp0` — the canonical
+/// TSS field the CPU hardware reads on IDT-gate entries — so syscall
+/// entry and IDT-gate entry can no longer disagree about which kstack
+/// to land on. (Previously this file declared a `per_cpu_asm` mirror
+/// in `.kdata_protected`; the two-field design tore under nested
+/// setTssRsp0 — cpu-alias FAIL 2026-05-17.)
 ///
-/// Split into TWO arrays for write-protection reasons:
-///
-///   per_cpu_user_rsp[N]    — transient user-RSP save, written by the LSTAR
-///                            stub on EVERY syscall (hot path). Lives in
-///                            ordinary BSS, NOT page-protected.
-///
-///   per_cpu_asm[N]         — { syscall_stack_top: u64 }, ONLY updated on
-///                            context switch via gdt.setTssRsp0. Lives in
-///                            .kdata_protected (RO except during the
-///                            paged-unlock window inside setTssRsp0). Wild
-///                            writes from anywhere else trap as #PF with
-///                            the writer's RIP.
-///
-/// Combining them into one struct (the previous design) would either trap
-/// every syscall on the user_rsp_save write, or require a CR0.WP toggle
-/// in the trampoline — ~60 cycles of overhead on the hottest kernel path.
-/// Splitting keeps the trampoline branch-free while still protecting the
-/// invariant field that's the actual corruption target.
-pub const PerCpuAsm = extern struct {
-    syscall_stack_top: u64 = 0, // updated by gdt.setTssRsp0
-};
-
-comptime {
-    if (@offsetOf(PerCpuAsm, "syscall_stack_top") != 0) @compileError("syscall_stack_top must be at offset 0");
-    if (@sizeOf(PerCpuAsm) != 8) @compileError("PerCpuAsm must be 8 bytes — LSTAR stub uses cpu_id*8 stride");
-}
-
-// Hot, unprotected: written every syscall by the LSTAR stub.
+/// per_cpu_user_rsp lives in ordinary BSS, not page-protected: it's
+/// written on every syscall and a write-trap on the hot path would cost
+/// the CR0.WP toggle.
 pub export var per_cpu_user_rsp: [MAX_CPUS]u64 = [_]u64{0} ** MAX_CPUS;
 
-// Cold, protected: written only by gdt.setTssRsp0 inside a CR0.WP-cleared
-// window. Lives in .kdata_protected (page-aligned, RO post-boot).
-pub export var per_cpu_asm: [MAX_CPUS]PerCpuAsm linksection(".kdata_protected") = [_]PerCpuAsm{.{}} ** MAX_CPUS;
-
+// The per-CPU LSTAR syscall stub needs the address of cpus[0] in inline
+// asm so it can compute `cpus + N*sizeOf(CpuLocal) + offsetOf(tss) +
+// offsetOf(rsp0)` to load the kernel RSP — the same memory the CPU
+// hardware reads on IDT-gate entries. Can't `export var cpus` directly:
+// CpuLocal isn't extern-compatible (has `?usize` optionals + Zig-only
+// SpinLock with align(64)). Instead, export a u64 holding
+// `@intFromPtr(&cpus[0])`, stamped at boot in `init()`. The stub does a
+// two-instruction load (`movq cpus_base(%rip), %rax; movq <off>(%rax),
+// %rsp`) — one extra cycle, negligible on the syscall path. Eliminates
+// the per_cpu_asm mirror that used to drift under nested setTssRsp0.
 pub var cpus: [MAX_CPUS]CpuLocal = [_]CpuLocal{.{}} ** MAX_CPUS;
+pub export var cpus_base: u64 = 0;
+
+comptime {
+    // tss.rsp0 is loaded as a single 8-byte `movq <offset>(%rip), %rsp` from
+    // the syscall LSTAR stub. Intel SDM Vol 3A §8.1.1 guarantees atomicity
+    // for cache-line-contained 8-byte stores on P6+; if the field straddles
+    // a 64-byte boundary we lose that and a torn write becomes observable
+    // on the syscall hot path. Assert it doesn't straddle.
+    const off = @offsetOf(CpuLocal, "tss") + @offsetOf(gdt.Tss64, "rsp0");
+    // CpuLocal has align(64) (from inner SpinLock), so cpus[N] is 64-aligned
+    // for every N — the within-cache-line offset is the same for every CPU.
+    const within = off & 63;
+    if (within + 8 > 64) {
+        @compileError("cpus[N].tss.rsp0 spans two cache lines — non-atomic 8-byte store on syscall path");
+    }
+}
 pub var cpu_count: u8 = 1;
 var smp_initialized: bool = false;
 
@@ -301,6 +345,14 @@ pub fn assertBSP(comptime site: []const u8) void {
 
 /// Initialize SMP: set up BSP per-CPU data, boot APs
 pub fn init() void {
+    // Stamp the address of cpus[0] into the exported `cpus_base` slot so
+    // the per-CPU LSTAR syscall stubs (syscall_entry.zig) can load the
+    // kernel RSP from `cpus[N].tss.rsp0` via a two-instruction indirect
+    // load. Must happen BEFORE any syscall can fire from userspace,
+    // which can't happen until after smp.init returns (BSP idle + first
+    // desktop dispatch are both later in main.zig).
+    cpus_base = @intFromPtr(&cpus);
+
     if (!apic.apic_active) {
         debug.klog("[smp] No APIC, SMP disabled\n", .{});
         return;
@@ -329,9 +381,10 @@ pub fn init() void {
     cpus[bsp_id].lapic_id = bsp_id;
     cpus[bsp_id].alive = true;
 
-    // Initialize this CPU's per-CPU asm slot (syscall stack pointer + zero
-    // user_rsp_save). The slot is addressed by the per-CPU LSTAR entry stub
-    // via RIP-relative load — no GS_BASE involvement.
+    // Zero this CPU's per-CPU syscall scratch slot (user_rsp_save). The
+    // kstack pointer itself lives in cpus[bsp_id].tss.rsp0 — written by
+    // setTssRsp0 on the first per-process dispatch. The LSTAR stub reads
+    // both via RIP-relative loads, no GS_BASE involvement.
     initPerCpuAsm(bsp_id);
 
     // Migrate BSP from the legacy shared GDT/TSS (set up by gdt.init()) to
@@ -582,16 +635,13 @@ export fn apEntry() callconv(.c) noreturn {
     process.enterFirstTaskAp(idle_pid);
 }
 
-/// Initialize this CPU's per-CPU asm storage. Both fields start at 0 — they
-/// are set by the per-process context switch path (gdt.setTssRsp0). Until
-/// the first dispatch into a process, no syscall can fire on this CPU
-/// (BSP enters user via desktop.yieldToScheduler which calls setTssRsp0
-/// first; APs never enter user mode in this kernel).
+/// Initialize this CPU's per-CPU syscall scratch slot. The kstack pointer
+/// itself lives in cpus[cpu_id].tss.rsp0 and is stamped by setTssRsp0 on
+/// the first per-process dispatch; until then no syscall can fire on this
+/// CPU (BSP enters user via desktop.yieldToScheduler which calls
+/// setTssRsp0 first; APs never enter user mode in this kernel).
 fn initPerCpuAsm(cpu_id: u8) void {
     per_cpu_user_rsp[cpu_id] = 0;
-    // per_cpu_asm[cpu_id].syscall_stack_top stays 0 from BSS init; first
-    // gdt.setTssRsp0 call (context switch into a user task) writes it
-    // through the kdata unlock window.
 }
 
 fn initPerCpuGdt(cpu: *CpuLocal) void {
@@ -603,8 +653,20 @@ fn initPerCpuGdt(cpu: *CpuLocal) void {
     cpu.gdt_entries[3] = bsp_entries[3]; // user code
     cpu.gdt_entries[4] = bsp_entries[4]; // user data
 
-    // Set up TSS with our ISR stack
+    // Set up TSS with our ISR stack. RSP0 is the legacy slot used by IDT
+    // gates with IST=0 on user→kernel transitions. setTssRsp0 overrides
+    // this per-process to point at the dispatched task's kstack_top, so
+    // this initial value matters only for the brief window before the
+    // first process is dispatched.
     cpu.tss.rsp0 = @intFromPtr(&cpu.isr_stack) + cpu.isr_stack.len;
+    // IST1 = dedicated per-CPU stack for IRQs marked with ist=1 (currently
+    // IRQ0 + dynamic IRQs — see idt.init). The CPU loads RSP from here on
+    // every entry to those vectors regardless of CPL, so the IRQ handler
+    // chain (handleIRQ0 → schedule → ...) NEVER runs on the preempted
+    // task's kstack. Fixes the netstat-desktop saved-kesp+48 corruption
+    // class. Re-uses the isr_stack buffer (which is otherwise unused after
+    // setTssRsp0 takes over rsp0 management).
+    cpu.tss.ist1 = @intFromPtr(&cpu.isr_stack) + cpu.isr_stack.len;
 
     // Build TSS descriptor pointing to our TSS
     const tss_base: u64 = @intFromPtr(&cpu.tss);
@@ -790,6 +852,11 @@ pub fn apProcessLoadQueue() void {
 
     // Signal BSP that disk I/O is done — BSP will create the process
     @atomicStore(LoadState, &load_req.state, .loaded, .release);
+    // Wake the event-driven compositor so its pollAppLoad() runs
+    // promptly. Without this the desktop sleeps until an unrelated
+    // event (input, animation) brings it back, and the new window
+    // appears delayed by up to the next wakeup.
+    @import("../ui/desktop/wake.zig").requestWake();
 }
 
 // External symbols from ap_trampoline.asm

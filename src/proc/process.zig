@@ -11,6 +11,7 @@ const memmap = @import("../mm/memmap.zig");
 const config = @import("../config.zig");
 const signals = @import("signals.zig");
 const runqueue = @import("runqueue.zig");
+const SpinLock = @import("spinlock.zig").SpinLock;
 const std = @import("std");
 
 pub const MAX_PROCS = config.MAX_PROCS;
@@ -43,6 +44,36 @@ const INIT_CWD: [256]u8 = blk: {
 // entries). Pool slot i ↔ procs[i].
 pub var kstack_pool: [MAX_PROCS][KSTACK_SLOT_SIZE]u8 align(4096) =
     [_][KSTACK_SLOT_SIZE]u8{[_]u8{0} ** KSTACK_SLOT_SIZE} ** MAX_PROCS;
+
+/// Per-task scratch slot for held-across-yield I/O buffers (one disk
+/// block = 4KB). Replaces `var X: [4096]u8 align(N) = undefined` patterns
+/// in fs/* and elsewhere that were:
+///   (a) eating ~4KB of kstack frame per call (close to KSTACK overflow
+///       on deep paths), and
+///   (b) being initialized to 0xAA by Zig ReleaseSafe undefined-fill,
+///       tripping our deep-kstack watchpoint with false positives.
+///
+/// Per-task (not per-CPU) so callers can safely hold the buffer across
+/// blocking I/O — preemption is a non-issue because each task owns its
+/// own slot. Limited to ONE outstanding borrow per task; deep nesting
+/// inside ext2/fat32 path-walks needs caller-passed buffers.
+///
+/// Cost: 4KB × MAX_PROCS = 128KB BSS at MAX_PROCS=32. Trivial.
+pub var io_scratch_pool: [MAX_PROCS][4096]u8 align(4096) =
+    [_][4096]u8{[_]u8{0} ** 4096} ** MAX_PROCS;
+
+/// Boot-time fallback. Returned by currentIoScratch when no current_pid
+/// is set (e.g. fs init runs from kmain before SMP/pid bring-up). Boot
+/// is single-threaded at this point so no concurrency exposure.
+var boot_io_scratch: [4096]u8 align(4096) = [_]u8{0} ** 4096;
+
+/// Return the current task's I/O scratch slot, or a boot-time fallback
+/// when no current_pid is set (early kmain fs init). Callers MUST NOT
+/// nest borrows on the same task — see io_scratch_pool docs.
+pub fn currentIoScratch() *[4096]u8 {
+    if (smp.myCpu().current_pid) |pid| return &io_scratch_pool[pid];
+    return &boot_io_scratch;
+}
 
 pub const State = enum(u8) {
     unused, // slot is free and may be claimed by process.create
@@ -85,6 +116,9 @@ pub const WaitKind = enum(u8) {
     pipe_read, // wait_target = pipe id
     pipe_write, // wait_target = pipe id
     futex, // wait_target = page-aligned user VA of the futex word
+    gpu_io, // wait_target = ignored; virtio-gpu IRQ wakes all .gpu_io waiters (only one exists at a time, ctrl_lock-serialized)
+    mutex, // wait_target = low-32 of &Mutex.owner_pid; Mutex.release walks procs and wakes matching waiters
+    nvme_io, // wait_target = (ctrl_idx << 16) | cid — NVMe MSI-X handler reaps CQ + wakes by exact (ctrl,cid) match
 };
 
 pub const FileDesc = struct {
@@ -247,13 +281,12 @@ pub const PCB = struct {
     // Userspace tid pointer — when this thread exits, futex-wake any
     // thread joining on this address. 0 = no join address.
     clear_child_tid: u32 = 0,
-    // Per-thread snapshot of `per_cpu_asm[cpu].user_rsp_save`. The
-    // syscall entry stub stashes the user RSP into the per-CPU slot;
-    // if this thread is preempted mid-syscall and another thread on
-    // the same CPU enters its own syscall, the per-CPU slot is
-    // overwritten. Schedule saves the slot here on switch-out and
-    // restores from here on switch-in so each thread's sysret pops
-    // the right user RSP.
+    // Per-thread snapshot of `per_cpu_user_rsp[cpu]`. The syscall entry
+    // stub stashes the user RSP into the per-CPU slot; if this thread is
+    // preempted mid-syscall and another thread on the same CPU enters its
+    // own syscall, the per-CPU slot is overwritten. Schedule saves the
+    // slot here on switch-out and restores from here on switch-in so each
+    // thread's sysret pops the right user RSP.
     user_rsp_save: u64 = 0,
 
     // PCID for this address space (CR4.PCIDE). 0 = no tagging (kernel
@@ -350,7 +383,44 @@ pub const PCB = struct {
     /// Tick at which this PCB entered its first non-unused state.
     /// `tick_count - acct_start_tick` = process uptime in ticks.
     acct_start_tick: u64 = 0,
+
+    // --- Diagnostic syscall ring ---------------------------------------
+    // 8-entry circular buffer of the most recent syscall numbers (high
+    // bit set on the entry written *most recently* — used as the head
+    // marker so dump order is unambiguous without a separate index).
+    // Cost: 16 bytes per PCB. Dumped on panic / watchdog wedge /
+    // sysExitStatus to answer "what was this PID doing when it died /
+    // hung?" — a class of question the existing acct_syscall_count
+    // total can't answer because it's just a counter.
+    syscall_ring: [8]u16 = [_]u16{0} ** 8,
+    syscall_ring_head: u8 = 0,
 };
+
+pub const SYSCALL_RING_LEN: u8 = 8;
+
+/// Record `sys_num` into this PCB's ring. Called from the syscall
+/// dispatch entry point (after PID resolution). Cheap — single store +
+/// modular increment; safe to call with IRQs enabled because the PCB
+/// is touched only by its assigned CPU.
+pub fn recordSyscall(pcb: *PCB, sys_num: u16) void {
+    pcb.syscall_ring[pcb.syscall_ring_head] = sys_num;
+    pcb.syscall_ring_head = (pcb.syscall_ring_head + 1) % SYSCALL_RING_LEN;
+}
+
+/// Print this PCB's recent syscall ring, newest first.
+pub fn dumpSyscallRing(pid: u8) void {
+    if (pid >= MAX_PROCS) return;
+    const pcb = &procs[pid];
+    debug.klog("[syscall-ring pid={d}] last {d} (newest first):", .{ pid, SYSCALL_RING_LEN });
+    var i: u8 = 0;
+    while (i < SYSCALL_RING_LEN) : (i += 1) {
+        const idx = (pcb.syscall_ring_head + SYSCALL_RING_LEN - 1 - i) % SYSCALL_RING_LEN;
+        const num = pcb.syscall_ring[idx];
+        if (num == 0 and i > 0) break;
+        debug.klog(" #{d}", .{num});
+    }
+    debug.klog("\n", .{});
+}
 
 /// Read-through helper: returns the lead thread's PCB for fields that
 /// are conceptually per-process. Single-threaded processes have
@@ -445,8 +515,8 @@ pub fn initKstackGuards() void {
 /// HIGH edge of one of kstack_pool's slots, or matches the recorded top of
 /// some heap-allocated kstack (kernel tasks like desktop with non-default
 /// sizes — see createKernelTask). Used by gdt.setTssRsp0 to catch a
-/// corrupted PCB.kernel_stack_top BEFORE it leaks into TSS.RSP0 and
-/// per_cpu_asm.syscall_stack_top.
+/// corrupted PCB.kernel_stack_top BEFORE it leaks into TSS.RSP0 (which
+/// both the IDT-gate AND the syscall-entry path read).
 pub fn isValidKstackTopShape(top: usize) bool {
     const base = @intFromPtr(&kstack_pool[0]);
     const end = base + MAX_PROCS * KSTACK_SLOT_SIZE;
@@ -671,6 +741,19 @@ pub fn migrate(pid: u8, new_cpu: u8) bool {
     const state_byte = @atomicLoad(u8, @as(*const u8, @ptrCast(&pcb.state)), .acquire);
     if (state_byte == @intFromEnum(State.unused) or
         state_byte == @intFromEnum(State.zombie)) return false;
+
+    // Cross-CPU dispatch race fix (task #713). Refuse migration if any CPU
+    // still has `pid` as `current_pid` — that CPU may be mid-schedule,
+    // having demoted prev to .ready (visible to us NOW), but not yet
+    // updated prev's kernel_esp via switchTo's save. Picking prev up here
+    // and dispatching elsewhere would resume from a stale kernel_esp →
+    // stack corruption. Caller (loadBalance) retries next tick.
+    for (0..smp.MAX_CPUS) |i| {
+        if (i > 0 and !smp.cpus[i].alive) continue;
+        if (smp.cpus[i].current_pid) |cur| {
+            if (cur == pid) return false;
+        }
+    }
 
     const old_rq = &smp.cpus[old_cpu].runqueue;
     const new_rq = &smp.cpus[new_cpu].runqueue;
@@ -916,6 +999,9 @@ fn rqEnter(pid: usize, from_sleep: bool) void {
 
     rqQueueFor(rq, pcb.priority).pushBack(pid_u8);
     rq.nr_runnable +%= 1;
+    @import("../debug/pid_act.zig").record(
+        pid, .rq_enter, @intFromEnum(pcb.priority), 0xFF, @returnAddress(),
+    );
 }
 
 /// Remove a pid from its assigned CPU's runqueue. Idempotent — if the
@@ -939,9 +1025,23 @@ fn rqLeave(pid: usize) void {
     const f = rq.lock.acquireIrqSave();
     defer rq.lock.releaseIrqRestore(f);
     const pid_u8: u8 = @intCast(pid);
-    if (rq.interactive.remove(pid_u8)) { rq.nr_runnable -%= 1; return; }
-    if (rq.normal.remove(pid_u8))      { rq.nr_runnable -%= 1; return; }
-    if (rq.background.remove(pid_u8))  { rq.nr_runnable -%= 1; return; }
+    const ra = @returnAddress();
+    const pid_act = @import("../debug/pid_act.zig");
+    if (rq.interactive.remove(pid_u8)) {
+        rq.nr_runnable -%= 1;
+        pid_act.record(pid, .rq_leave, @intFromEnum(Priority.interactive), 0xFF, ra);
+        return;
+    }
+    if (rq.normal.remove(pid_u8)) {
+        rq.nr_runnable -%= 1;
+        pid_act.record(pid, .rq_leave, @intFromEnum(Priority.normal), 0xFF, ra);
+        return;
+    }
+    if (rq.background.remove(pid_u8)) {
+        rq.nr_runnable -%= 1;
+        pid_act.record(pid, .rq_leave, @intFromEnum(Priority.background), 0xFF, ra);
+        return;
+    }
 }
 
 /// Centralized state setter. ALL non-CAS state writes go through here so
@@ -955,8 +1055,37 @@ fn rqLeave(pid: usize) void {
 /// Phase 6: after rqEnter, fire a preempt IPI to the assigned CPU when
 /// appropriate (target is idle or running a lower-priority task). Keeps
 /// IPC wake latency at ~μs instead of waiting up to a 10 ms timer tick.
+/// Per-pid bracket counter for the rq audit. Incremented at the top of
+/// setState (BEFORE the state CAS); decremented at the bottom (AFTER the
+/// rq op). Audit skips pids whose counter is non-zero, structurally
+/// eliminating the "CAS landed but rqEnter hasn't" transient FP. Counter
+/// (not bool) because the same pid can hit setState concurrently from
+/// multiple CPUs — the CAS loop reconciles state, but each caller's
+/// bracket must independently increment/decrement.
+pub var setstate_in_flight: [MAX_PROCS]u8 = [_]u8{0} ** MAX_PROCS;
+
+/// Per-pid setState serializing lock. Held across the CAS + rq op so a
+/// concurrent setState on the SAME pid (e.g., cpu1's nvme IRQ wake doing
+/// .sleeping→.ready while cpu0's preempt does .running→.ready) cannot
+/// interleave the state byte write with the rq insert/remove. Without
+/// this, a wake's `CAS .sleeping→.ready then rqEnter` could overlap with
+/// a picker's `CAS .ready→.running then rqLeave`: picker's rqLeave finds
+/// pid not yet in rq (no-op), wake's rqEnter then inserts pid AFTER
+/// picker already dispatched it — pid ends up .running AND in rq. On the
+/// next .running→.sleeping transition, was_ready=false skips rqLeave and
+/// pid stays in rq as .sleeping forever; picker keeps fishing it out,
+/// transitioning .sleeping→.running via CAS, dispatching, blockOn-yields
+/// immediately — tight schedule-park loop, system wedges.
+/// Caught 2026-05-19: audit reported `pid=2 state=3 in_rq=true want=false`
+/// right before all four pids stalled on (.nvme_io, target=0x10000).
+var setstate_locks: [MAX_PROCS]SpinLock = [_]SpinLock{.{}} ** MAX_PROCS;
+
 pub fn setState(pid: usize, new_state: State) void {
     if (pid >= MAX_PROCS) return;
+    const lock_flags = setstate_locks[pid].acquireIrqSave();
+    defer setstate_locks[pid].releaseIrqRestore(lock_flags);
+    _ = @atomicRmw(u8, &setstate_in_flight[pid], .Add, 1, .acquire);
+    defer _ = @atomicRmw(u8, &setstate_in_flight[pid], .Sub, 1, .release);
     const pcb = &procs[pid];
     const state_ptr: *u8 = @as(*u8, @ptrCast(&pcb.state));
 
@@ -984,6 +1113,12 @@ pub fn setState(pid: usize, new_state: State) void {
         old_byte = cas.?;        // someone else changed state — retry with their value
     }
     const old_state: State = @enumFromInt(old_byte);
+    // Per-PID activity ring stamp. Logged AFTER the CAS succeeded so the
+    // ring entry corresponds to a real transition (no-op early-returns
+    // above leave no trace, by design).
+    @import("../debug/pid_act.zig").record(
+        pid, .setstate, old_byte, new_byte, @returnAddress(),
+    );
     const was_ready = (old_state == .ready);
     const is_ready = (new_state == .ready);
     // Only .sleeping→.ready gets the CFS sleeper bonus. Demote
@@ -1121,17 +1256,22 @@ fn rqOnLeaveReady(pid: usize) void {
     rqLeave(pid);
 }
 
-/// Cheap per-tick audit. Sums `nr_runnable` across all alive CPUs and
-/// compares to the count of state==.ready PCBs in procs[]. Mismatch
-/// means a setState bypass somewhere; the slower walk in `rqAuditFull`
-/// (only called on mismatch) names the offending pid.
-///
-/// Phase 1 calls this from schedule() at low cadence (every ~64th call)
-/// — frequent enough to catch drift fast, rare enough to stay off the
-/// hot path. After Phase 2 cuts dispatch over to the rq, the audit
-/// becomes load-bearing and the cadence tightens.
+/// Per-tick audit. Two checks:
+///   (1) Per-CPU rq internal consistency: `totalCount == nr_runnable`.
+///       Both fields update under the rq.lock so no FP class applies; any
+///       mismatch is a real bookkeeping bug.
+///   (2) Per-pid cross-check: state==.ready ⟺ pid is in its assigned_cpu's
+///       rq. This one is FP-prone — setState's state CAS happens BEFORE
+///       rqEnter (deliberate ordering documented at setState — chosen to
+///       avoid the *reverse* "in rq but not .ready" class). The per-pid
+///       `setstate_in_flight[pid]` bracket counter is set BEFORE the CAS
+///       and cleared AFTER the rq op; the cross-check skips bracketed
+///       pids, structurally eliminating the FP. (Caught 2026-05-19 once
+///       the pcb-invariant FP was suppressed and the rq drift became
+///       visible — earlier "retry across N samples" approach reported
+///       persistent drift but couldn't distinguish a real bug from a
+///       slow-window transient.)
 pub fn rqAudit() void {
-    var rq_total: u32 = 0;
     var i: usize = 0;
     while (i < smp.MAX_CPUS) : (i += 1) {
         if (!smp.cpus[i].alive) continue;
@@ -1142,37 +1282,34 @@ pub fn rqAudit() void {
             rqAuditFull();
             return;
         }
-        rq_total +%= rq_count;
     }
-    var ready_total: u32 = 0;
-    var p: usize = 0;
-    while (p < MAX_PROCS) : (p += 1) {
-        if (procs[p].is_idle) continue;
-        const s = @atomicLoad(u8, @as(*const u8, @ptrCast(&procs[p].state)), .acquire);
-        if (s == @intFromEnum(State.ready)) ready_total +%= 1;
-    }
-    if (rq_total != ready_total) {
-        debug.klog("[rq-audit] rq_total={d} != ready_total={d} (drift)\n", .{ rq_total, ready_total });
-        rqAuditFull();
-    }
+    rqAuditFull();
 }
 
-/// Slow walk that names the drifting pid(s). Called on audit mismatch.
+/// Slow walk that names the drifting pid(s). Skips any pid whose
+/// `setstate_in_flight` counter is non-zero — that pid is mid-setState
+/// on another CPU and the state-byte ↔ rq-membership cross-check would
+/// fire spuriously inside the CAS-to-rqEnter window. The bracket is set
+/// at the top of setState and cleared at the bottom; on no-CPU-in-flight
+/// the cross-check is structurally consistent.
 fn rqAuditFull() void {
     var p: usize = 0;
     while (p < MAX_PROCS) : (p += 1) {
         if (procs[p].is_idle) continue;
+        if (@atomicLoad(u8, &setstate_in_flight[p], .acquire) > 0) continue;
         const s = @atomicLoad(u8, @as(*const u8, @ptrCast(&procs[p].state)), .acquire);
         const want_in_rq = (s == @intFromEnum(State.ready));
         const cpu_idx = procs[p].assigned_cpu;
         const in_rq = if (cpu_idx == 0xFF or cpu_idx >= smp.MAX_CPUS) false else
             smp.cpus[cpu_idx].runqueue.contains(@intCast(p));
-        if (want_in_rq != in_rq) {
-            debug.klog(
-                "[rq-audit] pid={d} state={d} assigned_cpu={d} in_rq={any} want={any}\n",
-                .{ p, s, cpu_idx, in_rq, want_in_rq },
-            );
-        }
+        if (want_in_rq == in_rq) continue;
+        // Re-check bracket after the in_rq load: a setState may have started
+        // between our skip-check and the in_rq read. If now in-flight, skip.
+        if (@atomicLoad(u8, &setstate_in_flight[p], .acquire) > 0) continue;
+        debug.klog(
+            "[rq-audit] pid={d} state={d} assigned_cpu={d} in_rq={any} want={any}\n",
+            .{ p, s, cpu_idx, in_rq, want_in_rq },
+        );
     }
 }
 
@@ -1226,6 +1363,15 @@ fn resetPcbExceptState(pcb: *PCB) void {
     // PCB lifecycle, right after allocSlot. Other accounting counters
     // start at 0 by design.
     pcb.acct_start_tick = tick_count;
+    // Clear save_trace's "has been preempted" flag so a re-used PID slot
+    // starts as "not yet saved" — the new task won't have a valid
+    // *(kesp+48) until switchTo runs at least once.
+    const pid = (@intFromPtr(pcb) - @intFromPtr(&procs[0])) / @sizeOf(PCB);
+    if (pid < MAX_PROCS) {
+        @import("../debug/save_trace.zig").resetPid(@intCast(pid));
+        @import("../debug/pid_act.zig").resetPid(pid);
+        @import("../debug/yield_loop.zig").resetPid(pid);
+    }
 }
 
 /// Create a process with a fake interrupt frame on its kernel stack.
@@ -1563,7 +1709,7 @@ pub fn getStateRaw(pid: usize) u8 {
 pub fn setCurrent(pid: usize) void {
     assignInitialCpu(pid);
     setState(pid, .running);
-    smp.myCpu().current_pid = pid;
+    @import("../debug/pid_trace.zig").setCurrentPid(smp.myCpu(), pid);
 }
 
 /// Per-CPU kernel-mode idle task (task #235). Runs CS=0x08, no user space,
@@ -1766,7 +1912,7 @@ pub fn enterFirstTask(desktop_entry: usize) noreturn {
     // and the schedule machinery expect cpu.current_pid to track reality.
     // setState (.ready→.running) also rqLeave's the desktop pid so it
     // doesn't sit on the rq while it's actively dispatched.
-    cpu.current_pid = desktop_pid;
+    @import("../debug/pid_trace.zig").setCurrentPid(cpu, desktop_pid);
     setState(desktop_pid, .running);
     procs[desktop_pid].last_cpu = 0;
     gdt.setTssRsp0(desktop_pid, procs[desktop_pid].kernel_stack_top);
@@ -1791,7 +1937,7 @@ pub fn enterFirstTaskAp(ap_idle_pid: usize) noreturn {
     asm volatile ("cli");
 
     const cpu = smp.myCpu();
-    cpu.current_pid = ap_idle_pid;
+    @import("../debug/pid_trace.zig").setCurrentPid(cpu, ap_idle_pid);
     // Idle PCB — rqLeave is a no-op (idles never enter the rq), but route
     // through setState anyway for path uniformity.
     setState(ap_idle_pid, .running);
@@ -2081,6 +2227,14 @@ pub fn schedule() void {
     // still count toward "this cpu reached schedule()".
     smp.myCpu().schedule_count +%= 1;
 
+    // Breadcrumb: schedule_enter, ctx = caller's current_pid (whichever
+    // task is about to be replaced). Picked here rather than later so we
+    // capture even early-bail paths.
+    {
+        const cur_now: u64 = if (smp.myCpu().current_pid) |p| @intCast(p) else 0xFF;
+        @import("../debug/breadcrumb.zig").stamp(.schedule_enter, cur_now);
+    }
+
     // Phase 1 rq audit (drift detector). Run every 64th schedule call so
     // it stays off the hot path — the audit itself is cheap (sum of
     // nr_runnable across CPUs vs count of .ready PCBs) but the kdbg log
@@ -2153,9 +2307,20 @@ pub fn schedule() void {
     //
     // CFS: setState's .running→non-running path flushes vruntime via
     // accountRunningTick — schedule doesn't need to do it directly.
+    //
+    // Transient-window bracket: between setState(.ready) and switchTo's
+    // save below, prev.state==.ready but prev.kernel_esp is still STALE
+    // (from the previous save) and prev is busily writing to its kstack
+    // (often AAAA from Zig undefined-init). pcb_invariants and
+    // kstack_protect.tickMonitor read this field on every cpu and skip
+    // the saved-RIP check for any pid that matches — without it they
+    // false-fire on the transient stack residue (caught 2026-05-19).
+    // Cleared inside save_trace_record once switchTo's `movq %rsp,(%rdi)`
+    // lands.
     var demoted_running_to_ready = false;
     if (cpu.current_pid) |cur| {
         if (procs[cur].state == .running) {
+            cpu.scheduling_out_pid = @intCast(cur);
             setState(cur, .ready);
             demoted_running_to_ready = true;
             @import("../debug/kdbg.zig").schedEvent(.preempt, @intCast(cur), @intFromEnum(State.running), @intFromEnum(State.ready), 0);
@@ -2184,26 +2349,52 @@ pub fn schedule() void {
             // Idle never enters the rq, so rqOnLeaveReady is a no-op,
             // but route through setState for path uniformity (and so a
             // future Phase 2 idle-in-rq variant just works).
+            // Same dispatching_in_pid bracket as the CAS-success branch
+            // below — even for idle, setState(.running) precedes the
+            // setCurrentPid in the caller, so the running-but-no-owner
+            // window exists.
+            cpu.dispatching_in_pid = @intCast(cand);
             setState(cand, .running);
             @import("../debug/kdbg.zig").schedEvent(.dispatch, @intCast(cand), ready_val, running_val, 0);
             break :blk cand;
         }
+        // Per-pid setState lock: serialize this direct CAS+rqLeave with
+        // any concurrent setState on cand (e.g., a cross-CPU wake doing
+        // .sleeping→.ready+rqEnter). Without it, picker's rqLeave can
+        // run BEFORE wake's rqEnter (no entry to remove → no-op),
+        // wake's rqEnter then inserts cand AFTER we already dispatched
+        // it — cand ends up .running AND in rq, and any subsequent
+        // .running→.sleeping skips rqLeave (was_ready=false), pinning
+        // cand in rq as .sleeping forever. Caught 2026-05-19 by audit.
+        const ss_flags = setstate_locks[cand].acquireIrqSave();
         const prev = @cmpxchgStrong(u8, state_ptr, ready_val, running_val, .seq_cst, .seq_cst);
         if (prev == null) {
             // CAS atomically claimed cand — sync the rq view (cand was
             // .ready, now .running, so it must leave its assigned_cpu's
-            // rq). Brief window where state==.running but cand may still
-            // be in the rq; an audit observing this would log but not
-            // crash. Phase 2 will swap pickNext to read from the rq, at
-            // which point this ordering becomes load-bearing.
+            // rq). Holding setstate_locks[cand] across CAS + rqLeave
+            // closes the dispatch / wake race documented above.
+            // dispatching_in_pid bracket: state is now .running but
+            // cpu.current_pid is still pointing at the previous task.
+            // Cross-CPU pcb_invariants scans would see "running but no
+            // owner". Claim the bracket here; setCurrentPid clears it
+            // once cpu.current_pid is updated.
+            cpu.dispatching_in_pid = @intCast(cand);
+            // Per-PID activity ring: this is the OTHER state-byte writer
+            // (not via setState). Without this stamp, the autopsy ring
+            // would show ready→running mysteriously without a SETSTATE.
+            @import("../debug/pid_act.zig").record(
+                cand, .pick_cas, 0xFF, 0xFF, @returnAddress(),
+            );
             rqOnLeaveReady(cand);
             // CFS: stamp slice_start so the next checkPreempt / schedule
             // measures only this run-slice. Sets even for idle path
             // above (skipped) — but accountRunningTick guards on is_idle.
             procs[cand].slice_start_tick = tick_count;
             @import("../debug/kdbg.zig").schedEvent(.dispatch, @intCast(cand), ready_val, running_val, 0);
+            setstate_locks[cand].releaseIrqRestore(ss_flags);
             break :blk cand;
         }
+        setstate_locks[cand].releaseIrqRestore(ss_flags);
         // CAS failed — another CPU got it first. Try again.
     };
 
@@ -2218,12 +2409,22 @@ pub fn schedule() void {
                     // cur (it was rqEnter'd by the demote's setState).
                     setState(cur, .running);
                 }
+                // Clear the transient bracket — no switchTo will run so
+                // save_trace_record won't fire, leaving the field stale
+                // would suppress real pcb-invariant hits on cur until the
+                // NEXT schedule call.
+                cpu.scheduling_out_pid = 0xFFFF;
                 cpu.sched_lock.releaseIrqRestore(flags);
                 return;
             }
         }
 
         // -------- Switch to a user task --------
+        // Belt-and-suspenders: if the incoming task is in PROTECTED_PIDS
+        // and a destroy-window happened to mark its kstack RO, unprotect
+        // it before switchTo writes any saved-state into the kstack.
+        // Idempotent (no shootdown issued if no PTE actually changed).
+        @import("../debug/kstack_protect.zig").unprotectPidIfProtected(next);
         // KCSAN-lite: just before we use procs[next].kernel_esp, watch
         // it for ~µs. If another CPU writes during this window, the race
         // is in switchTo's rsp-save vs another CPU's dispatch path.
@@ -2264,6 +2465,141 @@ pub fn schedule() void {
         // prev_save was determined at the top of schedule() — it's the
         // `?*u64` slot switchTo writes into, or null to skip the save.
         const next_kesp = procs[next].kernel_esp;
+
+        // Pre-dispatch saved-RIP guard. switchTo's `ret` will pop the
+        // qword at [next_kesp + 48] (after 6 callee-save pops) as the
+        // resume RIP. If it's 0, the dispatch lands at RIP=0 → faults
+        // on instruction-fetch with no useful backtrace. Catch it here
+        // with full diagnostics instead. Repro: `netstat` from shell
+        // (2026-05-17) leads to desktop's saved-RIP slot being 0
+        // post-pid-3-teardown.
+        //
+        // Skip the check if next_kesp + 48 isn't in the task's own
+        // kstack range — defensive: a wild next_kesp would itself be
+        // caught by the kesp watchdog (DR0-DR3), and reading random
+        // memory here could itself fault.
+        {
+            const kstop = procs[next].kernel_stack_top;
+            const rip_slot = next_kesp +% 48;
+            if (rip_slot + 8 <= kstop and rip_slot >= kstop -% (4 * @import("../config.zig").KSTACK_SIZE)) {
+                const saved_rip = @as(*const u64, @ptrFromInt(rip_slot)).*;
+                // Plausibility: saved RIP from switchTo's ret must be in
+                // kernel .text — either inside the image proper, OR the
+                // retToUserStub address used for first-dispatch of new
+                // tasks. Anything else (0, user VA, garbage) means kesp is
+                // pointing at corrupt/stale data and we'd crash post-ret.
+                const k_lo = memmap.KERNEL_VIRT_BASE;
+                const k_hi = memmap.kernelEnd();
+                const rip_in_text = saved_rip >= k_lo and saved_rip < k_hi;
+                if (!rip_in_text) {
+                    const cause: []const u8 = if (saved_rip == 0) "RIP=0" else "RIP outside kernel .text";
+                    debug.klog("[sched-rip-guard] about to dispatch pid={d} ({s}) with wild saved RIP=0x{X:0>16} ({s})\n", .{
+                        next, procs[next].name[0..procs[next].name_len], saved_rip, cause,
+                    });
+                    debug.klog("[sched-rip-guard]   kernel_esp     = 0x{X:0>16}\n", .{next_kesp});
+                    debug.klog("[sched-rip-guard]   kstack_top     = 0x{X:0>16}\n", .{kstop});
+                    debug.klog("[sched-rip-guard]   expected_top   = 0x{X:0>16}\n", .{
+                        @atomicLoad(usize, &expected_kstack_tops[next], .acquire),
+                    });
+                    debug.klog("[sched-rip-guard]   state          = {s}\n", .{@tagName(procs[next].state)});
+                    const cur_pid: i32 = if (cpu.current_pid) |c| @intCast(c) else -1;
+                    debug.klog("[sched-rip-guard]   from_pid       = {d}\n", .{cur_pid});
+                    // Per-pid save mirror diagnostic (wild-RIP=0 hunt 2026-05-17):
+                    // compare PCB.kernel_esp to what switchTo last saved, and the
+                    // current memory at kesp+48 to what was saved there. Reveals
+                    // whether the bug is "kesp value changed" or "kesp+48
+                    // memory got overwritten after save".
+                    const st = @import("../debug/save_trace.zig");
+                    const saved_kesp = st.last_save_kesp[next];
+                    const saved_plus48_then = st.last_save_plus48[next];
+                    const saved_tsc = st.last_save_tsc[next];
+                    const now_tsc: u64 = asm volatile (
+                        "rdtsc\n\tshlq $32, %%rdx\n\torq %%rdx, %%rax"
+                        : [r] "={rax}" (-> u64),
+                        :: .{ .rdx = true });
+                    debug.klog("[sched-rip-guard]   ---- save-mirror diagnostic ----\n", .{});
+                    debug.klog("[sched-rip-guard]   last_save kesp    = 0x{X:0>16}\n", .{saved_kesp});
+                    debug.klog("[sched-rip-guard]   last_save +48     = 0x{X:0>16}\n", .{saved_plus48_then});
+                    debug.klog("[sched-rip-guard]   last_save tsc     = 0x{X:0>12}  (now=0x{X:0>12}, delta={d} cycles)\n", .{
+                        saved_tsc, now_tsc, now_tsc -% saved_tsc,
+                    });
+                    if (saved_kesp != next_kesp) {
+                        debug.klog("[sched-rip-guard]   *** PCB.kernel_esp DIFFERS from last save (changed by non-switchTo writer) ***\n", .{});
+                    } else if (saved_plus48_then != saved_rip) {
+                        debug.klog("[sched-rip-guard]   *** kesp+48 OVERWRITTEN since save: was=0x{X:0>16} now=0x{X:0>16} ***\n", .{
+                            saved_plus48_then, saved_rip,
+                        });
+                    } else {
+                        debug.klog("[sched-rip-guard]   *** save mirror MATCHES current — bug was present AT save time ***\n", .{});
+                    }
+                    debug.klog("[sched-rip-guard]   --------------------------------\n", .{});
+                    // Dump 16 qwords at kernel_esp to see what the
+                    // restore frame actually contains.
+                    var i: usize = 0;
+                    while (i < 16) : (i += 1) {
+                        const a = next_kesp +% (i * 8);
+                        if (a + 8 > kstop) break;
+                        const v = @as(*const u64, @ptrFromInt(a)).*;
+                        debug.klog("[sched-rip-guard]   +0x{X:0>2}: 0x{X:0>16}\n", .{ i * 8, v });
+                    }
+                    // Scan the full kstack body to tell "task never ran"
+                    // (all zero) vs "task ran but kesp now points at unused
+                    // zeros" (top region has data, bottom is zero).
+                    const ktop_qwords: usize = (kstop - (kstop -% (4 * @import("../config.zig").KSTACK_SIZE))) / 8;
+                    var nonzero_count: usize = 0;
+                    var first_nonzero_off: usize = 0xFFFFFFFFFFFFFFFF;
+                    var last_nonzero_off: usize = 0;
+                    var q: usize = 0;
+                    const scan_qwords: usize = if (ktop_qwords < 8192) ktop_qwords else 8192;
+                    while (q < scan_qwords) : (q += 1) {
+                        const a = kstop -% (8 * (q + 1));
+                        const v = @as(*const u64, @ptrFromInt(a)).*;
+                        if (v != 0) {
+                            nonzero_count += 1;
+                            const off = kstop - a;
+                            if (off < first_nonzero_off) first_nonzero_off = off;
+                            if (off > last_nonzero_off) last_nonzero_off = off;
+                        }
+                    }
+                    debug.klog("[sched-rip-guard]   kstack scan: nonzero={d}/{d} qwords  first_nz_off=0x{X}  last_nz_off=0x{X}\n", .{
+                        nonzero_count, scan_qwords, first_nonzero_off, last_nonzero_off,
+                    });
+                    // Dump 8 qwords near the top of kstack — the area a
+                    // freshly-created task would have written to (sw_base
+                    // entry, iretq frame).
+                    debug.klog("[sched-rip-guard]   top-region dump (kstack_top-256 .. kstack_top):\n", .{});
+                    var j: usize = 0;
+                    while (j < 32) : (j += 1) {
+                        const a = kstop -% (8 * (32 - j));
+                        const v = @as(*const u64, @ptrFromInt(a)).*;
+                        if (v != 0) {
+                            debug.klog("[sched-rip-guard]     -0x{X:0>3}: 0x{X:0>16}\n", .{ (32 - j) * 8, v });
+                        }
+                    }
+                    @import("../debug/kdbg.zig").nmi_halt_after_snapshot = true;
+                    // Save-trace dump — shows the recent kesp saves that
+                    // led to this dispatch. The bad save is typically
+                    // a few entries back on `from_pid`'s CPU with a
+                    // BAD-RIP verdict. Dump BEFORE @panic so we get it
+                    // even if the panic path itself hiccups.
+                    @import("../debug/save_trace.zig").dumpAll();
+                    // Revert the pickNext .ready→.running CAS so the PCB
+                    // invariant scanner (which checks state==.running ⟺
+                    // some cpu owns it) doesn't false-positive on the
+                    // mid-dispatch state. We're panicking, so leaving it
+                    // .ready is harmless — nothing will dispatch.
+                    @atomicStore(u8, @as(*u8, @ptrCast(&procs[next].state)),
+                        @intFromEnum(State.ready), .release);
+                    // Release sched_lock BEFORE panicking. Otherwise the
+                    // panic-handler's autopsy walks (load balancer state,
+                    // rq dumps) re-acquire and self-deadlock on the same
+                    // CPU. Stale state in the running task is fine — we're
+                    // panicking, not resuming.
+                    cpu.sched_lock.release();
+                    @panic("dispatch with wild saved RIP (not in kernel .text)");
+                }
+            }
+        }
         // Phase 3 retired the pre-load `next_kesp ∈ next's kstack range`
         // panic block. It defended cross-stack aliasing — a class that
         // required two CPUs to dispatch the same pid in different schedules
@@ -2273,7 +2609,7 @@ pub fn schedule() void {
         // wrt itself) schedule call. KASAN/iretq_canary/stack_alias
         // tripwires still catch wild writes from anywhere else.
         const from_pid_a: u8 = if (cpu.current_pid) |c| @intCast(c) else 0xFE; // 0xFE = dying task
-        cpu.current_pid = next;
+        @import("../debug/pid_trace.zig").setCurrentPid(cpu, next);
 
         // Race fix (B.3 caught this): release the lock WITHOUT restoring IRQ
         // state. We must keep IRQs masked across switchToCall — otherwise an
@@ -2286,6 +2622,15 @@ pub fn schedule() void {
         // own kernel stack, which is preserved across the switch.
         cpu.sched_lock.release();
         @import("../debug/kdbg.zig").schedEvent(.switch_in, from_pid_a, 0, 0, @intCast(next));
+        // Breadcrumb: stamp the actual switch — ctx = next_kesp's low 48b
+        // so the autopsy shows which kstack address we're about to load.
+        @import("../debug/breadcrumb.zig").stamp(.switch_to, next_kesp);
+        // hwbp disarm: pid 2/3's kesp+48 is watched while parked
+        // (armed by save_trace_record with skip_value = legit RA).
+        // Disarm before dispatch — first callq after switchTo's retq
+        // legitimately writes a DIFFERENT RA to that exact slot.
+        if (next == 2) @import("../debug/watch.zig").disarm(2);
+        if (next == 3) @import("../debug/watch.zig").disarm(3);
         @import("sched_asm.zig").switchToCall(prev_save, next_kesp);
         // When we get here, this caller has been re-scheduled.
         @import("../debug/kdbg.zig").schedEvent(.switch_out, from_pid_a, 0, 0, @intCast(next));
@@ -2306,6 +2651,9 @@ pub fn schedule() void {
             // that the demote's setState triggered.
             setState(cur, .running);
         }
+        // Mirror the self-switch path: clear the transient bracket since
+        // no switchTo will run on this branch either.
+        cpu.scheduling_out_pid = 0xFFFF;
     }
     cpu.sched_lock.releaseIrqRestore(flags);
 }
@@ -2330,6 +2678,25 @@ inline fn writeFsBase(val: u64) void {
 /// race to .ready on the very next tick, breaking blocking syscalls.
 pub fn wakeExpired() void {
     for (0..MAX_PROCS) |i| {
+        // .gpu_io waiters set both wait_kind AND wake_tick as a safety
+        // net: the primary waker is virtio_gpu's MSI-X IRQ walking the
+        // PCB table, but QEMU CVE-2024-3446 occasionally drops the
+        // notify. wake_tick guarantees the waiter re-runs and re-polls
+        // usedIdx after a bounded delay even if no IRQ arrives. We
+        // handle .gpu_io here (not in the .none branch) so the wake
+        // clears wait_kind back to .none on the same path as the IRQ
+        // wake — keeping a single "waiter resumed" code path.
+        if (procs[i].state == .sleeping
+            and procs[i].wait_kind == .gpu_io
+            and procs[i].wake_tick != 0
+            and tick_count >= procs[i].wake_tick)
+        {
+            procs[i].wake_tick = 0;
+            procs[i].wait_kind = .none;
+            procs[i].wait_target = 0;
+            setState(i, .ready);
+            continue;
+        }
         if (procs[i].state == .sleeping
             and procs[i].wait_kind == .none
             and procs[i].wake_tick != 0
@@ -2384,6 +2751,13 @@ pub fn wakeExpired() void {
                     i, @intFromEnum(procs[i].wait_kind), procs[i].wait_target,
                 });
                 wake_dbg_last_log = tick_count;
+                // Stuck-waiter detector: one-shot full state dump after the
+                // pid has been parked on the same resource for ≥STUCK_TICKS.
+                // Single permanent park is the bug pattern that `observe()`
+                // can't catch — there are no repeated yields to compare.
+                @import("../debug/yield_loop.zig").checkStuck(
+                    i, procs[i].wait_kind, procs[i].wait_target,
+                );
             }
         }
     }
@@ -2442,43 +2816,51 @@ pub fn kernelSleepMs(ms: u32) void {
 pub fn blockOn(kind: WaitKind, target: u32) void {
     const cur = smp.myCpu().current_pid orelse return;
     const pcb = &procs[cur];
-    // Wake-pending handshake. Clear FIRST so any wake() that runs strictly
-    // after this point sets the flag and is observed by the re-check below.
-    @atomicStore(bool, &pcb.wake_pending, false, .release);
+    // Captured for the yield-loop detector call below — taken here so the
+    // trip dump names the high-level yield site (e.g.
+    // nvme.waitCompletionAsync, pipe.read), not blockOn itself.
+    const caller_ra = @returnAddress();
+    // Wake-pending handshake. Atomically test-and-clear: if wake_pending
+    // was ALREADY true on entry, a wake() ran between the caller's
+    // condition check and our entry here — the wake event has been
+    // delivered to us and the caller's next loop iteration will observe
+    // its condition is satisfied. Return immediately without parking.
+    //
+    // The old `@atomicStore(false)` here was buggy: it unconditionally
+    // stomped on a prior wake() that had set wake_pending=true,
+    // causing permanent park. Caught 2026-05-19 by yield-loop:stuck:
+    // desktop pid 2 stuck on nvme1 cid=0 with the waiter showing
+    // completed=true while pid 2 was parked .sleeping. The fix
+    // generalizes — every `while (!cond) blockOn(...)` pattern (pipe.read,
+    // futex_wait, sysWaitpid, etc.) had the same race window.
+    if (@atomicRmw(bool, &pcb.wake_pending, .Xchg, false, .acq_rel)) {
+        return;
+    }
     pcb.wait_kind = kind;
     pcb.wait_target = target;
     setState(cur, .sleeping);
-    // Race check: did a wake() land between our wake_pending=false and the
-    // setState above? If so, the wake's clear-of-wait_kind and the setState
-    // (.sleeping) check raced; either way, the wake event has been delivered
-    // and we must NOT yield, or this task sleeps with no further waker. Roll
-    // back to .running and return as if no block happened.
+    // Race check: did a wake() land between our test-and-clear above
+    // and the setState? If so, roll back to .running and return — the
+    // caller's condition is satisfied and yielding would lose the wake.
     if (@atomicLoad(bool, &pcb.wake_pending, .acquire)) {
         pcb.wait_kind = .none;
         pcb.wait_target = 0;
         setState(cur, .running);
-        if (cur < 8) blockon_dbg_rollback +%= 1;
         return;
     }
-    if (cur < 8) {
-        blockon_dbg_yield +%= 1;
-        // Rate-limited: log entry so we can correlate against later wake-skip
-        if (tick_count -% blockon_dbg_last_log >= 200) {
-            blockon_dbg_last_log = tick_count;
-            debug.klog("[blockOn] pid={d} kind={d} target=0x{x} yields={d} rollbacks={d}\n", .{
-                cur, @intFromEnum(kind), target, blockon_dbg_yield, blockon_dbg_rollback,
-            });
-        }
-    }
+    // Yield-loop detector: trips if this pid keeps actually parking with
+    // identical (kind, target, caller_ra) in a tight window — fingerprint
+    // of a wake-then-resleep loop on a non-progressing resource. Called
+    // here (after both wake_pending early-returns) so only REAL yields
+    // count; the fast-path returns from a satisfied caller condition
+    // would otherwise produce false-positive trips.
+    @import("../debug/yield_loop.zig").observe(cur, kind, target, caller_ra);
     smp.myCpu().pending_soft_yield = true;
     @import("sched_asm.zig").softYield();
     pcb.wait_kind = .none;
     pcb.wait_target = 0;
 }
 
-var blockon_dbg_yield: u64 = 0;
-var blockon_dbg_rollback: u64 = 0;
-var blockon_dbg_last_log: u64 = 0;
 
 /// Called by pipe.write when waking a blocked reader, by pipe.read when waking
 /// a blocked writer, and by killProcess/destroyCurrent when waking a parent
@@ -2499,6 +2881,56 @@ pub fn wake(pid: u8) void {
     // is meant to be a no-op for processes that aren't parked. setState
     // also rqEnter's pid on its assigned_cpu's runqueue.
     if (procs[pid].state == .sleeping) setState(pid, .ready);
+}
+
+/// Compare-and-sleep primitive for Mutex.acquire. Enrolls the current
+/// PCB as a .mutex waiter on `target_id` (= low-32 of the mutex's
+/// owner_pid address), then re-reads `*owner_pid_ptr` atomically. If
+/// the mutex became free between the caller's failed CAS-try and now,
+/// returns without sleeping — the caller's next CAS-try will claim it.
+/// Otherwise, sleeps until released. The dual race guard (re-check of
+/// owner + wake_pending) closes the wake-during-enrollment window that
+/// would otherwise lose a wakeup.
+pub fn blockOnMutex(target_id: u32, owner_pid_ptr: *const u16) void {
+    const cur = smp.myCpu().current_pid orelse return;
+    const pcb = &procs[cur];
+    @atomicStore(bool, &pcb.wake_pending, false, .release);
+    pcb.wait_kind = .mutex;
+    pcb.wait_target = target_id;
+    setState(cur, .sleeping);
+    // Race A: mutex got released between our caller's CAS-fail and our
+    // enrollment. Don't sleep; caller will retry the CAS.
+    if (@atomicLoad(u16, owner_pid_ptr, .acquire) == 0xFFFF) {
+        pcb.wait_kind = .none;
+        pcb.wait_target = 0;
+        setState(cur, .running);
+        return;
+    }
+    // Race B: a wake() landed between our wake_pending=false and now.
+    if (@atomicLoad(bool, &pcb.wake_pending, .acquire)) {
+        pcb.wait_kind = .none;
+        pcb.wait_target = 0;
+        setState(cur, .running);
+        return;
+    }
+    smp.myCpu().pending_soft_yield = true;
+    @import("sched_asm.zig").softYield();
+    pcb.wait_kind = .none;
+    pcb.wait_target = 0;
+}
+
+/// Wake every PCB sleeping on a Mutex with this target_id. Thundering-
+/// herd wake: all waiters retry CAS in parallel, one wins, losers
+/// re-blockOnMutex. Acceptable for low-contention locks (virtio-gpu
+/// submit serializes one ~50ms wait at a time, contention is rare).
+pub fn wakeMutexWaiters(target_id: u32) void {
+    for (0..MAX_PROCS) |i| {
+        const t = &procs[i];
+        if (t.state != .sleeping) continue;
+        if (t.wait_kind != .mutex) continue;
+        if (t.wait_target != target_id) continue;
+        wake(@intCast(i));
+    }
 }
 
 /// Walk a dying process's fd_table and close any pipe fds so the pipe pool's
@@ -2548,6 +2980,8 @@ const TerminateOp = enum { kill, destroy };
 ///   * `destroy`: call `schedule()` + halt AFTER this returns (the
 ///     dying CPU is still on the dying kstack until it reschedules).
 fn tearDownTask(pid: usize, status: u32, op: TerminateOp) void {
+    const kp = @import("../debug/kstack_protect.zig");
+    kp.checkpoint("tdt:entry");
     const my_tgid: u8 = procs[pid].tgid;
     const last_in_group = countThreadsInGroup(my_tgid) <= 1;
     debug.klog("[proc] {s} {d} {s} (status=0x{X})\n", .{
@@ -2556,6 +2990,11 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp) void {
         if (op == .kill) "killed" else "destroyed",
         status,
     });
+    // PMM diagnostic: free frames immediately before this proc's pages
+    // get reclaimed. Pair with the [pmm-diag] line on the next sysExec
+    // to see whether teardown returned everything to PMM.
+    const pmm_diag = @import("../mm/pmm.zig");
+    debug.klog("[pmm-diag] pre-teardown free={d}/{d}\n", .{ pmm_diag.freeFrameCount(), pmm_diag.managedFrameCount() });
 
     // Resources reachable in any address space (GUI window state, GPU
     // contexts, debug symbols all live in heap / driver structures, not
@@ -2563,6 +3002,7 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp) void {
     if (last_in_group) {
         const desktop = @import("../ui/desktop.zig");
         desktop.destroyGuiWindow(@intCast(pid));
+        kp.checkpoint("tdt:post-destroyGuiWindow");
         if (procs[pid].gpu_has_ctx) {
             const virtio_gpu = @import("../driver/virtio_gpu.zig");
             if (!virtio_gpu.ctxDestroy(procs[pid].gpu_ctx_id)) {
@@ -2570,10 +3010,12 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp) void {
             }
             procs[pid].gpu_has_ctx = false;
             procs[pid].gpu_ctx_id = 0;
+            kp.checkpoint("tdt:post-ctxDestroy");
         }
         if (procs[pid].sym_table) |st| {
             symbols.freeSymTable(st);
             procs[pid].sym_table = null;
+            kp.checkpoint("tdt:post-freeSymTable");
         }
     }
 
@@ -2583,6 +3025,7 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp) void {
     // victim's was never active here), so no switch needed.
     if (op == .destroy) {
         vmm.switchAddressSpace(@import("../mm/paging.zig").getKernelPageDirPhys());
+        kp.checkpoint("tdt:post-switchAS");
     }
 
     if (last_in_group) {
@@ -2595,9 +3038,12 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp) void {
                 pcid_mod.free(lead.pcid);
                 lead.pcid = 0;
             }
+            kp.checkpoint("tdt:post-destroyAS");
         }
         closePipeFds(my_tgid);
+        kp.checkpoint("tdt:post-closePipes");
         freeElfBuf(lead);
+        kp.checkpoint("tdt:post-freeElfBuf");
         const paging = @import("../mm/paging.zig");
         for (lead.lazy_regions[0..lead.lazy_count]) |r| {
             if (!r.buf_owned) continue;
@@ -2610,6 +3056,7 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp) void {
         }
         lead.lazy_count = 0;
         lead.heap_lazy_idx = -1;
+        kp.checkpoint("tdt:post-lazyRegions");
     }
 
     // Per-thread: drop borrowed page directory pointer so a future zombie
@@ -2633,7 +3080,8 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp) void {
         if (cpu.idle_pid) |idle| {
             gdt.setTssRsp0(idle, procs[idle].kernel_stack_top);
         }
-        cpu.current_pid = null;
+        @import("../debug/pid_trace.zig").setCurrentPid(cpu, null);
+        kp.checkpoint("tdt:post-steerToIdle");
     }
 
     // Decide zombie vs immediate free. Parent alive AND lead thread →
@@ -2664,10 +3112,12 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp) void {
         // that don't care; shells with a SIGCHLD handler can do
         // non-blocking reaping. Sent regardless of waitpid state per POSIX.
         _ = signals.send(parent, signals.SIGCHLD);
+        kp.checkpoint("tdt:post-zombie+SIGCHLD");
     } else {
         setState(pid, .unused);
         @atomicStore(usize, &expected_kstack_tops[pid], 0, .release);
         @import("../debug/kasan.zig").markPcbDead(@intFromPtr(&kstack_pool[pid]) + KSTACK_GUARD_SIZE, KSTACK_SIZE);
+        kp.checkpoint("tdt:post-markPcbDead");
     }
 
     @import("../debug/kdbg.zig").procEvent(
@@ -2676,6 +3126,12 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp) void {
         parent,
         status,
     );
+
+    // Post-teardown PMM count. Diff against [pmm-diag] pre-teardown
+    // above to see how many frames this exit returned to the pool. A
+    // process holding 1 MB of user pages should give back ~256 frames;
+    // anything less is a leak in the destroy path.
+    debug.klog("[pmm-diag] post-teardown free={d}/{d} (pid={d})\n", .{ pmm_diag.freeFrameCount(), pmm_diag.managedFrameCount(), pid });
 }
 
 /// External kill (Phase 3 protocol).
@@ -2902,7 +3358,23 @@ pub fn reapStaleZombies(max_age_ticks: u64) u32 {
 pub fn destroyCurrentWithStatus(status: u32) void {
     const cur = smp.myCpu().current_pid orelse return;
 
+    // Protect the kstacks of PROTECTED_PIDS (currently desktop=2, shell=3)
+    // for the duration of the destroy critical section. Any wild write
+    // into those kstacks during teardown #PFs on the writing CPU with
+    // the writer's RIP captured in the saved frame. Note: tasks currently
+    // running on another CPU are SKIPPED (would brick that CPU on next
+    // push); the running-victim wild-writer case is hunted via the
+    // `checkpoint` bisection logger instead.
+    const kstack_protect = @import("../debug/kstack_protect.zig");
+    kstack_protect.checkpoint("dcws:entry");
+    kstack_protect.protectAll();
+    kstack_protect.checkpoint("dcws:post-protect");
+
     tearDownTask(cur, status, .destroy);
+
+    kstack_protect.checkpoint("dcws:post-teardown");
+    kstack_protect.unprotectAll();
+    kstack_protect.checkpoint("dcws:post-unprotect");
 
     // For user sys_exit, the syscall handler ALSO calls schedule afterwards
     // — that's now a redundant no-op (cheap). For kernel-task callers, this
@@ -2926,9 +3398,12 @@ pub fn destroyCurrent() void {
 pub fn reapZombie(pid: u8) void {
     if (pid >= MAX_PROCS) return;
     if (procs[pid].state != .zombie) return;
+    const kp = @import("../debug/kstack_protect.zig");
+    kp.checkpoint("reap:entry");
     setState(pid, .unused);
     @atomicStore(usize, &expected_kstack_tops[pid], 0, .release);
     @import("../debug/kasan.zig").markPcbDead(@intFromPtr(&kstack_pool[pid]) + KSTACK_GUARD_SIZE, KSTACK_SIZE);
+    kp.checkpoint("reap:exit");
 }
 
 /// Find the lowest-pid zombie child of `parent`. Returns null if none.
@@ -3072,8 +3547,10 @@ fn handleCowFault(pml4: [*]align(4096) u64, cr2: usize) bool {
         return true;
     }
 
-    // Multiple owners — alloc a private copy.
-    const new_phys = pmm.allocFrame() orelse return false;
+    // Multiple owners — alloc a private copy. Use the user-reserve-
+    // aware allocator: a runaway COW fault storm during memory pressure
+    // shouldn't be allowed to deplete the kernel's emergency pool.
+    const new_phys = pmm.allocFrameUser() orelse return false;
     const src: [*]const u8 = @ptrFromInt(paging.physToVirt(old_phys));
     const dst: [*]u8 = @ptrFromInt(paging.physToVirt(new_phys));
     @memcpy(dst[0..0x1000], src[0..0x1000]);
@@ -3131,12 +3608,56 @@ pub fn handleUserPageFault(cr2: usize, error_code: u64) bool {
         const r = lead.lazy_regions[i];
         if (cr2 < r.start or cr2 >= r.end) continue;
         const va_aligned = cr2 & ~@as(usize, 0xFFF);
-        const frame = vmm.allocAndMapUserPage(pd, va_aligned, vmm.protToMapFlags(r.prot)) orelse {
+        var frame_opt = vmm.allocAndMapUserPage(pd, va_aligned, vmm.protToMapFlags(r.prot));
+        if (frame_opt == null) {
+            // Memory pressure response: ask registered modules to shed
+            // reclaimable caches (GUI back-buffers etc.), then retry the
+            // alloc ONCE. Reclaim frees up to N × num_pages frames where
+            // N is the number of back-buffer slots across all visible GUI
+            // windows — typically enough to handle a single page fault.
+            // If even that doesn't cover the demand, we fall through to
+            // OOM kill below.
+            const reclaimed = pmm.tryReclaim(1);
+            if (reclaimed > 0) {
+                frame_opt = vmm.allocAndMapUserPage(pd, va_aligned, vmm.protToMapFlags(r.prot));
+            }
+        }
+        const frame = frame_opt orelse {
             @import("../debug/kdbg.zig").pfEvent(@intCast(cur), cr2, @truncate(error_code), 0, false);
-            debug.klog("[pf-fail] PID={d} cr2=0x{X} — region[{d}] matched (0x{X}..0x{X}) but allocAndMapUserPage failed\n", .{
-                cur, cr2, i, r.start, r.end,
+            // OOM kill path. The region IS valid (cr2 fell in r.start..r.end);
+            // we just don't have a physical frame left. That's not a bug in
+            // the user app — it's resource exhaustion — and the right
+            // response is to SIGKILL THIS process and let the rest of the
+            // system keep running, NOT to run the full crashSummary
+            // (register dump, backtrace, dumpAll, fat32 writeCrashLog). The
+            // heavy dump is fine for a programmer-error fault but here it's
+            // both useless (we know why: OOM) and risky — fat32 writes
+            // re-enter the allocator under the same pressure, and the long
+            // print stream stalls the compositor on the BSP for hundreds of
+            // ms. Take the lightweight route instead and the system stays
+            // responsive even with photo / paint / etc. running into their
+            // memory caps.
+            debug.klog("[oom] killing PID={d} '{s}' — region[{d}] (0x{X}..0x{X}) needed page at cr2=0x{X}, pmm free={d}/{d}\n", .{
+                cur,
+                pcb.name[0..@min(pcb.name_len, pcb.name.len)],
+                i,
+                r.start,
+                r.end,
+                cr2,
+                pmm.freeFrameCount(),
+                pmm.managedFrameCount(),
             });
-            return false;
+            dumpSyscallRing(@intCast(cur));
+            // Desktop notification so the user sees WHY the app vanished
+            // without having to scroll serial.log.
+            const desktop = @import("../ui/desktop.zig");
+            if (desktop.active) desktop.showNotification("App killed: out of memory");
+            // tearDown + schedule. schedule() never returns when we just
+            // marked current_pid null (dead-letter eats the outgoing rsp);
+            // the `unreachable` below is for the type system.
+            destroyCurrent();
+            schedule();
+            unreachable;
         };
         @import("../debug/kdbg.zig").pfEvent(@intCast(cur), cr2, @truncate(error_code), 0, true);
         // For ELF demand paging: copy the intersection of this page with the

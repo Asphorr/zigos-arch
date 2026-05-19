@@ -55,11 +55,20 @@ var tss: Tss64 = .{};
 var isr_stack: [16384]u8 align(16) = undefined; // 16KB ISR stack
 
 // Update the kernel stack the CPU will switch to on user→kernel transitions:
-// the per-CPU TSS.RSP0 (used by IDT-gate interrupts) AND the per-CPU
-// syscall_stack_top slot in smp.per_cpu_asm (used by the syscall trampoline).
-// Both must point at the SAME per-process kstack so a syscall that sleeps via
-// `int $0x20` saves its resume frame on the process's own kstack — not on a
-// shared per-CPU buffer that other processes' syscalls would overwrite.
+// the per-CPU TSS.RSP0. ONE field, ONE writer, ONE store.
+//
+// Both the IDT-gate path (CPU hardware) and the SYSCALL path (per-CPU LSTAR
+// stub in syscall_entry.zig) read this same memory location, so by
+// construction they land on the SAME kstack — no duplicated state to keep
+// in sync. The previous design maintained a separate
+// `per_cpu_asm[N].syscall_stack_top` mirror updated alongside tss.rsp0;
+// the two writes could tear under a nested setTssRsp0 (cpu-alias FAIL
+// 2026-05-17). Collapsing to one field makes the desync class
+// structurally impossible.
+//
+// Atomicity: the smp.zig comptime check guarantees `cpus[N].tss.rsp0`
+// lies entirely within one cache line, so this single 8-byte store is
+// atomic to the syscall stub on the same CPU and to any cross-CPU reader.
 //
 // `pid` is the process being dispatched; `rsp0` should equal procs[pid].
 // kernel_stack_top. We cross-check against process.expected_kstack_tops[pid]
@@ -70,7 +79,6 @@ var isr_stack: [16384]u8 align(16) = undefined; // 16KB ISR stack
 pub fn setTssRsp0(pid: usize, rsp0: u64) void {
     const smp = @import("smp.zig");
     const process = @import("../proc/process.zig");
-    const paging = @import("../mm/paging.zig");
     // Per-PID exact match against the immutable witness set at create()
     // time. The shape-check (isValidKstackTopShape) accepted ANY value
     // that happened to be a valid pool top OR a registered heap kstack,
@@ -103,13 +111,10 @@ pub fn setTssRsp0(pid: usize, rsp0: u64) void {
     // overlapping write from another CPU (shouldn't happen — TSS is
     // per-CPU — but a wild writer would show up here).
     @import("../debug/kcsan.zig").checkU64("tss.rsp0", &cpu.tss.rsp0);
+    // Single atomic 8-byte store — same cache-line guarantee from the
+    // smp.zig comptime assert. No bracketing needed: there's nothing
+    // for an IRQ-driven nested setTssRsp0 to leave half-updated.
     cpu.tss.rsp0 = rsp0;
-    // per_cpu_asm lives in .kdata_protected (page-protected RO except
-    // here). Open the window, write, close it — wild writers anywhere
-    // else hit #PF with their RIP captured.
-    paging.unlockKdata();
-    smp.per_cpu_asm[cpu.cpu_id].syscall_stack_top = rsp0;
-    paging.lockKdata();
     // (Removed: legacy global tss write. setTssRsp0 only runs after
     // smp.init's `initPerCpuGdt` migrates BSP to its per-CPU TSS, so the
     // legacy `tss` is unreferenced by hardware from that point on. Its
@@ -129,24 +134,24 @@ pub fn setTssRsp0(pid: usize, rsp0: u64) void {
     );
 
     // STACK-ALIAS DETECTOR (task #233). Fires the moment two CPUs have the
-    // same kstack as their syscall_stack_top — the precondition for the
-    // observed cross-CPU corruption (one cpu's syscall_entry overwriting
-    // another cpu's iretq frame on the shared kstack). Walks the small
-    // per_cpu_asm table; cheap because setTssRsp0 is only called on
-    // dispatch (not hot path). When it fires, dumps both cpus' current_pid
-    // so we can pin the protocol violation to specific transition.
+    // same kstack as their TSS.RSP0 — the precondition for the observed
+    // cross-CPU corruption (one cpu's IDT-gate entry overwriting another
+    // cpu's iretq frame on the shared kstack). Walks the small cpus table;
+    // cheap because setTssRsp0 is only called on dispatch (not hot path).
+    // When it fires, dumps both cpus' current_pid so we can pin the
+    // protocol violation to a specific transition.
     {
         const debug = @import("../debug/debug.zig");
         for (0..smp.MAX_CPUS) |other| {
             if (other == cpu.cpu_id) continue;
-            const other_top = smp.per_cpu_asm[other].syscall_stack_top;
+            const other_top = smp.cpus[other].tss.rsp0;
             if (other_top != rsp0) continue;
             const my_pid: i32 = if (smp.cpus[cpu.cpu_id].current_pid) |p| @intCast(p) else -1;
             const other_pid: i32 = if (smp.cpus[other].current_pid) |p| @intCast(p) else -1;
             const my_state: u8 = if (my_pid >= 0) @import("../proc/process.zig").getStateRaw(@intCast(my_pid)) else 0xFF;
             const other_state: u8 = if (other_pid >= 0) @import("../proc/process.zig").getStateRaw(@intCast(other_pid)) else 0xFF;
             debug.klog(
-                "[stack-alias] cpu{d}.per_cpu_asm = cpu{d}.per_cpu_asm = 0x{X}  cpu{d}.pid={d}(state={d}) cpu{d}.pid={d}(state={d})\n",
+                "[stack-alias] cpu{d}.tss.rsp0 = cpu{d}.tss.rsp0 = 0x{X}  cpu{d}.pid={d}(state={d}) cpu{d}.pid={d}(state={d})\n",
                 .{ cpu.cpu_id, other, rsp0, cpu.cpu_id, my_pid, my_state, other, other_pid, other_state },
             );
         }
@@ -209,8 +214,14 @@ pub fn init() void {
     const tss_base: u64 = @intFromPtr(&tss);
     const tss_limit: u32 = @sizeOf(Tss64) - 1;
 
-    // Set TSS RSP0 to top of dedicated ISR stack
+    // Set TSS RSP0 to top of dedicated ISR stack (legacy global, used
+    // only pre-SMP; smp.init's initPerCpuGdt migrates BSP to per-CPU TSS
+    // shortly after this).
     tss.rsp0 = @intFromPtr(&isr_stack) + isr_stack.len;
+    // IST1 for IRQ0 / dyn IRQs (see smp.initPerCpuGdt comment) — same
+    // buffer as RSP0 here since this TSS is only live for the brief
+    // pre-SMP window; per-CPU TSS takes over before any task is running.
+    tss.ist1 = @intFromPtr(&isr_stack) + isr_stack.len;
 
     entries[0] = 0; // Null                     (0x00)
     entries[1] = makeEntry(0, 0xFFFFF, 0x9A, 0xA); // Kernel Code (0x08) L=1, D=0

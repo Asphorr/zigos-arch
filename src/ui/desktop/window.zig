@@ -162,6 +162,12 @@ pub const Window = struct {
     gui_alloc_w: u32 = 0,
     gui_alloc_h: u32 = 0,
     gui_present_pending: bool = false,
+    /// Tick of the last auto-refresh fallback that marked this window
+    /// for re-composite. The compositor's auto-refresh path (for apps
+    /// that don't call sysPresent — sysmon, settings, etc.) throttles
+    /// per-window to ~20 Hz via this field; explicit sysPresent calls
+    /// bypass the throttle entirely.
+    last_auto_refresh_tick: u64 = 0,
     /// True iff the owning process called setCursorVisible(false). The main
     /// desktop loop honors this when the window is focused — without this,
     /// the loop's auto-show heuristic for windowed apps stomps on the

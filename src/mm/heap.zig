@@ -51,6 +51,7 @@ var ops_since_largest_recompute: u32 = 0;
 const RECOMPUTE_INTERVAL: u32 = 1024;
 
 pub fn init() void {
+    @import("../proc/spinlock.zig").registerLock("heap.lock", &lock);
     const block: *FreeBlock = @ptrFromInt(HEAP_START);
     block.size = HEAP_SIZE;
     block.next = null;

@@ -63,6 +63,7 @@ const ADMIN_CREATE_CQ: u8 = 0x05;
 const ADMIN_IDENTIFY: u8 = 0x06;
 
 // --- I/O command opcodes ---
+const IO_FLUSH: u8 = 0x00;
 const IO_WRITE: u8 = 0x01;
 const IO_READ: u8 = 0x02;
 
@@ -103,6 +104,32 @@ const Q_DEPTH: u16 = 16;
 const MAX_CONTROLLERS: usize = 2;
 const SECTOR_SIZE: u32 = 512;
 
+/// Compile-time toggle for the async I/O path. When false (default),
+/// `ioCommand` and the IRQ handler take the polled / sync path that's
+/// been in place since the driver was written. When true, every read /
+/// write submits + yields, the IRQ handler reaps + wakes blocked
+/// processes, and we get Q_DEPTH=16-way parallelism.
+///
+/// SAFETY: async requires `process.blockOn` to work, which requires a
+/// current_pid on this CPU. Early-boot reads (ext2.init reading the
+/// superblock from main.zig:407 before enterFirstTask at line 565) run
+/// before any scheduled task exists — async path would dead-lock. The
+/// per-controller flag stays false until the FIRST scheduled task
+/// runs, then flips on. See `enableAsync` below.
+const ASYNC_BUILD_ENABLED: bool = true;
+
+/// One async I/O in flight. `cid` is the slot index in `waiters[]` and
+/// also the CID we write into the SQE. After IRQ reaps the matching CQE,
+/// `success`/`status_code` are set and `wake(pid)` is called; the waiter
+/// then copies bounce → user (for IO_READ) and marks itself inactive.
+const NvmeWaiter = struct {
+    active: bool = false,
+    completed: bool = false,
+    success: bool = false,
+    status_code: u16 = 0,
+    pid: u8 = 0xFF,
+};
+
 const Controller = struct {
     mmio_base: usize = 0,
     doorbell_stride_log: u8 = 0,
@@ -119,9 +146,16 @@ const Controller = struct {
     io_cq_head: u16 = 0,
     io_cq_phase: bool = true,
 
-    // 4 KiB-aligned scratch page used as a bounce buffer for read/write
-    // PRPs — lets the caller pass non-page-aligned destinations.
+    // Legacy shared bounce buffer — used by the synchronous `ioCommand`
+    // path. Kept while migrating callers to `ioCommandAsync`; remove once
+    // every reader/writer uses the per-CID `bounce_bufs[]` array below.
     bounce_buf: usize = 0,
+
+    // Per-CID bounce buffers (4 KiB each). Async submitters claim a CID
+    // via `allocCid`, use bounce_bufs[cid] for the PRP1, and release on
+    // completion. 16 * 4 KiB = 64 KiB per controller.
+    bounce_bufs: [Q_DEPTH]usize = [_]usize{0} ** Q_DEPTH,
+    waiters: [Q_DEPTH]NvmeWaiter = [_]NvmeWaiter{.{}} ** Q_DEPTH,
 
     nsid: u32 = 0, // first active namespace ID
     block_size: u32 = SECTOR_SIZE,
@@ -150,18 +184,52 @@ const Controller = struct {
     // ioCommandOneSector so admin-path callers (which run BSP-only at
     // boot) stay lock-free.
     io_lock: SpinLock = .{},
+
+    // Async-path CQ reaper lock. Held by `reapCq` (called from
+    // `nvmeIrqHandler` when async mode is active) and by the submit
+    // path while it advances cq_head reading completions during fallback
+    // polling. Distinct from io_lock so submit can release after ringing
+    // the doorbell without blocking IRQ reapers on other CPUs.
+    cq_lock: SpinLock = .{},
+    // When true, IRQs scan the I/O CQ + wake waiters. When false, IRQs
+    // only bump irq_count and ioCommand polls the CQ inline. Phase C
+    // flips this to true after migrating all readers/writers off the
+    // synchronous path. Read by `nvmeIrqHandler` on every IRQ.
+    async_mode: bool = false,
 };
 
 var controllers: [MAX_CONTROLLERS]Controller = .{ .{}, .{} };
 var num_controllers: usize = 0;
 pub var irq_count: u64 = 0;
 
-/// Catch-all MSI-X handler: just bumps a counter and returns. The real
-/// work — re-reading the CQ — happens in the next iteration of the
-/// `waitCompletion` hlt loop. The handler exists only so the LAPIC can
-/// EOI and the kernel can be woken from `hlt`.
+/// MSI-X handler. In sync mode (async_mode=false), just bumps a counter
+/// so the next waitCompletion iteration finds a flipped phase bit. In
+/// async mode, scans every async-enabled controller's CQ, wakes the
+/// blocked process whose CID matched, then calls schedule() so the
+/// woken task gets dispatched IMMEDIATELY instead of waiting up to a
+/// timer tick (~10 ms). Without the schedule() call, every async I/O
+/// pays a full slice penalty — measured at ~18 ms/call vs the expected
+/// ~50 µs NVMe completion latency. Matches killKickHandler's pattern.
 fn nvmeIrqHandler() callconv(.c) void {
     irq_count +%= 1;
+    if (!ASYNC_BUILD_ENABLED) return;
+    var any_woken = false;
+    var i: usize = 0;
+    while (i < num_controllers) : (i += 1) {
+        if (controllers[i].async_mode) {
+            if (reapCq(&controllers[i])) any_woken = true;
+        }
+    }
+    // Shape C: do NOT call schedule() from the IRQ handler. Calling schedule
+    // here runs with RSP on whatever kstack the IRQ inherited — which may
+    // not be current_pid's, opening the cross-stack-aliasing window the
+    // mirror-flip detector caught 2026-05-19. Instead, set a flag the
+    // DynIrqStub epilogue checks just before iretq; if set, it calls
+    // schedule() from the stub's own frame where RSP discipline is sound.
+    if (any_woken) {
+        const smp = @import("../cpu/smp.zig");
+        smp.myCpu().dynirq_preempt_pending = true;
+    }
 }
 
 fn r32(c: *const Controller, off: u32) u32 {
@@ -285,6 +353,16 @@ fn initController(c: *Controller, dev: pci.PciDevice, idx: usize) bool {
     c.next_cid = 1;
     c.bounce_buf = pmm.allocContiguous(1) orelse return false;
     _ = iommu.dmaMap(dev.bus, dev.dev, dev.func, c.bounce_buf, 4096, .{});
+
+    // Per-CID bounce buffers for the async path. One 4 KiB page per
+    // waiter slot so concurrent in-flight commands don't share the
+    // legacy `bounce_buf`. IOMMU-map each so the device can DMA into it.
+    var ci: usize = 0;
+    while (ci < Q_DEPTH) : (ci += 1) {
+        const bb = pmm.allocContiguous(1) orelse return false;
+        c.bounce_bufs[ci] = bb;
+        _ = iommu.dmaMap(dev.bus, dev.dev, dev.func, bb, 4096, .{});
+    }
 
     // Step 1: list active namespaces. NSID 0 is "no specific NS" for the
     // CNS=2 query. Result is a u32[1024] table of NSIDs (zero-terminated).
@@ -525,6 +603,13 @@ const MAX_SECTORS_PER_CMD: u32 = 8;
 fn ioCommand(c: *Controller, opcode: u8, lba: u32, user_buf: usize, sectors: u32) bool {
     if (!c.initialized) return false;
     if (sectors == 0 or sectors > MAX_SECTORS_PER_CMD) return false;
+    // Route to async path if this controller has been switched over.
+    // ctrl_idx = pointer arithmetic into the global controllers[] array
+    // so blockOn's wait_target is unambiguous.
+    if (ASYNC_BUILD_ENABLED and c.async_mode) {
+        const idx_offset = (@intFromPtr(c) - @intFromPtr(&controllers[0])) / @sizeOf(Controller);
+        return ioCommandAsync(c, @intCast(idx_offset), opcode, lba, user_buf, sectors);
+    }
     const t_call_start = @import("../debug/perf.zig").rdtsc();
 
     // Serialize across CPUs — bounce_buf, SQ tail, CQ head/phase, and the
@@ -535,7 +620,7 @@ fn ioCommand(c: *Controller, opcode: u8, lba: u32, user_buf: usize, sectors: u32
     c.io_lock.acquire();
     defer c.io_lock.release();
 
-    const xfer_bytes: u32 = sectors * SECTOR_SIZE;
+    const xfer_bytes: u32 = sectors * c.block_size;
     if (opcode == IO_WRITE) {
         const dst: [*]u8 = @ptrFromInt(paging.physToVirt(c.bounce_buf));
         const src: [*]const u8 = @ptrFromInt(user_buf);
@@ -590,11 +675,276 @@ fn ioCommand(c: *Controller, opcode: u8, lba: u32, user_buf: usize, sectors: u32
     return true;
 }
 
+// ============================================================
+// Async I/O path (Phase B — dead code until `async_mode` flipped)
+// ============================================================
+//
+// Submit-and-yield model. `ioCommandAsync` allocates a free CID via
+// allocCid, writes the SQE using bounce_bufs[cid] as PRP1, rings the
+// doorbell, then `blockOn(.nvme_io, packed_target)`. The NVMe IRQ
+// handler (`nvmeIrqHandler`) calls `reapCq` for each controller,
+// which advances io_cq_head, finds the matching waiter by CID, sets
+// completed/status_code, and `process.wake(waiter.pid)`. The woken
+// process reads its waiter slot, copies bounce → user for IO_READ,
+// frees the CID, and returns.
+//
+// Concurrency:
+//   - Multiple submitters race on cid allocation + SQ tail bump. Both
+//     happen inside io_lock (short critical section, no waitCompletion).
+//   - Reaper holds cq_lock while advancing io_cq_head; submitters never
+//     touch io_cq_head in async mode, so cq_lock and io_lock are
+//     non-overlapping.
+//   - Waiter slot transition active→completed is atomic-release; reader
+//     in waiter's wake-up path uses atomic-acquire.
+
+/// Allocate a free waiter / CID slot. Returns null if Q_DEPTH commands
+/// are already in flight. Caller must already hold `c.io_lock`.
+fn allocCid(c: *Controller) ?u16 {
+    var i: u16 = 0;
+    while (i < Q_DEPTH) : (i += 1) {
+        if (!c.waiters[i].active) {
+            c.waiters[i] = .{
+                .active = true,
+                .completed = false,
+                .success = false,
+                .status_code = 0,
+                .pid = 0xFF,
+            };
+            return i;
+        }
+    }
+    return null;
+}
+
+/// IRQ-context CQ scanner. Advances io_cq_head over every CQE whose
+/// phase bit matches our expected value, finds the matching waiter by
+/// CID, sets completion fields, and wakes the blocked process. Must be
+/// fast and non-blocking — runs with IRQs off, on the preempted task's
+/// kstack. Returns true iff at least one waiter was woken (caller can
+/// use this to decide whether to invoke `schedule()` for immediate
+/// dispatch of the woken task).
+fn reapCq(c: *Controller) bool {
+    if (!c.initialized) return false;
+    c.cq_lock.acquire();
+    defer c.cq_lock.release();
+    const cq: [*]volatile CqEntry = @ptrFromInt(paging.physToVirt(c.io_cq));
+    var any = false;
+    var any_woken = false;
+    while (true) {
+        const slot_vaddr = @intFromPtr(&cq[c.io_cq_head]);
+        asm volatile ("clflush (%[ptr])"
+            :
+            : [ptr] "r" (slot_vaddr),
+            : .{ .memory = true });
+        asm volatile ("mfence" ::: .{ .memory = true });
+        const status_word = cq[c.io_cq_head].status;
+        const phase_bit = (status_word & 1) != 0;
+        if (phase_bit != c.io_cq_phase) break;
+        const cid = cq[c.io_cq_head].cid;
+        const sc = status_word >> 1;
+        if (cid < Q_DEPTH) {
+            const w = &c.waiters[cid];
+            if (w.active) {
+                w.status_code = sc;
+                w.success = (sc == 0);
+                @atomicStore(bool, &w.completed, true, .release);
+                const proc = @import("../proc/process.zig");
+                proc.wake(w.pid);
+                any_woken = true;
+            }
+        }
+        c.io_cq_head = (c.io_cq_head + 1) % Q_DEPTH;
+        if (c.io_cq_head == 0) c.io_cq_phase = !c.io_cq_phase;
+        any = true;
+    }
+    if (any) cqDoorbell(c, 1).* = c.io_cq_head;
+    return any_woken;
+}
+
+/// Introspection helper used by the yield-loop detector. `wait_target`
+/// is the same encoding as `PCB.wait_target` for `WaitKind.nvme_io`:
+/// (ctrl_idx << 16) | cid. Dumps the waiter slot, the SW-side CQ state,
+/// and peeks the CQE at `io_cq_head` — if its phase bit matches the
+/// SW-expected phase, the hardware has already written a completion
+/// there and the IRQ-reaper has failed to pick it up. That single line
+/// is the root-cause discriminator between "HW stuck" and "SW missed
+/// the wake".
+pub fn dumpWaiterForTarget(wait_target: u32) void {
+    const ctrl_idx: usize = @intCast((wait_target >> 16) & 0xFFFF);
+    const cid: u16 = @intCast(wait_target & 0xFFFF);
+    if (ctrl_idx >= num_controllers) {
+        debug.klog("  nvme: ctrl_idx={d} out of range (num_controllers={d})\n", .{ ctrl_idx, num_controllers });
+        return;
+    }
+    if (cid >= Q_DEPTH) {
+        debug.klog("  nvme{d}: cid={d} out of range (Q_DEPTH={d})\n", .{ ctrl_idx, cid, Q_DEPTH });
+        return;
+    }
+    const c = &controllers[ctrl_idx];
+    const w = &c.waiters[cid];
+    debug.klog("  nvme{d}.waiters[cid={d}]:\n", .{ ctrl_idx, cid });
+    debug.klog("    active    = {any}\n", .{w.active});
+    debug.klog("    completed = {any}\n", .{w.completed});
+    debug.klog("    success   = {any}\n", .{w.success});
+    debug.klog("    status    = 0x{X:0>4}\n", .{w.status_code});
+    debug.klog("    pid       = {d}\n", .{w.pid});
+    debug.klog("  nvme{d}.cq:\n", .{ctrl_idx});
+    debug.klog("    sw_head    = {d}\n", .{c.io_cq_head});
+    debug.klog("    sw_phase   = {any}\n", .{c.io_cq_phase});
+    debug.klog("    sw_sq_tail = {d}\n", .{c.io_sq_tail});
+    debug.klog("    async_mode = {any}\n", .{c.async_mode});
+
+    const cq: [*]volatile CqEntry = @ptrFromInt(paging.physToVirt(c.io_cq));
+    // clflush head slot so we read whatever HW DMA'd most recently, not
+    // a stale cache line. Same pattern reapCq uses on its scan.
+    const slot_vaddr = @intFromPtr(&cq[c.io_cq_head]);
+    asm volatile ("clflush (%[ptr])"
+        :
+        : [ptr] "r" (slot_vaddr),
+        : .{ .memory = true });
+    const head_cqe = cq[c.io_cq_head];
+    const hw_phase = (head_cqe.status & 1) != 0;
+    debug.klog("    cq[head].cid    = {d}\n", .{head_cqe.cid});
+    debug.klog("    cq[head].status = 0x{X:0>4}\n", .{head_cqe.status});
+    debug.klog("    cq[head].phase  = {any}\n", .{hw_phase});
+    if (hw_phase == c.io_cq_phase) {
+        debug.klog("    ===> HW completion present at head; SW reaper missed it\n", .{});
+    } else {
+        debug.klog("    (HW phase != SW expected; no pending completion at head)\n", .{});
+    }
+    debug.klog("  nvme{d}.irq_count = {d}\n", .{ ctrl_idx, irq_count });
+}
+
+/// Async I/O command — submit and block until IRQ wakes us. Caller
+/// passes the user-side virtual buffer; we bounce through bounce_bufs
+/// for alignment + IOMMU containment. Returns true on success.
+fn ioCommandAsync(c: *Controller, ctrl_idx: u32, opcode: u8, lba: u32, user_buf: usize, sectors: u32) bool {
+    if (!c.initialized) return false;
+    if (sectors == 0 or sectors > MAX_SECTORS_PER_CMD) return false;
+    const t_call_start = @import("../debug/perf.zig").rdtsc();
+
+    // ---- Submit phase: short lock around CID alloc + SQ tail bump ----
+    c.io_lock.acquire();
+    const cid_opt = allocCid(c);
+    if (cid_opt == null) {
+        c.io_lock.release();
+        return false; // queue full; caller can retry
+    }
+    const cid = cid_opt.?;
+    const bounce_phys = c.bounce_bufs[cid];
+    const xfer_bytes: u32 = sectors * c.block_size;
+
+    // Mark the waiter as belonging to the current process so the IRQ
+    // handler knows whom to wake. Done before releasing io_lock so a
+    // wake on a stale pid can't slip in if the slot was just reused.
+    const proc = @import("../proc/process.zig");
+    const smp = @import("../cpu/smp.zig");
+    const cur_pid: u8 = if (smp.myCpu().current_pid) |p| @intCast(p) else 0xFF;
+    c.waiters[cid].pid = cur_pid;
+
+    // For IO_WRITE, copy user → bounce BEFORE releasing the lock so a
+    // concurrent reuser of this CID can't overwrite the buffer (can't
+    // happen yet — cid is ours until completion — but kept tight).
+    if (opcode == IO_WRITE) {
+        const dst: [*]u8 = @ptrFromInt(paging.physToVirt(bounce_phys));
+        const src: [*]const u8 = @ptrFromInt(user_buf);
+        @memcpy(dst[0..xfer_bytes], src[0..xfer_bytes]);
+    }
+
+    const slot_addr = c.io_sq + @as(usize, c.io_sq_tail) * 64;
+    const slot32: [*]volatile u32 = @ptrFromInt(paging.physToVirt(slot_addr));
+    writeSqe(slot32, opcode, cid, c.nsid, bounce_phys, 0, lba, 0, sectors - 1);
+    storeBarrier();
+
+    if (c.use_msix) {
+        const apic = @import("../time/apic.zig");
+        const dest_id: u64 = apic.getLapicId() & 0xFF;
+        const new_addr: u64 = 0xFEE00000 | (dest_id << 12);
+        if (c.msix_current_addr != new_addr) {
+            msix.writeEntry(c.msix_io_entry, new_addr, c.msix_data, false);
+            c.msix_current_addr = new_addr;
+            io_msix_retargets += 1;
+        }
+    }
+
+    c.io_sq_tail = (c.io_sq_tail + 1) % Q_DEPTH;
+    sqDoorbell(c, 1).* = @as(u32, c.io_sq_tail);
+    c.io_lock.release();
+
+    // ---- Wait phase: yield until IRQ reaper wakes us ----
+    const t_wait_start = @import("../debug/perf.zig").rdtsc();
+    const wait_target: u32 = (ctrl_idx << 16) | @as(u32, cid);
+    // Block until completion. The IRQ reaper sets w.completed and calls
+    // proc.wake(w.pid). blockOn handles the wake-pending handshake.
+    while (!@atomicLoad(bool, &c.waiters[cid].completed, .acquire)) {
+        proc.blockOn(.nvme_io, wait_target);
+    }
+    const t_wait_end = @import("../debug/perf.zig").rdtsc();
+    const wait_dt = t_wait_end -% t_wait_start;
+    io_wait_cycles +%= wait_dt;
+    if (wait_dt > io_max_wait_cycles) io_max_wait_cycles = wait_dt;
+
+    const success = c.waiters[cid].success;
+
+    // Copy bounce → user for reads BEFORE freeing the CID, otherwise a
+    // racing submitter could reuse the bounce buffer.
+    if (opcode == IO_READ and success) {
+        const dst: [*]u8 = @ptrFromInt(user_buf);
+        const src: [*]const u8 = @ptrFromInt(paging.physToVirt(bounce_phys));
+        @memcpy(dst[0..xfer_bytes], src[0..xfer_bytes]);
+    }
+
+    // Free the CID slot. Release-ordered so a subsequent allocCid sees
+    // the prior fields cleared.
+    @atomicStore(bool, &c.waiters[cid].active, false, .release);
+
+    const t_call_end = @import("../debug/perf.zig").rdtsc();
+    io_call_count += 1;
+    io_total_cycles +%= t_call_end -% t_call_start;
+    return success;
+}
+
+/// NVMe Flush (opcode 0x00). Tells the controller to commit all writes
+/// for `nsid` to non-volatile storage. Without this, writes can sit in
+/// the device write cache and be lost on power loss / hard reset. Uses
+/// the same SQ/CQ/IO-lock path as ioCommand but no bounce buffer (FLUSH
+/// has no data transfer).
+fn flushController(c: *Controller) bool {
+    if (!c.initialized) return false;
+    c.io_lock.acquire();
+    defer c.io_lock.release();
+
+    const cid = c.next_cid;
+    c.next_cid +%= 1;
+    const slot_addr = c.io_sq + @as(usize, c.io_sq_tail) * 64;
+    const slot32: [*]volatile u32 = @ptrFromInt(paging.physToVirt(slot_addr));
+    writeSqe(slot32, IO_FLUSH, cid, c.nsid, 0, 0, 0, 0, 0);
+    storeBarrier();
+
+    if (c.use_msix) {
+        const apic = @import("../time/apic.zig");
+        const dest_id: u64 = apic.getLapicId() & 0xFF;
+        const new_addr: u64 = 0xFEE00000 | (dest_id << 12);
+        if (c.msix_current_addr != new_addr) {
+            msix.writeEntry(c.msix_io_entry, new_addr, c.msix_data, false);
+            c.msix_current_addr = new_addr;
+            io_msix_retargets += 1;
+        }
+    }
+
+    c.io_sq_tail = (c.io_sq_tail + 1) % Q_DEPTH;
+    sqDoorbell(c, 1).* = @as(u32, c.io_sq_tail);
+    return waitCompletion(c, c.io_cq, &c.io_cq_head, &c.io_cq_phase, 1, c.use_msix);
+}
+
 // === Public surface ===
 
 pub fn init() bool {
     scanAndInit();
     if (num_controllers == 0) return false;
+    const spinlock = @import("../proc/spinlock.zig");
+    if (num_controllers >= 1) spinlock.registerLock("nvme0.io_lock", &controllers[0].io_lock);
+    if (num_controllers >= 2) spinlock.registerLock("nvme1.io_lock", &controllers[1].io_lock);
     debug.klog("[nvme] {d} controller(s) ready (primary={s}, secondary={s})\n", .{
         num_controllers,
         if (num_controllers >= 1) "yes" else "no",
@@ -622,7 +972,7 @@ pub fn readSectorsPrimary(lba: u32, count: u8, dest: [*]u8) void {
     const total: u32 = if (count == 0) 256 else @as(u32, count);
     while (done < total) {
         const chunk: u32 = @min(total - done, MAX_SECTORS_PER_CMD);
-        _ = ioCommand(&controllers[0], IO_READ, lba + done, @intFromPtr(dest) + done * SECTOR_SIZE, chunk);
+        _ = ioCommand(&controllers[0], IO_READ, lba + done, @intFromPtr(dest) + done * controllers[0].block_size, chunk);
         done += chunk;
     }
 }
@@ -638,9 +988,47 @@ pub fn readSectorsSecondary(lba: u32, count: u8, dest: [*]u8) void {
     const total: u32 = if (count == 0) 256 else @as(u32, count);
     while (done < total) {
         const chunk: u32 = @min(total - done, MAX_SECTORS_PER_CMD);
-        _ = ioCommand(&controllers[1], IO_READ, lba + done, @intFromPtr(dest) + done * SECTOR_SIZE, chunk);
+        _ = ioCommand(&controllers[1], IO_READ, lba + done, @intFromPtr(dest) + done * controllers[1].block_size, chunk);
         done += chunk;
     }
+}
+
+/// Commit any in-flight writes to non-volatile storage on the primary
+/// controller. Returns true on success. Callers concerned about
+/// crash-consistency (file commits, shutdown) should call this after
+/// the last write.
+pub fn flushPrimary() bool {
+    if (num_controllers < 1) return false;
+    return flushController(&controllers[0]);
+}
+
+pub fn flushSecondary() bool {
+    if (num_controllers < 2) return false;
+    return flushController(&controllers[1]);
+}
+
+/// Convenience: flush every initialized controller. Use from shutdown
+/// paths where you don't care about which controller.
+pub fn flushAll() void {
+    var i: usize = 0;
+    while (i < num_controllers) : (i += 1) {
+        _ = flushController(&controllers[i]);
+    }
+}
+
+/// Switch every initialized controller into async I/O mode. After this
+/// call, ioCommand routes through ioCommandAsync (submit-and-yield +
+/// IRQ reaper). Caller MUST already be a scheduled task — early-boot
+/// callers without a current_pid will dead-lock in blockOn. Suggested
+/// call site: top of the first user-mode task entry (desktop.taskEntry)
+/// after the scheduler is fully active.
+pub fn enableAsync() void {
+    if (!ASYNC_BUILD_ENABLED) return;
+    var i: usize = 0;
+    while (i < num_controllers) : (i += 1) {
+        controllers[i].async_mode = true;
+    }
+    debug.klog("[nvme] async I/O enabled on {d} controller(s)\n", .{num_controllers});
 }
 
 pub fn writeSectorSecondary(lba: u32, src: [*]const u8) void {

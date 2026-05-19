@@ -168,10 +168,10 @@ pub const SyscallFrame = extern struct {
     // the trailing position in this struct). Popped back into %rsp as the
     // LAST step before sysretq.
     //
-    // Why on the kernel stack instead of per_cpu_asm.user_rsp_save?
-    // per_cpu_asm is per-CPU, not per-thread. If a thread blocks mid-syscall
+    // Why on the kernel stack instead of per_cpu_user_rsp[cpu]?
+    // per_cpu_user_rsp is per-CPU, not per-thread. If a thread blocks mid-syscall
     // (futex/pipe/waitpid), schedule() runs another thread on the same CPU;
-    // that thread's syscall entry overwrites user_rsp_save with ITS user RSP.
+    // that thread's syscall entry overwrites the per-CPU slot with ITS user RSP.
     // When the original thread is rescheduled, sysret reads the OVERWRITTEN
     // value and lands on the wrong stack. Symptom: threadtest's main thread
     // crashed with RSP pointing into a worker's mmap'd thread stack.

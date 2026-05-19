@@ -38,6 +38,18 @@ var vis_w: u32 = 0;
 var vis_h: u32 = 0;
 var section_h: u32 = 0;
 
+// Label y-coordinates produced by computeLayout's VStack walk. Indexed
+// in section order: 0=Resolution, 1=Background, 2=Theme, 3=Mouse Speed,
+// 4=Dock Position, 5=Wallpaper. Render block reads from this to keep
+// the label rows aligned with the button rows below them without
+// re-doing the y math at every drawText call site.
+var label_ys: [6]u32 = [_]u32{0} ** 6;
+var wp_status_y: u32 = 0;
+// macOS-style cards — one per section. Each wraps its row of buttons
+// with rounded card_bg + AA corners. computeLayout sizes them after
+// reserving space for the row(s) inside.
+var cards: [6]ui.Card = [_]ui.Card{.{ .x = 0, .y = 0, .w = 0, .h = 0 }} ** 6;
+
 var res_btns: [2]ui.Button = undefined;
 var bg_btns: [4]ui.Button = undefined;
 const bg_colors = [4]u32{ 0x2D5F8A, 0x5F2D8A, 0x2D8A5F, 0x8A2D2D };
@@ -439,46 +451,104 @@ fn applyWallpaperAndNotify(ok_msg: []const u8, fail_msg: []const u8) void {
 fn computeLayout(w: u32, h: u32) void {
     vis_w = w;
     vis_h = h;
-    section_h = 60;
+    section_h = 60; // legacy field, no longer used by the layout itself
 
     const bh: u32 = 26;
     const m: u32 = 12;
-    var y: u32 = 58;
+    const LABEL_TO_CARD: u32 = 6; // small gap between section label and the card
+    const SECTION_GAP: u32 = 16;
+    const lh: u32 = fa.default_16.line_height;
+    const card_w: u32 = w -| (m * 2);
+    const ix: u32 = m + ui.Card.HPAD; // button x inside a card
 
-    res_btns[0] = .{ .x = m, .y = y, .w = 110, .h = bh, .label = "1280x720" };
-    res_btns[1] = .{ .x = m + 116, .y = y, .w = 120, .h = bh, .label = "1920x1080" };
-    y += section_h;
+    var v = ui.VStack.init(undefined, m, 8, card_w);
+    v.gap(fa.default_24.line_height + 12); // title row + gap
 
-    bg_btns[0] = .{ .x = m, .y = y, .w = 70, .h = bh, .label = "Blue" };
-    bg_btns[1] = .{ .x = m + 76, .y = y, .w = 80, .h = bh, .label = "Purple" };
-    bg_btns[2] = .{ .x = m + 162, .y = y, .w = 75, .h = bh, .label = "Green" };
-    bg_btns[3] = .{ .x = m + 243, .y = y, .w = 60, .h = bh, .label = "Red" };
-    y += section_h;
+    // Each section: label, small gap, then a card with one row of
+    // buttons (or two stacked rows for wallpaper). Card top/bottom are
+    // determined by `card_y_start` and `v.cursor() - card_y_start`
+    // after the row is reserved.
 
-    theme_btns[0] = .{ .x = m, .y = y, .w = 80, .h = bh, .label = "Light" };
-    theme_btns[1] = .{ .x = m + 86, .y = y, .w = 80, .h = bh, .label = "Dark" };
-    y += section_h;
+    // Resolution
+    label_ys[0] = v.cursor();
+    v.gap(lh + LABEL_TO_CARD);
+    var card_y = v.cursor();
+    v.gap(ui.Card.VPAD);
+    var y = v.reserve(bh);
+    res_btns[0] = .{ .x = ix, .y = y, .w = 110, .h = bh, .label = "1280x720" };
+    res_btns[1] = .{ .x = ix + 116, .y = y, .w = 120, .h = bh, .label = "1920x1080" };
+    v.gap(ui.Card.VPAD);
+    cards[0] = .{ .x = m, .y = card_y, .w = card_w, .h = v.cursor() - card_y };
+    v.gap(SECTION_GAP);
 
-    speed_btns[0] = .{ .x = m, .y = y, .w = 70, .h = bh, .label = "Slow" };
-    speed_btns[1] = .{ .x = m + 76, .y = y, .w = 85, .h = bh, .label = "Normal" };
-    speed_btns[2] = .{ .x = m + 167, .y = y, .w = 70, .h = bh, .label = "Fast" };
-    y += section_h;
+    // Background
+    label_ys[1] = v.cursor();
+    v.gap(lh + LABEL_TO_CARD);
+    card_y = v.cursor();
+    v.gap(ui.Card.VPAD);
+    y = v.reserve(bh);
+    bg_btns[0] = .{ .x = ix, .y = y, .w = 70, .h = bh, .label = "Blue" };
+    bg_btns[1] = .{ .x = ix + 76, .y = y, .w = 80, .h = bh, .label = "Purple" };
+    bg_btns[2] = .{ .x = ix + 162, .y = y, .w = 75, .h = bh, .label = "Green" };
+    bg_btns[3] = .{ .x = ix + 243, .y = y, .w = 60, .h = bh, .label = "Red" };
+    v.gap(ui.Card.VPAD);
+    cards[1] = .{ .x = m, .y = card_y, .w = card_w, .h = v.cursor() - card_y };
+    v.gap(SECTION_GAP);
 
-    dock_btns[0] = .{ .x = m, .y = y, .w = 90, .h = bh, .label = "Bottom" };
-    dock_btns[1] = .{ .x = m + 96, .y = y, .w = 80, .h = bh, .label = "Top" };
-    y += section_h;
+    // Theme
+    label_ys[2] = v.cursor();
+    v.gap(lh + LABEL_TO_CARD);
+    card_y = v.cursor();
+    v.gap(ui.Card.VPAD);
+    y = v.reserve(bh);
+    theme_btns[0] = .{ .x = ix, .y = y, .w = 80, .h = bh, .label = "Light" };
+    theme_btns[1] = .{ .x = ix + 86, .y = y, .w = 80, .h = bh, .label = "Dark" };
+    v.gap(ui.Card.VPAD);
+    cards[2] = .{ .x = m, .y = card_y, .w = card_w, .h = v.cursor() - card_y };
+    v.gap(SECTION_GAP);
 
-    // Wallpaper section — single "Choose Wallpaper..." button on the
-    // left, "Clear" button next to it. Status text drops to a row below
-    // with proper breathing room (the old row-of-thumb-buttons design
-    // made the status overlap the buttons themselves).
-    wp_choose_btn = .{ .x = m, .y = y, .w = 180, .h = bh, .label = "Choose Wallpaper..." };
-    wp_clear_btn = .{ .x = m + 186, .y = y, .w = 70, .h = bh, .label = "Clear" };
-    // Status line sits a full row below the buttons. section_h reserves
-    // the room.
-    y += section_h + 4;
+    // Mouse Speed
+    label_ys[3] = v.cursor();
+    v.gap(lh + LABEL_TO_CARD);
+    card_y = v.cursor();
+    v.gap(ui.Card.VPAD);
+    y = v.reserve(bh);
+    speed_btns[0] = .{ .x = ix, .y = y, .w = 70, .h = bh, .label = "Slow" };
+    speed_btns[1] = .{ .x = ix + 76, .y = y, .w = 85, .h = bh, .label = "Normal" };
+    speed_btns[2] = .{ .x = ix + 167, .y = y, .w = 70, .h = bh, .label = "Fast" };
+    v.gap(ui.Card.VPAD);
+    cards[3] = .{ .x = m, .y = card_y, .w = card_w, .h = v.cursor() - card_y };
+    v.gap(SECTION_GAP);
 
-    apply_btn = .{ .x = vis_w / 2 -| 65, .y = y, .w = 130, .h = 32, .label = "Apply" };
+    // Dock Position
+    label_ys[4] = v.cursor();
+    v.gap(lh + LABEL_TO_CARD);
+    card_y = v.cursor();
+    v.gap(ui.Card.VPAD);
+    y = v.reserve(bh);
+    dock_btns[0] = .{ .x = ix, .y = y, .w = 90, .h = bh, .label = "Bottom" };
+    dock_btns[1] = .{ .x = ix + 96, .y = y, .w = 80, .h = bh, .label = "Top" };
+    v.gap(ui.Card.VPAD);
+    cards[4] = .{ .x = m, .y = card_y, .w = card_w, .h = v.cursor() - card_y };
+    v.gap(SECTION_GAP);
+
+    // Wallpaper — button row + status line below, both inside the card
+    label_ys[5] = v.cursor();
+    v.gap(lh + LABEL_TO_CARD);
+    card_y = v.cursor();
+    v.gap(ui.Card.VPAD);
+    y = v.reserve(bh);
+    wp_choose_btn = .{ .x = ix, .y = y, .w = 180, .h = bh, .label = "Choose Wallpaper..." };
+    wp_clear_btn = .{ .x = ix + 186, .y = y, .w = 70, .h = bh, .label = "Clear" };
+    v.gap(8);
+    wp_status_y = v.reserve(lh);
+    v.gap(ui.Card.VPAD);
+    cards[5] = .{ .x = m, .y = card_y, .w = card_w, .h = v.cursor() - card_y };
+
+    // Apply — centered below all cards, 32 px tall as a primary action
+    v.gap(SECTION_GAP + 4);
+    const apply_y = v.reserve(32);
+    apply_btn = .{ .x = vis_w / 2 -| 65, .y = apply_y, .w = 130, .h = 32, .label = "Apply" };
 }
 
 // --- Status line drawer -----------------------------------------------------
@@ -514,7 +584,10 @@ fn drawWallpaperStatus(canvas: *gfx.Canvas, x: u32, y: u32) void {
         },
     }
 
-    fa.drawTextOpaque(canvas, x, y, line_buf[0..line_len], color, BG, &fa.default_16);
+    // Status sits INSIDE the wallpaper card now — bg-fill must use the
+    // card color, not the window bg, or the opaque rect punches a hole
+    // in the card.
+    fa.drawTextOpaque(canvas, x, y, line_buf[0..line_len], color, ui.palette.card_bg, &fa.default_16);
 }
 
 fn formatStatus(buf: []u8, suffix: []const u8) usize {
@@ -570,14 +643,26 @@ fn writeNum(buf: []u8, n: u32) usize {
 // --- Main -------------------------------------------------------------------
 
 export fn _start() linksection(".text.entry") callconv(.c) void {
+    // Atlases first — every later height calc (init_h below, computeLayout
+    // when called) reads line_height; lazy load would leave it as 0.
+    fa.ensureLoaded();
+
     const scr = libc.getScreenSize();
     var init_w = scr.w / 4;
     if (init_w < 460) init_w = 460;
     if (init_w > 540) init_w = 540;
-    // 6 sections + status row under the wallpaper buttons + apply button.
-    // Bumped from the old layout by +24 so the status text gets its own
-    // row instead of overlapping the wp buttons.
-    const init_h: u32 = 46 + 60 * 6 + 24 + 56;
+    // Card layout: title + 5 standard sections + wallpaper (taller, has
+    // status row) + apply. Numbers come from computeLayout's actual gaps:
+    //   title block:    title_lh + 12
+    //   per section:    label_lh + 6 (gap) + 12 (vpad) + 26 (button) + 12 (vpad) + 16 (section gap)
+    //   wallpaper extra: 8 (gap) + label_lh (status)
+    //   apply block:    (section_gap+4) + 32
+    //   bottom margin:  16
+    const bh: u32 = 26;
+    const lh16: u32 = fa.default_16.line_height;
+    const lh24: u32 = fa.default_24.line_height;
+    const per_section: u32 = lh16 + 6 + 12 + bh + 12 + 16;
+    const init_h: u32 = 8 + lh24 + 12 + per_section * 5 + (per_section + 8 + lh16) + (16 + 4 + 32) + 16;
     alloc_w = @min(init_w * 2, scr.w);
     alloc_h = @min(init_h * 2, scr.h);
     while (alloc_w * alloc_h > 524288) {
@@ -587,6 +672,13 @@ export fn _start() linksection(".text.entry") callconv(.c) void {
     loadConf();
     refreshWallpaperStatus(); // applyKv may have set sel_wp_path
     ui.setDarkMode(sel_theme == 1);
+
+    // Force font atlases parsed BEFORE computeLayout — the new VStack-based
+    // layout reads default_16/default_24's line_height to size the row
+    // gaps, and the atlases are otherwise lazy-loaded on first drawText.
+    // Without this, line_height reads as 0 (undefined) and all rows
+    // collapse onto the buttons below them.
+    fa.ensureLoaded();
 
     computeLayout(init_w, init_h);
 
@@ -777,32 +869,42 @@ export fn _start() linksection(".text.entry") callconv(.c) void {
         canvas.clear(BG);
         fa.drawTextOpaque(&canvas, 12, 8, "Settings", SECTION_COLOR, BG, &fa.default_24);
 
-        fa.drawTextOpaque(&canvas, 12, 42, "Resolution", LABEL_COLOR, BG, &fa.default_16);
+        // Each section: label outside the card, then card surface, then
+        // buttons inside. Buttons pass `palette.card_bg` as their corner
+        // clip color so the AA corners blend against the card and not the
+        // window bg behind it.
+        const cbg = ui.palette.card_bg;
+
+        fa.drawTextOpaque(&canvas, 12, label_ys[0], "Resolution", LABEL_COLOR, BG, &fa.default_16);
+        cards[0].drawBg(&canvas, BG);
         for (res_btns, 0..) |btn, i|
-            btn.drawStyled(&canvas, if (sel_resolution == i) .primary else .default, BG);
+            btn.drawStyled(&canvas, if (sel_resolution == i) .primary else .default, cbg);
 
-        fa.drawTextOpaque(&canvas, 12, 42 + section_h, "Background", LABEL_COLOR, BG, &fa.default_16);
+        fa.drawTextOpaque(&canvas, 12, label_ys[1], "Background", LABEL_COLOR, BG, &fa.default_16);
+        cards[1].drawBg(&canvas, BG);
         for (bg_btns, 0..) |btn, i|
-            btn.drawStyled(&canvas, if (sel_background == i) .primary else .default, BG);
+            btn.drawStyled(&canvas, if (sel_background == i) .primary else .default, cbg);
 
-        fa.drawTextOpaque(&canvas, 12, 42 + section_h * 2, "Theme", LABEL_COLOR, BG, &fa.default_16);
+        fa.drawTextOpaque(&canvas, 12, label_ys[2], "Theme", LABEL_COLOR, BG, &fa.default_16);
+        cards[2].drawBg(&canvas, BG);
         for (theme_btns, 0..) |btn, i|
-            btn.drawStyled(&canvas, if (sel_theme == i) .primary else .default, BG);
+            btn.drawStyled(&canvas, if (sel_theme == i) .primary else .default, cbg);
 
-        fa.drawTextOpaque(&canvas, 12, 42 + section_h * 3, "Mouse Speed", LABEL_COLOR, BG, &fa.default_16);
+        fa.drawTextOpaque(&canvas, 12, label_ys[3], "Mouse Speed", LABEL_COLOR, BG, &fa.default_16);
+        cards[3].drawBg(&canvas, BG);
         for (speed_btns, 0..) |btn, i|
-            btn.drawStyled(&canvas, if (sel_mouse_speed == i) .primary else .default, BG);
+            btn.drawStyled(&canvas, if (sel_mouse_speed == i) .primary else .default, cbg);
 
-        fa.drawTextOpaque(&canvas, 12, 42 + section_h * 4, "Dock Position", LABEL_COLOR, BG, &fa.default_16);
+        fa.drawTextOpaque(&canvas, 12, label_ys[4], "Dock Position", LABEL_COLOR, BG, &fa.default_16);
+        cards[4].drawBg(&canvas, BG);
         for (dock_btns, 0..) |btn, i|
-            btn.drawStyled(&canvas, if (sel_dock_pos == i) .primary else .default, BG);
+            btn.drawStyled(&canvas, if (sel_dock_pos == i) .primary else .default, cbg);
 
-        // Wallpaper section — single Choose... button + Clear, status
-        // text on its own row beneath with proper breathing.
-        fa.drawTextOpaque(&canvas, 12, 42 + section_h * 5, "Wallpaper", LABEL_COLOR, BG, &fa.default_16);
-        wp_choose_btn.drawStyled(&canvas, .default, BG);
-        wp_clear_btn.drawStyled(&canvas, .default, BG);
-        drawWallpaperStatus(&canvas, 12, 42 + section_h * 5 + 26 + 14);
+        fa.drawTextOpaque(&canvas, 12, label_ys[5], "Wallpaper", LABEL_COLOR, BG, &fa.default_16);
+        cards[5].drawBg(&canvas, BG);
+        wp_choose_btn.drawStyled(&canvas, .default, cbg);
+        wp_clear_btn.drawStyled(&canvas, .default, cbg);
+        drawWallpaperStatus(&canvas, cards[5].innerX(), wp_status_y);
 
         apply_btn.drawStyled(&canvas, .primary, BG);
 

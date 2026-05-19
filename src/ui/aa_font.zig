@@ -94,9 +94,20 @@ pub const Atlas = struct {
     }
 };
 
-const blob_16: []const u8 align(2) = @embedFile("assets/font_16.bin");
-const blob_24: []const u8 align(2) = @embedFile("assets/font_24.bin");
-const blob_mono: []const u8 align(2) = @embedFile("assets/font_mono.bin");
+// Atlases come from the `font_blobs` module — a thin embed-only module
+// in lib/ that resolves to lib/assets/font_*.bin, the same files used by
+// the UEFI bootloader (lib/aa_font_uefi.zig) and userspace libc
+// (lib/font_atlas.zig). tools/patch_atlas_blocks.py writes there.
+//
+// Prior to 2026-05-19 this file embedded from a separate src/ui/assets/
+// copy that drifted out of sync — fastfetch's Z went invisible because
+// the kernel atlas was the unpatched ASCII-only version while UEFI/libc
+// had the block-element-extended one. The shared module eliminates the
+// drift class structurally.
+const font_blobs = @import("font_blobs");
+const blob_16 = font_blobs.blob_16;
+const blob_24 = font_blobs.blob_24;
+const blob_mono = font_blobs.blob_mono;
 
 comptime {
     if (blob_16.len < 32) @compileError("aa_font: font_16.bin missing or truncated");

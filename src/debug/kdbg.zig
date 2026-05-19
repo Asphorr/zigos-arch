@@ -563,7 +563,28 @@ fn dumpCpuSnapshot() void {
         serial.print("  cpu{d}: alive={} lapic_id={d} current_pid={d} idle_pid={d}\n", .{
             i, cpu.alive, cpu.lapic_id, pid_s, idle_s,
         });
+        // TSS dump — caught today's netstat-crash bug class would have
+        // been one cpu showing tss.rsp0 = wrong-pid's-top. Both the IDT
+        // gate and the SYSCALL path read this same field (LSTAR stub
+        // loads RSP from cpus[N].tss.rsp0), so it's the canonical source.
+        serial.print("        tss.rsp0=0x{X:0>16} tss.rsp1=0x{X:0>16} tss.rsp2=0x{X:0>16}\n", .{
+            cpu.tss.rsp0, cpu.tss.rsp1, cpu.tss.rsp2,
+        });
     }
+    // Per-CPU breadcrumb dump — what each CPU was doing at the moment of
+    // capture. Often more useful than the bare current_pid because it
+    // identifies the kernel transition (SYSCALL X / IRQ0 / SCHED_ENTER /
+    // SWITCH_TO / EXC vec=N) the CPU was inside.
+    @import("breadcrumb.zig").dump();
+    // Per-CPU save-trace ring — every recent switchTo save with its
+    // saved-RIP plausibility verdict. A BAD-RIP entry is the smoking gun
+    // for kesp-clobber bugs (netstat-desktop 2026-05-17 class): the bad
+    // value was already in the slot at save time, dispatch just exposed it.
+    @import("save_trace.zig").dumpAll();
+    // Per-CPU current_pid transition ring. Same-pid races (per_cpu_asm
+    // alias bug class) show as two CPUs both having entries with the
+    // SAME new_pid at near-identical TSC values.
+    @import("pid_trace.zig").dumpAll();
 }
 
 // === All-process snapshot ==================================================
@@ -765,22 +786,45 @@ pub var nmi_halt_after_snapshot: bool = false;
 pub fn nmiSnapshot(rsp: u64, saved_rip: u64, saved_cs: u64) void {
     // Do NOT enter the panic critical section here — the caller of
     // broadcastNMI() likely holds it, and we'd deadlock waiting forever.
-    // Each NMI snapshot is short (1-2 lines with per-cpu prefix) so even
-    // interleaved output stays grep-able.
+    // Each NMI snapshot is short so even interleaved output stays
+    // grep-able (the post-`broadcastNMI` 50 ms wait + peers halting
+    // gives us mostly-clean output in practice).
     const apic = @import("../time/apic.zig");
     const smp = @import("../cpu/smp.zig");
+    const process = @import("../proc/process.zig");
     const cpu_id: u32 = @intCast(apic.getLapicId());
-    const cur_pid: i32 = if (cpu_id < smp.MAX_CPUS) blk: {
-        if (smp.cpus[cpu_id].current_pid) |p| break :blk @intCast(p);
-        break :blk -1;
-    } else -1;
+    const cur_pid_opt: ?usize = if (cpu_id < smp.MAX_CPUS)
+        smp.cpus[cpu_id].current_pid
+    else
+        null;
+    const cur_pid: i32 = if (cur_pid_opt) |p| @intCast(p) else -1;
+
     serial.print("[nmi-snap cpu{d}] rip=0x{X:0>16} cs=0x{X:0>4} rsp=0x{X:0>16} pid={d}", .{
         cpu_id, saved_rip, saved_cs, rsp, cur_pid,
     });
     if (symbols.resolveKernel(saved_rip)) |r| {
-        serial.print(" fn={s}+0x{X}\n", .{ r.name, r.offset });
+        serial.print(" fn={s}+0x{X}", .{ r.name, r.offset });
+    }
+    // Decode CPU+PCB state on a second line so the per-line lock keeps
+    // it from byte-interleaving with the rip line above. Tells us
+    // whether the wedged CPU was: running a normal task, parked in
+    // .sleeping (and on what wait_kind/target), or in idle.
+    if (cur_pid_opt) |p| {
+        if (p < process.MAX_PROCS) {
+            const pcb = &process.procs[p];
+            const name_slice = pcb.name[0..@min(pcb.name_len, pcb.name.len)];
+            serial.print("\n[nmi-snap cpu{d}] name='{s}' state={d} wait_kind={d} wait_target=0x{X} is_idle={any}\n", .{
+                cpu_id, name_slice,
+                @intFromEnum(pcb.state),
+                @intFromEnum(pcb.wait_kind),
+                pcb.wait_target,
+                pcb.is_idle,
+            });
+        } else {
+            serial.print("\n", .{});
+        }
     } else {
-        serial.print("\n", .{});
+        serial.print("\n[nmi-snap cpu{d}] current_pid=null (no task on this CPU)\n", .{cpu_id});
     }
 
     // Panic-path receivers stop here; non-panic diagnostic callers

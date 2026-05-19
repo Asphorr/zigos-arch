@@ -70,7 +70,7 @@ pub fn render() void {
     const dy: i32 = dockY();
     dirty_rects.add(0, if (dy < 0) 0 else @intCast(dy), gfx.screen_w, TASKBAR_H);
 
-    const pinned_count: u32 = pinned.list.len;
+    const pinned_count: u32 = pinned.dock_indices.len;
     var running_count: u32 = 0;
     for (wm.z_stack[0..wm.z_count]) |i| {
         if (wm.windows[i].visible) running_count += 1;
@@ -92,8 +92,12 @@ pub fn render() void {
     var icon_x: i32 = pill_x + @as(i32, DOCK_PILL_PAD);
     const icon_y: i32 = pill_y + @as(i32, DOCK_PILL_PAD);
 
-    // Pinned shortcuts
-    for (pinned.list, 0..) |sc, si| {
+    // Pinned shortcuts — only the "system tray" subset (see pinned.dock_indices).
+    // The desktop sidebar still shows the full launcher; the dock stays lean
+    // so it can dedicate space to running-window thumbnails next to a few
+    // always-useful tools.
+    for (pinned.dock_indices) |pinned_idx| {
+        const sc = pinned.list[pinned_idx];
         gfx.drawIcon32(icon_x, icon_y, sc.icon);
 
         // Running indicator dot if this shortcut has a window open
@@ -111,7 +115,9 @@ pub fn render() void {
         }
 
         if (btn_count < wm.MAX_WINDOWS + 10) {
-            btn_positions[btn_count] = .{ .x = icon_x, .idx = @intCast(si), .is_shortcut = true };
+            // `idx` indexes pinned.list (so launchShortcut/tooltip lookup
+            // stays uniform across the dock + sidebar surfaces).
+            btn_positions[btn_count] = .{ .x = icon_x, .idx = pinned_idx, .is_shortcut = true };
             btn_count += 1;
         }
         icon_x += @as(i32, icon_slot);

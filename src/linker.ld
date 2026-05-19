@@ -71,11 +71,13 @@ SECTIONS {
     }
     /* Hardened-data section: page-aligned, gets its W-bit cleared at boot.
      * Critical kernel structs that are rarely written + must never be
-     * wildly written (per_cpu_asm.syscall_stack_top, etc.) opt in via
-     * `linksection(".kdata_protected")`. Their only legit writers wrap
-     * writes with paging.unlockKdata()/lockKdata(). Any other write
-     * traps as #PF with the writer's RIP — turning a class of silent
-     * BSS-corruption bugs into immediate panics. */
+     * wildly written opt in via `linksection(".kdata_protected")`. Their
+     * only legit writers wrap writes with paging.unlockKdata()/lockKdata().
+     * Any other write traps as #PF with the writer's RIP — turning a
+     * class of silent BSS-corruption bugs into immediate panics.
+     * Currently no opt-ins (per_cpu_asm.syscall_stack_top was retired
+     * when the syscall LSTAR stub started loading RSP from
+     * cpus[N].tss.rsp0 directly); section retained for future use. */
     .kdata_protected ALIGN(4K) : AT(ADDR(.kdata_protected) - KERNEL_VIRT_BASE) {
         __kdata_protected_start = .;
         *(.kdata_protected) *(.kdata_protected.*)

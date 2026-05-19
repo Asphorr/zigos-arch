@@ -68,6 +68,13 @@ var total_frames: u32 = 0;
 var managed_frames: u32 = 0;
 var next_free_word: usize = 0; // Hint: start scanning from here
 
+/// Kernel emergency reserve — number of frames that allocFrameUser refuses
+/// to dip below, so user-driven faulting can never starve the kernel of
+/// frames it needs for page tables, kstacks, etc. Set to 5% of managed
+/// in init(). Kernel-internal callers use allocFrame() which doesn't check
+/// the reserve; user-faulting paths use allocFrameUser() which does.
+var pmm_user_reserve: u32 = 0;
+
 // Per-frame reference count for COW. Lockstep invariant: frame_refs[i] == 0 ⟺
 // bitmap-says-free OR sitting in some CPU's magazine cache; frame_refs[i] >= 1 ⟺
 // allocated to at least one address space. 1 byte/frame = 1 MB BSS for 4 GB
@@ -136,6 +143,7 @@ pub fn markRegionUsed(base: usize, length: usize) void {
 }
 
 pub fn init(info: *const boot_info.BootInfo) void {
+    @import("../proc/spinlock.zig").registerLock("pmm.lock", &lock);
     // Mark all frames as used initially
     for (&bitmap) |*word| {
         word.* = 0xFFFFFFFF;
@@ -206,6 +214,14 @@ pub fn init(info: *const boot_info.BootInfo) void {
     // KASAN shadow when enabled) will be accounted for as "used" against
     // this baseline rather than disappearing from the total.
     managed_frames = total_frames;
+
+    // 5% of managed frames, capped at a sane absolute (don't tie up
+    // 50 MB on a 1 GB host but also don't shrink below 256 frames =
+    // 1 MB on a 24 MB host — that's where kernel page-table churn
+    // alone can eat).
+    const five_pct: u32 = managed_frames / 20;
+    pmm_user_reserve = if (five_pct < 256) 256 else if (five_pct > 4096) 4096 else five_pct;
+    @import("../debug/serial.zig").print("[pmm] kernel reserve = {d} frames ({d} KB)\n", .{ pmm_user_reserve, pmm_user_reserve * 4 });
 }
 
 /// Internal: scan the bitmap for one free frame, mark it used, and return
@@ -252,6 +268,7 @@ pub fn allocFrame() ?usize {
         cpu.pmm_cache_count -= 1;
         const phys = cpu.pmm_cache[cpu.pmm_cache_count];
         checkPhysSafety(phys, "allocFrame(cache)");
+        checkKstackOverlap(phys, 1, "allocFrame(cache)", ra);
         @import("../debug/kdbg.zig").pmmAlloc(phys, 1, ra);
         @import("../debug/kasan.zig").unpoison(phys, FRAME_SIZE);
         frame_refs[phys / FRAME_SIZE] = 1;
@@ -273,6 +290,7 @@ pub fn allocFrame() ?usize {
     }
 
     checkPhysSafety(first, "allocFrame");
+    checkKstackOverlap(first, 1, "allocFrame", ra);
     @import("../debug/kdbg.zig").pmmAlloc(first, 1, ra);
     @import("../debug/kasan.zig").unpoison(first, FRAME_SIZE);
     frame_refs[first / FRAME_SIZE] = 1;
@@ -378,6 +396,62 @@ fn markRange(start_frame: u32, count: u32) void {
     if (total_frames >= count) total_frames -= count else total_frames = 0;
 }
 
+/// Tripwire: does this phys range overlap kstack_pool? Used on the FREE
+/// path — passing a kstack phys to freeFrame/freeContiguous marks the
+/// underlying frame "free" so the next alloc returns it; the new owner
+/// then zeroes/uses the page, clobbering a live kstack. There is no
+/// legitimate path that frees a kstack frame (kstack_pool is BSS, never
+/// PMM-managed), so any hit is unambiguously a bug — @panic to catch
+/// the buggy caller in the backtrace.
+fn checkKstackNotFreed(base: usize, count: u32, site: []const u8, ra: usize) void {
+    const process_mod = @import("../proc/process.zig");
+    const KERNEL_VIRT_BASE: usize = 0xFFFFFFFF80000000;
+    const ks_va = @intFromPtr(&process_mod.kstack_pool);
+    const ks_phys_start = ks_va - KERNEL_VIRT_BASE;
+    const ks_phys_end = ks_phys_start + @sizeOf(@TypeOf(process_mod.kstack_pool));
+    const free_end = base + @as(usize, count) * FRAME_SIZE;
+    if (base < ks_phys_end and free_end > ks_phys_start) {
+        const symbols = @import("../debug/symbols.zig");
+        const ser = @import("../debug/serial.zig");
+        ser.print("\n[pmm-bad-free] !!! {s} releasing phys 0x{X}..0x{X} INSIDE kstack_pool [0x{X}..0x{X}) !!!\n", .{
+            site, base, free_end, ks_phys_start, ks_phys_end,
+        });
+        if (symbols.resolveKernelNearest(@as(u64, ra))) |sym| {
+            ser.print("[pmm-bad-free]   caller: {s}+0x{X}\n", .{ sym.name, sym.offset });
+        } else {
+            ser.print("[pmm-bad-free]   caller RA: 0x{X}\n", .{ra});
+        }
+        @panic("freeFrame on kstack_pool — kstack frame being treated as PMM-managed");
+    }
+}
+
+/// Tripwire: does this phys range overlap kstack_pool (a kernel .bss
+/// region that PMM should NEVER hand out — kstacks live there at fixed
+/// addresses)? Symbol-derived so it tracks kernel growth automatically.
+/// On hit, log the caller's RA + the bad phys; the next @memset via
+/// physmap on this range will zero a live kstack — exactly the
+/// netstat-desktop bug class.
+fn checkKstackOverlap(base: usize, count: u32, site: []const u8, ra: usize) void {
+    const process_mod = @import("../proc/process.zig");
+    const KERNEL_VIRT_BASE: usize = 0xFFFFFFFF80000000;
+    const ks_va = @intFromPtr(&process_mod.kstack_pool);
+    const ks_phys_start = ks_va - KERNEL_VIRT_BASE;
+    const ks_phys_end = ks_phys_start + @sizeOf(@TypeOf(process_mod.kstack_pool));
+    const alloc_end = base + @as(usize, count) * FRAME_SIZE;
+    if (base < ks_phys_end and alloc_end > ks_phys_start) {
+        const symbols = @import("../debug/symbols.zig");
+        const ser = @import("../debug/serial.zig");
+        ser.print("\n[pmm-bad-alloc] !!! {s} returned phys 0x{X}..0x{X} overlapping kstack_pool [0x{X}..0x{X}) !!!\n", .{
+            site, base, alloc_end, ks_phys_start, ks_phys_end,
+        });
+        if (symbols.resolveKernelNearest(@as(u64, ra))) |sym| {
+            ser.print("[pmm-bad-alloc]   caller: {s}+0x{X}\n", .{ sym.name, sym.offset });
+        } else {
+            ser.print("[pmm-bad-alloc]   caller RA: 0x{X}\n", .{ra});
+        }
+    }
+}
+
 /// Allocate `count` physically contiguous frames. Returns base physical address.
 pub fn allocContiguous(count: u32) ?usize {
     if (count == 0) return null;
@@ -393,6 +467,7 @@ pub fn allocContiguous(count: u32) ?usize {
     checkPhysSafety(base, "allocContiguous");
     const last: usize = base + (@as(usize, count) - 1) * FRAME_SIZE;
     if (last != base) checkPhysSafety(last, "allocContiguous(last)");
+    checkKstackOverlap(base, count, "allocContiguous", ra);
     @import("../debug/kdbg.zig").pmmAlloc(base, count, ra);
     @import("../debug/kasan.zig").unpoison(base, @as(usize, count) * FRAME_SIZE);
     return base;
@@ -414,6 +489,7 @@ pub fn allocContiguousBelow4G(count: u32) ?usize {
     checkPhysSafety(base, "allocContiguousBelow4G");
     const last: usize = base + (@as(usize, count) - 1) * FRAME_SIZE;
     if (last != base) checkPhysSafety(last, "allocContiguousBelow4G(last)");
+    checkKstackOverlap(base, count, "allocContiguousBelow4G", ra);
     @import("../debug/kdbg.zig").pmmAlloc(base, count, ra);
     @import("../debug/kasan.zig").unpoison(base, @as(usize, count) * FRAME_SIZE);
     return base;
@@ -426,6 +502,7 @@ pub fn freeFrame(phys_addr: usize) void {
         @import("../debug/serial.zig").print("[pmm] WARNING: freeFrame bad addr=0x{X} (frame={X})\n", .{ phys_addr, frame_num });
         return;
     }
+    checkKstackNotFreed(phys_addr, 1, "freeFrame", ra);
 
     // Atomic refcount drop. Common COW case: another address space still holds
     // a reference, so we just decrement and return — frame stays mapped there.
@@ -510,6 +587,7 @@ pub fn freeContiguous(phys_addr: usize, count: u32) void {
         @import("../debug/serial.zig").print("[pmm] WARNING: freeContiguous bad range start=0x{X} count={d}\n", .{ phys_addr, count });
         return;
     }
+    checkKstackNotFreed(phys_addr, count, "freeContiguous", ra);
 
     // Bulk free assumes the entire range is single-owner (refcount==1 each).
     // Contiguous frames are DMA buffers / page-table pools / GUI FBs — none of
@@ -565,6 +643,26 @@ pub fn freeContiguous(phys_addr: usize, count: u32) void {
 
 pub fn freeFrameCount() u32 {
     return total_frames;
+}
+
+/// User-faulting variant of allocFrame. Refuses to dip below the kernel
+/// emergency reserve so a runaway user app can't exhaust PMM to the
+/// point where the kernel itself can't allocate page tables / kstacks
+/// / etc., which is when we previously saw mapUserPage wedge while
+/// spinning under PMM contention. Returns null when the would-be
+/// post-alloc free count is at or below the reserve — caller must
+/// surface that as ENOMEM to userspace and let the process die.
+pub fn allocFrameUser() ?usize {
+    if (total_frames <= pmm_user_reserve) return null;
+    return allocFrame();
+}
+
+/// User-faulting variant of allocContiguous. Same reserve check —
+/// big mmap-with-fd requests fail cleanly when PMM is tight rather
+/// than starving the kernel.
+pub fn allocContiguousUser(count: u32) ?usize {
+    if (total_frames <= pmm_user_reserve + count) return null;
+    return allocContiguous(count);
 }
 
 /// Total frames managed by PMM, snapshotted at end of init(). Stable for
@@ -624,4 +722,54 @@ pub fn printStats() void {
     vga.fg = .LightGray;
     vga.print("  Free frames: {d}\n", .{free});
     vga.print("  Free memory: {d} KB ({d} MB)\n", .{ free_kb, free_mb });
+}
+
+// =============================================================================
+// Reclaim registry — modules with reclaimable caches (GUI back-buffers,
+// scrollback rings, etc.) register a callback that PMM can invoke when
+// a caller hits an allocation failure. Each callback returns the number
+// of frames it freed; PMM totals them and the caller decides whether to
+// retry the alloc or escalate to OOM-kill.
+//
+// Why opt-in by caller and not inside allocFrame/allocContiguous: the
+// allocator holds its own internal lock, and reclaim callbacks may
+// re-enter the allocator via freeContiguous. Caller-driven reclaim runs
+// outside the alloc-lock critical section, sidestepping the recursion.
+// Callers that don't care about reclaim (boot-time, kernel-internal)
+// just see the orelse return as before.
+//
+// Registration is one-shot per module at boot — typically from main.zig
+// after the subsystem (desktop, fs, etc.) is up.
+// =============================================================================
+
+pub const ReclaimFn = *const fn (needed: u32) u32;
+
+const MAX_RECLAIMERS: usize = 4;
+var reclaim_fns: [MAX_RECLAIMERS]?ReclaimFn = [_]?ReclaimFn{null} ** MAX_RECLAIMERS;
+var reclaim_count: u8 = 0;
+
+pub fn registerReclaim(f: ReclaimFn) void {
+    if (reclaim_count >= MAX_RECLAIMERS) return;
+    reclaim_fns[reclaim_count] = f;
+    reclaim_count += 1;
+}
+
+/// Walk every registered reclaim callback, return total frames freed.
+/// Stops early if a callback frees more than `needed`. Logs the result
+/// so post-mortems can see whether reclaim was effective.
+pub fn tryReclaim(needed: u32) u32 {
+    var freed: u32 = 0;
+    var i: u8 = 0;
+    while (i < reclaim_count) : (i += 1) {
+        const f = reclaim_fns[i] orelse continue;
+        if (freed >= needed) break;
+        freed += f(needed -| freed);
+    }
+    if (freed > 0) {
+        const debug = @import("../debug/debug.zig");
+        debug.klog("[reclaim] needed={d} freed={d} pmm_free now {d}/{d}\n", .{
+            needed, freed, freeFrameCount(), managedFrameCount(),
+        });
+    }
+    return freed;
 }

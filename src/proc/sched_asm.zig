@@ -22,6 +22,13 @@
 
 const std = @import("std");
 
+// Pull save_trace into the import graph so the `save_trace_record` export
+// is present at link time — the inline asm in switchTo references it by
+// symbol name, which Zig's dependency tracker can't see.
+comptime {
+    _ = @import("../debug/save_trace.zig");
+}
+
 /// Save the calling task's kernel context (6 callee-saves + RSP) and
 /// switch to `next_kesp`'s kernel context. The next task resumes at
 /// wherever it last called `switchTo` from. When THIS task is later
@@ -60,6 +67,19 @@ pub fn switchTo() callconv(.naked) void {
         \\ testq %%rdi, %%rdi
         \\ jz 1f
         \\ movq %%rsp, (%%rdi)
+        // ---- save_trace: record the kesp we just wrote -----------------
+        // After 6 pushes, RSP is at (caller's RSP - 56), mod 16 = 8.
+        // pushq %%rsi → mod 16 = 0 → callq's push aligns callee to 8 ✓.
+        // RSI carries next_kesp which the post-save path still needs, so
+        // preserve it across the call. RDI is the kesp_ptr (= first SysV
+        // arg), which save_trace_record consumes; we don't need it after.
+        // Save trace can be globally disabled at link time by stubbing
+        // save_trace_record to a `ret`, but the cost is ~30ns/save so
+        // it stays armed.
+        \\ pushq %%rsi
+        \\ callq save_trace_record
+        \\ popq %%rsi
+        // ---------------------------------------------------------------
         \\ 1:
         \\ movq %%rsi, %%rsp
         \\ popq %%r15

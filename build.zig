@@ -61,6 +61,17 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // Single source of truth for SF Pro / SF Mono atlas .bin blobs. Lives in
+    // lib/ so its @embedFile resolves inside lib/assets/, the same files
+    // patched by tools/patch_atlas_blocks.py. Both kernel
+    // (src/ui/aa_font.zig) and userspace (lib/font_atlas.zig) import from
+    // this module, eliminating the prior dual-copy drift.
+    const font_blobs_mod = b.createModule(.{
+        .root_source_file = b.path("lib/font_blobs.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const kernel = b.addExecutable(.{
         .name = "kernel.elf",
         .root_module = b.createModule(.{
@@ -77,6 +88,7 @@ pub fn build(b: *std.Build) void {
             .code_model = .kernel,
             .imports = &.{
                 .{ .name = "shapes", .module = kernel_shapes_mod },
+                .{ .name = "font_blobs", .module = font_blobs_mod },
             },
         }),
         // Zig 0.16's self-hosted x86 backend can't yet encode some of our
@@ -273,6 +285,19 @@ pub fn build(b: *std.Build) void {
             .{ .name = "libc", .module = libc_mod },
         },
     });
+    // Open-Meteo client built on http + json. Used by both the
+    // terminal wx.elf and the GUI weather.elf so the API + WMO code
+    // mapping lives in one place.
+    const weather_mod = b.createModule(.{
+        .root_source_file = b.path("lib/weather.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "libc", .module = libc_mod },
+            .{ .name = "http", .module = http_mod },
+            .{ .name = "json", .module = json_mod },
+        },
+    });
 
     // Helper to create a user-space app executable
     const gui_imports: []const std.Build.Module.Import = &.{
@@ -283,6 +308,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "font_atlas", .module = font_atlas_mod },
         .{ .name = "http", .module = http_mod },
         .{ .name = "json", .module = json_mod },
+        .{ .name = "weather", .module = weather_mod },
     };
 
     // --- 2. USER APPS ---
@@ -357,6 +383,8 @@ pub fn build(b: *std.Build) void {
         .{ "httpsget.elf", "app/httpsget.zig" },
         .{ "curl.elf", "app/curl.zig" },
         .{ "jq.elf", "app/jq.zig" },
+        .{ "wx.elf", "app/wx.zig" },
+        .{ "weather.elf", "app/weather.zig" },
     };
 
     inline for (gui_apps) |entry| {

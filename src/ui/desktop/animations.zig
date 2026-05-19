@@ -45,6 +45,11 @@ pub fn start(idx: u8, atype: AnimationType) void {
     w.anim_type = atype;
     w.anim_frame = 0;
     w.anim_total = 6;
+    // Event-driven compositor wake: the next loop iteration will see
+    // hasActiveAnimations() and self-wake itself per frame until the
+    // animation drains; this initial wake is what brings the desktop
+    // back at all if it was parked.
+    @import("wake.zig").requestWake();
 
     switch (atype) {
         .opening => {

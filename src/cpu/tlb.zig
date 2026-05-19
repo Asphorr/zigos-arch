@@ -37,6 +37,7 @@ const debug = @import("../debug/debug.zig");
 const perf = @import("../debug/perf.zig");
 const pcid = @import("pcid.zig");
 const protect = @import("protect.zig");
+const hyperv = @import("../virt/hyperv.zig");
 
 // Slow-shootdown threshold (cycles). At Kaby Lake 2.4 GHz nominal TSC,
 // 2.5M cycles ≈ 1 ms — well above the few-μs IPI round-trip budget.
@@ -88,6 +89,7 @@ var current_va: u64 = 0;
 pub var n_shootdowns_full: u64 = 0;
 pub var n_shootdowns_context: u64 = 0;
 pub var n_shootdowns_page: u64 = 0;
+pub var n_shootdowns_via_hypercall: u64 = 0;
 
 inline fn flushLocalTlb() void {
     asm volatile (
@@ -158,37 +160,63 @@ fn doShootdown(mode: Mode, affected_pcid: u16, va: u64) void {
     current_pcid = affected_pcid;
     current_va = va;
 
-    // Bump ack-pending for each live target. Skip self — sender does its
-    // own flush at the end without bouncing through an IPI.
-    var n_targets: u32 = 0;
-    var i: u8 = 0;
-    while (i < smp.MAX_CPUS) : (i += 1) {
-        if (i == me) continue;
-        if (!smp.cpus[i].alive) continue;
-        _ = ack_pending[i].fetchAdd(1, .acq_rel);
-        n_targets += 1;
+    // Hyper-V fast path: HvCallFlushVirtualAddressSpace flushes all VPs
+    // (including self) for the given address space in one hypercall —
+    // skipping the IPI fan-out and the wait-for-ack spin. Only used for
+    // whole-AS flushes (.full / .single_context); .single_page still goes
+    // through the IPI path because we'd need HvCallFlushVirtualAddressList
+    // to express a single VA, which isn't wired yet.
+    //
+    // On success: skip the IPI block and the local flush (the hypercall
+    // covered self too). Still bump the PCID gen counter so peers lazy-
+    // flush again on their next CR3 load (belt-and-suspenders).
+    var via_hypercall = false;
+    if ((mode == .full or mode == .single_context) and hyperv.hasHypercalls()) {
+        const cr3 = asm volatile ("movq %%cr3, %[ret]"
+            : [ret] "=r" (-> u64),
+        );
+        if (hyperv.flushAllProcessors(cr3)) {
+            via_hypercall = true;
+            n_shootdowns_via_hypercall +%= 1;
+        }
     }
 
-    if (n_targets > 0) {
-        // Broadcast. icrSend doesn't have an "all-except-self" shorthand
-        // wired up, so unicast-loop targeting each live CPU's LAPIC ID.
-        // Tiny cost (~10 ICR writes max with MAX_CPUS=32).
-        i = 0;
+    // IPI fan-out path. Skipped entirely when the hypercall above already
+    // flushed all VPs. `i` and `n_targets` are scoped to the whole block
+    // so the broadcast loop can reuse the same iterator.
+    var n_targets: u32 = 0;
+    if (!via_hypercall) {
+        var i: u8 = 0;
+        // Bump ack-pending for each live target. Skip self — sender does
+        // its own flush at the end without bouncing through an IPI.
         while (i < smp.MAX_CPUS) : (i += 1) {
             if (i == me) continue;
             if (!smp.cpus[i].alive) continue;
-            apic.sendIPI(i, TLB_VECTOR);
+            _ = ack_pending[i].fetchAdd(1, .acq_rel);
+            n_targets += 1;
         }
 
-        // Wait for each target to ack. Bounded — worst case the target is
-        // running with cli; once it sti's, the queued IPI fires and the
-        // ack lands. Tens of microseconds typical, never milliseconds
-        // unless something is wedged (in which case the watchdog catches it).
-        i = 0;
-        while (i < smp.MAX_CPUS) : (i += 1) {
-            if (i == me) continue;
-            if (!smp.cpus[i].alive) continue;
-            while (ack_pending[i].load(.acquire) != 0) pause();
+        if (n_targets > 0) {
+            // Broadcast. icrSend doesn't have an "all-except-self" shorthand
+            // wired up, so unicast-loop targeting each live CPU's LAPIC ID.
+            // Tiny cost (~10 ICR writes max with MAX_CPUS=32).
+            i = 0;
+            while (i < smp.MAX_CPUS) : (i += 1) {
+                if (i == me) continue;
+                if (!smp.cpus[i].alive) continue;
+                apic.sendIPI(i, TLB_VECTOR);
+            }
+
+            // Wait for each target to ack. Bounded — worst case the target
+            // is running with cli; once it sti's, the queued IPI fires and
+            // the ack lands. Tens of microseconds typical, never milliseconds
+            // unless something is wedged (in which case the watchdog catches it).
+            i = 0;
+            while (i < smp.MAX_CPUS) : (i += 1) {
+                if (i == me) continue;
+                if (!smp.cpus[i].alive) continue;
+                while (ack_pending[i].load(.acquire) != 0) pause();
+            }
         }
     }
 
@@ -198,7 +226,11 @@ fn doShootdown(mode: Mode, affected_pcid: u16, va: u64) void {
     // the PCID generation counter (only for whole-context flushes — for
     // single-page mode we just removed one entry, the rest of the PCID
     // is still valid and peers should NOT lazy-flush on next CR3 load).
-    flushLocalForMode();
+    //
+    // Hypercall path already flushed self via FLUSH_ALL_PROCESSORS, so
+    // skip the local flush there — but still bump PCID gen as a belt-
+    // and-suspenders defense (same reason as the IPI path).
+    if (!via_hypercall) flushLocalForMode();
     if ((mode == .single_context or mode == .full) and affected_pcid != 0) {
         pcid.bumpAfterShootdown(affected_pcid, me);
     }
