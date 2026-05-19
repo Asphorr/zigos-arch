@@ -455,6 +455,69 @@ pub fn build(b: *std.Build) void {
     doom_real.root_module.addIncludePath(b.path("doom_src"));
     b.installArtifact(doom_real);
 
+    // --- Quake 1 (real engine via vendored id WinQuake 1999 source) ---
+    const quake1 = b.addExecutable(.{
+        .name = "quake1.elf",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("app/quake1.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "libc", .module = libc_mod },
+            },
+        }),
+    });
+    quake1.setLinkerScript(b.path("app/linker.ld"));
+    quake1.root_module.addCSourceFiles(.{
+        .root = b.path("quake_src"),
+        .files = &.{
+            "cl_demo.c",   "cl_input.c",  "cl_main.c",   "cl_parse.c",  "cl_tent.c",
+            "chase.c",     "cmd.c",       "common.c",    "console.c",   "crc.c",
+            "cvar.c",      "draw.c",
+            "d_edge.c",    "d_fill.c",    "d_init.c",    "d_modech.c",  "d_part.c",
+            "d_polyse.c",  "d_scan.c",    "d_sky.c",     "d_sprite.c",  "d_surf.c",
+            "d_vars.c",    "d_zpoint.c",
+            "host.c",      "host_cmd.c",  "keys.c",      "menu.c",      "mathlib.c",
+            "model.c",
+            "net_loop.c",  "net_main.c",  "net_none.c",
+            "nonintel.c",
+            "pr_cmds.c",   "pr_edict.c",  "pr_exec.c",
+            "r_aclip.c",   "r_alias.c",   "r_bsp.c",     "r_light.c",   "r_draw.c",
+            "r_efrag.c",   "r_edge.c",    "r_misc.c",    "r_main.c",    "r_sky.c",
+            "r_sprite.c",  "r_surf.c",    "r_part.c",    "r_vars.c",
+            "screen.c",    "sbar.c",
+            "snd_dma.c",   "snd_mem.c",   "snd_mix.c",
+            "sv_main.c",   "sv_phys.c",   "sv_move.c",   "sv_user.c",
+            "view.c",      "wad.c",       "world.c",     "zone.c",
+            "cd_null.c",
+            "sys_zigos.c",
+        },
+        .flags = &.{
+            "-fno-stack-protector",
+            "-fno-strict-aliasing",
+            "-fno-builtin",
+            "-ffreestanding",
+            "-Wno-implicit-function-declaration",
+            "-Wno-int-conversion",
+            "-Wno-pointer-sign",
+            "-Wno-return-type",
+            "-Wno-format",
+            "-Wno-missing-declarations",
+            "-Wno-shift-negative-value",
+            "-Wno-incompatible-pointer-types",
+            "-Wno-parentheses",
+            "-Wno-date-time",
+            // GCC <10 default. Q1's renderer has tentative defs that
+            // collide under lld's default strict mode (sadjust, tadjust,
+            // bbextents et al appear in several r_*.c files).
+            "-fcommon",
+        },
+    });
+    quake1.root_module.addSystemIncludePath(b.path("quake_src/include"));
+    quake1.root_module.addSystemIncludePath(b.path("doom_src/include"));
+    quake1.root_module.addIncludePath(b.path("quake_src"));
+    b.installArtifact(quake1);
+
     // --- STB_IMAGE BINDINGS (shared by photo.elf, wallpaper.elf, settings.elf) ---
     // First Zig 0.16 addTranslateC user: vendor/photo_lib.h is a tiny C
     // header declaring the public stb_image API surface; translate-c
