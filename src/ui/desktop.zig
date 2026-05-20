@@ -3726,6 +3726,6 @@ fn yieldToScheduler() void {
     // input. (schedule() already switched to kernel CR3 when handing back,
     // but this is harmless and keeps the contract explicit.)
     asm volatile ("sti");
-    vmm.switchAddressSpace(paging.getKernelPageDirPhys());
+    @import("../cpu/pcid.zig").loadCr3(paging.getKernelPageDirPhys(), 0, @import("../cpu/smp.zig").myCpu().cpu_id);
     keyboard.reEnable();
 }

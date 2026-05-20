@@ -3113,6 +3113,15 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp) void {
     const pmm_diag = @import("../mm/pmm.zig");
     debug.klog("[pmm-diag] pre-teardown free={d}/{d}\n", .{ pmm_diag.freeFrameCount(), pmm_diag.managedFrameCount() });
 
+    // Force-release any registered Mutex held by the dying pid. Done
+    // BEFORE the cleanup steps below because some of them
+    // (virtio_gpu.ctxDestroy → sendCmd → ctrl_lock.acquire) would
+    // recursively try to acquire a lock the dying pid still owns,
+    // deadlocking the entire GPU pipeline. Each released lock logs a
+    // [lock-dump] line so the autopsy shows what was stranded.
+    @import("spinlock.zig").releaseMutexesOwnedBy(@intCast(pid));
+    kp.checkpoint("tdt:post-mutexRelease");
+
     // Resources reachable in any address space (GUI window state, GPU
     // contexts, debug symbols all live in heap / driver structures, not
     // user memory). Safe to free before the CR3 switch below.
@@ -3141,7 +3150,7 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp) void {
     // CPU is walking. External kill is on the killer's own CR3 (the
     // victim's was never active here), so no switch needed.
     if (op == .destroy) {
-        vmm.switchAddressSpace(@import("../mm/paging.zig").getKernelPageDirPhys());
+        pcid_mod.loadCr3(@import("../mm/paging.zig").getKernelPageDirPhys(), 0, smp.myCpu().cpu_id);
         kp.checkpoint("tdt:post-switchAS");
     }
 
@@ -3741,18 +3750,34 @@ pub fn handleUserPageFault(cr2: usize, error_code: u64) bool {
         const r = lead.lazy_regions[i];
         if (cr2 < r.start or cr2 >= r.end) continue;
         const va_aligned = cr2 & ~@as(usize, 0xFFF);
-        var frame_opt = vmm.allocAndMapUserPage(pd, va_aligned, vmm.protToMapFlags(r.prot));
-        if (frame_opt == null) {
-            // Memory pressure response: ask registered modules to shed
-            // reclaimable caches (GUI back-buffers etc.), then retry the
-            // alloc ONCE. Reclaim frees up to N × num_pages frames where
-            // N is the number of back-buffer slots across all visible GUI
-            // windows — typically enough to handle a single page fault.
-            // If even that doesn't cover the demand, we fall through to
-            // OOM kill below.
-            const reclaimed = pmm.tryReclaim(1);
-            if (reclaimed > 0) {
-                frame_opt = vmm.allocAndMapUserPage(pd, va_aligned, vmm.protToMapFlags(r.prot));
+        // Gap #1+#5 (2026-05-20): allocAndMapUserPage now returns a named
+        // MapError instead of null. Oom is the only retry-worthy variant
+        // (caches might free under pressure); BadVA / KernelHeap mean the
+        // lazy region's start..end is malformed — no amount of reclaim
+        // helps, fall straight through to OOM-kill (with a distinct log
+        // line so the autopsy knows it wasn't memory pressure).
+        var frame_opt: ?usize = null;
+        if (vmm.allocAndMapUserPage(pd, va_aligned, vmm.protToMapFlags(r.prot))) |f| {
+            frame_opt = f;
+        } else |e1| {
+            if (e1 == error.Oom) {
+                // Memory pressure response: ask registered modules to
+                // shed reclaimable caches (GUI back-buffers etc.), then
+                // retry the alloc ONCE. Reclaim frees up to N × num_pages
+                // frames where N is the number of back-buffer slots across
+                // all visible GUI windows — typically enough to handle a
+                // single page fault. If even that doesn't cover the demand,
+                // we fall through to OOM-kill below.
+                const reclaimed = pmm.tryReclaim(1);
+                if (reclaimed > 0) {
+                    if (vmm.allocAndMapUserPage(pd, va_aligned, vmm.protToMapFlags(r.prot))) |f2| {
+                        frame_opt = f2;
+                    } else |_| {}
+                }
+            } else {
+                debug.klog("[vmm] lazy fault REJECTED virt=0x{X} {s} — region[{d}] (0x{X}..0x{X}) prot=0x{X}\n", .{
+                    va_aligned, @errorName(e1), i, r.start, r.end, r.prot,
+                });
             }
         }
         const frame = frame_opt orelse {
@@ -3936,7 +3961,7 @@ pub fn prefaultUserRange(addr: usize, len: usize) void {
             // to do. Otherwise allocate + map + (optionally) copy from src.
             if (pageHasRealMapping(pd, page)) break;
 
-            const frame = vmm.allocAndMapUserPage(pd, page, vmm.protToMapFlags(r.prot)) orelse return;
+            const frame = vmm.allocAndMapUserPage(pd, page, vmm.protToMapFlags(r.prot)) catch return;
             if (r.source) |src| {
                 const page_end = page + 0x1000;
                 const src_va_end = r.src_va_base + r.src_size;

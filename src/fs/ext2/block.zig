@@ -1,11 +1,20 @@
-// ext2 mount state + block-level I/O. Reads pass through an 8-sector
-// (4 KB) aligned cache window — same shape as fat32's 8-sector FAT cache,
-// since the underlying block driver batches up to N sectors per call but
-// only serves one byte range at a time.
+// ext2 mount state + block-level I/O. Reads pass through an aligned
+// cache window — same shape as fat32's FAT cache, since the underlying
+// block driver batches up to N sectors per call but only serves one
+// byte range at a time.
 //
-// At 4 KB ext2 blocks (the typical mkfs default) the cache holds exactly
-// one block. At smaller blocks (1 KB / 2 KB) the cache holds 4 / 2
-// blocks per fill, amortising disk latency across nearby blocks.
+// Cache size (2026-05-20): 64 sectors = 32 KiB, matching nvme's
+// MAX_SECTORS_PER_CMD after the PRP-list bump. Each cache fill is now
+// ONE NVMe command instead of needing eight; sequential file reads
+// (the dominant ELF-load pattern) hit ~88% of the time on the existing
+// window. Pre-fix this was 8 sectors / 4 KB and a 2.67 MB load
+// (doom_real) took 1293 NVMe calls; with 32 KB ≈ 85 calls — 15× win
+// stacked on top of the per-cmd 8× from MAX_SECTORS_PER_CMD.
+//
+// At 4 KB ext2 blocks the cache covers 8 logical blocks per fill; at
+// 1 KB it covers 32. Random-access workloads (directory walks, btree
+// metadata) over-fetch by the cache size but the absolute waste is
+// still 28 KB max — tiny in PMM terms.
 //
 // Phase 1: read-only. The dirty mask + writeBlock land in Phase 2.
 
@@ -15,8 +24,16 @@ const blkdev = @import("../../driver/block.zig");
 const debug = @import("../../debug/debug.zig");
 
 const SECTOR_SIZE: u32 = 512;
-const CACHE_SECTORS: u32 = 8;
+const CACHE_SECTORS: u32 = 64;
 const CACHE_BYTES: u32 = CACHE_SECTORS * SECTOR_SIZE;
+
+/// Number of independent cache windows. 2 is enough for the dominant
+/// ext2 access pattern (inode lookup followed by data block read at a
+/// far LBA): one way pins the inode-table block, the other holds the
+/// sequential data window. Bumping to 4+ would help only on workloads
+/// that hop across >2 metadata regions, which is rare. Each way costs
+/// CACHE_BYTES in BSS (32 KB at the default).
+const CACHE_WAYS: u32 = 2;
 
 // Function-pointer indirection: lets Phase 3 swap the underlying device
 // (secondary → primary) without touching ext2/ internals. Same idea as
@@ -36,10 +53,16 @@ pub const Mount = struct {
     partition_lba: u32,
     read_sectors: ReadFn,
     write_sector: WriteFn,
-    /// 8-sector aligned cache window. cache_base_lba is in disk LBAs,
-    /// not fs blocks. 0xFFFFFFFF = empty.
-    cache_base_lba: u32 = 0xFFFFFFFF,
-    cache_buf: [CACHE_BYTES]u8 align(8) = undefined,
+    /// Set-associative cache: CACHE_WAYS independent windows, each
+    /// CACHE_SECTORS-aligned. cache_base_lba[i] is in disk LBAs, not
+    /// fs blocks. 0xFFFFFFFF = empty slot. `cache_next_evict` is a
+    /// simple LRU bit for 2-way: on a hit at way X we set it to 1-X so
+    /// the next miss evicts the older one. For CACHE_WAYS > 2 this
+    /// would need expansion (e.g. per-way last_used counter); kept
+    /// minimal because 2 ways covers the structural workload.
+    cache_base_lba: [CACHE_WAYS]u32 = [_]u32{0xFFFFFFFF} ** CACHE_WAYS,
+    cache_buf: [CACHE_WAYS][CACHE_BYTES]u8 align(8) = undefined,
+    cache_next_evict: u8 = 0,
 };
 
 // BGD table cache. 64 entries × 32 B = 2 KB; covers ~8 GB at 4 KB blocks
@@ -120,9 +143,9 @@ pub fn readBlock(self: *Mount, block_num: u32, dst: []u8) bool {
     if (block_num == 0 or block_num >= self.sb.blocks_count) return false;
     if (dst.len != self.block_size) return false;
     const lba = blockLba(self, block_num);
-    if (!ensureCacheLoaded(self, lba)) return false;
-    const off = (lba - self.cache_base_lba) * SECTOR_SIZE;
-    @memcpy(dst, self.cache_buf[off .. off + self.block_size]);
+    const way = ensureCacheLoaded(self, lba) orelse return false;
+    const off = (lba - self.cache_base_lba[way]) * SECTOR_SIZE;
+    @memcpy(dst, self.cache_buf[way][off .. off + self.block_size]);
     return true;
 }
 
@@ -133,9 +156,9 @@ pub fn readBlockBytes(self: *Mount, block_num: u32, byte_off: u32, dst: []u8) bo
     if (block_num == 0 or block_num >= self.sb.blocks_count) return false;
     if (byte_off + dst.len > self.block_size) return false;
     const lba = blockLba(self, block_num);
-    if (!ensureCacheLoaded(self, lba)) return false;
-    const off = (lba - self.cache_base_lba) * SECTOR_SIZE + byte_off;
-    @memcpy(dst, self.cache_buf[off .. off + dst.len]);
+    const way = ensureCacheLoaded(self, lba) orelse return false;
+    const off = (lba - self.cache_base_lba[way]) * SECTOR_SIZE + byte_off;
+    @memcpy(dst, self.cache_buf[way][off .. off + dst.len]);
     return true;
 }
 
@@ -157,12 +180,17 @@ pub fn writeBlock(self: *Mount, block_num: u32, src: []const u8) bool {
         const sec_off = s * SECTOR_SIZE;
         self.write_sector(lba + s, src.ptr + sec_off);
     }
-    // Refresh the read cache in-place so a subsequent read sees the new
-    // bytes without re-fetching from disk.
+    // Refresh whichever cache way currently covers this LBA window so a
+    // subsequent read sees the new bytes without a re-fetch. With 2-way
+    // LRU either way could hold the window; check both.
     const base = cacheBaseFor(lba);
-    if (self.cache_base_lba == base) {
-        const off = (lba - self.cache_base_lba) * SECTOR_SIZE;
-        @memcpy(self.cache_buf[off .. off + self.block_size], src);
+    var w: u8 = 0;
+    while (w < CACHE_WAYS) : (w += 1) {
+        if (self.cache_base_lba[w] == base) {
+            const off = (lba - self.cache_base_lba[w]) * SECTOR_SIZE;
+            @memcpy(self.cache_buf[w][off .. off + self.block_size], src);
+            break;
+        }
     }
     return true;
 }
@@ -183,16 +211,16 @@ pub fn writeBlockBytes(self: *Mount, block_num: u32, byte_off: u32, src: []const
     if (block_num == 0 or block_num >= self.sb.blocks_count) return false;
     if (byte_off + src.len > self.block_size) return false;
     const lba = blockLba(self, block_num);
-    if (!ensureCacheLoaded(self, lba)) return false;
-    const cache_off_base = (lba - self.cache_base_lba) * SECTOR_SIZE;
+    const way = ensureCacheLoaded(self, lba) orelse return false;
+    const cache_off_base = (lba - self.cache_base_lba[way]) * SECTOR_SIZE;
     @memcpy(
-        self.cache_buf[cache_off_base + byte_off .. cache_off_base + byte_off + src.len],
+        self.cache_buf[way][cache_off_base + byte_off .. cache_off_base + byte_off + src.len],
         src,
     );
     var s: u32 = 0;
     while (s < self.sectors_per_block) : (s += 1) {
         const sec_off: u32 = cache_off_base + s * SECTOR_SIZE;
-        self.write_sector(lba + s, @as([*]const u8, @ptrCast(&self.cache_buf)) + sec_off);
+        self.write_sector(lba + s, @as([*]const u8, @ptrCast(&self.cache_buf[way])) + sec_off);
     }
     return true;
 }
@@ -266,9 +294,9 @@ pub fn freeBlock(self: *Mount, block_num: u32) bool {
 
     const bgd = &self.bgd[group];
     const bitmap_lba = blockLba(self, bgd.block_bitmap);
-    if (!ensureCacheLoaded(self, bitmap_lba)) return false;
-    const cache_off_base = (bitmap_lba - self.cache_base_lba) * SECTOR_SIZE;
-    const slice = self.cache_buf[cache_off_base .. cache_off_base + self.block_size];
+    const way = ensureCacheLoaded(self, bitmap_lba) orelse return false;
+    const cache_off_base = (bitmap_lba - self.cache_base_lba[way]) * SECTOR_SIZE;
+    const slice = self.cache_buf[way][cache_off_base .. cache_off_base + self.block_size];
 
     if (slice[byte_idx] & mask == 0) {
         debug.klog("[ext2] freeBlock: double-free of block {d} (bitmap bit clear)\n", .{block_num});
@@ -278,7 +306,7 @@ pub fn freeBlock(self: *Mount, block_num: u32) bool {
     var s: u32 = 0;
     while (s < self.sectors_per_block) : (s += 1) {
         const sec_off: u32 = cache_off_base + s * SECTOR_SIZE;
-        self.write_sector(bitmap_lba + s, @as([*]const u8, @ptrCast(&self.cache_buf)) + sec_off);
+        self.write_sector(bitmap_lba + s, @as([*]const u8, @ptrCast(&self.cache_buf[way])) + sec_off);
     }
     bgd.free_blocks_count +%= 1;
     self.sb.free_blocks_count +%= 1;
@@ -295,9 +323,9 @@ fn allocBlockInGroup(self: *Mount, group: u32) ?u32 {
     // writeBgdTable + writeSuperblock below may evict the bitmap from
     // the cache, but we no longer need `slice` after the bitmap write.
     const bitmap_lba = blockLba(self, bgd.block_bitmap);
-    if (!ensureCacheLoaded(self, bitmap_lba)) return null;
-    const cache_off_base = (bitmap_lba - self.cache_base_lba) * SECTOR_SIZE;
-    const slice = self.cache_buf[cache_off_base .. cache_off_base + self.block_size];
+    const way = ensureCacheLoaded(self, bitmap_lba) orelse return null;
+    const cache_off_base = (bitmap_lba - self.cache_base_lba[way]) * SECTOR_SIZE;
+    const slice = self.cache_buf[way][cache_off_base .. cache_off_base + self.block_size];
 
     var byte_idx: u32 = 0;
     while (byte_idx < self.block_size) : (byte_idx += 1) {
@@ -311,7 +339,7 @@ fn allocBlockInGroup(self: *Mount, group: u32) ?u32 {
                 var s: u32 = 0;
                 while (s < self.sectors_per_block) : (s += 1) {
                     const sec_off: u32 = cache_off_base + s * SECTOR_SIZE;
-                    self.write_sector(bitmap_lba + s, @as([*]const u8, @ptrCast(&self.cache_buf)) + sec_off);
+                    self.write_sector(bitmap_lba + s, @as([*]const u8, @ptrCast(&self.cache_buf[way])) + sec_off);
                 }
                 bgd.free_blocks_count -= 1;
                 self.sb.free_blocks_count -|= 1;
@@ -339,12 +367,28 @@ inline fn cacheBaseFor(lba: u32) u32 {
     return lba & ~(CACHE_SECTORS - 1);
 }
 
-fn ensureCacheLoaded(self: *Mount, lba: u32) bool {
+/// Ensure the cache contains the CACHE_SECTORS-aligned window covering
+/// `lba`, returning the way index it sits in. Hits promote the OTHER
+/// way to the eviction slot (2-way LRU). Misses evict the current
+/// `cache_next_evict` slot, refill it from disk, then promote it as MRU.
+///
+/// Returns null today only as a future-proof — every backend read_sectors
+/// in tree is `void`-returning, so misses always succeed. The Option<>
+/// shape lets callers propagate I/O failure cleanly when that changes.
+fn ensureCacheLoaded(self: *Mount, lba: u32) ?u8 {
     const base = cacheBaseFor(lba);
-    if (self.cache_base_lba == base) return true;
-    self.read_sectors(base, @intCast(CACHE_SECTORS), &self.cache_buf);
-    self.cache_base_lba = base;
-    return true;
+    var i: u8 = 0;
+    while (i < CACHE_WAYS) : (i += 1) {
+        if (self.cache_base_lba[i] == base) {
+            self.cache_next_evict = @intCast(1 - @as(u32, i));
+            return i;
+        }
+    }
+    const evict: u8 = self.cache_next_evict;
+    self.read_sectors(base, @intCast(CACHE_SECTORS), &self.cache_buf[evict]);
+    self.cache_base_lba[evict] = base;
+    self.cache_next_evict = @intCast(1 - @as(u32, evict));
+    return evict;
 }
 
 /// Bypass the block cache to read the SB. The cache isn't initialized yet

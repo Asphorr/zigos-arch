@@ -1254,6 +1254,12 @@ export fn atoi(s: ?[*:0]const u8) c_int {
 }
 
 export fn atof(s: ?[*:0]const u8) f64 {
+    // Original integer-loop formulation (`val = val*10 + @floatFromInt(str[i]-'0')`)
+    // miscompiled under Zig 0.15.2 ReleaseSafe: the inner `@floatFromInt` returned
+    // the raw byte (e.g. atof("544") -> 53.0 = '5'), so info_player_start origin
+    // "544 288 32" parsed as (53, 50, 51) and Quake's player spawned outside the
+    // map. Caught 2026-05-21. Use an explicit u32 accumulator + one @floatFromInt
+    // at the end — pattern that survives the codegen path used by atoi.
     if (s == null) return 0.0;
     const str = s.?;
     var i: usize = 0;
@@ -1263,19 +1269,26 @@ export fn atof(s: ?[*:0]const u8) f64 {
         neg = true;
         i += 1;
     } else if (str[i] == '+') i += 1;
-    var val: f64 = 0.0;
+
+    var int_acc: u64 = 0;
     while (str[i] >= '0' and str[i] <= '9') {
-        val = val * 10.0 + @as(f64, @floatFromInt(str[i] - '0'));
+        const digit: u8 = str[i] - '0';
+        int_acc = int_acc * 10 + @as(u64, digit);
         i += 1;
     }
+    var val: f64 = @as(f64, @floatFromInt(int_acc));
+
     if (str[i] == '.') {
         i += 1;
-        var frac: f64 = 0.1;
+        var frac_acc: u64 = 0;
+        var frac_div: f64 = 1.0;
         while (str[i] >= '0' and str[i] <= '9') {
-            val += @as(f64, @floatFromInt(str[i] - '0')) * frac;
-            frac *= 0.1;
+            const digit: u8 = str[i] - '0';
+            frac_acc = frac_acc * 10 + @as(u64, digit);
+            frac_div *= 10.0;
             i += 1;
         }
+        val += @as(f64, @floatFromInt(frac_acc)) / frac_div;
     }
     return if (neg) -val else val;
 }

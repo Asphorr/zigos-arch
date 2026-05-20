@@ -1020,15 +1020,17 @@ fn sysMunmap(va: u32, len: u32) u32 {
     const idx = found_idx orelse return E_INVAL;
     const removed = lead.lazy_regions[idx];
 
-    var page = start;
-    while (page < end) : (page += 0x1000) {
-        if (vmm.unmapUserPage(pd, page)) |frame| pmm.freeFrame(frame);
-    }
-    // Single cross-CPU TLB shootdown for the whole range. unmapUserPage
-    // only does a local invlpg per page; without this call, other CPUs
-    // would still cache the freed pages' translations and could read /
-    // write into now-recycled PMM frames. Doing it once at batch end
-    // rather than inside unmapUserPage cuts the IPI count by len/4096×.
+    // Gap #7+#8 (2026-05-20): batched walk that shares the PT pointer
+    // across each 2 MB span AND reclaims empty intermediate tables. The
+    // previous loop did a full PML4→PT walk per page (~100× more
+    // indirections on a 64 MB munmap) and never freed empty PTs.
+    _ = vmm.unmapUserRange(pd, start, end);
+
+    // Single cross-CPU TLB shootdown for the whole range. unmapUserRange
+    // does no per-page invlpg; without this call, other CPUs would still
+    // cache the freed pages' translations and could read / write into
+    // now-recycled PMM frames. Doing it once at batch end rather than
+    // inside the unmap loop cuts the IPI count by len/4096×.
     // For range==1 page, use INVPCID type-0 (single-page) so peer CPUs
     // only lose that one TLB entry; for larger ranges, use type-1
     // (whole-PCID flush) which is cheaper than emitting N type-0 calls.
@@ -1426,9 +1428,22 @@ fn sysCreateWindow(alloc_width_in: u32, alloc_height: u32, display_wh: u32) u32 
         const slot_pages: u32 = @intCast((sl.mem_bytes + 4095) / 4096);
         // Map the dmabuf into user-space at GUI_FB_BASE. The phys is
         // in the SHM BAR range — vmm.mapUserPage just sets PTE flags,
-        // any phys works.
+        // any phys works. Rollback on any per-page failure: in normal
+        // flow none of mapUserPage's error variants should fire
+        // (GUI_FB_BASE is empty per process, the phys range is valid,
+        // PMM has room for PT pages), but defensive coverage is the
+        // whole point of gap #1's MapError migration.
+        var mapped_pages: usize = 0;
         for (0..slot_pages) |i| {
-            vmm.mapUserPage(pd, GUI_FB_BASE + i * 4096, slot_phys + i * 4096, paging.READ_WRITE | paging.USER);
+            vmm.mapUserPage(pd, GUI_FB_BASE + i * 4096, slot_phys + i * 4096, paging.READ_WRITE | paging.USER) catch |e| {
+                debug.klog("[sysCW] BLOB mapUserPage failed at page={d} virt=0x{X}: {s}\n", .{ i, GUI_FB_BASE + i * 4096, @errorName(e) });
+                var j: usize = 0;
+                while (j < mapped_pages) : (j += 1) {
+                    _ = vmm.unmapUserPage(pd, GUI_FB_BASE + j * 4096);
+                }
+                return E_INVAL;
+            };
+            mapped_pages += 1;
         }
         asm volatile ("movq %%cr3, %%rax\n movq %%rax, %%cr3" ::: .{ .rax = true });
         // Zero the dmabuf so the compositor's first sample doesn't
@@ -1459,9 +1474,24 @@ fn sysCreateWindow(alloc_width_in: u32, alloc_height: u32, display_wh: u32) u32 
             debug.klog("[sysCW] reject: pmm.allocContiguous({d} pages = {d} KB) FAILED\n", .{ num_pages, num_pages * 4 });
             return E_INVAL;
         };
+        var mapped_pages: usize = 0;
         for (0..num_pages) |i| {
             const phys = phys_base + i * 4096;
-            vmm.mapUserPage(pd, GUI_FB_BASE + i * 4096, phys, paging.READ_WRITE | paging.USER);
+            vmm.mapUserPage(pd, GUI_FB_BASE + i * 4096, phys, paging.READ_WRITE | paging.USER) catch |e| {
+                // Rollback: undo dual-owner refs on what we mapped, then
+                // free the whole contiguous block. releaseFrame here pairs
+                // with the (skipped) acquireFrame we never reached on this
+                // iteration; the earlier mapped_pages iterations got their
+                // acquireFrame so we owe them a release apiece.
+                debug.klog("[sysCW] legacy mapUserPage failed at page={d} virt=0x{X}: {s}\n", .{ i, GUI_FB_BASE + i * 4096, @errorName(e) });
+                var j: usize = 0;
+                while (j < mapped_pages) : (j += 1) {
+                    _ = vmm.unmapUserPage(pd, GUI_FB_BASE + j * 4096);
+                    pmm.releaseFrame(phys_base + j * 4096);
+                }
+                pmm.freeContiguous(phys_base, num_pages);
+                return E_INVAL;
+            };
             // Dual-owner refcount bump: front-buffer pages live in BOTH the
             // user PML4 (released by destroyAddressSpace on process exit) AND
             // the kernel desktop's gui_fb_phys_base table (released by
@@ -1471,6 +1501,7 @@ fn sysCreateWindow(alloc_width_in: u32, alloc_height: u32, display_wh: u32) u32 
             pmm.acquireFrame(phys);
             const ptr: [*]u8 = @ptrFromInt(paging.physToVirt(phys));
             @memset(ptr[0..4096], 0);
+            mapped_pages += 1;
         }
         paging.registerGuiFB(pid, phys_base);
         asm volatile ("movq %%cr3, %%rax\n movq %%rax, %%cr3" ::: .{ .rax = true });
@@ -2160,10 +2191,22 @@ fn sysGpuMapBlob(resource_id: u32, size: u32) u32 {
     // pages must agree on cacheability or x86 calls it undefined.
     const pages = (size + 4095) / 4096;
     const base_virt = pcb.user_brk;
+    var mapped_pages: usize = 0;
     for (0..pages) |i| {
         const virt = base_virt + i * 0x1000;
         const p = phys + i * 0x1000;
-        vmm.mapUserPage(pd, virt, p, paging.PRESENT | paging.READ_WRITE | paging.USER);
+        vmm.mapUserPage(pd, virt, p, paging.PRESENT | paging.READ_WRITE | paging.USER) catch |e| {
+            debug.klog("[gpu] map_blob mapUserPage failed at page={d} virt=0x{X}: {s}\n", .{ i, virt, @errorName(e) });
+            // phys is host-owned SHM BAR memory — no PMM frame to free,
+            // just undo the page-table installs and leave user_brk where
+            // it was (we never bumped it).
+            var j: usize = 0;
+            while (j < mapped_pages) : (j += 1) {
+                _ = vmm.unmapUserPage(pd, base_virt + j * 0x1000);
+            }
+            return E_INVAL;
+        };
+        mapped_pages += 1;
     }
     pcb.user_brk = base_virt + pages * 0x1000;
 
@@ -2223,10 +2266,28 @@ fn sysGpuCreateGuestBlob(size: u32, out_resource_id_ptr: u32) u32 {
     }
 
     const base_virt = pcb.user_brk;
+    var mapped_pages: usize = 0;
     for (0..num_pages) |i| {
         const virt = base_virt + i * 0x1000;
         const phys = phys_base + i * 0x1000;
-        vmm.mapUserPage(pd, virt, phys, paging.READ_WRITE | paging.USER);
+        vmm.mapUserPage(pd, virt, phys, paging.READ_WRITE | paging.USER) catch |e| {
+            // Rollback: undo the page-table installs we did, free the
+            // PMM-allocated guest blob (no dual-owner refs here — these
+            // pages are only mapped into one PML4), leave user_brk where
+            // it was. resourceCreateGuestBlob/ctxAttachResource already
+            // succeeded by this point; the resource will stay attached
+            // until the process exits (or the caller calls a future
+            // sysGpuDestroyResource). Acceptable defensive leak for an
+            // error path that shouldn't normally fire.
+            debug.klog("[gpu] createGuestBlob mapUserPage failed at page={d} virt=0x{X}: {s}\n", .{ i, virt, @errorName(e) });
+            var j: usize = 0;
+            while (j < mapped_pages) : (j += 1) {
+                _ = vmm.unmapUserPage(pd, base_virt + j * 0x1000);
+            }
+            pmm.freeContiguous(phys_base, num_pages);
+            return E_INVAL;
+        };
+        mapped_pages += 1;
     }
     pcb.user_brk = base_virt + num_pages * 0x1000;
 

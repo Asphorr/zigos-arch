@@ -1180,6 +1180,26 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
     if (smp.isBSP() and (process.tick_count % 100) == 0) {
         @import("../debug/cpu_alias.zig").scan();
     }
+
+    // NVMe lost-IRQ sweeper (gap nvme#1, 2026-05-20). Every LAPIC tick on
+    // BSP, drain any CQ entries the MSI-X-driven reapCq missed. Catches
+    // the two race classes the in-code comment in nvme.tickSweep names:
+    // (1) MSI-X message lost during mask/unmask retarget, (2) PCIe
+    // posted-write ordering hiding the CQE from the IRQ-time read.
+    // Closes the recurring SW-reaper-missed wedge the yield-loop
+    // detector flagged on 2026-05-19 + 2026-05-20.
+    //
+    // virtio-gpu equivalent (gap virtio_gpu#3, 2026-05-20). Same
+    // structural problem: the GPU's MSI-X can be dropped under
+    // CVE-2024-3446 reentrancy, leaving the compositor parked in
+    // blockOn(.gpu_io) forever even though the host already completed
+    // the cmd. tickSweep wakes the parked waiter so its loop re-checks
+    // (and with gap virtio_gpu#1's clflush, actually observes the
+    // advanced used_idx instead of a stale L1 line).
+    if (smp.isBSP()) {
+        @import("../driver/nvme.zig").tickSweep();
+        @import("../driver/virtio_gpu.zig").tickSweep();
+    }
     bisectPoint("after irqEvent", frame_for_validate, irq_snap);
 
     // Sync this CPU's DR0-DR3+DR7 from the watch manager's canonical state.

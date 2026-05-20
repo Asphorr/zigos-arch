@@ -8,6 +8,21 @@
 
 #include "quakedef.h"
 
+// d_pzbuffer + D_SurfaceCacheForRes / D_InitCaches live in d_local.h /
+// render.h respectively. quakedef.h pulls render.h (for D_InitCaches
+// proto) but not d_local.h, so d_pzbuffer's extern decl needs a local
+// re-declaration here. Cheaper than dragging d_local.h's whole
+// software-renderer state into the platform layer.
+extern short *d_pzbuffer;
+
+// host.c loads gfx/colormap.lmp into host_colormap before calling VID_Init
+// (host.c:905). Q1's lit-surface and alias-model shaders read directly from
+// vid.colormap, so this MUST point at the loaded colormap, not a zeroed BSS
+// slot — otherwise every shaded pixel folds to palette index 0 and the world
+// (hands, monsters, lit walls) renders pitch black while the unshaded HUD
+// looks correct. Caught 2026-05-20 in our first running frame.
+extern unsigned char *host_colormap;
+
 // ============================================================
 // VIDEO STATE (referenced by renderer, draw.c, screen.c, ...)
 // ============================================================
@@ -23,7 +38,6 @@ unsigned d_8to24table[256];
 // Backing 8bpp buffer (palettized). VID_Update copies+expands to the
 // window FB via the Zig wrapper.
 static pixel_t vid_buffer[Q_WIDTH * Q_HEIGHT];
-static pixel_t vid_colormap[256 * VID_GRADES];
 
 // Zig side will read these to do the present.
 unsigned char zq_palette[768];
@@ -36,8 +50,11 @@ void VID_Init(unsigned char *palette) {
     vid.aspect = ((float)Q_HEIGHT / Q_WIDTH) * (320.0f / 240.0f);
     vid.numpages = 1;
     vid.buffer = vid_buffer;
-    vid.colormap = vid_colormap;
-    vid.fullbright = 256 - LittleLong(*((int *)vid_colormap + 2048));
+    vid.colormap = host_colormap;
+    // Last 4 bytes of the colormap encode the "fullbright" palette
+    // threshold — palette indices >= fullbright skip shading and render
+    // at full brightness (lamps, lava, etc).
+    vid.fullbright = 256 - LittleLong(*((int *)host_colormap + 2048));
     vid.conbuffer = vid_buffer;
     vid.conrowbytes = Q_WIDTH;
     vid.conwidth = Q_WIDTH;
@@ -46,6 +63,28 @@ void VID_Init(unsigned char *palette) {
     vid.maxwarpwidth = Q_WIDTH;
     vid.maxwarpheight = Q_HEIGHT;
     VID_SetPalette(palette);
+
+    // Z-buffer. d_pzbuffer is a global pointer the software renderer
+    // walks per-pixel during D_DrawZSpans; if NULL the first triangle
+    // writes through it and faults at a low VA. Sized `width * height *
+    // sizeof(short)` per Q1 convention. Reference vid_dos.c /
+    // vid_linux.c allocate it in their VID_Init too — we just skipped it.
+    // Caught 2026-05-20 when Q1 reached D_DrawSurfaces (CR2 ~ 0x10660).
+    d_pzbuffer = (short *)malloc(Q_WIDTH * Q_HEIGHT * sizeof(short));
+    if (!d_pzbuffer) Sys_Error("VID_Init: d_pzbuffer malloc failed");
+
+    // Surface cache. Reference DOS/Linux VID_Init's wire D_InitCaches with
+    // a buffer sized via D_SurfaceCacheForRes — at 320x200 that's
+    // SURFCACHE_SIZE_AT_320X200 = 600 KB; at higher res it scales with
+    // pixel count. Without this `sc_size` stays 0 in BSS and the FIRST
+    // texture lookup trips `D_SCAlloc: N > cache size`. Caught
+    // 2026-05-20 when Q1 reached SCR_UpdateScreen for the first time.
+    {
+        int sc_bytes = D_SurfaceCacheForRes(Q_WIDTH, Q_HEIGHT);
+        void *sc_buf = malloc(sc_bytes);
+        if (!sc_buf) Sys_Error("VID_Init: surfcache malloc(%d) failed", sc_bytes);
+        D_InitCaches(sc_buf, sc_bytes);
+    }
 }
 
 void VID_Shutdown(void) {}
@@ -55,11 +94,6 @@ extern void zq_present(void);
 
 void VID_Update(vrect_t *rects) {
     (void)rects;
-    static int vid_update_count = 0;
-    if (vid_update_count < 3) {
-        Sys_Printf("ZQ_DBG: VID_Update #%d called\n", vid_update_count);
-        vid_update_count++;
-    }
     zq_present();
 }
 

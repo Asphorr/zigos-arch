@@ -236,7 +236,45 @@ pub const Mutex = struct {
         const process = @import("process.zig");
         process.wakeMutexWaiters(@truncate(@intFromPtr(self)));
     }
+
+    /// Death-while-holding cleanup. Called from tearDownTask on each
+    /// registered mutex when a pid dies. Without this, a SIGKILL of a
+    /// pid mid-blockOn() while it holds (say) virtio_gpu.ctrl_lock leaves
+    /// the lock permanently owned by a dead pid — every subsequent
+    /// submitter then deadlocks in `acquire`, looking like a hardware
+    /// hang. Same idea as Linux's `__exit_robust_list` for futexes.
+    ///
+    /// Returns true if the mutex was force-released (caller can log).
+    /// CAS is used so a racing legitimate `release` from the live holder
+    /// (if the pid check were stale across teardown stages) doesn't
+    /// double-wake. Wake waiters AFTER the CAS so they observe the free
+    /// state and re-CAS for acquire.
+    pub fn forceReleaseIfOwnedBy(self: *Mutex, pid: u16) bool {
+        if (@cmpxchgStrong(u16, &self.owner_pid, pid, 0xFFFF, .release, .monotonic) != null) {
+            return false; // not held by `pid` (or not held at all)
+        }
+        const process = @import("process.zig");
+        process.wakeMutexWaiters(@truncate(@intFromPtr(self)));
+        return true;
+    }
 };
+
+/// Walk every registered Mutex and force-release any owned by `pid`.
+/// Called from `tearDownTask` so a dying pid never strands a named lock.
+/// O(named_lock_count) — small fixed bound, runs once per teardown.
+/// Spin locks are skipped (no per-pid ownership; they're held by CPU).
+pub fn releaseMutexesOwnedBy(pid: u16) void {
+    const serial = @import("../debug/serial.zig");
+    var i: u8 = 0;
+    while (i < named_lock_count) : (i += 1) {
+        const ent = &named_locks[i];
+        if (ent.kind != .mutex or ent.ptr == 0) continue;
+        const lock: *Mutex = @ptrFromInt(ent.ptr);
+        if (lock.forceReleaseIfOwnedBy(pid)) {
+            serial.print("[lock-dump] force-released {s} from dying pid={d}\n", .{ ent.name, pid });
+        }
+    }
+}
 
 // =============================================================================
 // Lock registry — opt-in naming for SpinLocks and Mutexes so panic/wedge

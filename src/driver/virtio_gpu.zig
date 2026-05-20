@@ -59,6 +59,12 @@ var use_msix: bool = false;
 /// permanent. Polling spin works regardless of LAPIC state. Set to true
 /// from main.zig right after the global sti.
 pub var msix_safe_to_use: bool = false;
+/// Diagnostic switch for bisecting async-wait wedges. When true,
+/// sendCmdViaPhys skips the blockOn(.gpu_io) path and pause-spins
+/// instead — same as the early-boot pre-MSI-X behaviour. CLI / kdbg
+/// can flip this live; sendCmd reads it on entry so the next submit
+/// uses the new mode. Cost when false: one memory load per submit.
+pub var force_polled: bool = false;
 pub var virtio_gpu_irq_count: u64 = 0;
 /// True iff VIRTIO_F_RING_EVENT_IDX was negotiated. When set, sendCmdViaPhys
 /// writes the target usedIdx into ctrl_vq.usedEvent() before HLT so the
@@ -80,44 +86,59 @@ var msix_entry_addr: usize = 0;
 /// Even with `retargetEntry` writing the correct destination APIC ID,
 /// QEMU/KVM/Hyper-V routes all virtio-gpu MSI-X to cpu0 in practice.
 /// Kept as a counter (not periodic log) so the CLI can sample on demand.
-pub var virtio_gpu_irq_per_cpu: [4]u64 = .{ 0, 0, 0, 0 };
+/// Sized to smp.MAX_CPUS so we don't silently truncate IRQ counts on
+/// CPUs ≥ 4 (was hardcoded [4]u64 — gap #15).
+pub var virtio_gpu_irq_per_cpu: [@import("../cpu/smp.zig").MAX_CPUS]u64 =
+    .{0} ** @import("../cpu/smp.zig").MAX_CPUS;
 /// IPIs we sent from the MSI-X handler to wake other CPUs from sti+hlt.
 /// Compared against process.kill_kick handler invocations to determine
 /// whether IPI delivery is the broken link. (See process.kickHandlerCount.)
 pub var virtio_gpu_wake_ipis_sent: u64 = 0;
+
+/// The single pid currently parked in blockOn(.gpu_io) via sendCmdViaPhys
+/// / sendSimpleCmdPair. ctrl_lock serializes submitters so there's at
+/// most one. 0xFF = nobody waiting; otherwise = pid. Updated atomically
+/// because the IRQ handler reads it concurrently from cpu0.
+///
+/// Pre-existing code scanned ALL MAX_PROCS PCBs on every IRQ — fine
+/// when MAX_PROCS was small but wasteful at 256. Direct lookup also
+/// lets us IPI ONLY the CPU the waiter parked on, instead of fanning
+/// out the wake-IPI to every alive CPU. (Gaps #8 + #9, 2026-05-20.)
+var current_gpu_waiter: u8 = 0xFF;
 fn virtioGpuIrqHandler() callconv(.c) void {
     virtio_gpu_irq_count +%= 1;
     const smp_mod = @import("../cpu/smp.zig");
     const cpu_id = smp_mod.myCpu().cpu_id;
-    if (cpu_id < 4) virtio_gpu_irq_per_cpu[cpu_id] +%= 1;
+    if (cpu_id < virtio_gpu_irq_per_cpu.len) virtio_gpu_irq_per_cpu[cpu_id] +%= 1;
     const process = @import("../proc/process.zig");
-    // Wake any PCB parked in `blockOn(.gpu_io, …)`. We MUST NOT call
-    // process.wake() from here — it would acquire cross-CPU sched_lock
-    // to rqEnter the woken pid, and a wedge fired during paint.elf load
-    // (wallpaper change racing with NVMe MSI-X-driven syscalls) traced
-    // to exactly that path. Safer: just bump the waiter's wake_tick
-    // back to "now", and let BSP's wakeExpired (already runs from IRQ0
-    // in a known-safe context with the right lock ordering) do the
-    // actual setState + rqEnter. The wake IPI fan-out below still
-    // pokes other CPUs out of hlt so their next IRQ0 fires quickly.
-    var pid: u8 = 0;
-    while (pid < process.MAX_PROCS) : (pid += 1) {
-        if (process.procs[pid].wait_kind == .gpu_io) {
-            @atomicStore(u64, &process.procs[pid].wake_tick, process.tick_count, .release);
-        }
-    }
-    // Use the wake-only vector (no schedule() call). kill_kick_vector's
-    // handler calls schedule() which actively de-prioritises the receiver's
-    // current task via pickNext(exclude=current) — wrong for our case where
-    // the current task is precisely the one that should re-check usedIdx.
+
+    // Direct waiter lookup (gap #8). ctrl_lock serializes submitters so
+    // current_gpu_waiter is at most one pid; previous code walked all
+    // MAX_PROCS PCBs every IRQ. We MUST NOT call process.wake() — it
+    // takes cross-CPU sched_lock and a wedge during paint.elf load
+    // traced to exactly that path. Bump wake_tick to "now" and let
+    // BSP's wakeExpired (runs from IRQ0 in a lock-clean context) do
+    // the setState + rqEnter. The targeted IPI below kicks the waiter's
+    // CPU out of hlt so its next IRQ0 fires immediately.
+    const pid = @atomicLoad(u8, &current_gpu_waiter, .acquire);
+    if (pid == 0xFF) return;
+    const pcb = &process.procs[pid];
+    @atomicStore(u64, &pcb.wake_tick, process.tick_count, .release);
+
+    // Targeted IPI (gap #9). Re-read wait_kind to defend against the
+    // waiter having raced through wake → re-park on something else;
+    // if it's no longer .gpu_io, no IPI is needed (the new waker
+    // owns delivery). last_cpu is the CPU the waiter most recently
+    // ran on — same one it parked from, since blockOn doesn't migrate.
+    if (@atomicLoad(process.WaitKind, &pcb.wait_kind, .acquire) != .gpu_io) return;
+    const wcpu = pcb.last_cpu;
+    if (wcpu == cpu_id) return; // own LAPIC tick will re-check usedIdx
+    if (wcpu >= smp_mod.MAX_CPUS) return;
+    const cl = &smp_mod.cpus[wcpu];
+    if (!cl.alive) return;
     if (process.wakeVector()) |v| {
-        for (0..smp_mod.MAX_CPUS) |cid| {
-            if (cid == cpu_id) continue;
-            const cl = &smp_mod.cpus[cid];
-            if (!cl.alive) continue;
-            apic.sendIPI(cl.lapic_id, v);
-            virtio_gpu_wake_ipis_sent +%= 1;
-        }
+        apic.sendIPI(cl.lapic_id, v);
+        virtio_gpu_wake_ipis_sent +%= 1;
     }
 }
 
@@ -548,6 +569,56 @@ var original_2d_resource_id: u32 = 0;
 // on host display backend's frame-done callback (vblank sync).
 var fence_id_next: u64 = 0;
 
+// --- Cache-coherence helpers (gap #1+#2, 2026-05-20) ---
+//
+// Same race class as `nvme.zig:562-565`'s clflush dance: QEMU's GTK /
+// Venus / display backend runs on a different host CPU than the guest's
+// vCPU0. The host writes `usedIdx` and `resp_phys` directly into guest
+// memory through QEMU's mmap, BYPASSING the guest's vCPU. Without an
+// explicit clflush + mfence on the guest side, our L1 keeps a stale
+// (pre-DMA) cache line — we read zero / unchanged for the field the
+// host already updated. Symptom: the Phase A poll spin times out, the
+// hlt waiter only "sees" the change when the cache line gets evicted
+// for other reasons (10+ ms later); on the resp read the cmd_type
+// reads as 0 instead of RESP_OK_NODATA, the caller treats the (already-
+// successful) command as failed, retries, retries, retries — the
+// multi-minute compositor freeze user observed 2026-05-20.
+
+/// Invalidate a single cache line (assumed aligned to 64 B) and order
+/// the subsequent reads. mfence is the cross-CPU barrier; clflush alone
+/// only invalidates the line on the local CPU.
+inline fn clflushLine(addr: usize) void {
+    asm volatile ("clflush (%[a])"
+        :
+        : [a] "r" (addr),
+        : .{ .memory = true });
+    asm volatile ("mfence" ::: .{ .memory = true });
+}
+
+/// Invalidate every cache line covering `[addr, addr+len)`. Used for
+/// the response buffer, which can be larger than one cache line
+/// (e.g. RESP_OK_DISPLAY_INFO is 280 B = 5 lines).
+inline fn clflushRange(addr: usize, len: usize) void {
+    var p = addr & ~@as(usize, 63);
+    const end = addr + len;
+    while (p < end) : (p += 64) {
+        asm volatile ("clflush (%[a])"
+            :
+            : [a] "r" (p),
+            : .{ .memory = true });
+    }
+    asm volatile ("mfence" ::: .{ .memory = true });
+}
+
+/// Coherent read of a virtqueue's used_idx. Replaces every bare
+/// `vq.usedIdx().*` read in the wait paths. Without this the polling
+/// loops were observing stale values for arbitrarily long until the
+/// cache line got naturally evicted.
+inline fn usedIdxCoherent(vq: *Virtqueue) u16 {
+    clflushLine(@intFromPtr(vq.usedIdx()));
+    return vq.usedIdx().*;
+}
+
 // --- MMIO register helpers ---
 
 fn ccRead8(off: u32) u8 {
@@ -716,13 +787,21 @@ fn sendCmdViaPhys(cmd_len: u32, resp_len: u32) bool {
     // LAPIC tick to re-check usedIdx.
     var phase_a_pause_iters: u64 = 0;
     var phase_a_done_via_poll: bool = false;
-    if (use_msix and msix_safe_to_use) {
+    // Gap #5 (2026-05-20): read cmd_type up front so we can pass it as
+    // the blockOn target. Was previously read only on the slow-gpu log
+    // path (line ~807, post-wait); now also used to identify which cmd
+    // is hanging when the yield-loop / stuck-waiter detector dumps us.
+    const cmd_type_for_target: u32 = blk_ct: {
+        const cv: [*]const volatile u32 = @ptrFromInt(paging.physToVirt(cmd_phys));
+        break :blk_ct cv[0];
+    };
+    if (use_msix and msix_safe_to_use and !force_polled) {
         const tsc_per_q = apic.tscPerQuantum();
         if (tsc_per_q > 0) {
             // 200 µs at 100 Hz tick (tsc_per_q = ticks per 10 ms) = q/50.
             const deadline = perf.rdtsc() +% (tsc_per_q / 50);
             while (perf.rdtsc() < deadline) : (phase_a_pause_iters +%= 1) {
-                if (ctrl_vq.last_used_idx != ctrl_vq.usedIdx().*) {
+                if (ctrl_vq.last_used_idx != usedIdxCoherent(&ctrl_vq)) {
                     phase_a_done_via_poll = true;
                     break;
                 }
@@ -734,7 +813,7 @@ fn sendCmdViaPhys(cmd_len: u32, resp_len: u32) bool {
     const wake_runs_before_cpu1 = @import("../proc/process.zig").wake_handler_runs[1];
     const got_response: bool = blk: {
         if (phase_a_done_via_poll) break :blk true;
-        if (use_msix and msix_safe_to_use) {
+        if (use_msix and msix_safe_to_use and !force_polled) {
             // Sleep-yield wait. blockOn parks the calling PCB in .sleeping
             // with wait_kind=.gpu_io; schedule() then picks idle (or
             // another runnable task), which means the timer IRQs that
@@ -751,8 +830,16 @@ fn sendCmdViaPhys(cmd_len: u32, resp_len: u32) bool {
             // schedule round-trips (~1 s if waking only via the 10 ms
             // LAPIC tick; far sooner under any real GPU IRQ delivery).
             const process = @import("../proc/process.zig");
+            const cur_pid_outer = @import("../cpu/smp.zig").myCpu().current_pid orelse break :blk false;
+            // Stamp ourselves as THE gpu_io waiter so virtioGpuIrqHandler
+            // can wake us directly instead of scanning MAX_PROCS PCBs and
+            // can IPI only our last_cpu instead of fanning out to all
+            // alive CPUs. Cleared by defer on every exit path (true, false,
+            // or panic-unwind). Gaps #8 + #9.
+            @atomicStore(u8, &current_gpu_waiter, @intCast(cur_pid_outer), .release);
+            defer @atomicStore(u8, &current_gpu_waiter, 0xFF, .release);
             while (true) {
-                if (ctrl_vq.last_used_idx != ctrl_vq.usedIdx().*) {
+                if (ctrl_vq.last_used_idx != usedIdxCoherent(&ctrl_vq)) {
                     break :blk true;
                 }
                 if (hlt_iters >= 100) {
@@ -761,17 +848,17 @@ fn sendCmdViaPhys(cmd_len: u32, resp_len: u32) bool {
                 // Safety-net: set wake_tick = now + 1 tick (~10 ms) so
                 // wakeExpired() wakes us if the GPU IRQ goes missing
                 // (CVE-2024-3446 drops virtio_notify under reentrancy).
-                // The primary waker is still virtioGpuIrqHandler walking
-                // the PCB table. Set wake_tick BEFORE blockOn so the
-                // soft-yield doesn't race wakeExpired clearing it.
-                const cur_pid = @import("../cpu/smp.zig").myCpu().current_pid orelse break :blk false;
-                process.procs[cur_pid].wake_tick = process.tick_count +% 1;
-                process.blockOn(.gpu_io, 0);
+                // The primary waker is still virtioGpuIrqHandler — now
+                // routes through current_gpu_waiter direct lookup. Set
+                // wake_tick BEFORE blockOn so the soft-yield doesn't race
+                // wakeExpired clearing it.
+                process.procs[cur_pid_outer].wake_tick = process.tick_count +% 1;
+                process.blockOn(.gpu_io, cmd_type_for_target);
                 hlt_iters += 1;
             }
         } else {
             var timeout: u32 = 10000000;
-            while (ctrl_vq.last_used_idx == ctrl_vq.usedIdx().* and timeout > 0) : (timeout -= 1) {
+            while (ctrl_vq.last_used_idx == usedIdxCoherent(&ctrl_vq) and timeout > 0) : (timeout -= 1) {
                 asm volatile ("pause");
             }
             break :blk timeout > 0;
@@ -789,7 +876,7 @@ fn sendCmdViaPhys(cmd_len: u32, resp_len: u32) bool {
     if (got_response) {
         ctrl_vq.last_used_idx +%= 1;
     } else {
-        ctrl_vq.last_used_idx = ctrl_vq.usedIdx().*;
+        ctrl_vq.last_used_idx = usedIdxCoherent(&ctrl_vq);
     }
     d1.next = ctrl_vq.free_head;
     d0.next = d1_idx;
@@ -832,6 +919,11 @@ pub fn sendCmd(cmd_buf: [*]const u8, cmd_len: u32, resp_buf: [*]u8, resp_len: u3
 
     if (!sendCmdViaPhys(cmd_len, resp_len)) return false;
 
+    // Gap #2: clflush before reading the device-written resp. Without
+    // this we sometimes saw cmd_type=0 (stale zero from the @memset
+    // above) instead of the actual RESP_OK_*; caller then treated the
+    // (already-successful) command as failed.
+    clflushRange(@intFromPtr(resp_dst), resp_len);
     @memcpy(resp_buf[0..resp_len], @as([*]const volatile u8, resp_dst)[0..resp_len]);
     return true;
 }
@@ -949,12 +1041,27 @@ fn sendSimpleCmdPair(
     var phase_a_pause_iters: u64 = 0;
     var phase_a_done_via_poll: bool = false;
     const target_idx: u16 = ctrl_vq.last_used_idx +% 2;
-    if (use_msix and msix_safe_to_use) {
+    // Gap #5: pass cmd0_type as the blockOn target so the autopsy can
+    // name the operation. For the pair path this is typically
+    // CMD_SET_SCANOUT_BLOB or CMD_TRANSFER_TO_HOST_2D (the flush hot path).
+    const cmd_type_for_target: u32 = blk_ct: {
+        const cv: [*]const volatile u32 = @ptrFromInt(cmd_base);
+        break :blk_ct cv[0];
+    };
+    if (use_msix and msix_safe_to_use and !force_polled) {
         const tsc_per_q = apic.tscPerQuantum();
         if (tsc_per_q > 0) {
             const deadline = perf.rdtsc() +% (tsc_per_q / 50);
             while (perf.rdtsc() < deadline) : (phase_a_pause_iters +%= 1) {
-                if (ctrl_vq.usedIdx().* == target_idx) {
+                // Gap #6: use `>=` (with wrap) instead of `==`. If the
+                // device advances past target_idx for any reason (a
+                // concurrent op crammed in by a future caller, or a
+                // wraparound race), strict `==` would never trigger.
+                // u16 wrap-aware "is at least target_idx" check: the
+                // difference is small (≤ MAX_QUEUE_SIZE), so signed
+                // (i16) subtraction handles wraps correctly.
+                const used = usedIdxCoherent(&ctrl_vq);
+                if (@as(i16, @bitCast(used -% target_idx)) >= 0) {
                     phase_a_done_via_poll = true;
                     break;
                 }
@@ -964,19 +1071,23 @@ fn sendSimpleCmdPair(
     }
     const got_response: bool = blk: {
         if (phase_a_done_via_poll) break :blk true;
-        if (use_msix and msix_safe_to_use) {
+        if (use_msix and msix_safe_to_use and !force_polled) {
             const process = @import("../proc/process.zig");
+            const cur_pid_outer = @import("../cpu/smp.zig").myCpu().current_pid orelse break :blk false;
+            // Single-waiter / targeted-IPI stamp; see sendCmdViaPhys above.
+            @atomicStore(u8, &current_gpu_waiter, @intCast(cur_pid_outer), .release);
+            defer @atomicStore(u8, &current_gpu_waiter, 0xFF, .release);
             while (true) {
-                if (ctrl_vq.usedIdx().* == target_idx) break :blk true;
+                const used = usedIdxCoherent(&ctrl_vq);
+                if (@as(i16, @bitCast(used -% target_idx)) >= 0) break :blk true;
                 if (hlt_iters >= 100) break :blk false;
-                const cur_pid = @import("../cpu/smp.zig").myCpu().current_pid orelse break :blk false;
-                process.procs[cur_pid].wake_tick = process.tick_count +% 1;
-                process.blockOn(.gpu_io, 0);
+                process.procs[cur_pid_outer].wake_tick = process.tick_count +% 1;
+                process.blockOn(.gpu_io, cmd_type_for_target);
                 hlt_iters += 1;
             }
         } else {
             var timeout: u32 = 10000000;
-            while (ctrl_vq.usedIdx().* != target_idx and timeout > 0) : (timeout -= 1) {
+            while (@as(i16, @bitCast(usedIdxCoherent(&ctrl_vq) -% target_idx)) < 0 and timeout > 0) : (timeout -= 1) {
                 asm volatile ("pause");
             }
             break :blk timeout > 0;
@@ -986,7 +1097,7 @@ fn sendSimpleCmdPair(
     if (got_response) {
         ctrl_vq.last_used_idx +%= 2;
     } else {
-        ctrl_vq.last_used_idx = ctrl_vq.usedIdx().*;
+        ctrl_vq.last_used_idx = usedIdxCoherent(&ctrl_vq);
     }
 
     // Return all 4 descriptors to the free list (preserve original
@@ -1011,6 +1122,11 @@ fn sendSimpleCmdPair(
 
     if (!got_response) return false;
 
+    // Gap #2: clflush both resp slots before decoding. Each CtrlHdr is
+    // 24 B; clflushRange aligns to 64-byte lines so a single line covers
+    // each slot, but call twice for clarity.
+    clflushRange(resp_base, @sizeOf(CtrlHdr));
+    clflushRange(resp_base + PAIR_CMD_SLOT_BYTES, @sizeOf(CtrlHdr));
     const resp0: *const CtrlHdr = @ptrFromInt(resp_base);
     const resp1: *const CtrlHdr = @ptrFromInt(resp_base + PAIR_CMD_SLOT_BYTES);
     if (resp0.cmd_type != RESP_OK_NODATA or resp1.cmd_type != RESP_OK_NODATA) {
@@ -1194,6 +1310,7 @@ fn attachBacking(resource_id: u32, pages: []const usize, page_count: u32) bool {
     defer ctrl_lock.release();
     if (!sendCmdViaPhys(total_len, @sizeOf(CtrlHdr))) return false;
 
+    clflushRange(paging.physToVirt(resp_phys), @sizeOf(CtrlHdr)); // gap #2
     const resp: *const CtrlHdr = @ptrFromInt(paging.physToVirt(resp_phys));
     if (resp.cmd_type != RESP_OK_NODATA) {
         debug.klog("[virtio-gpu] ATTACH_BACKING failed: 0x{X}\n", .{resp.cmd_type});
@@ -1523,6 +1640,61 @@ pub fn init(xres: u32, yres: u32) bool {
     return true;
 }
 
+/// Gap #3 (2026-05-20): per-tick sweeper, called from `handleIRQ0` on
+/// BSP. Catches the case where the GPU device DID complete the command
+/// but the IRQ never reached us (CVE-2024-3446 reentrancy guard silently
+/// dropping virtio_notify, or PCIe posted-write ordering hiding the CQE
+/// from the IRQ-time read). Walks the ctrl queue's coherent used_idx
+/// and pokes all .gpu_io waiters' wake_tick to "now" so wakeExpired()
+/// kicks them on the same tick. Mirrors `nvme.tickSweep`.
+///
+/// Cost when idle: one clflush + one memory read per tick. Sub-microsecond.
+pub fn tickSweep() void {
+    if (!active) return;
+    if (!use_msix) return;
+    const hw_used = usedIdxCoherent(&ctrl_vq);
+    if (ctrl_vq.last_used_idx == hw_used) return;
+    // HW advanced past SW — wake any .gpu_io waiter so its loop re-checks
+    // (and via gap #1's clflush, observes the new used_idx this time).
+    const process = @import("../proc/process.zig");
+    var pid: u8 = 0;
+    while (pid < process.MAX_PROCS) : (pid += 1) {
+        if (process.procs[pid].wait_kind == .gpu_io) {
+            @atomicStore(u64, &process.procs[pid].wake_tick, process.tick_count, .release);
+        }
+    }
+}
+
+/// Gap #4 (2026-05-20): diagnostic dump for the yield-loop / stuck-waiter
+/// detectors. Mirrors `nvme.dumpWaiterForTarget`. `target` is the cmd_type
+/// the waiter passed to blockOn — names which GPU command is hanging.
+/// Reports SW vs HW state so the autopsy can distinguish:
+///   - HW done, SW missed       → tickSweep regression / cache miss
+///   - HW pending, ctrl_lock idle → device-side stuck (Venus deadlock, etc.)
+///   - ctrl_lock held by dead pid → mutex-leak class
+pub fn dumpWaiterForTarget(target: u32) void {
+    debug.klog("  virtio-gpu state (cmd_type=0x{X}):\n", .{target});
+    debug.klog("    active        = {any}\n", .{active});
+    debug.klog("    use_msix      = {any}\n", .{use_msix});
+    debug.klog("    msix_safe     = {any}\n", .{msix_safe_to_use});
+    debug.klog("    use_event_idx = {any}\n", .{use_event_idx});
+    if (!active) return;
+    const hw_used = usedIdxCoherent(&ctrl_vq);
+    debug.klog("    sw_last_used  = {d}\n", .{ctrl_vq.last_used_idx});
+    debug.klog("    hw_used_idx   = {d}\n", .{hw_used});
+    debug.klog("    avail_idx     = {d}\n", .{ctrl_vq.availIdx().*});
+    debug.klog("    num_free      = {d}\n", .{ctrl_vq.num_free});
+    debug.klog("    irq_count     = {d}\n", .{virtio_gpu_irq_count});
+    debug.klog("    ipis_sent     = {d}\n", .{virtio_gpu_wake_ipis_sent});
+    if (hw_used != ctrl_vq.last_used_idx) {
+        debug.klog("    ===> HW advanced beyond SW; tickSweep should pick this up next tick\n", .{});
+    } else if (ctrl_vq.availIdx().* != ctrl_vq.last_used_idx) {
+        debug.klog("    ===> SW submitted a cmd; HW has NOT completed — device-side wedge\n", .{});
+    } else {
+        debug.klog("    (queue idle — waiter is racing a future submit?)\n", .{});
+    }
+}
+
 /// Set up display: create resource, attach backing, set scanout.
 fn setupDisplay(w: u32, h: u32) bool {
     debug.klog("[virtio-gpu] Creating resource {d} ({d}x{d})...\n", .{ current_resource_id, w, h });
@@ -1705,6 +1877,74 @@ pub fn changeMode(new_w: u32, new_h: u32) bool {
 /// to bypass the gate when it actually wants to flush.
 pub var skip_external_flush: bool = false;
 
+// =============================================================================
+// Compositor wedge tracking (gaps #7 + #16).
+//
+// Without this, a host-side stall (CVE-2024-3446 reentrancy drop, virgl
+// thread stuck, host hypervisor descheduling for SMI) made the compositor
+// call sendCmdViaPhys → 1-sec timeout, then immediately retry next frame.
+// 60 retries/sec × 1 sec wait/retry = the desktop completely frozen for
+// minutes while it grinds through identical failing submits.
+//
+// Now: after WEDGE_THRESHOLD consecutive flush failures we mark the GPU
+// wedged and short-circuit subsequent flush*() calls (early-return at
+// function entry). The desktop keeps running — input, syscalls, scheduling
+// all unchanged — but the screen stops updating. Every
+// WEDGE_PROBE_INTERVAL_TICKS we allow one probe through; if it succeeds,
+// clear wedged and resume normal flushing.
+//
+// Threshold is small (4) because each failure already costs ~1 sec, so
+// the user-visible latency budget is "blow 4 sec then surrender" — not
+// the multi-minute hang the old code produced.
+// =============================================================================
+const WEDGE_THRESHOLD: u32 = 4;
+const WEDGE_PROBE_INTERVAL_TICKS: u64 = 500; // ~5 sec at 100 Hz
+
+var consecutive_flush_failures: u32 = 0;
+pub var wedged: bool = false;
+var wedge_first_tick: u64 = 0;
+var last_probe_tick: u64 = 0;
+
+/// Update wedge state from a sendSimpleCmdPair result. Returns the input
+/// `ok` unchanged so the caller can keep its existing flow.
+fn noteFlushResult(ok: bool) bool {
+    if (ok) {
+        if (wedged) {
+            const span = @import("../proc/process.zig").tick_count -% wedge_first_tick;
+            debug.klog("[gpu] CONTROLLER RECOVERED after {d} ticks wedged\n", .{span});
+        }
+        consecutive_flush_failures = 0;
+        wedged = false;
+    } else {
+        consecutive_flush_failures +%= 1;
+        if (!wedged and consecutive_flush_failures >= WEDGE_THRESHOLD) {
+            wedged = true;
+            wedge_first_tick = @import("../proc/process.zig").tick_count;
+            last_probe_tick = wedge_first_tick;
+            debug.klog(
+                "[gpu] CONTROLLER WEDGE after {d} consecutive flush timeouts — suppressing flushes (probe every {d} ticks)\n",
+                .{ consecutive_flush_failures, WEDGE_PROBE_INTERVAL_TICKS },
+            );
+        }
+    }
+    return ok;
+}
+
+/// Wedge gate for flush callers. Returns true → caller should early-return
+/// (skip this frame's flush). Returns false → caller proceeds normally.
+/// When wedged AND the probe interval has elapsed, returns false so ONE
+/// flush attempt goes through; result feeds noteFlushResult and either
+/// clears the wedge or re-arms the probe timer.
+fn shouldSkipFlush() bool {
+    if (!wedged) return false;
+    const now = @import("../proc/process.zig").tick_count;
+    if ((now -% last_probe_tick) >= WEDGE_PROBE_INTERVAL_TICKS) {
+        last_probe_tick = now;
+        return false; // let one probe through
+    }
+    return true;
+}
+
 pub fn flush() void {
     if (skip_external_flush) return;
     flushUnconditional();
@@ -1712,6 +1952,7 @@ pub fn flush() void {
 
 pub fn flushUnconditional() void {
     if (!active) return;
+    if (shouldSkipFlush()) return;
     const t = @import("../debug/perf.zig").enter();
     defer @import("../debug/perf.zig").leave(.flush_rect, t);
     if (scanout_is_blob and blob_count >= 2) {
@@ -1739,18 +1980,18 @@ pub fn flushUnconditional() void {
             .resource_id = blob_resource_ids[new_front],
             .padding = 0,
         };
-        _ = sendSimpleCmdPair(
+        _ = noteFlushResult(sendSimpleCmdPair(
             @as([*]const u8, @ptrCast(&sb)),
             @sizeOf(SetScanoutBlob),
             @as([*]const u8, @ptrCast(&rf)),
             @sizeOf(ResourceFlush),
-        );
+        ));
         blob_front = new_front;
         framebuffer = blob_virt[1 - new_front];
         current_resource_id = blob_resource_ids[1 - new_front];
     } else if (scanout_is_blob) {
         // Single-buffer blob: host udmabuf-imports our pages, no transfer.
-        _ = resourceFlushCmd(current_resource_id, 0, 0, width, height);
+        _ = noteFlushResult(resourceFlushCmd(current_resource_id, 0, 0, width, height));
     } else {
         // 2D fallback: full transfer + flush — also batched into one
         // virtqueue submit + single MSI-X round-trip.
@@ -1767,12 +2008,12 @@ pub fn flushUnconditional() void {
             .resource_id = current_resource_id,
             .padding = 0,
         };
-        _ = sendSimpleCmdPair(
+        _ = noteFlushResult(sendSimpleCmdPair(
             @as([*]const u8, @ptrCast(&th)),
             @sizeOf(TransferToHost2D),
             @as([*]const u8, @ptrCast(&rf)),
             @sizeOf(ResourceFlush),
-        );
+        ));
     }
 }
 
@@ -1786,6 +2027,7 @@ pub fn flushRect(x: u32, y: u32, w: u32, h: u32) void {
 /// mode-9 GPU compositor uses this to flush its own dirty regions.
 pub fn flushRectUnconditional(x: u32, y: u32, w: u32, h: u32) void {
     if (!active) return;
+    if (shouldSkipFlush()) return;
     const x0 = @min(x, width);
     const y0 = @min(y, height);
     const x1 = @min(x + w, width);
@@ -1814,17 +2056,17 @@ pub fn flushRectUnconditional(x: u32, y: u32, w: u32, h: u32) void {
             .resource_id = blob_resource_ids[new_front],
             .padding = 0,
         };
-        _ = sendSimpleCmdPair(
+        _ = noteFlushResult(sendSimpleCmdPair(
             @as([*]const u8, @ptrCast(&sb)),
             @sizeOf(SetScanoutBlob),
             @as([*]const u8, @ptrCast(&rf)),
             @sizeOf(ResourceFlush),
-        );
+        ));
         blob_front = new_front;
         framebuffer = blob_virt[1 - new_front];
         current_resource_id = blob_resource_ids[1 - new_front];
     } else if (scanout_is_blob) {
-        _ = resourceFlushCmd(current_resource_id, x0, y0, x1 - x0, y1 - y0);
+        _ = noteFlushResult(resourceFlushCmd(current_resource_id, x0, y0, x1 - x0, y1 - y0));
     } else {
         // 2D fallback dirty-rect path — transfer + flush batched.
         const xferw = x1 - x0;
@@ -1843,12 +2085,12 @@ pub fn flushRectUnconditional(x: u32, y: u32, w: u32, h: u32) void {
             .resource_id = current_resource_id,
             .padding = 0,
         };
-        _ = sendSimpleCmdPair(
+        _ = noteFlushResult(sendSimpleCmdPair(
             @as([*]const u8, @ptrCast(&th)),
             @sizeOf(TransferToHost2D),
             @as([*]const u8, @ptrCast(&rf)),
             @sizeOf(ResourceFlush),
-        );
+        ));
     }
 }
 
@@ -1983,6 +2225,7 @@ pub fn initCursor() bool {
             debug.klog("[virtio-gpu] Cursor backing attach failed\n", .{});
             return false;
         }
+        clflushRange(paging.physToVirt(resp_phys), @sizeOf(CtrlHdr)); // gap #2
         const resp: *const CtrlHdr = @ptrFromInt(paging.physToVirt(resp_phys));
         if (resp.cmd_type != RESP_OK_NODATA) {
             debug.klog("[virtio-gpu] Cursor ATTACH_BACKING resp 0x{X}\n", .{resp.cmd_type});
@@ -2076,12 +2319,24 @@ fn sendCursorCmd(cmd_type: u32, x: u32, y: u32, resource_id: u32) void {
     // Notify cursor queue (uses cached notify_off — see notifyQueue helper).
     notifyQueue(1, &cursor_vq);
 
-    // Reclaim used descriptors
-    while (cursor_vq.last_used_idx != cursor_vq.usedIdx().*) {
+    // Reclaim used descriptors. The host's used-ring entry tells us
+    // WHICH descriptor completed via usedRingId(ui).* — we must NOT
+    // re-push the local `d_idx` we just submitted (that is the same
+    // slot N times across N completions, corrupting the free list
+    // into a self-loop and over-incrementing num_free). Prior bug:
+    // after enough cursor moves num_free underflows / free_head
+    // points at itself, and sendCursorCmd silently drops at the
+    // num_free==0 guard above. Mouse cursor "stops updating" after
+    // ~queue_size moves. Read each completed id from the used ring
+    // and return THAT desc to the free list.
+    while (cursor_vq.last_used_idx != usedIdxCoherent(&cursor_vq)) {
+        const ui = cursor_vq.last_used_idx % cursor_vq.queue_size;
+        const used_id: u16 = @intCast(cursor_vq.usedRingId(ui).*);
         cursor_vq.last_used_idx +%= 1;
-        // Return descriptor to free list
-        d.next = cursor_vq.free_head;
-        cursor_vq.free_head = d_idx;
+        if (used_id >= cursor_vq.queue_size) continue;
+        const used_d = cursor_vq.descPtr(used_id);
+        used_d.next = cursor_vq.free_head;
+        cursor_vq.free_head = used_id;
         cursor_vq.num_free += 1;
     }
 }
@@ -2192,6 +2447,7 @@ pub fn submit3D(ctx_id: u32, cmd_data: []const u8) bool {
 
     if (!sendCmdViaPhys(@intCast(total), @sizeOf(CtrlHdr))) return false;
 
+    clflushRange(paging.physToVirt(resp_phys), @sizeOf(CtrlHdr)); // gap #2
     const resp: *volatile CtrlHdr = @ptrFromInt(paging.physToVirt(resp_phys));
     return resp.cmd_type == RESP_OK_NODATA;
 }
@@ -2373,6 +2629,7 @@ pub fn resourceCreateGuestBlob(ctx_id: u32, resource_id: u32, blob_flags: u32, p
         return false;
     }
 
+    clflushRange(paging.physToVirt(resp_phys), 48); // gap #2
     const resp: *const CtrlHdr = @ptrFromInt(paging.physToVirt(resp_phys));
     if (resp.cmd_type != RESP_OK_NODATA) {
         debug.klog("[virtio-gpu] createGuestBlob failed: 0x{X}\n", .{resp.cmd_type});

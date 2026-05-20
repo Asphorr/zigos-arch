@@ -16,10 +16,10 @@
 //                        Historically reserved as USER_LOAD; the reservation
 //                        was fossilized protection for a Phase-2 lazy-fault
 //                        bug class that's gone since PML4[0] was dropped.
-//   0x800000..0xBFFFFF   kernel dynamic heap (KERNEL_HEAP)
-//   0xC00000..0x13FFFFF  guest GPU framebuffer (GUEST_FB)
-//   0x1400000..0x1BFFFFF CPU back buffer for compositing (BACK_BUFFER)
-//   0x1C00000..0x1C3FFFF UEFI page tables (reserved on UEFI builds only)
+//   0xA00000..0xDFFFFF   kernel dynamic heap (KERNEL_HEAP, 4 MB)
+//   0xE00000..0x15FFFFF  guest GPU framebuffer (GUEST_FB, 8 MB)
+//   0x1600000..0x1DFFFFF CPU back buffer for compositing (BACK_BUFFER, 8 MB)
+//   0x1E00000..0x1E3FFFF UEFI page tables (reserved on UEFI builds only)
 //
 // User space (per-process page tables): each process gets its own PML4[0]
 // from createAddressSpace; user-app .text loads at USER_VA_FLOOR (matches
@@ -80,14 +80,22 @@ pub fn kernelEndPhys() usize {
 pub const USER_VA_FLOOR: usize = 0x500000;
 
 // --- Static kernel-side regions (low PA, post-kernel-image) ---
-pub const KERNEL_HEAP_BASE: usize = 0x800000;
-pub const KERNEL_HEAP_SIZE: usize = 0x400000; // 4 MB → ends at 0xC00000
+//
+// Bumped 2026-05-20 from 0x800000 → 0xA00000. The kernel image (incl.
+// BSS) grew past 0x800000 once ext2's per-mount cache_buf went from
+// 4 KB → 32 KB (gap perf-#1) — the kernel-image-fits check tripped.
+// 2 MB of headroom now between _kernel_end and KERNEL_HEAP_BASE so
+// future BSS growth doesn't require chasing this constant again.
+// Downstream regions are *derived* so a future bump only touches
+// KERNEL_HEAP_BASE here.
+pub const KERNEL_HEAP_BASE: usize = 0xA00000;
+pub const KERNEL_HEAP_SIZE: usize = 0x400000; // 4 MB
 
-pub const GUEST_FB_BASE: usize = 0xC00000;
-pub const GUEST_FB_SIZE: usize = 0x800000; // 8 MB → ends at 0x1400000
+pub const GUEST_FB_BASE: usize = KERNEL_HEAP_BASE + KERNEL_HEAP_SIZE; // 0xE00000
+pub const GUEST_FB_SIZE: usize = 0x800000; // 8 MB
 
-pub const BACK_BUFFER_BASE: usize = 0x1400000;
-pub const BACK_BUFFER_SIZE: usize = 0x800000; // 8 MB → ends at 0x1C00000
+pub const BACK_BUFFER_BASE: usize = GUEST_FB_BASE + GUEST_FB_SIZE; // 0x1600000
+pub const BACK_BUFFER_SIZE: usize = 0x800000; // 8 MB
 
 // UEFI page tables (PML4/PDPT/PDs that map our 64 GB identity range with
 // 1 GB pages). Set up by uefi/uefi_boot.zig before kmain_uefi runs and
@@ -97,8 +105,8 @@ pub const BACK_BUFFER_SIZE: usize = 0x800000; // 8 MB → ends at 0x1C00000
 // Without the reservation, kasan.init's 32 MB shadow allocContiguous
 // happily lands here, the @memset overwrites the page tables, the next
 // memory access hits a wild CR3, and the kernel halts silently.
-pub const UEFI_PT_BASE: usize = 0x1C00000;
-pub const UEFI_PT_SIZE: usize = 0x40000; // 256 KB → ends at 0x1C40000
+pub const UEFI_PT_BASE: usize = BACK_BUFFER_BASE + BACK_BUFFER_SIZE; // 0x1E00000
+pub const UEFI_PT_SIZE: usize = 0x40000; // 256 KB
 
 // GUI framebuffers are PMM-allocated per window now (sysCreateWindow).
 // Only the per-window size cap remains.
@@ -113,14 +121,23 @@ pub const GUI_FB_PER_PID_SIZE: usize = 0x400000; // 4 MB max per window
 // Q1 with its 64-page stack — leaked 200 MB before OOM).
 // MUST be >= elf_loader's `stack_pages * PAGE_SIZE`. The comptime
 // assert in src/proc/elf_loader.zig keeps this in sync.
-pub const USER_STACK_RESERVE: u64 = 0x40000; // 64 pages
+//
+// 1 MB / 256 pages (2026-05-20): Quake1's R_EdgeDrawing overflowed the
+// prior 64-page reservation by ~7 KB. Lazy-fault means unused pages
+// cost zero PMM, so the reserve sets only the VA ceiling. Going higher
+// (e.g. 4 MB) would push USER_SPACE_START into the kernel image's low
+// PA range — stay at 1 MB until an app needs more and we restructure
+// the low-VA layout.
+pub const USER_STACK_RESERVE: u64 = 0x100000; // 256 pages = 1 MB
 pub const USER_SPACE_START: u64 = USER_VA_FLOOR - USER_STACK_RESERVE;
 pub const USER_SPACE_END: u64 = 0x10000000; // 256 MB
-// Initial sbrk position (per-process VA). Numerically equal to GUEST_FB_BASE
-// purely because both happen to be 12 MB — they live in different address
-// contexts (user CR3's lazy-faulted VA vs kernel's low-half FB mapping) and
-// have no design relationship. Don't refactor either to "match the other."
-pub const USER_BRK_INITIAL: usize = 0xC00000;
+// Initial sbrk position (per-process VA). Lives in user low-half VA
+// space, fully independent of kernel low-PA layout — kernel reaches its
+// own heap through the high-half physmap (Phase 3 dropped PML4[0]), so
+// a numeric collision between user-VA and kernel-PHYS is harmless.
+// 0x2000000 (32 MB) gives apps a fresh upward range from a round
+// boundary; well below USER_SPACE_END (0x10000000 = 256 MB).
+pub const USER_BRK_INITIAL: usize = 0x2000000;
 pub const USER_VA_MAX: usize = 0x40000000; // ELF segment validity ceiling
 
 // --- Comptime overlap asserts ---

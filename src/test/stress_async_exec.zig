@@ -90,9 +90,8 @@ pub fn taskEntry() callconv(.c) noreturn {
     // Without this, if our boot dispatch left us on a page directory
     // that doesn't fully cover all of kernel, the first internal
     // `loadAndStart` walk could fault.
-    const vmm = @import("../mm/vmm.zig");
     const paging = @import("../mm/paging.zig");
-    vmm.switchAddressSpace(paging.getKernelPageDirPhys());
+    @import("../cpu/pcid.zig").loadCr3(paging.getKernelPageDirPhys(), 0, smp.myCpu().cpu_id);
 
     var spawned: u64 = 0;
     var kills: u64 = 0;

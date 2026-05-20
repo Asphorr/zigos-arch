@@ -899,6 +899,7 @@ fn cmdIpi() void {
     printSection("Wake-IPI delivery audit");
     vga.print("virtio-gpu MSI-X received per CPU:\n", .{});
     for (vgpu.virtio_gpu_irq_per_cpu, 0..) |c, i| {
+        if (c == 0) continue;
         vga.print("  cpu{d}: {d}\n", .{ i, c });
     }
     vga.print("wake-IPIs sent from MSI-X handler: {d}\n", .{vgpu.virtio_gpu_wake_ipis_sent});

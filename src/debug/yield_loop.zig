@@ -144,6 +144,9 @@ fn tripStuck(pid: usize, kind: process.WaitKind, target: u32, caller_ra: u64, sp
         .nvme_io => {
             @import("../driver/nvme.zig").dumpWaiterForTarget(target);
         },
+        .gpu_io => {
+            @import("../driver/virtio_gpu.zig").dumpWaiterForTarget(target);
+        },
         else => {},
     }
     @import("pid_act.zig").dump(pid);
@@ -176,6 +179,9 @@ fn trip(pid: usize, kind: process.WaitKind, target: u32, caller_ra: u64, count: 
     switch (kind) {
         .nvme_io => {
             @import("../driver/nvme.zig").dumpWaiterForTarget(target);
+        },
+        .gpu_io => {
+            @import("../driver/virtio_gpu.zig").dumpWaiterForTarget(target);
         },
         else => {},
     }
