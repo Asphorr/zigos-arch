@@ -157,18 +157,25 @@ pub fn loadAndStart(elf_buf: [*]align(4) u8, file_size: usize, elf_buf_pages: u3
         }
     }
 
-    // User stack: 256KB (64 pages) lazily allocated via the page-fault
-    // handler. Pages back on first touch so unused stack costs 0 RSS.
-    // Top stays at 0x500000 so process.create's initial RSP (0x4FFFF8)
-    // is just below it; first push triggers fault-in for the top page.
+    // User stack: lazily allocated via the page-fault handler. Pages back
+    // on first touch so unused stack costs 0 RSS. Top stays at
+    // USER_VA_FLOOR so process.create's initial RSP is just below it; the
+    // first push triggers fault-in for the top page.
     //
-    // Was 64KB (16 pages) until 2026-05-20 — Quake 1's COM_LoadPackFile
-    // allocates `dpackfile_t info[MAX_FILES_IN_PACK]` on the stack
-    // (2048 * 64B = 128KB), which overflowed and #PF'd. Bumping
-    // universally rather than per-app since the cost is RSS-free.
-    const stack_top: usize = 0x500000;
-    const stack_pages: usize = 64;
+    // SIZE is derived from memmap.USER_STACK_RESERVE — must match exactly,
+    // otherwise mapUserPage silently rejects stack faults below
+    // USER_SPACE_START (=USER_VA_FLOOR - USER_STACK_RESERVE) and the app
+    // burns frames forever in a re-fault loop (caught 2026-05-20 on Q1
+    // after the stack was bumped to 64 pages but USER_STACK_RESERVE
+    // stayed at 16 pages = 64 KB → 200 MB leak before OOM).
+    const stack_top: usize = memmap.USER_VA_FLOOR;
+    const stack_pages: usize = memmap.USER_STACK_RESERVE / PAGE_SIZE;
     const stack_base: usize = stack_top - stack_pages * PAGE_SIZE;
+    comptime {
+        if (stack_pages * PAGE_SIZE > memmap.USER_STACK_RESERVE) {
+            @compileError("stack_pages exceeds USER_STACK_RESERVE — mapUserPage will reject low stack faults");
+        }
+    }
 
     const entry: usize = @intCast(header.entry);
     const pid = process.create(entry, stack_top - 8) orelse {
@@ -241,9 +248,10 @@ pub fn loadAndExecute(elf_buf: [*]align(4) u8, file_size: usize, elf_buf_pages: 
         return;
     };
 
-    // User stack: 64KB lazy (see loadAndStart for rationale).
-    const stack_top: usize = 0x500000;
-    const stack_pages: usize = 16;
+    // User stack: derived from memmap.USER_STACK_RESERVE — see loadAndStart
+    // for the silent-rejection bug class this matching prevents.
+    const stack_top: usize = memmap.USER_VA_FLOOR;
+    const stack_pages: usize = memmap.USER_STACK_RESERVE / PAGE_SIZE;
     const stack_base: usize = stack_top - stack_pages * PAGE_SIZE;
 
     // Create process with fake interrupt frame

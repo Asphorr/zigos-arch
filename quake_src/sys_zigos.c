@@ -55,6 +55,11 @@ extern void zq_present(void);
 
 void VID_Update(vrect_t *rects) {
     (void)rects;
+    static int vid_update_count = 0;
+    if (vid_update_count < 3) {
+        Sys_Printf("ZQ_DBG: VID_Update #%d called\n", vid_update_count);
+        vid_update_count++;
+    }
     zq_present();
 }
 
@@ -140,9 +145,42 @@ void IN_ClearStates(void) {}
 // ============================================================
 // SOUND DMA (snd_dma.c calls into us)
 // ============================================================
+//
+// We don't have a real audio backend wired up yet (task #742). But
+// returning false from SNDDMA_Init leaves Q1's `shm` global at NULL,
+// and S_Init unconditionally dereferences shm->speed → page fault at
+// 0x20. Caught 2026-05-20.
+//
+// Workaround until task #742 lands: present a software-only DMA
+// buffer. Q1's mixer happily writes samples into it; we just never
+// read them out, so the game stays silent. The fields below match
+// the shape Q1 expects (see dma_t in sound.h).
+extern volatile dma_t *shm;
 
-qboolean SNDDMA_Init(void) { return false; }
-int SNDDMA_GetDMAPos(void) { return 0; }
+static dma_t fake_dma;
+static unsigned char fake_dma_buffer[1 << 16];
+
+qboolean SNDDMA_Init(void) {
+    fake_dma.splitbuffer = 0;
+    fake_dma.samplebits = 16;
+    fake_dma.speed = 22050;
+    fake_dma.channels = 2;
+    fake_dma.samples = sizeof(fake_dma_buffer) / 2;  // mono samples in buffer
+    fake_dma.samplepos = 0;
+    fake_dma.soundalive = true;
+    fake_dma.gamealive = true;
+    fake_dma.submission_chunk = 1;
+    fake_dma.buffer = fake_dma_buffer;
+    shm = &fake_dma;
+    return true;
+}
+int SNDDMA_GetDMAPos(void) {
+    // Q1 advances samplepos via this; without it the mixer doesn't
+    // make forward progress and S_Update_ tight-loops. Increment by a
+    // chunk per call so the mixer thinks samples are being consumed.
+    fake_dma.samplepos = (fake_dma.samplepos + 256) % fake_dma.samples;
+    return fake_dma.samplepos;
+}
 void SNDDMA_Shutdown(void) {}
 void SNDDMA_Submit(void) {}
 
@@ -282,12 +320,23 @@ int quake_main(int argc, char **argv) {
 
     parms.memsize = sizeof(heap);
     parms.membase = heap;
-    parms.basedir = ".";
+    // Hardcode basedir — was relying on `-basedir /share/quake` argv but
+    // observed path passed to fsize was `quake/id1/pak0.pak` (missing the
+    // /share/ prefix), so the arg-parse path is dropping bytes. Bypass it
+    // by setting host_parms.basedir directly; this is the value Q1's
+    // COM_InitFilesystem falls back to when no -basedir arg is present.
+    parms.basedir = "/share/quake";
     parms.cachedir = NULL;
 
     COM_InitArgv(argc, argv);
     parms.argc = com_argc;
     parms.argv = com_argv;
+
+    Sys_Printf("ZQ_DBG: quake_main argc=%d, argv[0]='%s' argv[1]='%s' argv[2]='%s'\n",
+               argc,
+               argc >= 1 ? argv[0] : "(none)",
+               argc >= 2 ? argv[1] : "(none)",
+               argc >= 3 ? argv[2] : "(none)");
 
     Sys_Init();
     Host_Init(&parms);

@@ -1312,6 +1312,35 @@ pub const SIG_IGN: usize = 1;
 pub const SA_RESTART: u32 = 0x10000000;
 pub const SA_NODEFER: u32 = 0x40000000;
 pub const SA_RESETHAND: u32 = 0x80000000;
+/// When set, the kernel passes a populated `Siginfo` as the handler's
+/// second arg (signature: `void(int, *Siginfo, *MContext)`). When clear,
+/// the kernel passes NULL there — both signatures are SysV-compatible
+/// because unused args land in caller-saved registers.
+pub const SA_SIGINFO: u32 = 0x00000004;
+
+/// Mirrors the kernel's `signals.Siginfo`. Apps requesting SA_SIGINFO get a
+/// pointer to this as their 2nd arg. si_addr is the faulting VA for
+/// SIGSEGV/SIGBUS/SIGFPE/SIGILL; si_pid is set by future kill() bookkeeping.
+pub const Siginfo = extern struct {
+    si_signo: u32,
+    si_errno: u32,
+    si_code: u32,
+    _pad0: u32,
+    si_pid: u32,
+    si_uid: u32,
+    si_addr: u64,
+    si_status: u32,
+    _pad1: u32,
+};
+
+// si_code values
+pub const SI_USER: u32 = 0;
+pub const SI_KERNEL: u32 = 0x80;
+pub const SEGV_MAPERR: u32 = 1;
+pub const SEGV_ACCERR: u32 = 2;
+pub const ILL_ILLOPC: u32 = 1;
+pub const FPE_INTDIV: u32 = 1;
+pub const TRAP_BRKPT: u32 = 1;
 
 pub const SIG_BLOCK: u32 = 0;
 pub const SIG_UNBLOCK: u32 = 1;

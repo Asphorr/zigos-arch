@@ -565,7 +565,29 @@ export fn handleException(rsp: u64) callconv(.c) void {
                 // ExcFrame layout matches the GPR_start handed to handleException
                 // — see the layout comment a few hundred lines up.
                 const exc_frame: *signals.ExcFrame = @ptrFromInt(rsp);
-                if (signals.deliverFromExcFrame(pcb, exc_frame, sig)) {
+                // For SIGSEGV from #PF, surface cr2 as si_addr and pick a
+                // si_code based on error-code bit 0 (P=1 means present-page
+                // permission violation, 0 means missing mapping). Other
+                // exceptions don't have a meaningful faulting address.
+                var fault_addr: u64 = 0;
+                var si_code: u32 = signals.SI_KERNEL;
+                if (int_no == 14) {
+                    const cr2 = asm volatile ("movq %%cr2, %[ret]"
+                        : [ret] "=r" (-> u64),
+                    );
+                    fault_addr = cr2;
+                    si_code = if ((error_code & 1) == 0) signals.SEGV_MAPERR else signals.SEGV_ACCERR;
+                } else if (int_no == 6) {
+                    fault_addr = saved_rip;
+                    si_code = signals.ILL_ILLOPC;
+                } else if (int_no == 0) {
+                    fault_addr = saved_rip;
+                    si_code = signals.FPE_INTDIV;
+                } else if (int_no == 3 or int_no == 1) {
+                    fault_addr = saved_rip;
+                    si_code = signals.TRAP_BRKPT;
+                }
+                if (signals.deliverFromExcFrame(pcb, exc_frame, sig, fault_addr, si_code)) {
                     asm volatile ("sti");
                     return;
                 }

@@ -167,15 +167,15 @@ pub fn init() bool {
     // subsystem-id distinguishes. Modern (0x1041) doesn't need this since
     // the device-id itself encodes the type.
     if (dev_found.device_id == VIRTIO_NET_DEVICE_LEGACY) {
-        const subsys = pci.configRead(dev_found.bus, dev_found.dev, dev_found.func, 0x2C);
-        const subsys_dev: u16 = @truncate(subsys >> 16);
-        if (subsys_dev != 1) {
-            debug.klog("[virtio-net] Transitional subsystem {d} != 1, not net\n", .{subsys_dev});
+        const ss = pci.subsystemIds(dev_found);
+        if (ss.sid != 1) {
+            debug.klog("[virtio-net] Transitional subsystem {d} != 1, not net\n", .{ss.sid});
             return false;
         }
     }
 
-    pci.bindDevice(dev_found);
+    var bind = pci.bindDevice(dev_found);
+    defer bind.deinit();
     pci_bus = dev_found.bus;
     pci_dev = dev_found.dev;
     pci_func = dev_found.func;
@@ -350,6 +350,7 @@ pub fn init() bool {
 
     initialized = true;
     debug.klog("[virtio-net] Ready ({d} RX buffers)\n", .{rx_count});
+    bind.commit();
     return true;
 }
 

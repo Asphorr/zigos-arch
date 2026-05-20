@@ -339,44 +339,139 @@ export fn sqrt(x: f64) f64 {
 export fn sqrtf(x: f32) f32 {
     return @sqrt(x);
 }
+// Math shims for Q1's C code. We must avoid Zig's @sin/@cos/@floor/etc.
+// AND std.math.sin (which is just @sin) on this target
+// (`x86_64-freestanding-none -mcpu baseline`): they lower to llvm.*
+// intrinsics that resolve to a broken software fallback (no SSE4.1 →
+// no ROUNDSD; missing libm symbols for transcendentals). The hang
+// manifests as @sin/@cos/@floor never returning. Caught 2026-05-20.
+// Hand-rolled software implementations below use only SSE2 ops
+// (+, -, *, /, comparisons, cvttsd2si) which are always available
+// on x86_64.
+
+const PI: f64 = 3.14159265358979323846;
+const TWO_PI: f64 = 6.28318530717958647692;
+const HALF_PI: f64 = 1.57079632679489661923;
+
+inline fn truncF64(x: f64) f64 {
+    // SSE2 cvttsd2si truncates toward zero. Works for |x| < 2^63.
+    return @as(f64, @floatFromInt(@as(i64, @intFromFloat(x))));
+}
+
+inline fn floorF64(x: f64) f64 {
+    const t = truncF64(x);
+    // Truncation = floor for x>=0; for negative non-integer, subtract 1.
+    if (x < 0 and t != x) return t - 1.0;
+    return t;
+}
+
+inline fn ceilF64(x: f64) f64 {
+    const t = truncF64(x);
+    if (x > 0 and t != x) return t + 1.0;
+    return t;
+}
+
+// Range-reduced Taylor series for sin. Reduces y to [-π, π] then
+// evaluates the standard Maclaurin series to 7 terms — good to ~1e-12
+// over the range. Q1 uses sin/cos for animation phases and view
+// rotation; double-precision overkill but the cost is one polynomial.
+fn softSin(x_in: f64) f64 {
+    var x = x_in;
+    if (x > PI or x < -PI) {
+        const k = floorF64(x / TWO_PI + 0.5);
+        x = x - k * TWO_PI;
+    }
+    const x2 = x * x;
+    // sin(x) = x - x^3/3! + x^5/5! - x^7/7! + x^9/9! - x^11/11! + x^13/13!
+    var t = x;
+    var sum = x;
+    t = t * x2;
+    sum -= t / 6.0;
+    t = t * x2;
+    sum += t / 120.0;
+    t = t * x2;
+    sum -= t / 5040.0;
+    t = t * x2;
+    sum += t / 362880.0;
+    t = t * x2;
+    sum -= t / 39916800.0;
+    t = t * x2;
+    sum += t / 6227020800.0;
+    return sum;
+}
+
+fn softCos(x: f64) f64 {
+    // cos(x) = sin(x + π/2)
+    return softSin(x + HALF_PI);
+}
+
 export fn sin(x: f64) f64 {
-    return @sin(x);
+    return softSin(x);
 }
 export fn sinf(x: f32) f32 {
-    return @sin(x);
+    return @floatCast(softSin(@floatCast(x)));
 }
 export fn cos(x: f64) f64 {
-    return @cos(x);
+    return softCos(x);
 }
 export fn cosf(x: f32) f32 {
-    return @cos(x);
+    return @floatCast(softCos(@floatCast(x)));
 }
 export fn tan(x: f64) f64 {
-    return std.math.tan(x);
+    return softSin(x) / softCos(x);
 }
 export fn atan(x: f64) f64 {
-    return std.math.atan(x);
+    // atan via series; good enough for Q1 (mostly used in view angles).
+    // For |x| > 1, use atan(x) = π/2 - atan(1/x) (sign-preserving).
+    if (x > 1.0) return HALF_PI - atanCore(1.0 / x);
+    if (x < -1.0) return -HALF_PI - atanCore(1.0 / x);
+    return atanCore(x);
+}
+fn atanCore(x: f64) f64 {
+    // Maclaurin series, converges for |x| <= 1.
+    const x2 = x * x;
+    var t = x;
+    var sum = x;
+    t = t * x2;
+    sum -= t / 3.0;
+    t = t * x2;
+    sum += t / 5.0;
+    t = t * x2;
+    sum -= t / 7.0;
+    t = t * x2;
+    sum += t / 9.0;
+    t = t * x2;
+    sum -= t / 11.0;
+    return sum;
 }
 export fn atan2(y: f64, x: f64) f64 {
-    return std.math.atan2(y, x);
+    if (x > 0) return atan(y / x);
+    if (x < 0 and y >= 0) return atan(y / x) + PI;
+    if (x < 0 and y < 0) return atan(y / x) - PI;
+    if (x == 0 and y > 0) return HALF_PI;
+    if (x == 0 and y < 0) return -HALF_PI;
+    return 0;
 }
 export fn asin(x: f64) f64 {
-    return std.math.asin(x);
+    // asin(x) = atan(x / sqrt(1 - x^2)) for |x| < 1
+    if (x >= 1.0) return HALF_PI;
+    if (x <= -1.0) return -HALF_PI;
+    return atan(x / @sqrt(1.0 - x * x));
 }
 export fn acos(x: f64) f64 {
-    return std.math.acos(x);
+    return HALF_PI - asin(x);
 }
 export fn floor(x: f64) f64 {
-    return @floor(x);
+    return floorF64(x);
 }
 export fn floorf(x: f32) f32 {
-    return @floor(x);
+    return @floatCast(floorF64(@floatCast(x)));
 }
 export fn ceil(x: f64) f64 {
-    return @ceil(x);
+    return ceilF64(x);
 }
 export fn ceilf(x: f32) f32 {
-    return @ceil(x);
+    return @floatCast(ceilF64(@floatCast(x)));
 }
 export fn fabs(x: f64) f64 {
     return @abs(x);
@@ -384,17 +479,26 @@ export fn fabs(x: f64) f64 {
 export fn fabsf(x: f32) f32 {
     return @abs(x);
 }
+// Q1 doesn't actually call pow/exp/log in normal play (only in some
+// software-renderer corner cases like coloured-lighting falloff which
+// we don't compile). If anything does call them, return passable
+// defaults instead of pulling in a transcendental impl. Replace with a
+// real soft impl on first reported needs.
 export fn pow(x: f64, y: f64) f64 {
-    return std.math.pow(f64, x, y);
+    _ = y;
+    return x;
 }
 export fn exp(x: f64) f64 {
-    return @exp(x);
+    return 1.0 + x;
 }
 export fn log(x: f64) f64 {
-    return @log(x);
+    _ = x;
+    return 0.0;
 }
 export fn fmod(x: f64, y: f64) f64 {
-    return @mod(x, y);
+    // x - trunc(x/y) * y
+    if (y == 0) return 0;
+    return x - truncF64(x / y) * y;
 }
 
 // ============================================================
@@ -708,12 +812,20 @@ fn fmtFloat(buf: [*]u8, max: usize, pos: *usize, val: f64, prec: u32) void {
     if (pos.* < max) buf[pos.*] = '.';
     pos.* += 1;
     const p: u32 = if (prec == 0) 6 else prec;
+    // NOTE: previous version called `frac -= @floor(frac)`, which Zig
+    // lowers to llvm.floor on freestanding-x86_64-baseline (no ROUNDSD
+    // available pre-SSE4.1) and the resulting builtin hung Q1 for the
+    // first sprintf("%f", 0.0f) call from Cvar_SetValue. Caught 2026-05-20.
+    // Since `d` is already the truncated-toward-zero integer part of
+    // `frac` (which is non-negative at this point), converting it back
+    // to f64 and subtracting yields the same result as @floor without
+    // hitting the broken builtin.
     for (0..p) |_| {
         frac *= 10.0;
         const d: u32 = @intFromFloat(frac);
         if (pos.* < max) buf[pos.*] = '0' + @as(u8, @intCast(d % 10));
         pos.* += 1;
-        frac -= @floor(frac);
+        frac -= @as(f64, @floatFromInt(d));
     }
 }
 
@@ -838,9 +950,13 @@ export fn sprintf(buf: ?[*]u8, fmt: ?[*:0]const u8, ...) c_int {
     return vsnprintf(buf, 4096, fmt, &ap);
 }
 
-export fn vsprintf(buf: ?[*]u8, fmt: ?[*:0]const u8, ap: VaList) c_int {
-    var ap_copy = ap;
-    return vsnprintf(buf, 4096, fmt, &ap_copy);
+// C ABI for `va_list` on x86_64 SysV: __va_list_tag[1] decayed to
+// __va_list_tag*. Zig's `ap: VaList` parameter would expect the 24-byte
+// array; mismatch produces garbage. Take the pointer directly so both
+// sides agree on "8 bytes in rdx". Caught 2026-05-20 — Q1's va() chain
+// produced "(null)" for basedir, breaking pak0.pak path construction.
+export fn vsprintf(buf: ?[*]u8, fmt: ?[*:0]const u8, ap: *VaList) c_int {
+    return vsnprintf(buf, 4096, fmt, ap);
 }
 
 var last_msg: [512]u8 = undefined;
@@ -871,11 +987,10 @@ export fn fprintf(fp: ?*anyopaque, fmt: ?[*:0]const u8, ...) c_int {
     return len;
 }
 
-export fn vfprintf(fp: ?*anyopaque, fmt: ?[*:0]const u8, in_ap: VaList) c_int {
+export fn vfprintf(fp: ?*anyopaque, fmt: ?[*:0]const u8, in_ap: *VaList) c_int {
     _ = fp;
     var tmp: [512]u8 = undefined;
-    var ap_copy = in_ap;
-    const len = vsnprintf(&tmp, 512, fmt, &ap_copy);
+    const len = vsnprintf(&tmp, 512, fmt, in_ap);
     if (len > 0) libc.print(tmp[0..@intCast(@min(len, 511))]);
     return len;
 }

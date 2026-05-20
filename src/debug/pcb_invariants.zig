@@ -195,6 +195,15 @@ fn checkPcb(pid: usize) ?[]const u8 {
         if (@import("save_trace.zig").isPidDispatchingInAnywhere(@intCast(pid))) {
             return null;
         }
+        // Transient outbound-destroy window: destroyCurrent cleared
+        // cpu.current_pid before setState(.zombie/.unused); state stays
+        // .running in between. Symmetric partner of the inbound case;
+        // `dispatching_out_pid` is the load-bearing bracket. Added
+        // 2026-05-20 as the long-planned symmetric fix exposed during
+        // Q1 port stress.
+        if (@import("save_trace.zig").isPidDispatchingOutAnywhere(@intCast(pid))) {
+            return null;
+        }
         var found = false;
         for (0..smp.MAX_CPUS) |i| {
             const cpu = &smp.cpus[i];

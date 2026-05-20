@@ -312,19 +312,20 @@ pub fn init() bool {
     debug.klog("[xhci] Found at bus={d} dev={d} func={d} vendor=0x{x} device=0x{x}\n", .{
         dev.bus, dev.dev, dev.func, dev.vendor_id, dev.device_id,
     });
-    debug.klog("[xhci] BAR0=0x{x} IRQ={d}\n", .{ dev.bar0, dev.irq_line });
+    debug.klog("[xhci] BAR0=0x{x} IRQ={d}\n", .{ dev.bars[0], dev.irq_line });
 
     // Get BAR size
     const bar_size = pci.getBarSize(dev, 0);
     debug.klog("[xhci] BAR0 size={d} bytes\n", .{bar_size});
 
-    if (dev.bar0 == 0) {
+    if (dev.bars[0] == 0) {
         debug.klog("[xhci] BAR0 is zero, cannot map\n", .{});
         return false;
     }
 
     // Bus master + MEM/IO + INTx-disable (xHCI uses MSI-X for event ring).
-    pci.bindDevice(dev);
+    var bind = pci.bindDevice(dev);
+    defer bind.deinit();
     pci_bus = dev.bus;
     pci_dev = dev.dev;
     pci_func = dev.func;
@@ -339,8 +340,8 @@ pub fn init() bool {
     // `mmio_base + off` is directly dereferenceable; hardware never sees
     // this value, only CPU register reads/writes.
     const map_size = if (bar_size > 0) bar_size else 0x10000; // Default 64KB
-    paging.mapMMIO(dev.bar0, map_size);
-    mmio_base = paging.physToVirt(@intCast(dev.bar0));
+    paging.mapMMIO(dev.bars[0], map_size);
+    mmio_base = paging.physToVirt(@intCast(dev.bars[0]));
 
     // Read capability registers
     const caplength: u8 = @truncate(readReg(mmio_base));
@@ -570,6 +571,7 @@ pub fn init() bool {
     enumeration_done = true;
     debug.klog("[xhci] Enumeration complete, {d} HID devices\n", .{device_count});
 
+    bind.commit();
     return true;
 }
 

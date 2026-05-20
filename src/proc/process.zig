@@ -16,6 +16,17 @@ const std = @import("std");
 
 pub const MAX_PROCS = config.MAX_PROCS;
 const KSTACK_SIZE = config.KSTACK_SIZE;
+
+/// Targeted scheduler-trace gate. When non-zero, every setState CAS,
+/// rqEnter, rqLeave, and pickNext CAS for this pid prints a one-line
+/// klog with caller RA + CPU. Set to 0 to disable. Used 2026-05-20 to
+/// root out the "state=.running but no cpu.current_pid points here"
+/// pcb-invariant panic on Q1 — the trace klog widened the picker
+/// CAS→bracket window enough to make the latent race fire reliably,
+/// pinpointing that `cpu.dispatching_in_pid = cand` happened AFTER
+/// rather than BEFORE the state CAS in pickNext. Bracket order fixed
+/// 2026-05-20; trace left in place (gated to 0) for next regression.
+const TRACE_PID: u8 = 0;
 const KSTACK_GUARD_SIZE = config.KSTACK_GUARD_SIZE;
 const KSTACK_SLOT_SIZE = config.KSTACK_SLOT_SIZE;
 const MAX_FDS = config.MAX_FDS;
@@ -958,6 +969,17 @@ inline fn rqQueueFor(rq: *runqueue.Rq, prio: Priority) *runqueue.PriQueue {
 /// + 1 so they don't immediately monopolize their band.
 fn rqEnter(pid: usize, from_sleep: bool) void {
     const pcb = &procs[pid];
+    // Targeted scheduler-invariant trace: dump on every rq mutation for
+    // TRACE_PID (Q1's expected pid). Find which transition leaves pid
+    // stuck "state=sleeping + in_rq=true" by reading the linear sequence
+    // of setState/rqEnter/rqLeave events that crossed the bad state.
+    // Remove after the wedge is rooted out.
+    if (TRACE_PID != 0 and pid == TRACE_PID) {
+        const ra = @returnAddress();
+        debug.klog("[trace pid={d} cpu={d}] rqEnter from_sleep={any} state_before={d} assigned_cpu={d} ra=0x{X}\n", .{
+            pid, smp.myCpu().cpu_id, from_sleep, @intFromEnum(pcb.state), pcb.assigned_cpu, ra,
+        });
+    }
     if (pcb.is_idle) return;
     if (pcb.assigned_cpu == 0xFF) return;
     if (pcb.assigned_cpu >= smp.MAX_CPUS) return;
@@ -965,9 +987,18 @@ fn rqEnter(pid: usize, from_sleep: bool) void {
     const f = rq.lock.acquireIrqSave();
     defer rq.lock.releaseIrqRestore(f);
     const pid_u8: u8 = @intCast(pid);
-    if (rq.interactive.contains(pid_u8)) return; // already enqueued — idempotent
-    if (rq.normal.contains(pid_u8)) return;
-    if (rq.background.contains(pid_u8)) return;
+    if (rq.interactive.contains(pid_u8)) {
+        if (TRACE_PID != 0 and pid == TRACE_PID) debug.klog("[trace pid={d} cpu={d}] rqEnter SKIP — already in interactive\n", .{ pid, smp.myCpu().cpu_id });
+        return; // already enqueued — idempotent
+    }
+    if (rq.normal.contains(pid_u8)) {
+        if (TRACE_PID != 0 and pid == TRACE_PID) debug.klog("[trace pid={d} cpu={d}] rqEnter SKIP — already in normal\n", .{ pid, smp.myCpu().cpu_id });
+        return;
+    }
+    if (rq.background.contains(pid_u8)) {
+        if (TRACE_PID != 0 and pid == TRACE_PID) debug.klog("[trace pid={d} cpu={d}] rqEnter SKIP — already in background\n", .{ pid, smp.myCpu().cpu_id });
+        return;
+    }
 
     // CFS placement under the rq's own lock so a concurrent picker on the
     // same rq can't race against the vruntime adjustment.
@@ -1002,6 +1033,11 @@ fn rqEnter(pid: usize, from_sleep: bool) void {
     @import("../debug/pid_act.zig").record(
         pid, .rq_enter, @intFromEnum(pcb.priority), 0xFF, @returnAddress(),
     );
+    if (TRACE_PID != 0 and pid == TRACE_PID) {
+        debug.klog("[trace pid={d} cpu={d}] rqEnter DONE — pushed to band={d} nr_runnable={d}\n", .{
+            pid, smp.myCpu().cpu_id, @intFromEnum(pcb.priority), rq.nr_runnable,
+        });
+    }
 }
 
 /// Remove a pid from its assigned CPU's runqueue. Idempotent — if the
@@ -1018,6 +1054,12 @@ fn rqEnter(pid: usize, from_sleep: bool) void {
 /// MAX_PROCS=32 entries each is trivial to scan.
 fn rqLeave(pid: usize) void {
     const pcb = &procs[pid];
+    if (TRACE_PID != 0 and pid == TRACE_PID) {
+        const ra2 = @returnAddress();
+        debug.klog("[trace pid={d} cpu={d}] rqLeave ENTRY state={d} assigned_cpu={d} ra=0x{X}\n", .{
+            pid, smp.myCpu().cpu_id, @intFromEnum(pcb.state), pcb.assigned_cpu, ra2,
+        });
+    }
     if (pcb.is_idle) return;
     if (pcb.assigned_cpu == 0xFF) return;
     if (pcb.assigned_cpu >= smp.MAX_CPUS) return;
@@ -1030,18 +1072,22 @@ fn rqLeave(pid: usize) void {
     if (rq.interactive.remove(pid_u8)) {
         rq.nr_runnable -%= 1;
         pid_act.record(pid, .rq_leave, @intFromEnum(Priority.interactive), 0xFF, ra);
+        if (TRACE_PID != 0 and pid == TRACE_PID) debug.klog("[trace pid={d} cpu={d}] rqLeave REMOVED from interactive nr_runnable={d}\n", .{ pid, smp.myCpu().cpu_id, rq.nr_runnable });
         return;
     }
     if (rq.normal.remove(pid_u8)) {
         rq.nr_runnable -%= 1;
         pid_act.record(pid, .rq_leave, @intFromEnum(Priority.normal), 0xFF, ra);
+        if (TRACE_PID != 0 and pid == TRACE_PID) debug.klog("[trace pid={d} cpu={d}] rqLeave REMOVED from normal nr_runnable={d}\n", .{ pid, smp.myCpu().cpu_id, rq.nr_runnable });
         return;
     }
     if (rq.background.remove(pid_u8)) {
         rq.nr_runnable -%= 1;
         pid_act.record(pid, .rq_leave, @intFromEnum(Priority.background), 0xFF, ra);
+        if (TRACE_PID != 0 and pid == TRACE_PID) debug.klog("[trace pid={d} cpu={d}] rqLeave REMOVED from background nr_runnable={d}\n", .{ pid, smp.myCpu().cpu_id, rq.nr_runnable });
         return;
     }
+    if (TRACE_PID != 0 and pid == TRACE_PID) debug.klog("[trace pid={d} cpu={d}] rqLeave NO-OP — not in any queue\n", .{ pid, smp.myCpu().cpu_id });
 }
 
 /// Centralized state setter. ALL non-CAS state writes go through here so
@@ -1107,12 +1153,24 @@ pub fn setState(pid: usize, new_state: State) void {
     var old_byte: u8 = @atomicLoad(u8, state_ptr, .acquire);
     const new_byte: u8 = @intFromEnum(new_state);
     while (true) {
-        if (old_byte == new_byte) return; // already in this state
+        if (old_byte == new_byte) {
+            if (TRACE_PID != 0 and pid == TRACE_PID) {
+                debug.klog("[trace pid={d} cpu={d}] setState NOOP old=={d} new=={d} ra=0x{X}\n", .{
+                    pid, smp.myCpu().cpu_id, old_byte, new_byte, @returnAddress(),
+                });
+            }
+            return; // already in this state
+        }
         const cas = @cmpxchgStrong(u8, state_ptr, old_byte, new_byte, .acq_rel, .acquire);
         if (cas == null) break; // we own this transition
         old_byte = cas.?;        // someone else changed state — retry with their value
     }
     const old_state: State = @enumFromInt(old_byte);
+    if (TRACE_PID != 0 and pid == TRACE_PID) {
+        debug.klog("[trace pid={d} cpu={d}] setState CAS-OK {d}->{d} ra=0x{X}\n", .{
+            pid, smp.myCpu().cpu_id, old_byte, new_byte, @returnAddress(),
+        });
+    }
     // Per-PID activity ring stamp. Logged AFTER the CAS succeeded so the
     // ring entry corresponds to a real transition (no-op early-returns
     // above leave no trace, by design).
@@ -1708,8 +1766,15 @@ pub fn getStateRaw(pid: usize) u8 {
 /// before any other create-time helper has assigned a CPU.
 pub fn setCurrent(pid: usize) void {
     assignInitialCpu(pid);
+    // Inbound-dispatch bracket — same window as schedule()'s PICK_CAS
+    // path: state becomes .running here, but cpu.current_pid only
+    // claims it on the next line. Without the bracket a cross-CPU
+    // pcb_invariants scan landing in between would false-fire
+    // "state==.running but no owner". setCurrentPid clears the bracket.
+    const cpu = smp.myCpu();
+    cpu.dispatching_in_pid = @intCast(pid);
     setState(pid, .running);
-    @import("../debug/pid_trace.zig").setCurrentPid(smp.myCpu(), pid);
+    @import("../debug/pid_trace.zig").setCurrentPid(cpu, pid);
 }
 
 /// Per-CPU kernel-mode idle task (task #235). Runs CS=0x08, no user space,
@@ -2367,18 +2432,29 @@ pub fn schedule() void {
         // .running→.sleeping skips rqLeave (was_ready=false), pinning
         // cand in rq as .sleeping forever. Caught 2026-05-19 by audit.
         const ss_flags = setstate_locks[cand].acquireIrqSave();
+        // dispatching_in_pid bracket: declare intent to flip cand to
+        // .running BEFORE the CAS, so any cross-CPU pcb_invariants scan
+        // that observes state==.running sees a non-empty bracket and
+        // skips. Setting AFTER the CAS leaves a window where state is
+        // already .running but the bracket is still 0xFFFF — caught
+        // 2026-05-20 by Q1 stress + a debug klog that widened the
+        // window enough for cpu1's per-tick scan to land inside it,
+        // panicking with "state==.running but no cpu.current_pid points
+        // here." x86 TSO orders the prior store before the subsequent
+        // locked CAS, so the reader will see the bracket if it sees
+        // the post-CAS state.
+        cpu.dispatching_in_pid = @intCast(cand);
         const prev = @cmpxchgStrong(u8, state_ptr, ready_val, running_val, .seq_cst, .seq_cst);
+        if (TRACE_PID != 0 and cand == TRACE_PID) {
+            debug.klog("[trace pid={d} cpu={d}] pickNext CAS .ready->.running result={any}\n", .{
+                cand, cpu.cpu_id, prev,
+            });
+        }
         if (prev == null) {
             // CAS atomically claimed cand — sync the rq view (cand was
             // .ready, now .running, so it must leave its assigned_cpu's
             // rq). Holding setstate_locks[cand] across CAS + rqLeave
             // closes the dispatch / wake race documented above.
-            // dispatching_in_pid bracket: state is now .running but
-            // cpu.current_pid is still pointing at the previous task.
-            // Cross-CPU pcb_invariants scans would see "running but no
-            // owner". Claim the bracket here; setCurrentPid clears it
-            // once cpu.current_pid is updated.
-            cpu.dispatching_in_pid = @intCast(cand);
             // Per-PID activity ring: this is the OTHER state-byte writer
             // (not via setState). Without this stamp, the autopsy ring
             // would show ready→running mysteriously without a SETSTATE.
@@ -2394,6 +2470,10 @@ pub fn schedule() void {
             setstate_locks[cand].releaseIrqRestore(ss_flags);
             break :blk cand;
         }
+        // CAS failed — another CPU claimed cand first. Clear the bracket
+        // so a subsequent pcb_invariants scan doesn't ghost-skip cand on
+        // an unrelated future running state.
+        cpu.dispatching_in_pid = 0xFFFF;
         setstate_locks[cand].releaseIrqRestore(ss_flags);
         // CAS failed — another CPU got it first. Try again.
     };
@@ -2813,6 +2893,43 @@ pub fn kernelSleepMs(ms: u32) void {
 ///     (signal delivery, parent destroy, EINTR-style cancel).
 ///
 /// Returns when woken; does NOT loop.
+/// Result of `blockOnInterruptible`. `.woke` means the wait completed
+/// normally (caller's condition is presumed satisfied, or at least worth
+/// re-checking). `.signalled` means a non-blocked signal arrived while we
+/// were parked (or was already pending on entry); the caller must unwind
+/// and return -EINTR rather than continuing the blocking operation —
+/// otherwise the signal would only deliver after the syscall finishes,
+/// which can be never for `accept`/`read` shapes.
+pub const BlockResult = enum { woke, signalled };
+
+inline fn hasPendingDeliverable(pcb: *const PCB) bool {
+    const pending = @atomicLoad(u32, &pcb.pending_signals, .acquire);
+    return (pending & ~pcb.signal_mask) != 0;
+}
+
+/// Like `blockOn`, but bails out (without parking, or while parked) when a
+/// non-blocked signal is pending. Callers of the form
+///
+///     while (!cond) switch (process.blockOnInterruptible(.kind, t)) {
+///         .woke => {},
+///         .signalled => return E_INTR,
+///     }
+///
+/// get correct EINTR semantics: any syscall they're in is interrupted
+/// instead of resumed after handler delivery. Drivers doing kernel-internal
+/// waits (NVMe completion, GPU command IRQ) should keep using `blockOn` —
+/// interrupting them mid-DMA would leak hardware state.
+pub fn blockOnInterruptible(kind: WaitKind, target: u32) BlockResult {
+    const cur = smp.myCpu().current_pid orelse return .woke;
+    const pcb = &procs[cur];
+    // Signal already pending — don't even park. The deliver path on this
+    // syscall's return will pick it up.
+    if (hasPendingDeliverable(pcb)) return .signalled;
+    blockOn(kind, target);
+    if (hasPendingDeliverable(pcb)) return .signalled;
+    return .woke;
+}
+
 pub fn blockOn(kind: WaitKind, target: u32) void {
     const cur = smp.myCpu().current_pid orelse return;
     const pcb = &procs[cur];
@@ -3080,6 +3197,13 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp) void {
         if (cpu.idle_pid) |idle| {
             gdt.setTssRsp0(idle, procs[idle].kernel_stack_top);
         }
+        // Outbound TOCTOU bracket: cpu.current_pid is about to be cleared,
+        // but procs[pid].state stays .running until the setState
+        // (.zombie/.unused) below. A cross-CPU pcb_invariants scan in this
+        // window would false-fire "state==.running but no owner". Mirror
+        // of dispatching_in_pid for the outbound direction; cleared after
+        // the setState lands further down.
+        cpu.dispatching_out_pid = @intCast(pid);
         @import("../debug/pid_trace.zig").setCurrentPid(cpu, null);
         kp.checkpoint("tdt:post-steerToIdle");
     }
@@ -3118,6 +3242,15 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp) void {
         @atomicStore(usize, &expected_kstack_tops[pid], 0, .release);
         @import("../debug/kasan.zig").markPcbDead(@intFromPtr(&kstack_pool[pid]) + KSTACK_GUARD_SIZE, KSTACK_SIZE);
         kp.checkpoint("tdt:post-markPcbDead");
+    }
+
+    // Release the outbound TOCTOU bracket — pid's state is no longer
+    // .running so pcb_invariants' running-but-no-owner check is no
+    // longer fooled. Only applies to op == .destroy; the kill path
+    // never claimed it (the victim's CPU runs the .destroy branch
+    // instead per killProcessWithStatus's IPI protocol).
+    if (op == .destroy) {
+        smp.myCpu().dispatching_out_pid = 0xFFFF;
     }
 
     @import("../debug/kdbg.zig").procEvent(
@@ -3647,6 +3780,33 @@ pub fn handleUserPageFault(cr2: usize, error_code: u64) bool {
                 pmm.freeFrameCount(),
                 pmm.managedFrameCount(),
             });
+            // Memory autopsy: enumerate every lazy region so we can see
+            // WHICH range consumed the frames before OOM hit. Without
+            // this the OOM line names only the fault site, not the leak
+            // site. Added 2026-05-20 during Q1 memory-budget audit.
+            debug.klog("[oom]   lazy_count={d} user_brk=0x{X} heap_lazy_idx={d}\n", .{
+                lead.lazy_count, lead.user_brk, lead.heap_lazy_idx,
+            });
+            var ri: u8 = 0;
+            while (ri < lead.lazy_count) : (ri += 1) {
+                const rr = lead.lazy_regions[ri];
+                const size_kb: usize = (rr.end - rr.start) / 1024;
+                const tag: []const u8 = if (rr.source != null)
+                    "FILE-BACKED"
+                else if (lead.heap_lazy_idx >= 0 and ri == @as(u8, @intCast(lead.heap_lazy_idx)))
+                    "SBRK-HEAP"
+                else
+                    "ANON";
+                debug.klog("[oom]   region[{d}] 0x{X:0>9}..0x{X:0>9} size={d}KB prot=0x{X} {s}\n", .{
+                    ri, rr.start, rr.end, size_kb, rr.prot, tag,
+                });
+            }
+            // Dump the kdbg pmm_alloc + pmm_free rings — they name which
+            // call sites have been (de)allocating frames most recently.
+            // For the Q1 audit (2026-05-20): lazy regions sum to 17 MB
+            // but PMM dropped ~200 MB; the ring tells us who took the
+            // other 183 MB.
+            @import("../debug/kdbg.zig").dumpPmmAllocRing();
             dumpSyscallRing(@intCast(cur));
             // Desktop notification so the user sees WHY the app vanished
             // without having to scroll serial.log.

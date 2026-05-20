@@ -280,7 +280,8 @@ pub fn init() bool {
     });
 
     // Bus master + MEM (HDA is MMIO; INTx kept disabled — Phase 1 is polled).
-    pci.bindDevice(dev);
+    var bind = pci.bindDevice(dev);
+    defer bind.deinit();
     pci_bus = dev.bus;
     pci_dev = dev.dev;
     pci_func = dev.func;
@@ -365,6 +366,7 @@ pub fn init() bool {
     }
 
     debug.klog("[hda] init OK (afg={d} dac={d} pin={d}, stream ready)\n", .{ afg_nid, dac_nid, pin_nid });
+    bind.commit();
     return true;
 }
 

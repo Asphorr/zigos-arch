@@ -273,14 +273,15 @@ fn scanAndInit() void {
 }
 
 fn initController(c: *Controller, dev: pci.PciDevice, idx: usize) bool {
-    if (dev.bar0 == 0) {
+    if (dev.bars[0] == 0) {
         debug.klog("[nvme] ctrl#{d} BAR0 unassigned\n", .{idx});
         return false;
     }
-    pci.bindDevice(dev);
+    var bind = pci.bindDevice(dev);
+    defer bind.deinit();
     // Store the kernel-side VA (physmap). Hardware never sees mmio_base; only
     // CPU-side register reads/writes through it.
-    c.mmio_base = paging.physToVirt(@intCast(dev.bar0));
+    c.mmio_base = paging.physToVirt(@intCast(dev.bars[0]));
 
     // Probe MSI-X up front (before CC.EN). If the cap is missing or
     // there's no free dynamic IRQ vector, `use_msix` stays false and we
@@ -449,6 +450,7 @@ fn initController(c: *Controller, dev: pci.PciDevice, idx: usize) bool {
 
     c.initialized = true;
     debug.klog("[nvme] ctrl#{d} ready\n", .{idx});
+    bind.commit();
     return true;
 }
 
@@ -716,17 +718,22 @@ fn allocCid(c: *Controller) ?u16 {
     return null;
 }
 
-/// IRQ-context CQ scanner. Advances io_cq_head over every CQE whose
-/// phase bit matches our expected value, finds the matching waiter by
-/// CID, sets completion fields, and wakes the blocked process. Must be
-/// fast and non-blocking — runs with IRQs off, on the preempted task's
-/// kstack. Returns true iff at least one waiter was woken (caller can
-/// use this to decide whether to invoke `schedule()` for immediate
-/// dispatch of the woken task).
+/// CQ scanner. Advances io_cq_head over every CQE whose phase bit
+/// matches our expected value, finds the matching waiter by CID, sets
+/// completion fields, and wakes the blocked process. Returns true iff
+/// at least one waiter was woken.
+///
+/// Callable from both IRQ context (primary path, via nvmeIrqHandler)
+/// and task context (defensive safety-net call from ioCommandAsync's
+/// wait loop, to recover from lost MSI-X messages caused by mask races
+/// during mid-flight retargeting or PCIe posted-write ordering hiding
+/// the CQE from the IRQ-side read). `acquireIrqSave` ensures the lock
+/// is safe to take from either side without recursive-deadlock if an
+/// IRQ arrives mid-section in task context.
 fn reapCq(c: *Controller) bool {
     if (!c.initialized) return false;
-    c.cq_lock.acquire();
-    defer c.cq_lock.release();
+    const irq_flags = c.cq_lock.acquireIrqSave();
+    defer c.cq_lock.releaseIrqRestore(irq_flags);
     const cq: [*]volatile CqEntry = @ptrFromInt(paging.physToVirt(c.io_cq));
     var any = false;
     var any_woken = false;
@@ -911,6 +918,18 @@ fn ioCommandAsync(c: *Controller, ctrl_idx: u32, opcode: u8, lba: u32, user_buf:
         } else {
             proc.blockOn(.nvme_io, wait_target);
         }
+        // Safety net: opportunistically drain the CQ in case the
+        // IRQ-driven reapCq missed our completion. Two known race
+        // classes converge here — (1) MSI-X message lost during a
+        // mid-flight mask/unmask retarget (PBA replay isn't always
+        // reliable under QEMU contention), and (2) PCIe posted-write
+        // ordering letting the MSI-X land at the CPU before the CQE
+        // DMA is globally visible, so the IRQ-context read saw a
+        // stale phase bit and broke. In both cases HW thinks the IRQ
+        // was delivered and won't refire; without this drain the
+        // waiter would park forever. No-op when the CQ is empty;
+        // single MMIO + cq_lock acquire when it isn't.
+        _ = reapCq(c);
     }
     const t_wait_end = @import("../debug/perf.zig").rdtsc();
     const wait_dt = t_wait_end -% t_wait_start;

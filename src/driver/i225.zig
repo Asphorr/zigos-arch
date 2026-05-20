@@ -291,14 +291,15 @@ pub fn init() bool {
     const d = found orelse return false;
     debug.klog("[i225] found at {x}:{x}.{x} id=0x{x}\n", .{ d.bus, d.dev, d.func, d.device_id });
 
-    if (d.bar0 == 0) {
+    if (d.bars[0] == 0) {
         debug.klog("[i225] BAR0 unassigned\n", .{});
         return false;
     }
-    mmio_base = paging.physToVirt(@intCast(d.bar0));
-    debug.klog("[i225] mmio_base=0x{x} (phys 0x{x})\n", .{ mmio_base, d.bar0 });
+    mmio_base = paging.physToVirt(@intCast(d.bars[0]));
+    debug.klog("[i225] mmio_base=0x{x} (phys 0x{x})\n", .{ mmio_base, d.bars[0] });
 
-    pci.bindDevice(d);
+    var bind = pci.bindDevice(d);
+    defer bind.deinit();
 
     // --- Reset ---
     // CTRL.RST is self-clearing. Spec calls for a 1us delay after the write
@@ -454,6 +455,7 @@ pub fn init() bool {
 
     initialized = true;
     debug.klog("[i225] initialized (irq_driven={})\n", .{irq_driven});
+    bind.commit();
     return true;
 }
 

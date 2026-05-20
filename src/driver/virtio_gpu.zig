@@ -1299,7 +1299,8 @@ pub fn init(xres: u32, yres: u32) bool {
 
     // Bus master + MEM/IO + INTx-disable (virtio uses MSI-X for the
     // controlq/cursorq via the common cap below).
-    pci.bindDevice(dev_found);
+    var bind = pci.bindDevice(dev_found);
+    defer bind.deinit();
     pci_bus = dev_found.bus;
     pci_dev = dev_found.dev;
     pci_func = dev_found.func;
@@ -1518,6 +1519,7 @@ pub fn init(xres: u32, yres: u32) bool {
         }
     }
 
+    bind.commit();
     return true;
 }
 

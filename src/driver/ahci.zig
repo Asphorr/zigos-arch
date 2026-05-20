@@ -213,9 +213,9 @@ pub fn init() bool {
     };
     debug.klog("[ahci] found at {x}:{x}.{x} vendor=0x{x} dev=0x{x}\n", .{ dev.bus, dev.dev, dev.func, dev.vendor_id, dev.device_id });
 
-    // ABAR is BAR5 (offset 0x24). pci.PciDevice.bar0/bar1 are first two BARs;
-    // BAR5 we read directly.
-    const abar = pci.readBar64(dev.bus, dev.dev, dev.func, 0x24);
+    // ABAR is BAR5. pci.zig caches all 6 BARs at enumeration so we
+    // can index directly without re-walking config space.
+    const abar = dev.bars[5];
     if (abar == 0) {
         debug.klog("[ahci] BAR5 unassigned\n", .{});
         return false;
@@ -225,7 +225,8 @@ pub fn init() bool {
     hba_base = paging.physToVirt(abar);
     debug.klog("[ahci] hba_base=0x{x} (phys 0x{x})\n", .{ hba_base, abar });
 
-    pci.bindDevice(dev);
+    var bind = pci.bindDevice(dev);
+    defer bind.deinit();
 
     // BIOS/OS handoff if the controller supports it (CAP2.BOH bit). We
     // don't bother reading CAP2 — just always try and bail quickly if
@@ -308,6 +309,7 @@ pub fn init() bool {
         primary_port,
         if (secondary_port == 0xFF) null else @as(u8, secondary_port),
     });
+    bind.commit();
     return true;
 }
 

@@ -136,8 +136,17 @@ pub fn tableAddr(dev: pci.PciDevice, cap: Cap, idx: u16) usize {
 pub fn writeEntry(entry_addr: usize, addr: u64, data: u32, masked: bool) void {
     const e: *volatile TableEntry = @ptrFromInt(entry_addr);
     // Spec requires masking before changing addr/data so a stale entry
-    // can't fire mid-write. Set mask bit, write fields, optionally clear.
+    // can't fire mid-write. MMIO writes are POSTED — `e.vector_control =
+    // 1` doesn't guarantee the device has observed the mask before the
+    // following addr/data writes hit. Read it back to flush the posted
+    // write through the PCIe pipeline; only after that is it safe to
+    // mutate addr/data without risking a partial-update MSI-X message
+    // being delivered. Without this read-back, a completion that
+    // arrives mid-update can drop into the PBA against a stale entry
+    // and never get re-fired on the unmask. Caught 2026-05-20 by Q1
+    // load on nvme1 wedging the wait loop with HW completion present.
     e.vector_control = 1;
+    _ = e.vector_control;
     e.addr_lo = @truncate(addr);
     e.addr_hi = @truncate(addr >> 32);
     e.data = data;

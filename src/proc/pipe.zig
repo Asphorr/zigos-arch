@@ -106,19 +106,18 @@ pub fn read(id: u8, out: []u8) usize {
         // semantics: a partial read is valid, the caller can loop.
         if (copied > 0) return copied;
 
-        // Pending signal? Bail with whatever we have so we can deliver on the
-        // syscall return path. Without this we'd loop forever (process.wake
-        // flips state but the signal stays pending until exit-to-user).
-        if (process.currentPCB()) |pcb_check| {
-            if ((pcb_check.pending_signals & ~pcb_check.signal_mask) != 0) return copied;
-        }
-
-        // Sleep until a writer pushes data (or all writers close).
-        // process.blockOn handles the wait_kind/state/yield/clear dance;
-        // we only need to record the per-pipe bookkeeping here.
+        // Sleep until a writer pushes data (or all writers close). The
+        // .signalled branch returns the partial count (zero or otherwise)
+        // and lets the syscall-return signal-delivery path run; without
+        // this we'd loop forever (process.wake flips state but the signal
+        // stays pending until exit-to-user).
         const my_pid: u8 = @intCast(process.getCurrentPid());
         p.blocked_reader_pid = my_pid;
-        process.blockOn(.pipe_read, id);
+        const br = process.blockOnInterruptible(.pipe_read, id);
+        if (br == .signalled) {
+            p.blocked_reader_pid = 0xFF;
+            return copied;
+        }
         // Loop: re-check for data
     }
     return copied;
@@ -188,17 +187,16 @@ pub fn write(id: u8, data: []const u8) usize {
             continue;
         }
 
-        // Pending signal? Bail with partial count so syscall return can
-        // deliver. Caller can retry after handler returns. See pipe.read.
-        if (process.currentPCB()) |pcb_check| {
-            if ((pcb_check.pending_signals & ~pcb_check.signal_mask) != 0) return written;
-        }
-
-        // Ring full — sleep until reader drains. process.blockOn handles
-        // the wait_kind/state/yield/clear dance.
+        // Ring full — sleep until reader drains. Bail on pending signal
+        // with whatever partial count we have so the syscall-return
+        // delivery path runs. Caller can retry after handler returns.
         const my_pid: u8 = @intCast(process.getCurrentPid());
         p.blocked_writer_pid = my_pid;
-        process.blockOn(.pipe_write, id);
+        const br = process.blockOnInterruptible(.pipe_write, id);
+        if (br == .signalled) {
+            p.blocked_writer_pid = 0xFF;
+            return written;
+        }
     }
     return written;
 }

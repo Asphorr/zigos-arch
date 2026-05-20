@@ -105,12 +105,15 @@ pub const UEFI_PT_SIZE: usize = 0x40000; // 256 KB → ends at 0x1C40000
 pub const GUI_FB_PER_PID_SIZE: usize = 0x400000; // 4 MB max per window
 
 // --- User-space layout (per-process) ---
-// USER_SPACE_START sits 64 KB below USER_VA_FLOOR so the user stack (16
-// pages just under the load base) is mappable. Without this margin,
+// USER_SPACE_START sits N pages below USER_VA_FLOOR so the user stack
+// (just under the load base) is mappable. Without this margin,
 // mapUserPage silently rejects stack faults (virt < USER_SPACE_START), the
 // PF handler thinks the lazy fault-in succeeded (mapUserPage is void), and
-// the app spins re-faulting until the desktop kills it.
-pub const USER_STACK_RESERVE: u64 = 0x10000; // 16 pages
+// the app spins re-faulting until OOM kills it (caught 2026-05-20 on
+// Q1 with its 64-page stack — leaked 200 MB before OOM).
+// MUST be >= elf_loader's `stack_pages * PAGE_SIZE`. The comptime
+// assert in src/proc/elf_loader.zig keeps this in sync.
+pub const USER_STACK_RESERVE: u64 = 0x40000; // 64 pages
 pub const USER_SPACE_START: u64 = USER_VA_FLOOR - USER_STACK_RESERVE;
 pub const USER_SPACE_END: u64 = 0x10000000; // 256 MB
 // Initial sbrk position (per-process VA). Numerically equal to GUEST_FB_BASE

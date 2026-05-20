@@ -41,6 +41,7 @@ const E_SRCH: u32 = errno.err(.ESRCH);
 const E_NOSYS: u32 = errno.err(.ENOSYS);
 const E_PERM: u32 = errno.err(.EPERM);
 const E_CHILD: u32 = errno.err(.ECHILD);
+const E_INTR: u32 = errno.err(.EINTR);
 
 // memmap.USER_SPACE_START sits below USER_VA_FLOOR to cover the user
 // stack region (16 pages just under 0x500000). Earlier this was a local
@@ -1139,9 +1140,12 @@ fn sysFutex(uaddr: u32, op: u32, val: u32) u32 {
             if (word.* != val) return E_INVAL; // EAGAIN
 
             _ = process.currentPCB() orelse return E_FAULT;
-            // process.blockOn handles wait_kind/state/yield/clear. WAKE
-            // also clears, so the post-resume clear is idempotent.
-            process.blockOn(.futex, uaddr);
+            // blockOnInterruptible handles wait_kind/state/yield/clear AND
+            // bails out on a pending non-blocked signal so user code with a
+            // SIGINT/SIGTERM handler isn't stuck inside the wait forever.
+            // WAKE also clears, so the post-resume clear is idempotent.
+            const br = process.blockOnInterruptible(.futex, uaddr);
+            if (br == .signalled) return E_INTR;
             return 0;
         },
         FUTEX_WAKE => {
@@ -1279,9 +1283,24 @@ fn sysFread(fd: u32, buf_ptr: u32, count: u32) u32 {
 
 fn sysFwrite(fd: u32, buf_ptr: u32, count: u32) u32 {
     if (count == 0) return 0;
-    if (!validateUserPtr(buf_ptr, count)) return E_FAULT;
+    if (!validateUserPtr(buf_ptr, count)) {
+        if (process.getCurrentPid() == 4) {
+            debug.klog("[fwrite-dbg] pid=4 fd={d} count={d} buf=0x{x} -> E_FAULT (validateUserPtr)\n", .{ fd, count, buf_ptr });
+        }
+        return E_FAULT;
+    }
 
-    const pcb = process.currentPCB() orelse return E_FAULT;
+    const pcb = process.currentPCB() orelse {
+        if (process.getCurrentPid() == 4) {
+            debug.klog("[fwrite-dbg] pid=4 fd={d} count={d} -> E_FAULT (no pcb)\n", .{ fd, count });
+        }
+        return E_FAULT;
+    };
+    if (process.getCurrentPid() == 4 and fd <= 2) {
+        const buf_dbg: [*]const u8 = @ptrFromInt(@as(usize, buf_ptr));
+        const show = if (count > 80) @as(u32, 80) else count;
+        debug.klog("[fwrite-dbg] pid=4 fd={d} count={d} msg='{s}'\n", .{ fd, count, buf_dbg[0..show] });
+    }
     const buf: [*]const u8 = @ptrFromInt(@as(usize, buf_ptr));
     return vfs.write(pcb, fd, buf, count);
 }
@@ -1971,7 +1990,11 @@ fn sysFsize(name_ptr: u32) u32 {
     var name_len: usize = 0;
     while (name_len < 100 and name_bytes[name_len] != 0) : (name_len += 1) {}
     if (name_len == 0) return E_INVAL;
-    return vfs.fileSize(name_bytes[0..name_len]) orelse 0xFFFFFFFF;
+    const result = vfs.fileSize(name_bytes[0..name_len]) orelse 0xFFFFFFFF;
+    if (process.getCurrentPid() == 4) {
+        debug.klog("[fsize-dbg] pid=4 path='{s}' len={d} -> {x}\n", .{ name_bytes[0..name_len], name_len, result });
+    }
+    return result;
 }
 
 // --- GPU 3D syscalls ---
@@ -3078,18 +3101,17 @@ fn sysWaitpid(target_pid: u32, status_ptr: u32) u32 {
             return zpid;
         }
 
-        // Pending signal — bail out as EINTR. The signal will be delivered
-        // on the syscall return path before user code resumes; without this
-        // bail, we'd re-park forever even after wake() flipped us to .ready.
-        if (signals.hasDeliverable(me_pcb)) return E_INVAL;
-
         // Block until a child becomes a zombie (woken by killProcess/destroy
-        // OR by a signal posted with signals.send). process.blockOn handles
-        // the wait_kind/state/yield/clear dance.
+        // OR by a signal posted with signals.send). blockOnInterruptible
+        // returns .signalled when a non-blocked signal is pending — either
+        // on entry or arriving while parked — and we propagate -EINTR so the
+        // handler delivery path on syscall-return doesn't fight a syscall
+        // that would otherwise re-park immediately.
         const t_pause = perf.rdtsc();
-        process.blockOn(.waitpid, target_pid);
+        const br = process.blockOnInterruptible(.waitpid, target_pid);
         const t_resume = perf.rdtsc();
         me_pcb.perf_gap_cyc +%= t_resume -% t_pause;
+        if (br == .signalled) return E_INTR;
     }
 }
 

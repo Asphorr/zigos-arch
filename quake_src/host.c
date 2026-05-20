@@ -158,8 +158,9 @@ void	Host_FindMaxClients (void)
 {
 	int		i;
 
+	Sys_Printf("ZQ_DBG: FindMaxClients enter\n");
 	svs.maxclients = 1;
-		
+
 	i = COM_CheckParm ("-dedicated");
 	if (i)
 	{
@@ -192,12 +193,18 @@ void	Host_FindMaxClients (void)
 	svs.maxclientslimit = svs.maxclients;
 	if (svs.maxclientslimit < 4)
 		svs.maxclientslimit = 4;
+	Sys_Printf("ZQ_DBG: FindMaxClients pre-Hunk_AllocName maxcli=%d sz=%d\n", svs.maxclientslimit, (int)(svs.maxclientslimit*sizeof(client_t)));
 	svs.clients = Hunk_AllocName (svs.maxclientslimit*sizeof(client_t), "clients");
+	Sys_Printf("ZQ_DBG: FindMaxClients post-Hunk_AllocName addr=%p\n", svs.clients);
 
-	if (svs.maxclients > 1)
+	if (svs.maxclients > 1) {
+		Sys_Printf("ZQ_DBG: FindMaxClients pre-Cvar_SetValue(deathmatch,1)\n");
 		Cvar_SetValue ("deathmatch", 1.0);
-	else
+	} else {
+		Sys_Printf("ZQ_DBG: FindMaxClients pre-Cvar_SetValue(deathmatch,0)\n");
 		Cvar_SetValue ("deathmatch", 0.0);
+	}
+	Sys_Printf("ZQ_DBG: FindMaxClients exit\n");
 }
 
 
@@ -208,8 +215,10 @@ Host_InitLocal
 */
 void Host_InitLocal (void)
 {
+	Sys_Printf("ZQ_DBG: Host_InitLocal enter\n");
 	Host_InitCommands ();
-	
+	Sys_Printf("ZQ_DBG: Host_InitLocal post-Host_InitCommands\n");
+
 	Cvar_RegisterVariable (&host_framerate);
 	Cvar_RegisterVariable (&host_speeds);
 
@@ -229,9 +238,11 @@ void Host_InitLocal (void)
 	Cvar_RegisterVariable (&pausable);
 
 	Cvar_RegisterVariable (&temp1);
+	Sys_Printf("ZQ_DBG: Host_InitLocal post-cvars\n");
 
 	Host_FindMaxClients ();
-	
+	Sys_Printf("ZQ_DBG: Host_InitLocal post-FindMaxClients\n");
+
 	host_time = 1.0;		// so a think at time 0 won't get called
 }
 
@@ -851,33 +862,46 @@ void Host_Init (quakeparms_t *parms)
 	com_argc = parms->argc;
 	com_argv = parms->argv;
 
+	Sys_Printf("ZQ_DBG: phase pre-Memory_Init\n");
 	Memory_Init (parms->membase, parms->memsize);
 	Cbuf_Init ();
-	Cmd_Init ();	
+	Cmd_Init ();
 	V_Init ();
 	Chase_Init ();
 	Host_InitVCR (parms);
+	Sys_Printf("ZQ_DBG: phase pre-COM_Init\n");
 	COM_Init (parms->basedir);
+	Sys_Printf("ZQ_DBG: phase post-COM_Init\n");
 	Host_InitLocal ();
+	Sys_Printf("ZQ_DBG: phase pre-W_LoadWadFile\n");
 	W_LoadWadFile ("gfx.wad");
+	Sys_Printf("ZQ_DBG: phase post-W_LoadWadFile\n");
 	Key_Init ();
-	Con_Init ();	
-	M_Init ();	
+	Con_Init ();
+	Sys_Printf("ZQ_DBG: phase post-Con_Init\n");
+	M_Init ();
 	PR_Init ();
+	Sys_Printf("ZQ_DBG: phase pre-Mod_Init\n");
 	Mod_Init ();
+	Sys_Printf("ZQ_DBG: phase post-Mod_Init\n");
 	NET_Init ();
 	SV_Init ();
+	Sys_Printf("ZQ_DBG: phase post-SV_Init\n");
 
 	Con_Printf ("Exe: "__TIME__" "__DATE__"\n");
 	Con_Printf ("%4.1f megabyte heap\n",parms->memsize/ (1024*1024.0));
-	
+
+	Sys_Printf("ZQ_DBG: phase pre-R_InitTextures\n");
 	R_InitTextures ();		// needed even for dedicated servers
- 
+	Sys_Printf("ZQ_DBG: phase post-R_InitTextures\n");
+
 	if (cls.state != ca_dedicated)
 	{
+		Sys_Printf("ZQ_DBG: phase pre-palette.lmp\n");
 		host_basepal = (byte *)COM_LoadHunkFile ("gfx/palette.lmp");
 		if (!host_basepal)
 			Sys_Error ("Couldn't load gfx/palette.lmp");
+		Sys_Printf("ZQ_DBG: phase pre-colormap.lmp\n");
 		host_colormap = (byte *)COM_LoadHunkFile ("gfx/colormap.lmp");
 		if (!host_colormap)
 			Sys_Error ("Couldn't load gfx/colormap.lmp");
@@ -885,11 +909,15 @@ void Host_Init (quakeparms_t *parms)
 #ifndef _WIN32 // on non win32, mouse comes before video for security reasons
 		IN_Init ();
 #endif
+		Sys_Printf("ZQ_DBG: phase pre-VID_Init\n");
 		VID_Init (host_basepal);
-
+		Sys_Printf("ZQ_DBG: phase pre-Draw_Init\n");
 		Draw_Init ();
+		Sys_Printf("ZQ_DBG: phase pre-SCR_Init\n");
 		SCR_Init ();
+		Sys_Printf("ZQ_DBG: phase pre-R_Init\n");
 		R_Init ();
+		Sys_Printf("ZQ_DBG: phase post-R_Init\n");
 #ifndef	_WIN32
 	// on Win32, sound initialization has to come before video initialization, so we
 	// can put up a popup if the sound hardware is in use

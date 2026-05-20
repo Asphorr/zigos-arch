@@ -654,6 +654,50 @@ pub fn hexDump(base: u64, qwords: u32, label: []const u8) void {
 
 // === Crash autopsy: dump everything the rings know ==========================
 
+/// Dump just pmm_alloc + pmm_free rings. Useful for OOM diagnostics — far
+/// cheaper than dumpAll() (no sched / irq / proc / pf / mmap rings) and
+/// answers the only question that matters under memory pressure: who's
+/// been allocating? Each pmm_alloc entry resolves caller_ra to a kernel
+/// symbol so the leaking call site is grep-able. 2026-05-20: added for
+/// Q1 memory-budget audit.
+pub fn dumpPmmAllocRing() void {
+    serial.print("[kdbg] pmm_alloc (last {d}):\n", .{pmm_alloc_ring.count()});
+    var i: usize = 0;
+    while (i < pmm_alloc_ring.count()) : (i += 1) {
+        const ev = pmm_alloc_ring.at(i);
+        serial.print("  tsc={d} phys=0x{X}+{d}p by ", .{ ev.tsc, ev.phys, ev.count });
+        printSym(ev.caller_ra);
+        serial.print("\n", .{});
+    }
+    serial.print("[kdbg] pmm_free (last {d}):\n", .{pmm_free_ring.count()});
+    i = 0;
+    while (i < pmm_free_ring.count()) : (i += 1) {
+        const ev = pmm_free_ring.at(i);
+        serial.print("  tsc={d} phys=0x{X} by ", .{ ev.tsc, ev.phys });
+        printSym(ev.caller_ra);
+        serial.print("\n", .{});
+    }
+    // mmap ring: every PTE install. If the same `virt` appears twice
+    // (same pid) with different `phys`, the PTE got overwritten and the
+    // first phys is leaked — the smoking gun for the lazy-fault leak
+    // class we're hunting 2026-05-20.
+    serial.print("[kdbg] mmap (last {d}):\n", .{mmap_ring.count()});
+    i = 0;
+    while (i < mmap_ring.count()) : (i += 1) {
+        const ev = mmap_ring.at(i);
+        serial.print("  tsc={d} pid={d} virt=0x{X:0>16} -> phys=0x{X:0>16} flags=0x{X}\n", .{ ev.tsc, ev.pid, ev.virt, ev.phys, ev.flags });
+    }
+    // pf ring: every user-mode page fault. If we see the same cr2
+    // repeated with the same pid, the fault handler isn't actually
+    // resolving the fault (TLB stale, wrong PD, PTE not getting written).
+    serial.print("[kdbg] pf (last {d}):\n", .{pf_ring.count()});
+    i = 0;
+    while (i < pf_ring.count()) : (i += 1) {
+        const ev = pf_ring.at(i);
+        serial.print("  tsc={d} pid={d} cr2=0x{X:0>16} err=0x{X} rip=0x{X:0>16} handled={}\n", .{ ev.tsc, ev.pid, ev.cr2, ev.err, ev.rip, ev.handled });
+    }
+}
+
 /// Full ring dump. Called from crashAutopsy() AND from any code that wants
 /// just-the-rings (the older Ring-3 crash path used dumpAll() directly).
 pub fn dumpAll() void {

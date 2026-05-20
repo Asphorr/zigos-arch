@@ -229,7 +229,7 @@ pub fn init() bool {
         if (is_e1000e) " (e1000e family — experimental: link bring-up may need PHY tweaks)" else "",
     });
 
-    if (d.bar0 == 0) {
+    if (d.bars[0] == 0) {
         debug.klog("[e1000] BAR0 unassigned\n", .{});
         return false;
     }
@@ -237,10 +237,11 @@ pub fn init() bool {
     // dereferenceable without depending on the legacy low identity map.
     // Hardware itself never sees `mmio_base` — only register reads/writes
     // through it, and those are CPU-side.
-    mmio_base = paging.physToVirt(@intCast(d.bar0));
-    debug.klog("[e1000] mmio_base=0x{x} (phys 0x{x})\n", .{ mmio_base, d.bar0 });
+    mmio_base = paging.physToVirt(@intCast(d.bars[0]));
+    debug.klog("[e1000] mmio_base=0x{x} (phys 0x{x})\n", .{ mmio_base, d.bars[0] });
 
-    pci.bindDevice(d);
+    var bind = pci.bindDevice(d);
+    defer bind.deinit();
 
     // IOMMU Phase 3: flip onto own SL page table NOW, before any DMA
     // can happen. Every allocation that hardware will see must be
@@ -377,6 +378,7 @@ pub fn init() bool {
 
     initialized = true;
     debug.klog("[e1000] initialized\n", .{});
+    bind.commit();
     return true;
 }
 

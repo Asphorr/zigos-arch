@@ -286,6 +286,20 @@ pub fn isPidDispatchingInAnywhere(pid: u8) bool {
     return false;
 }
 
+/// Outbound counterpart of `isPidDispatchingInAnywhere`. True if any CPU
+/// is mid-destroy on this pid (between `setCurrentPid(cpu, null)` and
+/// `setState(.zombie/.unused)` in `destroyCurrent`). In that window the
+/// pid's state byte still says .running but no CPU's `current_pid`
+/// claims it — `pcb_invariants` would otherwise false-fire on the same
+/// "running but no owner" invariant the inbound helper guards.
+pub fn isPidDispatchingOutAnywhere(pid: u8) bool {
+    for (&smp.cpus, 0..) |*c, i| {
+        if (i != 0 and !c.alive) continue;
+        if (c.dispatching_out_pid == @as(u16, pid)) return true;
+    }
+    return false;
+}
+
 /// Combined gate used by saved-RIP validators: skip the check if the pid
 /// is currently running OR mid-schedule on any CPU. The running case is
 /// obvious (kesp+48 is stale free-stack); the scheduling-out case is the

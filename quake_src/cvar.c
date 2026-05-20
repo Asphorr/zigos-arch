@@ -135,9 +135,12 @@ Cvar_SetValue
 void Cvar_SetValue (char *var_name, float value)
 {
 	char	val[32];
-	
+
+	Sys_Printf("ZQ_DBG: Cvar_SetValue enter var=%s\n", var_name);
 	sprintf (val, "%f",value);
+	Sys_Printf("ZQ_DBG: Cvar_SetValue post-sprintf val_len=%d\n", (int)strlen(val));
 	Cvar_Set (var_name, val);
+	Sys_Printf("ZQ_DBG: Cvar_SetValue post-Cvar_Set\n");
 }
 
 

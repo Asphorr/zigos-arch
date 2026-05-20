@@ -498,7 +498,8 @@ pub fn init() bool {
     debug.klog("[virtio-snd] Found device at {d}:{d}\n", .{ dev_found.bus, dev_found.dev });
 
     // Bus-master + MEM/IO + INTx-disable (uses MSI-X via virtio common cap).
-    pci.bindDevice(dev_found);
+    var bind = pci.bindDevice(dev_found);
+    defer bind.deinit();
 
     // IOMMU Phase 3: own SL page table; map virtqueues + scratch
     // buffers + TX pool entries as they're allocated below.
@@ -629,5 +630,6 @@ pub fn init() bool {
 
     initialized = true;
     debug.klog("[virtio-snd] Ready (22050 Hz S16 stereo)\n", .{});
+    bind.commit();
     return true;
 }

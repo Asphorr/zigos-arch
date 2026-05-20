@@ -60,18 +60,17 @@ pub fn init() bool {
     debug.klog("[ac97] Found at bus={d} dev={d} irq={d}\n", .{ dev.bus, dev.dev, dev.irq_line });
 
     // I/O + MEM + bus master, INTx kept (AC97 has no MSI cap).
-    pci.bindDeviceLegacyIrq(dev);
+    var bind = pci.bindDeviceLegacyIrq(dev);
+    defer bind.deinit();
 
     // IOMMU Phase 3: switch to own SL page table before any DMA. BDL and
     // audio buffers are mapped after their allocation below; the device
     // reads them once we write PO_BDBAR and the PCM channel kicks off.
     _ = iommu.enableIsolation(dev.bus, dev.dev, dev.func);
 
-    // Read I/O BARs (mask off type bit)
-    const bar0_raw = pci.configRead(dev.bus, dev.dev, dev.func, 0x10);
-    const bar1_raw = pci.configRead(dev.bus, dev.dev, dev.func, 0x14);
-    nam_base = @truncate(bar0_raw & 0xFFFC);
-    nabm_base = @truncate(bar1_raw & 0xFFFC);
+    // I/O BARs already had the type bit stripped during enumeration.
+    nam_base = @truncate(dev.bars[0]);
+    nabm_base = @truncate(dev.bars[1]);
 
     debug.klog("[ac97] NAM=0x{X:0>4} NABM=0x{X:0>4}\n", .{ nam_base, nabm_base });
 
@@ -125,6 +124,7 @@ pub fn init() bool {
 
     initialized = true;
     debug.klog("[ac97] Initialized (sample rate: {d} Hz)\n", .{SAMPLE_RATE});
+    bind.commit();
     return true;
 }
 

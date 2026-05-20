@@ -976,6 +976,24 @@ pub fn build(b: *std.Build) void {
     });
     mkesp_dir.step.dependOn(&bootloader.step);
     mkesp_dir.step.dependOn(&kernel.step);
+    // The cp commands read from zig-out/bin/{kernel.elf,BOOTX64.efi} —
+    // which only exist AFTER the install step copies them out of the
+    // compile cache. Depending on kernel.step + bootloader.step alone
+    // is NOT enough: those produce cache-path artifacts, not zig-out/bin
+    // files. Without this dependency mkesp_dir can fire between compile
+    // and install, reading a STALE zig-out/bin/kernel.elf from the
+    // previous build — the exact symptom observed 2026-05-20 (esp had
+    // build_id 24CC, bin had 253B, both touched within 35ms).
+    mkesp_dir.step.dependOn(b.getInstallStep());
+    // Declare the real file inputs so the step's input-hash flips when
+    // either binary changes. Without this, Zig's addSystemCommand cache
+    // treats the bash-script argv as the only input and skips the cp
+    // forever after the first successful run — leaving zig-out/esp/
+    // serving a stale kernel.elf even though kernel.step rebuilt.
+    // (Captured 2026-05-15 in feedback_esp_kernel_cp_after_build memory;
+    // 2026-05-20: structurally fixed here rather than via post-build cp.)
+    mkesp_dir.addFileInput(kernel.getEmittedBin());
+    mkesp_dir.addFileInput(bootloader.getEmittedBin());
     const esp_dir_step = b.step("esp-dir", "Create ESP dir tree for QEMU fat:rw: (no sudo)");
     esp_dir_step.dependOn(&mkesp_dir.step);
 

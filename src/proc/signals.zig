@@ -62,6 +62,12 @@ pub const SIG_IGN: u64 = 1;
 pub const SA_RESTART: u32 = 0x10000000;
 pub const SA_NODEFER: u32 = 0x40000000;
 pub const SA_RESETHAND: u32 = 0x80000000;
+// Linux value (0x4). When set, the kernel calls the handler with three
+// args: (signo, *Siginfo, *ucontext). When clear, the handler still gets
+// three slots filled but rsi (siginfo) is NULL — apps with a 1-arg
+// `void(int)` signature only read rdi, so the extra slots are harmless
+// under SysV.
+pub const SA_SIGINFO: u32 = 0x00000004;
 
 pub const SIG_BLOCK: u32 = 0;
 pub const SIG_UNBLOCK: u32 = 1;
@@ -114,6 +120,34 @@ pub const SigAction = extern struct {
 /// from a malicious app shouldn't be able to forge an arbitrary register
 /// state. ASCII "ZOSMCTX_" (little-endian).
 pub const MCONTEXT_MAGIC: u64 = 0x5F58_5443_4D53_4F5A;
+
+/// Subset of POSIX `siginfo_t`. Field order chosen to match Linux's binary
+/// layout for the first three slots (signo/errno/code) so userland headers
+/// can be a drop-in; the rest are kept minimal — we don't track si_uid /
+/// si_band / sigval right now.
+pub const Siginfo = extern struct {
+    si_signo: u32,
+    si_errno: u32, // currently always 0; reserved for future use
+    si_code: u32,
+    _pad0: u32, // align si_pid + si_addr nicely
+    si_pid: u32, // sender pid for kill()/raise(); 0 for kernel-synthesized
+    si_uid: u32, // currently always 0; uids aren't modeled yet
+    si_addr: u64, // faulting address (SIGSEGV/SIGBUS/SIGFPE) or 0
+    si_status: u32, // exit status (SIGCHLD); 0 otherwise
+    _pad1: u32,
+};
+
+// si_code values. POSIX defines a small set of "source" codes (SI_USER,
+// SI_KERNEL, SI_TIMER, ...) plus per-signal sub-codes (SEGV_MAPERR for
+// SIGSEGV-with-unmapped-VA, FPE_INTDIV, etc). We include the ones we
+// actually produce; apps that read these can branch on them.
+pub const SI_USER: u32 = 0;
+pub const SI_KERNEL: u32 = 0x80;
+pub const SEGV_MAPERR: u32 = 1; // address not mapped to object
+pub const SEGV_ACCERR: u32 = 2; // invalid permissions for mapped object
+pub const ILL_ILLOPC: u32 = 1; // illegal opcode
+pub const FPE_INTDIV: u32 = 1; // integer divide by zero
+pub const TRAP_BRKPT: u32 = 1; // breakpoint
 
 /// Saved user state stored on the user stack at signal delivery and read back
 /// by sigreturn. The handler receives a pointer to this as its 3rd arg
@@ -255,14 +289,21 @@ fn pidIndexOfPcb(pcb: *const process.PCB) usize {
 
 /// Mark `signo` pending on `target` and wake the target if it's parked. Idempotent
 /// — sending the same signal twice between deliveries collapses to one bit.
-/// Returns false on bad inputs (out-of-range pid/signo, dead target). Returns
-/// true even if the target's disposition makes the signal a no-op (SIG_IGN /
-/// default-ignore) — caller can't observe the difference.
+/// Returns false on bad inputs (out-of-range pid, signo >= NSIG, dead target).
+/// Returns true even if the target's disposition makes the signal a no-op
+/// (SIG_IGN / default-ignore) — caller can't observe the difference.
+///
+/// signo == 0 is the POSIX "existence/permission probe": returns true if the
+/// target is a live, signalable PCB and false otherwise. No bit is set, no
+/// wake is sent.
 pub fn send(target: u8, signo: u32) bool {
     if (target >= process.MAX_PROCS) return false;
-    if (signo == 0 or signo >= NSIG) return false;
+    if (signo >= NSIG) return false;
     const pcb = &process.procs[target];
     if (pcb.state == .unused or pcb.state == .zombie) return false;
+
+    // Existence probe — `kill(pid, 0)` returns success iff target is live.
+    if (signo == 0) return true;
 
     // Catchable signals that are explicitly ignored short-circuit — no need
     // to wake the target or set a pending bit. SIGKILL/SIGSTOP can't be
@@ -273,7 +314,10 @@ pub fn send(target: u8, signo: u32) bool {
         if (sa.handler == SIG_DFL and default_actions[signo] == .ignore) return true;
     }
 
-    pcb.pending_signals |= (@as(u32, 1) << @intCast(signo));
+    // Atomic OR — two CPUs sending different signals to the same pid (or
+    // a sender vs the deliver-clear path) must not lose bits via a torn
+    // RMW. seq_cst pairs with the matching @atomicRmw .And in delivery.
+    _ = @atomicRmw(u32, &pcb.pending_signals, .Or, @as(u32, 1) << @intCast(signo), .seq_cst);
 
     // Make sure parked processes notice. wake() is a no-op for .running and
     // .ready, so this is safe to call unconditionally.
@@ -284,13 +328,25 @@ pub fn send(target: u8, signo: u32) bool {
 }
 
 fn pickSignal(pcb: *const process.PCB) ?u32 {
-    const deliverable = pcb.pending_signals & ~pcb.signal_mask;
+    // Atomic load — sender on another CPU could be mid-OR; we want a
+    // coherent snapshot. signal_mask is per-thread (only mutated by this
+    // CPU's syscall paths) so a plain read is fine.
+    const pending = @atomicLoad(u32, &pcb.pending_signals, .acquire);
+    const deliverable = pending & ~pcb.signal_mask;
     if (deliverable == 0) return null;
     var s: u32 = 1;
     while (s < NSIG) : (s += 1) {
         if ((deliverable & (@as(u32, 1) << @intCast(s))) != 0) return s;
     }
     return null;
+}
+
+/// Atomically clear `signo`'s pending bit. Used by the deliver paths
+/// (syscall/IRQ/exception return) after a signal has been picked for
+/// delivery. Pairs with the .Or in send() so concurrent sends/picks
+/// can't race.
+fn clearPending(pcb: *process.PCB, signo: u32) void {
+    _ = @atomicRmw(u32, &pcb.pending_signals, .And, ~(@as(u32, 1) << @intCast(signo)), .seq_cst);
 }
 
 fn applyDefault(pcb: *process.PCB, signo: u32) void {
@@ -333,6 +389,52 @@ fn applyHandlerMaskUpdate(pcb: *process.PCB, signo: u32, sa: *const SigAction) v
     pcb.in_signal_handler = true;
 }
 
+/// Frame layout we lay down on the user stack at signal delivery, growing
+/// downward from the saved user RSP:
+///
+///   [ ... pre-signal stack ... ]   ← old RSP
+///   [ Siginfo (40 B)         ]   ← optional, only when SA_SIGINFO
+///   [ MContext (~170 B)      ]
+///   [ trampoline RA (8 B)    ]   ← new RSP at handler entry
+///
+/// Returned struct holds the VAs the trap-frame mutators need so we don't
+/// duplicate the layout math across the three deliverFrom* entry points.
+const HandlerLayout = struct {
+    ra_va: u64,
+    mctx_va: u64,
+    siginfo_va: u64, // 0 when SA_SIGINFO not set
+};
+
+fn layoutHandlerFrame(user_rsp: u64, want_siginfo: bool) ?HandlerLayout {
+    const sinfo_size: u64 = if (want_siginfo) @sizeOf(Siginfo) else 0;
+    const sinfo_va = (user_rsp -% sinfo_size) & ~@as(u64, 0xF);
+    const mctx_va = (sinfo_va -% @sizeOf(MContext)) & ~@as(u64, 0xF);
+    const ra_va = mctx_va -% 8;
+    const total_span = (user_rsp -% ra_va);
+    if (!validateUserRange(ra_va, total_span)) return null;
+    return .{
+        .ra_va = ra_va,
+        .mctx_va = mctx_va,
+        .siginfo_va = if (want_siginfo) sinfo_va else 0,
+    };
+}
+
+fn writeSiginfo(layout: HandlerLayout, signo: u32, code: u32, addr: u64) void {
+    if (layout.siginfo_va == 0) return;
+    const sp: *Siginfo = @ptrFromInt(layout.siginfo_va);
+    sp.* = .{
+        .si_signo = signo,
+        .si_errno = 0,
+        .si_code = code,
+        ._pad0 = 0,
+        .si_pid = 0,
+        .si_uid = 0,
+        .si_addr = addr,
+        .si_status = 0,
+        ._pad1 = 0,
+    };
+}
+
 /// Try to deliver one pending signal at syscall-return. Mutates `frame` so
 /// sysret lands in the handler. `retval` is the dispatcher's return value;
 /// when no handler runs we return it back unchanged so the asm path can
@@ -348,7 +450,7 @@ pub fn deliverFromSyscallFrame(pcb: *process.PCB, frame: *SyscallFrame, retval: 
     if (pcb.in_signal_handler) return retval;
     while (true) {
         const sig = pickSignal(pcb) orelse return retval;
-        pcb.pending_signals &= ~(@as(u32, 1) << @intCast(sig));
+        clearPending(pcb, sig);
 
         if (!isCatchable(sig)) {
             applyDefault(pcb, sig);
@@ -366,20 +468,19 @@ pub fn deliverFromSyscallFrame(pcb: *process.PCB, frame: *SyscallFrame, retval: 
 
         // User handler. The saved user RSP lives at frame.user_rsp (per-thread,
         // pushed onto the kernel stack at syscall entry — see SyscallFrame
-        // doc and syscall_entry.zig). Push MContext + trampoline RA at the
-        // user's stack and rewrite frame.user_rsp so sysret lands on the
-        // handler's freshly-prepared frame.
+        // doc and syscall_entry.zig). Push MContext + optional Siginfo +
+        // trampoline RA at the user's stack and rewrite frame.user_rsp so
+        // sysret lands on the handler's freshly-prepared frame.
         const old_user_rsp = frame.user_rsp;
-        const mctx_va = (old_user_rsp -% @sizeOf(MContext)) & ~@as(u64, 0xF);
-        const ra_va = mctx_va -% 8;
-        if (!validateUserRange(ra_va, @sizeOf(MContext) + 8)) {
+        const want_si = (sa.flags & SA_SIGINFO) != 0;
+        const layout = layoutHandlerFrame(old_user_rsp, want_si) orelse {
             // User stack is hosed (recursive overflow into guard, e.g.) —
             // can't deliver. Force terminate with a recognizable status.
             process.destroyCurrentWithStatus(0xDEAD0000 | sig);
             return retval;
-        }
+        };
 
-        const mctx_ptr: *MContext = @ptrFromInt(mctx_va);
+        const mctx_ptr: *MContext = @ptrFromInt(layout.mctx_va);
         mctx_ptr.* = .{
             .magic = MCONTEXT_MAGIC,
             .saved_mask = pcb.signal_mask,
@@ -403,7 +504,11 @@ pub fn deliverFromSyscallFrame(pcb: *process.PCB, frame: *SyscallFrame, retval: 
             .rip = frame.rcx, // syscall instruction stashed user RIP in RCX
             .rflags = frame.r11,
         };
-        const ra_ptr: *u64 = @ptrFromInt(ra_va);
+        // Async signal (no fault address) — si_code = SI_USER for the
+        // best-effort common case; the kernel doesn't track sender pid yet,
+        // so si_pid stays 0.
+        writeSiginfo(layout, sig, SI_USER, 0);
+        const ra_ptr: *u64 = @ptrFromInt(layout.ra_va);
         ra_ptr.* = sa.restorer;
 
         // Rewrite the saved syscall frame so the asm-side pop sequence loads
@@ -411,9 +516,9 @@ pub fn deliverFromSyscallFrame(pcb: *process.PCB, frame: *SyscallFrame, retval: 
         frame.rcx = sa.handler; // sysret RIP
         frame.r11 = (mctx_ptr.rflags & ~@as(u64, 0x100)) | 0x202; // clear TF, ensure IF
         frame.rdi = sig;
-        frame.rsi = 0;
-        frame.rdx = mctx_va;
-        frame.user_rsp = ra_va;
+        frame.rsi = layout.siginfo_va; // 0 when SA_SIGINFO not set
+        frame.rdx = layout.mctx_va;
+        frame.user_rsp = layout.ra_va;
 
         applyHandlerMaskUpdate(pcb, sig, sa);
         if ((sa.flags & SA_RESETHAND) != 0) sa.handler = SIG_DFL;
@@ -430,7 +535,7 @@ pub fn deliverFromIrqFrame(pcb: *process.PCB, frame: *IrqFrame) void {
     if (pcb.in_signal_handler) return;
     while (true) {
         const sig = pickSignal(pcb) orelse return;
-        pcb.pending_signals &= ~(@as(u32, 1) << @intCast(sig));
+        clearPending(pcb, sig);
 
         if (!isCatchable(sig)) {
             applyDefault(pcb, sig);
@@ -445,14 +550,13 @@ pub fn deliverFromIrqFrame(pcb: *process.PCB, frame: *IrqFrame) void {
         }
 
         const old_user_rsp = frame.rsp;
-        const mctx_va = (old_user_rsp -% @sizeOf(MContext)) & ~@as(u64, 0xF);
-        const ra_va = mctx_va -% 8;
-        if (!validateUserRange(ra_va, @sizeOf(MContext) + 8)) {
+        const want_si = (sa.flags & SA_SIGINFO) != 0;
+        const layout = layoutHandlerFrame(old_user_rsp, want_si) orelse {
             process.destroyCurrentWithStatus(0xDEAD0000 | sig);
             return;
-        }
+        };
 
-        const mctx_ptr: *MContext = @ptrFromInt(mctx_va);
+        const mctx_ptr: *MContext = @ptrFromInt(layout.mctx_va);
         mctx_ptr.* = .{
             .magic = MCONTEXT_MAGIC,
             .saved_mask = pcb.signal_mask,
@@ -476,15 +580,16 @@ pub fn deliverFromIrqFrame(pcb: *process.PCB, frame: *IrqFrame) void {
             .rip = frame.rip,
             .rflags = frame.rflags,
         };
-        const ra_ptr: *u64 = @ptrFromInt(ra_va);
+        writeSiginfo(layout, sig, SI_USER, 0);
+        const ra_ptr: *u64 = @ptrFromInt(layout.ra_va);
         ra_ptr.* = sa.restorer;
 
         frame.rip = sa.handler;
-        frame.rsp = ra_va;
+        frame.rsp = layout.ra_va;
         frame.rflags = (frame.rflags & ~@as(u64, 0x100)) | 0x202;
         frame.rdi = sig;
-        frame.rsi = 0;
-        frame.rdx = mctx_va;
+        frame.rsi = layout.siginfo_va;
+        frame.rdx = layout.mctx_va;
 
         // iretq-canary refresh (task #230). We just legitimately rewrote the
         // saved RIP/RSP/RFLAGS plus the rdi/rsi/rdx GPR slots to redirect
@@ -507,8 +612,11 @@ pub fn deliverFromIrqFrame(pcb: *process.PCB, frame: *IrqFrame) void {
 ///
 /// `signo` is the signal we're raising on the user's behalf. `frame` is the
 /// exception trap frame whose RIP/RSP/RDI/RSI/RDX we may rewrite to redirect
-/// to the user handler.
-pub fn deliverFromExcFrame(pcb: *process.PCB, frame: *ExcFrame, signo: u32) bool {
+/// to the user handler. `fault_addr` is propagated into siginfo.si_addr when
+/// the user installed an SA_SIGINFO handler — pass cr2 for #PF, the faulting
+/// instruction RIP for #UD/#DE, or 0 when no meaningful address exists.
+/// `si_code` is the per-signal subcode (e.g. SEGV_MAPERR vs SEGV_ACCERR).
+pub fn deliverFromExcFrame(pcb: *process.PCB, frame: *ExcFrame, signo: u32, fault_addr: u64, si_code: u32) bool {
     if (signo == 0 or signo >= NSIG) return false;
 
     const sa = &pcb.sigactions[signo];
@@ -525,11 +633,10 @@ pub fn deliverFromExcFrame(pcb: *process.PCB, frame: *ExcFrame, signo: u32) bool
     }
 
     const old_user_rsp = frame.rsp;
-    const mctx_va = (old_user_rsp -% @sizeOf(MContext)) & ~@as(u64, 0xF);
-    const ra_va = mctx_va -% 8;
-    if (!validateUserRange(ra_va, @sizeOf(MContext) + 8)) return false;
+    const want_si = (sa.flags & SA_SIGINFO) != 0;
+    const layout = layoutHandlerFrame(old_user_rsp, want_si) orelse return false;
 
-    const mctx_ptr: *MContext = @ptrFromInt(mctx_va);
+    const mctx_ptr: *MContext = @ptrFromInt(layout.mctx_va);
     mctx_ptr.* = .{
         .magic = MCONTEXT_MAGIC,
         .saved_mask = pcb.signal_mask,
@@ -553,15 +660,16 @@ pub fn deliverFromExcFrame(pcb: *process.PCB, frame: *ExcFrame, signo: u32) bool
         .rip = frame.rip,
         .rflags = frame.rflags,
     };
-    const ra_ptr: *u64 = @ptrFromInt(ra_va);
+    writeSiginfo(layout, signo, si_code, fault_addr);
+    const ra_ptr: *u64 = @ptrFromInt(layout.ra_va);
     ra_ptr.* = sa.restorer;
 
     frame.rip = sa.handler;
-    frame.rsp = ra_va;
+    frame.rsp = layout.ra_va;
     frame.rflags = (frame.rflags & ~@as(u64, 0x100)) | 0x202;
     frame.rdi = signo;
-    frame.rsi = 0;
-    frame.rdx = mctx_va;
+    frame.rsi = layout.siginfo_va;
+    frame.rdx = layout.mctx_va;
 
     applyHandlerMaskUpdate(pcb, signo, sa);
     if ((sa.flags & SA_RESETHAND) != 0) sa.handler = SIG_DFL;

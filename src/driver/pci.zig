@@ -2,6 +2,7 @@ const io = @import("../io.zig");
 const acpi = @import("../time/acpi.zig");
 const paging = @import("../mm/paging.zig");
 const debug = @import("../debug/debug.zig");
+const time = @import("../time/time.zig");
 const SpinLock = @import("../proc/spinlock.zig").SpinLock;
 
 const CONFIG_ADDR: u16 = 0x0CF8;
@@ -83,8 +84,21 @@ pub const PciDevice = struct {
     // Cached here so `enumerate` doesn't have to re-read 0x0C to decide
     // whether to scan funcs 1-7 of a slot.
     header_type: u8,
-    bar0: usize, // Full 64-bit BAR address (handles UEFI high mappings)
+    // All 6 BARs cached at enumeration. For 64-bit memory BARs (type bits 2:1
+    // == 0b10), bars[i] holds the combined 64-bit address and bars[i+1] = 0.
+    // I/O BARs have the I/O-port address with the type bit stripped. Drivers
+    // can read any BAR without a second config-space round-trip; the
+    // pre-cached value is identical to what `readBar64(... 0x10 + i*4)` would
+    // return on demand. Slot 0 alias `bar0` was the old single-BAR field.
+    bars: [6]usize,
     irq_line: u8,
+
+    /// Convenience accessor. Equivalent to `dev.bars[idx]`; mostly for
+    /// drivers that want a function call instead of an array index in the
+    /// site (reads better next to `pci.mapBar` / `pci.getBarSize`).
+    pub inline fn bar(self: PciDevice, idx: u8) usize {
+        return self.bars[idx];
+    }
 };
 
 // --- Device cache ---------------------------------------------------------
@@ -137,15 +151,7 @@ pub fn enumerate() void {
                     if (device_count < MAX_DEVICES) {
                         devices[device_count] = d;
                         device_count += 1;
-                        debug.klog(
-                            "[pci]   {x:0>2}:{x:0>2}.{d} {s} vendor=0x{x:0>4} device=0x{x:0>4} class={x:0>2}.{x:0>2}.{x:0>2} bar0=0x{x} irq={d}\n",
-                            .{
-                                d.bus, d.dev, d.func, classifyName(d.class_code, d.subclass),
-                                d.vendor_id, d.device_id,
-                                d.class_code, d.subclass, d.prog_if,
-                                d.bar0, d.irq_line,
-                            },
-                        );
+                        logDevice(d);
                     } else {
                         debug.klog("[pci] cache full (>{d}); ignoring further devices\n", .{MAX_DEVICES});
                         return;
@@ -161,6 +167,28 @@ pub fn enumerate() void {
         }
     }
     debug.klog("[pci] {d} device(s) cached\n", .{device_count});
+}
+
+/// Single-device boot log line. Appends PCIe link info when the device
+/// exposes the PCIe capability — useful for spotting links that trained
+/// below their max speed/width (a common "device feels slow" cause on
+/// real hardware that we can't see at all without this).
+fn logDevice(d: PciDevice) void {
+    debug.klog(
+        "[pci]   {x:0>2}:{x:0>2}.{d} {s} vendor=0x{x:0>4} device=0x{x:0>4} class={x:0>2}.{x:0>2}.{x:0>2} bar0=0x{x} irq={d}\n",
+        .{
+            d.bus, d.dev, d.func, classifyName(d.class_code, d.subclass),
+            d.vendor_id, d.device_id,
+            d.class_code, d.subclass, d.prog_if,
+            d.bars[0], d.irq_line,
+        },
+    );
+    if (pcieLinkInfo(d)) |li| {
+        debug.klog(
+            "[pci]       pcie: link cur={s} x{d}, max={s} x{d}\n",
+            .{ speedString(li.cur_speed), li.cur_width, speedString(li.max_speed), li.max_width },
+        );
+    }
 }
 
 /// Read-only view of the cached device list. Use with a plain for loop:
@@ -206,6 +234,19 @@ pub fn markBound(dev: PciDevice) void {
     }
 }
 
+/// Reverse of `markBound`. Drivers that fail init after `bindDevice`
+/// already flipped the bit call this so `logUnbound` doesn't lie. The
+/// `BoundHandle` returned by `bindDevice` exposes this through `.fail()`
+/// for a defer-friendly pattern.
+pub fn markUnbound(dev: PciDevice) void {
+    for (devices[0..device_count], 0..) |cached, i| {
+        if (cached.bus == dev.bus and cached.dev == dev.dev and cached.func == dev.func) {
+            bound[i] = false;
+            return;
+        }
+    }
+}
+
 /// End-of-driver-init summary. Walks the device cache and logs any device
 /// in an "interesting" class (storage / network / display / multimedia /
 /// USB) that no driver claimed. The output points at the gap a real-HW
@@ -235,31 +276,66 @@ pub fn logUnbound() void {
     if (unbound_count == 0) debug.klog("[pci] all interesting devices bound\n", .{});
 }
 
+/// Returned by `bindDevice`. Designed for `defer h.deinit()` — if the
+/// driver returns without calling `.commit()`, the bound bit is reverted
+/// so `logUnbound` still reports the slot. Drivers that always succeed
+/// after `bindDevice` can ignore the handle and call `markBound` directly,
+/// but the BoundHandle pattern is the recommended one for any driver with
+/// fallible init beyond `bindDevice`.
+pub const BoundHandle = struct {
+    dev: PciDevice,
+    committed: bool = false,
+
+    pub fn commit(self: *BoundHandle) void {
+        self.committed = true;
+    }
+
+    pub fn fail(self: *BoundHandle) void {
+        if (!self.committed) {
+            markUnbound(self.dev);
+            self.committed = true; // prevent deinit double-unbind
+        }
+    }
+
+    pub fn deinit(self: *BoundHandle) void {
+        if (!self.committed) markUnbound(self.dev);
+    }
+};
+
 /// Routine "I'm taking this device" boilerplate that nearly every driver
-/// duplicates: enable Memory + I/O space decoding (PCI command bits 0/1),
-/// enable Bus Master (bit 2), and disable legacy INTx (bit 10) so a
-/// driver that arms MSI-X doesn't also see ghost interrupts on the
-/// shared IOAPIC line.
+/// duplicates: wake to D0 if firmware left the device in D3, then enable
+/// Memory + I/O space decoding (PCI command bits 0/1), enable Bus Master
+/// (bit 2), and disable legacy INTx (bit 10) so a driver that arms MSI-X
+/// doesn't also see ghost interrupts on the shared IOAPIC line.
 ///
 /// Drivers can still poke the command register afterwards if they need
 /// device-specific bits (e.g. AC97 doesn't want INTx disabled because it
 /// has no MSI). Default to bindDevice for everyone using MSI/MSI-X.
-pub fn bindDevice(dev: PciDevice) void {
+///
+/// Returns a `BoundHandle`: `defer h.deinit()` + `h.commit()` at the end
+/// of a successful init reverts the bound bit on early-return failures.
+/// Callers that don't care can `_ = pci.bindDevice(dev)` — the device
+/// stays marked bound either way as long as the handle isn't deinit'd.
+pub fn bindDevice(dev: PciDevice) BoundHandle {
+    pmWakeToD0(dev);
     var cmd = configRead16(dev.bus, dev.dev, dev.func, 0x04);
     cmd |= 0x0007; // I/O space + Memory space + Bus Master
     cmd |= 0x0400; // Disable legacy INTx (MSI/MSI-X drivers want this)
     configWrite16(dev.bus, dev.dev, dev.func, 0x04, cmd);
     markBound(dev);
+    return .{ .dev = dev };
 }
 
 /// Like bindDevice but keeps INTx live. For drivers that have no MSI/MSI-X
 /// path (legacy AC97, IDE in compat mode).
-pub fn bindDeviceLegacyIrq(dev: PciDevice) void {
+pub fn bindDeviceLegacyIrq(dev: PciDevice) BoundHandle {
+    pmWakeToD0(dev);
     var cmd = configRead16(dev.bus, dev.dev, dev.func, 0x04);
     cmd |= 0x0007; // I/O + Memory + Bus Master
     cmd &= ~@as(u16, 0x0400); // ensure INTx is enabled
     configWrite16(dev.bus, dev.dev, dev.func, 0x04, cmd);
     markBound(dev);
+    return .{ .dev = dev };
 }
 
 /// Read-friendly device-class label for the boot log. We don't need the
@@ -305,6 +381,15 @@ fn classifyName(class: u8, subclass: u8) []const u8 {
 /// Total cached device count. Mainly for diagnostics / sanity checks.
 pub fn deviceCount() usize {
     return device_count;
+}
+
+/// Read the device's (subsystem-vendor-id, subsystem-id) pair from config
+/// space offset 0x2C. Useful for telling apart variants that share the
+/// same vendor/device-id (transitional virtio devices, OEM rebrands of
+/// common chipsets, etc).
+pub fn subsystemIds(dev: PciDevice) struct { svid: u16, sid: u16 } {
+    const raw = configRead(dev.bus, dev.dev, dev.func, 0x2C);
+    return .{ .svid = @truncate(raw), .sid = @truncate(raw >> 16) };
 }
 
 // --- Config space access ---
@@ -380,6 +465,35 @@ pub fn configWrite16(bus: u8, dev: u8, func: u8, offset: u8, value: u16) void {
     configWrite16Unlocked(bus, dev, func, offset, value);
 }
 
+// --- Extended config space (ECAM-only, offsets 0x100..0xFFC) ---
+//
+// PCIe extended config space holds the extended capability chain (AER,
+// ARI, SR-IOV, ATS, ...). The legacy 0xCF8/0xCFC port pair physically
+// can't reach this — the register field is 6 bits = 0x00..0xFC. ECAM has
+// no such limit. These helpers return 0xFFFFFFFF when ECAM is absent so
+// callers can probe-and-fall-back without checking ecam_base themselves.
+
+fn configReadExtUnlocked(bus: u8, dev: u8, func: u8, offset: u16) u32 {
+    if (ecamPtr(bus, dev, func, offset)) |p| return p.*;
+    return 0xFFFFFFFF;
+}
+
+fn configWriteExtUnlocked(bus: u8, dev: u8, func: u8, offset: u16, value: u32) void {
+    if (ecamPtr(bus, dev, func, offset)) |p| p.* = value;
+}
+
+pub fn configReadExt(bus: u8, dev: u8, func: u8, offset: u16) u32 {
+    const flags = pci_lock.acquireIrqSave();
+    defer pci_lock.releaseIrqRestore(flags);
+    return configReadExtUnlocked(bus, dev, func, offset);
+}
+
+pub fn configWriteExt(bus: u8, dev: u8, func: u8, offset: u16, value: u32) void {
+    const flags = pci_lock.acquireIrqSave();
+    defer pci_lock.releaseIrqRestore(flags);
+    configWriteExtUnlocked(bus, dev, func, offset, value);
+}
+
 // --- Device scanning ---
 
 fn readDevice(bus: u8, dev: u8, func: u8) ?PciDevice {
@@ -399,6 +513,35 @@ fn readDevice(bus: u8, dev: u8, func: u8) ?PciDevice {
 
     const irq = configRead(bus, dev, func, 0x3C);
 
+    // Read all 6 BARs. 64-bit memory BARs straddle two slots: the lo half
+    // holds the type bits, the hi half is data-only. Putting the combined
+    // value into the lo slot and zeroing the hi slot mirrors how Linux
+    // exposes BARs through sysfs — drivers want a "BAR N's address" view,
+    // not "raw 32-bit dwords".
+    var bars: [6]usize = .{ 0, 0, 0, 0, 0, 0 };
+    var i: u8 = 0;
+    while (i < 6) : (i += 1) {
+        const off: u8 = 0x10 + i * 4;
+        const lo = configRead(bus, dev, func, off);
+        if (lo == 0) continue;
+        if (lo & 1 != 0) {
+            // I/O BAR — 32-bit only, address in bits 31:2.
+            bars[i] = lo & 0xFFFFFFFC;
+            continue;
+        }
+        const bar_type = (lo >> 1) & 3;
+        const base_lo: usize = lo & 0xFFFFFFF0;
+        if (bar_type == 2 and i < 5) {
+            // 64-bit memory BAR: pair (i, i+1) collapses into bars[i].
+            const hi: usize = configRead(bus, dev, func, off + 4);
+            bars[i] = base_lo | (hi << 32);
+            i += 1; // bars[i+1] stays 0; spec says the high slot has no
+            // independent meaning once paired.
+            continue;
+        }
+        bars[i] = base_lo;
+    }
+
     return .{
         .bus = bus,
         .dev = dev,
@@ -409,12 +552,15 @@ fn readDevice(bus: u8, dev: u8, func: u8) ?PciDevice {
         .subclass = subclass,
         .prog_if = prog_if,
         .header_type = header_type,
-        .bar0 = readBar64(bus, dev, func, 0x10),
+        .bars = bars,
         .irq_line = @truncate(irq),
     };
 }
 
-/// Read a BAR, handling 64-bit BARs (type 2 in bits 2:1).
+/// Read a BAR by config-space offset, handling 64-bit BARs (type 2 in
+/// bits 2:1). Kept for callers with a dynamic BAR offset (virtio SHM
+/// caps, MSI-X table BIR). Most drivers should prefer `dev.bars[i]` /
+/// `dev.bar(i)` since enumeration already cached every BAR.
 pub fn readBar64(bus: u8, dev: u8, func: u8, offset: u8) usize {
     const bar_lo = configRead(bus, dev, func, offset);
     if (bar_lo & 1 != 0) return bar_lo & 0xFFFFFFFC; // I/O BAR
@@ -597,10 +743,13 @@ pub fn findVirtioCap(dev: PciDevice, cfg_type: u8) ?VirtioCap {
 /// 4 KB on a 64 KB BAR just means later accesses past the mapped window
 /// would page-fault loudly — easy to spot and fix by raising `size`.
 pub fn mapBar(dev: PciDevice, bar_idx: u8, size: usize) ?usize {
+    // bars[] caches both I/O and memory BARs with the type bit stripped.
+    // We still need the raw lo dword to tell them apart: I/O BARs can't
+    // be mapped through the physmap.
     const bar_off: u8 = 0x10 + bar_idx * 4;
     const bar_lo = configRead(dev.bus, dev.dev, dev.func, bar_off);
     if (bar_lo & 1 != 0) return null; // I/O space
-    const phys = readBar64(dev.bus, dev.dev, dev.func, bar_off);
+    const phys = dev.bars[bar_idx];
     if (phys == 0) return null;
     paging.mapMMIO(phys, size);
     return paging.physToVirt(phys);
@@ -624,4 +773,257 @@ pub fn findCapability(dev: PciDevice, cap_id: u8) ?u8 {
         off = next & 0xFC;
     }
     return null;
+}
+
+// --- PCIe extended capability walk (config offsets ≥ 0x100) ----------------
+//
+// PCIe extended caps live in extended config space (only reachable via
+// ECAM). The header is 32-bit:
+//   bits  0..15 = ext_cap_id (AER=0x0001, SR-IOV=0x0010, ARI=0x000E, ATS=0x000F, ...)
+//   bits 16..19 = capability version
+//   bits 20..31 = next-cap offset (0 ends the chain)
+// A blank chain reads as all-zero or all-ones; both terminate the walk.
+
+const EXT_CAP_START: u16 = 0x100;
+const EXT_CAP_END: u16 = 0xFFC;
+
+/// Find a PCIe extended capability by 16-bit id. Returns the config-space
+/// offset of the cap header, or null. Requires ECAM (returns null silently
+/// if absent).
+pub fn findExtCap(dev: PciDevice, ext_cap_id: u16) ?u16 {
+    if (ecam_base == 0) return null;
+    var off: u16 = EXT_CAP_START;
+    var hops: u8 = 0;
+    while (off >= EXT_CAP_START and off <= EXT_CAP_END and hops < 64) : (hops += 1) {
+        const hdr = configReadExt(dev.bus, dev.dev, dev.func, off);
+        if (hdr == 0 or hdr == 0xFFFFFFFF) return null;
+        const id: u16 = @truncate(hdr);
+        if (id == ext_cap_id) return off;
+        const next: u16 = @truncate(hdr >> 20);
+        if (next == 0) return null;
+        off = next;
+    }
+    return null;
+}
+
+// --- Power management cap (cap_id 0x01) ------------------------------------
+//
+// Layout per PCI Power Management Spec rev 1.2:
+//   off+0  cap_id (1B) | next_ptr (1B) | PMC (2B, capabilities)
+//   off+4  PMCSR (PMC State Register, 16-bit). Bits 0..1 = current state:
+//          00 = D0 (active), 01 = D1, 10 = D2, 11 = D3hot.
+//          Writing the bits transitions the device.
+//   off+6  PMCSR_BSE (PCI bridge support extensions, irrelevant here)
+//   off+7  Data (capability-specific)
+
+const PM_CAP_ID: u8 = 0x01;
+const PM_PMCSR_OFF: u8 = 4;
+const PM_STATE_MASK: u16 = 0x0003;
+
+pub const PowerState = enum(u2) { d0 = 0, d1 = 1, d2 = 2, d3hot = 3 };
+
+/// Read the device's current PM state. Null if the device exposes no PM
+/// cap — common on the host bridge / older virtio.
+pub fn pmGetState(dev: PciDevice) ?PowerState {
+    const off = findCapability(dev, PM_CAP_ID) orelse return null;
+    const pmcsr = configRead16(dev.bus, dev.dev, dev.func, off + PM_PMCSR_OFF);
+    return @enumFromInt(@as(u2, @truncate(pmcsr & PM_STATE_MASK)));
+}
+
+/// Transition the device to `state`. Per spec, a D3hot→D0 transition
+/// requires at least 10 ms before the device responds; we sleep
+/// unconditionally on any state change to keep the helper foolproof.
+pub fn pmSetState(dev: PciDevice, state: PowerState) bool {
+    const off = findCapability(dev, PM_CAP_ID) orelse return false;
+    var pmcsr = configRead16(dev.bus, dev.dev, dev.func, off + PM_PMCSR_OFF);
+    const cur = pmcsr & PM_STATE_MASK;
+    const want: u16 = @intFromEnum(state);
+    if (cur == want) return true;
+    pmcsr = (pmcsr & ~PM_STATE_MASK) | want;
+    configWrite16(dev.bus, dev.dev, dev.func, off + PM_PMCSR_OFF, pmcsr);
+    // Per spec: D3hot→D0 requires Trestore >= 10 ms before any other config
+    // access. We don't know the previous state-pair precisely (the device
+    // may stale-cache), so always wait. Reads after this should hit a
+    // responsive device.
+    busyWaitMillis(10);
+    return true;
+}
+
+/// `bindDevice` calls this so devices firmware left in D3hot wake up
+/// automatically. Silent no-op when the device has no PM cap (we have
+/// no business "waking" something that doesn't sleep) or is already D0.
+fn pmWakeToD0(dev: PciDevice) void {
+    const cur = pmGetState(dev) orelse return;
+    if (cur == .d0) return;
+    _ = pmSetState(dev, .d0);
+}
+
+// --- PCIe capability (cap_id 0x10) -----------------------------------------
+//
+// Layout per PCIe Base Spec rev 3.0+. Only the fields we use are named:
+//   off+0   cap_id (1B) | next_ptr (1B) | PCIe Caps (2B)
+//   off+4   Device Capabilities (4B). Bit 28 = Function-Level Reset capable.
+//   off+8   Device Control (2B). Bit 15 = Initiate FLR (auto-clears).
+//   off+0xA Device Status (2B). Bit 5 = TransactionsPending — must clear
+//           before initiating FLR.
+//   off+0xC Link Capabilities (4B). Bits 0..3 = max speed, 4..9 = max width.
+//   off+0x10 Link Control (2B). Bits 0..1 = ASPM control (0=disabled).
+//   off+0x12 Link Status (2B). Bits 0..3 = cur speed, 4..9 = cur width.
+
+const PCIE_CAP_ID: u8 = 0x10;
+const PCIE_DEVCAP_OFF: u8 = 4;
+const PCIE_DEVCTL_OFF: u8 = 8;
+const PCIE_DEVSTA_OFF: u8 = 0xA;
+const PCIE_LINKCAP_OFF: u8 = 0xC;
+const PCIE_LINKCTL_OFF: u8 = 0x10;
+const PCIE_LINKSTA_OFF: u8 = 0x12;
+const PCIE_DEVCAP_FLR: u32 = 1 << 28;
+const PCIE_DEVCTL_INITIATE_FLR: u16 = 1 << 15;
+const PCIE_DEVSTA_TRANS_PENDING: u16 = 1 << 5;
+
+pub const PcieLinkInfo = struct {
+    cur_speed: u4, // 1 = 2.5 GT/s, 2 = 5, 3 = 8, 4 = 16, 5 = 32
+    cur_width: u6,
+    max_speed: u4,
+    max_width: u6,
+};
+
+/// Read current + max link speed/width. Null on devices without PCIe cap
+/// (legacy PCI, or some virtio-pci-modern in older QEMU).
+pub fn pcieLinkInfo(dev: PciDevice) ?PcieLinkInfo {
+    const off = findCapability(dev, PCIE_CAP_ID) orelse return null;
+    const linkcap = configRead(dev.bus, dev.dev, dev.func, off + PCIE_LINKCAP_OFF);
+    const linksta = configRead16(dev.bus, dev.dev, dev.func, off + PCIE_LINKSTA_OFF);
+    return .{
+        .max_speed = @truncate(linkcap & 0xF),
+        .max_width = @truncate((linkcap >> 4) & 0x3F),
+        .cur_speed = @truncate(linksta & 0xF),
+        .cur_width = @truncate((linksta >> 4) & 0x3F),
+    };
+}
+
+/// Disable Active State Power Management on the device's PCIe link.
+/// On real hardware ASPM L1 entry between an MSI-X posted write and the
+/// CPU's dispatch can manifest as "interrupt arrived but driver never ran"
+/// — disabling ASPM is the canonical fix when investigating these. No-op
+/// when the device has no PCIe cap. Returns true if ASPM bits were
+/// touched, false if the cap was absent.
+pub fn disableAspm(dev: PciDevice) bool {
+    const off = findCapability(dev, PCIE_CAP_ID) orelse return false;
+    var lc = configRead16(dev.bus, dev.dev, dev.func, off + PCIE_LINKCTL_OFF);
+    if ((lc & 0x3) == 0) return true; // already disabled
+    lc &= ~@as(u16, 0x3);
+    configWrite16(dev.bus, dev.dev, dev.func, off + PCIE_LINKCTL_OFF, lc);
+    return true;
+}
+
+/// Function-Level Reset. Sequence per PCIe Base Spec § 6.6.2:
+///   1. Confirm DevCap.FLR_Capable.
+///   2. Quiesce: wait for DevSta.TransactionsPending == 0 (best effort).
+///   3. Write DevCtl.InitiateFLR.
+///   4. Wait at least 100 ms before any other config access.
+///   5. Drivers are responsible for re-initializing device state.
+/// Returns true if a reset was issued, false if the device has no PCIe
+/// cap or isn't FLR-capable.
+pub fn flr(dev: PciDevice) bool {
+    const off = findCapability(dev, PCIE_CAP_ID) orelse return false;
+    const devcap = configRead(dev.bus, dev.dev, dev.func, off + PCIE_DEVCAP_OFF);
+    if (devcap & PCIE_DEVCAP_FLR == 0) return false;
+
+    // Best-effort quiesce; loop bounded so a stuck device doesn't wedge.
+    var quiesce: u32 = 0;
+    while (quiesce < 1000) : (quiesce += 1) {
+        const sta = configRead16(dev.bus, dev.dev, dev.func, off + PCIE_DEVSTA_OFF);
+        if (sta & PCIE_DEVSTA_TRANS_PENDING == 0) break;
+        busyWaitMillis(1);
+    }
+
+    var ctl = configRead16(dev.bus, dev.dev, dev.func, off + PCIE_DEVCTL_OFF);
+    ctl |= PCIE_DEVCTL_INITIATE_FLR;
+    configWrite16(dev.bus, dev.dev, dev.func, off + PCIE_DEVCTL_OFF, ctl);
+    // Spec mandates ≥100 ms recovery before subsequent config access.
+    busyWaitMillis(100);
+    return true;
+}
+
+fn speedString(s: u4) []const u8 {
+    return switch (s) {
+        1 => "2.5GT",
+        2 => "5GT",
+        3 => "8GT",
+        4 => "16GT",
+        5 => "32GT",
+        6 => "64GT",
+        else => "?GT",
+    };
+}
+
+/// Millisecond busy-wait used by PM/FLR helpers — they run on the boot
+/// CPU before IRQs are fully live, so any sleep that yields would deadlock
+/// the kernel timer init. Uses HPET via `time.monotonicNanos()`; before
+/// the time module is initialized (theoretically possible if a driver
+/// calls bindDevice that early), falls back to a port-80 spin which is
+/// rough but always available.
+fn busyWaitMillis(ms: u32) void {
+    if (ms == 0) return;
+    const start = time.monotonicNanos();
+    if (start != 0) {
+        const target: u64 = start + @as(u64, ms) * 1_000_000;
+        while (time.monotonicNanos() < target) {
+            asm volatile ("pause");
+        }
+        return;
+    }
+    // Pre-HPET fallback: 1µs ≈ 1 inb(0x80) on most chipsets, much faster
+    // on QEMU. Conservative — over-waiting here is harmless.
+    var i: u32 = 0;
+    while (i < ms) : (i += 1) {
+        var j: u32 = 0;
+        while (j < 1000) : (j += 1) {
+            _ = io.inb(0x80);
+        }
+    }
+}
+
+// --- Forensic config-space dump --------------------------------------------
+//
+// Prints the device's first 256 bytes (legacy config region) as a hex
+// dump with row offsets. Mostly useful when a driver is misbehaving on
+// hardware we can't easily reproduce — call `pci.dumpConfig(dev)` from
+// the failing driver and the boot log will show every header field,
+// command/status, BARs, and the legacy cap list raw.
+pub fn dumpConfig(dev: PciDevice) void {
+    debug.klog("[pci] config dump {x:0>2}:{x:0>2}.{d} (0x{x:0>4}:0x{x:0>4})\n", .{
+        dev.bus, dev.dev, dev.func, dev.vendor_id, dev.device_id,
+    });
+    var off: u8 = 0;
+    while (off < 0xF0) : (off += 0x10) {
+        const a = configRead(dev.bus, dev.dev, dev.func, off);
+        const b = configRead(dev.bus, dev.dev, dev.func, off + 4);
+        const c = configRead(dev.bus, dev.dev, dev.func, off + 8);
+        const d = configRead(dev.bus, dev.dev, dev.func, off + 12);
+        debug.klog("[pci]   0x{x:0>2}: {x:0>8} {x:0>8} {x:0>8} {x:0>8}\n", .{ off, a, b, c, d });
+        if (off == 0xE0) break;
+    }
+}
+
+/// Same as `dumpConfig` but also walks the extended config space (offsets
+/// 0x100..0xFFC) when ECAM is available. Bigger boot-log impact; only call
+/// when actually debugging an extended-cap issue.
+pub fn dumpConfigFull(dev: PciDevice) void {
+    dumpConfig(dev);
+    if (ecam_base == 0) return;
+    debug.klog("[pci] extended config:\n", .{});
+    var off: u16 = 0x100;
+    while (off < 0xFF0) : (off += 0x10) {
+        const a = configReadExt(dev.bus, dev.dev, dev.func, off);
+        // Skip empty 16-byte rows to keep the dump short on devices with
+        // few extended caps (the common case).
+        const b = configReadExt(dev.bus, dev.dev, dev.func, off + 4);
+        const c = configReadExt(dev.bus, dev.dev, dev.func, off + 8);
+        const d = configReadExt(dev.bus, dev.dev, dev.func, off + 12);
+        if (a == 0 and b == 0 and c == 0 and d == 0) continue;
+        if (a == 0xFFFFFFFF and b == 0xFFFFFFFF and c == 0xFFFFFFFF and d == 0xFFFFFFFF) continue;
+        debug.klog("[pci]   0x{x:0>3}: {x:0>8} {x:0>8} {x:0>8} {x:0>8}\n", .{ off, a, b, c, d });
+    }
 }

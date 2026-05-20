@@ -183,14 +183,16 @@ R_Init
 void R_Init (void)
 {
 	int		dummy;
-	
+
+	Sys_Printf("ZQ_DBG: R_Init enter\n");
 // get stack position so we can guess if we are going to overflow
 	r_stack_start = (byte *)&dummy;
-	
+
 	R_InitTurb ();
-	
-	Cmd_AddCommand ("timerefresh", R_TimeRefresh_f);	
-	Cmd_AddCommand ("pointfile", R_ReadPointFile_f);	
+	Sys_Printf("ZQ_DBG: R_Init post-R_InitTurb\n");
+
+	Cmd_AddCommand ("timerefresh", R_TimeRefresh_f);
+	Cmd_AddCommand ("pointfile", R_ReadPointFile_f);
 
 	Cvar_RegisterVariable (&r_draworder);
 	Cvar_RegisterVariable (&r_speeds);
@@ -213,9 +215,11 @@ void R_Init (void)
 	Cvar_RegisterVariable (&r_numedges);
 	Cvar_RegisterVariable (&r_aliastransbase);
 	Cvar_RegisterVariable (&r_aliastransadj);
+	Sys_Printf("ZQ_DBG: R_Init post-cvars\n");
 
 	Cvar_SetValue ("r_maxedges", (float)NUMSTACKEDGES);
 	Cvar_SetValue ("r_maxsurfs", (float)NUMSTACKSURFACES);
+	Sys_Printf("ZQ_DBG: R_Init post-Cvar_SetValue\n");
 
 	view_clipplanes[0].leftedge = true;
 	view_clipplanes[1].rightedge = true;
@@ -227,7 +231,9 @@ void R_Init (void)
 	r_refdef.xOrigin = XCENTERING;
 	r_refdef.yOrigin = YCENTERING;
 
+	Sys_Printf("ZQ_DBG: R_Init pre-R_InitParticles\n");
 	R_InitParticles ();
+	Sys_Printf("ZQ_DBG: R_Init post-R_InitParticles\n");
 
 // TODO: collect 386-specific code in one place
 #if	id386
@@ -235,7 +241,9 @@ void R_Init (void)
 					     (long)R_EdgeCodeEnd - (long)R_EdgeCodeStart);
 #endif	// id386
 
+	Sys_Printf("ZQ_DBG: R_Init pre-D_Init\n");
 	D_Init ();
+	Sys_Printf("ZQ_DBG: R_Init exit\n");
 }
 
 /*

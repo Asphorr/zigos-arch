@@ -210,6 +210,21 @@ pub const CpuLocal = struct {
     /// during normal sysSleep/wake cycling, caught by cross-CPU scan.
     dispatching_in_pid: u16 = 0xFFFF,
 
+    /// Symmetric partner of `dispatching_in_pid` for the OUTBOUND
+    /// (destroy/exit) direction. In `destroyCurrent`'s self-destroy
+    /// path, `setCurrentPid(cpu, null)` is called BEFORE the dying
+    /// pid's state transitions away from `.running` (to `.zombie` /
+    /// `.unused`). Between those two writes `procs[pid].state ==
+    /// .running` but no CPU's `current_pid` claims it — a cross-CPU
+    /// `pcb_invariants` scan would false-fire "state==.running but no
+    /// owner". The destroyer claims this bracket before the
+    /// `setCurrentPid` write and clears it after the `setState` lands;
+    /// scans skip the running-owner check when any CPU has this set
+    /// for the inspected pid. 0xFFFF = no outbound transient.
+    /// 2026-05-20: added as the long-planned symmetric partner the
+    /// inbound bracket was missing — exposed during Q1 port stress.
+    dispatching_out_pid: u16 = 0xFFFF,
+
     // Tripwire (task #226 lite). LAST field of CpuLocal. If anything writes
     // past the end of cpus[N] — overflow from neighboring data, wild
     // pointer that lands here, sched_lock-state-write that overran — the
