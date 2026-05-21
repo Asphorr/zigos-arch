@@ -127,20 +127,16 @@ pub fn init() void {
     }
 
     // IRQs
-    // IRQ0 (timer) + dynamic IRQs use IST=1. They feed handleIRQ0/handleDynIrq
-    // which may call schedule() and consume significant stack (~1-2 KB for
-    // CFS pickNext + load balance). On non-IST entry, that stack would land
-    // on the preempted task's kstack and could overwrite the saved kesp+48
-    // slot from a previous switchTo (netstat-desktop crash 2026-05-17 — the
-    // kesp+48 watchpoint named schedule's pushfq as the writer corrupting
-    // desktop's saved RA). IST=1 = per-CPU cpu.isr_stack (set up by
-    // initPerCpuGdt). IRQ1/IRQ12 stay on IST=0 — they don't reschedule and
-    // their handler chains are tiny.
-    // IRQ0 stays on IST=0 (preempted task's kstack). IST=1 was tried
-    // 2026-05-17 as a structural fix for kesp+48 corruption, but wedged
-    // virtio-gpu — isr_irq0's kernel-to-kernel-ret model requires entry
-    // state on the task's kstack so it survives task switches. See
-    // memory/feedback_ist1_irq0_incompatible.md.
+    // IRQ0 (timer) is IST=0 — it MUST run on the preempted task's kstack:
+    // isr_irq0's kernel-to-kernel-ret model keeps its entry state there so it
+    // survives task switches, and schedule()'s switchTo must save the task RSP
+    // into kernel_esp. IST=1 for IRQ0 was tried 2026-05-17 and wedged virtio-gpu
+    // (switchTo saved the IST RSP into kernel_esp). See feedback_ist1_irq0_incompatible.
+    // The kesp+48 corruption class that originally motivated IST is instead
+    // handled in software for the device IRQs that actually caused it — see the
+    // Shape D trampoline in DynIrqStub below (handler body on per-CPU isr_stack,
+    // schedule() back on the task kstack). IRQ1/IRQ12 stay IST=0 — they don't
+    // reschedule and their handler chains are tiny.
     setGateIst(32, @intFromPtr(&isr_irq0), 0x8E, 0);
     setGate(33, @intFromPtr(&isr_irq1), 0x8E);
     setGate(44, @intFromPtr(&isr_irq12), 0x8E); // Mouse
@@ -162,13 +158,14 @@ pub fn init() void {
     // Each stub is a comptime-generated naked thunk that calls handleDynIrq
     // with its own vector number — see DynIrqStub below.
     //
-    // IST=0 (use preempted task's kstack, not IST1). Briefly flipped to IST=1
-    // on 2026-05-17 alongside the IRQ0 fix, but that wedged virtio-gpu IRQ
-    // delivery — dyn IRQ count froze at 560 after wallpaper.elf finished,
-    // desktop sat in blockOn(.gpu_io) forever. Reverted to IST=0 here while
-    // IRQ0 stays on IST=1 (the kesp+48 corruption class only ever hit via
-    // the timer ISR path). If a dyn-IRQ handler ever needs IST=1, do it
-    // per-vector after isolating the path.
+    // IST=0 (hardware does not switch stacks). Stack isolation for the IRQ
+    // *handler body* is done in software instead — see DynIrqStub's Shape D
+    // trampoline, which runs handleDynIrq on the per-CPU isr_stack and switches
+    // back to the task kstack before schedule(). A blanket IST=1 was tried
+    // 2026-05-17 and wedged virtio-gpu (dyn IRQ count froze, desktop stuck in
+    // blockOn(.gpu_io)) because the IST stack also caught schedule()'s switchTo,
+    // which saved the IST RSP into kernel_esp — same failure as IRQ0-on-IST.
+    // The trampoline keeps schedule() on the task kstack, so it's safe.
     inline for (0..DYN_IRQ_COUNT) |i| {
         const v: u8 = DYN_IRQ_BASE + @as(u8, @intCast(i));
         setGateIst(v, @intFromPtr(&DynIrqStub(v).handler), 0x8E, 0);
@@ -1831,6 +1828,19 @@ pub export fn check_and_preempt_dynirq() callconv(.c) void {
     }
 }
 
+/// Shape D: top of this CPU's dedicated IRQ-handler stack. DynIrqStub switches
+/// RSP here for the `call handleDynIrq` window so device-IRQ handler bodies
+/// (reapCq + proc.wake chains) never run on — and thus never corrupt — the
+/// kstack of whatever task the IRQ happened to land on. Reuses `isr_stack`,
+/// which is otherwise unused at runtime: tss.rsp0 is repointed to the current
+/// task's kstack by setTssRsp0, and no IDT vector uses ist1. 16-aligned (the
+/// buffer is `align(16)`, len 16384). Called with IF=0 (no nesting), so a
+/// single per-CPU stack with no depth tracking is sufficient.
+pub export fn dynirqIrqStackTop() callconv(.c) usize {
+    const cpu = @import("smp.zig").myCpu();
+    return @intFromPtr(&cpu.isr_stack) + cpu.isr_stack.len;
+}
+
 // Per-vector naked stub. Each instantiation hardcodes its own vector # into
 // the `mov $N, %edi` immediately before `call handleDynIrq` — that's how
 // the dispatcher knows which IRQ fired without scanning ISR bits.
@@ -1852,22 +1862,34 @@ fn DynIrqStub(comptime vec: u8) type {
                     "pushq %%r11\n" ++
                     "subq $512, %%rsp\n" ++
                     "fxsaveq (%%rsp)\n" ++
-                    "movl $" ++ vec_str ++ ", %%edi\n" ++
-                    // Stack canary around `call handleDynIrq` (task #233).
-                    // Push 16B (canary + pad) so RSP stays 16-aligned across
-                    // the call. Verify on return — if the canary slot is
-                    // clobbered, the IRQ handler (or anything it called)
-                    // smashed our stack frame in this exact window.
-                    "subq $16, %%rsp\n" ++
+                    // Shape D — run handleDynIrq on the per-CPU isr_stack
+                    // instead of the interrupted task's kstack. This ends the
+                    // cross-stack-aliasing class structurally: the handler
+                    // body (reapCq + proc.wake) can no longer push onto
+                    // whatever task kstack the IRQ landed on and clobber a
+                    // parked task's saved RIP at kesp+48. We switch BACK to the
+                    // task kstack before check_and_preempt_dynirq, so
+                    // schedule()'s switchTo still saves the correct (task) RSP
+                    // into kernel_esp — that selectivity is why a blanket IST=1
+                    // wedged here before. Dyn-IRQ handlers run with IF=0 and
+                    // never sti, so the single per-CPU stack can't be re-entered.
+                    // Frame on isr_stack: [rsp+8]=saved task RSP, [rsp+0]=canary.
+                    "call dynirqIrqStackTop\n" ++ // rax = this CPU's isr_stack top (16-aligned)
+                    "movq %%rsp, %%rcx\n" ++ // rcx = task RSP (where the IRQ landed)
+                    "movq %%rax, %%rsp\n" ++ // switch to the dedicated IRQ stack
+                    "subq $16, %%rsp\n" ++ // 16-aligned scratch frame
+                    "movq %%rcx, 8(%%rsp)\n" ++ // stash task RSP for the return switch
                     "movabsq $0xC0FFEE0BA0BEDA0, %%rax\n" ++
-                    "movq %%rax, 8(%%rsp)\n" ++
+                    "movq %%rax, 0(%%rsp)\n" ++ // canary
+                    "movl $" ++ vec_str ++ ", %%edi\n" ++ // arg (edi was clobbered by the call above)
                     "test $0xF, %%rsp\n" ++
                     "jnz isr_dynirq_align_panic\n" ++
                     "call handleDynIrq\n" ++
                     "movabsq $0xC0FFEE0BA0BEDA0, %%rax\n" ++
-                    "cmpq %%rax, 8(%%rsp)\n" ++
+                    "cmpq %%rax, 0(%%rsp)\n" ++
                     "jne isr_dynirq_canary_panic\n" ++
-                    "addq $16, %%rsp\n" ++
+                    "movq 8(%%rsp), %%rcx\n" ++ // reload saved task RSP
+                    "movq %%rcx, %%rsp\n" ++ // back on the task kstack (discard IRQ-stack frame)
                     // Shape C: deferred-preempt check. If a handler called
                     // proc.wake() and set cpu.dynirq_preempt_pending, run
                     // schedule() from here (stub frame, sound RSP discipline)

@@ -2137,14 +2137,22 @@ pub var kick_handler_runs: [smp.MAX_CPUS]u64 = blk: {
     break :blk x;
 };
 fn killKickHandler() callconv(.c) void {
-    const cpu_id = smp.myCpu().cpu_id;
-    if (cpu_id < smp.MAX_CPUS) kick_handler_runs[cpu_id] +%= 1;
+    const cpu = smp.myCpu();
+    if (cpu.cpu_id < smp.MAX_CPUS) kick_handler_runs[cpu.cpu_id] +%= 1;
     // Receiving CPU: force a reschedule. The currently-running task may be
     // the kill target — schedule() will demote it through the normal path
     // and pick anything else (idle if nothing's ready). After this, the
     // victim CPU's `current_pid` no longer points at the dying pid, which
     // is what waitForPidOffCpu's polling loop is waiting for.
-    schedule();
+    //
+    // Shape D: do NOT call schedule() directly here. This handler dispatches
+    // through DynIrqStub, whose body now runs on the per-CPU isr_stack — a
+    // direct schedule()/switchTo would save an isr_stack RSP into the
+    // preempted task's kernel_esp (the IST=1-class corruption). Defer via the
+    // per-CPU flag instead; DynIrqStub's epilogue (check_and_preempt_dynirq)
+    // runs schedule() on the task kstack, in the same interrupt return, with
+    // the correct RSP. Matches the nvme/virtio deferred-preempt discipline.
+    cpu.dynirq_preempt_pending = true;
 }
 
 /// Allocate + register the dynamic IRQ vector for kill-kick. Must be called
