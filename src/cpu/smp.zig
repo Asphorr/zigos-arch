@@ -75,6 +75,15 @@ pub const CpuLocal = struct {
     /// (sipi_acked=true, alive=false). Real-HW BIOS/MADT mismatches and
     /// INIT-SIPI timing bugs show up as the first; init-path bugs (page
     /// table walk, kasan, MSR write) show up as the second.
+    ///
+    /// Cross-CPU handshake flags. The booting AP publishes them with
+    /// @atomicStore(.release); the BSP bring-up spin loop and aliveCpuCount()
+    /// observe them with @atomicLoad(.acquire). The atomics matter in the BSP
+    /// spin loop — a plain load there is legally hoistable (it only worked
+    /// because busyWait() is an opaque, non-inlined call that forced a reload),
+    /// and the release/acquire pair makes this AP's per-CPU init visible before
+    /// the BSP counts it online. Both are write-once-then-stable, so the many
+    /// steady-state `if (!cpu.alive)` readers elsewhere stay plain reads.
     sipi_acked: bool = false,
     alive: bool = false,
     /// Per-CPU scheduler lock. Replaces the old global sched_lock — one CPU's
@@ -332,7 +341,7 @@ pub fn bspCpu() *CpuLocal {
 pub fn aliveCpuCount() usize {
     var n: usize = 0;
     for (&cpus) |*c| {
-        if (c.alive) n += 1;
+        if (@atomicLoad(bool, &c.alive, .acquire)) n += 1;
     }
     return n;
 }
@@ -382,7 +391,7 @@ pub fn init() void {
         const bsp_id: u8 = @truncate(apic.getLapicId());
         cpus[bsp_id].cpu_id = 0;
         cpus[bsp_id].lapic_id = bsp_id;
-        cpus[bsp_id].alive = true;
+        @atomicStore(bool, &cpus[bsp_id].alive, true, .release);
         initPerCpuAsm(bsp_id);
         initPerCpuGdt(&cpus[bsp_id]);
         smp_initialized = true;
@@ -394,7 +403,7 @@ pub fn init() void {
     const bsp_id: u8 = @truncate(apic.getLapicId());
     cpus[bsp_id].cpu_id = 0;
     cpus[bsp_id].lapic_id = bsp_id;
-    cpus[bsp_id].alive = true;
+    @atomicStore(bool, &cpus[bsp_id].alive, true, .release);
 
     // Zero this CPU's per-CPU syscall scratch slot (user_rsp_save). The
     // kstack pointer itself lives in cpus[bsp_id].tss.rsp0 — written by
@@ -420,11 +429,27 @@ pub fn init() void {
     // through the physmap so the copy works without the legacy low identity.
     const trampoline: [*]const u8 = @ptrCast(&ap_trampoline_start);
     const trampoline_size = @intFromPtr(&ap_trampoline_end) - @intFromPtr(&ap_trampoline_start);
+    // The blob must not grow into the BSP-populated data slots that share its
+    // 0x8000 page (AP_ENTRY_SLOT, the lowest, sits at 0x8FE8). If it did, the
+    // memcpy below would overwrite the entry pointer the instant after we write
+    // it, and the AP would `call` a garbage address. NASM's preprocessor can't
+    // compare label offsets, so the guard lives here — it fires at boot, before
+    // any SIPI, with a clear panic instead of a wild AP jump.
+    if (trampoline_size > AP_ENTRY_SLOT - TRAMPOLINE_ADDR)
+        @panic("smp: AP trampoline blob overran its data slots (0x8000..0x8FE8)");
     const dest: [*]u8 = @ptrFromInt(paging.physToVirt(TRAMPOLINE_ADDR));
     @memcpy(dest[0..trampoline_size], trampoline[0..trampoline_size]);
 
     // Write data area for trampoline (0x8FE0-0x8FFF)
     const pml4_phys = paging.getKernelPML4Phys();
+    // The trampoline loads CR3 with a 32-bit `mov eax, [AP_PML4_SLOT]` (it's in
+    // 32-bit protected mode at that point), so the kernel PML4 phys MUST fit in
+    // 32 bits or the AP loads a truncated CR3 and triple-faults. Holds for the
+    // Multiboot path (pml4 ~1 MB) and normally for UEFI, but the UEFI allocator
+    // isn't architecturally bound to < 4 GB — assert it rather than risk a
+    // silent triple-fault on some firmware.
+    if (pml4_phys >= 0x1_0000_0000)
+        @panic("smp: kernel PML4 phys >= 4GB — AP 32-bit CR3 load would truncate");
 
     // Build the list of AP APIC IDs to try. With ACPI MADT we get a
     // definitive list of present, enabled processors; their APIC IDs
@@ -514,18 +539,18 @@ pub fn init() void {
         // (BIOS/MADT mismatch, INIT-SIPI timing, wrong APIC ID) or started
         // but hung in init. Without the split, both look identical.
         var ack_ms: u32 = 0;
-        while (!cpus[ap_id].sipi_acked and ack_ms < 100) : (ack_ms += 1) {
+        while (!@atomicLoad(bool, &cpus[ap_id].sipi_acked, .acquire) and ack_ms < 100) : (ack_ms += 1) {
             busyWait(1);
         }
         var alive_ms: u32 = ack_ms;
-        while (!cpus[ap_id].alive and alive_ms < 500) : (alive_ms += 1) {
+        while (!@atomicLoad(bool, &cpus[ap_id].alive, .acquire) and alive_ms < 500) : (alive_ms += 1) {
             busyWait(1);
         }
 
-        if (cpus[ap_id].alive) {
+        if (@atomicLoad(bool, &cpus[ap_id].alive, .acquire)) {
             cpu_count += 1;
             debug.klog("[smp] AP {d} alive (LAPIC ID={d}, ack={d}ms init={d}ms)\n", .{ cpu_count - 1, ap_id, ack_ms, alive_ms - ack_ms });
-        } else if (cpus[ap_id].sipi_acked) {
+        } else if (@atomicLoad(bool, &cpus[ap_id].sipi_acked, .acquire)) {
             // Started but never reached end of apEntry. Init crashed or
             // hung — page-fault, MSR fault, kasan-shadow OOM, or stuck in
             // a syscall_entry/idle setup spin. Real HW: capture this and
@@ -556,12 +581,20 @@ fn busyWait(ms: u32) void {
 
 /// AP entry point — called from trampoline after entering 64-bit mode
 export fn apEntry() callconv(.c) noreturn {
+    // INVARIANT: EFER.NXE is still 0 on this AP until syscall_entry.init()
+    // (called below) turns it on. Until then nothing here may walk a PTE with
+    // bit 63 (NX) set, or the CPU takes a reserved-bit #PF → #DF → triple-fault
+    // with no IDT installed yet. Safe today because the only memory touched
+    // pre-NXE is the kernel image (.text/.bss, mapped NX-clear), including this
+    // AP's isr_stack — keep any vmm-allocated / NX-mapped access *after*
+    // syscall_entry.init(). Same deferral as boot.asm's BSP path.
     // Figure out our LAPIC ID
     const my_id: u8 = @truncate(apic.getLapicId());
 
     // Stamp sipi_acked FIRST — before any work that could fault or hang.
     // BSP-side wait loop uses this to discriminate startup vs init failure.
-    cpus[my_id].sipi_acked = true;
+    // .release pairs with the BSP's .acquire load in the bring-up spin loop.
+    @atomicStore(bool, &cpus[my_id].sipi_acked, true, .release);
 
     // Set up per-CPU data
     cpus[my_id].cpu_id = my_id;
@@ -617,8 +650,9 @@ export fn apEntry() callconv(.c) noreturn {
     // Start our LAPIC timer at 100Hz
     apic.startTimerForAP();
 
-    // Mark alive
-    cpus[my_id].alive = true;
+    // Mark alive — .release publishes all the per-CPU init above; the BSP
+    // observes `alive` with an .acquire load before counting us online.
+    @atomicStore(bool, &cpus[my_id].alive, true, .release);
 
     // Per-CPU kernel-mode idle (task #235). Each AP gets its own idle PCB
     // with its own kstack — no more stack-aliasing failure mode where

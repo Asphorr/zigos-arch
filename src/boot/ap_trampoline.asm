@@ -141,4 +141,10 @@ ap_gdt_ptr:
     dw ap_gdt_end - ap_gdt - 1   ; limit
     dd AP_TRAMP_BASE + (ap_gdt - ap_trampoline_start)  ; base (physical addr)
 
+; SIZE CONSTRAINT: ap_trampoline_start..ap_trampoline_end is memcpy'd to
+; AP_TRAMP_BASE (0x8000). The BSP writes data slots into the SAME page starting
+; at AP_ENTRY_SLOT (0x8FE8), so this blob must stay under
+; (AP_ENTRY_SLOT - AP_TRAMP_BASE) = 0xFE8 bytes or the copy clobbers the entry
+; pointer. NASM's %if can't compare label offsets, so the bound is enforced at
+; boot in smp.zig at the memcpy site (panics before any SIPI).
 ap_trampoline_end:

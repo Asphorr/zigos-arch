@@ -67,8 +67,9 @@ align 4096
 ;                              See header for why USER is set + why the width
 ;                              is deliberately small + when the whole entry
 ;                              is dropped post-init.
-; pdpt_physmap  : PML4[256] → 64×1GB at VA 0xFFFF800000000000 → phys 0..64 GB,
+; pdpt_physmap  : PML4[256] → 512×1GB at VA 0xFFFF800000000000 → phys 0..512 GB,
 ;                              supervisor-only. The kernel's phys-frame view.
+;                              (Must match memmap.PHYSMAP_SIZE + uefi/uefi_boot.zig.)
 ; pdpt_high     : PML4[511] → 1 GB at slot 510 (VA 0xFFFFFFFF80000000) →
 ;                              phys 0..1 GB, supervisor-only. Kernel image.
 pml4:           resb 4096
@@ -161,7 +162,8 @@ _start:
     test edx, (1 << 29)    ; LM bit
     jz .no_long_mode
 
-    ; --- Build identity-mapped page tables (1 GB pages, 64 GB total) ---
+    ; --- Build the boot page tables (1 GB huge pages: 4 GB low identity +
+    ;     512 GB physmap + 1 GB high kernel image; see the layout header) ---
 
     ; Zero PML4 + pdpt_low + pdpt_physmap + pdpt_high (4 pages). Boot.bss
     ; zeroing above already did this; redundant but cheap insurance against
@@ -271,6 +273,13 @@ _start:
     ; PDPTEs are 0x83/0x87/0x07; the kernel only starts emitting NX-bearing
     ; PTEs after init runs). Setting NXE early would be harmless but the
     ; deferred-init point is the canonical "MSRs come up here" spot.
+    ;
+    ; The AP trampoline (ap_trampoline.asm) inherits the same deferral, but for
+    ; a different reason: an AP loads the ALREADY-LIVE kernel PML4, which by
+    ; AP-boot time may hold NX-bearing PTEs. The AP is safe only because the
+    ; window between its CR3 load and apEntry → syscall_entry.init() walks
+    ; exclusively the kernel image (NX-clear); see the INVARIANT note at
+    ; smp.apEntry before adding early-AP code that touches user/vmm pages.
     mov ecx, 0xC0000080         ; IA32_EFER MSR
     rdmsr
     or  eax, (1 << 8)           ; LME
