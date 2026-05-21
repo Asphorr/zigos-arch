@@ -434,45 +434,35 @@ pub fn init() void {
     var ap_ids: [MAX_CPUS]u8 = undefined;
     var ap_count: usize = 0;
     if (acpi.getMadt() != null) {
-        const Ctx = struct {
-            ids: *[MAX_CPUS]u8,
-            count: *usize,
-            bsp: u8,
-        };
-        var ctx = Ctx{ .ids = &ap_ids, .count = &ap_count, .bsp = bsp_id };
-        const Walker = struct {
-            fn cb(c: *Ctx, h: *align(1) const acpi.MadtEntryHeader) void {
-                // flags bit 0 = enabled, bit 1 = online-capable. Only
-                // include CPUs explicitly marked enabled. Both legacy
-                // MadtLapic (type 0) and MadtX2Apic (type 9) carry the
-                // same shape we care about; type 9 has a wider id, so
-                // its entries are skipped if the id doesn't fit our
-                // u8/MAX_CPUS-bounded array.
-                const t = @as(acpi.MadtType, @enumFromInt(h.entry_type));
-                var apic_id_u32: u32 = 0;
-                var flags: u32 = 0;
-                switch (t) {
-                    .processor_lapic => {
-                        const e: *align(1) const acpi.MadtLapic = @ptrCast(h);
-                        apic_id_u32 = e.apic_id;
-                        flags = e.flags;
-                    },
-                    .processor_x2apic => {
-                        const e: *align(1) const acpi.MadtX2Apic = @ptrCast(h);
-                        apic_id_u32 = e.x2apic_id;
-                        flags = e.flags;
-                    },
-                    else => return,
-                }
-                if (flags & 1 == 0) return;
-                if (apic_id_u32 == c.bsp) return;
-                if (apic_id_u32 >= MAX_CPUS) return;
-                if (c.count.* >= MAX_CPUS) return;
-                c.ids[c.count.*] = @intCast(apic_id_u32);
-                c.count.* += 1;
+        // flags bit 0 = enabled, bit 1 = online-capable. Only include CPUs
+        // explicitly marked enabled. Both legacy MadtLapic (type 0) and
+        // MadtX2Apic (type 9) carry the same shape we care about; type 9 has a
+        // wider id, so its entries are skipped if the id doesn't fit our
+        // u8/MAX_CPUS-bounded array.
+        var it = acpi.madtEntries();
+        while (it.next()) |h| {
+            var apic_id_u32: u32 = 0;
+            var flags: u32 = 0;
+            switch (@as(acpi.MadtType, @enumFromInt(h.entry_type))) {
+                .processor_lapic => {
+                    const e: *align(1) const acpi.MadtLapic = @ptrCast(h);
+                    apic_id_u32 = e.apic_id;
+                    flags = e.flags;
+                },
+                .processor_x2apic => {
+                    const e: *align(1) const acpi.MadtX2Apic = @ptrCast(h);
+                    apic_id_u32 = e.x2apic_id;
+                    flags = e.flags;
+                },
+                else => continue,
             }
-        };
-        acpi.forEachMadtEntry(Ctx, &ctx, Walker.cb);
+            if (flags & 1 == 0) continue;
+            if (apic_id_u32 == bsp_id) continue;
+            if (apic_id_u32 >= MAX_CPUS) continue;
+            if (ap_count >= MAX_CPUS) continue;
+            ap_ids[ap_count] = @intCast(apic_id_u32);
+            ap_count += 1;
+        }
         debug.klog("[smp] MADT lists {d} AP(s)\n", .{ap_count});
     } else {
         // Fallback probe path — still bounded by MAX_CPUS.

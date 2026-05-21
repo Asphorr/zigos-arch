@@ -325,44 +325,39 @@ pub fn dumpCpuInfo() void {
         serial.print("[cpu] no MADT — APIC topology unknown\n", .{});
         return;
     }
-    const Ctx = struct {
-        bsp_id: u32,
-        count: u32 = 0,
-    };
-    var ctx = Ctx{ .bsp_id = blk: {
+    const bsp_id: u32 = blk: {
         const id_reg = cpuid(1, 0).ebx;
         break :blk id_reg >> 24;
-    } };
-    serial.print("[cpu] LAPIC IDs (BSP=0x{X}): ", .{ctx.bsp_id});
-    const Walker = struct {
-        fn cb(c: *Ctx, h: *align(1) const acpi.MadtEntryHeader) void {
-            switch (@as(acpi.MadtType, @enumFromInt(h.entry_type))) {
-                .processor_lapic => {
-                    const e: *align(1) const acpi.MadtLapic = @ptrCast(h);
-                    if (e.flags & 1 == 0) return;
-                    if (c.count > 0) serial.print(", ", .{});
-                    if (e.apic_id == c.bsp_id) {
-                        serial.print("0x{X}*", .{e.apic_id});
-                    } else {
-                        serial.print("0x{X}", .{e.apic_id});
-                    }
-                    c.count += 1;
-                },
-                .processor_x2apic => {
-                    const e: *align(1) const acpi.MadtX2Apic = @ptrCast(h);
-                    if (e.flags & 1 == 0) return;
-                    if (c.count > 0) serial.print(", ", .{});
-                    if (e.x2apic_id == c.bsp_id) {
-                        serial.print("0x{X}*x2", .{e.x2apic_id});
-                    } else {
-                        serial.print("0x{X}x2", .{e.x2apic_id});
-                    }
-                    c.count += 1;
-                },
-                else => {},
-            }
-        }
     };
-    acpi.forEachMadtEntry(Ctx, &ctx, Walker.cb);
-    serial.print(" ({d} enabled)\n", .{ctx.count});
+    serial.print("[cpu] LAPIC IDs (BSP=0x{X}): ", .{bsp_id});
+    var count: u32 = 0;
+    var it = acpi.madtEntries();
+    while (it.next()) |h| {
+        switch (@as(acpi.MadtType, @enumFromInt(h.entry_type))) {
+            .processor_lapic => {
+                const e: *align(1) const acpi.MadtLapic = @ptrCast(h);
+                if (e.flags & 1 == 0) continue;
+                if (count > 0) serial.print(", ", .{});
+                if (e.apic_id == bsp_id) {
+                    serial.print("0x{X}*", .{e.apic_id});
+                } else {
+                    serial.print("0x{X}", .{e.apic_id});
+                }
+                count += 1;
+            },
+            .processor_x2apic => {
+                const e: *align(1) const acpi.MadtX2Apic = @ptrCast(h);
+                if (e.flags & 1 == 0) continue;
+                if (count > 0) serial.print(", ", .{});
+                if (e.x2apic_id == bsp_id) {
+                    serial.print("0x{X}*x2", .{e.x2apic_id});
+                } else {
+                    serial.print("0x{X}x2", .{e.x2apic_id});
+                }
+                count += 1;
+            },
+            else => {},
+        }
+    }
+    serial.print(" ({d} enabled)\n", .{count});
 }

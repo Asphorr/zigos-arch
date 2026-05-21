@@ -20,6 +20,7 @@
 const std = @import("std");
 const debug = @import("../debug/debug.zig");
 const paging = @import("../mm/paging.zig");
+const io = @import("../io.zig");
 
 // --- Top-level ACPI structures ---------------------------------------------
 //
@@ -127,6 +128,17 @@ pub const Fadt = extern struct {
     // ... rest omitted; we don't need it.
 };
 
+comptime {
+    // The fields tryReset reads sit at spec-fixed offsets (ACPI 6.4 Table
+    // 5.34). They only stay put because every multi-byte field above carries
+    // align(1) — drop one (e.g. iapc_boot_arch at the odd offset 109) and
+    // everything below shifts a byte, so tryReset would poke the wrong
+    // register. Fail the build instead of finding out at reboot time.
+    std.debug.assert(@offsetOf(Fadt, "flags") == 112);
+    std.debug.assert(@offsetOf(Fadt, "reset_reg") == 116);
+    std.debug.assert(@offsetOf(Fadt, "reset_value") == 128);
+}
+
 // --- MADT (signature "APIC") -----------------------------------------------
 // Header followed by a stream of variable-length sub-entries discriminated
 // by an 8-bit type field. Walk by header.length; each sub-entry is at
@@ -219,7 +231,7 @@ pub const McfgSegment = extern struct {
 
 // --- DMAR (signature "DMAR") -----------------------------------------------
 // DMA Remapping Reporting — describes the Intel VT-d remapping units in the
-// system. The table header is followed by a 16-byte DMAR-specific header
+// system. The table header is followed by a 12-byte DMAR-specific header
 // (host address width + flags) and then a stream of variable-length
 // remapping structures (DRHD, RMRR, ATSR, RHSA, ANDD) each prefixed by
 // `{type:u16, length:u16}`.
@@ -287,9 +299,14 @@ const FADT_F_RESET_REG_SUP: u32 = 1 << 10;
 /// should try the next reboot mechanism (0xCF9, 8042, triple fault).
 pub fn tryReset() void {
     const f = fadt orelse return;
+    // ACPI 1.0 FADTs are only 116 bytes — shorter than reset_reg's offset
+    // (116). Don't read reset_reg / reset_value unless the table is long
+    // enough to contain them, or we'd interpret adjacent physmap bytes as a
+    // GAS. (On a 1.0 FADT this returns here; the RESET_REG_SUP flag below
+    // would also be clear, but this makes the bound explicit, not incidental.)
+    if (f.header.length < @offsetOf(Fadt, "reset_value") + 1) return;
     if (f.flags & FADT_F_RESET_REG_SUP == 0) return;
     if (f.reset_reg.address == 0) return;
-    const io = @import("../io.zig");
     switch (f.reset_reg.addr_space) {
         // System I/O space (most common — even modern systems use this for
         // reset-control registers because they predate MMIO config).
@@ -297,6 +314,10 @@ pub fn tryReset() void {
         // System Memory (MMIO). Some server boards use this; a single byte
         // write at the indicated address triggers reset.
         0 => {
+            // Bound the firmware-supplied MMIO address to the physmap so a
+            // corrupt FADT can't turn a reboot attempt into an unmapped-VA
+            // #PF; fall through to the caller's next reboot mechanism instead.
+            if (!physRangeMapped(f.reset_reg.address, 1)) return;
             const va = paging.physToVirt(f.reset_reg.address);
             const ptr: *volatile u8 = @ptrFromInt(va);
             ptr.* = f.reset_value;
@@ -325,30 +346,61 @@ pub fn getDmar() ?*align(1) const Dmar {
     return dmar;
 }
 
-/// Walk every DMAR sub-entry. Caller cases on `header.entry_type` and
-/// casts to the appropriate concrete struct (DmarDrhd / etc.).
-pub fn forEachDmarEntry(comptime Ctx: type, ctx: *Ctx, cb: *const fn (*Ctx, *align(1) const DmarRemappingHeader) void) void {
-    const d = dmar orelse return;
-    const base: usize = @intFromPtr(d) + @sizeOf(Dmar);
-    const end: usize = @intFromPtr(d) + d.header.length;
-    var p: usize = base;
-    while (p + @sizeOf(DmarRemappingHeader) <= end) {
-        const h: *align(1) const DmarRemappingHeader = @ptrFromInt(p);
-        if (h.length == 0) break;
-        cb(ctx, h);
-        p += h.length;
+/// Iterator over DMAR remapping structures (DRHD / RMRR / ...). Caller cases
+/// on `entry_type` (see DmarType) and casts the header to the concrete struct:
+///   var it = acpi.dmarEntries();
+///   while (it.next()) |h| switch (@as(acpi.DmarType, @enumFromInt(h.entry_type))) { ... }
+pub const DmarIterator = struct {
+    p: usize,
+    end: usize,
+
+    pub fn next(self: *DmarIterator) ?*align(1) const DmarRemappingHeader {
+        if (self.p + @sizeOf(DmarRemappingHeader) > self.end) return null;
+        const h: *align(1) const DmarRemappingHeader = @ptrFromInt(self.p);
+        // length must cover its own header (catches 0 and the 1-byte desync
+        // that would walk misaligned garbage) and the whole entry must fit
+        // before end, or the caller reads past the table.
+        if (h.length < @sizeOf(DmarRemappingHeader) or self.p + h.length > self.end) return null;
+        self.p += h.length;
+        return h;
     }
+};
+
+/// DMAR remapping-structure iterator. Yields nothing when no DMAR was found.
+pub fn dmarEntries() DmarIterator {
+    const d = dmar orelse return .{ .p = 0, .end = 0 };
+    return .{ .p = @intFromPtr(d) + @sizeOf(Dmar), .end = @intFromPtr(d) + d.header.length };
 }
 
 // --- Checksum + validation --------------------------------------------------
 
-fn checksumOk(bytes: [*]const u8, len: usize) bool {
+fn checksumOk(bytes: []const u8) bool {
     var sum: u8 = 0;
-    var i: usize = 0;
-    while (i < len) : (i += 1) {
-        sum +%= bytes[i];
-    }
+    for (bytes) |b| sum +%= b; // ACPI checksum is a mod-256 sum (+%= wraps)
     return sum == 0;
+}
+
+/// True if [phys, phys+len) lies entirely inside the mapped 512 GB physmap
+/// window, so physToVirt over that range yields only mapped VAs. The
+/// subtraction form (rather than `phys + len <= SIZE`) can't overflow on a
+/// hostile phys/len. phys == 0 (null / real-mode IVT) and len == 0 are never
+/// real table reads, so both are rejected. This is the single bound every
+/// firmware-supplied physical address passes through before it reaches
+/// physToVirt.
+fn physRangeMapped(phys: u64, len: u64) bool {
+    return phys != 0 and len != 0 and phys <= paging.PHYSMAP_SIZE and len <= paging.PHYSMAP_SIZE - phys;
+}
+
+/// Validate an SDT's checksum after sanity-checking its firmware-supplied
+/// `length`: too-large would walk off the physmap, too-small (< header size)
+/// would underflow the entry-count subtraction in walkSdt (a ReleaseSafe
+/// trap). `phys` is the table's physical base — used to confirm the whole
+/// length-byte body is mapped before checksumOk reads it. 1 MiB is far above
+/// any real table yet finite.
+fn sdtChecksumOk(phys: u64, hdr: *align(1) const SdtHeader) bool {
+    if (hdr.length < @sizeOf(SdtHeader) or hdr.length > 1 << 20) return false;
+    if (!physRangeMapped(phys, hdr.length)) return false;
+    return checksumOk(@as([*]const u8, @ptrCast(hdr))[0..hdr.length]);
 }
 
 // --- RSDP discovery ---------------------------------------------------------
@@ -357,7 +409,8 @@ fn checksumOk(bytes: [*]const u8, len: usize) bool {
 /// first 20 bytes; revision >= 2 also requires the extended checksum
 /// over the full `length` field.
 fn validateRsdp(addr: u64) ?*align(1) const Rsdp {
-    if (addr == 0) return null;
+    // The 8-byte signature + 20-byte ACPI 1.0 checksum span must be mapped.
+    if (!physRangeMapped(addr, 20)) return null;
     const r: *align(1) const Rsdp = @ptrFromInt(paging.physToVirt(addr));
     if (!std.mem.eql(u8, &r.signature, "RSD PTR ")) {
         // Diagnostic: dump the first 16 bytes at this address so we can
@@ -369,7 +422,7 @@ fn validateRsdp(addr: u64) ?*align(1) const Rsdp {
         );
         return null;
     }
-    if (!checksumOk(@ptrCast(r), 20)) {
+    if (!checksumOk(@as([*]const u8, @ptrCast(r))[0..20])) {
         debug.klog("[acpi]   RSDP@0x{x} 1.0 checksum failed (rev={d})\n", .{ addr, r.revision });
         return null;
     }
@@ -385,7 +438,8 @@ fn validateRsdp(addr: u64) ?*align(1) const Rsdp {
             debug.klog("[acpi]   RSDP@0x{x} length {d} out of range\n", .{ addr, r.length });
             return null;
         }
-        if (!checksumOk(@ptrCast(r), r.length)) {
+        if (!physRangeMapped(addr, r.length)) return null; // extended body mapped
+        if (!checksumOk(@as([*]const u8, @ptrCast(r))[0..r.length])) {
             debug.klog("[acpi]   RSDP@0x{x} extended checksum failed\n", .{addr});
             return null;
         }
@@ -433,57 +487,43 @@ fn dispatchTable(hdr: *align(1) const SdtHeader) void {
     }
 }
 
-/// Iterate XSDT entries (8-byte pointers). Verifies each table's
-/// checksum before caching it; mismatched tables are logged and skipped
-/// rather than aborting boot, since one bad table shouldn't disable
-/// shutdown / SMP / ECAM altogether. All ACPI structure pointers use
-/// align(1) — ACPI tables are spec-aligned to 4, but the safety check
-/// in @ptrFromInt is annoying when firmware does anything unusual, and
-/// extern struct accesses with align(1) just work.
-fn walkXsdt(xsdt_phys: u64) void {
-    const hdr: *align(1) const SdtHeader = @ptrFromInt(paging.physToVirt(xsdt_phys));
-    if (!checksumOk(@ptrCast(hdr), hdr.length)) {
-        debug.klog("[acpi] XSDT checksum FAIL\n", .{});
-        return;
+/// Walk an (X)SDT's entry array, dispatching each known-signature table.
+/// `Ptr` is the entry-pointer width: `u64` for an XSDT, `u32` for a legacy
+/// RSDT. Returns true if the root table's own header validated — the caller
+/// uses that to fall back to the RSDT when firmware published a corrupt XSDT.
+///
+/// Each member table's checksum is verified before caching; a mismatched
+/// table is logged and skipped rather than aborting boot, since one bad table
+/// shouldn't disable shutdown / SMP / ECAM altogether. All ACPI structure
+/// pointers use align(1) — ACPI tables are spec-aligned to 4, but the
+/// @ptrFromInt safety check is annoying when firmware does anything unusual,
+/// and extern struct accesses with align(1) just work.
+///
+/// Every firmware-supplied physical address+extent is checked with
+/// physRangeMapped before physToVirt, so a wild or oversized pointer becomes a
+/// skipped entry instead of an unmapped-VA #PF.
+fn walkSdt(comptime Ptr: type, table_phys: u64) bool {
+    // The header must be mapped before we can trust-read its length.
+    if (!physRangeMapped(table_phys, @sizeOf(SdtHeader))) return false;
+    const hdr: *align(1) const SdtHeader = @ptrFromInt(paging.physToVirt(table_phys));
+    if (!sdtChecksumOk(table_phys, hdr)) {
+        debug.klog("[acpi] root SDT checksum/length FAIL (len={d})\n", .{hdr.length});
+        return false;
     }
-    const entry_count = (hdr.length - @sizeOf(SdtHeader)) / 8;
-    const entries: [*]align(1) const u64 = @ptrFromInt(paging.physToVirt(xsdt_phys + @sizeOf(SdtHeader)));
-    var i: usize = 0;
-    while (i < entry_count) : (i += 1) {
-        const tbl_phys = entries[i];
-        if (tbl_phys == 0) continue;
+    const entry_count = (hdr.length - @sizeOf(SdtHeader)) / @sizeOf(Ptr);
+    const entries: [*]align(1) const Ptr = @ptrFromInt(paging.physToVirt(table_phys + @sizeOf(SdtHeader)));
+    for (0..entry_count) |i| {
+        const tbl_phys: u64 = entries[i];
+        if (!physRangeMapped(tbl_phys, @sizeOf(SdtHeader))) continue;
         const tbl: *align(1) const SdtHeader = @ptrFromInt(paging.physToVirt(tbl_phys));
-        if (!checksumOk(@ptrCast(tbl), tbl.length)) {
-            debug.klog("[acpi] table {s} checksum FAIL\n", .{tbl.signature});
+        if (!sdtChecksumOk(tbl_phys, tbl)) {
+            debug.klog("[acpi] table {s} checksum/length FAIL\n", .{tbl.signature});
             continue;
         }
         debug.klog("[acpi] table {s} len={d} rev={d}\n", .{ tbl.signature, tbl.length, tbl.revision });
         dispatchTable(tbl);
     }
-}
-
-/// Same as walkXsdt but for legacy 32-bit pointers (RSDT). Used when
-/// firmware only published an RSDT (revision < 2 or no XSDT given).
-fn walkRsdt(rsdt_phys: u64) void {
-    const hdr: *align(1) const SdtHeader = @ptrFromInt(paging.physToVirt(rsdt_phys));
-    if (!checksumOk(@ptrCast(hdr), hdr.length)) {
-        debug.klog("[acpi] RSDT checksum FAIL\n", .{});
-        return;
-    }
-    const entry_count = (hdr.length - @sizeOf(SdtHeader)) / 4;
-    const entries: [*]align(1) const u32 = @ptrFromInt(paging.physToVirt(rsdt_phys + @sizeOf(SdtHeader)));
-    var i: usize = 0;
-    while (i < entry_count) : (i += 1) {
-        const tbl_phys = entries[i];
-        if (tbl_phys == 0) continue;
-        const tbl: *align(1) const SdtHeader = @ptrFromInt(paging.physToVirt(tbl_phys));
-        if (!checksumOk(@ptrCast(tbl), tbl.length)) {
-            debug.klog("[acpi] table {s} checksum FAIL\n", .{tbl.signature});
-            continue;
-        }
-        debug.klog("[acpi] table {s} len={d} rev={d}\n", .{ tbl.signature, tbl.length, tbl.revision });
-        dispatchTable(tbl);
-    }
+    return true;
 }
 
 /// One-time boot-side initialisation. Pass `boot_rsdp` as either the
@@ -505,12 +545,19 @@ pub fn init(boot_rsdp: u64) void {
         return;
     };
 
+    // Prefer the XSDT (64-bit entry pointers). If firmware published one but
+    // it's corrupt, fall back to the RSDT rather than losing every table —
+    // some firmware ships a good RSDT alongside a broken XSDT.
+    var walked = false;
     if (r.revision >= 2 and r.xsdt_address != 0) {
-        walkXsdt(r.xsdt_address);
-    } else if (r.rsdt_address != 0) {
-        walkRsdt(@as(u64, r.rsdt_address));
-    } else {
-        debug.klog("[acpi] RSDP has no XSDT or RSDT pointer\n", .{});
+        walked = walkSdt(u64, r.xsdt_address);
+        if (!walked) debug.klog("[acpi] XSDT unusable; falling back to RSDT\n", .{});
+    }
+    if (!walked and r.rsdt_address != 0) {
+        walked = walkSdt(u32, r.rsdt_address);
+    }
+    if (!walked) {
+        debug.klog("[acpi] no usable XSDT or RSDT — ACPI disabled\n", .{});
         return;
     }
 
@@ -524,20 +571,29 @@ pub fn init(boot_rsdp: u64) void {
 }
 
 // --- MADT iterator ----------------------------------------------------------
-//
-// Walk MADT sub-entries with a callback. `cb` is called once per entry; it
-// receives a pointer to the variable-length sub-entry header. Caller cases
-// on `header.entry_type` and casts to MadtLapic/MadtIoapic/MadtIso/etc.
 
-pub fn forEachMadtEntry(comptime Ctx: type, ctx: *Ctx, cb: *const fn (*Ctx, *align(1) const MadtEntryHeader) void) void {
-    const m = madt orelse return;
-    const base: usize = @intFromPtr(m) + @sizeOf(Madt);
-    const end: usize = @intFromPtr(m) + m.header.length;
-    var p: usize = base;
-    while (p + @sizeOf(MadtEntryHeader) <= end) {
-        const h: *align(1) const MadtEntryHeader = @ptrFromInt(p);
-        if (h.length == 0) break; // malformed — bail rather than infinite loop
-        cb(ctx, h);
-        p += h.length;
+/// Iterator over MADT sub-entries. Caller cases on `entry_type` (see MadtType)
+/// and casts the header to the concrete struct (MadtLapic/MadtIoapic/MadtIso/…):
+///   var it = acpi.madtEntries();
+///   while (it.next()) |h| switch (@as(acpi.MadtType, @enumFromInt(h.entry_type))) { ... }
+pub const MadtIterator = struct {
+    p: usize,
+    end: usize,
+
+    pub fn next(self: *MadtIterator) ?*align(1) const MadtEntryHeader {
+        if (self.p + @sizeOf(MadtEntryHeader) > self.end) return null;
+        const h: *align(1) const MadtEntryHeader = @ptrFromInt(self.p);
+        // length must cover its own header (catches 0 and the 1-byte desync
+        // that would walk misaligned garbage) and the whole sub-entry must fit
+        // before end, or the caller reads past the table.
+        if (h.length < @sizeOf(MadtEntryHeader) or self.p + h.length > self.end) return null;
+        self.p += h.length;
+        return h;
     }
+};
+
+/// MADT sub-entry iterator. Yields nothing when no MADT was found.
+pub fn madtEntries() MadtIterator {
+    const m = madt orelse return .{ .p = 0, .end = 0 };
+    return .{ .p = @intFromPtr(m) + @sizeOf(Madt), .end = @intFromPtr(m) + m.header.length };
 }

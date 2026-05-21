@@ -208,49 +208,43 @@ fn applyAcpi() void {
         }
     }
 
-    const Ctx = struct {
-        ioapic_seen: bool = false,
-    };
-    var ctx = Ctx{};
-    const Walker = struct {
-        fn cb(c: *Ctx, h: *align(1) const acpi.MadtEntryHeader) void {
-            switch (@as(acpi.MadtType, @enumFromInt(h.entry_type))) {
-                .ioapic => {
-                    const e: *align(1) const acpi.MadtIoapic = @ptrCast(h);
-                    if (!c.ioapic_seen) {
-                        const new_va = paging.physToVirt(e.ioapic_addr);
-                        if (new_va != ioapic_base) {
-                            debug.klog("[apic] MADT overrides IOAPIC base: phys 0x{x} (was VA 0x{x})\n", .{ e.ioapic_addr, ioapic_base });
-                            ioapic_base = new_va;
-                            paging.mapMMIO(@intCast(e.ioapic_addr), 0x1000);
-                        }
-                        ioapic_gsi_base = e.gsi_base;
-                        debug.klog("[apic] IOAPIC[0] phys=0x{x} gsi_base={d} (active)\n", .{ e.ioapic_addr, e.gsi_base });
-                        c.ioapic_seen = true;
-                    } else {
-                        // Multiple IOAPICs on real hardware — we only
-                        // wire the first one. Workstations / servers
-                        // sometimes route specific GSIs (e.g. PCH legacy
-                        // IRQs vs CPU-local sources) across separate
-                        // IOAPICs; if a device's GSI is outside the
-                        // first IOAPIC's range, MSI-X works (bypasses
-                        // IOAPIC) but legacy IRQ doesn't.
-                        debug.klog("[apic] IOAPIC[+] phys=0x{x} gsi_base={d} (NOT WIRED — IRQs in this range need MSI-X)\n", .{ e.ioapic_addr, e.gsi_base });
+    var ioapic_seen = false;
+    var it = acpi.madtEntries();
+    while (it.next()) |h| {
+        switch (@as(acpi.MadtType, @enumFromInt(h.entry_type))) {
+            .ioapic => {
+                const e: *align(1) const acpi.MadtIoapic = @ptrCast(h);
+                if (!ioapic_seen) {
+                    const new_va = paging.physToVirt(e.ioapic_addr);
+                    if (new_va != ioapic_base) {
+                        debug.klog("[apic] MADT overrides IOAPIC base: phys 0x{x} (was VA 0x{x})\n", .{ e.ioapic_addr, ioapic_base });
+                        ioapic_base = new_va;
+                        paging.mapMMIO(@intCast(e.ioapic_addr), 0x1000);
                     }
-                },
-                .interrupt_source_override => {
-                    const e: *align(1) const acpi.MadtIso = @ptrCast(h);
-                    if (e.source < 16) {
-                        iso_remap[e.source] = @intCast(e.gsi);
-                        iso_flags[e.source] = e.flags;
-                        debug.klog("[apic] MADT ISO: ISA IRQ{d} -> GSI{d} flags=0x{x}\n", .{ e.source, e.gsi, e.flags });
-                    }
-                },
-                else => {},
-            }
+                    ioapic_gsi_base = e.gsi_base;
+                    debug.klog("[apic] IOAPIC[0] phys=0x{x} gsi_base={d} (active)\n", .{ e.ioapic_addr, e.gsi_base });
+                    ioapic_seen = true;
+                } else {
+                    // Multiple IOAPICs on real hardware — we only wire the
+                    // first one. Workstations / servers sometimes route
+                    // specific GSIs (e.g. PCH legacy IRQs vs CPU-local sources)
+                    // across separate IOAPICs; if a device's GSI is outside the
+                    // first IOAPIC's range, MSI-X works (bypasses IOAPIC) but
+                    // legacy IRQ doesn't.
+                    debug.klog("[apic] IOAPIC[+] phys=0x{x} gsi_base={d} (NOT WIRED — IRQs in this range need MSI-X)\n", .{ e.ioapic_addr, e.gsi_base });
+                }
+            },
+            .interrupt_source_override => {
+                const e: *align(1) const acpi.MadtIso = @ptrCast(h);
+                if (e.source < 16) {
+                    iso_remap[e.source] = @intCast(e.gsi);
+                    iso_flags[e.source] = e.flags;
+                    debug.klog("[apic] MADT ISO: ISA IRQ{d} -> GSI{d} flags=0x{x}\n", .{ e.source, e.gsi, e.flags });
+                }
+            },
+            else => {},
         }
-    };
-    acpi.forEachMadtEntry(Ctx, &ctx, Walker.cb);
+    }
 }
 
 /// Translate a legacy ISA IRQ number to its GSI per MADT ISO entries.

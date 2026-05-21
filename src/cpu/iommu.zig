@@ -516,7 +516,8 @@ pub fn init() void {
         return;
     }
     var wctx = WalkCtx{};
-    acpi.forEachDmarEntry(WalkCtx, &wctx, dmarCb);
+    var it = acpi.dmarEntries();
+    while (it.next()) |h| dmarCb(&wctx, h);
     if (wctx.found == 0) {
         debug.klog("[iommu] DMAR present but no DRHDs found\n", .{});
         return;
