@@ -8,8 +8,10 @@
 // Redirection:       "ls > out.txt"     -> stdout to file (truncate-create)
 //                    "cat < foo.txt"    -> stdin from file
 //                    "echo hi >> log"   -> stdout to file (append; uses O_APPEND)
+// Sequencing:        "a ; b ; c"        -> run commands left to right
+// Quoting:           echo "a > b"       -> " and ' protect | < > ; and spaces
 //
-// Built-ins:         help, clear, cd, pwd, q/exit
+// Built-ins:         help, clear, cd [-], pwd, q/exit
 //
 // Line editing:
 //   left/right       move cursor within the current line
@@ -19,16 +21,27 @@
 //   up/down          scroll through command history
 //   tab              complete command (col 0) or filename (after a space)
 //
-// No quoting, no globbing yet — `echo "hi >"` will treat `>` as a redirect.
-// Built-ins ignore redirects (running them in the parent shell makes that
-// awkward; revisit if it becomes a real annoyance).
+// Quoting is supported (" and '): the quotes are stripped and any |, <, >, ;
+// or spaces inside them are literal. No globbing yet. Built-ins ignore
+// redirects (running them in the parent shell makes that awkward).
 
+const std = @import("std");
 const libc = @import("libc");
 
 const MAX_LINE: usize = 128;
 const HISTORY_SIZE: usize = 32;
 const MAX_PIPELINE: usize = 4;
 const MAX_PATH: usize = 96;
+
+/// libc.execAs rejects a resolved name longer than this; the shell checks it
+/// to print an honest "command line too long" instead of a misleading
+/// "not found" (MAX_LINE is bigger, so a long line can exceed this).
+const EXEC_NAME_MAX: usize = 100;
+
+/// Sentinels. NO_FD marks an unassigned slot in runPipeline's fd arrays;
+/// BAD_PID is execAs/waitpid's failure + EINTR return value.
+const NO_FD: u32 = 0xFF;
+const BAD_PID: u32 = 0xFFFFFFFF;
 
 /// Parsed form of one segment in a pipeline. `cmd` is what we'll exec
 /// (with redirect tokens stripped); `in_path`/`out_path` are non-null when
@@ -87,6 +100,11 @@ var hist_view: ?usize = null;
 // Restored by the matching Down past hist_view==0.
 var saved_line: [MAX_LINE]u8 = undefined;
 var saved_len: usize = 0;
+
+// Previous working directory for `cd -`. oldpwd_len == 0 means "no previous
+// dir yet" (first cd, or we never successfully changed away from start).
+var oldpwd: [256]u8 = undefined;
+var oldpwd_len: usize = 0;
 
 export fn handleSigint(signo: u32, info: *anyopaque, uc: *anyopaque) void {
     _ = signo;
@@ -152,14 +170,11 @@ export fn _start() linksection(".text.entry") callconv(.c) void {
                     hist_view = null;
                     continue;
                 }
-                if ((len == 1 and buf[0] == 'q') or
-                    (len == 4 and equals(buf[0..4], "exit")))
-                {
+                historyPush(buf[0..len]);
+                if (runLine(buf[0..len])) {
                     libc.print("Goodbye!\n");
                     break;
                 }
-                historyPush(buf[0..len]);
-                runLine(buf[0..len]);
                 // run* may have been interrupted; clear any latched flag before
                 // printing the next prompt (otherwise the next readChar would
                 // print "^C\n>" immediately on a clean prompt).
@@ -238,37 +253,41 @@ export fn _start() linksection(".text.entry") callconv(.c) void {
 }
 
 fn equals(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |x, y| if (x != y) return false;
-    return true;
+    return std.mem.eql(u8, a, b);
+}
+
+fn startsWith(haystack: []const u8, needle: []const u8) bool {
+    return std.mem.startsWith(u8, haystack, needle);
 }
 
 /// Trim ASCII spaces from both ends of `s`.
 fn trim(s: []const u8) []const u8 {
-    var start: usize = 0;
-    var end: usize = s.len;
-    while (start < end and s[start] == ' ') start += 1;
-    while (end > start and s[end - 1] == ' ') end -= 1;
-    return s[start..end];
+    return std.mem.trim(u8, s, " ");
 }
 
-/// Format a non-negative integer as decimal into `out`. Returns the slice
-/// covering the formatted digits. Used to build `\x1b[<n>D` move sequences.
-fn formatU32(out: []u8, n: u32) []const u8 {
-    if (n == 0) {
-        out[0] = '0';
-        return out[0..1];
+/// Tracks single/double quote state while scanning a line. The pipeline (`|`),
+/// sequence (`;`) and redirect (`<`/`>`) splitters consult `inQuote()` so those
+/// operators are literal inside quotes; the quote chars themselves are stripped
+/// by the consumer (parseRedirects). A quote of the *other* kind inside a
+/// quoted run is literal — the matched-char close check below handles that.
+const QuoteScan = struct {
+    quote: u8 = 0, // 0 = outside quotes; otherwise the opening quote char
+
+    fn inQuote(self: QuoteScan) bool {
+        return self.quote != 0;
     }
-    var tmp: [10]u8 = undefined;
-    var i: usize = 0;
-    var v = n;
-    while (v > 0) : (i += 1) {
-        tmp[i] = '0' + @as(u8, @intCast(v % 10));
-        v /= 10;
+
+    /// Feed one char. Opens a quote on `"`/`'` when outside one; closes it on
+    /// the matching char. Non-quote chars and the non-matching quote char are
+    /// no-ops, so a caller can safely step() every char it doesn't consume.
+    fn step(self: *QuoteScan, c: u8) void {
+        if (self.quote == 0) {
+            if (c == '"' or c == '\'') self.quote = c;
+        } else if (c == self.quote) {
+            self.quote = 0;
+        }
     }
-    for (0..i) |j| out[j] = tmp[i - 1 - j];
-    return out[0..i];
-}
+};
 
 /// Repaint the current input line, then put the cursor at `pos`. Strategy:
 /// `\r` returns to column 0, `\x1b[K` clears the line right of cursor (so a
@@ -283,11 +302,9 @@ fn redrawInputLine(line: []const u8, pos: usize) void {
     libc.print("\x1b[32m> \x1b[0m");
     libc.print(line);
     if (pos < line.len) {
-        const back: u32 = @intCast(line.len - pos);
-        libc.print("\x1b[");
-        var nbuf: [10]u8 = undefined;
-        libc.print(formatU32(&nbuf, back));
-        libc.print("D");
+        var nbuf: [16]u8 = undefined;
+        const seq = std.fmt.bufPrint(&nbuf, "\x1b[{d}D", .{line.len - pos}) catch return;
+        libc.print(seq);
     }
 }
 
@@ -351,6 +368,34 @@ fn historyDown(buf: *[MAX_LINE]u8, len: *usize, pos: *usize) void {
     @memcpy(buf[0..h.len], h);
     len.* = h.len;
     pos.* = h.len;
+    redrawInputLine(buf[0..len.*], pos.*);
+}
+
+/// Replace the token at [token_start, pos) in `buf` with `m`, preserving any
+/// text after the cursor, then move the cursor to the end of `m` and repaint.
+/// Shared by tab completion for both a single match and a common-prefix extend.
+fn expandToken(buf: *[MAX_LINE]u8, len: *usize, pos: *usize, token_start: usize, m: []const u8) void {
+    const token_len = pos.* - token_start;
+    const suffix_len = len.* - pos.*;
+    const new_len = token_start + m.len + suffix_len;
+    if (new_len > MAX_LINE) return;
+    // Shift the post-cursor suffix to its new position. Back-to-front when the
+    // token grows (dest overlaps source on the right), front-to-back when it
+    // shrinks — the descending loop handles the only overlapping case safely.
+    if (m.len >= token_len) {
+        var k: usize = suffix_len;
+        while (k > 0) {
+            k -= 1;
+            buf[token_start + m.len + k] = buf[pos.* + k];
+        }
+    } else {
+        for (0..suffix_len) |k| {
+            buf[token_start + m.len + k] = buf[pos.* + k];
+        }
+    }
+    @memcpy(buf[token_start .. token_start + m.len], m);
+    len.* = new_len;
+    pos.* = token_start + m.len;
     redrawInputLine(buf[0..len.*], pos.*);
 }
 
@@ -423,34 +468,25 @@ fn tryComplete(buf: *[MAX_LINE]u8, len: *usize, pos: *usize) void {
     if (match_count == 0) return;
 
     if (match_count == 1) {
-        const m = matches[0][0..match_lens[0]];
-        const suffix_len = len.* - pos.*;
-        const new_len = token_start + m.len + suffix_len;
-        if (new_len > MAX_LINE) return;
-        // Shift the post-cursor suffix to the new position. Going back-to-front
-        // is safe whether m is longer or shorter than the token (the source
-        // and destination ranges overlap in only one of those cases, and that
-        // case is shifting right — handled correctly by the descending loop).
-        if (m.len >= token.len) {
-            var k: usize = suffix_len;
-            while (k > 0) {
-                k -= 1;
-                buf[token_start + m.len + k] = buf[pos.* + k];
-            }
-        } else {
-            for (0..suffix_len) |k| {
-                buf[token_start + m.len + k] = buf[pos.* + k];
-            }
-        }
-        @memcpy(buf[token_start .. token_start + m.len], m);
-        len.* = new_len;
-        pos.* = token_start + m.len;
-        redrawInputLine(buf[0..len.*], pos.*);
+        expandToken(buf, len, pos, token_start, matches[0][0..match_lens[0]]);
         return;
     }
 
-    // Multiple candidates — print them on a fresh line as a hint, then
-    // reprompt with the unchanged input (mimicking bash's double-tab list).
+    // Multiple candidates. First extend the input to their longest common
+    // prefix (bash's first-tab behavior); if there's nothing more to add,
+    // list them on a fresh line and reprompt (bash's second-tab behavior).
+    var lcp_len: usize = match_lens[0];
+    for (1..match_count) |k| {
+        const m = matches[k][0..match_lens[k]];
+        var j: usize = 0;
+        while (j < lcp_len and j < m.len and matches[0][j] == m[j]) j += 1;
+        lcp_len = j;
+    }
+    if (lcp_len > token.len) {
+        expandToken(buf, len, pos, token_start, matches[0][0..lcp_len]);
+        return;
+    }
+
     libc.printChar('\n');
     for (0..match_count) |k| {
         if (k > 0) libc.printChar(' ');
@@ -507,7 +543,7 @@ const help_categories = [_]HelpCategory{
 const help_entries = [_]HelpEntry{
     .{ .category = "builtins",   .name = "help [target]",       .summary = "list everything, or expand a category/command" },
     .{ .category = "builtins",   .name = "clear",               .summary = "clear the screen" },
-    .{ .category = "builtins",   .name = "cd [path]",           .summary = "change directory (no arg = /)" },
+    .{ .category = "builtins",   .name = "cd [path]",           .summary = "change directory (cd - = previous, no arg = /)" },
     .{ .category = "builtins",   .name = "pwd",                 .summary = "print working directory" },
     .{ .category = "builtins",   .name = "q, exit",             .summary = "leave the shell" },
 
@@ -549,6 +585,8 @@ const help_entries = [_]HelpEntry{
     .{ .category = "syntax",     .name = "cmd > file",          .summary = "redirect stdout (truncate)" },
     .{ .category = "syntax",     .name = "cmd >> file",         .summary = "redirect stdout (append)" },
     .{ .category = "syntax",     .name = "cmd < file",          .summary = "read stdin from file" },
+    .{ .category = "syntax",     .name = "a ; b",               .summary = "run commands in sequence" },
+    .{ .category = "syntax",     .name = "\"..\" '..'",           .summary = "quote: protect | < > ; and spaces" },
 
     .{ .category = "keys",       .name = "left/right",          .summary = "move cursor by character" },
     .{ .category = "keys",       .name = "home/end",            .summary = "jump to start/end of line" },
@@ -743,12 +781,35 @@ fn runHelp(arg: []const u8) void {
 /// against the mount table. Errors print in red and the cwd is left
 /// unchanged.
 fn runCd(arg: []const u8) void {
-    const target = if (arg.len == 0) "/" else arg;
+    // Capture where we are now so a successful cd can record it for `cd -`.
+    var cur_buf: [256]u8 = undefined;
+    const cur = libc.getCwd(&cur_buf);
+
+    var target: []const u8 = if (arg.len == 0) "/" else arg;
+    if (equals(arg, "-")) {
+        if (oldpwd_len == 0) {
+            libc.print("\x1b[31mshell: cd: no previous directory\x1b[0m\n");
+            return;
+        }
+        target = oldpwd[0..oldpwd_len];
+    }
+
     if (!libc.chdir(target)) {
         libc.print("\x1b[31mshell: cd: ");
         libc.print(target);
         libc.print("\x1b[0m\n");
+        return;
     }
+
+    // Remember the directory we just left (target may alias oldpwd here, but
+    // chdir already consumed it, so overwriting oldpwd now is safe).
+    if (cur) |c| {
+        const k = @min(c.len, oldpwd.len);
+        @memcpy(oldpwd[0..k], c[0..k]);
+        oldpwd_len = k;
+    }
+    // `cd -` echoes the directory it landed in, like bash.
+    if (equals(arg, "-")) runPwd();
 }
 
 /// `pwd` built-in. Prints the canonical absolute cwd as the kernel stores it
@@ -764,45 +825,59 @@ fn runPwd() void {
     }
 }
 
-/// Parse + dispatch one command line. Empty input is a no-op (caller already
-/// re-prompts). Errors are reported inline; the shell does not exit on a
-/// failed command.
-fn runLine(line: []const u8) void {
-    const trimmed = trim(line);
-    if (trimmed.len == 0) return;
+/// Run one full input line: split on top-level `;` (a `;` inside quotes is
+/// literal) and run each segment left to right. Returns true if a segment
+/// asked the shell to exit (`q`/`exit`), so the read loop can leave.
+fn runLine(line: []const u8) bool {
+    var q: QuoteScan = .{};
+    var seg_start: usize = 0;
+    var i: usize = 0;
+    while (i <= line.len) : (i += 1) {
+        const at_end = i == line.len;
+        const at_sep = !at_end and !q.inQuote() and line[i] == ';';
+        if (!at_end and !at_sep) {
+            q.step(line[i]);
+            continue;
+        }
+        if (runSegment(line[seg_start..i])) return true;
+        seg_start = i + 1;
+        if (at_end) break;
+    }
+    return false;
+}
+
+/// Parse + dispatch one `;`-free command segment. Empty input is a no-op.
+/// Returns true iff the segment was `q`/`exit`. Errors are reported inline;
+/// the shell does not exit on a failed command.
+fn runSegment(seg: []const u8) bool {
+    const trimmed = trim(seg);
+    if (trimmed.len == 0) return false;
+
+    // `q` / `exit` leave the shell. Handled here, not just in the read loop,
+    // so `do-stuff ; exit` works.
+    if (equals(trimmed, "q") or equals(trimmed, "exit")) return true;
 
     // Shell built-ins (no .elf lookup, no waitpid). Redirects on built-ins
     // would need a sub-shell or temporary fd dup in the parent — neither is
     // worth it for what we have today.
     if (equals(trimmed, "help")) {
         runHelp("");
-        return;
-    }
-    if (trimmed.len > 5 and trimmed[0] == 'h' and trimmed[1] == 'e' and trimmed[2] == 'l' and trimmed[3] == 'p' and trimmed[4] == ' ') {
+    } else if (startsWith(trimmed, "help ")) {
         runHelp(trim(trimmed[5..]));
-        return;
-    }
-    if (equals(trimmed, "clear")) {
+    } else if (equals(trimmed, "clear")) {
         libc.print("\x1b[2J\x1b[H");
-        return;
-    }
-    if (equals(trimmed, "pwd")) {
+    } else if (equals(trimmed, "pwd")) {
         runPwd();
-        return;
-    }
-    if (equals(trimmed, "cd")) {
+    } else if (equals(trimmed, "cd")) {
         runCd("");
-        return;
-    }
-    if (trimmed.len > 3 and trimmed[0] == 'c' and trimmed[1] == 'd' and trimmed[2] == ' ') {
+    } else if (startsWith(trimmed, "cd ")) {
         runCd(trim(trimmed[3..]));
-        return;
+    } else {
+        var commands: [MAX_PIPELINE]Command = undefined;
+        var n: usize = 0;
+        if (parsePipeline(trimmed, &commands, &n)) runPipeline(commands[0..n]);
     }
-
-    var commands: [MAX_PIPELINE]Command = undefined;
-    var n: usize = 0;
-    if (!parsePipeline(trimmed, &commands, &n)) return;
-    runPipeline(commands[0..n]);
+    return false;
 }
 
 /// Split `line` on `|`, then for each segment extract `<` / `>` / `>>`
@@ -811,16 +886,17 @@ fn runLine(line: []const u8) void {
 fn parsePipeline(line: []const u8, cmds: *[MAX_PIPELINE]Command, n_out: *usize) bool {
     var n: usize = 0;
     var seg_start: usize = 0;
+    var q: QuoteScan = .{};
     var i: usize = 0;
     while (i <= line.len) : (i += 1) {
         const at_end = i == line.len;
-        const at_pipe = !at_end and line[i] == '|';
-        if (!at_end and !at_pipe) continue;
+        const at_pipe = !at_end and !q.inQuote() and line[i] == '|';
+        if (!at_end and !at_pipe) {
+            q.step(line[i]);
+            continue;
+        }
         if (n >= MAX_PIPELINE) {
-            libc.print("\x1b[31mshell: pipeline too long (max ");
-            var nbuf: [4]u8 = undefined;
-            libc.print(formatU32(&nbuf, MAX_PIPELINE));
-            libc.print(")\x1b[0m\n");
+            libc.print(std.fmt.comptimePrint("\x1b[31mshell: pipeline too long (max {d})\x1b[0m\n", .{MAX_PIPELINE}));
             return false;
         }
         const seg = trim(line[seg_start..i]);
@@ -850,10 +926,11 @@ fn parseRedirects(seg: []const u8, cmd: *Command, idx: usize) bool {
     var out_path: ?[]const u8 = null;
     var out_append: bool = false;
 
+    var q: QuoteScan = .{};
     var i: usize = 0;
     while (i < seg.len) {
         const c = seg[i];
-        if (c == '<' or c == '>') {
+        if (!q.inQuote() and (c == '<' or c == '>')) {
             const is_out = c == '>';
             i += 1;
             var append = false;
@@ -892,6 +969,15 @@ fn parseRedirects(seg: []const u8, cmd: *Command, idx: usize) bool {
                 @memcpy(pipeline_in_paths[idx][0..path.len], path);
                 in_path = pipeline_in_paths[idx][0..path.len];
             }
+        } else if ((c == '"' or c == '\'') and (q.quote == 0 or q.quote == c)) {
+            // Quote delimiter — toggle state and strip it from the command.
+            // The (quote == 0 or quote == c) guard MUST mirror QuoteScan.step's
+            // open/close rule so strip and toggle stay in lockstep — a quote of
+            // the *other* kind mid-run fails this test, falls to else, and is
+            // kept literal. Redirect *targets* are read literally, so a quoted
+            // filename keeps its quotes; quoting is meant to protect operators.
+            q.step(c);
+            i += 1;
         } else {
             cmd_buf[cmd_len] = c;
             cmd_len += 1;
@@ -955,17 +1041,15 @@ fn resolveBin(line: []const u8, buf: []u8) []const u8 {
 /// and we re-call waitpid to actually reap. Without the loop the shell would
 /// leak a zombie and (worse) think its child is still running.
 fn waitpidIntr(pid: u32, status: *u32) void {
+    var tries: u32 = 0;
     while (true) {
         const r = libc.waitpid(pid, status);
-        if (r != 0xFFFFFFFF) return;
-        const limiter = struct {
-            var n: u32 = 0;
-        };
-        limiter.n += 1;
-        if (limiter.n > 16) {
-            limiter.n = 0;
-            return;
-        }
+        if (r != BAD_PID) return;
+        // EINTR (SIGINT delivered to the shell). The handler already forwarded
+        // the signal to `pid`; loop to actually reap it. Cap retries per call
+        // so a pathological signal storm can't wedge us.
+        tries += 1;
+        if (tries > 16) return;
     }
 }
 
@@ -1012,10 +1096,10 @@ fn runPipeline(cmds: []const Command) void {
     const n = cmds.len;
     if (n == 0) return;
 
-    var in_fds: [MAX_PIPELINE]u32 = [_]u32{0xFF} ** MAX_PIPELINE;
-    var out_fds: [MAX_PIPELINE]u32 = [_]u32{0xFF} ** MAX_PIPELINE;
-    var pipe_r: [MAX_PIPELINE]u32 = [_]u32{0xFF} ** MAX_PIPELINE;
-    var pipe_w: [MAX_PIPELINE]u32 = [_]u32{0xFF} ** MAX_PIPELINE;
+    var in_fds: [MAX_PIPELINE]u32 = [_]u32{NO_FD} ** MAX_PIPELINE;
+    var out_fds: [MAX_PIPELINE]u32 = [_]u32{NO_FD} ** MAX_PIPELINE;
+    var pipe_r: [MAX_PIPELINE]u32 = [_]u32{NO_FD} ** MAX_PIPELINE;
+    var pipe_w: [MAX_PIPELINE]u32 = [_]u32{NO_FD} ** MAX_PIPELINE;
     var pids: [MAX_PIPELINE]u32 = [_]u32{0} ** MAX_PIPELINE;
 
     var any_failed = false;
@@ -1035,17 +1119,15 @@ fn runPipeline(cmds: []const Command) void {
         }
     }
 
-    if (!any_failed) {
-        if (n >= 2) {
-            for (0..n - 1) |i| {
-                const fds = libc.pipe() orelse {
-                    libc.print("\x1b[31mshell: pipe alloc failed\x1b[0m\n");
-                    any_failed = true;
-                    break;
-                };
-                pipe_r[i] = fds[0];
-                pipe_w[i] = fds[1];
-            }
+    if (!any_failed and n >= 2) {
+        for (0..n - 1) |i| {
+            const fds = libc.pipe() orelse {
+                libc.print("\x1b[31mshell: pipe alloc failed\x1b[0m\n");
+                any_failed = true;
+                break;
+            };
+            pipe_r[i] = fds[0];
+            pipe_w[i] = fds[1];
         }
     }
 
@@ -1053,34 +1135,42 @@ fn runPipeline(cmds: []const Command) void {
         for (cmds, 0..) |c, i| {
             var name_buf: [MAX_LINE + 4]u8 = undefined;
             const resolved = resolveBin(c.cmd, &name_buf);
+            if (resolved.len > EXEC_NAME_MAX) {
+                libc.print("\x1b[31mshell: command line too long: ");
+                libc.print(c.cmd);
+                libc.print("\x1b[0m\n");
+                for (0..i) |j| _ = libc.kill(pids[j], libc.SIGKILL);
+                any_failed = true;
+                break;
+            }
 
             var remap: [3]libc.FdRemap = undefined;
             var rcount: usize = 0;
 
-            const child_in: u32 = if (in_fds[i] != 0xFF)
+            const child_in: u32 = if (in_fds[i] != NO_FD)
                 in_fds[i]
             else if (i > 0)
                 pipe_r[i - 1]
             else
-                0xFF;
-            if (child_in != 0xFF) {
+                NO_FD;
+            if (child_in != NO_FD) {
                 remap[rcount] = .{ .parent_fd = @truncate(child_in), .child_fd = 0 };
                 rcount += 1;
             }
 
-            const child_out: u32 = if (out_fds[i] != 0xFF)
+            const child_out: u32 = if (out_fds[i] != NO_FD)
                 out_fds[i]
             else if (i + 1 < n)
                 pipe_w[i]
             else
-                0xFF;
-            if (child_out != 0xFF) {
+                NO_FD;
+            if (child_out != NO_FD) {
                 remap[rcount] = .{ .parent_fd = @truncate(child_out), .child_fd = 1 };
                 rcount += 1;
             }
 
             const pid = libc.execAs(resolved, remap[0..rcount]);
-            if (pid == 0xFFFFFFFF) {
+            if (pid == BAD_PID) {
                 libc.print("\x1b[31mshell: not found: ");
                 libc.print(c.cmd);
                 libc.print("\x1b[0m\n");
@@ -1096,13 +1186,13 @@ fn runPipeline(cmds: []const Command) void {
     // kernel-side refcounts to zero. Pipe writer-count must reach zero for
     // the read end to see EOF; otherwise downstream cmds block forever.
     for (0..n) |i| {
-        if (in_fds[i] != 0xFF) libc.close(in_fds[i]);
-        if (out_fds[i] != 0xFF) libc.close(out_fds[i]);
+        if (in_fds[i] != NO_FD) libc.close(in_fds[i]);
+        if (out_fds[i] != NO_FD) libc.close(out_fds[i]);
     }
     if (n >= 2) {
         for (0..n - 1) |i| {
-            if (pipe_r[i] != 0xFF) libc.close(pipe_r[i]);
-            if (pipe_w[i] != 0xFF) libc.close(pipe_w[i]);
+            if (pipe_r[i] != NO_FD) libc.close(pipe_r[i]);
+            if (pipe_w[i] != NO_FD) libc.close(pipe_w[i]);
         }
     }
 
@@ -1122,10 +1212,22 @@ fn runPipeline(cmds: []const Command) void {
     // pipe, the next cmd sees EOF, exits, and so on down the chain.
     fg_child_a = pids[0];
     fg_child_b = if (n >= 2) pids[n - 1] else 0;
+    var last_status: u32 = 0;
     for (0..n) |i| {
         var st: u32 = 0;
         waitpidIntr(pids[i], &st);
+        if (i == n - 1) last_status = st;
     }
     fg_child_a = 0;
     fg_child_b = 0;
+
+    // Surface a non-zero exit from the last stage (the pipeline's status),
+    // unless we were interrupted (the user already saw `^C`). Dim, so it
+    // doesn't shout; a clean exit (status 0) stays quiet.
+    const sip: *volatile bool = &sigint_pending;
+    if (last_status != 0 and !sip.*) {
+        var nbuf: [40]u8 = undefined;
+        const s = std.fmt.bufPrint(&nbuf, "\x1b[2m[exit {d}]\x1b[0m\n", .{last_status}) catch return;
+        libc.print(s);
+    }
 }
