@@ -448,7 +448,7 @@ pub fn ls() void {
     fat32.listFiles();
 }
 
-pub fn loadFile(name: []const u8, dest: [*]align(4) u8) ?usize {
+pub fn loadFile(name: []const u8, dest: []align(4) u8) ?usize {
     // Kernel-context load (no PCB, so no cwd) — strictly absolute paths.
     // Mount table dispatch matches the per-fs `read`/`open` paths used
     // from user processes, so behavior is consistent across both.
@@ -462,7 +462,8 @@ pub fn loadFile(name: []const u8, dest: [*]align(4) u8) ?usize {
                 if (fat32.openFile(rel)) |handle| {
                     const size = handle.file_size;
                     if (size > 0) {
-                        const r = fat32.readFile(handle, @ptrCast(dest), size);
+                        const want: u32 = @intCast(@min(@as(u64, size), dest.len));
+                        const r = fat32.readFile(handle, @ptrCast(dest.ptr), want);
                         fat32.closeFile(handle);
                         if (r > 0) break :blk r;
                     } else {
@@ -489,7 +490,8 @@ pub fn loadFile(name: []const u8, dest: [*]align(4) u8) ?usize {
     if (fat32.openFile(name)) |handle| {
         const size = handle.file_size;
         if (size > 0) {
-            const r = fat32.readFile(handle, @ptrCast(dest), size);
+            const want: u32 = @intCast(@min(@as(u64, size), dest.len));
+            const r = fat32.readFile(handle, @ptrCast(dest.ptr), want);
             fat32.closeFile(handle);
             if (r > 0) return r;
         } else {
@@ -502,7 +504,7 @@ pub fn loadFile(name: []const u8, dest: [*]align(4) u8) ?usize {
 /// Try `ext2.loadFile("bin/" ++ name)`. Used by the bare-name fallback
 /// path so that `sysExec("cat.elf")` finds `/bin/cat.elf` without the
 /// shell having to prepend the prefix itself.
-fn binFallback(name: []const u8, dest: [*]align(4) u8) ?usize {
+fn binFallback(name: []const u8, dest: []align(4) u8) ?usize {
     var buf: [128]u8 = undefined;
     const prefix = "bin/";
     if (name.len + prefix.len > buf.len) return null;
@@ -601,7 +603,7 @@ pub fn loadFileFresh(name: []const u8) ?FreshFile {
     const io_irq0 = nvme.irq_count;
     nvme.io_max_wait_cycles = 0; // local-max for this load only
 
-    if (loadFile(name, buf)) |got| {
+    if (loadFile(name, buf[0 .. @as(usize, pages) * 4096])) |got| {
         const t3 = perf.rdtsc();
         const io_calls = nvme.io_call_count - io_calls0;
         const io_cyc = nvme.io_total_cycles - io_cyc0;

@@ -276,15 +276,18 @@ pub fn matchPrefix(prefix: []const u8, names: *[8][32]u8, name_lens: *[8]u8) u8 
     return count;
 }
 
-pub fn loadFile(filename: []const u8, load_addr: [*]align(4) u8) ?usize {
+pub fn loadFile(filename: []const u8, load_addr: []align(4) u8) ?usize {
     // Use index for instant lookup
     if (indexed) {
         const entry = findInIndex(filename) orelse return null;
         const sectors = (entry.file_size + 511) / 512;
+        // Whole-sector reads land directly in load_addr — refuse if the
+        // rounded-up size wouldn't fit (the caller's buffer is the bound).
+        if (@as(u64, sectors) * 512 > load_addr.len) return null;
         var s: u32 = 0;
         while (s < sectors) {
             const batch: u8 = @intCast(@min(sectors - s, 128));
-            const dest_ptr: [*]u8 = @ptrFromInt(@intFromPtr(load_addr) + s * 512);
+            const dest_ptr: [*]u8 = @ptrFromInt(@intFromPtr(load_addr.ptr) + s * 512);
             ata.readSectors(entry.data_lba + s, batch, dest_ptr);
             s += batch;
         }
@@ -301,10 +304,11 @@ pub fn loadFile(filename: []const u8, load_addr: [*]align(4) u8) ?usize {
         const size = parseOctal(buf[124..136]);
         const sectors = @as(u32, @intCast((size + 511) / 512));
         if (std.mem.eql(u8, buf[0..name_len], filename)) {
+            if (@as(u64, sectors) * 512 > load_addr.len) return null;
             var s: u32 = 0;
             while (s < sectors) {
                 const batch: u8 = @intCast(@min(sectors - s, 128));
-                const dest_ptr: [*]u8 = @ptrFromInt(@intFromPtr(load_addr) + s * 512);
+                const dest_ptr: [*]u8 = @ptrFromInt(@intFromPtr(load_addr.ptr) + s * 512);
                 ata.readSectors(lba + 1 + s, batch, dest_ptr);
                 s += batch;
             }

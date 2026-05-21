@@ -1,4 +1,4 @@
-// Inode I/O + the block-pointer-tree walker. Phase 1: read paths only.
+// Inode I/O + the block-pointer-tree walker. Read + write (Phase 2) paths.
 //
 // The inode cache holds 16 entries, evicted LRU on miss. Cached entries
 // are returned BY VALUE (Inode is 128 B), so a caller's reference can't
@@ -29,7 +29,7 @@ var cache: [CACHE_LEN]InodeCacheEntry = [_]InodeCacheEntry{.{}} ** CACHE_LEN;
 var lru_counter: u32 = 0;
 
 fn lookupCached(inum: u32) ?u32 {
-    for (cache, 0..) |e, i| {
+    for (&cache, 0..) |*e, i| {
         if (e.inum == inum) return @intCast(i);
     }
     return null;
@@ -45,7 +45,7 @@ fn insertCache(inum: u32, ino: layout.Inode) void {
     }
     var min_use: u32 = std.math.maxInt(u32);
     var lru_idx: usize = 0;
-    for (cache, 0..) |e, i| {
+    for (&cache, 0..) |*e, i| {
         if (e.last_use < min_use) {
             min_use = e.last_use;
             lru_idx = i;
@@ -91,7 +91,7 @@ fn allocInodeInGroup(m: *block.Mount, group: u32, is_dir: bool) ?u32 {
             if (byte_buf[0] & mask == 0) {
                 byte_buf[0] |= mask;
                 if (!block.writeBlockBytes(m, bitmap_block, byte_idx, &byte_buf)) return null;
-                bgd.free_inodes_count -= 1;
+                bgd.free_inodes_count -|= 1;
                 if (is_dir) bgd.used_dirs_count +%= 1;
                 m.sb.free_inodes_count -|= 1;
                 if (!block.writeBgdTable(m)) return null;
@@ -262,7 +262,9 @@ pub fn readInodeBytes(inum: u32, offset: u64, dst: []u8) usize {
     var done: usize = 0;
     var off = offset;
     while (done < want) {
-        const logical: u32 = @intCast(off / bs);
+        const lblk = off / bs;
+        if (lblk > std.math.maxInt(u32)) return done; // logical block beyond u32 (hostile LARGE_FILE size)
+        const logical: u32 = @intCast(lblk);
         const in_block_off: u32 = @intCast(off % bs);
         const can: u32 = bs - in_block_off;
         const remain: u64 = want - done;

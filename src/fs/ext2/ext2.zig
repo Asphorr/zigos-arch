@@ -3,8 +3,8 @@
 // taking *anyopaque, listDir/resolveDirInum split) so the VFS dispatch
 // arms are mechanical.
 //
-// Phase 1: read-only. createFile / writeFile / unlink / mkdir / rmdir
-// land in Phase 2.
+// Read + write: open/read/loadFile plus createFile / writeFile / unlink /
+// mkdir / rmdir / truncate.
 
 const std = @import("std");
 const layout = @import("layout.zig");
@@ -24,6 +24,57 @@ fn cachedWalk(path: []const u8) ?u32 {
     const inum = walkPath(path) orelse return null;
     path_cache.insertExt2(path, inum);
     return inum;
+}
+
+// =============================================================================
+// Directory-entry walker + path split
+// =============================================================================
+
+/// Iterates the directory entries packed into a single directory-block
+/// buffer, validating each against the block bounds before yielding it.
+/// `rec_len` must cover the 8-byte header, fit within the block, and span
+/// the entry's claimed `name_len`; any violation (including rec_len == 0)
+/// ends the walk — a malformed or hostile block is truncated, never
+/// over-read. (This is the on-disk twin of the ACPI MADT/DMAR entry walk:
+/// the bounds check that used to be missing from every caller now lives
+/// here once.) Yields EVERY structurally-valid entry, including empty
+/// (inode == 0) slack slots so the insert/remove paths can see them; read
+/// callers skip `inode == 0 or name.len == 0` themselves.
+const DirWalk = struct {
+    buf: []u8,
+    off: u32 = 0,
+
+    const Entry = struct {
+        e: *align(1) layout.DirEntry,
+        off: u32,
+        name: []u8,
+    };
+
+    fn next(self: *DirWalk) ?Entry {
+        if (self.off + layout.DIR_ENTRY_HDR > self.buf.len) return null;
+        const e = std.mem.bytesAsValue(layout.DirEntry, self.buf[self.off .. self.off + layout.DIR_ENTRY_HDR]);
+        const rl: u32 = e.rec_len;
+        if (rl < layout.DIR_ENTRY_HDR or self.off + rl > self.buf.len) return null;
+        if (layout.DIR_ENTRY_HDR + @as(u32, e.name_len) > rl) return null;
+        const at = self.off;
+        self.off += rl;
+        return .{ .e = e, .off = at, .name = self.buf[at + layout.DIR_ENTRY_HDR ..][0..e.name_len] };
+    }
+};
+
+const ParentLeaf = struct { parent: []const u8, leaf: []const u8 };
+
+/// Split `path` at its last '/' into parent-directory + final component.
+/// "a/b/c" → {"a/b", "c"}; "c" → {"", "c"}; "/c" → {"", "c"}. The caller
+/// maps an empty `parent` to ROOT_INO.
+fn splitParentLeaf(path: []const u8) ParentLeaf {
+    if (std.mem.lastIndexOfScalar(u8, path, '/')) |slash| {
+        return .{
+            .parent = if (slash == 0) "" else path[0..slash],
+            .leaf = path[slash + 1 ..],
+        };
+    }
+    return .{ .parent = "", .leaf = path };
 }
 
 // =============================================================================
@@ -80,7 +131,9 @@ pub fn writeFile(handle: *Handle, src: [*]const u8, count: u32) u32 {
 
     while (done < count) {
         const file_off: u64 = handle.current_offset + done;
-        const logical: u32 = @intCast(file_off / bs);
+        const lblk = file_off / bs;
+        if (lblk > std.math.maxInt(u32)) break; // logical block beyond u32
+        const logical: u32 = @intCast(lblk);
         const in_block_off: u32 = @intCast(file_off % bs);
         const can: u32 = bs - in_block_off;
         const remain: u32 = count - done;
@@ -132,20 +185,9 @@ pub fn writeFile(handle: *Handle, src: [*]const u8, count: u32) u32 {
 /// immediately, no second walk needed.
 pub fn createFilePath(path: []const u8) ?Handle {
     if (path.len == 0 or path.len > 255) return null;
-    // Find the last '/' — split point between parent and leaf.
-    var slash_idx: usize = 0;
-    var found = false;
-    var i: usize = path.len;
-    while (i > 0) {
-        i -= 1;
-        if (path[i] == '/') {
-            slash_idx = i;
-            found = true;
-            break;
-        }
-    }
-    const parent_path: []const u8 = if (!found or slash_idx == 0) "" else path[0..slash_idx];
-    const leaf: []const u8 = if (!found) path else path[slash_idx + 1 ..];
+    const split = splitParentLeaf(path);
+    const parent_path = split.parent;
+    const leaf = split.leaf;
     if (leaf.len == 0) return null;
 
     const parent_inum = if (parent_path.len == 0) layout.ROOT_INO else (cachedWalk(parent_path) orelse return null);
@@ -219,19 +261,17 @@ fn dirInsert(m: *block.Mount, dir_inum: u32, dir_ino: *layout.Inode, name: []con
     _ = dir_inum;
     while (@as(u64, lblock) * bs < total) : (lblock += 1) {
         if (!inode.readInodeBlock(dir_ino, lblock, dir_buf[0..bs])) return false;
-        var off: u32 = 0;
-        while (off + layout.DIR_ENTRY_HDR <= bs) {
-            const e = std.mem.bytesAsValue(layout.DirEntry, dir_buf[off .. off + 8]);
-            if (e.rec_len == 0) break; // malformed
-            const tight: u16 = if (e.inode == 0)
+        var w = DirWalk{ .buf = dir_buf[0..bs] };
+        while (w.next()) |d| {
+            const tight: u16 = if (d.e.inode == 0)
                 layout.DIR_ENTRY_HDR // empty entry — all of rec_len is slack
             else
-                layout.dirEntryAlign(e.name_len);
-            if (e.rec_len >= tight + needed) {
+                layout.dirEntryAlign(d.e.name_len);
+            if (d.e.rec_len >= tight + needed) {
                 // Split this entry: shrink to tight, append new entry in slack.
-                const new_off: u32 = off + tight;
-                const slack: u16 = e.rec_len - tight;
-                e.rec_len = tight;
+                const new_off: u32 = d.off + tight;
+                const slack: u16 = d.e.rec_len - tight;
+                d.e.rec_len = tight;
                 // Construct new entry in-place.
                 const ne = std.mem.bytesAsValue(layout.DirEntry, dir_buf[new_off .. new_off + 8]);
                 ne.inode = child_inum;
@@ -245,7 +285,6 @@ fn dirInsert(m: *block.Mount, dir_inum: u32, dir_ino: *layout.Inode, name: []con
                 if (!block.writeBlock(m, phys, dir_buf[0..bs])) return false;
                 return true;
             }
-            off += e.rec_len;
         }
     }
 
@@ -276,19 +315,9 @@ inline fn containsSlash(name: []const u8) bool {
 /// pointer. Returns true on success.
 pub fn mkdirPath(path: []const u8) bool {
     if (path.len == 0 or path.len > 255) return false;
-    var slash_idx: usize = 0;
-    var found = false;
-    var i: usize = path.len;
-    while (i > 0) {
-        i -= 1;
-        if (path[i] == '/') {
-            slash_idx = i;
-            found = true;
-            break;
-        }
-    }
-    const parent_path: []const u8 = if (!found or slash_idx == 0) "" else path[0..slash_idx];
-    const leaf: []const u8 = if (!found) path else path[slash_idx + 1 ..];
+    const split = splitParentLeaf(path);
+    const parent_path = split.parent;
+    const leaf = split.leaf;
     if (leaf.len == 0 or leaf.len > 255) return false;
     if (containsSlash(leaf)) return false;
 
@@ -373,22 +402,10 @@ pub fn mkdirPath(path: []const u8) bool {
 /// by 1.
 pub fn rmdirPath(path: []const u8) bool {
     if (path.len == 0 or path.len > 255) return false;
-    var slash_idx: usize = 0;
-    var found = false;
-    var i: usize = path.len;
-    while (i > 0) {
-        i -= 1;
-        if (path[i] == '/') {
-            slash_idx = i;
-            found = true;
-            break;
-        }
-    }
-    const parent_path: []const u8 = if (!found or slash_idx == 0) "" else path[0..slash_idx];
-    const leaf: []const u8 = if (!found) path else path[slash_idx + 1 ..];
+    const split = splitParentLeaf(path);
+    const parent_path = split.parent;
+    const leaf = split.leaf;
     if (leaf.len == 0) return false;
-    // "/" can't be removed.
-    if (parent_path.len == 0 and leaf.len == 0) return false;
 
     const parent_inum = if (parent_path.len == 0) layout.ROOT_INO else (cachedWalk(parent_path) orelse return false);
     var parent = inode.readInode(parent_inum) orelse return false;
@@ -411,15 +428,9 @@ fn dirIsEmpty(dir_ino: *const layout.Inode) bool {
     var dir_buf: [4096]u8 align(8) = undefined;
     while (@as(u64, lblock) * bs < total) : (lblock += 1) {
         if (!inode.readInodeBlock(dir_ino, lblock, dir_buf[0..bs])) return false;
-        var off: u32 = 0;
-        while (off + layout.DIR_ENTRY_HDR <= bs) {
-            const e = std.mem.bytesAsValue(layout.DirEntry, dir_buf[off .. off + 8]);
-            if (e.rec_len == 0) break;
-            if (e.inode != 0 and e.name_len > 0) {
-                const name = dir_buf[off + 8 .. off + 8 + e.name_len];
-                if (!isDotEntry(name)) return false;
-            }
-            off += e.rec_len;
+        var w = DirWalk{ .buf = dir_buf[0..bs] };
+        while (w.next()) |d| {
+            if (d.e.inode != 0 and d.name.len > 0 and !isDotEntry(d.name)) return false;
         }
     }
     return true;
@@ -431,19 +442,9 @@ fn dirIsEmpty(dir_ino: *const layout.Inode) bool {
 /// directories — use rmdir for those.
 pub fn unlinkPath(path: []const u8) bool {
     if (path.len == 0 or path.len > 255) return false;
-    var slash_idx: usize = 0;
-    var found = false;
-    var i: usize = path.len;
-    while (i > 0) {
-        i -= 1;
-        if (path[i] == '/') {
-            slash_idx = i;
-            found = true;
-            break;
-        }
-    }
-    const parent_path: []const u8 = if (!found or slash_idx == 0) "" else path[0..slash_idx];
-    const leaf: []const u8 = if (!found) path else path[slash_idx + 1 ..];
+    const split = splitParentLeaf(path);
+    const parent_path = split.parent;
+    const leaf = split.leaf;
     if (leaf.len == 0) return false;
 
     const parent_inum = if (parent_path.len == 0) layout.ROOT_INO else (cachedWalk(parent_path) orelse return false);
@@ -515,29 +516,22 @@ fn dirRemove(m: *block.Mount, dir_ino: *layout.Inode, name: []const u8) bool {
     var dir_buf: [4096]u8 align(8) = undefined;
     while (@as(u64, lblock) * bs < total) : (lblock += 1) {
         if (!inode.readInodeBlock(dir_ino, lblock, dir_buf[0..bs])) return false;
-        var off: u32 = 0;
-        var prev_off: i64 = -1;
-        while (off + layout.DIR_ENTRY_HDR <= bs) {
-            const e = std.mem.bytesAsValue(layout.DirEntry, dir_buf[off .. off + 8]);
-            if (e.rec_len == 0) break;
-            if (e.inode != 0 and e.name_len == name.len) {
-                const ent_name = dir_buf[off + 8 .. off + 8 + e.name_len];
-                if (std.mem.eql(u8, ent_name, name)) {
-                    if (prev_off < 0) {
-                        // First entry in block — null its inode but keep rec_len so
-                        // the dir walker still strides past it.
-                        e.inode = 0;
-                    } else {
-                        // Merge: prev.rec_len absorbs this entry's slot.
-                        const prev_e = std.mem.bytesAsValue(layout.DirEntry, dir_buf[@intCast(prev_off) .. @as(usize, @intCast(prev_off)) + 8]);
-                        prev_e.rec_len += e.rec_len;
-                    }
-                    const phys = inode.blockMapLookup(dir_ino, lblock) orelse return false;
-                    return block.writeBlock(m, phys, dir_buf[0..bs]);
+        var w = DirWalk{ .buf = dir_buf[0..bs] };
+        var prev: ?*align(1) layout.DirEntry = null;
+        while (w.next()) |d| {
+            if (d.e.inode != 0 and d.name.len == name.len and std.mem.eql(u8, d.name, name)) {
+                if (prev) |prev_e| {
+                    // Merge: prev.rec_len absorbs this entry's slot.
+                    prev_e.rec_len += d.e.rec_len;
+                } else {
+                    // First entry in block — null its inode but keep rec_len so
+                    // the dir walker still strides past it.
+                    d.e.inode = 0;
                 }
+                const phys = inode.blockMapLookup(dir_ino, lblock) orelse return false;
+                return block.writeBlock(m, phys, dir_buf[0..bs]);
             }
-            prev_off = @intCast(off);
-            off += e.rec_len;
+            prev = d.e;
         }
     }
     return false;
@@ -568,12 +562,15 @@ pub fn fileSize(path: []const u8) ?u64 {
 }
 
 /// Whole-file load into `dest`. Returns total bytes read or null on miss.
-pub fn loadFile(path: []const u8, dest: [*]align(4) u8) ?usize {
+pub fn loadFile(path: []const u8, dest: []align(4) u8) ?usize {
     const inum = cachedWalk(path) orelse return null;
     const ino = inode.readInode(inum) orelse return null;
     if (!inode.isReg(&ino)) return null;
     const sz = inode.fileSize(&ino);
-    return inode.readInodeBytes(inum, 0, dest[0..@intCast(sz)]);
+    // `sz` is an untrusted on-disk size — clamp to the caller's buffer so we
+    // never write past `dest`.
+    const want: usize = @intCast(@min(sz, @as(u64, dest.len)));
+    return inode.readInodeBytes(inum, 0, dest[0..want]);
 }
 
 pub fn getFileStat(path: []const u8, stat_buf: *anyopaque) bool {
@@ -639,22 +636,18 @@ pub fn listDir(dir_inum: u32, entries: [*]FileEntry, max_entries: u32) u32 {
     var lblock: u32 = 0;
     while (@as(u64, lblock) * m.block_size < total and count < max_entries) : (lblock += 1) {
         if (!inode.readInodeBlock(&dir_ino, lblock, block_buf[0..m.block_size])) return count;
-        var off: u32 = 0;
-        while (off + layout.DIR_ENTRY_HDR <= m.block_size and count < max_entries) {
-            const e = std.mem.bytesAsValue(layout.DirEntry, block_buf[off .. off + 8]);
-            if (e.rec_len == 0) break; // malformed — abandon block
-            if (e.inode != 0 and e.name_len > 0) {
-                const name = block_buf[off + 8 .. off + 8 + e.name_len];
-                // Skip "." / ".." (sysListDir consumers don't show them) and
-                // ext2's reserved `lost+found` directory (created by every
-                // mkfs-equivalent for fsck recovery; clutters listings since
-                // we never run fsck and the user has no use for it).
-                if (!isDotEntry(name) and !isLostFound(name)) {
-                    fillEntry(&entries[count], name, e.inode);
-                    count += 1;
-                }
+        var w = DirWalk{ .buf = block_buf[0..m.block_size] };
+        while (w.next()) |d| {
+            if (count >= max_entries) break;
+            if (d.e.inode == 0 or d.name.len == 0) continue;
+            // Skip "." / ".." (sysListDir consumers don't show them) and
+            // ext2's reserved `lost+found` directory (created by every
+            // mkfs-equivalent for fsck recovery; clutters listings since
+            // we never run fsck and the user has no use for it).
+            if (!isDotEntry(d.name) and !isLostFound(d.name)) {
+                fillEntry(&entries[count], d.name, d.e.inode);
+                count += 1;
             }
-            off += e.rec_len;
         }
     }
     return count;
@@ -703,15 +696,9 @@ fn lookupInDir(dir_ino: *const layout.Inode, name: []const u8) ?u32 {
     var lblock: u32 = 0;
     while (@as(u64, lblock) * m.block_size < total) : (lblock += 1) {
         if (!inode.readInodeBlock(dir_ino, lblock, block_buf[0..m.block_size])) return null;
-        var off: u32 = 0;
-        while (off + layout.DIR_ENTRY_HDR <= m.block_size) {
-            const e = std.mem.bytesAsValue(layout.DirEntry, block_buf[off .. off + 8]);
-            if (e.rec_len == 0) break;
-            if (e.inode != 0 and e.name_len > 0) {
-                const ent_name = block_buf[off + 8 .. off + 8 + e.name_len];
-                if (std.mem.eql(u8, ent_name, name)) return e.inode;
-            }
-            off += e.rec_len;
+        var w = DirWalk{ .buf = block_buf[0..m.block_size] };
+        while (w.next()) |d| {
+            if (d.e.inode != 0 and d.name.len > 0 and std.mem.eql(u8, d.name, name)) return d.e.inode;
         }
     }
     return null;

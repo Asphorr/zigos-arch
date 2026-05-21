@@ -16,7 +16,8 @@
 // metadata) over-fetch by the cache size but the absolute waste is
 // still 28 KB max — tiny in PMM terms.
 //
-// Phase 1: read-only. The dirty mask + writeBlock land in Phase 2.
+// Writes are implemented: writeBlock / writeBlockBytes + the bitmap
+// alloc/free paths all funnel through the same cache window.
 
 const std = @import("std");
 const layout = @import("layout.zig");
@@ -106,8 +107,25 @@ pub fn mount(partition_lba: u32) bool {
     }
 
     const block_size: u32 = @as(u32, 1024) << @as(u5, @intCast(sb.log_block_size));
+
+    // Validate the superblock fields that feed divisions / geometry below.
+    // These are untrusted on-disk values; a zeroed or hostile field must
+    // fail the mount, not divide-by-zero or overflow-trap the kernel.
+    // (inode_size must divide block_size so inodes_per_block >= 1.)
+    if (sb.inode_size == 0 or sb.inode_size > block_size or block_size % sb.inode_size != 0) {
+        debug.klog("[ext2] mount: bad inode_size={d} for block_size={d}\n", .{ sb.inode_size, block_size });
+        return false;
+    }
+    if (sb.blocks_per_group == 0 or sb.inodes_per_group == 0 or sb.blocks_count == 0) {
+        debug.klog("[ext2] mount: zero blocks_count/blocks_per_group/inodes_per_group\n", .{});
+        return false;
+    }
+
     const sectors_per_block: u32 = block_size / SECTOR_SIZE;
-    const bgd_count: u32 = (sb.blocks_count + sb.blocks_per_group - 1) / sb.blocks_per_group;
+    // Ceil-div as floor + remainder so `blocks_count + bpg - 1` can't
+    // overflow u32 on a hostile blocks_count.
+    const bgd_count: u32 = sb.blocks_count / sb.blocks_per_group +
+        @intFromBool(sb.blocks_count % sb.blocks_per_group != 0);
     if (bgd_count > MAX_BGD_CACHED) {
         debug.klog("[ext2] mount: bgd_count={d} exceeds cache cap {d}\n", .{ bgd_count, MAX_BGD_CACHED });
         return false;
@@ -341,7 +359,7 @@ fn allocBlockInGroup(self: *Mount, group: u32) ?u32 {
                     const sec_off: u32 = cache_off_base + s * SECTOR_SIZE;
                     self.write_sector(bitmap_lba + s, @as([*]const u8, @ptrCast(&self.cache_buf[way])) + sec_off);
                 }
-                bgd.free_blocks_count -= 1;
+                bgd.free_blocks_count -|= 1;
                 self.sb.free_blocks_count -|= 1;
                 if (!writeBgdTable(self)) return null;
                 if (!writeSuperblock(self)) return null;
