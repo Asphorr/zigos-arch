@@ -124,6 +124,17 @@ pub inline fn physPtr(comptime T: type, phys: u64) T {
 ///     this needs revisiting.
 ///   - Doesn't validate canonical-form. Caller should do that first.
 pub fn isMapped(addr: u64) bool {
+    // Reject non-canonical VAs up front. On real HW, a non-canonical
+    // memory access raises #GP; if the caller (debug paths, gdb stub) is
+    // probing such a VA, the right answer is "not mapped" — falling
+    // through would extract a plausible-looking (addr >> 39) & 0x1FF
+    // index from the wild high bits and walk through whichever kernel
+    // master slot it lands on, returning a misleading true/false.
+    // x86_64 canonical form: bits 47..63 must all be 0 (low half) or
+    // all be 1 (high half).
+    const high = addr >> 47;
+    if (high != 0 and high != 0x1FFFF) return false;
+
     const cr3 = asm volatile ("movq %%cr3, %[ret]"
         : [ret] "=r" (-> u64),
     );
@@ -185,22 +196,82 @@ pub fn init(boot_info: *const @import("../boot/boot_info.zig").BootInfo) void {
 
 const debug = @import("../debug/debug.zig");
 
+/// Mark a physical range as Memory-Mapped I/O (Uncached) on the kernel side.
+///
+/// Walks the physmap (PML4[256]) PTEs covering [phys, phys+size), splits
+/// 1GB/2MB pages down to 4KB as needed, and ORs `CACHE_DISABLE` onto each
+/// leaf. Drivers that subsequently read/write via `physToVirt(phys)` see
+/// strict-UC ordering — register writes aren't reordered through the cache.
+///
+/// For phys >= PHYSMAP_SIZE: legacy `ensureMapped` path (currently a stub
+/// since we don't extend the physmap above 512 GB).
+///
+/// Previous version forwarded straight to `ensureMapped`, which short-
+/// circuits for `phys + size <= PHYSMAP_SIZE` and silently discarded the
+/// CACHE_DISABLE flag — every in-range BAR mapping inherited the boot map's
+/// WB caching. On QEMU/KVM the hypervisor traps regardless, so the symptom
+/// was invisible; on real HW with no MTRR override the device would see
+/// reordered or coalesced register writes. mapAPIC had a hand-rolled
+/// workaround for this exact reason — now generalized here so all drivers
+/// benefit. Caught 2026-05-21 in paging.zig audit.
 pub fn mapMMIO(phys: usize, size: usize) void {
-    ensureMapped(phys, size, CACHE_DISABLE);
+    applyPhysmapCacheFlag(phys, size, CACHE_DISABLE);
+    if (phys + size > PHYSMAP_SIZE) {
+        ensureMapped(phys, size, CACHE_DISABLE);
+    }
 }
 
-/// Same as mapMMIO but Write-Back cacheable. Use for shared host/guest
+/// Same shape as mapMMIO but Write-Back cacheable. Use for shared host/guest
 /// DRAM regions exposed via PCI BARs (e.g. virtio-gpu BLOB / SHM BAR)
 /// — those are real DRAM, not registers, and reading them via UC PTEs
 /// (1) thrashes performance to ~1.5 GB/s, and (2) breaks x86 cache
 /// coherency with the host's WB mapping of the same dma-buf, so the
 /// guest sees stale DRAM until the host flushes its own caches. WB on
 /// both sides lets MESI snoop across the KVM boundary.
+///
+/// In-range (phys < PHYSMAP_SIZE) is a no-op: the physmap is already WB,
+/// so there's nothing to apply.
 pub fn mapWBRange(phys: usize, size: usize) void {
-    ensureMapped(phys, size, 0);
+    if (phys + size > PHYSMAP_SIZE) {
+        ensureMapped(phys, size, 0);
+    }
+}
+
+/// Walk the kernel physmap (PML4[256]) PTEs covering [phys, phys+size),
+/// split 1GB / 2MB pages down to 4KB as needed, and OR `cache_flag` onto
+/// each 4KB leaf. The physmap defaults to WB; this is how callers upgrade
+/// individual pages to UC (mapMMIO) or other PAT slots.
+///
+/// `cache_flag == 0` is treated as a no-op — there's nothing to clear.
+/// Cache policy here is sticky in practice: once a leaf carries UC, only
+/// an explicit clear flips it back. That matches the "drivers set policy
+/// once at init" model.
+///
+/// Each split-down 1GB → 2MB costs one 4KB PMM frame (the new PD); each
+/// 2MB → 4KB costs another (the new PT). Subsequent pages inside the
+/// same 2MB chunk reuse the PT — so a typical 4KB BAR pays ~8KB of PMM
+/// overhead total.
+///
+/// Issues a global TLB flush on the calling CPU after modifications, and —
+/// when called post-boot (boot_phase complete) — broadcasts a cross-CPU
+/// `tlb.shootdownAll(0)` so peers drop their stale GLOBAL entry too. See
+/// `shootdownIfPostBoot`.
+fn applyPhysmapCacheFlag(phys: usize, size: usize, cache_flag: u64) void {
+    if (cache_flag == 0 or size == 0 or phys >= PHYSMAP_SIZE) return;
+    const end_phys = @min(phys + size, PHYSMAP_SIZE);
+    var p = phys & ~@as(usize, 0xFFF);
+    const aligned_end = (end_phys + 0xFFF) & ~@as(usize, 0xFFF);
+    while (p < aligned_end) : (p += 4096) {
+        if (splitToPte(physToVirt(p))) |pte| {
+            pte.* |= cache_flag;
+        }
+    }
+    flushTLBGlobal();
+    shootdownIfPostBoot("applyPhysmapCacheFlag");
 }
 
 pub fn mapAPIC() void {
+    auditBootOnly("mapAPIC");
     // The boot identity map covers IOAPIC at 0xFEC00000 and LAPIC at
     // 0xFEE00000 via 1GB huge pages defaulting to WB. APIC registers
     // require strict UC: WB-cached writes can be reordered or coalesced,
@@ -227,7 +298,7 @@ pub fn mapAPIC() void {
             pte.* |= CACHE_DISABLE;
         }
     }
-    flushTLB();
+    flushTLBGlobal();
 }
 
 // --- PAT (Page Attribute Table) ---------------------------------------
@@ -297,7 +368,10 @@ pub fn setupPat() void {
         : .{ .ebx = true, .ecx = true });
     if (edx & (1 << 16) == 0) return;
     writeMsr(PAT_MSR, PAT_VALUE_WITH_WC4);
-    flushTLB();
+    // PAT changes how every PTE's PCD/PWT/PAT bits resolve to a memory
+    // type. Existing TLB entries cache the OLD type — must blow them all
+    // away, globals included, or kernel pages keep their pre-PAT caching.
+    flushTLBGlobal();
 }
 
 /// Mark a physical address range as Write-Combining via PAT, viewed
@@ -319,6 +393,7 @@ pub fn setupPat() void {
 /// this before APs come up, so APs naturally see the new mapping when
 /// their cr3 load picks up the modified PD entries via the shared PML4.
 pub fn setRangeWriteCombining(phys: u64, size: u64) void {
+    auditBootOnly("setRangeWriteCombining");
     if (pml4_addr == 0 or size == 0) return;
     const pml4: [*]volatile u64 = @ptrFromInt(physToVirt(pml4_addr));
     const physmap_pml4_idx: usize = (PHYSMAP_BASE >> 39) & 0x1FF;
@@ -347,7 +422,10 @@ pub fn setRangeWriteCombining(phys: u64, size: u64) void {
             // and 2MB encodings, so no bit movement is required. PS stays
             // set since the new 2MB PDEs are also leaves.
             const leaf_template = pdpte & ~PAGE_MASK_1G;
-            const new_pd_phys = pmm.allocFrame() orelse return;
+            const new_pd_phys = pmm.allocFrame() orelse {
+                debug.klog("[paging] FATAL setRangeWriteCombining: PMM OOM splitting 1GB at phys=0x{X} — WC upgrade abandoned mid-range\n", .{p});
+                return;
+            };
             const new_pd: [*]u64 = @ptrFromInt(physToVirt(new_pd_phys));
             for (0..512) |i| {
                 new_pd[i] = (gb_phys + @as(u64, @intCast(i)) * 0x200000) | leaf_template;
@@ -363,7 +441,9 @@ pub fn setRangeWriteCombining(phys: u64, size: u64) void {
         }
         p += 0x200000;
     }
-    flushTLB();
+    // Physmap PDEs are global — must flush globals or the WC upgrade
+    // is invisible to the CPU until eviction.
+    flushTLBGlobal();
 }
 
 /// Ensure a physical address range is identity-mapped via 2MB pages.
@@ -413,7 +493,10 @@ fn ensureMapped(phys: usize, size: usize, cache_flag: u64) void {
         // Check/create PDPT
         if (pml4[pml4_idx] & PRESENT == 0) {
             // Need a new PDPT page — allocate from PMM
-            const page = @import("pmm.zig").allocFrame() orelse return;
+            const page = @import("pmm.zig").allocFrame() orelse {
+                debug.klog("[paging] FATAL ensureMapped: PMM OOM allocating PDPT for VA=0x{X}\n", .{addr});
+                return;
+            };
             const p: [*]u8 = @ptrFromInt(physToVirt(page));
             @memset(p[0..4096], 0);
             pml4[pml4_idx] = @as(u64, page) | TBL_FLAGS;
@@ -424,7 +507,10 @@ fn ensureMapped(phys: usize, size: usize, cache_flag: u64) void {
 
         // Check/create PD
         if (pdpt[pdpt_idx] & PRESENT == 0) {
-            const page = @import("pmm.zig").allocFrame() orelse return;
+            const page = @import("pmm.zig").allocFrame() orelse {
+                debug.klog("[paging] FATAL ensureMapped: PMM OOM allocating PD for VA=0x{X}\n", .{addr});
+                return;
+            };
             const p: [*]u8 = @ptrFromInt(physToVirt(page));
             @memset(p[0..4096], 0);
             pdpt[pdpt_idx] = @as(u64, page) | TBL_FLAGS;
@@ -446,7 +532,9 @@ fn ensureMapped(phys: usize, size: usize, cache_flag: u64) void {
             debug.klog("[paging]   Already mapped at 0x{X}\n", .{addr});
         }
     }
-    flushTLB();
+    // Kernel-master mutation — globals must be flushed too.
+    flushTLBGlobal();
+    shootdownIfPostBoot("ensureMapped");
 }
 
 // --- Per-process GUI framebuffer kernel mappings ---
@@ -563,11 +651,96 @@ pub fn freeGuestFB(num_pages: u32) void {
 
 // --- Helpers ---
 
+/// CR3-reload TLB flush. Under `CR4.PCIDE=1` (always set since the PCID
+/// rollout) this invalidates the current PCID's non-global entries; with
+/// PCIDE=0 it invalidates every non-global entry. Either way **global
+/// pages survive** — and kernel PTEs at PML4[256] (physmap) and PML4[511]
+/// (kernel image) are tagged G=1 (boot.asm / uefi_boot.zig set 0x183 on
+/// those 1GB pages), so any mutation of a kernel-master PTE will leave a
+/// stale global TLB entry on this CPU. Use `flushTLBGlobal` for those.
+///
+/// Appropriate uses:
+///   - Per-process address-space changes (user pages are G=0)
+///   - Clearing PML4[0] in `dropLowIdentity` — see note there
 pub fn flushTLB() void {
     asm volatile (
         \\ movq %%cr3, %%rax
         \\ movq %%rax, %%cr3
         ::: .{ .rax = true });
+}
+
+/// Flush ALL TLB entries on the calling CPU, including global pages.
+/// Required after any mutation of a kernel-master PTE (mapMMIO,
+/// splitToPte, installGuardPage, setupPat, ...): those PTEs have G=1
+/// and aren't invalidated by `flushTLB`'s CR3 reload.
+///
+/// Mechanism: toggle CR4.PGE off then on. Disabling PGE invalidates every
+/// global TLB entry on the CPU; restoring CR4 returns the kernel pages to
+/// global-cached status for subsequent fills. Equivalent to INVPCID
+/// type-2 (all-context including globals) but doesn't require the
+/// CPUID.07H:EBX[10] feature.
+///
+/// Per-CPU. Post-boot kernel-master mutations need a cross-CPU shootdown
+/// (see `tlb.shootdownAll(0)`) in addition — this only flushes locally.
+pub fn flushTLBGlobal() void {
+    asm volatile (
+        \\ movq %%cr4, %%rcx
+        \\ movq %%rcx, %%rax
+        \\ btrq $7, %%rax
+        \\ movq %%rax, %%cr4
+        \\ movq %%rcx, %%cr4
+        ::: .{ .rax = true, .rcx = true });
+}
+
+/// Boot-phase audit for the two kernel-master mutators that are expected to
+/// run ONLY during single-threaded boot: `mapAPIC` (APIC pages, mapped once)
+/// and `setRangeWriteCombining` (framebuffer WC, set once). Both flush only
+/// the local CPU. If either is ever reached AFTER boot — a future PCI hotplug
+/// rebind, FLR re-init, or runtime fb remap — AND it modifies an already-
+/// cached kernel mapping, the local-only flush leaves peer CPUs with a stale
+/// (global) TLB entry (silent corruption). We LOG, never panic: a panic on a
+/// normal path is worse than the issue it guards (the 2026-05-21
+/// `cpu_count > 1` version fired at xhci.init and broke boot). If one ever
+/// fires, route that mutator through `shootdownIfPostBoot` the way
+/// applyPhysmapCacheFlag/ensureMapped already are. Cocked trap — never fires
+/// today.
+///
+/// The mapMMIO-reachable pair (`applyPhysmapCacheFlag`, `ensureMapped`) is NOT
+/// audited here: those legitimately run post-boot (driver late-init, e.g.
+/// virtio-gpu binding inside the desktop task) and self-correct via
+/// `shootdownIfPostBoot`. `installGuardPage` is also excluded — it runs every
+/// process spawn but maps a FRESH VA no peer CPU has cached, so its local
+/// flush is always sufficient.
+fn auditBootOnly(comptime site: []const u8) void {
+    if (@import("../boot/boot_phase.zig").isComplete()) {
+        debug.klog("[paging-AUDIT] {s} ran post-boot — local-only flush of a possibly-cached kernel mapping; route it through shootdownIfPostBoot\n", .{site});
+    }
+}
+
+/// Post-boot counterpart to `auditBootOnly` for the two kernel-master mutators
+/// that legitimately CAN run after boot (reached via `mapMMIO` from driver
+/// late-init — virtio-gpu binds inside the desktop task, after
+/// `boot_phase.markComplete()`). They modify EXISTING physmap entries, which
+/// peer CPUs may have cached, so the local `flushTLBGlobal()` isn't enough —
+/// broadcast a shootdown so every CPU drops the stale translation.
+///
+/// `shootdownAll(0)` runs in `.full` mode; because affected_pcid == 0 its peer
+/// handler toggles CR4.PGE (NOT a bare CR3 reload) so GLOBAL physmap/kernel
+/// entries are actually evicted — the bare reload would silently keep them.
+///
+/// During single-threaded boot this is a no-op: APs are parked in kernelIdle
+/// and have never touched these VAs, so the local flush suffices and we skip an
+/// IPI storm across every driver's boot-time mapMMIO. Gated on the boot-phase
+/// flag, NOT cpu_count — APs come online early in boot (see boot_phase.zig).
+///
+/// Precondition (met by the sole post-boot caller, driver init in task
+/// context): IRQs enabled and NO raw spinlock held across the call. doShootdown
+/// spins for peer IPI acks; a peer cli-spinning on a lock we hold would deadlock.
+fn shootdownIfPostBoot(comptime site: []const u8) void {
+    if (@import("../boot/boot_phase.zig").isComplete()) {
+        @import("../cpu/tlb.zig").shootdownAll(0);
+        debug.klog("[paging] {s}: post-boot kernel-master mutation — broadcast global TLB shootdown to all CPUs\n", .{site});
+    }
 }
 
 /// Phase 3: clear the low-identity slot (PML4[0]) in the kernel master.
@@ -705,7 +878,10 @@ fn splitToPte(virt: usize) ?*u64 {
         // PAT stays at bit 12 in both 1GB and 2MB pages; PS stays set since
         // the new 2MB PDEs are also leaves.
         const leaf_template = orig & ~PAGE_MASK_1G;
-        const new_pd_phys = pmm.allocFrame() orelse return null;
+        const new_pd_phys = pmm.allocFrame() orelse {
+            debug.klog("[paging] FATAL splitToPte: PMM OOM splitting 1GB at VA=0x{X} — guard/watch install will fail\n", .{virt});
+            return null;
+        };
         const new_pd: [*]u64 = @ptrFromInt(physToVirt(new_pd_phys));
         for (0..512) |i| {
             new_pd[i] = (gb_phys + @as(u64, @intCast(i)) * 0x200000) | leaf_template;
@@ -726,7 +902,10 @@ fn splitToPte(virt: usize) ?*u64 {
         const huge_phys = orig & PAGE_MASK_2M;
         const huge_pat = (orig >> 12) & 1;
         const leaf_template = (orig & ~PAGE_MASK_2M & ~PAGE_SIZE_FLAG & ~PAT_BIT_HUGE) | (huge_pat << 7);
-        const new_pt_phys = pmm.allocFrame() orelse return null;
+        const new_pt_phys = pmm.allocFrame() orelse {
+            debug.klog("[paging] FATAL splitToPte: PMM OOM splitting 2MB at VA=0x{X} — guard/watch install will fail\n", .{virt});
+            return null;
+        };
         const new_pt: [*]u64 = @ptrFromInt(physToVirt(new_pt_phys));
         for (0..512) |i| {
             new_pt[i] = (huge_phys + @as(u64, @intCast(i)) * 4096) | leaf_template;
@@ -753,7 +932,9 @@ fn splitToPte(virt: usize) ?*u64 {
 pub fn installGuardPage(virt: usize) bool {
     const pte = splitToPte(virt) orelse return false;
     pte.* &= ~PRESENT;
-    flushTLB();
+    // Kstack guard pages live in the global PML4[511] window — CR3 reload
+    // alone doesn't invalidate them.
+    flushTLBGlobal();
     return true;
 }
 
@@ -767,7 +948,8 @@ pub fn installGuardPage(virt: usize) bool {
 pub fn installWriteWatch(virt: usize) ?usize {
     const pte = splitToPte(virt) orelse return null;
     pte.* &= ~READ_WRITE;
-    flushTLB();
+    // Kdata-protected pages are global — CR3 reload doesn't reach them.
+    flushTLBGlobal();
     return virt & ~@as(usize, 0xFFF);
 }
 
@@ -841,8 +1023,19 @@ extern var __kdata_protected_end: u8;
 pub fn protectKdataInit() void {
     var page = @intFromPtr(&__kdata_protected_start);
     const end = @intFromPtr(&__kdata_protected_end);
+    var total: u32 = 0;
+    var failed: u32 = 0;
     while (page < end) : (page += 4096) {
-        _ = installWriteWatch(page);
+        total += 1;
+        if (installWriteWatch(page) == null) failed += 1;
+    }
+    // Boot-critical: kdata pages SHOULD be protected before any kernel code
+    // runs. Silent partial protection means wild writes go undetected against
+    // pages we thought were RO. Panic loudly so a future PMM-init bug that
+    // leaves us short of frames at this point is impossible to ignore.
+    if (failed != 0) {
+        debug.klog("[paging] FATAL protectKdataInit: {d}/{d} kdata pages failed to be marked RO — boot heap exhausted?\n", .{ failed, total });
+        @panic("protectKdataInit: kdata page protection install failed");
     }
 }
 

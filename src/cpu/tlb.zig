@@ -98,6 +98,22 @@ inline fn flushLocalTlb() void {
         ::: .{ .rax = true, .memory = true });
 }
 
+/// Full local flush INCLUDING global (PGE) entries — toggles CR4.PGE off
+/// then on. A plain `mov cr3,cr3` (flushLocalTlb) PRESERVES global entries,
+/// so it cannot evict a stale kernel-master / physmap translation. Required
+/// on peers (and the sender) for a `.full` shootdown whose target is a
+/// kernel-global mapping (signalled by current_pcid == 0). Mirrors
+/// paging.flushTLBGlobal(); kept inline here to avoid a paging<->tlb import.
+inline fn flushLocalTlbIncludingGlobal() void {
+    asm volatile (
+        \\ movq %%cr4, %%rcx
+        \\ movq %%rcx, %%rax
+        \\ btrq $7, %%rax
+        \\ movq %%rax, %%cr4
+        \\ movq %%rcx, %%cr4
+        ::: .{ .rax = true, .rcx = true, .memory = true });
+}
+
 inline fn pause() void {
     asm volatile ("pause");
 }
@@ -106,7 +122,11 @@ inline fn pause() void {
 /// the IPI handler (peers) and the sender's own post-broadcast flush.
 inline fn flushLocalForMode() void {
     switch (current_mode) {
-        .full => flushLocalTlb(),
+        // pcid == 0 marks a kernel-master mutation whose PTEs are GLOBAL
+        // (PGE); a CR3 reload preserves global entries, so toggle CR4.PGE to
+        // actually evict them. pcid != 0 (user AS, INVPCID absent) keeps
+        // globals — the cheaper CR3 reload is correct there.
+        .full => if (current_pcid == 0) flushLocalTlbIncludingGlobal() else flushLocalTlb(),
         .single_context => {
             // INVPCID type 1: flush all entries for `current_pcid` on this
             // CPU, even if it's not the loaded one. Other PCIDs survive.
@@ -171,7 +191,11 @@ fn doShootdown(mode: Mode, affected_pcid: u16, va: u64) void {
     // covered self too). Still bump the PCID gen counter so peers lazy-
     // flush again on their next CR3 load (belt-and-suspenders).
     var via_hypercall = false;
-    if ((mode == .full or mode == .single_context) and hyperv.hasHypercalls()) {
+    // Exclude kernel-global flushes (affected_pcid == 0): the per-address-
+    // space hypercall isn't guaranteed to evict GLOBAL translations on every
+    // VP. Force the IPI path below, which toggles CR4.PGE explicitly. (Moot on
+    // KVM — hasHypercalls() is false — but correct under Hyper-V.)
+    if ((mode == .full or mode == .single_context) and affected_pcid != 0 and hyperv.hasHypercalls()) {
         const cr3 = asm volatile ("movq %%cr3, %[ret]"
             : [ret] "=r" (-> u64),
         );
