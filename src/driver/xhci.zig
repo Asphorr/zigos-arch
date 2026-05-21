@@ -1766,6 +1766,8 @@ fn processMouseReport(data: [*]volatile const u8) void {
             ady *= 2;
         }
 
+        mouse.raw_dx +%= adx;
+        mouse.raw_dy +%= ady;
         mouse.x += adx;
         mouse.y += ady;
         if (mouse.x < 0) mouse.x = 0;

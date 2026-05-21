@@ -18,6 +18,13 @@ pub var accum_dx: i32 = 0;
 pub var accum_dy: i32 = 0;
 pub var prev_accum_x: i32 = 640;
 pub var prev_accum_y: i32 = 360;
+
+// Raw, pre-clamp relative motion accumulated by the HID/PS2 mouse drivers and
+// drained by desktop.getMouseRelative into the per-app FPS delta channel
+// (buf[3..4]). Kept separate from the screen-clamped absolute x/y so mouse-
+// look doesn't saturate to 0 when the visible cursor pins to a screen edge.
+pub var raw_dx: i32 = 0;
+pub var raw_dy: i32 = 0;
 // Accumulated scroll-wheel notches since last consumer read.
 // Positive = wheel-up (scroll content down / view earlier history).
 // Consumer (desktop.handleMouseEvents) reads then resets to 0.
@@ -285,6 +292,8 @@ fn processPacket() void {
         dy *= 2;
     }
 
+    raw_dx +%= dx;
+    raw_dy -%= dy; // PS/2 dy is up-positive; match the screen's down-positive y
     x += dx;
     y -= dy;
     if (x < 0) x = 0;
@@ -354,6 +363,8 @@ fn processSynapticsPacket() void {
                     dx *= 2;
                     dy *= 2;
                 }
+                raw_dx +%= dx;
+                raw_dy +%= dy;
                 x += dx;
                 y += dy;
                 if (x < 0) x = 0;

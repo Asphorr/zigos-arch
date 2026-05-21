@@ -1825,6 +1825,17 @@ fn restoreCornerPixels(x: i32, y: i32, w: u32, h: u32, border_color: u32) void {
 
 // --- Cursor ---
 
+/// Software-cursor visibility gate. The SW cursor is stamped into the
+/// framebuffer only when there's no HW cursor AND the focused app hasn't
+/// requested cursor-hide (DOOM/Quake fullscreen call setCursorVisible(false)).
+/// Mirrors the gate in renderFrame (search: `app_hides`) so the main-loop fast
+/// paths can't drift from it and re-stamp a frozen cursor over a fullscreen
+/// game. Erase sites stay gated on `!use_hw_cursor` alone so a cursor drawn
+/// before the hide still gets cleaned up.
+fn swCursorActive(use_hw_cursor: bool) bool {
+    return !use_hw_cursor and !(slot_used[wm.focused] and windows[wm.focused].cursor_hidden_by_app);
+}
+
 var cursor_save_buf: [CURSOR_W * CURSOR_H]u32 = [_]u32{0} ** (CURSOR_W * CURSOR_H);
 
 fn eraseCursor() void {
@@ -3315,7 +3326,7 @@ pub fn run() void {
                             const uy: u32 = @intCast(ry);
                             if (!use_hw_cursor) eraseCursor();
                             gfx.blitRectToScreen(if (cw.x < 0) 0 else @intCast(cw.x), uy, cw.width, FONT_H);
-                            if (!use_hw_cursor) drawCursorOnScreen();
+                            if (swCursorActive(use_hw_cursor)) drawCursorOnScreen();
                             // Partial flush: just the text row band
                             if (vgpu.active) vgpu.flushRect(0, uy, gfx.screen_w, FONT_H);
                             // Mode 9: terminal row → compositor.
@@ -3326,7 +3337,7 @@ pub fn run() void {
                         renderWindow(wm.focused);
                         if (!use_hw_cursor) eraseCursor();
                         blitWindowBounds(wm.focused);
-                        if (!use_hw_cursor) drawCursorOnScreen();
+                        if (swCursorActive(use_hw_cursor)) drawCursorOnScreen();
                         // Flush window region
                         if (vgpu.active) {
                             const wy: u32 = if (cw.y < 0) 0 else @intCast(cw.y);
@@ -3340,7 +3351,7 @@ pub fn run() void {
                 .cursor_only => {
                     if (!use_hw_cursor) {
                         eraseCursor();
-                        drawCursorOnScreen();
+                        if (swCursorActive(use_hw_cursor)) drawCursorOnScreen();
                         // Software cursor: flush cursor bands
                         if (vgpu.active) vgpu.flush();
                     }
@@ -3350,7 +3361,7 @@ pub fn run() void {
             }
         } else if (dirty != .none) {
             renderScene();
-            if (!use_hw_cursor) drawCursorOnScreen();
+            if (swCursorActive(use_hw_cursor)) drawCursorOnScreen();
             if (vgpu.active) vgpu.flush();
         }
 
@@ -3832,13 +3843,21 @@ pub fn popCharEvent(pid: u8) ?u8 {
 }
 
 pub fn getMouseRelative(pid: u8, buf: [*]u32) void {
-    // Update delta accumulator from current position
-    const dx = mouse.x - mouse.prev_accum_x;
-    const dy = mouse.y - mouse.prev_accum_y;
-    mouse.accum_dx += dx;
-    mouse.accum_dy += dy;
-    mouse.prev_accum_x = mouse.x;
-    mouse.prev_accum_y = mouse.y;
+    // Pull true relative motion from the driver's pre-clamp accumulator
+    // (mouse.raw_dx/dy) rather than diffing the screen-clamped cursor
+    // position. The old `mouse.x - prev_accum_x` form saturated to 0 the
+    // instant the visible cursor pinned to a screen edge, which froze FPS
+    // mouse-look mid-turn (the "move right, cursor leaves the window, can't
+    // keep turning" bug — hit by both Quake and DOOM). The absolute clamp on
+    // mouse.x/y still governs the visible cursor + desktop hit-testing; it just
+    // no longer bounds the relative channel apps read from buf[3..4]. NOTE:
+    // unbounded turning also needs a relative input device (usb-mouse) + a
+    // pointer grab — an absolute usb-tablet can't supply it. See
+    // run-uefi-ext2-iommu-game.sh.
+    mouse.accum_dx += mouse.raw_dx;
+    mouse.accum_dy += mouse.raw_dy;
+    mouse.raw_dx = 0;
+    mouse.raw_dy = 0;
 
     for (z_stack[0..wm.z_count]) |i| {
         if (windows[i].owner_pid == pid and windows[i].visible) {
