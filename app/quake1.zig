@@ -27,6 +27,58 @@ const WIN_H: u32 = Q_HEIGHT * SCALE;
 var fb: [*]volatile u32 = undefined;
 var start_ticks: u32 = 0;
 
+// Dynamic present geometry — supports the compositor's grow-FB fullscreen
+// (F10). The window FB can be grown past WIN_W×WIN_H; we re-fetch the
+// allocation stride + visible size each frame and integer-scale Q1's fixed
+// 320×200 render to fill the visible region (centered, letterboxed). Q1's
+// internal resolution stays 320×200 — fullscreen is a bigger nearest-neighbor
+// upscale, not more detail.
+var fb_stride: u32 = WIN_W; // pixels per row in `fb` (== getWindowAlloc().w)
+var vis_w: u32 = WIN_W; // visible window width  (getWindowSize().w)
+var vis_h: u32 = WIN_H; // visible window height
+var blit_scale: u32 = SCALE; // integer 320×200 → visible scale factor
+var blit_off_x: u32 = 0; // centering offset, px
+var blit_off_y: u32 = 0;
+var last_vis_w: u32 = 0; // change-detection cache
+var last_vis_h: u32 = 0;
+var last_stride: u32 = 0;
+
+// Re-fetch window geometry and, if it changed (e.g. F10 maximize grew the
+// FB), recompute the integer scale + centering and clear the whole FB to
+// black once so the letterbox margins stay clean. `getWindowAlloc` also
+// opts this window into the compositor's grow-on-maximize path.
+fn recomputeLayout() void {
+    const a = libc.getWindowAlloc();
+    const s = libc.getWindowSize();
+    if (a.w == 0 or s.w == 0 or s.h == 0) return; // not ready; keep last good
+    if (s.w == last_vis_w and s.h == last_vis_h and a.w == last_stride) return;
+    last_vis_w = s.w;
+    last_vis_h = s.h;
+    last_stride = a.w;
+
+    fb_stride = a.w;
+    vis_w = s.w;
+    vis_h = s.h;
+
+    const sx = vis_w / Q_WIDTH;
+    const sy = vis_h / Q_HEIGHT;
+    var sc = if (sx < sy) sx else sy;
+    if (sc < 1) sc = 1;
+    blit_scale = sc;
+
+    const scaled_w = Q_WIDTH * sc;
+    const scaled_h = Q_HEIGHT * sc;
+    blit_off_x = if (vis_w > scaled_w) (vis_w - scaled_w) / 2 else 0;
+    blit_off_y = if (vis_h > scaled_h) (vis_h - scaled_h) / 2 else 0;
+
+    // One-time clear of the full allocation (covers the visible region +
+    // any letterbox margins). The game overwrites the centered rect every
+    // frame; margins stay black.
+    const total: usize = @as(usize, a.w) * @as(usize, a.h);
+    var i: usize = 0;
+    while (i < total) : (i += 1) fb[i] = 0xFF000000;
+}
+
 // C globals exported by sys_zigos.c / screen.c
 const Viddef = extern struct {
     buffer: ?[*]u8,
@@ -272,11 +324,11 @@ fn rebuildPaletteLut() void {
     palette_lut_built = true;
 }
 
-// Called from sys_zigos.c VID_Update. Expands the 320x200 8bpp palettized
-// `vid.buffer` to our 640x400 RGBA window FB (nearest-neighbor 2× scale),
-// then presents. Q1's "dirty" optimization (vrect_t list) is ignored —
-// the rect tracking is fine-grained but our compositor presents whole
-// windows, so a full blit is cheaper than walking N rects.
+// Called from sys_zigos.c VID_Update. Expands the 320×200 8bpp palettized
+// `vid.buffer` into the window FB with an integer scale + centering that
+// adapts to the current (possibly grown-for-fullscreen) window size. Q1's
+// "dirty" optimization (vrect_t list) is ignored — our compositor presents
+// whole windows, so a full blit is cheaper than walking N rects.
 export fn zq_present() void {
     // VID_SetPalette / VID_ShiftPalette toggle zq_dirty. Rebuild LUT once
     // per palette change, not per frame.
@@ -284,21 +336,25 @@ export fn zq_present() void {
         rebuildPaletteLut();
         zq_dirty = 0;
     }
+    recomputeLayout();
     const src = vid.buffer orelse return;
-    // 2× nearest-neighbor expand into the output FB.
+    const sc = blit_scale;
+    const stride = fb_stride;
+    // Nearest-neighbor expand by `sc`, placed at (blit_off_x, blit_off_y).
     var y: u32 = 0;
     while (y < Q_HEIGHT) : (y += 1) {
         const src_row = y * Q_WIDTH;
-        const dst_row_a = (y * SCALE) * WIN_W;
-        const dst_row_b = dst_row_a + WIN_W;
+        const blk_y = blit_off_y + y * sc;
         var x: u32 = 0;
         while (x < Q_WIDTH) : (x += 1) {
             const px = palette_lut[src[src_row + x]];
-            const dx = x * SCALE;
-            fb[dst_row_a + dx] = px;
-            fb[dst_row_a + dx + 1] = px;
-            fb[dst_row_b + dx] = px;
-            fb[dst_row_b + dx + 1] = px;
+            const blk_x = blit_off_x + x * sc;
+            var ry: u32 = 0;
+            while (ry < sc) : (ry += 1) {
+                const drow = (blk_y + ry) * stride + blk_x;
+                var rx: u32 = 0;
+                while (rx < sc) : (rx += 1) fb[drow + rx] = px;
+            }
         }
     }
     libc.present();
@@ -317,6 +373,9 @@ export fn _start() linksection(".text.entry") callconv(.c) void {
     };
     fb = win.fb;
     libc.setCursorVisible(false);
+    // Opt into the compositor's grow-on-maximize (F10) path. zq_present's
+    // recomputeLayout re-fetches the allocation each frame and rescales.
+    _ = libc.getWindowAlloc();
 
     var argv = [_][*:0]u8{
         @ptrCast(@constCast("quake")),
@@ -1254,12 +1313,13 @@ export fn atoi(s: ?[*:0]const u8) c_int {
 }
 
 export fn atof(s: ?[*:0]const u8) f64 {
-    // Original integer-loop formulation (`val = val*10 + @floatFromInt(str[i]-'0')`)
-    // miscompiled under Zig 0.15.2 ReleaseSafe: the inner `@floatFromInt` returned
-    // the raw byte (e.g. atof("544") -> 53.0 = '5'), so info_player_start origin
-    // "544 288 32" parsed as (53, 50, 51) and Quake's player spawned outside the
-    // map. Caught 2026-05-21. Use an explicit u32 accumulator + one @floatFromInt
-    // at the end — pattern that survives the codegen path used by atoi.
+    // Build the float value DIRECTLY in a f64 accumulator using `val * 10 + digit_f`
+    // where digit_f is a lookup table from byte -> f64. Avoids any @floatFromInt
+    // of a runtime integer because Zig 0.15.2 ReleaseSafe miscompiles BOTH
+    // `@floatFromInt(str[i] - '0')` AND `@floatFromInt(u64_accumulator)` — the
+    // u64-accumulator form used the LLVM `punpckldq+subpd` u64→f64 idiom and
+    // somehow still returned `(double)str[0]`. Lookup table dodges the whole
+    // builtin path. Caught 2026-05-21.
     if (s == null) return 0.0;
     const str = s.?;
     var i: usize = 0;
@@ -1270,25 +1330,21 @@ export fn atof(s: ?[*:0]const u8) f64 {
         i += 1;
     } else if (str[i] == '+') i += 1;
 
-    var int_acc: u64 = 0;
+    const digit_f = [_]f64{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 };
+
+    var val: f64 = 0.0;
     while (str[i] >= '0' and str[i] <= '9') {
-        const digit: u8 = str[i] - '0';
-        int_acc = int_acc * 10 + @as(u64, digit);
+        val = val * 10.0 + digit_f[str[i] - '0'];
         i += 1;
     }
-    var val: f64 = @as(f64, @floatFromInt(int_acc));
-
     if (str[i] == '.') {
         i += 1;
-        var frac_acc: u64 = 0;
         var frac_div: f64 = 1.0;
         while (str[i] >= '0' and str[i] <= '9') {
-            const digit: u8 = str[i] - '0';
-            frac_acc = frac_acc * 10 + @as(u64, digit);
             frac_div *= 10.0;
+            val += digit_f[str[i] - '0'] / frac_div;
             i += 1;
         }
-        val += @as(f64, @floatFromInt(frac_acc)) / frac_div;
     }
     return if (neg) -val else val;
 }

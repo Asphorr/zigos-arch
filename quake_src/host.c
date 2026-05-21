@@ -940,6 +940,12 @@ void Host_Init (quakeparms_t *parms)
 
 	Cbuf_InsertText ("exec quake.rc\n");
 
+	// ZigOS: modern WASD movement defaults. Appended (not inserted) AFTER
+	// the quake.rc exec — which chains default.cfg + config.cfg — so these
+	// run LAST in the command buffer and win. Classic 1996 default.cfg only
+	// binds the arrow keys for movement; the arrow binds are untouched.
+	Cbuf_AddText ("bind w \"+forward\"\nbind s \"+back\"\nbind a \"+moveleft\"\nbind d \"+moveright\"\n");
+
 	Hunk_AllocName (0, "-HOST_HUNKLEVEL-");
 	host_hunklevel = Hunk_LowMark ();
 
