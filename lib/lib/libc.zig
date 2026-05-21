@@ -307,6 +307,15 @@ pub fn getWindowSize() WindowSize {
     return .{ .w = buf[0], .h = buf[1] };
 }
 
+pub const WindowAlloc = struct { w: u32, h: u32 };
+/// Current framebuffer allocation (stride width, rows). May GROW past the
+/// requested size on F10 maximize; re-fetch on `.resize` and use `w` as stride.
+pub fn getWindowAlloc() WindowAlloc {
+    var buf: [2]u32 align(4) = undefined;
+    _ = syscall(112, @truncate(@intFromPtr(&buf)), 0);
+    return .{ .w = buf[0], .h = buf[1] };
+}
+
 // --- Bump allocator ---
 
 var heap_base: usize = 0;

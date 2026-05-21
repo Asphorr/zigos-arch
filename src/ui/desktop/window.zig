@@ -161,6 +161,12 @@ pub const Window = struct {
     gui_h: u32 = 0,
     gui_alloc_w: u32 = 0,
     gui_alloc_h: u32 = 0,
+    /// Opt-in for F10 grow-on-maximize (desktop.growGuiFb). Set true the first
+    /// time the app queries sysGetWindowAlloc — i.e. it knows to re-fetch its
+    /// stride on a `.resize`. Until then growGuiFb leaves the FB alone and the
+    /// compositor upscales, so fixed-size / non-resize apps (doom, quake, the
+    /// vulkan demos, sysmon, …) keep working unchanged on F10.
+    fb_growable: bool = false,
     gui_present_pending: bool = false,
     /// Tick of the last auto-refresh fallback that marked this window
     /// for re-composite. The compositor's auto-refresh path (for apps

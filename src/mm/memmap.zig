@@ -110,7 +110,11 @@ pub const UEFI_PT_SIZE: usize = 0x40000; // 256 KB
 
 // GUI framebuffers are PMM-allocated per window now (sysCreateWindow).
 // Only the per-window size cap remains.
-pub const GUI_FB_PER_PID_SIZE: usize = 0x400000; // 4 MB max per window
+// 10 MB max per window. Initial allocations stay small (apps request their
+// window size, still bounded by GUI_MAX_SIZE = 8 MB in sysCreateWindow); the
+// extra headroom is for F10 grow-on-maximize (desktop.growGuiFb), which only
+// the maximized window pays — a full 1920×1080 RGBA buffer is ~8.3 MB.
+pub const GUI_FB_PER_PID_SIZE: usize = 0xA00000;
 
 // --- User-space layout (per-process) ---
 // USER_SPACE_START sits N pages below USER_VA_FLOOR so the user stack

@@ -70,6 +70,7 @@ export fn _start() linksection(".text.entry") callconv(.c) void {
     alloc_w = win.alloc_w; // libc may have rounded up to 16-px stride
     alloc_h = win.alloc_h;
     var canvas = gfx.Canvas.init(win.fb, alloc_w, alloc_h);
+    _ = libc.getWindowAlloc(); // opt this window into F10 grow-on-maximize (re-fetched in .resize)
 
     var needs_redraw: bool = true;
 
@@ -132,6 +133,16 @@ export fn _start() linksection(".text.entry") callconv(.c) void {
                     }
                 },
                 .resize => {
+                    // F10 maximize may have GROWN our framebuffer past the
+                    // alloc we requested. Re-fetch and rebuild the canvas at
+                    // the new stride before clamping/laying out (FB ptr is
+                    // unchanged) so we render crisply instead of upscaled.
+                    const wa = libc.getWindowAlloc();
+                    if (wa.w != 0 and (wa.w != alloc_w or wa.h != alloc_h)) {
+                        alloc_w = wa.w;
+                        alloc_h = wa.h;
+                        canvas = gfx.Canvas.init(win.fb, alloc_w, alloc_h);
+                    }
                     const new_w = @min(ev.a, alloc_w);
                     const new_h = @min(ev.b, alloc_h);
                     if (new_w != vis_w or new_h != vis_h) {

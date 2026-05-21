@@ -93,6 +93,7 @@ export fn _start() linksection(".text.entry") callconv(.c) void {
     ed_alloc_w = win.alloc_w;
     ed_alloc_h = win.alloc_h;
     var canvas = gfx.Canvas.init(win.fb, ed_alloc_w, ed_alloc_h);
+    _ = libc.getWindowAlloc(); // opt this window into F10 grow-on-maximize (re-fetched in .resize)
     fa.ensureLoaded();
     layoutScrollbar();
 
@@ -121,6 +122,16 @@ export fn _start() linksection(".text.entry") callconv(.c) void {
             switch (ev.kindOf()) {
                 .close_request => should_quit = true,
                 .resize => {
+                    // F10 maximize may have GROWN our framebuffer past the
+                    // alloc we requested. Re-fetch and rebuild the canvas at
+                    // the new stride before clamping/laying out (FB ptr is
+                    // unchanged) so we render crisply instead of upscaled.
+                    const wa = libc.getWindowAlloc();
+                    if (wa.w != 0 and (wa.w != ed_alloc_w or wa.h != ed_alloc_h)) {
+                        ed_alloc_w = wa.w;
+                        ed_alloc_h = wa.h;
+                        canvas = gfx.Canvas.init(win.fb, ed_alloc_w, ed_alloc_h);
+                    }
                     const new_w = @min(ev.a, ed_alloc_w);
                     const new_h = @min(ev.b, ed_alloc_h);
                     if (new_w != win_w or new_h != win_h) {

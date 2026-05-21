@@ -702,6 +702,152 @@ fn closeWindow(idx: u8) void {
     startAnimation(idx, .closing);
 }
 
+/// Grow window `idx`'s GUI framebuffer so the app can render crisply at
+/// `need_w × need_h` content pixels instead of being upscaled from a smaller
+/// allocation. GROW-only (the bigger block is kept until the window closes);
+/// returns true once the FB covers need_w/need_h.
+///
+/// Runs in the DESKTOP TASK, sequential with renderScene — so there is no
+/// render-vs-free race on the front buffer (the dangerous case an app-side
+/// realloc syscall would have). Mirrors sysCreateWindow's legacy PMM path +
+/// unmapGuiFB teardown:
+///   1. alloc + zero a new contiguous block;
+///   2. map the GROWTH pages first (only these can fail on PT-OOM → clean
+///      abort, live mapping untouched), then overwrite the existing
+///      [0,old_pages) PTEs in place (no unmapped gap → an app mid-write on
+///      another CPU can't fault on GUI_FB_BASE);
+///   3. shoot down the app's PCID so no CPU can still reach the old frames
+///      (relies on the 2026-05-21 global-flush shootdown fix);
+///   4. NULL the front + drain in-flight present snapshots, repoint the window,
+///      then drop the old block's two refcounts + free its back buffers.
+/// The app learns the new stride via sysGetWindowAlloc on the `.resize` event
+/// toggleFullscreen pushes right after.
+fn growGuiFb(idx: u8, need_w: u32, need_h: u32) bool {
+    const w = &windows[idx];
+    if (w.gpu_slot != null) return false; // GPU path scales via the compositor
+    // Opt-in: only grow for apps that have queried getWindowAlloc and thus know
+    // to re-fetch their stride on the resize event. Everything else keeps the
+    // upscale fallback (no stride change → no shear/blank regression).
+    if (!w.fb_growable) return false;
+    const fb_kv = w.gui_fb orelse return false;
+    const pid = w.owner_pid;
+    if (pid >= process.procs.len) return false;
+
+    const new_alloc_w: u32 = (need_w + 15) & ~@as(u32, 15); // 16-px stride
+    const new_alloc_h: u32 = need_h;
+    // Already big enough — just adopt the new logical content size.
+    if (new_alloc_w <= w.gui_alloc_w and new_alloc_h <= w.gui_alloc_h) {
+        w.gui_w = need_w;
+        w.gui_h = need_h;
+        return true;
+    }
+    const new_bytes: u64 = @as(u64, new_alloc_w) * new_alloc_h * 4;
+    if (new_bytes > @import("../mm/memmap.zig").GUI_FB_PER_PID_SIZE) return false;
+    const new_pages: u32 = @intCast((new_bytes + 4095) / 4096);
+    const old_bytes: u64 = @as(u64, w.gui_alloc_w) * w.gui_alloc_h * 4;
+    const old_pages: u32 = @intCast((old_bytes + 4095) / 4096);
+    const old_phys = paging.virtToPhys(@intFromPtr(fb_kv)) orelse return false;
+
+    const new_phys = pmm.allocContiguous(new_pages) orelse {
+        debug.klog("[maximize] growGuiFb pid={d}: allocContiguous({d} pages) failed; staying {d}x{d}\n", .{ pid, new_pages, w.gui_alloc_w, w.gui_alloc_h });
+        return false;
+    };
+    const new_kv: [*]volatile u32 = @ptrFromInt(paging.physToVirt(new_phys));
+    @memset(@as([*]volatile u8, @ptrCast(new_kv))[0 .. new_pages * 4096], 0);
+
+    const pd: [*]align(4096) u64 = @ptrFromInt(paging.physToVirt(process.procs[pid].page_dir_phys));
+    const base = paging.GUI_FB_USER_BASE;
+    const map_flags = paging.READ_WRITE | paging.USER;
+
+    // Growth pages first — the only ones that can need (and fail to get) a new
+    // page-table page. On failure the live [0,old_pages) mapping is untouched.
+    var i: u32 = old_pages;
+    while (i < new_pages) : (i += 1) {
+        vmm.mapUserPage(pd, base + i * 4096, new_phys + i * 4096, map_flags) catch {
+            var j: u32 = old_pages;
+            while (j < i) : (j += 1) {
+                _ = vmm.unmapUserPage(pd, base + j * 4096);
+                pmm.releaseFrame(new_phys + j * 4096);
+            }
+            pmm.freeContiguous(new_phys, new_pages);
+            debug.klog("[maximize] growGuiFb pid={d}: PT OOM at growth page {d}; aborted\n", .{ pid, i });
+            return false;
+        };
+        pmm.acquireFrame(new_phys + i * 4096);
+    }
+    // Repoint the existing [0,old_pages) mapping. mapUserPage refuses to
+    // overwrite a PTE that points at a different phys (vmm gap #2 →
+    // error.AlreadyMapped), so clear each PTE first. unmapUserPage only zeroes
+    // the PTE (no releaseFrame), so the old frame's refcount is left intact for
+    // the explicit double-release below. The PT page for this VA already exists
+    // (the old FB mapped it), so the subsequent map cannot fail.
+    //
+    // The one-page-wide gap between unmap and map is safe here: F10 is handled
+    // by the desktop task while the app sits parked in its event loop (not
+    // writing its FB). An app that renders continuously would want a
+    // force-overwrite mapUserPage variant to close the gap entirely.
+    i = 0;
+    while (i < old_pages) : (i += 1) {
+        _ = vmm.unmapUserPage(pd, base + i * 4096);
+        vmm.mapUserPage(pd, base + i * 4096, new_phys + i * 4096, map_flags) catch |e| {
+            debug.klog("[maximize] growGuiFb pid={d}: in-place remap page {d} failed: {s}\n", .{ pid, i, @errorName(e) });
+            @panic("growGuiFb in-place remap (PT page should already exist)");
+        };
+        pmm.acquireFrame(new_phys + i * 4096);
+    }
+    // Old frames are now unreachable from the app once its TLB is flushed.
+    @import("../cpu/tlb.zig").shootdownAll(process.procs[pid].pcid);
+
+    // Repoint the window. NULL the front AND the stale back-buffer pointers
+    // first (they point at the OLD, smaller, about-to-be-freed blocks), THEN
+    // drain in-flight present snapshots, THEN publish the new geometry — the
+    // ordering reclaimBackBuffers uses. The backs MUST be nulled before
+    // gui_fb_pixels grows and gui_fb is re-published: otherwise the next
+    // snapshotGuiFb sees them non-null, skips realloc, and memcpys the new
+    // (larger) pixel count into a small freed back buffer → overflow + panic in
+    // sysPresent. Nulling forces a lazy realloc at the new size.
+    var old_back_phys: [3]usize = .{ 0, 0, 0 };
+    w.gui_fb = null;
+    w.has_presented = false;
+    {
+        var s: u8 = 0;
+        while (s < 3) : (s += 1) {
+            w.gui_fb_backs[s] = null;
+            old_back_phys[s] = paging.takeGuiFbBackPhys(pid, s);
+        }
+    }
+    var spin: u32 = 0;
+    while (@atomicLoad(u32, &presenting_count, .acquire) > 0) {
+        asm volatile ("pause");
+        spin += 1;
+        if (spin > 10_000_000) break;
+    }
+    w.gui_fb_pixels = @intCast(@as(u64, new_alloc_w) * new_alloc_h);
+    w.gui_alloc_w = new_alloc_w;
+    w.gui_alloc_h = new_alloc_h;
+    w.gui_w = need_w;
+    w.gui_h = need_h;
+    w.gui_fb_pub.store(0, .release);
+    paging.registerGuiFB(pid, new_phys);
+    w.gui_fb = new_kv;
+
+    // Free the OLD block: front frames carry two refs (alloc + acquire) — drop
+    // both; each old back buffer (phys taken above) is a single-owner block.
+    i = 0;
+    while (i < old_pages) : (i += 1) {
+        pmm.releaseFrame(old_phys + i * 4096);
+        pmm.releaseFrame(old_phys + i * 4096);
+    }
+    {
+        var s: u8 = 0;
+        while (s < 3) : (s += 1) {
+            if (old_back_phys[s] != 0) pmm.freeContiguous(old_back_phys[s], old_pages);
+        }
+    }
+    debug.klog("[maximize] grew pid={d} FB -> {d}x{d} ({d} pages, was {d} pages)\n", .{ pid, new_alloc_w, new_alloc_h, new_pages, old_pages });
+    return true;
+}
+
 fn toggleFullscreen(idx: u8) void {
     if (idx >= MAX_WINDOWS or !slot_used[idx]) return;
     const w = &windows[idx];
@@ -724,6 +870,9 @@ fn toggleFullscreen(idx: u8) void {
             w.gui_w = w.saved_w;
             w.gui_h = w.saved_h -| TITLEBAR_H;
         }
+        // Notify the app of the restored size. It keeps the grown FB (we don't
+        // shrink it for now) and renders a sub-region at the same stride.
+        w.events.push(.{ .kind = @intFromEnum(EventKind.resize), .a = w.saved_w, .b = w.saved_h });
     } else {
         // Enter maximize — fill the entire area between menubar and
         // dock. Keep window chrome (titlebar + traffic-light buttons)
@@ -761,9 +910,14 @@ fn toggleFullscreen(idx: u8) void {
         // getWindowSize() (already returns w.width/height) and repaints
         // to fill the expanded gui_fb region within its alloc cap.
         if (w.gui_fb != null) {
-            w.gui_w = target_w;
-            w.gui_h = target_h -| TITLEBAR_H;
+            // Grow the app's framebuffer to the maximized content size so it
+            // can repaint crisply (falls back to upscaling if the bigger
+            // contiguous block can't be allocated). Sets gui_w/gui_h.
+            _ = growGuiFb(idx, target_w, target_h -| TITLEBAR_H);
         }
+        // Notify the app: it re-fetches the (grown) alloc via getWindowAlloc and
+        // repaints at the new size. Payload matches the drag-resize convention.
+        w.events.push(.{ .kind = @intFromEnum(EventKind.resize), .a = target_w, .b = target_h });
     }
 }
 
@@ -1027,6 +1181,50 @@ fn roundSmallCorners(x: i32, y: i32, w: u32, h: u32, bg: u32) void {
     gfx.putPixel(right, bot - 1, bg);
 }
 
+// ─── Window drop-shadow geometry ────────────────────────────────────────────
+// A soft "elevation" shadow on ALL FOUR sides, biased downward so the bottom
+// reads heavier than the top (key light from above) — the macOS/material look,
+// not the old right+bottom-only drop shadow. Shared by renderWindow (the blend),
+// the dirty-rect, and the z-occlusion test so all three agree on the extent.
+//
+//   SHADOW_R    — reach in px beyond the window border (corners included)
+//   SHADOW_OFFY — downward offset of the shadow caster; the bottom gains +OFFY
+//                 of reach, the top loses OFFY of contact strength
+//   SHADOW_PEAK — max alpha byte at contact (~13%); low enough that windows feel
+//                 lifted (not glued) and stacked shadows don't muddy into black
+const SHADOW_R = 22;
+const SHADOW_OFFY = 6;
+const SHADOW_PEAK = 0x22;
+// One symmetric pad that over-covers the (asymmetric) shadow on every side —
+// used by the dirty-rect and the occlusion test. Over-covering is harmless
+// (a few extra wallpaper px get repainted/flushed); under-covering smears.
+const SHADOW_SPAD: i32 = SHADOW_R + SHADOW_OFFY + @as(i32, BORDER) + 2;
+
+// Precomputed at COMPILE time: shadow_lut[dy][dx] = alpha byte for a pixel that
+// is (dx, dy) px from the (offset) window rect. Euclidean distance → naturally
+// round corners; (1 − smoothstep) falloff → soft shoulder near the window and a
+// clean vanish at the rim (no hard cut line). Building it at comptime keeps the
+// runtime hot path free of sqrt/float, both slow-or-broken on the freestanding-
+// baseline target (see the @floatFromInt / @floor freestanding gotchas).
+const shadow_lut: [SHADOW_R + 1][SHADOW_R + 1]u8 = blk: {
+    @setEvalBranchQuota(10000);
+    var lut: [SHADOW_R + 1][SHADOW_R + 1]u8 = [_][SHADOW_R + 1]u8{[_]u8{0} ** (SHADOW_R + 1)} ** (SHADOW_R + 1);
+    const r: f64 = SHADOW_R;
+    for (0..SHADOW_R + 1) |dy| {
+        for (0..SHADOW_R + 1) |dx| {
+            const fx: f64 = @floatFromInt(dx);
+            const fy: f64 = @floatFromInt(dy);
+            const dist = @sqrt(fx * fx + fy * fy);
+            if (dist < r) {
+                const t = dist / r; // 0 at contact … 1 at the rim
+                const fall = 1.0 - (3.0 * t * t - 2.0 * t * t * t); // 1 − smoothstep
+                lut[dy][dx] = @intFromFloat(fall * @as(f64, SHADOW_PEAK));
+            }
+        }
+    }
+    break :blk lut;
+};
+
 /// Re-render every visible window above `target` in z-order whose outer
 /// rect (including shadow) overlaps `target`. Called from partial-render
 /// paths (`.gui_only`) after the target window has been stamped into the
@@ -1034,16 +1232,15 @@ fn roundSmallCorners(x: i32, y: i32, w: u32, h: u32, bg: u32) void {
 /// neighbors in the overlap region because renderWindow doesn't itself
 /// know about stacking order.
 ///
-/// Shadow alpha is included by widening the overlap test on the lower
-/// + right edges by the SHADOW_W constant (16) used in renderWindow.
+/// The shadow is now all-around (see SHADOW_* above), so the overlap test is
+/// widened by SHADOW_SPAD on EVERY side, not just lower+right.
 fn repaintZAboveOverlapping(target: u8) void {
     if (target >= MAX_WINDOWS or !slot_used[target]) return;
     const t = &windows[target];
-    const SHADOW_PAD: i32 = 16;
-    const t_left: i32 = t.x - @as(i32, BORDER);
-    const t_top: i32 = t.y - @as(i32, BORDER);
-    const t_right: i32 = t.x + @as(i32, @intCast(t.width)) + @as(i32, BORDER) + SHADOW_PAD;
-    const t_bot: i32 = t.y + @as(i32, @intCast(t.height)) + @as(i32, BORDER) + SHADOW_PAD;
+    const t_left: i32 = t.x - SHADOW_SPAD;
+    const t_top: i32 = t.y - SHADOW_SPAD;
+    const t_right: i32 = t.x + @as(i32, @intCast(t.width)) + SHADOW_SPAD;
+    const t_bot: i32 = t.y + @as(i32, @intCast(t.height)) + SHADOW_SPAD;
 
     var zi: u8 = 0;
     while (zi < wm.z_count and z_stack[zi] != target) : (zi += 1) {}
@@ -1053,10 +1250,10 @@ fn repaintZAboveOverlapping(target: u8) void {
         const ai = z_stack[zi];
         const aw = &windows[ai];
         if (!aw.visible or aw.minimized) continue;
-        const a_left: i32 = aw.x - @as(i32, BORDER);
-        const a_top: i32 = aw.y - @as(i32, BORDER);
-        const a_right: i32 = aw.x + @as(i32, @intCast(aw.width)) + @as(i32, BORDER) + SHADOW_PAD;
-        const a_bot: i32 = aw.y + @as(i32, @intCast(aw.height)) + @as(i32, BORDER) + SHADOW_PAD;
+        const a_left: i32 = aw.x - SHADOW_SPAD;
+        const a_top: i32 = aw.y - SHADOW_SPAD;
+        const a_right: i32 = aw.x + @as(i32, @intCast(aw.width)) + SHADOW_SPAD;
+        const a_bot: i32 = aw.y + @as(i32, @intCast(aw.height)) + SHADOW_SPAD;
         const overlaps = a_right > t_left and a_left < t_right and a_bot > t_top and a_top < t_bot;
         if (!overlaps) continue;
         // Do NOT set shadow_dirty here. Re-blending the 7.8% alpha shadow
@@ -1086,75 +1283,61 @@ fn renderWindow(idx: u8) void {
     // at its own resolution (centered if alloc-capped) inside the
     // maximized window frame.
 
-    // Mark this window's region as dirty for partial GPU flush.
-    // Padding of 28 covers the 24-px soft shadow plus 1-px border plus
-    // a few pixels of slack on each side.
-    const dx: u32 = if (w.x < 0) 0 else @intCast(w.x);
-    const dy: u32 = if (w.y < 0) 0 else @intCast(w.y);
-    addDirtyRect(dx -| 1, dy -| 1, w.width + 28, w.height + 28);
+    // Mark this window's region (incl. the all-around soft shadow) dirty for
+    // partial GPU flush. SHADOW_SPAD pads every side; clamp the origin to the
+    // screen and let addDirtyRect clip the far edges.
+    const sx0: i32 = w.x - SHADOW_SPAD;
+    const sy0: i32 = w.y - SHADOW_SPAD;
+    const ddx: u32 = if (sx0 < 0) 0 else @intCast(sx0);
+    const ddy: u32 = if (sy0 < 0) 0 else @intCast(sy0);
+    const span: u32 = @intCast(2 * SHADOW_SPAD);
+    addDirtyRect(ddx, ddy, w.width + span, w.height + span);
 
     // Save corner pixels from back buffer BEFORE drawing (for transparent rounded corners)
     saveCornerPixels(w.x - @as(i32, BORDER), w.y - @as(i32, BORDER), w.width + BORDER * 2, w.height + BORDER * 2);
 
-    // Soft drop shadow — 16-step gaussian falloff for right + bottom edges
-    // plus a 2D corner blob at the bottom-right. Lower max alpha (~7.8%)
-    // and longer tail give a modern "lifted" feel rather than the old
-    // inky hard-edged shadow. Top + left intentionally have no shadow:
-    // we're going for macOS-style asymmetric drop shadow, not material-
-    // design all-around elevation.
+    // Soft "elevation" drop shadow on ALL FOUR sides, biased downward so the
+    // bottom reads heavier than the top (key light from above). The shadow is
+    // cast by the window+border rect shifted down by SHADOW_OFFY; per-pixel
+    // alpha comes from the comptime shadow_lut keyed by the (dx,dy) distance to
+    // that rect — Euclidean, so the corners round off naturally. See SHADOW_*.
     //
-    // Gated on `w.shadow_dirty` so content-only redraws don't re-blend
-    // over the previous frame's shadow (which would accumulate to black
-    // after ~30 frames on a 60fps app like sysmon).
-    if (w.shadow_dirty) shadow_blk: {
-    const wx_r: i32 = w.x + @as(i32, @intCast(w.width));
-    const wy_b: i32 = w.y + @as(i32, @intCast(w.height));
-    // 24-step two-tier falloff. Inner 8 px are the "core" shadow (close
-    // contact, fairly visible — peak ~9.4%). Middle 8 px soften to a
-    // half-strength haze. Outer 8 px stretch out a long, very-faint
-    // tail (≤2%) so the window feels lifted rather than glued to the
-    // wallpaper. Same asymmetric layout as before (bottom + right only).
-    const SHADOW_W: u32 = 24;
-    const SHADOW_MAX: u32 = 0x18;
-    const shadow_alphas = [SHADOW_W]u8{
-        // inner (close contact)
-        0x18, 0x16, 0x14, 0x12, 0x10, 0x0E, 0x0C, 0x0A,
-        // mid (softening)
-        0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x03, 0x02,
-        // outer (long faint tail)
-        0x02, 0x02, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
-    };
+    // Gated on `w.shadow_dirty` so content-only redraws don't re-blend over the
+    // previous frame's shadow (which would accumulate to black after ~30 frames
+    // on a 60fps app like sysmon). Redrawn on every shadow_dirty frame (incl.
+    // each drag step); the scalar per-pixel blend is bounded by the shadow-band
+    // area and runs only here, never on content-only ticks.
+    if (w.shadow_dirty) {
+        const ol = w.x - @as(i32, BORDER);
+        const ot = w.y - @as(i32, BORDER);
+        const orr = w.x + @as(i32, @intCast(w.width)) + @as(i32, BORDER);
+        const ob = w.y + @as(i32, @intCast(w.height)) + @as(i32, BORDER);
+        const ct = ot + SHADOW_OFFY; // caster top/bottom (left/right unshifted)
+        const cb = ob + SHADOW_OFFY;
+        const tw: i32 = @intCast(gfx.target_w);
+        const th: i32 = @intCast(gfx.target_h);
 
-    // Bottom edge — horizontal rows below the window
-    for (0..SHADOW_W) |si| {
-        const off: i32 = @intCast(si + 1);
-        const a: u32 = @as(u32, shadow_alphas[si]) << 24;
-        gfx.fillRectAlpha(w.x + 2, wy_b + off, w.width -| 2, 1, a);
-    }
-    // Right edge — vertical cols to the right of window
-    for (0..SHADOW_W) |si| {
-        const off: i32 = @intCast(si + 1);
-        const a: u32 = @as(u32, shadow_alphas[si]) << 24;
-        gfx.fillRectAlpha(wx_r + off, w.y + 2, 1, w.height -| 2, a);
-    }
-    // Bottom-right corner — gaussian 2D fade. Divide by SHADOW_MAX (not
-    // 255) so the corner darkness matches the edge darkness at equal
-    // distance from the window, producing a continuous round shadow
-    // instead of a too-light hollow corner.
-    for (0..SHADOW_W) |sy| {
-        for (0..SHADOW_W) |sx| {
-            const a_combined: u32 = (@as(u32, shadow_alphas[sx]) * @as(u32, shadow_alphas[sy])) / SHADOW_MAX;
-            if (a_combined == 0) continue;
-            const px = wx_r + @as(i32, @intCast(sx + 1));
-            const py = wy_b + @as(i32, @intCast(sy + 1));
-            if (px < 0 or py < 0) continue;
-            if (@as(u32, @intCast(px)) >= gfx.target_w or @as(u32, @intCast(py)) >= gfx.target_h) continue;
-            const soff = @as(u32, @intCast(py)) * gfx.target_w + @as(u32, @intCast(px));
-            gfx.target[soff] = gfx.blendPixel(gfx.target[soff], (a_combined << 24));
+        var py: i32 = ct - SHADOW_R;
+        while (py < cb + SHADOW_R) : (py += 1) {
+            if (py < 0 or py >= th) continue;
+            // vertical distance from the (offset) caster rect, 0 inside its span
+            const dy_i: i32 = if (py < ct) ct - py else if (py >= cb) py - cb + 1 else 0;
+            if (dy_i > SHADOW_R) continue;
+            const row: u32 = @as(u32, @intCast(py)) * gfx.target_w;
+            var px: i32 = ol - SHADOW_R;
+            while (px < orr + SHADOW_R) : (px += 1) {
+                if (px < 0 or px >= tw) continue;
+                // Skip the window's own footprint — chrome paints over it below.
+                if (px >= ol and px < orr and py >= ot and py < ob) continue;
+                const dx_i: i32 = if (px < ol) ol - px else if (px >= orr) px - orr + 1 else 0;
+                if (dx_i > SHADOW_R) continue;
+                const a = shadow_lut[@intCast(dy_i)][@intCast(dx_i)];
+                if (a == 0) continue;
+                const off: u32 = row + @as(u32, @intCast(px));
+                gfx.target[off] = gfx.blendPixel(gfx.target[off], @as(u32, a) << 24);
+            }
         }
-    }
         w.shadow_dirty = false;
-        break :shadow_blk;
     }
 
     // Border (1px) — flashes red while a terminal's bell_phase counts down.
@@ -1205,13 +1388,6 @@ fn renderWindow(idx: u8) void {
     gfx.drawFilledCircle(w.x + 16, btn_cy, BTN_RADIUS, btn_close_col);
     gfx.drawFilledCircle(w.x + 38, btn_cy, BTN_RADIUS, btn_min_col);
     gfx.drawFilledCircle(w.x + 60, btn_cy, BTN_RADIUS, btn_max_col);
-    if (is_focused) {
-        // 1-px specular highlight on the upper-left of each light — sells
-        // the "rounded gem" feel that flat circles miss.
-        gfx.fillRectAlpha(w.x + 14, btn_cy - 3, 2, 1, 0x60FFFFFF);
-        gfx.fillRectAlpha(w.x + 36, btn_cy - 3, 2, 1, 0x60FFFFFF);
-        gfx.fillRectAlpha(w.x + 58, btn_cy - 3, 2, 1, 0x60FFFFFF);
-    }
 
     // Centered title — SF Pro Display 24px AA. Title bar gradient is already
     // painted; aa_font draws via per-pixel alpha blend so we just stamp glyphs
@@ -1237,8 +1413,9 @@ fn renderWindow(idx: u8) void {
     const content_y = w.y + @as(i32, TITLEBAR_H);
     const content_h = w.height -| TITLEBAR_H;
 
-    // Restore saved corner pixels (shows whatever is behind this window)
-    restoreCornerPixels(w.x - @as(i32, BORDER), w.y - @as(i32, BORDER), w.width + BORDER * 2, w.height + BORDER * 2);
+    // Restore saved corner pixels — rounds the corners, tracing the white
+    // chrome border around the arc (border_color drives the ring).
+    restoreCornerPixels(w.x - @as(i32, BORDER), w.y - @as(i32, BORDER), w.width + BORDER * 2, w.height + BORDER * 2, border_color);
 
     // Read the published back buffer if the app has presented at least
     // once. Until then, read gui_fb directly so apps that never call
@@ -1260,40 +1437,70 @@ fn renderWindow(idx: u8) void {
         // pre-date the triple-buffer change (none should exist post-
         // sysCreateWindow change; defensive fallback).
 
-        // Cap visible region to the FB's actual extent. With maximize
-        // now allowed past gui_alloc_w/h (GPU shader handles scaling
-        // via uv_scale), 2D blit must not read past the FB or it walks
-        // off each row into the next via the smaller stride.
-        const fb_w: u32 = if (w.gui_alloc_w > 0) @min(w.gui_w, w.gui_alloc_w) else w.gui_w;
-        const fb_h: u32 = if (w.gui_alloc_h > 0) @min(w.gui_h, w.gui_alloc_h) else w.gui_h;
-        const vis_w = @min(fb_w, w.width);
-        const vis_h = @min(fb_h, content_h);
+        // Source = the app's rendered content extent, capped to its FB
+        // allocation (reading past it would walk into the next row through
+        // the smaller stride).
+        const src_w: u32 = if (w.gui_alloc_w > 0) @min(w.gui_w, w.gui_alloc_w) else w.gui_w;
+        const src_h: u32 = if (w.gui_alloc_h > 0) @min(w.gui_h, w.gui_alloc_h) else w.gui_h;
         const stride = if (w.gui_alloc_w > 0) w.gui_alloc_w else w.gui_w;
-        var row: u32 = 0;
-        while (row < vis_h) : (row += 1) {
-            const py = content_y + @as(i32, @intCast(row));
-            if (py < 0) continue;
-            if (py >= @as(i32, @intCast(gfx.target_h))) break;
-            const px = w.x;
-            if (px >= @as(i32, @intCast(gfx.target_w))) continue;
-            // Clip to screen
-            const dst_x: u32 = if (px < 0) 0 else @intCast(px);
-            const src_skip: u32 = if (px < 0) @intCast(-px) else 0;
-            const avail = gfx.target_w - dst_x;
-            const count = @min(vis_w -| src_skip, avail);
-            if (count == 0) continue;
-            // Copy row from user FB to back buffer (use stride for row pitch)
-            const dst_off = @as(u32, @intCast(py)) * gfx.target_w + dst_x;
-            const src_off = row * stride + src_skip;
-            const dest = @intFromPtr(gfx.target) + dst_off * 4;
-            const src = @intFromPtr(fb) + src_off * 4;
-            asm volatile ("cld; rep movsl"
-                :
-                : [dst] "{rdi}" (dest),
-                  [src] "{rsi}" (src),
-                  [cnt] "{rcx}" (count),
-                : .{ .rdi = true, .rsi = true, .rcx = true, .memory = true }
-            );
+        // Destination = the FULL window content area. When it equals the source
+        // (normal/dragged window — drag is capped at the alloc) we blit 1:1:
+        // crisp + fast (rep movsl). When it's larger (F10 maximize past the FB
+        // alloc) we nearest-neighbor UPSCALE so the content fills the window
+        // instead of sitting alloc-sized in the corner with wallpaper around it.
+        // (cpu-comp path; the GPU compositor does the equivalent via uv_scale.)
+        const dst_w: u32 = w.width;
+        const dst_h: u32 = content_h;
+        if (src_w != 0 and src_h != 0 and dst_w != 0 and dst_h != 0) {
+            if (src_w == dst_w and src_h == dst_h) {
+                var row: u32 = 0;
+                while (row < dst_h) : (row += 1) {
+                    const py = content_y + @as(i32, @intCast(row));
+                    if (py < 0) continue;
+                    if (py >= @as(i32, @intCast(gfx.target_h))) break;
+                    if (w.x >= @as(i32, @intCast(gfx.target_w))) continue;
+                    const dst_x: u32 = if (w.x < 0) 0 else @intCast(w.x);
+                    const src_skip: u32 = if (w.x < 0) @intCast(-w.x) else 0;
+                    const avail = gfx.target_w - dst_x;
+                    const count = @min(dst_w -| src_skip, avail);
+                    if (count == 0) continue;
+                    const dst_off = @as(u32, @intCast(py)) * gfx.target_w + dst_x;
+                    const src_off = row * stride + src_skip;
+                    const dest = @intFromPtr(gfx.target) + dst_off * 4;
+                    const src = @intFromPtr(fb) + src_off * 4;
+                    asm volatile ("cld; rep movsl"
+                        :
+                        : [dst] "{rdi}" (dest),
+                          [src] "{rsi}" (src),
+                          [cnt] "{rcx}" (count),
+                        : .{ .rdi = true, .rsi = true, .rcx = true, .memory = true }
+                    );
+                }
+            } else {
+                // Nearest-neighbor scale src→dst. 16.16 fixed-point sampled per
+                // pixel (stateless, so the screen-edge `continue`/`break` clips
+                // can't desync the source index) — no per-pixel divide and no
+                // large stack buffer, keeping pid 2's kstack lean.
+                const x_step: u32 = (src_w << 16) / dst_w;
+                const y_step: u32 = (src_h << 16) / dst_h;
+                var row: u32 = 0;
+                while (row < dst_h) : (row += 1) {
+                    const py = content_y + @as(i32, @intCast(row));
+                    if (py < 0) continue;
+                    if (py >= @as(i32, @intCast(gfx.target_h))) break;
+                    const sy: u32 = @min((row * y_step) >> 16, src_h - 1);
+                    const src_row: [*]volatile u32 = @ptrFromInt(@intFromPtr(fb) + @as(usize, sy) * stride * 4);
+                    const dst_row_base = @as(u32, @intCast(py)) * gfx.target_w;
+                    var col: u32 = 0;
+                    while (col < dst_w) : (col += 1) {
+                        const dx = w.x + @as(i32, @intCast(col));
+                        if (dx < 0) continue;
+                        if (dx >= @as(i32, @intCast(gfx.target_w))) break;
+                        const sx: u32 = @min((col * x_step) >> 16, src_w - 1);
+                        gfx.target[dst_row_base + @as(u32, @intCast(dx))] = src_row[sx];
+                    }
+                }
+            }
         }
     } else if (w.term) |t| {
         // Terminal window — draw text buffer (with scrollback support)
@@ -1504,6 +1711,41 @@ const corner_mask: [CORNER_R][CORNER_R]u8 = blk: {
     break :blk mask;
 };
 
+// White border-ring coverage hugging the rounded corner's OUTER arc — distance
+// (R−CORNER_RING_T, R] from the pivot. Lets the white chrome border continue
+// smoothly around the curve instead of the corner dropping straight to bg.
+// Same 4×4 supersample as corner_mask; together they partition each corner
+// pixel into {outside→bg, ring→border, inside→window}.
+const CORNER_RING_T: f32 = 1.6;
+const corner_ring: [CORNER_R][CORNER_R]u8 = blk: {
+    @setEvalBranchQuota(50_000);
+    var mask: [CORNER_R][CORNER_R]u8 = undefined;
+    const R: f32 = @floatFromInt(CORNER_R);
+    const inner: f32 = R - CORNER_RING_T;
+    const SAMPLES: u32 = 4;
+    const SAMPLES_F: f32 = @floatFromInt(SAMPLES);
+    const TOTAL: u32 = SAMPLES * SAMPLES;
+    for (0..CORNER_R) |y_| {
+        for (0..CORNER_R) |x_| {
+            var inring: u32 = 0;
+            const fx: f32 = @floatFromInt(x_);
+            const fy: f32 = @floatFromInt(y_);
+            for (0..SAMPLES) |sy| {
+                for (0..SAMPLES) |sx| {
+                    const sub_x = fx + (@as(f32, @floatFromInt(sx)) + 0.5) / SAMPLES_F;
+                    const sub_y = fy + (@as(f32, @floatFromInt(sy)) + 0.5) / SAMPLES_F;
+                    const dx = R - sub_x;
+                    const dy = R - sub_y;
+                    const d2 = dx * dx + dy * dy;
+                    if (d2 <= R * R and d2 > inner * inner) inring += 1;
+                }
+            }
+            mask[y_][x_] = @intCast((inring * 255) / TOTAL);
+        }
+    }
+    break :blk mask;
+};
+
 fn bgColorAt(y: i32) u32 {
     const start_y: i32 = if (conf.dock_pos == 1) @as(i32, TASKBAR_H) else 0;
     const rel_y = y - start_y;
@@ -1518,14 +1760,6 @@ fn bgColorAt(y: i32) u32 {
 // edges blend smoothly with whatever is behind. 4 corners × 8×8 = 256 px.
 const CORNER_BUF_PER: u32 = CORNER_R * CORNER_R;
 var corner_save: [256]u32 = undefined;
-
-inline fn cornerBlend(dst: u32, src: u32, alpha: u32) u32 {
-    const inv: u32 = 255 - alpha;
-    const r = (((src >> 16) & 0xFF) * alpha + ((dst >> 16) & 0xFF) * inv) / 255;
-    const g = (((src >> 8) & 0xFF) * alpha + ((dst >> 8) & 0xFF) * inv) / 255;
-    const b = ((src & 0xFF) * alpha + (dst & 0xFF) * inv) / 255;
-    return (r << 16) | (g << 8) | b;
-}
 
 fn saveCornerPixels(x: i32, y: i32, w: u32, h: u32) void {
     const right: i32 = x + @as(i32, @intCast(w)) - 1;
@@ -1549,29 +1783,41 @@ fn saveCornerPixels(x: i32, y: i32, w: u32, h: u32) void {
     }
 }
 
-fn restoreCornerPixels(x: i32, y: i32, w: u32, h: u32) void {
+fn restoreCornerPixels(x: i32, y: i32, w: u32, h: u32, border_color: u32) void {
     const right: i32 = x + @as(i32, @intCast(w)) - 1;
     const bot: i32 = y + @as(i32, @intCast(h)) - 1;
     const corners = [_][2]i32{ .{ x, y }, .{ right, y }, .{ x, bot }, .{ right, bot } };
     const x_dirs = [_]i32{ 1, -1, 1, -1 };
     const y_dirs = [_]i32{ 1, 1, -1, -1 };
+    const br_r = (border_color >> 16) & 0xFF;
+    const br_g = (border_color >> 8) & 0xFF;
+    const br_b = border_color & 0xFF;
     for (0..4) |c| {
         const base = c * CORNER_BUF_PER;
         for (0..CORNER_R) |cy| {
             for (0..CORNER_R) |cx| {
-                const alpha = corner_mask[cy][cx];
-                if (alpha == 0) continue; // fully window pixel — skip
+                const out_a: u32 = corner_mask[cy][cx]; // outside the arc → background
+                const ring_a: u32 = corner_ring[cy][cx]; // on the arc → white border
+                if (out_a == 0 and ring_a == 0) continue; // fully interior — keep window pixel
                 const px = corners[c][0] + @as(i32, @intCast(cx)) * x_dirs[c];
                 const py = corners[c][1] + @as(i32, @intCast(cy)) * y_dirs[c];
                 if (px < 0 or py < 0) continue;
                 if (@as(u32, @intCast(px)) >= gfx.target_w or @as(u32, @intCast(py)) >= gfx.target_h) continue;
                 const off = @as(u32, @intCast(py)) * gfx.target_w + @as(u32, @intCast(px));
                 const bg_pixel = corner_save[base + cy * CORNER_R + cx];
-                if (alpha >= 254) {
-                    gfx.target[off] = bg_pixel;
-                } else {
-                    gfx.target[off] = cornerBlend(gfx.target[off], bg_pixel, alpha);
+                if (out_a >= 254) {
+                    gfx.target[off] = bg_pixel; // fully outside the rounded rect
+                    continue;
                 }
+                // 3-way composite: window interior · white border ring · bg outside.
+                // The three coverages partition the pixel (sum == 255), so the
+                // white chrome border traces the corner arc instead of vanishing.
+                const win = gfx.target[off];
+                const int_a: u32 = 255 - out_a - ring_a;
+                const r = (((win >> 16) & 0xFF) * int_a + br_r * ring_a + ((bg_pixel >> 16) & 0xFF) * out_a) / 255;
+                const g = (((win >> 8) & 0xFF) * int_a + br_g * ring_a + ((bg_pixel >> 8) & 0xFF) * out_a) / 255;
+                const b = ((win & 0xFF) * int_a + br_b * ring_a + (bg_pixel & 0xFF) * out_a) / 255;
+                gfx.target[off] = (r << 16) | (g << 8) | b;
             }
         }
     }
@@ -2394,6 +2640,9 @@ pub fn taskEntry() callconv(.c) noreturn {
     // used the sync polled path; post-this-line reads (every userspace
     // file load via vfs.loadFileFresh) go through submit-and-yield with
     // Q_DEPTH=16-way parallelism.
+    // Boot is over — we're in steady-state preemptive multitasking now.
+    // Flip the kernel-wide phase flag (paging's boot-only audit consults it).
+    @import("../boot/boot_phase.zig").markComplete();
     @import("../driver/nvme.zig").enableAsync();
     run();
     asm volatile ("ud2");
@@ -3666,6 +3915,25 @@ pub fn getWindowContentSize(pid: u8, buf: [*]u32) void {
             // fullscreen flag.
             buf[0] = w.width -| (BORDER * 2);
             buf[1] = w.height -| (TITLEBAR_H + BORDER);
+            return;
+        }
+    }
+    buf[0] = 0;
+    buf[1] = 0;
+}
+
+/// Report the calling window's FB allocation (stride width, rows). growGuiFb
+/// can bump this past the app's create-time request on F10 maximize; the app
+/// re-fetches it on the `.resize` event and rebuilds its canvas at buf[0] stride.
+pub fn getWindowAllocSize(pid: u8, buf: [*]u32) void {
+    for (z_stack[0..wm.z_count]) |i| {
+        if (windows[i].owner_pid == pid and windows[i].visible) {
+            const w = &windows[i];
+            // Querying the alloc opts the window into grow-on-maximize: the app
+            // is signalling it adapts its stride to the reported alloc.
+            w.fb_growable = true;
+            buf[0] = if (w.gui_alloc_w > 0) w.gui_alloc_w else w.gui_w;
+            buf[1] = if (w.gui_alloc_h > 0) w.gui_alloc_h else w.gui_h;
             return;
         }
     }

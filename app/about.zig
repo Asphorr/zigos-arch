@@ -189,7 +189,10 @@ export fn _start() linksection(".text.entry") callconv(.c) void {
     greeting_input = .{ .x = 0, .y = 0, .w = 100, .h = 26, .buf = &greeting_buf, .buf_len = greet.len, .cursor = greet.len };
 
     const win = libc.createWindowEx(ALLOC_W, ALLOC_H, INIT_W, INIT_H) orelse libc.exit();
-    var canvas = gfx.Canvas.init(win.fb, win.alloc_w, win.alloc_h);
+    var alloc_w: u32 = win.alloc_w; // current FB stride; grows on F10 maximize
+    var alloc_h: u32 = win.alloc_h;
+    var canvas = gfx.Canvas.init(win.fb, alloc_w, alloc_h);
+    _ = libc.getWindowAlloc(); // opt this window into F10 grow-on-maximize (re-fetched in .resize)
 
     fa.ensureLoaded();
     computeLayout(INIT_W, INIT_H);
@@ -220,8 +223,19 @@ export fn _start() linksection(".text.entry") callconv(.c) void {
                     should_quit = true;
                 },
                 .resize => {
-                    const new_w = @min(ev.a, ALLOC_W);
-                    const new_h = @min(ev.b, ALLOC_H);
+                    // F10 maximize may have GROWN our framebuffer past the
+                    // alloc we requested. Re-fetch and rebuild the canvas at
+                    // the new stride before clamping/laying out. win.fb stays
+                    // valid (kernel re-backs the same VA) so render is crisp
+                    // instead of upscaled.
+                    const wa = libc.getWindowAlloc();
+                    if (wa.w != 0 and (wa.w != alloc_w or wa.h != alloc_h)) {
+                        alloc_w = wa.w;
+                        alloc_h = wa.h;
+                        canvas = gfx.Canvas.init(win.fb, alloc_w, alloc_h);
+                    }
+                    const new_w = @min(ev.a, alloc_w);
+                    const new_h = @min(ev.b, alloc_h);
                     if (new_w != vis_w or new_h != vis_h) computeLayout(new_w, new_h);
                 },
                 .key_char => {

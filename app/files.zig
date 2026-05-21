@@ -637,6 +637,7 @@ export fn _start() linksection(".text.entry") callconv(.c) void {
     alloc_w = win.alloc_w; // libc may have rounded up to 16-px stride
     alloc_h = win.alloc_h;
     var canvas = gfx.Canvas.init(win.fb, alloc_w, alloc_h);
+    _ = libc.getWindowAlloc(); // opt this window into F10 grow-on-maximize (re-fetched in .resize)
     fa.ensureLoaded();
 
     refreshCwd();
@@ -701,6 +702,17 @@ export fn _start() linksection(".text.entry") callconv(.c) void {
                     needs_redraw = true; // press/release-edge may matter
                 },
                 .resize => {
+                    // The compositor may have GROWN our framebuffer (F10
+                    // maximize) past the alloc we requested at startup. Re-fetch
+                    // it and rebuild the canvas at the new stride before laying
+                    // out, so we render crisply into the bigger FB instead of
+                    // being upscaled. The FB pointer (win.fb) is unchanged.
+                    const wa = libc.getWindowAlloc();
+                    if (wa.w != 0 and (wa.w != alloc_w or wa.h != alloc_h)) {
+                        alloc_w = wa.w;
+                        alloc_h = wa.h;
+                        canvas = gfx.Canvas.init(win.fb, alloc_w, alloc_h);
+                    }
                     const new_w = @min(ev.a, alloc_w);
                     const new_h = @min(ev.b, alloc_h);
                     if (new_w != vis_w or new_h != vis_h) {

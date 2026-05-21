@@ -756,6 +756,17 @@ pub fn getWindowSize() WindowSize {
     return .{ .w = buf[0], .h = buf[1] };
 }
 
+pub const WindowAlloc = struct { w: u32, h: u32 };
+/// Current framebuffer allocation = (stride width in px, rows). The compositor
+/// can GROW this past what we requested at create time (F10 maximize) so the
+/// app renders crisply instead of being upscaled. Re-fetch on a `.resize`
+/// event and rebuild your canvas with `w` as the row stride.
+pub fn getWindowAlloc() WindowAlloc {
+    var buf: [2]u32 align(4) = undefined;
+    _ = syscall(112, @truncate(@intFromPtr(&buf)), 0);
+    return .{ .w = buf[0], .h = buf[1] };
+}
+
 // --- Heap allocator: thread-safe boundary-tag with magic-protected blocks --
 //
 // Each allocation is preceded by a 16-byte Block header carrying:
