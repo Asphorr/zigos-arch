@@ -185,38 +185,76 @@ void IN_ClearStates(void) {}
 // and S_Init unconditionally dereferences shm->speed → page fault at
 // 0x20. Caught 2026-05-20.
 //
-// Workaround until task #742 lands: present a software-only DMA
-// buffer. Q1's mixer happily writes samples into it; we just never
-// read them out, so the game stays silent. The fields below match
-// the shape Q1 expects (see dma_t in sound.h).
+// Bridged to the kernel streaming audio device (task #742, 2026-05-21):
+// the mixer writes interleaved S16 into fake_dma_buffer; GetDMAPos presents
+// a real-time play cursor, and Submit pushes freshly-mixed frames out via
+// zq_audio_submit (syscall #38). Fields below match dma_t in sound.h.
 extern volatile dma_t *shm;
+extern int paintedtime;  // snd_dma.c: monotonic mix cursor, in sample PAIRS
+extern void zq_audio_submit(const short *samples, unsigned frames);
+extern unsigned int zq_time_ms(void);  // also declared below; identical dup is fine
 
 static dma_t fake_dma;
-static unsigned char fake_dma_buffer[1 << 16];
+// Power-of-two ring (32768 S16 = 16384 stereo frames, ~0.74s @ 22050) so the
+// mixer's `& (samples-1)` masking is valid. `short`-typed for S16 alignment.
+static short fake_dma_buffer[1 << 15];
 
 qboolean SNDDMA_Init(void) {
     fake_dma.splitbuffer = 0;
     fake_dma.samplebits = 16;
-    fake_dma.speed = 22050;
+    fake_dma.speed = 22050;            // matches virtio-snd's configured rate
     fake_dma.channels = 2;
-    fake_dma.samples = sizeof(fake_dma_buffer) / 2;  // mono samples in buffer
+    fake_dma.samples = sizeof(fake_dma_buffer) / sizeof(fake_dma_buffer[0]);
     fake_dma.samplepos = 0;
     fake_dma.soundalive = true;
     fake_dma.gamealive = true;
     fake_dma.submission_chunk = 1;
-    fake_dma.buffer = fake_dma_buffer;
+    fake_dma.buffer = (unsigned char *)fake_dma_buffer;
     shm = &fake_dma;
     return true;
 }
+
 int SNDDMA_GetDMAPos(void) {
-    // Q1 advances samplepos via this; without it the mixer doesn't
-    // make forward progress and S_Update_ tight-loops. Increment by a
-    // chunk per call so the mixer thinks samples are being consumed.
-    fake_dma.samplepos = (fake_dma.samplepos + 256) % fake_dma.samples;
+    // Emulate a hardware play cursor advancing in real time at `speed` Hz.
+    // The mixer mixes ahead of this (by _snd_mixahead s); Submit then ships
+    // the freshly-mixed frames. Time-based (not per-call) so playback speed
+    // is independent of the engine frame rate.
+    static unsigned start_ms = 0;
+    static int started = 0;
+    unsigned now = zq_time_ms();
+    if (!started) { start_ms = now; started = 1; }
+    unsigned long elapsed = (unsigned long)(now - start_ms);
+    unsigned long frames = (elapsed * (unsigned long)fake_dma.speed) / 1000UL;
+    fake_dma.samplepos =
+        (int)((frames * (unsigned long)fake_dma.channels) % (unsigned long)fake_dma.samples);
     return fake_dma.samplepos;
 }
+
 void SNDDMA_Shutdown(void) {}
-void SNDDMA_Submit(void) {}
+
+void SNDDMA_Submit(void) {
+    // Push the frames mixed since the previous Submit. paintedtime is the
+    // monotonic mix cursor (sample pairs); the ring offset (frame*channels &
+    // (samples-1)) matches where S_TransferStereo16 wrote.
+    static int last_painted = 0;
+    int painted = paintedtime;
+    int new_frames = painted - last_painted;
+    if (new_frames <= 0) { last_painted = painted; return; }
+
+    int chans = fake_dma.channels;
+    int ring = fake_dma.samples;            // S16 values, power of two
+    int count = new_frames * chans;         // S16 values to push
+    if (count > ring) count = ring;         // never push more than one ring
+    int start = (int)(((unsigned)last_painted * (unsigned)chans) & (unsigned)(ring - 1));
+    int first = ring - start;               // S16 until wrap
+    if (first > count) first = count;
+
+    zq_audio_submit(&fake_dma_buffer[start], (unsigned)(first / chans));
+    if (count > first)
+        zq_audio_submit(&fake_dma_buffer[0], (unsigned)((count - first) / chans));
+
+    last_painted = painted;
+}
 
 // ============================================================
 // SYSTEM (file I/O, time, error, exit)

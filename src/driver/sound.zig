@@ -44,6 +44,27 @@ pub fn init() void {
 /// Stream raw S16 stereo samples. Probe-order dispatch:
 /// virtio-sound → HDA → AC97. Silently no-op if no streaming backend.
 pub fn writeSamples(src: [*]const i16, stereo_samples: u32) void {
+    // Throttled flow diagnostic — every 64th call log frame count + peak
+    // amplitude. Lets the audio path be verified from serial.log even with
+    // QEMU `-audiodev none` (no host output): a non-zero peak proves real,
+    // non-silent samples are reaching the device.
+    {
+        const D = struct {
+            var calls: u32 = 0;
+        };
+        D.calls +%= 1;
+        if (D.calls % 64 == 0) {
+            var peak: u32 = 0;
+            const n = stereo_samples *| 2;
+            var i: u32 = 0;
+            while (i < n) : (i += 1) {
+                const v: i32 = src[i];
+                const a: u32 = @intCast(if (v < 0) -v else v);
+                if (a > peak) peak = a;
+            }
+            debug.klog("[snd] writeSamples #{d} frames={d} peak={d}\n", .{ D.calls, stereo_samples, peak });
+        }
+    }
     if (use_virtio and virtio_snd.isReady()) {
         virtio_snd.writeSamples(src, stereo_samples);
         return;

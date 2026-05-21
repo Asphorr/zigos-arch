@@ -127,6 +127,22 @@ export fn zq_print(s: ?[*:0]const u8) void {
     }
 }
 
+// Push freshly-mixed S16 stereo frames to the kernel audio device (syscall
+// #38 → sound.writeSamples → virtio-snd/HDA/AC97). Called from sys_zigos.c
+// SNDDMA_Submit after S_PaintChannels mixes into shm->buffer. `frames` is a
+// count of stereo sample-pairs (matches Quake's paintedtime units).
+export fn zq_audio_submit(samples: [*]const i16, frames: u32) void {
+    // sysAudioWrite caps each call at 8192 stereo frames — chunk to respect
+    // it (a single Submit can occasionally exceed that after a frame hitch).
+    // 2 i16 per stereo frame, so advance the pointer by chunk*2 elements.
+    var off: u32 = 0;
+    while (off < frames) {
+        const chunk = @min(frames - off, @as(u32, 8192));
+        _ = libc.audioWrite(samples + off * 2, chunk);
+        off += chunk;
+    }
+}
+
 // ============================================================
 // Input — zq_poll_keys / zq_next_key / zq_get_mouse_delta
 // (driven by sys_zigos.c IN_Commands + Sys_SendKeyEvents + IN_Move)
