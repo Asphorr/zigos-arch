@@ -126,26 +126,71 @@ pub fn init() void {
         return;
     }
 
-    sectors_per_cluster = bpb.sectors_per_cluster;
+    // --- BPB validation -----------------------------------------------------
+    // A malformed or non-FAT boot sector must be REJECTED, not trusted into a
+    // divide-by-zero, an unchecked subtraction/multiply that underflows or
+    // overflows, or a runaway cluster count — every one of those is a
+    // ReleaseSafe panic (= kernel halt) on a slightly-corrupt or hostile image.
+    // Each field used below as a divisor or inside an arithmetic op is bounded
+    // here first. Mirrors the ext2 mount() superblock divisor-validation; on
+    // any failure we klog and leave initialized = false.
 
-    // Determine FAT size (FAT32 uses fat_size_32)
-    if (bpb.fat_size_16 != 0) {
-        fat_size = bpb.fat_size_16;
-    } else {
-        fat_size = bpb.fat_size_32;
+    const spc = bpb.sectors_per_cluster;
+    // Power of two in 1..128 (FAT spec). spc == 0 would divide-by-zero in the
+    // total_clusters and entries_per_cluster computations.
+    if (spc == 0 or (spc & (spc - 1)) != 0 or spc > 128) {
+        debug.klog("[fat32] reject: sectors_per_cluster={d} (need pow2 in 1..128)\n", .{spc});
+        return;
+    }
+    if (bpb.reserved_sectors == 0) {
+        debug.klog("[fat32] reject: reserved_sectors=0 (FAT would overlap boot sector)\n", .{});
+        return;
+    }
+    if (bpb.num_fats == 0) {
+        debug.klog("[fat32] reject: num_fats=0\n", .{});
+        return;
     }
 
+    const fsz: u32 = if (bpb.fat_size_16 != 0) @as(u32, bpb.fat_size_16) else bpb.fat_size_32;
+    if (fsz == 0) {
+        debug.klog("[fat32] reject: fat_size=0\n", .{});
+        return;
+    }
+
+    // Compute data_start in u64 so a huge num_fats*fat_size can't overflow u32
+    // (which would panic in ReleaseSafe, or wrap to a bogus-small data_start
+    // that slips past the volume-fit check below).
+    const root_dir_sectors: u64 = (@as(u64, bpb.root_entry_count) * DIR_ENTRY_SIZE + SECTOR_SIZE - 1) / SECTOR_SIZE;
+    const data_start_64: u64 = @as(u64, bpb.reserved_sectors) +
+        @as(u64, bpb.num_fats) * @as(u64, fsz) + root_dir_sectors;
+
+    const total_sectors: u32 = if (bpb.total_sectors_16 != 0) @as(u32, bpb.total_sectors_16) else bpb.total_sectors_32;
+    // The data region must start inside the volume; otherwise total_sectors -
+    // data_start underflows (panic) and every LBA we derive is wild.
+    if (data_start_64 >= total_sectors) {
+        debug.klog("[fat32] reject: data_start={d} >= total_sectors={d}\n", .{ data_start_64, total_sectors });
+        return;
+    }
+
+    sectors_per_cluster = spc;
+    fat_size = fsz;
     fat_start = bpb.reserved_sectors;
     root_cluster = bpb.root_cluster;
+    data_start = @intCast(data_start_64); // < total_sectors (u32), so fits
 
-    // FAT32: no fixed root directory area
-    // data_start = after reserved sectors + FATs
-    const root_dir_sectors: u32 = (@as(u32, bpb.root_entry_count) * DIR_ENTRY_SIZE + SECTOR_SIZE - 1) / SECTOR_SIZE;
-    data_start = fat_start + @as(u32, bpb.num_fats) * fat_size + root_dir_sectors;
+    // FAT32 tops out at 0x0FFFFFF6 valid clusters (>= 0x0FFFFFF7 is the
+    // bad-cluster / EOC space). Compute in u64 and cap so total_clusters stays
+    // a sane u32 even for an absurd total_sectors (also dodges the +2 overflow).
+    const data_clusters: u64 = (@as(u64, total_sectors) - data_start_64) / spc;
+    total_clusters = @intCast(@min(data_clusters + 2, 0x0FFFFFF7));
 
-    // Calculate total clusters for allocCluster bounds
-    const total_sectors = if (bpb.total_sectors_16 != 0) @as(u32, bpb.total_sectors_16) else bpb.total_sectors_32;
-    total_clusters = (total_sectors - data_start) / sectors_per_cluster + 2;
+    // root_cluster must name a real data cluster: 2 <= root_cluster <
+    // total_clusters. (< 2 underflows clusterToLBA's `cluster - 2`; at/above the
+    // top points outside the volume.) Every public op starts from root_cluster.
+    if (root_cluster < 2 or root_cluster >= total_clusters) {
+        debug.klog("[fat32] reject: root_cluster={d} outside [2,{d})\n", .{ root_cluster, total_clusters });
+        return;
+    }
 
     initialized = true;
     debug.klog("[fat32] Initialized: fat@{d} data@{d} spc={d} rootclus={d} total_clus={d}\n", .{ fat_start, data_start, sectors_per_cluster, root_cluster, total_clusters });
@@ -262,6 +307,28 @@ fn isEOC(cluster: u32) bool {
     return cluster >= FAT32_EOC;
 }
 
+/// True when `cluster` is a usable data cluster: in range and not EOC/free.
+/// The "are we pointing at a real cluster?" guard for every chain walk —
+/// adds the upper bound (< total_clusters) the hand-rolled walks were missing.
+fn clusterValid(cluster: u32) bool {
+    return cluster >= 2 and cluster < total_clusters and !isEOC(cluster);
+}
+
+/// Advance one link along a cluster chain, fully validated. Returns the next
+/// cluster, or null when `cluster` is the end of the chain (EOC), free, or
+/// outside the valid data-cluster range [2, total_clusters) — and likewise if
+/// the link it points to is out of range. Routing every chain-follow through
+/// here means a corrupt FAT entry can never feed a wild cluster number into
+/// clusterToLBA (→ u32 multiply-overflow panic) or readFATEntry (→ read off
+/// the end of the FAT). Mirrors the bounds-checked DirWalk iterator the ext2
+/// driver got for the same class of bug.
+fn nextInChain(cluster: u32) ?u32 {
+    if (!clusterValid(cluster)) return null;
+    const next = readFATEntry(cluster);
+    if (!clusterValid(next)) return null;
+    return next;
+}
+
 // --- Directory entry helpers (cluster-based) ---
 
 /// Read a directory entry from a directory cluster chain.
@@ -271,14 +338,13 @@ fn readDirEntry(dir_cluster: u32, index: u32) ?DirEntry {
     var cluster = dir_cluster;
     var remaining = index;
 
-    // Follow chain to the right cluster
+    // Follow chain to the right cluster (bounds-checked via nextInChain).
     while (remaining >= entries_per_cluster) {
-        if (isEOC(cluster) or cluster < 2) return null;
-        cluster = readFATEntry(cluster);
+        cluster = nextInChain(cluster) orelse return null;
         remaining -= entries_per_cluster;
     }
 
-    if (isEOC(cluster) or cluster < 2) return null;
+    if (!clusterValid(cluster)) return null;
 
     // Read the sector containing this entry using cache
     const entries_per_sector = SECTOR_SIZE / DIR_ENTRY_SIZE;
@@ -310,11 +376,10 @@ fn readDirEntryRaw(dir_cluster: u32, index: u32) ?[32]u8 {
     var cluster = dir_cluster;
     var remaining = index;
     while (remaining >= entries_per_cluster) {
-        if (isEOC(cluster) or cluster < 2) return null;
-        cluster = readFATEntry(cluster);
+        cluster = nextInChain(cluster) orelse return null;
         remaining -= entries_per_cluster;
     }
-    if (isEOC(cluster) or cluster < 2) return null;
+    if (!clusterValid(cluster)) return null;
     const entries_per_sector = SECTOR_SIZE / DIR_ENTRY_SIZE;
     const sector_in_cluster = remaining / entries_per_sector;
     const offset = (remaining % entries_per_sector) * DIR_ENTRY_SIZE;
@@ -335,12 +400,11 @@ fn writeDirEntry(dir_cluster: u32, index: u32, entry: DirEntry) void {
     var remaining = index;
 
     while (remaining >= entries_per_cluster) {
-        if (isEOC(cluster) or cluster < 2) return;
-        cluster = readFATEntry(cluster);
+        cluster = nextInChain(cluster) orelse return;
         remaining -= entries_per_cluster;
     }
 
-    if (isEOC(cluster) or cluster < 2) return;
+    if (!clusterValid(cluster)) return;
 
     const entries_per_sector = SECTOR_SIZE / DIR_ENTRY_SIZE;
     const sector_in_cluster = remaining / entries_per_sector;
@@ -583,11 +647,16 @@ fn findFreeSlotInDir(dir_cluster: u32) ?u32 {
 /// resolves into the new cluster.
 fn extendDirChain(dir_cluster: u32, target_index: u32) ?u32 {
     var cluster = dir_cluster;
-    while (true) {
-        const next = readFATEntry(cluster);
-        if (isEOC(next) or next < 2) break;
+    var guard: u32 = 0;
+    // Walk to the tail. nextInChain stops at EOC / any out-of-range link; the
+    // guard caps a corrupt chain that cycles back on itself (every link
+    // in-range and non-EOC would otherwise spin here forever).
+    while (nextInChain(cluster)) |next| {
         cluster = next;
+        guard += 1;
+        if (guard >= total_clusters) return null;
     }
+    if (!clusterValid(cluster)) return null; // chain head itself was bogus
     const new_cluster = allocCluster() orelse return null;
     writeFATEntry(cluster, new_cluster);
     writeFATEntry(new_cluster, FAT32_EOC);
@@ -732,15 +801,14 @@ pub fn readFileAt(handle: Handle, buf: [*]u8, count: u32, cached_cluster: u32, c
     var cluster_base = handle.current_offset - offset;
 
     while (offset >= cluster_size) {
-        if (isEOC(cluster) or cluster < 2) return 0;
-        cluster = readFATEntry(cluster);
+        cluster = nextInChain(cluster) orelse return 0;
         offset -= cluster_size;
         cluster_base += cluster_size;
     }
 
     var sector_buf: [SECTOR_SIZE]u8 = undefined;
     while (bytes_read < to_read) {
-        if (isEOC(cluster) or cluster < 2) break;
+        if (!clusterValid(cluster)) break;
 
         const lba = clusterToLBA(cluster);
         const byte_in_sector = offset % SECTOR_SIZE;
@@ -760,7 +828,7 @@ pub fn readFileAt(handle: Handle, buf: [*]u8, count: u32, cached_cluster: u32, c
                 (run_clusters + 1) * cluster_size <= to_read - bytes_read)
             {
                 const next = readFATEntry(run_tail);
-                if (isEOC(next) or next != run_tail + 1) break;
+                if (isEOC(next) or next >= total_clusters or next != run_tail + 1) break;
                 run_tail = next;
                 run_clusters += 1;
             }
@@ -851,8 +919,13 @@ pub fn writeFile(handle: *Handle, buf: [*]const u8, count: u32) usize {
     const cluster_size = sectors_per_cluster * SECTOR_SIZE;
 
     while (offset >= cluster_size) {
+        // A corrupt dirent first_cluster reaches here unvalidated; stop before
+        // readFATEntry(cluster) faults on the `cluster*4` u32 overflow (or
+        // writeFATEntry corrupts a wild FAT slot below). Mirrors readFileAt's
+        // skip-loop guard. The main loop's clusterValid check then returns 0.
+        if (!clusterValid(cluster)) break;
         const next = readFATEntry(cluster);
-        if (isEOC(next) or next < 2) {
+        if (isEOC(next) or next < 2 or next >= total_clusters) {
             const new_cluster = allocCluster() orelse return bytes_written;
             writeFATEntry(cluster, new_cluster);
             writeFATEntry(new_cluster, 0x0FFFFFFF);
@@ -866,7 +939,7 @@ pub fn writeFile(handle: *Handle, buf: [*]const u8, count: u32) usize {
 
     var sector_buf: [SECTOR_SIZE]u8 = undefined;
     while (bytes_written < count) {
-        if (cluster < 2) break;
+        if (!clusterValid(cluster)) break;
 
         const lba = clusterToLBA(cluster);
         const sector_in_cluster = offset / SECTOR_SIZE;
@@ -886,7 +959,7 @@ pub fn writeFile(handle: *Handle, buf: [*]const u8, count: u32) usize {
 
         if (offset >= cluster_size) {
             const next = readFATEntry(cluster);
-            if (isEOC(next) or next < 2) {
+            if (isEOC(next) or next < 2 or next >= total_clusters) {
                 if (bytes_written < count) {
                     const new_cluster = allocCluster() orelse break;
                     writeFATEntry(cluster, new_cluster);
@@ -1024,13 +1097,18 @@ pub fn getFileSize(dir_index: u16) u32 {
 
 /// Free a cluster chain starting from the given cluster.
 fn freeClusterChain(start_cluster: u32) void {
-    if (start_cluster < 2 or isEOC(start_cluster)) return;
+    if (!clusterValid(start_cluster)) return;
 
     var cluster = start_cluster;
-    while (cluster >= 2 and !isEOC(cluster)) {
+    var guard: u32 = 0;
+    // Range-check each link and cap total iterations: a cross-linked or
+    // self-referential FAT chain must not spin forever or walk off the FAT.
+    while (clusterValid(cluster)) {
         const next = readFATEntry(cluster);
         writeFATEntry(cluster, FAT32_FREE);
         cluster = next;
+        guard += 1;
+        if (guard >= total_clusters) break;
     }
     flushFATCache();
 }
@@ -1065,12 +1143,11 @@ fn writeDirEntryRaw(dir_cluster: u32, index: u32, raw: [32]u8) void {
     var remaining = index;
 
     while (remaining >= entries_per_cluster) {
-        if (isEOC(cluster) or cluster < 2) return;
-        cluster = readFATEntry(cluster);
+        cluster = nextInChain(cluster) orelse return;
         remaining -= entries_per_cluster;
     }
 
-    if (isEOC(cluster) or cluster < 2) return;
+    if (!clusterValid(cluster)) return;
 
     const entries_per_sector = SECTOR_SIZE / DIR_ENTRY_SIZE;
     const sector_in_cluster = remaining / entries_per_sector;
