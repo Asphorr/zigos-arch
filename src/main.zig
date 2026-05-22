@@ -346,6 +346,14 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     // HvCallFlushVirtualAddressSpace instead of IPI fan-out.
     @import("virt/hyperv.zig").detect();
     @import("virt/hyperv.zig").enableHypercalls();
+    // VT-x (VMX) capability probe — Phase 0 of ZigOS-as-hypervisor. Pure
+    // CPUID/MSR reads: logs whether we can host a guest (and whether the
+    // EPT + unrestricted-guest path is available). No VMXON yet; that is
+    // gated on this verdict. See virt/vmx.zig.
+    @import("virt/vmx.zig").detect();
+    // Phase 1: VMXON/VMXOFF round-trip on the BSP (no-op unless USABLE).
+    // Single-threaded here — runs before AP startup.
+    @import("virt/vmx.zig").enableBsp();
     if (@import("time/apic.zig").init()) {
         blog.ok("Local APIC + IOAPIC");
     } else {
