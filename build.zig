@@ -385,6 +385,7 @@ pub fn build(b: *std.Build) void {
         .{ "jq.elf", "app/jq.zig" },
         .{ "wx.elf", "app/wx.zig" },
         .{ "weather.elf", "app/weather.zig" },
+        .{ "web.elf", "app/web.zig" },
     };
 
     inline for (gui_apps) |entry| {
