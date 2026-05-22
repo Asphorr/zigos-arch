@@ -153,7 +153,13 @@ export fn _start() linksection(".text.entry") callconv(.c) void {
     var pos: usize = 0;
 
     while (true) {
-        const c = libc.readChar();
+        // Blocking read: parks until a keystroke arrives (or a signal), so the
+        // idle shell consumes ~0 CPU instead of busy-polling read()+sleep(10)
+        // (was the top idle-CPU hog: sys#04+sys#08 ~59.5k calls/sample). The
+        // c==0 arm now only fires on EINTR (Ctrl+C woke us) or kb_pipe EOF
+        // (terminal closing) — the sleep(10) there is a spin guard for the EOF
+        // case, not the steady-state path.
+        const c = libc.readCharBlocking();
         drainSigint(&len, &pos);
         if (c == 0) {
             libc.sleep(10);

@@ -157,6 +157,14 @@ pub fn readChar() u8 {
     return @truncate(syscall(4, 0, 0));
 }
 
+/// Blocking read of one byte from fd 0 (syscall 113). Parks until a byte is
+/// available rather than returning immediately; returns 0 on a pending signal
+/// (EINTR) or EOF. Interactive readers should prefer this over the
+/// readChar()+sleep() poll loop — it drops idle CPU to ~0.
+pub fn readCharBlocking() u8 {
+    return @truncate(syscall(113, 0, 0));
+}
+
 // --- Window event API (syscall 90) ---
 //
 // The kernel maintains a per-window event queue (see src/ui/events.zig).

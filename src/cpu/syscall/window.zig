@@ -82,6 +82,35 @@ pub fn sysRead() u32 {
     }
 }
 
+/// Blocking counterpart to sysRead for fd 0. Parks the caller until a byte is
+/// available (woken by the pipe writer — e.g. the desktop pushing a keystroke
+/// into kb_pipe) or a signal is pending, instead of returning 0 immediately.
+/// Lets the interactive shell sleep until a keystroke arrives rather than
+/// busy-polling read()+sleep() — the #1 idle-CPU hog in the perf profile
+/// (sys#04 + sys#08 each ~59.5k calls/sample on the resident shell).
+///
+/// Only the .pipe fd path blocks: it reuses pipe.read's proven block/wake +
+/// .signalled (EINTR) handshake, so Ctrl+C still interrupts a parked read and
+/// pipe.read returns 0, letting the syscall-return signal path run. The
+/// .console event-queue path has no blocked-reader wake hook, so it falls back
+/// to the non-blocking sysRead behavior (console apps use poll_event anyway).
+pub fn sysReadBlocking() u32 {
+    const pcb = process.currentPCB() orelse return 0;
+    const fd0 = &pcb.fd_table[0];
+    if (!fd0.in_use) return 0;
+    switch (fd0.fs_type) {
+        .pipe => {
+            var buf: [1]u8 = .{0};
+            // Blocks until >=1 byte; returns 0 on EOF (writer closed) or a
+            // pending signal. Caller treats 0 as "handle signal / retry".
+            const n = @import("../../proc/pipe.zig").read(fd0.pipe_id, &buf);
+            if (n == 0) return 0;
+            return buf[0];
+        },
+        else => return sysRead(),
+    }
+}
+
 pub fn sysGetKeyState(arg1: u32) u32 {
     if (arg1 < 256) return @intFromBool(keyboard.key_state[arg1]);
     return 0;
