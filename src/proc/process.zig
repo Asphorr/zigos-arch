@@ -4007,14 +4007,25 @@ pub fn handleUserPageFault(cr2: usize, error_code: u64) bool {
                             frame_opt = f2;
                         } else |_| {}
                     }
-                    // Still nothing? Evict a BATCH of cold pages of this
-                    // process out to swap and retry — THIS is what lets a
-                    // process allocate and run past physical RAM instead of
-                    // being OOM-killed. The batch must be big enough to climb
-                    // back above the reserve-aware user-alloc floor (evicting
-                    // just a handful leaves free below the reserve and the
-                    // retry alloc still fails).
-                    if (frame_opt == null and reclaimViaSwap(pd, lead, va_aligned, lead.pcid, 64) > 0) {
+                    // Still nothing? Evict cold pages of this process out to
+                    // swap and retry — THIS is what lets a process run past
+                    // physical RAM instead of being OOM-killed. The batch must
+                    // be big enough to climb back ACROSS the reserve-aware
+                    // user-alloc floor: swap-ins use the reserve-EXEMPT
+                    // allocFrame and can leave free FAR below the reserve, so a
+                    // fixed small batch (the old 64) can't lift this
+                    // allocFrameUser back over it -> spurious OOM-kill. Reclaim
+                    // the actual deficit (reserve - free, + margin for the data
+                    // page and its PT/PD/PDPT levels). Loop a few times in case
+                    // one scan only partially fills the gap or a peer races us;
+                    // reclaimViaSwap returning 0 means nothing left to evict =
+                    // genuine OOM, so stop.
+                    var rtries: u8 = 0;
+                    while (frame_opt == null and rtries < 8) : (rtries += 1) {
+                        const reserve = pmm.userReserveFrames();
+                        const free_now = pmm.freeFrameCount();
+                        const want: usize = if (free_now <= reserve) (reserve - free_now) + 16 else 16;
+                        if (reclaimViaSwap(pd, lead, va_aligned, lead.pcid, want) == 0) break;
                         if (vmm.allocAndMapUserPage(pd, va_aligned, vmm.protToMapFlags(r.prot))) |f3| {
                             frame_opt = f3;
                         } else |_| {}

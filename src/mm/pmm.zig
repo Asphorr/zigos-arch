@@ -645,6 +645,15 @@ pub fn freeFrameCount() u32 {
     return total_frames;
 }
 
+/// The kernel emergency reserve, in frames: allocFrameUser refuses to allocate
+/// once free <= this. Exposed so the swap reclaim path can evict ENOUGH cold
+/// pages to lift free back ACROSS the reserve — a fresh user fault otherwise
+/// can't allocate after swap-ins (which use the reserve-exempt allocFrame)
+/// have driven free below it.
+pub fn userReserveFrames() u32 {
+    return pmm_user_reserve;
+}
+
 /// User-faulting variant of allocFrame. Refuses to dip below the kernel
 /// emergency reserve so a runaway user app can't exhaust PMM to the
 /// point where the kernel itself can't allocate page tables / kstacks
