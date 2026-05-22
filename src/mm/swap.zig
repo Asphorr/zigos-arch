@@ -46,6 +46,7 @@ var slot_lock: SpinLock = .{};
 // Stats (Phase 2/3 will bump these).
 pub var pages_out: u64 = 0; // pages written to swap (evictions)
 pub var pages_in: u64 = 0; // pages read back (swap-ins)
+pub var pages_second_chance: u64 = 0; // candidates spared by the clock (A bit set) — bumped by reclaimViaSwap
 
 inline fn bitGet(slot: usize) bool {
     return (slot_used[slot >> 3] & (@as(u8, 1) << @as(u3, @intCast(slot & 7)))) != 0;
@@ -252,7 +253,7 @@ pub fn evictFrame(pte_ptr: *u64, va: usize, pcid: u16) bool {
     pmm.freeFrame(frame);
     pages_out += 1;
     if (pages_out == 1 or pages_out % 4096 == 0)
-        debug.klog("[swap] out={d} in={d} slots={d}/{d}\n", .{ pages_out, pages_in, used_count, NUM_SLOTS });
+        debug.klog("[swap] out={d} in={d} sc={d} slots={d}/{d}\n", .{ pages_out, pages_in, pages_second_chance, used_count, NUM_SLOTS });
     return true;
 }
 
@@ -282,6 +283,6 @@ pub fn swapInFrame(pte_ptr: *u64, va: usize, flags: u64, pcid: u16) bool {
     freeSlot(slot);
     pages_in += 1;
     if (pages_in == 1 or pages_in % 4096 == 0)
-        debug.klog("[swap] out={d} in={d} slots={d}/{d}\n", .{ pages_out, pages_in, used_count, NUM_SLOTS });
+        debug.klog("[swap] out={d} in={d} sc={d} slots={d}/{d}\n", .{ pages_out, pages_in, pages_second_chance, used_count, NUM_SLOTS });
     return true;
 }

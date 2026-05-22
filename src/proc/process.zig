@@ -3851,6 +3851,14 @@ fn reclaimViaSwap(pml4: [*]align(4096) u64, lead: *PCB, skip_va: usize, pcid: u1
     var freed: usize = 0;
     var iters: usize = 0;
     const ITER_CAP: usize = 16384; // bounds total work (pages examined + gap hops)
+    // Second-chance (clock) aging: a recently-accessed page gets its A bit
+    // cleared and is skipped this sweep rather than evicted. skip_budget bounds
+    // how many such reprieves we hand out so an all-hot working set still makes
+    // progress (once spent, we evict regardless of A) — without this bound a
+    // freshly-touched buffer (every page A=1) would clear A's and evict nothing,
+    // and the OOM caller would mistake freed==0 for genuine exhaustion.
+    var skipped: usize = 0;
+    const skip_budget: usize = want * 2;
     var va = lead.swap_clock_va;
     while (freed < want and iters < ITER_CAP) : (iters += 1) {
         // Is va inside a (non-empty) lazy region? Phase 3: we evict ANY private
@@ -3898,13 +3906,29 @@ fn reclaimViaSwap(pml4: [*]align(4096) u64, lead: *PCB, skip_va: usize, pcid: u1
             if (vmm.userPtePtr(pml4, va)) |pte_ptr| {
                 const pte = pte_ptr.*;
                 if ((pte & paging.PRESENT) != 0 and (pte & paging.COW) == 0) {
-                    if (swap.evictFrame(pte_ptr, va, pcid)) freed += 1;
+                    if ((pte & paging.ACCESSED) != 0 and skipped < skip_budget) {
+                        // Recently used: clear A and give it another sweep
+                        // instead of evicting. Local INVLPG so the CPU re-sets
+                        // A on the next touch (else the cached TLB entry keeps
+                        // A=0 and the page looks cold next sweep -> we'd evict a
+                        // hot page anyway). Approximate cross-CPU aging is fine
+                        // — a peer's stale A just spares the page once more.
+                        pte_ptr.* = pte & ~paging.ACCESSED;
+                        asm volatile ("invlpg (%[v])"
+                            :
+                            : [v] "r" (va),
+                            : .{ .memory = true });
+                        skipped += 1;
+                    } else if (swap.evictFrame(pte_ptr, va, pcid)) {
+                        freed += 1;
+                    }
                 }
             }
         }
         va += 0x1000;
     }
     lead.swap_clock_va = va;
+    swap.pages_second_chance +%= skipped;
     return freed;
 }
 

@@ -15,6 +15,12 @@ pub const READ_WRITE: u64 = 1 << 1;
 pub const USER: u64 = 1 << 2;
 pub const WRITE_THROUGH: u64 = 1 << 3; // PWT — write-through caching
 pub const CACHE_DISABLE: u64 = 1 << 4; // PCD — uncached (set for MMIO)
+// Bit 5 (A) — set by the CPU on any access to the page; the swap clock clears
+// it (+ INVLPG) to give a recently-used page a second chance before eviction.
+pub const ACCESSED: u64 = 1 << 5;
+// Bit 6 (D) — set by the CPU on write. Lets a clean file-backed page be
+// discarded (re-faultable from source) instead of written to swap.
+pub const DIRTY: u64 = 1 << 6;
 // Multi-level: at PDPT entry = 1GB page, at PD entry = 2MB page. Never set
 // at PML4 in our setup (would mean 512GB pages, no boot path uses them).
 pub const PAGE_SIZE_FLAG: u64 = 1 << 7;
