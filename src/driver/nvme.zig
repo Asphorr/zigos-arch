@@ -128,7 +128,7 @@ const CqEntry = extern struct {
 };
 
 const Q_DEPTH: u16 = 16;
-const MAX_CONTROLLERS: usize = 2;
+const MAX_CONTROLLERS: usize = 3; // 0 = tarfs, 1 = ext2, 2 = swap
 const SECTOR_SIZE: u32 = 512;
 
 /// Compile-time toggle for the async I/O path. When **true** (default
@@ -281,6 +281,10 @@ const Controller = struct {
     // flips this to true after migrating all readers/writers off the
     // synchronous path. Read by `nvmeIrqHandler` on every IRQ.
     async_mode: bool = false,
+    // When true, enableAsync() skips this controller so it stays on the polled
+    // sync path. swap sets this (its I/O runs in the page-fault handler, which
+    // must not block on an IRQ-wake).
+    sync_only: bool = false,
 
     /// Gap #12 (2026-05-20): per-controller count of CQEs that
     /// `reapCq` actually processed. Bumped each time a completion was
@@ -297,7 +301,7 @@ const Controller = struct {
     queue_full_retries: u64 = 0,
 };
 
-var controllers: [MAX_CONTROLLERS]Controller = .{ .{}, .{} };
+var controllers: [MAX_CONTROLLERS]Controller = .{ .{}, .{}, .{} };
 var num_controllers: usize = 0;
 pub var irq_count: u64 = 0;
 
@@ -1568,6 +1572,48 @@ pub fn readSectorsSecondary(lba: u32, count: u8, dest: [*]u8) void {
     }
 }
 
+/// Generic indexed sector I/O for callers that aren't the FS primary/secondary
+/// — currently the swap subsystem on controller #2. Chunks by
+/// MAX_SECTORS_PER_CMD. Returns false if `idx` isn't an initialized controller.
+/// `dest`/`src` is a kernel VA; a physmap VA is fine (ioCommand does the DMA
+/// translation), which is how swap passes physToVirt(frame).
+pub fn readSectorsOn(idx: usize, lba: u32, count: u32, dest: [*]u8) bool {
+    if (idx >= num_controllers) return false;
+    const c = &controllers[idx];
+    var done: u32 = 0;
+    while (done < count) {
+        const chunk: u32 = @min(count - done, MAX_SECTORS_PER_CMD);
+        if (!ioCommand(c, IO_READ, lba + done, @intFromPtr(dest) + done * c.block_size, chunk)) return false;
+        done += chunk;
+    }
+    return true;
+}
+
+pub fn writeSectorsOn(idx: usize, lba: u32, count: u32, src: [*]const u8) bool {
+    if (idx >= num_controllers) return false;
+    const c = &controllers[idx];
+    var done: u32 = 0;
+    while (done < count) {
+        const chunk: u32 = @min(count - done, MAX_SECTORS_PER_CMD);
+        if (!ioCommand(c, IO_WRITE, lba + done, @intFromPtr(src) + done * c.block_size, chunk)) return false;
+        done += chunk;
+    }
+    return true;
+}
+
+/// Number of initialized NVMe controllers (swap.zig checks this to see if its
+/// dedicated device is present).
+pub fn controllerCount() usize {
+    return num_controllers;
+}
+
+/// Keep controller `idx` on the polled (sync) I/O path — enableAsync() skips
+/// it. Used by swap, whose I/O runs in the page-fault handler and must not
+/// block on an IRQ-wake. Call before enableAsync().
+pub fn markSyncOnly(idx: usize) void {
+    if (idx < num_controllers) controllers[idx].sync_only = true;
+}
+
 /// Commit any in-flight writes to non-volatile storage on the primary
 /// controller. Returns true on success. Callers concerned about
 /// crash-consistency (file commits, shutdown) should call this after
@@ -1601,6 +1647,7 @@ pub fn enableAsync() void {
     if (!ASYNC_BUILD_ENABLED) return;
     var i: usize = 0;
     while (i < num_controllers) : (i += 1) {
+        if (controllers[i].sync_only) continue; // swap device stays polled
         controllers[i].async_mode = true;
         // 2026-05-20 cleanup: the legacy single-page `bounce_buf` field
         // is gone. Sync path now uses `bounce_bufs[0]`, which stays

@@ -290,6 +290,28 @@ pub fn resolveUserPhys(pml4: [*]align(4096) u64, virt: usize) ?usize {
     return entryPhys(pt[pt_idx]);
 }
 
+/// Pointer to the leaf PTE for `virt` in `pml4`, or null if the page tables
+/// down to the PT don't exist (an upper level not present, or a huge page).
+/// Unlike resolveUserPhys, this returns the pointer EVEN when the leaf itself
+/// is not present — so the swap subsystem can read/rewrite a swapped-out
+/// (not-present) entry, and the page-fault handler can test for one.
+pub fn userPtePtr(pml4: [*]align(4096) u64, virt: usize) ?*u64 {
+    if (virt < USER_SPACE_START or virt >= USER_SPACE_END) return null;
+    const vaddr: u64 = @intCast(virt);
+    const pml4_idx = (vaddr >> 39) & 0x1FF;
+    const pdpt_idx = (vaddr >> 30) & 0x1FF;
+    const pd_idx = (vaddr >> 21) & 0x1FF;
+    const pt_idx = (vaddr >> 12) & 0x1FF;
+
+    if (pml4[pml4_idx] & PRESENT == 0) return null;
+    const pdpt = tableFromEntry(pml4[pml4_idx]);
+    if (pdpt[pdpt_idx] & PRESENT == 0 or pdpt[pdpt_idx] & PAGE_SIZE_FLAG != 0) return null;
+    const pd = tableFromEntry(pdpt[pdpt_idx]);
+    if (pd[pd_idx] & PRESENT == 0 or pd[pd_idx] & PAGE_SIZE_FLAG != 0) return null;
+    const pt = tableFromEntry(pd[pd_idx]);
+    return &pt[pt_idx];
+}
+
 /// Bit 63 of a 64-bit PTE — when set (and EFER.NXE=1), executing from this
 /// page traps as a page fault. We enable NXE in `syscall_entry.init` so this
 /// bit takes effect.

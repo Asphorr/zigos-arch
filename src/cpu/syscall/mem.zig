@@ -214,6 +214,14 @@ pub fn sysMunmap(va: u32, len: u32) u32 {
     const tlb = @import("../tlb.zig");
     if ((end - start) == 0x1000) {
         tlb.shootdownPage(lead.pcid, start);
+        // Local INVLPG backstop. shootdownPage's own local flush is INVPCID
+        // type-0, which under-invalidates under nested virt (we always run as
+        // an L2 guest) and can leave a stale PRESENT entry for `start` on THIS
+        // CPU — a read/write into the just-freed (and possibly recycled) frame.
+        // INVLPG is reliably emulated and INVPCID-independent. Peers are
+        // covered by the .single_page PCID gen-bump (see tlb.zig doShootdown).
+        // Symmetric to the swap-eviction fix (swap.zig).
+        tlb.flushPageLocal(start);
     } else {
         tlb.shootdownAll(lead.pcid);
     }
@@ -305,6 +313,11 @@ pub fn sysMprotect(va: u32, len: u32, prot: u32) u32 {
     const tlb = @import("../tlb.zig");
     if (len_pg == 0x1000) {
         tlb.shootdownPage(pcb.pcid, start);
+        // Local INVLPG backstop — see sysMunmap. Without it, an mprotect
+        // narrowing (RW→RO) could leave a stale WRITABLE entry on THIS CPU
+        // under nested virt (type-0 under-invalidation) = a W^X bypass until
+        // that entry happens to evict. Peers covered by the gen-bump.
+        tlb.flushPageLocal(start);
     } else {
         tlb.shootdownAll(pcb.pcid);
     }

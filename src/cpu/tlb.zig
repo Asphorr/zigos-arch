@@ -246,16 +246,35 @@ fn doShootdown(mode: Mode, affected_pcid: u16, va: u64) void {
 
     const t_acked = perf.rdtsc();
 
-    // Local flush in the same mode the peers used. Then optionally bump
-    // the PCID generation counter (only for whole-context flushes — for
-    // single-page mode we just removed one entry, the rest of the PCID
-    // is still valid and peers should NOT lazy-flush on next CR3 load).
+    // Local flush in the same mode the peers used. Then bump the PCID
+    // generation counter so peers lazy-flush this PCID on their next CR3
+    // load.
     //
-    // Hypercall path already flushed self via FLUSH_ALL_PROCESSORS, so
-    // skip the local flush there — but still bump PCID gen as a belt-
-    // and-suspenders defense (same reason as the IPI path).
+    // Why .single_page is bumped too (it used to be excluded): the peer IPI
+    // handler flushes a single_page shootdown via INVPCID type-0
+    // (flushLocalForMode), and under nested virt — this kernel always runs as
+    // an L2 guest — INVPCID type-0 has been observed to UNDER-invalidate,
+    // leaving a stale PRESENT entry for (pcid, va) on a peer. If a single-
+    // threaded process then migrates to that peer, it would read the freed-
+    // and-reused frame through the stale entry without faulting (silent
+    // corruption — the swap-eviction data-loss bug). Bumping the gen forces
+    // the peer to full-flush this PCID on the CR3 load that brings the process
+    // back, so the stale entry can never be USED. The local CPU is already
+    // covered: the swap path flushes via INVLPG (tlb.flushPageLocal) and the
+    // bump catches local_gen up so the sender doesn't redundantly full-flush.
+    // Cost is one PCID flush per migration (bumps between migrations collapse
+    // to one), not per shootdown.
+    //
+    // REMAINING GAP (not closed here): two threads of the SAME pcid running
+    // concurrently on both CPUs — the peer is mid-execution and won't reload
+    // CR3, so the gen bump doesn't help. Closing that needs the peer IPI
+    // handler to escalate .single_page to an all-context flush under nested
+    // virt. Pre-existing (mprotect/COW), COW-masked, tracked as a follow-up.
+    //
+    // Hypercall path already flushed self via FLUSH_ALL_PROCESSORS, so skip
+    // the local flush there — but still bump PCID gen for the same reason.
     if (!via_hypercall) flushLocalForMode();
-    if ((mode == .single_context or mode == .full) and affected_pcid != 0) {
+    if (affected_pcid != 0) {
         pcid.bumpAfterShootdown(affected_pcid, me);
     }
 
@@ -311,4 +330,18 @@ pub fn shootdownPage(affected_pcid: u16, va: u64) void {
         return;
     }
     doShootdown(.single_page, affected_pcid, va & ~@as(u64, 0xFFF));
+}
+
+/// Invalidate THIS CPU's TLB entry for `va` in the currently-loaded PCID via
+/// plain INVLPG. Reliable and INVPCID-independent — used as the local-flush
+/// backstop on the swap path, where the faulting CPU IS running the affected
+/// address space and where nested-virt INVPCID type-0 has been observed to
+/// under-invalidate (leaving a stale PRESENT entry on a freed-and-reused frame
+/// -> silent corruption). INVLPG flushes the loaded PCID's mapping for `va`,
+/// which on the faulting CPU is exactly the affected (pcid, va).
+pub fn flushPageLocal(va: usize) void {
+    asm volatile ("invlpg (%[v])"
+        :
+        : [v] "r" (va),
+        : .{ .memory = true });
 }

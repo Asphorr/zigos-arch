@@ -24,6 +24,13 @@ if [ ! -f ext2.img ]; then
     exit 1
 fi
 
+# Swap backing disk — raw 128 MiB image presented as a 3rd NVMe controller.
+# Created on first run so a fresh checkout works without a manual dd step.
+if [ ! -f swap.img ]; then
+    dd if=/dev/zero of=swap.img bs=1M count=128 status=none
+    echo "[run-uefi-ext2] Created swap.img (128 MiB swap disk)"
+fi
+
 # Archive previous serial.log into crashes/ (last 20). Same scheme as run-uefi.sh.
 mkdir -p crashes
 if [ -f serial.log ]; then
@@ -72,6 +79,8 @@ VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json \
     -drive file=fat:rw:zig-out/esp,index=1,if=ide \
     -drive file=ext2.img,format=raw,if=none,id=nvm_ext2 \
     -device nvme,drive=nvm_ext2,serial=zigos-ext2 \
+    -drive file=swap.img,format=raw,if=none,id=nvm_swap \
+    -device nvme,drive=nvm_swap,serial=zigos-swap \
     -serial file:serial.log "$@"
 
 # Post-mortem: parse [crash-fp] lines into crashes/db.csv and warn on dups.

@@ -28,6 +28,9 @@ pub fn init() void {
     if (nvme.init()) {
         backend = .nvme;
         debug.klog("[block] using NVMe\n", .{});
+        // Swap backing store lives on a dedicated NVMe disk (controller #2);
+        // no-op if that device isn't present. Must run after nvme.init().
+        @import("../mm/swap.zig").init();
         return;
     }
     if (ahci.init()) {

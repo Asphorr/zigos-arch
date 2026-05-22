@@ -137,11 +137,13 @@ pub fn restoreSaved(saved_cr3: u64, cpu_id: u8) void {
 /// `loadCr3(pcid, ...)` and flush. Also catches the local CPU up so its
 /// next reload (post-flushLocalTlb) sets bit 63 = 1.
 ///
-/// Kept as belt-and-suspenders even when INVPCID is in use: INVPCID
-/// type 1 explicitly flushes the named PCID's entries on the peer CPU,
-/// so the lazy-flush mechanism is redundant in that path. The cost is
-/// one atomic increment per shootdown — cheap enough to keep as
-/// defense against a stray entry slipping past the INVPCID issue.
+/// For .single_context (INVPCID type 1) the peer flush is reliable and this
+/// is merely belt-and-suspenders. For .single_page (INVPCID type 0) it is
+/// LOAD-BEARING under nested virt: type-0 has been observed to under-
+/// invalidate on a peer, and this lazy full-PCID flush on the peer's next
+/// CR3 load is what guarantees a migrated process never reads through the
+/// stale (pcid, va) entry. See doShootdown for the full rationale. Cost is
+/// one atomic increment per shootdown.
 pub fn bumpAfterShootdown(pcid: u16, cpu_id: u8) void {
     if (!protect.pcid_supported or pcid == 0 or pcid >= MAX_PCID) return;
     const new_gen = global_gen[pcid].fetchAdd(1, .acq_rel) + 1;

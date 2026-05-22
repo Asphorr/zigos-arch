@@ -5,6 +5,7 @@ const vmm = @import("../mm/vmm.zig");
 const pcid_mod = @import("../cpu/pcid.zig");
 const heap = @import("../mm/heap.zig");
 const pmm = @import("../mm/pmm.zig");
+const swap = @import("../mm/swap.zig");
 const symbols = @import("../debug/symbols.zig");
 const smp = @import("../cpu/smp.zig");
 const memmap = @import("../mm/memmap.zig");
@@ -212,6 +213,10 @@ pub const PCB = struct {
     // Index of the lazy region tracking the heap (sbrk). -1 = no heap region
     // has been registered yet. Allows sysSbrk to extend in place across calls.
     heap_lazy_idx: i8 = -1,
+    // Swap clock cursor (a user VA): reclaimViaSwap resumes its cold-page
+    // eviction scan from here so it doesn't rescan already-evicted pages on
+    // every fault (turns an O(n^2) linear-scan workload into O(n)).
+    swap_clock_va: usize = 0,
     // Per-process kernel-side ELF buffer (PMM-allocated contiguous frames).
     // Lazy regions for PT_LOAD segments reference this; freed on process destroy.
     elf_buf: ?[*]u8 = null,
@@ -3834,6 +3839,76 @@ pub fn ensureUserRangeWritable(va: usize, len: usize) bool {
 /// regions. If the address is inside a registered region, allocate+map a
 /// fresh zero page, flush TLB, and return true. The caller (PF handler) can
 /// then sysret without killing the process.
+/// Free up to `want` physical frames by evicting cold, present, non-COW pages
+/// of `lead`'s lazy regions out to swap (Phase 2: intra-process only). A
+/// per-lead clock cursor (`swap_clock_va`) resumes the scan where it left off
+/// so a linear >RAM workload stays O(n), and ITER_CAP bounds per-call work.
+/// Skips `skip_va` (the page currently being faulted in). Returns frames freed;
+/// no-op if swap is unavailable.
+fn reclaimViaSwap(pml4: [*]align(4096) u64, lead: *PCB, skip_va: usize, pcid: u16, want: usize) usize {
+    if (!swap.available or lead.lazy_count == 0) return 0;
+    const paging = @import("../mm/paging.zig");
+    var freed: usize = 0;
+    var iters: usize = 0;
+    const ITER_CAP: usize = 16384; // bounds total work (pages examined + gap hops)
+    var va = lead.swap_clock_va;
+    while (freed < want and iters < ITER_CAP) : (iters += 1) {
+        // Is va inside a (non-empty) lazy region? Also note whether that region
+        // is file-backed (ELF code/rodata, file mmap): we do NOT swap those
+        // out. They're clean (re-faultable from `source`), so swapping them is
+        // wasteful — and, critically, kernel-mode syscall pointer validation
+        // (validateUserPtr) walks the PT and would see the swapped (not-present)
+        // PTE as unmapped, returning E_FAULT when an app passes e.g. a string
+        // literal to write(). Phase 2 swaps anonymous pages only; teaching the
+        // kernel user-access path to swap-in on demand is a Phase 3 item.
+        var in_region = false;
+        var src_backed = false;
+        var k: u8 = 0;
+        while (k < lead.lazy_count) : (k += 1) {
+            const r = lead.lazy_regions[k];
+            if (r.end > r.start and va >= r.start and va < r.end) {
+                in_region = true;
+                src_backed = (r.source != null);
+                break;
+            }
+        }
+        if (!in_region) {
+            // Jump to the next region start above va, else wrap to the lowest.
+            var next_start: usize = 0;
+            var found = false;
+            var lo: usize = 0;
+            var any = false;
+            var j: u8 = 0;
+            while (j < lead.lazy_count) : (j += 1) {
+                const r = lead.lazy_regions[j];
+                if (r.end <= r.start) continue;
+                if (!any or r.start < lo) {
+                    lo = r.start;
+                    any = true;
+                }
+                if (r.start > va and (!found or r.start < next_start)) {
+                    next_start = r.start;
+                    found = true;
+                }
+            }
+            if (!any) break; // no non-empty regions
+            va = if (found) next_start else lo;
+            continue;
+        }
+        if (va != skip_va and !src_backed) {
+            if (vmm.userPtePtr(pml4, va)) |pte_ptr| {
+                const pte = pte_ptr.*;
+                if ((pte & paging.PRESENT) != 0 and (pte & paging.COW) == 0) {
+                    if (swap.evictFrame(pte_ptr, va, pcid)) freed += 1;
+                }
+            }
+        }
+        va += 0x1000;
+    }
+    lead.swap_clock_va = va;
+    return freed;
+}
+
 pub fn handleUserPageFault(cr2: usize, error_code: u64) bool {
     // Must be user-mode access (U=1, bit 2). Both non-present (P=0) and
     // protection violations (P=1) are valid lazy-fault triggers — the
@@ -3869,6 +3944,29 @@ pub fn handleUserPageFault(cr2: usize, error_code: u64) bool {
         const r = lead.lazy_regions[i];
         if (cr2 < r.start or cr2 >= r.end) continue;
         const va_aligned = cr2 & ~@as(usize, 0xFFF);
+
+        // Swap-in: if this VA was evicted to swap, page it back in instead of
+        // fresh-allocating a zero page (which would discard its contents and
+        // leak the swap slot). The lazy region still exists; only the physical
+        // frame was reclaimed. swap_failed => genuine OOM swapping in; skip the
+        // fresh-alloc and fall through to the OOM-kill.
+        var swap_failed = false;
+        if (swap.available) {
+            if (vmm.userPtePtr(pd, va_aligned)) |sp| {
+                if (swap.pteIsSwapped(sp.*)) {
+                    // Make sure a frame is free for the read-in; evict cold
+                    // pages of this process if memory is exhausted.
+                    if (pmm.freeFrameCount() < 64) _ = reclaimViaSwap(pd, lead, va_aligned, lead.pcid, 64);
+                    if (swap.swapInFrame(sp, va_aligned, vmm.protToMapFlags(r.prot), lead.pcid)) {
+                        @import("../debug/kdbg.zig").pfEvent(@intCast(cur), cr2, @truncate(error_code), 0, true);
+                        return true;
+                    }
+                    debug.klog("[swap] swap-in FAILED pid={d} va=0x{X} — out of memory, killing\n", .{ cur, va_aligned });
+                    swap_failed = true;
+                }
+            }
+        }
+
         // Gap #1+#5 (2026-05-20): allocAndMapUserPage now returns a named
         // MapError instead of null. Oom is the only retry-worthy variant
         // (caches might free under pressure); BadVA / KernelHeap mean the
@@ -3876,27 +3974,36 @@ pub fn handleUserPageFault(cr2: usize, error_code: u64) bool {
         // helps, fall straight through to OOM-kill (with a distinct log
         // line so the autopsy knows it wasn't memory pressure).
         var frame_opt: ?usize = null;
-        if (vmm.allocAndMapUserPage(pd, va_aligned, vmm.protToMapFlags(r.prot))) |f| {
-            frame_opt = f;
-        } else |e1| {
-            if (e1 == error.Oom) {
-                // Memory pressure response: ask registered modules to
-                // shed reclaimable caches (GUI back-buffers etc.), then
-                // retry the alloc ONCE. Reclaim frees up to N × num_pages
-                // frames where N is the number of back-buffer slots across
-                // all visible GUI windows — typically enough to handle a
-                // single page fault. If even that doesn't cover the demand,
-                // we fall through to OOM-kill below.
-                const reclaimed = pmm.tryReclaim(1);
-                if (reclaimed > 0) {
-                    if (vmm.allocAndMapUserPage(pd, va_aligned, vmm.protToMapFlags(r.prot))) |f2| {
-                        frame_opt = f2;
-                    } else |_| {}
+        if (!swap_failed) {
+            if (vmm.allocAndMapUserPage(pd, va_aligned, vmm.protToMapFlags(r.prot))) |f| {
+                frame_opt = f;
+            } else |e1| {
+                if (e1 == error.Oom) {
+                    // Memory pressure response: ask registered modules to
+                    // shed reclaimable caches (GUI back-buffers etc.), then
+                    // retry the alloc ONCE.
+                    if (pmm.tryReclaim(1) > 0) {
+                        if (vmm.allocAndMapUserPage(pd, va_aligned, vmm.protToMapFlags(r.prot))) |f2| {
+                            frame_opt = f2;
+                        } else |_| {}
+                    }
+                    // Still nothing? Evict a BATCH of cold pages of this
+                    // process out to swap and retry — THIS is what lets a
+                    // process allocate and run past physical RAM instead of
+                    // being OOM-killed. The batch must be big enough to climb
+                    // back above the reserve-aware user-alloc floor (evicting
+                    // just a handful leaves free below the reserve and the
+                    // retry alloc still fails).
+                    if (frame_opt == null and reclaimViaSwap(pd, lead, va_aligned, lead.pcid, 64) > 0) {
+                        if (vmm.allocAndMapUserPage(pd, va_aligned, vmm.protToMapFlags(r.prot))) |f3| {
+                            frame_opt = f3;
+                        } else |_| {}
+                    }
+                } else {
+                    debug.klog("[vmm] lazy fault REJECTED virt=0x{X} {s} — region[{d}] (0x{X}..0x{X}) prot=0x{X}\n", .{
+                        va_aligned, @errorName(e1), i, r.start, r.end, r.prot,
+                    });
                 }
-            } else {
-                debug.klog("[vmm] lazy fault REJECTED virt=0x{X} {s} — region[{d}] (0x{X}..0x{X}) prot=0x{X}\n", .{
-                    va_aligned, @errorName(e1), i, r.start, r.end, r.prot,
-                });
             }
         }
         const frame = frame_opt orelse {
