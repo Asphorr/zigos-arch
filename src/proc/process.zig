@@ -3767,6 +3767,69 @@ fn handleCowFault(pml4: [*]align(4096) u64, cr2: usize) bool {
     return true;
 }
 
+/// Ensure every page overlapping [va, va+len) in the CURRENT process's user
+/// address space is present AND writable, performing the same lazy fault-in +
+/// copy-on-write break the ring-3 #PF path does — but proactively, WITHOUT
+/// taking a fault. Returns false if any page can't be made writable (no lazy
+/// region covers it, or OOM).
+///
+/// WHY this exists: signal delivery writes the handler frame DIRECTLY to the
+/// user stack inside a SMAP `stac` bracket. This kernel's #PF handler only
+/// services ring-3 faults (idt.zig gates lazy/COW on `saved_cs & 3`), so a
+/// kernel-mode (stac'd) write to a not-yet-faulted-in or still-COW stack page
+/// would hit the kernel-fault autopsy and PANIC instead of paging in. The
+/// realistic triggers are a freshly fork()'d process whose stack is still COW,
+/// and a frame that spans into a lower stack page not yet lazily mapped.
+/// Pre-resolving the frame's pages here removes the fault entirely.
+///
+/// Mirrors handleUserPageFault's COW (handleCowFault) + lazy (allocAndMapUserPage)
+/// dispatch, but keyed on the live PTE state rather than a fault error code.
+/// Adds an explicit invlpg after a fresh map: mapUserPage only flushes on the
+/// remap path (the fault path relies on the faulting instruction's re-walk,
+/// which a proactive caller doesn't have).
+pub fn ensureUserRangeWritable(va: usize, len: usize) bool {
+    if (len == 0) return true;
+    const cur = smp.myCpu().current_pid orelse return false;
+    const pcb = &procs[cur];
+    const pd = pcb.page_directory orelse return false;
+    const lead = leader(pcb);
+
+    var p = va & ~@as(usize, 0xFFF);
+    const end_excl = va +% len;
+    while (p < end_excl) : (p += 0x1000) {
+        if (vmm.resolveUserPhys(pd, p) != null) {
+            // Present — break COW if needed. handleCowFault breaks + invlpg's a
+            // COW page, and is a safe no-op on a non-COW page.
+            _ = handleCowFault(pd, p);
+            // A present page that is STILL read-only (e.g. an app that
+            // mprotect'd its own stack region read-only) can't take our write —
+            // fail delivery so the caller kills it (≈ SIGSEGV) rather than
+            // panic on the kernel-mode #PF this kernel's ring-3-only handler
+            // won't service.
+            const paging = @import("../mm/paging.zig");
+            const pte_ptr = findUserPte(pd, p) orelse return false;
+            if (pte_ptr.* & paging.READ_WRITE == 0) return false;
+        } else {
+            // Not present — lazy fault-in via the owning region.
+            var mapped = false;
+            var i: u8 = 0;
+            while (i < lead.lazy_count) : (i += 1) {
+                const r = lead.lazy_regions[i];
+                if (p < r.start or p >= r.end) continue;
+                _ = vmm.allocAndMapUserPage(pd, p, vmm.protToMapFlags(r.prot)) catch return false;
+                asm volatile ("invlpg (%[addr])"
+                    :
+                    : [addr] "r" (p),
+                    : .{ .memory = true });
+                mapped = true;
+                break;
+            }
+            if (!mapped) return false; // no lazy region covers this page
+        }
+    }
+    return true;
+}
+
 /// Resolve a faulting user address against the current process's lazy
 /// regions. If the address is inside a registered region, allocate+map a
 /// fresh zero page, flush TLB, and return true. The caller (PF handler) can

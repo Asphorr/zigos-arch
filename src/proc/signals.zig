@@ -31,6 +31,7 @@ const debug = @import("../debug/debug.zig");
 const smp = @import("../cpu/smp.zig");
 const memmap = @import("../mm/memmap.zig");
 const config = @import("../config.zig");
+const protect = @import("../cpu/protect.zig");
 
 pub const NSIG: u32 = config.NSIG;
 
@@ -267,7 +268,15 @@ pub const ExcFrame = extern struct {
     ss: u64,
 };
 
-const USER_BASE: u64 = memmap.USER_VA_FLOOR;
+// Lowest legitimate user VA for signal frames. This MUST be USER_SPACE_START,
+// not USER_VA_FLOOR: the user *stack* lives in [USER_SPACE_START, USER_VA_FLOOR)
+// (the 1 MB reserve just under the ELF load base — see memmap.zig), and we write
+// the handler frame / read the sigreturn MContext on that stack. Using
+// USER_VA_FLOOR (the code load base) rejected every RSP in the stack region, so
+// layoutHandlerFrame failed and we KILLED any process that had a real SIGINT
+// handler (shell, httpd, …) with 0xDEAD0002 instead of running its handler —
+// the long-standing "Ctrl+C does nothing / kills the shell" bug.
+const USER_BASE: u64 = memmap.USER_SPACE_START;
 const USER_END: u64 = memmap.USER_SPACE_END;
 
 fn validateUserRange(addr: u64, len: u64) bool {
@@ -480,6 +489,20 @@ pub fn deliverFromSyscallFrame(pcb: *process.PCB, frame: *SyscallFrame, retval: 
             return retval;
         };
 
+        // The handler frame goes DIRECTLY onto the user stack (unlike syscall
+        // arg copies, which go through the physmap), so under CR4.SMAP we must:
+        //  1. Pre-resolve the frame's pages (lazy fault-in + COW break) NOW. A
+        //     kernel-mode write that faults here is NOT serviced by this
+        //     kernel's ring-3-only #PF path — it would panic. (Triggers: a
+        //     freshly-forked process with a still-COW stack, or a frame
+        //     spanning into a lower stack page not yet lazily mapped.)
+        //  2. Bracket the writes — mctx, writeSiginfo, RA, and the mctx.rflags
+        //     read-back below — with stac/clac so SMAP permits kernel access.
+        if (!process.ensureUserRangeWritable(layout.ra_va, old_user_rsp - layout.ra_va)) {
+            process.destroyCurrentWithStatus(0xDEAD0000 | sig);
+            return retval;
+        }
+        protect.allowUserAccess();
         const mctx_ptr: *MContext = @ptrFromInt(layout.mctx_va);
         mctx_ptr.* = .{
             .magic = MCONTEXT_MAGIC,
@@ -519,6 +542,7 @@ pub fn deliverFromSyscallFrame(pcb: *process.PCB, frame: *SyscallFrame, retval: 
         frame.rsi = layout.siginfo_va; // 0 when SA_SIGINFO not set
         frame.rdx = layout.mctx_va;
         frame.user_rsp = layout.ra_va;
+        protect.disallowUserAccess(); // end user-frame access (covers the rflags read-back above)
 
         applyHandlerMaskUpdate(pcb, sig, sa);
         if ((sa.flags & SA_RESETHAND) != 0) sa.handler = SIG_DFL;
@@ -556,6 +580,13 @@ pub fn deliverFromIrqFrame(pcb: *process.PCB, frame: *IrqFrame) void {
             return;
         };
 
+        // SMAP: pre-resolve frame pages (no-fault lazy/COW) + bracket the
+        // direct user-stack frame writes. See deliverFromSyscallFrame.
+        if (!process.ensureUserRangeWritable(layout.ra_va, old_user_rsp - layout.ra_va)) {
+            process.destroyCurrentWithStatus(0xDEAD0000 | sig);
+            return;
+        }
+        protect.allowUserAccess();
         const mctx_ptr: *MContext = @ptrFromInt(layout.mctx_va);
         mctx_ptr.* = .{
             .magic = MCONTEXT_MAGIC,
@@ -590,6 +621,7 @@ pub fn deliverFromIrqFrame(pcb: *process.PCB, frame: *IrqFrame) void {
         frame.rdi = sig;
         frame.rsi = layout.siginfo_va;
         frame.rdx = layout.mctx_va;
+        protect.disallowUserAccess(); // end user-frame access
 
         // iretq-canary refresh (task #230). We just legitimately rewrote the
         // saved RIP/RSP/RFLAGS plus the rdi/rsi/rdx GPR slots to redirect
@@ -636,6 +668,13 @@ pub fn deliverFromExcFrame(pcb: *process.PCB, frame: *ExcFrame, signo: u32, faul
     const want_si = (sa.flags & SA_SIGINFO) != 0;
     const layout = layoutHandlerFrame(old_user_rsp, want_si) orelse return false;
 
+    // SMAP: pre-resolve frame pages (no-fault lazy/COW) + bracket the direct
+    // user-stack frame writes. See deliverFromSyscallFrame.
+    if (!process.ensureUserRangeWritable(layout.ra_va, old_user_rsp - layout.ra_va)) {
+        process.destroyCurrentWithStatus(0xDEAD0000 | signo);
+        return false;
+    }
+    protect.allowUserAccess();
     const mctx_ptr: *MContext = @ptrFromInt(layout.mctx_va);
     mctx_ptr.* = .{
         .magic = MCONTEXT_MAGIC,
@@ -670,6 +709,7 @@ pub fn deliverFromExcFrame(pcb: *process.PCB, frame: *ExcFrame, signo: u32, faul
     frame.rdi = signo;
     frame.rsi = layout.siginfo_va;
     frame.rdx = layout.mctx_va;
+    protect.disallowUserAccess(); // end user-frame access
 
     applyHandlerMaskUpdate(pcb, signo, sa);
     if ((sa.flags & SA_RESETHAND) != 0) sa.handler = SIG_DFL;
@@ -692,8 +732,12 @@ pub fn sigreturn(pcb: *process.PCB, frame: *SyscallFrame) u32 {
         return 0;
     }
     const mctx_ptr: *const MContext = @ptrFromInt(user_rsp);
-    if (mctx_ptr.magic != MCONTEXT_MAGIC) {
-        debug.klog("[sig] sigreturn: bad MContext magic 0x{X} at 0x{X}\n", .{ mctx_ptr.magic, user_rsp });
+    // SMAP: reading the saved MContext back off the user stack also needs AC.
+    protect.allowUserAccess();
+    const magic = mctx_ptr.magic;
+    if (magic != MCONTEXT_MAGIC) {
+        protect.disallowUserAccess();
+        debug.klog("[sig] sigreturn: bad MContext magic 0x{X} at 0x{X}\n", .{ magic, user_rsp });
         process.destroyCurrentWithStatus(0xDEAD000B);
         return 0;
     }
@@ -717,11 +761,14 @@ pub fn sigreturn(pcb: *process.PCB, frame: *SyscallFrame) u32 {
     frame.rcx = mctx_ptr.rip;
     frame.r11 = mctx_ptr.rflags;
     frame.user_rsp = mctx_ptr.rsp;
+    const saved_mask = mctx_ptr.saved_mask;
+    const ret_rax = mctx_ptr.rax;
+    protect.disallowUserAccess(); // end user-frame access
 
-    pcb.signal_mask = mctx_ptr.saved_mask;
+    pcb.signal_mask = saved_mask;
     pcb.in_signal_handler = false;
 
-    return @truncate(mctx_ptr.rax);
+    return @truncate(ret_rax);
 }
 
 /// True if the calling process has any pending non-blocked signal whose

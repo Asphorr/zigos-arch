@@ -24,8 +24,12 @@
 // User space (per-process page tables): each process gets its own PML4[0]
 // from createAddressSpace; user-app .text loads at USER_VA_FLOOR (matches
 // app/linker.ld). user_brk starts at USER_BRK_INITIAL and grows to
-// USER_SPACE_END. Validators (kdbg.validateUserReturnIretq, addrinfo,
-// signals.sigaltstack) use USER_VA_FLOOR as the lowest legitimate user VA.
+// USER_SPACE_END. Two distinct floors apply: CODE/RIP validators (kdbg
+// ripIsValidUser, elf_loader segments, sysClone entry) floor at USER_VA_FLOOR
+// because code never lives below the load base; STACK/DATA validators
+// (validateUserPtr, vmm.mapUserPage, signals frame validation) MUST floor at
+// USER_SPACE_START, since the user stack lives in [USER_SPACE_START,
+// USER_VA_FLOOR). Conflating the two is the class of bug that broke Ctrl+C.
 
 const std = @import("std");
 
