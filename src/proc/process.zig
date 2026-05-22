@@ -126,7 +126,7 @@ pub const WaitKind = enum(u8) {
     waitpid, // wait_target = child pid, or 0xFFFFFFFF = any child
     pipe_read, // wait_target = pipe id
     pipe_write, // wait_target = pipe id
-    futex, // wait_target = page-aligned user VA of the futex word
+    futex, // wait_target = exact 4-byte-aligned user VA of the futex word (NOT page-aligned — two futexes in one page must stay distinct); FUTEX_WAKE matches on the exact VA
     gpu_io, // wait_target = ignored; virtio-gpu IRQ wakes all .gpu_io waiters (only one exists at a time, ctrl_lock-serialized)
     mutex, // wait_target = low-32 of &Mutex.owner_pid; Mutex.release walks procs and wakes matching waiters
     nvme_io, // wait_target = (ctrl_idx << 16) | cid — NVMe MSI-X handler reaps CQ + wakes by exact (ctrl,cid) match
@@ -2986,6 +2986,54 @@ pub fn blockOn(kind: WaitKind, target: u32) void {
     pcb.wait_target = 0;
 }
 
+
+/// Result of blockOnFutex: woke normally, interrupted by a deliverable signal,
+/// or the futex word changed during enrollment (caller returns EAGAIN).
+pub const FutexResult = enum { woke, signalled, again };
+
+/// Futex compare-and-sleep — mirrors blockOnMutex's register-then-recheck so a
+/// racing FUTEX_WAKE can't be lost. `word` is the validated user *uaddr. We
+/// enroll as a .futex waiter FIRST, then re-read *word and re-check wake_pending.
+/// The old order ("read *uaddr THEN blockOn") dropped a wake that fired in the
+/// gap — futex was the only waiter kind whose waker never set wake_pending, so
+/// blockOn's re-check was structurally blind to it. setState(.sleeping)'s
+/// internal atomic fences our enroll ahead of the *word re-read on x86 (same
+/// assumption blockOnMutex relies on). Interruptible: .signalled on a pending
+/// deliverable signal so a SIGINT/SIGTERM handler isn't stuck in the wait.
+pub fn blockOnFutex(target: u32, word: *const volatile u32, val: u32) FutexResult {
+    const cur = smp.myCpu().current_pid orelse return .woke;
+    const pcb = &procs[cur];
+    if (hasPendingDeliverable(pcb)) return .signalled;
+
+    @atomicStore(bool, &pcb.wake_pending, false, .release);
+    pcb.wait_kind = .futex;
+    pcb.wait_target = target;
+    setState(cur, .sleeping);
+
+    // Race A: the waker stored a new *uaddr before we enrolled. (Futex contract:
+    // the waker changes *uaddr, THEN calls FUTEX_WAKE.) Seeing the new value
+    // means the wake is already in flight / done — don't park.
+    if (word.* != val) {
+        pcb.wait_kind = .none;
+        pcb.wait_target = 0;
+        setState(cur, .running);
+        return .again;
+    }
+    // Race B: a FUTEX_WAKE landed during enrollment — wake() set wake_pending.
+    if (@atomicLoad(bool, &pcb.wake_pending, .acquire)) {
+        pcb.wait_kind = .none;
+        pcb.wait_target = 0;
+        setState(cur, .running);
+        return .woke;
+    }
+
+    smp.myCpu().pending_soft_yield = true;
+    @import("sched_asm.zig").softYield();
+    pcb.wait_kind = .none;
+    pcb.wait_target = 0;
+    if (hasPendingDeliverable(pcb)) return .signalled;
+    return .woke;
+}
 
 /// Called by pipe.write when waking a blocked reader, by pipe.read when waking
 /// a blocked writer, and by killProcess/destroyCurrent when waking a parent

@@ -270,48 +270,40 @@ pub fn sysFutex(uaddr: u32, op: u32, val: u32) u32 {
 
     switch (op) {
         FUTEX_WAIT => {
-            // Compare-and-sleep. The user's read of *uaddr happened to
-            // be `val` from the calling thread's perspective; we re-read
-            // here under (effectively) the kernel's lock to detect a
-            // racing WAKE that already changed *uaddr.
+            // Compare-and-sleep. Fast EAGAIN check, then hand off to
+            // blockOnFutex, which RE-CHECKS *uaddr only AFTER enrolling as a
+            // waiter — so a FUTEX_WAKE racing our enrollment is never lost. The
+            // old order (read *uaddr → blockOnInterruptible) dropped such a wake
+            // and left the thread parked forever (the threadtest-teardown wedge:
+            // [futex.wake.miss] then [wake-skip] explicit waker not firing).
             const word: *const volatile u32 = @ptrFromInt(@as(usize, uaddr));
             if (word.* != val) return E_INVAL; // EAGAIN
-
             _ = process.currentPCB() orelse return E_FAULT;
-            // blockOnInterruptible handles wait_kind/state/yield/clear AND
-            // bails out on a pending non-blocked signal so user code with a
-            // SIGINT/SIGTERM handler isn't stuck inside the wait forever.
-            // WAKE also clears, so the post-resume clear is idempotent.
-            const br = process.blockOnInterruptible(.futex, uaddr);
-            if (br == .signalled) return E_INTR;
-            return 0;
+            return switch (process.blockOnFutex(uaddr, word, val)) {
+                .again => E_INVAL, // *uaddr changed during enroll
+                .signalled => E_INTR,
+                .woke => 0,
+            };
         },
         FUTEX_WAKE => {
             var woken: u32 = 0;
             for (0..process.MAX_PROCS) |i| {
                 if (woken >= val) break;
                 const t = &process.procs[i];
-                if (t.state != .sleeping) continue;
-                if (t.wait_kind != .futex) continue;
-                if (t.wait_target != uaddr) continue;
-                t.wait_kind = .none;
-                t.wait_target = 0;
-                // setState routes through the rq book-keeping (rqEnter on
-                // .ready) so the parallel-tracked runqueue stays in sync.
-                process.setState(i, .ready);
+                if (t.wait_kind != .futex or t.wait_target != uaddr) continue;
+                if (t.state == .unused or t.state == .zombie) continue;
+                // Route through wake(): it sets wake_pending (so a waiter still
+                // mid-enroll in blockOnFutex catches us via its Race B re-check)
+                // and flips .sleeping->.ready. Matching futex waiters that
+                // haven't reached .sleeping yet closes the enroll window the old
+                // .sleeping-only scan dropped.
+                process.wake(@intCast(i));
                 woken += 1;
             }
-            // Diag: when no waiter found, dump every live PCB's state +
-            // wait fields so we can compare to the wake's uaddr.
-            if (woken == 0) {
-                const cur_pid_dbg = process.getCurrentPid();
-                debug.klog("[futex.wake.miss] pid={d} uaddr=0x{x}\n", .{ cur_pid_dbg, uaddr });
-                for (0..process.MAX_PROCS) |i| {
-                    const t = &process.procs[i];
-                    if (t.state == .unused) continue;
-                    debug.klog("  pid={d} state={d} wait_kind={d} wait_target=0x{x} tgid={d}\n", .{ i, @intFromEnum(t.state), @intFromEnum(t.wait_kind), t.wait_target, t.tgid });
-                }
-            }
+            // woken == 0 is normal (an uncontended wake with no current waiter);
+            // the old [futex.wake.miss] PCB dump was a lost-wake tripwire that
+            // the enroll-window fix makes obsolete. The wakeExpired [wake-skip]
+            // detector still catches any genuinely stuck waiter.
             return woken;
         },
         else => return 0xFFFFFFFF,
