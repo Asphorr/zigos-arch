@@ -213,15 +213,12 @@ pub fn sysMunmap(va: u32, len: u32) u32 {
     // (whole-PCID flush) which is cheaper than emitting N type-0 calls.
     const tlb = @import("../tlb.zig");
     if ((end - start) == 0x1000) {
+        // Single page: surgical INVPCID type-0 on peers. shootdownPage's local
+        // flush (flushLocalForMode) carries an INVLPG backstop that reliably
+        // clears THIS CPU's entry under nested virt — where type-0 under-
+        // invalidates and could leave a stale entry into the just-freed frame —
+        // so no separate local flush is needed here.
         tlb.shootdownPage(lead.pcid, start);
-        // Local INVLPG backstop. shootdownPage's own local flush is INVPCID
-        // type-0, which under-invalidates under nested virt (we always run as
-        // an L2 guest) and can leave a stale PRESENT entry for `start` on THIS
-        // CPU — a read/write into the just-freed (and possibly recycled) frame.
-        // INVLPG is reliably emulated and INVPCID-independent. Peers are
-        // covered by the .single_page PCID gen-bump (see tlb.zig doShootdown).
-        // Symmetric to the swap-eviction fix (swap.zig).
-        tlb.flushPageLocal(start);
     } else {
         tlb.shootdownAll(lead.pcid);
     }
@@ -312,12 +309,10 @@ pub fn sysMprotect(va: u32, len: u32, prot: u32) u32 {
     // flush.
     const tlb = @import("../tlb.zig");
     if (len_pg == 0x1000) {
+        // Single page: see sysMunmap — shootdownPage's flushLocalForMode INVLPG
+        // backstop reliably clears THIS CPU's stale entry under nested virt (the
+        // W^X-narrowing hazard); peers are covered by the .single_page gen-bump.
         tlb.shootdownPage(pcb.pcid, start);
-        // Local INVLPG backstop — see sysMunmap. Without it, an mprotect
-        // narrowing (RW→RO) could leave a stale WRITABLE entry on THIS CPU
-        // under nested virt (type-0 under-invalidation) = a W^X bypass until
-        // that entry happens to evict. Peers covered by the gen-bump.
-        tlb.flushPageLocal(start);
     } else {
         tlb.shootdownAll(pcb.pcid);
     }

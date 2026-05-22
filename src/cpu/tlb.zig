@@ -144,6 +144,21 @@ inline fn flushLocalForMode() void {
             } else {
                 flushLocalTlb();
             }
+            // INVLPG backstop for the CURRENTLY-LOADED PCID. INVPCID type-0 has
+            // been observed to under-invalidate under nested virt, leaving a
+            // stale entry. INVLPG reliably flushes current_va for whatever PCID
+            // is loaded on THIS CPU right now — covering (a) the SENDER, always
+            // running the affected AS, and (b) a PEER concurrently running it
+            // (the multi-threaded case the PCID gen-bump can't reach, since that
+            // peer never reloads CR3). A peer loaded with a DIFFERENT PCID gets
+            // a harmless flush of an unrelated VA; its dormant stale entry for
+            // the affected PCID is cleared by the gen-bump on the CR3 load that
+            // migrates that AS onto it. Surgical (one page) — no working-set
+            // loss. Subsumes the old per-call-site tlb.flushPageLocal.
+            asm volatile ("invlpg (%[v])"
+                :
+                : [v] "r" (current_va),
+                : .{ .memory = true });
         },
     }
 }
@@ -259,17 +274,18 @@ fn doShootdown(mode: Mode, affected_pcid: u16, va: u64) void {
     // and-reused frame through the stale entry without faulting (silent
     // corruption — the swap-eviction data-loss bug). Bumping the gen forces
     // the peer to full-flush this PCID on the CR3 load that brings the process
-    // back, so the stale entry can never be USED. The local CPU is already
-    // covered: the swap path flushes via INVLPG (tlb.flushPageLocal) and the
-    // bump catches local_gen up so the sender doesn't redundantly full-flush.
-    // Cost is one PCID flush per migration (bumps between migrations collapse
-    // to one), not per shootdown.
+    // back, so the stale entry can never be USED. The sender's own CPU is
+    // covered by flushLocalForMode's INVLPG backstop (.single_page branch), and
+    // the bump catches local_gen up so the sender doesn't redundantly full-
+    // flush on its next reload. Cost is one PCID flush per migration (bumps
+    // between migrations collapse to one), not per shootdown.
     //
-    // REMAINING GAP (not closed here): two threads of the SAME pcid running
-    // concurrently on both CPUs — the peer is mid-execution and won't reload
-    // CR3, so the gen bump doesn't help. Closing that needs the peer IPI
-    // handler to escalate .single_page to an all-context flush under nested
-    // virt. Pre-existing (mprotect/COW), COW-masked, tracked as a follow-up.
+    // The concurrent case — two threads of the SAME pcid on both CPUs, where
+    // the peer is mid-execution and won't reload CR3 (so the gen bump can't
+    // reach it) — is handled by that same INVLPG: it runs in the peer's IPI
+    // handler against the peer's loaded (== affected) pcid, reliably dropping
+    // the stale (pcid, va) entry. So both migration and concurrent access are
+    // now closed.
     //
     // Hypercall path already flushed self via FLUSH_ALL_PROCESSORS, so skip
     // the local flush there — but still bump PCID gen for the same reason.
@@ -330,18 +346,4 @@ pub fn shootdownPage(affected_pcid: u16, va: u64) void {
         return;
     }
     doShootdown(.single_page, affected_pcid, va & ~@as(u64, 0xFFF));
-}
-
-/// Invalidate THIS CPU's TLB entry for `va` in the currently-loaded PCID via
-/// plain INVLPG. Reliable and INVPCID-independent — used as the local-flush
-/// backstop on the swap path, where the faulting CPU IS running the affected
-/// address space and where nested-virt INVPCID type-0 has been observed to
-/// under-invalidate (leaving a stale PRESENT entry on a freed-and-reused frame
-/// -> silent corruption). INVLPG flushes the loaded PCID's mapping for `va`,
-/// which on the faulting CPU is exactly the affected (pcid, va).
-pub fn flushPageLocal(va: usize) void {
-    asm volatile ("invlpg (%[v])"
-        :
-        : [v] "r" (va),
-        : .{ .memory = true });
 }

@@ -197,6 +197,21 @@ inline fn pteSlot(pte: u64) u32 {
     return @intCast((pte >> SLOT_SHIFT) & 0xF_FFFF); // 20-bit field covers all NUM_SLOTS
 }
 
+/// If `pte` encodes a swapped-out page, release its backing swap slot and
+/// return true; no-op (returns false) for any other PTE. Call during
+/// address-space teardown (destroyAddressSpace) and munmap (unmapUserRange) so
+/// an evicted page's slot isn't leaked when its owner goes away without ever
+/// faulting it back in. Without this, a process that exits or unmaps while
+/// holding swapped pages permanently consumes those slots until reboot.
+/// NOTE: this only releases the slot — it does NOT zero the PTE. Callers that
+/// keep the page table around (unmapUserRange) must zero the PTE themselves so
+/// the empty-PT reclamation doesn't see a dangling swapped entry.
+pub fn releaseIfSwapped(pte: u64) bool {
+    if (!pteIsSwapped(pte)) return false;
+    freeSlot(pteSlot(pte));
+    return true;
+}
+
 /// Evict one present user page to swap, freeing its physical frame. `pte_ptr`
 /// points at the live (present) leaf PTE; `va` is its user virtual address;
 /// `pcid` is the owning address space's PCID (for the TLB shootdown). Returns
@@ -228,9 +243,13 @@ pub fn evictFrame(pte_ptr: *u64, va: usize, pcid: u16) bool {
         return false;
     }
     pte_ptr.* = makeSwapPte(slot);
-    tlb.shootdownPage(pcid, va); // peers: drop the stale present mapping (INVPCID type-0)
-    tlb.flushPageLocal(va); // reliable INVLPG backstop on THIS CPU before the frame is freed/reused
-    pmm.freeFrame(frame); // safe now: no TLB entry can reach this frame
+    // Drops the stale present mapping on peers AND this CPU. shootdownPage's
+    // local flush (flushLocalForMode, tlb.zig) includes an INVLPG backstop that
+    // reliably clears THIS CPU's (pcid, va) entry under nested virt — where
+    // INVPCID type-0 under-invalidates — BEFORE we free the frame, so no TLB
+    // entry can reach the freed (and soon recycled) frame.
+    tlb.shootdownPage(pcid, va);
+    pmm.freeFrame(frame);
     pages_out += 1;
     if (pages_out == 1 or pages_out % 4096 == 0)
         debug.klog("[swap] out={d} in={d} slots={d}/{d}\n", .{ pages_out, pages_in, used_count, NUM_SLOTS });
@@ -256,8 +275,10 @@ pub fn swapInFrame(pte_ptr: *u64, va: usize, flags: u64, pcid: u16) bool {
         return false;
     }
     pte_ptr.* = (frame & paging.PAGE_MASK) | flags | paging.PRESENT;
-    tlb.shootdownPage(pcid, va); // peers: flush any cached not-present entry for va
-    tlb.flushPageLocal(va); // reliable INVLPG backstop so THIS CPU sees the new frame
+    // Flush the stale not-present entry on peers AND this CPU (shootdownPage's
+    // flushLocalForMode INVLPG backstop) so the freshly-installed frame is
+    // visible immediately on the faulting CPU.
+    tlb.shootdownPage(pcid, va);
     freeSlot(slot);
     pages_in += 1;
     if (pages_in == 1 or pages_in % 4096 == 0)

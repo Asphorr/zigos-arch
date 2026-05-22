@@ -3853,22 +3853,21 @@ fn reclaimViaSwap(pml4: [*]align(4096) u64, lead: *PCB, skip_va: usize, pcid: u1
     const ITER_CAP: usize = 16384; // bounds total work (pages examined + gap hops)
     var va = lead.swap_clock_va;
     while (freed < want and iters < ITER_CAP) : (iters += 1) {
-        // Is va inside a (non-empty) lazy region? Also note whether that region
-        // is file-backed (ELF code/rodata, file mmap): we do NOT swap those
-        // out. They're clean (re-faultable from `source`), so swapping them is
-        // wasteful — and, critically, kernel-mode syscall pointer validation
-        // (validateUserPtr) walks the PT and would see the swapped (not-present)
-        // PTE as unmapped, returning E_FAULT when an app passes e.g. a string
-        // literal to write(). Phase 2 swaps anonymous pages only; teaching the
-        // kernel user-access path to swap-in on demand is a Phase 3 item.
+        // Is va inside a (non-empty) lazy region? Phase 3: we evict ANY private
+        // user page — anonymous OR file-backed. File-backed pages used to be
+        // skipped because (a) they're clean and re-faultable from `source`, and
+        // (b) a swapped (not-present) PTE made kernel-side pointer validation
+        // (validateUserPtr) return E_FAULT. (b) is now fixed — trySwapInPage
+        // pages a swapped entry back in on the kernel user-access path too — so
+        // eviction is transparent to syscalls and the restriction is lifted.
+        // (Later optimization: DISCARD clean file-backed pages rather than
+        // writing them to swap; they re-read from `source` for free.)
         var in_region = false;
-        var src_backed = false;
         var k: u8 = 0;
         while (k < lead.lazy_count) : (k += 1) {
             const r = lead.lazy_regions[k];
             if (r.end > r.start and va >= r.start and va < r.end) {
                 in_region = true;
-                src_backed = (r.source != null);
                 break;
             }
         }
@@ -3895,7 +3894,7 @@ fn reclaimViaSwap(pml4: [*]align(4096) u64, lead: *PCB, skip_va: usize, pcid: u1
             va = if (found) next_start else lo;
             continue;
         }
-        if (va != skip_va and !src_backed) {
+        if (va != skip_va) {
             if (vmm.userPtePtr(pml4, va)) |pte_ptr| {
                 const pte = pte_ptr.*;
                 if ((pte & paging.PRESENT) != 0 and (pte & paging.COW) == 0) {
@@ -3907,6 +3906,31 @@ fn reclaimViaSwap(pml4: [*]align(4096) u64, lead: *PCB, skip_va: usize, pcid: u1
     }
     lead.swap_clock_va = va;
     return freed;
+}
+
+/// Outcome of attempting a swap-in for one page.
+///   not_swapped — PTE wasn't a swapped entry; caller proceeds normally.
+///   paged_in    — page is now resident.
+///   oom         — it WAS swapped but no frame could be obtained even after
+///                 reclaim (genuine exhaustion); caller should fail/kill.
+const SwapInOutcome = enum { not_swapped, paged_in, oom };
+
+/// If `va`'s leaf PTE encodes a swapped page, page it back in — reclaiming cold
+/// frames first if memory is tight. Shared by the page-fault handler AND the
+/// kernel-side pointer prefault (validateUserPtr -> prefaultUserRange) so a
+/// swapped-out user buffer handed to a syscall is paged in rather than failing
+/// validation with E_FAULT. This is what makes evicting ANY user page (not just
+/// Phase 2's anon-only subset) safe: the kernel can always fault it back in.
+fn trySwapInPage(pd: [*]align(4096) u64, lead: *PCB, va: usize, prot: u8, pcid: u16) SwapInOutcome {
+    if (!swap.available) return .not_swapped;
+    const sp = vmm.userPtePtr(pd, va) orelse return .not_swapped;
+    if (!swap.pteIsSwapped(sp.*)) return .not_swapped;
+    // Make sure a frame is free for the read-in; evict cold pages of this
+    // process if memory is exhausted. skip_va = va so reclaim never re-targets
+    // the very page we're about to swap in.
+    if (pmm.freeFrameCount() < 64) _ = reclaimViaSwap(pd, lead, va, pcid, 64);
+    if (swap.swapInFrame(sp, va, vmm.protToMapFlags(prot), pcid)) return .paged_in;
+    return .oom;
 }
 
 pub fn handleUserPageFault(cr2: usize, error_code: u64) bool {
@@ -3951,20 +3975,16 @@ pub fn handleUserPageFault(cr2: usize, error_code: u64) bool {
         // frame was reclaimed. swap_failed => genuine OOM swapping in; skip the
         // fresh-alloc and fall through to the OOM-kill.
         var swap_failed = false;
-        if (swap.available) {
-            if (vmm.userPtePtr(pd, va_aligned)) |sp| {
-                if (swap.pteIsSwapped(sp.*)) {
-                    // Make sure a frame is free for the read-in; evict cold
-                    // pages of this process if memory is exhausted.
-                    if (pmm.freeFrameCount() < 64) _ = reclaimViaSwap(pd, lead, va_aligned, lead.pcid, 64);
-                    if (swap.swapInFrame(sp, va_aligned, vmm.protToMapFlags(r.prot), lead.pcid)) {
-                        @import("../debug/kdbg.zig").pfEvent(@intCast(cur), cr2, @truncate(error_code), 0, true);
-                        return true;
-                    }
-                    debug.klog("[swap] swap-in FAILED pid={d} va=0x{X} — out of memory, killing\n", .{ cur, va_aligned });
-                    swap_failed = true;
-                }
-            }
+        switch (trySwapInPage(pd, lead, va_aligned, r.prot, lead.pcid)) {
+            .paged_in => {
+                @import("../debug/kdbg.zig").pfEvent(@intCast(cur), cr2, @truncate(error_code), 0, true);
+                return true;
+            },
+            .oom => {
+                debug.klog("[swap] swap-in FAILED pid={d} va=0x{X} — out of memory, killing\n", .{ cur, va_aligned });
+                swap_failed = true;
+            },
+            .not_swapped => {},
         }
 
         // Gap #1+#5 (2026-05-20): allocAndMapUserPage now returns a named
@@ -4186,6 +4206,20 @@ pub fn prefaultUserRange(addr: usize, len: usize) void {
             // If a real 4K PTE is already installed (has USER bit), nothing
             // to do. Otherwise allocate + map + (optionally) copy from src.
             if (pageHasRealMapping(pd, page)) break;
+
+            // If the page was evicted to swap, page it back in rather than
+            // mapping a fresh zero page over the swapped PTE (which would lose
+            // its contents AND leak the slot). This is the kernel-side swap-in
+            // that lets validateUserPtr accept a pointer into a swapped buffer.
+            // NOTE: prefault covers the WHOLE syscall (ptr,len) range, so a
+            // syscall handed a large fully-swapped buffer swaps every page in
+            // here (evict<->swap-in thrash if it exceeds RAM). Fine for normal
+            // syscall buffers; a per-call swap-in cap is the fix if it bites.
+            switch (trySwapInPage(pd, lead, page, r.prot, lead.pcid)) {
+                .paged_in => break, // resident now (swapInFrame flushed this CPU)
+                .oom => break, // leave unmapped — allCurrentUserPagesMapped() then fails -> clean E_FAULT
+                .not_swapped => {}, // never-faulted page: fall through to fresh alloc + src copy
+            }
 
             const frame = vmm.allocAndMapUserPage(pd, page, vmm.protToMapFlags(r.prot)) catch return;
             if (r.source) |src| {

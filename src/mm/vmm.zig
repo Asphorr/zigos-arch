@@ -7,6 +7,7 @@ const paging = @import("paging.zig");
 const debug = @import("../debug/debug.zig");
 const heap = @import("heap.zig");
 const memmap = @import("memmap.zig");
+const swap = @import("swap.zig");
 
 const PRESENT: u64 = paging.PRESENT;
 const READ_WRITE: u64 = paging.READ_WRITE;
@@ -510,6 +511,13 @@ pub fn unmapUserRange(pml4: [*]align(4096) u64, start: usize, end: usize) usize 
                 pt[i] = 0;
                 pmm.freeFrame(@intCast(pte & PAGE_MASK));
                 freed += 1;
+            } else if (swap.releaseIfSwapped(pte)) {
+                // Evicted page in the unmapped range: release its swap slot and
+                // clear the PTE. Must zero it so the empty-PT reclamation below
+                // (which counts PRESENT entries) doesn't leave a dangling
+                // swapped PTE in a table it then frees — and so the slot isn't
+                // leaked.
+                pt[i] = 0;
             }
         }
 
@@ -644,9 +652,14 @@ pub fn destroyAddressSpace(pml4: [*]align(4096) u64, pml4_phys: usize) void {
             // the surviving address space keeps the frame mapped until its
             // own teardown drops the last reference.
             for (0..512) |pt_i| {
-                if (pt[pt_i] & PRESENT != 0 and pt[pt_i] & USER != 0) {
-                    const phys = entryPhys(pt[pt_i]);
-                    pmm.releaseFrame(phys);
+                const pte = pt[pt_i];
+                if (pte & PRESENT != 0 and pte & USER != 0) {
+                    pmm.releaseFrame(entryPhys(pte));
+                } else {
+                    // Evicted page held by this dying address space: release its
+                    // swap slot so it isn't leaked at exit. No-op for empty /
+                    // kernel PTEs. (PT is freed right after, so no need to zero.)
+                    _ = swap.releaseIfSwapped(pte);
                 }
             }
 
@@ -720,6 +733,14 @@ pub fn destroyAddressSpace(pml4: [*]align(4096) u64, pml4_phys: usize) void {
 /// Worth doing if/when fork-heavy workloads appear (none today — Doom and
 /// Quake load via exec, not fork). Documented here as the architectural
 /// next step.
+///
+/// SWAPPED PAGES: a parent PTE that is out on swap (PRESENT=0 + SWAPPED marker)
+/// is SKIPPED by the present-check below — the child does NOT inherit it. So a
+/// fork-without-exec child that reads a page the parent had swapped before the
+/// fork sees a fresh zero page (anon) or a re-read of `source` (file-backed),
+/// not the parent's copy. Harmless in practice (fork is ~always followed by
+/// exec, which tears down PML4[0]); a complete fix would swap the parent's
+/// pages in before cloning. Tracked as a swap follow-up.
 pub fn cloneAddressSpace(parent_pml4: [*]align(4096) u64, phys_out: *usize) ?[*]align(4096) u64 {
     const pml4_alloc = allocZeroedTable() orelse return null;
     const child_pml4: [*]align(4096) u64 = @alignCast(pml4_alloc.ptr);
