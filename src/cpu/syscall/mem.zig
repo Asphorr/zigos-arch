@@ -165,6 +165,42 @@ pub fn sysMmap(len: u32, fd: u32, offset: u32) u32 {
     return @intCast(new_top);
 }
 
+/// MAP_SHARED|MAP_ANONYMOUS mmap (POSIX-style). Creates a new shared-anon
+/// region of `len` bytes (page-rounded), eagerly allocates and zeros all
+/// frames, and maps the caller's lazy region against it. Subsequent fork()s
+/// inherit the region as truly shared (not COW); munmap / exit decrement
+/// the refcount; frames are freed when the last attacher releases.
+///
+/// Returns the VA on success, 0 on E_NOMEM / E_INVAL. (We can't use E_NOMEM
+/// here because the mmap ABI uses 0 as "failure" — same convention as
+/// sysMmap above.)
+pub fn sysMmapSharedAnon(len: u32) u32 {
+    if (len == 0) return 0;
+    const pcb = process.currentPCB() orelse return 0;
+    _ = pcb.page_directory orelse return 0;
+    const lead = process.leader(pcb);
+    if (lead.lazy_count >= process.MAX_LAZY_REGIONS) return 0;
+
+    const len_pg: usize = (@as(usize, len) + 0xFFF) & ~@as(usize, 0xFFF);
+    if (len_pg > lead.mmap_top) return 0;
+    const new_top = lead.mmap_top - len_pg;
+    if (new_top < lead.user_brk) return 0;
+
+    const shm = @import("../../mm/shm.zig");
+    const num_pages: u32 = @intCast(len_pg / 0x1000);
+    const shm_id = shm.create(num_pages) orelse return 0;
+
+    if (!process.addLazyRegion(lead.tgid, new_top, lead.mmap_top, 0)) {
+        shm.release(shm_id);
+        return 0;
+    }
+    const ridx = lead.lazy_count - 1;
+    lead.lazy_regions[ridx].prot = process.PROT_RW;
+    lead.lazy_regions[ridx].shm_id = shm_id;
+    lead.mmap_top = new_top;
+    return @intCast(new_top);
+}
+
 /// Free a previously-mmapped region. `va` must match the start of a registered
 /// region exactly and `len` must match its length (rounded up to page) — partial
 /// unmaps are rejected. Walks the page table releasing each present 4KB frame
@@ -254,6 +290,16 @@ pub fn sysMunmap(va: u32, len: u32) u32 {
             const phys = paging.virtToPhys(@intFromPtr(src)).?;
             pmm.freeContiguous(phys, removed.buf_pages);
         }
+    }
+
+    // Shared-anon: drop this attacher's ref on the shm region. At refcount==0
+    // the shm registry freeFrame's every page; until then peers keep using
+    // them. The PMM refcount per frame (bumped by every fault-in via
+    // acquireFrame) gets dropped by unmapUserRange above when it freeFrame's
+    // present pages — so the only thing remaining here is the shm-side ref.
+    {
+        const shm = @import("../../mm/shm.zig");
+        if (removed.shm_id != shm.SHM_INVALID) shm.release(removed.shm_id);
     }
 
     return 0;

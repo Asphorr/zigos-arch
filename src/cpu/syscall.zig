@@ -317,6 +317,7 @@ const SYSCALLS = [_]SyscallSpec{
     .{ .num = 111, .name = "seek",                    .handler = wrap(fs.sysSeek) },
     .{ .num = 112, .name = "get_window_alloc",        .handler = wrap(window.sysGetWindowAlloc) },
     .{ .num = 113, .name = "read_blocking",           .handler = wrap(window.sysReadBlocking) },
+    .{ .num = 114, .name = "mmap_shared_anon",        .handler = wrap(mem.sysMmapSharedAnon) },
 };
 
 /// Returns the registered name for a syscall number, or null if not registered.
@@ -345,6 +346,7 @@ fn doSyscallInner(sys_num: u32, arg1: u32, arg2: u32, arg3: u32, frame: *signals
         3 => proc.sysExit(),
         4 => window.sysRead(),
         113 => window.sysReadBlocking(),
+        114 => mem.sysMmapSharedAnon(arg1),
         5 => mem.sysSbrk(arg1),
         6 => proc.sysGetpid(),
         7 => proc.sysYield(),

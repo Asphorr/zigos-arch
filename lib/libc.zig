@@ -351,6 +351,20 @@ pub fn mmapFile(fd: u32, offset: u32, len: usize) ?[]u8 {
     return ptr[0..aligned];
 }
 
+/// POSIX MAP_SHARED|MAP_ANONYMOUS. Returns a slice that's truly shared
+/// across fork() — child sees parent's writes byte-for-byte and vice
+/// versa (no COW break). munmap on either side decrements the shm
+/// region's refcount; the underlying frames stay alive until the last
+/// attacher releases. Returns null on out-of-table / OOM / oversize.
+pub fn mmapSharedAnon(len: usize) ?[]u8 {
+    if (len == 0) return null;
+    const va = syscall(114, @intCast(len), 0);
+    if (va == 0) return null;
+    const aligned: usize = (len + 0xFFF) & ~@as(usize, 0xFFF);
+    const ptr: [*]u8 = @ptrFromInt(@as(usize, va));
+    return ptr[0..aligned];
+}
+
 /// Release an mmap region. The slice must be exactly what `mmap` returned —
 /// partial unmaps aren't supported. Returns true on success.
 pub fn munmap(buf: []u8) bool {

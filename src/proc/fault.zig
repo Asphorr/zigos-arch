@@ -100,6 +100,31 @@ fn handleCowFault(pml4: [*]align(4096) u64, cr2: usize) bool {
     const pte = pte_p.*;
     if (pte & paging.COW == 0) return false;
 
+    // Shared-anon escape hatch: cloneAddressSpace marks every writable PTE COW
+    // without knowing about lazy regions, so a fork'd shared-anon page lands
+    // here on first write. We must NOT copy — that would break sharing. Clear
+    // COW + restore W and bail; the frame stays mapped at the same phys in
+    // both ASs, preserving POSIX MAP_SHARED semantics.
+    {
+        const cur = smp.myCpu().current_pid orelse return false;
+        const pcb = &process.procs[cur];
+        const lead = leader(pcb);
+        const shm = @import("../mm/shm.zig");
+        var i: u8 = 0;
+        while (i < lead.lazy_count) : (i += 1) {
+            const r = lead.lazy_regions[i];
+            if (r.shm_id == shm.SHM_INVALID) continue;
+            if (va_aligned < r.start or va_aligned >= r.end) continue;
+            pte_p.* = (pte & ~paging.COW) | paging.READ_WRITE;
+            asm volatile ("invlpg (%[addr])"
+                :
+                : [addr] "r" (va_aligned),
+                : .{ .memory = true }
+            );
+            return true;
+        }
+    }
+
     const old_phys = pte & paging.PAGE_MASK;
 
     // Sole-owner promote-in-place. Refcount may race against another CPU's
@@ -381,6 +406,33 @@ pub fn handleUserPageFault(cr2: usize, error_code: u64) bool {
         const r = lead.lazy_regions[i];
         if (cr2 < r.start or cr2 >= r.end) continue;
         const va_aligned = cr2 & ~@as(usize, 0xFFF);
+
+        // Shared-anon shortcut: map the precomputed phys from the shm region.
+        // No swap, no fresh-alloc — the frame is owned by the shm registry and
+        // shared across every attached AS. Same phys mapped into N AS's = N
+        // PRESENT PTEs of the same frame; refcount management is in
+        // forkCurrent/munmap/tearDown via shm.acquire/release.
+        const shm = @import("../mm/shm.zig");
+        if (r.shm_id != shm.SHM_INVALID) {
+            const page_idx: u32 = @intCast((va_aligned - r.start) / 0x1000);
+            const phys = shm.frameAt(r.shm_id, page_idx) orelse {
+                debug.klog("[shm] frameAt miss id={d} pi={d} on fault — region torn down?\n", .{ r.shm_id, page_idx });
+                return false;
+            };
+            vmm.mapUserPage(pd, va_aligned, phys, vmm.protToMapFlags(r.prot)) catch |e| {
+                debug.klog("[shm] mapUserPage failed va=0x{X} phys=0x{X} err={s}\n", .{ va_aligned, phys, @errorName(e) });
+                return false;
+            };
+            // Bump the PMM refcount so the frame survives even if one
+            // attacher's destroyAddressSpace walks the PT and tries to free
+            // present pages — the shm registry owns the original alloc and
+            // calls freeFrame at release(refcount==0). Frame thus has
+            // (N attachers + 1 shm-owned) refcount; munmap path drops the
+            // attacher count, shm.release drops the +1.
+            pmm.acquireFrame(phys);
+            @import("../debug/kdbg.zig").pfEvent(@intCast(cur), cr2, @truncate(error_code), 0, true);
+            return true;
+        }
 
         // Swap-in: if this VA was evicted to swap, page it back in instead of
         // fresh-allocating a zero page (which would discard its contents and

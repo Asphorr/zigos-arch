@@ -504,6 +504,11 @@ pub const LazyRegion = struct {
     // mprotect explicitly set tighter prots (PROT_RW = no exec; PROT_READ
     // alone = RO + NX; etc.) and the page-fault handler honors them.
     prot: u8 = PROT_RWX,
+    // Shared-anon region id (POSIX MAP_SHARED|MAP_ANONYMOUS). When not
+    // SHM_INVALID, the page-fault handler maps `shm.frameAt(shm_id, page_idx)`
+    // instead of fresh-allocating a private zero page. fork() bumps the
+    // region's refcount; munmap / teardown decrements.
+    shm_id: u32 = 0xFFFFFFFF,
 };
 
 fn initFdTable() [MAX_FDS]FileDesc {

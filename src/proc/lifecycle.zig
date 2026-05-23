@@ -321,6 +321,22 @@ pub fn forkCurrent(frame: *signals.SyscallFrame) ?usize {
     process.procs[i].user_brk = parent.user_brk;
     process.procs[i].mmap_top = parent.mmap_top;
     process.procs[i].stack_base = parent.stack_base;
+
+    // Shared-anon regions: bump refcount per inherited LazyRegion. The
+    // PT-level COW path covers private anon (each AS gets a fresh frame on
+    // first write); shared-anon stays POSIX-SHARED — child sees parent's
+    // writes byte-for-byte and vice versa. The PTE entries already point at
+    // the same frames (cloneAddressSpace strips writable for COW, but the
+    // fault handler re-checks shm_id BEFORE handleCowFault, so writes on a
+    // shared-anon page take the shm-map path, not the COW path).
+    {
+        const shm = @import("../mm/shm.zig");
+        var ri: u8 = 0;
+        while (ri < process.procs[i].lazy_count) : (ri += 1) {
+            const sid = process.procs[i].lazy_regions[ri].shm_id;
+            if (sid != shm.SHM_INVALID) _ = shm.acquire(sid);
+        }
+    }
     // ELF buf is the parent's source-of-truth for demand paging; child shares
     // a *reference* to it (lazy_regions point at parent's buf). Don't free
     // it twice on exit — child sets its own elf_buf to null so destroyCurrent
@@ -798,7 +814,12 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp) void {
         freeElfBuf(lead);
         kp.checkpoint("tdt:post-freeElfBuf");
         const paging = @import("../mm/paging.zig");
+        const shm = @import("../mm/shm.zig");
         for (lead.lazy_regions[0..lead.lazy_count]) |r| {
+            // Shared-anon: drop this AS's refcount. The shm registry frees
+            // its frames at refcount==0, so peers keep working until they
+            // also exit / munmap.
+            if (r.shm_id != shm.SHM_INVALID) shm.release(r.shm_id);
             if (!r.buf_owned) continue;
             const src = r.source orelse continue;
             // r.source points at a PMM-allocated buffer reached through
