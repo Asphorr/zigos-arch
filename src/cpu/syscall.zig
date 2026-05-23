@@ -318,7 +318,18 @@ const SYSCALLS = [_]SyscallSpec{
     .{ .num = 112, .name = "get_window_alloc",        .handler = wrap(window.sysGetWindowAlloc) },
     .{ .num = 113, .name = "read_blocking",           .handler = wrap(window.sysReadBlocking) },
     .{ .num = 114, .name = "mmap_shared_anon",        .handler = wrap(mem.sysMmapSharedAnon) },
+    .{ .num = 115, .name = "io_uring_setup",          .handler = wrap(sys_iouring_setup) },
+    .{ .num = 116, .name = "io_uring_enter",          .handler = wrap(sys_iouring_enter) },
 };
+
+// Thin shims so the dispatch table can route into the iouring module
+// without giving SYSCALLS a hard dependency on it.
+fn sys_iouring_setup(entries: u32) u32 {
+    return @import("iouring.zig").setup(entries);
+}
+fn sys_iouring_enter(user_va: u32, to_submit: u32, min_complete: u32) u32 {
+    return @import("iouring.zig").enter(user_va, to_submit, min_complete);
+}
 
 /// Returns the registered name for a syscall number, or null if not registered.
 /// Useful for diagnostic output (sysmon, dmesg, kdbg autopsy).
@@ -347,6 +358,8 @@ fn doSyscallInner(sys_num: u32, arg1: u32, arg2: u32, arg3: u32, frame: *signals
         4 => window.sysRead(),
         113 => window.sysReadBlocking(),
         114 => mem.sysMmapSharedAnon(arg1),
+        115 => sys_iouring_setup(arg1),
+        116 => sys_iouring_enter(arg1, arg2, arg3),
         5 => mem.sysSbrk(arg1),
         6 => proc.sysGetpid(),
         7 => proc.sysYield(),

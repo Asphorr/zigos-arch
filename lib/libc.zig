@@ -351,6 +351,112 @@ pub fn mmapFile(fd: u32, offset: u32, len: usize) ?[]u8 {
     return ptr[0..aligned];
 }
 
+/// io_uring Sqe / Cqe / RingHeader — must match src/cpu/iouring.zig byte-for-byte.
+pub const IoUringSqe = extern struct {
+    opcode: u8,
+    flags: u8,
+    _pad1: u16,
+    fd: u32,
+    off: u64,
+    addr: u64,
+    len: u32,
+    user_data: u64,
+    _pad2: [28]u8,
+};
+
+pub const IoUringCqe = extern struct {
+    user_data: u64,
+    res: i32,
+    flags: u32,
+};
+
+pub const IoUringHeader = extern struct {
+    sq_head: u32,
+    sq_tail: u32,
+    sq_mask: u32,
+    sq_entries: u32,
+    cq_head: u32,
+    cq_tail: u32,
+    cq_mask: u32,
+    cq_entries: u32,
+    sqes_offset: u32,
+    cqes_offset: u32,
+    _pad: [24]u8,
+};
+
+pub const IOURING_OP_NOP: u8 = 0;
+pub const IOURING_OP_READ: u8 = 1;
+pub const IOURING_OP_WRITE: u8 = 2;
+
+pub const IoUring = struct {
+    header: *volatile IoUringHeader,
+    sqes: [*]IoUringSqe,
+    cqes: [*]volatile IoUringCqe,
+    base_va: usize,
+    // Tentative-submit counter: getSqe() bumps; submit() flushes via
+    // sq_tail += pending. Mirrors liburing's io_uring_get_sqe so back-to-
+    // back getSqe calls return DIFFERENT slots between submit() flushes.
+    pending: u32 = 0,
+
+    /// Get the next free Sqe slot. Returns null if the SQ ring is full
+    /// (kernel hasn't caught up to draining previous batch). The caller
+    /// fills the returned Sqe in place; `submit()` later flushes by
+    /// publishing sq_tail to the kernel.
+    pub fn getSqe(self: *IoUring) ?*IoUringSqe {
+        const tail = self.header.sq_tail +% self.pending;
+        const head = self.header.sq_head;
+        if (tail -% head >= self.header.sq_entries) return null;
+        self.pending += 1;
+        return &self.sqes[tail & self.header.sq_mask];
+    }
+
+    /// Flush queued Sqes by publishing sq_tail. `count` should match the
+    /// number of getSqe calls since the last submit (or 0 — we'll use
+    /// the tracked pending count). Always uses release ordering so the
+    /// kernel's acquire-load of sq_tail observes our Sqe writes.
+    pub fn submit(self: *IoUring, count: u32) void {
+        const n = if (count != 0) count else self.pending;
+        const new_tail = self.header.sq_tail +% n;
+        @atomicStore(u32, &self.header.sq_tail, new_tail, .release);
+        self.pending = 0;
+    }
+
+    /// Reap one completion. Returns null if the CQ ring is empty.
+    /// The returned Cqe is a copy; advances cq_head atomically.
+    pub fn reapCqe(self: *IoUring) ?IoUringCqe {
+        const head = self.header.cq_head;
+        const tail = @atomicLoad(u32, &self.header.cq_tail, .acquire);
+        if (head == tail) return null;
+        const cqe = self.cqes[head & self.header.cq_mask];
+        @atomicStore(u32, &self.header.cq_head, head +% 1, .release);
+        return cqe;
+    }
+
+    /// Drive submission + completion. Returns # SQEs processed, or null on error.
+    pub fn enter(self: *IoUring, to_submit: u32, min_complete: u32) ?u32 {
+        const r = syscall3(116, @truncate(self.base_va), to_submit, min_complete);
+        if (r == 0xFFFFFFFF) return null;
+        return r;
+    }
+};
+
+/// Set up a new io_uring with at least `entries` SQ/CQ slots. Returns a
+/// wrapper struct or null on failure.
+pub fn ioUringSetup(entries: u32) ?IoUring {
+    const va = syscall(115, entries, 0);
+    if (va == 0) return null;
+    const base: usize = @as(usize, va);
+    const hdr: *volatile IoUringHeader = @ptrFromInt(base);
+    const sqes_ptr: [*]IoUringSqe = @ptrFromInt(base + hdr.sqes_offset);
+    const cqes_ptr: [*]volatile IoUringCqe = @ptrFromInt(base + hdr.cqes_offset);
+    return .{
+        .header = hdr,
+        .sqes = sqes_ptr,
+        .cqes = cqes_ptr,
+        .base_va = base,
+    };
+}
+
 /// POSIX MAP_SHARED|MAP_ANONYMOUS. Returns a slice that's truly shared
 /// across fork() — child sees parent's writes byte-for-byte and vice
 /// versa (no COW break). munmap on either side decrements the shm

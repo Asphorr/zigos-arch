@@ -765,6 +765,11 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp) void {
     // frame via teardownNonPresent. (Reviewer-caught 2026-05-23.)
     reclaimInflightSlot(pid);
 
+    // io_uring instances owned by this pid: free the slot-table entries.
+    // The underlying ring memory is freed by the LazyRegion shm.release in
+    // the per-AS cleanup below; this just recycles the kernel bookkeeping.
+    @import("../cpu/iouring.zig").releaseAllForPid(@intCast(pid));
+
     // Resources reachable in any address space (GUI window state, GPU
     // contexts, debug symbols all live in heap / driver structures, not
     // user memory). Safe to free before the CR3 switch below.

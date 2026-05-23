@@ -349,6 +349,7 @@ pub fn build(b: *std.Build) void {
         .{ "swapsys.elf", "app/swapsys.zig" },
         .{ "mtswap.elf", "app/mtswap.zig" },
         .{ "shmtest.elf", "app/shmtest.zig" },
+        .{ "iouringtest.elf", "app/iouringtest.zig" },
         .{ "threadtest.elf", "app/threadtest.zig" },
         .{ "threadbrot.elf", "app/threadbrot.zig" },
         .{ "synctest.elf", "app/synctest.zig" },
@@ -894,7 +895,7 @@ pub fn build(b: *std.Build) void {
         \\  paint.elf editor.elf doom.elf gpu_test.elf vulkan_triangle.elf \
         \\  venus_test.elf vulkan_cube.elf doom_real.elf \
         \\  mmaptest.elf threadtest.elf threadbrot.elf synctest.elf babel.elf forktest.elf daemontest.elf logd.elf photo.elf wallpaper.elf \
-        \\  shmtest.elf redteam.elf
+        \\  shmtest.elf iouringtest.elf redteam.elf
         \\echo "[tar] rebuilt"
         ,
     });
