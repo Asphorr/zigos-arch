@@ -352,6 +352,18 @@ fn allocBlockInGroup(self: *Mount, group: u32) ?u32 {
         while (true) : (bit += 1) {
             const mask: u8 = @as(u8, 1) << bit;
             if (slice[byte_idx] & mask == 0) {
+                const block_in_group: u32 = byte_idx * 8 + @as(u32, bit);
+                const block_num: u32 = self.sb.first_data_block + group * self.sb.blocks_per_group + block_in_group;
+                // Phantom-tail guard: bits past the group's real block count
+                // represent fs blocks past sb.blocks_count. Per ext2 spec the
+                // last group's tail bits should be pre-set to "allocated" by
+                // mkfs, but a malformed image could leave them clear; without
+                // this check we'd return a block number past EOF and the
+                // subsequent write would land off-disk.
+                if (block_num >= self.sb.blocks_count) {
+                    if (bit == 7) break;
+                    continue;
+                }
                 slice[byte_idx] |= mask;
                 // Persist the bitmap directly from the cache.
                 var s: u32 = 0;
@@ -363,8 +375,7 @@ fn allocBlockInGroup(self: *Mount, group: u32) ?u32 {
                 self.sb.free_blocks_count -|= 1;
                 if (!writeBgdTable(self)) return null;
                 if (!writeSuperblock(self)) return null;
-                const block_in_group: u32 = byte_idx * 8 + @as(u32, bit);
-                return self.sb.first_data_block + group * self.sb.blocks_per_group + block_in_group;
+                return block_num;
             }
             if (bit == 7) break;
         }

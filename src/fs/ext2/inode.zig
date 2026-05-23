@@ -89,6 +89,17 @@ fn allocInodeInGroup(m: *block.Mount, group: u32, is_dir: bool) ?u32 {
         while (true) : (bit += 1) {
             const mask: u8 = @as(u8, 1) << bit;
             if (byte_buf[0] & mask == 0) {
+                const idx_in_group: u32 = byte_idx * 8 + @as(u32, bit);
+                const inum: u32 = group * m.sb.inodes_per_group + idx_in_group + 1;
+                // Phantom-tail guard: inum > sb.inodes_count means we picked
+                // a bit past the filesystem's inode count (last group's
+                // bitmap can have trailing clear bits in a malformed image).
+                // Skip — allocating one would write a phantom inode the FS
+                // doesn't claim to have.
+                if (inum > m.sb.inodes_count) {
+                    if (bit == 7) break;
+                    continue;
+                }
                 byte_buf[0] |= mask;
                 if (!block.writeBlockBytes(m, bitmap_block, byte_idx, &byte_buf)) return null;
                 bgd.free_inodes_count -|= 1;
@@ -96,8 +107,7 @@ fn allocInodeInGroup(m: *block.Mount, group: u32, is_dir: bool) ?u32 {
                 m.sb.free_inodes_count -|= 1;
                 if (!block.writeBgdTable(m)) return null;
                 if (!block.writeSuperblock(m)) return null;
-                const idx_in_group: u32 = byte_idx * 8 + @as(u32, bit);
-                return group * m.sb.inodes_per_group + idx_in_group + 1;
+                return inum;
             }
             if (bit == 7) break;
         }
