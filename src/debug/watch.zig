@@ -655,7 +655,17 @@ fn isLegitKernelEspWriter(rip: u64, addr: u64) bool {
     // Step 1: identify the writer first. Any write from outside the known
     // legit functions is wild regardless of value/PCB-state.
     const r = symbols.resolveKernel(rip) orelse return false;
+    // After commit ??? these moved from proc.process.* to proc.lifecycle.*.
+    // Re-exports in process.zig don't change the symbol the linker assigns to
+    // the function BODY — that stays in lifecycle.zig — so the resolver
+    // returns "proc.lifecycle.X" for any RIP inside one of these now. Accept
+    // both prefixes so the whitelist survives the split.
     const is_create =
+        std.mem.eql(u8, r.name, "proc.lifecycle.create") or
+        std.mem.eql(u8, r.name, "proc.lifecycle.cloneCurrent") or
+        std.mem.eql(u8, r.name, "proc.lifecycle.createKernelIdle") or
+        std.mem.eql(u8, r.name, "proc.lifecycle.createKernelTask") or
+        std.mem.eql(u8, r.name, "proc.lifecycle.forkCurrent") or
         std.mem.eql(u8, r.name, "proc.process.create") or
         std.mem.eql(u8, r.name, "proc.process.cloneCurrent") or
         std.mem.eql(u8, r.name, "proc.process.createKernelIdle") or
