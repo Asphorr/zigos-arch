@@ -1147,10 +1147,11 @@ fn ioCommandAsync(c: *Controller, ctrl_idx: u32, opcode: u8, lba: u32, user_buf:
             }
             c.queue_full_retries +%= 1;
             // Yield so the IRQ reaper (or tickSweep) gets a chance to
-            // drain in-flight completions. softYield is the generic
-            // "give back the CPU" entry point — process.zig uses it
-            // wherever a task wants to deschedule without parking on
-            // a specific wait_kind.
+            // drain in-flight completions. Must set pending_soft_yield
+            // first — without it handleIRQ0 mis-attributes the int $0x20
+            // as a kernel-mode hardware timer (sendEOI+rearm+return) and
+            // never calls schedule(), making the "yield" a no-op spin.
+            smp.myCpu().pending_soft_yield = true;
             @import("../proc/sched_asm.zig").softYield();
         }
     };
