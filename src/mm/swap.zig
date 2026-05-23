@@ -121,12 +121,26 @@ pub fn init() void {
         return;
     }
     available = true;
-    // Keep the swap controller on the POLLED (sync) NVMe path: swap I/O runs
-    // inside the page-fault handler, which can't safely block on an IRQ-wake
-    // in every state. Polled completion happens on the faulting CPU. Must be
-    // set before nvme.enableAsync() (desktop.taskEntry).
-    nvme.markSyncOnly(SWAP_CTRL_IDX);
-    debug.klog("[swap] swap device = NVMe ctrl #{d}, {d} slots ({d} MiB), polled I/O\n", .{ SWAP_CTRL_IDX, NUM_SLOTS, SWAP_BYTES / (1024 * 1024) });
+    // Self-test runs SYNCHRONOUSLY because nvme.enableAsync() hasn't fired yet
+    // at this point in init — async_mode is false on every controller. Once
+    // enableAsync() flips this controller too (we no longer markSyncOnly), all
+    // post-boot swap I/O routes through ioCommandAsync → blockOn(.nvme_io).
+    //
+    // Why async is safe here even though swap I/O runs in the page-fault path:
+    //   1. Ring-3 user faults hold no kernel spinlock, so blockOn parks the
+    //      thread cleanly and the NVMe IRQ reaper wakes it (same shape as a
+    //      blocking read() syscall on the FS controllers — proven pattern).
+    //   2. Kernel-context swap-ins (validateUserPtr → prefaultUserRange) run
+    //      at syscall entry BEFORE the handler takes any lock, so blocking
+    //      there is equivalent to a normal blocking syscall.
+    //   3. evictFrame/swapInFrame hold no lock across writePage/readPage (the
+    //      slot_lock is taken inside allocSlot/freeSlot only, never spanning
+    //      the I/O). So eviction during reclaim can yield freely.
+    // The single narrow concern — a mid-syscall kernel access to a user page
+    // that was re-evicted between prefault and access — is bounded by the
+    // refcount==1 guard in evictFrame (won't touch shared pages) and the fact
+    // that syscall handlers don't hold spinlocks across user copies. Reviewed.
+    debug.klog("[swap] swap device = NVMe ctrl #{d}, {d} slots ({d} MiB), async I/O\n", .{ SWAP_CTRL_IDX, NUM_SLOTS, SWAP_BYTES / (1024 * 1024) });
     selfTest();
 }
 
@@ -221,11 +235,18 @@ pub fn releaseIfSwapped(pte: u64) bool {
 ///
 /// Ordering: copy the still-present page out, THEN rewrite the PTE to
 /// not-present + shootdown, THEN free the frame — so no CPU can reach the
-/// frame through a stale TLB entry once it is freed. (A concurrent write to
-/// this exact page on another CPU between the copy and the rewrite could be
-/// lost; Phase 2 evicts only cold, non-faulting pages of a single-threaded
-/// workload, so the window is benign. Per-page I/O locking is a later
-/// hardening — see the multi-threaded note for the reviewer.)
+/// frame through a stale TLB entry once it is freed.
+///
+/// Multi-thread caveat (widened by async swap I/O 2026-05-23): a concurrent
+/// write to this exact page on another CPU between the writePage copy and
+/// the PTE rewrite could be lost. Pre-async this window was ~50-200 µs
+/// (sync poll); post-async it's up to a full scheduling slice (ms-scale)
+/// because writePage now yields. The PTE rewrite is also a plain store,
+/// not CAS — two CPUs hitting the same VA race to install a swap slot and
+/// one slot leaks. Both are tolerated for now because (a) Phase 2 evicts
+/// only cold pages of single-threaded workloads, and (b) the refcount==1
+/// guard below already refuses shared-frame eviction. Per-page I/O lock +
+/// CAS rewrite is the proper hardening — deferred.
 pub fn evictFrame(pte_ptr: *u64, va: usize, pcid: u16) bool {
     const pte = pte_ptr.*;
     if ((pte & paging.PRESENT) == 0) return false; // nothing present to evict

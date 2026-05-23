@@ -281,10 +281,6 @@ const Controller = struct {
     // flips this to true after migrating all readers/writers off the
     // synchronous path. Read by `nvmeIrqHandler` on every IRQ.
     async_mode: bool = false,
-    // When true, enableAsync() skips this controller so it stays on the polled
-    // sync path. swap sets this (its I/O runs in the page-fault handler, which
-    // must not block on an IRQ-wake).
-    sync_only: bool = false,
 
     /// Gap #12 (2026-05-20): per-controller count of CQEs that
     /// `reapCq` actually processed. Bumped each time a completion was
@@ -1464,28 +1460,21 @@ fn submitDatalessAsync(
 
 /// NVMe Flush (opcode 0x00). Tells the controller to commit all writes
 /// for `nsid` to non-volatile storage. Without this, writes can sit in
-/// the device write cache and be lost on power loss / hard reset. Uses
-/// the same SQ/CQ/IO-lock path as ioCommand but no bounce buffer (FLUSH
-/// has no data transfer).
+/// the device write cache and be lost on power loss / hard reset.
+///
+/// Routes through `submitDatalessAsync` (same machinery as TRIM/WZ) so the
+/// async CQ reaper sees a proper packed-CID waiter rather than a raw
+/// `next_cid` value. Pre-fix this used the sync path with raw next_cid:
+/// post-enableAsync, the MSI-X for the flush could land on a peer CPU, get
+/// reaped by `reapCq`, fail the CID→waiter lookup (because raw next_cid
+/// rarely decodes to a live `(gen<<4)|slot`), advance `io_cq_head` past
+/// the flush CQE, and leave the sync poller spinning for the 2s timeout
+/// while shutdown silently misses the actual flush. Closes a race the
+/// reviewer caught on 2026-05-23 surfaced by the swap-async flip.
 fn flushController(c: *Controller) bool {
     if (!c.initialized) return false;
-    // acquireIrqSave: see ioCommandSync for the deadlock class.
-    const _flush_flags = c.io_lock.acquireIrqSave();
-    defer c.io_lock.releaseIrqRestore(_flush_flags);
-
-    const cid = c.next_cid;
-    c.next_cid +%= 1;
-    const slot_addr = c.io_sq + @as(usize, c.io_sq_tail) * 64;
-    const slot32: [*]volatile u32 = @ptrFromInt(paging.physToVirt(slot_addr));
-    writeSqe(slot32, IO_FLUSH, cid, c.nsid, 0, 0, 0, 0, 0);
-    storeBarrier();
-
-    // Gap #15: same as the sync ioCommand retarget — vestigial under
-    // pause-spin waitCompletion. Removed.
-
-    c.io_sq_tail = (c.io_sq_tail + 1) % Q_DEPTH;
-    sqDoorbell(c, 1).* = @as(u32, c.io_sq_tail);
-    return waitCompletion(c, c.io_cq, &c.io_cq_head, &c.io_cq_phase, 1, c.use_msix);
+    const idx_offset = (@intFromPtr(c) - @intFromPtr(&controllers[0])) / @sizeOf(Controller);
+    return submitDatalessAsync(c, @intCast(idx_offset), IO_FLUSH, &[_]u8{}, 0, 0, 0);
 }
 
 // === Public surface ===
@@ -1607,13 +1596,6 @@ pub fn controllerCount() usize {
     return num_controllers;
 }
 
-/// Keep controller `idx` on the polled (sync) I/O path — enableAsync() skips
-/// it. Used by swap, whose I/O runs in the page-fault handler and must not
-/// block on an IRQ-wake. Call before enableAsync().
-pub fn markSyncOnly(idx: usize) void {
-    if (idx < num_controllers) controllers[idx].sync_only = true;
-}
-
 /// Commit any in-flight writes to non-volatile storage on the primary
 /// controller. Returns true on success. Callers concerned about
 /// crash-consistency (file commits, shutdown) should call this after
@@ -1647,7 +1629,6 @@ pub fn enableAsync() void {
     if (!ASYNC_BUILD_ENABLED) return;
     var i: usize = 0;
     while (i < num_controllers) : (i += 1) {
-        if (controllers[i].sync_only) continue; // swap device stays polled
         controllers[i].async_mode = true;
         // 2026-05-20 cleanup: the legacy single-page `bounce_buf` field
         // is gone. Sync path now uses `bounce_bufs[0]`, which stays

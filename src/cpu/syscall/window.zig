@@ -507,12 +507,21 @@ pub fn sysSetClipboard(buf_ptr: u32, len: u32) u32 {
 }
 
 pub fn sysGetClipboard(buf_ptr: u32, max_len: u32) u32 {
+    if (max_len == 0) return 0;
+    // validateUserPtr MUST run BEFORE clipboard_lock.acquire — it calls
+    // prefaultUserRange which now blocks (.nvme_io) if the buffer's pages
+    // were swapped out. Acquiring first → SpinLock-held-across-blockOn
+    // deadlock (post-async-swap diff, 2026-05-23). Validate up to the cap;
+    // sysSetClipboard uses the same order and we mirror it. Same residual
+    // narrow re-eviction window as set: memcpy can page-fault if a peer
+    // CPU evicts between validate and copy; tolerated project-wide.
+    const cap = @min(max_len, CLIPBOARD_MAX);
+    if (!validateUserPtr(buf_ptr, cap)) return E_FAULT;
     clipboard_lock.acquire();
     defer clipboard_lock.release();
     const actual = clipboard_len;
-    if (actual == 0 or max_len == 0) return 0;
+    if (actual == 0) return 0;
     const copy_n = @min(actual, max_len);
-    if (!validateUserPtr(buf_ptr, copy_n)) return E_FAULT;
     const dst: [*]u8 = @ptrFromInt(@as(usize, buf_ptr));
     @memcpy(dst[0..copy_n], clipboard_buf[0..copy_n]);
     return actual;
