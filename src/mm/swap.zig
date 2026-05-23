@@ -47,6 +47,7 @@ var slot_lock: SpinLock = .{};
 pub var pages_out: u64 = 0; // pages written to swap (evictions)
 pub var pages_in: u64 = 0; // pages read back (swap-ins)
 pub var pages_second_chance: u64 = 0; // candidates spared by the clock (A bit set) — bumped by reclaimViaSwap
+pub var pages_discarded: u64 = 0; // clean file-backed pages dropped without swap I/O — re-faulted from source
 
 inline fn bitGet(slot: usize) bool {
     return (slot_used[slot >> 3] & (@as(u8, 1) << @as(u3, @intCast(slot & 7)))) != 0;
@@ -274,7 +275,37 @@ pub fn evictFrame(pte_ptr: *u64, va: usize, pcid: u16) bool {
     pmm.freeFrame(frame);
     pages_out += 1;
     if (pages_out == 1 or pages_out % 4096 == 0)
-        debug.klog("[swap] out={d} in={d} sc={d} slots={d}/{d}\n", .{ pages_out, pages_in, pages_second_chance, used_count, NUM_SLOTS });
+        debug.klog("[swap] out={d} in={d} sc={d} dc={d} slots={d}/{d}\n", .{ pages_out, pages_in, pages_second_chance, pages_discarded, used_count, NUM_SLOTS });
+    return true;
+}
+
+/// Discard a clean, file-backed page: zero the PTE, shootdown, free the frame.
+/// No swap I/O — the lazy-fault path will re-read from the region's `source`
+/// buffer on next touch (handleUserPageFault loads the file image just as on
+/// the first fault). Returns false (PTE untouched) if the frame is shared
+/// (refcount > 1) — same conservatism as `evictFrame`, to keep the dual-owned
+/// frame class (GUI framebuffer pages, etc.) out of reclaim.
+///
+/// Caller must have already verified that (a) the page is file-backed (the
+/// owning lazy_region has `source != null`) and (b) the PTE's DIRTY bit is
+/// clear. With those preconditions the page is byte-identical to what
+/// re-loading from `source` would produce, so dropping it is lossless. If
+/// DIRTY is set the page has user modifications and MUST go through
+/// `evictFrame` (preserve via swap) instead of being discarded.
+pub fn discardFrame(pte_ptr: *u64, va: usize, pcid: u16) bool {
+    const pte = pte_ptr.*;
+    if ((pte & paging.PRESENT) == 0) return false;
+    const frame = pte & paging.PAGE_MASK;
+    if (pmm.frameRefCount(frame) != 1) return false;
+    // PTE = 0 returns the slot to the "never-faulted" state. handleUserPageFault
+    // sees no PTE, walks lazy_regions, finds the file-backed region, and reloads
+    // from source. Same code path as first fault.
+    pte_ptr.* = 0;
+    tlb.shootdownPage(pcid, va);
+    pmm.freeFrame(frame);
+    pages_discarded +%= 1;
+    if (pages_discarded == 1 or pages_discarded % 4096 == 0)
+        debug.klog("[swap] out={d} in={d} sc={d} dc={d} slots={d}/{d}\n", .{ pages_out, pages_in, pages_second_chance, pages_discarded, used_count, NUM_SLOTS });
     return true;
 }
 
@@ -304,6 +335,6 @@ pub fn swapInFrame(pte_ptr: *u64, va: usize, flags: u64, pcid: u16) bool {
     freeSlot(slot);
     pages_in += 1;
     if (pages_in == 1 or pages_in % 4096 == 0)
-        debug.klog("[swap] out={d} in={d} sc={d} slots={d}/{d}\n", .{ pages_out, pages_in, pages_second_chance, used_count, NUM_SLOTS });
+        debug.klog("[swap] out={d} in={d} sc={d} dc={d} slots={d}/{d}\n", .{ pages_out, pages_in, pages_second_chance, pages_discarded, used_count, NUM_SLOTS });
     return true;
 }

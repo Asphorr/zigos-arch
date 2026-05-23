@@ -3871,11 +3871,13 @@ fn reclaimViaSwap(pml4: [*]align(4096) u64, lead: *PCB, skip_va: usize, pcid: u1
         // (Later optimization: DISCARD clean file-backed pages rather than
         // writing them to swap; they re-read from `source` for free.)
         var in_region = false;
+        var region_has_source = false;
         var k: u8 = 0;
         while (k < lead.lazy_count) : (k += 1) {
             const r = lead.lazy_regions[k];
             if (r.end > r.start and va >= r.start and va < r.end) {
                 in_region = true;
+                region_has_source = r.source != null;
                 break;
             }
         }
@@ -3919,6 +3921,16 @@ fn reclaimViaSwap(pml4: [*]align(4096) u64, lead: *PCB, skip_va: usize, pcid: u1
                             : [v] "r" (va),
                             : .{ .memory = true });
                         skipped += 1;
+                    } else if (region_has_source and (pte & paging.DIRTY) == 0 and
+                        swap.discardFrame(pte_ptr, va, pcid))
+                    {
+                        // Clean file-backed page: drop the PTE, no NVMe write.
+                        // handleUserPageFault will reload from `source` on next
+                        // touch. Skipping the swap-out is the whole point of
+                        // the discard path — saves an NVMe round-trip per page
+                        // for code segments, RO data, and any unwritten file
+                        // mapping (which is most of an app's working set).
+                        freed += 1;
                     } else if (swap.evictFrame(pte_ptr, va, pcid)) {
                         freed += 1;
                     }
