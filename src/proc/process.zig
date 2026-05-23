@@ -4015,17 +4015,19 @@ fn reclaimViaSwap(pml4: [*]align(4096) u64, lead: *PCB, skip_va: usize, pcid: u1
                 if ((pte & paging.PRESENT) != 0 and (pte & paging.COW) == 0) {
                     if ((pte & paging.ACCESSED) != 0 and skipped < skip_budget) {
                         // Recently used: clear A and give it another sweep
-                        // instead of evicting. Local INVLPG so the CPU re-sets
-                        // A on the next touch (else the cached TLB entry keeps
-                        // A=0 and the page looks cold next sweep -> we'd evict a
-                        // hot page anyway). Approximate cross-CPU aging is fine
-                        // — a peer's stale A just spares the page once more.
-                        pte_ptr.* = pte & ~paging.ACCESSED;
-                        asm volatile ("invlpg (%[v])"
-                            :
-                            : [v] "r" (va),
-                            : .{ .memory = true });
-                        skipped += 1;
+                        // instead of evicting. CAS so a concurrent evictor's
+                        // PRESENT→INFLIGHT write isn't clobbered by our
+                        // non-atomic A-clear — pre-CAS this was a 2× eviction-
+                        // count race (sc=2×out in the log) that wedged the MT
+                        // stress test. If the CAS fails another thread changed
+                        // the PTE; skip aging on this iteration (loop continues).
+                        if (@cmpxchgStrong(u64, pte_ptr, pte, pte & ~paging.ACCESSED, .seq_cst, .seq_cst) == null) {
+                            asm volatile ("invlpg (%[v])"
+                                :
+                                : [v] "r" (va),
+                                : .{ .memory = true });
+                            skipped += 1;
+                        }
                     } else if (region_has_source and (pte & paging.DIRTY) == 0 and
                         swap.discardFrame(pte_ptr, va, pcid))
                     {
