@@ -496,20 +496,29 @@ pub fn configWriteExt(bus: u8, dev: u8, func: u8, offset: u16, value: u32) void 
 
 // --- Device scanning ---
 
+// PCI config register layouts per PCI Local Bus Spec 3.0 §6.1.
+const IdReg = packed struct(u32) {
+    vendor_id: u16,
+    device_id: u16,
+};
+const ClassReg = packed struct(u32) {
+    revision_id: u8,
+    prog_if: u8,
+    subclass: u8,
+    class_code: u8,
+};
+const HdrReg = packed struct(u32) {
+    cache_line_size: u8,
+    latency_timer: u8,
+    header_type: u8,
+    bist: u8,
+};
+
 fn readDevice(bus: u8, dev: u8, func: u8) ?PciDevice {
-    const id = configRead(bus, dev, func, 0x00);
-    const vendor_id: u16 = @truncate(id);
-    if (vendor_id == 0xFFFF) return null;
-
-    const device_id: u16 = @truncate(id >> 16);
-    const class_reg = configRead(bus, dev, func, 0x08);
-    const class_code: u8 = @truncate(class_reg >> 24);
-    const subclass: u8 = @truncate(class_reg >> 16);
-    const prog_if: u8 = @truncate(class_reg >> 8);
-
-    // Header-type byte lives at byte 2 of the dword at offset 0x0C.
-    const hdr_reg = configRead(bus, dev, func, 0x0C);
-    const header_type: u8 = @truncate(hdr_reg >> 16);
+    const id: IdReg = @bitCast(configRead(bus, dev, func, 0x00));
+    if (id.vendor_id == 0xFFFF) return null;
+    const class_reg: ClassReg = @bitCast(configRead(bus, dev, func, 0x08));
+    const hdr_reg: HdrReg = @bitCast(configRead(bus, dev, func, 0x0C));
 
     const irq = configRead(bus, dev, func, 0x3C);
 
@@ -546,12 +555,12 @@ fn readDevice(bus: u8, dev: u8, func: u8) ?PciDevice {
         .bus = bus,
         .dev = dev,
         .func = func,
-        .vendor_id = vendor_id,
-        .device_id = device_id,
-        .class_code = class_code,
-        .subclass = subclass,
-        .prog_if = prog_if,
-        .header_type = header_type,
+        .vendor_id = id.vendor_id,
+        .device_id = id.device_id,
+        .class_code = class_reg.class_code,
+        .subclass = class_reg.subclass,
+        .prog_if = class_reg.prog_if,
+        .header_type = hdr_reg.header_type,
         .bars = bars,
         .irq_line = @truncate(irq),
     };
@@ -888,17 +897,27 @@ pub const PcieLinkInfo = struct {
     max_width: u6,
 };
 
+// PCIe LinkCap (32b) and LinkSta (16b) low halves share the same speed[3:0],
+// width[9:4] layout. Per PCIe Base Spec § 7.5.3.
+const LinkSpeedWidth = packed struct(u16) {
+    speed: u4,
+    width: u6,
+    _r: u6,
+};
+
 /// Read current + max link speed/width. Null on devices without PCIe cap
 /// (legacy PCI, or some virtio-pci-modern in older QEMU).
 pub fn pcieLinkInfo(dev: PciDevice) ?PcieLinkInfo {
     const off = findCapability(dev, PCIE_CAP_ID) orelse return null;
     const linkcap = configRead(dev.bus, dev.dev, dev.func, off + PCIE_LINKCAP_OFF);
     const linksta = configRead16(dev.bus, dev.dev, dev.func, off + PCIE_LINKSTA_OFF);
+    const cap: LinkSpeedWidth = @bitCast(@as(u16, @truncate(linkcap)));
+    const sta: LinkSpeedWidth = @bitCast(linksta);
     return .{
-        .max_speed = @truncate(linkcap & 0xF),
-        .max_width = @truncate((linkcap >> 4) & 0x3F),
-        .cur_speed = @truncate(linksta & 0xF),
-        .cur_width = @truncate((linksta >> 4) & 0x3F),
+        .max_speed = cap.speed,
+        .max_width = cap.width,
+        .cur_speed = sta.speed,
+        .cur_width = sta.width,
     };
 }
 

@@ -166,36 +166,43 @@ pub fn dumpMtrrs() void {
     const safe_bits: u8 = @min(maxPhysAddrBits(), 52);
     const addr_mask: u64 = ((@as(u64, 1) << @as(u6, @intCast(safe_bits))) - 1) & ~@as(u64, 0xFFF);
 
-    // IA32_MTRRCAP (0xFE): vcnt[7:0] = number of variable MTRRs.
-    const cap = rdmsr(0xFE);
-    const vcnt: u8 = @truncate(cap & 0xFF);
-    const has_fixed = (cap & (1 << 8)) != 0;
-    const has_wc = (cap & (1 << 10)) != 0;
-
-    // IA32_MTRR_DEF_TYPE (0x2FF): default memory type, MTRR enable, fixed enable.
-    const def = rdmsr(0x2FF);
-    const def_type: u8 = @truncate(def & 0xFF);
-    const fixed_en = (def & (1 << 10)) != 0;
-    const mtrr_en = (def & (1 << 11)) != 0;
+    // IA32_MTRRCAP (0xFE) and IA32_MTRR_DEF_TYPE (0x2FF) layouts per Intel
+    // SDM Vol 3A § 11.11.1. Only the bits we actually read are named.
+    const MtrrCap = packed struct(u64) {
+        vcnt: u8,
+        has_fixed: bool,
+        _r1: u1,
+        has_wc: bool,
+        _r2: u53,
+    };
+    const MtrrDef = packed struct(u64) {
+        def_type: u8,
+        _r1: u2,
+        fixed_en: bool,
+        mtrr_en: bool,
+        _r2: u52,
+    };
+    const cap: MtrrCap = @bitCast(rdmsr(0xFE));
+    const def: MtrrDef = @bitCast(rdmsr(0x2FF));
 
     serial.print("[mtrr] cap: vcnt={d} fixed={s} wc={s}\n", .{
-        vcnt,
-        if (has_fixed) "y" else "n",
-        if (has_wc) "y" else "n",
+        cap.vcnt,
+        if (cap.has_fixed) "y" else "n",
+        if (cap.has_wc) "y" else "n",
     });
     serial.print("[mtrr] def_type={s} mtrr_en={s} fixed_en={s}\n", .{
-        mtrrTypeName(def_type),
-        if (mtrr_en) "y" else "n",
-        if (fixed_en) "y" else "n",
+        mtrrTypeName(def.def_type),
+        if (def.mtrr_en) "y" else "n",
+        if (def.fixed_en) "y" else "n",
     });
 
-    if (!mtrr_en) return;
+    if (!def.mtrr_en) return;
 
     // Variable MTRRs: pairs at 0x200 (PHYSBASE_n) / 0x201 (PHYSMASK_n).
     // PHYSBASE: bits 7:0 = type, 12+ = base phys.
     // PHYSMASK: bit 11 = valid, 12+ = mask. Length = ~mask + 1 (in pages).
     var i: u8 = 0;
-    while (i < vcnt and i < 16) : (i += 1) {
+    while (i < cap.vcnt and i < 16) : (i += 1) {
         const base = rdmsr(0x200 + @as(u32, i) * 2);
         const mask = rdmsr(0x201 + @as(u32, i) * 2);
         if (mask & (1 << 11) == 0) continue; // not valid → skip
@@ -226,15 +233,29 @@ pub fn dumpCpuInfo() void {
     vendor[8..12].* = @bitCast(v.ecx);
 
     // --- Family / model / stepping ---
+    // CPUID.01H:EAX bit layout per Intel SDM Vol 2A § "Version Information".
+    const FmsEax = packed struct(u32) {
+        stepping: u4,
+        base_model: u4,
+        base_family: u4,
+        proc_type: u2,
+        _r1: u2,
+        ext_model: u4,
+        ext_family: u8,
+        _r2: u4,
+    };
     const fms = cpuid(1, 0);
-    const stepping: u32 = fms.eax & 0xF;
-    const base_model: u32 = (fms.eax >> 4) & 0xF;
-    const base_family: u32 = (fms.eax >> 8) & 0xF;
-    const ext_model: u32 = (fms.eax >> 16) & 0xF;
-    const ext_family: u32 = (fms.eax >> 20) & 0xFF;
+    const fms_eax: FmsEax = @bitCast(fms.eax);
     // Per Intel/AMD convention: if base_family == 6 or 0xF, combine with extensions.
-    const family: u32 = if (base_family == 0x6 or base_family == 0xF) base_family + ext_family else base_family;
-    const model: u32 = if (base_family == 0x6 or base_family == 0xF) base_model | (ext_model << 4) else base_model;
+    const family: u32 = if (fms_eax.base_family == 0x6 or fms_eax.base_family == 0xF)
+        @as(u32, fms_eax.base_family) + @as(u32, fms_eax.ext_family)
+    else
+        fms_eax.base_family;
+    const model: u32 = if (fms_eax.base_family == 0x6 or fms_eax.base_family == 0xF)
+        @as(u32, fms_eax.base_model) | (@as(u32, fms_eax.ext_model) << 4)
+    else
+        fms_eax.base_model;
+    const stepping: u32 = fms_eax.stepping;
 
     serial.print("[cpu] vendor=\"{s}\" family=0x{X} model=0x{X} stepping=0x{X}\n", .{ vendor, family, model, stepping });
 
