@@ -511,13 +511,14 @@ pub fn unmapUserRange(pml4: [*]align(4096) u64, start: usize, end: usize) usize 
                 pt[i] = 0;
                 pmm.freeFrame(@intCast(pte & PAGE_MASK));
                 freed += 1;
-            } else if (swap.releaseIfSwapped(pte)) {
-                // Evicted page in the unmapped range: release its swap slot and
-                // clear the PTE. Must zero it so the empty-PT reclamation below
-                // (which counts PRESENT entries) doesn't leave a dangling
-                // swapped PTE in a table it then frees — and so the slot isn't
-                // leaked.
-                pt[i] = 0;
+            } else {
+                // Non-PRESENT: may be SWAPPED, SWAP_INFLIGHT (mid-eviction on
+                // another thread), or 0. teardownNonPresent CAS-claims the PTE
+                // and releases the right resource (slot or pinned frame). The
+                // CAS is needed because a concurrent evictor may flip
+                // SWAP_INFLIGHT → SWAPPED at any moment; without CAS we'd
+                // race and either double-free or leak.
+                _ = swap.teardownNonPresent(&pt[i]);
             }
         }
 
@@ -656,10 +657,13 @@ pub fn destroyAddressSpace(pml4: [*]align(4096) u64, pml4_phys: usize) void {
                 if (pte & PRESENT != 0 and pte & USER != 0) {
                     pmm.releaseFrame(entryPhys(pte));
                 } else {
-                    // Evicted page held by this dying address space: release its
-                    // swap slot so it isn't leaked at exit. No-op for empty /
-                    // kernel PTEs. (PT is freed right after, so no need to zero.)
-                    _ = swap.releaseIfSwapped(pte);
+                    // Evicted page (SWAPPED) or in-flight eviction
+                    // (SWAP_INFLIGHT) held by this dying address space: release
+                    // the slot OR the pinned frame respectively. teardownNonPresent
+                    // CAS-claims the PTE so it can't race with a concurrent
+                    // evictor finishing on another CPU. PT is freed right after,
+                    // so the CAS-to-0 side effect is harmless.
+                    _ = swap.teardownNonPresent(&pt[pt_i]);
                 }
             }
 

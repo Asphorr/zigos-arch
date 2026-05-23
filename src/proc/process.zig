@@ -131,6 +131,7 @@ pub const WaitKind = enum(u8) {
     gpu_io, // wait_target = ignored; virtio-gpu IRQ wakes all .gpu_io waiters (only one exists at a time, ctrl_lock-serialized)
     mutex, // wait_target = low-32 of &Mutex.owner_pid; Mutex.release walks procs and wakes matching waiters
     nvme_io, // wait_target = (ctrl_idx << 16) | cid — NVMe MSI-X handler reaps CQ + wakes by exact (ctrl,cid) match
+    swap_evict, // wait_target = low-32 of &leaf_pte. Set by handleUserPageFault when it hits a SWAP_INFLIGHT PTE; evictFrame's commit/abort phase wakes matching waiters
 };
 
 pub const FileDesc = struct {
@@ -178,6 +179,14 @@ pub const PCB = struct {
     // dead" — both apps eventually call blockOn (via pipe.read or sysSleep)
     // and lose a wake to this race. Atomic for cross-CPU visibility.
     wake_pending: bool = false,
+    // Swap slot owned by an evictFrame call currently in progress on this PCB
+    // (between phase-1 CAS and phase-3 CAS). 0xFFFFFFFF = no in-flight slot.
+    // Lets process teardown free the slot if this thread is killed while
+    // parked in blockOn(.nvme_io) inside writePage — without this, wake() is
+    // a no-op on .zombie and the slot would leak. evictFrame stores at phase-1
+    // success, clears at phase-3 / writePage-fail. Atomic so killProcess can
+    // read it safely from another CPU.
+    swap_inflight_slot: u32 = 0xFFFFFFFF,
     // Process name (for window titles / icon matching)
     name: [16]u8 = [_]u8{0} ** 16,
     name_len: u8 = 0,
@@ -3111,6 +3120,96 @@ pub fn wakeMutexWaiters(target_id: u32) void {
     }
 }
 
+/// Publish the swap slot the calling thread has in-flight (between
+/// evictFrame's phase-1 and phase-3 CAS) so process teardown can free the
+/// slot if the thread is killed while parked in blockOn(.nvme_io). Called
+/// by swap.evictFrame; counterpart `clearInflightSlot` runs at phase-3 /
+/// rollback. Atomic so killProcess can observe it from another CPU.
+pub fn setInflightSlot(slot: u32) void {
+    const cur = smp.myCpu().current_pid orelse return;
+    @atomicStore(u32, &procs[cur].swap_inflight_slot, slot, .release);
+}
+
+pub fn clearInflightSlot() void {
+    const cur = smp.myCpu().current_pid orelse return;
+    @atomicStore(u32, &procs[cur].swap_inflight_slot, 0xFFFFFFFF, .release);
+}
+
+/// Release any in-flight swap slot owned by `pid` so it isn't leaked when
+/// the thread is torn down. Called from kill / destroy paths just before
+/// freeing the PCB. Idempotent — clears the field after freeing.
+pub fn reclaimInflightSlot(pid: usize) void {
+    if (pid >= MAX_PROCS) return;
+    const cur = @atomicLoad(u32, &procs[pid].swap_inflight_slot, .acquire);
+    if (cur == 0xFFFFFFFF) return;
+    @atomicStore(u32, &procs[pid].swap_inflight_slot, 0xFFFFFFFF, .release);
+    swap.freeSlot(cur);
+}
+
+/// Wake every PCB blocked on a SWAP_INFLIGHT PTE whose leaf-PTE address
+/// truncates to `target`. Called by `evictFrame` at the end of every
+/// eviction (success or failure) so faulters can retry — they re-check the
+/// PTE on resume and take the swap-in path (success) or re-fault the now-
+/// PRESENT page (I/O failure restored the original PTE). Mirrors
+/// `wakeMutexWaiters` — thundering-herd is fine because the .swap_evict
+/// fan-in per page is small (typically one or two threads of a MT process).
+pub fn wakeSwapEvictWaiters(target: u32) void {
+    for (0..MAX_PROCS) |i| {
+        const t = &procs[i];
+        if (t.state != .sleeping) continue;
+        if (t.wait_kind != .swap_evict) continue;
+        if (t.wait_target != target) continue;
+        wake(@intCast(i));
+    }
+}
+
+/// Block until the SWAP_INFLIGHT eviction at `pte_ptr` completes. Used by
+/// `trySwapInPage` when a thread touches a page that another thread is
+/// mid-evicting.
+///
+/// Uses the enroll-then-recheck pattern (mirrors blockOnMutex / blockOnFutex)
+/// because `wakeSwapEvictWaiters` skips non-sleeping waiters: a naive
+/// blockOn(.swap_evict, ..) race-window — wake fires between the pre-check
+/// and our setState(.sleeping) — would silently lose the wake. The PTE is
+/// re-checked AFTER enrolling .sleeping, with a release-fence-then-acquire
+/// pairing the evictor's CAS so we can't read the stale in-flight encoding
+/// after the eviction has already committed.
+///
+/// Returns once the PTE is in a settled state (SWAPPED commit / PRESENT abort
+/// / 0 teardown). The caller re-dispatches based on the new state.
+pub fn blockOnSwapEvict(pte_ptr: *const u64) void {
+    const cur = smp.myCpu().current_pid orelse return;
+    const pcb = &procs[cur];
+    const target = swap.evictWaitTarget(pte_ptr);
+    while (true) {
+        if (!swap.pteIsInflight(@atomicLoad(u64, pte_ptr, .acquire))) return;
+        @atomicStore(bool, &pcb.wake_pending, false, .release);
+        pcb.wait_kind = .swap_evict;
+        pcb.wait_target = target;
+        setState(cur, .sleeping);
+        // Race A: eviction committed/aborted between our pre-check and enroll.
+        if (!swap.pteIsInflight(@atomicLoad(u64, pte_ptr, .acquire))) {
+            pcb.wait_kind = .none;
+            pcb.wait_target = 0;
+            setState(cur, .running);
+            return;
+        }
+        // Race B: wake() landed on us during enroll.
+        if (@atomicLoad(bool, &pcb.wake_pending, .acquire)) {
+            pcb.wait_kind = .none;
+            pcb.wait_target = 0;
+            setState(cur, .running);
+            continue;
+        }
+        smp.myCpu().pending_soft_yield = true;
+        @import("sched_asm.zig").softYield();
+        pcb.wait_kind = .none;
+        pcb.wait_target = 0;
+        // Loop and re-check; the PTE may still be in-flight (spurious wake)
+        // or settled (return on next iteration).
+    }
+}
+
 /// Walk a dying process's fd_table and close any pipe fds so the pipe pool's
 /// reader/writer counts stay correct. Called from killProcessWithStatus and
 /// destroyCurrentWithStatus before the slot is freed.
@@ -3182,6 +3281,12 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp) void {
     // [lock-dump] line so the autopsy shows what was stranded.
     @import("spinlock.zig").releaseMutexesOwnedBy(@intCast(pid));
     kp.checkpoint("tdt:post-mutexRelease");
+
+    // If this thread was parked in blockOn(.nvme_io) inside swap.evictFrame's
+    // writePage, wake() against a .zombie is a no-op and the in-flight swap
+    // slot would leak. Reclaim it before the AS teardown frees the in-flight
+    // frame via teardownNonPresent. (Reviewer-caught 2026-05-23.)
+    reclaimInflightSlot(pid);
 
     // Resources reachable in any address space (GUI window state, GPU
     // contexts, debug symbols all live in heap / driver structures, not
@@ -3960,7 +4065,21 @@ const SwapInOutcome = enum { not_swapped, paged_in, oom };
 fn trySwapInPage(pd: [*]align(4096) u64, lead: *PCB, va: usize, prot: u8, pcid: u16) SwapInOutcome {
     if (!swap.available) return .not_swapped;
     const sp = vmm.userPtePtr(pd, va) orelse return .not_swapped;
-    if (!swap.pteIsSwapped(sp.*)) return .not_swapped;
+    // MT case: another thread is mid-evicting this exact page. Wait until the
+    // eviction commits (PTE → SWAPPED), aborts (→ PRESENT restored), or the
+    // process is torn down (→ 0). The faulter is in a blockable context
+    // (#PF runs IST=0 on its own kstack) so this is identical in shape to
+    // the .nvme_io wait inside ioCommandAsync.
+    if (swap.pteIsInflight(sp.*)) blockOnSwapEvict(sp);
+
+    const pte = sp.*;
+    // Eviction aborted and restored the original mapping while we waited —
+    // page is resident now, the fault was caused by the eviction's shootdown.
+    // Tell the caller to retry the user access.
+    const paging = @import("../mm/paging.zig");
+    if ((pte & paging.PRESENT) != 0) return .paged_in;
+    if (!swap.pteIsSwapped(pte)) return .not_swapped;
+
     // Make sure a frame is free for the read-in; evict cold pages of this
     // process if memory is exhausted. skip_va = va so reclaim never re-targets
     // the very page we're about to swap in.

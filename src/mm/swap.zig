@@ -193,15 +193,41 @@ fn selfTest() void {
 
 // --- Phase 2: swapped-PTE encoding + evict / swap-in mechanism ---------
 //
-// A swapped-out page's PTE has PRESENT=0, the SWAPPED marker (bit 10 — COW is
-// bit 9, so they never collide), and the swap slot index in bits 12+. This is
-// distinguishable from a never-mapped PTE (all zero) and any present mapping.
-// The CPU ignores every bit when PRESENT=0, so only our swap-in path reads it.
+// PTE state machine for a swap-eligible user page:
+//
+//   PRESENT       (bit 0  set)   = mapped, addressable by user.
+//   SWAP_INFLIGHT (bit 11 set, PRESENT=0) = evict-in-progress. Frame phys is
+//                                            in the top bits. Any user access
+//                                            faults; the handler waits on
+//                                            .swap_evict until the eviction
+//                                            CASes the PTE to SWAPPED.
+//   SWAPPED       (bit 10 set, PRESENT=0) = page is on the swap disk. Slot
+//                                            index in bits 12+.
+//   0                            = never faulted / discarded; first-fault path.
+//
+// COW is bit 9 — never collides with SWAPPED (10) or SWAP_INFLIGHT (11). The
+// CPU ignores all bits when PRESENT=0, so the markers are software-only.
+//
+// CAS-on-every-PTE-rewrite (added 2026-05-23 for MT hardening): every state
+// transition in evict/swap-in/discard uses @cmpxchgStrong on the PTE so two
+// CPUs racing on the same VA can't both "win" — exactly one transition
+// succeeds, the loser unwinds (free slot, free local frame) and bails.
 const SWAPPED: u64 = 1 << 10;
+const SWAP_INFLIGHT: u64 = 1 << 11;
 const SLOT_SHIFT: u6 = 12;
 
 inline fn makeSwapPte(slot: u32) u64 {
     return (@as(u64, slot) << SLOT_SHIFT) | SWAPPED;
+}
+
+inline fn makeInflightPte(frame_phys: usize) u64 {
+    // Frame is page-aligned (low 12 bits zero) so SWAP_INFLIGHT (bit 11) and
+    // the frame address don't overlap. PRESENT (bit 0) stays 0 by construction.
+    return frame_phys | SWAP_INFLIGHT;
+}
+
+inline fn inflightFrame(pte: u64) usize {
+    return @intCast(pte & paging.PAGE_MASK);
 }
 
 /// True if `pte` encodes a page that is currently out on swap.
@@ -209,49 +235,88 @@ pub inline fn pteIsSwapped(pte: u64) bool {
     return (pte & paging.PRESENT) == 0 and (pte & SWAPPED) != 0;
 }
 
+/// True if `pte` encodes a page that is mid-eviction (writePage in flight).
+/// Faulters that hit this state must wait on `.swap_evict` until the
+/// evicting thread CASes the PTE to SWAPPED (or back, on I/O failure).
+pub inline fn pteIsInflight(pte: u64) bool {
+    return (pte & paging.PRESENT) == 0 and (pte & SWAP_INFLIGHT) != 0;
+}
+
+/// Wait-target encoding for `.swap_evict`. Each leaf PTE lives at a unique
+/// kernel VA (per-process page tables), so truncating that VA to u32 gives a
+/// stable identifier for the (process, page) pair. Cross-VA collisions only
+/// cause spurious wakes — the faulter re-reads the PTE on resume and rolls
+/// back into blockOn if the eviction hasn't completed.
+pub inline fn evictWaitTarget(pte_ptr: *const u64) u32 {
+    return @truncate(@intFromPtr(pte_ptr));
+}
+
 inline fn pteSlot(pte: u64) u32 {
     return @intCast((pte >> SLOT_SHIFT) & 0xF_FFFF); // 20-bit field covers all NUM_SLOTS
 }
 
-/// If `pte` encodes a swapped-out page, release its backing swap slot and
-/// return true; no-op (returns false) for any other PTE. Call during
-/// address-space teardown (destroyAddressSpace) and munmap (unmapUserRange) so
-/// an evicted page's slot isn't leaked when its owner goes away without ever
-/// faulting it back in. Without this, a process that exits or unmaps while
-/// holding swapped pages permanently consumes those slots until reboot.
-/// NOTE: this only releases the slot — it does NOT zero the PTE. Callers that
-/// keep the page table around (unmapUserRange) must zero the PTE themselves so
-/// the empty-PT reclamation doesn't see a dangling swapped entry.
-pub fn releaseIfSwapped(pte: u64) bool {
-    if (!pteIsSwapped(pte)) return false;
-    freeSlot(pteSlot(pte));
-    return true;
+/// Race-aware teardown for non-PRESENT PTEs. CAS-claims the PTE to 0 and
+/// releases the backing resource (slot for SWAPPED, frame for SWAP_INFLIGHT).
+/// Retries on CAS loss until the PTE is 0 or in an encoding we don't manage.
+/// Returns true if any work was done.
+///
+/// Why CAS instead of plain store: an evicting thread may concurrently flip
+/// SWAP_INFLIGHT → SWAPPED on the same PTE (or restore it on I/O failure).
+/// Without CAS, teardown could (a) freeFrame on the in-flight frame, then
+/// evictor's CAS succeeds and it tries to freeFrame again from a stale read,
+/// or (b) overwrite SWAPPED with 0 between evictor's CAS and teardown's
+/// release-slot, leaking the slot. The CAS-winner pattern ensures exactly one
+/// party performs each cleanup.
+pub fn teardownNonPresent(pte_ptr: *u64) bool {
+    while (true) {
+        const cur = @atomicLoad(u64, pte_ptr, .acquire);
+        if (cur == 0) return false;
+        if ((cur & paging.PRESENT) != 0) return false; // caller handles
+        if (!pteIsSwapped(cur) and !pteIsInflight(cur)) return false;
+        if (@cmpxchgStrong(u64, pte_ptr, cur, 0, .seq_cst, .seq_cst) != null) {
+            continue; // CAS lost — re-read
+        }
+        if (pteIsSwapped(cur)) {
+            freeSlot(pteSlot(cur));
+        } else { // pteIsInflight
+            pmm.freeFrame(inflightFrame(cur));
+        }
+        return true;
+    }
 }
 
 /// Evict one present user page to swap, freeing its physical frame. `pte_ptr`
 /// points at the live (present) leaf PTE; `va` is its user virtual address;
 /// `pcid` is the owning address space's PCID (for the TLB shootdown). Returns
 /// true iff the frame was freed and the PTE rewritten to a swapped entry; on
-/// any failure (swap full / NVMe error) the PTE and frame are left untouched.
+/// any failure (swap full / NVMe error / lost CAS race) the PTE and frame are
+/// left in a consistent state and the caller can retry.
 ///
-/// Ordering: copy the still-present page out, THEN rewrite the PTE to
-/// not-present + shootdown, THEN free the frame — so no CPU can reach the
-/// frame through a stale TLB entry once it is freed.
+/// Three-phase MT-safe sequence (added 2026-05-23):
+///   1. CAS the live PTE to SWAP_INFLIGHT encoding (frame_phys + marker bit,
+///      PRESENT=0). Shootdown so peers can no longer write via stale TLB.
+///      Any thread that now touches the page faults and waits on .swap_evict
+///      via `blockOnSwapEvict` until phase 3 completes.
+///   2. writePage may block (async NVMe). The frame's contents are stable
+///      because no PTE in any AS still maps the frame (refcount==1 guard +
+///      shootdown).
+///   3. CAS the in-flight PTE to SWAPPED (slot index). Wake waiters and free
+///      the frame.
 ///
-/// Multi-thread caveat (widened by async swap I/O 2026-05-23): a concurrent
-/// write to this exact page on another CPU between the writePage copy and
-/// the PTE rewrite could be lost. Pre-async this window was ~50-200 µs
-/// (sync poll); post-async it's up to a full scheduling slice (ms-scale)
-/// because writePage now yields. The PTE rewrite is also a plain store,
-/// not CAS — two CPUs hitting the same VA race to install a swap slot and
-/// one slot leaks. Both are tolerated for now because (a) Phase 2 evicts
-/// only cold pages of single-threaded workloads, and (b) the refcount==1
-/// guard below already refuses shared-frame eviction. Per-page I/O lock +
-/// CAS rewrite is the proper hardening — deferred.
+/// Failure paths:
+///   - allocSlot returns null → no PTE change, return false.
+///   - Phase-1 CAS fails → another CPU is evicting (or the PTE changed e.g.
+///     teardown). freeSlot, return false. PTE untouched by us.
+///   - writePage fails → CAS the PTE back to its original value; freeSlot;
+///     wake waiters; return false. If the back-CAS itself fails the process
+///     was torn down — the inflight teardown handler already freed the frame.
+///   - Phase-3 CAS fails → teardownNonPresent (or unmapUserRange's racing
+///     PRESENT-branch) wiped the PTE and already freed the frame. freeSlot,
+///     wake waiters, return false — no freeFrame here.
 pub fn evictFrame(pte_ptr: *u64, va: usize, pcid: u16) bool {
-    const pte = pte_ptr.*;
-    if ((pte & paging.PRESENT) == 0) return false; // nothing present to evict
-    const frame = pte & paging.PAGE_MASK;
+    const original = pte_ptr.*;
+    if ((original & paging.PRESENT) == 0) return false; // nothing present to evict
+    const frame = original & paging.PAGE_MASK;
     // Refcount guard: only evict a frame this address space SOLELY owns. A
     // refcount > 1 means the frame is dual-owned — e.g. the GUI framebuffer
     // (mapped into the app AND held by the kernel compositor via
@@ -261,22 +326,69 @@ pub fn evictFrame(pte_ptr: *u64, va: usize, pcid: u16) bool {
     // refcount==1 predicate the COW handler trusts. (zig-osdev-reviewer catch.)
     if (pmm.frameRefCount(frame) != 1) return false;
     const slot = allocSlot() orelse return false;
-    if (!writePage(slot, frame)) {
+
+    // --- Phase 1: claim the page via CAS to the in-flight encoding ---
+    const inflight = makeInflightPte(frame);
+    if (@cmpxchgStrong(u64, pte_ptr, original, inflight, .seq_cst, .seq_cst)) |_| {
+        // Lost the race — another CPU evicted, the page was unmapped, or it
+        // got modified between the read and the CAS. Bail with no side effects
+        // beyond the slot bookkeeping.
         freeSlot(slot);
         return false;
     }
-    pte_ptr.* = makeSwapPte(slot);
-    // Drops the stale present mapping on peers AND this CPU. shootdownPage's
-    // local flush (flushLocalForMode, tlb.zig) includes an INVLPG backstop that
-    // reliably clears THIS CPU's (pcid, va) entry under nested virt — where
-    // INVPCID type-0 under-invalidates — BEFORE we free the frame, so no TLB
-    // entry can reach the freed (and soon recycled) frame.
+    // Publish the in-flight slot to the calling thread's PCB so process
+    // teardown can free it if this thread is killed mid-writePage. Cleared
+    // again at phase-3 commit / writePage-fail rollback.
+    @import("../proc/process.zig").setInflightSlot(slot);
+    // Shootdown BEFORE writePage so peers' TLBs can't satisfy writes via the
+    // pre-CAS PRESENT entry. After shootdownPage returns, every CPU has
+    // observed PRESENT=0; further writes fault and the handler will block.
     tlb.shootdownPage(pcid, va);
+
+    // --- Phase 2: write the frame contents to swap (may block under async) ---
+    if (!writePage(slot, frame)) {
+        // Restore the PTE so userspace re-enters with the page resident. If
+        // a concurrent writer (teardownNonPresent or unmapUserRange's
+        // PRESENT-branch race) wiped our in-flight entry while we were in
+        // writePage, they already freed the frame and the back-CAS fails —
+        // bail without double-freeing.
+        if (@cmpxchgStrong(u64, pte_ptr, inflight, original, .seq_cst, .seq_cst) == null) {
+            tlb.shootdownPage(pcid, va);
+        }
+        @import("../proc/process.zig").clearInflightSlot();
+        freeSlot(slot);
+        wakeSwapEvictWaiters(evictWaitTarget(pte_ptr));
+        return false;
+    }
+
+    // --- Phase 3: commit by transitioning in-flight → SWAPPED ---
+    if (@cmpxchgStrong(u64, pte_ptr, inflight, makeSwapPte(slot), .seq_cst, .seq_cst)) |_| {
+        // Phase-3 CAS failed → PTE was cleared by either teardownNonPresent or
+        // unmapUserRange's PRESENT-branch race (which already freed the frame).
+        // Don't double-free. The slot holds data nobody will ever read; free it.
+        @import("../proc/process.zig").clearInflightSlot();
+        freeSlot(slot);
+        wakeSwapEvictWaiters(evictWaitTarget(pte_ptr));
+        return false;
+    }
+    // Frame is no longer referenced by any PTE; release it. No shootdown
+    // needed here — phase 1's shootdown already cleared the present mapping,
+    // and the in-flight→SWAPPED transition keeps PRESENT=0.
+    @import("../proc/process.zig").clearInflightSlot();
     pmm.freeFrame(frame);
+    wakeSwapEvictWaiters(evictWaitTarget(pte_ptr));
     pages_out += 1;
     if (pages_out == 1 or pages_out % 4096 == 0)
         debug.klog("[swap] out={d} in={d} sc={d} dc={d} slots={d}/{d}\n", .{ pages_out, pages_in, pages_second_chance, pages_discarded, used_count, NUM_SLOTS });
     return true;
+}
+
+/// Wake every thread blocked on `.swap_evict` with this target. Mirrors
+/// `wakeMutexWaiters`. Defined inline as a forward dispatch into process.zig
+/// so swap.zig doesn't take a hard dependency on the proc subsystem at file
+/// scope.
+fn wakeSwapEvictWaiters(target: u32) void {
+    @import("../proc/process.zig").wakeSwapEvictWaiters(target);
 }
 
 /// Discard a clean, file-backed page: zero the PTE, shootdown, free the frame.
@@ -293,14 +405,17 @@ pub fn evictFrame(pte_ptr: *u64, va: usize, pcid: u16) bool {
 /// DIRTY is set the page has user modifications and MUST go through
 /// `evictFrame` (preserve via swap) instead of being discarded.
 pub fn discardFrame(pte_ptr: *u64, va: usize, pcid: u16) bool {
-    const pte = pte_ptr.*;
-    if ((pte & paging.PRESENT) == 0) return false;
-    const frame = pte & paging.PAGE_MASK;
+    const original = pte_ptr.*;
+    if ((original & paging.PRESENT) == 0) return false;
+    const frame = original & paging.PAGE_MASK;
     if (pmm.frameRefCount(frame) != 1) return false;
-    // PTE = 0 returns the slot to the "never-faulted" state. handleUserPageFault
-    // sees no PTE, walks lazy_regions, finds the file-backed region, and reloads
-    // from source. Same code path as first fault.
-    pte_ptr.* = 0;
+    // CAS to 0 so a concurrent evictor / teardown of the same VA can't both
+    // try to free the frame. Loser of the race returns false without touching
+    // anything. PTE = 0 returns the slot to the "never-faulted" state;
+    // handleUserPageFault will reload from `source` on next touch.
+    if (@cmpxchgStrong(u64, pte_ptr, original, 0, .seq_cst, .seq_cst)) |_| {
+        return false;
+    }
     tlb.shootdownPage(pcid, va);
     pmm.freeFrame(frame);
     pages_discarded +%= 1;
@@ -316,9 +431,9 @@ pub fn discardFrame(pte_ptr: *u64, va: usize, pcid: u16) bool {
 /// (PTE untouched, slot retained) if no frame is available or the read fails —
 /// the caller should free a frame (evict) and retry, or fall through.
 pub fn swapInFrame(pte_ptr: *u64, va: usize, flags: u64, pcid: u16) bool {
-    const pte = pte_ptr.*;
-    if (!pteIsSwapped(pte)) return false;
-    const slot = pteSlot(pte);
+    const original = pte_ptr.*;
+    if (!pteIsSwapped(original)) return false;
+    const slot = pteSlot(original);
     // allocFrame (not allocFrameUser): swap-in is high priority — failing it
     // means data loss / a killed process — so it may use the reserve the
     // user allocator protects. Deliberate.
@@ -327,7 +442,21 @@ pub fn swapInFrame(pte_ptr: *u64, va: usize, flags: u64, pcid: u16) bool {
         pmm.freeFrame(frame);
         return false;
     }
-    pte_ptr.* = (frame & paging.PAGE_MASK) | flags | paging.PRESENT;
+    // CAS so two threads racing to swap-in the same VA don't both install
+    // PTEs / free the slot. The loser frees its freshly-read frame; the
+    // slot was already freed by the winner. We then distinguish "lost race
+    // (PTE now PRESENT)" from genuine failure: if the PTE is PRESENT we
+    // return true so the caller treats this as a successful swap-in and
+    // retries the user access. (Returning false would cascade to
+    // trySwapInPage → .oom → handleUserPageFault OOM-killing the process.
+    // Reviewer-caught regression 2026-05-23.)
+    const new_pte = (frame & paging.PAGE_MASK) | flags | paging.PRESENT;
+    if (@cmpxchgStrong(u64, pte_ptr, original, new_pte, .seq_cst, .seq_cst)) |_| {
+        pmm.freeFrame(frame);
+        // Re-read with acquire so the winner's PRESENT store is observed.
+        const post = @atomicLoad(u64, pte_ptr, .acquire);
+        return (post & paging.PRESENT) != 0;
+    }
     // Flush the stale not-present entry on peers AND this CPU (shootdownPage's
     // flushLocalForMode INVLPG backstop) so the freshly-installed frame is
     // visible immediately on the faulting CPU.

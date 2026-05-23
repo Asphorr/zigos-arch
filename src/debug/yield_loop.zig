@@ -163,6 +163,7 @@ fn waitKindName(k: process.WaitKind) []const u8 {
         .gpu_io => "gpu_io",
         .mutex => "mutex",
         .nvme_io => "nvme_io",
+        .swap_evict => "swap_evict",
     };
 }
 
