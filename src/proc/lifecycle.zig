@@ -150,7 +150,12 @@ pub fn create(entry: usize, user_stack: usize) ?usize {
 
     const frame: [*]u64 = @ptrFromInt(stack_top - PT_REGS_QWORDS * 8);
     frame[19] = 0x1B;
-    frame[18] = user_stack;
+    // SysV ABI invariant: function entry RSP must be (16-aligned minus 8) —
+    // see the matching block in cloneCurrent. _start almost always survives
+    // because it's a small leaf that calls main via `call` (which itself
+    // realigns), so the bug stays latent for sysExec but bites sysClone
+    // where the entry is an arbitrary user function. Fix both for symmetry.
+    frame[18] = (user_stack & ~@as(usize, 0xF)) - 8;
     frame[17] = 0x202;
     frame[16] = 0x23;
     frame[15] = entry;
@@ -256,7 +261,16 @@ pub fn cloneCurrent(entry: usize, stack_top: usize, arg: usize, fs_base: u64) ?u
 
     const frame: [*]u64 = @ptrFromInt(kstack_top - PT_REGS_QWORDS * 8);
     frame[19] = 0x1B;
-    frame[18] = stack_top;
+    // SysV ABI invariant: at function entry RSP must be (16-aligned minus 8).
+    // A normal `call` pushes 8-byte RA before transferring control, so the
+    // callee sees RSP at (16k - 8). iretq performs no such push, so we
+    // pre-adjust user RSP so `entry`'s prologue sees the alignment a normal
+    // `call` would produce. Without this, ANY XMM-spill in `entry`'s
+    // prologue (movaps/movdqa — emitted by Zig under register pressure,
+    // notably anything calling std.fmt.bufPrint) GPFs immediately on
+    // misaligned access. threadtest/threadbrot survive only because their
+    // worker bodies don't trigger XMM pressure; richer thread bodies crash.
+    frame[18] = (stack_top & ~@as(usize, 0xF)) - 8;
     frame[17] = 0x202;
     frame[16] = 0x23;
     frame[15] = entry;
