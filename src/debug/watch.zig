@@ -740,6 +740,14 @@ fn isLegitKernelEspWriter(rip: u64, addr: u64) bool {
 ///   slot 0..KESP_WATCHED_PIDS.len-1   : kernel_esp FIELD watch (cross-stack alias detector)
 ///   slot KESP_WATCHED_PIDS.len..      : kesp+48 MEMORY watch (saved-RIP zeroing detector)
 pub fn rotateKernelEspWatches() void {
+    // KASAN renames bulk-copy intrinsics (memcpy/memset → __anon_*) so the
+    // isLegitKernelEspWriter exact-match whitelist falsely flags the legit
+    // PCB zero-init from proc.lifecycle.create as a wild writer. KASAN
+    // covers the same corruption class with finer-grained reporting, so
+    // disable this hw-watchpoint when KASAN is on rather than relax the
+    // whitelist into something too permissive.
+    if (@hasDecl(@import("build_options"), "kasan_enabled") and
+        @import("build_options").kasan_enabled) return;
     const process = @import("../proc/process.zig");
     var any_change = false;
     for (KESP_WATCHED_PIDS, 0..) |pid, i| {

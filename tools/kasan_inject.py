@@ -58,6 +58,75 @@ DENYLIST: set[str] = {
     "main.zig",
     "boot_info.zig",
     "uefi_boot.zig",
+    # Early-boot helpers called between [boot] UEFI entry and kasan.init().
+    # All of these run while the KASAN shadow region is still uninitialised
+    # (shadow_offset == 0), so any instrumented load/store immediately reads
+    # poison from address 0 and reports a false trip.
+    "uefi_nvram.zig",
+    "cmdline.zig",
+    "boot_phase.zig",
+    "multiboot.zig",
+    "early_fb.zig",
+    "boot_log.zig",
+    "cpuid_info.zig",
+    "protect.zig",
+    "mce.zig",
+    "mwait.zig",
+    "pmu.zig",
+    "vga.zig",
+    # KCSAN runtime — installed in the same Phase 2 block as kasan.init();
+    # its callbacks run from instrumented code paths and would recurse.
+    "kcsan.zig",
+    # Zig stdlib pieces pulled into the kernel by even trivial code paths.
+    # Every `serial.print("... {d} ...", ...)` reaches std.fmt.format;
+    # @memcpy/@memset lower to std.mem helpers; Allocator/Writer glue is
+    # everywhere. All of these run before kasan.init() the first time we
+    # print anything formatted. Basename match also covers our own
+    # src/lib/* shims if they exist.
+    "fmt.zig",
+    "mem.zig",
+    "Allocator.zig",
+    "Writer.zig",
+    "Reader.zig",
+    "builtin.zig",
+    "atomic.zig",
+    "DeprecatedReader.zig",
+    "fixed_buffer_stream.zig",
+    "File.zig",
+    # Same idea for our own pre-init shims that print or allocate.
+    "panic_handler.zig",
+    # boot_log.banner() reaches into boot_screen.init() and the gfx/font/theme
+    # helpers that paint the splash. All called before kasan.init().
+    "boot_screen.zig",
+    "gfx.zig",
+    "theme.zig",
+    "icons.zig",
+    "font8x16.zig",
+    "font16x32.zig",
+    "aa_font.zig",
+    # ALL crash/autopsy path files — once a phantom KASAN trip happens
+    # pre-init, the panic handler itself recurses through these and the
+    # trip becomes an infinite reboot loop. Caught with breadcrumb.dump
+    # at the top of an unbounded crashAutopsy → handleException →
+    # isr_common_exc cycle 2026-05-24.
+    "breadcrumb.zig",
+    "addrinfo.zig",
+    "cpu_alias.zig",
+    "cpu_struct_hash.zig",
+    "diag.zig",
+    "dwarf_line.zig",
+    "exectrail.zig",
+    "iretq_canary.zig",
+    "kstack_protect.zig",
+    "panic_screen.zig",
+    "pcb_invariants.zig",
+    "pid_act.zig",
+    "pid_trace.zig",
+    "save_trace.zig",
+    "stack_alias.zig",
+    "syscall_perf.zig",
+    "watchdog.zig",
+    "yield_loop.zig",
     # Inline-asm-heavy modules. The asan pass leaves asm alone, but the Zig
     # wrappers around the asm sometimes have arg pointers that legitimately
     # point at TSS / per_cpu_asm — outside [REGION_LO, REGION_HI), bogus
@@ -101,11 +170,28 @@ DENYLIST: set[str] = {
     "time.zig",
     "acpi.zig",
     "ioapic.zig",
+    "iommu.zig",
     # Process / scheduler — called from IRQ entry where a phantom KASAN trip
     # would recurse forever before the IRQ stub completes. Plus they touch
     # PCB structures whose pointers we don't fully cover.
     "process.zig",
     "scheduler.zig",
+    # process.zig was split 2026-05-23 into lifecycle/sched/fault siblings;
+    # they share the same IRQ-entry constraints as the parent and used to
+    # be part of the single process.zig denylist entry.
+    "lifecycle.zig",
+    "sched.zig",
+    "fault.zig",
+    "runqueue.zig",
+    "signals.zig",
+    "elf_loader.zig",
+    "pipe.zig",
+    "errno.zig",
+    # mm siblings to the already-denylisted core allocator files. These are
+    # called from IRQ paths and from kasan.init itself (vmm.allocContiguous).
+    "slab.zig",
+    "shm.zig",
+    "swap.zig",
 }
 
 

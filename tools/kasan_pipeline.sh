@@ -72,6 +72,7 @@ opt-20 \
     --asan-force-dynamic-shadow \
     --asan-stack=false \
     --asan-globals=false \
+    --asan-instrumentation-with-call-threshold=0 \
     "$WORK/kernel-tagged.bc" \
     -o "$WORK/kernel-asan.bc"
 
