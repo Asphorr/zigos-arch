@@ -80,6 +80,13 @@ inline fn pmmCanaryCheck(phys: usize, callsite: []const u8, alloc_ra: usize) voi
     const want_lo = phys ^ CANARY_PMM_MAGIC;
     const got_lo = v[0];
     const got_hi = v[1];
+    // Suppress the "never canaried" pattern: a fresh boot frame that has
+    // never been through freeFrame contains all zeros. We'd see 169+
+    // benign hits across early boot otherwise. A real UAF writer is
+    // overwhelmingly unlikely to write exactly all-zero into the canary
+    // slots; if it does, we lose this one signal — acceptable for the
+    // S/N win.
+    if (got_lo == 0 and got_hi == 0) return;
     if (got_lo != want_lo or got_hi != ~want_lo) {
         _ = @atomicRmw(u64, &canary_mismatch_count, .Add, 1, .monotonic);
         const serial = @import("../debug/serial.zig");

@@ -716,18 +716,27 @@ pub fn printDetailedStats(use_vga: bool) void {
     // counters and the validateHeap walk both read mutable state.
     const irq_flags = lock.acquireIrqSave();
     defer lock.releaseIrqRestore(irq_flags);
-    if (ops_since_largest_recompute >= RECOMPUTE_INTERVAL) {
-        recomputeLargestFreeBlock();
-    }
+    // Always force a fresh recompute when displaying — incrementally-
+    // maintained largest_free_block is an UPPER BOUND between recomputes
+    // (it grows on insert, never shrinks on alloc). After we fixed the
+    // free_bytes_remaining double-count bug, an inflated largest could
+    // exceed the (now-accurate) free_bytes and overflow the frag_pct
+    // subtraction below. Recomputing here is O(free_blocks), trivial for
+    // an observability path.
+    recomputeLargestFreeBlock();
     const free_bytes = free_bytes_remaining;
     const free_blocks = free_block_count;
     const largest = largest_free_block;
     const used_bytes = if (HEAP_SIZE > free_bytes) HEAP_SIZE - free_bytes else 0;
     const pct = if (HEAP_SIZE > 0) (used_bytes * 100) / HEAP_SIZE else 0;
-    const frag_pct: u64 = if (free_bytes > 0)
-        100 - (largest * 100) / free_bytes
-    else
-        0;
+    // Defense-in-depth guard against the same overflow class: even if
+    // someone broke recompute, never let frag_pct's subtraction underflow.
+    const frag_pct: u64 = blk: {
+        if (free_bytes == 0) break :blk 0;
+        const ratio = (largest * 100) / free_bytes;
+        if (ratio >= 100) break :blk 0;
+        break :blk 100 - ratio;
+    };
     if (use_vga) {
         vga.fg = .Yellow;
         vga.print("Heap Statistics (TLSF)\n", .{});
@@ -778,15 +787,18 @@ pub fn snapshot() Stats {
     // different instants).
     const irq_flags = lock.acquireIrqSave();
     defer lock.releaseIrqRestore(irq_flags);
-    if (ops_since_largest_recompute >= RECOMPUTE_INTERVAL) {
-        recomputeLargestFreeBlock();
-    }
+    // Same recompute-always-then-guard pattern as printDetailedStats —
+    // snapshot is an observability path; an accurate `largest` matters
+    // more than a few µs of walk cost.
+    recomputeLargestFreeBlock();
     const free_bytes = free_bytes_remaining;
     const used = if (HEAP_SIZE > free_bytes) HEAP_SIZE - free_bytes else 0;
-    const frag: u32 = if (free_bytes > 0)
-        @intCast(100 - (@as(u64, largest_free_block) * 100) / free_bytes)
-    else
-        0;
+    const frag: u32 = blk: {
+        if (free_bytes == 0) break :blk 0;
+        const ratio = (@as(u64, largest_free_block) * 100) / free_bytes;
+        if (ratio >= 100) break :blk 0;
+        break :blk @intCast(100 - ratio);
+    };
     return .{
         .total_bytes = HEAP_SIZE,
         .used_bytes = used,
