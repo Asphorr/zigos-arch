@@ -9,6 +9,12 @@ pub const SpinLock = struct {
     /// sitting on the lock. 0xFF cpu = unheld.
     holder_cpu: u8 = 0xFF,
     holder_ra: u64 = 0,
+    /// TSC at the moment `acquireIrqSave` returned. Read by
+    /// `releaseIrqRestore` to compute the cli-held duration and emit
+    /// a `[cli-hold]` warning past CLI_HOLD_THRESHOLD_MS. 0 = not
+    /// currently held by an IrqSave path (plain acquire/release pairs
+    /// don't bracket and don't fire the warning).
+    acquire_tsc: u64 = 0,
 
     /// Acquire the lock. Spins until this ticket is served.
     ///
@@ -64,15 +70,70 @@ pub const SpinLock = struct {
     pub fn acquireIrqSave(self: *SpinLock) u64 {
         const flags = saveAndDisableIrq();
         self.acquire();
+        self.acquire_tsc = @import("../debug/perf.zig").rdtsc();
         return flags;
     }
 
-    /// Release and restore interrupt state.
+    /// Release and restore interrupt state. Emits `[cli-hold]` with the
+    /// acquire site + held duration if we sat with cli for longer than
+    /// CLI_HOLD_THRESHOLD_MS — ground-truth replacement for the SMI
+    /// classifier's IRQ0-gap sampling, which can't tell our cli-hold
+    /// apart from host SMI or cross-CPU spin contention.
     pub fn releaseIrqRestore(self: *SpinLock, flags: u64) void {
+        const start_tsc = self.acquire_tsc;
+        const holder_ra = self.holder_ra;
+        const cpu_id = self.holder_cpu;
+        self.acquire_tsc = 0;
         self.release();
+        if (start_tsc != 0) cliHoldCheck(self, start_tsc, holder_ra, cpu_id);
         restoreIrq(flags);
     }
 };
+
+/// Warn threshold for cli-bracketed critical sections. 5 ms is the same
+/// floor the SMI classifier uses; anything above that is provably too
+/// long regardless of why.
+const CLI_HOLD_THRESHOLD_MS: u64 = 5;
+
+/// One-shot rate-limit per process tick to avoid log floods when a
+/// genuinely-slow path runs in a loop (e.g. paging code-walk during
+/// swap pressure). Bumps to >0 only inside cliHoldCheck.
+var cli_hold_logged_this_tick: u32 = 0;
+var cli_hold_last_tick: u64 = 0;
+
+fn cliHoldCheck(self: *SpinLock, start_tsc: u64, ra: u64, cpu_id: u8) void {
+    const apic = @import("../time/apic.zig");
+    const per_q = apic.tscPerQuantum();
+    if (per_q == 0) return; // pre-calibration; no useful conversion
+    const perf = @import("../debug/perf.zig");
+    const delta = perf.rdtsc() -% start_tsc;
+    // tsc_per_quantum covers 10 ms; threshold in TSC = per_q * (ms/10)
+    const threshold_tsc = per_q * CLI_HOLD_THRESHOLD_MS / 10;
+    if (delta < threshold_tsc) return;
+    // Soft rate-limit: at most ~16 lines per second-of-tick window.
+    const process = @import("process.zig");
+    const tick: u64 = @atomicLoad(u64, &process.tick_count, .monotonic);
+    if (tick != cli_hold_last_tick) {
+        cli_hold_last_tick = tick;
+        cli_hold_logged_this_tick = 0;
+    }
+    if (cli_hold_logged_this_tick >= 16) return;
+    cli_hold_logged_this_tick += 1;
+    const symbols = @import("../debug/symbols.zig");
+    const serial = @import("../debug/serial.zig");
+    const ms = delta * 10 / per_q;
+    if (symbols.resolveKernel(ra)) |r| {
+        serial.print(
+            "[cli-hold] cpu{d} lock@0x{X} {d} ms at {s}+0x{X}\n",
+            .{ cpu_id, @intFromPtr(self), ms, r.name, r.offset },
+        );
+    } else {
+        serial.print(
+            "[cli-hold] cpu{d} lock@0x{X} {d} ms ra=0x{X}\n",
+            .{ cpu_id, @intFromPtr(self), ms, ra },
+        );
+    }
+}
 
 fn currentCpuId() u8 {
     const apic = @import("../time/apic.zig");
