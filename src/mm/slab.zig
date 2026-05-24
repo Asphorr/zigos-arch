@@ -164,6 +164,12 @@ pub const SlabAddrInfo = struct {
 
 pub fn querySlabAddr(addr: usize) ?SlabAddrInfo {
     const slab_addr = addr & SLAB_MASK;
+    // PT-walk gate. Called by addrinfo / autopsy with arbitrary RIPs and
+    // pointers; dereffing s.magic on an unmapped page would double-fault
+    // INSIDE the autopsy path — the same class as the 2026-05-11 IDT
+    // code-dump bug ([[idt-code-dump-unmapped-rip]]). Bail cleanly if the
+    // slab base isn't mapped before any deref.
+    if (!@import("paging.zig").isMapped(slab_addr)) return null;
     const s: *const Slab = @ptrFromInt(slab_addr);
     if (s.magic != SLAB_MAGIC or s.type_tag != SLAB_TYPE_TAG) return null;
     const cache = s.cache;

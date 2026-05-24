@@ -66,8 +66,13 @@ const FOOTER_SIZE: usize = 8;
 // Per-alloc prefix (header + user_size + canary_head):
 const USER_OFFSET: usize = 16;
 const CANARY_TAIL_SIZE: usize = 4;
-// Min total block size: header + next + prev + footer = 32.
+// Min total block size: header + next + prev + footer = 32. Shrinking this
+// would silently overlap the prev pointer (offset 16) with the footer
+// (offset size-8) — see prevFreePtr at line ~165. Comptime-locked.
 const MIN_BLOCK_SIZE: usize = 32;
+comptime {
+    if (MIN_BLOCK_SIZE < 32) @compileError("MIN_BLOCK_SIZE < 32 overlaps prev pointer with footer");
+}
 
 const FLAG_THIS_FREE: usize = 1 << 0;
 const FLAG_PREV_FREE: usize = 1 << 1;
