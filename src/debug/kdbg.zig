@@ -28,6 +28,13 @@ const addrinfo = @import("addrinfo.zig");
 const RING_SIZE: usize = 64; // per-category history depth — pow-of-2 for cheap modulo
 const SCHED_RING_SIZE: usize = 1024; // bigger — every dispatch + state change + tss/switch breadcrumbs
 const IRQ_RING_SIZE: usize = 128;
+// PMM free ring needs to be MUCH bigger than the generic RING_SIZE.
+// Canary-mismatch lookups walk this ring backwards looking for the most-recent
+// freer of a given phys, so the bug-of-interest's free event must still be
+// present. With mtswap-style stress doing 17k+ frees per run, RING_SIZE=64
+// rotates ~270×, losing the event before the mismatch fires. 8192 × 24 B
+// PmmFreeEvent = 192 KB BSS; covers several seconds of load.
+const PMM_FREE_RING_SIZE: usize = 8192;
 
 inline fn rdtsc() u64 {
     var lo: u32 = undefined;
@@ -165,7 +172,7 @@ fn Ring(comptime T: type, comptime size: usize) type {
 }
 
 pub var pmm_alloc_ring: Ring(PmmAllocEvent, RING_SIZE) = .{};
-pub var pmm_free_ring: Ring(PmmFreeEvent, RING_SIZE) = .{};
+pub var pmm_free_ring: Ring(PmmFreeEvent, PMM_FREE_RING_SIZE) = .{};
 pub var proc_ring: Ring(ProcEvent, RING_SIZE) = .{};
 pub var pf_ring: Ring(PFEvent, RING_SIZE) = .{};
 pub var mmap_ring: Ring(MmapEvent, RING_SIZE) = .{};
