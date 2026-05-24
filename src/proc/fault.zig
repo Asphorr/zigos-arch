@@ -237,6 +237,14 @@ fn reclaimViaSwap(pml4: [*]align(4096) u64, lead: *PCB, skip_va: usize, pcid: u1
     var freed: usize = 0;
     var iters: usize = 0;
     const ITER_CAP: usize = 16384; // bounds total work (pages examined + gap hops)
+    // [mtswap-trace] probes inside the loop are gated to stress-test pids
+    // (the user-spawned mtswap workers) so regular reclaim stays quiet.
+    const trace_pid: u32 = if (smp.myCpu().current_pid) |p| @intCast(p) else 0xFF;
+    const rtrace = trace_pid >= 4;
+    const trace_cpu = smp.myCpu().cpu_id;
+    if (rtrace) debug.klog("[mtswap-trace] pid={d} cpu{d} reclaim_loop_enter va=0x{X} lazy_count={d}\n", .{
+        trace_pid, trace_cpu, lead.swap_clock_va, lead.lazy_count,
+    });
     // Second-chance (clock) aging: a recently-accessed page gets its A bit
     // cleared and is skipped this sweep rather than evicted. skip_budget bounds
     // how many such reprieves we hand out so an all-hot working set still makes
@@ -309,24 +317,55 @@ fn reclaimViaSwap(pml4: [*]align(4096) u64, lead: *PCB, skip_va: usize, pcid: u1
                                 : .{ .memory = true });
                             skipped += 1;
                         }
-                    } else if (region_has_source and (pte & paging.DIRTY) == 0 and
-                        swap.discardFrame(pte_ptr, va, pcid))
-                    {
+                    } else if (region_has_source and (pte & paging.DIRTY) == 0) {
+                        if (rtrace) debug.klog("[mtswap-trace] pid={d} cpu{d} discard_call va=0x{X}\n", .{
+                            trace_pid, trace_cpu, va,
+                        });
+                        const dok = swap.discardFrame(pte_ptr, va, pcid);
+                        if (rtrace) debug.klog("[mtswap-trace] pid={d} cpu{d} discard_ret ok={any}\n", .{
+                            trace_pid, trace_cpu, dok,
+                        });
                         // Clean file-backed page: drop the PTE, no NVMe write.
                         // handleUserPageFault will reload from `source` on next
                         // touch. Skipping the swap-out is the whole point of
                         // the discard path — saves an NVMe round-trip per page
                         // for code segments, RO data, and any unwritten file
                         // mapping (which is most of an app's working set).
-                        freed += 1;
-                    } else if (swap.evictFrame(pte_ptr, va, pcid)) {
-                        freed += 1;
+                        if (dok) {
+                            freed += 1;
+                        } else {
+                            if (rtrace) debug.klog("[mtswap-trace] pid={d} cpu{d} evict_call va=0x{X}\n", .{
+                                trace_pid, trace_cpu, va,
+                            });
+                            const eok = swap.evictFrame(pte_ptr, va, pcid);
+                            if (rtrace) debug.klog("[mtswap-trace] pid={d} cpu{d} evict_ret ok={any}\n", .{
+                                trace_pid, trace_cpu, eok,
+                            });
+                            if (eok) freed += 1;
+                        }
+                    } else {
+                        if (rtrace) debug.klog("[mtswap-trace] pid={d} cpu{d} evict_call va=0x{X}\n", .{
+                            trace_pid, trace_cpu, va,
+                        });
+                        const eok = swap.evictFrame(pte_ptr, va, pcid);
+                        if (rtrace) debug.klog("[mtswap-trace] pid={d} cpu{d} evict_ret ok={any}\n", .{
+                            trace_pid, trace_cpu, eok,
+                        });
+                        if (eok) freed += 1;
                     }
                 }
             }
         }
         va += 0x1000;
+        if (rtrace and (iters & 1023) == 0 and iters != 0) {
+            debug.klog("[mtswap-trace] pid={d} cpu{d} reclaim_iter iters={d} freed={d} skipped={d} va=0x{X}\n", .{
+                trace_pid, trace_cpu, iters, freed, skipped, va,
+            });
+        }
     }
+    if (rtrace) debug.klog("[mtswap-trace] pid={d} cpu{d} reclaim_loop_exit iters={d} freed={d} skipped={d}\n", .{
+        trace_pid, trace_cpu, iters, freed, skipped,
+    });
     lead.swap_clock_va = va;
     swap.pages_second_chance +%= skipped;
     return freed;
@@ -391,7 +430,16 @@ fn trySwapInPage(pd: [*]align(4096) u64, lead: *PCB, va: usize, prot: u8, pcid: 
     // Make sure a frame is free for the read-in; evict cold pages of this
     // process if memory is exhausted. skip_va = va so reclaim never re-targets
     // the very page we're about to swap in.
-    if (pmm.freeFrameCount() < 64) _ = reclaimViaSwap(pd, lead, va, pcid, 64);
+    const free_pre = pmm.freeFrameCount();
+    if (free_pre < 64) {
+        if (trace) debug.klog("[mtswap-trace] pid={d} cpu{d} reclaim_begin free={d}\n", .{
+            cur_pid, smp.myCpu().cpu_id, free_pre,
+        });
+        const freed = reclaimViaSwap(pd, lead, va, pcid, 64);
+        if (trace) debug.klog("[mtswap-trace] pid={d} cpu{d} reclaim_end freed={d} free_post={d}\n", .{
+            cur_pid, smp.myCpu().cpu_id, freed, pmm.freeFrameCount(),
+        });
+    }
     if (trace) debug.klog("[mtswap-trace] pid={d} cpu{d} swapInFrame_begin\n", .{
         cur_pid, smp.myCpu().cpu_id,
     });

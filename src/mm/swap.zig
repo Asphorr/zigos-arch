@@ -317,6 +317,13 @@ pub fn evictFrame(pte_ptr: *u64, va: usize, pcid: u16) bool {
     const original = pte_ptr.*;
     if ((original & paging.PRESENT) == 0) return false; // nothing present to evict
     const frame = original & paging.PAGE_MASK;
+    // [mtswap-trace] gated to stress-test pids (current_pid >= 4). evictFrame
+    // is on the hot reclaim path; ungated logging would drown the log under
+    // normal swap activity.
+    const smp = @import("../cpu/smp.zig");
+    const evict_pid: u32 = if (smp.myCpu().current_pid) |p| @intCast(p) else 0xFF;
+    const etrace = evict_pid >= 4;
+    const ecpu = smp.myCpu().cpu_id;
     // Refcount guard: only evict a frame this address space SOLELY owns. A
     // refcount > 1 means the frame is dual-owned — e.g. the GUI framebuffer
     // (mapped into the app AND held by the kernel compositor via
@@ -325,7 +332,10 @@ pub fn evictFrame(pte_ptr: *u64, va: usize, pcid: u16) bool {
     // the app a fresh frame with stale contents -> silent FB corruption. Same
     // refcount==1 predicate the COW handler trusts. (zig-osdev-reviewer catch.)
     if (pmm.frameRefCount(frame) != 1) return false;
-    const slot = allocSlot() orelse return false;
+    const slot = allocSlot() orelse {
+        if (etrace) debug.klog("[mtswap-trace] pid={d} cpu{d} evict_no_slot va=0x{X}\n", .{ evict_pid, ecpu, va });
+        return false;
+    };
 
     // --- Phase 1: claim the page via CAS to the in-flight encoding ---
     const inflight = makeInflightPte(frame);
@@ -333,6 +343,7 @@ pub fn evictFrame(pte_ptr: *u64, va: usize, pcid: u16) bool {
         // Lost the race — another CPU evicted, the page was unmapped, or it
         // got modified between the read and the CAS. Bail with no side effects
         // beyond the slot bookkeeping.
+        if (etrace) debug.klog("[mtswap-trace] pid={d} cpu{d} evict_p1_cas_lost va=0x{X}\n", .{ evict_pid, ecpu, va });
         freeSlot(slot);
         return false;
     }
@@ -340,13 +351,18 @@ pub fn evictFrame(pte_ptr: *u64, va: usize, pcid: u16) bool {
     // teardown can free it if this thread is killed mid-writePage. Cleared
     // again at phase-3 commit / writePage-fail rollback.
     @import("../proc/process.zig").setInflightSlot(slot);
+    if (etrace) debug.klog("[mtswap-trace] pid={d} cpu{d} evict_p2_shootdown_begin va=0x{X} slot={d}\n", .{ evict_pid, ecpu, va, slot });
     // Shootdown BEFORE writePage so peers' TLBs can't satisfy writes via the
     // pre-CAS PRESENT entry. After shootdownPage returns, every CPU has
     // observed PRESENT=0; further writes fault and the handler will block.
     tlb.shootdownPage(pcid, va);
+    if (etrace) debug.klog("[mtswap-trace] pid={d} cpu{d} evict_p2_shootdown_end va=0x{X}\n", .{ evict_pid, ecpu, va });
 
     // --- Phase 2: write the frame contents to swap (may block under async) ---
-    if (!writePage(slot, frame)) {
+    if (etrace) debug.klog("[mtswap-trace] pid={d} cpu{d} evict_p2_writePage_begin slot={d} frame=0x{X}\n", .{ evict_pid, ecpu, slot, frame });
+    const wok = writePage(slot, frame);
+    if (etrace) debug.klog("[mtswap-trace] pid={d} cpu{d} evict_p2_writePage_end ok={any}\n", .{ evict_pid, ecpu, wok });
+    if (!wok) {
         // Restore the PTE so userspace re-enters with the page resident. If
         // a concurrent writer (teardownNonPresent or unmapUserRange's
         // PRESENT-branch race) wiped our in-flight entry while we were in
@@ -362,10 +378,12 @@ pub fn evictFrame(pte_ptr: *u64, va: usize, pcid: u16) bool {
     }
 
     // --- Phase 3: commit by transitioning in-flight → SWAPPED ---
+    if (etrace) debug.klog("[mtswap-trace] pid={d} cpu{d} evict_p3_commit_begin\n", .{ evict_pid, ecpu });
     if (@cmpxchgStrong(u64, pte_ptr, inflight, makeSwapPte(slot), .seq_cst, .seq_cst)) |_| {
         // Phase-3 CAS failed → PTE was cleared by either teardownNonPresent or
         // unmapUserRange's PRESENT-branch race (which already freed the frame).
         // Don't double-free. The slot holds data nobody will ever read; free it.
+        if (etrace) debug.klog("[mtswap-trace] pid={d} cpu{d} evict_p3_cas_lost\n", .{ evict_pid, ecpu });
         @import("../proc/process.zig").clearInflightSlot();
         freeSlot(slot);
         wakeSwapEvictWaiters(evictWaitTarget(pte_ptr));
@@ -377,6 +395,7 @@ pub fn evictFrame(pte_ptr: *u64, va: usize, pcid: u16) bool {
     @import("../proc/process.zig").clearInflightSlot();
     pmm.freeFrame(frame);
     wakeSwapEvictWaiters(evictWaitTarget(pte_ptr));
+    if (etrace) debug.klog("[mtswap-trace] pid={d} cpu{d} evict_done slot={d}\n", .{ evict_pid, ecpu, slot });
     pages_out += 1;
     if (pages_out == 1 or pages_out % 4096 == 0)
         debug.klog("[swap] out={d} in={d} sc={d} dc={d} slots={d}/{d}\n", .{ pages_out, pages_in, pages_second_chance, pages_discarded, used_count, NUM_SLOTS });
