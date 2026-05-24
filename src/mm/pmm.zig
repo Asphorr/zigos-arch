@@ -80,11 +80,23 @@ pub fn pmmCanaryMismatches() u64 {
     return @atomicLoad(u64, &canary_mismatch_count, .monotonic);
 }
 
+// Tail-canary location: last 16 bytes of the frame (offset 0xFF0..0xFFF).
+// Paired with the head canary at offset 0..15 so we can tell HEAD-only
+// overwrites (struct header written at frame start) from FULL-FRAME
+// overwrites (someone refilled the whole page) — different bug shapes.
+const CANARY_TAIL_OFFSET: usize = FRAME_SIZE - 16;
+const CANARY_TAIL_MAGIC: u64 = 0x4C49415446524545; // "EERFTAIL" reversed for "TAILFREE"
+
 inline fn pmmCanaryWrite(phys: usize) void {
-    const v: *[2]u64 = @ptrFromInt(@import("paging.zig").physToVirt(phys));
-    const lo = phys ^ CANARY_PMM_MAGIC;
-    v[0] = lo;
-    v[1] = ~lo;
+    const base = @import("paging.zig").physToVirt(phys);
+    const head: *[2]u64 = @ptrFromInt(base);
+    const tail: *[2]u64 = @ptrFromInt(base + CANARY_TAIL_OFFSET);
+    const head_lo = phys ^ CANARY_PMM_MAGIC;
+    const tail_lo = phys ^ CANARY_TAIL_MAGIC;
+    head[0] = head_lo;
+    head[1] = ~head_lo;
+    tail[0] = tail_lo;
+    tail[1] = ~tail_lo;
     canaryBitSet(@intCast(phys / FRAME_SIZE));
 }
 
@@ -95,15 +107,30 @@ inline fn pmmCanaryCheck(phys: usize, callsite: []const u8, alloc_ra: usize) voi
     // entirely; only frames that went through freeFrame are audited.
     if (!canaryBitGet(frame)) return;
     canaryBitClear(frame);
-    const v: *const [2]u64 = @ptrFromInt(@import("paging.zig").physToVirt(phys));
-    const want_lo = phys ^ CANARY_PMM_MAGIC;
-    const got_lo = v[0];
-    const got_hi = v[1];
-    if (got_lo != want_lo or got_hi != ~want_lo) {
+    const base = @import("paging.zig").physToVirt(phys);
+    const head: *const [2]u64 = @ptrFromInt(base);
+    const tail: *const [2]u64 = @ptrFromInt(base + CANARY_TAIL_OFFSET);
+    const want_head_lo = phys ^ CANARY_PMM_MAGIC;
+    const want_tail_lo = phys ^ CANARY_TAIL_MAGIC;
+    const got_lo = head[0];
+    const got_hi = head[1];
+    const head_ok = (got_lo == want_head_lo and got_hi == ~want_head_lo);
+    const tail_ok = (tail[0] == want_tail_lo and tail[1] == ~want_tail_lo);
+    if (!head_ok or !tail_ok) {
         _ = @atomicRmw(u64, &canary_mismatch_count, .Add, 1, .monotonic);
         const serial = @import("../debug/serial.zig");
         const symbols = @import("../debug/symbols.zig");
-        serial.print("[pmm-canary] !!! UAF !!! phys=0x{X:0>16} from {s} (got lo=0x{X:0>16} hi=0x{X:0>16}) — alloc caller=", .{ phys, callsite, got_lo, got_hi });
+        // head_ok / tail_ok distinguishes bug shape:
+        //   HEAD bad + TAIL ok  → header-only overwrite (struct write at frame
+        //                         start; small, targeted). Suspect: PT/PD entry
+        //                         writes, slab-meta writes, FreshFile header.
+        //   HEAD ok  + TAIL bad → tail-only overwrite (stack-bottom adjacency,
+        //                         bottom-up scribble). Suspect: kstack overflow.
+        //   HEAD bad + TAIL bad → full-frame rewrite. Suspect: DMA replay,
+        //                         memcpy-into-freed-frame, page-recycled-but-
+        //                         caller-still-has-ptr (UAF via large write).
+        const shape = if (!head_ok and !tail_ok) "FULL" else if (!head_ok) "HEAD" else "TAIL";
+        serial.print("[pmm-canary] !!! UAF !!! shape={s} phys=0x{X:0>16} from {s} (got lo=0x{X:0>16} hi=0x{X:0>16}) — alloc caller=", .{ shape, phys, callsite, got_lo, got_hi });
         if (symbols.resolveKernel(alloc_ra)) |r| {
             serial.print("{s}+0x{X}\n", .{ r.name, r.offset });
         } else {
