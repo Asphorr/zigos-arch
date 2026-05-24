@@ -1,9 +1,8 @@
+const std = @import("std");
 const vga = @import("../ui/vga.zig");
 const boot_info = @import("../boot/boot_info.zig");
 const SpinLock = @import("../proc/spinlock.zig").SpinLock;
 const memmap = @import("memmap.zig");
-
-var lock: SpinLock = .{};
 
 const FRAME_SIZE: u32 = 4096;
 // 1 GB cap: bitmap = 32 KB, frame_refs = 256 KB. ZigOS QEMU configs use
@@ -13,6 +12,316 @@ const FRAME_SIZE: u32 = 4096;
 // warning — bump this if a config ever genuinely wants more RAM exposed.
 const MAX_FRAMES: u32 = 256 * 1024;
 const BITMAP_SIZE = MAX_FRAMES / 32;
+
+// === Region-bucketed bitmap with per-CPU affinity + per-region order freelists ===
+//
+// The bitmap remains the ground truth (canary/kasan/refcount/kstack tripwires
+// all key off it). Around it we layer:
+//
+//   1. REGIONS — physical memory split into REGIONS_COUNT regions of
+//      REGION_FRAMES frames each. Each region carries its own lock,
+//      free-frame count, scan hint, and per-order freelist of contiguous
+//      free runs inside the region. Splitting the global lock into per-
+//      region locks lets SMP allocs/frees on different regions proceed
+//      in parallel; per-CPU magazine refill biases toward the CPU's
+//      preferred region to keep bitmap cache-lines hot per CPU.
+//
+//   2. RUN POOL — pre-allocated pool of `Run` nodes (start_frame, count,
+//      next index). Per-order freelists are intrusive linked lists through
+//      this pool. Fixed pool size: exhaustion gracefully degrades to
+//      "no freelist available for this push" — bitmap remains authoritative
+//      so future allocs still find the frames via scan, just slower.
+//
+//   3. PER-CPU PREFERRED REGION — derived from cpu_id, not stored. CPU `c`
+//      prefers region `c * (REGIONS_COUNT / MAX_CPUS)`. Magazine refill /
+//      single-frame fallback / contiguous alloc all start at the preferred
+//      region and walk outward. Anti-fragmentation: a CPU consistently
+//      allocates from the same region, so its working set stays contiguous.
+const REGION_FRAMES: u32 = 1024; // 4 MB per region
+const REGIONS_COUNT: u32 = MAX_FRAMES / REGION_FRAMES; // 256
+const REGION_WORDS: u32 = REGION_FRAMES / 32; // bitmap words per region
+
+comptime {
+    if (MAX_FRAMES % REGION_FRAMES != 0) {
+        @compileError("MAX_FRAMES must be a multiple of REGION_FRAMES");
+    }
+    if (REGION_FRAMES % 32 != 0) {
+        @compileError("REGION_FRAMES must be a multiple of 32");
+    }
+}
+
+// MAX_ORDER must cover REGION_FRAMES: 2^MAX_ORDER >= REGION_FRAMES.
+// REGION_FRAMES=1024 → MAX_ORDER=10 (2^10 = 1024). Plus order 0 = 1 frame.
+const MAX_ORDER: u5 = 10;
+
+/// A free contiguous run [start_frame, start_frame+count) entirely inside
+/// one region. Lives in `run_pool`; `next` is the next index in the order
+/// freelist (or NULL_RUN for tail).
+const Run = extern struct {
+    start_frame: u32,
+    count: u32,
+    next: u32,
+};
+
+/// Run pool sizing: worst-case fragmentation = 1 run per 2 frames =
+/// MAX_FRAMES/2 = 128K runs. Realistic = far fewer; 4096 covers heavy
+/// fragmentation comfortably and stays at 48 KB BSS (12 B × 4096).
+/// Pool exhaustion is non-fatal — coalesceAndPush logs a warning and skips
+/// the freelist push; the bitmap is still authoritative.
+const RUN_POOL_SIZE: u32 = 4096;
+const NULL_RUN: u32 = 0xFFFFFFFF;
+
+var run_pool: [RUN_POOL_SIZE]Run = undefined;
+var run_pool_freelist: u32 = NULL_RUN;
+var run_pool_exhaustions: u64 = 0;
+
+/// Per-region metadata. Each region owns a REGION_FRAMES-frame slice of the
+/// global bitmap (no allocation — bitmap is shared, region.lock guards
+/// access to its slice). free_count + next_free_word + freelist_heads are
+/// region-local.
+const Region = struct {
+    lock: SpinLock = .{},
+    free_count: u32 = 0,
+    /// Word index into the global bitmap, RELATIVE to the region's start.
+    /// Range: 0..REGION_WORDS. Hints where the next scan should begin.
+    next_free_word: u32 = 0,
+    /// Per-order freelist heads. Index into `run_pool`; NULL_RUN = empty.
+    /// freelist_heads[k] holds runs of size [2^k, 2^(k+1)) (except the
+    /// top-most bucket which is open-ended).
+    freelist_heads: [MAX_ORDER + 1]u32 = [_]u32{NULL_RUN} ** (MAX_ORDER + 1),
+};
+
+var regions: [REGIONS_COUNT]Region = blk: {
+    var arr: [REGIONS_COUNT]Region = undefined;
+    for (&arr) |*r| r.* = .{};
+    break :blk arr;
+};
+
+inline fn regionForFrame(frame: u32) u32 {
+    return frame / REGION_FRAMES;
+}
+
+inline fn regionStartFrame(region_idx: u32) u32 {
+    return region_idx * REGION_FRAMES;
+}
+
+/// Map a CPU id to its preferred region. With REGIONS_COUNT=256 and
+/// MAX_CPUS=32, each CPU's primary region is at stride 8: cpu 0 → region 0,
+/// cpu 1 → region 8, ..., cpu 31 → region 248. The cpu's scan walks
+/// outward from there.
+inline fn preferredRegion(cpu_id: u8) u32 {
+    const stride: u32 = REGIONS_COUNT / @import("../cpu/smp.zig").MAX_CPUS;
+    return @as(u32, cpu_id) * stride;
+}
+
+/// floor(log2(count)) — order bucket for a run of `count` frames. Runs of
+/// size 1 land in order 0; size 1024 lands in order 10.
+inline fn orderForSize(count: u32) u5 {
+    if (count <= 1) return 0;
+    const o = @as(u5, @truncate(31 - @clz(count)));
+    return if (o > MAX_ORDER) MAX_ORDER else o;
+}
+
+// === Run pool — fixed-size pool of Run nodes for per-region freelists ===
+//
+// Single-threaded init followed by lock-protected use (each push/pop runs
+// under its owning region's lock). The pool's free-chain is implicitly
+// protected by the same locks: only the region that has the lock can
+// alloc/free a Run, and the lock chain prevents two regions from racing.
+// One global pool because runs migrate ownership (free into region A may
+// coalesce frames originally from region B's perspective? No — coalescing
+// is region-local), and per-region pools would over-provision.
+//
+// Race note: `run_pool_freelist` is touched by every region. We protect it
+// with a tiny dedicated spinlock — uncontended in practice because the
+// push/pop happens under a region lock and only briefly touches the pool.
+
+var run_pool_lock: SpinLock = .{};
+
+fn runPoolInit() void {
+    var i: u32 = 0;
+    while (i + 1 < RUN_POOL_SIZE) : (i += 1) {
+        run_pool[i].next = i + 1;
+    }
+    run_pool[RUN_POOL_SIZE - 1].next = NULL_RUN;
+    run_pool_freelist = 0;
+}
+
+/// Acquire one Run node from the pool. Returns null on exhaustion — caller
+/// degrades gracefully (skip the freelist push; bitmap remains authoritative).
+fn allocRun() ?u32 {
+    run_pool_lock.acquire();
+    defer run_pool_lock.release();
+    if (run_pool_freelist == NULL_RUN) {
+        run_pool_exhaustions +%= 1;
+        return null;
+    }
+    const idx = run_pool_freelist;
+    run_pool_freelist = run_pool[idx].next;
+    return idx;
+}
+
+fn freeRunNode(idx: u32) void {
+    run_pool_lock.acquire();
+    defer run_pool_lock.release();
+    run_pool[idx].next = run_pool_freelist;
+    run_pool_freelist = idx;
+}
+
+// === Per-region freelist operations — caller must hold region's lock ===
+
+/// Push a run [start_frame, start_frame+count) into the region's order bucket.
+/// Returns false if the Run pool is exhausted (caller should not consider
+/// this an error — bitmap still authoritative).
+fn pushRunLocked(region_idx: u32, start_frame: u32, count: u32) bool {
+    const idx = allocRun() orelse return false;
+    run_pool[idx].start_frame = start_frame;
+    run_pool[idx].count = count;
+    const order = orderForSize(count);
+    const r = &regions[region_idx];
+    run_pool[idx].next = r.freelist_heads[order];
+    r.freelist_heads[order] = idx;
+    return true;
+}
+
+/// Remove ALL freelist entries that overlap [range_start, range_end). Used
+/// by markRegionFree/Used when the range may contain pre-existing entries
+/// whose state is unknown (rare runtime call paths: paging.allocBackBuffer
+/// / freeBackBuffer, GFB allocate/free). Walks every order bucket; cost is
+/// O(K) in the per-region freelist length. Caller must hold the region's
+/// lock.
+fn removeRunsInRangeLocked(region_idx: u32, range_start: u32, range_count: u32) void {
+    const range_end = range_start + range_count;
+    const r = &regions[region_idx];
+    var order: u5 = 0;
+    while (order <= MAX_ORDER) : (order += 1) {
+        var prev: u32 = NULL_RUN;
+        var cur = r.freelist_heads[order];
+        while (cur != NULL_RUN) {
+            const cs = run_pool[cur].start_frame;
+            const ce = cs + run_pool[cur].count;
+            if (cs < range_end and ce > range_start) {
+                const next = run_pool[cur].next;
+                if (prev == NULL_RUN) {
+                    r.freelist_heads[order] = next;
+                } else {
+                    run_pool[prev].next = next;
+                }
+                freeRunNode(cur);
+                cur = next;
+                continue;
+            }
+            prev = cur;
+            cur = run_pool[cur].next;
+        }
+    }
+}
+
+/// Remove a specific run [start_frame, start_frame+count) from the region's
+/// freelist. Returns true if found+removed. Used by coalesceAndPushLocked
+/// to drop neighbor entries before pushing the merged run.
+fn removeRunLocked(region_idx: u32, start_frame: u32, count: u32) bool {
+    const order = orderForSize(count);
+    const r = &regions[region_idx];
+    var prev: u32 = NULL_RUN;
+    var cur = r.freelist_heads[order];
+    while (cur != NULL_RUN) {
+        if (run_pool[cur].start_frame == start_frame and run_pool[cur].count == count) {
+            const next = run_pool[cur].next;
+            if (prev == NULL_RUN) {
+                r.freelist_heads[order] = next;
+            } else {
+                run_pool[prev].next = next;
+            }
+            freeRunNode(cur);
+            return true;
+        }
+        prev = cur;
+        cur = run_pool[cur].next;
+    }
+    return false;
+}
+
+/// Pop the smallest-order run of size ≥ `count` from this region's freelists.
+/// Returns the run's start_frame and original count, or null if no run fits.
+/// Caller takes the first `count` frames and is responsible for pushing the
+/// remainder (count - needed) back via `pushRunLocked` if any.
+fn popRunGEInRegionLocked(region_idx: u32, count: u32) ?struct { start_frame: u32, run_count: u32 } {
+    const r = &regions[region_idx];
+    var order = orderForSize(count);
+    while (order <= MAX_ORDER) : (order += 1) {
+        var prev: u32 = NULL_RUN;
+        var cur = r.freelist_heads[order];
+        while (cur != NULL_RUN) {
+            if (run_pool[cur].count >= count) {
+                const start = run_pool[cur].start_frame;
+                const rc = run_pool[cur].count;
+                if (prev == NULL_RUN) {
+                    r.freelist_heads[order] = run_pool[cur].next;
+                } else {
+                    run_pool[prev].next = run_pool[cur].next;
+                }
+                freeRunNode(cur);
+                return .{ .start_frame = start, .run_count = rc };
+            }
+            prev = cur;
+            cur = run_pool[cur].next;
+        }
+    }
+    return null;
+}
+
+/// Coalesce a just-freed range [start_frame, start_frame+count) with its
+/// left+right free neighbors (within the same region) and push the merged
+/// run to the region's freelist. Caller must hold the region's lock AND
+/// have already cleared the range's bits in the bitmap. Both neighbor scans
+/// stop at region boundaries — coalescing across regions is intentionally
+/// skipped to keep the freelist single-region (cross-region runs still
+/// reachable via bitmap scan fallback in allocContiguous).
+fn coalesceAndPushLocked(region_idx: u32, start_frame: u32, count: u32) void {
+    const region_start = regionStartFrame(region_idx);
+    const region_end = region_start + REGION_FRAMES;
+
+    var new_start = start_frame;
+    var new_count = count;
+
+    // Extend left: walk bitmap leftward while bits are clear AND we stay
+    // inside the region. Count how many frames we absorb so we can locate
+    // the left neighbor's freelist entry (if any).
+    var left_count: u32 = 0;
+    while (new_start > region_start and !testBit(new_start - 1)) {
+        new_start -= 1;
+        new_count += 1;
+        left_count += 1;
+    }
+
+    // Extend right: walk bitmap rightward while bits are clear AND inside
+    // the region.
+    var right_count: u32 = 0;
+    while (new_start + new_count < region_end and !testBit(new_start + new_count)) {
+        new_count += 1;
+        right_count += 1;
+    }
+
+    // Drop left+right neighbor freelist entries (they're subsumed by the
+    // merged run). Each removeRunLocked walks ONE order bucket — cheap.
+    // Missing entry isn't an error: pool exhaustion when the neighbor was
+    // freed left the bitmap correct but no freelist node, so there's nothing
+    // to remove.
+    if (left_count > 0) _ = removeRunLocked(region_idx, new_start, left_count);
+    if (right_count > 0) _ = removeRunLocked(region_idx, start_frame + count, right_count);
+
+    if (!pushRunLocked(region_idx, new_start, new_count)) {
+        // Pool exhausted. Bitmap is still authoritative; allocs will find
+        // these frames via scan. Log once per 4K exhaustions to avoid spam.
+        if ((run_pool_exhaustions & 0xFFF) == 1) {
+            @import("../debug/serial.zig").print(
+                "[pmm] run pool exhausted ({d} total); coalesce push skipped for {d} frames at frame {d}\n",
+                .{ run_pool_exhaustions, new_count, new_start },
+            );
+        }
+    }
+}
 
 /// Per-CPU magazine cache parameters (Bonwick magazine layer).
 ///
@@ -66,18 +375,61 @@ var canary_mismatch_count: u64 = 0;
 // 2026-05-24 mtswap run). 1 bit per FRAME_SIZE PA = 32 KB BSS.
 var canary_present: [BITMAP_SIZE]u32 = [_]u32{0} ** BITMAP_SIZE;
 
+// Atomic RmW so concurrent free / alloc on different CPUs don't lose
+// canary marks. A torn set or clear would produce false-negative UAF
+// detection (mark dropped) or false-positive next-alloc check.
 inline fn canaryBitSet(frame: u32) void {
-    canary_present[frame / 32] |= (@as(u32, 1) << @intCast(frame & 31));
+    const bit: u32 = @as(u32, 1) << @intCast(frame & 31);
+    _ = @atomicRmw(u32, &canary_present[frame / 32], .Or, bit, .monotonic);
 }
 inline fn canaryBitClear(frame: u32) void {
-    canary_present[frame / 32] &= ~(@as(u32, 1) << @intCast(frame & 31));
+    const mask: u32 = ~(@as(u32, 1) << @intCast(frame & 31));
+    _ = @atomicRmw(u32, &canary_present[frame / 32], .And, mask, .monotonic);
 }
 inline fn canaryBitGet(frame: u32) bool {
-    return (canary_present[frame / 32] & (@as(u32, 1) << @intCast(frame & 31))) != 0;
+    const w = @atomicLoad(u32, &canary_present[frame / 32], .monotonic);
+    return (w & (@as(u32, 1) << @intCast(frame & 31))) != 0;
 }
 
 pub fn pmmCanaryMismatches() u64 {
     return @atomicLoad(u64, &canary_mismatch_count, .monotonic);
+}
+
+// === Public introspection for diagnostics + stress tests ===
+
+/// Exposed region geometry so stress tests can compute the per-CPU
+/// affinity score (frame → region → expected-region match).
+pub const PUB_REGION_FRAMES: u32 = REGION_FRAMES;
+pub const PUB_REGIONS_COUNT: u32 = REGIONS_COUNT;
+pub const PUB_MAX_FRAMES: u32 = MAX_FRAMES;
+pub const PUB_FRAME_SIZE: u32 = FRAME_SIZE;
+
+/// Snapshot count of times allocRun has hit `run_pool_freelist == NULL_RUN`.
+/// Stress tests can drive this number up to validate graceful degradation.
+pub fn pmmRunPoolExhaustions() u64 {
+    return @atomicLoad(u64, &run_pool_exhaustions, .monotonic);
+}
+
+/// Best-effort snapshot of region.free_count. Racy (no region lock), but
+/// adequate for "did this region get most of CPU N's allocs" affinity
+/// scoring. Returns 0 for out-of-range region_idx.
+pub fn pmmRegionFreeCount(region_idx: u32) u32 {
+    if (region_idx >= REGIONS_COUNT) return 0;
+    return regions[region_idx].free_count;
+}
+
+/// Count of free Run nodes in the pool. Walks the freelist briefly under
+/// the pool lock — O(RUN_POOL_SIZE) worst case but typically O(K) where
+/// K = free nodes. Diagnostic only.
+pub fn pmmRunPoolFreeCount() u32 {
+    run_pool_lock.acquire();
+    defer run_pool_lock.release();
+    var n: u32 = 0;
+    var cur = run_pool_freelist;
+    while (cur != NULL_RUN and n < RUN_POOL_SIZE) : (n += 1) {
+        cur = run_pool[cur].next;
+    }
+    return n;
 }
 
 // Tail-canary location: last 16 bytes of the frame (offset 0xFF0..0xFFF).
@@ -185,12 +537,31 @@ var bitmap: [BITMAP_SIZE]u32 = undefined;
 /// count, decremented on alloc and incremented on free. The post-init
 /// snapshot is held in `managed_frames` so /proc/meminfo can report a
 /// stable "total" without subtracting current usage from a moving target.
-var total_frames: u32 = 0;
+///
+/// Atomic because per-region locks no longer serialize total_frames across
+/// regions — a free in region A and an alloc in region B race on this u32.
+/// Native-aligned u32 RmW (LOCK XADD) is cheap on x86 and serializes the
+/// read-modify-write cleanly.
+var total_frames: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+
+/// Saturating atomic subtraction: subtract `n` but clamp at 0 instead of
+/// underflowing. Defensive — region accounting should keep total_frames
+/// >= sum-of-subs at all times, but a single accounting bug shouldn't
+/// flip the visible count to ~4 billion. CAS loop is uncontended in
+/// practice (only the loser of a concurrent free races).
+fn satSubTotal(n: u32) void {
+    while (true) {
+        const cur = total_frames.load(.monotonic);
+        const new: u32 = if (cur >= n) cur - n else 0;
+        if (cur == new) return;
+        if (total_frames.cmpxchgWeak(cur, new, .monotonic, .monotonic) == null) return;
+    }
+}
 /// Snapshot of the free-frame count at the moment PMM init finishes —
 /// effectively the size of the usable PMM pool (free + about-to-be-allocated
 /// kernel structures). Stable for the lifetime of the OS; used by meminfo.
 var managed_frames: u32 = 0;
-var next_free_word: usize = 0; // Hint: start scanning from here
+// Per-region scan hint lives in `Region.next_free_word`; no global hint.
 
 /// Kernel emergency reserve — number of frames that allocFrameUser refuses
 /// to dip below, so user-driven faulting can never starve the kernel of
@@ -244,36 +615,115 @@ fn testBit(frame: u32) bool {
     return (bitmap[frame / 32] & (@as(u32, 1) << @as(u5, @truncate(frame % 32)))) != 0;
 }
 
+/// Mark [base, base+length) as free in the bitmap, update per-region free
+/// counts, and push the freed range into the affected regions' freelists.
+/// Used at init (single-threaded, no contention) AND at runtime by
+/// paging.freeBackBuffer / paging.freeGuestFB (rare). Splits the range
+/// per region; locks each region briefly.
 pub fn markRegionFree(base: usize, length: usize) void {
     var frame: u32 = @intCast(base / FRAME_SIZE);
-    const end_frame: u32 = @intCast((base + length) / FRAME_SIZE);
-    while (frame < end_frame and frame < MAX_FRAMES) : (frame += 1) {
-        if (testBit(frame)) {
-            clearBit(frame);
-            total_frames += 1;
+    const end_frame: u32 = @intCast(@min((base + length) / FRAME_SIZE, MAX_FRAMES));
+    while (frame < end_frame) {
+        const region_idx = regionForFrame(frame);
+        const region_end = (region_idx + 1) * REGION_FRAMES;
+        const chunk_end = @min(end_frame, region_end);
+        const r = &regions[region_idx];
+        const flags = r.lock.acquireIrqSave();
+        const chunk_start = frame;
+        var chunk_freed: u32 = 0;
+        while (frame < chunk_end) : (frame += 1) {
+            if (testBit(frame)) {
+                clearBit(frame);
+                chunk_freed += 1;
+            }
         }
+        if (chunk_freed > 0) {
+            r.free_count += chunk_freed;
+            _ = total_frames.fetchAdd(chunk_freed, .monotonic);
+            // Range may contain pre-existing freelist entries (already-free
+            // frames). Scrub them, then coalesce+push the now-fully-free
+            // chunk. Scrub is a no-op when the range was all-used (the
+            // common case: init + back-buffer/GFB unmark).
+            removeRunsInRangeLocked(region_idx, chunk_start, chunk_end - chunk_start);
+            coalesceAndPushLocked(region_idx, chunk_start, chunk_end - chunk_start);
+            // Region's scan hint may now point past free frames in this chunk.
+            const chunk_first_word = (chunk_start - regionStartFrame(region_idx)) / 32;
+            if (chunk_first_word < r.next_free_word) r.next_free_word = chunk_first_word;
+        }
+        r.lock.releaseIrqRestore(flags);
     }
 }
 
+/// Mark [base, base+length) as used in the bitmap. Updates per-region free
+/// counts and removes any freelist entries that overlap. Used at init AND
+/// at runtime by paging.allocBackBuffer / paging.allocGuestFB.
 pub fn markRegionUsed(base: usize, length: usize) void {
     var frame: u32 = @intCast(base / FRAME_SIZE);
-    const end_frame: u32 = @intCast((base + length + FRAME_SIZE - 1) / FRAME_SIZE);
-    while (frame < end_frame and frame < MAX_FRAMES) : (frame += 1) {
-        if (!testBit(frame)) {
-            setBit(frame);
-            if (total_frames > 0) total_frames -= 1;
+    const end_frame: u32 = @intCast(@min((base + length + FRAME_SIZE - 1) / FRAME_SIZE, MAX_FRAMES));
+    while (frame < end_frame) {
+        const region_idx = regionForFrame(frame);
+        const region_end = (region_idx + 1) * REGION_FRAMES;
+        const chunk_end = @min(end_frame, region_end);
+        const r = &regions[region_idx];
+        const flags = r.lock.acquireIrqSave();
+        const chunk_start = frame;
+        var chunk_used: u32 = 0;
+        while (frame < chunk_end) : (frame += 1) {
+            if (!testBit(frame)) {
+                setBit(frame);
+                chunk_used += 1;
+            }
         }
+        if (chunk_used > 0) {
+            if (r.free_count >= chunk_used) r.free_count -= chunk_used else r.free_count = 0;
+            satSubTotal(chunk_used);
+            // Drop any freelist entries that included these now-used frames.
+            // A previously-free run may have spanned the chunk; after the
+            // mark, part of it (or all of it) is used, so the entry is stale.
+            // Re-push any free fragments left at the edges.
+            removeRunsInRangeLocked(region_idx, chunk_start, chunk_end - chunk_start);
+            // Left fragment: any free frames immediately before chunk_start
+            // that were part of the removed run.
+            var left_start = chunk_start;
+            var left_count: u32 = 0;
+            const reg_start = regionStartFrame(region_idx);
+            while (left_start > reg_start and !testBit(left_start - 1)) {
+                left_start -= 1;
+                left_count += 1;
+            }
+            if (left_count > 0) {
+                _ = pushRunLocked(region_idx, left_start, left_count);
+            }
+            // Right fragment: free frames immediately after chunk_end.
+            var right_count: u32 = 0;
+            while (chunk_end + right_count < region_end and !testBit(chunk_end + right_count)) {
+                right_count += 1;
+            }
+            if (right_count > 0) {
+                _ = pushRunLocked(region_idx, chunk_end, right_count);
+            }
+        }
+        r.lock.releaseIrqRestore(flags);
     }
 }
 
 pub fn init(info: *const boot_info.BootInfo) void {
-    @import("../proc/spinlock.zig").registerLock("pmm.lock", &lock);
+    runPoolInit();
+    // Register the run-pool lock + one representative region lock so the
+    // spinlock holder dump can name them in a deadlock report. The 256
+    // region locks are intentionally anonymous — naming each one would
+    // clutter the registry, and the lock-diag falls back to printing the
+    // pointer for unregistered locks anyway.
+    const spinlock = @import("../proc/spinlock.zig");
+    spinlock.registerLock("pmm.run_pool", &run_pool_lock);
+    spinlock.registerLock("pmm.r0", &regions[0].lock);
+
     // Mark all frames as used initially
     for (&bitmap) |*word| {
         word.* = 0xFFFFFFFF;
     }
     @memset(&frame_refs, 0);
-    total_frames = 0;
+    total_frames.store(0, .monotonic);
 
     if (info.memory_map_count == 0) {
         @panic("No memory map!");
@@ -337,7 +787,7 @@ pub fn init(info: *const boot_info.BootInfo) void {
     // hand back from meminfo. Reservations done after this point (e.g.
     // KASAN shadow when enabled) will be accounted for as "used" against
     // this baseline rather than disappearing from the total.
-    managed_frames = total_frames;
+    managed_frames = total_frames.load(.monotonic);
 
     // 5% of managed frames, capped at a sane absolute (don't tie up
     // 50 MB on a 1 GB host but also don't shrink below 256 frames =
@@ -348,42 +798,112 @@ pub fn init(info: *const boot_info.BootInfo) void {
     @import("../debug/serial.zig").print("[pmm] kernel reserve = {d} frames ({d} KB)\n", .{ pmm_user_reserve, pmm_user_reserve * 4 });
 }
 
-/// Internal: scan the bitmap for one free frame, mark it used, and return
-/// its phys addr. Caller must already hold `lock`. Same wrap-around logic
-/// as the original allocFrame inline scan.
-fn scanAndConsumeOneLocked() ?usize {
-    var i: usize = next_free_word;
-    while (i < bitmap.len) : (i += 1) {
-        if (bitmap[i] != 0xFFFFFFFF) {
-            const free_bits = ~bitmap[i];
-            const bit: u5 = @truncate(@ctz(free_bits));
-            const frame = @as(u32, @intCast(i)) * 32 + bit;
-            setBit(frame);
-            if (total_frames > 0) total_frames -= 1;
-            next_free_word = i;
-            return @as(usize, frame) * FRAME_SIZE;
+/// Scan one region's bitmap slice for a free frame, claim it, return phys
+/// addr. Caller must hold `regions[region_idx].lock`. Wraps within region;
+/// null if region is full. This is the BITMAP FALLBACK — callers should
+/// try popRunGEInRegionLocked first; scan only runs when the region's
+/// freelist is empty (e.g., post-pool-exhaustion orphaned free frames).
+///
+/// Invariant: when this returns frame F, no freelist entry contains F.
+/// That holds because (a) the freelist try happened first and returned null,
+/// meaning no entry of any order had count≥1 in this region, and (b)
+/// coalesceAndPush always merges adjacent free frames into one entry, so
+/// "no entry" means "no entry covers any free frame in this region".
+fn scanInRegionLocked(region_idx: u32) ?usize {
+    const region_base_word: u32 = region_idx * REGION_WORDS;
+    const region_end_word: u32 = region_base_word + REGION_WORDS;
+    const r = &regions[region_idx];
+    var w: u32 = region_base_word + r.next_free_word;
+    while (w < region_end_word) : (w += 1) {
+        if (bitmap[w] != 0xFFFFFFFF) {
+            return takeFrameFromWordLocked(region_idx, w);
         }
     }
-    i = 0;
-    while (i < next_free_word) : (i += 1) {
-        if (bitmap[i] != 0xFFFFFFFF) {
-            const free_bits = ~bitmap[i];
-            const bit: u5 = @truncate(@ctz(free_bits));
-            const frame = @as(u32, @intCast(i)) * 32 + bit;
-            setBit(frame);
-            if (total_frames > 0) total_frames -= 1;
-            next_free_word = i;
-            return @as(usize, frame) * FRAME_SIZE;
+    w = region_base_word;
+    const stop = region_base_word + r.next_free_word;
+    while (w < stop) : (w += 1) {
+        if (bitmap[w] != 0xFFFFFFFF) {
+            return takeFrameFromWordLocked(region_idx, w);
         }
     }
     return null;
+}
+
+/// Claim one free bit from `bitmap[word_idx]`, update region/global counts,
+/// advance the region's scan hint, return phys addr. Caller holds the region
+/// lock and has verified `bitmap[word_idx] != 0xFFFFFFFF`.
+fn takeFrameFromWordLocked(region_idx: u32, word_idx: u32) usize {
+    const free_bits = ~bitmap[word_idx];
+    const bit: u5 = @truncate(@ctz(free_bits));
+    const frame = word_idx * 32 + @as(u32, bit);
+    setBit(frame);
+    const r = &regions[region_idx];
+    if (r.free_count > 0) r.free_count -= 1;
+    satSubTotal(1);
+    r.next_free_word = word_idx - region_idx * REGION_WORDS;
+    return @as(usize, frame) * FRAME_SIZE;
+}
+
+/// Magazine-refilling alloc from one region. Caller passes its CpuLocal so
+/// any extra frames (beyond the one returned to caller) land in the per-CPU
+/// magazine. Tries the region's freelist (one pop yields up to REFILL_BATCH+1
+/// frames); falls back to bitmap scan inside the region. Returns the phys
+/// addr of the frame given to the caller (frame is bit-set; remainder is
+/// in the magazine), or null if region has nothing to offer.
+fn allocAndRefillFromRegion(region_idx: u32, cpu: anytype) ?usize {
+    const r = &regions[region_idx];
+    const flags = r.lock.acquireIrqSave();
+    defer r.lock.releaseIrqRestore(flags);
+
+    // Freelist path: one pop may satisfy caller + refill batch in one op.
+    if (popRunGEInRegionLocked(region_idx, 1)) |run| {
+        // Cap `take` by what the magazine can actually hold so a partly-full
+        // cache doesn't drop the trailing setBit'd frames. With the current
+        // callers (cache miss path enters with count==0) this is always
+        // REFILL_BATCH+1, but the floor below is the defensive invariant.
+        const cache_room: u32 = if (CACHE_SIZE > cpu.pmm_cache_count)
+            CACHE_SIZE - cpu.pmm_cache_count
+        else
+            0;
+        const want: u32 = @min(REFILL_BATCH + 1, cache_room + 1); // +1 for caller's own frame
+        const take: u32 = if (run.run_count > want) want else run.run_count;
+        const start_frame = run.start_frame;
+        var i: u32 = 0;
+        while (i < take) : (i += 1) setBit(start_frame + i);
+        if (r.free_count >= take) r.free_count -= take else r.free_count = 0;
+        satSubTotal(take);
+        if (run.run_count > take) {
+            _ = pushRunLocked(region_idx, start_frame + take, run.run_count - take);
+        }
+        // Frame 0 → caller. Frames 1..take → magazine.
+        const caller_phys: usize = @as(usize, start_frame) * FRAME_SIZE;
+        var j: u32 = 1;
+        while (j < take and cpu.pmm_cache_count < CACHE_SIZE) : (j += 1) {
+            cpu.pmm_cache[cpu.pmm_cache_count] = caller_phys + @as(usize, j) * FRAME_SIZE;
+            cpu.pmm_cache_count += 1;
+        }
+        return caller_phys;
+    }
+
+    // Bitmap-scan fallback: freelist is empty (or pool-exhausted) for this
+    // region. Find one frame, then refill cache from same region.
+    const caller = scanInRegionLocked(region_idx) orelse return null;
+    var refilled: u32 = 0;
+    while (refilled < REFILL_BATCH and cpu.pmm_cache_count < CACHE_SIZE) : (refilled += 1) {
+        const phys = scanInRegionLocked(region_idx) orelse break;
+        cpu.pmm_cache[cpu.pmm_cache_count] = phys;
+        cpu.pmm_cache_count += 1;
+    }
+    return caller;
 }
 
 pub fn allocFrame() ?usize {
     const ra = @returnAddress();
     // IF off across cache access — guarantees no preemption / IRQ runs an
     // allocFrame on the same CPU's cache mid-pop. With per-CPU storage and
-    // IF=0, no extra synchronisation is required.
+    // IF=0, no extra synchronisation is required. Per-region locks below
+    // re-disable (no-op when already off) and pair release with the same
+    // restore-to-off state.
     const irq_flags = saveAndDisableIrq();
     defer restoreIrq(irq_flags);
 
@@ -400,19 +920,22 @@ pub fn allocFrame() ?usize {
         return phys;
     }
 
-    // Cache miss: bulk-refill (REFILL_BATCH frames into cache) + return one
-    // to the caller, all under a single lock acquire. Amortises the lock +
-    // cache-line-ping cost across the next ~REFILL_BATCH single-frame allocs.
-    lock.acquire();
-    defer lock.release();
-
-    const first = scanAndConsumeOneLocked() orelse return null;
-    var refilled: u32 = 0;
-    while (refilled < REFILL_BATCH) : (refilled += 1) {
-        const phys = scanAndConsumeOneLocked() orelse break;
-        cpu.pmm_cache[cpu.pmm_cache_count] = phys;
-        cpu.pmm_cache_count += 1;
+    // Cache miss: try preferred region first (per-CPU affinity = cache
+    // locality on the bitmap line, anti-fragmentation), then walk outward.
+    const pref = preferredRegion(cpu.cpu_id);
+    var first_phys: ?usize = allocAndRefillFromRegion(pref, cpu);
+    if (first_phys == null) {
+        // Walk other regions in ascending order from preferred+1, wrapping.
+        var off: u32 = 1;
+        while (off < REGIONS_COUNT) : (off += 1) {
+            const ri = (pref + off) % REGIONS_COUNT;
+            if (allocAndRefillFromRegion(ri, cpu)) |p| {
+                first_phys = p;
+                break;
+            }
+        }
     }
+    const first = first_phys orelse return null;
 
     checkPhysSafety(first, "allocFrame");
     checkKstackOverlap(first, 1, "allocFrame", ra);
@@ -420,27 +943,43 @@ pub fn allocFrame() ?usize {
     @import("../debug/kdbg.zig").pmmAlloc(first, 1, ra);
     @import("../debug/kasan.zig").unpoison(first, FRAME_SIZE);
     frame_refs[first / FRAME_SIZE] = 1;
-    // Cache-stuffed frames stay at refcount=0 — they're held in the magazine
-    // but not yet allocated to any caller; the next cache-hit pop bumps to 1.
     return first;
 }
 
 /// Allocate a frame below 4GB (for DMA buffers that require 32-bit addresses).
+/// Walks only regions whose end frame is below the 4GB boundary.
 pub fn allocFrameBelow4G() ?usize {
     const max_frame_32: u32 = 0x100000; // 4GB / 4KB
-    const max_words = max_frame_32 / 32;
-    for (0..@min(bitmap.len, max_words)) |i| {
-        if (bitmap[i] != 0xFFFFFFFF) {
-            const free_bits = ~bitmap[i];
-            const bit: u5 = @truncate(@ctz(free_bits));
-            const frame = @as(u32, @intCast(i)) * 32 + bit;
-            if (frame >= max_frame_32) return null;
-            setBit(frame);
-            if (total_frames > 0) total_frames -= 1;
-            const phys: usize = @as(usize, frame) * FRAME_SIZE;
+    const max_region: u32 = max_frame_32 / REGION_FRAMES; // exclusive upper
+
+    const irq_flags = saveAndDisableIrq();
+    defer restoreIrq(irq_flags);
+
+    var ri: u32 = 0;
+    while (ri < max_region) : (ri += 1) {
+        const r = &regions[ri];
+        const flags = r.lock.acquireIrqSave();
+        defer r.lock.releaseIrqRestore(flags);
+
+        // Single-frame: try freelist, then bitmap scan, both region-local.
+        if (popRunGEInRegionLocked(ri, 1)) |run| {
+            const start_frame = run.start_frame;
+            setBit(start_frame);
+            if (r.free_count > 0) r.free_count -= 1;
+            satSubTotal(1);
+            if (run.run_count > 1) {
+                _ = pushRunLocked(ri, start_frame + 1, run.run_count - 1);
+            }
+            const phys: usize = @as(usize, start_frame) * FRAME_SIZE;
             checkPhysSafety(phys, "allocFrameBelow4G");
             @import("../debug/kasan.zig").unpoison(phys, FRAME_SIZE);
-            frame_refs[frame] = 1;
+            frame_refs[start_frame] = 1;
+            return phys;
+        }
+        if (scanInRegionLocked(ri)) |phys| {
+            checkPhysSafety(phys, "allocFrameBelow4G");
+            @import("../debug/kasan.zig").unpoison(phys, FRAME_SIZE);
+            frame_refs[phys / FRAME_SIZE] = 1;
             return phys;
         }
     }
@@ -519,7 +1058,7 @@ fn markRange(start_frame: u32, count: u32) void {
 
     @memset(frame_refs[start_frame..end_frame], 1);
 
-    if (total_frames >= count) total_frames -= count else total_frames = 0;
+    satSubTotal(count);
 }
 
 /// Tripwire: does this phys range overlap kstack_pool? Used on the FREE
@@ -579,17 +1118,133 @@ fn checkKstackOverlap(base: usize, count: u32, site: []const u8, ra: usize) void
 }
 
 /// Allocate `count` physically contiguous frames. Returns base physical address.
+/// Try to satisfy a contiguous alloc of `count` frames entirely within
+/// `region_idx`. Returns base phys, or null if region can't fit. Tries
+/// freelist (O(1) common path) then in-region bitmap scan (orphaned-by-
+/// pool-exhaustion fallback).
+fn allocContiguousFromRegion(region_idx: u32, count: u32) ?usize {
+    const r = &regions[region_idx];
+    const flags = r.lock.acquireIrqSave();
+    defer r.lock.releaseIrqRestore(flags);
+
+    if (popRunGEInRegionLocked(region_idx, count)) |run| {
+        const start_frame = run.start_frame;
+        var i: u32 = 0;
+        while (i < count) : (i += 1) setBit(start_frame + i);
+        @memset(frame_refs[start_frame .. start_frame + count], 1);
+        if (r.free_count >= count) r.free_count -= count else r.free_count = 0;
+        satSubTotal(count);
+        if (run.run_count > count) {
+            _ = pushRunLocked(region_idx, start_frame + count, run.run_count - count);
+        }
+        return @as(usize, start_frame) * FRAME_SIZE;
+    }
+
+    // Bitmap-scan fallback (orphaned free frames not in freelist).
+    const region_start = regionStartFrame(region_idx);
+    const region_end = region_start + REGION_FRAMES;
+    if (findContiguousRun(region_start, region_end, count)) |start_frame| {
+        markRange(start_frame, count);
+        if (r.free_count >= count) r.free_count -= count else r.free_count = 0;
+        return @as(usize, start_frame) * FRAME_SIZE;
+    }
+    return null;
+}
+
+/// Cross-region contiguous allocation. Used when `count > REGION_FRAMES`
+/// (no single region can hold) or when every per-region attempt failed.
+/// Locks ALL regions in ascending order (deadlock-safe ordering) and walks
+/// the full bitmap. Holds per-region locks for the duration of the scan +
+/// markup — heavy, but the path is rare. `max_frame` caps the scan (for
+/// allocContiguousBelow4G, this is the 4 GB frame index).
+fn allocContiguousCrossRegion(count: u32, max_frame: u32) ?usize {
+    // Lock all regions in ascending order — consistent ordering avoids
+    // deadlock against any concurrent per-region acquirer (which holds
+    // exactly one lock at a time). Use acquireIrqSave on regions[0] so
+    // the cli-hold tracker arms (a slow full-bitmap scan + 256-lock fan-
+    // out is exactly the kind of long cli-held section we want surfaced
+    // in `[cli-hold]`); the remaining 255 use plain acquire because IF
+    // is already off after the first save.
+    const flags = regions[0].lock.acquireIrqSave();
+    var i: u32 = 1;
+    while (i < REGIONS_COUNT) : (i += 1) regions[i].lock.acquire();
+    defer {
+        var j: u32 = REGIONS_COUNT;
+        while (j > 1) {
+            j -= 1;
+            regions[j].lock.release();
+        }
+        regions[0].lock.releaseIrqRestore(flags);
+    }
+
+    const start_frame = findContiguousRun(0, max_frame, count) orelse return null;
+    markRange(start_frame, count);
+
+    // Update per-region free_counts + scrub freelist entries in the marked
+    // range. Re-push any free fragments at the edges (a removed entry that
+    // extended beyond our take needs its tail back).
+    const end_frame = start_frame + count;
+    var ri: u32 = start_frame / REGION_FRAMES;
+    const end_region = (end_frame - 1) / REGION_FRAMES;
+    while (ri <= end_region) : (ri += 1) {
+        const reg_start = ri * REGION_FRAMES;
+        const reg_end = reg_start + REGION_FRAMES;
+        const overlap_start = @max(start_frame, reg_start);
+        const overlap_end = @min(end_frame, reg_end);
+        const overlap = overlap_end - overlap_start;
+        const rr = &regions[ri];
+        if (rr.free_count >= overlap) rr.free_count -= overlap else rr.free_count = 0;
+        removeRunsInRangeLocked(ri, overlap_start, overlap);
+
+        // Re-push left edge fragment if any free frames immediately precede
+        // overlap_start (still in this region).
+        if (overlap_start > reg_start) {
+            var ls = overlap_start;
+            var lc: u32 = 0;
+            while (ls > reg_start and !testBit(ls - 1)) {
+                ls -= 1;
+                lc += 1;
+            }
+            if (lc > 0) _ = pushRunLocked(ri, ls, lc);
+        }
+        // Right edge fragment.
+        if (overlap_end < reg_end) {
+            var rc: u32 = 0;
+            while (overlap_end + rc < reg_end and !testBit(overlap_end + rc)) {
+                rc += 1;
+            }
+            if (rc > 0) _ = pushRunLocked(ri, overlap_end, rc);
+        }
+    }
+    return @as(usize, start_frame) * FRAME_SIZE;
+}
+
 pub fn allocContiguous(count: u32) ?usize {
     if (count == 0) return null;
     if (count == 1) return allocFrame();
     const ra = @returnAddress();
-    const flags = lock.acquireIrqSave();
-    defer lock.releaseIrqRestore(flags);
 
-    const start = findContiguousRun(0, MAX_FRAMES, count) orelse return null;
-    markRange(start, count);
+    var base_opt: ?usize = null;
+    if (count <= REGION_FRAMES) {
+        const cpu = @import("../cpu/smp.zig").myCpu();
+        const pref = preferredRegion(cpu.cpu_id);
+        base_opt = allocContiguousFromRegion(pref, count);
+        if (base_opt == null) {
+            var off: u32 = 1;
+            while (off < REGIONS_COUNT) : (off += 1) {
+                const ri = (pref + off) % REGIONS_COUNT;
+                if (allocContiguousFromRegion(ri, count)) |p| {
+                    base_opt = p;
+                    break;
+                }
+            }
+        }
+    }
+    if (base_opt == null) {
+        base_opt = allocContiguousCrossRegion(count, MAX_FRAMES);
+    }
+    const base = base_opt orelse return null;
 
-    const base: usize = @as(usize, start) * FRAME_SIZE;
     checkPhysSafety(base, "allocContiguous");
     const last: usize = base + (@as(usize, count) - 1) * FRAME_SIZE;
     if (last != base) checkPhysSafety(last, "allocContiguous(last)");
@@ -604,14 +1259,24 @@ pub fn allocContiguousBelow4G(count: u32) ?usize {
     if (count == 0) return null;
     if (count == 1) return allocFrameBelow4G();
     const ra = @returnAddress();
-    const flags = lock.acquireIrqSave();
-    defer lock.releaseIrqRestore(flags);
     const max_frame_32: u32 = 0x100000; // 4GB / 4KB
+    const max_region: u32 = max_frame_32 / REGION_FRAMES;
 
-    const start = findContiguousRun(0, max_frame_32, count) orelse return null;
-    markRange(start, count);
+    var base_opt: ?usize = null;
+    if (count <= REGION_FRAMES) {
+        var ri: u32 = 0;
+        while (ri < max_region) : (ri += 1) {
+            if (allocContiguousFromRegion(ri, count)) |p| {
+                base_opt = p;
+                break;
+            }
+        }
+    }
+    if (base_opt == null) {
+        base_opt = allocContiguousCrossRegion(count, max_frame_32);
+    }
+    const base = base_opt orelse return null;
 
-    const base: usize = @as(usize, start) * FRAME_SIZE;
     checkPhysSafety(base, "allocContiguousBelow4G");
     const last: usize = base + (@as(usize, count) - 1) * FRAME_SIZE;
     if (last != base) checkPhysSafety(last, "allocContiguousBelow4G(last)");
@@ -678,23 +1343,30 @@ pub fn freeFrame(phys_addr: usize) void {
         return;
     }
 
-    // Cache full: drain DRAIN_BATCH back to the global pool (one lock
-    // acquisition for all of them), then push the new frame. This keeps
-    // the cache below CACHE_SIZE so subsequent frees stay hot.
-    lock.acquire();
-    defer lock.release();
-
+    // Cache full: drain DRAIN_BATCH back to the per-region freelists.
+    // Each drained frame is routed to its source region (by phys), the
+    // region's lock acquired briefly, bit cleared, coalesce-and-push into
+    // the order freelist. With per-region locks instead of one global,
+    // drains to different regions don't serialize, and the coalesce path
+    // grows the freelist's contiguous runs as adjacent frees arrive.
     var i: u32 = 0;
     while (i < DRAIN_BATCH) : (i += 1) {
         cpu.pmm_cache_count -= 1;
         const drain_phys = cpu.pmm_cache[cpu.pmm_cache_count];
         const drain_frame: u32 = @intCast(drain_phys / FRAME_SIZE);
+        if (drain_frame >= MAX_FRAMES) continue;
+        const region_idx = regionForFrame(drain_frame);
+        const r = &regions[region_idx];
+        r.lock.acquire();
         if (testBit(drain_frame)) {
             clearBit(drain_frame);
-            total_frames += 1;
-            const word = drain_frame / 32;
-            if (word < next_free_word) next_free_word = word;
+            r.free_count += 1;
+            _ = total_frames.fetchAdd(1, .monotonic);
+            coalesceAndPushLocked(region_idx, drain_frame, 1);
+            const word_in_region = (drain_frame - region_idx * REGION_FRAMES) / 32;
+            if (word_in_region < r.next_free_word) r.next_free_word = word_in_region;
         }
+        r.lock.release();
     }
     cpu.pmm_cache[cpu.pmm_cache_count] = phys_addr;
     cpu.pmm_cache_count += 1;
@@ -739,34 +1411,51 @@ pub fn freeContiguous(phys_addr: usize, count: u32) void {
     @import("../debug/kdbg.zig").pmmFree(phys_addr, ra);
     @import("../debug/kasan.zig").poison(phys_addr, @as(usize, count) * FRAME_SIZE, @import("../debug/kasan.zig").SHADOW_FREED);
 
-    const flags = lock.acquireIrqSave();
-    defer lock.releaseIrqRestore(flags);
-
+    // Split the range per region, lock each region briefly, clear bits and
+    // coalesce+push the chunk into the region's freelist. Most contiguous
+    // frees come from a single region (DMA buffer, page-table pool, GUI FB
+    // slice). The rare cross-region case (e.g. a 2 MB run spanning a region
+    // boundary) handles each region's chunk independently — coalescing stops
+    // at the boundary, but allocs across the boundary still find the runs
+    // via per-region freelist when they fit; oversized requests use
+    // allocContiguousCrossRegion's bitmap scan.
     var f: u32 = @intCast(start_frame);
     const end_frame: u32 = @intCast(start_frame + count);
-    var freed: u32 = 0;
-
-    while (f < end_frame and (f % 32) != 0) : (f += 1) {
-        if (testBit(f)) {
-            clearBit(f);
-            freed += 1;
+    while (f < end_frame) {
+        const region_idx = regionForFrame(f);
+        const region_end = (region_idx + 1) * REGION_FRAMES;
+        const chunk_end = @min(end_frame, region_end);
+        const r = &regions[region_idx];
+        const flags = r.lock.acquireIrqSave();
+        const chunk_start = f;
+        var chunk_freed: u32 = 0;
+        // Word-at-a-time clear in the middle of the chunk for speed.
+        while (f < chunk_end and (f % 32) != 0) : (f += 1) {
+            if (testBit(f)) {
+                clearBit(f);
+                chunk_freed += 1;
+            }
         }
-    }
-    while (f + 32 <= end_frame) : (f += 32) {
-        const w = bitmap[f / 32];
-        freed += @popCount(w);
-        bitmap[f / 32] = 0;
-    }
-    while (f < end_frame) : (f += 1) {
-        if (testBit(f)) {
-            clearBit(f);
-            freed += 1;
+        while (f + 32 <= chunk_end) : (f += 32) {
+            const w = bitmap[f / 32];
+            chunk_freed += @popCount(w);
+            bitmap[f / 32] = 0;
         }
+        while (f < chunk_end) : (f += 1) {
+            if (testBit(f)) {
+                clearBit(f);
+                chunk_freed += 1;
+            }
+        }
+        if (chunk_freed > 0) {
+            r.free_count += chunk_freed;
+            _ = total_frames.fetchAdd(chunk_freed, .monotonic);
+            coalesceAndPushLocked(region_idx, chunk_start, chunk_end - chunk_start);
+            const word_in_region = (chunk_start - region_idx * REGION_FRAMES) / 32;
+            if (word_in_region < r.next_free_word) r.next_free_word = word_in_region;
+        }
+        r.lock.releaseIrqRestore(flags);
     }
-
-    total_frames += freed;
-    const start_word: usize = start_frame / 32;
-    if (start_word < next_free_word) next_free_word = start_word;
 }
 
 /// Free a range whose size is held as a `pages: u32` field — i.e. anything
@@ -784,7 +1473,7 @@ pub inline fn freeRange(phys_base: usize, count: u32) void {
 }
 
 pub fn freeFrameCount() u32 {
-    return total_frames;
+    return total_frames.load(.monotonic);
 }
 
 /// The kernel emergency reserve, in frames: allocFrameUser refuses to allocate
@@ -804,7 +1493,7 @@ pub fn userReserveFrames() u32 {
 /// post-alloc free count is at or below the reserve — caller must
 /// surface that as ENOMEM to userspace and let the process die.
 pub fn allocFrameUser() ?usize {
-    if (total_frames <= pmm_user_reserve) return null;
+    if (total_frames.load(.monotonic) <= pmm_user_reserve) return null;
     return allocFrame();
 }
 
@@ -812,7 +1501,7 @@ pub fn allocFrameUser() ?usize {
 /// big mmap-with-fd requests fail cleanly when PMM is tight rather
 /// than starving the kernel.
 pub fn allocContiguousUser(count: u32) ?usize {
-    if (total_frames <= pmm_user_reserve + count) return null;
+    if (total_frames.load(.monotonic) <= pmm_user_reserve + count) return null;
     return allocContiguous(count);
 }
 
