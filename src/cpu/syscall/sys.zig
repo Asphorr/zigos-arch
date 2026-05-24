@@ -105,13 +105,18 @@ const CpuStat = extern struct {
 
 pub fn sysCpuStats(buf_ptr: u32, max_cpus: u32) u32 {
     if (max_cpus == 0) return E_INVAL;
-    const byte_len: u32 = max_cpus * @sizeOf(CpuStat);
+    // Clamp BEFORE computing byte_len — the redteam fuzzer hands us
+    // max_cpus=0x7fffffff which would overflow u32 in the multiply
+    // below (`* 16`). MAX_CPUS is tiny (single digits typically), so
+    // capping here costs nothing for honest callers.
+    const clamped: u32 = if (max_cpus > smp.MAX_CPUS) smp.MAX_CPUS else max_cpus;
+    const byte_len: u32 = clamped * @sizeOf(CpuStat);
     if (!validateUserPtrAligned(buf_ptr, byte_len, @alignOf(CpuStat))) return E_FAULT;
     const buf: [*]CpuStat = @ptrFromInt(@as(usize, buf_ptr));
     var written: u32 = 0;
     for (&smp.cpus) |*c| {
         if (!c.alive) continue;
-        if (written >= max_cpus) break;
+        if (written >= clamped) break;
         buf[written] = .{
             .irq_ticks = c.irq_tick_count,
             .idle_ticks = c.idle_tick_count,
