@@ -43,12 +43,19 @@ BOEOF
 
 "$ZIG" build-obj \
     -target x86_64-freestanding-none \
+    -mcmodel kernel \
     -O "$OPT_LEVEL" \
     -fno-emit-bin \
     -femit-llvm-ir="$WORK/kernel-pre.ll" \
     --dep build_options \
+    --dep shapes \
+    --dep font_blobs \
+    --dep uefi_layout \
     -Mroot=src/main.zig \
-    -Mbuild_options="$WORK/build_options.zig" 2>&1 | sed 's/^/  /' || {
+    -Mbuild_options="$WORK/build_options.zig" \
+    -Mshapes=lib/shapes.zig \
+    -Mfont_blobs=lib/font_blobs.zig \
+    -Muefi_layout=lib/uefi_layout.zig 2>&1 | sed 's/^/  /' || {
     echo "[kasan] FATAL: zig build-obj failed"
     exit 1
 }
