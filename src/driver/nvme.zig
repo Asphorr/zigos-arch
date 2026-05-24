@@ -159,12 +159,29 @@ const ASYNC_BUILD_ENABLED: bool = true;
 /// well under wrap. `gen` is bumped on every alloc; we never use gen=0,
 /// so pre-async-flip sync CIDs (which never set the high 12 bits) can't
 /// false-match a freshly-allocated slot.
+/// Per-CID completion notification. Two flavors:
+///   .pid   — IRQ reaper calls process.wake(pid). Used by sync-style
+///            blockOn(.nvme_io) waiters: ioCommandAsync, submitDatalessAsync.
+///   .cb    — IRQ reaper invokes the callback in IRQ context with
+///            (ctx, success, status_code). Used by io_uring's per-IRQ
+///            async path: callback marks the io_uring PendingOp done and
+///            wakes the worker. Callback MUST be brief — runs at IRQ with
+///            cq_lock held; deferred work (user-buffer copy, posting CQE)
+///            happens in the woken task context.
+const WakeMode = union(enum) {
+    pid: u8,
+    cb: struct {
+        callback: *const fn (ctx: usize, success: bool, sc: u16) callconv(.c) void,
+        ctx: usize,
+    },
+};
+
 const NvmeWaiter = struct {
     active: bool = false,
     completed: bool = false,
     success: bool = false,
     status_code: u16 = 0,
-    pid: u8 = 0xFF,
+    wake: WakeMode = .{ .pid = 0xFF },
     gen: u16 = 0,
     /// Gap #11 (2026-05-20): SQ ring slot index (in [0, Q_DEPTH)) where
     /// the SQE for this command was written. Lets `dumpWaiterForTarget`
@@ -951,7 +968,7 @@ fn allocCid(c: *Controller) ?u16 {
                 .completed = false,
                 .success = false,
                 .status_code = 0,
-                .pid = 0xFF,
+                .wake = .{ .pid = 0xFF },
                 .gen = new_gen,
             };
             return packCid(i, new_gen);
@@ -1004,8 +1021,18 @@ fn reapCq(c: *Controller) bool {
             w.status_code = sc;
             w.success = (sc == 0);
             @atomicStore(bool, &w.completed, true, .release);
-            const proc = @import("../proc/process.zig");
-            proc.wake(w.pid);
+            // Dispatch by wake mode. Sync waiters get a process.wake; async
+            // io_uring waiters get their callback invoked directly here in
+            // IRQ context (callback is contractually brief — see WakeMode).
+            switch (w.wake) {
+                .pid => |pid| {
+                    const proc = @import("../proc/process.zig");
+                    proc.wake(pid);
+                },
+                .cb => |hook| {
+                    hook.callback(hook.ctx, w.success, sc);
+                },
+            }
             any_woken = true;
         } else {
             // Orphan: either the slot was already freed (a TIMEOUT path
@@ -1058,7 +1085,10 @@ pub fn dumpWaiterForTarget(wait_target: u32) void {
     debug.klog("    completed  = {any}\n", .{w.completed});
     debug.klog("    success    = {any}\n", .{w.success});
     debug.klog("    status     = 0x{X:0>4}\n", .{w.status_code});
-    debug.klog("    pid        = {d}\n", .{w.pid});
+    switch (w.wake) {
+        .pid => |p| debug.klog("    wake       = pid({d})\n", .{p}),
+        .cb => |hook| debug.klog("    wake       = cb(fn=0x{X:0>16} ctx=0x{X:0>16})\n", .{ @intFromPtr(hook.callback), hook.ctx }),
+    }
     debug.klog("    current_gen= {d}{s}\n", .{
         w.gen,
         if (w.gen == expected_gen) "" else " (MISMATCH — slot was reused since this command issued)",
@@ -1167,7 +1197,7 @@ fn ioCommandAsync(c: *Controller, ctrl_idx: u32, opcode: u8, lba: u32, user_buf:
     // wake on a stale pid can't slip in if the slot was just reused.
     // (proc/smp already imported up in the queue-full retry block.)
     const cur_pid: u8 = if (smp.myCpu().current_pid) |p| @intCast(p) else 0xFF;
-    c.waiters[slot_idx].pid = cur_pid;
+    c.waiters[slot_idx].wake = .{ .pid = cur_pid };
     // Gap #11: record the SQ ring slot where this command's SQE lives.
     // dumpWaiterForTarget reads io_sq[sq_slot] so we can prove "yes,
     // our SQE is sitting there with the right opcode/lba."
@@ -1386,7 +1416,7 @@ fn submitDatalessAsync(
     }
 
     const cur_pid: u8 = if (smp.myCpu().current_pid) |p| @intCast(p) else 0xFF;
-    c.waiters[slot_idx].pid = cur_pid;
+    c.waiters[slot_idx].wake = .{ .pid = cur_pid };
     c.waiters[slot_idx].sq_slot = c.io_sq_tail;
 
     const slot_addr = c.io_sq + @as(usize, c.io_sq_tail) * 64;
@@ -1589,6 +1619,129 @@ pub fn writeSectorsOn(idx: usize, lba: u32, count: u32, src: [*]const u8) bool {
         done += chunk;
     }
     return true;
+}
+
+// === Per-IRQ async path (io_uring A1) ===
+//
+// `ioCommandAsync` blocks the caller until the IRQ reaper calls
+// `proc.wake(w.pid)` and the caller observes `completed=true`. That model
+// serializes ops within a single caller — a 4-op io_uring submit
+// dispatches one at a time because the worker can only park on one CID.
+//
+// `submitAsyncCallback` is the same submit half WITHOUT the wait. The
+// caller registers a completion callback; the IRQ reaper invokes it from
+// IRQ context when the CQE arrives. This lets io_uring's worker submit
+// N ops, return immediately, park on a single .iouring_complete wait,
+// and have every callback wake it when any op finishes — true per-IRQ
+// concurrency.
+//
+// Bounce buffer ownership: the per-CID `bounce_bufs[slot_idx]` is used
+// as the DMA target, same as the sync path. Caller copies user→bounce
+// before submit (for WRITE) and bounce→user after callback (for READ),
+// via `bounceBufPhys(ctrl_idx, packed_cid)`. The CID stays allocated
+// (waiter.active=true) from submit until the caller invokes
+// `releaseAsyncCid` — this prevents the slot's bounce buffer from being
+// reused mid-flight.
+
+pub const AsyncCompletionFn = *const fn (ctx: usize, success: bool, sc: u16) callconv(.c) void;
+
+/// Submit an async I/O with a completion callback. Returns true on submit;
+/// false on controller-not-ready / bad args / queue-full (caller decides
+/// whether to retry). On success, `out_packed_cid` receives the CID the
+/// caller passes back to `bounceBufPhys` and `releaseAsyncCid`.
+///
+/// IRQ-context contract: the callback runs from `reapCq` with `cq_lock`
+/// held + IRQs disabled (acquireIrqSave). Keep it brief — atomic stores
+/// and a single `proc.wake` are fine; anything that might yield is not.
+pub fn submitAsyncCallback(
+    ctrl_idx: u32,
+    opcode: u8,
+    lba: u32,
+    sectors: u32,
+    callback: AsyncCompletionFn,
+    ctx: usize,
+    out_packed_cid: *u16,
+) bool {
+    if (ctrl_idx >= num_controllers) return false;
+    const c = &controllers[ctrl_idx];
+    if (!c.initialized or !c.async_mode) return false;
+    if (sectors == 0 or sectors > MAX_SECTORS_PER_CMD) return false;
+    if (opcode != IO_READ and opcode != IO_WRITE) return false;
+
+    const saved_flags = c.io_lock.acquireIrqSave();
+    const cid_opt = allocCid(c);
+    const cid = cid_opt orelse {
+        c.io_lock.releaseIrqRestore(saved_flags);
+        return false;
+    };
+    const slot_idx: u16 = cidSlot(cid);
+    const xfer_bytes: u32 = sectors * c.block_size;
+
+    // Wake mode = callback. Set BEFORE writing the SQE so an IRQ that
+    // arrives between SQ-doorbell and lock-release sees the right wake
+    // mode (cq_lock vs io_lock are distinct — IRQ-side reapCq takes
+    // cq_lock, doesn't touch io_lock).
+    c.waiters[slot_idx].wake = .{ .cb = .{ .callback = callback, .ctx = ctx } };
+    c.waiters[slot_idx].sq_slot = c.io_sq_tail;
+
+    const slot_addr = c.io_sq + @as(usize, c.io_sq_tail) * 64;
+    const slot32: [*]volatile u32 = @ptrFromInt(paging.physToVirt(slot_addr));
+    const prp = buildPrp(c, slot_idx, xfer_bytes);
+    writeSqe(slot32, opcode, cid, c.nsid, prp.prp1, prp.prp2, lba, 0, sectors - 1);
+    storeBarrier();
+
+    // MSI-X retarget if our CPU has changed — same logic as ioCommandAsync.
+    if (c.use_msix) {
+        const apic_mod = @import("../time/apic.zig");
+        const dest_id: u64 = apic_mod.getLapicId() & 0xFF;
+        const new_addr: u64 = 0xFEE00000 | (dest_id << 12);
+        if (c.msix_current_addr != new_addr) {
+            msix.writeEntry(c.msix_io_entry, new_addr, c.msix_data, false);
+            c.msix_current_addr = new_addr;
+            io_msix_retargets += 1;
+        }
+    }
+
+    c.io_sq_tail = (c.io_sq_tail + 1) % Q_DEPTH;
+    sqDoorbell(c, 1).* = @as(u32, c.io_sq_tail);
+    c.io_lock.releaseIrqRestore(saved_flags);
+
+    out_packed_cid.* = cid;
+    return true;
+}
+
+/// Physical base of the per-CID bounce buffer. Caller converts to a
+/// kernel VA via `paging.physToVirt` to copy data in/out. Only valid
+/// between a successful `submitAsyncCallback` and the matching
+/// `releaseAsyncCid` call.
+pub fn bounceBufPhys(ctrl_idx: u32, packed_cid: u16) ?usize {
+    if (ctrl_idx >= num_controllers) return null;
+    const slot_idx: u16 = cidSlot(packed_cid);
+    if (slot_idx >= Q_DEPTH) return null;
+    return controllers[ctrl_idx].bounce_bufs[slot_idx];
+}
+
+/// Release the CID after the caller is done with the bounce buffer
+/// (typically: after a READ has been copied to user). MUST be called
+/// exactly once per successful `submitAsyncCallback`.
+pub fn releaseAsyncCid(ctrl_idx: u32, packed_cid: u16) void {
+    if (ctrl_idx >= num_controllers) return;
+    const slot_idx: u16 = cidSlot(packed_cid);
+    if (slot_idx >= Q_DEPTH) return;
+    @atomicStore(bool, &controllers[ctrl_idx].waiters[slot_idx].active, false, .release);
+}
+
+/// Block size for `ctrl_idx`. Used by io_uring to compute the byte-len
+/// CQE result from the SQE's sector count.
+pub fn controllerBlockSize(ctrl_idx: u32) u32 {
+    if (ctrl_idx >= num_controllers) return 0;
+    return controllers[ctrl_idx].block_size;
+}
+
+/// Max sectors per single submit, exposed so io_uring can validate the
+/// SQE's `len` field client-side without recompiling on Q_DEPTH changes.
+pub fn maxSectorsPerCmd() u32 {
+    return MAX_SECTORS_PER_CMD;
 }
 
 /// Number of initialized NVMe controllers (swap.zig checks this to see if its

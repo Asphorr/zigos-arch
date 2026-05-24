@@ -141,6 +141,8 @@ pub const WaitKind = enum(u8) {
     mutex, // wait_target = low-32 of &Mutex.owner_pid; Mutex.release walks procs and wakes matching waiters
     nvme_io, // wait_target = (ctrl_idx << 16) | cid — NVMe MSI-X handler reaps CQ + wakes by exact (ctrl,cid) match
     swap_evict, // wait_target = low-32 of &leaf_pte. Set by handleUserPageFault when it hits a SWAP_INFLIGHT PTE; evictFrame's commit/abort phase wakes matching waiters
+    iouring_work, // wait_target = io_uring instance index. Worker task idles here; both io_uring_enter (fresh SQEs) and the NVMe IRQ callback (in-flight completion) wake the matching worker.
+    iouring_cq, // wait_target = io_uring instance index. io_uring_enter parks here when caller asked for min_complete > 0; worker wakes it after writing each CQE.
 };
 
 pub const FileDesc = struct {
@@ -741,6 +743,8 @@ pub const blockOnSwapEvict = @import("sched.zig").blockOnSwapEvict;
 pub const wake = @import("sched.zig").wake;
 pub const wakeMutexWaiters = @import("sched.zig").wakeMutexWaiters;
 pub const wakeSwapEvictWaiters = @import("sched.zig").wakeSwapEvictWaiters;
+pub const wakeIoUringWorker = @import("sched.zig").wakeIoUringWorker;
+pub const wakeIoUringCqWaiters = @import("sched.zig").wakeIoUringCqWaiters;
 pub const wakeExpired = @import("sched.zig").wakeExpired;
 pub const deliverDueAlarms = @import("sched.zig").deliverDueAlarms;
 pub const kernelSleepMs = @import("sched.zig").kernelSleepMs;

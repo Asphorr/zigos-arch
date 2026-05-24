@@ -742,6 +742,22 @@ pub fn allCurrentUserPagesMapped(addr: usize, len: usize) bool {
     return true;
 }
 
+/// Variant that walks an explicitly-provided PML4 rather than the current
+/// task's. Used by io_uring's worker, which runs as a kernel task but needs
+/// to validate user pointers in the OWNER's address space (after swapping
+/// CR3). The fault handler can't service a missed page on the worker — its
+/// currentPCB is the worker, with no lazy regions — so the worker must
+/// pre-validate every page is honestly mapped.
+pub fn allUserPagesMappedFor(pml4: [*]align(4096) u64, addr: usize, len: usize) bool {
+    if (len == 0) return true;
+    var page = addr & ~@as(usize, 0xFFF);
+    const end = addr + len;
+    while (page < end) : (page += 0x1000) {
+        if (!pageHasRealMapping(pml4, page)) return false;
+    }
+    return true;
+}
+
 /// Walk PML4→PDPT→PD→PT and report whether `va` resolves through a 4K PTE
 /// with the USER bit set (i.e. an honest per-process mapping). Returns false
 /// if the address falls through an inherited 2MB / 1GB page or isn't mapped.

@@ -1975,6 +1975,33 @@ pub fn wakeSwapEvictWaiters(target: u32) void {
     }
 }
 
+/// Wake the single worker task blocked on .iouring_work with this instance id.
+/// Called by io_uring_enter when userspace bumped sq_tail; the worker drains
+/// pending Sqes on its next loop iteration.
+pub fn wakeIoUringWorker(instance_id: u32) void {
+    for (0..MAX_PROCS) |i| {
+        const t = &process.procs[i];
+        if (t.state != .sleeping) continue;
+        if (t.wait_kind != .iouring_work) continue;
+        if (t.wait_target != instance_id) continue;
+        wake(@intCast(i));
+    }
+}
+
+/// Wake every task parked on io_uring_enter(min_complete > 0) for this
+/// instance. Called by the worker after writing a CQE; the enter caller's
+/// while-cq_count<min_complete loop re-checks on wake.
+pub fn wakeIoUringCqWaiters(instance_id: u32) void {
+    for (0..MAX_PROCS) |i| {
+        const t = &process.procs[i];
+        if (t.state != .sleeping) continue;
+        if (t.wait_kind != .iouring_cq) continue;
+        if (t.wait_target != instance_id) continue;
+        wake(@intCast(i));
+    }
+}
+
+
 /// Block until the SWAP_INFLIGHT eviction at `pte_ptr` completes. Used by
 /// `trySwapInPage` when a thread touches a page that another thread is
 /// mid-evicting.

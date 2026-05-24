@@ -387,6 +387,14 @@ pub const IoUringHeader = extern struct {
 pub const IOURING_OP_NOP: u8 = 0;
 pub const IOURING_OP_READ: u8 = 1;
 pub const IOURING_OP_WRITE: u8 = 2;
+/// Raw-LBA NVMe ops (Phase 3 A1): bypass VFS, true per-IRQ async.
+///   sqe.fd     = NVMe controller idx (0 primary, 1 secondary, ...)
+///   sqe.off    = LBA (32-bit; high bits truncated)
+///   sqe.addr   = user buffer VA
+///   sqe.len    = sectors (NOT bytes) — bytes = sectors * controller block size
+/// CQE.res on success = bytes transferred; negative errno on error.
+pub const IOURING_OP_NVME_READ: u8 = 3;
+pub const IOURING_OP_NVME_WRITE: u8 = 4;
 
 pub const IoUring = struct {
     header: *volatile IoUringHeader,
