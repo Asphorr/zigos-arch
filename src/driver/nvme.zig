@@ -1439,16 +1439,14 @@ fn submitDatalessAsync(
     const proc = @import("../proc/process.zig");
     const smp = @import("../cpu/smp.zig");
 
-    // Same queue-full retry pattern as ioCommandAsync (gap #6).
-    // acquireIrqSave for the same reason: see ioCommandSync's deadlock note.
+    // Same queue-full retry pattern as ioCommandAsync (gap #6) — allocCid
+    // is lockless since step 2 so the retry loop no longer hangs onto
+    // io_lock across the soft-yield.
     const MAX_QUEUE_FULL_RETRIES: u32 = 8;
-    var saved_io_flags: u64 = 0;
     const cid: u16 = blk_alloc: {
         var attempts: u32 = 0;
         while (true) : (attempts += 1) {
-            saved_io_flags = c.io_lock.acquireIrqSave();
             if (allocCid(c)) |c_packed| break :blk_alloc c_packed;
-            c.io_lock.releaseIrqRestore(saved_io_flags);
             if (attempts >= MAX_QUEUE_FULL_RETRIES) {
                 debug.klog("[nvme] dataless 0x{X}: queue full after {d} retries ctrl#{d}\n", .{ opcode, attempts, ctrl_idx });
                 return false;
@@ -1457,10 +1455,10 @@ fn submitDatalessAsync(
             @import("../proc/sched_asm.zig").softYield();
         }
     };
-    // io_lock held here (with saved_io_flags).
     const slot_idx: u16 = cidSlot(cid);
 
-    // Copy payload into bounce so the device can DMA-read it as PRP1.
+    // Copy payload into bounce. Per-slot ownership via the allocCid CAS
+    // means no other submitter touches bounce_bufs[slot_idx]; no lock.
     var prp1: u64 = 0;
     if (payload.len > 0) {
         prp1 = c.bounce_bufs[slot_idx];
@@ -1470,25 +1468,28 @@ fn submitDatalessAsync(
 
     const cur_pid: u8 = if (smp.myCpu().current_pid) |p| @intCast(p) else 0xFF;
     c.waiters[slot_idx].wake = .{ .pid = cur_pid };
-    c.waiters[slot_idx].sq_slot = c.io_sq_tail;
 
-    const slot_addr = c.io_sq + @as(usize, c.io_sq_tail) * 64;
+    const new_msix_addr: u64 = if (c.use_msix) blk: {
+        const apic_mod = @import("../time/apic.zig");
+        const dest_id: u64 = apic_mod.getLapicId() & 0xFF;
+        break :blk 0xFEE00000 | (dest_id << 12);
+    } else 0;
+
+    // Narrow critical section: SQE write at our slot + tail bump + doorbell.
+    // See ioCommandAsync above for the rationale.
+    const saved_io_flags = c.io_lock.acquireIrqSave();
+    if (c.use_msix and c.msix_current_addr != new_msix_addr) {
+        msix.writeEntry(c.msix_io_entry, new_msix_addr, c.msix_data, false);
+        c.msix_current_addr = new_msix_addr;
+        io_msix_retargets += 1;
+    }
+    const sq_tail_at_submit = c.io_sq_tail;
+    c.waiters[slot_idx].sq_slot = sq_tail_at_submit;
+    const slot_addr = c.io_sq + @as(usize, sq_tail_at_submit) * 64;
     const slot32: [*]volatile u32 = @ptrFromInt(paging.physToVirt(slot_addr));
     writeSqe(slot32, opcode, cid, c.nsid, prp1, 0, cdw10, cdw11, cdw12);
     storeBarrier();
-
-    if (c.use_msix) {
-        const apic_mod = @import("../time/apic.zig");
-        const dest_id: u64 = apic_mod.getLapicId() & 0xFF;
-        const new_addr: u64 = 0xFEE00000 | (dest_id << 12);
-        if (c.msix_current_addr != new_addr) {
-            msix.writeEntry(c.msix_io_entry, new_addr, c.msix_data, false);
-            c.msix_current_addr = new_addr;
-            io_msix_retargets += 1;
-        }
-    }
-
-    c.io_sq_tail = (c.io_sq_tail + 1) % Q_DEPTH;
+    c.io_sq_tail = (sq_tail_at_submit + 1) % Q_DEPTH;
     sqDoorbell(c, 1).* = @as(u32, c.io_sq_tail);
     c.io_lock.releaseIrqRestore(saved_io_flags);
 
@@ -1703,9 +1704,11 @@ pub const AsyncCompletionFn = *const fn (ctx: usize, success: bool, sc: u16) cal
 /// whether to retry). On success, `out_packed_cid` receives the CID the
 /// caller passes back to `bounceBufPhys` and `releaseAsyncCid`.
 ///
-/// IRQ-context contract: the callback runs from `reapCq` with `cq_lock`
-/// held + IRQs disabled (acquireIrqSave). Keep it brief — atomic stores
-/// and a single `proc.wake` are fine; anything that might yield is not.
+/// IRQ-context contract: the callback runs from `reapCq` in IRQ
+/// context (cli/iretq window) but with `cq_lock` ALREADY RELEASED as
+/// of step-1 of the lockless-rework (2026-05-24 — see reapCq). Keep
+/// it brief — atomic stores and a single `proc.wake` are fine;
+/// anything that might yield is not.
 pub fn submitAsyncCallback(
     ctrl_idx: u32,
     opcode: u8,
@@ -1721,41 +1724,36 @@ pub fn submitAsyncCallback(
     if (sectors == 0 or sectors > MAX_SECTORS_PER_CMD) return false;
     if (opcode != IO_READ and opcode != IO_WRITE) return false;
 
-    const saved_flags = c.io_lock.acquireIrqSave();
-    const cid_opt = allocCid(c);
-    const cid = cid_opt orelse {
-        c.io_lock.releaseIrqRestore(saved_flags);
-        return false;
-    };
+    // allocCid is lockless (step 2). One-shot here — no queue-full retry
+    // because submitAsyncCallback callers (io_uring) handle EAGAIN.
+    const cid = allocCid(c) orelse return false;
     const slot_idx: u16 = cidSlot(cid);
     const xfer_bytes: u32 = sectors * c.block_size;
 
-    // Wake mode = callback. Set BEFORE writing the SQE so an IRQ that
-    // arrives between SQ-doorbell and lock-release sees the right wake
-    // mode (cq_lock vs io_lock are distinct — IRQ-side reapCq takes
-    // cq_lock, doesn't touch io_lock).
+    // Wake mode = callback (per-slot, owned by us via the CAS in allocCid).
     c.waiters[slot_idx].wake = .{ .cb = .{ .callback = callback, .ctx = ctx } };
-    c.waiters[slot_idx].sq_slot = c.io_sq_tail;
 
-    const slot_addr = c.io_sq + @as(usize, c.io_sq_tail) * 64;
+    const new_msix_addr: u64 = if (c.use_msix) blk: {
+        const apic_mod = @import("../time/apic.zig");
+        const dest_id: u64 = apic_mod.getLapicId() & 0xFF;
+        break :blk 0xFEE00000 | (dest_id << 12);
+    } else 0;
+
+    // Narrow critical section: SQE write + tail bump + doorbell.
+    const saved_flags = c.io_lock.acquireIrqSave();
+    if (c.use_msix and c.msix_current_addr != new_msix_addr) {
+        msix.writeEntry(c.msix_io_entry, new_msix_addr, c.msix_data, false);
+        c.msix_current_addr = new_msix_addr;
+        io_msix_retargets += 1;
+    }
+    const sq_tail_at_submit = c.io_sq_tail;
+    c.waiters[slot_idx].sq_slot = sq_tail_at_submit;
+    const slot_addr = c.io_sq + @as(usize, sq_tail_at_submit) * 64;
     const slot32: [*]volatile u32 = @ptrFromInt(paging.physToVirt(slot_addr));
     const prp = buildPrp(c, slot_idx, xfer_bytes);
     writeSqe(slot32, opcode, cid, c.nsid, prp.prp1, prp.prp2, lba, 0, sectors - 1);
     storeBarrier();
-
-    // MSI-X retarget if our CPU has changed — same logic as ioCommandAsync.
-    if (c.use_msix) {
-        const apic_mod = @import("../time/apic.zig");
-        const dest_id: u64 = apic_mod.getLapicId() & 0xFF;
-        const new_addr: u64 = 0xFEE00000 | (dest_id << 12);
-        if (c.msix_current_addr != new_addr) {
-            msix.writeEntry(c.msix_io_entry, new_addr, c.msix_data, false);
-            c.msix_current_addr = new_addr;
-            io_msix_retargets += 1;
-        }
-    }
-
-    c.io_sq_tail = (c.io_sq_tail + 1) % Q_DEPTH;
+    c.io_sq_tail = (sq_tail_at_submit + 1) % Q_DEPTH;
     sqDoorbell(c, 1).* = @as(u32, c.io_sq_tail);
     c.io_lock.releaseIrqRestore(saved_flags);
 
