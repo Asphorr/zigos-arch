@@ -458,6 +458,16 @@ pub fn handleUserPageFault(cr2: usize, error_code: u64) bool {
     // kernel-identity pages, so user access hits "present but no USER" PT
     // entries until we replace them with a fresh USER-bit mapping below.
     if ((error_code & 4) == 0) return false;
+    // Re-enable IRQs. #PF entered via interrupt gate (IF=0), but cr2 and
+    // error_code are already in registers, so we won't lose them on a nested
+    // fault. From here on the handler may yield (blockOn in swapInFrame /
+    // writePage) and call tlb.shootdownPage, which IPIs peers and waits for
+    // ACKs. If a peer is ALSO in this handler with IF=0, its IPI never fires
+    // and we deadlock. Linux does exactly this in do_page_fault. The handler
+    // is already preemption-safe — blockOn yields, all PTE mutations are CAS,
+    // and nested #PF (kernel-stack growth) is fine because every #PF gets
+    // a fresh stack frame.
+    asm volatile ("sti");
     const cur = smp.myCpu().current_pid orelse return false;
     const pcb = &process.procs[cur];
     // Accounting: count every user-mode page fault (handled or not) so the

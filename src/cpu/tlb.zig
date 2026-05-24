@@ -118,6 +118,20 @@ inline fn pause() void {
     asm volatile ("pause");
 }
 
+/// Read RFLAGS.IF (bit 9). Used to decide whether a CLI'd caller needs the
+/// IF-aware spin: if we entered with IF=0 we must temporarily enable IRQs
+/// while spinning to acquire `shootdown_lock`, otherwise a peer that's the
+/// current lock-holder will never get its IPI ack from us and we deadlock.
+inline fn readIf() bool {
+    var rflags: u64 = undefined;
+    asm volatile (
+        \\ pushfq
+        \\ pop %[rf]
+        : [rf] "=r" (rflags),
+    );
+    return (rflags & 0x200) != 0;
+}
+
 /// Local-CPU flush honoring the current shootdown mode. Used by both
 /// the IPI handler (peers) and the sender's own post-broadcast flush.
 inline fn flushLocalForMode() void {
@@ -186,7 +200,20 @@ fn doShootdown(mode: Mode, affected_pcid: u16, va: u64) void {
 
     // Acquire global shootdown lock. Held until all acks are in. Spin with
     // pause; on contention the wait is bounded by one in-flight shootdown.
+    //
+    // IF-aware spin: if the caller entered CLI'd (#PF handler, exception
+    // dispatch, etc.) AND a peer is currently the lock-holder broadcasting
+    // IPIs to us, we'd deadlock — peer waits forever for our IPI ack, we
+    // can't service the IPI because IF=0. Snapshot caller's IF; if it was
+    // off, temporarily sti while spinning, then cli before publishing mode
+    // (the rest of the critical section runs at caller's IF state). Servicing
+    // an inbound shootdown IPI while we're spinning is safe: handleTlbShootdown
+    // just flushes our local TLB + decrements our ack slot + EOI. No locks
+    // touched.
+    const caller_if = readIf();
+    if (!caller_if) asm volatile ("sti");
     while (shootdown_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) pause();
+    if (!caller_if) asm volatile ("cli");
     const t_locked = perf.rdtsc();
 
     // Publish mode under the lock so peer handlers see a consistent
