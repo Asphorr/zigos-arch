@@ -432,7 +432,21 @@ pub fn discardFrame(pte_ptr: *u64, va: usize, pcid: u16) bool {
 /// the caller should free a frame (evict) and retry, or fall through.
 pub fn swapInFrame(pte_ptr: *u64, va: usize, flags: u64, pcid: u16) bool {
     const original = pte_ptr.*;
-    if (!pteIsSwapped(original)) return false;
+    if (!pteIsSwapped(original)) {
+        // Race-with-winner: between trySwapInPage's pteIsSwapped check
+        // and our re-read here, another thread completed the swap-in
+        // (PTE now PRESENT) or the process is tearing down (PTE → 0).
+        // Either way, NOT an OOM — caller's PF-handler-retry path will
+        // re-attempt the user access and find a usable mapping (or
+        // re-fault into the lazy-region path on PTE=0).
+        //
+        // This is the SAME class of bug fixed for the CAS-loser case
+        // below 2026-05-23 — the early-exit here was missed in that
+        // sweep. Caught 2026-05-24 by [mtswap-trace] when pid 5 won
+        // the CAS for va=0x713D000 and pid 6's swapInFrame returned
+        // false here → trySwapInPage → .oom → OOM-killed pid 6.
+        return true;
+    }
     const slot = pteSlot(original);
     // [mtswap-trace] for the parked MT-stress wedge — see fault.zig.
     const smp = @import("../cpu/smp.zig");

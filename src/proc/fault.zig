@@ -348,14 +348,17 @@ const SwapInOutcome = enum { not_swapped, paged_in, oom };
 fn trySwapInPage(pd: [*]align(4096) u64, lead: *PCB, va: usize, prot: u8, pcid: u16) SwapInOutcome {
     if (!swap.available) return .not_swapped;
     const sp = vmm.userPtePtr(pd, va) orelse return .not_swapped;
-    // [mtswap-trace] gated debug for the parked MT-stress wedge. The wedge
-    // signature is: PIDs N and N+1 both #PF at the same userspace RIP and
-    // never return. With these logs, the last line printed BEFORE silence
-    // tells us which step doesn't return (blockOnSwapEvict, readPage,
-    // CAS retry, tlb shootdown).
+    // [mtswap-trace] gated to the INTERESTING cases only — common
+    // first-touch lazy-fault (pte=0) was producing 40k+ lines per run
+    // and drowning the log. We only emit when this is an actual swap
+    // candidate (pte non-zero and either in_flight or pteIsSwapped).
+    const initial_pte = sp.*;
+    const is_swap_candidate = initial_pte != 0 and
+        (swap.pteIsInflight(initial_pte) or swap.pteIsSwapped(initial_pte));
     const cur_pid: u32 = if (smp.myCpu().current_pid) |p| @intCast(p) else 0xFF;
-    if (cur_pid >= 4) debug.klog("[mtswap-trace] pid={d} cpu{d} swap_try va=0x{X} pte=0x{X}\n", .{
-        cur_pid, smp.myCpu().cpu_id, va, sp.*,
+    const trace = is_swap_candidate and cur_pid >= 4;
+    if (trace) debug.klog("[mtswap-trace] pid={d} cpu{d} swap_try va=0x{X} pte=0x{X}\n", .{
+        cur_pid, smp.myCpu().cpu_id, va, initial_pte,
     });
     // MT case: another thread is mid-evicting this exact page. Wait until the
     // eviction commits (PTE → SWAPPED), aborts (→ PRESENT restored), or the
@@ -363,11 +366,11 @@ fn trySwapInPage(pd: [*]align(4096) u64, lead: *PCB, va: usize, prot: u8, pcid: 
     // (#PF runs IST=0 on its own kstack) so this is identical in shape to
     // the .nvme_io wait inside ioCommandAsync.
     if (swap.pteIsInflight(sp.*)) {
-        if (cur_pid >= 4) debug.klog("[mtswap-trace] pid={d} cpu{d} blockOnSwapEvict pte=0x{X}\n", .{
+        if (trace) debug.klog("[mtswap-trace] pid={d} cpu{d} blockOnSwapEvict pte=0x{X}\n", .{
             cur_pid, smp.myCpu().cpu_id, sp.*,
         });
         process.blockOnSwapEvict(sp);
-        if (cur_pid >= 4) debug.klog("[mtswap-trace] pid={d} cpu{d} woke pte=0x{X}\n", .{
+        if (trace) debug.klog("[mtswap-trace] pid={d} cpu{d} woke pte=0x{X}\n", .{
             cur_pid, smp.myCpu().cpu_id, sp.*,
         });
     }
@@ -378,27 +381,22 @@ fn trySwapInPage(pd: [*]align(4096) u64, lead: *PCB, va: usize, prot: u8, pcid: 
     // Tell the caller to retry the user access.
     const paging = @import("../mm/paging.zig");
     if ((pte & paging.PRESENT) != 0) {
-        if (cur_pid >= 4) debug.klog("[mtswap-trace] pid={d} cpu{d} race_won_by_other paged_in\n", .{
+        if (trace) debug.klog("[mtswap-trace] pid={d} cpu{d} race_won_by_other paged_in\n", .{
             cur_pid, smp.myCpu().cpu_id,
         });
         return .paged_in;
     }
-    if (!swap.pteIsSwapped(pte)) {
-        if (cur_pid >= 4) debug.klog("[mtswap-trace] pid={d} cpu{d} not_swapped pte=0x{X}\n", .{
-            cur_pid, smp.myCpu().cpu_id, pte,
-        });
-        return .not_swapped;
-    }
+    if (!swap.pteIsSwapped(pte)) return .not_swapped;
 
     // Make sure a frame is free for the read-in; evict cold pages of this
     // process if memory is exhausted. skip_va = va so reclaim never re-targets
     // the very page we're about to swap in.
     if (pmm.freeFrameCount() < 64) _ = reclaimViaSwap(pd, lead, va, pcid, 64);
-    if (cur_pid >= 4) debug.klog("[mtswap-trace] pid={d} cpu{d} swapInFrame_begin\n", .{
+    if (trace) debug.klog("[mtswap-trace] pid={d} cpu{d} swapInFrame_begin\n", .{
         cur_pid, smp.myCpu().cpu_id,
     });
     const ok = swap.swapInFrame(sp, va, vmm.protToMapFlags(prot), pcid);
-    if (cur_pid >= 4) debug.klog("[mtswap-trace] pid={d} cpu{d} swapInFrame_end ok={any}\n", .{
+    if (trace) debug.klog("[mtswap-trace] pid={d} cpu{d} swapInFrame_end ok={any}\n", .{
         cur_pid, smp.myCpu().cpu_id, ok,
     });
     if (ok) return .paged_in;
