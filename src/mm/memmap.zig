@@ -93,7 +93,7 @@ pub const USER_VA_FLOOR: usize = 0x500000;
 // Downstream regions are *derived* so a future bump only touches
 // KERNEL_HEAP_BASE here.
 pub const KERNEL_HEAP_BASE: usize = 0xA00000;
-pub const KERNEL_HEAP_SIZE: usize = 0x400000; // 4 MB
+pub const KERNEL_HEAP_SIZE: usize = 0x1000000; // 16 MB (TLSF: bumped from 4 MB 2026-05-24)
 
 pub const GUEST_FB_BASE: usize = KERNEL_HEAP_BASE + KERNEL_HEAP_SIZE; // 0xE00000
 pub const GUEST_FB_SIZE: usize = 0x800000; // 8 MB
