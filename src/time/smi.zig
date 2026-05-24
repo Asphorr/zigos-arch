@@ -114,7 +114,13 @@ fn classifyAndLog(us: u64) void {
     const prev_rip = prev_rip_opt.?;
 
     // Decode syscall marker (the PREVIOUS IRQ0 sampled CPU mid-syscall).
-    if (prev_rip >= exectrail.MARKER_BASE) {
+    // Marker layout: MARKER_BASE (bit 47) | MARKER_SYSCALL_BIT (bit 48) |
+    // sys_num (low 16). Crucially this sits in the LOW canonical half;
+    // every canonical kernel RIP (0xFFFF8000..) is also >= MARKER_BASE
+    // but does NOT carry the marker pattern. Without the high-bound the
+    // [smi] line decoded random kernel RIPs as "sc#<low 16 bits>" and
+    // hid the real "kernel held cli" verdict behind a bogus syscall id.
+    if (prev_rip >= exectrail.MARKER_BASE and prev_rip < KERNEL_HIGH_HALF) {
         const sys_num = prev_rip & 0xFFFF;
         debug.klog("[smi] stall: {d}us — likely OURS (sc#{d} held cli) — events={d} max={d}us\n", .{ us, sys_num, stall_events, max_stall_us });
         return;
