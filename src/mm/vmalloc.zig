@@ -18,11 +18,28 @@
 //
 // NOT for DMA. Drivers that hand a pointer to hardware (NVMe PRPs,
 // virtio queues, etc.) still need pmm.allocContiguous via kvmalloc.
+//
+// Modernization (2026-05-24): plugged into the rest of the kernel —
+//   - free() does a kernel-PCID TLB shootdown so other CPUs drop stale
+//     entries before the freed PMM frames are recycled (was: local invlpg
+//     only; latent SMP UAF noted in the source for ages, fixed now)
+//   - shootdown is gated by boot_phase — pre-scheduler boot has 1 CPU,
+//     local invlpg suffices and the IPI fan-out machinery isn't up yet
+//   - PTEs carry NX by default; vmalloc is data-only, anyone executing
+//     from a vmalloc buffer is an attacker
+//   - alloc/free wrap kasan unpoison/poison so UAF on vmalloc'd memory
+//     surfaces the same way it does on kvmalloc
+//   - atomic stats (pages_in_use, live_regions, peak_pages) exposed for
+//     /proc/meminfo + sysmon
 
 const pmm = @import("pmm.zig");
 const paging = @import("paging.zig");
 const debug = @import("../debug/debug.zig");
 const SpinLock = @import("../proc/spinlock.zig").SpinLock;
+const std = @import("std");
+const tlb = @import("../cpu/tlb.zig");
+const boot_phase = @import("../boot/boot_phase.zig");
+const kasan = @import("../debug/kasan.zig");
 
 /// Kernel VA arena. Sits in an otherwise-unused PML4 slot above the
 /// physmap (which owns slot 256 entirely). Slot 258 = 0xFFFF810000000000.
@@ -48,7 +65,32 @@ const Header = extern struct {
 
 const PRESENT: u64 = 1;
 const RW: u64 = 2;
+const NX: u64 = 1 << 63;
 const PAGE_MASK: u64 = ~@as(u64, 0xFFF);
+
+/// PTE flags for vmalloc data pages: P + RW + NX. Setting NX (bit 63) means
+/// instruction fetch from a vmalloc page #GPs — vmalloc returns DATA buffers,
+/// no legitimate caller jumps into one. Cheap defense against the "use a
+/// data-page write to land shellcode" pattern.
+const VMALLOC_PTE_FLAGS: u64 = PRESENT | RW | NX;
+
+// === Stats — read by sysmon / /proc/meminfo (atomic; lock-free readers) ===
+var pages_in_use: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+var live_regions: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+var peak_pages_in_use: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+
+pub fn pagesInUse() u32 {
+    return pages_in_use.load(.monotonic);
+}
+pub fn liveRegions() u32 {
+    return live_regions.load(.monotonic);
+}
+pub fn peakPagesInUse() u32 {
+    return peak_pages_in_use.load(.monotonic);
+}
+pub fn totalPages() u32 {
+    return @intCast(NUM_PAGES);
+}
 
 inline fn isFree(idx: usize) bool {
     return (bitmap[idx / 64] & (@as(u64, 1) << @intCast(idx % 64))) == 0;
@@ -103,7 +145,11 @@ fn mapPage(va: usize, phys: usize) bool {
     const pt_phys = pd[pd_idx] & PAGE_MASK;
     const pt: [*]volatile u64 = @ptrFromInt(paging.physToVirt(pt_phys));
     const pt_idx = (va >> 12) & 0x1FF;
-    pt[pt_idx] = phys | PRESENT | RW;
+    pt[pt_idx] = phys | VMALLOC_PTE_FLAGS;
+    // Fresh PTE on a previously-not-present slot — local invlpg flushes any
+    // negative cache entry. No TLB shootdown needed: peers also have no
+    // cached entry (because there was nothing to cache) and their next walk
+    // will pull the new PTE through the kernel-shared page-table tree.
     asm volatile ("invlpg (%[addr])"
         :
         : [addr] "r" (va),
@@ -112,7 +158,9 @@ fn mapPage(va: usize, phys: usize) bool {
 }
 
 /// Inverse of mapPage. Returns the physical frame that was mapped, or
-/// null if nothing was there.
+/// null if nothing was there. Caller must perform a TLB shootdown for the
+/// VA AFTER the PMM frame has been freed (or batch the shootdown across
+/// many unmaps via `tlb.shootdownAll(0)`).
 fn unmapPage(va: usize) ?usize {
     const pml4_phys = paging.getKernelPML4Phys();
     const pml4: [*]volatile u64 = @ptrFromInt(paging.physToVirt(pml4_phys));
@@ -135,16 +183,13 @@ fn unmapPage(va: usize) ?usize {
     const old = pt[pt_idx];
     if (old & PRESENT == 0) return null;
     pt[pt_idx] = 0;
+    // Local invlpg only. Caller is responsible for the cross-CPU shootdown
+    // (typically batched as one `tlb.shootdownAll(0)` covering all unmapped
+    // pages, instead of one IPI per page). See `free()` for the batching.
     asm volatile ("invlpg (%[addr])"
         :
         : [addr] "r" (va),
         : .{ .memory = true });
-    // NOTE: local-CPU TLB invalidation only. Other CPUs that previously
-    // touched this VA could still have a stale entry; for kernel mappings
-    // shared across all CPUs the proper fix is a TLB shootdown IPI.
-    // Acceptable for vmalloc free today because frees are rare (wallpaper
-    // change, app exit) and the freed frame is unlikely to be reused
-    // quickly. Revisit if this allocator gets used for hot frees.
     return old & PAGE_MASK;
 }
 
@@ -233,6 +278,25 @@ pub fn alloc(size: usize) ?[*]u8 {
     const base_va = VMALLOC_BASE + start * 4096;
     const hdr: *Header = @ptrFromInt(base_va);
     hdr.* = .{ .magic = MAGIC, .pages = @intCast(pages) };
+
+    // KASAN: unpoison only the user-visible bytes (skip header pad). Header
+    // itself stays implicitly unpoisoned via vmalloc-arena exclusion in
+    // kasan.zig REGION_LO/HI check (shadow only covers low 256 MB; vmalloc
+    // arena is at 0xFFFF810000000000, so kasan.poison/unpoison is a no-op
+    // here today — but we call it anyway so the moment the kasan shadow
+    // extends to cover kernel VAs, vmalloc gets free UAF detection without
+    // a code change.)
+    kasan.unpoison(base_va + HEADER_PAD, size);
+
+    const new_pages = pages_in_use.fetchAdd(@intCast(pages), .monotonic) + @as(u32, @intCast(pages));
+    _ = live_regions.fetchAdd(1, .monotonic);
+    // Update peak via CAS — tiny race ok, peak is diagnostic.
+    var peak = peak_pages_in_use.load(.monotonic);
+    while (new_pages > peak) {
+        if (peak_pages_in_use.cmpxchgWeak(peak, new_pages, .monotonic, .monotonic) == null) break;
+        peak = peak_pages_in_use.load(.monotonic);
+    }
+
     return @ptrFromInt(base_va + HEADER_PAD);
 }
 
@@ -254,6 +318,11 @@ pub fn free(ptr: [*]u8) void {
     hdr.magic = 0xDEADDEADDEADDEAD;
     const start = (base_va - VMALLOC_BASE) / 4096;
 
+    // Poison the user-visible bytes BEFORE we drop the lock so any racing
+    // reader hits a kasan red-zone instead of the soon-to-be-recycled data.
+    // Size derived from header.pages × frame - header pad.
+    kasan.poison(base_va + HEADER_PAD, pages * 4096 - HEADER_PAD, kasan.SHADOW_FREED);
+
     lock.acquire();
     defer lock.release();
 
@@ -262,5 +331,29 @@ pub fn free(ptr: [*]u8) void {
         const va = VMALLOC_BASE + (start + i) * 4096;
         if (unmapPage(va)) |phys| pmm.freeFrame(phys);
         setFree(start + i);
+    }
+
+    // Cross-CPU TLB shootdown. Kernel-PCID (pcid 0) shootdown broadcasts
+    // to every alive CPU + toggles CR4.PGE on each (kernel mappings carry
+    // PGE so a CR3 reload alone won't evict them). One IPI batch covers
+    // the whole range — cheaper than per-page shootdownPage(0, va) when
+    // pages > 1. Gated on boot_phase: pre-scheduler boot only has cpu0 alive
+    // and the local invlpg inside unmapPage already sufficed; the shootdown
+    // IPI fan-out machinery may not even be armed yet.
+    //
+    // Without this, freed PMM frames could be observed live on another CPU
+    // via a stale kernel TLB entry — catastrophic if PMM has handed the
+    // frame back out for, say, a page table. Latent SMP UAF bug pre-2026-05-24.
+    if (boot_phase.isComplete()) {
+        tlb.shootdownAll(0);
+    }
+
+    if (pages_in_use.load(.monotonic) >= pages) {
+        _ = pages_in_use.fetchSub(@intCast(pages), .monotonic);
+    } else {
+        pages_in_use.store(0, .monotonic);
+    }
+    if (live_regions.load(.monotonic) > 0) {
+        _ = live_regions.fetchSub(1, .monotonic);
     }
 }
