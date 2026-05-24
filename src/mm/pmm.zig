@@ -57,8 +57,25 @@ comptime {
 // artifacts. The line includes the most-recent freer's caller_ra (from
 // the existing `kdbg` pmm event ring) so investigation has a target.
 const CANARY_PMM_MAGIC: u64 = 0x4646524545504D4D; // "FFREEPMM"
-var canary_enabled: bool = false;
 var canary_mismatch_count: u64 = 0;
+// Per-frame "canary is valid for this frame" bitmap. Set by freeFrame's
+// canary write, cleared by allocFrame's canary check (whether it matches
+// or not — the next free→alloc cycle writes a fresh canary). Without
+// this side-table the check fired on every first-use of high-PA frames
+// that were FREE from boot but never freed (765 spam hits in the
+// 2026-05-24 mtswap run). 1 bit per FRAME_SIZE PA = 32 KB BSS.
+var canary_present: [BITMAP_SIZE]u32 = [_]u32{0} ** BITMAP_SIZE;
+
+inline fn canaryBitSet(frame: u32) void {
+    canary_present[frame / 32] |= (@as(u32, 1) << @intCast(frame & 31));
+}
+inline fn canaryBitClear(frame: u32) void {
+    canary_present[frame / 32] &= ~(@as(u32, 1) << @intCast(frame & 31));
+}
+inline fn canaryBitGet(frame: u32) bool {
+    return (canary_present[frame / 32] & (@as(u32, 1) << @intCast(frame & 31))) != 0;
+}
+
 pub fn pmmCanaryMismatches() u64 {
     return @atomicLoad(u64, &canary_mismatch_count, .monotonic);
 }
@@ -68,30 +85,25 @@ inline fn pmmCanaryWrite(phys: usize) void {
     const lo = phys ^ CANARY_PMM_MAGIC;
     v[0] = lo;
     v[1] = ~lo;
-    // First-write latches the flag; after that, skip the redundant store.
-    if (!@atomicLoad(bool, &canary_enabled, .monotonic)) {
-        @atomicStore(bool, &canary_enabled, true, .release);
-    }
+    canaryBitSet(@intCast(phys / FRAME_SIZE));
 }
 
 inline fn pmmCanaryCheck(phys: usize, callsite: []const u8, alloc_ra: usize) void {
-    if (!@atomicLoad(bool, &canary_enabled, .acquire)) return;
+    const frame: u32 = @intCast(phys / FRAME_SIZE);
+    // Only check if a canary was actually written for this frame.
+    // Eliminates the "boot-pristine high-PA frame" false-positive class
+    // entirely; only frames that went through freeFrame are audited.
+    if (!canaryBitGet(frame)) return;
+    canaryBitClear(frame);
     const v: *const [2]u64 = @ptrFromInt(@import("paging.zig").physToVirt(phys));
     const want_lo = phys ^ CANARY_PMM_MAGIC;
     const got_lo = v[0];
     const got_hi = v[1];
-    // Suppress the "never canaried" pattern: a fresh boot frame that has
-    // never been through freeFrame contains all zeros. We'd see 169+
-    // benign hits across early boot otherwise. A real UAF writer is
-    // overwhelmingly unlikely to write exactly all-zero into the canary
-    // slots; if it does, we lose this one signal — acceptable for the
-    // S/N win.
-    if (got_lo == 0 and got_hi == 0) return;
     if (got_lo != want_lo or got_hi != ~want_lo) {
         _ = @atomicRmw(u64, &canary_mismatch_count, .Add, 1, .monotonic);
         const serial = @import("../debug/serial.zig");
         const symbols = @import("../debug/symbols.zig");
-        serial.print("[pmm-canary] mismatch at phys=0x{X:0>16} from {s} (got lo=0x{X:0>16} hi=0x{X:0>16}) — alloc caller=", .{ phys, callsite, got_lo, got_hi });
+        serial.print("[pmm-canary] !!! UAF !!! phys=0x{X:0>16} from {s} (got lo=0x{X:0>16} hi=0x{X:0>16}) — alloc caller=", .{ phys, callsite, got_lo, got_hi });
         if (symbols.resolveKernel(alloc_ra)) |r| {
             serial.print("{s}+0x{X}\n", .{ r.name, r.offset });
         } else {

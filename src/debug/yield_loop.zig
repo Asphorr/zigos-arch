@@ -133,6 +133,16 @@ fn tripStuck(pid: usize, kind: process.WaitKind, target: u32, caller_ra: u64, sp
         "\n!!! [yield-loop:stuck] pid={d} parked on {s} target=0x{X} span={d}t (no wake) !!!\n",
         .{ pid, waitKindName(kind), target, span_ticks },
     );
+    // S3: include the parker's PCB state, especially wake_pending (the
+    // 2026-05-19 lost-wake handshake field). A common failure mode is
+    // "waker fired but didn't set wake_pending → wakeExpired skips".
+    if (pid < config.MAX_PROCS) {
+        const p = &process.procs[pid];
+        const name = p.name[0..@min(p.name_len, p.name.len)];
+        serial.print("  pid={d} name='{s}' state={s} wake_pending={}\n", .{
+            pid, name, @tagName(p.state), p.wake_pending,
+        });
+    }
     if (caller_ra != 0) {
         if (symbols.resolveKernel(caller_ra)) |sym| {
             serial.print("  blockOn caller: {s}+0x{X}\n", .{ sym.name, sym.offset });
@@ -140,15 +150,7 @@ fn tripStuck(pid: usize, kind: process.WaitKind, target: u32, caller_ra: u64, sp
             serial.print("  blockOn caller: 0x{X:0>16}\n", .{caller_ra});
         }
     }
-    switch (kind) {
-        .nvme_io => {
-            @import("../driver/nvme.zig").dumpWaiterForTarget(target);
-        },
-        .gpu_io => {
-            @import("../driver/virtio_gpu.zig").dumpWaiterForTarget(target);
-        },
-        else => {},
-    }
+    dumpResourceState(pid, kind, target);
     @import("pid_act.zig").dump(pid);
     serial.print("[yield-loop:stuck] -- end pid={d} dump --\n\n", .{pid});
 }
@@ -179,15 +181,111 @@ fn trip(pid: usize, kind: process.WaitKind, target: u32, caller_ra: u64, count: 
     } else {
         serial.print("  yield site (blockOn caller): 0x{X:0>16}\n", .{caller_ra});
     }
-    switch (kind) {
-        .nvme_io => {
-            @import("../driver/nvme.zig").dumpWaiterForTarget(target);
-        },
-        .gpu_io => {
-            @import("../driver/virtio_gpu.zig").dumpWaiterForTarget(target);
-        },
-        else => {},
-    }
+    dumpResourceState(pid, kind, target);
     @import("pid_act.zig").dump(pid);
     serial.print("[yield-loop] -- end pid={d} dump --\n\n", .{pid});
+}
+
+/// S3: per-wait-kind context dump. The blockOn caller_ra tells us WHERE
+/// the waiter parked; this tells us WHAT it was waiting on and the
+/// current state of that resource. Common diagnosis pattern is to
+/// compare expected-waker-state vs actual: e.g. child IS zombie but
+/// waitpid still parked → the wake didn't fire, OR pipe has 0 writers
+/// but reader still parked → EOF wasn't signaled.
+fn dumpResourceState(pid: usize, kind: process.WaitKind, target: u32) void {
+    switch (kind) {
+        .none => serial.print("  (no resource — wait_kind=.none)\n", .{}),
+        .waitpid => dumpWaitpid(pid, target),
+        .pipe_read => dumpPipe(target, true),
+        .pipe_write => dumpPipe(target, false),
+        .futex => dumpFutex(pid, target),
+        .mutex => dumpMutex(pid, target),
+        .nvme_io => @import("../driver/nvme.zig").dumpWaiterForTarget(target),
+        .gpu_io => @import("../driver/virtio_gpu.zig").dumpWaiterForTarget(target),
+        .swap_evict => serial.print("  swap_evict low32-of-pte=0x{X:0>8} — wait for evictFrame commit/abort\n", .{target}),
+        .iouring_work => serial.print("  iouring_work instance={d} (worker idle, wake from io_uring_enter or NVMe IRQ callback)\n", .{target}),
+        .iouring_cq => serial.print("  iouring_cq instance={d} (enter() parked, wake from worker after CQE)\n", .{target}),
+    }
+}
+
+fn dumpWaitpid(pid: usize, target: u32) void {
+    if (target == 0xFFFFFFFF) {
+        serial.print("  waitpid: ANY CHILD (target=0xFFFFFFFF)\n", .{});
+    } else {
+        serial.print("  waitpid: specific pid={d}\n", .{target});
+    }
+    var found: u32 = 0;
+    for (0..config.MAX_PROCS) |i| {
+        const p = &process.procs[i];
+        if (p.state == .unused) continue;
+        if (p.parent_pid != @as(u8, @intCast(pid))) continue;
+        if (target != 0xFFFFFFFF and target != i) continue;
+        const name = p.name[0..@min(p.name_len, p.name.len)];
+        serial.print("    child pid={d} name='{s}' state={s} wake_pending={}\n", .{
+            i, name, @tagName(p.state), p.wake_pending,
+        });
+        if (p.state == .zombie) {
+            serial.print("      ** child IS zombie — waker SHOULD have fired sysExit→reapChildren wake\n", .{});
+        }
+        found += 1;
+    }
+    if (found == 0) {
+        serial.print("    (no matching children in proc table — parent is waiting on ghosts)\n", .{});
+    }
+}
+
+fn dumpPipe(target: u32, is_read: bool) void {
+    const pipe = @import("../proc/pipe.zig");
+    if (target >= pipe.MAX_PIPES) {
+        serial.print("  pipe id {d} OUT OF RANGE (max {d})\n", .{ target, pipe.MAX_PIPES });
+        return;
+    }
+    const p = &pipe.pipes[target];
+    serial.print("  pipe[{d}]: in_use={} head={d} tail={d} count={d} readers={d} writers={d}\n", .{
+        target, p.in_use, p.head, p.tail, p.count, p.readers, p.writers,
+    });
+    serial.print("    blocked_reader_pid={d} blocked_writer_pid={d}\n", .{
+        p.blocked_reader_pid, p.blocked_writer_pid,
+    });
+    if (is_read and p.count == 0 and p.writers == 0) {
+        serial.print("    ** reader parked but pipe empty + writers=0 → EOF should have been signaled\n", .{});
+    }
+    if (!is_read and p.count == pipe.PIPE_BUF_SIZE and p.readers == 0) {
+        serial.print("    ** writer parked but pipe full + readers=0 → write should have returned EPIPE\n", .{});
+    }
+}
+
+fn dumpFutex(pid: usize, target: u32) void {
+    // *uaddr lives in user space — reading from kernel context requires the
+    // owner's CR3 to be loaded. Skip the value, but enumerate co-waiters.
+    serial.print("  futex uaddr=0x{X:0>8} (value not safely readable from kernel ctx)\n", .{target});
+    var others: u32 = 0;
+    for (0..config.MAX_PROCS) |i| {
+        if (i == pid) continue;
+        const p = &process.procs[i];
+        if (p.state == .sleeping and p.wait_kind == .futex and p.wait_target == target) {
+            serial.print("    co-waiter pid={d}\n", .{i});
+            others += 1;
+        }
+    }
+    if (others == 0) {
+        serial.print("    no other waiters at this uaddr — FUTEX_WAKE may have raced past blockOn\n", .{});
+    }
+}
+
+fn dumpMutex(pid: usize, target: u32) void {
+    serial.print("  mutex (low32-of-&owner_pid)=0x{X:0>8}\n", .{target});
+    var waiters: u32 = 0;
+    for (0..config.MAX_PROCS) |i| {
+        const p = &process.procs[i];
+        if (p.state == .sleeping and p.wait_kind == .mutex and p.wait_target == target) {
+            serial.print("    waiter pid={d}{s}\n", .{ i, if (i == pid) " (this trip)" else "" });
+            waiters += 1;
+        }
+    }
+    if (waiters == 0) {
+        serial.print("    NO waiters found — release-then-wake race may have left this stuck\n", .{});
+    } else {
+        serial.print("    {d} total waiters — owner should release; check who calls Mutex.release\n", .{waiters});
+    }
 }
