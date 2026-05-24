@@ -575,6 +575,7 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
         8 => @intFromPtr(&@import("test/stress_async_exec.zig").taskEntry),
         10 => @intFromPtr(&@import("test/stress_wake_ipi.zig").taskEntry),
         11 => @intFromPtr(&@import("test/stress_io_chain.zig").taskEntry),
+        12 => @intFromPtr(&@import("test/stress_pmm.zig").taskEntry),
         // Mode 9 (GPU compositor) boots the regular desktop; the desktop
         // detects boot_mode==9 and spawns ui/gpu_compositor.zig as a
         // side-by-side kernel task so they share one screen.
