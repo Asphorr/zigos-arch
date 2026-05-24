@@ -1,5 +1,7 @@
 const io = @import("../io.zig");
 const debug = @import("../debug/debug.zig");
+const perf = @import("../debug/perf.zig");
+const apic = @import("../time/apic.zig");
 
 /// True after initPS2() succeeds. Read by main.zig at the end of hardware
 /// probe to decide whether to warn about missing input devices.
@@ -7,17 +9,49 @@ pub var ps2_present: bool = false;
 
 // --- PS/2 controller initialization ---
 
+// Wall-clock deadline (5 ms) instead of iteration count. On bare metal x86
+// `inb` is ~100 ns so 100k iterations ≈ 10 ms, but under Hyper-V hosting
+// nested QEMU each `inb(0x64)` is a VM exit that costs ~5-10 µs — same
+// 100k loop ends up holding cli for ~500 ms-1 s. Caught reEnable() in the
+// SMI stall classifier with a 1.028 s cli-hold on 2026-05-24. PS/2 spec
+// allows up to 17 ms response; 5 ms is the working compromise so we
+// don't starve IRQs in the slow case.
+const PS2_WAIT_MS: u64 = 5;
+
+inline fn ps2Deadline() u64 {
+    const per_quantum = apic.tscPerQuantum();
+    // Before APIC calibration tsc_per_quantum=0; fall back to a generous
+    // iteration ceiling. 200k inb at ~5 µs each = 1 s upper bound (early
+    // boot only — calibration lands within the first phase).
+    if (per_quantum == 0) return 0;
+    return perf.rdtsc() + (per_quantum * PS2_WAIT_MS / 10);
+}
+
 fn ps2Wait() bool {
-    var timeout: u32 = 100000;
-    while (timeout > 0) : (timeout -= 1) {
+    const deadline = ps2Deadline();
+    if (deadline == 0) {
+        var timeout: u32 = 200_000;
+        while (timeout > 0) : (timeout -= 1) {
+            if (io.inb(0x64) & 2 == 0) return true;
+        }
+        return false;
+    }
+    while (perf.rdtsc() < deadline) {
         if (io.inb(0x64) & 2 == 0) return true;
     }
     return false;
 }
 
 fn ps2WaitOutput() bool {
-    var timeout: u32 = 100000;
-    while (timeout > 0) : (timeout -= 1) {
+    const deadline = ps2Deadline();
+    if (deadline == 0) {
+        var timeout: u32 = 200_000;
+        while (timeout > 0) : (timeout -= 1) {
+            if (io.inb(0x64) & 1 != 0) return true;
+        }
+        return false;
+    }
+    while (perf.rdtsc() < deadline) {
         if (io.inb(0x64) & 1 != 0) return true;
     }
     return false;
