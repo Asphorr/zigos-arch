@@ -191,6 +191,8 @@ pub fn sysSetWallpaper(buf_ptr: u32, w: u32, h: u32) u32 {
         free_before_clear, free_after_clear, free_after_clear -% free_before_clear,
         free_after_alloc, free_after_clear -% free_after_alloc,
     });
+    background.lockForWrite();
+    defer background.unlockAfterWrite();
     const dst = background.wallpaperSlice() orelse {
         debug.klog("[sysSetWallpaper] wallpaperSlice() null after alloc\n", .{});
         return E_INVAL;

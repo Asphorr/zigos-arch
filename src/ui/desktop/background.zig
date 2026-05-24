@@ -13,6 +13,17 @@ const gfx = @import("../gfx.zig");
 const conf = @import("config.zig");
 const vmalloc = @import("../../mm/vmalloc.zig");
 const debug = @import("../../debug/debug.zig");
+const Mutex = @import("../../proc/spinlock.zig").Mutex;
+
+// Serializes wallpaper change (settings → sysSetWallpaper) against the
+// render path (desktop task → renderScene → background.render). Without
+// it, settings.clearWallpaper can free the vmalloc backing while desktop
+// is mid-blit — the now-correct cross-CPU TLB shootdown in vmalloc.free
+// turns that latent UAF into an immediate kernel #PF (was masked before
+// 2026-05-25 by stale local TLB entries on the renderer's CPU).
+// Mutex (sleepable), not SpinLock: render blits 6+ MB at 1920×1080,
+// which is too long to hold with interrupts off.
+var wp_lock: Mutex = .{};
 
 const bg_presets = [4][2]u32{
     .{ 0x1B2838, 0x2D5F8A }, // blue
@@ -65,7 +76,9 @@ pub fn allocateWallpaper(w: u32, h: u32) bool {
     if (w == 0 or h == 0 or w > 4096 or h > 4096) return false;
 
     const bytes: usize = @as(usize, w) * @as(usize, h) * 4;
-    clearWallpaper();
+    wp_lock.acquire();
+    defer wp_lock.release();
+    clearWallpaperLocked();
     // vmalloc rather than heap.kvmalloc: a 6+ MB wallpaper needs 1500+
     // contiguous frames from PMM, which can't be served on a fragmented
     // heap. vmalloc returns a virtually-contiguous region backed by
@@ -89,6 +102,12 @@ pub fn allocateWallpaper(w: u32, h: u32) bool {
 
 /// Drop the wallpaper, falling back to gradient render. Idempotent.
 pub fn clearWallpaper() void {
+    wp_lock.acquire();
+    defer wp_lock.release();
+    clearWallpaperLocked();
+}
+
+fn clearWallpaperLocked() void {
     if (wp_pixels) |p| {
         const old_buf: [*]u8 = @ptrCast(p);
         vmalloc.free(old_buf);
@@ -100,9 +119,19 @@ pub fn clearWallpaper() void {
 
 /// Direct write access for the syscall handler — copies user pixels into
 /// the wallpaper buffer. Returns the slice if valid, null otherwise.
+/// Caller must hold `wp_lock` for the duration of the write to keep the
+/// returned slice from being unmapped underneath them.
 pub fn wallpaperSlice() ?[]u32 {
     const p = wp_pixels orelse return null;
     return p[0 .. @as(usize, wp_w) * @as(usize, wp_h)];
+}
+
+pub fn lockForWrite() void {
+    wp_lock.acquire();
+}
+
+pub fn unlockAfterWrite() void {
+    wp_lock.release();
 }
 
 pub fn hasWallpaper() bool {
@@ -116,6 +145,11 @@ pub fn wallpaperDims() struct { w: u32, h: u32 } {
 // --- Render --------------------------------------------------------------
 
 pub fn render() void {
+    // Hold the lock for the whole render — without it, sysSetWallpaper
+    // can call vmalloc.free on the buffer mid-blit and the cross-CPU
+    // TLB shootdown unmaps our source pointer. ~600 µs on 1920×1080.
+    wp_lock.acquire();
+    defer wp_lock.release();
     if (wp_pixels) |pixels| {
         renderWallpaper(pixels);
         return;

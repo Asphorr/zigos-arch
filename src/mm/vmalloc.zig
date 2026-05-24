@@ -66,7 +66,12 @@ const Header = extern struct {
 const PRESENT: u64 = 1;
 const RW: u64 = 2;
 const NX: u64 = 1 << 63;
-const PAGE_MASK: u64 = ~@as(u64, 0xFFF);
+// x86-64 PTE phys mask: bits [51:12]. Bits [11:0] are flags, [62:52] are
+// PKE/ignored, [63] is NX. `~0xFFF` only clears flag bits — it leaks NX
+// (and any PKE bits) into the extracted phys, which then looks like a
+// frame number > 2^52 to PMM and gets rejected as a bad address.
+const PHYS_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+const PAGE_MASK: u64 = PHYS_MASK;
 
 /// PTE flags for vmalloc data pages: P + RW + NX. Setting NX (bit 63) means
 /// instruction fetch from a vmalloc page #GPs — vmalloc returns DATA buffers,
