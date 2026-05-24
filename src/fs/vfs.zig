@@ -559,7 +559,11 @@ pub fn fileSize(name: []const u8) ?u32 {
 }
 
 /// A PMM-allocated file buffer ready to hand to elf_loader.loadAndStart
-/// (which takes ownership) or pmm.freeFrame'd by the caller on cleanup.
+/// (which takes ownership) or freed by the caller via `pmm.freeRange(phys,
+/// fresh.pages)` on cleanup. Use `freeRange` (NOT a per-frame `freeFrame`
+/// loop) — the buffer came from `pmm.allocContiguous`, which is the bulk
+/// allocator; a per-frame free loop stamps a spurious canary onto every
+/// page and produces fake UAF reports at the next allocation.
 pub const FreshFile = struct {
     buf: [*]align(4) u8,
     size: usize,
@@ -573,8 +577,9 @@ pub const FreshFile = struct {
 /// load destination — the bug class is impossible by construction.
 ///
 /// Caller owns the returned buffer. Either pass it to
-/// elf_loader.loadAndStart (which takes ownership), or free pages with
-/// pmm.freeFrame on each phys page.
+/// elf_loader.loadAndStart (which takes ownership), or call
+/// `pmm.freeRange(phys_base, fresh.pages)` to release it. Per-frame
+/// `freeFrame` loops are the wrong API pairing — see FreshFile doc.
 pub fn loadFileFresh(name: []const u8) ?FreshFile {
     const perf = @import("../debug/perf.zig");
     const serial = @import("../debug/serial.zig");
@@ -634,7 +639,7 @@ pub fn loadFileFresh(name: []const u8) ?FreshFile {
         );
         if (got == size) return .{ .buf = buf, .size = size, .pages = pages };
     }
-    pmm.freeContiguous(phys, @intCast(pages));
+    pmm.freeRange(phys, @intCast(pages));
     return null;
 }
 

@@ -64,13 +64,13 @@ pub fn init() void {
     const staging: [*]const u8 = fresh.buf;
     const file_size = fresh.size;
     defer {
-        // vfs.loadFileFresh uses pmm.allocContiguous; pair with freeContiguous
-        // for the correct API match. The per-frame freeFrame loop here was
-        // mismatched and produced spurious [pmm-canary] mismatches on these
-        // pages (freeFrame writes a canary per frame; freeContiguous skips
-        // canary writes for bulk-freed contiguous ranges by design).
+        // pmm.freeRange is the canonical "free a FreshFile / allocContiguous
+        // block" API — internally routes to freeContiguous, but the name
+        // signals "this isn't a per-frame free choice; just call it." Per-
+        // frame freeFrame loops stamp spurious canaries that read as fake
+        // UAF later.
         const phys_base = paging.virtToPhys(@intFromPtr(fresh.buf)).?;
-        @import("../mm/pmm.zig").freeContiguous(phys_base, fresh.pages);
+        @import("../mm/pmm.zig").freeRange(phys_base, fresh.pages);
     }
 
     if (file_size < 12) {

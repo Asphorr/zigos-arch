@@ -79,11 +79,13 @@ pub fn taskEntry() callconv(.c) noreturn {
                 // some scheduler corners.
             } else {
                 // ELF load failed — release the buffer back to PMM. Same
-                // dance as sysExec's failure branch.
+                // dance as sysExec's failure branch. Use freeRange (the
+                // allocContiguous pair) — per-frame freeFrame loops stamp
+                // spurious canaries on every page.
                 pids[b] = 0xFF;
                 spawn_failures += 1;
                 const phys_base = paging.virtToPhys(@intFromPtr(fresh.buf)).?;
-                for (0..fresh.pages) |k| pmm.freeFrame(phys_base + k * 4096);
+                pmm.freeRange(phys_base, fresh.pages);
             }
         }
 

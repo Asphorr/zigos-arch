@@ -769,6 +769,19 @@ pub fn freeContiguous(phys_addr: usize, count: u32) void {
     if (start_word < next_free_word) next_free_word = start_word;
 }
 
+/// Free a range whose size is held as a `pages: u32` field — i.e. anything
+/// that came back from `allocContiguous`, `allocContiguousBelow4G`, or
+/// `allocContiguousUser`, OR a `FreshFile.buf` whose `.pages` count we
+/// already know. Delegates to `freeContiguous` (which itself routes
+/// `count==1` through `freeFrame`). The named purpose: lift the choice
+/// "freeFrame in a loop vs freeContiguous" off the caller — the wrong
+/// choice (loop) silently stamps spurious PMM canaries onto every page
+/// of the bulk-allocated range and shows up later as fake UAF reports.
+/// THIS IS THE CANONICAL "free a `pages: u32` block" API; reach for it
+/// instead of writing a per-page free loop.
+pub inline fn freeRange(phys_base: usize, count: u32) void {
+    freeContiguous(phys_base, count);
+}
 
 pub fn freeFrameCount() u32 {
     return total_frames;

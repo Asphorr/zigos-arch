@@ -106,9 +106,12 @@ pub fn loadKernelSymbols() void {
     defer {
         // fresh.buf is a kernel-side physmap VA (from vfs.loadFileFresh's
         // physToVirt). PMM expects physical addresses, so translate back.
+        // Use pmm.freeRange — the buffer came from allocContiguous; freeing
+        // it with per-frame freeFrame stamps a spurious canary on every page
+        // and looks like a UAF burst at next allocation.
         const paging = @import("../mm/paging.zig");
         const phys_base = paging.virtToPhys(@intFromPtr(fresh.buf)).?;
-        for (0..fresh.pages) |p| @import("../mm/pmm.zig").freeFrame(phys_base + p * 4096);
+        @import("../mm/pmm.zig").freeRange(phys_base, fresh.pages);
     }
 
     if (file_size < 12) {
