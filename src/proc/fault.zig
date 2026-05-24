@@ -758,6 +758,57 @@ pub fn allUserPagesMappedFor(pml4: [*]align(4096) u64, addr: usize, len: usize) 
     return true;
 }
 
+/// Foreign-PCB variant of `ensureUserRangeWritable`. The owner PCB is
+/// passed explicitly so this works from a non-current task — specifically,
+/// the io_uring worker, which runs as a kernel task on its own pid but
+/// needs to make sure the OWNER's user-VA range is mapped + writable
+/// before doing a memcpy into it. Closes the HIGH "COW write-fault"
+/// reviewer flagged 2026-05-24: pageHasRealMapping only checks PRESENT+
+/// USER, leaving COW pages (READ_WRITE=0) to trap as kernel-mode #PF
+/// when the worker writes through them.
+///
+/// PRECONDITION: caller has loaded `owner_pcb`'s CR3 — INVLPG after
+/// allocAndMapUserPage flushes the CURRENT CPU's TLB view, which must
+/// match the PML4 we're modifying. handleCompletion satisfies this by
+/// switching to owner CR3 before calling us.
+///
+/// Acquiring the owner's `as_lock` BEFORE calling this (and holding it
+/// across the subsequent memcpy) is the caller's responsibility — that's
+/// what serializes us vs concurrent sysMunmap/sysMprotect on the owner's
+/// own thread.
+pub fn ensureUserRangeWritableFor(owner_pcb: *process.PCB, va: usize, len: usize) bool {
+    if (len == 0) return true;
+    const pd = owner_pcb.page_directory orelse return false;
+    const lead = leader(owner_pcb);
+
+    const paging = @import("../mm/paging.zig");
+    var p = va & ~@as(usize, 0xFFF);
+    const end_excl = va +% len;
+    while (p < end_excl) : (p += 0x1000) {
+        if (vmm.resolveUserPhys(pd, p) != null) {
+            _ = handleCowFault(pd, p);
+            const pte_ptr = findUserPte(pd, p) orelse return false;
+            if (pte_ptr.* & paging.READ_WRITE == 0) return false;
+        } else {
+            var mapped = false;
+            var i: u8 = 0;
+            while (i < lead.lazy_count) : (i += 1) {
+                const r = lead.lazy_regions[i];
+                if (p < r.start or p >= r.end) continue;
+                _ = vmm.allocAndMapUserPage(pd, p, vmm.protToMapFlags(r.prot)) catch return false;
+                asm volatile ("invlpg (%[addr])"
+                    :
+                    : [addr] "r" (p),
+                    : .{ .memory = true });
+                mapped = true;
+                break;
+            }
+            if (!mapped) return false;
+        }
+    }
+    return true;
+}
+
 /// Walk PML4→PDPT→PD→PT and report whether `va` resolves through a 4K PTE
 /// with the USER bit set (i.e. an honest per-process mapping). Returns false
 /// if the address falls through an inherited 2MB / 1GB page or isn't mapped.

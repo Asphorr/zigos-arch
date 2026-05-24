@@ -238,6 +238,14 @@ fn nvmeCompletionCallback(ctx: usize, success: bool, sc: u16) callconv(.c) void 
 /// Execute one non-NVMe Sqe synchronously. For OP_READ/WRITE the worker
 /// swaps to the owner's CR3 so user-buffer dereferences resolve. vfs.read/
 /// write take the owner's PCB so fd_table lookups use the right table.
+///
+/// Acquires owner_leader.as_lock around the validation + CR3 swap + vfs
+/// call to serialize against concurrent sysMunmap/sysMprotect on the
+/// owner's own thread (would otherwise unmap pages mid-vfs, causing a
+/// kernel-mode #PF that the ring-3-only handler can't service → panic).
+/// Plus ensureUserRangeWritableFor breaks COW so the kernel WRITE on the
+/// user VA doesn't trap on a fork-shared page. Closes HIGH classes 3+3b
+/// reviewer flagged 2026-05-24.
 fn executeSyncAsWorker(inst: *Instance, sqe: Sqe) i32 {
     if (inst.owner_pid >= process.MAX_PROCS) return ERES_FAULT;
     const owner_pcb = &process.procs[inst.owner_pid];
@@ -261,13 +269,26 @@ fn executeSyncAsWorker(inst: *Instance, sqe: Sqe) i32 {
             const owner_pcid: u16 = owner_pcb.pcid;
             if (owner_pd_phys == 0) return ERES_FAULT;
 
+            // AS-stability lock. Acquired BEFORE CR3 swap (the swap itself
+            // must not span a yield, but Mutex.acquire may yield via
+            // blockOnMutex on contention — fine here since CR3 hasn't been
+            // touched yet). Released on return via defer.
+            const owner_leader = process.leader(owner_pcb);
+            owner_leader.as_lock.acquire();
+            defer owner_leader.as_lock.release();
+
             const my_cpu_id = smp.myCpu().cpu_id;
             const kernel_pd_phys = paging.getKernelPageDirPhys();
             pcid_mod.loadCr3(owner_pd_phys, owner_pcid, my_cpu_id);
             defer pcid_mod.loadCr3(kernel_pd_phys, 0, my_cpu_id);
 
-            const pd_ptr: [*]align(4096) u64 = @ptrFromInt(paging.physToVirt(owner_pd_phys));
-            if (!fault.allUserPagesMappedFor(@alignCast(pd_ptr), addr, sqe.len)) {
+            // Break COW + lazy-fault any missing pages in the range BEFORE
+            // vfs touches user memory. For OP_WRITE (vfs reads user buf to
+            // write to fd) we only need PRESENT; for OP_READ (vfs writes
+            // user buf) we need writable. We always ensure writable — extra
+            // strictness is fine for reads (the buffer is meant to receive
+            // data; the caller wouldn't pass a R/O page).
+            if (!fault.ensureUserRangeWritableFor(owner_pcb, addr, sqe.len)) {
                 return ERES_FAULT;
             }
 
@@ -390,15 +411,11 @@ fn submitNvmeOp(inst: *Instance, inst_id: u8, slot_idx: u8, sqe: Sqe) SubmitResu
 /// Drain one completed pending slot. Copies bounce → user (for reads),
 /// posts the CQE, releases the NVMe CID, frees the slot.
 ///
-/// Known pre-existing class (shared with executeSyncAsWorker's OP_READ/WRITE
-/// path; reviewer flagged 2026-05-24): the bounce→user memcpy walks the
-/// owner's PT under STAC then writes through the user VA. If the owner
-/// concurrently munmap/mprotect's the range, or the PTE is still COW from
-/// a recent fork, the write traps as a kernel-mode #PF and the handler is
-/// ring-3-only → panic. Single-thread apps that pre-touch their buffer
-/// (the iouringtest s5 case) avoid both. A foreign-PCB variant of
-/// process.ensureUserRangeWritable plus an AS-stability lock fixes both
-/// branches; deferred to a follow-up that also retrofits executeSyncAsWorker.
+/// Acquires owner_leader.as_lock around the CR3 swap + ensureUserRangeWritableFor
+/// + memcpy. Lock-then-swap order is correct (Mutex may yield on
+/// contention; CR3 must not span a yield). ensureUserRangeWritableFor
+/// breaks any COW page in the range so the kernel WRITE doesn't trap as
+/// kernel-mode #PF. Closes HIGH classes 3+3b reviewer flagged 2026-05-24.
 fn handleCompletion(inst: *Instance, p: *PendingOp) void {
     const success = p.success; // Already synchronized via Acquire on done.
     var res: i32 = if (success) @intCast(p.bytes) else ERES_IO;
@@ -413,13 +430,16 @@ fn handleCompletion(inst: *Instance, p: *PendingOp) void {
                 break :copy;
             }
 
+            const owner_leader = process.leader(owner_pcb);
+            owner_leader.as_lock.acquire();
+            defer owner_leader.as_lock.release();
+
             const my_cpu_id = smp.myCpu().cpu_id;
             const kernel_pd_phys = paging.getKernelPageDirPhys();
             pcid_mod.loadCr3(owner_pcb.page_dir_phys, owner_pcb.pcid, my_cpu_id);
             defer pcid_mod.loadCr3(kernel_pd_phys, 0, my_cpu_id);
 
-            const pd_ptr: [*]align(4096) u64 = @ptrFromInt(paging.physToVirt(owner_pcb.page_dir_phys));
-            if (!fault.allUserPagesMappedFor(@alignCast(pd_ptr), p.user_addr, p.bytes)) {
+            if (!fault.ensureUserRangeWritableFor(owner_pcb, p.user_addr, p.bytes)) {
                 res = ERES_FAULT;
                 break :copy;
             }
@@ -638,6 +658,13 @@ pub fn setup(entries_req: u32) u32 {
     const pcb = process.currentPCB() orelse return 0;
     _ = pcb.page_directory orelse return 0;
     const lead = process.leader(pcb);
+
+    // AS-stability lock — setup adds a lazy region + bumps mmap_top. Even
+    // for the first instance, the caller's other threads or a sibling
+    // worker (other instance, same pid) could be mutating concurrently.
+    lead.as_lock.acquire();
+    defer lead.as_lock.release();
+
     if (lead.lazy_count >= process.MAX_LAZY_REGIONS) return 0;
 
     const region_bytes = regionSize(entries);

@@ -230,6 +230,18 @@ pub const PCB = struct {
     // sbrk heap (grows on demand), and demand-paged ELF segments.
     lazy_regions: [MAX_LAZY_REGIONS]LazyRegion = [_]LazyRegion{.{}} ** MAX_LAZY_REGIONS,
     lazy_count: u8 = 0,
+    /// Address-space stability lock (leader-owned, non-leader threads access via
+    /// `leader(pcb).as_lock`). Acquired by:
+    ///   - AS-mutating syscalls: sysSbrk, sysMmap, sysMmapSharedAnon, sysMunmap,
+    ///     sysMprotect (mutate lazy_regions / page directory).
+    ///   - Kernel paths that read/write user memory from a NON-current pid:
+    ///     io_uring worker's handleCompletion + executeSyncAsWorker.
+    /// Serializes the (walk → memcpy) sequence against concurrent munmap/mprotect
+    /// on another CPU, which would otherwise let the kernel write to a page after
+    /// the owner's TLB shootdown freed its backing frame. Closes the HIGH classes
+    /// reviewer flagged 2026-05-24 (concurrent munmap + COW write-fault).
+    /// Mutex semantics + sleep-aware → safe to hold across vfs.read/write.
+    as_lock: @import("spinlock.zig").Mutex = .{},
     // Index of the lazy region tracking the heap (sbrk). -1 = no heap region
     // has been registered yet. Allows sysSbrk to extend in place across calls.
     heap_lazy_idx: i8 = -1,
@@ -779,6 +791,7 @@ pub const findZombieChild = @import("lifecycle.zig").findZombieChild;
 pub const addLazyRegion = @import("fault.zig").addLazyRegion;
 pub const addLazyRegionWithSource = @import("fault.zig").addLazyRegionWithSource;
 pub const ensureUserRangeWritable = @import("fault.zig").ensureUserRangeWritable;
+pub const ensureUserRangeWritableFor = @import("fault.zig").ensureUserRangeWritableFor;
 pub const handleUserPageFault = @import("fault.zig").handleUserPageFault;
 pub const prefaultUserRange = @import("fault.zig").prefaultUserRange;
 pub const allCurrentUserPagesMapped = @import("fault.zig").allCurrentUserPagesMapped;

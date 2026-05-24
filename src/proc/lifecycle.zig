@@ -293,6 +293,15 @@ pub fn forkCurrent(frame: *signals.SyscallFrame) ?usize {
     const parent_pid_u8: u8 = @intCast(smp.myCpu().current_pid orelse return null);
     const parent_pml4 = parent.page_directory orelse return null;
 
+    // AS-stability lock on PARENT — cloneAddressSpace walks every PTE,
+    // mutating R/W bits for COW. Concurrent sysMunmap / io_uring worker
+    // memcpy on the parent's AS would race the walk. Released after the
+    // child PML4 is built; the new child PCB gets its own as_lock (default
+    // unowned). See PCB.as_lock.
+    const parent_lead = process.leader(parent);
+    parent_lead.as_lock.acquire();
+    defer parent_lead.as_lock.release();
+
     const i = allocSlot() orelse return null;
     resetPcbExceptState(&process.procs[i]); // state stays .loading from allocSlot's CAS
 

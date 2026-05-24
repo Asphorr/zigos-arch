@@ -51,6 +51,13 @@ pub fn sysSbrk(increment: u32) u32 {
     // grow the same heap. Same indirection pattern as sysMmap.
     const lead = process.leader(pcb);
 
+    // AS-stability lock. Serializes against the io_uring worker (running
+    // on a different pid + CPU) doing memcpy into this AS — without this
+    // the worker could be mid-bounce-copy when sbrk's lazy-region mutation
+    // changes the region table mid-walk. See PCB.as_lock doc.
+    lead.as_lock.acquire();
+    defer lead.as_lock.release();
+
     const old_brk = lead.user_brk;
     if (increment == 0) return @intCast(old_brk);
 
@@ -102,6 +109,12 @@ pub fn sysMmap(len: u32, fd: u32, offset: u32) u32 {
     const pcb = process.currentPCB() orelse return E_FAULT;
     _ = pcb.page_directory orelse return E_FAULT;
     const lead = process.leader(pcb);
+
+    // AS-stability lock (see PCB.as_lock). Acquired before any AS-state
+    // read to avoid races with the io_uring worker.
+    lead.as_lock.acquire();
+    defer lead.as_lock.release();
+
     if (lead.lazy_count >= process.MAX_LAZY_REGIONS) return E_INVAL;
 
     const len_pg: usize = (@as(usize, len) + 0xFFF) & ~@as(usize, 0xFFF);
@@ -179,6 +192,10 @@ pub fn sysMmapSharedAnon(len: u32) u32 {
     const pcb = process.currentPCB() orelse return 0;
     _ = pcb.page_directory orelse return 0;
     const lead = process.leader(pcb);
+
+    lead.as_lock.acquire();
+    defer lead.as_lock.release();
+
     if (lead.lazy_count >= process.MAX_LAZY_REGIONS) return 0;
 
     const len_pg: usize = (@as(usize, len) + 0xFFF) & ~@as(usize, 0xFFF);
@@ -217,6 +234,10 @@ pub fn sysMunmap(va: u32, len: u32) u32 {
     const pcb = process.currentPCB() orelse return E_FAULT;
     const pd = pcb.page_directory orelse return E_FAULT;
     const lead = process.leader(pcb);
+
+    // AS-stability lock — serializes vs io_uring worker memcpy into AS.
+    lead.as_lock.acquire();
+    defer lead.as_lock.release();
 
     const start: usize = @as(usize, va) & ~@as(usize, 0xFFF);
     const len_pg: usize = (@as(usize, len) + 0xFFF) & ~@as(usize, 0xFFF);
@@ -318,6 +339,11 @@ pub fn sysMprotect(va: u32, len: u32, prot: u32) u32 {
     if (len == 0) return E_INVAL;
     const pcb = process.currentPCB() orelse return E_FAULT;
     const pd = pcb.page_directory orelse return E_FAULT;
+
+    // AS-stability lock — serializes vs io_uring worker memcpy into AS.
+    const lead = process.leader(pcb);
+    lead.as_lock.acquire();
+    defer lead.as_lock.release();
 
     const start: usize = @as(usize, va) & ~@as(usize, 0xFFF);
     const len_pg: usize = (@as(usize, len) + 0xFFF) & ~@as(usize, 0xFFF);
