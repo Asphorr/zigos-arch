@@ -49,11 +49,48 @@ var global_gen: [MAX_PCID]std.atomic.Value(u32) = blk: {
 var local_gen: [smp.MAX_CPUS][MAX_PCID]u32 =
     [_][MAX_PCID]u32{[_]u32{0} ** MAX_PCID} ** smp.MAX_CPUS;
 
+/// Per-PCID bitmask of CPUs that have loaded this PCID's CR3 at least once
+/// since the PCID was allocated. A bit at position `cpu_id` means "this CPU
+/// may have cached (PCID, *) TLB entries" — used by `tlb.doShootdown` to
+/// narrow IPI fan-out to only the CPUs that could possibly need flushing.
+/// Other CPUs are guaranteed to have no entries for this PCID (they never
+/// loaded it), so their TLB needs no shootdown.
+///
+/// Sized as `u32` because MAX_CPUS == 32. Set in `loadCr3` BEFORE the CR3
+/// write so a concurrent sender that reads the mask after our `or` sees us;
+/// a sender that reads before our set still wins because our PT walks haven't
+/// started yet (TLB for this PCID still empty on us). Cleared in `free` —
+/// once a process exits its PCID can be reused, and the new owner starts
+/// with a clean slate.
+///
+/// Stays SET when a CPU switches away from the PCID (lazy clear). The stale
+/// entries on that CPU survive until either (a) a future shootdown's
+/// INVPCID flushes them, or (b) the AS is destroyed and `free` clears the
+/// mask. Eager clear on switch-out would reduce IPI volume further but
+/// requires tracking the OLD pcid in the context switch — defer until
+/// profiling shows it matters.
+var pcid_cpumask: [MAX_PCID]std.atomic.Value(u32) = blk: {
+    var arr: [MAX_PCID]std.atomic.Value(u32) = undefined;
+    var i: usize = 0;
+    while (i < MAX_PCID) : (i += 1) {
+        arr[i] = std.atomic.Value(u32).init(0);
+    }
+    break :blk arr;
+};
+
 // Stats — surfaced by procfs/sysmon for visibility.
 pub var alloc_count: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
 pub var free_count: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
 pub var preserve_hits: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
 pub var flush_misses: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+
+/// Read the per-PCID cpumask. Returns 0 for invalid PCIDs (caller treats as
+/// "nobody has loaded this PCID" — sender does its local flush and skips the
+/// IPI block entirely). `tlb.doShootdown` is the sole consumer.
+pub inline fn cpumaskOf(p: u16) u32 {
+    if (p == 0 or p >= MAX_PCID) return 0;
+    return pcid_cpumask[p].load(.acquire);
+}
 
 /// Allocate a fresh PCID. Returns 0 if PCID is unsupported on this CPU
 /// (PCB.pcid stays 0 and loadCr3 falls back to plain CR3 writes).
@@ -86,6 +123,12 @@ pub fn free(p: u16) void {
     if (!in_use[p]) return;
     in_use[p] = false;
     _ = global_gen[p].fetchAdd(1, .acq_rel);
+    // Clear the cpumask: any CPU that loaded this PCID will see the gen
+    // mismatch on its next CR3 load of a REUSED slot and full-flush, so the
+    // old entries don't leak into the new owner's working set. Resetting the
+    // mask to 0 lets the new owner's cpumask grow organically from its own
+    // loads.
+    pcid_cpumask[p].store(0, .release);
     _ = free_count.fetchAdd(1, .monotonic);
 }
 
@@ -105,6 +148,16 @@ pub fn loadCr3(pml4_phys: u64, pcid: u16, cpu_id: u8) void {
     if (!protect.pcid_supported or pcid == 0 or pcid >= MAX_PCID) {
         writeCr3(aligned);
         return;
+    }
+    // Record our presence in this PCID's cpumask BEFORE writing CR3. A
+    // concurrent sender of a shootdown for `pcid` that reads the mask after
+    // our `fetchOr` will include us in its IPI fan-out and flush any TLB
+    // entries we then cache. A sender that reads BEFORE our fetchOr misses
+    // us, but our TLB for this PCID is still empty at that instant (no PT
+    // walks for this AS have happened on this CPU yet), so safe.
+    if (cpu_id < smp.MAX_CPUS) {
+        const bit = @as(u32, 1) << @as(u5, @intCast(cpu_id));
+        _ = pcid_cpumask[pcid].fetchOr(bit, .acq_rel);
     }
     var preserve: u64 = (@as(u64, 1) << 63);
     if (cpu_id < smp.MAX_CPUS) {

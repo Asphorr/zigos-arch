@@ -24,11 +24,22 @@
 //                    (mprotect of one page, single-page unmap).
 //                    Used by `shootdownPage`.
 //
-// Optimization paths (later, if shootdowns are hot):
-//   - Skip CPUs that don't have this PML4 loaded (require per-CPU
-//     `active_pml4_phys` tracking — currently not maintained).
-//   - Linux-style per-mm cpumask + sequence numbers so concurrent
-//     shootdowns don't have to serialize through one global lock.
+// IPI fan-out narrowing (Linux-style per-mm cpumask):
+//   For affected_pcid != 0, the IPI is sent only to CPUs that have loaded
+//   this PCID's CR3 at least once (tracked in `pcid_cpumask` — set in
+//   `pcid.loadCr3`, cleared in `pcid.free`). CPUs that have never run the
+//   AS are guaranteed to have no entries for this PCID, so their TLB needs
+//   no shootdown. For affected_pcid == 0 (kernel-global mappings) all
+//   CPUs may have stale GLOBAL entries — fall back to broadcasting to
+//   every alive CPU.
+//
+// Still-open future work:
+//   - Eager mask clear on context-switch-out (currently lazy: bit stays
+//     set until `pcid.free`). Would shrink IPI fan-out further when a PCID
+//     is short-lived on a CPU but the AS is long-lived.
+//   - Per-mm sequence numbers so concurrent shootdowns don't have to
+//     serialize through `shootdown_lock` (would also let us drop the
+//     global lock entirely).
 
 const std = @import("std");
 const apic = @import("../time/apic.zig");
@@ -90,6 +101,13 @@ pub var n_shootdowns_full: u64 = 0;
 pub var n_shootdowns_context: u64 = 0;
 pub var n_shootdowns_page: u64 = 0;
 pub var n_shootdowns_via_hypercall: u64 = 0;
+/// Count of alive peer CPUs that were SKIPPED by the cpumask narrowing
+/// (i.e., the IPI we did NOT have to send). Effectiveness signal for the
+/// per-mm cpumask optimization: high values mean the narrowing is paying
+/// off; near-zero means most processes touch every CPU and the mask isn't
+/// helping (and the bitmap maintenance is pure overhead). Accumulated only
+/// on IPI-path shootdowns (skipped on hypercall path).
+pub var n_shootdowns_cpumask_skipped: u64 = 0;
 
 inline fn flushLocalTlb() void {
     asm volatile (
@@ -250,17 +268,35 @@ fn doShootdown(mode: Mode, affected_pcid: u16, va: u64) void {
     // IPI fan-out path. Skipped entirely when the hypercall above already
     // flushed all VPs. `i` and `n_targets` are scoped to the whole block
     // so the broadcast loop can reuse the same iterator.
+    //
+    // Per-mm cpumask narrowing: when `affected_pcid != 0`, only CPUs whose
+    // bit is set in `pcid.cpumaskOf(affected_pcid)` can possibly hold (PCID, *)
+    // TLB entries — IPI just those. Skipped CPUs are tallied into
+    // `n_shootdowns_cpumask_skipped` for visibility. For `affected_pcid == 0`
+    // (kernel-global mappings via PGE) every CPU may hold stale entries, so
+    // the mask is set to all-1s to preserve broadcast semantics.
     var n_targets: u32 = 0;
     if (!via_hypercall) {
+        const target_mask: u32 = if (affected_pcid != 0)
+            pcid.cpumaskOf(affected_pcid)
+        else
+            ~@as(u32, 0);
+        var n_skipped: u32 = 0;
         var i: u8 = 0;
         // Bump ack-pending for each live target. Skip self — sender does
-        // its own flush at the end without bouncing through an IPI.
+        // its own flush at the end without bouncing through an IPI. Skip CPUs
+        // not in the target mask — they have no entries for this PCID.
         while (i < smp.MAX_CPUS) : (i += 1) {
             if (i == me) continue;
             if (!smp.cpus[i].alive) continue;
+            if ((target_mask & (@as(u32, 1) << @as(u5, @intCast(i)))) == 0) {
+                n_skipped += 1;
+                continue;
+            }
             _ = ack_pending[i].fetchAdd(1, .acq_rel);
             n_targets += 1;
         }
+        n_shootdowns_cpumask_skipped +%= n_skipped;
 
         if (n_targets > 0) {
             // Broadcast. icrSend doesn't have an "all-except-self" shorthand
@@ -270,6 +306,7 @@ fn doShootdown(mode: Mode, affected_pcid: u16, va: u64) void {
             while (i < smp.MAX_CPUS) : (i += 1) {
                 if (i == me) continue;
                 if (!smp.cpus[i].alive) continue;
+                if ((target_mask & (@as(u32, 1) << @as(u5, @intCast(i)))) == 0) continue;
                 apic.sendIPI(i, TLB_VECTOR);
             }
 
@@ -281,6 +318,7 @@ fn doShootdown(mode: Mode, affected_pcid: u16, va: u64) void {
             while (i < smp.MAX_CPUS) : (i += 1) {
                 if (i == me) continue;
                 if (!smp.cpus[i].alive) continue;
+                if ((target_mask & (@as(u32, 1) << @as(u5, @intCast(i)))) == 0) continue;
                 while (ack_pending[i].load(.acquire) != 0) pause();
             }
         }
