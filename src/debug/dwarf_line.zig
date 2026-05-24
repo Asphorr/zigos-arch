@@ -64,8 +64,13 @@ pub fn init() void {
     const staging: [*]const u8 = fresh.buf;
     const file_size = fresh.size;
     defer {
+        // vfs.loadFileFresh uses pmm.allocContiguous; pair with freeContiguous
+        // for the correct API match. The per-frame freeFrame loop here was
+        // mismatched and produced spurious [pmm-canary] mismatches on these
+        // pages (freeFrame writes a canary per frame; freeContiguous skips
+        // canary writes for bulk-freed contiguous ranges by design).
         const phys_base = paging.virtToPhys(@intFromPtr(fresh.buf)).?;
-        for (0..fresh.pages) |p| @import("../mm/pmm.zig").freeFrame(phys_base + p * 4096);
+        @import("../mm/pmm.zig").freeContiguous(phys_base, fresh.pages);
     }
 
     if (file_size < 12) {
