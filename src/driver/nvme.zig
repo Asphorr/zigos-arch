@@ -165,9 +165,10 @@ const ASYNC_BUILD_ENABLED: bool = true;
 ///   .cb    — IRQ reaper invokes the callback in IRQ context with
 ///            (ctx, success, status_code). Used by io_uring's per-IRQ
 ///            async path: callback marks the io_uring PendingOp done and
-///            wakes the worker. Callback MUST be brief — runs at IRQ with
-///            cq_lock held; deferred work (user-buffer copy, posting CQE)
-///            happens in the woken task context.
+///            wakes the worker. Callback MUST be brief — runs at IRQ
+///            context (still cli/iretq window), but cq_lock has already
+///            been released by the time dispatch runs. Deferred work
+///            (user-buffer copy, posting CQE) happens in the woken task.
 const WakeMode = union(enum) {
     pid: u8,
     cb: struct {
@@ -991,68 +992,99 @@ fn allocCid(c: *Controller) ?u16 {
 /// IRQ arrives mid-section in task context.
 fn reapCq(c: *Controller) bool {
     if (!c.initialized) return false;
-    const irq_flags = c.cq_lock.acquireIrqSave();
-    defer c.cq_lock.releaseIrqRestore(irq_flags);
-    const cq: [*]volatile CqEntry = @ptrFromInt(paging.physToVirt(c.io_cq));
-    var any = false;
+
+    // Wakes are STAGED inside the cq_lock window and DISPATCHED outside.
+    // Each proc.wake takes sched_lock; inlining 16 of them under cq_lock
+    // gave us [cli-hold] reapCq+0x34 holds of 5-39 ms under mtswap
+    // (2026-05-24). Pulling dispatch out shortens cq_lock to "drain CQEs
+    // + advance head + ring doorbell" — pure device-state work. Waiter
+    // slot is pinned by `gen`, so a TIMEOUT path racing to free between
+    // release and dispatch is safe: the wake still goes to the right pid
+    // (and that pid's blockOn returns whether or not we woke it).
+    const PendingWake = struct {
+        wake: WakeMode,
+        success: bool,
+        sc: u16,
+    };
+    var pending: [Q_DEPTH]PendingWake = undefined;
+    var pending_count: usize = 0;
     var any_woken = false;
-    while (true) {
-        const slot_vaddr = @intFromPtr(&cq[c.io_cq_head]);
-        asm volatile ("clflush (%[ptr])"
-            :
-            : [ptr] "r" (slot_vaddr),
-            : .{ .memory = true });
-        asm volatile ("mfence" ::: .{ .memory = true });
-        const status_word = cq[c.io_cq_head].status;
-        const phase_bit = (status_word & 1) != 0;
-        if (phase_bit != c.io_cq_phase) break;
-        const cid = cq[c.io_cq_head].cid;
-        const sc = status_word >> 1;
-        // Gap #2+#3 (2026-05-20): decode the slot + generation. The slot
-        // tells us which waiter to wake; the generation tells us this
-        // completion is for the CURRENT occupant of that slot. A gen
-        // mismatch means the original submitter timed out and abandoned;
-        // the slot may now hold a different waiter that we MUST NOT
-        // mistakenly wake with this stale completion.
-        const slot_idx = cidSlot(cid);
-        const expected_gen = cidGen(cid);
-        const w = &c.waiters[slot_idx];
-        if (w.active and w.gen == expected_gen) {
-            w.status_code = sc;
-            w.success = (sc == 0);
-            @atomicStore(bool, &w.completed, true, .release);
-            // Dispatch by wake mode. Sync waiters get a process.wake; async
-            // io_uring waiters get their callback invoked directly here in
-            // IRQ context (callback is contractually brief — see WakeMode).
-            switch (w.wake) {
-                .pid => |pid| {
-                    const proc = @import("../proc/process.zig");
-                    proc.wake(pid);
-                },
-                .cb => |hook| {
-                    hook.callback(hook.ctx, w.success, sc);
-                },
+
+    {
+        const irq_flags = c.cq_lock.acquireIrqSave();
+        defer c.cq_lock.releaseIrqRestore(irq_flags);
+        const cq: [*]volatile CqEntry = @ptrFromInt(paging.physToVirt(c.io_cq));
+        var any = false;
+        while (true) {
+            const slot_vaddr = @intFromPtr(&cq[c.io_cq_head]);
+            asm volatile ("clflush (%[ptr])"
+                :
+                : [ptr] "r" (slot_vaddr),
+                : .{ .memory = true });
+            asm volatile ("mfence" ::: .{ .memory = true });
+            const status_word = cq[c.io_cq_head].status;
+            const phase_bit = (status_word & 1) != 0;
+            if (phase_bit != c.io_cq_phase) break;
+            const cid = cq[c.io_cq_head].cid;
+            const sc = status_word >> 1;
+            // Gap #2+#3 (2026-05-20): decode the slot + generation. The slot
+            // tells us which waiter to wake; the generation tells us this
+            // completion is for the CURRENT occupant of that slot. A gen
+            // mismatch means the original submitter timed out and abandoned;
+            // the slot may now hold a different waiter that we MUST NOT
+            // mistakenly wake with this stale completion.
+            const slot_idx = cidSlot(cid);
+            const expected_gen = cidGen(cid);
+            const w = &c.waiters[slot_idx];
+            if (w.active and w.gen == expected_gen) {
+                w.status_code = sc;
+                w.success = (sc == 0);
+                @atomicStore(bool, &w.completed, true, .release);
+                // Stage — dispatch below, outside cq_lock.
+                pending[pending_count] = .{
+                    .wake = w.wake,
+                    .success = w.success,
+                    .sc = sc,
+                };
+                pending_count += 1;
+                any_woken = true;
+            } else {
+                // Orphan: either the slot was already freed (a TIMEOUT path
+                // abandoned it), or the slot was reused under a new gen
+                // (active=true but gen has moved on). Either way the
+                // completion is not for any current waiter — log it and
+                // drop. Without this branch the orphan would be silently
+                // swallowed; the previous code path even risked falsely
+                // waking the slot's CURRENT owner with stale status data.
+                debug.klog(
+                    "[nvme] orphan CQE: cid=0x{X:0>4} (slot={d} gen={d}) sc=0x{X} — current slot active={any} gen={d}\n",
+                    .{ cid, slot_idx, expected_gen, sc, w.active, w.gen },
+                );
             }
-            any_woken = true;
-        } else {
-            // Orphan: either the slot was already freed (a TIMEOUT path
-            // abandoned it), or the slot was reused under a new gen
-            // (active=true but gen has moved on). Either way the
-            // completion is not for any current waiter — log it and
-            // drop. Without this branch the orphan would be silently
-            // swallowed; the previous code path even risked falsely
-            // waking the slot's CURRENT owner with stale status data.
-            debug.klog(
-                "[nvme] orphan CQE: cid=0x{X:0>4} (slot={d} gen={d}) sc=0x{X} — current slot active={any} gen={d}\n",
-                .{ cid, slot_idx, expected_gen, sc, w.active, w.gen },
-            );
+            c.io_cq_head = (c.io_cq_head + 1) % Q_DEPTH;
+            if (c.io_cq_head == 0) c.io_cq_phase = !c.io_cq_phase;
+            c.cqe_drained_count +%= 1; // gap #12
+            any = true;
         }
-        c.io_cq_head = (c.io_cq_head + 1) % Q_DEPTH;
-        if (c.io_cq_head == 0) c.io_cq_phase = !c.io_cq_phase;
-        c.cqe_drained_count +%= 1; // gap #12
-        any = true;
+        if (any) cqDoorbell(c, 1).* = c.io_cq_head;
     }
-    if (any) cqDoorbell(c, 1).* = c.io_cq_head;
+
+    // Dispatch — cq_lock released, still in IRQ context. proc.wake
+    // takes sched_lock; the staging above keeps that out of our cli
+    // window. .cb path is io_uring's IRQ callback (same constraints as
+    // before minus the cq_lock-held claim).
+    if (pending_count > 0) {
+        const proc = @import("../proc/process.zig");
+        var i: usize = 0;
+        while (i < pending_count) : (i += 1) {
+            const p = pending[i];
+            switch (p.wake) {
+                .pid => |pid| proc.wake(pid),
+                .cb => |hook| hook.callback(hook.ctx, p.success, p.sc),
+            }
+        }
+    }
+
     return any_woken;
 }
 
