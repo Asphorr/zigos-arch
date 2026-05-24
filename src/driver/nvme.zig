@@ -960,20 +960,35 @@ fn ioCommand(c: *Controller, opcode: u8, lba: u32, user_buf: usize, sectors: u32
 /// completions (gen mismatch == slot was abandoned + reused since this
 /// command was issued).
 fn allocCid(c: *Controller) ?u16 {
+    // Lockless slot claim via per-slot CAS on `active`. Pre-rework this
+    // was a linear scan under `io_lock`; the lock was the dominant cost
+    // in ioCommand's cli-hold (8-28 ms). Multiple submitters can claim
+    // different free slots in parallel here without ANY locking.
+    //
+    // Ordering: gen MUST be bumped AFTER winning the CAS (so we know we
+    // own the slot exclusively) and BEFORE returning the cid (so the
+    // submitter writes the new gen into the SQE, and any late CQE from
+    // the previous occupant orphan-misses on gen mismatch in reapCq).
+    // A late CQE arriving in the (CAS-win, gen-bump) window would match
+    // the OLD gen — reapCq would set `completed=true` on us spuriously.
+    // We reset `completed` after the gen bump so the submitter never
+    // sees that stale write when it starts polling.
     var i: u16 = 0;
     while (i < Q_DEPTH) : (i += 1) {
-        if (!c.waiters[i].active) {
-            const new_gen = nextGen(c.waiters[i].gen);
-            c.waiters[i] = .{
-                .active = true,
-                .completed = false,
-                .success = false,
-                .status_code = 0,
-                .wake = .{ .pid = 0xFF },
-                .gen = new_gen,
-            };
-            return packCid(i, new_gen);
+        if (@atomicLoad(bool, &c.waiters[i].active, .acquire)) continue;
+        if (@cmpxchgStrong(bool, &c.waiters[i].active, false, true, .acq_rel, .acquire)) |_| {
+            // CAS lost — another CPU just claimed this slot.
+            continue;
         }
+        // Own the slot. Bump gen atomically, then reset state.
+        const new_gen = nextGen(@atomicLoad(u16, &c.waiters[i].gen, .acquire));
+        @atomicStore(u16, &c.waiters[i].gen, new_gen, .release);
+        @atomicStore(bool, &c.waiters[i].completed, false, .release);
+        c.waiters[i].success = false;
+        c.waiters[i].status_code = 0;
+        c.waiters[i].wake = .{ .pid = 0xFF };
+        c.waiters[i].sq_slot = 0xFFFF;
+        return packCid(i, new_gen);
     }
     return null;
 }
@@ -1178,29 +1193,21 @@ fn ioCommandAsync(c: *Controller, ctrl_idx: u32, opcode: u8, lba: u32, user_buf:
     if (sectors == 0 or sectors > MAX_SECTORS_PER_CMD) return false;
     const t_call_start = @import("../debug/perf.zig").rdtsc();
 
-    // ---- Submit phase: short lock around CID alloc + SQ tail bump ----
-    // Gap #6 (2026-05-20): queue-full retry. Pre-fix, any concurrent
-    // burst that exceeded Q_DEPTH=16 in-flight commands returned false
-    // immediately. Callers (block.zig dispatch) discarded the bool —
-    // reads silently returned garbage, writes silently dropped. Now we
-    // yield-and-retry up to MAX_QUEUE_FULL_RETRIES times; each yield
-    // lets the IRQ reaper drain at least one completion. Real failures
-    // (device hung, all CIDs orphaned by gen-counter timeouts) still
-    // surface as false after the retry budget.
+    // ---- Submit phase: lockless prep + narrow lock for SQ tail+doorbell ----
+    // Step 2 (2026-05-24): allocCid is now lockless (per-slot CAS on
+    // .active). Step 3 narrows io_lock to just the SQE write + tail bump
+    // + doorbell — the writes that MUST be ordered across submitters
+    // because they all target io_sq[io_sq_tail] and the single doorbell
+    // register. Everything else (waiter setup, bounce copy, MSI-X
+    // retarget, build PRP) is per-slot or per-controller-but-already-
+    // synchronized state and runs lock-free in parallel across CPUs.
     const MAX_QUEUE_FULL_RETRIES: u32 = 8;
     const proc = @import("../proc/process.zig");
     const smp = @import("../cpu/smp.zig");
-    // Saved RFLAGS for the held-across-blk acquireIrqSave. See ioCommandSync's
-    // comment for the deadlock class this avoids (SpinLock-held-across-
-    // schedule). softYield happens with the lock RELEASED + IRQs restored,
-    // so the scheduler can run normally between retries.
-    var saved_io_flags: u64 = 0;
     const cid: u16 = blk_alloc: {
         var attempts: u32 = 0;
         while (true) : (attempts += 1) {
-            saved_io_flags = c.io_lock.acquireIrqSave();
-            if (allocCid(c)) |c_packed| break :blk_alloc c_packed; // lock + flags stay held
-            c.io_lock.releaseIrqRestore(saved_io_flags);
+            if (allocCid(c)) |c_packed| break :blk_alloc c_packed;
             if (attempts >= MAX_QUEUE_FULL_RETRIES) {
                 debug.klog("[nvme] queue full after {d} retries on ctrl#{d} (pid={d}, opcode=0x{X}, lba={d})\n", .{
                     attempts, ctrl_idx, smp.myCpu().current_pid orelse 0xFF, opcode, lba,
@@ -1225,43 +1232,57 @@ fn ioCommandAsync(c: *Controller, ctrl_idx: u32, opcode: u8, lba: u32, user_buf:
     const xfer_bytes: u32 = sectors * c.block_size;
 
     // Mark the waiter as belonging to the current process so the IRQ
-    // handler knows whom to wake. Done before releasing io_lock so a
-    // wake on a stale pid can't slip in if the slot was just reused.
-    // (proc/smp already imported up in the queue-full retry block.)
+    // handler knows whom to wake. allocCid already CAS-claimed the slot
+    // exclusively to us — no lock needed for these per-slot writes.
     const cur_pid: u8 = if (smp.myCpu().current_pid) |p| @intCast(p) else 0xFF;
     c.waiters[slot_idx].wake = .{ .pid = cur_pid };
-    // Gap #11: record the SQ ring slot where this command's SQE lives.
-    // dumpWaiterForTarget reads io_sq[sq_slot] so we can prove "yes,
-    // our SQE is sitting there with the right opcode/lba."
-    c.waiters[slot_idx].sq_slot = c.io_sq_tail;
 
-    // For IO_WRITE, copy user → bounce BEFORE releasing the lock so a
-    // concurrent reuser of this CID can't overwrite the buffer (can't
-    // happen yet — cid is ours until completion — but kept tight).
+    // For IO_WRITE, copy user → bounce. Slot is ours via CAS until we
+    // free it; the bounce buffer at bounce_bufs[slot_idx] is per-slot
+    // so no other submitter touches it. Lock-free.
     if (opcode == IO_WRITE) {
         const dst: [*]u8 = @ptrFromInt(paging.physToVirt(bounce_phys));
         const src: [*]const u8 = @ptrFromInt(user_buf);
         @memcpy(dst[0..xfer_bytes], src[0..xfer_bytes]);
     }
 
-    const slot_addr = c.io_sq + @as(usize, c.io_sq_tail) * 64;
+    // MSI-X retarget: msix_current_addr is shared per-controller, but
+    // updates are idempotent (any LAPIC that the IRQ delivers to can
+    // handle the wake — pid lookup is global). Two CPUs racing to write
+    // distinct dest_ids would just oscillate; pick one with a brief
+    // io_lock window OR move this OUT entirely. For now keep inside the
+    // narrow lock below — costs one MMIO write on the rare retarget.
+    const new_msix_addr: u64 = if (c.use_msix) blk: {
+        const apic = @import("../time/apic.zig");
+        const dest_id: u64 = apic.getLapicId() & 0xFF;
+        break :blk 0xFEE00000 | (dest_id << 12);
+    } else 0;
+
+    // ---- Narrow critical section: SQE write at our slot + doorbell ----
+    // What it protects:
+    //   - io_sq_tail bump must atomically pair with the SQE write to
+    //     io_sq[tail] — otherwise two submitters could write the same
+    //     slot or skip a slot.
+    //   - sqDoorbell writes must be in tail order (device reads SQEs
+    //     up to the doorbell value).
+    //   - MSI-X retarget piggy-backs here (idempotent; cheap).
+    // What it does NOT protect:
+    //   - allocCid / waiter setup / bounce copy (lockless above).
+    //   - bounce_bufs[slot_idx] (per-slot ownership).
+    const saved_io_flags = c.io_lock.acquireIrqSave();
+    if (c.use_msix and c.msix_current_addr != new_msix_addr) {
+        msix.writeEntry(c.msix_io_entry, new_msix_addr, c.msix_data, false);
+        c.msix_current_addr = new_msix_addr;
+        io_msix_retargets += 1;
+    }
+    const sq_tail_at_submit = c.io_sq_tail;
+    c.waiters[slot_idx].sq_slot = sq_tail_at_submit;
+    const slot_addr = c.io_sq + @as(usize, sq_tail_at_submit) * 64;
     const slot32: [*]volatile u32 = @ptrFromInt(paging.physToVirt(slot_addr));
     const prp = buildPrp(c, slot_idx, xfer_bytes);
     writeSqe(slot32, opcode, cid, c.nsid, prp.prp1, prp.prp2, lba, 0, sectors - 1);
     storeBarrier();
-
-    if (c.use_msix) {
-        const apic = @import("../time/apic.zig");
-        const dest_id: u64 = apic.getLapicId() & 0xFF;
-        const new_addr: u64 = 0xFEE00000 | (dest_id << 12);
-        if (c.msix_current_addr != new_addr) {
-            msix.writeEntry(c.msix_io_entry, new_addr, c.msix_data, false);
-            c.msix_current_addr = new_addr;
-            io_msix_retargets += 1;
-        }
-    }
-
-    c.io_sq_tail = (c.io_sq_tail + 1) % Q_DEPTH;
+    c.io_sq_tail = (sq_tail_at_submit + 1) % Q_DEPTH;
     sqDoorbell(c, 1).* = @as(u32, c.io_sq_tail);
     c.io_lock.releaseIrqRestore(saved_io_flags);
 
