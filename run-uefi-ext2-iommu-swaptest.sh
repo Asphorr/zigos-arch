@@ -14,7 +14,16 @@ if [ ! -f ovmf_vars.fd ]; then
     echo "[run-swaptest] Initialized ovmf_vars.fd"
 fi
 
-"$ZIG" build -Doptimize=ReleaseSafe || { echo "[run-swaptest] build failed"; exit 1; }
+# Set KASAN=1 to build through the LLVM IR-pass KASAN pipeline. Without
+# it, regular ReleaseSafe build (~5 MB kernel). With it, instrumented
+# build (~17 MB) routes through tools/kasan_pipeline.sh and catches
+# wild writes / use-after-free at every instrumented memory access.
+KASAN_FLAG=""
+if [ -n "${KASAN:-}" ]; then
+    KASAN_FLAG="-Dkasan=true"
+    echo "[run-swaptest] KASAN enabled"
+fi
+"$ZIG" build -Doptimize=ReleaseSafe $KASAN_FLAG || { echo "[run-swaptest] build failed"; exit 1; }
 
 if [ ! -f ext2.img ]; then
     echo "[run-swaptest] ext2.img missing — build should have produced it" >&2
