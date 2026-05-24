@@ -277,6 +277,11 @@ fn freeWallpaperThumbs() void {
         }
     }
     wp_thumb_count = 0;
+    // stb's per-decode 4-8 MB scratch buffers were freed during the scan;
+    // freeing the small downscaled thumbnails above is what unlocks the
+    // adjacent-block coalesce that gives us one big free tail. Now is the
+    // moment to hand that tail back to the kernel via malloc_trim.
+    _ = libc.malloc_trim(0);
 }
 
 /// Decode (or rather, decode + scale-down) every image in `dir` into the

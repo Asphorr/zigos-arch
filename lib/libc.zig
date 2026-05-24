@@ -253,6 +253,17 @@ pub fn sbrk(increment: u32) ?[*]u8 {
     return @ptrFromInt(result);
 }
 
+/// Shrink the data segment by `decrement` bytes. Returns true on success;
+/// the kernel unmaps and frees PMM frames for any pages whose VA falls in
+/// the released range, then shortens the heap lazy region. Caller is
+/// responsible for not shrinking past live allocations — `malloc_trim`
+/// below is the supported high-level entry.
+pub fn sbrkShrink(decrement: u32) bool {
+    const neg: i32 = -@as(i32, @intCast(decrement));
+    const result = syscall(5, @bitCast(neg), 0);
+    return result != 0xFFFFFFFF;
+}
+
 pub fn getpid() u32 {
     return syscall(6, 0, 0);
 }
@@ -1122,6 +1133,91 @@ pub fn free(ptr: ?[*]u8) void {
     heap_lock.lock();
     defer heap_lock.unlock();
     freeLocked(ptr);
+}
+
+/// Return trailing free heap pages to the kernel (sbrk(-N)). If the
+/// final block is FREE and big enough, asks the kernel to unmap the
+/// trailing pages and shortens our heap_end to match. `keep_bytes`
+/// leaves that much slack at the end to avoid thrashing on small
+/// re-grows; pass 0 to give back as much as possible. Returns the
+/// number of bytes returned to the kernel.
+pub fn malloc_trim(keep_bytes: usize) usize {
+    heap_lock.lock();
+    defer heap_lock.unlock();
+    if (heap_start == 0 or heap_end <= heap_start) return 0;
+    // Boundary-tag layout is contiguous — a single forward walk finds
+    // the last block.
+    var addr: usize = heap_start;
+    var last_addr: usize = 0;
+    while (addr < heap_end) {
+        const blk: *Block = @ptrFromInt(addr);
+        if (blk.size == 0) return 0; // corruption guard — bail out
+        last_addr = addr;
+        addr += blk.size;
+    }
+    if (last_addr == 0) return 0;
+    const last: *Block = @ptrFromInt(last_addr);
+    if (last.magic != BLOCK_MAGIC_FREE) return 0;
+    // Snapshot the header NOW: in consume_whole the header itself sits in
+    // the about-to-be-unmapped range, so any read after sbrkShrink would
+    // page-fault. Bug surfaced 2026-05-25 — pid=4 settings crashed on
+    // `heap_free -= last.size` immediately after a shrink fully consumed
+    // the tail block.
+    const last_size: usize = last.size;
+    if (last_size <= keep_bytes + 4096) return 0;
+
+    // Pick the largest page-aligned amount we can release while leaving
+    // either zero residual (consume the whole block) or a residual that
+    // is still a valid block (>= HEADER_SIZE).
+    var trim_bytes: usize = (last_size - keep_bytes) & ~@as(usize, 4095);
+    if (trim_bytes < 4096) return 0;
+    var consume_whole = false;
+    var residual = last_size - trim_bytes;
+    if (residual == 0) {
+        consume_whole = true;
+    } else if (residual < HEADER_SIZE) {
+        // Back off one page so the residual is a sane size, or consume
+        // the whole block if that's not possible.
+        if (trim_bytes >= 4096) {
+            trim_bytes -= 4096;
+            residual = last_size - trim_bytes;
+            if (trim_bytes == 0) return 0;
+        } else {
+            return 0;
+        }
+    }
+
+    const new_end = heap_end - trim_bytes;
+    // Update bookkeeping BEFORE the shrink so we never need to re-read
+    // the block header (which may be in the released range).
+    if (consume_whole) {
+        heap_free -= last_size;
+        heap_blocks -= 1;
+        if (heap_hint >= new_end) heap_hint = heap_start;
+    } else {
+        // Partial trim: residual > 0 means last_addr < new_end, so the
+        // header stays mapped. Write the new size now anyway — keeps
+        // the "no post-shrink reads" invariant tidy.
+        last.size = @intCast(residual);
+        heap_free -= trim_bytes;
+    }
+    heap_end = new_end;
+    if (heap_hint >= heap_end) heap_hint = heap_start;
+
+    if (!sbrkShrink(@intCast(trim_bytes))) {
+        // Rollback — kernel refused (shouldn't happen given we validated)
+        // but stay correct if it does.
+        if (consume_whole) {
+            heap_free += last_size;
+            heap_blocks += 1;
+        } else {
+            last.size = @intCast(last_size);
+            heap_free += trim_bytes;
+        }
+        heap_end += trim_bytes;
+        return 0;
+    }
+    return trim_bytes;
 }
 
 /// Return the usable payload size for `ptr` (i.e. block.size - header).

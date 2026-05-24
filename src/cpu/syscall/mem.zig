@@ -61,8 +61,47 @@ pub fn sysSbrk(increment: u32) u32 {
     const old_brk = lead.user_brk;
     if (increment == 0) return @intCast(old_brk);
 
+    // Shrink path: when the caller passes a negative i32 (reinterpreted as
+    // u32 with bit 31 set), trim the heap. Returns `old_brk` on success or
+    // E_INVAL if the requested shrink would drop below the heap origin or
+    // there is no heap region to trim. Pages between [new_brk, old_brk)
+    // are unmapped and their PMM frames freed; the tail of the heap lazy
+    // region is shortened. One TLB shootdown covers the whole batch.
+    const inc_signed: i32 = @bitCast(increment);
+    if (inc_signed < 0) {
+        const decrement: usize = @intCast(-inc_signed);
+        if (decrement > old_brk - memmap.USER_BRK_INITIAL) return E_INVAL;
+        const new_brk_shrink = old_brk - decrement;
+        if (lead.heap_lazy_idx < 0) return E_INVAL;
+        const hr = &lead.lazy_regions[@intCast(lead.heap_lazy_idx)];
+        if (hr.end != old_brk) return E_INVAL;
+        if (new_brk_shrink < hr.start) return E_INVAL;
+
+        debug.klog("[sbrk-shrink] pid={d} name='{s}' dec={d}KB old=0x{X} new=0x{X}\n", .{
+            process.getCurrentPid(), pcb.name[0..pcb.name_len],
+            decrement / 1024, old_brk, new_brk_shrink,
+        });
+
+        const pml4: [*]align(4096) u64 = @ptrCast(@alignCast(lead.page_directory.?));
+        _ = vmm.unmapUserRange(pml4, new_brk_shrink, old_brk);
+        @import("../tlb.zig").shootdownAll(lead.pcid);
+
+        hr.end = new_brk_shrink;
+        lead.user_brk = new_brk_shrink;
+        return @intCast(old_brk);
+    }
+
     const new_brk = old_brk + increment;
     if (new_brk > USER_SPACE_END or new_brk < old_brk) return E_INVAL;
+
+    // Diagnostic: log every grow > 1 MB so we can attribute big user-heap
+    // jumps to a specific app call. Filter small grows to avoid spam.
+    if (increment >= 1024 * 1024) {
+        debug.klog("[sbrk] pid={d} name='{s}' inc={d}KB old=0x{X} new=0x{X}\n", .{
+            process.getCurrentPid(), pcb.name[0..pcb.name_len],
+            increment / 1024, old_brk, new_brk,
+        });
+    }
 
     // Lazy heap: register (or extend) a lazy region instead of eagerly mapping
     // every page. The page-fault handler allocates+zeros pages on first touch.
