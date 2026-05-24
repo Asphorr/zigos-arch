@@ -141,6 +141,14 @@ const Instance = struct {
     header_kvirt: usize = 0,
     worker_pid: u32 = 0xFFFFFFFF,
     pending: [MAX_PENDING_PER_INSTANCE]PendingOp = [_]PendingOp{.{}} ** MAX_PENDING_PER_INSTANCE,
+    /// Suppress spurious wakes to .iouring_cq parkers. Set by enter() to its
+    /// min_complete before parking; cleared on exit. Worker checks before
+    /// calling wakeIoUringCqWaiters — only wakes when ready ≥ cq_min_complete.
+    /// Without this, a 16-deep concurrent submit triggered 16 separate IRQs →
+    /// 16 wake-and-re-park cycles for the app (each adds a ~4 ms schedule
+    /// round-trip), turning a single wait into N × round-trip latency.
+    /// 0 means "no one is parked / no waiter cares" — worker skips the wake.
+    cq_min_complete: u32 = 0,
 };
 
 var instances: [MAX_INSTANCES_TOTAL]Instance = [_]Instance{.{}} ** MAX_INSTANCES_TOTAL;
@@ -520,7 +528,19 @@ fn workerLoop() callconv(.c) noreturn {
         // or by the NVMe IRQ callback (op completed).
         const drained = drainCompletions(inst);
         if (drained > 0) {
-            process.wakeIoUringCqWaiters(inst_id);
+            // Only wake CQ waiters when the parked caller's min_complete is
+            // satisfied — otherwise they'd wake, re-check, see ready < min,
+            // and re-park, paying a full schedule round-trip per spurious
+            // wake. With this gate, a 16-deep enter(min=16) wakes the app
+            // exactly once when the 16th completion lands, instead of 16×.
+            const cq_hdr: *RingHeader = @ptrFromInt(inst.header_kvirt);
+            const cq_tail = @atomicLoad(u32, &cq_hdr.cq_tail, .acquire);
+            const cq_head = @atomicLoad(u32, &cq_hdr.cq_head, .acquire);
+            const ready = cq_tail -% cq_head;
+            const min_c = @atomicLoad(u32, &inst.cq_min_complete, .acquire);
+            if (min_c == 0 or ready >= min_c) {
+                process.wakeIoUringCqWaiters(inst_id);
+            }
         }
 
         // Phase 1b: shutdown coordination. If the owner requested exit,
@@ -795,6 +815,11 @@ pub fn enter(user_va: u32, to_submit: u32, min_complete: u32) u32 {
     }
 
     if (min_complete > 0) {
+        // Tell the worker what min_complete we're waiting for, so it can
+        // suppress per-CQE wakes and only wake us when the count is hit.
+        @atomicStore(u32, &inst.cq_min_complete, min_complete, .release);
+        defer @atomicStore(u32, &inst.cq_min_complete, 0, .release);
+
         while (true) {
             const cq_tail = @atomicLoad(u32, &hdr.cq_tail, .acquire);
             const cq_head = @atomicLoad(u32, &hdr.cq_head, .acquire);
