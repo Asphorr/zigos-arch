@@ -434,14 +434,34 @@ pub fn swapInFrame(pte_ptr: *u64, va: usize, flags: u64, pcid: u16) bool {
     const original = pte_ptr.*;
     if (!pteIsSwapped(original)) return false;
     const slot = pteSlot(original);
+    // [mtswap-trace] for the parked MT-stress wedge — see fault.zig.
+    const smp = @import("../cpu/smp.zig");
+    const cur_pid: u32 = if (smp.myCpu().current_pid) |p| @intCast(p) else 0xFF;
+    if (cur_pid >= 4) debug.klog("[mtswap-trace] pid={d} cpu{d} swapIn slot={d} alloc...\n", .{
+        cur_pid, smp.myCpu().cpu_id, slot,
+    });
     // allocFrame (not allocFrameUser): swap-in is high priority — failing it
     // means data loss / a killed process — so it may use the reserve the
     // user allocator protects. Deliberate.
-    const frame = pmm.allocFrame() orelse return false;
+    const frame = pmm.allocFrame() orelse {
+        if (cur_pid >= 4) debug.klog("[mtswap-trace] pid={d} cpu{d} swapIn FAIL_NO_FRAME\n", .{
+            cur_pid, smp.myCpu().cpu_id,
+        });
+        return false;
+    };
+    if (cur_pid >= 4) debug.klog("[mtswap-trace] pid={d} cpu{d} swapIn readPage frame=0x{X}...\n", .{
+        cur_pid, smp.myCpu().cpu_id, frame,
+    });
     if (!readPage(slot, frame)) {
+        if (cur_pid >= 4) debug.klog("[mtswap-trace] pid={d} cpu{d} swapIn readPage FAILED\n", .{
+            cur_pid, smp.myCpu().cpu_id,
+        });
         pmm.freeFrame(frame);
         return false;
     }
+    if (cur_pid >= 4) debug.klog("[mtswap-trace] pid={d} cpu{d} swapIn readPage OK, CAS...\n", .{
+        cur_pid, smp.myCpu().cpu_id,
+    });
     // CAS so two threads racing to swap-in the same VA don't both install
     // PTEs / free the slot. The loser frees its freshly-read frame; the
     // slot was already freed by the winner. We then distinguish "lost race
@@ -455,13 +475,22 @@ pub fn swapInFrame(pte_ptr: *u64, va: usize, flags: u64, pcid: u16) bool {
         pmm.freeFrame(frame);
         // Re-read with acquire so the winner's PRESENT store is observed.
         const post = @atomicLoad(u64, pte_ptr, .acquire);
+        if (cur_pid >= 4) debug.klog("[mtswap-trace] pid={d} cpu{d} swapIn CAS_LOST post=0x{X}\n", .{
+            cur_pid, smp.myCpu().cpu_id, post,
+        });
         return (post & paging.PRESENT) != 0;
     }
+    if (cur_pid >= 4) debug.klog("[mtswap-trace] pid={d} cpu{d} swapIn CAS_WON shootdown va=0x{X}\n", .{
+        cur_pid, smp.myCpu().cpu_id, va,
+    });
     // Flush the stale not-present entry on peers AND this CPU (shootdownPage's
     // flushLocalForMode INVLPG backstop) so the freshly-installed frame is
     // visible immediately on the faulting CPU.
     tlb.shootdownPage(pcid, va);
     freeSlot(slot);
+    if (cur_pid >= 4) debug.klog("[mtswap-trace] pid={d} cpu{d} swapIn DONE\n", .{
+        cur_pid, smp.myCpu().cpu_id,
+    });
     pages_in += 1;
     if (pages_in == 1 or pages_in % 4096 == 0)
         debug.klog("[swap] out={d} in={d} sc={d} dc={d} slots={d}/{d}\n", .{ pages_out, pages_in, pages_second_chance, pages_discarded, used_count, NUM_SLOTS });
