@@ -72,6 +72,16 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // Cross-unit memory-layout source of truth. Both kernel (memmap.zig
+    // comptime-asserts it agrees) and UEFI bootloader (consumes the fixed
+    // addresses directly) import this. Bumping any region size requires
+    // updating the values here — build refuses on drift.
+    const uefi_layout_mod = b.createModule(.{
+        .root_source_file = b.path("lib/uefi_layout.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const kernel = b.addExecutable(.{
         .name = "kernel.elf",
         .root_module = b.createModule(.{
@@ -89,6 +99,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "shapes", .module = kernel_shapes_mod },
                 .{ .name = "font_blobs", .module = font_blobs_mod },
+                .{ .name = "uefi_layout", .module = uefi_layout_mod },
             },
         }),
         // Zig 0.16's self-hosted x86 backend can't yet encode some of our
@@ -923,6 +934,15 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseSafe,
     });
 
+    // Re-create uefi_layout for the bootloader with the right target — it's
+    // the same source file (single source of truth), but Zig needs a module
+    // instance per target.
+    const bootloader_uefi_layout_mod = b.createModule(.{
+        .root_source_file = b.path("lib/uefi_layout.zig"),
+        .target = uefi_target,
+        .optimize = .ReleaseSafe,
+    });
+
     const bootloader = b.addExecutable(.{
         .name = "BOOTX64",
         .root_module = b.createModule(.{
@@ -931,6 +951,7 @@ pub fn build(b: *std.Build) void {
             .optimize = .ReleaseSafe,
             .imports = &.{
                 .{ .name = "aa_font", .module = bootloader_aa_font_mod },
+                .{ .name = "uefi_layout", .module = bootloader_uefi_layout_mod },
             },
         }),
     });

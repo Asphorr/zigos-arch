@@ -50,6 +50,12 @@ comptime {
 var entries: [256]Entry = undefined;
 var ptr: Ptr = undefined;
 
+/// Raw byte view of the IDT entries — for src/debug/cpu_struct_hash.zig
+/// (post-init integrity hashing). Read-only by convention.
+pub fn entriesBytes() []const u8 {
+    return @as([*]const u8, @ptrCast(&entries))[0..@sizeOf(@TypeOf(entries))];
+}
+
 fn setGate(num: u8, handler: usize, flags: u8) void {
     setGateIst(num, handler, flags, 0);
 }
@@ -1230,6 +1236,9 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
         // (hlt suppression). Samples PM_TMR once per real (non-soft-yield)
         // BSP timer tick; logs windows >15 ms.
         @import("../time/smi.zig").tick();
+        // S10 heartbeat — proves the trap checkers are actually running.
+        // Self-rate-limits to one log per ~60s.
+        @import("../debug/diag.zig").maybeHeartbeat(process.tick_count);
     }
 
     // Per-CPU tick — counted on EVERY IRQ0 (including soft yields) so the

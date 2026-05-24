@@ -641,6 +641,74 @@ fn validateHeapLocked() bool {
     return errors == 0;
 }
 
+/// Re-derive the heap's free-pool counters (free_bytes_remaining,
+/// free_block_count, largest_free_block) from a full block walk and
+/// verify they match the incrementally-maintained globals. Catches the
+/// class of bug where alloc/free arithmetic on the counters drifts from
+/// reality — silent until someone notices a weird number (e.g. the 2026-
+/// 05-24 TLSF double-count-on-coalesce that reported Free: 233546 KB on
+/// a 16 MB heap). Returns true if all invariants hold; logs detailed
+/// diff to serial otherwise.
+///
+/// Takes the heap lock — safe to call from anywhere outside the heap's
+/// own internal critical sections. Bounded O(blocks).
+pub fn validateInvariants() bool {
+    if (!initialized) return true;
+    const irq_flags = lock.acquireIrqSave();
+    defer lock.releaseIrqRestore(irq_flags);
+    return validateInvariantsLocked();
+}
+
+fn validateInvariantsLocked() bool {
+    var walked_free_bytes: u64 = 0;
+    var walked_free_blocks: u32 = 0;
+    var walked_largest: usize = 0;
+    var walked_alloc_bytes: u64 = 0;
+    var addr: usize = HEAP_START;
+    while (addr < HEAP_START + HEAP_SIZE) {
+        const sz = blockSize(addr);
+        if (sz < MIN_BLOCK_SIZE or addr + sz > HEAP_START + HEAP_SIZE) {
+            serial.print("[tlsf] inv: walk derailed at 0x{X:0>16} (sz={d}) — structural corruption, can't audit\n", .{ addr, sz });
+            return false;
+        }
+        if (blockIsFree(addr)) {
+            walked_free_bytes += sz;
+            walked_free_blocks += 1;
+            if (sz > walked_largest) walked_largest = sz;
+        } else {
+            walked_alloc_bytes += sz;
+        }
+        addr += sz;
+    }
+
+    var ok = true;
+    if (walked_free_bytes != free_bytes_remaining) {
+        serial.print("[tlsf] inv: free_bytes_remaining={d} but walk says {d} (delta={d})\n", .{ free_bytes_remaining, walked_free_bytes, @as(i64, @intCast(free_bytes_remaining)) - @as(i64, @intCast(walked_free_bytes)) });
+        ok = false;
+    }
+    if (walked_free_blocks != free_block_count) {
+        serial.print("[tlsf] inv: free_block_count={d} but walk says {d}\n", .{ free_block_count, walked_free_blocks });
+        ok = false;
+    }
+    if (walked_largest != largest_free_block) {
+        // largest_free_block is an upper bound between recomputes; only
+        // flag if the global is SMALLER than the actual max (i.e. lying
+        // about available space).
+        if (largest_free_block < walked_largest) {
+            serial.print("[tlsf] inv: largest_free_block={d} but walk found {d}\n", .{ largest_free_block, walked_largest });
+            ok = false;
+        }
+    }
+    // Cross-check: walked free + walked alloc must equal the whole heap
+    // (the sentinel wall block is counted in walked_alloc).
+    const total = walked_free_bytes + walked_alloc_bytes;
+    if (total != HEAP_SIZE) {
+        serial.print("[tlsf] inv: walked free+alloc={d} but heap size is {d}\n", .{ total, HEAP_SIZE });
+        ok = false;
+    }
+    return ok;
+}
+
 // === Stats output ===
 
 pub fn printDetailedStats(use_vga: bool) void {
@@ -677,6 +745,13 @@ pub fn printDetailedStats(use_vga: bool) void {
         } else {
             vga.fg = .LightRed;
             vga.print("  Integrity:    CORRUPTED (see serial)\n", .{});
+        }
+        if (validateInvariantsLocked()) {
+            vga.fg = .LightGreen;
+            vga.print("  Invariants:   OK\n", .{});
+        } else {
+            vga.fg = .LightRed;
+            vga.print("  Invariants:   MISMATCH (see serial)\n", .{});
         }
         vga.fg = .LightGray;
     } else {

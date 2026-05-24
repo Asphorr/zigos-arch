@@ -46,6 +46,12 @@ pub fn arm() void {
     serial.print("[watchdog] armed (interval={d} ticks, strikes={d})\n", .{ WATCHDOG_CHECK_INTERVAL, WATCHDOG_STRIKES });
 }
 
+/// Public read accessor — used by src/debug/diag.zig for the boot
+/// manifest. Cheap; reads a plain bool that's set once at arm().
+pub fn isArmed() bool {
+    return armed;
+}
+
 /// Called from each CPU's handleIRQ0 after its own tick is bumped. Cheap
 /// fast-path: most ticks return immediately on the modulo gate. The actual
 /// peer read fires once per second per CPU.

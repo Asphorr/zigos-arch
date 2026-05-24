@@ -377,6 +377,12 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     // downstream driver init.
     @import("debug/cpu_alias.zig").checkAtBoot();
     blog.ok("Cross-CPU alias audit");
+    // S7: snapshot GDT/IDT/TSS-of-every-alive-CPU FNV hash as the post-
+    // init baseline. From here forward `pcb_invariants` verifies the
+    // hash 1Hz; any wild write into the descriptor tables surfaces in
+    // O(1s) instead of as a #GP / #PF in unrelated code later.
+    @import("debug/cpu_struct_hash.zig").captureBaseline();
+    blog.ok("Descriptor-table hash baseline");
     // DR-watchpoint cross-CPU sync via IPI — must come AFTER smp.init()
     // (so cpu.alive[] is populated) and BEFORE any arm() that needs cross-CPU
     // semantics. See project_iretq_race_ipi_fix.md.
@@ -509,6 +515,10 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
         pmm.freeFrameCount() * 4 / 1024,
         @import("cpu/smp.zig").aliveCpuCount(),
     });
+    // S10: enumerate every trap-style diagnostic and whether it's
+    // armed in this build/session. Single grep-friendly line so log
+    // archaeology can ask "was kasan even on when this wedged?".
+    @import("debug/diag.zig").printManifest();
 
     // Audit the kernel's page-table mapping granularity. Surfaces TLB
     // working-set size and detects over-splitting (every 2 MB or 4 KB

@@ -27,6 +27,8 @@ const acpi = @import("acpi.zig");
 const apic = @import("apic.zig");
 const debug = @import("../debug/debug.zig");
 const io = @import("../io.zig");
+const exectrail = @import("../debug/exectrail.zig");
+const symbols = @import("../debug/symbols.zig");
 
 const PM_TMR_HZ: u64 = 3_579_545;
 const QUANTUM_MS: u64 = 10;
@@ -81,7 +83,15 @@ pub fn tick() void {
     // Rate limit: log at most once per second (every 100 BSP IRQ0s).
     if (sample_count - last_log_tick < 100) return;
     last_log_tick = sample_count;
-    debug.klog("[smi] stall: {d}us in last quantum (events={d}, max={d}us)\n", .{ us, stall_events, max_stall_us });
+    // Attribution: snapshot what cpu0 was doing at the PREVIOUS IRQ0 boundary.
+    // exectrail's head-1 holds that saved_rip because handleIRQ0 calls smi.tick()
+    // BEFORE exectrail.recordIrq() (see src/cpu/idt.zig:1232 vs :1258).
+    // Classification heuristic:
+    //   - syscall marker → kernel syscall path held cli (or schedule blocked)
+    //   - kernel RIP in idle's halt loop → likely host SMI (CPU was halted)
+    //   - kernel RIP elsewhere → kernel-cli-too-long
+    //   - user RIP (< 0x800000_0000_0000 and < kernel high half) → likely host SMI
+    classifyAndLog(us);
 }
 
 /// Wraparound-safe delta on the masked counter. Returns the number of PM
@@ -92,3 +102,43 @@ fn pmDelta(prev: u32, now: u32) u64 {
     // Wrapped: distance is (mask - prev) + now + 1.
     return (@as(u64, pm_tmr_mask) - prev) + now + 1;
 }
+
+const KERNEL_HIGH_HALF: u64 = 0xFFFF800000000000;
+
+fn classifyAndLog(us: u64) void {
+    const prev_rip_opt = exectrail.peekHeadMinusOne(0);
+    if (prev_rip_opt == null) {
+        debug.klog("[smi] stall: {d}us (events={d}, max={d}us) — no trail data\n", .{ us, stall_events, max_stall_us });
+        return;
+    }
+    const prev_rip = prev_rip_opt.?;
+
+    // Decode syscall marker (the PREVIOUS IRQ0 sampled CPU mid-syscall).
+    if (prev_rip >= exectrail.MARKER_BASE) {
+        const sys_num = prev_rip & 0xFFFF;
+        debug.klog("[smi] stall: {d}us — likely OURS (sc#{d} held cli) — events={d} max={d}us\n", .{ us, sys_num, stall_events, max_stall_us });
+        return;
+    }
+
+    // User-space RIP — IRQs were unmasked just before; stall is almost
+    // certainly host SMI (we can't hold cli in user mode).
+    if (prev_rip < KERNEL_HIGH_HALF) {
+        debug.klog("[smi] stall: {d}us — likely HOST (user RIP 0x{X:0>16}) — events={d} max={d}us\n", .{ us, prev_rip, stall_events, max_stall_us });
+        return;
+    }
+
+    // Kernel RIP — symbolize and let the caller judge. Idle/hlt path
+    // = host; anywhere else = us.
+    if (symbols.resolveKernel(prev_rip)) |r| {
+        const name = r.name;
+        // Heuristic: any "idle" symbol is the halt path → host-side.
+        const is_idle = std.mem.indexOf(u8, name, "idle") != null or
+            std.mem.indexOf(u8, name, "Idle") != null;
+        const verdict = if (is_idle) "likely HOST (kernel idle/hlt)" else "likely OURS (kernel held cli)";
+        debug.klog("[smi] stall: {d}us — {s} at {s}+0x{X} — events={d} max={d}us\n", .{ us, verdict, name, r.offset, stall_events, max_stall_us });
+    } else {
+        debug.klog("[smi] stall: {d}us — kernel RIP 0x{X:0>16} (unresolved) — events={d} max={d}us\n", .{ us, prev_rip, stall_events, max_stall_us });
+    }
+}
+
+const std = @import("std");

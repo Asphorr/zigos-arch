@@ -40,6 +40,59 @@ comptime {
     if (DRAIN_BATCH >= CACHE_SIZE) @compileError("DRAIN_BATCH must leave the cache non-empty");
 }
 
+// === S5: PMM frame canary (free→alloc tripwire) ===
+//
+// On every freeFrame we write a self-referencing canary at offset 0..16 of
+// the freed frame; on every allocFrame we check it before handing the
+// frame back. A mismatch means SOMEONE wrote to a freed frame — the
+// silent-corruption class that bit us today (FB zero-fill clobbering
+// PML4). Self-referencing (`phys ^ MAGIC` + ones-complement) means random
+// data is extremely unlikely to satisfy both 8-byte halves, and we don't
+// need a side-table to know "this frame was canaried."
+//
+// Logging only — no panic — because the very first allocations after
+// boot come from bitmap-direct frames that were never freed (so the
+// canary will mismatch benignly). After warm-up, mismatches at the same
+// `phys` indicate UAF; sporadic single mismatches are boot-frame
+// artifacts. The line includes the most-recent freer's caller_ra (from
+// the existing `kdbg` pmm event ring) so investigation has a target.
+const CANARY_PMM_MAGIC: u64 = 0x4646524545504D4D; // "FFREEPMM"
+var canary_enabled: bool = false;
+var canary_mismatch_count: u64 = 0;
+pub fn pmmCanaryMismatches() u64 {
+    return @atomicLoad(u64, &canary_mismatch_count, .monotonic);
+}
+
+inline fn pmmCanaryWrite(phys: usize) void {
+    const v: *[2]u64 = @ptrFromInt(@import("paging.zig").physToVirt(phys));
+    const lo = phys ^ CANARY_PMM_MAGIC;
+    v[0] = lo;
+    v[1] = ~lo;
+    // First-write latches the flag; after that, skip the redundant store.
+    if (!@atomicLoad(bool, &canary_enabled, .monotonic)) {
+        @atomicStore(bool, &canary_enabled, true, .release);
+    }
+}
+
+inline fn pmmCanaryCheck(phys: usize, callsite: []const u8, alloc_ra: usize) void {
+    if (!@atomicLoad(bool, &canary_enabled, .acquire)) return;
+    const v: *const [2]u64 = @ptrFromInt(@import("paging.zig").physToVirt(phys));
+    const want_lo = phys ^ CANARY_PMM_MAGIC;
+    const got_lo = v[0];
+    const got_hi = v[1];
+    if (got_lo != want_lo or got_hi != ~want_lo) {
+        _ = @atomicRmw(u64, &canary_mismatch_count, .Add, 1, .monotonic);
+        const serial = @import("../debug/serial.zig");
+        const symbols = @import("../debug/symbols.zig");
+        serial.print("[pmm-canary] mismatch at phys=0x{X:0>16} from {s} (got lo=0x{X:0>16} hi=0x{X:0>16}) — alloc caller=", .{ phys, callsite, got_lo, got_hi });
+        if (symbols.resolveKernel(alloc_ra)) |r| {
+            serial.print("{s}+0x{X}\n", .{ r.name, r.offset });
+        } else {
+            serial.print("0x{X}\n", .{alloc_ra});
+        }
+    }
+}
+
 // Local copies of the spinlock IRQ-save helpers. Duplicated rather than
 // imported because the per-CPU cache path doesn't take a lock — we need
 // just the IF gate, not the whole acquire+IF dance.
@@ -269,6 +322,7 @@ pub fn allocFrame() ?usize {
         const phys = cpu.pmm_cache[cpu.pmm_cache_count];
         checkPhysSafety(phys, "allocFrame(cache)");
         checkKstackOverlap(phys, 1, "allocFrame(cache)", ra);
+        pmmCanaryCheck(phys, "allocFrame(cache)", ra);
         @import("../debug/kdbg.zig").pmmAlloc(phys, 1, ra);
         @import("../debug/kasan.zig").unpoison(phys, FRAME_SIZE);
         frame_refs[phys / FRAME_SIZE] = 1;
@@ -291,6 +345,7 @@ pub fn allocFrame() ?usize {
 
     checkPhysSafety(first, "allocFrame");
     checkKstackOverlap(first, 1, "allocFrame", ra);
+    pmmCanaryCheck(first, "allocFrame(bitmap)", ra);
     @import("../debug/kdbg.zig").pmmAlloc(first, 1, ra);
     @import("../debug/kasan.zig").unpoison(first, FRAME_SIZE);
     frame_refs[first / FRAME_SIZE] = 1;
@@ -536,6 +591,9 @@ pub fn freeFrame(phys_addr: usize) void {
     checkPhysSafety(phys_addr, "freeFrame");
     @import("../debug/kdbg.zig").pmmFree(phys_addr, ra);
     @import("../debug/kasan.zig").poison(phys_addr, FRAME_SIZE, @import("../debug/kasan.zig").SHADOW_FREED);
+    // S5 canary: stamp self-referencing magic at offset 0. If anyone
+    // writes to this frame while it's free, the next alloc detects it.
+    pmmCanaryWrite(phys_addr);
 
     const irq_flags = saveAndDisableIrq();
     defer restoreIrq(irq_flags);

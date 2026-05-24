@@ -32,6 +32,12 @@ comptime {
 // 7 GDT entries: null, kcode, kdata, ucode, udata, tss_low, tss_high
 var entries: [7]u64 = undefined;
 
+/// Raw byte view of the GDT entries — for src/debug/cpu_struct_hash.zig
+/// (post-init integrity hashing). Read-only by convention.
+pub fn entriesBytes() []const u8 {
+    return @as([*]const u8, @ptrCast(&entries))[0..@sizeOf(@TypeOf(entries))];
+}
+
 // Hardware `lgdt m16:64` reads exactly limit (offset 0, 2 bytes) + base
 // (offset 2, 8 bytes). `packed` keeps `base` at byte offset 2; if a
 // refactor drops `packed`, Zig aligns u64 and `base` jumps to offset 8 —

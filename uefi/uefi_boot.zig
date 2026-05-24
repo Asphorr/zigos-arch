@@ -109,18 +109,16 @@ const Elf64Sym = extern struct {
 const SHT_SYMTAB: u32 = 2;
 const SHT_STRTAB: u32 = 3;
 
-// Fixed addresses for bootloader data. MUST live inside the region the
-// kernel reserves as `memmap.UEFI_PT_BASE..+UEFI_PT_SIZE` (256 KB) —
-// otherwise the kernel's PMM doesn't know these pages are in use and
-// some later allocator can hand them out. Shifted from 0x1C00000 →
-// 0x2A00000 on 2026-05-24 to track the heap bump 4 MB → 16 MB, which
-// pushed GUEST_FB into the old 0x1C00000-range and a 4 MB FB zero-fill
-// then clobbered the live PML4 (silent triple-fault during virtio-gpu
-// init). If memmap.zig regions shift again, this MUST move in lockstep.
-const PAGE_TABLES_ADDR: u64 = 0x2A00000; // PML4+PDPT+8xPD = 10 pages (0x2A00000-0x2A09FFF)
-const BOOT_INFO_ADDR: u64 = 0x2A30000; // After page tables (PML4+PDPT+34 PDs end at 0x2A24000)
-const MMAP_REGIONS_ADDR: u64 = 0x2A31000; // MemoryRegion array (64 entries × 20 bytes < 4KB)
-const BOOT_STACK_TOP: u64 = 0x2A40000; // Stack (pages below this, after BootInfo+mmap)
+// Bootloader-fixed addresses now come from `lib/uefi_layout.zig`, the
+// single source of truth shared with the kernel. memmap.zig comptime-
+// asserts that its UEFI_PT_BASE equals uefi_layout.PAGE_TABLES_ADDR;
+// any drift fails the build. See lib/uefi_layout.zig header for the
+// 2026-05-24 silent-corruption incident that motivated this.
+const uefi_layout = @import("uefi_layout");
+const PAGE_TABLES_ADDR: u64 = uefi_layout.PAGE_TABLES_ADDR;
+const BOOT_INFO_ADDR: u64 = uefi_layout.BOOT_INFO_ADDR;
+const MMAP_REGIONS_ADDR: u64 = uefi_layout.MMAP_REGIONS_ADDR;
+const BOOT_STACK_TOP: u64 = uefi_layout.BOOT_STACK_TOP;
 
 // Output to serial COM1 (0x3F8) for debug — works before and after ExitBootServices
 fn serialPut(c: u8) void {

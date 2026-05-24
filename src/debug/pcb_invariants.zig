@@ -228,6 +228,11 @@ fn checkPcb(pid: usize) ?[]const u8 {
 /// handleIRQ0 (cli is held). Returns the count of violations found (0 on
 /// pass — the panic path doesn't return).
 pub fn scan() void {
+    // S7: GDT/IDT/TSS post-init hash verification. Re-derive FNV hash and
+    // compare to the baseline captured at end of smp.init. ~5 KB to hash,
+    // microseconds; lifecycle is decoupled from PCB scan but the cadence
+    // is the same so we piggyback rather than wiring a second timer.
+    _ = @import("cpu_struct_hash.zig").verify();
     for (0..config.MAX_PROCS) |pid| {
         const failure = checkPcb(pid) orelse continue;
         // Latch the one-shot flag so subsequent ticks don't re-fire.

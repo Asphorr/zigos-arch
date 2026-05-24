@@ -92,14 +92,20 @@ pub const USER_VA_FLOOR: usize = 0x500000;
 // future BSS growth doesn't require chasing this constant again.
 // Downstream regions are *derived* so a future bump only touches
 // KERNEL_HEAP_BASE here.
-pub const KERNEL_HEAP_BASE: usize = 0xA00000;
-pub const KERNEL_HEAP_SIZE: usize = 0x1000000; // 16 MB (TLSF: bumped from 4 MB 2026-05-24)
+// Cross-unit layout constants live in lib/uefi_layout.zig — both kernel
+// and UEFI bootloader import from there. The comptime block at the
+// bottom of this file enforces agreement; if the values diverge, build
+// fails loudly (see lib/uefi_layout.zig header for the bug-class history).
+const uefi_layout = @import("uefi_layout");
 
-pub const GUEST_FB_BASE: usize = KERNEL_HEAP_BASE + KERNEL_HEAP_SIZE; // 0xE00000
-pub const GUEST_FB_SIZE: usize = 0x800000; // 8 MB
+pub const KERNEL_HEAP_BASE: usize = uefi_layout.KERNEL_HEAP_BASE;
+pub const KERNEL_HEAP_SIZE: usize = uefi_layout.KERNEL_HEAP_SIZE;
 
-pub const BACK_BUFFER_BASE: usize = GUEST_FB_BASE + GUEST_FB_SIZE; // 0x1600000
-pub const BACK_BUFFER_SIZE: usize = 0x800000; // 8 MB
+pub const GUEST_FB_BASE: usize = uefi_layout.GUEST_FB_BASE;
+pub const GUEST_FB_SIZE: usize = uefi_layout.GUEST_FB_SIZE;
+
+pub const BACK_BUFFER_BASE: usize = uefi_layout.BACK_BUFFER_BASE;
+pub const BACK_BUFFER_SIZE: usize = uefi_layout.BACK_BUFFER_SIZE;
 
 // UEFI page tables (PML4/PDPT/PDs that map our 64 GB identity range with
 // 1 GB pages). Set up by uefi/uefi_boot.zig before kmain_uefi runs and
@@ -109,8 +115,21 @@ pub const BACK_BUFFER_SIZE: usize = 0x800000; // 8 MB
 // Without the reservation, kasan.init's 32 MB shadow allocContiguous
 // happily lands here, the @memset overwrites the page tables, the next
 // memory access hits a wild CR3, and the kernel halts silently.
-pub const UEFI_PT_BASE: usize = BACK_BUFFER_BASE + BACK_BUFFER_SIZE; // 0x1E00000
-pub const UEFI_PT_SIZE: usize = 0x40000; // 256 KB
+pub const UEFI_PT_BASE: usize = uefi_layout.UEFI_PT_BASE;
+pub const UEFI_PT_SIZE: usize = uefi_layout.UEFI_PT_SIZE;
+
+// Defense-in-depth: re-verify the bootloader's fixed addresses fit in
+// UEFI_PT_BASE..+UEFI_PT_SIZE from THIS side too. uefi_layout.zig already
+// asserts the same, but a future refactor could split the module — keep
+// the check here so memmap is self-defending.
+comptime {
+    if (uefi_layout.PAGE_TABLES_ADDR != UEFI_PT_BASE) {
+        @compileError("uefi_layout.PAGE_TABLES_ADDR drifted from memmap.UEFI_PT_BASE — both must update in lockstep");
+    }
+    if (uefi_layout.BOOT_STACK_TOP > UEFI_PT_BASE + UEFI_PT_SIZE) {
+        @compileError("UEFI bootloader fixed addresses overflow UEFI_PT region");
+    }
+}
 
 // GUI framebuffers are PMM-allocated per window now (sysCreateWindow).
 // Only the per-window size cap remains.

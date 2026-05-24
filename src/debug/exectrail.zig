@@ -65,6 +65,24 @@ pub fn recordSyscall(sys_num: u32) void {
     trail_head[cpu_id] = (head + 1) % TRAIL_ENTRIES;
 }
 
+/// Peek at the most-recent recorded entry for `cpu_id`. Returns the
+/// saved RIP (or syscall marker) — caller can decode marker bits via
+/// MARKER_BASE / MARKER_SYSCALL_BIT. Returns null if the ring is empty
+/// or cpu_id is out of range.
+///
+/// Used by smi.tick() classification: at SMI-tick time the head-1 entry
+/// holds the saved_rip from the PREVIOUS IRQ0 (this tick's recordIrq
+/// hasn't run yet — see idt.zig ordering), which tells us whether the
+/// CPU was in user code, idle, or kernel work during the stall gap.
+pub fn peekHeadMinusOne(cpu_id: u8) ?u64 {
+    if (cpu_id >= smp.MAX_CPUS) return null;
+    const head = trail_head[cpu_id];
+    const idx = (head + TRAIL_ENTRIES - 1) % TRAIL_ENTRIES;
+    const e = trails[cpu_id][idx];
+    if (e.tsc == 0) return null;
+    return e.rip;
+}
+
 /// Dump the last `n` entries of `cpu_id`'s ring, newest first. Used by
 /// crash / watchdog autopsy. Cap n at TRAIL_ENTRIES.
 pub fn dump(cpu_id: u8, n: u8) void {
