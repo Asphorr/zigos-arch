@@ -109,6 +109,31 @@ inline fn pmmCanaryCheck(phys: usize, callsite: []const u8, alloc_ra: usize) voi
         } else {
             serial.print("0x{X}\n", .{alloc_ra});
         }
+        // Walk the kdbg pmm_free_ring backwards (most-recent first) and
+        // print the latest freer-RA for this phys. Tells us WHICH path freed
+        // the frame whose contents now mismatch the canary — the missing
+        // half of the UAF triangulation. Bounded scan, called only at the
+        // moment of mismatch so cost is irrelevant.
+        const kdbg = @import("../debug/kdbg.zig");
+        const ring = &kdbg.pmm_free_ring;
+        const n = ring.count();
+        var found: bool = false;
+        var idx: usize = n;
+        while (idx > 0) {
+            idx -= 1;
+            const ev = ring.at(idx);
+            if (ev.phys == phys) {
+                serial.print("[pmm-canary]   last freer for this phys=", .{});
+                if (symbols.resolveKernel(ev.caller_ra)) |r| {
+                    serial.print("{s}+0x{X}\n", .{ r.name, r.offset });
+                } else {
+                    serial.print("0x{X}\n", .{ev.caller_ra});
+                }
+                found = true;
+                break;
+            }
+        }
+        if (!found) serial.print("[pmm-canary]   no freer event in ring for this phys (rotated out)\n", .{});
     }
 }
 
