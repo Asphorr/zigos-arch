@@ -63,18 +63,18 @@ const SLOW_SHOOTDOWN_THRESHOLD_CYC: u64 = 2_500_000;
 /// `handleTlbShootdown`, which lives in this file.
 pub const TLB_VECTOR: u8 = 0x50;
 
-/// Outstanding shootdown ack from each CPU. Sender increments the slot
-/// for each target before broadcasting; target's IPI handler decrements
-/// its own slot on completion. Sender spin-waits until all slots == 0.
-/// Serialized externally by `shootdown_lock` so a sender's pre-broadcast
-/// count never races with a concurrent sender's increment.
+/// (a) Outstanding shootdown ack from each CPU. Sender does `fetchAdd(.acq_rel)`
+/// for each target before broadcasting; target's IPI handler `fetchSub(.acq_rel)`
+/// on completion; sender's wait loop `load(.acquire)`. Serialized externally
+/// by `shootdown_lock` so a sender's pre-broadcast count never races with a
+/// concurrent sender's increment.
 var ack_pending: [smp.MAX_CPUS]std.atomic.Value(u32) = blk: {
     var arr: [smp.MAX_CPUS]std.atomic.Value(u32) = undefined;
     for (&arr) |*v| v.* = std.atomic.Value(u32).init(0);
     break :blk arr;
 };
 
-/// Global serialization. Only one shootdown can be broadcast-and-awaited at
+/// (a) Global serialization. Only one shootdown can be broadcast-and-awaited at
 /// a time. Without it, two concurrent senders both decrementing the same
 /// target's slot would cause one to observe ack_pending==0 prematurely and
 /// proceed to free the underlying frame while the other CPU still holds a
@@ -83,31 +83,36 @@ var ack_pending: [smp.MAX_CPUS]std.atomic.Value(u32) = blk: {
 var shootdown_lock: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
 
 /// Shootdown mode + parameters. Set by the sender under `shootdown_lock`
-/// before broadcasting; read by `handleTlbShootdown` on each target.
-/// Safe without per-field atomics because the lock serializes one
-/// shootdown at a time, and the IPI handlers complete (and ack) before
-/// the lock is released.
+/// before broadcasting; read by `handleTlbShootdown` on each target. The
+/// lock serializes one shootdown at a time, but does NOT by itself drain
+/// the sender's store buffer before the IPI fires — see the explicit
+/// `@fence(.seq_cst)` in `doShootdown` between publishing stores and
+/// `apic.sendIPI`. x2APIC's `wrmsr 0x830` is NOT a serializing instruction
+/// (SDM Vol 3A §10.12.3) so the fence is load-bearing on every modern host
+/// (Hyper-V, KVM, SNB+ where x2apic is active). xAPIC's MMIO path drains
+/// implicitly via UC ordering, but x2APIC supplants it on modern hardware.
 const Mode = enum(u32) {
     full = 0,
     single_context = 1,
     single_page = 2,
 };
-var current_mode: Mode = .full;
-var current_pcid: u16 = 0;
-var current_va: u64 = 0;
+var current_mode: Mode = .full;  // (p:shootdown_lock) publisher-fenced before IPI broadcast
+var current_pcid: u16 = 0;       // (p:shootdown_lock) publisher-fenced before IPI broadcast
+var current_va: u64 = 0;         // (p:shootdown_lock) publisher-fenced before IPI broadcast
 
-// Telemetry — surfaces in `[slow-tlb]` lines + can be read by sysmon later.
-pub var n_shootdowns_full: u64 = 0;
-pub var n_shootdowns_context: u64 = 0;
-pub var n_shootdowns_page: u64 = 0;
-pub var n_shootdowns_via_hypercall: u64 = 0;
-/// Count of alive peer CPUs that were SKIPPED by the cpumask narrowing
-/// (i.e., the IPI we did NOT have to send). Effectiveness signal for the
-/// per-mm cpumask optimization: high values mean the narrowing is paying
-/// off; near-zero means most processes touch every CPU and the mask isn't
-/// helping (and the bitmap maintenance is pure overhead). Accumulated only
-/// on IPI-path shootdowns (skipped on hypercall path).
-pub var n_shootdowns_cpumask_skipped: u64 = 0;
+// Telemetry — surfaces in `[slow-tlb]` lines + readable by sysmon. All bumped
+// from multi-CPU senders, so atomic-RMW only (never plain `+=` / `+%=`).
+pub var n_shootdowns_full: u64 = 0;            // (a)
+pub var n_shootdowns_context: u64 = 0;         // (a)
+pub var n_shootdowns_page: u64 = 0;            // (a)
+pub var n_shootdowns_via_hypercall: u64 = 0;   // (a)
+/// (a) Count of skipped peer-CPU slots (NOT shootdown events) due to the
+/// per-mm cpumask narrowing. A 32-CPU host where every shootdown narrows
+/// down to 2 targets would accumulate ~30 per shootdown. High values mean
+/// the narrowing is paying off; near-zero means most processes touch every
+/// CPU and the mask isn't helping. Accumulated only on IPI-path shootdowns
+/// (skipped on hypercall path).
+pub var n_shootdowns_cpumask_skipped: u64 = 0; // (a)
 
 inline fn flushLocalTlb() void {
     asm volatile (
@@ -203,6 +208,11 @@ pub export fn handleTlbShootdown() callconv(.c) void {
     const me_full = apic.getLapicId();
     if (me_full < smp.MAX_CPUS) {
         _ = ack_pending[me_full].fetchSub(1, .acq_rel);
+    } else {
+        // Should be impossible — smp.init filters MADT entries with apic_id
+        // >= MAX_CPUS. If we ever get here the sender will spin forever
+        // waiting for this CPU's ack; surface the diagnostic.
+        debug.kwarn(@src(), "IPI on CPU with lapic_id={d} >= MAX_CPUS; sender will hang", .{me_full});
     }
     apic.eoi();
 }
@@ -213,6 +223,12 @@ pub export fn handleTlbShootdown() callconv(.c) void {
 /// (single_page).
 fn doShootdown(mode: Mode, affected_pcid: u16, va: u64) void {
     const me_full = apic.getLapicId();
+    if (me_full >= smp.MAX_CPUS) {
+        // Cannot recover safely: the `else 0` fallback below would make us
+        // self-IPI cpu 0 and double-flush an unrelated slot. smp.init should
+        // have rejected this MADT entry; surface the diagnostic before the wedge.
+        debug.kwarn(@src(), "doShootdown sender lapic_id={d} >= MAX_CPUS; treating as cpu 0", .{me_full});
+    }
     const me: u8 = if (me_full < smp.MAX_CPUS) @intCast(me_full) else 0;
     const t_enter = perf.rdtsc();
 
@@ -224,10 +240,17 @@ fn doShootdown(mode: Mode, affected_pcid: u16, va: u64) void {
     // IPIs to us, we'd deadlock — peer waits forever for our IPI ack, we
     // can't service the IPI because IF=0. Snapshot caller's IF; if it was
     // off, temporarily sti while spinning, then cli before publishing mode
-    // (the rest of the critical section runs at caller's IF state). Servicing
-    // an inbound shootdown IPI while we're spinning is safe: handleTlbShootdown
-    // just flushes our local TLB + decrements our ack slot + EOI. No locks
-    // touched.
+    // (the rest of the critical section runs at caller's IF state).
+    //
+    // Re-entry safety contract for the sti'd window: servicing an inbound
+    // shootdown IPI is safe (handleTlbShootdown just flushes our local TLB
+    // + decrements our ack slot + EOI; no locks touched). But ANY OTHER
+    // vector firing here re-enters kernel paths the caller didn't expect —
+    // LAPIC timer (-> schedule), MSI-X disk IRQ, dynirq, NMI watchdog.
+    // Known-safe callers entering with IF=0: #PF handler (sti's before this
+    // point on its own; see fault.zig:464-466), exception dispatch, swap
+    // eviction's CAS-restore back-path. Any NEW caller entering with IF=0
+    // MUST audit re-entry safety for those other vectors firing mid-spin.
     const caller_if = readIf();
     if (!caller_if) asm volatile ("sti");
     while (shootdown_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) pause();
@@ -235,10 +258,17 @@ fn doShootdown(mode: Mode, affected_pcid: u16, va: u64) void {
     const t_locked = perf.rdtsc();
 
     // Publish mode under the lock so peer handlers see a consistent
-    // (mode, pcid, va) triple.
+    // (mode, pcid, va) triple. The seq_cst fence drains the store buffer
+    // before x2APIC IPI delivery — `wrmsr 0x830` is NOT a serializing
+    // instruction (SDM Vol 3A §10.12.3), so without the fence a peer IPI
+    // handler could observe stale values from a previous shootdown that's
+    // already lock-released. xAPIC's MMIO path drains implicitly via UC
+    // ordering, but x2APIC is active on every modern host (Hyper-V, KVM,
+    // SNB+) so this is load-bearing in practice.
     current_mode = mode;
     current_pcid = affected_pcid;
     current_va = va;
+    asm volatile ("mfence" ::: .{ .memory = true });
 
     // Hyper-V fast path: HvCallFlushVirtualAddressSpace flushes all VPs
     // (including self) for the given address space in one hypercall —
@@ -261,7 +291,7 @@ fn doShootdown(mode: Mode, affected_pcid: u16, va: u64) void {
         );
         if (hyperv.flushAllProcessors(cr3)) {
             via_hypercall = true;
-            n_shootdowns_via_hypercall +%= 1;
+            _ = @atomicRmw(u64, &n_shootdowns_via_hypercall, .Add, 1, .monotonic);
         }
     }
 
@@ -282,10 +312,21 @@ fn doShootdown(mode: Mode, affected_pcid: u16, va: u64) void {
         else
             ~@as(u32, 0);
         var n_skipped: u32 = 0;
+        // Record the exact set of CPUs we bumped ack_pending for. The
+        // broadcast + wait loops then iterate THIS local snapshot rather
+        // than re-reading (alive, target_mask) — independent of any
+        // concurrent mutation in pcid_cpumask. Today the mask is
+        // monotonic-grow during a shootdown so re-reading would also be
+        // correct, but the planned "eager clear on context-switch-out"
+        // optimization (pcid.zig TODO) would let bits clear mid-shootdown
+        // and silently break the wait loop: we'd skip waiting for a CPU
+        // we incremented for, leaking the increment so the next sender
+        // either spins forever on its slot or observes ack_pending==0
+        // prematurely. Tracking inflight_mask locally closes that hole
+        // structurally. Skip self — sender does its own flush at the end
+        // without bouncing through an IPI.
+        var inflight_mask: u32 = 0;
         var i: u8 = 0;
-        // Bump ack-pending for each live target. Skip self — sender does
-        // its own flush at the end without bouncing through an IPI. Skip CPUs
-        // not in the target mask — they have no entries for this PCID.
         while (i < smp.MAX_CPUS) : (i += 1) {
             if (i == me) continue;
             if (!smp.cpus[i].alive) continue;
@@ -293,20 +334,20 @@ fn doShootdown(mode: Mode, affected_pcid: u16, va: u64) void {
                 n_skipped += 1;
                 continue;
             }
+            inflight_mask |= (@as(u32, 1) << @as(u5, @intCast(i)));
             _ = ack_pending[i].fetchAdd(1, .acq_rel);
             n_targets += 1;
         }
-        n_shootdowns_cpumask_skipped +%= n_skipped;
+        _ = @atomicRmw(u64, &n_shootdowns_cpumask_skipped, .Add, n_skipped, .monotonic);
 
         if (n_targets > 0) {
-            // Broadcast. icrSend doesn't have an "all-except-self" shorthand
-            // wired up, so unicast-loop targeting each live CPU's LAPIC ID.
-            // Tiny cost (~10 ICR writes max with MAX_CPUS=32).
+            // Broadcast — iterate the local inflight_mask snapshot. Tiny cost
+            // (~10 ICR writes max with MAX_CPUS=32). icrSend doesn't have an
+            // "all-except-self" shorthand wired up, so unicast-loop targeting
+            // each LAPIC ID we incremented for.
             i = 0;
             while (i < smp.MAX_CPUS) : (i += 1) {
-                if (i == me) continue;
-                if (!smp.cpus[i].alive) continue;
-                if ((target_mask & (@as(u32, 1) << @as(u5, @intCast(i)))) == 0) continue;
+                if ((inflight_mask & (@as(u32, 1) << @as(u5, @intCast(i)))) == 0) continue;
                 apic.sendIPI(i, TLB_VECTOR);
             }
 
@@ -316,9 +357,7 @@ fn doShootdown(mode: Mode, affected_pcid: u16, va: u64) void {
             // unless something is wedged (in which case the watchdog catches it).
             i = 0;
             while (i < smp.MAX_CPUS) : (i += 1) {
-                if (i == me) continue;
-                if (!smp.cpus[i].alive) continue;
-                if ((target_mask & (@as(u32, 1) << @as(u5, @intCast(i)))) == 0) continue;
+                if ((inflight_mask & (@as(u32, 1) << @as(u5, @intCast(i)))) == 0) continue;
                 while (ack_pending[i].load(.acquire) != 0) pause();
             }
         }
@@ -360,9 +399,9 @@ fn doShootdown(mode: Mode, affected_pcid: u16, va: u64) void {
     }
 
     switch (mode) {
-        .full => n_shootdowns_full +%= 1,
-        .single_context => n_shootdowns_context +%= 1,
-        .single_page => n_shootdowns_page +%= 1,
+        .full => _ = @atomicRmw(u64, &n_shootdowns_full, .Add, 1, .monotonic),
+        .single_context => _ = @atomicRmw(u64, &n_shootdowns_context, .Add, 1, .monotonic),
+        .single_page => _ = @atomicRmw(u64, &n_shootdowns_page, .Add, 1, .monotonic),
     }
 
     shootdown_lock.store(0, .release);
@@ -409,6 +448,12 @@ pub fn shootdownPage(affected_pcid: u16, va: u64) void {
         // CPU has the affected PCID loaded, which we can't guarantee.)
         shootdownAll(affected_pcid);
         return;
+    }
+    if (va & 0xFFF != 0) {
+        // Caller passed a non-aligned VA. We mask it down to a page
+        // boundary below, but the caller's PTE mutation may have been
+        // at a different VA — masking the wrong bug. Surface it.
+        debug.kwarn(@src(), "shootdownPage va=0x{X} not page-aligned", .{va});
     }
     doShootdown(.single_page, affected_pcid, va & ~@as(u64, 0xFFF));
 }

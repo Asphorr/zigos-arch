@@ -34,45 +34,49 @@ const SECTORS_PER_PAGE: u32 = 8; // 4096 / 512
 const SWAP_BYTES: usize = 128 * 1024 * 1024;
 const NUM_SLOTS: usize = SWAP_BYTES / PAGE_SIZE; // 32768
 
-pub var available: bool = false;
-var slot_used: [NUM_SLOTS / 8]u8 = [_]u8{0} ** (NUM_SLOTS / 8);
-var used_count: usize = 0;
-var next_scan: usize = 0; // round-robin hint for allocSlot
-// Guards the slot bitmap. Phase 2's evict / swap-in run in the page-fault
-// handler on any CPU, so allocSlot/freeSlot must be serialized. NVMe I/O is
-// done OUTSIDE this lock (no I/O is held under it).
+pub var available: bool = false;                                // (c) set in init() on swap-NVMe present; RO afterwards
+var slot_used: [NUM_SLOTS / 8]u8 = [_]u8{0} ** (NUM_SLOTS / 8); // (p:slot_lock) free-slot bitmap
+var used_count: usize = 0;                                       // (a) bumped by alloc/freeSlot; consumers may read outside slot_lock
+var next_scan: usize = 0;                                        // (p:slot_lock) round-robin hint for allocSlot
+// Guards slot_used + next_scan. Evict / swap-in run in the page-fault handler
+// on any CPU, so allocSlot/freeSlot must be serialized. NVMe I/O is done
+// OUTSIDE this lock (no I/O is held under it).
 var slot_lock: SpinLock = .{};
 
-// Stats (Phase 2/3 will bump these).
-pub var pages_out: u64 = 0; // pages written to swap (evictions)
-pub var pages_in: u64 = 0; // pages read back (swap-ins)
-pub var pages_second_chance: u64 = 0; // candidates spared by the clock (A bit set) — bumped by reclaimViaSwap
-pub var pages_discarded: u64 = 0; // clean file-backed pages dropped without swap I/O — re-faulted from source
+// Stats. All bumped from multi-CPU evict/swap-in/discard/reclaim — atomic RMW
+// only, never plain `+=`. Milestone klog lines use the fetchAdd return value so
+// the "every 4096th" trigger is per-callsite stable.
+pub var pages_out: u64 = 0;            // (a) eviction counter; multi-CPU
+pub var pages_in: u64 = 0;             // (a) swap-in counter; multi-CPU
+pub var pages_second_chance: u64 = 0;  // (a) clock skips; bumped from fault.zig reclaimViaSwap
+pub var pages_discarded: u64 = 0;      // (a) discardFrame counter; multi-CPU
 
 inline fn bitGet(slot: usize) bool {
+    slot_lock.assertHeld();
     return (slot_used[slot >> 3] & (@as(u8, 1) << @as(u3, @intCast(slot & 7)))) != 0;
 }
 inline fn bitSet(slot: usize) void {
+    slot_lock.assertHeld();
     slot_used[slot >> 3] |= (@as(u8, 1) << @as(u3, @intCast(slot & 7)));
 }
 inline fn bitClear(slot: usize) void {
+    slot_lock.assertHeld();
     slot_used[slot >> 3] &= ~(@as(u8, 1) << @as(u3, @intCast(slot & 7)));
 }
 
 /// Reserve a free swap slot. Returns its index, or null if swap is full or
-/// unavailable. (Not yet locked — Phase 1's only caller is the boot self-test;
-/// Phase 2 adds a lock when the page-fault path calls this concurrently.)
+/// unavailable. Locking: acquires `slot_lock` internally.
 pub fn allocSlot() ?u32 {
     if (!available) return null;
     slot_lock.acquire();
     defer slot_lock.release();
-    if (used_count >= NUM_SLOTS) return null;
+    if (@atomicLoad(usize, &used_count, .monotonic) >= NUM_SLOTS) return null;
     var scanned: usize = 0;
     var s = next_scan;
     while (scanned < NUM_SLOTS) : (scanned += 1) {
         if (!bitGet(s)) {
             bitSet(s);
-            used_count += 1;
+            _ = @atomicRmw(usize, &used_count, .Add, 1, .monotonic);
             next_scan = (s + 1) % NUM_SLOTS;
             return @intCast(s);
         }
@@ -82,25 +86,36 @@ pub fn allocSlot() ?u32 {
 }
 
 /// Release a swap slot (after its page was read back in, or its owner died).
+/// Locking: acquires `slot_lock` internally. Out-of-range and double-free
+/// paths warn via `kwarn` so a caller's bookkeeping bug is observable rather
+/// than silently absorbed (mtswap-style stress would otherwise hide drift).
 pub fn freeSlot(slot: u32) void {
-    if (slot >= NUM_SLOTS) return;
+    if (slot >= NUM_SLOTS) {
+        debug.kwarn(@src(), "freeSlot out-of-range slot={d} NUM_SLOTS={d}", .{ slot, NUM_SLOTS });
+        return;
+    }
     slot_lock.acquire();
     defer slot_lock.release();
-    if (!bitGet(slot)) return; // double-free guard
+    if (!bitGet(slot)) {
+        debug.kwarn(@src(), "freeSlot double-free slot={d}", .{slot});
+        return;
+    }
     bitClear(slot);
-    used_count -= 1;
+    _ = @atomicRmw(usize, &used_count, .Sub, 1, .monotonic);
 }
 
 /// Write a 4 KiB physical frame out to swap slot `slot`. `frame_phys` is a
 /// PMM frame's physical address. Returns false if swap is unavailable or the
-/// NVMe write reports failure.
+/// NVMe write reports failure. Locking: holds no kernel lock; may block on
+/// async NVMe completion.
 pub fn writePage(slot: u32, frame_phys: usize) bool {
     if (!available or slot >= NUM_SLOTS) return false;
     const va = paging.physToVirt(frame_phys);
     return nvme.writeSectorsOn(SWAP_CTRL_IDX, slot * SECTORS_PER_PAGE, SECTORS_PER_PAGE, @ptrFromInt(va));
 }
 
-/// Read swap slot `slot` back into a 4 KiB physical frame.
+/// Read swap slot `slot` back into a 4 KiB physical frame. Locking: same as
+/// `writePage`.
 pub fn readPage(slot: u32, frame_phys: usize) bool {
     if (!available or slot >= NUM_SLOTS) return false;
     const va = paging.physToVirt(frame_phys);
@@ -108,7 +123,7 @@ pub fn readPage(slot: u32, frame_phys: usize) bool {
 }
 
 pub fn slotsUsed() usize {
-    return used_count;
+    return @atomicLoad(usize, &used_count, .monotonic);
 }
 pub fn slotsTotal() usize {
     return NUM_SLOTS;
@@ -216,6 +231,17 @@ const SWAPPED: u64 = 1 << 10;
 const SWAP_INFLIGHT: u64 = 1 << 11;
 const SLOT_SHIFT: u6 = 12;
 
+// Bits needed to encode every slot index, derived from NUM_SLOTS so the mask
+// can't silently lag a future capacity bump (would lop off high slot bits and
+// silently corrupt swap-in). Asserted to stay inside the architectural 52-bit
+// physical-address field, since the SWAPPED PTE encoding lives there.
+const SLOT_BITS: u6 = @intCast(@bitSizeOf(usize) - @clz(@as(usize, NUM_SLOTS - 1)));
+const SLOT_MASK: u64 = (@as(u64, 1) << SLOT_BITS) - 1;
+comptime {
+    @import("std").debug.assert(SLOT_SHIFT + SLOT_BITS <= 52);
+    @import("std").debug.assert((@as(usize, 1) << SLOT_BITS) >= NUM_SLOTS);
+}
+
 inline fn makeSwapPte(slot: u32) u64 {
     return (@as(u64, slot) << SLOT_SHIFT) | SWAPPED;
 }
@@ -252,7 +278,7 @@ pub inline fn evictWaitTarget(pte_ptr: *const u64) u32 {
 }
 
 inline fn pteSlot(pte: u64) u32 {
-    return @intCast((pte >> SLOT_SHIFT) & 0xF_FFFF); // 20-bit field covers all NUM_SLOTS
+    return @intCast((pte >> SLOT_SHIFT) & SLOT_MASK);
 }
 
 /// Race-aware teardown for non-PRESENT PTEs. CAS-claims the PTE to 0 and
@@ -314,7 +340,10 @@ pub fn teardownNonPresent(pte_ptr: *u64) bool {
 ///     PRESENT-branch) wiped the PTE and already freed the frame. freeSlot,
 ///     wake waiters, return false — no freeFrame here.
 pub fn evictFrame(pte_ptr: *u64, va: usize, pcid: u16) bool {
-    const original = pte_ptr.*;
+    // Non-atomic snapshot is fine because the CAS below rejects a stale
+    // sample, but promote to atomicLoad for consistency with the sibling
+    // @atomicLoad sites in teardownNonPresent / swapInFrame's CAS-loss path.
+    const original = @atomicLoad(u64, pte_ptr, .acquire);
     if ((original & paging.PRESENT) == 0) return false; // nothing present to evict
     const frame = original & paging.PAGE_MASK;
     // [mtswap-trace] gated to stress-test pids (current_pid >= 4). evictFrame
@@ -396,9 +425,16 @@ pub fn evictFrame(pte_ptr: *u64, va: usize, pcid: u16) bool {
     pmm.freeFrame(frame);
     wakeSwapEvictWaiters(evictWaitTarget(pte_ptr));
     if (etrace) debug.klog("[mtswap-trace] pid={d} cpu{d} evict_done slot={d}\n", .{ evict_pid, ecpu, slot });
-    pages_out += 1;
-    if (pages_out == 1 or pages_out % 4096 == 0)
-        debug.klog("[swap] out={d} in={d} sc={d} dc={d} slots={d}/{d}\n", .{ pages_out, pages_in, pages_second_chance, pages_discarded, used_count, NUM_SLOTS });
+    const out = @atomicRmw(u64, &pages_out, .Add, 1, .monotonic) + 1;
+    if (out == 1 or out % 4096 == 0)
+        debug.klog("[swap] out={d} in={d} sc={d} dc={d} slots={d}/{d}\n", .{
+            out,
+            @atomicLoad(u64, &pages_in, .monotonic),
+            @atomicLoad(u64, &pages_second_chance, .monotonic),
+            @atomicLoad(u64, &pages_discarded, .monotonic),
+            @atomicLoad(usize, &used_count, .monotonic),
+            NUM_SLOTS,
+        });
     return true;
 }
 
@@ -424,7 +460,7 @@ fn wakeSwapEvictWaiters(target: u32) void {
 /// DIRTY is set the page has user modifications and MUST go through
 /// `evictFrame` (preserve via swap) instead of being discarded.
 pub fn discardFrame(pte_ptr: *u64, va: usize, pcid: u16) bool {
-    const original = pte_ptr.*;
+    const original = @atomicLoad(u64, pte_ptr, .acquire);
     if ((original & paging.PRESENT) == 0) return false;
     const frame = original & paging.PAGE_MASK;
     if (pmm.frameRefCount(frame) != 1) return false;
@@ -437,9 +473,16 @@ pub fn discardFrame(pte_ptr: *u64, va: usize, pcid: u16) bool {
     }
     tlb.shootdownPage(pcid, va);
     pmm.freeFrame(frame);
-    pages_discarded +%= 1;
-    if (pages_discarded == 1 or pages_discarded % 4096 == 0)
-        debug.klog("[swap] out={d} in={d} sc={d} dc={d} slots={d}/{d}\n", .{ pages_out, pages_in, pages_second_chance, pages_discarded, used_count, NUM_SLOTS });
+    const dc = @atomicRmw(u64, &pages_discarded, .Add, 1, .monotonic) + 1;
+    if (dc == 1 or dc % 4096 == 0)
+        debug.klog("[swap] out={d} in={d} sc={d} dc={d} slots={d}/{d}\n", .{
+            @atomicLoad(u64, &pages_out, .monotonic),
+            @atomicLoad(u64, &pages_in, .monotonic),
+            @atomicLoad(u64, &pages_second_chance, .monotonic),
+            dc,
+            @atomicLoad(usize, &used_count, .monotonic),
+            NUM_SLOTS,
+        });
     return true;
 }
 
@@ -450,7 +493,7 @@ pub fn discardFrame(pte_ptr: *u64, va: usize, pcid: u16) bool {
 /// (PTE untouched, slot retained) if no frame is available or the read fails —
 /// the caller should free a frame (evict) and retry, or fall through.
 pub fn swapInFrame(pte_ptr: *u64, va: usize, flags: u64, pcid: u16) bool {
-    const original = pte_ptr.*;
+    const original = @atomicLoad(u64, pte_ptr, .acquire);
     if (!pteIsSwapped(original)) {
         // Race-with-winner: between trySwapInPage's pteIsSwapped check
         // and our re-read here, another thread completed the swap-in
@@ -524,8 +567,15 @@ pub fn swapInFrame(pte_ptr: *u64, va: usize, flags: u64, pcid: u16) bool {
     if (cur_pid >= 4) debug.klog("[mtswap-trace] pid={d} cpu{d} swapIn DONE\n", .{
         cur_pid, smp.myCpu().cpu_id,
     });
-    pages_in += 1;
-    if (pages_in == 1 or pages_in % 4096 == 0)
-        debug.klog("[swap] out={d} in={d} sc={d} dc={d} slots={d}/{d}\n", .{ pages_out, pages_in, pages_second_chance, pages_discarded, used_count, NUM_SLOTS });
+    const in_n = @atomicRmw(u64, &pages_in, .Add, 1, .monotonic) + 1;
+    if (in_n == 1 or in_n % 4096 == 0)
+        debug.klog("[swap] out={d} in={d} sc={d} dc={d} slots={d}/{d}\n", .{
+            @atomicLoad(u64, &pages_out, .monotonic),
+            in_n,
+            @atomicLoad(u64, &pages_second_chance, .monotonic),
+            @atomicLoad(u64, &pages_discarded, .monotonic),
+            @atomicLoad(usize, &used_count, .monotonic),
+            NUM_SLOTS,
+        });
     return true;
 }

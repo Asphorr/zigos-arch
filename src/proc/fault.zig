@@ -367,7 +367,7 @@ fn reclaimViaSwap(pml4: [*]align(4096) u64, lead: *PCB, skip_va: usize, pcid: u1
         trace_pid, trace_cpu, iters, freed, skipped,
     });
     lead.swap_clock_va = va;
-    swap.pages_second_chance +%= skipped;
+    _ = @atomicRmw(u64, &swap.pages_second_chance, .Add, @as(u64, skipped), .monotonic);
     return freed;
 }
 
