@@ -38,6 +38,31 @@ pub fn klog(comptime format: []const u8, args: anytype) void {
     vga.print(format, args);
 }
 
+/// Recoverable-warning facade. Use for "this shouldn't happen, but we
+/// can keep going" — sibling to klog (info) and panic (fatal). Logs a
+/// [kwarn] line with the source location plus a bump of the global
+/// warn_count counter. The counter turns "did this fire?" into a
+/// metric instead of relying on a human scanning logs.
+///
+/// Discipline:
+///   * klog  — normal informational output, expected events.
+///   * kwarn — invariant violated but recovery is correct. Should be
+///             rare; non-zero count at shutdown is itself a finding.
+///   * panic — invariant violated AND we can't reason about subsequent
+///             state. Aborts.
+///
+/// Mirrors Linux's WARN_ON / BUG_ON distinction.
+pub var warn_count: u64 = 0;
+
+pub fn kwarn(comptime src: std.builtin.SourceLocation, comptime fmt: []const u8, args: anytype) void {
+    _ = @atomicRmw(u64, &warn_count, .Add, 1, .monotonic);
+    klog("[kwarn] {s}:{d}: ", .{ src.file, src.line });
+    klog(fmt, args);
+    // Caller is expected to provide the trailing newline if multi-line;
+    // for one-liners we add one here.
+    if (fmt.len == 0 or fmt[fmt.len - 1] != '\n') klog("\n", .{});
+}
+
 /// Dump full CPU state to both VGA and serial.
 pub fn dumpState(state: *const CpuState) void {
     klog("  RAX={X:0>16} RBX={X:0>16} RCX={X:0>16} RDX={X:0>16}\n", .{ state.rax, state.rbx, state.rcx, state.rdx });

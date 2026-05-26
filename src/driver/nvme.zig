@@ -21,6 +21,7 @@
 // QEMU, swap your `-drive` lines to `-device nvme,drive=...`.
 
 const std = @import("std");
+const endian = @import("../util/endian.zig");
 const io = @import("../io.zig");
 const pci = @import("pci.zig");
 const iommu = @import("../cpu/iommu.zig");
@@ -88,13 +89,19 @@ const DSM_ATTR_AD: u32 = 1 << 2; // Deallocate (cdw11 bit 2)
 /// We currently emit exactly one range per call — block.zig's munmap /
 /// file-delete hooks can batch multiple LBAs into one call by extending
 /// `trim*` to accept a slice.
+/// NVMe Dataset Management Range descriptor. Canonical exemplar for the
+/// `LE(T)` endian-typed-field pattern (docs/STYLE.md): every wire field
+/// is wrapped so direct `.length = n` is a compile error and callers
+/// must go through `.length.set(n)` which does the host-to-LE swap
+/// (no-op on x86_64, correct on any future BE port).
 const DsmRange = extern struct {
-    context_attributes: u32 = 0,
-    length: u32 = 0, // in LBAs
-    starting_lba: u64 = 0,
+    context_attributes: endian.LE(u32) = endian.LE(u32).init(0),
+    length: endian.LE(u32) = endian.LE(u32).init(0), // in LBAs
+    starting_lba: endian.LE(u64) = endian.LE(u64).init(0),
 };
 comptime {
-    // NVMe spec — Dataset Management Range, 16 bytes per range.
+    // NVMe spec — Dataset Management Range, 16 bytes per range. The LE
+    // wrapper preserves size + alignment so these asserts still hold.
     const a = std.debug.assert;
     a(@sizeOf(DsmRange) == 16);
     a(@offsetOf(DsmRange, "context_attributes") == 0);
@@ -1905,9 +1912,9 @@ fn trimController(c: *Controller, ctrl_idx: u32, lba: u64, num_blocks: u32) bool
     if (num_blocks == 0) return true; // no-op trim is fine
     if (num_blocks > 0xFFFF_FFFF) return false; // single u32 length field
     const range = DsmRange{
-        .context_attributes = 0,
-        .length = num_blocks,
-        .starting_lba = lba,
+        .context_attributes = endian.LE(u32).init(0),
+        .length = endian.LE(u32).init(num_blocks),
+        .starting_lba = endian.LE(u64).init(lba),
     };
     const payload = std.mem.asBytes(&range);
     // cdw10: number of ranges - 1. We send exactly one.

@@ -19,6 +19,7 @@ allowed to be read/written:
 | `(p:lockname)`  | Protected by the named lock. Reads + writes hold it.          |
 | `(a)`           | Atomic — access via `@atomic{Load,Store,Rmw}`; no lock held.  |
 | `(c)`           | Const-after-init. Written once during setup, read everywhere. |
+| `(u)`           | User-mmap-shared. Kernel + userspace both touch via `@atomic*` with explicit ordering; producer side uses `.release`, consumer side uses `.acquire`. |
 
 The tag goes at the start of the field's `//` comment so a `\w (p:` or
 `\w (a)` grep finds every field with a given discipline:
@@ -44,6 +45,16 @@ declaration.
 "silent corruption" hunt, the mtswap layered bugs, the futex lost-wake)
 came down to a field's ownership being implicit. The annotation forces
 authorial intent at the declaration site at zero runtime cost.
+
+**On `(u)` specifically:** the kernel ↔ userspace ring protocol
+(io_uring SQ/CQ head+tail counters, future shm consumer/producer rings)
+isn't a normal atomic — it's a *cross-privilege* contract. Both sides
+must agree on which counter is `.release`-written by the producer and
+which is `.acquire`-read by the consumer. The reference implementation
+lives in `src/cpu/iouring.zig`: kernel writes `sq_head` + `cq_tail`
+with `.release`, reads `sq_tail` + `cq_head` with `.acquire`. Userspace
+libc mirrors with the opposite direction. Any new userspace-mapped
+ring should follow this same shape.
 
 ## comptime layout asserts on wire-format structs
 
@@ -94,6 +105,122 @@ declaration. Assert only offsets the wire actually defines — don't
 assert padding offsets; padding is an implementation detail of the
 struct, not a wire commitment.
 
+## Endian-typed wire fields (`LE(T)` / `BE(T)`)
+
+Extern-struct fields that cross a wire have an implicit endianness that
+`u32 field = 5` doesn't surface. Wrap each multi-byte wire field in
+`util/endian.zig`'s `LE(T)` or `BE(T)`:
+
+```zig
+const DsmRange = extern struct {
+    context_attributes: endian.LE(u32) = endian.LE(u32).init(0),
+    length: endian.LE(u32) = endian.LE(u32).init(0),
+    starting_lba: endian.LE(u64) = endian.LE(u64).init(0),
+};
+```
+
+Read with `field.get()`, write with `field.set(value)`, construct with
+`endian.LE(T).init(value)` for struct literals. Direct `.field = 5`
+becomes a compile error — forcing the host-endian-to-wire-endian swap
+to happen at every access site. Layout-invariant: `@sizeOf(LE(T)) ==
+@sizeOf(T)`, so the comptime offset asserts still hold.
+
+**Why:** silent byte-order bugs are the worst kind — code works on the
+testing host, breaks on a port. Now the type system catches them.
+**Reference exemplar:** `nvme.DsmRange`. **How to apply:** required on
+new wire-format `extern struct`s for any field wider than `u8`. When
+touching an existing one, wrap fields opportunistically — `@sizeOf` /
+`@offsetOf` asserts under the struct verify the wrap didn't disturb
+the layout.
+
+## Lock-Guard pattern (compile-time-enforced lock-held)
+
+For structs with a clearly delimited lock + a handful of lock-requiring
+methods, expose the lock via an `acquire() Guard` method whose return
+value is the receiver of every protected method:
+
+```zig
+const Region = struct {
+    lock: SpinLock = .{},
+    // ... fields ...
+
+    pub fn acquire(self: *Region) Guard { ... }
+
+    pub const Guard = struct {
+        region: *Region,
+        pub fn release(self: Guard) void { ... }
+        pub fn pushRun(self: Guard, ...) bool { ... }  // requires lock
+    };
+};
+```
+
+Callers `const g = region.acquire(); defer g.release();` then call
+`g.pushRun(...)`. Calling `pushRun` without going through `acquire()`
+is a compile error — the Guard is a *witness of lock-held state*.
+Strictly stronger than the `_locked` naming convention because the
+compiler enforces it.
+
+**When NOT to use:** for fields where dozens of unrelated sites touch
+the lock-protected state (e.g. `PCB.pending_signals`), the Guard would
+be more friction than the `(p:lockname)` tag is worth. Use Guards
+where lock + protected methods cluster on one struct. **Reference
+exemplar:** `pmm.Region.Guard.pushRun`. Existing `_Locked`-suffixed
+module functions can coexist during the migration; new lock-protected
+methods should be added as `Guard` methods directly.
+
+## `lock.assertHeld()` runtime checks
+
+Both `SpinLock` and `Mutex` carry holder identity already (`holder_cpu`
+/ `owner_pid`). The cheapest possible "I claim the caller holds this
+lock" check is `lock.assertHeld()` at function entry — compiled out
+in non-ReleaseSafe builds, free in production, catches "caller
+forgot to lock" on the first run instead of waiting for the timing-
+dependent race. Linux's `lockdep_assert_held` analogue.
+
+**Where to use:** every function whose docstring says "caller must
+hold X" or whose name ends in `_Locked`. **Reference exemplar:**
+`pmm.pushRunLocked` line 1 calls `r.lock.assertHeld()`.
+
+## `UserPtr(T)` — type-safe user-space pointers
+
+Raw `usize` / `u32` user VAs flowing through kernel code can't be
+distinguished from kernel pointers at the type level — the "validate
+before deref" contract is invisible at the deref site. Wrap user
+pointers in `util/user_ptr.zig`'s `UserPtr(T)`:
+
+```zig
+const up = UserPtr(u32).fromRaw(arg).validate() orelse return E_FAULT;
+const value = up.copyIn();  // or up.copyOut(value)
+```
+
+`UserPtr` has no direct dereference path — the only way to touch the
+underlying memory is via `copyIn` / `copyOut`, and reaching those
+methods requires going through `validate()` first. Direct
+`@ptrFromInt(arg).*` becomes a type error. The Zig-native equivalent
+of Linux's SPARSE `__user` annotation, but enforced at compile time
+rather than by an external tool.
+
+**Reference exemplar:** `sysSigpending` in `cpu/syscall/proc.zig`.
+Mass-rollout across ~50 syscall sites is incremental — new syscalls
+should use UserPtr; existing ones migrate when touched.
+
+## `kwarn` — recoverable warnings
+
+Three-level severity in `debug/debug.zig`:
+
+- `klog(...)` — informational, expected events.
+- `kwarn(@src(), ...)` — invariant violated but recovery is correct.
+  Logs to serial+VGA AND bumps `debug.warn_count` (atomic counter).
+  Non-zero count at shutdown is itself a finding worth investigating.
+- `@panic(...)` / `kpanic(...)` — invariant violated, subsequent state
+  unreasonable. Aborts.
+
+Mirrors Linux's `WARN_ON` vs `BUG_ON` distinction. **Where to use
+kwarn:** "this shouldn't have happened but we handled it" — e.g.
+NVMe queue-full retries, fdpoll waiter registry exhaustion, an `E_BADF`
+from a path that should always pass a live fd. The counter turns
+silent self-recovery into observable metric.
+
 ## What we deliberately don't do
 
 - **No separate prototypes / forward declarations.** Zig has no header
@@ -103,3 +230,16 @@ struct, not a wire commitment.
   get touched. Canonical exemplars (`PCB`, `pmm.Region`, NVMe
   `Controller`, `TcpConn`/`TcpListener`, `FileDesc`, NVMe `SqEntry` /
   `CqEntry`) were retrofitted in one pass — the rest stays incremental.
+
+## Reference index
+
+| Pattern             | Canonical exemplar                              |
+| ------------------- | ----------------------------------------------- |
+| `(p:lock)/(a)/(c)`  | `src/proc/process.zig` `PCB`                    |
+| `(u)` user-mmap     | `src/cpu/iouring.zig` `RingHeader`              |
+| Wire layout asserts | `src/driver/nvme.zig` `SqEntry`                 |
+| `LE(T)` / `BE(T)`   | `src/driver/nvme.zig` `DsmRange`                |
+| Lock-Guard          | `src/mm/pmm.zig` `Region.Guard.pushRun`         |
+| `assertHeld()`      | `src/mm/pmm.zig` `pushRunLocked` line 1         |
+| `UserPtr(T)`        | `src/cpu/syscall/proc.zig` `sysSigpending`      |
+| `kwarn(@src(),...)` | `src/debug/debug.zig` `kwarn`                   |

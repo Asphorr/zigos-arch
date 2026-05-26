@@ -780,12 +780,18 @@ pub fn sysSigprocmask(how: u32, set_ptr: u32, old_ptr: u32) u32 {
 }
 
 /// sigpending(*set) — write the bitmap of pending-but-blocked signals.
+/// **Canonical exemplar for the UserPtr(T) pattern (docs/STYLE.md).**
+/// The user pointer is wrapped at the ABI boundary; direct `*u32`
+/// dereference is no longer reachable — every access goes through
+/// `validate()` + `copyOut()`, which makes "deref unvalidated user
+/// pointer" a type error instead of a runtime SMAP fault.
 pub fn sysSigpending(set_ptr: u32) u32 {
     if (set_ptr == 0) return E_INVAL;
-    if (!validateUserPtrAligned(set_ptr, 4, 4)) return E_FAULT;
+    const UserPtr = @import("../../util/user_ptr.zig").UserPtr;
+    const up = UserPtr(u32).fromRaw(set_ptr).validate() orelse return E_FAULT;
     const pcb = process.currentPCB() orelse return E_FAULT;
-    const sp: *u32 = @ptrFromInt(@as(usize, set_ptr));
-    sp.* = @atomicLoad(u32, &pcb.pending_signals, .acquire) & pcb.signal_mask;
+    const value = @atomicLoad(u32, &pcb.pending_signals, .acquire) & pcb.signal_mask;
+    up.copyOut(value);
     return 0;
 }
 

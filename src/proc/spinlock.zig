@@ -1,3 +1,5 @@
+const std = @import("std");
+
 /// Ticket-based spinlock for SMP synchronization.
 /// Uses @atomicRmw for lock-free ticket acquisition.
 pub const SpinLock = struct {
@@ -55,6 +57,19 @@ pub const SpinLock = struct {
                 warned = true;
                 printSpinDiag(self, ticket, serving, ra);
             }
+        }
+    }
+
+    /// Runtime check that THIS CPU holds the lock. Inline call at the
+    /// entry of every `_locked` function (and any function documented
+    /// as requiring the lock). Linux's `lockdep_assert_held` analogue —
+    /// catches "caller forgot the lock" the first time the path runs,
+    /// instead of waiting for a timing-dependent race. Compiled out in
+    /// non-Debug/non-ReleaseSafe.
+    pub inline fn assertHeld(self: *const SpinLock) void {
+        if (std.debug.runtime_safety) {
+            const cpu = currentCpuId();
+            std.debug.assert(@atomicLoad(u8, &self.holder_cpu, .acquire) == cpu);
         }
     }
 
@@ -231,6 +246,17 @@ pub const Mutex = struct {
     /// GPU flush that would recursively acquire ctrl_lock and self-deadlock.
     pub fn isHeld(self: *const Mutex) bool {
         return @atomicLoad(u16, &self.owner_pid, .acquire) != 0xFFFF;
+    }
+
+    /// Runtime check that THIS PID holds the lock. Inline call at the
+    /// entry of every Mutex-requiring method. See SpinLock.assertHeld
+    /// for the rationale.
+    pub inline fn assertHeld(self: *const Mutex) void {
+        if (std.debug.runtime_safety) {
+            const smp = @import("../cpu/smp.zig");
+            const cur = smp.myCpu().current_pid orelse return;
+            std.debug.assert(@atomicLoad(u16, &self.owner_pid, .acquire) == @as(u16, @intCast(cur)));
+        }
     }
 
     pub fn acquire(self: *Mutex) void {

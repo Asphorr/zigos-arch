@@ -60,6 +60,14 @@ const Waiter = struct {
     pid: u8 = 0xFF,
     handle: FdHandle = .{ .kind = .console, .id = 0xFFFF },
     events: u16 = 0,
+    /// Generation counter captured from the iouring PendingOp at register
+    /// time. Fired back to iouring through the callback so the callback
+    /// can detect recycled-slot wakes (the lifecycle race from 2026-05-24:
+    /// wakePollers snapshots the waiter + drops the lock, worker drains
+    /// the slot, allocPendingSlot reassigns it, then the deferred cb
+    /// would have landed on the WRONG op). Compare-on-fire skips the
+    /// wake if `p.gen != expected_gen`.
+    expected_gen: u16 = 0,
 };
 
 // Sized for the worst realistic case (16 io_uring instances × ~4 polls
@@ -72,7 +80,7 @@ var lock: SpinLock = .{};
 /// waiter. Receives the back-pointer + the events mask that's actually
 /// ready (POSIX poll convention — handler decides what to do with it).
 /// Signature must match iouring's poll-completion helper exactly.
-pub var completion_callback: ?*const fn (inst_id: u8, slot_idx: u8, ready_mask: u16) void = null;
+pub var completion_callback: ?*const fn (inst_id: u8, slot_idx: u8, expected_gen: u16, ready_mask: u16) void = null;
 
 /// Compute the current readiness mask for `pcb.fd_table[fd]`. Returns
 /// the bitwise OR of POLLIN/POLLOUT/POLLHUP/POLLERR bits true RIGHT NOW.
@@ -155,7 +163,7 @@ fn pollMaskConsole(pid: u8, _: u16) u16 {
 /// Reserve a waiter slot. Returns the waiter index (opaque to caller —
 /// pass back to unregister). null = registry full; iouring should
 /// surface this as ENOMEM on the CQE.
-pub fn register(inst_id: u8, slot_idx: u8, pid: u8, h: FdHandle, events: u16) ?u8 {
+pub fn register(inst_id: u8, slot_idx: u8, pid: u8, h: FdHandle, events: u16, gen: u16) ?u8 {
     lock.acquire();
     defer lock.release();
     for (&waiters, 0..) |*w, i| {
@@ -167,6 +175,7 @@ pub fn register(inst_id: u8, slot_idx: u8, pid: u8, h: FdHandle, events: u16) ?u
             .pid = pid,
             .handle = h,
             .events = events,
+            .expected_gen = gen,
         };
         return @intCast(i);
     }
@@ -206,7 +215,7 @@ pub fn wakePollers(kind: process.FsType, id: u16) void {
     // Snapshot which slots to complete under the lock, then call out
     // without holding it — completion may take long enough that we
     // don't want to block fresh register() calls behind it.
-    var to_fire: [MAX_WAITERS]struct { inst_id: u8, slot_idx: u8, mask: u16 } = undefined;
+    var to_fire: [MAX_WAITERS]struct { inst_id: u8, slot_idx: u8, expected_gen: u16, mask: u16 } = undefined;
     var n: usize = 0;
     lock.acquire();
     for (&waiters, 0..) |*w, i| {
@@ -218,11 +227,11 @@ pub fn wakePollers(kind: process.FsType, id: u16) void {
         const ready = pollMaskHandle(w.pid, w.handle);
         const matched = ready & w.events;
         if (matched == 0) continue;
-        to_fire[n] = .{ .inst_id = w.inst_id, .slot_idx = w.slot_idx, .mask = matched };
+        to_fire[n] = .{ .inst_id = w.inst_id, .slot_idx = w.slot_idx, .expected_gen = w.expected_gen, .mask = matched };
         n += 1;
         w.in_use = false;
         _ = i;
     }
     lock.release();
-    for (to_fire[0..n]) |entry| cb(entry.inst_id, entry.slot_idx, entry.mask);
+    for (to_fire[0..n]) |entry| cb(entry.inst_id, entry.slot_idx, entry.expected_gen, entry.mask);
 }

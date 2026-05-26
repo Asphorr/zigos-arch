@@ -92,6 +92,33 @@ const Region = struct {
     /// freelist_heads[k] holds runs of size [2^k, 2^(k+1)) (except the
     /// top-most bucket which is open-ended).
     freelist_heads: [MAX_ORDER + 1]u32 = [_]u32{NULL_RUN} ** (MAX_ORDER + 1), // (p:lock)
+
+    /// Lock-Guard pattern (docs/STYLE.md): `Region.acquire()` returns a
+    /// `Guard` that proves the lock is held. Methods that require the
+    /// lock take `Guard` as their receiver, so calling them without a
+    /// Guard is a *compile error* instead of a runtime race. Migrate
+    /// existing `pushRunLocked`-style module functions to this shape
+    /// incrementally; both APIs coexist during the transition.
+    pub fn acquire(self: *Region) Guard {
+        self.lock.acquire();
+        return .{ .region = self };
+    }
+
+    pub const Guard = struct {
+        region: *Region,
+
+        pub fn release(self: Guard) void {
+            self.region.lock.release();
+        }
+
+        /// Same logic as `pushRunLocked` but lock-held is proved by the
+        /// Guard receiver instead of a free-floating `_Locked` naming
+        /// convention. Canonical Guard-method exemplar.
+        pub fn pushRun(self: Guard, start_frame: u32, count: u32) bool {
+            const region_idx: u32 = @intCast((@intFromPtr(self.region) - @intFromPtr(&regions[0])) / @sizeOf(Region));
+            return pushRunLocked(region_idx, start_frame, count);
+        }
+    };
 };
 
 var regions: [REGIONS_COUNT]Region = blk: {
@@ -177,11 +204,12 @@ fn freeRunNode(idx: u32) void {
 /// Returns false if the Run pool is exhausted (caller should not consider
 /// this an error — bitmap still authoritative).
 fn pushRunLocked(region_idx: u32, start_frame: u32, count: u32) bool {
+    const r = &regions[region_idx];
+    r.lock.assertHeld();
     const idx = allocRun() orelse return false;
     run_pool[idx].start_frame = start_frame;
     run_pool[idx].count = count;
     const order = orderForSize(count);
-    const r = &regions[region_idx];
     run_pool[idx].next = r.freelist_heads[order];
     r.freelist_heads[order] = idx;
     return true;

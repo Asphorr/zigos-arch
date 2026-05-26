@@ -103,60 +103,103 @@ pub const Cqe = extern struct {
     flags: u32,
 };
 
+/// Shared kernel↔userspace ring header — mmap'd into the owning process
+/// at `Instance.user_va`. Access-tag legend (see docs/STYLE.md): the
+/// SQ/CQ counters are `(u)` user-mmap-shared (kernel uses @atomicLoad
+/// .acquire on counters the producer-side owns and @atomicStore .release
+/// on the ones we produce). Counters tagged with their *kernel* role —
+/// "kernel-consumer" reads with .acquire, "kernel-producer" writes with
+/// .release. Reference implementation for the (u) discipline.
 pub const RingHeader = extern struct {
-    sq_head: u32,
-    sq_tail: u32,
-    sq_mask: u32,
-    sq_entries: u32,
-    cq_head: u32,
-    cq_tail: u32,
-    cq_mask: u32,
-    cq_entries: u32,
-    sqes_offset: u32,
-    cqes_offset: u32,
+    sq_head: u32, // (u) kernel-producer — kernel writes .release as SQEs are consumed
+    sq_tail: u32, // (u) kernel-consumer — userspace writes .release after filling an SQE
+    sq_mask: u32, // (c) set at setup
+    sq_entries: u32, // (c)
+    cq_head: u32, // (u) kernel-consumer — userspace writes .release after reading a CQE
+    cq_tail: u32, // (u) kernel-producer — kernel writes .release after posting a CQE
+    cq_mask: u32, // (c)
+    cq_entries: u32, // (c)
+    sqes_offset: u32, // (c)
+    cqes_offset: u32, // (c)
     _pad: [24]u8,
 };
+comptime {
+    // ABI contract — userspace libc maps this struct directly; size +
+    // offsets must stay stable. 32-byte trailer + 10×u32 = 72 → padded to 96.
+    const a = std.debug.assert;
+    a(@sizeOf(RingHeader) == 64);
+    a(@offsetOf(RingHeader, "sq_head") == 0);
+    a(@offsetOf(RingHeader, "sq_tail") == 4);
+    a(@offsetOf(RingHeader, "sq_mask") == 8);
+    a(@offsetOf(RingHeader, "cq_head") == 16);
+    a(@offsetOf(RingHeader, "cq_tail") == 20);
+    a(@offsetOf(RingHeader, "sqes_offset") == 32);
+    a(@offsetOf(RingHeader, "cqes_offset") == 36);
+}
 
 /// One async NVMe op in flight. Allocated by the worker before submit,
 /// populated with the SQE-derived parameters + the CQE-side `user_data`,
 /// then handed to `nvme.submitAsyncCallback` with `ctx = @intFromPtr(self)`.
 /// The IRQ callback writes `success` + `done`; the worker drains on wake.
 const PendingOp = struct {
-    in_use: bool = false,
-    instance_id: u8 = 0xFF,
-    op: u8 = 0,
-    ctrl_idx: u32 = 0,
-    packed_cid: u16 = 0,
-    user_addr: usize = 0,
-    sectors: u32 = 0,
-    bytes: u32 = 0,
-    cqe_user_data: u64 = 0,
+    // Access-tag legend (see docs/STYLE.md). `in_use` and `done` are the
+    // synchronization points: `in_use` flips false→true under the
+    // submitter (allocPendingSlot) and back via worker drain; `done`
+    // flips false→true under the IRQ-callback / fdpoll-callback. Other
+    // fields are written by the submitter BEFORE in_use=true (or BEFORE
+    // ringing the NVMe doorbell), then read by the worker AFTER it
+    // observes done=true — the release/acquire pair on done carries
+    // them. Fields tagged "(done-fenced)" mean "covered by done's
+    // release/acquire ordering, no explicit atomic needed."
+    in_use: bool = false, // (a) submitter sets, worker clears
+    instance_id: u8 = 0xFF, // (done-fenced) read by IRQ callback (line ~258) via @ptrFromInt(ctx)
+    op: u8 = 0, // (done-fenced)
+    ctrl_idx: u32 = 0, // (done-fenced)
+    packed_cid: u16 = 0, // (done-fenced)
+    user_addr: usize = 0, // (done-fenced)
+    sectors: u32 = 0, // (done-fenced)
+    bytes: u32 = 0, // (done-fenced)
+    cqe_user_data: u64 = 0, // (done-fenced)
     /// IRQ-callback writes with Release; worker reads with Acquire. All
     /// other fields are written by the worker before submit; the worker
     /// re-reads them after observing done=true, but they were never
     /// re-written by any other context, so no atomic needed.
-    done: bool = false,
-    success: bool = false,
+    done: bool = false, // (a) IRQ / fdpoll callback writes .release; worker reads .acquire
+    success: bool = false, // (done-fenced) IRQ callback writes plain before done=true
     /// OP_POLL only — set by fdpoll's completion callback to the ready
     /// mask that triggered the wake. Worker reads after observing
     /// `done` with Acquire, then posts CQE.res = poll_mask.
-    poll_mask: u16 = 0,
+    poll_mask: u16 = 0, // (done-fenced) fdpoll callback writes plain before done=true
     /// OP_POLL only — index into fdpoll.waiters[] for the registered
     /// waiter, so on instance shutdown we can drop the registration
     /// before recycling the pending slot. 0xFF = no waiter registered.
-    fdpoll_waiter_idx: u8 = 0xFF,
+    fdpoll_waiter_idx: u8 = 0xFF, // owner: worker-only after allocPendingSlot
+    /// Slot generation. Bumped on every allocPendingSlot. Captured by
+    /// fdpoll.register and fired back through pollCompletionCallback so a
+    /// deferred wake firing on a since-recycled slot is a no-op instead
+    /// of clobbering the new op's poll_mask/done. Pre-fix, the race was:
+    /// wakePollers snapshots the waiter, drops the lock, slot drains +
+    /// allocPendingSlot reassigns it, deferred cb lands on the wrong op.
+    /// 16 bits gives 65 535 generations before wrap — far more than the
+    /// 64-deep pending array could chew through between a register and
+    /// its matching wake.
+    gen: u16 = 0, // (a) bumped by allocPendingSlot; read by pollCompletionCallback
 };
 
 const Instance = struct {
-    in_use: bool = false,
-    exit_requested: bool = false,
-    owner_pid: u32 = 0xFFFFFFFF,
-    user_va: usize = 0,
-    region_pages: u32 = 0,
-    entries: u32 = 0,
-    shm_id: u32 = 0xFFFFFFFF,
-    header_kvirt: usize = 0,
-    worker_pid: u32 = 0xFFFFFFFF,
+    // Access-tag legend (see docs/STYLE.md). The Instance's lifecycle is
+    // setup() (under global iouring `lock`) → worker_pid wake → worker
+    // drains until exit_requested → self-recycle. `in_use` is the
+    // single source of truth for "this slot is alive."
+    in_use: bool = false, // (a) setup writes .release; worker self-clears at recycle
+    exit_requested: bool = false, // (a) releaseAllForPid sets; worker reads
+    owner_pid: u32 = 0xFFFFFFFF, // (c) set under iouring lock in setup; self-cleared at recycle
+    user_va: usize = 0, // (c)
+    region_pages: u32 = 0, // (c)
+    entries: u32 = 0, // (c)
+    shm_id: u32 = 0xFFFFFFFF, // (c)
+    header_kvirt: usize = 0, // (c)
+    worker_pid: u32 = 0xFFFFFFFF, // (c) — final field set by setup, signals "fully constructed"
     pending: [MAX_PENDING_PER_INSTANCE]PendingOp = [_]PendingOp{.{}} ** MAX_PENDING_PER_INSTANCE,
     /// Suppress spurious wakes to .iouring_cq parkers. Set by enter() to its
     /// min_complete before parking; cleared on exit. Worker checks before
@@ -165,7 +208,7 @@ const Instance = struct {
     /// 16 wake-and-re-park cycles for the app (each adds a ~4 ms schedule
     /// round-trip), turning a single wait into N × round-trip latency.
     /// 0 means "no one is parked / no waiter cares" — worker skips the wake.
-    cq_min_complete: u32 = 0,
+    cq_min_complete: u32 = 0, // (a) enter() writes before park, worker reads
 };
 
 var instances: [MAX_INSTANCES_TOTAL]Instance = [_]Instance{.{}} ** MAX_INSTANCES_TOTAL;
@@ -204,14 +247,16 @@ fn writeCqe(inst: *Instance, idx_masked: u32, cqe: Cqe) void {
 
 fn countOwnedLocked(pid: u32) u8 {
     var n: u8 = 0;
-    for (instances) |it| if (it.in_use and it.owner_pid == pid) {
+    // By-pointer iter: per-Instance memcpy onto kstack is ~12 KB (pending
+    // array × 16). By-value loop overflows kstack at this size.
+    for (&instances) |*it| if (@atomicLoad(bool, &it.in_use, .acquire) and it.owner_pid == pid) {
         n += 1;
     };
     return n;
 }
 
 fn findByVa(pid: u32, va: usize) ?*Instance {
-    for (&instances) |*it| if (it.in_use and it.owner_pid == pid and it.user_va == va) {
+    for (&instances) |*it| if (@atomicLoad(bool, &it.in_use, .acquire) and it.owner_pid == pid and it.user_va == va) {
         return it;
     };
     return null;
@@ -224,7 +269,12 @@ fn findByVa(pid: u32, va: usize) ?*Instance {
 fn allocPendingSlot(inst: *Instance) ?u8 {
     for (&inst.pending, 0..) |*p, i| {
         if (@atomicLoad(bool, &p.in_use, .acquire)) continue;
+        // Preserve+bump gen across the field reset so the new slot has a
+        // unique generation. Deferred wakes from the previous incarnation
+        // compare against `expected_gen` and short-circuit.
+        const next_gen = p.gen +% 1;
         p.* = .{};
+        p.gen = next_gen;
         @atomicStore(bool, &p.in_use, true, .release);
         return @intCast(i);
     }
@@ -266,7 +316,7 @@ fn nvmeCompletionCallback(ctx: usize, success: bool, sc: u16) callconv(.c) void 
 /// CPU. Mirrors `nvmeCompletionCallback`'s shape: store the result,
 /// flip `done` with Release, wake the worker so it posts the CQE via
 /// the normal drainCompletions path.
-fn pollCompletionCallback(inst_id: u8, slot_idx: u8, ready_mask: u16) void {
+fn pollCompletionCallback(inst_id: u8, slot_idx: u8, expected_gen: u16, ready_mask: u16) void {
     if (inst_id >= MAX_INSTANCES_TOTAL) return;
     const inst = &instances[inst_id];
     if (!@atomicLoad(bool, &inst.in_use, .acquire)) return;
@@ -277,6 +327,10 @@ fn pollCompletionCallback(inst_id: u8, slot_idx: u8, ready_mask: u16) void {
     // should have dropped the waiter before that, but a wake racing
     // with shutdown can still arrive.
     if (!@atomicLoad(bool, &p.in_use, .acquire)) return;
+    // Recycled-slot guard: if allocPendingSlot bumped gen since the
+    // waiter was registered, the slot now belongs to a different op
+    // and we'd clobber its poll_mask/done. Closes the lifecycle race.
+    if (p.gen != expected_gen) return;
     if (p.op != OP_POLL) return;
     p.poll_mask = ready_mask;
     @atomicStore(bool, &p.done, true, .release);
@@ -289,7 +343,7 @@ fn pollCompletionCallback(inst_id: u8, slot_idx: u8, ready_mask: u16) void {
 /// our pointer here is safe.
 fn ensurePollCallbackRegistered() void {
     @atomicStore(
-        ?*const fn (inst_id: u8, slot_idx: u8, ready_mask: u16) void,
+        ?*const fn (inst_id: u8, slot_idx: u8, expected_gen: u16, ready_mask: u16) void,
         &fdpoll.completion_callback,
         pollCompletionCallback,
         .release,
@@ -436,7 +490,7 @@ fn submitPollOp(inst: *Instance, inst_id: u8, sqe: Sqe) SubmitResult {
     p.instance_id = inst_id;
     p.fdpoll_waiter_idx = 0xFF;
 
-    const widx = fdpoll.register(inst_id, slot_idx, pid, handle, events) orelse {
+    const widx = fdpoll.register(inst_id, slot_idx, pid, handle, events, p.gen) orelse {
         // Registry full — free the slot we just took and surface ENOMEM.
         @atomicStore(bool, &p.in_use, false, .release);
         return postInlineCqe(inst, sqe.user_data, ERES_NOMEM);
@@ -678,7 +732,7 @@ fn workerLoop() callconv(.c) noreturn {
     const my_pid = process.getCurrentPid();
     var inst_id: u8 = 0xFF;
     while (inst_id == 0xFF) {
-        for (instances, 0..) |it, i| if (it.in_use and it.worker_pid == my_pid) {
+        for (&instances, 0..) |*it, i| if (@atomicLoad(bool, &it.in_use, .acquire) and it.worker_pid == my_pid) {
             inst_id = @intCast(i);
             break;
         };
@@ -691,7 +745,7 @@ fn workerLoop() callconv(.c) noreturn {
 
     while (true) {
         const inst = &instances[inst_id];
-        if (!inst.in_use) break;
+        if (!@atomicLoad(bool, &inst.in_use, .acquire)) break;
 
         // Phase 1: drain completed in-flight ops. ALWAYS runs first so
         // we observe completions whether woken by enter() (new submission)
@@ -727,7 +781,7 @@ fn workerLoop() callconv(.c) noreturn {
         // tearDownTask returns from releaseAllForPid (which spin-waits on
         // worker_pid going to .zombie), every NVMe op has been reaped via
         // releaseAsyncCid and no stale callbacks can fire.
-        if (inst.exit_requested) {
+        if (@atomicLoad(bool, &inst.exit_requested, .acquire)) {
             // OP_POLL slots don't complete on their own — fdpoll wake is
             // the only signal, and a dying process won't generate one.
             // Drop them now so pendingInFlightCount can reach zero.
@@ -745,7 +799,7 @@ fn workerLoop() callconv(.c) noreturn {
                 // All in-flight cleared. Self-recycle the Instance slot,
                 // THEN destroyCurrent. setup() can immediately reuse this
                 // slot once we've cleared it.
-                inst.exit_requested = false;
+                @atomicStore(bool, &inst.exit_requested, false, .release);
                 inst.owner_pid = 0xFFFFFFFF;
                 inst.user_va = 0;
                 inst.region_pages = 0;
@@ -767,7 +821,7 @@ fn workerLoop() callconv(.c) noreturn {
         // NVMe queue full. Sync ops always submit (no pending slot needed).
         const hdr: *RingHeader = @ptrFromInt(inst.header_kvirt);
         var blocked_by_full = false;
-        submit_loop: while (!inst.exit_requested) {
+        submit_loop: while (!@atomicLoad(bool, &inst.exit_requested, .acquire)) {
             const sq_head = @atomicLoad(u32, &hdr.sq_head, .acquire);
             const sq_tail = @atomicLoad(u32, &hdr.sq_tail, .acquire);
             if (sq_head == sq_tail) break :submit_loop;
@@ -842,7 +896,7 @@ fn workerLoop() callconv(.c) noreturn {
             }
         }
 
-        if (inst.exit_requested) break;
+        if (@atomicLoad(bool, &inst.exit_requested, .acquire)) break;
 
         // Phase 3: park if there's nothing to do right now.
         const sq_head_post = @atomicLoad(u32, &hdr.sq_head, .acquire);
@@ -901,7 +955,7 @@ pub fn setup(entries_req: u32) u32 {
         lock.releaseIrqRestore(flags);
         return 0;
     }
-    for (instances, 0..) |it, i| if (!it.in_use) {
+    for (&instances, 0..) |*it, i| if (!@atomicLoad(bool, &it.in_use, .acquire)) {
         slot_opt = i;
         break;
     };
@@ -909,8 +963,8 @@ pub fn setup(entries_req: u32) u32 {
         lock.releaseIrqRestore(flags);
         return 0;
     };
-    instances[slot].in_use = true;
-    instances[slot].exit_requested = false;
+    @atomicStore(bool, &instances[slot].in_use, true, .release);
+    @atomicStore(bool, &instances[slot].exit_requested, false, .release);
     instances[slot].worker_pid = 0xFFFFFFFF;
     // Reset all pending slots — last owner may have left stale state.
     for (&instances[slot].pending) |*p| {
@@ -1030,7 +1084,7 @@ pub fn enter(user_va: u32, to_submit: u32, min_complete: u32) u32 {
             const cq_head = @atomicLoad(u32, &hdr.cq_head, .acquire);
             const ready = cq_tail -% cq_head;
             if (ready >= min_complete) break;
-            if (!inst.in_use or inst.exit_requested) break;
+            if (!@atomicLoad(bool, &inst.in_use, .acquire) or @atomicLoad(bool, &inst.exit_requested, .acquire)) break;
             process.blockOn(.iouring_cq, inst_id);
         }
     }
@@ -1060,10 +1114,10 @@ pub fn releaseAllForPid(pid: u32) void {
         const flags = lock.acquireIrqSave();
         defer lock.releaseIrqRestore(flags);
         for (&instances, 0..) |*it, idx| {
-            if (!it.in_use) continue;
+            if (!@atomicLoad(bool, &it.in_use, .acquire)) continue;
             if (it.owner_pid != pid) continue;
             owned_slots[idx] = true;
-            it.exit_requested = true;
+            @atomicStore(bool, &it.exit_requested, true, .release);
             if (it.worker_pid < process.MAX_PROCS) {
                 process.wake(@intCast(it.worker_pid));
             }
