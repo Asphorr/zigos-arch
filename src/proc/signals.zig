@@ -366,25 +366,24 @@ fn applyDefault(pcb: *process.PCB, signo: u32) void {
             // scheduler state we don't have yet.
         },
         .term, .core => {
+            // POSIX exit_group: for a multi-threaded process, a fatal default
+            // action kills EVERY thread in the group, not just `pcb`. The
+            // current-CPU thread is handled inside killThreadGroup's self-
+            // phase (destroyCurrentWithStatus there, same dance as before).
+            // For single-threaded processes pcb.tgid == self_pid and the
+            // group-walk hits exactly one slot — identical behavior to the
+            // pre-tgid path.
             const status: u32 = 0xDEAD0000 | signo;
-            const pid: u8 = @intCast(pidIndexOfPcb(pcb));
+            process.killThreadGroup(pcb.tgid, status);
             if (smp.myCpu().current_pid) |cur| {
-                if (cur == pid) {
-                    // Self-kill on the current syscall/IRQ/exception path.
-                    // destroyCurrentWithStatus tears down the address space
-                    // and clears cpu.current_pid, but it doesn't unwind the
-                    // kernel stack we got here on — if we just `return`, the
-                    // syscall asm pops registers and sysrets into freed user
-                    // memory under kernel CR3 → triple fault. Match sys_exit:
-                    // switch back to this CPU's scheduler context (the boot
-                    // context running desktop.run / apEntry) so the kstack
-                    // we're on gets dropped and CPU returns to the scheduler.
-                    process.destroyCurrentWithStatus(status);
+                if (cur == pidIndexOfPcb(pcb)) {
+                    // If pcb wasn't in its own group (shouldn't happen — clone
+                    // sets tgid before .ready) the killThreadGroup self-phase
+                    // is a no-op; fall back to schedule() to drop our frame.
                     process.schedule();
                     unreachable;
                 }
             }
-            process.killProcessWithStatus(pid, status);
         },
     }
 }

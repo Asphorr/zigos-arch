@@ -135,6 +135,31 @@ const NICE_WEIGHTS = [40]u64{
       110,    87,    70,    56,    45,    36,    29,    23,    18,    15,
 };
 
+/// Atomically set a PCB's wait fields together. `pcb.wait_kind` and
+/// `pcb.wait_target` are tagged `(a)` in process.zig because cross-CPU
+/// readers (wake() on a remote CPU, wakeExpired() on any CPU) read them.
+/// All blockOn entry paths use this; the .release ordering pairs with
+/// the @atomicLoad(wake_pending, .acquire) re-check that follows.
+inline fn setWait(pcb: *process.PCB, kind: process.WaitKind, target: u32) void {
+    @atomicStore(u8, @as(*u8, @ptrCast(&pcb.wait_kind)), @intFromEnum(kind), .release);
+    @atomicStore(u32, &pcb.wait_target, target, .release);
+}
+
+/// Atomically clear a PCB's wait fields. Used at every blockOn exit /
+/// wake / wakeExpired path. Pairs with setWait + the lost-wake handshake.
+inline fn clearWait(pcb: *process.PCB) void {
+    @atomicStore(u8, @as(*u8, @ptrCast(&pcb.wait_kind)), @intFromEnum(process.WaitKind.none), .release);
+    @atomicStore(u32, &pcb.wait_target, 0, .release);
+}
+
+/// Test whether this PCB is enrolled as a (kind, target) waiter, atomically.
+/// All wake-helper fan-out loops (wakeMutexWaiters, wakeSwapEvictWaiters,
+/// wakeIoUring*) use this so the read pairs with setWait's .release store.
+inline fn waitsOn(t: *const process.PCB, kind: process.WaitKind, target: u32) bool {
+    return @atomicLoad(u8, @as(*const u8, @ptrCast(&t.wait_kind)), .acquire) == @intFromEnum(kind)
+        and @atomicLoad(u32, &t.wait_target, .acquire) == target;
+}
+
 /// Map a nice value (-20..19, clamped) to its weight. Out-of-range nice is
 /// clamped to the nearest endpoint.
 inline fn niceToWeight(nice: i8) u64 {
@@ -1236,16 +1261,25 @@ pub fn schedule() void {
     // Transient-window bracket: between setState(.ready) and switchTo's
     // save below, prev.state==.ready but prev.kernel_esp is still STALE
     // (from the previous save) and prev is busily writing to its kstack
-    // (often AAAA from Zig undefined-init). pcb_invariants and
-    // kstack_protect.tickMonitor read this field on every cpu and skip
-    // the saved-RIP check for any pid that matches — without it they
-    // false-fire on the transient stack residue (caught 2026-05-19).
+    // (often AAAA from Zig undefined-init). pcb_invariants reads this field
+    // on every cpu and skips the saved-RIP check for any pid that matches
+    // — without it it false-fires on transient stack residue (caught
+    // 2026-05-19).
     // Cleared inside save_trace_record once switchTo's `movq %rsp,(%rdi)`
     // lands.
     var demoted_running_to_ready = false;
     if (cpu.current_pid) |cur| {
+        // Set the scheduling_out bracket for EVERY yield path, not just
+        // .running → .ready demotion. blockOn-style yields (state set to
+        // .sleeping by the caller before invoking schedule) used to bypass
+        // this bracket — leaving a transient window where the saved-RIP
+        // mirror-compare false-fired on the schedule body's own `call
+        // setTssRsp0` push (a stale-data read between two consecutive
+        // pushes to the same kesp+48 slot). The bracket already covered
+        // the .running-demote case; extending it to all yields closes the
+        // detector race without changing schedule semantics.
+        cpu.scheduling_out_pid = @intCast(cur);
         if (process.procs[cur].state == .running) {
-            cpu.scheduling_out_pid = @intCast(cur);
             setState(cur, .ready);
             demoted_running_to_ready = true;
             @import("../debug/kdbg.zig").schedEvent(.preempt, @intCast(cur), @intFromEnum(State.running), @intFromEnum(State.ready), 0);
@@ -1360,11 +1394,6 @@ pub fn schedule() void {
         }
 
         // -------- Switch to a user task --------
-        // Belt-and-suspenders: if the incoming task is in PROTECTED_PIDS
-        // and a destroy-window happened to mark its kstack RO, unprotect
-        // it before switchTo writes any saved-state into the kstack.
-        // Idempotent (no shootdown issued if no PTE actually changed).
-        @import("../debug/kstack_protect.zig").unprotectPidIfProtected(next);
         // KCSAN-lite: just before we use procs[next].kernel_esp, watch
         // it for ~µs. If another CPU writes during this window, the race
         // is in switchTo's rsp-save vs another CPU's dispatch path.
@@ -1405,6 +1434,32 @@ pub fn schedule() void {
         // prev_save was determined at the top of schedule() — it's the
         // `?*u64` slot switchTo writes into, or null to skip the save.
         const next_kesp = process.procs[next].kernel_esp;
+
+        // Wild-kernel_esp dispatch detector (2026-05-25 audit, secondary
+        // probe). If next_kesp points outside next's own kstack body,
+        // switchTo's `movq (%rsi), %rsp` would swap RSP to a foreign
+        // kstack and the next `call setTssRsp0` would plant its RA at
+        // the foreign location. The save-side detector in
+        // save_trace_record is the primary catch (it preserves the
+        // offending schedule's stack); this is the consumer-side
+        // backstop in case the wild save happened before this code was
+        // wired or via a path that bypasses save_trace_record.
+        {
+            const ktop_chk = process.procs[next].kernel_stack_top;
+            if (ktop_chk != 0) {
+                const body_lo = ktop_chk -| config.KSTACK_SIZE;
+                if (next_kesp < body_lo or next_kesp >= ktop_chk) {
+                    debug.klog("\n[wild-kesp-dispatch] !!! pid={d} kernel_esp points OUTSIDE its own kstack body !!!\n", .{next});
+                    debug.klog("[wild-kesp-dispatch]   next_kesp = 0x{X:0>16}\n", .{next_kesp});
+                    debug.klog("[wild-kesp-dispatch]   pid {d} kstack body = [0x{X:0>16}..0x{X:0>16})\n", .{ next, body_lo, ktop_chk });
+                    const cur_pid: i32 = if (cpu.current_pid) |c| @intCast(c) else -1;
+                    debug.klog("[wild-kesp-dispatch]   cpu = {d}  current_pid = {d}\n", .{ cpu.cpu_id, cur_pid });
+                    @import("../debug/kdbg.zig").nmi_halt_after_snapshot = true;
+                    @import("../debug/save_trace.zig").dumpAll();
+                    @panic("dispatch with wild next_kesp (cross-stack-alias consumer)");
+                }
+            }
+        }
 
         // Pre-dispatch saved-RIP guard. switchTo's `ret` will pop the
         // qword at [next_kesp + 48] (after 6 callee-save pops) as the
@@ -1567,10 +1622,14 @@ pub fn schedule() void {
         @import("../debug/breadcrumb.zig").stamp(.switch_to, next_kesp);
         // hwbp disarm: pid 2/3's kesp+48 is watched while parked
         // (armed by save_trace_record with skip_value = legit RA).
-        // Disarm before dispatch — first callq after switchTo's retq
-        // legitimately writes a DIFFERENT RA to that exact slot.
-        if (next == 2) @import("../debug/watch.zig").disarm(2);
-        if (next == 3) @import("../debug/watch.zig").disarm(3);
+        // Old pre-dispatch disarm of slots 2/3 removed 2026-05-25: the watch
+        // entries at those slots are now kesp+48 mirror-compare watches with
+        // an isPidRunningOrSchedulingOut guard (see watch.onDebugException
+        // mirror_pid_plus1 branch). The structural guard already suppresses
+        // the "first callq after switchTo's retq writes a different RA"
+        // false positive, so disarming on every dispatch is unnecessary and
+        // leaves slots permanently disarmed (the corrupter never gets caught
+        // because by the time pid reparks, slot is still off).
         @import("sched_asm.zig").switchToCall(prev_save, next_kesp);
         // When we get here, this caller has been re-scheduled.
         @import("../debug/kdbg.zig").schedEvent(.switch_out, from_pid_a, 0, 0, @intCast(next));
@@ -1626,21 +1685,22 @@ pub fn wakeExpired() void {
         // handle .gpu_io here (not in the .none branch) so the wake
         // clears wait_kind back to .none on the same path as the IRQ
         // wake — keeping a single "waiter resumed" code path.
+        const wt_gpu = @atomicLoad(u64, &process.procs[i].wake_tick, .acquire);
         if (process.procs[i].state == .sleeping
             and process.procs[i].wait_kind == .gpu_io
-            and process.procs[i].wake_tick != 0
-            and process.tick_count >= process.procs[i].wake_tick)
+            and wt_gpu != 0
+            and process.tick_count >= wt_gpu)
         {
-            process.procs[i].wake_tick = 0;
-            process.procs[i].wait_kind = .none;
-            process.procs[i].wait_target = 0;
+            @atomicStore(u64, &process.procs[i].wake_tick, 0, .release);
+            clearWait(&process.procs[i]);
             setState(i, .ready);
             continue;
         }
+        const wt_none = @atomicLoad(u64, &process.procs[i].wake_tick, .acquire);
         if (process.procs[i].state == .sleeping
             and process.procs[i].wait_kind == .none
-            and process.procs[i].wake_tick != 0
-            and process.tick_count >= process.procs[i].wake_tick)
+            and wt_none != 0
+            and process.tick_count >= wt_none)
         {
             // ORDER MATTERS: clear wake_tick BEFORE setState. setState
             // routes through rqEnter — once the pid is in the rq, an AP
@@ -1656,7 +1716,7 @@ pub fn wakeExpired() void {
             // the next tick (we'd be sleeping with wake_tick=0 briefly,
             // skipped by wakeExpired guard, but the fresh sysSleep would
             // overwrite it before any harm).
-            process.procs[i].wake_tick = 0;
+            @atomicStore(u64, &process.procs[i].wake_tick, 0, .release);
             setState(i, .ready);
         } else if (process.procs[i].state == .sleeping
             and process.tick_count -% wake_dbg_last_log >= 200)
@@ -1733,7 +1793,7 @@ pub fn kernelSleepMs(ms: u32) void {
     const cur = smp.myCpu().current_pid orelse return;
     const pcb = &process.procs[cur];
     const ticks = (ms + 9) / 10; // 100 Hz timer, round up
-    pcb.wake_tick = process.tick_count + ticks;
+    @atomicStore(u64, &pcb.wake_tick, process.tick_count + ticks, .release);
     setState(cur, .sleeping);
     smp.myCpu().pending_soft_yield = true;
     @import("sched_asm.zig").softYield();
@@ -1813,15 +1873,13 @@ pub fn blockOn(kind: WaitKind, target: u32) void {
     if (@atomicRmw(bool, &pcb.wake_pending, .Xchg, false, .acq_rel)) {
         return;
     }
-    pcb.wait_kind = kind;
-    pcb.wait_target = target;
+    setWait(pcb, kind, target);
     setState(cur, .sleeping);
     // Race check: did a wake() land between our test-and-clear above
     // and the setState? If so, roll back to .running and return — the
     // caller's condition is satisfied and yielding would lose the wake.
     if (@atomicLoad(bool, &pcb.wake_pending, .acquire)) {
-        pcb.wait_kind = .none;
-        pcb.wait_target = 0;
+        clearWait(pcb);
         setState(cur, .running);
         return;
     }
@@ -1834,8 +1892,7 @@ pub fn blockOn(kind: WaitKind, target: u32) void {
     @import("../debug/yield_loop.zig").observe(cur, kind, target, caller_ra);
     smp.myCpu().pending_soft_yield = true;
     @import("sched_asm.zig").softYield();
-    pcb.wait_kind = .none;
-    pcb.wait_target = 0;
+    clearWait(pcb);
 }
 
 
@@ -1858,31 +1915,27 @@ pub fn blockOnFutex(target: u32, word: *const volatile u32, val: u32) FutexResul
     if (hasPendingDeliverable(pcb)) return .signalled;
 
     @atomicStore(bool, &pcb.wake_pending, false, .release);
-    pcb.wait_kind = .futex;
-    pcb.wait_target = target;
+    setWait(pcb, .futex, target);
     setState(cur, .sleeping);
 
     // Race A: the waker stored a new *uaddr before we enrolled. (Futex contract:
     // the waker changes *uaddr, THEN calls FUTEX_WAKE.) Seeing the new value
     // means the wake is already in flight / done — don't park.
     if (word.* != val) {
-        pcb.wait_kind = .none;
-        pcb.wait_target = 0;
+        clearWait(pcb);
         setState(cur, .running);
         return .again;
     }
     // Race B: a FUTEX_WAKE landed during enrollment — wake() set wake_pending.
     if (@atomicLoad(bool, &pcb.wake_pending, .acquire)) {
-        pcb.wait_kind = .none;
-        pcb.wait_target = 0;
+        clearWait(pcb);
         setState(cur, .running);
         return .woke;
     }
 
     smp.myCpu().pending_soft_yield = true;
     @import("sched_asm.zig").softYield();
-    pcb.wait_kind = .none;
-    pcb.wait_target = 0;
+    clearWait(pcb);
     if (hasPendingDeliverable(pcb)) return .signalled;
     return .woke;
 }
@@ -1897,8 +1950,7 @@ pub fn wake(pid: u8) void {
     // store and its setState) can detect us via the re-check after setState.
     // Without this, the wake is silently lost and the task sleeps forever.
     @atomicStore(bool, &process.procs[pid].wake_pending, true, .release);
-    process.procs[pid].wait_kind = .none;
-    process.procs[pid].wait_target = 0;
+    clearWait(&process.procs[pid]);
     // pipe.read / pipe.write park themselves with state=.sleeping so the
     // int $0x20 yield actually reschedules (idt's yielded_from_kernel check
     // requires state != .running). Flip back to .ready here so the next
@@ -1920,28 +1972,24 @@ pub fn blockOnMutex(target_id: u32, owner_pid_ptr: *const u16) void {
     const cur = smp.myCpu().current_pid orelse return;
     const pcb = &process.procs[cur];
     @atomicStore(bool, &pcb.wake_pending, false, .release);
-    pcb.wait_kind = .mutex;
-    pcb.wait_target = target_id;
+    setWait(pcb, .mutex, target_id);
     setState(cur, .sleeping);
     // Race A: mutex got released between our caller's CAS-fail and our
     // enrollment. Don't sleep; caller will retry the CAS.
     if (@atomicLoad(u16, owner_pid_ptr, .acquire) == 0xFFFF) {
-        pcb.wait_kind = .none;
-        pcb.wait_target = 0;
+        clearWait(pcb);
         setState(cur, .running);
         return;
     }
     // Race B: a wake() landed between our wake_pending=false and now.
     if (@atomicLoad(bool, &pcb.wake_pending, .acquire)) {
-        pcb.wait_kind = .none;
-        pcb.wait_target = 0;
+        clearWait(pcb);
         setState(cur, .running);
         return;
     }
     smp.myCpu().pending_soft_yield = true;
     @import("sched_asm.zig").softYield();
-    pcb.wait_kind = .none;
-    pcb.wait_target = 0;
+    clearWait(pcb);
 }
 
 /// Wake every PCB sleeping on a Mutex with this target_id. Thundering-
@@ -1952,8 +2000,7 @@ pub fn wakeMutexWaiters(target_id: u32) void {
     for (0..MAX_PROCS) |i| {
         const t = &process.procs[i];
         if (t.state != .sleeping) continue;
-        if (t.wait_kind != .mutex) continue;
-        if (t.wait_target != target_id) continue;
+        if (!waitsOn(t, .mutex, target_id)) continue;
         wake(@intCast(i));
     }
 }
@@ -1969,8 +2016,7 @@ pub fn wakeSwapEvictWaiters(target: u32) void {
     for (0..MAX_PROCS) |i| {
         const t = &process.procs[i];
         if (t.state != .sleeping) continue;
-        if (t.wait_kind != .swap_evict) continue;
-        if (t.wait_target != target) continue;
+        if (!waitsOn(t, .swap_evict, target)) continue;
         wake(@intCast(i));
     }
 }
@@ -1982,8 +2028,7 @@ pub fn wakeIoUringWorker(instance_id: u32) void {
     for (0..MAX_PROCS) |i| {
         const t = &process.procs[i];
         if (t.state != .sleeping) continue;
-        if (t.wait_kind != .iouring_work) continue;
-        if (t.wait_target != instance_id) continue;
+        if (!waitsOn(t, .iouring_work, instance_id)) continue;
         wake(@intCast(i));
     }
 }
@@ -1995,8 +2040,7 @@ pub fn wakeIoUringCqWaiters(instance_id: u32) void {
     for (0..MAX_PROCS) |i| {
         const t = &process.procs[i];
         if (t.state != .sleeping) continue;
-        if (t.wait_kind != .iouring_cq) continue;
-        if (t.wait_target != instance_id) continue;
+        if (!waitsOn(t, .iouring_cq, instance_id)) continue;
         wake(@intCast(i));
     }
 }
@@ -2023,27 +2067,23 @@ pub fn blockOnSwapEvict(pte_ptr: *const u64) void {
     while (true) {
         if (!swap.pteIsInflight(@atomicLoad(u64, pte_ptr, .acquire))) return;
         @atomicStore(bool, &pcb.wake_pending, false, .release);
-        pcb.wait_kind = .swap_evict;
-        pcb.wait_target = target;
+        setWait(pcb, .swap_evict, target);
         setState(cur, .sleeping);
         // Race A: eviction committed/aborted between our pre-check and enroll.
         if (!swap.pteIsInflight(@atomicLoad(u64, pte_ptr, .acquire))) {
-            pcb.wait_kind = .none;
-            pcb.wait_target = 0;
+            clearWait(pcb);
             setState(cur, .running);
             return;
         }
         // Race B: wake() landed on us during enroll.
         if (@atomicLoad(bool, &pcb.wake_pending, .acquire)) {
-            pcb.wait_kind = .none;
-            pcb.wait_target = 0;
+            clearWait(pcb);
             setState(cur, .running);
             continue;
         }
         smp.myCpu().pending_soft_yield = true;
         @import("sched_asm.zig").softYield();
-        pcb.wait_kind = .none;
-        pcb.wait_target = 0;
+        clearWait(pcb);
         // Loop and re-check; the PTE may still be in-flight (spurious wake)
         // or settled (return on next iteration).
     }

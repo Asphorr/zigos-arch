@@ -69,7 +69,22 @@ inline fn entryPhys(entry: u64) usize {
 /// (ReleaseSafe panics on integer overflow, masking the real cause).
 inline fn tableFromEntry(entry: u64) [*]u64 {
     if (entry & PRESENT == 0) @panic("tableFromEntry: entry not present");
-    return @ptrFromInt(paging.physToVirt(entryPhys(entry)));
+    const phys = entryPhys(entry);
+    // Validate phys is within physmap-covered range. A garbage PD entry
+    // (corrupted table page) can have bit 51 set in the phys field; the
+    // next `physToVirt(phys) = PHYSMAP_BASE + phys` then overflows u64
+    // and ReleaseSafe panics on integer overflow without telling us the
+    // original PTE was the problem. With this guard, the panic message
+    // points at the corrupt PTE directly so the autopsy ring lookup in
+    // pmm.freeFrame's underflow path lines up with the right phys.
+    if (phys >= paging.PHYSMAP_SIZE) {
+        @import("../debug/serial.zig").print(
+            "[vmm] tableFromEntry: out-of-physmap PTE=0x{X} phys=0x{X} — table page is corrupt\n",
+            .{ entry, phys },
+        );
+        @panic("tableFromEntry: phys outside physmap (corrupt PTE)");
+    }
+    return @ptrFromInt(paging.physToVirt(phys));
 }
 
 /// Allocate a zeroed page frame and return it as a table pointer (via the

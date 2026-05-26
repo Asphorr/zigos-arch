@@ -144,7 +144,7 @@ export fn doSyscall(sys_num: u32, arg1: u32, arg2: u32, arg3: u32, frame_raw: *a
     // killed the process (currentPCB returns null after destroyCurrent), and
     // is a no-op when the process is mid-handler (in_signal_handler == true).
     if (process.currentPCB()) |pcb| {
-        if ((pcb.pending_signals & ~pcb.signal_mask) != 0) {
+        if ((@atomicLoad(u32, &pcb.pending_signals, .acquire) & ~pcb.signal_mask) != 0) {
             return signals.deliverFromSyscallFrame(pcb, frame, ret);
         }
     }
@@ -273,10 +273,10 @@ const SYSCALLS = [_]SyscallSpec{
     .{ .num = 70, .name = "net_tcp_connect",      .handler = wrap(net.sysNetTcpConnect) },
     .{ .num = 71, .name = "net_tcp_send",         .handler = wrap(net.sysNetTcpSend) },
     .{ .num = 72, .name = "net_tcp_recv",         .handler = wrap(net.sysNetTcpRecv) },
-    .{ .num = 73, .name = "net_tcp_close",        .handler = wrap(net.sysNetTcpClose) },
+    // 73 (net_tcp_close) removed 2026-05-26 — use close(fd); .tcp_sock arm in vfs.close.
     .{ .num = 74, .name = "net_tcp_status",       .handler = wrap(net.sysNetTcpStatus) },
     .{ .num = 75, .name = "net_tcp_listen",       .handler = wrap(net.sysNetTcpListen) },
-    .{ .num = 76, .name = "net_tcp_unlisten",     .handler = wrap(net.sysNetTcpUnlisten) },
+    // 76 (net_tcp_unlisten) removed 2026-05-26 — use close(fd); .tcp_listener arm in vfs.close.
     .{ .num = 77, .name = "net_tcp_accept",       .handler = wrap(net.sysNetTcpAccept) },
     .{ .num = 78, .name = "process_list",         .handler = wrap(proc.sysProcessList) },
     .{ .num = 79, .name = "usb_info",             .handler = wrap(sys.sysUsbInfo) },
@@ -320,6 +320,7 @@ const SYSCALLS = [_]SyscallSpec{
     .{ .num = 114, .name = "mmap_shared_anon",        .handler = wrap(mem.sysMmapSharedAnon) },
     .{ .num = 115, .name = "io_uring_setup",          .handler = wrap(sys_iouring_setup) },
     .{ .num = 116, .name = "io_uring_enter",          .handler = wrap(sys_iouring_enter) },
+    .{ .num = 117, .name = "debug_crash",             .handler = wrap(sys.sysDebugCrash) },
 };
 
 // Thin shims so the dispatch table can route into the iouring module
@@ -360,6 +361,7 @@ fn doSyscallInner(sys_num: u32, arg1: u32, arg2: u32, arg3: u32, frame: *signals
         114 => mem.sysMmapSharedAnon(arg1),
         115 => sys_iouring_setup(arg1),
         116 => sys_iouring_enter(arg1, arg2, arg3),
+        117 => sys.sysDebugCrash(arg1),
         5 => mem.sysSbrk(arg1),
         6 => proc.sysGetpid(),
         7 => proc.sysYield(),
@@ -429,10 +431,8 @@ fn doSyscallInner(sys_num: u32, arg1: u32, arg2: u32, arg3: u32, frame: *signals
         70 => net.sysNetTcpConnect(arg1, arg2),
         71 => net.sysNetTcpSend(arg1, arg2, arg3),
         72 => net.sysNetTcpRecv(arg1, arg2, arg3),
-        73 => net.sysNetTcpClose(arg1),
         74 => net.sysNetTcpStatus(arg1),
         75 => net.sysNetTcpListen(arg1),
-        76 => net.sysNetTcpUnlisten(arg1),
         77 => net.sysNetTcpAccept(arg1),
         78 => proc.sysProcessList(arg1, arg2),
         79 => sys.sysUsbInfo(arg1),

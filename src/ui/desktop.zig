@@ -3039,6 +3039,14 @@ pub fn run() void {
                 const pre_count: u8 = (w.events.head -% w.events.tail) & 31;
                 w.events.push(.{ .kind = kind, .a = ch, .b = mods });
                 const post_count: u8 = (w.events.head -% w.events.tail) & 31;
+                // Wake any io_uring OP_POLL waiters on a console fd. We
+                // can't filter by which pid owns the focused window here
+                // (fdpoll's wake walk does pollMaskConsole, which re-runs
+                // the focus/visibility/owner check), so the broadcast
+                // (.console, 0xFFFF) lets the matcher do its job.
+                if (post_count != pre_count) {
+                    @import("../cpu/fdpoll.zig").wakePollers(.console, 0xFFFF);
+                }
                 if (pre_count == post_count) {
                     // push() did NOT advance head — queue full, event dropped
                     dbg_event_queue_full +%= 1;
@@ -3814,6 +3822,25 @@ pub fn popEvent(pid: u8, out: *Event) bool {
         return true;
     }
     return false;
+}
+
+/// Peek-style predicate matching `popCharEvent` — returns true iff the
+/// next `popCharEvent(pid)` would succeed without blocking. Used by
+/// fdpoll's `pollMaskConsole` so OP_POLL can complete immediately when
+/// a console fd already has data ready, and re-check on wake. Pure
+/// read — does not pop, does not mutate queue state. Mirrors every
+/// gate inside popCharEvent; if those diverge, update both.
+pub fn consoleReadable(pid: u8) bool {
+    if (!slot_used[wm.focused]) return false;
+    const w = &windows[wm.focused];
+    if (!w.visible or w.minimized) return false;
+    if (w.term != null) return false;
+    if (w.owner_pid != pid) return false;
+    // Queue uses ring buffer: head==tail = empty. We don't peek event
+    // kinds — non-char events are vanishingly rare (no current pusher),
+    // and a stale POLLIN that resolves to zero bytes is benign (caller
+    // re-polls).
+    return w.events.head != w.events.tail;
 }
 
 /// Drain one char event from the focused window's queue and return its

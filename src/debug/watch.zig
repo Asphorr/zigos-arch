@@ -103,6 +103,28 @@ pub const WatchEntry = struct {
     /// the bug we're hunting. The predicate is called inside the #DB
     /// handler so it must be re-entrant-safe and fast (no locks, no I/O).
     whitelist_fn: ?*const fn (rip: u64, addr: u64) bool = null,
+    /// kesp+48 mirror-compare: when `mirror_pid_plus1 != 0`, suppresses the
+    /// hit if the post-write value at addr EQUALS
+    /// `save_trace.last_save_plus48[mirror_pid_plus1 - 1]`. Use case: hunt
+    /// the silent corrupter that overwrites a parked task's saved RA — every
+    /// legit switchTo save updates both the slot and the mirror to the same
+    /// value, so any post-write value that differs from the mirror is the
+    /// bug. mirror_pid_plus1 is the pid + 1 (0 = disabled) so the default
+    /// zero is "off".
+    mirror_pid_plus1: u8 = 0,
+    /// "Armed only while pid is parked" gate. When non-zero, the watch is
+    /// only effectively armed in `computeDr7` if procs[gate_pid_parked - 1]
+    /// is fully parked (state != .running AND no CPU is mid-scheduling-out
+    /// of it). Used to scope DR fires to the diagnostically-interesting
+    /// window (silent corruption while task is sleeping) and skip the
+    /// noise / cost of #DB on every legit switchTo save. The arm/disarm
+    /// is recomputed lazily in computeDr7 → applyLocal on each timer
+    /// tick + on every explicit applyLocal call from save_trace_record
+    /// (so the disarm-during-scheduling-out window updates the local
+    /// CPU's DR7 immediately, before switchTo writes kernel_esp).
+    /// 0 = disabled (always armed when .armed=true). Stored as pid+1 so
+    /// the default zero is "off".
+    gate_pid_parked_plus1: u8 = 0,
 };
 
 /// Canonical state. The actual DR registers on each CPU are kept in sync via
@@ -152,11 +174,45 @@ inline fn writeDr6(val: u64) void {
     );
 }
 
+/// Returns true if pid is "fully parked" — not running on any CPU AND no
+/// CPU is mid-scheduling-out of it. The scheduling-out window matters
+/// because the outgoing pid's state byte gets flipped to .sleeping/.ready
+/// BEFORE switchTo's `movq %rsp,(%rdi)` saves its kernel_esp; if the gate
+/// said "parked" then, that legit save would fire #DB and waste an
+/// exception cycle on a known-good writer. save_trace_record clears
+/// scheduling_out_pid right after the save, at which point we genuinely
+/// want subsequent writes to the same slot to fire.
+inline fn isPidFullyParked(pid: u8) bool {
+    const process = @import("../proc/process.zig");
+    const smp_mod = @import("../cpu/smp.zig");
+    if (pid >= process.MAX_PROCS) return false;
+    if (@atomicLoad(u8, @as(*const u8, @ptrCast(&process.procs[pid].state)), .acquire) ==
+        @intFromEnum(process.State.running)) return false;
+    for (&smp_mod.cpus, 0..) |*c, i| {
+        if (i != 0 and !c.alive) continue;
+        if (c.scheduling_out_pid == @as(u16, pid)) return false;
+    }
+    return true;
+}
+
+/// True iff `e` should contribute its enable bits to DR7 right now.
+/// Wraps the static `.armed` flag with the dynamic
+/// `gate_pid_parked_plus1` gate so a watch can opt into "only fire while
+/// the watched pid is parked" semantics without rewriting the suppression
+/// logic in onDebugException.
+inline fn entryEffectivelyArmed(e: WatchEntry) bool {
+    if (!e.armed) return false;
+    if (e.gate_pid_parked_plus1 != 0) {
+        return isPidFullyParked(e.gate_pid_parked_plus1 - 1);
+    }
+    return true;
+}
+
 /// Compute DR7 from `entries[]`. Bit 10 is reserved-must-be-1.
 fn computeDr7() u64 {
     var dr7: u64 = (1 << 10);
     for (entries, 0..) |e, i| {
-        if (e.armed) {
+        if (entryEffectivelyArmed(e)) {
             const shift_en: u6 = @intCast(2 * i + 1);
             const shift_rw: u6 = @intCast(16 + 4 * i);
             const shift_len: u6 = @intCast(18 + 4 * i);
@@ -220,7 +276,7 @@ pub fn initIpi() void {
 /// after entries[] is updated locally so all CPUs converge before the
 /// caller proceeds. No-op if initIpi() hasn't run yet (boot-time arms
 /// from BSP fall back to local-only — fine because APs aren't running yet).
-fn broadcastSync() void {
+pub fn broadcastSync() void {
     const v = ipi_vector orelse return;
     const my_id = apic.getLapicId();
     for (&smp.cpus) |*cpu| {
@@ -394,6 +450,31 @@ pub fn onDebugException(rsp: u64, saved_rip: u64) bool {
             const v = p.*;
             if (v == e.skip_value) continue;
         }
+        // kesp+48 mirror-compare: legit switchTo saves update both the slot
+        // and save_trace's last_save_plus48 mirror to the same value. Any
+        // post-write value that DIFFERS from the mirror is the silent
+        // corrupter we're hunting (the writer RIP captured in `saved_rip`
+        // names the culprit).
+        //
+        // Two additional guards: (a) suppress if pid is currently running/scheduling-out
+        // on ANY cpu — when the task is live, RSP moves below kesp+48 and
+        // new function calls (e.g., IRQ-time verifyEndCanary's push rbp)
+        // legitimately reuse the slot; (b) suppress if the watched address
+        // != current pcb.kernel_esp + 48 — the watch is on a stale (old)
+        // kesp slot that was abandoned when the task reparked at a different
+        // depth, so writes there are normal stack churn.
+        if (e.mirror_pid_plus1 != 0) {
+            const pid: u8 = e.mirror_pid_plus1 - 1;
+            const save_trace = @import("save_trace.zig");
+            const process = @import("../proc/process.zig");
+            if (save_trace.isPidRunningOrSchedulingOut(pid)) continue;
+            const kesp_now = @atomicLoad(usize, &process.procs[pid].kernel_esp, .acquire);
+            if (kesp_now +% 48 != e.addr) continue;
+            const p: *const u64 = @ptrFromInt(@as(usize, @intCast(e.addr)));
+            const v = p.*;
+            const mirror = save_trace.last_save_plus48[pid];
+            if (v == mirror) continue;
+        }
         // CS-slot filter: legit iretq frames always have CS=0x08 or 0x23.
         // Any other value is corruption (including 0x0 from shifted-frame
         // races, or 0x800005-style scrambled values).
@@ -561,6 +642,20 @@ pub const KESP_REROTATE_TICKS: u32 = 50;
 // crash). pcb_invariants.checkPcb catches the SLEEPING/READY case via
 // the same saved-RIP-text-range check, so this watch was redundant.
 pub const KESP_WATCHED_PIDS = [_]u8{ 2, 3 };
+// Silent-RA-flip hunt (2026-05-25): pid=2 desktop + pid=3 shell both saw
+// kesp+48 stomped from a real schedule RA to 0x80340317 (another
+// schedule-shaped address). Arm save_trace mirror-compare on these slots;
+// any write whose post-value differs from save_trace.last_save_plus48[pid]
+// fires with the writer RIP. Empty means "off".
+//
+// TEMPORARILY DISABLED 2026-05-25: enabling { 2, 3 } here regressed boot
+// against f813bec — splash drags ~10× longer to render under host SMI
+// load. Combined with the per-switch arm in save_trace_record (now also
+// off via hwbp_save_arm_enabled=false) and the per-tick rotation, going
+// from 2 → 4 active DR slots seems to compound badly with the slow
+// scheduler / nested-virt environment. Need to investigate WHY before
+// re-enabling — the structural diagnostic value of these is real, but
+// running them while the cause is unknown blocks all other work.
 pub const KESP_PLUS48_WATCHED_PIDS = [_]u8{};
 
 // 2026-05-19 attempt: re-enabled the deep canary on pid 2 at
@@ -632,6 +727,24 @@ fn isLegitDeepKstackWriter(rip: u64, addr: u64) bool {
 // Kernel VA base — any value written at *(kesp+48) below this is wild
 // (legit values are kernel .text RAs which all sit above KERNEL_VIRT_BASE).
 const KERNEL_VIRT_BASE: u64 = 0xFFFFFFFF80000000;
+
+/// Predicate: is this kesp+48 write a legitimate `call switchTo` push?
+///
+/// Every legit kesp+48 write comes from the `call switchTo` instruction
+/// inside `proc.sched.schedule` (that call pushes the return address onto
+/// the parked task's kstack, landing at kesp+48 after switchTo's 6 register
+/// pushes). save_trace_record runs AFTER switchTo's body, so there is a
+/// brief window where (post-write value at kesp+48) != (mirror) — the
+/// mirror-compare alone would false-positive on every save. Whitelist the
+/// writer RIP if it's inside schedule.
+///
+/// Anything OUTSIDE schedule writing to a parked task's kesp+48 is the
+/// silent corrupter we're hunting.
+pub fn isLegitKesp48Writer(rip: u64, _: u64) bool {
+    const r = symbols.resolveKernel(rip) orelse return false;
+    return std.mem.eql(u8, r.name, "proc.sched.schedule") or
+        std.mem.eql(u8, r.name, "proc.sched_asm.switchTo");
+}
 
 /// Predicate: is this kernel_esp write legitimate?
 ///
@@ -755,7 +868,8 @@ pub fn rotateKernelEspWatches() void {
         const want_addr = @intFromPtr(&process.procs[pid].kernel_esp);
         // Skip re-write if already armed at the right address — saves the
         // applyLocal churn on the steady state.
-        if (e.armed and e.addr == want_addr and e.whitelist_fn != null) continue;
+        if (e.armed and e.addr == want_addr and e.whitelist_fn != null and
+            e.gate_pid_parked_plus1 == pid + 1) continue;
         e.* = .{
             .armed = true,
             .addr = want_addr,
@@ -764,6 +878,14 @@ pub fn rotateKernelEspWatches() void {
             .policy = .panic_dump,
             .label = "kesp",
             .whitelist_fn = &isLegitKernelEspWriter,
+            // Gate: only fire while pid is fully parked. While the pid is
+            // running, every switchTo legitimately rewrites this field —
+            // arming through that wastes ~3000 cycles per dispatch on a
+            // suppression path. The gate cuts those out entirely; we still
+            // catch cross-stack-alias writes that land OUTSIDE legit
+            // switchTo because those happen with the pid parked (the
+            // attacker pid races against the watched pid's PCB slot).
+            .gate_pid_parked_plus1 = pid + 1,
         };
         any_change = true;
     }
@@ -795,7 +917,8 @@ pub fn rotateKernelEspWatches() void {
             }
             continue;
         }
-        if (e.armed and e.addr == want_addr and e.value_threshold == KERNEL_VIRT_BASE) continue;
+        if (e.armed and e.addr == want_addr and e.mirror_pid_plus1 == pid + 1 and
+            e.gate_pid_parked_plus1 == pid + 1) continue;
         e.* = .{
             .armed = true,
             .addr = want_addr,
@@ -803,7 +926,15 @@ pub fn rotateKernelEspWatches() void {
             .len = .eight,
             .policy = .panic_dump,
             .label = "kesp+48",
-            .value_threshold = KERNEL_VIRT_BASE,
+            .mirror_pid_plus1 = pid + 1,
+            .whitelist_fn = &isLegitKesp48Writer,
+            // Same gate as the kesp FIELD watch above: while pid is
+            // running, kesp+48 is meaningless — the saved-RIP slot has
+            // already been popped off and live stack churn writes there.
+            // The corruption we hunt only matters once the pid is fully
+            // parked and the slot is supposed to hold the next dispatch's
+            // RA.
+            .gate_pid_parked_plus1 = pid + 1,
         };
         any_change = true;
     }
@@ -811,6 +942,11 @@ pub fn rotateKernelEspWatches() void {
     // and onwards. Arms one address per watched pid at `kstack_top - OFFSET`.
     // No value threshold: ANY write to this address is interesting (no legit
     // writer should reach this deep into a live task's kstack).
+    //
+    // Skipped at comptime when KSTACK_DEEP_WATCHED_PIDS is empty so the u2
+    // slot index can't overflow when KESP_WATCHED_PIDS + KESP_PLUS48_WATCHED_PIDS
+    // already fill all four DR slots.
+    if (comptime KSTACK_DEEP_WATCHED_PIDS.len > 0) {
     const deep_base: u2 = @intCast(KESP_WATCHED_PIDS.len + KESP_PLUS48_WATCHED_PIDS.len);
     for (KSTACK_DEEP_WATCHED_PIDS, 0..) |pid, k| {
         const slot: u2 = deep_base + @as(u2, @intCast(k));
@@ -841,6 +977,7 @@ pub fn rotateKernelEspWatches() void {
             // already gates same-stack writers.
         };
         any_change = true;
+    }
     }
     if (any_change) applyLocal();
     // No broadcastSync — handleIRQ0's per-tick applyLocal on each CPU

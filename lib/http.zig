@@ -163,21 +163,22 @@ pub fn parseUrl(url: []const u8) Error!Url {
 }
 
 // ---------------------------------------------------------------------
-// Transport: TCP for http, TLS for https. The slot id is a u8; we
-// disambiguate by `is_tls` because TCP and TLS pools are independent.
+// Transport: TCP for http, TLS for https. TCP is an fd post the
+// sockets-as-fds migration (2026-05-26); TLS is still a u8 slot from
+// the kernel TLS pool. Both fit in a u32 handle; is_tls picks the route.
 
 const Conn = struct {
     is_tls: bool,
-    slot: u8,
+    handle: u32,
 
     fn open(url: Url) Error!Conn {
         const ip = libc.parseIp(url.host) orelse libc.resolve(url.host) orelse return Error.DnsFailure;
         if (url.scheme == .https) {
             const slot = libc.tlsConnect(ip, url.port, url.host) orelse return Error.TlsFailure;
-            return .{ .is_tls = true, .slot = slot };
+            return .{ .is_tls = true, .handle = @as(u32, slot) };
         } else {
-            const slot = libc.tcpConnect(ip, url.port) orelse return Error.ConnectFailure;
-            return .{ .is_tls = false, .slot = slot };
+            const fd = libc.tcpConnect(ip, url.port) orelse return Error.ConnectFailure;
+            return .{ .is_tls = false, .handle = fd };
         }
     }
 
@@ -187,11 +188,11 @@ const Conn = struct {
             var off: usize = 0;
             while (off < data.len) {
                 const want = @min(data.len - off, 16 * 1024);
-                _ = libc.tlsSend(self.slot, data[off .. off + want]) orelse return Error.SendFailure;
+                _ = libc.tlsSend(@intCast(self.handle), data[off .. off + want]) orelse return Error.SendFailure;
                 off += want;
             }
         } else {
-            if (!libc.tcpSend(self.slot, data)) return Error.SendFailure;
+            if (!libc.tcpSend(self.handle, data)) return Error.SendFailure;
         }
     }
 
@@ -201,18 +202,18 @@ const Conn = struct {
     fn recv(self: Conn, buf: []u8) Error!usize {
         if (buf.len == 0) return 0;
         if (self.is_tls) {
-            return libc.tlsRecv(self.slot, buf) orelse return Error.RecvFailure;
+            return libc.tlsRecv(@intCast(self.handle), buf) orelse return Error.RecvFailure;
         }
         // TCP poll loop: tcpRecv returns 0 when there's nothing buffered.
         // Re-check peer status periodically; bail on EOF.
         var spins: u32 = 0;
         while (true) {
-            const n = libc.tcpRecv(self.slot, buf);
+            const n = libc.tcpRecv(self.handle, buf);
             if (n > 0) return n;
-            const status = libc.tcpStatus(self.slot);
+            const status = libc.tcpStatus(self.handle);
             if ((status & libc.TCP_STATUS_PEER_CLOSED) != 0) {
                 // One last drain attempt in case peer-close raced our recv.
-                const n2 = libc.tcpRecv(self.slot, buf);
+                const n2 = libc.tcpRecv(self.handle, buf);
                 if (n2 > 0) return n2;
                 return 0;
             }
@@ -225,7 +226,7 @@ const Conn = struct {
     }
 
     fn close(self: Conn) void {
-        if (self.is_tls) libc.tlsClose(self.slot) else libc.tcpClose(self.slot);
+        if (self.is_tls) libc.tlsClose(@intCast(self.handle)) else libc.tcpClose(self.handle);
     }
 };
 

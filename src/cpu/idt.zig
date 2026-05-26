@@ -870,26 +870,6 @@ export fn handleException(rsp: u64) callconv(.c) void {
             cr2,
         });
 
-        // Kstack-protect smoking gun: kernel-mode write #PF on a present
-        // page that belongs to a PROTECTED_PIDS kstack. CR2 = the exact
-        // byte the wild writer aimed at; saved_rip = the writer's
-        // instruction. Logged BEFORE the rest of the autopsy so it lands
-        // even if a follow-up step itself faults.
-        if ((error_code & 4) == 0 and (error_code & 2) != 0 and (error_code & 1) != 0) {
-            if (@import("../debug/kstack_protect.zig").faultBelongsToProtectedKstack(@intCast(cr2))) |victim| {
-                const writer_pid: ?usize = if (@import("smp.zig").myCpu().current_pid) |p| p else null;
-                @import("../debug/kstack_protect.zig").dumpFault(
-                    victim,
-                    @intCast(cr2),
-                    @intCast(saved_rip),
-                    writer_pid,
-                );
-                // Auto-unprotect so the panic path / autopsy chain doesn't
-                // double-fault on the same RO page. We already have the
-                // smoking gun (writer's RIP + CR2 + writer pid).
-                @import("../debug/kstack_protect.zig").unprotectPidIfProtected(@as(usize, victim));
-            }
-        }
         // SMAP-violation classifier — supervisor #PF on a present page in
         // user-VA range almost certainly means kernel touched user memory
         // without STAC (i.e. outside an active syscall validateUserPtr
@@ -1164,16 +1144,6 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
     // Catches cross-stack-aliasing / kesp-clobber / kstack_top mismatch
     // shortly after they happen instead of after they manifest downstream.
     @import("../debug/pcb_invariants.zig").maybeScan();
-    // Per-tick kstack saved-RIP mirror-flip monitor (see kstack_protect.zig).
-    // Runs on EVERY CPU's IRQ0, not just BSP — the netstat hunt found that
-    // the victim is typically on cpu1 (shell) while BSP runs desktop, so a
-    // BSP-only check never sees pid=3 in a parked state. Per-pid flip_logged
-    // dedup makes concurrent fires from BSP+AP harmless (worst case one
-    // extra log line). Narrows the writer window to ~10 ms.
-    @import("../debug/kstack_protect.zig").tickMonitor();
-    // (Per-save kstack protection auto-arm removed — wedges silently when
-    // the protect fires inside switchTo. Function kept in kstack_protect
-    // for manual experimentation. See save_trace.zig for context.)
     // Cross-CPU aliasing scan — runs every 100 ticks (~1s) on BSP only.
     // (cheaper than per-CPU, since the state it checks is global). Catches
     // current_pid / idle_pid / tss.rsp0 collisions that would otherwise
@@ -1412,7 +1382,7 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
 fn deliverPendingToReturnFrame(cpu: *@import("smp.zig").CpuLocal, new_rsp: u64) void {
     const cur_pid = cpu.current_pid orelse return;
     const pcb = process.getPCB(cur_pid);
-    if ((pcb.pending_signals & ~pcb.signal_mask) == 0) return;
+    if ((@atomicLoad(u32, &pcb.pending_signals, .acquire) & ~pcb.signal_mask) == 0) return;
     if (pcb.in_signal_handler) return;
     const frame: *signals.IrqFrame = @ptrFromInt(new_rsp);
     if ((frame.cs & 3) == 0) return; // returning to kernel — no handler call

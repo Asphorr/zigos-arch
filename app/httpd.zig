@@ -154,7 +154,7 @@ fn jsonResult() []const u8 {
 /// first line (`GET /path HTTP/1.x`), so once we see `\r\n\r\n` we stop.
 /// Also bails immediately when `should_quit` flips — so a client that
 /// connected then went silent doesn't extend Ctrl+C latency by 3 s.
-fn readRequest(conn: u8, buf: []u8) ?usize {
+fn readRequest(conn: u32, buf: []u8) ?usize {
     var total: usize = 0;
     var iters: u32 = 0;
     while (iters < READ_TIMEOUT_ITERS) : (iters += 1) {
@@ -215,22 +215,22 @@ fn isSafePath(p: []const u8) bool {
     return true;
 }
 
-fn sendStatus(conn: u8, line: []const u8) void {
+fn sendStatus(conn: u32, line: []const u8) void {
     _ = libc.tcpSend(conn, "HTTP/1.0 ");
     _ = libc.tcpSend(conn, line);
     _ = libc.tcpSend(conn, "\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
 }
 
-fn sendNotFound(conn: u8) void {
+fn sendNotFound(conn: u32) void {
     sendStatus(conn, "404 Not Found");
 }
 
-fn sendBadRequest(conn: u8) void {
+fn sendBadRequest(conn: u32) void {
     sendStatus(conn, "400 Bad Request");
 }
 
 /// Send a JSON body with HTTP/1.0 200 + Content-Length + close.
-fn sendJsonResponse(conn: u8, body: []const u8) void {
+fn sendJsonResponse(conn: u32, body: []const u8) void {
     var len_buf: [16]u8 = undefined;
     const len_str = formatU32(&len_buf, @intCast(body.len));
     _ = libc.tcpSend(conn, "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: ");
@@ -242,7 +242,7 @@ fn sendJsonResponse(conn: u8, body: []const u8) void {
 /// Plain-text variant of sendJsonResponse for endpoints that don't benefit
 /// from JSON wrapping (e.g. raw log dumps that the client renders into a
 /// <pre>). Same Content-Length / no-store / CORS headers.
-fn sendTextResponse(conn: u8, body: []const u8) void {
+fn sendTextResponse(conn: u32, body: []const u8) void {
     var len_buf: [16]u8 = undefined;
     const len_str = formatU32(&len_buf, @intCast(body.len));
     _ = libc.tcpSend(conn, "HTTP/1.0 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nCache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: ");
@@ -399,7 +399,7 @@ fn apiAll() []const u8 {
 /// Dispatch /api/* routes. `route` is the path segment after /api/.
 /// Returns true if a route was matched (and a response sent), false to fall
 /// through to file serving.
-fn handleApi(conn: u8, route: []const u8) bool {
+fn handleApi(conn: u32, route: []const u8) bool {
     if (equals(route, "uptime")) {
         sendJsonResponse(conn, apiUptime());
         return true;
@@ -454,7 +454,7 @@ fn apiLog() []const u8 {
     return json_buf[0..json_len];
 }
 
-fn serveFile(conn: u8, doc_path: []const u8, ctype: []const u8) void {
+fn serveFile(conn: u32, doc_path: []const u8, ctype: []const u8) void {
     const size = libc.fsize(doc_path) orelse {
         sendNotFound(conn);
         return;
@@ -490,7 +490,7 @@ fn serveFile(conn: u8, doc_path: []const u8, ctype: []const u8) void {
     _ = libc.tcpSend(conn, buf[0..total]);
 }
 
-fn handleConn(conn: u8) void {
+fn handleConn(conn: u32) void {
     var req_buf: [REQUEST_BUF]u8 = undefined;
     const req_len = readRequest(conn, &req_buf) orelse {
         sendBadRequest(conn);

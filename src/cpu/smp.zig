@@ -199,8 +199,8 @@ pub const CpuLocal = struct {
     /// previous save's slot, which the still-running prev task is busily
     /// overwriting with whatever its current code path is doing (often
     /// 0xAAAAAAAAAAAAAAAA from Zig's ReleaseSafe undefined-init pattern).
-    /// pcb_invariants and kstack_protect.tickMonitor skip the saved-RIP
-    /// validation when any CPU has this set for the inspected pid, otherwise
+    /// pcb_invariants skips the saved-RIP validation when any CPU has this
+    /// set for the inspected pid, otherwise
     /// they false-fire on transient stack residue.
     ///   0xFFFF = no transient in progress on this CPU.
     /// 2026-05-19: introduced after pcb-invariant panic'd on

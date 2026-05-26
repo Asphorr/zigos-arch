@@ -124,7 +124,7 @@ pub const Priority = enum(u8) {
     interactive = 2,
 };
 
-pub const FsType = enum(u8) { console = 0, fat32 = 1, tarfs = 2, pipe = 3, devfs = 4, procfs = 5, ext2 = 6 };
+pub const FsType = enum(u8) { console = 0, fat32 = 1, tarfs = 2, pipe = 3, devfs = 4, procfs = 5, ext2 = 6, tcp_sock = 7, tcp_listener = 8 };
 
 /// Generic blocking primitive used by waitpid + pipe read/write. The scheduler
 /// treats a PCB with wait_kind != .none as not runnable. Exactly one waiter
@@ -145,6 +145,8 @@ pub const WaitKind = enum(u8) {
     iouring_cq, // wait_target = io_uring instance index. io_uring_enter parks here when caller asked for min_complete > 0; worker wakes it after writing each CQE.
 };
 
+// Per-fd table entry. All fields are owner-pid only — fd_table lives on
+// the PCB and is only touched on syscall paths running as that PID.
 pub const FileDesc = struct {
     in_use: bool = false,
     inode: u32 = 0,
@@ -162,12 +164,15 @@ pub const FileDesc = struct {
 };
 
 pub const PCB = struct {
-    state: State = .unused,
-    kernel_esp: usize = 0,
-    kernel_stack_top: usize = 0,
+    // Access-tag legend (see docs/STYLE.md): (p:lock) protected by lock,
+    // (a) atomic, (c) const-after-init. Fields without a tag are
+    // owner-pid / owner-CPU only.
+    state: State = .unused, // (a) mutate via sched.setState — setstate_locks[pid] serializes
+    kernel_esp: usize = 0, // (p:rq.lock) switchTo saves on switch-out
+    kernel_stack_top: usize = 0, // (c) assigned at allocKstack
     // VMM fields
-    page_directory: ?[*]align(4096) u64 = null,
-    page_dir_phys: usize = 0,
+    page_directory: ?[*]align(4096) u64 = null, // (c) createAddressSpace, RO after
+    page_dir_phys: usize = 0, // (c) createAddressSpace, RO after
     user_brk: usize = memmap.USER_BRK_INITIAL, // sbrk start; sits above kernel heap (see memmap.zig)
     // mmap allocator (sysMmap). VAs grow downward from USER_SPACE_END so they
     // don't collide with the upward-growing user_brk; collision is rejected
@@ -175,11 +180,11 @@ pub const PCB = struct {
     // unmapped VA into a free list (pages are freed, just the address space
     // isn't compacted). v2 problem; bump-allocator works fine for short-lived
     // apps and the few hundred MB of user space is plenty for now.
-    mmap_top: usize = MMAP_TOP_INIT,
-    // File descriptor table
+    mmap_top: usize = MMAP_TOP_INIT, // (p:as_lock)
+    // File descriptor table — owner-pid only
     fd_table: [MAX_FDS]FileDesc = initFdTable(),
     // Sleep support
-    wake_tick: u64 = 0,
+    wake_tick: u64 = 0, // (a) sysSleep + sched wakeExpired + virtio_gpu IRQ; cross-CPU readable
     // Race-free wake handshake. wake() sets this BEFORE clearing wait_kind /
     // setStating .ready, so a blockOn that just set wait_kind but hasn't yet
     // setState(.sleeping) can detect the race after setState and roll back.
@@ -189,7 +194,7 @@ pub const PCB = struct {
     // "shell stops accepting input after a few keystrokes" / "calc clicks
     // dead" — both apps eventually call blockOn (via pipe.read or sysSleep)
     // and lose a wake to this race. Atomic for cross-CPU visibility.
-    wake_pending: bool = false,
+    wake_pending: bool = false, // (a) wake-handshake; cross-CPU
     // Swap slot owned by an evictFrame call currently in progress on this PCB
     // (between phase-1 CAS and phase-3 CAS). 0xFFFFFFFF = no in-flight slot.
     // Lets process teardown free the slot if this thread is killed while
@@ -197,24 +202,24 @@ pub const PCB = struct {
     // a no-op on .zombie and the slot would leak. evictFrame stores at phase-1
     // success, clears at phase-3 / writePage-fail. Atomic so killProcess can
     // read it safely from another CPU.
-    swap_inflight_slot: u32 = 0xFFFFFFFF,
+    swap_inflight_slot: u32 = 0xFFFFFFFF, // (a) cross-CPU readable by killProcess
     // Process name (for window titles / icon matching)
-    name: [16]u8 = [_]u8{0} ** 16,
-    name_len: u8 = 0,
+    name: [16]u8 = [_]u8{0} ** 16, // (c) set at create/exec
+    name_len: u8 = 0, // (c)
     // Real argv vector. argv[0] is the program name without `.elf`; argv[1..
     // argc] are user-supplied args parsed out of the exec string by splitting
     // on spaces. Replaces the old single-string `exec_arg`/`exec_arg_len`,
     // which couldn't represent multi-arg invocations like `cat foo bar`.
     // syscall 25 (getExecArg) is preserved as a backward-compat shim by
     // joining argv[1..] with spaces in the kernel.
-    argv: [config.MAX_ARGS][config.MAX_ARG_LEN]u8 =
+    argv: [config.MAX_ARGS][config.MAX_ARG_LEN]u8 = // (c) set at exec
         [_][config.MAX_ARG_LEN]u8{[_]u8{0} ** config.MAX_ARG_LEN} ** config.MAX_ARGS,
-    arg_lens: [config.MAX_ARGS]u8 = [_]u8{0} ** config.MAX_ARGS,
-    argc: u8 = 0,
+    arg_lens: [config.MAX_ARGS]u8 = [_]u8{0} ** config.MAX_ARGS, // (c)
+    argc: u8 = 0, // (c)
     // Scheduler — track consecutive ticks for fairness
-    ticks_used: u32 = 0,
-    priority: Priority = .normal,
-    last_cpu: u8 = 0, // CPU this process last ran on (for affinity)
+    ticks_used: u32 = 0, // (p:rq.lock)
+    priority: Priority = .normal, // (p:rq.lock)
+    last_cpu: u8 = 0, // (p:rq.lock) CPU this process last ran on (affinity)
     // GPU 3D context
     gpu_ctx_id: u32 = 0,
     gpu_has_ctx: bool = false,
@@ -228,8 +233,8 @@ pub const PCB = struct {
     // Lazy regions: VA ranges whose pages get allocated on first access via the
     // page-fault handler. Used for: 64KB user stack (avoids upfront cost),
     // sbrk heap (grows on demand), and demand-paged ELF segments.
-    lazy_regions: [MAX_LAZY_REGIONS]LazyRegion = [_]LazyRegion{.{}} ** MAX_LAZY_REGIONS,
-    lazy_count: u8 = 0,
+    lazy_regions: [MAX_LAZY_REGIONS]LazyRegion = [_]LazyRegion{.{}} ** MAX_LAZY_REGIONS, // (p:as_lock)
+    lazy_count: u8 = 0, // (p:as_lock)
     /// Address-space stability lock (leader-owned, non-leader threads access via
     /// `leader(pcb).as_lock`). Acquired by:
     ///   - AS-mutating syscalls: sysSbrk, sysMmap, sysMmapSharedAnon, sysMunmap,
@@ -244,19 +249,19 @@ pub const PCB = struct {
     as_lock: @import("spinlock.zig").Mutex = .{},
     // Index of the lazy region tracking the heap (sbrk). -1 = no heap region
     // has been registered yet. Allows sysSbrk to extend in place across calls.
-    heap_lazy_idx: i8 = -1,
+    heap_lazy_idx: i8 = -1, // (p:as_lock)
     // Swap clock cursor (a user VA): reclaimViaSwap resumes its cold-page
     // eviction scan from here so it doesn't rescan already-evicted pages on
     // every fault (turns an O(n^2) linear-scan workload into O(n)).
     swap_clock_va: usize = 0,
     // Per-process kernel-side ELF buffer (PMM-allocated contiguous frames).
     // Lazy regions for PT_LOAD segments reference this; freed on process destroy.
-    elf_buf: ?[*]u8 = null,
-    elf_buf_pages: u32 = 0,
+    elf_buf: ?[*]u8 = null, // (c) set at exec
+    elf_buf_pages: u32 = 0, // (c)
     // Bottom of the user stack (lazy region start). Set by elf_loader. The
     // page-fault handler treats faults in [stack_base - GUARD_SIZE, stack_base)
     // as stack overflow rather than a generic segfault.
-    stack_base: usize = 0,
+    stack_base: usize = 0, // (c) set at exec
     // Cycles spent descheduled inside the current syscall — bumped by blocking
     // primitives (yield/sleep) and subtracted by doSyscall so the syscall
     // counter reflects CPU time, not wall time.
@@ -265,18 +270,18 @@ pub const PCB = struct {
     // 0 means "no parent" (kernel-spawned, e.g. desktop). When this process
     // exits, killProcess/destroyCurrent looks for procs[parent_pid] with a
     // matching wait_kind == .waitpid and wakes it.
-    parent_pid: u8 = 0,
+    parent_pid: u8 = 0, // (c) set at create/fork
     // Exit status reported via sysWaitpid. Valid only when state == .zombie.
     exit_status: u32 = 0,
     // Generic blocking primitive (used by waitpid + pipe.read/write).
     // Scheduler skips PCBs with wait_kind != .none.
-    wait_kind: WaitKind = .none,
-    wait_target: u32 = 0,
+    wait_kind: WaitKind = .none, // (a) blockOn writes; wake() reads cross-CPU
+    wait_target: u32 = 0, // (a) read by wake() to match waiters
     // --- POSIX signals (src/signals.zig) ---
     // Pending bitmap — bit N = signal N is pending. Cleared when delivered.
     // u32 caps us at NSIG=32 which matches POSIX 1..31; widening to u64 +
     // rt-signals is a future tunable in config.zig.
-    pending_signals: u32 = 0,
+    pending_signals: u32 = 0, // (a) atomic OR by signal sender (any CPU)
     // Currently blocked signals (sigprocmask). Signals marked pending while
     // blocked stay pending until unblocked, then deliver in numeric order.
     signal_mask: u32 = 0,
@@ -303,7 +308,7 @@ pub const PCB = struct {
     // see the same mmap'd address space.
     //
     // 0xFF means "not assigned yet"; create() and clone() fill it in.
-    tgid: u8 = 0xFF,
+    tgid: u8 = 0xFF, // (c) set at create/clone
 
     // --- Sessions / process groups (POSIX setsid / setpgid) -------------
     // Process group ID = pid of the group leader. Default fill-in (by
@@ -313,7 +318,7 @@ pub const PCB = struct {
     // self_pid). Used for kill(-PID) → "signal whole group", for shell
     // job control's foreground-group concept, and for daemons that detach
     // from the parent shell's session via setsid.
-    pgid: u8 = 0,
+    pgid: u8 = 0, // (c) inherited or set by setpgid/setsid
     // Session ID = pid of the session leader. Boot session is whatever sid
     // the desktop kernel-task ends up with (it's never set explicitly, so
     // its children inherit the create()-default of self_pid). User
@@ -321,7 +326,7 @@ pub const PCB = struct {
     // and it's no longer in any other process group. Daemons run their
     // own session so closing the parent shell's session leader doesn't
     // SIGHUP them.
-    sid: u8 = 0,
+    sid: u8 = 0, // (c) inherited or set by setsid
 
     // Per-thread TLS base (written to IA32_FS_BASE on dispatch). 0 = no
     // TLS / inherit. Set by sysSetTls.
@@ -335,14 +340,14 @@ pub const PCB = struct {
     // own syscall, the per-CPU slot is overwritten. Schedule saves the
     // slot here on switch-out and restores from here on switch-in so each
     // thread's sysret pops the right user RSP.
-    user_rsp_save: u64 = 0,
+    user_rsp_save: u64 = 0, // (p:rq.lock) switchTo saves on switch-out
 
     // PCID for this address space (CR4.PCIDE). 0 = no tagging (kernel
     // tasks or PCID feature unavailable). User PCBs get a non-zero PCID
     // from `pcid.alloc` when their page_dir_phys is assigned and free it
     // on destroyAddressSpace. The schedule path uses pcid + the per-CPU
     // generation tracker to set CR3 bit 63 (preserve-TLB) on reloads.
-    pcid: u16 = 0,
+    pcid: u16 = 0, // (c) pcid.alloc in createAddressSpace; RO after
 
     // iretq-frame snapshot tripwire (task #230). Captured by
     // debug.iretq_canary.capture() at IRQ/exception entry; checked at
@@ -358,18 +363,18 @@ pub const PCB = struct {
     // a current task: when no user task is ready, schedule() dispatches
     // the cpu's own idle. This eliminates the "scheduler context with stale
     // per_cpu_asm" failure mode that powered the iretq-aliasing bug class.
-    is_idle: bool = false,
+    is_idle: bool = false, // (c) set at idle-PCB creation
     // Which CPU owns this idle PCB. pickNext only picks an idle PCB when
     // cpu.cpu_id == idle_cpu — prevents two CPUs from racing onto the
     // same idle kstack (the bug we observed before per-CPU idle existed).
-    idle_cpu: u8 = 0xFF,
+    idle_cpu: u8 = 0xFF, // (c)
     // CPU pin for non-idle kernel tasks (desktop). Only this CPU picks
     // them. 0xFF = unpinned (normal user task — schedulable anywhere).
     // Without this, an AP can pick the desktop kernel task (its priority
     // is higher than user tasks), causing two CPUs to run desktop on
     // its single kstack and trip BSP-only assertions. Set by
     // createKernelTask from its `cpu_id` arg.
-    pinned_cpu: u8 = 0xFF,
+    pinned_cpu: u8 = 0xFF, // (c)
 
     // --- Phase 1 runqueue parallel-tracking (scheduler rewrite) -----------
     // Which CPU's `runqueue` this PCB is enqueued on when state == .ready.
@@ -377,13 +382,13 @@ pub const PCB = struct {
     // user tasks; copies idle_cpu / pinned_cpu when those are set). Phase
     // 4's load balancer will mutate this under both rq.lock acquisitions.
     // 0xFF = not yet assigned (between allocSlot and the post-init assign).
-    assigned_cpu: u8 = 0xFF,
+    assigned_cpu: u8 = 0xFF, // (c) Phase 1; will become (p:rq.lock) in Phase 4 balancer
     // Cross-CPU exit signal. The killer sets this true atomically + IPIs
     // the assigned_cpu; that CPU's schedule() observes the flag on its
     // own current task and tears self down on its own kstack — closing
     // the kill-vs-save race without the dead-letter machinery. Phase 1
     // only stores the field; the consumer lands in Phase 2's cutover.
-    exit_requested: bool = false,
+    exit_requested: bool = false, // (a) cross-CPU; set by killer, observed in schedule()
 
     // --- CFS-style vruntime (scheduler rewrite, post-Phase 7) -------------
     // Accumulated CPU "fair-share" time in ticks. Bumped by accountRunningTick
@@ -391,12 +396,12 @@ pub const PCB = struct {
     // weight so that lower-nice (higher-priority) tasks accumulate vruntime
     // slower → get picked more often within their band. Pickers select the
     // lowest vruntime within each priority band.
-    vruntime: u64 = 0,
+    vruntime: u64 = 0, // (p:rq.lock) accountRunningTick + rqEnter / pickNext
     // Tick at which the current run-slice began (set by schedule() when
     // this PCB transitions to .running). On the next preempt or
     // checkPreempt firing, `tick_count - slice_start_tick` is the slice
     // length used for ideal_runtime gating.
-    slice_start_tick: u64 = 0,
+    slice_start_tick: u64 = 0, // (p:rq.lock)
     // Linux-style nice value, range -20..19 (defaults to 0). Lower = more
     // CPU share, higher = less. Maps to a weight via NICE_WEIGHTS; vruntime
     // increment per tick = NICE_0_WEIGHT / weight[20+nice]. So nice=-20
@@ -405,7 +410,7 @@ pub const PCB = struct {
     // band, this lets userspace fine-tune CPU share without changing the
     // band. setpriority(#47) still picks the BAND; sysSetNice (#101) picks
     // the WEIGHT within the band.
-    nice: i8 = 0,
+    nice: i8 = 0, // (p:rq.lock)
 
     // --- Accounting (process accounting infra) ----------------------------
     // Counters maintained by scheduler / page-fault handler / syscall
@@ -493,6 +498,9 @@ pub const PROT_EXEC: u8 = 4;
 pub const PROT_RW: u8 = PROT_READ | PROT_WRITE;
 pub const PROT_RWX: u8 = PROT_READ | PROT_WRITE | PROT_EXEC;
 
+// Per-region demand-paging descriptor. Stored inside `PCB.lazy_regions`;
+// all field reads/writes go through that array, so the access discipline
+// is `(p:as_lock)` inherited from the array's annotation.
 pub const LazyRegion = struct {
     start: usize = 0,
     end: usize = 0, // exclusive
@@ -776,6 +784,7 @@ pub const clearInflightSlot = @import("lifecycle.zig").clearInflightSlot;
 pub const reclaimInflightSlot = @import("lifecycle.zig").reclaimInflightSlot;
 pub const killProcessWithStatus = @import("lifecycle.zig").killProcessWithStatus;
 pub const killProcess = @import("lifecycle.zig").killProcess;
+pub const killThreadGroup = @import("lifecycle.zig").killThreadGroup;
 pub const reparentChildren = @import("lifecycle.zig").reparentChildren;
 pub const maybeReapZombies = @import("lifecycle.zig").maybeReapZombies;
 pub const reapStaleZombies = @import("lifecycle.zig").reapStaleZombies;

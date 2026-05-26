@@ -500,8 +500,20 @@ pub fn kfree(ptr: [*]u8) void {
         block_addr -= BLOCK_ALIGN;
     }
     if (!found) {
+        // Wild free: pointer doesn't sit inside any live block we can
+        // scan back to. Causes: kfree(p + offset) on a non-allocation
+        // boundary; kfree on a stack/static/userspace pointer; double-
+        // free racing a different freer. Either way it's a real kernel
+        // bug — surface loud instead of silently leaking. Matches the
+        // tail-canary panic policy a few lines below (consistent: every
+        // heap-corruption class fails the same way).
         serial.print("[tlsf] free: no header for ptr 0x{X:0>16} (scan {d} bytes)\n", .{ addr, scanned });
-        return;
+        // Release before @panic: Zig's @panic does not unwind, so the
+        // outer `defer lock.releaseIrqRestore` would never run and the
+        // lock-dump autopsy reports heap.lock as held. Cosmetic (kernel
+        // halts either way), but a clean lock-dump is worth two lines.
+        lock.releaseIrqRestore(irq_flags);
+        @panic("tlsf: kfree on non-heap or non-block-aligned pointer");
     }
 
     // Validate canaries.
@@ -512,6 +524,8 @@ pub fn kfree(ptr: [*]u8) void {
         const tail_ptr: *align(1) const u32 = @ptrFromInt(tail_addr);
         if (tail_ptr.* != CANARY_TAIL) {
             serial.print("\n!!! HEAP CORRUPTION: tail canary at 0x{X:0>16}: got 0x{X:0>8} want 0x{X:0>8} (user_size={d} block=0x{X:0>16})\n", .{ tail_addr, tail_ptr.*, CANARY_TAIL, user_size, block_addr });
+            // Release before @panic — same reason as the no-header path.
+            lock.releaseIrqRestore(irq_flags);
             @panic("tlsf: buffer overflow — tail canary corrupted");
         }
     }

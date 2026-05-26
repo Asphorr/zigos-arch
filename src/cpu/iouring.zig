@@ -52,11 +52,19 @@ const E_NOMEM = common.E_NOMEM;
 const E_FAULT = common.E_FAULT;
 const E_BADF = common.E_BADF;
 
+const fdpoll = @import("fdpoll.zig");
+
 pub const OP_NOP: u8 = 0;
 pub const OP_READ: u8 = 1;
 pub const OP_WRITE: u8 = 2;
 pub const OP_NVME_READ: u8 = 3;
 pub const OP_NVME_WRITE: u8 = 4;
+/// Wait until `fd` is ready for the events specified in `sqe.len`
+/// (POLLIN|POLLOUT|... — see fdpoll.zig). Returns the ready mask in
+/// CQE.res, or a negative errno on bad fd / out-of-waiters. Submitted
+/// like any other SQE; completion happens when the underlying fd's
+/// subsystem (pipe/console/etc) calls fdpoll.wakePollers.
+pub const OP_POLL: u8 = 5;
 
 pub const MAX_ENTRIES: u32 = 256;
 pub const MIN_ENTRIES: u32 = 1;
@@ -75,6 +83,7 @@ const ERES_BADF: i32 = -9;
 const ERES_FAULT: i32 = -14;
 const ERES_INVAL: i32 = -22;
 const ERES_IO: i32 = -5;
+const ERES_NOMEM: i32 = -12;
 
 pub const Sqe = extern struct {
     opcode: u8,
@@ -128,6 +137,14 @@ const PendingOp = struct {
     /// re-written by any other context, so no atomic needed.
     done: bool = false,
     success: bool = false,
+    /// OP_POLL only — set by fdpoll's completion callback to the ready
+    /// mask that triggered the wake. Worker reads after observing
+    /// `done` with Acquire, then posts CQE.res = poll_mask.
+    poll_mask: u16 = 0,
+    /// OP_POLL only — index into fdpoll.waiters[] for the registered
+    /// waiter, so on instance shutdown we can drop the registration
+    /// before recycling the pending slot. 0xFF = no waiter registered.
+    fdpoll_waiter_idx: u8 = 0xFF,
 };
 
 const Instance = struct {
@@ -243,6 +260,42 @@ fn nvmeCompletionCallback(ctx: usize, success: bool, sc: u16) callconv(.c) void 
     }
 }
 
+/// fdpoll's completion callback for OP_POLL. Called from whatever
+/// subsystem flipped the fd's readiness (pipe.write, desktop.pushEvent,
+/// etc.) — may be on any CPU, not necessarily the instance's worker
+/// CPU. Mirrors `nvmeCompletionCallback`'s shape: store the result,
+/// flip `done` with Release, wake the worker so it posts the CQE via
+/// the normal drainCompletions path.
+fn pollCompletionCallback(inst_id: u8, slot_idx: u8, ready_mask: u16) void {
+    if (inst_id >= MAX_INSTANCES_TOTAL) return;
+    const inst = &instances[inst_id];
+    if (!@atomicLoad(bool, &inst.in_use, .acquire)) return;
+    if (slot_idx >= inst.pending.len) return;
+    const p = &inst.pending[slot_idx];
+    // Defend against stale wakes after the slot was recycled — the
+    // worker clears in_use after posting the CQE; fdpoll.unregister
+    // should have dropped the waiter before that, but a wake racing
+    // with shutdown can still arrive.
+    if (!@atomicLoad(bool, &p.in_use, .acquire)) return;
+    if (p.op != OP_POLL) return;
+    p.poll_mask = ready_mask;
+    @atomicStore(bool, &p.done, true, .release);
+    process.wakeIoUringWorker(inst_id);
+}
+
+/// Called from `setup` the first time it runs. Registers the OP_POLL
+/// completion path with fdpoll; idempotent because we compare-and-swap
+/// against null. fdpoll has no other consumer right now, so storing
+/// our pointer here is safe.
+fn ensurePollCallbackRegistered() void {
+    @atomicStore(
+        ?*const fn (inst_id: u8, slot_idx: u8, ready_mask: u16) void,
+        &fdpoll.completion_callback,
+        pollCompletionCallback,
+        .release,
+    );
+}
+
 /// Execute one non-NVMe Sqe synchronously. For OP_READ/WRITE the worker
 /// swaps to the owner's CR3 so user-buffer dereferences resolve. vfs.read/
 /// write take the owner's PCB so fd_table lookups use the right table.
@@ -317,17 +370,114 @@ fn executeSyncAsWorker(inst: *Instance, sqe: Sqe) i32 {
     }
 }
 
-/// Result of attempting to submit an NVMe op.
+/// Result of attempting to submit an NVMe (or OP_POLL) op.
 const SubmitResult = enum {
-    /// Successfully submitted; sq_head must be advanced.
+    /// Successfully submitted; sq_head must be advanced. For NVMe this
+    /// means the pending slot is now active and will complete via the
+    /// IRQ callback; for OP_POLL it means a waiter was registered with
+    /// fdpoll and will complete via pollCompletionCallback.
     ok,
-    /// NVMe controller queue is full; leave sq_head + pending slot alone
-    /// so the next loop iteration retries after some completions free space.
+    /// Backend queue is full (NVMe controller's queue OR our pending
+    /// table); leave sq_head + pending slot alone so the next loop
+    /// iteration retries after some completions free space.
     queue_full,
-    /// SQE is structurally invalid (bad ctrl, bad LBA, etc). Post an
-    /// error CQE inline + advance sq_head.
+    /// SQE handled inline — error or already-ready. The CQE has been
+    /// posted by the submit fn; sq_head must be advanced. The variant
+    /// is named `invalid` for historical NVMe reasons but the OP_POLL
+    /// path uses it for both error AND immediate-success completions.
     invalid,
 };
+
+/// Submit one OP_POLL SQE. Three outcomes:
+///   * fd already ready: post success CQE inline, return .invalid (caller
+///     advances sq_head).
+///   * fd not ready, pending slot + fdpoll waiter both allocated: return
+///     .ok (caller advances sq_head; completion comes via the callback).
+///   * fd not ready, pending table full: return .queue_full (do NOT
+///     advance sq_head; the next loop iteration retries after a slot
+///     frees). fdpoll-registry-full collapses into an inline error CQE
+///     instead — it's rare and not worth re-blocking the SQE for.
+///   * fd invalid / events == 0 / etc: post error CQE inline, return .invalid.
+///
+/// sqe.fd  — fd index into the caller's fd_table.
+/// sqe.len — events mask (POLLIN/POLLOUT/POLLERR/POLLHUP). Low 16 bits used.
+fn submitPollOp(inst: *Instance, inst_id: u8, sqe: Sqe) SubmitResult {
+    if (inst.owner_pid >= process.MAX_PROCS) {
+        return postInlineCqe(inst, sqe.user_data, ERES_FAULT);
+    }
+    if (sqe.fd >= config.MAX_FDS) {
+        return postInlineCqe(inst, sqe.user_data, ERES_BADF);
+    }
+    const pid: u8 = @intCast(inst.owner_pid);
+    const fd: u8 = @intCast(sqe.fd);
+    const events: u16 = @intCast(sqe.len & 0xFFFF);
+    if (events == 0) {
+        return postInlineCqe(inst, sqe.user_data, ERES_INVAL);
+    }
+
+    const handle = fdpoll.resolveFd(pid, fd) orelse {
+        return postInlineCqe(inst, sqe.user_data, ERES_BADF);
+    };
+
+    // Fast path: already ready. Post CQE immediately, no registration.
+    const ready_now = fdpoll.pollMaskHandle(pid, handle);
+    const matched_now = ready_now & events;
+    if (matched_now != 0) {
+        return postInlineCqe(inst, sqe.user_data, @intCast(matched_now));
+    }
+
+    // Slow path: register + wait.
+    const slot_idx = allocPendingSlot(inst) orelse return .queue_full;
+    const p = &inst.pending[slot_idx];
+    p.op = OP_POLL;
+    p.cqe_user_data = sqe.user_data;
+    p.done = false;
+    p.poll_mask = 0;
+    p.instance_id = inst_id;
+    p.fdpoll_waiter_idx = 0xFF;
+
+    const widx = fdpoll.register(inst_id, slot_idx, pid, handle, events) orelse {
+        // Registry full — free the slot we just took and surface ENOMEM.
+        @atomicStore(bool, &p.in_use, false, .release);
+        return postInlineCqe(inst, sqe.user_data, ERES_NOMEM);
+    };
+    p.fdpoll_waiter_idx = widx;
+
+    // Race-close: fd may have flipped to ready BETWEEN our pollMaskHandle
+    // check and fdpoll.register. Re-check now that the waiter is enrolled;
+    // if it's actually ready, manually fire the completion path so we
+    // don't depend on a future wakePollers (which may have already run
+    // and missed us). Mirrors the futex enroll-then-recheck handshake.
+    const ready_post = fdpoll.pollMaskHandle(pid, handle);
+    const matched_post = ready_post & events;
+    if (matched_post != 0) {
+        // fdpoll might already have cleared the waiter slot if it raced;
+        // unregister is idempotent so this is safe either way.
+        fdpoll.unregister(widx);
+        p.poll_mask = matched_post;
+        @atomicStore(bool, &p.done, true, .release);
+        // Worker drains in the same loop pass — no wake needed since we
+        // ARE the worker.
+    }
+
+    return .ok;
+}
+
+/// Post a single CQE with `(user_data, res)` and signal CQ waiters.
+/// Always returns `.invalid` so OP_POLL callers can `switch` cleanly.
+fn postInlineCqe(inst: *Instance, user_data: u64, res: i32) SubmitResult {
+    const hdr: *RingHeader = @ptrFromInt(inst.header_kvirt);
+    const cq_tail = @atomicLoad(u32, &hdr.cq_tail, .acquire);
+    writeCqe(inst, cq_tail & hdr.cq_mask, .{
+        .user_data = user_data,
+        .res = res,
+        .flags = 0,
+    });
+    @atomicStore(u32, &hdr.cq_tail, cq_tail +% 1, .release);
+    const inst_id: u32 = @intCast((@intFromPtr(inst) - @intFromPtr(&instances[0])) / @sizeOf(Instance));
+    process.wakeIoUringCqWaiters(inst_id);
+    return .invalid;
+}
 
 /// Submit one NVMe SQE asynchronously. On `.ok`, the pending slot is now
 /// active; the worker will drain it after the IRQ callback fires.
@@ -425,6 +575,26 @@ fn submitNvmeOp(inst: *Instance, inst_id: u8, slot_idx: u8, sqe: Sqe) SubmitResu
 /// breaks any COW page in the range so the kernel WRITE doesn't trap as
 /// kernel-mode #PF. Closes HIGH classes 3+3b reviewer flagged 2026-05-24.
 fn handleCompletion(inst: *Instance, p: *PendingOp) void {
+    // OP_POLL completes via fdpoll.wakePollers (not NVMe IRQ), no CID
+    // to release, no bounce copy. Just post the ready mask and free
+    // the slot. Branch sits ahead of the NVMe-shaped path because the
+    // shared epilogue calls nvme.releaseAsyncCid unconditionally.
+    if (p.op == OP_POLL) {
+        const hdr: *RingHeader = @ptrFromInt(inst.header_kvirt);
+        const cq_tail = @atomicLoad(u32, &hdr.cq_tail, .acquire);
+        writeCqe(inst, cq_tail & hdr.cq_mask, .{
+            .user_data = p.cqe_user_data,
+            .res = @intCast(p.poll_mask),
+            .flags = 0,
+        });
+        @atomicStore(u32, &hdr.cq_tail, cq_tail +% 1, .release);
+        // fdpoll already cleared its waiter slot before invoking our
+        // callback (in wakePollers), so no fdpoll.unregister needed.
+        p.fdpoll_waiter_idx = 0xFF;
+        @atomicStore(bool, &p.in_use, false, .release);
+        return;
+    }
+
     const success = p.success; // Already synchronized via Acquire on done.
     var res: i32 = if (success) @intCast(p.bytes) else ERES_IO;
 
@@ -558,6 +728,19 @@ fn workerLoop() callconv(.c) noreturn {
         // worker_pid going to .zombie), every NVMe op has been reaped via
         // releaseAsyncCid and no stale callbacks can fire.
         if (inst.exit_requested) {
+            // OP_POLL slots don't complete on their own — fdpoll wake is
+            // the only signal, and a dying process won't generate one.
+            // Drop them now so pendingInFlightCount can reach zero.
+            // Idempotent: subsequent iterations see in_use=false and skip.
+            for (&inst.pending) |*p| {
+                if (!@atomicLoad(bool, &p.in_use, .acquire)) continue;
+                if (p.op != OP_POLL) continue;
+                if (p.fdpoll_waiter_idx != 0xFF) {
+                    fdpoll.unregister(p.fdpoll_waiter_idx);
+                    p.fdpoll_waiter_idx = 0xFF;
+                }
+                @atomicStore(bool, &p.in_use, false, .release);
+            }
             if (pendingInFlightCount(inst) == 0) {
                 // All in-flight cleared. Self-recycle the Instance slot,
                 // THEN destroyCurrent. setup() can immediately reuse this
@@ -592,6 +775,26 @@ fn workerLoop() callconv(.c) noreturn {
             const sqe = readSqe(inst, sq_head & hdr.sq_mask);
 
             switch (sqe.opcode) {
+                OP_POLL => {
+                    // OP_POLL flow:
+                    //   1. Resolve fd → FdHandle (current pcb's fd_table)
+                    //   2. Check pollMask NOW. If matches requested events
+                    //      → post CQE inline + advance sq_head, no slot.
+                    //   3. Else allocate pending slot + register with fdpoll.
+                    //      Slot completes via pollCompletionCallback → drain.
+                    // sqe.fd holds the fd index; sqe.len holds the events
+                    // mask (POLLIN/POLLOUT/...). Re-purposing sqe.len keeps
+                    // the SQE shape unchanged.
+                    switch (submitPollOp(inst, inst_id, sqe)) {
+                        .ok, .invalid => {
+                            @atomicStore(u32, &hdr.sq_head, sq_head +% 1, .release);
+                        },
+                        .queue_full => {
+                            blocked_by_full = true;
+                            break :submit_loop;
+                        },
+                    }
+                },
                 OP_NVME_READ, OP_NVME_WRITE => {
                     const slot_idx = allocPendingSlot(inst) orelse {
                         // Pending table full — break and park; completions
@@ -674,6 +877,8 @@ pub fn setup(entries_req: u32) u32 {
     if (entries_req == 0 or entries_req > MAX_ENTRIES) return 0;
     const entries = nextPow2(entries_req);
     if (entries > MAX_ENTRIES) return 0;
+
+    ensurePollCallbackRegistered();
 
     const pcb = process.currentPCB() orelse return 0;
     _ = pcb.page_directory orelse return 0;

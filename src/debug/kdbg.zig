@@ -189,6 +189,39 @@ pub fn pmmFree(phys: u64, caller_ra: u64) void {
     pmm_free_ring.record(.{ .tsc = rdtsc(), .phys = phys, .caller_ra = caller_ra });
 }
 
+/// Scan the free ring backwards for the most recent free event matching `phys`
+/// (frame-aligned compare — caller's `phys` may be the bare frame address while
+/// recorded events are also frame-aligned). Diagnostic-only, used by pmm's
+/// underflow path to name "who freed this frame BEFORE the double-free".
+pub fn pmmFindLastFree(phys: u64) ?PmmFreeEvent {
+    const target = phys & ~@as(u64, 0xFFF);
+    const n = pmm_free_ring.count();
+    var i: usize = n;
+    while (i > 0) {
+        i -= 1;
+        const ev = pmm_free_ring.at(i);
+        if ((ev.phys & ~@as(u64, 0xFFF)) == target) return ev.*;
+    }
+    return null;
+}
+
+/// Scan the alloc ring backwards for the most recent alloc that covers `phys`
+/// (event covers [phys, phys + count*4096)). Diagnostic-only — paired with
+/// pmmFindLastFree so the underflow dump can show alloc → free → free chains.
+pub fn pmmFindLastAlloc(phys: u64) ?PmmAllocEvent {
+    const target = phys & ~@as(u64, 0xFFF);
+    const n = pmm_alloc_ring.count();
+    var i: usize = n;
+    while (i > 0) {
+        i -= 1;
+        const ev = pmm_alloc_ring.at(i);
+        const ev_base = ev.phys & ~@as(u64, 0xFFF);
+        const ev_end = ev_base + @as(u64, ev.count) * 4096;
+        if (target >= ev_base and target < ev_end) return ev.*;
+    }
+    return null;
+}
+
 pub fn procEvent(kind: ProcEvent.Kind, pid: u8, parent_pid: u8, status: u32) void {
     proc_ring.record(.{ .tsc = rdtsc(), .kind = kind, .pid = pid, .parent_pid = parent_pid, .status = status });
 }

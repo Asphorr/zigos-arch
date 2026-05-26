@@ -406,6 +406,16 @@ pub const IOURING_OP_WRITE: u8 = 2;
 /// CQE.res on success = bytes transferred; negative errno on error.
 pub const IOURING_OP_NVME_READ: u8 = 3;
 pub const IOURING_OP_NVME_WRITE: u8 = 4;
+/// Wait until `sqe.fd` is ready for the events specified in `sqe.len`
+/// (POLLIN/POLLOUT/POLLERR/POLLHUP). CQE.res returns the ready-event
+/// mask, or a negative errno (-EBADF for invalid fd, -ENOMEM if the
+/// kernel's waiter table is full).
+pub const IOURING_OP_POLL: u8 = 5;
+
+pub const POLLIN: u32 = 0x0001;
+pub const POLLOUT: u32 = 0x0004;
+pub const POLLERR: u32 = 0x0008;
+pub const POLLHUP: u32 = 0x0010;
 
 pub const IoUring = struct {
     header: *volatile IoUringHeader,
@@ -1412,6 +1422,21 @@ pub fn exitWith(status: u32) noreturn {
     unreachable;
 }
 
+/// debugCrash(variant) — deliberately trigger one kernel crash class so
+/// app/crashtest.elf can exercise the panic / autopsy / halt-all-CPUs
+/// machinery from userspace. 1=dfree, 2=wild, 3=assert, 4=unmapped,
+/// 5=nonc, 6=panic. Never returns on valid variant (kernel panics);
+/// returns 0xFFFFFFFF on unknown variant.
+pub const CRASH_DFREE: u32 = 1;
+pub const CRASH_WILD: u32 = 2;
+pub const CRASH_ASSERT: u32 = 3;
+pub const CRASH_UNMAPPED: u32 = 4;
+pub const CRASH_NONC: u32 = 5;
+pub const CRASH_PANIC: u32 = 6;
+pub fn debugCrash(variant: u32) u32 {
+    return syscall(117, variant, 0);
+}
+
 /// waitpid(pid, *status) — block until child `pid` exits (or any child if
 /// pid == WAIT_ANY). Returns the reaped child's pid, or 0xFFFFFFFF if the
 /// caller has no such child.
@@ -1829,36 +1854,38 @@ pub fn httpGet(url: []const u8, response_buf: []u8) ?usize {
     return result;
 }
 
-/// TCP socket API. The kernel keeps a small fixed pool of connections (TCP_MAX_CONNS,
-/// currently 2), addressed by `slot`. tcpConnect blocks; tcpSend blocks until all
-/// bytes are queued; tcpRecv is non-blocking (poll). Status check returns a bitmask
-/// distinguishing "connected" from "peer half-closed".
+/// TCP socket API. Conns and listeners are exposed as ordinary fds — same
+/// numbering space as files/pipes — so close(fd), and io_uring OP_POLL
+/// (POLLIN/OUT/HUP/ERR), work uniformly. tcpConnect blocks; tcpSend blocks
+/// until all bytes are queued; tcpRecv is non-blocking (poll). Status
+/// check returns a bitmask distinguishing "connected" from "peer
+/// half-closed". close(fd) frees the underlying slot.
 
 pub const TCP_STATUS_CONNECTED: u32 = 1;
 pub const TCP_STATUS_PEER_CLOSED: u32 = 2;
 
-/// Open a TCP connection to `ip:port`. Returns a slot id (≥0) or null on
-/// failure. Blocks for up to 5 seconds during the handshake.
-pub fn tcpConnect(ip: [4]u8, port: u16) ?u8 {
+/// Open a TCP connection to `ip:port`. Returns an fd or null on failure.
+/// Blocks for up to 5 seconds during the handshake.
+pub fn tcpConnect(ip: [4]u8, port: u16) ?u32 {
     var ip_buf: [4]u8 = ip;
     const result = syscall(
         70,
         @truncate(@intFromPtr(&ip_buf)),
         @as(u32, port),
     );
-    if (result == 0xFFFFFFFF) return null;
-    return @truncate(result);
+    if (isErr(result)) return null;
+    return result;
 }
 
-/// Send `data` over the connection. Returns false on any failure (including
+/// Send `data` over the connection. Returns false on any failure (bad fd,
 /// peer disconnect mid-send). Larger writes are split into MSS chunks
 /// kernel-side; callers pass the full buffer in one call.
-pub fn tcpSend(slot: u8, data: []const u8) bool {
+pub fn tcpSend(fd: u32, data: []const u8) bool {
     if (data.len == 0) return true;
     if (data.len > 64 * 1024) return false;
     return syscall3(
         71,
-        @as(u32, slot),
+        fd,
         @truncate(@intFromPtr(data.ptr)),
         @intCast(data.len),
     ) == 0;
@@ -1867,49 +1894,51 @@ pub fn tcpSend(slot: u8, data: []const u8) bool {
 /// Receive up to `buf.len` bytes from the connection. Non-blocking: returns
 /// 0 if nothing is buffered yet. Callers poll (with a small sleep) until
 /// status reports peer_closed AND a recv returns 0 — that's true EOF.
-pub fn tcpRecv(slot: u8, buf: []u8) usize {
+pub fn tcpRecv(fd: u32, buf: []u8) usize {
     if (buf.len == 0) return 0;
     return @intCast(syscall3(
         72,
-        @as(u32, slot),
+        fd,
         @truncate(@intFromPtr(buf.ptr)),
         @intCast(buf.len),
     ));
 }
 
 /// Close the connection. Sends FIN, waits briefly for the peer's FIN-ACK,
-/// then frees the slot. Idempotent — safe to call on an already-closed slot.
-pub fn tcpClose(slot: u8) void {
-    _ = syscall(73, @as(u32, slot), 0);
+/// then frees the slot. Idempotent — safe to call on an already-closed fd.
+/// Routes through the generic close() (syscall #12); the kernel's vfs.close
+/// dispatches to net.tcpClose via the .tcp_sock fd-table arm.
+pub fn tcpClose(fd: u32) void {
+    close(fd);
 }
 
 /// Bitmask of connection state. Use `TCP_STATUS_CONNECTED` /
 /// `TCP_STATUS_PEER_CLOSED` rather than raw bit indices.
-pub fn tcpStatus(slot: u8) u32 {
-    return syscall(74, @as(u32, slot), 0);
+pub fn tcpStatus(fd: u32) u32 {
+    return syscall(74, fd, 0);
 }
 
-/// Bind a server-side TCP socket to `port`. Returns the listener slot id, or
-/// null on failure (port in use, listener pool full).
-pub fn tcpListen(port: u16) ?u8 {
+/// Bind a server-side TCP socket to `port`. Returns a listener fd or null
+/// on failure (port in use, listener pool full).
+pub fn tcpListen(port: u16) ?u32 {
     const result = syscall(75, @as(u32, port), 0);
-    if (result == 0xFFFFFFFF) return null;
-    return @truncate(result);
+    if (isErr(result)) return null;
+    return result;
 }
 
 /// Release a listener. Already-accepted conns keep working; only new SYNs
-/// stop being accepted on this port.
-pub fn tcpUnlisten(listener_slot: u8) void {
-    _ = syscall(76, @as(u32, listener_slot), 0);
+/// stop being accepted on this port. Same routing as tcpClose.
+pub fn tcpUnlisten(listener_fd: u32) void {
+    close(listener_fd);
 }
 
-/// Pop one ESTABLISHED conn slot from the listener's accept queue. Returns
-/// null if nothing is queued (poll). The returned slot is a regular conn id
-/// usable with tcpSend/Recv/Close/Status.
-pub fn tcpAccept(listener_slot: u8) ?u8 {
-    const result = syscall(77, @as(u32, listener_slot), 0);
-    if (result == 0xFFFFFFFF) return null;
-    return @truncate(result);
+/// Pop one ESTABLISHED conn from the listener's accept queue. Returns an
+/// fd for the new conn or null if nothing is queued (caller polls). The
+/// returned fd is usable with tcpSend/Recv/Close/Status.
+pub fn tcpAccept(listener_fd: u32) ?u32 {
+    const result = syscall(77, listener_fd, 0);
+    if (isErr(result)) return null;
+    return result;
 }
 
 // ---- TLS 1.3 syscalls (107-110) -----------------------------------------

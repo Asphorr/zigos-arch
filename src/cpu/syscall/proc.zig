@@ -318,7 +318,7 @@ pub fn sysSleep(ms: u32) u32 {
     // ms > 0xFFFFFFF6, which trivially-fuzzable input triggers.
     // Caught by redteam fuzzer hitting sysSleep with random u32.
     const ticks = (@as(u64, ms) + 9) / 10;
-    pcb.wake_tick = process.tick_count +% ticks;
+    @atomicStore(u64, &pcb.wake_tick, process.tick_count +% ticks, .release);
     process.setState(cur_pid, .sleeping);
     // Force the scheduler to actually deschedule us. Same alignment dance as
     // sys#07 — see comments there. wakeExpired() flips us back to .ready once
@@ -785,7 +785,7 @@ pub fn sysSigpending(set_ptr: u32) u32 {
     if (!validateUserPtrAligned(set_ptr, 4, 4)) return E_FAULT;
     const pcb = process.currentPCB() orelse return E_FAULT;
     const sp: *u32 = @ptrFromInt(@as(usize, set_ptr));
-    sp.* = pcb.pending_signals & pcb.signal_mask;
+    sp.* = @atomicLoad(u32, &pcb.pending_signals, .acquire) & pcb.signal_mask;
     return 0;
 }
 
@@ -810,7 +810,7 @@ pub fn sysSigsuspend(mask_ptr: u32) u32 {
     const cur_pid = smp.myCpu().current_pid orelse return E_FAULT;
     while (!signals.hasDeliverable(pcb)) {
         process.setState(cur_pid, .sleeping);
-        pcb.wake_tick = std.math.maxInt(u64); // sleep "forever" — only signals wake us
+        @atomicStore(u64, &pcb.wake_tick, std.math.maxInt(u64), .release); // sleep "forever" — only signals wake us
         const t_pause = perf.rdtsc();
         smp.myCpu().pending_soft_yield = true;
         sched_asm.softYield();
@@ -828,7 +828,7 @@ pub fn sysPause() u32 {
     const pcb = &process.procs[cur_pid];
     while (!signals.hasDeliverable(pcb)) {
         process.setState(cur_pid, .sleeping);
-        pcb.wake_tick = std.math.maxInt(u64);
+        @atomicStore(u64, &pcb.wake_tick, std.math.maxInt(u64), .release);
         const t_pause = perf.rdtsc();
         smp.myCpu().pending_soft_yield = true;
         sched_asm.softYield();

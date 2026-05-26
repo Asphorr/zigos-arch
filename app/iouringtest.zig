@@ -303,6 +303,134 @@ export fn _start() linksection(".text.entry") callconv(.c) void {
         libc.print("[iouringtest] s5 OK (4x OP_NVME_READ concurrent, per-IRQ async)\n");
     }
 
+    // --- s6: OP_POLL (task #893) ---
+    //
+    // 6a — fast path: create a pipe and poll its write end with POLLOUT.
+    //      An empty pipe is always writable, so submitPollOp's inline
+    //      check satisfies the request → CQE posted before the SQE even
+    //      reaches the slow-path waiter registration.
+    // 6b — slow path: poll the read end with POLLIN against an empty
+    //      pipe → no inline match → fdpoll registers a waiter. We then
+    //      fwrite() to the write end; pipe.write calls fdpoll.wakePollers,
+    //      which posts the CQE via pollCompletionCallback. Verifies the
+    //      cross-CPU wake path end-to-end.
+    {
+        const fds = libc.pipe() orelse {
+            libc.print("[iouringtest] FAIL s6: pipe() returned null\n");
+            libc.exitWith(0xDEAD0221);
+        };
+        const rfd = fds[0];
+        const wfd = fds[1];
+
+        // 6a — POLLOUT on writable pipe (fast path).
+        {
+            const sqe = ring.getSqe() orelse {
+                libc.print("[iouringtest] FAIL s6a: getSqe null\n");
+                libc.exitWith(0xDEAD0222);
+            };
+            sqe.* = .{
+                .opcode = libc.IOURING_OP_POLL,
+                .flags = 0,
+                ._pad1 = 0,
+                .fd = wfd,
+                .off = 0,
+                .addr = 0,
+                .len = libc.POLLOUT,
+                .user_data = 0x6000,
+                ._pad2 = [_]u8{0} ** 28,
+            };
+            ring.submit(1);
+            const ready = ring.enter(1, 1) orelse {
+                libc.print("[iouringtest] FAIL s6a: enter null\n");
+                libc.exitWith(0xDEAD0223);
+            };
+            if (ready < 1) {
+                libc.print("[iouringtest] FAIL s6a: ready < 1\n");
+                libc.exitWith(0xDEAD0224);
+            }
+            const cqe = ring.reapCqe() orelse {
+                libc.print("[iouringtest] FAIL s6a: CQE missing\n");
+                libc.exitWith(0xDEAD0225);
+            };
+            if (cqe.user_data != 0x6000) {
+                libc.print("[iouringtest] FAIL s6a: user_data mismatch\n");
+                libc.exitWith(0xDEAD0226);
+            }
+            if (cqe.res < 0) {
+                libc.print("[iouringtest] FAIL s6a: negative res (errno)\n");
+                libc.exitWith(0xDEAD0227);
+            }
+            if ((@as(u32, @intCast(cqe.res)) & libc.POLLOUT) == 0) {
+                libc.print("[iouringtest] FAIL s6a: POLLOUT bit missing\n");
+                libc.exitWith(0xDEAD0228);
+            }
+            libc.print("[iouringtest] s6a OK (POLLOUT fast path on writable pipe)\n");
+        }
+
+        // 6b — POLLIN on empty pipe (slow path: register, then wake).
+        {
+            const sqe = ring.getSqe() orelse {
+                libc.print("[iouringtest] FAIL s6b: getSqe null\n");
+                libc.exitWith(0xDEAD0229);
+            };
+            sqe.* = .{
+                .opcode = libc.IOURING_OP_POLL,
+                .flags = 0,
+                ._pad1 = 0,
+                .fd = rfd,
+                .off = 0,
+                .addr = 0,
+                .len = libc.POLLIN,
+                .user_data = 0x6100,
+                ._pad2 = [_]u8{0} ** 28,
+            };
+            ring.submit(1);
+            // Non-blocking enter: just kick the worker. CQE shouldn't be
+            // ready yet because pipe is empty + has writers.
+            _ = ring.enter(1, 0) orelse {
+                libc.print("[iouringtest] FAIL s6b: kick enter null\n");
+                libc.exitWith(0xDEAD022A);
+            };
+
+            // Push a byte into the pipe — pipe.write fires wakePollers.
+            const wmsg = "X";
+            const nw = libc.fwrite(wfd, wmsg);
+            if (nw != 1) {
+                libc.print("[iouringtest] FAIL s6b: pipe write failed\n");
+                libc.exitWith(0xDEAD022B);
+            }
+
+            const ready = ring.enter(0, 1) orelse {
+                libc.print("[iouringtest] FAIL s6b: block enter null\n");
+                libc.exitWith(0xDEAD022C);
+            };
+            if (ready < 1) {
+                libc.print("[iouringtest] FAIL s6b: ready < 1 after wake\n");
+                libc.exitWith(0xDEAD022D);
+            }
+            const cqe = ring.reapCqe() orelse {
+                libc.print("[iouringtest] FAIL s6b: CQE missing after wake\n");
+                libc.exitWith(0xDEAD022E);
+            };
+            if (cqe.user_data != 0x6100) {
+                libc.print("[iouringtest] FAIL s6b: user_data mismatch\n");
+                libc.exitWith(0xDEAD022F);
+            }
+            if (cqe.res < 0) {
+                libc.print("[iouringtest] FAIL s6b: negative res\n");
+                libc.exitWith(0xDEAD0230);
+            }
+            if ((@as(u32, @intCast(cqe.res)) & libc.POLLIN) == 0) {
+                libc.print("[iouringtest] FAIL s6b: POLLIN bit missing\n");
+                libc.exitWith(0xDEAD0231);
+            }
+            libc.print("[iouringtest] s6b OK (POLLIN slow path + wake from pipe.write)\n");
+        }
+
+        libc.close(rfd);
+        libc.close(wfd);
+    }
+
     libc.print("[iouringtest] OK\n");
     libc.exitWith(0xCAFE0115);
 }

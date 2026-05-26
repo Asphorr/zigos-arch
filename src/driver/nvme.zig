@@ -93,6 +93,14 @@ const DsmRange = extern struct {
     length: u32 = 0, // in LBAs
     starting_lba: u64 = 0,
 };
+comptime {
+    // NVMe spec — Dataset Management Range, 16 bytes per range.
+    const a = std.debug.assert;
+    a(@sizeOf(DsmRange) == 16);
+    a(@offsetOf(DsmRange, "context_attributes") == 0);
+    a(@offsetOf(DsmRange, "length") == 4);
+    a(@offsetOf(DsmRange, "starting_lba") == 8);
+}
 
 // --- Identify CNS values ---
 const CNS_NAMESPACE: u32 = 0x00;
@@ -116,6 +124,20 @@ const SqEntry = extern struct {
     cdw14: u32 align(1),
     cdw15: u32 align(1),
 };
+comptime {
+    // NVMe spec — submission queue entry is exactly 64 bytes.
+    const a = std.debug.assert;
+    a(@sizeOf(SqEntry) == 64);
+    a(@offsetOf(SqEntry, "opcode") == 0);
+    a(@offsetOf(SqEntry, "flags") == 1);
+    a(@offsetOf(SqEntry, "cid") == 2);
+    a(@offsetOf(SqEntry, "nsid") == 4);
+    a(@offsetOf(SqEntry, "mptr") == 16);
+    a(@offsetOf(SqEntry, "prp1") == 24);
+    a(@offsetOf(SqEntry, "prp2") == 32);
+    a(@offsetOf(SqEntry, "cdw10") == 40);
+    a(@offsetOf(SqEntry, "cdw15") == 60);
+}
 
 // --- Completion queue entry (16 bytes) ---
 const CqEntry = extern struct {
@@ -126,6 +148,16 @@ const CqEntry = extern struct {
     cid: u16 align(1),
     status: u16 align(1), // bit 0 = phase, bits 15:1 = status code
 };
+comptime {
+    // NVMe spec — completion queue entry is exactly 16 bytes.
+    const a = std.debug.assert;
+    a(@sizeOf(CqEntry) == 16);
+    a(@offsetOf(CqEntry, "result") == 0);
+    a(@offsetOf(CqEntry, "sq_head") == 8);
+    a(@offsetOf(CqEntry, "sq_id") == 10);
+    a(@offsetOf(CqEntry, "cid") == 12);
+    a(@offsetOf(CqEntry, "status") == 14);
+}
 
 const Q_DEPTH: u16 = 16;
 const MAX_CONTROLLERS: usize = 3; // 0 = tarfs, 1 = ext2, 2 = swap
@@ -178,19 +210,29 @@ const WakeMode = union(enum) {
 };
 
 const NvmeWaiter = struct {
-    active: bool = false,
-    completed: bool = false,
-    success: bool = false,
-    status_code: u16 = 0,
-    wake: WakeMode = .{ .pid = 0xFF },
-    gen: u16 = 0,
+    // Access-tag legend (see docs/STYLE.md). Two-tier discipline:
+    //   (a) atomic — `active`, `gen`, `completed`. allocCid uses
+    //       @cmpxchgStrong(active) + @atomicStore(gen, .release) +
+    //       @atomicStore(completed, .release). reapCq + waiters use
+    //       @atomicLoad. Cross-CPU visible without io_lock or cq_lock.
+    //   Doorbell-fenced — `success`/`status_code`/`wake`/`sq_slot`.
+    //   The submitter writes these *before* the SQ doorbell MMIO write;
+    //   the device can't generate a completion until after the doorbell;
+    //   reapCq reads them under cq_lock once a completion arrives, so
+    //   the doorbell write acts as the release fence. No explicit atomic.
+    active: bool = false, // (a) CAS-flipped by allocCid, plain-cleared by waiter on completion
+    completed: bool = false, // (a) flipped true by reapCq
+    success: bool = false, // doorbell-fenced — see top comment
+    status_code: u16 = 0, // doorbell-fenced
+    wake: WakeMode = .{ .pid = 0xFF }, // doorbell-fenced
+    gen: u16 = 0, // (a) generation counter for CID disambiguation
     /// Gap #11 (2026-05-20): SQ ring slot index (in [0, Q_DEPTH)) where
     /// the SQE for this command was written. Lets `dumpWaiterForTarget`
     /// dump the actual SQE the device should be processing, so the
     /// autopsy can confirm "yes, our cmd is sitting at io_sq[N] waiting"
     /// vs "the SQ has someone else's cmd in our slot." Set in
     /// `ioCommandAsync` between alloc and doorbell; 0xFFFF = never set.
-    sq_slot: u16 = 0xFFFF,
+    sq_slot: u16 = 0xFFFF, // doorbell-fenced
 };
 
 /// Pack a slot index + generation counter into the 16-bit CID we write
@@ -231,55 +273,58 @@ inline fn nextGen(g: u16) u16 {
 }
 
 const Controller = struct {
-    mmio_base: usize = 0,
-    doorbell_stride_log: u8 = 0,
+    // Access-tag legend (see docs/STYLE.md). The admin queues are
+    // BSP-only at boot; I/O queues are guarded by io_lock (submit side)
+    // and cq_lock (IRQ reaper side).
+    mmio_base: usize = 0, // (c) set at initController
+    doorbell_stride_log: u8 = 0, // (c)
 
-    admin_sq: usize = 0, // phys addr of the admin SQ ring
-    admin_cq: usize = 0,
-    admin_sq_tail: u16 = 0,
-    admin_cq_head: u16 = 0,
-    admin_cq_phase: bool = true,
+    admin_sq: usize = 0, // (c) phys addr of the admin SQ ring; BSP-only at boot
+    admin_cq: usize = 0, // (c)
+    admin_sq_tail: u16 = 0, // BSP-only at boot
+    admin_cq_head: u16 = 0, // BSP-only at boot
+    admin_cq_phase: bool = true, // BSP-only at boot
 
-    io_sq: usize = 0,
-    io_cq: usize = 0,
-    io_sq_tail: u16 = 0,
-    io_cq_head: u16 = 0,
-    io_cq_phase: bool = true,
+    io_sq: usize = 0, // (c) phys addr of the I/O SQ ring
+    io_cq: usize = 0, // (c)
+    io_sq_tail: u16 = 0, // (p:io_lock)
+    io_cq_head: u16 = 0, // (p:cq_lock)
+    io_cq_phase: bool = true, // (p:cq_lock)
 
     // Per-CID bounce buffers (BOUNCE_PAGES_PER_SLOT * 4 KiB each, contiguous).
     // Async submitters claim a CID via `allocCid`, use bounce_bufs[cid] for
     // the PRP1 (and PRP2 / prp_list_phys for larger transfers). Each entry
     // is the PHYSICAL base address; pages are contiguous in physical memory.
     // 16 * 32 KiB = 512 KiB per controller after the bump.
-    bounce_bufs: [Q_DEPTH]usize = [_]usize{0} ** Q_DEPTH,
+    bounce_bufs: [Q_DEPTH]usize = [_]usize{0} ** Q_DEPTH, // (c) phys-addr table; mutable buf contents are owner-cid
     // Per-CID PRP list pages. NVMe requires a PRP list when a transfer
     // spans more than 2 pages: PRP1 = page0, PRP2 = phys of a list page
     // containing u64 entries for page1, page2, ... For ≤ 2 pages PRP2 is
     // the page1 phys directly and this list page is unused. One page each,
     // 16 * 4 KiB = 64 KiB per controller.
-    prp_list_phys: [Q_DEPTH]usize = [_]usize{0} ** Q_DEPTH,
-    waiters: [Q_DEPTH]NvmeWaiter = [_]NvmeWaiter{.{}} ** Q_DEPTH,
+    prp_list_phys: [Q_DEPTH]usize = [_]usize{0} ** Q_DEPTH, // (c)
+    waiters: [Q_DEPTH]NvmeWaiter = [_]NvmeWaiter{.{}} ** Q_DEPTH, // see NvmeWaiter: alloc/free under io_lock; completion fields under cq_lock
 
-    nsid: u32 = 0, // first active namespace ID
-    block_size: u32 = SECTOR_SIZE,
+    nsid: u32 = 0, // (c) first active namespace ID
+    block_size: u32 = SECTOR_SIZE, // (c)
 
-    next_cid: u16 = 1,
-    initialized: bool = false,
+    next_cid: u16 = 1, // (p:io_lock) allocCid bumps under io_lock
+    initialized: bool = false, // (c) flipped true at end of initController, RO after
 
     // MSI-X: when present, I/O completions wake the kernel via `hlt`
     // instead of busy-spinning the polled clflush loop. The admin queue
     // stays polled because it's only used during init.
-    use_msix: bool = false,
-    msix_cap: msix.Cap = undefined,
+    use_msix: bool = false, // (c) probed at init
+    msix_cap: msix.Cap = undefined, // (c)
     // Absolute virtual address of the I/O CQ's MSI-X table entry — saved
     // at init so the per-call retarget in ioCommandOneSector doesn't have
     // to re-walk the cap structure. data is the vector word writeEntry
     // needs; addr is recomputed each call from the current CPU's APIC ID.
     // msix_current_addr caches the most recently written addr so we can
     // skip the mask/write/unmask cycle when the calling CPU hasn't changed.
-    msix_io_entry: usize = 0,
-    msix_data: u32 = 0,
-    msix_current_addr: u64 = 0,
+    msix_io_entry: usize = 0, // (c) cached MSI-X table-entry VA
+    msix_data: u32 = 0, // (c) data word for the I/O vector
+    msix_current_addr: u64 = 0, // (p:io_lock) retarget cache, mutated in ioCommandOneSector
 
     // Serializes ioCommandOneSector across CPUs. The bounce_buf, SQ tail,
     // and CQ head/phase are all single-element state — concurrent access
@@ -298,7 +343,7 @@ const Controller = struct {
     // only bump irq_count and ioCommand polls the CQ inline. Phase C
     // flips this to true after migrating all readers/writers off the
     // synchronous path. Read by `nvmeIrqHandler` on every IRQ.
-    async_mode: bool = false,
+    async_mode: bool = false, // (a) read in IRQ context
 
     /// Gap #12 (2026-05-20): per-controller count of CQEs that
     /// `reapCq` actually processed. Bumped each time a completion was
@@ -308,11 +353,11 @@ const Controller = struct {
     /// controller. The shared global handler can't attribute IRQs to a
     /// specific device, but each controller's own reapCq knows what it
     /// saw on its CQ.
-    cqe_drained_count: u64 = 0,
+    cqe_drained_count: u64 = 0, // (p:cq_lock) diagnostic counter
     /// Counter for `if (cid_opt == null)` retries inside the async
     /// queue-full retry loop (gap #6). Bumped each time allocCid
     /// returned null and we yielded. Diagnostic only.
-    queue_full_retries: u64 = 0,
+    queue_full_retries: u64 = 0, // (p:io_lock) diagnostic counter
 };
 
 var controllers: [MAX_CONTROLLERS]Controller = .{ .{}, .{}, .{} };
@@ -333,7 +378,7 @@ fn nvmeIrqHandler() callconv(.c) void {
     var any_woken = false;
     var i: usize = 0;
     while (i < num_controllers) : (i += 1) {
-        if (controllers[i].async_mode) {
+        if (@atomicLoad(bool, &controllers[i].async_mode, .acquire)) {
             if (reapCq(&controllers[i])) any_woken = true;
         }
     }
@@ -849,7 +894,7 @@ fn ioCommand(c: *Controller, opcode: u8, lba: u32, user_buf: usize, sectors: u32
     // Route to async path if this controller has been switched over.
     // ctrl_idx = pointer arithmetic into the global controllers[] array
     // so blockOn's wait_target is unambiguous.
-    if (ASYNC_BUILD_ENABLED and c.async_mode) {
+    if (ASYNC_BUILD_ENABLED and @atomicLoad(bool, &c.async_mode, .acquire)) {
         const idx_offset = (@intFromPtr(c) - @intFromPtr(&controllers[0])) / @sizeOf(Controller);
         return ioCommandAsync(c, @intCast(idx_offset), opcode, lba, user_buf, sectors);
     }
@@ -1160,7 +1205,7 @@ pub fn dumpWaiterForTarget(wait_target: u32) void {
     debug.klog("    sw_head     = {d}\n", .{c.io_cq_head});
     debug.klog("    sw_phase    = {any}\n", .{c.io_cq_phase});
     debug.klog("    sw_sq_tail  = {d}\n", .{c.io_sq_tail});
-    debug.klog("    async_mode  = {any}\n", .{c.async_mode});
+    debug.klog("    async_mode  = {any}\n", .{@atomicLoad(bool, &c.async_mode, .acquire)});
     debug.klog("    cqe_drained = {d} (per-ctrl, gap #12)\n", .{c.cqe_drained_count});
     debug.klog("    queue_full_retries = {d}\n", .{c.queue_full_retries});
 
@@ -1427,7 +1472,7 @@ fn submitDatalessAsync(
     cdw12: u32,
 ) bool {
     if (!c.initialized) return false;
-    if (!c.async_mode) {
+    if (!@atomicLoad(bool, &c.async_mode, .acquire)) {
         // Pre-async-enable callers would need a sync variant; not
         // exercised in current code (TRIM and WZ are called from user
         // paths long after enableAsync). Surface the impossibility.
@@ -1606,7 +1651,7 @@ pub fn tickSweep() void {
     if (!ASYNC_BUILD_ENABLED) return;
     var i: usize = 0;
     while (i < num_controllers) : (i += 1) {
-        if (controllers[i].async_mode) _ = reapCq(&controllers[i]);
+        if (@atomicLoad(bool, &controllers[i].async_mode, .acquire)) _ = reapCq(&controllers[i]);
     }
 }
 
@@ -1720,7 +1765,7 @@ pub fn submitAsyncCallback(
 ) bool {
     if (ctrl_idx >= num_controllers) return false;
     const c = &controllers[ctrl_idx];
-    if (!c.initialized or !c.async_mode) return false;
+    if (!c.initialized or !@atomicLoad(bool, &c.async_mode, .acquire)) return false;
     if (sectors == 0 or sectors > MAX_SECTORS_PER_CMD) return false;
     if (opcode != IO_READ and opcode != IO_WRITE) return false;
 
@@ -1834,7 +1879,7 @@ pub fn enableAsync() void {
     if (!ASYNC_BUILD_ENABLED) return;
     var i: usize = 0;
     while (i < num_controllers) : (i += 1) {
-        controllers[i].async_mode = true;
+        @atomicStore(bool, &controllers[i].async_mode, true, .release);
         // 2026-05-20 cleanup: the legacy single-page `bounce_buf` field
         // is gone. Sync path now uses `bounce_bufs[0]`, which stays
         // valid post-flip (async submitters won't pick slot 0 specifically;

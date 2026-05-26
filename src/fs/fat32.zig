@@ -54,6 +54,25 @@ const BPB = extern struct {
     volume_label: [11]u8,
     fs_type: [8]u8,
 };
+comptime {
+    // FAT32 BPB — Microsoft spec, 90 bytes through fs_type (sector 0 boot
+    // sector is 512 bytes including the boot code we don't model here).
+    const a = std.debug.assert;
+    a(@sizeOf(BPB) == 90);
+    a(@offsetOf(BPB, "jmp_boot") == 0);
+    a(@offsetOf(BPB, "oem_name") == 3);
+    a(@offsetOf(BPB, "bytes_per_sector") == 11);
+    a(@offsetOf(BPB, "sectors_per_cluster") == 13);
+    a(@offsetOf(BPB, "reserved_sectors") == 14);
+    a(@offsetOf(BPB, "num_fats") == 16);
+    a(@offsetOf(BPB, "fat_size_32") == 36);
+    a(@offsetOf(BPB, "root_cluster") == 44);
+    a(@offsetOf(BPB, "fs_info") == 48);
+    a(@offsetOf(BPB, "boot_sig") == 66);
+    a(@offsetOf(BPB, "volume_id") == 67);
+    a(@offsetOf(BPB, "volume_label") == 71);
+    a(@offsetOf(BPB, "fs_type") == 82);
+}
 
 // Directory entry (32 bytes)
 pub const DirEntry = extern struct {
@@ -70,6 +89,20 @@ pub const DirEntry = extern struct {
     fst_clus_lo: u16 align(1),
     file_size: u32 align(1),
 };
+comptime {
+    // FAT32 directory entry — exactly 32 bytes.
+    const a = std.debug.assert;
+    a(@sizeOf(DirEntry) == 32);
+    a(@offsetOf(DirEntry, "name") == 0);
+    a(@offsetOf(DirEntry, "attr") == 11);
+    a(@offsetOf(DirEntry, "crt_time") == 14);
+    a(@offsetOf(DirEntry, "crt_date") == 16);
+    a(@offsetOf(DirEntry, "fst_clus_hi") == 20);
+    a(@offsetOf(DirEntry, "wrt_time") == 22);
+    a(@offsetOf(DirEntry, "wrt_date") == 24);
+    a(@offsetOf(DirEntry, "fst_clus_lo") == 26);
+    a(@offsetOf(DirEntry, "file_size") == 28);
+}
 
 pub const Handle = struct {
     dir_cluster: u32, // cluster of the directory containing this file

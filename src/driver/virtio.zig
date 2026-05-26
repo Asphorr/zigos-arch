@@ -71,6 +71,15 @@ pub const VirtqDesc = extern struct {
     flags: u16 align(1),
     next: u16 align(1),
 };
+comptime {
+    // virtio 1.1 §2.6.5 — descriptor is exactly 16 bytes.
+    const a = @import("std").debug.assert;
+    a(@sizeOf(VirtqDesc) == 16);
+    a(@offsetOf(VirtqDesc, "addr") == 0);
+    a(@offsetOf(VirtqDesc, "len") == 8);
+    a(@offsetOf(VirtqDesc, "flags") == 12);
+    a(@offsetOf(VirtqDesc, "next") == 14);
+}
 
 pub const VRING_DESC_F_NEXT: u16 = 1;
 pub const VRING_DESC_F_WRITE: u16 = 2;

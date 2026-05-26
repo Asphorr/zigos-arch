@@ -124,6 +124,17 @@ fn virtioGpuIrqHandler() callconv(.c) void {
     if (pid == 0xFF) return;
     const pcb = &process.procs[pid];
     @atomicStore(u64, &pcb.wake_tick, process.tick_count, .release);
+    // Participate in blockOn's lost-wake handshake (sched.zig:1817).
+    // Without this, an IRQ landing between the submitter's last
+    // usedIdxCoherent re-read and blockOn's setState(.sleeping) is
+    // silently dropped — recovery falls onto wakeExpired's 10 ms
+    // safety net, which compounds with schedule overhead into the
+    // 150 ms-per-cycle yield-loop the autopsy 2026-05-25 surfaced.
+    // Same shape as the 2026-05-22 futex lost-wake fix
+    // ([[futex-lostwake-fix-2026-05-22]]); every waker outside the
+    // process.wake() path has to set wake_pending or it's blind to
+    // the handshake. wake_tick stays as the missed-notify safety net.
+    @atomicStore(bool, &pcb.wake_pending, true, .release);
 
     // Targeted IPI (gap #9). Re-read wait_kind to defend against the
     // waiter having raced through wake → re-park on something else;
@@ -851,8 +862,17 @@ fn sendCmdViaPhys(cmd_len: u32, resp_len: u32) bool {
                 // The primary waker is still virtioGpuIrqHandler — now
                 // routes through current_gpu_waiter direct lookup. Set
                 // wake_tick BEFORE blockOn so the soft-yield doesn't race
-                // wakeExpired clearing it.
-                process.procs[cur_pid_outer].wake_tick = process.tick_count +% 1;
+                // wakeExpired clearing it. @atomicStore to avoid racing
+                // the IRQ handler's @atomicStore of wake_tick = now
+                // (without atomicity, the IRQ's "wake now" could be
+                // clobbered by our "wake at now+1" → one extra tick of
+                // latency per loss).
+                @atomicStore(
+                    u64,
+                    &process.procs[cur_pid_outer].wake_tick,
+                    process.tick_count +% 1,
+                    .release,
+                );
                 process.blockOn(.gpu_io, cmd_type_for_target);
                 hlt_iters += 1;
             }
@@ -1081,7 +1101,15 @@ fn sendSimpleCmdPair(
                 const used = usedIdxCoherent(&ctrl_vq);
                 if (@as(i16, @bitCast(used -% target_idx)) >= 0) break :blk true;
                 if (hlt_iters >= 100) break :blk false;
-                process.procs[cur_pid_outer].wake_tick = process.tick_count +% 1;
+                // @atomicStore to avoid racing virtioGpuIrqHandler's
+                // @atomicStore of wake_tick = now (see sendCmdViaPhys
+                // for the full rationale).
+                @atomicStore(
+                    u64,
+                    &process.procs[cur_pid_outer].wake_tick,
+                    process.tick_count +% 1,
+                    .release,
+                );
                 process.blockOn(.gpu_io, cmd_type_for_target);
                 hlt_iters += 1;
             }
@@ -1659,7 +1687,8 @@ pub fn tickSweep() void {
     const process = @import("../proc/process.zig");
     var pid: u8 = 0;
     while (pid < process.MAX_PROCS) : (pid += 1) {
-        if (process.procs[pid].wait_kind == .gpu_io) {
+        const wk = @atomicLoad(u8, @as(*const u8, @ptrCast(&process.procs[pid].wait_kind)), .acquire);
+        if (wk == @intFromEnum(process.WaitKind.gpu_io)) {
             @atomicStore(u64, &process.procs[pid].wake_tick, process.tick_count, .release);
         }
     }

@@ -117,7 +117,6 @@ DENYLIST: set[str] = {
     "dwarf_line.zig",
     "exectrail.zig",
     "iretq_canary.zig",
-    "kstack_protect.zig",
     "panic_screen.zig",
     "pcb_invariants.zig",
     "pid_act.zig",

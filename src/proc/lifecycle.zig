@@ -757,8 +757,6 @@ const TerminateOp = enum { kill, destroy };
 ///   * `destroy`: call `schedule()` + halt AFTER this returns (the
 ///     dying CPU is still on the dying kstack until it reschedules).
 fn tearDownTask(pid: usize, status: u32, op: TerminateOp) void {
-    const kp = @import("../debug/kstack_protect.zig");
-    kp.checkpoint("tdt:entry");
     const my_tgid: u8 = process.procs[pid].tgid;
     const last_in_group = countThreadsInGroup(my_tgid) <= 1;
     debug.klog("[proc] {s} {d} {s} (status=0x{X})\n", .{
@@ -780,7 +778,6 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp) void {
     // deadlocking the entire GPU pipeline. Each released lock logs a
     // [lock-dump] line so the autopsy shows what was stranded.
     @import("spinlock.zig").releaseMutexesOwnedBy(@intCast(pid));
-    kp.checkpoint("tdt:post-mutexRelease");
 
     // If this thread was parked in blockOn(.nvme_io) inside swap.evictFrame's
     // writePage, wake() against a .zombie is a no-op and the in-flight swap
@@ -793,13 +790,17 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp) void {
     // the per-AS cleanup below; this just recycles the kernel bookkeeping.
     @import("../cpu/iouring.zig").releaseAllForPid(@intCast(pid));
 
+    // fdpoll waiters tied to this pid — drop them before iouring shutdown
+    // completes, since the OP_POLL pending slots reference them by index
+    // and the worker may already have recycled the Instance slot above.
+    @import("../cpu/fdpoll.zig").releaseAllForPid(@intCast(pid));
+
     // Resources reachable in any address space (GUI window state, GPU
     // contexts, debug symbols all live in heap / driver structures, not
     // user memory). Safe to free before the CR3 switch below.
     if (last_in_group) {
         const desktop = @import("../ui/desktop.zig");
         desktop.destroyGuiWindow(@intCast(pid));
-        kp.checkpoint("tdt:post-destroyGuiWindow");
         if (process.procs[pid].gpu_has_ctx) {
             const virtio_gpu = @import("../driver/virtio_gpu.zig");
             if (!virtio_gpu.ctxDestroy(process.procs[pid].gpu_ctx_id)) {
@@ -807,12 +808,10 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp) void {
             }
             process.procs[pid].gpu_has_ctx = false;
             process.procs[pid].gpu_ctx_id = 0;
-            kp.checkpoint("tdt:post-ctxDestroy");
         }
         if (process.procs[pid].sym_table) |st| {
             symbols.freeSymTable(st);
             process.procs[pid].sym_table = null;
-            kp.checkpoint("tdt:post-freeSymTable");
         }
     }
 
@@ -822,7 +821,6 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp) void {
     // victim's was never active here), so no switch needed.
     if (op == .destroy) {
         pcid_mod.loadCr3(@import("../mm/paging.zig").getKernelPageDirPhys(), 0, smp.myCpu().cpu_id);
-        kp.checkpoint("tdt:post-switchAS");
     }
 
     if (last_in_group) {
@@ -835,12 +833,9 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp) void {
                 pcid_mod.free(lead.pcid);
                 lead.pcid = 0;
             }
-            kp.checkpoint("tdt:post-destroyAS");
         }
         closePipeFds(my_tgid);
-        kp.checkpoint("tdt:post-closePipes");
         freeElfBuf(lead);
-        kp.checkpoint("tdt:post-freeElfBuf");
         const paging = @import("../mm/paging.zig");
         const shm = @import("../mm/shm.zig");
         for (lead.lazy_regions[0..lead.lazy_count]) |r| {
@@ -858,7 +853,6 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp) void {
         }
         lead.lazy_count = 0;
         lead.heap_lazy_idx = -1;
-        kp.checkpoint("tdt:post-lazyRegions");
     }
 
     // Per-thread: drop borrowed page directory pointer so a future zombie
@@ -890,7 +884,6 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp) void {
         // the setState lands further down.
         cpu.dispatching_out_pid = @intCast(pid);
         @import("../debug/pid_trace.zig").setCurrentPid(cpu, null);
-        kp.checkpoint("tdt:post-steerToIdle");
     }
 
     // Decide zombie vs immediate free. Parent alive AND lead thread →
@@ -921,12 +914,10 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp) void {
         // that don't care; shells with a SIGCHLD handler can do
         // non-blocking reaping. Sent regardless of waitpid state per POSIX.
         _ = signals.send(parent, signals.SIGCHLD);
-        kp.checkpoint("tdt:post-zombie+SIGCHLD");
     } else {
         process.setState(pid, .unused);
         @atomicStore(usize, &process.expected_kstack_tops[pid], 0, .release);
         @import("../debug/kasan.zig").markPcbDead(@intFromPtr(&process.kstack_pool[pid]) + KSTACK_GUARD_SIZE, KSTACK_SIZE);
-        kp.checkpoint("tdt:post-markPcbDead");
     }
 
     // Release the outbound TOCTOU bracket — pid's state is no longer
@@ -1067,6 +1058,49 @@ pub fn killProcess(pid: u8) void {
     killProcessWithStatus(pid, 0);
 }
 
+/// POSIX exit_group semantics for multi-threaded processes. When a fatal
+/// default-action signal (term/core) fires on one thread, the WHOLE thread
+/// group must die — otherwise cloned peers keep running with the leader's
+/// address space and hold all the memory the leader thought it freed.
+/// (Without this, ^C on mtswap kills only the leader; pid 5 / pid 6 peers
+/// keep evicting until OOM. See [[ctrlc-mtswap-wedge]].)
+///
+/// Walks every PCB whose `tgid` matches and kills it via the existing
+/// killProcessWithStatus path — peers first, self last. The self-kill
+/// (destroyCurrentWithStatus inside killProcessWithStatus's case-1) never
+/// returns. Idempotent re: peers racing into this from concurrent fatal
+/// signals: killProcessWithStatus's exit_requested xchg collapses duplicates.
+pub fn killThreadGroup(tgid: u8, status: u32) void {
+    const my_pid_opt = smp.myCpu().current_pid;
+
+    // Phase 1: kill every peer OTHER than the current thread. Defer self so
+    // tearDownTask on peers (which reads procs[tgid].lazy_regions etc) can
+    // finish before we tear our own kstack out from under this call.
+    var i: u8 = 0;
+    while (i < MAX_PROCS) : (i += 1) {
+        const p = &process.procs[i];
+        const s = p.state;
+        if (s == .unused or s == .zombie) continue;
+        if (p.tgid != tgid) continue;
+        if (my_pid_opt) |cur| if (cur == i) continue;
+        killProcessWithStatus(i, status);
+    }
+
+    // Phase 2: if current is in the group, self-destroy. Mirrors the case-1
+    // self-escalation inside killProcessWithStatus — destroyCurrentWithStatus
+    // never returns.
+    if (my_pid_opt) |cur| {
+        const cur_pcb = &process.procs[cur];
+        if (cur_pcb.tgid == tgid) {
+            const s = cur_pcb.state;
+            if (s != .unused and s != .zombie) {
+                destroyCurrentWithStatus(status);
+                unreachable;
+            }
+        }
+    }
+}
+
 // =============================================================================
 // Reaper infrastructure (process accounting / cleanup)
 // =============================================================================
@@ -1176,23 +1210,7 @@ pub fn reapStaleZombies(max_age_ticks: u64) u32 {
 pub fn destroyCurrentWithStatus(status: u32) void {
     const cur = smp.myCpu().current_pid orelse return;
 
-    // Protect the kstacks of PROTECTED_PIDS (currently desktop=2, shell=3)
-    // for the duration of the destroy critical section. Any wild write
-    // into those kstacks during teardown #PFs on the writing CPU with
-    // the writer's RIP captured in the saved frame. Note: tasks currently
-    // running on another CPU are SKIPPED (would brick that CPU on next
-    // push); the running-victim wild-writer case is hunted via the
-    // `checkpoint` bisection logger instead.
-    const kstack_protect = @import("../debug/kstack_protect.zig");
-    kstack_protect.checkpoint("dcws:entry");
-    kstack_protect.protectAll();
-    kstack_protect.checkpoint("dcws:post-protect");
-
     tearDownTask(cur, status, .destroy);
-
-    kstack_protect.checkpoint("dcws:post-teardown");
-    kstack_protect.unprotectAll();
-    kstack_protect.checkpoint("dcws:post-unprotect");
 
     // For user sys_exit, the syscall handler ALSO calls schedule afterwards
     // — that's now a redundant no-op (cheap). For kernel-task callers, this
@@ -1216,12 +1234,9 @@ pub fn destroyCurrent() void {
 pub fn reapZombie(pid: u8) void {
     if (pid >= MAX_PROCS) return;
     if (process.procs[pid].state != .zombie) return;
-    const kp = @import("../debug/kstack_protect.zig");
-    kp.checkpoint("reap:entry");
     process.setState(pid, .unused);
     @atomicStore(usize, &process.expected_kstack_tops[pid], 0, .release);
     @import("../debug/kasan.zig").markPcbDead(@intFromPtr(&process.kstack_pool[pid]) + KSTACK_GUARD_SIZE, KSTACK_SIZE);
-    kp.checkpoint("reap:exit");
 }
 
 /// Find the lowest-pid zombie child of `parent`. Returns null if none.

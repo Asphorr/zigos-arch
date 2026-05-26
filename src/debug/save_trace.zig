@@ -43,7 +43,18 @@ const watch = @import("watch.zig");
 /// the working baseline IPI cost.
 ///
 /// Toggle off if false positives become noisy.
-pub var hwbp_save_arm_enabled: bool = true;
+///
+/// DISABLED 2026-05-25: per-switch arm fires an applyLocal+broadcastSync
+/// (mov-to-DR0..3+DR7 locally + DR-sync IPI to every other alive CPU which
+/// does the same) on every context switch for pid 2 / pid 3. Desktop pid 2
+/// context-switches dozens of times per second through GPU blockOn loops,
+/// so this saturated the cross-CPU IPI path and made the system perceptibly
+/// stall post-boot. The 2026-05-19 dual-VA arming attempt hit the same
+/// class of wedge. Mirror compare logic stays wired up in watch.zig for
+/// later hunts — just disabled until we either (a) gate it on a "suspect
+/// pid is parked" condition rather than every switch, or (b) deduplicate
+/// the arm so we only re-IPI when the address actually changed.
+pub var hwbp_save_arm_enabled: bool = false;
 const HWBP_SLOT_PID2: u2 = 2;
 const HWBP_SLOT_PID3: u2 = 3;
 
@@ -154,16 +165,49 @@ pub export fn save_trace_record(kesp_ptr: usize) callconv(.c) void {
     if (cpu_id >= smp.MAX_CPUS) return;
     // Clear schedule's transient-window bracket. We've just performed the
     // save that updates procs[prev].kernel_esp; from here on prev is fully
-    // parked and pcb_invariants / kstack_protect.tickMonitor can safely
-    // validate its kesp+48. Done before the ring-buffer record so a panic
+    // parked and pcb_invariants can safely validate its kesp+48. Done
+    // before the ring-buffer record so a panic
     // inside the record path doesn't leave the bracket set.
     smp.cpus[cpu_id].scheduling_out_pid = 0xFFFF;
+    // Re-evaluate DR7 on this CPU now that scheduling_out is clear: the
+    // pid we just saved is "fully parked" by the watch.gate semantics
+    // (see watch.entryEffectivelyArmed), so any kesp-gated entries should
+    // arm here without waiting ~10ms for the next timer-tick applyLocal.
+    // Cost: 5 mov-to-DR (~250 cycles) per switchTo save — cheap vs the
+    // #DBs we save by gating.
+    @import("watch.zig").applyLocal();
     const ring = &rings[cpu_id];
     const slot: usize = ring.head % RING_SIZE;
     ring.head +%= 1;
 
     const new_kesp: u64 = @as(*const u64, @ptrFromInt(kesp_ptr)).*;
     const pid = pidFromKespPtr(kesp_ptr);
+
+    // Wild-RSP source detector (2026-05-25 zig-osdev-reviewer audit): catch
+    // the switchTo save that introduces a `kernel_esp` value pointing
+    // OUTSIDE pid's own kstack body. That stale value is the agent's H1
+    // root cause of the cross-CPU stack aliasing class — at the next
+    // dispatch of `pid`, switchTo's `movq (%rsi), %rsp` swaps to a
+    // foreign kstack, and the very next `call setTssRsp0` plants RA
+    // 0x803428F2 inside whichever pid's kstack the wild RSP happens to
+    // address. Catching here (at SAVE) keeps the offending schedule's
+    // call stack still live — the dispatch consumer's stack is already
+    // overwritten by switchTo's pops by the time the bad value bites.
+    if (pid < config.MAX_PROCS) {
+        const top_chk = @atomicLoad(usize, &process.expected_kstack_tops[pid], .acquire);
+        if (top_chk != 0) {
+            const body_lo = top_chk -| config.KSTACK_SIZE;
+            if (new_kesp < body_lo or new_kesp >= top_chk) {
+                serial.print("\n[wild-rsp-save] !!! save into pid={d}'s PCB.kernel_esp is OUTSIDE its kstack body !!!\n", .{pid});
+                serial.print("[wild-rsp-save]   new_kesp = 0x{X:0>16}\n", .{new_kesp});
+                serial.print("[wild-rsp-save]   pid {d} kstack body = [0x{X:0>16}..0x{X:0>16})\n", .{ pid, body_lo, top_chk });
+                serial.print("[wild-rsp-save]   cpu = {d}  self_ra = 0x{X:0>16}\n", .{ cpu_id, @returnAddress() });
+                @import("kdbg.zig").nmi_halt_after_snapshot = true;
+                dumpAll();
+                @panic("save_trace_record: wild RSP saved into PCB.kernel_esp (cross-stack-alias source)");
+            }
+        }
+    }
 
     // Peek the qword at kesp+48 — that's the RA `ret` will pop on the
     // next dispatch. Bounds-check against the pid's kstack body so a
@@ -206,38 +250,37 @@ pub export fn save_trace_record(kesp_ptr: usize) callconv(.c) void {
         last_save_kesp[pid] = new_kesp;
         last_save_plus48[pid] = saved_rip;
         last_save_tsc[pid] = rings[cpu_id].entries[slot].tsc;
-        // (Per-save page-protect was tried 2026-05-18 — wedges silently
-        // even with local-only invlpg + no cross-CPU shootdown; possibly
-        // splitToPte allocator lock or TLB-cascade through schedule's
-        // critical section. Kept the protectOnSave function in
-        // kstack_protect.zig for later research but it's no-op until
-        // `per_save_protect_enabled` is flipped manually + the wedge
-        // is debugged.)
-
-        // HWBP arm: catch any write to kesp+48 whose value ≠ the
-        // just-observed legit saved RA. Disarm in process.schedule
-        // when pid is dispatched (first callq after switchTo's retq
-        // legitimately overwrites this slot with a different RA).
+        // HWBP arm: catch any write to kesp+48 whose value ≠ the per-pid
+        // save_trace mirror. Uses the mirror_pid_plus1 path in
+        // watch.onDebugException, which structurally suppresses:
+        //   - writes while pid is running on any CPU (stack reuse — IRQ
+        //     handlers calling functions whose prologues push regs into
+        //     this slot via the live RSP)
+        //   - writes when watched addr != current pcb.kernel_esp + 48
+        //     (stale watch — pid reparked at a different depth)
+        //   - the `call switchTo` push inside schedule (whitelisted by RIP)
+        // Replaces the older armSkipValue arm: that one needed a paired
+        // disarm in process.schedule before dispatch to silence the running-
+        // pid stack-reuse case, which left the slot disarmed for most of the
+        // task's lifetime — corrupters slipped through whenever they fired
+        // before the next save_trace_record re-armed.
         if (hwbp_save_arm_enabled and rip_in_body == 1) {
             const rip_slot = new_kesp +% 48;
-            if (pid == 2) {
-                watch.armSkipValue(
-                    HWBP_SLOT_PID2,
-                    rip_slot,
-                    .eight,
-                    .panic_dump,
-                    "kesp48_pid2",
-                    saved_rip,
-                );
-            } else if (pid == 3) {
-                watch.armSkipValue(
-                    HWBP_SLOT_PID3,
-                    rip_slot,
-                    .eight,
-                    .panic_dump,
-                    "kesp48_pid3",
-                    saved_rip,
-                );
+            if (pid == 2 or pid == 3) {
+                const hw_slot: u2 = if (pid == 2) HWBP_SLOT_PID2 else HWBP_SLOT_PID3;
+                const label = if (pid == 2) "kesp48_pid2" else "kesp48_pid3";
+                watch.entries[hw_slot] = .{
+                    .armed = true,
+                    .addr = rip_slot,
+                    .kind = .write,
+                    .len = .eight,
+                    .policy = .panic_dump,
+                    .label = label,
+                    .mirror_pid_plus1 = pid + 1,
+                    .whitelist_fn = &watch.isLegitKesp48Writer,
+                };
+                watch.applyLocal();
+                watch.broadcastSync();
             }
         }
     }

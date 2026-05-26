@@ -67,3 +67,31 @@ pub fn validateUserPtrAligned(ptr: usize, len: usize, comptime align_to: usize) 
     if (align_to > 1 and ptr & (align_to - 1) != 0) return false;
     return validateUserPtr(ptr, len);
 }
+
+/// Wrap a kernel-side socket slot in a per-process fd. Used by socket-
+/// allocating syscalls (tcp_connect, tcp_listen, tcp_accept) so userspace
+/// gets a uniform fd back instead of a separate slot namespace. Returns
+/// null if the caller's fd_table is full — caller must roll back the
+/// slot allocation in that case.
+pub fn allocSocketFd(pcb: *process.PCB, kind: process.FsType, slot: u8) ?u32 {
+    const vfs = @import("../../fs/vfs.zig");
+    const fd_idx = vfs.allocFd(pcb) orelse return null;
+    pcb.fd_table[fd_idx] = .{
+        .in_use = true,
+        .fs_type = kind,
+        .inode = @as(u32, slot),
+    };
+    return @intCast(fd_idx);
+}
+
+/// Resolve a socket fd back to the kernel slot. Verifies the fd is in use
+/// AND that its fs_type matches the expected kind, so tcpSend on a pipe
+/// fd or a tcp_listener fd is rejected with EBADF instead of silently
+/// indexing into the wrong table. Returns the u8 slot id on success.
+pub fn resolveSocketFd(pcb: *process.PCB, fd: u32, expected_kind: process.FsType) ?u8 {
+    if (fd >= pcb.fd_table.len) return null;
+    const e = &pcb.fd_table[fd];
+    if (!e.in_use) return null;
+    if (e.fs_type != expected_kind) return null;
+    return @intCast(e.inode);
+}

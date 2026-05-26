@@ -838,6 +838,8 @@ fn cmdDump(pid_str: []const u8) void {
                 .devfs => "devfs",
                 .procfs => "procfs",
                 .ext2 => "ext2",
+                .tcp_sock => "tcp_sock",
+                .tcp_listener => "tcp_listener",
             };
             vga.print("    fd={d} {s} offset={d}\n", .{ i, fs_name, fd.offset });
             open_fds += 1;

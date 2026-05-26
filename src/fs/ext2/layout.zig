@@ -108,6 +108,26 @@ pub const Superblock = extern struct {
     // Padding fills to 1024 bytes.
     _reserved: [1024 - 204]u8,
 };
+comptime {
+    // ext2 rev 1 dynamic superblock — 1024 bytes total at offset 1024.
+    const a = std.debug.assert;
+    a(@sizeOf(Superblock) == 1024);
+    a(@offsetOf(Superblock, "inodes_count") == 0);
+    a(@offsetOf(Superblock, "blocks_count") == 4);
+    a(@offsetOf(Superblock, "log_block_size") == 24);
+    a(@offsetOf(Superblock, "blocks_per_group") == 32);
+    a(@offsetOf(Superblock, "inodes_per_group") == 40);
+    a(@offsetOf(Superblock, "magic") == 56);
+    a(@offsetOf(Superblock, "rev_level") == 76);
+    a(@offsetOf(Superblock, "first_ino") == 84);
+    a(@offsetOf(Superblock, "inode_size") == 88);
+    a(@offsetOf(Superblock, "feature_compat") == 92);
+    a(@offsetOf(Superblock, "feature_incompat") == 96);
+    a(@offsetOf(Superblock, "feature_ro_compat") == 100);
+    a(@offsetOf(Superblock, "uuid") == 104);
+    a(@offsetOf(Superblock, "volume_name") == 120);
+    a(@offsetOf(Superblock, "last_mounted") == 136);
+}
 
 /// 32 bytes per block group, packed back-to-back into the group descriptor
 /// table (which itself starts at the block right after the primary
@@ -122,6 +142,17 @@ pub const BlockGroupDescriptor = extern struct {
     pad: u16 align(1),
     _reserved: [12]u8,
 };
+comptime {
+    // ext2 spec — block group descriptor is exactly 32 bytes.
+    const a = std.debug.assert;
+    a(@sizeOf(BlockGroupDescriptor) == 32);
+    a(@offsetOf(BlockGroupDescriptor, "block_bitmap") == 0);
+    a(@offsetOf(BlockGroupDescriptor, "inode_bitmap") == 4);
+    a(@offsetOf(BlockGroupDescriptor, "inode_table") == 8);
+    a(@offsetOf(BlockGroupDescriptor, "free_blocks_count") == 12);
+    a(@offsetOf(BlockGroupDescriptor, "free_inodes_count") == 14);
+    a(@offsetOf(BlockGroupDescriptor, "used_dirs_count") == 16);
+}
 
 /// 128 bytes (rev 0 layout). Rev 1 grows to 256 with extended attrs we
 /// don't need; we read only the first 128. Inode 1 is bad-blocks, inode 2
@@ -153,6 +184,21 @@ pub const Inode = extern struct {
     faddr: u32 align(1),
     osd2: [12]u8,
 };
+comptime {
+    // ext2 rev 0 inode — 128 bytes; rev 1 with extended attrs grows but
+    // we only read the first 128 (consistent with Inode struct).
+    const a = std.debug.assert;
+    a(@sizeOf(Inode) == 128);
+    a(@offsetOf(Inode, "mode") == 0);
+    a(@offsetOf(Inode, "size") == 4);
+    a(@offsetOf(Inode, "atime") == 8);
+    a(@offsetOf(Inode, "links_count") == 26);
+    a(@offsetOf(Inode, "blocks") == 28);
+    a(@offsetOf(Inode, "flags") == 32);
+    a(@offsetOf(Inode, "block") == 40);
+    a(@offsetOf(Inode, "generation") == 100);
+    a(@offsetOf(Inode, "dir_acl") == 108);
+}
 
 /// Variable-length, 4-byte-aligned. Directories are streams of these
 /// inside the directory file. The last entry's `rec_len` stretches to
@@ -174,6 +220,16 @@ pub const DirEntry = extern struct {
     /// (0 in practice since names are < 256 bytes).
     file_type: u8,
 };
+comptime {
+    // ext2 dir entry header — 8 bytes before the inline name.
+    const a = std.debug.assert;
+    a(@sizeOf(DirEntry) == 8);
+    a(@offsetOf(DirEntry, "inode") == 0);
+    a(@offsetOf(DirEntry, "rec_len") == 4);
+    a(@offsetOf(DirEntry, "name_len") == 6);
+    a(@offsetOf(DirEntry, "file_type") == 7);
+    a(DIR_ENTRY_HDR == 8);
+}
 
 /// Header size before the inline name. dirInsert/Remove use this when
 /// computing slack.

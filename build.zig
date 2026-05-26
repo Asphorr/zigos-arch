@@ -361,6 +361,7 @@ pub fn build(b: *std.Build) void {
         .{ "mtswap.elf", "app/mtswap.zig" },
         .{ "shmtest.elf", "app/shmtest.zig" },
         .{ "iouringtest.elf", "app/iouringtest.zig" },
+        .{ "crashtest.elf", "app/crashtest.zig" },
         .{ "diskbench.elf", "app/diskbench.zig" },
         .{ "threadtest.elf", "app/threadtest.zig" },
         .{ "threadbrot.elf", "app/threadbrot.zig" },

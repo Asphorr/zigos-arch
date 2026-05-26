@@ -466,6 +466,16 @@ pub fn nslookupCommand(hostname: []const u8) void {
 
 const TcpState = enum { closed, listen, syn_sent, syn_received, established, fin_wait_1, fin_wait_2, time_wait, close_wait, last_ack };
 
+// TcpConn / TcpListener slots carry no per-table lock today. The two
+// access paths are (a) NIC-RX, driven by net.handleRxFrame called from
+// driver IRQ handlers + net.poll() in syscall context; (b) syscall
+// handlers in cpu/syscall/net.zig that read/write a specific slot.
+// Both currently run effectively single-threaded relative to each
+// other — NIC IRQs land on BSP and syscalls touch slots only at
+// well-defined points — so there's no fine-grained protection. The
+// day NIC IRQs get distributed across CPUs, this table needs a lock
+// (and these annotations should change from blank to (p:tcp_lock)).
+// See docs/STYLE.md.
 const TcpConn = struct {
     state: TcpState = .closed,
     active: bool = false,
@@ -816,6 +826,41 @@ pub fn tcpPeerClosed(slot: u8) bool {
     return !tcp_conns[slot].active or tcp_conns[slot].peer_closed or tcp_conns[slot].error_flag;
 }
 
+// POSIX poll bits — duplicated from fdpoll.zig (single source if/when we
+// add more wakers; net.zig avoids importing fdpoll at top level to dodge
+// the iouring↔fdpoll↔net cycle through fdpoll.completion_callback).
+const POLLIN_BIT: u16 = 0x0001;
+const POLLOUT_BIT: u16 = 0x0004;
+const POLLERR_BIT: u16 = 0x0008;
+const POLLHUP_BIT: u16 = 0x0010;
+
+/// Readiness mask for a connection slot. Consumed by fdpoll.pollMaskHandle
+/// when an OP_POLL is submitted against a .tcp_sock fd. Free-window check
+/// for POLLOUT mirrors send-side: established connections with in-flight
+/// bytes below the rx window count as writable (the kernel splits into
+/// MSS-sized segments internally, so userspace doesn't need to know the
+/// exact byte budget).
+pub fn tcpPollMask(slot: u8) u16 {
+    if (slot >= TCP_MAX_CONNS) return POLLERR_BIT;
+    const c = &tcp_conns[slot];
+    if (!c.active) return POLLERR_BIT;
+    var mask: u16 = 0;
+    if (c.rx_count > 0 or c.peer_closed) mask |= POLLIN_BIT;
+    if (c.state == .established) mask |= POLLOUT_BIT;
+    if (c.error_flag) mask |= POLLERR_BIT;
+    if (c.peer_closed and c.rx_count == 0) mask |= POLLHUP_BIT;
+    return mask;
+}
+
+/// Readiness mask for a listener slot. POLLIN means accept() won't block.
+pub fn tcpListenerPollMask(slot: u8) u16 {
+    if (slot >= TCP_MAX_LISTENERS) return POLLERR_BIT;
+    const l = &tcp_listeners[slot];
+    if (!l.active) return POLLERR_BIT;
+    if (l.accept_head != l.accept_tail) return POLLIN_BIT;
+    return 0;
+}
+
 /// Bulk-copy TCP payload bytes into the connection's ring buffer.
 /// Returns the number of bytes actually copied (capped by ring free space).
 /// Handles the ring's wrap point with at most two @memcpy calls — replaces
@@ -840,6 +885,7 @@ fn ringPushTcpData(c: *TcpConn, tcp: []volatile u8, data_offset: usize, payload_
     }
     c.rx_write +%= @intCast(to_copy);
     c.rx_count += @intCast(to_copy);
+    @import("../cpu/fdpoll.zig").wakePollers(.tcp_sock, @as(u16, connSlotIndex(c)));
     return to_copy;
 }
 
@@ -897,6 +943,7 @@ fn handleTcpPacket(ip_data: []volatile u8, ihl: usize) void {
                 c.retransmit_count = 0;
                 if (c.listener_slot != TCP_NO_LISTENER and c.listener_slot < TCP_MAX_LISTENERS) {
                     enqueueAccepted(&tcp_listeners[c.listener_slot], connSlotIndex(c));
+                    @import("../cpu/fdpoll.zig").wakePollers(.tcp_listener, @as(u16, c.listener_slot));
                 }
                 // Bundled data on the ACK that completes the handshake.
                 if (payload_len > 0 and seq == c.rcv_nxt) {
@@ -931,6 +978,7 @@ fn handleTcpPacket(ip_data: []volatile u8, ihl: usize) void {
                     c.state = .established;
                     c.retransmit_count = 0;
                     _ = sendTcpPacket(c, TCP_ACK, null, false);
+                    @import("../cpu/fdpoll.zig").wakePollers(.tcp_sock, @as(u16, connSlotIndex(c)));
                 }
             }
         },
@@ -954,6 +1002,7 @@ fn handleTcpPacket(ip_data: []volatile u8, ihl: usize) void {
                 c.peer_closed = true;
                 _ = sendTcpPacket(c, TCP_ACK, null, false);
                 c.state = .close_wait;
+                @import("../cpu/fdpoll.zig").wakePollers(.tcp_sock, @as(u16, connSlotIndex(c)));
             }
         },
         .fin_wait_1 => {

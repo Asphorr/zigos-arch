@@ -80,15 +80,18 @@ var run_pool_exhaustions: u64 = 0;
 /// access to its slice). free_count + next_free_word + freelist_heads are
 /// region-local.
 const Region = struct {
+    // Access-tag legend (see docs/STYLE.md). All mutable region state is
+    // guarded by `lock`; the global bitmap slice this region owns is the
+    // same — touched only under this lock.
     lock: SpinLock = .{},
-    free_count: u32 = 0,
+    free_count: u32 = 0, // (p:lock)
     /// Word index into the global bitmap, RELATIVE to the region's start.
     /// Range: 0..REGION_WORDS. Hints where the next scan should begin.
-    next_free_word: u32 = 0,
+    next_free_word: u32 = 0, // (p:lock)
     /// Per-order freelist heads. Index into `run_pool`; NULL_RUN = empty.
     /// freelist_heads[k] holds runs of size [2^k, 2^(k+1)) (except the
     /// top-most bucket which is open-ended).
-    freelist_heads: [MAX_ORDER + 1]u32 = [_]u32{NULL_RUN} ** (MAX_ORDER + 1),
+    freelist_heads: [MAX_ORDER + 1]u32 = [_]u32{NULL_RUN} ** (MAX_ORDER + 1), // (p:lock)
 };
 
 var regions: [REGIONS_COUNT]Region = blk: {
@@ -389,6 +392,22 @@ inline fn canaryBitClear(frame: u32) void {
 inline fn canaryBitGet(frame: u32) bool {
     const w = @atomicLoad(u32, &canary_present[frame / 32], .monotonic);
     return (w & (@as(u32, 1) << @intCast(frame & 31))) != 0;
+}
+
+/// Bulk-clear canary-present bits for a contiguous frame range. Used by
+/// allocContiguous + freeContiguous to keep the canary state-machine
+/// consistent across single-frame ↔ contiguous transitions. Without this,
+/// a frame that bounces freeFrame → allocContiguous → contiguous-user-write
+/// → freeContiguous → allocFrame keeps the canary-present bit set from the
+/// first freeFrame (no path clears it), so the second allocFrame's check
+/// fires on overwritten contiguous-user content — a flood of false-positive
+/// UAFs (see 2026-05-25 ELF-page run, ~40 spurious hits in one boot).
+inline fn canaryBitClearRange(start_frame: u32, count: u32) void {
+    var f = start_frame;
+    const end = start_frame + count;
+    while (f < end) : (f += 1) {
+        canaryBitClear(f);
+    }
 }
 
 pub fn pmmCanaryMismatches() u64 {
@@ -1249,6 +1268,7 @@ pub fn allocContiguous(count: u32) ?usize {
     const last: usize = base + (@as(usize, count) - 1) * FRAME_SIZE;
     if (last != base) checkPhysSafety(last, "allocContiguous(last)");
     checkKstackOverlap(base, count, "allocContiguous", ra);
+    canaryBitClearRange(@intCast(base / FRAME_SIZE), count);
     @import("../debug/kdbg.zig").pmmAlloc(base, count, ra);
     @import("../debug/kasan.zig").unpoison(base, @as(usize, count) * FRAME_SIZE);
     return base;
@@ -1281,6 +1301,7 @@ pub fn allocContiguousBelow4G(count: u32) ?usize {
     const last: usize = base + (@as(usize, count) - 1) * FRAME_SIZE;
     if (last != base) checkPhysSafety(last, "allocContiguousBelow4G(last)");
     checkKstackOverlap(base, count, "allocContiguousBelow4G", ra);
+    canaryBitClearRange(@intCast(base / FRAME_SIZE), count);
     @import("../debug/kdbg.zig").pmmAlloc(base, count, ra);
     @import("../debug/kasan.zig").unpoison(base, @as(usize, count) * FRAME_SIZE);
     return base;
@@ -1312,11 +1333,37 @@ pub fn freeFrame(phys_addr: usize) void {
         @atomicStore(u8, &frame_refs[frame_num], 0, .release);
         const symbols = @import("../debug/symbols.zig");
         const serial = @import("../debug/serial.zig");
+        const kdbg = @import("../debug/kdbg.zig");
         serial.print("[pmm] LEAK: freeFrame underflow phys=0x{X} caller=", .{phys_addr});
         if (symbols.resolveKernel(ra)) |r| {
             serial.print("{s}+0x{X}\n", .{ r.name, r.offset });
         } else {
             serial.print("0x{X}\n", .{ra});
+        }
+        // Walk the free/alloc rings to name the prior frees and last alloc.
+        // Mass-double-free patterns (like 29 consecutive frames at exit) all
+        // share one root: a stale parent table pointing into PMM-managed
+        // memory that was reallocated to someone else. The ring tells us
+        // WHO freed it the first time and WHO last allocated it.
+        if (kdbg.pmmFindLastFree(phys_addr)) |prev| {
+            serial.print("[pmm] LEAK:   prior-free caller=", .{});
+            if (symbols.resolveKernel(prev.caller_ra)) |r| {
+                serial.print("{s}+0x{X}", .{ r.name, r.offset });
+            } else {
+                serial.print("0x{X}", .{prev.caller_ra});
+            }
+            serial.print(" tsc=0x{X}\n", .{prev.tsc});
+        } else {
+            serial.print("[pmm] LEAK:   no prior-free event in ring\n", .{});
+        }
+        if (kdbg.pmmFindLastAlloc(phys_addr)) |alloc_ev| {
+            serial.print("[pmm] LEAK:   last-alloc caller=", .{});
+            if (symbols.resolveKernel(alloc_ev.caller_ra)) |r| {
+                serial.print("{s}+0x{X}", .{ r.name, r.offset });
+            } else {
+                serial.print("0x{X}", .{alloc_ev.caller_ra});
+            }
+            serial.print(" tsc=0x{X} count={d}\n", .{ alloc_ev.tsc, alloc_ev.count });
         }
         return;
     }
@@ -1408,6 +1455,7 @@ pub fn freeContiguous(phys_addr: usize, count: u32) void {
     checkPhysSafety(phys_addr, "freeContiguous");
     const last_addr = phys_addr + (@as(usize, count) - 1) * FRAME_SIZE;
     if (last_addr != phys_addr) checkPhysSafety(last_addr, "freeContiguous(last)");
+    canaryBitClearRange(@intCast(start_frame), count);
     @import("../debug/kdbg.zig").pmmFree(phys_addr, ra);
     @import("../debug/kasan.zig").poison(phys_addr, @as(usize, count) * FRAME_SIZE, @import("../debug/kasan.zig").SHADOW_FREED);
 

@@ -192,6 +192,13 @@ const RxDesc = extern struct {
     /// extras (rss_hash low half).
     word1: u64 align(1),
 };
+comptime {
+    // i225 advanced RX descriptor — 16 bytes (datasheet §7.1.5).
+    const a = @import("std").debug.assert;
+    a(@sizeOf(RxDesc) == 16);
+    a(@offsetOf(RxDesc, "word0") == 0);
+    a(@offsetOf(RxDesc, "word1") == 8);
+}
 
 const TxDesc = extern struct {
     /// Read & writeback: buffer phys addr.
@@ -202,6 +209,14 @@ const TxDesc = extern struct {
     /// Bytes 12-15: cmd_type_len (see TXD_CMD_* constants above).
     cmd_type_len: u32 align(1),
 };
+comptime {
+    // i225 advanced TX descriptor — 16 bytes.
+    const a = @import("std").debug.assert;
+    a(@sizeOf(TxDesc) == 16);
+    a(@offsetOf(TxDesc, "buffer_addr") == 0);
+    a(@offsetOf(TxDesc, "olinfo_status") == 8);
+    a(@offsetOf(TxDesc, "cmd_type_len") == 12);
+}
 
 // --- Module state ---
 var mmio_base: usize = 0;

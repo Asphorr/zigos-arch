@@ -13,6 +13,7 @@ const std = @import("std");
 const process = @import("process.zig");
 const debug = @import("../debug/debug.zig");
 const config = @import("../config.zig");
+const fdpoll = @import("../cpu/fdpoll.zig");
 
 pub const PIPE_BUF_SIZE: u32 = config.PIPE_BUF_SIZE;
 pub const MAX_PIPES: u8 = config.MAX_PIPES;
@@ -75,6 +76,7 @@ pub fn read(id: u8, out: []u8) usize {
     if (!p.in_use) return 0;
 
     var copied: usize = 0;
+    var freed_space = false;
     while (copied < out.len) {
         if (p.count > 0) {
             const wanted = out.len - copied;
@@ -86,6 +88,7 @@ pub fn read(id: u8, out: []u8) usize {
             p.tail = (p.tail + @as(u32, @intCast(n))) % PIPE_BUF_SIZE;
             p.count -= @intCast(n);
             copied += n;
+            freed_space = true;
 
             // Wake any writer waiting on this pipe
             if (p.blocked_writer_pid != 0xFF) {
@@ -99,12 +102,16 @@ pub fn read(id: u8, out: []u8) usize {
         // Ring empty
         if (p.writers == 0) {
             // EOF — no more writers, no more data
+            if (freed_space) fdpoll.wakePollers(.pipe, id);
             return copied;
         }
 
         // If the caller already got something, return early — POSIX read
         // semantics: a partial read is valid, the caller can loop.
-        if (copied > 0) return copied;
+        if (copied > 0) {
+            fdpoll.wakePollers(.pipe, id);
+            return copied;
+        }
 
         // Sleep until a writer pushes data (or all writers close). The
         // .signalled branch returns the partial count (zero or otherwise)
@@ -116,10 +123,12 @@ pub fn read(id: u8, out: []u8) usize {
         const br = process.blockOnInterruptible(.pipe_read, id);
         if (br == .signalled) {
             p.blocked_reader_pid = 0xFF;
+            if (freed_space) fdpoll.wakePollers(.pipe, id);
             return copied;
         }
         // Loop: re-check for data
     }
+    if (freed_space) fdpoll.wakePollers(.pipe, id);
     return copied;
 }
 
@@ -149,6 +158,7 @@ pub fn tryRead(id: u8, out: []u8) usize {
             process.wake(w);
         }
     }
+    if (copied > 0) fdpoll.wakePollers(.pipe, id);
     return copied;
 }
 
@@ -162,9 +172,11 @@ pub fn write(id: u8, data: []const u8) usize {
     if (!p.in_use) return 0xFFFFFFFF;
 
     var written: usize = 0;
+    var pushed_data = false;
     while (written < data.len) {
         if (p.readers == 0) {
             // No one to read this. Treat as EPIPE.
+            if (pushed_data) fdpoll.wakePollers(.pipe, id);
             return 0xFFFFFFFF;
         }
 
@@ -177,6 +189,7 @@ pub fn write(id: u8, data: []const u8) usize {
             p.head = (p.head + @as(u32, @intCast(n))) % PIPE_BUF_SIZE;
             p.count += @intCast(n);
             written += n;
+            pushed_data = true;
 
             if (p.blocked_reader_pid != 0xFF) {
                 const r = p.blocked_reader_pid;
@@ -195,9 +208,11 @@ pub fn write(id: u8, data: []const u8) usize {
         const br = process.blockOnInterruptible(.pipe_write, id);
         if (br == .signalled) {
             p.blocked_writer_pid = 0xFF;
+            if (pushed_data) fdpoll.wakePollers(.pipe, id);
             return written;
         }
     }
+    if (pushed_data) fdpoll.wakePollers(.pipe, id);
     return written;
 }
 
@@ -228,7 +243,10 @@ pub fn tryWrite(id: u8, data: []const u8) usize {
             process.wake(r);
         }
     }
-    if (written > 0 and p.wake_desktop_on_write) @import("../ui/desktop/wake.zig").requestWake();
+    if (written > 0) {
+        if (p.wake_desktop_on_write) @import("../ui/desktop/wake.zig").requestWake();
+        fdpoll.wakePollers(.pipe, id);
+    }
     return written;
 }
 
@@ -246,6 +264,11 @@ pub fn closeReader(id: u8) void {
         p.blocked_writer_pid = 0xFF;
         process.wake(w);
     }
+
+    // readers→0 means any POLLOUT poller now has to see POLLERR (next
+    // write would EPIPE). Wake regardless of whether refcount actually
+    // hit zero — pollers may have been racing in.
+    fdpoll.wakePollers(.pipe, id);
 
     if (p.readers == 0 and p.writers == 0) {
         p.in_use = false;
@@ -266,6 +289,10 @@ pub fn closeWriter(id: u8) void {
         p.blocked_reader_pid = 0xFF;
         process.wake(r);
     }
+
+    // writers→0 means any POLLIN poller now sees POLLHUP (next read
+    // returns 0/EOF). Wake unconditionally — same reasoning as closeReader.
+    fdpoll.wakePollers(.pipe, id);
 
     if (p.readers == 0 and p.writers == 0) {
         p.in_use = false;

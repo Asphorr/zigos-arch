@@ -124,6 +124,15 @@ const RxDesc = extern struct {
     errors: u8,
     special: u16 align(1),
 };
+comptime {
+    // Intel 82540 datasheet — legacy RX descriptor is 16 bytes.
+    const a = @import("std").debug.assert;
+    a(@sizeOf(RxDesc) == 16);
+    a(@offsetOf(RxDesc, "buffer_addr") == 0);
+    a(@offsetOf(RxDesc, "length") == 8);
+    a(@offsetOf(RxDesc, "status") == 12);
+    a(@offsetOf(RxDesc, "errors") == 13);
+}
 
 const TxDesc = extern struct {
     buffer_addr: u64 align(1),
@@ -134,6 +143,15 @@ const TxDesc = extern struct {
     css: u8,
     special: u16 align(1),
 };
+comptime {
+    // Intel 82540 datasheet — legacy TX descriptor is 16 bytes.
+    const a = @import("std").debug.assert;
+    a(@sizeOf(TxDesc) == 16);
+    a(@offsetOf(TxDesc, "buffer_addr") == 0);
+    a(@offsetOf(TxDesc, "length") == 8);
+    a(@offsetOf(TxDesc, "cmd") == 11);
+    a(@offsetOf(TxDesc, "sta") == 12);
+}
 
 var mmio_base: usize = 0;
 pub var mac: [6]u8 = .{ 0, 0, 0, 0, 0, 0 };

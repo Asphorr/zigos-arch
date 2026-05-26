@@ -264,3 +264,74 @@ pub fn sysUsbWriteSector(lba: u32, buf_ptr: u32) u32 {
     return 0;
 }
 
+/// debug_crash(variant) — deliberately trigger one kernel crash class
+/// to exercise the panic / autopsy / halt-all-CPUs machinery. Used by
+/// app/crashtest.elf as a CI / regression smoke for the panic path.
+///
+/// Modeled on style9's `cmd_crash` (BSD-style sibling project) which
+/// validates the same five fault classes from its in-kernel shell.
+/// ZigOS has no in-kernel shell, so we route through a syscall instead.
+///
+///   1 = dfree     — heap double-free (heap detects mismatched header)
+///   2 = wild      — kfree at offset +64 of a real allocation (header magic mismatch)
+///   3 = assert    — @panic from kernel code path
+///   4 = unmapped  — write to canonical-unmapped kernel VA (#PF in ring 0)
+///   5 = nonc      — write to non-canonical VA (#GP, vec 13)
+///   6 = panic     — direct @panic("crashtest: user-requested")
+///
+/// Returns 0xFFFFFFFF for unknown variant (the others never return —
+/// they trigger panic which halts the system).
+pub fn sysDebugCrash(variant: u32) u32 {
+    const heap = @import("../../mm/heap.zig");
+    debug.klog("[crashtest] sysDebugCrash variant={d}\n", .{variant});
+
+    switch (variant) {
+        1 => {
+            // dfree: kalloc → kfree → kfree. The second kfree should trip
+            // heap's free-list / canary check and panic.
+            const p = heap.kalloc(64) orelse @panic("crashtest dfree: kalloc returned null");
+            heap.kfree(p);
+            debug.klog("[crashtest] dfree: freeing {*} a second time...\n", .{p});
+            heap.kfree(p);
+            @panic("crashtest dfree: kfree double-free should have panicked");
+        },
+        2 => {
+            // wild: kfree at the wrong offset. The 64-byte header in front
+            // of `p + 64` is allocation payload, not a heap header — the
+            // canary / size check fires.
+            const p = heap.kalloc(128) orelse @panic("crashtest wild: kalloc returned null");
+            debug.klog("[crashtest] wild: kfree({*} + 64)...\n", .{p});
+            heap.kfree(@as([*]u8, @ptrCast(p)) + 64);
+            @panic("crashtest wild: misaligned kfree should have panicked");
+        },
+        3 => {
+            // assert: deliberate kernel @panic — tests the dump pipeline
+            // independently of any specific corruption shape.
+            @panic("crashtest assert: deliberate KASSERT-equivalent");
+        },
+        4 => {
+            // unmapped: high-half VA in an empty PML4 slot. Kernel
+            // physmap = PML4[256] (0xFFFF800000000000), vmalloc = PML4[258].
+            // PML4[273] = 0xFFFF888000000000 is left empty by setup —
+            // write triggers a kernel-mode #PF that the exception handler
+            // panics on (ring-3-only fault servicing).
+            const up: *volatile u64 = @ptrFromInt(0xFFFF888000000000);
+            debug.klog("[crashtest] unmapped: writing 0xDEAD to {*}...\n", .{up});
+            up.* = 0xDEAD;
+            @panic("crashtest unmapped: write to empty PML4 slot should have faulted");
+        },
+        5 => {
+            // nonc: bit 47 set, bits 48-63 zero → non-canonical. Touching
+            // it raises #GP (vector 13), distinct fault class from #PF.
+            const up: *volatile u64 = @ptrFromInt(0x0000800000000000);
+            debug.klog("[crashtest] nonc: writing 0xDEAD to non-canonical {*}...\n", .{up});
+            up.* = 0xDEAD;
+            @panic("crashtest nonc: write to non-canonical should have GP'd");
+        },
+        6 => {
+            @panic("crashtest panic: user-requested deliberate panic");
+        },
+        else => return 0xFFFFFFFF,
+    }
+}
+

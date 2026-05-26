@@ -134,7 +134,8 @@ pub fn sysNetHttpGet(url_ptr: u32, url_len: u32, req_ptr: u32) u32 {
 
 /// tcp_connect(ip[4], port) — perform the TCP three-way handshake to
 /// `ip:port`. Blocks for up to 5s (kernel-side, with sleep yields). Returns
-/// a slot id (0..TCP_MAX_CONNS-1) on success, or 0xFFFFFFFF on failure.
+/// a per-process fd (.tcp_sock kind) on success, or 0xFFFFFFFF on failure.
+/// close(fd) releases the connection.
 pub fn sysNetTcpConnect(ip_ptr: u32, port: u32) u32 {
     if (port == 0 or port > 65535) return E_INVAL;
     if (!validateUserPtr(ip_ptr, 4)) return E_FAULT;
@@ -145,102 +146,106 @@ pub fn sysNetTcpConnect(ip_ptr: u32, port: u32) u32 {
 
     const net = @import("../../net/net.zig");
     const slot = net.tcpConnect(ip, @intCast(port)) orelse return E_INVAL;
-    return slot;
+    const cur = smp.myCpu().current_pid orelse {
+        net.tcpClose(slot);
+        return E_INVAL;
+    };
+    const pcb = &process.procs[cur];
+    return common.allocSocketFd(pcb, .tcp_sock, slot) orelse {
+        net.tcpClose(slot);
+        return E_NOMEM;
+    };
 }
 
-/// tcp_send(slot, buf, len) — send `len` bytes synchronously over the TCP
-/// connection at `slot`. Splits into MSS-sized segments internally. Returns
-/// 0 on success, 0xFFFFFFFF on any failure (bad slot, not connected, send
-/// queue full, peer closed mid-send).
-pub fn sysNetTcpSend(slot: u32, buf_ptr: u32, buf_len: u32) u32 {
-    if (slot > 255) return E_INVAL;
+/// tcp_send(fd, buf, len) — send `len` bytes synchronously over the TCP
+/// connection. Splits into MSS-sized segments internally. Returns 0 on
+/// success, errno on failure (EBADF if fd isn't a tcp_sock; EINVAL on
+/// send failure / peer-closed mid-send).
+pub fn sysNetTcpSend(fd: u32, buf_ptr: u32, buf_len: u32) u32 {
     if (buf_len == 0) return 0;
     if (buf_len > 64 * 1024) return E_INVAL;
     if (!validateUserPtr(buf_ptr, buf_len)) return E_FAULT;
 
+    const cur = smp.myCpu().current_pid orelse return E_INVAL;
+    const pcb = &process.procs[cur];
+    const slot = common.resolveSocketFd(pcb, fd, .tcp_sock) orelse return E_BADF;
+
     const buf: [*]const u8 = @ptrFromInt(@as(usize, buf_ptr));
     const net = @import("../../net/net.zig");
-    if (!net.tcpSend(@intCast(slot), buf[0..buf_len])) return E_INVAL;
+    if (!net.tcpSend(slot, buf[0..buf_len])) return E_INVAL;
     return 0;
 }
 
-/// tcp_recv(slot, buf, len) — copy up to `len` bytes from the connection's
+/// tcp_recv(fd, buf, len) — copy up to `len` bytes from the connection's
 /// RX ring into the user's buffer. Non-blocking: returns 0 if no data is
 /// ready yet (callers poll). Closed peer with empty RX returns 0 too —
 /// distinguish by checking tcp_status's peer_closed bit.
-///
-/// We `net.poll()` first to drain the virtio-net RX queue into the per-
-/// connection buffers; without this, packets sit in the device queue and
-/// the conn buffer reads as empty until some other path happens to call
-/// poll() (e.g. a busy-loop in resolve / httpGet).
-pub fn sysNetTcpRecv(slot: u32, buf_ptr: u32, buf_len: u32) u32 {
-    if (slot > 255) return 0;
+pub fn sysNetTcpRecv(fd: u32, buf_ptr: u32, buf_len: u32) u32 {
     if (buf_len == 0) return 0;
     if (buf_len > 64 * 1024) return 0;
     if (!validateUserPtr(buf_ptr, buf_len)) return 0;
 
+    const cur = smp.myCpu().current_pid orelse return 0;
+    const pcb = &process.procs[cur];
+    const slot = common.resolveSocketFd(pcb, fd, .tcp_sock) orelse return 0;
+
     const buf: [*]u8 = @ptrFromInt(@as(usize, buf_ptr));
     const net = @import("../../net/net.zig");
     net.poll();
-    return @intCast(net.tcpRecv(@intCast(slot), buf[0..buf_len]));
+    return @intCast(net.tcpRecv(slot, buf[0..buf_len]));
 }
 
-/// tcp_close(slot) — close the connection at `slot`, sending FIN and
-/// (synchronously) waiting up to 1s for the peer's FIN-ACK. Always returns 0;
-/// the slot is freed regardless of whether the peer cleanly tore down.
-pub fn sysNetTcpClose(slot: u32) u32 {
-    if (slot > 255) return 0;
-    const net = @import("../../net/net.zig");
-    net.tcpClose(@intCast(slot));
-    return 0;
-}
-
-/// tcp_status(slot) — non-blocking status check. Returns a bitmask:
+/// tcp_status(fd) — non-blocking status check. Returns a bitmask:
 ///   bit 0 (1)  : connection is established and active
 ///   bit 1 (2)  : peer has sent FIN (we may still have data to drain)
 ///
-/// poll() runs first so the FIN bit reflects the freshest state — without it,
-/// nc would never notice the peer closed unless tcpRecv happened to drain a
-/// packet that included data along with the FIN.
-pub fn sysNetTcpStatus(slot: u32) u32 {
-    if (slot > 255) return 0;
+/// poll() runs first so the FIN bit reflects the freshest state.
+pub fn sysNetTcpStatus(fd: u32) u32 {
+    const cur = smp.myCpu().current_pid orelse return 0;
+    const pcb = &process.procs[cur];
+    const slot = common.resolveSocketFd(pcb, fd, .tcp_sock) orelse return 0;
     const net = @import("../../net/net.zig");
     net.poll();
-    const s: u8 = @intCast(slot);
     var status: u32 = 0;
-    if (net.tcpIsConnected(s)) status |= 1;
-    if (net.tcpPeerClosed(s)) status |= 2;
+    if (net.tcpIsConnected(slot)) status |= 1;
+    if (net.tcpPeerClosed(slot)) status |= 2;
     return status;
 }
 
-/// tcp_listen(port) — bind a server-side TCP socket to `port`. Returns the
-/// listener slot id (0..TCP_MAX_LISTENERS-1), or 0xFFFFFFFF on failure
-/// (port already bound, slot pool full, port == 0).
+/// tcp_listen(port) — bind a server-side TCP socket to `port`. Returns a
+/// per-process fd (.tcp_listener kind) on success, or 0xFFFFFFFF on
+/// failure (port already bound, slot pool full, port == 0). close(fd)
+/// releases the listener; already-accepted conns keep working.
 pub fn sysNetTcpListen(port: u32) u32 {
     if (port == 0 or port > 65535) return E_INVAL;
     const net = @import("../../net/net.zig");
     const slot = net.tcpListen(@intCast(port)) orelse return E_INVAL;
-    return slot;
+    const cur = smp.myCpu().current_pid orelse {
+        net.tcpUnlisten(slot);
+        return E_INVAL;
+    };
+    const pcb = &process.procs[cur];
+    return common.allocSocketFd(pcb, .tcp_listener, slot) orelse {
+        net.tcpUnlisten(slot);
+        return E_NOMEM;
+    };
 }
 
-/// tcp_unlisten(listener_slot) — release the listener slot. Already-accepted
-/// conns keep working; only the door for new SYNs closes. Returns 0.
-pub fn sysNetTcpUnlisten(listener_slot: u32) u32 {
-    if (listener_slot > 255) return 0;
-    const net = @import("../../net/net.zig");
-    net.tcpUnlisten(@intCast(listener_slot));
-    return 0;
-}
-
-/// tcp_accept(listener_slot) — pop one ESTABLISHED conn from the listener's
-/// accept queue. Returns the conn slot id, or 0xFFFFFFFF if nothing is
-/// queued yet. poll() runs first to land any pending handshakes.
-pub fn sysNetTcpAccept(listener_slot: u32) u32 {
-    if (listener_slot > 255) return E_INVAL;
+/// tcp_accept(listener_fd) — pop one ESTABLISHED conn from the listener's
+/// accept queue. Returns a fresh per-process fd (.tcp_sock kind) for the
+/// accepted conn, or 0xFFFFFFFF if nothing is queued yet. poll() runs
+/// first to land any pending handshakes.
+pub fn sysNetTcpAccept(listener_fd: u32) u32 {
+    const cur = smp.myCpu().current_pid orelse return E_INVAL;
+    const pcb = &process.procs[cur];
+    const lst_slot = common.resolveSocketFd(pcb, listener_fd, .tcp_listener) orelse return E_BADF;
     const net = @import("../../net/net.zig");
     net.poll();
-    const conn = net.tcpAccept(@intCast(listener_slot)) orelse return E_INVAL;
-    return conn;
+    const conn_slot = net.tcpAccept(lst_slot) orelse return E_INVAL;
+    return common.allocSocketFd(pcb, .tcp_sock, conn_slot) orelse {
+        net.tcpClose(conn_slot);
+        return E_NOMEM;
+    };
 }
 
 const tls_conn = @import("../../crypto/tls/conn.zig");

@@ -343,6 +343,15 @@ pub fn read(pcb: *process.PCB, fd: u32, buf: [*]u8, count: u32) u32 {
             fd_entry.offset += @intCast(n);
             return @intCast(n);
         },
+        .tcp_sock => {
+            // Non-blocking read on the conn ring. Pollers handle blocking
+            // via OP_POLL; raw read() returns 0 when there's nothing yet
+            // (mirrors sys#72 net_tcp_recv semantics).
+            const net = @import("../net/net.zig");
+            net.poll();
+            return @intCast(net.tcpRecv(@intCast(fd_entry.inode), buf[0..count]));
+        },
+        .tcp_listener => return 0xFFFFFFFF, // listeners aren't readable; use accept()
     }
 }
 
@@ -399,6 +408,12 @@ pub fn write(pcb: *process.PCB, fd: u32, buf: [*]const u8, count: u32) u32 {
             fd_entry.offset += bytes_written;
             return bytes_written;
         },
+        .tcp_sock => {
+            const net = @import("../net/net.zig");
+            if (!net.tcpSend(@intCast(fd_entry.inode), buf[0..count])) return 0xFFFFFFFF;
+            return count;
+        },
+        .tcp_listener => return 0xFFFFFFFF, // listeners aren't writable
     }
 }
 
@@ -437,6 +452,14 @@ pub fn close(pcb: *process.PCB, fd: u32) u32 {
         },
         .ext2 => {
             // ext2.closeFile is a no-op — Handle is pure value, nothing to release.
+        },
+        .tcp_sock => {
+            const net = @import("../net/net.zig");
+            net.tcpClose(@intCast(fd_entry.inode));
+        },
+        .tcp_listener => {
+            const net = @import("../net/net.zig");
+            net.tcpUnlisten(@intCast(fd_entry.inode));
         },
     }
     fd_entry.in_use = false;
@@ -643,7 +666,7 @@ pub fn loadFileFresh(name: []const u8) ?FreshFile {
     return null;
 }
 
-fn allocFd(pcb: *process.PCB) ?usize {
+pub fn allocFd(pcb: *process.PCB) ?usize {
     for (3..pcb.fd_table.len) |fd_idx| {
         if (!pcb.fd_table[fd_idx].in_use) return fd_idx;
     }
