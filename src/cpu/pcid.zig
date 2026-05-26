@@ -54,21 +54,25 @@ var local_gen: [smp.MAX_CPUS][MAX_PCID]u32 =
 /// may have cached (PCID, *) TLB entries" — used by `tlb.doShootdown` to
 /// narrow IPI fan-out to only the CPUs that could possibly need flushing.
 /// Other CPUs are guaranteed to have no entries for this PCID (they never
-/// loaded it), so their TLB needs no shootdown.
+/// loaded it, or they switched away from it and eager-cleared their bit),
+/// so their TLB needs no shootdown.
 ///
-/// Sized as `u32` because MAX_CPUS == 32. Set in `loadCr3` BEFORE the CR3
+/// Sized as `u32` because MAX_CPUS == 32. SET in `loadCr3` BEFORE the CR3
 /// write so a concurrent sender that reads the mask after our `or` sees us;
 /// a sender that reads before our set still wins because our PT walks haven't
-/// started yet (TLB for this PCID still empty on us). Cleared in `free` —
-/// once a process exits its PCID can be reused, and the new owner starts
-/// with a clean slate.
+/// started yet (TLB for this PCID still empty on us). CLEARED in `loadCr3`
+/// AFTER an `invpcid(.single_context, old_pcid)` flushes the entries we're
+/// abandoning on switch-out (eager clear, gated on INVPCID support). Also
+/// cleared wholesale in `free` when the PCID is recycled.
 ///
-/// Stays SET when a CPU switches away from the PCID (lazy clear). The stale
-/// entries on that CPU survive until either (a) a future shootdown's
-/// INVPCID flushes them, or (b) the AS is destroyed and `free` clears the
-/// mask. Eager clear on switch-out would reduce IPI volume further but
-/// requires tracking the OLD pcid in the context switch — defer until
-/// profiling shows it matters.
+/// Race with a concurrent shootdown sender during eager clear: if the sender
+/// reads the mask BEFORE our `fetchAnd`, we get included in the IPI fan-out
+/// and our handler runs a no-op flush (TLB was already drained by our
+/// INVPCID) and acks. If the sender reads AFTER our `fetchAnd`, we're
+/// skipped — also fine because our TLB has no entries for that PCID. The
+/// sender's wait loop uses `inflight_mask` (the snapshot at increment time,
+/// see tlb.zig:doShootdown) rather than re-reading this mask, so a
+/// clear-during-shootdown cannot cause a missed ack.
 var pcid_cpumask: [MAX_PCID]std.atomic.Value(u32) = blk: {
     var arr: [MAX_PCID]std.atomic.Value(u32) = undefined;
     var i: usize = 0;
@@ -83,6 +87,12 @@ pub var alloc_count: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
 pub var free_count: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
 pub var preserve_hits: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
 pub var flush_misses: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+/// Count of switch-out eager clears: a CPU loaded a CR3 with a different
+/// user PCID, INVPCID-flushed the old PCID's entries on this CPU, and
+/// removed its bit from old_pcid's cpumask. Each clear narrows future
+/// IPI fan-out for old_pcid by one CPU. Compare against the total
+/// shootdown count to gauge the optimization's payoff.
+pub var eager_clears: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
 
 /// Read the per-PCID cpumask. Returns 0 for invalid PCIDs (caller treats as
 /// "nobody has loaded this PCID" — sender does its local flush and skips the
@@ -145,6 +155,34 @@ inline fn writeCr3(value: u64) void {
 /// TLB entries are still coherent.
 pub fn loadCr3(pml4_phys: u64, pcid: u16, cpu_id: u8) void {
     const aligned = pml4_phys & ~@as(u64, 0xFFF);
+
+    // Eager clear on switch-out. If we're moving to a different user PCID
+    // (or to kernel-PCID 0) and we previously ran some other user PCID on
+    // this CPU, INVPCID-flush its entries and remove our bit from its
+    // cpumask. Shrinks future IPI fan-out for the old PCID: shootdowns
+    // for it will skip us since we no longer hold any (old_pcid, *) entries.
+    //
+    // Gated on `invpcid_supported` because INVPCID type-1 is what makes the
+    // flush selective; without it we'd have to `mov cr3, cr3` (loses ALL
+    // PCIDs' entries on this CPU), which costs more than the optimization
+    // saves. Lazy clear falls back automatically.
+    //
+    // Flush BEFORE clearing the bit so any shootdown sender that snapshots
+    // the mask before our `fetchAnd` includes us in the IPI fan-out and
+    // gets a correct no-op ack (our TLB is already empty for that PCID).
+    if (protect.pcid_supported and protect.invpcid_supported and cpu_id < smp.MAX_CPUS) {
+        const old_cr3 = asm volatile ("movq %%cr3, %[ret]"
+            : [ret] "=r" (-> u64),
+        );
+        const old_pcid: u16 = @truncate(old_cr3 & 0xFFF);
+        if (old_pcid != 0 and old_pcid != pcid and old_pcid < MAX_PCID) {
+            invpcid(.single_context, old_pcid, 0);
+            const bit = @as(u32, 1) << @as(u5, @intCast(cpu_id));
+            _ = pcid_cpumask[old_pcid].fetchAnd(~bit, .acq_rel);
+            _ = eager_clears.fetchAdd(1, .monotonic);
+        }
+    }
+
     if (!protect.pcid_supported or pcid == 0 or pcid >= MAX_PCID) {
         writeCr3(aligned);
         return;

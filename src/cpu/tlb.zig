@@ -34,9 +34,6 @@
 //   every alive CPU.
 //
 // Still-open future work:
-//   - Eager mask clear on context-switch-out (currently lazy: bit stays
-//     set until `pcid.free`). Would shrink IPI fan-out further when a PCID
-//     is short-lived on a CPU but the AS is long-lived.
 //   - Per-mm sequence numbers so concurrent shootdowns don't have to
 //     serialize through `shootdown_lock` (would also let us drop the
 //     global lock entirely).
@@ -313,18 +310,16 @@ fn doShootdown(mode: Mode, affected_pcid: u16, va: u64) void {
             ~@as(u32, 0);
         var n_skipped: u32 = 0;
         // Record the exact set of CPUs we bumped ack_pending for. The
-        // broadcast + wait loops then iterate THIS local snapshot rather
-        // than re-reading (alive, target_mask) — independent of any
-        // concurrent mutation in pcid_cpumask. Today the mask is
-        // monotonic-grow during a shootdown so re-reading would also be
-        // correct, but the planned "eager clear on context-switch-out"
-        // optimization (pcid.zig TODO) would let bits clear mid-shootdown
-        // and silently break the wait loop: we'd skip waiting for a CPU
-        // we incremented for, leaking the increment so the next sender
-        // either spins forever on its slot or observes ack_pending==0
-        // prematurely. Tracking inflight_mask locally closes that hole
-        // structurally. Skip self — sender does its own flush at the end
-        // without bouncing through an IPI.
+        // broadcast + wait loops iterate THIS local snapshot rather than
+        // re-reading (alive, target_mask) — independent of any concurrent
+        // mutation in pcid_cpumask. `pcid.loadCr3` eager-clears its bit on
+        // switch-out (after INVPCID-flushing the old PCID), so bits can
+        // clear mid-shootdown. Re-reading the mask in the wait loop would
+        // skip a CPU we incremented for, leaking the ack_pending bump so
+        // the next sender either spins forever on its slot or observes
+        // ack_pending==0 prematurely. Tracking inflight_mask locally closes
+        // that hole structurally. Skip self — sender does its own flush at
+        // the end without bouncing through an IPI.
         var inflight_mask: u32 = 0;
         var i: u8 = 0;
         while (i < smp.MAX_CPUS) : (i += 1) {
