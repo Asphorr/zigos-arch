@@ -12,7 +12,7 @@ Acknowledged limitations:
 - Regex parsing of asm is brittle. We only catch the obvious patterns (the
   ones that just bit us). False positives are acceptable if they force humans
   to add explicit alignment documentation.
-- The runtime guards in syscall_entry.zig and idt.zig are still the
+- The runtime guards in cpu/syscall/entry.zig and idt.zig are still the
   authoritative check. This linter is a fast-fail convenience, not a proof.
 """
 

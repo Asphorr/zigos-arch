@@ -214,8 +214,8 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     blog.ok("IDT installed");
     @import("debug/lbr.zig").enable();
     blog.ok("LBR enabled");
-    @import("cpu/syscall_entry.zig").init();
-    @import("cpu/syscall_entry.zig").verifyMsrs("BSP");
+    @import("cpu/syscall/entry.zig").init();
+    @import("cpu/syscall/entry.zig").verifyMsrs("BSP");
     blog.ok("Syscall/sysret MSRs");
     // SMEP/UMIP — safe to enable on BSP now. SMAP is deferred until
     // desktop.taskEntry has dropped the low-half identity map, because

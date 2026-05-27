@@ -113,8 +113,9 @@ pub fn build(b: *std.Build) void {
 
     // --- ASM ALIGNMENT LINTER ---
     // Run before linking to catch push-count drift at build time. Exits nonzero
-    // on misalignment → aborts the build. The runtime guards in syscall_entry
-    // and idt.zig are still the authoritative check; this is a fast-fail.
+    // on misalignment → aborts the build. The runtime guards in
+    // cpu/syscall/entry.zig and idt.zig are still the authoritative check;
+    // this is a fast-fail.
     const asm_lint = b.addSystemCommand(&.{ "python3", "tools/check_asm_alignment.py" });
     kernel.step.dependOn(&asm_lint.step);
 

@@ -45,7 +45,7 @@ fn testHeapCanaryIntegrity() void {
 
 // --- Test 2: Per-CPU LSTAR points at this CPU's entry stub ---
 // The kernel no longer uses GS_BASE for per-CPU lookup. Each CPU's syscall
-// LSTAR points at its own entry stub in syscall_entry.zig; the stub loads
+// LSTAR points at its own entry stub in cpu/syscall/entry.zig; the stub loads
 // RSP directly from `cpus[N].tss.rsp0` — the canonical TSS field the CPU
 // hardware reads on every IDT-gate entry — so the syscall path and the
 // IDT-gate path land on the same per-process kstack by construction.
@@ -175,7 +175,7 @@ fn rdmsr(msr: u32) u64 {
 }
 
 // --- Test 6: Trampoline alignment ---
-// Scans the inline asm in syscall_entry.zig and idt.zig for the alignment
+// Scans the inline asm in cpu/syscall/entry.zig and idt.zig for the alignment
 // guards we just added. If the guard instructions are missing, someone
 // removed them without updating this test. This is a compile-time-ish check
 // done at runtime by reading the .text bytes at known entry points.
@@ -187,7 +187,7 @@ fn rdmsr(msr: u32) u64 {
 fn testTrampolineAlignment() void {
     // The panic targets are exported symbols. If they exist, the guards exist.
     // We can't call them (they're noreturn), but we can take their addresses.
-    const syscall_panic = @import("../cpu/syscall_entry.zig").syscall_align_panic;
+    const syscall_panic = @import("../cpu/syscall/entry.zig").syscall_align_panic;
     const exc_panic = @import("../cpu/idt.zig").isr_common_exc_align_panic;
     const irq0_panic = @import("../cpu/idt.zig").isr_irq0_align_panic;
     const irq1_panic = @import("../cpu/idt.zig").isr_irq1_align_panic;

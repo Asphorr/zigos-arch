@@ -277,7 +277,7 @@ pub fn verifyEndCanary() void {
     @panic("CpuLocal end-canary clobbered — wild write into per-CPU slot");
 }
 
-/// Per-CPU storage for syscall_entry.zig's fast path. Just one slot now:
+/// Per-CPU storage for cpu/syscall/entry.zig's fast path. Just one slot now:
 /// the LSTAR stub also needs a transient place to spill the user RSP
 /// before it switches to the kernel stack (cpus[N].tss.rsp0). The
 /// kernel-stack-top itself lives in `cpus[N].tss.rsp0` — the canonical
@@ -370,7 +370,7 @@ pub fn assertBSP(comptime site: []const u8) void {
 /// Initialize SMP: set up BSP per-CPU data, boot APs
 pub fn init() void {
     // Stamp the address of cpus[0] into the exported `cpus_base` slot so
-    // the per-CPU LSTAR syscall stubs (syscall_entry.zig) can load the
+    // the per-CPU LSTAR syscall stubs (cpu/syscall/entry.zig) can load the
     // kernel RSP from `cpus[N].tss.rsp0` via a two-instruction indirect
     // load. Must happen BEFORE any syscall can fire from userspace,
     // which can't happen until after smp.init returns (BSP idle + first
@@ -616,7 +616,7 @@ export fn apEntry() callconv(.c) noreturn {
     // from a process that hasn't issued any syscall yet means we have no
     // earlier dispatch to log around. (Spent an evening chasing exactly this
     // bug — see feedback_smp_syscall_msrs.md.)
-    @import("syscall_entry.zig").init();
+    @import("syscall/entry.zig").init();
     // LBR is per-CPU — enable on each AP too, otherwise crashes on this
     // CPU dump an empty branch ring.
     @import("../debug/lbr.zig").enable();
@@ -624,7 +624,7 @@ export fn apEntry() callconv(.c) noreturn {
     // code. Catches future "init() got refactored and dropped a wrmsr" too.
     var label_buf: [16]u8 = undefined;
     const label = std.fmt.bufPrint(&label_buf, "AP{d}", .{my_id}) catch "AP?";
-    @import("syscall_entry.zig").verifyMsrs(label);
+    @import("syscall/entry.zig").verifyMsrs(label);
 
     // SMEP/UMIP + SMAP. AP's kstack is allocated in the physmap (high-VA,
     // U/S=0) from the start, so SMAP enable is safe immediately — unlike

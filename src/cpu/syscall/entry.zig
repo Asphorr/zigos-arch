@@ -24,10 +24,10 @@
 // CPU separately (BSP from main, APs from `apEntry`). At init() time we read
 // the calling CPU's LAPIC ID and write LSTAR to point at that CPU's stub.
 
-const syscall = @import("syscall.zig");
-const smp = @import("smp.zig");
-const gdt = @import("gdt.zig");
-const apic = @import("../time/apic.zig");
+const syscall = @import("../syscall.zig");
+const smp = @import("../smp.zig");
+const gdt = @import("../gdt.zig");
+const apic = @import("../../time/apic.zig");
 const std = @import("std");
 
 // MSR numbers
@@ -39,7 +39,7 @@ const MSR_EFER: u32 = 0xC0000080;
 /// Initialize syscall/sysret support on the calling CPU. Picks this CPU's
 /// dedicated entry stub via LAPIC ID and writes it to LSTAR.
 pub fn init() void {
-    const debug = @import("../debug/debug.zig");
+    const debug = @import("../../debug/debug.zig");
 
     // Enable syscall/sysret in EFER (bit 0 = SCE) and NX execution control
     // (bit 11 = NXE). NXE makes the CPU honor PTE bit 63 (NX) — without it
@@ -97,7 +97,7 @@ pub fn init() void {
 /// init()" and "BSP MSR overwritten by some later code" alike. Cheap (4 rdmsr,
 /// no allocations); call after init() on every CPU.
 pub fn verifyMsrs(cpu_label: []const u8) void {
-    const debug = @import("../debug/debug.zig");
+    const debug = @import("../../debug/debug.zig");
     const efer = rdmsr(MSR_EFER);
     const star = rdmsr(MSR_STAR);
     const lstar = rdmsr(MSR_LSTAR);

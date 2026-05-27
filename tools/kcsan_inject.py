@@ -66,7 +66,7 @@ DENYLIST: set[str] = {
     # legitimately reference TSS/per_cpu_asm structures outside the watch
     # set; bogus instrumentation noise.
     "idt.zig",
-    "syscall_entry.zig",
+    "entry.zig", # cpu/syscall/entry.zig — LSTAR asm trampoline
     "sched_asm.zig",
     "smp.zig",
     "gdt.zig",

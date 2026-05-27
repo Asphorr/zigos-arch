@@ -131,7 +131,7 @@ DENYLIST: set[str] = {
     # point at TSS / per_cpu_asm — outside [REGION_LO, REGION_HI), bogus
     # shadow lookup.
     "idt.zig",
-    "syscall_entry.zig",
+    "entry.zig", # cpu/syscall/entry.zig — LSTAR asm trampoline
     "sched_asm.zig",
     "smp.zig",
     "gdt.zig",
