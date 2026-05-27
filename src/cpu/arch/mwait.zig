@@ -19,7 +19,7 @@
 // keeps idle on plain HLT.
 
 const std = @import("std");
-const debug = @import("../debug/debug.zig");
+const debug = @import("../../debug/debug.zig");
 
 pub var mwait_supported: bool = false;
 pub var monitor_line_size: u32 = 64; // CPUID.05H:EAX[15:0] smallest

@@ -152,7 +152,7 @@ pub fn init() void {
 
     // PMI (Performance Monitor Interrupt). LAPIC LVT.PMI delivers to this
     // vector when PMC0 overflows. Stub forwards saved RIP to pmu.onSample.
-    setGate(@import("pmu.zig").PMI_VECTOR, @intFromPtr(&isr_pmi), 0x8E);
+    setGate(@import("arch/pmu.zig").PMI_VECTOR, @intFromPtr(&isr_pmi), 0x8E);
 
     // Syscall (DPL=3: callable from Ring 3)
     setGate(128, @intFromPtr(&syscall.isr_syscall), 0xEE);
@@ -297,7 +297,7 @@ export fn handleException(rsp: u64) callconv(.c) void {
     // SMAP: an exception during a syscall body inherits AC=1 from the
     // syscall; clear it so kernel-mode handler code runs with SMAP
     // enforcement. IRET pops RFLAGS so AC is restored on return.
-    @import("protect.zig").disallowUserAccess();
+    @import("arch/protect.zig").disallowUserAccess();
 
     // Sanity-check the rsp arg: a non-canonical or NULL pointer here means
     // the IRQ stub's leaq fed us garbage (e.g., TSS.RSP0 was clobbered or
@@ -346,7 +346,7 @@ export fn handleException(rsp: u64) callconv(.c) void {
     // is set. Without this dispatch the generic exception path treats
     // every #MC as a panic, losing the per-bank decode.
     if (int_no == 18) {
-        const outcome = @import("mce.zig").handle();
+        const outcome = @import("arch/mce.zig").handle();
         if (outcome == .recovered) return;
         // Fatal — fall through to the standard panic dump below.
         serial.print("[mce] FATAL: PCC set on at least one bank — kernel state corrupt\n", .{});
@@ -677,7 +677,7 @@ export fn handleException(rsp: u64) callconv(.c) void {
                 // User RIP is below the kernel half — bracket the read with
                 // STAC/CLAC so SMAP doesn't double-fault us here.
                 const is_user_rip = saved_rip < 0xFFFF800000000000;
-                const protect_mod = @import("protect.zig");
+                const protect_mod = @import("arch/protect.zig");
                 if (is_user_rip) protect_mod.allowUserAccess();
                 serial.print("  Code:", .{});
                 for (0..@intCast(safe_len)) |i| serial.print(" {X:0>2}", .{code[i]});
@@ -697,7 +697,7 @@ export fn handleException(rsp: u64) callconv(.c) void {
         var bt_frames: u32 = 0;
         if (saved_rbp > 0x100000 and saved_rbp < 0x600000) {
             serial.print("  Backtrace (rbp):\n", .{});
-            const protect_bt = @import("protect.zig");
+            const protect_bt = @import("arch/protect.zig");
             protect_bt.allowUserAccess();
             var rbp: usize = @intCast(saved_rbp);
             var depth: u32 = 0;
@@ -725,7 +725,7 @@ export fn handleException(rsp: u64) callconv(.c) void {
             const stack_page_end = (saved_rsp & ~@as(u64, 0xFFF)) + 0x1000;
             const sp: [*]const u64 = @ptrFromInt(saved_rsp);
             const max_words: u64 = @min(64, (stack_page_end - saved_rsp) / 8);
-            const protect_ss = @import("protect.zig");
+            const protect_ss = @import("arch/protect.zig");
             protect_ss.allowUserAccess();
             var printed: u32 = 0;
             var prev: u64 = 0;
@@ -765,7 +765,7 @@ export fn handleException(rsp: u64) callconv(.c) void {
                 const stack_page_end = (saved_rsp & ~@as(u64, 0xFFF)) + 0x1000;
                 const sp: [*]const u8 = @ptrFromInt(saved_rsp);
                 const dump_bytes: u64 = @min(64, stack_page_end - saved_rsp);
-                const protect_sh = @import("protect.zig");
+                const protect_sh = @import("arch/protect.zig");
                 protect_sh.allowUserAccess();
                 var off: u64 = 0;
                 while (off < dump_bytes) : (off += 16) {
@@ -875,7 +875,7 @@ export fn handleException(rsp: u64) callconv(.c) void {
         // without STAC (i.e. outside an active syscall validateUserPtr
         // bracket). Names the bug class so we don't have to puzzle over
         // "kernel-mode #PF on a present page".
-        const protect = @import("protect.zig");
+        const protect = @import("arch/protect.zig");
         if (protect.smap_enabled and
             (error_code & 4) == 0 and
             (error_code & 1) != 0 and
@@ -1072,7 +1072,7 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
     // SMAP: timer IRQ during a syscall body inherits AC=1; clear it so the
     // scheduler / schedulable kernel work runs with SMAP enforcement. IRET
     // pops RFLAGS so AC is restored on return.
-    @import("protect.zig").disallowUserAccess();
+    @import("arch/protect.zig").disallowUserAccess();
 
     // KASAN: same invariant as handleException — the saved-state region
     // must be on a live kstack. If we entered IRQ0 on a kstack whose owner
@@ -1407,7 +1407,7 @@ fn rearmTimerForCurrent(cpu: *@import("smp.zig").CpuLocal) void {
 }
 
 export fn handleIRQ1() callconv(.c) void {
-    @import("protect.zig").disallowUserAccess();
+    @import("arch/protect.zig").disallowUserAccess();
     const t = @import("../debug/perf.zig").enter();
     defer @import("../debug/perf.zig").leave(.irq1_kbd, t);
     const scancode = io.inb(0x60);
@@ -1416,7 +1416,7 @@ export fn handleIRQ1() callconv(.c) void {
 }
 
 export fn handleIRQ12() callconv(.c) void {
-    @import("protect.zig").disallowUserAccess();
+    @import("arch/protect.zig").disallowUserAccess();
     const t = @import("../debug/perf.zig").enter();
     defer @import("../debug/perf.zig").leave(.irq12_mouse, t);
     mouse.handleIRQ();
@@ -1737,7 +1737,7 @@ pub export fn isr_pmi_align_panic() callconv(.c) noreturn {
 }
 
 export fn handlePmi(rip: u64) callconv(.c) void {
-    @import("pmu.zig").onSample(rip);
+    @import("arch/pmu.zig").onSample(rip);
 }
 
 // --- Dynamic IRQ vectors (MSI-X) ---------------------------------------------
@@ -1773,7 +1773,7 @@ pub fn registerIrq(vec: u8, handler: DynHandler) void {
 }
 
 export fn handleDynIrq(vec: u32) callconv(.c) void {
-    @import("protect.zig").disallowUserAccess();
+    @import("arch/protect.zig").disallowUserAccess();
     const t = @import("../debug/perf.zig").enter();
     defer @import("../debug/perf.zig").leave(.dynirq, t);
     // Breadcrumb: (vec << 16) | pid. cpu.current_pid read once.

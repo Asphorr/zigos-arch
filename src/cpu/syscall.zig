@@ -95,7 +95,7 @@ export fn doSyscall(sys_num: u32, arg1: u32, arg2: u32, arg3: u32, frame_raw: *a
     // already STAC'd. The bracketing is per-syscall, not per-access — once
     // a syscall has unlocked user access for one buffer it stays unlocked
     // until return, but no other kernel path runs with AC=1.
-    defer @import("protect.zig").disallowUserAccess();
+    defer @import("arch/protect.zig").disallowUserAccess();
     defer {
         // Subtract any descheduled-time gap recorded by blocking primitives
         // (yield/sleep) so the syscall counter reflects CPU time, not wall.

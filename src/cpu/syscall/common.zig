@@ -55,7 +55,7 @@ pub fn validateUserPtr(ptr: usize, len: usize) bool {
     // Validation succeeded — caller is about to deref. STAC unlocks user
     // memory access for the remainder of this syscall; doSyscall's defer
     // CLACs on exit. Cheap: with SMAP off this is a noop branch.
-    @import("../protect.zig").allowUserAccess();
+    @import("../arch/protect.zig").allowUserAccess();
     return true;
 }
 

@@ -152,7 +152,7 @@ fn historyReadInto(out: *BootHistoryRing) bool {
     const buf: [*]u8 = @ptrCast(out);
     // UEFI RS code lives in the low-half firmware map with U/S=1 — SMEP
     // would trap the `call` to _getVariable. Drop SMEP for the call.
-    const protect = @import("../cpu/protect.zig");
+    const protect = @import("../cpu/arch/protect.zig");
     const saved = protect.beginNonSmepCall();
     const status = rs._getVariable(NAME_BOOT_HISTORY, &VENDOR_GUID, null, &size, buf);
     protect.endNonSmepCall(saved);
@@ -166,7 +166,7 @@ fn historyWrite(ring: *const BootHistoryRing) void {
     if (!rsCallable()) return;
     const rs = rs_ptr.?;
     const buf: [*]const u8 = @ptrCast(ring);
-    const protect = @import("../cpu/protect.zig");
+    const protect = @import("../cpu/arch/protect.zig");
     const saved = protect.beginNonSmepCall();
     _ = rs._setVariable(NAME_BOOT_HISTORY, &VENDOR_GUID, ATTRS_PERSIST, @sizeOf(BootHistoryRing), buf);
     protect.endNonSmepCall(saved);
@@ -234,7 +234,7 @@ fn rsCallable() bool {
 fn writeRaw(name: [*:0]const u16, data: []const u8) void {
     if (!rsCallable()) return;
     const rs = rs_ptr.?;
-    const protect = @import("../cpu/protect.zig");
+    const protect = @import("../cpu/arch/protect.zig");
     const saved = protect.beginNonSmepCall();
     _ = rs._setVariable(name, &VENDOR_GUID, ATTRS_PERSIST, data.len, data.ptr);
     protect.endNonSmepCall(saved);

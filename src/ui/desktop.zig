@@ -9,7 +9,7 @@ const paging = @import("../mm/paging.zig");
 const pmm = @import("../mm/pmm.zig");
 const debug = @import("../debug/debug.zig");
 const elf_loader = @import("../proc/elf_loader.zig");
-const gdt = @import("../cpu/gdt.zig");
+const gdt = @import("../cpu/arch/gdt.zig");
 const vmm = @import("../mm/vmm.zig");
 const xhci = @import("../driver/xhci.zig");
 const tarfs = @import("../fs/tarfs.zig");
@@ -2640,7 +2640,7 @@ pub fn taskEntry() callconv(.c) noreturn {
     @import("../mm/paging.zig").dropLowIdentity();
     // BSP is now off the UEFI low-half boot stack; safe to enable SMAP
     // (kstack is high-VA / U/S=0, so the next push won't #PF).
-    @import("../cpu/protect.zig").enableSmapPerCpu();
+    @import("../cpu/arch/protect.zig").enableSmapPerCpu();
     // enterFirstTask cli'd before swapping us onto desktop's kstack —
     // re-enable IRQs now that RSP is on the high-VA kstack and the
     // legacy low identity is gone.

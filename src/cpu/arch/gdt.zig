@@ -83,8 +83,8 @@ var isr_stack: [16384]u8 align(16) = undefined; // 16KB ISR stack
 // dispatch, and we panic HERE pointing at the bad slot rather than letting
 // the wild value leak into TSS.RSP0 and crash deep inside doSyscall.
 pub fn setTssRsp0(pid: usize, rsp0: u64) void {
-    const smp = @import("smp.zig");
-    const process = @import("../proc/process.zig");
+    const smp = @import("../smp.zig");
+    const process = @import("../../proc/process.zig");
     // Per-PID exact match against the immutable witness set at create()
     // time. The shape-check (isValidKstackTopShape) accepted ANY value
     // that happened to be a valid pool top OR a registered heap kstack,
@@ -95,8 +95,8 @@ pub fn setTssRsp0(pid: usize, rsp0: u64) void {
     // writer scribbling inside one PCB can't simultaneously corrupt the
     // witness.
     if (!process.isValidKstackTop(pid, rsp0)) {
-        const debug = @import("../debug/debug.zig");
-        const expected = if (pid < @import("../config.zig").MAX_PROCS)
+        const debug = @import("../../debug/debug.zig");
+        const expected = if (pid < @import("../../config.zig").MAX_PROCS)
             @atomicLoad(usize, &process.expected_kstack_tops[pid], .acquire)
         else
             0;
@@ -108,15 +108,15 @@ pub fn setTssRsp0(pid: usize, rsp0: u64) void {
         // Dump all kdbg rings so we can see who else dispatched this
         // slot — typically the wild writer's PID is the dispatch
         // immediately before the corruption.
-        @import("../debug/kdbg.zig").enterCritical();
-        @import("../debug/kdbg.zig").dumpAll();
+        @import("../../debug/kdbg.zig").enterCritical();
+        @import("../../debug/kdbg.zig").dumpAll();
         @panic("setTssRsp0: rsp0 mismatch — pcb.kernel_stack_top corrupted (cross-PCB leak?)");
     }
     const cpu = smp.myCpu();
     // KCSAN-lite: watch the TSS slot we're about to overwrite for an
     // overlapping write from another CPU (shouldn't happen — TSS is
     // per-CPU — but a wild writer would show up here).
-    @import("../debug/kcsan.zig").checkU64("tss.rsp0", &cpu.tss.rsp0);
+    @import("../../debug/kcsan.zig").checkU64("tss.rsp0", &cpu.tss.rsp0);
     // Single atomic 8-byte store — same cache-line guarantee from the
     // smp.zig comptime assert. No bracketing needed: there's nothing
     // for an IRQ-driven nested setTssRsp0 to leave half-updated.
@@ -131,7 +131,7 @@ pub fn setTssRsp0(pid: usize, rsp0: u64) void {
     // know exactly which CPU rewired its TSS in the µs before. PID is
     // the dispatch target (`pid` arg), not stale `current_pid`. rsp0
     // truncated to low 32b.
-    @import("../debug/kdbg.zig").schedEvent(
+    @import("../../debug/kdbg.zig").schedEvent(
         .tss_rsp0,
         @intCast(pid),
         0,
@@ -147,15 +147,15 @@ pub fn setTssRsp0(pid: usize, rsp0: u64) void {
     // When it fires, dumps both cpus' current_pid so we can pin the
     // protocol violation to a specific transition.
     {
-        const debug = @import("../debug/debug.zig");
+        const debug = @import("../../debug/debug.zig");
         for (0..smp.MAX_CPUS) |other| {
             if (other == cpu.cpu_id) continue;
             const other_top = smp.cpus[other].tss.rsp0;
             if (other_top != rsp0) continue;
             const my_pid: i32 = if (smp.cpus[cpu.cpu_id].current_pid) |p| @intCast(p) else -1;
             const other_pid: i32 = if (smp.cpus[other].current_pid) |p| @intCast(p) else -1;
-            const my_state: u8 = if (my_pid >= 0) @import("../proc/process.zig").getStateRaw(@intCast(my_pid)) else 0xFF;
-            const other_state: u8 = if (other_pid >= 0) @import("../proc/process.zig").getStateRaw(@intCast(other_pid)) else 0xFF;
+            const my_state: u8 = if (my_pid >= 0) @import("../../proc/process.zig").getStateRaw(@intCast(my_pid)) else 0xFF;
+            const other_state: u8 = if (other_pid >= 0) @import("../../proc/process.zig").getStateRaw(@intCast(other_pid)) else 0xFF;
             debug.klog(
                 "[stack-alias] cpu{d}.tss.rsp0 = cpu{d}.tss.rsp0 = 0x{X}  cpu{d}.pid={d}(state={d}) cpu{d}.pid={d}(state={d})\n",
                 .{ cpu.cpu_id, other, rsp0, cpu.cpu_id, my_pid, my_state, other, other_pid, other_state },
@@ -170,7 +170,7 @@ pub fn getEntries() *const [7]u64 {
 
 /// Load the shared IDT (for AP use)
 pub fn loadIdt() void {
-    const idt_mod = @import("idt.zig");
+    const idt_mod = @import("../idt.zig");
     idt_mod.loadIdtForAP();
 }
 

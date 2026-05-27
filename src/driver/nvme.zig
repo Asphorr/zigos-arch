@@ -1368,7 +1368,7 @@ fn ioCommandAsync(c: *Controller, ctrl_idx: u32, opcode: u8, lba: u32, user_buf:
         if (smp.myCpu().current_pid) |p| break :blk proc.procs[p].is_idle;
         break :blk false;
     };
-    const mwait_mod = @import("../cpu/mwait.zig");
+    const mwait_mod = @import("../cpu/arch/mwait.zig");
     var timed_out = false;
     while (!@atomicLoad(bool, &c.waiters[slot_idx].completed, .acquire)) {
         if (@import("../debug/perf.zig").rdtsc() -% t_wait_start > TIMEOUT_CYC_ASYNC) {
@@ -1554,7 +1554,7 @@ fn submitDatalessAsync(
         if (smp.myCpu().current_pid) |p| break :blk proc.procs[p].is_idle;
         break :blk false;
     };
-    const mwait_mod = @import("../cpu/mwait.zig");
+    const mwait_mod = @import("../cpu/arch/mwait.zig");
     var timed_out = false;
     while (!@atomicLoad(bool, &c.waiters[slot_idx].completed, .acquire)) {
         if (@import("../debug/perf.zig").rdtsc() -% t_wait_start > TIMEOUT_CYC_ASYNC) {

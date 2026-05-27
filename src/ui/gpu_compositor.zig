@@ -1885,7 +1885,7 @@ pub fn taskEntry() callconv(.c) noreturn {
     paging.dropLowIdentity();
     // BSP off the UEFI low-half boot stack — enable SMAP now (mirror of
     // desktop.taskEntry; boot_mode=9 takes this path instead).
-    @import("../cpu/protect.zig").enableSmapPerCpu();
+    @import("../cpu/arch/protect.zig").enableSmapPerCpu();
     asm volatile ("sti");
     run();
     asm volatile ("ud2");

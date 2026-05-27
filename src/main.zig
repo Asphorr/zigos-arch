@@ -1,6 +1,6 @@
 const std = @import("std");
 const vga = @import("ui/vga.zig");
-const gdt = @import("cpu/gdt.zig");
+const gdt = @import("cpu/arch/gdt.zig");
 const idt = @import("cpu/idt.zig");
 const pmm = @import("mm/pmm.zig");
 const paging = @import("mm/paging.zig");
@@ -189,7 +189,7 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     // to boot with a clear message if any are missing, instead of GP-faulting
     // mute deep inside paging/syscall init. All x86_64 CPUs have these per
     // AMD64 spec, but a malformed `-cpu` model in a VM could omit one.
-    @import("cpu/cpuid_info.zig").requireFeatures();
+    @import("cpu/arch/cpuid_info.zig").requireFeatures();
     blog.ok("CPU features verified");
     // Clear sticky NMI status latches in port 0x61 (legacy "system control").
     // BIOSes occasionally leave parity / I/O-check NMI status set; a thermal
@@ -221,29 +221,29 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     // desktop.taskEntry has dropped the low-half identity map, because
     // the UEFI boot stack lives at low-VA with the USER bit set and
     // enabling SMAP here #PFs on the next push.
-    @import("cpu/protect.zig").detectFeatures();
-    @import("cpu/protect.zig").applyEarlyCr4();
+    @import("cpu/arch/protect.zig").detectFeatures();
+    @import("cpu/arch/protect.zig").applyEarlyCr4();
     blog.ok("SMEP/UMIP (SMAP deferred to post-PML4[0] drop)");
     // Machine Check Exception: probe MCG_CAP, enable all banks, set
     // CR4.MCE so vector 18 actually delivers. Per-CPU init for APs lives
     // in smp.apEntry. Must run after detectFeatures (shares the cpuid
     // helper) and before any code that could fault on an MC bank state.
-    @import("cpu/mce.zig").detect();
+    @import("cpu/arch/mce.zig").detect();
     blog.ok("MCE banks enabled");
     // MWAIT/MONITOR: detect support so kernelIdle can swap `sti; hlt`
     // for `sti; monitor; mwait` (faster IPI wake + deeper C-states).
     // No CR bits to flip — the instructions are gated purely on CPUID.
-    @import("cpu/mwait.zig").detect();
+    @import("cpu/arch/mwait.zig").detect();
     blog.ok("MWAIT/MONITOR detected");
     // PMU (Performance Monitoring Unit) — sets up PMC0 for cycles, PMI
     // routed via LAPIC LVT.PMI to vector 0xFE. Sampling profiler can be
     // armed from the kernel via pmu.start(...) at any later point.
-    @import("cpu/pmu.zig").detect();
+    @import("cpu/arch/pmu.zig").detect();
     blog.ok("PMU detected");
     // Capture the FPU/SSE "init" state used to seed every new process. Must
     // run after enableSSE() (CR0/CR4 already set) and before process.create()
     // can be called.
-    @import("cpu/fp.zig").captureInitTemplate();
+    @import("cpu/arch/fp.zig").captureInitTemplate();
     blog.ok("FPU/SSE init template");
     // GDB stub on COM2 (remote debug via QEMU TCP serial)
     @import("debug/gdb_stub.zig").init();
@@ -312,8 +312,8 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     // Pure observability: dump CPU vendor/family/model/stepping/microcode/
     // LAPIC IDs to serial. These are the data points needed first the time
     // something feels off on real HW. No-op for QEMU + KVM (always identical).
-    @import("cpu/cpuid_info.zig").dumpCpuInfo();
-    @import("cpu/cpuid_info.zig").dumpMtrrs();
+    @import("cpu/arch/cpuid_info.zig").dumpCpuInfo();
+    @import("cpu/arch/cpuid_info.zig").dumpMtrrs();
     // PCI ECAM — uses MCFG if present.
     @import("driver/pci.zig").applyAcpi();
     blog.ok("PCI configuration");

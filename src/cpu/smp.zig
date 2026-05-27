@@ -4,7 +4,7 @@ const apic = @import("../time/apic.zig");
 const acpi = @import("../time/acpi.zig");
 const paging = @import("../mm/paging.zig");
 const pmm = @import("../mm/pmm.zig");
-const gdt = @import("gdt.zig");
+const gdt = @import("arch/gdt.zig");
 const vfs = @import("../fs/vfs.zig");
 const elf_loader = @import("../proc/elf_loader.zig");
 const process = @import("../proc/process.zig");
@@ -629,10 +629,10 @@ export fn apEntry() callconv(.c) noreturn {
     // SMEP/UMIP + SMAP. AP's kstack is allocated in the physmap (high-VA,
     // U/S=0) from the start, so SMAP enable is safe immediately — unlike
     // BSP which has to wait for paging.dropLowIdentity.
-    @import("protect.zig").applyEarlyCr4();
-    @import("protect.zig").enableSmapPerCpu();
-    @import("mce.zig").perCpuInit();
-    @import("pmu.zig").perCpuInit();
+    @import("arch/protect.zig").applyEarlyCr4();
+    @import("arch/protect.zig").enableSmapPerCpu();
+    @import("arch/mce.zig").perCpuInit();
+    @import("arch/pmu.zig").perCpuInit();
 
     // Enable our LAPIC
     apic.initLAPICForAP();

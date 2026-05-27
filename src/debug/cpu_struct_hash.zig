@@ -19,7 +19,7 @@
 //     IDT entries themselves are fixed after init.
 
 const std = @import("std");
-const gdt = @import("../cpu/gdt.zig");
+const gdt = @import("../cpu/arch/gdt.zig");
 const idt = @import("../cpu/idt.zig");
 const smp = @import("../cpu/smp.zig");
 const serial = @import("serial.zig");

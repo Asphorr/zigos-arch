@@ -31,7 +31,7 @@
 const std = @import("std");
 
 const vga = @import("../ui/vga.zig");
-const gdt = @import("../cpu/gdt.zig");
+const gdt = @import("../cpu/arch/gdt.zig");
 const debug = @import("../debug/debug.zig");
 const vmm = @import("../mm/vmm.zig");
 const pcid_mod = @import("../cpu/pcid.zig");
@@ -474,7 +474,7 @@ pub fn forkCurrent(frame: *signals.SyscallFrame) ?usize {
 /// us inline (kernel-mode IRQs don't switch stacks); we resume after hlt
 /// and yield, repeat.
 fn kernelIdle() callconv(.c) noreturn {
-    const mwait = @import("../cpu/mwait.zig");
+    const mwait = @import("../cpu/arch/mwait.zig");
     while (true) {
         // Drain any pending async app load (file-read offload). Used to be
         // serviced by apEntry's scheduler-context loop, but per-CPU idle

@@ -26,7 +26,7 @@
 // global generation + 32 × 128 × 4 = 16 KB per-CPU generation. Cheap.
 
 const std = @import("std");
-const protect = @import("protect.zig");
+const protect = @import("arch/protect.zig");
 const smp = @import("smp.zig");
 const debug = @import("../debug/debug.zig");
 const spinlock = @import("../proc/spinlock.zig");

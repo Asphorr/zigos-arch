@@ -20,9 +20,9 @@
 // its own PMC0/PERFEVTSEL0 MSRs, so this can't be a one-shot BSP call.
 
 const std = @import("std");
-const debug = @import("../debug/debug.zig");
-const serial = @import("../debug/serial.zig");
-const apic = @import("../time/apic.zig");
+const debug = @import("../../debug/debug.zig");
+const serial = @import("../../debug/serial.zig");
+const apic = @import("../../time/apic.zig");
 
 const MSR_IA32_PMC0: u32 = 0xC1;
 const MSR_IA32_PERFEVTSEL0: u32 = 0x186;

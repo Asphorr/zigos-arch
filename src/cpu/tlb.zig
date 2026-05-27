@@ -44,7 +44,7 @@ const smp = @import("smp.zig");
 const debug = @import("../debug/debug.zig");
 const perf = @import("../debug/perf.zig");
 const pcid = @import("pcid.zig");
-const protect = @import("protect.zig");
+const protect = @import("arch/protect.zig");
 const hyperv = @import("../virt/hyperv.zig");
 
 // Slow-shootdown threshold (cycles). At Kaby Lake 2.4 GHz nominal TSC,

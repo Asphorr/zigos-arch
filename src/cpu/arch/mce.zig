@@ -18,8 +18,8 @@
 // treats vec 18 as a generic panic, which loses all the bank state.
 
 const std = @import("std");
-const debug = @import("../debug/debug.zig");
-const serial = @import("../debug/serial.zig");
+const debug = @import("../../debug/debug.zig");
+const serial = @import("../../debug/serial.zig");
 
 const MSR_IA32_MCG_CAP: u32 = 0x179;
 const MSR_IA32_MCG_STATUS: u32 = 0x17A;

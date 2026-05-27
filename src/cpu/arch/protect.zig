@@ -23,7 +23,7 @@
 // braces with the validateUserPtr STAC convention.
 
 const std = @import("std");
-const serial = @import("../debug/serial.zig");
+const serial = @import("../../debug/serial.zig");
 
 pub var smep_enabled: bool = false;
 pub var smap_enabled: bool = false;

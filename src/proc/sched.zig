@@ -50,7 +50,7 @@
 const std = @import("std");
 
 const vga = @import("../ui/vga.zig");
-const gdt = @import("../cpu/gdt.zig");
+const gdt = @import("../cpu/arch/gdt.zig");
 const debug = @import("../debug/debug.zig");
 const pcid_mod = @import("../cpu/pcid.zig");
 const smp = @import("../cpu/smp.zig");

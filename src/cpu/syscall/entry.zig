@@ -26,7 +26,7 @@
 
 const syscall = @import("../syscall.zig");
 const smp = @import("../smp.zig");
-const gdt = @import("../gdt.zig");
+const gdt = @import("../arch/gdt.zig");
 const apic = @import("../../time/apic.zig");
 const std = @import("std");
 
