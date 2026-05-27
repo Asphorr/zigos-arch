@@ -788,12 +788,12 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp) void {
     // io_uring instances owned by this pid: free the slot-table entries.
     // The underlying ring memory is freed by the LazyRegion shm.release in
     // the per-AS cleanup below; this just recycles the kernel bookkeeping.
-    @import("../cpu/iouring.zig").releaseAllForPid(@intCast(pid));
+    @import("../cpu/ipc/iouring.zig").releaseAllForPid(@intCast(pid));
 
     // fdpoll waiters tied to this pid — drop them before iouring shutdown
     // completes, since the OP_POLL pending slots reference them by index
     // and the worker may already have recycled the Instance slot above.
-    @import("../cpu/fdpoll.zig").releaseAllForPid(@intCast(pid));
+    @import("../cpu/ipc/fdpoll.zig").releaseAllForPid(@intCast(pid));
 
     // Resources reachable in any address space (GUI window state, GPU
     // contexts, debug symbols all live in heap / driver structures, not

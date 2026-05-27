@@ -885,7 +885,7 @@ fn ringPushTcpData(c: *TcpConn, tcp: []volatile u8, data_offset: usize, payload_
     }
     c.rx_write +%= @intCast(to_copy);
     c.rx_count += @intCast(to_copy);
-    @import("../cpu/fdpoll.zig").wakePollers(.tcp_sock, @as(u16, connSlotIndex(c)));
+    @import("../cpu/ipc/fdpoll.zig").wakePollers(.tcp_sock, @as(u16, connSlotIndex(c)));
     return to_copy;
 }
 
@@ -943,7 +943,7 @@ fn handleTcpPacket(ip_data: []volatile u8, ihl: usize) void {
                 c.retransmit_count = 0;
                 if (c.listener_slot != TCP_NO_LISTENER and c.listener_slot < TCP_MAX_LISTENERS) {
                     enqueueAccepted(&tcp_listeners[c.listener_slot], connSlotIndex(c));
-                    @import("../cpu/fdpoll.zig").wakePollers(.tcp_listener, @as(u16, c.listener_slot));
+                    @import("../cpu/ipc/fdpoll.zig").wakePollers(.tcp_listener, @as(u16, c.listener_slot));
                 }
                 // Bundled data on the ACK that completes the handshake.
                 if (payload_len > 0 and seq == c.rcv_nxt) {
@@ -978,7 +978,7 @@ fn handleTcpPacket(ip_data: []volatile u8, ihl: usize) void {
                     c.state = .established;
                     c.retransmit_count = 0;
                     _ = sendTcpPacket(c, TCP_ACK, null, false);
-                    @import("../cpu/fdpoll.zig").wakePollers(.tcp_sock, @as(u16, connSlotIndex(c)));
+                    @import("../cpu/ipc/fdpoll.zig").wakePollers(.tcp_sock, @as(u16, connSlotIndex(c)));
                 }
             }
         },
@@ -1002,7 +1002,7 @@ fn handleTcpPacket(ip_data: []volatile u8, ihl: usize) void {
                 c.peer_closed = true;
                 _ = sendTcpPacket(c, TCP_ACK, null, false);
                 c.state = .close_wait;
-                @import("../cpu/fdpoll.zig").wakePollers(.tcp_sock, @as(u16, connSlotIndex(c)));
+                @import("../cpu/ipc/fdpoll.zig").wakePollers(.tcp_sock, @as(u16, connSlotIndex(c)));
             }
         },
         .fin_wait_1 => {

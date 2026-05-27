@@ -25,10 +25,10 @@
 //! iouring is.
 
 const std = @import("std");
-const process = @import("../proc/process.zig");
-const pipe = @import("../proc/pipe.zig");
-const SpinLock = @import("../proc/spinlock.zig").SpinLock;
-const debug = @import("../debug/debug.zig");
+const process = @import("../../proc/process.zig");
+const pipe = @import("../../proc/pipe.zig");
+const SpinLock = @import("../../proc/spinlock.zig").SpinLock;
+const debug = @import("../../debug/debug.zig");
 
 // POSIX poll bit values (match Linux). Apps observe these as CQE.res on
 // a satisfied OP_POLL — they should be ABI-stable across libc updates.
@@ -107,8 +107,8 @@ pub fn pollMaskHandle(pid: u8, h: FdHandle) u16 {
         // — always ready. POLLOUT is meaningless for read-only mounts but
         // returning it is harmless (writes happen via separate paths).
         .fat32, .tarfs, .ext2, .devfs, .procfs => POLLIN | POLLOUT,
-        .tcp_sock => @import("../net/net.zig").tcpPollMask(@intCast(h.id)),
-        .tcp_listener => @import("../net/net.zig").tcpListenerPollMask(@intCast(h.id)),
+        .tcp_sock => @import("../../net/net.zig").tcpPollMask(@intCast(h.id)),
+        .tcp_listener => @import("../../net/net.zig").tcpListenerPollMask(@intCast(h.id)),
     };
 }
 
@@ -153,7 +153,7 @@ fn pollMaskConsole(pid: u8, _: u16) u16 {
     // declaration time. `consoleReadable` mirrors `popCharEvent`'s
     // gates (focus, visibility, terminal-mode, ownership) so a "ready"
     // verdict means the next sysRead/popCharEvent will succeed.
-    const desktop = @import("../ui/desktop.zig");
+    const desktop = @import("../../ui/desktop.zig");
     if (desktop.consoleReadable(pid)) return POLLIN;
     return 0;
 }

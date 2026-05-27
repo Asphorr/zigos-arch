@@ -362,7 +362,7 @@ pub fn mmapFile(fd: u32, offset: u32, len: usize) ?[]u8 {
     return ptr[0..aligned];
 }
 
-/// io_uring Sqe / Cqe / RingHeader — must match src/cpu/iouring.zig byte-for-byte.
+/// io_uring Sqe / Cqe / RingHeader — must match src/cpu/ipc/iouring.zig byte-for-byte.
 pub const IoUringSqe = extern struct {
     opcode: u8,
     flags: u8,

@@ -32,21 +32,21 @@
 //! ops beyond NVMe + R/W/NOP.
 
 const std = @import("std");
-const process = @import("../proc/process.zig");
-const shm = @import("../mm/shm.zig");
-const paging = @import("../mm/paging.zig");
-const vfs = @import("../fs/vfs.zig");
-const debug = @import("../debug/debug.zig");
-const smp = @import("smp.zig");
-const pcid_mod = @import("pcid.zig");
-const fault = @import("../proc/fault.zig");
-const protect = @import("protect.zig");
-const lifecycle = @import("../proc/lifecycle.zig");
-const config = @import("../config.zig");
-const memmap = @import("../mm/memmap.zig");
-const nvme = @import("../driver/nvme.zig");
+const process = @import("../../proc/process.zig");
+const shm = @import("../../mm/shm.zig");
+const paging = @import("../../mm/paging.zig");
+const vfs = @import("../../fs/vfs.zig");
+const debug = @import("../../debug/debug.zig");
+const smp = @import("../smp.zig");
+const pcid_mod = @import("../pcid.zig");
+const fault = @import("../../proc/fault.zig");
+const protect = @import("../protect.zig");
+const lifecycle = @import("../../proc/lifecycle.zig");
+const config = @import("../../config.zig");
+const memmap = @import("../../mm/memmap.zig");
+const nvme = @import("../../driver/nvme.zig");
 
-const common = @import("syscall/common.zig");
+const common = @import("../syscall/common.zig");
 const E_INVAL = common.E_INVAL;
 const E_NOMEM = common.E_NOMEM;
 const E_FAULT = common.E_FAULT;
@@ -212,7 +212,7 @@ const Instance = struct {
 };
 
 var instances: [MAX_INSTANCES_TOTAL]Instance = [_]Instance{.{}} ** MAX_INSTANCES_TOTAL;
-var lock: @import("../proc/spinlock.zig").SpinLock = .{};
+var lock: @import("../../proc/spinlock.zig").SpinLock = .{};
 
 inline fn nextPow2(v: u32) u32 {
     if (v <= 1) return 1;
@@ -1140,7 +1140,7 @@ pub fn releaseAllForPid(pid: u32) void {
             // Yield to give the worker a chance to run. softYield() here
             // mirrors nvme.ioCommandAsync's queue-full-retry pattern.
             smp.myCpu().pending_soft_yield = true;
-            @import("../proc/sched_asm.zig").softYield();
+            @import("../../proc/sched_asm.zig").softYield();
             // Diagnostic: if we spin >100k times the worker is wedged.
             // 100k * softYield latency = many seconds at minimum.
             if (spins > 100_000 and spins & 0xFFFF == 0) {

@@ -3045,7 +3045,7 @@ pub fn run() void {
                 // the focus/visibility/owner check), so the broadcast
                 // (.console, 0xFFFF) lets the matcher do its job.
                 if (post_count != pre_count) {
-                    @import("../cpu/fdpoll.zig").wakePollers(.console, 0xFFFF);
+                    @import("../cpu/ipc/fdpoll.zig").wakePollers(.console, 0xFFFF);
                 }
                 if (pre_count == post_count) {
                     // push() did NOT advance head — queue full, event dropped

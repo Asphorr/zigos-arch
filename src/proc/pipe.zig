@@ -13,7 +13,7 @@ const std = @import("std");
 const process = @import("process.zig");
 const debug = @import("../debug/debug.zig");
 const config = @import("../config.zig");
-const fdpoll = @import("../cpu/fdpoll.zig");
+const fdpoll = @import("../cpu/ipc/fdpoll.zig");
 
 pub const PIPE_BUF_SIZE: u32 = config.PIPE_BUF_SIZE;
 pub const MAX_PIPES: u8 = config.MAX_PIPES;

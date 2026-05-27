@@ -326,10 +326,10 @@ const SYSCALLS = [_]SyscallSpec{
 // Thin shims so the dispatch table can route into the iouring module
 // without giving SYSCALLS a hard dependency on it.
 fn sys_iouring_setup(entries: u32) u32 {
-    return @import("iouring.zig").setup(entries);
+    return @import("ipc/iouring.zig").setup(entries);
 }
 fn sys_iouring_enter(user_va: u32, to_submit: u32, min_complete: u32) u32 {
-    return @import("iouring.zig").enter(user_va, to_submit, min_complete);
+    return @import("ipc/iouring.zig").enter(user_va, to_submit, min_complete);
 }
 
 /// Returns the registered name for a syscall number, or null if not registered.
