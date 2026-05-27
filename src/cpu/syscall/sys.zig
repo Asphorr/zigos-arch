@@ -118,8 +118,8 @@ pub fn sysCpuStats(buf_ptr: u32, max_cpus: u32) u32 {
         if (!c.alive) continue;
         if (written >= clamped) break;
         buf[written] = .{
-            .irq_ticks = c.irq_tick_count,
-            .idle_ticks = c.idle_tick_count,
+            .irq_ticks = @atomicLoad(u64, &c.irq_tick_count, .acquire),
+            .idle_ticks = @atomicLoad(u64, &c.idle_tick_count, .acquire),
         };
         written += 1;
     }

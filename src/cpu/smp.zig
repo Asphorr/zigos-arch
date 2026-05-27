@@ -101,6 +101,10 @@ pub const CpuLocal = struct {
     /// `tick_count` stop advancing whenever BSP was busy in any kernel-mode
     /// task (FAT32 read, virtio-gpu flush) — symptom: UI freezes during
     /// long kernel work because polling/wakeExpired stop with it.
+    /// (u: this CPU only) Set by int $0x20 issuers on the same CPU
+    /// immediately before issuing the software interrupt; cleared by
+    /// handleIRQ0 at entry. NEVER set or cleared from a peer CPU — peer
+    /// access would race with the entry-clear and lose the yield signal.
     pending_soft_yield: bool = false,
 
     // (Phase 5 retired: save_in_flight_prev. Per-CPU dispatch + the
@@ -158,13 +162,18 @@ pub const CpuLocal = struct {
     /// Watchdog peers compare deltas: if a peer's tick stops advancing for
     /// N seconds, that CPU is wedged with cli — broadcast NMI + autopsy.
     /// Without this, silent freezes (kernel running but cli'd in tight
-    /// loop, 100% CPU, no log output) leave us blind. Bumped under cli, no
-    /// atomic needed for self-write; readers from peer CPUs use volatile.
+    /// loop, 100% CPU, no log output) leave us blind.
+    /// (a) Self-write is under cli but uses @atomicStore so peer
+    /// @atomicLoads compose with the StoreLoad fence the load implies
+    /// — without atomics a future LICM hoist across IRQ-entry would
+    /// freeze the displayed value forever. Readers: watchdog.peerCheck,
+    /// menubar sample loop, sys.cpustat.
     irq_tick_count: u64 = 0,
     /// Counts only the IRQ0 firings that interrupted an idle PCB on this CPU.
     /// `(irq_tick_count - idle_tick_count) / irq_tick_count` over a window
     /// gives instantaneous CPU usage — what htop/top draw. Updated under the
     /// same cli as `irq_tick_count` so the pair stays monotonic to readers.
+    /// (a) Same access rules as irq_tick_count above.
     idle_tick_count: u64 = 0,
     /// Watchdog scratch — last `peer.irq_tick_count` snapshot taken by this
     /// CPU's watchdog check, and how many consecutive 1s windows the peer
@@ -189,6 +198,9 @@ pub const CpuLocal = struct {
     /// which observes this flag, clears it, and calls `schedule()` from the
     /// stub's frame instead. Net effect: ~50µs wake-latency preserved
     /// without the cross-stack hazard.
+    /// (u: this CPU only) Set by dyn-IRQ handler bodies running on this
+    /// CPU's isr_stack with IF=0; consumed by check_and_preempt_dynirq in
+    /// the DynIrqStub epilogue, also on this CPU. NEVER set from a peer.
     dynirq_preempt_pending: bool = false,
 
     /// Bracket-marker for the schedule() transient demote window. Set to the

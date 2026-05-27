@@ -217,7 +217,12 @@ pub const PCB = struct {
     arg_lens: [config.MAX_ARGS]u8 = [_]u8{0} ** config.MAX_ARGS, // (c)
     argc: u8 = 0, // (c)
     // Scheduler — track consecutive ticks for fairness
-    ticks_used: u32 = 0, // (p:rq.lock)
+    /// (p:rq.lock | owning-cpu-cli) Bumped from IRQ0 on the CPU currently
+    /// running this PCB (cli-held throughout). Reset/inspected from
+    /// schedule() under rq.lock. The two writers never overlap because
+    /// IRQ0 cli on the owning CPU blocks the migration that schedule()
+    /// would do to take the PCB elsewhere.
+    ticks_used: u32 = 0,
     priority: Priority = .normal, // (p:rq.lock)
     last_cpu: u8 = 0, // (p:rq.lock) CPU this process last ran on (affinity)
     // GPU 3D context
@@ -420,6 +425,10 @@ pub const PCB = struct {
     /// Total scheduler ticks ever consumed by this PCB. One tick = one
     /// timer-IRQ interval (LAPIC tick). Add `acct_cpu_ticks * tick_ms`
     /// to get wall-clock CPU time.
+    /// (p:owning-cpu-cli) Bumped from IRQ0 on the CPU running this PCB.
+    /// /proc/stat reader does a plain torn-tolerant 64-bit read (x86_64
+    /// aligned u64 loads are atomic at the ISA level; snapshot may miss
+    /// <1 tick — acceptable for human display).
     acct_cpu_ticks: u64 = 0,
     /// Page faults serviced for this PCB (user-mode). Includes lazy
     /// region fault-ins, NOT supervisor-mode kernel faults.

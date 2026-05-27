@@ -33,8 +33,8 @@ fn sampleCpu() void {
     var idle_sum: u64 = 0;
     for (&smp.cpus) |*c| {
         if (!c.alive) continue;
-        irq_sum +%= c.irq_tick_count;
-        idle_sum +%= c.idle_tick_count;
+        irq_sum +%= @atomicLoad(u64, &c.irq_tick_count, .acquire);
+        idle_sum +%= @atomicLoad(u64, &c.idle_tick_count, .acquire);
     }
     const d_irq = irq_sum -% prev_irq_total;
     const d_idle = idle_sum -% prev_idle_total;

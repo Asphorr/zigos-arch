@@ -15,8 +15,31 @@ const apic = @import("../time/apic.zig");
 const symbols = @import("../debug/symbols.zig");
 const signals = @import("../proc/signals.zig");
 const memmap = @import("../mm/memmap.zig");
+const boot_phase = @import("../boot/boot_phase.zig");
 
-// x86_64 IDT entry: 16 bytes (128 bits)
+// IRQ0 stack-canary magic — pushed below the 15 GPRs at IRQ entry, verified
+// before iretq. Used by both the isr_irq0 asm (literal embedded for the
+// pushq immediate / cmpq immediate) AND isr_irq0_canary_panic's printed
+// banner. Single named source; comptime cross-check below asserts the asm
+// literals match.
+pub const IRQ0_CANARY: u64 = 0x7B0FF1CE;
+
+// Dyn-IRQ stub stack-canary magic — same scheme as IRQ0 but for DynIrqStub
+// (vec 0x40..0x4F MSI-X handlers). Embedded in DynIrqStub's asm via
+// comptimePrint, referenced by isr_dynirq_canary_panic's banner.
+pub const DYNIRQ_CANARY: u64 = 0x0C0FFEE0BA0BEDA0;
+
+// Comptime hex strings for embedding the canaries into inline asm
+// (movabsq/pushq immediates). Keep the literal in one place so a drift
+// between the asm-pushed value and the cmpq-checked value is impossible.
+const IRQ0_CANARY_STR = std.fmt.comptimePrint("0x{X}", .{IRQ0_CANARY});
+const DYNIRQ_CANARY_STR = std.fmt.comptimePrint("0x{X}", .{DYNIRQ_CANARY});
+
+// x86_64 IDT entry: 16 bytes (128 bits). Consumed by hardware via `lidt`
+// — the field order is THE wire format, so reorders silently break the
+// CPU's interrupt dispatch. The bit-offset asserts at the bottom of this
+// module nail the layout (a `@sizeOf == 16` check alone catches resize but
+// not swapped fields).
 const Entry = packed struct(u128) {
     offset_low: u16, // Bits 0..15 of handler address
     selector: u16, // Code segment selector
@@ -28,6 +51,11 @@ const Entry = packed struct(u128) {
     reserved1: u32, // Must be zero
 };
 
+// IDTR (`lidt m16&64` operand): 2-byte limit followed by 8-byte base. Packed
+// struct: Zig encodes the fields with no inter-field padding, giving the
+// 10-byte memory layout the CPU reads. The `@bitSizeOf == 80` assert below
+// catches a future refactor to `extern struct` (where the u64 would natural-
+// align with 6 bytes of padding after `limit` and `lidt` would read garbage).
 const Ptr = packed struct {
     limit: u16,
     base: u64,
@@ -38,9 +66,25 @@ const Ptr = packed struct {
 // or u128 → u64 packing changes.
 comptime {
     if (@sizeOf(Entry) != 16) @compileError("IDT Entry must be 16 bytes (x86_64 long mode)");
-    // Ptr is packed struct with u16 + u64 = 10 bytes, but Zig may pad to 16.
-    // The lidt instruction reads exactly 10 bytes (2-byte limit + 8-byte base).
-    // As long as the fields are in the right order and contiguous, it works.
+    // Bit-offset asserts — defense against a field-order refactor that
+    // happens to keep size right (e.g. swapping selector + offset_low
+    // would still be 16 bytes, but `lidt` would read garbage).
+    if (@bitOffsetOf(Entry, "offset_low")  !=  0) @compileError("Entry.offset_low must be at bit 0");
+    if (@bitOffsetOf(Entry, "selector")    != 16) @compileError("Entry.selector must be at bit 16");
+    if (@bitOffsetOf(Entry, "ist")         != 32) @compileError("Entry.ist must be at bit 32");
+    if (@bitOffsetOf(Entry, "reserved0")   != 35) @compileError("Entry.reserved0 must be at bit 35");
+    if (@bitOffsetOf(Entry, "type_attr")   != 40) @compileError("Entry.type_attr must be at bit 40");
+    if (@bitOffsetOf(Entry, "offset_mid")  != 48) @compileError("Entry.offset_mid must be at bit 48");
+    if (@bitOffsetOf(Entry, "offset_high") != 64) @compileError("Entry.offset_high must be at bit 64");
+    if (@bitOffsetOf(Entry, "reserved1")   != 96) @compileError("Entry.reserved1 must be at bit 96");
+
+    // IDTR Ptr must be exactly 80 bits (16 limit + 64 base, no padding).
+    // packed struct is bit-packed by Zig spec — this assert backs the
+    // contract against future refactors to extern struct.
+    if (@bitSizeOf(Ptr) != 80) @compileError("IDTR Ptr must be exactly 80 bits (16 limit + 64 base, no padding)");
+    if (@bitOffsetOf(Ptr, "limit") !=  0) @compileError("IDTR Ptr.limit must be at bit 0");
+    if (@bitOffsetOf(Ptr, "base")  != 16) @compileError("IDTR Ptr.base must follow limit at bit 16");
+
     // CpuState (in debug.zig) is dereferenced as `state.field` from asm-built
     // stack frames in handleException. 22 fields × 8 bytes = 176 bytes.
     if (@sizeOf(debug.CpuState) != 22 * 8)
@@ -60,6 +104,15 @@ fn setGate(num: u8, handler: usize, flags: u8) void {
     setGateIst(num, handler, flags, 0);
 }
 
+/// Compile-time-evaluated guard the IDT-install path runs at boot. Returns
+/// false after `boot_phase.markComplete()` — once the scheduler is live, the
+/// IDT is immutable and any setGate call would skip the serializing barrier
+/// (`pic.init` on BSP, AP-startup IPI on APs) that published the previous
+/// entry writes to the local CPU's instruction-fetch path.
+inline fn idtInstallAllowed() bool {
+    return !boot_phase.isComplete();
+}
+
 /// Same as setGate but with an explicit IST (Interrupt Stack Table) index.
 /// IST=0 means "don't switch stacks" (use TSS.RSP0 on privilege change, or
 /// keep the current RSP on same-privilege interrupts). IST=1..7 names a
@@ -77,6 +130,16 @@ fn setGate(num: u8, handler: usize, flags: u8) void {
 /// frame. Mitigation: IRQ handlers cli-on-entry (interrupt-gate type 0x8E
 /// auto-clears IF) so no nesting on the same IST happens.
 fn setGateIst(num: u8, handler: usize, flags: u8, ist: u3) void {
+    // Invariant: IDT install is BSP-only during single-threaded boot, PLUS
+    // each AP's loadIdtForAP() reload during its own bringup (also single-
+    // threaded on that AP). After boot_phase.markComplete(), the IDT is
+    // immutable — mutating a vector here would not be observed by peer
+    // CPUs without an explicit IPI + lidt-reload, and the live device on
+    // that vector could fire mid-rewrite (torn 16-byte entry write).
+    if (!idtInstallAllowed()) {
+        debug.kwarn(@src(), "setGate vec={d} after boot_phase complete — IDT mutation post-boot ignored", .{num});
+        return;
+    }
     entries[num] = .{
         .offset_low = @as(u16, @truncate(handler & 0xFFFF)),
         .selector = 0x08,
@@ -246,11 +309,26 @@ fn printSym(addr: u64, app_syms: ?*const symbols.SymTable) void {
 /// a page with vga.col/row/bg, so the page-coarse watch fired on every
 /// vga.print and drowned out the wild writer we're hunting.
 pub var hb_state_count_page: struct {
+    /// (u: BSP IRQ0 only) Bumped on every non-soft-yield IRQ0 on BSP, under
+    /// cli. No cross-CPU reader of `.count` itself (the MMU write-watch
+    /// uses the PAGE-protection bit, not the value). If you add a remote
+    /// reader, retag this `(a)` and switch to @atomicStore/@atomicLoad —
+    /// the +=  here would race with the read on x86_64-aligned u64 it
+    /// won't tear, but a future LICM hoist could freeze the displayed
+    /// value.
     count: u64 = 0,
     _pad: [4088]u8 = [_]u8{0} ** 4088,
 } align(4096) = .{};
 
-// --- MMU write-watch state ---------------------------------------------------
+// --- MMU write-watch state (RETIRED) -----------------------------------------
+// (u: dead) Retained as a reference for the write-watch protocol; no caller
+// currently arms a watch (see project_mmu_watch_obsolete in memory). The
+// underlying #PF / #DB hooks below still read ww_pending_reprotect_page and
+// ww_entries[], but with all entries zeroed those branches are dead. If you
+// rearm this, note that the existing plain-store discipline is racy across
+// CPUs — multiple #PFs can clobber ww_pending_reprotect_page; wrap in
+// std.atomic.Value(u64) and document one-shot exclusivity per page.
+//
 // Page-granular wild-write detector. Up to 4 simultaneous protected pages,
 // each with its own legit-writer whitelist (symbol name + max offset within
 // the function). On a kernel-mode write to a watched page: if RIP is in the
@@ -304,8 +382,8 @@ export fn handleException(rsp: u64) callconv(.c) void {
     // setTssRsp0 wrote a wrong address). Print and bail before deref'ing
     // garbage and triple-faulting in the dump.
     if (rsp < 0x1000 or (rsp >= 0x0000_8000_0000_0000 and rsp < 0xFFFF_8000_0000_0000)) {
-        @import("../debug/serial.zig").print("[exc] BOGUS rsp=0x{X} — skipping dump\n", .{rsp});
-        while (true) asm volatile ("hlt");
+        @import("../debug/serial.zig").print("[exc] BOGUS rsp=0x{X} — TSS.RSP0 corrupted before entry?\n", .{rsp});
+        @panic("handleException: noncanonical rsp — TSS.RSP0 corrupted before entry");
     }
 
     // KASAN: the saved-register area + iretq frame above us must be on a
@@ -1219,16 +1297,18 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
     // Per-CPU tick — counted on EVERY IRQ0 (including soft yields) so the
     // watchdog peer-check sees forward progress regardless of cause. Bumped
     // BEFORE the peer check so a CPU that's only running soft yields still
-    // shows up alive. cli is held throughout handleIRQ0 so a plain += is
-    // safe; peer reads use volatile.
-    cpu.irq_tick_count +%= 1;
+    // shows up alive. cli is held throughout handleIRQ0 so the read+store is
+    // race-free against this CPU's other code; @atomicStore is used so peer
+    // @atomicLoad readers (watchdog, menubar, sys.cpustat) see ordered
+    // values that the compiler can't hoist across IRQ entry.
+    @atomicStore(u64, &cpu.irq_tick_count, cpu.irq_tick_count +% 1, .release);
     // Charge this tick as "idle" if the CPU was running its kernel idle PCB
     // at the moment of the IRQ. The /proc/cpustat consumer subtracts idle
     // from total to get utilization. Done under the same cli as irq_tick,
     // so a reader on another CPU never sees idle > irq.
     if (cpu.current_pid) |pid| {
         if (pid < process.procs.len and process.procs[pid].is_idle) {
-            cpu.idle_tick_count +%= 1;
+            @atomicStore(u64, &cpu.idle_tick_count, cpu.idle_tick_count +% 1, .release);
         }
     }
     @import("../debug/watchdog.zig").peerCheck(cpu);
@@ -1384,6 +1464,12 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
 /// AND has a deliverable signal, mutate its iretq frame so iretq lands inside
 /// the user's signal handler. No-op for kernel-mode preemptions and for
 /// processes already mid-handler.
+///
+/// Invariant: MUST be called from the CPU where `cpu.current_pid` is the
+/// PCB's owning thread (cpu == myCpu()). `signal_mask` and
+/// `in_signal_handler` are read PLAIN — only safe because no other CPU
+/// mutates this thread's per-thread state. `pending_signals` IS multi-CPU-
+/// mutated by signals.send() and is atomic-loaded below.
 fn deliverPendingToReturnFrame(cpu: *@import("smp.zig").CpuLocal, new_rsp: u64) void {
     const cur_pid = cpu.current_pid orelse return;
     const pcb = process.getPCB(cur_pid);
@@ -1545,7 +1631,8 @@ fn isr_irq0() callconv(.naked) void {
         \\ pushq %%r13
         \\ pushq %%r14
         \\ pushq %%r15
-        \\ pushq $0x7B0FF1CE         // KASAN canary, sits BELOW the 15 GPRs so iretq-frame indices in iretqValidate stay unchanged
+        // KASAN canary, sits BELOW the 15 GPRs so iretq-frame indices in iretqValidate stay unchanged
+        ++ "\npushq $" ++ IRQ0_CANARY_STR ++ "\n" ++
         \\ movw $0x10, %%ax
         \\ movw %%ax, %%ds
         \\ movw %%ax, %%es
@@ -1557,7 +1644,8 @@ fn isr_irq0() callconv(.naked) void {
         \\ call handleIRQ0
         \\ fxrstorq (%%rsp)
         \\ addq $520, %%rsp          // back to canary slot
-        \\ cmpq $0x7B0FF1CE, (%%rsp) // canary must be intact
+        // canary must be intact — slot still holds IRQ0_CANARY
+        ++ "\ncmpq $" ++ IRQ0_CANARY_STR ++ ", (%%rsp)\n" ++
         \\ jne isr_irq0_canary_panic
         \\ addq $8, %%rsp            // pop canary
         \\ popq %%r15
@@ -1752,14 +1840,30 @@ pub const DYN_IRQ_BASE: u8 = 0x40;
 pub const DYN_IRQ_COUNT: u8 = 16;
 
 pub const DynHandler = *const fn () callconv(.c) void;
-var dyn_handlers: [DYN_IRQ_COUNT]?DynHandler = .{null} ** DYN_IRQ_COUNT;
+
+/// (a) Per-vector dyn-IRQ handler dispatch table. Slot value is the
+/// fn-pointer stored as usize (0 = unregistered sentinel). Stored as a
+/// scalar u64 — NOT `?DynHandler` — because a `?fn-pointer` is a 16-byte
+/// fat type whose tag + payload would tear under concurrent read+install,
+/// while a usize is a single 8-byte atomic load/store on x86_64.
+///
+/// Writers: registerIrq (BSP boot-time only — the boot_phase guard in
+/// setGate would catch a post-boot rewrite if it ever happened).
+/// Readers: handleDynIrq from any CPU that an MSI-X message steers to,
+/// allocDynVector from BSP boot.
+///
+/// Ordering: registerIrq uses .release so a peer CPU that observes the
+/// non-null slot (acquire-loaded in handleDynIrq) also observes the
+/// handler-function memory it points at. Pairs naturally with the IPI
+/// that the device's mask-write generates after registerIrq returns.
+var dyn_handlers: [DYN_IRQ_COUNT]usize = .{0} ** DYN_IRQ_COUNT;
 
 /// Reserve a free dynamic IRQ vector. Returns null if all 16 slots are in
 /// use. Caller must `registerIrq(vec, handler)` immediately to install the
-/// dispatch target — the slot is "taken" once the handler is non-null.
+/// dispatch target — the slot is "taken" once the handler is non-zero.
 pub fn allocDynVector() ?u8 {
     for (&dyn_handlers, 0..) |*slot, i| {
-        if (slot.* == null) return DYN_IRQ_BASE + @as(u8, @intCast(i));
+        if (@atomicLoad(usize, slot, .acquire) == 0) return DYN_IRQ_BASE + @as(u8, @intCast(i));
     }
     return null;
 }
@@ -1768,8 +1872,11 @@ pub fn allocDynVector() ?u8 {
 /// MSI-X messages for that vector arrive at the handler with interrupts
 /// disabled; LAPIC EOI is issued automatically after the handler returns.
 pub fn registerIrq(vec: u8, handler: DynHandler) void {
-    if (vec < DYN_IRQ_BASE or vec >= DYN_IRQ_BASE + DYN_IRQ_COUNT) return;
-    dyn_handlers[vec - DYN_IRQ_BASE] = handler;
+    if (vec < DYN_IRQ_BASE or vec >= DYN_IRQ_BASE + DYN_IRQ_COUNT) {
+        debug.kwarn(@src(), "registerIrq vec=0x{X} outside dynirq range [0x{X}..0x{X})", .{ vec, DYN_IRQ_BASE, DYN_IRQ_BASE + DYN_IRQ_COUNT });
+        return;
+    }
+    @atomicStore(usize, &dyn_handlers[vec - DYN_IRQ_BASE], @intFromPtr(handler), .release);
 }
 
 export fn handleDynIrq(vec: u32) callconv(.c) void {
@@ -1781,9 +1888,27 @@ export fn handleDynIrq(vec: u32) callconv(.c) void {
         const pid_now: u64 = if (@import("smp.zig").myCpu().current_pid) |p| @intCast(p) else 0xFF;
         @import("../debug/breadcrumb.zig").stamp(.irq_dynamic, (@as(u64, vec) << 16) | pid_now);
     }
+
+    // Range-check: a vector below DYN_IRQ_BASE means the DynIrqStub's
+    // baked vec_str immediate is wrong (or someone wired a non-dynirq
+    // vector through this entry by mistake). Don't silently EOI — that
+    // hides the bug.
+    if (vec < DYN_IRQ_BASE or vec >= DYN_IRQ_BASE + DYN_IRQ_COUNT) {
+        debug.kwarn(@src(), "handleDynIrq vec=0x{X} out of dynirq range — bogus stub immediate?", .{vec});
+        if (apic.apic_active) apic.eoi();
+        return;
+    }
+
     const idx: usize = @intCast(vec - DYN_IRQ_BASE);
-    if (idx < DYN_IRQ_COUNT) {
-        if (dyn_handlers[idx]) |h| h();
+    const h_raw = @atomicLoad(usize, &dyn_handlers[idx], .acquire);
+    if (h_raw != 0) {
+        const h: DynHandler = @ptrFromInt(h_raw);
+        h();
+    } else {
+        // Spurious-on-this-CPU: vector fired before registerIrq ran, or
+        // after teardown. EOI'ing silently would let the device wedge
+        // with no log; kwarn pings the audit-rate counter once.
+        debug.kwarn(@src(), "dynirq vec=0x{X} fired with no handler installed", .{vec});
     }
     if (apic.apic_active) apic.eoi();
 }
@@ -1863,13 +1988,13 @@ fn DynIrqStub(comptime vec: u8) type {
                     "movq %%rax, %%rsp\n" ++ // switch to the dedicated IRQ stack
                     "subq $16, %%rsp\n" ++ // 16-aligned scratch frame
                     "movq %%rcx, 8(%%rsp)\n" ++ // stash task RSP for the return switch
-                    "movabsq $0xC0FFEE0BA0BEDA0, %%rax\n" ++
+                    "movabsq $" ++ DYNIRQ_CANARY_STR ++ ", %%rax\n" ++
                     "movq %%rax, 0(%%rsp)\n" ++ // canary
                     "movl $" ++ vec_str ++ ", %%edi\n" ++ // arg (edi was clobbered by the call above)
                     "test $0xF, %%rsp\n" ++
                     "jnz isr_dynirq_align_panic\n" ++
                     "call handleDynIrq\n" ++
-                    "movabsq $0xC0FFEE0BA0BEDA0, %%rax\n" ++
+                    "movabsq $" ++ DYNIRQ_CANARY_STR ++ ", %%rax\n" ++
                     "cmpq %%rax, 0(%%rsp)\n" ++
                     "jne isr_dynirq_canary_panic\n" ++
                     "movq 8(%%rsp), %%rcx\n" ++ // reload saved task RSP
@@ -1917,7 +2042,7 @@ pub export fn isr_dynirq_canary_panic() callconv(.c) noreturn {
     );
     const slots: [*]const u64 = @ptrFromInt(rsp_now);
     serial.print("\n!!! DYNIRQ STACK CANARY CLOBBERED — IPI handler smashed stack !!!\n", .{});
-    serial.print("  expected canary 0x0C0FFEE0BA0BEDA0 at 0x{X:0>16}+8\n", .{rsp_now});
+    serial.print("  expected canary 0x{X:0>16} at 0x{X:0>16}+8\n", .{ DYNIRQ_CANARY, rsp_now });
     serial.print("  got 0x{X:0>16}", .{slots[1]});
     if (sym.resolveKernel(slots[1])) |r| {
         serial.print("  // {s}+0x{X}", .{ r.name, r.offset });
@@ -1960,7 +2085,7 @@ pub export fn isr_irq0_canary_panic() callconv(.c) noreturn {
     const got_canary = slots[0];
 
     serial.print("\n!!! isr_irq0 CANARY CLOBBERED — wild writer scribbled IRQ frame !!!\n", .{});
-    serial.print("  canary slot 0x{X:0>16}: expected 0x000000007B0FF1CE, got 0x{X:0>16}\n", .{ rsp_now, got_canary });
+    serial.print("  canary slot 0x{X:0>16}: expected 0x{X:0>16}, got 0x{X:0>16}\n", .{ rsp_now, IRQ0_CANARY, got_canary });
 
     serial.print("  saved GPRs (push order, bottom→top):\n", .{});
     const gpr_names = [_][]const u8{ "r15", "r14", "r13", "r12", "r11", "r10", "r9 ", "r8 ", "rdi", "rsi", "rbp", "rbx", "rdx", "rcx", "rax" };
