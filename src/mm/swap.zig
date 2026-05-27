@@ -19,7 +19,7 @@ const debug = @import("../debug/debug.zig");
 const pmm = @import("pmm.zig");
 const paging = @import("paging.zig");
 const nvme = @import("../driver/nvme.zig");
-const tlb = @import("../cpu/tlb.zig");
+const tlb = @import("../cpu/mmu/tlb.zig");
 const SpinLock = @import("../proc/spinlock.zig").SpinLock;
 
 // The swap device is the 3rd NVMe controller (0 = tarfs, 1 = ext2, 2 = swap).

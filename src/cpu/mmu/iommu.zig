@@ -28,12 +28,12 @@
 //   §11 — Second-level page table format
 
 const std = @import("std");
-const acpi = @import("../time/acpi.zig");
-const pmm = @import("../mm/pmm.zig");
-const paging = @import("../mm/paging.zig");
-const debug = @import("../debug/debug.zig");
-const pci = @import("../driver/pci.zig");
-const msix = @import("../time/msix.zig");
+const acpi = @import("../../time/acpi.zig");
+const pmm = @import("../../mm/pmm.zig");
+const paging = @import("../../mm/paging.zig");
+const debug = @import("../../debug/debug.zig");
+const pci = @import("../../driver/pci.zig");
+const msix = @import("../../time/msix.zig");
 
 // --- VT-d register offsets (relative to each DRHD's `register_base`) ------
 
@@ -737,7 +737,7 @@ pub fn dmaMap(bus: u8, dev: u8, func: u8, phys: u64, len: u64, prot: Prot) bool 
     // authorizing the mapping. Caller's RIP in the panic backtrace
     // identifies the buggy driver call site.
     {
-        const process_mod = @import("../proc/process.zig");
+        const process_mod = @import("../../proc/process.zig");
         const KERNEL_VIRT_BASE: u64 = 0xFFFFFFFF80000000;
         const ks_va = @intFromPtr(&process_mod.kstack_pool);
         const ks_phys_start = ks_va - KERNEL_VIRT_BASE;

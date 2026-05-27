@@ -796,7 +796,7 @@ fn growGuiFb(idx: u8, need_w: u32, need_h: u32) bool {
         pmm.acquireFrame(new_phys + i * 4096);
     }
     // Old frames are now unreachable from the app once its TLB is flushed.
-    @import("../cpu/tlb.zig").shootdownAll(process.procs[pid].pcid);
+    @import("../cpu/mmu/tlb.zig").shootdownAll(process.procs[pid].pcid);
 
     // Repoint the window. NULL the front AND the stale back-buffer pointers
     // first (they point at the OLD, smaller, about-to-be-freed blocks), THEN
@@ -4049,5 +4049,5 @@ fn yieldToScheduler() void {
     // legitimate post-mouse-init reEnable call still happens at desktop
     // startup (see line ~2765).
     asm volatile ("sti");
-    @import("../cpu/pcid.zig").loadCr3(paging.getKernelPageDirPhys(), 0, @import("../cpu/smp.zig").myCpu().cpu_id);
+    @import("../cpu/mmu/pcid.zig").loadCr3(paging.getKernelPageDirPhys(), 0, @import("../cpu/smp.zig").myCpu().cpu_id);
 }

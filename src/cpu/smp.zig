@@ -766,7 +766,7 @@ pub fn pollAppLoad() ?u32 {
     // Switch to the kernel page directory before reading the AP-allocated
     // buffer (whose virt = phys, identity-mapped in the kernel PD), then
     // restore.
-    const pcid_mod = @import("pcid.zig");
+    const pcid_mod = @import("mmu/pcid.zig");
     const caller_pd = if (process.currentPCB()) |pcb| pcb.page_dir_phys else 0;
     const caller_pcid: u16 = if (process.currentPCB()) |pcb| pcb.pcid else 0;
     pcid_mod.loadCr3(paging.getKernelPageDirPhys(), 0, myCpu().cpu_id);
@@ -844,7 +844,7 @@ pub fn apProcessLoadQueue() void {
     // Save caller's CR3 (including PCID bits 11:0), switch to kernel PML4
     // for I/O, restore at end via pcid.restoreSaved so the caller's TLB
     // is preserved if it had a tagged address space loaded.
-    const pcid_mod = @import("pcid.zig");
+    const pcid_mod = @import("mmu/pcid.zig");
     const caller_pd: u64 = asm volatile ("mov %%cr3, %[r]"
         : [r] "=r" (-> u64),
     );

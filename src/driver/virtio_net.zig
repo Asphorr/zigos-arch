@@ -25,7 +25,7 @@ const msix = @import("../time/msix.zig");
 const debug = @import("../debug/debug.zig");
 const net = @import("../net/net.zig");
 const virtio = @import("virtio.zig");
-const iommu = @import("../cpu/iommu.zig");
+const iommu = @import("../cpu/mmu/iommu.zig");
 const SpinLock = @import("../proc/spinlock.zig").SpinLock;
 
 const VirtqDesc = virtio.VirtqDesc;

@@ -91,7 +91,7 @@ pub fn taskEntry() callconv(.c) noreturn {
     // that doesn't fully cover all of kernel, the first internal
     // `loadAndStart` walk could fault.
     const paging = @import("../mm/paging.zig");
-    @import("../cpu/pcid.zig").loadCr3(paging.getKernelPageDirPhys(), 0, smp.myCpu().cpu_id);
+    @import("../cpu/mmu/pcid.zig").loadCr3(paging.getKernelPageDirPhys(), 0, smp.myCpu().cpu_id);
 
     var spawned: u64 = 0;
     var kills: u64 = 0;

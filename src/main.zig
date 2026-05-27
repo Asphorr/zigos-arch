@@ -327,7 +327,7 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     // for off-the-rails DMA without changing driver semantics. No-op
     // when no DMAR table is present (no -device intel-iommu in QEMU,
     // or BIOS-mode boot on real hardware).
-    @import("cpu/iommu.zig").init();
+    @import("cpu/mmu/iommu.zig").init();
     blog.ok("IOMMU (VT-d pass-through)");
     // SMI / scheduler stall detector. Reads FADT.pm_tmr_blk for sampling.
     // Has to come after acpi.init (FADT cached) but before apic.init starts
@@ -363,7 +363,7 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     // LAPIC wasn't running yet. Now that it is, hardware can deliver
     // fault-event MSIs to our IDT vector instead of accumulating silently
     // in FSTS/FRR.
-    @import("cpu/iommu.zig").armFaultMsi();
+    @import("cpu/mmu/iommu.zig").armFaultMsi();
     // Wall-clock time: latch boot epoch from RTC + HPET.
     @import("time/time.zig").init();
     blog.ok("Wall-clock epoch");

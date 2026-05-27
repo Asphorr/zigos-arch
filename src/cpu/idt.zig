@@ -148,7 +148,7 @@ pub fn init() void {
     setGate(44, @intFromPtr(&isr_irq12), 0x8E); // Mouse
 
     // TLB shootdown IPI (vector 0x50). Receiver: full local TLB flush + ack.
-    setGate(@import("tlb.zig").TLB_VECTOR, @intFromPtr(&isr_tlb_shootdown), 0x8E);
+    setGate(@import("mmu/tlb.zig").TLB_VECTOR, @intFromPtr(&isr_tlb_shootdown), 0x8E);
 
     // PMI (Performance Monitor Interrupt). LAPIC LVT.PMI delivers to this
     // vector when PMC0 overflows. Stub forwards saved RIP to pmu.onSample.

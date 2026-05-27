@@ -27,7 +27,7 @@ const paging = @import("../mm/paging.zig");
 const debug = @import("../debug/debug.zig");
 const hpet = @import("../time/hpet.zig");
 const SpinLock = @import("../proc/spinlock.zig").SpinLock;
-const iommu = @import("../cpu/iommu.zig");
+const iommu = @import("../cpu/mmu/iommu.zig");
 
 var pci_bus: u8 = 0;
 var pci_dev: u8 = 0;

@@ -7,7 +7,7 @@ const pmm = @import("../mm/pmm.zig");
 const paging = @import("../mm/paging.zig");
 const debug = @import("../debug/debug.zig");
 const SpinLock = @import("../proc/spinlock.zig").SpinLock;
-const iommu = @import("../cpu/iommu.zig");
+const iommu = @import("../cpu/mmu/iommu.zig");
 
 /// Serializes everything that touches `bdl_phys` / `buf_phys` / the PCM-out
 /// register sequence. Audio entry points are called from syscall context

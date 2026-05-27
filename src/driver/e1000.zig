@@ -28,7 +28,7 @@ const paging = @import("../mm/paging.zig");
 const msix = @import("../time/msix.zig");
 const debug = @import("../debug/debug.zig");
 const net = @import("../net/net.zig");
-const iommu = @import("../cpu/iommu.zig");
+const iommu = @import("../cpu/mmu/iommu.zig");
 
 const E1000_VENDOR: u16 = 0x8086;
 

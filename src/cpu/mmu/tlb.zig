@@ -39,13 +39,13 @@
 //     global lock entirely).
 
 const std = @import("std");
-const apic = @import("../time/apic.zig");
-const smp = @import("smp.zig");
-const debug = @import("../debug/debug.zig");
-const perf = @import("../debug/perf.zig");
+const apic = @import("../../time/apic.zig");
+const smp = @import("../smp.zig");
+const debug = @import("../../debug/debug.zig");
+const perf = @import("../../debug/perf.zig");
 const pcid = @import("pcid.zig");
-const protect = @import("arch/protect.zig");
-const hyperv = @import("../virt/hyperv.zig");
+const protect = @import("../arch/protect.zig");
+const hyperv = @import("../../virt/hyperv.zig");
 
 // Slow-shootdown threshold (cycles). At Kaby Lake 2.4 GHz nominal TSC,
 // 2.5M cycles ≈ 1 ms — well above the few-μs IPI round-trip budget.

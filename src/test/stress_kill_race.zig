@@ -47,7 +47,7 @@ pub fn taskEntry() callconv(.c) noreturn {
     // Driver runs in kernel context with kernel CR3 already active (kernel
     // tasks share the master PD). loadAndStart needs to walk + write to
     // the kernel master PD; defensively switch to be sure.
-    @import("../cpu/pcid.zig").loadCr3(paging.getKernelPageDirPhys(), 0, @import("../cpu/smp.zig").myCpu().cpu_id);
+    @import("../cpu/mmu/pcid.zig").loadCr3(paging.getKernelPageDirPhys(), 0, @import("../cpu/smp.zig").myCpu().cpu_id);
 
     var spawned: u64 = 0;
     var spawn_failures: u64 = 0;

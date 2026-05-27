@@ -6,7 +6,7 @@ const process = @import("../proc/process.zig");
 const keyboard = @import("keyboard.zig");
 const mouse = @import("mouse.zig");
 const msix = @import("../time/msix.zig");
-const iommu = @import("../cpu/iommu.zig");
+const iommu = @import("../cpu/mmu/iommu.zig");
 
 // PCI BDF captured at init for per-device-attach iommu.dmaMap calls.
 var pci_bus: u8 = 0;

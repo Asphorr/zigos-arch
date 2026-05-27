@@ -37,7 +37,7 @@ const paging = @import("paging.zig");
 const debug = @import("../debug/debug.zig");
 const SpinLock = @import("../proc/spinlock.zig").SpinLock;
 const std = @import("std");
-const tlb = @import("../cpu/tlb.zig");
+const tlb = @import("../cpu/mmu/tlb.zig");
 const boot_phase = @import("../boot/boot_phase.zig");
 const kasan = @import("../debug/kasan.zig");
 

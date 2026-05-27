@@ -744,7 +744,7 @@ fn auditBootOnly(comptime site: []const u8) void {
 /// spins for peer IPI acks; a peer cli-spinning on a lock we hold would deadlock.
 fn shootdownIfPostBoot(comptime site: []const u8) void {
     if (@import("../boot/boot_phase.zig").isComplete()) {
-        @import("../cpu/tlb.zig").shootdownAll(0);
+        @import("../cpu/mmu/tlb.zig").shootdownAll(0);
         debug.klog("[paging] {s}: post-boot kernel-master mutation — broadcast global TLB shootdown to all CPUs\n", .{site});
     }
 }

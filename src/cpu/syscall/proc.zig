@@ -366,7 +366,7 @@ pub fn sysExec(name_ptr: u32, name_len: u32) u32 {
     // Switch to kernel PD -- user PD doesn't map all kernel memory
     const caller_pd = if (process.currentPCB()) |pcb| pcb.page_dir_phys else 0;
     const caller_pcid = if (process.currentPCB()) |pcb| pcb.pcid else 0;
-    @import("../pcid.zig").loadCr3(paging.getKernelPageDirPhys(), 0, @import("../smp.zig").myCpu().cpu_id);
+    @import("../mmu/pcid.zig").loadCr3(paging.getKernelPageDirPhys(), 0, @import("../smp.zig").myCpu().cpu_id);
 
     var pid: u32 = 0xFFFFFFFF;
     if (vfs.loadFileFresh(name_buf[0..fname_len])) |fresh| {
@@ -459,7 +459,7 @@ pub fn sysExec(name_ptr: u32, name_len: u32) u32 {
 
     // Switch back to caller's PD (PCID-aware so caller's TLB is preserved).
     if (caller_pd != 0) {
-        @import("../pcid.zig").loadCr3(caller_pd, caller_pcid, @import("../smp.zig").myCpu().cpu_id);
+        @import("../mmu/pcid.zig").loadCr3(caller_pd, caller_pcid, @import("../smp.zig").myCpu().cpu_id);
     }
 
     return pid;

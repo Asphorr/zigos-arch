@@ -84,7 +84,7 @@ pub fn sysSbrk(increment: u32) u32 {
 
         const pml4: [*]align(4096) u64 = @ptrCast(@alignCast(lead.page_directory.?));
         _ = vmm.unmapUserRange(pml4, new_brk_shrink, old_brk);
-        @import("../tlb.zig").shootdownAll(lead.pcid);
+        @import("../mmu/tlb.zig").shootdownAll(lead.pcid);
 
         hr.end = new_brk_shrink;
         lead.user_brk = new_brk_shrink;
@@ -307,7 +307,7 @@ pub fn sysMunmap(va: u32, len: u32) u32 {
     // For range==1 page, use INVPCID type-0 (single-page) so peer CPUs
     // only lose that one TLB entry; for larger ranges, use type-1
     // (whole-PCID flush) which is cheaper than emitting N type-0 calls.
-    const tlb = @import("../tlb.zig");
+    const tlb = @import("../mmu/tlb.zig");
     if ((end - start) == 0x1000) {
         // Single page: surgical INVPCID type-0 on peers. shootdownPage's local
         // flush (flushLocalForMode) carries an INVLPG backstop that reliably
@@ -418,7 +418,7 @@ pub fn sysMprotect(va: u32, len: u32, prot: u32) u32 {
     // Single-page case uses type-0 INVPCID (surgical, leaves the rest of
     // the PCID's TLB intact); ranges fall through to the whole-PCID type-1
     // flush.
-    const tlb = @import("../tlb.zig");
+    const tlb = @import("../mmu/tlb.zig");
     if (len_pg == 0x1000) {
         // Single page: see sysMunmap — shootdownPage's flushLocalForMode INVLPG
         // backstop reliably clears THIS CPU's stale entry under nested virt (the
