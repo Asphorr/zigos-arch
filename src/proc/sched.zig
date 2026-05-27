@@ -329,8 +329,12 @@ pub fn migrate(pid: u8, new_cpu: u8) bool {
 
     // Migration accounting (exposed via /proc/sched). Bump under both
     // rq locks so /proc/sched readers see a coherent in/out pair.
-    smp.cpus[old_cpu].migrations_out +%= 1;
-    smp.cpus[new_cpu].migrations_in +%= 1;
+    // L6: atomic RMW — readers in procfs use @atomicLoad; writers under
+    // the dual rq locks were plain but the tag-discipline mismatch could
+    // hide tearing on future arch ports. Single writer per dual-lock
+    // acquisition; .monotonic is sufficient.
+    _ = @atomicRmw(u64, &smp.cpus[old_cpu].migrations_out, .Add, 1, .monotonic);
+    _ = @atomicRmw(u64, &smp.cpus[new_cpu].migrations_in, .Add, 1, .monotonic);
 
     pcb.assigned_cpu = new_cpu;
     return true;
@@ -364,12 +368,19 @@ pub fn setAffinity(pid: u8, cpu_id: u8) bool {
         // rebalance opportunistically if there's a load delta.
         return true;
     }
-    pcb.assigned_cpu = cpu_id;
 
+    // H2: Don't write assigned_cpu BEFORE migrate() — migrate snapshots
+    // pcb.assigned_cpu as `old_cpu` and bails immediately if
+    // old_cpu == new_cpu. Stomping assigned_cpu here would make migrate
+    // a no-op; the pid would stay in its real (old) rq with assigned_cpu
+    // pointing at the new (uninhabited-by-it) CPU. For .ready, migrate
+    // itself updates assigned_cpu under both rq locks. For other states
+    // there's no rq membership to move — write directly after the branch.
     const state_byte = @atomicLoad(u8, @as(*const u8, @ptrCast(&pcb.state)), .acquire);
     if (state_byte == @intFromEnum(State.ready)) {
         _ = migrate(pid, cpu_id);
     } else if (state_byte == @intFromEnum(State.running)) {
+        pcb.assigned_cpu = cpu_id;
         // pid is dispatched somewhere — find that CPU and IPI it so its
         // schedule runs sooner. The prev demote in schedule will see the
         // updated assigned_cpu via setState→rqEnter.
@@ -386,6 +397,11 @@ pub fn setAffinity(pid: u8, cpu_id: u8) bool {
                 }
             }
         }
+    } else {
+        // .sleeping / .loading / .zombie / .unused — no rq membership to
+        // move, no IPI to send. Write assigned_cpu directly so the next
+        // state→.ready transition's rqEnter lands on the new CPU.
+        pcb.assigned_cpu = cpu_id;
     }
     return true;
 }
@@ -504,10 +520,24 @@ fn rqEnter(pid: usize, from_sleep: bool) void {
         });
     }
     if (pcb.is_idle) return;
-    if (pcb.assigned_cpu == 0xFF) return;
-    if (pcb.assigned_cpu >= smp.MAX_CPUS) return;
-    const rq = &smp.cpus[pcb.assigned_cpu].runqueue;
+    // H4: snapshot assigned_cpu BEFORE lock acquire, then re-check under the
+    // lock. A concurrent migrate updates pcb.assigned_cpu while holding both
+    // rq locks; if it ran between our load and our lock acquire, we'd
+    // otherwise enrol the pid in the OLD rq with assigned_cpu pointing at
+    // the NEW cpu — permanent nr_runnable drift + lost migration.
+    const cpu_idx_snap = @atomicLoad(u8, &pcb.assigned_cpu, .acquire);
+    if (cpu_idx_snap == 0xFF) return;
+    if (cpu_idx_snap >= smp.MAX_CPUS) return;
+    const rq = &smp.cpus[cpu_idx_snap].runqueue;
     const f = rq.lock.acquireIrqSave();
+    if (@atomicLoad(u8, &pcb.assigned_cpu, .acquire) != cpu_idx_snap) {
+        // Migrate moved us between snapshot and lock acquire. Release and
+        // retry against the fresh assigned_cpu. Tail-recursion bounded by
+        // the practical migrate rate (a single rqEnter call should never
+        // see more than 1-2 concurrent migrates).
+        rq.lock.releaseIrqRestore(f);
+        return rqEnter(pid, from_sleep);
+    }
     defer rq.lock.releaseIrqRestore(f);
     const pid_u8: u8 = @intCast(pid);
     if (rq.interactive.contains(pid_u8)) {
@@ -584,10 +614,17 @@ fn rqLeave(pid: usize) void {
         });
     }
     if (pcb.is_idle) return;
-    if (pcb.assigned_cpu == 0xFF) return;
-    if (pcb.assigned_cpu >= smp.MAX_CPUS) return;
-    const rq = &smp.cpus[pcb.assigned_cpu].runqueue;
+    // H4: snapshot+recheck same as rqEnter — migrate can move us during
+    // the lock-acquire window.
+    const cpu_idx_snap = @atomicLoad(u8, &pcb.assigned_cpu, .acquire);
+    if (cpu_idx_snap == 0xFF) return;
+    if (cpu_idx_snap >= smp.MAX_CPUS) return;
+    const rq = &smp.cpus[cpu_idx_snap].runqueue;
     const f = rq.lock.acquireIrqSave();
+    if (@atomicLoad(u8, &pcb.assigned_cpu, .acquire) != cpu_idx_snap) {
+        rq.lock.releaseIrqRestore(f);
+        return rqLeave(pid);
+    }
     defer rq.lock.releaseIrqRestore(f);
     const pid_u8: u8 = @intCast(pid);
     const ra = @returnAddress();
@@ -683,6 +720,26 @@ pub fn setState(pid: usize, new_state: State) void {
                 });
             }
             return; // already in this state
+        }
+        // H1: Terminal-state guard. Once a pid is .zombie or .unused, the
+        // ONLY legitimate transition out is .zombie→.unused (reaper) or
+        // .unused→.loading (allocator). All other transitions out of a
+        // terminal state are races — wake() reads state=.sleeping plain,
+        // a concurrent killer flips state to .zombie, then wake's
+        // setState(.ready) here CAS-retries against the new .zombie value
+        // and resurrects the zombie as .ready. Filter the retry path so
+        // a peer's terminal-state flip absorbs cleanly.
+        if (old_byte == @intFromEnum(State.zombie) and new_state != .unused) {
+            if (TRACE_PID != 0 and pid == TRACE_PID) {
+                debug.klog("[trace pid={d}] setState ABSORB zombie→{d} (terminal guard)\n", .{ pid, new_byte });
+            }
+            return;
+        }
+        if (old_byte == @intFromEnum(State.unused) and new_state != .loading) {
+            if (TRACE_PID != 0 and pid == TRACE_PID) {
+                debug.klog("[trace pid={d}] setState ABSORB unused→{d} (terminal guard)\n", .{ pid, new_byte });
+            }
+            return;
         }
         const cas = @cmpxchgStrong(u8, state_ptr, old_byte, new_byte, .acq_rel, .acquire);
         if (cas == null) break; // we own this transition
@@ -1013,6 +1070,13 @@ pub fn pickNext(exclude_pid: ?u8) ?usize {
 
     const cpu = smp.myCpu();
     const rq = &cpu.runqueue;
+    // M5: hold rq.lock across the pickMinVruntime walks. A peer CPU's
+    // setState→rqEnter (waking a pid whose assigned_cpu = this cpu) can
+    // mutate q.pids[]/q.count concurrently with our scan; without the
+    // lock, q.count shifts under us and pickMinVruntime indexes past
+    // the new count or reads a pid that was just shifted out.
+    const f = rq.lock.acquireIrqSave();
+    defer rq.lock.releaseIrqRestore(f);
     const queues = [_]*const runqueue.PriQueue{
         &rq.interactive,
         &rq.normal,
@@ -1191,13 +1255,17 @@ pub fn schedule() void {
     // on mismatch is verbose. Running it BEFORE the schedule body gives
     // us the cleanest snapshot of any drift introduced by an external
     // (cross-CPU) state write between the previous schedule and now.
-    sched_audit_counter +%= 1;
+    // L3: atomic Add — every CPU's schedule() increments concurrently,
+    // plain `+%= 1` was a non-atomic RMW with lost-increment race that
+    // made the audit cadence non-deterministic (anywhere from 1× to N×
+    // the intended rate depending on which writes survived).
+    const counter_after = @atomicRmw(u32, &sched_audit_counter, .Add, 1, .monotonic) +% 1;
     // Every 1024 schedules (~0.4 s at the observed 2800/s rate). Was every
     // 64 (~44/s) but the audit does an O(MAX_PROCS²) walk and runs at consumer
     // rate at idle — wasted cycles on a hot path. The audit catches drift
     // bugs over wall-clock seconds, not over micro-windows, so a coarser
     // cadence is structurally fine.
-    if (sched_audit_counter & 0x3FF == 0) rqAudit();
+    if (counter_after & 0x3FF == 0) rqAudit();
 
     // Phase 3: cross-CPU kill via exit_requested. If the current task on
     // this CPU has been marked for exit by another CPU's killProcess,
@@ -1393,6 +1461,12 @@ pub fn schedule() void {
                 // would suppress real pcb-invariant hits on cur until the
                 // NEXT schedule call.
                 cpu.scheduling_out_pid = 0xFFFF;
+                // M4: mirror dispatching_in_pid clear too. The self-switch
+                // path returns BEFORE the pid_trace.setCurrentPid call that
+                // would normally clear this bracket. Leaking it lets a peer
+                // CPU's pcb_invariants scan skip cand's invariant check
+                // until the next schedule that actually switches.
+                cpu.dispatching_in_pid = 0xFFFF;
                 cpu.sched_lock.releaseIrqRestore(flags);
                 return;
             }
@@ -1805,7 +1879,20 @@ pub fn wakeExpired() void {
         stuck_last_seen_wait_target[i] = target;
         wake_dbg_last_log = process.tick_count;
     }
-    earliest_wake_tick.store(new_earliest, .release);
+    // H5: Store-back the recomputed earliest, but only if no concurrent
+    // registrar already lowered the cache below our value. An unconditional
+    // store(new_earliest) would stomp a kernelSleepMs that registered a
+    // deadline DURING our scan: pid 5 was .running at scan time so
+    // contributed nothing to new_earliest, then registered D1 before our
+    // store, then our store(maxInt) wipes D1 → fast-path returns early
+    // forever, pid 5 sleeps with no waker. cmpxchg-only-if-larger preserves
+    // any racing lower registration.
+    var cur_earliest = earliest_wake_tick.load(.acquire);
+    while (cur_earliest > new_earliest) {
+        const r = earliest_wake_tick.cmpxchgWeak(cur_earliest, new_earliest, .release, .acquire);
+        if (r == null) break;
+        cur_earliest = r.?;
+    }
 }
 
 var wake_dbg_last_log: u64 = 0;
@@ -1834,7 +1921,14 @@ pub fn deliverDueAlarms() void {
             new_earliest = at;
         }
     }
-    earliest_alarm_tick.store(new_earliest, .release);
+    // H5: same cmpxchg-only-if-larger as wakeExpired — don't stomp a
+    // racing registerAlarmDeadline that lowered the cache during our scan.
+    var cur_earliest = earliest_alarm_tick.load(.acquire);
+    while (cur_earliest > new_earliest) {
+        const r = earliest_alarm_tick.cmpxchgWeak(cur_earliest, new_earliest, .release, .acquire);
+        if (r == null) break;
+        cur_earliest = r.?;
+    }
 }
 
 /// Clear a process's wait flag so the scheduler considers it runnable again.
@@ -1975,7 +2069,16 @@ pub fn blockOnFutex(target: u32, word: *const volatile u32, val: u32) FutexResul
     const pcb = &process.procs[cur];
     if (hasPendingDeliverable(pcb)) return .signalled;
 
-    @atomicStore(bool, &pcb.wake_pending, false, .release);
+    // H3: test-and-clear instead of unconditional store. A signal arriving
+    // between hasPendingDeliverable and the wake_pending reset would set
+    // wake_pending=true; an unconditional store(false) would stomp it and
+    // Race A below (word != val) can't catch signal-driven wakes since
+    // signals don't change the futex word. Mirrors the 2026-05-19 blockOn
+    // lost-wake fix.
+    if (@atomicRmw(bool, &pcb.wake_pending, .Xchg, false, .acq_rel)) {
+        if (hasPendingDeliverable(pcb)) return .signalled;
+        return .woke;
+    }
     setWait(pcb, .futex, target);
     setState(cur, .sleeping);
 
@@ -2018,7 +2121,12 @@ pub fn wake(pid: u8) void {
     // scheduler tick can pick us up. Don't touch .running or .zombie — wake
     // is meant to be a no-op for processes that aren't parked. setState
     // also rqEnter's pid on its assigned_cpu's runqueue.
-    if (process.procs[pid].state == .sleeping) setState(pid, .ready);
+    // M3: atomic-load state — `state` is `(a)` and a peer CPU may flip
+    // it to .zombie between this read and setState's CAS. setState's H1
+    // guard absorbs the race if it happens; the atomic load keeps the
+    // compiler from hoisting the check across IRQ boundaries.
+    const s = @atomicLoad(u8, @as(*const u8, @ptrCast(&process.procs[pid].state)), .acquire);
+    if (s == @intFromEnum(State.sleeping)) setState(pid, .ready);
 }
 
 /// Compare-and-sleep primitive for Mutex.acquire. Enrolls the current
@@ -2032,7 +2140,11 @@ pub fn wake(pid: u8) void {
 pub fn blockOnMutex(target_id: u32, owner_pid_ptr: *const u16) void {
     const cur = smp.myCpu().current_pid orelse return;
     const pcb = &process.procs[cur];
-    @atomicStore(bool, &pcb.wake_pending, false, .release);
+    // H3: test-and-clear. A wake() that arrived between caller's failed
+    // CAS-try and our enrollment would set wake_pending=true; unconditional
+    // store(false) here would stomp it. If we see true, return — caller
+    // retries the CAS, which will see the (now-released) mutex.
+    if (@atomicRmw(bool, &pcb.wake_pending, .Xchg, false, .acq_rel)) return;
     setWait(pcb, .mutex, target_id);
     setState(cur, .sleeping);
     // Race A: mutex got released between our caller's CAS-fail and our
@@ -2060,7 +2172,7 @@ pub fn blockOnMutex(target_id: u32, owner_pid_ptr: *const u16) void {
 pub fn wakeMutexWaiters(target_id: u32) void {
     for (0..MAX_PROCS) |i| {
         const t = &process.procs[i];
-        if (t.state != .sleeping) continue;
+        if (@atomicLoad(u8, @as(*const u8, @ptrCast(&t.state)), .acquire) != @intFromEnum(State.sleeping)) continue;
         if (!waitsOn(t, .mutex, target_id)) continue;
         wake(@intCast(i));
     }
@@ -2076,7 +2188,7 @@ pub fn wakeMutexWaiters(target_id: u32) void {
 pub fn wakeSwapEvictWaiters(target: u32) void {
     for (0..MAX_PROCS) |i| {
         const t = &process.procs[i];
-        if (t.state != .sleeping) continue;
+        if (@atomicLoad(u8, @as(*const u8, @ptrCast(&t.state)), .acquire) != @intFromEnum(State.sleeping)) continue;
         if (!waitsOn(t, .swap_evict, target)) continue;
         wake(@intCast(i));
     }
@@ -2088,7 +2200,7 @@ pub fn wakeSwapEvictWaiters(target: u32) void {
 pub fn wakeIoUringWorker(instance_id: u32) void {
     for (0..MAX_PROCS) |i| {
         const t = &process.procs[i];
-        if (t.state != .sleeping) continue;
+        if (@atomicLoad(u8, @as(*const u8, @ptrCast(&t.state)), .acquire) != @intFromEnum(State.sleeping)) continue;
         if (!waitsOn(t, .iouring_work, instance_id)) continue;
         wake(@intCast(i));
     }
@@ -2100,7 +2212,7 @@ pub fn wakeIoUringWorker(instance_id: u32) void {
 pub fn wakeIoUringCqWaiters(instance_id: u32) void {
     for (0..MAX_PROCS) |i| {
         const t = &process.procs[i];
-        if (t.state != .sleeping) continue;
+        if (@atomicLoad(u8, @as(*const u8, @ptrCast(&t.state)), .acquire) != @intFromEnum(State.sleeping)) continue;
         if (!waitsOn(t, .iouring_cq, instance_id)) continue;
         wake(@intCast(i));
     }
@@ -2127,7 +2239,10 @@ pub fn blockOnSwapEvict(pte_ptr: *const u64) void {
     const target = swap.evictWaitTarget(pte_ptr);
     while (true) {
         if (!swap.pteIsInflight(@atomicLoad(u64, pte_ptr, .acquire))) return;
-        @atomicStore(bool, &pcb.wake_pending, false, .release);
+        // H3: test-and-clear. If a wake() landed between the pteIsInflight
+        // check and now, treat as already-woken and loop to re-check the
+        // PTE rather than stomping wake_pending and parking.
+        if (@atomicRmw(bool, &pcb.wake_pending, .Xchg, false, .acq_rel)) continue;
         setWait(pcb, .swap_evict, target);
         setState(cur, .sleeping);
         // Race A: eviction committed/aborted between our pre-check and enroll.
