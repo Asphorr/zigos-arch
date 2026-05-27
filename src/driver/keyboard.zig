@@ -182,7 +182,15 @@ pub fn disableIRQ1() void {
 /// Re-enable keyboard IRQ after mouse init may have changed the PS/2 config.
 /// Disables interrupts during config byte read/write to prevent mouse IRQ
 /// from stealing the data byte.
+///
+/// No-op when PS/2 is not the active input path (`!ps2_present`) — either
+/// the controller was never present or `disableIRQ1()` has masked PS/2 in
+/// favor of a USB keyboard. Without this gate, callers in the yield hot
+/// path would hold cli for hundreds of ms under Hyper-V nested-virt while
+/// reprogramming a masked controller's config byte (caught 2026-05-26 as
+/// the #1 source of OURS-class SMI stalls).
 pub fn reEnable() void {
+    if (!ps2_present) return;
     // Disable interrupts so mouse IRQ can't eat config byte from port 0x60
     asm volatile ("cli");
     // Flush any pending data first

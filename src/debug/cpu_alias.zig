@@ -77,22 +77,30 @@ inline fn fail(v: Violation) noreturn {
 /// Cost is O(N²) but N is at most MAX_CPUS=32 — well under 1µs total.
 pub fn scan() void {
     if (@atomicLoad(bool, &reported, .acquire)) return;
-    // Reset the static snapshot in-place (cheap: ~800 stores). Reusing
-    // file-scope buffers across calls — see comment on snap_* above for
-    // why these can't be function locals.
-    for (0..smp.MAX_CPUS) |i| {
-        snap_alive[i] = false;
-        snap_idle_pid[i] = -1;
-        snap_cur_pid[i] = -1;
-        snap_rsp0[i] = 0;
-    }
+    const target_count = smp.aliveCpuCount();
+    // No pairs to compare — single-CPU systems can't alias.
+    if (target_count < 2) return;
+    // Reset + snapshot in one pass; early-exit once we've stamped every
+    // alive CPU. With target_count=2 on a 32-slot array this avoids 30
+    // iterations of pure no-op writes.
+    var snapshotted: usize = 0;
     for (0..smp.MAX_CPUS) |i| {
         const cpu = &smp.cpus[i];
-        if (i > 0 and !cpu.alive) continue;
-        snap_alive[i] = true;
-        if (cpu.idle_pid) |p| snap_idle_pid[i] = @intCast(p);
-        if (cpu.current_pid) |p| snap_cur_pid[i] = @intCast(p);
-        snap_rsp0[i] = cpu.tss.rsp0;
+        const alive_now = (i == 0) or cpu.alive;
+        snap_alive[i] = alive_now;
+        if (alive_now) {
+            snap_idle_pid[i] = if (cpu.idle_pid) |p| @intCast(p) else -1;
+            snap_cur_pid[i] = if (cpu.current_pid) |p| @intCast(p) else -1;
+            snap_rsp0[i] = cpu.tss.rsp0;
+            snapshotted += 1;
+            if (snapshotted == target_count) break;
+        } else {
+            // Stale state from a prior scan when this CPU was alive — clear
+            // so the pairwise loop can't false-fire on a recycled value.
+            snap_idle_pid[i] = -1;
+            snap_cur_pid[i] = -1;
+            snap_rsp0[i] = 0;
+        }
     }
 
     for (0..smp.MAX_CPUS) |a| {

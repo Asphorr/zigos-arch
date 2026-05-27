@@ -225,13 +225,56 @@ fn computeDr7() u64 {
     return dr7;
 }
 
+// Per-CPU cache of the last-applied (DR7, addr0..3) tuple. Used by
+// applyLocal to skip the 5 mov-to-DR writes (each serializing on x86,
+// ~hundreds of cycles under nested-virt) when the effective state hasn't
+// changed since the last application on this CPU. The save_trace_record
+// path fires applyLocal on EVERY context switch — without this cache,
+// 2,800 schedules/sec × 5 DR writes = ~14K mov-to-DR/sec on cpu0.
+//
+// Initial sentinel 0xFFFFFFFFFFFFFFFF forces a first-time write since
+// DR7 is initialized to 0x400 (bit 10 reserved-set) on boot, which we
+// won't otherwise match.
+var last_applied_dr7: [smp.MAX_CPUS]u64 = [_]u64{0xFFFF_FFFF_FFFF_FFFF} ** smp.MAX_CPUS;
+var last_applied_addrs: [smp.MAX_CPUS][4]u64 =
+    [_][4]u64{[_]u64{0xFFFF_FFFF_FFFF_FFFF} ** 4} ** smp.MAX_CPUS;
+
 /// Push the current `entries[]` to the local CPU's DR registers. Idempotent.
+/// Per-CPU cached — when neither the effective DR7 (which depends on the
+/// scheduling-out gate state of any kesp-gated watch) nor any of the four
+/// watched addresses have changed since the last apply on this CPU, the
+/// function is a 5-compare branch and 0 writes. Caller correctness is
+/// preserved because computeDr7() re-evaluates entryEffectivelyArmed every
+/// call — the gate state IS part of the cache key.
 pub fn applyLocal() void {
-    writeDr0(entries[0].addr);
-    writeDr1(entries[1].addr);
-    writeDr2(entries[2].addr);
-    writeDr3(entries[3].addr);
-    writeDr7(computeDr7());
+    const cpu_id = smp.myCpu().cpu_id;
+    const new_dr7 = computeDr7();
+    const a0 = entries[0].addr;
+    const a1 = entries[1].addr;
+    const a2 = entries[2].addr;
+    const a3 = entries[3].addr;
+    if (cpu_id < smp.MAX_CPUS) {
+        if (last_applied_dr7[cpu_id] == new_dr7
+            and last_applied_addrs[cpu_id][0] == a0
+            and last_applied_addrs[cpu_id][1] == a1
+            and last_applied_addrs[cpu_id][2] == a2
+            and last_applied_addrs[cpu_id][3] == a3)
+        {
+            return;
+        }
+    }
+    writeDr0(a0);
+    writeDr1(a1);
+    writeDr2(a2);
+    writeDr3(a3);
+    writeDr7(new_dr7);
+    if (cpu_id < smp.MAX_CPUS) {
+        last_applied_dr7[cpu_id] = new_dr7;
+        last_applied_addrs[cpu_id][0] = a0;
+        last_applied_addrs[cpu_id][1] = a1;
+        last_applied_addrs[cpu_id][2] = a2;
+        last_applied_addrs[cpu_id][3] = a3;
+    }
 }
 
 // ---- IPI-based cross-CPU sync (task #231) -------------------------------

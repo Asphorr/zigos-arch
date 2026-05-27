@@ -108,5 +108,12 @@ pub fn notify() void {
 }
 
 pub fn tick() void {
-    if (use_ac97) ac97.tick() else speaker.tick();
+    // virtio-sound + HDA are IRQ-driven streamers — they don't need a periodic
+    // tick. AC97 still owns the UI sound effects (LFO/noise generator) and
+    // needs tick() to advance them. PC speaker is the bare-metal fallback.
+    if (use_ac97) {
+        ac97.tick();
+    } else if (!use_virtio and !use_hda) {
+        speaker.tick();
+    }
 }

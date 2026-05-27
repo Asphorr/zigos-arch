@@ -1057,7 +1057,12 @@ fn writeHex64(buf: []u8, pos: usize, n: u64) usize {
 /// full diagnostic+panic. Callers sprinkle these between sub-routines in
 /// handleIRQ0 — the first label printed names the sub-routine that wrote
 /// to the iretq frame between the previous checkpoint and this one.
+/// Comptime-gated. Was load-bearing during the 2026-05-17 iretq-corruption
+/// hunt; structurally fixed by the IST=1 / per-CPU isr_stack rework (Shape D).
+/// Flip BISECT_ENABLED to true to re-enable during a future forensic hunt.
+const BISECT_ENABLED = false;
 inline fn bisectPoint(comptime label: []const u8, frame: [*]const u64, snap: @import("../debug/kdbg.zig").IretqSnap) void {
+    if (comptime !BISECT_ENABLED) return;
     if (frame[16] == snap.cs and frame[19] == snap.ss) return;
     @import("../debug/serial.zig").print("[bisect] CORRUPTED AT: {s}\n", .{label});
     @import("../debug/kdbg.zig").iretqValidate(frame, snap);

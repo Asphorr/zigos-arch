@@ -4036,10 +4036,18 @@ fn yieldToScheduler() void {
     // and we fall through to the desktop main loop's housekeeping.
     process.schedule();
 
-    // After scheduler context is back, restore kernel CR3 and re-enable
-    // input. (schedule() already switched to kernel CR3 when handing back,
-    // but this is harmless and keeps the contract explicit.)
+    // After scheduler context is back, restore kernel CR3. schedule() already
+    // switched to kernel CR3 when handing back, but this is harmless and keeps
+    // the contract explicit.
+    //
+    // We do NOT call keyboard.reEnable() here. It used to run every yield
+    // (~28×/tick) and was the #1 source of "OURS"-class SMI stalls — caught
+    // 2026-05-26 with hits up to 773 ms cli-held at reEnable+0x2ED. The
+    // PS/2 config it writes is set once by initPS2() at boot and (if USB
+    // keyboard wins) immediately masked by disableIRQ1(); reprogramming
+    // the same config byte every yield serves no purpose. The one
+    // legitimate post-mouse-init reEnable call still happens at desktop
+    // startup (see line ~2765).
     asm volatile ("sti");
     @import("../cpu/pcid.zig").loadCr3(paging.getKernelPageDirPhys(), 0, @import("../cpu/smp.zig").myCpu().cpu_id);
-    keyboard.reEnable();
 }

@@ -1192,7 +1192,12 @@ pub fn schedule() void {
     // us the cleanest snapshot of any drift introduced by an external
     // (cross-CPU) state write between the previous schedule and now.
     sched_audit_counter +%= 1;
-    if (sched_audit_counter & 0x3F == 0) rqAudit();
+    // Every 1024 schedules (~0.4 s at the observed 2800/s rate). Was every
+    // 64 (~44/s) but the audit does an O(MAX_PROCS²) walk and runs at consumer
+    // rate at idle — wasted cycles on a hot path. The audit catches drift
+    // bugs over wall-clock seconds, not over micro-windows, so a coarser
+    // cadence is structurally fine.
+    if (sched_audit_counter & 0x3FF == 0) rqAudit();
 
     // Phase 3: cross-CPU kill via exit_requested. If the current task on
     // this CPU has been marked for exit by another CPU's killProcess,
@@ -1669,14 +1674,55 @@ inline fn writeFsBase(val: u64) void {
           [hi] "{edx}" (@as(u32, @truncate(val >> 32))));
 }
 
+/// Lazy min-deadline caches for `wakeExpired` / `deliverDueAlarms`. Setters
+/// of `wake_tick` / `alarm_tick` must call the matching `register*Deadline`
+/// so the 100 Hz scan-skip fast-path can detect "nothing is due yet" and
+/// avoid walking MAX_PROCS PCBs. `maxInt` = no deadline pending.
+///
+/// Race tolerance: registrars only LOWER (never raise) the cached value via
+/// cmpxchgWeak loop, so a stale too-low value forces a no-op scan — harmless.
+/// wakeExpired/deliverDueAlarms recompute the new min from what actually
+/// remains after their scan and store it back, so the cache self-corrects
+/// every tick that crosses a deadline.
+pub var earliest_wake_tick: std.atomic.Value(u64) = std.atomic.Value(u64).init(std.math.maxInt(u64));
+pub var earliest_alarm_tick: std.atomic.Value(u64) = std.atomic.Value(u64).init(std.math.maxInt(u64));
+
+pub fn registerWakeDeadline(deadline: u64) void {
+    var cur = earliest_wake_tick.load(.monotonic);
+    while (deadline < cur) {
+        cur = earliest_wake_tick.cmpxchgWeak(cur, deadline, .release, .monotonic) orelse return;
+    }
+}
+
+pub fn registerAlarmDeadline(deadline: u64) void {
+    var cur = earliest_alarm_tick.load(.monotonic);
+    while (deadline < cur) {
+        cur = earliest_alarm_tick.cmpxchgWeak(cur, deadline, .release, .monotonic) orelse return;
+    }
+}
+
 /// Wake sleeping processes whose `sleep()` deadline has expired. Only
 /// considers processes with wait_kind == .none (those blocked via
-/// `sysSleep`) — futex/pipe/waitpid sleepers leave wait_kind set and
-/// must be woken by their respective explicit wake paths. Without the
-/// guard, every `.sleeping` PCB with the default wake_tick=0 would
-/// race to .ready on the very next tick, breaking blocking syscalls.
+/// `sysSleep`) and .gpu_io (virtio-gpu safety-net) — futex/pipe/waitpid
+/// sleepers leave wait_kind set and must be woken by their respective
+/// explicit wake paths. Without the guard, every `.sleeping` PCB with the
+/// default wake_tick=0 would race to .ready on the very next tick, breaking
+/// blocking syscalls.
 pub fn wakeExpired() void {
+    // Fast path: nothing is due yet. Was: full MAX_PROCS scan + 2 atomic loads
+    // per slot every tick. With the earliest cache + tick gating, idle ticks
+    // skip the scan entirely. ~6,400 PCB atomic loads/sec eliminated at idle.
+    if (process.tick_count < earliest_wake_tick.load(.acquire)) return;
+    var new_earliest: u64 = std.math.maxInt(u64);
     for (0..MAX_PROCS) |i| {
+        const pcb = &process.procs[i];
+        if (pcb.state != .sleeping) {
+            // Forward progress on this slot — clear any latched stuck
+            // state so the NEXT incident logs fresh.
+            stuck_last_seen_wait_kind[i] = null;
+            continue;
+        }
+        const wt = @atomicLoad(u64, &pcb.wake_tick, .acquire);
         // .gpu_io waiters set both wait_kind AND wake_tick as a safety
         // net: the primary waker is virtio_gpu's MSI-X IRQ walking the
         // PCB table, but QEMU CVE-2024-3446 occasionally drops the
@@ -1685,23 +1731,14 @@ pub fn wakeExpired() void {
         // handle .gpu_io here (not in the .none branch) so the wake
         // clears wait_kind back to .none on the same path as the IRQ
         // wake — keeping a single "waiter resumed" code path.
-        const wt_gpu = @atomicLoad(u64, &process.procs[i].wake_tick, .acquire);
-        if (process.procs[i].state == .sleeping
-            and process.procs[i].wait_kind == .gpu_io
-            and wt_gpu != 0
-            and process.tick_count >= wt_gpu)
-        {
-            @atomicStore(u64, &process.procs[i].wake_tick, 0, .release);
-            clearWait(&process.procs[i]);
+        if (pcb.wait_kind == .gpu_io and wt != 0 and process.tick_count >= wt) {
+            @atomicStore(u64, &pcb.wake_tick, 0, .release);
+            clearWait(pcb);
             setState(i, .ready);
+            stuck_last_seen_wait_kind[i] = null;
             continue;
         }
-        const wt_none = @atomicLoad(u64, &process.procs[i].wake_tick, .acquire);
-        if (process.procs[i].state == .sleeping
-            and process.procs[i].wait_kind == .none
-            and wt_none != 0
-            and process.tick_count >= wt_none)
-        {
+        if (pcb.wait_kind == .none and wt != 0 and process.tick_count >= wt) {
             // ORDER MATTERS: clear wake_tick BEFORE setState. setState
             // routes through rqEnter — once the pid is in the rq, an AP
             // (or this CPU on its next schedule()) can pick it, dispatch
@@ -1716,66 +1753,88 @@ pub fn wakeExpired() void {
             // the next tick (we'd be sleeping with wake_tick=0 briefly,
             // skipped by wakeExpired guard, but the fresh sysSleep would
             // overwrite it before any harm).
-            @atomicStore(u64, &process.procs[i].wake_tick, 0, .release);
+            @atomicStore(u64, &pcb.wake_tick, 0, .release);
             setState(i, .ready);
-        } else if (process.procs[i].state == .sleeping
-            and process.tick_count -% wake_dbg_last_log >= 200)
-        {
-            // DBG: this PCB is sleeping but wakeExpired isn't waking it.
-            // Three cases — all suspect:
-            //   (a) wait_kind=.none AND wake_tick=0  : orphan sleep — no
-            //       waker registered. Likely a wake-races-blockOn race
-            //       where wake() ran before blockOn() set wait_kind, so
-            //       wake cleared wait_kind=.none then state was set to
-            //       .sleeping with no further waker.
-            //   (b) wait_kind=.none AND wake_tick>now : sleep still pending
-            //       (legitimate). Logged for completeness.
-            //   (c) wait_kind!=.none (pipe/futex/waitpid/etc) AND no wake
-            //       observed for >200 ticks : the explicit-waker path
-            //       (pipe.write→process.wake / futex_wake / etc) didn't
-            //       fire OR raced against blockOn the same way as (a).
-            if (process.procs[i].wait_kind == .none) {
-                if (process.procs[i].wake_tick == 0) {
-                    debug.klog("[wake-skip] pid={d} state=sleeping wait=none wake_tick=0 (orphan sleep)\n", .{i});
-                    wake_dbg_last_log = process.tick_count;
-                } else if (process.tick_count < process.procs[i].wake_tick) {
-                    debug.klog("[wake-skip] pid={d} state=sleeping wait=none wake_tick={d} now={d} delta_future={d}\n", .{
-                        i, process.procs[i].wake_tick, process.tick_count, process.procs[i].wake_tick - process.tick_count,
-                    });
-                    wake_dbg_last_log = process.tick_count;
-                }
-            } else {
-                // wait_kind != .none — explicit waker should fire. Log so
-                // we can correlate against pipe/futex/waitpid event flow.
-                debug.klog("[wake-skip] pid={d} state=sleeping wait_kind={d} wait_target=0x{x} (explicit waker not firing)\n", .{
-                    i, @intFromEnum(process.procs[i].wait_kind), process.procs[i].wait_target,
-                });
-                wake_dbg_last_log = process.tick_count;
-                // Stuck-waiter detector: one-shot full state dump after the
-                // pid has been parked on the same resource for ≥STUCK_TICKS.
-                // Single permanent park is the bug pattern that `observe()`
-                // can't catch — there are no repeated yields to compare.
-                @import("../debug/yield_loop.zig").checkStuck(
-                    i, process.procs[i].wait_kind, process.procs[i].wait_target,
-                );
-            }
+            stuck_last_seen_wait_kind[i] = null;
+            continue;
         }
+        // Sleeper remains parked. If it has a future deadline this function
+        // would honor (.gpu_io or .none with wt > now), track it for the
+        // post-scan earliest_wake_tick store. Other wait kinds are woken by
+        // explicit paths and their wake_tick (if any) is informational only.
+        if ((pcb.wait_kind == .gpu_io or pcb.wait_kind == .none)
+            and wt > process.tick_count and wt < new_earliest)
+        {
+            new_earliest = wt;
+        }
+        // Diagnostic — pid is sleeping but neither wake path fires. Three cases:
+        //   (a) wait_kind=.none AND wake_tick=0  : orphan sleep (no waker)
+        //   (b) wait_kind=.none AND wake_tick>now : sleep still pending
+        //   (c) wait_kind!=.none                  : explicit waker not firing
+        // Per-pid latch keyed on (wait_kind, wait_target) so a permanently-
+        // stuck pid emits exactly ONE line per incident. Replaces the old
+        // every-200-ticks treadmill that drowned the log for the stuck shell
+        // (272 identical dumps observed in serial.log 2026-05-26 before fix).
+        if (process.tick_count -% wake_dbg_last_log < 200) continue;
+        const kind = pcb.wait_kind;
+        const target = pcb.wait_target;
+        if (stuck_last_seen_wait_kind[i]) |last_kind| {
+            if (last_kind == kind and stuck_last_seen_wait_target[i] == target) continue;
+        }
+        if (kind == .none) {
+            if (wt == 0) {
+                debug.klog("[wake-skip] pid={d} state=sleeping wait=none wake_tick=0 (orphan sleep)\n", .{i});
+            } else if (process.tick_count < wt) {
+                debug.klog("[wake-skip] pid={d} state=sleeping wait=none wake_tick={d} now={d} delta_future={d}\n", .{
+                    i, wt, process.tick_count, wt - process.tick_count,
+                });
+            } else {
+                continue; // race: wt became eligible, we'll wake on next pass
+            }
+        } else {
+            debug.klog("[wake-skip] pid={d} state=sleeping wait_kind={d} wait_target=0x{x} (explicit waker not firing)\n", .{
+                i, @intFromEnum(kind), target,
+            });
+            // Stuck-waiter detector: one-shot full state dump after the
+            // pid has been parked on the same resource for ≥STUCK_TICKS.
+            // Single permanent park is the bug pattern that `observe()`
+            // can't catch — there are no repeated yields to compare.
+            @import("../debug/yield_loop.zig").checkStuck(i, kind, target);
+        }
+        stuck_last_seen_wait_kind[i] = kind;
+        stuck_last_seen_wait_target[i] = target;
+        wake_dbg_last_log = process.tick_count;
     }
+    earliest_wake_tick.store(new_earliest, .release);
 }
 
 var wake_dbg_last_log: u64 = 0;
+// Per-pid latch for the wake-skip diagnostic. Holds the (wait_kind, wait_target)
+// tuple last logged; cleared back to null when the pid leaves .sleeping. A
+// permanently-stuck pid emits ONE line per (kind, target) incident instead
+// of every 200 ticks forever.
+var stuck_last_seen_wait_kind: [MAX_PROCS]?WaitKind = [_]?WaitKind{null} ** MAX_PROCS;
+var stuck_last_seen_wait_target: [MAX_PROCS]u32 = [_]u32{0} ** MAX_PROCS;
 
 /// Deliver SIGALRM to any process whose `alarm()` deadline has come due.
 /// Called from the BSP timer IRQ alongside wakeExpired. Per-process — each
 /// PCB has at most one alarm pending; setting a new alarm cancels the old.
 pub fn deliverDueAlarms() void {
+    // Fast path mirrors wakeExpired: skip the MAX_PROCS scan when no alarm
+    // is due. Alarms are rare (sys_alarm only) so this is nearly always
+    // the case at runtime.
+    if (process.tick_count < earliest_alarm_tick.load(.acquire)) return;
+    var new_earliest: u64 = std.math.maxInt(u64);
     for (0..MAX_PROCS) |i| {
         const at = process.procs[i].alarm_tick;
         if (at != 0 and process.tick_count >= at) {
             process.procs[i].alarm_tick = 0;
             _ = signals.send(@intCast(i), signals.SIGALRM);
+        } else if (at != 0 and at < new_earliest) {
+            new_earliest = at;
         }
     }
+    earliest_alarm_tick.store(new_earliest, .release);
 }
 
 /// Clear a process's wait flag so the scheduler considers it runnable again.
@@ -1793,7 +1852,9 @@ pub fn kernelSleepMs(ms: u32) void {
     const cur = smp.myCpu().current_pid orelse return;
     const pcb = &process.procs[cur];
     const ticks = (ms + 9) / 10; // 100 Hz timer, round up
-    @atomicStore(u64, &pcb.wake_tick, process.tick_count + ticks, .release);
+    const deadline = process.tick_count + ticks;
+    @atomicStore(u64, &pcb.wake_tick, deadline, .release);
+    registerWakeDeadline(deadline);
     setState(cur, .sleeping);
     smp.myCpu().pending_soft_yield = true;
     @import("sched_asm.zig").softYield();

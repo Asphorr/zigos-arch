@@ -318,7 +318,9 @@ pub fn sysSleep(ms: u32) u32 {
     // ms > 0xFFFFFFF6, which trivially-fuzzable input triggers.
     // Caught by redteam fuzzer hitting sysSleep with random u32.
     const ticks = (@as(u64, ms) + 9) / 10;
-    @atomicStore(u64, &pcb.wake_tick, process.tick_count +% ticks, .release);
+    const deadline = process.tick_count +% ticks;
+    @atomicStore(u64, &pcb.wake_tick, deadline, .release);
+    @import("../../proc/sched.zig").registerWakeDeadline(deadline);
     process.setState(cur_pid, .sleeping);
     // Force the scheduler to actually deschedule us. Same alignment dance as
     // sys#07 — see comments there. wakeExpired() flips us back to .ready once
@@ -947,7 +949,9 @@ pub fn sysAlarm(seconds: u32) u32 {
     if (seconds == 0) {
         pcb.alarm_tick = 0;
     } else {
-        pcb.alarm_tick = now + @as(u64, seconds) * 100;
+        const deadline = now + @as(u64, seconds) * 100;
+        pcb.alarm_tick = deadline;
+        @import("../../proc/sched.zig").registerAlarmDeadline(deadline);
     }
     return prev_remaining;
 }

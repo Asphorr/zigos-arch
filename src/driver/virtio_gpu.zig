@@ -124,6 +124,7 @@ fn virtioGpuIrqHandler() callconv(.c) void {
     if (pid == 0xFF) return;
     const pcb = &process.procs[pid];
     @atomicStore(u64, &pcb.wake_tick, process.tick_count, .release);
+    @import("../proc/sched.zig").registerWakeDeadline(process.tick_count);
     // Participate in blockOn's lost-wake handshake (sched.zig:1817).
     // Without this, an IRQ landing between the submitter's last
     // usedIdxCoherent re-read and blockOn's setState(.sleeping) is
@@ -873,6 +874,7 @@ fn sendCmdViaPhys(cmd_len: u32, resp_len: u32) bool {
                     process.tick_count +% 1,
                     .release,
                 );
+                @import("../proc/sched.zig").registerWakeDeadline(process.tick_count +% 1);
                 process.blockOn(.gpu_io, cmd_type_for_target);
                 hlt_iters += 1;
             }
@@ -1110,6 +1112,7 @@ fn sendSimpleCmdPair(
                     process.tick_count +% 1,
                     .release,
                 );
+                @import("../proc/sched.zig").registerWakeDeadline(process.tick_count +% 1);
                 process.blockOn(.gpu_io, cmd_type_for_target);
                 hlt_iters += 1;
             }
@@ -1686,12 +1689,17 @@ pub fn tickSweep() void {
     // (and via gap #1's clflush, observes the new used_idx this time).
     const process = @import("../proc/process.zig");
     var pid: u8 = 0;
+    var any_woken = false;
     while (pid < process.MAX_PROCS) : (pid += 1) {
         const wk = @atomicLoad(u8, @as(*const u8, @ptrCast(&process.procs[pid].wait_kind)), .acquire);
         if (wk == @intFromEnum(process.WaitKind.gpu_io)) {
             @atomicStore(u64, &process.procs[pid].wake_tick, process.tick_count, .release);
+            any_woken = true;
         }
     }
+    // Register the deadline once (now) if we set any wake_tick — avoids N
+    // cmpxchg loops for N waiters all stamping the same tick.
+    if (any_woken) @import("../proc/sched.zig").registerWakeDeadline(process.tick_count);
 }
 
 /// Gap #4 (2026-05-20): diagnostic dump for the yield-loop / stuck-waiter
