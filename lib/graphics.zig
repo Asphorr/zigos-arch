@@ -112,6 +112,143 @@ pub const Canvas = struct {
         if (rw > 1) self.drawVLine(rx + rw - 1, ry, rh, color);
     }
 
+    /// Blit an opaque RGB pixmap onto the canvas. `pixels` is row-major
+    /// R,G,B triples (3 bytes/pixel — what stb_image returns for `channels=3`).
+    /// Every source pixel overwrites the destination; clips to canvas
+    /// bounds.
+    pub fn drawPixmap(self: *Canvas, dx: u32, dy: u32, w: u32, h: u32, pixels: []const u8) void {
+        if (pixels.len < @as(usize, w) * h * 3) return;
+        var row: u32 = 0;
+        while (row < h) : (row += 1) {
+            const py = dy + row;
+            if (py >= self.height) break;
+            const base = py * self.width;
+            const src_row: usize = @as(usize, row) * w * 3;
+            var col: u32 = 0;
+            while (col < w) : (col += 1) {
+                const px = dx + col;
+                if (px >= self.width) break;
+                const s = src_row + @as(usize, col) * 3;
+                const r: u32 = pixels[s];
+                const g: u32 = pixels[s + 1];
+                const b: u32 = pixels[s + 2];
+                self.fb[base + px] = (r << 16) | (g << 8) | b;
+            }
+        }
+    }
+
+    /// Blit an RGBA pixmap with straight-alpha src-over blending. `pixels`
+    /// is row-major R,G,B,A quadruples (4 bytes/pixel — stb_image with
+    /// `channels=4`). The dominant use case is VN character sprites where
+    /// the alpha channel carries the silhouette over a background BG.
+    /// Fully transparent pixels (a=0) skip; opaque (a=255) overwrite;
+    /// the middle band uses the same +127 rounded blend as `blendPixel`.
+    pub fn drawPixmapAlpha(self: *Canvas, dx: u32, dy: u32, w: u32, h: u32, pixels: []const u8) void {
+        if (pixels.len < @as(usize, w) * h * 4) return;
+        var row: u32 = 0;
+        while (row < h) : (row += 1) {
+            const py = dy + row;
+            if (py >= self.height) break;
+            const base = py * self.width;
+            const src_row: usize = @as(usize, row) * w * 4;
+            var col: u32 = 0;
+            while (col < w) : (col += 1) {
+                const px = dx + col;
+                if (px >= self.width) break;
+                const s = src_row + @as(usize, col) * 4;
+                const a: u32 = pixels[s + 3];
+                if (a == 0) continue;
+                const idx = base + px;
+                const sr: u32 = pixels[s];
+                const sg: u32 = pixels[s + 1];
+                const sb: u32 = pixels[s + 2];
+                if (a == 255) {
+                    self.fb[idx] = (sr << 16) | (sg << 8) | sb;
+                    continue;
+                }
+                const inv: u32 = 255 - a;
+                const dst = self.fb[idx];
+                const dr = (dst >> 16) & 0xFF;
+                const dg = (dst >> 8) & 0xFF;
+                const db = dst & 0xFF;
+                const r = (sr * a + dr * inv + 127) / 255;
+                const g = (sg * a + dg * inv + 127) / 255;
+                const b = (sb * a + db * inv + 127) / 255;
+                self.fb[idx] = (r << 16) | (g << 8) | b;
+            }
+        }
+    }
+
+    /// Nearest-neighbor scaled blit of an RGBA pixmap. Source `sw × sh` at
+    /// `pixels` maps onto destination `dw × dh` at `(dx, dy)` with straight-
+    /// alpha src-over blending. Q16 fixed-point step lets us avoid float;
+    /// integer-only inner loop. Nearest-neighbor — sharper than bilinear
+    /// on pixel art, slightly grainier on photographic upscales. For VN
+    /// art where window size differs from the asset's native 1280×720.
+    pub fn drawPixmapAlphaScaled(
+        self: *Canvas,
+        dx: u32,
+        dy: u32,
+        dw: u32,
+        dh: u32,
+        sw: u32,
+        sh: u32,
+        pixels: []const u8,
+    ) void {
+        if (dw == 0 or dh == 0 or sw == 0 or sh == 0) return;
+        if (pixels.len < @as(usize, sw) * sh * 4) return;
+
+        // Q16 step: how many source pixels per one destination pixel.
+        const dx_step: u32 = (sw << 16) / dw;
+        const dy_step: u32 = (sh << 16) / dh;
+
+        var dst_row: u32 = 0;
+        var src_y_q16: u32 = 0;
+        while (dst_row < dh) : ({
+            dst_row += 1;
+            src_y_q16 += dy_step;
+        }) {
+            const py = dy + dst_row;
+            if (py >= self.height) break;
+            const sy_unclamped = src_y_q16 >> 16;
+            const sy = if (sy_unclamped < sh) sy_unclamped else sh - 1;
+            const src_row_base: usize = @as(usize, sy) * sw * 4;
+            const base = py * self.width;
+
+            var dst_col: u32 = 0;
+            var src_x_q16: u32 = 0;
+            while (dst_col < dw) : ({
+                dst_col += 1;
+                src_x_q16 += dx_step;
+            }) {
+                const px = dx + dst_col;
+                if (px >= self.width) break;
+                const sx_unclamped = src_x_q16 >> 16;
+                const sx = if (sx_unclamped < sw) sx_unclamped else sw - 1;
+                const s = src_row_base + @as(usize, sx) * 4;
+                const a: u32 = pixels[s + 3];
+                if (a == 0) continue;
+                const idx = base + px;
+                const sr: u32 = pixels[s];
+                const sg: u32 = pixels[s + 1];
+                const sb: u32 = pixels[s + 2];
+                if (a == 255) {
+                    self.fb[idx] = (sr << 16) | (sg << 8) | sb;
+                    continue;
+                }
+                const inv: u32 = 255 - a;
+                const dst = self.fb[idx];
+                const dr = (dst >> 16) & 0xFF;
+                const dg = (dst >> 8) & 0xFF;
+                const db = dst & 0xFF;
+                const r = (sr * a + dr * inv + 127) / 255;
+                const g = (sg * a + dg * inv + 127) / 255;
+                const b = (sb * a + db * inv + 127) / 255;
+                self.fb[idx] = (r << 16) | (g << 8) | b;
+            }
+        }
+    }
+
     pub fn drawHLine(self: *Canvas, x: u32, y: u32, w: u32, color: u32) void {
         if (y >= self.height) return;
         for (0..w) |i| {

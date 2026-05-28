@@ -742,6 +742,18 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(vorbis_lib);
     _ = vorbis_mod; // suppress unused-var; first audio consumer wires it up
 
+    // --- MIXER — userspace multi-voice mixer for VN-engine audio paths ---
+    //
+    // No C deps; just a Zig module callers import alongside vorbis. The
+    // VN engine will plug stb_vorbis decoders into the mixer's pull
+    // callbacks and submit the mixed buffer via audio_write.
+    const mixer_mod = b.createModule(.{
+        .root_source_file = b.path("lib/mixer.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    _ = mixer_mod; // suppress unused-var; first VN-engine consumer wires it up
+
     // --- SETTINGS (uses image.decode for wallpaper-picker thumbnails) ---
     const settings_exe = b.addExecutable(.{
         .name = "settings.elf",
