@@ -47,6 +47,7 @@ pub const Kind = enum(u8) {
     net_info,
     net_sock,
     net_arp,
+    pcid_stats,
     pid_cmdline,
     pid_status,
 };
@@ -68,6 +69,7 @@ const STATIC_FILES = [_]StaticFile{
     .{ .name = "netinfo", .kind = .net_info },
     .{ .name = "netsock", .kind = .net_sock },
     .{ .name = "netarp", .kind = .net_arp },
+    .{ .name = "pcid_stats", .kind = .pcid_stats },
 };
 
 const PER_PID_FILES = [_]StaticFile{
@@ -142,6 +144,7 @@ pub fn read(inode: u32, offset: u32, buf: [*]u8, count: u32) u32 {
         .net_info => net.renderProcInfo(rendered),
         .net_sock => net.renderProcSock(rendered),
         .net_arp => net.renderProcArp(rendered),
+        .pcid_stats => renderPcidStats(rendered),
         .pid_cmdline => renderPidCmdline(pid, rendered),
         .pid_status => renderPidStatus(pid, rendered),
     };
@@ -212,6 +215,37 @@ fn renderInterrupts(buf: []u8) usize {
         const c = @atomicLoad(u64, row.counter, .monotonic);
         n += fmt(buf[n..], "{s:<16} {d}\n", .{ row.name, c });
     }
+    return n;
+}
+
+/// Per-PCID + global PCID telemetry. Surfaces counters from
+/// `src/cpu/mmu/pcid.zig`: how many PCIDs allocated/freed, how often
+/// CR3 loads hit the preserve-TLB path (bit 63 = 1, gen-coherent), how
+/// often they miss (bit 63 = 0, forced flush), and how many eager
+/// switch-out flushes narrowed future shootdown fan-out.
+///
+/// Derived metric: preserve-hit ratio = preserve_hits / (preserve_hits +
+/// flush_misses). Lower-bound 0% means PCID is acting like plain CR3 reloads
+/// (gen tracker forcing flushes); higher = TLB working sets surviving
+/// context switches as designed.
+fn renderPcidStats(buf: []u8) usize {
+    const pcid = @import("../cpu/mmu/pcid.zig");
+    const allocs = pcid.alloc_count.load(.monotonic);
+    const frees = pcid.free_count.load(.monotonic);
+    const hits = pcid.preserve_hits.load(.monotonic);
+    const misses = pcid.flush_misses.load(.monotonic);
+    const eager = pcid.eager_clears.load(.monotonic);
+    const total = hits + misses;
+    const hit_ratio = if (total == 0) 0 else (hits * 100) / total;
+    var n: usize = 0;
+    n += fmt(buf[n..], "MAX_PCID:        {d}\n", .{pcid.MAX_PCID});
+    n += fmt(buf[n..], "alloc_count:     {d}\n", .{allocs});
+    n += fmt(buf[n..], "free_count:      {d}\n", .{frees});
+    n += fmt(buf[n..], "in_use:          {d}\n", .{allocs - frees});
+    n += fmt(buf[n..], "preserve_hits:   {d}\n", .{hits});
+    n += fmt(buf[n..], "flush_misses:    {d}\n", .{misses});
+    n += fmt(buf[n..], "preserve_ratio:  {d}% ({d}/{d} cr3 loads kept TLB)\n", .{ hit_ratio, hits, total });
+    n += fmt(buf[n..], "eager_clears:    {d}\n", .{eager});
     return n;
 }
 
