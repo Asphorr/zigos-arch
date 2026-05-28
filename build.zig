@@ -680,6 +680,68 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(truetype_lib);
     _ = truetype_mod; // suppress unused-var; first VN-engine consumer will reference it
 
+    // --- STB_VORBIS — vendored 2026-05-28 for the VN-engine BGM path ---
+    //
+    // Same shape as stb_image / stb_truetype. Compiles stb_vorbis.c
+    // with STB_VORBIS_NO_STDIO; vendor/c_math.c provides external-
+    // linkage libm symbols (sqrt/cos/sin/exp/log/...) that stb_vorbis
+    // calls by their standard names, backed by the same fsm_*
+    // freestanding implementations the truetype lib uses internally.
+    const vb_tc = b.addTranslateC(.{
+        .root_source_file = b.path("vendor/vorbis_lib.h"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = false,
+    });
+    const vorbis_raw_mod = vb_tc.createModule();
+
+    const vb_cflags = &[_][]const u8{
+        "-fno-stack-protector",
+        "-Wno-unused-but-set-variable",
+        "-Wno-unused-variable",
+        "-Wno-unused-function",
+        "-Wno-shift-negative-value",
+        "-Wno-parentheses",
+        "-Wno-tautological-compare",
+        "-Wno-tautological-pointer-compare",
+        "-Wno-implicit-function-declaration",
+    };
+
+    const vorbis_lib = b.addLibrary(.{
+        .linkage = .static,
+        .name = "vorbis",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("lib/stb_shims.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = false,
+            .imports = &.{
+                .{ .name = "libc", .module = libc_mod },
+            },
+        }),
+    });
+    vorbis_lib.root_module.addCSourceFile(.{
+        .file = b.path("vendor/vorbis_lib.c"),
+        .flags = vb_cflags,
+    });
+    vorbis_lib.root_module.addCSourceFile(.{
+        .file = b.path("vendor/c_math.c"),
+        .flags = vb_cflags,
+    });
+    vorbis_lib.root_module.addIncludePath(b.path("vendor"));
+    vorbis_lib.root_module.addSystemIncludePath(b.path("doom_src/include"));
+
+    const vorbis_mod = b.createModule(.{
+        .root_source_file = b.path("lib/vorbis.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "vorbis_raw", .module = vorbis_raw_mod },
+        },
+    });
+    b.installArtifact(vorbis_lib);
+    _ = vorbis_mod; // suppress unused-var; first audio consumer wires it up
+
     // --- SETTINGS (uses image.decode for wallpaper-picker thumbnails) ---
     const settings_exe = b.addExecutable(.{
         .name = "settings.elf",
