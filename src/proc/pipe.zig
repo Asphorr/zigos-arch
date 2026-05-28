@@ -314,3 +314,54 @@ pub fn addWriter(id: u8) void {
     if (!pipes[id].in_use) return;
     pipes[id].writers +|= 1;
 }
+
+/// Walk every in-use pipe and verify ring invariants:
+///   - head, tail < PIPE_BUF_SIZE
+///   - count <= PIPE_BUF_SIZE
+///   - count == (head - tail) mod PIPE_BUF_SIZE
+///   - if count > 0, readers > 0 or writers > 0 (no orphaned data)
+/// Returns true if all invariants hold; logs to serial otherwise.
+///
+/// Catches: ring wraparound bugs, count-vs-position drift (alloc/free
+/// arithmetic on count drifted from the actual head/tail-distance — same
+/// shape as the 2026-05-24 TLSF double-count-on-coalesce class).
+pub fn validate() bool {
+    const serial = @import("../debug/serial.zig");
+    var ok = true;
+    for (&pipes, 0..) |*p, i| {
+        if (!p.in_use) continue;
+        if (p.head >= PIPE_BUF_SIZE) {
+            serial.print("[pipe] inv: pipe {d} head={d} >= PIPE_BUF_SIZE={d}\n", .{ i, p.head, PIPE_BUF_SIZE });
+            ok = false;
+        }
+        if (p.tail >= PIPE_BUF_SIZE) {
+            serial.print("[pipe] inv: pipe {d} tail={d} >= PIPE_BUF_SIZE={d}\n", .{ i, p.tail, PIPE_BUF_SIZE });
+            ok = false;
+        }
+        if (p.count > PIPE_BUF_SIZE) {
+            serial.print("[pipe] inv: pipe {d} count={d} > PIPE_BUF_SIZE={d}\n", .{ i, p.count, PIPE_BUF_SIZE });
+            ok = false;
+        }
+        if (p.head < PIPE_BUF_SIZE and p.tail < PIPE_BUF_SIZE) {
+            const expected_count: u32 = if (p.head >= p.tail)
+                p.head - p.tail
+            else
+                PIPE_BUF_SIZE - p.tail + p.head;
+            // When the ring is exactly full, head == tail but count == PIPE_BUF_SIZE,
+            // so the head>=tail branch returns 0; accept either 0 (empty) or PIPE_BUF_SIZE.
+            const matches = if (p.head == p.tail)
+                (p.count == 0 or p.count == PIPE_BUF_SIZE)
+            else
+                (p.count == expected_count);
+            if (!matches) {
+                serial.print("[pipe] inv: pipe {d} count={d} but head={d} tail={d} (expected {d})\n", .{ i, p.count, p.head, p.tail, expected_count });
+                ok = false;
+            }
+        }
+        if (p.count > 0 and p.readers == 0 and p.writers == 0) {
+            serial.print("[pipe] inv: pipe {d} has {d} bytes but no readers/writers\n", .{ i, p.count });
+            ok = false;
+        }
+    }
+    return ok;
+}

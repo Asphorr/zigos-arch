@@ -81,6 +81,20 @@ const SIZE_MASK: usize = ~@as(usize, 0xF);
 const CANARY_HEAD: u32 = 0xDEADBEEF;
 const CANARY_TAIL: u32 = 0xCAFEBABE;
 
+comptime {
+    // Allocated-block prefix layout: header[0..8] u64, user_size[8..12] u32,
+    // canary_head[12..16] u32. The first user byte is at USER_OFFSET=16 for
+    // naturally-aligned allocs. If any field widens, the user pointer math
+    // breaks silently. See debug/layout.zig for why hand-overlaid storage
+    // needs this gate (2026-05-28 heap freelist bug post-mortem).
+    const layout = @import("../debug/layout.zig");
+    layout.assertFieldsExactFill(&.{
+        .{ .name = "header",      .offset = 0,  .size = HEADER_SIZE },
+        .{ .name = "user_size",   .offset = 8,  .size = @sizeOf(u32) },
+        .{ .name = "canary_head", .offset = 12, .size = @sizeOf(u32) },
+    }, USER_OFFSET);
+}
+
 // === TLSF parameters ===
 
 // SMALL_BLOCK_SIZE is the boundary below which we use the "small" (FL=0)
@@ -109,11 +123,16 @@ var initialized: bool = false;
 var lock: SpinLock = .{};
 
 // Bitmaps: bit i in fl_bitmap set iff sl_bitmaps[i] != 0.
-//          bit j in sl_bitmaps[i] set iff free_lists[i][j] != null.
+//          bit j in sl_bitmaps[i] set iff free_lists[i][j] != 0.
 var fl_bitmap: u32 = 0; // up to FL_INDEX_COUNT bits used (max 18)
 var sl_bitmaps: [FL_INDEX_COUNT]u16 = [_]u16{0} ** FL_INDEX_COUNT;
-var free_lists: [FL_INDEX_COUNT][SL_INDEX_COUNT]?usize =
-    [_][SL_INDEX_COUNT]?usize{[_]?usize{null} ** SL_INDEX_COUNT} ** FL_INDEX_COUNT;
+// NOTE: `usize` not `?usize` — sentinel is 0 (heap addresses are never 0).
+// `?usize` is 16 bytes wide (payload + has_value, non-pointer optional),
+// which would overlap next_free@+8 with prev_free@+16 inside a free block
+// and silently corrupt the freelist. Caught 2026-05-28 as #PF cr2=0x10 in
+// removeFreeBlock after the discriminant overlap yielded `some(0)`.
+var free_lists: [FL_INDEX_COUNT][SL_INDEX_COUNT]usize =
+    [_][SL_INDEX_COUNT]usize{[_]usize{0} ** SL_INDEX_COUNT} ** FL_INDEX_COUNT;
 
 // Stats (preserved from prior impl for compat with sysmon/cli output).
 var alloc_count: u32 = 0;
@@ -164,12 +183,26 @@ inline fn readFooterAt(footer_addr: usize) usize {
 }
 
 // Free-block links live in the user-data region; safe to overlay because
-// the block is free.
-inline fn nextFreePtr(addr: usize) *?usize {
+// the block is free. Use plain `usize` with 0 as the null sentinel — see
+// free_lists declaration for why `?usize` is unsafe here.
+inline fn nextFreePtr(addr: usize) *usize {
     return @ptrFromInt(addr + 8);
 }
-inline fn prevFreePtr(addr: usize) *?usize {
+inline fn prevFreePtr(addr: usize) *usize {
     return @ptrFromInt(addr + 16);
+}
+comptime {
+    // Free-block layout — header[0..8], next_free[8..16], prev_free[16..24],
+    // footer[MIN_BLOCK_SIZE-8..MIN_BLOCK_SIZE]. The .size for each link is
+    // computed from @sizeOf(@TypeOf(deref)) so any future widening (e.g., a
+    // refactor back to ?usize @ 16B) trips the assertion at compile time.
+    const layout = @import("../debug/layout.zig");
+    layout.assertFieldsNonOverlap(&.{
+        .{ .name = "header",    .offset = 0,                    .size = HEADER_SIZE },
+        .{ .name = "next_free", .offset = 8,                    .size = @sizeOf(@TypeOf(nextFreePtr(0).*)) },
+        .{ .name = "prev_free", .offset = 16,                   .size = @sizeOf(@TypeOf(prevFreePtr(0).*)) },
+        .{ .name = "footer",    .offset = MIN_BLOCK_SIZE - 8,   .size = FOOTER_SIZE },
+    }, MIN_BLOCK_SIZE);
 }
 
 // === Size → (FL, SL) mapping ===
@@ -226,8 +259,8 @@ fn insertFreeBlock(addr: usize) void {
     const m = mapping(sz);
     const head = free_lists[m.fl][m.sl];
     nextFreePtr(addr).* = head;
-    prevFreePtr(addr).* = null;
-    if (head) |h| prevFreePtr(h).* = addr;
+    prevFreePtr(addr).* = 0;
+    if (head != 0) prevFreePtr(head).* = addr;
     free_lists[m.fl][m.sl] = addr;
     sl_bitmaps[m.fl] |= (@as(u16, 1) << @intCast(m.sl));
     fl_bitmap |= (@as(u32, 1) << @intCast(m.fl));
@@ -240,13 +273,13 @@ fn removeFreeBlock(addr: usize) void {
     const m = mapping(sz);
     const next = nextFreePtr(addr).*;
     const prev = prevFreePtr(addr).*;
-    if (next) |n| prevFreePtr(n).* = prev;
-    if (prev) |p| {
-        nextFreePtr(p).* = next;
+    if (next != 0) prevFreePtr(next).* = prev;
+    if (prev != 0) {
+        nextFreePtr(prev).* = next;
     } else {
         // We were the head.
         free_lists[m.fl][m.sl] = next;
-        if (next == null) {
+        if (next == 0) {
             sl_bitmaps[m.fl] &= ~(@as(u16, 1) << @intCast(m.sl));
             if (sl_bitmaps[m.fl] == 0) {
                 fl_bitmap &= ~(@as(u32, 1) << @intCast(m.fl));
@@ -286,8 +319,8 @@ pub fn init() void {
 
     writeHeader(HEAP_START, big_size, true, false);
     writeFooter(HEAP_START);
-    nextFreePtr(HEAP_START).* = null;
-    prevFreePtr(HEAP_START).* = null;
+    nextFreePtr(HEAP_START).* = 0;
+    prevFreePtr(HEAP_START).* = 0;
 
     // Sentinel "wall" — allocated, never freed, PREV_FREE set (the big
     // block in front of it IS free initially).
@@ -296,7 +329,7 @@ pub fn init() void {
     fl_bitmap = 0;
     @memset(sl_bitmaps[0..], 0);
     for (&free_lists) |*row| {
-        @memset(row[0..], null);
+        @memset(row[0..], 0);
     }
     free_bytes_remaining = big_size;
     free_block_count = 0;
@@ -358,7 +391,7 @@ pub fn kmallocAligned(size: usize, alignment: usize) ?[*]u8 {
         return null;
     };
 
-    const block_addr = free_lists[found.fl][found.sl].?;
+    const block_addr = free_lists[found.fl][found.sl];
     removeFreeBlock(block_addr);
     const block_sz = blockSize(block_addr);
 
@@ -508,6 +541,11 @@ pub fn kfree(ptr: [*]u8) void {
         // tail-canary panic policy a few lines below (consistent: every
         // heap-corruption class fails the same way).
         serial.print("[tlsf] free: no header for ptr 0x{X:0>16} (scan {d} bytes)\n", .{ addr, scanned });
+        // Auto-bisect — what alloc/free events touched this frame recently?
+        // For the no-header case it most often points at "the kernel heap
+        // tore through whoever owns this page" so the surfacing is doubly
+        // useful.
+        @import("../debug/kdbg.zig").attributeHeapCorruptor(addr);
         // Release before @panic: Zig's @panic does not unwind, so the
         // outer `defer lock.releaseIrqRestore` would never run and the
         // lock-dump autopsy reports heap.lock as held. Cosmetic (kernel
@@ -524,6 +562,10 @@ pub fn kfree(ptr: [*]u8) void {
         const tail_ptr: *align(1) const u32 = @ptrFromInt(tail_addr);
         if (tail_ptr.* != CANARY_TAIL) {
             serial.print("\n!!! HEAP CORRUPTION: tail canary at 0x{X:0>16}: got 0x{X:0>8} want 0x{X:0>8} (user_size={d} block=0x{X:0>16})\n", .{ tail_addr, tail_ptr.*, CANARY_TAIL, user_size, block_addr });
+            // Auto-bisect: surface the most-recent alloc/free for this frame
+            // and a window-event count, so the human sees the strongest
+            // culprit immediately rather than greping the rings by hand.
+            @import("../debug/kdbg.zig").attributeHeapCorruptor(tail_addr);
             // Release before @panic — same reason as the no-header path.
             lock.releaseIrqRestore(irq_flags);
             @panic("tlsf: buffer overflow — tail canary corrupted");
@@ -591,7 +633,8 @@ fn recomputeLargestFreeBlock() void {
             j -= 1;
             if ((sl_bitmaps[i] & (@as(u16, 1) << @intCast(j))) == 0) continue;
             var p = free_lists[i][j];
-            while (p) |addr| {
+            while (p != 0) {
+                const addr = p;
                 const sz = blockSize(addr);
                 if (sz > best) best = sz;
                 p = nextFreePtr(addr).*;
@@ -723,6 +766,117 @@ fn validateInvariantsLocked() bool {
     const total = walked_free_bytes + walked_alloc_bytes;
     if (total != HEAP_SIZE) {
         serial.print("[tlsf] inv: walked free+alloc={d} but heap size is {d}\n", .{ total, HEAP_SIZE });
+        ok = false;
+    }
+    return ok;
+}
+
+/// Walk every populated `free_lists[fl][sl]` doubly-linked list and verify:
+///   1. each link points inside the heap
+///   2. each block has THIS_FREE set (i.e. the block IS actually free)
+///   3. `mapping(blockSize(p)) == (fl, sl)` (block is in the correct bucket)
+///   4. `prevFreePtr(head) == 0` (head's prev link is null sentinel)
+///   5. `prevFreePtr(next) == current` (back-link symmetry through the chain)
+///   6. fl_bitmap/sl_bitmaps[fl] bits are consistent with free_lists[fl][sl]
+///      (`bit set ⇔ head != 0`)
+///   7. total visited free blocks equals `free_block_count` (no orphans, no
+///      cycles — guarded by a max-iteration ceiling).
+///
+/// Catches the class of bug where freelist link metadata is corrupted by an
+/// out-of-bounds write, type-width regression (the 2026-05-28 `?usize` overlap
+/// bug would have failed step 1 — `nextFreePtr` would have loaded a non-heap
+/// pointer immediately after the first conflicting insert), or coalesce path
+/// that forgets to detach a neighbour before merging.
+///
+/// Returns true if all invariants hold. Bounded O(free_blocks) — same cost as
+/// `recomputeLargestFreeBlock`. Holds the heap lock — safe from anywhere
+/// outside the heap's own internal critical sections.
+pub fn validateFreelists() bool {
+    if (!initialized) return true;
+    const irq_flags = lock.acquireIrqSave();
+    defer lock.releaseIrqRestore(irq_flags);
+    return validateFreelistsLocked();
+}
+
+fn validateFreelistsLocked() bool {
+    var ok = true;
+    var visited: u32 = 0;
+    // Outer iteration cap: free_block_count is the authoritative-by-design
+    // count, but the bug we're trying to catch is "counter lies". Cap at
+    // free_block_count + a slack of 16 so a small overshoot still completes
+    // and reports the issue rather than spinning.
+    const max_visit: u32 = free_block_count + 16;
+
+    var fl: usize = 0;
+    while (fl < FL_INDEX_COUNT) : (fl += 1) {
+        const fl_set = (fl_bitmap & (@as(u32, 1) << @intCast(fl))) != 0;
+        const sl_word = sl_bitmaps[fl];
+        // Invariant: fl_bitmap bit is set iff sl_bitmaps[fl] != 0.
+        if (fl_set != (sl_word != 0)) {
+            serial.print("[tlsf] fl-inv: fl_bitmap[{d}]={any} but sl_bitmaps[{d}]=0x{X}\n", .{ fl, fl_set, fl, sl_word });
+            ok = false;
+        }
+        var sl: usize = 0;
+        while (sl < SL_INDEX_COUNT) : (sl += 1) {
+            const sl_set = (sl_word & (@as(u16, 1) << @intCast(sl))) != 0;
+            const head = free_lists[fl][sl];
+            // Invariant: sl_bitmaps[fl] bit j set iff free_lists[fl][j] != 0.
+            if (sl_set != (head != 0)) {
+                serial.print("[tlsf] fl-inv: sl_bitmaps[{d}][{d}]={any} but head=0x{X}\n", .{ fl, sl, sl_set, head });
+                ok = false;
+                continue;
+            }
+            if (head == 0) continue;
+
+            // Walk this bucket's freelist.
+            var prev: usize = 0;
+            var cur: usize = head;
+            while (cur != 0) {
+                visited += 1;
+                if (visited > max_visit) {
+                    serial.print("[tlsf] fl-inv: bucket [{d}][{d}] over visit cap (cycle? count={d})\n", .{ fl, sl, free_block_count });
+                    return false;
+                }
+                // Bounds.
+                if (cur < HEAP_START or cur >= HEAP_START + HEAP_SIZE) {
+                    serial.print("[tlsf] fl-inv: bucket [{d}][{d}] block 0x{X} out of heap\n", .{ fl, sl, cur });
+                    return false;
+                }
+                // Alignment.
+                if ((cur & BLOCK_ALIGN_MASK) != 0) {
+                    serial.print("[tlsf] fl-inv: bucket [{d}][{d}] block 0x{X} misaligned\n", .{ fl, sl, cur });
+                    ok = false;
+                }
+                // THIS_FREE must be set.
+                if (!blockIsFree(cur)) {
+                    serial.print("[tlsf] fl-inv: bucket [{d}][{d}] block 0x{X} on freelist but THIS_FREE clear\n", .{ fl, sl, cur });
+                    ok = false;
+                }
+                // Bucket-membership.
+                const sz = blockSize(cur);
+                if (sz < MIN_BLOCK_SIZE or sz > HEAP_SIZE) {
+                    serial.print("[tlsf] fl-inv: bucket [{d}][{d}] block 0x{X} bad size {d}\n", .{ fl, sl, cur, sz });
+                    return false;
+                }
+                const want = mapping(sz);
+                if (want.fl != fl or want.sl != sl) {
+                    serial.print("[tlsf] fl-inv: block 0x{X} sz={d} mapped to [{d}][{d}] but is in [{d}][{d}]\n", .{ cur, sz, want.fl, want.sl, fl, sl });
+                    ok = false;
+                }
+                // Back-link symmetry.
+                const cur_prev = prevFreePtr(cur).*;
+                if (cur_prev != prev) {
+                    serial.print("[tlsf] fl-inv: block 0x{X} prev_free=0x{X} but list-prev=0x{X}\n", .{ cur, cur_prev, prev });
+                    ok = false;
+                }
+                prev = cur;
+                cur = nextFreePtr(cur).*;
+            }
+        }
+    }
+
+    if (visited != free_block_count) {
+        serial.print("[tlsf] fl-inv: walked {d} blocks across all freelists but counter says {d}\n", .{ visited, free_block_count });
         ok = false;
     }
     return ok;

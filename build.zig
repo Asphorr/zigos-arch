@@ -475,6 +475,25 @@ pub fn build(b: *std.Build) void {
     doom_real.root_module.addIncludePath(b.path("doom_src"));
     b.installArtifact(doom_real);
 
+    // --- ABI oracle header (P6) ---
+    // Run tools/gen_abi_header.zig to emit zig-out/abi/zigos_app_exports.h
+    // with one C prototype per Zig export listed in the generator. Force-
+    // include the header into the Quake C TUs below so missing/wrong
+    // prototypes can never silently mis-decode return registers — fixing
+    // the bug class that hid the 2026-05-21 Q_atof regression.
+    const abi_gen = b.addExecutable(.{
+        .name = "gen_abi_header",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/gen_abi_header.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    const run_abi_gen = b.addRunArtifact(abi_gen);
+    const abi_header_file = run_abi_gen.addOutputFileArg("zigos_app_exports.h");
+    const abi_install = b.addInstallFileWithDir(abi_header_file, .{ .custom = "abi" }, "zigos_app_exports.h");
+    b.getInstallStep().dependOn(&abi_install.step);
+
     // --- Quake 1 (real engine via vendored id WinQuake 1999 source) ---
     const quake1 = b.addExecutable(.{
         .name = "quake1.elf",

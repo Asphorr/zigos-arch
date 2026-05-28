@@ -1689,3 +1689,110 @@ pub fn tryReclaim(needed: u32) u32 {
     }
     return freed;
 }
+
+/// Walk every region's per-order freelist and verify:
+///   1. Each Run idx in [0, RUN_POOL_SIZE) — bounded index, no UB on lookup.
+///   2. Run.start_frame falls inside this region's frame range.
+///   3. start_frame + count <= region.end (no spill across region boundary).
+///   4. count > 0.
+///   5. order = orderForSize(count) matches the bucket the run is filed under.
+///   6. Bitmap shows start_frame and (start_frame + count - 1) as FREE
+///      (i.e. clear in `bitmap[]`). Sampling endpoints, not every frame —
+///      a full bit-scan would be O(MAX_FRAMES) per run.
+///   7. Each region's freelist length doesn't exceed RUN_POOL_SIZE (cycle
+///      / corrupted-next guard).
+/// Also walks `run_pool_freelist` (the chain of FREE Run nodes, separate
+/// from per-region runs) and bounds its length.
+///
+/// Catches: per-order freelist corruption (Run.next stomp), region/bitmap
+/// drift (bitmap says allocated but a run claims it free), and pool-freelist
+/// cycles. Bounded O(total_runs). Does NOT detect orphaned Runs (Run not on
+/// any freelist) — that would need a visited-bitmap and is left for later.
+///
+/// Returns true if all invariants hold. Each region's lock is acquired
+/// briefly per-walk; safe from any non-critical-section caller.
+pub fn validateRunPool() bool {
+    const serial = @import("../debug/serial.zig");
+    var ok = true;
+
+    // Walk the free-Run-node chain. Cap at RUN_POOL_SIZE+1 so a cycle is
+    // reported, not infinite-looped.
+    {
+        run_pool_lock.acquire();
+        defer run_pool_lock.release();
+        var seen: u32 = 0;
+        var cur = run_pool_freelist;
+        while (cur != NULL_RUN) {
+            if (cur >= RUN_POOL_SIZE) {
+                serial.print("[pmm] run-inv: pool freelist has out-of-range idx={d}\n", .{cur});
+                return false;
+            }
+            seen += 1;
+            if (seen > RUN_POOL_SIZE) {
+                serial.print("[pmm] run-inv: pool freelist cycle (seen > {d})\n", .{RUN_POOL_SIZE});
+                return false;
+            }
+            cur = run_pool[cur].next;
+        }
+    }
+
+    // Walk every region's per-order freelists.
+    var region_idx: u32 = 0;
+    while (region_idx < REGIONS_COUNT) : (region_idx += 1) {
+        const r = &regions[region_idx];
+        const region_start = regionStartFrame(region_idx);
+        const region_end = region_start + REGION_FRAMES;
+
+        r.lock.acquire();
+        defer r.lock.release();
+
+        var order: u5 = 0;
+        while (order <= MAX_ORDER) : (order += 1) {
+            var visited: u32 = 0;
+            var cur = r.freelist_heads[order];
+            while (cur != NULL_RUN) {
+                visited += 1;
+                if (visited > RUN_POOL_SIZE) {
+                    serial.print("[pmm] run-inv: region {d} order {d} cycle (>{d} visits)\n", .{ region_idx, order, RUN_POOL_SIZE });
+                    return false;
+                }
+                if (cur >= RUN_POOL_SIZE) {
+                    serial.print("[pmm] run-inv: region {d} order {d} out-of-range idx={d}\n", .{ region_idx, order, cur });
+                    return false;
+                }
+                const run = run_pool[cur];
+                if (run.count == 0) {
+                    serial.print("[pmm] run-inv: region {d} order {d} idx={d} zero count\n", .{ region_idx, order, cur });
+                    ok = false;
+                }
+                if (run.start_frame < region_start or run.start_frame >= region_end) {
+                    serial.print("[pmm] run-inv: region {d} run {d}.start={d} outside region [{d},{d})\n", .{ region_idx, cur, run.start_frame, region_start, region_end });
+                    ok = false;
+                }
+                if (run.start_frame + run.count > region_end) {
+                    serial.print("[pmm] run-inv: region {d} run {d} [{d},{d}) spills past region end {d}\n", .{ region_idx, cur, run.start_frame, run.start_frame + run.count, region_end });
+                    ok = false;
+                }
+                if (run.count > 0 and orderForSize(run.count) != order) {
+                    serial.print("[pmm] run-inv: region {d} run idx={d} count={d} order={d} but should be order={d}\n", .{ region_idx, cur, run.count, order, orderForSize(run.count) });
+                    ok = false;
+                }
+                // Spot-check bitmap: first + last frame of run must be clear
+                // (i.e. free). Skip when count==0 (already flagged).
+                if (run.count > 0 and run.start_frame < region_end) {
+                    if (testBit(run.start_frame)) {
+                        serial.print("[pmm] run-inv: region {d} run {d} start_frame={d} bitmap says ALLOC\n", .{ region_idx, cur, run.start_frame });
+                        ok = false;
+                    }
+                    const last = run.start_frame + run.count - 1;
+                    if (last < region_end and testBit(last)) {
+                        serial.print("[pmm] run-inv: region {d} run {d} last_frame={d} bitmap says ALLOC\n", .{ region_idx, cur, last });
+                        ok = false;
+                    }
+                }
+                cur = run.next;
+            }
+        }
+    }
+    return ok;
+}

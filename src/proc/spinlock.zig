@@ -400,6 +400,35 @@ pub fn registerMutex(name: []const u8, lock: *Mutex) void {
     named_lock_count += 1;
 }
 
+/// Walk registered SpinLocks; emit one [smi-cause] line per currently-held
+/// lock whose acquire_tsc indicates it has been held for at least
+/// `threshold_ticks` TSC ticks (now − acquire_tsc ≥ threshold_ticks).
+/// Mutexes are intentionally skipped — they sleep, so a long-held mutex
+/// does not hold cli and cannot cause an SMI-style stall. Cheap O(N) over
+/// MAX_NAMED_LOCKS (=32) — safe to call from smi.tick().
+pub fn dumpHeldLocksOlderThan(now_tsc: u64, threshold_ticks: u64) void {
+    const serial = @import("../debug/serial.zig");
+    const symbols = @import("../debug/symbols.zig");
+    var i: u8 = 0;
+    while (i < named_lock_count) : (i += 1) {
+        const ent = &named_locks[i];
+        if (ent.ptr == 0 or ent.kind != .spin) continue;
+        const lock: *SpinLock = @ptrFromInt(ent.ptr);
+        const cpu = @atomicLoad(u8, &lock.holder_cpu, .acquire);
+        if (cpu == 0xFF) continue;
+        const ts = @atomicLoad(u64, &lock.acquire_tsc, .acquire);
+        if (ts == 0 or now_tsc <= ts) continue;
+        const held = now_tsc - ts;
+        if (held < threshold_ticks) continue;
+        serial.print("[smi-cause]   {s}: HELD by cpu{d} for {d} tsc ra=", .{ ent.name, cpu, held });
+        if (symbols.resolveKernel(lock.holder_ra)) |r| {
+            serial.print("{s}+0x{X}\n", .{ r.name, r.offset });
+        } else {
+            serial.print("0x{X}\n", .{lock.holder_ra});
+        }
+    }
+}
+
 /// Dump every registered lock's state: SpinLocks print holder cpu +
 /// ticket distance, Mutexes print holder pid. Both symbol-resolve the
 /// last acquire site. Called from the panic / watchdog autopsy AFTER

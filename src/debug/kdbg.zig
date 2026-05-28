@@ -585,6 +585,113 @@ pub fn findFrame(phys: u64) void {
     if (!found) serial.print("  (no provenance — frame not in alloc/free rings)\n", .{});
 }
 
+// === Heap corruption auto-bisect ===========================================
+//
+// On a heap canary fire (kfree's tail-canary mismatch, validateHeap's
+// header/footer disagreement, or any other "this byte should not have
+// been written"), call attributeHeapCorruptor with the virtual address
+// of the corrupted byte. The function:
+//
+//   1. Resolves virt → phys via paging.virtToPhys.
+//   2. Looks up pmmFindLastAlloc(phys): who currently OWNS this frame.
+//   3. Looks up pmmFindLastFree(phys): who LAST released this frame.
+//   4. Computes which of the two is more recent and infers verdict:
+//        - alloc more recent than free  → buffer overflow into a live alloc
+//        - free  more recent than alloc → use-after-free (frame was returned
+//          to PMM after the kernel-heap region was released, dangling write)
+//   5. Walks irq_ring/sched_ring for the time-window between the relevant
+//      anchor (most recent alloc/free) and now, surfacing the count of
+//      events so the human sees how busy the window was — a small count
+//      means a tight blast radius.
+//
+// Output is one "[autopsy] strongest culprit" line plus sub-lines for
+// each contributor. The detector path is already inside a panic context;
+// printing here adds noise to an already-loud log but turns a 5-min ring
+// grep into one glance. Proposal P5 in the debug infra survey 2026-05-28.
+
+pub fn attributeHeapCorruptor(bad_virt: u64) void {
+    const paging = @import("../mm/paging.zig");
+    serial.print("[autopsy] heap-corruptor bisect for virt=0x{X:0>16}\n", .{bad_virt});
+
+    const phys_opt = paging.virtToPhys(bad_virt);
+    if (phys_opt == null) {
+        serial.print("[autopsy]   virt not mapped — no phys to query rings with\n", .{});
+        return;
+    }
+    const phys = phys_opt.?;
+    serial.print("[autopsy]   phys=0x{X:0>16}\n", .{phys});
+
+    const last_alloc = pmmFindLastAlloc(phys);
+    const last_free = pmmFindLastFree(phys);
+
+    if (last_alloc == null and last_free == null) {
+        serial.print("[autopsy]   no alloc/free events for this frame in {d}/{d}-entry rings\n", .{ pmm_alloc_ring.count(), pmm_free_ring.count() });
+        return;
+    }
+
+    if (last_alloc) |a| {
+        serial.print("[autopsy]   last_alloc: tsc=0x{X:0>12} phys=0x{X}+{d}p caller=", .{ a.tsc, a.phys, a.count });
+        printSym(a.caller_ra);
+        serial.print("\n", .{});
+    } else {
+        serial.print("[autopsy]   last_alloc: (none in ring — frame allocated before ring wrap)\n", .{});
+    }
+    if (last_free) |f| {
+        serial.print("[autopsy]   last_free:  tsc=0x{X:0>12} phys=0x{X} caller=", .{ f.tsc, f.phys });
+        printSym(f.caller_ra);
+        serial.print("\n", .{});
+    } else {
+        serial.print("[autopsy]   last_free:  (none — frame still held since alloc)\n", .{});
+    }
+
+    // Verdict + window scan.
+    if (last_alloc != null and last_free != null) {
+        const a = last_alloc.?;
+        const f = last_free.?;
+        if (a.tsc >= f.tsc) {
+            // Most recent owner is the current alloc; the free was an
+            // earlier life of this frame. Likely buffer overflow inside
+            // the current alloc — its caller_ra is the suspect window.
+            const age = a.tsc;
+            serial.print("[autopsy]   verdict: BUFFER OVERFLOW into LIVE alloc (alloc tsc 0x{X:0>12} > prior free tsc 0x{X:0>12})\n", .{ a.tsc, f.tsc });
+            describeWindow(age);
+        } else {
+            // Free is more recent → use-after-free. The freer's caller_ra
+            // is where the frame was returned to PMM, and the corruption
+            // must have come from a writer holding a stale pointer.
+            serial.print("[autopsy]   verdict: USE-AFTER-FREE (free tsc 0x{X:0>12} > alloc tsc 0x{X:0>12}) — page returned to PMM after release\n", .{ f.tsc, a.tsc });
+            describeWindow(f.tsc);
+        }
+    } else if (last_alloc) |a| {
+        serial.print("[autopsy]   verdict: corruption INSIDE first-and-only alloc (no prior free) — overflow/UAF from caller above\n", .{});
+        describeWindow(a.tsc);
+    } else if (last_free) |f| {
+        serial.print("[autopsy]   verdict: write to a freed frame (no alloc in ring) — stale-pointer writer\n", .{});
+        describeWindow(f.tsc);
+    }
+}
+
+/// Tally the number of irq_ring/sched_ring events with tsc >= anchor_tsc
+/// — gives a sense of how busy the window-since-anchor was. A small count
+/// (1-10) means a tight blast radius; thousands means the corruption was
+/// in flight for a long time and the per-event RIP walk-back would be the
+/// next manual step.
+fn describeWindow(anchor_tsc: u64) void {
+    var irq_in_window: usize = 0;
+    const irq_n = irq_ring.count();
+    var i: usize = 0;
+    while (i < irq_n) : (i += 1) {
+        if (irq_ring.at(i).tsc >= anchor_tsc) irq_in_window += 1;
+    }
+    var sched_in_window: usize = 0;
+    const sched_n = sched_ring.count();
+    i = 0;
+    while (i < sched_n) : (i += 1) {
+        if (sched_ring.at(i).tsc >= anchor_tsc) sched_in_window += 1;
+    }
+    serial.print("[autopsy]   window-since-anchor: {d} irq events, {d} sched events\n", .{ irq_in_window, sched_in_window });
+}
+
 // === Cross-CPU snapshot ====================================================
 //
 // Walks smp.cpus[] and prints each live CPU's "what process do you think

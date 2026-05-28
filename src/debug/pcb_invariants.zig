@@ -223,6 +223,18 @@ fn checkPcb(pid: usize) ?[]const u8 {
     return null;
 }
 
+/// Trip the one-shot reported latch and halt with a structural-data
+/// violation panic. Shared exit-path for heap / pmm / pipe / fdpoll
+/// validator failures so the autopsy stays uniform.
+fn structuralFail(kind: []const u8) noreturn {
+    @atomicStore(bool, &reported, true, .release);
+    serial.print("[pcb-invariant] STRUCTURAL FAIL: {s}\n", .{kind});
+    serial.print("[pcb-invariant]   (look above for [tlsf]/[pmm]/[pipe] inv detail)\n", .{});
+    @import("breadcrumb.zig").dump();
+    @import("kdbg.zig").nmi_halt_after_snapshot = true;
+    @panic("structural data-structure invariant violated");
+}
+
 /// Walk every alive PCB. On the first invariant miss, klog + panic.
 /// Cheap: ~64 reads/PCB × MAX_PROCS = ~2K loads. Safe to call from inside
 /// handleIRQ0 (cli is held). Returns the count of violations found (0 on
@@ -233,6 +245,22 @@ pub fn scan() void {
     // microseconds; lifecycle is decoupled from PCB scan but the cadence
     // is the same so we piggyback rather than wiring a second timer.
     _ = @import("cpu_struct_hash.zig").verify();
+
+    // Structural data-structure walks: kernel heap counters + freelists,
+    // PMM per-region run pool, pipe ring invariants. All are bounded
+    // O(in-use entries) and lock-aware. Wired into the tick path 2026-05-28
+    // so that the 4-day silent-overlap class (?usize freelist corruption)
+    // surfaces seconds after the regression instead of waiting for the
+    // next downstream #PF in removeFreeBlock. (Proposal P3 in the debug
+    // infra survey 2026-05-28.) Each returns true on pass; on first false
+    // we panic via the shared structuralFail path — the validators have
+    // already logged the offending detail line to serial.
+    const heap = @import("../mm/heap.zig");
+    if (!heap.validateInvariants()) structuralFail("heap.validateInvariants");
+    if (!heap.validateFreelists()) structuralFail("heap.validateFreelists");
+    if (!@import("../mm/pmm.zig").validateRunPool()) structuralFail("pmm.validateRunPool");
+    if (!@import("../proc/pipe.zig").validate()) structuralFail("pipe.validate");
+
     for (0..config.MAX_PROCS) |pid| {
         const failure = checkPcb(pid) orelse continue;
         // Latch the one-shot flag so subsequent ticks don't re-fire.

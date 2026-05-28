@@ -83,6 +83,27 @@ pub fn tick() void {
     // Rate limit: log at most once per second (every 100 BSP IRQ0s).
     if (sample_count - last_log_tick < 100) return;
     last_log_tick = sample_count;
+
+    // Lock-attribution: walk registered SpinLocks for any whose acquire_tsc
+    // shows it has been held for >5ms. Emits one [smi-cause] line per such
+    // lock ABOVE the main [smi] classifier line, so a "blame the host"
+    // verdict can be immediately checked against actual cli-held locks.
+    // Directly answers user memory feedback: "[smi] stall can be us — check
+    // pid_act / slow-sc / yield-loop first" — now the lock dump joins
+    // those signals at fire time, not after the fact. (Proposal P4 in the
+    // debug infra survey 2026-05-28.)
+    const tsc_per_quantum = apic.tscPerQuantum();
+    if (tsc_per_quantum > 0) {
+        const now_tsc: u64 = asm volatile (
+            \\ rdtsc
+            \\ shlq $32, %%rdx
+            \\ orq %%rdx, %%rax
+            : [r] "={rax}" (-> u64),
+            :: .{ .rdx = true });
+        // 5ms = half of the 10ms LAPIC quantum.
+        @import("../proc/spinlock.zig").dumpHeldLocksOlderThan(now_tsc, tsc_per_quantum / 2);
+    }
+
     // Attribution: snapshot what cpu0 was doing at the PREVIOUS IRQ0 boundary.
     // exectrail's head-1 holds that saved_rip because handleIRQ0 calls smi.tick()
     // BEFORE exectrail.recordIrq() (see src/cpu/idt.zig:1232 vs :1258).
