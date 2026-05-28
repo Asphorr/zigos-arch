@@ -557,11 +557,17 @@ pub fn build(b: *std.Build) void {
     quake1.root_module.addIncludePath(b.path("quake_src"));
     b.installArtifact(quake1);
 
-    // --- STB_IMAGE BINDINGS (shared by photo.elf, wallpaper.elf, settings.elf) ---
-    // First Zig 0.16 addTranslateC user: vendor/photo_lib.h is a tiny C
-    // header declaring the public stb_image API surface; translate-c
-    // produces a Zig module from it. The implementation lives in
-    // vendor/photo_lib.c which gets re-compiled per app via addCSourceFile.
+    // --- STB_IMAGE — promoted to lib/image.zig 2026-05-28 ---
+    //
+    // Was: per-app translate-c + addCSourceFile + addIncludePath repeated
+    // for each consumer (photo, settings, wallpaper).
+    // Now: one static library bundles vendor/photo_lib.c + lib/stb_shims.zig
+    // exports; one Zig module (lib/image.zig) provides the idiomatic
+    // Pixel/decode API on top of the translate-c'd C surface. Consumers
+    // need two lines: addImport("image", image_mod) + linkLibrary(stb_lib).
+    //
+    // Foundation for the upcoming VN-engine port (DDLC needs PNG+JPG
+    // decode on the same shape as the photo viewer).
     const stb_tc = b.addTranslateC(.{
         .root_source_file = b.path("vendor/photo_lib.h"),
         .target = target,
@@ -570,22 +576,7 @@ pub fn build(b: *std.Build) void {
     });
     const stb_mod = stb_tc.createModule();
 
-    // libc shim re-exports (malloc/realloc/free/memset/memcpy/...) that
-    // stb_image's C code calls. Apps that link photo_lib.c need to pull
-    // these into their link unit.
-    const stb_shims_mod = b.createModule(.{
-        .root_source_file = b.path("lib/stb_shims.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "libc", .module = libc_mod },
-        },
-    });
-
-    // C-source wiring helper: every app importing `stb` needs to (a)
-    // compile vendor/photo_lib.c, (b) include vendor/, (c) include
-    // doom_src/include/ for the freestanding libc shim headers
-    // (stdlib.h, string.h, math.h — declarations only).
+    // C compile flags for the stb_image implementation TU.
     const stb_cflags = &[_][]const u8{
         "-fno-stack-protector",
         "-Wno-unused-but-set-variable",
@@ -595,9 +586,43 @@ pub fn build(b: *std.Build) void {
         "-DSTBI_NO_THREAD_LOCALS",
     };
 
-    // --- SETTINGS (uses stb_image for the wallpaper-picker thumbnail
-    //     decode; moved here so it can link against vendor/photo_lib.c
-    //     and import the translate-c stb module) ---
+    // Static library bundling the stb_image C impl + the Zig-side libc
+    // shims (malloc/realloc/free/memset/memcpy/memmove/memcmp/abs) that
+    // the C code calls. Linked once into each consumer; symbols pulled
+    // in on demand.
+    const stb_lib = b.addLibrary(.{
+        .linkage = .static,
+        .name = "stb_image",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("lib/stb_shims.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = false,
+            .imports = &.{
+                .{ .name = "libc", .module = libc_mod },
+            },
+        }),
+    });
+    stb_lib.root_module.addCSourceFile(.{
+        .file = b.path("vendor/photo_lib.c"),
+        .flags = stb_cflags,
+    });
+    stb_lib.root_module.addIncludePath(b.path("vendor"));
+    stb_lib.root_module.addSystemIncludePath(b.path("doom_src/include"));
+
+    // Consumer-facing wrapper module — `@import("image")` from any app.
+    // Imports the translate-c'd C surface internally; exposes Pixel +
+    // decode() and a `raw` escape hatch for the rare direct-C-API caller.
+    const image_mod = b.createModule(.{
+        .root_source_file = b.path("lib/image.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "stb", .module = stb_mod },
+        },
+    });
+
+    // --- SETTINGS (uses image.decode for wallpaper-picker thumbnails) ---
     const settings_exe = b.addExecutable(.{
         .name = "settings.elf",
         .root_module = b.createModule(.{
@@ -610,18 +635,12 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "font", .module = font_mod },
                 .{ .name = "ui", .module = ui_mod },
                 .{ .name = "font_atlas", .module = font_atlas_mod },
-                .{ .name = "stb", .module = stb_mod },
-                .{ .name = "stb_shims", .module = stb_shims_mod },
+                .{ .name = "image", .module = image_mod },
             },
         }),
     });
     settings_exe.setLinkerScript(b.path("app/linker.ld"));
-    settings_exe.root_module.addCSourceFile(.{
-        .file = b.path("vendor/photo_lib.c"),
-        .flags = stb_cflags,
-    });
-    settings_exe.root_module.addIncludePath(b.path("vendor"));
-    settings_exe.root_module.addSystemIncludePath(b.path("doom_src/include"));
+    settings_exe.linkLibrary(stb_lib);
     b.installArtifact(settings_exe);
 
     // --- PHOTO VIEWER ---
@@ -633,8 +652,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "libc", .module = libc_mod },
-                .{ .name = "stb", .module = stb_mod },
-                .{ .name = "stb_shims", .module = stb_shims_mod },
+                .{ .name = "image", .module = image_mod },
                 .{ .name = "graphics", .module = graphics_mod },
                 .{ .name = "ui", .module = ui_mod },
                 .{ .name = "font_atlas", .module = font_atlas_mod },
@@ -642,12 +660,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     photo.setLinkerScript(b.path("app/linker.ld"));
-    photo.root_module.addCSourceFile(.{
-        .file = b.path("vendor/photo_lib.c"),
-        .flags = stb_cflags,
-    });
-    photo.root_module.addIncludePath(b.path("vendor"));
-    photo.root_module.addSystemIncludePath(b.path("doom_src/include"));
+    photo.linkLibrary(stb_lib);
     b.installArtifact(photo);
 
     // --- WALLPAPER (one-shot boot helper) ---
@@ -659,18 +672,12 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "libc", .module = libc_mod },
-                .{ .name = "stb", .module = stb_mod },
-                .{ .name = "stb_shims", .module = stb_shims_mod },
+                .{ .name = "image", .module = image_mod },
             },
         }),
     });
     wallpaper.setLinkerScript(b.path("app/linker.ld"));
-    wallpaper.root_module.addCSourceFile(.{
-        .file = b.path("vendor/photo_lib.c"),
-        .flags = stb_cflags,
-    });
-    wallpaper.root_module.addIncludePath(b.path("vendor"));
-    wallpaper.root_module.addSystemIncludePath(b.path("doom_src/include"));
+    wallpaper.linkLibrary(stb_lib);
     b.installArtifact(wallpaper);
 
     // --- GPU TEST APP ---

@@ -6,10 +6,7 @@
 // Pass `--clear` to skip decoding and just clear any installed wallpaper.
 
 const libc = @import("libc");
-const stb = @import("stb");
-comptime {
-    _ = @import("stb_shims");
-}
+const image = @import("image");
 
 const CONF_PATH = "/etc/zigos.conf";
 const CONF_KEY = "wallpaper";
@@ -84,39 +81,24 @@ fn decodeAndPush(path: []const u8) bool {
     const file_data = readEntireFile(path, 16 * 1024 * 1024) orelse return false;
     defer libc.free(file_data.ptr);
 
-    var iw: c_int = 0;
-    var ih: c_int = 0;
-    var ich: c_int = 0;
-    const pixels_opt = stb.stbi_load_from_memory(
-        file_data.ptr,
-        @intCast(file_data.len),
-        &iw,
-        &ih,
-        &ich,
-        4,
-    );
-    if (pixels_opt == null or iw <= 0 or ih <= 0) return false;
-    const pixels = pixels_opt.?;
-    const w: u32 = @intCast(iw);
-    const h: u32 = @intCast(ih);
+    const img = image.decode(file_data, 4) catch return false;
+    defer img.deinit();
+    if (img.width == 0 or img.height == 0) return false;
 
     // Repack stb's RGBA bytes into FB-native B8G8R8A8 packed u32 in place.
     // Doing it in-place avoids a second N-MB allocation; we treat the
     // returned [*]u8 buffer as N u32 entries.
-    const total: usize = @as(usize, w) * @as(usize, h);
-    const dst_u32: [*]u32 = @ptrCast(@alignCast(pixels));
+    const total: usize = @as(usize, img.width) * @as(usize, img.height);
+    const dst_u32: [*]u32 = @ptrCast(@alignCast(img.pixels.ptr));
     var i: usize = 0;
     while (i < total) : (i += 1) {
-        const r: u32 = pixels[i * 4 + 0];
-        const g: u32 = pixels[i * 4 + 1];
-        const b: u32 = pixels[i * 4 + 2];
+        const r: u32 = img.pixels[i * 4 + 0];
+        const g: u32 = img.pixels[i * 4 + 1];
+        const b: u32 = img.pixels[i * 4 + 2];
         dst_u32[i] = (r << 16) | (g << 8) | b;
     }
 
-    const ok = libc.setWallpaper(dst_u32, w, h);
-    // stbi_image_free is just free() because we routed STBI_FREE → free.
-    libc.free(@as([*]u8, @ptrCast(pixels)));
-    return ok;
+    return libc.setWallpaper(dst_u32, img.width, img.height);
 }
 
 export fn _start() linksection(".text.entry") callconv(.c) void {

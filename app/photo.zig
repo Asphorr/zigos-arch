@@ -11,10 +11,7 @@ const libc = @import("libc");
 const gfx = @import("graphics");
 const ui = @import("ui");
 const fa = @import("font_atlas");
-const stb = @import("stb");
-comptime {
-    _ = @import("stb_shims");
-}
+const image = @import("image");
 
 // --- Layout ---
 const TOOLBAR_H: u32 = 36;
@@ -196,7 +193,7 @@ fn cachePickSlot() u32 {
     }
     // Evict — free the pixels we're about to overwrite.
     if (cache[best].pixels) |p| {
-        stb.stbi_image_free(p);
+        image.raw.stbi_image_free(p);
         cache[best].pixels = null;
     }
     return best;
@@ -260,19 +257,21 @@ fn loadCurrentImage() bool {
     const full = path_buf[0 .. dir_len + name.len];
 
     const file_data = readEntireFile(full) orelse return false;
-    var iw: c_int = 0;
-    var ih: c_int = 0;
-    var ich: c_int = 0;
-    const px = stb.stbi_load_from_memory(file_data.ptr, @intCast(file_data.len), &iw, &ih, &ich, 4);
-    // file_data lives in the reusable file_buf — no free here.
-    if (px == null or iw <= 0 or ih <= 0) return false;
+    const img = image.decode(file_data, 4) catch return false;
+    // file_data lives in the reusable file_buf — no free here. img.pixels
+    // is the stb-allocated buffer; cache stores the raw pointer + dims and
+    // frees via image.raw.stbi_image_free on eviction.
+    if (img.width == 0 or img.height == 0) {
+        img.deinit();
+        return false;
+    }
 
     const slot = cachePickSlot();
     @memcpy(cache[slot].name_buf[0..name.len], name);
     cache[slot].name_len = @intCast(name.len);
-    cache[slot].pixels = px;
-    cache[slot].w = @intCast(iw);
-    cache[slot].h = @intCast(ih);
+    cache[slot].pixels = img.pixels.ptr;
+    cache[slot].w = @intCast(img.width);
+    cache[slot].h = @intCast(img.height);
     cacheBump(slot);
     current_cache = @intCast(slot);
     return true;
@@ -284,7 +283,7 @@ fn freeAllCaches() void {
     var i: u32 = 0;
     while (i < CACHE_SIZE) : (i += 1) {
         if (cache[i].pixels) |p| {
-            stb.stbi_image_free(p);
+            image.raw.stbi_image_free(p);
             cache[i].pixels = null;
         }
         cache[i].stamp = 0;

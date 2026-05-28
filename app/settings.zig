@@ -2,10 +2,7 @@ const libc = @import("libc");
 const gfx = @import("graphics");
 const ui = @import("ui");
 const fa = @import("font_atlas");
-const stb = @import("stb");
-comptime {
-    _ = @import("stb_shims");
-}
+const image = @import("image");
 
 const BG: u32 = 0x1E1E2E;
 const SECTION_COLOR: u32 = 0x8888CC;
@@ -368,14 +365,13 @@ fn decodeThumb(dir: []const u8, name: []const u8) DecodedThumb {
         total += got;
     }
 
-    // stb decode → full-res RGBA.
-    var iw: c_int = 0;
-    var ih: c_int = 0;
-    var ich: c_int = 0;
-    const px = stb.stbi_load_from_memory(file_buf, @intCast(total), &iw, &ih, &ich, 4);
-    if (px == null or iw <= 0 or ih <= 0) return .{ .pixels = null, .w = 0, .h = 0 };
-    const src_w: u32 = @intCast(iw);
-    const src_h: u32 = @intCast(ih);
+    // Decode → full-res RGBA via the idiomatic image wrapper.
+    const img = image.decode(file_buf[0..total], 4) catch return .{ .pixels = null, .w = 0, .h = 0 };
+    defer img.deinit();
+    if (img.width == 0 or img.height == 0) return .{ .pixels = null, .w = 0, .h = 0 };
+    const src_w: u32 = img.width;
+    const src_h: u32 = img.height;
+    const px = img.pixels.ptr;
 
     // Scale-down to thumb dimensions while preserving aspect.
     const max_w: u32 = ui.ImagePicker.thumb_w;
@@ -394,10 +390,7 @@ fn decodeThumb(dir: []const u8, name: []const u8) DecodedThumb {
 
     const dst_size: usize = @as(usize, dst_w) * @as(usize, dst_h) * 4;
     const dst_opt = libc.malloc(dst_size);
-    if (dst_opt == null) {
-        stb.stbi_image_free(px);
-        return .{ .pixels = null, .w = 0, .h = 0 };
-    }
+    if (dst_opt == null) return .{ .pixels = null, .w = 0, .h = 0 };
     const dst = dst_opt.?;
     var y: u32 = 0;
     while (y < dst_h) : (y += 1) {
@@ -413,7 +406,6 @@ fn decodeThumb(dir: []const u8, name: []const u8) DecodedThumb {
             dst[drow + x * 4 + 3] = px[srow + sx * 4 + 3];
         }
     }
-    stb.stbi_image_free(px);
     return .{ .pixels = dst, .w = dst_w, .h = dst_h };
 }
 
