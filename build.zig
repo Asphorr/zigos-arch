@@ -812,6 +812,32 @@ pub fn build(b: *std.Build) void {
     wallpaper.linkLibrary(stb_lib);
     b.installArtifact(wallpaper);
 
+    // --- VN ENGINE (skeleton — assets / scripting iteratively land 2026-W22+) ---
+    //
+    // Standalone exec because the VN engine pulls in the asset/audio side
+    // (image + mixer + vorbis + truetype) that the standard gui_imports
+    // tuple intentionally doesn't carry. The current skeleton doesn't yet
+    // @import the audio/text libs, but the wiring is here so the next
+    // iteration can drop them in without touching build.zig.
+    const vn = b.addExecutable(.{
+        .name = "vn.elf",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("app/vn.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "libc", .module = libc_mod },
+                .{ .name = "graphics", .module = graphics_mod },
+                .{ .name = "ui", .module = ui_mod },
+                .{ .name = "font_atlas", .module = font_atlas_mod },
+                .{ .name = "image", .module = image_mod },
+            },
+        }),
+    });
+    vn.setLinkerScript(b.path("app/linker.ld"));
+    vn.linkLibrary(stb_lib);
+    b.installArtifact(vn);
+
     // --- GPU TEST APP ---
     const gpu_test = b.addExecutable(.{
         .name = "gpu_test.elf",
@@ -1068,7 +1094,7 @@ pub fn build(b: *std.Build) void {
         \\  cat.elf ls.elf wc.elf echo.elf grep.elf head.elf sleep.elf taskset.elf nice.elf yes.elf iretq_spin.elf \
         \\  ps.elf dmesg.elf mkdir.elf rmdir.elf rm.elf touch.elf shutdown.elf beep.elf \
         \\  sysmon.elf calc.elf settings.elf files.elf about.elf fastfetch.elf zigtop.elf sigil.elf tg.elf \
-        \\  paint.elf editor.elf doom.elf gpu_test.elf vulkan_triangle.elf \
+        \\  paint.elf editor.elf doom.elf vn.elf gpu_test.elf vulkan_triangle.elf \
         \\  venus_test.elf vulkan_cube.elf doom_real.elf \
         \\  mmaptest.elf threadtest.elf threadbrot.elf synctest.elf babel.elf forktest.elf daemontest.elf logd.elf photo.elf wallpaper.elf \
         \\  shmtest.elf iouringtest.elf redteam.elf
