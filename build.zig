@@ -956,7 +956,7 @@ pub fn build(b: *std.Build) void {
     const populate_disk = b.step("disk", "Create FAT32 disk.img with ELFs + KERNEL.SYM + doom1.wad");
     populate_disk.dependOn(&mkdisk.step);
 
-    // --- Create ext2 disk image (64 MB) via genext2fs ---
+    // --- Create ext2 disk image (512 MB) via genext2fs ---
     // No sudo, no losetup, no mkfs.ext2 — `genext2fs` creates a fully-formed
     // rev-1 ext2 image from a staging directory in one shot. Reproducible:
     // same staging tree → byte-identical image (modulo timestamps, which
@@ -1029,7 +1029,11 @@ pub fn build(b: *std.Build) void {
         \\dock_pos=0
         \\EOF
         \\
-        \\genext2fs -B 4096 -b 65536 -N 2048 -d $STAGE -q $IMG
+        \\# -B 4096 block size, -b 131072 blocks → 512 MB raw image. The on-disk
+        \\# file ends up sparse so unused capacity costs ~nothing. -N 8192 inode
+        \\# table covers DDLC's ~1500 small assets (442 PNG + 64 OGG + ~1000 misc)
+        \\# with headroom for system files.
+        \\genext2fs -B 4096 -b 131072 -N 8192 -d $STAGE -q $IMG
         \\echo "[ext2] rebuilt ($(du -h $IMG | cut -f1))"
         ,
     });
