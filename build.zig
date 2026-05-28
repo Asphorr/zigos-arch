@@ -622,6 +622,64 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // --- STB_TRUETYPE — vendored 2026-05-28 for the upcoming VN engine ---
+    //
+    // Same shape as stb_image above: translate-c'd slim C surface +
+    // static library bundling the impl + Zig wrapper module. Math
+    // overrides in vendor/text_lib.c keep us off libm (freestanding
+    // builds break on the @floor / @cos lowering — see
+    // [[zig-floor-freestanding-baseline]]).
+    const tt_tc = b.addTranslateC(.{
+        .root_source_file = b.path("vendor/text_lib.h"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = false,
+    });
+    const truetype_raw_mod = tt_tc.createModule();
+
+    const tt_cflags = &[_][]const u8{
+        "-fno-stack-protector",
+        "-Wno-unused-but-set-variable",
+        "-Wno-unused-variable",
+        "-Wno-unused-function",
+        "-Wno-shift-negative-value",
+    };
+
+    const truetype_lib = b.addLibrary(.{
+        .linkage = .static,
+        .name = "truetype",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("lib/stb_shims.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = false,
+            .imports = &.{
+                .{ .name = "libc", .module = libc_mod },
+            },
+        }),
+    });
+    truetype_lib.root_module.addCSourceFile(.{
+        .file = b.path("vendor/text_lib.c"),
+        .flags = tt_cflags,
+    });
+    truetype_lib.root_module.addIncludePath(b.path("vendor"));
+
+    const truetype_mod = b.createModule(.{
+        .root_source_file = b.path("lib/truetype.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "truetype_raw", .module = truetype_raw_mod },
+        },
+    });
+
+    // Force the static library to actually build even before the first
+    // consumer comes online — catches C compilation issues now rather
+    // than at first-use. The .a file gets installed but no app links it
+    // yet; remove this once the VN engine wires it up via linkLibrary.
+    b.installArtifact(truetype_lib);
+    _ = truetype_mod; // suppress unused-var; first VN-engine consumer will reference it
+
     // --- SETTINGS (uses image.decode for wallpaper-picker thumbnails) ---
     const settings_exe = b.addExecutable(.{
         .name = "settings.elf",

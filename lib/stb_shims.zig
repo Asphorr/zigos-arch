@@ -69,3 +69,12 @@ export fn memcmp(a: ?[*]const u8, b: ?[*]const u8, n: usize) c_int {
 export fn abs(x: c_int) c_int {
     return if (x < 0) -x else x;
 }
+
+export fn strlen(s: ?[*:0]const u8) usize {
+    if (s) |str| {
+        var n: usize = 0;
+        while (str[n] != 0) : (n += 1) {}
+        return n;
+    }
+    return 0;
+}
