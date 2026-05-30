@@ -813,7 +813,7 @@ fn verifyBuildId() void {
     var buf: [32]u8 align(4) = undefined;
     // Try ext2 root first (canonical post-migration), fall back to tarfs
     // so older images keep working during the transition.
-    const size = vfs.loadFile("/BUILD.ID", &buf) orelse vfs.loadFile("BUILD.ID", &buf) orelse {
+    const size = vfs.loadFile("/BUILD.ID", &buf, null) orelse vfs.loadFile("BUILD.ID", &buf, null) orelse {
         debug.klog("[buildid] WARNING: BUILD.ID missing from disk (kernel ID = {X:0>16})\n", .{expected});
         return;
     };

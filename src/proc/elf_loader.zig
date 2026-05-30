@@ -72,8 +72,19 @@ fn allocAndCopyElfBuf(staging: [*]const u8, file_size: usize) ?struct { buf: [*]
     return .{ .buf = buf, .pages = pages };
 }
 
-fn freePmmRange(base: usize, pages: u32) void {
-    pmm.freeContiguous(base, pages);
+fn freePmmRange(base_va: usize, pages: u32) void {
+    // Callers pass @intFromPtr(elf_buf) — a kernel physmap VA (elf_buf is the
+    // physToVirt of a PMM frame; see allocAndCopyElfBuf / vfs.loadFileFresh).
+    // freeContiguous speaks phys, so translate — exactly as lifecycle.freeElfBuf
+    // does. (Pre-3e this passed the VA straight through; only rare error paths
+    // ever hit it, so freeContiguous's bad-range reject silently leaked. Slice
+    // 3e's success-path elf_buf drop fires it on every DROPPED load and surfaced
+    // it: a [pmm] WARNING + ~1 MB leaked per exec.)
+    const phys = paging.virtToPhys(base_va) orelse {
+        debug.klog("[elf] freePmmRange: virtToPhys(0x{X:0>16}) failed — leaking {d} pages\n", .{ base_va, pages });
+        return;
+    };
+    pmm.freeContiguous(phys, pages);
 }
 
 /// Register a lazy region for a single PT_LOAD segment, sourced from elf_buf.
@@ -102,6 +113,88 @@ fn registerSegmentLazy(
     );
 }
 
+// ELF program-header flag bits.
+const PF_X: u32 = 0x1;
+const PF_W: u32 = 0x2;
+// PF_R = 0x4 — always set for loadable segments; PROT_READ has no PTE bit.
+
+/// Translate a PT_LOAD's p_flags into our PROT_* bitmask (always readable;
+/// writable iff PF_W; executable iff PF_X). Used for cache-shared segments so
+/// `cacheMapFlags` produces the right RO / RX / NX mapping.
+fn segProt(p_flags: u32) u8 {
+    var prot: u8 = process.PROT_READ;
+    if (p_flags & PF_W != 0) prot |= process.PROT_WRITE;
+    if (p_flags & PF_X != 0) prot |= process.PROT_EXEC;
+    return prot;
+}
+
+/// Register every PT_LOAD segment's lazy region (Slice 3e), choosing per segment:
+///   * pure BSS (p_filesz==0)           → anonymous zero-fill (no source), the
+///                                         same path the stack uses.
+///   * read-only, file==mem, page-      → the unified page cache: the segment's
+///     congruent, on ext2 (inode!=0)      frames are SHARED across every process
+///                                         running this binary; a stray write
+///                                         COW-diverges into a private copy.
+///   * everything else (RW init data,   → a private copy demand-paged from
+///     or a non-qualifying RO segment)    elf_buf (the legacy path).
+/// Returns whether ANY segment still needs elf_buf (so the caller knows whether
+/// to retain it or free it after symbol parsing), or null if a region couldn't
+/// be registered or a segment's VA is out of user range (caller kills the proc).
+fn registerSegments(pid: usize, elf_buf: [*]const u8, phoff: usize, phnum: u16, inode: u32) ?bool {
+    const pcb = process.getPCB(pid);
+    const phdrs: [*]align(1) const ProgramHeader = @ptrCast(elf_buf + phoff);
+    var needs_elf_buf = false;
+    var n_cache: u32 = 0;
+    var n_anon: u32 = 0;
+    var n_priv: u32 = 0;
+    for (0..phnum) |i| {
+        if (phdrs[i].p_type != 1) continue; // PT_LOAD
+        const p_vaddr: usize = @intCast(phdrs[i].p_vaddr);
+        const p_memsz: usize = @intCast(phdrs[i].p_memsz);
+        const p_filesz: usize = @intCast(phdrs[i].p_filesz);
+        const p_offset: usize = @intCast(phdrs[i].p_offset);
+        const p_flags = phdrs[i].p_flags;
+        if (!isUserVA(p_vaddr, p_memsz)) {
+            debug.klog("[elf] segment 0x{X}+{d} outside user VA\n", .{ p_vaddr, p_memsz });
+            return null;
+        }
+        const seg_start = p_vaddr & ~@as(usize, PAGE_SIZE - 1);
+        const seg_end = (p_vaddr + p_memsz + PAGE_SIZE - 1) & ~@as(usize, PAGE_SIZE - 1);
+
+        if (p_filesz == 0) {
+            // Pure BSS: anonymous zero-fill — no file content, never needs elf_buf.
+            if (!process.addLazyRegion(pid, seg_start, seg_end, 0)) return null;
+            n_anon += 1;
+        } else if (inode != 0 and (p_flags & PF_W) == 0 and p_filesz == p_memsz and
+            (p_offset & (PAGE_SIZE - 1)) == (p_vaddr & (PAGE_SIZE - 1)))
+        {
+            // Read-only, fully file-backed, page-congruent, on ext2: share via
+            // the unified page cache. cache_off is the file offset of the page-
+            // aligned segment start (congruence guarantees off & ~0xFFF lines up
+            // with vaddr & ~0xFFF). Maps RO, executable iff PF_X; a write
+            // COW-diverges (the cache's own ref keeps refcount>=2, so the shared
+            // frame is copied, never stolen).
+            if (!process.addLazyRegion(pid, seg_start, seg_end, 0)) return null;
+            const ridx = pcb.lazy_count - 1;
+            pcb.lazy_regions[ridx].cache_inode = inode;
+            pcb.lazy_regions[ridx].cache_off = p_offset & ~@as(usize, PAGE_SIZE - 1);
+            pcb.lazy_regions[ridx].prot = segProt(p_flags);
+            n_cache += 1;
+        } else {
+            // RW initialized data (+maybe a BSS tail), or a non-qualifying RO
+            // segment (filesz!=memsz, not page-congruent, or non-ext2 boot):
+            // keep the private elf_buf-sourced copy.
+            if (!registerSegmentLazy(pid, elf_buf, p_vaddr, p_memsz, p_filesz, p_offset)) return null;
+            needs_elf_buf = true;
+            n_priv += 1;
+        }
+    }
+    debug.klog("[elf] pid={d} inode={d}: segs cache={d} anon={d} priv={d} elf_buf={s}\n", .{
+        pid, inode, n_cache, n_anon, n_priv, if (needs_elf_buf) "kept" else "DROPPED",
+    });
+    return needs_elf_buf;
+}
+
 /// Load an ELF and create the process, but don't enter user mode.
 /// Returns PID or null. Used by the desktop for multitasking.
 ///
@@ -109,7 +202,7 @@ fn registerSegmentLazy(
 /// buffer is stashed in `pcb.elf_buf` and freed when the process exits.
 /// On any failure path, this function frees `elf_buf` itself — the caller
 /// must NOT touch it after the call.
-pub fn loadAndStart(elf_buf: [*]align(4) u8, file_size: usize, elf_buf_pages: u32) ?usize {
+pub fn loadAndStart(elf_buf: [*]align(4) u8, file_size: usize, elf_buf_pages: u32, inode: u32) ?usize {
     debug.klog("[elf] Loading ELF64 binary...\n", .{});
     const header = @as([*]align(1) const Header, @ptrCast(elf_buf))[0];
     if (!std.mem.eql(u8, header.ident[0..4], "\x7fELF") or header.ident[4] != 2 or header.machine != 0x3E) {
@@ -200,21 +293,24 @@ pub fn loadAndStart(elf_buf: [*]align(4) u8, file_size: usize, elf_buf_pages: u3
         process.killProcess(@intCast(pid));
         return null;
     }
-    for (0..header.phnum) |i| {
-        if (phdrs[i].p_type != 1) continue;
-        const p_vaddr: usize = @intCast(phdrs[i].p_vaddr);
-        const p_memsz: usize = @intCast(phdrs[i].p_memsz);
-        const p_filesz: usize = @intCast(phdrs[i].p_filesz);
-        const p_offset: usize = @intCast(phdrs[i].p_offset);
-        if (!registerSegmentLazy(pid, elf_buf, p_vaddr, p_memsz, p_filesz, p_offset)) {
-            debug.klog("[elf] Lazy regions full registering segment 0x{X}\n", .{p_vaddr});
-            process.killProcess(@intCast(pid));
-            return null;
-        }
-    }
+    const needs_elf_buf = registerSegments(pid, elf_buf, phoff, header.phnum, inode) orelse {
+        debug.klog("[elf] segment registration failed for PID {d}\n", .{pid});
+        process.killProcess(@intCast(pid));
+        return null;
+    };
 
     // Parse debug symbols from ELF section headers (use kernel-side ELF buffer).
     pcb.sym_table = symbols.parseElfSymbols(elf_buf, file_size);
+
+    // Slice 3e: if no segment is demand-paged from elf_buf (all are cache-shared
+    // or pure-BSS anon), the per-process whole-file copy is dead weight — free it
+    // now instead of holding it until exit. freeElfBuf is null-safe, so teardown
+    // simply no-ops. Symbol parsing above already copied what it needs.
+    if (!needs_elf_buf) {
+        freePmmRange(@intFromPtr(elf_buf), elf_buf_pages);
+        pcb.elf_buf = null;
+        pcb.elf_buf_pages = 0;
+    }
 
     // Init complete — transition .loading → .ready. Until this store, an AP
     // sees the PCB as not-runnable. After this, pickNext can dispatch it
@@ -227,7 +323,7 @@ pub fn loadAndStart(elf_buf: [*]align(4) u8, file_size: usize, elf_buf_pages: u3
     return pid;
 }
 
-pub fn loadAndExecute(elf_buf: [*]align(4) u8, file_size: usize, elf_buf_pages: u32) void {
+pub fn loadAndExecute(elf_buf: [*]align(4) u8, file_size: usize, elf_buf_pages: u32, inode: u32) void {
     debug.klog("[elf] Loading ELF64 binary...\n", .{});
     const header = @as([*]align(1) const Header, @ptrCast(elf_buf))[0];
     if (!std.mem.eql(u8, header.ident[0..4], "\x7fELF") or header.ident[4] != 2 or header.machine != 0x3E) {
@@ -283,29 +379,23 @@ pub fn loadAndExecute(elf_buf: [*]align(4) u8, file_size: usize, elf_buf_pages: 
     }
 
     const phoff: usize = @intCast(header.phoff);
-    const phdrs: [*]align(1) const ProgramHeader = @ptrCast(elf_buf + phoff);
-    for (0..header.phnum) |i| {
-        if (phdrs[i].p_type != 1) continue;
-        const p_vaddr: usize = @intCast(phdrs[i].p_vaddr);
-        const p_memsz: usize = @intCast(phdrs[i].p_memsz);
-        const p_filesz: usize = @intCast(phdrs[i].p_filesz);
-        const p_offset: usize = @intCast(phdrs[i].p_offset);
-        if (!isUserVA(p_vaddr, p_memsz)) {
-            vga.fg = .LightRed;
-            vga.print("Error: segment outside user VA!\n", .{});
-            process.killProcess(@intCast(pid));
-            return;
-        }
-        if (!registerSegmentLazy(pid, elf_buf, p_vaddr, p_memsz, p_filesz, p_offset)) {
-            vga.fg = .LightRed;
-            vga.print("Error: lazy regions full!\n", .{});
-            process.killProcess(@intCast(pid));
-            return;
-        }
-    }
+    const needs_elf_buf = registerSegments(pid, elf_buf, phoff, header.phnum, inode) orelse {
+        vga.fg = .LightRed;
+        vga.print("Error: segment registration failed!\n", .{});
+        process.killProcess(@intCast(pid));
+        return;
+    };
 
     // Parse debug symbols from ELF section headers (use kernel-side ELF buffer).
     pcb.sym_table = symbols.parseElfSymbols(elf_buf, file_size);
+
+    // Slice 3e: drop the per-process whole-file copy if nothing sources from it
+    // (all segments cache-shared or pure-BSS anon). See loadAndStart.
+    if (!needs_elf_buf) {
+        freePmmRange(@intFromPtr(elf_buf), elf_buf_pages);
+        pcb.elf_buf = null;
+        pcb.elf_buf_pages = 0;
+    }
 
     // Init complete — flip .loading → .ready so an AP's pickNext can see it
     // (and so this CPU's later preemption-resume cycles work). loadAndExecute

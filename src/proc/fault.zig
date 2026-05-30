@@ -316,6 +316,15 @@ pub fn ensureUserRangeWritable(va: usize, len: usize) bool {
                     // must touch the page itself so the #PF path can fill it).
                     if (!tryMapCachedPage(pd, r, p)) return false;
                     _ = handleCowFault(pd, p);
+                    // A READ-ONLY cache region (Slice 3e ELF text/rodata: prot has
+                    // no PROT_WRITE, so cacheMapFlags emits no COW bit and
+                    // handleCowFault is a no-op) stays read-only here. Fail
+                    // delivery — exactly as the present-page branch above does —
+                    // so the caller doesn't kernel-mode #PF writing into it (a
+                    // CPL0 fault this ring-3-only handler can't service → panic).
+                    const paging = @import("../mm/paging.zig");
+                    const pte_ptr = findUserPte(pd, p) orelse return false;
+                    if (pte_ptr.* & paging.READ_WRITE == 0) return false;
                 } else {
                     _ = vmm.allocAndMapUserPage(pd, p, vmm.protToMapFlags(r.prot)) catch return false;
                     asm volatile ("invlpg (%[addr])"
@@ -1069,6 +1078,11 @@ pub fn ensureUserRangeWritableFor(owner_pcb: *process.PCB, va: usize, len: usize
                     // must touch the page itself so the #PF path can fill it).
                     if (!tryMapCachedPage(pd, r, p)) return false;
                     _ = handleCowFault(pd, p);
+                    // RO cache region (Slice 3e ELF text/rodata: no PROT_WRITE →
+                    // no COW bit → handleCowFault no-op) stays read-only. Fail
+                    // delivery rather than let the caller kernel-mode #PF into it.
+                    const pte_ptr = findUserPte(pd, p) orelse return false;
+                    if (pte_ptr.* & paging.READ_WRITE == 0) return false;
                 } else {
                     _ = vmm.allocAndMapUserPage(pd, p, vmm.protToMapFlags(r.prot)) catch return false;
                     asm volatile ("invlpg (%[addr])"

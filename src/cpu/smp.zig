@@ -766,6 +766,7 @@ const LoadRequest = struct {
     // kill the BSS-overlap bug class.
     file_buf: ?[*]align(4) u8 = null,
     file_pages: u32 = 0,
+    file_inode: u32 = 0, // ext2 inode (0 = non-ext2): lets the BSP cache-share RO segments (Slice 3e)
     result_pid: u32 = 0xFFFFFFFF, // set by BSP after process creation
 };
 
@@ -808,7 +809,7 @@ pub fn pollAppLoad() ?u32 {
             // Hand ownership of the PMM-allocated buffer to elf_loader.
             // loadAndStart frees on failure, otherwise stashes in pcb.elf_buf.
             const t_before_las = perf.rdtsc();
-            const las_result = elf_loader.loadAndStart(buf, fsize, load_req.file_pages);
+            const las_result = elf_loader.loadAndStart(buf, fsize, load_req.file_pages, load_req.file_inode);
             t_after_load = perf.rdtsc();
             if (las_result) |p| {
                 var nlen: usize = load_req.name_len;
@@ -838,6 +839,7 @@ pub fn pollAppLoad() ?u32 {
     load_req.file_buf = null;
     load_req.file_pages = 0;
     load_req.file_size = 0;
+    load_req.file_inode = 0;
 
     // Restore caller's CR3 before returning so the desktop's main loop continues
     // executing in whatever address space it expected (PCID-aware so caller's
@@ -894,10 +896,12 @@ pub fn apProcessLoadQueue() void {
         load_req.file_buf = fresh.buf;
         load_req.file_pages = fresh.pages;
         load_req.file_size = fresh.size;
+        load_req.file_inode = fresh.inode;
     } else {
         load_req.file_buf = null;
         load_req.file_pages = 0;
         load_req.file_size = 0;
+        load_req.file_inode = 0;
     }
 
     const sz: usize = if (fresh_opt) |f| f.size else 0;

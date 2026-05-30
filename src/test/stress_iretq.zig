@@ -63,7 +63,7 @@ fn workerExit() callconv(.c) noreturn {
 
 fn spawnSpinner() ?u8 {
     const fresh = vfs.loadFileFresh(SPINNER_BIN) orelse return null;
-    const pid = elf_loader.loadAndStart(fresh.buf, fresh.size, fresh.pages) orelse return null;
+    const pid = elf_loader.loadAndStart(fresh.buf, fresh.size, fresh.pages, fresh.inode) orelse return null;
     process.setName(@intCast(pid), "spin");
     return @intCast(pid);
 }

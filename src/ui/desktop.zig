@@ -1111,7 +1111,7 @@ fn launchShortcut(idx: usize) void {
             // Single-core only — sync fallback is safe (no concurrent
             // reader to race against).
             if (@import("../fs/vfs.zig").loadFileFresh(sc.cmd)) |fresh| {
-                if (elf_loader.loadAndStart(fresh.buf, fresh.size, fresh.pages)) |pid| {
+                if (elf_loader.loadAndStart(fresh.buf, fresh.size, fresh.pages, fresh.inode)) |pid| {
                     var nlen = sc.cmd.len;
                     if (nlen >= 4 and sc.cmd[nlen - 4] == '.') nlen -= 4;
                     process.setName(@intCast(pid), sc.cmd[0..nlen]);
@@ -1152,7 +1152,7 @@ fn spawnShellOnWindow(wi: u8) void {
         pipe.closeWriter(out_pipe);
         return;
     };
-    const pid_or_null = elf_loader.loadAndStart(fresh.buf, fresh.size, fresh.pages);
+    const pid_or_null = elf_loader.loadAndStart(fresh.buf, fresh.size, fresh.pages, fresh.inode);
     const pid = pid_or_null orelse {
         putStringOnWindow(wi, "shell: load failed\n");
         pipe.closeReader(kb_pipe);
@@ -2817,7 +2817,7 @@ pub fn run() void {
     // is missing), it bails silently and the gradient stays. Fire-and-
     // forget: we don't await it so a slow decode doesn't block boot.
     if (@import("../fs/vfs.zig").loadFileFresh("wallpaper.elf")) |fresh| {
-        if (elf_loader.loadAndStart(fresh.buf, fresh.size, fresh.pages)) |wpid| {
+        if (elf_loader.loadAndStart(fresh.buf, fresh.size, fresh.pages, fresh.inode)) |wpid| {
             process.setName(@intCast(wpid), "wallpaper");
             debug.klog("[desktop] wallpaper.elf spawned pid={d}\n", .{wpid});
         }

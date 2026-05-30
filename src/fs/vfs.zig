@@ -631,7 +631,15 @@ pub fn ls() void {
     fat32.listFiles();
 }
 
-pub fn loadFile(name: []const u8, dest: []align(4) u8) ?usize {
+/// `out_inode`, if non-null, receives the ext2 inode number of the file that
+/// was actually read — or 0 if the file came from a non-ext2 mount (tarfs/fat32)
+/// or wasn't found. Callers that cache-key on the file (ELF text sharing, Slice
+/// 3e) use it; everyone else passes null. The inum is captured from the SAME
+/// resolution that read the bytes (ext2.loadFileInum), so it can never name a
+/// different file than the one whose contents landed in `dest`.
+pub fn loadFile(name: []const u8, dest: []align(4) u8, out_inode: ?*u32) ?usize {
+    if (out_inode) |p| p.* = 0; // default: no ext2 cache key
+
     // Kernel-context load (no PCB, so no cwd) — strictly absolute paths.
     // Mount table dispatch matches the per-fs `read`/`open` paths used
     // from user processes, so behavior is consistent across both.
@@ -640,7 +648,11 @@ pub fn loadFile(name: []const u8, dest: []align(4) u8) ?usize {
         const rel = name[m.prefix.len..];
         return switch (m.fs) {
             .tarfs => tarfs.loadFile(rel, dest),
-            .ext2 => ext2.loadFile(rel, dest),
+            .ext2 => blk_ext2: {
+                const r = ext2.loadFileInum(rel, dest) orelse break :blk_ext2 null;
+                if (out_inode) |p| p.* = r.inum;
+                break :blk_ext2 r.size;
+            },
             .fat32 => blk: {
                 if (fat32.openFile(rel)) |handle| {
                     const size = handle.file_size;
@@ -667,8 +679,11 @@ pub fn loadFile(name: []const u8, dest: []align(4) u8) ?usize {
     //   2. ext2 /bin  — for shell-style `cat` → /bin/cat.elf (PATH analogue)
     //   3. tarfs      — legacy fallback during migration
     //   4. fat32      — only matters with /fat/ disk attached
-    if (ext2.loadFile(name, dest)) |size| return size;
-    if (binFallback(name, dest)) |size| return size;
+    if (ext2.loadFileInum(name, dest)) |r| {
+        if (out_inode) |p| p.* = r.inum;
+        return r.size;
+    }
+    if (binFallback(name, dest, out_inode)) |size| return size;
     if (tarfs.loadFile(name, dest)) |size| return size;
     if (fat32.openFile(name)) |handle| {
         const size = handle.file_size;
@@ -687,13 +702,15 @@ pub fn loadFile(name: []const u8, dest: []align(4) u8) ?usize {
 /// Try `ext2.loadFile("bin/" ++ name)`. Used by the bare-name fallback
 /// path so that `sysExec("cat.elf")` finds `/bin/cat.elf` without the
 /// shell having to prepend the prefix itself.
-fn binFallback(name: []const u8, dest: []align(4) u8) ?usize {
+fn binFallback(name: []const u8, dest: []align(4) u8, out_inode: ?*u32) ?usize {
     var buf: [128]u8 = undefined;
     const prefix = "bin/";
     if (name.len + prefix.len > buf.len) return null;
     @memcpy(buf[0..prefix.len], prefix);
     @memcpy(buf[prefix.len..][0..name.len], name);
-    return ext2.loadFile(buf[0 .. prefix.len + name.len], dest);
+    const r = ext2.loadFileInum(buf[0 .. prefix.len + name.len], dest) orelse return null;
+    if (out_inode) |p| p.* = r.inum;
+    return r.size;
 }
 
 fn binFallbackSize(name: []const u8) ?u64 {
@@ -751,6 +768,10 @@ pub const FreshFile = struct {
     buf: [*]align(4) u8,
     size: usize,
     pages: u32,
+    /// ext2 inode of the loaded file, or 0 if it came from a non-ext2 mount.
+    /// The ELF loader uses it to cache-share read-only segments (Slice 3e);
+    /// 0 makes the loader fall back to the private elf_buf path.
+    inode: u32 = 0,
 };
 
 /// Architectural replacement for the `staging` pattern: size the file via
@@ -791,7 +812,8 @@ pub fn loadFileFresh(name: []const u8) ?FreshFile {
     const io_irq0 = nvme.irq_count;
     nvme.io_max_wait_cycles = 0; // local-max for this load only
 
-    if (loadFile(name, buf[0 .. @as(usize, pages) * 4096])) |got| {
+    var inode_out: u32 = 0;
+    if (loadFile(name, buf[0 .. @as(usize, pages) * 4096], &inode_out)) |got| {
         const t3 = perf.rdtsc();
         const io_calls = nvme.io_call_count - io_calls0;
         const io_cyc = nvme.io_total_cycles - io_cyc0;
@@ -820,7 +842,7 @@ pub fn loadFileFresh(name: []const u8) ?FreshFile {
                 max_wait,
             },
         );
-        if (got == size) return .{ .buf = buf, .size = size, .pages = pages };
+        if (got == size) return .{ .buf = buf, .size = size, .pages = pages, .inode = inode_out };
     }
     pmm.freeRange(phys, @intCast(pages));
     return null;

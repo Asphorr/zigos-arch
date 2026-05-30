@@ -26,7 +26,7 @@ pub const PATH = "/etc/zigos.conf";
 /// checks as the setConfig syscall).
 pub fn load() void {
     var staging: [4096]u8 align(4) = undefined;
-    const size = @import("../../fs/vfs.zig").loadFile(PATH, &staging) orelse return;
+    const size = @import("../../fs/vfs.zig").loadFile(PATH, &staging, null) orelse return;
     if (size == 0 or size >= staging.len) return;
     parse(staging[0..size]);
     debug.klog("[desktop] Loaded {s} ({d} bytes)\n", .{ PATH, size });

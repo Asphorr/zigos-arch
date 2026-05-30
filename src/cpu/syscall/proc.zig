@@ -375,7 +375,7 @@ pub fn sysExec(name_ptr: u32, name_len: u32) u32 {
 
     var pid: u32 = 0xFFFFFFFF;
     if (vfs.loadFileFresh(name_buf[0..fname_len])) |fresh| {
-        if (elf_loader.loadAndStart(fresh.buf, fresh.size, fresh.pages)) |p| {
+        if (elf_loader.loadAndStart(fresh.buf, fresh.size, fresh.pages, fresh.inode)) |p| {
             pid = @intCast(p);
             // Set process name + exec arg
             const nlen = @min(fname_len, 16);

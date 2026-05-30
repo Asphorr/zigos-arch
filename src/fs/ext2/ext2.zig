@@ -651,6 +651,15 @@ pub fn fileSize(path: []const u8) ?u64 {
 
 /// Whole-file load into `dest`. Returns total bytes read or null on miss.
 pub fn loadFile(path: []const u8, dest: []align(4) u8) ?usize {
+    const r = loadFileInum(path, dest) orelse return null;
+    return r.size;
+}
+
+/// Like `loadFile`, but also returns the resolved inode number — so a caller
+/// that wants to cache-key on the file (ELF text sharing, Slice 3e) gets the
+/// inum from the *same* resolution that read the bytes, with no chance of a
+/// second `cachedWalk` diverging to a different file.
+pub fn loadFileInum(path: []const u8, dest: []align(4) u8) ?struct { size: usize, inum: u32 } {
     const inum = cachedWalk(path) orelse return null;
     const ino = inode.readInode(inum) orelse return null;
     if (!inode.isReg(&ino)) return null;
@@ -658,7 +667,8 @@ pub fn loadFile(path: []const u8, dest: []align(4) u8) ?usize {
     // `sz` is an untrusted on-disk size — clamp to the caller's buffer so we
     // never write past `dest`.
     const want: usize = @intCast(@min(sz, @as(u64, dest.len)));
-    return inode.readInodeBytes(inum, 0, dest[0..want]);
+    const got = inode.readInodeBytes(inum, 0, dest[0..want]);
+    return .{ .size = got, .inum = inum };
 }
 
 pub fn getFileStat(path: []const u8, stat_buf: *anyopaque) bool {
