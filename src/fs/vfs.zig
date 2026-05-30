@@ -275,6 +275,46 @@ pub fn openFlags(pcb: *process.PCB, name: []const u8, flags: u32) ?u32 {
     }
 }
 
+/// Open a directory for getdents-style enumeration (ext2 only — the writable
+/// root fs). Returns an fd whose `.inode` is the directory's inum and
+/// `.fs_type == .ext2`. ext2.openFile rejects non-regular files, so a Linux
+/// binary's openat(O_DIRECTORY) falls back to this when the regular-file open
+/// path returns null. No "is-dir" bit is stored — getdents64 / fstat re-read
+/// the inode to learn the type.
+pub fn openDir(pcb: *process.PCB, name: []const u8) ?u32 {
+    var path_buf: [256]u8 = undefined;
+    const resolved = resolvePath(pcb, name, &path_buf) orelse return null;
+    if (resolved.fs != .ext2) return null;
+    const dir_inum = ext2.resolveDirInum(resolved.path) orelse return null;
+    const fd_idx = allocFd(pcb) orelse return null;
+    pcb.fd_table[fd_idx] = .{
+        .in_use = true,
+        .inode = dir_inum,
+        .offset = 0,
+        .flags = 0,
+        .fs_type = .ext2,
+    };
+    return @intCast(fd_idx);
+}
+
+/// Shared stat shape (file_size / is_directory / times) used by the Linux
+/// personality's newfstatat to reshape into a Linux `struct stat`.
+pub const StatInfo = extern struct {
+    file_size: u32,
+    is_directory: u32,
+    create_time: u32,
+    modify_time: u32,
+};
+
+/// Path-based stat for the Linux personality (ext2 root fs only — where
+/// unmodified Linux binaries actually operate). Fills `out`; caller reshapes.
+pub fn statPath(pcb: *process.PCB, name: []const u8, out: *StatInfo) bool {
+    var path_buf: [256]u8 = undefined;
+    const resolved = resolvePath(pcb, name, &path_buf) orelse return false;
+    if (resolved.fs != .ext2) return false;
+    return ext2.getFileStat(resolved.path, out);
+}
+
 pub fn read(pcb: *process.PCB, fd: u32, buf: [*]u8, count: u32) u32 {
     if (fd >= pcb.fd_table.len or !pcb.fd_table[fd].in_use) return 0xFFFFFFFF;
     const fd_entry = &pcb.fd_table[fd];
