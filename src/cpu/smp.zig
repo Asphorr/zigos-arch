@@ -809,7 +809,7 @@ pub fn pollAppLoad() ?u32 {
             // Hand ownership of the PMM-allocated buffer to elf_loader.
             // loadAndStart frees on failure, otherwise stashes in pcb.elf_buf.
             const t_before_las = perf.rdtsc();
-            const las_result = elf_loader.loadAndStart(buf, fsize, load_req.file_pages, load_req.file_inode);
+            const las_result = elf_loader.loadAndStart(buf, fsize, load_req.file_pages, load_req.file_inode, null);
             t_after_load = perf.rdtsc();
             if (las_result) |p| {
                 var nlen: usize = load_req.name_len;

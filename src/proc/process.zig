@@ -853,6 +853,39 @@ pub fn setName(pid: u8, name: []const u8) void {
     procs[pid].name_len = @intCast(len);
 }
 
+/// Fill `pcb.argv` from a program name + the raw exec string. argv[0] is the
+/// bare program name (no `.elf`); argv[1..] are space-separated tokens from
+/// `raw` starting after `fname_len`. Tokens longer than MAX_ARG_LEN are
+/// truncated; argc is capped at MAX_ARGS. Lives here (not in the syscall
+/// layer) so both sysExec and elf_loader.loadAndStart can populate argv
+/// before a Linux binary's SysV initial stack is built.
+pub fn populateArgv(
+    pcb: *PCB,
+    prog_name: []const u8,
+    raw: []const u8,
+    fname_len: usize,
+) void {
+    // argv[0]
+    const n0 = @min(prog_name.len, @as(usize, config.MAX_ARG_LEN));
+    @memcpy(pcb.argv[0][0..n0], prog_name[0..n0]);
+    pcb.arg_lens[0] = @intCast(n0);
+    pcb.argc = 1;
+
+    // argv[1..]: walk the bytes after the program name, splitting on spaces.
+    var i: usize = if (fname_len < raw.len) fname_len + 1 else raw.len;
+    while (i < raw.len and pcb.argc < config.MAX_ARGS) {
+        while (i < raw.len and raw[i] == ' ') : (i += 1) {}
+        if (i >= raw.len) break;
+        const start = i;
+        while (i < raw.len and raw[i] != ' ') : (i += 1) {}
+        const tok_len = @min(i - start, @as(usize, config.MAX_ARG_LEN));
+        const slot = pcb.argc;
+        @memcpy(pcb.argv[slot][0..tok_len], raw[start..][0..tok_len]);
+        pcb.arg_lens[slot] = @intCast(tok_len);
+        pcb.argc += 1;
+    }
+}
+
 pub fn getName(pid: u8) []const u8 {
     return procs[pid].name[0..procs[pid].name_len];
 }

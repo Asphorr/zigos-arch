@@ -368,6 +368,17 @@ pub fn sysExec(name_ptr: u32, name_len: u32) u32 {
     // Split on first space: "editor.elf myfile.txt" -> filename + arg
     const fname_len = std.mem.indexOfScalar(u8, name_buf[0..actual_len], ' ') orelse actual_len;
 
+    // Derive the clean process name (filename with the `.elf` stripped) up
+    // front so it can be handed to loadAndStart, which sets pcb.name + the real
+    // argv BEFORE building a Linux binary's SysV initial stack. This used to be
+    // set AFTER loadAndStart returned — too late for the stack builder, which
+    // is why Linux argv[0] was the "prog" placeholder.
+    const nlen = @min(fname_len, 16);
+    var clean_name: [16]u8 = undefined;
+    @memcpy(clean_name[0..nlen], name_buf[0..nlen]);
+    var nl = nlen;
+    if (nl >= 4 and clean_name[nl - 4] == '.') nl -= 4;
+
     // Switch to kernel PD -- user PD doesn't map all kernel memory
     const caller_pd = if (process.currentPCB()) |pcb| pcb.page_dir_phys else 0;
     const caller_pcid = if (process.currentPCB()) |pcb| pcb.pcid else 0;
@@ -375,16 +386,15 @@ pub fn sysExec(name_ptr: u32, name_len: u32) u32 {
 
     var pid: u32 = 0xFFFFFFFF;
     if (vfs.loadFileFresh(name_buf[0..fname_len])) |fresh| {
-        if (elf_loader.loadAndStart(fresh.buf, fresh.size, fresh.pages, fresh.inode)) |p| {
+        // Hand loadAndStart the parsed name + full exec string so it sets the
+        // child's name and real argv before any Linux initial-stack build.
+        const launch = elf_loader.LaunchInfo{
+            .name = clean_name[0..nl],
+            .raw = name_buf[0..actual_len],
+            .fname_len = fname_len,
+        };
+        if (elf_loader.loadAndStart(fresh.buf, fresh.size, fresh.pages, fresh.inode, launch)) |p| {
             pid = @intCast(p);
-            // Set process name + exec arg
-            const nlen = @min(fname_len, 16);
-            var clean_name: [16]u8 = undefined;
-            @memcpy(clean_name[0..nlen], name_buf[0..nlen]);
-            // Strip .elf extension for name
-            var nl = nlen;
-            if (nl >= 4 and clean_name[nl - 4] == '.') nl -= 4;
-            process.setName(@intCast(p), clean_name[0..nl]);
             // Promote to interactive immediately so the new process isn't
             // starved by an already-running interactive app — same fix as
             // desktop.launchShortcut and smp.pollAppLoad.
@@ -454,11 +464,8 @@ pub fn sysExec(name_ptr: u32, name_len: u32) u32 {
                     @import("../../debug/debug.zig").klog("[sysExec] WARN: child_pid == parent_pid={d} — inheritance skipped\n", .{process.getCurrentPid()});
                 }
             }
-            // Populate argv. argv[0] = program name (without the `.elf`
-            // extension, matching how `setName` derives the kernel-side name).
-            // argv[1..argc] = whitespace-split tokens from the rest of the
-            // exec string, capped at MAX_ARGS-1 user args.
-            populateArgv(child_pcb, clean_name[0..nl], name_buf[0..actual_len], fname_len);
+            // (name + real argv were set inside loadAndStart, before the Linux
+            // initial stack was built — see the LaunchInfo passed above.)
         }
     }
 
@@ -468,37 +475,6 @@ pub fn sysExec(name_ptr: u32, name_len: u32) u32 {
     }
 
     return pid;
-}
-
-/// Fill `child_pcb.argv` from a program name + the raw exec string. argv[0]
-/// is the bare program name (no `.elf`); argv[1..] are space-separated
-/// tokens from the input string starting after `fname_len`. Tokens longer
-/// than MAX_ARG_LEN are truncated; argc is capped at MAX_ARGS.
-pub fn populateArgv(
-    child_pcb: *process.PCB,
-    prog_name: []const u8,
-    raw: []const u8,
-    fname_len: usize,
-) void {
-    // argv[0]
-    const n0 = @min(prog_name.len, config.MAX_ARG_LEN);
-    @memcpy(child_pcb.argv[0][0..n0], prog_name[0..n0]);
-    child_pcb.arg_lens[0] = @intCast(n0);
-    child_pcb.argc = 1;
-
-    // argv[1..]: walk the bytes after the program name, splitting on spaces.
-    var i: usize = if (fname_len < raw.len) fname_len + 1 else raw.len;
-    while (i < raw.len and child_pcb.argc < config.MAX_ARGS) {
-        while (i < raw.len and raw[i] == ' ') : (i += 1) {}
-        if (i >= raw.len) break;
-        const start = i;
-        while (i < raw.len and raw[i] != ' ') : (i += 1) {}
-        const tok_len = @min(i - start, @as(usize, config.MAX_ARG_LEN));
-        const slot = child_pcb.argc;
-        @memcpy(child_pcb.argv[slot][0..tok_len], raw[start..][0..tok_len]);
-        child_pcb.arg_lens[slot] = @intCast(tok_len);
-        child_pcb.argc += 1;
-    }
 }
 
 pub fn sysGetExecArg(buf_ptr: u32) u32 {

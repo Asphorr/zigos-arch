@@ -95,7 +95,7 @@ pub fn taskEntry() callconv(.c) noreturn {
             process.kernelSleepMs(0);
             continue;
         };
-        const pid_or_null = elf_loader.loadAndStart(fresh.buf, fresh.size, fresh.pages, fresh.inode);
+        const pid_or_null = elf_loader.loadAndStart(fresh.buf, fresh.size, fresh.pages, fresh.inode, null);
         if (pid_or_null == null) {
             spawn_failures += 1;
             _ = process.reapStaleZombies(0);

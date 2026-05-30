@@ -474,7 +474,7 @@ fn cmdRun(name: []const u8) void {
     // Sync fallback (single core or AP busy)
     if (vfs.loadFileFresh(name)) |fresh| {
         if (desktop.active) {
-            if (elf_loader.loadAndStart(fresh.buf, fresh.size, fresh.pages, fresh.inode)) |pid| {
+            if (elf_loader.loadAndStart(fresh.buf, fresh.size, fresh.pages, fresh.inode, null)) |pid| {
                 const fname = name;
                 var nlen: usize = fname.len;
                 if (nlen >= 4 and fname[nlen - 4] == '.') nlen -= 4;

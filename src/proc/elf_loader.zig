@@ -8,6 +8,21 @@ const pmm = @import("../mm/pmm.zig");
 const paging = @import("../mm/paging.zig");
 const symbols = @import("../debug/symbols.zig");
 const memmap = @import("../mm/memmap.zig");
+const config = @import("../config.zig");
+
+/// Optional launch descriptor handed to loadAndStart so it can set the new
+/// process's name + real argv BEFORE building a Linux binary's SysV initial
+/// stack (which reads pcb.name/argv for argv[0..argc]). Callers that launch
+/// by name only (desktop, smp, boot) pass null; a Linux binary launched that
+/// way gets the "prog" argv[0] fallback.
+pub const LaunchInfo = struct {
+    /// Clean program name with the `.elf` extension stripped → pcb.name + argv[0].
+    name: []const u8,
+    /// Full exec string ("prog.elf arg1 arg2") for splitting argv[1..].
+    raw: []const u8,
+    /// Index in `raw` where the filename ends (the first space, or raw.len).
+    fname_len: usize,
+};
 
 const Header = extern struct {
     ident: [16]u8,
@@ -305,16 +320,32 @@ fn setupLinuxInitialStack(
     }
     const rand_va: u64 = page_base + rand_off;
 
-    // argv[0] string — the program name (for getprogname / err()). Capped so it
-    // can never crowd the arrays out of the page.
+    // argv strings — the real argv parsed at exec time (pcb.argv[0..argc],
+    // populated by loadAndStart from the exec string before we run). Laid out
+    // high→low; each string's VA is recorded for the pointer array below. If no
+    // argv was set (a non-shell launch path), fall back to a single
+    // argv[0]="prog" so _start still finds a valid, NUL-terminated argv[0].
     const pcb = process.getPCB(pid);
-    const name_len: usize = @min(@as(usize, pcb.name_len), pcb.name.len);
-    const argv0_str: []const u8 = if (name_len > 0) pcb.name[0..name_len] else "prog";
-    off -= argv0_str.len + 1;
-    const argv0_off = off;
-    for (argv0_str, 0..) |c, k| kbuf[argv0_off + k] = c;
-    kbuf[argv0_off + argv0_str.len] = 0;
-    const argv0_va: u64 = page_base + argv0_off;
+    var argv_va: [config.MAX_ARGS]u64 = undefined;
+    const real_argc: usize = @min(@as(usize, pcb.argc), @as(usize, config.MAX_ARGS));
+    const argc: usize = if (real_argc > 0) real_argc else 1;
+    if (real_argc > 0) {
+        var ai: usize = 0;
+        while (ai < real_argc) : (ai += 1) {
+            const alen: usize = @min(@as(usize, pcb.arg_lens[ai]), @as(usize, config.MAX_ARG_LEN));
+            off -= alen + 1;
+            const aoff = off;
+            for (0..alen) |k| kbuf[aoff + k] = pcb.argv[ai][k];
+            kbuf[aoff + alen] = 0;
+            argv_va[ai] = page_base + aoff;
+        }
+    } else {
+        const s = "prog";
+        off -= s.len + 1;
+        for (s, 0..) |c, k| kbuf[off + k] = c;
+        kbuf[off + s.len] = 0;
+        argv_va[0] = page_base + off;
+    }
 
     // Auxiliary vector — (type,value) pairs, AT_NULL-terminated.
     const auxv = [_][2]u64{
@@ -334,9 +365,16 @@ fn setupLinuxInitialStack(
         .{ AT_NULL, 0 },
     };
 
-    // word layout (low→high): argc | argv[0] | NULL | envp NULL | auxv pairs.
-    // M1 is always argc=1 (no real argv yet); M2 generalizes this.
-    const argc: usize = 1;
+    // word layout (low→high): argc | argv[0..argc] | NULL | envp NULL | auxv.
+    // Provably fits one page: rand(16) + argv strings + these arrays total a
+    // few hundred bytes with the MAX_ARGS/MAX_ARG_LEN caps, far under 4 KiB, so
+    // the descending `off` can never underflow into the array region below.
+    comptime {
+        const max_strings = @as(usize, config.MAX_ARGS) * (@as(usize, config.MAX_ARG_LEN) + 1) + 16;
+        const max_arrays = (1 + @as(usize, config.MAX_ARGS) + 1 + 1 + auxv.len * 2) * 8;
+        if (max_strings + max_arrays + 16 > PAGE_SIZE)
+            @compileError("SysV initial stack may overflow one page — shrink MAX_ARGS/MAX_ARG_LEN");
+    }
     const words: usize = 1 + (argc + 1) + 1 + auxv.len * 2;
     var block_off: usize = off - words * 8;
     block_off &= ~@as(usize, 0xF); // &argc must be 16-byte aligned at _start
@@ -345,9 +383,12 @@ fn setupLinuxInitialStack(
     const wp: [*]align(1) u64 = @ptrFromInt(@intFromPtr(kbuf) + block_off);
     var w: usize = 0;
     wp[w] = argc; w += 1;
-    wp[w] = argv0_va; w += 1;
+    for (0..argc) |ai| {
+        wp[w] = argv_va[ai];
+        w += 1;
+    }
     wp[w] = 0; w += 1; // argv terminator
-    wp[w] = 0; w += 1; // envp terminator (no env for M1)
+    wp[w] = 0; w += 1; // envp terminator (no env yet)
     for (auxv) |pair| {
         wp[w] = pair[0]; w += 1;
         wp[w] = pair[1]; w += 1;
@@ -360,8 +401,12 @@ fn setupLinuxInitialStack(
     const iretf: [*]u64 = @ptrFromInt(process.procs[pid].kernel_stack_top - PT_REGS_QWORDS * 8);
     iretf[18] = argc_va;
 
-    debug.klog("[linux] pid={d} SysV stack: rsp=0x{X} argv0='{s}' phdr=0x{X} phnum={d} entry=0x{X}\n", .{
-        pid, argc_va, argv0_str, phdr_va, phnum, entry,
+    const argv0_log: []const u8 = if (real_argc > 0)
+        pcb.argv[0][0..@min(@as(usize, pcb.arg_lens[0]), @as(usize, config.MAX_ARG_LEN))]
+    else
+        "prog";
+    debug.klog("[linux] pid={d} SysV stack: rsp=0x{X} argc={d} argv0='{s}' phdr=0x{X} phnum={d} entry=0x{X}\n", .{
+        pid, argc_va, argc, argv0_log, phdr_va, phnum, entry,
     });
     return true;
 }
@@ -373,7 +418,7 @@ fn setupLinuxInitialStack(
 /// buffer is stashed in `pcb.elf_buf` and freed when the process exits.
 /// On any failure path, this function frees `elf_buf` itself — the caller
 /// must NOT touch it after the call.
-pub fn loadAndStart(elf_buf: [*]align(4) u8, file_size: usize, elf_buf_pages: u32, inode: u32) ?usize {
+pub fn loadAndStart(elf_buf: [*]align(4) u8, file_size: usize, elf_buf_pages: u32, inode: u32, launch: ?LaunchInfo) ?usize {
     debug.klog("[elf] Loading ELF64 binary...\n", .{});
     const header = @as([*]align(1) const Header, @ptrCast(elf_buf))[0];
     if (!std.mem.eql(u8, header.ident[0..4], "\x7fELF") or header.ident[4] != 2 or header.machine != 0x3E) {
@@ -461,6 +506,16 @@ pub fn loadAndStart(elf_buf: [*]align(4) u8, file_size: usize, elf_buf_pages: u3
     // translation layer (syscall/linux.zig). Native zigos ELFs have OSABI 0.
     // One detection point here covers every launch path (shell/desktop/smp).
     pcb.personality = if (header.ident[7] == 3) .linux else .native;
+
+    // Set the process name + real argv from the launch descriptor (if any)
+    // BEFORE setupLinuxInitialStack below reads them. The caller used to do
+    // this AFTER loadAndStart returned, which left a Linux binary's argv as
+    // the "prog" placeholder because the stack was already built. Native
+    // processes read argv via syscalls, so the ordering only matters here.
+    if (launch) |li| {
+        process.setName(@intCast(pid), li.name);
+        process.populateArgv(pcb, li.name, li.raw, li.fname_len);
+    }
 
     // Register lazy regions: stack first (region 0), then each PT_LOAD segment
     // (regions 1..N). Heap is registered later by sysSbrk.

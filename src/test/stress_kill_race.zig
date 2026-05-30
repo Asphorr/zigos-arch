@@ -68,7 +68,7 @@ pub fn taskEntry() callconv(.c) noreturn {
                 spawn_failures += 1;
                 continue;
             };
-            if (elf_loader.loadAndStart(fresh.buf, fresh.size, fresh.pages, fresh.inode)) |p| {
+            if (elf_loader.loadAndStart(fresh.buf, fresh.size, fresh.pages, fresh.inode, null)) |p| {
                 pids[b] = @intCast(p);
                 n_spawned += 1;
                 spawned += 1;
