@@ -756,7 +756,7 @@ const TerminateOp = enum { kill, destroy };
 ///     (so no other CPU still references the dying PCB).
 ///   * `destroy`: call `schedule()` + halt AFTER this returns (the
 ///     dying CPU is still on the dying kstack until it reschedules).
-fn tearDownTask(pid: usize, status: u32, op: TerminateOp) void {
+fn tearDownTask(pid: usize, status: u32, op: TerminateOp, persist_shared_dirty: bool) void {
     const my_tgid: u8 = process.procs[pid].tgid;
     const last_in_group = countThreadsInGroup(my_tgid) <= 1;
     debug.klog("[proc] {s} {d} {s} (status=0x{X})\n", .{
@@ -852,13 +852,29 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp) void {
             // also exit / munmap.
             if (r.shm_id != shm.SHM_INVALID) shm.release(r.shm_id);
             // MAP_SHARED file region: destroyAddressSpace above already dropped
-            // this AS's PTEs, so any of its pages now mapped by no one else
-            // (refcount==1) are clean cache-only pages we should un-dirty — else
-            // they'd linger dirty and unevictable (chooseSlot skips dirty). No
-            // writeback (teardown is I/O-free, also reached by the OOM killer);
-            // persist via msync/munmap before exit. Pages another AS still maps
-            // stay dirty (clearDirtyRangeCacheOnly is refcount-gated).
-            if (r.cache_inode != 0 and r.cache_shared) {
+            // this AS's PTEs, so any of its pages now mapped by no one else sit
+            // at refcount==1 (cache-only) with their dirty bit still set.
+            //
+            //   * persist_shared_dirty (graceful exit, Slice 3d-2b): LEAVE them
+            //     dirty. pgflushd — guaranteed running, since a cache_shared
+            //     region can only exist if ext2 init'd, which is what spawns it
+            //     — writes them back within ≤1 interval, then its refcount-gated
+            //     clear makes them evictable. So a process that exits WITHOUT
+            //     msync still durably persists its final window of writes.
+            //   * !persist_shared_dirty (OOM-kill / fatal fault / external kill):
+            //     clear the dirty bit WITHOUT writeback. The OOM path reaches
+            //     here under memory pressure and must free these pages NOW, not
+            //     wait for the daemon; dropping the unflushed writes is the right
+            //     trade when the alternative is staying out of memory. (Else they
+            //     would linger dirty-and-unevictable — chooseSlot skips dirty.)
+            //
+            // Either way, pages another AS still maps (refcount>1) are untouched:
+            // clearDirtyRangeCacheOnly is refcount-gated, and the surviving peer
+            // keeps them dirty (pgflushd re-flushes while it lives). Safe against
+            // an inode being freed+reused inside the widened dirty window: ext2
+            // freeInode/truncate → page_cache.invalidateFile drops EVERY entry
+            // (dirty included), so a stale page can't be written to a reused inum.
+            if (r.cache_inode != 0 and r.cache_shared and !persist_shared_dirty) {
                 _ = page_cache.clearDirtyRangeCacheOnly(page_cache.ext2FileId(r.cache_inode), r.cache_off, r.end - r.start);
             }
             if (!r.buf_owned) continue;
@@ -1064,7 +1080,11 @@ pub fn killProcessWithStatus(pid: u8, status: u32) void {
         // tearDown is naturally serialized via the wake() inside tearDown
         // — parent was blocked in waitpid until tearDown wakes it.)
         process.setState(pid, .zombie);
-        tearDownTask(pid, status, .kill);
+        // External kill (user kill / Ctrl-C / fatal signal): clear unflushed
+        // shared dirty pages, same as today. A killed process makes no msync
+        // guarantee; persisting its final window is deferred (the graceful
+        // self-exit path opts in via destroyCurrentGraceful).
+        tearDownTask(pid, status, .kill, false);
         return;
     }
 }
@@ -1226,9 +1246,23 @@ pub fn reapStaleZombies(max_age_ticks: u64) u32 {
 /// dying kstack (the CPU only loads rsp0 on a privilege transition),
 /// and handleIRQ0 runs on memory that's about to be reclaimed.
 pub fn destroyCurrentWithStatus(status: u32) void {
+    destroyCurrentImpl(status, false);
+}
+
+/// Graceful self-exit. Identical to destroyCurrentWithStatus EXCEPT it leaves a
+/// MAP_SHARED region's unflushed dirty cache pages in place so pgflushd persists
+/// them (Slice 3d-2b: a process that exits without msync still durably writes
+/// back its final window). Wired ONLY to the voluntary exit syscalls
+/// (sys_exit / exit_status) — the OOM, fatal-fault, and external-kill paths keep
+/// the default (clear-without-writeback) so they free memory immediately.
+pub fn destroyCurrentGraceful(status: u32) void {
+    destroyCurrentImpl(status, true);
+}
+
+fn destroyCurrentImpl(status: u32, persist_shared_dirty: bool) void {
     const cur = smp.myCpu().current_pid orelse return;
 
-    tearDownTask(cur, status, .destroy);
+    tearDownTask(cur, status, .destroy, persist_shared_dirty);
 
     // For user sys_exit, the syscall handler ALSO calls schedule afterwards
     // — that's now a redundant no-op (cheap). For kernel-task callers, this
@@ -1240,7 +1274,10 @@ pub fn destroyCurrentWithStatus(status: u32) void {
     while (true) asm volatile ("cli; hlt");
 }
 
-/// Mark current process as unused (called by sys_exit with no status — exit code 0).
+/// Mark current process as unused (called by sys_exit with no status — exit code
+/// 0). Forced/status-0 self-destroy used by the OOM, fatal-fault, io_uring
+/// worker, and deferred-self-destroy paths — clears dirty shared pages (does NOT
+/// persist; the graceful exit syscalls call destroyCurrentGraceful instead).
 pub fn destroyCurrent() void {
     destroyCurrentWithStatus(0);
 }

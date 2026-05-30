@@ -816,6 +816,7 @@ pub const reparentChildren = @import("lifecycle.zig").reparentChildren;
 pub const maybeReapZombies = @import("lifecycle.zig").maybeReapZombies;
 pub const reapStaleZombies = @import("lifecycle.zig").reapStaleZombies;
 pub const destroyCurrentWithStatus = @import("lifecycle.zig").destroyCurrentWithStatus;
+pub const destroyCurrentGraceful = @import("lifecycle.zig").destroyCurrentGraceful;
 pub const destroyCurrent = @import("lifecycle.zig").destroyCurrent;
 pub const reapZombie = @import("lifecycle.zig").reapZombie;
 pub const findZombieChild = @import("lifecycle.zig").findZombieChild;

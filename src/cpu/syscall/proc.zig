@@ -45,7 +45,10 @@ const E_CHILD = common.E_CHILD;
 const E_INTR = common.E_INTR;
 
 pub fn sysExit() u32 {
-    process.destroyCurrent();
+    // Voluntary exit: persist a MAP_SHARED region's unflushed dirty pages via
+    // pgflushd (Slice 3d-2b) instead of dropping them. destroyCurrent (clear)
+    // stays the OOM/fatal/worker path.
+    process.destroyCurrentGraceful(0);
     process.schedule();
     unreachable;
 }
@@ -71,7 +74,9 @@ pub fn sysUptime() u32 {
 }
 
 pub fn sysExitStatus(arg1: u32) u32 {
-    process.destroyCurrentWithStatus(arg1);
+    // Voluntary exit with status (libc exitWith): persist unflushed shared
+    // dirty pages via pgflushd (Slice 3d-2b), same as sysExit.
+    process.destroyCurrentGraceful(arg1);
     process.schedule();
     unreachable;
 }

@@ -424,7 +424,15 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     // ext2 try-mount: silently fails if IDE2 isn't an ext2 image (the
     // common case during dev where IDE2 is FAT32). Swap disk.img →
     // ext2.img in the QEMU args to test ext2.
-    if (@import("fs/ext2/ext2.zig").init()) blog.ok("ext2 (IDE2)");
+    if (@import("fs/ext2/ext2.zig").init()) {
+        blog.ok("ext2 (IDE2)");
+        // pgflushd — background page-cache writeback daemon (Slice 3d-2). Spawn
+        // it only when ext2 mounts (the sole cache populator). 32 KB kstack covers
+        // the writeback chain (vfs → ext2 → block → nvme). Runs once the scheduler
+        // starts switching tasks at end of boot.
+        if (@import("proc/lifecycle.zig").createKernelTask(@intFromPtr(&pgflushdEntry), "pgflushd", 0, .normal, 32 * 1024) == null)
+            blog.warn("pgflushd", "spawn failed — MAP_SHARED dirty pages won't auto-persist", .{});
+    }
     verifyBuildId();
     blog.ok("Build-ID stamp");
     @import("debug/symbols.zig").loadKernelSymbols();
@@ -781,6 +789,23 @@ pub fn panic(msg: []const u8, _: ?*std.builtin.StackTrace, ret_addr: ?usize) nor
 // Verify the BUILD.ID file inside disk.tar matches the build_id embedded in
 // this kernel. Mismatch means kernel.elf and disk.tar came from different
 // builds — we screamed about it after losing an hour debugging stale code.
+
+/// pgflushd kernel-thread entry (Slice 3d-2). Periodically writes back dirty
+/// page-cache pages so MAP_SHARED file writes persist to disk without an explicit
+/// msync (and so any orphaned dirty page gets cleaned + made reclaimable). Spawned
+/// once ext2 mounts — the only filesystem that populates the cache. Never returns.
+/// Sleeps PGFLUSH_INTERVAL_MS between passes; the flush itself parks on NVMe I/O
+/// (no spinlock held) so it never hogs its CPU.
+const PGFLUSH_INTERVAL_MS: u32 = 2000;
+fn pgflushdEntry() callconv(.c) noreturn {
+    const vfs = @import("fs/vfs.zig");
+    const sched = @import("proc/sched.zig");
+    while (true) {
+        sched.kernelSleepMs(PGFLUSH_INTERVAL_MS);
+        _ = vfs.flushAllDirty();
+    }
+}
+
 fn verifyBuildId() void {
     const build_options = @import("build_options");
     const vfs = @import("fs/vfs.zig");

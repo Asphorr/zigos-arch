@@ -118,6 +118,7 @@ pub var stat_misses: u64 = 0;
 pub var stat_inserts: u64 = 0;
 pub var stat_evictions: u64 = 0;
 pub var stat_full_skips: u64 = 0; // insert found every way of the set pinned -> couldn't cache
+pub var stat_reclaimed: u64 = 0; // clean cache-only pages dropped by reclaim() under PMM pressure (3d-1)
 
 /// Clear the cache and reset stats. For the MVP this is called by the self-test
 /// task; the eventual read()/mmap integration will call it once from mm init.
@@ -138,8 +139,15 @@ pub fn init() void {
     stat_inserts = 0;
     stat_evictions = 0;
     stat_full_skips = 0;
+    stat_reclaimed = 0;
     if (!registered) {
         spinlock.registerLock("page_cache.lock", &lock);
+        // PMM invokes reclaim() under memory pressure to shed clean cache pages
+        // (Slice 3d-1). One-shot: init() runs at boot (main.zig) and again per
+        // self-test, so the guard keeps a single registration. registerReclaim
+        // takes no lock (plain array append, boot-time/single-threaded), so it's
+        // safe to call here while `lock` is held.
+        pmm.registerReclaim(reclaim);
         registered = true;
     }
 }
@@ -420,6 +428,38 @@ pub fn takeNextDirty(file_id: u64, from_off: u64) ?DirtyPage {
     return .{ .page_off = e.page_off, .frame = e.frame };
 }
 
+pub const GlobalDirtyPage = struct {
+    file_id: u64,
+    page_off: u64,
+    frame: usize, // pinned (acquireFrame'd) — caller MUST pmm.releaseFrame after writeback
+    next_idx: u32, // flat way cursor to resume the scan from on the next call
+};
+
+/// Global dirty enumeration for the background flush daemon (Slice 3d-2) — the
+/// cross-file analogue of takeNextDirty. Scans the cache linearly from flat way
+/// index `from_idx` (= set*WAYS + way) and returns the FIRST dirty page found,
+/// PINNED (acquireFrame, so the lockless writeback I/O can't race eviction or an
+/// unmap freeing the frame) and WITHOUT clearing the flag, plus `next_idx` to
+/// resume from. Returns null once no dirty page remains at/after `from_idx` (the
+/// pass is complete). Order within a pass is arbitrary — every dirty page is
+/// flushed regardless — and the strictly-advancing cursor guarantees the daemon's
+/// loop terminates. A page at PIN_SATURATION is skipped (flushed a later pass)
+/// rather than tripping acquireFrame's 255 ceiling.
+pub fn takeNextDirtyGlobal(from_idx: u32) ?GlobalDirtyPage {
+    lock.acquire();
+    defer lock.release();
+    var idx = from_idx;
+    while (idx < CAPACITY) : (idx += 1) {
+        const e = &sets[idx / WAYS].ways[idx % WAYS];
+        if (e.valid and e.dirty) {
+            if (pmm.frameRefCount(e.frame) >= PIN_SATURATION) continue; // skip; flush a later pass
+            pmm.acquireFrame(e.frame); // pin across the lockless writeback I/O
+            return .{ .file_id = e.file_id, .page_off = e.page_off, .frame = e.frame, .next_idx = idx + 1 };
+        }
+    }
+    return null;
+}
+
 /// Clear the dirty flag on a page IFF it's now cache-only (refcount == 1), i.e.
 /// no writable mapper remains that could store new bytes without re-faulting.
 /// Called by munmap/teardown AFTER the region's PTEs are torn down and the
@@ -496,6 +536,43 @@ pub fn residentCount() u32 {
         }
     }
     return n;
+}
+
+/// PMM reclaim callback (registered once from init(); see pmm.registerReclaim).
+/// pmm.tryReclaim invokes this when an allocation fails — currently only the
+/// fault-handler OOM path — to hand frames back by discarding CLEAN cache-only
+/// pages: refcount == 1 (no live mapper) AND !dirty (no unflushed MAP_SHARED
+/// write). Such a page is pure read-cache; dropping it costs only a future refill
+/// from disk, never data. DIRTY pages are skipped here — their writeback needs a
+/// blocking context (a flush daemon cleans them first, Slice 3d-2). Stops once
+/// `needed` frames are freed; returns the count actually freed.
+///
+/// NON-BLOCKING by contract — tryReclaim runs from a page fault (possibly under a
+/// caller's as_lock), so this does no I/O. It holds `lock` and calls releaseFrame
+/// under it: the same `page_cache.lock -> pmm` order, and the same refcount==1
+/// stability argument, as chooseSlot's eviction. A refcount-1 frame is mapped
+/// nowhere, and the only way to raise it to 2 is pin()'s acquireFrame, which runs
+/// under this same lock — so the count cannot rise under us between the check and
+/// releaseFrame. A concurrent unmap can only drop a count toward 1 (more
+/// evictable: safe). Linear scan is fine: every clean page refills identically,
+/// so which ones we drop doesn't matter for correctness.
+pub fn reclaim(needed: u32) u32 {
+    if (needed == 0) return 0;
+    lock.acquire();
+    defer lock.release();
+    var freed: u32 = 0;
+    for (&sets) |*set| {
+        for (&set.ways) |*e| {
+            if (freed >= needed) return freed;
+            if (!e.valid or e.dirty) continue;
+            if (pmm.frameRefCount(e.frame) != 1) continue;
+            pmm.releaseFrame(e.frame); // 1 -> 0: frame returns to the pool
+            e.* = .{};
+            freed += 1;
+            stat_reclaimed += 1;
+        }
+    }
+    return freed;
 }
 
 // ------------------------------- internals ---------------------------------

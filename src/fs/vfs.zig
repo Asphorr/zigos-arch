@@ -475,6 +475,46 @@ pub fn syncCacheFile(inum: u32, clear: bool) u32 {
     return written;
 }
 
+/// Background page-cache writeback (Slice 3d-2's worker half) — the global
+/// analogue of syncCacheFile. Flushes EVERY dirty cache page to disk: the
+/// pgflushd kernel thread (main.zig) calls this on a timer so MAP_SHARED writes
+/// persist to disk periodically without an explicit msync — a live mapping's
+/// pages are re-flushed every pass (refcount>1 keeps them dirty), bounding
+/// crash / bare-exit data loss to one flush interval instead of all of it — and
+/// so any orphaned refcount==1 dirty page is written back and then made
+/// reclaimable. (Full bare-exit persistence of the final pre-exit window needs
+/// the OOM-safe teardown change deferred to Slice 3d-2b.)
+///
+/// Same lock discipline as syncCacheFile: takeNextDirtyGlobal PINS each page
+/// under page_cache.lock, then we drop the lock, do the blocking ext2 writeback,
+/// releaseFrame, and refcount-gate the dirty clear. clearDirtyIfCacheOnly clears
+/// only refcount==1 pages, so a still-live mapper's page stays dirty and is
+/// re-flushed next pass (periodic durability) while an orphaned page is cleaned
+/// and becomes evictable. MUST run with NO spinlock held (writebackPage blocks on
+/// NVMe I/O) — only from the daemon thread, never a syscall under a lock. Returns
+/// the number of pages written back.
+pub fn flushAllDirty() u32 {
+    var cursor: u32 = 0;
+    var written: u32 = 0;
+    while (page_cache.takeNextDirtyGlobal(cursor)) |dp| {
+        cursor = dp.next_idx; // strictly advances -> the pass terminates
+        // The cache is ext2-only, so a dirty page is always an ext2 file page; the
+        // FILE_ID_EXT2 tag-check is defensive against a future fs that would need
+        // its own writeback path.
+        if (dp.file_id & page_cache.FILE_ID_EXT2 != 0) {
+            const inum: u32 = @intCast(dp.file_id & ~page_cache.FILE_ID_EXT2);
+            const src: [*]const u8 = @ptrFromInt(paging.physToVirt(dp.frame));
+            _ = ext2.writebackPage(inum, dp.page_off, src);
+        }
+        pmm.releaseFrame(dp.frame); // drop the writeback pin BEFORE the refcount-gated clear
+        _ = page_cache.clearDirtyIfCacheOnly(dp.file_id, dp.page_off);
+        written += 1;
+    }
+    if (written > 0)
+        @import("../debug/serial.zig").print("[3d] pgflushd wrote {d} dirty page(s)\n", .{written});
+    return written;
+}
+
 pub fn write(pcb: *process.PCB, fd: u32, buf: [*]const u8, count: u32) u32 {
     if (fd >= pcb.fd_table.len or !pcb.fd_table[fd].in_use) return 0xFFFFFFFF;
     const fd_entry = &pcb.fd_table[fd];
