@@ -29,6 +29,8 @@
 const std = @import("std");
 const acpi = @import("acpi.zig");
 const debug = @import("../debug/debug.zig");
+const io = @import("../io.zig"); // SystemIO field access (B2c)
+const paging = @import("../mm/paging.zig"); // SystemMemory field access (B2c)
 
 // Flip to false once the namespace dump has served its purpose (it's one-time
 // boot noise). Kept on through Slice B bring-up so each boot shows the walk.
@@ -87,7 +89,8 @@ pub const NodeKind = enum {
 const Shape = enum {
     scope, // PkgLength NameString <extra> TermList — record + recurse as new scope
     method, // PkgLength NameString flags TermList — record, do NOT recurse (body is code)
-    leaf_pkg, // PkgLength NameString … — record, jump past the package (Field/IndexField/BankField)
+    field, // PkgLength NameString(region) flags FieldList — parse elements (B2c)
+    leaf_pkg, // PkgLength NameString … — record, jump past the package (IndexField/BankField)
     name, // NameString DataRefObject — record, skip the value object
     op_region, // NameString space(byte) offset(TermArg) len(TermArg) — record
     name_byte, // NameString byte — record (Mutex sync flags)
@@ -115,9 +118,9 @@ const op_table = [_]OpInfo{
     .{ .code = 0x5B84, .kind = .power_res, .shape = .scope, .extra = 3 }, // PowerResOp: SystemLevel(1)+ResourceOrder(2)
     .{ .code = 0x5B83, .kind = .processor, .shape = .scope, .extra = 6 }, // ProcessorOp: ProcID(1)+PblkAddr(4)+PblkLen(1)
     .{ .code = 0x5B80, .kind = .op_region, .shape = .op_region }, // OperationRegionOp
-    .{ .code = 0x5B81, .kind = .field, .shape = .leaf_pkg }, // FieldOp
-    .{ .code = 0x5B86, .kind = .field, .shape = .leaf_pkg }, // IndexFieldOp
-    .{ .code = 0x5B87, .kind = .field, .shape = .leaf_pkg }, // BankFieldOp
+    .{ .code = 0x5B81, .kind = .field, .shape = .field }, // FieldOp — parse FieldList (B2c)
+    .{ .code = 0x5B86, .kind = .field, .shape = .leaf_pkg }, // IndexFieldOp (opaque: indirect)
+    .{ .code = 0x5B87, .kind = .field, .shape = .leaf_pkg }, // BankFieldOp (opaque: banked)
     .{ .code = 0x5B01, .kind = .mutex, .shape = .name_byte }, // MutexOp
     .{ .code = 0x5B02, .kind = .event, .shape = .name_only }, // EventOp
     .{ .code = 0xA0, .kind = .other, .shape = .ctrl_pkg }, // IfOp
@@ -379,7 +382,23 @@ fn walkTerms(r: *Reader, end: usize, path: *PathBuf, depth: u8) void {
                 const pkg_end = packageEnd(r, term_start) orelse return;
                 const ns = readNameString(r) orelse return;
                 record(info.kind, path, ns, depth);
-                storeNode(info.kind, path, ns, .{}); // Field elements parsed in B2c
+                storeNode(info.kind, path, ns, .{}); // IndexField/BankField: opaque (indirect)
+                r.pos = pkg_end;
+            },
+            .field => {
+                // FieldOp PkgLength NameString(region) FieldFlags FieldList. The
+                // region NameString is a *reference* (already an OpRegion node),
+                // not a new object; the FieldList's NamedFields are the objects,
+                // created in the current scope. Resolve the region to its node so
+                // each element can reach the hardware (B2c).
+                const pkg_end = packageEnd(r, term_start) orelse return;
+                const region_ns = readNameString(r) orelse return;
+                var region_idx: i32 = -1;
+                if (resolve(path.snapshot(), region_ns)) |rn| {
+                    if (rn.kind == .op_region) region_idx = @intCast(nodeIndexOf(rn));
+                }
+                const flags = r.next() orelse return; // FieldFlags
+                parseFieldList(r, pkg_end, path, region_idx, flags & 0x0F, depth);
                 r.pos = pkg_end;
             },
             .name => {
@@ -531,6 +550,12 @@ const StoredNode = struct {
     region_space: u8 = 0,
     region_off: u64 = 0,
     region_len: u64 = 0,
+    // Field element (B2c, kind == .field): the parent OperationRegion's node
+    // index (-1 if unresolved) plus this element's bit position/width/access.
+    field_region: i32 = -1,
+    field_bit_off: u32 = 0,
+    field_bit_width: u32 = 0,
+    field_access: u8 = 0,
     // Runtime mutable value (B2b): Store-to-Name updates this; reads prefer it
     // over the static DSDT value. Reset every load() (nnodes = 0 re-walks).
     runtime_val: Value = .uninit,
@@ -545,6 +570,10 @@ const Payload = struct {
     region_space: u8 = 0,
     region_off: u64 = 0,
     region_len: u64 = 0,
+    field_region: i32 = -1,
+    field_bit_off: u32 = 0,
+    field_bit_width: u32 = 0,
+    field_access: u8 = 0,
 };
 
 var nodes: [MAX_NODES]StoredNode = undefined;
@@ -571,6 +600,10 @@ fn storeNode(kind: NodeKind, path: *PathBuf, ns: NameString, p: Payload) void {
         .region_space = p.region_space,
         .region_off = p.region_off,
         .region_len = p.region_len,
+        .field_region = p.field_region,
+        .field_bit_off = p.field_bit_off,
+        .field_bit_width = p.field_bit_width,
+        .field_access = p.field_access,
     };
     const cl = @min(full.len, @as(usize, PATH_MAX));
     @memcpy(n.path[0..cl], full[0..cl]);
@@ -1027,7 +1060,11 @@ fn evalNameRef(r: *Reader, st: *ExecState) ?Value {
             var rr = Reader{ .buf = dsdt_body, .pos = node.val_off };
             return evalData(&rr) orelse .uninit;
         },
-        else => return .uninit, // op_region/field/device → B2c or not a value
+        .field => { // B2c: read the backing hardware
+            if (readField(node)) |fv| return .{ .integer = fv };
+            return .uninit;
+        },
+        else => return .uninit, // op_region/device → not a value
     }
 }
 
@@ -1054,11 +1091,14 @@ fn storeTarget(r: *Reader, st: *ExecState, v: Value) bool {
             if (isNameLead(op)) {
                 const ns = readNameString(r) orelse return false;
                 if (resolve(st.scope, ns)) |n| {
-                    if (n.kind == .name) {
-                        n.runtime_val = v;
-                        n.has_runtime = true;
+                    switch (n.kind) {
+                        .name => {
+                            n.runtime_val = v;
+                            n.has_runtime = true;
+                        },
+                        .field => _ = writeField(n, toInt(v)), // B2c: write hardware
+                        else => {},
                     }
-                    // Field/OpRegion writes are B2c.
                 }
                 return true;
             }
@@ -1224,6 +1264,221 @@ fn selfTest() void {
     debug.klog("[aml] executor self-test Add(2,3)->Local0; Return(Local0) = {d} ({s})\n", .{ got, if (got == 5) "PASS" else "FAIL" });
 }
 
+// === B2c: OperationRegion / Field hardware I/O ==============================
+// A Field declares named bit-slices over an OperationRegion. B2c parses the
+// FieldList into .field nodes (parent region + bit offset/width/access) and
+// reads/writes the backing hardware: SystemIO (port in/out) and SystemMemory
+// (physmap). PCI_Config is deferred (needs the enclosing device's _ADR/_BBN).
+// Field reads wire into evalNameRef; writes into storeTarget. Every access is
+// bounds-/mapping-checked — a bad region degrades to uninit, never a fault.
+
+const SPACE_MEM: u8 = 0;
+const SPACE_IO: u8 = 1;
+const SPACE_PCI: u8 = 2;
+
+fn nodeIndexOf(n: *StoredNode) usize {
+    return (@intFromPtr(n) - @intFromPtr(&nodes[0])) / @sizeOf(StoredNode);
+}
+
+/// Parse a FieldList in [r.pos, end), creating a .field node per NamedField in
+/// `path`, tracking the running bit offset and the current AccessType.
+fn parseFieldList(r: *Reader, end: usize, path: *PathBuf, region_idx: i32, access0: u8, depth: u8) void {
+    var bit_off: u32 = 0;
+    var access = access0;
+    while (r.pos < end) {
+        const lead = r.peek(0) orelse return;
+        switch (lead) {
+            0x00 => { // ReservedField: 0x00 PkgLength (= bit width)
+                _ = r.next();
+                const pl = readPkgLength(r) orelse return;
+                bit_off +%= @truncate(pl.value);
+            },
+            0x01 => { // AccessField: 0x01 AccessType AccessAttrib
+                _ = r.next();
+                const at = r.next() orelse return;
+                _ = r.next(); // AccessAttrib
+                access = at & 0x0F;
+            },
+            0x02 => return, // ConnectField (GPIO/SerialBus): hard to bound — stop list
+            0x03 => { // ExtendedAccessField: 0x03 AccessType ExtAttrib AccessLength
+                _ = r.next();
+                const at = r.next() orelse return;
+                _ = r.next();
+                _ = r.next();
+                access = at & 0x0F;
+            },
+            else => { // NamedField: NameSeg(4) PkgLength (= bit width)
+                if (r.rem() < 4) return;
+                var seg: [4]u8 = undefined;
+                seg[0] = r.next().?;
+                seg[1] = r.next().?;
+                seg[2] = r.next().?;
+                seg[3] = r.next().?;
+                if (!(seg[0] == '_' or (seg[0] >= 'A' and seg[0] <= 'Z'))) return; // desync guard
+                const pl = readPkgLength(r) orelse return;
+                const width: u32 = @truncate(pl.value);
+                var ns = NameString{ .rooted = false, .parents = 0, .segs = undefined, .nsegs = 1 };
+                ns.segs[0] = seg;
+                record(.field, path, ns, depth);
+                storeNode(.field, path, ns, .{
+                    .field_region = region_idx,
+                    .field_bit_off = bit_off,
+                    .field_bit_width = width,
+                    .field_access = access,
+                });
+                bit_off +%= width;
+            },
+        }
+    }
+}
+
+fn accessWidthBytes(access: u8) u32 {
+    return switch (access) {
+        1 => 1, // ByteAcc
+        2 => 2, // WordAcc
+        3 => 4, // DWordAcc
+        4 => 8, // QWordAcc
+        else => 1, // AnyAcc / BufferAcc / unknown → byte
+    };
+}
+
+fn physMapped(phys: u64, len: u64) bool {
+    if (phys == 0 or len == 0) return false;
+    if (phys > paging.PHYSMAP_SIZE or len > paging.PHYSMAP_SIZE - phys) return false;
+    return paging.isMapped(paging.physToVirt(phys));
+}
+
+/// Read one access-width unit (1/2/4/8 bytes) from a region at a byte offset.
+fn readRegionUnit(region: *const StoredNode, byte_off: u64, width: u32) ?u64 {
+    switch (region.region_space) {
+        SPACE_IO => {
+            const base = region.region_off + byte_off;
+            if (base > 0xFFFF) return null;
+            const port: u16 = @intCast(base);
+            return switch (width) {
+                1 => io.inb(port),
+                2 => io.inw(port),
+                4 => io.inl(port),
+                8 => @as(u64, io.inl(port)) | (@as(u64, io.inl(port +% 4)) << 32),
+                else => null,
+            };
+        },
+        SPACE_MEM => {
+            const phys = region.region_off + byte_off;
+            if (!physMapped(phys, width)) return null;
+            const va = paging.physToVirt(phys);
+            return switch (width) {
+                1 => @as(*align(1) const u8, @ptrFromInt(va)).*,
+                2 => @as(*align(1) const u16, @ptrFromInt(va)).*,
+                4 => @as(*align(1) const u32, @ptrFromInt(va)).*,
+                8 => @as(*align(1) const u64, @ptrFromInt(va)).*,
+                else => null,
+            };
+        },
+        else => return null, // PCI_Config + others: deferred
+    }
+}
+
+fn writeRegionUnit(region: *const StoredNode, byte_off: u64, width: u32, val: u64) bool {
+    switch (region.region_space) {
+        SPACE_IO => {
+            const base = region.region_off + byte_off;
+            if (base > 0xFFFF) return false;
+            const port: u16 = @intCast(base);
+            switch (width) {
+                1 => io.outb(port, @truncate(val)),
+                2 => io.outw(port, @truncate(val)),
+                4 => io.outl(port, @truncate(val)),
+                8 => {
+                    io.outl(port, @truncate(val));
+                    io.outl(port +% 4, @truncate(val >> 32));
+                },
+                else => return false,
+            }
+            return true;
+        },
+        SPACE_MEM => {
+            const phys = region.region_off + byte_off;
+            if (!physMapped(phys, width)) return false;
+            const va = paging.physToVirt(phys);
+            switch (width) {
+                1 => @as(*align(1) u8, @ptrFromInt(va)).* = @truncate(val),
+                2 => @as(*align(1) u16, @ptrFromInt(va)).* = @truncate(val),
+                4 => @as(*align(1) u32, @ptrFromInt(va)).* = @truncate(val),
+                8 => @as(*align(1) u64, @ptrFromInt(va)).* = val,
+                else => return false,
+            }
+            return true;
+        },
+        else => return false,
+    }
+}
+
+/// Read a scalar field (≤ 64 bits) by assembling the access-width units it
+/// spans and extracting its bit-slice. Null for unsupported widths, unresolved
+/// regions, or an access window too wide to fit a u64.
+fn readField(field: *const StoredNode) ?u64 {
+    if (field.field_region < 0) return null;
+    const ridx: usize = @intCast(field.field_region);
+    if (ridx >= nnodes) return null;
+    const region = &nodes[ridx];
+    const width = field.field_bit_width;
+    if (width == 0 or width > 64) return null;
+    const ab = accessWidthBytes(field.field_access);
+    const abits = ab * 8;
+    const first_unit = field.field_bit_off / abits;
+    const last_unit = (field.field_bit_off + width - 1) / abits;
+    const n_units = last_unit - first_unit + 1;
+    if (n_units * abits > 64) return null;
+    var raw: u64 = 0;
+    var u: u32 = 0;
+    while (u < n_units) : (u += 1) {
+        const unit_byte = @as(u64, first_unit + u) * @as(u64, ab);
+        const v = readRegionUnit(region, unit_byte, ab) orelse return null;
+        raw |= v << @as(u6, @intCast(u * abits));
+    }
+    const shift: u32 = field.field_bit_off - first_unit * abits;
+    const shifted = raw >> @as(u6, @intCast(shift));
+    if (width >= 64) return shifted;
+    return shifted & ((@as(u64, 1) << @as(u6, @intCast(width))) - 1);
+}
+
+/// Write a scalar field (≤ 64 bits), preserving surrounding bits (Preserve
+/// UpdateRule) via read-modify-write across the spanned access units.
+fn writeField(field: *const StoredNode, value: u64) bool {
+    if (field.field_region < 0) return false;
+    const ridx: usize = @intCast(field.field_region);
+    if (ridx >= nnodes) return false;
+    const region = &nodes[ridx];
+    const width = field.field_bit_width;
+    if (width == 0 or width > 64) return false;
+    const ab = accessWidthBytes(field.field_access);
+    const abits = ab * 8;
+    const first_unit = field.field_bit_off / abits;
+    const last_unit = (field.field_bit_off + width - 1) / abits;
+    const n_units = last_unit - first_unit + 1;
+    if (n_units * abits > 64) return false;
+    const shift: u32 = field.field_bit_off - first_unit * abits;
+    const field_mask: u64 = if (width >= 64) ~@as(u64, 0) else (@as(u64, 1) << @as(u6, @intCast(width))) - 1;
+    const window_mask = field_mask << @as(u6, @intCast(shift));
+    var cur: u64 = 0;
+    var u: u32 = 0;
+    while (u < n_units) : (u += 1) {
+        const unit_byte = @as(u64, first_unit + u) * @as(u64, ab);
+        const v = readRegionUnit(region, unit_byte, ab) orelse return false;
+        cur |= v << @as(u6, @intCast(u * abits));
+    }
+    cur = (cur & ~window_mask) | ((value & field_mask) << @as(u6, @intCast(shift)));
+    const unit_mask: u64 = if (abits >= 64) ~@as(u64, 0) else (@as(u64, 1) << @as(u6, @intCast(abits))) - 1;
+    u = 0;
+    while (u < n_units) : (u += 1) {
+        const unit_byte = @as(u64, first_unit + u) * @as(u64, ab);
+        const piece = (cur >> @as(u6, @intCast(u * abits))) & unit_mask;
+        if (!writeRegionUnit(region, unit_byte, ab, piece)) return false;
+    }
+    return true;
+}
+
 // --- entry point ------------------------------------------------------------
 
 /// Decode the cached DSDT and walk its namespace. Call after acpi.init has
@@ -1299,6 +1554,32 @@ pub fn load() u32 {
         }
     } else {
         debug.klog("[aml] \\_SB_.PCI0._PRT not found / not invokable\n", .{});
+    }
+
+    // B2c proof: report parsed field elements and read one live hardware field
+    // (the first SystemIO field — a port `in`, side-effect-free on these ACPI
+    // status registers). Proves FieldList parse + region access end to end.
+    var nfields: u32 = 0;
+    var first_io: ?usize = null;
+    var fi: usize = 0;
+    while (fi < nnodes) : (fi += 1) {
+        if (nodes[fi].kind == .field and nodes[fi].field_region >= 0) {
+            nfields += 1;
+            if (first_io == null) {
+                const ridx: usize = @intCast(nodes[fi].field_region);
+                if (ridx < nnodes and nodes[ridx].region_space == SPACE_IO) first_io = fi;
+            }
+        }
+    }
+    debug.klog("[aml] parsed {d} field elements over OperationRegions\n", .{nfields});
+    if (first_io) |idx| {
+        const f = &nodes[idx];
+        const region = &nodes[@as(usize, @intCast(f.field_region))];
+        if (readField(f)) |val| {
+            debug.klog("[aml] live field read {s} @ SystemIO 0x{X}+{d}b w{d} = 0x{X}\n", .{ f.path[0..f.path_len], region.region_off, f.field_bit_off, f.field_bit_width, val });
+        } else {
+            debug.klog("[aml] live field read {s}: unsupported\n", .{f.path[0..f.path_len]});
+        }
     }
     return node_count;
 }
