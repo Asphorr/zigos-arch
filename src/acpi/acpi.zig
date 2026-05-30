@@ -591,6 +591,11 @@ pub fn init(boot_rsdp: u64) void {
         if (mcfg != null) "yes" else "no",
         if (dmar != null) "yes" else "no",
     });
+
+    // Dynamic ACPI (Slice B): decode the DSDT's AML into a namespace. Best-
+    // effort + fully bounds-checked; a malformed DSDT yields a partial walk,
+    // never a fault. For bring-up this dumps the discovered objects to serial.
+    _ = @import("aml.zig").load();
 }
 
 // --- MADT iterator ----------------------------------------------------------
