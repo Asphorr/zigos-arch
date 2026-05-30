@@ -370,6 +370,10 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     // fault-event MSIs to our IDT vector instead of accumulating silently
     // in FSTS/FRR.
     @import("cpu/mmu/iommu.zig").armFaultMsi();
+    // Dynamic ACPI: enable ACPI mode and wire the fixed power button to a clean
+    // OS shutdown via the SCI. Needs the FADT (acpi.init) and the IOAPIC
+    // (apic.init) — both up by here. Best-effort; logs and continues on quirks.
+    @import("time/sci.zig").init();
     // Wall-clock time: latch boot epoch from RTC + HPET.
     @import("time/time.zig").init();
     blog.ok("Wall-clock epoch");
@@ -433,6 +437,12 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
         if (@import("proc/lifecycle.zig").createKernelTask(@intFromPtr(&pgflushdEntry), "pgflushd", 0, .normal, 32 * 1024) == null)
             blog.warn("pgflushd", "spawn failed — MAP_SHARED dirty pages won't auto-persist", .{});
     }
+    // acpid — consumes the power-button flag set by the SCI handler (sci.zig)
+    // and runs the graceful shutdown in thread context (FS flush + S5 enter),
+    // which must NOT happen inside the SCI IRQ. Spawned unconditionally so the
+    // power button works regardless of which filesystem mounted.
+    if (@import("proc/lifecycle.zig").createKernelTask(@intFromPtr(&acpidEntry), "acpid", 0, .normal, 16 * 1024) == null)
+        blog.warn("acpid", "spawn failed — ACPI power button won't trigger shutdown", .{});
     verifyBuildId();
     blog.ok("Build-ID stamp");
     @import("debug/symbols.zig").loadKernelSymbols();
@@ -803,6 +813,26 @@ fn pgflushdEntry() callconv(.c) noreturn {
     while (true) {
         sched.kernelSleepMs(PGFLUSH_INTERVAL_MS);
         _ = vfs.flushAllDirty();
+    }
+}
+
+/// acpid kernel-thread entry (dynamic-ACPI Slice A). Polls the power-button flag
+/// the SCI handler sets (sci.takePowerOffRequest) and, on a press, runs the same
+/// graceful power-off as the shutdown(0) syscall — FS cache flush + NVMe sync +
+/// S5 enter. This must run here, in thread context, not in the SCI IRQ:
+/// sysShutdown takes FS locks and polls device I/O. A 250 ms poll is
+/// imperceptible for a power button and the thread is otherwise asleep.
+/// (Future: wake-driven via proc.wake instead of polled.)
+const ACPID_POLL_MS: u32 = 250;
+fn acpidEntry() callconv(.c) noreturn {
+    const sched = @import("proc/sched.zig");
+    const sci = @import("time/sci.zig");
+    while (true) {
+        sched.kernelSleepMs(ACPID_POLL_MS);
+        if (sci.takePowerOffRequest()) {
+            debug.klog("[acpid] power-off requested — flushing caches + entering S5\n", .{});
+            _ = @import("cpu/syscall/sys.zig").sysShutdown(0); // never returns
+        }
     }
 }
 

@@ -351,6 +351,31 @@ pub fn maskIsaIrq(isa_irq: u8, vector: u8) void {
     debug.klog("[apic] ISA IRQ{d} -> GSI{d} masked at IOAPIC\n", .{ isa_irq, gsi });
 }
 
+/// Route the ACPI SCI (System Control Interrupt) GSI to `vector` through the
+/// IOAPIC, unmasked. Per ACPI 6.4 §5.8.1 the SCI is a sharable, LEVEL-triggered
+/// interrupt; its polarity is active-low by spec default, but firmware may
+/// override it via a MADT Interrupt Source Override (QEMU declares the SCI —
+/// GSI 9 — active-HIGH, level). We therefore always force level trigger (the
+/// spec guarantees it) and take polarity from the ISO when one exists for this
+/// GSI, else the spec-default active-low.
+///
+/// `iso_flags` is indexed by ISO *source* IRQ; for the SCI the source and GSI
+/// coincide on every PC firmware we target (QEMU maps IRQ9 → GSI9 identity), so
+/// `iso_flags[gsi]` carries the SCI's electrical config. The caller (sci.zig)
+/// has already enabled the source and storm-proofed it (GPEs masked), so we
+/// unmask immediately.
+pub fn routeSci(gsi: u8, vector: u8) void {
+    var polarity_low = true; // ACPI spec default for the SCI
+    if (gsi < 16 and iso_remap[gsi] != 0xFF) {
+        // ISO polarity bits 0-1: 11 = active low, 01 = active high, 00 = bus default.
+        polarity_low = (iso_flags[gsi] & 0b11) == 0b11;
+    }
+    ioapicSetEntry(gsi, vector, false, polarity_low, true); // unmasked, level-triggered
+    debug.klog("[apic] SCI GSI{d} -> vec=0x{X} pol={s} level\n", .{
+        gsi, vector, if (polarity_low) "low" else "high",
+    });
+}
+
 fn initIOAPIC() void {
     const ver = ioapicRead(IOAPIC_VER_REG);
     const max_entries: u8 = @truncate((ver >> 16) & 0xFF);
