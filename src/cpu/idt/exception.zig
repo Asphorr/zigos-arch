@@ -556,6 +556,16 @@ export fn handleException(rsp: u64) callconv(.c) void {
             var rbp: usize = @intCast(saved_rbp);
             var depth: u32 = 0;
             while (rbp >= 0x100000 and rbp < 0x600000 and depth < 16) : (depth += 1) {
+                // Don't fault the handler: if this frame's page isn't mapped, a
+                // SECONDARY #PF reading through it would escalate a survivable
+                // user fault into a kernel panic. Stop the walk instead. (Same
+                // isMapped guard the Code-bytes dump above already uses.) We
+                // read frame[0] (at rbp) AND frame[1] (at rbp+8), so a corrupt
+                // rbp 8 bytes shy of a page edge could straddle into the next,
+                // non-present page — gate both. (rbp < 0x600000 here, so rbp+8
+                // can't overflow.)
+                if (!@import("../../mm/paging.zig").isMapped(rbp) or
+                    !@import("../../mm/paging.zig").isMapped(rbp + 8)) break;
                 const frame: [*]const usize = @ptrFromInt(rbp);
                 const ret_addr: u64 = @intCast(frame[1]);
                 if (ret_addr == 0) break;
@@ -574,7 +584,9 @@ export fn handleException(rsp: u64) callconv(.c) void {
         // -fomit-frame-pointer code, clobbered RBP). Scan up to 64 stack words
         // looking for values that look like return addresses into a known
         // user code segment, and dedupe.
-        if (bt_frames < 2 and saved_rsp >= 0x100000 and saved_rsp < 0x600000) {
+        if (bt_frames < 2 and saved_rsp >= 0x100000 and saved_rsp < 0x600000 and
+            @import("../../mm/paging.zig").isMapped(saved_rsp))
+        {
             serial.print("  Stack scan candidates:\n", .{});
             const stack_page_end = (saved_rsp & ~@as(u64, 0xFFF)) + 0x1000;
             const sp: [*]const u64 = @ptrFromInt(saved_rsp);
@@ -614,7 +626,9 @@ export fn handleException(rsp: u64) callconv(.c) void {
             // walk is short (e.g. memcpy clobbered RBP via prologue or the
             // crash is in -fomit-frame-pointer code). 64 bytes covers the
             // typical "saved args + return slot" window of a small frame.
-            if (saved_rsp >= 0x100000 and saved_rsp < 0x600000) {
+            if (saved_rsp >= 0x100000 and saved_rsp < 0x600000 and
+                @import("../../mm/paging.zig").isMapped(saved_rsp))
+            {
                 serial.print("  Stack hex (64B from RSP):\n", .{});
                 const stack_page_end = (saved_rsp & ~@as(u64, 0xFFF)) + 0x1000;
                 const sp: [*]const u8 = @ptrFromInt(saved_rsp);
