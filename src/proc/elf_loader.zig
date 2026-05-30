@@ -195,6 +195,177 @@ fn registerSegments(pid: usize, elf_buf: [*]const u8, phoff: usize, phnum: u16, 
     return needs_elf_buf;
 }
 
+// --- Linux personality: SysV initial process stack ---------------------------
+// A Linux x86-64 `_start` reads argc/argv/envp/auxv off the stack (RSP → argc)
+// and sets up TLS from the auxiliary vector — none of which the native zigos
+// path provides (native argv arrives via syscalls). For a .linux process we
+// eagerly map the top stack page, lay down the SysV block there, and point the
+// task's first-dispatch RSP at argc. The whole block is ~300 bytes, so one
+// eager page suffices; the rest of the stack stays lazy. That page is a normal
+// private anon frame — destroyAddressSpace reclaims it on exit like any other.
+
+// Linux auxv tags (the subset we populate).
+const AT_NULL: u64 = 0;
+const AT_PHDR: u64 = 3;
+const AT_PHENT: u64 = 4;
+const AT_PHNUM: u64 = 5;
+const AT_PAGESZ: u64 = 6;
+const AT_ENTRY: u64 = 9;
+const AT_UID: u64 = 11;
+const AT_EUID: u64 = 12;
+const AT_GID: u64 = 13;
+const AT_EGID: u64 = 14;
+const AT_HWCAP: u64 = 16;
+const AT_CLKTCK: u64 = 17;
+const AT_SECURE: u64 = 23;
+const AT_RANDOM: u64 = 25;
+
+const PT_LOAD_T: u32 = 1;
+const PT_PHDR_T: u32 = 6;
+
+inline fn rdtsc() u64 {
+    var lo: u32 = undefined;
+    var hi: u32 = undefined;
+    asm volatile ("rdtsc"
+        : [lo] "={eax}" (lo),
+          [hi] "={edx}" (hi),
+    );
+    return (@as(u64, hi) << 32) | lo;
+}
+
+/// Build the SysV initial stack for a .linux process and point its first-
+/// dispatch RSP at argc. `pd` is the new address space, `stack_top` the
+/// page-aligned top of the user stack region, `elf_buf` the kernel-side
+/// whole-file image (still valid — the caller invokes this before any elf_buf
+/// drop). Returns false if the top page couldn't be mapped (caller kills it).
+fn setupLinuxInitialStack(
+    pid: usize,
+    pd: [*]align(4096) u64,
+    stack_top: usize,
+    elf_buf: [*]align(4) const u8,
+) bool {
+    const header = @as([*]align(1) const Header, @ptrCast(elf_buf))[0];
+    const phoff: usize = @intCast(header.phoff);
+    const phnum: u16 = header.phnum;
+    const phentsize: u64 = header.phentsize;
+    const entry: u64 = header.entry;
+    const phdrs: [*]align(1) const ProgramHeader = @ptrCast(elf_buf + phoff);
+
+    // AT_PHDR: where the program headers live in the *process's* memory. Prefer
+    // an explicit PT_PHDR; else the first PT_LOAD mapping file offset 0 (it
+    // covers the ELF header, so the phdrs sit at p_vaddr + e_phoff). The page
+    // holding them is demand-paged from the text segment when musl reads it.
+    var phdr_va: u64 = 0;
+    {
+        var found = false;
+        for (0..phnum) |i| {
+            if (phdrs[i].p_type == PT_PHDR_T) {
+                phdr_va = phdrs[i].p_vaddr;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            for (0..phnum) |i| {
+                if (phdrs[i].p_type == PT_LOAD_T and phdrs[i].p_offset == 0) {
+                    phdr_va = phdrs[i].p_vaddr + phoff;
+                    break;
+                }
+            }
+        }
+    }
+
+    // Eagerly back the top stack page with a zeroed anon frame, mapped RW/NX
+    // exactly as the lazy stack-fault path would (protToMapFlags(R|W)).
+    const page_base: usize = stack_top - PAGE_SIZE;
+    const flags = vmm.protToMapFlags(process.PROT_READ | process.PROT_WRITE);
+    const frame = vmm.allocAndMapUserPage(pd, page_base, flags) catch {
+        debug.klog("[linux] setupLinuxInitialStack: map of top stack page failed\n", .{});
+        return false;
+    };
+    const kbuf: [*]u8 = @ptrFromInt(paging.physToVirt(frame)); // physmap alias, zeroed
+
+    // Strings/data at the top of the page (descending); the argc/argv/envp/auxv
+    // arrays go below them.
+    var off: usize = PAGE_SIZE;
+
+    // 16 random bytes for AT_RANDOM (musl seeds its stack canary from these).
+    // rdtsc-derived — not cryptographic, but canary strength isn't an M1 goal;
+    // what matters is the pointer is valid and the bytes vary per launch.
+    off -= 16;
+    const rand_off = off;
+    {
+        const r0 = rdtsc() ^ (@as(u64, pid) << 40);
+        const r1 = (rdtsc() << 1) ^ 0x9E3779B97F4A7C15;
+        var k: usize = 0;
+        while (k < 8) : (k += 1) {
+            kbuf[rand_off + k] = @truncate(r0 >> @intCast(k * 8));
+            kbuf[rand_off + 8 + k] = @truncate(r1 >> @intCast(k * 8));
+        }
+    }
+    const rand_va: u64 = page_base + rand_off;
+
+    // argv[0] string — the program name (for getprogname / err()). Capped so it
+    // can never crowd the arrays out of the page.
+    const pcb = process.getPCB(pid);
+    const name_len: usize = @min(@as(usize, pcb.name_len), pcb.name.len);
+    const argv0_str: []const u8 = if (name_len > 0) pcb.name[0..name_len] else "prog";
+    off -= argv0_str.len + 1;
+    const argv0_off = off;
+    for (argv0_str, 0..) |c, k| kbuf[argv0_off + k] = c;
+    kbuf[argv0_off + argv0_str.len] = 0;
+    const argv0_va: u64 = page_base + argv0_off;
+
+    // Auxiliary vector — (type,value) pairs, AT_NULL-terminated.
+    const auxv = [_][2]u64{
+        .{ AT_PHDR, phdr_va },
+        .{ AT_PHENT, phentsize },
+        .{ AT_PHNUM, @intCast(phnum) },
+        .{ AT_PAGESZ, PAGE_SIZE },
+        .{ AT_ENTRY, entry },
+        .{ AT_RANDOM, rand_va },
+        .{ AT_UID, 0 },
+        .{ AT_EUID, 0 },
+        .{ AT_GID, 0 },
+        .{ AT_EGID, 0 },
+        .{ AT_SECURE, 0 },
+        .{ AT_CLKTCK, 100 },
+        .{ AT_HWCAP, 0 },
+        .{ AT_NULL, 0 },
+    };
+
+    // word layout (low→high): argc | argv[0] | NULL | envp NULL | auxv pairs.
+    // M1 is always argc=1 (no real argv yet); M2 generalizes this.
+    const argc: usize = 1;
+    const words: usize = 1 + (argc + 1) + 1 + auxv.len * 2;
+    var block_off: usize = off - words * 8;
+    block_off &= ~@as(usize, 0xF); // &argc must be 16-byte aligned at _start
+    const argc_va: u64 = page_base + block_off;
+
+    const wp: [*]align(1) u64 = @ptrFromInt(@intFromPtr(kbuf) + block_off);
+    var w: usize = 0;
+    wp[w] = argc; w += 1;
+    wp[w] = argv0_va; w += 1;
+    wp[w] = 0; w += 1; // argv terminator
+    wp[w] = 0; w += 1; // envp terminator (no env for M1)
+    for (auxv) |pair| {
+        wp[w] = pair[0]; w += 1;
+        wp[w] = pair[1]; w += 1;
+    }
+
+    // Point the task's first-dispatch RSP at argc (overriding create()'s native
+    // (16-aligned − 8) value). retToUserStub iretqs through frame[15..20];
+    // frame[18] is RSP. The frame sits at kstack_top − 20 qwords.
+    const PT_REGS_QWORDS: usize = 20;
+    const iretf: [*]u64 = @ptrFromInt(process.procs[pid].kernel_stack_top - PT_REGS_QWORDS * 8);
+    iretf[18] = argc_va;
+
+    debug.klog("[linux] pid={d} SysV stack: rsp=0x{X} argv0='{s}' phdr=0x{X} phnum={d} entry=0x{X}\n", .{
+        pid, argc_va, argv0_str, phdr_va, phnum, entry,
+    });
+    return true;
+}
+
 /// Load an ELF and create the process, but don't enter user mode.
 /// Returns PID or null. Used by the desktop for multitasking.
 ///
@@ -285,6 +456,11 @@ pub fn loadAndStart(elf_buf: [*]align(4) u8, file_size: usize, elf_buf_pages: u3
     pcb.elf_buf = elf_buf;
     pcb.elf_buf_pages = elf_buf_pages;
     pcb.stack_base = stack_base;
+    // ABI personality: EI_OSABI (e_ident[7]) == ELFOSABI_LINUX (3) marks an
+    // unmodified Linux x86-64 binary, so its `syscall`s route to the Linux
+    // translation layer (syscall/linux.zig). Native zigos ELFs have OSABI 0.
+    // One detection point here covers every launch path (shell/desktop/smp).
+    pcb.personality = if (header.ident[7] == 3) .linux else .native;
 
     // Register lazy regions: stack first (region 0), then each PT_LOAD segment
     // (regions 1..N). Heap is registered later by sysSbrk.
@@ -298,6 +474,18 @@ pub fn loadAndStart(elf_buf: [*]align(4) u8, file_size: usize, elf_buf_pages: u3
         process.killProcess(@intCast(pid));
         return null;
     };
+
+    // Linux personality: build the SysV initial stack (argc/argv/envp/auxv +
+    // RSP) BEFORE elf_buf can be dropped below — setupLinuxInitialStack reads
+    // the program headers out of it. Native processes get argv via syscalls and
+    // skip this entirely.
+    if (pcb.personality == .linux) {
+        if (!setupLinuxInitialStack(pid, pd, stack_top, elf_buf)) {
+            debug.klog("[linux] initial-stack setup failed for PID {d}\n", .{pid});
+            process.killProcess(@intCast(pid));
+            return null;
+        }
+    }
 
     // Parse debug symbols from ELF section headers (use kernel-side ELF buffer).
     pcb.sym_table = symbols.parseElfSymbols(elf_buf, file_size);
@@ -370,6 +558,8 @@ pub fn loadAndExecute(elf_buf: [*]align(4) u8, file_size: usize, elf_buf_pages: 
     pcb.elf_buf = elf_buf;
     pcb.elf_buf_pages = elf_buf_pages;
     pcb.stack_base = stack_base;
+    // ABI personality (see loadAndStart): Linux OSABI(3) → Linux syscall layer.
+    pcb.personality = if (header.ident[7] == 3) .linux else .native;
 
     if (!process.addLazyRegion(pid, stack_base, stack_top, 0)) {
         vga.fg = .LightRed;
@@ -385,6 +575,16 @@ pub fn loadAndExecute(elf_buf: [*]align(4) u8, file_size: usize, elf_buf_pages: 
         process.killProcess(@intCast(pid));
         return;
     };
+
+    // Linux personality: build the SysV initial stack before any elf_buf drop
+    // (see loadAndStart for the full rationale).
+    if (pcb.personality == .linux) {
+        if (!setupLinuxInitialStack(pid, pd, stack_top, elf_buf)) {
+            debug.klog("[linux] initial-stack setup failed for PID {d}\n", .{pid});
+            process.killProcess(@intCast(pid));
+            return;
+        }
+    }
 
     // Parse debug symbols from ELF section headers (use kernel-side ELF buffer).
     pcb.sym_table = symbols.parseElfSymbols(elf_buf, file_size);

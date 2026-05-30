@@ -398,6 +398,9 @@ pub fn forkCurrent(frame: *signals.SyscallFrame) ?usize {
     process.procs[i].argc = parent.argc;
     process.procs[i].priority = parent.priority;
     process.procs[i].fs_base = parent.fs_base;
+    // A Linux process's forked children are Linux too — inherit the ABI
+    // personality so the child's syscalls route to the same translation layer.
+    process.procs[i].personality = parent.personality;
 
     process.procs[i].parent_pid = parent_pid_u8;
     process.procs[i].tgid = @intCast(i); // lead thread of the new process group

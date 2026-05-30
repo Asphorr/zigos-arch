@@ -29,7 +29,7 @@ const sys = @import("syscall/sys.zig");
 /// blocks for seconds" class without spamming normal blocking primitives.
 const SLOW_SYSCALL_THRESHOLD_MS: u64 = 5;
 
-export fn doSyscall(sys_num: u32, arg1: u32, arg2: u32, arg3: u32, frame_raw: *anyopaque) callconv(.c) u32 {
+export fn doSyscall(sys_num: u32, arg1: u32, arg2: u32, arg3: u32, frame_raw: *anyopaque) callconv(.c) u64 {
     // Per-CPU breadcrumb — stamp BEFORE everything else so even if we panic
     // mid-syscall, the autopsy reflects what this CPU was doing.
     @import("../debug/breadcrumb.zig").stamp(.syscall_entry, sys_num);
@@ -128,13 +128,25 @@ export fn doSyscall(sys_num: u32, arg1: u32, arg2: u32, arg3: u32, frame_raw: *a
     // layout matches the push order in syscall_entry.zig — see signals.zig.
     const frame: *signals.SyscallFrame = @ptrCast(@alignCast(frame_raw));
 
+    // Linux-personality processes use a completely separate ABI — 6×u64 args
+    // read from the frame, Linux syscall numbers, u64 return. Route them to the
+    // Linux translation layer, bypassing native dispatch + native signal
+    // handling (native sigreturn/signals don't apply to a Linux binary; Linux
+    // signal delivery, when it lands, hooks in here). This still returns through
+    // the perf `defer` above, so accounting is unaffected.
+    if (process.currentPCB()) |pcb| {
+        if (pcb.personality == .linux) {
+            return @import("syscall/linux.zig").dispatch(sys_num, frame);
+        }
+    }
+
     // Sigreturn (#62) MUST short-circuit normal dispatch + signal-on-return —
     // it has its own special return semantics (returns the user's saved RAX,
     // and rewrites the caller's saved frame so sysret resumes pre-signal user
     // state). Routing it through the regular path would re-deliver any still-
     // pending signal before user code runs the post-handler instruction.
     if (sys_num == 62) {
-        if (process.currentPCB()) |pcb| return signals.sigreturn(pcb, frame);
+        if (process.currentPCB()) |pcb| return @as(u64, signals.sigreturn(pcb, frame));
         return 0;
     }
 
@@ -145,10 +157,10 @@ export fn doSyscall(sys_num: u32, arg1: u32, arg2: u32, arg3: u32, frame_raw: *a
     // is a no-op when the process is mid-handler (in_signal_handler == true).
     if (process.currentPCB()) |pcb| {
         if ((@atomicLoad(u32, &pcb.pending_signals, .acquire) & ~pcb.signal_mask) != 0) {
-            return signals.deliverFromSyscallFrame(pcb, frame, ret);
+            return @as(u64, signals.deliverFromSyscallFrame(pcb, frame, ret));
         }
     }
-    return ret;
+    return @as(u64, ret);
 }
 
 // ===========================================================================

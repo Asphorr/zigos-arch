@@ -163,6 +163,13 @@ pub const FileDesc = struct {
     pipe_id: u8 = 0xFF, // valid only when fs_type == .pipe
 };
 
+/// ABI personality of a process — selects which translation the `syscall`
+/// instruction routes to. `.native` is zigos's own ABI (3×u32 args, native
+/// numbers, u32 return); `.linux` is an unmodified Linux x86-64 binary (6×u64
+/// args read from the saved frame, Linux numbers, u64 return — see
+/// syscall/linux.zig). Set by the Linux ELF load path; inherited across fork.
+pub const Personality = enum(u8) { native, linux };
+
 pub const PCB = struct {
     // Access-tag legend (see docs/STYLE.md): (p:lock) protected by lock,
     // (a) atomic, (c) const-after-init. Fields without a tag are
@@ -336,6 +343,12 @@ pub const PCB = struct {
     // Per-thread TLS base (written to IA32_FS_BASE on dispatch). 0 = no
     // TLS / inherit. Set by sysSetTls.
     fs_base: u64 = 0,
+    /// ABI personality of this process. .native = zigos's own syscall ABI
+    /// (3×u32 args, native numbers) — the default. .linux = an unmodified
+    /// Linux x86-64 binary (6×u64 args, Linux numbers, SysV initial stack);
+    /// doSyscall reroutes these to syscall/linux.zig. Set by the Linux ELF
+    /// load path and inherited across fork. (`Personality` is module-level.)
+    personality: Personality = .native,
     // Userspace tid pointer — when this thread exits, futex-wake any
     // thread joining on this address. 0 = no join address.
     clear_child_tid: u32 = 0,

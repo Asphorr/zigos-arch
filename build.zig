@@ -1048,7 +1048,7 @@ pub fn build(b: *std.Build) void {
         \\
         \\# Skip rebuild if every input file is older than the image.
         \\if [ -f $IMG ]; then
-        \\  newest=$( { ls -t zig-out/bin/*.elf zig-out/bin/KERNEL.SYM zig-out/bin/BUILD.ID doom1.wad www/* 2>/dev/null; find share -type f -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2; } | head -1 || true)
+        \\  newest=$( { ls -t zig-out/bin/*.elf zig-out/bin/KERNEL.SYM zig-out/bin/BUILD.ID doom1.wad www/* linux-bin/* 2>/dev/null; find share -type f -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2; } | head -1 || true)
         \\  if [ -n "$newest" ] && [ "$newest" -ot $IMG ]; then
         \\    echo "[ext2] up-to-date $(($(date +%s%3N)-T0))ms"
         \\    exit 0
@@ -1058,6 +1058,12 @@ pub fn build(b: *std.Build) void {
         \\rm -rf $STAGE
         \\mkdir -p $STAGE/bin $STAGE/etc $STAGE/share $STAGE/var/log
         \\for f in zig-out/bin/*.elf; do
+        \\  [ -f "$f" ] && cp "$f" $STAGE/bin/
+        \\done
+        \\# Linux-personality test binaries: hand-built static x86-64 ELFs
+        \\# (EI_OSABI=3) staged into /bin next to native apps. The loader routes
+        \\# them to the Linux syscall layer (syscall/linux.zig) by their OSABI.
+        \\for f in linux-bin/*; do
         \\  [ -f "$f" ] && cp "$f" $STAGE/bin/
         \\done
         \\[ -f zig-out/bin/KERNEL.SYM ] && cp zig-out/bin/KERNEL.SYM $STAGE/
@@ -1098,6 +1104,9 @@ pub fn build(b: *std.Build) void {
         \\# file ends up sparse so unused capacity costs ~nothing. -N 8192 inode
         \\# table covers DDLC's ~1500 small assets (442 PNG + 64 OGG + ~1000 misc)
         \\# with headroom for system files.
+        \\# genext2fs won't cleanly overwrite an existing image — remove first
+        \\# so a triggered rebuild (e.g. a new input under linux-bin/) succeeds.
+        \\rm -f $IMG
         \\genext2fs -B 4096 -b 131072 -N 8192 -d $STAGE -q $IMG
         \\echo "[ext2] rebuilt ($(du -h $IMG | cut -f1)) $(($(date +%s%3N)-T0))ms"
         ,

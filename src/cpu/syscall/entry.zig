@@ -167,7 +167,7 @@ fn wrmsr(msr: u32, value: u64) void {
 // The smp.zig assert guarantees the 8-byte read doesn't straddle a cache
 // line, so a same-CPU setTssRsp0 update is observed atomically here.
 
-extern fn doSyscall(num: u32, arg1: u32, arg2: u32, arg3: u32, frame: *anyopaque) callconv(.c) u32;
+extern fn doSyscall(num: u32, arg1: u32, arg2: u32, arg3: u32, frame: *anyopaque) callconv(.c) u64;
 
 fn CpuEntry(comptime cpu_id: u8) type {
     const off_user_rsp_str = std.fmt.comptimePrint("{d}", .{@as(usize, cpu_id) * 8});
