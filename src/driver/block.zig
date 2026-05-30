@@ -54,7 +54,7 @@ pub fn readSector(lba: u32, dest: [*]u8) void {
     }
 }
 
-pub fn readSectors(lba: u32, count: u8, dest: [*]u8) void {
+pub fn readSectors(lba: u32, count: u16, dest: [*]u8) void {
     switch (backend) {
         .none => {},
         .ata => ata.readSectors(lba, count, dest),
@@ -72,7 +72,7 @@ pub fn readSectorSecondary(lba: u32, dest: [*]u8) void {
     }
 }
 
-pub fn readSectorsSecondary(lba: u32, count: u8, dest: [*]u8) void {
+pub fn readSectorsSecondary(lba: u32, count: u16, dest: [*]u8) void {
     switch (backend) {
         .none => {},
         .ata => ata.readSectorsSecondary(lba, count, dest),

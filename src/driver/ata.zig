@@ -243,24 +243,39 @@ pub fn readSectorSecondary(lba: u32, dest: [*]u8) void {
 /// channels — without the lock, two CPUs reading concurrently race on PRDT
 /// setup and produce garbage ELF buffers (`Invalid ELF64 header` on every
 /// `cat foo | wc`-style pipeline where AP and BSP both touch ATA).
-pub fn readSectorsSecondary(lba: u32, count: u8, dest: [*]u8) void {
+///
+/// `count` is u16 because ext2's cache fill grew to 256 sectors (QD4). ATA's
+/// single-entry PRDT caps one DMA transfer at 64 KiB (readSectorsDMA clamps
+/// byte_count to the 0x10000 encoding) = 128 sectors, and the 8-bit count
+/// register can't exceed 256, so split into <=128-sector commands under one
+/// lock hold (keeping the multi-chunk read atomic vs. the other channel). Every
+/// caller that stays <=128 — all fat32 reads, any request <=64 KiB — takes a
+/// single iteration and behaves exactly as before; only >128 fills split.
+const MAX_SECTORS_PER_DMA: u32 = 128;
+
+fn readSectorsChunked(port: u16, bm_base: u16, lba: u32, count: u16, dest: [*]u8) void {
     ata_lock.acquire();
     defer ata_lock.release();
-    if (dma_available and count >= 2) {
-        readSectorsDMA(SECONDARY_PORT, 0xE0, lba, count, dest, bmide_base + 0x08);
-    } else {
-        readSectorsPort(SECONDARY_PORT, 0xE0, lba, count, dest);
+    const total: u32 = if (count == 0) 256 else @as(u32, count);
+    var done: u32 = 0;
+    while (done < total) {
+        const chunk: u8 = @intCast(@min(total - done, MAX_SECTORS_PER_DMA));
+        const d = dest + @as(usize, done) * 512;
+        if (dma_available and chunk >= 2) {
+            readSectorsDMA(port, 0xE0, lba + done, chunk, d, bm_base);
+        } else {
+            readSectorsPort(port, 0xE0, lba + done, chunk, d);
+        }
+        done += chunk;
     }
 }
 
-pub fn readSectors(lba: u32, count: u8, dest: [*]u8) void {
-    ata_lock.acquire();
-    defer ata_lock.release();
-    if (dma_available and count >= 2) {
-        readSectorsDMA(PRIMARY_PORT, 0xE0, lba, count, dest, bmide_base);
-    } else {
-        readSectorsPort(PRIMARY_PORT, 0xE0, lba, count, dest);
-    }
+pub fn readSectorsSecondary(lba: u32, count: u16, dest: [*]u8) void {
+    readSectorsChunked(SECONDARY_PORT, bmide_base + 0x08, lba, count, dest);
+}
+
+pub fn readSectors(lba: u32, count: u16, dest: [*]u8) void {
+    readSectorsChunked(PRIMARY_PORT, bmide_base, lba, count, dest);
 }
 
 pub fn writeSectorSecondary(lba: u32, src: [*]const u8) void {

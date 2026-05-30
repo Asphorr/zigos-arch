@@ -480,7 +480,11 @@ pub fn readSectorPrimary(lba: u32, dest: [*]u8) void {
     _ = issueCommand(primary_port, ATA_CMD_READ_DMA_EXT, lba, 1, vp(dest), false);
 }
 
-pub fn readSectorsPrimary(lba: u32, count: u8, dest: [*]u8) void {
+// count is u16 (ext2's cache fill can now be up to 256 sectors for QD4). No
+// chunk loop needed: issueCommand's CFIS count is 16-bit (LBA48) and its single
+// PRDT entry's dbc is 22-bit, so one command covers up to 4 MiB / 8192 sectors
+// in one contiguous transfer — far past anything the FS cache asks for.
+pub fn readSectorsPrimary(lba: u32, count: u16, dest: [*]u8) void {
     if (primary_port == 0xFF) return;
     _ = issueCommand(primary_port, ATA_CMD_READ_DMA_EXT, lba, count, vp(dest), false);
 }
@@ -490,7 +494,7 @@ pub fn readSectorSecondary(lba: u32, dest: [*]u8) void {
     _ = issueCommand(secondary_port, ATA_CMD_READ_DMA_EXT, lba, 1, vp(dest), false);
 }
 
-pub fn readSectorsSecondary(lba: u32, count: u8, dest: [*]u8) void {
+pub fn readSectorsSecondary(lba: u32, count: u16, dest: [*]u8) void {
     if (secondary_port == 0xFF) return;
     _ = issueCommand(secondary_port, ATA_CMD_READ_DMA_EXT, lba, count, vp(dest), false);
 }

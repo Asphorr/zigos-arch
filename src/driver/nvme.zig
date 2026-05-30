@@ -507,7 +507,13 @@ fn initController(c: *Controller, dev: pci.PciDevice, idx: usize) bool {
     var init_state = InitState{};
     defer init_state.deinit();
     // Store the kernel-side VA (physmap). Hardware never sees mmio_base; only
-    // CPU-side register reads/writes through it.
+    // CPU-side register reads/writes through it. NOTE: this is a physmap VA, so
+    // BAR0 is WB-mapped, NOT UC — we rely on the BAR being an EPT/softmmu MMIO
+    // region that TRAPS every access out to QEMU's device model (the PTE cache
+    // type is moot under virtualization). A bare-metal port MUST route this
+    // through pci.mapBar / mapMMIO (UC) or the doorbell + register writes can
+    // sit in cache and never reach a real controller. See storeBarrier for the
+    // submit-ordering consequence this enables.
     c.mmio_base = paging.physToVirt(@intCast(dev.bars[0]));
 
     // Probe MSI-X up front (before CC.EN). If the cap is missing or
@@ -728,17 +734,39 @@ fn adminCommand(c: *Controller, args: AdminArgs) bool {
     return waitCompletion(c, c.admin_cq, &c.admin_cq_head, &c.admin_cq_phase, 0, false);
 }
 
-/// Drain prior WB stores (the SQE bytes) before any subsequent operation.
-/// Empirically, `mfence` alone wasn't enough on this QEMU/KVM setup —
-/// the controller's read of the SQ would see the zero-initialized memory
-/// instead of our just-written command. Adding a single OUT to port 0x80
-/// (a harmless BIOS POST-diagnostic register) fixes it: UC writes are
-/// serializing on x86 and flush the store buffer in a way that the
-/// emulated NVMe device's guest-memory read can definitely observe. The
-/// mfence is kept to be belt-and-suspenders.
+/// Drain prior WB stores (the SQE bytes) so the controller's read of the
+/// SQ sees our just-written command, not zero-initialized memory.
+///
+/// Why `mfence` alone is the ordering point: EVERY caller of storeBarrier()
+/// follows it (within one non-device statement — a plain tail-index bump) with
+/// the `sqDoorbell` MMIO write that the device reads the SQ *in response to*.
+/// x86 TSO never reorders a store with an older store, so the SQE stores are
+/// published ahead of the doorbell store regardless of cache type; and because
+/// BAR0 is an EPT/softmmu MMIO region, the doorbell store TRAPS to QEMU's device
+/// model synchronously — after the vCPU's stores have committed — so the
+/// iothread re-reads the SQ from already-coherent guest RAM. (The doorbell is
+/// WB-mapped, NOT UC — see initController; the trap, not a cache type, is what
+/// serializes here.) `mfence` is thus redundant for this StoreStore case; it is
+/// kept as cheap, self-documenting insurance for the StoreLoad edge.
+///
+/// HISTORY: this additionally did `outb(0x80, 0)` — a port-I/O write whose
+/// VM-exit was believed necessary because "mfence alone wasn't enough" (the
+/// device read zero-initialized SQ memory). That diagnosis doesn't survive the
+/// analysis above: the real device->guest staleness is CQ-side (handled by the
+/// clflush in waitCompletion/reapCq), and a port-0x80 OUT does nothing
+/// architecturally to publish WB stores TSO hasn't already published — so its
+/// "fix" was coincidental timing. The OUT cost one forced VM-exit on EVERY
+/// command (~1-3 µs), which dominates small single-command I/O (swap pages at
+/// 8 sectors, ext2 metadata blocks). Gated off below; flip back to true if a
+/// stale-SQ regression ever appears (symptom: waitCompletion timeouts /
+/// CSTS.CFS under heavy I/O, or a failed controller init at boot). TCG is if
+/// anything safer here than KVM (no cross-host-CPU hazard; the doorbell's
+/// mmio_write callback runs synchronously on the emulation thread).
+const STORE_BARRIER_PORT_IO: bool = false;
+
 inline fn storeBarrier() void {
     asm volatile ("mfence" ::: .{ .memory = true });
-    io.outb(0x80, 0);
+    if (STORE_BARRIER_PORT_IO) io.outb(0x80, 0);
 }
 
 /// Lay an SQ entry as 16 explicit volatile u32 writes. Volatile keeps
@@ -1671,13 +1699,18 @@ pub fn readSectorPrimary(lba: u32, dest: [*]u8) void {
     _ = ioCommand(&controllers[0], IO_READ, lba, @intFromPtr(dest), 1);
 }
 
-pub fn readSectorsPrimary(lba: u32, count: u8, dest: [*]u8) void {
+pub fn readSectorsPrimary(lba: u32, count: u16, dest: [*]u8) void {
     if (num_controllers < 1) return;
-    var done: u32 = 0;
+    const c = &controllers[0];
     const total: u32 = if (count == 0) 256 else @as(u32, count);
+    if (ASYNC_BUILD_ENABLED and total > MAX_SECTORS_PER_CMD and @atomicLoad(bool, &c.async_mode, .acquire)) {
+        _ = readSectorsPipelined(c, 0, lba, total, @intFromPtr(dest));
+        return;
+    }
+    var done: u32 = 0;
     while (done < total) {
         const chunk: u32 = @min(total - done, MAX_SECTORS_PER_CMD);
-        _ = ioCommand(&controllers[0], IO_READ, lba + done, @intFromPtr(dest) + done * controllers[0].block_size, chunk);
+        _ = ioCommand(c, IO_READ, lba + done, @intFromPtr(dest) + done * c.block_size, chunk);
         done += chunk;
     }
 }
@@ -1687,13 +1720,21 @@ pub fn readSectorSecondary(lba: u32, dest: [*]u8) void {
     _ = ioCommand(&controllers[1], IO_READ, lba, @intFromPtr(dest), 1);
 }
 
-pub fn readSectorsSecondary(lba: u32, count: u8, dest: [*]u8) void {
+pub fn readSectorsSecondary(lba: u32, count: u16, dest: [*]u8) void {
     if (num_controllers < 2) return;
-    var done: u32 = 0;
+    const c = &controllers[1];
     const total: u32 = if (count == 0) 256 else @as(u32, count);
+    // QD>1 fast path: ext2's cache fills (CACHE_SECTORS sectors) land here.
+    // Multi-chunk reads pipeline across the ring; single-chunk / pre-async
+    // reads fall through to the serial path.
+    if (ASYNC_BUILD_ENABLED and total > MAX_SECTORS_PER_CMD and @atomicLoad(bool, &c.async_mode, .acquire)) {
+        _ = readSectorsPipelined(c, 1, lba, total, @intFromPtr(dest));
+        return;
+    }
+    var done: u32 = 0;
     while (done < total) {
         const chunk: u32 = @min(total - done, MAX_SECTORS_PER_CMD);
-        _ = ioCommand(&controllers[1], IO_READ, lba + done, @intFromPtr(dest) + done * controllers[1].block_size, chunk);
+        _ = ioCommand(c, IO_READ, lba + done, @intFromPtr(dest) + done * c.block_size, chunk);
         done += chunk;
     }
 }
@@ -1706,6 +1747,9 @@ pub fn readSectorsSecondary(lba: u32, count: u8, dest: [*]u8) void {
 pub fn readSectorsOn(idx: usize, lba: u32, count: u32, dest: [*]u8) bool {
     if (idx >= num_controllers) return false;
     const c = &controllers[idx];
+    if (ASYNC_BUILD_ENABLED and count > MAX_SECTORS_PER_CMD and @atomicLoad(bool, &c.async_mode, .acquire)) {
+        return readSectorsPipelined(c, @intCast(idx), lba, count, @intFromPtr(dest));
+    }
     var done: u32 = 0;
     while (done < count) {
         const chunk: u32 = @min(count - done, MAX_SECTORS_PER_CMD);
@@ -1832,6 +1876,192 @@ pub fn releaseAsyncCid(ctrl_idx: u32, packed_cid: u16) void {
     const slot_idx: u16 = cidSlot(packed_cid);
     if (slot_idx >= Q_DEPTH) return;
     @atomicStore(bool, &controllers[ctrl_idx].waiters[slot_idx].active, false, .release);
+}
+
+// ============================================================
+// QD>1 pipelined read (the fix for the QD=1 serialization)
+// ============================================================
+//
+// The synchronous block API used to submit one chunk and block until it
+// completed before submitting the next (`ioCommandAsync` per chunk). A
+// multi-chunk read (e.g. a 942 KB ELF load = 32 chunks) therefore paid 32
+// sequential completion waits with the 16-slot ring idle — ~95% of the load
+// time was spent blocked. `readSectorsPipelined` keeps up to PIPELINE_DEPTH
+// chunks in flight at once so those waits OVERLAP.
+//
+// Why the `.pid` waiter path (not submitAsyncCallback's `.cb`): the IRQ
+// reaper records completion in the persistent `waiters[]` array and wakes
+// the owner pid — it never writes through a caller-supplied pointer. So the
+// per-wave bookkeeping (cids/offsets) can live on the owner's stack with no
+// risk of an IRQ callback corrupting it after the owner is killed; the only
+// loose end on kill is the still-active CID slots, freed by
+// `reclaimWaitersForPid` from process teardown.
+
+/// Max chunks in flight per wave. <= Q_DEPTH and leaves headroom so a
+/// pipelined FS read can't monopolize the ring and starve swap / other tasks.
+const PIPELINE_DEPTH: u32 = 8;
+
+/// Submit ONE read command without waiting, in `.pid` wake mode: the IRQ
+/// reaper sets this slot's completed/success in the persistent `waiters[]`
+/// and wakes the current pid. The submit half of `ioCommandAsync` minus the
+/// per-command block + bounce copy — the building block `readSectorsPipelined`
+/// fires repeatedly to fill the queue. READS ONLY (the device fills the bounce
+/// buffer; the caller copies bounce->dest after the wave completes). Returns
+/// false on not-ready / bad args / queue-full (caller throttles). Mirrors the
+/// submitAsyncCallback critical section — keep the two in sync.
+fn submitReadNoWait(ctrl_idx: u32, lba: u32, sectors: u32, out_cid: *u16) bool {
+    if (ctrl_idx >= num_controllers) return false;
+    const c = &controllers[ctrl_idx];
+    if (!c.initialized or !@atomicLoad(bool, &c.async_mode, .acquire)) return false;
+    if (sectors == 0 or sectors > MAX_SECTORS_PER_CMD) return false;
+
+    const smp = @import("../cpu/smp.zig");
+    const cid = allocCid(c) orelse return false;
+    const slot_idx: u16 = cidSlot(cid);
+    const xfer_bytes: u32 = sectors * c.block_size;
+
+    const cur_pid: u8 = if (smp.myCpu().current_pid) |p| @intCast(p) else 0xFF;
+    c.waiters[slot_idx].wake = .{ .pid = cur_pid };
+
+    const new_msix_addr: u64 = if (c.use_msix) blk: {
+        const apic_mod = @import("../time/apic.zig");
+        const dest_id: u64 = apic_mod.getLapicId() & 0xFF;
+        break :blk 0xFEE00000 | (dest_id << 12);
+    } else 0;
+
+    const saved_flags = c.io_lock.acquireIrqSave();
+    if (c.use_msix and c.msix_current_addr != new_msix_addr) {
+        msix.writeEntry(c.msix_io_entry, new_msix_addr, c.msix_data, false);
+        c.msix_current_addr = new_msix_addr;
+        io_msix_retargets += 1;
+    }
+    const sq_tail_at_submit = c.io_sq_tail;
+    c.waiters[slot_idx].sq_slot = sq_tail_at_submit;
+    const slot_addr = c.io_sq + @as(usize, sq_tail_at_submit) * 64;
+    const slot32: [*]volatile u32 = @ptrFromInt(paging.physToVirt(slot_addr));
+    const prp = buildPrp(c, slot_idx, xfer_bytes);
+    writeSqe(slot32, IO_READ, cid, c.nsid, prp.prp1, prp.prp2, lba, 0, sectors - 1);
+    storeBarrier();
+    c.io_sq_tail = (sq_tail_at_submit + 1) % Q_DEPTH;
+    sqDoorbell(c, 1).* = @as(u32, c.io_sq_tail);
+    c.io_lock.releaseIrqRestore(saved_flags);
+
+    out_cid.* = cid;
+    return true;
+}
+
+/// Read `count` sectors at `lba` into kernel-VA `dest`, pipelining up to
+/// PIPELINE_DEPTH chunks at a time so their completion waits overlap instead
+/// of stacking. `dest` is a kernel VA (FS cache / swap frame), so the copy is
+/// a plain kernel memcpy — no CR3 swap / user-access dance (cf. io_uring's
+/// handleCompletion). Returns false on any chunk error or wave timeout.
+fn readSectorsPipelined(c: *Controller, ctrl_idx: u32, lba: u32, count: u32, dest: usize) bool {
+    const proc = @import("../proc/process.zig");
+    const smp = @import("../cpu/smp.zig");
+    const perf = @import("../debug/perf.zig");
+    const TIMEOUT_CYC: u64 = 30_000_000_000; // ~30 s at 1 GHz — matches ioCommandAsync
+    const t_call = perf.rdtsc();
+
+    var cids: [PIPELINE_DEPTH]u16 = undefined;
+    var offs: [PIPELINE_DEPTH]usize = undefined;
+    var lens: [PIPELINE_DEPTH]u32 = undefined;
+    var done: u32 = 0;
+    var wait_total: u64 = 0;
+
+    while (done < count) {
+        // ---- submit a wave of up to PIPELINE_DEPTH chunks ----
+        var wave: u32 = 0;
+        while (wave < PIPELINE_DEPTH and done < count) {
+            const sec = @min(count - done, MAX_SECTORS_PER_CMD);
+            var cid: u16 = 0;
+            if (!submitReadNoWait(ctrl_idx, lba + done, sec, &cid)) break; // queue full / not ready
+            cids[wave] = cid;
+            offs[wave] = @as(usize, done) * c.block_size;
+            lens[wave] = sec * c.block_size;
+            done += sec;
+            wave += 1;
+        }
+        if (wave == 0) {
+            // Every slot busy with other tasks' I/O — yield so the reaper can
+            // drain, then retry (same shape as ioCommandAsync's queue-full loop).
+            smp.myCpu().pending_soft_yield = true;
+            @import("../proc/sched_asm.zig").softYield();
+            continue;
+        }
+
+        // ---- wait for the whole wave (one park, woken per-completion) ----
+        const t_wait = perf.rdtsc();
+        const rep_target: u32 = (ctrl_idx << 16) | cids[0]; // diagnostic label for blockOn/dump
+        while (true) {
+            var all_done = true;
+            var i: u32 = 0;
+            while (i < wave) : (i += 1) {
+                if (!@atomicLoad(bool, &c.waiters[cidSlot(cids[i])].completed, .acquire)) {
+                    all_done = false;
+                    break;
+                }
+            }
+            if (all_done) break;
+            if (perf.rdtsc() -% t_wait > TIMEOUT_CYC) {
+                debug.klog("[nvme] pipelined read TIMEOUT ctrl#{d} lba={d} wave={d}\n", .{ ctrl_idx, lba, wave });
+                var j: u32 = 0;
+                while (j < wave) : (j += 1) @atomicStore(bool, &c.waiters[cidSlot(cids[j])].active, false, .release);
+                return false;
+            }
+            proc.blockOn(.nvme_io, rep_target);
+            _ = reapCq(c); // safety net for a lost MSI-X (mirrors ioCommandAsync)
+        }
+        wait_total +%= perf.rdtsc() -% t_wait;
+
+        // ---- copy each chunk bounce -> dest, free the cid ----
+        var i: u32 = 0;
+        var wave_ok = true;
+        while (i < wave) : (i += 1) {
+            const slot = cidSlot(cids[i]);
+            if (c.waiters[slot].success) {
+                const bphys = c.bounce_bufs[slot];
+                const d: [*]u8 = @ptrFromInt(dest + offs[i]);
+                const s: [*]const u8 = @ptrFromInt(paging.physToVirt(bphys));
+                @memcpy(d[0..lens[i]], s[0..lens[i]]);
+            } else wave_ok = false;
+            @atomicStore(bool, &c.waiters[slot].active, false, .release);
+            io_call_count += 1;
+        }
+        if (!wave_ok) {
+            io_wait_cycles +%= wait_total;
+            io_total_cycles +%= perf.rdtsc() -% t_call;
+            return false;
+        }
+    }
+
+    io_wait_cycles +%= wait_total;
+    if (wait_total > io_max_wait_cycles) io_max_wait_cycles = wait_total;
+    io_total_cycles +%= perf.rdtsc() -% t_call;
+    return true;
+}
+
+/// Free any I/O CID slots still owned by `pid` across all controllers. Called
+/// from process teardown (lifecycle.tearDownTask): a task killed while parked
+/// in `readSectorsPipelined`'s wave-wait holds up to PIPELINE_DEPTH CIDs
+/// (`.wake = .pid(pid)`); without this they'd stay active=true forever and
+/// slowly starve the queue. Safe even if the device completes one of these
+/// after teardown — a late CQE for a freed slot hits reapCq's orphan branch
+/// (gen mismatch on the slot's next reuse), and `wake` against the now-dead
+/// pid is a no-op. The `.cb` (io_uring) slots are reclaimed by releaseAllForPid.
+pub fn reclaimWaitersForPid(pid: u8) void {
+    var ci: usize = 0;
+    while (ci < num_controllers) : (ci += 1) {
+        const c = &controllers[ci];
+        var s: usize = 0;
+        while (s < Q_DEPTH) : (s += 1) {
+            const w = &c.waiters[s];
+            if (!@atomicLoad(bool, &w.active, .acquire)) continue;
+            switch (w.wake) {
+                .pid => |p| if (p == pid) @atomicStore(bool, &w.active, false, .release),
+                .cb => {},
+            }
+        }
+    }
 }
 
 /// Block size for `ctrl_idx`. Used by io_uring to compute the byte-len
