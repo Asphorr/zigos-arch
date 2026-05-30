@@ -531,6 +531,10 @@ const StoredNode = struct {
     region_space: u8 = 0,
     region_off: u64 = 0,
     region_len: u64 = 0,
+    // Runtime mutable value (B2b): Store-to-Name updates this; reads prefer it
+    // over the static DSDT value. Reset every load() (nnodes = 0 re-walks).
+    runtime_val: Value = .uninit,
+    has_runtime: bool = false,
 };
 
 /// Optional payload passed to storeNode; defaults keep call sites terse.
@@ -589,7 +593,7 @@ fn findExact(abs: []const u8) ?*StoredNode {
 // Packages need backing storage for their element Values. A fixed bump arena,
 // reset before each top-level evaluation, avoids an allocator on the AML path.
 
-const VALUE_ARENA = 2048;
+const VALUE_ARENA = 4096;
 var value_arena: [VALUE_ARENA]Value = undefined;
 var arena_top: usize = 0;
 
@@ -734,6 +738,492 @@ pub fn s5SlpTyp() ?u8 {
     return @truncate(v.package[0].integer);
 }
 
+// === B2b: statement executor + method invocation ============================
+// B2a evaluates static data; B2b *runs* control methods. A method body is a
+// TermList executed against a Frame (Arg0-6 / Local0-7). Expressions resolve
+// via evalTermArg; statements (Store/If/While/Return/Notify) via execTermList.
+// Arithmetic/logic opcodes collapse to two comptime tables so one code path
+// covers Add…LLess rather than ~20 near-identical cases.
+//
+// Scope: integer/logic ops, If/Else/While, Store, method calls, scope-relative
+// name resolution. OperationRegion/Field reads still yield uninit — that's B2c
+// (the hardware bridge). A method that hits an unmodeled op stops cleanly with
+// whatever it has returned so far; it never faults or desyncs the stream.
+
+const MAX_CALL_DEPTH = 16;
+const MAX_LOOP_ITERS = 100_000;
+
+const Frame = struct {
+    args: [7]Value = [_]Value{.uninit} ** 7,
+    locals: [8]Value = [_]Value{.uninit} ** 8,
+};
+
+const ExecState = struct {
+    frame: *Frame,
+    scope: []const u8, // absolute path of the executing method, for name lookup
+    depth: u8,
+    ret: Value = .uninit,
+    returned: bool = false,
+    last_if_taken: bool = false,
+    break_loop: bool = false,
+};
+
+fn toInt(v: Value) u64 {
+    return switch (v) {
+        .integer => |i| i,
+        else => 0,
+    };
+}
+
+fn toBool(v: Value) bool {
+    return toInt(v) != 0;
+}
+
+fn boolVal(b: bool) u64 {
+    return if (b) ~@as(u64, 0) else 0; // AML true = Ones, false = Zero
+}
+
+// --- arithmetic/logic opcode tables -----------------------------------------
+// has_target: the op writes its result to a trailing Target (Add/And/…). The
+// logical ops (LAnd/LEqual/…) take no Target.
+
+const BinOp = struct { code: u16, has_target: bool, apply: *const fn (u64, u64) u64 };
+
+fn aAdd(a: u64, b: u64) u64 {
+    return a +% b;
+}
+fn aSub(a: u64, b: u64) u64 {
+    return a -% b;
+}
+fn aMul(a: u64, b: u64) u64 {
+    return a *% b;
+}
+fn aAnd(a: u64, b: u64) u64 {
+    return a & b;
+}
+fn aOr(a: u64, b: u64) u64 {
+    return a | b;
+}
+fn aXor(a: u64, b: u64) u64 {
+    return a ^ b;
+}
+fn aShl(a: u64, b: u64) u64 {
+    return if (b >= 64) 0 else a << @as(u6, @intCast(b));
+}
+fn aShr(a: u64, b: u64) u64 {
+    return if (b >= 64) 0 else a >> @as(u6, @intCast(b));
+}
+fn aMod(a: u64, b: u64) u64 {
+    return if (b == 0) 0 else a % b;
+}
+fn aLAnd(a: u64, b: u64) u64 {
+    return boolVal(a != 0 and b != 0);
+}
+fn aLOr(a: u64, b: u64) u64 {
+    return boolVal(a != 0 or b != 0);
+}
+fn aLEq(a: u64, b: u64) u64 {
+    return boolVal(a == b);
+}
+fn aLGt(a: u64, b: u64) u64 {
+    return boolVal(a > b);
+}
+fn aLLt(a: u64, b: u64) u64 {
+    return boolVal(a < b);
+}
+
+const bin_table = [_]BinOp{
+    .{ .code = 0x72, .has_target = true, .apply = aAdd }, // Add
+    .{ .code = 0x74, .has_target = true, .apply = aSub }, // Subtract
+    .{ .code = 0x77, .has_target = true, .apply = aMul }, // Multiply
+    .{ .code = 0x79, .has_target = true, .apply = aShl }, // ShiftLeft
+    .{ .code = 0x7A, .has_target = true, .apply = aShr }, // ShiftRight
+    .{ .code = 0x7B, .has_target = true, .apply = aAnd }, // And
+    .{ .code = 0x7D, .has_target = true, .apply = aOr }, // Or
+    .{ .code = 0x7F, .has_target = true, .apply = aXor }, // Xor
+    .{ .code = 0x85, .has_target = true, .apply = aMod }, // Mod
+    .{ .code = 0x90, .has_target = false, .apply = aLAnd }, // LAnd
+    .{ .code = 0x91, .has_target = false, .apply = aLOr }, // LOr
+    .{ .code = 0x93, .has_target = false, .apply = aLEq }, // LEqual
+    .{ .code = 0x94, .has_target = false, .apply = aLGt }, // LGreater
+    .{ .code = 0x95, .has_target = false, .apply = aLLt }, // LLess
+};
+
+fn binLookup(code: u16) ?BinOp {
+    inline for (bin_table) |o| {
+        if (o.code == code) return o;
+    }
+    return null;
+}
+
+const UnOp = struct { code: u16, has_target: bool, apply: *const fn (u64) u64 };
+
+fn aNot(a: u64) u64 {
+    return ~a;
+}
+fn aLNot(a: u64) u64 {
+    return boolVal(a == 0);
+}
+
+const un_table = [_]UnOp{
+    .{ .code = 0x80, .has_target = true, .apply = aNot }, // Not
+    .{ .code = 0x92, .has_target = false, .apply = aLNot }, // LNot (also prefixes LGE/LLE/LNE)
+};
+
+fn unLookup(code: u16) ?UnOp {
+    inline for (un_table) |o| {
+        if (o.code == code) return o;
+    }
+    return null;
+}
+
+// --- scope-relative name resolution (ACPI 6.4 §5.3) -------------------------
+
+fn seedPath(pb: *PathBuf, scope: []const u8) void {
+    const n = @min(scope.len, pb.buf.len);
+    @memcpy(pb.buf[0..n], scope[0..n]);
+    pb.len = n;
+    if (pb.len == 0) {
+        pb.buf[0] = '\\';
+        pb.len = 1;
+    }
+}
+
+/// Resolve a NameString referenced from `scope` to a stored node. A single
+/// relative NameSeg searches the current scope and each ancestor up to root
+/// (the AML upward-search rule); a rooted, parent-prefixed, or multi-seg name
+/// is resolved anchored (no upward search).
+fn resolve(scope: []const u8, ns: NameString) ?*StoredNode {
+    if (ns.nsegs == 0) return null;
+    var pb = PathBuf{};
+    const single_relative = !ns.rooted and ns.parents == 0 and ns.nsegs == 1;
+    if (!single_relative) {
+        seedPath(&pb, scope);
+        const mark = pb.enter(ns);
+        const hit = findExact(pb.snapshot());
+        pb.restore(mark);
+        return hit;
+    }
+    seedPath(&pb, scope);
+    while (true) {
+        const mark = pb.enter(ns);
+        if (findExact(pb.snapshot())) |n| {
+            pb.restore(mark);
+            return n;
+        }
+        pb.restore(mark);
+        if (pb.len <= 1) return null; // tested root too
+        pb.dropSegment();
+    }
+}
+
+// --- expression evaluation --------------------------------------------------
+
+fn evalTermArg(r: *Reader, st: *ExecState) ?Value {
+    const op = r.peek(0) orelse return null;
+    switch (op) {
+        0x60...0x67 => { // Local0..7
+            _ = r.next();
+            return st.frame.locals[@as(usize, op) - 0x60];
+        },
+        0x68...0x6E => { // Arg0..6
+            _ = r.next();
+            return st.frame.args[@as(usize, op) - 0x68];
+        },
+        0x70 => { // Store used as an expression: yields the stored value
+            _ = r.next();
+            const src = evalTermArg(r, st) orelse return null;
+            _ = storeTarget(r, st, src);
+            return src;
+        },
+        0x78 => return evalDivide(r, st),
+        0x75, 0x76 => return evalIncDec(r, st, op),
+        else => {
+            if (binLookup(op)) |bi| return evalBinary(r, st, bi);
+            if (unLookup(op)) |ui| return evalUnary(r, st, ui);
+            if (op == 0x88) return evalIndexExpr(r, st); // Index (best-effort)
+            if (op == 0x83) return evalDerefExpr(r, st); // DerefOf (best-effort)
+            if (isNameLead(op)) return evalNameRef(r, st);
+            return evalData(r); // literal / Buffer / Package
+        },
+    }
+}
+
+fn evalBinary(r: *Reader, st: *ExecState, bi: BinOp) ?Value {
+    _ = r.next(); // opcode
+    const a = toInt(evalTermArg(r, st) orelse return null);
+    const b = toInt(evalTermArg(r, st) orelse return null);
+    const res = bi.apply(a, b);
+    if (bi.has_target) {
+        if (!storeTarget(r, st, .{ .integer = res })) return null;
+    }
+    return .{ .integer = res };
+}
+
+fn evalUnary(r: *Reader, st: *ExecState, ui: UnOp) ?Value {
+    _ = r.next(); // opcode
+    const a = toInt(evalTermArg(r, st) orelse return null);
+    const res = ui.apply(a);
+    if (ui.has_target) {
+        if (!storeTarget(r, st, .{ .integer = res })) return null;
+    }
+    return .{ .integer = res };
+}
+
+fn evalDivide(r: *Reader, st: *ExecState) ?Value {
+    _ = r.next(); // DivideOp: Dividend Divisor Remainder Quotient
+    const a = toInt(evalTermArg(r, st) orelse return null);
+    const b = toInt(evalTermArg(r, st) orelse return null);
+    const q = if (b == 0) 0 else a / b;
+    const rem = if (b == 0) 0 else a % b;
+    if (!storeTarget(r, st, .{ .integer = rem })) return null;
+    if (!storeTarget(r, st, .{ .integer = q })) return null;
+    return .{ .integer = q };
+}
+
+fn evalIncDec(r: *Reader, st: *ExecState, op: u8) ?Value {
+    _ = r.next(); // Increment/Decrement: SuperName (read-modify-write)
+    const tpos = r.pos;
+    const cur = toInt(evalTermArg(r, st) orelse return null);
+    const nv = if (op == 0x75) cur +% 1 else cur -% 1;
+    const after = r.pos;
+    r.pos = tpos;
+    _ = storeTarget(r, st, .{ .integer = nv });
+    r.pos = after;
+    return .{ .integer = nv };
+}
+
+fn evalIndexExpr(r: *Reader, st: *ExecState) ?Value {
+    _ = r.next(); // IndexOp: Source Index Target
+    _ = evalTermArg(r, st) orelse return null;
+    _ = evalTermArg(r, st) orelse return null;
+    _ = storeTarget(r, st, .uninit);
+    return .uninit; // element references are B2c
+}
+
+fn evalDerefExpr(r: *Reader, st: *ExecState) ?Value {
+    _ = r.next(); // DerefOfOp
+    _ = evalTermArg(r, st) orelse return null;
+    return .uninit;
+}
+
+/// A NameString in expression position: a method invocation (consume its args)
+/// or a reference to a Name (yield its value). Unresolved / non-value objects
+/// yield uninit so a method keeps running.
+fn evalNameRef(r: *Reader, st: *ExecState) ?Value {
+    const ns = readNameString(r) orelse return null;
+    const node = resolve(st.scope, ns) orelse return .uninit;
+    switch (node.kind) {
+        .method => {
+            var args: [7]Value = [_]Value{.uninit} ** 7;
+            var i: usize = 0;
+            while (i < @as(usize, node.arg_count) and i < 7) : (i += 1) {
+                args[i] = evalTermArg(r, st) orelse .uninit;
+            }
+            return callMethod(node, args[0 .. @min(@as(usize, node.arg_count), 7)], st.depth + 1);
+        },
+        .name => {
+            if (node.has_runtime) return node.runtime_val;
+            var rr = Reader{ .buf = dsdt_body, .pos = node.val_off };
+            return evalData(&rr) orelse .uninit;
+        },
+        else => return .uninit, // op_region/field/device → B2c or not a value
+    }
+}
+
+// --- Target writes ----------------------------------------------------------
+
+fn storeTarget(r: *Reader, st: *ExecState, v: Value) bool {
+    const op = r.peek(0) orelse return false;
+    switch (op) {
+        0x00 => { // Null target — discard
+            _ = r.next();
+            return true;
+        },
+        0x60...0x67 => {
+            _ = r.next();
+            st.frame.locals[@as(usize, op) - 0x60] = v;
+            return true;
+        },
+        0x68...0x6E => {
+            _ = r.next();
+            st.frame.args[@as(usize, op) - 0x68] = v;
+            return true;
+        },
+        else => {
+            if (isNameLead(op)) {
+                const ns = readNameString(r) orelse return false;
+                if (resolve(st.scope, ns)) |n| {
+                    if (n.kind == .name) {
+                        n.runtime_val = v;
+                        n.has_runtime = true;
+                    }
+                    // Field/OpRegion writes are B2c.
+                }
+                return true;
+            }
+            // Index()/DerefOf() target: consume as an expression, best-effort.
+            return evalTermArg(r, st) != null;
+        },
+    }
+}
+
+// --- statement execution ----------------------------------------------------
+
+fn execTermList(r: *Reader, end: usize, st: *ExecState) void {
+    while (r.pos < end and !st.returned and !st.break_loop) {
+        const op = r.peek(0) orelse return;
+        switch (op) {
+            0x70 => { // Store SourceTermArg Target
+                _ = r.next();
+                const src = evalTermArg(r, st) orelse return;
+                _ = storeTarget(r, st, src);
+            },
+            0xA0 => execIf(r, st),
+            0xA1 => execElse(r, st),
+            0xA2 => execWhile(r, st),
+            0xA4 => { // Return
+                _ = r.next();
+                st.ret = evalTermArg(r, st) orelse .uninit;
+                st.returned = true;
+                return;
+            },
+            0xA5 => { // Break
+                _ = r.next();
+                st.break_loop = true;
+                return;
+            },
+            0x9F => { // Continue (simplified: end this list pass)
+                _ = r.next();
+                return;
+            },
+            0xA3 => { // Noop
+                _ = r.next();
+            },
+            0x86 => execNotify(r, st),
+            else => {
+                // An expression / method call evaluated for side effect.
+                const before = r.pos;
+                if (evalTermArg(r, st)) |_| {
+                    if (r.pos == before) _ = r.next(); // guarantee forward progress
+                } else {
+                    return; // unmodeled term — stop this list cleanly
+                }
+            },
+        }
+    }
+}
+
+fn execIf(r: *Reader, st: *ExecState) void {
+    const start = r.pos;
+    _ = r.next(); // IfOp
+    const pkg_end = packageEnd(r, start) orelse {
+        st.returned = true; // can't bound the package → stop safely
+        return;
+    };
+    const pred = evalTermArg(r, st) orelse {
+        r.pos = pkg_end;
+        st.last_if_taken = false;
+        return;
+    };
+    if (toBool(pred)) {
+        execTermList(r, pkg_end, st);
+        st.last_if_taken = true;
+    } else {
+        st.last_if_taken = false;
+    }
+    if (r.pos < pkg_end) r.pos = pkg_end;
+}
+
+fn execElse(r: *Reader, st: *ExecState) void {
+    const start = r.pos;
+    _ = r.next(); // ElseOp
+    const pkg_end = packageEnd(r, start) orelse {
+        st.returned = true;
+        return;
+    };
+    if (!st.last_if_taken) execTermList(r, pkg_end, st);
+    st.last_if_taken = false;
+    if (r.pos < pkg_end) r.pos = pkg_end;
+}
+
+fn execWhile(r: *Reader, st: *ExecState) void {
+    const start = r.pos;
+    _ = r.next(); // WhileOp
+    const pkg_end = packageEnd(r, start) orelse {
+        st.returned = true;
+        return;
+    };
+    const cond_start = r.pos;
+    var iters: u32 = 0;
+    while (iters < MAX_LOOP_ITERS) : (iters += 1) {
+        r.pos = cond_start;
+        const pred = evalTermArg(r, st) orelse break;
+        if (!toBool(pred)) break;
+        execTermList(r, pkg_end, st);
+        if (st.returned) return;
+        if (st.break_loop) {
+            st.break_loop = false;
+            break;
+        }
+    }
+    r.pos = pkg_end;
+}
+
+fn execNotify(r: *Reader, st: *ExecState) void {
+    _ = r.next(); // NotifyOp: NotifyObject NotifyValue
+    const obj_op = r.peek(0) orelse return;
+    var obj_path: []const u8 = "?";
+    if (isNameLead(obj_op)) {
+        const ns = readNameString(r) orelse return;
+        if (resolve(st.scope, ns)) |n| obj_path = n.path[0..n.path_len];
+    } else {
+        _ = evalTermArg(r, st); // Local/Arg holding a reference
+    }
+    const val = evalTermArg(r, st) orelse .uninit;
+    debug.klog("[aml] Notify({s}, 0x{X})\n", .{ obj_path, toInt(val) });
+}
+
+// --- method invocation ------------------------------------------------------
+
+/// Invoke a stored Method node with `args`. Returns its Return value (uninit if
+/// it falls off the end). Depth-guarded against runaway recursion.
+fn callMethod(node: *StoredNode, args: []const Value, depth: u8) ?Value {
+    if (depth > MAX_CALL_DEPTH) return null;
+    if (node.kind != .method or dsdt_body.len == 0) return null;
+    var frame = Frame{};
+    var i: usize = 0;
+    while (i < args.len and i < 7) : (i += 1) frame.args[i] = args[i];
+    var st = ExecState{ .frame = &frame, .scope = node.path[0..node.path_len], .depth = depth };
+    var r = Reader{ .buf = dsdt_body, .pos = node.val_off };
+    const end = @min(node.val_off + node.val_len, dsdt_body.len);
+    execTermList(&r, end, &st);
+    return st.ret;
+}
+
+/// Evaluate a no-argument control method by absolute path (e.g.
+/// "\\_SB_.PCI0._PRT"). Public entry for GPE dispatch (Slice C) + diagnostics.
+pub fn evalMethod(abs: []const u8) ?Value {
+    const n = findExact(abs) orelse return null;
+    if (n.kind != .method) return null;
+    arenaReset();
+    return callMethod(n, &.{}, 0);
+}
+
+/// Deterministic executor self-test, independent of firmware: run the AML for
+/// `Add(2, 3) -> Local0; Return(Local0)` and expect 5. Proves operand decode, a
+/// binary op writing a Target, Local store/load, and Return.
+fn selfTest() void {
+    const prog = [_]u8{ 0x72, 0x0A, 0x02, 0x0A, 0x03, 0x60, 0xA4, 0x60 };
+    var frame = Frame{};
+    var st = ExecState{ .frame = &frame, .scope = "\\", .depth = 0 };
+    var r = Reader{ .buf = &prog };
+    arenaReset();
+    execTermList(&r, prog.len, &st);
+    const got = toInt(st.ret);
+    debug.klog("[aml] executor self-test Add(2,3)->Local0; Return(Local0) = {d} ({s})\n", .{ got, if (got == 5) "PASS" else "FAIL" });
+}
+
 // --- entry point ------------------------------------------------------------
 
 /// Decode the cached DSDT and walk its namespace. Call after acpi.init has
@@ -795,6 +1285,20 @@ pub fn load() u32 {
         }
     } else {
         debug.klog("[aml] \\_S5_ not found in namespace store\n", .{});
+    }
+
+    // B2b proof: run the executor. First a deterministic self-test, then invoke
+    // a real firmware control method (\_SB_.PCI0._PRT: If/Else on \PICF returning
+    // a PCI-routing Package) to exercise method calls + control flow end to end.
+    selfTest();
+    if (evalMethod("\\_SB_.PCI0._PRT")) |rv| {
+        switch (rv) {
+            .package => |p| debug.klog("[aml] invoked \\_SB_.PCI0._PRT -> Package[{d}] (PCI IRQ routing)\n", .{p.len}),
+            .integer => |iv| debug.klog("[aml] invoked \\_SB_.PCI0._PRT -> integer {d}\n", .{iv}),
+            else => debug.klog("[aml] invoked \\_SB_.PCI0._PRT -> (unhandled result type)\n", .{}),
+        }
+    } else {
+        debug.klog("[aml] \\_SB_.PCI0._PRT not found / not invokable\n", .{});
     }
     return node_count;
 }
