@@ -50,7 +50,7 @@ VKR_DEBUG=udmabuf \
 LD_LIBRARY_PATH=/usr/local/lib/x86_64-linux-gnu \
 VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json \
     ~/qemu-master/build/qemu-system-x86_64 \
-    -m 256 -accel kvm -cpu host,hv-time,hv-frequencies -smp 2 -no-reboot \
+    -m 256 -accel kvm -cpu host,hv-time,hv-frequencies -smp 2 \
     -object memory-backend-memfd,id=mem1,size=256M \
     -machine q35,kernel-irqchip=split,pcspk-audiodev=snd0,memory-backend=mem1 \
     -device intel-iommu,aw-bits=48 \

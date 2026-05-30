@@ -785,6 +785,13 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp) void {
     // frame via teardownNonPresent. (Reviewer-caught 2026-05-23.)
     reclaimInflightSlot(pid);
 
+    // Same hazard for the FS read path: a thread killed while parked in
+    // nvme.readSectorsPipelined's wave-wait holds up to PIPELINE_DEPTH NVMe
+    // CID slots (.wake = .pid). wake() against the .zombie is a no-op, so
+    // without an explicit reclaim those slots stay active forever and starve
+    // the ring. Safe post-kill: a late CQE hits reapCq's orphan branch.
+    @import("../driver/nvme.zig").reclaimWaitersForPid(@intCast(pid));
+
     // io_uring instances owned by this pid: free the slot-table entries.
     // The underlying ring memory is freed by the LazyRegion shm.release in
     // the per-AS cleanup below; this just recycles the kernel bookkeeping.
@@ -838,11 +845,22 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp) void {
         freeElfBuf(lead);
         const paging = @import("../mm/paging.zig");
         const shm = @import("../mm/shm.zig");
+        const page_cache = @import("../mm/page_cache.zig");
         for (lead.lazy_regions[0..lead.lazy_count]) |r| {
             // Shared-anon: drop this AS's refcount. The shm registry frees
             // its frames at refcount==0, so peers keep working until they
             // also exit / munmap.
             if (r.shm_id != shm.SHM_INVALID) shm.release(r.shm_id);
+            // MAP_SHARED file region: destroyAddressSpace above already dropped
+            // this AS's PTEs, so any of its pages now mapped by no one else
+            // (refcount==1) are clean cache-only pages we should un-dirty — else
+            // they'd linger dirty and unevictable (chooseSlot skips dirty). No
+            // writeback (teardown is I/O-free, also reached by the OOM killer);
+            // persist via msync/munmap before exit. Pages another AS still maps
+            // stay dirty (clearDirtyRangeCacheOnly is refcount-gated).
+            if (r.cache_inode != 0 and r.cache_shared) {
+                _ = page_cache.clearDirtyRangeCacheOnly(page_cache.ext2FileId(r.cache_inode), r.cache_off, r.end - r.start);
+            }
             if (!r.buf_owned) continue;
             const src = r.source orelse continue;
             // r.source points at a PMM-allocated buffer reached through

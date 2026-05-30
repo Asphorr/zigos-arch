@@ -345,6 +345,21 @@ pub fn protToMapFlags(prot: u8) u64 {
     return f;
 }
 
+/// Map flags for a page served from the unified page cache (file-backed mmap).
+/// A cache frame is SHARED across mappers, so it must NEVER be mapped directly
+/// writable. If the region permits writes we map it READ-ONLY + COW: the first
+/// write faults into handleCowFault, which — because the cache's own reference
+/// keeps the frame's refcount >= 2 — always copies into a private frame and
+/// drops one ref back to the cache (never steals the shared page). If the region
+/// is read-only we map plain RO so a write genuinely faults (SIGSEGV) instead of
+/// silently COW-succeeding, honoring PROT_READ. Used by BOTH the fault path and
+/// sysMprotect (so an mprotect can't strip the COW bit off a live cache page).
+pub fn cacheMapFlags(prot: u8) u64 {
+    const base = protToMapFlags(prot);
+    if ((prot & 0x02) != 0) return (base & ~READ_WRITE) | paging.COW;
+    return base;
+}
+
 /// Allocate a physical frame, map it at the given virtual address with the
 /// supplied flags, and zero it. `flags` is the OR of the bits the page-fault
 /// resolution path wants — typically `protToMapFlags(region.prot)`. PRESENT

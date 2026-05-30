@@ -540,6 +540,24 @@ pub const LazyRegion = struct {
     // instead of fresh-allocating a private zero page. fork() bumps the
     // region's refcount; munmap / teardown decrements.
     shm_id: u32 = 0xFFFFFFFF,
+    // File-backed-via-page-cache region (currently ext2 file mmap). When
+    // cache_inode != 0 the page-fault handler serves each page from the unified
+    // page cache (mm/page_cache.zig) keyed on (inode, cache_off + (va - start)),
+    // mapped read-only + COW: reads SHARE one physical frame across mappers; a
+    // write COW-diverges into a private copy. No eager buffer (buf_owned stays
+    // false), so teardown is the ordinary per-PTE refcount drop. Inherited by
+    // value on fork; cleared on munmap of the region.
+    cache_inode: u32 = 0, // 0 = not cache-backed
+    cache_off: u64 = 0, // file byte offset corresponding to `start`
+    // MAP_SHARED file mapping (Slice 3c). When cache_inode != 0 AND this is set,
+    // pages map the shared cache frame WRITABLE (not RO+COW): writes land in the
+    // shared page — visible to every other mapper and to read() — and are
+    // written back to disk on msync()/munmap() (page_cache dirty tracking +
+    // vfs.syncCacheFile). When cache_inode != 0 and this is false, the region is
+    // the older RO+COW private mapping. Inherited by value on fork; the COW hatch
+    // (fault.zig handleCowFault) keeps a forked shared page shared rather than
+    // copying it. Ignored when cache_inode == 0.
+    cache_shared: bool = false,
 };
 
 fn initFdTable() [MAX_FDS]FileDesc {

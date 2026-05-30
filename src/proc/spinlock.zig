@@ -1,10 +1,14 @@
 const std = @import("std");
+const witness = @import("../debug/witness.zig");
 
 /// Ticket-based spinlock for SMP synchronization.
 /// Uses @atomicRmw for lock-free ticket acquisition.
 pub const SpinLock = struct {
     next_ticket: u32 = 0,
     now_serving: u32 = 0,
+    /// WITNESS lock-order class, set by registerLock. 0xFF = unregistered
+    /// (the common case) → the lock-order hooks below are skipped entirely.
+    witness_class: u8 = 0xFF,
     /// Holder diagnostics — populated after acquire wins, cleared on
     /// release. Read by the spin-warn diagnostic so a deadlock dump
     /// names not just the spinner but the CPU + RIP that's still
@@ -42,8 +46,15 @@ pub const SpinLock = struct {
         while (true) {
             const serving = @atomicLoad(u32, &self.now_serving, .acquire);
             if (serving == ticket) {
-                self.holder_cpu = currentCpuId();
+                const cpu = currentCpuId();
+                self.holder_cpu = cpu;
                 self.holder_ra = ra;
+                if (comptime witness.enabled) {
+                    if (self.witness_class != 0xFF) {
+                        const smp = @import("../cpu/smp.zig");
+                        witness.spinAcquire(self.witness_class, cpu, smp.myCpu().current_pid, ra);
+                    }
+                }
                 return;
             }
             // u32 wrapping subtract: handles next_ticket overflow correctly
@@ -75,6 +86,9 @@ pub const SpinLock = struct {
 
     /// Release the lock. Advances to the next ticket.
     pub fn release(self: *SpinLock) void {
+        if (comptime witness.enabled) {
+            if (self.witness_class != 0xFF) witness.spinRelease(self.witness_class, currentCpuId());
+        }
         self.holder_cpu = 0xFF;
         // Leave holder_ra in place as a "last holder" hint — useful when a
         // deadlock fires immediately after a release/re-acquire cycle.
@@ -239,6 +253,8 @@ pub const Mutex = struct {
     /// Diagnostic: where the current/last holder acquired the lock.
     /// Held across release as a "last holder" hint for post-mortems.
     holder_ra: u64 = 0,
+    /// WITNESS lock-order class, set by registerMutex. 0xFF = unregistered.
+    witness_class: u8 = 0xFF,
 
     /// Non-blocking, non-trapping observe: is this mutex currently held by
     /// SOMEBODY (any pid)? Snapshot only — value may be stale by the time
@@ -297,6 +313,14 @@ pub const Mutex = struct {
             }
             @panic("Mutex recursive acquire — self-deadlock prevented");
         }
+        if (comptime witness.enabled) {
+            // Before the (possibly blocking) CAS loop, so a "sleeping with a
+            // spinlock held" violation is caught before we actually park.
+            // Use currentCpuId() (LAPIC id) to match the spin hooks — both
+            // index witness's spin_held[] and must agree on the numbering, or
+            // the sleep-with-spinlock check reads the wrong CPU's held-set.
+            if (self.witness_class != 0xFF) witness.mutexAcquire(self.witness_class, currentCpuId(), my_pid, ra);
+        }
         const process = @import("process.zig");
         while (true) {
             // Fast path: claim the lock atomically.
@@ -316,6 +340,9 @@ pub const Mutex = struct {
         if (smp.myCpu().current_pid == null) {
             // Pre-scheduler: nothing to wake; clear diag.
             return;
+        }
+        if (comptime witness.enabled) {
+            if (self.witness_class != 0xFF) witness.mutexRelease(self.witness_class, smp.myCpu().current_pid.?);
         }
         // Clear ownership BEFORE waking waiters: they retry CAS on wake
         // and need to observe the free state.
@@ -352,6 +379,9 @@ pub const Mutex = struct {
 /// Spin locks are skipped (no per-pid ownership; they're held by CPU).
 pub fn releaseMutexesOwnedBy(pid: u16) void {
     const serial = @import("../debug/serial.zig");
+    // Drop WITNESS's per-pid mutex-held bits so a force-release doesn't
+    // strand a stale bit into the next task that reuses this pid slot.
+    if (comptime witness.enabled) witness.threadExit(pid);
     var i: u8 = 0;
     while (i < named_lock_count) : (i += 1) {
         const ent = &named_locks[i];
@@ -374,6 +404,16 @@ pub fn releaseMutexesOwnedBy(pid: u16) void {
 
 const MAX_NAMED_LOCKS: usize = 32;
 
+comptime {
+    // Each registered lock's registry index doubles as its WITNESS class, so
+    // the registry must not be able to hand out an index WITNESS can't track
+    // (registerClass silently drops index >= MAX_CLASSES). Asserted here —
+    // spinlock already imports witness, so this direction avoids a cycle.
+    if (MAX_NAMED_LOCKS > @as(usize, witness.MAX_CLASSES)) {
+        @compileError("MAX_NAMED_LOCKS exceeds witness.MAX_CLASSES — registered locks would be silently untracked");
+    }
+}
+
 const LockKind = enum(u8) { spin, mutex };
 
 const NamedLock = struct {
@@ -385,10 +425,13 @@ const NamedLock = struct {
 var named_locks: [MAX_NAMED_LOCKS]NamedLock = [_]NamedLock{.{}} ** MAX_NAMED_LOCKS;
 var named_lock_count: u8 = 0;
 
-/// Register a SpinLock under `name`. Called once per lock at boot.
+/// Register a SpinLock under `name`. Called once per lock at boot. Also
+/// assigns the lock its WITNESS lock-order class (= the registry index).
 pub fn registerLock(name: []const u8, lock: *SpinLock) void {
     if (named_lock_count >= MAX_NAMED_LOCKS) return;
+    lock.witness_class = named_lock_count;
     named_locks[named_lock_count] = .{ .name = name, .kind = .spin, .ptr = @intFromPtr(lock) };
+    witness.registerClass(named_lock_count, name, .spin);
     named_lock_count += 1;
 }
 
@@ -396,8 +439,34 @@ pub fn registerLock(name: []const u8, lock: *SpinLock) void {
 /// dump path reads owner_pid (not cpu).
 pub fn registerMutex(name: []const u8, lock: *Mutex) void {
     if (named_lock_count >= MAX_NAMED_LOCKS) return;
+    lock.witness_class = named_lock_count;
     named_locks[named_lock_count] = .{ .name = name, .kind = .mutex, .ptr = @intFromPtr(lock) };
+    witness.registerClass(named_lock_count, name, .mutex);
     named_lock_count += 1;
+}
+
+/// Register a per-CPU (or otherwise multi-instance) SpinLock FAMILY under a
+/// single WITNESS lock-order class. Returns the class so the caller can tag
+/// every instance (`lock.witness_class = class`); `representative` is tagged
+/// here and is the instance the [lock-dump] autopsy will name (one class can't
+/// name N distinct holders anyway). Returns 0xFF if the registry is full, in
+/// which case the caller must skip tagging.
+///
+/// SOUND ONLY when no single CPU ever holds two instances of the family at
+/// once: the held-set carries one bit per CPU, so a second same-class acquire
+/// on the same CPU is indistinguishable and its release would clear the bit
+/// early (a benign false-negative, never a false alarm). ZigOS's per-CPU
+/// sched_lock satisfies this — schedule() only ever takes the running CPU's
+/// own (see sched.zig); cross-CPU wakeups go through the reschedule IPI, which
+/// makes the *remote* CPU take its own lock.
+pub fn registerLockClass(name: []const u8, representative: *SpinLock) u8 {
+    if (named_lock_count >= MAX_NAMED_LOCKS) return 0xFF;
+    const class = named_lock_count;
+    representative.witness_class = class;
+    named_locks[class] = .{ .name = name, .kind = .spin, .ptr = @intFromPtr(representative) };
+    witness.registerClass(class, name, .spin);
+    named_lock_count += 1;
+    return class;
 }
 
 /// Walk registered SpinLocks; emit one [smi-cause] line per currently-held

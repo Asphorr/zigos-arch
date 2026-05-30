@@ -19,6 +19,19 @@ const sound = @import("../driver/sound.zig");
 const events_mod = @import("events.zig");
 pub const Event = events_mod.Event;
 pub const EventKind = events_mod.EventKind;
+const Mutex = @import("../proc/spinlock.zig").Mutex;
+
+// Serializes growGuiFb's FB-mutation sequence against destroyGuiWindow's
+// FB teardown. Without it, an F10-grown FB whose owner process exits in
+// the narrow window between alloc/PTE-repoint and the publish step can be
+// observed mid-update by destroyGuiWindow — which then frees the OLD phys
+// block while growGuiFb is also freeing it (the 1789 freeFrame underflows
+// the kernel panics on). Mutex (not SpinLock) because growGuiFb calls
+// tlb.shootdownAll, which IPIs peer CPUs and waits for ACK — peers that
+// are also spinning on windows_lock with IRQs off would never ACK and
+// we'd hard-deadlock. The mutex sleeps the waiter through the scheduler
+// (IF stays on) so the shootdown still completes.
+var gui_fb_realloc_lock: Mutex = .{};
 
 // DBG: input-pipeline diagnostic counters. Bumped from desktop's drain
 // loop when chars get dropped. Read by manual klog dumps when input
@@ -723,6 +736,15 @@ fn closeWindow(idx: u8) void {
 /// The app learns the new stride via sysGetWindowAlloc on the `.resize` event
 /// toggleFullscreen pushes right after.
 fn growGuiFb(idx: u8, need_w: u32, need_h: u32) bool {
+    // Hold across the full grow so destroyGuiWindow (which also takes
+    // this mutex) cannot observe gui_fb_phys_base / gui_alloc_w/h
+    // mid-publish, and so it cannot race lines 836-840's OLD-frame
+    // release against its own unmapGuiFB. windows_lock is NOT taken
+    // around shootdownAll — that would deadlock against a peer CPU
+    // spinning on windows_lock with IRQs off (it could not ACK our IPI).
+    gui_fb_realloc_lock.acquire();
+    defer gui_fb_realloc_lock.release();
+
     const w = &windows[idx];
     if (w.gpu_slot != null) return false; // GPU path scales via the compositor
     // Opt-in: only grow for apps that have queried getWindowAlloc and thus know
@@ -798,41 +820,56 @@ fn growGuiFb(idx: u8, need_w: u32, need_h: u32) bool {
     // Old frames are now unreachable from the app once its TLB is flushed.
     @import("../cpu/mmu/tlb.zig").shootdownAll(process.procs[pid].pcid);
 
-    // Repoint the window. NULL the front AND the stale back-buffer pointers
-    // first (they point at the OLD, smaller, about-to-be-freed blocks), THEN
-    // drain in-flight present snapshots, THEN publish the new geometry — the
-    // ordering reclaimBackBuffers uses. The backs MUST be nulled before
-    // gui_fb_pixels grows and gui_fb is re-published: otherwise the next
-    // snapshotGuiFb sees them non-null, skips realloc, and memcpys the new
-    // (larger) pixel count into a small freed back buffer → overflow + panic in
-    // sysPresent. Nulling forces a lazy realloc at the new size.
-    var old_back_phys: [3]usize = .{ 0, 0, 0 };
-    w.gui_fb = null;
-    w.has_presented = false;
-    {
-        var s: u8 = 0;
-        while (s < 3) : (s += 1) {
-            w.gui_fb_backs[s] = null;
-            old_back_phys[s] = paging.takeGuiFbBackPhys(pid, s);
-        }
-    }
+    // Drain in-flight present snapshots BEFORE taking windows_lock — the
+    // drain loop can spin millions of cycles waiting for a peer CPU's
+    // sysPresent to finish, and holding windows_lock (IRQ-save spinlock)
+    // through that would block IRQ delivery on this CPU for the whole
+    // wait. snapshotGuiFb doesn't take windows_lock, so this drain is
+    // safe outside it.
     var spin: u32 = 0;
     while (@atomicLoad(u32, &presenting_count, .acquire) > 0) {
         asm volatile ("pause");
         spin += 1;
         if (spin > 10_000_000) break;
     }
-    w.gui_fb_pixels = @intCast(@as(u64, new_alloc_w) * new_alloc_h);
-    w.gui_alloc_w = new_alloc_w;
-    w.gui_alloc_h = new_alloc_h;
-    w.gui_w = need_w;
-    w.gui_h = need_h;
-    w.gui_fb_pub.store(0, .release);
-    paging.registerGuiFB(pid, new_phys);
-    w.gui_fb = new_kv;
+
+    // Publish the new geometry atomically with windows_lock held so the
+    // compositor (and createGuiWindow / destroyGuiWindow) cannot observe
+    // a half-updated window. NULL the front AND the stale back-buffer
+    // pointers first (they point at the OLD, smaller, about-to-be-freed
+    // blocks), THEN publish — the ordering reclaimBackBuffers uses. The
+    // backs MUST be nulled before gui_fb_pixels grows and gui_fb is
+    // re-published: otherwise the next snapshotGuiFb sees them non-null,
+    // skips realloc, and memcpys the new (larger) pixel count into a
+    // small freed back buffer → overflow + panic in sysPresent.
+    var old_back_phys: [3]usize = .{ 0, 0, 0 };
+    {
+        const wflags = lockWindows();
+        defer unlockWindows(wflags);
+        w.gui_fb = null;
+        w.has_presented = false;
+        var s: u8 = 0;
+        while (s < 3) : (s += 1) {
+            w.gui_fb_backs[s] = null;
+            old_back_phys[s] = paging.takeGuiFbBackPhys(pid, s);
+        }
+        w.gui_fb_pixels = @intCast(@as(u64, new_alloc_w) * new_alloc_h);
+        w.gui_alloc_w = new_alloc_w;
+        w.gui_alloc_h = new_alloc_h;
+        w.gui_w = need_w;
+        w.gui_h = need_h;
+        w.gui_fb_pub.store(0, .release);
+        paging.registerGuiFB(pid, new_phys);
+        w.gui_fb = new_kv;
+    }
 
     // Free the OLD block: front frames carry two refs (alloc + acquire) — drop
     // both; each old back buffer (phys taken above) is a single-owner block.
+    // Outside windows_lock (refcount math is independent) but still inside
+    // gui_fb_realloc_lock so destroyGuiWindow's unmapGuiFB can't also drop a
+    // ref on the same OLD frames (it would have done that under
+    // gui_fb_realloc_lock + windows_lock and our publish would have shown it
+    // OLD-state values via gui_fb_phys_base/gui_alloc still being OLD).
     i = 0;
     while (i < old_pages) : (i += 1) {
         pmm.releaseFrame(old_phys + i * 4096);
@@ -3401,6 +3438,14 @@ const win_title = @import("desktop/title.zig");
 /// the user is typing and a background-spawn shouldn't yank the cursor away.
 /// Pass `true` for explicit user gestures (shortcut launch, dock click).
 pub fn createGuiWindow(pid: u8, fb: [*]volatile u32, fb_backs: [3]?[*]volatile u32, fb_pixels: u32, w: u32, h: u32, alloc_w: u32, alloc_h: u32, auto_focus: bool, gpu_slot: ?u8) ?u8 {
+    // Hold gui_fb_realloc_lock so slot recycling can't race a concurrent
+    // growGuiFb that's still inside the OLD-release region (the OLD slot
+    // it's working with must not be re-allocSlot'd until both growGuiFb
+    // and destroyGuiWindow have fully exited). The fragility this guards
+    // against is documented next to gui_fb_realloc_lock's declaration.
+    // Order is gui_fb_realloc_lock -> windows_lock, matching destroyGuiWindow.
+    gui_fb_realloc_lock.acquire();
+    defer gui_fb_realloc_lock.release();
     const wflags = lockWindows();
     defer unlockWindows(wflags);
     const slot = allocSlot() orelse return null;
@@ -3549,6 +3594,12 @@ fn removeWindow(slot: u8) void {
 
 /// Destroy GUI windows owned by the given process.
 pub fn destroyGuiWindow(pid: u8) void {
+    // Mutex held across the whole teardown so growGuiFb cannot race
+    // its publish + OLD-release sequence against our unmapGuiFB. See
+    // the lock's declaration for the deadlock analysis. Lock order is
+    // ALWAYS gui_fb_realloc_lock -> windows_lock; never the reverse.
+    gui_fb_realloc_lock.acquire();
+    defer gui_fb_realloc_lock.release();
     const wflags = lockWindows();
     defer unlockWindows(wflags);
     // Restore cursor if this process had it hidden

@@ -149,10 +149,11 @@ pub fn sysKlog(buf_ptr: u32, len: u32) u32 {
 /// ACPI parsing failed. Reboot uses the standard PCI reset register
 /// (0xCF9) with an 8042 fallback. Never returns on success.
 ///
-/// SLP_TYPa = 5 (S5 — soft off) is hardcoded. The "right" way is to read
-/// the value from DSDT's `\_S5_` package, but that requires an AML
-/// interpreter; every BIOS we've ever seen uses 5 here, and QEMU
-/// accepts any SLP_TYP when SLP_EN=1.
+/// SLP_TYPa/b come from the DSDT's `\_S5_` package (parsed at boot by the
+/// minimal AML scan in acpi.zig), falling back to the spec-default 5 when no
+/// parseable `_S5_` was found. The legacy port-magic writes below still fire
+/// unconditionally, so shutdown survives even firmware whose SLP_TYP we read
+/// wrong — and QEMU accepts any SLP_TYP when SLP_EN=1 regardless.
 pub fn sysShutdown(mode: u32) u32 {
     const io = @import("../../io.zig");
     const fat32 = @import("../../fs/fat32.zig");
@@ -191,13 +192,20 @@ pub fn sysShutdown(mode: u32) u32 {
         while ((io.inb(0x64) & 0x02) != 0 and spin < 100000) : (spin += 1) {}
         io.outb(0x64, 0xFE);
     } else {
-        // SLP_TYPa=5, SLP_EN=1 → bit pattern 0x3400. Writing this to
-        // PM1a_CNT (and PM1b_CNT if non-zero) is the spec-mandated
-        // way to enter S5.
-        const sleep_word: u16 = (@as(u16, 5) << 10) | (1 << 13);
+        // Enter S5 (soft off): write SLP_TYP|SLP_EN to PM1a_CNT (and PM1b_CNT
+        // when present). SLP_EN is bit 13; SLP_TYP is bits 12:10. The codes come
+        // from the DSDT's \_S5_ package (acpi.getS5SleepTypes) with a fallback to
+        // 5. PM1a and PM1b legitimately take *different* codes (SLP_TYPa vs
+        // SLP_TYPb), so the two words are built apart; each is masked to the
+        // 3-bit field so a stray parse can't disturb adjacent PM1 control bits.
+        const s5 = acpi.getS5SleepTypes();
+        const slp_a: u16 = if (s5) |st| (st.a & 0x7) else 5;
+        const slp_b: u16 = if (s5) |st| (st.b & 0x7) else 5;
+        const word_a: u16 = (slp_a << 10) | (1 << 13);
+        const word_b: u16 = (slp_b << 10) | (1 << 13);
         if (acpi.getFadt()) |f| {
-            if (f.pm1a_cnt_blk != 0) io.outw(@truncate(f.pm1a_cnt_blk), sleep_word);
-            if (f.pm1b_cnt_blk != 0) io.outw(@truncate(f.pm1b_cnt_blk), sleep_word);
+            if (f.pm1a_cnt_blk != 0) io.outw(@truncate(f.pm1a_cnt_blk), word_a);
+            if (f.pm1b_cnt_blk != 0) io.outw(@truncate(f.pm1b_cnt_blk), word_b);
         }
         // Belt-and-suspenders for hosts where FADT was unparseable or
         // the FADT-named port isn't actually wired (some emulator

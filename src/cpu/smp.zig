@@ -389,6 +389,22 @@ pub fn init() void {
     // desktop dispatch are both later in main.zig).
     cpus_base = @intFromPtr(&cpus);
 
+    // Register the per-CPU sched_lock family with WITNESS under ONE lock-order
+    // class. Every CPU only ever acquires its own sched_lock (sched.zig
+    // schedule()), so a single per-CPU held bit is exact — see
+    // spinlock.registerLockClass. This is the high-value class: the scheduler
+    // sits beneath the allocator/driver paths, exactly where a lock-order
+    // reversal would wedge the box. Done here while single-threaded (covers
+    // every boot-mode path below) and before any AP can run schedule().
+    {
+        const spinlock = @import("../proc/spinlock.zig");
+        const sched_class = spinlock.registerLockClass("sched_lock", &cpus[0].sched_lock);
+        if (sched_class != 0xFF) {
+            var i: usize = 1;
+            while (i < MAX_CPUS) : (i += 1) cpus[i].sched_lock.witness_class = sched_class;
+        }
+    }
+
     if (!apic.apic_active) {
         debug.klog("[smp] No APIC, SMP disabled\n", .{});
         return;

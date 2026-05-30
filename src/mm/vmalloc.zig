@@ -233,6 +233,9 @@ pub fn init() void {
     debug.klog("[vmalloc] init: arena @ 0x{X:0>16}, {d} MB ({d} pages)\n", .{
         VMALLOC_BASE, VMALLOC_SIZE / (1024 * 1024), NUM_PAGES,
     });
+    // WITNESS: track the arena lock's order vs other subsystem locks. Reached
+    // only on successful init (the allocFrame failures above return early).
+    @import("../proc/spinlock.zig").registerLock("vmalloc.lock", &lock);
 }
 
 /// Allocate `size` bytes from the vmalloc arena. Returns a kernel-VA

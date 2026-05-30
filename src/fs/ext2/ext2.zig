@@ -13,6 +13,7 @@ const inode = @import("inode.zig");
 const path_cache = @import("../path_cache.zig");
 const time = @import("../../time/time.zig");
 const debug = @import("../../debug/debug.zig");
+const page_cache = @import("../../mm/page_cache.zig");
 
 /// Path-cached `walkPath`. Saves the full root → leaf directory walk on
 /// repeat opens of the same path (httpd serving static files, shell
@@ -112,6 +113,17 @@ pub fn readFile(handle: Handle, buf: [*]u8, count: u32) usize {
     return inode.readInodeBytes(handle.inum, handle.current_offset, buf[0..count]);
 }
 
+/// Whether `inum` is a regular file plus its size, in a single (cached) inode
+/// read — the two facts vfs.readThroughCache needs to decide cache eligibility
+/// (only regular-file data is cached + invalidated) and to clip at EOF.
+/// is_reg=false (including an unreadable inode) tells the caller to bypass the
+/// cache entirely.
+pub const CacheReadInfo = struct { is_reg: bool, size: u64 };
+pub fn cacheReadInfo(inum: u32) CacheReadInfo {
+    const ino = inode.readInode(inum) orelse return .{ .is_reg = false, .size = 0 };
+    return .{ .is_reg = inode.isReg(&ino), .size = inode.fileSize(&ino) };
+}
+
 pub fn closeFile(_: Handle) void {}
 
 /// Overwrite or extend an existing file's contents at `handle.current_offset`.
@@ -126,6 +138,9 @@ pub fn writeFile(handle: *Handle, src: [*]const u8, count: u32) u32 {
     var ino = inode.readInode(handle.inum) orelse return 0;
     if (!inode.isReg(&ino)) return 0;
 
+    // Captured before the loop: writeFile advances handle.current_offset to
+    // new_end at the end, so we can't read the write's start offset there.
+    const start_off = handle.current_offset;
     const bs = m.block_size;
     var done: u32 = 0;
 
@@ -171,6 +186,76 @@ pub fn writeFile(handle: *Handle, src: [*]const u8, count: u32) u32 {
 
     handle.current_offset = new_end;
     handle.file_size = inode.fileSize(&ino);
+    // Page-cache coherence: drop cached pages overlapping the written range so a
+    // later mmap fault / cached read re-fills from disk rather than serving the
+    // pre-write bytes. No-op (quick misses) for files nothing has mmap'd.
+    if (done > 0) _ = page_cache.invalidateRange(page_cache.ext2FileId(handle.inum), start_off, done);
+    return done;
+}
+
+/// Persist one page (`src`, up to 4 KiB) of already-cached regular-file data
+/// straight to its on-disk data blocks — the disk half of MAP_SHARED writeback
+/// (Slice 3c), driven by vfs.syncCacheFile on msync/munmap.
+///
+/// Two deliberate differences from writeFile:
+///   1. It does NOT invalidate the page cache. We are persisting the cache's OWN
+///      live shared frame; dropping it (writeFile's coherence hook) would desync
+///      every other mapper from disk and force a divergent re-read.
+///   2. It NEVER grows the file. Only bytes within the inode's current size are
+///      written (a shared mapping doesn't extend the file; bytes mapped past EOF
+///      are simply not persisted). So `ino.size` is left untouched.
+/// mtime/ctime are intentionally not bumped (that would cost an inode write per
+/// page) — writeback is a pure data persist of blocks the file already owns.
+/// `page_off` must be page-aligned. Returns bytes written.
+pub fn writebackPage(inum: u32, page_off: u64, src: [*]const u8) u32 {
+    const m = block.getMount() orelse return 0;
+    var ino = inode.readInode(inum) orelse return 0;
+    if (!inode.isReg(&ino)) return 0;
+    const fsize = inode.fileSize(&ino);
+    if (page_off >= fsize) return 0; // wholly past EOF — nothing on disk to update
+    const want: u32 = @intCast(@min(@as(u64, 0x1000), fsize - page_off)); // clip at EOF
+    const bs = m.block_size;
+    var done: u32 = 0;
+    var inode_grew = false; // a sparse-hole fill allocated a block → must persist ino
+    while (done < want) {
+        const file_off: u64 = page_off + done;
+        const lblk = file_off / bs;
+        if (lblk > std.math.maxInt(u32)) break;
+        const logical: u32 = @intCast(lblk);
+        const in_block_off: u32 = @intCast(file_off % bs);
+        const can: u32 = bs - in_block_off;
+        const remain: u32 = want - done;
+        const take: u32 = if (remain < can) remain else can;
+
+        // The data being written was originally READ from these blocks into the
+        // cache, so they already exist and ensurePhysicalBlock returns the
+        // existing mapping. Only a genuinely sparse file (a hole the mapping
+        // wrote into) allocates here — correct, and flagged so we persist the
+        // updated block map.
+        const was_unallocated = (inode.blockMapLookup(&ino, logical) == null);
+        const phys = inode.ensurePhysicalBlock(m, &ino, logical) orelse break;
+        if (was_unallocated) {
+            inode_grew = true;
+            // Sparse-hole fill: zero the slack we won't immediately overwrite
+            // (mirrors writeFile) so a later file growth can't expose stale
+            // allocBlock contents. The slack here is strictly past our clipped
+            // write, so reads at the current size never see it — belt-and-braces.
+            if (in_block_off != 0 or take != bs) {
+                _ = block.writeBlock(m, phys, block.zero_block[0..bs]);
+            }
+        }
+
+        const ok = if (in_block_off == 0 and take == bs)
+            block.writeBlock(m, phys, src[done .. done + take])
+        else
+            block.writeBlockBytes(m, phys, in_block_off, src[done .. done + take]);
+        if (!ok) break;
+        done += take;
+    }
+    // Persist the inode only if its block map changed (sparse-hole fill). The
+    // common overwrite path leaves `ino` untouched, so we skip a redundant
+    // inode write per page.
+    if (inode_grew) _ = inode.writeInode(inum, &ino);
     return done;
 }
 
@@ -551,6 +636,9 @@ pub fn truncate(inum: u32) bool {
     const sec: u32 = @truncate(time.now().sec);
     ino.mtime = sec;
     ino.ctime = sec;
+    // Page-cache coherence: every data page is gone — drop them all so a later
+    // fault/read doesn't serve pre-truncate bytes.
+    _ = page_cache.invalidateFile(page_cache.ext2FileId(inum));
     return inode.writeInode(inum, &ino);
 }
 

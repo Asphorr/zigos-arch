@@ -86,6 +86,8 @@ pub const TEST_ENTRIES = [_]Entry{
     .{ .label = "Stress: I/O chain", .desc = "Concurrent NVMe loadFileFresh from N workers + virtio-gpu flushRect on main. Hunts the 2026-05-19 cpu1-wedge / watchdog trip — determines code-bug vs host-SMI.", .boot_mode = 11, .badge = "STRESS", .badge_color = COLOR_BADGE_STRESS },
     .{ .label = "Stress: PMM heavy", .desc = "14-phase PMM stress: single/contig churn, cross-region big allocs, fragmentation+coalesce, run pool exhaustion, UAF canary, SMP concurrent. Validates the 2026-05-24 region-bucketed rewrite. Output in serial.log.", .boot_mode = 12, .badge = "STRESS", .badge_color = COLOR_BADGE_STRESS },
     .{ .label = "Test: panic UI", .desc = "Trigger a controlled @panic after boot to render the panic screen for visual review. Switch trigger kind (PF / UD / panic) by editing src/test/panic_test.zig.", .boot_mode = 7, .badge = "DEMO", .badge_color = COLOR_BADGE_INFO },
+    .{ .label = "Test: WITNESS self-test", .desc = "Deliberately reverse a lock order, then take a mutex while holding a spinlock, to prove the WITNESS detector fires. Expect one [witness] LOR + one SLEEP-WITH-SPINLOCK line in serial.log, then the box idles.", .boot_mode = 13, .badge = "DEMO", .badge_color = COLOR_BADGE_INFO },
+    .{ .label = "Test: page cache", .desc = "Exercise the unified page cache (mm/page_cache.zig) in isolation: hit/miss, set-associative eviction frees the victim frame, refcount-pinned pages survive eviction, no frame leaks. Expect a [pgcache] PASS line in serial.log, then the box idles.", .boot_mode = 14, .badge = "DEMO", .badge_color = COLOR_BADGE_INFO },
     .{ .label = "< Back", .desc = "Return to the main boot menu.", .boot_mode = BOOT_MODE_BACK, .badge = "BACK", .badge_color = COLOR_BADGE_INFO },
 };
 
@@ -282,10 +284,14 @@ fn aboutText(stack: *layout.VStack, label: []const u8, value: []const u8) void {
 // `for (entries, ...) { drawEntry(...); }`.
 const ENTRY_H: u32 = 60;
 
-fn drawEntry(fb: Fb, panel_x: u32, ey: u32, panel_w: u32, entry: Entry, is_sel: bool) void {
+fn drawEntry(fb: Fb, panel_x: u32, ey: u32, panel_w: u32, entry: Entry, is_sel: bool, row_h: u32) void {
+    // Selection box is the row minus an 8-px inter-row gap. `row_h` is ENTRY_H
+    // for short menus and a compressed value for a submenu too tall to fit the
+    // screen (see showImpl); saturating-sub so it never underflows at the floor.
+    const box_h: u32 = row_h -| 8;
     if (is_sel) {
-        fillRect(fb, panel_x + 24, ey, panel_w - 48, ENTRY_H - 8, COLOR_SEL_BG);
-        drawBorder(fb, panel_x + 24, ey, panel_w - 48, ENTRY_H - 8, COLOR_SEL_BORDER);
+        fillRect(fb, panel_x + 24, ey, panel_w - 48, box_h, COLOR_SEL_BG);
+        drawBorder(fb, panel_x + 24, ey, panel_w - 48, box_h, COLOR_SEL_BORDER);
         drawTriangleRight(fb, panel_x + 36, ey + 16, 7, COLOR_SEL_TEXT);
     }
     const text_color = if (is_sel) COLOR_SEL_TEXT else COLOR_TEXT;
@@ -298,7 +304,7 @@ fn drawEntry(fb: Fb, panel_x: u32, ey: u32, panel_w: u32, entry: Entry, is_sel: 
     const badge_h: u32 = 22;
     const badge_w = aa.default_16.measure(entry.badge) + 12;
     const badge_x = panel_x + panel_w - 24 - badge_w - 8;
-    const badge_y = ey + (ENTRY_H - 8 -| badge_h) / 2;
+    const badge_y = ey + (box_h -| badge_h) / 2;
 
     // Description column: left of badge with a small gap. Truncate with
     // "..." if the full text doesn't fit. Without this, long descs
@@ -341,6 +347,7 @@ fn modeShortName(mode: u32) []const u8 {
         8 => "stress async-exec",
         10 => "stress wake-ipi",
         11 => "stress io-chain",
+        14 => "page-cache",
         else => "?",
     };
 }
@@ -607,10 +614,25 @@ fn showImpl(
     // vertical space (title strip + gap + footer + countdown bar area).
     const min_panel_h: u32 = 480;
     const overhead_h: u32 = 60 + 7 + 80;
-    const needed_h: u32 = @as(u32, @intCast(entries.len)) * ENTRY_H + overhead_h;
+    // Rows are ENTRY_H tall, but a tall submenu (Tests) can total more than the
+    // screen height at modest GOP modes — e.g. 11 rows × 60 + 147 overhead =
+    // 807 on an 800-px panel. The centering below computes `fb.h - panel_h`,
+    // which then underflowed u32 → a ReleaseSafe "integer overflow" panic that
+    // aborted the bootloader straight into the UEFI shell. Compress the per-row
+    // height ONLY when the natural layout would overflow, so short menus keep
+    // the full 60 px while a tall one shrinks to fit. Floor at 40 px so a row
+    // never collapses below glyph height.
+    const avail_h: u32 = fb.h -| 80; // usable height: 40-px margin top + bottom
+    const list_budget: u32 = avail_h -| overhead_h;
+    const natural_list: u32 = entries_len_u32 * ENTRY_H;
+    const entry_h: u32 = if (natural_list <= list_budget) ENTRY_H else @max(@as(u32, 40), list_budget / entries_len_u32);
+    const needed_h: u32 = entries_len_u32 * entry_h + overhead_h;
     const panel_h: u32 = @max(min_panel_h, needed_h);
     const panel_x = (fb.w - panel_w) / 2;
-    const panel_y = (fb.h - panel_h) / 2 + 40;
+    // Saturating subtract: if panel_h still exceeds fb.h (pathologically small
+    // mode), top-anchor at +40 rather than underflow. This is the line that
+    // panicked before the compression above bounded panel_h.
+    const panel_y = (fb.h -| panel_h) / 2 + 40;
     // Crash on previous boot disables auto-boot — the user clearly needs to
     // pick something deliberately, and freeing the countdown-bar strip lets
     // the crash banner sit cleanly above the entries.
@@ -725,8 +747,8 @@ fn showImpl(
             ps.gap(7); // separator before entries
             for (entries, 0..) |entry, i| {
                 const idx: u32 = @intCast(i);
-                const ey = ps.reserve(ENTRY_H);
-                drawEntry(fb, panel_x, ey, panel_w, entry, idx == selected);
+                const ey = ps.reserve(entry_h);
+                drawEntry(fb, panel_x, ey, panel_w, entry, idx == selected, entry_h);
             }
 
             // Bottom-anchored items — countdown bar + footer key row.

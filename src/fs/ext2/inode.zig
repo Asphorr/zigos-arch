@@ -12,6 +12,7 @@
 const std = @import("std");
 const layout = @import("layout.zig");
 const block = @import("block.zig");
+const page_cache = @import("../../mm/page_cache.zig");
 
 // =============================================================================
 // Inode cache
@@ -156,6 +157,11 @@ pub fn freeInode(inum: u32, was_dir: bool) bool {
     if (!block.writeSuperblock(m)) return false;
 
     invalidate(inum);
+    // Page-cache coherence + SECURITY: this inode may be reused by a new file;
+    // drop its cached data pages so the new file can't read the deleted file's
+    // contents (the cache keys on file_id = inode). Walk is cheap (unlink/rmdir
+    // is rare) and a no-op when nothing of this inode was cached.
+    _ = page_cache.invalidateFile(page_cache.ext2FileId(inum));
     return true;
 }
 

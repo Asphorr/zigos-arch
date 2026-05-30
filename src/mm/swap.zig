@@ -137,6 +137,10 @@ pub fn init() void {
         return;
     }
     available = true;
+    // WITNESS: track the slot-allocator lock (taken in the page-fault evict /
+    // swap-in path) vs other subsystem locks. Registered only when swap is
+    // actually live — past the no-device early return above.
+    @import("../proc/spinlock.zig").registerLock("swap.slots", &slot_lock);
     // Self-test runs SYNCHRONOUSLY because nvme.enableAsync() hasn't fired yet
     // at this point in init — async_mode is false on every controller. Once
     // enableAsync() flips this controller too (we no longer markSyncOnly), all

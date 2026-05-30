@@ -321,6 +321,8 @@ const SYSCALLS = [_]SyscallSpec{
     .{ .num = 115, .name = "io_uring_setup",          .handler = wrap(sys_iouring_setup) },
     .{ .num = 116, .name = "io_uring_enter",          .handler = wrap(sys_iouring_enter) },
     .{ .num = 117, .name = "debug_crash",             .handler = wrap(sys.sysDebugCrash) },
+    .{ .num = 118, .name = "mmap_file_shared",        .handler = wrap(mem.sysMmapFileShared) },
+    .{ .num = 119, .name = "msync",                   .handler = wrap(mem.sysMsync) },
 };
 
 // Thin shims so the dispatch table can route into the iouring module
@@ -362,6 +364,8 @@ fn doSyscallInner(sys_num: u32, arg1: u32, arg2: u32, arg3: u32, frame: *signals
         115 => sys_iouring_setup(arg1),
         116 => sys_iouring_enter(arg1, arg2, arg3),
         117 => sys.sysDebugCrash(arg1),
+        118 => mem.sysMmapFileShared(arg1, arg2, arg3),
+        119 => mem.sysMsync(arg1, arg2),
         5 => mem.sysSbrk(arg1),
         6 => proc.sysGetpid(),
         7 => proc.sysYield(),

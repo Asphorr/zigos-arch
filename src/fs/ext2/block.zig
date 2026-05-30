@@ -3,18 +3,23 @@
 // block driver batches up to N sectors per call but only serves one
 // byte range at a time.
 //
-// Cache size (2026-05-20): 64 sectors = 32 KiB, matching nvme's
-// MAX_SECTORS_PER_CMD after the PRP-list bump. Each cache fill is now
-// ONE NVMe command instead of needing eight; sequential file reads
-// (the dominant ELF-load pattern) hit ~88% of the time on the existing
-// window. Pre-fix this was 8 sectors / 4 KB and a 2.67 MB load
-// (doom_real) took 1293 NVMe calls; with 32 KB ≈ 85 calls — 15× win
-// stacked on top of the per-cmd 8× from MAX_SECTORS_PER_CMD.
+// Cache size (2026-05-29): 256 sectors = 128 KiB = 4 x nvme's
+// MAX_SECTORS_PER_CMD. Each cache fill spans 4 NVMe commands, which
+// nvme.readSectorsPipelined submits CONCURRENTLY (QD4) instead of serially —
+// the fix for the QD=1 serialization where ~95% of an ELF load was spent
+// blocked one command at a time. History: 64 sectors / 32 KiB (one command
+// per fill, fully serial) -> 128 / 64 KiB (QD2: measured the wait on a 942 KiB
+// load drop 243M -> 32M cycles, ~95% -> 27% of load time) -> 256 / 128 KiB
+// (QD4). The read_sectors count param was widened u8 -> u16 so a fill can
+// exceed 255 sectors. Sequential file reads (the dominant ELF-load pattern)
+// keep their high hit rate; the wider window just deepens the pipeline. To go
+// to QD8, bump to 512 (u16 already fits; ATA chunks at 128 either way).
 //
-// At 4 KB ext2 blocks the cache covers 8 logical blocks per fill; at
-// 1 KB it covers 32. Random-access workloads (directory walks, btree
-// metadata) over-fetch by the cache size but the absolute waste is
-// still 28 KB max — tiny in PMM terms.
+// At 4 KB ext2 blocks the cache covers 32 logical blocks per fill; at 1 KB it
+// covers 128. Random-access workloads (directory walks, btree metadata)
+// over-fetch by the cache size — now 128 KiB max per fill, 256 KiB across the
+// 2 ways. That over-fetch is the reason we don't widen further by default: a
+// metadata-hop workload that keeps missing both ways re-reads 128 KiB a time.
 //
 // Writes are implemented: writeBlock / writeBlockBytes + the bitmap
 // alloc/free paths all funnel through the same cache window.
@@ -25,7 +30,7 @@ const blkdev = @import("../../driver/block.zig");
 const debug = @import("../../debug/debug.zig");
 
 const SECTOR_SIZE: u32 = 512;
-const CACHE_SECTORS: u32 = 64;
+const CACHE_SECTORS: u32 = 256; // 128 KiB window = 4 pipelined NVMe cmds (QD4); see header. MUST stay a power of 2 (cacheBaseFor masks).
 const CACHE_BYTES: u32 = CACHE_SECTORS * SECTOR_SIZE;
 
 /// Number of independent cache windows. 2 is enough for the dominant
@@ -33,13 +38,13 @@ const CACHE_BYTES: u32 = CACHE_SECTORS * SECTOR_SIZE;
 /// far LBA): one way pins the inode-table block, the other holds the
 /// sequential data window. Bumping to 4+ would help only on workloads
 /// that hop across >2 metadata regions, which is rare. Each way costs
-/// CACHE_BYTES in BSS (32 KB at the default).
+/// CACHE_BYTES in BSS (128 KB at the default).
 const CACHE_WAYS: u32 = 2;
 
 // Function-pointer indirection: lets Phase 3 swap the underlying device
 // (secondary → primary) without touching ext2/ internals. Same idea as
 // the block driver's own backend dispatch.
-const ReadFn = *const fn (lba: u32, count: u8, dest: [*]u8) void;
+const ReadFn = *const fn (lba: u32, count: u16, dest: [*]u8) void;
 const WriteFn = *const fn (lba: u32, src: [*]const u8) void;
 
 pub const Mount = struct {

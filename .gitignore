@@ -9,7 +9,7 @@ disk.tar
 
 # Logs (kernel serial output, debug captures)
 *.log
-serial.log
+serial.log*
 
 # OS / editor noise
 .DS_Store
@@ -19,4 +19,12 @@ Thumbs.db
 
 # Claude Code internal state (plans, conversation IDs)
 .claude/
+
+# Game / VN assets — pipeline-generated from upstream sources (tools/ddlc/*.py),
+# supplied locally and not redistributed. Mirrors the share/quake/ policy.
 share/quake/
+share/ddlc/
+share/vn/
+
+# Python bytecode from host-side asset tooling
+__pycache__/

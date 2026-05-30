@@ -170,6 +170,21 @@ pub fn sysMmap(len: u32, fd: u32, offset: u32) u32 {
         if (fd >= config.MAX_FDS) return E_INVAL;
         if (!pcb.fd_table[fd].in_use) return E_INVAL;
 
+        // Cache-backed fast path (ext2 only): register a demand-paged region
+        // keyed on the file's inode and return immediately — NO eager read, NO
+        // private buffer. Pages fault in through the unified page cache, shared
+        // across mappers and filled lazily (fault.zig faultInCachePage). Other
+        // filesystems fall through to the eager copy-into-buffer path below.
+        if (pcb.fd_table[fd].fs_type == .ext2) {
+            if (!process.addLazyRegion(lead_pid, new_top, lead.mmap_top, 0)) return E_INVAL;
+            const ridx = lead.lazy_count - 1;
+            lead.lazy_regions[ridx].prot = process.PROT_RW;
+            lead.lazy_regions[ridx].cache_inode = @intCast(pcb.fd_table[fd].inode);
+            lead.lazy_regions[ridx].cache_off = offset;
+            lead.mmap_top = new_top;
+            return @intCast(new_top);
+        }
+
         const num_pages: u32 = @intCast(len_pg / 0x1000);
         // User-driven fd-backed mmap — respect the PMM reserve so a
         // big mmap can't deplete the kernel emergency pool.
@@ -215,6 +230,78 @@ pub fn sysMmap(len: u32, fd: u32, offset: u32) u32 {
 
     lead.mmap_top = new_top;
     return @intCast(new_top);
+}
+
+/// MAP_SHARED file mapping (Slice 3c). Like the ext2 fast path of sysMmap, but
+/// the region is flagged `cache_shared`: its pages map the shared page-cache
+/// frame WRITABLE, so writes land in the shared page — visible to every other
+/// mapper of the file and to read() — and are written back to disk on msync()
+/// (sysMsync) / munmap() (sysMunmap). Demand-paged: no eager read.
+///
+/// ext2 regular-file fds only; any other fd / fs type is rejected (E_INVAL) so
+/// the caller falls back to the private mmapFile path. Returns the VA on success,
+/// E_INVAL on bad fd / table-full / VA exhaustion. VAs grow downward from
+/// mmap_top exactly like sysMmap.
+pub fn sysMmapFileShared(len: u32, fd: u32, offset: u32) u32 {
+    if (len == 0) return E_INVAL;
+    const pcb = process.currentPCB() orelse return E_FAULT;
+    _ = pcb.page_directory orelse return E_FAULT;
+    const lead = process.leader(pcb);
+
+    lead.as_lock.acquire();
+    defer lead.as_lock.release();
+
+    if (lead.lazy_count >= process.MAX_LAZY_REGIONS) return E_INVAL;
+    if (fd >= config.MAX_FDS) return E_INVAL;
+    if (!pcb.fd_table[fd].in_use) return E_INVAL;
+    // Shared writeback only exists for the ext2 page cache. Other fs types have
+    // no cache frame to share, so reject rather than silently giving private
+    // semantics under a MAP_SHARED name.
+    if (pcb.fd_table[fd].fs_type != .ext2) return E_INVAL;
+
+    const len_pg: usize = (@as(usize, len) + 0xFFF) & ~@as(usize, 0xFFF);
+    if (len_pg > lead.mmap_top) return E_INVAL;
+    const new_top = lead.mmap_top - len_pg;
+    if (new_top < lead.user_brk) return E_INVAL;
+
+    if (!process.addLazyRegion(lead.tgid, new_top, lead.mmap_top, 0)) return E_INVAL;
+    const ridx = lead.lazy_count - 1;
+    lead.lazy_regions[ridx].prot = process.PROT_RW;
+    lead.lazy_regions[ridx].cache_inode = @intCast(pcb.fd_table[fd].inode);
+    lead.lazy_regions[ridx].cache_off = offset;
+    lead.lazy_regions[ridx].cache_shared = true;
+    lead.mmap_top = new_top;
+    return @intCast(new_top);
+}
+
+/// msync(addr, len): write a MAP_SHARED file mapping's dirty pages back to disk.
+/// Finds the cache-shared region covering `va` and flushes the WHOLE file's dirty
+/// pages (a correct superset of [va, va+len) — every dirty page of the file needs
+/// persisting eventually). The dirty flag is left set (the mapping stays live), so
+/// a later write re-dirties and a later msync re-flushes. Blocking NVMe I/O runs
+/// OUTSIDE as_lock. Returns 0 on success, E_INVAL if no shared region covers `va`.
+pub fn sysMsync(va: u32, len: u32) u32 {
+    _ = len; // whole-file flush (MVP) — range is advisory; see doc above
+    const pcb = process.currentPCB() orelse return E_FAULT;
+    _ = pcb.page_directory orelse return E_FAULT;
+    const lead = process.leader(pcb);
+    const start: usize = @as(usize, va) & ~@as(usize, 0xFFF);
+
+    // Resolve the region under the lock (the table can be mutated by a concurrent
+    // mmap/munmap on another thread), capture the inode, then release before I/O.
+    lead.as_lock.acquire();
+    const inum: ?u32 = blk: {
+        defer lead.as_lock.release();
+        for (lead.lazy_regions[0..lead.lazy_count]) |r| {
+            if (r.cache_inode != 0 and r.cache_shared and start >= r.start and start < r.end) {
+                break :blk r.cache_inode;
+            }
+        }
+        break :blk null;
+    };
+    const i = inum orelse return E_INVAL;
+    _ = vfs.syncCacheFile(i, false); // clear=false: mapping stays live, keep dirty
+    return 0;
 }
 
 /// MAP_SHARED|MAP_ANONYMOUS mmap (POSIX-style). Creates a new shared-anon
@@ -274,14 +361,19 @@ pub fn sysMunmap(va: u32, len: u32) u32 {
     const pd = pcb.page_directory orelse return E_FAULT;
     const lead = process.leader(pcb);
 
-    // AS-stability lock — serializes vs io_uring worker memcpy into AS.
+    // AS-stability lock — serializes vs io_uring worker memcpy into AS. Released
+    // EXPLICITLY (not deferred) before the shared-region writeback at the end:
+    // that does blocking NVMe I/O and so must run with this spinlock dropped.
+    // Each early error return below releases it first.
     lead.as_lock.acquire();
-    defer lead.as_lock.release();
 
     const start: usize = @as(usize, va) & ~@as(usize, 0xFFF);
     const len_pg: usize = (@as(usize, len) + 0xFFF) & ~@as(usize, 0xFFF);
     const end = start + len_pg;
-    if (end <= start) return E_INVAL;
+    if (end <= start) {
+        lead.as_lock.release();
+        return E_INVAL;
+    }
 
     var found_idx: ?usize = null;
     for (lead.lazy_regions[0..lead.lazy_count], 0..) |r, i| {
@@ -290,7 +382,10 @@ pub fn sysMunmap(va: u32, len: u32) u32 {
             break;
         }
     }
-    const idx = found_idx orelse return E_INVAL;
+    const idx = found_idx orelse {
+        lead.as_lock.release();
+        return E_INVAL;
+    };
     const removed = lead.lazy_regions[idx];
 
     // Gap #7+#8 (2026-05-20): batched walk that shares the PT pointer
@@ -362,6 +457,17 @@ pub fn sysMunmap(va: u32, len: u32) u32 {
         if (removed.shm_id != shm.SHM_INVALID) shm.release(removed.shm_id);
     }
 
+    // Capture before releasing: a MAP_SHARED file region needs its dirty pages
+    // flushed to disk. unmapUserRange above already dropped this mapping's PTE
+    // refs, so by the time syncCacheFile(clear=true) runs, clearDirtyIfCacheOnly
+    // sees the true remaining-mapper count (refcount==1 ⇒ no other mapper ⇒ clear
+    // ⇒ the page rejoins the evictable pool).
+    const shared_inode: ?u32 =
+        if (removed.cache_inode != 0 and removed.cache_shared) removed.cache_inode else null;
+    lead.as_lock.release();
+
+    // Writeback runs OUTSIDE as_lock — writebackPage blocks on NVMe I/O.
+    if (shared_inode) |inum| _ = vfs.syncCacheFile(inum, true);
     return 0;
 }
 
@@ -389,8 +495,11 @@ pub fn sysMprotect(va: u32, len: u32, prot: u32) u32 {
     const end = start + len_pg;
     if (end <= start) return E_INVAL;
 
+    // Lazy regions live on the lead thread (per-process), like every other
+    // mmap-family syscall — a cloned (non-lead) thread's mprotect must see the
+    // shared table, not its own empty one.
     var found_idx: ?usize = null;
-    for (pcb.lazy_regions[0..pcb.lazy_count], 0..) |r, i| {
+    for (lead.lazy_regions[0..lead.lazy_count], 0..) |r, i| {
         if (r.start == start and r.end == end) {
             found_idx = i;
             break;
@@ -400,9 +509,20 @@ pub fn sysMprotect(va: u32, len: u32, prot: u32) u32 {
 
     // Mask off non-prot bits the user might have passed; we own the encoding.
     const new_prot: u8 = @as(u8, @truncate(prot)) & process.PROT_RWX;
-    pcb.lazy_regions[idx].prot = new_prot;
+    lead.lazy_regions[idx].prot = new_prot;
 
-    const new_flags = vmm.protToMapFlags(new_prot);
+    // A PRIVATE cache-backed region's present pages are mapped read-only + COW
+    // over a SHARED frame; protToMapFlags(PROT_RW) would strip COW and set W,
+    // letting a write scribble the shared page (and every other mapper's view).
+    // cacheMapFlags keeps them RO+COW (writable prot) or plain RO (read-only prot)
+    // so the COW divergence — and PROT_READ enforcement — stay intact.
+    // A SHARED cache region (cache_shared, Slice 3c) is the opposite: writes are
+    // SUPPOSED to hit the shared frame, so it takes the plain prot bits like anon.
+    const lr = &lead.lazy_regions[idx];
+    const new_flags = if (lr.cache_inode != 0 and !lr.cache_shared)
+        vmm.cacheMapFlags(new_prot)
+    else
+        vmm.protToMapFlags(new_prot);
     var page = start;
     while (page < end) : (page += 0x1000) {
         // changePageProt returns false for not-yet-faulted-in pages — that's

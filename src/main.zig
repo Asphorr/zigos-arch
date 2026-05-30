@@ -274,6 +274,12 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     blog.ok("KASAN shadow");
     @import("mm/vmalloc.zig").init();
     blog.ok("vmalloc arena");
+    // Unified page cache (file-backed mmap + future read() path). init() clears
+    // the (BSS-zeroed) table — a no-op at boot — and registers page_cache.lock
+    // with WITNESS so the first fault-path acquire participates in lock-order
+    // checking (order: as_lock -> page_cache.lock -> pmm).
+    @import("mm/page_cache.zig").init();
+    blog.ok("Page cache");
     @import("debug/symbols.zig").init();
     @import("debug/kcsan.zig").init();
     blog.ok("KCSAN runtime");
@@ -558,6 +564,13 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     //   4      → stress test (ring-3 spinners + kernel-task churn; see
     //            src/test/stress_iretq.zig — hunts the cross-CPU iretq frame
     //            race documented in project_iretq_race_ipi_fix.md)
+    //   13     → WITNESS self-test (deliberate lock-order reversal; see
+    //            src/test/witness_selftest.zig — proves the detector fires so
+    //            a clean boot's silence can be trusted)
+    //   14     → page cache self-test (mm/page_cache.zig in isolation: hit/
+    //            miss, set eviction frees the victim frame, refcount pinning
+    //            prevents eviction, no frame leak — see
+    //            src/test/page_cache_selftest.zig)
     const desktop_mod = @import("ui/desktop.zig");
     // Read from the module global (set in line 118) rather than the
     // function-parameter pointer. The boot_info struct lives in a
@@ -576,6 +589,8 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
         10 => @intFromPtr(&@import("test/stress_wake_ipi.zig").taskEntry),
         11 => @intFromPtr(&@import("test/stress_io_chain.zig").taskEntry),
         12 => @intFromPtr(&@import("test/stress_pmm.zig").taskEntry),
+        13 => @intFromPtr(&@import("test/witness_selftest.zig").taskEntry),
+        14 => @intFromPtr(&@import("test/page_cache_selftest.zig").taskEntry),
         // Mode 9 (GPU compositor) boots the regular desktop; the desktop
         // detects boot_mode==9 and spawns ui/gpu_compositor.zig as a
         // side-by-side kernel task so they share one screen.

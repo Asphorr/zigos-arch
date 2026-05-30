@@ -37,11 +37,19 @@ pub fn build(b: *std.Build) void {
     }
 
     // --- BUILD ID ---
-    // Each `zig build` invocation gets a unique 64-bit ID (Unix timestamp).
-    // The kernel embeds it via build options; mktar writes the same value to
-    // BUILD.ID inside disk.tar. At boot the kernel compares them and shouts
-    // if they don't match — so we never silently run with a stale tar again.
+    // Each `zig build` invocation gets a unique 64-bit ID. The kernel embeds
+    // it via build options; mktar writes the same value to BUILD.ID inside
+    // disk.tar. At boot the kernel compares them and shouts if they don't
+    // match — so we never silently run with a stale tar again.
+    //
+    // We reuse the existing BUILD.ID (and so let the Zig compile cache hit
+    // for the kernel) when no source file is newer than the last build —
+    // that's the common dev-loop case. If anything under src/, lib/, or
+    // app/ has been touched, we mint a fresh timestamp. Without this every
+    // `zig build` triggers a 2-minute kernel re-link from scratch even when
+    // the change was confined to userspace.
     const build_id_value: u64 = blk: {
+        if (cachedBuildId(b)) |existing| break :blk existing;
         var ts: std.os.linux.timespec = undefined;
         _ = std.os.linux.clock_gettime(.REALTIME, &ts);
         break :blk @intCast(ts.sec);
@@ -197,11 +205,38 @@ pub fn build(b: *std.Build) void {
     }
 
     // --- Shared library modules ---
+    //
+    // libc_heap.zig (per-process malloc/free/realloc + heap state) is the
+    // hottest file in lib/; we want edits there to NOT trigger every app
+    // to recompile. Neither `addLibrary + linkLibrary` nor
+    // `addLibrary + addObjectFile(getEmittedBin())` decouples the source
+    // hash — both propagate the Zig-internal module hash to consumers, so
+    // touching libc_heap.zig re-runs ~50 app compiles (~2 min).
+    //
+    // The real decoupling: invoke `zig build-lib` as an external system
+    // command, producing a .a file that Zig's higher-level build cache
+    // treats as a plain opaque input. Consumers then `addObjectFile` the
+    // .a's path — when its bytes change, only the *link* step on each app
+    // re-runs (~100-300ms each); the Zig compile cache hits.
+    const libc_heap_compile = b.addSystemCommand(&.{
+        "/opt/zig-x86_64-linux-0.15.2/zig",
+        "build-lib",
+        "-target",
+        "x86_64-freestanding-none",
+        "-mcpu",
+        "baseline",
+        "-O",
+        "ReleaseSafe",
+    });
+    libc_heap_compile.addFileArg(b.path("lib/libc_heap.zig"));
+    const libc_heap_a = libc_heap_compile.addPrefixedOutputFileArg("-femit-bin=", "libc_heap.a");
+
     const libc_mod = b.createModule(.{
         .root_source_file = b.path("lib/libc.zig"),
         .target = target,
         .optimize = optimize,
     });
+    libc_mod.addObjectFile(libc_heap_a);
     const font_mod = b.createModule(.{
         .root_source_file = b.path("lib/font.zig"),
         .target = target,
@@ -357,6 +392,7 @@ pub fn build(b: *std.Build) void {
         .{ "grep.elf", "app/grep.zig" },
         .{ "head.elf", "app/head.zig" },
         .{ "mmaptest.elf", "app/mmaptest.zig" },
+        .{ "mapshare.elf", "app/mapshare.zig" },
         .{ "swaptest.elf", "app/swaptest.zig" },
         .{ "swapsys.elf", "app/swapsys.zig" },
         .{ "mtswap.elf", "app/mtswap.zig" },
@@ -598,9 +634,11 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .link_libc = false,
-            .imports = &.{
-                .{ .name = "libc", .module = libc_mod },
-            },
+            // No libc import — stb_shims.zig declares `extern fn __libc_*`
+            // for the heap entrypoints it needs, and importing libc_mod
+            // here would transitively bundle libc_heap.a inside stb_lib.a
+            // (yields `ld.lld: archive member ... neither ET_REL nor LLVM
+            // bitcode` warnings at every consumer link).
         }),
     });
     stb_lib.root_module.addCSourceFile(.{
@@ -653,9 +691,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .link_libc = false,
-            .imports = &.{
-                .{ .name = "libc", .module = libc_mod },
-            },
+            // No libc import — see stb_lib above for the rationale.
         }),
     });
     truetype_lib.root_module.addCSourceFile(.{
@@ -715,9 +751,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .link_libc = false,
-            .imports = &.{
-                .{ .name = "libc", .module = libc_mod },
-            },
+            // No libc import — see stb_lib above for the rationale.
         }),
     });
     vorbis_lib.root_module.addCSourceFile(.{
@@ -831,6 +865,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "ui", .module = ui_mod },
                 .{ .name = "font_atlas", .module = font_atlas_mod },
                 .{ .name = "image", .module = image_mod },
+                .{ .name = "json", .module = json_mod },
             },
         }),
     });
@@ -954,11 +989,12 @@ pub fn build(b: *std.Build) void {
     const mkdisk = b.addSystemCommand(&.{
         "bash", "-c",
         \\set -e
+        \\T0=$(date +%s%3N)
         \\# Skip if disk.img is newer than every input — saves ~1s on kernel-only edits.
         \\if [ -f disk.img ]; then
         \\  newest=$(ls -t zig-out/bin/*.elf zig-out/bin/KERNEL.SYM zig-out/bin/BUILD.ID doom1.wad 2>/dev/null | head -1 || true)
         \\  if [ -n "$newest" ] && [ "$newest" -ot disk.img ]; then
-        \\    echo "[disk] up-to-date"
+        \\    echo "[disk] up-to-date $(($(date +%s%3N)-T0))ms"
         \\    exit 0
         \\  fi
         \\fi
@@ -973,7 +1009,7 @@ pub fn build(b: *std.Build) void {
         \\for f in www/*; do
         \\  [ -f "$f" ] && mcopy -i disk.img "$f" ::
         \\done
-        \\echo "[disk] rebuilt"
+        \\echo "[disk] rebuilt $(($(date +%s%3N)-T0))ms"
         ,
     });
     mkdisk.step.dependOn(b.getInstallStep());
@@ -1004,6 +1040,7 @@ pub fn build(b: *std.Build) void {
     const mkext2 = b.addSystemCommand(&.{
         "bash", "-c",
         \\set -e
+        \\T0=$(date +%s%3N)
         \\IMG=ext2.img
         \\STAGE=zig-out/ext2-stage
         \\
@@ -1011,7 +1048,7 @@ pub fn build(b: *std.Build) void {
         \\if [ -f $IMG ]; then
         \\  newest=$( { ls -t zig-out/bin/*.elf zig-out/bin/KERNEL.SYM zig-out/bin/BUILD.ID doom1.wad www/* 2>/dev/null; find share -type f -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2; } | head -1 || true)
         \\  if [ -n "$newest" ] && [ "$newest" -ot $IMG ]; then
-        \\    echo "[ext2] up-to-date"
+        \\    echo "[ext2] up-to-date $(($(date +%s%3N)-T0))ms"
         \\    exit 0
         \\  fi
         \\fi
@@ -1060,7 +1097,7 @@ pub fn build(b: *std.Build) void {
         \\# table covers DDLC's ~1500 small assets (442 PNG + 64 OGG + ~1000 misc)
         \\# with headroom for system files.
         \\genext2fs -B 4096 -b 131072 -N 8192 -d $STAGE -q $IMG
-        \\echo "[ext2] rebuilt ($(du -h $IMG | cut -f1))"
+        \\echo "[ext2] rebuilt ($(du -h $IMG | cut -f1)) $(($(date +%s%3N)-T0))ms"
         ,
     });
     mkext2.step.dependOn(b.getInstallStep());
@@ -1072,12 +1109,13 @@ pub fn build(b: *std.Build) void {
     const mktar = b.addSystemCommand(&.{
         "bash", "-c",
         \\set -e
+        \\T0=$(date +%s%3N)
         \\# Skip if disk.tar is newer than every app .elf AND BUILD.ID — kernel-only
         \\# edits don't need a fresh tar, but app edits and new build IDs absolutely do.
         \\if [ -f disk.tar ]; then
         \\  newest=$(ls -t zig-out/bin/*.elf zig-out/bin/BUILD.ID 2>/dev/null | head -1 || true)
         \\  if [ -n "$newest" ] && [ "$newest" -ot disk.tar ]; then
-        \\    echo "[tar] up-to-date"
+        \\    echo "[tar] up-to-date $(($(date +%s%3N)-T0))ms"
         \\    exit 0
         \\  fi
         \\fi
@@ -1096,9 +1134,9 @@ pub fn build(b: *std.Build) void {
         \\  sysmon.elf calc.elf settings.elf files.elf about.elf fastfetch.elf zigtop.elf sigil.elf tg.elf \
         \\  paint.elf editor.elf doom.elf vn.elf gpu_test.elf vulkan_triangle.elf \
         \\  venus_test.elf vulkan_cube.elf doom_real.elf \
-        \\  mmaptest.elf threadtest.elf threadbrot.elf synctest.elf babel.elf forktest.elf daemontest.elf logd.elf photo.elf wallpaper.elf \
+        \\  mmaptest.elf mapshare.elf threadtest.elf threadbrot.elf synctest.elf babel.elf forktest.elf daemontest.elf logd.elf photo.elf wallpaper.elf \
         \\  shmtest.elf iouringtest.elf redteam.elf
-        \\echo "[tar] rebuilt"
+        \\echo "[tar] rebuilt $(($(date +%s%3N)-T0))ms"
         ,
     });
     mktar.step.dependOn(b.getInstallStep());
@@ -1187,9 +1225,11 @@ pub fn build(b: *std.Build) void {
     const mkesp_dir = b.addSystemCommand(&.{
         "bash", "-c",
         \\set -e
+        \\T0=$(date +%s%3N)
         \\mkdir -p zig-out/esp/EFI/BOOT
         \\cp zig-out/bin/BOOTX64.efi zig-out/esp/EFI/BOOT/BOOTX64.EFI
         \\cp zig-out/bin/kernel.elf zig-out/esp/kernel.elf
+        \\echo "[esp-dir] rebuilt $(($(date +%s%3N)-T0))ms"
         ,
     });
     mkesp_dir.step.dependOn(&bootloader.step);
@@ -1279,4 +1319,62 @@ pub fn build(b: *std.Build) void {
     debug_cmd.step.dependOn(b.getInstallStep());
     const debug_step = b.step("debug", "Boot under QEMU with gdbstub on :1234 (use -Dhalt=true to pause at boot)");
     debug_step.dependOn(&debug_cmd.step);
+}
+
+/// Reuse the existing BUILD.ID's value when no source under src/, lib/,
+/// app/, or build.zig itself is newer than the stored ID file. Returns the
+/// cached u64 on cache-hit, null otherwise (caller mints a fresh timestamp).
+///
+/// Without this, `build_options.build_id` changes on every `zig build` →
+/// the kernel's compile cache misses → 2+ minute kernel re-link even when
+/// the edit was confined to a single user-space file.
+fn cachedBuildId(b: *std.Build) ?u64 {
+    _ = b; // kept for forward-compat (e.g. b.path() if we add more sources)
+    const id_path = "zig-out/bin/BUILD.ID";
+    const cwd = std.fs.cwd();
+    const id_stat = cwd.statFile(id_path) catch return null;
+
+    // Watch the *kernel's* source surface only: anything not under src/ or
+    // build.zig itself can't affect kernel.elf (libc_heap edits, vn.zig
+    // tweaks, etc.). Zig's own compile cache invalidates the kernel when
+    // a referenced lib/ file changes, and our reused build_id still gets
+    // baked into the new kernel + written to the BUILD.ID file by mktar
+    // — they stay matched.
+    if (anyChildNewer(cwd, "src", id_stat.mtime)) return null;
+    if (cwd.statFile("build.zig")) |bz| {
+        if (bz.mtime > id_stat.mtime) return null;
+    } else |_| return null;
+
+    // Parse the existing BUILD.ID — 16-hex-char file, no trailing newline.
+    var buf: [32]u8 = undefined;
+    const f = cwd.openFile(id_path, .{}) catch return null;
+    defer f.close();
+    const n = f.read(&buf) catch return null;
+    if (n < 16) return null;
+    return std.fmt.parseInt(u64, buf[0..16], 16) catch null;
+}
+
+/// Recursively check whether any regular file under `path` has mtime
+/// strictly greater than `cutoff`. Returns true on first hit.
+fn anyChildNewer(root: std.fs.Dir, path: []const u8, cutoff: i128) bool {
+    var dir = root.openDir(path, .{ .iterate = true }) catch return false;
+    defer dir.close();
+    var it = dir.iterate();
+    while (it.next() catch return false) |entry| {
+        switch (entry.kind) {
+            .file => {
+                const st = dir.statFile(entry.name) catch continue;
+                if (st.mtime > cutoff) return true;
+            },
+            .directory => {
+                // Skip generated/cache subtrees so .zig-cache doesn't
+                // racily look "new" mid-build.
+                if (std.mem.eql(u8, entry.name, ".zig-cache")) continue;
+                if (std.mem.eql(u8, entry.name, "zig-out")) continue;
+                if (anyChildNewer(dir, entry.name, cutoff)) return true;
+            },
+            else => {},
+        }
+    }
+    return false;
 }

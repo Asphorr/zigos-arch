@@ -362,6 +362,23 @@ pub fn mmapFile(fd: u32, offset: u32, len: usize) ?[]u8 {
     return ptr[0..aligned];
 }
 
+/// MAP_SHARED file mapping (Slice 3c). Unlike `mmapFile` (which gives each
+/// caller a private snapshot), writes through the returned slice land in the
+/// SHARED page-cache frame — visible to every other mapper of the file and to
+/// read() — and are written back to disk by `msync()` or `munmap()`. ext2
+/// regular files only; returns null on any other fd / fs type, table-full, or
+/// VA exhaustion. `len` is page-rounded; bytes past EOF read as zero and are not
+/// persisted (the file is never grown). The caller's `fd` read position is
+/// untouched (the mapping is keyed on the inode, demand-paged — no eager read).
+pub fn mmapFileShared(fd: u32, offset: u32, len: usize) ?[]u8 {
+    if (len == 0) return null;
+    const va = syscall3(118, @intCast(len), fd, offset);
+    if (va == 0xFFFFFFFF) return null;
+    const aligned: usize = (len + 0xFFF) & ~@as(usize, 0xFFF);
+    const ptr: [*]u8 = @ptrFromInt(@as(usize, va));
+    return ptr[0..aligned];
+}
+
 /// io_uring Sqe / Cqe / RingHeader — must match src/cpu/ipc/iouring.zig byte-for-byte.
 pub const IoUringSqe = extern struct {
     opcode: u8,
@@ -505,6 +522,19 @@ pub fn mmapSharedAnon(len: usize) ?[]u8 {
 pub fn munmap(buf: []u8) bool {
     if (buf.len == 0) return false;
     return syscall(58, @truncate(@intFromPtr(buf.ptr)), @intCast(buf.len)) == 0;
+}
+
+/// Flush a MAP_SHARED file mapping's dirty pages to disk (POSIX msync). `buf`
+/// must point into a region returned by `mmapFileShared`; the whole file's dirty
+/// pages are written back (a correct superset of `buf`'s range). The mapping
+/// stays live and writable — keep writing and call msync again to re-flush.
+/// munmap() also flushes, so an explicit msync is only needed to persist while
+/// the mapping is still in use. Returns true on success, false if no shared
+/// region covers `buf`. (Plain process exit does NOT flush — msync or munmap
+/// first if you need the bytes on disk.)
+pub fn msync(buf: []u8) bool {
+    if (buf.len == 0) return false;
+    return syscall(119, @truncate(@intFromPtr(buf.ptr)), @intCast(buf.len)) == 0;
 }
 
 // Page-protection bits for `mprotect`. PROT_READ is informational — pages
@@ -924,54 +954,16 @@ pub fn getWindowAlloc() WindowAlloc {
     return .{ .w = buf[0], .h = buf[1] };
 }
 
-// --- Heap allocator: thread-safe boundary-tag with magic-protected blocks --
+// --- Heap allocator (extern interface to lib/libc_heap.zig static lib) ----
 //
-// Each allocation is preceded by a 16-byte Block header carrying:
-//   - this block's size (multiple of 16, includes header)
-//   - a magic word (MAGIC_ALLOC when in-use, MAGIC_FREE when on the free list)
-//   - the preceding block's size (Knuth boundary tag — backward coalesce is
-//     O(1): on free we look at `prev_size` instead of walking from heap_start)
+// Implementation lives in lib/libc_heap.zig — built as a separate static
+// library so that heap-internal edits (malloc strategies, the freelist
+// scan, debug-fill toggles) don't fan out into every app rebuilding
+// libc.zig from scratch. The C-ABI symbols __libc_* are resolved at link
+// time. The public Zig API below stays the same shape callers expect, so
+// `libc.malloc(sz)` / `libc.free(p)` etc. work unchanged.
 //
-// Thread safety: `heap_lock` (Mutex) wraps every public API. Uncontended path
-// is a single atomic CAS; contended falls into the futex.
-//
-// Block magic is the main corruption canary. `free()` validates it before
-// touching anything, catching:
-//   - free(ptr_not_from_malloc): random memory rarely has MAGIC_ALLOC at -16
-//   - free(ptr + offset): mid-block frees, rejected by the alignment check
-//   - free(ptr); free(ptr): second free sees MAGIC_FREE, returns silently
-//   - buffer overflow scribbling the next block's header: magic mismatch
-//
-// Allocation policy is next-fit-with-hint: each malloc starts the free-list
-// scan from where the last successful alloc landed, wrapping at heap_end.
-// Spreads allocations out (reduces fragmentation vs first-fit) and skips
-// the "long prefix of used blocks" walk-cost as the heap fills.
-//
-// realloc tries three strategies before fall-back:
-//   1. Already big enough → shrink in place + split remainder
-//   2. Next block is free and combined size fits → merge in place
-//   3. malloc + memcpy + free
-// All three run under a single heap_lock acquire so the source bytes can't
-// be racily reused between the strategy-3 malloc and free.
-
-const BLOCK_MAGIC_ALLOC: u32 = 0xA110_CA7E; // "ALLOCATE"
-const BLOCK_MAGIC_FREE: u32 = 0xFEED_5EED; // "FEED-SEED"
-
-/// Pattern written into freed payload when HEAP_DEBUG_FILL is true. 0xDD
-/// catches use-after-free by ensuring re-reads of freed data return junk
-/// rather than the previously-stored value. Off by default — adds a memset
-/// per free.
-const FREE_FILL: u8 = 0xDD;
-const HEAP_DEBUG_FILL: bool = false;
-
-const Block = extern struct {
-    size: u32, // total block size including this 16-byte header (multiple of 16)
-    magic: u32, // BLOCK_MAGIC_ALLOC or BLOCK_MAGIC_FREE; 0 on a defensively-invalidated block
-    prev_size: u32, // size of preceding block in the same sbrk chunk; 0 = first
-    _pad: u32 = 0,
-};
-const HEADER_SIZE: usize = @sizeOf(Block); // 16 bytes
-const MIN_SPLIT: usize = HEADER_SIZE + 16; // don't split if remainder smaller
+// See [[libc-heap-static-lib-2026-05-28]] for the why.
 
 pub const HeapStats = extern struct {
     used_bytes: u64,
@@ -980,363 +972,44 @@ pub const HeapStats = extern struct {
     blocks: u32,
 };
 
-var heap_start: usize = 0; // address of first block (set on first sbrk)
-var heap_end: usize = 0; // one past last block (== sbrk top)
-var heap_hint: usize = 0; // next-fit cursor; wraps to heap_start at heap_end
-var heap_lock: Mutex = .{};
-var heap_used: usize = 0;
-var heap_free: usize = 0;
-var heap_blocks: u32 = 0;
+pub extern fn __libc_malloc(size: usize) ?[*]u8;
+pub extern fn __libc_free(ptr: ?[*]u8) void;
+pub extern fn __libc_realloc(old_ptr: ?[*]u8, new_size: usize) ?[*]u8;
+pub extern fn __libc_calloc(nmemb: usize, size: usize) ?[*]u8;
+pub extern fn __libc_malloc_trim(keep_bytes: usize) usize;
+pub extern fn __libc_malloc_usable_size(ptr: ?[*]u8) usize;
+pub extern fn __libc_malloc_stats(out: *HeapStats) void;
 
-inline fn alignUp(x: usize, a: usize) usize {
-    return (x + a - 1) & ~(a - 1);
+pub inline fn malloc(size: usize) ?[*]u8 {
+    return __libc_malloc(size);
 }
 
-/// After a block at `addr` changes size (split, merge, etc.), update the
-/// `prev_size` field of whichever block now follows it so the boundary tag
-/// stays consistent.
-inline fn linkPrevSize(addr: usize, new_size: u32) void {
-    const after = addr + new_size;
-    if (after < heap_end) {
-        const next: *Block = @ptrFromInt(after);
-        next.prev_size = new_size;
-    }
+pub inline fn free(ptr: ?[*]u8) void {
+    __libc_free(ptr);
 }
 
-/// Validate a user-supplied pointer and return the matching Block, or null
-/// if it's clearly not a live allocation. Catches OOB pointers, mid-block
-/// frees, double-frees (MAGIC_FREE), and non-malloc pointers (random magic).
-inline fn blockFromUser(user_addr: usize) ?*Block {
-    if (user_addr < heap_start + HEADER_SIZE or user_addr >= heap_end) return null;
-    if ((user_addr & 15) != 0) return null; // malloc payloads are always 16-aligned
-    const block: *Block = @ptrFromInt(user_addr - HEADER_SIZE);
-    if (block.magic != BLOCK_MAGIC_ALLOC) return null;
-    return block;
+pub inline fn realloc(old_ptr: ?[*]u8, new_size: usize) ?[*]u8 {
+    return __libc_realloc(old_ptr, new_size);
 }
 
-fn growHeap(min_bytes: usize) ?usize {
-    const min_request: usize = 65536;
-    const raw = if (min_bytes < min_request) min_request else min_bytes;
-    const request = alignUp(raw, 4096);
-    const ptr = sbrk(@intCast(request)) orelse return null;
-    const addr = @intFromPtr(ptr);
-    if (heap_start == 0) {
-        heap_start = addr;
-        heap_hint = addr;
-    }
-    // Head of new sbrk chunk: prev_size = 0. We don't try to coalesce across
-    // gaps between sbrk chunks — current sbrk impl makes them contiguous in
-    // practice, but the safe behavior is to treat each chunk as its own
-    // boundary-tag chain.
-    const block: *Block = @ptrFromInt(addr);
-    block.* = .{ .size = @intCast(request), .magic = BLOCK_MAGIC_FREE, .prev_size = 0 };
-    heap_end = addr + request;
-    heap_free += request;
-    heap_blocks += 1;
-    return addr;
+pub inline fn calloc(nmemb: usize, size: usize) ?[*]u8 {
+    return __libc_calloc(nmemb, size);
 }
 
-fn mallocLocked(size: usize) ?[*]u8 {
-    if (size == 0) return null;
-    const need = alignUp(size, 16) + HEADER_SIZE;
-
-    // Next-fit pass 1: start from hint, sweep to heap_end.
-    var addr = if (heap_hint != 0) heap_hint else heap_start;
-    while (addr != 0 and addr < heap_end) {
-        const block: *Block = @ptrFromInt(addr);
-        if (block.size == 0) break; // corrupted; bail to grow path rather than spin
-        if (block.magic == BLOCK_MAGIC_FREE and block.size >= need) {
-            return claimBlock(addr, need);
-        }
-        addr += block.size;
-    }
-    // Pass 2: wrap from heap_start to original hint.
-    addr = heap_start;
-    while (addr != 0 and addr < heap_hint) {
-        const block: *Block = @ptrFromInt(addr);
-        if (block.size == 0) break;
-        if (block.magic == BLOCK_MAGIC_FREE and block.size >= need) {
-            return claimBlock(addr, need);
-        }
-        addr += block.size;
-    }
-
-    // No fit — grow.
-    const new_addr = growHeap(need) orelse return null;
-    return claimBlock(new_addr, need);
+pub inline fn malloc_trim(keep_bytes: usize) usize {
+    return __libc_malloc_trim(keep_bytes);
 }
 
-pub fn malloc(size: usize) ?[*]u8 {
-    heap_lock.lock();
-    defer heap_lock.unlock();
-    return mallocLocked(size);
+pub inline fn malloc_usable_size(ptr: ?[*]u8) usize {
+    return __libc_malloc_usable_size(ptr);
 }
 
-fn claimBlock(addr: usize, need: usize) [*]u8 {
-    const block: *Block = @ptrFromInt(addr);
-    const original_size = block.size;
-    if (original_size >= need + MIN_SPLIT) {
-        const next_addr = addr + need;
-        const next_block: *Block = @ptrFromInt(next_addr);
-        next_block.* = .{
-            .size = original_size - @as(u32, @intCast(need)),
-            .magic = BLOCK_MAGIC_FREE,
-            .prev_size = @intCast(need),
-        };
-        block.size = @intCast(need);
-        linkPrevSize(next_addr, next_block.size);
-        heap_blocks += 1;
-    }
-    block.magic = BLOCK_MAGIC_ALLOC;
-    heap_used += block.size;
-    heap_free -= block.size;
-    heap_hint = addr + block.size;
-    if (heap_hint >= heap_end) heap_hint = heap_start;
-    return @ptrFromInt(addr + HEADER_SIZE);
+pub inline fn malloc_stats() HeapStats {
+    var s: HeapStats = undefined;
+    __libc_malloc_stats(&s);
+    return s;
 }
 
-fn freeLocked(ptr: ?[*]u8) void {
-    const p = ptr orelse return;
-    const user_addr = @intFromPtr(p);
-    var block = blockFromUser(user_addr) orelse return; // bad ptr, double-free, or corruption
-    var block_addr = user_addr - HEADER_SIZE;
-
-    block.magic = BLOCK_MAGIC_FREE;
-    heap_used -= block.size;
-    heap_free += block.size;
-
-    if (HEAP_DEBUG_FILL) {
-        const payload: [*]u8 = @ptrFromInt(user_addr);
-        @memset(payload[0 .. block.size - HEADER_SIZE], FREE_FILL);
-    }
-
-    // Forward coalesce (this block + immediately-following block, if free).
-    const next_addr = block_addr + block.size;
-    if (next_addr < heap_end) {
-        const next_block: *Block = @ptrFromInt(next_addr);
-        if (next_block.magic == BLOCK_MAGIC_FREE) {
-            block.size += next_block.size;
-            next_block.magic = 0; // defensive: kill the absorbed header
-            heap_blocks -= 1;
-            if (heap_hint == next_addr) heap_hint = block_addr;
-        }
-    }
-
-    // Backward coalesce — O(1) via boundary tag.
-    if (block.prev_size != 0) {
-        const prev_addr = block_addr - block.prev_size;
-        const prev_block: *Block = @ptrFromInt(prev_addr);
-        if (prev_block.magic == BLOCK_MAGIC_FREE) {
-            prev_block.size += block.size;
-            block.magic = 0; // defensive
-            heap_blocks -= 1;
-            if (heap_hint == block_addr) heap_hint = prev_addr;
-            block_addr = prev_addr;
-            block = prev_block;
-        }
-    }
-
-    linkPrevSize(block_addr, block.size);
-}
-
-pub fn free(ptr: ?[*]u8) void {
-    heap_lock.lock();
-    defer heap_lock.unlock();
-    freeLocked(ptr);
-}
-
-/// Return trailing free heap pages to the kernel (sbrk(-N)). If the
-/// final block is FREE and big enough, asks the kernel to unmap the
-/// trailing pages and shortens our heap_end to match. `keep_bytes`
-/// leaves that much slack at the end to avoid thrashing on small
-/// re-grows; pass 0 to give back as much as possible. Returns the
-/// number of bytes returned to the kernel.
-pub fn malloc_trim(keep_bytes: usize) usize {
-    heap_lock.lock();
-    defer heap_lock.unlock();
-    if (heap_start == 0 or heap_end <= heap_start) return 0;
-    // Boundary-tag layout is contiguous — a single forward walk finds
-    // the last block.
-    var addr: usize = heap_start;
-    var last_addr: usize = 0;
-    while (addr < heap_end) {
-        const blk: *Block = @ptrFromInt(addr);
-        if (blk.size == 0) return 0; // corruption guard — bail out
-        last_addr = addr;
-        addr += blk.size;
-    }
-    if (last_addr == 0) return 0;
-    const last: *Block = @ptrFromInt(last_addr);
-    if (last.magic != BLOCK_MAGIC_FREE) return 0;
-    // Snapshot the header NOW: in consume_whole the header itself sits in
-    // the about-to-be-unmapped range, so any read after sbrkShrink would
-    // page-fault. Bug surfaced 2026-05-25 — pid=4 settings crashed on
-    // `heap_free -= last.size` immediately after a shrink fully consumed
-    // the tail block.
-    const last_size: usize = last.size;
-    if (last_size <= keep_bytes + 4096) return 0;
-
-    // Pick the largest page-aligned amount we can release while leaving
-    // either zero residual (consume the whole block) or a residual that
-    // is still a valid block (>= HEADER_SIZE).
-    var trim_bytes: usize = (last_size - keep_bytes) & ~@as(usize, 4095);
-    if (trim_bytes < 4096) return 0;
-    var consume_whole = false;
-    var residual = last_size - trim_bytes;
-    if (residual == 0) {
-        consume_whole = true;
-    } else if (residual < HEADER_SIZE) {
-        // Back off one page so the residual is a sane size, or consume
-        // the whole block if that's not possible.
-        if (trim_bytes >= 4096) {
-            trim_bytes -= 4096;
-            residual = last_size - trim_bytes;
-            if (trim_bytes == 0) return 0;
-        } else {
-            return 0;
-        }
-    }
-
-    const new_end = heap_end - trim_bytes;
-    // Update bookkeeping BEFORE the shrink so we never need to re-read
-    // the block header (which may be in the released range).
-    if (consume_whole) {
-        heap_free -= last_size;
-        heap_blocks -= 1;
-        if (heap_hint >= new_end) heap_hint = heap_start;
-    } else {
-        // Partial trim: residual > 0 means last_addr < new_end, so the
-        // header stays mapped. Write the new size now anyway — keeps
-        // the "no post-shrink reads" invariant tidy.
-        last.size = @intCast(residual);
-        heap_free -= trim_bytes;
-    }
-    heap_end = new_end;
-    if (heap_hint >= heap_end) heap_hint = heap_start;
-
-    if (!sbrkShrink(@intCast(trim_bytes))) {
-        // Rollback — kernel refused (shouldn't happen given we validated)
-        // but stay correct if it does.
-        if (consume_whole) {
-            heap_free += last_size;
-            heap_blocks += 1;
-        } else {
-            last.size = @intCast(last_size);
-            heap_free += trim_bytes;
-        }
-        heap_end += trim_bytes;
-        return 0;
-    }
-    return trim_bytes;
-}
-
-/// Return the usable payload size for `ptr` (i.e. block.size - header).
-/// Returns 0 for null or invalid pointers (silent — caller's responsibility
-/// to know what they passed).
-pub fn malloc_usable_size(ptr: ?[*]u8) usize {
-    const p = ptr orelse return 0;
-    const user_addr = @intFromPtr(p);
-    heap_lock.lock();
-    defer heap_lock.unlock();
-    const block = blockFromUser(user_addr) orelse return 0;
-    return block.size - HEADER_SIZE;
-}
-
-/// Snapshot of current heap state. Consistent under heap_lock.
-pub fn malloc_stats() HeapStats {
-    heap_lock.lock();
-    defer heap_lock.unlock();
-    return .{
-        .used_bytes = heap_used,
-        .free_bytes = heap_free,
-        .total_bytes = heap_end - heap_start,
-        .blocks = heap_blocks,
-    };
-}
-
-pub fn calloc(nmemb: usize, size: usize) ?[*]u8 {
-    const total = nmemb * size;
-    const ptr = malloc(total) orelse return null;
-    @memset(ptr[0..total], 0);
-    return ptr;
-}
-
-pub fn realloc(old_ptr: ?[*]u8, new_size: usize) ?[*]u8 {
-    if (new_size == 0) {
-        free(old_ptr);
-        return null;
-    }
-    const old = old_ptr orelse return malloc(new_size);
-    const old_user_addr = @intFromPtr(old);
-
-    heap_lock.lock();
-    defer heap_lock.unlock();
-
-    const block = blockFromUser(old_user_addr) orelse return null;
-    const need = alignUp(new_size, 16) + HEADER_SIZE;
-    const block_addr = old_user_addr - HEADER_SIZE;
-
-    // Strategy 1: shrink in place.
-    if (block.size >= need) {
-        if (block.size >= need + MIN_SPLIT) {
-            const remainder_addr = block_addr + need;
-            const remainder: *Block = @ptrFromInt(remainder_addr);
-            remainder.* = .{
-                .size = block.size - @as(u32, @intCast(need)),
-                .magic = BLOCK_MAGIC_FREE,
-                .prev_size = @intCast(need),
-            };
-            linkPrevSize(remainder_addr, remainder.size);
-            heap_used -= remainder.size;
-            heap_free += remainder.size;
-            heap_blocks += 1;
-            block.size = @intCast(need);
-        }
-        return @ptrFromInt(old_user_addr);
-    }
-
-    // Strategy 2: merge with next free block if combined fits.
-    const next_addr = block_addr + block.size;
-    if (next_addr < heap_end) {
-        const next_block: *Block = @ptrFromInt(next_addr);
-        if (next_block.magic == BLOCK_MAGIC_FREE and block.size + next_block.size >= need) {
-            const absorbed_size = next_block.size;
-            const merged_size = block.size + absorbed_size;
-            heap_used += absorbed_size;
-            heap_free -= absorbed_size;
-            heap_blocks -= 1;
-            next_block.magic = 0; // defensive
-            block.size = merged_size;
-            if (block.size >= need + MIN_SPLIT) {
-                const remainder_addr = block_addr + need;
-                const remainder: *Block = @ptrFromInt(remainder_addr);
-                remainder.* = .{
-                    .size = block.size - @as(u32, @intCast(need)),
-                    .magic = BLOCK_MAGIC_FREE,
-                    .prev_size = @intCast(need),
-                };
-                linkPrevSize(remainder_addr, remainder.size);
-                heap_used -= remainder.size;
-                heap_free += remainder.size;
-                heap_blocks += 1;
-                block.size = @intCast(need);
-            } else {
-                linkPrevSize(block_addr, block.size);
-            }
-            return @ptrFromInt(old_user_addr);
-        }
-    }
-
-    // Strategy 3: malloc + memcpy + freeLocked. We hold heap_lock across the
-    // entire op so the source bytes can't be racily reused between the
-    // mallocLocked and freeLocked calls — `old` stays valid until we say so.
-    const old_payload = block.size - HEADER_SIZE;
-    const new_ptr = mallocLocked(new_size) orelse return null;
-    const copy_len = if (old_payload < new_size) old_payload else new_size;
-    @memcpy(new_ptr[0..copy_len], old[0..copy_len]);
-    freeLocked(old);
-    return new_ptr;
-}
 
 // --- New filesystem syscalls ---
 

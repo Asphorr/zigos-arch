@@ -100,20 +100,25 @@ fn handleCowFault(pml4: [*]align(4096) u64, cr2: usize) bool {
     const pte = pte_p.*;
     if (pte & paging.COW == 0) return false;
 
-    // Shared-anon escape hatch: cloneAddressSpace marks every writable PTE COW
-    // without knowing about lazy regions, so a fork'd shared-anon page lands
-    // here on first write. We must NOT copy — that would break sharing. Clear
-    // COW + restore W and bail; the frame stays mapped at the same phys in
-    // both ASs, preserving POSIX MAP_SHARED semantics.
+    // Shared escape hatch: cloneAddressSpace marks every writable PTE COW without
+    // knowing about lazy regions, so a fork'd page of a SHARED mapping — anon
+    // (shm) OR file (cache_shared, Slice 3c) — lands here on first write. We must
+    // NOT copy: that would break sharing. Clear COW + restore W and bail; the
+    // frame stays mapped at the same phys in every AS, preserving MAP_SHARED
+    // semantics. (cloneAddressSpace's acquireFrame already balanced the child's
+    // inherited reference, so teardown stays leak-free.)
     {
         const cur = smp.myCpu().current_pid orelse return false;
         const pcb = &process.procs[cur];
         const lead = leader(pcb);
         const shm = @import("../mm/shm.zig");
+        const page_cache = @import("../mm/page_cache.zig");
         var i: u8 = 0;
         while (i < lead.lazy_count) : (i += 1) {
             const r = lead.lazy_regions[i];
-            if (r.shm_id == shm.SHM_INVALID) continue;
+            const is_shared_anon = r.shm_id != shm.SHM_INVALID;
+            const is_shared_file = r.cache_inode != 0 and r.cache_shared;
+            if (!is_shared_anon and !is_shared_file) continue;
             if (va_aligned < r.start or va_aligned >= r.end) continue;
             pte_p.* = (pte & ~paging.COW) | paging.READ_WRITE;
             asm volatile ("invlpg (%[addr])"
@@ -121,6 +126,11 @@ fn handleCowFault(pml4: [*]align(4096) u64, cr2: usize) bool {
                 : [addr] "r" (va_aligned),
                 : .{ .memory = true }
             );
+            // A shared FILE page just made writable is now (potentially) modified —
+            // flag it dirty so the next msync/munmap writes it back to disk.
+            if (is_shared_file) {
+                page_cache.markDirty(page_cache.ext2FileId(r.cache_inode), r.cache_off + (va_aligned - r.start));
+            }
             return true;
         }
     }
@@ -154,6 +164,93 @@ fn handleCowFault(pml4: [*]align(4096) u64, cr2: usize) bool {
 
     pmm.releaseFrame(old_phys);
 
+    asm volatile ("invlpg (%[addr])"
+        :
+        : [addr] "r" (va_aligned),
+        : .{ .memory = true }
+    );
+    return true;
+}
+
+/// Fault-in one page of a cache-backed (ext2 file mmap) region `r` at
+/// `va_aligned`. Pins the shared cache frame for this file page — or
+/// demand-reads it into a fresh frame and publishes it on a miss — then maps it
+/// read-only + COW (vmm.cacheMapFlags). Reads SHARE one physical frame across
+/// every mapper of the file page; a write COW-diverges into a private copy via
+/// handleCowFault (the cache's own reference keeps refcount >= 2, so that path
+/// always copies and never steals the cache page). The mapper ref taken here is
+/// balanced by the ordinary per-PTE freeFrame at unmap/teardown — the cache's
+/// own +1 keeps the page warm until eviction. Returns false on OOM or I/O
+/// failure (caller OOM-kills); true on success OR a benign same-page race.
+fn faultInCachePage(pd: [*]align(4096) u64, r: process.LazyRegion, va_aligned: usize) bool {
+    const page_cache = @import("../mm/page_cache.zig");
+    const vfs = @import("../fs/vfs.zig");
+    const paging = @import("../mm/paging.zig");
+
+    const file_id = page_cache.ext2FileId(r.cache_inode);
+    const page_off = r.cache_off + (va_aligned - r.start);
+
+    var phys: usize = undefined;
+    if (page_cache.pin(file_id, page_off)) |p| {
+        phys = p; // cache hit: a mapper ref was taken atomically under the cache lock
+    } else {
+        // Miss (or refcount-saturated): read the page into a PRIVATE frame with
+        // NO cache lock held, THEN publish it. Filling before publishing means
+        // no other CPU can ever observe a half-filled cache page.
+        const pf = pmm.allocFrameUser() orelse return false;
+        const dst: [*]u8 = @ptrFromInt(paging.physToVirt(pf));
+        const n = @min(vfs.fillCachePage(r.cache_inode, page_off, dst), 0x1000);
+        if (n < 0x1000) @memset(dst[n..0x1000], 0); // zero the tail past EOF
+        phys = page_cache.insertFilled(file_id, page_off, pf);
+    }
+
+    // MAP_SHARED (cache_shared): map the shared cache frame WRITABLE so writes
+    // land in it — visible to every other mapper and to read() — and get written
+    // back to disk on msync/munmap. MAP_PRIVATE (default): RO + COW, so a write
+    // diverges into a private copy (the cache's own ref keeps refcount >= 2, so
+    // handleCowFault always copies and never steals the shared page).
+    const map_flags = if (r.cache_shared) vmm.protToMapFlags(r.prot) else vmm.cacheMapFlags(r.prot);
+    vmm.mapUserPage(pd, va_aligned, phys, map_flags) catch |e| {
+        pmm.freeFrame(phys); // release the mapper ref we took above
+        // AlreadyMapped: another CPU faulted this exact page first — it's mapped
+        // now, so the fault is resolved (that CPU's fault flagged it dirty if
+        // shared). Any other error is a real failure.
+        return e == error.AlreadyMapped;
+    };
+    // Shared writable page: flag it dirty for writeback. Coarse by design — even a
+    // read-faulted page is marked, because with a direct RW mapping a later write
+    // won't re-fault to mark it. Cost is re-persisting unchanged pages, never loss.
+    if (r.cache_shared) page_cache.markDirty(file_id, page_off);
+    asm volatile ("invlpg (%[addr])"
+        :
+        : [addr] "r" (va_aligned),
+        : .{ .memory = true }
+    );
+    return true;
+}
+
+/// NON-BLOCKING variant of faultInCachePage for the proactive prefault helpers
+/// that must not do disk I/O — specifically ensureUserRangeWritableFor, which
+/// runs with the owner's `as_lock` (a spinlock) held: maps the page ONLY if it's
+/// already resident in the cache (pin HIT, no ext2 read). Returns false on a
+/// miss, so the caller fails the operation cleanly instead of blocking under a
+/// spinlock. Maps read-only + COW; the caller breaks COW if it needs the page
+/// writable. (A miss here just means the app must touch the page itself — the
+/// real #PF path then fills it.)
+fn tryMapCachedPage(pd: [*]align(4096) u64, r: process.LazyRegion, va_aligned: usize) bool {
+    const page_cache = @import("../mm/page_cache.zig");
+    const file_id = page_cache.ext2FileId(r.cache_inode);
+    const page_off = r.cache_off + (va_aligned - r.start);
+    const phys = page_cache.pin(file_id, page_off) orelse return false;
+    // Shared: map writable directly (the caller's kernel write must hit the shared
+    // frame, NOT a COW copy) and flag dirty. Private: RO + COW (caller breaks COW
+    // for its write into a private page). See faultInCachePage for the rationale.
+    const map_flags = if (r.cache_shared) vmm.protToMapFlags(r.prot) else vmm.cacheMapFlags(r.prot);
+    vmm.mapUserPage(pd, va_aligned, phys, map_flags) catch |e| {
+        pmm.freeFrame(phys);
+        return e == error.AlreadyMapped;
+    };
+    if (r.cache_shared) page_cache.markDirty(file_id, page_off);
     asm volatile ("invlpg (%[addr])"
         :
         : [addr] "r" (va_aligned),
@@ -211,11 +308,21 @@ pub fn ensureUserRangeWritable(va: usize, len: usize) bool {
             while (i < lead.lazy_count) : (i += 1) {
                 const r = lead.lazy_regions[i];
                 if (p < r.start or p >= r.end) continue;
-                _ = vmm.allocAndMapUserPage(pd, p, vmm.protToMapFlags(r.prot)) catch return false;
-                asm volatile ("invlpg (%[addr])"
-                    :
-                    : [addr] "r" (p),
-                    : .{ .memory = true });
+                if (r.cache_inode != 0) {
+                    // Cache-backed page: map it shared RO+COW if resident, then
+                    // break COW so this proactive (SMAP/signal-frame or io_uring)
+                    // write lands on a private WRITABLE page. Non-blocking — a
+                    // miss returns false (the caller may hold a spinlock; the app
+                    // must touch the page itself so the #PF path can fill it).
+                    if (!tryMapCachedPage(pd, r, p)) return false;
+                    _ = handleCowFault(pd, p);
+                } else {
+                    _ = vmm.allocAndMapUserPage(pd, p, vmm.protToMapFlags(r.prot)) catch return false;
+                    asm volatile ("invlpg (%[addr])"
+                        :
+                        : [addr] "r" (p),
+                        : .{ .memory = true });
+                }
                 mapped = true;
                 break;
             }
@@ -266,12 +373,14 @@ fn reclaimViaSwap(pml4: [*]align(4096) u64, lead: *PCB, skip_va: usize, pcid: u1
         // writing them to swap; they re-read from `source` for free.)
         var in_region = false;
         var region_has_source = false;
+        var region_is_cache = false;
         var k: u8 = 0;
         while (k < lead.lazy_count) : (k += 1) {
             const r = lead.lazy_regions[k];
             if (r.end > r.start and va >= r.start and va < r.end) {
                 in_region = true;
                 region_has_source = r.source != null;
+                region_is_cache = r.cache_inode != 0;
                 break;
             }
         }
@@ -296,6 +405,17 @@ fn reclaimViaSwap(pml4: [*]align(4096) u64, lead: *PCB, skip_va: usize, pcid: u1
             }
             if (!any) break; // no non-empty regions
             va = if (found) next_start else lo;
+            continue;
+        }
+        // Cache-backed pages (ext2 file mmap, Slice 2/3) are NEVER swapped. A
+        // private (RO+COW) page is clean + re-faultable from the page cache; a
+        // SHARED (RW, Slice 3c) page MUST keep pointing at the shared cache frame
+        // — swapping it would fork a private copy disconnected from the cache and
+        // silently lose writeback tracking. (Private pages were already skipped
+        // below via the COW-bit gate; shared pages are RW with no COW bit, so they
+        // need this explicit skip.) Page-cache reclaim — not swap — handles these.
+        if (region_is_cache) {
+            va += 0x1000;
             continue;
         }
         if (va != skip_va) {
@@ -485,6 +605,21 @@ pub fn handleUserPageFault(cr2: usize, error_code: u64) bool {
             @import("../debug/kdbg.zig").pfEvent(@intCast(cur), cr2, @truncate(error_code), 0, true);
             return true;
         }
+        // handleCowFault declined (no COW bit; the shm hatch didn't apply). If
+        // the page is PRESENT and read-only, this is a genuine write-to-RO
+        // protection violation — e.g. a write after mprotect(PROT_READ), or to
+        // ELF text/rodata. Do NOT fall through to lazy resolution: a present
+        // page makes trySwapInPage report .paged_in → retry → re-fault forever
+        // (anon/ELF livelock), and a cache page would re-pin its shared frame
+        // every iteration, inflating the refcount until pmm.acquireFrame panics
+        // at 255. Returning false routes to the #PF→SIGSEGV path (idt/
+        // exception.zig, si_code SEGV_ACCERR) — the correct answer for writing
+        // read-only memory.
+        const paging = @import("../mm/paging.zig");
+        if (findUserPte(pd, cr2 & ~@as(usize, 0xFFF))) |pte_ptr| {
+            const pte = pte_ptr.*;
+            if ((pte & paging.PRESENT) != 0 and (pte & paging.READ_WRITE) == 0) return false;
+        }
     }
     // Lazy regions live on the lead thread (per-process resource). For
     // single-threaded processes this aliases pcb itself; for cloned
@@ -522,6 +657,36 @@ pub fn handleUserPageFault(cr2: usize, error_code: u64) bool {
             pmm.acquireFrame(phys);
             @import("../debug/kdbg.zig").pfEvent(@intCast(cur), cr2, @truncate(error_code), 0, true);
             return true;
+        }
+
+        // File-backed-via-cache shortcut (ext2 mmap): serve this page from the
+        // unified page cache — shared across mappers, demand-filled; private
+        // mappings are COW-on-write, shared (Slice 3c) are writable. Placed BEFORE
+        // swap-in because reclaimViaSwap explicitly skips cache-backed regions
+        // (region_is_cache) — private RO+COW pages would also be filtered by its
+        // COW gate, but shared pages are RW with no COW bit, so the region skip is
+        // what guarantees a cache page is never a swap entry.
+        if (r.cache_inode != 0) {
+            if (faultInCachePage(pd, r, va_aligned)) {
+                @import("../debug/kdbg.zig").pfEvent(@intCast(cur), cr2, @truncate(error_code), 0, true);
+                lead.acct_current_rss +%= 1;
+                if (lead.acct_current_rss > lead.acct_peak_rss) lead.acct_peak_rss = lead.acct_current_rss;
+                return true;
+            }
+            // Fill/map failed (OOM or ext2 I/O). Neither swap-in nor zero-alloc
+            // applies to a file page, so go straight to the lightweight OOM-kill
+            // (mirrors the frame_opt==null path below — no heavy autopsy under
+            // memory pressure: a fat32 crash-log write would re-enter the
+            // allocator and the long dump would stall the compositor).
+            @import("../debug/kdbg.zig").pfEvent(@intCast(cur), cr2, @truncate(error_code), 0, false);
+            debug.klog("[oom] cache-mmap fill failed pid={d} '{s}' va=0x{X} inode={d} — killing\n", .{
+                cur, pcb.name[0..@min(pcb.name_len, pcb.name.len)], va_aligned, r.cache_inode,
+            });
+            const desktop = @import("../ui/desktop.zig");
+            if (desktop.active) desktop.showNotification("App killed: out of memory");
+            process.destroyCurrent();
+            process.schedule();
+            unreachable;
         }
 
         // Swap-in: if this VA was evicted to swap, page it back in instead of
@@ -773,6 +938,17 @@ pub fn prefaultUserRange(addr: usize, len: usize) void {
             // to do. Otherwise allocate + map + (optionally) copy from src.
             if (pageHasRealMapping(pd, page)) break;
 
+            // Cache-backed (ext2 mmap): fault the shared page in through the page
+            // cache so a kernel READ of an mmap'd buffer sees real file data, not
+            // a zero page (that would be silent corruption). faultInCachePage may
+            // block on ext2 I/O, which is fine here — prefault already blocks via
+            // trySwapInPage below, so callers hold no spinlock. On failure the
+            // page stays unmapped and allCurrentUserPagesMapped → clean E_FAULT.
+            if (r.cache_inode != 0) {
+                _ = faultInCachePage(pd, r, page);
+                break;
+            }
+
             // If the page was evicted to swap, page it back in rather than
             // mapping a fresh zero page over the swapped PTE (which would lose
             // its contents AND leak the slot). This is the kernel-side swap-in
@@ -885,11 +1061,21 @@ pub fn ensureUserRangeWritableFor(owner_pcb: *process.PCB, va: usize, len: usize
             while (i < lead.lazy_count) : (i += 1) {
                 const r = lead.lazy_regions[i];
                 if (p < r.start or p >= r.end) continue;
-                _ = vmm.allocAndMapUserPage(pd, p, vmm.protToMapFlags(r.prot)) catch return false;
-                asm volatile ("invlpg (%[addr])"
-                    :
-                    : [addr] "r" (p),
-                    : .{ .memory = true });
+                if (r.cache_inode != 0) {
+                    // Cache-backed page: map it shared RO+COW if resident, then
+                    // break COW so this proactive (SMAP/signal-frame or io_uring)
+                    // write lands on a private WRITABLE page. Non-blocking — a
+                    // miss returns false (the caller may hold a spinlock; the app
+                    // must touch the page itself so the #PF path can fill it).
+                    if (!tryMapCachedPage(pd, r, p)) return false;
+                    _ = handleCowFault(pd, p);
+                } else {
+                    _ = vmm.allocAndMapUserPage(pd, p, vmm.protToMapFlags(r.prot)) catch return false;
+                    asm volatile ("invlpg (%[addr])"
+                        :
+                        : [addr] "r" (p),
+                        : .{ .memory = true });
+                }
                 mapped = true;
                 break;
             }

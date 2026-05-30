@@ -1,27 +1,35 @@
-// Shared libc shims that any app linking against vendor/photo_lib.c (the
-// stb_image implementation TU) needs. Each app importing this file gets
-// the C ABI surface — the `export fn` declarations land in the app's own
-// linked ELF independently. Re-exporting libc.malloc/free/etc keeps
-// stb_image's allocations going through our own per-process heap.
+// C-ABI shims for vendor/photo_lib.c / stb_truetype's text_lib.c /
+// stb_vorbis's vorbis_lib.c — the static-library root module they all
+// share. Used to `@import("libc")` and call `libc.malloc`/`free`/
+// `realloc` directly; that produced a separate libc compilation
+// (and a separate copy of every heap-state global) inside each
+// static .a, which silently fork-ed the heap accounting from the
+// exe's own libc instance — see [[libc-static-lib-dup-globals]].
 //
-// Use:
-//   _ = @import("stb_shims");  // pulls the exports into the link unit
+// Fix: route `malloc`/`free`/`realloc` through C-ABI extern symbols
+// that resolve at exe-link time to the single libc instance the exe
+// compiles. Each static .a now has UNDEFINED references to
+// `__libc_malloc` / `__libc_free` / `__libc_realloc`; whichever exe
+// links these libs provides them from its own libc.zig (which
+// declares them as `export fn`).
 //
-// or add the module to .imports in build.zig:
-//   .{ .name = "stb_shims", .module = stb_shims_mod }
+// memset / memcpy / memmove / memcmp / abs / strlen don't touch the
+// heap, so they stay self-contained byte loops in the static .a.
 
-const libc = @import("libc");
+extern fn __libc_malloc(size: usize) ?[*]u8;
+extern fn __libc_realloc(old_ptr: ?[*]u8, new_size: usize) ?[*]u8;
+extern fn __libc_free(ptr: ?[*]u8) void;
 
 export fn malloc(size: usize) ?[*]u8 {
-    return libc.malloc(size);
+    return __libc_malloc(size);
 }
 
 export fn realloc(old_ptr: ?[*]u8, new_size: usize) ?[*]u8 {
-    return libc.realloc(old_ptr, new_size);
+    return __libc_realloc(old_ptr, new_size);
 }
 
 export fn free(ptr: ?[*]u8) void {
-    libc.free(ptr);
+    __libc_free(ptr);
 }
 
 export fn memset(dest: ?[*]u8, c_val: c_int, n: usize) ?[*]u8 {

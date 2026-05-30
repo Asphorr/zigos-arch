@@ -10,6 +10,7 @@ const vga = @import("../ui/vga.zig");
 const pipe = @import("../proc/pipe.zig");
 const paging = @import("../mm/paging.zig");
 const pmm = @import("../mm/pmm.zig");
+const page_cache = @import("../mm/page_cache.zig");
 
 pub const O_CREATE: u32 = 0x100;
 pub const O_APPEND: u32 = 0x400; // start the fd's offset at file_size so writes append
@@ -334,14 +335,12 @@ pub fn read(pcb: *process.PCB, fd: u32, buf: [*]u8, count: u32) u32 {
             return n;
         },
         .ext2 => {
-            const handle = ext2.Handle{
-                .inum = fd_entry.inode,
-                .file_size = 0, // Phase 1 readFile doesn't enforce; readInodeBytes clips at EOF
-                .current_offset = fd_entry.offset,
-            };
-            const n = ext2.readFile(handle, buf, count);
-            fd_entry.offset += @intCast(n);
-            return @intCast(n);
+            // Through the unified page cache (Slice 3b): a page read here is the
+            // SAME physical frame a later mmap of this file maps, and vice versa.
+            // Falls back to a private uncached read only under frame OOM.
+            const n = readThroughCache(fd_entry.inode, fd_entry.offset, buf, count);
+            fd_entry.offset += n;
+            return n;
         },
         .tcp_sock => {
             // Non-blocking read on the conn ring. Pollers handle blocking
@@ -353,6 +352,127 @@ pub fn read(pcb: *process.PCB, fd: u32, buf: [*]u8, count: u32) u32 {
         },
         .tcp_listener => return 0xFFFFFFFF, // listeners aren't readable; use accept()
     }
+}
+
+/// Demand-fill one page for the unified page cache: read up to one page (4 KiB)
+/// at absolute byte `offset` from ext2 inode `inode` into `buf`, WITHOUT an fd
+/// or FileDesc — a file mmap can outlive the fd that created it. Returns the
+/// number of bytes read (clipped at EOF; the caller zero-fills the tail). ext2
+/// only: sysMmap routes only ext2 fds through the cache, so this is the only
+/// backing store the page-cache fault path needs today.
+pub fn fillCachePage(inode: u32, offset: u64, buf: [*]u8) u32 {
+    const handle = ext2.Handle{ .inum = inode, .file_size = 0, .current_offset = offset };
+    return @intCast(ext2.readFile(handle, buf, 0x1000));
+}
+
+/// Read up to `count` bytes from ext2 inode `inum` at byte `offset` into user
+/// `buf`, THROUGH the unified page cache — the read() half of the cache
+/// unification (Slice 3b). Each touched page is pinned on a hit, or read into a
+/// private frame and published on a miss, so a page pulled in by read() is the
+/// same physical frame a later mmap of this file maps (and vice versa). Mirrors
+/// faultInCachePage's hit-or-fill, but copies to the user buffer instead of
+/// mapping. Returns bytes read, clipped at EOF exactly like readInodeBytes; the
+/// caller advances the fd offset by the return value.
+///
+/// The per-page copy is deliberately two-step: frame → kstack scratch while
+/// holding the cache reference (kernel-to-kernel, so eviction can't free the
+/// page and the copy can't fault-kill), then scratch → user AFTER dropping the
+/// reference (so a malformed user buffer that #PFs can't leak the frame's
+/// refcount). The 64 KB kstack swallows the 4 KB scratch with room to spare.
+pub fn readThroughCache(inum: u32, offset: u64, buf: [*]u8, count: u32) u32 {
+    if (count == 0) return 0;
+    // Only REGULAR-file data rides the page cache — it's the sole thing the
+    // write/truncate/free invalidation (Slice 3a) and the mmap path cover.
+    // Directories, symlinks, devices (and an unreadable inode) bypass the cache
+    // and read straight through, exactly as before, so e.g. a directory mutation
+    // (which doesn't touch the page cache) can never serve stale dirents.
+    const info = ext2.cacheReadInfo(inum);
+    if (!info.is_reg)
+        return @intCast(ext2.readFile(.{ .inum = inum, .file_size = 0, .current_offset = offset }, buf, count));
+    // EOF clip from the inode's current size — the same source readInodeBytes
+    // uses, so we stop where the old path did and never surface a cached page's
+    // zero-filled past-EOF tail as data. info.size is NOT u32-bounded (ext2
+    // LARGE_FILE reaches 2^48), so the `@as(u64, count)` is load-bearing — it
+    // clamps want to count (<= u32max). Don't "simplify" it to a bare `count`.
+    if (offset >= info.size) return 0;
+    const want: u64 = @min(@as(u64, count), info.size - offset);
+
+    const file_id = page_cache.ext2FileId(inum);
+    var scratch: [0x1000]u8 align(8) = undefined;
+    var done: u64 = 0;
+    while (done < want) {
+        const cur = offset + done;
+        const page_off = cur & ~@as(u64, 0xFFF);
+        const in_page: u64 = cur & 0xFFF;
+        const chunk: u64 = @min(@as(u64, 0x1000) - in_page, want - done);
+        const ip: usize = @intCast(in_page);
+        const ck: usize = @intCast(chunk);
+        const dst_off: usize = @intCast(done);
+
+        const frame = page_cache.pin(file_id, page_off) orelse blk: {
+            // Miss (or the resident page is at PIN_SATURATION): fill a PRIVATE
+            // frame with NO cache lock held, then publish it atomically.
+            const pf = pmm.allocFrameUser() orelse {
+                // Out of frames: finish the remainder with a direct uncached
+                // read so the call still makes forward progress, then stop.
+                const nread: u64 = @intCast(ext2.readFile(.{ .inum = inum, .file_size = 0, .current_offset = cur }, buf + dst_off, @intCast(want - done)));
+                return @intCast(done + nread);
+            };
+            const fdst: [*]u8 = @ptrFromInt(paging.physToVirt(pf));
+            const got: u64 = @min(@as(u64, fillCachePage(inum, page_off, fdst)), 0x1000);
+            if (got < 0x1000) @memset(fdst[@as(usize, @intCast(got))..0x1000], 0); // zero tail past EOF
+            break :blk page_cache.insertFilled(file_id, page_off, pf);
+        };
+
+        // frame -> kstack scratch, under the reference (cannot fault-kill).
+        const src: [*]const u8 = @ptrFromInt(paging.physToVirt(frame));
+        @memcpy(scratch[0..ck], src[ip .. ip + ck]);
+        pmm.releaseFrame(frame); // drop the pin / insertFilled ref BEFORE the user copy
+
+        // scratch -> user (no cache ref held; a faulting user page is safe now).
+        // Like the existing readInodeBytes path this user write isn't SMAP-
+        // bracketed — it rides the syscall-context AC discipline, same as before.
+        @memcpy((buf + dst_off)[0..ck], scratch[0..ck]);
+        done += chunk;
+    }
+    return @intCast(done);
+}
+
+/// Write every dirty page of ext2 inode `inum` back to disk — the orchestration
+/// half of MAP_SHARED writeback (Slice 3c). Drives page_cache.takeNextDirty
+/// (which PINS each dirty page so the lockless writeback I/O can't race eviction
+/// or a concurrent unmap freeing the frame) → ext2.writebackPage → releaseFrame,
+/// looping on a strictly-increasing offset cursor so it always terminates.
+///
+/// `clear` clears the dirty flag on pages that are now cache-only (no remaining
+/// writable mapper): munmap/teardown pass true (the mapping is gone, so the page
+/// returns to the evictable pool); msync passes false (the mapping stays live —
+/// its still-writable PTE means future writes won't re-fault to re-mark the page,
+/// so the bit must stay set or those writes would never be flushed by a later
+/// msync). The clear runs AFTER releaseFrame so clearDirtyIfCacheOnly's
+/// refcount==1 test sees the true mapper count, not our transient writeback pin.
+///
+/// MUST be called with NO page_cache/as_lock spinlock held: writebackPage blocks
+/// on NVMe I/O. Returns the number of pages written back.
+pub fn syncCacheFile(inum: u32, clear: bool) u32 {
+    const file_id = page_cache.ext2FileId(inum);
+    var off: u64 = 0;
+    var written: u32 = 0;
+    while (page_cache.takeNextDirty(file_id, off)) |dp| {
+        off = dp.page_off + page_cache.PAGE_SIZE; // advance cursor → guarantees termination
+        const src: [*]const u8 = @ptrFromInt(paging.physToVirt(dp.frame));
+        _ = ext2.writebackPage(inum, dp.page_off, src);
+        pmm.releaseFrame(dp.frame); // drop the writeback pin BEFORE the refcount-gated clear
+        if (clear) _ = page_cache.clearDirtyIfCacheOnly(file_id, dp.page_off);
+        written += 1;
+    }
+    // Disk-truth trace for MAP_SHARED writeback (Slice 3c). Silent on the common
+    // case (no dirty shared pages → written==0): only msync()/munmap() of a
+    // writable file mapping reaches here with work to do, so this never fires on
+    // ordinary read/write/exec workloads.
+    if (written > 0)
+        @import("../debug/serial.zig").print("[3c] writeback inum={d} pages={d} clear={}\n", .{ inum, written, clear });
+    return written;
 }
 
 pub fn write(pcb: *process.PCB, fd: u32, buf: [*]const u8, count: u32) u32 {
