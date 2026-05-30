@@ -79,6 +79,26 @@ pub fn takePowerOffRequest() bool {
     return @atomicRmw(u8, &power_off_requested, .Xchg, 0, .acq_rel) != 0;
 }
 
+// --- GPE0 dispatch state (Slice C) ------------------------------------------
+//
+// Slice A masked every GPE for storm safety. Slice C selectively re-enables the
+// GPE0 bits that have an AML handler (\_GPE._Exx/_Lxx) and dispatches them: the
+// SCI handler records fired bits into `gpe_pending` (and W1C-acks them), and the
+// acpid thread runs each bit's handler method in thread context (AML field I/O /
+// Notify must not run in the IRQ). GPE0 only for now (QEMU has no GPE1); bits
+// are capped at 64 to fit the pending bitmask.
+
+var gpe0_sts_port: u16 = 0;
+var gpe0_en_port: u16 = 0;
+var gpe0_bits: u16 = 0; // number of GPE0 event bits (≤ 64), 0 = GPE dispatch off
+var gpe_pending: u64 = 0; // atomic bitmask of fired GPE0 bits awaiting acpid
+
+/// Thread-side: atomically take + clear the set of GPE0 bits the SCI handler has
+/// flagged since the last call. acpid runs each one's AML handler.
+pub fn takePendingGpes() u64 {
+    return @atomicRmw(u64, &gpe_pending, .Xchg, 0, .acq_rel);
+}
+
 // --- PM1 register addressing ------------------------------------------------
 //
 // The PM1 EVENT block splits in half: the lower `pm1_evt_len/2` bytes are the
@@ -142,6 +162,53 @@ fn maskGpeBlock(blk: u32, len: u8) void {
     while (i < half) : (i += 1) {
         io.outb(@truncate(en_base +% i), 0x00); // disable every GPE
         io.outb(@truncate(blk +% i), 0xFF); // clear any latched status (W1C)
+    }
+}
+
+// --- GPE handler enable + dispatch (Slice C) --------------------------------
+
+/// Relax Slice A's mask-all: for each GPE0 bit that has an AML handler
+/// (\_GPE._Exx/_Lxx), set its GPE0_EN bit so the event can raise the SCI;
+/// unhandled bits stay masked (storm safety). Caches the block geometry for
+/// sciHandler. Returns the count armed. Called after the SCI is routed.
+fn enableHandledGpes(f: *align(1) const acpi.Fadt) u32 {
+    if (f.gpe0_blk == 0 or f.gpe0_blk_len < 2) return 0;
+    const half: u32 = f.gpe0_blk_len / 2; // status bytes == enable bytes
+    gpe0_sts_port = @truncate(f.gpe0_blk);
+    gpe0_en_port = @truncate(f.gpe0_blk +% half);
+    gpe0_bits = @intCast(@min(half * 8, 64)); // pending bitmask is 64-bit wide
+
+    const aml = @import("aml.zig");
+    var armed: u32 = 0;
+    var n: u16 = 0;
+    while (n < gpe0_bits) : (n += 1) {
+        var lvl: bool = false;
+        const path = aml.gpeHandler(@truncate(n), &lvl) orelse continue;
+        const port = gpe0_en_port +% (n / 8);
+        const bit: u3 = @intCast(n % 8);
+        io.outb(port, io.inb(port) | (@as(u8, 1) << bit)); // set GPE0_EN bit n
+        debug.klog("[sci] GPE 0x{X:0>2} -> {s} ({s}) armed\n", .{ n, path, if (lvl) "level" else "edge" });
+        armed += 1;
+    }
+    return armed;
+}
+
+/// One-time software dispatch self-test (Slice C): run the lowest armed GPE
+/// handler once to prove lookup -> evalMethod -> handler end to end, with no real
+/// hardware event. Called from acpid (thread context). Benign at boot — a
+/// hotplug-scan handler finds zero changed slots and does nothing. Real events
+/// arrive via the SCI -> gpe_pending -> acpid path.
+pub fn gpeDispatchSelfTest() void {
+    if (gpe0_bits == 0) return;
+    const aml = @import("aml.zig");
+    var n: u16 = 0;
+    while (n < gpe0_bits) : (n += 1) {
+        var lvl: bool = false;
+        if (aml.gpeHandler(@truncate(n), &lvl) == null) continue;
+        debug.klog("[sci] GPE self-test: simulating bit 0x{X:0>2}\n", .{n});
+        const ran = aml.runGpeHandler(@truncate(n));
+        debug.klog("[sci] GPE self-test: bit 0x{X:0>2} handler {s}\n", .{ n, if (ran) "ran" else "MISSING" });
+        return;
     }
 }
 
@@ -221,6 +288,30 @@ fn sciHandler() callconv(.c) void {
         @atomicStore(u8, &power_off_requested, 1, .release);
         serial.print("[sci] power button -> graceful power-off requested\n", .{});
     }
+
+    // GPE0 events (Slice C). For each enabled+set bit: record it for acpid and
+    // write-1-to-clear the latch (edge GPEs de-assert here, so the shared SCI
+    // line drops and we don't storm). The handler method runs later in acpid —
+    // never AML in the IRQ. Unhandled GPEs are masked at init, so a set+enabled
+    // bit always has a handler.
+    if (gpe0_sts_port != 0 and gpe0_bits != 0) {
+        const nbytes: u16 = (gpe0_bits + 7) / 8;
+        var fired: u64 = 0;
+        var bi: u16 = 0;
+        while (bi < nbytes) : (bi += 1) {
+            const sts = io.inb(gpe0_sts_port +% bi);
+            const en = io.inb(gpe0_en_port +% bi);
+            const active = sts & en;
+            if (active != 0) {
+                io.outb(gpe0_sts_port +% bi, active); // W1C the active bits
+                fired |= @as(u64, active) << @as(u6, @intCast(bi * 8));
+            }
+        }
+        if (fired != 0) {
+            _ = @atomicRmw(u64, &gpe_pending, .Or, fired, .acq_rel);
+            serial.print("[sci] GPE event(s) -> acpid (bits=0x{X})\n", .{fired});
+        }
+    }
 }
 
 // --- init -------------------------------------------------------------------
@@ -274,5 +365,10 @@ pub fn init() void {
     apic.routeSci(@truncate(f.sci_int), vec);
     sci_vector = vec;
 
-    debug.klog("[sci] ready: ACPI mode on, power button armed, SCI GSI{d} -> vec 0x{X}\n", .{ f.sci_int, vec });
+    // 5. Now that the SCI is routed, selectively enable the GPE0 bits that have
+    //    AML handlers (Slice C): they fire -> sciHandler records -> acpid runs
+    //    the method. Unhandled GPEs stay masked from step 2 (storm safety).
+    const gpes_armed = enableHandledGpes(f);
+
+    debug.klog("[sci] ready: ACPI mode on, power button + {d} GPE handler(s) armed, SCI GSI{d} -> vec 0x{X}\n", .{ gpes_armed, f.sci_int, vec });
 }

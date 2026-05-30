@@ -827,11 +827,31 @@ const ACPID_POLL_MS: u32 = 250;
 fn acpidEntry() callconv(.c) noreturn {
     const sched = @import("proc/sched.zig");
     const sci = @import("acpi/sci.zig");
+    const aml = @import("acpi/aml.zig");
+    var did_selftest = false;
     while (true) {
         sched.kernelSleepMs(ACPID_POLL_MS);
         if (sci.takePowerOffRequest()) {
             debug.klog("[acpid] power-off requested — flushing caches + entering S5\n", .{});
             _ = @import("cpu/syscall/sys.zig").sysShutdown(0); // never returns
+        }
+        // GPE events recorded by the SCI handler (Slice C): run each fired bit's
+        // AML handler here in thread context — the method does field I/O / Notify,
+        // which is unsafe in the IRQ. The SCI already W1C-acked the status.
+        const pend = sci.takePendingGpes();
+        if (pend != 0) {
+            var n: u32 = 0;
+            while (n < 64) : (n += 1) {
+                if (pend & (@as(u64, 1) << @as(u6, @intCast(n))) != 0) {
+                    debug.klog("[acpid] GPE 0x{X:0>2} fired -> running handler\n", .{n});
+                    _ = aml.runGpeHandler(@intCast(n));
+                }
+            }
+        }
+        // One-time GPE dispatch self-test, once boot has settled (Slice C).
+        if (!did_selftest) {
+            did_selftest = true;
+            sci.gpeDispatchSelfTest();
         }
     }
 }

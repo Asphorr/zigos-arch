@@ -1250,6 +1250,42 @@ pub fn evalMethod(abs: []const u8) ?Value {
     return callMethod(n, &.{}, 0);
 }
 
+/// Find the AML handler method for GPE bit `n` of block 0: `\_GPE._E<nn>` (edge)
+/// or `\_GPE._L<nn>` (level), where nn is the two uppercase hex digits of n.
+/// Returns the method's absolute path (into the static store) and sets
+/// `is_level.*`. Null if neither method exists. (Slice C uses this to decide
+/// which GPEs to enable and which method to run when one fires.)
+pub fn gpeHandler(n: u8, is_level: *bool) ?[]const u8 {
+    const hex = "0123456789ABCDEF";
+    var buf = [_]u8{ '\\', '_', 'G', 'P', 'E', '.', '_', 'E', 0, 0 };
+    buf[8] = hex[(n >> 4) & 0xF];
+    buf[9] = hex[n & 0xF];
+    if (findExact(&buf)) |node| {
+        if (node.kind == .method) {
+            is_level.* = false;
+            return node.path[0..node.path_len];
+        }
+    }
+    buf[7] = 'L'; // _L<nn>
+    if (findExact(&buf)) |node| {
+        if (node.kind == .method) {
+            is_level.* = true;
+            return node.path[0..node.path_len];
+        }
+    }
+    return null;
+}
+
+/// Run the GPE handler for bit `n` (block 0) if one exists; true if it ran.
+/// MUST be called from thread context — it evaluates AML (field I/O, Notify),
+/// which is unsafe in the SCI IRQ.
+pub fn runGpeHandler(n: u8) bool {
+    var lvl: bool = false;
+    const path = gpeHandler(n, &lvl) orelse return false;
+    _ = evalMethod(path);
+    return true;
+}
+
 /// Deterministic executor self-test, independent of firmware: run the AML for
 /// `Add(2, 3) -> Local0; Return(Local0)` and expect 5. Proves operand decode, a
 /// binary op writing a Target, Local store/load, and Return.
