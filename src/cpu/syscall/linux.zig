@@ -40,6 +40,7 @@ const ENOTDIR: i64 = 20;
 const EISDIR: i64 = 21;
 const EINVAL: i64 = 22;
 const ENOTTY: i64 = 25;
+const ERANGE: i64 = 34;
 const ESPIPE: i64 = 29;
 const ENOSYS: i64 = 38;
 
@@ -72,6 +73,19 @@ const F_GETFD: u64 = 1;
 const F_SETFD: u64 = 2;
 const F_GETFL: u64 = 3;
 const F_SETFL: u64 = 4;
+const SYS_stat: u32 = 4;
+const SYS_lstat: u32 = 6;
+const SYS_uname: u32 = 63;
+const SYS_getcwd: u32 = 79;
+const SYS_getuid: u32 = 102;
+const SYS_getgid: u32 = 104;
+const SYS_setuid: u32 = 105;
+const SYS_setgid: u32 = 106;
+const SYS_geteuid: u32 = 107;
+const SYS_getegid: u32 = 108;
+// AT_FDCWD (-100): stat/lstat resolve their path against the cwd, exactly like
+// newfstatat(AT_FDCWD, ...). statPath ignores the dirfd for a non-empty path.
+const AT_FDCWD: u64 = 0xFFFF_FFFF_FFFF_FF9C;
 const SYS_getpid: u32 = 39;
 const SYS_exit: u32 = 60;
 const SYS_getdents64: u32 = 217;
@@ -196,6 +210,15 @@ pub fn dispatch(num: u32, frame: *signals.SyscallFrame) u64 {
         SYS_rt_sigprocmask => return 0,
         SYS_rt_sigaction => return 0,
         SYS_set_robust_list => return 0,
+        // Path-based stat/lstat == newfstatat against the cwd. We have no
+        // symlinks, so lstat and stat are identical.
+        SYS_stat, SYS_lstat => return sysNewfstatat(AT_FDCWD, a1, a2, 0),
+        SYS_uname => return sysUname(a1),
+        SYS_getcwd => return sysGetcwd(a1, a2),
+        // Single-user system: everything runs as root (uid/gid 0). setuid/setgid
+        // to any id "succeeds" as a no-op (we are already privileged).
+        SYS_getuid, SYS_geteuid, SYS_getgid, SYS_getegid => return 0,
+        SYS_setuid, SYS_setgid => return 0,
         SYS_exit, SYS_exit_group => {
             // Low byte is the wait-status exit code (per _exit(2)).
             process.destroyCurrentGraceful(@truncate(a1 & 0xFF));
@@ -497,6 +520,40 @@ fn sysNewfstatat(dirfd: u64, path_va: u64, statbuf_va: u64, flags: u64) u64 {
         st.st_ctime = info.modify_time;
     }
     return 0;
+}
+
+/// uname(2): fill `struct utsname` — six 65-byte char fields (sysname,
+/// nodename, release, version, machine, domainname). We report a Linux identity
+/// (so `uname -s` reads "Linux", which is what a Linux binary expects) with a
+/// zigos flavor in the node/release/version fields.
+const UTS_LEN: usize = 65;
+const UTSNAME_SIZE: usize = 6 * UTS_LEN; // 390 bytes
+
+fn sysUname(buf_va: u64) u64 {
+    if (buf_va == 0 or buf_va > 0xFFFF_FFFF or !common.validateUserPtr(@truncate(buf_va), UTSNAME_SIZE)) return err(EFAULT);
+    const buf: []u8 = @as([*]u8, @ptrFromInt(@as(usize, @intCast(buf_va))))[0..UTSNAME_SIZE];
+    @memset(buf, 0); // zero first so every field is NUL-terminated
+    const fields = [_][]const u8{ "Linux", "zigos", "6.6.0-zigos", "#1 zigos", "x86_64", "(none)" };
+    inline for (fields, 0..) |f, i| {
+        const n = @min(f.len, UTS_LEN - 1);
+        @memcpy(buf[i * UTS_LEN ..][0..n], f[0..n]);
+    }
+    return 0;
+}
+
+/// getcwd(buf, size): copy the process cwd + NUL into the user buffer. Linux
+/// returns the byte length including the NUL (musl turns that into the buf
+/// pointer); -ERANGE if the buffer is too small to hold path + NUL.
+fn sysGetcwd(buf_va: u64, size: u64) u64 {
+    const pcb = process.currentPCB() orelse return err(EFAULT);
+    const cwd = pcb.cwd[0..pcb.cwd_len];
+    const needed: u64 = @as(u64, @intCast(cwd.len)) + 1; // path + NUL
+    if (size < needed) return err(ERANGE);
+    if (buf_va == 0 or buf_va > 0xFFFF_FFFF or !common.validateUserPtr(@truncate(buf_va), @as(usize, @intCast(needed)))) return err(EFAULT);
+    const out: [*]u8 = @ptrFromInt(@as(usize, @intCast(buf_va)));
+    @memcpy(out[0..cwd.len], cwd);
+    out[cwd.len] = 0;
+    return needed;
 }
 
 /// getdents64(fd, buf, count). Enumerates an ext2 directory fd into Linux
