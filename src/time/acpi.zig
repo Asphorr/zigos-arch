@@ -282,6 +282,14 @@ var madt: ?*align(1) const Madt = null;
 var hpet: ?*align(1) const Hpet = null;
 var mcfg: ?*align(1) const Mcfg = null;
 var dmar: ?*align(1) const Dmar = null;
+var dsdt: ?*align(1) const SdtHeader = null;
+
+/// SLP_TYPa / SLP_TYPb values extracted from the DSDT's `\_S5_` package — the
+/// 3-bit codes the firmware wants written into PM1a_CNT / PM1b_CNT (bits 12:10)
+/// to enter S5 (soft off). Null until init parses them; sysShutdown falls back
+/// to the spec-default 5 when null.
+pub const SleepTypes = struct { a: u8, b: u8 };
+var s5_slp_typ: ?SleepTypes = null;
 
 /// FADT.flags bit 10 = RESET_REG_SUP. When set, FADT.reset_reg is a valid
 /// Generic Address pointing at a register; writing FADT.reset_value to it
@@ -344,6 +352,16 @@ pub fn getMcfg() ?*align(1) const Mcfg {
 
 pub fn getDmar() ?*align(1) const Dmar {
     return dmar;
+}
+
+pub fn getDsdt() ?*align(1) const SdtHeader {
+    return dsdt;
+}
+
+/// The `\_S5_` SLP_TYPa/b codes parsed from the DSDT, or null if no DSDT /
+/// no `_S5_` / unparseable. sysShutdown writes these into PM1a/PM1b_CNT.
+pub fn getS5SleepTypes() ?SleepTypes {
+    return s5_slp_typ;
 }
 
 /// Iterator over DMAR remapping structures (DRHD / RMRR / ...). Caller cases
@@ -561,6 +579,11 @@ pub fn init(boot_rsdp: u64) void {
         return;
     }
 
+    // DSDT isn't an (X)SDT entry — it's reached via FADT. Cache it and extract
+    // the `\_S5_` sleep codes so shutdown uses the firmware's real SLP_TYP
+    // instead of the spec-default 5 (which only happens to work on QEMU).
+    cacheDsdtAndParseS5();
+
     debug.klog("[acpi] ready: FADT={s} MADT={s} HPET={s} MCFG={s} DMAR={s}\n", .{
         if (fadt != null) "yes" else "no",
         if (madt != null) "yes" else "no",
@@ -596,4 +619,138 @@ pub const MadtIterator = struct {
 pub fn madtEntries() MadtIterator {
     const m = madt orelse return .{ .p = 0, .end = 0 };
     return .{ .p = @intFromPtr(m) + @sizeOf(Madt), .end = @intFromPtr(m) + m.header.length };
+}
+
+// --- DSDT + `\_S5_` (minimal AML) ------------------------------------------
+//
+// NOT an AML interpreter — just the one well-trodden pattern match every
+// shutdown path needs. A real DSDT encodes S5 as:
+//
+//     NameOp(0x08) [ '\' 0x5C ]? "_S5_" PackageOp(0x12) PkgLength NumElements
+//         <SLP_TYPa> <SLP_TYPb> <reserved> <reserved>
+//
+// We find `_S5_`, confirm the NameOp/PackageOp framing (so a stray "_S5_"
+// inside some buffer can't masquerade as the object), step over the package
+// header, and read the first two integer elements. Everything is a small
+// integer op: ZeroOp/OneOp/OnesOp or BytePrefix(0x0A)+byte. The AML is
+// untrusted firmware, so every index is bounds-checked: a malformed table
+// degrades to "not found" (caller keeps the default SLP_TYP=5) instead of
+// reading off the end of the DSDT.
+
+/// Locate, validate, and cache the DSDT (reached via FADT, not the (X)SDT),
+/// then parse `\_S5_`. Best-effort: any failure leaves s5_slp_typ null and
+/// logs why, so shutdown falls back to the spec default.
+fn cacheDsdtAndParseS5() void {
+    const f = fadt orelse return;
+
+    // Prefer the 64-bit X_DSDT, but only when the FADT is actually long enough
+    // to contain it (ACPI 1.0 FADTs stop well before offset 140). Otherwise the
+    // 32-bit DSDT pointer.
+    var dsdt_phys: u64 = 0;
+    if (f.header.length >= @offsetOf(Fadt, "x_dsdt") + @sizeOf(u64) and f.x_dsdt != 0) {
+        dsdt_phys = f.x_dsdt;
+    } else if (f.dsdt != 0) {
+        dsdt_phys = f.dsdt;
+    }
+    if (dsdt_phys == 0) {
+        debug.klog("[acpi] FADT has no DSDT pointer; shutdown uses default SLP_TYP=5\n", .{});
+        return;
+    }
+
+    if (!physRangeMapped(dsdt_phys, @sizeOf(SdtHeader))) return;
+    const hdr: *align(1) const SdtHeader = @ptrFromInt(paging.physToVirt(dsdt_phys));
+    if (!std.mem.eql(u8, &hdr.signature, "DSDT")) {
+        debug.klog("[acpi] DSDT signature mismatch ({s}); shutdown uses default\n", .{hdr.signature});
+        return;
+    }
+    // 2 MiB cap: QEMU's DSDT is ~8 KiB; even large server DSDTs stay well under
+    // this. The bound keeps a corrupt `length` from walking off the physmap.
+    if (hdr.length < @sizeOf(SdtHeader) or hdr.length > 2 << 20 or !physRangeMapped(dsdt_phys, hdr.length)) {
+        debug.klog("[acpi] DSDT length {d} unusable; shutdown uses default\n", .{hdr.length});
+        return;
+    }
+    dsdt = hdr;
+    // A bad DSDT checksum is common on real firmware and doesn't stop us — we
+    // bounds-check the scan independently — but it's worth a breadcrumb.
+    if (!checksumOk(@as([*]const u8, @ptrCast(hdr))[0..hdr.length]))
+        debug.klog("[acpi] DSDT checksum bad (scanning _S5_ anyway)\n", .{});
+
+    // AML proper begins after the 36-byte SDT header.
+    const body = @as([*]const u8, @ptrCast(hdr))[@sizeOf(SdtHeader)..hdr.length];
+    if (parseS5(body)) |st| {
+        s5_slp_typ = st;
+        debug.klog("[acpi] \\_S5_ SLP_TYPa={d} SLP_TYPb={d}\n", .{ st.a, st.b });
+    } else {
+        debug.klog("[acpi] \\_S5_ not found in DSDT; shutdown uses default SLP_TYP=5\n", .{});
+    }
+}
+
+/// Scan an AML body for the `_S5_` name object and return its SLP_TYPa/b.
+/// Keeps scanning past a coincidental `_S5_` byte run that fails the framing
+/// check, so the real Name() object is still found.
+fn parseS5(aml: []const u8) ?SleepTypes {
+    if (aml.len < 4) return null;
+    var i: usize = 0;
+    while (i + 4 <= aml.len) : (i += 1) {
+        if (aml[i] == '_' and aml[i + 1] == 'S' and aml[i + 2] == '5' and aml[i + 3] == '_') {
+            if (parseS5At(aml, i)) |st| return st;
+        }
+    }
+    return null;
+}
+
+/// Validate the Name/Package framing around `_S5_` at `name_idx` and decode the
+/// first two package integers. Returns null on any structural or bounds miss.
+fn parseS5At(aml: []const u8, name_idx: usize) ?SleepTypes {
+    // NameOp(0x08) must precede the name — directly, or with a single root
+    // prefix '\' (0x5C) between (i.e. `\_S5_`). This is what distinguishes the
+    // real object from an incidental "_S5_" in data.
+    const framed = (name_idx >= 1 and aml[name_idx - 1] == 0x08) or
+        (name_idx >= 2 and aml[name_idx - 2] == 0x08 and aml[name_idx - 1] == 0x5C);
+    if (!framed) return null;
+
+    // PackageOp(0x12) directly after the 4-char name.
+    var p = name_idx + 4;
+    if (p >= aml.len or aml[p] != 0x12) return null;
+    p += 1; // -> PkgLength byte 0
+
+    // PkgLength field is 1 + ByteCount bytes (ByteCount = top two bits of byte
+    // 0); NumElements is one more byte. Step over both to the first element.
+    if (p >= aml.len) return null;
+    const pkglen_field: usize = 1 + ((aml[p] & 0xC0) >> 6);
+    p += pkglen_field + 1;
+
+    const a = readPkgInt(aml, &p) orelse return null;
+    // Single-element _S5_ packages exist; default SLP_TYPb to 0 (PM1b is absent
+    // on most systems anyway) when the second element is missing/odd.
+    const b = readPkgInt(aml, &p) orelse 0;
+    return .{ .a = a, .b = b };
+}
+
+/// Decode one small-integer AML element at `aml[p.*]`, advancing `p.*` past it.
+/// Covers the encodings an `_S5_` package realistically uses. Returns null for
+/// out-of-bounds or any other opcode (caller treats as "no value").
+fn readPkgInt(aml: []const u8, p: *usize) ?u8 {
+    if (p.* >= aml.len) return null;
+    switch (aml[p.*]) {
+        0x00 => { // ZeroOp
+            p.* += 1;
+            return 0;
+        },
+        0x01 => { // OneOp
+            p.* += 1;
+            return 1;
+        },
+        0xFF => { // OnesOp
+            p.* += 1;
+            return 0xFF;
+        },
+        0x0A => { // BytePrefix + one data byte
+            if (p.* + 1 >= aml.len) return null;
+            const v = aml[p.* + 1];
+            p.* += 2;
+            return v;
+        },
+        else => return null,
+    }
 }
