@@ -11,7 +11,7 @@
 
 const debug = @import("../debug/debug.zig");
 const paging = @import("../mm/paging.zig");
-const acpi = @import("acpi.zig");
+const acpi = @import("../acpi/acpi.zig");
 
 // Architectural default base (physical). Real boards usually keep this
 // and ACPI's HPET table reports the same address; on a few exotic

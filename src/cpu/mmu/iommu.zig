@@ -28,7 +28,7 @@
 //   §11 — Second-level page table format
 
 const std = @import("std");
-const acpi = @import("../../time/acpi.zig");
+const acpi = @import("../../acpi/acpi.zig");
 const pmm = @import("../../mm/pmm.zig");
 const paging = @import("../../mm/paging.zig");
 const debug = @import("../../debug/debug.zig");

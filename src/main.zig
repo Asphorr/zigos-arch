@@ -313,7 +313,7 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     blog.ok("PIT calibrated");
     // ACPI: parse RSDP/XSDT and cache FADT/MADT/HPET/MCFG. Must run before
     // APIC, HPET, SMP, PCI ECAM.
-    @import("time/acpi.zig").init(boot_info.rsdp_addr);
+    @import("acpi/acpi.zig").init(boot_info.rsdp_addr);
     blog.ok("ACPI tables parsed");
     // Pure observability: dump CPU vendor/family/model/stepping/microcode/
     // LAPIC IDs to serial. These are the data points needed first the time
@@ -373,7 +373,7 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     // Dynamic ACPI: enable ACPI mode and wire the fixed power button to a clean
     // OS shutdown via the SCI. Needs the FADT (acpi.init) and the IOAPIC
     // (apic.init) — both up by here. Best-effort; logs and continues on quirks.
-    @import("time/sci.zig").init();
+    @import("acpi/sci.zig").init();
     // Wall-clock time: latch boot epoch from RTC + HPET.
     @import("time/time.zig").init();
     blog.ok("Wall-clock epoch");
@@ -826,7 +826,7 @@ fn pgflushdEntry() callconv(.c) noreturn {
 const ACPID_POLL_MS: u32 = 250;
 fn acpidEntry() callconv(.c) noreturn {
     const sched = @import("proc/sched.zig");
-    const sci = @import("time/sci.zig");
+    const sci = @import("acpi/sci.zig");
     while (true) {
         sched.kernelSleepMs(ACPID_POLL_MS);
         if (sci.takePowerOffRequest()) {

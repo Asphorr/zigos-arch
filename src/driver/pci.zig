@@ -1,5 +1,5 @@
 const io = @import("../io.zig");
-const acpi = @import("../time/acpi.zig");
+const acpi = @import("../acpi/acpi.zig");
 const paging = @import("../mm/paging.zig");
 const debug = @import("../debug/debug.zig");
 const time = @import("../time/time.zig");

@@ -18,7 +18,7 @@
 // "this BIOS hands us non-sequential LAPIC IDs."
 
 const serial = @import("../../debug/serial.zig");
-const acpi = @import("../../time/acpi.zig");
+const acpi = @import("../../acpi/acpi.zig");
 
 inline fn cpuid(leaf: u32, subleaf: u32) struct { eax: u32, ebx: u32, ecx: u32, edx: u32 } {
     var eax: u32 = undefined;

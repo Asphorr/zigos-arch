@@ -3,7 +3,7 @@
 
 const io = @import("../io.zig");
 const paging = @import("../mm/paging.zig");
-const acpi = @import("acpi.zig");
+const acpi = @import("../acpi/acpi.zig");
 const debug = @import("../debug/debug.zig");
 
 // Local APIC + IOAPIC bases — stored as kernel-pointer VAs through the

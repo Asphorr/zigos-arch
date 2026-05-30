@@ -30,7 +30,7 @@
 
 const std = @import("std");
 const acpi = @import("acpi.zig");
-const apic = @import("apic.zig");
+const apic = @import("../time/apic.zig");
 const dynirq = @import("../cpu/idt/dynirq.zig");
 const io = @import("../io.zig");
 const debug = @import("../debug/debug.zig");

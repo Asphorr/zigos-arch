@@ -157,7 +157,7 @@ pub fn sysKlog(buf_ptr: u32, len: u32) u32 {
 pub fn sysShutdown(mode: u32) u32 {
     const io = @import("../../io.zig");
     const fat32 = @import("../../fs/fat32.zig");
-    const acpi = @import("../../time/acpi.zig");
+    const acpi = @import("../../acpi/acpi.zig");
 
     // Best-effort: flush dirty FS caches before yanking the power.
     if (fat32.isInitialized()) fat32.flushAll();

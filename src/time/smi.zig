@@ -23,7 +23,7 @@
 // Cost: one I/O port read (~1 µs on real HW, near zero on QEMU+KVM) per
 // BSP IRQ0 = ~100 µs/sec = 0.01% CPU. Negligible.
 
-const acpi = @import("acpi.zig");
+const acpi = @import("../acpi/acpi.zig");
 const apic = @import("apic.zig");
 const debug = @import("../debug/debug.zig");
 const io = @import("../io.zig");
