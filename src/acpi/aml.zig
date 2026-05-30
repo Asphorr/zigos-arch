@@ -15,10 +15,12 @@
 // access is bounds-checked via the Reader; a malformed table degrades to a
 // short/partial walk + a log line, never an out-of-bounds read or a panic.
 //
-// Slice B1 (this file today): decode the DSDT, walk the namespace, dump it
-// (named object + full ACPI path + kind), like `acpidump`/`iasl` namespace
-// listing. No method *evaluation* yet — that's B2. This proves the decoder
-// against the real firmware DSDT and lays the namespace foundation that GPE
+// Slice B1: decode the DSDT, walk the namespace, dump it (named object + full
+// ACPI path + kind), like `acpidump`/`iasl`. Slice B2a (this file now): also
+// *record* every object into a flat store and *evaluate* AML data — integer
+// constants, Buffer, Package — proven by evaluating \_S5_ to the same SLP_TYP
+// the static scan finds. Statement execution (Store/If/While, method calls)
+// is B2b; OperationRegion/Field hardware I/O is B2c. The store is what GPE
 // dispatch (Slice C) and thermal/battery (Slice D) look objects up in.
 //
 // Reference: ACPI 6.4 §20 (AML), §20.2.2 (NameString), §20.2.4 (PkgLength),
@@ -354,42 +356,63 @@ fn walkTerms(r: *Reader, end: usize, path: *PathBuf, depth: u8) void {
                 const ns = readNameString(r) orelse return;
                 if (info.extra > 0) r.skip(info.extra);
                 record(info.kind, path, ns, depth);
+                storeNode(info.kind, path, ns, .{});
                 const mark = path.enter(ns);
                 walkTerms(r, pkg_end, path, depth + 1);
                 path.restore(mark);
                 r.pos = pkg_end;
             },
-            .method, .leaf_pkg => {
+            .method => {
+                const pkg_end = packageEnd(r, term_start) orelse return;
+                const ns = readNameString(r) orelse return;
+                const flags = r.next() orelse return; // MethodFlags
+                const body_off = r.pos;
+                record(info.kind, path, ns, depth);
+                storeNode(.method, path, ns, .{
+                    .val_off = body_off,
+                    .val_len = if (pkg_end > body_off) pkg_end - body_off else 0,
+                    .arg_count = flags & 0x07,
+                });
+                r.pos = pkg_end; // body not walked here (executed on call, B2b)
+            },
+            .leaf_pkg => {
                 const pkg_end = packageEnd(r, term_start) orelse return;
                 const ns = readNameString(r) orelse return;
                 record(info.kind, path, ns, depth);
-                r.pos = pkg_end; // body/fieldlist not walked (B1)
+                storeNode(info.kind, path, ns, .{}); // Field elements parsed in B2c
+                r.pos = pkg_end;
             },
             .name => {
                 const ns = readNameString(r) orelse return;
+                const val_off = r.pos;
                 record(info.kind, path, ns, depth);
                 if (!skipDataObject(r)) return;
+                storeNode(.name, path, ns, .{ .val_off = val_off, .val_len = r.pos - val_off });
             },
             .op_region => {
                 const ns = readNameString(r) orelse return;
-                r.skip(1); // RegionSpace byte
-                if (!skipTermArg(r)) return; // RegionOffset
-                if (!skipTermArg(r)) return; // RegionLen
+                const space = r.next() orelse return; // RegionSpace
+                const off = evalConstInt(r) orelse 0; // RegionOffset (TermArg, ~always const)
+                const len = evalConstInt(r) orelse 0; // RegionLen
                 record(info.kind, path, ns, depth);
+                storeNode(.op_region, path, ns, .{ .region_space = space, .region_off = off, .region_len = len });
             },
             .name_byte => {
                 const ns = readNameString(r) orelse return;
                 r.skip(1);
                 record(info.kind, path, ns, depth);
+                storeNode(info.kind, path, ns, .{});
             },
             .name_only => {
                 const ns = readNameString(r) orelse return;
                 record(info.kind, path, ns, depth);
+                storeNode(info.kind, path, ns, .{});
             },
             .alias => {
                 const ns = readNameString(r) orelse return;
                 _ = readNameString(r) orelse return; // alias target
                 record(info.kind, path, ns, depth);
+                storeNode(info.kind, path, ns, .{});
             },
             .ctrl_pkg => {
                 // Control flow (If/Else/While). Skip the whole package. (A later
@@ -484,6 +507,233 @@ fn record(kind: NodeKind, path: *PathBuf, ns: NameString, depth: u8) void {
     path.restore(mark);
 }
 
+// === B2: namespace store + value evaluator ==================================
+// B1 walks and dumps; B2 also *records* each object into a flat store and can
+// *evaluate* AML data. This section is the store + the data evaluator
+// (constants, Buffer, Package). Statement execution (Store, If, method calls)
+// is B2b; OperationRegion/Field I/O is B2c.
+
+const PATH_MAX = 64;
+const MAX_NODES = 512;
+
+/// One resolved namespace entry. Which payload fields matter depends on `kind`:
+///   .name      -> val_off/val_len: the DataRefObject's byte range in the body
+///   .method    -> val_off/val_len: the method body's TermList range; arg_count
+///   .op_region -> region_space/off/len
+/// Other kinds (scope/device/field/…) are stored for path resolution only.
+const StoredNode = struct {
+    path: [PATH_MAX]u8 = undefined,
+    path_len: u8 = 0,
+    kind: NodeKind = .other,
+    val_off: usize = 0,
+    val_len: usize = 0,
+    arg_count: u8 = 0,
+    region_space: u8 = 0,
+    region_off: u64 = 0,
+    region_len: u64 = 0,
+};
+
+/// Optional payload passed to storeNode; defaults keep call sites terse.
+const Payload = struct {
+    val_off: usize = 0,
+    val_len: usize = 0,
+    arg_count: u8 = 0,
+    region_space: u8 = 0,
+    region_off: u64 = 0,
+    region_len: u64 = 0,
+};
+
+var nodes: [MAX_NODES]StoredNode = undefined;
+var nnodes: usize = 0;
+var store_overflow: bool = false;
+
+/// The DSDT AML body, cached by load() so evaluator helpers can build Readers
+/// over the same bytes the stored offsets index into.
+var dsdt_body: []const u8 = &.{};
+
+fn storeNode(kind: NodeKind, path: *PathBuf, ns: NameString, p: Payload) void {
+    if (nnodes >= nodes.len) {
+        store_overflow = true;
+        return;
+    }
+    const mark = path.enter(ns);
+    const full = path.snapshot();
+    const n = &nodes[nnodes];
+    n.* = .{
+        .kind = kind,
+        .val_off = p.val_off,
+        .val_len = p.val_len,
+        .arg_count = p.arg_count,
+        .region_space = p.region_space,
+        .region_off = p.region_off,
+        .region_len = p.region_len,
+    };
+    const cl = @min(full.len, @as(usize, PATH_MAX));
+    @memcpy(n.path[0..cl], full[0..cl]);
+    n.path_len = @intCast(cl);
+    path.restore(mark);
+    nnodes += 1;
+}
+
+/// Exact absolute-path lookup (e.g. "\\_S5_"). B2b adds scope-relative search.
+fn findExact(abs: []const u8) ?*StoredNode {
+    var i: usize = 0;
+    while (i < nnodes) : (i += 1) {
+        const n = &nodes[i];
+        if (std.mem.eql(u8, n.path[0..n.path_len], abs)) return n;
+    }
+    return null;
+}
+
+// --- value arena ------------------------------------------------------------
+// Packages need backing storage for their element Values. A fixed bump arena,
+// reset before each top-level evaluation, avoids an allocator on the AML path.
+
+const VALUE_ARENA = 2048;
+var value_arena: [VALUE_ARENA]Value = undefined;
+var arena_top: usize = 0;
+
+fn arenaReset() void {
+    arena_top = 0;
+}
+
+fn arenaAlloc(n: usize) ?[]Value {
+    if (arena_top + n > value_arena.len) return null;
+    const s = value_arena[arena_top .. arena_top + n];
+    arena_top += n;
+    return s;
+}
+
+// --- data evaluator ---------------------------------------------------------
+// Evaluate one DataObject / computational-data TermArg at the cursor into a
+// Value. Handles the literal forms (the bulk of Name values and Package
+// elements). Non-constant expressions return null (B2b extends this).
+
+fn evalData(r: *Reader) ?Value {
+    const op = r.peek(0) orelse return null;
+    switch (op) {
+        0x00 => { // ZeroOp
+            _ = r.next();
+            return .{ .integer = 0 };
+        },
+        0x01 => { // OneOp
+            _ = r.next();
+            return .{ .integer = 1 };
+        },
+        0xFF => { // OnesOp (64-bit all-ones)
+            _ = r.next();
+            return .{ .integer = ~@as(u64, 0) };
+        },
+        0x0A => { // BytePrefix
+            _ = r.next();
+            const b = r.next() orelse return null;
+            return .{ .integer = b };
+        },
+        0x0B => { // WordPrefix
+            _ = r.next();
+            return .{ .integer = readLe(r, 2) orelse return null };
+        },
+        0x0C => { // DWordPrefix
+            _ = r.next();
+            return .{ .integer = readLe(r, 4) orelse return null };
+        },
+        0x0E => { // QWordPrefix
+            _ = r.next();
+            return .{ .integer = readLe(r, 8) orelse return null };
+        },
+        0x0D => { // StringPrefix: AsciiCharList NullChar
+            _ = r.next();
+            const start = r.pos;
+            while (r.next()) |c| {
+                if (c == 0) return .{ .string = r.buf[start .. r.pos - 1] };
+            }
+            return null;
+        },
+        0x11 => { // BufferOp: PkgLength BufferSize ByteList
+            _ = r.next();
+            const pkg_start = r.pos;
+            const pl = readPkgLength(r) orelse return null;
+            const end = pkg_start + pl.value;
+            if (end > r.buf.len or end < r.pos) return null;
+            _ = evalData(r); // BufferSize TermArg (real length is the byte count)
+            const bytes = if (r.pos <= end) r.buf[r.pos..end] else r.buf[0..0];
+            r.pos = end;
+            return .{ .buffer = bytes };
+        },
+        0x12, 0x13 => { // PackageOp / VarPackageOp
+            _ = r.next();
+            const pkg_start = r.pos;
+            const pl = readPkgLength(r) orelse return null;
+            const end = pkg_start + pl.value;
+            if (end > r.buf.len or end < r.pos) return null;
+            var num: usize = 0;
+            if (op == 0x12) {
+                num = r.next() orelse return null; // NumElements: ByteData
+            } else {
+                const v = evalData(r) orelse return null; // NumElements: TermArg
+                num = if (v == .integer) @intCast(@min(v.integer, VALUE_ARENA)) else 0;
+            }
+            const elems = arenaAlloc(num) orelse return null;
+            var i: usize = 0;
+            while (i < num) : (i += 1) {
+                elems[i] = if (r.pos < end) (evalData(r) orelse .uninit) else .uninit;
+            }
+            r.pos = end;
+            return .{ .package = elems };
+        },
+        else => {
+            // A NameString reference or unmodeled expression used as data (e.g.
+            // a Package element naming another object). Consume a NameString if
+            // that's what it is so the surrounding Package stays in sync; the
+            // referenced value is left unresolved (B2b resolves references).
+            if (isNameLead(op)) {
+                _ = readNameString(r) orelse return null;
+                return .uninit;
+            }
+            return null;
+        },
+    }
+}
+
+fn readLe(r: *Reader, n: usize) ?u64 {
+    if (r.rem() < n) return null;
+    var v: u64 = 0;
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        v |= @as(u64, r.next().?) << @intCast(8 * i);
+    }
+    return v;
+}
+
+fn isNameLead(c: u8) bool {
+    return c == 0x5C or c == 0x5E or c == 0x2E or c == 0x2F or c == '_' or (c >= 'A' and c <= 'Z');
+}
+
+/// Evaluate a TermArg expected to be a constant integer (OpRegion offset/len).
+/// On a non-constant expression, skip the TermArg and return null.
+fn evalConstInt(r: *Reader) ?u64 {
+    const save = r.pos;
+    if (evalData(r)) |v| {
+        if (v == .integer) return v.integer;
+    }
+    r.pos = save;
+    _ = skipTermArg(r);
+    return null;
+}
+
+/// SLP_TYPa from \_S5_ as evaluated from AML (cross-checks Slice A's static
+/// scan; usable by the shutdown path later). Null if \_S5_ is absent or not a
+/// Package of integers. Call after load() has populated the store.
+pub fn s5SlpTyp() ?u8 {
+    if (dsdt_body.len == 0) return null;
+    const n = findExact("\\_S5_") orelse return null;
+    arenaReset();
+    var r = Reader{ .buf = dsdt_body, .pos = n.val_off };
+    const v = evalData(&r) orelse return null;
+    if (v != .package or v.package.len < 1 or v.package[0] != .integer) return null;
+    return @truncate(v.package[0].integer);
+}
+
 // --- entry point ------------------------------------------------------------
 
 /// Decode the cached DSDT and walk its namespace. Call after acpi.init has
@@ -492,6 +742,9 @@ fn record(kind: NodeKind, path: *PathBuf, ns: NameString, depth: u8) void {
 pub fn load() u32 {
     node_count = 0;
     unknown_op_seen = 0;
+    nnodes = 0;
+    store_overflow = false;
+    arenaReset();
 
     const dsdt = acpi.getDsdt() orelse {
         debug.klog("[aml] no DSDT cached — namespace unavailable\n", .{});
@@ -502,6 +755,7 @@ pub fn load() u32 {
     const hdr_len = @sizeOf(acpi.SdtHeader);
     if (dsdt.length <= hdr_len) return 0;
     const body = @as([*]const u8, @ptrCast(dsdt))[hdr_len..dsdt.length];
+    dsdt_body = body;
 
     if (DUMP) debug.klog("[aml] walking DSDT namespace ({d} AML bytes)\n", .{body.len});
 
@@ -514,6 +768,33 @@ pub fn load() u32 {
         debug.klog("[aml] walk stopped early at unmodeled opcode 0x{X} ({d} objects so far)\n", .{ unknown_op_seen, node_count });
     } else {
         debug.klog("[aml] namespace walk complete: {d} named objects\n", .{node_count});
+    }
+    debug.klog("[aml] namespace store: {d} objects{s}\n", .{ nnodes, if (store_overflow) " (TRUNCATED)" else "" });
+
+    // B2a proof: evaluate \_S5_ through the interpreter and report SLP_TYP — the
+    // same datum Slice A's static scan extracts, now produced by the general
+    // value path (Name lookup + Package/integer decode).
+    arenaReset();
+    if (findExact("\\_S5_")) |n| {
+        var er = Reader{ .buf = body, .pos = n.val_off };
+        if (evalData(&er)) |v| {
+            if (v == .package and v.package.len >= 1 and v.package[0] == .integer) {
+                const a = v.package[0].integer;
+                const b = if (v.package.len >= 2 and v.package[1] == .integer) v.package[1].integer else 0;
+                // Cross-check against acpi.zig's independent static byte-scan of
+                // the same package — two unrelated decoders, one verdict.
+                if (acpi.getS5SleepTypes()) |st| {
+                    const ok = (a == st.a) and (b == st.b);
+                    debug.klog("[aml] evaluated \\_S5_ = Package[{d}]: SLP_TYPa={d} SLP_TYPb={d} (static scan a={d} b={d}: {s})\n", .{ v.package.len, a, b, st.a, st.b, if (ok) "MATCH" else "MISMATCH" });
+                } else {
+                    debug.klog("[aml] evaluated \\_S5_ = Package[{d}]: SLP_TYPa={d} SLP_TYPb={d} (no static scan to compare)\n", .{ v.package.len, a, b });
+                }
+            } else {
+                debug.klog("[aml] \\_S5_ present but not an integer Package\n", .{});
+            }
+        }
+    } else {
+        debug.klog("[aml] \\_S5_ not found in namespace store\n", .{});
     }
     return node_count;
 }
