@@ -284,6 +284,15 @@ var mcfg: ?*align(1) const Mcfg = null;
 var dmar: ?*align(1) const Dmar = null;
 var dsdt: ?*align(1) const SdtHeader = null;
 
+/// SSDTs (Secondary System Description Tables) found in the (X)SDT. Unlike the
+/// DSDT there can be several — real firmware splits thermal zones, batteries,
+/// CPU objects, etc. across SSDTs, and QEMU's `-acpitable sig=SSDT,...` injects
+/// one here too. The AML interpreter loads each into the same namespace as the
+/// DSDT (Slice D), so a thermal/battery method defined in any of them resolves.
+const MAX_SSDT = 20;
+var ssdts: [MAX_SSDT]*align(1) const SdtHeader = undefined;
+var nssdt: usize = 0;
+
 /// SLP_TYPa / SLP_TYPb values extracted from the DSDT's `\_S5_` package — the
 /// 3-bit codes the firmware wants written into PM1a_CNT / PM1b_CNT (bits 12:10)
 /// to enter S5 (soft off). Null until init parses them; sysShutdown falls back
@@ -356,6 +365,18 @@ pub fn getDmar() ?*align(1) const Dmar {
 
 pub fn getDsdt() ?*align(1) const SdtHeader {
     return dsdt;
+}
+
+/// Number of SSDTs discovered in the (X)SDT (0 on QEMU's stock q35 unless one
+/// was injected via `-acpitable`). The AML loader iterates [0, ssdtCount).
+pub fn ssdtCount() usize {
+    return nssdt;
+}
+
+/// The i-th SSDT header (already checksum-validated by the table walk), or null
+/// if out of range. Its AML body begins at +sizeof(SdtHeader).
+pub fn getSsdt(i: usize) ?*align(1) const SdtHeader {
+    return if (i < nssdt) ssdts[i] else null;
 }
 
 /// The `\_S5_` SLP_TYPa/b codes parsed from the DSDT, or null if no DSDT /
@@ -502,6 +523,14 @@ fn dispatchTable(hdr: *align(1) const SdtHeader) void {
         mcfg = @ptrCast(hdr);
     } else if (std.mem.eql(u8, &hdr.signature, "DMAR")) {
         dmar = @ptrCast(hdr);
+    } else if (std.mem.eql(u8, &hdr.signature, "SSDT")) {
+        // Collect every SSDT; the AML interpreter walks them all into the one
+        // namespace (Slice D). Cap silently — overflow just means the namespace
+        // misses a late table, never a crash.
+        if (nssdt < ssdts.len) {
+            ssdts[nssdt] = hdr;
+            nssdt += 1;
+        }
     }
 }
 

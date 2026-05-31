@@ -544,6 +544,9 @@ const StoredNode = struct {
     path: [PATH_MAX]u8 = undefined,
     path_len: u8 = 0,
     kind: NodeKind = .other,
+    /// Which loaded table (DSDT=0, SSDTs=1..) this node's byte offsets index, so
+    /// the evaluator reads val_off/val_len from the right table body (Slice D).
+    table_id: u8 = 0,
     val_off: usize = 0,
     val_len: usize = 0,
     arg_count: u8 = 0,
@@ -580,9 +583,22 @@ var nodes: [MAX_NODES]StoredNode = undefined;
 var nnodes: usize = 0;
 var store_overflow: bool = false;
 
-/// The DSDT AML body, cached by load() so evaluator helpers can build Readers
-/// over the same bytes the stored offsets index into.
-var dsdt_body: []const u8 = &.{};
+/// Loaded AML table bodies, indexed by StoredNode.table_id. The DSDT is table 0;
+/// SSDTs (and the synthetic test table) follow. Evaluator helpers build their
+/// Readers over bodies[node.table_id], so a node's byte offsets always index the
+/// table it was decoded from — the multi-table generalization of what used to be
+/// a single `dsdt_body`.
+const MAX_TABLES = 24;
+var bodies: [MAX_TABLES][]const u8 = [_][]const u8{&[_]u8{}} ** MAX_TABLES;
+var nbodies: u8 = 0;
+/// Stamped onto every node storeNode() records; set before each table's walk
+/// (walkBody) so nodes inherit the body they came from.
+var cur_table_id: u8 = 0;
+
+/// The AML body a stored node's offsets index into (its source table).
+fn bodyOf(n: *const StoredNode) []const u8 {
+    return if (n.table_id < nbodies) bodies[n.table_id] else &[_]u8{};
+}
 
 fn storeNode(kind: NodeKind, path: *PathBuf, ns: NameString, p: Payload) void {
     if (nnodes >= nodes.len) {
@@ -594,6 +610,7 @@ fn storeNode(kind: NodeKind, path: *PathBuf, ns: NameString, p: Payload) void {
     const n = &nodes[nnodes];
     n.* = .{
         .kind = kind,
+        .table_id = cur_table_id,
         .val_off = p.val_off,
         .val_len = p.val_len,
         .arg_count = p.arg_count,
@@ -762,10 +779,10 @@ fn evalConstInt(r: *Reader) ?u64 {
 /// scan; usable by the shutdown path later). Null if \_S5_ is absent or not a
 /// Package of integers. Call after load() has populated the store.
 pub fn s5SlpTyp() ?u8 {
-    if (dsdt_body.len == 0) return null;
+    if (nbodies == 0) return null;
     const n = findExact("\\_S5_") orelse return null;
     arenaReset();
-    var r = Reader{ .buf = dsdt_body, .pos = n.val_off };
+    var r = Reader{ .buf = bodyOf(n), .pos = n.val_off };
     const v = evalData(&r) orelse return null;
     if (v != .package or v.package.len < 1 or v.package[0] != .integer) return null;
     return @truncate(v.package[0].integer);
@@ -1100,7 +1117,7 @@ fn evalNameRef(r: *Reader, st: *ExecState) ?Value {
         },
         .name => {
             if (node.has_runtime) return node.runtime_val;
-            var rr = Reader{ .buf = dsdt_body, .pos = node.val_off };
+            var rr = Reader{ .buf = bodyOf(node), .pos = node.val_off };
             return evalData(&rr) orelse .uninit;
         },
         .field => { // B2c: read the backing hardware
@@ -1286,13 +1303,14 @@ fn execNotify(r: *Reader, st: *ExecState) void {
 /// it falls off the end). Depth-guarded against runaway recursion.
 fn callMethod(node: *StoredNode, args: []const Value, depth: u8) ?Value {
     if (depth > MAX_CALL_DEPTH) return null;
-    if (node.kind != .method or dsdt_body.len == 0) return null;
+    if (node.kind != .method or bodyOf(node).len == 0) return null;
     var frame = Frame{};
     var i: usize = 0;
     while (i < args.len and i < 7) : (i += 1) frame.args[i] = args[i];
     var st = ExecState{ .frame = &frame, .scope = node.path[0..node.path_len], .depth = depth };
-    var r = Reader{ .buf = dsdt_body, .pos = node.val_off };
-    const end = @min(node.val_off + node.val_len, dsdt_body.len);
+    const body = bodyOf(node);
+    var r = Reader{ .buf = body, .pos = node.val_off };
+    const end = @min(node.val_off + node.val_len, body.len);
     execTermList(&r, end, &st);
     return st.ret;
 }
@@ -1571,49 +1589,272 @@ fn writeField(field: *const StoredNode, value: u64) bool {
     return true;
 }
 
+// --- Slice D: multi-table load + thermal/battery readout --------------------
+
+/// Walk one already-validated AML body into the shared namespace, tagging every
+/// node with this table's id so the evaluator later reads val_off/val_len from
+/// the right table's bytes. Returns how many named objects it added. A body past
+/// MAX_TABLES is dropped with a diagnostic — never a fault.
+fn walkBody(body: []const u8) u32 {
+    if (body.len == 0) return 0;
+    if (nbodies >= MAX_TABLES) {
+        debug.klog("[aml] table registry full ({d}); a table is unloaded\n", .{MAX_TABLES});
+        return 0;
+    }
+    const id = nbodies;
+    bodies[id] = body;
+    nbodies += 1;
+    cur_table_id = id;
+    const before = node_count;
+    if (DUMP) debug.klog("[aml] walking table {d} ({d} AML bytes)\n", .{ id, body.len });
+    var r = Reader{ .buf = body };
+    var path = PathBuf{};
+    path.reset();
+    walkTerms(&r, body.len, &path, 0);
+    return node_count - before;
+}
+
+/// Slice past an (X)SDT-supplied table's 36-byte header to its AML body and walk
+/// it. acpi.zig already validated the length + mapping, so the slice is safe.
+fn walkTable(hdr: *align(1) const acpi.SdtHeader) u32 {
+    const hdr_len = @sizeOf(acpi.SdtHeader);
+    if (hdr.length <= hdr_len) return 0;
+    const body = @as([*]const u8, @ptrCast(hdr))[hdr_len..hdr.length];
+    return walkBody(body);
+}
+
+/// Compile in a deterministic thermal zone so Slice D's readout has a target on
+/// firmware (QEMU) that ships none. Set false to test against only real tables.
+const SYNTH_TEST = true;
+
+/// Hand-assembled AML body (no SDT header — QEMU synthesizes that for a real
+/// `-acpitable` table; here we feed the body straight to walkBody). Decodes to
+///   Scope(\_SB) { ThermalZone(TZ0) { Method(_TMP, 0) { Return(0x0BB8) } } }
+/// 0x0BB8 = 3000 tenths-of-Kelvin = 26.85 C. Encoding per ACPI 6.4 §20.2; every
+/// PkgLength here is the 1-byte form (length < 0x40).
+const synth_ssdt = [_]u8{
+    0x10, 0x18, // ScopeOp, PkgLength=24
+    0x5C, 0x5F, 0x53, 0x42, 0x5F, // RootChar '\' + "_SB_"
+    0x5B, 0x85, 0x10, // ThermalZoneOp, PkgLength=16
+    0x54, 0x5A, 0x30, 0x5F, // "TZ0_"
+    0x14, 0x0A, // MethodOp, PkgLength=10
+    0x5F, 0x54, 0x4D, 0x50, // "_TMP"
+    0x00, // MethodFlags (0 args)
+    0xA4, 0x0B, 0xB8, 0x0B, // Return(WordPrefix 0x0BB8)
+};
+
+/// Companion synthetic table: Scope(\_SB) { Device(BAT0) { _BST, _BIF } }, so
+/// battery evaluation has a deterministic target too. Kept separate from
+/// synth_ssdt so the (already boot-verified) thermal blob stays byte-identical.
+///   _BST -> Package(4){ 1, 0x0BB8, 0x0FA0, 0x2EE0 }
+///           = discharging, 3000 mW rate, 4000 mWh remaining, 12000 mV
+///   _BIF -> Package(5){ 0, 0x1388, 0x1388, 1, 0x2EE0 }
+///           = mWh unit, 5000 design, 5000 last-full, rechargeable, 12000 mV
+/// remaining 4000 / last-full 5000 = 80%. Each PkgLength is the 1-byte form.
+const synth_battery = [_]u8{
+    0x10, 0x38, // ScopeOp, PkgLength=56
+    0x5C, 0x5F, 0x53, 0x42, 0x5F, // RootChar '\' + "_SB_"
+    0x5B, 0x82, 0x30, // DeviceOp, PkgLength=48
+    0x42, 0x41, 0x54, 0x30, // "BAT0"
+    // Method(_BST, 0) { Return(Package(4){ 1, 0x0BB8, 0x0FA0, 0x2EE0 }) }
+    0x14, 0x14, // MethodOp, PkgLength=20
+    0x5F, 0x42, 0x53, 0x54, // "_BST"
+    0x00, // MethodFlags (0 args)
+    0xA4, // Return
+    0x12, 0x0C, 0x04, // PackageOp, PkgLength=12, NumElements=4
+    0x01, // 1 (status: discharging)
+    0x0B, 0xB8, 0x0B, // 0x0BB8 = 3000 mW present rate
+    0x0B, 0xA0, 0x0F, // 0x0FA0 = 4000 mWh remaining capacity
+    0x0B, 0xE0, 0x2E, // 0x2EE0 = 12000 mV present voltage
+    // Method(_BIF, 0) { Return(Package(5){ 0, 0x1388, 0x1388, 1, 0x2EE0 }) }
+    0x14, 0x15, // MethodOp, PkgLength=21
+    0x5F, 0x42, 0x49, 0x46, // "_BIF"
+    0x00, // MethodFlags (0 args)
+    0xA4, // Return
+    0x12, 0x0D, 0x05, // PackageOp, PkgLength=13, NumElements=5
+    0x00, // 0 (power unit: mWh)
+    0x0B, 0x88, 0x13, // 0x1388 = 5000 design capacity
+    0x0B, 0x88, 0x13, // 0x1388 = 5000 last-full-charge capacity
+    0x01, // 1 (battery technology: rechargeable)
+    0x0B, 0xE0, 0x2E, // 0x2EE0 = 12000 mV design voltage
+};
+
+/// True when `path`'s final '.'-separated component equals `seg` (a 4-char
+/// NameSeg like "_TMP"/"_BST"). Finds a well-known method anywhere in the
+/// namespace without caring which device/zone it hangs off.
+fn pathEndsWithSeg(path: []const u8, seg: []const u8) bool {
+    if (path.len < seg.len) return false;
+    if (!std.mem.eql(u8, path[path.len - seg.len ..], seg)) return false;
+    if (path.len == seg.len) return true;
+    const pc = path[path.len - seg.len - 1];
+    return pc == '.' or pc == '\\';
+}
+
+/// Log one _TMP reading. _TMP is tenths of Kelvin (ACPI 6.4 §11.4.13); convert
+/// to C in centidegrees (deci_k*10 - 27315) for two decimals without floats.
+fn logTempDeciK(path: []const u8, deci_k: u64) void {
+    // Cap before the i64 math: a garbage region read could otherwise overflow.
+    // Real temperatures are a few thousand dK; 1e6 dK (~99726 C) is absurd-high.
+    const dk: i64 = if (deci_k > 1_000_000) 1_000_000 else @intCast(deci_k);
+    const centi_c: i64 = dk * 10 - 27315;
+    const neg = centi_c < 0;
+    const mag: u64 = @intCast(if (neg) -centi_c else centi_c);
+    debug.klog("[aml] thermal {s} = {d} dK ({s}{d}.{d:0>2} C)\n", .{
+        path, deci_k, if (neg) "-" else "", mag / 100, mag % 100,
+    });
+}
+
+/// Slice D: evaluate every thermal-zone temperature method (\..._TMP) and report
+/// it. Returns the count read. A zone whose _TMP needs an unsupported region
+/// (e.g. an embedded controller) just won't evaluate to an integer and is
+/// skipped — best-effort, never a fault. Public so a CLI/acpid can re-poll.
+pub fn reportThermal() u32 {
+    var found: u32 = 0;
+    var i: usize = 0;
+    while (i < nnodes) : (i += 1) {
+        const n = &nodes[i];
+        if (n.kind != .method) continue;
+        if (!pathEndsWithSeg(n.path[0..n.path_len], "_TMP")) continue;
+        arenaReset();
+        const v = callMethod(n, &.{}, 0) orelse continue;
+        if (v != .integer) continue;
+        logTempDeciK(n.path[0..n.path_len], v.integer);
+        found += 1;
+    }
+    if (found == 0) debug.klog("[aml] no readable thermal zones (_TMP) in namespace\n", .{});
+    return found;
+}
+
+/// Integer at `idx` in a Package value, or 0 if absent / not an integer.
+fn pkgInt(pkg: []const Value, idx: usize) u64 {
+    if (idx >= pkg.len) return 0;
+    return switch (pkg[idx]) {
+        .integer => |v| v,
+        else => 0,
+    };
+}
+
+/// Battery state label from _BST's status bitfield (ACPI 6.4 §10.2.2.6).
+fn batteryState(s: u64) []const u8 {
+    if (s & 0x04 != 0) return "critical";
+    if (s & 0x02 != 0) return "charging";
+    if (s & 0x01 != 0) return "discharging";
+    return "idle/full";
+}
+
+fn logBattery(path: []const u8, state: u64, rate: u64, remaining: u64, voltage: u64, full: u64, pct: u64) void {
+    if (full != 0) {
+        debug.klog("[aml] battery {s}: {s}, {d} mWh / {d} mWh ({d}%), {d} mW, {d} mV\n", .{ path, batteryState(state), remaining, full, pct, rate, voltage });
+    } else {
+        debug.klog("[aml] battery {s}: {s}, {d} mWh, {d} mW, {d} mV\n", .{ path, batteryState(state), remaining, rate, voltage });
+    }
+}
+
+/// Slice D: evaluate every battery status method (\..._BST) and report it,
+/// pairing each with its sibling _BIF (last-full-charge capacity at index 2) for
+/// a charge percentage when present. Returns the count read. Best-effort: a _BST
+/// that doesn't yield a 4+ element Package is skipped — never a fault. Public so
+/// a CLI/acpid can re-poll.
+pub fn reportBattery() u32 {
+    var found: u32 = 0;
+    var i: usize = 0;
+    while (i < nnodes) : (i += 1) {
+        const n = &nodes[i];
+        if (n.kind != .method) continue;
+        const path = n.path[0..n.path_len];
+        if (!pathEndsWithSeg(path, "_BST")) continue;
+        arenaReset();
+        const bst = callMethod(n, &.{}, 0) orelse continue;
+        if (bst != .package or bst.package.len < 4) continue;
+        // Copy the fields out before any further eval reuses the value arena.
+        const state = pkgInt(bst.package, 0);
+        const rate = pkgInt(bst.package, 1);
+        const remaining = pkgInt(bst.package, 2);
+        const voltage = pkgInt(bst.package, 3);
+
+        // Sibling _BIF (rewrite the trailing "_BST" seg -> "_BIF"): index 2 is the
+        // last-full-charge capacity, which turns remaining mWh into a percentage.
+        var full: u64 = 0;
+        if (path.len <= PATH_MAX and path.len >= 4) {
+            var bif_buf: [PATH_MAX]u8 = undefined;
+            @memcpy(bif_buf[0..path.len], path);
+            bif_buf[path.len - 2] = 'I';
+            bif_buf[path.len - 1] = 'F';
+            if (findExact(bif_buf[0..path.len])) |bn| {
+                if (bn.kind == .method) {
+                    arenaReset();
+                    if (callMethod(bn, &.{}, 0)) |bif| {
+                        if (bif == .package) full = pkgInt(bif.package, 2);
+                    }
+                }
+            }
+        }
+
+        // Guard the multiply: a garbage remaining could otherwise overflow u64.
+        const pct: u64 = if (full != 0 and remaining <= 100_000_000) @min(remaining * 100 / full, 100) else 0;
+        logBattery(path, state, rate, remaining, voltage, full, pct);
+        found += 1;
+    }
+    if (found == 0) debug.klog("[aml] no batteries (_BST) in namespace\n", .{});
+    return found;
+}
+
 // --- entry point ------------------------------------------------------------
 
-/// Decode the cached DSDT and walk its namespace. Call after acpi.init has
-/// cached the DSDT (acpi.getDsdt()). Best-effort: logs a summary; a malformed
-/// DSDT yields a partial walk, never a fault. Returns the object count.
+/// Decode the cached DSDT plus every SSDT into one namespace, then run the
+/// boot-time proofs. Call after acpi.init has cached the tables. Best-effort:
+/// logs a summary; a malformed table yields a partial walk, never a fault.
+/// Returns the total named-object count.
 pub fn load() u32 {
     node_count = 0;
     unknown_op_seen = 0;
     nnodes = 0;
     store_overflow = false;
+    nbodies = 0;
     arenaReset();
 
-    const dsdt = acpi.getDsdt() orelse {
-        debug.klog("[aml] no DSDT cached — namespace unavailable\n", .{});
-        return 0;
-    };
-    // AML body begins after the 36-byte SDT header. acpi.zig already validated
-    // the length + that the whole table is mapped, so this slice is safe.
-    const hdr_len = @sizeOf(acpi.SdtHeader);
-    if (dsdt.length <= hdr_len) return 0;
-    const body = @as([*]const u8, @ptrCast(dsdt))[hdr_len..dsdt.length];
-    dsdt_body = body;
+    // Table 0: the DSDT — the namespace root. SSDTs (next) re-open \_SB etc. by
+    // path, so we still load them even if the DSDT is somehow absent.
+    var dsdt_objs: u32 = 0;
+    if (acpi.getDsdt()) |dsdt| {
+        dsdt_objs = walkTable(dsdt);
+    } else {
+        debug.klog("[aml] no DSDT cached — namespace limited to SSDTs\n", .{});
+    }
 
-    if (DUMP) debug.klog("[aml] walking DSDT namespace ({d} AML bytes)\n", .{body.len});
+    // Tables 1..N: every SSDT. Real firmware splits thermal zones, batteries and
+    // CPU objects across these; `-acpitable sig=SSDT,...` injects one here too.
+    var ssdt_objs: u32 = 0;
+    var si: usize = 0;
+    while (si < acpi.ssdtCount()) : (si += 1) {
+        if (acpi.getSsdt(si)) |s| ssdt_objs += walkTable(s);
+    }
 
-    var r = Reader{ .buf = body };
-    var path = PathBuf{};
-    path.reset();
-    walkTerms(&r, body.len, &path, 0);
+    // A built-in synthetic SSDT (\_SB.TZ0._TMP) so thermal evaluation has a
+    // deterministic target even on firmware that ships no thermal zone. Loaded
+    // through the exact same multi-table path — proves SSDT loading every boot.
+    if (SYNTH_TEST) {
+        _ = walkBody(&synth_ssdt); // thermal zone \_SB.TZ0
+        _ = walkBody(&synth_battery); // battery \_SB.BAT0
+    }
 
     if (unknown_op_seen != 0) {
         debug.klog("[aml] walk stopped early at unmodeled opcode 0x{X} ({d} objects so far)\n", .{ unknown_op_seen, node_count });
     } else {
         debug.klog("[aml] namespace walk complete: {d} named objects\n", .{node_count});
     }
-    debug.klog("[aml] namespace store: {d} objects{s}\n", .{ nnodes, if (store_overflow) " (TRUNCATED)" else "" });
+    debug.klog("[aml] namespace: DSDT {d} obj + {d} SSDT(s) {d} obj{s} = {d} total{s}\n", .{
+        dsdt_objs, acpi.ssdtCount(), ssdt_objs,
+        if (SYNTH_TEST) " + synthetic test SSDT" else "",
+        nnodes, if (store_overflow) " (TRUNCATED)" else "",
+    });
 
     // B2a proof: evaluate \_S5_ through the interpreter and report SLP_TYP — the
     // same datum Slice A's static scan extracts, now produced by the general
     // value path (Name lookup + Package/integer decode).
     arenaReset();
     if (findExact("\\_S5_")) |n| {
-        var er = Reader{ .buf = body, .pos = n.val_off };
+        var er = Reader{ .buf = bodyOf(n), .pos = n.val_off };
         if (evalData(&er)) |v| {
             if (v == .package and v.package.len >= 1 and v.package[0] == .integer) {
                 const a = v.package[0].integer;
@@ -1673,5 +1914,10 @@ pub fn load() u32 {
             debug.klog("[aml] live field read {s}: unsupported\n", .{f.path[0..f.path_len]});
         }
     }
+
+    // Slice D proof: read every thermal zone + battery — the synthetic \_SB.TZ0
+    // and \_SB.BAT0 are always present; real/-acpitable objects report alongside.
+    _ = reportThermal();
+    _ = reportBattery();
     return node_count;
 }
