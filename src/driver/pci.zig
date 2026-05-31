@@ -169,6 +169,90 @@ pub fn enumerate() void {
     debug.klog("[pci] {d} device(s) cached\n", .{device_count});
 }
 
+/// Re-walk config space and register devices that appeared since the last scan
+/// — PCI hotplug (driven by the ACPI \_GPE._E01 Notify via acpid). Returns the
+/// number of devices newly added to the cache.
+///
+/// Concurrency: safe from thread context (acpid). Each config read serializes
+/// on pci_lock *internally*, so we must NOT hold pci_lock across readDevice (the
+/// spinlock isn't recursive). The only shared state we mutate is the cache; a new
+/// slot is fully written before device_count is bumped with a release store, so
+/// the lock-free readers (allDevices/findByClass) never observe a half-written
+/// entry (x86-TSO + release ordering). acpid is the sole writer, so the read of
+/// device_count inside isCached/addDevice can't race another writer.
+///
+/// A hot-added device's BARs are unassigned until a driver calls assignBar64, so
+/// "online" here means detected + cached + visible to allDevices()/findByClass —
+/// not driver-bound. Removed devices are detected and logged but left in the
+/// cache (no driver-unbind/eject path yet; tombstoning a live entry would race
+/// the lock-free readers).
+pub fn rescan() usize {
+    const first_bus: u16 = if (ecam_base != 0) ecam_start_bus else 0;
+    const last_bus: u16 = if (ecam_base != 0) @as(u16, ecam_end_bus) + 1 else 256;
+    var added: usize = 0;
+    var bus: u16 = first_bus;
+    while (bus < last_bus) : (bus += 1) {
+        var dev_idx: u8 = 0;
+        while (dev_idx < 32) : (dev_idx += 1) {
+            var func: u8 = 0;
+            while (func < 8) : (func += 1) {
+                if (readDevice(@truncate(bus), dev_idx, func)) |d| {
+                    if (!isCached(d.bus, d.dev, d.func) and addDevice(d)) {
+                        added += 1;
+                        debug.klog(
+                            "[pci] hotplug +{x:0>2}:{x:0>2}.{d} {s} vendor=0x{x:0>4} device=0x{x:0>4} class={x:0>2}.{x:0>2}.{x:0>2}\n",
+                            .{
+                                d.bus, d.dev, d.func, classifyName(d.class_code, d.subclass),
+                                d.vendor_id, d.device_id, d.class_code, d.subclass, d.prog_if,
+                            },
+                        );
+                    }
+                    // Same multi-function short-circuit as enumerate().
+                    if (func == 0 and (d.header_type & 0x80) == 0) break;
+                } else {
+                    if (func == 0) break;
+                }
+            }
+        }
+    }
+    logRemovals();
+    return added;
+}
+
+/// True if (bus,dev,func) is already in the device cache.
+fn isCached(bus: u8, dev: u8, func: u8) bool {
+    for (devices[0..device_count]) |c| {
+        if (c.bus == bus and c.dev == dev and c.func == func) return true;
+    }
+    return false;
+}
+
+/// Append a newly-discovered device, publishing the slot *before* the count via
+/// a release store so lock-free readers never see a partial entry. False if the
+/// cache is full.
+fn addDevice(d: PciDevice) bool {
+    const n = device_count;
+    if (n >= MAX_DEVICES) {
+        debug.klog("[pci] hotplug: cache full (>{d}); dropping {x:0>2}:{x:0>2}.{d}\n", .{ MAX_DEVICES, d.bus, d.dev, d.func });
+        return false;
+    }
+    devices[n] = d;
+    bound[n] = false;
+    @atomicStore(usize, &device_count, n + 1, .release);
+    return true;
+}
+
+/// Log any cached device that has stopped responding (hot-removed). Does not
+/// mutate the cache (see rescan's note on why).
+fn logRemovals() void {
+    for (devices[0..device_count]) |c| {
+        if (c.vendor_id == 0xFFFF) continue;
+        const id: IdReg = @bitCast(configRead(c.bus, c.dev, c.func, 0x00));
+        if (id.vendor_id == 0xFFFF)
+            debug.klog("[pci] hotplug -{x:0>2}:{x:0>2}.{d} {s} (removed)\n", .{ c.bus, c.dev, c.func, classifyName(c.class_code, c.subclass) });
+    }
+}
+
 /// Single-device boot log line. Appends PCIe link info when the device
 /// exposes the PCIe capability — useful for spotting links that trained
 /// below their max speed/width (a common "device feels slow" cause on

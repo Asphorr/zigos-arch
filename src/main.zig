@@ -437,6 +437,11 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
         if (@import("proc/lifecycle.zig").createKernelTask(@intFromPtr(&pgflushdEntry), "pgflushd", 0, .normal, 32 * 1024) == null)
             blog.warn("pgflushd", "spawn failed — MAP_SHARED dirty pages won't auto-persist", .{});
     }
+    // Route AML Notify()s to a dispatcher: the PCI-hotplug \_GPE._E01 Notifies
+    // the affected slot, and acpid rescans the bus so a hot-added device is
+    // detected + registered. Registered before acpid spawns (the only thing that
+    // runs GPE handlers) so the very first event is covered.
+    @import("acpi/aml.zig").setNotifyHook(&acpiNotifyDispatch);
     // acpid — consumes the power-button flag set by the SCI handler (sci.zig)
     // and runs the graceful shutdown in thread context (FS flush + S5 enter),
     // which must NOT happen inside the SCI IRQ. Spawned unconditionally so the
@@ -824,6 +829,24 @@ fn pgflushdEntry() callconv(.c) noreturn {
 /// imperceptible for a power button and the thread is otherwise asleep.
 /// (Future: wake-driven via proc.wake instead of polled.)
 const ACPID_POLL_MS: u32 = 250;
+// PCI hotplug: set by acpiNotifyDispatch (the aml Notify hook) when a GPE
+// handler signals a topology change; drained once per acpid poll so a handler
+// that Notifies several slots triggers a single rescan, and the heavy bus walk
+// runs OUTSIDE the AML interpreter's call stack. acpid is the sole reader and
+// writer of this flag, so no atomics are needed.
+var pci_rescan_requested: bool = false;
+
+/// aml's Notify hook. ACPI device-presence notifications — 0x00 Bus Check,
+/// 0x01 Device Check, 0x03 Eject Request — all mean the PCI topology changed:
+/// request a rescan. Other values (0x80 thermal/battery) are for later slices.
+fn acpiNotifyDispatch(obj_path: []const u8, value: u64) void {
+    _ = obj_path;
+    switch (value) {
+        0x00, 0x01, 0x03 => pci_rescan_requested = true,
+        else => {},
+    }
+}
+
 fn acpidEntry() callconv(.c) noreturn {
     const sched = @import("proc/sched.zig");
     const sci = @import("acpi/sci.zig");
@@ -847,6 +870,13 @@ fn acpidEntry() callconv(.c) noreturn {
                     _ = aml.runGpeHandler(@intCast(n));
                 }
             }
+        }
+        // A GPE handler that Notify'd a PCI topology change (hotplug) asked for a
+        // rescan; do it here — once — outside the AML interpreter's call stack.
+        if (pci_rescan_requested) {
+            pci_rescan_requested = false;
+            const added = @import("driver/pci.zig").rescan();
+            if (added != 0) debug.klog("[acpid] PCI hotplug: {d} new device(s) online\n", .{added});
         }
         // One-time GPE dispatch self-test, once boot has settled (Slice C).
         if (!did_selftest) {

@@ -1253,6 +1253,17 @@ fn execWhile(r: *Reader, st: *ExecState) void {
     r.pos = pkg_end;
 }
 
+/// Hook invoked for every executed Notify(object, value). The integrator
+/// (main.zig) registers one to react to ACPI device notifications without this
+/// leaf AML module having to know about drivers: PCI hotplug (Bus/Device Check
+/// 0x00/0x01, Eject 0x03 → pci.rescan), thermal/battery (0x80, Slice D), etc.
+/// Runs in acpid thread context (Notify only executes inside a GPE handler).
+pub const NotifyFn = *const fn (obj_path: []const u8, value: u64) void;
+var notify_hook: ?NotifyFn = null;
+pub fn setNotifyHook(f: NotifyFn) void {
+    notify_hook = f;
+}
+
 fn execNotify(r: *Reader, st: *ExecState) void {
     _ = r.next(); // NotifyOp: NotifyObject NotifyValue
     const obj_op = r.peek(0) orelse return;
@@ -1264,7 +1275,9 @@ fn execNotify(r: *Reader, st: *ExecState) void {
         _ = evalTermArg(r, st); // Local/Arg holding a reference
     }
     const val = evalTermArg(r, st) orelse .uninit;
-    debug.klog("[aml] Notify({s}, 0x{X})\n", .{ obj_path, toInt(val) });
+    const v = toInt(val);
+    debug.klog("[aml] Notify({s}, 0x{X})\n", .{ obj_path, v });
+    if (notify_hook) |h| h(obj_path, v);
 }
 
 // --- method invocation ------------------------------------------------------
