@@ -952,6 +952,48 @@ fn resolve(scope: []const u8, ns: NameString) ?*StoredNode {
 
 // --- expression evaluation --------------------------------------------------
 
+/// Consume a SuperName operand (e.g. the Mutex object of Acquire/Release) without
+/// evaluating it — just enough to keep the cursor aligned. Handles the forms a
+/// lock target actually takes: a NameString, or a Local/Arg byte. Returns false
+/// only on truncation/desync so the caller can bail cleanly.
+fn skipSuperName(r: *Reader) bool {
+    const lead = r.peek(0) orelse return false;
+    if (lead >= 0x60 and lead <= 0x6E) { // Local0..7 / Arg0..6
+        _ = r.next();
+        return true;
+    }
+    return readNameString(r) != null;
+}
+
+/// Extended (0x5B-prefixed) opcodes in expression/statement position. The
+/// synchronization ops are modeled as no-ops: acpid runs every GPE/AML handler
+/// serially in a single thread, so a Mutex is always uncontended — Acquire
+/// "succeeds" (returns 0 = no timeout) and Release does nothing. This lets real
+/// firmware methods run *past* their lock: e.g. the PCI-hotplug \_GPE._E01
+/// serializes on \_SB.PCI0.BLCK before touching the controller, then walks the
+/// slots (PCIU/PCID field I/O) and Notifies. Any other extended opcode stays
+/// unmodeled → null so the caller bails cleanly.
+fn evalExtTerm(r: *Reader) ?Value {
+    const ext = r.peek(1) orelse return null;
+    switch (ext) {
+        0x23 => { // AcquireOp SuperName WordData(timeout)
+            _ = r.next(); // 0x5B (ExtOpPrefix)
+            _ = r.next(); // 0x23 (AcquireOp)
+            if (!skipSuperName(r)) return null;
+            _ = r.next(); // timeout lo
+            _ = r.next(); // timeout hi (WordData, a raw literal — not a TermArg)
+            return .{ .integer = 0 }; // 0 ⇒ acquired, no timeout
+        },
+        0x27 => { // ReleaseOp SuperName
+            _ = r.next(); // 0x5B (ExtOpPrefix)
+            _ = r.next(); // 0x27 (ReleaseOp)
+            if (!skipSuperName(r)) return null;
+            return .uninit;
+        },
+        else => return null, // unmodeled extended op — bail cleanly
+    }
+}
+
 fn evalTermArg(r: *Reader, st: *ExecState) ?Value {
     const op = r.peek(0) orelse return null;
     switch (op) {
@@ -971,6 +1013,7 @@ fn evalTermArg(r: *Reader, st: *ExecState) ?Value {
         },
         0x78 => return evalDivide(r, st),
         0x75, 0x76 => return evalIncDec(r, st, op),
+        0x5B => return evalExtTerm(r), // extended opcodes (Acquire/Release/…)
         else => {
             if (binLookup(op)) |bi| return evalBinary(r, st, bi);
             if (unLookup(op)) |ui| return evalUnary(r, st, ui);
