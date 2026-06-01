@@ -2015,17 +2015,27 @@ pub fn reportDevices() u32 {
 
         debug.klog("[acpi]   {s}", .{path});
 
-        // _HID (PNP/ACPI id) — integer EISAID or string; fall back to _ADR.
+        // _HID (PNP/ACPI id) — integer EISAID or string; captured into idbuf for
+        // the role lookup below. Falls back to _ADR for resource-only PCI slots.
+        var idbuf: [16]u8 = undefined;
+        var idlen: usize = 0;
         if (evalDeviceChild(path, "_HID")) |v| {
             switch (v) {
                 .integer => |iv| {
                     var hid: [7]u8 = undefined;
                     eisaIdToString(@truncate(iv), &hid);
-                    debug.klog("  {s}", .{&hid});
+                    @memcpy(idbuf[0..7], &hid);
+                    idlen = 7;
                 },
-                .string => |s| debug.klog("  {s}", .{s}),
-                else => debug.klog("  ----", .{}),
+                .string => |s| {
+                    idlen = @min(s.len, idbuf.len);
+                    @memcpy(idbuf[0..idlen], s[0..idlen]);
+                },
+                else => {},
             }
+        }
+        if (idlen > 0) {
+            debug.klog("  {s}", .{idbuf[0..idlen]});
         } else if (evalDeviceChild(path, "_ADR")) |v| {
             if (v == .integer) debug.klog("  _ADR=0x{X}", .{v.integer}) else debug.klog("  ----", .{});
         } else {
@@ -2045,6 +2055,11 @@ pub fn reportDevices() u32 {
             }
         }
 
+        // Slice G: the kernel role/driver that claims this _HID, when known.
+        if (idlen > 0) {
+            if (roleForId(idbuf[0..idlen])) |role| debug.klog("  -> {s}", .{role});
+        }
+
         // _CRS decoded resources, inline.
         if (evalDeviceChild(path, "_CRS")) |v| {
             if (v == .buffer) _ = printCrsResources(v.buffer);
@@ -2060,6 +2075,179 @@ pub fn reportDevices() u32 {
         debug.klog("[acpi] {d} device(s) present\n", .{shown});
     }
     return shown;
+}
+
+// === Slice G: ACPI device → kernel-driver binding ===========================
+// Slice F lists what hardware ACPI *describes*; this maps each device's _HID/_CID
+// to the kernel role that drives it, and exposes findByHid() so a consumer can
+// pull a device's I/O base / IRQ / MMIO from ACPI instead of hardcoding it. Most
+// legacy drivers init *before* the AML namespace exists, so the namespace's job
+// here is discovery + validation + late-binding (hotplug / EC / thermal);
+// crossCheckBindings() proves the data is correct by agreeing with the values the
+// kernel independently runs on — the same two-decoders-one-verdict idiom as the
+// \_S5_ static-scan-vs-AML-eval check.
+
+const HidRole = struct { id: []const u8, role: []const u8 };
+
+/// Known PNP/ACPI/vendor ids → the kernel role/driver that claims them. Matched
+/// against both _HID and _CID; first hit wins.
+const hid_roles = [_]HidRole{
+    .{ .id = "PNP0A08", .role = "pcie-host" },
+    .{ .id = "PNP0A03", .role = "pci-host" },
+    .{ .id = "PNP0A06", .role = "acpi-container" },
+    .{ .id = "PNP0A05", .role = "acpi-bus" },
+    .{ .id = "PNP0C0F", .role = "pci-link" },
+    .{ .id = "PNP0C01", .role = "system-board" },
+    .{ .id = "PNP0103", .role = "hpet" },
+    .{ .id = "PNP0303", .role = "ps2-kbd" },
+    .{ .id = "PNP0F13", .role = "ps2-mouse" },
+    .{ .id = "PNP0501", .role = "uart-16550" },
+    .{ .id = "PNP0400", .role = "parallel" },
+    .{ .id = "PNP0B00", .role = "rtc-cmos" },
+    .{ .id = "ACPI0010", .role = "cpu-container" },
+    .{ .id = "ACPI0003", .role = "ac-adapter" },
+    .{ .id = "PNP0C0A", .role = "battery" },
+    .{ .id = "QEMU0002", .role = "fw-cfg" },
+};
+
+fn roleForId(id: []const u8) ?[]const u8 {
+    for (hid_roles) |hr| {
+        if (std.mem.eql(u8, hr.id, id)) return hr.role;
+    }
+    return null;
+}
+
+/// First-of-each decoded resource from a device's _CRS — what a driver needs to
+/// claim the hardware.
+pub const DevResources = struct {
+    io_base: ?u16 = null,
+    irq: ?u8 = null,
+    mem_base: ?u64 = null,
+};
+
+/// Scan a _CRS buffer for the first I/O base, IRQ and memory base (best-effort,
+/// bounds-checked) — the structured counterpart of printCrsResources.
+fn extractCrs(buf: []const u8) DevResources {
+    var out = DevResources{};
+    var i: usize = 0;
+    while (i < buf.len) {
+        const tag = buf[i];
+        if (tag & 0x80 == 0) {
+            const dlen: usize = @as(usize, tag) & 0x07;
+            const rtype: u8 = (tag >> 3) & 0x0F;
+            const ds = i + 1;
+            if (ds + dlen > buf.len) return out;
+            const d = buf[ds .. ds + dlen];
+            switch (rtype) {
+                0x04 => if (out.irq == null and d.len >= 2) { // IRQ mask → lowest set line
+                    const mask = leU16(d, 0);
+                    var b: u32 = 0;
+                    while (b < 16) : (b += 1) {
+                        if (mask & (@as(u16, 1) << @as(u4, @intCast(b))) != 0) {
+                            out.irq = @intCast(b);
+                            break;
+                        }
+                    }
+                },
+                0x08 => if (out.io_base == null and d.len >= 7) {
+                    out.io_base = leU16(d, 1);
+                },
+                0x09 => if (out.io_base == null and d.len >= 3) {
+                    out.io_base = leU16(d, 0);
+                },
+                0x0F => return out, // End Tag
+                else => {},
+            }
+            i = ds + dlen;
+        } else {
+            if (i + 3 > buf.len) return out;
+            const rtype: u8 = tag & 0x7F;
+            const dlen: usize = @as(usize, buf[i + 1]) | (@as(usize, buf[i + 2]) << 8);
+            const ds = i + 3;
+            if (ds + dlen > buf.len) return out;
+            const d = buf[ds .. ds + dlen];
+            switch (rtype) {
+                0x06 => if (out.mem_base == null and d.len >= 9) {
+                    out.mem_base = leU32(d, 1);
+                },
+                0x09 => if (out.irq == null and d.len >= 6) {
+                    out.irq = @truncate(leU32(d, 2)); // Extended IRQ: first listed line
+                },
+                else => {},
+            }
+            i = ds + dlen;
+        }
+    }
+    return out;
+}
+
+fn idMatches(v: Value, id: []const u8) bool {
+    switch (v) {
+        .integer => |iv| {
+            var s: [7]u8 = undefined;
+            eisaIdToString(@truncate(iv), &s);
+            return std.mem.eql(u8, &s, id);
+        },
+        .string => |s| return std.mem.eql(u8, s, id),
+        else => return false,
+    }
+}
+
+fn deviceMatchesId(path: []const u8, id: []const u8) bool {
+    if (evalDeviceChild(path, "_HID")) |v| {
+        if (idMatches(v, id)) return true;
+    }
+    if (evalDeviceChild(path, "_CID")) |v| {
+        if (idMatches(v, id)) return true;
+    }
+    return false;
+}
+
+/// Find the first *present* device whose _HID or _CID equals `id` and return its
+/// decoded _CRS resources (null if none present). The consumption API: a driver
+/// or late-binder pulls its I/O base / IRQ / MMIO from ACPI rather than hardcoding
+/// it. `id` is a 7-char EISA id like "PNP0501" or a vendor string like "QEMU0002".
+pub fn findByHid(id: []const u8) ?DevResources {
+    var i: usize = 0;
+    while (i < nnodes) : (i += 1) {
+        const n = &nodes[i];
+        if (n.kind != .device) continue;
+        const path = n.path[0..n.path_len];
+        var sta: u64 = 0x0F;
+        if (evalDeviceChild(path, "_STA")) |v| {
+            if (v == .integer) sta = v.integer;
+        }
+        if (sta & 0x01 == 0) continue;
+        if (!deviceMatchesId(path, id)) continue;
+        if (evalDeviceChild(path, "_CRS")) |v| {
+            if (v == .buffer) return extractCrs(v.buffer);
+        }
+        return DevResources{}; // matched, but defines no _CRS
+    }
+    return null;
+}
+
+/// Slice G proof: cross-check a few enumerated legacy-device resources against
+/// the values the kernel independently knows — proving the namespace yields
+/// correct, consumable resource data.
+fn crossCheckBindings() void {
+    if (findByHid("PNP0501")) |r| { // COM1 → 16550 UART
+        const iob = r.io_base orelse 0;
+        debug.klog("[acpi] bind uart-16550: ACPI COM1 io 0x{X} irq {d} ({s} 0x3F8)\n", .{ iob, r.irq orelse 0, if (iob == 0x3F8) "matches" else "DIFFERS from" });
+    }
+    if (findByHid("PNP0103")) |r| { // HPET: namespace _CRS vs the static HPET table
+        const ns = r.mem_base orelse 0;
+        if (acpi.getHpet()) |h| {
+            const tbl: u64 = h.address.address;
+            debug.klog("[acpi] bind hpet: namespace _CRS 0x{X} vs HPET table 0x{X} ({s})\n", .{ ns, tbl, if (ns == tbl) "MATCH" else "MISMATCH" });
+        } else {
+            debug.klog("[acpi] bind hpet: namespace _CRS 0x{X} (no HPET table)\n", .{ns});
+        }
+    }
+    if (findByHid("PNP0303")) |r| { // PS/2 keyboard → legacy IRQ 1
+        const irq = r.irq orelse 0;
+        debug.klog("[acpi] bind ps2-kbd: ACPI irq {d} ({s} 1)\n", .{ irq, if (irq == 1) "matches" else "DIFFERS from" });
+    }
 }
 
 // --- entry point ------------------------------------------------------------
@@ -2187,5 +2375,9 @@ pub fn load() u32 {
     // _HID/_CID + _CRS resources — ACPI as the platform's device manager, run
     // against QEMU's real q35 DSDT (COM/PS2/RTC/HPET/PCI-root all carry _CRS).
     _ = reportDevices();
+
+    // Slice G proof: the enumerated _HIDs map to kernel roles (shown above), and
+    // a few legacy resources cross-check against what the kernel independently runs.
+    crossCheckBindings();
     return node_count;
 }
