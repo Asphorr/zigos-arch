@@ -75,6 +75,18 @@ const HID_PROTOCOL_MOUSE = 2;
 const USB_CLASS_MSC = 8;
 const MSC_SUBCLASS_SCSI = 6;
 const MSC_PROTOCOL_BOT = 0x50; // Bulk-Only Transport
+const MSC_PROTOCOL_UAS = 0x62; // USB Attached SCSI
+
+// UAS descriptors + pipe roles (UAS spec §4). Each UAS bulk endpoint is
+// followed by a Pipe Usage Descriptor binding it to one of four logical
+// pipes; on SuperSpeed a SuperSpeed Endpoint Companion descriptor carries
+// bMaxStreams (the number of streams = 2^bMaxStreams).
+const DESC_PIPE_USAGE = 0x24; // class-specific endpoint descriptor
+const DESC_SS_EP_COMPANION = 0x30; // SuperSpeed endpoint companion
+const UAS_PIPE_COMMAND = 1; // bulk OUT — Command IUs
+const UAS_PIPE_STATUS = 2; // bulk IN  — Status/Sense IUs (streamed)
+const UAS_PIPE_DATA_IN = 3; // bulk IN  — read data (streamed)
+const UAS_PIPE_DATA_OUT = 4; // bulk OUT — write data (streamed)
 
 // USB request types
 const REQ_GET_DESCRIPTOR = 6;
@@ -112,6 +124,30 @@ const DeviceSlot = struct {
 };
 
 var devices: [MAX_DEVICES]DeviceSlot = [_]DeviceSlot{.{}} ** MAX_DEVICES;
+
+// Single detected UAS device. UAS keeps its own state (4 logical pipes +
+// stream count) separate from the BOT DeviceSlot path: a UAS device is NOT
+// added to devices[] (it isn't HID and its bulk endpoints are streamed, so
+// pollHID / mscScsiCommand must not touch it). Filled by enumerateDevice
+// (Slice U1 = detection); the stream endpoints + transport land in U2/U3.
+const UasInfo = struct {
+    present: bool = false,
+    slot_id: u8 = 0,
+    port: u8 = 0,
+    speed: u8 = 0,
+    dev_ctx_phys: usize = 0,
+    alt: u8 = 0, // UAS alternate interface setting
+    cmd_ep: u8 = 0, // bulk OUT — command pipe (no streams)
+    cmd_mp: u16 = 0,
+    status_ep: u8 = 0, // bulk IN — status pipe (streamed)
+    status_mp: u16 = 0,
+    in_ep: u8 = 0, // bulk IN — data-in pipe (streamed)
+    in_mp: u16 = 0,
+    out_ep: u8 = 0, // bulk OUT — data-out pipe (streamed)
+    out_mp: u16 = 0,
+    max_streams: u8 = 0, // 2^bMaxStreams from the SS companion (0 = no streams)
+};
+var uas_dev: UasInfo = .{};
 
 // Per-device lock for the MSC bulk-transport path. mscScsiCommand shares
 // dev.data_phys (CBW@0/data@512/CSW@1024) + the device's bulk in/out rings,
@@ -835,8 +871,8 @@ fn enumerateDevice(port: u8, speed: u8) void {
     debug.klog("[xhci] Device: class={d} configs={d}\n", .{ dev_class, num_configs });
 
     // Step 5: GET_DESCRIPTOR (Configuration Descriptor)
-    var config_buf: [128]u8 = [_]u8{0} ** 128;
-    if (!controlTransfer(&ep0_ring, slot_id, 0x80, REQ_GET_DESCRIPTOR, (DESC_CONFIGURATION << 8), 0, &config_buf, 128)) {
+    var config_buf: [256]u8 = [_]u8{0} ** 256;
+    if (!controlTransfer(&ep0_ring, slot_id, 0x80, REQ_GET_DESCRIPTOR, (DESC_CONFIGURATION << 8), 0, &config_buf, 256)) {
         debug.klog("[xhci] GET_DESCRIPTOR (config) failed\n", .{});
         return;
     }
@@ -865,17 +901,41 @@ fn enumerateDevice(port: u8, speed: u8) void {
     var bulk_out_addr: u8 = 0;
     var bulk_out_max_packet: u16 = 0;
 
+    // UAS (USB Attached SCSI) detection state. A UAS interface advertises
+    // protocol 0x62; its four bulk endpoints are each bound to a logical
+    // pipe by a following Pipe Usage Descriptor, and (on SuperSpeed) carry a
+    // companion descriptor with the stream count.
+    var is_uas = false;
+    var cur_iface_uas = false; // are we inside the UAS interface right now?
+    var uas_alt: u8 = 0;
+    var uas_cmd_ep: u8 = 0;
+    var uas_cmd_mp: u16 = 0;
+    var uas_status_ep: u8 = 0;
+    var uas_status_mp: u16 = 0;
+    var uas_in_ep: u8 = 0;
+    var uas_in_mp: u16 = 0;
+    var uas_out_ep: u8 = 0;
+    var uas_out_mp: u16 = 0;
+    var uas_max_streams: u8 = 0;
+    // The most recent endpoint seen inside the UAS interface, so the Pipe
+    // Usage Descriptor that follows can bind it to a role.
+    var last_ep_addr: u8 = 0;
+    var last_ep_mp: u16 = 0;
+
     var offset: u16 = 0;
-    const parse_len = @min(total_len, 128);
+    const parse_len = @min(total_len, 256);
     while (offset + 2 <= parse_len) {
         const dlen = config_buf[offset];
         const dtype = config_buf[offset + 1];
         if (dlen == 0) break;
 
         if (dtype == DESC_INTERFACE and offset + 9 <= parse_len) {
+            const ialt = config_buf[offset + 3];
             const iclass = config_buf[offset + 5];
             const isubclass = config_buf[offset + 6];
             const iprotocol = config_buf[offset + 7];
+            // A new interface descriptor ends any prior interface's UAS scope.
+            cur_iface_uas = false;
             if (iclass == USB_CLASS_HID) {
                 if (isubclass == HID_SUBCLASS_BOOT and iprotocol == HID_PROTOCOL_KEYBOARD) {
                     is_kbd = true;
@@ -888,9 +948,16 @@ fn enumerateDevice(port: u8, speed: u8) void {
                     is_tablet = true;
                     debug.klog("[xhci] Found HID Tablet/Pointer\n", .{});
                 }
-            } else if (iclass == USB_CLASS_MSC and isubclass == MSC_SUBCLASS_SCSI and iprotocol == MSC_PROTOCOL_BOT) {
-                is_msc = true;
-                debug.klog("[xhci] Found USB Mass Storage (SCSI BOT)\n", .{});
+            } else if (iclass == USB_CLASS_MSC and isubclass == MSC_SUBCLASS_SCSI) {
+                if (iprotocol == MSC_PROTOCOL_BOT) {
+                    is_msc = true;
+                    debug.klog("[xhci] Found USB Mass Storage (SCSI BOT)\n", .{});
+                } else if (iprotocol == MSC_PROTOCOL_UAS) {
+                    is_uas = true;
+                    cur_iface_uas = true;
+                    uas_alt = ialt;
+                    debug.klog("[xhci] Found USB Attached SCSI (UAS), alt={d}\n", .{ialt});
+                }
             }
         }
 
@@ -901,7 +968,14 @@ fn enumerateDevice(port: u8, speed: u8) void {
             const ep_type = ep_attr & 0x03;
             const ep_dir_in = (ep_addr & 0x80) != 0;
 
-            if (ep_type == 0x03 and ep_dir_in) { // Interrupt IN
+            if (cur_iface_uas) {
+                // Inside the UAS interface: stash this endpoint so the Pipe
+                // Usage Descriptor that follows binds it to a role. Don't
+                // touch bulk_in/out — those drive the (separate) BOT path so
+                // a UAS-only device never accidentally lights up is_msc.
+                last_ep_addr = ep_addr;
+                last_ep_mp = ep_max;
+            } else if (ep_type == 0x03 and ep_dir_in) { // Interrupt IN
                 intr_ep_addr = ep_addr;
                 intr_ep_max_packet = ep_max;
                 intr_ep_interval = config_buf[offset + 6];
@@ -919,12 +993,75 @@ fn enumerateDevice(port: u8, speed: u8) void {
             }
         }
 
+        // UAS Pipe Usage Descriptor (follows each UAS endpoint): bPipeID at
+        // +2 binds the most-recent endpoint to a logical pipe.
+        if (cur_iface_uas and dtype == DESC_PIPE_USAGE and offset + 3 <= parse_len) {
+            switch (config_buf[offset + 2]) {
+                UAS_PIPE_COMMAND => {
+                    uas_cmd_ep = last_ep_addr;
+                    uas_cmd_mp = last_ep_mp;
+                },
+                UAS_PIPE_STATUS => {
+                    uas_status_ep = last_ep_addr;
+                    uas_status_mp = last_ep_mp;
+                },
+                UAS_PIPE_DATA_IN => {
+                    uas_in_ep = last_ep_addr;
+                    uas_in_mp = last_ep_mp;
+                },
+                UAS_PIPE_DATA_OUT => {
+                    uas_out_ep = last_ep_addr;
+                    uas_out_mp = last_ep_mp;
+                },
+                else => {},
+            }
+        }
+
+        // SuperSpeed Endpoint Companion (follows each SS endpoint): bMaxStreams
+        // in the low 5 bits of bmAttributes (+3) → stream count = 2^bMaxStreams.
+        if (cur_iface_uas and dtype == DESC_SS_EP_COMPANION and offset + 4 <= parse_len) {
+            const bmax = config_buf[offset + 3] & 0x1F;
+            if (bmax > uas_max_streams) uas_max_streams = bmax;
+        }
+
         offset += dlen;
     }
 
-    if (!is_kbd and !is_mouse and !is_tablet and !is_msc) {
+    if (!is_kbd and !is_mouse and !is_tablet and !is_msc and !is_uas) {
         debug.klog("[xhci] Unknown device class, skipping\n", .{});
         return;
+    }
+
+    // UAS detected (Slice U1 = detection only). Record the pipe map + stream
+    // count for the stream setup + IU transport that land in U2/U3. The
+    // device is NOT added to devices[] and its endpoints are NOT yet
+    // configured, so it stays inert for now. We fall through rather than
+    // return: a hybrid device that also exposes a BOT alt-setting still gets
+    // its BOT endpoints configured below as a working fallback.
+    if (is_uas) {
+        uas_dev = .{
+            .present = true,
+            .slot_id = slot_id,
+            .port = port,
+            .speed = speed,
+            .dev_ctx_phys = dev_ctx_phys,
+            .alt = uas_alt,
+            .cmd_ep = uas_cmd_ep,
+            .cmd_mp = uas_cmd_mp,
+            .status_ep = uas_status_ep,
+            .status_mp = uas_status_mp,
+            .in_ep = uas_in_ep,
+            .in_mp = uas_in_mp,
+            .out_ep = uas_out_ep,
+            .out_mp = uas_out_mp,
+            .max_streams = uas_max_streams,
+        };
+        const nstreams: u32 = if (uas_max_streams == 0)
+            0
+        else
+            (@as(u32, 1) << @as(u5, @truncate(uas_max_streams)));
+        debug.klog("[xhci] UAS pipes: cmd=0x{x} status=0x{x} data-in=0x{x} data-out=0x{x}\n", .{ uas_cmd_ep, uas_status_ep, uas_in_ep, uas_out_ep });
+        debug.klog("[xhci] UAS streams: bMaxStreams={d} ({d} streams), speed={d}{s}, slot={d}\n", .{ uas_max_streams, nstreams, speed, if (speed == SPEED_SUPER) " SuperSpeed" else "", slot_id });
     }
 
     // HID-specific setup
@@ -1275,6 +1412,39 @@ fn mscScsiCommand(dev_idx: u8, cdb: []const u8, cdb_len: u8, data: ?[*]u8, data_
     }
 
     return true;
+}
+
+/// True if a UAS device was detected during enumeration.
+pub fn uasPresent() bool {
+    return uas_dev.present;
+}
+
+/// Report the detected UAS device (Slice U1 = detection). Pub so the `uas`
+/// CLI command and later slices can query it. Logs the pipe map + stream
+/// count; klog tees to the VGA console so this prints from the shell.
+pub fn uasReport() void {
+    if (!uas_dev.present) {
+        debug.klog("[uas] no UAS device detected on the USB bus\n", .{});
+        return;
+    }
+    const d = uas_dev;
+    const nstreams: u32 = if (d.max_streams == 0)
+        0
+    else
+        (@as(u32, 1) << @as(u5, @truncate(d.max_streams)));
+    debug.klog("[uas] device: slot {d}, port {d}, speed {d}{s}, UAS alt-setting {d}\n", .{
+        d.slot_id, d.port + 1, d.speed,
+        if (d.speed == SPEED_SUPER) " (SuperSpeed)" else "",
+        d.alt,
+    });
+    debug.klog("[uas]   pipes: cmd ep0x{x} | status ep0x{x} | data-in ep0x{x} | data-out ep0x{x}\n", .{
+        d.cmd_ep, d.status_ep, d.in_ep, d.out_ep,
+    });
+    debug.klog("[uas]   streams: bMaxStreams={d} -> {d} stream(s){s}\n", .{
+        d.max_streams, nstreams,
+        if (nstreams == 0) "  (no streams — device not at SuperSpeed)" else "",
+    });
+    debug.klog("[uas]   transport: pending (U2 stream contexts / U3 IU flow not yet implemented)\n", .{});
 }
 
 /// Read `count` sectors starting at `lba` into `buf`. mscScsiCommand uses
