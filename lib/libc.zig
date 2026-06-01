@@ -1591,6 +1591,21 @@ pub fn tcpStatus(fd: u32) u32 {
     return syscall(74, fd, 0);
 }
 
+/// Fill `buf` with cryptographically-secure random bytes from the kernel
+/// CSPRNG (RDRAND/RDSEED-backed; syscall #120). Single call fills the whole
+/// buffer. Returns true on success, false on a rejected pointer/length.
+pub fn getRandom(buf: []u8) bool {
+    if (buf.len == 0) return true;
+    if (buf.len > (1 << 20)) return false;
+    const result = syscall(
+        120,
+        @truncate(@intFromPtr(buf.ptr)),
+        @intCast(buf.len),
+    );
+    if (isErr(result)) return false;
+    return result == buf.len;
+}
+
 /// Bind a server-side TCP socket to `port`. Returns a listener fd or null
 /// on failure (port in use, listener pool full).
 pub fn tcpListen(port: u16) ?u32 {

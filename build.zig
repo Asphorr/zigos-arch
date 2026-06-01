@@ -346,6 +346,17 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // MTProto client library (tl/ige/factorize/rsa_pad/transport). The pure
+    // crypto is zig-test'd off-target; transport/auth are the live pieces.
+    const mtproto_mod = b.createModule(.{
+        .root_source_file = b.path("lib/mtproto/mtproto.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "libc", .module = libc_mod },
+        },
+    });
+
     // Helper to create a user-space app executable
     const gui_imports: []const std.Build.Module.Import = &.{
         .{ .name = "libc", .module = libc_mod },
@@ -356,6 +367,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "http", .module = http_mod },
         .{ .name = "json", .module = json_mod },
         .{ .name = "weather", .module = weather_mod },
+        .{ .name = "mtproto", .module = mtproto_mod },
     };
 
     // --- 2. USER APPS ---
@@ -439,6 +451,10 @@ pub fn build(b: *std.Build) void {
         .{ "netstat.elf", "app/netstat.zig" },
         .{ "httpsget.elf", "app/httpsget.zig" },
         .{ "curl.elf", "app/curl.zig" },
+        .{ "rndtest.elf", "app/rndtest.zig" },
+        // tgmt.elf is built separately below — it links the truetype static
+        // lib + a bundled Cyrillic font for its GUI (the shared gui_imports
+        // tuple carries neither).
         .{ "jq.elf", "app/jq.zig" },
         .{ "wx.elf", "app/wx.zig" },
         .{ "weather.elf", "app/weather.zig" },
@@ -713,10 +729,49 @@ pub fn build(b: *std.Build) void {
 
     // Force the static library to actually build even before the first
     // consumer comes online — catches C compilation issues now rather
-    // than at first-use. The .a file gets installed but no app links it
-    // yet; remove this once the VN engine wires it up via linkLibrary.
+    // than at first-use.
     b.installArtifact(truetype_lib);
-    _ = truetype_mod; // suppress unused-var; first VN-engine consumer will reference it
+
+    // --- TGMT (MTProto Telegram client) — first truetype consumer ---
+    //
+    // Pulled out of the gui_apps loop because its GUI renders real Cyrillic
+    // contact names / messages, which the ASCII-only SF Pro atlas can't do.
+    // It rasterizes a bundled DejaVu Sans TTF on the fly (lib/ttf_text.zig
+    // over stb_truetype) and links the truetype static lib for that.
+    const tg_font_mod = b.createModule(.{
+        .root_source_file = b.path("lib/tg_font.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const ttf_text_mod = b.createModule(.{
+        .root_source_file = b.path("lib/ttf_text.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "truetype", .module = truetype_mod },
+            .{ .name = "graphics", .module = graphics_mod },
+        },
+    });
+    const tgmt_exe = b.addExecutable(.{
+        .name = "tgmt.elf",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("app/tgmt.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "libc", .module = libc_mod },
+                .{ .name = "graphics", .module = graphics_mod },
+                .{ .name = "ui", .module = ui_mod },
+                .{ .name = "font_atlas", .module = font_atlas_mod },
+                .{ .name = "mtproto", .module = mtproto_mod },
+                .{ .name = "ttf_text", .module = ttf_text_mod },
+                .{ .name = "tg_font", .module = tg_font_mod },
+            },
+        }),
+    });
+    tgmt_exe.setLinkerScript(b.path("app/linker.ld"));
+    tgmt_exe.linkLibrary(truetype_lib);
+    b.installArtifact(tgmt_exe);
 
     // --- STB_VORBIS — vendored 2026-05-28 for the VN-engine BGM path ---
     //

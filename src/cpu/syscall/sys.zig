@@ -23,6 +23,7 @@ const signals = @import("../../proc/signals.zig");
 const errno = @import("../../proc/errno.zig");
 const sched_asm = @import("../../proc/sched_asm.zig");
 const apic = @import("../../time/apic.zig");
+const random = @import("../../crypto/random.zig");
 
 const common = @import("common.zig");
 const validateUserPtr = common.validateUserPtr;
@@ -52,6 +53,19 @@ pub fn sysAudioWrite(buf_ptr: u32, num_samples: u32) u32 {
     const src: [*]const i16 = @ptrFromInt(@as(usize, buf_ptr));
     sound.writeSamples(src, num_samples);
     return 0;
+}
+
+/// getrandom(buf, len) — fill a user buffer with cryptographically-secure
+/// bytes from the kernel CSPRNG (RDRAND/RDSEED-backed; crypto/random.zig).
+/// Returns the byte count on success, E_FAULT on a bad pointer, E_INVAL on
+/// an absurd length. A single call fills the whole range.
+pub fn sysGetRandom(buf_ptr: u32, len: u32) u32 {
+    if (len == 0) return 0;
+    if (len > (1 << 20)) return E_INVAL; // 1 MiB sanity cap
+    if (!validateUserPtr(buf_ptr, len)) return E_FAULT;
+    const dst: [*]u8 = @ptrFromInt(@as(usize, buf_ptr));
+    _ = random.fillRandom(dst[0..len]);
+    return len;
 }
 
 pub fn sysSetConfig(key: u32, value: u32) u32 {
