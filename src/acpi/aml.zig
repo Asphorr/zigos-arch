@@ -46,6 +46,7 @@ pub const Value = union(enum) {
     string: []const u8, // points into the DSDT body (no copy)
     buffer: []const u8,
     package: []const Value,
+    name_ref: [4]u8, // a NamePath used as data (e.g. a _PRT source link) — its last NameSeg
 };
 
 // --- Namespace object kinds -------------------------------------------------
@@ -736,12 +737,12 @@ fn evalData(r: *Reader) ?Value {
             return .{ .package = elems };
         },
         else => {
-            // A NameString reference or unmodeled expression used as data (e.g.
-            // a Package element naming another object). Consume a NameString if
-            // that's what it is so the surrounding Package stays in sync; the
-            // referenced value is left unresolved (B2b resolves references).
+            // A NameString reference used as data (e.g. a _PRT entry's source
+            // naming a PCI interrupt-link device). Capture its last NameSeg so
+            // consumers can resolve the reference; non-name leads are unmodeled.
             if (isNameLead(op)) {
-                _ = readNameString(r) orelse return null;
+                const ns = readNameString(r) orelse return null;
+                if (ns.nsegs > 0) return .{ .name_ref = ns.segs[ns.nsegs - 1] };
                 return .uninit;
             }
             return null;
@@ -1322,6 +1323,15 @@ pub fn evalMethod(abs: []const u8) ?Value {
     if (n.kind != .method) return null;
     arenaReset();
     return callMethod(n, &.{}, 0);
+}
+
+/// Like evalMethod but passes one argument — e.g. _PIC(1) to tell the firmware we
+/// use the IOAPIC, so _PRT yields GSI (not 8259 IRQ) routing.
+pub fn evalMethodArg1(abs: []const u8, arg: Value) ?Value {
+    const n = findExact(abs) orelse return null;
+    if (n.kind != .method) return null;
+    arenaReset();
+    return callMethod(n, &.{arg}, 0);
 }
 
 /// Find the AML handler method for GPE bit `n` of block 0: `\_GPE._E<nn>` (edge)
@@ -2250,6 +2260,164 @@ fn crossCheckBindings() void {
     }
 }
 
+// === Slice H: PCI interrupt routing from _PRT ===============================
+// \_SB.PCI0._PRT maps each PCI device's INTx pin to an interrupt source: either a
+// GSI directly (integer source) or — on q35 — a reference to a PCI interrupt
+// *link* device (GSIx in APIC mode, LNKx in PIC mode) whose _CRS carries the GSI.
+// This builds that routing table (selecting APIC mode via _PIC first), resolves
+// each link through a seg→GSI map, and caches it so gsiForPciPin() can hand the
+// kernel's PCI/IOAPIC code the GSI for a legacy INTx interrupt — sourced from
+// ACPI instead of guessed. ACPI 6.4 §6.2.13 (_PRT), §6.2.9 (link _PRS/_CRS).
+
+const PrtRoute = struct { dev: u8, pin: u8, gsi: u32 };
+var prt_routes: [160]PrtRoute = undefined;
+var prt_nroutes: usize = 0;
+
+// seg→GSI map for interrupt-link devices, built once *before* the _PRT package is
+// walked (the per-link _CRS evals reset the value arena the package lives in).
+const LinkGsi = struct { seg: [4]u8, gsi: u32 };
+var link_map: [64]LinkGsi = undefined;
+var nlink: usize = 0;
+
+fn pinChar(p: u8) u8 {
+    const idx: u8 = @min(p, 3);
+    return 'A' + idx;
+}
+
+/// The final 4-byte NameSeg of an absolute path (e.g. "\_SB_.GSIA" → "GSIA").
+fn lastSeg(path: []const u8) [4]u8 {
+    var start: usize = 0;
+    var k: usize = path.len;
+    while (k > 0) : (k -= 1) {
+        if (path[k - 1] == '.' or path[k - 1] == '\\') {
+            start = k;
+            break;
+        }
+    }
+    var seg = [4]u8{ '_', '_', '_', '_' };
+    const comp = path[start..];
+    const n = @min(comp.len, 4);
+    @memcpy(seg[0..n], comp[0..n]);
+    return seg;
+}
+
+/// Resolve every device's _CRS IRQ into the seg→GSI map. The interrupt-link
+/// devices (GSIx/LNKx) land here with their routed GSI; other devices' irqs are
+/// harmless (their segs never match a _PRT source). Resets the value arena.
+fn buildLinkMap() void {
+    nlink = 0;
+    var i: usize = 0;
+    while (i < nnodes and nlink < link_map.len) : (i += 1) {
+        const nd = &nodes[i];
+        if (nd.kind != .device) continue;
+        const p = nd.path[0..nd.path_len];
+        if (evalDeviceChild(p, "_CRS")) |v| {
+            if (v == .buffer) {
+                const rr = extractCrs(v.buffer);
+                if (rr.irq) |q| {
+                    link_map[nlink] = .{ .seg = lastSeg(p), .gsi = q };
+                    nlink += 1;
+                }
+            }
+        }
+    }
+}
+
+fn lookupLink(seg: [4]u8) ?u32 {
+    var i: usize = 0;
+    while (i < nlink) : (i += 1) {
+        if (std.mem.eql(u8, &link_map[i].seg, &seg)) return link_map[i].gsi;
+    }
+    return null;
+}
+
+/// Slice H: build the PCI INTx → GSI routing table from \_SB.PCI0._PRT and cache
+/// it for gsiForPciPin(). Returns the number of pins routed.
+pub fn buildPrt() u32 {
+    prt_nroutes = 0;
+    // Announce APIC mode so q35 returns IOAPIC (GSIx) routing, not the 8259 table.
+    _ = evalMethodArg1("\\_PIC", .{ .integer = 1 });
+    buildLinkMap(); // before the _PRT eval — link _CRS evals reset the arena
+
+    arenaReset();
+    const prt = evalMethod("\\_SB_.PCI0._PRT") orelse {
+        debug.klog("[acpi] _PRT: \\_SB_.PCI0._PRT not found\n", .{});
+        return 0;
+    };
+    if (prt != .package) {
+        debug.klog("[acpi] _PRT: not a Package\n", .{});
+        return 0;
+    }
+
+    // Each entry: Package{ Address(DWord: dev<<16 | fn), Pin(0..3), Source, Index }.
+    // Source is a link NameSeg (name_ref) or integer 0 (then Index is the GSI).
+    for (prt.package) |entry| {
+        if (prt_nroutes >= prt_routes.len) break;
+        if (entry != .package or entry.package.len < 4) continue;
+        const e = entry.package;
+        if (e[0] != .integer or e[1] != .integer) continue;
+        const dev: u8 = @truncate(e[0].integer >> 16);
+        const pin: u8 = @truncate(e[1].integer);
+        var gsi: ?u32 = null;
+        switch (e[2]) {
+            .name_ref => |s| gsi = lookupLink(s),
+            .integer => |s| if (s == 0 and e[3] == .integer) {
+                gsi = @truncate(e[3].integer);
+            },
+            else => {},
+        }
+        if (gsi) |g| {
+            prt_routes[prt_nroutes] = .{ .dev = dev, .pin = pin, .gsi = g };
+            prt_nroutes += 1;
+        }
+    }
+
+    debug.klog("[acpi] PCI interrupt routing (\\_SB.PCI0._PRT, {d} entries -> {d} routed):\n", .{ prt.package.len, prt_nroutes });
+    var shown: usize = 0;
+    while (shown < prt_nroutes and shown < 8) : (shown += 1) {
+        const r = prt_routes[shown];
+        debug.klog("[acpi]   00:{X:0>2}.x INT{c} -> gsi {d}\n", .{ r.dev, pinChar(r.pin), r.gsi });
+    }
+    return @intCast(prt_nroutes);
+}
+
+/// The consumption API: the IOAPIC GSI a PCI device's INTx pin routes to per ACPI
+/// _PRT (pin 0=INTA..3=INTD), or null if absent. A driver enabling a legacy INTx
+/// interrupt programs its IOAPIC redirection entry for this GSI.
+pub fn gsiForPciPin(dev: u8, pin: u8) ?u32 {
+    var i: usize = 0;
+    while (i < prt_nroutes) : (i += 1) {
+        if (prt_routes[i].dev == dev and prt_routes[i].pin == pin) return prt_routes[i].gsi;
+    }
+    return null;
+}
+
+/// Join the cached _PRT routing against live PCI config space: for every bus-0
+/// device that declares an INT pin (config 0x3D), show the ACPI-derived GSI — the
+/// load-bearing proof that the routing table maps onto real hardware. Run from the
+/// `acpiprt` CLI (after PCI enumeration has populated the device cache).
+pub fn reportPrtPciJoin() void {
+    const pci = @import("../driver/pci.zig");
+    debug.klog("[acpi] _PRT join with live PCI config (bus 0):\n", .{});
+    var matched: u32 = 0;
+    var pinned: u32 = 0;
+    for (pci.allDevices()) |d| {
+        if (d.bus != 0) continue; // \_SB.PCI0._PRT covers bus 0
+        const il = pci.configRead16(d.bus, d.dev, d.func, 0x3C);
+        const pin_raw: u8 = @truncate(il >> 8); // config 0x3D: 0=none, 1=INTA..4=INTD
+        if (pin_raw == 0 or pin_raw > 4) continue;
+        pinned += 1;
+        const pin = pin_raw - 1;
+        if (gsiForPciPin(d.dev, pin)) |g| {
+            debug.klog("[acpi]   00:{X:0>2}.{d} INT{c} -> gsi {d} (cfg line {d})\n", .{ d.dev, d.func, pinChar(pin), g, il & 0xFF });
+            matched += 1;
+        } else {
+            debug.klog("[acpi]   00:{X:0>2}.{d} INT{c} -> (no _PRT route)\n", .{ d.dev, d.func, pinChar(pin) });
+        }
+    }
+    debug.klog("[acpi] _PRT join: {d}/{d} INTx PCI device(s) matched an ACPI route\n", .{ matched, pinned });
+}
+
 // --- entry point ------------------------------------------------------------
 
 /// Decode the cached DSDT plus every SSDT into one namespace, then run the
@@ -2379,5 +2547,9 @@ pub fn load() u32 {
     // Slice G proof: the enumerated _HIDs map to kernel roles (shown above), and
     // a few legacy resources cross-check against what the kernel independently runs.
     crossCheckBindings();
+
+    // Slice H proof: build the PCI INTx → GSI routing table from \_SB.PCI0._PRT
+    // (selecting APIC mode via _PIC), resolving each link device to its GSI.
+    _ = buildPrt();
     return node_count;
 }
