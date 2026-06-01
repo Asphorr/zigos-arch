@@ -1799,6 +1799,269 @@ pub fn reportBattery() u32 {
     return found;
 }
 
+// === Slice F: ACPI namespace device enumeration =============================
+// The static tables (MADT/FADT/HPET) describe the platform's interrupt + timer
+// topology; the AML namespace describes its *devices*. This walks every Device()
+// object, evaluates its _STA (presence), _HID/_CID (PNP/ACPI id) and _CRS
+// (resource template), and reports each with decoded I/O / IRQ / memory ranges —
+// the data a real OS uses to find and bind drivers (the legacy UART, the EC, the
+// PCI host bridge, HPET, …). Like `acpidump` + iasl's resource decode, but live.
+// Best-effort + bounds-checked: a device whose _CRS needs an unsupported region
+// just lists without resources; a malformed descriptor ends that one device's
+// resource list, never the walk. ACPI 6.4 §6 (device config), §6.4.2/§6.4.3
+// (small/large resource data types), §5.6.4 (EISA-ID compression).
+
+/// Decode a 32-bit EISA/PNP id (the integer form of _HID/_CID) to its 7-char
+/// "PNP0501" / "ACPI0003" string. The stored DWord is byte-swapped, then 3×5-bit
+/// letters ('@'+n, i.e. A=1..Z=26) followed by 4 hex nibbles.
+fn eisaIdToString(v: u32, out: *[7]u8) void {
+    const s = @byteSwap(v);
+    const hex = "0123456789ABCDEF";
+    out[0] = '@' + @as(u8, @intCast((s >> 26) & 0x1F));
+    out[1] = '@' + @as(u8, @intCast((s >> 21) & 0x1F));
+    out[2] = '@' + @as(u8, @intCast((s >> 16) & 0x1F));
+    out[3] = hex[@as(usize, (s >> 12) & 0xF)];
+    out[4] = hex[@as(usize, (s >> 8) & 0xF)];
+    out[5] = hex[@as(usize, (s >> 4) & 0xF)];
+    out[6] = hex[@as(usize, s & 0xF)];
+}
+
+/// Evaluate a stored Name (static data) or no-arg Method (computed) to a Value —
+/// the two forms _HID/_STA/_CRS take in practice. Resets the value arena first.
+fn evalNamedNode(n: *StoredNode) ?Value {
+    arenaReset();
+    switch (n.kind) {
+        .name => {
+            if (n.has_runtime) return n.runtime_val;
+            var rr = Reader{ .buf = bodyOf(n), .pos = n.val_off };
+            return evalData(&rr);
+        },
+        .method => return callMethod(n, &.{}, 0),
+        else => return null,
+    }
+}
+
+/// Evaluate `<dev_path>.<seg>` (e.g. "\_SB_.COM1" + "_HID") if that child object
+/// exists; null when the device doesn't define it.
+fn evalDeviceChild(dev_path: []const u8, seg: []const u8) ?Value {
+    if (dev_path.len + 1 + seg.len > PATH_MAX) return null;
+    var buf: [PATH_MAX]u8 = undefined;
+    @memcpy(buf[0..dev_path.len], dev_path);
+    buf[dev_path.len] = '.';
+    @memcpy(buf[dev_path.len + 1 ..][0..seg.len], seg);
+    const n = findExact(buf[0 .. dev_path.len + 1 + seg.len]) orelse return null;
+    return evalNamedNode(n);
+}
+
+fn leU16(b: []const u8, off: usize) u16 {
+    return @as(u16, b[off]) | (@as(u16, b[off + 1]) << 8);
+}
+fn leU32(b: []const u8, off: usize) u32 {
+    return @as(u32, b[off]) | (@as(u32, b[off + 1]) << 8) |
+        (@as(u32, b[off + 2]) << 16) | (@as(u32, b[off + 3]) << 24);
+}
+
+/// Read a `w`-byte (1/2/4/8) little-endian integer at `off`, clamped to the slice.
+fn leSlice(b: []const u8, off: usize, w: usize) u64 {
+    var v: u64 = 0;
+    var i: usize = 0;
+    while (i < w and off + i < b.len) : (i += 1) v |= @as(u64, b[off + i]) << @intCast(8 * i);
+    return v;
+}
+
+/// Print each IRQ number set in a 16-bit IRQ mask (small IRQ descriptor).
+fn printIrqMask(mask: u16) void {
+    var i: u32 = 0;
+    while (i < 16) : (i += 1) {
+        if (mask & (@as(u16, 1) << @as(u4, @intCast(i))) != 0) debug.klog(" irq {d}", .{i});
+    }
+}
+
+/// Decode a Word/DWord/QWord Address Space descriptor (a bus/io/mem window, as
+/// used by the PCI host bridge _CRS) and print its label + [min, +length). d[0]
+/// is the ResourceType (0=mem,1=io,2=bus); granularity/min/max/translate/length
+/// follow the two flag bytes, each `w` bytes wide. Bounds-checked.
+fn printAddrSpace(rtype: u8, d: []const u8) u32 {
+    if (d.len < 3) return 0;
+    const label: []const u8 = switch (d[0]) {
+        0 => "mem",
+        1 => "io",
+        2 => "bus",
+        else => "win",
+    };
+    const w: usize = switch (rtype) {
+        0x08 => 2, // WordAddressSpace
+        0x0A => 8, // QWordAddressSpace
+        else => 4, // DWordAddressSpace (0x07)
+    };
+    const min_off = 3 + w; // skip granularity (1st integer)
+    const len_off = 3 + 4 * w; // length is the 5th integer
+    if (len_off + w > d.len) return 0;
+    const min = leSlice(d, min_off, w);
+    const len = leSlice(d, len_off, w);
+    debug.klog(" {s} 0x{X}+0x{X}", .{ label, min, len });
+    return 1;
+}
+
+/// Parse a _CRS ResourceTemplate buffer, printing its I/O / IRQ / memory items
+/// inline (continuing the current device's line). Returns the count printed. The
+/// descriptor stream is bounds-checked at every step; the End Tag (or any
+/// truncation) stops the list cleanly. ACPI 6.4 §6.4.
+fn printCrsResources(buf: []const u8) u32 {
+    var count: u32 = 0;
+    var i: usize = 0;
+    while (i < buf.len) {
+        const tag = buf[i];
+        if (tag & 0x80 == 0) {
+            // Small resource: bit7=0, bits6:3 = type, bits2:0 = data length.
+            const dlen: usize = @as(usize, tag) & 0x07;
+            const rtype: u8 = (tag >> 3) & 0x0F;
+            const ds = i + 1;
+            if (ds + dlen > buf.len) return count;
+            const d = buf[ds .. ds + dlen];
+            switch (rtype) {
+                0x04 => { // IRQ Format: 2-byte mask (+ optional 1-byte flags)
+                    if (d.len >= 2) {
+                        printIrqMask(leU16(d, 0));
+                        count += 1;
+                    }
+                },
+                0x08 => { // I/O Port: info, min(2), max(2), align, len
+                    if (d.len >= 7) {
+                        const base = leU16(d, 1);
+                        const len = d[6];
+                        const last = if (len > 0) base +% (@as(u16, len) - 1) else base;
+                        debug.klog(" io 0x{X:0>4}-0x{X:0>4}", .{ base, last });
+                        count += 1;
+                    }
+                },
+                0x09 => { // Fixed Location I/O Port: base(2), len(1)
+                    if (d.len >= 3) {
+                        const base = leU16(d, 0);
+                        const len = d[2];
+                        const last = if (len > 0) base +% (@as(u16, len) - 1) else base;
+                        debug.klog(" io 0x{X:0>4}-0x{X:0>4}", .{ base, last });
+                        count += 1;
+                    }
+                },
+                0x0F => return count, // End Tag
+                else => {}, // DMA / dependent / vendor: skip
+            }
+            i = ds + dlen;
+        } else {
+            // Large resource: bits6:0 = type, then 2-byte length, then data.
+            if (i + 3 > buf.len) return count;
+            const rtype: u8 = tag & 0x7F;
+            const dlen: usize = @as(usize, buf[i + 1]) | (@as(usize, buf[i + 2]) << 8);
+            const ds = i + 3;
+            if (ds + dlen > buf.len) return count;
+            const d = buf[ds .. ds + dlen];
+            switch (rtype) {
+                0x06 => { // 32-bit Fixed Memory: info(1), base(4), len(4)
+                    if (d.len >= 9) {
+                        debug.klog(" mem 0x{X:0>8}+0x{X}", .{ leU32(d, 1), leU32(d, 5) });
+                        count += 1;
+                    }
+                },
+                0x01 => { // 24-bit Memory Range: info(1), min(2), max(2), aln(2), len(2)
+                    if (d.len >= 9) {
+                        debug.klog(" mem 0x{X:0>8}+0x{X}", .{ @as(u32, leU16(d, 1)) << 8, @as(u32, leU16(d, 7)) << 8 });
+                        count += 1;
+                    }
+                },
+                0x09 => { // Extended IRQ: flags(1), count(1), then count × 4-byte IRQ #s
+                    if (d.len >= 2) {
+                        const cnt = d[1];
+                        var k: usize = 0;
+                        while (k < cnt and 2 + k * 4 + 4 <= d.len) : (k += 1) {
+                            debug.klog(" irq {d}", .{leU32(d, 2 + k * 4)});
+                            count += 1;
+                        }
+                    }
+                },
+                0x07, 0x08, 0x0A => count += printAddrSpace(rtype, d), // bus/io/mem window
+                else => {},
+            }
+            i = ds + dlen;
+        }
+    }
+    return count;
+}
+
+/// Slice F: enumerate every present ACPI Device() in the namespace, reporting
+/// _HID/_CID (or _ADR), _STA presence, and decoded _CRS resources. Devices whose
+/// _STA marks them not-present (empty hotplug slots) are counted, not listed.
+/// Returns the present-device count. Public so the `acpidev` CLI and boot path
+/// can list the platform's ACPI-described hardware.
+pub fn reportDevices() u32 {
+    debug.klog("[acpi] ACPI namespace devices (Device + _HID/_CID + _CRS):\n", .{});
+    var shown: u32 = 0;
+    var hidden: u32 = 0;
+    var i: usize = 0;
+    while (i < nnodes) : (i += 1) {
+        const n = &nodes[i];
+        if (n.kind != .device) continue;
+        const path = n.path[0..n.path_len];
+
+        // _STA: absent ⇒ assume present+enabled (0x0F). bit0 clear ⇒ not present.
+        var sta: u64 = 0x0F;
+        if (evalDeviceChild(path, "_STA")) |v| {
+            if (v == .integer) sta = v.integer;
+        }
+        if (sta & 0x01 == 0) {
+            hidden += 1;
+            continue;
+        }
+
+        debug.klog("[acpi]   {s}", .{path});
+
+        // _HID (PNP/ACPI id) — integer EISAID or string; fall back to _ADR.
+        if (evalDeviceChild(path, "_HID")) |v| {
+            switch (v) {
+                .integer => |iv| {
+                    var hid: [7]u8 = undefined;
+                    eisaIdToString(@truncate(iv), &hid);
+                    debug.klog("  {s}", .{&hid});
+                },
+                .string => |s| debug.klog("  {s}", .{s}),
+                else => debug.klog("  ----", .{}),
+            }
+        } else if (evalDeviceChild(path, "_ADR")) |v| {
+            if (v == .integer) debug.klog("  _ADR=0x{X}", .{v.integer}) else debug.klog("  ----", .{});
+        } else {
+            debug.klog("  ----", .{});
+        }
+
+        // _CID (compatible id), shown when it's a single EISAID/string.
+        if (evalDeviceChild(path, "_CID")) |v| {
+            switch (v) {
+                .integer => |iv| {
+                    var cid: [7]u8 = undefined;
+                    eisaIdToString(@truncate(iv), &cid);
+                    debug.klog("/{s}", .{&cid});
+                },
+                .string => |s| debug.klog("/{s}", .{s}),
+                else => {},
+            }
+        }
+
+        // _CRS decoded resources, inline.
+        if (evalDeviceChild(path, "_CRS")) |v| {
+            if (v == .buffer) _ = printCrsResources(v.buffer);
+        }
+
+        debug.klog("\n", .{});
+        shown += 1;
+    }
+    if (shown == 0 and hidden == 0) debug.klog("[acpi]   (no Device() objects in namespace)\n", .{});
+    if (hidden > 0) {
+        debug.klog("[acpi] {d} device(s) present, {d} absent/empty slot(s) hidden\n", .{ shown, hidden });
+    } else {
+        debug.klog("[acpi] {d} device(s) present\n", .{shown});
+    }
+    return shown;
+}
+
 // --- entry point ------------------------------------------------------------
 
 /// Decode the cached DSDT plus every SSDT into one namespace, then run the
@@ -1919,5 +2182,10 @@ pub fn load() u32 {
     // and \_SB.BAT0 are always present; real/-acpitable objects report alongside.
     _ = reportThermal();
     _ = reportBattery();
+
+    // Slice F proof: enumerate the namespace's Device() objects with decoded
+    // _HID/_CID + _CRS resources — ACPI as the platform's device manager, run
+    // against QEMU's real q35 DSDT (COM/PS2/RTC/HPET/PCI-root all carry _CRS).
+    _ = reportDevices();
     return node_count;
 }

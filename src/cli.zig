@@ -140,6 +140,7 @@ pub fn execute(cmd: []const u8) void {
         printCmd("heap", "Heap stats + integrity check");
         printCmd("bt", "Kernel backtrace");
         printCmd("perf [reset]", "Per-CPU phase + per-syscall cycle counters");
+        printCmd("acpidev", "ACPI namespace devices + decoded _CRS resources");
     } else if (std.mem.eql(u8, cmd, "clear")) {
         vga.clear();
     } else if (std.mem.eql(u8, cmd, "ls")) {
@@ -234,6 +235,8 @@ pub fn execute(cmd: []const u8) void {
         vga.print("perf counters cleared\n", .{});
     } else if (std.mem.eql(u8, cmd, "ipi")) {
         cmdIpi();
+    } else if (std.mem.eql(u8, cmd, "acpidev")) {
+        _ = @import("acpi/aml.zig").reportDevices();
     } else {
         printErr("Unknown command: {s}\n", .{cmd});
         vga.fg = .DarkGray;
