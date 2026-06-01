@@ -88,6 +88,14 @@ const UAS_PIPE_STATUS = 2; // bulk IN  — Status/Sense IUs (streamed)
 const UAS_PIPE_DATA_IN = 3; // bulk IN  — read data (streamed)
 const UAS_PIPE_DATA_OUT = 4; // bulk OUT — write data (streamed)
 
+// xHCI Streams (Slice U2). The serialized first cut uses a single stream
+// (id 1). MaxPStreams=1 in the endpoint context gives a 2^(1+1)=4-entry
+// Primary Stream Array; LSA=1 makes it linear (stream id directly indexes
+// the array). Each used entry is a Stream Context of type Primary Ring.
+const UAS_STREAM_ID: u16 = 1;
+const EP_MAXPSTREAMS_1: u32 = 1; // -> 4-entry primary stream array
+const SCT_PRIMARY_RING: u32 = 1; // Stream Context Type = primary transfer ring
+
 // USB request types
 const REQ_GET_DESCRIPTOR = 6;
 const REQ_SET_CONFIGURATION = 9;
@@ -146,6 +154,20 @@ const UasInfo = struct {
     out_ep: u8 = 0, // bulk OUT — data-out pipe (streamed)
     out_mp: u16 = 0,
     max_streams: u8 = 0, // 2^bMaxStreams from the SS companion (0 = no streams)
+    // U2: endpoint configuration (filled by setupUasStreams).
+    configured: bool = false,
+    cmd_dci: u8 = 0,
+    status_dci: u8 = 0,
+    in_dci: u8 = 0,
+    out_dci: u8 = 0,
+    cmd_ring: ?Ring = null, // command pipe — no streams
+    status_ring: ?Ring = null, // status pipe — stream 1
+    in_ring: ?Ring = null, // data-in pipe — stream 1
+    out_ring: ?Ring = null, // data-out pipe — stream 1
+    status_sca: usize = 0, // status Primary Stream Array (phys)
+    in_sca: usize = 0, // data-in Primary Stream Array (phys)
+    out_sca: usize = 0, // data-out Primary Stream Array (phys)
+    data_phys: usize = 0, // IU + data DMA staging buffer
 };
 var uas_dev: UasInfo = .{};
 
@@ -332,6 +354,15 @@ fn ringDoorbell(slot: u8, target: u8) void {
     asm volatile ("mfence" ::: .{ .memory = true });
     const db_addr = db_base + @as(usize, slot) * 4;
     writeReg(db_addr, @as(u32, target));
+}
+
+/// Doorbell for a stream-enabled endpoint. The DB Target (bits 7:0) is the
+/// DCI; the Stream ID rides in bits 31:16. (ringDoorbell rings stream 0,
+/// which is correct for non-streamed endpoints.)
+fn ringDoorbellStream(slot: u8, dci: u8, stream_id: u16) void {
+    asm volatile ("mfence" ::: .{ .memory = true });
+    const db_addr = db_base + @as(usize, slot) * 4;
+    writeReg(db_addr, @as(u32, dci) | (@as(u32, stream_id) << 16));
 }
 
 // --- Controller initialization ---
@@ -1062,6 +1093,21 @@ fn enumerateDevice(port: u8, speed: u8) void {
             (@as(u32, 1) << @as(u5, @truncate(uas_max_streams)));
         debug.klog("[xhci] UAS pipes: cmd=0x{x} status=0x{x} data-in=0x{x} data-out=0x{x}\n", .{ uas_cmd_ep, uas_status_ep, uas_in_ep, uas_out_ep });
         debug.klog("[xhci] UAS streams: bMaxStreams={d} ({d} streams), speed={d}{s}, slot={d}\n", .{ uas_max_streams, nstreams, speed, if (speed == SPEED_SUPER) " SuperSpeed" else "", slot_id });
+
+        // Slice U2: select the UAS alternate setting if it isn't the default
+        // (QEMU presents UAS on alt 0, already active after SET_CONFIGURATION;
+        // many real drives put UAS on alt 1 with BOT on alt 0), then configure
+        // the four endpoints with the streamed-pipe machinery.
+        if (uas_alt != 0) {
+            // SET_INTERFACE(altSetting=uas_alt, interface=0): standard request,
+            // host->device, recipient interface (bmRequestType 0x01, bRequest 11).
+            _ = controlTransfer(&ep0_ring, slot_id, 0x01, 11, uas_alt, 0, null, 0);
+        }
+        if (uas_max_streams == 0) {
+            debug.klog("[uas] no streams advertised (device not at SuperSpeed) — UAS transport requires streams; skipping endpoint setup\n", .{});
+        } else if (!setupUasStreams(slot_id, input_ctx_phys, speed_val)) {
+            debug.klog("[uas] stream endpoint setup failed\n", .{});
+        }
     }
 
     // HID-specific setup
@@ -1414,6 +1460,135 @@ fn mscScsiCommand(dev_idx: u8, cdb: []const u8, cdb_len: u8, data: ?[*]u8, data_
     return true;
 }
 
+// --- UAS stream endpoint configuration (Slice U2) --------------------------
+
+/// Write a Stream Context at array index 1 (stream id 1) of a Primary Stream
+/// Array, pointing at `ring_phys`. Layout (xHCI §6.2.4.1): DW0 bits 31:4 =
+/// dequeue ptr lo, bits 3:1 = SCT, bit 0 = DCS; DW1 = dequeue ptr hi; DW2/3
+/// reserved. SCT=1 (primary ring), DCS=1 (initTransferRing starts cycle=1).
+fn fillStreamCtx(sca_phys: usize, ring_phys: usize) void {
+    const sca: [*]volatile u32 = @ptrFromInt(paging.physToVirt(sca_phys));
+    // Entry index 1 begins at dword 4 (each Stream Context is 16 B = 4 dwords).
+    sca[4] = @truncate((ring_phys & 0xFFFFFFF0) | (@as(usize, SCT_PRIMARY_RING) << 1) | 1);
+    sca[5] = @truncate(ring_phys >> 32);
+    sca[6] = 0;
+    sca[7] = 0;
+}
+
+/// Fill a bulk endpoint context. `ep_type` is 2 (Bulk OUT) or 6 (Bulk IN).
+/// `deq` is the TR Dequeue Pointer field — a `ring_phys | DCS` for a plain
+/// endpoint, or a Stream Context Array phys (16-byte aligned, no DCS) for a
+/// streamed one. `dw0_extra` carries MaxPStreams/LSA for streamed endpoints
+/// (0 for a plain endpoint).
+fn writeBulkEpCtx(input_ctx_phys: usize, dci: u8, ep_type: u32, max_packet: u16, deq: usize, dw0_extra: u32) void {
+    const ep_ctx = @as([*]volatile u32, @ptrFromInt(paging.physToVirt(input_ctx_phys + CTX_SIZE * (@as(u32, dci) + 1))));
+    ep_ctx[0] = dw0_extra;
+    ep_ctx[1] = (ep_type << 3) | (3 << 1) | (@as(u32, max_packet) << 16); // CErr=3
+    ep_ctx[2] = @truncate(deq);
+    ep_ctx[3] = @truncate(deq >> 32);
+    ep_ctx[4] = max_packet; // average TRB length (approximation)
+}
+
+/// Configure the four UAS bulk endpoints on the controller (Slice U2). The
+/// command pipe is a plain bulk endpoint (single ring); the status,
+/// data-in, and data-out pipes are stream-enabled — each gets a Primary
+/// Stream Context Array (MaxPStreams=1, LSA=1) whose entry [1] points at
+/// that pipe's transfer ring. This is the xHCI Streams machinery UAS needs.
+/// Returns true on a successful CONFIGURE_ENDPOINT. Fills uas_dev.
+fn setupUasStreams(slot_id: u8, input_ctx_phys: usize, speed_val: u32) bool {
+    const d = &uas_dev;
+
+    // DCI = ep_num*2 + (1 for an IN endpoint, 0 for OUT).
+    const cmd_dci: u8 = (d.cmd_ep & 0x0F) * 2 + @as(u8, if (d.cmd_ep & 0x80 != 0) 1 else 0);
+    const status_dci: u8 = (d.status_ep & 0x0F) * 2 + @as(u8, if (d.status_ep & 0x80 != 0) 1 else 0);
+    const in_dci: u8 = (d.in_ep & 0x0F) * 2 + @as(u8, if (d.in_ep & 0x80 != 0) 1 else 0);
+    const out_dci: u8 = (d.out_ep & 0x0F) * 2 + @as(u8, if (d.out_ep & 0x80 != 0) 1 else 0);
+    const max_dci = @max(@max(cmd_dci, status_dci), @max(in_dci, out_dci));
+
+    // Four transfer rings (one page each, with a trailing Link TRB).
+    const cmd_r = initTransferRing() orelse return false;
+    const status_ring = initTransferRing() orelse return false;
+    const in_ring = initTransferRing() orelse return false;
+    const out_ring = initTransferRing() orelse return false;
+    _ = iommu.dmaMap(pci_bus, pci_dev, pci_func, cmd_r.phys, 4096, .{});
+    _ = iommu.dmaMap(pci_bus, pci_dev, pci_func, status_ring.phys, 4096, .{});
+    _ = iommu.dmaMap(pci_bus, pci_dev, pci_func, in_ring.phys, 4096, .{});
+    _ = iommu.dmaMap(pci_bus, pci_dev, pci_func, out_ring.phys, 4096, .{});
+
+    // One page holds the three Primary Stream Context Arrays (the command
+    // pipe has no streams). Each array is 4 entries x 16 B = 64 B; spaced
+    // 256 B apart for clarity (all are 16-byte aligned within the page).
+    const sca_page = pmm.allocFrame() orelse return false;
+    @memset(@as([*]u8, @ptrFromInt(paging.physToVirt(sca_page)))[0..4096], 0);
+    _ = iommu.dmaMap(pci_bus, pci_dev, pci_func, sca_page, 4096, .{});
+    const status_sca = sca_page + 0;
+    const in_sca = sca_page + 256;
+    const out_sca = sca_page + 512;
+    fillStreamCtx(status_sca, status_ring.phys);
+    fillStreamCtx(in_sca, in_ring.phys);
+    fillStreamCtx(out_sca, out_ring.phys);
+
+    // Input context: add Slot + the four endpoints (mirrors the MSC path —
+    // only slot_ctx[0] is set after the memset; the device context supplies
+    // the rest, e.g. the root-hub port).
+    @memset(@as([*]u8, @ptrFromInt(paging.physToVirt(input_ctx_phys)))[0..4096], 0);
+    const input_ctx: [*]volatile u32 = @ptrFromInt(paging.physToVirt(input_ctx_phys));
+    input_ctx[1] = (1 << 0) |
+        (@as(u32, 1) << @as(u5, @truncate(cmd_dci))) |
+        (@as(u32, 1) << @as(u5, @truncate(status_dci))) |
+        (@as(u32, 1) << @as(u5, @truncate(in_dci))) |
+        (@as(u32, 1) << @as(u5, @truncate(out_dci)));
+    const slot_ctx = @as([*]volatile u32, @ptrFromInt(paging.physToVirt(input_ctx_phys + CTX_SIZE)));
+    slot_ctx[0] = speed_val | (@as(u32, max_dci) << 27);
+
+    // Command pipe — plain bulk OUT, single ring (DCS in the dequeue ptr).
+    writeBulkEpCtx(input_ctx_phys, cmd_dci, 2, d.cmd_mp, cmd_r.phys | 1, 0);
+    // Streamed pipes — MaxPStreams=1, LSA=1, dequeue ptr = stream array base.
+    const stream_dw0: u32 = (EP_MAXPSTREAMS_1 << 10) | (1 << 15);
+    writeBulkEpCtx(input_ctx_phys, status_dci, 6, d.status_mp, status_sca, stream_dw0);
+    writeBulkEpCtx(input_ctx_phys, in_dci, 6, d.in_mp, in_sca, stream_dw0);
+    writeBulkEpCtx(input_ctx_phys, out_dci, 2, d.out_mp, out_sca, stream_dw0);
+
+    const cfg_trb = TRB{
+        .param_lo = @truncate(input_ctx_phys),
+        .param_hi = @truncate(input_ctx_phys >> 32),
+        .status = 0,
+        .control = (TRB_CONFIGURE_EP << 10) | (@as(u32, slot_id) << 24),
+    };
+    const evt = sendCommand(cfg_trb) orelse {
+        debug.klog("[uas] CONFIGURE_ENDPOINT failed (no event)\n", .{});
+        return false;
+    };
+    const cc = @as(u8, @truncate(evt.status >> 24));
+    if (cc != 1) {
+        debug.klog("[uas] CONFIGURE_ENDPOINT failed, cc={d}\n", .{cc});
+        return false;
+    }
+
+    // IU + data DMA staging buffer (enlarged in U3 for multi-sector reads).
+    const data_phys = pmm.allocFrame() orelse return false;
+    @memset(@as([*]u8, @ptrFromInt(paging.physToVirt(data_phys)))[0..4096], 0);
+    _ = iommu.dmaMap(pci_bus, pci_dev, pci_func, data_phys, 4096, .{});
+
+    d.configured = true;
+    d.cmd_dci = cmd_dci;
+    d.status_dci = status_dci;
+    d.in_dci = in_dci;
+    d.out_dci = out_dci;
+    d.cmd_ring = cmd_r;
+    d.status_ring = status_ring;
+    d.in_ring = in_ring;
+    d.out_ring = out_ring;
+    d.status_sca = status_sca;
+    d.in_sca = in_sca;
+    d.out_sca = out_sca;
+    d.data_phys = data_phys;
+
+    debug.klog("[uas] endpoints configured (streams): cmd dci={d} | status dci={d} | data-in dci={d} | data-out dci={d}, cc=1\n", .{ cmd_dci, status_dci, in_dci, out_dci });
+    debug.klog("[uas] stream arrays: status@0x{x} in@0x{x} out@0x{x}, using stream id {d}\n", .{ status_sca, in_sca, out_sca, UAS_STREAM_ID });
+    return true;
+}
+
 /// True if a UAS device was detected during enumeration.
 pub fn uasPresent() bool {
     return uas_dev.present;
@@ -1444,7 +1619,14 @@ pub fn uasReport() void {
         d.max_streams, nstreams,
         if (nstreams == 0) "  (no streams — device not at SuperSpeed)" else "",
     });
-    debug.klog("[uas]   transport: pending (U2 stream contexts / U3 IU flow not yet implemented)\n", .{});
+    if (d.configured) {
+        debug.klog("[uas]   endpoints: cmd dci={d} | status dci={d} | data-in dci={d} | data-out dci={d} (stream id {d})\n", .{
+            d.cmd_dci, d.status_dci, d.in_dci, d.out_dci, UAS_STREAM_ID,
+        });
+        debug.klog("[uas]   transport: stream endpoints configured (U2); IU command flow pending (U3)\n", .{});
+    } else {
+        debug.klog("[uas]   transport: endpoints not configured\n", .{});
+    }
 }
 
 /// Read `count` sectors starting at `lba` into `buf`. mscScsiCommand uses
