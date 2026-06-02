@@ -43,10 +43,22 @@ const DUMP = true;
 pub const Value = union(enum) {
     uninit,
     integer: u64,
-    string: []const u8, // points into the DSDT body (no copy)
-    buffer: []const u8,
-    package: []const Value,
+    string: []const u8, // immutable: into the table body, or into the byte arena
+    buffer: []const u8, // read view; runtime/mutable buffers live in the byte arena
+    package: []Value, // mutable elements (value arena) so Index() can write through
     name_ref: [4]u8, // a NamePath used as data (e.g. a _PRT source link) — its last NameSeg
+    ref: Ref, // an lvalue: Index()/RefOf()/CreateField result (a writable location)
+};
+
+/// A writable reference — the AML "reference" object produced by Index(),
+/// RefOf() and the CreateField family. DerefOf reads through it; Store writes
+/// through it. The buffer variants point into the byte arena (mutable storage),
+/// so a write to one is visible to every alias of the same underlying object.
+pub const Ref = union(enum) {
+    buf_byte: struct { buf: []u8, idx: usize }, // Index(Buffer/String, i) → one byte
+    pkg_elem: struct { pkg: []Value, idx: usize }, // Index(Package, i) → one element slot
+    buf_field: struct { buf: []u8, bit_off: u32, bit_width: u32 }, // CreateField window (A2)
+    node: usize, // RefOf(Name/Field) → a nodes[] index
 };
 
 // --- Namespace object kinds -------------------------------------------------
@@ -564,6 +576,10 @@ const StoredNode = struct {
     // over the static DSDT value. Reset every load() (nnodes = 0 re-walks).
     runtime_val: Value = .uninit,
     has_runtime: bool = false,
+    // A1/A2: this Name is a CreateField buffer-field window (runtime_val holds a
+    // .ref => .buf_field). Reads/writes auto-deref through it instead of
+    // replacing it. Created dynamically at exec time (beyond static_nnodes).
+    is_buffer_field: bool = false,
 };
 
 /// Optional payload passed to storeNode; defaults keep call sites terse.
@@ -583,6 +599,11 @@ const Payload = struct {
 var nodes: [MAX_NODES]StoredNode = undefined;
 var nnodes: usize = 0;
 var store_overflow: bool = false;
+/// Count of nodes from the static namespace walk. CreateField creates nodes
+/// dynamically at exec time (nnodes grows past this); each top-level arenaReset
+/// truncates back to here, so dynamic buffer-field windows live exactly one
+/// method-call tree — the same lifetime as the byte arena they point into.
+var static_nnodes: usize = 0;
 
 /// Loaded AML table bodies, indexed by StoredNode.table_id. The DSDT is table 0;
 /// SSDTs (and the synthetic test table) follow. Evaluator helpers build their
@@ -693,15 +714,88 @@ const VALUE_ARENA = 4096;
 var value_arena: [VALUE_ARENA]Value = undefined;
 var arena_top: usize = 0;
 
-fn arenaReset() void {
-    arena_top = 0;
-}
-
 fn arenaAlloc(n: usize) ?[]Value {
     if (arena_top + n > value_arena.len) return null;
     const s = value_arena[arena_top .. arena_top + n];
     arena_top += n;
     return s;
+}
+
+// --- byte arena (mutable buffer/string storage) -----------------------------
+// Runtime buffers (Buffer(n){}, Concatenate/ToBuffer results, wide field reads)
+// and the windows CreateField carves over them need WRITABLE backing the table
+// body can't provide. The byte arena is that storage: a bump allocator reset
+// per top-level evaluation alongside the value arena. A buffer Value pointing
+// into this arena is mutable; one pointing into a table body is read-only. The
+// rule that makes Index()/CreateField aliasing correct: every object created or
+// mutated during a single method-call tree lives here and shares its lifetime.
+
+const BYTE_ARENA = 8192;
+var byte_arena: [BYTE_ARENA]u8 = undefined;
+var byte_top: usize = 0;
+
+fn bufAlloc(n: usize) ?[]u8 {
+    if (byte_top + n > byte_arena.len) return null;
+    const s = byte_arena[byte_top .. byte_top + n];
+    byte_top += n;
+    return s;
+}
+
+/// True if a slice lives in the writable byte arena (⇒ its bytes are mutable).
+fn inByteArena(b: []const u8) bool {
+    if (b.len == 0) return false;
+    const base = @intFromPtr(&byte_arena[0]);
+    const p = @intFromPtr(b.ptr);
+    return p >= base and p < base + byte_arena.len;
+}
+
+/// The mutable view of an arena-backed buffer, or null if it's a table literal.
+fn mutBuf(b: []const u8) ?[]u8 {
+    if (!inByteArena(b)) return null;
+    const base = @intFromPtr(&byte_arena[0]);
+    const off = @intFromPtr(b.ptr) - base;
+    return byte_arena[off .. off + b.len];
+}
+
+/// Ensure `b` is arena-backed + writable, copying a table literal in first.
+/// Returns the mutable view, or null only if the arena is exhausted.
+fn materializeBuf(b: []const u8) ?[]u8 {
+    if (mutBuf(b)) |m| return m;
+    const m = bufAlloc(b.len) orelse return null;
+    @memcpy(m, b);
+    return m;
+}
+
+/// Allocate a fresh zeroed arena buffer of `n` bytes.
+fn newBuf(n: usize) ?[]u8 {
+    const m = bufAlloc(n) orelse return null;
+    @memset(m, 0);
+    return m;
+}
+
+// --- arena reset (per top-level evaluation) ---------------------------------
+// Called at every public entry (evalMethod, reportThermal, buildPrt, the load()
+// proofs, the self-tests). Resets both arenas, then invalidates any cached
+// runtime Name value that points into the (now-recycled) arenas — a stale
+// buffer/package/ref would dangle. Integer/string runtime values survive, so a
+// Name written by one method (e.g. \PICF set by _PIC, read later by _PRT) keeps
+// its value across calls; only arena-backed objects are dropped.
+fn arenaReset() void {
+    arena_top = 0;
+    byte_top = 0;
+    if (nnodes > static_nnodes) nnodes = static_nnodes; // drop dynamic CreateField nodes
+    var i: usize = 0;
+    while (i < nnodes) : (i += 1) {
+        if (!nodes[i].has_runtime) continue;
+        switch (nodes[i].runtime_val) {
+            .buffer, .package, .ref => {
+                nodes[i].has_runtime = false;
+                nodes[i].runtime_val = .uninit;
+                nodes[i].is_buffer_field = false;
+            },
+            else => {},
+        }
+    }
 }
 
 // --- data evaluator ---------------------------------------------------------
@@ -862,11 +956,13 @@ const ExecState = struct {
     returned: bool = false,
     last_if_taken: bool = false,
     break_loop: bool = false,
+    continue_loop: bool = false, // Continue: unwind to the enclosing While's condition
 };
 
 fn toInt(v: Value) u64 {
     return switch (v) {
         .integer => |i| i,
+        .ref => |rf| toInt(readThroughRef(rf)), // an Index/RefOf result used as an integer auto-derefs
         else => 0,
     };
 }
@@ -1036,7 +1132,7 @@ fn skipSuperName(r: *Reader) bool {
 /// serializes on \_SB.PCI0.BLCK before touching the controller, then walks the
 /// slots (PCIU/PCID field I/O) and Notifies. Any other extended opcode stays
 /// unmodeled → null so the caller bails cleanly.
-fn evalExtTerm(r: *Reader) ?Value {
+fn evalExtTerm(r: *Reader, st: *ExecState) ?Value {
     const ext = r.peek(1) orelse return null;
     switch (ext) {
         0x23 => { // AcquireOp SuperName WordData(timeout)
@@ -1053,8 +1149,47 @@ fn evalExtTerm(r: *Reader) ?Value {
             if (!skipSuperName(r)) return null;
             return .uninit;
         },
+        0x13 => { // CreateFieldOp Source BitIndex NumBits Name (arbitrary width)
+            _ = r.next(); // 0x5B
+            _ = r.next(); // 0x13
+            const src = evalTermArg(r, st) orelse return null;
+            const bit_index = toInt(evalTermArg(r, st) orelse return null);
+            const num_bits = toInt(evalTermArg(r, st) orelse return null);
+            const ns = readNameString(r) orelse return null;
+            return bindBufferField(st, ns, src, @intCast(bit_index & 0xFFFF_FFFF), @intCast(num_bits & 0xFFFF_FFFF));
+        },
+        0x21, 0x22 => { // Stall(usec) / Sleep(msec): consume the TermArg, no-op.
+            _ = r.next(); // 0x5B
+            _ = r.next(); // 0x21 / 0x22
+            _ = evalTermArg(r, st); // acpid runs serially and the QEMU mailbox is
+            return .uninit; // synchronous, so pacing delays are unnecessary here.
+        },
         else => return null, // unmodeled extended op — bail cleanly
     }
+}
+
+/// _OSI(InterfaceString): the OS-supplied interface query. Firmware gates code
+/// paths on it; we answer like a current Windows so the DSDT runs its modern
+/// branches. Ones ⇒ supported, Zero ⇒ not. (Intercepted by name, since _OSI is
+/// not a DSDT object.)
+fn osiVerdict(arg: Value) u64 {
+    const s = switch (derefValue(arg)) {
+        .string => |x| x,
+        else => return 0,
+    };
+    const known = [_][]const u8{
+        "Windows", // Windows 2000
+        "Windows 2001",    "Windows 2001 SP1", "Windows 2001 SP2", "Windows 2001 SP3",
+        "Windows 2001.1",  "Windows 2001.1 SP1", "Windows 2006",   "Windows 2006 SP1",
+        "Windows 2006.1",  "Windows 2009",     "Windows 2012",     "Windows 2013",
+        "Windows 2015",    "Windows 2016",     "Windows 2017",     "Windows 2017.2",
+        "Windows 2018",    "Windows 2018.2",   "Windows 2019",     "Windows 2020",
+        "Windows 2021",    "Windows 2022",
+    };
+    for (known) |k| {
+        if (std.mem.eql(u8, s, k)) return ~@as(u64, 0);
+    }
+    return 0;
 }
 
 fn evalTermArg(r: *Reader, st: *ExecState) ?Value {
@@ -1076,16 +1211,499 @@ fn evalTermArg(r: *Reader, st: *ExecState) ?Value {
         },
         0x78 => return evalDivide(r, st),
         0x75, 0x76 => return evalIncDec(r, st, op),
-        0x5B => return evalExtTerm(r), // extended opcodes (Acquire/Release/…)
+        0x11 => return evalBufferRuntime(r, st), // Buffer(): arena-backed (mutable)
+        0x87 => return evalSizeOf(r, st), // SizeOf
+        0x88 => return evalIndexExpr(r, st), // Index → reference
+        0x83 => return evalDerefExpr(r, st), // DerefOf
+        0x71 => return evalRefOf(r, st), // RefOf → reference
+        0x8A, 0x8B, 0x8C, 0x8D, 0x8F => return evalCreateField(r, st, op), // CreateDWord/Word/Byte/Bit/QWordField
+        0x73 => return evalConcat(r, st), // Concatenate
+        0x96 => return evalToBuffer(r, st), // ToBuffer
+        0x99 => return evalToInteger(r, st), // ToInteger
+        0x98 => return evalToHexString(r, st), // ToHexString
+        0x9C => return evalToString(r, st), // ToString
+        0x9E => return evalMid(r, st), // Mid
+        0x8E => return evalObjectType(r, st), // ObjectType
+        0x9D => return evalCopyObject(r, st), // CopyObject
+        0x5B => return evalExtTerm(r, st), // extended opcodes (Acquire/Release/CreateField/…)
         else => {
             if (binLookup(op)) |bi| return evalBinary(r, st, bi);
             if (unLookup(op)) |ui| return evalUnary(r, st, ui);
-            if (op == 0x88) return evalIndexExpr(r, st); // Index (best-effort)
-            if (op == 0x83) return evalDerefExpr(r, st); // DerefOf (best-effort)
             if (isNameLead(op)) return evalNameRef(r, st);
-            return evalData(r); // literal / Buffer / Package
+            return evalData(r); // literal / Package
         },
     }
+}
+
+// --- reference read/write + buffer-field bit access -------------------------
+
+/// Extract a ≤64-bit little-endian bit-slice from a byte buffer (CreateField).
+fn bufFieldRead(buf: []const u8, bit_off: u32, bit_width: u32) u64 {
+    if (bit_width == 0 or bit_width > 64) return 0;
+    var v: u64 = 0;
+    var i: u32 = 0;
+    while (i < bit_width) : (i += 1) {
+        const bit = bit_off + i;
+        const byte = bit >> 3;
+        if (byte >= buf.len) break;
+        if ((buf[byte] >> @as(u3, @intCast(bit & 7))) & 1 != 0) v |= @as(u64, 1) << @as(u6, @intCast(i));
+    }
+    return v;
+}
+
+/// Deposit a ≤64-bit value into a byte buffer's bit-slice (CreateField write).
+fn bufFieldWrite(buf: []u8, bit_off: u32, bit_width: u32, val: u64) void {
+    if (bit_width == 0 or bit_width > 64) return;
+    var i: u32 = 0;
+    while (i < bit_width) : (i += 1) {
+        const bit = bit_off + i;
+        const byte = bit >> 3;
+        if (byte >= buf.len) break;
+        const mask = @as(u8, 1) << @as(u3, @intCast(bit & 7));
+        if ((val >> @as(u6, @intCast(i))) & 1 != 0) buf[byte] |= mask else buf[byte] &= ~mask;
+    }
+}
+
+/// Read the value a reference points at (DerefOf / auto-deref).
+fn readThroughRef(rf: Ref) Value {
+    switch (rf) {
+        .buf_byte => |bb| return .{ .integer = if (bb.idx < bb.buf.len) bb.buf[bb.idx] else 0 },
+        .pkg_elem => |pe| return if (pe.idx < pe.pkg.len) pe.pkg[pe.idx] else .uninit,
+        .buf_field => |bf| return .{ .integer = bufFieldRead(bf.buf, bf.bit_off, bf.bit_width) },
+        .node => |ni| {
+            if (ni >= nnodes) return .uninit;
+            const n = &nodes[ni];
+            return switch (n.kind) {
+                .name => if (n.has_runtime) n.runtime_val else blk: {
+                    var rr = Reader{ .buf = bodyOf(n), .pos = n.val_off };
+                    break :blk (evalData(&rr) orelse .uninit);
+                },
+                .field => .{ .integer = readField(n) orelse 0 },
+                else => .uninit,
+            };
+        },
+    }
+}
+
+/// Write a value through a reference (Store-to-lvalue). True on success.
+fn writeThroughRef(rf: Ref, v: Value) bool {
+    switch (rf) {
+        .buf_byte => |bb| {
+            if (bb.idx >= bb.buf.len) return false;
+            bb.buf[bb.idx] = @truncate(toInt(v));
+            return true;
+        },
+        .pkg_elem => |pe| {
+            if (pe.idx >= pe.pkg.len) return false;
+            pe.pkg[pe.idx] = v;
+            return true;
+        },
+        .buf_field => |bf| {
+            bufFieldWrite(bf.buf, bf.bit_off, bf.bit_width, toInt(v));
+            return true;
+        },
+        .node => |ni| {
+            if (ni >= nnodes) return false;
+            const n = &nodes[ni];
+            switch (n.kind) {
+                .name => {
+                    n.runtime_val = v;
+                    n.has_runtime = true;
+                    return true;
+                },
+                .field => return writeField(n, toInt(v)),
+                else => return false,
+            }
+        },
+    }
+}
+
+/// DerefOf on a value: through a reference, else the value unchanged (lenient).
+fn derefValue(v: Value) Value {
+    return switch (v) {
+        .ref => |rf| readThroughRef(rf),
+        else => v,
+    };
+}
+
+// --- Buffer()/SizeOf/Index/DerefOf/RefOf ------------------------------------
+
+/// Runtime Buffer(): BufferSize TermArg + ByteList → a fresh arena buffer (so
+/// it is mutable and Index/CreateField over it alias correctly). The declared
+/// size is the length; the byte list initializes the front, the rest is zero.
+fn evalBufferRuntime(r: *Reader, st: *ExecState) ?Value {
+    _ = r.next(); // 0x11 BufferOp
+    const pkg_start = r.pos;
+    const pl = readPkgLength(r) orelse return null;
+    const end = pkg_start + pl.value;
+    if (end > r.buf.len or end < r.pos) return null;
+    const size_v = evalTermArg(r, st) orelse return null; // BufferSize TermArg
+    const declared: usize = @intCast(@min(toInt(size_v), @as(u64, BYTE_ARENA)));
+    const init_bytes = if (r.pos <= end) r.buf[r.pos..end] else r.buf[0..0];
+    r.pos = end;
+    const mb = newBuf(declared) orelse return null;
+    const copy_n = @min(init_bytes.len, declared);
+    @memcpy(mb[0..copy_n], init_bytes[0..copy_n]);
+    return .{ .buffer = mb };
+}
+
+/// SizeOf(obj): element/byte count of a Buffer, String or Package; 0 otherwise.
+fn evalSizeOf(r: *Reader, st: *ExecState) ?Value {
+    _ = r.next(); // 0x87 SizeOfOp
+    const v = derefValue(evalTermArg(r, st) orelse return null);
+    return .{ .integer = switch (v) {
+        .string => |s| s.len,
+        .buffer => |b| b.len,
+        .package => |p| p.len,
+        else => 0,
+    } };
+}
+
+/// Build the reference Index(src, idx) names: a byte of a Buffer/String, or an
+/// element slot of a Package. Null if out of range or src isn't indexable.
+fn refForIndex(src: Value, idx: u64) ?Ref {
+    switch (src) {
+        .buffer => |b| {
+            const mb = materializeBuf(b) orelse return null;
+            if (idx >= mb.len) return null;
+            return Ref{ .buf_byte = .{ .buf = mb, .idx = @intCast(idx) } };
+        },
+        .string => |s| {
+            const mb = materializeBuf(s) orelse return null;
+            if (idx >= mb.len) return null;
+            return Ref{ .buf_byte = .{ .buf = mb, .idx = @intCast(idx) } };
+        },
+        .package => |p| {
+            if (idx >= p.len) return null;
+            return Ref{ .pkg_elem = .{ .pkg = p, .idx = @intCast(idx) } };
+        },
+        else => return null,
+    }
+}
+
+/// Index(Source, Index, Target): yield a reference to the indexed element and
+/// (optionally) store it into Target. Auto-derefs when used as an integer.
+fn evalIndexExpr(r: *Reader, st: *ExecState) ?Value {
+    _ = r.next(); // IndexOp
+    const src = evalTermArg(r, st) orelse return null;
+    const idx = toInt(evalTermArg(r, st) orelse return null);
+    const rv: Value = if (refForIndex(src, idx)) |rf| .{ .ref = rf } else .uninit;
+    if (!storeTarget(r, st, rv)) return null; // trailing Target (often Null)
+    return rv;
+}
+
+/// DerefOf(ref): the value the reference points at.
+fn evalDerefExpr(r: *Reader, st: *ExecState) ?Value {
+    _ = r.next(); // DerefOfOp
+    const v = evalTermArg(r, st) orelse return null;
+    return derefValue(v);
+}
+
+/// RefOf(obj): a reference to a named object (Name or Field). References to
+/// frame slots (Local/Arg) aren't modeled — the operand is consumed, uninit.
+fn evalRefOf(r: *Reader, st: *ExecState) ?Value {
+    _ = r.next(); // RefOfOp
+    const op = r.peek(0) orelse return null;
+    if (isNameLead(op)) {
+        const ns = readNameString(r) orelse return null;
+        if (resolve(st.scope, ns)) |n| return .{ .ref = .{ .node = nodeIndexOf(n) } };
+        return .uninit;
+    }
+    _ = evalTermArg(r, st);
+    return .uninit;
+}
+
+// --- CreateField family (buffer-field windows) ------------------------------
+// CreateByteField/Word/DWord/QWord/BitField and the general CreateField create
+// a NAMED window over a Buffer's bits. They run at EXECUTION time, so the node
+// is created dynamically (beyond static_nnodes) and reclaimed at the next
+// top-level arenaReset. Reads/writes of the name auto-deref through the window.
+
+/// Find-or-create a namespace node for `ns` resolved against `scope`. Returns an
+/// existing node (CreateField re-target) or a freshly appended one; null if the
+/// store is full.
+fn createDynNode(scope: []const u8, ns: NameString) ?*StoredNode {
+    var pb = PathBuf{};
+    seedPath(&pb, scope);
+    _ = pb.enter(ns);
+    const abs = pb.snapshot();
+    if (findExact(abs)) |n| return n;
+    if (nnodes >= nodes.len) {
+        store_overflow = true;
+        return null;
+    }
+    const n = &nodes[nnodes];
+    n.* = .{};
+    const cl = @min(abs.len, @as(usize, PATH_MAX));
+    @memcpy(n.path[0..cl], abs[0..cl]);
+    n.path_len = @intCast(cl);
+    nnodes += 1;
+    return n;
+}
+
+/// Bind `ns` as a buffer-field window [bit_off, bit_off+bit_width) over `src`'s
+/// bytes (materialized into the byte arena so writes alias the source object).
+fn bindBufferField(st: *ExecState, ns: NameString, src: Value, bit_off: u32, bit_width: u32) ?Value {
+    const buf: []u8 = switch (derefValue(src)) {
+        .buffer => |b| materializeBuf(b) orelse return .uninit,
+        else => return .uninit, // CreateField over a non-buffer: ignore (lenient)
+    };
+    const node = createDynNode(st.scope, ns) orelse return .uninit;
+    node.kind = .name;
+    node.is_buffer_field = true;
+    node.has_runtime = true;
+    node.runtime_val = .{ .ref = .{ .buf_field = .{ .buf = buf, .bit_off = bit_off, .bit_width = bit_width } } };
+    return .uninit;
+}
+
+/// CreateByteField(0x8C)/Word(0x8B)/DWord(0x8A)/QWord(0x8F)/BitField(0x8D):
+/// Source ByteIndex(or BitIndex) Name. Fixed widths; byte-indexed except
+/// CreateBitField which is bit-indexed.
+fn evalCreateField(r: *Reader, st: *ExecState, op: u8) ?Value {
+    _ = r.next(); // CreateXFieldOp
+    const src = evalTermArg(r, st) orelse return null;
+    const index = toInt(evalTermArg(r, st) orelse return null);
+    const ns = readNameString(r) orelse return null;
+    const bits: u32 = switch (op) {
+        0x8D => 1, // CreateBitField
+        0x8C => 8, // CreateByteField
+        0x8B => 16, // CreateWordField
+        0x8A => 32, // CreateDWordField
+        0x8F => 64, // CreateQWordField
+        else => 8,
+    };
+    const bit_off: u32 = if (op == 0x8D) @intCast(index) else @intCast(index *% 8);
+    return bindBufferField(st, ns, src, bit_off, bits);
+}
+
+// --- conversions + buffer/string manipulation (A3) --------------------------
+// Concatenate, ToBuffer, ToInteger, ToHexString, ToString, Mid, ObjectType,
+// CopyObject — the operators real control methods use to marshal data in and
+// out of mailbox buffers. Results that need fresh storage land in the byte
+// arena (buffers/strings) or value arena and live for the call.
+
+fn writeLe(out: []u8, v: u64) void {
+    var i: usize = 0;
+    while (i < out.len and i < 8) : (i += 1) out[i] = @truncate(v >> @as(u6, @intCast(i * 8)));
+}
+
+fn readLeBytes(b: []const u8) u64 {
+    var v: u64 = 0;
+    var i: usize = 0;
+    while (i < b.len and i < 8) : (i += 1) v |= @as(u64, b[i]) << @as(u6, @intCast(i * 8));
+    return v;
+}
+
+/// The raw bytes of a value as a Buffer view: Buffer/String pass through;
+/// Integer is laid out as 8 little-endian bytes in a fresh arena slice.
+fn toBufferBytes(v: Value) []const u8 {
+    return switch (derefValue(v)) {
+        .buffer => |b| b,
+        .string => |s| s,
+        .integer => |iv| blk: {
+            const out = bufAlloc(8) orelse break :blk &[_]u8{};
+            writeLe(out, iv);
+            break :blk out;
+        },
+        else => &[_]u8{},
+    };
+}
+
+/// Parse a String as an Integer (leading "0x" ⇒ hex, else decimal; stops at the
+/// first non-digit) — ACPI's ToInteger(String) rule.
+fn parseIntStr(s: []const u8) u64 {
+    var i: usize = 0;
+    while (i < s.len and s[i] == ' ') i += 1;
+    var v: u64 = 0;
+    if (i + 1 < s.len and s[i] == '0' and (s[i + 1] == 'x' or s[i + 1] == 'X')) {
+        i += 2;
+        while (i < s.len) : (i += 1) {
+            const c = s[i];
+            const d: u64 = if (c >= '0' and c <= '9') c - '0' else if (c >= 'A' and c <= 'F') c - 'A' + 10 else if (c >= 'a' and c <= 'f') c - 'a' + 10 else break;
+            v = v *% 16 +% d;
+        }
+    } else {
+        while (i < s.len) : (i += 1) {
+            if (s[i] < '0' or s[i] > '9') break;
+            v = v *% 10 +% (s[i] - '0');
+        }
+    }
+    return v;
+}
+
+/// Concatenate(a, b): result type follows `a` (Integer→Buffer). `b` is coerced
+/// to that type, then the two are joined into a fresh arena object.
+fn concatValues(a: Value, b: Value) ?Value {
+    switch (a) {
+        .string => |sa| {
+            const sb = toBufferBytes(b); // string bytes (or coerced)
+            const out = bufAlloc(sa.len + sb.len) orelse return null;
+            @memcpy(out[0..sa.len], sa);
+            @memcpy(out[sa.len..], sb);
+            return .{ .string = out };
+        },
+        .buffer => |ba| {
+            const bb = toBufferBytes(b);
+            const out = bufAlloc(ba.len + bb.len) orelse return null;
+            @memcpy(out[0..ba.len], ba);
+            @memcpy(out[ba.len..], bb);
+            return .{ .buffer = out };
+        },
+        .integer => |ia| {
+            const bb = toBufferBytes(b);
+            const out = bufAlloc(8 + bb.len) orelse return null;
+            writeLe(out[0..8], ia);
+            @memcpy(out[8..], bb);
+            return .{ .buffer = out };
+        },
+        else => return null,
+    }
+}
+
+fn evalConcat(r: *Reader, st: *ExecState) ?Value {
+    _ = r.next(); // 0x73 ConcatOp
+    const a = derefValue(evalTermArg(r, st) orelse return null);
+    const b = derefValue(evalTermArg(r, st) orelse return null);
+    const res = concatValues(a, b) orelse Value.uninit;
+    if (!storeTarget(r, st, res)) return null;
+    return res;
+}
+
+fn evalToBuffer(r: *Reader, st: *ExecState) ?Value {
+    _ = r.next(); // 0x96 ToBufferOp
+    const s = derefValue(evalTermArg(r, st) orelse return null);
+    const res: Value = switch (s) {
+        .buffer => s,
+        .string => |str| blk: {
+            const out = newBuf(str.len) orelse break :blk Value.uninit;
+            @memcpy(out, str);
+            break :blk Value{ .buffer = out };
+        },
+        .integer => |iv| blk: {
+            const out = newBuf(8) orelse break :blk Value.uninit;
+            writeLe(out, iv);
+            break :blk Value{ .buffer = out };
+        },
+        else => Value.uninit,
+    };
+    if (!storeTarget(r, st, res)) return null;
+    return res;
+}
+
+fn evalToInteger(r: *Reader, st: *ExecState) ?Value {
+    _ = r.next(); // 0x99 ToIntegerOp
+    const s = derefValue(evalTermArg(r, st) orelse return null);
+    const v: u64 = switch (s) {
+        .integer => |iv| iv,
+        .buffer => |b| readLeBytes(b),
+        .string => |str| parseIntStr(str),
+        else => 0,
+    };
+    const res = Value{ .integer = v };
+    if (!storeTarget(r, st, res)) return null;
+    return res;
+}
+
+const HEX = "0123456789ABCDEF";
+
+/// ToHexString(int): uppercase hex digits (minimal width, ≥1 digit). Buffers
+/// stringify as comma-separated byte hex per ACPI, but the integer form is what
+/// firmware logging paths use; a buffer falls back to its first 8 bytes.
+fn evalToHexString(r: *Reader, st: *ExecState) ?Value {
+    _ = r.next(); // 0x98 ToHexStringOp
+    const s = derefValue(evalTermArg(r, st) orelse return null);
+    const iv: u64 = switch (s) {
+        .integer => |x| x,
+        .buffer => |b| readLeBytes(b),
+        .string => {
+            if (!storeTarget(r, st, s)) return null;
+            return s;
+        },
+        else => 0,
+    };
+    var tmp: [16]u8 = undefined;
+    var n: usize = 0;
+    var shift: i32 = 60;
+    var started = false;
+    while (shift >= 0) : (shift -= 4) {
+        const nib: u8 = @intCast((iv >> @as(u6, @intCast(shift))) & 0xF);
+        if (nib != 0 or started or shift == 0) {
+            tmp[n] = HEX[nib];
+            n += 1;
+            started = true;
+        }
+    }
+    const out = bufAlloc(n) orelse return null;
+    @memcpy(out, tmp[0..n]);
+    const res = Value{ .string = out };
+    if (!storeTarget(r, st, res)) return null;
+    return res;
+}
+
+/// ToString(Source, Length): a String of Source's bytes up to a NUL or Length
+/// (whichever first); Length = Ones (0xFFFF_FFFF…) means "to the NUL".
+fn evalToString(r: *Reader, st: *ExecState) ?Value {
+    _ = r.next(); // 0x9C ToStringOp
+    const src = derefValue(evalTermArg(r, st) orelse return null);
+    const length = toInt(evalTermArg(r, st) orelse return null);
+    const bytes = switch (src) {
+        .buffer => |b| b,
+        .string => |s| s,
+        else => &[_]u8{},
+    };
+    var n: usize = 0;
+    const cap = if (length == ~@as(u64, 0)) bytes.len else @min(@as(usize, @intCast(@min(length, bytes.len))), bytes.len);
+    while (n < cap and bytes[n] != 0) n += 1;
+    const out = bufAlloc(n) orelse return null;
+    @memcpy(out, bytes[0..n]);
+    const res = Value{ .string = out };
+    if (!storeTarget(r, st, res)) return null;
+    return res;
+}
+
+/// Mid(Source, Index, Length): a sub-Buffer/sub-String (type follows Source).
+fn evalMid(r: *Reader, st: *ExecState) ?Value {
+    _ = r.next(); // 0x9E MidOp
+    const src = derefValue(evalTermArg(r, st) orelse return null);
+    const index = toInt(evalTermArg(r, st) orelse return null);
+    const length = toInt(evalTermArg(r, st) orelse return null);
+    const bytes = switch (src) {
+        .buffer => |b| b,
+        .string => |s| s,
+        else => {
+            if (!storeTarget(r, st, .uninit)) return null;
+            return .uninit;
+        },
+    };
+    const start: usize = @intCast(@min(index, bytes.len));
+    const end: usize = @intCast(@min(start + @min(length, bytes.len), bytes.len));
+    const n = end - start;
+    const out = bufAlloc(n) orelse return null;
+    @memcpy(out, bytes[start..end]);
+    const res: Value = if (src == .string) .{ .string = out } else .{ .buffer = out };
+    if (!storeTarget(r, st, res)) return null;
+    return res;
+}
+
+/// ObjectType(obj): the ACPI type code (0=uninit,1=int,2=str,3=buffer,4=pkg).
+fn evalObjectType(r: *Reader, st: *ExecState) ?Value {
+    _ = r.next(); // 0x8E ObjectTypeOp
+    const v = derefValue(evalTermArg(r, st) orelse return null);
+    return .{ .integer = switch (v) {
+        .integer => 1,
+        .string => 2,
+        .buffer => 3,
+        .package => 4,
+        else => 0,
+    } };
+}
+
+/// CopyObject(Source, Target): store Source into Target (value semantics).
+fn evalCopyObject(r: *Reader, st: *ExecState) ?Value {
+    _ = r.next(); // 0x9D CopyObjectOp
+    const s = evalTermArg(r, st) orelse return null;
+    if (!storeTarget(r, st, s)) return null;
+    return s;
 }
 
 fn evalBinary(r: *Reader, st: *ExecState, bi: BinOp) ?Value {
@@ -1132,25 +1750,16 @@ fn evalIncDec(r: *Reader, st: *ExecState, op: u8) ?Value {
     return .{ .integer = nv };
 }
 
-fn evalIndexExpr(r: *Reader, st: *ExecState) ?Value {
-    _ = r.next(); // IndexOp: Source Index Target
-    _ = evalTermArg(r, st) orelse return null;
-    _ = evalTermArg(r, st) orelse return null;
-    _ = storeTarget(r, st, .uninit);
-    return .uninit; // element references are B2c
-}
-
-fn evalDerefExpr(r: *Reader, st: *ExecState) ?Value {
-    _ = r.next(); // DerefOfOp
-    _ = evalTermArg(r, st) orelse return null;
-    return .uninit;
-}
-
 /// A NameString in expression position: a method invocation (consume its args)
 /// or a reference to a Name (yield its value). Unresolved / non-value objects
 /// yield uninit so a method keeps running.
 fn evalNameRef(r: *Reader, st: *ExecState) ?Value {
     const ns = readNameString(r) orelse return null;
+    // _OSI(str): OS-supplied, not a DSDT object — intercept and answer directly.
+    if (ns.nsegs > 0 and std.mem.eql(u8, &ns.segs[ns.nsegs - 1], "_OSI")) {
+        const arg = evalTermArg(r, st) orelse Value.uninit;
+        return .{ .integer = osiVerdict(arg) };
+    }
     const node = resolve(st.scope, ns) orelse return .uninit;
     switch (node.kind) {
         .method => {
@@ -1162,11 +1771,27 @@ fn evalNameRef(r: *Reader, st: *ExecState) ?Value {
             return callMethod(node, args[0 .. @min(@as(usize, node.arg_count), 7)], st.depth + 1);
         },
         .name => {
+            // A CreateField window auto-derefs: reading the name yields the
+            // value of the bits it covers, not the reference object itself.
+            if (node.is_buffer_field and node.has_runtime) return readThroughRef(node.runtime_val.ref);
             if (node.has_runtime) return node.runtime_val;
             var rr = Reader{ .buf = bodyOf(node), .pos = node.val_off };
-            return evalData(&rr) orelse .uninit;
+            var v = evalData(&rr) orelse .uninit;
+            // A buffer-valued Name materializes into the byte arena on first
+            // access and caches the arena copy as its runtime value — so a later
+            // Index()/CreateField over this Name aliases the SAME storage and
+            // writes persist. (Invalidated at the next arenaReset.)
+            if (v == .buffer) {
+                if (materializeBuf(v.buffer)) |mb| {
+                    v = .{ .buffer = mb };
+                    node.runtime_val = v;
+                    node.has_runtime = true;
+                }
+            }
+            return v;
         },
-        .field => { // B2c: read the backing hardware
+        .field => { // B2c/A4: read the backing hardware
+            if (node.field_bit_width > 64) return readFieldBuffer(node) orelse .uninit;
             if (readField(node)) |fv| return .{ .integer = fv };
             return .uninit;
         },
@@ -1199,17 +1824,47 @@ fn storeTarget(r: *Reader, st: *ExecState, v: Value) bool {
                 if (resolve(st.scope, ns)) |n| {
                     switch (n.kind) {
                         .name => {
-                            n.runtime_val = v;
-                            n.has_runtime = true;
+                            // A CreateField window: deposit v into its bits
+                            // instead of replacing the reference object.
+                            if (n.is_buffer_field and n.has_runtime) {
+                                _ = writeThroughRef(n.runtime_val.ref, v);
+                            } else {
+                                n.runtime_val = v;
+                                n.has_runtime = true;
+                            }
                         },
-                        .field => _ = writeField(n, toInt(v)), // B2c: write hardware
+                        .field => { // B2c/A4: write hardware (scalar, or wide ← Buffer)
+                            if (n.field_bit_width > 64) {
+                                _ = writeFieldBuffer(n, toBufferBytes(v));
+                            } else {
+                                _ = writeField(n, toInt(v));
+                            }
+                        },
                         else => {},
                     }
                 }
                 return true;
             }
-            // Index()/DerefOf() target: consume as an expression, best-effort.
-            return evalTermArg(r, st) != null;
+            // Index() as a Store target: evaluate it to a reference (consuming
+            // its own trailing Target), then write v through that reference —
+            // Store(x, Index(BUF, i)) deposits x into BUF's i-th element.
+            if (op == 0x88) {
+                const rv = evalIndexExpr(r, st) orelse return false;
+                if (rv == .ref) return writeThroughRef(rv.ref, v);
+                return true;
+            }
+            // DerefOf(ref) as a target: write through the dereferenced location.
+            if (op == 0x83) {
+                _ = r.next(); // DerefOfOp
+                const refv = evalTermArg(r, st) orelse return false;
+                if (refv == .ref) return writeThroughRef(refv.ref, v);
+                return true;
+            }
+            // Some other expression as a target — evaluate for its side effect;
+            // if it yields a reference, honor it.
+            const tv = evalTermArg(r, st) orelse return false;
+            if (tv == .ref) return writeThroughRef(tv.ref, v);
+            return true;
         },
     }
 }
@@ -1217,7 +1872,7 @@ fn storeTarget(r: *Reader, st: *ExecState, v: Value) bool {
 // --- statement execution ----------------------------------------------------
 
 fn execTermList(r: *Reader, end: usize, st: *ExecState) void {
-    while (r.pos < end and !st.returned and !st.break_loop) {
+    while (r.pos < end and !st.returned and !st.break_loop and !st.continue_loop) {
         const op = r.peek(0) orelse return;
         switch (op) {
             0x70 => { // Store SourceTermArg Target
@@ -1239,8 +1894,9 @@ fn execTermList(r: *Reader, end: usize, st: *ExecState) void {
                 st.break_loop = true;
                 return;
             },
-            0x9F => { // Continue (simplified: end this list pass)
+            0x9F => { // Continue: unwind nested lists to the enclosing While
                 _ = r.next();
+                st.continue_loop = true;
                 return;
             },
             0xA3 => { // Noop
@@ -1308,6 +1964,10 @@ fn execWhile(r: *Reader, st: *ExecState) void {
         if (!toBool(pred)) break;
         execTermList(r, pkg_end, st);
         if (st.returned) return;
+        if (st.continue_loop) {
+            st.continue_loop = false; // swallow it here → re-evaluate the condition
+            continue;
+        }
         if (st.break_loop) {
             st.break_loop = false;
             break;
@@ -1415,18 +2075,252 @@ pub fn runGpeHandler(n: u8) bool {
     return true;
 }
 
-/// Deterministic executor self-test, independent of firmware: run the AML for
-/// `Add(2, 3) -> Local0; Return(Local0)` and expect 5. Proves operand decode, a
-/// binary op writing a Target, Local store/load, and Return.
-fn selfTest() void {
-    const prog = [_]u8{ 0x72, 0x0A, 0x02, 0x0A, 0x03, 0x60, 0xA4, 0x60 };
+// === deterministic self-tests (firmware-independent) ========================
+// Each check runs a hand-assembled AML program and compares the result against
+// an expected value, counting failures. selfTestExtended() is the SINGLE source
+// of truth: load() runs it at boot (one PASS/FAIL klog per check), and the
+// native harness (tools/aml test rig) asserts it returns 0. Extending the
+// interpreter ⇒ add a check here — so every capability has a pinned proof that
+// runs both natively (fast) and on real firmware (boot).
+
+/// Reset the namespace store + arenas so a self-test can walk its own
+/// hand-assembled table into a clean namespace. Mirrors the head of load().
+fn tNsReset() void {
+    node_count = 0;
+    unknown_op_seen = 0;
+    nnodes = 0;
+    static_nnodes = 0;
+    store_overflow = false;
+    nbodies = 0;
+    arenaReset();
+}
+
+/// Run a bare TermList (no enclosing method) against a fresh Frame and return
+/// its Return value. Starts from an empty namespace so CreateField-style tests
+/// (which create nodes at the root) are isolated from one another.
+fn runProg(body: []const u8) Value {
+    tNsReset();
     var frame = Frame{};
     var st = ExecState{ .frame = &frame, .scope = "\\", .depth = 0 };
-    var r = Reader{ .buf = &prog };
+    var r = Reader{ .buf = body };
+    execTermList(&r, body.len, &st);
+    return st.ret;
+}
+
+/// Walk a hand-assembled AML body into a fresh namespace, then invoke a method
+/// by absolute path and return its result. For tests that need named objects
+/// (CreateField, method calls, OperationRegion/Field I/O).
+fn tWalkEval(body: []const u8, method_abs: []const u8) Value {
+    tNsReset();
+    _ = walkBody(body);
+    static_nnodes = nnodes; // the walked nodes are the static baseline
+    return evalMethod(method_abs) orelse .uninit;
+}
+
+/// Run a bare TermList against the CURRENT namespace (no reset) — for tests that
+/// pre-built region/field nodes the program references by name.
+fn runProgKeepNs(body: []const u8) Value {
+    var frame = Frame{};
+    var st = ExecState{ .frame = &frame, .scope = "\\", .depth = 0 };
+    var r = Reader{ .buf = body };
     arenaReset();
-    execTermList(&r, prog.len, &st);
-    const got = toInt(st.ret);
-    debug.klog("[aml] executor self-test Add(2,3)->Local0; Return(Local0) = {d} ({s})\n", .{ got, if (got == 5) "PASS" else "FAIL" });
+    execTermList(&r, body.len, &st);
+    return st.ret;
+}
+
+/// Programmatically append a namespace node at an absolute path (self-tests that
+/// build OperationRegion/Field nodes pointing at a runtime address).
+fn stMakeNode(abs: []const u8) ?*StoredNode {
+    if (nnodes >= nodes.len) return null;
+    const n = &nodes[nnodes];
+    n.* = .{};
+    const cl = @min(abs.len, @as(usize, PATH_MAX));
+    @memcpy(n.path[0..cl], abs[0..cl]);
+    n.path_len = @intCast(cl);
+    nnodes += 1;
+    return n;
+}
+
+/// Backing store for the wide-field self-test's OperationRegion: a real,
+/// kernel-owned, mapped buffer. The region is placed at this buffer's PHYSICAL
+/// address (via virtToPhys), so the test drives readRegionUnit/writeRegionUnit
+/// over genuine SystemMemory in both the native harness and on hardware — no
+/// fake address, nothing else's memory touched.
+var st_region_buf: [16]u8 align(16) = [_]u8{0} ** 16;
+
+/// Wide (96-bit) SystemMemory field round-trip: write a 12-byte buffer through
+/// the field, read it back, check byte 5 == 0x06. Exercises the >64-bit
+/// readFieldBuffer/writeFieldBuffer path over a real mapped region.
+fn stWideFieldTest(fails: *u32) void {
+    tNsReset();
+    const phys = paging.virtToPhys(@intFromPtr(&st_region_buf)) orelse {
+        debug.klog("[aml] selftest wide field buffer r/w: SKIP (test buffer not mapped)\n", .{});
+        return;
+    };
+    @memset(&st_region_buf, 0);
+    const reg = stMakeNode("\\RAM_") orelse return;
+    reg.kind = .op_region;
+    reg.region_space = SPACE_MEM;
+    reg.region_off = phys;
+    reg.region_len = st_region_buf.len;
+    const reg_idx = nnodes - 1;
+    const fld = stMakeNode("\\WIDE") orelse return;
+    fld.kind = .field;
+    fld.field_region = @intCast(reg_idx);
+    fld.field_bit_off = 0;
+    fld.field_bit_width = 96;
+    fld.field_access = 1; // ByteAcc
+    static_nnodes = nnodes; // keep RAM_/WIDE across the program's arenaReset
+    const got = toInt(runProgKeepNs(&[_]u8{
+        0x70, 0x11, 0x0F, 0x0A, 0x0C, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x60, // Store Buffer(12){1..12} -> L0
+        0x70, 0x60, 'W', 'I', 'D', 'E', // Store(L0, WIDE)  — wide write ← Buffer
+        0x70, 'W', 'I', 'D', 'E', 0x61, // Store(WIDE, L1)  — wide read → Buffer
+        0xA4, 0x83, 0x88, 0x61, 0x0A, 0x05, 0x00, // Return DerefOf(Index(L1,5)) == 0x06
+    }));
+    stCheck("wide field buffer r/w", got, 0x06, fails);
+}
+
+/// Compare got/want, log PASS/FAIL, bump fails on mismatch.
+fn stCheck(name: []const u8, got: u64, want: u64, fails: *u32) void {
+    const ok = got == want;
+    if (!ok) fails.* += 1;
+    debug.klog("[aml] selftest {s}: got 0x{X} want 0x{X} ({s})\n", .{ name, got, want, if (ok) "PASS" else "FAIL" });
+}
+
+/// All deterministic self-tests. Returns the count that FAILED (0 = all pass).
+/// Self-contained: each check resets the namespace it needs, so calling this at
+/// the very top of load() leaves the real DSDT walk a clean store.
+pub fn selfTestExtended() u32 {
+    var fails: u32 = 0;
+
+    // Executor smoke test: Add(2,3) -> Local0; Return(Local0) == 5. Proves
+    // operand decode, a binary op writing a Target, Local store/load, Return.
+    stCheck("Add(2,3)", toInt(runProg(&[_]u8{ 0x72, 0x0A, 0x02, 0x0A, 0x03, 0x60, 0xA4, 0x60 })), 5, &fails);
+
+    // === A1: object model — mutable buffers, references, SizeOf =============
+
+    // Return(SizeOf(Buffer(4){})) == 4. Proves runtime Buffer() + SizeOf.
+    stCheck("SizeOf(Buffer(4))", toInt(runProg(&[_]u8{
+        0xA4, 0x87, 0x11, 0x03, 0x0A, 0x04, // Return SizeOf Buffer(PkgLen=3){ size=4 }
+    })), 4, &fails);
+
+    // Return(SizeOf("AB")) == 2; Return(SizeOf(Package(3){0,0,0})) == 3.
+    stCheck("SizeOf(\"AB\")", toInt(runProg(&[_]u8{ 0xA4, 0x87, 0x0D, 0x41, 0x42, 0x00 })), 2, &fails);
+    stCheck("SizeOf(Package(3))", toInt(runProg(&[_]u8{ 0xA4, 0x87, 0x12, 0x05, 0x03, 0x00, 0x00, 0x00 })), 3, &fails);
+
+    // Buffer write-through-Index: Store(Buffer(4){},L0); Store(0x42,Index(L0,1));
+    // Return(DerefOf(Index(L0,1))) == 0x42. Proves a runtime buffer is mutable
+    // and that Index() aliases the same storage (write then read back).
+    stCheck("Index(Buffer) store/deref", toInt(runProg(&[_]u8{
+        0x70, 0x11, 0x03, 0x0A, 0x04, 0x60, // Store Buffer(4){} -> Local0
+        0x70, 0x0A, 0x42, 0x88, 0x60, 0x0A, 0x01, 0x00, // Store 0x42 -> Index(Local0,1)
+        0xA4, 0x83, 0x88, 0x60, 0x0A, 0x01, 0x00, // Return DerefOf(Index(Local0,1))
+    })), 0x42, &fails);
+
+    // Package element read: Store(Package(2){0x11,0x22},L0);
+    // Return(DerefOf(Index(L0,1))) == 0x22.
+    stCheck("Index(Package) deref", toInt(runProg(&[_]u8{
+        0x70, 0x12, 0x06, 0x02, 0x0A, 0x11, 0x0A, 0x22, 0x60, // Store Package(2){0x11,0x22} -> L0
+        0xA4, 0x83, 0x88, 0x60, 0x0A, 0x01, 0x00, // Return DerefOf(Index(Local0,1))
+    })), 0x22, &fails);
+
+    // === A2: CreateField family (buffer-field windows) =====================
+
+    // CreateDWordField round-trip: over Buffer(8) in L0, FLD = dword@0;
+    // Store(0x12345678,FLD); Return(FLD) == 0x12345678.
+    stCheck("CreateDWordField r/w", toInt(runProg(&[_]u8{
+        0x70, 0x11, 0x03, 0x0A, 0x08, 0x60, // Store Buffer(8){} -> Local0
+        0x8A, 0x60, 0x00, 'F', 'L', 'D', '_', // CreateDWordField(Local0, 0, FLD)
+        0x70, 0x0C, 0x78, 0x56, 0x34, 0x12, 'F', 'L', 'D', '_', // Store 0x12345678 -> FLD
+        0xA4, 'F', 'L', 'D', '_', // Return(FLD)
+    })), 0x12345678, &fails);
+
+    // Same write, but read byte 1 via Index — proves the window writes into the
+    // SAME buffer and little-endian layout: byte1 of 0x12345678 == 0x56.
+    stCheck("CreateDWordField LE alias", toInt(runProg(&[_]u8{
+        0x70, 0x11, 0x03, 0x0A, 0x08, 0x60, // Store Buffer(8){} -> Local0
+        0x8A, 0x60, 0x00, 'F', 'L', 'D', '_', // CreateDWordField(Local0, 0, FLD)
+        0x70, 0x0C, 0x78, 0x56, 0x34, 0x12, 'F', 'L', 'D', '_', // Store 0x12345678 -> FLD
+        0xA4, 0x83, 0x88, 0x60, 0x0A, 0x01, 0x00, // Return DerefOf(Index(Local0,1))
+    })), 0x56, &fails);
+
+    // Arbitrary-width CreateField: 8 bits at bit offset 4 → straddles byte0/byte1.
+    // Store(0xFF,F); byte0 gets its top nibble set → 0xF0.
+    stCheck("CreateField bits@4 w8", toInt(runProg(&[_]u8{
+        0x70, 0x11, 0x03, 0x0A, 0x08, 0x60, // Store Buffer(8){} -> Local0
+        0x5B, 0x13, 0x60, 0x0A, 0x04, 0x0A, 0x08, 'B', 'Y', 'T', '_', // CreateField(Local0, 4, 8, BYT)
+        0x70, 0x0A, 0xFF, 'B', 'Y', 'T', '_', // Store 0xFF -> BYT
+        0xA4, 0x83, 0x88, 0x60, 0x00, 0x00, // Return DerefOf(Index(Local0,0)) == 0xF0
+    })), 0xF0, &fails);
+
+    // CreateBitField: single bit 5; Store(One,B); byte0 == 0x20.
+    stCheck("CreateBitField bit5", toInt(runProg(&[_]u8{
+        0x70, 0x11, 0x03, 0x0A, 0x08, 0x60, // Store Buffer(8){} -> Local0
+        0x8D, 0x60, 0x0A, 0x05, 'B', 'I', 'T', '_', // CreateBitField(Local0, 5, BIT)
+        0x70, 0x01, 'B', 'I', 'T', '_', // Store One -> BIT
+        0xA4, 0x83, 0x88, 0x60, 0x00, 0x00, // Return DerefOf(Index(Local0,0)) == 0x20
+    })), 0x20, &fails);
+
+    // === A3: conversions + buffer/string manipulation ======================
+
+    // Concatenate(Buffer{0x11,0x22}, Buffer{0x33,0x44}) -> L0; byte 2 == 0x33.
+    stCheck("Concatenate(buf,buf)", toInt(runProg(&[_]u8{
+        0x73, 0x11, 0x05, 0x0A, 0x02, 0x11, 0x22, 0x11, 0x05, 0x0A, 0x02, 0x33, 0x44, 0x60, // Concatenate(.., .., Local0)
+        0xA4, 0x83, 0x88, 0x60, 0x0A, 0x02, 0x00, // Return DerefOf(Index(Local0,2)) == 0x33
+    })), 0x33, &fails);
+
+    // ToBuffer(0x11223344) -> L0; little-endian, byte 0 == 0x44.
+    stCheck("ToBuffer(int) LE", toInt(runProg(&[_]u8{
+        0x96, 0x0C, 0x44, 0x33, 0x22, 0x11, 0x60, // ToBuffer(0x11223344, Local0)
+        0xA4, 0x83, 0x88, 0x60, 0x00, 0x00, // Return DerefOf(Index(Local0,0)) == 0x44
+    })), 0x44, &fails);
+
+    // ToInteger(Buffer{0x44,0x33,0x22,0x11}) == 0x11223344.
+    stCheck("ToInteger(buf) LE", toInt(runProg(&[_]u8{
+        0x70, 0x11, 0x07, 0x0A, 0x04, 0x44, 0x33, 0x22, 0x11, 0x60, // Store Buffer(4){..} -> L0
+        0x99, 0x60, 0x61, // ToInteger(Local0, Local1)
+        0xA4, 0x61, // Return(Local1)
+    })), 0x11223344, &fails);
+
+    // Mid(Buffer{0x10,0x20,0x30,0x40}, 1, 2) -> L0 = {0x20,0x30}; byte 1 == 0x30.
+    stCheck("Mid(buf,1,2)", toInt(runProg(&[_]u8{
+        0x9E, 0x11, 0x07, 0x0A, 0x04, 0x10, 0x20, 0x30, 0x40, 0x0A, 0x01, 0x0A, 0x02, 0x60, // Mid(.., 1, 2, L0)
+        0xA4, 0x83, 0x88, 0x60, 0x0A, 0x01, 0x00, // Return DerefOf(Index(Local0,1)) == 0x30
+    })), 0x30, &fails);
+
+    // ObjectType: Buffer==3, String==2, Integer==1.
+    stCheck("ObjectType(Buffer)", toInt(runProg(&[_]u8{ 0xA4, 0x8E, 0x11, 0x03, 0x0A, 0x01 })), 3, &fails);
+    stCheck("ObjectType(String)", toInt(runProg(&[_]u8{ 0xA4, 0x8E, 0x0D, 'X', 0x00 })), 2, &fails);
+    stCheck("ObjectType(Integer)", toInt(runProg(&[_]u8{ 0xA4, 0x8E, 0x0A, 0x05 })), 1, &fails);
+
+    // === A4: wide fields ↔ Buffer, Continue, _OSI ==========================
+
+    // A 96-bit SystemMemory field over a real kernel-owned buffer: write a
+    // 12-byte buffer through it, read it back, check byte 5 == 0x06. Proves the
+    // wide-field ↔ Buffer data path through genuine region I/O (boot + harness).
+    stWideFieldTest(&fails);
+
+    // Continue inside If inside While: sum 1..5 but skip 3 → 12. Without a
+    // proper continue this mis-sums to 15 (the Add after the If still runs).
+    stCheck("Continue in While", toInt(runProg(&[_]u8{
+        0x70, 0x00, 0x60, // Store(0, Local0)  counter
+        0x70, 0x00, 0x61, // Store(0, Local1)  sum
+        0xA2, 0x12, 0x95, 0x60, 0x0A, 0x05, // While(LLess(Local0,5)) { ...13 bytes...
+        0x75, 0x60, //   Increment(Local0)
+        0xA0, 0x06, 0x93, 0x60, 0x0A, 0x03, 0x9F, //   If(LEqual(Local0,3)) { Continue }
+        0x72, 0x61, 0x60, 0x61, //   Add(Local1, Local0, Local1)
+        0xA4, 0x61, // Return(Local1) == 12
+    })), 12, &fails);
+
+    // _OSI: a claimed Windows interface ⇒ Ones; an unknown one ⇒ Zero.
+    stCheck("_OSI(\"Windows 2009\")", toInt(runProg(&[_]u8{
+        0xA4, 0x5F, 0x4F, 0x53, 0x49, 0x0D, 'W', 'i', 'n', 'd', 'o', 'w', 's', ' ', '2', '0', '0', '9', 0x00,
+    })), ~@as(u64, 0), &fails);
+    stCheck("_OSI(\"Linux\")", toInt(runProg(&[_]u8{
+        0xA4, 0x5F, 0x4F, 0x53, 0x49, 0x0D, 'L', 'i', 'n', 'u', 'x', 0x00,
+    })), 0, &fails);
+
+    return fails;
 }
 
 // === B2c: OperationRegion / Field hardware I/O ==============================
@@ -1640,6 +2534,70 @@ fn writeField(field: *const StoredNode, value: u64) bool {
         const unit_byte = @as(u64, first_unit + u) * @as(u64, ab);
         const piece = (cur >> @as(u6, @intCast(u * abits))) & unit_mask;
         if (!writeRegionUnit(region, unit_byte, ab, piece)) return false;
+    }
+    return true;
+}
+
+// --- wide fields (> 64 bits) ↔ Buffer (A4) ----------------------------------
+// The DSM mailbox carries request/response payloads far wider than a u64. A
+// Field element wider than 64 bits reads into a Buffer (LSB-first: field bit 0
+// → buffer byte 0 bit 0) and is written from a Buffer the same way. Each access
+// unit is read/written once; partial leading/trailing units are RMW-preserved
+// by walking only the field's own bits.
+
+/// Read a field of any width into a fresh arena Buffer ((width+7)/8 bytes).
+fn readFieldBuffer(field: *const StoredNode) ?Value {
+    if (field.field_region < 0) return null;
+    const ridx: usize = @intCast(field.field_region);
+    if (ridx >= nnodes) return null;
+    const region = &nodes[ridx];
+    const width = field.field_bit_width;
+    if (width == 0) return null;
+    const out = newBuf((width + 7) / 8) orelse return null;
+    const ab = accessWidthBytes(field.field_access);
+    const abits = ab * 8;
+    var fpos: u32 = 0;
+    while (fpos < width) {
+        const abs_bit = field.field_bit_off + fpos;
+        const unit = abs_bit / abits;
+        const v = readRegionUnit(region, @as(u64, unit) * ab, ab) orelse return null;
+        var k: u32 = abs_bit - unit * abits;
+        while (k < abits and fpos < width) : ({
+            k += 1;
+            fpos += 1;
+        }) {
+            if ((v >> @as(u6, @intCast(k))) & 1 != 0) out[fpos >> 3] |= @as(u8, 1) << @as(u3, @intCast(fpos & 7));
+        }
+    }
+    return .{ .buffer = out };
+}
+
+/// Write a Buffer's bytes into a field of any width (RMW per access unit).
+fn writeFieldBuffer(field: *const StoredNode, bytes: []const u8) bool {
+    if (field.field_region < 0) return false;
+    const ridx: usize = @intCast(field.field_region);
+    if (ridx >= nnodes) return false;
+    const region = &nodes[ridx];
+    const width = field.field_bit_width;
+    if (width == 0) return false;
+    const ab = accessWidthBytes(field.field_access);
+    const abits = ab * 8;
+    var fpos: u32 = 0;
+    while (fpos < width) {
+        const abs_bit = field.field_bit_off + fpos;
+        const unit = abs_bit / abits;
+        const unit_byte = @as(u64, unit) * ab;
+        var v = readRegionUnit(region, unit_byte, ab) orelse 0;
+        var k: u32 = abs_bit - unit * abits;
+        while (k < abits and fpos < width) : ({
+            k += 1;
+            fpos += 1;
+        }) {
+            const mask = @as(u64, 1) << @as(u6, @intCast(k));
+            const src_set = if ((fpos >> 3) < bytes.len) (bytes[fpos >> 3] >> @as(u3, @intCast(fpos & 7))) & 1 else 0;
+            if (src_set != 0) v |= mask else v &= ~mask;
+        }
+        if (!writeRegionUnit(region, unit_byte, ab, v)) return false;
     }
     return true;
 }
@@ -2470,6 +3428,12 @@ pub fn reportPrtPciJoin() void {
 /// logs a summary; a malformed table yields a partial walk, never a fault.
 /// Returns the total named-object count.
 pub fn load() u32 {
+    // Deterministic interpreter self-tests first. Each is self-contained (walks
+    // its own hand-assembled table into the store), so it must run BEFORE the
+    // reset below — which then hands the real DSDT walk a clean namespace.
+    const st_fails = selfTestExtended();
+    if (st_fails != 0) debug.klog("[aml] !!! {d} interpreter self-test(s) FAILED\n", .{st_fails});
+
     node_count = 0;
     unknown_op_seen = 0;
     nnodes = 0;
@@ -2501,6 +3465,11 @@ pub fn load() u32 {
         _ = walkBody(&synth_ssdt); // thermal zone \_SB.TZ0
         _ = walkBody(&synth_battery); // battery \_SB.BAT0
     }
+
+    // Freeze the static namespace size: everything walked so far is permanent;
+    // CreateField nodes created later at exec time live past this mark and are
+    // reclaimed by each top-level arenaReset.
+    static_nnodes = nnodes;
 
     if (unknown_op_seen != 0) {
         debug.klog("[aml] walk stopped early at unmodeled opcode 0x{X} ({d} objects so far)\n", .{ unknown_op_seen, node_count });
@@ -2539,10 +3508,10 @@ pub fn load() u32 {
         debug.klog("[aml] \\_S5_ not found in namespace store\n", .{});
     }
 
-    // B2b proof: run the executor. First a deterministic self-test, then invoke
-    // a real firmware control method (\_SB_.PCI0._PRT: If/Else on \PICF returning
-    // a PCI-routing Package) to exercise method calls + control flow end to end.
-    selfTest();
+    // B2b proof: run the executor against a real firmware control method
+    // (\_SB_.PCI0._PRT: If/Else on \PICF returning a PCI-routing Package) to
+    // exercise method calls + control flow end to end. (The deterministic
+    // interpreter self-tests already ran at the top of load(), before the walk.)
     if (evalMethod("\\_SB_.PCI0._PRT")) |rv| {
         switch (rv) {
             .package => |p| debug.klog("[aml] invoked \\_SB_.PCI0._PRT -> Package[{d}] (PCI IRQ routing)\n", .{p.len}),
