@@ -96,6 +96,20 @@ const UAS_STREAM_ID: u16 = 1;
 const EP_MAXPSTREAMS_1: u32 = 1; // -> 4-entry primary stream array
 const SCT_PRIMARY_RING: u32 = 1; // Stream Context Type = primary transfer ring
 
+// UAS Information Unit IDs (UAS spec §4.1) — sent/received on the pipes.
+const UAS_IU_COMMAND = 0x01; // host -> device, command pipe
+const UAS_IU_SENSE = 0x03; // device -> host, status pipe (final status)
+const UAS_IU_RESPONSE = 0x04; // device -> host, status pipe (task-mgmt resp)
+const UAS_IU_READ_READY = 0x06; // device -> host, status pipe (ready to send)
+const UAS_IU_WRITE_READY = 0x07; // device -> host, status pipe (ready to recv)
+
+// Buffer offsets within the UAS data_phys page (U3). Command IU and the
+// Sense IU are kept apart from the data staging area so a single page backs
+// all three for a one-sector transfer.
+const UAS_CMD_IU_OFF: usize = 0; // Command IU (32 B)
+const UAS_DATA_OFF: usize = 512; // data staging (<= 512 B / sector)
+const UAS_STATUS_IU_OFF: usize = 3072; // Sense/Ready IU (64 B)
+
 // USB request types
 const REQ_GET_DESCRIPTOR = 6;
 const REQ_SET_CONFIGURATION = 9;
@@ -168,8 +182,14 @@ const UasInfo = struct {
     in_sca: usize = 0, // data-in Primary Stream Array (phys)
     out_sca: usize = 0, // data-out Primary Stream Array (phys)
     data_phys: usize = 0, // IU + data DMA staging buffer
+    // U3: SCSI geometry from READ CAPACITY.
+    block_size: u32 = 512,
+    block_count: u32 = 0,
 };
 var uas_dev: UasInfo = .{};
+// Serializes the UAS transport (Command IU + data + Status IU share one
+// data_phys staging page + the stream rings + the global event ring).
+var uas_lock: SpinLock = .{};
 
 // Per-device lock for the MSC bulk-transport path. mscScsiCommand shares
 // dev.data_phys (CBW@0/data@512/CSW@1024) + the device's bulk in/out rings,
@@ -1107,6 +1127,8 @@ fn enumerateDevice(port: u8, speed: u8) void {
             debug.klog("[uas] no streams advertised (device not at SuperSpeed) — UAS transport requires streams; skipping endpoint setup\n", .{});
         } else if (!setupUasStreams(slot_id, input_ctx_phys, speed_val)) {
             debug.klog("[uas] stream endpoint setup failed\n", .{});
+        } else {
+            uasProbe(); // INQUIRY + READ CAPACITY + verification READ(10) of LBA0
         }
     }
 
@@ -1589,6 +1611,249 @@ fn setupUasStreams(slot_id: u8, input_ctx_phys: usize, speed_val: u32) bool {
     return true;
 }
 
+// --- UAS transport: Command IU -> data stream -> Status IU (Slice U3) ------
+
+/// Queue an IN transfer on the status stream (id 1) to receive one IU.
+fn queueStatusRecv(d: *UasInfo, status_buf: usize) void {
+    if (d.status_ring) |*r| {
+        ringEnqueue(r, .{
+            .param_lo = @truncate(status_buf),
+            .param_hi = @truncate(status_buf >> 32),
+            .status = 64,
+            .control = (TRB_NORMAL << 10) | (1 << 5), // IOC
+        });
+    }
+    ringDoorbellStream(d.slot_id, d.status_dci, UAS_STREAM_ID);
+}
+
+/// Run one SCSI command over UAS using stream id 1 (serialized). The flow:
+/// send a Command IU on the command pipe, pre-queue the data transfer on its
+/// stream, then receive IUs on the status stream until a Sense IU arrives —
+/// handling Read/Write Ready IUs and demuxing data-vs-status completions by
+/// the transfer event's Endpoint ID. Returns true on GOOD SCSI status.
+fn uasScsiCommand(cdb: []const u8, cdb_len: u8, data: ?[*]u8, data_len: u32, data_in: bool) bool {
+    const d = &uas_dev;
+    if (!d.configured) return false;
+    uas_lock.acquire();
+    defer uas_lock.release();
+    // Keep pollHID from draining our transfer events between doorbell + wait.
+    event_drain_locked = true;
+    defer event_drain_locked = false;
+
+    const base = d.data_phys;
+
+    // --- Command IU on the command pipe (no stream) ---
+    const iu: [*]volatile u8 = @ptrFromInt(paging.physToVirt(base + UAS_CMD_IU_OFF));
+    @memset(iu[0..32], 0);
+    iu[0] = UAS_IU_COMMAND;
+    iu[2] = @truncate(UAS_STREAM_ID >> 8); // Tag (big-endian) == stream id
+    iu[3] = @truncate(UAS_STREAM_ID);
+    // iu[4] task attribute = Simple(0); iu[6] additional CDB length = 0;
+    // iu[8..16] LUN = 0.
+    const cn = @min(cdb_len, 16);
+    @memcpy(iu[16..][0..cn], cdb[0..cn]);
+
+    if (d.cmd_ring) |*r| {
+        ringEnqueue(r, .{
+            .param_lo = @truncate(base + UAS_CMD_IU_OFF),
+            .param_hi = @truncate((base + UAS_CMD_IU_OFF) >> 32),
+            .status = 32,
+            .control = (TRB_NORMAL << 10) | (1 << 5),
+        });
+    } else return false;
+    ringDoorbell(d.slot_id, d.cmd_dci);
+    if (waitForEvent(TRB_EVENT_TRANSFER, 500000) == null) {
+        debug.klog("[uas] command IU send timeout\n", .{});
+        return false;
+    }
+
+    // --- Pre-queue the data transfer on its stream (if any) ---
+    const data_buf = base + UAS_DATA_OFF;
+    if (data_len > 0) {
+        if (!data_in) {
+            if (data) |src| {
+                const dst: [*]u8 = @ptrFromInt(paging.physToVirt(data_buf));
+                @memcpy(dst[0..data_len], src[0..data_len]);
+            }
+        }
+        const dtrb = TRB{
+            .param_lo = @truncate(data_buf),
+            .param_hi = @truncate(data_buf >> 32),
+            .status = data_len,
+            .control = (TRB_NORMAL << 10) | (1 << 5),
+        };
+        if (data_in) {
+            if (d.in_ring) |*r| ringEnqueue(r, dtrb);
+            ringDoorbellStream(d.slot_id, d.in_dci, UAS_STREAM_ID);
+        } else {
+            if (d.out_ring) |*r| ringEnqueue(r, dtrb);
+            ringDoorbellStream(d.slot_id, d.out_dci, UAS_STREAM_ID);
+        }
+    }
+
+    // --- Status loop: receive IUs until the Sense IU, demuxing by endpoint ---
+    const status_buf = base + UAS_STATUS_IU_OFF;
+    var data_done = (data_len == 0);
+    var scsi_status: u8 = 0xFF;
+    queueStatusRecv(d, status_buf);
+    var guard: u8 = 0;
+    while (guard < 8) : (guard += 1) {
+        const evt = waitForEvent(TRB_EVENT_TRANSFER, 500000) orelse {
+            debug.klog("[uas] transfer timeout (guard={d})\n", .{guard});
+            return false;
+        };
+        const ep = @as(u8, @truncate((evt.control >> 16) & 0x1F)); // Endpoint ID
+        if (ep == d.in_dci or ep == d.out_dci) {
+            data_done = true;
+        } else if (ep == d.status_dci) {
+            const sbuf: [*]const volatile u8 = @ptrFromInt(paging.physToVirt(status_buf));
+            const iu_id = sbuf[0];
+            if (iu_id == UAS_IU_SENSE) {
+                scsi_status = sbuf[6];
+                break;
+            } else if (iu_id == UAS_IU_READ_READY or iu_id == UAS_IU_WRITE_READY) {
+                // Device signalled ready; the data transfer is already queued.
+                // Re-arm the status receive to catch the final Sense IU.
+                queueStatusRecv(d, status_buf);
+            } else {
+                debug.klog("[uas] unexpected IU id=0x{x}\n", .{iu_id});
+                return false;
+            }
+        }
+    }
+    if (scsi_status == 0xFF) {
+        debug.klog("[uas] no Sense IU received\n", .{});
+        return false;
+    }
+    // If the Sense IU beat the data completion, drain the trailing data event.
+    if (!data_done) _ = waitForEvent(TRB_EVENT_TRANSFER, 200000);
+
+    if (data_in and data != null and data_len > 0) {
+        const src: [*]const u8 = @ptrFromInt(paging.physToVirt(data_buf));
+        @memcpy(data.?[0..data_len], src[0..data_len]);
+    }
+    if (scsi_status != 0) {
+        debug.klog("[uas] SCSI status=0x{x}\n", .{scsi_status});
+        return false;
+    }
+    return true;
+}
+
+/// Read one block at `lba` into `buf` (512-byte sectors). READ(10).
+fn uasReadOneSector(lba: u32, buf: *[512]u8) bool {
+    const cdb = [_]u8{
+        0x28, 0, // READ(10), flags
+        @truncate(lba >> 24), @truncate(lba >> 16), @truncate(lba >> 8), @truncate(lba),
+        0, 0, 1, 0, // group, transfer length = 1 block, control
+    };
+    return uasScsiCommand(&cdb, 10, buf, 512, true);
+}
+
+/// Probe the UAS disk after the endpoints are configured: INQUIRY, TEST UNIT
+/// READY, READ CAPACITY (records geometry), then a verification READ(10) of
+/// LBA 0 whose signature is logged. Runs during boot enumeration.
+fn uasProbe() void {
+    var inq: [36]u8 = [_]u8{0} ** 36;
+    if (uasScsiCommand(&[_]u8{ 0x12, 0, 0, 0, 36, 0 }, 6, &inq, 36, true))
+        debug.klog("[uas] INQUIRY ok: vendor='{s}'\n", .{inq[8..16]})
+    else
+        debug.klog("[uas] INQUIRY failed\n", .{});
+
+    _ = uasScsiCommand(&[_]u8{ 0x00, 0, 0, 0, 0, 0 }, 6, null, 0, false); // TEST UNIT READY
+
+    var cap: [8]u8 = [_]u8{0} ** 8;
+    if (uasScsiCommand(&[_]u8{ 0x25, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, 10, &cap, 8, true)) {
+        const last_lba = @as(u32, cap[0]) << 24 | @as(u32, cap[1]) << 16 | @as(u32, cap[2]) << 8 | cap[3];
+        const bs = @as(u32, cap[4]) << 24 | @as(u32, cap[5]) << 16 | @as(u32, cap[6]) << 8 | cap[7];
+        uas_dev.block_count = last_lba +% 1;
+        uas_dev.block_size = bs;
+        debug.klog("[uas] READ CAPACITY: {d} blocks x {d} bytes ({d} MiB)\n", .{ uas_dev.block_count, bs, (@as(u64, uas_dev.block_count) * bs) / (1024 * 1024) });
+    } else debug.klog("[uas] READ CAPACITY failed\n", .{});
+
+    // Verification read: LBA 0 carries a known signature in the test image.
+    var sec: [512]u8 = [_]u8{0} ** 512;
+    if (uasReadOneSector(0, &sec)) {
+        var txt: [24]u8 = undefined;
+        for (0..24) |i| {
+            const c = sec[i];
+            txt[i] = if (c >= 0x20 and c < 0x7F) c else '.';
+        }
+        debug.klog("[uas] READ(10) LBA0 ok -> \"{s}\"\n", .{txt[0..24]});
+    } else debug.klog("[uas] READ(10) LBA0 failed\n", .{});
+
+    // Write round-trip self-test: write a known pattern to the LAST block
+    // (leaves the LBA0 signature intact for the read verify above), read it
+    // back, and confirm it matches — exercises the OUT data stream + the
+    // WRITE_READY IU path end-to-end. The UAS image is a scratch test disk.
+    if (uas_dev.block_count > 1 and uas_dev.block_size == 512) {
+        const scratch_lba: u32 = uas_dev.block_count - 1;
+        var wbuf: [512]u8 = undefined;
+        for (0..512) |i| wbuf[i] = @truncate(0x55 ^ (i *% 7));
+        var rbuf: [512]u8 = [_]u8{0} ** 512;
+        const wok = uasWriteSectors(scratch_lba, 1, &wbuf);
+        const rok = uasReadSectors(scratch_lba, 1, &rbuf);
+        var match = wok and rok;
+        if (match) {
+            for (0..512) |i| {
+                if (wbuf[i] != rbuf[i]) {
+                    match = false;
+                    break;
+                }
+            }
+        }
+        if (match)
+            debug.klog("[uas] WRITE(10)+readback round-trip OK (LBA {d}) — write path live\n", .{scratch_lba})
+        else
+            debug.klog("[uas] WRITE(10) round-trip FAILED (w={any} r={any})\n", .{ wok, rok });
+    }
+
+    debug.klog("[uas] active USB block device: UAS via /dev/usb0 + usb_* syscalls (supersedes BOT)\n", .{});
+}
+
+/// Read `count` 512-byte sectors from `lba` into `buf` (one block per
+/// command — serialized, like the MSC path). For U4 / the block layer.
+pub fn uasReadSectors(lba: u32, count: u16, buf: [*]u8) bool {
+    if (!uas_dev.configured) return false;
+    var i: u16 = 0;
+    while (i < count) : (i += 1) {
+        var sec: [512]u8 = undefined;
+        if (!uasReadOneSector(lba + i, &sec)) return false;
+        @memcpy(buf[@as(usize, i) * 512 ..][0..512], sec[0..512]);
+    }
+    return true;
+}
+
+/// Write one 512-byte block at `lba` from `buf`. WRITE(10). uasScsiCommand
+/// copies the OUT data into its DMA staging area and only reads through the
+/// pointer, so const-casting the caller's buffer is safe.
+fn uasWriteOneSector(lba: u32, buf: [*]const u8) bool {
+    const cdb = [_]u8{
+        0x2A, 0, // WRITE(10), flags
+        @truncate(lba >> 24), @truncate(lba >> 16), @truncate(lba >> 8), @truncate(lba),
+        0, 0, 1, 0, // group, transfer length = 1 block, control
+    };
+    return uasScsiCommand(&cdb, 10, @constCast(buf), 512, false);
+}
+
+/// Write `count` 512-byte sectors from `buf` to `lba` (one block per
+/// command — serialized, mirrors uasReadSectors). For U4 / the block layer.
+pub fn uasWriteSectors(lba: u32, count: u16, buf: [*]const u8) bool {
+    if (!uas_dev.configured) return false;
+    var i: u16 = 0;
+    while (i < count) : (i += 1) {
+        if (!uasWriteOneSector(lba + i, buf + @as(usize, i) * 512)) return false;
+    }
+    return true;
+}
+
+pub fn uasBlockCount() u32 {
+    return uas_dev.block_count;
+}
+
+pub fn uasBlockSize() u32 {
+    return uas_dev.block_size;
+}
+
 /// True if a UAS device was detected during enumeration.
 pub fn uasPresent() bool {
     return uas_dev.present;
@@ -1623,10 +1888,81 @@ pub fn uasReport() void {
         debug.klog("[uas]   endpoints: cmd dci={d} | status dci={d} | data-in dci={d} | data-out dci={d} (stream id {d})\n", .{
             d.cmd_dci, d.status_dci, d.in_dci, d.out_dci, UAS_STREAM_ID,
         });
-        debug.klog("[uas]   transport: stream endpoints configured (U2); IU command flow pending (U3)\n", .{});
+        if (d.block_count != 0) {
+            debug.klog("[uas]   disk: {d} blocks x {d} bytes = {d} MiB (READ(10) over streams)\n", .{
+                d.block_count, d.block_size, (@as(u64, d.block_count) * d.block_size) / (1024 * 1024),
+            });
+        } else {
+            debug.klog("[uas]   disk: not probed\n", .{});
+        }
     } else {
         debug.klog("[uas]   transport: endpoints not configured\n", .{});
     }
+}
+
+// ===================================================================
+// Unified USB block device. UAS (xHCI Streams) supersedes BOT when both
+// are present, so devfs (/dev/usb0) and the usb_* syscalls transparently
+// use the faster transport. UAS-only and BOT-only setups both still work.
+// ===================================================================
+
+pub const UsbBlockKind = enum { none, bot, uas };
+
+/// A UAS disk is usable as a block device once its endpoints are configured
+/// and READ CAPACITY has filled in the geometry.
+fn uasUsable() bool {
+    return uas_dev.configured and uas_dev.block_count != 0;
+}
+
+/// Which USB block transport backs /dev/usb0 right now. UAS wins ties.
+pub fn usbBlockKind() UsbBlockKind {
+    if (uasUsable()) return .uas;
+    if (hasMscDevice()) return .bot;
+    return .none;
+}
+
+pub fn usbBlockKindName() []const u8 {
+    return switch (usbBlockKind()) {
+        .uas => "UAS",
+        .bot => "BOT",
+        .none => "none",
+    };
+}
+
+pub fn usbBlockPresent() bool {
+    return usbBlockKind() != .none;
+}
+
+pub fn usbBlockSize() u32 {
+    return switch (usbBlockKind()) {
+        .uas => uas_dev.block_size,
+        .bot => getMscBlockSize(),
+        .none => 0,
+    };
+}
+
+pub fn usbBlockCount() u32 {
+    return switch (usbBlockKind()) {
+        .uas => uas_dev.block_count,
+        .bot => getMscBlockCount(),
+        .none => 0,
+    };
+}
+
+pub fn usbReadSectors(lba: u32, count: u16, buf: [*]u8) bool {
+    return switch (usbBlockKind()) {
+        .uas => uasReadSectors(lba, count, buf),
+        .bot => mscReadSectors(lba, count, buf),
+        .none => false,
+    };
+}
+
+pub fn usbWriteSectors(lba: u32, count: u16, buf: [*]const u8) bool {
+    return switch (usbBlockKind()) {
+        .uas => uasWriteSectors(lba, count, buf),
+        .bot => mscWriteSectors(lba, count, buf),
+        .none => false,
+    };
 }
 
 /// Read `count` sectors starting at `lba` into `buf`. mscScsiCommand uses

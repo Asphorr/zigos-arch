@@ -249,11 +249,11 @@ pub fn sysUsbInfo(info_ptr: u32) u32 {
     if (!validateUserPtrAligned(info_ptr, @sizeOf(UsbInfoUser), @alignOf(UsbInfoUser))) return E_INVAL;
     const dst: *UsbInfoUser = @ptrFromInt(@as(usize, info_ptr));
     dst.* = .{ .present = 0, .block_size = 0, .block_count = 0 };
-    if (!xhci.hasMscDevice()) return E_INVAL;
+    if (!xhci.usbBlockPresent()) return E_INVAL;
     dst.* = .{
         .present = 1,
-        .block_size = xhci.getMscBlockSize(),
-        .block_count = xhci.getMscBlockCount(),
+        .block_size = xhci.usbBlockSize(),
+        .block_count = xhci.usbBlockCount(),
     };
     return 0;
 }
@@ -264,12 +264,12 @@ pub fn sysUsbInfo(info_ptr: u32) u32 {
 /// containing the buffer pointer; mistaken caller sizing risks overflowing
 /// later memory. Returns 0 on success.
 pub fn sysUsbReadSector(lba: u32, buf_ptr: u32) u32 {
-    if (!xhci.hasMscDevice()) return E_INVAL;
-    const block_size = xhci.getMscBlockSize();
+    if (!xhci.usbBlockPresent()) return E_INVAL;
+    const block_size = xhci.usbBlockSize();
     if (block_size == 0 or block_size > 4096) return E_INVAL;
     if (!validateUserPtr(buf_ptr, block_size)) return E_FAULT;
     const buf: [*]u8 = @ptrFromInt(@as(usize, buf_ptr));
-    if (!xhci.mscReadSectors(lba, 1, buf)) return E_INVAL;
+    if (!xhci.usbReadSectors(lba, 1, buf)) return E_INVAL;
     return 0;
 }
 
@@ -277,12 +277,12 @@ pub fn sysUsbReadSector(lba: u32, buf_ptr: u32) u32 {
 /// as `sysUsbReadSector`. Returns 0 on success, 0xFFFFFFFF if no device or
 /// the underlying SCSI WRITE(10) failed.
 pub fn sysUsbWriteSector(lba: u32, buf_ptr: u32) u32 {
-    if (!xhci.hasMscDevice()) return E_INVAL;
-    const block_size = xhci.getMscBlockSize();
+    if (!xhci.usbBlockPresent()) return E_INVAL;
+    const block_size = xhci.usbBlockSize();
     if (block_size == 0 or block_size > 4096) return E_INVAL;
     if (!validateUserPtr(buf_ptr, block_size)) return E_FAULT;
     const buf: [*]const u8 = @ptrFromInt(@as(usize, buf_ptr));
-    if (!xhci.mscWriteSectors(lba, 1, buf)) return E_INVAL;
+    if (!xhci.usbWriteSectors(lba, 1, buf)) return E_INVAL;
     return 0;
 }
 

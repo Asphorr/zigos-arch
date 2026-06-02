@@ -9,13 +9,14 @@
 //   /dev/null    write-discard, read returns 0 (EOF)
 //   /dev/zero    read returns zeros forever
 //   /dev/random  read returns xorshift32-derived bytes
-//   /dev/usb0    raw block access to the first USB Mass Storage device.
+//   /dev/usb0    raw block access to the first USB block device (UAS or BOT).
 //                 sector-aligned (offset and count multiples of block_size,
 //                 typically 512). Returns 0xFFFFFFFF on misalignment.
 //
 // /dev/usb0 is meant as the kernel-side counterpart to usbcat/usbwrite —
 // it lets generic byte tools (`cat /dev/usb0 > backup.bin`, `wc -c …`)
-// exercise the xHCI MSC code path without bespoke utilities.
+// exercise the xHCI USB block path (UAS streams, else BOT) without
+// bespoke utilities.
 
 const std = @import("std");
 const xhci = @import("../driver/xhci.zig");
@@ -76,8 +77,8 @@ pub fn deviceSize(idx: u32) u64 {
     return switch (DEVICES[idx].kind) {
         .null_dev, .zero_dev, .random_dev => 0,
         .usb0 => blk: {
-            const bs: u64 = xhci.getMscBlockSize();
-            const bc: u64 = xhci.getMscBlockCount();
+            const bs: u64 = xhci.usbBlockSize();
+            const bc: u64 = xhci.usbBlockCount();
             break :blk bs * bc;
         },
         .kmsg => serial.ringSize(),
@@ -133,9 +134,9 @@ pub fn write(idx: u32, offset: u32, buf: [*]const u8, count: u32) u32 {
 }
 
 fn readUsb(offset: u32, buf: [*]u8, count: u32) u32 {
-    const bs = xhci.getMscBlockSize();
-    const bc = xhci.getMscBlockCount();
-    if (bs == 0 or bc == 0) return 0xFFFFFFFF; // no MSC device
+    const bs = xhci.usbBlockSize();
+    const bc = xhci.usbBlockCount();
+    if (bs == 0 or bc == 0) return 0xFFFFFFFF; // no USB block device
     if (bs != 512) return 0xFFFFFFFF; // only 512-byte sectors supported here
     if (offset % bs != 0 or count < bs) return 0xFFFFFFFF;
     const sector_count = count / bs;
@@ -143,21 +144,21 @@ fn readUsb(offset: u32, buf: [*]u8, count: u32) u32 {
     if (start_lba >= bc) return 0; // EOF — past end of device
     const max_avail = bc - start_lba;
     const take: u32 = @intCast(@min(@as(u64, sector_count), @as(u64, max_avail)));
-    // mscReadSectors itself loops one sector at a time (data buffer limit),
+    // usbReadSectors itself loops one sector at a time (data buffer limit),
     // so it's safe to call with `take` directly. Stop on the first failure
     // so the caller sees a short read rather than corrupt-mixed data.
     var done: u32 = 0;
     var s: u32 = 0;
     while (s < take) : (s += 1) {
-        if (!xhci.mscReadSectors(start_lba + s, 1, buf + done)) break;
+        if (!xhci.usbReadSectors(start_lba + s, 1, buf + done)) break;
         done += bs;
     }
     return done;
 }
 
 fn writeUsb(offset: u32, buf: [*]const u8, count: u32) u32 {
-    const bs = xhci.getMscBlockSize();
-    const bc = xhci.getMscBlockCount();
+    const bs = xhci.usbBlockSize();
+    const bc = xhci.usbBlockCount();
     if (bs == 0 or bc == 0) return 0xFFFFFFFF;
     if (bs != 512) return 0xFFFFFFFF;
     if (offset % bs != 0 or count < bs) return 0xFFFFFFFF;
@@ -169,7 +170,7 @@ fn writeUsb(offset: u32, buf: [*]const u8, count: u32) u32 {
     var done: u32 = 0;
     var s: u32 = 0;
     while (s < take) : (s += 1) {
-        if (!xhci.mscWriteSectors(start_lba + s, 1, buf + done)) break;
+        if (!xhci.usbWriteSectors(start_lba + s, 1, buf + done)) break;
         done += bs;
     }
     return done;
