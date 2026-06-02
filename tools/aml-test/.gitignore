@@ -1,0 +1,6 @@
+# The real aml.zig is copied in by run.sh on each run — never commit the copy.
+/src/acpi/aml.zig
+# Zig build artifacts
+.zig-cache/
+zig-cache/
+zig-out/

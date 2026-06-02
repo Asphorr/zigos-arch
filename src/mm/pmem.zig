@@ -293,6 +293,11 @@ pub fn init() void {
         // NFIT oracle proves the whole dynamic AML path works against real
         // firmware, not just discovery.
         if (nv.has_fit) fitCrossCheck(nv.path);
+
+        // Labels (the AML "finish"): drive the per-NVDIMM `_DSM` label functions
+        // over the same DSM mailbox `_FIT` rides — proving the interpreter works
+        // the mailbox for functions beyond FIT, not just FIT discovery.
+        dsmLabelProbe(nv.path);
     } else {
         debug.klog("[pmem] AML: no ACPI0012 NVDIMM root device found in namespace\n", .{});
     }
@@ -339,4 +344,151 @@ fn fitCrossCheck(dev_path: []const u8) void {
     debug.klog("[pmem] AML _FIT vs static NFIT: dyn[base=0x{x} len=0x{x}] static[base=0x{x} len=0x{x}] => {s}\n", .{
         dyn.base, dyn.length, stat.base, stat.length, if (match) "MATCH" else "MISMATCH",
     });
+}
+
+// === labels: per-NVDIMM _DSM (driving the DSM mailbox beyond _FIT) ===========
+
+// NVDIMM _DSM interface UUIDs in ACPI ToUUID() mixed-endian byte order (first
+// three fields little-endian, last two as written). The per-device label
+// functions dispatch on the device UUID; the root _FIT/query uses the root UUID.
+const NVDIMM_ROOT_UUID = [16]u8{ // 2F10E7A4-9E91-11E4-89D3-123B93F75CBA
+    0xA4, 0xE7, 0x10, 0x2F, 0x91, 0x9E, 0xE4, 0x11,
+    0x89, 0xD3, 0x12, 0x3B, 0x93, 0xF7, 0x5C, 0xBA,
+};
+const NVDIMM_DEV_UUID = [16]u8{ // 4309AC30-0D11-11E4-9191-0800200C9A66
+    0x30, 0xAC, 0x09, 0x43, 0x11, 0x0D, 0xE4, 0x11,
+    0x91, 0x91, 0x08, 0x00, 0x20, 0x0C, 0x9A, 0x66,
+};
+
+fn le32(b: []const u8, off: usize) u32 {
+    if (off + 4 > b.len) return 0;
+    return @as(u32, b[off]) | (@as(u32, b[off + 1]) << 8) |
+        (@as(u32, b[off + 2]) << 16) | (@as(u32, b[off + 3]) << 24);
+}
+
+fn dumpHex(label: []const u8, b: []const u8, max: usize) void {
+    debug.klog("{s}", .{label});
+    var i: usize = 0;
+    while (i < b.len and i < max) : (i += 1) debug.klog(" {x:0>2}", .{b[i]});
+    if (b.len > max) debug.klog(" … ({d} bytes)", .{b.len});
+    debug.klog("\n", .{});
+}
+
+/// Labels (the AML "finish"): exercise the per-NVDIMM `_DSM` label functions over
+/// the same DSM mailbox `_FIT` rides, proving the interpreter drives the mailbox
+/// for functions beyond FIT discovery. Enumerates the child NVDIMM device,
+/// queries its supported functions, then reads the Namespace Label Storage Area
+/// size and cross-checks it against the launcher's configured `label-size`. Every
+/// step logs; a not-supported result (no label-size configured) stays legible.
+fn dsmLabelProbe(root_path: []const u8) void {
+    const dev = aml.nvdimmFirstDevice(root_path) orelse {
+        debug.klog("[pmem] AML _DSM labels: no child NVDIMM device exposes _DSM under '{s}'\n", .{root_path});
+        return;
+    };
+    debug.klog("[pmem] AML _DSM labels: child NVDIMM device '{s}'\n", .{dev});
+
+    // Function 0 (query) — supported-function bitmap. No input; proves the 4-arg
+    // _DSM path + device-UUID dispatch even before labels are configured.
+    if (aml.callDsm(dev, &NVDIMM_DEV_UUID, 1, 0, null)) |q| {
+        if (aml.asBuffer(q)) |qb| {
+            dumpHex("[pmem] AML _DSM query (func0):", qb, 16);
+        } else debug.klog("[pmem] AML _DSM query (func0): non-buffer result\n", .{});
+    } else debug.klog("[pmem] AML _DSM query (func0): did not evaluate\n", .{});
+
+    // Function 4 (Get Namespace Label Size) — output [status u32][size u32][max_xfer u32].
+    const expect: u32 = 2 * 1024 * 1024; // launcher label-size=2M
+    var labels_ok = false;
+    if (aml.callDsm(dev, &NVDIMM_DEV_UUID, 1, 4, null)) |r| {
+        if (aml.asBuffer(r)) |rb| {
+            dumpHex("[pmem] AML _DSM GetLabelSize (func4):", rb, 16);
+            if (rb.len >= 8) {
+                const status = le32(rb, 0);
+                const lsize = le32(rb, 4);
+                labels_ok = status == 0 and lsize == expect;
+                debug.klog("[pmem] AML _DSM label area: status={d} size={d} ({d} KiB) vs expected {d} => {s}\n", .{
+                    status, lsize, lsize / 1024, expect,
+                    if (labels_ok) "MATCH" else "MISMATCH",
+                });
+            }
+        } else debug.klog("[pmem] AML _DSM GetLabelSize: non-buffer result\n", .{});
+    } else debug.klog("[pmem] AML _DSM GetLabelSize: did not evaluate\n", .{});
+
+    // Functions 5/6: the label-data round trip + cross-reboot persistence proof.
+    if (labels_ok) dsmLabelRoundTrip(dev);
+}
+
+const LBL_MAGIC = [8]u8{ 'Z', 'I', 'G', 'L', 'B', 'L', '0', '1' }; // signature at LSA offset 0
+
+fn writeLe32(b: []u8, off: usize, v: u32) void {
+    b[off] = @truncate(v);
+    b[off + 1] = @truncate(v >> 8);
+    b[off + 2] = @truncate(v >> 16);
+    b[off + 3] = @truncate(v >> 24);
+}
+
+fn bytesEql(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    var i: usize = 0;
+    while (i < a.len) : (i += 1) if (a[i] != b[i]) return false;
+    return true;
+}
+
+/// The label-data round trip + persistence proof (M-C/M-D): read the Label
+/// Storage Area via `_DSM` func 5, write a signature record via func 6, read it
+/// back to confirm the in-boot round trip, and — across reboots — detect a prior
+/// boot's signature to prove it persisted. Label data moves ONLY through the DSM
+/// mailbox (not the mmap'd SPA), so this drives the bidirectional mailbox end to
+/// end with real INPUT marshaling (offset/length, then offset/length/data). The
+/// signature is raw scratch at LSA offset 0 — we deliberately don't write a real
+/// namespace label (the index-block format is a separate concern); the point is
+/// the data path, not namespace management.
+fn dsmLabelRoundTrip(dev: []const u8) void {
+    const REC = 12; // 8-byte magic + u32 write counter
+
+    // --- M-C: Get Label Data (func 5), offset 0, REC bytes → [status u32][data REC] ---
+    var in5: [8]u8 = undefined; // {offset u32, length u32}
+    writeLe32(&in5, 0, 0);
+    writeLe32(&in5, 4, REC);
+    var prior: u32 = 0;
+    var persisted = false;
+    if (aml.callDsm(dev, &NVDIMM_DEV_UUID, 1, 5, &in5)) |r| {
+        if (aml.asBuffer(r)) |rb| {
+            dumpHex("[pmem] AML _DSM GetLabelData (func5) @0:", rb, 4 + REC);
+            if (rb.len >= 4 + REC and le32(rb, 0) == 0 and bytesEql(rb[4 .. 4 + 8], &LBL_MAGIC)) {
+                prior = le32(rb, 4 + 8);
+                persisted = true;
+            }
+        } else debug.klog("[pmem] AML _DSM GetLabelData: non-buffer result\n", .{});
+    } else debug.klog("[pmem] AML _DSM GetLabelData: did not evaluate\n", .{});
+    if (persisted) {
+        debug.klog("[pmem] AML _DSM labels: signature PERSISTED across reboot — prior write #{d}\n", .{prior});
+    } else {
+        debug.klog("[pmem] AML _DSM labels: no prior signature (fresh LSA)\n", .{});
+    }
+
+    // --- M-D: Set Label Data (func 6) — write magic + incremented counter ---
+    const next = prior + 1;
+    var in6: [8 + REC]u8 = undefined; // {offset u32, length u32, data[REC]}
+    writeLe32(&in6, 0, 0);
+    writeLe32(&in6, 4, REC);
+    @memcpy(in6[8 .. 8 + 8], &LBL_MAGIC);
+    writeLe32(&in6, 8 + 8, next);
+    if (aml.callDsm(dev, &NVDIMM_DEV_UUID, 1, 6, &in6)) |w| {
+        var st6: u32 = 0xffffffff;
+        if (aml.asBuffer(w)) |wb| {
+            if (wb.len >= 4) st6 = le32(wb, 0);
+        }
+        debug.klog("[pmem] AML _DSM SetLabelData (func6): status={d} (wrote signature #{d})\n", .{ st6, next });
+    } else debug.klog("[pmem] AML _DSM SetLabelData: did not evaluate\n", .{});
+
+    // --- verify the write in-boot: read back, expect magic + next ---
+    if (aml.callDsm(dev, &NVDIMM_DEV_UUID, 1, 5, &in5)) |r2| {
+        if (aml.asBuffer(r2)) |rb2| {
+            const ok = rb2.len >= 4 + REC and le32(rb2, 0) == 0 and
+                bytesEql(rb2[4 .. 4 + 8], &LBL_MAGIC) and le32(rb2, 4 + 8) == next;
+            if (ok) {
+                debug.klog("[pmem] AML _DSM labels: in-boot read-back OK (signature #{d}) => ROUND-TRIP\n", .{next});
+            } else dumpHex("[pmem] AML _DSM labels: read-back MISMATCH:", rb2, 4 + REC);
+        }
+    }
 }

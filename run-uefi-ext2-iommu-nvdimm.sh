@@ -53,8 +53,15 @@ fi
 #                                 reach pmem.img and survive reboot. (pmem=on is
 #                                 omitted: this QEMU build lacks libpmem; the file
 #                                 still persists, we just skip libpmem's flush.)
-#   -device nvdimm              — surfaces it via the NFIT table AND \_SB.NVDR
+#   -device nvdimm,label-size=2M — surfaces it via the NFIT table AND \_SB.NVDR
 #                                 (_HID "ACPI0012", _FIT/_DSM control methods).
+#                                 label-size carves a 2 MiB Namespace Label
+#                                 Storage Area from the backend tail, which is
+#                                 what enables the per-NVDIMM label _DSM funcs
+#                                 (Get/Set Label Size/Data). It shrinks the
+#                                 usable PMEM SPA 256→254 MiB (stays 2M-aligned);
+#                                 pmem.img is NOT recreated (the label area is
+#                                 just the last 2 MiB of the existing image).
 VKR_DEBUG=udmabuf \
 LD_LIBRARY_PATH=/usr/local/lib/x86_64-linux-gnu \
 VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json \
@@ -64,7 +71,7 @@ VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json \
     -machine q35,kernel-irqchip=split,pcspk-audiodev=snd0,memory-backend=mem1,nvdimm=on \
     -device intel-iommu,aw-bits=48 \
     -object memory-backend-file,id=nvmem0,share=on,mem-path=pmem.img,size=256M,align=2M \
-    -device nvdimm,memdev=nvmem0,id=nvd0 \
+    -device nvdimm,memdev=nvmem0,id=nvd0,label-size=2M \
     -vga none \
     -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd \
     -drive if=pflash,format=raw,file=ovmf_vars.fd \

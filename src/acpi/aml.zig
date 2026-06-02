@@ -2369,6 +2369,75 @@ pub fn asBuffer(v: Value) ?[]const u8 {
     };
 }
 
+/// Invoke `<dev_path>._DSM(uuid, rev, func, args)` — the 4-argument Device
+/// Specific Method convention — and return its result Value (a Buffer for the
+/// NVDIMM label/health functions). `uuid` is the 16-byte interface GUID, `rev`
+/// the revision, `func` the function index; `input` is an optional byte blob
+/// that becomes the single Buffer element of the Arg3 argument Package (null ⇒
+/// an empty Package, matching what Linux's acpi_evaluate_dsm passes for the
+/// no-input query/size functions). Public entry for the NVDIMM DSM label calls
+/// (mm/pmem.zig). All argument storage is built in a freshly reset arena so it
+/// lives through the call; the returned buffer (arena-backed) is valid only
+/// until the next public AML entry — copy/parse it immediately.
+pub fn callDsm(dev_path: []const u8, uuid: *const [16]u8, rev: u32, func: u32, input: ?[]const u8) ?Value {
+    var path_buf: [PATH_MAX]u8 = undefined;
+    if (dev_path.len + 5 > path_buf.len) return null;
+    @memcpy(path_buf[0..dev_path.len], dev_path);
+    @memcpy(path_buf[dev_path.len..][0..5], "._DSM");
+    const n = findExact(path_buf[0 .. dev_path.len + 5]) orelse return null;
+    if (n.kind != .method) return null;
+    return invokeDsm(n, uuid, rev, func, input);
+}
+
+/// Core of callDsm: marshal (uuid, rev, func, Package(input)) into a method's
+/// Arg0..Arg3 and invoke it. Split from callDsm so the self-tests can drive the
+/// argument construction against a hand-built method without the `._DSM`
+/// path-append + namespace lookup.
+fn invokeDsm(n: *StoredNode, uuid: *const [16]u8, rev: u32, func: u32, input: ?[]const u8) ?Value {
+    arenaReset();
+    // Arg0: the interface UUID as a 16-byte Buffer (byte arena).
+    const ub = bufAlloc(16) orelse return null;
+    @memcpy(ub, uuid);
+    // Arg3: a Package whose single element is the input Buffer, or an empty
+    // Package for no-input functions. The element slice lives in the value
+    // arena, the bytes in the byte arena — both valid until the next reset.
+    var pkg: []Value = &.{};
+    if (input) |in| {
+        const ib = bufAlloc(in.len) orelse return null;
+        @memcpy(ib, in);
+        pkg = arenaAlloc(1) orelse return null;
+        pkg[0] = .{ .buffer = ib };
+    }
+    const args = [_]Value{
+        .{ .buffer = ub },
+        .{ .integer = rev },
+        .{ .integer = func },
+        .{ .package = pkg },
+    };
+    return callMethod(n, &args, 0);
+}
+
+/// Find the first child device under the ACPI0012 NVDIMM root (`root_path`) that
+/// exposes a `_DSM` — the per-NVDIMM label/health interface. QEMU emits one
+/// `NVxx` child node per plugged nvdimm; the label functions live there, not on
+/// the root (which handles _FIT). Returns the child's absolute path (into stable
+/// store storage), or null. Direct children only.
+pub fn nvdimmFirstDevice(root_path: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (i < nnodes) : (i += 1) {
+        const n = &nodes[i];
+        if (n.kind != .device) continue;
+        const path = n.path[0..n.path_len];
+        if (path.len <= root_path.len + 1) continue;
+        if (!std.mem.eql(u8, path[0..root_path.len], root_path)) continue;
+        if (path[root_path.len] != '.') continue; // must sit under the root
+        if (std.mem.indexOfScalar(u8, path[root_path.len + 1 ..], '.') != null) continue; // direct child
+        if (!childExists(path, "_DSM")) continue;
+        return path;
+    }
+    return null;
+}
+
 /// Find the AML handler method for GPE bit `n` of block 0: `\_GPE._E<nn>` (edge)
 /// or `\_GPE._L<nn>` (level), where nn is the two uppercase hex digits of n.
 /// Returns the method's absolute path (into the static store) and sets
@@ -2574,6 +2643,43 @@ fn stExecRegionTest(fails: *u32) void {
     const got = toInt(tWalkEval(&body, "\\TST_"));
     stCheck("exec-region (method-local) r/w", got, 0xCAFEF00D, fails);
     stCheck("exec-region hit buffer", st_region_buf[0], 0x0D, fails);
+}
+
+/// callDsm/invokeDsm argument marshaling: a hand-built method echoes an arg back,
+/// proving the native-side 4-arg construction reaches Arg0..Arg3. (1) a method
+/// returning Arg2 confirms the function index lands; (2) a method returning
+/// SizeOf(Arg3) confirms the input Package is built with one element when an input
+/// blob is supplied and zero when it isn't. The mailbox responder is QEMU-only,
+/// but the request-side construction is pinned here (the live label calls rely on
+/// exactly this Arg layout).
+fn stCallDsmTest(fails: *u32) void {
+    const uuid = [_]u8{0} ** 16; // echo methods ignore Arg0; content irrelevant
+
+    // Method(TDSF, 4) { Return(Arg2) } — walked at root ⇒ \TDSF
+    tNsReset();
+    _ = walkBody(&[_]u8{ 0x14, 0x08, 'T', 'D', 'S', 'F', 0x04, 0xA4, 0x6A });
+    static_nnodes = nnodes;
+    if (findExact("\\TDSF")) |n| {
+        stCheck("callDsm Arg2(func)", toInt(invokeDsm(n, &uuid, 1, 0x2A, null) orelse .uninit), 0x2A, fails);
+    } else stCheck("callDsm Arg2(func) [missing]", 0, 1, fails);
+
+    // Method(TDSP, 4) { Return(SizeOf(Arg3)) } — element count of the arg Package
+    tNsReset();
+    _ = walkBody(&[_]u8{ 0x14, 0x09, 'T', 'D', 'S', 'P', 0x04, 0xA4, 0x87, 0x6B });
+    static_nnodes = nnodes;
+    if (findExact("\\TDSP")) |n| {
+        stCheck("callDsm Arg3 pkg(input)", toInt(invokeDsm(n, &uuid, 1, 5, &[_]u8{ 1, 2, 3 }) orelse .uninit), 1, fails);
+        stCheck("callDsm Arg3 pkg(empty)", toInt(invokeDsm(n, &uuid, 1, 4, null) orelse .uninit), 0, fails);
+    } else stCheck("callDsm Arg3 pkg [missing]", 0, 1, fails);
+
+    // Method(TDSB, 4) { Return(DerefOf(Index(DerefOf(Index(Arg3,0)),0))) } — first byte
+    // of the input Buffer, i.e. the {offset,length[,data]} blob funcs 5/6 marshal.
+    tNsReset();
+    _ = walkBody(&[_]u8{ 0x14, 0x10, 'T', 'D', 'S', 'B', 0x04, 0xA4, 0x83, 0x88, 0x83, 0x88, 0x6B, 0x00, 0x00, 0x00, 0x00 });
+    static_nnodes = nnodes;
+    if (findExact("\\TDSB")) |n| {
+        stCheck("callDsm Arg3 input[0]", toInt(invokeDsm(n, &uuid, 1, 9, &[_]u8{ 0xAB, 0xCD }) orelse .uninit), 0xAB, fails);
+    } else stCheck("callDsm Arg3 input[0] [missing]", 0, 1, fails);
 }
 
 /// Compare got/want, log PASS/FAIL, bump fails on mismatch.
@@ -2788,6 +2894,10 @@ pub fn selfTestExtended() u32 {
         0x70, 0x0A, 0x05, 'F', 'U', 'N', 'C', // Store 0x05 -> FUNC
         0xA4, 0x83, 0x88, 0x60, 0x0A, 0x04, 0x00, // Return DerefOf(Index(Local0,4)) == 0x05
     })), 0x05, &fails);
+
+    // callDsm/invokeDsm: native-side 4-arg _DSM argument construction (the label
+    // calls' request path — Arg2 function index + Arg3 input Package).
+    stCallDsmTest(&fails);
 
     return fails;
 }
