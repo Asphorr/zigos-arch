@@ -284,6 +284,15 @@ pub fn init() void {
             if (nv.has_dsm) "yes" else "no",
             if (nv.has_ncal) "yes" else "no",
         });
+        // N5/A5: actually EXECUTE the firmware control interface. _FIT drives the
+        // QEMU DSM mailbox end-to-end — it calls _DSM/NCAL internally, which
+        // marshals a request into the NRAM mailbox buffer (a SystemMemory region
+        // the firmware based at the patched MEMA address), pokes the NTFI I/O port
+        // to hand off to QEMU, and reads the wide response back — then returns the
+        // live NFIT as a buffer. Cross-checking its PM range against the static
+        // NFIT oracle proves the whole dynamic AML path works against real
+        // firmware, not just discovery.
+        if (nv.has_fit) fitCrossCheck(nv.path);
     } else {
         debug.klog("[pmem] AML: no ACPI0012 NVDIMM root device found in namespace\n", .{});
     }
@@ -292,4 +301,42 @@ pub fn init() void {
     // kept in the region itself. Runs after the first-bytes dump above, so that
     // dump shows the PRIOR boot's persisted header before we increment it.
     persistenceSelfTest();
+}
+
+/// A5: execute the firmware's `_FIT` control method and cross-check the
+/// persistent-memory range it reports against the static NFIT oracle
+/// (acpi.firstPmemRange). `_FIT` runs the full DSM-mailbox round-trip in AML —
+/// request marshaling, NTFI hand-off, wide response read — so agreement proves
+/// the dynamic path works end-to-end against real firmware. Every step logs, so a
+/// partial result (mailbox inactive, executor stopped early, empty range) is
+/// legible in the boot log rather than a silent nothing.
+fn fitCrossCheck(dev_path: []const u8) void {
+    var path_buf: [160]u8 = undefined;
+    if (dev_path.len + 5 > path_buf.len) return;
+    @memcpy(path_buf[0..dev_path.len], dev_path);
+    @memcpy(path_buf[dev_path.len..][0..5], "._FIT");
+    const path = path_buf[0 .. dev_path.len + 5];
+
+    const ret = aml.evalMethod(path) orelse {
+        debug.klog("[pmem] AML _FIT: did not evaluate (mailbox path inactive)\n", .{});
+        return;
+    };
+    const fit = aml.asBuffer(ret) orelse {
+        debug.klog("[pmem] AML _FIT: returned a non-buffer (executor stopped early)\n", .{});
+        return;
+    };
+    debug.klog("[pmem] AML _FIT: returned {d} bytes\n", .{fit.len});
+
+    const dyn = acpi.pmemRangeFromFitBuffer(fit) orelse {
+        debug.klog("[pmem] AML _FIT: no PM SPA range parsed from the returned buffer\n", .{});
+        return;
+    };
+    const stat = acpi.firstPmemRange() orelse {
+        debug.klog("[pmem] AML _FIT: dynamic base=0x{x} len=0x{x} (no static NFIT to compare)\n", .{ dyn.base, dyn.length });
+        return;
+    };
+    const match = dyn.base == stat.base and dyn.length == stat.length;
+    debug.klog("[pmem] AML _FIT vs static NFIT: dyn[base=0x{x} len=0x{x}] static[base=0x{x} len=0x{x}] => {s}\n", .{
+        dyn.base, dyn.length, stat.base, stat.length, if (match) "MATCH" else "MISMATCH",
+    });
 }

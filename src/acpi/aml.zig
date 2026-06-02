@@ -424,7 +424,7 @@ fn walkTerms(r: *Reader, end: usize, path: *PathBuf, depth: u8) void {
             .op_region => {
                 const ns = readNameString(r) orelse return;
                 const space = r.next() orelse return; // RegionSpace
-                const off = evalConstInt(r) orelse 0; // RegionOffset (TermArg, ~always const)
+                const off = evalRegionBase(r, path.snapshot()); // RegionOffset: const, or a Name (QEMU NVDIMM NRAM ← MEMA)
                 const len = evalConstInt(r) orelse 0; // RegionLen
                 record(info.kind, path, ns, depth);
                 storeNode(.op_region, path, ns, .{ .region_space = space, .region_off = off, .region_len = len });
@@ -730,7 +730,11 @@ fn arenaAlloc(n: usize) ?[]Value {
 // rule that makes Index()/CreateField aliasing correct: every object created or
 // mutated during a single method-call tree lives here and shares its lifetime.
 
-const BYTE_ARENA = 8192;
+// Sized for the NVDIMM DSM-mailbox path: a single wide field (FARG/ODAT) is up to
+// ~4 KiB, and _FIT reads a fresh response buffer per loop iteration plus a growing
+// accumulator — all live until the next top-level arenaReset. 64 KiB leaves ample
+// headroom over that worst case while staying trivial BSS.
+const BYTE_ARENA = 65536;
 var byte_arena: [BYTE_ARENA]u8 = undefined;
 var byte_top: usize = 0;
 
@@ -913,6 +917,34 @@ fn evalConstInt(r: *Reader) ?u64 {
     r.pos = save;
     _ = skipTermArg(r);
     return null;
+}
+
+/// Resolve an OperationRegion's base offset. Almost always a constant integer (a
+/// fixed I/O port or MMIO address) — handled by evalConstInt. QEMU's NVDIMM is
+/// the exception that makes A5 possible: it bases the SystemMemory DSM-mailbox
+/// region (NRAM) at `MEMA`, a Name the firmware's ACPI table-loader patched to
+/// the mailbox buffer's physical address before our kernel ran. So if the base
+/// operand is a NameString, resolve it against the enclosing scope and read the
+/// (firmware-patched) integer literal it names — the name is declared before the
+/// region in the same scope, so it's already in the store at parse time. Anything
+/// that doesn't cleanly resolve to an integer yields 0, which readRegionUnit/
+/// writeRegionUnit treat as an unmapped no-op (never a fault) — byte-for-byte the
+/// prior behavior, since evalConstInt also folded an unresolved name to 0.
+fn evalRegionBase(r: *Reader, scope: []const u8) u64 {
+    const lead = r.peek(0) orelse return 0;
+    if (isNameLead(lead)) {
+        const ns = readNameString(r) orelse return 0;
+        if (resolve(scope, ns)) |n| {
+            if (n.kind == .name) {
+                var br = Reader{ .buf = bodyOf(n), .pos = n.val_off };
+                if (evalData(&br)) |bv| {
+                    if (bv == .integer) return bv.integer;
+                }
+            }
+        }
+        return 0;
+    }
+    return evalConstInt(r) orelse 0;
 }
 
 /// SLP_TYPa from \_S5_ as evaluated from AML (cross-checks Slice A's static
@@ -1226,6 +1258,7 @@ fn evalTermArg(r: *Reader, st: *ExecState) ?Value {
         0x8E => return evalObjectType(r, st), // ObjectType
         0x9D => return evalCopyObject(r, st), // CopyObject
         0x5B => return evalExtTerm(r, st), // extended opcodes (Acquire/Release/CreateField/…)
+        0x12, 0x13 => return evalPackageRuntime(r, st, op), // Package/VarPackage: Name elems → references
         else => {
             if (binLookup(op)) |bi| return evalBinary(r, st, bi);
             if (unLookup(op)) |ui| return evalUnary(r, st, ui);
@@ -1264,12 +1297,55 @@ fn bufFieldWrite(buf: []u8, bit_off: u32, bit_width: u32, val: u64) void {
     }
 }
 
+/// Read a CreateField window as a Value: ≤64 bits ⇒ Integer, wider ⇒ a Buffer in
+/// the byte arena. The wide case is what the NVDIMM mailbox needs — NCAL/RFIT
+/// carve multi-hundred-byte CreateField windows over the DSM response (OBUF/BUFF)
+/// and return them; flattening those to a 64-bit integer (the old behavior) drops
+/// the whole FIT. Byte-aligned windows copy the byte range directly; otherwise
+/// bit-by-bit.
+fn bufFieldReadValue(buf: []const u8, bit_off: u32, bit_width: u32) Value {
+    if (bit_width == 0) return .{ .integer = 0 };
+    if (bit_width <= 64) return .{ .integer = bufFieldRead(buf, bit_off, bit_width) };
+    const nbytes = (bit_width + 7) / 8;
+    const out = newBuf(nbytes) orelse return .{ .integer = 0 };
+    if (bit_off & 7 == 0) {
+        const start = bit_off >> 3;
+        var i: u32 = 0;
+        while (i < nbytes and start + i < buf.len) : (i += 1) out[i] = buf[start + i];
+    } else {
+        var i: u32 = 0;
+        while (i < bit_width) : (i += 1) {
+            const sbit = bit_off + i;
+            const sbyte = sbit >> 3;
+            if (sbyte >= buf.len) break;
+            if ((buf[sbyte] >> @as(u3, @intCast(sbit & 7))) & 1 != 0)
+                out[i >> 3] |= @as(u8, 1) << @as(u3, @intCast(i & 7));
+        }
+    }
+    return .{ .buffer = out };
+}
+
+/// Deposit a Buffer's bytes into a wide (>64-bit) CreateField window, bit-by-bit.
+/// Bits past the source are written 0 (mirrors writeFieldBuffer's zero-fill).
+fn bufFieldWriteWide(buf: []u8, bit_off: u32, bit_width: u32, src: []const u8) void {
+    var i: u32 = 0;
+    while (i < bit_width) : (i += 1) {
+        const dbit = bit_off + i;
+        const dbyte = dbit >> 3;
+        if (dbyte >= buf.len) break;
+        const sbyte = i >> 3;
+        const sset = if (sbyte < src.len) (src[sbyte] >> @as(u3, @intCast(i & 7))) & 1 else 0;
+        const mask = @as(u8, 1) << @as(u3, @intCast(dbit & 7));
+        if (sset != 0) buf[dbyte] |= mask else buf[dbyte] &= ~mask;
+    }
+}
+
 /// Read the value a reference points at (DerefOf / auto-deref).
 fn readThroughRef(rf: Ref) Value {
     switch (rf) {
         .buf_byte => |bb| return .{ .integer = if (bb.idx < bb.buf.len) bb.buf[bb.idx] else 0 },
         .pkg_elem => |pe| return if (pe.idx < pe.pkg.len) pe.pkg[pe.idx] else .uninit,
-        .buf_field => |bf| return .{ .integer = bufFieldRead(bf.buf, bf.bit_off, bf.bit_width) },
+        .buf_field => |bf| return bufFieldReadValue(bf.buf, bf.bit_off, bf.bit_width),
         .node => |ni| {
             if (ni >= nnodes) return .uninit;
             const n = &nodes[ni];
@@ -1299,7 +1375,11 @@ fn writeThroughRef(rf: Ref, v: Value) bool {
             return true;
         },
         .buf_field => |bf| {
-            bufFieldWrite(bf.buf, bf.bit_off, bf.bit_width, toInt(v));
+            if (bf.bit_width <= 64) {
+                bufFieldWrite(bf.buf, bf.bit_off, bf.bit_width, toInt(v));
+            } else {
+                bufFieldWriteWide(bf.buf, bf.bit_off, bf.bit_width, toBufferBytes(v));
+            }
             return true;
         },
         .node => |ni| {
@@ -1345,6 +1425,54 @@ fn evalBufferRuntime(r: *Reader, st: *ExecState) ?Value {
     const copy_n = @min(init_bytes.len, declared);
     @memcpy(mb[0..copy_n], init_bytes[0..copy_n]);
     return .{ .buffer = mb };
+}
+
+/// Runtime Package() built during method execution. Same as evalData's package,
+/// except a NameString element that names a value-bearing object (a .name —
+/// e.g. RFIT's local OFST) becomes a reference to that object (ref{.node}), so a
+/// later DerefOf recovers its live value even from another method's scope. (ACPI:
+/// a Package holding a Name stores a reference to it.) This is what carries the
+/// FIT-read offset through RFIT's Package(1){OFST} into NCAL. Names that resolve
+/// to a Device/Method (e.g. a _PRT interrupt-link source), or don't resolve, stay
+/// a name_ref — preserving the existing _PRT decode.
+fn evalPackageRuntime(r: *Reader, st: *ExecState, op: u8) ?Value {
+    _ = r.next(); // 0x12 PackageOp / 0x13 VarPackageOp
+    const pkg_start = r.pos;
+    const pl = readPkgLength(r) orelse return null;
+    const end = pkg_start + pl.value;
+    if (end > r.buf.len or end < r.pos) return null;
+    var num: usize = 0;
+    if (op == 0x12) {
+        num = r.next() orelse return null; // NumElements: ByteData
+    } else {
+        const v = evalTermArg(r, st) orelse return null; // VarNumElements: TermArg
+        num = if (v == .integer) @intCast(@min(v.integer, VALUE_ARENA)) else 0;
+    }
+    const elems = arenaAlloc(num) orelse return null;
+    var i: usize = 0;
+    while (i < num) : (i += 1) {
+        if (r.pos >= end) {
+            elems[i] = .uninit;
+            continue;
+        }
+        const lead = r.peek(0) orelse 0;
+        if (isNameLead(lead)) {
+            const ns = readNameString(r) orelse {
+                elems[i] = .uninit;
+                continue;
+            };
+            const resolved = resolve(st.scope, ns);
+            if (resolved != null and resolved.?.kind == .name) {
+                elems[i] = .{ .ref = .{ .node = nodeIndexOf(resolved.?) } };
+            } else {
+                elems[i] = if (ns.nsegs > 0) .{ .name_ref = ns.segs[ns.nsegs - 1] } else .uninit;
+            }
+        } else {
+            elems[i] = evalData(r) orelse .uninit;
+        }
+    }
+    r.pos = end;
+    return .{ .package = elems };
 }
 
 /// SizeOf(obj): element/byte count of a Buffer, String or Package; 0 otherwise.
@@ -1706,11 +1834,58 @@ fn evalCopyObject(r: *Reader, st: *ExecState) ?Value {
     return s;
 }
 
+/// The bytes of a value IF it's genuinely a buffer/string (deref'd) — else null.
+/// Used by comparison ops to compare byte-wise rather than coercing to integer.
+fn asBytesForCmp(v: Value) ?[]const u8 {
+    return switch (derefValue(v)) {
+        .buffer => |b| b,
+        .string => |s| s,
+        else => null,
+    };
+}
+
+fn cmpBytes(a: []const u8, b: []const u8) i8 {
+    const n = @min(a.len, b.len);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        if (a[i] != b[i]) return if (a[i] < b[i]) @as(i8, -1) else @as(i8, 1);
+    }
+    if (a.len == b.len) return 0;
+    return if (a.len < b.len) @as(i8, -1) else @as(i8, 1); // prefix ⇒ shorter is less
+}
+
+/// Three-way compare for LEqual/LGreater/LLess. Two buffers/strings compare
+/// byte-wise (ACPI 19.6.x) — essential for the UUID matching in _DSM/NCAL
+/// dispatch, where toInt() would flatten every 16-byte UUID to 0 and make every
+/// compare spuriously equal. Anything else compares as integers.
+fn compareValues(a: Value, b: Value) i8 {
+    if (asBytesForCmp(a)) |ab| {
+        if (asBytesForCmp(b)) |bb| return cmpBytes(ab, bb);
+    }
+    const ia = toInt(a);
+    const ib = toInt(b);
+    return if (ia < ib) @as(i8, -1) else if (ia > ib) @as(i8, 1) else 0;
+}
+
 fn evalBinary(r: *Reader, st: *ExecState, bi: BinOp) ?Value {
     _ = r.next(); // opcode
-    const a = toInt(evalTermArg(r, st) orelse return null);
-    const b = toInt(evalTermArg(r, st) orelse return null);
-    const res = bi.apply(a, b);
+    const av = evalTermArg(r, st) orelse return null;
+    const bv = evalTermArg(r, st) orelse return null;
+    // LEqual/LGreater/LLess: compare Values (buffers/strings byte-wise) instead of
+    // collapsing both to integers — UUID buffers must compare correctly here.
+    switch (bi.code) {
+        0x93, 0x94, 0x95 => {
+            const ord = compareValues(av, bv);
+            const t = switch (bi.code) {
+                0x93 => ord == 0, // LEqual
+                0x94 => ord > 0, // LGreater
+                else => ord < 0, // LLess (0x95)
+            };
+            return .{ .integer = boolVal(t) };
+        },
+        else => {},
+    }
+    const res = bi.apply(toInt(av), toInt(bv));
     if (bi.has_target) {
         if (!storeTarget(r, st, .{ .integer = res })) return null;
     }
@@ -1903,6 +2078,22 @@ fn execTermList(r: *Reader, end: usize, st: *ExecState) void {
                 _ = r.next();
             },
             0x86 => execNotify(r, st),
+            0x08 => execName(r, st), // exec-time Name declaration (e.g. RFIT's Name(OFST,0))
+            0x5B => { // ExtOpPrefix: an exec-time declaration, or a side-effecting ext op
+                const ext = r.peek(1) orelse return;
+                switch (ext) {
+                    0x80 => execOpRegion(r, st), // OperationRegion (e.g. NCAL's NRAM mailbox)
+                    0x81 => execField(r, st), // Field over a just-declared region
+                    else => {
+                        // Acquire/Release/Stall/Sleep/CreateField(0x13)/… — evaluate
+                        // for side effect via the expression path.
+                        const before = r.pos;
+                        if (evalTermArg(r, st)) |_| {
+                            if (r.pos == before) _ = r.next();
+                        } else return;
+                    },
+                }
+            },
             else => {
                 // An expression / method call evaluated for side effect.
                 const before = r.pos;
@@ -1976,6 +2167,132 @@ fn execWhile(r: *Reader, st: *ExecState) void {
     r.pos = pkg_end;
 }
 
+// --- exec-time declarations (OperationRegion / Field inside a method body) ---
+// Most firmware declares regions/fields at table scope, walked once at load. But
+// QEMU's NVDIMM NCAL declares its DSM-mailbox region (NRAM, based at MEMA's
+// runtime value) and the HDLE/REVS/FUNC/FARG/… fields INSIDE the method body, so
+// they exist only while the method runs. The executor creates them as dynamic
+// nodes (past the static high-water mark, reclaimed at the next top-level
+// arenaReset — same lifetime model as the CreateField windows). Without this,
+// NCAL halts on its first line and the whole _FIT/_DSM mailbox path stays dark.
+
+/// Exec-time OperationRegion: NameString RegionSpace RegionOffset RegionLen. The
+/// offset/length are evaluated as runtime TermArgs (a Local holding MEMA, a
+/// constant, …) rather than const-folded like the static parse.
+fn execOpRegion(r: *Reader, st: *ExecState) void {
+    _ = r.next(); // 0x5B ExtOpPrefix
+    _ = r.next(); // 0x80 OpRegionOp
+    const ns = readNameString(r) orelse return;
+    const space = r.next() orelse return;
+    const off = toInt(evalTermArg(r, st) orelse .uninit);
+    const len = toInt(evalTermArg(r, st) orelse .uninit);
+    const node = createDynNode(st.scope, ns) orelse return;
+    node.kind = .op_region;
+    node.region_space = space;
+    node.region_off = off;
+    node.region_len = len;
+    node.has_runtime = false;
+    if (DUMP) {
+        const seg = ns.segs[ns.nsegs - 1];
+        debug.klog("[aml] exec OperationRegion {s} space={d} base=0x{X} len=0x{X}\n", .{ seg[0..], space, off, len });
+    }
+}
+
+/// Exec-time Field: PkgLength NameString(region) FieldFlags FieldList. Resolves
+/// the (just-declared) region and creates a dynamic .field node per NamedField in
+/// the method's scope — the runtime twin of the static parseFieldList.
+fn execField(r: *Reader, st: *ExecState) void {
+    _ = r.next(); // 0x5B ExtOpPrefix
+    _ = r.next(); // 0x81 FieldOp
+    const pkg_end = packageEnd(r, r.pos) orelse return;
+    const region_ns = readNameString(r) orelse {
+        r.pos = pkg_end;
+        return;
+    };
+    var region_idx: i32 = -1;
+    if (resolve(st.scope, region_ns)) |rn| {
+        if (rn.kind == .op_region) region_idx = @intCast(nodeIndexOf(rn));
+    }
+    const flags = r.next() orelse {
+        r.pos = pkg_end;
+        return;
+    };
+    execParseFieldList(r, pkg_end, st.scope, region_idx, flags & 0x0F);
+    r.pos = pkg_end;
+}
+
+/// FieldList parse for exec-time Field — mirrors parseFieldList but registers each
+/// NamedField via createDynNode in `scope` (the method's path) instead of the
+/// load-time store. Tracks the running bit offset + current AccessType.
+fn execParseFieldList(r: *Reader, end: usize, scope: []const u8, region_idx: i32, access0: u8) void {
+    var bit_off: u32 = 0;
+    var access = access0;
+    while (r.pos < end) {
+        const lead = r.peek(0) orelse return;
+        switch (lead) {
+            0x00 => { // ReservedField: 0x00 PkgLength
+                _ = r.next();
+                const pl = readPkgLength(r) orelse return;
+                bit_off +%= @truncate(pl.value);
+            },
+            0x01 => { // AccessField: 0x01 AccessType AccessAttrib
+                _ = r.next();
+                const at = r.next() orelse return;
+                _ = r.next();
+                access = at & 0x0F;
+            },
+            0x02 => return, // ConnectField: unbounded — stop the list
+            0x03 => { // ExtendedAccessField: 0x03 AccessType ExtAttrib AccessLength
+                _ = r.next();
+                const at = r.next() orelse return;
+                _ = r.next();
+                _ = r.next();
+                access = at & 0x0F;
+            },
+            else => { // NamedField: NameSeg(4) PkgLength(= bit width)
+                if (r.rem() < 4) return;
+                var seg: [4]u8 = undefined;
+                seg[0] = r.next().?;
+                seg[1] = r.next().?;
+                seg[2] = r.next().?;
+                seg[3] = r.next().?;
+                if (!(seg[0] == '_' or (seg[0] >= 'A' and seg[0] <= 'Z'))) return; // desync guard
+                const pl = readPkgLength(r) orelse return;
+                const width: u32 = @truncate(pl.value);
+                var ns = NameString{ .rooted = false, .parents = 0, .segs = undefined, .nsegs = 1 };
+                ns.segs[0] = seg;
+                if (createDynNode(scope, ns)) |node| {
+                    node.kind = .field;
+                    node.field_region = region_idx;
+                    node.field_bit_off = bit_off;
+                    node.field_bit_width = width;
+                    node.field_access = access;
+                    node.is_buffer_field = false;
+                    node.has_runtime = false;
+                }
+                bit_off +%= width;
+            },
+        }
+    }
+}
+
+/// Exec-time Name declaration (inside a method body), e.g. RFIT's `Name(OFST, 0)`
+/// or NCAL's `Name(TBUF, Buffer(1){})` — a method-local mutable named value.
+/// Creates a dynamic node seeded with the initial value; later Store/reads go
+/// through it like any runtime Name. (Buffer/Package initializers materialize
+/// into the arena via evalTermArg, so a CreateField/Index over the Name aliases
+/// the same storage.)
+fn execName(r: *Reader, st: *ExecState) void {
+    _ = r.next(); // 0x08 NameOp
+    const ns = readNameString(r) orelse return;
+    const v = evalTermArg(r, st) orelse .uninit;
+    const node = createDynNode(st.scope, ns) orelse return;
+    node.kind = .name;
+    node.is_buffer_field = false;
+    node.has_runtime = true;
+    node.runtime_val = v;
+}
+
 /// Hook invoked for every executed Notify(object, value). The integrator
 /// (main.zig) registers one to react to ACPI device notifications without this
 /// leaf AML module having to know about drivers: PCI hotplug (Bus/Device Check
@@ -2037,6 +2354,19 @@ pub fn evalMethodArg1(abs: []const u8, arg: Value) ?Value {
     if (n.kind != .method) return null;
     arenaReset();
     return callMethod(n, &.{arg}, 0);
+}
+
+/// Extract a buffer view from a Value — e.g. the Buffer the NVDIMM `_FIT` method
+/// returns (the live NFIT structure stream). Null if the Value isn't a buffer
+/// (an unmodeled opcode would leave the method returning `.uninit`). Lets a
+/// consumer inspect a method result without reaching into the Value union.
+/// The returned slice points into the byte arena and is valid only until the
+/// next public AML entry (which resets the arena) — copy/parse it immediately.
+pub fn asBuffer(v: Value) ?[]const u8 {
+    return switch (v) {
+        .buffer => |b| b,
+        else => null,
+    };
 }
 
 /// Find the AML handler method for GPE bit `n` of block 0: `\_GPE._E<nn>` (edge)
@@ -2180,6 +2510,72 @@ fn stWideFieldTest(fails: *u32) void {
     stCheck("wide field buffer r/w", got, 0x06, fails);
 }
 
+/// A5: named-base OperationRegion — the one new primitive the live NVDIMM mailbox
+/// depends on. Hand-assemble Name(MEMA, <st_region_buf phys>), an OperationRegion
+/// based at MEMA (a Name, not a constant), a DWord field over it, and a method
+/// that writes then reads the field. Proves evalRegionBase resolves the Name to
+/// the address so region I/O lands in the real buffer — exactly how QEMU bases
+/// NRAM at the firmware-patched MEMA. Verified twice: the field read-back, and the
+/// raw little-endian bytes deposited in st_region_buf.
+fn stNamedRegionTest(fails: *u32) void {
+    const phys = paging.virtToPhys(@intFromPtr(&st_region_buf)) orelse {
+        debug.klog("[aml] selftest named-base region (MEMA): SKIP (test buffer not mapped)\n", .{});
+        return;
+    };
+    @memset(&st_region_buf, 0);
+    var body = [_]u8{
+        // Name(MEMA, QWord<phys>)  — the 8 phys bytes are spliced into 6..13 below
+        0x08, 'M', 'E', 'M', 'A', 0x0E, 0, 0, 0, 0, 0, 0, 0, 0,
+        // OperationRegion(NRAM, SystemMemory, MEMA, 16)  — base operand is the Name MEMA
+        0x5B, 0x80, 'N', 'R', 'A', 'M', 0x00, 'M', 'E', 'M', 'A', 0x0A, 0x10,
+        // Field(NRAM, DWordAcc, NoLock, Preserve){ DAT0, 32 }
+        0x5B, 0x81, 0x0B, 'N', 'R', 'A', 'M', 0x03, 'D', 'A', 'T', '0', 0x20,
+        // Method(TST_, 0){ Store(0xCAFEF00D, DAT0); Return(DAT0) }
+        0x14, 0x15, 'T', 'S', 'T', '_', 0x00,
+        0x70, 0x0C, 0x0D, 0xF0, 0xFE, 0xCA, 'D', 'A', 'T', '0',
+        0xA4, 'D', 'A', 'T', '0',
+    };
+    var i: usize = 0;
+    while (i < 8) : (i += 1) body[6 + i] = @truncate(phys >> @intCast(8 * i));
+    const got = toInt(tWalkEval(&body, "\\TST_"));
+    stCheck("named-base region (MEMA) r/w", got, 0xCAFEF00D, fails);
+    // Confirm the write reached the genuine buffer (low byte of 0xCAFEF00D = 0x0D).
+    stCheck("named-base region hit buffer", st_region_buf[0], 0x0D, fails);
+}
+
+/// A5: exec-time OperationRegion + Field declared INSIDE a method body — the exact
+/// shape QEMU's NCAL uses (region based at a Local holding MEMA's value, fields
+/// carved at run time). Proves the executor materializes the dynamic region/field
+/// nodes and drives genuine region I/O over the real st_region_buf. stNamedRegion
+/// covers the table-scope path; this covers the method-local path the live mailbox
+/// actually needs.
+fn stExecRegionTest(fails: *u32) void {
+    const phys = paging.virtToPhys(@intFromPtr(&st_region_buf)) orelse {
+        debug.klog("[aml] selftest exec-region (method-local): SKIP (test buffer not mapped)\n", .{});
+        return;
+    };
+    @memset(&st_region_buf, 0);
+    var body = [_]u8{
+        // Method(TST_, 0) { ... }
+        0x14, 0x37, 'T', 'S', 'T', '_', 0x00,
+        // Store(QWord<phys>, Local0)  — the 8 phys bytes are spliced into 9..16 below
+        0x70, 0x0E, 0, 0, 0, 0, 0, 0, 0, 0, 0x60,
+        // OperationRegion(NRAM, SystemMemory, Local0, 16)  — base is a runtime TermArg
+        0x5B, 0x80, 'N', 'R', 'A', 'M', 0x00, 0x60, 0x0A, 0x10,
+        // Field(NRAM, DWordAcc, NoLock, Preserve) { DAT0, 32 }
+        0x5B, 0x81, 0x0B, 'N', 'R', 'A', 'M', 0x03, 'D', 'A', 'T', '0', 0x20,
+        // Store(0xCAFEF00D, DAT0)
+        0x70, 0x0C, 0x0D, 0xF0, 0xFE, 0xCA, 'D', 'A', 'T', '0',
+        // Return(DAT0)
+        0xA4, 'D', 'A', 'T', '0',
+    };
+    var i: usize = 0;
+    while (i < 8) : (i += 1) body[9 + i] = @truncate(phys >> @intCast(8 * i));
+    const got = toInt(tWalkEval(&body, "\\TST_"));
+    stCheck("exec-region (method-local) r/w", got, 0xCAFEF00D, fails);
+    stCheck("exec-region hit buffer", st_region_buf[0], 0x0D, fails);
+}
+
 /// Compare got/want, log PASS/FAIL, bump fails on mismatch.
 fn stCheck(name: []const u8, got: u64, want: u64, fails: *u32) void {
     const ok = got == want;
@@ -2319,6 +2715,79 @@ pub fn selfTestExtended() u32 {
     stCheck("_OSI(\"Linux\")", toInt(runProg(&[_]u8{
         0xA4, 0x5F, 0x4F, 0x53, 0x49, 0x0D, 'L', 'i', 'n', 'u', 'x', 0x00,
     })), 0, &fails);
+
+    // === A5: the transfer — NVDIMM DSM mailbox machinery ===================
+
+    // Named-base OperationRegion (MEMA): region I/O over a Name-addressed region,
+    // the primitive QEMU's NRAM mailbox region needs. End-to-end over a real
+    // mapped buffer (boot + harness).
+    stNamedRegionTest(&fails);
+
+    // Exec-time OperationRegion + Field declared inside a method body — the shape
+    // QEMU's NCAL uses to stand up the mailbox region/fields at run time.
+    stExecRegionTest(&fails);
+
+    // Exec-time Name declaration inside a method body — RFIT/NCAL declare local
+    // mutable Names (Name(OFST,0), Name(TBUF,Buffer)). Name(VVAL,0);
+    // Store(0x1234,VVAL); Return(VVAL) == 0x1234.
+    stCheck("exec-time Name decl", toInt(tWalkEval(&[_]u8{
+        0x14, 0x19, 'T', 'S', 'T', '_', 0x00, // Method(TST_, 0) { ... }
+        0x08, 'V', 'V', 'A', 'L', 0x00, // Name(VVAL, 0)
+        0x70, 0x0B, 0x34, 0x12, 'V', 'V', 'A', 'L', // Store(0x1234, VVAL)
+        0xA4, 'V', 'V', 'A', 'L', // Return(VVAL)
+    }, "\\TST_")), 0x1234, &fails);
+
+    // LEqual on buffers compares byte-wise (toInt flattens any buffer to 0, which
+    // would make every buffer-compare spuriously equal — and break _DSM/NCAL's
+    // UUID dispatch). Equal 4-byte buffers ⇒ Ones; a one-byte difference ⇒ Zero.
+    stCheck("LEqual(buf,buf) equal", toInt(runProg(&[_]u8{
+        0xA4, 0x93, // Return(LEqual(
+        0x11, 0x07, 0x0A, 0x04, 0x11, 0x22, 0x33, 0x44, // Buffer(4){11 22 33 44},
+        0x11, 0x07, 0x0A, 0x04, 0x11, 0x22, 0x33, 0x44, // Buffer(4){11 22 33 44}))
+    })), ~@as(u64, 0), &fails);
+    stCheck("LEqual(buf,buf) differ", toInt(runProg(&[_]u8{
+        0xA4, 0x93,
+        0x11, 0x07, 0x0A, 0x04, 0x11, 0x22, 0x33, 0x44, // Buffer(4){11 22 33 44},
+        0x11, 0x07, 0x0A, 0x04, 0x11, 0x22, 0x33, 0x99, // Buffer(4){11 22 33 99}))
+    })), 0, &fails);
+
+    // A CreateField window WIDER than 64 bits must read back as a Buffer, not an
+    // integer (NCAL/RFIT return such windows over the DSM response — OBUF/BUFF).
+    // Buffer(16){00 11 22 … FF}; WIDE = 96-bit window @0; Store(WIDE,L1) reads it as
+    // a Buffer; byte 5 == 0x55. Pre-fix this read collapsed to integer 0 ⇒ 0x00.
+    stCheck("wide CreateField → Buffer", toInt(runProg(&[_]u8{
+        0x70, 0x11, 0x13, 0x0A, 0x10, // Store Buffer(16){
+        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x60, // …} -> L0
+        0x5B, 0x13, 0x60, 0x00, 0x0A, 0x60, 'W', 'I', 'D', 'E', // CreateField(L0, bit 0, 96 bits, WIDE)
+        0x70, 'W', 'I', 'D', 'E', 0x61, // Store(WIDE, L1) — read the 96-bit window as a Buffer
+        0xA4, 0x83, 0x88, 0x61, 0x0A, 0x05, 0x00, // Return DerefOf(Index(L1, 5)) == 0x55
+    })), 0x55, &fails);
+
+    // A Package holding a Name stores a reference to it, so DerefOf recovers the
+    // live value (RFIT's Package(1){OFST} carries the FIT offset into NCAL — a bare
+    // name_ref would read back 0 and spin the read loop forever). Name(OFST,0x42);
+    // DerefOf(Index(Package(1){OFST}, 0)) == 0x42.
+    stCheck("Package(Name) deref", toInt(tWalkEval(&[_]u8{
+        0x14, 0x1C, 'T', 'S', 'T', '_', 0x00, // Method(TST_, 0) { ... }
+        0x08, 'O', 'F', 'S', 'T', 0x0A, 0x42, // Name(OFST, 0x42)
+        0x70, 0x12, 0x06, 0x01, 'O', 'F', 'S', 'T', 0x60, // Store(Package(1){OFST}, Local0)
+        0xA4, 0x83, 0x88, 0x60, 0x00, 0x00, // Return DerefOf(Index(Local0, 0))
+    }, "\\TST_")), 0x42, &fails);
+
+    // DSM request marshaling: NCAL builds a request by carving CreateDWordField
+    // windows over a buffer (handle / function / …) and storing into them. Prove
+    // that exact layout: Buffer(16); HDLE=dword@0, FUNC=dword@4; store a handle and
+    // function index; read byte 4 (low byte of FUNC) == 0x05. This is the
+    // request-side machinery the live _FIT/_DSM path assembles before poking the
+    // mailbox — covered natively (the responder is QEMU-only).
+    stCheck("DSM request marshal", toInt(runProg(&[_]u8{
+        0x70, 0x11, 0x03, 0x0A, 0x10, 0x60, // Store Buffer(16){} -> Local0
+        0x8A, 0x60, 0x00, 'H', 'D', 'L', 'E', // CreateDWordField(Local0, 0, HDLE)
+        0x8A, 0x60, 0x0A, 0x04, 'F', 'U', 'N', 'C', // CreateDWordField(Local0, 4, FUNC)
+        0x70, 0x0C, 0x44, 0x33, 0x22, 0x11, 'H', 'D', 'L', 'E', // Store 0x11223344 -> HDLE
+        0x70, 0x0A, 0x05, 'F', 'U', 'N', 'C', // Store 0x05 -> FUNC
+        0xA4, 0x83, 0x88, 0x60, 0x0A, 0x04, 0x00, // Return DerefOf(Index(Local0,4)) == 0x05
+    })), 0x05, &fails);
 
     return fails;
 }

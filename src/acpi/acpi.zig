@@ -513,6 +513,32 @@ pub fn firstPmemRange() ?struct { base: u64, length: u64 } {
     return null;
 }
 
+/// Find the first persistent-memory SPA Range inside a raw `_FIT` buffer — the
+/// NFIT sub-structure stream returned by the AML `_FIT` control method. It holds
+/// the same `{type,length}`-prefixed entries as the static NFIT, but WITHOUT the
+/// table header + 4-byte reserved field (the buffer begins at the first
+/// sub-structure). Mirrors firstPmemRange over caller-supplied bytes so the
+/// firmware's *dynamic* (DSM-mailbox) answer can be cross-checked against the
+/// static table. Every field read is bounds-checked against `buf`; a zero or
+/// truncated entry length stops the walk rather than spinning.
+pub fn pmemRangeFromFitBuffer(buf: []const u8) ?struct { base: u64, length: u64 } {
+    var off: usize = 0;
+    while (off + @sizeOf(NfitStructHeader) <= buf.len) {
+        const etype = @as(u16, buf[off]) | (@as(u16, buf[off + 1]) << 8);
+        const elen = @as(u16, buf[off + 2]) | (@as(u16, buf[off + 3]) << 8);
+        if (elen < @sizeOf(NfitStructHeader)) break; // zero / garbage length: stop
+        if (off + elen > buf.len) break; // truncated final entry
+        if (etype == 0 and elen >= @sizeOf(NfitSpaRange)) {
+            const spa: *align(1) const NfitSpaRange = @ptrCast(&buf[off]);
+            const is_pm = std.mem.eql(u8, &spa.range_guid, &PM_SPA_GUID) or
+                std.mem.eql(u8, &spa.range_guid, &PM_SPA_GUID_QEMU);
+            if (is_pm) return .{ .base = spa.base, .length = spa.length };
+        }
+        off += elen;
+    }
+    return null;
+}
+
 // --- Checksum + validation --------------------------------------------------
 
 fn checksumOk(bytes: []const u8) bool {
