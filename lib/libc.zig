@@ -379,6 +379,21 @@ pub fn mmapFileShared(fd: u32, offset: u32, len: usize) ?[]u8 {
     return ptr[0..aligned];
 }
 
+/// DAX mmap of /dev/pmem0 (sys mmap_pmem, #121). Maps a page-aligned window of
+/// the NVDIMM persistent-memory region DIRECTLY into this process: stores
+/// through the returned slice land in persistent memory with no page-cache copy.
+/// `fd` must be an open /dev/pmem0; `offset` must be page-aligned and the
+/// [offset, offset+len) window must fit inside the region. `len` is page-rounded.
+/// Returns the mapping, or null on bad fd / not-pmem0 / out-of-range / VA exhaustion.
+pub fn mmapPmem(fd: u32, offset: u32, len: usize) ?[]u8 {
+    if (len == 0) return null;
+    const va = syscall3(121, @intCast(len), fd, offset);
+    if (va == 0xFFFFFFFF) return null;
+    const aligned: usize = (len + 0xFFF) & ~@as(usize, 0xFFF);
+    const ptr: [*]u8 = @ptrFromInt(@as(usize, va));
+    return ptr[0..aligned];
+}
+
 /// io_uring Sqe / Cqe / RingHeader — must match src/cpu/ipc/iouring.zig byte-for-byte.
 pub const IoUringSqe = extern struct {
     opcode: u8,

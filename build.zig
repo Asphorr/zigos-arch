@@ -407,6 +407,7 @@ pub fn build(b: *std.Build) void {
         .{ "mapshare.elf", "app/mapshare.zig" },
         .{ "flushtest.elf", "app/flushtest.zig" },
         .{ "bareexit.elf", "app/bareexit.zig" },
+        .{ "pmemdax.elf", "app/pmemdax.zig" },
         .{ "swaptest.elf", "app/swaptest.zig" },
         .{ "swapsys.elf", "app/swapsys.zig" },
         .{ "mtswap.elf", "app/mtswap.zig" },

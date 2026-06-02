@@ -315,6 +315,13 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     // APIC, HPET, SMP, PCI ECAM.
     @import("acpi/acpi.zig").init(boot_info.rsdp_addr);
     blog.ok("ACPI tables parsed");
+    // NVDIMM: discover the persistent-memory region (static NFIT) + the AML
+    // control interface (\_SB.NVDR _FIT/_DSM), then bring up the crash-consistent
+    // persistent log on it. Needs the parsed ACPI tables and the AML namespace,
+    // both ready once acpi.init returns. (logBoot lives in a separate module so
+    // pmem.zig doesn't import its own consumer — keeps the dependency one-way.)
+    @import("mm/pmem.zig").init();
+    @import("mm/pmem_log.zig").logBoot();
     // Pure observability: dump CPU vendor/family/model/stepping/microcode/
     // LAPIC IDs to serial. These are the data points needed first the time
     // something feels off on real HW. No-op for QEMU + KVM (always identical).

@@ -1335,9 +1335,32 @@ pub fn allocContiguousBelow4G(count: u32) ?usize {
     return base;
 }
 
+// Device-memory window (e.g. an NVDIMM's DAX frames) that is NOT PMM-managed
+// and must never be reclaimed. When such frames are mapped into a user address
+// space (DAX mmap) and that AS is torn down, unmapUserRange/destroyAddressSpace
+// call freeFrame on every present leaf — including these. freeFrame consults
+// this window (before its MAX_FRAMES bounds gate) and treats those frees as
+// silent no-ops. Registered once at boot by pmem.init via registerDeviceRange.
+var device_lo: usize = 0;
+var device_hi: usize = 0;
+
+/// Register a physical range as device memory that freeFrame must silently
+/// ignore (not warn about). Used for NVDIMM DAX frames mapped into user space.
+pub fn registerDeviceRange(base: usize, len: usize) void {
+    device_lo = base;
+    device_hi = base +| len;
+}
+
 pub fn freeFrame(phys_addr: usize) void {
     const ra = @returnAddress();
     const frame_num = phys_addr / FRAME_SIZE;
+    // Registered device memory (NVDIMM DAX frames, etc.) is never PMM-managed —
+    // ignore frees of it regardless of where the window sits relative to the RAM
+    // bitmap. Checked BEFORE the MAX_FRAMES gate so a device range placed below
+    // the RAM ceiling can't fall through into the normal refcount path and
+    // corrupt the bitmap. The device_hi==0 short-circuit keeps this free when no
+    // device range is registered (the common case).
+    if (device_hi != 0 and phys_addr >= device_lo and phys_addr < device_hi) return;
     if (frame_num >= MAX_FRAMES) {
         @import("../debug/serial.zig").print("[pmm] WARNING: freeFrame bad addr=0x{X} (frame={X})\n", .{ phys_addr, frame_num });
         return;

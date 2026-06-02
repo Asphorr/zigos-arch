@@ -275,6 +275,62 @@ pub const DmarDrhd = extern struct {
     // followed by variable-length device-scope entries
 };
 
+// --- NFIT (signature "NFIT") -----------------------------------------------
+// NVDIMM Firmware Interface Table — describes persistent-memory regions. The
+// table header is followed by a 4-byte reserved field, then a stream of
+// variable-length sub-structures each prefixed by `{type:u16, length:u16}`
+// (same shape as DMAR). We decode the System Physical Address (SPA) Range
+// Structure (type 0), which carries one address range's guest-physical
+// base + length + a GUID identifying the kind of range.
+//
+// Reference: ACPI 6.4 §5.2.25.
+
+pub const Nfit = extern struct {
+    header: SdtHeader,
+    _reserved: u32 align(1),
+    // followed by NfitStructHeader entries until header.length is exhausted
+};
+
+pub const NfitStructHeader = extern struct {
+    /// 0 = SPA Range, 1 = NVDIMM Region Mapping, 2 = Interleave, 3 = SMBIOS,
+    /// 4 = NVDIMM Control Region, 5 = Block Data Window, 6 = Flush Hint,
+    /// 7 = Platform Capabilities.
+    entry_type: u16 align(1),
+    length: u16 align(1),
+};
+
+/// System Physical Address (SPA) Range Structure — NFIT type 0. base/length
+/// give the guest-physical extent of one range; range_guid says what kind.
+pub const NfitSpaRange = extern struct {
+    header: NfitStructHeader,
+    spa_index: u16 align(1),
+    flags: u16 align(1),
+    _reserved: u32 align(1),
+    proximity_domain: u32 align(1),
+    range_guid: [16]u8,
+    base: u64 align(1),
+    length: u64 align(1),
+    memory_mapping_attribute: u64 align(1),
+};
+
+/// Address Range Type GUID for byte-addressable persistent memory
+/// (66F0D379-B4F3-4074-AC43-0D3318B78CDC), in the mixed-endian GUID byte
+/// order NFIT stores it (Data1/2/3 little-endian, Data4 as-is). This is the
+/// spec-correct value real NVDIMM firmware emits.
+pub const PM_SPA_GUID = [16]u8{
+    0x79, 0xD3, 0xF0, 0x66, 0xF3, 0xB4, 0x74, 0x40,
+    0xAC, 0x43, 0x0D, 0x33, 0x18, 0xB7, 0x8C, 0xDC,
+};
+
+/// QEMU's NVDIMM emits the PM range GUID with the last byte 0xDB instead of the
+/// spec's 0xDC (hw/acpi/nvdimm.c: `nvdimm_nfit_spa_uuid` ends ...0x8c, 0xdb) —
+/// a long-standing one-byte deviation from ACPI 6.x. Match it too so the same
+/// parser works under QEMU and on real hardware.
+pub const PM_SPA_GUID_QEMU = [16]u8{
+    0x79, 0xD3, 0xF0, 0x66, 0xF3, 0xB4, 0x74, 0x40,
+    0xAC, 0x43, 0x0D, 0x33, 0x18, 0xB7, 0x8C, 0xDB,
+};
+
 // --- Module state ----------------------------------------------------------
 
 var fadt: ?*align(1) const Fadt = null;
@@ -282,6 +338,7 @@ var madt: ?*align(1) const Madt = null;
 var hpet: ?*align(1) const Hpet = null;
 var mcfg: ?*align(1) const Mcfg = null;
 var dmar: ?*align(1) const Dmar = null;
+var nfit: ?*align(1) const Nfit = null;
 var dsdt: ?*align(1) const SdtHeader = null;
 
 /// SSDTs (Secondary System Description Tables) found in the (X)SDT. Unlike the
@@ -411,6 +468,51 @@ pub fn dmarEntries() DmarIterator {
     return .{ .p = @intFromPtr(d) + @sizeOf(Dmar), .end = @intFromPtr(d) + d.header.length };
 }
 
+/// Iterator over NFIT sub-structures. Same `{type,length}`-prefixed walk as
+/// DMAR; caller cases on `entry_type` and casts to the concrete struct.
+pub const NfitIterator = struct {
+    p: usize,
+    end: usize,
+
+    pub fn next(self: *NfitIterator) ?*align(1) const NfitStructHeader {
+        if (self.p + @sizeOf(NfitStructHeader) > self.end) return null;
+        const h: *align(1) const NfitStructHeader = @ptrFromInt(self.p);
+        if (h.length < @sizeOf(NfitStructHeader) or self.p + h.length > self.end) return null;
+        self.p += h.length;
+        return h;
+    }
+};
+
+/// NFIT sub-structure iterator. Yields nothing when no NFIT was found.
+pub fn nfitEntries() NfitIterator {
+    const n = nfit orelse return .{ .p = 0, .end = 0 };
+    return .{ .p = @intFromPtr(n) + @sizeOf(Nfit), .end = @intFromPtr(n) + n.header.length };
+}
+
+/// True when an NFIT table was published (i.e. an NVDIMM is present).
+pub fn hasNfit() bool {
+    return nfit != null;
+}
+
+/// Walk the NFIT for the first persistent-memory SPA Range Structure (type 0
+/// carrying the PM address-range GUID) and return its guest-physical base +
+/// length. Null if there's no NFIT or no PM range. The iterator already
+/// bounds every entry inside the table body, and the type-0 length check
+/// guarantees the full NfitSpaRange is readable before we cast.
+pub fn firstPmemRange() ?struct { base: u64, length: u64 } {
+    var it = nfitEntries();
+    while (it.next()) |h| {
+        if (h.entry_type != 0) continue; // only SPA Range structures
+        if (h.length < @sizeOf(NfitSpaRange)) continue;
+        const spa: *align(1) const NfitSpaRange = @ptrCast(h);
+        const is_pm = std.mem.eql(u8, &spa.range_guid, &PM_SPA_GUID) or
+            std.mem.eql(u8, &spa.range_guid, &PM_SPA_GUID_QEMU);
+        if (!is_pm) continue;
+        return .{ .base = spa.base, .length = spa.length };
+    }
+    return null;
+}
+
 // --- Checksum + validation --------------------------------------------------
 
 fn checksumOk(bytes: []const u8) bool {
@@ -523,6 +625,8 @@ fn dispatchTable(hdr: *align(1) const SdtHeader) void {
         mcfg = @ptrCast(hdr);
     } else if (std.mem.eql(u8, &hdr.signature, "DMAR")) {
         dmar = @ptrCast(hdr);
+    } else if (std.mem.eql(u8, &hdr.signature, "NFIT")) {
+        nfit = @ptrCast(hdr);
     } else if (std.mem.eql(u8, &hdr.signature, "SSDT")) {
         // Collect every SSDT; the AML interpreter walks them all into the one
         // namespace (Slice D). Cap silently — overflow just means the namespace
@@ -613,12 +717,13 @@ pub fn init(boot_rsdp: u64) void {
     // instead of the spec-default 5 (which only happens to work on QEMU).
     cacheDsdtAndParseS5();
 
-    debug.klog("[acpi] ready: FADT={s} MADT={s} HPET={s} MCFG={s} DMAR={s}\n", .{
+    debug.klog("[acpi] ready: FADT={s} MADT={s} HPET={s} MCFG={s} DMAR={s} NFIT={s}\n", .{
         if (fadt != null) "yes" else "no",
         if (madt != null) "yes" else "no",
         if (hpet != null) "yes" else "no",
         if (mcfg != null) "yes" else "no",
         if (dmar != null) "yes" else "no",
+        if (nfit != null) "yes" else "no",
     });
 
     // Dynamic ACPI (Slice B): decode the DSDT's AML into a namespace. Best-

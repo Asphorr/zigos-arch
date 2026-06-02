@@ -344,6 +344,84 @@ pub fn sysMmapSharedAnon(len: u32) u32 {
     return @intCast(new_top);
 }
 
+/// DAX mmap of /dev/pmem0 (sys mmap_pmem, #121). Maps a page-aligned window of
+/// the NVDIMM persistent-memory region DIRECTLY into the caller's address space:
+/// each user page points at the pmem physical frame itself, so loads/stores hit
+/// persistent memory with NO page-cache copy (the defining property of DAX). This
+/// is unlike every other mmap flavor here, which either zero-fill, snapshot, or
+/// route through the page cache.
+///
+/// `fd` must be an open /dev/pmem0; `offset` must be page-aligned and the whole
+/// [offset, offset+len) window must lie inside the region. Pages are mapped
+/// eagerly (the frames are fixed and known — no demand faulting needed) RW|USER,
+/// write-back cacheable so CLWB/CLFLUSHOPT persistence works. The frames are
+/// device memory registered with the PMM as a no-free range (pmem.init →
+/// pmm.registerDeviceRange), so munmap / process-exit teardown freeFrame's them
+/// as silent no-ops — they are never recycled into the RAM allocator.
+///
+/// Returns the mapped VA, or E_INVAL / E_NOMEM. (Like sysMmap, VAs grow down
+/// from mmap_top.) NOTE: a DAX region is effectively MAP_SHARED — fork-COW of it
+/// is not modeled (it would try to copy device frames); no current caller forks
+/// across one. Same eager-device-mapping shape as the GPU blob path.
+pub fn sysMmapPmem(len: u32, fd: u32, offset: u32) u32 {
+    if (len == 0) return E_INVAL;
+    const pcb = process.currentPCB() orelse return E_FAULT;
+    const pd = pcb.page_directory orelse return E_FAULT;
+    const lead = process.leader(pcb);
+
+    // The fd must really be /dev/pmem0 — DAX semantics only make sense there.
+    if (fd >= config.MAX_FDS) return E_INVAL;
+    if (!pcb.fd_table[fd].in_use) return E_INVAL;
+    if (pcb.fd_table[fd].fs_type != .devfs) return E_INVAL;
+    const devfs = @import("../../fs/devfs.zig");
+    if (devfs.kindOf(pcb.fd_table[fd].inode) != .pmem0) return E_INVAL;
+
+    const pmem = @import("../../mm/pmem.zig");
+    if (!pmem.isPresent()) return E_INVAL;
+
+    // Page-align: we map whole frames, and the pmem offset must be a frame
+    // boundary so user VA page N maps pmem frame (offset/4096 + N).
+    if (offset & 0xFFF != 0) return E_INVAL;
+    const len_pg: usize = (@as(usize, len) + 0xFFF) & ~@as(usize, 0xFFF);
+    if (@as(u64, offset) + len_pg > pmem.size()) return E_INVAL; // window must fit the region
+
+    lead.as_lock.acquire();
+    defer lead.as_lock.release();
+
+    if (lead.lazy_count >= process.MAX_LAZY_REGIONS) return E_INVAL;
+    if (len_pg > lead.mmap_top) return E_INVAL;
+    const new_top = lead.mmap_top - len_pg;
+    if (new_top < lead.user_brk) return E_INVAL;
+
+    // Eagerly install the direct mappings. base_phys + offset is the first
+    // frame; map consecutive frames to consecutive user pages.
+    const first_phys: usize = @intCast(pmem.basePhys() + offset);
+    const num_pages = len_pg / 0x1000;
+    var i: usize = 0;
+    while (i < num_pages) : (i += 1) {
+        const virt = new_top + i * 0x1000;
+        const phys = first_phys + i * 0x1000;
+        vmm.mapUserPage(pd, virt, phys, paging.PRESENT | paging.READ_WRITE | paging.USER) catch {
+            // Roll back the pages mapped so far. These are device frames, so
+            // unmapUserPage's returned phys is discarded (nothing to free).
+            var j: usize = 0;
+            while (j < i) : (j += 1) _ = vmm.unmapUserPage(pd, new_top + j * 0x1000);
+            return E_NOMEM;
+        };
+    }
+
+    // Track the VA range so munmap/teardown account for it. No buf_owned /
+    // cache_inode / shm_id: the frames are device memory, freed as no-ops.
+    if (!process.addLazyRegion(lead.tgid, new_top, lead.mmap_top, 0)) {
+        var j: usize = 0;
+        while (j < num_pages) : (j += 1) _ = vmm.unmapUserPage(pd, new_top + j * 0x1000);
+        return E_INVAL;
+    }
+    lead.lazy_regions[lead.lazy_count - 1].prot = process.PROT_RW;
+    lead.mmap_top = new_top;
+    return @intCast(new_top);
+}
+
 /// Free a previously-mmapped region. `va` must match the start of a registered
 /// region exactly and `len` must match its length (rounded up to page) — partial
 /// unmaps are rejected. Walks the page table releasing each present 4KB frame

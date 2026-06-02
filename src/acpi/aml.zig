@@ -640,6 +640,51 @@ fn findExact(abs: []const u8) ?*StoredNode {
     return null;
 }
 
+/// One NVDIMM-root discovery result: the device's namespace path plus which of
+/// the firmware control methods are present. Consumed by the NVDIMM driver
+/// (mm/pmem.zig).
+pub const NvdimmInfo = struct {
+    path: []const u8, // into the StoredNode path buffer (stable module storage)
+    has_fit: bool,
+    has_dsm: bool,
+    has_ncal: bool,
+};
+
+/// True if the namespace holds an object at "<dev_path>.<seg>". Probes for a
+/// control method WITHOUT evaluating it — evaluating _FIT would fire the QEMU
+/// DSM mailbox; here we only want presence.
+fn childExists(dev_path: []const u8, seg: []const u8) bool {
+    var buf: [128]u8 = undefined;
+    if (dev_path.len + 1 + seg.len > buf.len) return false;
+    @memcpy(buf[0..dev_path.len], dev_path);
+    buf[dev_path.len] = '.';
+    @memcpy(buf[dev_path.len + 1 ..][0..seg.len], seg);
+    return findExact(buf[0 .. dev_path.len + 1 + seg.len]) != null;
+}
+
+/// Find the NVDIMM root device — the Device with _HID "ACPI0012" — and report
+/// whether its _FIT / _DSM / NCAL control methods are present. The AML-side
+/// half of NVDIMM discovery: the static NFIT gives the memory geometry, this
+/// confirms the firmware's dynamic (DSM-mailbox) interface exists.
+pub fn nvdimmInfo() ?NvdimmInfo {
+    var i: usize = 0;
+    while (i < nnodes) : (i += 1) {
+        const n = &nodes[i];
+        if (n.kind != .device) continue;
+        const path = n.path[0..n.path_len];
+        const hid = evalDeviceChild(path, "_HID") orelse continue;
+        if (hid != .string) continue;
+        if (!std.mem.eql(u8, hid.string, "ACPI0012")) continue;
+        return .{
+            .path = path,
+            .has_fit = childExists(path, "_FIT"),
+            .has_dsm = childExists(path, "_DSM"),
+            .has_ncal = childExists(path, "NCAL"),
+        };
+    }
+    return null;
+}
+
 // --- value arena ------------------------------------------------------------
 // Packages need backing storage for their element Values. A fixed bump arena,
 // reset before each top-level evaluation, avoids an allocator on the AML path.

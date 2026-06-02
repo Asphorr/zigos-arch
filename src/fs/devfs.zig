@@ -12,6 +12,17 @@
 //   /dev/usb0    raw block access to the first USB block device (UAS or BOT).
 //                 sector-aligned (offset and count multiples of block_size,
 //                 typically 512). Returns 0xFFFFFFFF on misalignment.
+//   /dev/pmem0   byte-addressable access to the NVDIMM persistent-memory region
+//                 (no sector alignment — pmem is not block-structured). Reads
+//                 copy straight from the mapped region; every write is flushed
+//                 to the persistence domain before returning. mmap'ing this node
+//                 (sys mmap_pmem) gives a DAX mapping: the pages point directly
+//                 at the pmem frames, so user stores hit persistent memory with
+//                 no page-cache copy. Note: the devfs read/write offset and the
+//                 mmap_pmem offset are u32, so this path reaches only the first
+//                 4 GiB of a region (ample for current pmem; the pmem.zig API
+//                 itself is u64 — widen the devfs/syscall ABI if regions ever
+//                 exceed 4 GiB).
 //
 // /dev/usb0 is meant as the kernel-side counterpart to usbcat/usbwrite —
 // it lets generic byte tools (`cat /dev/usb0 > backup.bin`, `wc -c …`)
@@ -20,6 +31,7 @@
 
 const std = @import("std");
 const xhci = @import("../driver/xhci.zig");
+const pmem = @import("../mm/pmem.zig");
 const serial = @import("../debug/serial.zig");
 
 pub const Kind = enum(u8) {
@@ -28,6 +40,7 @@ pub const Kind = enum(u8) {
     random_dev,
     usb0,
     kmsg,
+    pmem0,
 };
 
 pub const Device = struct {
@@ -41,6 +54,7 @@ const DEVICES = [_]Device{
     .{ .name = "random", .kind = .random_dev },
     .{ .name = "usb0", .kind = .usb0 },
     .{ .name = "kmsg", .kind = .kmsg },
+    .{ .name = "pmem0", .kind = .pmem0 },
 };
 
 // Single global xorshift32 — `random` is for entropy-as-a-toy, not cryptography.
@@ -69,6 +83,14 @@ pub fn openFile(rel: []const u8) ?u32 {
 
 pub fn closeFile(_: u32) void {}
 
+/// Device kind for an open devfs index (the value stored in fd.inode), or null
+/// if out of range. Lets syscalls that special-case a device (e.g. mmap_pmem
+/// for /dev/pmem0) recover the kind from a file descriptor.
+pub fn kindOf(idx: u32) ?Kind {
+    if (idx >= DEVICES.len) return null;
+    return DEVICES[idx].kind;
+}
+
 /// Total readable bytes for a device, used for `stat` and listdir.
 /// Stream-style devices report 0 (no fixed size); usb0 reports the
 /// underlying disk capacity (block_count × block_size).
@@ -82,6 +104,7 @@ pub fn deviceSize(idx: u32) u64 {
             break :blk bs * bc;
         },
         .kmsg => serial.ringSize(),
+        .pmem0 => pmem.size(),
     };
 }
 
@@ -120,6 +143,7 @@ pub fn read(idx: u32, offset: *u32, buf: [*]u8, count: u32) u32 {
         },
         .usb0 => readUsb(offset.*, buf, count),
         .kmsg => return serial.ringRead(offset, buf, count), // already advances offset
+        .pmem0 => @as(u32, @intCast(pmem.readAt(offset.*, buf[0..count]))),
     };
     if (n != 0xFFFFFFFF) offset.* += n;
     return n;
@@ -130,6 +154,7 @@ pub fn write(idx: u32, offset: u32, buf: [*]const u8, count: u32) u32 {
     return switch (DEVICES[idx].kind) {
         .null_dev, .zero_dev, .random_dev, .kmsg => count, // sinks — pretend we wrote
         .usb0 => writeUsb(offset, buf, count),
+        .pmem0 => @as(u32, @intCast(pmem.writeAt(offset, buf[0..count]))),
     };
 }
 

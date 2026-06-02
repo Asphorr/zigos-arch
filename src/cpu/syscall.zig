@@ -336,6 +336,7 @@ const SYSCALLS = [_]SyscallSpec{
     .{ .num = 118, .name = "mmap_file_shared",        .handler = wrap(mem.sysMmapFileShared) },
     .{ .num = 119, .name = "msync",                   .handler = wrap(mem.sysMsync) },
     .{ .num = 120, .name = "getrandom",               .handler = wrap(sys.sysGetRandom) },
+    .{ .num = 121, .name = "mmap_pmem",               .handler = wrap(mem.sysMmapPmem) },
 };
 
 // Thin shims so the dispatch table can route into the iouring module
@@ -380,6 +381,7 @@ fn doSyscallInner(sys_num: u32, arg1: u32, arg2: u32, arg3: u32, frame: *signals
         118 => mem.sysMmapFileShared(arg1, arg2, arg3),
         119 => mem.sysMsync(arg1, arg2),
         120 => sys.sysGetRandom(arg1, arg2),
+        121 => mem.sysMmapPmem(arg1, arg2, arg3),
         5 => mem.sysSbrk(arg1),
         6 => proc.sysGetpid(),
         7 => proc.sysYield(),
