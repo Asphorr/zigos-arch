@@ -18,6 +18,17 @@ const serial = @import("../../debug/serial.zig");
 const desktop = @import("../../ui/desktop.zig");
 const xhci = @import("../../driver/xhci.zig");
 const signals = @import("../../proc/signals.zig");
+const perf = @import("../../debug/perf.zig");
+const hrtimer = @import("../../proc/hrtimer.zig");
+
+// TSC watermark for the elapsed-time wallclock advance (#1006). BSP-only,
+// mutated solely inside handleIRQ0's `!was_soft_yield` block with IRQs off — no
+// atomics needed (same single-writer regime as hb_state_count_page). The hires
+// one-shot fires the timer EARLY for sub-quantum usleep deadlines, so the 100 Hz
+// `tick_count` must advance by real elapsed quanta (hrtimer.ticksToAdvance), not
+// one per fire, or every tick-keyed timeout would run fast.
+var last_tick_tsc: u64 = 0;
+var tick_tsc_seeded: bool = false;
 
 /// IRQ0 stack-canary magic — pushed below the 15 GPRs at IRQ entry, verified
 /// before iretq. Used by both the isr_irq0 asm (literal embedded for the
@@ -255,43 +266,65 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
     // whenever BSP was in long kernel work (FAT32 read, gpu flush) and the
     // UI/sleep timing went haywire.
     if (cpu.cpu_id == 0 and !was_soft_yield) {
-        process.tick_count += 1;
-        bisectPoint("after tick++", frame_for_validate, irq_snap);
-        process.wakeExpired();
-        bisectPoint("after wakeExpired", frame_for_validate, irq_snap);
-        process.deliverDueAlarms();
-        bisectPoint("after deliverDueAlarms", frame_for_validate, irq_snap);
-        xhci.pollHID();
-        bisectPoint("after pollHID", frame_for_validate, irq_snap);
-        @import("../../driver/sound.zig").tick();
-        bisectPoint("after sound.tick", frame_for_validate, irq_snap);
-        @import("../../debug/gdb_stub.zig").checkForBreak();
-        bisectPoint("after gdb checkForBreak", frame_for_validate, irq_snap);
-        // Auto-dump perf counters every ~5 seconds (500 ticks at 100Hz). The
-        // counters survive the dump (no implicit reset) so the next dump shows
-        // accumulated cost since boot. Use `perf reset` from the CLI to zero.
-        if (process.tick_count % 500 == 0 and process.tick_count > 0) {
-            @import("../../debug/perf.zig").dumpAll();
+        // Advance the 100 Hz wallclock by ELAPSED TSC, not one tick per fire:
+        // the hires one-shot (#1006) fires the timer EARLY for sub-quantum
+        // usleep deadlines, and those early fires must add 0 ticks — else every
+        // tick-keyed sleep/timeout runs fast. TSC-deadline off ⇒ no early fires,
+        // so keep the simple one-per-fire advance.
+        var n_ticks: u32 = 1;
+        const tpq = apic.tscPerQuantum();
+        if (apic.tsc_deadline_active and tpq != 0) {
+            const now_tsc = perf.rdtsc();
+            if (!tick_tsc_seeded) {
+                last_tick_tsc = now_tsc -% tpq; // first fire counts as one quantum
+                tick_tsc_seeded = true;
+            }
+            const adv = hrtimer.ticksToAdvance(now_tsc, last_tick_tsc, tpq);
+            last_tick_tsc = adv.last;
+            n_ticks = adv.n;
+            // Wake precise-usleep sleepers on EVERY fire, including the early
+            // sub-quantum ones — arming the one-shot early is the whole point.
+            process.wakeHiresExpired(now_tsc);
         }
+        if (n_ticks > 0) {
+            process.tick_count += n_ticks;
+            bisectPoint("after tick++", frame_for_validate, irq_snap);
+            process.wakeExpired();
+            bisectPoint("after wakeExpired", frame_for_validate, irq_snap);
+            process.deliverDueAlarms();
+            bisectPoint("after deliverDueAlarms", frame_for_validate, irq_snap);
+            xhci.pollHID();
+            bisectPoint("after pollHID", frame_for_validate, irq_snap);
+            @import("../../driver/sound.zig").tick();
+            bisectPoint("after sound.tick", frame_for_validate, irq_snap);
+            @import("../../debug/gdb_stub.zig").checkForBreak();
+            bisectPoint("after gdb checkForBreak", frame_for_validate, irq_snap);
+            // Auto-dump perf counters every ~5 seconds (500 ticks at 100Hz). The
+            // counters survive the dump (no implicit reset) so the next dump shows
+            // accumulated cost since boot. Use `perf reset` from the CLI to zero.
+            if (process.tick_count % 500 == 0 and process.tick_count > 0) {
+                @import("../../debug/perf.zig").dumpAll();
+            }
 
-        // Tier C.1: rotate DR0-DR3 across procs[].kernel_esp slots so any
-        // wild writer (cross-CPU stack-aliasing source) trips with full RIP.
-        // BSP-only update of canonical entries[]; APs pick up via lazy
-        // applyLocal at their next IRQ entry. Cadence chosen to avoid
-        // IPI-flood heisendetector — see watch.rotateKernelEspWatches docs.
-        const watch_mod = @import("../../debug/watch.zig");
-        if (process.tick_count % watch_mod.KESP_REROTATE_TICKS == 0 and
-            process.tick_count > 0)
-        {
-            watch_mod.rotateKernelEspWatches();
-        }
+            // Tier C.1: rotate DR0-DR3 across procs[].kernel_esp slots so any
+            // wild writer (cross-CPU stack-aliasing source) trips with full RIP.
+            // BSP-only update of canonical entries[]; APs pick up via lazy
+            // applyLocal at their next IRQ entry. Cadence chosen to avoid
+            // IPI-flood heisendetector — see watch.rotateKernelEspWatches docs.
+            const watch_mod = @import("../../debug/watch.zig");
+            if (process.tick_count % watch_mod.KESP_REROTATE_TICKS == 0 and
+                process.tick_count > 0)
+            {
+                watch_mod.rotateKernelEspWatches();
+            }
 
-        // Phase 4 load balancer. Migrates one task per call from busiest
-        // → idlest cpu when delta >= threshold. ~500 ms cadence keeps the
-        // overhead minimal while still converging within a few balance
-        // rounds after a load shift.
-        if (process.tick_count % 50 == 0 and process.tick_count > 0) {
-            process.loadBalance();
+            // Phase 4 load balancer. Migrates one task per call from busiest
+            // → idlest cpu when delta >= threshold. ~500 ms cadence keeps the
+            // overhead minimal while still converging within a few balance
+            // rounds after a load shift.
+            if (process.tick_count % 50 == 0 and process.tick_count > 0) {
+                process.loadBalance();
+            }
         }
     }
     bisectPoint("after BSP wallclock", frame_for_validate, irq_snap);
@@ -411,7 +444,16 @@ fn rearmTimerForCurrent(cpu: *@import("../smp.zig").CpuLocal) void {
         const cur = cpu.current_pid orelse break :blk false;
         break :blk process.procs[cur].is_idle;
     };
-    apic.armOneShot(if (is_ap_idle) quantum *| 10 else quantum);
+    const base = if (is_ap_idle) quantum *| 10 else quantum;
+    // BSP clamps the one-shot to the soonest precise-usleep deadline so it fires
+    // exactly when a usleep is due (#1006). Only BSP runs wakeHiresExpired, so
+    // only BSP needs the early fire. Gated on TSC-deadline mode: our deadlines
+    // are absolute TSC ticks, the unit armOneShot wants only in that mode.
+    if (cpu.cpu_id == 0 and apic.tsc_deadline_active) {
+        apic.armOneShot(hrtimer.armDelta(base, perf.rdtsc(), process.nextHiresTsc()));
+        return;
+    }
+    apic.armOneShot(base);
 }
 
 // Timer IRQ stub — push 15 GPRs, call handleIRQ0 (context switch),

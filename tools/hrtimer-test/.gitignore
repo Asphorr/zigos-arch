@@ -1,0 +1,3 @@
+# Copied in by run.sh from src/proc/hrtimer.zig so the @import stays inside the
+# harness module path (Zig 0.15). Not source of truth — never commit the copy.
+hrtimer.zig

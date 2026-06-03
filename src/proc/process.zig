@@ -192,6 +192,12 @@ pub const PCB = struct {
     fd_table: [MAX_FDS]FileDesc = initFdTable(),
     // Sleep support
     wake_tick: u64 = 0, // (a) sysSleep + sched wakeExpired + virtio_gpu IRQ; cross-CPU readable
+    // Hi-res sleep deadline, ABSOLUTE TSC ticks (0 = none). Set by sysUsleep,
+    // woken by sched.wakeHiresExpired from the timer ISR — the precise-usleep
+    // path (#1006) that replaced the ~19.3B-cycle HPET busy-wait. Kept distinct
+    // from wake_tick (10 ms-granular) so the two wakers never fight: wakeExpired
+    // owns wake_tick, wakeHiresExpired owns this; a sleeper sets exactly one.
+    hires_wake_tsc: u64 = 0, // (a) cross-CPU readable
     // Race-free wake handshake. wake() sets this BEFORE clearing wait_kind /
     // setStating .ready, so a blockOn that just set wait_kind but hasn't yet
     // setState(.sleeping) can detect the race after setState and roll back.
@@ -806,6 +812,8 @@ pub const wakeSwapEvictWaiters = @import("sched.zig").wakeSwapEvictWaiters;
 pub const wakeIoUringWorker = @import("sched.zig").wakeIoUringWorker;
 pub const wakeIoUringCqWaiters = @import("sched.zig").wakeIoUringCqWaiters;
 pub const wakeExpired = @import("sched.zig").wakeExpired;
+pub const wakeHiresExpired = @import("sched.zig").wakeHiresExpired;
+pub const nextHiresTsc = @import("sched.zig").nextHiresTsc;
 pub const deliverDueAlarms = @import("sched.zig").deliverDueAlarms;
 pub const kernelSleepMs = @import("sched.zig").kernelSleepMs;
 pub const BlockResult = @import("sched.zig").BlockResult;

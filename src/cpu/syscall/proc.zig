@@ -1032,31 +1032,70 @@ pub fn sysGettimeofday(buf_ptr: u32) u32 {
     return 0;
 }
 
-/// usleep(usec) — sleep for `usec` microseconds. Tiered:
-///   * usec <  10000  : pure HPET busy-wait (sub-tick precision matters more
-///                       than CPU efficiency for sub-10ms sleeps).
-///   * usec >= 10000  : descheduled sleep down to a 10ms tick boundary, then
-///                       HPET busy-wait the remainder. Avoids burning CPU on
-///                       long sleeps while keeping ~µs precision at the end.
+/// usleep(usec) — sleep for `usec` microseconds.
+///
+/// Previously this busy-waited the sub-tick remainder in
+/// `while (monotonicNanos() < target) pause;` — an HPET-MMIO poll that pinned a
+/// core at 100% (and took a VM exit per iteration on QEMU). By the kernel's own
+/// gap-adjusted perf counter it was the #1 on-CPU sink at ~19.3B cycles/session.
+///
+/// Now it *blocks* on the LAPIC TSC-deadline one-shot (#1006): it stores an
+/// absolute TSC deadline, registers it so `rearmTimerForCurrent` arms the timer
+/// to fire then, and deschedules — so the core halts or runs other work instead
+/// of spinning. `wakeHiresExpired` (BSP timer ISR) flips it `.ready` at the
+/// deadline. The loop re-blocks on a spurious early wake, stays interruptible
+/// (bails on a pending signal), and TSC-spins only a sub-`SPIN_FLOOR_US`
+/// remainder where a block round-trip would cost more than the wait. The fallout
+/// spin uses `rdtsc` (one cheap instruction) not the HPET MMIO read, so even the
+/// no-TSC-deadline / sub-floor fallbacks drop the VM-exit storm.
 pub fn sysUsleep(usec: u32) u32 {
     if (usec == 0) return 0;
-    const time = @import("../../time/time.zig");
-    const target = time.monotonicNanos() + @as(u64, usec) * 1000;
+    const hrtimer = @import("../../proc/hrtimer.zig");
+    const sched = @import("../../proc/sched.zig");
 
-    // Coarse phase: tick-based deschedule for the bulk of long sleeps.
-    if (usec >= 10_000) {
-        const ms = (usec - 5_000) / 1_000; // leave ~5ms for fine spin
-        if (ms > 0) {
-            _ = sysSleep(ms);
+    const tpq = apic.tscPerQuantum();
+    const SPIN_FLOOR_US: u32 = 50;
+    const per_us = hrtimer.tscPerUs(if (tpq == 0) 30_000_000 else tpq);
+
+    // Fallback: no precise one-shot to block on (pre-calibration or LAPIC
+    // count-down mode), or a sub-floor sleep where a block + IRQ round-trip
+    // costs more than the wait itself. Spin — but on rdtsc, not the HPET MMIO
+    // poll, so no VM exits.
+    if (!apic.tsc_deadline_active or tpq == 0 or usec <= SPIN_FLOOR_US) {
+        const target = perf.rdtsc() +% @as(u64, usec) *% per_us;
+        while (!hrtimer.due(perf.rdtsc(), target)) asm volatile ("pause");
+        return 0;
+    }
+
+    const cur_pid = smp.myCpu().current_pid orelse return E_FAULT;
+    const pcb = &process.procs[cur_pid];
+    const deadline = hrtimer.deadline(perf.rdtsc(), usec, tpq);
+    const floor_tsc: u64 = @as(u64, SPIN_FLOOR_US) *% per_us;
+
+    // Block until the one-shot fires at `deadline`.
+    while (!hrtimer.due(perf.rdtsc(), deadline)) {
+        // Interruptible: a pending, unmasked signal ends the sleep so it's
+        // delivered on syscall return rather than after the full duration.
+        if ((@atomicLoad(u32, &pcb.pending_signals, .acquire) & ~pcb.signal_mask) != 0) break;
+        // Sub-floor remainder (woken a hair early, or usec barely over the
+        // floor): spin it out rather than pay another deschedule round-trip.
+        if (hrtimer.due(perf.rdtsc() +% floor_tsc, deadline)) {
+            while (!hrtimer.due(perf.rdtsc(), deadline)) asm volatile ("pause");
+            break;
         }
+        // Arm + deschedule. Mirrors sysSleep (incl. the perf-gap accounting so
+        // the descheduled time isn't charged to this syscall's CPU counter).
+        @atomicStore(u64, &pcb.hires_wake_tsc, deadline, .release);
+        sched.registerHiresWake(deadline);
+        process.setState(cur_pid, .sleeping);
+        const t_pause = perf.rdtsc();
+        smp.myCpu().pending_soft_yield = true;
+        sched_asm.softYield();
+        const t_resume = perf.rdtsc();
+        if (process.currentPCB()) |p| p.perf_gap_cyc +%= t_resume -% t_pause;
     }
-
-    // Fine phase: HPET busy-wait until target. `pause` hints the CPU we're in
-    // a spin loop — saves power on real hardware and avoids some pipeline
-    // stalls. On QEMU it's a no-op but harmless.
-    while (time.monotonicNanos() < target) {
-        asm volatile ("pause");
-    }
+    // Leave no stale deadline behind (broke out on signal, or woken early).
+    @atomicStore(u64, &pcb.hires_wake_tsc, 0, .release);
     return 0;
 }
 

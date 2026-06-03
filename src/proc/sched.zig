@@ -62,6 +62,7 @@ const swap = @import("../mm/swap.zig");
 const SpinLock = @import("spinlock.zig").SpinLock;
 
 const process = @import("process.zig");
+const hrtimer = @import("hrtimer.zig");
 const PCB = process.PCB;
 const State = process.State;
 const Priority = process.Priority;
@@ -1761,11 +1762,34 @@ inline fn writeFsBase(val: u64) void {
 pub var earliest_wake_tick: std.atomic.Value(u64) = std.atomic.Value(u64).init(std.math.maxInt(u64));
 pub var earliest_alarm_tick: std.atomic.Value(u64) = std.atomic.Value(u64).init(std.math.maxInt(u64));
 
+// Earliest pending hi-res (TSC-absolute) usleep deadline across all PCBs — the
+// min of every `.sleeping` PCB's `hires_wake_tsc`. `rearmTimerForCurrent` reads
+// it to clamp the one-shot to the soonest usleep due-time; `wakeHiresExpired`
+// gates its scan and recomputes it. hrtimer.NONE (maxInt) = nothing pending.
+pub var earliest_hires_tsc: std.atomic.Value(u64) = std.atomic.Value(u64).init(hrtimer.NONE);
+
 pub fn registerWakeDeadline(deadline: u64) void {
     var cur = earliest_wake_tick.load(.monotonic);
     while (deadline < cur) {
         cur = earliest_wake_tick.cmpxchgWeak(cur, deadline, .release, .monotonic) orelse return;
     }
+}
+
+/// Register a hi-res usleep deadline (absolute TSC). CAS-min into the cache so
+/// the timer ISR's re-arm sees the soonest due-time. Mirrors
+/// registerWakeDeadline; the caller has already stored it in pcb.hires_wake_tsc.
+pub fn registerHiresWake(deadline: u64) void {
+    var cur = earliest_hires_tsc.load(.monotonic);
+    while (deadline < cur) {
+        cur = earliest_hires_tsc.cmpxchgWeak(cur, deadline, .release, .monotonic) orelse return;
+    }
+}
+
+/// Earliest pending hi-res deadline (absolute TSC), or hrtimer.NONE if none.
+/// Read by rearmTimerForCurrent on every timer re-arm — kept O(1) via the cache
+/// rather than rescanning the proc table each fire.
+pub inline fn nextHiresTsc() u64 {
+    return earliest_hires_tsc.load(.acquire);
 }
 
 pub fn registerAlarmDeadline(deadline: u64) void {
@@ -1793,6 +1817,14 @@ pub fn wakeExpired() void {
         if (pcb.state != .sleeping) {
             // Forward progress on this slot — clear any latched stuck
             // state so the NEXT incident logs fresh.
+            stuck_last_seen_wait_kind[i] = null;
+            continue;
+        }
+        // Hi-res usleep sleepers carry hires_wake_tsc (not wake_tick) and are
+        // woken by wakeHiresExpired (#1006). Skip them here — otherwise their
+        // wait_kind==.none + wake_tick==0 shape trips the orphan-sleep
+        // diagnostic below.
+        if (@atomicLoad(u64, &pcb.hires_wake_tsc, .acquire) != 0) {
             stuck_last_seen_wait_kind[i] = null;
             continue;
         }
@@ -1892,6 +1924,60 @@ pub fn wakeExpired() void {
         const r = earliest_wake_tick.cmpxchgWeak(cur_earliest, new_earliest, .release, .acquire);
         if (r == null) break;
         cur_earliest = r.?;
+    }
+}
+
+/// Wake usleep sleepers whose hi-res (TSC-absolute) deadline has come due — the
+/// TSC twin of wakeExpired (#1006). Called from the BSP timer ISR on EVERY
+/// hardware fire, not just 10 ms tick boundaries: the one-shot is armed early
+/// for sub-quantum deadlines, so this is where a precise usleep actually wakes.
+/// `now_tsc` is rdtsc() read once by the handler. Only touches `.sleeping`,
+/// wait_kind==.none PCBs carrying a non-zero hires_wake_tsc (set by sysUsleep);
+/// tick-based sleepers keep wake_tick and are left to wakeExpired.
+pub fn wakeHiresExpired(now_tsc: u64) void {
+    // Fast path: nothing pending, or the soonest deadline isn't due yet. The
+    // cache is the min of all pending hires deadlines and is only ever raised by
+    // recomputing from the table (below) — so it can't read "not due" while a
+    // real deadline is due (no missed wake). This runs every timer fire, so the
+    // single-compare early-out matters. NONE must be checked explicitly:
+    // due(now, NONE) is true (maxInt is "1 ahead" under wrapping).
+    const earliest = earliest_hires_tsc.load(.acquire);
+    if (earliest == hrtimer.NONE or !hrtimer.due(now_tsc, earliest)) return;
+
+    var new_earliest: u64 = hrtimer.NONE;
+    for (0..MAX_PROCS) |i| {
+        const pcb = &process.procs[i];
+        if (pcb.state != .sleeping) continue;
+        const dl = @atomicLoad(u64, &pcb.hires_wake_tsc, .acquire);
+        if (dl == 0) continue; // not a hi-res sleeper
+        if (pcb.wait_kind == .none and hrtimer.due(now_tsc, dl)) {
+            // ORDER: clear the deadline BEFORE setState — same orphan-sleep rule
+            // as wakeExpired. setState routes into the run queue; the woken task
+            // can run and usleep again before our store lands, and a late store
+            // would clobber its fresh deadline, parking it with no waker.
+            @atomicStore(u64, &pcb.hires_wake_tsc, 0, .release);
+            setState(i, .ready);
+            continue;
+        }
+        if (pcb.wait_kind == .none and dl < new_earliest) new_earliest = dl;
+    }
+    // Heal the cache to the recomputed earliest. CRITICAL difference from
+    // wakeExpired's "only lower" store-back: THIS cache drives timer arming, so a
+    // value stuck in the PAST makes armDelta re-fire the timer every tick — the
+    // livelock that wedged the box (BSP fired ~67×/quantum, tick_count crawled).
+    // A past cached value is therefore always stale (real deadlines are future)
+    // and must be overwritten; a FUTURE value below new_earliest is a concurrent
+    // registerHiresWake to preserve. So keep `cur` only when it's a sooner
+    // *future* deadline — otherwise overwrite (this raises a stale-past value
+    // back to NONE/next, which "only lower" never could).
+    var cur = earliest_hires_tsc.load(.acquire);
+    while (true) {
+        const cur_future = cur != hrtimer.NONE and !hrtimer.due(now_tsc, cur);
+        const want = if (cur_future and cur < new_earliest) cur else new_earliest;
+        if (want == cur) break;
+        if (earliest_hires_tsc.cmpxchgWeak(cur, want, .release, .acquire)) |actual| {
+            cur = actual;
+        } else break;
     }
 }
 
