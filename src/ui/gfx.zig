@@ -383,6 +383,38 @@ pub fn drawFilledCircle(cx: i32, cy: i32, radius: u32, color: u32) void {
     }
 }
 
+/// Like `drawFilledCircle`, but the entire disc (interior + AA edge) is
+/// alpha-blended using the color's top-byte alpha — so it shows the pixels
+/// underneath. Used for soft circular speculars (e.g. the traffic-light
+/// gloss) where a fully opaque fill would read as a hard dot.
+pub fn drawFilledCircleAlpha(cx: i32, cy: i32, radius: u32, color: u32) void {
+    const a = (color >> 24) & 0xFF;
+    if (a == 0) return;
+    const r: i32 = @intCast(radius);
+    const r_outer = r + 1;
+    const r_sq = r * r;
+    const base = color & 0x00FFFFFF;
+    var dy: i32 = -r_outer;
+    while (dy <= r_outer) : (dy += 1) {
+        var dx: i32 = -r_outer;
+        while (dx <= r_outer) : (dx += 1) {
+            const dist_sq = dx * dx + dy * dy;
+            var cov: u32 = 0;
+            if (dist_sq <= r_sq - r) {
+                cov = 255;
+            } else if (dist_sq <= r_sq + r * 2 + 1) {
+                const diff = dist_sq - (r_sq - r);
+                const band = @as(u32, @intCast(r * 3 + 1));
+                cov = if (diff >= band) 0 else 255 - @as(u32, @intCast(diff)) * 255 / band;
+            }
+            if (cov == 0) continue;
+            const pa = (a * cov) / 255;
+            if (pa == 0) continue;
+            blendPixelAt(cx + dx, cy + dy, (pa << 24) | base);
+        }
+    }
+}
+
 /// SSE2 memcpy for framebuffer rows.
 fn copyRowSSE2(dst: usize, src: usize, count: u32) void {
     var d = dst;
@@ -653,22 +685,63 @@ fn isqrt(n: u32) u32 {
     }
 }
 
+/// Blend `argb` (alpha in the top byte) onto the target pixel at (px, py).
+/// Bounds-checked. Used for the sub-pixel AA edge of rounded corners and for
+/// soft circular speculars.
+inline fn blendPixelAt(px: i32, py: i32, argb: u32) void {
+    if (px < 0 or py < 0) return;
+    const ux: u32 = @intCast(px);
+    const uy: u32 = @intCast(py);
+    if (ux >= target_w or uy >= target_h) return;
+    const off = uy * target_w + ux;
+    target[off] = blendPixel(target[off], argb);
+}
+
+/// Per-row geometry of a rounded corner. `dy` is the vertical distance (0..r)
+/// from the corner arc's center row. Returns the integer `inset` (first fully
+/// solid column from the edge) and `edge_a` (0..255) — the coverage of the
+/// single partially-covered pixel just OUTSIDE that inset on each side.
+///
+/// Float-free: the boundary sits at `inset - frac(sqrt(inner))`, and
+/// `frac(sqrt(n)) ≈ (n - s²)/(2s + 1)` with `s = floor(sqrt(n))`. That fraction
+/// IS the coverage of the boundary pixel — blending it turns the old
+/// stair-stepped corner into a smooth 1px-AA arc that matches the window
+/// chrome's supersampled corners.
+fn roundedRowEdge(r: u32, dy: u32) struct { inset: u32, edge_a: u32 } {
+    const inner = r * r -| (dy * dy);
+    const s = isqrt(inner);
+    const denom = 2 * s + 1;
+    var frac = (inner - s * s) * 255 / denom;
+    if (frac > 255) frac = 255;
+    return .{ .inset = r - s, .edge_a = frac };
+}
+
 pub fn fillRoundedRect(x: i32, y: i32, w: u32, h: u32, radius: u32, color: u32) void {
     if (w == 0 or h == 0) return;
     const r = @min(radius, w / 2, h / 2);
     if (r == 0) return fillRect(x, y, w, h, color);
+    const rgb = color & 0x00FFFFFF;
 
     for (0..h) |row_i| {
         var inset: u32 = 0;
+        var edge_a: u32 = 0;
         if (row_i < r) {
-            const dy = r - 1 - @as(u32, @intCast(row_i));
-            inset = r - isqrt(r * r -| (dy * dy));
+            const e = roundedRowEdge(r, r - 1 - @as(u32, @intCast(row_i)));
+            inset = e.inset;
+            edge_a = e.edge_a;
         } else if (row_i >= h - r) {
-            const dy = @as(u32, @intCast(row_i)) - (h - r);
-            inset = r - isqrt(r * r -| (dy * dy));
+            const e = roundedRowEdge(r, @as(u32, @intCast(row_i)) - (h - r));
+            inset = e.inset;
+            edge_a = e.edge_a;
         }
         if (inset * 2 >= w) continue;
-        fillRect(x + @as(i32, @intCast(inset)), y + @as(i32, @intCast(row_i)), w - inset * 2, 1, color);
+        const ry = y + @as(i32, @intCast(row_i));
+        fillRect(x + @as(i32, @intCast(inset)), ry, w - inset * 2, 1, color);
+        // Sub-pixel AA: blend the single partial pixel just outside each side.
+        if (inset > 0 and edge_a > 0) {
+            blendPixelAt(x + @as(i32, @intCast(inset)) - 1, ry, (edge_a << 24) | rgb);
+            blendPixelAt(x + @as(i32, @intCast(w - inset)), ry, (edge_a << 24) | rgb);
+        }
     }
 }
 
@@ -676,18 +749,32 @@ pub fn fillRoundedRectAlpha(x: i32, y: i32, w: u32, h: u32, radius: u32, color: 
     if (w == 0 or h == 0) return;
     const r = @min(radius, w / 2, h / 2);
     if (r == 0) return fillRectAlpha(x, y, w, h, color);
+    const base_a = (color >> 24) & 0xFF;
+    const rgb = color & 0x00FFFFFF;
 
     for (0..h) |row_i| {
         var inset: u32 = 0;
+        var edge_a: u32 = 0;
         if (row_i < r) {
-            const dy = r - 1 - @as(u32, @intCast(row_i));
-            inset = r - isqrt(r * r -| (dy * dy));
+            const e = roundedRowEdge(r, r - 1 - @as(u32, @intCast(row_i)));
+            inset = e.inset;
+            edge_a = e.edge_a;
         } else if (row_i >= h - r) {
-            const dy = @as(u32, @intCast(row_i)) - (h - r);
-            inset = r - isqrt(r * r -| (dy * dy));
+            const e = roundedRowEdge(r, @as(u32, @intCast(row_i)) - (h - r));
+            inset = e.inset;
+            edge_a = e.edge_a;
         }
         if (inset * 2 >= w) continue;
-        fillRectAlpha(x + @as(i32, @intCast(inset)), y + @as(i32, @intCast(row_i)), w - inset * 2, 1, color);
+        const ry = y + @as(i32, @intCast(row_i));
+        fillRectAlpha(x + @as(i32, @intCast(inset)), ry, w - inset * 2, 1, color);
+        // Sub-pixel AA, scaled by the fill's own alpha.
+        if (inset > 0 and edge_a > 0) {
+            const pa = (base_a * edge_a) / 255;
+            if (pa > 0) {
+                blendPixelAt(x + @as(i32, @intCast(inset)) - 1, ry, (pa << 24) | rgb);
+                blendPixelAt(x + @as(i32, @intCast(w - inset)), ry, (pa << 24) | rgb);
+            }
+        }
     }
 }
 

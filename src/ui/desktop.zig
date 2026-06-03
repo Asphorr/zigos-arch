@@ -1380,7 +1380,11 @@ fn renderWindow(idx: u8) void {
     // Border (1px) — flashes red while a terminal's bell_phase counts down.
     const border_color: u32 = blk: {
         if (w.term) |t| if (t.bell_phase > 0) break :blk BELL_FLASH_COLOR;
-        break :blk WINDOW_BORDER;
+        // Subtle hairline instead of a hard bright outline — a touch lighter
+        // than the dark body (dark theme) or a soft grey (light theme). The
+        // window reads as elevated via its shadow + AA corners, not a heavy
+        // border. restoreCornerPixels reuses this for the rounded corner ring.
+        break :blk if (conf.theme == 1) @as(u32, 0x3A3A3A) else @as(u32, 0xC0C0C0);
     };
     gfx.drawRect(w.x - @as(i32, BORDER), w.y - @as(i32, BORDER), w.width + BORDER * 2, w.height + BORDER * 2, border_color);
 
@@ -1425,6 +1429,13 @@ fn renderWindow(idx: u8) void {
     gfx.drawFilledCircle(w.x + 16, btn_cy, BTN_RADIUS, btn_close_col);
     gfx.drawFilledCircle(w.x + 38, btn_cy, BTN_RADIUS, btn_min_col);
     gfx.drawFilledCircle(w.x + 60, btn_cy, BTN_RADIUS, btn_max_col);
+    // Subtle upper specular so the lights read as soft glass beads rather than
+    // flat discs — a faint white sheen biased upward (key light from above).
+    const gloss_r: u32 = @max(BTN_RADIUS / 2, 2);
+    const gloss_up: i32 = @as(i32, @intCast(BTN_RADIUS)) / 2;
+    gfx.drawFilledCircleAlpha(w.x + 16, btn_cy - gloss_up, gloss_r, 0x38FFFFFF);
+    gfx.drawFilledCircleAlpha(w.x + 38, btn_cy - gloss_up, gloss_r, 0x38FFFFFF);
+    gfx.drawFilledCircleAlpha(w.x + 60, btn_cy - gloss_up, gloss_r, 0x38FFFFFF);
 
     // Centered title — SF Pro Display 24px AA. Title bar gradient is already
     // painted; aa_font draws via per-pixel alpha blend so we just stamp glyphs

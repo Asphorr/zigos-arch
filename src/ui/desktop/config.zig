@@ -14,7 +14,7 @@ const std = @import("std");
 const debug = @import("../../debug/debug.zig");
 
 pub var bg: u8 = 0; // 0=blue, 1=purple, 2=green, 3=red
-pub var theme: u8 = 0; // 0=light, 1=dark
+pub var theme: u8 = 1; // 0=light, 1=dark (default dark — matches the dark window body/terminal; a true light theme needs a light body + palette)
 pub var mouse_speed: u8 = 1; // 0=slow, 1=normal, 2=fast
 pub var dock_pos: u8 = 0; // 0=bottom, 1=top
 pub var resolution: u8 = 1; // 0=720p, 1=1080p (default to current)
