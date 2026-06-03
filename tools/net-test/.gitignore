@@ -1,0 +1,6 @@
+# The real net.zig is copied in by run.sh on each run — never commit the copy.
+/src/net/net.zig
+# Zig build artifacts
+.zig-cache/
+zig-cache/
+zig-out/

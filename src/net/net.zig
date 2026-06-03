@@ -40,6 +40,7 @@ const TCP_ACK: u8 = 0x10;
 const TCP_MAX_CONNS = 16;
 const TCP_MAX_LISTENERS = 4;
 const TCP_RX_BUF_SIZE = 8192;
+const TCP_SND_BUF_SIZE = 8192; // per-conn ring of unacked+unsent outbound data
 const TCP_RETRANSMIT_TICKS: u64 = 300;
 const TCP_MAX_RETRIES: u8 = 3;
 const TCP_NO_LISTENER: u8 = 0xFF;
@@ -485,6 +486,14 @@ const TcpConn = struct {
     snd_nxt: u32 = 0,
     snd_una: u32 = 0,
     snd_iss: u32 = 0,
+    snd_wnd: u32 = 0, // peer's most-recently advertised receive window
+    // Ring of outbound data we may still have to retransmit. The byte at
+    // snd_buf[snd_buf_head] corresponds to sequence number snd_una; the ring
+    // holds snd_buf_len bytes spanning [snd_una, snd_una+snd_buf_len). Of those,
+    // [snd_una, snd_nxt) are sent-but-unacked and the rest are buffered-unsent.
+    snd_buf: [TCP_SND_BUF_SIZE]u8 = undefined,
+    snd_buf_head: u32 = 0,
+    snd_buf_len: u32 = 0,
     rcv_nxt: u32 = 0,
     rx_buf: [TCP_RX_BUF_SIZE]u8 = undefined,
     rx_write: u32 = 0,
@@ -537,7 +546,11 @@ fn enqueueAccepted(lst: *TcpListener, conn_slot: u8) void {
     lst.accept_head = next;
 }
 
-fn sendTcpPacket(conn: *TcpConn, flags: u8, payload: ?[]const u8, include_mss: bool) bool {
+/// Build and transmit a single TCP segment stamped with an explicit sequence
+/// number. `sendTcpPacket` wraps this at conn.snd_nxt for the common case; the
+/// data path passes an explicit seq so a retransmission can re-send the oldest
+/// unacked bytes (seq == snd_una) rather than whatever went out last.
+fn emitSegment(conn: *TcpConn, seq: u32, flags: u8, payload: ?[]const u8, include_mss: bool) bool {
     const loop = isLoopback(conn.remote_ip);
     if (!loop and !arpResolveGateway()) return false;
     var pkt: [1514]u8 = undefined;
@@ -552,7 +565,7 @@ fn sendTcpPacket(conn: *TcpConn, flags: u8, payload: ?[]const u8, include_mss: b
     const tcp = pkt[ETH_HDR_SIZE + IPV4_HDR_SIZE ..];
     writeU16BE(tcp[0..2], conn.local_port);
     writeU16BE(tcp[2..4], conn.remote_port);
-    writeU32BE(tcp[4..8], conn.snd_nxt);
+    writeU32BE(tcp[4..8], seq);
     writeU32BE(tcp[8..12], if (flags & TCP_ACK != 0) conn.rcv_nxt else 0);
     tcp[12] = if (include_mss) (6 << 4) else (5 << 4); // data offset
     tcp[13] = flags;
@@ -590,12 +603,26 @@ fn sendTcpPacket(conn: *TcpConn, flags: u8, payload: ?[]const u8, include_mss: b
 
     const total: usize = ETH_HDR_SIZE + IPV4_HDR_SIZE + tcp_total;
 
-    // Save for retransmission
-    @memcpy(conn.last_tx[0..total], pkt[0..total]);
-    conn.last_tx_len = @intCast(total);
-    conn.last_send_tick = process.tick_count;
+    // Control segments (SYN/SYN-ACK/FIN) consume a sequence number and are
+    // retransmitted verbatim from last_tx; data segments are retransmitted from
+    // the snd_buf ring instead, so they must not clobber a pending SYN/FIN here.
+    if (flags & (TCP_SYN | TCP_FIN) != 0) {
+        @memcpy(conn.last_tx[0..total], pkt[0..total]);
+        conn.last_tx_len = @intCast(total);
+    }
+    // Arm the retransmit timer whenever we put retransmittable octets on the
+    // wire — anything that consumes sequence space (data, SYN or FIN).
+    if ((payload != null and payload.?.len > 0) or flags & (TCP_SYN | TCP_FIN) != 0) {
+        conn.last_send_tick = process.tick_count;
+    }
 
     return dispatchPacket(conn.remote_ip, pkt[0..total]);
+}
+
+/// Send a segment at the connection's current snd_nxt — the common path for
+/// control segments and bare ACKs.
+fn sendTcpPacket(conn: *TcpConn, flags: u8, payload: ?[]const u8, include_mss: bool) bool {
+    return emitSegment(conn, conn.snd_nxt, flags, payload, include_mss);
 }
 
 pub fn tcpConnect(dst_ip: [4]u8, dst_port: u16) ?u8 {
@@ -752,19 +779,80 @@ pub fn tcpAccept(listen_slot: u8) ?u8 {
     return slot;
 }
 
+// === send buffer (snd_buf ring) ===
+
+/// Most unacked bytes we may keep in flight: bounded by both the peer's
+/// advertised window and our own ring. (A congestion window joins this later.)
+fn effectiveWindow(conn: *const TcpConn) u32 {
+    return @min(conn.snd_wnd, @as(u32, TCP_SND_BUF_SIZE));
+}
+
+/// Append `bytes` at the ring tail (sequence snd_una+snd_buf_len). The caller
+/// guarantees bytes.len <= free space.
+fn appendSnd(conn: *TcpConn, bytes: []const u8) void {
+    var pos = (conn.snd_buf_head + conn.snd_buf_len) % TCP_SND_BUF_SIZE;
+    for (bytes) |b| {
+        conn.snd_buf[pos] = b;
+        pos = (pos + 1) % TCP_SND_BUF_SIZE;
+    }
+    conn.snd_buf_len += @intCast(bytes.len);
+}
+
+/// Copy out.len bytes from the ring starting at sequence number `seq`, which
+/// must lie within [snd_una, snd_una+snd_buf_len).
+fn readSnd(conn: *const TcpConn, seq: u32, out: []u8) void {
+    var pos = (conn.snd_buf_head + (seq -% conn.snd_una)) % TCP_SND_BUF_SIZE;
+    for (out) |*o| {
+        o.* = conn.snd_buf[pos];
+        pos = (pos + 1) % TCP_SND_BUF_SIZE;
+    }
+}
+
+/// Emit as many new MSS-sized segments as the send window allows, advancing
+/// snd_nxt. Sends only buffered-but-unsent bytes: [snd_nxt, snd_una+snd_buf_len).
+fn flushSnd(conn: *TcpConn) void {
+    const wnd = effectiveWindow(conn);
+    var guard: u32 = 0;
+    while (guard < TCP_SND_BUF_SIZE) : (guard += 1) {
+        const unsent = (conn.snd_una +% conn.snd_buf_len) -% conn.snd_nxt;
+        if (unsent == 0) break;
+        const inflight = conn.snd_nxt -% conn.snd_una;
+        if (inflight >= wnd) break; // window full
+        const allow = wnd - inflight;
+        const seg = @min(@min(unsent, @as(u32, conn.peer_mss)), allow);
+        if (seg == 0) break;
+        var tmp: [1460]u8 = undefined;
+        readSnd(conn, conn.snd_nxt, tmp[0..seg]);
+        if (!emitSegment(conn, conn.snd_nxt, TCP_PSH | TCP_ACK, tmp[0..seg], false)) break;
+        conn.snd_nxt +%= seg;
+    }
+}
+
 pub fn tcpSend(slot: u8, data: []const u8) bool {
     if (slot >= TCP_MAX_CONNS) return false;
-    var conn = &tcp_conns[slot];
+    const conn = &tcp_conns[slot];
     if (!conn.active or conn.state != .established) return false;
 
-    var sent: usize = 0;
-    while (sent < data.len) {
-        const chunk = @min(data.len - sent, conn.peer_mss);
-        if (!sendTcpPacket(conn, TCP_PSH | TCP_ACK, data[sent..][0..chunk], false)) return false;
-        conn.snd_nxt += @intCast(chunk);
-        sent += chunk;
-        // Brief poll to process ACKs
-        poll();
+    var off: usize = 0;
+    while (off < data.len) {
+        // Block (bounded) for ring space when the unacked window is full; ACKs
+        // arriving via poll() drain it. The deadline keeps a stalled peer from
+        // wedging the caller forever.
+        if (conn.snd_buf_len >= TCP_SND_BUF_SIZE) {
+            const deadline = process.tick_count + 500;
+            while (conn.snd_buf_len >= TCP_SND_BUF_SIZE and process.tick_count < deadline) {
+                poll();
+                if (conn.error_flag or conn.state != .established) return false;
+                process.kernelSleepMs(10);
+            }
+            if (conn.snd_buf_len >= TCP_SND_BUF_SIZE) return false; // timed out
+        }
+        const space: usize = TCP_SND_BUF_SIZE - conn.snd_buf_len;
+        const chunk = @min(data.len - off, space);
+        appendSnd(conn, data[off..][0..chunk]);
+        off += chunk;
+        flushSnd(conn);
+        poll(); // pick up ACKs so the next iteration sees freed window
     }
     return true;
 }
@@ -930,6 +1018,18 @@ fn handleTcpPacket(ip_data: []volatile u8, ihl: usize) void {
 
     debug.klog("[tcp] RX state={d} flags=0x{X:0>2} seq={d} ack={d} payload={d}\n", .{ @intFromEnum(c.state), flags, seq, ack, payload_len });
 
+    // Track the peer's advertised receive window for send-side flow control.
+    c.snd_wnd = readU16BE(tcp[14..16]);
+    // A window update — including one re-opening from a (near-)zero window — can
+    // let buffered-but-unsent data move even when this segment's ACK didn't
+    // advance snd_una. Flush here too, not only on the snd_una-advancing path,
+    // or a slow reader could wedge the sender until the next data-bearing ACK.
+    if ((c.state == .established or c.state == .close_wait) and
+        (c.snd_una +% c.snd_buf_len) != c.snd_nxt)
+    {
+        flushSnd(c);
+    }
+
     switch (c.state) {
         .syn_received => {
             // Peer is finishing the handshake we started in tryAcceptIncomingSyn.
@@ -985,9 +1085,19 @@ fn handleTcpPacket(ip_data: []volatile u8, ihl: usize) void {
         .established => {
             // ACK processing
             if (flags & TCP_ACK != 0) {
-                if (@as(i32, @bitCast(ack -% c.snd_una)) > 0) {
+                const adv = @as(i32, @bitCast(ack -% c.snd_una));
+                const inflight = c.snd_nxt -% c.snd_una;
+                // Accept only ACKs that advance snd_una without acking data we
+                // never sent. Free the acked bytes from the send ring, restart
+                // the retransmit timer, and let the freed window push more out.
+                if (adv > 0 and @as(u32, @bitCast(adv)) <= inflight) {
+                    const acked: u32 = @bitCast(adv);
+                    c.snd_buf_head = (c.snd_buf_head + acked) % TCP_SND_BUF_SIZE;
+                    c.snd_buf_len -= acked;
                     c.snd_una = ack;
                     c.retransmit_count = 0;
+                    c.last_send_tick = process.tick_count;
+                    flushSnd(c);
                 }
             }
             // Data
@@ -1044,8 +1154,9 @@ fn tcpTick() void {
             }
             continue;
         }
-        // Retransmission
-        if (c.snd_una != c.snd_nxt and c.last_tx_len > 0 and
+        // Retransmission: fire when the oldest unacked octet has gone
+        // unacknowledged for the timeout.
+        if (c.snd_una != c.snd_nxt and
             process.tick_count -% c.last_send_tick >= TCP_RETRANSMIT_TICKS)
         {
             if (c.retransmit_count >= TCP_MAX_RETRIES) {
@@ -1053,7 +1164,18 @@ fn tcpTick() void {
                 c.state = .closed;
                 continue;
             }
-            _ = dispatchPacket(c.remote_ip, c.last_tx[0..c.last_tx_len]);
+            if ((c.state == .established or c.state == .close_wait) and c.snd_buf_len > 0) {
+                // Resend the FIRST unacked segment, rebuilt from the send ring —
+                // not whatever happened to go out last.
+                const inflight = c.snd_nxt -% c.snd_una;
+                const seg = @min(inflight, @as(u32, c.peer_mss));
+                var tmp: [1460]u8 = undefined;
+                readSnd(c, c.snd_una, tmp[0..seg]);
+                _ = emitSegment(c, c.snd_una, TCP_PSH | TCP_ACK, tmp[0..seg], false);
+            } else if (c.last_tx_len > 0) {
+                // Control segment (SYN / SYN-ACK / FIN) retransmit.
+                _ = dispatchPacket(c.remote_ip, c.last_tx[0..c.last_tx_len]);
+            }
             c.retransmit_count += 1;
             c.last_send_tick = process.tick_count;
         }
