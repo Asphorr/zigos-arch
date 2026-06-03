@@ -41,7 +41,13 @@ const TCP_MAX_CONNS = 16;
 const TCP_MAX_LISTENERS = 4;
 const TCP_RX_BUF_SIZE = 8192;
 const TCP_SND_BUF_SIZE = 8192; // per-conn ring of unacked+unsent outbound data
-const TCP_RETRANSMIT_TICKS: u64 = 300;
+const TCP_OOO_BUF_SIZE = 4096; // per-conn buffer for one out-of-order segment run
+// Retransmit timeout, in 10 ms ticks, derived per-conn from RTT (Jacobson/Karn).
+const TCP_INIT_RTO_TICKS: u32 = 100; // 1 s, until the first RTT sample (RFC 6298)
+const TCP_MIN_RTO_TICKS: u32 = 20; // 200 ms floor (cf. Linux TCP_RTO_MIN)
+const TCP_MAX_RTO_TICKS: u32 = 6000; // 60 s ceiling + exponential-backoff cap
+const TCP_INIT_CWND_SEGS: u32 = 4; // initial congestion window, in MSS-sized segments
+const TCP_MAX_CWND: u32 = 65535; // congestion-window ceiling (bytes)
 const TCP_MAX_RETRIES: u8 = 3;
 const TCP_NO_LISTENER: u8 = 0xFF;
 // Per-listener ring of accepted-but-not-yet-handed-out connection slots.
@@ -494,7 +500,24 @@ const TcpConn = struct {
     snd_buf: [TCP_SND_BUF_SIZE]u8 = undefined,
     snd_buf_head: u32 = 0,
     snd_buf_len: u32 = 0,
+    // RTT estimation (Jacobson/Karn) -> adaptive retransmit timeout, in ticks.
+    srtt: u32 = 0, // smoothed RTT (0 = no sample yet)
+    rttvar: u32 = 0, // RTT variation
+    rto: u32 = TCP_INIT_RTO_TICKS, // current retransmit timeout
+    rtt_pending: bool = false, // timing a sample right now?
+    rtt_seq: u32 = 0, // sample completes once snd_una reaches this seq
+    rtt_start: u64 = 0, // tick the timed segment was sent
     rcv_nxt: u32 = 0,
+    // Single out-of-order reassembly region: bytes [ooo_seq, ooo_seq+ooo_len)
+    // held until the preceding gap fills (ooo_len 0 = empty).
+    ooo_buf: [TCP_OOO_BUF_SIZE]u8 = undefined,
+    ooo_seq: u32 = 0,
+    ooo_len: u32 = 0,
+    // Congestion control (Reno): cwnd/ssthresh in bytes, dup-ACK counter.
+    cwnd: u32 = 2144, // 4*536; refined to 4*peer_mss at established
+    ssthresh: u32 = TCP_MAX_CWND,
+    dup_acks: u8 = 0,
+    in_recovery: bool = false,
     rx_buf: [TCP_RX_BUF_SIZE]u8 = undefined,
     rx_write: u32 = 0,
     rx_count: u32 = 0,
@@ -784,7 +807,7 @@ pub fn tcpAccept(listen_slot: u8) ?u8 {
 /// Most unacked bytes we may keep in flight: bounded by both the peer's
 /// advertised window and our own ring. (A congestion window joins this later.)
 fn effectiveWindow(conn: *const TcpConn) u32 {
-    return @min(conn.snd_wnd, @as(u32, TCP_SND_BUF_SIZE));
+    return @min(@min(conn.snd_wnd, conn.cwnd), @as(u32, TCP_SND_BUF_SIZE));
 }
 
 /// Append `bytes` at the ring tail (sequence snd_una+snd_buf_len). The caller
@@ -808,6 +831,66 @@ fn readSnd(conn: *const TcpConn, seq: u32, out: []u8) void {
     }
 }
 
+/// Fold a new RTT sample into the smoothed estimate and recompute the
+/// retransmit timeout (RFC 6298 integer form). All quantities are in ticks.
+fn updateRto(c: *TcpConn, sample: u64) void {
+    const r: u32 = @intCast(@min(sample, @as(u64, TCP_MAX_RTO_TICKS)));
+    if (c.srtt == 0) {
+        c.srtt = r;
+        c.rttvar = r / 2;
+    } else {
+        const err = if (c.srtt > r) c.srtt - r else r - c.srtt;
+        c.rttvar = c.rttvar - (c.rttvar >> 2) + (err >> 2);
+        c.srtt = c.srtt - (c.srtt >> 3) + (r >> 3);
+    }
+    var rto = c.srtt + @max(@as(u32, 1), c.rttvar << 2);
+    if (rto < TCP_MIN_RTO_TICKS) rto = TCP_MIN_RTO_TICKS;
+    if (rto > TCP_MAX_RTO_TICKS) rto = TCP_MAX_RTO_TICKS;
+    c.rto = rto;
+}
+
+/// Reset the congestion window for a freshly-established connection: a small
+/// initial window and a high ssthresh, so we begin in slow start.
+fn initCwnd(c: *TcpConn) void {
+    c.cwnd = TCP_INIT_CWND_SEGS * @as(u32, c.peer_mss);
+    c.ssthresh = TCP_MAX_CWND;
+    c.dup_acks = 0;
+    c.in_recovery = false;
+}
+
+/// Grow the congestion window on an ACK of `acked` new bytes: slow start (one
+/// MSS per ACK) below ssthresh, congestion avoidance (~one MSS per RTT) above.
+/// Leaving fast recovery deflates cwnd back to ssthresh.
+fn ackCwnd(c: *TcpConn, acked: u32) void {
+    const mss: u32 = c.peer_mss;
+    if (c.in_recovery) {
+        c.cwnd = c.ssthresh;
+        c.in_recovery = false;
+    } else if (c.cwnd < c.ssthresh) {
+        c.cwnd += @min(acked, mss);
+    } else {
+        c.cwnd += @max(@as(u32, 1), (mss *% mss) / c.cwnd);
+    }
+    if (c.cwnd > TCP_MAX_CWND) c.cwnd = TCP_MAX_CWND;
+}
+
+/// Three duplicate ACKs: halve ssthresh, drop cwnd to it, and retransmit the
+/// first unacked segment immediately instead of waiting for the RTO.
+fn fastRetransmit(c: *TcpConn) void {
+    const mss: u32 = c.peer_mss;
+    c.ssthresh = @max(c.cwnd / 2, 2 * mss);
+    c.cwnd = c.ssthresh;
+    c.in_recovery = true;
+    if (c.snd_buf_len > 0) {
+        const inflight = c.snd_nxt -% c.snd_una;
+        const seg = @min(inflight, mss);
+        var tmp: [1460]u8 = undefined;
+        readSnd(c, c.snd_una, tmp[0..seg]);
+        _ = emitSegment(c, c.snd_una, TCP_PSH | TCP_ACK, tmp[0..seg], false);
+    }
+    c.rtt_pending = false;
+}
+
 /// Emit as many new MSS-sized segments as the send window allows, advancing
 /// snd_nxt. Sends only buffered-but-unsent bytes: [snd_nxt, snd_una+snd_buf_len).
 fn flushSnd(conn: *TcpConn) void {
@@ -825,6 +908,12 @@ fn flushSnd(conn: *TcpConn) void {
         readSnd(conn, conn.snd_nxt, tmp[0..seg]);
         if (!emitSegment(conn, conn.snd_nxt, TCP_PSH | TCP_ACK, tmp[0..seg], false)) break;
         conn.snd_nxt +%= seg;
+        // Begin an RTT sample for this segment if one isn't already timing.
+        if (!conn.rtt_pending) {
+            conn.rtt_pending = true;
+            conn.rtt_start = process.tick_count;
+            conn.rtt_seq = conn.snd_nxt;
+        }
     }
 }
 
@@ -870,6 +959,8 @@ pub fn tcpRecv(slot: u8, buf: []u8) usize {
         buf[i] = conn.rx_buf[(read_pos + i) % TCP_RX_BUF_SIZE];
     }
     conn.rx_count -= avail;
+    // Freed receive space may let buffered out-of-order data move in.
+    oooDrain(conn);
 
     // If the drain re-opened a meaningful chunk of the receive window,
     // tell the peer with an empty ACK. Without this, a sender that
@@ -957,12 +1048,12 @@ pub fn tcpListenerPollMask(slot: u8) u16 {
 /// volatile qualifier is shed via @volatileCast: by the time handleRxFrame
 /// runs, the NIC's descriptor IRQ implies the device finished the DMA, so
 /// the payload is stable DRAM (no benefit from per-byte volatile reads).
-fn ringPushTcpData(c: *TcpConn, tcp: []volatile u8, data_offset: usize, payload_len: usize) usize {
+/// Copy `len` bytes from a plain source into the receive ring (capped by free
+/// space). Updates counters and wakes pollers. Returns bytes copied.
+fn rxPush(c: *TcpConn, src: [*]const u8, len: usize) usize {
     const room = TCP_RX_BUF_SIZE - c.rx_count;
-    const to_copy = @min(payload_len, room);
+    const to_copy = @min(len, room);
     if (to_copy == 0) return 0;
-
-    const src: [*]const u8 = @volatileCast(tcp[data_offset..].ptr);
     const w0: u32 = c.rx_write % TCP_RX_BUF_SIZE;
     const tail: u32 = TCP_RX_BUF_SIZE - w0;
     if (to_copy <= tail) {
@@ -975,6 +1066,76 @@ fn ringPushTcpData(c: *TcpConn, tcp: []volatile u8, data_offset: usize, payload_
     c.rx_count += @intCast(to_copy);
     @import("../cpu/ipc/fdpoll.zig").wakePollers(.tcp_sock, @as(u16, connSlotIndex(c)));
     return to_copy;
+}
+
+/// Push the in-order payload of a received segment (volatile NIC buffer) into
+/// the receive ring.
+fn ringPushTcpData(c: *TcpConn, tcp: []volatile u8, data_offset: usize, payload_len: usize) usize {
+    const src: [*]const u8 = @volatileCast(tcp[data_offset..].ptr);
+    return rxPush(c, src, payload_len);
+}
+
+/// Buffer an out-of-order segment in the single OOO region. Stores it if the
+/// region is empty, extends it if the new segment abuts the end, otherwise drops
+/// it (a second disjoint gap — the peer retransmits; single-region by design).
+fn oooStore(c: *TcpConn, seq: u32, tcp: []volatile u8, data_offset: usize, payload_len: usize) void {
+    const src: [*]const u8 = @volatileCast(tcp[data_offset..].ptr);
+    if (c.ooo_len == 0) {
+        const n: u32 = @intCast(@min(payload_len, @as(usize, TCP_OOO_BUF_SIZE)));
+        @memcpy(c.ooo_buf[0..n], src[0..n]);
+        c.ooo_seq = seq;
+        c.ooo_len = n;
+    } else if (seq == c.ooo_seq +% c.ooo_len) {
+        const space = TCP_OOO_BUF_SIZE - c.ooo_len;
+        const n: u32 = @intCast(@min(payload_len, @as(usize, space)));
+        @memcpy(c.ooo_buf[c.ooo_len..][0..n], src[0..n]);
+        c.ooo_len += n;
+    }
+}
+
+/// After rcv_nxt advances, splice any now-contiguous OOO bytes into the receive
+/// ring and advance rcv_nxt over them.
+fn oooDrain(c: *TcpConn) void {
+    if (c.ooo_len == 0) return;
+    // Drop any leading OOO bytes already covered by rcv_nxt.
+    const lead = c.rcv_nxt -% c.ooo_seq;
+    if (@as(i32, @bitCast(lead)) > 0) {
+        const skip = @min(lead, c.ooo_len);
+        var i: u32 = 0;
+        while (i + skip < c.ooo_len) : (i += 1) c.ooo_buf[i] = c.ooo_buf[i + skip];
+        c.ooo_seq +%= skip;
+        c.ooo_len -= skip;
+    }
+    if (c.ooo_len == 0 or c.ooo_seq != c.rcv_nxt) return; // still a gap
+    const pushed: u32 = @intCast(rxPush(c, c.ooo_buf[0..].ptr, c.ooo_len));
+    c.rcv_nxt +%= pushed;
+    if (pushed >= c.ooo_len) {
+        c.ooo_len = 0;
+    } else {
+        const rem = c.ooo_len - pushed; // rx ring filled first; keep the rest
+        var i: u32 = 0;
+        while (i < rem) : (i += 1) c.ooo_buf[i] = c.ooo_buf[i + pushed];
+        c.ooo_seq +%= pushed;
+        c.ooo_len = rem;
+    }
+}
+
+/// Handle an inbound data segment: in-order delivery (then drain OOO), out-of-
+/// order buffering, or a duplicate. Always ACKs — a non-advancing ACK is the
+/// duplicate ACK the peer's fast-retransmit keys on.
+fn receiveData(c: *TcpConn, seq: u32, tcp: []volatile u8, data_offset: usize, payload_len: usize) void {
+    if (payload_len == 0) return;
+    if (seq == c.rcv_nxt) {
+        const copied = ringPushTcpData(c, tcp, data_offset, payload_len);
+        c.rcv_nxt +%= @intCast(copied);
+        oooDrain(c);
+        _ = sendTcpPacket(c, TCP_ACK, null, false);
+    } else if (@as(i32, @bitCast(seq -% c.rcv_nxt)) > 0 and (seq -% c.rcv_nxt) < TCP_OOO_BUF_SIZE) {
+        oooStore(c, seq, tcp, data_offset, payload_len);
+        _ = sendTcpPacket(c, TCP_ACK, null, false); // duplicate ACK (gap remains)
+    } else {
+        _ = sendTcpPacket(c, TCP_ACK, null, false); // old/duplicate: re-ACK
+    }
 }
 
 fn handleTcpPacket(ip_data: []volatile u8, ihl: usize) void {
@@ -1041,16 +1202,13 @@ fn handleTcpPacket(ip_data: []volatile u8, ihl: usize) void {
                 c.snd_una = ack;
                 c.state = .established;
                 c.retransmit_count = 0;
+                initCwnd(c);
                 if (c.listener_slot != TCP_NO_LISTENER and c.listener_slot < TCP_MAX_LISTENERS) {
                     enqueueAccepted(&tcp_listeners[c.listener_slot], connSlotIndex(c));
                     @import("../cpu/ipc/fdpoll.zig").wakePollers(.tcp_listener, @as(u16, c.listener_slot));
                 }
                 // Bundled data on the ACK that completes the handshake.
-                if (payload_len > 0 and seq == c.rcv_nxt) {
-                    const copied = ringPushTcpData(c, tcp, data_offset, payload_len);
-                    c.rcv_nxt += @intCast(copied);
-                    _ = sendTcpPacket(c, TCP_ACK, null, false);
-                }
+                receiveData(c, seq, tcp, data_offset, payload_len);
             }
         },
         .syn_sent => {
@@ -1077,6 +1235,7 @@ fn handleTcpPacket(ip_data: []volatile u8, ihl: usize) void {
                     }
                     c.state = .established;
                     c.retransmit_count = 0;
+                    initCwnd(c);
                     _ = sendTcpPacket(c, TCP_ACK, null, false);
                     @import("../cpu/ipc/fdpoll.zig").wakePollers(.tcp_sock, @as(u16, connSlotIndex(c)));
                 }
@@ -1095,17 +1254,26 @@ fn handleTcpPacket(ip_data: []volatile u8, ihl: usize) void {
                     c.snd_buf_head = (c.snd_buf_head + acked) % TCP_SND_BUF_SIZE;
                     c.snd_buf_len -= acked;
                     c.snd_una = ack;
+                    ackCwnd(c, acked); // grow cwnd / exit fast recovery
+                    c.dup_acks = 0;
+                    // Karn: only sample RTT from a segment that wasn't
+                    // retransmitted (rtt_pending is cleared on retransmit).
+                    if (c.rtt_pending and @as(i32, @bitCast(ack -% c.rtt_seq)) >= 0) {
+                        updateRto(c, process.tick_count -% c.rtt_start);
+                        c.rtt_pending = false;
+                    }
                     c.retransmit_count = 0;
                     c.last_send_tick = process.tick_count;
                     flushSnd(c);
+                } else if (adv == 0 and payload_len == 0 and inflight > 0) {
+                    // Duplicate ACK: three of them trigger fast retransmit.
+                    c.dup_acks += 1;
+                    if (c.dup_acks == 3) fastRetransmit(c);
                 }
             }
-            // Data
-            if (payload_len > 0 and seq == c.rcv_nxt) {
-                const copied = ringPushTcpData(c, tcp, data_offset, payload_len);
-                c.rcv_nxt += @intCast(copied);
-                _ = sendTcpPacket(c, TCP_ACK, null, false);
-            }
+            // Data: in-order, out-of-order (buffered), or duplicate. receiveData
+            // always ACKs, so a gap yields the duplicate ACKs fast-retransmit needs.
+            receiveData(c, seq, tcp, data_offset, payload_len);
             // FIN
             if (flags & TCP_FIN != 0) {
                 c.rcv_nxt += 1;
@@ -1157,7 +1325,7 @@ fn tcpTick() void {
         // Retransmission: fire when the oldest unacked octet has gone
         // unacknowledged for the timeout.
         if (c.snd_una != c.snd_nxt and
-            process.tick_count -% c.last_send_tick >= TCP_RETRANSMIT_TICKS)
+            process.tick_count -% c.last_send_tick >= c.rto)
         {
             if (c.retransmit_count >= TCP_MAX_RETRIES) {
                 c.error_flag = true;
@@ -1176,6 +1344,16 @@ fn tcpTick() void {
                 // Control segment (SYN / SYN-ACK / FIN) retransmit.
                 _ = dispatchPacket(c.remote_ip, c.last_tx[0..c.last_tx_len]);
             }
+            // Congestion response to a timeout: collapse to one segment and set
+            // ssthresh to half the flight size (RFC 5681).
+            c.ssthresh = @max(c.cwnd / 2, 2 * @as(u32, c.peer_mss));
+            c.cwnd = c.peer_mss;
+            c.dup_acks = 0;
+            c.in_recovery = false;
+            // Karn: back off the timeout exponentially and don't sample RTT from
+            // the retransmitted (ambiguous) segment.
+            c.rto = @min(c.rto * 2, TCP_MAX_RTO_TICKS);
+            c.rtt_pending = false;
             c.retransmit_count += 1;
             c.last_send_tick = process.tick_count;
         }

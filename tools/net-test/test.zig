@@ -30,7 +30,7 @@ const RST: u8 = 0x04;
 const PSH: u8 = 0x08;
 const ACK: u8 = 0x10;
 
-// net.zig's fixed retransmit interval (TCP_RETRANSMIT_TICKS is private).
+// A clock advance comfortably beyond any RTO, used to force a retransmit.
 const RETX_TICKS: u64 = 300;
 
 // --- big-endian helpers ---
@@ -236,7 +236,7 @@ test "inbound data is delivered to tcpRecv and ACKed" {
     try expectEqual(@as(u32, 13000 +% 1 +% 11), a.ack);
 }
 
-test "receiver drops out-of-order data (no reassembly yet)" {
+test "receiver reassembles out-of-order data and dup-ACKs the gap" {
     resolveGateway();
     nic.txClear();
     const peer = [4]u8{ 10, 0, 2, 99 };
@@ -245,17 +245,25 @@ test "receiver drops out-of-order data (no reassembly yet)" {
     nic.txClear();
 
     var b: [1600]u8 = undefined;
-    // Gap: server rcv_nxt == 11001, but this segment starts 10 bytes ahead.
-    deliver(b[0..buildSeg(&b, peer, e.client_port, 8083, 11000 +% 1 +% 10, e.siss +% 1, ACK | PSH, 16384, "OUTOFORDER")]);
+    // Segment B arrives first, out of order (7 bytes ahead of rcv_nxt == 11001).
+    deliver(b[0..buildSeg(&b, peer, e.client_port, 8083, 11000 +% 1 +% 7, e.siss +% 1, ACK | PSH, 16384, "HIJKLMN")]);
     var rb: [64]u8 = undefined;
-    try expectEqual(@as(usize, 0), net.tcpRecv(e.srv, &rb)); // dropped, not buffered
+    try expectEqual(@as(usize, 0), net.tcpRecv(e.srv, &rb)); // gap not yet filled
 
-    // In-order data that fills the front of the gap is still accepted...
-    deliver(b[0..buildSeg(&b, peer, e.client_port, 8083, 11000 +% 1, e.siss +% 1, ACK | PSH, 16384, "INORDER")]);
-    try expectEqual(@as(usize, 7), net.tcpRecv(e.srv, &rb));
-    try expect(std.mem.eql(u8, rb[0..7], "INORDER"));
-    // ...but the earlier out-of-order bytes are gone for good — the cost the
-    // reassembly task (#1001) will remove.
+    // A duplicate ACK should have been emitted, still at the cumulative point.
+    const da = popFor(e.client_port) orelse return error.NoDupAck;
+    try expect(da.flags & ACK != 0);
+    try expectEqual(@as(u32, 11000 +% 1), da.ack);
+    nic.txClear();
+
+    // Segment A fills the gap; both segments now deliver in order, reassembled.
+    deliver(b[0..buildSeg(&b, peer, e.client_port, 8083, 11000 +% 1, e.siss +% 1, ACK | PSH, 16384, "ABCDEFG")]);
+    try expectEqual(@as(usize, 14), net.tcpRecv(e.srv, &rb));
+    try expect(std.mem.eql(u8, rb[0..14], "ABCDEFGHIJKLMN"));
+
+    // The cumulative ACK now covers all 14 bytes.
+    const a2 = popFor(e.client_port) orelse return error.NoAck;
+    try expectEqual(@as(u32, 11000 +% 1 +% 14), a2.ack);
 }
 
 test "tcpSend segments the stream at peer_mss with contiguous seqs" {
@@ -364,4 +372,101 @@ test "flow control: small window throttles, window update flushes the rest" {
     while (popFor(e.client_port)) |t| more += t.payload.len;
     try expect(more > 0);
     try expectEqual(@as(usize, 1500), sent + more);
+}
+
+test "RTO adapts to measured RTT (Jacobson/Karn), not a fixed timer" {
+    resolveGateway();
+    nic.txClear();
+    const peer = [4]u8{ 10, 0, 2, 99 };
+    const e = try establishServer(8087, peer, 40007, 51000);
+    defer net.tcpUnlisten(e.lst);
+    nic.txClear();
+
+    // First send: one segment, ACKed after a measured ~30-tick round trip.
+    // The first RTT sample sets RTO = SRTT + 4*RTTVAR = R + 4*(R/2) = 3R = 90.
+    try expect(net.tcpSend(e.srv, "first chunk"));
+    const s1 = popFor(e.client_port) orelse return error.NoSeg;
+    nic.txClear();
+    process.tick_count +%= 30; // round-trip time = 30 ticks
+    var b: [1600]u8 = undefined;
+    deliver(b[0..buildSeg(&b, peer, e.client_port, 8087, 51000 +% 1, s1.seq +% @as(u32, @intCast(s1.payload.len)), ACK, 16384, "")]);
+
+    // Second send: withhold the ACK and watch when the retransmit fires.
+    try expect(net.tcpSend(e.srv, "second chunk"));
+    nic.txClear();
+    // 40 ticks elapsed < RTO(~90): nothing retransmitted yet.
+    process.tick_count +%= 40;
+    net.poll();
+    try expect(popFor(e.client_port) == null);
+    // +60 more (100 elapsed > RTO~90): now it fires. The old fixed 300-tick
+    // timer would NOT have fired by here — proof the RTO tracked the RTT.
+    process.tick_count +%= 60;
+    net.poll();
+    try expect(popFor(e.client_port) != null);
+}
+
+test "slow start: cwnd throttles the opening burst, ACKs open it up" {
+    resolveGateway();
+    nic.txClear();
+    const peer = [4]u8{ 10, 0, 2, 99 };
+    const e = try establishServer(8088, peer, 40008, 61000);
+    defer net.tcpUnlisten(e.lst);
+    nic.txClear();
+
+    var payload: [3000]u8 = undefined;
+    for (&payload, 0..) |*x, i| x.* = @intCast(i & 0xFF);
+    try expect(net.tcpSend(e.srv, &payload));
+
+    // The opening burst is bounded by the initial cwnd (a few MSS), not 3000.
+    var first_seq: u32 = 0;
+    var sent: usize = 0;
+    var n0: usize = 0;
+    while (popFor(e.client_port)) |t| {
+        if (n0 == 0) first_seq = t.seq;
+        sent += t.payload.len;
+        n0 += 1;
+    }
+    try expect(sent >= 536);
+    try expect(sent < 3000); // throttled by cwnd — not the whole payload at once
+
+    // Cumulative ACKs grow cwnd (slow start) and flush the remainder.
+    var b: [1600]u8 = undefined;
+    var guard: usize = 0;
+    while (sent < 3000 and guard < 12) : (guard += 1) {
+        deliver(b[0..buildSeg(&b, peer, e.client_port, 8088, 61000 +% 1, first_seq +% @as(u32, @intCast(sent)), ACK, 16384, "")]);
+        while (popFor(e.client_port)) |t| sent += t.payload.len;
+    }
+    try expectEqual(@as(usize, 3000), sent);
+}
+
+test "fast retransmit: 3 duplicate ACKs resend immediately, before any RTO" {
+    resolveGateway();
+    nic.txClear();
+    const peer = [4]u8{ 10, 0, 2, 99 };
+    const e = try establishServer(8089, peer, 40009, 71000);
+    defer net.tcpUnlisten(e.lst);
+    nic.txClear();
+
+    var payload: [2000]u8 = undefined;
+    for (&payload, 0..) |*x, i| x.* = @intCast(i & 0xFF);
+    try expect(net.tcpSend(e.srv, &payload));
+    var first_seq: u32 = 0;
+    var n0: usize = 0;
+    while (popFor(e.client_port)) |t| {
+        if (n0 == 0) first_seq = t.seq;
+        n0 += 1;
+    }
+    try expect(n0 >= 2);
+    nic.txClear();
+
+    // First segment "lost": the peer keeps ACKing first_seq (its rcv_nxt). No
+    // clock advance — so a retransmit here can only be the fast path, not the RTO.
+    var b: [1600]u8 = undefined;
+    var k: usize = 0;
+    while (k < 3) : (k += 1) {
+        deliver(b[0..buildSeg(&b, peer, e.client_port, 8089, 71000 +% 1, first_seq, ACK, 16384, "")]);
+    }
+    const r = popFor(e.client_port) orelse return error.NoFastRetransmit;
+    try expectEqual(first_seq, r.seq);
+    try expect(r.payload.len > 0);
 }

@@ -49,15 +49,18 @@ EXIT=0
 |------|---------------|
 | passive open | SYN → SYN-ACK → ACK → ESTABLISHED, `accept()` hands the slot out |
 | inbound data | payload reaches `tcpRecv`, an ACK covering it is emitted |
-| out-of-order | OOO data is **dropped** (no reassembly) — pins the gap task #1001 closes |
+| out-of-order | OOO data is **buffered and reassembled** when the gap fills; the gap yields duplicate ACKs — proves task #1001 |
 | send segmentation | `tcpSend` splits at `peer_mss` with contiguous seqs |
 | loss recovery | on loss the RTO resends the **first unacked** segment from the send ring (the right bytes), and the ring drains on full ACK — proves task #999 |
 | flow control | a small advertised window throttles in-flight bytes; a window-update ACK flushes the buffered remainder — proves task #999 |
+| RTO adapts | a measured round trip sets the retransmit timeout (≈3×RTT), not a fixed 300 ticks — proves task #1000 (Jacobson/Karn) |
+| slow start | the opening burst is bounded by cwnd, then grows on ACKs until the whole payload is out — proves task #1002 |
+| fast retransmit | three duplicate ACKs resend the missing segment immediately, before any RTO — proves task #1002 |
 
-Each test either **proves a fix** or **pins a known gap**, so the suite stays
-green as the rework proceeds. The send-side reliability work (task #999) is in —
-its tests now prove correct retransmission and flow control; the out-of-order
-test still pins the receiver gap that task #1001 will close.
+Every test **proves a fix** — the full TCP reliability + congestion rework is in:
+correct retransmission and flow control (#999), an RTT-estimated RTO (#1000),
+out-of-order reassembly with duplicate ACKs (#1001), and Reno congestion control —
+slow start and fast retransmit (#1002).
 
 ## The stubs
 
