@@ -580,6 +580,11 @@ const StoredNode = struct {
     // .ref => .buf_field). Reads/writes auto-deref through it instead of
     // replacing it. Created dynamically at exec time (beyond static_nnodes).
     is_buffer_field: bool = false,
+    // Slice J (kind == .op_region, region_space == SPACE_PCI): the addressed
+    // device's bus/dev/func, packed (bus<<16)|(dev<<8)|func. Resolved once from the
+    // enclosing _ADR/_BBN by resolvePciRegions() after the namespace is built, so
+    // field I/O never re-enters the evaluator. 0xFFFFFFFF = not yet resolved.
+    pci_bdf: u32 = 0xFFFF_FFFF,
 };
 
 /// Optional payload passed to storeNode; defaults keep call sites terse.
@@ -2541,6 +2546,22 @@ const synth_osc = [_]u8{
     0xA4, 0x6B, // Return(Arg3)
 };
 
+/// Synthetic PCI namespace for the firmware-independent BDF self-test (stPciTest):
+///   Device(PCI0) { Name(_BBN, 0)
+///     Device(TDEV) { Name(_ADR, 0x00030001)          // device 3, function 1
+///       OperationRegion(TPCF, PCI_Config, 0x04, 0x10) // base = command register
+///       Field(TPCF, DWordAcc, NoLock, Preserve) { CMD_, 32 } } }
+/// Lets regionBdf() resolve TPCF → bus 0 / dev 3 / func 1 from the enclosing
+/// _BBN + _ADR with no hardware. (PkgLengths: PCI0=0x34, TDEV=0x27, Field=0x0B.)
+const synth_pci = [_]u8{
+    0x5B, 0x82, 0x34, 'P', 'C', 'I', '0', // Device(PCI0)
+    0x08, '_', 'B', 'B', 'N', 0x00, //         Name(_BBN, Zero)
+    0x5B, 0x82, 0x27, 'T', 'D', 'E', 'V', //   Device(TDEV)
+    0x08, '_', 'A', 'D', 'R', 0x0C, 0x01, 0x00, 0x03, 0x00, // Name(_ADR, 0x00030001)
+    0x5B, 0x80, 'T', 'P', 'C', 'F', 0x02, 0x0A, 0x04, 0x0A, 0x10, // OperationRegion(TPCF, PCI_Config, 4, 16)
+    0x5B, 0x81, 0x0B, 'T', 'P', 'C', 'F', 0x03, 'C', 'M', 'D', '_', 0x20, // Field(...){ CMD_, 32 }
+};
+
 /// Find the first child device under the ACPI0012 NVDIMM root (`root_path`) that
 /// exposes a `_DSM` — the per-NVDIMM label/health interface. QEMU emits one
 /// `NVxx` child node per plugged nvdimm; the label functions live there, not on
@@ -2748,6 +2769,31 @@ fn stOscTest(fails: *u32) void {
         const status: u64 = if (buf.len >= 4) readLeBytes(buf[0..4]) else 0xDEAD;
         stCheck("_OSC status untouched", status, 0, fails);
     } else stCheck("_OSC method [missing]", 0, 1, fails);
+}
+
+/// Slice J proof: walk the synthetic PCI0/TDEV namespace and confirm a PCI_Config
+/// region resolves its device's bus/dev/func from the enclosing _BBN/_ADR, and that
+/// the legacy CF8 config address is assembled correctly. (The port I/O itself needs
+/// hardware; the BDF + address derivation is the host-independent invariant.)
+fn stPciTest(fails: *u32) void {
+    tNsReset();
+    _ = walkBody(&synth_pci);
+    static_nnodes = nnodes;
+    resolvePciRegions();
+    if (findExact("\\PCI0.TDEV.TPCF")) |reg| {
+        const b = unpackBdf(reg.pci_bdf);
+        stCheck("PCI bdf bus", @as(u64, b.bus), 0, fails);
+        stCheck("PCI bdf dev", @as(u64, b.dev), 3, fails);
+        stCheck("PCI bdf func", @as(u64, b.func), 1, fails);
+        stCheck("PCI region off", reg.region_off, 0x04, fails);
+        // Legacy mechanism-#1 address for the dword field at config offset 0x04:
+        // enable | (dev 3 << 11) | (func 1 << 8) | 0x04 = 0x8000_1904.
+        const addr = pciCfgAddr(b, @intCast(reg.region_off));
+        stCheck("PCI cfg address", @as(u64, addr), 0x8000_1904, fails);
+    } else stCheck("PCI_Config region [missing]", 0, 1, fails);
+    // parentScope: strips the trailing seg, empty at the root.
+    stCheck("parentScope dev", @as(u64, parentScope("\\PCI0.TDEV.TPCF").len), @as(u64, "\\PCI0.TDEV".len), fails);
+    stCheck("parentScope root", @as(u64, parentScope("\\PCI0").len), 0, fails);
 }
 
 /// A5: named-base OperationRegion — the one new primitive the live NVDIMM mailbox
@@ -3076,16 +3122,19 @@ pub fn selfTestExtended() u32 {
     // Slice I: drive _OSC argument marshaling + granted-control decode.
     stOscTest(&fails);
 
+    // Slice J: resolve a PCI_Config region's BDF from _BBN/_ADR + config address math.
+    stPciTest(&fails);
+
     return fails;
 }
 
 // === B2c: OperationRegion / Field hardware I/O ==============================
 // A Field declares named bit-slices over an OperationRegion. B2c parses the
 // FieldList into .field nodes (parent region + bit offset/width/access) and
-// reads/writes the backing hardware: SystemIO (port in/out) and SystemMemory
-// (physmap). PCI_Config is deferred (needs the enclosing device's _ADR/_BBN).
-// Field reads wire into evalNameRef; writes into storeTarget. Every access is
-// bounds-/mapping-checked — a bad region degrades to uninit, never a fault.
+// reads/writes the backing hardware: SystemIO (port in/out), SystemMemory
+// (physmap), and PCI_Config (legacy CF8/CFC, BDF from the enclosing _ADR/_BBN —
+// Slice J). Field reads wire into evalNameRef; writes into storeTarget. Every
+// access is bounds-/mapping-checked — a bad region degrades to uninit, never a fault.
 
 const SPACE_MEM: u8 = 0;
 const SPACE_IO: u8 = 1;
@@ -3164,6 +3213,187 @@ fn physMapped(phys: u64, len: u64) bool {
     return paging.isMapped(paging.physToVirt(phys));
 }
 
+// === Slice J: PCI_Config OperationRegion access ============================
+// A PCI_Config region addresses the configuration space of the device named by
+// the enclosing namespace scope: the byte offset is region_off + the field's bit
+// offset, and the device's bus/dev/func come from the nearest ancestor _ADR
+// (high16 = device, low16 = function) and _BBN (base bus number, default 0).
+// Backed by the legacy mechanism-#1 CF8/CFC config ports — port I/O is the `io`
+// surface the native harness already stubs, so aml.zig stays a leaf module.
+// Honest scope limits: standard 256-byte config space only (no ECAM/extended),
+// and a device sitting under its host bridge — nested PCI-PCI bridge secondary-bus
+// chasing is not done (QEMU's DSDT PCI_Config fields all live under the root
+// bridge). config reads are side-effect-free per spec, so the boot liveness probe
+// is safe to run unconditionally.
+
+const PCI_CFG_ADDR: u16 = 0xCF8;
+const PCI_CFG_DATA: u16 = 0xCFC;
+
+const Bdf = struct { bus: u8 = 0, dev: u8 = 0, func: u8 = 0 };
+
+fn packBdf(b: Bdf) u32 {
+    return (@as(u32, b.bus) << 16) | (@as(u32, b.dev) << 8) | b.func;
+}
+fn unpackBdf(v: u32) Bdf {
+    return .{ .bus = @truncate(v >> 16), .dev = @truncate(v >> 8), .func = @truncate(v) };
+}
+
+/// Legacy mechanism-#1 config address for a dword-aligned offset (bits[1:0] forced 0).
+fn pciCfgAddr(b: Bdf, off: u16) u32 {
+    return 0x8000_0000 |
+        (@as(u32, b.bus) << 16) |
+        (@as(u32, b.dev & 0x1F) << 11) |
+        (@as(u32, b.func & 0x07) << 8) |
+        (@as(u32, off) & 0xFC);
+}
+
+fn pciCfgReadDword(b: Bdf, off: u16) u32 {
+    io.outl(PCI_CFG_ADDR, pciCfgAddr(b, off));
+    return io.inl(PCI_CFG_DATA);
+}
+
+/// Read `width` (1/2/4/8) bytes from config offset `co` (standard space only). The
+/// field engine hands us an access-width-aligned `co`, so a sub-dword read just
+/// shifts the containing dword — no reliance on sub-dword CFC port decode.
+fn pciCfgRead(b: Bdf, co: u64, width: u32) ?u64 {
+    if (co > 0xFF) return null;
+    switch (width) {
+        1, 2, 4 => {
+            const dw = pciCfgReadDword(b, @intCast(co & 0xFC));
+            const shift: u5 = @intCast((co & 3) * 8);
+            const v = dw >> shift;
+            return switch (width) {
+                1 => v & 0xFF,
+                2 => v & 0xFFFF,
+                else => v, // width 4: co is dword-aligned, shift 0
+            };
+        },
+        8 => {
+            if (co + 8 > 0x100) return null;
+            const lo = pciCfgReadDword(b, @intCast(co & 0xFC));
+            const hi = pciCfgReadDword(b, @intCast((co + 4) & 0xFC));
+            return @as(u64, lo) | (@as(u64, hi) << 32);
+        },
+        else => return null,
+    }
+}
+
+/// Write `width` bytes to config offset `co`. Sub-dword writes read-modify-write
+/// the containing dword (Preserve the neighbour bytes), mirroring the field
+/// engine's own RMW so a byte field never clobbers its dword's other three bytes.
+fn pciCfgWrite(b: Bdf, co: u64, width: u32, val: u64) bool {
+    if (co > 0xFF) return false;
+    switch (width) {
+        4 => {
+            io.outl(PCI_CFG_ADDR, pciCfgAddr(b, @intCast(co & 0xFC)));
+            io.outl(PCI_CFG_DATA, @truncate(val));
+            return true;
+        },
+        1, 2 => {
+            const aligned: u16 = @intCast(co & 0xFC);
+            const shift: u5 = @intCast((co & 3) * 8);
+            const mask: u32 = (if (width == 1) @as(u32, 0xFF) else @as(u32, 0xFFFF)) << shift;
+            var dw = pciCfgReadDword(b, aligned);
+            dw = (dw & ~mask) | ((@as(u32, @truncate(val)) << shift) & mask);
+            io.outl(PCI_CFG_ADDR, pciCfgAddr(b, aligned));
+            io.outl(PCI_CFG_DATA, dw);
+            return true;
+        },
+        8 => {
+            if (co + 8 > 0x100) return false;
+            io.outl(PCI_CFG_ADDR, pciCfgAddr(b, @intCast(co & 0xFC)));
+            io.outl(PCI_CFG_DATA, @truncate(val));
+            io.outl(PCI_CFG_ADDR, pciCfgAddr(b, @intCast((co + 4) & 0xFC)));
+            io.outl(PCI_CFG_DATA, @truncate(val >> 32));
+            return true;
+        },
+        else => return false,
+    }
+}
+
+/// Strip the trailing ".SEG" from an absolute path → the enclosing scope. Returns
+/// empty once at the root (no '.' left), which terminates the ancestor walk.
+fn parentScope(path: []const u8) []const u8 {
+    if (std.mem.lastIndexOfScalar(u8, path, '.')) |dot| return path[0..dot];
+    return path[0..0];
+}
+
+/// Resolve a PCI_Config region's bus/dev/func by walking ancestor scopes: the
+/// nearest _ADR gives device/function, the nearest _BBN gives the bus (default 0).
+/// Side-effect-free in practice (_ADR/_BBN are constant Names), and run once at
+/// load time so the hot field path only reads the cached value.
+fn regionBdf(region: *const StoredNode) Bdf {
+    var b = Bdf{};
+    var have_adr = false;
+    var have_bbn = false;
+    var cur = parentScope(region.path[0..region.path_len]);
+    var guard: u32 = 0;
+    while (cur.len > 0 and guard < 24) : (guard += 1) {
+        if (!have_adr) {
+            if (evalDeviceChild(cur, "_ADR")) |v| if (v == .integer) {
+                b.dev = @intCast((v.integer >> 16) & 0x1F);
+                b.func = @intCast(v.integer & 0x07);
+                have_adr = true;
+            };
+        }
+        if (!have_bbn) {
+            if (evalDeviceChild(cur, "_BBN")) |v| if (v == .integer) {
+                b.bus = @truncate(v.integer);
+                have_bbn = true;
+            };
+        }
+        if (have_adr and have_bbn) break;
+        cur = parentScope(cur);
+    }
+    return b;
+}
+
+/// Resolve + cache the BDF of every PCI_Config OperationRegion. Call once after the
+/// namespace is fully walked (in load(), and after each synth walk in the harness)
+/// so field reads/writes never re-enter the evaluator mid-access.
+fn resolvePciRegions() void {
+    var i: usize = 0;
+    while (i < nnodes) : (i += 1) {
+        const n = &nodes[i];
+        if (n.kind == .op_region and n.region_space == SPACE_PCI) {
+            n.pci_bdf = packBdf(regionBdf(n));
+        }
+    }
+}
+
+/// Slice J proof: read the host bridge (0:0:0) vendor/device ID — a hardware-true
+/// liveness check that the CF8/CFC path works — then, for each PCI_Config region
+/// the DSDT declares, log its resolved BDF and read its first field (config reads
+/// are side-effect-free, so this is safe to run every boot).
+pub fn reportPciConfig() void {
+    const id = pciCfgReadDword(.{ .bus = 0, .dev = 0, .func = 0 }, 0);
+    debug.klog("[aml] PCI cfg probe: host bridge 0:0:0 vendor=0x{X:0>4} device=0x{X:0>4}\n", .{ id & 0xFFFF, (id >> 16) & 0xFFFF });
+
+    var n_regions: u32 = 0;
+    var i: usize = 0;
+    while (i < nnodes) : (i += 1) {
+        const n = &nodes[i];
+        if (n.kind != .op_region or n.region_space != SPACE_PCI) continue;
+        n_regions += 1;
+        const b = unpackBdf(n.pci_bdf);
+        debug.klog("[aml] PCI_Config region {s} -> {d}:{d}.{d} off 0x{X} len 0x{X}\n", .{ n.path[0..n.path_len], b.bus, b.dev, b.func, n.region_off, n.region_len });
+        // First field over this region — enough for an end-to-end liveness proof.
+        var fj: usize = 0;
+        while (fj < nnodes) : (fj += 1) {
+            const f = &nodes[fj];
+            if (f.kind != .field or f.field_region < 0) continue;
+            if (@as(usize, @intCast(f.field_region)) != i) continue;
+            if (readField(f)) |val| {
+                debug.klog("[aml]   field {s} @+{d}b w{d} = 0x{X}\n", .{ f.path[0..f.path_len], f.field_bit_off, f.field_bit_width, val });
+            } else {
+                debug.klog("[aml]   field {s}: unsupported\n", .{f.path[0..f.path_len]});
+            }
+            break;
+        }
+    }
+    if (n_regions == 0) debug.klog("[aml] (DSDT declares no PCI_Config regions — host-bridge probe is the liveness proof)\n", .{});
+}
+
 /// Read one access-width unit (1/2/4/8 bytes) from a region at a byte offset.
 fn readRegionUnit(region: *const StoredNode, byte_off: u64, width: u32) ?u64 {
     switch (region.region_space) {
@@ -3191,7 +3421,8 @@ fn readRegionUnit(region: *const StoredNode, byte_off: u64, width: u32) ?u64 {
                 else => null,
             };
         },
-        else => return null, // PCI_Config + others: deferred
+        SPACE_PCI => return pciCfgRead(unpackBdf(region.pci_bdf), region.region_off + byte_off, width),
+        else => return null, // unmodeled address spaces: degrade to uninit
     }
 }
 
@@ -3226,6 +3457,7 @@ fn writeRegionUnit(region: *const StoredNode, byte_off: u64, width: u32, val: u6
             }
             return true;
         },
+        SPACE_PCI => return pciCfgWrite(unpackBdf(region.pci_bdf), region.region_off + byte_off, width, val),
         else => return false,
     }
 }
@@ -3681,6 +3913,7 @@ fn spaceName(space: u8) []const u8 {
     return switch (space) {
         SPACE_MEM => "SystemMemory",
         SPACE_IO => "SystemIO",
+        SPACE_PCI => "PCI_Config",
         SPACE_FFH => "FFixedHW",
         else => "other",
     };
@@ -4385,6 +4618,12 @@ pub fn load() u32 {
     // reclaimed by each top-level arenaReset.
     static_nnodes = nnodes;
 
+    // Slice J: resolve each PCI_Config region's bus/dev/func now that the full
+    // namespace is available, so field I/O later only reads the cached BDF and
+    // never re-enters the evaluator mid-access.
+    arenaReset();
+    resolvePciRegions();
+
     if (unknown_op_seen != 0) {
         debug.klog("[aml] walk stopped early at unmodeled opcode 0x{X} ({d} objects so far)\n", .{ unknown_op_seen, node_count });
     } else {
@@ -4474,6 +4713,10 @@ pub fn load() u32 {
     // Slice I proof: negotiate PCIe feature control with firmware via the live
     // \_SB.PCI0._OSC and log which controls it granted.
     _ = reportOsc();
+
+    // Slice J proof: read PCI configuration space through the field engine — a
+    // live host-bridge ID probe plus any PCI_Config region the DSDT declares.
+    reportPciConfig();
 
     // Slice F proof: enumerate the namespace's Device() objects with decoded
     // _HID/_CID + _CRS resources — ACPI as the platform's device manager, run
