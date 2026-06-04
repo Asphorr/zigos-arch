@@ -44,7 +44,7 @@ const CACHE_WAYS: u32 = 2;
 // Function-pointer indirection: lets Phase 3 swap the underlying device
 // (secondary → primary) without touching ext2/ internals. Same idea as
 // the block driver's own backend dispatch.
-const ReadFn = *const fn (lba: u32, count: u16, dest: [*]u8) void;
+const ReadFn = *const fn (lba: u32, count: u16, dest: [*]u8) bool;
 const WriteFn = *const fn (lba: u32, src: [*]const u8) void;
 
 pub const Mount = struct {
@@ -69,7 +69,68 @@ pub const Mount = struct {
     cache_base_lba: [CACHE_WAYS]u32 = [_]u32{0xFFFFFFFF} ** CACHE_WAYS,
     cache_buf: [CACHE_WAYS][CACHE_BYTES]u8 align(8) = undefined,
     cache_next_evict: u8 = 0,
+
+    /// Per-mount REENTRANT SLEEPING lock (2026-06-04). The block cache,
+    /// BGD table, and superblock above are shared mutable state with NO
+    /// other synchronization, but ext2 runs concurrently on every CPU
+    /// (no big syscall lock; MAX_PROCS=64). Under SMP a write-back that
+    /// races a concurrent cache-window refill wrote a shifted slice of one
+    /// file over another's on-disk block — the redteam/cat "corrupt ELF on
+    /// disk" bug. Every cache-touching block op (readBlock/writeBlock/
+    /// alloc/free/bgd/sb) takes this first. SLEEPING because those ops block
+    /// on NVMe I/O while holding it; REENTRANT because alloc/free nest
+    /// (allocBlock -> writeBgdTable -> writeBlock). 0xFFFF owner = free.
+    lock_owner: u16 = 0xFFFF, // (a) pid holding the lock
+    lock_depth: u32 = 0, // recursion depth — only the owner mutates
 };
+
+/// Acquire the per-mount lock (see Mount.lock_owner). No-op before the
+/// scheduler is up (mount/boot reads run single-threaded with no current_pid).
+fn lockMount(self: *Mount) void {
+    const smp = @import("../../cpu/smp.zig");
+    const sched = @import("../../proc/sched.zig");
+    const me: u16 = if (smp.myCpu().current_pid) |p| @intCast(p) else return;
+    if (@atomicLoad(u16, &self.lock_owner, .acquire) == me) {
+        self.lock_depth += 1; // reentrant — we already hold it
+        return;
+    }
+    const tid: u32 = @truncate(@intFromPtr(&self.lock_owner));
+    while (true) {
+        // CAS free(0xFFFF) -> me. cmpxchgStrong returns null on success.
+        if (@cmpxchgStrong(u16, &self.lock_owner, 0xFFFF, me, .acq_rel, .acquire) == null) {
+            self.lock_depth = 1;
+            return;
+        }
+        sched.blockOnMutex(tid, &self.lock_owner); // sleep until released, then retry CAS
+    }
+}
+
+fn unlockMount(self: *Mount) void {
+    const smp = @import("../../cpu/smp.zig");
+    const sched = @import("../../proc/sched.zig");
+    const me: u16 = if (smp.myCpu().current_pid) |p| @intCast(p) else return;
+    if (@atomicLoad(u16, &self.lock_owner, .acquire) != me) return; // not held by us (boot path)
+    self.lock_depth -= 1;
+    if (self.lock_depth == 0) {
+        const tid: u32 = @truncate(@intFromPtr(&self.lock_owner));
+        @atomicStore(u16, &self.lock_owner, 0xFFFF, .release);
+        sched.wakeMutexWaiters(tid);
+    }
+}
+
+/// Death-while-holding cleanup. Called from `tearDownTask`: if `pid` was killed
+/// while holding the per-mount lock (e.g. blocked on NVMe I/O inside readBlock),
+/// release it so the filesystem doesn't deadlock forever. The kill path parks
+/// the pid off-CPU before teardown, so nothing races our reset of the owner.
+pub fn releaseLockIfHeld(pid: u16) void {
+    if (!mounted) return;
+    const self = &mount_storage;
+    if (@atomicLoad(u16, &self.lock_owner, .acquire) != pid) return;
+    self.lock_depth = 0;
+    const tid: u32 = @truncate(@intFromPtr(&self.lock_owner));
+    @atomicStore(u16, &self.lock_owner, 0xFFFF, .release);
+    @import("../../proc/sched.zig").wakeMutexWaiters(tid);
+}
 
 // BGD table cache. 64 entries × 32 B = 2 KB; covers ~8 GB at 4 KB blocks
 // with 32K blocks/group. Larger disks would need PMM-allocated storage.
@@ -163,6 +224,8 @@ pub fn mount(partition_lba: u32) bool {
 
 /// Read one fs block into `dst`. `dst.len` MUST equal `mount.block_size`.
 pub fn readBlock(self: *Mount, block_num: u32, dst: []u8) bool {
+    lockMount(self);
+    defer unlockMount(self);
     if (block_num == 0 or block_num >= self.sb.blocks_count) return false;
     if (dst.len != self.block_size) return false;
     const lba = blockLba(self, block_num);
@@ -176,6 +239,8 @@ pub fn readBlock(self: *Mount, block_num: u32, dst: []u8) bool {
 /// fs block `block_num`. Used by inode.zig for partial-block reads
 /// (e.g., last block of a file that ends mid-block).
 pub fn readBlockBytes(self: *Mount, block_num: u32, byte_off: u32, dst: []u8) bool {
+    lockMount(self);
+    defer unlockMount(self);
     if (block_num == 0 or block_num >= self.sb.blocks_count) return false;
     if (byte_off + dst.len > self.block_size) return false;
     const lba = blockLba(self, block_num);
@@ -195,6 +260,8 @@ pub fn readBlockBytes(self: *Mount, block_num: u32, byte_off: u32, dst: []u8) bo
 /// this block (no extra read needed). All write paths funnel through here
 /// so a single cache-invalidation strategy covers everything.
 pub fn writeBlock(self: *Mount, block_num: u32, src: []const u8) bool {
+    lockMount(self);
+    defer unlockMount(self);
     if (block_num == 0 or block_num >= self.sb.blocks_count) return false;
     if (src.len != self.block_size) return false;
     const lba = blockLba(self, block_num);
@@ -231,6 +298,8 @@ pub fn writeBlock(self: *Mount, block_num: u32, src: []const u8) bool {
 /// buffers + syscall-entry frames and overflows a 16 KB kstack on
 /// non-trivial saves.
 pub fn writeBlockBytes(self: *Mount, block_num: u32, byte_off: u32, src: []const u8) bool {
+    lockMount(self);
+    defer unlockMount(self);
     if (block_num == 0 or block_num >= self.sb.blocks_count) return false;
     if (byte_off + src.len > self.block_size) return false;
     const lba = blockLba(self, block_num);
@@ -252,6 +321,8 @@ pub fn writeBlockBytes(self: *Mount, block_num: u32, byte_off: u32, src: []const
 /// the partition). Called after free_blocks_count / free_inodes_count
 /// changes.
 pub fn writeSuperblock(self: *Mount) bool {
+    lockMount(self);
+    defer unlockMount(self);
     const sb_bytes: [*]const u8 = @ptrCast(&self.sb);
     self.write_sector(self.partition_lba + 2, sb_bytes);
     self.write_sector(self.partition_lba + 3, sb_bytes + SECTOR_SIZE);
@@ -263,6 +334,8 @@ pub fn writeSuperblock(self: *Mount) bool {
 /// it. With 64-entry cap and 32 B per entry, the table is at most 2 KB
 /// (one block at 4 KB; partial block at 1 KB).
 pub fn writeBgdTable(self: *Mount) bool {
+    lockMount(self);
+    defer unlockMount(self);
     const bgd_start_block: u32 = if (self.block_size == 1024) 2 else 1;
     const bytes_total: u32 = self.bgd_count * @sizeOf(layout.BlockGroupDescriptor);
     const blocks_needed: u32 = (bytes_total + self.block_size - 1) / self.block_size;
@@ -290,6 +363,8 @@ pub fn writeBgdTable(self: *Mount) bool {
 /// Bits start cleared on a freshly-mkfs'd image except for the structural
 /// blocks (superblock, BGD table, bitmaps, inode table).
 pub fn allocBlock(self: *Mount) ?u32 {
+    lockMount(self);
+    defer unlockMount(self);
     var g: u32 = 0;
     while (g < self.bgd_count) : (g += 1) {
         if (self.bgd[g].free_blocks_count == 0) continue;
@@ -305,6 +380,8 @@ pub fn allocBlock(self: *Mount) ?u32 {
 /// corruption. Reserved blocks (block_num == 0, or below first_data_block)
 /// are likewise rejected.
 pub fn freeBlock(self: *Mount, block_num: u32) bool {
+    lockMount(self);
+    defer unlockMount(self);
     if (block_num == 0 or block_num >= self.sb.blocks_count) return false;
     if (block_num < self.sb.first_data_block) return false;
     const rel: u32 = block_num - self.sb.first_data_block;
@@ -406,9 +483,12 @@ inline fn cacheBaseFor(lba: u32) u32 {
 /// way to the eviction slot (2-way LRU). Misses evict the current
 /// `cache_next_evict` slot, refill it from disk, then promote it as MRU.
 ///
-/// Returns null today only as a future-proof — every backend read_sectors
-/// in tree is `void`-returning, so misses always succeed. The Option<>
-/// shape lets callers propagate I/O failure cleanly when that changes.
+/// Returns null on a propagated backend read failure (BUG 2 fix, 2026-06-04).
+/// The NVMe backend's `read_sectors` now returns a real bool, so a failed
+/// cache fill surfaces here as null instead of silently caching whatever
+/// stale bytes the fill left behind. Every caller already does
+/// `orelse return false/null`, so the failure flows the whole way up:
+/// readBlock -> readInodeBytes (short) -> loadFile (short read) -> clean null.
 fn ensureCacheLoaded(self: *Mount, lba: u32) ?u8 {
     const base = cacheBaseFor(lba);
     var i: u8 = 0;
@@ -419,7 +499,13 @@ fn ensureCacheLoaded(self: *Mount, lba: u32) ?u8 {
         }
     }
     const evict: u8 = self.cache_next_evict;
-    self.read_sectors(base, @intCast(CACHE_SECTORS), &self.cache_buf[evict]);
+    if (!self.read_sectors(base, @intCast(CACHE_SECTORS), &self.cache_buf[evict])) {
+        // I/O failure mid-fill: cache_buf[evict] is now partially overwritten.
+        // Invalidate this way so a later lookup for the OLD base can't match a
+        // corrupt window, and DON'T mark `base` valid. Propagate as a miss-fail.
+        self.cache_base_lba[evict] = 0xFFFFFFFF;
+        return null;
+    }
     self.cache_base_lba[evict] = base;
     self.cache_next_evict = @intCast(1 - @as(u32, evict));
     return evict;
@@ -430,7 +516,7 @@ fn ensureCacheLoaded(self: *Mount, lba: u32) ?u8 {
 fn readSuperblock(partition_lba: u32, dst: *layout.Superblock) bool {
     var buf: [2 * SECTOR_SIZE]u8 align(8) = undefined;
     // SB lives at byte 1024..2048 within the FS → sectors 2..3.
-    blkdev.readSectorsSecondary(partition_lba + 2, 2, &buf);
+    if (!blkdev.readSectorsSecondary(partition_lba + 2, 2, &buf)) return false;
     const src = std.mem.bytesAsValue(layout.Superblock, &buf);
     dst.* = src.*;
     return true;

@@ -12,6 +12,16 @@
 // unmapped memory just bounce off validateUserPtr; real strings actually
 // reach the path parser.
 //
+// V3 sharpens the edges: a much wider boundary-value corpus (page-rounding,
+// table-bound off-by-ones, ptr+len overflow), READ-ONLY pointer injection on
+// write-target syscalls (the validateUserPtrWrite tripwire — a write to a
+// mapped-but-RO page must EFAULT, never #PF in ring 0), near-valid handle
+// mutation (fd±1 / region^page / single-bit flip), and — the big one —
+// scripted combos every 12th iter that *construct* use-after-free, double-
+// free, W^X, and range-spill sequences instead of hoping random ordering
+// stumbles onto them. Each combo allocates and frees its own resources, so it
+// can never wedge the fuzzer.
+//
 // Tracked:
 //   - file descriptors: sys#9 (open), sys#51 (pipe — both ends)
 //   - mmap regions:     sys#57
@@ -51,21 +61,91 @@ fn next() u32 {
 }
 
 fn spicyArg() u32 {
-    const r = next() & 0x1F;
-    return switch (r) {
+    return switch (next() % 40) {
         0 => 0,
         1 => 1,
-        2 => 0xFFFFFFFF,
-        3 => 0x7FFFFFFF,
-        4 => 0x80000000,
-        5 => 0x500000,
-        6 => 0x4FFFFF,
-        7 => 0xC00000,
-        8 => 0x10000000,
-        9 => 0xFFFFF000,
-        10 => 0x4FF000,
-        11 => 0x501000,
-        else => next(),
+        2 => 2,
+        3 => 3,
+        4 => 0xFFFFFFFF, // -1
+        5 => 0xFFFFFFFE,
+        6 => 0x7FFFFFFF, // INT_MAX
+        7 => 0x80000000, // high bit / INT_MIN
+        8 => 0x80000001,
+        // user-space landmarks
+        9 => 0x500000, // own image / .text base (mapped, READ-ONLY)
+        10 => 0x500001, // unaligned into .text
+        11 => 0x4FFFFF, // one byte below the image
+        12 => 0x4FF000, // page below the image (stack-guard neighbourhood)
+        13 => 0x501000, // second image page
+        14 => 0xC00000, // heap-ish
+        15 => 0x10000000, // top of the user VA window
+        16 => 0x0FFFFFFF, // just under the ceiling
+        17 => 0x10000001, // just over the ceiling
+        // page-rounding edges
+        18 => 0x1000,
+        19 => 0x0FFF,
+        20 => 0x1001,
+        21 => 0xFFFFF000,
+        22 => 0xFFFFEFFF,
+        // table-bound edges (MAX_FDS=16, MAX_PROCS=64, MAX_WINDOWS/NSIG/PIPES=32, FD_REMAP=8)
+        23 => 8,
+        24 => 16,
+        25 => 17,
+        26 => 32,
+        27 => 33,
+        28 => 64,
+        29 => 65,
+        30 => 255,
+        31 => 256,
+        32 => 4095,
+        33 => 4096,
+        // big lengths / counts
+        34 => 0x40000000,
+        35 => 0x20000000,
+        36 => next() & 0xFFF, // small
+        37 => @intCast(@intFromPtr(&ro_marker)), // own .rodata (mapped, READ-ONLY)
+        else => next(), // full random
+    };
+}
+
+// A genuinely-mapped, READ-ONLY user page: a `const` with a non-zero
+// initializer lands in .rodata (PF_W==0), so the kernel maps it RO. Handing
+// this to a *write-target* syscall must yield E_FAULT, never a ring-0 #PF —
+// the live tripwire for the validateUserPtrWrite class.
+const ro_marker: [16]u8 = .{ 0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE, 0x13, 0x37, 0x73, 0x31, 0xAA, 0x55, 0x0F, 0xF0 };
+
+// Read-only / range-edge pointers for hammering write-target syscalls.
+fn roPtr() u32 {
+    return switch (next() % 5) {
+        0 => 0x500000, // own .text base
+        1 => @intCast(@intFromPtr(&ro_marker)), // own .rodata
+        2 => 0x500001, // unaligned .text
+        3 => 0x4FF000, // page just below the image
+        else => 0x10000000 - 8, // top of user VA — a write spills past it
+    };
+}
+
+// A length that makes ptr+len overflow u32 or shoot past the user ceiling —
+// probes range checks that forget the wraparound case.
+fn overflowLen(ptr: u32) u32 {
+    return switch (next() % 4) {
+        0 => (0xFFFFFFFF -% ptr) +% (1 + (next() % 16)), // ptr +% len wraps past 2^32
+        1 => 0xFFFFFFFF,
+        2 => 0x40000000 + (next() & 0xFFFF), // huge
+        else => 0x10000000, // exactly the user-window size
+    };
+}
+
+// Bit-flip / off-by-one mutation of a known-valid handle or address — yields
+// "near-valid" values that a sloppy bounds check waves through where neither a
+// valid handle nor pure noise would reach.
+fn nearValid(h: u32) u32 {
+    const sh: u5 = @intCast(next() % 32);
+    return switch (next() % 4) {
+        0 => h +% 1,
+        1 => h -% 1,
+        2 => h ^ 0x1000, // adjacent page
+        else => h ^ (@as(u32, 1) << sh), // random single-bit flip
     };
 }
 
@@ -180,15 +260,22 @@ fn pickWid() u32 {
 // fills live_fds — without this, the resource-bias path never fires — and
 // (b) boundary cases the path parser is likely to mishandle.
 const PATHS = [_][]const u8{
-    // Real files (open should succeed → fd added to live_fds)
-    "/BUILD.ID",
-    "/KERNEL.LINE",
-    "/KERNEL.SYM",
-    "/etc/motd",
-    "/etc/zigos.conf",
-    "/bin/echo.elf",
-    "/bin/ls.elf",
-    "/bin/cat.elf",
+    // Fuzzer-OWNED scratch files (created by setupScratch() at startup). These
+    // are the destructive-write targets: open/fwrite/truncate/unlink land on
+    // DISPOSABLE files, never on real system binaries. This pool USED to list
+    // /BUILD.ID, /KERNEL.SYM, /bin/echo|ls|cat|redteam.elf — and the fuzzer
+    // fwrite'd into them through entirely legit syscalls, truncating its own
+    // /bin/redteam.elf to size 0 ("shell can't find redteam"). That was the
+    // root cause of the multi-session "ELF corruption" hunt — self-inflicted,
+    // not a kernel race. (2026-06-04)
+    "/fuzz0.dat",
+    "/fuzz1.dat",
+    "/fuzz2.dat",
+    "/fuzz3.dat",
+    // ETXTBSY canary: redteam's OWN running binary, kept on purpose. The fuzzer
+    // WILL try to write/truncate it; the kernel's new ETXTBSY guard must reject
+    // every such mutation (E_TXTBSY) and leave it byte-intact. If this file
+    // ever corrupts on disk again, ETXTBSY has a hole.
     "/bin/redteam.elf",
     // Edge cases (path parser fuzz)
     "/",
@@ -206,13 +293,40 @@ const PATHS = [_][]const u8{
     "very_long_path_that_might_overflow_the_kernel_buffer_if_anyone_forgot_a_bound_check_xxxxxxxxxxxxxxxx",
 };
 
-fn pickPathPtr() u32 {
-    const p = PATHS[next() % PATHS.len];
+fn copyPath(p: []const u8) u32 {
     const n = if (p.len < path_buf.len - 1) p.len else path_buf.len - 1;
     var k: usize = 0;
     while (k < n) : (k += 1) path_buf[k] = p[k];
     path_buf[n] = 0;
     return @intCast(@intFromPtr(&path_buf));
+}
+
+fn pickPathPtr() u32 {
+    return copyPath(PATHS[next() % PATHS.len]);
+}
+
+// The first N_REAL_PATHS entries of PATHS are real, openable files — combos
+// that need a valid fd open from this subset so the sequence actually forms.
+// = the 4 scratch files + the redteam.elf canary (all reliably openable).
+const N_REAL_PATHS: u32 = 5;
+
+// Scratch files the fuzzer creates and owns. Listed first in PATHS so the
+// destructive path-arg syscalls hit these throwaway files instead of real
+// binaries. setupScratch() creates each (O_CREATE) and seeds 256 bytes so
+// reads return data and the open/read/write/truncate machinery is exercised.
+const SCRATCH = [_][]const u8{ "/fuzz0.dat", "/fuzz1.dat", "/fuzz2.dat", "/fuzz3.dat" };
+
+fn setupScratch() void {
+    var seed: [256]u8 = undefined;
+    for (&seed, 0..) |*b, k| b.* = @truncate(k);
+    for (SCRATCH) |p| {
+        const fd = libc.openFlags(p, libc.O_CREATE) orelse continue;
+        _ = libc.syscall3(11, fd, @intCast(@intFromPtr(&seed)), seed.len); // sys#11 fwrite
+        libc.close(fd);
+    }
+}
+fn realPathPtr() u32 {
+    return copyPath(PATHS[next() % N_REAL_PATHS]);
 }
 
 // === per-syscall arg shaping ===
@@ -257,6 +371,14 @@ fn smartArg1(sys_no: u32) u32 {
         if (isWidArg1(sys_no)) return pickWid();
         if (isPathArg1(sys_no)) return pickPathPtr();
     }
+    // Near-valid mutation: 1-in-4, hand back a *slightly wrong* live handle
+    // (fd±1, region^page, single-bit flip). Exercises off-by-one handle checks
+    // that neither a valid handle nor pure noise would reach.
+    if ((next() % 4) == 0) {
+        if (isFdArg1(sys_no) and n_fds > 0) return nearValid(live_fds[next() % n_fds]);
+        if (isRegionArg1(sys_no) and n_regions > 0) return nearValid(region_addr[next() % n_regions]);
+        if (isWidArg1(sys_no) and n_wids > 0) return nearValid(live_wids[next() % n_wids]);
+    }
     // Fallback: spicy random. For fd-arg syscalls, ensure the result is
     // never 0/1/2 (stdio fds — reading from 0 blocks for a keypress, and
     // writing to 1/2 spams the terminal).
@@ -268,30 +390,41 @@ fn smartArg1(sys_no: u32) u32 {
 // io_buf so the kernel doesn't bounce off validateUserPtr.
 fn smartArg2(sys_no: u32) u32 {
     return switch (sys_no) {
-        // (fd, buf, len) — pass a real buffer 70% of the time so the read
-        // actually copies and we exercise the copy path, not the validator.
-        4, 10, 11, 42 => if ((next() % 10) < 7)
-            @intCast(@intFromPtr(&io_buf))
-        else
-            spicyArg(),
+        // (fd, buf, len): 60% a real buffer (exercise the copy path), 20% a
+        // READ-ONLY pointer (validateUserPtrWrite tripwire on read-INTO
+        // syscalls — the kernel must EFAULT, not #PF), 20% spicy.
+        4, 10, 11, 42 => blk: {
+            const r = next() % 10;
+            if (r < 6) break :blk @intCast(@intFromPtr(&io_buf));
+            if (r < 8) break :blk roPtr();
+            break :blk spicyArg();
+        },
         // open(path, flags) — flags = O_RDONLY/WRONLY/RDWR plus modifiers.
         // Garbage flags don't matter to ZigOS's openFlags right now (it
         // ignores them mostly), but biasing toward 0..3 keeps the call
         // looking like a normal open and makes any future flag validation
         // exercise normal paths.
         9 => if ((next() % 10) < 8) (next() % 4) else spicyArg(),
-        else => spicyArg(),
+        // Default arg2 is often a write-back pointer (stat buf, size out,
+        // etc.). 1-in-4, feed a read-only pointer so any write-target syscall
+        // that skipped the writability check trips here instead of in prod.
+        else => if ((next() % 4) == 0) roPtr() else spicyArg(),
     };
 }
 
 fn smartArg3(sys_no: u32) u32 {
     return switch (sys_no) {
-        // For read/write/readdir, cap len to io_buf size most of the time
-        // so we don't OOB into adjacent .data on success.
-        4, 10, 11, 42 => if ((next() % 10) < 8)
-            (next() % @as(u32, @intCast(io_buf.len + 1)))
-        else
-            spicyArg(),
+        // (fd, buf, len): 60% a sane capped len (clean copy), 20% an
+        // overflowing len (ptr+len wraps / shoots past the user ceiling —
+        // probes the range check), 20% spicy. The overflow len is huge, so a
+        // missed check walks straight off into unmapped memory and faults
+        // LOUDLY rather than silently corrupting adjacent state.
+        4, 10, 11, 42 => blk: {
+            const r = next() % 10;
+            if (r < 6) break :blk (next() % @as(u32, @intCast(io_buf.len + 1)));
+            if (r < 8) break :blk overflowLen(@intCast(@intFromPtr(&io_buf)));
+            break :blk spicyArg();
+        },
         else => spicyArg(),
     };
 }
@@ -341,6 +474,19 @@ fn isBlocked(sys_no: u32) bool {
         83 => true, // clone — thread spawn, complicates teardown
         86 => true, // exit_thread
         92 => true, // fork — risk of fuzz-bomb
+        117 => true, // debug_crash — deliberate kernel-panic backdoor (now E_NOSYS-gated kernel-side too)
+        // GPU passthrough (30-37, 87-89, 91) — the raw venus/virgl 3D/blob/
+        // scanout interface. Same category as fork/exec/shutdown: fuzzing it
+        // wrecks the *environment*, not the kernel. sys#31 submit_3d feeds
+        // arbitrary bytes to the shared host renderer, sys#88 set_scanout_blob
+        // repoints the live display, sys#34 create_blob had no size cap — random
+        // fuzz here poisons the renderer + leaks host resources and permanently
+        // kills the display (kernel survives). It's a trusted-app interface that
+        // can't be made fuzz-safe without a full 3D command validator. Excluded
+        // so runs complete; real GPU isolation (per-proc resource reclaim +
+        // gating scanout/submit on display ownership) is a separate effort.
+        // (2026-06-04 — found by this fuzzer killing the display output.)
+        30, 31, 32, 33, 34, 35, 36, 37, 87, 88, 89, 91 => true,
         else => false,
     };
 }
@@ -362,6 +508,95 @@ fn forceArg1(sys_no: u32) ?u32 {
         51 => @intCast(@intFromPtr(&pipe_buf)), // pipe: must be a real buffer
         else => null,
     };
+}
+
+// === scripted combos ===
+// Syscall numbers the combos drive directly (mirror the dispatch table + the
+// bias maps above). A wrong guess is harmless — it just yields an errno.
+const SYS_OPEN = 9;
+const SYS_FREAD = 10;
+const SYS_CLOSE = 12;
+const SYS_CREATE_WINDOW = 13;
+const SYS_PRESENT = 14;
+const SYS_DESTROY_WINDOW = 16;
+const SYS_FSIZE = 29;
+const SYS_STAT = 44;
+const SYS_MMAP = 57;
+const SYS_MUNMAP = 58;
+const SYS_MPROTECT = 59;
+
+fn isUserAddr(a: u32) bool {
+    return a >= 0x500000 and a < 0x10000000;
+}
+
+// Construct the multi-step bugs random ordering almost never lines up: use-
+// after-free, double-free, W^X, write-target-with-RO-pointer, range spill.
+// Each branch allocates AND frees its own resources, so a combo can't wedge
+// the fuzzer (no indefinite blocks: all fds are regular files, all mappings
+// are ours). Returns the branch id for the trace.
+fn combo() u32 {
+    const which = next() % 6;
+    switch (which) {
+        0 => {
+            // UAF + double-close on a file descriptor.
+            const fd = libc.syscall3(SYS_OPEN, realPathPtr(), next() % 4, 0);
+            if (!isError(fd) and fd >= 3 and fd < 256) {
+                _ = libc.syscall3(SYS_CLOSE, fd, 0, 0);
+                _ = libc.syscall3(SYS_FREAD, fd, @intCast(@intFromPtr(&io_buf)), 16); // read the freed fd
+                _ = libc.syscall3(SYS_FSIZE, fd, 0, 0); // stat the freed fd
+                _ = libc.syscall3(SYS_CLOSE, fd, 0, 0); // double close
+            }
+        },
+        1 => {
+            // Double-munmap of a fresh mapping.
+            const len: u32 = 0x2000;
+            const a = libc.syscall3(SYS_MMAP, 0, len, 0);
+            if (isUserAddr(a)) {
+                _ = libc.syscall3(SYS_MUNMAP, a, len, 0);
+                _ = libc.syscall3(SYS_MUNMAP, a, len, 0); // double munmap
+                removeRegion(a);
+            }
+        },
+        2 => {
+            // W^X probe: ask for write+exec on a fresh mapping — it must be
+            // refused or split, never silently granted.
+            const len: u32 = 0x1000;
+            const a = libc.syscall3(SYS_MMAP, 0, len, 0);
+            if (isUserAddr(a)) {
+                _ = libc.syscall3(SYS_MPROTECT, a, len, 0x7); // PROT_READ|WRITE|EXEC
+                _ = libc.syscall3(SYS_MPROTECT, a, len, 0x5); // PROT_READ|EXEC
+                addRegion(a);
+            }
+        },
+        3 => {
+            // UAF + double-free on a window id.
+            const w = libc.syscall3(SYS_CREATE_WINDOW, 64, 64, 0);
+            if (!isError(w) and w < 256) {
+                _ = libc.syscall3(SYS_DESTROY_WINDOW, w, 0, 0);
+                _ = libc.syscall3(SYS_PRESENT, w, 0, 0); // present a destroyed window
+                _ = libc.syscall3(SYS_DESTROY_WINDOW, w, 0, 0); // double destroy
+            }
+        },
+        4 => {
+            // validateUserPtrWrite tripwire: feed write-target syscalls a
+            // READ-ONLY pointer (+ an overflowing length). A clean kernel
+            // returns E_FAULT; a missed write site #PFs in ring 0.
+            const ro = roPtr();
+            _ = libc.syscall3(SYS_STAT, realPathPtr(), ro, overflowLen(ro)); // stat → statbuf = RO
+            _ = libc.syscall3(SYS_FREAD, pickFd(), ro, overflowLen(ro)); // read → buf = RO
+        },
+        else => {
+            // Range spill: a write that starts inside a live mapping but runs
+            // off its end into the next (unmapped) page.
+            const len: u32 = 0x1000;
+            const a = libc.syscall3(SYS_MMAP, 0, len, 0);
+            if (isUserAddr(a)) {
+                _ = libc.syscall3(SYS_FREAD, pickFd(), a + len - 8, 64); // spills 56 B past the end
+                _ = libc.syscall3(SYS_MUNMAP, a, len, 0);
+            }
+        },
+    }
+    return which;
 }
 
 export fn _start() linksection(".text.entry") callconv(.c) void {
@@ -395,6 +630,11 @@ export fn _start() linksection(".text.entry") callconv(.c) void {
     libc.printHex(@truncate(state));
     libc.print("\n");
 
+    // Create the disposable scratch files the destructive syscalls target, so
+    // the fuzzer never corrupts real binaries (see SCRATCH / PATHS). Done after
+    // the banner, before the loop. (2026-06-04)
+    setupScratch();
+
     var i: u32 = 0;
     var skipped: u32 = 0;
     var ok_count: u32 = 0;
@@ -402,6 +642,14 @@ export fn _start() linksection(".text.entry") callconv(.c) void {
     var biased: u32 = 0;
 
     while (i < iters) : (i += 1) {
+        // Every 12th iteration, run a scripted UAF/double-free/W^X/overflow
+        // sequence instead of a single random call — these construct the
+        // multi-step bugs that independent random calls statistically miss.
+        if (i != 0 and i % 12 == 0) {
+            const c = combo();
+            libc.klogFmt("[redteam] iter={d} COMBO#{d} live[fd={d} rg={d} wid={d}]\n", .{ i, c, n_fds, n_regions, n_wids });
+            continue;
+        }
         const sys_no: u32 = next() % 130;
         if (isBlocked(sys_no)) {
             skipped += 1;

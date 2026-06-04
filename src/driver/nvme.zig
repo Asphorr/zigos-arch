@@ -167,6 +167,29 @@ comptime {
 }
 
 const Q_DEPTH: u16 = 16;
+
+/// Max commands the host may keep in flight at once. An NVMe Submission
+/// Queue created with QSIZE entries can hold at most QSIZE-1 *outstanding*
+/// SQEs: the ring is "full" when `(tail + 1) % QSIZE == head`, so writing
+/// all QSIZE entries makes `io_sq_tail` wrap to EQUAL the controller's SQ
+/// head — a state the controller cannot tell apart from "empty", at which
+/// point it silently stops fetching and the wrapped commands are lost
+/// (their CQEs are never written, so the waiters park forever). We size the
+/// I/O SQ/CQ at Q_DEPTH entries (see CREATE_SQ/CREATE_CQ, qsize = Q_DEPTH-1)
+/// and gate concurrency on the CID-slot count, so capping in-flight CIDs at
+/// Q_DEPTH-1 keeps the SQ tail from ever lapping the SQ head:
+///   active_cids <= Q_DEPTH-1  ⟹  (io_sq_tail − sq_head) <= Q_DEPTH-1
+///                             ⟹  io_sq_tail ≠ sq_head  (never full).
+/// (Active CIDs is an upper bound on un-fetched SQEs — the device advances
+/// its SQ head as soon as it *fetches*, well before it *completes* — so the
+/// CID cap is a sufficient, if slightly conservative, ring-overflow guard.)
+///
+/// Hit under the 100k-iter redteam fuzzer (2026-06-04): with all 16 slots
+/// in flight the 16th submit lapped the SQ head, the controller dropped the
+/// wrapped commands, and the reading processes wedged on `nvme_io` with no
+/// completion ever arriving. Pre-fix `allocCid` scanned `i < Q_DEPTH`.
+const MAX_INFLIGHT: u16 = Q_DEPTH - 1;
+
 const MAX_CONTROLLERS: usize = 3; // 0 = tarfs, 1 = ext2, 2 = swap
 const SECTOR_SIZE: u32 = 512;
 
@@ -904,6 +927,31 @@ pub var io_wait_cycles: u64 = 0;
 pub var io_msix_retargets: u64 = 0;
 pub var io_max_wait_cycles: u64 = 0;
 
+/// Invalidate the guest CPU's cached copy of a device-DMA'd buffer before the
+/// CPU reads it. QEMU's NVMe iothread writes the data on a *different host CPU*,
+/// so the guest L1 can hold a STALE line — the exact hazard waitCompletion /
+/// reapCq already clflush around for the CQ (see waitCompletion ~line 865).
+/// The read copyout paths (sync / async / pipelined) bounce DMA into
+/// bounce_bufs[slot] then @memcpy it to the destination; WITHOUT this, a
+/// *successful* read can copy the bounce buffer's stale cache content (old or
+/// never-written kernel bytes) instead of the freshly-DMA'd file data —
+/// surfaced as garbage ELF headers / silent data corruption under heavy
+/// concurrent load (redteam: a 225-page redteam.elf read came back with kernel
+/// pointers where \x7fELF should be). clflush takes a virtual address; the
+/// trailing mfence orders the invalidates before the copy.
+fn invalidateDmaRange(virt: usize, len: usize) void {
+    if (len == 0) return;
+    var p = virt & ~@as(usize, 63); // align down to the 64-byte cache line
+    const end = virt + len;
+    while (p < end) : (p += 64) {
+        asm volatile ("clflush (%[ptr])"
+            :
+            : [ptr] "r" (p),
+            : .{ .memory = true });
+    }
+    asm volatile ("mfence" ::: .{ .memory = true });
+}
+
 /// Bounce buffer size per CID slot, in 4 KiB pages. Contiguous in
 /// physical memory so the SQE can describe it with one PRP page list.
 /// 8 pages × 4 KiB = 32 KiB per slot → MAX_SECTORS_PER_CMD = 64.
@@ -999,8 +1047,10 @@ fn ioCommand(c: *Controller, opcode: u8, lba: u32, user_buf: usize, sectors: u32
     if (wait_dt > io_max_wait_cycles) io_max_wait_cycles = wait_dt;
 
     if (opcode == IO_READ) {
+        const src_va = paging.physToVirt(sync_bounce_phys);
+        invalidateDmaRange(src_va, xfer_bytes); // guest L1 may hold a stale pre-DMA line
         const dst: [*]u8 = @ptrFromInt(user_buf);
-        const src: [*]const u8 = @ptrFromInt(paging.physToVirt(sync_bounce_phys));
+        const src: [*]const u8 = @ptrFromInt(src_va);
         @memcpy(dst[0..xfer_bytes], src[0..xfer_bytes]);
     }
     const t_call_end = @import("../debug/perf.zig").rdtsc();
@@ -1032,8 +1082,10 @@ fn ioCommand(c: *Controller, opcode: u8, lba: u32, user_buf: usize, sectors: u32
 //     in waiter's wake-up path uses atomic-acquire.
 
 /// Allocate a free waiter slot, bump its generation counter, and return
-/// the packed CID `(new_gen << 4) | slot_idx`. Caller must already hold
-/// `c.io_lock`. Returns null if Q_DEPTH commands are already in flight.
+/// the packed CID `(new_gen << 4) | slot_idx`. Lockless (per-slot CAS on
+/// `.active`). Returns null if MAX_INFLIGHT (= Q_DEPTH-1) commands are
+/// already in flight — reserving one slot keeps the SQ tail from lapping
+/// the SQ head (see MAX_INFLIGHT).
 ///
 /// The packed CID is what gets written into the SQE and echoed by the
 /// device in the CQE. `reapCq` decodes both halves to detect orphan
@@ -1053,8 +1105,11 @@ fn allocCid(c: *Controller) ?u16 {
     // the OLD gen — reapCq would set `completed=true` on us spuriously.
     // We reset `completed` after the gen bump so the submitter never
     // sees that stale write when it starts polling.
+    // Scan only MAX_INFLIGHT slots, not all Q_DEPTH: the reserved slot caps
+    // outstanding commands at Q_DEPTH-1 so io_sq_tail can never lap the
+    // controller's SQ head (see MAX_INFLIGHT — the "wedge" root cause).
     var i: u16 = 0;
-    while (i < Q_DEPTH) : (i += 1) {
+    while (i < MAX_INFLIGHT) : (i += 1) {
         if (@atomicLoad(bool, &c.waiters[i].active, .acquire)) continue;
         if (@cmpxchgStrong(bool, &c.waiters[i].active, false, true, .acq_rel, .acquire)) |_| {
             // CAS lost — another CPU just claimed this slot.
@@ -1468,8 +1523,10 @@ fn ioCommandAsync(c: *Controller, ctrl_idx: u32, opcode: u8, lba: u32, user_buf:
     // Copy bounce → user for reads BEFORE freeing the CID, otherwise a
     // racing submitter could reuse the bounce buffer.
     if (opcode == IO_READ and success) {
+        const src_va = paging.physToVirt(bounce_phys);
+        invalidateDmaRange(src_va, xfer_bytes); // guest L1 may hold a stale pre-DMA line
         const dst: [*]u8 = @ptrFromInt(user_buf);
-        const src: [*]const u8 = @ptrFromInt(paging.physToVirt(bounce_phys));
+        const src: [*]const u8 = @ptrFromInt(src_va);
         @memcpy(dst[0..xfer_bytes], src[0..xfer_bytes]);
     }
 
@@ -1720,23 +1777,33 @@ pub fn readSectorSecondary(lba: u32, dest: [*]u8) void {
     _ = ioCommand(&controllers[1], IO_READ, lba, @intFromPtr(dest), 1);
 }
 
-pub fn readSectorsSecondary(lba: u32, count: u16, dest: [*]u8) void {
-    if (num_controllers < 2) return;
+pub fn readSectorsSecondary(lba: u32, count: u16, dest: [*]u8) bool {
+    if (num_controllers < 2) return false;
     const c = &controllers[1];
     const total: u32 = if (count == 0) 256 else @as(u32, count);
     // QD>1 fast path: ext2's cache fills (CACHE_SECTORS sectors) land here.
     // Multi-chunk reads pipeline across the ring; single-chunk / pre-async
     // reads fall through to the serial path.
+    //
+    // BUG 2 fix (2026-06-04): RETURN the read result instead of swallowing it
+    // with `_ =`. A failed block read used to leave stale bytes in `dest` and
+    // ext2 handed them back as valid — the redteam "garbage ELF" silent
+    // corruption (only redteam tripped it: it's the one app big enough to get
+    // partially evicted from ext2's block cache and re-read from disk; smaller
+    // apps stay fully cached and never re-read). Now the failure propagates:
+    // ext2's ensureCacheLoaded sees false -> readBlock false -> readInodeBytes
+    // short -> loadFile short read -> clean null, so the ELF loader gets an
+    // honest error instead of executing garbage.
     if (ASYNC_BUILD_ENABLED and total > MAX_SECTORS_PER_CMD and @atomicLoad(bool, &c.async_mode, .acquire)) {
-        _ = readSectorsPipelined(c, 1, lba, total, @intFromPtr(dest));
-        return;
+        return readSectorsPipelined(c, 1, lba, total, @intFromPtr(dest));
     }
     var done: u32 = 0;
     while (done < total) {
         const chunk: u32 = @min(total - done, MAX_SECTORS_PER_CMD);
-        _ = ioCommand(c, IO_READ, lba + done, @intFromPtr(dest) + done * c.block_size, chunk);
+        if (!ioCommand(c, IO_READ, lba + done, @intFromPtr(dest) + done * c.block_size, chunk)) return false;
         done += chunk;
     }
+    return true;
 }
 
 /// Generic indexed sector I/O for callers that aren't the FS primary/secondary
@@ -2020,10 +2087,23 @@ fn readSectorsPipelined(c: *Controller, ctrl_idx: u32, lba: u32, count: u32, des
             const slot = cidSlot(cids[i]);
             if (c.waiters[slot].success) {
                 const bphys = c.bounce_bufs[slot];
+                const src_va = paging.physToVirt(bphys);
+                invalidateDmaRange(src_va, lens[i]); // guest L1 may hold a stale pre-DMA line
                 const d: [*]u8 = @ptrFromInt(dest + offs[i]);
-                const s: [*]const u8 = @ptrFromInt(paging.physToVirt(bphys));
+                const s: [*]const u8 = @ptrFromInt(src_va);
                 @memcpy(d[0..lens[i]], s[0..lens[i]]);
-            } else wave_ok = false;
+            } else {
+                wave_ok = false;
+                // BUG 2 diagnostic (2026-06-04): a chunk completed with an error
+                // status (sc != 0). Pre-fix this was swallowed and the FS served
+                // the stale bounce bytes as a "successful" read (redteam garbage
+                // ELF). Log WHICH chunk and its status code so the root cause is
+                // visible; the wave returns false and the FS surfaces it as EIO.
+                debug.klog(
+                    "[nvme] read chunk FAIL ctrl#{d} lba={d} cid=0x{X:0>4} (slot={d}) sc=0x{X} — propagating to FS as error\n",
+                    .{ ctrl_idx, lba + @as(u32, @intCast(offs[i])) / c.block_size, cids[i], slot, c.waiters[slot].status_code },
+                );
+            }
             @atomicStore(bool, &c.waiters[slot].active, false, .release);
             io_call_count += 1;
         }

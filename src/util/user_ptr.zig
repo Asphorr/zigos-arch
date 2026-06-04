@@ -35,9 +35,27 @@ pub fn UserPtr(comptime T: type) type {
         /// unmapped lazy region, returns null. The caller-side SMAP
         /// unlock is held for the rest of the syscall (doSyscall's
         /// trailing CLAC closes it on exit).
+        ///
+        /// READ-ONLY contract: this only proves the page is *present*, not
+        /// *writable*. A present-but-read-only user page (the app's own
+        /// .text/.rodata, or an un-broken COW page) passes here. So pair
+        /// `validate()` with `copyIn()` only. For `copyOut()` use
+        /// `validateWrite()` — a read-only pointer handed to a write-target
+        /// syscall would otherwise #PF (err=0x3) in ring 0 after STAC opens.
         pub fn validate(self: Self) ?Self {
             const common = @import("../cpu/syscall/common.zig");
             if (!common.validateUserPtrAligned(@intCast(self.addr), @sizeOf(T), @alignOf(T))) return null;
+            return self;
+        }
+
+        /// Like `validate()` but ALSO proves the page is writable (breaks COW
+        /// and rejects genuinely read-only pages). Use before `copyOut()`.
+        /// Returns null (→ caller maps to E_FAULT) for a read-only target,
+        /// converting what would be a kernel write-fault panic into a clean
+        /// errno.
+        pub fn validateWrite(self: Self) ?Self {
+            const common = @import("../cpu/syscall/common.zig");
+            if (!common.validateUserPtrWriteAligned(@intCast(self.addr), @sizeOf(T), @alignOf(T))) return null;
             return self;
         }
 
@@ -49,7 +67,9 @@ pub fn UserPtr(comptime T: type) type {
             return p.*;
         }
 
-        /// Write one `T` to user memory. Same validate-first contract.
+        /// Write one `T` to user memory. Must be reached via `validateWrite()`
+        /// (NOT `validate()`) — the target page has to be proven writable
+        /// first, else this store #PFs in ring 0 against a read-only user page.
         pub inline fn copyOut(self: Self, value: T) void {
             const p: *T = @ptrFromInt(@as(usize, @intCast(self.addr)));
             p.* = value;

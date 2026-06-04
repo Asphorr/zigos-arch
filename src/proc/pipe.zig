@@ -14,6 +14,7 @@ const process = @import("process.zig");
 const debug = @import("../debug/debug.zig");
 const config = @import("../config.zig");
 const fdpoll = @import("../cpu/ipc/fdpoll.zig");
+const spinlock = @import("spinlock.zig");
 
 pub const PIPE_BUF_SIZE: u32 = config.PIPE_BUF_SIZE;
 pub const MAX_PIPES: u8 = config.MAX_PIPES;
@@ -37,6 +38,24 @@ pub const Pipe = struct {
     /// pipe is wired into a window. Default false; process-to-process
     /// pipes never touch this path.
     wake_desktop_on_write: bool = false,
+
+    /// Per-pipe ticket spinlock serialising ALL ring-state access
+    /// (head / tail / count / buf). Added 2026-06-04 after the fuzzer
+    /// tripped pcb_invariants' pipe.validate with `count=0 but head=N
+    /// tail=N-1`. The ring was being mutated lock-free from two CPUs —
+    /// the shell's blocking write() vs the desktop's non-blocking
+    /// tryRead() draining a terminal out_pipe (the shell→desktop drain
+    /// path) — so a `count += n` and a `count -= n` could race and lose
+    /// an update, and the IRQ0 validator on the other CPU could sample a
+    /// torn (head bumped, count not yet) intermediate and false-panic.
+    /// Held with interrupts OFF (acquireIrqSave) across only the memcpy +
+    /// counter update — NEVER across blockOnInterruptible or process.wake
+    /// — so it stays a leaf lock and a CPU's own IRQ0 validator can never
+    /// interrupt a holder on that CPU and self-deadlock. validate() takes
+    /// the same lock to read a consistent snapshot. Left unregistered (no
+    /// WITNESS class) — 32 pipes would blow the named-lock budget, and the
+    /// lock acquires nothing else while held so order tracking is moot.
+    lock: spinlock.SpinLock = .{},
 };
 
 pub var pipes: [MAX_PIPES]Pipe = [_]Pipe{.{}} ** MAX_PIPES;
@@ -47,11 +66,24 @@ pub var pipes: [MAX_PIPES]Pipe = [_]Pipe{.{}} ** MAX_PIPES;
 pub fn alloc() ?u8 {
     for (0..MAX_PIPES) |i| {
         if (!pipes[i].in_use) {
-            pipes[i] = .{
-                .in_use = true,
-                .readers = 1,
-                .writers = 1,
-            };
+            const p = &pipes[i];
+            // Reset ring + refcount state field-by-field, DELIBERATELY
+            // leaving `lock` untouched: a whole-struct `.{}` assign would
+            // reset the ticket counters, which (very rarely) corrupts a
+            // cross-CPU validator that's mid-acquire on this slot's lock.
+            // A freed slot's lock is unheld, so preserving it is safe and
+            // makes the lock's lifecycle airtight. `in_use` is written LAST
+            // — on x86-TSO that publishes the field writes before any other
+            // CPU can observe the slot as live.
+            p.head = 0;
+            p.tail = 0;
+            p.count = 0;
+            p.readers = 1;
+            p.writers = 1;
+            p.blocked_reader_pid = 0xFF;
+            p.blocked_writer_pid = 0xFF;
+            p.wake_desktop_on_write = false;
+            @atomicStore(bool, &p.in_use, true, .release);
             return @intCast(i);
         }
     }
@@ -78,6 +110,7 @@ pub fn read(id: u8, out: []u8) usize {
     var copied: usize = 0;
     var freed_space = false;
     while (copied < out.len) {
+        const flags = p.lock.acquireIrqSave();
         if (p.count > 0) {
             const wanted = out.len - copied;
             const remaining = p.count;
@@ -90,18 +123,20 @@ pub fn read(id: u8, out: []u8) usize {
             copied += n;
             freed_space = true;
 
-            // Wake any writer waiting on this pipe
-            if (p.blocked_writer_pid != 0xFF) {
-                const w = p.blocked_writer_pid;
-                p.blocked_writer_pid = 0xFF;
-                process.wake(w);
-            }
+            // Capture the blocked writer, then drop the lock BEFORE waking:
+            // process.wake may take sched_lock, which must never nest under
+            // the (cli-held) pipe lock.
+            const w = p.blocked_writer_pid;
+            if (w != 0xFF) p.blocked_writer_pid = 0xFF;
+            p.lock.releaseIrqRestore(flags);
+            if (w != 0xFF) process.wake(w);
             continue;
         }
 
         // Ring empty
         if (p.writers == 0) {
             // EOF — no more writers, no more data
+            p.lock.releaseIrqRestore(flags);
             if (freed_space) fdpoll.wakePollers(.pipe, id);
             return copied;
         }
@@ -109,6 +144,7 @@ pub fn read(id: u8, out: []u8) usize {
         // If the caller already got something, return early — POSIX read
         // semantics: a partial read is valid, the caller can loop.
         if (copied > 0) {
+            p.lock.releaseIrqRestore(flags);
             fdpoll.wakePollers(.pipe, id);
             return copied;
         }
@@ -117,12 +153,18 @@ pub fn read(id: u8, out: []u8) usize {
         // .signalled branch returns the partial count (zero or otherwise)
         // and lets the syscall-return signal-delivery path run; without
         // this we'd loop forever (process.wake flips state but the signal
-        // stays pending until exit-to-user).
+        // stays pending until exit-to-user). Set blocked_reader_pid UNDER
+        // the lock (so a racing writer's wake-check observes it), then
+        // release before parking — blockOnInterruptible must never run
+        // with the pipe lock (or cli) held.
         const my_pid: u8 = @intCast(process.getCurrentPid());
         p.blocked_reader_pid = my_pid;
+        p.lock.releaseIrqRestore(flags);
         const br = process.blockOnInterruptible(.pipe_read, id);
         if (br == .signalled) {
+            const f2 = p.lock.acquireIrqSave();
             p.blocked_reader_pid = 0xFF;
+            p.lock.releaseIrqRestore(f2);
             if (freed_space) fdpoll.wakePollers(.pipe, id);
             return copied;
         }
@@ -143,6 +185,8 @@ pub fn tryRead(id: u8, out: []u8) usize {
     const p = &pipes[id];
     if (!p.in_use) return 0;
     var copied: usize = 0;
+    var wake_w: u8 = 0xFF;
+    const flags = p.lock.acquireIrqSave();
     while (copied < out.len and p.count > 0) {
         const wanted = out.len - copied;
         const remaining = p.count;
@@ -153,11 +197,12 @@ pub fn tryRead(id: u8, out: []u8) usize {
         p.count -= @intCast(n);
         copied += n;
         if (p.blocked_writer_pid != 0xFF) {
-            const w = p.blocked_writer_pid;
+            wake_w = p.blocked_writer_pid;
             p.blocked_writer_pid = 0xFF;
-            process.wake(w);
         }
     }
+    p.lock.releaseIrqRestore(flags);
+    if (wake_w != 0xFF) process.wake(wake_w);
     if (copied > 0) fdpoll.wakePollers(.pipe, id);
     return copied;
 }
@@ -174,8 +219,10 @@ pub fn write(id: u8, data: []const u8) usize {
     var written: usize = 0;
     var pushed_data = false;
     while (written < data.len) {
+        const flags = p.lock.acquireIrqSave();
         if (p.readers == 0) {
             // No one to read this. Treat as EPIPE.
+            p.lock.releaseIrqRestore(flags);
             if (pushed_data) fdpoll.wakePollers(.pipe, id);
             return 0xFFFFFFFF;
         }
@@ -191,23 +238,29 @@ pub fn write(id: u8, data: []const u8) usize {
             written += n;
             pushed_data = true;
 
-            if (p.blocked_reader_pid != 0xFF) {
-                const r = p.blocked_reader_pid;
-                p.blocked_reader_pid = 0xFF;
-                process.wake(r);
-            }
-            if (p.wake_desktop_on_write) @import("../ui/desktop/wake.zig").requestWake();
+            // Capture wake targets, drop the lock, THEN wake — keep
+            // process.wake / the compositor wake out of the cli section.
+            const r = p.blocked_reader_pid;
+            if (r != 0xFF) p.blocked_reader_pid = 0xFF;
+            const wake_desktop = p.wake_desktop_on_write;
+            p.lock.releaseIrqRestore(flags);
+            if (r != 0xFF) process.wake(r);
+            if (wake_desktop) @import("../ui/desktop/wake.zig").requestWake();
             continue;
         }
 
         // Ring full — sleep until reader drains. Bail on pending signal
         // with whatever partial count we have so the syscall-return
         // delivery path runs. Caller can retry after handler returns.
+        // blocked_writer_pid set under the lock, released before parking.
         const my_pid: u8 = @intCast(process.getCurrentPid());
         p.blocked_writer_pid = my_pid;
+        p.lock.releaseIrqRestore(flags);
         const br = process.blockOnInterruptible(.pipe_write, id);
         if (br == .signalled) {
+            const f2 = p.lock.acquireIrqSave();
             p.blocked_writer_pid = 0xFF;
+            p.lock.releaseIrqRestore(f2);
             if (pushed_data) fdpoll.wakePollers(.pipe, id);
             return written;
         }
@@ -228,6 +281,8 @@ pub fn tryWrite(id: u8, data: []const u8) usize {
     if (!p.in_use) return 0;
     if (p.readers == 0) return 0; // EPIPE-ish — drop the write
     var written: usize = 0;
+    var wake_r: u8 = 0xFF;
+    const flags = p.lock.acquireIrqSave();
     while (written < data.len and p.count < PIPE_BUF_SIZE) {
         const free = PIPE_BUF_SIZE - p.count;
         const wanted = data.len - written;
@@ -238,13 +293,15 @@ pub fn tryWrite(id: u8, data: []const u8) usize {
         p.count += @intCast(n);
         written += n;
         if (p.blocked_reader_pid != 0xFF) {
-            const r = p.blocked_reader_pid;
+            wake_r = p.blocked_reader_pid;
             p.blocked_reader_pid = 0xFF;
-            process.wake(r);
         }
     }
+    const wake_desktop = p.wake_desktop_on_write;
+    p.lock.releaseIrqRestore(flags);
+    if (wake_r != 0xFF) process.wake(wake_r);
     if (written > 0) {
-        if (p.wake_desktop_on_write) @import("../ui/desktop/wake.zig").requestWake();
+        if (wake_desktop) @import("../ui/desktop/wake.zig").requestWake();
         fdpoll.wakePollers(.pipe, id);
     }
     return written;
@@ -330,36 +387,52 @@ pub fn validate() bool {
     var ok = true;
     for (&pipes, 0..) |*p, i| {
         if (!p.in_use) continue;
-        if (p.head >= PIPE_BUF_SIZE) {
-            serial.print("[pipe] inv: pipe {d} head={d} >= PIPE_BUF_SIZE={d}\n", .{ i, p.head, PIPE_BUF_SIZE });
+        // Take the SAME per-pipe lock the ring ops hold, so we read a
+        // CONSISTENT snapshot of head/tail/count rather than a torn
+        // intermediate. Without this the IRQ0 scanner (on another CPU)
+        // could catch write() mid-update — head bumped, count not yet —
+        // and false-panic on a healthy pipe (the 2026-06-04 fuzzer hit).
+        // Self-deadlock-safe: ring ops hold this lock with interrupts OFF,
+        // so this CPU's IRQ0 can never interrupt a holder on THIS cpu; a
+        // holder on another CPU releases within one memcpy.
+        const flags = p.lock.acquireIrqSave();
+        const head = p.head;
+        const tail = p.tail;
+        const count = p.count;
+        const readers = p.readers;
+        const writers = p.writers;
+        p.lock.releaseIrqRestore(flags);
+
+        if (head >= PIPE_BUF_SIZE) {
+            serial.print("[pipe] inv: pipe {d} head={d} >= PIPE_BUF_SIZE={d}\n", .{ i, head, PIPE_BUF_SIZE });
             ok = false;
         }
-        if (p.tail >= PIPE_BUF_SIZE) {
-            serial.print("[pipe] inv: pipe {d} tail={d} >= PIPE_BUF_SIZE={d}\n", .{ i, p.tail, PIPE_BUF_SIZE });
+        if (tail >= PIPE_BUF_SIZE) {
+            serial.print("[pipe] inv: pipe {d} tail={d} >= PIPE_BUF_SIZE={d}\n", .{ i, tail, PIPE_BUF_SIZE });
             ok = false;
         }
-        if (p.count > PIPE_BUF_SIZE) {
-            serial.print("[pipe] inv: pipe {d} count={d} > PIPE_BUF_SIZE={d}\n", .{ i, p.count, PIPE_BUF_SIZE });
+        if (count > PIPE_BUF_SIZE) {
+            serial.print("[pipe] inv: pipe {d} count={d} > PIPE_BUF_SIZE={d}\n", .{ i, count, PIPE_BUF_SIZE });
             ok = false;
         }
-        if (p.head < PIPE_BUF_SIZE and p.tail < PIPE_BUF_SIZE) {
-            const expected_count: u32 = if (p.head >= p.tail)
-                p.head - p.tail
+        if (head < PIPE_BUF_SIZE and tail < PIPE_BUF_SIZE) {
+            const expected_count: u32 = if (head >= tail)
+                head - tail
             else
-                PIPE_BUF_SIZE - p.tail + p.head;
+                PIPE_BUF_SIZE - tail + head;
             // When the ring is exactly full, head == tail but count == PIPE_BUF_SIZE,
             // so the head>=tail branch returns 0; accept either 0 (empty) or PIPE_BUF_SIZE.
-            const matches = if (p.head == p.tail)
-                (p.count == 0 or p.count == PIPE_BUF_SIZE)
+            const matches = if (head == tail)
+                (count == 0 or count == PIPE_BUF_SIZE)
             else
-                (p.count == expected_count);
+                (count == expected_count);
             if (!matches) {
-                serial.print("[pipe] inv: pipe {d} count={d} but head={d} tail={d} (expected {d})\n", .{ i, p.count, p.head, p.tail, expected_count });
+                serial.print("[pipe] inv: pipe {d} count={d} but head={d} tail={d} (expected {d})\n", .{ i, count, head, tail, expected_count });
                 ok = false;
             }
         }
-        if (p.count > 0 and p.readers == 0 and p.writers == 0) {
-            serial.print("[pipe] inv: pipe {d} has {d} bytes but no readers/writers\n", .{ i, p.count });
+        if (count > 0 and readers == 0 and writers == 0) {
+            serial.print("[pipe] inv: pipe {d} has {d} bytes but no readers/writers\n", .{ i, count });
             ok = false;
         }
     }

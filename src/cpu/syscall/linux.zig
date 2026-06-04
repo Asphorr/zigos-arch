@@ -259,7 +259,7 @@ fn sysRead(fd: u32, buf_va: u64, count: u64) u64 {
     if (count == 0) return 0;
     if (buf_va > 0xFFFF_FFFF) return err(EFAULT);
     const len: u32 = if (count > 0xFFFF_F000) 0xFFFF_F000 else @truncate(count);
-    if (!common.validateUserPtr(@truncate(buf_va), len)) return err(EFAULT);
+    if (!common.validateUserPtrWrite(@truncate(buf_va), len)) return err(EFAULT);
     const pcb = process.currentPCB() orelse return err(EFAULT);
     if (fd < pcb.fd_table.len and pcb.fd_table[fd].in_use and pcb.fd_table[fd].fs_type == .ext2) {
         if (ext2_inode.readInode(pcb.fd_table[fd].inode)) |ino| {
@@ -338,7 +338,7 @@ fn sysReadv(fd: u32, iov_va: u64, iovcnt: u64) u64 {
         const seg = iov[i].len;
         if (seg == 0) continue;
         if (seg > 0xFFFF_FFFF or base > 0xFFFF_FFFF or
-            !common.validateUserPtr(@truncate(base), @truncate(seg)))
+            !common.validateUserPtrWrite(@truncate(base), @truncate(seg)))
         {
             if (total > 0) return total;
             return err(EFAULT);
@@ -488,7 +488,7 @@ fn statByFd(pcb: *process.PCB, fd: u32, st: *LinuxStat) u64 {
 /// fstat(fd, statbuf).
 fn sysFstat(fd: u32, statbuf_va: u64) u64 {
     const pcb = process.currentPCB() orelse return err(EFAULT);
-    if (statbuf_va > 0xFFFF_FFFF or !common.validateUserPtr(@truncate(statbuf_va), @sizeOf(LinuxStat))) return err(EFAULT);
+    if (statbuf_va > 0xFFFF_FFFF or !common.validateUserPtrWrite(@truncate(statbuf_va), @sizeOf(LinuxStat))) return err(EFAULT);
     const st: *LinuxStat = @ptrFromInt(@as(usize, @intCast(statbuf_va)));
     st.* = .{};
     return statByFd(pcb, fd, st);
@@ -499,7 +499,7 @@ fn sysFstat(fd: u32, statbuf_va: u64) u64 {
 /// dirfd-relative resolution against an arbitrary directory fd is deferred.
 fn sysNewfstatat(dirfd: u64, path_va: u64, statbuf_va: u64, flags: u64) u64 {
     const pcb = process.currentPCB() orelse return err(EFAULT);
-    if (statbuf_va > 0xFFFF_FFFF or !common.validateUserPtr(@truncate(statbuf_va), @sizeOf(LinuxStat))) return err(EFAULT);
+    if (statbuf_va > 0xFFFF_FFFF or !common.validateUserPtrWrite(@truncate(statbuf_va), @sizeOf(LinuxStat))) return err(EFAULT);
     const st: *LinuxStat = @ptrFromInt(@as(usize, @intCast(statbuf_va)));
     st.* = .{};
 
@@ -530,7 +530,7 @@ const UTS_LEN: usize = 65;
 const UTSNAME_SIZE: usize = 6 * UTS_LEN; // 390 bytes
 
 fn sysUname(buf_va: u64) u64 {
-    if (buf_va == 0 or buf_va > 0xFFFF_FFFF or !common.validateUserPtr(@truncate(buf_va), UTSNAME_SIZE)) return err(EFAULT);
+    if (buf_va == 0 or buf_va > 0xFFFF_FFFF or !common.validateUserPtrWrite(@truncate(buf_va), UTSNAME_SIZE)) return err(EFAULT);
     const buf: []u8 = @as([*]u8, @ptrFromInt(@as(usize, @intCast(buf_va))))[0..UTSNAME_SIZE];
     @memset(buf, 0); // zero first so every field is NUL-terminated
     const fields = [_][]const u8{ "Linux", "zigos", "6.6.0-zigos", "#1 zigos", "x86_64", "(none)" };
@@ -549,7 +549,7 @@ fn sysGetcwd(buf_va: u64, size: u64) u64 {
     const cwd = pcb.cwd[0..pcb.cwd_len];
     const needed: u64 = @as(u64, @intCast(cwd.len)) + 1; // path + NUL
     if (size < needed) return err(ERANGE);
-    if (buf_va == 0 or buf_va > 0xFFFF_FFFF or !common.validateUserPtr(@truncate(buf_va), @as(usize, @intCast(needed)))) return err(EFAULT);
+    if (buf_va == 0 or buf_va > 0xFFFF_FFFF or !common.validateUserPtrWrite(@truncate(buf_va), @as(usize, @intCast(needed)))) return err(EFAULT);
     const out: [*]u8 = @ptrFromInt(@as(usize, @intCast(buf_va)));
     @memcpy(out[0..cwd.len], cwd);
     out[cwd.len] = 0;
@@ -570,7 +570,7 @@ fn sysGetdents64(fd: u32, buf_va: u64, count: u64) u64 {
     if (buf_va > 0xFFFF_FFFF) return err(EFAULT);
     const cap: u32 = if (count > 0xFFFF_F000) 0xFFFF_F000 else @truncate(count);
     if (cap < 32) return err(EINVAL);
-    if (!common.validateUserPtr(@truncate(buf_va), cap)) return err(EFAULT);
+    if (!common.validateUserPtrWrite(@truncate(buf_va), cap)) return err(EFAULT);
 
     // Heap temp (not stack): ext2.listDir already burns 4 KiB of stack for its
     // block buffer, so keep our own footprint off the kstack.
@@ -665,7 +665,7 @@ fn sysArchPrctl(code: u64, addr: u64) u64 {
             return 0;
         },
         ARCH_GET_FS => {
-            if (addr > 0xFFFF_FFFF or !common.validateUserPtr(@truncate(addr), 8)) return err(EFAULT);
+            if (addr > 0xFFFF_FFFF or !common.validateUserPtrWrite(@truncate(addr), 8)) return err(EFAULT);
             const p: *align(1) u64 = @ptrFromInt(@as(usize, @intCast(addr)));
             p.* = pcb.fs_base;
             return 0;

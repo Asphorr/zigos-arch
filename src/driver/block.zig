@@ -72,21 +72,53 @@ pub fn readSectorSecondary(lba: u32, dest: [*]u8) void {
     }
 }
 
-pub fn readSectorsSecondary(lba: u32, count: u16, dest: [*]u8) void {
-    switch (backend) {
-        .none => {},
-        .ata => ata.readSectorsSecondary(lba, count, dest),
-        .ahci => ahci.readSectorsSecondary(lba, count, dest),
+// Returns false on a propagated read error (BUG 2 fix, 2026-06-04). Only the
+// NVMe backend reports failures today (ext2 lives on NVMe controller #1); the
+// ata/ahci backends are still void-returning, so they're wrapped as `true` —
+// no behavior change for them, and the ext2 path now surfaces real I/O errors
+// instead of serving stale buffer bytes as a valid read.
+pub fn readSectorsSecondary(lba: u32, count: u16, dest: [*]u8) bool {
+    return switch (backend) {
+        .none => false,
+        .ata => blk: {
+            ata.readSectorsSecondary(lba, count, dest);
+            break :blk true;
+        },
+        .ahci => blk: {
+            ahci.readSectorsSecondary(lba, count, dest);
+            break :blk true;
+        },
         .nvme => nvme.readSectorsSecondary(lba, count, dest),
-    }
+    };
 }
 
 pub fn writeSectorSecondary(lba: u32, src: [*]const u8) void {
+    elfWriteTripwire(lba, src, @returnAddress());
     switch (backend) {
         .none => {},
         .ata => ata.writeSectorSecondary(lba, src),
         .ahci => ahci.writeSectorSecondary(lba, src),
         .nvme => nvme.writeSectorSecondary(lba, src),
+    }
+}
+
+/// [write-tripwire] (2026-06-04) — catch the ext2 on-disk corruptor in the act.
+/// A 512-byte sector carrying a 7-byte ELF header (`7F 45 4C 46 02 01 01`) at a
+/// NON-ZERO offset is a misplaced header: the exact signature of the unsynced
+/// SMP ext2 cache race writing a shifted slice of one file over another's block
+/// (observed on redteam.elf at sector-offset 0xB9). A legit ELF sector-0 write
+/// has the magic at offset 0 (skipped). `ra` is writeSectorSecondary's caller —
+/// resolves (via KERNEL.SYM) to the ext2 write path that did it (writeBlock /
+/// writeBlockBytes / mmap writeback). Remove once the corruption is fixed.
+fn elfWriteTripwire(lba: u32, src: [*]const u8, ra: usize) void {
+    var i: usize = 1;
+    while (i + 7 <= 512) : (i += 1) {
+        if (src[i] == 0x7F and src[i + 1] == 0x45 and src[i + 2] == 0x4C and src[i + 3] == 0x46 and
+            src[i + 4] == 0x02 and src[i + 5] == 0x01 and src[i + 6] == 0x01)
+        {
+            debug.klog("[write-tripwire] misplaced ELF magic @ sector-off={d} -> ext2 LBA {d} ra=0x{X}\n", .{ i, lba, ra });
+            return;
+        }
     }
 }
 

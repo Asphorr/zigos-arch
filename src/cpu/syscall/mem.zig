@@ -69,7 +69,12 @@ pub fn sysSbrk(increment: u32) u32 {
     // region is shortened. One TLB shootdown covers the whole batch.
     const inc_signed: i32 = @bitCast(increment);
     if (inc_signed < 0) {
-        const decrement: usize = @intCast(-inc_signed);
+        // Widen to i64 BEFORE negating: inc_signed can be i32 INT_MIN
+        // (increment == 0x80000000), and -INT_MIN overflows i32 → a ReleaseSafe
+        // "integer overflow" panic = userspace-reachable kernel DoS (found by
+        // redteam: sbrk(0x80000000)). i64 holds the 2^31 magnitude; the bounds
+        // check just below then rejects the absurd shrink as E_INVAL.
+        const decrement: usize = @intCast(-@as(i64, inc_signed));
         if (decrement > old_brk - memmap.USER_BRK_INITIAL) return E_INVAL;
         const new_brk_shrink = old_brk - decrement;
         if (lead.heap_lazy_idx < 0) return E_INVAL;

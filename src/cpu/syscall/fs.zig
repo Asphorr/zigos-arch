@@ -27,6 +27,8 @@ const apic = @import("../../time/apic.zig");
 const common = @import("common.zig");
 const validateUserPtr = common.validateUserPtr;
 const validateUserPtrAligned = common.validateUserPtrAligned;
+const validateUserPtrWrite = common.validateUserPtrWrite;
+const validateUserPtrWriteAligned = common.validateUserPtrWriteAligned;
 const USER_SPACE_START = common.USER_SPACE_START;
 const USER_SPACE_END = common.USER_SPACE_END;
 const E_INVAL = common.E_INVAL;
@@ -60,7 +62,7 @@ pub fn sysOpen(name_ptr: u32, flags: u32) u32 {
 
 pub fn sysFread(fd: u32, buf_ptr: u32, count: u32) u32 {
     if (count == 0) return 0;
-    if (!validateUserPtr(buf_ptr, count)) return E_FAULT;
+    if (!validateUserPtrWrite(buf_ptr, count)) return E_FAULT;
 
     const pcb = process.currentPCB() orelse return E_FAULT;
     const buf: [*]u8 = @ptrFromInt(@as(usize, buf_ptr));
@@ -69,24 +71,9 @@ pub fn sysFread(fd: u32, buf_ptr: u32, count: u32) u32 {
 
 pub fn sysFwrite(fd: u32, buf_ptr: u32, count: u32) u32 {
     if (count == 0) return 0;
-    if (!validateUserPtr(buf_ptr, count)) {
-        if (process.getCurrentPid() == 4) {
-            debug.klog("[fwrite-dbg] pid=4 fd={d} count={d} buf=0x{x} -> E_FAULT (validateUserPtr)\n", .{ fd, count, buf_ptr });
-        }
-        return E_FAULT;
-    }
+    if (!validateUserPtr(buf_ptr, count)) return E_FAULT;
 
-    const pcb = process.currentPCB() orelse {
-        if (process.getCurrentPid() == 4) {
-            debug.klog("[fwrite-dbg] pid=4 fd={d} count={d} -> E_FAULT (no pcb)\n", .{ fd, count });
-        }
-        return E_FAULT;
-    };
-    if (process.getCurrentPid() == 4 and fd <= 2) {
-        const buf_dbg: [*]const u8 = @ptrFromInt(@as(usize, buf_ptr));
-        const show = if (count > 80) @as(u32, 80) else count;
-        debug.klog("[fwrite-dbg] pid=4 fd={d} count={d} msg='{s}'\n", .{ fd, count, buf_dbg[0..show] });
-    }
+    const pcb = process.currentPCB() orelse return E_FAULT;
     const buf: [*]const u8 = @ptrFromInt(@as(usize, buf_ptr));
     return vfs.write(pcb, fd, buf, count);
 }
@@ -131,7 +118,7 @@ pub fn sysListDir(buf_ptr: u32, buf_size: u32) u32 {
     const entry_size: u32 = @sizeOf(FileEntry);
     const max_entries = buf_size / entry_size;
     if (max_entries == 0) return E_INVAL;
-    if (!validateUserPtrAligned(buf_ptr, buf_size, @alignOf(FileEntry))) return E_FAULT;
+    if (!validateUserPtrWriteAligned(buf_ptr, buf_size, @alignOf(FileEntry))) return E_FAULT;
     const entries: [*]FileEntry = @ptrFromInt(@as(usize, buf_ptr));
 
     // Dispatch by cwd → mount table. Previously hardcoded to FAT32 root,
@@ -440,7 +427,7 @@ pub fn sysGetcwd(buf_ptr: u32, size: u32) u32 {
 
     const cwd_len = pcb.cwd_len;
     if (size < cwd_len + 1) return E_INVAL; // need space for null terminator
-    if (!validateUserPtr(buf_ptr, cwd_len + 1)) return E_FAULT;
+    if (!validateUserPtrWrite(buf_ptr, cwd_len + 1)) return E_FAULT;
 
     const dest: [*]u8 = @ptrFromInt(@as(usize, buf_ptr));
     @memcpy(dest[0..cwd_len], pcb.cwd[0..cwd_len]);
@@ -507,7 +494,7 @@ pub fn sysReaddir(path_ptr: u32, buf_ptr: u32, buf_size: u32) u32 {
     }
 
     if (path_len == 0 or path_len >= 256) return E_NAMETOOLONG;
-    if (!validateUserPtrAligned(buf_ptr, buf_size, @alignOf(FileEntry))) return E_FAULT;
+    if (!validateUserPtrWriteAligned(buf_ptr, buf_size, @alignOf(FileEntry))) return E_FAULT;
 
     const entry_size: u32 = @sizeOf(FileEntry);
     const max_entries = buf_size / entry_size;
@@ -598,7 +585,7 @@ pub fn sysStat(path_ptr: u32, path_len: u32, stat_buf_ptr: u32) u32 {
 
     if (path_len == 0 or path_len > 256) return E_NAMETOOLONG;
     if (!validateUserPtr(path_ptr, path_len)) return E_FAULT;
-    if (!validateUserPtrAligned(stat_buf_ptr, @sizeOf(FileStat), @alignOf(FileStat))) return E_INVAL;
+    if (!validateUserPtrWriteAligned(stat_buf_ptr, @sizeOf(FileStat), @alignOf(FileStat))) return E_INVAL;
 
     // Read path from user space
     var path_buf: [256]u8 = undefined;
@@ -761,7 +748,7 @@ pub fn sysRmdir(path_ptr: u32, path_len: u32) u32 {
 /// (two u32s) into the user buffer. Returns 0 on success, 0xFFFFFFFF if the
 /// pipe pool or fd table is full.
 pub fn sysPipe(fds_ptr: u32) u32 {
-    if (!validateUserPtrAligned(fds_ptr, 8, 4)) return E_FAULT;
+    if (!validateUserPtrWriteAligned(fds_ptr, 8, 4)) return E_FAULT;
     const pcb = process.currentPCB() orelse return E_FAULT;
 
     const id = pipe.alloc() orelse return E_INVAL;

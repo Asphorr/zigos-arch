@@ -68,6 +68,30 @@ pub fn validateUserPtrAligned(ptr: usize, len: usize, comptime align_to: usize) 
     return validateUserPtr(ptr, len);
 }
 
+/// validateUserPtr for a WRITE target: additionally guarantees every page in
+/// the range is WRITABLE (breaking COW as needed) so the syscall body can copy
+/// data OUT to the user buffer without a kernel-mode #PF this ring-3-only fault
+/// handler can't service (which panics/halts the box). Use for EVERY syscall
+/// that writes through the pointer — read() dest, stat buf, getcwd, getdents,
+/// gettimeofday, poll revents, the OLD sigaction/sigmask, etc. Read-only args
+/// (path strings, write() source buffers) stay on plain validateUserPtr.
+/// process.ensureUserRangeWritable returns false for a genuinely read-only page
+/// (an app's own .text/.rodata, or an mprotect'd-RO region), so a hostile or
+/// buggy pointer becomes a clean EFAULT instead of a kernel fault. Found by the
+/// redteam fuzzer handing sysGettimeofday a pointer into its read-only code.
+pub fn validateUserPtrWrite(ptr: usize, len: usize) bool {
+    if (!validateUserPtr(ptr, len)) return false;
+    if (len > 0 and !process.ensureUserRangeWritable(ptr, len)) return false;
+    return true;
+}
+
+/// validateUserPtrWrite + alignment check (see validateUserPtrAligned). Use for
+/// write targets cast to `*T` / `[*]T` with `@alignOf(T) > 1`.
+pub fn validateUserPtrWriteAligned(ptr: usize, len: usize, comptime align_to: usize) bool {
+    if (align_to > 1 and ptr & (align_to - 1) != 0) return false;
+    return validateUserPtrWrite(ptr, len);
+}
+
 /// Wrap a kernel-side socket slot in a per-process fd. Used by socket-
 /// allocating syscalls (tcp_connect, tcp_listen, tcp_accept) so userspace
 /// gets a uniform fd back instead of a separate slot namespace. Returns

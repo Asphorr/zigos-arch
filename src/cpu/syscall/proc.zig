@@ -27,6 +27,8 @@ const apic = @import("../../time/apic.zig");
 const common = @import("common.zig");
 const validateUserPtr = common.validateUserPtr;
 const validateUserPtrAligned = common.validateUserPtrAligned;
+const validateUserPtrWrite = common.validateUserPtrWrite;
+const validateUserPtrWriteAligned = common.validateUserPtrWriteAligned;
 const USER_SPACE_START = common.USER_SPACE_START;
 const USER_SPACE_END = common.USER_SPACE_END;
 const E_INVAL = common.E_INVAL;
@@ -478,7 +480,7 @@ pub fn sysExec(name_ptr: u32, name_len: u32) u32 {
 }
 
 pub fn sysGetExecArg(buf_ptr: u32) u32 {
-    if (!validateUserPtr(buf_ptr, 64)) return E_FAULT;
+    if (!validateUserPtrWrite(buf_ptr, 64)) return E_FAULT;
     const pcb = process.currentPCB() orelse return 0;
     if (pcb.argc <= 1) return 0;
     const buf: [*]u8 = @ptrFromInt(@as(usize, buf_ptr));
@@ -507,7 +509,7 @@ pub fn sysGetArgv(idx: u32, buf_ptr: u32, buf_size: u32) u32 {
     const pcb = process.currentPCB() orelse return E_FAULT;
     if (idx >= pcb.argc) return E_INVAL;
     if (buf_size == 0) return E_INVAL;
-    if (!validateUserPtr(buf_ptr, buf_size)) return E_FAULT;
+    if (!validateUserPtrWrite(buf_ptr, buf_size)) return E_FAULT;
     const tok = pcb.argv[idx][0..pcb.arg_lens[idx]];
     const n = @min(tok.len, buf_size);
     const dst: [*]u8 = @ptrFromInt(@as(usize, buf_ptr));
@@ -647,7 +649,7 @@ pub fn sysGetNice(target_pid: u32) u32 {
 /// pid == 0xFFFFFFFF: any child. Otherwise: that exact child only.
 /// Returns 0xFFFFFFFF if there is no such child (or the target isn't ours).
 pub fn sysWaitpid(target_pid: u32, status_ptr: u32) u32 {
-    if (status_ptr != 0 and !validateUserPtr(status_ptr, 4)) return E_INVAL;
+    if (status_ptr != 0 and !validateUserPtrWrite(status_ptr, 4)) return E_INVAL;
     const me_pcb = process.currentPCB() orelse return E_FAULT;
     const me: u8 = @intCast(process.getCurrentPid());
 
@@ -679,7 +681,7 @@ pub fn sysWaitpid(target_pid: u32, status_ptr: u32) u32 {
                 // != 0 guards the cast against null; aligned variant also
                 // catches misaligned u32 (Zig safety panics on @ptrFromInt
                 // to *u32 with non-4-byte-aligned int) and unmapped pages.
-                if (!validateUserPtrAligned(status_ptr, 4, 4)) return E_FAULT;
+                if (!validateUserPtrWriteAligned(status_ptr, 4, 4)) return E_FAULT;
                 const sp: *u32 = @ptrFromInt(@as(usize, status_ptr));
                 sp.* = status;
             }
@@ -722,7 +724,7 @@ pub fn sysSigaction(signum: u32, new_ptr: u32, old_ptr: u32) u32 {
     const slot = &pcb.sigactions[signum];
 
     if (old_ptr != 0) {
-        if (!validateUserPtrAligned(old_ptr, @sizeOf(signals.SigAction), @alignOf(signals.SigAction))) return E_INVAL;
+        if (!validateUserPtrWriteAligned(old_ptr, @sizeOf(signals.SigAction), @alignOf(signals.SigAction))) return E_INVAL;
         const op: *signals.SigAction = @ptrFromInt(@as(usize, old_ptr));
         op.* = slot.*;
     }
@@ -742,7 +744,7 @@ pub fn sysSigaction(signum: u32, new_ptr: u32, old_ptr: u32) u32 {
 pub fn sysSigprocmask(how: u32, set_ptr: u32, old_ptr: u32) u32 {
     const pcb = process.currentPCB() orelse return E_FAULT;
     if (old_ptr != 0) {
-        if (!validateUserPtrAligned(old_ptr, 4, 4)) return E_FAULT;
+        if (!validateUserPtrWriteAligned(old_ptr, 4, 4)) return E_FAULT;
         const op: *u32 = @ptrFromInt(@as(usize, old_ptr));
         op.* = pcb.signal_mask;
     }
@@ -766,12 +768,14 @@ pub fn sysSigprocmask(how: u32, set_ptr: u32, old_ptr: u32) u32 {
 /// **Canonical exemplar for the UserPtr(T) pattern (docs/STYLE.md).**
 /// The user pointer is wrapped at the ABI boundary; direct `*u32`
 /// dereference is no longer reachable — every access goes through
-/// `validate()` + `copyOut()`, which makes "deref unvalidated user
-/// pointer" a type error instead of a runtime SMAP fault.
+/// `validateWrite()` + `copyOut()`, which makes "deref unvalidated user
+/// pointer" a type error instead of a runtime SMAP fault. It's a *write*
+/// target, so it gates on `validateWrite()` (writable-page check); a fuzzer
+/// handing in a read-only .text VA (0x500000) gets E_FAULT, not a ring-0 #PF.
 pub fn sysSigpending(set_ptr: u32) u32 {
     if (set_ptr == 0) return E_INVAL;
     const UserPtr = @import("../../util/user_ptr.zig").UserPtr;
-    const up = UserPtr(u32).fromRaw(set_ptr).validate() orelse return E_FAULT;
+    const up = UserPtr(u32).fromRaw(set_ptr).validateWrite() orelse return E_FAULT;
     const pcb = process.currentPCB() orelse return E_FAULT;
     const value = @atomicLoad(u32, &pcb.pending_signals, .acquire) & pcb.signal_mask;
     up.copyOut(value);
@@ -871,7 +875,7 @@ const ProcInfoUser = extern struct {
 pub fn sysProcessList(buf_ptr: u32, max_entries: u32) u32 {
     const ENTRY_SIZE = @sizeOf(ProcInfoUser);
     if (max_entries == 0 or max_entries > process.MAX_PROCS) return 0;
-    if (!validateUserPtr(buf_ptr, max_entries * ENTRY_SIZE)) return 0;
+    if (!validateUserPtrWrite(buf_ptr, max_entries * ENTRY_SIZE)) return 0;
 
     const dst: [*]u8 = @ptrFromInt(@as(usize, buf_ptr));
     var count: u32 = 0;
@@ -1019,7 +1023,7 @@ pub fn sysExecAs(name_ptr: u32, name_len: u32, remap_ptr: u32) u32 {
 /// Unix epoch seconds; usec is microseconds within the current second.
 /// Returns 0 on success.
 pub fn sysGettimeofday(buf_ptr: u32) u32 {
-    if (!validateUserPtr(buf_ptr, 16)) return E_FAULT;
+    if (!validateUserPtrWrite(buf_ptr, 16)) return E_FAULT;
     const time = @import("../../time/time.zig");
     const t = time.now();
     const out: [*]u8 = @ptrFromInt(@as(usize, buf_ptr));

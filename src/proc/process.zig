@@ -205,6 +205,12 @@ pub const PCB = struct {
     mmap_top: usize = MMAP_TOP_INIT, // (p:as_lock)
     // File descriptor table — owner-pid only
     fd_table: [MAX_FDS]FileDesc = initFdTable(),
+    // ext2 inode this process's executable image was loaded from (0 = none /
+    // not loaded from a regular file). Set by elf_loader.loadAndStart. Read by
+    // isTextBusy to implement ETXTBSY: a write/truncate of a file whose inum
+    // matches a live process's text_inum is refused, so a process can't pull
+    // the rug from under its own (or another's) loader. (2026-06-04)
+    text_inum: u32 = 0, // (c) set once at load
     // Sleep support
     wake_tick: u64 = 0, // (a) sysSleep + sched wakeExpired + virtio_gpu IRQ; cross-CPU readable
     // Hi-res sleep deadline, ABSOLUTE TSC ticks (0 = none). Set by sysUsleep,
@@ -835,6 +841,25 @@ pub fn currentPCB() ?*PCB {
 /// Get mutable pointer to PCB by pid.
 pub fn getPCB(pid: usize) *PCB {
     return &procs[pid];
+}
+
+/// ETXTBSY oracle: is `inum` the executable image of any live process?
+/// Walks procs[] for a slot whose text_inum matches (skipping slots without a
+/// loaded-and-running image: .unused = free, .loading = text not mapped yet,
+/// .zombie = execution already ended). Used by vfs.write and ext2.truncate to
+/// refuse mutating a file that's currently being executed — POSIX ETXTBSY.
+/// Inode-keyed, so path aliases (/bin/redteam.elf vs //bin//redteam.elf)
+/// collapse to the same identity. O(MAX_PROCS) reads, no lock: text_inum is
+/// (c) set-once-at-load, and a single missed/extra write is benign here (the
+/// harness scratch-file fence is the belt to this suspenders). (2026-06-04)
+pub fn isTextBusy(inum: u32) bool {
+    if (inum == 0) return false;
+    for (&procs) |*p| {
+        const st = p.state;
+        if (st == .unused or st == .loading or st == .zombie) continue;
+        if (p.text_inum == inum) return true;
+    }
+    return false;
 }
 
 /// Read the raw u8 state byte for a pid. Used by stack-alias detector and

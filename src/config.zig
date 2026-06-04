@@ -67,6 +67,16 @@ pub const MAX_ARG_LEN: u8 = 32;
 /// signal-frame magic constant — defer until we genuinely need rt-signals.
 pub const NSIG: u32 = 32;
 
+// --- Debug / test backdoors ---
+/// Gates sysDebugCrash (sys#117), the crash-test backdoor crashtest.elf uses
+/// to exercise the panic/dump pipeline (double-free, wild-free, #PF, #GP,
+/// @panic). It deliberately crashes the kernel from ring 3, so leaving it
+/// always-on is a userspace-reachable DoS: any unprivileged process — or a
+/// syscall fuzzer like redteam — can panic the whole OS by calling it. Gated
+/// OFF by default; the syscall returns E_NOSYS so it's indistinguishable from
+/// an unimplemented number. Flip to true only in a crashtest CI image.
+pub const ENABLE_DEBUG_CRASH: bool = false;
+
 // --- Sanity ---
 comptime {
     if (MAX_PROCS < 2) @compileError("MAX_PROCS must be >= 2 (idle + at least one user process)");

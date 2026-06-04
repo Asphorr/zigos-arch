@@ -599,6 +599,11 @@ pub fn write(pcb: *process.PCB, fd: u32, buf: [*]const u8, count: u32) u32 {
         },
         .procfs => return 0xFFFFFFFF, // read-only
         .ext2 => {
+            // ETXTBSY: refuse to overwrite the text image of a live process.
+            // This is the choke-point the fuzzer hit — fwrite-ing into its own
+            // /bin/redteam.elf while running. Inode-keyed, so the //bin//…
+            // path alias is covered too. (2026-06-04)
+            if (process.isTextBusy(fd_entry.inode)) return @import("../proc/errno.zig").err(.ETXTBSY);
             var handle = ext2.Handle{
                 .inum = fd_entry.inode,
                 .file_size = 0, // refreshed by writeFile
@@ -834,11 +839,22 @@ pub fn loadFileFresh(name: []const u8) ?FreshFile {
     const sp = @import("../debug/syscall_perf.zig").scope(.disk_read);
     defer sp.end();
     const t0 = perf.rdtsc();
-    const size = fileSize(name) orelse return null;
+    const size = fileSize(name) orelse {
+        // [probe] which loadFileFresh early-exit fired — temporary diagnostic
+        // for the redteam "can't re-launch its own inode" investigation.
+        serial.print("[loadFresh-fail] {s}: fileSize -> null (name unresolvable / inode unreadable / not-regular)\n", .{name});
+        return null;
+    };
     const t1 = perf.rdtsc();
-    if (size == 0) return null;
+    if (size == 0) {
+        serial.print("[loadFresh-fail] {s}: size == 0\n", .{name});
+        return null;
+    }
     const pages: u32 = @intCast((@as(usize, size) + 4095) / 4096);
-    const phys = pmm.allocContiguous(pages) orelse return null;
+    const phys = pmm.allocContiguous(pages) orelse {
+        serial.print("[loadFresh-fail] {s}: allocContiguous({d} pages) -> null  (free={d} frames; fragmentation iff free >> pages)\n", .{ name, pages, pmm.freeFrameCount() });
+        return null;
+    };
     const t2 = perf.rdtsc();
     // Reach the PMM-allocated buffer through the kernel physmap.
     const buf: [*]align(4) u8 = @ptrFromInt(paging.physToVirt(phys));
@@ -883,6 +899,9 @@ pub fn loadFileFresh(name: []const u8) ?FreshFile {
             },
         );
         if (got == size) return .{ .buf = buf, .size = size, .pages = pages, .inode = inode_out };
+        serial.print("[loadFresh-fail] {s}: short read got={d} != size={d} (inode={d}) — data blocks unreadable\n", .{ name, got, size, inode_out });
+    } else {
+        serial.print("[loadFresh-fail] {s}: loadFile -> null (inode/blocks unreadable)\n", .{name});
     }
     pmm.freeRange(phys, @intCast(pages));
     return null;

@@ -27,6 +27,8 @@ const apic = @import("../../time/apic.zig");
 const common = @import("common.zig");
 const validateUserPtr = common.validateUserPtr;
 const validateUserPtrAligned = common.validateUserPtrAligned;
+const validateUserPtrWrite = common.validateUserPtrWrite;
+const validateUserPtrWriteAligned = common.validateUserPtrWriteAligned;
 const USER_SPACE_START = common.USER_SPACE_START;
 const USER_SPACE_END = common.USER_SPACE_END;
 const E_INVAL = common.E_INVAL;
@@ -129,7 +131,7 @@ pub fn sysGetKeyState(arg1: u32) u32 {
 /// poll_event (apps must pick one — mixing both will lose events).
 pub fn sysPollEvent(buf_ptr: u32) u32 {
     if (buf_ptr == 0) return 0;
-    if (!validateUserPtrAligned(buf_ptr, @sizeOf(desktop.Event), @alignOf(desktop.Event))) return 0;
+    if (!validateUserPtrWriteAligned(buf_ptr, @sizeOf(desktop.Event), @alignOf(desktop.Event))) return 0;
     var ev: desktop.Event = .{ .kind = 0 };
     const cur: u8 = @intCast(process.getCurrentPid());
     if (!desktop.popEvent(cur, &ev)) return 0;
@@ -426,7 +428,7 @@ pub fn sysPresent() u32 {
 }
 
 pub fn sysGetMouse(buf_ptr: u32) u32 {
-    if (!validateUserPtrAligned(buf_ptr, 20, 4)) return E_FAULT; // 5 u32s = 20 bytes
+    if (!validateUserPtrWriteAligned(buf_ptr, 20, 4)) return E_FAULT; // 5 u32s = 20 bytes
     const pid: u8 = @intCast(process.getCurrentPid());
     const buf: [*]u32 = @ptrFromInt(@as(usize, buf_ptr));
     desktop.getMouseRelative(pid, buf);
@@ -457,7 +459,7 @@ pub fn sysDestroyWindow() u32 {
 }
 
 pub fn sysGetScreenSize(buf_ptr: u32) u32 {
-    if (!validateUserPtrAligned(buf_ptr, 8, 4)) return E_FAULT;
+    if (!validateUserPtrWriteAligned(buf_ptr, 8, 4)) return E_FAULT;
     const buf: [*]u32 = @ptrFromInt(@as(usize, buf_ptr));
     const gfx = @import("../../ui/gfx.zig");
     buf[0] = gfx.screen_w;
@@ -466,7 +468,7 @@ pub fn sysGetScreenSize(buf_ptr: u32) u32 {
 }
 
 pub fn sysGetWindowSize(buf_ptr: u32) u32 {
-    if (!validateUserPtrAligned(buf_ptr, 8, 4)) return E_FAULT;
+    if (!validateUserPtrWriteAligned(buf_ptr, 8, 4)) return E_FAULT;
     const buf: [*]u32 = @ptrFromInt(@as(usize, buf_ptr));
     const pid: u8 = @intCast(process.getCurrentPid());
     desktop.getWindowContentSize(pid, buf);
@@ -479,7 +481,7 @@ pub fn sysGetWindowSize(buf_ptr: u32) u32 {
 /// rebuild its canvas at the new stride and render crisply. buf[0]=alloc_w,
 /// buf[1]=alloc_h.
 pub fn sysGetWindowAlloc(buf_ptr: u32) u32 {
-    if (!validateUserPtrAligned(buf_ptr, 8, 4)) return E_FAULT;
+    if (!validateUserPtrWriteAligned(buf_ptr, 8, 4)) return E_FAULT;
     const buf: [*]u32 = @ptrFromInt(@as(usize, buf_ptr));
     const pid: u8 = @intCast(process.getCurrentPid());
     desktop.getWindowAllocSize(pid, buf);
@@ -518,7 +520,7 @@ pub fn sysGetClipboard(buf_ptr: u32, max_len: u32) u32 {
     // narrow re-eviction window as set: memcpy can page-fault if a peer
     // CPU evicts between validate and copy; tolerated project-wide.
     const cap = @min(max_len, CLIPBOARD_MAX);
-    if (!validateUserPtr(buf_ptr, cap)) return E_FAULT;
+    if (!validateUserPtrWrite(buf_ptr, cap)) return E_FAULT;
     clipboard_lock.acquire();
     defer clipboard_lock.release();
     const actual = clipboard_len;

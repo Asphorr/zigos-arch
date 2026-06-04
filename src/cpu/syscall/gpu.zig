@@ -27,6 +27,8 @@ const apic = @import("../../time/apic.zig");
 const common = @import("common.zig");
 const validateUserPtr = common.validateUserPtr;
 const validateUserPtrAligned = common.validateUserPtrAligned;
+const validateUserPtrWrite = common.validateUserPtrWrite;
+const validateUserPtrWriteAligned = common.validateUserPtrWriteAligned;
 const USER_SPACE_START = common.USER_SPACE_START;
 const USER_SPACE_END = common.USER_SPACE_END;
 const E_INVAL = common.E_INVAL;
@@ -45,6 +47,17 @@ const E_CHILD = common.E_CHILD;
 const E_INTR = common.E_INTR;
 
 var next_gpu_ctx_id: u32 = 1;
+
+/// Hard ceiling on a single user-requested HOST GPU blob (sysGpuCreateBlob /
+/// sysGpuMapBlob). The host venus pool is `hostmem=256M`; a single blob at or
+/// near that size is abuse, not a real app — the fuzzer asked for 1 GiB
+/// (size=0x40000000), which the host UNSPEC-rejected and which, repeated,
+/// helped poison the shared renderer and kill the display. Real venus apps
+/// allocate much smaller individual blobs. sysGpuCreateGuestBlob already caps
+/// itself at 32 MB; this is the matching bound the host-blob path was missing.
+/// NOT a substitute for real per-process GPU resource isolation (deferred) —
+/// just stops the gross memory-DoS. (2026-06-04)
+const GPU_BLOB_MAX_SIZE: u32 = 256 * 1024 * 1024;
 
 pub fn sysGpuCtxCreate(capset_id: u32) u32 {
     const virtio_gpu = @import("../../driver/virtio_gpu.zig");
@@ -106,7 +119,7 @@ pub fn sysGpuCtxDestroy() u32 {
 
 pub fn sysGpuGetCapsetInfo(index: u32, buf_ptr: u32) u32 {
     // Returns [capset_id: u32, max_version: u32, max_size: u32] to user buffer
-    if (!validateUserPtrAligned(buf_ptr, 12, 4)) {
+    if (!validateUserPtrWriteAligned(buf_ptr, 12, 4)) {
         debug.klog("[gpu] capset_info[{d}] FAIL: bad user ptr 0x{X}\n", .{ index, buf_ptr });
         return E_INVAL;
     }
@@ -150,6 +163,9 @@ pub fn sysGpuGetCapsetInfo(index: u32, buf_ptr: u32) u32 {
 pub fn sysGpuCreateBlob(blob_mem: u32, size: u32, blob_id_arg: u32) u32 {
     const virtio_gpu = @import("../../driver/virtio_gpu.zig");
     if (!virtio_gpu.has_blob) return E_INVAL;
+    // Bound the host allocation — see GPU_BLOB_MAX_SIZE. Without this a 1 GiB
+    // request reaches the host renderer and pressures the shared venus pool.
+    if (size == 0 or size > GPU_BLOB_MAX_SIZE) return E_INVAL;
 
     const pcb = process.currentPCB() orelse return E_FAULT;
     if (!pcb.gpu_has_ctx) return E_INVAL;
@@ -175,6 +191,10 @@ pub fn sysGpuMapBlob(resource_id: u32, size: u32) u32 {
         debug.klog("[gpu] mapBlob: no blob support\n", .{});
         return E_INVAL;
     }
+    // Bound the map — sysGpuMapBlob maps `size` bytes (kernel WB + user_brk
+    // pages), so an unclamped size balloons the page tables and user_brk. Match
+    // the create cap; a legit map never exceeds the blob it created.
+    if (size == 0 or size > GPU_BLOB_MAX_SIZE) return E_INVAL;
 
     const pcb = process.currentPCB() orelse return E_FAULT;
     if (!pcb.gpu_has_ctx) return E_INVAL;
@@ -243,7 +263,7 @@ pub fn sysGpuCreateGuestBlob(size: u32, out_resource_id_ptr: u32) u32 {
     const virtio_gpu = @import("../../driver/virtio_gpu.zig");
     if (!virtio_gpu.has_blob) return E_INVAL;
     if (size == 0 or size > 32 * 1024 * 1024) return E_INVAL;
-    if (!validateUserPtrAligned(out_resource_id_ptr, 4, 4)) return E_FAULT;
+    if (!validateUserPtrWriteAligned(out_resource_id_ptr, 4, 4)) return E_FAULT;
 
     const pcb = process.currentPCB() orelse return E_FAULT;
     if (!pcb.gpu_has_ctx) return E_INVAL;

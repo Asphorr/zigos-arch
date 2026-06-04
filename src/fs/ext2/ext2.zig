@@ -627,6 +627,10 @@ fn dirRemove(m: *block.Mount, dir_ino: *layout.Inode, name: []const u8) bool {
 /// AND occupies zero physical blocks — the next write re-allocates via
 /// ensurePhysicalBlock. Used by VFS open(O_TRUNC) and (future) unlink.
 pub fn truncate(inum: u32) bool {
+    // ETXTBSY: never truncate the text image of a running process. Covers both
+    // O_TRUNC-on-open (vfs.openFlags) and any explicit ftruncate. This is the
+    // path that took redteam.elf to size 0 and bricked its reload. (2026-06-04)
+    if (@import("../../proc/process.zig").isTextBusy(inum)) return false;
     const m = block.getMount() orelse return false;
     var ino = inode.readInode(inum) orelse return false;
     if (!inode.isReg(&ino)) return false;
@@ -643,9 +647,15 @@ pub fn truncate(inum: u32) bool {
 }
 
 pub fn fileSize(path: []const u8) ?u64 {
-    const inum = cachedWalk(path) orelse return null;
-    const ino = inode.readInode(inum) orelse return null;
-    if (!inode.isReg(&ino)) return null;
+    const inum = cachedWalk(path) orelse return null; // genuinely-absent (e.g. tarfs file) — stay silent
+    const ino = inode.readInode(inum) orelse {
+        debug.klog("[ext2-fail] fileSize {s}: inum={d} readInode->null (inode-table block unreadable)\n", .{ path, inum });
+        return null;
+    };
+    if (!inode.isReg(&ino)) {
+        debug.klog("[ext2-fail] fileSize {s}: inum={d} not-a-regular-file (mode corrupt?)\n", .{ path, inum });
+        return null;
+    }
     return inode.fileSize(&ino);
 }
 
@@ -661,13 +671,20 @@ pub fn loadFile(path: []const u8, dest: []align(4) u8) ?usize {
 /// second `cachedWalk` diverging to a different file.
 pub fn loadFileInum(path: []const u8, dest: []align(4) u8) ?struct { size: usize, inum: u32 } {
     const inum = cachedWalk(path) orelse return null;
-    const ino = inode.readInode(inum) orelse return null;
-    if (!inode.isReg(&ino)) return null;
+    const ino = inode.readInode(inum) orelse {
+        debug.klog("[ext2-fail] loadFileInum {s}: inum={d} readInode->null (inode-table block unreadable)\n", .{ path, inum });
+        return null;
+    };
+    if (!inode.isReg(&ino)) {
+        debug.klog("[ext2-fail] loadFileInum {s}: inum={d} not-a-regular-file (mode corrupt?)\n", .{ path, inum });
+        return null;
+    }
     const sz = inode.fileSize(&ino);
     // `sz` is an untrusted on-disk size — clamp to the caller's buffer so we
     // never write past `dest`.
     const want: usize = @intCast(@min(sz, @as(u64, dest.len)));
     const got = inode.readInodeBytes(inum, 0, dest[0..want]);
+    if (got != want) debug.klog("[ext2-fail] loadFileInum {s}: inum={d} short block read got={d} want={d} (on-disk size={d})\n", .{ path, inum, got, want, sz });
     return .{ .size = got, .inum = inum };
 }
 

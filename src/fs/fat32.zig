@@ -281,7 +281,11 @@ fn ensureFATCached(sector: u32) void {
     const base = sector & ~@as(u32, FAT_CACHE_SECTORS - 1); // align to 8-sector boundary
     if (cached_fat_base == base) return;
     flushFATCache();
-    ata.readSectorsSecondary(base, FAT_CACHE_SECTORS, &fat_cache);
+    // block.readSectorsSecondary became bool for the ext2 "garbage ELF" BUG 2
+    // fix; fat32 keeps its prior swallow-on-read behavior here (explicit `_ =`).
+    // Propagating EIO through fat32's read paths is a separate follow-up — fat32
+    // is dormant in the NVMe config and not part of that bug.
+    _ = ata.readSectorsSecondary(base, FAT_CACHE_SECTORS, &fat_cache);
     cached_fat_base = base;
 }
 
@@ -309,7 +313,7 @@ fn ensureDirCached(dir_cluster: u32, sector_in_cluster: u32) void {
 
     const lba = clusterToLBA(dir_cluster) + base_sector;
     const sectors_to_read = @min(DIR_CACHE_SECTORS, sectors_per_cluster - base_sector);
-    ata.readSectorsSecondary(lba, @intCast(sectors_to_read), &dir_cache);
+    _ = ata.readSectorsSecondary(lba, @intCast(sectors_to_read), &dir_cache);
 
     cached_dir_cluster = dir_cluster;
     cached_dir_sector = base_sector;
@@ -867,7 +871,7 @@ pub fn readFileAt(handle: Handle, buf: [*]u8, count: u32, cached_cluster: u32, c
             }
 
             const total_sectors: u8 = @intCast(run_clusters * sectors_per_cluster);
-            ata.readSectorsSecondary(lba, total_sectors, buf + bytes_read);
+            _ = ata.readSectorsSecondary(lba, total_sectors, buf + bytes_read);
             bytes_read += run_clusters * cluster_size;
             cluster = readFATEntry(run_tail);
             cluster_base += run_clusters * cluster_size;

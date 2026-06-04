@@ -800,6 +800,13 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp, persist_shared_dirty: 
     // the ring. Safe post-kill: a late CQE hits reapCq's orphan branch.
     @import("../driver/nvme.zig").reclaimWaitersForPid(@intCast(pid));
 
+    // The per-mount ext2 block-cache lock (sleeping) can likewise be held by a
+    // thread killed while blocked on NVMe I/O inside readBlock/writeBlock. Left
+    // stranded, the whole filesystem deadlocks (every later ext2 op sleeps on
+    // the dead owner forever). Release it here, mirroring the NVMe reclaim above.
+    // (2026-06-04 SMP ext2 on-disk-corruption fix.)
+    @import("../fs/ext2/block.zig").releaseLockIfHeld(@intCast(pid));
+
     // io_uring instances owned by this pid: free the slot-table entries.
     // The underlying ring memory is freed by the LazyRegion shm.release in
     // the per-AS cleanup below; this just recycles the kernel bookkeeping.

@@ -27,6 +27,8 @@ const apic = @import("../../time/apic.zig");
 const common = @import("common.zig");
 const validateUserPtr = common.validateUserPtr;
 const validateUserPtrAligned = common.validateUserPtrAligned;
+const validateUserPtrWrite = common.validateUserPtrWrite;
+const validateUserPtrWriteAligned = common.validateUserPtrWriteAligned;
 const USER_SPACE_START = common.USER_SPACE_START;
 const USER_SPACE_END = common.USER_SPACE_END;
 const E_INVAL = common.E_INVAL;
@@ -62,7 +64,7 @@ const NetInfo = extern struct {
 };
 
 pub fn sysNetInfo(buf_ptr: u32) u32 {
-    if (!validateUserPtrAligned(buf_ptr, @sizeOf(NetInfo), @alignOf(NetInfo))) return E_FAULT;
+    if (!validateUserPtrWriteAligned(buf_ptr, @sizeOf(NetInfo), @alignOf(NetInfo))) return E_FAULT;
     const net = @import("../../net/net.zig");
     const nic = @import("../../driver/nic.zig");
     const info: *NetInfo = @ptrFromInt(@as(usize, buf_ptr));
@@ -88,7 +90,7 @@ pub fn sysNetInfo(buf_ptr: u32) u32 {
 pub fn sysNetResolve(host_ptr: u32, host_len: u32, ip_out_ptr: u32) u32 {
     if (host_len == 0 or host_len > 255) return E_NAMETOOLONG;
     if (!validateUserPtr(host_ptr, host_len)) return E_FAULT;
-    if (!validateUserPtr(ip_out_ptr, 4)) return E_FAULT;
+    if (!validateUserPtrWrite(ip_out_ptr, 4)) return E_FAULT;
 
     var hbuf: [256]u8 = undefined;
     const src: [*]const u8 = @ptrFromInt(@as(usize, host_ptr));
@@ -118,7 +120,7 @@ pub fn sysNetHttpGet(url_ptr: u32, url_len: u32, req_ptr: u32) u32 {
     if (!validateUserPtrAligned(req_ptr, @sizeOf(HttpReq), @alignOf(HttpReq))) return E_FAULT;
     const req: *const HttpReq = @ptrFromInt(@as(usize, req_ptr));
     if (req.buf_len == 0 or req.buf_len > 1024 * 1024) return E_INVAL;
-    if (!validateUserPtr(req.buf_ptr, req.buf_len)) return E_FAULT;
+    if (!validateUserPtrWrite(req.buf_ptr, req.buf_len)) return E_FAULT;
 
     var url_buf: [1024]u8 = undefined;
     const url_src: [*]const u8 = @ptrFromInt(@as(usize, url_ptr));
@@ -183,7 +185,7 @@ pub fn sysNetTcpSend(fd: u32, buf_ptr: u32, buf_len: u32) u32 {
 pub fn sysNetTcpRecv(fd: u32, buf_ptr: u32, buf_len: u32) u32 {
     if (buf_len == 0) return 0;
     if (buf_len > 64 * 1024) return 0;
-    if (!validateUserPtr(buf_ptr, buf_len)) return 0;
+    if (!validateUserPtrWrite(buf_ptr, buf_len)) return 0;
 
     const cur = smp.myCpu().current_pid orelse return 0;
     const pcb = &process.procs[cur];
@@ -306,7 +308,7 @@ pub fn sysTlsSend(slot: u32, buf_ptr: u32, buf_len: u32) u32 {
 pub fn sysTlsRecv(slot: u32, buf_ptr: u32, buf_len: u32) u32 {
     if (slot > 255) return E_INVAL;
     if (buf_len == 0) return 0;
-    if (!validateUserPtr(buf_ptr, buf_len)) return E_FAULT;
+    if (!validateUserPtrWrite(buf_ptr, buf_len)) return E_FAULT;
     const buf: [*]u8 = @ptrFromInt(@as(usize, buf_ptr));
     const got = tls_conn.tlsRecv(@intCast(slot), buf[0..buf_len]);
     if (got < 0) return E_INVAL;

@@ -28,6 +28,8 @@ const random = @import("../../crypto/random.zig");
 const common = @import("common.zig");
 const validateUserPtr = common.validateUserPtr;
 const validateUserPtrAligned = common.validateUserPtrAligned;
+const validateUserPtrWrite = common.validateUserPtrWrite;
+const validateUserPtrWriteAligned = common.validateUserPtrWriteAligned;
 const USER_SPACE_START = common.USER_SPACE_START;
 const USER_SPACE_END = common.USER_SPACE_END;
 const E_INVAL = common.E_INVAL;
@@ -62,7 +64,7 @@ pub fn sysAudioWrite(buf_ptr: u32, num_samples: u32) u32 {
 pub fn sysGetRandom(buf_ptr: u32, len: u32) u32 {
     if (len == 0) return 0;
     if (len > (1 << 20)) return E_INVAL; // 1 MiB sanity cap
-    if (!validateUserPtr(buf_ptr, len)) return E_FAULT;
+    if (!validateUserPtrWrite(buf_ptr, len)) return E_FAULT;
     const dst: [*]u8 = @ptrFromInt(@as(usize, buf_ptr));
     _ = random.fillRandom(dst[0..len]);
     return len;
@@ -98,7 +100,7 @@ pub fn sysSetConfig(key: u32, value: u32) u32 {
 }
 
 pub fn sysMeminfo(buf_ptr: u32) u32 {
-    if (!validateUserPtrAligned(buf_ptr, 8, 4)) return E_FAULT;
+    if (!validateUserPtrWriteAligned(buf_ptr, 8, 4)) return E_FAULT;
     const buf: [*]u32 = @ptrFromInt(@as(usize, buf_ptr));
     buf[0] = pmm.freeFrameCount();
     buf[1] = pmm.managedFrameCount();
@@ -125,7 +127,7 @@ pub fn sysCpuStats(buf_ptr: u32, max_cpus: u32) u32 {
     // capping here costs nothing for honest callers.
     const clamped: u32 = if (max_cpus > smp.MAX_CPUS) smp.MAX_CPUS else max_cpus;
     const byte_len: u32 = clamped * @sizeOf(CpuStat);
-    if (!validateUserPtrAligned(buf_ptr, byte_len, @alignOf(CpuStat))) return E_FAULT;
+    if (!validateUserPtrWriteAligned(buf_ptr, byte_len, @alignOf(CpuStat))) return E_FAULT;
     const buf: [*]CpuStat = @ptrFromInt(@as(usize, buf_ptr));
     var written: u32 = 0;
     for (&smp.cpus) |*c| {
@@ -246,7 +248,7 @@ const UsbInfoUser = extern struct {
 /// MSC device is connected. Either way the struct is zero-initialised first
 /// so callers can read `present` to be sure.
 pub fn sysUsbInfo(info_ptr: u32) u32 {
-    if (!validateUserPtrAligned(info_ptr, @sizeOf(UsbInfoUser), @alignOf(UsbInfoUser))) return E_INVAL;
+    if (!validateUserPtrWriteAligned(info_ptr, @sizeOf(UsbInfoUser), @alignOf(UsbInfoUser))) return E_INVAL;
     const dst: *UsbInfoUser = @ptrFromInt(@as(usize, info_ptr));
     dst.* = .{ .present = 0, .block_size = 0, .block_count = 0 };
     if (!xhci.usbBlockPresent()) return E_INVAL;
@@ -267,7 +269,7 @@ pub fn sysUsbReadSector(lba: u32, buf_ptr: u32) u32 {
     if (!xhci.usbBlockPresent()) return E_INVAL;
     const block_size = xhci.usbBlockSize();
     if (block_size == 0 or block_size > 4096) return E_INVAL;
-    if (!validateUserPtr(buf_ptr, block_size)) return E_FAULT;
+    if (!validateUserPtrWrite(buf_ptr, block_size)) return E_FAULT;
     const buf: [*]u8 = @ptrFromInt(@as(usize, buf_ptr));
     if (!xhci.usbReadSectors(lba, 1, buf)) return E_INVAL;
     return 0;
@@ -304,6 +306,11 @@ pub fn sysUsbWriteSector(lba: u32, buf_ptr: u32) u32 {
 /// Returns 0xFFFFFFFF for unknown variant (the others never return —
 /// they trigger panic which halts the system).
 pub fn sysDebugCrash(variant: u32) u32 {
+    // Deliberate kernel-crash backdoor — compile-gated off so a normal app (or
+    // a syscall fuzzer) can't panic the OS at will. See config.ENABLE_DEBUG_CRASH.
+    // When disabled it's indistinguishable from an unimplemented syscall.
+    if (!config.ENABLE_DEBUG_CRASH) return E_NOSYS;
+
     const heap = @import("../../mm/heap.zig");
     debug.klog("[crashtest] sysDebugCrash variant={d}\n", .{variant});
 

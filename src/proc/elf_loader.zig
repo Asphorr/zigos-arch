@@ -501,6 +501,10 @@ pub fn loadAndStart(elf_buf: [*]align(4) u8, file_size: usize, elf_buf_pages: u3
     pcb.elf_buf = elf_buf;
     pcb.elf_buf_pages = elf_buf_pages;
     pcb.stack_base = stack_base;
+    // Record the source inode for ETXTBSY: while this process is live, writes
+    // and truncates of this same file are refused (process.isTextBusy). 0 for
+    // tarfs/non-regular loads (inum is an ext2 identity); harmless there.
+    pcb.text_inum = inode;
     // ABI personality: EI_OSABI (e_ident[7]) == ELFOSABI_LINUX (3) marks an
     // unmodified Linux x86-64 binary, so its `syscall`s route to the Linux
     // translation layer (syscall/linux.zig). Native zigos ELFs have OSABI 0.
@@ -613,6 +617,7 @@ pub fn loadAndExecute(elf_buf: [*]align(4) u8, file_size: usize, elf_buf_pages: 
     pcb.elf_buf = elf_buf;
     pcb.elf_buf_pages = elf_buf_pages;
     pcb.stack_base = stack_base;
+    pcb.text_inum = inode; // ETXTBSY — see loadAndStart
     // ABI personality (see loadAndStart): Linux OSABI(3) → Linux syscall layer.
     pcb.personality = if (header.ident[7] == 3) .linux else .native;
 
