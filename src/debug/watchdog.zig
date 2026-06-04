@@ -32,11 +32,31 @@ const apic = @import("../time/apic.zig");
 
 /// Ticks between peer checks. 100 Hz IRQ0 × 100 ticks = 1 second.
 const WATCHDOG_CHECK_INTERVAL: u64 = 100;
-/// Consecutive missed checks before declaring a wedge.
+/// Consecutive missed checks before we SUSPECT a wedge (~3s frozen).
 const WATCHDOG_STRIKES: u8 = 3;
+/// Once suspect, how many more 1s windows we wait for the peer's tick to
+/// RESUME before declaring a genuine wedge and halting. A host vCPU pause /
+/// long SMI / live-migration stall always resumes once the host reschedules
+/// us; only a real cli-wedge stays frozen. Generous when the peer holds no
+/// lock (host-pause very likely, system keeps running degraded meanwhile);
+/// short when it holds a cli-lock (a real wedge there risks deadlock-
+/// propagating to the watcher before it can autopsy).
+const WATCHDOG_GRACE_FREE: u8 = 7; // ~10s total before halting a lockless freeze
+const WATCHDOG_GRACE_LOCKED: u8 = 2; // ~5s total when a cli-lock is held
 
 var armed: bool = false;
 var fired: bool = false;
+
+// Per-watcher host-pause discrimination state, indexed by the WATCHING cpu's
+// id. Lives here rather than in CpuLocal because that struct's field layout is
+// cache-line-sensitive (tss.rsp0 must not straddle a line — see the comptime
+// check in smp.zig) and adding fields to it perturbs that. After a peer is
+// frozen WATCHDOG_STRIKES checks we don't halt — we SUSPECT and watch whether
+// its tick RESUMES (host vCPU pause / long SMI → always does) vs stays frozen
+// (genuine cli-wedge → halt). suspect_tick = the frozen value we wait to move.
+var wd_suspecting: [smp.MAX_CPUS]bool = [_]bool{false} ** smp.MAX_CPUS;
+var wd_suspect_tick: [smp.MAX_CPUS]u64 = [_]u64{0} ** smp.MAX_CPUS;
+var wd_suspect_age: [smp.MAX_CPUS]u8 = [_]u8{0} ** smp.MAX_CPUS;
 
 /// Enable the watchdog. Call after smp.init() so peer CPUs exist. No-op
 /// before that; the per-CPU tick fields default to 0, and a freshly-zeroed
@@ -82,10 +102,44 @@ pub fn peerCheck(self: *smp.CpuLocal) void {
     {
         self.watchdog_peer_last_tick = peer.irq_tick_count;
         self.watchdog_peer_strikes = 0;
+        wd_suspecting[self.cpu_id] = false;
+        wd_suspect_age[self.cpu_id] = 0;
         return;
     }
 
     const peer_tick = @atomicLoad(u64, &peer.irq_tick_count, .acquire);
+
+    // ---- SUSPECT mode: we flagged this peer ~3s ago and are probing whether
+    // it's a host vCPU pause (its tick will resume) or a real cli-wedge (it
+    // never will). The tick-resume test is the only fully reliable
+    // discriminator — a descheduled vCPU ALWAYS resumes once the host
+    // reschedules it; a wedged CPU never does. (Same blind spot the [smi]
+    // classifier had: "peer not ticking" ≠ "peer wedged".)
+    if (wd_suspecting[self.cpu_id]) {
+        if (peer_tick != wd_suspect_tick[self.cpu_id]) {
+            const frozen_s: u32 = @as(u32, WATCHDOG_STRIKES) + wd_suspect_age[self.cpu_id];
+            serial.print("[watchdog] cpu{d} RESUMED after ~{d}s frozen (tick advanced) — host vCPU pause / long SMI, NOT a guest wedge; not halting\n", .{ peer.cpu_id, frozen_s });
+            wd_suspecting[self.cpu_id] = false;
+            wd_suspect_age[self.cpu_id] = 0;
+            self.watchdog_peer_last_tick = peer_tick;
+            self.watchdog_peer_strikes = 0;
+            return;
+        }
+        // Still frozen. Wait up to the grace window — shorter if the peer is
+        // sitting on a cli-lock (a real wedge there can propagate to us).
+        wd_suspect_age[self.cpu_id] +|= 1;
+        const grace: u8 = if (@import("../proc/spinlock.zig").cpuHoldsAnyLock(peer.cpu_id))
+            WATCHDOG_GRACE_LOCKED
+        else
+            WATCHDOG_GRACE_FREE;
+        if (wd_suspect_age[self.cpu_id] < grace) return;
+        // Never resumed through the full grace window → genuine wedge.
+        // Race-free single-fire via CAS: first detector dumps, others bail.
+        if (@cmpxchgStrong(bool, &fired, false, true, .acq_rel, .acquire) != null) return;
+        fire(self, peer);
+        return;
+    }
+
     if (peer_tick != self.watchdog_peer_last_tick) {
         // Peer made progress since last check. Reset strikes.
         self.watchdog_peer_last_tick = peer_tick;
@@ -97,11 +151,13 @@ pub fn peerCheck(self: *smp.CpuLocal) void {
     self.watchdog_peer_strikes +|= 1;
     if (self.watchdog_peer_strikes < WATCHDOG_STRIKES) return;
 
-    // Threshold crossed — wedge confirmed. Race-free single-fire via
-    // compare-exchange: only the first CPU to detect dumps; others bail.
-    if (@cmpxchgStrong(bool, &fired, false, true, .acq_rel, .acquire) != null) return;
-
-    fire(self, peer);
+    // ~3s frozen. DON'T halt yet — a host vCPU pause looks identical here.
+    // Enter SUSPECT; the resume probe above decides on the next checks.
+    wd_suspecting[self.cpu_id] = true;
+    wd_suspect_tick[self.cpu_id] = peer_tick;
+    wd_suspect_age[self.cpu_id] = 0;
+    const locked = @import("../proc/spinlock.zig").cpuHoldsAnyLock(peer.cpu_id);
+    serial.print("\n[watchdog] cpu{d} tick frozen ~{d}s (holds_lock={any}) — probing host-pause vs wedge before halting\n", .{ peer.cpu_id, WATCHDOG_STRIKES, locked });
 }
 
 fn nextAlivePeer(self: *smp.CpuLocal) ?*smp.CpuLocal {

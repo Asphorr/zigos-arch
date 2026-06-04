@@ -168,6 +168,7 @@ pub fn create(entry: usize, user_stack: usize) ?usize {
 
     process.procs[i].kernel_esp = stack_top - TOTAL_BYTES;
     process.procs[i].kernel_stack_top = stack_top;
+    process.plantStackCanary(i); // P4: plant base canary BEFORE publishing the slot runnable
     @atomicStore(usize, &process.expected_kstack_tops[i], stack_top, .release);
     // state already .loading from allocSlot's CAS — no further write needed.
     process.procs[i].tgid = @intCast(i);
@@ -284,6 +285,7 @@ pub fn cloneCurrent(entry: usize, stack_top: usize, arg: usize, fs_base: u64) ?u
 
     process.procs[i].kernel_esp = kstack_top - TOTAL_BYTES;
     process.procs[i].kernel_stack_top = kstack_top;
+    process.plantStackCanary(i); // P4: plant base canary BEFORE publishing the slot runnable
     @atomicStore(usize, &process.expected_kstack_tops[i], kstack_top, .release);
     // Atomic transition .loading → .ready. Callers of cloneCurrent expect
     // the new PCB to be schedulable immediately (no separate "ready" step
@@ -453,6 +455,7 @@ pub fn forkCurrent(frame: *signals.SyscallFrame) ?usize {
 
     process.procs[i].kernel_esp = kstack_top - TOTAL_BYTES;
     process.procs[i].kernel_stack_top = kstack_top;
+    process.plantStackCanary(i); // P4: plant base canary BEFORE publishing the slot runnable
     @atomicStore(usize, &process.expected_kstack_tops[i], kstack_top, .release);
     process.assignInitialCpu(i);
     process.setState(i, .ready);
@@ -520,6 +523,7 @@ pub fn createKernelIdle(cpu_id: u8) ?usize {
 
     process.procs[i].kernel_esp = stack_top - FRAME_BYTES;
     process.procs[i].kernel_stack_top = stack_top;
+    process.plantStackCanary(i); // P4: plant base canary BEFORE publishing the slot runnable
     @atomicStore(usize, &process.expected_kstack_tops[i], stack_top, .release);
     process.procs[i].is_idle = true;
     process.procs[i].idle_cpu = cpu_id;
@@ -608,6 +612,7 @@ pub fn createKernelTask(
 
     process.procs[i].kernel_esp = stack_top - FRAME_BYTES;
     process.procs[i].kernel_stack_top = stack_top;
+    process.plantStackCanary(i); // P4: plant base canary BEFORE publishing the slot runnable
     @atomicStore(usize, &process.expected_kstack_tops[i], stack_top, .release);
     process.procs[i].is_idle = false;
     process.procs[i].pinned_cpu = cpu_id;

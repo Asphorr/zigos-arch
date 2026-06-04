@@ -274,7 +274,7 @@ fn report(addr: usize, size: usize, is_write: bool, tag: u8) void {
     {
         const process = @import("../proc/process.zig");
         const pool_base = @intFromPtr(&process.kstack_pool[0]);
-        const pool_end = pool_base + @sizeOf(@TypeOf(process.kstack_pool));
+        const pool_end = pool_base + process.KSTACK_POOL_BYTES;
         if (addr >= pool_base and addr < pool_end) {
             const slot_size = @sizeOf(@TypeOf(process.kstack_pool[0]));
             const slot_idx = (addr - pool_base) / slot_size;

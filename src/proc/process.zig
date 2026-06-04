@@ -57,14 +57,29 @@ const INIT_CWD: [256]u8 = blk: {
     break :blk c;
 };
 
-// Per-process kernel stack pool. Each slot is `[guard 4KB | stack 16KB ↑]`,
+// Per-process kernel stack pool. Each slot is `[guard 4KB | stack 64KB ↑]`,
 // 4KB-aligned so paging.installGuardPage can mark slot[0..4096] not-present.
-// Static (BSS) so the addresses are stable from boot — guards must be planted
-// before any user process exists (createAddressSpace copies kernel PD entries
-// by value; later splits would leave older processes with stale huge-page
-// entries). Pool slot i ↔ procs[i].
-pub var kstack_pool: [MAX_PROCS][KSTACK_SLOT_SIZE]u8 align(4096) =
-    [_][KSTACK_SLOT_SIZE]u8{[_]u8{0} ** KSTACK_SLOT_SIZE} ** MAX_PROCS;
+// PMM-BACKED (was static BSS): one contiguous block allocated at boot in
+// initKstackGuards and accessed through the physmap, so slot i sits at
+// `base + i*KSTACK_SLOT_SIZE` exactly as the old array did — every consumer's
+// `&kstack_pool[i]` math is byte-identical. Moved out of BSS so MAX_PROCS no
+// longer bloats the kernel image past KERNEL_HEAP_BASE (68KB/proc was the
+// dominant term). Shared across address spaces via the physmap's PML4[256]
+// entry — which createAddressSpace copies — so the guards we punch before the
+// first user process are inherited. Pool slot i ↔ procs[i]. `undefined` until
+// initKstackGuards; nothing touches a kstack before then (first task creation
+// is well after, see main.zig init order).
+pub var kstack_pool: *align(4096) [MAX_PROCS][KSTACK_SLOT_SIZE]u8 = undefined;
+
+/// Total bytes the kstack pool spans. Use this instead of
+/// `@sizeOf(@TypeOf(kstack_pool))` — that now yields a pointer's 8 bytes.
+pub const KSTACK_POOL_BYTES: usize = MAX_PROCS * KSTACK_SLOT_SIZE;
+
+/// Physical base of the kstack pool block (set in initKstackGuards). The pool
+/// lives in the physmap now, NOT at KERNEL_VIRT_BASE — code that needs the
+/// pool's phys range (e.g. the iommu DMA tripwire) MUST use this, not the old
+/// `VA − KERNEL_VIRT_BASE` trick.
+pub var kstack_pool_phys_base: usize = 0;
 
 /// Per-task scratch slot for held-across-yield I/O buffers (one disk
 /// block = 4KB). Replaces `var X: [4096]u8 align(N) = undefined` patterns
@@ -630,16 +645,118 @@ pub var wake_handler_runs: [smp.MAX_CPUS]u64 = blk: {
 /// 2MB→4KB split and works fine. Disabling on UEFI keeps stack overflow
 /// detection on Multiboot while UEFI is investigated separately.
 pub fn initKstackGuards() void {
+    const pmm = @import("../mm/pmm.zig");
+    const paging = @import("../mm/paging.zig");
+    // Allocate the kstack pool from PMM as ONE contiguous block (was static
+    // BSS). Contiguous so the physmap VA is linear → slot i at base + i*SLOT,
+    // identical to the old array math. At boot the free list is pristine, so a
+    // multi-MB contiguous block is readily available.
+    const frames: u32 = @intCast(KSTACK_POOL_BYTES / 4096);
+    const block_phys = pmm.allocContiguous(frames) orelse {
+        debug.klog("[proc] FATAL: kstack pool alloc failed ({d} frames / {d} KB)\n", .{ frames, KSTACK_POOL_BYTES / 1024 });
+        @panic("kstack pool allocation failed");
+    };
+    kstack_pool_phys_base = block_phys;
+    const region_va = paging.physToVirt(block_phys);
+    kstack_pool = @ptrFromInt(region_va);
+    // BSS was zero-initialized; preserve that — the kstack scanners and the
+    // base canary both read these bytes.
+    @memset(@as([*]u8, @ptrFromInt(region_va))[0..KSTACK_POOL_BYTES], 0);
+    debug.klog("[proc] kstack pool: {d} slots PMM-backed @ phys 0x{X} va 0x{X} ({d} KB)\n", .{ MAX_PROCS, block_phys, region_va, KSTACK_POOL_BYTES / 1024 });
+
+    // Punch the unmapped guard page at the bottom of every slot so a stack
+    // overflow #PFs (a kernel-mode not-present fault → fatal autopsy, since the
+    // demand-pager only services user-mode faults). UEFI carve-out preserved:
+    // the firmware's huge-page split corrupts under PMM-allocated PT pages (see
+    // history) so UEFI runs canary-only, exactly as before — but it still gets
+    // the PMM-backing (and thus the BSS savings) above.
+    //
+    // PREMISE SHIFT (2026-06-04): the pool used to live in the PML4[511] image
+    // window (2 MB pages → a single 2MB→4KB split). It's now in the physmap
+    // (PML4[256]), which boot.asm maps with 1 GB pages on BOTH bootloaders, so
+    // Multiboot now exercises the SAME 1GB→2MB→4KB triple-split the UEFI
+    // carve-out blames. splitToPte handles it, but the first guard install is
+    // the thing to boot-verify on Multiboot (triple-fault here = the 1GB-split
+    // PT page, not firmware).
     if (@import("../boot/boot_info.zig").is_uefi) {
         debug.klog("[proc] kstack guards disabled on UEFI (see comment)\n", .{});
         return;
     }
     for (0..MAX_PROCS) |i| {
-        const slot_base = @intFromPtr(&kstack_pool[i]);
-        if (!@import("../mm/paging.zig").installGuardPage(slot_base)) {
+        const slot_base = region_va + i * KSTACK_SLOT_SIZE;
+        if (!paging.installGuardPage(slot_base)) {
             debug.klog("[proc] guard page install failed for slot {d} @ 0x{X}\n", .{ i, slot_base });
         }
     }
+}
+
+// =============================================================================
+// P4: base-of-kstack canary (2026-06-04 debug-infra pass)
+// =============================================================================
+//
+// The kesp / iretq / saved-RIP guards all watch the switch + interrupt
+// frames near the TOP of each kernel stack. Nothing watched the BASE. A deep
+// overflow (KSTACK_SIZE's history in config.zig is a list of these — RSA
+// modpow overran 32 KB and wrote modulus bytes over a saved RIP) or a runaway
+// write that walks DOWN the stack clobbers the lowest qword, just above the
+// unmapped guard page. We plant a per-pid magic there at create and verify it
+// at every dispatch: a silent near-overflow becomes a localized panic (which
+// pid, which CPU, with a save-trace) instead of a wild jump hours later. The
+// pmm/desc canaries don't cover kstacks — this closes that gap. Compile out
+// via STACK_CANARY_ENABLE.
+pub const STACK_CANARY_ENABLE: bool = true;
+var stack_canary_miss: u64 = 0;
+
+/// Per-pid magic, so a cross-stack wild write carrying another task's canary
+/// value still mismatches. High bits are a fixed, unlikely-natural value.
+pub inline fn stackCanaryValue(pid: usize) u64 {
+    return 0xCA11AB1E_5AFE_0000 ^ @as(u64, pid);
+}
+
+/// Address of the canary word: the lowest qword of the body, just above the
+/// 4 KB guard page. Always-mapped BSS for pool-backed stacks.
+inline fn stackCanaryAddr(pid: usize) usize {
+    return @intFromPtr(&kstack_pool[pid]) + KSTACK_GUARD_SIZE;
+}
+
+/// True iff `pid` runs on its own pool slot (vs a heap-backed kstack of
+/// non-default size, whose true base isn't top-KSTACK_SIZE — we skip those).
+inline fn kstackPoolBacked(pid: usize) bool {
+    return procs[pid].kernel_stack_top ==
+        @intFromPtr(&kstack_pool[pid]) + KSTACK_SLOT_SIZE;
+}
+
+/// Plant (or refresh) `pid`'s base canary. Called at every create site so a
+/// reused slot starts each life clean. No-op for non-pool-backed stacks. MUST
+/// run after kernel_stack_top is assigned (the pool-backed gate reads it).
+pub fn plantStackCanary(pid: usize) void {
+    if (!STACK_CANARY_ENABLE) return;
+    if (pid >= MAX_PROCS) return;
+    if (!kstackPoolBacked(pid)) return;
+    @as(*u64, @ptrFromInt(stackCanaryAddr(pid))).* = stackCanaryValue(pid);
+}
+
+/// Verify `pid`'s base canary. Returns true when intact OR not-applicable
+/// (disabled / never-created / heap-backed); false ONLY on a real mismatch.
+/// Gated on expected_kstack_tops != 0 AND pool-backed, so it can fire only for
+/// a properly-created pool task — never a false positive on a bootstrap or
+/// unused slot. The canary address is always-mapped BSS, so the read can't
+/// fault.
+pub inline fn checkStackCanary(pid: usize) bool {
+    if (!STACK_CANARY_ENABLE) return true;
+    if (pid >= MAX_PROCS) return true;
+    if (@atomicLoad(usize, &expected_kstack_tops[pid], .acquire) == 0) return true;
+    if (!kstackPoolBacked(pid)) return true;
+    const ok = @as(*const u64, @ptrFromInt(stackCanaryAddr(pid))).* == stackCanaryValue(pid);
+    if (!ok) _ = @atomicRmw(u64, &stack_canary_miss, .Add, 1, .monotonic);
+    return ok;
+}
+
+/// Running count of canary mismatches seen at dispatch. Surfaced in the
+/// [diag-hb] heartbeat so a near-miss that somehow didn't panic is still a
+/// visible metric.
+pub fn stackCanaryMismatches() u64 {
+    return @atomicLoad(u64, &stack_canary_miss, .monotonic);
 }
 
 /// True if `top` is a plausible kernel_stack_top value — it points at the

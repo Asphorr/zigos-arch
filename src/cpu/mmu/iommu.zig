@@ -738,10 +738,10 @@ pub fn dmaMap(bus: u8, dev: u8, func: u8, phys: u64, len: u64, prot: Prot) bool 
     // identifies the buggy driver call site.
     {
         const process_mod = @import("../../proc/process.zig");
-        const KERNEL_VIRT_BASE: u64 = 0xFFFFFFFF80000000;
-        const ks_va = @intFromPtr(&process_mod.kstack_pool);
-        const ks_phys_start = ks_va - KERNEL_VIRT_BASE;
-        const ks_phys_end = ks_phys_start + @sizeOf(@TypeOf(process_mod.kstack_pool));
+        // kstack_pool is PMM-backed in the physmap now (not at KERNEL_VIRT_BASE);
+        // use its recorded phys base + region size for the DMA tripwire range.
+        const ks_phys_start = process_mod.kstack_pool_phys_base;
+        const ks_phys_end = ks_phys_start + process_mod.KSTACK_POOL_BYTES;
         const req_end = phys + len;
         if (phys < ks_phys_end and req_end > ks_phys_start) {
             debug.klog("\n[iommu-tripwire] !!! dmaMap into kstack range !!!\n", .{});

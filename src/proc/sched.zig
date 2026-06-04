@@ -1541,6 +1541,48 @@ pub fn schedule() void {
             }
         }
 
+        // P4: base-of-kstack canary. The kesp/RIP guards above watch the
+        // switch frame near the TOP of the stack; this catches a deep
+        // overflow or runaway write that walked DOWN and clobbered the base
+        // qword (just above the guard page) — the class config.zig's 64 KB
+        // bump was chasing. Check the OUTGOING task (caught in the act at
+        // switch-out) and the INCOMING one (integrity before we resume it).
+        // Self-gates to pool-backed, properly-created pids → no false
+        // positives; compiles out when STACK_CANARY_ENABLE is false.
+        if (process.STACK_CANARY_ENABLE) {
+            var bad_pid: ?usize = null;
+            var which: []const u8 = "incoming";
+            if (cpu.current_pid) |cur| {
+                if (!process.checkStackCanary(cur)) {
+                    bad_pid = cur;
+                    which = "outgoing";
+                }
+            }
+            if (bad_pid == null and !process.checkStackCanary(next)) {
+                bad_pid = next;
+            }
+            if (bad_pid) |b| {
+                debug.klog("\n[stack-canary] !!! pid={d} ({s}) base-of-kstack canary CORRUPTED — deep overflow or wild write !!!\n", .{ b, which });
+                const cbase = @intFromPtr(&process.kstack_pool[b]) + config.KSTACK_GUARD_SIZE;
+                debug.klog("[stack-canary]   canary @ 0x{X:0>16} = 0x{X:0>16}  (expected 0x{X:0>16})\n", .{
+                    cbase, @as(*const u64, @ptrFromInt(cbase)).*, process.stackCanaryValue(b),
+                });
+                debug.klog("[stack-canary]   kstack_top = 0x{X:0>16}  state = {s}  name = {s}\n", .{
+                    process.procs[b].kernel_stack_top,
+                    @tagName(process.procs[b].state),
+                    process.procs[b].name[0..process.procs[b].name_len],
+                });
+                const from_pid_c: i32 = if (cpu.current_pid) |c| @intCast(c) else -1;
+                debug.klog("[stack-canary]   cpu = {d}  from_pid = {d}\n", .{ cpu.cpu_id, from_pid_c });
+                @import("../debug/kdbg.zig").nmi_halt_after_snapshot = true;
+                @import("../debug/save_trace.zig").dumpAll();
+                @atomicStore(u8, @as(*u8, @ptrCast(&process.procs[next].state)),
+                    @intFromEnum(State.ready), .release);
+                cpu.sched_lock.release();
+                @panic("base-of-kstack canary corrupted");
+            }
+        }
+
         // Pre-dispatch saved-RIP guard. switchTo's `ret` will pop the
         // qword at [next_kesp + 48] (after 6 callee-save pops) as the
         // resume RIP. If it's 0, the dispatch lands at RIP=0 → faults
@@ -1567,7 +1609,18 @@ pub fn schedule() void {
                 const k_hi = memmap.kernelEnd();
                 const rip_in_text = saved_rip >= k_lo and saved_rip < k_hi;
                 if (!rip_in_text) {
-                    const cause: []const u8 = if (saved_rip == 0) "RIP=0" else "RIP outside kernel .text";
+                    // P3(b): annotate the 0x….00000000 hi-half signature
+                    // (low 32 bits zero, high bits set) — a structured clobber
+                    // (a shifted or high-half value landing in the RIP slot),
+                    // not random noise. Pure labelling on the already-failing
+                    // path; the [k_lo,k_hi) range check above is what gates.
+                    const structured = (saved_rip & 0xFFFFFFFF) == 0 and (saved_rip >> 32) != 0;
+                    const cause: []const u8 = if (saved_rip == 0)
+                        "RIP=0"
+                    else if (structured)
+                        "RIP outside kernel .text (structured garbage: low32=0 — looks like a hi-half/shifted value clobbering the slot)"
+                    else
+                        "RIP outside kernel .text";
                     debug.klog("[sched-rip-guard] about to dispatch pid={d} ({s}) with wild saved RIP=0x{X:0>16} ({s})\n", .{
                         next, process.procs[next].name[0..process.procs[next].name_len], saved_rip, cause,
                     });
@@ -1673,6 +1726,34 @@ pub fn schedule() void {
                     cpu.sched_lock.release();
                     @panic("dispatch with wild saved RIP (not in kernel .text)");
                 }
+            } else if (kstop == 0 or next_kesp +% 56 > kstop) {
+                // P3(a): the kesp+48 slot isn't inside this task's kstack
+                // window, so we can't safely read it to validate the saved
+                // RIP — pre-P3 this path was silently skipped. But a
+                // kernel_esp within 56 bytes of (or above) kstack_top, or a
+                // zero kstack_top at dispatch time, is itself corrupt:
+                // switchTo pops 56 bytes (6 callee-save + ret), so a valid
+                // kesp is always <= top-56. The wild-kesp detector earlier
+                // only fires on kesp BELOW the body and is gated on
+                // kstack_top != 0; this catches the too-high / unset end that
+                // escaped both. Report + autopsy rather than dispatch blind
+                // into a malformed restore frame.
+                debug.klog("\n[sched-rip-guard] !!! pid={d} kernel_esp outside valid dispatch window — cannot validate saved RIP !!!\n", .{next});
+                debug.klog("[sched-rip-guard]   kernel_esp   = 0x{X:0>16}\n", .{next_kesp});
+                debug.klog("[sched-rip-guard]   kstack_top   = 0x{X:0>16}\n", .{kstop});
+                debug.klog("[sched-rip-guard]   rip_slot     = 0x{X:0>16}  (need within [top-0x{X}, top-8])\n", .{ rip_slot, 4 * @import("../config.zig").KSTACK_SIZE });
+                debug.klog("[sched-rip-guard]   expected_top = 0x{X:0>16}\n", .{
+                    @atomicLoad(usize, &process.expected_kstack_tops[next], .acquire),
+                });
+                debug.klog("[sched-rip-guard]   state        = {s}\n", .{@tagName(process.procs[next].state)});
+                const from_pid_w: i32 = if (cpu.current_pid) |c| @intCast(c) else -1;
+                debug.klog("[sched-rip-guard]   from_pid     = {d}\n", .{from_pid_w});
+                @import("../debug/kdbg.zig").nmi_halt_after_snapshot = true;
+                @import("../debug/save_trace.zig").dumpAll();
+                @atomicStore(u8, @as(*u8, @ptrCast(&process.procs[next].state)),
+                    @intFromEnum(State.ready), .release);
+                cpu.sched_lock.release();
+                @panic("dispatch with kernel_esp outside valid kstack window");
             }
         }
         // Phase 3 retired the pre-load `next_kesp ∈ next's kstack range`

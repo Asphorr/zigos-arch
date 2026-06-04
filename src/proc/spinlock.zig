@@ -130,6 +130,38 @@ const CLI_HOLD_THRESHOLD_MS: u64 = 5;
 var cli_hold_logged_this_tick: u32 = 0;
 var cli_hold_last_tick: u64 = 0;
 
+/// Most-recent significant cli-hold, published for smi.zig's stall
+/// classifier. The `[smi]` detector sees only an IRQ0 *gap* and can't
+/// tell "we held cli too long" (OURS) from "the host descheduled our
+/// vCPU" (HOST) — both block IRQ0. But a real cpu-local cli-hold is
+/// released (and recorded here) microseconds BEFORE the pending IRQ0 can
+/// re-fire, whereas a host pause leaves these stale. So smi can corroborate
+/// a gap against an ACTUAL recorded hold of comparable duration instead of
+/// guessing from the sampled RIP (which, since schedule() is the hottest
+/// kernel code, mislabels most host pauses "OURS at schedule"). Caveat:
+/// only acquireIrqSave/releaseIrqRestore regions are tracked — a raw
+/// cli/sti window (rare, audited) would not corroborate and reads as HOST.
+/// end_tsc is published LAST with .release so a reader that observes the
+/// fresh end_tsc also observes the matching dur/ra/cpu.
+pub var last_clihold_end_tsc: u64 = 0;
+pub var last_clihold_dur_tsc: u64 = 0;
+pub var last_clihold_ra: u64 = 0;
+pub var last_clihold_cpu: u8 = 0xFF;
+
+/// Linker-provided bounds of the kernel `.text` section (see linker.ld).
+/// The P5 held-path stack-scan uses these to keep only words that point
+/// INTO executable code. The kernel symbol table also carries data
+/// symbols (`kstack_pool` in .bss, the `__bss_phys_*` aliases, …), so an
+/// unfiltered `resolveKernel` on raw stack words happily labels random
+/// pointers/locals with a data-symbol name — pure noise. A real return
+/// address always lands in `.text`; that's the only filter we need.
+extern var __text_start: u8;
+extern var __text_end: u8;
+
+inline fn isKernelTextAddr(v: u64) bool {
+    return v >= @intFromPtr(&__text_start) and v < @intFromPtr(&__text_end);
+}
+
 fn cliHoldCheck(self: *SpinLock, start_tsc: u64, ra: u64, cpu_id: u8) void {
     const apic = @import("../time/apic.zig");
     const per_q = apic.tscPerQuantum();
@@ -139,6 +171,14 @@ fn cliHoldCheck(self: *SpinLock, start_tsc: u64, ra: u64, cpu_id: u8) void {
     // tsc_per_quantum covers 10 ms; threshold in TSC = per_q * (ms/10)
     const threshold_tsc = per_q * CLI_HOLD_THRESHOLD_MS / 10;
     if (delta < threshold_tsc) return;
+    // Publish this hold for smi.zig's stall classifier BEFORE the log
+    // rate-limit below — the corroboration signal must be recorded even
+    // when the [cli-hold] line itself is throttled. dur/ra/cpu first, then
+    // end_tsc with .release as the publish barrier.
+    @atomicStore(u64, &last_clihold_dur_tsc, delta, .monotonic);
+    @atomicStore(u64, &last_clihold_ra, ra, .monotonic);
+    @atomicStore(u8, &last_clihold_cpu, cpu_id, .monotonic);
+    @atomicStore(u64, &last_clihold_end_tsc, start_tsc +% delta, .release);
     // Soft rate-limit: at most ~16 lines per second-of-tick window.
     const process = @import("process.zig");
     const tick: u64 = @atomicLoad(u64, &process.tick_count, .monotonic);
@@ -161,6 +201,34 @@ fn cliHoldCheck(self: *SpinLock, start_tsc: u64, ra: u64, cpu_id: u8) void {
             "[cli-hold] cpu{d} lock@0x{X} {d} ms ra=0x{X}\n",
             .{ cpu_id, @intFromPtr(self), ms, ra },
         );
+    }
+    // P5: mini stack-scan backtrace of the holder AT RELEASE. The acquire
+    // `ra` above is only WHERE the lock was taken; this shows the call path
+    // the (too-slow) critical section was on when it finally let go — the
+    // "where was cpu N" datum that turns a bare lock address into a lead.
+    // The RBP walk is unreliable here (higher-half kernel + omit-frame-
+    // pointer), so we scan THIS cpu's own (mapped) kstack for words that
+    // point into kernel `.text` and print the first few. The `.text`-range
+    // pre-filter is what makes the output trustworthy: without it, raw
+    // stack words alias data symbols (kstack_pool, __bss_phys_end, …) and
+    // resolveKernel labels them confidently — noise. With it, every line
+    // is a genuine code return address (still a heuristic — STALE return
+    // addresses from prior frames can show, but never a data symbol).
+    // Bounded to the current stack page, reads only our own stack so it
+    // can't fault. Already inside the 16-lines/tick gate above, so it
+    // doesn't flood.
+    var fp = @frameAddress();
+    const page_top = (fp & ~@as(usize, 0xFFF)) + 0x1000;
+    var scanned: usize = 0;
+    var shown: usize = 0;
+    while (fp + 8 <= page_top and scanned < 96 and shown < 3) : (fp += 8) {
+        scanned += 1;
+        const v = @as(*const u64, @ptrFromInt(fp)).*;
+        if (!isKernelTextAddr(v)) continue;
+        if (symbols.resolveKernel(v)) |r2| {
+            serial.print("[cli-hold]     held-path #{d}: {s}+0x{X}\n", .{ shown, r2.name, r2.offset });
+            shown += 1;
+        }
     }
 }
 
@@ -496,6 +564,24 @@ pub fn dumpHeldLocksOlderThan(now_tsc: u64, threshold_ticks: u64) void {
             serial.print("0x{X}\n", .{lock.holder_ra});
         }
     }
+}
+
+/// True if `cpu_id` currently holds any registered SpinLock. The watchdog
+/// uses this to tell a peer that's frozen but holding NOTHING (host vCPU
+/// pause — safe to wait for it to resume) from one frozen INSIDE a cli
+/// critical section (a real wedge there can deadlock-propagate to us, so
+/// halt sooner). Best-effort: only the 11 registered locks are visible —
+/// an unregistered-lock wedge reads as "free" and just gets the longer
+/// grace, still caught by the resume probe. Cheap O(N) over the registry.
+pub fn cpuHoldsAnyLock(cpu_id: u8) bool {
+    var i: u8 = 0;
+    while (i < named_lock_count) : (i += 1) {
+        const ent = &named_locks[i];
+        if (ent.ptr == 0 or ent.kind != .spin) continue;
+        const lock: *SpinLock = @ptrFromInt(ent.ptr);
+        if (@atomicLoad(u8, &lock.holder_cpu, .acquire) == cpu_id) return true;
+    }
+    return false;
 }
 
 /// Dump every registered lock's state: SpinLocks print holder cpu +

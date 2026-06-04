@@ -3,6 +3,18 @@ const io = @import("../io.zig");
 
 const PORT: u16 = 0x3F8; // COM1
 
+// Line Status Register (PORT+5) bits used ONLY by the bounded-poll
+// emergency writer below (the normal putChar path is fire-and-forget on
+// purpose — see putChar's comment for why).
+const LSR: u16 = PORT + 5;
+const LSR_THR_EMPTY: u8 = 0x20; // bit 5 — holding reg empty, OK to queue a byte
+const LSR_TEMT: u8 = 0x40; // bit 6 — transmitter fully drained (FIFO + shift reg)
+// Hard spin cap for every emergency LSR poll, so a wedged or absent UART
+// can never turn a crash dump into a *second* hang. ~1M pause-spins is
+// well under a millisecond of real time but far longer than QEMU needs to
+// drain one byte.
+const EMERG_SPIN_CAP: u32 = 1_000_000;
+
 // Cross-CPU write lock. Without this, fire-and-forget putChar calls from
 // BSP and AP interleave at byte granularity (a `[smp.timing]` line gets
 // shredded by a concurrent `[perf]` dump). Plain test-and-set + cli to
@@ -26,6 +38,21 @@ inline fn unlockWrite(flags: u64) void {
     @atomicStore(u32, &write_lock, 0, .release);
     if (flags & 0x200 != 0) asm volatile ("sti");
 }
+
+/// Set once by kdbg.enterCritical when the system enters a panic/fault
+/// critical section. While true, EVERY serial write bypasses write_lock and
+/// uses the lock-free, bounded-LSR-poll emergency path below. Two problems
+/// this solves at once:
+///   1. Deadlock. A peer CPU frozen by NMI mid-`write` still holds
+///      write_lock; any locked print after that — this CPU's panic banner,
+///      or the peer's own nmiSnapshot — would spin on the lock forever. The
+///      NMI snapshot hung exactly here (2026-06-04 wedge: log ended at a
+///      lone `[`, a partial line from a peer frozen mid-write).
+///   2. Lost tail. putChar is fire-and-forget, so the last ~16 bytes of a
+///      crash dump sit in QEMU's FIFO when we halt; the emergency writer
+///      waits (bounded) on THR-empty so nothing is dropped.
+/// Never cleared — the only caller is the about-to-halt panic path.
+pub var emergency_mode: bool = false;
 
 // In-memory mirror of everything sent over the serial port. /dev/kmsg
 // reads from this so user-space tools (cat, grep, dmesg) can inspect
@@ -77,6 +104,10 @@ fn ringPush(c: u8) void {
 }
 
 pub fn write(msg: []const u8) void {
+    if (@atomicLoad(bool, &emergency_mode, .acquire)) {
+        emergencyWrite(msg);
+        return;
+    }
     const flags = lockWrite();
     defer unlockWrite(flags);
     for (msg) |c| {
@@ -93,6 +124,54 @@ pub fn write(msg: []const u8) void {
 /// with whatever the other CPU was printing — acceptable for a panic.
 pub fn panicResetLock() void {
     @atomicStore(u32, &write_lock, 0, .release);
+}
+
+/// Bounds-safe ring push for the emergency path, where two CPUs (the
+/// panicking one and a peer running its NMI snapshot) can push concurrently
+/// with no lock held. Reads ring_pos into a local and clamps before
+/// indexing, so a torn `ring_pos += 1` between the two CPUs can never
+/// produce an out-of-bounds store. It may still lose/tear bytes in the ring
+/// under that race — fine for a panic; the host serial.log is the record.
+fn ringPushSafe(c: u8) void {
+    var p = ring_pos;
+    if (p >= RING_LEN) p = 0;
+    ring[p] = c;
+    p += 1;
+    if (p >= RING_LEN) p = 0;
+    ring_pos = p;
+    total_written +%= 1;
+}
+
+/// Lock-free, bounded byte write for the fault/NMI/panic path. Waits
+/// (capped) for THR-empty so the FIFO doesn't drop bytes, then writes.
+/// Takes NO lock and does NO cli — safe to call from an NMI handler that
+/// may have interrupted a normal `write` that still holds write_lock.
+fn emergencyPutChar(c: u8) void {
+    var spins: u32 = 0;
+    while (spins < EMERG_SPIN_CAP) : (spins += 1) {
+        if (io.inb(LSR) & LSR_THR_EMPTY != 0) break;
+        asm volatile ("pause");
+    }
+    io.outb(PORT, c);
+}
+
+/// Lock-free emergency byte-string write. See `emergency_mode`.
+pub fn emergencyWrite(msg: []const u8) void {
+    for (msg) |c| {
+        emergencyPutChar(c);
+        ringPushSafe(c);
+    }
+}
+
+/// Bounded wait for the UART transmitter to fully drain (LSR.TEMT) before
+/// the panic path halts, so the tail of a crash dump isn't stranded in
+/// QEMU's 16-byte FIFO. Bounded so a dead UART can't hang the halt itself.
+pub fn drainFifo() void {
+    var spins: u32 = 0;
+    while (spins < EMERG_SPIN_CAP) : (spins += 1) {
+        if (io.inb(LSR) & LSR_TEMT != 0) return;
+        asm volatile ("pause");
+    }
 }
 
 /// Number of bytes currently visible in the ring (≤ RING_LEN).
@@ -146,6 +225,10 @@ pub fn hex32(val: u32) void {
 
 const WriterType = std.io.GenericWriter(void, error{}, writeFn);
 fn writeFn(_: void, bytes: []const u8) error{}!usize {
+    if (@atomicLoad(bool, &emergency_mode, .acquire)) {
+        emergencyWrite(bytes);
+        return bytes.len;
+    }
     const flags = lockWrite();
     defer unlockWrite(flags);
     for (bytes) |b| {
@@ -182,4 +265,24 @@ pub fn print(comptime format: []const u8, args: anytype) void {
     const buf = &print_bufs[cpu_idx];
     const out = std.fmt.bufPrint(buf, format, args) catch "[print: buf overflow]\n";
     write(out);
+}
+
+// Dedicated emergency format buffers — separate from print_bufs so that a
+// peer interrupted by NMI mid-`print` (its print_bufs slot half-formatted)
+// can format its snapshot cleanly, and so a resumed normal write (a
+// non-panic diagnostic snapshot that IRETs back) still sees its original
+// bytes rather than ones we overwrote.
+var emerg_bufs: [PRINT_NUM_BUFS][PRINT_BUF_LEN]u8 align(16) = undefined;
+
+/// Lock-free formatted print for the fault/NMI/panic path. Mirrors `print`
+/// but formats into emerg_bufs and emits via the lock-free emergencyWrite,
+/// so it can never deadlock on write_lock. nmiSnapshot/broadcastNMI call
+/// this directly because they run in NMI context, possibly before
+/// emergency_mode is even set; once it IS set, plain `print`/`write` also
+/// route through the lock-free path automatically (no call-site changes).
+pub fn emergencyPrint(comptime format: []const u8, args: anytype) void {
+    const lapic_id = @import("../time/apic.zig").getLapicId();
+    const idx: usize = if (lapic_id < PRINT_NUM_BUFS) @intCast(lapic_id) else 0;
+    const out = std.fmt.bufPrint(&emerg_bufs[idx], format, args) catch "[emerg: buf overflow]\n";
+    emergencyWrite(out);
 }

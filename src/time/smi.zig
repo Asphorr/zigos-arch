@@ -93,6 +93,8 @@ pub fn tick() void {
     // those signals at fire time, not after the fact. (Proposal P4 in the
     // debug infra survey 2026-05-28.)
     const tsc_per_quantum = apic.tscPerQuantum();
+    var cli_us: u64 = 0;
+    var cli_ra: u64 = 0;
     if (tsc_per_quantum > 0) {
         const now_tsc: u64 = asm volatile (
             \\ rdtsc
@@ -100,19 +102,33 @@ pub fn tick() void {
             \\ orq %%rdx, %%rax
             : [r] "={rax}" (-> u64),
             :: .{ .rdx = true });
-        // 5ms = half of the 10ms LAPIC quantum.
-        @import("../proc/spinlock.zig").dumpHeldLocksOlderThan(now_tsc, tsc_per_quantum / 2);
+        const sl = @import("../proc/spinlock.zig");
+        // 5ms = half of the 10ms LAPIC quantum. Existing [smi-cause] dump of
+        // any lock CURRENTLY held >5ms — catches a PEER cpu still sitting on
+        // one (orthogonal to cpu0's own gap, which we corroborate below).
+        sl.dumpHeldLocksOlderThan(now_tsc, tsc_per_quantum / 2);
+        // Corroboration for cpu0's gap: did THIS cpu release a cli-hold of
+        // comparable size just before this IRQ0? A real cli-hold is recorded
+        // µs ago (now-end is tiny); a host pause leaves the record stale (it
+        // ended ~`us` ago, when the pause began). Require same-cpu so a
+        // peer's hold can't masquerade as ours. .acquire pairs with the
+        // .release publish so dur is consistent with end_tsc.
+        const my_cpu: u8 = @truncate(apic.getLapicId());
+        const end = @atomicLoad(u64, &sl.last_clihold_end_tsc, .acquire);
+        const hold_cpu = @atomicLoad(u8, &sl.last_clihold_cpu, .monotonic);
+        if (end != 0 and hold_cpu == my_cpu and now_tsc >= end and (now_tsc - end) < tsc_per_quantum) {
+            const dur = @atomicLoad(u64, &sl.last_clihold_dur_tsc, .monotonic);
+            cli_ra = @atomicLoad(u64, &sl.last_clihold_ra, .monotonic);
+            cli_us = dur * 10_000 / tsc_per_quantum; // tsc_per_quantum = TSC/10ms = TSC/10_000µs
+        }
     }
 
-    // Attribution: snapshot what cpu0 was doing at the PREVIOUS IRQ0 boundary.
-    // exectrail's head-1 holds that saved_rip because handleIRQ0 calls smi.tick()
-    // BEFORE exectrail.recordIrq() (see src/cpu/idt.zig:1232 vs :1258).
-    // Classification heuristic:
-    //   - syscall marker → kernel syscall path held cli (or schedule blocked)
-    //   - kernel RIP in idle's halt loop → likely host SMI (CPU was halted)
-    //   - kernel RIP elsewhere → kernel-cli-too-long
-    //   - user RIP (< 0x800000_0000_0000 and < kernel high half) → likely host SMI
-    classifyAndLog(us);
+    // prev_rip (in classifyAndLog) = what cpu0 was doing at the PREVIOUS
+    // IRQ0 boundary (exectrail head-1; handleIRQ0 calls smi.tick() BEFORE
+    // exectrail.recordIrq()). The verdict is now decided by cli_us — an
+    // ACTUAL recorded cli-hold — not guessed from prev_rip; prev_rip is
+    // only context for where a host pause happened to sample us.
+    classifyAndLog(us, cli_us, cli_ra);
 }
 
 /// Wraparound-safe delta on the masked counter. Returns the number of PM
@@ -126,45 +142,60 @@ fn pmDelta(prev: u32, now: u32) u64 {
 
 const KERNEL_HIGH_HALF: u64 = 0xFFFF800000000000;
 
-fn classifyAndLog(us: u64) void {
+// Decide OURS vs HOST from cli_us — the duration of an ACTUAL cpu-local
+// cli-hold that ended just before this IRQ0 (0 if none). A gap is OURS only
+// when a recorded hold covers at least half of it; otherwise it's a host
+// vCPU pause that merely SAMPLED cpu0 somewhere (prev_rip). The old code
+// guessed "OURS" from prev_rip alone, so every host pause that happened to
+// sample schedule() — the hottest kernel code — was mislabeled "OURS at
+// schedule" while the real cli-holds were only ≤17ms and the gaps ran to
+// 1.3s. cli_ra is the hold's acquire site = the authoritative location.
+fn classifyAndLog(us: u64, cli_us: u64, cli_ra: u64) void {
+    const accounted = cli_us != 0 and cli_us * 2 >= us;
+
+    if (accounted) {
+        if (symbols.resolveKernel(cli_ra)) |r| {
+            debug.klog("[smi] stall: {d}us — OURS (cli-hold {d}us at {s}+0x{X}) — events={d} max={d}us\n", .{ us, cli_us, r.name, r.offset, stall_events, max_stall_us });
+        } else {
+            debug.klog("[smi] stall: {d}us — OURS (cli-hold {d}us at ra=0x{X:0>16}) — events={d} max={d}us\n", .{ us, cli_us, cli_ra, stall_events, max_stall_us });
+        }
+        return;
+    }
+
+    // No cli-hold accounts for the gap → host vCPU pause. Report WHERE cpu0
+    // was sampled (prev_rip) as context, plus cli-acct (the largest hold we
+    // did see, ~0) to make the "nothing actually held cli" basis explicit.
     const prev_rip_opt = exectrail.peekHeadMinusOne(0);
     if (prev_rip_opt == null) {
-        debug.klog("[smi] stall: {d}us (events={d}, max={d}us) — no trail data\n", .{ us, stall_events, max_stall_us });
+        debug.klog("[smi] stall: {d}us — likely HOST (vCPU pause; cli-acct={d}us) — no trail (events={d} max={d}us)\n", .{ us, cli_us, stall_events, max_stall_us });
         return;
     }
     const prev_rip = prev_rip_opt.?;
 
-    // Decode syscall marker (the PREVIOUS IRQ0 sampled CPU mid-syscall).
-    // Marker layout: MARKER_BASE (bit 47) | MARKER_SYSCALL_BIT (bit 48) |
-    // sys_num (low 16). Crucially this sits in the LOW canonical half;
-    // every canonical kernel RIP (0xFFFF8000..) is also >= MARKER_BASE
-    // but does NOT carry the marker pattern. Without the high-bound the
-    // [smi] line decoded random kernel RIPs as "sc#<low 16 bits>" and
-    // hid the real "kernel held cli" verdict behind a bogus syscall id.
+    // Syscall marker (low canonical half; a real kernel RIP 0xFFFF8000.. is
+    // >= MARKER_BASE but lacks the bit-47/48 pattern, hence the high bound).
+    // CPU was mid-syscall when the pause began.
     if (prev_rip >= exectrail.MARKER_BASE and prev_rip < KERNEL_HIGH_HALF) {
         const sys_num = prev_rip & 0xFFFF;
-        debug.klog("[smi] stall: {d}us — likely OURS (sc#{d} held cli) — events={d} max={d}us\n", .{ us, sys_num, stall_events, max_stall_us });
+        debug.klog("[smi] stall: {d}us — likely HOST (vCPU pause; was in sc#{d}, cli-acct={d}us) — events={d} max={d}us\n", .{ us, sys_num, cli_us, stall_events, max_stall_us });
         return;
     }
 
-    // User-space RIP — IRQs were unmasked just before; stall is almost
-    // certainly host SMI (we can't hold cli in user mode).
+    // User-space RIP — IRQs were unmasked, so it can't be our cli-hold → host.
     if (prev_rip < KERNEL_HIGH_HALF) {
         debug.klog("[smi] stall: {d}us — likely HOST (user RIP 0x{X:0>16}) — events={d} max={d}us\n", .{ us, prev_rip, stall_events, max_stall_us });
         return;
     }
 
-    // Kernel RIP — symbolize and let the caller judge. Idle/hlt path
-    // = host; anywhere else = us.
+    // Kernel RIP, no cli-hold corroborated. idle/hlt = expected host wait;
+    // anything else = host starvation that sampled us mid-kernel.
     if (symbols.resolveKernel(prev_rip)) |r| {
-        const name = r.name;
-        // Heuristic: any "idle" symbol is the halt path → host-side.
-        const is_idle = std.mem.indexOf(u8, name, "idle") != null or
-            std.mem.indexOf(u8, name, "Idle") != null;
-        const verdict = if (is_idle) "likely HOST (kernel idle/hlt)" else "likely OURS (kernel held cli)";
-        debug.klog("[smi] stall: {d}us — {s} at {s}+0x{X} — events={d} max={d}us\n", .{ us, verdict, name, r.offset, stall_events, max_stall_us });
+        const is_idle = std.mem.indexOf(u8, r.name, "idle") != null or
+            std.mem.indexOf(u8, r.name, "Idle") != null;
+        const why = if (is_idle) "kernel idle/hlt" else "vCPU pause";
+        debug.klog("[smi] stall: {d}us — likely HOST ({s}; was at {s}+0x{X}, cli-acct={d}us) — events={d} max={d}us\n", .{ us, why, r.name, r.offset, cli_us, stall_events, max_stall_us });
     } else {
-        debug.klog("[smi] stall: {d}us — kernel RIP 0x{X:0>16} (unresolved) — events={d} max={d}us\n", .{ us, prev_rip, stall_events, max_stall_us });
+        debug.klog("[smi] stall: {d}us — likely HOST (vCPU pause; kernel RIP 0x{X:0>16} unresolved, cli-acct={d}us) — events={d} max={d}us\n", .{ us, prev_rip, cli_us, stall_events, max_stall_us });
     }
 }
 

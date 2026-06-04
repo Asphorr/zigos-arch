@@ -61,7 +61,9 @@ SECTIONS {
     . += KERNEL_VIRT_BASE;
 
     .text ALIGN(4K) : AT(ADDR(.text) - KERNEL_VIRT_BASE) {
+        __text_start = .;
         *(.text) *(.text.*)
+        __text_end = .;
     }
     .rodata ALIGN(4K) : AT(ADDR(.rodata) - KERNEL_VIRT_BASE) {
         *(.rodata) *(.rodata.*)

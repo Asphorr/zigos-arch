@@ -11,13 +11,22 @@
 const std = @import("std");
 
 // --- Process / scheduler ---
-pub const MAX_PROCS: u32 = 32;
+pub const MAX_PROCS: u32 = 64; // kstacks are PMM-backed (see process.kstack_pool) so this no longer bloats BSS; only procs[] (~2KB/proc) grows
 pub const MAX_FDS: u32 = 16;
 /// Lazy-region table size per PCB. Used by stack (1) + sbrk heap (1) + ELF
 /// PT_LOAD segments (~3) + mmap (1+ per call). 8 was tight once mmap was
-/// added — bumped to 16 so a few back-to-back mmaps don't immediately
-/// exhaust the table on a freshly-loaded process.
-pub const MAX_LAZY_REGIONS: u8 = 16;
+/// added — bumped to 16. Then schedstress exposed the deeper limit: every
+/// pthread stack is its OWN mmap region in the shared address space
+/// (libc.pthreadCreate → mmap → procs[tgid].lazy_regions), so a process is
+/// capped at (MAX_LAZY_REGIONS − ~5 base regions) live THREADS. 16 capped
+/// schedstress at 11 threads — its churn/sleeper/yielder pools silently
+/// failed to spawn (pthreadCreate returned null, NOT a MAX_PROCS/slot issue:
+/// PCB slots 18..63 sat .unused). 32 lifts the ceiling to ~27 threads/proc.
+/// Cost is tiny BSS (~80 B/LazyRegion × MAX_PROCS PCBs; only a leader's table
+/// is live, but every PCB carries one). munmap compacts the table
+/// (sysMunmap → lazy_count−1), so create→join thread churn recycles regions
+/// cleanly and never accumulates.
+pub const MAX_LAZY_REGIONS: u8 = 32;
 
 /// Per-process kernel stack body size. Plus KSTACK_GUARD_SIZE below it.
 pub const KSTACK_SIZE: usize = 64 * 1024; // 64 KB — std.crypto.Certificate.rsa modpow uses Modulus(4096) Fe arrays (512 B each, several live in flight) + AEAD scratch + cert chain walk; deep TLS syscalls peak well past 16 KB. 32 KB still wasn't enough — hex-dump after a second crash showed RSA modulus bytes (0xCAAF53D8...) sitting on the kstack where doSyscall's saved RIP should have been. Was 16 KB. Linux uses 16 KB but offloads crypto to worker threads with their own kstacks — a cleaner future fix.

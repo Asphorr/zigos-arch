@@ -974,6 +974,14 @@ pub const AutopsyOpts = struct {
 /// while the first victim is still wedged in the panic handler.
 pub var nmi_halt_after_snapshot: bool = false;
 
+/// Per-CPU "snapshot complete" acks, indexed by lapic id. broadcastNMI
+/// clears these, sends the NMIs, then waits (bounded) for each targeted
+/// peer to set its slot from nmiSnapshot — replacing the old blind fixed
+/// 50 ms delay with "return as soon as everyone actually answered, give up
+/// after a hard cap if a peer is too wedged to even take the NMI."
+const MAX_CPUS_NMI = @import("../cpu/smp.zig").MAX_CPUS;
+var nmi_ack: [MAX_CPUS_NMI]bool = [_]bool{false} ** MAX_CPUS_NMI;
+
 pub fn nmiSnapshot(rsp: u64, saved_rip: u64, saved_cs: u64) void {
     // Do NOT enter the panic critical section here — the caller of
     // broadcastNMI() likely holds it, and we'd deadlock waiting forever.
@@ -990,21 +998,22 @@ pub fn nmiSnapshot(rsp: u64, saved_rip: u64, saved_cs: u64) void {
         null;
     const cur_pid: i32 = if (cur_pid_opt) |p| @intCast(p) else -1;
 
-    serial.print("[nmi-snap cpu{d}] rip=0x{X:0>16} cs=0x{X:0>4} rsp=0x{X:0>16} pid={d}", .{
+    serial.emergencyPrint("[nmi-snap cpu{d}] rip=0x{X:0>16} cs=0x{X:0>4} rsp=0x{X:0>16} pid={d}", .{
         cpu_id, saved_rip, saved_cs, rsp, cur_pid,
     });
     if (symbols.resolveKernel(saved_rip)) |r| {
-        serial.print(" fn={s}+0x{X}", .{ r.name, r.offset });
+        serial.emergencyPrint(" fn={s}+0x{X}", .{ r.name, r.offset });
     }
-    // Decode CPU+PCB state on a second line so the per-line lock keeps
-    // it from byte-interleaving with the rip line above. Tells us
-    // whether the wedged CPU was: running a normal task, parked in
-    // .sleeping (and on what wait_kind/target), or in idle.
+    // Decode CPU+PCB state on a second line. (process.procs is a fixed
+    // value array and p<MAX_PROCS, so this deref can't fault even on a
+    // corrupt PCB, and name_len is @min-bounded against the buffer.) Tells
+    // us whether the wedged CPU was running a normal task, parked in
+    // .sleeping (and on what wait_kind/target), or idle.
     if (cur_pid_opt) |p| {
         if (p < process.MAX_PROCS) {
             const pcb = &process.procs[p];
             const name_slice = pcb.name[0..@min(pcb.name_len, pcb.name.len)];
-            serial.print("\n[nmi-snap cpu{d}] name='{s}' state={d} wait_kind={d} wait_target=0x{X} is_idle={any}\n", .{
+            serial.emergencyPrint("\n[nmi-snap cpu{d}] name='{s}' state={d} wait_kind={d} wait_target=0x{X} is_idle={any}\n", .{
                 cpu_id, name_slice,
                 @intFromEnum(pcb.state),
                 @intFromEnum(pcb.wait_kind),
@@ -1012,11 +1021,18 @@ pub fn nmiSnapshot(rsp: u64, saved_rip: u64, saved_cs: u64) void {
                 pcb.is_idle,
             });
         } else {
-            serial.print("\n", .{});
+            serial.emergencyPrint("\n", .{});
         }
     } else {
-        serial.print("\n[nmi-snap cpu{d}] current_pid=null (no task on this CPU)\n", .{cpu_id});
+        serial.emergencyPrint("\n[nmi-snap cpu{d}] current_pid=null (no task on this CPU)\n", .{cpu_id});
     }
+
+    // Publish completion so broadcastNMI's ack-wait can return as soon as
+    // every peer has actually snapshotted, instead of blindly waiting a
+    // fixed 50 ms. Set BEFORE the halt loop so a halting (panic-path) peer
+    // still acks. Out-of-range lapic ids simply aren't tracked (the
+    // broadcaster doesn't gate on them either).
+    if (cpu_id < MAX_CPUS_NMI) @atomicStore(bool, &nmi_ack[cpu_id], true, .release);
 
     // Panic-path receivers stop here; non-panic diagnostic callers
     // (spinlock contention reporter, etc.) IRET back to whatever they
@@ -1033,20 +1049,46 @@ pub fn broadcastNMI() void {
     const apic = @import("../time/apic.zig");
     const smp = @import("../cpu/smp.zig");
     const my_id = apic.getLapicId();
-    serial.print("[nmi-broadcast] from cpu{d} — soliciting snapshots\n", .{my_id});
+    serial.emergencyPrint("[nmi-broadcast] from cpu{d} — soliciting snapshots\n", .{my_id});
+
+    // Clear acks before soliciting, so a stale ack from a prior broadcast
+    // (e.g. an earlier diagnostic snapshot) can't make us believe a peer has
+    // already answered this round.
+    for (&nmi_ack) |*a| @atomicStore(bool, a, false, .release);
+
     for (&smp.cpus) |*cpu| {
         if (!cpu.alive) continue;
         if (cpu.lapic_id == my_id) continue;
         apic.sendNMI(cpu.lapic_id);
     }
-    // Brief wait for NMI handlers to fire and print. Each handler enters
-    // the critical section (which we own), prints, exits — they queue
-    // behind us if we hold it. We don't release; caller is mid-panic.
-    // 50M pause spins ≈ 50ms on a 1GHz CPU — long enough.
+
+    // Wait until every targeted peer has published its snapshot ack, or a
+    // hard cap elapses. The cap matters: a peer too wedged to even take a
+    // non-maskable interrupt (stuck in a #DF, or already halted) must not
+    // hang the broadcaster forever. This both shortens the common case to
+    // microseconds and bounds the worst case — versus the old unconditional
+    // 50M-spin that always paid ~50 ms and could still race the peers'
+    // in-flight output.
     var spins: u32 = 0;
     while (spins < 50_000_000) : (spins += 1) {
+        var all_done = true;
+        for (&smp.cpus) |*cpu| {
+            if (!cpu.alive) continue;
+            if (cpu.lapic_id == my_id) continue;
+            if (cpu.lapic_id >= MAX_CPUS_NMI) continue; // untrackable id — don't gate on it
+            if (!@atomicLoad(bool, &nmi_ack[cpu.lapic_id], .acquire)) {
+                all_done = false;
+                break;
+            }
+        }
+        if (all_done) break;
         asm volatile ("pause");
     }
+
+    // Push the snapshots (and our own banner) fully out of the UART before
+    // the caller halts — otherwise the last ~16 bytes sit in QEMU's FIFO and
+    // are lost from serial.log at the exact moment they matter most.
+    serial.drainFifo();
 }
 
 /// Cross-CPU panic-section serialization. Without this, two CPUs panicing
@@ -1071,6 +1113,12 @@ const CRITICAL_WAIT_SPINS: u32 = 50_000_000;
 /// caller is expected to halt.
 pub fn enterCritical() void {
     serial.panicResetLock();
+    // Flip ALL serial output to the lock-free, FIFO-draining emergency path
+    // for the remainder of this (about-to-halt) panic. Without this, a peer
+    // frozen by the NMI broadcast below while it holds write_lock would
+    // deadlock every subsequent banner/dump on this CPU — the 2026-06-04
+    // wedge, where the snapshot hung and the log ended at a lone `[`.
+    serial.emergency_mode = true;
     const my_cpu: u32 = @intCast(@import("../time/apic.zig").getLapicId());
 
     // Already ours? (e.g., main.panic called from iretq_canary.report)
@@ -1081,6 +1129,11 @@ pub fn enterCritical() void {
         // Someone else owns. Wait their turn — or steal after timeout.
         spins += 1;
         if (spins > CRITICAL_WAIT_SPINS) {
+            // P6: the previous owner never released — it likely died holding
+            // serial's write_lock too. emergency_mode (set at entry above)
+            // already makes our output lock-free, but reset the serial lock
+            // as well so any path still on the locked logger can emit.
+            serial.panicResetLock();
             @atomicStore(u32, &critical_owner_cpu, my_cpu, .release);
             return;
         }

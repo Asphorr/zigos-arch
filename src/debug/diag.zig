@@ -39,7 +39,7 @@ pub fn printManifest() void {
     const kcsan = if (@hasDecl(build_options, "kcsan_enabled") and build_options.kcsan_enabled) "on" else "off";
     const watchdog = if (@import("watchdog.zig").isArmed()) "armed" else "disarmed";
     serial.print(
-        "[diag] traps: kasan={s} kcsan={s} watchdog={s} pcb_inv=1s alias=piggy desc_hash=piggy heap_canary=on pmm_canary=on heap_inv=on-demand smp_check=boot\n",
+        "[diag] traps: kasan={s} kcsan={s} watchdog={s} pcb_inv=1s alias=piggy desc_hash=piggy heap_canary=on pmm_canary=on kstack_canary=on heap_inv=on-demand smp_check=boot\n",
         .{ kasan, kcsan, watchdog },
     );
 }
@@ -52,11 +52,13 @@ pub fn maybeHeartbeat(tick_count: u64) void {
     last_hb_tick = tick_count;
     const hash = @import("cpu_struct_hash.zig");
     const pmm = @import("../mm/pmm.zig");
+    const process = @import("../proc/process.zig");
     const hash_count = hash.verifyCount();
     const hash_miss = hash.mismatchCount();
     const pmm_miss = pmm.pmmCanaryMismatches();
+    const kstack_canary_miss = process.stackCanaryMismatches();
     serial.print(
-        "[diag-hb] tick={d} desc_hash=runs:{d}/mis:{d} pmm_canary=mis:{d}\n",
-        .{ tick_count, hash_count, hash_miss, pmm_miss },
+        "[diag-hb] tick={d} desc_hash=runs:{d}/mis:{d} pmm_canary=mis:{d} kstack_canary=mis:{d}\n",
+        .{ tick_count, hash_count, hash_miss, pmm_miss, kstack_canary_miss },
     );
 }

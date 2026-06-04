@@ -1112,15 +1112,17 @@ fn markRange(start_frame: u32, count: u32) void {
 /// path — passing a kstack phys to freeFrame/freeContiguous marks the
 /// underlying frame "free" so the next alloc returns it; the new owner
 /// then zeroes/uses the page, clobbering a live kstack. There is no
-/// legitimate path that frees a kstack frame (kstack_pool is BSS, never
-/// PMM-managed), so any hit is unambiguously a bug — @panic to catch
-/// the buggy caller in the backtrace.
+/// legitimate path that frees a kstack frame (the pool's PMM block is
+/// allocated once at boot in initKstackGuards and never freed), so any hit
+/// is unambiguously a bug — @panic to catch the buggy caller in the backtrace.
 fn checkKstackNotFreed(base: usize, count: u32, site: []const u8, ra: usize) void {
     const process_mod = @import("../proc/process.zig");
-    const KERNEL_VIRT_BASE: usize = 0xFFFFFFFF80000000;
-    const ks_va = @intFromPtr(&process_mod.kstack_pool);
-    const ks_phys_start = ks_va - KERNEL_VIRT_BASE;
-    const ks_phys_end = ks_phys_start + @sizeOf(@TypeOf(process_mod.kstack_pool));
+    // kstack_pool is PMM-backed in the physmap now; use its recorded phys base
+    // + region size. Skip while 0 = the bootstrap window before initKstackGuards
+    // has allocated the pool (the pool's OWN allocContiguous runs through here).
+    const ks_phys_start = process_mod.kstack_pool_phys_base;
+    if (ks_phys_start == 0) return;
+    const ks_phys_end = ks_phys_start + process_mod.KSTACK_POOL_BYTES;
     const free_end = base + @as(usize, count) * FRAME_SIZE;
     if (base < ks_phys_end and free_end > ks_phys_start) {
         const symbols = @import("../debug/symbols.zig");
@@ -1137,18 +1139,20 @@ fn checkKstackNotFreed(base: usize, count: u32, site: []const u8, ra: usize) voi
     }
 }
 
-/// Tripwire: does this phys range overlap kstack_pool (a kernel .bss
-/// region that PMM should NEVER hand out — kstacks live there at fixed
-/// addresses)? Symbol-derived so it tracks kernel growth automatically.
+/// Tripwire: does this phys range overlap kstack_pool (the PMM block,
+/// allocated once at boot and never freed, that PMM must NEVER hand out
+/// again — kstacks live there)? Range comes from kstack_pool_phys_base.
 /// On hit, log the caller's RA + the bad phys; the next @memset via
 /// physmap on this range will zero a live kstack — exactly the
 /// netstat-desktop bug class.
 fn checkKstackOverlap(base: usize, count: u32, site: []const u8, ra: usize) void {
     const process_mod = @import("../proc/process.zig");
-    const KERNEL_VIRT_BASE: usize = 0xFFFFFFFF80000000;
-    const ks_va = @intFromPtr(&process_mod.kstack_pool);
-    const ks_phys_start = ks_va - KERNEL_VIRT_BASE;
-    const ks_phys_end = ks_phys_start + @sizeOf(@TypeOf(process_mod.kstack_pool));
+    // kstack_pool is PMM-backed in the physmap now; use its recorded phys base
+    // + region size. Skip while 0 = the bootstrap window before initKstackGuards
+    // has allocated the pool (the pool's OWN allocContiguous runs through here).
+    const ks_phys_start = process_mod.kstack_pool_phys_base;
+    if (ks_phys_start == 0) return;
+    const ks_phys_end = ks_phys_start + process_mod.KSTACK_POOL_BYTES;
     const alloc_end = base + @as(usize, count) * FRAME_SIZE;
     if (base < ks_phys_end and alloc_end > ks_phys_start) {
         const symbols = @import("../debug/symbols.zig");

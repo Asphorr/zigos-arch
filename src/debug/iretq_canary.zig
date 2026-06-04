@@ -356,7 +356,9 @@ fn report(
 pub fn armPermanentWatchpoints() void {
     if (!ENABLE) return;
     const watch = @import("watch.zig");
-    const kstack_pool = &process.kstack_pool;
+    // process.kstack_pool is already a pointer-to-region; don't take its
+    // address again (that would be a double pointer and mis-index below).
+    const kstack_pool = process.kstack_pool;
     const slot_size = @sizeOf(@TypeOf(kstack_pool.*[0]));
 
     const PIDS_TO_WATCH = [_]u8{ 3, 4, 5, 6 };
