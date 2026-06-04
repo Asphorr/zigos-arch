@@ -44,6 +44,19 @@ pub const C_BAD_MSG_NOTIFY: u32 = 0xa7eff811; // CRC32-verified (a7eddc27 is a m
 pub const C_RPC_RESULT: u32 = 0xf35c6d01;
 pub const C_GZIP_PACKED: u32 = 0x3072cfa1;
 
+// --- API-layer Updates (server pushes; layer 225) ---
+// These ride in as standalone top-level objects (NOT inside an rpc_result), so
+// the body walker drops them unless we recognise them. We only DETECT + SLICE
+// them here; the actual parse lives in dialogs.zig (the API layer). The five
+// message-bearing forms are surfaced; updatesTooLong / updateShortSentMessage
+// are intentionally not (the former needs getDifference, the latter only ever
+// arrives as the rpc_result of our own sendMessage).
+pub const C_UPDATE_SHORT_MESSAGE: u32 = 0x313bc7f8;
+pub const C_UPDATE_SHORT_CHAT_MESSAGE: u32 = 0x4d6deea5;
+pub const C_UPDATE_SHORT: u32 = 0x78d4dec1;
+pub const C_UPDATES_COMBINED: u32 = 0x725b04c3;
+pub const C_UPDATES: u32 = 0x74ae4240;
+
 const AesKeyIv = struct { key: [32]u8, iv: [32]u8 };
 
 /// MTProto 2.0 key/iv schedule. x = 0 (client->server) or 8 (server->client).
@@ -183,6 +196,7 @@ pub const Scan = struct {
     bad_msg_code: ?i32 = null,
     rpc_req_id: ?u64 = null, // req_msg_id this rpc_result answers
     rpc_result: ?[]const u8 = null, // the boxed result object (slice into body)
+    updates: ?[]const u8 = null, // a server-pushed Updates object (incoming msgs etc.)
 };
 
 /// Walk a decrypted message body (a single object or a msg_container) and pull
@@ -236,6 +250,11 @@ fn scanInto(body: []const u8, out: *Scan) Error!void {
             // bytes ARE the boxed result object (auth.sentCode / rpc_error / ...).
             out.rpc_req_id = r.readLong() catch return error.Malformed;
             out.rpc_result = r.buf[r.pos..];
+        },
+        C_UPDATE_SHORT_MESSAGE, C_UPDATE_SHORT_CHAT_MESSAGE, C_UPDATE_SHORT, C_UPDATES, C_UPDATES_COMBINED => {
+            // A pushed Updates object — hand the whole slice (ctor included) to the
+            // API layer to parse. Last one wins if a container holds several.
+            out.updates = body;
         },
         else => {}, // msgs_ack, gzip, ... not relevant here
     }
@@ -388,4 +407,36 @@ test "scanBody surfaces an rpc_result payload (req_msg_id + boxed result object)
     try std.testing.expect(scan.rpc_result != null);
     try std.testing.expectEqual(@as(usize, 8), scan.rpc_result.?.len);
     try std.testing.expectEqual(@as(u32, 0xdeadbeef), std.mem.readInt(u32, scan.rpc_result.?[0..4], .little));
+}
+
+test "scanBody surfaces a pushed updateShortMessage (top-level and containerised)" {
+    // bare updateShortMessage (flags=0): id:int user_id:long message:string pts pts_count date
+    var ob: [96]u8 = undefined;
+    var ow = tl.Writer.init(&ob);
+    ow.writeU32(C_UPDATE_SHORT_MESSAGE) catch unreachable;
+    ow.writeU32(0) catch unreachable; // flags
+    ow.writeU32(12345) catch unreachable; // id
+    ow.writeLong(777) catch unreachable; // user_id
+    ow.writeBytes("hi") catch unreachable; // message
+    ow.writeU32(1000) catch unreachable; // pts
+    ow.writeU32(1) catch unreachable; // pts_count
+    ow.writeU32(1700000000) catch unreachable; // date
+    const obj = ow.written();
+
+    const s1 = try scanBody(obj);
+    try std.testing.expect(s1.updates != null);
+    try std.testing.expectEqualSlices(u8, obj, s1.updates.?);
+
+    // wrapped in a msg_container — the per-inner walk still surfaces it
+    var cb: [160]u8 = undefined;
+    var cw = tl.Writer.init(&cb);
+    cw.writeU32(C_MSG_CONTAINER) catch unreachable;
+    cw.writeU32(1) catch unreachable;
+    cw.writeLong(0x7000000000000000) catch unreachable;
+    cw.writeU32(0) catch unreachable; // seqno
+    cw.writeU32(@intCast(obj.len)) catch unreachable; // bytes
+    cw.writeRaw(obj) catch unreachable;
+    const s2 = try scanBody(cw.written());
+    try std.testing.expect(s2.updates != null);
+    try std.testing.expectEqualSlices(u8, obj, s2.updates.?);
 }

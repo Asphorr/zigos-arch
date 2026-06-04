@@ -471,6 +471,22 @@ pub fn parseHistory(obj: []const u8) Error!History {
     return .{ .n = @intCast(n), .msgs = r };
 }
 
+/// After parseHistory's `Vector<Message>` has been fully consumed (the caller must
+/// have parsed all `n` messages), walk the trailing `chats` vector and return a
+/// (count, Reader) over the `users` vector — the senders, for name resolution.
+/// messages.messages / messagesSlice / channelMessages all end `... chats users`.
+pub fn parseHistoryUsers(r: *tl.Reader) Error!Contacts {
+    if ((try rU32(r)) != tl.VECTOR_CTOR) return error.UnexpectedCtor; // chats: Vector<Chat>
+    const nc = try rI32(r);
+    if (nc < 0) return error.Malformed;
+    var c: usize = 0;
+    while (c < @as(usize, @intCast(nc))) : (c += 1) try skipBoxed(r);
+    if ((try rU32(r)) != tl.VECTOR_CTOR) return error.UnexpectedCtor; // users: Vector<User>
+    const nu = try rI32(r);
+    if (nu < 0) return error.Malformed;
+    return .{ .n_users = @intCast(nu), .users = r.* };
+}
+
 // --- request builder: messages.getHistory ---
 const C_MESSAGES_GET_HISTORY: u32 = 0x4423e6c5;
 const C_INPUT_PEER_USER: u32 = 0xdde8a54c;
@@ -524,6 +540,124 @@ pub fn gunzipIfPacked(obj: []const u8, out: []u8) Error![]const u8 {
     var w: std.Io.Writer = .fixed(out);
     _ = dec.reader.streamRemaining(&w) catch return error.Malformed; // ReadFailed or out full
     return w.buffered();
+}
+
+// =====================================================================
+// Live updates — the server-pushed `Updates` objects that carry incoming
+// messages (someone messaged us, or we sent from another device). session.zig
+// detects + slices the Updates object off the decrypted body; here we parse it.
+//
+// We REUSE parseMessage (byte-exact, table-driven) for the embedded-Message
+// forms, and the generic skipBoxed to step past any non-message Update inside an
+// `updates` vector — only possible because Update/Updates were added to the
+// generated skip table. The flat short-message forms are synthesized by hand.
+// All ctor ids + field orders are from the layer-225 api.tl.
+
+// Updates (the boxed envelope)
+const C_UPDATE_SHORT_MESSAGE: u32 = 0x313bc7f8;
+const C_UPDATE_SHORT_CHAT_MESSAGE: u32 = 0x4d6deea5;
+const C_UPDATE_SHORT: u32 = 0x78d4dec1;
+const C_UPDATES: u32 = 0x74ae4240;
+const C_UPDATES_COMBINED: u32 = 0x725b04c3;
+const C_UPDATES_TOO_LONG: u32 = 0xe317af7e;
+// Update (the inner variants we EXTRACT; everything else is skipBoxed'd)
+const C_UPDATE_NEW_MESSAGE: u32 = 0x1f2b0afd;
+const C_UPDATE_NEW_CHANNEL_MESSAGE: u32 = 0x62ba04d9;
+
+/// The result of parsing one pushed Updates object: the new messages it carried
+/// (filled into the caller's buffer) plus a (count, Reader) over its users vector
+/// (only for the `updates`/`updatesCombined` container forms) so the caller can
+/// harvest sender names. `too_long` signals updatesTooLong (the caller may want
+/// to resync via getDifference — not implemented yet).
+pub const Incoming = struct {
+    msgs: []Message,
+    too_long: bool = false,
+    n_users: usize = 0,
+    users: tl.Reader = undefined,
+};
+
+/// updateShortMessage / updateShortChatMessage — a flat (no embedded Message)
+/// form for 1-1 and basic-group text messages. Synthesize a Message from it.
+fn parseShortMessage(r: *tl.Reader, is_chat: bool) Error!Message {
+    const f = try rU32(r);
+    var m = Message{ .out = bit(f, 1) };
+    m.id = try rI32(r);
+    if (is_chat) {
+        m.from = .{ .kind = .user, .id = try rLong(r) }; // from_id (the sender)
+        m.peer = .{ .kind = .chat, .id = try rLong(r) }; // chat_id (the dialog)
+    } else {
+        const uid = try rLong(r); // user_id = the other party = the dialog
+        m.peer = .{ .kind = .user, .id = uid };
+        m.from = .{ .kind = .user, .id = uid };
+    }
+    m.text = try rBytes(r); // message
+    _ = try rI32(r); // pts
+    _ = try rI32(r); // pts_count
+    m.date = try rI32(r);
+    // trailing optionals (fwd_from/via_bot_id/reply_to/entities/ttl_period) are
+    // not read: this is the whole standalone object, nothing follows it.
+    return m;
+}
+
+/// Parse one `Update`: if it's a new-message variant, extract the Message into
+/// `out`; otherwise step past it with the generic table-driven skipper.
+fn parseOneUpdate(r: *tl.Reader, out: []Message, n: *usize) Error!void {
+    const snap = r.*;
+    const ctor = try rU32(r);
+    if (ctor == C_UPDATE_NEW_MESSAGE or ctor == C_UPDATE_NEW_CHANNEL_MESSAGE) {
+        const m = try parseMessage(r); // byte-exact (consumes media/entities/...)
+        _ = try rI32(r); // pts
+        _ = try rI32(r); // pts_count
+        if (!m.empty and n.* < out.len) {
+            out[n.*] = m;
+            n.* += 1;
+        }
+    } else {
+        r.* = snap; // rewind to the ctor, then skip the whole Update via the table
+        try skipBoxed(r);
+    }
+}
+
+/// Parse a pushed `Updates` object, extracting any new messages into `out`.
+pub fn parseUpdates(obj: []const u8, out: []Message) Error!Incoming {
+    var r = tl.Reader.init(obj);
+    var n: usize = 0;
+    switch (try rU32(&r)) {
+        C_UPDATES_TOO_LONG => return .{ .msgs = out[0..0], .too_long = true },
+        C_UPDATE_SHORT_MESSAGE => {
+            const m = try parseShortMessage(&r, false);
+            if (!m.empty and out.len > 0) {
+                out[0] = m;
+                n = 1;
+            }
+        },
+        C_UPDATE_SHORT_CHAT_MESSAGE => {
+            const m = try parseShortMessage(&r, true);
+            if (!m.empty and out.len > 0) {
+                out[0] = m;
+                n = 1;
+            }
+        },
+        C_UPDATE_SHORT => {
+            // updateShort: update:Update date:int — one embedded Update.
+            try parseOneUpdate(&r, out, &n);
+        },
+        C_UPDATES, C_UPDATES_COMBINED => {
+            // updates: Vector<Update> users:Vector<User> chats:Vector<Chat> date seq[...]
+            if ((try rU32(&r)) != tl.VECTOR_CTOR) return error.UnexpectedCtor;
+            const nupd = try rI32(&r);
+            if (nupd < 0) return error.Malformed;
+            var i: usize = 0;
+            while (i < @as(usize, @intCast(nupd))) : (i += 1) try parseOneUpdate(&r, out, &n);
+            // users vector follows — hand it back for sender-name harvesting
+            if ((try rU32(&r)) != tl.VECTOR_CTOR) return error.UnexpectedCtor;
+            const nusers = try rI32(&r);
+            if (nusers < 0) return error.Malformed;
+            return .{ .msgs = out[0..n], .n_users = @intCast(nusers), .users = r };
+        },
+        else => {}, // updateShortSentMessage et al. carry no incoming message for us
+    }
+    return .{ .msgs = out[0..n] };
 }
 
 // =====================================================================
@@ -1043,6 +1177,33 @@ test "parseHistory + parseMessage iterate a Vector<Message>" {
     try std.testing.expectEqualStrings("second", m2.text);
 }
 
+test "parseHistoryUsers reaches the senders after the messages vector" {
+    var buf: [256]u8 = undefined;
+    var w = tl.Writer.init(&buf);
+    try w.writeU32(C_MESSAGES_MESSAGES);
+    try w.writeU32(tl.VECTOR_CTOR);
+    try w.writeInt(1);
+    try writeSimpleMessage(&w, 5, "hi");
+    try w.writeU32(tl.VECTOR_CTOR); // chats: Vector<Chat>[0]
+    try w.writeInt(0);
+    try w.writeU32(tl.VECTOR_CTOR); // users: Vector<User>[1] = Bob(42)
+    try w.writeInt(1);
+    try w.writeU32(C_USER);
+    try w.writeU32(1 << 1); // first only
+    try w.writeU32(0);
+    try w.writeLong(42);
+    try w.writeBytes("Bob");
+
+    var h = try parseHistory(w.written());
+    try std.testing.expectEqual(@as(usize, 1), h.n);
+    _ = try parseMessage(&h.msgs); // consume the one message
+    var hu = try parseHistoryUsers(&h.msgs);
+    try std.testing.expectEqual(@as(usize, 1), hu.n_users);
+    const u = try parseUser(&hu.users);
+    try std.testing.expectEqual(@as(u64, 42), u.id);
+    try std.testing.expectEqualStrings("Bob", u.first);
+}
+
 test "buildGetHistory wire bytes (inputPeerUser)" {
     var buf: [64]u8 = undefined;
     const q = try buildGetHistory(&buf, .{ .kind = .user, .id = 0x1122 }, 0x3344, 20);
@@ -1212,4 +1373,108 @@ test "buildGetDialogs / buildSendMessage wire bytes" {
         "4433000000000000" ++ // access_hash
         "03686579" ++ // message = "hey" (len-prefixed, padded)
         "5500000000000000"); // random_id
+}
+
+// ---- live updates ----
+
+test "parseUpdates: updateShortMessage → one synthesized incoming message" {
+    var buf: [96]u8 = undefined;
+    var w = tl.Writer.init(&buf);
+    try w.writeU32(C_UPDATE_SHORT_MESSAGE);
+    try w.writeU32(0); // flags
+    try w.writeInt(42); // id
+    try w.writeLong(555); // user_id
+    try w.writeBytes("yo");
+    try w.writeInt(1000); // pts
+    try w.writeInt(1); // pts_count
+    try w.writeInt(1700009999); // date
+    var out: [8]Message = undefined;
+    const inc = try parseUpdates(w.written(), &out);
+    try std.testing.expectEqual(@as(usize, 1), inc.msgs.len);
+    try std.testing.expectEqual(PeerKind.user, inc.msgs[0].peer.kind);
+    try std.testing.expectEqual(@as(u64, 555), inc.msgs[0].peer.id);
+    try std.testing.expectEqualStrings("yo", inc.msgs[0].text);
+    try std.testing.expectEqual(@as(i32, 1700009999), inc.msgs[0].date);
+    try std.testing.expect(!inc.msgs[0].out);
+}
+
+test "parseUpdates: updateShortChatMessage carries the sender + the chat dialog" {
+    var buf: [96]u8 = undefined;
+    var w = tl.Writer.init(&buf);
+    try w.writeU32(C_UPDATE_SHORT_CHAT_MESSAGE);
+    try w.writeU32(1 << 1); // flags: out
+    try w.writeInt(7); // id
+    try w.writeLong(111); // from_id (sender)
+    try w.writeLong(222); // chat_id (dialog)
+    try w.writeBytes("hi all");
+    try w.writeInt(1000); // pts
+    try w.writeInt(1); // pts_count
+    try w.writeInt(1700000000); // date
+    var out: [8]Message = undefined;
+    const inc = try parseUpdates(w.written(), &out);
+    try std.testing.expectEqual(@as(usize, 1), inc.msgs.len);
+    try std.testing.expectEqual(PeerKind.chat, inc.msgs[0].peer.kind);
+    try std.testing.expectEqual(@as(u64, 222), inc.msgs[0].peer.id);
+    try std.testing.expectEqual(PeerKind.user, inc.msgs[0].from.kind);
+    try std.testing.expectEqual(@as(u64, 111), inc.msgs[0].from.id);
+    try std.testing.expect(inc.msgs[0].out);
+}
+
+test "parseUpdates: updateShort(updateNewMessage) reuses parseMessage" {
+    var buf: [128]u8 = undefined;
+    var w = tl.Writer.init(&buf);
+    try w.writeU32(C_UPDATE_SHORT);
+    try w.writeU32(C_UPDATE_NEW_MESSAGE);
+    try writeSimpleMessage(&w, 7, "hello"); // message#..., peerUser(777)
+    try w.writeInt(1000); // pts
+    try w.writeInt(1); // pts_count
+    try w.writeInt(1700000000); // updateShort.date
+    var out: [8]Message = undefined;
+    const inc = try parseUpdates(w.written(), &out);
+    try std.testing.expectEqual(@as(usize, 1), inc.msgs.len);
+    try std.testing.expectEqual(@as(i32, 7), inc.msgs[0].id);
+    try std.testing.expectEqualStrings("hello", inc.msgs[0].text);
+}
+
+test "parseUpdates: updates container skips a non-message update + harvests users" {
+    var buf: [256]u8 = undefined;
+    var w = tl.Writer.init(&buf);
+    try w.writeU32(C_UPDATES);
+    // updates: Vector<Update>[2] = { updateReadHistoryOutbox (skipped), updateNewMessage }
+    try w.writeU32(tl.VECTOR_CTOR);
+    try w.writeInt(2);
+    // updateReadHistoryOutbox#2f2f21bf peer:Peer max_id:int pts:int pts_count:int — table-skipped
+    try w.writeU32(0x2f2f21bf);
+    try w.writeU32(C_PEER_USER);
+    try w.writeLong(555);
+    try w.writeInt(9); // max_id
+    try w.writeInt(1000); // pts
+    try w.writeInt(1); // pts_count
+    // updateNewMessage(message id=8 "hey")
+    try w.writeU32(C_UPDATE_NEW_MESSAGE);
+    try writeSimpleMessage(&w, 8, "hey");
+    try w.writeInt(1001); // pts
+    try w.writeInt(1); // pts_count
+    // users: Vector<User>[1] = Alice(555)
+    try w.writeU32(tl.VECTOR_CTOR);
+    try w.writeInt(1);
+    try w.writeU32(C_USER);
+    try w.writeU32(1 << 1); // first only
+    try w.writeU32(0);
+    try w.writeLong(555);
+    try w.writeBytes("Alice");
+    // chats: Vector<Chat>[0] + date + seq (ignored by parseUpdates)
+    try w.writeU32(tl.VECTOR_CTOR);
+    try w.writeInt(0);
+    try w.writeInt(1700000000); // date
+    try w.writeInt(1); // seq
+
+    var out: [8]Message = undefined;
+    var inc = try parseUpdates(w.written(), &out);
+    try std.testing.expectEqual(@as(usize, 1), inc.msgs.len);
+    try std.testing.expectEqualStrings("hey", inc.msgs[0].text);
+    try std.testing.expectEqual(@as(usize, 1), inc.n_users);
+    const u = try parseUser(&inc.users);
+    try std.testing.expectEqual(@as(u64, 555), u.id);
+    try std.testing.expectEqualStrings("Alice", u.first);
 }

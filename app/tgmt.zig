@@ -526,6 +526,9 @@ const COL_BUBBLE_TXT: u32 = 0x16181A;
 const COL_SERVICE_BG: u32 = 0x8499AC;
 const COL_PLACEHOLDER: u32 = 0x5E6B78;
 const COL_INPUT_FIELD: u32 = 0xF0F0F3;
+const COL_TIME_IN: u32 = 0x9AA6B0; // timestamp on incoming/white bubbles
+const COL_TIME_OUT: u32 = 0x6AAE7C; // timestamp on outgoing/green bubbles
+const COL_DATESEP_TXT: u32 = 0xFFFFFF; // date-separator pill text
 
 // Telegram's avatar color ring, picked by user id.
 const AVATAR_COLORS = [_]u32{ 0xE17076, 0xEDA86C, 0xA695E7, 0x7BC862, 0x6EC9CB, 0x65AADD, 0xEE7AAE };
@@ -540,6 +543,8 @@ const MSG_MARGIN: u32 = 16; // bubble inset from the pane edge
 const MSG_GAP: u32 = 8; // vertical gap between bubbles
 const PAD_X: u32 = 11; // bubble text horizontal padding
 const PAD_Y: u32 = 7; // bubble text vertical padding
+const TIME_GAP: u32 = 10; // gap between the last text line and the inline timestamp
+const SEP_H: u32 = 30; // height reserved for a date-separator pill row
 
 // --- window + text renderers (separate glyph caches over the same TTF) ---
 var canvas: gfx.Canvas = undefined;
@@ -672,6 +677,142 @@ fn addContact(u: dialogs.User) void {
     contact_count += 1;
 }
 
+/// Find the sidebar row for a (kind,id) peer — used to route a live incoming
+/// message to the right chat.
+fn findContact(kind: dialogs.PeerKind, id: u64) ?usize {
+    var i: usize = 0;
+    while (i < contact_count) : (i += 1) {
+        if (contacts[i].id == id and contacts[i].kind == kind) return i;
+    }
+    return null;
+}
+
+// ---- sender-name cache: id -> display name, harvested from the dialog list's
+// users and from live `updates` user vectors, so incoming group/channel bubbles
+// can show who sent them. Bounded; a miss simply shows no name. ----
+const NameEntry = struct { id: u64 = 0, name: [40]u8 = undefined, len: u8 = 0 };
+var name_cache: [1024]NameEntry = undefined;
+var name_cache_n: usize = 0;
+var show_senders: bool = false; // true while the open chat is a group/channel
+
+fn cacheUserName(u: dialogs.User) void {
+    if (u.id == 0 or u.deleted) return;
+    var nm: [40]u8 = undefined;
+    var k: usize = 0;
+    if (u.first.len > 0) k += copyOut(nm[k..], u.first);
+    if (u.last.len > 0 and k < nm.len) {
+        if (k > 0 and k < nm.len) {
+            nm[k] = ' ';
+            k += 1;
+        }
+        k += copyOut(nm[k..], u.last);
+    }
+    if (k == 0) return;
+    var i: usize = 0;
+    while (i < name_cache_n) : (i += 1) {
+        if (name_cache[i].id == u.id) {
+            @memcpy(name_cache[i].name[0..k], nm[0..k]);
+            name_cache[i].len = @intCast(k);
+            return;
+        }
+    }
+    if (name_cache_n >= name_cache.len) return;
+    name_cache[name_cache_n] = .{ .id = u.id };
+    @memcpy(name_cache[name_cache_n].name[0..k], nm[0..k]);
+    name_cache[name_cache_n].len = @intCast(k);
+    name_cache_n += 1;
+}
+
+fn lookupName(id: u64) ?[]const u8 {
+    var i: usize = 0;
+    while (i < name_cache_n) : (i += 1) {
+        if (name_cache[i].id == id) return name_cache[i].name[0..name_cache[i].len];
+    }
+    return null;
+}
+
+/// Set a row's sender label (incoming group/channel messages only, when the
+/// sender resolves in the name cache); `show` also folds in consecutive-message
+/// grouping so a run from one person labels only its first bubble.
+fn setSender(e: *MsgRow, show: bool) void {
+    if (show and !e.out and !e.service) {
+        if (lookupName(e.from_id)) |nm| {
+            e.sender_len = @intCast(sanitizeCopy(&e.sender, nm));
+            e.sender_col = avatarColor(e.from_id);
+            return;
+        }
+    }
+    e.sender_len = 0;
+}
+
+// ---- civil date/time from a Unix timestamp (UTC; the kernel clock has no tz) ----
+const MONTHS = [_][]const u8{ "January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December" };
+var cur_year: i32 = 0; // set at GUI start, so a separator only shows the year when it isn't this one
+
+const Civil = struct { y: i32, m: u32, d: u32 };
+
+/// days since the Unix epoch -> calendar date (Howard Hinnant's algorithm).
+fn civilFromDays(days: i64) Civil {
+    const z = days + 719468;
+    const era: i64 = @divFloor(if (z >= 0) z else z - 146096, 146097);
+    const doe: i64 = z - era * 146097; // [0, 146096]
+    const yoe: i64 = @divTrunc(doe - @divTrunc(doe, 1460) + @divTrunc(doe, 36524) - @divTrunc(doe, 146096), 365); // [0,399]
+    const y: i64 = yoe + era * 400;
+    const doy: i64 = doe - (365 * yoe + @divTrunc(yoe, 4) - @divTrunc(yoe, 100)); // [0,365]
+    const mp: i64 = @divTrunc(5 * doy + 2, 153); // [0,11]
+    const d: i64 = doy - @divTrunc(153 * mp + 2, 5) + 1; // [1,31]
+    const m: i64 = if (mp < 10) mp + 3 else mp - 9; // [1,12]
+    return .{ .y = @intCast(if (m <= 2) y + 1 else y), .m = @intCast(m), .d = @intCast(d) };
+}
+
+fn dayOf(date: i32) i64 {
+    return @divFloor(@as(i64, date), 86400);
+}
+
+/// Format "HH:MM" (UTC) into the row's time field.
+fn fmtTime(e: *MsgRow) void {
+    if (e.date <= 0 or e.service) {
+        e.time_len = 0;
+        return;
+    }
+    const sod: u32 = @intCast(@mod(@as(i64, e.date), 86400));
+    const hh = sod / 3600;
+    const mm = (sod % 3600) / 60;
+    e.time[0] = '0' + @as(u8, @intCast(hh / 10));
+    e.time[1] = '0' + @as(u8, @intCast(hh % 10));
+    e.time[2] = ':';
+    e.time[3] = '0' + @as(u8, @intCast(mm / 10));
+    e.time[4] = '0' + @as(u8, @intCast(mm % 10));
+    e.time_len = 5;
+}
+
+var datelbl_year: [8]u8 = undefined;
+/// A date-separator label, e.g. "June 4" or "June 4, 2025", into `buf`.
+fn fmtDateLabel(buf: []u8, date: i32) []const u8 {
+    const c = civilFromDays(dayOf(date));
+    var n: usize = 0;
+    const mon = if (c.m >= 1 and c.m <= 12) MONTHS[c.m - 1] else "?";
+    n += copyOut(buf[n..], mon);
+    if (n < buf.len) {
+        buf[n] = ' ';
+        n += 1;
+    }
+    n += copyOut(buf[n..], u64Str(@intCast(c.d))); // copied out before u64Str is reused
+    if (c.y != cur_year) {
+        if (n + 2 <= buf.len) {
+            buf[n] = ',';
+            buf[n + 1] = ' ';
+            n += 2;
+        }
+        // stash the year string (u64Str shares a static buffer) before copying
+        const ys = u64Str(@intCast(c.y));
+        const yl = @min(ys.len, datelbl_year.len);
+        @memcpy(datelbl_year[0..yl], ys[0..yl]);
+        n += copyOut(buf[n..], datelbl_year[0..yl]);
+    }
+    return buf[0..n];
+}
+
 /// Copy `src` into `dst` whole-UTF-8-char at a time (never split a multibyte
 /// char), replacing control bytes with spaces so a message stays on one row.
 fn sanitizeCopy(dst: []u8, src: []const u8) usize {
@@ -700,12 +841,21 @@ const MsgRow = struct {
     text_len: u16 = 0,
     out: bool = false,
     service: bool = false,
+    date: i32 = 0, // unix timestamp (for the inline time + date separators)
+    from_id: u64 = 0, // sender (for the group/channel sender name)
     // Wrapped-line layout for the current window width (computed at chat load).
     line_start: [MAX_LINES]u16 = undefined,
     line_len: [MAX_LINES]u16 = undefined,
     nlines: u8 = 0,
     bub_w: u16 = 0, // inner text width (px)
     bub_h: u16 = 0, // full bubble height (px)
+    // Stage B decorations (computed in layoutMessage).
+    time: [6]u8 = undefined, // "HH:MM"
+    time_len: u8 = 0,
+    time_own_row: bool = false, // time didn't fit beside the last line → own row
+    sender: [40]u8 = undefined, // group/channel sender name (incoming only)
+    sender_len: u8 = 0,
+    sender_col: u32 = 0,
 };
 var msgs: [128]MsgRow = undefined;
 var msg_count: usize = 0;
@@ -766,9 +916,47 @@ fn layoutMessage(e: *MsgRow, max_inner: u32) void {
     }
     if (line_start < s.len or nl == 0) pushLine(e, &nl, &widest, line_start, s.len, cur_w);
     e.nlines = @intCast(nl);
-    e.bub_w = @intCast(@min(widest, max_inner));
+    const lh = tr.lineHeight();
     const lines: u32 = @max(1, @as(u32, @intCast(nl)));
-    e.bub_h = @intCast(PAD_Y * 2 + lines * tr.lineHeight());
+
+    // --- timestamp placement: beside the last line if it fits, else its own row ---
+    fmtTime(e);
+    var inner_w: u32 = widest;
+    e.time_own_row = false;
+    var extra_h: u32 = 0;
+    if (e.time_len > 0) {
+        const timw = tr_sm.measure(e.time[0..e.time_len]);
+        const last_w: u32 = if (nl > 0) lineWidthPx(e, nl - 1) else 0;
+        if (nl > 0 and last_w + TIME_GAP + timw <= max_inner) {
+            if (last_w + TIME_GAP + timw > inner_w) inner_w = last_w + TIME_GAP + timw;
+        } else {
+            e.time_own_row = true;
+            if (timw > inner_w) inner_w = timw;
+            extra_h += tr_sm.lineHeight();
+        }
+    }
+    // --- sender-name row (set by setSender before layout) ---
+    var name_h: u32 = 0;
+    if (e.sender_len > 0) {
+        const sw = tr_sm.measure(e.sender[0..e.sender_len]);
+        if (sw > inner_w) inner_w = sw;
+        name_h = tr_sm.lineHeight();
+    }
+    e.bub_w = @intCast(@min(inner_w, max_inner));
+    e.bub_h = @intCast(PAD_Y * 2 + name_h + lines * lh + extra_h);
+}
+
+/// Pixel width of one wrapped line (sum of glyph advances), for time placement.
+fn lineWidthPx(e: *const MsgRow, li: usize) u32 {
+    const a = e.line_start[li];
+    const s = e.text[a .. a + e.line_len[li]];
+    var w: u32 = 0;
+    var i: usize = 0;
+    while (i < s.len) {
+        w += tr.advanceOf(decodeCp(s, i));
+        i += ttf.Utf8.cpLen(s, i);
+    }
+    return w;
 }
 
 fn maxInnerWidth() u32 {
@@ -782,7 +970,14 @@ fn maxInnerWidth() u32 {
 fn layoutAll() void {
     const mi = maxInnerWidth();
     var i: usize = 0;
-    while (i < msg_count) : (i += 1) layoutMessage(&msgs[i], mi);
+    while (i < msg_count) : (i += 1) {
+        // grouping: show the sender only when it differs from the previous DISPLAYED
+        // (older) message. The store is newest-first, so the older neighbour is i+1.
+        const prev_same = i + 1 < msg_count and !msgs[i + 1].service and
+            msgs[i + 1].from_id == msgs[i].from_id and msgs[i + 1].out == msgs[i].out;
+        setSender(&msgs[i], show_senders and !prev_same);
+        layoutMessage(&msgs[i], mi);
+    }
 }
 
 // ---- drawing ----------------------------------------------------------------
@@ -936,14 +1131,43 @@ fn drawBubble(e: *const MsgRow, area_x0: u32, pw: u32, y: i32, y0: i32, y1: i32)
     const txt_col: u32 = if (e.service) 0xFFFFFF else COL_BUBBLE_TXT;
     const clip = ttf.Clip{ .x0 = @intCast(area_x0), .y0 = y0, .x1 = @intCast(area_x0 + pw), .y1 = y1 };
     const lh = tr.lineHeight();
-    var li: usize = 0;
     var ly = y + @as(i32, @intCast(PAD_Y));
+    // sender name (incoming group/channel messages only)
+    if (e.sender_len > 0) {
+        _ = tr_sm.drawClip(&canvas, bx + @as(i32, @intCast(PAD_X)), ly, e.sender[0..e.sender_len], e.sender_col, clip);
+        ly += @intCast(tr_sm.lineHeight());
+    }
+    var li: usize = 0;
     while (li < e.nlines) : (li += 1) {
         const a = e.line_start[li];
         const s = e.text[a .. a + e.line_len[li]];
         _ = tr.drawClip(&canvas, bx + @as(i32, @intCast(PAD_X)), ly, s, txt_col, clip);
         ly += @intCast(lh);
     }
+    // timestamp (bottom-right): beside the last line, or on its own trailing row
+    if (e.time_len > 0) {
+        const timw = tr_sm.measure(e.time[0..e.time_len]);
+        const tcol: u32 = if (e.out) COL_TIME_OUT else COL_TIME_IN;
+        const tx: i32 = bx + @as(i32, @intCast(bw)) - @as(i32, @intCast(PAD_X)) - @as(i32, @intCast(timw));
+        const ty: i32 = if (e.time_own_row) ly else ly - @as(i32, @intCast(lh)) + @as(i32, @intCast(lh -| tr_sm.lineHeight()));
+        _ = tr_sm.drawClip(&canvas, tx, ty, e.time[0..e.time_len], tcol, clip);
+    }
+}
+
+/// A centered date-separator pill (e.g. "June 4"), like a service message.
+fn drawDateSep(px0: u32, pw: u32, y: i32, date: i32, y0: i32, y1: i32) void {
+    var lbl: [32]u8 = undefined;
+    const s = fmtDateLabel(&lbl, date);
+    const tw = tr_sm.measure(s);
+    const pillw: u32 = tw + 20;
+    const bx: i32 = @as(i32, @intCast(px0)) + @as(i32, @intCast((pw -| pillw) / 2));
+    const by: i32 = y + 4;
+    const pillh: u32 = 22;
+    fillClampY(bx, by, pillw, pillh, COL_SERVICE_BG, y0, y1);
+    if (by >= y0 and by + @as(i32, @intCast(pillh)) <= y1)
+        canvas.roundCornersRadius(@intCast(bx), @intCast(by), pillw, pillh, pillh / 2, COL_CHAT_BG);
+    const clip = ttf.Clip{ .x0 = @intCast(px0), .y0 = y0, .x1 = @intCast(px0 + pw), .y1 = y1 };
+    tr_sm.drawCentered(&canvas, bx, by + 3, pillw, s, COL_DATESEP_TXT, clip);
 }
 
 fn drawMessages(px0: u32, pw: u32, y0: i32, y1: i32) void {
@@ -953,18 +1177,39 @@ fn drawMessages(px0: u32, pw: u32, y0: i32, y1: i32) void {
         return;
     }
     const view_h: i32 = y1 - y0;
+    // total height including date separators (same display-order walk as the draw pass)
     var total: i32 = @intCast(MSG_GAP);
-    var i: usize = 0;
-    while (i < msg_count) : (i += 1) total += @as(i32, @intCast(msgs[i].bub_h + MSG_GAP));
+    var prev_day: i64 = std.math.minInt(i64);
+    var k: usize = 0;
+    while (k < msg_count) : (k += 1) {
+        const e = &msgs[msg_count - 1 - k];
+        if (e.date > 0) {
+            const d = dayOf(e.date);
+            if (d != prev_day) {
+                total += @intCast(SEP_H);
+                prev_day = d;
+            }
+        }
+        total += @as(i32, @intCast(e.bub_h + MSG_GAP));
+    }
     var maxscroll: i32 = total - view_h;
     if (maxscroll < 0) maxscroll = 0;
     if (msg_scroll < 0) msg_scroll = 0;
     if (msg_scroll > maxscroll) msg_scroll = maxscroll;
     // newest pinned to the bottom; msg_scroll pushes the content down to reveal older
     var y: i32 = y1 - total + msg_scroll + @as(i32, @intCast(MSG_GAP));
-    var k: usize = 0;
+    prev_day = std.math.minInt(i64);
+    k = 0;
     while (k < msg_count) : (k += 1) {
         const e = &msgs[msg_count - 1 - k]; // store is newest-first → display oldest→newest
+        if (e.date > 0) {
+            const d = dayOf(e.date);
+            if (d != prev_day) {
+                if (y + @as(i32, @intCast(SEP_H)) > y0 and y < y1) drawDateSep(px0, pw, y, e.date, y0, y1);
+                y += @intCast(SEP_H);
+                prev_day = d;
+            }
+        }
         const bh: i32 = @intCast(e.bub_h);
         if (y + bh > y0 and y < y1) drawBubble(e, px0, pw, y, y0, y1);
         y += bh + @as(i32, @intCast(MSG_GAP));
@@ -1087,17 +1332,34 @@ fn loadHistoryFromObj(obj: []const u8) void {
         msg_count = 0;
         return;
     };
+    // show sender names only for group/channel chats
+    if (net_for_contact >= 0 and net_for_contact < @as(i32, @intCast(contact_count)))
+        show_senders = contacts[@intCast(net_for_contact)].kind != .user;
     msg_count = 0;
     var i: usize = 0;
     while (i < h.n and msg_count < msgs.len) : (i += 1) {
         const m = dialogs.parseMessage(&h.msgs) catch break;
         const e = &msgs[msg_count];
+        e.* = .{};
         const src = if (m.service) "service message" else if (m.empty) "(empty message)" else m.text;
         e.text_len = @intCast(sanitizeCopy(&e.text, src));
         e.out = m.out;
         e.service = m.service;
+        e.date = m.date;
+        e.from_id = m.from.id;
         msg_count += 1;
     }
+    // consume any messages beyond the display cap, then cache the senders so
+    // group/channel bubbles can show who wrote each one.
+    while (i < h.n) : (i += 1) _ = dialogs.parseMessage(&h.msgs) catch break;
+    if (dialogs.parseHistoryUsers(&h.msgs)) |hu| {
+        var ur = hu.users;
+        var k: usize = 0;
+        while (k < hu.n_users) : (k += 1) {
+            const u = dialogs.parseUser(&ur) catch break;
+            cacheUserName(u);
+        }
+    } else |_| {}
     layoutAll();
 }
 
@@ -1148,6 +1410,7 @@ fn loadDialogsFromObj(obj: []const u8) void {
     var i: usize = 0;
     while (i < list.n_users and n_tmp_users < tmp_users.len) : (i += 1) {
         tmp_users[n_tmp_users] = dialogs.parseUser(&list.users) catch break;
+        cacheUserName(tmp_users[n_tmp_users]); // feed the sender-name cache
         n_tmp_users += 1;
     }
     n_tmp_chats = 0;
@@ -1272,17 +1535,29 @@ fn inputAppendByte(b: u8) void {
 
 /// Insert a just-sent message at the bottom of the chat. The store is newest-
 /// first, so the newest bubble lives at index 0 — shift the rest up by one.
-fn prependOutgoing(text: []const u8) void {
+fn insertNewest(text: []const u8, out: bool, service: bool, date: i32, from_id: u64) void {
+    const had = msg_count;
     if (msg_count >= msgs.len) msg_count = msgs.len - 1; // drop the oldest to make room
     var i: usize = msg_count;
     while (i > 0) : (i -= 1) msgs[i] = msgs[i - 1];
     const e = &msgs[0];
     e.* = .{};
     e.text_len = @intCast(sanitizeCopy(&e.text, text));
-    e.out = true;
-    e.service = false;
+    e.out = out;
+    e.service = service;
+    e.date = date;
+    e.from_id = from_id;
+    // sender grouping vs the previous newest (now at index 1)
+    const prev_same = had > 0 and !msgs[1].service and msgs[1].from_id == from_id and msgs[1].out == out;
+    setSender(e, show_senders and !prev_same);
     layoutMessage(e, maxInnerWidth());
     msg_count += 1;
+}
+
+/// Optimistic local echo of a message we just sent.
+fn prependOutgoing(text: []const u8) void {
+    const now: i32 = @intCast(libc.gettimeofday().sec);
+    insertNewest(text, true, false, now, self_id);
 }
 
 var send_rng: [8]u8 = undefined;
@@ -1311,6 +1586,57 @@ fn doSend(conn: *transport.Conn) void {
     prependOutgoing(input[0..input_len]); // optimistic local echo
     input_len = 0;
     msg_scroll = 0; // pin to the bottom so the new bubble shows
+    dirty = true;
+}
+
+// ---- live incoming messages (server-pushed Updates) ------------------------
+
+var in_msgs: [16]dialogs.Message = undefined;
+
+/// Parse a pushed Updates object and deliver any new messages to the UI.
+fn applyUpdates(upd: []const u8) void {
+    const inc = dialogs.parseUpdates(upd, &in_msgs) catch return;
+    // harvest sender names from the accompanying users vector (only the container
+    // forms carry one; `users` is undefined otherwise, so gate on the count).
+    if (inc.n_users > 0) {
+        var ur = inc.users;
+        var ui: usize = 0;
+        while (ui < inc.n_users) : (ui += 1) {
+            const u = dialogs.parseUser(&ur) catch break;
+            cacheUserName(u);
+        }
+    }
+    for (inc.msgs) |m| routeIncoming(m);
+}
+
+// We don't send msgs_ack, so the server may re-push an un-acked update. A small
+// ring of recent (peer,id) keys drops the repeats so a message isn't shown twice.
+var seen_keys: [64]u64 = [_]u64{0} ** 64;
+var seen_pos: usize = 0;
+fn alreadySeen(key: u64) bool {
+    if (key == 0) return false;
+    for (seen_keys) |k| if (k == key) return true;
+    seen_keys[seen_pos] = key;
+    seen_pos = (seen_pos + 1) % seen_keys.len;
+    return false;
+}
+
+/// Deliver one incoming message: bump its dialog's preview/unread, and append it
+/// live if that chat is the one currently open.
+fn routeIncoming(m: dialogs.Message) void {
+    const id32: u64 = @as(u32, @bitCast(m.id));
+    if (alreadySeen((m.peer.id *% 1000003) ^ id32)) return; // a resend of one we showed
+    const idx = findContact(m.peer.kind, m.peer.id) orelse return; // unknown dialog → ignore
+    const e = &contacts[idx];
+    const t: []const u8 = if (m.service) "service message" else m.text;
+    e.preview_len = @intCast(sanitizeCopy(&e.preview, t));
+    const is_open = (sel == @as(i32, @intCast(idx)) and chat_loaded == sel);
+    if (is_open) {
+        insertNewest(t, m.out, m.service, m.date, m.from.id);
+        if (msg_scroll > 0) msg_scroll += @intCast(msgs[0].bub_h + MSG_GAP); // hold position if scrolled up
+    } else if (!m.out) {
+        e.unread += 1; // badge a chat we're not looking at
+    }
     dirty = true;
 }
 
@@ -1347,6 +1673,7 @@ fn pumpNet(conn: *transport.Conn) void {
         if (scan.rpc_result) |res| {
             if (net_state != .idle and scan.rpc_req_id == net_req_id) handleResult(res);
         }
+        if (scan.updates) |upd| applyUpdates(upd); // live incoming messages
     }
 }
 
@@ -1375,6 +1702,7 @@ fn onClick(mx: i32, my: i32, conn: *transport.Conn) void {
     const i = listIndexAt(my);
     if (i < 0 or i == sel) return;
     sel = i;
+    show_senders = contacts[@intCast(i)].kind != .user; // groups/channels show sender names
     msg_scroll = 0;
     chat_loaded = -1;
     input_len = 0; // fresh compose box for the new chat
@@ -1437,6 +1765,7 @@ fn runGui(conn: *transport.Conn) void {
         libc.destroyWindow();
         return;
     }
+    cur_year = civilFromDays(dayOf(@intCast(libc.gettimeofday().sec))).y; // for date separators
     emit("[tgmt] Telegram window open — click a chat to read it, type to reply, Esc to go back.\n");
 
     var mx: i32 = 0;

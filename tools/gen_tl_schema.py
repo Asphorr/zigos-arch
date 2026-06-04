@@ -25,6 +25,10 @@ ROOTS = [
     "DraftMessage", "ChatPhoto", "ChatAdminRights", "ChatBannedRights",
     "InputChannel", "EmojiStatus", "PeerColor", "Username", "RecentStory",
     "Photo", "Document", "WebPage",
+    # Live updates (server pushes): the generic walker must be able to consume
+    # any Update variant byte-exactly so it can step past typing/read/status
+    # updates to reach the new-message ones inside an `updates` vector.
+    "Update", "Updates",
 ]
 
 # Primitives read by fixed/known rules (Bool = read the 4-byte ctor; both
