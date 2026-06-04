@@ -2417,6 +2417,130 @@ fn invokeDsm(n: *StoredNode, uuid: *const [16]u8, rev: u32, func: u32, input: ?[
     return callMethod(n, &args, 0);
 }
 
+// === Slice I: _OSC capability negotiation ===================================
+// _OSC (ACPI 6.4 §6.2.11) is how the OS and firmware negotiate control of
+// platform features. The PCI Host Bridge _OSC (\_SB.PCI0._OSC, PCI Firmware
+// Spec 3.x) hands PCIe features (native hotplug / PME / AER / capability
+// structure / LTR) to the OS: the OS passes a 3-DWORD capabilities buffer
+// (status, support, control-request); firmware clears the control bits it won't
+// grant and returns the buffer. Same 4-arg shape as _DSM, marshaled the same way.
+
+/// PCI Host Bridge _OSC interface UUID 33DB4D5B-1FF7-401C-9657-7441C03DD766
+/// (PCI Firmware Spec), in ACPI ToUUID() mixed-endian byte order.
+const OSC_PCI_UUID = [_]u8{ 0x5B, 0x4D, 0xDB, 0x33, 0xF7, 0x1F, 0x1C, 0x40, 0x96, 0x57, 0x74, 0x41, 0xC0, 0x3D, 0xD7, 0x66 };
+
+// PCI _OSC control field (3rd DWORD) — the controls the OS requests.
+const OSC_CTRL_PCIE_HOTPLUG: u32 = 1 << 0;
+const OSC_CTRL_SHPC_HOTPLUG: u32 = 1 << 1;
+const OSC_CTRL_PCIE_PME: u32 = 1 << 2;
+const OSC_CTRL_PCIE_AER: u32 = 1 << 3;
+const OSC_CTRL_PCIE_CAP: u32 = 1 << 4;
+// _OSC return-status (1st DWORD) flags firmware sets.
+const OSC_STS_FAILURE: u32 = 1 << 1;
+const OSC_STS_UNRECOGNIZED_UUID: u32 = 1 << 2;
+const OSC_STS_UNRECOGNIZED_REV: u32 = 1 << 3;
+const OSC_STS_CAPS_MASKED: u32 = 1 << 4;
+
+/// Decoded PCI _OSC result: `granted` is the returned control DWORD (bits still
+/// set = controls firmware handed to the OS); `status` is DWORD 0's flags.
+pub const OscResult = struct {
+    status: u32 = 0,
+    support: u32 = 0,
+    granted: u32 = 0,
+    ok: bool = false,
+};
+
+var osc_result: OscResult = .{};
+
+/// The last \_SB.PCI0._OSC negotiation result — for a PCI driver that wants to
+/// know whether it owns native hotplug / AER / etc.
+pub fn pciOscResult() OscResult {
+    return osc_result;
+}
+
+/// Invoke `<dev_path>._OSC(uuid, rev, count, caps)` and return the capabilities
+/// Buffer the method returns with firmware's granted bits. `caps` is the input
+/// capability DWORDs (status / support / control); Arg2 is their count. Mirrors
+/// callDsm but Arg3 is a flat Buffer (not a Package), modified + returned in
+/// place. The returned buffer is arena-backed — decode it before the next entry.
+pub fn callOsc(dev_path: []const u8, uuid: *const [16]u8, rev: u32, caps: []const u32) ?Value {
+    var path_buf: [PATH_MAX]u8 = undefined;
+    if (dev_path.len + 5 > path_buf.len) return null;
+    @memcpy(path_buf[0..dev_path.len], dev_path);
+    @memcpy(path_buf[dev_path.len..][0..5], "._OSC");
+    const n = findExact(path_buf[0 .. dev_path.len + 5]) orelse return null;
+    if (n.kind != .method) return null;
+    return invokeOsc(n, uuid, rev, caps);
+}
+
+/// Core of callOsc, split out so the self-test drives the marshaling against a
+/// hand-built method without the path-append + lookup.
+fn invokeOsc(n: *StoredNode, uuid: *const [16]u8, rev: u32, caps: []const u32) ?Value {
+    arenaReset();
+    const ub = bufAlloc(16) orelse return null;
+    @memcpy(ub, uuid);
+    const cb = bufAlloc(caps.len * 4) orelse return null;
+    for (caps, 0..) |dw, i| writeLe(cb[i * 4 ..][0..4], @as(u64, dw));
+    const args = [_]Value{
+        .{ .buffer = ub },
+        .{ .integer = rev },
+        .{ .integer = caps.len },
+        .{ .buffer = cb },
+    };
+    return callMethod(n, &args, 0);
+}
+
+fn oscYN(b: bool) []const u8 {
+    return if (b) "y" else "n";
+}
+
+/// Slice I: run \_SB.PCI0._OSC to negotiate PCIe feature control with firmware.
+/// Requests native hotplug + PME + AER + cap-structure and logs what firmware
+/// granted; records it for pciOscResult(). Returns true if it ran.
+pub fn reportOsc() bool {
+    const request: u32 = OSC_CTRL_PCIE_HOTPLUG | OSC_CTRL_PCIE_PME | OSC_CTRL_PCIE_AER | OSC_CTRL_PCIE_CAP;
+    // DWORD0 status=0; DWORD1 support (extended-config + MSI); DWORD2 control req.
+    const caps = [_]u32{ 0, 0x00000011, request };
+    osc_result = .{};
+    const rv = callOsc("\\_SB_.PCI0", &OSC_PCI_UUID, 1, &caps) orelse {
+        debug.klog("[aml] \\_SB_.PCI0._OSC not found / not invokable\n", .{});
+        return false;
+    };
+    const buf = asBuffer(rv) orelse {
+        debug.klog("[aml] _OSC returned a non-buffer result\n", .{});
+        return false;
+    };
+    if (buf.len < 12) {
+        debug.klog("[aml] _OSC returned {d} bytes (< 3 DWORDs)\n", .{buf.len});
+        return false;
+    }
+    const status: u32 = @truncate(readLeBytes(buf[0..4]));
+    const support: u32 = @truncate(readLeBytes(buf[4..8]));
+    const granted: u32 = @truncate(readLeBytes(buf[8..12]));
+    osc_result = .{ .status = status, .support = support, .granted = granted, .ok = true };
+    debug.klog("[aml] _OSC(\\_SB.PCI0) rev1: requested ctrl 0x{X}, granted 0x{X} [hotplug={s} PME={s} AER={s} cap={s}]{s}\n", .{
+        request,                                            granted,
+        oscYN((granted & OSC_CTRL_PCIE_HOTPLUG) != 0),      oscYN((granted & OSC_CTRL_PCIE_PME) != 0),
+        oscYN((granted & OSC_CTRL_PCIE_AER) != 0),          oscYN((granted & OSC_CTRL_PCIE_CAP) != 0),
+        if ((status & OSC_STS_CAPS_MASKED) != 0) " (firmware masked some bits)" else "",
+    });
+    if ((status & (OSC_STS_FAILURE | OSC_STS_UNRECOGNIZED_UUID | OSC_STS_UNRECOGNIZED_REV)) != 0) {
+        debug.klog("[aml] _OSC status 0x{X}: failure / unrecognized UUID or revision\n", .{status});
+    }
+    return true;
+}
+
+/// Synthetic _OSC method for the firmware-independent self-test (stOscTest):
+///   Method(_OSC, 4) { CreateDWordField(Arg3, 8, CTRL); And(CTRL, 0x17, CTRL); Return(Arg3) }
+/// — masks the control DWORD with 0x17 (grants bits 0,1,2,4; denies bit 3 = AER),
+/// modeling firmware clearing a requested-but-ungranted control.
+const synth_osc = [_]u8{
+    0x14, 0x1B, 0x5F, 0x4F, 0x53, 0x43, 0x04, // Method(_OSC, 4)
+    0x8A, 0x6B, 0x0A, 0x08, 0x43, 0x54, 0x52, 0x4C, // CreateDWordField(Arg3, 8, CTRL)
+    0x7B, 0x43, 0x54, 0x52, 0x4C, 0x0A, 0x17, 0x43, 0x54, 0x52, 0x4C, // And(CTRL, 0x17, CTRL)
+    0xA4, 0x6B, // Return(Arg3)
+};
+
 /// Find the first child device under the ACPI0012 NVDIMM root (`root_path`) that
 /// exposes a `_DSM` — the per-NVDIMM label/health interface. QEMU emits one
 /// `NVxx` child node per plugged nvdimm; the label functions live there, not on
@@ -2605,6 +2729,25 @@ fn stCstTest(fails: *u32) void {
     stCheck("_CST select.found", if (c.found) @as(u64, 1) else @as(u64, 0), 1, fails);
     stCheck("_CST select deepest=C3", @as(u64, c.ctype), 3, fails);
     stCheck("_CST select hint=0x20", @as(u64, c.hint), 0x20, fails);
+}
+
+/// Slice I proof: drive the synthetic _OSC's argument marshaling + return decode
+/// — request control bits 0..4, expect the method's 0x17 mask to grant only bits
+/// 0,1,2,4 (AER bit 3 denied), and the status DWORD to come back untouched.
+fn stOscTest(fails: *u32) void {
+    const uuid = [_]u8{0} ** 16; // the synthetic method ignores Arg0
+    tNsReset();
+    _ = walkBody(&synth_osc);
+    static_nnodes = nnodes;
+    if (findExact("\\_OSC")) |n| {
+        const caps = [_]u32{ 0, 0x11, 0x1F }; // status / support / control-request
+        const rv = invokeOsc(n, &uuid, 1, &caps) orelse .uninit;
+        const buf = asBuffer(rv) orelse &[_]u8{};
+        const granted: u64 = if (buf.len >= 12) readLeBytes(buf[8..12]) else 0xDEAD;
+        stCheck("_OSC granted control", granted, 0x17, fails);
+        const status: u64 = if (buf.len >= 4) readLeBytes(buf[0..4]) else 0xDEAD;
+        stCheck("_OSC status untouched", status, 0, fails);
+    } else stCheck("_OSC method [missing]", 0, 1, fails);
 }
 
 /// A5: named-base OperationRegion — the one new primitive the live NVDIMM mailbox
@@ -2929,6 +3072,9 @@ pub fn selfTestExtended() u32 {
 
     // Slice E: decode the synthetic Processor _CST + verify the idle-hint selection.
     stCstTest(&fails);
+
+    // Slice I: drive _OSC argument marshaling + granted-control decode.
+    stOscTest(&fails);
 
     return fails;
 }
@@ -4324,6 +4470,10 @@ pub fn load() u32 {
     // Slice E proof: evaluate processor _CST C-states (the synthetic \_SB.CPUT is
     // always present; real firmware _CST report alongside) and pick the idle hint.
     _ = reportCStates();
+
+    // Slice I proof: negotiate PCIe feature control with firmware via the live
+    // \_SB.PCI0._OSC and log which controls it granted.
+    _ = reportOsc();
 
     // Slice F proof: enumerate the namespace's Device() objects with decoded
     // _HID/_CID + _CRS resources — ACPI as the platform's device manager, run
