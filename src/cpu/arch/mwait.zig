@@ -24,6 +24,11 @@ const debug = @import("../../debug/debug.zig");
 pub var mwait_supported: bool = false;
 pub var monitor_line_size: u32 = 64; // CPUID.05H:EAX[15:0] smallest
 
+/// CPUID.05H:EDX — the MWAIT sub-C-state map (4 bits per C-state: nibble 1 = C1,
+/// nibble 2 = C2, …). Lets supportsHint() reject a hint for a C-state the CPU
+/// doesn't actually offer (QEMU typically enumerates only C1).
+pub var substates: u32 = 0;
+
 // Hint encoding for the MWAIT EAX register (Intel SDM Vol. 2B):
 //   Bits 7:4 = sub-C-state
 //   Bits 3:0 = C-state hint (0 = C1, 1 = C1E, ...). C0 is just MWAIT-wake-
@@ -32,6 +37,20 @@ pub const HINT_C1: u32 = 0x00;
 pub const HINT_C1E: u32 = 0x01;
 
 pub var default_hint: u32 = HINT_C1;
+
+/// True when the CPU enumerates at least one MWAIT sub-state for the C-state that
+/// `hint` targets. MWAIT EAX bits[7:4] select the target C-state (0=C1, 1=C2, …);
+/// CPUID.05H:EDX holds that C-state's sub-state count in nibble (target+1) (nibble
+/// 0 = C0). Mirrors Linux's acpi_processor_ffh_cstate gating, so we never feed
+/// MWAIT a hint for a C-state the hardware doesn't offer — on QEMU (C1 only) a
+/// deeper _CST hint is correctly declined and idle stays C1.
+pub fn supportsHint(hint: u32) bool {
+    if (!mwait_supported) return false;
+    const nibble_idx = ((hint >> 4) & 0x0F) + 1; // EDX nibble for the target C-state
+    if (nibble_idx > 7) return false; // CPUID.05H enumerates up to C7
+    const shift: u5 = @intCast(nibble_idx * 4);
+    return ((substates >> shift) & 0x0F) != 0;
+}
 
 inline fn cpuid(leaf: u32, sub: u32) struct { eax: u32, ebx: u32, ecx: u32, edx: u32 } {
     var eax: u32 = undefined;
@@ -62,6 +81,7 @@ pub fn detect() void {
     }
     const r5 = cpuid(5, 0);
     monitor_line_size = r5.eax & 0xFFFF;
+    substates = r5.edx;
     const max_line = (r5.ebx & 0xFFFF);
     const ecx0 = (r5.ecx & 1) != 0; // enumeration of MWAIT extensions
     const ecx1 = (r5.ecx & 2) != 0; // break on EFLAGS.IF=0 supported

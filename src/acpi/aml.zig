@@ -2579,6 +2579,34 @@ fn stWideFieldTest(fails: *u32) void {
     stCheck("wide field buffer r/w", got, 0x06, fails);
 }
 
+/// Slice E proof: decode the synthetic Processor _CST (the exact blob injected at
+/// boot) and check each C-state's type/hint/latency/power, then confirm selection
+/// picks the deepest FFixedHW state (C3, MWAIT hint 0x20).
+fn stCstTest(fails: *u32) void {
+    const v = tWalkEval(&synth_cst, "\\_SB_.CPUT._CST");
+    var states: [8]CState = undefined;
+    const ns = decodeCstValue(v, &states);
+    stCheck("_CST count", @as(u64, ns), 3, fails);
+    if (ns == 3) {
+        stCheck("_CST C1 type", @as(u64, states[0].ctype), 1, fails);
+        stCheck("_CST C1 space=FFH", @as(u64, states[0].gas.space), @as(u64, SPACE_FFH), fails);
+        stCheck("_CST C1 hint", states[0].gas.address, 0x00, fails);
+        stCheck("_CST C2 type", @as(u64, states[1].ctype), 2, fails);
+        stCheck("_CST C2 hint", states[1].gas.address, 0x10, fails);
+        stCheck("_CST C2 latency", @as(u64, states[1].latency), 64, fails);
+        stCheck("_CST C3 type", @as(u64, states[2].ctype), 3, fails);
+        stCheck("_CST C3 hint", states[2].gas.address, 0x20, fails);
+        stCheck("_CST C3 power", @as(u64, states[2].power), 350, fails);
+    }
+    // Selection walks the just-walked namespace (\_SB_.CPUT._CST) and records the
+    // deepest FFixedHW state for the idle loop.
+    _ = reportCStates();
+    const c = selectedCState();
+    stCheck("_CST select.found", if (c.found) @as(u64, 1) else @as(u64, 0), 1, fails);
+    stCheck("_CST select deepest=C3", @as(u64, c.ctype), 3, fails);
+    stCheck("_CST select hint=0x20", @as(u64, c.hint), 0x20, fails);
+}
+
 /// A5: named-base OperationRegion — the one new primitive the live NVDIMM mailbox
 /// depends on. Hand-assemble Name(MEMA, <st_region_buf phys>), an OperationRegion
 /// based at MEMA (a Name, not a constant), a DWord field over it, and a method
@@ -2899,6 +2927,9 @@ pub fn selfTestExtended() u32 {
     // calls' request path — Arg2 function index + Arg3 input Package).
     stCallDsmTest(&fails);
 
+    // Slice E: decode the synthetic Processor _CST + verify the idle-hint selection.
+    stCstTest(&fails);
+
     return fails;
 }
 
@@ -2913,6 +2944,7 @@ pub fn selfTestExtended() u32 {
 const SPACE_MEM: u8 = 0;
 const SPACE_IO: u8 = 1;
 const SPACE_PCI: u8 = 2;
+const SPACE_FFH: u8 = 0x7F; // Functional Fixed Hardware (native C-state entry via MWAIT)
 
 fn nodeIndexOf(n: *StoredNode) usize {
     return (@intFromPtr(n) - @intFromPtr(&nodes[0])) / @sizeOf(StoredNode);
@@ -3388,6 +3420,162 @@ pub fn reportBattery() u32 {
         found += 1;
     }
     if (found == 0) debug.klog("[aml] no batteries (_BST) in namespace\n", .{});
+    return found;
+}
+
+// === Slice E: processor power states (_CST C-states) ========================
+// _CST (ACPI 6.4 §8.4.2.1) returns Package{ Count, CStatePkg… }; each CStatePkg
+// is Package{ Register, Type, Latency, Power }. `Register` is a ResourceTemplate
+// buffer holding one Generic Register Descriptor (a GAS): native C-states are
+// FFixedHW with the MWAIT hint in the Address field; legacy ones are SystemIO
+// (read the P_LVLx port to enter). We decode + report each and record the deepest
+// FFixedHW state as the idle MWAIT hint. This module stays a leaf (no cpu/arch
+// import, so the native harness builds unchanged): selectedCState() hands the
+// choice to the kernel, which knows the CPU's actual MWAIT support.
+
+/// A Generic Address Structure decoded from a C-state Register descriptor.
+pub const Gas = struct {
+    space: u8 = 0, // 0x00 SystemMemory, 0x01 SystemIO, 0x7F FFixedHW
+    width: u8 = 0,
+    offset: u8 = 0,
+    access: u8 = 0,
+    address: u64 = 0,
+};
+
+/// One decoded C-state from a _CST package.
+pub const CState = struct {
+    gas: Gas = .{},
+    ctype: u8 = 0, // 1 = C1, 2 = C2, 3 = C3 …
+    latency: u32 = 0, // worst-case entry/exit latency, µs
+    power: u32 = 0, // average power draw in that state, mW
+};
+
+/// The idle loop's adopted C-state: the deepest FFixedHW (MWAIT) state _CST
+/// advertised. `hint` is the MWAIT EAX value (the descriptor's Address). When
+/// found=false there is no usable FFixedHW _CST entry; the caller keeps its
+/// default (C1) hint.
+pub const CstChoice = struct {
+    found: bool = false,
+    ctype: u8 = 0,
+    hint: u32 = 0,
+    latency: u32 = 0,
+};
+
+var cst_choice: CstChoice = .{};
+
+/// The deepest FFixedHW C-state reportCStates() selected. The KERNEL (which knows
+/// MWAIT/CPUID support) decides whether to adopt `hint` as the idle MWAIT hint —
+/// keeping this interpreter a leaf module.
+pub fn selectedCState() CstChoice {
+    return cst_choice;
+}
+
+/// Synthetic Processor + _CST so C-state evaluation has a live target on firmware
+/// (QEMU) that ships none — same role as synth_ssdt/synth_battery, injected via
+/// walkBody() and also driven by stCstTest (so this exact blob is proven natively
+/// AND every boot). Decodes to:
+///   Scope(\_SB_){ Processor(CPUT,0xFF,0,0){ Method(_CST,0){ Return(Package(4){
+///     3,
+///     Package(4){ ResourceTemplate(){Register(FFixedHW,1,2,0x00,1)}, 1, 1,  1000 },
+///     Package(4){ ResourceTemplate(){Register(FFixedHW,1,2,0x10,1)}, 2, 64, 500  },
+///     Package(4){ ResourceTemplate(){Register(FFixedHW,1,2,0x20,1)}, 3, 96, 350  } }) }}}
+/// — three FFixedHW states C1/C2/C3 with MWAIT hints 0x00/0x10/0x20.
+const synth_cst = [_]u8{
+    0x10, 0x49, 0x07, 0x5C, 0x5F, 0x53, 0x42, 0x5F, 0x5B, 0x83, 0x40, 0x07,
+    0x43, 0x50, 0x55, 0x54, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x14, 0x43,
+    0x06, 0x5F, 0x43, 0x53, 0x54, 0x00, 0xA4, 0x12, 0x4A, 0x05, 0x04, 0x0A,
+    0x03, 0x12, 0x1A, 0x04, 0x11, 0x12, 0x0A, 0x0F, 0x82, 0x0C, 0x00, 0x7F,
+    0x01, 0x02, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+    0x01, 0x0B, 0xE8, 0x03, 0x12, 0x1C, 0x04, 0x11, 0x12, 0x0A, 0x0F, 0x82,
+    0x0C, 0x00, 0x7F, 0x01, 0x02, 0x01, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x0A, 0x02, 0x0A, 0x40, 0x0B, 0xF4, 0x01, 0x12, 0x1C, 0x04,
+    0x11, 0x12, 0x0A, 0x0F, 0x82, 0x0C, 0x00, 0x7F, 0x01, 0x02, 0x01, 0x20,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0A, 0x03, 0x0A, 0x60, 0x0B,
+    0x5E, 0x01,
+};
+
+/// Decode a Generic Register Descriptor (ACPI 6.4 §6.4.3.7, large-resource tag
+/// 0x82) from a C-state Register buffer into a GAS. Null unless `buf` is a 0x82
+/// record (≥15 bytes: tag + u16 length + 12-byte payload). A real-firmware buffer
+/// with a trailing end-tag (so len > 15) is fine — we read only the fixed fields.
+fn parseGenericRegister(buf: []const u8) ?Gas {
+    if (buf.len < 15 or buf[0] != 0x82) return null;
+    var addr: u64 = 0;
+    var k: usize = 0;
+    while (k < 8) : (k += 1) addr |= @as(u64, buf[7 + k]) << @as(u6, @intCast(k * 8));
+    return Gas{ .space = buf[3], .width = buf[4], .offset = buf[5], .access = buf[6], .address = addr };
+}
+
+/// Decode a _CST result (Package{ Count, CStatePkg… }) into `out`; returns the
+/// count decoded (≤ out.len). The leading Count element is advisory — we trust the
+/// sub-packages actually present. Best-effort: a malformed entry is skipped.
+fn decodeCstValue(v: Value, out: []CState) u32 {
+    if (v != .package) return 0;
+    const pkg = v.package;
+    if (pkg.len < 2) return 0;
+    var got: u32 = 0;
+    var i: usize = 1; // element 0 is the count
+    while (i < pkg.len and got < out.len) : (i += 1) {
+        if (pkg[i] != .package) continue;
+        const sp = pkg[i].package;
+        if (sp.len < 4 or sp[0] != .buffer) continue;
+        const gas = parseGenericRegister(sp[0].buffer) orelse continue;
+        out[got] = .{
+            .gas = gas,
+            .ctype = @truncate(pkgInt(sp, 1)),
+            .latency = @truncate(pkgInt(sp, 2)),
+            .power = @truncate(pkgInt(sp, 3)),
+        };
+        got += 1;
+    }
+    return got;
+}
+
+fn spaceName(space: u8) []const u8 {
+    return switch (space) {
+        SPACE_MEM => "SystemMemory",
+        SPACE_IO => "SystemIO",
+        SPACE_FFH => "FFixedHW",
+        else => "other",
+    };
+}
+
+/// Slice E: evaluate every processor _CST in the namespace, log each C-state, and
+/// record the deepest FFixedHW (MWAIT) state for the idle loop (selectedCState()).
+/// Returns the number of _CST methods read. Best-effort; public so acpid/a CLI can
+/// re-poll.
+pub fn reportCStates() u32 {
+    cst_choice = .{};
+    var found: u32 = 0;
+    var i: usize = 0;
+    while (i < nnodes) : (i += 1) {
+        const n = &nodes[i];
+        if (n.kind != .method) continue;
+        const path = n.path[0..n.path_len];
+        if (!pathEndsWithSeg(path, "_CST")) continue;
+        arenaReset();
+        const v = callMethod(n, &.{}, 0) orelse continue;
+        var states: [8]CState = undefined;
+        const ns = decodeCstValue(v, &states);
+        if (ns == 0) continue;
+        found += 1;
+        var s: usize = 0;
+        while (s < ns) : (s += 1) {
+            const cs = states[s];
+            debug.klog("[aml] {s}: C{d} {s} addr=0x{X} lat={d}us pwr={d}mW\n", .{
+                path, cs.ctype, spaceName(cs.gas.space), cs.gas.address, cs.latency, cs.power,
+            });
+            // Deepest (highest type) FFixedHW state becomes the idle MWAIT hint.
+            if (cs.gas.space == SPACE_FFH and (!cst_choice.found or cs.ctype > cst_choice.ctype)) {
+                cst_choice = .{ .found = true, .ctype = cs.ctype, .hint = @truncate(cs.gas.address), .latency = cs.latency };
+            }
+        }
+    }
+    if (found == 0) {
+        debug.klog("[aml] no processor C-states (_CST) in namespace\n", .{});
+    } else if (cst_choice.found) {
+        debug.klog("[aml] _CST: deepest FFixedHW C{d} (MWAIT hint 0x{X}, {d}us) offered to idle\n", .{ cst_choice.ctype, cst_choice.hint, cst_choice.latency });
+    }
     return found;
 }
 
@@ -4043,6 +4231,7 @@ pub fn load() u32 {
     if (SYNTH_TEST) {
         _ = walkBody(&synth_ssdt); // thermal zone \_SB.TZ0
         _ = walkBody(&synth_battery); // battery \_SB.BAT0
+        _ = walkBody(&synth_cst); // processor C-states \_SB.CPUT._CST
     }
 
     // Freeze the static namespace size: everything walked so far is permanent;
@@ -4131,6 +4320,10 @@ pub fn load() u32 {
     // and \_SB.BAT0 are always present; real/-acpitable objects report alongside.
     _ = reportThermal();
     _ = reportBattery();
+
+    // Slice E proof: evaluate processor _CST C-states (the synthetic \_SB.CPUT is
+    // always present; real firmware _CST report alongside) and pick the idle hint.
+    _ = reportCStates();
 
     // Slice F proof: enumerate the namespace's Device() objects with decoded
     // _HID/_CID + _CRS resources — ACPI as the platform's device manager, run

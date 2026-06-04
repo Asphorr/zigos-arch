@@ -756,6 +756,19 @@ pub fn init(boot_rsdp: u64) void {
     // effort + fully bounds-checked; a malformed DSDT yields a partial walk,
     // never a fault. For bring-up this dumps the discovered objects to serial.
     _ = @import("aml.zig").load();
+
+    // Slice E: adopt the deepest CPU-supported processor C-state from _CST as the
+    // idle MWAIT hint. mwait.detect() ran earlier in boot, so its CPUID enumeration
+    // is ready. No-op when firmware ships no _CST or the CPU enumerates only C1
+    // (QEMU) — the idle loop then keeps its default C1 hint.
+    const mwait = @import("../cpu/arch/mwait.zig");
+    const cst = @import("aml.zig").selectedCState();
+    if (cst.found and mwait.supportsHint(cst.hint)) {
+        mwait.default_hint = cst.hint;
+        debug.klog("[acpi] idle C-state: adopted C{d} (MWAIT hint 0x{X}, {d}us) from _CST\n", .{ cst.ctype, cst.hint, cst.latency });
+    } else if (cst.found) {
+        debug.klog("[acpi] _CST advertises C{d} (hint 0x{X}) but the CPU enumerates no MWAIT substate for it — idle stays C1\n", .{ cst.ctype, cst.hint });
+    }
 }
 
 // --- MADT iterator ----------------------------------------------------------
