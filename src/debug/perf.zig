@@ -38,6 +38,13 @@ pub const Phase = enum(u8) {
     /// host vblank (~16ms) or returning instantly (the latter would
     /// be a tearing source — comment claims vsync, code may differ).
     comp_flush,
+    /// Catch-all for samples whose measured span exceeds PAUSE_CEILING_CYC —
+    /// almost certainly a host vCPU pause (nested Hyper-V de-schedules the whole
+    /// guest CPU mid-measurement, so rdtsc jumps by seconds). Diverted here so it
+    /// doesn't poison a real phase's mean/total/max; the bucket keeps the lost
+    /// time visible. Never passed to leave() by a caller — set only internally by
+    /// recordPause. (2026-06-05)
+    host_pause,
 };
 
 const PHASE_COUNT: usize = @typeInfo(Phase).@"enum".fields.len;
@@ -57,6 +64,7 @@ pub const phase_name: [PHASE_COUNT][]const u8 = .{
     "comp_vk_render",
     "comp_corner_blit",
     "comp_flush",
+    "host_pause",
 };
 
 pub const Counter = struct {
@@ -105,6 +113,23 @@ pub inline fn enter() u64 {
     return rdtsc();
 }
 
+/// A single measured span longer than this is treated as host-pause-contaminated
+/// (a nested-Hyper-V vCPU de-schedule mid-measurement), not real on-CPU work, and
+/// diverted to the `host_pause` bucket. ~133ms @3GHz — chosen from the live table:
+/// the highest LEGITIMATE phase observed was a vblank-stalled `flush_rect` at ~217M
+/// cyc (~72ms), while host pauses landed at ~974M and up (≈325ms–4.4s). 400M sits in
+/// the gap (1.8× above the real max, well below the pauses). The first cut at 1B was
+/// too high — pauses just under it (~975M) still leaked into schedule/irq0_timer's
+/// max. Tunable; sub-400M pauses still slip, but the dominant spikes are removed.
+pub const PAUSE_CEILING_CYC: u64 = 400_000_000;
+
+inline fn recordPause(cpu_id: usize, dt: u64) void {
+    const c = &phases[cpu_id][@intFromEnum(Phase.host_pause)];
+    c.total +%= dt;
+    c.count +%= 1;
+    if (dt > c.max) c.max = dt;
+}
+
 pub fn leave(phase: Phase, start_tsc: u64) void {
     const end = rdtsc();
     const dt = end -% start_tsc;
@@ -113,6 +138,12 @@ pub fn leave(phase: Phase, start_tsc: u64) void {
     if (cpu_id >= MAX_CPUS) return;
     if (wall_start_tsc[cpu_id] == 0) wall_start_tsc[cpu_id] = start_tsc;
     wall_last_tsc[cpu_id] = end;
+    // A span this long isn't on-CPU work — a host vCPU pause landed inside the
+    // measured window. Divert it so it doesn't poison this phase's mean/total/max.
+    if (dt > PAUSE_CEILING_CYC and phase != .host_pause) {
+        recordPause(cpu_id, dt);
+        return;
+    }
     const c = &phases[cpu_id][@intFromEnum(phase)];
     c.total +%= dt;
     c.count +%= 1;
@@ -124,6 +155,11 @@ pub fn leave(phase: Phase, start_tsc: u64) void {
 /// aggregate "all syscalls" cost AND a per-number breakdown.
 pub fn syscallSample(num: u32, dt: u64) void {
     if (num >= SYSCALL_TABLE_SIZE) return;
+    // Host-pause guard, same ceiling as leave(): a multi-hundred-ms "syscall" is a
+    // paused vCPU, not real cost. Skip it (don't pollute the per-number mean) —
+    // the paired leave(.syscall) call already bucketed the span into host_pause,
+    // so recording here too would double-count it.
+    if (dt > PAUSE_CEILING_CYC) return;
     const c = &syscalls[num];
     c.total +%= dt;
     c.count +%= 1;
@@ -155,6 +191,20 @@ pub fn dumpAll() void {
         for (row, 0..) |*c, p| {
             if (c.count == 0) continue;
             const mean = c.total / c.count;
+            // host_pause is an overlap-summed diagnostic — one vCPU pause inflates
+            // EVERY nested measurement it straddles (the `syscall` AND the
+            // `schedule` running inside it both divert it), so its total can exceed
+            // the wall window and a %wall would be meaningless. Show a marker. Real
+            // phases now read an honest %wall ≤100 on their own, because the pause
+            // spikes that used to push schedule past 200% are diverted out of their
+            // totals before we get here.
+            if (p == @intFromEnum(Phase.host_pause)) {
+                serial.print(
+                    "[perf] {s:11} {d:>3} {d:>10} {d:>14} {d:>11} {d:>10}     --\n",
+                    .{ phase_name[p], cpu_id, c.count, c.total, mean, c.max },
+                );
+                continue;
+            }
             const pct_x100: u64 = if (wall_cpu == 0) 0 else (c.total *| 10000) / wall_cpu;
             serial.print(
                 "[perf] {s:11} {d:>3} {d:>10} {d:>14} {d:>11} {d:>10} {d:>3}.{d:0>2}\n",
