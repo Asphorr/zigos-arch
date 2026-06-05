@@ -570,8 +570,15 @@ var msg_scroll: i32 = 0; // px scrolled up from the newest message (0 = pinned t
 var loading: bool = false; // a getHistory call is in flight
 var dirty: bool = true; // a redraw is pending
 
+// --- scrollback (load older history when the message view hits the top) ---
+const HIST_PAGE: i32 = 40; // messages per getHistory page (initial load + each older page)
+var loading_older: bool = false; // an older page is in flight; the chat stays visible (no full spinner)
+var has_more: bool = true; // more older messages may still exist for the open chat
+var want_older: bool = false; // a scroll-to-top gesture asked for the previous page
+var last_maxscroll: i32 = 0; // msg-view max scroll from the last layout (the top-edge detector)
+
 // --- non-blocking network pump (keeps the UI live during getHistory) ---
-const NetState = enum { idle, await_history, await_dialogs, await_send };
+const NetState = enum { idle, await_history, await_dialogs, await_send, await_older };
 var net_state: NetState = .idle;
 var net_req_id: u64 = 0; // msg_id we're awaiting a reply for
 var net_for_contact: i32 = -1; // contact a pending history load belongs to
@@ -842,6 +849,7 @@ const MsgRow = struct {
     out: bool = false,
     service: bool = false,
     date: i32 = 0, // unix timestamp (for the inline time + date separators)
+    id: i32 = 0, // telegram message id — the offset_id cursor for scrollback
     from_id: u64 = 0, // sender (for the group/channel sender name)
     // Wrapped-line layout for the current window width (computed at chat load).
     line_start: [MAX_LINES]u16 = undefined,
@@ -1196,6 +1204,7 @@ fn drawMessages(px0: u32, pw: u32, y0: i32, y1: i32) void {
     if (maxscroll < 0) maxscroll = 0;
     if (msg_scroll < 0) msg_scroll = 0;
     if (msg_scroll > maxscroll) msg_scroll = maxscroll;
+    last_maxscroll = maxscroll; // remember the top edge so a wheel-up can trigger paging
     // newest pinned to the bottom; msg_scroll pushes the content down to reveal older
     var y: i32 = y1 - total + msg_scroll + @as(i32, @intCast(MSG_GAP));
     prev_day = std.math.minInt(i64);
@@ -1213,6 +1222,11 @@ fn drawMessages(px0: u32, pw: u32, y0: i32, y1: i32) void {
         const bh: i32 = @intCast(e.bub_h);
         if (y + bh > y0 and y < y1) drawBubble(e, px0, pw, y, y0, y1);
         y += bh + @as(i32, @intCast(MSG_GAP));
+    }
+    if (loading_older) { // a thin banner at the very top while the previous page loads
+        const hint_h: u32 = tr_sm.lineHeight() + 8;
+        canvas.fillRect(px0, @intCast(y0), pw, hint_h, COL_CHAT_BG);
+        drawCenteredText(&tr_sm, px0, pw, y0 + 4, "Loading older messages...", COL_PLACEHOLDER);
     }
 }
 
@@ -1314,7 +1328,7 @@ fn sendQuery(conn: *transport.Conn, query: []const u8) bool {
 fn requestHistory(conn: *transport.Conn, idx: usize) void {
     const c = &contacts[idx];
     var qbuf: [64]u8 = undefined;
-    const q = dialogs.buildGetHistory(&qbuf, .{ .kind = c.kind, .id = c.id }, c.ah, 40) catch {
+    const q = dialogs.buildGetHistory(&qbuf, .{ .kind = c.kind, .id = c.id }, c.ah, HIST_PAGE, 0) catch {
         loading = false;
         return;
     };
@@ -1326,16 +1340,46 @@ fn requestHistory(conn: *transport.Conn, idx: usize) void {
     net_state = .await_history;
 }
 
+/// Fetch the page of history just before the oldest message we currently hold
+/// (offset_id = that message's id). Non-blocking; the reply appends via pumpNet.
+fn requestOlder(conn: *transport.Conn) void {
+    if (sel < 0 or msg_count == 0) return;
+    const offset_id = msgs[msg_count - 1].id; // store is newest-first → last row is the oldest
+    if (offset_id == 0) { // no usable cursor (e.g. only local echoes) → don't page
+        has_more = false;
+        return;
+    }
+    const c = &contacts[@intCast(sel)];
+    var qbuf: [64]u8 = undefined;
+    const q = dialogs.buildGetHistory(&qbuf, .{ .kind = c.kind, .id = c.id }, c.ah, HIST_PAGE, offset_id) catch return;
+    if (!sendQuery(conn, q)) return;
+    net_for_contact = sel;
+    net_state = .await_older;
+    loading_older = true;
+    dirty = true;
+}
+
+/// Once per event-loop tick: if a scroll-to-top gesture set `want_older` and the
+/// session is idle, kick off the next older page.
+fn maybeFetchOlder(conn: *transport.Conn) void {
+    if (!want_older) return;
+    want_older = false;
+    if (has_more and !loading and !loading_older and net_state == .idle and
+        sel >= 0 and chat_loaded == sel and msg_count > 0)
+        requestOlder(conn);
+}
+
 /// Parse a messages.Messages object into the message store + lay it out.
-fn loadHistoryFromObj(obj: []const u8) void {
+fn loadHistoryFromObj(obj: []const u8, append: bool) void {
     var h = dialogs.parseHistory(obj) catch {
-        msg_count = 0;
+        if (!append) msg_count = 0;
         return;
     };
-    // show sender names only for group/channel chats
-    if (net_for_contact >= 0 and net_for_contact < @as(i32, @intCast(contact_count)))
+    // show sender names only for group/channel chats; the chat identity doesn't
+    // change when paging older, so only (re)compute it for a fresh load
+    if (!append and net_for_contact >= 0 and net_for_contact < @as(i32, @intCast(contact_count)))
         show_senders = contacts[@intCast(net_for_contact)].kind != .user;
-    msg_count = 0;
+    if (!append) msg_count = 0;
     var i: usize = 0;
     while (i < h.n and msg_count < msgs.len) : (i += 1) {
         const m = dialogs.parseMessage(&h.msgs) catch break;
@@ -1346,12 +1390,16 @@ fn loadHistoryFromObj(obj: []const u8) void {
         e.out = m.out;
         e.service = m.service;
         e.date = m.date;
+        e.id = m.id;
         e.from_id = m.from.id;
         msg_count += 1;
     }
     // consume any messages beyond the display cap, then cache the senders so
     // group/channel bubbles can show who wrote each one.
     while (i < h.n) : (i += 1) _ = dialogs.parseMessage(&h.msgs) catch break;
+    // a full page implies there's older history behind it; a short page (or a
+    // full store) means we've reached the start — stop paging there
+    has_more = h.n >= @as(usize, @intCast(HIST_PAGE)) and msg_count < msgs.len;
     if (dialogs.parseHistoryUsers(&h.msgs)) |hu| {
         var ur = hu.users;
         var k: usize = 0;
@@ -1479,6 +1527,7 @@ fn handleResult(res: []const u8) void {
     const obj = dialogs.gunzipIfPacked(res, &inflate_out) catch {
         net_state = .idle;
         loading = false;
+        loading_older = false;
         dirty = true;
         return;
     };
@@ -1492,8 +1541,13 @@ fn handleResult(res: []const u8) void {
                 emit(er.message);
                 emit("\x1b[0m\n");
                 msg_count = 0;
-            } else loadHistoryFromObj(obj);
+            } else loadHistoryFromObj(obj, false);
             chat_loaded = net_for_contact;
+        },
+        .await_older => {
+            // append the previous page; on error keep the current view and let a
+            // later scroll-to-top gesture retry
+            if (!is_err) loadHistoryFromObj(obj, true);
         },
         .await_dialogs => {
             if (is_err) {
@@ -1513,6 +1567,7 @@ fn handleResult(res: []const u8) void {
     }
     net_state = .idle;
     loading = false;
+    loading_older = false;
     dirty = true;
 }
 
@@ -1707,6 +1762,10 @@ fn onClick(mx: i32, my: i32, conn: *transport.Conn) void {
     chat_loaded = -1;
     input_len = 0; // fresh compose box for the new chat
     loading = true;
+    has_more = true; // a fresh chat: assume there's history to page back through
+    loading_older = false;
+    want_older = false;
+    last_maxscroll = 0;
     requestHistory(conn, @intCast(i)); // non-blocking; the reply arrives via pumpNet
     dirty = true;
 }
@@ -1717,6 +1776,9 @@ fn onWheel(delta: i32, mx: i32) void {
         list_scroll -= delta * step; // wheel up (delta>0) → toward the top
     } else if (sel >= 0 and chat_loaded == sel) {
         msg_scroll += delta * step; // wheel up → reveal older messages
+        // scrolled up to (or past) the top edge → ask for the previous page
+        if (delta > 0 and has_more and !loading_older and msg_scroll >= last_maxscroll)
+            want_older = true;
     }
     dirty = true;
 }
@@ -1836,6 +1898,7 @@ fn runGui(conn: *transport.Conn) void {
             libc.destroyWindow();
             return;
         }
+        maybeFetchOlder(conn); // a scroll-to-top gesture pages older history in
         if (loading) { // animate the spinner while a chat's history is loading
             spin_tick +%= 1;
             dirty = true;

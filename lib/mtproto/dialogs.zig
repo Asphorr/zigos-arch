@@ -494,7 +494,7 @@ const C_INPUT_PEER_CHAT: u32 = 0x35a95cb9;
 const C_INPUT_PEER_CHANNEL: u32 = 0x27bcbbfc;
 
 /// messages.getHistory(peer, limit) — newest `limit` messages of a conversation.
-pub fn buildGetHistory(out: []u8, peer: Peer, access_hash: u64, limit: i32) Error![]const u8 {
+pub fn buildGetHistory(out: []u8, peer: Peer, access_hash: u64, limit: i32, offset_id: i32) Error![]const u8 {
     var w = tl.Writer.init(out);
     w.writeU32(C_MESSAGES_GET_HISTORY) catch return error.Malformed;
     switch (peer.kind) {
@@ -514,7 +514,7 @@ pub fn buildGetHistory(out: []u8, peer: Peer, access_hash: u64, limit: i32) Erro
         },
         .none => return error.Malformed,
     }
-    w.writeInt(0) catch return error.Malformed; // offset_id
+    w.writeInt(offset_id) catch return error.Malformed; // offset_id
     w.writeInt(0) catch return error.Malformed; // offset_date
     w.writeInt(0) catch return error.Malformed; // add_offset
     w.writeInt(limit) catch return error.Malformed; // limit
@@ -1206,13 +1206,27 @@ test "parseHistoryUsers reaches the senders after the messages vector" {
 
 test "buildGetHistory wire bytes (inputPeerUser)" {
     var buf: [64]u8 = undefined;
-    const q = try buildGetHistory(&buf, .{ .kind = .user, .id = 0x1122 }, 0x3344, 20);
+    const q = try buildGetHistory(&buf, .{ .kind = .user, .id = 0x1122 }, 0x3344, 20, 0);
     try expectHex(q, "c5e62344" ++ // messages.getHistory#4423e6c5
         "4ca5e8dd" ++ // inputPeerUser#dde8a54c
         "2211000000000000" ++ // user_id
         "4433000000000000" ++ // access_hash
         "00000000" ++ "00000000" ++ "00000000" ++ // offset_id, offset_date, add_offset
         "14000000" ++ // limit = 20
+        "00000000" ++ "00000000" ++ // max_id, min_id
+        "0000000000000000"); // hash
+}
+
+test "buildGetHistory wire bytes (offset_id cursor for scrollback)" {
+    var buf: [64]u8 = undefined;
+    const q = try buildGetHistory(&buf, .{ .kind = .user, .id = 0x1122 }, 0x3344, 40, 0x100);
+    try expectHex(q, "c5e62344" ++ // messages.getHistory#4423e6c5
+        "4ca5e8dd" ++ // inputPeerUser#dde8a54c
+        "2211000000000000" ++ // user_id
+        "4433000000000000" ++ // access_hash
+        "00010000" ++ // offset_id = 0x100
+        "00000000" ++ "00000000" ++ // offset_date, add_offset
+        "28000000" ++ // limit = 40
         "00000000" ++ "00000000" ++ // max_id, min_id
         "0000000000000000"); // hash
 }
