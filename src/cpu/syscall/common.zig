@@ -38,9 +38,7 @@ pub const USER_SPACE_END: usize = memmap.USER_SPACE_END;
 /// bit check and return inherited 2MB-page data (random kernel memory)
 /// instead of the app's content.
 pub fn validateUserPtr(ptr: usize, len: usize) bool {
-    if (ptr < USER_SPACE_START or ptr >= USER_SPACE_END) return false;
-    if (len > 0 and ptr + len > USER_SPACE_END) return false;
-    if (len > 0 and ptr + len < ptr) return false; // overflow
+    if (!memmap.userDataRangeOk(ptr, len)) return false;
     // Instrument the slow part — prefault + per-page PT walk. Cheap range
     // checks above don't need bracketing; the meaningful cost starts here.
     const sp = @import("../../debug/syscall_perf.zig").scope(.user_ptr_walk);

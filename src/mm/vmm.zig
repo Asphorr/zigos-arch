@@ -165,7 +165,7 @@ pub fn createAddressSpace(phys_out: *usize) ?[*]align(4096) u64 {
 /// invlpg to make sure the flag change is visible. This keeps the contract
 /// idempotent under multi-CPU lazy-fault races.
 pub fn mapUserPage(pml4: [*]align(4096) u64, virt: usize, phys: usize, flags: u64) MapError!void {
-    if (virt < USER_SPACE_START or virt >= USER_SPACE_END) return error.BadVA;
+    if (!memmap.isUserDataAddr(virt)) return error.BadVA;
     // Historical note: this used to also reject any user VA falling inside
     // [KERNEL_HEAP_BASE, KERNEL_HEAP_BASE+KERNEL_HEAP_SIZE) as a defense
     // against user/kernel low-half aliasing. That check was vestigial

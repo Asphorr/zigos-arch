@@ -33,6 +33,11 @@
 
 const std = @import("std");
 
+/// VA-space model: typed addresses (Phys/KVa/UVa) + comptime-verified layout.
+/// The VA constants below are *re-exported* from here (single source of truth);
+/// see layout.zig for the two-floor rationale and the invariant proofs.
+const layout = @import("layout.zig");
+
 // --- Kernel image (linker-defined; runtime values) ---
 pub const KERNEL_PHYS_START: usize = 0x100000;
 
@@ -40,7 +45,7 @@ pub const KERNEL_PHYS_START: usize = 0x100000;
 /// Kernel symbols (kmain, _kernel_end, &__kdata_protected_start, etc.) link
 /// at `phys + KERNEL_VIRT_BASE`, so any check that compares a kernel VA
 /// against a low-half constant has to translate first.
-pub const KERNEL_VIRT_BASE: usize = 0xFFFFFFFF80000000;
+pub const KERNEL_VIRT_BASE: usize = layout.KERNEL_VIRT_BASE;
 
 /// Physmap base — must match `pdpt_physmap` slot in boot.asm. Maps phys
 /// 0..PHYSMAP_SIZE at VA `PHYSMAP_BASE..PHYSMAP_BASE+PHYSMAP_SIZE`. The
@@ -53,8 +58,8 @@ pub const KERNEL_VIRT_BASE: usize = 0xFFFFFFFF80000000;
 /// 39-bit maxphyaddr) and the bare physToVirt() result page-faults.
 /// `pdpt_physmap` in src/boot/boot.asm and uefi/uefi_boot.zig must fill
 /// all 512 entries to match.
-pub const PHYSMAP_BASE: usize = 0xFFFF800000000000;
-pub const PHYSMAP_SIZE: usize = 0x8000000000; // 512 GB (full PML4 slot)
+pub const PHYSMAP_BASE: usize = layout.PHYSMAP_BASE;
+pub const PHYSMAP_SIZE: usize = layout.PHYSMAP_SIZE; // 512 GB (full PML4 slot)
 
 extern var _kernel_end: u8;
 
@@ -81,7 +86,7 @@ pub fn kernelEndPhys() usize {
 // VAs; the only thing that has to fit at low PAs is "kernel image must
 // end before KERNEL_HEAP_BASE" (assertKernelImageFits). Bumping this
 // constant requires re-linking all user apps and is rarely the right move.
-pub const USER_VA_FLOOR: usize = 0x500000;
+pub const USER_VA_FLOOR: usize = layout.USER_VA_FLOOR;
 
 // --- Static kernel-side regions (low PA, post-kernel-image) ---
 //
@@ -155,17 +160,33 @@ pub const GUI_FB_PER_PID_SIZE: usize = 0xA00000;
 // (e.g. 4 MB) would push USER_SPACE_START into the kernel image's low
 // PA range — stay at 1 MB until an app needs more and we restructure
 // the low-VA layout.
-pub const USER_STACK_RESERVE: u64 = 0x100000; // 256 pages = 1 MB
-pub const USER_SPACE_START: u64 = USER_VA_FLOOR - USER_STACK_RESERVE;
-pub const USER_SPACE_END: u64 = 0x10000000; // 256 MB
+pub const USER_STACK_RESERVE: u64 = layout.USER_STACK_RESERVE; // 256 pages = 1 MB
+pub const USER_SPACE_START: u64 = layout.USER_SPACE_START;
+pub const USER_SPACE_END: u64 = layout.USER_SPACE_END; // 256 MB
 // Initial sbrk position (per-process VA). Lives in user low-half VA
 // space, fully independent of kernel low-PA layout — kernel reaches its
 // own heap through the high-half physmap (Phase 3 dropped PML4[0]), so
 // a numeric collision between user-VA and kernel-PHYS is harmless.
 // 0x2000000 (32 MB) gives apps a fresh upward range from a round
 // boundary; well below USER_SPACE_END (0x10000000 = 256 MB).
-pub const USER_BRK_INITIAL: usize = 0x2000000;
-pub const USER_VA_MAX: usize = 0x40000000; // ELF segment validity ceiling
+pub const USER_BRK_INITIAL: usize = layout.USER_BRK_INITIAL;
+pub const USER_VA_MAX: usize = layout.USER_VA_MAX; // ELF segment validity ceiling
+
+// VA classification + validator predicates + typed addresses, all defined and
+// comptime-proven in layout.zig. Re-exported here so the 5 user-VA validators
+// (kdbg.ripIsValidUser, common.validateUserPtr, vmm.mapUserPage,
+// signals.validateUserRange, elf_loader.isUserVA) route through ONE exhaustive
+// classifier instead of ad-hoc `if (va < FLOOR)` ladders — adding a region is a
+// compile error until every validator re-decides where it belongs.
+pub const AddrClass = layout.AddrClass;
+pub const classify = layout.classify;
+pub const isValidUserCode = layout.isValidUserCode;
+pub const isUserDataAddr = layout.isUserDataAddr;
+pub const userCodeRangeOk = layout.userCodeRangeOk;
+pub const userDataRangeOk = layout.userDataRangeOk;
+pub const Phys = layout.Phys;
+pub const KVa = layout.KVa;
+pub const UVa = layout.UVa;
 
 // --- Comptime overlap asserts ---
 //

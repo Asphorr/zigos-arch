@@ -427,7 +427,7 @@ inline fn ripIsValidUser(rip: u64) bool {
     // user processes (see memmap.zig). The lower bound catches every "RIP <
     // load base" stale-pointer case; the upper bound catches kernel-half
     // pointers leaked into user RIP (e.g. 0x80000C, 0x800010, fmt strings).
-    return rip >= memmap.USER_VA_FLOOR and rip < memmap.USER_VA_MAX;
+    return memmap.isValidUserCode(rip);
 }
 
 /// Call from `defer` at the end of every handleIRQ0 / handleException path

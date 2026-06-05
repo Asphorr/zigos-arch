@@ -280,10 +280,11 @@ const USER_BASE: u64 = memmap.USER_SPACE_START;
 const USER_END: u64 = memmap.USER_SPACE_END;
 
 fn validateUserRange(addr: u64, len: u64) bool {
-    if (addr < USER_BASE) return false;
-    if (addr +% len > USER_END) return false;
-    if (addr +% len < addr) return false;
-    return true;
+    // Routed through the single data/stack range predicate (layout.zig). Same
+    // accept/reject as before on every reachable input; the unified helper
+    // additionally rejects the degenerate addr==USER_SPACE_END, len==0 edge
+    // (never a real signal frame) and saturates the length add.
+    return memmap.userDataRangeOk(addr, len);
 }
 
 pub fn isCatchable(signo: u32) bool {

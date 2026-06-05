@@ -62,9 +62,7 @@ const USER_VA_MIN: usize = memmap.USER_VA_FLOOR;
 const USER_VA_MAX: usize = memmap.USER_VA_MAX;
 
 fn isUserVA(addr: usize, size: usize) bool {
-    if (addr < USER_VA_MIN) return false;
-    const end = addr +| size;
-    return end <= USER_VA_MAX;
+    return memmap.userCodeRangeOk(addr, size);
 }
 
 // (PerCpuRspSlot + per_cpu_rsp_save removed. The Linux-style switchTo
