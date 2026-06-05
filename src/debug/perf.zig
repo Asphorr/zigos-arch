@@ -113,15 +113,29 @@ pub inline fn enter() u64 {
     return rdtsc();
 }
 
-/// A single measured span longer than this is treated as host-pause-contaminated
-/// (a nested-Hyper-V vCPU de-schedule mid-measurement), not real on-CPU work, and
-/// diverted to the `host_pause` bucket. ~133ms @3GHz — chosen from the live table:
-/// the highest LEGITIMATE phase observed was a vblank-stalled `flush_rect` at ~217M
-/// cyc (~72ms), while host pauses landed at ~974M and up (≈325ms–4.4s). 400M sits in
-/// the gap (1.8× above the real max, well below the pauses). The first cut at 1B was
-/// too high — pauses just under it (~975M) still leaked into schedule/irq0_timer's
-/// max. Tunable; sub-400M pauses still slip, but the dominant spikes are removed.
-pub const PAUSE_CEILING_CYC: u64 = 400_000_000;
+// Per-phase host-pause ceilings. A measured span longer than its phase's ceiling is
+// treated as host-pause-contaminated (a nested-Hyper-V vCPU de-schedule landing
+// mid-measurement makes rdtsc jump by 0.3-64s) and diverted to host_pause rather
+// than poisoning the phase. Tiered because the legitimate max on-CPU cost differs by
+// phase, and a single global ceiling either clipped real flush frames or let pauses
+// leak into schedule/irq0:
+//   - compute/IRQ phases never legitimately run tens of ms on-CPU;
+//   - a syscall CAN be genuinely CPU-bound (crypto, ELF load, a big checksum);
+//   - display phases legitimately block on the host vblank (a multi-frame stall up
+//     to ~217M cyc was observed as real).
+// All three sit well below the observed pauses (~975M and up), so each catches its
+// own pauses without clipping its own legit work.
+const CEIL_COMPUTE: u64 = 100_000_000; // ~33ms — schedule, IRQ, exception, dynirq
+const CEIL_SYSCALL: u64 = 400_000_000; // ~133ms — a heavy CPU-bound syscall
+const CEIL_DISPLAY: u64 = 600_000_000; // ~200ms — vblank-blocking flush/compositor
+
+fn pauseCeiling(phase: Phase) u64 {
+    return switch (phase) {
+        .syscall => CEIL_SYSCALL,
+        .present, .flush_rect, .comp_sync, .comp_fill_src, .comp_vk_render, .comp_corner_blit, .comp_flush => CEIL_DISPLAY,
+        else => CEIL_COMPUTE, // irq0_timer, irq1_kbd, irq12_mouse, dynirq, exception, schedule
+    };
+}
 
 inline fn recordPause(cpu_id: usize, dt: u64) void {
     const c = &phases[cpu_id][@intFromEnum(Phase.host_pause)];
@@ -138,9 +152,10 @@ pub fn leave(phase: Phase, start_tsc: u64) void {
     if (cpu_id >= MAX_CPUS) return;
     if (wall_start_tsc[cpu_id] == 0) wall_start_tsc[cpu_id] = start_tsc;
     wall_last_tsc[cpu_id] = end;
-    // A span this long isn't on-CPU work — a host vCPU pause landed inside the
-    // measured window. Divert it so it doesn't poison this phase's mean/total/max.
-    if (dt > PAUSE_CEILING_CYC and phase != .host_pause) {
+    // A span past this phase's ceiling isn't on-CPU work — a host vCPU pause landed
+    // inside the measured window. Divert it so it doesn't poison this phase's
+    // mean/total/max. (host_pause is the sink itself — never re-divert it.)
+    if (phase != .host_pause and dt > pauseCeiling(phase)) {
         recordPause(cpu_id, dt);
         return;
     }
@@ -155,11 +170,11 @@ pub fn leave(phase: Phase, start_tsc: u64) void {
 /// aggregate "all syscalls" cost AND a per-number breakdown.
 pub fn syscallSample(num: u32, dt: u64) void {
     if (num >= SYSCALL_TABLE_SIZE) return;
-    // Host-pause guard, same ceiling as leave(): a multi-hundred-ms "syscall" is a
-    // paused vCPU, not real cost. Skip it (don't pollute the per-number mean) —
-    // the paired leave(.syscall) call already bucketed the span into host_pause,
-    // so recording here too would double-count it.
-    if (dt > PAUSE_CEILING_CYC) return;
+    // Host-pause guard, same ceiling as the syscall phase in leave(): a span past
+    // CEIL_SYSCALL is a paused vCPU, not real cost. Skip it (don't pollute the
+    // per-number mean) — the paired leave(.syscall) already bucketed it into
+    // host_pause, so recording here too would double-count.
+    if (dt > CEIL_SYSCALL) return;
     const c = &syscalls[num];
     c.total +%= dt;
     c.count +%= 1;

@@ -1292,7 +1292,16 @@ pub fn schedule() void {
     }
 
     const t = @import("../debug/perf.zig").enter();
-    defer @import("../debug/perf.zig").leave(.schedule, t);
+    // The .schedule phase must measure the scheduler's pick + bookkeeping cost, NOT
+    // the descheduled span. switchToCall (far below) freezes this stack frame until
+    // the task is resumed, so a plain `defer leave()` fires on RESUME and clocks the
+    // entire time the task sat idle/blocked (seconds) as if it were scheduling work —
+    // which is exactly why `schedule` looked like 55% of wall. Stop the clock
+    // explicitly right before the switch; this flag leaves the defer to cover only
+    // the no-switch return paths (self-switch, pickNext-null), where the small
+    // bookkeeping cost genuinely is the whole call.
+    var sched_measured = false;
+    defer if (!sched_measured) @import("../debug/perf.zig").leave(.schedule, t);
     const cpu = smp.myCpu();
     const paging = @import("../mm/paging.zig");
 
@@ -1791,6 +1800,11 @@ pub fn schedule() void {
         // false positive, so disarming on every dispatch is unnecessary and
         // leaves slots permanently disarmed (the corrupter never gets caught
         // because by the time pid reparks, slot is still off).
+        // Stop the .schedule clock HERE, before the context switch (see sched_measured
+        // at the top of schedule()). Past this point the frame is suspended for the
+        // task's entire descheduled duration — idle/wait time, not scheduler cost.
+        @import("../debug/perf.zig").leave(.schedule, t);
+        sched_measured = true;
         @import("sched_asm.zig").switchToCall(prev_save, next_kesp);
         // When we get here, this caller has been re-scheduled.
         @import("../debug/kdbg.zig").schedEvent(.switch_out, from_pid_a, 0, 0, @intCast(next));
