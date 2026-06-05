@@ -208,46 +208,13 @@ pub fn sysShutdown(mode: u32) u32 {
         while ((io.inb(0x64) & 0x02) != 0 and spin < 100000) : (spin += 1) {}
         io.outb(0x64, 0xFE);
     } else if (mode == 2) {
-        // Enter S3 (suspend-to-RAM). Same PM1_CNT SLP_TYP|SLP_EN write as S5,
-        // but with the \_S3_ codes — and unlike S5 there is NO universal
-        // port-magic fallback, so S3 strictly requires a parsed \_S3_ package
-        // AND a wired PM1a_CNT. Bail cleanly (caller's shell stays alive) if
-        // either is missing, rather than poke a half-known sleep type.
-        //
-        // CP2a: entry only. On success the platform suspends right here and
-        // this never returns — the resume trampoline + CPU-context save that
-        // lets it come back is CP2b. If the write is ignored we log it and
-        // return E_BUSY (re-enabling interrupts first) so the shell survives.
-        const serial = @import("../../debug/serial.zig");
-        const s3 = acpi.getS3SleepTypes() orelse {
-            serial.print("[s3] no \\_S3_ sleep codes — S3 unavailable\n", .{});
-            return E_NOSYS;
-        };
-        const f = acpi.getFadt() orelse {
-            serial.print("[s3] no FADT — S3 unavailable\n", .{});
-            return E_NOSYS;
-        };
-        if (f.pm1a_cnt_blk == 0) {
-            serial.print("[s3] PM1a_CNT_BLK is 0 — S3 unavailable\n", .{});
-            return E_NOSYS;
-        }
-        const slp_a: u16 = @as(u16, s3.a) & 0x7;
-        const slp_b: u16 = @as(u16, s3.b) & 0x7;
-        const word_a: u16 = (slp_a << 10) | (1 << 13);
-        const word_b: u16 = (slp_b << 10) | (1 << 13);
-        serial.print("[s3] entering S3 (SLP_TYPa={d} b={d}); PM1a_CNT port=0x{x} <- 0x{x}\n", .{ s3.a, s3.b, @as(u16, @truncate(f.pm1a_cnt_blk)), word_a });
-
-        // Quiesce this CPU + flush caches, then request sleep. CP2b will also
-        // park the AP and save CPU context before this write.
-        asm volatile ("cli");
-        asm volatile ("wbinvd");
-        io.outw(@truncate(f.pm1a_cnt_blk), word_a);
-        if (f.pm1b_cnt_blk != 0) io.outw(@truncate(f.pm1b_cnt_blk), word_b);
-
-        // Reached only if the platform ignored the sleep request.
-        serial.print("[s3] SLP_EN write returned — platform did not suspend\n", .{});
-        asm volatile ("sti");
-        return common.E_BUSY;
+        // Enter S3 (suspend-to-RAM). All staging — resume trampoline, the
+        // temporary low identity it needs, the FACS wake vector, then the
+        // PM1_CNT SLP_TYP|SLP_EN write — lives in acpi/s3.zig. On a honored
+        // request the platform suspends inside this call; on resume (CP2b) it
+        // returns 0; if S3 is unavailable or the write was ignored it returns
+        // an errno and the caller's shell survives.
+        return @import("../../acpi/s3.zig").suspendToRam();
     } else {
         // Enter S5 (soft off): write SLP_TYP|SLP_EN to PM1a_CNT (and PM1b_CNT
         // when present). SLP_EN is bit 13; SLP_TYP is bits 12:10. The codes come
