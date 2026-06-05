@@ -139,6 +139,37 @@ comptime {
     std.debug.assert(@offsetOf(Fadt, "reset_value") == 128);
 }
 
+// --- FACS (Firmware ACPI Control Structure) --------------------------------
+// Reached via FADT.firmware_ctrl (32-bit) / FADT.x_firmware_ctrl (64-bit), NOT
+// the (X)SDT, and unlike every other ACPI table it carries NO SdtHeader and NO
+// checksum — it's identified by its "FACS" signature and self-describing
+// `length`. The OS owns `firmware_waking_vector`: the real-mode physical entry
+// the firmware jumps to on S3 (suspend-to-RAM) wake. We read it at boot to
+// confirm S3 is stageable; the suspend path later points it at our resume
+// trampoline. Layout: ACPI 6.4 Table 5.37.
+pub const Facs = extern struct {
+    signature: [4]u8, // "FACS"
+    length: u32 align(1), // total length of the structure
+    hardware_signature: u32 align(1),
+    firmware_waking_vector: u32 align(1), // 32-bit real-mode S3 wake entry (phys)
+    global_lock: u32 align(1),
+    flags: u32 align(1),
+    x_firmware_waking_vector: u64 align(1), // 64-bit wake entry (0 => use 32-bit)
+    version: u8,
+    _reserved0: [3]u8,
+    ospm_flags: u32 align(1),
+    _reserved1: [24]u8,
+};
+
+comptime {
+    // The waking-vector fields the suspend path writes sit at spec-fixed
+    // offsets (ACPI 6.4 Table 5.37); align(1) on every multi-byte field keeps
+    // them put. Fail the build rather than poke the wrong firmware word.
+    std.debug.assert(@offsetOf(Facs, "firmware_waking_vector") == 12);
+    std.debug.assert(@offsetOf(Facs, "x_firmware_waking_vector") == 24);
+    std.debug.assert(@sizeOf(Facs) == 64);
+}
+
 // --- MADT (signature "APIC") -----------------------------------------------
 // Header followed by a stream of variable-length sub-entries discriminated
 // by an 8-bit type field. Walk by header.length; each sub-entry is at
@@ -357,6 +388,15 @@ var nssdt: usize = 0;
 pub const SleepTypes = struct { a: u8, b: u8 };
 var s5_slp_typ: ?SleepTypes = null;
 
+/// SLP_TYPa / SLP_TYPb from the DSDT's `\_S3_` package — the codes written into
+/// PM1a/PM1b_CNT to enter S3 (suspend-to-RAM). Null until init parses them (or
+/// if firmware advertises no S3). The suspend path uses these.
+var s3_slp_typ: ?SleepTypes = null;
+
+/// The validated FACS, or null if absent/unmappable/malformed. Non-const: the
+/// suspend path writes `firmware_waking_vector` here. Mapped read-only at boot.
+var facs: ?*align(1) Facs = null;
+
 /// FADT.flags bit 10 = RESET_REG_SUP. When set, FADT.reset_reg is a valid
 /// Generic Address pointing at a register; writing FADT.reset_value to it
 /// triggers a system reset.
@@ -440,6 +480,18 @@ pub fn getSsdt(i: usize) ?*align(1) const SdtHeader {
 /// no `_S5_` / unparseable. sysShutdown writes these into PM1a/PM1b_CNT.
 pub fn getS5SleepTypes() ?SleepTypes {
     return s5_slp_typ;
+}
+
+/// The `\_S3_` SLP_TYPa/b codes parsed from the DSDT, or null if S3 isn't
+/// advertised / unparseable. The suspend path writes these to PM1a/PM1b_CNT.
+pub fn getS3SleepTypes() ?SleepTypes {
+    return s3_slp_typ;
+}
+
+/// The validated FACS (firmware control structure), or null if S3 staging
+/// isn't possible. The suspend path writes its `firmware_waking_vector`.
+pub fn getFacs() ?*align(1) Facs {
+    return facs;
 }
 
 /// Iterator over DMAR remapping structures (DRHD / RMRR / ...). Caller cases
@@ -739,9 +791,17 @@ pub fn init(boot_rsdp: u64) void {
     }
 
     // DSDT isn't an (X)SDT entry — it's reached via FADT. Cache it and extract
-    // the `\_S5_` sleep codes so shutdown uses the firmware's real SLP_TYP
-    // instead of the spec-default 5 (which only happens to work on QEMU).
-    cacheDsdtAndParseS5();
+    // the `\_S5_` (shutdown) and `\_S3_` (suspend-to-RAM) sleep codes so the
+    // power paths use the firmware's real SLP_TYP, not the spec-default 5.
+    cacheDsdtAndParseSleep();
+
+    // S3 (suspend-to-RAM) needs BOTH a FACS — whose firmware_waking_vector we
+    // point at our resume trampoline — and an `\_S3_` package for the SLP_TYP
+    // codes. Map+validate the FACS (read-only) and report whether S3 is
+    // stageable. The actual suspend (trampoline + CPU-context save) is driven
+    // later via a syscall, not at boot.
+    mapAndValidateFacs();
+    reportS3();
 
     debug.klog("[acpi] ready: FADT={s} MADT={s} HPET={s} MCFG={s} DMAR={s} NFIT={s}\n", .{
         if (fadt != null) "yes" else "no",
@@ -816,9 +876,10 @@ pub fn madtEntries() MadtIterator {
 // reading off the end of the DSDT.
 
 /// Locate, validate, and cache the DSDT (reached via FADT, not the (X)SDT),
-/// then parse `\_S5_`. Best-effort: any failure leaves s5_slp_typ null and
-/// logs why, so shutdown falls back to the spec default.
-fn cacheDsdtAndParseS5() void {
+/// then parse `\_S5_` (shutdown) and `\_S3_` (suspend) sleep codes. Best-
+/// effort: any failure leaves the respective slp_typ null and logs why, so
+/// shutdown falls back to the spec default and S3 reports unavailable.
+fn cacheDsdtAndParseSleep() void {
     const f = fadt orelse return;
 
     // Prefer the 64-bit X_DSDT, but only when the FADT is actually long enough
@@ -855,31 +916,87 @@ fn cacheDsdtAndParseS5() void {
 
     // AML proper begins after the 36-byte SDT header.
     const body = @as([*]const u8, @ptrCast(hdr))[@sizeOf(SdtHeader)..hdr.length];
-    if (parseS5(body)) |st| {
+    if (parseSx(body, "_S5_")) |st| {
         s5_slp_typ = st;
         debug.klog("[acpi] \\_S5_ SLP_TYPa={d} SLP_TYPb={d}\n", .{ st.a, st.b });
     } else {
         debug.klog("[acpi] \\_S5_ not found in DSDT; shutdown uses default SLP_TYP=5\n", .{});
     }
+    if (parseSx(body, "_S3_")) |st| {
+        s3_slp_typ = st;
+        debug.klog("[acpi] \\_S3_ SLP_TYPa={d} SLP_TYPb={d}\n", .{ st.a, st.b });
+    } else {
+        debug.klog("[acpi] \\_S3_ not found in DSDT — S3 suspend-to-RAM unavailable\n", .{});
+    }
 }
 
-/// Scan an AML body for the `_S5_` name object and return its SLP_TYPa/b.
-/// Keeps scanning past a coincidental `_S5_` byte run that fails the framing
-/// check, so the real Name() object is still found.
-fn parseS5(aml: []const u8) ?SleepTypes {
+/// Map + validate the FACS, reached via FADT like the DSDT. Read-only here; the
+/// suspend path later writes our wake-trampoline address into
+/// `firmware_waking_vector`. Best-effort: any failure leaves `facs` null and
+/// logs why (S3 then unavailable).
+fn mapAndValidateFacs() void {
+    const f = fadt orelse return;
+
+    // Prefer the 64-bit X_FIRMWARE_CTRL when the FADT is long enough to contain
+    // it; else the 32-bit FIRMWARE_CTRL. (Mirrors the X_DSDT/DSDT choice.)
+    var facs_phys: u64 = 0;
+    if (f.header.length >= @offsetOf(Fadt, "x_firmware_ctrl") + @sizeOf(u64) and f.x_firmware_ctrl != 0) {
+        facs_phys = f.x_firmware_ctrl;
+    } else if (f.firmware_ctrl != 0) {
+        facs_phys = f.firmware_ctrl;
+    }
+    if (facs_phys == 0) {
+        debug.klog("[acpi] FADT has no FACS pointer; S3 suspend unavailable\n", .{});
+        return;
+    }
+
+    if (!physRangeMapped(facs_phys, @sizeOf(Facs))) return;
+    const p: *align(1) Facs = @ptrFromInt(paging.physToVirt(facs_phys));
+    // No SdtHeader and no checksum — the FACS is identified by its "FACS"
+    // signature and self-describing `length`.
+    if (!std.mem.eql(u8, &p.signature, "FACS")) {
+        debug.klog("[acpi] FACS signature mismatch ({s}); S3 unavailable\n", .{p.signature});
+        return;
+    }
+    if (p.length < @sizeOf(Facs)) {
+        debug.klog("[acpi] FACS length {d} too short; S3 unavailable\n", .{p.length});
+        return;
+    }
+    facs = p;
+}
+
+/// One-line boot report of S3 readiness. S3 needs BOTH the FACS (for the wake
+/// vector) and the `\_S3_` SLP_TYP codes; name whichever is missing.
+fn reportS3() void {
+    const fc = facs orelse {
+        debug.klog("[acpi] S3: no FACS — suspend-to-RAM unavailable\n", .{});
+        return;
+    };
+    const st = s3_slp_typ orelse {
+        debug.klog("[acpi] S3: FACS present but no \\_S3_ — suspend-to-RAM unavailable\n", .{});
+        return;
+    };
+    debug.klog("[acpi] S3 available: SLP_TYPa={d} SLP_TYPb={d}; FACS len={d} v{d} hw_sig=0x{X} wv=0x{X} xwv=0x{X}\n", .{ st.a, st.b, fc.length, fc.version, fc.hardware_signature, fc.firmware_waking_vector, fc.x_firmware_waking_vector });
+}
+
+/// Scan an AML body for an `\_Sx_` name object (name = "_S5_" or "_S3_") and
+/// return its SLP_TYPa/b. Keeps scanning past a coincidental byte run that
+/// fails the framing check, so the real Name() object is still found.
+fn parseSx(aml: []const u8, name: *const [4]u8) ?SleepTypes {
     if (aml.len < 4) return null;
     var i: usize = 0;
     while (i + 4 <= aml.len) : (i += 1) {
-        if (aml[i] == '_' and aml[i + 1] == 'S' and aml[i + 2] == '5' and aml[i + 3] == '_') {
-            if (parseS5At(aml, i)) |st| return st;
+        if (aml[i] == name[0] and aml[i + 1] == name[1] and aml[i + 2] == name[2] and aml[i + 3] == name[3]) {
+            if (parseSxAt(aml, i)) |st| return st;
         }
     }
     return null;
 }
 
-/// Validate the Name/Package framing around `_S5_` at `name_idx` and decode the
-/// first two package integers. Returns null on any structural or bounds miss.
-fn parseS5At(aml: []const u8, name_idx: usize) ?SleepTypes {
+/// Validate the Name/Package framing around an `\_Sx_` name at `name_idx` and
+/// decode the first two package integers. Returns null on any structural or
+/// bounds miss.
+fn parseSxAt(aml: []const u8, name_idx: usize) ?SleepTypes {
     // NameOp(0x08) must precede the name — directly, or with a single root
     // prefix '\' (0x5C) between (i.e. `\_S5_`). This is what distinguishes the
     // real object from an incidental "_S5_" in data.
