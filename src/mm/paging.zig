@@ -8,6 +8,7 @@
 
 const pmm = @import("pmm.zig");
 const memmap = @import("memmap.zig");
+const layout = @import("layout.zig");
 
 // Page table entry flags (same bit positions in x86_64)
 pub const PRESENT: u64 = 1 << 0;
@@ -55,6 +56,62 @@ pub const PAGE_MASK_1G: u64 = 0x000FFFFFC0000000; // 1GB PDPTE phys (bits 30..51
 // wants WB (= zeros). Leaf flags (cache type, COW, GLOBAL, ...) get
 // re-applied per-leaf below the new pointer.
 pub const PTR_FLAGS_MASK: u64 = PRESENT | READ_WRITE | USER | NX;
+
+// Typed page-table entry — a `packed struct(u64)` overlay on the raw PTE/PDE/
+// PDPTE u64. Named bitfields with guaranteed bit positions, proven equivalent
+// to the flag constants above by the comptime block below, so clean walks can
+// read `e.present` / `e.physAddr()` instead of `e & PRESENT` / `e & PAGE_MASK`
+// without risking a bit-position typo. The delicate huge-page splitters
+// (splitToPte, setRangeWriteCombining, ensureMapped) deliberately keep their
+// raw-u64 PAT/PS juggling — this overlay is for the straightforward walks.
+//
+// Bit 7 is PS (huge page) at PDPTE/PDE and PAT at a 4KB PTE — the same bit,
+// reinterpreted by level; `huge_or_pat` names it once.
+pub const Pte = packed struct(u64) {
+    present: bool = false, // 0   P
+    writable: bool = false, // 1   R/W
+    user: bool = false, // 2   U/S
+    pwt: bool = false, // 3   PWT  (write-through)
+    pcd: bool = false, // 4   PCD  (cache-disable)
+    accessed: bool = false, // 5   A
+    dirty: bool = false, // 6   D
+    huge_or_pat: bool = false, // 7   PS (huge) at PDPTE/PDE, PAT at 4KB PTE
+    global: bool = false, // 8   G
+    cow: bool = false, // 9   AVL — this kernel's copy-on-write flag
+    avl_10_11: u2 = 0, // 10..11 AVL
+    frame: u40 = 0, // 12..51 physical frame bits
+    avl_52_58: u7 = 0, // 52..58 AVL
+    pkey: u4 = 0, // 59..62 protection key
+    nx: bool = false, // 63  No-Execute
+
+    /// Reinterpret a raw entry. Equivalent to a bitcast; named for call sites.
+    pub inline fn of(raw: u64) Pte {
+        return @bitCast(raw);
+    }
+    /// Physical address this entry points at (bits 12..51 in place).
+    /// Equivalent to `(raw & PAGE_MASK)`.
+    pub inline fn physAddr(self: Pte) u64 {
+        return @as(u64, self.frame) << 12;
+    }
+};
+
+comptime {
+    // Pin every named field to the flag constant it mirrors: a bit-position
+    // typo in Pte becomes a build error here, not a silent mis-mapping at boot.
+    if (@as(u64, @bitCast(Pte{ .present = true })) != PRESENT) @compileError("Pte.present != PRESENT");
+    if (@as(u64, @bitCast(Pte{ .writable = true })) != READ_WRITE) @compileError("Pte.writable != READ_WRITE");
+    if (@as(u64, @bitCast(Pte{ .user = true })) != USER) @compileError("Pte.user != USER");
+    if (@as(u64, @bitCast(Pte{ .pwt = true })) != WRITE_THROUGH) @compileError("Pte.pwt != WRITE_THROUGH");
+    if (@as(u64, @bitCast(Pte{ .pcd = true })) != CACHE_DISABLE) @compileError("Pte.pcd != CACHE_DISABLE");
+    if (@as(u64, @bitCast(Pte{ .accessed = true })) != ACCESSED) @compileError("Pte.accessed != ACCESSED");
+    if (@as(u64, @bitCast(Pte{ .dirty = true })) != DIRTY) @compileError("Pte.dirty != DIRTY");
+    if (@as(u64, @bitCast(Pte{ .huge_or_pat = true })) != PAGE_SIZE_FLAG) @compileError("Pte.huge_or_pat != PAGE_SIZE_FLAG");
+    if (@as(u64, @bitCast(Pte{ .huge_or_pat = true })) != PAT_BIT_4K) @compileError("Pte.huge_or_pat != PAT_BIT_4K");
+    if (@as(u64, @bitCast(Pte{ .cow = true })) != COW) @compileError("Pte.cow != COW");
+    if (@as(u64, @bitCast(Pte{ .nx = true })) != NX) @compileError("Pte.nx != NX");
+    if (@as(u64, @bitCast(Pte{ .frame = 1 })) != 0x1000) @compileError("Pte.frame not based at bit 12");
+    if (@as(u64, @bitCast(Pte{ .frame = 0xFFFFFFFFFF })) != PAGE_MASK) @compileError("Pte.frame mask != PAGE_MASK");
+}
 
 // Higher-half kernel translation.
 //
@@ -144,24 +201,24 @@ pub fn isMapped(addr: u64) bool {
     const cr3 = asm volatile ("movq %%cr3, %[ret]"
         : [ret] "=r" (-> u64),
     );
-    const pml4: [*]const u64 = @ptrFromInt(physToVirt(cr3 & PAGE_MASK));
-    const pml4e = pml4[(addr >> 39) & 0x1FF];
-    if (pml4e & PRESENT == 0) return false;
-    if (pml4e & PAGE_SIZE_FLAG != 0) return true; // unusual: 512GB huge
+    const pml4 = layout.Phys.from(cr3 & PAGE_MASK).toKVa().ptr([*]const u64);
+    const pml4e = Pte.of(pml4[layout.pml4Index(addr)]);
+    if (!pml4e.present) return false;
+    if (pml4e.huge_or_pat) return true; // unusual: 512GB huge
 
-    const pdpt: [*]const u64 = @ptrFromInt(physToVirt(pml4e & PAGE_MASK));
-    const pdpte = pdpt[(addr >> 30) & 0x1FF];
-    if (pdpte & PRESENT == 0) return false;
-    if (pdpte & PAGE_SIZE_FLAG != 0) return true; // 1GB page
+    const pdpt = layout.Phys.from(pml4e.physAddr()).toKVa().ptr([*]const u64);
+    const pdpte = Pte.of(pdpt[layout.pdptIndex(addr)]);
+    if (!pdpte.present) return false;
+    if (pdpte.huge_or_pat) return true; // 1GB page
 
-    const pd: [*]const u64 = @ptrFromInt(physToVirt(pdpte & PAGE_MASK));
-    const pde = pd[(addr >> 21) & 0x1FF];
-    if (pde & PRESENT == 0) return false;
-    if (pde & PAGE_SIZE_FLAG != 0) return true; // 2MB page
+    const pd = layout.Phys.from(pdpte.physAddr()).toKVa().ptr([*]const u64);
+    const pde = Pte.of(pd[layout.pdIndex(addr)]);
+    if (!pde.present) return false;
+    if (pde.huge_or_pat) return true; // 2MB page
 
-    const pt: [*]const u64 = @ptrFromInt(physToVirt(pde & PAGE_MASK));
-    const pte = pt[(addr >> 12) & 0x1FF];
-    return pte & PRESENT != 0;
+    const pt = layout.Phys.from(pde.physAddr()).toKVa().ptr([*]const u64);
+    const pte = Pte.of(pt[layout.ptIndex(addr)]);
+    return pte.present;
 }
 
 // --- PML4 address ---
@@ -988,10 +1045,10 @@ pub fn setWriteWatchRW(virt: usize, allow_write: bool) void {
 pub fn setWriteWatchRWNoFlush(virt: usize, allow_write: bool) void {
     if (pml4_addr == 0) return;
     const pml4: [*]u64 = @ptrFromInt(physToVirt(pml4_addr));
-    const pml4_idx = (virt >> 39) & 0x1FF;
-    const pdpt_idx = (virt >> 30) & 0x1FF;
-    const pd_idx = (virt >> 21) & 0x1FF;
-    const pt_idx = (virt >> 12) & 0x1FF;
+    const pml4_idx = layout.pml4Index(virt);
+    const pdpt_idx = layout.pdptIndex(virt);
+    const pd_idx = layout.pdIndex(virt);
+    const pt_idx = layout.ptIndex(virt);
     if (pml4[pml4_idx] & PRESENT == 0) return;
     const pdpt: [*]u64 = @ptrFromInt(physToVirt(pml4[pml4_idx] & PAGE_MASK));
     if (pdpt[pdpt_idx] & PRESENT == 0 or pdpt[pdpt_idx] & PAGE_SIZE_FLAG != 0) return;

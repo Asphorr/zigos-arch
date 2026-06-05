@@ -288,6 +288,24 @@ pub const UVa = enum(u64) {
     }
 };
 
+// ── 4-level paging structure ───────────────────────────────────────────────
+// VA → table-index decomposition. Named, single-purpose helpers replace the
+// repeated, easy-to-misorder `(va >> N) & 0x1FF` open-coding in paging.zig.
+// Each returns a usize ready to index a [*]u64 table.
+
+pub inline fn pml4Index(va: anytype) usize {
+    return @intCast((va >> 39) & 0x1FF);
+}
+pub inline fn pdptIndex(va: anytype) usize {
+    return @intCast((va >> 30) & 0x1FF);
+}
+pub inline fn pdIndex(va: anytype) usize {
+    return @intCast((va >> 21) & 0x1FF);
+}
+pub inline fn ptIndex(va: anytype) usize {
+    return @intCast((va >> 12) & 0x1FF);
+}
+
 // ── Native tests (zig test src/mm/layout.zig) ──────────────────────────────
 
 test "constants match the pre-refactor literals (no-op guard)" {
@@ -369,4 +387,18 @@ test "typed UVa classifies" {
     try std.testing.expect(UVa.from(USER_VA_FLOOR).isCode());
     try std.testing.expect(UVa.from(USER_SPACE_START).isData());
     try std.testing.expect(!UVa.from(USER_SPACE_START).isCode()); // stack reserve: data yes, code no
+}
+
+test "paging index decomposition" {
+    // PHYSMAP_BASE = 0xFFFF800000000000 → PML4 slot 256.
+    try std.testing.expectEqual(@as(usize, 256), pml4Index(PHYSMAP_BASE));
+    // KERNEL_VIRT_BASE = 0xFFFFFFFF80000000 → PML4 511, PDPT 510.
+    try std.testing.expectEqual(@as(usize, 511), pml4Index(KERNEL_VIRT_BASE));
+    try std.testing.expectEqual(@as(usize, 510), pdptIndex(KERNEL_VIRT_BASE));
+    // Arbitrary VA matches the open-coded expressions it replaces.
+    const va: u64 = 0x0000_0000_0123_4567;
+    try std.testing.expectEqual(@as(usize, (va >> 39) & 0x1FF), pml4Index(va));
+    try std.testing.expectEqual(@as(usize, (va >> 30) & 0x1FF), pdptIndex(va));
+    try std.testing.expectEqual(@as(usize, (va >> 21) & 0x1FF), pdIndex(va));
+    try std.testing.expectEqual(@as(usize, (va >> 12) & 0x1FF), ptIndex(va));
 }
