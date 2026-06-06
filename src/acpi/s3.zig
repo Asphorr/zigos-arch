@@ -7,10 +7,13 @@
 // real->long-mode trampoline (src/boot/wake_trampoline.asm, a near-copy of the
 // proven AP bring-up trampoline) which re-enters 64-bit kernel code here.
 //
-// CP2b-1 (this step): prove the trampoline reaches long-mode kernel code at all.
-// The trampoline runs, s3ResumeEntry logs a breadcrumb and halts. No CPU-state
-// restore yet — re-init (mirroring smp.apEntry) + a setjmp/longjmp back into the
-// suspender is CP2b-2.
+// CP2b-2 (this step): full restore -> usable resume. s3ResumeEntry re-establishes
+// the BSP CPU state (smp.reinitForS3Resume, mirroring apEntry) and longjmps back
+// into suspendToRam, which returns 0 to the syscall so sysret lands the shutdown
+// app back in userspace with the scheduler ticking again. Only the BSP comes
+// back online (the APs are powered down by S3 and marked offline on resume —
+// re-bringing them up, and any device/GPU re-init the display needs, are later
+// steps).
 
 const std = @import("std");
 const acpi = @import("acpi.zig");
@@ -18,6 +21,7 @@ const paging = @import("../mm/paging.zig");
 const io = @import("../io.zig");
 const serial = @import("../debug/serial.zig");
 const common = @import("../cpu/syscall/common.zig");
+const smp = @import("../cpu/smp.zig");
 
 // Fixed low phys, < 1 MiB: the FACS 32-bit waking vector and the real-mode entry
 // both require it. RAM is preserved across S3, so the blob + slots survive the
@@ -35,6 +39,36 @@ extern const wake_trampoline_end: u8;
 // the resume CR3's shared kernel half.
 var resume_stack: [16384]u8 align(16) = undefined;
 
+// setjmp/longjmp buffer for the suspend -> resume hand-off. suspendToRam calls
+// s3_save_context just before SLP_EN; the wake path (s3ResumeEntry, after the
+// trampoline + smp.reinitForS3Resume) calls s3_longjmp to return into
+// suspendToRam's resume branch as if s3_save_context had returned 1. Only
+// callee-saved regs + rsp/rip/rflags survive the round trip — the resume branch
+// must not rely on any caller-saved value computed before the suspend (it
+// doesn't). Field order/offsets MUST match the asm in wake_trampoline.asm.
+const JmpBuf = extern struct {
+    rbx: u64 = 0,
+    rbp: u64 = 0,
+    r12: u64 = 0,
+    r13: u64 = 0,
+    r14: u64 = 0,
+    r15: u64 = 0,
+    rsp: u64 = 0,
+    rip: u64 = 0,
+    rflags: u64 = 0,
+};
+extern fn s3_save_context(ctx: *JmpBuf) callconv(.c) usize;
+extern fn s3_longjmp(ctx: *JmpBuf) callconv(.c) noreturn;
+var s3_ctx: JmpBuf = .{};
+
+// TSC value captured just before the SLP_EN write, restored first thing on
+// resume. S3 powers the CPU down and the TSC comes back at ~0; the whole kernel
+// measures elapsed time as `now -% start` deltas, so a backward TSC makes the
+// very next delta enormous (the suspending syscall's own exit accounting ->
+// apic.tscToMs(delta*10) overflows; the scheduler tick and the host-pause/SMI
+// detector also break). Restoring continuity keeps every delta small + positive.
+var saved_tsc: u64 = 0;
+
 /// SLP_EN (bit 13) | SLP_TYP (bits 12:10), masked to the 3-bit field so a stray
 /// parse can't disturb adjacent PM1_CNT bits.
 inline fn sleepWord(slp_typ: u8) u16 {
@@ -47,21 +81,81 @@ fn readCr3() u64 {
     );
 }
 
-/// Entry point the wake trampoline jumps to in 64-bit mode. CP2b-1: confirm we
-/// reached long-mode kernel code, then halt (no restore yet).
+fn readTsc() u64 {
+    var hi: u32 = undefined;
+    var lo: u32 = undefined;
+    asm volatile ("rdtsc"
+        : [lo] "={eax}" (lo),
+          [hi] "={edx}" (hi),
+    );
+    return (@as(u64, hi) << 32) | @as(u64, lo);
+}
+
+/// Write IA32_TIME_STAMP_COUNTER (MSR 0x10). Under KVM this adjusts the guest
+/// TSC offset; on real hardware it sets the counter directly.
+fn writeTsc(val: u64) void {
+    asm volatile ("wrmsr"
+        :
+        : [msr] "{ecx}" (@as(u32, 0x10)),
+          [lo] "{eax}" (@as(u32, @truncate(val))),
+          [hi] "{edx}" (@as(u32, @truncate(val >> 32))),
+    );
+}
+
+/// Entry point the wake trampoline jumps to in 64-bit mode. Re-establishes the
+/// BSP CPU state torn down by S3, then longjmps back into suspendToRam's resume
+/// branch (never returns here).
 export fn s3ResumeEntry() callconv(.c) noreturn {
     // Rawest possible breadcrumb FIRST: write straight to COM1 (0x3F8) before
     // touching any kernel infrastructure, so even if serial.print or per-CPU
     // (GS-based) state is unhappy this early post-resume, we still get proof the
     // trampoline reached 64-bit kernel code. QEMU's UART transmits a THR byte to
-    // its backend regardless of line config.
+    // its backend regardless of line config. IF is 0 here (the trampoline cli'd).
     for ("\r\nS3WAKE\r\n") |c| io.outb(0x3F8, c);
 
-    // Richer log (uses the stack the trampoline handed us; port I/O only — no
-    // GDT/IDT/TR needed, and we never touch an NX page so EFER.NXE=0 is fine).
-    serial.print("[s3] RESUME: reached 64-bit kernel via wake trampoline\n", .{});
-    serial.print("[s3] RESUME: CP2b-1 stops here (full restore is CP2b-2) — halting\n", .{});
-    while (true) asm volatile ("cli; hlt");
+    // Restore the TSC to its pre-suspend value FIRST: S3 reset it to ~0, and the
+    // whole kernel measures elapsed time as `now -% start` deltas. A backward TSC
+    // makes the next such delta enormous — the suspending syscall's own exit
+    // accounting (apic.tscToMs(delta*10)) overflows, the scheduler tick freezes,
+    // and the host-pause detector mis-fires. Must precede reinitForS3Resume (its
+    // timer arm reads the TSC) and any scheduler/perf path.
+    writeTsc(saved_tsc);
+
+    // Re-establish the BSP's CPU state (GDT/IDT/TR, syscall MSRs, EFER.NXE,
+    // CR0.WP, CR4, PAT, LAPIC + timer), mirroring AP bring-up. After this the
+    // CPU is whole again and per-CPU / NX-page access are safe.
+    smp.reinitForS3Resume();
+    serial.print("[s3] RESUME: BSP CPU state re-established; longjmp -> suspendToRam\n", .{});
+
+    // Hand control back to suspendToRam's resume branch (its s3_save_context call
+    // appears to return 1 there). Never returns to this frame.
+    s3_longjmp(&s3_ctx);
+}
+
+/// Undo installLowIdentity: restore the 0..2 MiB null-guard slot (PD[0] = 0) in
+/// the current (post-resume) page tables so user null derefs fault again. Walks
+/// the live CR3 rather than trusting a saved value. No-op if the tables aren't
+/// shaped as installLowIdentity left them.
+fn removeLowIdentity() void {
+    const cr3 = readCr3();
+    const pml4: [*]volatile u64 = @ptrFromInt(paging.physToVirt(cr3 & paging.PAGE_MASK));
+    const pml4e = pml4[0];
+    if (pml4e & paging.PRESENT == 0) return;
+    const pdpt: [*]volatile u64 = @ptrFromInt(paging.physToVirt(pml4e & paging.PAGE_MASK));
+    const pdpte = pdpt[0];
+    if (pdpte & paging.PRESENT == 0) return;
+    if (pdpte & paging.PAGE_SIZE_FLAG != 0) return;
+    const pd: [*]volatile u64 = @ptrFromInt(paging.physToVirt(pdpte & paging.PAGE_MASK));
+    pd[0] = 0;
+    // Flush the stale VA-0 translation: reload CR3 (the 2 MiB entry wasn't
+    // GLOBAL, so a plain CR3 reload evicts it). Value-based reload so the
+    // compiler picks the scratch reg; memory clobber pins it after the pd[0]
+    // store.
+    const cur = readCr3();
+    asm volatile ("mov %[v], %%cr3"
+        :
+        : [v] "r" (cur),
+        : .{ .memory = true });
 }
 
 /// Install a temporary 2 MiB identity page at VA 0 in the current (suspending)
@@ -69,7 +163,8 @@ export fn s3ResumeEntry() callconv(.c) noreturn {
 /// trampoline turns paging on. The process already has PML4[0]->PDPT[0]->PD
 /// present (its user image lives at 4 MiB = PD[2]); PD[0] (the 0..2 MiB null
 /// guard) is empty, so we borrow it without disturbing user mappings. Returns
-/// the CR3 to load on resume, or null if the tables aren't shaped as expected.
+/// the CR3 to load on resume (PML4 phys with the low 12 bits stripped), or null
+/// if the tables aren't shaped as expected.
 fn installLowIdentity() ?u64 {
     const cr3 = readCr3();
     const pml4: [*]volatile u64 = @ptrFromInt(paging.physToVirt(cr3 & paging.PAGE_MASK));
@@ -84,7 +179,14 @@ fn installLowIdentity() ?u64 {
     pd[0] = paging.PRESENT | paging.READ_WRITE | paging.PAGE_SIZE_FLAG;
     // No flush needed: nothing reads VA 0..2 MiB until the trampoline reloads
     // CR3 on resume, which flushes the whole TLB.
-    return cr3;
+    //
+    // Return the BARE PML4 phys (low 12 bits masked off): at a syscall CR3 also
+    // carries the process's PCID in bits [11:0] (e.g. 0x...004), but the resume
+    // path re-enables CR4.PCIDE in reinitForS3Resume -> applyEarlyCr4, and the
+    // CPU #GPs if PCIDE is set while CR3[11:0] != 0. The trampoline therefore
+    // loads CR3 with PCID=0 (harmless: PCIDE is off at that point so the tag is
+    // ignored, and the process re-acquires its PCID on the next context switch).
+    return cr3 & paging.PAGE_MASK;
 }
 
 /// Copy the wake trampoline blob to WAKE_TRAMP_BASE (through the physmap) and
@@ -106,10 +208,21 @@ fn installWakeTrampoline(resume_cr3: u64) void {
 }
 
 /// Kernel side of `shutdown -s` (sysShutdown mode 2). Stages the resume path,
-/// then writes SLP_EN. On a honored request the platform suspends inside this
-/// call. CP2b-1 does not return on success (the trampoline halts in
-/// s3ResumeEntry); on any failure it returns an errno so the shell survives.
+/// arms a setjmp, then writes SLP_EN; the platform suspends inside this call. On
+/// S3 wake the trampoline -> s3ResumeEntry -> reinitForS3Resume -> s3_longjmp
+/// re-enters here and this returns 0 (back to userspace via sysret). On any
+/// staging failure, or if the platform ignores the request, it returns an errno
+/// so the shell survives.
 pub fn suspendToRam() u32 {
+    // S3 resumes on the BSP only (the firmware waking vector brings up CPU 0), so
+    // the context we save must belong to the BSP. If this syscall is running on
+    // an AP, refuse rather than save a context we can't correctly resume.
+    // (Migrating the caller onto the BSP first is a later refinement.)
+    if (!smp.isBSP()) {
+        serial.print("[s3] suspend syscall not on BSP — S3 needs the BSP; aborted\n", .{});
+        return common.E_NOSYS;
+    }
+
     const s3 = acpi.getS3SleepTypes() orelse {
         serial.print("[s3] no \\_S3_ sleep codes — S3 unavailable\n", .{});
         return common.E_NOSYS;
@@ -127,31 +240,60 @@ pub fn suspendToRam() u32 {
         return common.E_NOSYS;
     };
 
+    // From here we mutate the resume staging (trampoline page + FACS wake vector)
+    // and arm the setjmp. Disable interrupts so nothing runs between arming and
+    // the SLP_EN write — and so the resume branch, reached via s3_longjmp
+    // restoring THIS rflags, runs with IF=0 until it returns to the syscall
+    // dispatcher (sysret restores the app's own IF on the way back to userspace).
+    asm volatile ("cli");
+
     // Stage resume: low identity for the trampoline page, copy the trampoline +
     // slots, point the FACS wake vector at it (32-bit real-mode entry).
     const resume_cr3 = installLowIdentity() orelse {
         serial.print("[s3] could not install low identity — S3 aborted\n", .{});
+        asm volatile ("sti");
         return common.E_NOSYS;
     };
     if (resume_cr3 >= 0x1_0000_0000) {
         serial.print("[s3] CR3 0x{x} >= 4 GiB — trampoline 32-bit CR3 load would truncate; S3 aborted\n", .{resume_cr3});
+        asm volatile ("sti");
         return common.E_NOSYS;
     }
     installWakeTrampoline(resume_cr3);
     facs.firmware_waking_vector = WAKE_TRAMP_BASE;
     facs.x_firmware_waking_vector = 0; // force the 32-bit real-mode entry
 
-    const word_a = sleepWord(s3.a);
-    const word_b = sleepWord(s3.b);
-    serial.print("[s3] suspending: wake_vector=0x{x} resume_cr3=0x{x}; PM1a_CNT port=0x{x} <- 0x{x}\n", .{ @as(u64, WAKE_TRAMP_BASE), resume_cr3, @as(u16, @truncate(f.pm1a_cnt_blk)), word_a });
+    // setjmp: 0 = first pass (arm + suspend). On S3 wake the trampoline ->
+    // s3ResumeEntry -> reinitForS3Resume -> s3_longjmp makes this "return" 1 and
+    // execution falls through to the resume branch below.
+    if (s3_save_context(&s3_ctx) == 0) {
+        const word_a = sleepWord(s3.a);
+        const word_b = sleepWord(s3.b);
+        serial.print("[s3] suspending: wake_vector=0x{x} resume_cr3=0x{x}; PM1a_CNT port=0x{x} <- 0x{x}\n", .{ @as(u64, WAKE_TRAMP_BASE), resume_cr3, @as(u16, @truncate(f.pm1a_cnt_blk)), word_a });
 
-    asm volatile ("cli");
-    asm volatile ("wbinvd");
-    io.outw(@truncate(f.pm1a_cnt_blk), word_a);
-    if (f.pm1b_cnt_blk != 0) io.outw(@truncate(f.pm1b_cnt_blk), word_b);
+        // Continuous-time baseline restored on resume (writeTsc in s3ResumeEntry).
+        // Capture as late as possible so the restored TSC is closest to real time.
+        saved_tsc = readTsc();
+        asm volatile ("wbinvd");
+        io.outw(@truncate(f.pm1a_cnt_blk), word_a);
+        if (f.pm1b_cnt_blk != 0) io.outw(@truncate(f.pm1b_cnt_blk), word_b);
 
-    // Reached only if the platform ignored the sleep request.
-    serial.print("[s3] SLP_EN write returned — platform did not suspend\n", .{});
-    asm volatile ("sti");
-    return common.E_BUSY;
+        // Reached only if the platform ignored the sleep request.
+        serial.print("[s3] SLP_EN write returned — platform did not suspend\n", .{});
+        asm volatile ("sti");
+        return common.E_BUSY;
+    }
+
+    // ---- RESUME path (s3_longjmp landed here from s3ResumeEntry; IF=0) ----
+    serial.print("[s3] resumed: back in suspendToRam via longjmp\n", .{});
+    // S3 powered the APs down — only the BSP woke. Mark them offline so the
+    // scheduler/watchdog treat this as a single-CPU system, then restore the
+    // 0..2 MiB null guard the suspend path borrowed for the trampoline page.
+    smp.offlineApsForS3Resume();
+    removeLowIdentity();
+    serial.print("[s3] resumed: APs offlined, low identity removed — returning to userspace\n", .{});
+    // return 0 -> sysShutdown -> syscall dispatcher -> sysret restores the app's
+    // RFLAGS (IF=1) and lands it back in userspace; the LAPIC timer re-armed in
+    // reinitForS3Resume drives the scheduler again from the next tick.
+    return 0;
 }

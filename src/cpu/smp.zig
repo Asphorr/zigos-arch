@@ -702,6 +702,77 @@ export fn apEntry() callconv(.c) noreturn {
     process.enterFirstTaskAp(idle_pid);
 }
 
+/// Re-establish the BSP's per-CPU CPU state after an S3 (suspend-to-RAM) resume.
+/// On S3 wake the CPU comes back with GDTR/IDTR/TR, the syscall MSRs, EFER.NXE,
+/// CR0.WP, CR4, PAT, and the LAPIC all reset. This mirrors the per-CPU bring-up
+/// `apEntry` runs on an AP, but for the BSP (CPU 0) and WITHOUT creating an idle
+/// task: the caller (src/acpi/s3.zig) longjmps back into the suspending syscall
+/// afterwards, so the BSP resumes its existing kernel context rather than
+/// starting a new one.
+///
+/// NXE invariant (identical to apEntry): runs with EFER.NXE still 0 until
+/// `syscall/entry.zig.init()` below re-enables it, so nothing here may touch an
+/// NX-mapped page before that. Only the kernel image + cpus[]/GDT/IDT (all
+/// mapped NX-clear) are touched pre-NXE, exactly as on the AP path.
+pub fn reinitForS3Resume() void {
+    const bsp = &cpus[0];
+
+    // FIRST: re-enable the LAPIC and re-derive `x2apic_active` from the reset
+    // IA32_APIC_BASE. Must precede any getLapicId()/myCpu() below — the stale
+    // RAM flag would otherwise route LAPIC access down the wrong MMIO/MSR path
+    // and #GP. Enabling the LAPIC this early is safe: IF is still 0 (the wake
+    // trampoline cli'd and never sti'd) and the timer isn't armed until the end.
+    apic.reinitLapicForS3Resume();
+
+    // Per-CPU syscall scratch + per-CPU GDT/TSS. Preserve tss.rsp0 (the CURRENT
+    // process's kernel stack, set by the last setTssRsp0) across initPerCpuGdt,
+    // which would otherwise reset it to the isr_stack — the suspending app must
+    // land its next syscall on its own kstack, not the IST/ISR stack (the
+    // cross-stack-aliasing hazard). ist1 is process-independent, so letting
+    // initPerCpuGdt re-set it to the isr_stack top is correct.
+    initPerCpuAsm(0);
+    const saved_rsp0 = bsp.tss.rsp0;
+    initPerCpuGdt(bsp);
+    bsp.tss.rsp0 = saved_rsp0;
+
+    // Shared IDT.
+    gdt.loadIdt();
+
+    // syscall/sysret MSRs (SCE/STAR/LSTAR/SFMASK) + EFER.NXE. Required for the
+    // eventual sysret back to userspace, and re-enables NXE for everything after.
+    @import("syscall/entry.zig").init();
+    @import("../debug/lbr.zig").enable();
+    @import("syscall/entry.zig").verifyMsrs("S3-BSP");
+
+    // SMEP/UMIP + SMAP, MCE, PMU — all per-CPU, all reset by S3.
+    @import("arch/protect.zig").applyEarlyCr4();
+    @import("arch/protect.zig").enableSmapPerCpu();
+    @import("arch/mce.zig").perCpuInit();
+    @import("arch/pmu.zig").perCpuInit();
+
+    // CR0.WP + PAT (per-CPU, reset by S3).
+    @import("../mm/paging.zig").enableCR0WriteProtect();
+    @import("../mm/paging.zig").setupPat();
+
+    // Timer last (mirrors apEntry) — arms IRQ0 at 100 Hz so the scheduler ticks
+    // again the moment we return to userspace with IF=1.
+    apic.startTimerForAP();
+}
+
+/// After an S3 resume only the BSP is running: S3 powered the APs down and the
+/// firmware waking vector brings up CPU 0 alone. Mark every other CPU offline so
+/// the scheduler, watchdog (nextAlivePeer skips !alive), and every
+/// `if (!cpu.alive)` consumer treat this as a single-CPU system. Re-bringing the
+/// APs up (INIT/SIPI) is a later S3 step; until then any task left in an
+/// offlined CPU's runqueue is stranded.
+pub fn offlineApsForS3Resume() void {
+    var i: usize = 1;
+    while (i < MAX_CPUS) : (i += 1) {
+        @atomicStore(bool, &cpus[i].alive, false, .release);
+    }
+    cpu_count = 1;
+}
+
 /// Initialize this CPU's per-CPU syscall scratch slot. The kstack pointer
 /// itself lives in cpus[cpu_id].tss.rsp0 and is stamped by setTssRsp0 on
 /// the first per-process dispatch; until then no syscall can fire on this

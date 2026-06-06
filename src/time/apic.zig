@@ -730,6 +730,17 @@ pub fn initLAPICForAP() void {
     lapicWrite(LAPIC_TPR, 0);
 }
 
+/// Re-enable the LAPIC after an S3 resume. Unlike initLAPICForAP this runs the
+/// full initLAPIC() so `x2apic_active` is re-derived from the (S3-reset)
+/// IA32_APIC_BASE: S3 clears the x2APIC-enable bit, and a stale RAM flag would
+/// otherwise route every subsequent lapicRead/Write down the wrong (MSR vs MMIO)
+/// path and #GP. Call this BEFORE any getLapicId()/myCpu() on the resume path.
+/// Does NOT re-arm the timer (the caller does, mirroring apEntry's ordering) and
+/// does NOT touch the IOAPIC — device-IRQ routing re-init is a later S3 step.
+pub fn reinitLapicForS3Resume() void {
+    initLAPIC();
+}
+
 /// Start LAPIC timer for an AP (uses BSP's calibrated count)
 pub fn startTimerForAP() void {
     if (tsc_deadline_active) {

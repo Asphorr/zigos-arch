@@ -136,3 +136,58 @@ wake_gdt_ptr:
 ; this blob must stay under (WAKE_ENTRY_SLOT - WAKE_TRAMP_BASE) = 0xFE8 bytes.
 ; Enforced at the memcpy site in src/acpi/s3.zig (panics before any suspend).
 wake_trampoline_end:
+
+; ============================================================================
+; S3 setjmp / longjmp — the suspend -> resume hand-off (CP2b-2).
+;
+; These are ORDINARY 64-bit kernel functions, linked at their kernel VA. They
+; sit past wake_trampoline_end and in .text, so the relocated 0x9000 blob above
+; (and its size guard / memcpy in s3.zig) never include them.
+;
+; s3_save_context saves the callee-saved registers + rsp/rip/rflags and returns
+; 0. The platform then suspends. On the far side of S3 the wake path
+; (s3ResumeEntry -> smp.reinitForS3Resume) calls s3_longjmp, which restores that
+; saved context and makes s3_save_context appear to return 1 — classic
+; setjmp/longjmp, letting suspendToRam "fall through" to its resume branch.
+;
+; SysV AMD64: arg (ctx: *JmpBuf) arrives in rdi; usize result in rax. The JmpBuf
+; layout MUST match the extern struct in src/acpi/s3.zig (9 x u64, this order):
+;   0x00 rbx  0x08 rbp  0x10 r12  0x18 r13  0x20 r14  0x28 r15
+;   0x30 rsp  0x38 rip  0x40 rflags
+; ============================================================================
+section .text
+BITS 64
+
+global s3_save_context
+s3_save_context:
+    mov [rdi + 0x00], rbx
+    mov [rdi + 0x08], rbp
+    mov [rdi + 0x10], r12
+    mov [rdi + 0x18], r13
+    mov [rdi + 0x20], r14
+    mov [rdi + 0x28], r15
+    lea rax, [rsp + 8]       ; rsp as it will be once our `ret` pops the retaddr
+    mov [rdi + 0x30], rax
+    mov rax, [rsp]           ; return address = where save "returns" to
+    mov [rdi + 0x38], rax
+    pushfq
+    pop rax
+    mov [rdi + 0x40], rax
+    xor eax, eax            ; first return: 0
+    ret
+
+global s3_longjmp
+s3_longjmp:
+    mov rbx, [rdi + 0x00]
+    mov rbp, [rdi + 0x08]
+    mov r12, [rdi + 0x10]
+    mov r13, [rdi + 0x18]
+    mov r14, [rdi + 0x20]
+    mov r15, [rdi + 0x28]
+    mov rsp, [rdi + 0x30]    ; back onto the suspending syscall's kernel stack
+    mov rax, [rdi + 0x40]
+    push rax
+    popfq                    ; restore rflags (IF included — suspend cli'd first)
+    mov rcx, [rdi + 0x38]    ; resume rip (just after the s3_save_context call)
+    mov eax, 1             ; longjmp return: 1
+    jmp rcx
