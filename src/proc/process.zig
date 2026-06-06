@@ -967,6 +967,7 @@ pub const countThreadsInGroup = @import("lifecycle.zig").countThreadsInGroup;
 pub const cloneCurrent = @import("lifecycle.zig").cloneCurrent;
 pub const forkCurrent = @import("lifecycle.zig").forkCurrent;
 pub const createKernelIdle = @import("lifecycle.zig").createKernelIdle;
+pub const resetKernelIdleForResume = @import("lifecycle.zig").resetKernelIdleForResume;
 pub const createIdleProcess = @import("lifecycle.zig").createIdleProcess;
 pub const createKernelTask = @import("lifecycle.zig").createKernelTask;
 pub const setInflightSlot = @import("lifecycle.zig").setInflightSlot;

@@ -380,6 +380,57 @@ pub fn assertBSP(comptime site: []const u8) void {
 }
 
 /// Initialize SMP: set up BSP per-CPU data, boot APs
+/// Build the list of AP LAPIC ids to bring up. With ACPI MADT we get a
+/// definitive list of present, enabled processors (their APIC ids are NOT
+/// guaranteed to be 0..N-1 — real boards have gaps from hyperthreading or
+/// socket layout); without MADT we fall back to the historical 1..MAX_CPUS-1
+/// probe. The BSP is excluded. Returns the count written into `out`. Shared by
+/// the boot bring-up (`init`) and the S3-resume re-online (`reonlineApsForS3Resume`).
+fn collectApIds(bsp_id: u8, out: *[MAX_CPUS]u8) usize {
+    var ap_count: usize = 0;
+    if (acpi.getMadt() != null) {
+        // flags bit 0 = enabled, bit 1 = online-capable. Only include CPUs
+        // explicitly marked enabled. Both legacy MadtLapic (type 0) and
+        // MadtX2Apic (type 9) carry the same shape we care about; type 9 has a
+        // wider id, so its entries are skipped if the id doesn't fit our
+        // u8/MAX_CPUS-bounded array.
+        var it = acpi.madtEntries();
+        while (it.next()) |h| {
+            var apic_id_u32: u32 = 0;
+            var flags: u32 = 0;
+            switch (@as(acpi.MadtType, @enumFromInt(h.entry_type))) {
+                .processor_lapic => {
+                    const e: *align(1) const acpi.MadtLapic = @ptrCast(h);
+                    apic_id_u32 = e.apic_id;
+                    flags = e.flags;
+                },
+                .processor_x2apic => {
+                    const e: *align(1) const acpi.MadtX2Apic = @ptrCast(h);
+                    apic_id_u32 = e.x2apic_id;
+                    flags = e.flags;
+                },
+                else => continue,
+            }
+            if (flags & 1 == 0) continue;
+            if (apic_id_u32 == bsp_id) continue;
+            if (apic_id_u32 >= MAX_CPUS) continue;
+            if (ap_count >= MAX_CPUS) continue;
+            out[ap_count] = @intCast(apic_id_u32);
+            ap_count += 1;
+        }
+        debug.klog("[smp] MADT lists {d} AP(s)\n", .{ap_count});
+    } else {
+        // Fallback probe path — still bounded by MAX_CPUS.
+        var i: u8 = 1;
+        while (i < MAX_CPUS) : (i += 1) {
+            out[ap_count] = i;
+            ap_count += 1;
+        }
+        debug.klog("[smp] no MADT — probing {d} AP slot(s)\n", .{ap_count});
+    }
+    return ap_count;
+}
+
 pub fn init() void {
     // Stamp the address of cpus[0] into the exported `cpus_base` slot so
     // the per-CPU LSTAR syscall stubs (cpu/syscall/entry.zig) can load the
@@ -485,47 +536,7 @@ pub fn init() void {
     // hyperthreading or socket layout). Without MADT we fall back to
     // the historical 1..MAX_CPUS-1 probe loop.
     var ap_ids: [MAX_CPUS]u8 = undefined;
-    var ap_count: usize = 0;
-    if (acpi.getMadt() != null) {
-        // flags bit 0 = enabled, bit 1 = online-capable. Only include CPUs
-        // explicitly marked enabled. Both legacy MadtLapic (type 0) and
-        // MadtX2Apic (type 9) carry the same shape we care about; type 9 has a
-        // wider id, so its entries are skipped if the id doesn't fit our
-        // u8/MAX_CPUS-bounded array.
-        var it = acpi.madtEntries();
-        while (it.next()) |h| {
-            var apic_id_u32: u32 = 0;
-            var flags: u32 = 0;
-            switch (@as(acpi.MadtType, @enumFromInt(h.entry_type))) {
-                .processor_lapic => {
-                    const e: *align(1) const acpi.MadtLapic = @ptrCast(h);
-                    apic_id_u32 = e.apic_id;
-                    flags = e.flags;
-                },
-                .processor_x2apic => {
-                    const e: *align(1) const acpi.MadtX2Apic = @ptrCast(h);
-                    apic_id_u32 = e.x2apic_id;
-                    flags = e.flags;
-                },
-                else => continue,
-            }
-            if (flags & 1 == 0) continue;
-            if (apic_id_u32 == bsp_id) continue;
-            if (apic_id_u32 >= MAX_CPUS) continue;
-            if (ap_count >= MAX_CPUS) continue;
-            ap_ids[ap_count] = @intCast(apic_id_u32);
-            ap_count += 1;
-        }
-        debug.klog("[smp] MADT lists {d} AP(s)\n", .{ap_count});
-    } else {
-        // Fallback probe path — still bounded by MAX_CPUS.
-        var i: u8 = 1;
-        while (i < MAX_CPUS) : (i += 1) {
-            ap_ids[ap_count] = i;
-            ap_count += 1;
-        }
-        debug.klog("[smp] no MADT — probing {d} AP slot(s)\n", .{ap_count});
-    }
+    const ap_count = collectApIds(bsp_id, &ap_ids);
 
     var ap_idx: usize = 0;
     while (ap_idx < ap_count) : (ap_idx += 1) {
@@ -607,15 +618,21 @@ fn busyWait(ms: u32) void {
     }
 }
 
-/// AP entry point — called from trampoline after entering 64-bit mode
-export fn apEntry() callconv(.c) noreturn {
-    // INVARIANT: EFER.NXE is still 0 on this AP until syscall_entry.init()
-    // (called below) turns it on. Until then nothing here may walk a PTE with
-    // bit 63 (NX) set, or the CPU takes a reserved-bit #PF → #DF → triple-fault
-    // with no IDT installed yet. Safe today because the only memory touched
-    // pre-NXE is the kernel image (.text/.bss, mapped NX-clear), including this
-    // AP's isr_stack — keep any vmm-allocated / NX-mapped access *after*
-    // syscall_entry.init(). Same deferral as boot.asm's BSP path.
+/// Per-CPU bring-up shared by the boot AP entry (`apEntry`) and the S3-resume
+/// re-online entry (`apEntryS3Resume`). Stamps sipi_acked, then re-establishes
+/// every piece of per-CPU CPU state (GDT/TSS, IDT, syscall MSRs, EFER.NXE,
+/// SMEP/SMAP, MCE/PMU, LAPIC + timer, CR0.WP, PAT) and marks the CPU alive.
+/// Returns this CPU's LAPIC id. The ONLY thing the two callers do differently is
+/// what they dispatch into afterwards (a fresh idle PCB vs. the surviving one).
+///
+/// INVARIANT: EFER.NXE is still 0 on this AP until syscall_entry.init() (called
+/// below) turns it on. Until then nothing here may walk a PTE with bit 63 (NX)
+/// set, or the CPU takes a reserved-bit #PF → #DF → triple-fault with no IDT
+/// installed yet. Safe today because the only memory touched pre-NXE is the
+/// kernel image (.text/.bss, mapped NX-clear), including this AP's isr_stack —
+/// keep any vmm-allocated / NX-mapped access *after* syscall_entry.init(). Same
+/// deferral as boot.asm's BSP path.
+fn apInitPerCpu() u8 {
     // Figure out our LAPIC ID
     const my_id: u8 = @truncate(apic.getLapicId());
 
@@ -682,6 +699,13 @@ export fn apEntry() callconv(.c) noreturn {
     // observes `alive` with an .acquire load before counting us online.
     @atomicStore(bool, &cpus[my_id].alive, true, .release);
 
+    return my_id;
+}
+
+/// AP entry point — called from trampoline after entering 64-bit mode (boot).
+export fn apEntry() callconv(.c) noreturn {
+    const my_id = apInitPerCpu();
+
     // Per-CPU kernel-mode idle (task #235). Each AP gets its own idle PCB
     // with its own kstack — no more stack-aliasing failure mode where
     // multiple CPUs share the same idle.kstack. The idle PCB is what
@@ -699,6 +723,45 @@ export fn apEntry() callconv(.c) noreturn {
     // kernel-task context (just like the BSP after enterFirstTask). The
     // trampoline stack we've been running on is abandoned — switchToCall
     // sets RSP to idle's kernel_esp and never returns to this caller.
+    process.enterFirstTaskAp(idle_pid);
+}
+
+/// AP entry point for the S3-resume re-online path (CP2b-2b) — called from the
+/// SAME trampoline blob at 0x8000, but reached via `reonlineApsForS3Resume`
+/// pointing AP_ENTRY_SLOT here instead of at `apEntry`. Identical per-CPU
+/// bring-up, but REUSES this CPU's idle PCB (which survived S3 in RAM) instead
+/// of creating a new one — `createKernelIdle` would allocate a fresh PCB slot
+/// every resume and leak the old one. The surviving PCB's saved context is stale
+/// (the CPU's live registers were lost at suspend), so we re-plant a fresh
+/// `kernelIdle` switch frame before dispatching. Falls back to a fresh idle only
+/// if this CPU somehow has no idle_pid (came up on resume but not at boot).
+export fn apEntryS3Resume() callconv(.c) noreturn {
+    const my_id = apInitPerCpu();
+
+    // apInitPerCpu ran on the resume CR3 — the suspending PROCESS's page tables,
+    // which carry the 0x8000 low-identity the trampoline needed to enable paging.
+    // Switch to the kernel master PML4 now, the stable table boot APs run their
+    // idle on (page_dir_phys=0 idles resolve to getKernelPageDirPhys in schedule).
+    // A process CR3 could be freed underneath us if that process later exits;
+    // apInitPerCpu touched only kernel-high memory, so nothing here depended on
+    // the process low mappings. Use the same loadCr3 helper schedule() uses so
+    // the per-CPU PCID bookkeeping stays consistent.
+    {
+        const pcid_mod = @import("mmu/pcid.zig");
+        pcid_mod.loadCr3(paging.getKernelPageDirPhys(), 0, my_id);
+    }
+
+    const idle_pid = if (cpus[my_id].idle_pid) |pid| reuse: {
+        process.resetKernelIdleForResume(pid);
+        break :reuse pid;
+    } else (process.createKernelIdle(my_id) orelse {
+        serial.print("[smp] FATAL: AP {d} could not create idle PCB on resume\n", .{my_id});
+        while (true) asm volatile ("hlt");
+    });
+    cpus[my_id].idle_pid = idle_pid;
+
+    serial.print("[smp] AP {d} re-online after S3\n", .{my_id});
+
     process.enterFirstTaskAp(idle_pid);
 }
 
@@ -762,15 +825,115 @@ pub fn reinitForS3Resume() void {
 /// After an S3 resume only the BSP is running: S3 powered the APs down and the
 /// firmware waking vector brings up CPU 0 alone. Mark every other CPU offline so
 /// the scheduler, watchdog (nextAlivePeer skips !alive), and every
-/// `if (!cpu.alive)` consumer treat this as a single-CPU system. Re-bringing the
-/// APs up (INIT/SIPI) is a later S3 step; until then any task left in an
-/// offlined CPU's runqueue is stranded.
+/// `if (!cpu.alive)` consumer treat this as a single-CPU system — a clean
+/// single-CPU baseline that `reonlineApsForS3Resume` then builds back up from
+/// (it relies on these cleared `alive` flags as its bring-up gate). Any task
+/// left running on an offlined CPU at suspend is stranded (its live register
+/// context was lost — only the BSP's was saved).
 pub fn offlineApsForS3Resume() void {
     var i: usize = 1;
     while (i < MAX_CPUS) : (i += 1) {
         @atomicStore(bool, &cpus[i].alive, false, .release);
     }
     cpu_count = 1;
+}
+
+/// Re-online the APs S3 powered down (CP2b-2b). The counterpart to
+/// `offlineApsForS3Resume`: where that degrades the box to single-CPU on wake,
+/// this re-runs the INIT/SIPI bring-up so the machine comes back full-SMP.
+///
+/// MUST be called from the S3 resume path on the BSP with IF=0, AFTER
+/// `offlineApsForS3Resume` (which clears the stale `alive` flags this function's
+/// wait loop gates on) and BEFORE `removeLowIdentity`: the AP trampoline runs at
+/// phys 0x8000 and needs the 2 MiB low-identity mapping (still live in the
+/// post-resume CR3 the suspend path installed) the instant it enables paging.
+/// `resume_cr3` is that CR3 (bare PML4 phys, PCID stripped) — the APs load it,
+/// exactly as the BSP's own wake trampoline did, then switch to their idle PCB's
+/// page tables on the first dispatch.
+///
+/// Each AP re-enters via `apEntryS3Resume`, which reuses its surviving idle PCB.
+///
+/// LIMITATION — S3 does not quiesce the APs before power-off, so an AP frozen
+/// mid-execution at suspend has two unrecoverable hazards, both rooted in the
+/// missing pre-suspend quiesce (the proper fix, and the next step):
+///   1. Its live register context is lost (only the BSP's was saved), so a task
+///      that was *running* on it at suspend can't be resumed — it's stranded.
+///   2. Any lock it held at power-off stays stuck-held; the re-onlined AP's
+///      idle→schedule path (sched_lock, setstate_locks) — or, for that matter,
+///      the BSP's own resume device re-init (global pmm.lock via xHCI re-enum) —
+///      can then spin forever on it. This is a pre-existing S3 risk, not new to
+///      AP re-online. In practice a user suspends from an *idle* desktop: the APs
+///      sit in kernelIdle's hlt/mwait holding nothing, so neither hazard fires.
+///      A busy-system suspend can wedge a re-onlined AP (contained + watchdog-
+///      visible: the BSP keeps running, the stuck AP stops ticking → autopsy).
+pub fn reonlineApsForS3Resume(resume_cr3: u64) void {
+    if (!apic.apic_active) return;
+    if (@import("../boot/boot_info.zig").boot_mode == 2) return; // safe mode: stay single-CPU
+    // The AP trampoline does a 32-bit `mov cr3, eax`, so the CR3 must fit in 32
+    // bits or the AP loads a truncated value and triple-faults. installLowIdentity
+    // already asserted this for resume_cr3 at suspend; re-check rather than risk it.
+    if (resume_cr3 >= 0x1_0000_0000) {
+        debug.klog("[smp] S3 re-online: resume CR3 0x{x} >= 4 GiB — skipped, staying single-CPU\n", .{resume_cr3});
+        return;
+    }
+
+    // Re-copy the trampoline blob to 0x8000. Low memory [0,1 MiB) is PMM-reserved
+    // so it almost certainly survived S3, but re-copy for determinism (and to
+    // re-run the overrun guard) — mirrors init().
+    const trampoline: [*]const u8 = @ptrCast(&ap_trampoline_start);
+    const trampoline_size = @intFromPtr(&ap_trampoline_end) - @intFromPtr(&ap_trampoline_start);
+    if (trampoline_size > AP_ENTRY_SLOT - TRAMPOLINE_ADDR)
+        @panic("smp: AP trampoline blob overran its data slots (0x8000..0x8FE8)");
+    const dest: [*]u8 = @ptrFromInt(paging.physToVirt(TRAMPOLINE_ADDR));
+    @memcpy(dest[0..trampoline_size], trampoline[0..trampoline_size]);
+
+    const bsp_id: u8 = @truncate(apic.getLapicId());
+    var ap_ids: [MAX_CPUS]u8 = undefined;
+    const ap_count = collectApIds(bsp_id, &ap_ids);
+
+    var brought: usize = 0;
+    var ap_idx: usize = 0;
+    while (ap_idx < ap_count) : (ap_idx += 1) {
+        const ap_id: u8 = ap_ids[ap_idx];
+
+        // Clear this AP's bring-up handshake flags (offlineApsForS3Resume cleared
+        // `alive`; clear `sipi_acked` too so the alive-wait gates on a freshly-set
+        // flag rather than a stale boot value).
+        @atomicStore(bool, &cpus[ap_id].sipi_acked, false, .release);
+        @atomicStore(bool, &cpus[ap_id].alive, false, .release);
+
+        // Trampoline data slots: re-enter via apEntryS3Resume, load the live
+        // resume CR3 (NOT the kernel master PML4 — its low identity was dropped
+        // at boot; resume_cr3 still maps 0x8000), reuse the AP's isr_stack for
+        // bring-up (abandoned once it dispatches into idle, same as boot).
+        const stack_top = @intFromPtr(&cpus[ap_id].isr_stack) + cpus[ap_id].isr_stack.len;
+        const ap_entry_ptr: *volatile u64 = @ptrFromInt(paging.physToVirt(AP_ENTRY_SLOT));
+        ap_entry_ptr.* = @intFromPtr(&apEntryS3Resume);
+        const pml4_ptr: *volatile u64 = @ptrFromInt(paging.physToVirt(AP_PML4_SLOT));
+        pml4_ptr.* = resume_cr3;
+        const stack_ptr: *volatile u64 = @ptrFromInt(paging.physToVirt(AP_STACK_SLOT));
+        stack_ptr.* = stack_top;
+
+        apic.sendInitIPI(ap_id);
+        busyWait(10);
+        apic.sendSIPI(ap_id, AP_SIPI_VECTOR);
+        busyWait(1);
+        apic.sendSIPI(ap_id, AP_SIPI_VECTOR);
+
+        // Wait for the AP to come back alive (apEntryS3Resume reached its end).
+        var ms: u32 = 0;
+        while (!@atomicLoad(bool, &cpus[ap_id].alive, .acquire) and ms < 500) : (ms += 1) {
+            busyWait(1);
+        }
+        if (@atomicLoad(bool, &cpus[ap_id].alive, .acquire)) {
+            cpu_count += 1;
+            brought += 1;
+            debug.klog("[smp] S3 re-online: AP {d} back ({d}ms)\n", .{ ap_id, ms });
+        } else {
+            debug.klog("[smp] S3 re-online: AP {d} did NOT come back ({d}ms timeout)\n", .{ ap_id, ms });
+        }
+    }
+    debug.klog("[smp] S3 re-online: {d}/{d} AP(s) back, {d} CPU(s) online\n", .{ brought, ap_count, cpu_count });
 }
 
 /// Initialize this CPU's per-CPU syscall scratch slot. The kstack pointer

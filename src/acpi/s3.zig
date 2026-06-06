@@ -289,10 +289,20 @@ pub fn suspendToRam() u32 {
 
     // ---- RESUME path (s3_longjmp landed here from s3ResumeEntry; IF=0) ----
     serial.print("[s3] resumed: back in suspendToRam via longjmp\n", .{});
-    // S3 powered the APs down — only the BSP woke. Mark them offline so the
-    // scheduler/watchdog treat this as a single-CPU system, then restore the
-    // 0..2 MiB null guard the suspend path borrowed for the trampoline page.
+    // S3 powered the APs down — only the BSP woke. Mark them offline first (a
+    // clean single-CPU baseline that clears the stale `alive` flags), then
+    // re-online them (CP2b-2b) so the machine comes back full-SMP. The re-online
+    // INIT/SIPIs the APs through the trampoline at phys 0x8000, which is still
+    // covered by the 2 MiB low-identity the suspend path installed in this CR3 —
+    // so it MUST run before removeLowIdentity tears that mapping down. The APs
+    // load this same resume CR3 (PCID stripped), exactly as the BSP's own wake
+    // trampoline did. IF is still 0, so the whole bring-up is atomic w.r.t. the
+    // watchdog/scheduler (no IRQ0 fires until we sysret back to userspace).
     smp.offlineApsForS3Resume();
+    smp.reonlineApsForS3Resume(readCr3() & paging.PAGE_MASK);
+
+    // Restore the 0..2 MiB null guard the suspend path borrowed for the
+    // trampoline page (now that AP re-online is done with it).
     removeLowIdentity();
 
     // Disk first: the NVMe controllers (root fs + swap) were powered down by S3
@@ -327,7 +337,7 @@ pub fn suspendToRam() u32 {
         serial.print("[s3] resumed: xhci re-init failed — USB input stays dead\n", .{});
     }
 
-    serial.print("[s3] resumed: APs offlined, low identity removed — returning to userspace\n", .{});
+    serial.print("[s3] resumed: APs re-onlined, devices + low identity restored — returning to userspace\n", .{});
     // return 0 -> sysShutdown -> syscall dispatcher -> sysret restores the app's
     // RFLAGS (IF=1) and lands it back in userspace; the LAPIC timer re-armed in
     // reinitForS3Resume drives the scheduler again from the next tick.

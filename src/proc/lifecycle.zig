@@ -553,6 +553,37 @@ pub fn createKernelIdle(cpu_id: u8) ?usize {
     return i;
 }
 
+/// Re-plant a fresh synthetic switch frame on an EXISTING idle PCB so its CPU can
+/// be re-dispatched cleanly after an S3 resume (CP2b-2b). The idle task is a
+/// stateless `while (true)` loop, so restarting it from `kernelIdle` with a clean
+/// stack is correct — and necessary: the CPU's live registers were lost when S3
+/// powered it down, so the PCB's saved `kernel_esp` is stale and must NOT be fed
+/// to `enterFirstTaskAp` as-is. Mirrors the frame-planting in `createKernelIdle`
+/// but REUSES the slot (no `allocSlot`) so a PCB isn't leaked every resume. Runs
+/// on the re-onlined AP, after the BSP has already observed its `alive` flag, so
+/// no other CPU is touching this slot.
+pub fn resetKernelIdleForResume(idle_pid: usize) void {
+    const i = idle_pid;
+    const slot_base = @intFromPtr(&process.kstack_pool[i]);
+    const stack_top = slot_base + KSTACK_SLOT_SIZE;
+
+    const FRAME_BYTES: usize = 64;
+    const sw_base: [*]u64 = @ptrFromInt(stack_top - FRAME_BYTES);
+    for (0..6) |k| sw_base[k] = 0;
+    sw_base[6] = @intFromPtr(&kernelIdle);
+    sw_base[7] = 0;
+
+    process.procs[i].kernel_esp = stack_top - FRAME_BYTES;
+    process.procs[i].kernel_stack_top = stack_top;
+    process.plantStackCanary(i); // re-plant base canary before re-publishing runnable
+    @atomicStore(usize, &process.expected_kstack_tops[i], stack_top, .release);
+
+    // It may still be marked .running (was current on the AP at suspend); route to
+    // .ready so enterFirstTaskAp's setState(.running) is a clean transition.
+    // rqEnter skips is_idle, so this never enqueues.
+    process.setState(i, .ready);
+}
+
 /// Compatibility shim — old call site in main.zig. Creates the BSP's
 /// kernel-mode idle and stashes it in `cpus[0].idle_pid`. Per-CPU idle
 /// is the only idle book-keeping we need; pickNext filters via the
