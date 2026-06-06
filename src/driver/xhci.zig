@@ -13,6 +13,15 @@ var pci_bus: u8 = 0;
 var pci_dev: u8 = 0;
 var pci_func: u8 = 0;
 
+/// The six BAR registers (config 0x10..0x27), snapshotted at init. S3
+/// (suspend-to-RAM) powers the controller down and zeroes its BAR addresses +
+/// clears the command register; the firmware doesn't re-program device BARs on
+/// resume. resumeFromS3 writes these back before re-enabling the device — same
+/// fix as virtio_gpu. Without it every MMIO read returns 0 and the controller
+/// looks dead.
+var saved_bars: [6]u32 = .{ 0, 0, 0, 0, 0, 0 };
+var saved_pci_valid: bool = false;
+
 // --- xHCI TRB Types ---
 const TRB_NORMAL = 1;
 const TRB_SETUP = 2;
@@ -657,6 +666,171 @@ pub fn init() bool {
     scanAndEnumerate();
     enumeration_done = true;
     debug.klog("[xhci] Enumeration complete, {d} HID devices\n", .{device_count});
+
+    // Snapshot the BARs for the S3 resume restore (see saved_bars). Programmed
+    // by firmware before init ran and stable after enumeration.
+    {
+        var bi: u8 = 0;
+        while (bi < 6) : (bi += 1) {
+            const off: u8 = 0x10 + bi * 4;
+            saved_bars[bi] = pci.configRead(pci_bus, pci_dev, pci_func, off);
+        }
+        saved_pci_valid = true;
+    }
+
+    bind.commit();
+    return true;
+}
+
+/// Re-initialize the xHCI controller after an S3 (suspend-to-RAM) resume.
+///
+/// Like the virtio-gpu, the xHCI controller is a PCI device S3 powered down:
+/// BARs zeroed, command register cleared, the controller reset (USBCMD / CRCR /
+/// DCBAAP / ERST all lost) and the two USB HID devices (keyboard + tablet)
+/// de-addressed — so keyboard *and* mouse input die. Guest RAM survived, so the
+/// DCBAA, command ring, event ring and ERST frames are still allocated: we
+/// restore the BARs, re-program the controller onto those surviving structures,
+/// and re-enumerate the devices.
+///
+/// HID input is drained by pollHID() from the IRQ0 *timer tick* (not the xHCI
+/// MSI-X IRQ), and the LAPIC timer is already re-armed by the time we run, so
+/// input revives without re-arming the controller's now-stale MSI-X — we leave
+/// use_msix=false. That also forces the enumeration's command-completion waits
+/// onto the busy-poll path, which is exactly what's needed here under IF=0 (no
+/// hlt, no scheduler dependency) — the same reasoning as the GPU's force-polled
+/// re-init.
+///
+/// Called once from the S3 resume path (acpi/s3.zig) on the BSP with IF=0.
+/// Best-effort: returns false (input stays dead but the system runs) on any
+/// failed step rather than panicking.
+///
+/// Known limitation: the previous per-device contexts + transfer rings are
+/// orphaned (a few frames leaked per resume) since re-enumeration allocates
+/// fresh ones; S3 is rare so this is bounded. Freeing them is a later refinement.
+pub fn resumeFromS3() bool {
+    if (!initialized) return false; // never initialised — nothing to resume
+    if (mmio_base == 0 or op_base == 0) return false;
+
+    debug.klog("[xhci] S3 resume: re-initializing controller\n", .{});
+
+    const dev = pci.findByClass(0x0C, 0x03, 0x30) orelse {
+        debug.klog("[xhci] S3 resume: controller not found\n", .{});
+        return false;
+    };
+
+    // Restore the BARs S3 zeroed (disable decode, write all six low-then-high),
+    // then bindDevice re-enables Memory + Bus Master and wakes D3->D0.
+    if (saved_pci_valid) {
+        const cmd_before = pci.configRead16(pci_bus, pci_dev, pci_func, 0x04);
+        pci.configWrite16(pci_bus, pci_dev, pci_func, 0x04, cmd_before & ~@as(u16, 0x0003));
+        var bi: u8 = 0;
+        while (bi < 6) : (bi += 1) {
+            const off: u8 = 0x10 + bi * 4;
+            pci.configWrite(pci_bus, pci_dev, pci_func, off, saved_bars[bi]);
+        }
+        debug.klog("[xhci] S3 resume: PCI BARs restored (cmd was 0x{X})\n", .{cmd_before});
+    }
+    var bind = pci.bindDevice(dev);
+    defer bind.deinit();
+
+    // MSI-X is stale post-S3; rely on the IRQ0-tick pollHID drain and force the
+    // busy-poll command-wait path (we run with IF=0 here, so no hlt).
+    use_msix = false;
+
+    // --- Stop + reset the controller (same sequence as init) ---
+    var cmd = readReg(op_base + USBCMD);
+    cmd &= ~@as(u32, CMD_RS);
+    writeReg(op_base + USBCMD, cmd);
+    var timeout: u32 = 100000;
+    while (timeout > 0) : (timeout -= 1) {
+        if (readReg(op_base + USBSTS) & STS_HCH != 0) break;
+    }
+    if (timeout == 0) {
+        debug.klog("[xhci] S3 resume: halt timeout\n", .{});
+        return false;
+    }
+    writeReg(op_base + USBCMD, CMD_HCRST);
+    timeout = 100000;
+    while (timeout > 0) : (timeout -= 1) {
+        if (readReg(op_base + USBCMD) & CMD_HCRST == 0) break;
+    }
+    timeout = 100000;
+    while (timeout > 0) : (timeout -= 1) {
+        if (readReg(op_base + USBSTS) & STS_CNR == 0) break;
+    }
+    if (timeout == 0) {
+        debug.klog("[xhci] S3 resume: CNR timeout\n", .{});
+        return false;
+    }
+
+    // --- Re-program the controller onto the SURVIVING structures ---
+    writeReg(op_base + CONFIG, max_slots);
+
+    // DCBAA: re-zero (every slot is invalid after reset) and re-point.
+    @memset(@as([*]u8, @ptrFromInt(paging.physToVirt(dcbaa_phys)))[0..4096], 0);
+    writeReg64(op_base + DCBAAP, dcbaa_phys);
+
+    // Command ring: re-zero, reset enqueue/cycle, re-point CRCR.
+    @memset(@as([*]u8, @ptrFromInt(paging.physToVirt(cmd_ring.phys)))[0..4096], 0);
+    cmd_ring.enqueue = 0;
+    cmd_ring.cycle = true;
+    cmd_ring.link_pending = false;
+    writeReg64(op_base + CRCR, cmd_ring.phys | 1);
+
+    // Event ring (4 pages) + ERST: re-zero, reset, re-point.
+    @memset(@as([*]u8, @ptrFromInt(paging.physToVirt(evt_ring.phys)))[0 .. 4096 * 4], 0);
+    evt_ring.enqueue = 0;
+    evt_ring.cycle = true;
+    evt_dequeue = 0;
+    evt_cycle = true;
+    const erst: [*]volatile u32 = @ptrFromInt(paging.physToVirt(erst_phys));
+    @memset(@as([*]u8, @ptrFromInt(paging.physToVirt(erst_phys)))[0..4096], 0);
+    erst[0] = @truncate(evt_ring.phys);
+    erst[1] = @truncate(evt_ring.phys >> 32);
+    erst[2] = EVT_RING_SIZE;
+    erst[3] = 0;
+    const ir0_base = rt_base + 0x20;
+    writeReg(ir0_base + 0x08, 1); // ERSTSZ = one segment
+    writeReg64(ir0_base + 0x18, evt_ring.phys); // ERDP
+    writeReg64(ir0_base + 0x10, erst_phys); // ERSTBA
+    var iman = readReg(ir0_base + 0x00);
+    iman |= 0x02; // IE
+    writeReg(ir0_base + 0x00, iman);
+
+    // --- Start the controller ---
+    cmd = readReg(op_base + USBCMD);
+    cmd |= CMD_RS | CMD_INTE;
+    writeReg(op_base + USBCMD, cmd);
+    timeout = 100000;
+    while (timeout > 0) : (timeout -= 1) {
+        if (readReg(op_base + USBSTS) & STS_HCH == 0) break;
+    }
+    if (timeout == 0) {
+        debug.klog("[xhci] S3 resume: controller failed to start\n", .{});
+        return false;
+    }
+
+    // --- Reset device tracking so re-enumeration starts clean. The controller
+    // forgot every slot; the old per-device contexts/rings are orphaned. ---
+    {
+        var i: usize = 0;
+        while (i < MAX_DEVICES) : (i += 1) {
+            devices[i] = .{};
+            hid_ring_active[i] = false;
+        }
+    }
+    device_count = 0;
+    enumeration_done = false;
+    if (scratch_phys != 0) {
+        pmm.freeFrame(scratch_phys);
+        scratch_phys = 0;
+    }
+
+    // --- Re-enumerate the connected ports (re-addresses keyboard + tablet and
+    // re-arms their HID interrupt rings). ---
+    scanAndEnumerate();
+    enumeration_done = true;
+    debug.klog("[xhci] S3 resume: re-enumerated {d} HID device(s)\n", .{device_count});
 
     bind.commit();
     return true;

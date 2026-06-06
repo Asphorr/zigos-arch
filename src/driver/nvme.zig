@@ -309,6 +309,16 @@ const Controller = struct {
     mmio_base: usize = 0, // (c) set at initController
     doorbell_stride_log: u8 = 0, // (c)
 
+    // PCI identity + BAR snapshot for S3 (suspend-to-RAM) resume. Across S3
+    // the controller is powered down: its six BARs are zeroed and the command
+    // register cleared (left in D3), so MMIO stops decoding and the controller
+    // is reset. `resumeController` restores these before re-binding the device.
+    // Snapshotted (raw config dwords, so the low type/prefetch bits survive the
+    // write-back) at the end of a successful initController. See resumeFromS3.
+    pci_dev: pci.PciDevice = undefined, // (c)
+    saved_bars: [6]u32 = [_]u32{0} ** 6, // (c) config 0x10..0x27 snapshot
+    saved_pci_valid: bool = false, // (c) true once snapshotted
+
     admin_sq: usize = 0, // (c) phys addr of the admin SQ ring; BSP-only at boot
     admin_cq: usize = 0, // (c)
     admin_sq_tail: u16 = 0, // BSP-only at boot
@@ -711,6 +721,20 @@ fn initController(c: *Controller, dev: pci.PciDevice, idx: usize) bool {
     }
 
     c.initialized = true;
+
+    // Snapshot PCI identity + BARs for the S3 resume restore. Stable once
+    // firmware programmed them; resumeController writes the BARs back after S3
+    // zeroes them. Read raw config dwords (not dev.bars[]) so the low type/
+    // prefetch bits are preserved for an exact write-back.
+    c.pci_dev = dev;
+    {
+        var bi: u8 = 0;
+        while (bi < 6) : (bi += 1) {
+            c.saved_bars[bi] = pci.configRead(dev.bus, dev.dev, dev.func, 0x10 + bi * 4);
+        }
+        c.saved_pci_valid = true;
+    }
+
     debug.klog("[nvme] ctrl#{d} ready\n", .{idx});
     init_state.commit();
     bind.commit();
@@ -1717,6 +1741,139 @@ pub fn init() bool {
 
 pub fn isReady() bool {
     return num_controllers > 0;
+}
+
+/// Re-initialize a single NVMe controller after an S3 (suspend-to-RAM) resume.
+///
+/// Like the virtio-gpu and xHCI, an NVMe controller is a PCI device S3 powers
+/// down: its BARs are zeroed, the command register cleared (D3), and the
+/// controller reset (CC.EN drops, the admin/I-O queues are forgotten). Guest
+/// RAM survives, so every DMA structure this driver allocated at init — the
+/// admin SQ/CQ, the I/O SQ/CQ, the per-CID bounce + PRP-list pages — is still
+/// present, and (proven by the GPU resume working) the IOMMU's isolation domain
+/// + DMA mappings for this BDF survive too. So we restore the BARs, re-bind to
+/// wake D3->D0, reset + re-enable the controller pointing the admin queues at
+/// the surviving frames, and re-create the I/O queue pair on its surviving
+/// frames. No re-IDENTIFY (nsid/block_size already known) and no re-map.
+///
+/// MSI-X lived in the device's BAR space and is gone; rather than re-arm (which
+/// burns another dynamic IRQ vector), we drop to use_msix=false and let the
+/// IRQ0-tick `tickSweep` -> `reapCq` path — which already backstops every
+/// completion regardless of MSI-X — wake blocked I/O. async_mode is untouched.
+/// Runs on the BSP with IF=0, so adminCommand's pause-spin completion wait is
+/// the right (and only safe) path here.
+///
+/// The host-side waiters array is intentionally left alone: a command in flight
+/// across the suspend is lost with the controller reset, but its waiter
+/// self-heals via the submit-side rdtsc timeout (and the slot-reuse invariant —
+/// allocCid CASes on `active` — stays intact, so we must NOT force-clear it).
+/// In the normal case (suspend from an idle desktop) there are no such waiters.
+fn resumeController(c: *Controller, idx: usize) bool {
+    if (!c.initialized) return false;
+    if (!c.saved_pci_valid) return false;
+    if (c.mmio_base == 0) return false;
+    const dev = c.pci_dev;
+
+    // Restore the BARs S3 zeroed (disable decode first, then write all six
+    // low-then-high); bindDevice then re-enables Memory + Bus Master + wakes D0.
+    {
+        const cmd_before = pci.configRead16(dev.bus, dev.dev, dev.func, 0x04);
+        pci.configWrite16(dev.bus, dev.dev, dev.func, 0x04, cmd_before & ~@as(u16, 0x0003));
+        var bi: u8 = 0;
+        while (bi < 6) : (bi += 1) {
+            pci.configWrite(dev.bus, dev.dev, dev.func, 0x10 + bi * 4, c.saved_bars[bi]);
+        }
+        debug.klog("[nvme] ctrl#{d} S3 resume: BARs restored (cmd was 0x{X})\n", .{ idx, cmd_before });
+    }
+    var bind = pci.bindDevice(dev);
+    defer bind.deinit();
+
+    // MSI-X table is gone with the BAR; fall back to the IRQ0-tick reaper.
+    c.use_msix = false;
+
+    // Disable the controller (defensive — power loss already dropped CC.EN)
+    // then re-program the admin queues onto their SURVIVING frames.
+    const cc = r32(c, REG_CC);
+    if (cc & CC_EN != 0) {
+        w32(c, REG_CC, cc & ~CC_EN);
+        var spin: u32 = 0;
+        while ((r32(c, REG_CSTS) & CSTS_RDY) != 0 and spin < 5_000_000) : (spin += 1) {}
+    }
+
+    // Re-zero the admin rings (stale phase bits from the boot session would
+    // false-match) and reset our head/tail/phase to the post-reset device state.
+    @memset(@as([*]u8, @ptrFromInt(paging.physToVirt(c.admin_sq)))[0..4096], 0);
+    @memset(@as([*]u8, @ptrFromInt(paging.physToVirt(c.admin_cq)))[0..4096], 0);
+    c.admin_sq_tail = 0;
+    c.admin_cq_head = 0;
+    c.admin_cq_phase = true;
+
+    const aqa: u32 = (@as(u32, Q_DEPTH - 1) << 16) | @as(u32, Q_DEPTH - 1);
+    w32(c, REG_AQA, aqa);
+    w32(c, REG_ASQ_LO, @truncate(c.admin_sq));
+    w32(c, REG_ASQ_HI, @truncate(c.admin_sq >> 32));
+    w32(c, REG_ACQ_LO, @truncate(c.admin_cq));
+    w32(c, REG_ACQ_HI, @truncate(c.admin_cq >> 32));
+
+    w32(c, REG_CC, CC_IOSQES_64 | CC_IOCQES_16);
+    w32(c, REG_CC, CC_IOSQES_64 | CC_IOCQES_16 | CC_EN);
+    var spin: u32 = 0;
+    while ((r32(c, REG_CSTS) & CSTS_RDY) == 0 and spin < 10_000_000) : (spin += 1) {}
+    if ((r32(c, REG_CSTS) & CSTS_RDY) == 0) {
+        debug.klog("[nvme] ctrl#{d} S3 resume: not RDY (csts=0x{x})\n", .{ idx, r32(c, REG_CSTS) });
+        return false;
+    }
+
+    c.next_cid = 1;
+
+    // Re-create the I/O queue pair on its surviving frames. Re-zero (phase) +
+    // reset head/tail/phase, then CREATE_CQ/CREATE_SQ via the now-live admin
+    // queue. nsid/block_size are already known — no re-IDENTIFY needed.
+    @memset(@as([*]u8, @ptrFromInt(paging.physToVirt(c.io_sq)))[0..4096], 0);
+    @memset(@as([*]u8, @ptrFromInt(paging.physToVirt(c.io_cq)))[0..4096], 0);
+    c.io_sq_tail = 0;
+    c.io_cq_head = 0;
+    c.io_cq_phase = true;
+
+    const cq_cdw11: u32 = if (c.use_msix) (@as(u32, 1) << 16) | (@as(u32, 1) << 1) | 1 else 1;
+    if (!adminCommand(c, .{
+        .opcode = ADMIN_CREATE_CQ,
+        .prp1 = c.io_cq,
+        .cdw10 = (@as(u32, Q_DEPTH - 1) << 16) | 1,
+        .cdw11 = cq_cdw11,
+    })) {
+        debug.klog("[nvme] ctrl#{d} S3 resume: create IO CQ failed\n", .{idx});
+        return false;
+    }
+    if (!adminCommand(c, .{
+        .opcode = ADMIN_CREATE_SQ,
+        .prp1 = c.io_sq,
+        .cdw10 = (@as(u32, Q_DEPTH - 1) << 16) | 1,
+        .cdw11 = (1 << 16) | 1, // CQID=1 << 16 | PC=1
+    })) {
+        debug.klog("[nvme] ctrl#{d} S3 resume: create IO SQ failed\n", .{idx});
+        return false;
+    }
+
+    bind.commit();
+    debug.klog("[nvme] ctrl#{d} S3 resume: re-initialized\n", .{idx});
+    return true;
+}
+
+/// Re-initialize every NVMe controller after an S3 resume (root fs + swap).
+/// Best-effort and idempotent-per-call: a controller that fails to come back
+/// leaves its disk dead but doesn't block the others or the resume. Called once
+/// from the S3 resume path (acpi/s3.zig) on the BSP with IF=0, before the GPU/
+/// xHCI re-init — disk is the most foundational (an app launch's ELF read wedges
+/// on a dead controller, which is exactly the post-resume freeze this fixes).
+pub fn resumeFromS3() bool {
+    if (num_controllers == 0) return false;
+    var all_ok = true;
+    var i: usize = 0;
+    while (i < num_controllers) : (i += 1) {
+        if (!resumeController(&controllers[i], i)) all_ok = false;
+    }
+    return all_ok;
 }
 
 /// Gap #1 (2026-05-20): per-tick CQ sweeper. Wired into `handleIRQ0`

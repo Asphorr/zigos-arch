@@ -23,6 +23,8 @@ const serial = @import("../debug/serial.zig");
 const common = @import("../cpu/syscall/common.zig");
 const smp = @import("../cpu/smp.zig");
 const virtio_gpu = @import("../driver/virtio_gpu.zig");
+const xhci = @import("../driver/xhci.zig");
+const nvme = @import("../driver/nvme.zig");
 
 // Fixed low phys, < 1 MiB: the FACS 32-bit waking vector and the real-mode entry
 // both require it. RAM is preserved across S3, so the blob + slots survive the
@@ -293,6 +295,19 @@ pub fn suspendToRam() u32 {
     smp.offlineApsForS3Resume();
     removeLowIdentity();
 
+    // Disk first: the NVMe controllers (root fs + swap) were powered down by S3
+    // like every other PCI device — BARs zeroed, controllers reset. Until they
+    // are re-initialized, the first post-resume disk read (e.g. an app launch
+    // loading its ELF) blocks forever on a dead controller and the desktop
+    // appears frozen, even though the kernel keeps ticking. Re-init here (IF=0,
+    // best-effort) ahead of the GPU/xHCI so storage is live before anything that
+    // might touch it.
+    if (nvme.resumeFromS3()) {
+        serial.print("[s3] resumed: nvme re-initialized — disk I/O restored\n", .{});
+    } else {
+        serial.print("[s3] resumed: nvme re-init failed — disk I/O may hang\n", .{});
+    }
+
     // Devices were powered down across S3. Bring the GPU back so the desktop
     // renders again. Runs here with IF=0 so it's atomic (no task can interleave
     // a half-initialized device) and uses the driver's polled submit path, which
@@ -302,6 +317,14 @@ pub fn suspendToRam() u32 {
         serial.print("[s3] resumed: virtio-gpu re-initialized — display restored\n", .{});
     } else {
         serial.print("[s3] resumed: virtio-gpu re-init failed — staying headless\n", .{});
+    }
+
+    // USB keyboard + mouse hang off the xHCI controller, also powered down by
+    // S3. Re-init it so input revives. Same IF=0 / best-effort contract.
+    if (xhci.resumeFromS3()) {
+        serial.print("[s3] resumed: xhci re-initialized — USB input restored\n", .{});
+    } else {
+        serial.print("[s3] resumed: xhci re-init failed — USB input stays dead\n", .{});
     }
 
     serial.print("[s3] resumed: APs offlined, low identity removed — returning to userspace\n", .{});
