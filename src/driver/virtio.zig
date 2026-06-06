@@ -204,6 +204,51 @@ pub const Queue = struct {
         ccWrite16(cc_base, CC_QUEUE_ENABLE, 1);
         return true;
     }
+
+    /// Re-program the device's per-queue registers to point back at this
+    /// queue's EXISTING ring memory after the *device* was reset but guest RAM
+    /// survived — the S3 (suspend-to-RAM) resume case. Unlike `init`, allocates
+    /// and frees nothing: it reuses desc_phys/avail_phys/used_phys and only
+    /// re-zeroes the rings, rebuilds the descriptor free-list, and re-writes the
+    /// common-config queue registers. `qi` must match the index originally
+    /// passed to `init`. Returns false if this queue was never initialised
+    /// (queue_size 0 / desc_phys 0) or the device now reports queue size 0.
+    pub fn reprogram(self: *Queue, cc_base: usize, qi: u16) bool {
+        if (self.queue_size == 0 or self.desc_phys == 0) return false;
+
+        ccWrite16(cc_base, CC_QUEUE_SELECT, qi);
+        if (ccRead16(cc_base, CC_QUEUE_SIZE) == 0) return false;
+        const qs = self.queue_size;
+        ccWrite16(cc_base, CC_QUEUE_SIZE, qs);
+
+        // Re-zero both ring frames. A device reset puts the device's internal
+        // avail/used indices back to 0, so our in-memory used_idx (and the
+        // avail-ring idx, which lives in the desc/avail frame) must be 0 too or
+        // the freshly-reset device and the driver disagree about how many
+        // buffers are outstanding. desc+avail share one frame; used has its own.
+        @memset(@as([*]u8, @ptrFromInt(paging.physToVirt(self.desc_phys)))[0..4096], 0);
+        @memset(@as([*]u8, @ptrFromInt(paging.physToVirt(self.used_phys)))[0..4096], 0);
+
+        self.free_head = 0;
+        self.num_free = qs;
+        self.last_used_idx = 0;
+        for (0..qs) |i| {
+            self.descPtr(@intCast(i)).next = @as(u16, @intCast(i)) + 1;
+        }
+
+        // Re-cache notify_off (constant per queue) and re-write the ring
+        // addresses — the same register sequence as init's tail.
+        self.notify_off = ccRead16(cc_base, CC_QUEUE_NOTIFY_OFF);
+        ccWrite32(cc_base, CC_QUEUE_DESC_LO, @truncate(self.desc_phys));
+        ccWrite32(cc_base, CC_QUEUE_DESC_HI, @truncate(self.desc_phys >> 32));
+        ccWrite32(cc_base, CC_QUEUE_AVAIL_LO, @truncate(self.avail_phys));
+        ccWrite32(cc_base, CC_QUEUE_AVAIL_HI, @truncate(self.avail_phys >> 32));
+        ccWrite32(cc_base, CC_QUEUE_USED_LO, @truncate(self.used_phys));
+        ccWrite32(cc_base, CC_QUEUE_USED_HI, @truncate(self.used_phys >> 32));
+        ccWrite16(cc_base, CC_QUEUE_MSIX_VECTOR, 0xFFFF);
+        ccWrite16(cc_base, CC_QUEUE_ENABLE, 1);
+        return true;
+    }
 };
 
 // --- Common-config MMIO accessors ---

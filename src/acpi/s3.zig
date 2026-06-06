@@ -22,6 +22,7 @@ const io = @import("../io.zig");
 const serial = @import("../debug/serial.zig");
 const common = @import("../cpu/syscall/common.zig");
 const smp = @import("../cpu/smp.zig");
+const virtio_gpu = @import("../driver/virtio_gpu.zig");
 
 // Fixed low phys, < 1 MiB: the FACS 32-bit waking vector and the real-mode entry
 // both require it. RAM is preserved across S3, so the blob + slots survive the
@@ -291,6 +292,18 @@ pub fn suspendToRam() u32 {
     // 0..2 MiB null guard the suspend path borrowed for the trampoline page.
     smp.offlineApsForS3Resume();
     removeLowIdentity();
+
+    // Devices were powered down across S3. Bring the GPU back so the desktop
+    // renders again. Runs here with IF=0 so it's atomic (no task can interleave
+    // a half-initialized device) and uses the driver's polled submit path, which
+    // needs no interrupts. Best-effort: a failure leaves the system running
+    // headless (as it did before CP2c) rather than blocking the resume.
+    if (virtio_gpu.resumeFromS3()) {
+        serial.print("[s3] resumed: virtio-gpu re-initialized — display restored\n", .{});
+    } else {
+        serial.print("[s3] resumed: virtio-gpu re-init failed — staying headless\n", .{});
+    }
+
     serial.print("[s3] resumed: APs offlined, low identity removed — returning to userspace\n", .{});
     // return 0 -> sysShutdown -> syscall dispatcher -> sysret restores the app's
     // RFLAGS (IF=1) and lands it back in userspace; the LAPIC timer re-armed in

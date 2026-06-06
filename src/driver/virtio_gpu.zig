@@ -508,6 +508,17 @@ var cursor_vq: Virtqueue = .{};
 var pci_bus: u8 = 0;
 var pci_dev: u8 = 0;
 var pci_func: u8 = 0;
+
+/// The six BAR registers (config 0x10..0x27), snapshotted at init. S3
+/// (suspend-to-RAM) powers the PCI function down and the firmware does NOT
+/// re-program device BARs on resume — a real OS saves/restores config space in
+/// its PM callbacks. resumeFromS3 writes these back before re-enabling decode,
+/// otherwise common_cfg/notify_base (kernel VAs mapping to the boot BAR phys)
+/// point at a BAR that no longer decodes and every MMIO read returns 0 (→ device
+/// reports no features → FEATURES_OK never sets). 64-bit BARs (BAR0/1, BAR2/3
+/// here) are covered by restoring all six slots low-then-high in index order.
+var saved_bars: [6]u32 = .{ 0, 0, 0, 0, 0, 0 };
+var saved_pci_valid: bool = false;
 // Cursor command ring. Single-page (4 KB) carved into CURSOR_RING_SIZE
 // UpdateCursor slots. Each sendCursorCmd writes into a fresh slot and
 // hands its physical address to the device; the previous in-flight slot
@@ -1667,7 +1678,174 @@ pub fn init(xres: u32, yres: u32) bool {
         }
     }
 
+    // Snapshot the BARs for the S3 resume restore (see saved_bars). They were
+    // programmed by firmware before init ran and don't change after enumeration,
+    // so capturing once here is sufficient.
+    {
+        var bi: u8 = 0;
+        while (bi < 6) : (bi += 1) {
+            const off: u8 = 0x10 + bi * 4;
+            saved_bars[bi] = pci.configRead(pci_bus, pci_dev, pci_func, off);
+        }
+        saved_pci_valid = true;
+    }
+
     bind.commit();
+    return true;
+}
+
+/// Re-initialize the virtio-gpu after an S3 (suspend-to-RAM) resume.
+///
+/// Across S3 the machine was powered down, so the device came back in its
+/// power-on-reset state: virtqueues forgotten, every host resource (the 2D
+/// scanout + any compositor blobs) destroyed, DRIVER_OK cleared, and the PCI
+/// function dropped to D3. Guest RAM survived, though — the framebuffer pages,
+/// the command/response buffers, and the virtqueue ring memory are all still
+/// allocated and still mapped (page tables + IOMMU tables live in RAM). So we
+/// only re-drive the device handshake, re-point the device at the (surviving)
+/// rings, and re-create the 2D scanout bound to the (surviving) guest
+/// framebuffer.
+///
+/// Called once from the S3 resume path (acpi/s3.zig) on the BSP with IF=0.
+/// Forces the polled submit path for the duration: that path neither yields
+/// (blockOn) nor depends on the GPU MSI-X IRQ / LAPIC tick, so the whole
+/// re-init is atomic — no other task can run and observe a half-initialized
+/// device — and it works before interrupts are re-enabled, exactly the context
+/// the early-boot init() ran in before MSI-X was armed.
+///
+/// Resets to the plain 2D scanout regardless of the pre-suspend mode: if the
+/// compositor had armed a blob double-buffer those host blobs are gone too, and
+/// rebuilding them needs the Venus/virgl context path (a later step); dropping
+/// to 2D restores a working desktop either way. Best-effort — returns false
+/// (system stays headless, as before CP2c) on any failed step rather than
+/// panicking.
+pub fn resumeFromS3() bool {
+    if (!active) return false; // GPU was never initialised — nothing to resume
+    if (common_cfg == 0) return false;
+
+    debug.klog("[virtio-gpu] S3 resume: re-initializing device ({d}x{d})\n", .{ width, height });
+
+    // Bring the PCI function back to D0 + re-enable Bus Master/Memory (S3
+    // dropped it to D3 and may have cleared the command register). Re-find the
+    // device from the bus cache — same BDF we bound at init.
+    const dev_found = pci.findByVendorDevice(VIRTIO_VENDOR, VIRTIO_GPU_DEVICE) orelse {
+        debug.klog("[virtio-gpu] S3 resume: device not found\n", .{});
+        return false;
+    };
+
+    // S3 cleared the device's PCI BARs. Restore them from the init snapshot
+    // BEFORE re-enabling decode (Linux-style: disable I/O+Mem decode, write the
+    // BARs, then bindDevice re-enables Memory + Bus Master). Without this,
+    // common_cfg/notify_base map to a BAR that no longer decodes and every MMIO
+    // read returns 0.
+    if (saved_pci_valid) {
+        const cmd_before = pci.configRead16(pci_bus, pci_dev, pci_func, 0x04);
+        pci.configWrite16(pci_bus, pci_dev, pci_func, 0x04, cmd_before & ~@as(u16, 0x0003));
+        var bi: u8 = 0;
+        while (bi < 6) : (bi += 1) {
+            const off: u8 = 0x10 + bi * 4;
+            pci.configWrite(pci_bus, pci_dev, pci_func, off, saved_bars[bi]);
+        }
+        debug.klog("[virtio-gpu] S3 resume: PCI BARs restored (cmd was 0x{X})\n", .{cmd_before});
+    }
+
+    var bind = pci.bindDevice(dev_found);
+    defer bind.deinit();
+
+    // Force the polled submit path for every command below: no blockOn(.gpu_io)
+    // yields, no dependence on the GPU IRQ or the LAPIC tick (neither may
+    // deliver yet at this point in resume). Restored on exit so steady-state
+    // frames go back to the fast IRQ-driven path.
+    const saved_force_polled = force_polled;
+    force_polled = true;
+    defer force_polled = saved_force_polled;
+
+    // --- Re-drive the device handshake (per virtio §3.1.1) ---
+    // Unlike init (which runs against an already-reset device at boot), here the
+    // device is live in DRIVER_OK, so the reset is NOT instant: we MUST wait for a
+    // read-back of 0 before re-initialising, or the device rejects FEATURES_OK
+    // while it's still tearing down its old state. Mirrors virtio_net/virtio_sound.
+    ccWrite8(CC_DEVICE_STATUS, 0); // reset
+    var reset_spin: u32 = 0;
+    while (ccRead8(CC_DEVICE_STATUS) != 0 and reset_spin < 1000) : (reset_spin += 1) {}
+    ccWrite8(CC_DEVICE_STATUS, STATUS_ACKNOWLEDGE);
+    ccWrite8(CC_DEVICE_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER);
+
+    // Re-negotiate features. The device advertises the same set as at boot, so
+    // re-derive driver features from what it offers (keeps the accepted bits
+    // consistent with has_*/use_event_idx already recorded by init).
+    ccWrite32(CC_DEVICE_FEATURE_SELECT, 0);
+    const dev_features_0 = ccRead32(CC_DEVICE_FEATURE);
+    ccWrite32(CC_DEVICE_FEATURE_SELECT, 1);
+    const dev_features_1 = ccRead32(CC_DEVICE_FEATURE);
+    var driver_features_0: u32 = 0;
+    if (dev_features_0 & (@as(u32, 1) << VIRTIO_GPU_F_VIRGL) != 0) driver_features_0 |= @as(u32, 1) << VIRTIO_GPU_F_VIRGL;
+    if (dev_features_0 & (@as(u32, 1) << VIRTIO_GPU_F_RESOURCE_BLOB) != 0) driver_features_0 |= @as(u32, 1) << VIRTIO_GPU_F_RESOURCE_BLOB;
+    if (dev_features_0 & (@as(u32, 1) << VIRTIO_GPU_F_CONTEXT_INIT) != 0) driver_features_0 |= @as(u32, 1) << VIRTIO_GPU_F_CONTEXT_INIT;
+    if (dev_features_0 & (@as(u32, 1) << VIRTIO_GPU_F_EDID) != 0) driver_features_0 |= @as(u32, 1) << VIRTIO_GPU_F_EDID;
+    if (dev_features_0 & (@as(u32, 1) << 29) != 0) driver_features_0 |= @as(u32, 1) << 29; // RING_EVENT_IDX
+    var driver_features_1: u32 = 0;
+    if (dev_features_1 & 1 != 0) driver_features_1 |= 1; // VERSION_1
+    ccWrite32(CC_DRIVER_FEATURE_SELECT, 0);
+    ccWrite32(CC_DRIVER_FEATURE, driver_features_0);
+    ccWrite32(CC_DRIVER_FEATURE_SELECT, 1);
+    ccWrite32(CC_DRIVER_FEATURE, driver_features_1);
+    ccWrite8(CC_DEVICE_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK);
+    if (ccRead8(CC_DEVICE_STATUS) & STATUS_FEATURES_OK == 0) {
+        debug.klog("[virtio-gpu] S3 resume: FEATURES_OK rejected\n", .{});
+        return false;
+    }
+    ccWrite16(CC_MSIX_CONFIG, 0xFFFF);
+
+    // --- Re-program the control virtqueue onto its EXISTING rings (leak-free) ---
+    if (!ctrl_vq.reprogram(common_cfg, 0)) {
+        debug.klog("[virtio-gpu] S3 resume: ctrl queue reprogram failed\n", .{});
+        return false;
+    }
+
+    // DRIVER_OK — device is live again.
+    ccWrite8(CC_DEVICE_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK);
+
+    // Re-point the ctrl-queue MSI-X vector (the reset cleared it to 0xFFFF). The
+    // IDT vector + MSI-X table entry themselves survive in RAM; only the device's
+    // per-queue vector register needs re-arming. The setup cmds below still run
+    // polled (forced above); this just restores fast completions for steady state.
+    if (use_msix and msix_entry_addr != 0) {
+        ccWrite16(CC_QUEUE_SELECT, 0);
+        ccWrite16(CC_QUEUE_MSIX_VECTOR, 0);
+        if (ccRead16(CC_QUEUE_MSIX_VECTOR) != 0) {
+            use_msix = false;
+            debug.klog("[virtio-gpu] S3 resume: MSI-X re-arm rejected, polled steady state\n", .{});
+        }
+    }
+
+    // --- Drop any blob-scanout state and re-create the plain 2D scanout on the
+    // surviving guest framebuffer. The device's resource-id space was reset, so
+    // reusing current_resource_id is fine. ---
+    scanout_is_blob = false;
+    blob_count = 0;
+    blob_front = 0;
+    original_2d_resource_id = 0;
+    skip_external_flush = false; // the 2D desktop owns flushing again
+    if (!setupDisplay(width, height)) {
+        debug.klog("[virtio-gpu] S3 resume: setupDisplay failed\n", .{});
+        return false;
+    }
+
+    // The hardware-cursor resource is gone too; leave it disabled so moveCursor
+    // no-ops (SDL's show-cursor=on covers the pointer). A leak-free cursor
+    // re-arm reusing the surviving image buffer is a later refinement.
+    hw_cursor_active = false;
+
+    // --- Clear the wedge state so flushes resume immediately, then repaint the
+    // whole screen from the surviving framebuffer. ---
+    consecutive_flush_failures = 0;
+    wedged = false;
+    markFullDirty();
+    flushUnconditional();
+
+    bind.commit();
+    debug.klog("[virtio-gpu] S3 resume: device re-initialized, display restored\n", .{});
     return true;
 }
 
