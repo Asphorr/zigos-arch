@@ -158,6 +158,7 @@ pub const WaitKind = enum(u8) {
     swap_evict, // wait_target = low-32 of &leaf_pte. Set by handleUserPageFault when it hits a SWAP_INFLIGHT PTE; evictFrame's commit/abort phase wakes matching waiters
     iouring_work, // wait_target = io_uring instance index. Worker task idles here; both io_uring_enter (fresh SQEs) and the NVMe IRQ callback (in-flight completion) wake the matching worker.
     iouring_cq, // wait_target = io_uring instance index. io_uring_enter parks here when caller asked for min_complete > 0; worker wakes it after writing each CQE.
+    softirq, // wait_target = cpu_id. This CPU's ksoftirqd parks here when its softirq_pending mask is empty; softirq.raise wakes it by pid (target is informational only).
 };
 
 // Per-fd table entry. All fields are owner-pid only — fd_table lives on

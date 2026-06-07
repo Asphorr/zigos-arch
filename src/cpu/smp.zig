@@ -246,6 +246,16 @@ pub const CpuLocal = struct {
     /// inbound bracket was missing — exposed during Q1 port stress.
     dispatching_out_pid: u16 = 0xFFFF,
 
+    /// Pending bottom-half (softirq) bitmask for this CPU — one bit per
+    /// `softirq.Softirq`. Set by `softirq.raise` from any context (atomic OR,
+    /// safe under IF=0); read-and-cleared by this CPU's `ksoftirqd` drain.
+    /// Per-CPU so `raise` needs no global lock. (a) cross-context on one CPU.
+    softirq_pending: u32 = 0,
+    /// PID of this CPU's pinned `ksoftirqd` bottom-half task, or null until
+    /// `softirq.startAll()` (called from smp.init) spawns it. `raise` wakes
+    /// this pid; while null, the tick falls back to inline device sweeps.
+    ksoftirqd_pid: ?usize = null,
+
     // Tripwire (task #226 lite). LAST field of CpuLocal. If anything writes
     // past the end of cpus[N] — overflow from neighboring data, wild
     // pointer that lands here, sched_lock-state-write that overran — the
@@ -606,6 +616,12 @@ pub fn init() void {
     }
 
     debug.klog("[smp] {d} CPU(s) online\n", .{cpu_count});
+
+    // Stand up the bottom-half engine now that every AP is alive: one pinned
+    // `ksoftirqd` per CPU. After this returns, `softirq.raise` from the IRQ0
+    // tick (and, later, from device MSI-X top-halves) defers heavy completion
+    // work here instead of running it in IF=0 hard-IRQ context.
+    @import("../proc/softirq.zig").startAll();
 }
 
 fn busyWait(ms: u32) void {

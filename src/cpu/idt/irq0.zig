@@ -185,10 +185,13 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
     // the cmd. tickSweep wakes the parked waiter so its loop re-checks
     // (and with gap virtio_gpu#1's clflush, actually observes the
     // advanced used_idx instead of a stale L1 line).
-    if (smp.isBSP()) {
-        @import("../../driver/nvme.zig").tickSweep();
-        @import("../../driver/virtio_gpu.zig").tickSweep();
-    }
+    // NVMe + virtio-gpu lost-IRQ backstop sweeps used to run here, inline on
+    // EVERY handleIRQ0 — including the soft-yield `int $0x20` path. They now
+    // run in ksoftirqd (bottom-half, IF=1), raised from the real-hardware-tick
+    // block below (gated on !was_soft_yield + a cadence), NOT here. Raising on
+    // the soft-yield path would re-wake ksoftirqd through its OWN blockOn-driven
+    // int $0x20 and spin it solid — caught in boot-verify as ~1600 drains/tick
+    // with tick_count frozen.
     bisectPoint("after irqEvent", frame_for_validate, irq_snap);
 
     // Sync this CPU's DR0-DR3+DR7 from the watch manager's canonical state.
@@ -297,6 +300,21 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
             bisectPoint("after pollHID", frame_for_validate, irq_snap);
             @import("../../driver/sound.zig").tick();
             bisectPoint("after sound.tick", frame_for_validate, irq_snap);
+
+            // NVMe + virtio-gpu lost-IRQ backstop sweeps, deferred to ksoftirqd
+            // (bottom-half, IF=1) instead of run inline here at IF=0. This block
+            // is !was_soft_yield, so we raise ONLY on real hardware ticks — never
+            // on ksoftirqd's own blockOn-driven soft yield (which would re-wake
+            // it and spin). ~10 Hz: a dropped-MSI-X backstop needs no more, and a
+            // low rate keeps ksoftirqd parked rather than churning the scheduler.
+            // raise() returns false only before ksoftirqd exists (early boot) →
+            // inline-sweep fallback so the backstop is never dropped.
+            if (process.tick_count % 10 == 0) {
+                const softirq = @import("../../proc/softirq.zig");
+                if (!softirq.raise(.nvme)) @import("../../driver/nvme.zig").tickSweep();
+                if (!softirq.raise(.virtio_gpu)) @import("../../driver/virtio_gpu.zig").tickSweep();
+            }
+
             @import("../../debug/gdb_stub.zig").checkForBreak();
             bisectPoint("after gdb checkForBreak", frame_for_validate, irq_snap);
             // Auto-dump perf counters every ~5 seconds (500 ticks at 100Hz). The

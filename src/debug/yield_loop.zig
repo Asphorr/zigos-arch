@@ -71,6 +71,12 @@ pub fn disable() void {
 pub fn observe(pid: usize, kind: process.WaitKind, target: u32, caller_ra: u64) void {
     if (disabled) return;
     if (pid >= config.MAX_PROCS) return;
+    // ksoftirqd parks on .softirq every time its pending mask drains empty — a
+    // legitimate worker idle-wait with an identical (kind, target, caller_ra)
+    // fingerprint each time, exactly the pattern this detector trips on. Exempt
+    // it (the slot is never recorded, so checkStuck also skips it) so a healthy
+    // bottom-half worker isn't mistaken for a stuck wake/resleep spin.
+    if (kind == .softirq) return;
     // Earlier we disabled .nvme_io / .gpu_io thinking allocCid recycling
     // produced FPs — the "FPs" turned out to be REAL state/rq race trips
     // (pid stuck .sleeping in rq → picker repeatedly transitions
@@ -168,6 +174,7 @@ fn waitKindName(k: process.WaitKind) []const u8 {
         .swap_evict => "swap_evict",
         .iouring_work => "iouring_work",
         .iouring_cq => "iouring_cq",
+        .softirq => "softirq",
     };
 }
 
@@ -205,6 +212,7 @@ fn dumpResourceState(pid: usize, kind: process.WaitKind, target: u32) void {
         .swap_evict => serial.print("  swap_evict low32-of-pte=0x{X:0>8} — wait for evictFrame commit/abort\n", .{target}),
         .iouring_work => serial.print("  iouring_work instance={d} (worker idle, wake from io_uring_enter or NVMe IRQ callback)\n", .{target}),
         .iouring_cq => serial.print("  iouring_cq instance={d} (enter() parked, wake from worker after CQE)\n", .{target}),
+        .softirq => serial.print("  softirq cpu={d} — ksoftirqd idle (no bottom-half pending)\n", .{target}),
     }
 }
 
