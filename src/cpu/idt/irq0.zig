@@ -296,30 +296,41 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
             bisectPoint("after wakeExpired", frame_for_validate, irq_snap);
             process.deliverDueAlarms();
             bisectPoint("after deliverDueAlarms", frame_for_validate, irq_snap);
-            // HID drain deferred to ksoftirqd (Inc 2b). The PRIMARY path is now
-            // event-driven — xhciIrqHandler raises .hid on each HID MSI-X — so
-            // normal input is no longer quantized to this tick. This every-real-
-            // tick raise is the dropped-MSI-X backstop, kept at the old 100 Hz
-            // pollHID cadence so worst-case input latency doesn't regress. raise()
-            // returns false only before ksoftirqd exists (early boot) → inline
-            // pollHID fallback so input is never dropped. Single-consumer holds:
-            // .hid is only ever raised on the BSP (here + the BSP-directed xHCI
-            // IRQ), so only the BSP's ksoftirqd (or this BSP tick) drains it.
-            if (!@import("../../proc/softirq.zig").raise(.hid)) xhci.pollHID();
-            bisectPoint("after pollHID", frame_for_validate, irq_snap);
             @import("../../driver/sound.zig").tick();
             bisectPoint("after sound.tick", frame_for_validate, irq_snap);
 
-            // NVMe + virtio-gpu lost-IRQ backstop sweeps, deferred to ksoftirqd
-            // (bottom-half, IF=1) instead of run inline here at IF=0. This block
-            // is !was_soft_yield, so we raise ONLY on real hardware ticks — never
-            // on ksoftirqd's own blockOn-driven soft yield (which would re-wake
-            // it and spin). ~10 Hz: a dropped-MSI-X backstop needs no more, and a
-            // low rate keeps ksoftirqd parked rather than churning the scheduler.
-            // raise() returns false only before ksoftirqd exists (early boot) →
-            // inline-sweep fallback so the backstop is never dropped.
+            // Device lost-IRQ backstop sweeps (HID, NVMe, virtio-gpu), deferred
+            // to ksoftirqd (bottom-half, IF=1) instead of run inline here at
+            // IF=0. ALL THREE primary paths are now event-driven — the device's
+            // MSI-X handler raises the softirq directly (xHCI HID → .hid, NVMe
+            // reapCq → .nvme, virtio-gpu completion → .virtio_gpu) — so normal
+            // input/IO is no longer quantized to this tick. These per-tick raises
+            // are purely the dropped-MSI-X backstop; ~10 Hz is ample for one and
+            // keeps ksoftirqd parked rather than churning the scheduler.
+            //
+            // Inc 3a: .hid used to raise every real tick (~100 Hz, the old
+            // pollHID cadence) from caution before the event path was trusted.
+            // Folding it into this 10 Hz block cuts the biggest remaining bottom-
+            // half churn (60 → 6 .hid drains/s on an idle-but-ticking BSP); the
+            // only cost is a genuinely-lost HID MSI-X surfacing ≤100 ms late
+            // instead of ≤10 ms — invisible for a backstop, since live input
+            // rides the xHCI interrupt. (If input ever feels laggy after this,
+            // that's the tell the event path ISN'T firing and the tick was
+            // secretly carrying input — revert the .hid cadence and investigate.)
+            //
+            // This block is !was_soft_yield, so we raise ONLY on real hardware
+            // ticks — never on ksoftirqd's own blockOn-driven soft yield (which
+            // would re-wake it and spin). The BSP-only invariant that matters is
+            // .hid: pollHID asserts BSP, and .hid is raised solely on the BSP
+            // (this cpu0-gated block + the BSP-directed xHCI MSI-X), so only the
+            // BSP's ksoftirqd ever drains it. .nvme/.virtio_gpu may be raised on
+            // other CPUs (NVMe retargets its MSI-X), which is fine — softirq_
+            // pending is per-CPU and their sweep handlers are CPU-agnostic.
+            // raise()==false only before ksoftirqd exists (early boot) → inline-
+            // sweep fallback so no backstop is ever dropped.
             if (process.tick_count % 10 == 0) {
                 const softirq = @import("../../proc/softirq.zig");
+                if (!softirq.raise(.hid)) xhci.pollHID();
                 if (!softirq.raise(.nvme)) @import("../../driver/nvme.zig").tickSweep();
                 if (!softirq.raise(.virtio_gpu)) @import("../../driver/virtio_gpu.zig").tickSweep();
             }
