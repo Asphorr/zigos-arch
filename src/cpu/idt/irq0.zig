@@ -296,7 +296,16 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
             bisectPoint("after wakeExpired", frame_for_validate, irq_snap);
             process.deliverDueAlarms();
             bisectPoint("after deliverDueAlarms", frame_for_validate, irq_snap);
-            xhci.pollHID();
+            // HID drain deferred to ksoftirqd (Inc 2b). The PRIMARY path is now
+            // event-driven — xhciIrqHandler raises .hid on each HID MSI-X — so
+            // normal input is no longer quantized to this tick. This every-real-
+            // tick raise is the dropped-MSI-X backstop, kept at the old 100 Hz
+            // pollHID cadence so worst-case input latency doesn't regress. raise()
+            // returns false only before ksoftirqd exists (early boot) → inline
+            // pollHID fallback so input is never dropped. Single-consumer holds:
+            // .hid is only ever raised on the BSP (here + the BSP-directed xHCI
+            // IRQ), so only the BSP's ksoftirqd (or this BSP tick) drains it.
+            if (!@import("../../proc/softirq.zig").raise(.hid)) xhci.pollHID();
             bisectPoint("after pollHID", frame_for_validate, irq_snap);
             @import("../../driver/sound.zig").tick();
             bisectPoint("after sound.tick", frame_for_validate, irq_snap);

@@ -255,11 +255,21 @@ pub var xhci_irq_count: u64 = 0;
 /// between doorbell and waitForEvent doesn't expose a race.
 var event_drain_locked: bool = false;
 
-/// Catch-all MSI-X handler. Just bumps a counter — the actual ring drain
-/// happens in waitForEvent's next loop iteration after `hlt` returns.
-/// Same design as nvmeIrqHandler / virtio_gpu's irq handler.
+/// MSI-X handler. Bumps the counter (commands are drained by waitForEvent's
+/// next loop after `hlt` returns), then RAISES the HID softirq so the BSP's
+/// ksoftirqd runs pollHID in normal context (IF=1) — the event-driven HID
+/// drain (Inc 2b). This MSI-X is BSP-directed (msix.allocVector dest=0, never
+/// retargeted), so we always run on the BSP and raise(.hid) wakes the BSP's
+/// ksoftirqd; pollHID's assertBSP therefore holds. dynirq_preempt_pending makes
+/// the DynIrqStub epilogue schedule it promptly, so input is event-driven
+/// rather than quantized to the 100 Hz tick. The IRQ fires for ALL event types;
+/// on a command/MSC event pollHID bails via event_drain_locked, so the only
+/// cost there is a cheap no-op ksoftirqd hop.
 fn xhciIrqHandler() callconv(.c) void {
     xhci_irq_count +%= 1;
+    if (@import("../proc/softirq.zig").raise(.hid)) {
+        @import("../cpu/smp.zig").myCpu().dynirq_preempt_pending = true;
+    }
 }
 
 // --- MMIO register helpers ---

@@ -44,6 +44,10 @@ pub const Softirq = enum(u5) {
     nvme = 0,
     /// virtio-gpu completion sweep + parked-compositor wake.
     virtio_gpu = 1,
+    /// xHCI HID event-ring drain (keyboard/mouse). Always raised on the BSP —
+    /// the xHCI MSI-X is BSP-directed and the tick raise runs in the BSP block —
+    /// so the BSP's ksoftirqd is the sole consumer and pollHID's assertBSP holds.
+    hid = 2,
     // room for: net (NAPI), block, tasklet, ...
 };
 
@@ -157,6 +161,7 @@ pub fn startAll() void {
     // functions, now run from ksoftirqd instead of the IRQ0 tick.
     register(.nvme, @import("../driver/nvme.zig").tickSweep);
     register(.virtio_gpu, @import("../driver/virtio_gpu.zig").tickSweep);
+    register(.hid, @import("../driver/xhci.zig").pollHID);
 
     var id: u8 = 0;
     while (id < smp.MAX_CPUS) : (id += 1) {
