@@ -404,33 +404,44 @@ var controllers: [MAX_CONTROLLERS]Controller = .{ .{}, .{}, .{} };
 var num_controllers: usize = 0;
 pub var irq_count: u64 = 0;
 
-/// MSI-X handler. In sync mode (async_mode=false), just bumps a counter
-/// so the next waitCompletion iteration finds a flipped phase bit. In
-/// async mode, scans every async-enabled controller's CQ, wakes the
-/// blocked process whose CID matched, then calls schedule() so the
-/// woken task gets dispatched IMMEDIATELY instead of waiting up to a
-/// timer tick (~10 ms). Without the schedule() call, every async I/O
-/// pays a full slice penalty — measured at ~18 ms/call vs the expected
-/// ~50 µs NVMe completion latency. Matches killKickHandler's pattern.
+/// MSI-X top-half. Bumps the diagnostic IRQ counter, then — if any controller
+/// is in async mode — RAISES the NVMe softirq and requests a reschedule so this
+/// CPU's ksoftirqd runs reapCq in normal task context (IF=1). The heavy work
+/// (Increment 2) no longer runs here: the top-half is now just "ack + raise +
+/// kick".
+///
+/// Why defer rather than reap inline: reapCq takes cq_lock and then dispatches
+/// a burst of proc.wake — each taking sched_lock — for every completed CID.
+/// Doing that with IF=0 on the per-CPU isr_stack stretched interrupt-disabled
+/// time and put the sched_lock storm in the sharpest cross-stack context (the
+/// kesp+48 hazard the Shape D trampoline guards). The bottom-half (ksoftirqd,
+/// whose .nvme handler is `tickSweep` → reapCq) does it in a preemptible task
+/// instead. raise() also wakes that ksoftirqd; if it doesn't exist yet (very
+/// early boot), the IRQ0-tick backstop's inline-sweep fallback covers the gap.
+///
+/// dynirq_preempt_pending is still set (Shape C): the DynIrqStub epilogue
+/// schedules from its OWN frame (never from here — IRQ-inherited RSP may not be
+/// current_pid's, the cross-stack-aliasing window caught 2026-05-19), picking
+/// ksoftirqd (.interactive) promptly so a completion still wakes its blocked
+/// waiter within a couple of context switches rather than a timer tick (~10 ms;
+/// inline-reap measured ~18 ms/call before deferral fixed the slice penalty).
 fn nvmeIrqHandler() callconv(.c) void {
     irq_count +%= 1;
     if (!ASYNC_BUILD_ENABLED) return;
-    var any_woken = false;
+    // Only kick the bottom-half when there's async work to reap. In sync mode
+    // the submit path polls the CQ itself (waitCompletion), and ksoftirqd's
+    // .nvme handler would no-op (tickSweep skips non-async controllers).
+    var any_async = false;
     var i: usize = 0;
     while (i < num_controllers) : (i += 1) {
         if (@atomicLoad(bool, &controllers[i].async_mode, .acquire)) {
-            if (reapCq(&controllers[i])) any_woken = true;
+            any_async = true;
+            break;
         }
     }
-    // Shape C: do NOT call schedule() from the IRQ handler. Calling schedule
-    // here runs with RSP on whatever kstack the IRQ inherited — which may
-    // not be current_pid's, opening the cross-stack-aliasing window the
-    // mirror-flip detector caught 2026-05-19. Instead, set a flag the
-    // DynIrqStub epilogue checks just before iretq; if set, it calls
-    // schedule() from the stub's own frame where RSP discipline is sound.
-    if (any_woken) {
-        const smp = @import("../cpu/smp.zig");
-        smp.myCpu().dynirq_preempt_pending = true;
+    if (any_async) {
+        _ = @import("../proc/softirq.zig").raise(.nvme);
+        @import("../cpu/smp.zig").myCpu().dynirq_preempt_pending = true;
     }
 }
 
