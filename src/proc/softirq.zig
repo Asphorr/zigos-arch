@@ -48,6 +48,10 @@ pub const Softirq = enum(u5) {
     /// the xHCI MSI-X is BSP-directed and the tick raise runs in the BSP block —
     /// so the BSP's ksoftirqd is the sole consumer and pollHID's assertBSP holds.
     hid = 2,
+    /// Deferred serial-port drain (klog ring → UART). Raised only from the
+    /// BSP tick when bytes are pending, so the BSP's ksoftirqd is the sole
+    /// drainer — serial.drain_pos needs exactly one consumer.
+    klog = 3,
     // room for: net (NAPI), block, tasklet, ...
 };
 
@@ -127,6 +131,17 @@ fn drain(cpu: *smp.CpuLocal) u32 {
 /// `WaitKind.softirq` until `raise` kicks it. Pinned to one CPU, so `myCpu()`
 /// is stable across the park/resume. Never returns.
 fn ksoftirqdEntry() callconv(.c) noreturn {
+    // The BSP drainer flips serial output into deferred mode the moment it
+    // first gets CPU time — NOT in startAll. startAll runs well before the
+    // scheduler's first pick, and the boot init spew between those points
+    // (~48KB of GPU/desktop/PCI lines, memcpy-fast once deferred) lapped
+    // the kmsg ring with nobody draining — a real boot lost 15KB of boot
+    // diagnostics. Flipping here keeps boot output synchronous until the
+    // drainer is provably live.
+    if (smp.myCpu().cpu_id == 0) {
+        @atomicStore(bool, &serial.deferred, true, .release);
+        serial.print("[klog] serial port drain deferred to ksoftirqd\n", .{});
+    }
     var drained_runs: u64 = 0;
     while (true) {
         const cpu = smp.myCpu();
@@ -162,6 +177,7 @@ pub fn startAll() void {
     register(.nvme, @import("../driver/nvme.zig").tickSweep);
     register(.virtio_gpu, @import("../driver/virtio_gpu.zig").tickSweep);
     register(.hid, @import("../driver/xhci.zig").pollHID);
+    register(.klog, serial.drainToPort);
 
     var id: u8 = 0;
     while (id < smp.MAX_CPUS) : (id += 1) {
@@ -179,4 +195,8 @@ pub fn startAll() void {
         smp.cpus[id].ksoftirqd_pid = pid;
         serial.print("[softirq] ksoftirqd pid={d} pinned to cpu{d}\n", .{ pid, id });
     }
+
+    // Serial deferred mode is enabled by the BSP ksoftirqd itself on its
+    // first run (see ksoftirqdEntry) — flipping it here, before the
+    // scheduler ever picks the drainer, let boot spew lap the ring.
 }

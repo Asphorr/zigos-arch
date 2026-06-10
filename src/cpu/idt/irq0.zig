@@ -235,6 +235,14 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
         // S10 heartbeat — proves the trap checkers are actually running.
         // Self-rate-limits to one log per ~60s.
         @import("../../debug/diag.zig").maybeHeartbeat(process.tick_count);
+        // Deferred-klog kick: if write() appended bytes the UART hasn't
+        // seen, have ksoftirqd drain them at IF=1 — port outb's are VM
+        // exits and don't belong in cli'd contexts. Inside the
+        // !was_soft_yield gate so ksoftirqd's own blockOn soft-yield can
+        // never re-raise and spin it (the Inc1 bug-lesson).
+        if (serial.pendingToPort() != 0) {
+            _ = @import("../../proc/softirq.zig").raise(.klog);
+        }
     }
 
     // Per-CPU tick — counted on EVERY IRQ0 (including soft yields) so the

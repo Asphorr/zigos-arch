@@ -58,7 +58,8 @@ pub var emergency_mode: bool = false;
 // reads from this so user-space tools (cat, grep, dmesg) can inspect
 // recent kernel log output without needing the host's serial.log file.
 //
-// 16 KiB is enough for ~150 lines of typical kernel output. Reads are
+// 64 KiB holds ~600 lines of typical kernel output — sized so a boot-scale
+// print burst can't lap the deferred-port drainer (see `deferred`). Reads are
 // addressed by a *monotonic stream position* (total bytes ever written),
 // not by ring index — that way an fd's saved offset survives ring wraps
 // and the dmesg follow loop can pick up cleanly across iterations.
@@ -68,10 +69,29 @@ pub var emergency_mode: bool = false;
 //
 // We don't try to be lockless: serial.write is already racy across cores
 // (see putChar's wait-loop), and the worst case is a torn line.
-const RING_LEN: u32 = 16 * 1024;
+const RING_LEN: u32 = 64 * 1024;
 var ring: [RING_LEN]u8 = [_]u8{0} ** RING_LEN;
 var ring_pos: u32 = 0; // next write index (physical, into `ring`)
 var total_written: u32 = 0; // monotonic byte counter (stream position)
+
+/// Deferred-port mode. When true, normal `write` only appends to the ring;
+/// the UART I/O happens in ksoftirqd via `drainToPort` (the .klog softirq).
+/// Rationale: each `outb` is a VM exit (µs-scale under nested virt), so an
+/// 80-char line costs a fraction of a millisecond — and several printers
+/// (smi.tick, cli-hold flush, perf dump) run from cli'd tick context, where
+/// that cost is pure jitter. Flipped on by softirq.startAll once ksoftirqd
+/// exists; flipped back off permanently by the emergency path, which also
+/// flushes the backlog (crash output must be synchronous and complete).
+pub var deferred: bool = false;
+
+/// Stream position (same coordinate as total_written) of the next byte to
+/// send to the UART. Single consumer: only the BSP ksoftirqd drainer (or
+/// the one-shot emergency flush) advances it.
+var drain_pos: u32 = 0;
+
+/// Bytes that fell out of the ring before the drainer reached them (port
+/// output lost them; the in-ring /dev/kmsg view saw them until lapped).
+var port_lost_bytes: u32 = 0;
 
 pub fn init() void {
     io.outb(PORT + 1, 0x00); // Disable interrupts
@@ -110,9 +130,51 @@ pub fn write(msg: []const u8) void {
     }
     const flags = lockWrite();
     defer unlockWrite(flags);
+    const to_port = !@atomicLoad(bool, &deferred, .monotonic);
     for (msg) |c| {
-        putChar(c);
+        if (to_port) putChar(c);
         ringPush(c);
+    }
+}
+
+/// Bytes appended but not yet sent to the UART. 0 whenever deferred mode is
+/// off (everything went out synchronously). Used by the IRQ0 tick as the
+/// "raise .klog or not" hint.
+pub fn pendingToPort() u32 {
+    if (!@atomicLoad(bool, &deferred, .monotonic)) return 0;
+    return @atomicLoad(u32, &total_written, .monotonic) -% drain_pos;
+}
+
+/// .klog softirq handler — runs in ksoftirqd (IF=1, schedulable). Copies
+/// pending ring bytes to the UART in small chunks. Lock-free against
+/// writers: ringRead only touches stream positions < total_written, which
+/// are stable unless the ring laps the cursor mid-drain — under that kind
+/// of burst a torn byte in the port output is acceptable (the ring is the
+/// canonical record) and the lap itself is counted + reported.
+pub fn drainToPort() void {
+    if (!@atomicLoad(bool, &deferred, .monotonic)) return;
+    var chunk: [256]u8 = undefined;
+    // Per-invocation cap: ksoftirqd also drains .hid (input) — a full-ring
+    // drain at ~µs-per-char of port VM exits would block input for tens of
+    // ms under storm logging. 4 KB ≈ a few ms worst case; the leftover
+    // keeps pendingToPort() nonzero so the next tick re-raises us.
+    var budget: u32 = 4096;
+    while (budget > 0) {
+        const behind = @atomicLoad(u32, &total_written, .monotonic) -% drain_pos;
+        if (behind == 0) break;
+        if (behind > RING_LEN) {
+            // Writers lapped us; ringRead will jump the cursor forward.
+            port_lost_bytes +%= behind - RING_LEN;
+        }
+        const n = ringRead(&drain_pos, &chunk, chunk.len);
+        if (n == 0) break;
+        for (chunk[0..n]) |c| putChar(c);
+        budget -|= n;
+    }
+    if (port_lost_bytes != 0) {
+        const lost = port_lost_bytes;
+        port_lost_bytes = 0;
+        print("[klog] {d} bytes lost to port (ring lapped the drainer)\n", .{lost});
     }
 }
 
@@ -157,6 +219,22 @@ fn emergencyPutChar(c: u8) void {
 
 /// Lock-free emergency byte-string write. See `emergency_mode`.
 pub fn emergencyWrite(msg: []const u8) void {
+    // One-shot deferred-mode unwind: flush the ring backlog FIRST so the
+    // crash dump lands AFTER the lines that led up to it, then force all
+    // subsequent output synchronous (we may be about to halt — ksoftirqd
+    // will never drain again). Racy vs a concurrent normal write's loaded
+    // `deferred` — worst case its bytes reach only the ring, not the port.
+    if (@atomicLoad(bool, &deferred, .monotonic)) {
+        @atomicStore(bool, &deferred, false, .release);
+        var chunk: [256]u8 = undefined;
+        var guard: u32 = RING_LEN;
+        while (guard > 0) {
+            const n = ringRead(&drain_pos, &chunk, chunk.len);
+            if (n == 0) break;
+            for (chunk[0..n]) |c| emergencyPutChar(c);
+            guard -|= n;
+        }
+    }
     for (msg) |c| {
         emergencyPutChar(c);
         ringPushSafe(c);
@@ -231,8 +309,9 @@ fn writeFn(_: void, bytes: []const u8) error{}!usize {
     }
     const flags = lockWrite();
     defer unlockWrite(flags);
+    const to_port = !@atomicLoad(bool, &deferred, .monotonic);
     for (bytes) |b| {
-        putChar(b);
+        if (to_port) putChar(b);
         ringPush(b);
     }
     return bytes.len;
