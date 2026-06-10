@@ -112,6 +112,14 @@ fn virtioGpuIrqHandler() callconv(.c) void {
     if (cpu_id < virtio_gpu_irq_per_cpu.len) virtio_gpu_irq_per_cpu[cpu_id] +%= 1;
     const process = @import("../proc/process.zig");
 
+    // Async flush completion: nobody is parked for it — hand the reap (and
+    // the coalesced-rect resubmit) to ksoftirqd via the .virtio_gpu softirq,
+    // same discipline as the NVMe reap. One atomic load when idle.
+    if (@atomicLoad(bool, &aflush_in_flight, .acquire)) {
+        _ = @import("../proc/softirq.zig").raise(.virtio_gpu);
+        smp_mod.myCpu().dynirq_preempt_pending = true;
+    }
+
     // Direct waiter lookup (gap #8). ctrl_lock serializes submitters so
     // current_gpu_waiter is at most one pid; previous code walked all
     // MAX_PROCS PCBs every IRQ. We MUST NOT call process.wake() — it
@@ -943,6 +951,10 @@ fn sendCmdViaPhys(cmd_len: u32, resp_len: u32) bool {
 pub fn sendCmd(cmd_buf: [*]const u8, cmd_len: u32, resp_buf: [*]u8, resp_len: u32) bool {
     ctrl_lock.acquire();
     defer ctrl_lock.release();
+    // An async flush pair may still be outstanding — wait for + reap it so
+    // the one-op-at-a-time last_used_idx accounting (and the shared cmd/
+    // resp slots) are ours alone.
+    waitAsyncFlushIdleLocked();
 
     const cmd_dst: [*]volatile u8 = @ptrFromInt(paging.physToVirt(cmd_phys));
     @memcpy(@as([*]volatile u8, cmd_dst)[0..cmd_len], cmd_buf[0..cmd_len]);
@@ -993,6 +1005,8 @@ fn sendSimpleCmdPair(
 ) bool {
     ctrl_lock.acquire();
     defer ctrl_lock.release();
+    // See sendCmd: drain any outstanding async flush pair first.
+    waitAsyncFlushIdleLocked();
 
     if (ctrl_vq.num_free < 4) return false;
     if (cmd0_len > PAIR_CMD_SLOT_BYTES or cmd1_len > PAIR_CMD_SLOT_BYTES) return false;
@@ -1174,6 +1188,345 @@ fn sendSimpleCmdPair(
     if (resp0.cmd_type != RESP_OK_NODATA or resp1.cmd_type != RESP_OK_NODATA) {
         debug.klog("[virtio-gpu] Pair error: resp0=0x{X} resp1=0x{X}\n", .{ resp0.cmd_type, resp1.cmd_type });
         return false;
+    }
+    return true;
+}
+
+// =============================================================================
+// Async (fire-and-forget) flush engine
+// =============================================================================
+//
+// The compositor's present pair (TransferToHost2D/SetScanoutBlob +
+// ResourceFlush) used to block in sendSimpleCmdPair until the host's MSI-X —
+// and on QEMU's GTK/SDL backends the ResourceFlush response is gated on the
+// host actually presenting, so every flush charged a full host round-trip
+// (12 ms mean, 100+ ms under host pressure) to the CALLER, holding ctrl_lock
+// the whole time. perf showed flush_rect at 42M cyc mean, and the block/wake
+// churn behind it drove schedule() to ~36 calls/tick (the gpu_io yield storm).
+//
+// Now a flush SUBMITS the pair and returns. At most one pair is in flight;
+// flushes arriving meanwhile coalesce into one pending dirty rect submitted
+// on completion (event-driven: the MSI-X handler raises .virtio_gpu so
+// ksoftirqd reaps + resubmits; the 10 Hz tickSweep is the lost-IRQ backstop).
+// Sync control commands (resource ops, 3D, capsets) first wait for + reap
+// the in-flight pair under ctrl_lock — preserving the "at most one
+// outstanding ctrl op" invariant that sendCmdViaPhys/sendSimpleCmdPair's
+// last_used_idx accounting relies on, and reusing cmd/resp slots 0+1 safely.
+//
+// Tradeoff: the compositor may scribble the framebuffer while the host DMA
+// still reads it for an in-flight transfer (2D path), or draw into the old
+// front for a moment before SetScanoutBlob lands (flip path) — transient
+// tearing bounded by the one-in-flight rule, in exchange for never stalling
+// the UI on a host present again.
+
+var aflush_in_flight: bool = false;
+var aflush_target_idx: u16 = 0;
+var aflush_descs: [4]u16 = .{ 0, 0, 0, 0 };
+var aflush_submit_tsc: u64 = 0;
+var aflush_pending: bool = false;
+// Coalesced dirty rect (exclusive max corner); valid while aflush_pending.
+var aflush_px0: u32 = 0;
+var aflush_py0: u32 = 0;
+var aflush_px1: u32 = 0;
+var aflush_py1: u32 = 0;
+
+/// Async needs a working MSI-X → softirq completion path. Early boot and
+/// the S3-resume forced-poll window fall back to the synchronous pair.
+/// So does a panic (emergency_mode): the panic screen's flush must reach
+/// the host NOW — fire-and-forget would coalesce it behind an in-flight
+/// pair that ksoftirqd (dead by then) never reaps.
+fn asyncFlushEligible() bool {
+    if (!(use_msix and msix_safe_to_use and !force_polled)) return false;
+    if (@atomicLoad(bool, &@import("../debug/serial.zig").emergency_mode, .acquire)) return false;
+    return @import("../cpu/smp.zig").myCpu().ksoftirqd_pid != null;
+}
+
+fn unionPendingLocked(x0: u32, y0: u32, x1: u32, y1: u32) void {
+    if (aflush_pending) {
+        aflush_px0 = @min(aflush_px0, x0);
+        aflush_py0 = @min(aflush_py0, y0);
+        aflush_px1 = @max(aflush_px1, x1);
+        aflush_py1 = @max(aflush_py1, y1);
+    } else {
+        aflush_px0 = x0;
+        aflush_py0 = y0;
+        aflush_px1 = x1;
+        aflush_py1 = y1;
+        @atomicStore(bool, &aflush_pending, true, .release);
+    }
+}
+
+/// Stage + submit a cmd pair WITHOUT waiting. Caller holds ctrl_lock and
+/// has ensured nothing is outstanding (reapAsyncFlushLocked returned true).
+/// Same staging/descriptor dance as sendSimpleCmdPair minus the wait; no
+/// MSI-X retarget (the reap runs wherever ksoftirqd picks it up — QEMU
+/// routes virtio-gpu MSI-X to cpu0 in practice anyway).
+fn submitPairAsyncLocked(
+    cmd0_buf: [*]const u8,
+    cmd0_len: u32,
+    cmd1_buf: [*]const u8,
+    cmd1_len: u32,
+) bool {
+    if (ctrl_vq.num_free < 4) return false;
+    if (cmd0_len > PAIR_CMD_SLOT_BYTES or cmd1_len > PAIR_CMD_SLOT_BYTES) return false;
+
+    const cmd_base: usize = paging.physToVirt(cmd_phys);
+    const resp_base: usize = paging.physToVirt(resp_phys);
+    @memcpy(@as([*]volatile u8, @ptrFromInt(cmd_base))[0..cmd0_len], cmd0_buf[0..cmd0_len]);
+    @memcpy(@as([*]volatile u8, @ptrFromInt(cmd_base + PAIR_CMD_SLOT_BYTES))[0..cmd1_len], cmd1_buf[0..cmd1_len]);
+    @memset(@as([*]volatile u8, @ptrFromInt(resp_base))[0..@sizeOf(CtrlHdr)], 0);
+    @memset(@as([*]volatile u8, @ptrFromInt(resp_base + PAIR_CMD_SLOT_BYTES))[0..@sizeOf(CtrlHdr)], 0);
+
+    const c0d0_idx = ctrl_vq.free_head;
+    const c0d0 = ctrl_vq.descPtr(c0d0_idx);
+    const c0d1_idx: u16 = @intCast(c0d0.next);
+    const c0d1 = ctrl_vq.descPtr(c0d1_idx);
+    const c1d0_idx: u16 = @intCast(c0d1.next);
+    const c1d0 = ctrl_vq.descPtr(c1d0_idx);
+    const c1d1_idx: u16 = @intCast(c1d0.next);
+    const c1d1 = ctrl_vq.descPtr(c1d1_idx);
+    ctrl_vq.free_head = @intCast(c1d1.next);
+    ctrl_vq.num_free -= 4;
+
+    c0d0.addr = cmd_phys;
+    c0d0.len = cmd0_len;
+    c0d0.flags = VRING_DESC_F_NEXT;
+    c0d0.next = c0d1_idx;
+    c0d1.addr = resp_phys;
+    c0d1.len = @sizeOf(CtrlHdr);
+    c0d1.flags = VRING_DESC_F_WRITE;
+    c0d1.next = 0;
+
+    c1d0.addr = cmd_phys + PAIR_CMD_SLOT_BYTES;
+    c1d0.len = cmd1_len;
+    c1d0.flags = VRING_DESC_F_NEXT;
+    c1d0.next = c1d1_idx;
+    c1d1.addr = resp_phys + PAIR_CMD_SLOT_BYTES;
+    c1d1.len = @sizeOf(CtrlHdr);
+    c1d1.flags = VRING_DESC_F_WRITE;
+    c1d1.next = 0;
+
+    var ai = ctrl_vq.availIdx().*;
+    ctrl_vq.availRing(ai % ctrl_vq.queue_size).* = c0d0_idx;
+    ai +%= 1;
+    ctrl_vq.availRing(ai % ctrl_vq.queue_size).* = c1d0_idx;
+    asm volatile ("" ::: .{ .memory = true });
+    ctrl_vq.availIdx().* = ai +% 1;
+
+    if (use_event_idx) {
+        ctrl_vq.usedEvent().* = ctrl_vq.last_used_idx +% 1;
+        asm volatile ("" ::: .{ .memory = true });
+    }
+
+    notifyQueue(0, &ctrl_vq);
+
+    aflush_target_idx = ctrl_vq.last_used_idx +% 2;
+    aflush_descs = .{ c0d0_idx, c0d1_idx, c1d0_idx, c1d1_idx };
+    aflush_submit_tsc = perf.rdtsc();
+    @atomicStore(bool, &aflush_in_flight, true, .release);
+    return true;
+}
+
+fn freeAflushDescsLocked() void {
+    const d = aflush_descs;
+    ctrl_vq.descPtr(d[3]).next = ctrl_vq.free_head;
+    ctrl_vq.descPtr(d[2]).next = d[3];
+    ctrl_vq.descPtr(d[1]).next = d[2];
+    ctrl_vq.descPtr(d[0]).next = d[1];
+    ctrl_vq.free_head = d[0];
+    ctrl_vq.num_free += 4;
+}
+
+/// Reap the in-flight async pair if complete — free its descriptors,
+/// advance last_used_idx, validate responses, feed the wedge detector.
+/// Non-blocking. Returns true when nothing is outstanding anymore (the
+/// caller may submit). Caller holds ctrl_lock.
+fn reapAsyncFlushLocked() bool {
+    if (!aflush_in_flight) return true;
+    const used = usedIdxCoherent(&ctrl_vq);
+    if (@as(i16, @bitCast(used -% aflush_target_idx)) < 0) {
+        // Not complete. Wedge guard: a host that never answers would pin
+        // in_flight forever (every flush coalescing into a black hole) —
+        // after ~2 s abandon the pair exactly like the sync path's
+        // timeout: resync, free, count a failure.
+        const tpq = apic.tscPerQuantum();
+        if (tpq != 0 and (perf.rdtsc() -% aflush_submit_tsc) > tpq *% 200) {
+            ctrl_vq.last_used_idx = usedIdxCoherent(&ctrl_vq);
+            freeAflushDescsLocked();
+            @atomicStore(bool, &aflush_in_flight, false, .release);
+            _ = noteFlushResult(false);
+            debug.klog("[virtio-gpu] async pair ABANDONED after ~2s (host unresponsive)\n", .{});
+            return true;
+        }
+        return false;
+    }
+    ctrl_vq.last_used_idx = aflush_target_idx;
+    freeAflushDescsLocked();
+    @atomicStore(bool, &aflush_in_flight, false, .release);
+
+    const resp_base: usize = paging.physToVirt(resp_phys);
+    clflushRange(resp_base, @sizeOf(CtrlHdr));
+    clflushRange(resp_base + PAIR_CMD_SLOT_BYTES, @sizeOf(CtrlHdr));
+    const resp0: *const CtrlHdr = @ptrFromInt(resp_base);
+    const resp1: *const CtrlHdr = @ptrFromInt(resp_base + PAIR_CMD_SLOT_BYTES);
+    const ok = resp0.cmd_type == RESP_OK_NODATA and resp1.cmd_type == RESP_OK_NODATA;
+    if (!ok) {
+        debug.klog("[virtio-gpu] async pair error: resp0=0x{X} resp1=0x{X}\n", .{ resp0.cmd_type, resp1.cmd_type });
+    }
+    _ = noteFlushResult(ok);
+    return true;
+}
+
+/// Block (holding ctrl_lock — the historical posture of every sync ctrl op)
+/// until no async pair is outstanding. Bounded: reapAsyncFlushLocked's ~2 s
+/// abandon guarantees forward progress even against a dead host. Same
+/// blockOn(.gpu_io) + wake_tick net as the sync pair's wait.
+fn waitAsyncFlushIdleLocked() void {
+    while (!reapAsyncFlushLocked()) {
+        // Polled / panic context must never park — pause-spin; the reap's
+        // ~2 s abandon bounds the loop even against a dead host.
+        if (force_polled or
+            @atomicLoad(bool, &@import("../debug/serial.zig").emergency_mode, .acquire))
+        {
+            asm volatile ("pause");
+            continue;
+        }
+        const process = @import("../proc/process.zig");
+        const cur = @import("../cpu/smp.zig").myCpu().current_pid orelse {
+            // No task context — asyncFlushEligible() should make this
+            // unreachable; bounded spin as a belt.
+            var timeout: u32 = 1_000_000;
+            while (timeout > 0 and !reapAsyncFlushLocked()) : (timeout -= 1) {
+                asm volatile ("pause");
+            }
+            return;
+        };
+        @atomicStore(u8, &current_gpu_waiter, @intCast(cur), .release);
+        defer @atomicStore(u8, &current_gpu_waiter, 0xFF, .release);
+        @atomicStore(u64, &process.procs[cur].wake_tick, process.tick_count +% 1, .release);
+        @import("../proc/sched.zig").registerWakeDeadline(process.tick_count +% 1);
+        process.blockOn(.gpu_io, CMD_RESOURCE_FLUSH);
+    }
+}
+
+/// Build + submit the present pair for the (already clipped, exclusive-max)
+/// rect — fire-and-forget. Caller holds ctrl_lock with nothing outstanding.
+/// Handles the double-buffered flip and 2D transfer+flush shapes; single-
+/// blob configs never get here (flushRectAsyncSubmit rejects them).
+fn submitFlushRectLocked(x0: u32, y0: u32, x1: u32, y1: u32) bool {
+    if (scanout_is_blob and blob_count >= 2) {
+        const new_front = 1 - blob_front;
+        var sb = SetScanoutBlob{
+            .hdr = .{ .cmd_type = CMD_SET_SCANOUT_BLOB },
+            .r = .{ .x = 0, .y = 0, .width = width, .height = height },
+            .scanout_id = 0,
+            .resource_id = blob_resource_ids[new_front],
+            .width = width,
+            .height = height,
+            .format = FORMAT_B8G8R8X8_UNORM,
+            .strides = .{ width * 4, 0, 0, 0 },
+        };
+        var rf = ResourceFlush{
+            .hdr = .{ .cmd_type = CMD_RESOURCE_FLUSH },
+            .r = .{ .x = 0, .y = 0, .width = width, .height = height },
+            .resource_id = blob_resource_ids[new_front],
+            .padding = 0,
+        };
+        if (!submitPairAsyncLocked(
+            @as([*]const u8, @ptrCast(&sb)),
+            @sizeOf(SetScanoutBlob),
+            @as([*]const u8, @ptrCast(&rf)),
+            @sizeOf(ResourceFlush),
+        )) {
+            _ = noteFlushResult(false);
+            return false;
+        }
+        // Flip immediately: the compositor draws the next frame into the
+        // old front. Until the host processes SetScanoutBlob it still
+        // scans out from that buffer — a transient tear, bounded by the
+        // one-in-flight rule, traded for never blocking on present.
+        blob_front = new_front;
+        framebuffer = blob_virt[1 - new_front];
+        current_resource_id = blob_resource_ids[1 - new_front];
+        return true;
+    }
+    const w = x1 - x0;
+    const h = y1 - y0;
+    const offset: u64 = @as(u64, y0) * @as(u64, width) * 4 + @as(u64, x0) * 4;
+    var th = TransferToHost2D{
+        .hdr = .{ .cmd_type = CMD_TRANSFER_TO_HOST_2D },
+        .r = .{ .x = x0, .y = y0, .width = w, .height = h },
+        .offset = offset,
+        .resource_id = current_resource_id,
+        .padding = 0,
+    };
+    var rf = ResourceFlush{
+        .hdr = .{ .cmd_type = CMD_RESOURCE_FLUSH },
+        .r = .{ .x = x0, .y = y0, .width = w, .height = h },
+        .resource_id = current_resource_id,
+        .padding = 0,
+    };
+    if (!submitPairAsyncLocked(
+        @as([*]const u8, @ptrCast(&th)),
+        @sizeOf(TransferToHost2D),
+        @as([*]const u8, @ptrCast(&rf)),
+        @sizeOf(ResourceFlush),
+    )) {
+        _ = noteFlushResult(false);
+        return false;
+    }
+    return true;
+}
+
+/// Submit any coalesced pending rect once the queue is free. Caller holds
+/// ctrl_lock. On submit failure the rect goes back to pending (retried by
+/// the next flush call / softirq / tick).
+fn kickPendingFlushLocked() void {
+    if (aflush_in_flight or !aflush_pending) return;
+    if (!asyncFlushEligible()) return;
+    if (scanout_is_blob and blob_count < 2) {
+        // Shape changed under us to single-blob (sync-only) — drop it; the
+        // compositor's next flush repaints through the sync path.
+        @atomicStore(bool, &aflush_pending, false, .release);
+        return;
+    }
+    const x0 = aflush_px0;
+    const y0 = aflush_py0;
+    const x1 = aflush_px1;
+    const y1 = aflush_py1;
+    @atomicStore(bool, &aflush_pending, false, .release);
+    if (!submitFlushRectLocked(x0, y0, x1, y1)) unionPendingLocked(x0, y0, x1, y1);
+}
+
+/// Async entry for the flush paths. Returns true if the rect was handled
+/// (submitted or coalesced) — the caller is done. False = not eligible;
+/// the caller runs the original synchronous body.
+fn flushRectAsyncSubmit(x0: u32, y0: u32, x1: u32, y1: u32) bool {
+    if (!asyncFlushEligible()) return false;
+    if (scanout_is_blob and blob_count < 2) return false; // single-cmd shape — sync path
+    ctrl_lock.acquire();
+    defer ctrl_lock.release();
+    _ = reapAsyncFlushLocked();
+    if (aflush_in_flight) {
+        // One pair in flight max: this frame's damage rides the next
+        // submit, unioned with whatever else lands meanwhile. No wait —
+        // that's the whole point.
+        unionPendingLocked(x0, y0, x1, y1);
+        return true;
+    }
+    var fx0 = x0;
+    var fy0 = y0;
+    var fx1 = x1;
+    var fy1 = y1;
+    if (aflush_pending) {
+        fx0 = @min(fx0, aflush_px0);
+        fy0 = @min(fy0, aflush_py0);
+        fx1 = @max(fx1, aflush_px1);
+        fy1 = @max(fy1, aflush_py1);
+        @atomicStore(bool, &aflush_pending, false, .release);
+    }
+    if (!submitFlushRectLocked(fx0, fy0, fx1, fy1)) {
+        unionPendingLocked(fx0, fy0, fx1, fy1);
     }
     return true;
 }
@@ -1760,6 +2113,12 @@ pub fn resumeFromS3() bool {
     force_polled = true;
     defer force_polled = saved_force_polled;
 
+    // Any pre-suspend async flush died with the controller, and the rings
+    // are about to be re-programmed — forget it rather than ever reaping
+    // stale descriptor indices into the rebuilt free list.
+    @atomicStore(bool, &aflush_in_flight, false, .release);
+    @atomicStore(bool, &aflush_pending, false, .release);
+
     // --- Re-drive the device handshake (per virtio §3.1.1) ---
     // Unlike init (which runs against an already-reset device at boot), here the
     // device is live in DRIVER_OK, so the reset is NOT instant: we MUST wait for a
@@ -1861,6 +2220,23 @@ pub fn resumeFromS3() bool {
 pub fn tickSweep() void {
     if (!active) return;
     if (!use_msix) return;
+    // Async flush bookkeeping: reap a completed pair + submit the coalesced
+    // pending rect. tryAcquire, never block — ksoftirqd must not park
+    // behind a sync sender holding ctrl_lock across a host wait (input's
+    // .hid drain runs behind us in the same task). A miss is fine: the
+    // next IRQ-raise / tick / flush call retries. The bools gate keeps the
+    // early-boot inline-fallback path (IF=0, no task) from ever touching
+    // the Mutex: both stay false until asyncFlushEligible() holds, which
+    // requires ksoftirqd to exist.
+    if (@atomicLoad(bool, &aflush_in_flight, .acquire) or
+        @atomicLoad(bool, &aflush_pending, .acquire))
+    {
+        if (ctrl_lock.tryAcquire()) {
+            _ = reapAsyncFlushLocked();
+            kickPendingFlushLocked();
+            ctrl_lock.release();
+        }
+    }
     const hw_used = usedIdxCoherent(&ctrl_vq);
     if (ctrl_vq.last_used_idx == hw_used) return;
     // HW advanced past SW — wake any .gpu_io waiter so its loop re-checks
@@ -1901,6 +2277,11 @@ pub fn dumpWaiterForTarget(target: u32) void {
     debug.klog("    num_free      = {d}\n", .{ctrl_vq.num_free});
     debug.klog("    irq_count     = {d}\n", .{virtio_gpu_irq_count});
     debug.klog("    ipis_sent     = {d}\n", .{virtio_gpu_wake_ipis_sent});
+    debug.klog("    aflush: in_flight={any} pending={any} target={d}\n", .{
+        @atomicLoad(bool, &aflush_in_flight, .acquire),
+        @atomicLoad(bool, &aflush_pending, .acquire),
+        aflush_target_idx,
+    });
     if (hw_used != ctrl_vq.last_used_idx) {
         debug.klog("    ===> HW advanced beyond SW; tickSweep should pick this up next tick\n", .{});
     } else if (ctrl_vq.availIdx().* != ctrl_vq.last_used_idx) {
@@ -2170,6 +2551,10 @@ pub fn flushUnconditional() void {
     if (shouldSkipFlush()) return;
     const t = @import("../debug/perf.zig").enter();
     defer @import("../debug/perf.zig").leave(.flush_rect, t);
+    // Fire-and-forget when the MSI-X→softirq completion path is up: submit
+    // (or coalesce) and return. The sync body below is the early-boot /
+    // forced-poll / single-blob fallback.
+    if (flushRectAsyncSubmit(0, 0, width, height)) return;
     if (scanout_is_blob and blob_count >= 2) {
         // Page flip: the compositor just wrote into blob[1-blob_front]
         // (which framebuffer points at). Display it, then point
@@ -2250,6 +2635,8 @@ pub fn flushRectUnconditional(x: u32, y: u32, w: u32, h: u32) void {
     if (x0 >= x1 or y0 >= y1) return;
     const t = @import("../debug/perf.zig").enter();
     defer @import("../debug/perf.zig").leave(.flush_rect, t);
+    // Fire-and-forget when eligible — see flushUnconditional.
+    if (flushRectAsyncSubmit(x0, y0, x1, y1)) return;
     if (scanout_is_blob and blob_count >= 2) {
         // Page flip: SetScanoutBlob + ResourceFlush batched (see
         // flushUnconditional for rationale). Partial rects can't be

@@ -509,6 +509,33 @@ pub const Mutex = struct {
         }
     }
 
+    /// Non-blocking acquire attempt. Returns true on success (caller owns
+    /// the mutex and must release()). A lock already held — including by
+    /// the calling pid itself — just returns false: the caller chose not
+    /// to wait, so unlike acquire() there is no self-deadlock to panic
+    /// about. No-task context mirrors acquire(): stamp and succeed.
+    pub fn tryAcquire(self: *Mutex) bool {
+        const ra = @returnAddress();
+        const smp = @import("../cpu/smp.zig");
+        const cur_opt = smp.myCpu().current_pid;
+        if (cur_opt == null) {
+            self.holder_ra = ra;
+            return true;
+        }
+        const my_pid: u16 = @intCast(cur_opt.?);
+        if (@cmpxchgStrong(u16, &self.owner_pid, 0xFFFF, my_pid, .acquire, .monotonic) != null) {
+            return false;
+        }
+        if (comptime witness.enabled) {
+            // After the CAS (we never sleep here, so the pre-park ordering
+            // concern in acquire() doesn't apply) — but still recorded, so
+            // release()'s witness.mutexRelease stays balanced.
+            if (self.witness_class != 0xFF) witness.mutexAcquire(self.witness_class, currentCpuId(), my_pid, ra);
+        }
+        self.holder_ra = ra;
+        return true;
+    }
+
     pub fn release(self: *Mutex) void {
         const smp = @import("../cpu/smp.zig");
         if (smp.myCpu().current_pid == null) {
