@@ -211,6 +211,13 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
     const was_soft_yield = cpu.pending_soft_yield;
     cpu.pending_soft_yield = false;
 
+    // VM-liveness pulse for spinlock's cli-hold classifier: ANY entry here,
+    // on ANY cpu, hardware tick or soft yield, proves the VM was executing
+    // at this instant. cliHoldCheck diffs the counter across a hold window
+    // to tell a whole-VM host freeze from a genuine long hold — the holder
+    // itself can never pulse (its cli stays masked for the whole window).
+    @import("../../proc/spinlock.zig").noteAlivePulse();
+
     // BSP heartbeat: count hardware IRQ firings (skip soft yields so the
     // count tracks wallclock). Print every 200 firings (~2s at 100Hz) to
     // confirm BSP timer is alive. If the heartbeat stops advancing in

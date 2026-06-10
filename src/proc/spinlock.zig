@@ -16,11 +16,17 @@ pub const SpinLock = struct {
     holder_cpu: u8 = 0xFF,
     holder_ra: u64 = 0,
     /// TSC at the moment `acquireIrqSave` returned. Read by
-    /// `releaseIrqRestore` to compute the cli-held duration and emit
-    /// a `[cli-hold]` warning past CLI_HOLD_THRESHOLD_MS. 0 = not
+    /// `releaseIrqRestore` to compute the cli-held duration and record
+    /// a cli-hold past CLI_HOLD_THRESHOLD_MS (see cliHoldCheck). 0 = not
     /// currently held by an IrqSave path (plain acquire/release pairs
-    /// don't bracket and don't fire the warning).
+    /// don't bracket and don't record).
     acquire_tsc: u64 = 0,
+    /// vm_alive_pulse sampled at the same moment as acquire_tsc. Diffed at
+    /// release to tell "the whole VM was frozen by the host during this
+    /// window" (pulse unchanged) from "the VM kept executing" — the only
+    /// signal that discriminates a host pause INSIDE a cli window from a
+    /// genuine long hold, since the TSC keeps counting through both.
+    acquire_pulse: u64 = 0,
 
     /// Acquire the lock. Spins until this ticket is served.
     ///
@@ -64,6 +70,11 @@ pub const SpinLock = struct {
             var i: u32 = 0;
             while (i < cap) : (i += 1) asm volatile ("pause");
             spins +%= 1;
+            // Spin-waiters are still EXECUTING even with IRQs masked
+            // (acquireIrqSave spins cli'd) — pulse the VM-liveness witness
+            // so a peer's long hold that we're queued on isn't mistaken
+            // for a whole-VM host freeze (see cliHoldCheck's verdict).
+            if (spins & 0xFFF == 0) noteAlivePulse();
             if (!warned and spins > 200_000_000) {
                 warned = true;
                 printSpinDiag(self, ticket, serving, ra);
@@ -90,6 +101,12 @@ pub const SpinLock = struct {
             if (self.witness_class != 0xFF) witness.spinRelease(self.witness_class, currentCpuId());
         }
         self.holder_cpu = 0xFF;
+        // Clear the IrqSave bracket stamp here too: a lock acquired via
+        // acquireIrqSave but released via plain release() would otherwise
+        // keep a stale acquire_tsc, and the NEXT plain acquire/release
+        // cycle would expose holder_cpu set + ancient tsc to
+        // dumpHeldLocksOlderThan — a phantom multi-second [smi-cause].
+        self.acquire_tsc = 0;
         // Leave holder_ra in place as a "last holder" hint — useful when a
         // deadlock fires immediately after a release/re-acquire cycle.
         _ = @atomicRmw(u32, &self.now_serving, .Add, 1, .release);
@@ -99,22 +116,25 @@ pub const SpinLock = struct {
     pub fn acquireIrqSave(self: *SpinLock) u64 {
         const flags = saveAndDisableIrq();
         self.acquire();
+        self.acquire_pulse = @atomicLoad(u64, &vm_alive_pulse, .monotonic);
         self.acquire_tsc = @import("../debug/perf.zig").rdtsc();
         return flags;
     }
 
-    /// Release and restore interrupt state. Emits `[cli-hold]` with the
-    /// acquire site + held duration if we sat with cli for longer than
-    /// CLI_HOLD_THRESHOLD_MS — ground-truth replacement for the SMI
-    /// classifier's IRQ0-gap sampling, which can't tell our cli-hold
-    /// apart from host SMI or cross-CPU spin contention.
+    /// Release and restore interrupt state. RECORDS a cli-hold (per-CPU
+    /// slot, drained + printed by smi.tick under a rate budget) when we
+    /// sat with cli for longer than CLI_HOLD_THRESHOLD_MS — ground truth
+    /// the SMI classifier corroborates its IRQ0-gap sampling against. For
+    /// ≥250ms windows the record carries a freeze-vs-hold verdict (see
+    /// vm_alive_pulse). Record-only by design: inline printing here used
+    /// to flood thousands of misattributed lines per host-pause storm.
     pub fn releaseIrqRestore(self: *SpinLock, flags: u64) void {
         const start_tsc = self.acquire_tsc;
+        const start_pulse = self.acquire_pulse;
         const holder_ra = self.holder_ra;
         const cpu_id = self.holder_cpu;
-        self.acquire_tsc = 0;
-        self.release();
-        if (start_tsc != 0) cliHoldCheck(self, start_tsc, holder_ra, cpu_id);
+        self.release(); // also clears acquire_tsc
+        if (start_tsc != 0) cliHoldCheck(self, start_tsc, start_pulse, holder_ra, cpu_id);
         restoreIrq(flags);
     }
 };
@@ -124,29 +144,103 @@ pub const SpinLock = struct {
 /// long regardless of why.
 const CLI_HOLD_THRESHOLD_MS: u64 = 5;
 
-/// One-shot rate-limit per process tick to avoid log floods when a
-/// genuinely-slow path runs in a loop (e.g. paging code-walk during
-/// swap pressure). Bumps to >0 only inside cliHoldCheck.
-var cli_hold_logged_this_tick: u32 = 0;
-var cli_hold_last_tick: u64 = 0;
+// =============================================================================
+// cli-hold recording — record-only at release; smi.tick prints.
+//
+// History: cliHoldCheck used to print [cli-hold] lines inline at release
+// time. Under a Hyper-V host-pause storm that produced thousands of lines
+// per boot — every vCPU freeze landing inside schedule()'s cli window read
+// as an 8-525ms "lock hold" with stale stack frames, and the flood misled
+// a whole perf session (2026-06-09). The guest TSC keeps counting through
+// a host pause, so DURATION ALONE cannot distinguish a host-frozen window
+// from a genuine long hold.
+//
+// What can: progress elsewhere in the VM. vm_alive_pulse is bumped by every
+// handleIRQ0 entry on every CPU (hardware tick or soft yield) and by
+// spin-waiters every 4096 backoff rounds. The holder itself can never
+// advance it: cli is masked for its whole window and it isn't spinning.
+// So across a ≥250ms hold window:
+//   pulse advanced ≥2 → something in the VM executed → genuine hold (or a
+//                       single-vCPU host steal — indistinguishable inside);
+//   pulse unchanged   → NOTHING in the VM ran → whole-VM host freeze,
+//                       provably not a kernel hold.
+// 250ms = 2.5× the AP idle one-shot cap (10 quanta, rearmTimerForCurrent),
+// so an alive-but-idle AP is guaranteed ≥2 pulses inside the window. Below
+// 250ms the witness has no resolution → verdict stays .unverified. Same
+// when cpu_count==1 (e.g. S3 AP-offline window): no peer, no witness.
+// Caveat: a raw cli/sti poll loop (rare, audited) on the only other CPU
+// would also silence pulses and could fake .vm_frozen — acceptable for a
+// log-only verdict.
+//
+// Records land in a per-CPU seqlock slot (single writer: the releasing CPU,
+// which still holds cli — not even an IRQ can start a nested write). The
+// BSP's smi.tick drains all slots every tick and prints under a budget with
+// a suppressed-counter, so an AP-side hold or a sub-gap BSP hold still
+// surfaces while a storm collapses to a few honest lines + a count.
+// =============================================================================
 
-/// Most-recent significant cli-hold, published for smi.zig's stall
-/// classifier. The `[smi]` detector sees only an IRQ0 *gap* and can't
-/// tell "we held cli too long" (OURS) from "the host descheduled our
-/// vCPU" (HOST) — both block IRQ0. But a real cpu-local cli-hold is
-/// released (and recorded here) microseconds BEFORE the pending IRQ0 can
-/// re-fire, whereas a host pause leaves these stale. So smi can corroborate
-/// a gap against an ACTUAL recorded hold of comparable duration instead of
-/// guessing from the sampled RIP (which, since schedule() is the hottest
-/// kernel code, mislabels most host pauses "OURS at schedule"). Caveat:
-/// only acquireIrqSave/releaseIrqRestore regions are tracked — a raw
-/// cli/sti window (rare, audited) would not corroborate and reads as HOST.
-/// end_tsc is published LAST with .release so a reader that observes the
-/// fresh end_tsc also observes the matching dur/ra/cpu.
-pub var last_clihold_end_tsc: u64 = 0;
-pub var last_clihold_dur_tsc: u64 = 0;
-pub var last_clihold_ra: u64 = 0;
-pub var last_clihold_cpu: u8 = 0xFF;
+/// Whole-VM execution witness. See block comment above.
+var vm_alive_pulse: u64 = 0;
+
+/// Bump the VM-liveness witness. Called from handleIRQ0 (any CPU, any
+/// entry kind) and from SpinLock.acquire's contended spin loop.
+pub inline fn noteAlivePulse() void {
+    _ = @atomicRmw(u64, &vm_alive_pulse, .Add, 1, .monotonic);
+}
+
+/// == smp.MAX_CPUS (LAPIC ids are bounded below it at MADT collection).
+/// Kept as a local constant so this file stays a top-level leaf.
+pub const MAX_HOLD_CPUS: usize = 32;
+
+pub const HoldVerdict = enum(u8) { unverified, vm_alive, vm_frozen };
+
+/// One recorded cli-hold. Written by the owning CPU under the seqlock
+/// protocol below; read by smi.tick via sampleHold.
+pub const CliHoldRecord = struct {
+    /// Seqlock: bumped to odd before the fields are written, back to even
+    /// after. Even and != the reader's last-seen ⇒ a new stable record.
+    /// Advances by 2 per record, so (seq_now − seq_seen)/2 − 1 = records
+    /// overwritten before the reader drained them.
+    seq: u32 = 0,
+    end_tsc: u64 = 0,
+    dur_tsc: u64 = 0,
+    /// Acquire-site return address.
+    ra: u64 = 0,
+    lock_addr: u64 = 0,
+    /// vm_alive_pulse advance across the window (meaningful only when the
+    /// verdict logic ran: dur ≥ 250ms and >1 CPU online).
+    pulse_delta: u64 = 0,
+    verdict: HoldVerdict = .unverified,
+    /// Release-time stack-scan return addresses (.text-filtered), captured
+    /// raw and symbol-resolved only if printed. 0 = unused entry.
+    path: [3]u64 = .{ 0, 0, 0 },
+};
+
+var clihold_slots: [MAX_HOLD_CPUS]CliHoldRecord = [_]CliHoldRecord{.{}} ** MAX_HOLD_CPUS;
+
+/// Seqlock read of `cpu`'s slot into `out`. Returns the (even) seq on a
+/// stable read — 0 means "never written" — or null on a torn read (writer
+/// mid-update; caller retries next tick). All reader loads are .acquire and
+/// all writer stores .release: an acquire load forbids later ops from
+/// moving above it, so s1 → fields → s2 executes in program order, which is
+/// exactly what a seqlock reader needs.
+pub fn sampleHold(cpu: usize, out: *CliHoldRecord) ?u32 {
+    if (cpu >= MAX_HOLD_CPUS) return null;
+    const slot = &clihold_slots[cpu];
+    const s1 = @atomicLoad(u32, &slot.seq, .acquire);
+    if (s1 & 1 != 0) return null;
+    out.end_tsc = @atomicLoad(u64, &slot.end_tsc, .acquire);
+    out.dur_tsc = @atomicLoad(u64, &slot.dur_tsc, .acquire);
+    out.ra = @atomicLoad(u64, &slot.ra, .acquire);
+    out.lock_addr = @atomicLoad(u64, &slot.lock_addr, .acquire);
+    out.pulse_delta = @atomicLoad(u64, &slot.pulse_delta, .acquire);
+    out.verdict = @atomicLoad(HoldVerdict, &slot.verdict, .acquire);
+    for (&out.path, 0..) |*p, i| p.* = @atomicLoad(u64, &slot.path[i], .acquire);
+    const s2 = @atomicLoad(u32, &slot.seq, .acquire);
+    if (s2 != s1) return null;
+    out.seq = s1;
+    return s1;
+}
 
 /// Linker-provided bounds of the kernel `.text` section (see linker.ld).
 /// The P5 held-path stack-scan uses these to keep only words that point
@@ -162,7 +256,7 @@ inline fn isKernelTextAddr(v: u64) bool {
     return v >= @intFromPtr(&__text_start) and v < @intFromPtr(&__text_end);
 }
 
-fn cliHoldCheck(self: *SpinLock, start_tsc: u64, ra: u64, cpu_id: u8) void {
+fn cliHoldCheck(self: *SpinLock, start_tsc: u64, start_pulse: u64, ra: u64, cpu_id: u8) void {
     const apic = @import("../time/apic.zig");
     const per_q = apic.tscPerQuantum();
     if (per_q == 0) return; // pre-calibration; no useful conversion
@@ -171,63 +265,75 @@ fn cliHoldCheck(self: *SpinLock, start_tsc: u64, ra: u64, cpu_id: u8) void {
     // tsc_per_quantum covers 10 ms; threshold in TSC = per_q * (ms/10)
     const threshold_tsc = per_q * CLI_HOLD_THRESHOLD_MS / 10;
     if (delta < threshold_tsc) return;
-    // Publish this hold for smi.zig's stall classifier BEFORE the log
-    // rate-limit below — the corroboration signal must be recorded even
-    // when the [cli-hold] line itself is throttled. dur/ra/cpu first, then
-    // end_tsc with .release as the publish barrier.
-    @atomicStore(u64, &last_clihold_dur_tsc, delta, .monotonic);
-    @atomicStore(u64, &last_clihold_ra, ra, .monotonic);
-    @atomicStore(u8, &last_clihold_cpu, cpu_id, .monotonic);
-    @atomicStore(u64, &last_clihold_end_tsc, start_tsc +% delta, .release);
-    // Soft rate-limit: at most ~16 lines per second-of-tick window.
-    const process = @import("process.zig");
-    const tick: u64 = @atomicLoad(u64, &process.tick_count, .monotonic);
-    if (tick != cli_hold_last_tick) {
-        cli_hold_last_tick = tick;
-        cli_hold_logged_this_tick = 0;
+    if (cpu_id >= MAX_HOLD_CPUS) return;
+
+    // Freeze-vs-hold verdict — see the vm_alive_pulse block comment.
+    var verdict: HoldVerdict = .unverified;
+    var pulse_delta: u64 = 0;
+    const verdict_min_tsc = per_q * 25; // 250 ms = 2.5× the AP idle one-shot cap
+    if (delta >= verdict_min_tsc) {
+        pulse_delta = @atomicLoad(u64, &vm_alive_pulse, .monotonic) -% start_pulse;
+        const smp = @import("../cpu/smp.zig");
+        if (smp.cpu_count > 1) {
+            verdict = if (pulse_delta == 0) .vm_frozen else if (pulse_delta >= 2) .vm_alive else .unverified;
+        }
     }
-    if (cli_hold_logged_this_tick >= 16) return;
-    cli_hold_logged_this_tick += 1;
-    const symbols = @import("../debug/symbols.zig");
-    const serial = @import("../debug/serial.zig");
-    const ms = delta * 10 / per_q;
-    if (symbols.resolveKernel(ra)) |r| {
-        serial.print(
-            "[cli-hold] cpu{d} lock@0x{X} {d} ms at {s}+0x{X}\n",
-            .{ cpu_id, @intFromPtr(self), ms, r.name, r.offset },
-        );
-    } else {
-        serial.print(
-            "[cli-hold] cpu{d} lock@0x{X} {d} ms ra=0x{X}\n",
-            .{ cpu_id, @intFromPtr(self), ms, ra },
-        );
-    }
+
     // P5: mini stack-scan backtrace of the holder AT RELEASE. The acquire
-    // `ra` above is only WHERE the lock was taken; this shows the call path
-    // the (too-slow) critical section was on when it finally let go — the
-    // "where was cpu N" datum that turns a bare lock address into a lead.
-    // The RBP walk is unreliable here (higher-half kernel + omit-frame-
-    // pointer), so we scan THIS cpu's own (mapped) kstack for words that
-    // point into kernel `.text` and print the first few. The `.text`-range
-    // pre-filter is what makes the output trustworthy: without it, raw
-    // stack words alias data symbols (kstack_pool, __bss_phys_end, …) and
-    // resolveKernel labels them confidently — noise. With it, every line
-    // is a genuine code return address (still a heuristic — STALE return
-    // addresses from prior frames can show, but never a data symbol).
-    // Bounded to the current stack page, reads only our own stack so it
-    // can't fault. Already inside the 16-lines/tick gate above, so it
-    // doesn't flood.
-    var fp = @frameAddress();
-    const page_top = (fp & ~@as(usize, 0xFFF)) + 0x1000;
-    var scanned: usize = 0;
-    var shown: usize = 0;
-    while (fp + 8 <= page_top and scanned < 96 and shown < 3) : (fp += 8) {
-        scanned += 1;
-        const v = @as(*const u64, @ptrFromInt(fp)).*;
-        if (!isKernelTextAddr(v)) continue;
-        if (symbols.resolveKernel(v)) |r2| {
-            serial.print("[cli-hold]     held-path #{d}: {s}+0x{X}\n", .{ shown, r2.name, r2.offset });
+    // `ra` is only WHERE the lock was taken; this captures the call path
+    // the critical section was on when it finally let go. The RBP walk is
+    // unreliable here (higher-half kernel + omit-frame-pointer), so we scan
+    // THIS cpu's own (mapped) kstack for words that point into kernel
+    // `.text` — the range pre-filter is what keeps the output trustworthy
+    // (raw stack words alias data symbols otherwise). Raw addresses only;
+    // symbol resolution is deferred to smi's print path. Skipped for
+    // vm_frozen: those frames are host-storm noise we'll never print —
+    // exactly the stale-frame misattribution this redesign exists to kill.
+    var path = [3]u64{ 0, 0, 0 };
+    if (verdict != .vm_frozen) {
+        var fp = @frameAddress();
+        const page_top = (fp & ~@as(usize, 0xFFF)) + 0x1000;
+        var scanned: usize = 0;
+        var shown: usize = 0;
+        while (fp + 8 <= page_top and scanned < 96 and shown < 3) : (fp += 8) {
+            scanned += 1;
+            const v = @as(*const u64, @ptrFromInt(fp)).*;
+            if (!isKernelTextAddr(v)) continue;
+            path[shown] = v;
             shown += 1;
+        }
+    }
+
+    // Publish into this CPU's seqlock slot. Single writer guaranteed: we
+    // still hold cli, so not even an IRQ can start a second write here.
+    const slot = &clihold_slots[cpu_id];
+    const s = @atomicLoad(u32, &slot.seq, .monotonic);
+    @atomicStore(u32, &slot.seq, s +% 1, .release); // odd: write in progress
+    @atomicStore(u64, &slot.end_tsc, start_tsc +% delta, .release);
+    @atomicStore(u64, &slot.dur_tsc, delta, .release);
+    @atomicStore(u64, &slot.ra, ra, .release);
+    @atomicStore(u64, &slot.lock_addr, @intFromPtr(self), .release);
+    @atomicStore(u64, &slot.pulse_delta, pulse_delta, .release);
+    @atomicStore(HoldVerdict, &slot.verdict, verdict, .release);
+    for (path, 0..) |v, i| @atomicStore(u64, &slot.path[i], v, .release);
+    @atomicStore(u32, &slot.seq, s +% 2, .release); // even: stable
+
+    // No PM_TMR on this board → smi.tick never drains the slots. Rare
+    // config (q35 always has one); print directly, hard-capped per boot.
+    if (!@import("../time/smi.zig").isActive()) {
+        const S = struct {
+            var printed: u32 = 0;
+        };
+        if (S.printed < 32) {
+            S.printed += 1;
+            const symbols = @import("../debug/symbols.zig");
+            const serial = @import("../debug/serial.zig");
+            const ms = delta * 10 / per_q;
+            if (symbols.resolveKernel(ra)) |r| {
+                serial.print("[cli-hold] cpu{d} lock@0x{X} {d} ms at {s}+0x{X} (no-smi fallback)\n", .{ cpu_id, @intFromPtr(self), ms, r.name, r.offset });
+            } else {
+                serial.print("[cli-hold] cpu{d} lock@0x{X} {d} ms ra=0x{X} (no-smi fallback)\n", .{ cpu_id, @intFromPtr(self), ms, ra });
+            }
         }
     }
 }

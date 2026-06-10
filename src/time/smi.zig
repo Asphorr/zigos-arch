@@ -15,10 +15,12 @@
 //     ~35795 ticks (= 10 ms × 3.579545 MHz). If we see significantly more,
 //     the OS lost time — either to SMM or to a long-disabled IRQ window.
 //
-// We don't distinguish SMI from "we held cli too long" — both look like
-// "elapsed PM_TMR > expected since last IRQ." On a clean kernel the only
-// way to lose 5+ ms is SMI; if we ever start triggering this from our own
-// kernel paths, that itself is a useful signal that something is wrong.
+// This module is also the sole PRINTER for spinlock's cli-hold records:
+// cliHoldCheck records into per-CPU seqlock slots and tick() drains them
+// under a rate budget (flushCliHolds). Printing used to happen inline at
+// release time — under a Hyper-V host-pause storm that flooded thousands
+// of misattributed [cli-hold] lines per boot (see spinlock.zig's
+// vm_alive_pulse block comment for the full story).
 //
 // Cost: one I/O port read (~1 µs on real HW, near zero on QEMU+KVM) per
 // BSP IRQ0 = ~100 µs/sec = 0.01% CPU. Negligible.
@@ -29,6 +31,7 @@ const debug = @import("../debug/debug.zig");
 const io = @import("../io.zig");
 const exectrail = @import("../debug/exectrail.zig");
 const symbols = @import("../debug/symbols.zig");
+const spinlock = @import("../proc/spinlock.zig");
 
 const PM_TMR_HZ: u64 = 3_579_545;
 const QUANTUM_MS: u64 = 10;
@@ -60,8 +63,16 @@ pub fn init() void {
     debug.klog("[smi] PM_TMR detector ready: port=0x{x} {s}-bit\n", .{ pm_tmr_port, if (ext_32) "32" else "24" });
 }
 
+/// True once the PM_TMR detector is armed. spinlock.cliHoldCheck uses this
+/// to decide whether tick() will drain its hold slots or it must fall back
+/// to printing directly (no-FADT boards).
+pub fn isActive() bool {
+    return initialized;
+}
+
 /// Called from BSP IRQ0 (timer). Reads PM_TMR, computes elapsed-since-last
-/// in PM ticks, flags windows that exceeded the stall threshold.
+/// in PM ticks, flags windows that exceeded the stall threshold. Also
+/// drains spinlock's cli-hold slots every tick (see flushCliHolds).
 ///
 /// Don't call from APs — their IRQ0 is irregular (idle hlt suppresses it)
 /// and would trigger constant false positives. Don't call before APIC
@@ -76,6 +87,17 @@ pub fn tick() void {
     }
     const delta = pmDelta(last_pm, now);
     last_pm = now;
+
+    const tsc_per_quantum = apic.tscPerQuantum();
+    var now_tsc: u64 = 0;
+    if (tsc_per_quantum > 0) {
+        now_tsc = rdtsc();
+        // Drain recorded cli-holds EVERY tick, not only on stall ticks: a
+        // hold on an AP never delays BSP IRQ0, and a 5-15ms BSP hold stays
+        // under the stall threshold — both must still surface.
+        flushCliHolds(tsc_per_quantum);
+    }
+
     if (delta < STALL_THRESHOLD_PM) return;
     stall_events +%= 1;
     const us = delta * 1_000_000 / PM_TMR_HZ;
@@ -84,51 +106,48 @@ pub fn tick() void {
     if (sample_count - last_log_tick < 100) return;
     last_log_tick = sample_count;
 
-    // Lock-attribution: walk registered SpinLocks for any whose acquire_tsc
-    // shows it has been held for >5ms. Emits one [smi-cause] line per such
-    // lock ABOVE the main [smi] classifier line, so a "blame the host"
-    // verdict can be immediately checked against actual cli-held locks.
-    // Directly answers user memory feedback: "[smi] stall can be us — check
-    // pid_act / slow-sc / yield-loop first" — now the lock dump joins
-    // those signals at fire time, not after the fact. (Proposal P4 in the
-    // debug infra survey 2026-05-28.)
-    const tsc_per_quantum = apic.tscPerQuantum();
     var cli_us: u64 = 0;
     var cli_ra: u64 = 0;
+    var cli_vm_frozen = false;
     if (tsc_per_quantum > 0) {
-        const now_tsc: u64 = asm volatile (
-            \\ rdtsc
-            \\ shlq $32, %%rdx
-            \\ orq %%rdx, %%rax
-            : [r] "={rax}" (-> u64),
-            :: .{ .rdx = true });
-        const sl = @import("../proc/spinlock.zig");
-        // 5ms = half of the 10ms LAPIC quantum. Existing [smi-cause] dump of
-        // any lock CURRENTLY held >5ms — catches a PEER cpu still sitting on
-        // one (orthogonal to cpu0's own gap, which we corroborate below).
-        sl.dumpHeldLocksOlderThan(now_tsc, tsc_per_quantum / 2);
-        // Corroboration for cpu0's gap: did THIS cpu release a cli-hold of
-        // comparable size just before this IRQ0? A real cli-hold is recorded
-        // µs ago (now-end is tiny); a host pause leaves the record stale (it
-        // ended ~`us` ago, when the pause began). Require same-cpu so a
-        // peer's hold can't masquerade as ours. .acquire pairs with the
-        // .release publish so dur is consistent with end_tsc.
+        // Lock-attribution: any lock CURRENTLY held >5ms (half the 10ms
+        // LAPIC quantum) — catches a PEER cpu still sitting on one
+        // (orthogonal to cpu0's own gap, corroborated below). One
+        // [smi-cause] line per lock, ABOVE the classifier verdict.
+        spinlock.dumpHeldLocksOlderThan(now_tsc, tsc_per_quantum / 2);
+        // Corroboration for cpu0's gap: did THIS cpu record a cli-hold
+        // ending just before this IRQ0? A real cli-hold is recorded µs
+        // before the pending IRQ0 re-fires; an unrelated stale record
+        // fails the end-within-a-quantum check. Same-cpu so a peer's hold
+        // can't masquerade as ours. The record also carries the
+        // freeze-vs-hold verdict: a vm_frozen window must NOT be blamed
+        // OURS — its TSC delta counted host freeze time, not kernel work.
         const my_cpu: u8 = @truncate(apic.getLapicId());
-        const end = @atomicLoad(u64, &sl.last_clihold_end_tsc, .acquire);
-        const hold_cpu = @atomicLoad(u8, &sl.last_clihold_cpu, .monotonic);
-        if (end != 0 and hold_cpu == my_cpu and now_tsc >= end and (now_tsc - end) < tsc_per_quantum) {
-            const dur = @atomicLoad(u64, &sl.last_clihold_dur_tsc, .monotonic);
-            cli_ra = @atomicLoad(u64, &sl.last_clihold_ra, .monotonic);
-            cli_us = dur * 10_000 / tsc_per_quantum; // tsc_per_quantum = TSC/10ms = TSC/10_000µs
+        var rec: spinlock.CliHoldRecord = undefined;
+        if (spinlock.sampleHold(my_cpu, &rec)) |seq| {
+            if (seq != 0 and now_tsc >= rec.end_tsc and (now_tsc - rec.end_tsc) < tsc_per_quantum) {
+                cli_us = rec.dur_tsc * 10_000 / tsc_per_quantum; // tsc_per_quantum = TSC/10ms = TSC/10_000µs
+                cli_ra = rec.ra;
+                cli_vm_frozen = rec.verdict == .vm_frozen;
+            }
         }
     }
 
     // prev_rip (in classifyAndLog) = what cpu0 was doing at the PREVIOUS
     // IRQ0 boundary (exectrail head-1; handleIRQ0 calls smi.tick() BEFORE
-    // exectrail.recordIrq()). The verdict is now decided by cli_us — an
-    // ACTUAL recorded cli-hold — not guessed from prev_rip; prev_rip is
-    // only context for where a host pause happened to sample us.
-    classifyAndLog(us, cli_us, cli_ra);
+    // exectrail.recordIrq()). The verdict is decided by cli_us — an ACTUAL
+    // recorded cli-hold — not guessed from prev_rip; prev_rip is only
+    // context for where a host pause happened to sample us.
+    classifyAndLog(us, cli_us, cli_ra, cli_vm_frozen);
+}
+
+inline fn rdtsc() u64 {
+    return asm volatile (
+        \\ rdtsc
+        \\ shlq $32, %%rdx
+        \\ orq %%rdx, %%rax
+        : [r] "={rax}" (-> u64),
+        :: .{ .rdx = true });
 }
 
 /// Wraparound-safe delta on the masked counter. Returns the number of PM
@@ -140,20 +159,98 @@ fn pmDelta(prev: u32, now: u32) u64 {
     return (@as(u64, pm_tmr_mask) - prev) + now + 1;
 }
 
+// ---------------------------------------------------------------------------
+// cli-hold drain — sole printer for spinlock's per-CPU hold records.
+// ---------------------------------------------------------------------------
+
+/// Budget: at most this many [cli-hold] lines per ~1s window. A host-pause
+/// storm generates one record per freeze-inside-cli; without the budget
+/// that's still hundreds of lines/minute. Anything over budget (or
+/// overwritten in a slot before we drained it) is counted and reported
+/// once per window — the data degrades to a count, never to silence.
+const HOLD_LINES_PER_WINDOW: u32 = 4;
+
+var hold_last_seen: [spinlock.MAX_HOLD_CPUS]u32 = [_]u32{0} ** spinlock.MAX_HOLD_CPUS;
+var hold_window_start_sample: u64 = 0;
+var hold_printed_this_window: u32 = 0;
+var hold_suppressed_this_window: u64 = 0;
+
+fn flushCliHolds(tsc_per_quantum: u64) void {
+    // ~1s window (100 BSP ticks at 10ms) — same cadence as the [smi] limiter.
+    if (sample_count -% hold_window_start_sample >= 100) {
+        if (hold_suppressed_this_window > 0) {
+            debug.klog("[cli-hold] +{d} hold(s) suppressed ({d}/s print budget)\n", .{ hold_suppressed_this_window, HOLD_LINES_PER_WINDOW });
+        }
+        hold_window_start_sample = sample_count;
+        hold_printed_this_window = 0;
+        hold_suppressed_this_window = 0;
+    }
+    var cpu: usize = 0;
+    while (cpu < spinlock.MAX_HOLD_CPUS) : (cpu += 1) {
+        var rec: spinlock.CliHoldRecord = undefined;
+        const seq = spinlock.sampleHold(cpu, &rec) orelse continue; // torn → retry next tick
+        if (seq == hold_last_seen[cpu]) continue; // nothing new (incl. never-written 0)
+        const missed: u32 = (seq -% hold_last_seen[cpu]) / 2 -| 1;
+        hold_last_seen[cpu] = seq;
+        if (hold_printed_this_window >= HOLD_LINES_PER_WINDOW) {
+            hold_suppressed_this_window += @as(u64, missed) + 1;
+            continue;
+        }
+        hold_printed_this_window += 1;
+        hold_suppressed_this_window += missed;
+        const us = rec.dur_tsc * 10_000 / tsc_per_quantum;
+        if (symbols.resolveKernel(rec.ra)) |r| {
+            debug.klog("[cli-hold] cpu{d} lock@0x{X} {d}us at {s}+0x{X}", .{ cpu, rec.lock_addr, us, r.name, r.offset });
+        } else {
+            debug.klog("[cli-hold] cpu{d} lock@0x{X} {d}us ra=0x{X}", .{ cpu, rec.lock_addr, us, rec.ra });
+        }
+        switch (rec.verdict) {
+            .vm_frozen => debug.klog(" — VM SILENT thru window: host freeze, NOT a kernel hold", .{}),
+            .vm_alive => debug.klog(" — VM alive (pulses={d}): genuine hold or 1-vCPU steal", .{rec.pulse_delta}),
+            .unverified => {},
+        }
+        if (missed > 0) debug.klog(" (+{d} earlier unlogged)", .{missed});
+        debug.klog("\n", .{});
+        // Held-path backtrace captured at release time. vm_frozen records
+        // carry none (skipped at capture — the frames would be stale
+        // host-storm noise, the 2026-06-09 misattribution).
+        if (rec.verdict != .vm_frozen) {
+            for (rec.path, 0..) |p, i| {
+                if (p == 0) continue;
+                if (symbols.resolveKernel(p)) |r2| {
+                    debug.klog("[cli-hold]   held-path #{d}: {s}+0x{X}\n", .{ i, r2.name, r2.offset });
+                }
+            }
+        }
+    }
+}
+
 const KERNEL_HIGH_HALF: u64 = 0xFFFF800000000000;
 
 // Decide OURS vs HOST from cli_us — the duration of an ACTUAL cpu-local
 // cli-hold that ended just before this IRQ0 (0 if none). A gap is OURS only
-// when a recorded hold covers at least half of it; otherwise it's a host
-// vCPU pause that merely SAMPLED cpu0 somewhere (prev_rip). The old code
-// guessed "OURS" from prev_rip alone, so every host pause that happened to
-// sample schedule() — the hottest kernel code — was mislabeled "OURS at
-// schedule" while the real cli-holds were only ≤17ms and the gaps ran to
-// 1.3s. cli_ra is the hold's acquire site = the authoritative location.
-fn classifyAndLog(us: u64, cli_us: u64, cli_ra: u64) void {
+// when a recorded hold covers at least half of it AND the hold's window
+// wasn't itself a whole-VM freeze (cli_vm_frozen). The old code guessed
+// "OURS" from prev_rip alone, so every host pause that happened to sample
+// schedule() — the hottest kernel code — was mislabeled "OURS at schedule";
+// then the corroboration rework still mislabeled host-freezes-inside-cli as
+// OURS because the TSC counts through a freeze. cli_ra is the hold's
+// acquire site = the authoritative location.
+fn classifyAndLog(us: u64, cli_us: u64, cli_ra: u64, cli_vm_frozen: bool) void {
     const accounted = cli_us != 0 and cli_us * 2 >= us;
 
     if (accounted) {
+        if (cli_vm_frozen) {
+            // The recorded hold covers the gap, but the whole VM was silent
+            // through it (vm_alive_pulse unchanged): the host froze us
+            // INSIDE the cli window. Freeze time, not kernel work.
+            if (symbols.resolveKernel(cli_ra)) |r| {
+                debug.klog("[smi] stall: {d}us — HOST (froze {d}us inside cli window at {s}+0x{X}; VM silent) — events={d} max={d}us\n", .{ us, cli_us, r.name, r.offset, stall_events, max_stall_us });
+            } else {
+                debug.klog("[smi] stall: {d}us — HOST (froze {d}us inside cli window at ra=0x{X:0>16}; VM silent) — events={d} max={d}us\n", .{ us, cli_us, cli_ra, stall_events, max_stall_us });
+            }
+            return;
+        }
         if (symbols.resolveKernel(cli_ra)) |r| {
             debug.klog("[smi] stall: {d}us — OURS (cli-hold {d}us at {s}+0x{X}) — events={d} max={d}us\n", .{ us, cli_us, r.name, r.offset, stall_events, max_stall_us });
         } else {
