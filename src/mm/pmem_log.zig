@@ -131,36 +131,53 @@ fn entrySpan(len: u32) u64 {
 
 // --- append (the crash-consistent write) -----------------------------------
 
+/// Assemble an entry body (seq ++ len ++ payload) in one buffer, persist it
+/// with a SINGLE writeAt (one flush+SFENCE instead of three), and return the
+/// crc that would commit it — computed over the exact bytes just written.
+/// Shared by append (which then persists the true crc) and injectTornTail
+/// (which deliberately persists a wrong one). Returns null on a short write
+/// (region end), leaving an uncommitted body that recovery discards.
+fn writeBody(off: u64, seq: u64, payload: []const u8) ?u32 {
+    var body: [12 + MAX_PAYLOAD]u8 = undefined;
+    const len: u32 = @intCast(payload.len);
+    var i: u6 = 0;
+    while (i < 8) : (i += 1) body[i] = @truncate(seq >> (@as(u6, i) * 8));
+    body[8] = @truncate(len);
+    body[9] = @truncate(len >> 8);
+    body[10] = @truncate(len >> 16);
+    body[11] = @truncate(len >> 24);
+    @memcpy(body[12..][0..payload.len], payload);
+    const body_len: usize = 12 + payload.len;
+    if (pmem.writeAt(off, body[0..body_len]) != body_len) return null;
+    var crc = crc32Start();
+    crc = crc32Feed(crc, body[0..body_len]);
+    return crc32End(crc);
+}
+
 /// Append `payload` as a committed record. Body is written + persisted first,
 /// then the crc commit marker — so a crash between the two leaves an entry that
 /// recovery discards. Returns false if the log is full. Caller must have run
 /// recover() so tail_off/next_seq are valid.
 fn append(payload: []const u8) bool {
+    // Bounds first, cast second — an oversized slice must hit the early
+    // return, not an @intCast panic.
+    if (payload.len > MAX_PAYLOAD) return false;
+    // len == 0 is recovery's clean-end sentinel (a zeroed len field marks
+    // the end of the committed log). A zero-length record would "commit"
+    // here but be discarded — together with every record after it — by the
+    // next boot's recover(). Refuse it rather than silently lose data.
+    if (payload.len == 0) return false;
     const len: u32 = @intCast(payload.len);
-    if (len > MAX_PAYLOAD) return false;
     const off = tail_off;
     if (off + entrySpan(len) > pmem.size()) return false; // out of room
 
-    // 1. Body: seq, len, payload — each writeAt is durable, so on return the
-    //    full body has reached the persistence domain (crc not yet written).
-    put64(off, next_seq);
-    put32(off + 8, len);
-    if (len != 0) _ = pmem.writeAt(off + 12, payload);
+    // 1. Body: one durable writeAt; on return the full body has reached the
+    //    persistence domain (crc not yet written).
+    const crc = writeBody(off, next_seq, payload) orelse return false;
 
-    // 2. Commit marker: crc over seq ++ len ++ payload, written + persisted
-    //    LAST. The SFENCE inside the body writeAts orders the body strictly
-    //    before this marker becomes durable.
-    var hdr: [12]u8 = undefined;
-    var i: u6 = 0;
-    while (i < 8) : (i += 1) hdr[i] = @truncate(next_seq >> (@as(u6, i) * 8));
-    hdr[8] = @truncate(len);
-    hdr[9] = @truncate(len >> 8);
-    hdr[10] = @truncate(len >> 16);
-    hdr[11] = @truncate(len >> 24);
-    var crc = crc32Start();
-    crc = crc32Feed(crc, &hdr);
-    crc = crc32Feed(crc, payload);
-    put32(off + 12 + len, crc32End(crc));
+    // 2. Commit marker: written + persisted LAST. The SFENCE inside the body
+    //    writeAt orders it strictly before this marker becomes durable.
+    put32(off + 12 + len, crc);
 
     tail_off = off + entrySpan(len);
     next_seq += 1;
@@ -235,10 +252,14 @@ fn injectTornTail() void {
     const len: u32 = marker.len;
     const off = tail_off;
     if (off + entrySpan(len) > pmem.size()) return;
-    put64(off, next_seq); // a plausible seq, so recovery treats it as a real entry...
-    put32(off + 8, len);
-    _ = pmem.writeAt(off + 12, marker);
-    put32(off + 12 + len, 0); // ...but the commit crc is invalid (0) → torn
+    // A plausible seq + body, so recovery treats it as a real entry...
+    const true_crc = writeBody(off, next_seq, marker) orelse return;
+    // ...with a GUARANTEED-invalid commit marker: the bitwise NOT of the
+    // entry's true crc. The previous constant 0 had a 2^-32 per-boot chance
+    // of matching the real crc (seq varies each boot, so the crc does too) —
+    // and on that boot recovery would have accepted the torn entry as
+    // committed. ~true_crc can never equal true_crc.
+    put32(off + 12 + len, ~true_crc);
 }
 
 // --- boot demo --------------------------------------------------------------
