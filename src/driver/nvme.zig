@@ -687,6 +687,18 @@ fn initController(c: *Controller, dev: pci.PciDevice, idx: usize) bool {
     const flbas = id_ns[26];
     const lbaf_idx: usize = flbas & 0x0F;
     const lbads = id_ns[128 + lbaf_idx * 4 + 2];
+    // LBADS is a device-reported exponent (block size = 2^LBADS), read raw out
+    // of the Identify Namespace DMA payload. `1 << lbads` shifts a u32, whose
+    // shift-amount type is u5 — so a corrupt or exotic payload reporting
+    // LBADS >= 32 makes `@intCast(lbads)` a checked out-of-range cast that
+    // PANICS the kernel at boot under ReleaseSafe (the build oracle), turning a
+    // bad disk into a hang instead of a clean refusal. Reject the impossible
+    // exponent up front; the only value we ultimately accept is 9 (512 B),
+    // enforced by the SECTOR_SIZE check just below.
+    if (lbads >= 32) {
+        debug.klog("[nvme] ctrl#{d} bogus LBADS={d} (block size 2^{d} overflows u32) — refusing\n", .{ idx, lbads, lbads });
+        return false;
+    }
     c.block_size = @as(u32, 1) << @intCast(lbads);
     debug.klog("[nvme] ctrl#{d} nsid={d} block_size={d}\n", .{ idx, c.nsid, c.block_size });
 
@@ -1924,20 +1936,26 @@ pub fn readSectorPrimary(lba: u32, dest: [*]u8) void {
     _ = ioCommand(&controllers[0], IO_READ, lba, @intFromPtr(dest), 1);
 }
 
-pub fn readSectorsPrimary(lba: u32, count: u16, dest: [*]u8) void {
-    if (num_controllers < 1) return;
+// Returns false on a failed read — same contract as readSectorsSecondary's
+// BUG 2 fix (2026-06-04), which hardened only the secondary path because the
+// primary was believed caller-less. It isn't: tarfs/fat32 import block.zig
+// under the alias `ata`, so tarfs's bulk loads land HERE when the backend is
+// NVMe, and a swallowed error served stale buffer bytes as valid file data —
+// the same silent-corruption class as the ext2 garbage-ELF.
+pub fn readSectorsPrimary(lba: u32, count: u16, dest: [*]u8) bool {
+    if (num_controllers < 1) return false;
     const c = &controllers[0];
     const total: u32 = if (count == 0) 256 else @as(u32, count);
     if (ASYNC_BUILD_ENABLED and total > MAX_SECTORS_PER_CMD and @atomicLoad(bool, &c.async_mode, .acquire)) {
-        _ = readSectorsPipelined(c, 0, lba, total, @intFromPtr(dest));
-        return;
+        return readSectorsPipelined(c, 0, lba, total, @intFromPtr(dest));
     }
     var done: u32 = 0;
     while (done < total) {
         const chunk: u32 = @min(total - done, MAX_SECTORS_PER_CMD);
-        _ = ioCommand(c, IO_READ, lba + done, @intFromPtr(dest) + done * c.block_size, chunk);
+        if (!ioCommand(c, IO_READ, lba + done, @intFromPtr(dest) + done * c.block_size, chunk)) return false;
         done += chunk;
     }
+    return true;
 }
 
 pub fn readSectorSecondary(lba: u32, dest: [*]u8) void {

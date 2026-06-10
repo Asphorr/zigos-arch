@@ -54,13 +54,25 @@ pub fn readSector(lba: u32, dest: [*]u8) void {
     }
 }
 
-pub fn readSectors(lba: u32, count: u16, dest: [*]u8) void {
-    switch (backend) {
-        .none => {},
-        .ata => ata.readSectors(lba, count, dest),
-        .ahci => ahci.readSectorsPrimary(lba, count, dest),
+// Returns false on a propagated read error — primary-disk twin of the
+// readSectorsSecondary BUG 2 contract below. Only NVMe reports failures;
+// ata/ahci stay void-returning and are wrapped as `true`. tarfs's bulk file
+// loads (the primary disk's only multi-sector reader) check this so a failed
+// read surfaces as a clean load failure instead of stale bytes served as
+// file content.
+pub fn readSectors(lba: u32, count: u16, dest: [*]u8) bool {
+    return switch (backend) {
+        .none => false,
+        .ata => blk: {
+            ata.readSectors(lba, count, dest);
+            break :blk true;
+        },
+        .ahci => blk: {
+            ahci.readSectorsPrimary(lba, count, dest);
+            break :blk true;
+        },
         .nvme => nvme.readSectorsPrimary(lba, count, dest),
-    }
+    };
 }
 
 pub fn readSectorSecondary(lba: u32, dest: [*]u8) void {

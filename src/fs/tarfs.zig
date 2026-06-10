@@ -288,7 +288,9 @@ pub fn loadFile(filename: []const u8, load_addr: []align(4) u8) ?usize {
         while (s < sectors) {
             const batch: u8 = @intCast(@min(sectors - s, 128));
             const dest_ptr: [*]u8 = @ptrFromInt(@intFromPtr(load_addr.ptr) + s * 512);
-            ata.readSectors(entry.data_lba + s, batch, dest_ptr);
+            // Propagate read failure (BUG 2 class): serving the unwritten
+            // load_addr bytes as file content is silent corruption.
+            if (!ata.readSectors(entry.data_lba + s, batch, dest_ptr)) return null;
             s += batch;
         }
         return entry.file_size;
@@ -309,7 +311,7 @@ pub fn loadFile(filename: []const u8, load_addr: []align(4) u8) ?usize {
             while (s < sectors) {
                 const batch: u8 = @intCast(@min(sectors - s, 128));
                 const dest_ptr: [*]u8 = @ptrFromInt(@intFromPtr(load_addr.ptr) + s * 512);
-                ata.readSectors(lba + 1 + s, batch, dest_ptr);
+                if (!ata.readSectors(lba + 1 + s, batch, dest_ptr)) return null;
                 s += batch;
             }
             return size;
