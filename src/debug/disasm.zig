@@ -19,6 +19,20 @@ const REG32 = [_][]const u8{
     "r8d", "r9d", "r10d", "r11d", "r12d", "r13d", "r14d", "r15d",
 };
 
+// 8-bit register names. The encoding splits on whether ANY REX prefix is
+// present: without REX, indices 4..7 are the legacy high-byte regs AH..BH
+// (and only 0..7 are reachable); with REX, 4..7 become SPL..DIL, 8..15 the
+// extended byte regs, and AH..BH are no longer addressable. reg8Name picks
+// the right table — getting this wrong would mislabel a byte access as a
+// dword one in a fault dump, the exact thing this decoder exists to clarify.
+const REG8_REX = [_][]const u8{
+    "al",  "cl",  "dl",   "bl",   "spl",  "bpl",  "sil",  "dil",
+    "r8b", "r9b", "r10b", "r11b", "r12b", "r13b", "r14b", "r15b",
+};
+const REG8_NOREX = [_][]const u8{
+    "al", "cl", "dl", "bl", "ah", "ch", "dh", "bh",
+};
+
 const State = struct {
     bytes: []const u8,
     pos: usize = 0,
@@ -26,6 +40,7 @@ const State = struct {
     rex_r: bool = false,
     rex_x: bool = false,
     rex_b: bool = false,
+    has_rex: bool = false,
 
     fn peek(s: *State) ?u8 {
         if (s.pos >= s.bytes.len) return null;
@@ -48,17 +63,28 @@ fn regIdx(rex_high_bit: bool, low3: u8) u4 {
     return idx;
 }
 
+/// 8-bit register name for `idx`, accounting for the REX-present split
+/// described on REG8_REX/REG8_NOREX. Without REX only 0..7 are reachable
+/// (regIdx can't set the high bit), so REG8_NOREX[idx & 7] is in-range.
+fn reg8Name(s: *const State, idx: u4) []const u8 {
+    return if (s.has_rex) REG8_REX[idx] else REG8_NOREX[idx & 7];
+}
+
 // Decode a ModR/M memory operand and write something like "[rsi+r8*8]" to the
 // serial. Consumes the ModR/M byte plus optional SIB and displacement.
-fn writeMemOperand(s: *State, modrm: u8) void {
+fn writeMemOperand(s: *State, modrm: u8, byte_op: bool) void {
     const mod: u2 = @intCast((modrm >> 6) & 3);
     const rm: u8 = modrm & 7;
-    const regs = s.regNames();
 
     if (mod == 3) {
-        // Register-direct, no memory.
+        // Register-direct, no memory. Operand size selects the table; memory
+        // operands below always use 64-bit address registers regardless.
         const r = regIdx(s.rex_b, rm);
-        serial.print("{s}", .{regs[r]});
+        if (byte_op) {
+            serial.print("{s}", .{reg8Name(s, r)});
+        } else {
+            serial.print("{s}", .{s.regNames()[r]});
+        }
         return;
     }
 
@@ -152,6 +178,7 @@ pub fn printOne(bytes: []const u8) void {
     // REX prefix.
     if (s.peek()) |b| {
         if (b >= 0x40 and b <= 0x4F) {
+            s.has_rex = true;
             s.rex_w = (b & 0x08) != 0;
             s.rex_r = (b & 0x04) != 0;
             s.rex_x = (b & 0x02) != 0;
@@ -166,28 +193,34 @@ pub fn printOne(bytes: []const u8) void {
     };
 
     switch (op) {
-        0x88, 0x89 => { // MOV r/m, r
+        0x88, 0x89 => { // MOV r/m, r  (0x88 = byte, 0x89 = word/dword/qword)
             const modrm = s.next() orelse {
                 serial.print("mov ??", .{});
                 return;
             };
-            const reg_low = (modrm >> 3) & 7;
-            const reg = regIdx(s.rex_r, reg_low);
-            const regs = s.regNames();
+            const byte_op = (op == 0x88);
+            const reg = regIdx(s.rex_r, (modrm >> 3) & 7);
             serial.print("mov ", .{});
-            writeMemOperand(&s, modrm);
-            serial.print(", {s}", .{regs[reg]});
+            writeMemOperand(&s, modrm, byte_op);
+            if (byte_op) {
+                serial.print(", {s}", .{reg8Name(&s, reg)});
+            } else {
+                serial.print(", {s}", .{s.regNames()[reg]});
+            }
         },
-        0x8A, 0x8B => { // MOV r, r/m
+        0x8A, 0x8B => { // MOV r, r/m  (0x8A = byte, 0x8B = word/dword/qword)
             const modrm = s.next() orelse {
                 serial.print("mov ??", .{});
                 return;
             };
-            const reg_low = (modrm >> 3) & 7;
-            const reg = regIdx(s.rex_r, reg_low);
-            const regs = s.regNames();
-            serial.print("mov {s}, ", .{regs[reg]});
-            writeMemOperand(&s, modrm);
+            const byte_op = (op == 0x8A);
+            const reg = regIdx(s.rex_r, (modrm >> 3) & 7);
+            if (byte_op) {
+                serial.print("mov {s}, ", .{reg8Name(&s, reg)});
+            } else {
+                serial.print("mov {s}, ", .{s.regNames()[reg]});
+            }
+            writeMemOperand(&s, modrm, byte_op);
         },
         0x3B => { // CMP r, r/m
             const modrm = s.next() orelse {
@@ -198,7 +231,7 @@ pub fn printOne(bytes: []const u8) void {
             const reg = regIdx(s.rex_r, reg_low);
             const regs = s.regNames();
             serial.print("cmp {s}, ", .{regs[reg]});
-            writeMemOperand(&s, modrm);
+            writeMemOperand(&s, modrm, false);
         },
         0x39 => { // CMP r/m, r
             const modrm = s.next() orelse {
@@ -209,7 +242,7 @@ pub fn printOne(bytes: []const u8) void {
             const reg = regIdx(s.rex_r, reg_low);
             const regs = s.regNames();
             serial.print("cmp ", .{});
-            writeMemOperand(&s, modrm);
+            writeMemOperand(&s, modrm, false);
             serial.print(", {s}", .{regs[reg]});
         },
         0x83 => { // ALU r/m, imm8 — sub-op encoded in ModR/M.reg
@@ -228,7 +261,7 @@ pub fn printOne(bytes: []const u8) void {
                 else => "??",
             };
             serial.print("{s} ", .{name});
-            writeMemOperand(&s, modrm);
+            writeMemOperand(&s, modrm, false);
             const imm = s.next() orelse 0;
             serial.print(", 0x{X}", .{imm});
         },
@@ -245,7 +278,7 @@ pub fn printOne(bytes: []const u8) void {
                 else => "??",
             };
             serial.print("{s} ", .{name});
-            writeMemOperand(&s, modrm);
+            writeMemOperand(&s, modrm, false);
         },
         0xE8 => serial.print("call rel32", .{}),
         0xE9 => serial.print("jmp rel32", .{}),
