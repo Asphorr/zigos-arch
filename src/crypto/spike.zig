@@ -9,8 +9,9 @@
 //
 // Validates against known RFC test vectors:
 //   SHA-256        — NIST FIPS 180-4, "abc"
-//   ChaCha20-Poly1305 — RFC 7539 §2.8.2
-//   X25519        — RFC 7748 §6.1 (Alice's keypair: sk=09… → expected pk)
+//   ChaCha20-Poly1305 — RFC 7539 §2.8.2 (ciphertext + tag + decrypt round-trip)
+//   X25519        — RFC 7748 §6.1 (sk=77… × basepoint(9) → Alice's pk, plus
+//                   the full Alice/Bob DH exchange agreeing on shared K)
 
 const std = @import("std");
 const debug = @import("../debug/debug.zig");
@@ -64,6 +65,24 @@ fn testChaCha20Poly1305() bool {
     var tag: [16]u8 = undefined;
     ChaCha20Poly1305.encrypt(&ciphertext, &tag, plaintext, &aad, nonce, key);
 
+    // Full RFC 7539 §2.8.2 expected ciphertext (114 bytes). The tag alone
+    // would transitively cover it (Poly1305 runs over the ciphertext), but
+    // a conformance spike should check the spec's bytes literally.
+    const expected_ct =
+        "d31a8d34648e60db7b86afbc53ef7ec2" ++
+        "a4aded51296e08fea9e2b5a736ee62d6" ++
+        "3dbea45e8ca9671282fafb69da92728b" ++
+        "1a71de0a9e060b2905d6a5b67ecd3b36" ++
+        "92ddbd7f2d778b8c9803aee328091b58" ++
+        "fab324e4fad675945585808b4831d7bc" ++
+        "3ff4def08e4b7a9de576d26586cec64b" ++
+        "6116";
+    if (!hexEqual(&ciphertext, expected_ct)) {
+        klogHex("chacha20-poly1305 ct", &ciphertext);
+        debug.klog("[crypto] ciphertext mismatch vs RFC 7539 §2.8.2\n", .{});
+        return false;
+    }
+
     klogHex("chacha20-poly1305 tag", &tag);
     const expected_tag = "1ae10b594f09e26a7e902ecbd0600691";
     if (!hexEqual(&tag, expected_tag)) {
@@ -83,9 +102,13 @@ fn testChaCha20Poly1305() bool {
     return true;
 }
 
-/// Test X25519 with the RFC 7748 §6.1 first-step keypair. Alice's
-/// secret key 0x77…2a should derive the public key 0x85…4a from the
-/// basepoint.
+/// Test X25519 with the full RFC 7748 §6.1 vector set. Both pubkeys
+/// recover from their secret keys (scalarmult by the basepoint), then the
+/// two sides of the DH exchange — scalarmult(alice_sk, bob_pk) and
+/// scalarmult(bob_sk, alice_pk) — must agree on the spec's shared K.
+/// The DH step is what TLS actually performs (arbitrary peer point, a
+/// different code path than fixed-base pubkey recovery), so the spike
+/// exercises it explicitly instead of inferring it.
 fn testX25519() bool {
     const alice_sk = [_]u8{
         0x77, 0x07, 0x6d, 0x0a, 0x73, 0x18, 0xa5, 0x7d,
@@ -93,14 +116,52 @@ fn testX25519() bool {
         0xdf, 0x4c, 0x2f, 0x87, 0xeb, 0xc0, 0x99, 0x2a,
         0xb1, 0x77, 0xfb, 0xa5, 0x1d, 0xb9, 0x2c, 0x2a,
     };
-    const expected_pk = "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a";
+    const expected_alice_pk = "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a";
+    const bob_sk = [_]u8{
+        0x5d, 0xab, 0x08, 0x7e, 0x62, 0x4a, 0x8a, 0x4b,
+        0x79, 0xe1, 0x7f, 0x8b, 0x83, 0x80, 0x0e, 0xe6,
+        0x6f, 0x3b, 0xb1, 0x29, 0x26, 0x18, 0xb6, 0xfd,
+        0x1c, 0x2f, 0x8b, 0x27, 0xff, 0x88, 0xe0, 0xeb,
+    };
+    const expected_bob_pk = "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f";
+    const expected_shared = "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742";
 
-    const pk = X25519.recoverPublicKey(alice_sk) catch |e| {
-        debug.klog("[crypto] X25519.recoverPublicKey FAILED: {s}\n", .{@errorName(e)});
+    const alice_pk = X25519.recoverPublicKey(alice_sk) catch |e| {
+        debug.klog("[crypto] X25519.recoverPublicKey(alice) FAILED: {s}\n", .{@errorName(e)});
         return false;
     };
-    klogHex("X25519 alice pubkey", &pk);
-    return hexEqual(&pk, expected_pk);
+    klogHex("X25519 alice pubkey", &alice_pk);
+    if (!hexEqual(&alice_pk, expected_alice_pk)) return false;
+
+    const bob_pk = X25519.recoverPublicKey(bob_sk) catch |e| {
+        debug.klog("[crypto] X25519.recoverPublicKey(bob) FAILED: {s}\n", .{@errorName(e)});
+        return false;
+    };
+    if (!hexEqual(&bob_pk, expected_bob_pk)) {
+        klogHex("X25519 bob pubkey", &bob_pk);
+        debug.klog("[crypto] bob pubkey mismatch vs RFC 7748 §6.1\n", .{});
+        return false;
+    }
+
+    // DH exchange: both directions must derive the spec's K.
+    const k_ab = X25519.scalarmult(alice_sk, bob_pk) catch |e| {
+        debug.klog("[crypto] X25519.scalarmult(alice_sk, bob_pk) FAILED: {s}\n", .{@errorName(e)});
+        return false;
+    };
+    const k_ba = X25519.scalarmult(bob_sk, alice_pk) catch |e| {
+        debug.klog("[crypto] X25519.scalarmult(bob_sk, alice_pk) FAILED: {s}\n", .{@errorName(e)});
+        return false;
+    };
+    klogHex("X25519 shared K", &k_ab);
+    if (!hexEqual(&k_ab, expected_shared)) {
+        debug.klog("[crypto] shared secret mismatch vs RFC 7748 §6.1\n", .{});
+        return false;
+    }
+    if (!std.mem.eql(u8, &k_ab, &k_ba)) {
+        debug.klog("[crypto] DH asymmetry: alice·bob_pk != bob·alice_pk\n", .{});
+        return false;
+    }
+    return true;
 }
 
 /// Run all three tests. Each prints its result; the final summary
