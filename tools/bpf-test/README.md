@@ -23,16 +23,25 @@ net-test no stub tree is needed: `run.sh` copies the two live sources and
 |-------|-----------------|
 | ALU | wrapping arith, 32-bit zero-extension, shift masking, RFC div/mod-by-zero, signed div/mod incl. INT_MIN/-1, MOVSX, endian + v4 BSWAP |
 | control flow | signed/unsigned compares (JMP + JMP32 lanes), JSET, real backward-jump loops, v4 long-JA, fall-off-end and out-of-range jumps rejected |
-| memory | stack roundtrips at all sizes, sign-extending loads, per-run stack zeroing, every out-of-stack access (incl. a live host address in r1) → `error.OutOfBounds` |
+| memory | stack roundtrips at all sizes, sign-extending loads, per-run stack zeroing, every out-of-window access (incl. a live host address in r1 with no region) → `error.OutOfBounds` |
+| regions (M2) | ctx structs readable via registered windows, read-only enforcement on stores, boundary-straddling accesses rejected, writable regions visible to the host |
+| helpers (M2) | r1–r5 arrive as args / r0 takes the result, null-slot + out-of-range ids + bpf-to-bpf calls → `error.BadHelperId`, the in-kernel syscall-counter program byte-for-byte against a fake ctx |
 | fuel | infinite loop → `error.TimeLimit`, step accounting |
-| malformed input | garbage opcodes, truncated `LD_IMM64`, calls/atomics/legacy packet modes (deferred features) → clean errors |
+| malformed input | garbage opcodes, truncated `LD_IMM64`, atomics/legacy packet modes → clean errors |
 
-## Deliberate M1 limits (the roadmap, not bugs)
+## In the kernel since M2
 
-* **No helpers, no maps, no context regions** — M2 wires kernel hooks and
-  defines the helper ABI; r1 is an opaque scalar until then.
-* **No verifier** — M3. Until then the interpreter double-checks everything
-  at runtime (and will keep doing so afterwards: defence in depth).
+`src/bpf/kernel.zig` attaches the builtin counter program (assembled from
+the same insn.zig builders this harness uses) at syscall entry: per-pid
+counts land in a map read back at **`/proc/bpf`**. The hook runs outside
+the `[perf] sys#` window and swallows program errors into a counter —
+observation never breaks the observed.
+
+## Deliberate limits (the roadmap, not bugs)
+
+* **No verifier** — M3 (and with it userspace program loading). Until then
+  only the builtin program runs, and the interpreter double-checks
+  everything at runtime (it will keep doing so afterwards: defence in depth).
 * **No atomics / bpf-to-bpf calls / JIT** — later, if ever needed.
 * r10 writability and read-before-write are verifier-class checks (the
   runtime sandbox makes them harmless meanwhile: a clobbered r10 still

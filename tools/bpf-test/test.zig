@@ -465,14 +465,6 @@ test "fuel is accounted" {
     try expectEqual(@as(u64, 2), res.steps);
 }
 
-test "calls are cleanly rejected until M2" {
-    const prog = [_]i.Insn{
-        i.call(1),
-        i.exit(),
-    };
-    try expectError(error.UnknownOpcode, run(&prog));
-}
-
 test "atomics and legacy packet loads are cleanly rejected" {
     var atomic = i.stx(.w, 10, 1, -4);
     atomic.opcode = i.MODE_ATOMIC | @intFromEnum(i.Size.w) | i.CLASS_STX;
@@ -510,6 +502,177 @@ test "garbage opcode is UnknownOpcode" {
         i.exit(),
     };
     try expectError(error.UnknownOpcode, run(&prog));
+}
+
+// === M2: regions (real ctx structs) + helper calls ===
+
+test "ctx region: program reads a real struct's fields" {
+    const Ctx = extern struct { nr: u64, pid: u64 };
+    var ctx = Ctx{ .nr = 7, .pid = 42 };
+    const prog = [_]i.Insn{
+        i.ldx(.dw, 2, 1, 0), // r2 = ctx->nr
+        i.ldx(.dw, 0, 1, 8), // r0 = ctx->pid
+        i.alu64Reg(.add, 0, 2), // r0 = pid + nr
+        i.exit(),
+    };
+    var vm = bpf.Vm{};
+    const env = bpf.Env{
+        .regions = &[_]bpf.Region{
+            .{ .base = @intFromPtr(&ctx), .len = @sizeOf(Ctx) },
+        },
+    };
+    const res = try vm.runEnv(&prog, @intFromPtr(&ctx), FUEL, env);
+    try expectEqual(@as(u64, 49), res.r0);
+}
+
+test "ctx region is read-only: store into it is OutOfBounds" {
+    var ctx: u64 = 7;
+    const prog = [_]i.Insn{
+        i.st(.dw, 1, 0, 99),
+        i.exit(),
+    };
+    var vm = bpf.Vm{};
+    const env = bpf.Env{
+        .regions = &[_]bpf.Region{
+            .{ .base = @intFromPtr(&ctx), .len = 8, .writable = false },
+        },
+    };
+    try expectError(error.OutOfBounds, vm.runEnv(&prog, @intFromPtr(&ctx), FUEL, env));
+    try expectEqual(@as(u64, 7), ctx); // untouched
+}
+
+test "writable region: program output lands in host memory" {
+    var out: u64 = 0;
+    const prog = [_]i.Insn{
+        i.st(.dw, 1, 0, 1234),
+        i.mov64Imm(0, 0),
+        i.exit(),
+    };
+    var vm = bpf.Vm{};
+    const env = bpf.Env{
+        .regions = &[_]bpf.Region{
+            .{ .base = @intFromPtr(&out), .len = 8, .writable = true },
+        },
+    };
+    _ = try vm.runEnv(&prog, @intFromPtr(&out), FUEL, env);
+    try expectEqual(@as(u64, 1234), out);
+}
+
+test "region edges: access straddling a region boundary is OutOfBounds" {
+    var ctx: [8]u8 = undefined;
+    const prog = [_]i.Insn{
+        i.ldx(.dw, 0, 1, 4), // 8-byte read at +4 of an 8-byte region
+        i.exit(),
+    };
+    var vm = bpf.Vm{};
+    const env = bpf.Env{
+        .regions = &[_]bpf.Region{
+            .{ .base = @intFromPtr(&ctx), .len = ctx.len },
+        },
+    };
+    try expectError(error.OutOfBounds, vm.runEnv(&prog, @intFromPtr(&ctx), FUEL, env));
+}
+
+// Helper-call scaffolding: module-level state because HelperFn is a plain
+// fn pointer (no closure ctx) — exactly the constraint kernel helpers have.
+var helper_log: [5]u64 = undefined;
+fn helperRecordArgs(a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) u64 {
+    helper_log = .{ a1, a2, a3, a4, a5 };
+    return a1 + a2 + a3 + a4 + a5;
+}
+var counter_slots: [4]u64 = [_]u64{0} ** 4;
+fn helperCount(idx: u64, _: u64, _: u64, _: u64, _: u64) u64 {
+    if (idx >= counter_slots.len) return 1; // helper validates its own args
+    counter_slots[@intCast(idx)] += 1;
+    return 0;
+}
+const TEST_HELPERS = [_]?bpf.HelperFn{
+    null, // id 0 reserved — must reject
+    helperRecordArgs, // 1
+    helperCount, // 2
+};
+
+test "helper call: r1-r5 arrive as args, result lands in r0" {
+    const prog = [_]i.Insn{
+        i.mov64Imm(1, 10),
+        i.mov64Imm(2, 20),
+        i.mov64Imm(3, 30),
+        i.mov64Imm(4, 40),
+        i.mov64Imm(5, 50),
+        i.call(1),
+        i.exit(),
+    };
+    var vm = bpf.Vm{};
+    const res = try vm.runEnv(&prog, 0, FUEL, .{ .helpers = &TEST_HELPERS });
+    try expectEqual(@as(u64, 150), res.r0);
+    try expectEqual(@as(u64, 10), helper_log[0]);
+    try expectEqual(@as(u64, 50), helper_log[4]);
+}
+
+test "helper id misuse: null slot, out-of-range id, bpf-to-bpf call" {
+    var vm = bpf.Vm{};
+
+    const null_slot = [_]i.Insn{ i.call(0), i.exit() };
+    try expectError(error.BadHelperId, vm.runEnv(&null_slot, 0, FUEL, .{ .helpers = &TEST_HELPERS }));
+
+    const oob = [_]i.Insn{ i.call(99), i.exit() };
+    try expectError(error.BadHelperId, vm.runEnv(&oob, 0, FUEL, .{ .helpers = &TEST_HELPERS }));
+
+    var local = i.call(1);
+    local.regs = 1 << 4; // src=1: bpf-to-bpf call — not supported yet
+    const l_prog = [_]i.Insn{ local, i.exit() };
+    _ = &local;
+    try expectError(error.BadHelperId, vm.runEnv(&l_prog, 0, FUEL, .{ .helpers = &TEST_HELPERS }));
+
+    // And with NO env at all (the M1 wrappers), any call must reject.
+    const m1 = [_]i.Insn{ i.call(1), i.exit() };
+    try expectError(error.BadHelperId, vm.run(&m1, 0, FUEL));
+}
+
+test "end-to-end M2 shape: the syscall-counter program against a fake ctx" {
+    // Byte-for-byte the program bpf/kernel.zig attaches at syscall entry,
+    // driven here against a fake context + the counting helper above.
+    const Ctx = extern struct { nr: u64, pid: u64 };
+    const prog = [_]i.Insn{
+        i.ldx(.dw, 2, 1, 0), // r2 = ctx->nr
+        i.ldx(.dw, 1, 1, 8), // r1 = ctx->pid
+        i.call(2), // count(pid)
+        i.mov64Imm(0, 0),
+        i.exit(),
+    };
+    counter_slots = [_]u64{0} ** 4;
+
+    var vm = bpf.Vm{};
+    var pid: u64 = 0;
+    while (pid < 3) : (pid += 1) {
+        var reps: u64 = 0;
+        while (reps < pid + 1) : (reps += 1) {
+            var ctx = Ctx{ .nr = 8, .pid = pid };
+            const env = bpf.Env{
+                .regions = &[_]bpf.Region{
+                    .{ .base = @intFromPtr(&ctx), .len = @sizeOf(Ctx) },
+                },
+                .helpers = &TEST_HELPERS,
+            };
+            const res = try vm.runEnv(&prog, @intFromPtr(&ctx), FUEL, env);
+            try expectEqual(@as(u64, 0), res.r0);
+        }
+    }
+    try expectEqual(@as(u64, 1), counter_slots[0]);
+    try expectEqual(@as(u64, 2), counter_slots[1]);
+    try expectEqual(@as(u64, 3), counter_slots[2]);
+
+    // A pid the helper must refuse: returns 1, counts untouched.
+    var ctx = Ctx{ .nr = 8, .pid = 9999 };
+    const env = bpf.Env{
+        .regions = &[_]bpf.Region{
+            .{ .base = @intFromPtr(&ctx), .len = @sizeOf(Ctx) },
+        },
+        .helpers = &TEST_HELPERS,
+    };
+    const res = try vm.runEnv(&prog, @intFromPtr(&ctx), FUEL, env);
+    try expectEqual(@as(u64, 0), res.r0); // program ignores helper rc; map just doesn't move
+    try expectEqual(@as(u64, 1), counter_slots[0]);
 }
 
 // === a real program: fizzbuzz-style classification, end to end ===

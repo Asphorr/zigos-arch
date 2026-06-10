@@ -86,6 +86,12 @@ export fn doSyscall(sys_num: u32, arg1: u32, arg2: u32, arg3: u32, frame_raw: *a
             debug.klog("[sc] PID={d} sys#{d}\n", .{ cur_pid, sys_num });
         }
     }
+    // zBPF syscall-entry hook: runs the attached program (sandboxed,
+    // fuel-bounded — see bpf/kernel.zig's safety story) with {nr, pid} as
+    // its context. Deliberately BEFORE perf.enter so interpreter cycles
+    // never pollute the [perf] sys# table the perf rounds are tuned on.
+    @import("../bpf/kernel.zig").onSyscallEnter(sys_num);
+
     const t_enter = perf.enter();
     // Reset per-syscall phase tracker. Instrumented hot paths (validateUserPtr,
     // virtio_gpu wait, vfs read, ...) accumulate cycles into named phases;

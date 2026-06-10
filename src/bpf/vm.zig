@@ -9,13 +9,15 @@
 //! interpreter keeps them — defence in depth, and the off-target harness leans
 //! on them to assert "this malformed program is rejected, not crashing."
 //!
-//! Memory model (M1): a program sees exactly ONE writable region — its own
-//! 512-byte stack, addressed through r10 (the read-only frame pointer, which
-//! starts at stack-top). Context pointers and maps arrive in M2; until then
-//! r1 is loaded with the caller-supplied `ctx` scalar but there is no region
-//! it may dereference, so any load/store outside the stack is EACCES. This is
-//! the smallest possible sandbox that still runs real arithmetic/branch logic
-//! — and it cannot touch kernel memory by construction.
+//! Memory model: a program may touch its own 512-byte stack (always RW,
+//! addressed through r10 — the read-only frame pointer, which starts at
+//! stack-top) plus whatever `Env.regions` the embedder registers (M2: the
+//! hook's read-only context struct; later: map values, packet buffers).
+//! Every access funnels through one chokepoint (checkMem); anything outside
+//! the declared windows is error.OutOfBounds before a pointer is formed.
+//! With an empty Env (the M1 `run` wrapper) the sandbox cannot touch kernel
+//! memory by construction. CALL dispatches into the embedder's helper table
+//! — helpers are trusted native kernel code and validate their own args.
 //!
 //! Execution bound: every step decrements a fuel counter (`max_insns`). A
 //! program that loops forever halts with error.TimeLimit instead of hanging
@@ -29,8 +31,11 @@ const Insn = insn.Insn;
 pub const Error = error{
     /// Ran past max_insns — possible infinite loop.
     TimeLimit,
-    /// Memory access outside the program stack (or any non-stack region in M1).
+    /// Memory access outside the program stack / registered regions.
     OutOfBounds,
+    /// CALL with an id the embedder didn't register (or a call flavor —
+    /// bpf-to-bpf, runtime fn — that doesn't exist yet).
+    BadHelperId,
     /// Divide or modulo by zero (eBPF defines these as producing 0/dst, but we
     /// surface it so the harness can distinguish; runStrict treats it as fatal).
     DivideByZero,
@@ -51,6 +56,29 @@ pub const RunResult = struct {
     steps: u64,
 };
 
+/// A memory window the program may dereference, on top of its own stack.
+/// M2 uses one read-only region for the hook context struct; maps and
+/// packet buffers arrive as further regions later. Regions are the
+/// embedder's assertion of safety — the VM only enforces the bounds.
+pub const Region = struct {
+    base: usize,
+    len: usize,
+    writable: bool = false,
+};
+
+/// Kernel helper, eBPF calling convention: args in r1..r5, result to r0.
+/// Runs NATIVE — a helper is trusted kernel code and must do its own
+/// argument validation (the program controls all five values).
+pub const HelperFn = *const fn (u64, u64, u64, u64, u64) u64;
+
+/// Embedder-supplied execution environment. `helpers` is indexed by the
+/// CALL immediate; null slots are unregistered ids. Defaults reproduce the
+/// M1 sandbox exactly: no regions, no helpers.
+pub const Env = struct {
+    regions: []const Region = &.{},
+    helpers: []const ?HelperFn = &.{},
+};
+
 pub const Vm = struct {
     regs: [insn.NUM_REGS]u64 = [_]u64{0} ** insn.NUM_REGS,
     stack: [insn.STACK_SIZE]u8 align(8) = undefined,
@@ -62,17 +90,23 @@ pub const Vm = struct {
     /// yields the dividend, and execution CONTINUES. We follow the spec here so
     /// real clang output runs unmodified; `runStrict` is the fail-fast variant.
     pub fn run(self: *Vm, prog: []const Insn, ctx: u64, fuel: u64) Error!RunResult {
-        return self.runImpl(prog, ctx, fuel, false);
+        return self.runImpl(prog, ctx, fuel, .{}, false);
     }
 
     /// Like `run`, but div/mod by zero is a fatal error.DivideByZero instead of
     /// the spec's continue-with-0. Used by tests that want to assert a program
     /// never divides by zero.
     pub fn runStrict(self: *Vm, prog: []const Insn, ctx: u64, fuel: u64) Error!RunResult {
-        return self.runImpl(prog, ctx, fuel, true);
+        return self.runImpl(prog, ctx, fuel, .{}, true);
     }
 
-    fn runImpl(self: *Vm, prog: []const Insn, ctx: u64, fuel: u64, strict_div: bool) Error!RunResult {
+    /// Full-environment variant: registered memory regions + helper table.
+    /// This is the entry point kernel hooks use (M2+).
+    pub fn runEnv(self: *Vm, prog: []const Insn, ctx: u64, fuel: u64, env: Env) Error!RunResult {
+        return self.runImpl(prog, ctx, fuel, env, false);
+    }
+
+    fn runImpl(self: *Vm, prog: []const Insn, ctx: u64, fuel: u64, env: Env, strict_div: bool) Error!RunResult {
         if (prog.len == 0 or prog.len > insn.MAX_INSNS) return error.BadProgram;
 
         // Reset architectural state. r10 = read-only frame pointer at stack top.
@@ -108,9 +142,17 @@ pub const Vm = struct {
                         return .{ .r0 = self.regs[0], .steps = steps };
                     }
                     if (op == @intFromEnum(insn.JmpCode.call)) {
-                        // Helpers/sub-calls arrive in M2. For now a call is a
-                        // clean rejection, not a crash.
-                        return error.UnknownOpcode;
+                        // src=0: helper call by id (the only flavor we run).
+                        // src=1 bpf-to-bpf and src=2 runtime-fn need verifier
+                        // -era machinery — clean rejection until then.
+                        if (i.src() != 0) return error.BadHelperId;
+                        const id = i.imm;
+                        if (id < 0 or @as(usize, @intCast(id)) >= env.helpers.len)
+                            return error.BadHelperId;
+                        const h = env.helpers[@intCast(id)] orelse return error.BadHelperId;
+                        self.regs[0] = h(self.regs[1], self.regs[2], self.regs[3], self.regs[4], self.regs[5]);
+                        pc += 1;
+                        continue;
                     }
                     // JA: CLASS_JMP uses the 16-bit offset; CLASS_JMP32 long-JA
                     // (v4) uses the 32-bit imm.
@@ -127,11 +169,11 @@ pub const Vm = struct {
                     }
                 },
                 insn.CLASS_LDX => {
-                    try self.execLoad(i);
+                    try self.execLoad(i, env);
                     pc += 1;
                 },
                 insn.CLASS_ST, insn.CLASS_STX => {
-                    try self.execStore(i, class == insn.CLASS_STX);
+                    try self.execStore(i, env, class == insn.CLASS_STX);
                     pc += 1;
                 },
                 insn.CLASS_LD => {
@@ -247,52 +289,64 @@ pub const Vm = struct {
     }
 
     // --- memory load: dst = *(size *)(src + off) ---
-    fn execLoad(self: *Vm, i: Insn) Error!void {
+    fn execLoad(self: *Vm, i: Insn, env: Env) Error!void {
         const size: insn.Size = @enumFromInt(i.opcode & 0x18);
         const mode = i.opcode & 0xe0;
         if (mode != insn.MODE_MEM and mode != insn.MODE_MEMSX) return error.UnknownOpcode;
 
         const addr = self.regs[i.src()] +% @as(u64, @bitCast(@as(i64, i.offset)));
         const n = size.bytes();
-        const off = try self.checkStack(addr, n);
+        try self.checkMem(env, addr, n, false);
 
-        var val: u64 = 0;
-        var b: u64 = 0;
-        while (b < n) : (b += 1) {
-            val |= @as(u64, self.stack[off + b]) << @intCast(b * 8);
-        }
+        var val: u64 = switch (size) {
+            .b => @as(*align(1) const u8, @ptrFromInt(@as(usize, @intCast(addr)))).*,
+            .h => @as(*align(1) const u16, @ptrFromInt(@as(usize, @intCast(addr)))).*,
+            .w => @as(*align(1) const u32, @ptrFromInt(@as(usize, @intCast(addr)))).*,
+            .dw => @as(*align(1) const u64, @ptrFromInt(@as(usize, @intCast(addr)))).*,
+        };
         if (mode == insn.MODE_MEMSX) val = signExtend(val, n);
         self.regs[i.dst()] = val;
     }
 
     // --- memory store: *(size *)(dst + off) = (src reg | imm) ---
-    fn execStore(self: *Vm, i: Insn, from_reg: bool) Error!void {
+    fn execStore(self: *Vm, i: Insn, env: Env, from_reg: bool) Error!void {
         const size: insn.Size = @enumFromInt(i.opcode & 0x18);
         const mode = i.opcode & 0xe0;
-        if (mode == insn.MODE_ATOMIC) return error.UnknownOpcode; // M2+
+        if (mode == insn.MODE_ATOMIC) return error.UnknownOpcode; // M3+
         if (mode != insn.MODE_MEM) return error.UnknownOpcode;
 
         const addr = self.regs[i.dst()] +% @as(u64, @bitCast(@as(i64, i.offset)));
         const n = size.bytes();
-        const off = try self.checkStack(addr, n);
+        try self.checkMem(env, addr, n, true);
 
         const val: u64 = if (from_reg) self.regs[i.src()] else @as(u64, @bitCast(@as(i64, i.imm)));
-        var b: u64 = 0;
-        while (b < n) : (b += 1) {
-            self.stack[off + b] = @truncate(val >> @intCast(b * 8));
+        switch (size) {
+            .b => @as(*align(1) u8, @ptrFromInt(@as(usize, @intCast(addr)))).* = @truncate(val),
+            .h => @as(*align(1) u16, @ptrFromInt(@as(usize, @intCast(addr)))).* = @truncate(val),
+            .w => @as(*align(1) u32, @ptrFromInt(@as(usize, @intCast(addr)))).* = @truncate(val),
+            .dw => @as(*align(1) u64, @ptrFromInt(@as(usize, @intCast(addr)))).* = val,
         }
     }
 
-    /// Map an absolute address to a stack byte-offset, or fail. This is the
-    /// single chokepoint that confines all program memory access to the
-    /// program's own stack — the M1 sandbox boundary.
-    fn checkStack(self: *Vm, addr: u64, n: u64) Error!usize {
-        const base = @intFromPtr(&self.stack);
-        if (addr < base) return error.OutOfBounds;
-        const off = addr - base;
-        // off + n must not overflow and must stay within the stack.
-        if (off > insn.STACK_SIZE or n > insn.STACK_SIZE - off) return error.OutOfBounds;
-        return @intCast(off);
+    /// THE sandbox chokepoint: every program memory access — load or store —
+    /// must fall entirely inside the program's own stack or one of the
+    /// embedder's registered regions (writable for stores). Anything else is
+    /// error.OutOfBounds before any pointer is formed.
+    fn checkMem(self: *Vm, env: Env, addr: u64, n: u64, write: bool) Error!void {
+        // usize round-trip guard: on x86_64 usize == u64, but be explicit
+        // that a wrapped addr+offset can't sneak past via truncation.
+        if (addr > std.math.maxInt(usize)) return error.OutOfBounds;
+
+        const stack_base = @intFromPtr(&self.stack);
+        if (regionContains(stack_base, insn.STACK_SIZE, addr, n)) return; // stack: always RW
+
+        for (env.regions) |r| {
+            if (regionContains(r.base, r.len, addr, n)) {
+                if (write and !r.writable) return error.OutOfBounds;
+                return;
+            }
+        }
+        return error.OutOfBounds;
     }
 
     fn evalBranch(self: *Vm, i: Insn, is32: bool) bool {
@@ -326,6 +380,14 @@ pub const Vm = struct {
 };
 
 // === pure helpers ===
+
+/// [base, base+len) fully contains [addr, addr+n)? Overflow-safe: the
+/// subtraction form never computes addr+n.
+fn regionContains(base: usize, len: usize, addr: u64, n: u64) bool {
+    if (addr < base) return false;
+    const off = addr - base;
+    return off <= len and n <= len - off;
+}
 
 fn pick(is64: bool, to_be: bool, host_is_le: bool, native: u64, swapped: u64) u64 {
     if (is64) return swapped; // ALU64 bswap is unconditional

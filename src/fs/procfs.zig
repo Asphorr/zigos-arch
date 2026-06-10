@@ -48,6 +48,7 @@ pub const Kind = enum(u8) {
     net_sock,
     net_arp,
     pcid_stats,
+    bpf,
     pid_cmdline,
     pid_status,
 };
@@ -70,6 +71,7 @@ const STATIC_FILES = [_]StaticFile{
     .{ .name = "netsock", .kind = .net_sock },
     .{ .name = "netarp", .kind = .net_arp },
     .{ .name = "pcid_stats", .kind = .pcid_stats },
+    .{ .name = "bpf", .kind = .bpf },
 };
 
 const PER_PID_FILES = [_]StaticFile{
@@ -145,6 +147,7 @@ pub fn read(inode: u32, offset: u32, buf: [*]u8, count: u32) u32 {
         .net_sock => net.renderProcSock(rendered),
         .net_arp => net.renderProcArp(rendered),
         .pcid_stats => renderPcidStats(rendered),
+        .bpf => @import("../bpf/kernel.zig").renderProc(rendered),
         .pid_cmdline => renderPidCmdline(pid, rendered),
         .pid_status => renderPidStatus(pid, rendered),
     };
