@@ -1,11 +1,12 @@
-// Top-right toast notification — slide-in from the right edge, brief
-// glass pill with a single line of text. One toast at a time; a new
-// `show()` call replaces whatever was there.
+// Top-right toast notification — slides in from the right edge, holds,
+// then slides back out. Brief glass pill with a single line of text.
+// One toast at a time; a new `show()` call replaces whatever was there.
 //
 // Lifecycle: `show()` queues text + resets timer/anim. The desktop
-// main loop calls `tick()` once per frame, which decrements the
-// timer and advances the slide-in. `render()` draws the current
-// frame's glass pill at the eased-in position.
+// main loop calls `tick()` once per frame, which advances the slide-in,
+// counts the hold timer down, then drives the slide-out over the final
+// ANIM_FRAMES. `render()` draws the current frame's glass pill at the
+// eased position — ease-out on the way in, ease-in on the way out.
 //
 // Width estimate uses 9 px / char (matches the legacy bitmap font's
 // advance) plus 32 px horizontal padding — close enough for SF Pro
@@ -37,13 +38,14 @@ pub fn show(text: []const u8) void {
 }
 
 /// True iff a toast is currently on screen. Desktop's idle-yield logic
-/// uses this to keep ticking while the slide-in / fade-out plays.
+/// uses this to keep ticking while the slide-in / slide-out plays.
 pub fn isActive() bool {
     return timer > 0;
 }
 
 /// Per-frame timer/anim advance. Returns true iff the desktop must
-/// schedule a full repaint (slide-in step or final fade-out).
+/// schedule a full repaint (a slide-in step, a slide-out step, or the
+/// final clear when the pill leaves the screen).
 pub fn tick() bool {
     if (timer == 0) return false;
     var dirty = false;
@@ -52,7 +54,11 @@ pub fn tick() bool {
         dirty = true;
     }
     timer -= 1;
-    if (timer == 0) dirty = true;
+    // The final ANIM_FRAMES of life are the slide-out (plus the timer==0
+    // frame, where render() draws nothing and the desktop's force-full
+    // repaint clears the pixels). Repaint every one of those frames so the
+    // pill animates off-screen instead of hard-cutting.
+    if (timer <= ANIM_FRAMES) dirty = true;
     return dirty;
 }
 
@@ -61,15 +67,24 @@ pub fn render() void {
     const toast_w: u32 = @as(u32, text_len) * FONT_ADVANCE + 32;
     const toast_y: i32 = @as(i32, layout.MENUBAR_H) + MARGIN;
 
-    // Slide-in from right edge with quadratic ease-out.
+    // `full_x` = resting position; `off_x` = distance from rest to fully
+    // off-screen past the right edge. The pill eases between the two.
     const full_x: i32 = @as(i32, @intCast(gfx.screen_w)) - @as(i32, @intCast(toast_w)) - MARGIN;
     const off_x: i32 = @as(i32, @intCast(toast_w)) + MARGIN;
+    const total: i32 = ANIM_FRAMES;
     var toast_x: i32 = full_x;
     if (anim < ANIM_FRAMES) {
+        // Slide-in from the right edge with quadratic ease-out.
         const t: i32 = @intCast(anim);
-        const total: i32 = ANIM_FRAMES;
         const progress = total - @divTrunc((total - t) * (total - t), total);
         toast_x = full_x + off_x - @divTrunc(off_x * progress, total);
+    } else if (timer <= ANIM_FRAMES) {
+        // Slide-out back off the right edge with quadratic ease-in — the
+        // mirror of the slide-in. `timer` counts ANIM_FRAMES..1 across the
+        // exit, so t = ANIM_FRAMES - timer ramps 0..ANIM_FRAMES-1.
+        const t: i32 = total - @as(i32, @intCast(timer));
+        const progress = @divTrunc(t * t, total);
+        toast_x = full_x + @divTrunc(off_x * progress, total);
     }
 
     // Track the painted region so partial-blit paths flush this strip.

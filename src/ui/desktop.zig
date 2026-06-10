@@ -2941,7 +2941,7 @@ pub fn run() void {
         if (toast.tick()) dirty_rects_mod.force_full_kind = true;
         // Toast keeps animating until its timer drains — request a
         // self-wake so the next tick brings us back to advance the
-        // slide-in / fade-out. ~2 ticks (~50 Hz) is plenty for a 200-
+        // slide-in / slide-out. ~2 ticks (~50 Hz) is plenty for a 200-
         // frame countdown; 1 tick would be 100 Hz, more than needed.
         if (toast.isActive()) wake.requestSelfWake(process.tick_count + 2);
 
