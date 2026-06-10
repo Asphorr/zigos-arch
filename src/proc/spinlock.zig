@@ -44,16 +44,34 @@ pub const SpinLock = struct {
     /// holder (cpu + ra). Long spin = almost always a missing release
     /// or a cross-CPU deadlock; the log line is enough for symbols.zig
     /// to resolve both ends.
+    ///
+    /// Involuntary-preemption pin: the whole acquire+hold window bumps
+    /// this CPU's `preempt_pin`, dropped by release() — see the
+    /// preempt_pin block comment for why every plain acquire needs it
+    /// (the SpinLock-held-across-schedule deadlock class).
     pub fn acquire(self: *SpinLock) void {
         const ra = @returnAddress();
+        // Pin BEFORE taking the ticket so there is no instant at which we
+        // own (or are committed to owning) the lock while still parkable.
+        // The id-read + increment pair must be IRQ-atomic: an IRQ between
+        // them could preempt-and-migrate us, landing the pin on the wrong
+        // CPU's counter (stuck pin there, underflow here). Two instructions
+        // under cli; acquireIrqSave callers arrive with IF already 0 and
+        // pay nothing extra.
+        const pin_flags = saveAndDisableIrq();
+        const cpu = currentCpuId();
+        if (cpu < MAX_HOLD_CPUS) preempt_pin[cpu] += 1;
+        restoreIrq(pin_flags);
         const ticket = @atomicRmw(u32, &self.next_ticket, .Add, 1, .seq_cst);
         var spins: u64 = 0;
         var warned = false;
         while (true) {
             const serving = @atomicLoad(u32, &self.now_serving, .acquire);
             if (serving == ticket) {
-                const cpu = currentCpuId();
-                self.holder_cpu = cpu;
+                // Atomic store: every diagnostic reader (assertHeld, the
+                // same-CPU spin diag, dumpHeldLocksOlderThan, cpuHoldsAnyLock)
+                // atomic-loads holder_cpu — keep writer and readers paired.
+                @atomicStore(u8, &self.holder_cpu, cpu, .release);
                 self.holder_ra = ra;
                 if (comptime witness.enabled) {
                     if (self.witness_class != 0xFF) {
@@ -74,7 +92,24 @@ pub const SpinLock = struct {
             // (acquireIrqSave spins cli'd) — pulse the VM-liveness witness
             // so a peer's long hold that we're queued on isn't mistaken
             // for a whole-VM host freeze (see cliHoldCheck's verdict).
-            if (spins & 0xFFF == 0) noteAlivePulse();
+            if (spins & 0xFFF == 0) {
+                noteAlivePulse();
+                // Same-CPU holder while we spin can never resolve on its
+                // own: the preempt pin means a holder is never parked
+                // mid-hold, so a holder_cpu equal to OURS is either our own
+                // caller (recursion) or this CPU's interrupted context (an
+                // IRQ path acquiring what its interruptee holds) — both
+                // spin forever. Diagnose at ~4M rounds (order 100ms)
+                // instead of waiting out the generic 200M warn. (A task
+                // that slept holding the lock and resumed on another CPU
+                // can clear this — recoverable, hence diag, not panic.)
+                if (!warned and spins >= (1 << 22) and
+                    @atomicLoad(u8, &self.holder_cpu, .acquire) == cpu)
+                {
+                    warned = true;
+                    printSpinDiag(self, ticket, serving, ra);
+                }
+            }
             if (!warned and spins > 200_000_000) {
                 warned = true;
                 printSpinDiag(self, ticket, serving, ra);
@@ -97,10 +132,14 @@ pub const SpinLock = struct {
 
     /// Release the lock. Advances to the next ticket.
     pub fn release(self: *SpinLock) void {
+        // holder_cpu is ours and stable — the preempt pin forbids migration
+        // for the whole hold — so reuse it instead of re-reading the LAPIC
+        // id (an uncached MMIO load) for witness + the unpin below.
+        const cpu = self.holder_cpu;
         if (comptime witness.enabled) {
-            if (self.witness_class != 0xFF) witness.spinRelease(self.witness_class, currentCpuId());
+            if (self.witness_class != 0xFF) witness.spinRelease(self.witness_class, cpu);
         }
-        self.holder_cpu = 0xFF;
+        @atomicStore(u8, &self.holder_cpu, 0xFF, .release);
         // Clear the IrqSave bracket stamp here too: a lock acquired via
         // acquireIrqSave but released via plain release() would otherwise
         // keep a stale acquire_tsc, and the NEXT plain acquire/release
@@ -110,6 +149,15 @@ pub const SpinLock = struct {
         // Leave holder_ra in place as a "last holder" hint — useful when a
         // deadlock fires immediately after a release/re-acquire cycle.
         _ = @atomicRmw(u32, &self.now_serving, .Add, 1, .release);
+        // Unpin AFTER the lock is publicly free. An IRQ landing in between
+        // sees pin>0 and defers (flag stays set) — never a parked holder.
+        // The read-modify-write is safe without cli because any interrupting
+        // handler nets ZERO on the pin (its own acquire/release pair), so an
+        // in-flight decrement can't be lost to interleaving — and preemption
+        // from here is impossible while the count is still raised.
+        // The 0xFF guard makes a double-release skip the decrement instead
+        // of underflowing the pin into a permanently-unpreemptible CPU.
+        if (cpu < MAX_HOLD_CPUS and preempt_pin[cpu] != 0) preempt_pin[cpu] -= 1;
     }
 
     /// Acquire with interrupts disabled. Returns previous RFLAGS for restore.
@@ -189,8 +237,61 @@ pub inline fn noteAlivePulse() void {
 }
 
 /// == smp.MAX_CPUS (LAPIC ids are bounded below it at MADT collection).
-/// Kept as a local constant so this file stays a top-level leaf.
+/// Kept as a local constant so this file stays a top-level leaf; the
+/// comptime check below keeps the two from drifting apart.
 pub const MAX_HOLD_CPUS: usize = 32;
+
+comptime {
+    if (MAX_HOLD_CPUS != @import("../cpu/smp.zig").MAX_CPUS) {
+        @compileError("MAX_HOLD_CPUS must equal smp.MAX_CPUS — per-CPU slots below are indexed by LAPIC id");
+    }
+}
+
+// =============================================================================
+// Involuntary-preemption pin — the systematic fix for the SpinLock-held-
+// across-schedule deadlock class.
+//
+// History: a device IRQ landing while a task holds a PLAIN-acquired SpinLock
+// (IF=1) can set dynirq_preempt_pending; the DynIrqStub epilogue then ran
+// schedule() unconditionally, parking the holder .ready WITH THE LOCK HELD.
+// The next task on that CPU to touch the lock spins it dead. Reproduced
+// 2026-05-20 at nvme.ioCommand (io_lock) and fixed THERE with acquireIrqSave
+// — but every other plain acquire in task context (pmm, page_cache, as_lock,
+// vmalloc, swap, …) stayed exposed. Note the timer never had this hole:
+// handleIRQ0 deliberately refuses to preempt !from_user contexts.
+//
+// Fix (Linux preempt_count, scoped to what this kernel needs): each plain
+// acquire bumps its CPU's pin before the ticket is taken; release drops it
+// after now_serving advances. check_and_preempt_dynirq defers (leaves the
+// pending flag SET) while the interrupted context's pin is non-zero — the
+// pin drops within the critical section's own µs scale, and the still-set
+// flag is consumed at the next boundary. Consequences, all deliberate:
+//   * A holder can never be parked mid-hold ⇒ spin waits are bounded by
+//     real critical-section lengths, and holder_cpu/witness per-CPU state
+//     can never be invalidated by migration-while-holding.
+//   * Spinners are pinned too (the pin covers the wait). Safe BECAUSE
+//     holders are never parked: the wait is µs-bounded. The one way to
+//     break that is sleeping while holding a spinlock — already a bug,
+//     already WITNESS-checked, now also surfaced by the same-CPU early
+//     spin diagnostic in acquire().
+//   * User-mode interrupts always see pin==0 (ring 3 cannot hold kernel
+//     locks), so wake-from-IRQ dispatch latency for user contexts — the
+//     input path — is byte-identical.
+//   * The pin is per-CPU, not per-task: every context switch happens at
+//     pin==0 (schedule() releases sched_lock before switchTo; voluntary
+//     yields holding a spinlock are the WITNESS bug above), so no
+//     save/restore across switches is needed.
+// =============================================================================
+var preempt_pin: [MAX_HOLD_CPUS]u32 = [_]u32{0} ** MAX_HOLD_CPUS;
+
+/// True when the calling CPU currently holds (or is acquiring) at least one
+/// plain-acquired SpinLock and must not be involuntarily preempted. Called
+/// by check_and_preempt_dynirq at IF=0; own-CPU counter, plain read.
+pub fn preemptionPinned() bool {
+    const cpu = currentCpuId();
+    if (cpu >= MAX_HOLD_CPUS) return false;
+    return preempt_pin[cpu] != 0;
+}
 
 pub const HoldVerdict = enum(u8) { unverified, vm_alive, vm_frozen };
 
@@ -421,8 +522,16 @@ fn restoreIrq(flags: u64) void {
 // is negligible vs the wait time we're already paying.
 // =============================================================================
 
+/// Mutex.owner_pid sentinel for holds taken from a context with no
+/// current_pid. Outside the valid pid range (MAX_PROCS=64) and distinct
+/// from the 0xFFFF "unowned" sentinel, so forceReleaseIfOwnedBy(real pid)
+/// can never match it.
+pub const NO_TASK_OWNER: u16 = 0xFFFE;
+
 pub const Mutex = struct {
-    /// 0xFFFF = unowned. Otherwise = PID of holder.
+    /// 0xFFFF = unowned. 0xFFFE (NO_TASK_OWNER) = held from a no-task
+    /// context (pre-scheduler boot thread, or an IRQ that landed before the
+    /// first dispatch). Otherwise = PID of holder.
     owner_pid: u16 = 0xFFFF,
     /// Diagnostic: where the current/last holder acquired the lock.
     /// Held across release as a "last holder" hint for post-mortems.
@@ -454,11 +563,21 @@ pub const Mutex = struct {
         const smp = @import("../cpu/smp.zig");
         const cur_opt = smp.myCpu().current_pid;
         if (cur_opt == null) {
-            // Pre-scheduler / no-task context. Single-threaded — just
-            // stamp and return. We deliberately DON'T write owner_pid
-            // here: leaving it at 0xFFFF means once the scheduler is up,
-            // the first real acquirer sees a free lock (the alternative
-            // would require a release-from-no-task path).
+            // No-task context — pre-scheduler boot. The old stamp-only
+            // no-op assumed strict single-threadedness, but IRQ-context
+            // callers exist (virtio_gpu's IF=0 inline-fallback tryAcquire
+            // can fire mid-boot): an unclaimed hold let tryAcquire
+            // "succeed" straight into this live critical section. CLAIM a
+            // sentinel owner so exclusion is real; release()'s no-task
+            // path clears it. On CAS failure proceed anyway like the old
+            // code (a no-task acquire of a held mutex can only be the
+            // boot thread self-nesting — excluding would self-wedge the
+            // boot) but say so: it means the inner release will free the
+            // outer hold early, which is worth a breadcrumb.
+            if (@cmpxchgStrong(u16, &self.owner_pid, 0xFFFF, NO_TASK_OWNER, .acquire, .monotonic) != null) {
+                const serial = @import("../debug/serial.zig");
+                serial.print("[mutex] no-task acquire of held mutex@0x{X} (boot self-nest?)\n", .{@intFromPtr(self)});
+            }
             self.holder_ra = ra;
             return;
         }
@@ -519,6 +638,13 @@ pub const Mutex = struct {
         const smp = @import("../cpu/smp.zig");
         const cur_opt = smp.myCpu().current_pid;
         if (cur_opt == null) {
+            // Honest even with no task: claim the sentinel or report
+            // failure. (The old unconditional `return true` let an
+            // IRQ-context tryAcquire during a boot-thread hold walk
+            // straight into the live critical section.)
+            if (@cmpxchgStrong(u16, &self.owner_pid, 0xFFFF, NO_TASK_OWNER, .acquire, .monotonic) != null) {
+                return false;
+            }
             self.holder_ra = ra;
             return true;
         }
@@ -539,7 +665,15 @@ pub const Mutex = struct {
     pub fn release(self: *Mutex) void {
         const smp = @import("../cpu/smp.zig");
         if (smp.myCpu().current_pid == null) {
-            // Pre-scheduler: nothing to wake; clear diag.
+            // No-task context: clear the sentinel claim (no-op if a boot
+            // self-nest's inner release already freed it). Wake on success
+            // is cheap pre-scheduler (procs[] all .unused → no-op) and
+            // closes the lost-wake hole if a task ever DOES contend a
+            // sentinel-held mutex.
+            if (@cmpxchgStrong(u16, &self.owner_pid, NO_TASK_OWNER, 0xFFFF, .release, .monotonic) == null) {
+                const process = @import("process.zig");
+                process.wakeMutexWaiters(@truncate(@intFromPtr(self)));
+            }
             return;
         }
         if (comptime witness.enabled) {
@@ -703,7 +837,7 @@ pub fn dumpHeldLocksOlderThan(now_tsc: u64, threshold_ticks: u64) void {
 /// uses this to tell a peer that's frozen but holding NOTHING (host vCPU
 /// pause — safe to wait for it to resume) from one frozen INSIDE a cli
 /// critical section (a real wedge there can deadlock-propagate to us, so
-/// halt sooner). Best-effort: only the 11 registered locks are visible —
+/// halt sooner). Best-effort: only registered locks are visible —
 /// an unregistered-lock wedge reads as "free" and just gets the longer
 /// grace, still caught by the resume probe. Cheap O(N) over the registry.
 pub fn cpuHoldsAnyLock(cpu_id: u8) bool {
@@ -756,7 +890,14 @@ pub fn dumpAllLocks() void {
             .mutex => {
                 const lock: *Mutex = @ptrFromInt(ent.ptr);
                 const owner = @atomicLoad(u16, &lock.owner_pid, .acquire);
-                if (owner != 0xFFFF) {
+                if (owner == NO_TASK_OWNER) {
+                    serial.print("[lock-dump]   {s}: HELD by no-task ctx ra=", .{ent.name});
+                    if (symbols.resolveKernel(lock.holder_ra)) |r| {
+                        serial.print("{s}+0x{X}\n", .{ r.name, r.offset });
+                    } else {
+                        serial.print("0x{X}\n", .{lock.holder_ra});
+                    }
+                } else if (owner != 0xFFFF) {
                     serial.print("[lock-dump]   {s}: HELD by pid={d} ra=", .{ ent.name, owner });
                     if (symbols.resolveKernel(lock.holder_ra)) |r| {
                         serial.print("{s}+0x{X}\n", .{ r.name, r.offset });

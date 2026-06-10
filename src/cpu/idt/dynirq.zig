@@ -119,6 +119,24 @@ pub export fn check_and_preempt_dynirq() callconv(.c) void {
     const smp_mod = @import("../smp.zig");
     const cpu = smp_mod.myCpu();
     if (cpu.dynirq_preempt_pending) {
+        // Deferred-preempt guard (see spinlock.zig's preempt_pin block —
+        // the systematic version of nvme's 2026-05-20 io_lock deadlock):
+        // if this IRQ interrupted a context holding a plain-acquired
+        // SpinLock, scheduling here would park the holder .ready with the
+        // lock held and the next task to touch it spins forever. Leave the
+        // flag SET and return — the pin drops within the critical
+        // section's µs scale and the next boundary (device-IRQ epilogue,
+        // from_user tick, voluntary yield) runs the deferred preempt.
+        // User-mode interrupts are never pinned, so wake dispatch latency
+        // for the input path is unchanged.
+        //
+        // Asymmetry worth knowing: this is the ONLY clear site. A kernel-
+        // mode timer tick never schedules (irq0 !from_user policy) and
+        // schedule() itself never reads the flag — a deferred preempt is
+        // consumed by the next DEVICE-IRQ epilogue on this CPU, not by a
+        // tick. Bounded in practice by ambient device IRQ rates; same
+        // class of delay the timer policy already imposes on kernel tasks.
+        if (@import("../../proc/spinlock.zig").preemptionPinned()) return;
         cpu.dynirq_preempt_pending = false;
         @import("../../proc/process.zig").schedule();
     }
