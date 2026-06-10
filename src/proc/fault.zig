@@ -1052,6 +1052,20 @@ pub fn allUserPagesMappedFor(pml4: [*]align(4096) u64, addr: usize, len: usize) 
 /// what serializes us vs concurrent sysMunmap/sysMprotect on the owner's
 /// own thread.
 pub fn ensureUserRangeWritableFor(owner_pcb: *process.PCB, va: usize, len: usize) bool {
+    return ensureUserRangeFor(owner_pcb, va, len, true);
+}
+
+/// Read-side sibling: guarantees every page in the range is PRESENT in the
+/// owner's tables but leaves protection alone. For paths where the kernel
+/// only READS the user buffer (io_uring OP_WRITE: vfs reads the source buf)
+/// — demanding READ_WRITE there would reject any buffer in an RO cache
+/// region (Slice 3e ELF .rodata), i.e. every string literal. COW pages are
+/// readable without breaking; resident is resident.
+pub fn ensureUserRangeReadableFor(owner_pcb: *process.PCB, va: usize, len: usize) bool {
+    return ensureUserRangeFor(owner_pcb, va, len, false);
+}
+
+fn ensureUserRangeFor(owner_pcb: *process.PCB, va: usize, len: usize, need_write: bool) bool {
     if (len == 0) return true;
     const pd = owner_pcb.page_directory orelse return false;
     const lead = leader(owner_pcb);
@@ -1061,9 +1075,11 @@ pub fn ensureUserRangeWritableFor(owner_pcb: *process.PCB, va: usize, len: usize
     const end_excl = va +% len;
     while (p < end_excl) : (p += 0x1000) {
         if (vmm.resolveUserPhys(pd, p) != null) {
-            _ = handleCowFault(pd, p);
-            const pte_ptr = findUserPte(pd, p) orelse return false;
-            if (pte_ptr.* & paging.READ_WRITE == 0) return false;
+            if (need_write) {
+                _ = handleCowFault(pd, p);
+                const pte_ptr = findUserPte(pd, p) orelse return false;
+                if (pte_ptr.* & paging.READ_WRITE == 0) return false;
+            }
         } else {
             var mapped = false;
             var i: u8 = 0;
@@ -1072,17 +1088,20 @@ pub fn ensureUserRangeWritableFor(owner_pcb: *process.PCB, va: usize, len: usize
                 if (p < r.start or p >= r.end) continue;
                 if (r.cache_inode != 0) {
                     // Cache-backed page: map it shared RO+COW if resident, then
-                    // break COW so this proactive (SMAP/signal-frame or io_uring)
-                    // write lands on a private WRITABLE page. Non-blocking — a
-                    // miss returns false (the caller may hold a spinlock; the app
-                    // must touch the page itself so the #PF path can fill it).
+                    // (write paths only) break COW so this proactive (SMAP/
+                    // signal-frame or io_uring) write lands on a private
+                    // WRITABLE page. Non-blocking — a miss returns false (the
+                    // caller may hold a spinlock; the app must touch the page
+                    // itself so the #PF path can fill it).
                     if (!tryMapCachedPage(pd, r, p)) return false;
-                    _ = handleCowFault(pd, p);
-                    // RO cache region (Slice 3e ELF text/rodata: no PROT_WRITE →
-                    // no COW bit → handleCowFault no-op) stays read-only. Fail
-                    // delivery rather than let the caller kernel-mode #PF into it.
-                    const pte_ptr = findUserPte(pd, p) orelse return false;
-                    if (pte_ptr.* & paging.READ_WRITE == 0) return false;
+                    if (need_write) {
+                        _ = handleCowFault(pd, p);
+                        // RO cache region (Slice 3e ELF text/rodata: no PROT_WRITE →
+                        // no COW bit → handleCowFault no-op) stays read-only. Fail
+                        // delivery rather than let the caller kernel-mode #PF into it.
+                        const pte_ptr = findUserPte(pd, p) orelse return false;
+                        if (pte_ptr.* & paging.READ_WRITE == 0) return false;
+                    }
                 } else {
                     _ = vmm.allocAndMapUserPage(pd, p, vmm.protToMapFlags(r.prot)) catch return false;
                     asm volatile ("invlpg (%[addr])"

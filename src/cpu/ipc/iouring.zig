@@ -397,13 +397,18 @@ fn executeSyncAsWorker(inst: *Instance, sqe: Sqe) i32 {
             pcid_mod.loadCr3(owner_pd_phys, owner_pcid, my_cpu_id);
             defer pcid_mod.loadCr3(kernel_pd_phys, 0, my_cpu_id);
 
-            // Break COW + lazy-fault any missing pages in the range BEFORE
-            // vfs touches user memory. For OP_WRITE (vfs reads user buf to
-            // write to fd) we only need PRESENT; for OP_READ (vfs writes
-            // user buf) we need writable. We always ensure writable — extra
-            // strictness is fine for reads (the buffer is meant to receive
-            // data; the caller wouldn't pass a R/O page).
-            if (!fault.ensureUserRangeWritableFor(owner_pcb, addr, sqe.len)) {
+            // Lazy-fault any missing pages in the range BEFORE vfs touches
+            // user memory — the worker's #PF context can't service the
+            // owner's lazy regions. OP_READ (vfs WRITES the user buf):
+            // present + writable, breaking COW. OP_WRITE (vfs only READS
+            // the buf): present suffices — demanding writable would
+            // ERES_FAULT any source in an RO cache region (Slice 3e ELF
+            // .rodata), i.e. every string literal passed to a write.
+            const range_ok = if (sqe.opcode == OP_READ)
+                fault.ensureUserRangeWritableFor(owner_pcb, addr, sqe.len)
+            else
+                fault.ensureUserRangeReadableFor(owner_pcb, addr, sqe.len);
+            if (!range_ok) {
                 return ERES_FAULT;
             }
 
