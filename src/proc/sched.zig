@@ -17,8 +17,9 @@
 //!     assignInitialCpu — CPU pin / load-balance plumbing. The balancer
 //!     runs from the BSP timer IRQ at BALANCE_INTERVAL_TICKS cadence.
 //!   * niceToWeight / NICE_WEIGHTS — Linux-style nice → weight table for
-//!     CFS vruntime scaling (currently disabled in accountRunningTick;
-//!     table kept for re-enable).
+//!     CFS vruntime scaling, live in accountRunningTick (fixed-point
+//!     VRUNTIME_SCALE units keep negative-nice weights from truncating
+//!     a 1-tick delta to zero — the bug that forced the original disable).
 //!   * killKickHandler / wakeOnlyHandler / initKillKickIpi / initWakeIpi /
 //!     kickVector / wakeVector — the two cross-CPU IPI vectors. Kill-kick
 //!     re-schedules the receiver (forces a context switch off a dying pid);
@@ -102,22 +103,33 @@ const TRACE_PID: u8 = 0;
 const BALANCE_INTERVAL_TICKS: u64 = 50;
 const BALANCE_THRESHOLD: u16 = 2;
 
-/// CFS-style scheduling tunables. Units are timer ticks (10 ms each at
-/// our 100 Hz LAPIC cadence). See pickNext / checkPreempt / setState
-/// (sleeper-bonus path) / migrate for usage.
+/// CFS-style scheduling tunables.
 ///
-/// SCHED_LATENCY: target wall time for ALL runnable tasks in a band to
-///   each get one slice. With 6 ticks (60 ms) and N runnable tasks,
-///   ideal_runtime = max(MIN_GRANULARITY, SCHED_LATENCY/N).
-/// MIN_GRANULARITY: floor on a slice. Without this, two tasks with
-///   near-equal vruntime would ping-pong every tick.
+/// VRUNTIME_SCALE: fixed-point scale for vruntime — one timer tick (10 ms
+///   at the 100 Hz LAPIC cadence) of nice=0 runtime adds exactly
+///   VRUNTIME_SCALE units. Sub-tick resolution is what makes nice
+///   weighting workable at tick granularity: accrual is
+///   `delta_ticks * VRUNTIME_SCALE * NICE_0_WEIGHT / weight`, so even a
+///   1-tick slice at nice=-20 (weight 88761) yields 11 units instead of
+///   the 0 that bare `delta * 1024 / weight` integer math produces. That
+///   truncation-to-zero is why the original nice re-enable starved
+///   same-band peers: a nice<0 task never accrued vruntime, stayed
+///   minimum in its band forever, and the picker pinned to it.
+///   With every task at the default nice=0 the accrual is exactly
+///   `delta * VRUNTIME_SCALE` — order-isomorphic to the old unweighted
+///   per-tick accrual, so default-workload scheduling is unchanged.
 /// SLEEPER_CREDIT: when a task wakes from .sleeping, it's bumped to
 ///   `max(vruntime, min_vruntime - SLEEPER_CREDIT)` so it runs soon
 ///   without strip-mining tasks that have been waiting at the floor.
-///   Half SCHED_LATENCY is the standard CFS heuristic.
-const SCHED_LATENCY: u64 = 6;
-const MIN_GRANULARITY: u64 = 1;
-const SLEEPER_CREDIT: u64 = 3;
+///   3 tick-equivalents (half a 60 ms latency target — the standard CFS
+///   heuristic).
+///
+/// (SCHED_LATENCY / MIN_GRANULARITY — the ideal_runtime slice-stretching
+/// tunables — sat here for weeks consumed by NOTHING: the real preempt
+/// cadence is simply every 10 ms tick via handleIRQ0. Removed rather than
+/// left implying a slice policy that doesn't exist.)
+const VRUNTIME_SCALE: u64 = 1024;
+const SLEEPER_CREDIT: u64 = 3 * VRUNTIME_SCALE;
 
 /// Linux-style nice → weight table (kernel/sched/core.c sched_prio_to_weight[]).
 /// Indexed by `nice + 20` (so range -20..19 maps to indices 0..39).
@@ -559,10 +571,11 @@ fn rqEnter(pid: usize, from_sleep: bool) void {
     const band: usize = @intFromEnum(pcb.priority);
     const floor = rq.min_vruntime[band];
     if (pcb.vruntime == 0) {
-        // Fresh PCB — seed at min + 1 so it doesn't outrank everyone in
-        // its band immediately. The +1 keeps strict ordering with any
-        // task currently sitting AT min.
-        pcb.vruntime = floor +% 1;
+        // Fresh PCB — seed one tick-equivalent above the floor so it
+        // doesn't outrank everyone in its band immediately (the same
+        // offset the old tick-unit code expressed as +1), keeping strict
+        // ordering with any task currently sitting AT min.
+        pcb.vruntime = floor +% VRUNTIME_SCALE;
     } else if (from_sleep) {
         // Sleeper bonus: bump near floor so the woken task gets to run
         // soon, but cap at its own historical vruntime so a long-running
@@ -801,11 +814,19 @@ fn accountRunningTick(pid: usize, commit_slice_start: bool) void {
         return;
     }
     const delta = now - start;
-    // TRIAGE: nice scaling temporarily disabled — just bump vruntime by
-    // delta to isolate whether the multiply/divide was the problem.
-    // const weight = niceToWeight(pcb.nice);
-    // const weighted_delta = (delta * NICE_0_WEIGHT) / weight;
-    pcb.vruntime +%= delta;
+    // Weighted CFS accrual in fixed-point VRUNTIME_SCALE units. The old
+    // "TRIAGE: nice scaling temporarily disabled" state wasn't about the
+    // multiply/divide being slow — the math itself was broken at tick
+    // granularity: `delta * 1024 / weight` truncates to ZERO whenever
+    // weight > delta*1024 (i.e. every negative nice at 1-tick deltas), so
+    // a boosted task never accrued vruntime, stayed minimum in its band,
+    // and starved its peers. The VRUNTIME_SCALE numerator keeps the
+    // quotient non-zero (nice=-20, delta=1 → 11 units) while nice=0 stays
+    // exact (delta * VRUNTIME_SCALE). This makes sys_setpriority and the
+    // `nice` app actually do something — pcb.nice was user-settable but
+    // scheduler-ignored the whole time the triage comment sat here.
+    const weight = niceToWeight(pcb.nice);
+    pcb.vruntime +%= (delta * VRUNTIME_SCALE * NICE_0_WEIGHT) / weight;
     if (commit_slice_start) pcb.slice_start_tick = now;
 
     // Bump per-band min_vruntime floor on this rq if the running task
@@ -1033,7 +1054,10 @@ fn pickMinVruntime(q: *const runqueue.PriQueue, exclude_pid: ?u8) ?u8 {
         if (pid >= MAX_PROCS) continue;
         if (exclude_pid) |xp| if (pid == xp) continue;
         if (@atomicLoad(bool, &process.procs[pid].exit_requested, .acquire)) continue;
-        if (process.procs[pid].wait_kind != .none) continue;
+        // Atomic read — wait_kind is tagged (a): setWait stores it with
+        // .release under the waiter's setstate lock, which this picker
+        // does NOT hold (it holds rq.lock). Matches waitsOn's discipline.
+        if (@atomicLoad(u8, @as(*const u8, @ptrCast(&process.procs[pid].wait_kind)), .acquire) != @intFromEnum(WaitKind.none)) continue;
         const vr = process.procs[pid].vruntime;
         if (best == null or vr < best_vr) {
             best = pid;
@@ -2094,10 +2118,22 @@ pub fn deliverDueAlarms() void {
     if (process.tick_count < earliest_alarm_tick.load(.acquire)) return;
     var new_earliest: u64 = std.math.maxInt(u64);
     for (0..MAX_PROCS) |i| {
-        const at = process.procs[i].alarm_tick;
+        const at = @atomicLoad(u64, &process.procs[i].alarm_tick, .acquire);
         if (at != 0 and process.tick_count >= at) {
-            process.procs[i].alarm_tick = 0;
-            _ = signals.send(@intCast(i), signals.SIGALRM);
+            // Claim-then-fire: only deliver if alarm_tick still holds the
+            // value we judged due. The old plain `alarm_tick = 0` could
+            // stomp a concurrent sys_alarm re-arm (the target's CPU storing
+            // a fresh deadline between our read and our clear) — the fresh
+            // alarm would be silently zeroed and never fire. Same lost-
+            // deadline class as wakeExpired's clear-before-setState rule,
+            // just on the other field. On CAS failure, fold the re-armed
+            // value into the cache recompute so the fast-path gate stays
+            // correct.
+            if (@cmpxchgStrong(u64, &process.procs[i].alarm_tick, at, 0, .acq_rel, .acquire)) |fresh| {
+                if (fresh != 0 and fresh < new_earliest) new_earliest = fresh;
+            } else {
+                _ = signals.send(@intCast(i), signals.SIGALRM);
+            }
         } else if (at != 0 and at < new_earliest) {
             new_earliest = at;
         }
@@ -2346,57 +2382,52 @@ pub fn blockOnMutex(target_id: u32, owner_pid_ptr: *const u16) void {
     clearWait(pcb);
 }
 
+/// Wake every .sleeping PCB enrolled on exactly (kind, target). Shared
+/// body of the four wake-fan-out entry points below — the state filter +
+/// waitsOn + wake() triple was copy-pasted four times and had begun to
+/// age independently. Thundering-herd by design: every matching waiter
+/// re-checks its condition on resume; losers re-park (see each entry
+/// point's contract).
+fn wakeAllWaitingOn(kind: WaitKind, target: u32) void {
+    for (0..MAX_PROCS) |i| {
+        const t = &process.procs[i];
+        if (@atomicLoad(u8, @as(*const u8, @ptrCast(&t.state)), .acquire) != @intFromEnum(State.sleeping)) continue;
+        if (!waitsOn(t, kind, target)) continue;
+        wake(@intCast(i));
+    }
+}
+
 /// Wake every PCB sleeping on a Mutex with this target_id. Thundering-
 /// herd wake: all waiters retry CAS in parallel, one wins, losers
 /// re-blockOnMutex. Acceptable for low-contention locks (virtio-gpu
 /// submit serializes one ~50ms wait at a time, contention is rare).
 pub fn wakeMutexWaiters(target_id: u32) void {
-    for (0..MAX_PROCS) |i| {
-        const t = &process.procs[i];
-        if (@atomicLoad(u8, @as(*const u8, @ptrCast(&t.state)), .acquire) != @intFromEnum(State.sleeping)) continue;
-        if (!waitsOn(t, .mutex, target_id)) continue;
-        wake(@intCast(i));
-    }
+    wakeAllWaitingOn(.mutex, target_id);
 }
 
 /// Wake every PCB blocked on a SWAP_INFLIGHT PTE whose leaf-PTE address
 /// truncates to `target`. Called by `evictFrame` at the end of every
 /// eviction (success or failure) so faulters can retry — they re-check the
 /// PTE on resume and take the swap-in path (success) or re-fault the now-
-/// PRESENT page (I/O failure restored the original PTE). Mirrors
-/// `wakeMutexWaiters` — thundering-herd is fine because the .swap_evict
-/// fan-in per page is small (typically one or two threads of a MT process).
+/// PRESENT page (I/O failure restored the original PTE). Thundering-herd
+/// is fine because the .swap_evict fan-in per page is small (typically
+/// one or two threads of a MT process).
 pub fn wakeSwapEvictWaiters(target: u32) void {
-    for (0..MAX_PROCS) |i| {
-        const t = &process.procs[i];
-        if (@atomicLoad(u8, @as(*const u8, @ptrCast(&t.state)), .acquire) != @intFromEnum(State.sleeping)) continue;
-        if (!waitsOn(t, .swap_evict, target)) continue;
-        wake(@intCast(i));
-    }
+    wakeAllWaitingOn(.swap_evict, target);
 }
 
 /// Wake the single worker task blocked on .iouring_work with this instance id.
 /// Called by io_uring_enter when userspace bumped sq_tail; the worker drains
 /// pending Sqes on its next loop iteration.
 pub fn wakeIoUringWorker(instance_id: u32) void {
-    for (0..MAX_PROCS) |i| {
-        const t = &process.procs[i];
-        if (@atomicLoad(u8, @as(*const u8, @ptrCast(&t.state)), .acquire) != @intFromEnum(State.sleeping)) continue;
-        if (!waitsOn(t, .iouring_work, instance_id)) continue;
-        wake(@intCast(i));
-    }
+    wakeAllWaitingOn(.iouring_work, instance_id);
 }
 
 /// Wake every task parked on io_uring_enter(min_complete > 0) for this
 /// instance. Called by the worker after writing a CQE; the enter caller's
 /// while-cq_count<min_complete loop re-checks on wake.
 pub fn wakeIoUringCqWaiters(instance_id: u32) void {
-    for (0..MAX_PROCS) |i| {
-        const t = &process.procs[i];
-        if (@atomicLoad(u8, @as(*const u8, @ptrCast(&t.state)), .acquire) != @intFromEnum(State.sleeping)) continue;
-        if (!waitsOn(t, .iouring_cq, instance_id)) continue;
-        wake(@intCast(i));
-    }
+    wakeAllWaitingOn(.iouring_cq, instance_id);
 }
 
 
