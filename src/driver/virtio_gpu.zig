@@ -2590,7 +2590,11 @@ fn setupDisplay(w: u32, h: u32) bool {
     return true;
 }
 
-fn resourceUnref(resource_id: u32) bool {
+/// pub: the GPU syscall layer (cpu/syscall/gpu.zig) calls this on its
+/// guest-blob error-rollback paths — a created-but-unusable resource must
+/// be unref'd BEFORE its guest backing pages go back to the PMM, or the
+/// host renderer keeps a reference into recycled frames.
+pub fn resourceUnref(resource_id: u32) bool {
     const ResourceUnref = extern struct { hdr: CtrlHdr, resource_id: u32, padding: u32 };
     var cmd = ResourceUnref{
         .hdr = .{ .cmd_type = CMD_RESOURCE_UNREF },

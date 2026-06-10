@@ -59,6 +59,13 @@ var next_gpu_ctx_id: u32 = 1;
 /// just stops the gross memory-DoS. (2026-06-04)
 const GPU_BLOB_MAX_SIZE: u32 = 256 * 1024 * 1024;
 
+/// Cap on a single GUEST blob (sysGpuCreateGuestBlob). Guest blobs are
+/// backed by pmm.allocContiguous — the scarcest PMM resource (the whole
+/// machine has 64-256 MB) — so the bound is much tighter than the
+/// host-pool cap above. 32 MB = 8192 contiguous frames, enough for a
+/// 1920x1080 RGBA image with headroom.
+const GPU_GUEST_BLOB_MAX_SIZE: u32 = 32 * 1024 * 1024;
+
 pub fn sysGpuCtxCreate(capset_id: u32) u32 {
     const virtio_gpu = @import("../../driver/virtio_gpu.zig");
     if (!virtio_gpu.has_virgl) {
@@ -262,7 +269,7 @@ pub fn sysGpuMapBlob(resource_id: u32, size: u32) u32 {
 pub fn sysGpuCreateGuestBlob(size: u32, out_resource_id_ptr: u32) u32 {
     const virtio_gpu = @import("../../driver/virtio_gpu.zig");
     if (!virtio_gpu.has_blob) return E_INVAL;
-    if (size == 0 or size > 32 * 1024 * 1024) return E_INVAL;
+    if (size == 0 or size > GPU_GUEST_BLOB_MAX_SIZE) return E_INVAL;
     if (!validateUserPtrWriteAligned(out_resource_id_ptr, 4, 4)) return E_FAULT;
 
     const pcb = process.currentPCB() orelse return E_FAULT;
@@ -291,11 +298,21 @@ pub fn sysGpuCreateGuestBlob(size: u32, out_resource_id_ptr: u32) u32 {
         @as(u64, size),
     )) {
         debug.klog("[gpu] createGuestBlob: resourceCreateGuestBlob FAILED\n", .{});
+        // No host resource exists — the contiguous block has no other
+        // owner, return it to the PMM. (Was a leak: up to 8192 frames
+        // per failed call, user-triggerable.)
+        pmm.freeContiguous(phys_base, num_pages);
         return E_INVAL;
     }
 
     if (!virtio_gpu.ctxAttachResource(pcb.gpu_ctx_id, resource_id)) {
         debug.klog("[gpu] createGuestBlob: ctxAttachResource FAILED\n", .{});
+        // The host resource WAS created and references phys_base — unref
+        // it first so the host drops its mapping, THEN free the backing.
+        // Freeing while the resource lives would hand the host a window
+        // into recycled frames.
+        _ = virtio_gpu.resourceUnref(resource_id);
+        pmm.freeContiguous(phys_base, num_pages);
         return E_INVAL;
     }
 
@@ -304,20 +321,24 @@ pub fn sysGpuCreateGuestBlob(size: u32, out_resource_id_ptr: u32) u32 {
     for (0..num_pages) |i| {
         const virt = base_virt + i * 0x1000;
         const phys = phys_base + i * 0x1000;
-        vmm.mapUserPage(pd, virt, phys, paging.READ_WRITE | paging.USER) catch |e| {
-            // Rollback: undo the page-table installs we did, free the
-            // PMM-allocated guest blob (no dual-owner refs here — these
-            // pages are only mapped into one PML4), leave user_brk where
-            // it was. resourceCreateGuestBlob/ctxAttachResource already
-            // succeeded by this point; the resource will stay attached
-            // until the process exits (or the caller calls a future
-            // sysGpuDestroyResource). Acceptable defensive leak for an
-            // error path that shouldn't normally fire.
+        // PRESENT for clarity only — mapUserPage ORs it in regardless
+        // (vmm.zig new_pte). Keeps this call site consistent with
+        // sysGpuMapBlob's.
+        vmm.mapUserPage(pd, virt, phys, paging.PRESENT | paging.READ_WRITE | paging.USER) catch |e| {
+            // Rollback: undo the page-table installs we did, unref the
+            // created+attached host resource so the host drops its
+            // reference to phys_base, and only THEN free the contiguous
+            // block (no dual-owner refs — these pages are only mapped
+            // into one PML4). user_brk stays where it was (never bumped).
+            // Previously the resource was left alive ("defensive leak")
+            // while its backing went back to the PMM — the host kept a
+            // window into recycled frames.
             debug.klog("[gpu] createGuestBlob mapUserPage failed at page={d} virt=0x{X}: {s}\n", .{ i, virt, @errorName(e) });
             var j: usize = 0;
             while (j < mapped_pages) : (j += 1) {
                 _ = vmm.unmapUserPage(pd, base_virt + j * 0x1000);
             }
+            _ = virtio_gpu.resourceUnref(resource_id);
             pmm.freeContiguous(phys_base, num_pages);
             return E_INVAL;
         };
