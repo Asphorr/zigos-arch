@@ -378,7 +378,16 @@ pub fn allocHook(addr: usize, user_size: usize) void {
     if (addr < HEAP_REDZONE) return;
     poison(addr - HEAP_REDZONE, HEAP_REDZONE, SHADOW_RED_ZONE);
     unpoison(addr, user_size);
-    poison(addr + user_size, HEAP_REDZONE, SHADOW_RED_ZONE);
+    // Right redzone must start on the next 8-byte shadow granule boundary.
+    // unpoison() rounds the body UP to a whole granule (1 shadow byte per 8
+    // bytes), so poisoning the redzone at the raw addr+user_size — which is
+    // mid-granule whenever user_size isn't a multiple of 8 — would memset
+    // that shared tail granule to RED_ZONE and bury the live body bytes
+    // under it, tripping a false-positive report on the allocation's own
+    // tail. Rounding the start up keeps the redzone on bytes genuinely past
+    // the (granule-rounded) body.
+    const body_rounded = (user_size + 7) & ~@as(usize, 7);
+    poison(addr + body_rounded, HEAP_REDZONE, SHADOW_RED_ZONE);
 }
 
 /// Mark a freed block: entire span (with both redzones) poisoned as freed.
