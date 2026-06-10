@@ -1,0 +1,3 @@
+# run.sh copies the live kernel sources here so the harness always tests
+# current code — never commit the copies.
+/src/
