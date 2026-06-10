@@ -120,7 +120,13 @@ fn handleCowFault(pml4: [*]align(4096) u64, cr2: usize) bool {
             const is_shared_file = r.cache_inode != 0 and r.cache_shared;
             if (!is_shared_anon and !is_shared_file) continue;
             if (va_aligned < r.start or va_aligned >= r.end) continue;
-            pte_p.* = (pte & ~paging.COW) | paging.READ_WRITE;
+            // CAS — a peer thread of this AS can resolve the same fault
+            // between our PTE read and this write. Loser returns resolved:
+            // the winner's transition stands (and did the markDirty below);
+            // if anything is still wrong the retried instruction re-faults.
+            if (@cmpxchgStrong(u64, pte_p, pte, (pte & ~paging.COW) | paging.READ_WRITE, .seq_cst, .seq_cst) != null) {
+                return true;
+            }
             asm volatile ("invlpg (%[addr])"
                 :
                 : [addr] "r" (va_aligned),
@@ -141,7 +147,10 @@ fn handleCowFault(pml4: [*]align(4096) u64, cr2: usize) bool {
     // releaseFrame on the same shared frame, but the only outcome of being
     // wrong here is taking the slow path unnecessarily — never incorrect.
     if (pmm.frameRefCount(old_phys) == 1) {
-        pte_p.* = (pte & ~paging.COW) | paging.READ_WRITE;
+        // CAS for the same reason as the copy path below — a peer thread of
+        // this AS can resolve this PTE between our read and the store. The
+        // loser's intended value is identical, so just take the winner's.
+        _ = @cmpxchgStrong(u64, pte_p, pte, (pte & ~paging.COW) | paging.READ_WRITE, .seq_cst, .seq_cst);
         asm volatile ("invlpg (%[addr])"
             :
             : [addr] "r" (va_aligned),
@@ -160,7 +169,21 @@ fn handleCowFault(pml4: [*]align(4096) u64, cr2: usize) bool {
 
     // Replace phys field, clear COW, restore R/W. Other flag bits (USER, NX,
     // accessed/dirty) are inherited from the COW PTE.
-    pte_p.* = (pte & ~paging.PAGE_MASK & ~paging.COW) | new_phys | paging.READ_WRITE;
+    //
+    // CAS-claim the transition. Two threads of the same (forked) AS writing
+    // the same COW page concurrently both reach here with the same `pte`
+    // snapshot; with a plain store BOTH would copy, BOTH store, and BOTH
+    // releaseFrame(old_phys) — dropping the shared frame's refcount by two,
+    // freeing it under the other fork side's still-COW PTE (silent UAF on
+    // every later parent read), and leaking the loser's private copy. Only
+    // the CAS winner owns the release; the loser rolls back its copy and
+    // returns resolved — the winner's mapping satisfies the retried write.
+    // (Same CAS discipline reclaimViaSwap's A-bit aging already adopted
+    // after its own pre-CAS 2x-eviction race.)
+    if (@cmpxchgStrong(u64, pte_p, pte, (pte & ~paging.PAGE_MASK & ~paging.COW) | new_phys | paging.READ_WRITE, .seq_cst, .seq_cst) != null) {
+        pmm.freeFrame(new_phys);
+        return true;
+    }
 
     pmm.releaseFrame(old_phys);
 
@@ -282,63 +305,9 @@ fn tryMapCachedPage(pd: [*]align(4096) u64, r: process.LazyRegion, va_aligned: u
 pub fn ensureUserRangeWritable(va: usize, len: usize) bool {
     if (len == 0) return true;
     const cur = smp.myCpu().current_pid orelse return false;
-    const pcb = &process.procs[cur];
-    const pd = pcb.page_directory orelse return false;
-    const lead = leader(pcb);
-
-    var p = va & ~@as(usize, 0xFFF);
-    const end_excl = va +% len;
-    while (p < end_excl) : (p += 0x1000) {
-        if (vmm.resolveUserPhys(pd, p) != null) {
-            // Present — break COW if needed. handleCowFault breaks + invlpg's a
-            // COW page, and is a safe no-op on a non-COW page.
-            _ = handleCowFault(pd, p);
-            // A present page that is STILL read-only (e.g. an app that
-            // mprotect'd its own stack region read-only) can't take our write —
-            // fail delivery so the caller kills it (≈ SIGSEGV) rather than
-            // panic on the kernel-mode #PF this kernel's ring-3-only handler
-            // won't service.
-            const paging = @import("../mm/paging.zig");
-            const pte_ptr = findUserPte(pd, p) orelse return false;
-            if (pte_ptr.* & paging.READ_WRITE == 0) return false;
-        } else {
-            // Not present — lazy fault-in via the owning region.
-            var mapped = false;
-            var i: u8 = 0;
-            while (i < lead.lazy_count) : (i += 1) {
-                const r = lead.lazy_regions[i];
-                if (p < r.start or p >= r.end) continue;
-                if (r.cache_inode != 0) {
-                    // Cache-backed page: map it shared RO+COW if resident, then
-                    // break COW so this proactive (SMAP/signal-frame or io_uring)
-                    // write lands on a private WRITABLE page. Non-blocking — a
-                    // miss returns false (the caller may hold a spinlock; the app
-                    // must touch the page itself so the #PF path can fill it).
-                    if (!tryMapCachedPage(pd, r, p)) return false;
-                    _ = handleCowFault(pd, p);
-                    // A READ-ONLY cache region (Slice 3e ELF text/rodata: prot has
-                    // no PROT_WRITE, so cacheMapFlags emits no COW bit and
-                    // handleCowFault is a no-op) stays read-only here. Fail
-                    // delivery — exactly as the present-page branch above does —
-                    // so the caller doesn't kernel-mode #PF writing into it (a
-                    // CPL0 fault this ring-3-only handler can't service → panic).
-                    const paging = @import("../mm/paging.zig");
-                    const pte_ptr = findUserPte(pd, p) orelse return false;
-                    if (pte_ptr.* & paging.READ_WRITE == 0) return false;
-                } else {
-                    _ = vmm.allocAndMapUserPage(pd, p, vmm.protToMapFlags(r.prot)) catch return false;
-                    asm volatile ("invlpg (%[addr])"
-                        :
-                        : [addr] "r" (p),
-                        : .{ .memory = true });
-                }
-                mapped = true;
-                break;
-            }
-            if (!mapped) return false; // no lazy region covers this page
-        }
-    }
-    return true;
+    // Body lives in ensureUserRangeFor — this was a ~55-line verbatim copy
+    // of its need_write=true path that had already begun to age separately.
+    return ensureUserRangeFor(&process.procs[cur], va, len, true);
 }
 
 /// Free up to `want` physical frames by evicting cold, present, non-COW pages
@@ -654,6 +623,16 @@ pub fn handleUserPageFault(cr2: usize, error_code: u64) bool {
                 return false;
             };
             vmm.mapUserPage(pd, va_aligned, phys, vmm.protToMapFlags(r.prot)) catch |e| {
+                // Benign MT race: another thread of this process faulted the
+                // same shm page first — it's mapped now, and that winner took
+                // the acquireFrame ref below. Returning false here SIGSEGV'd
+                // the losing thread of a concurrent same-page fault (the
+                // sibling cache path already treated AlreadyMapped as
+                // resolved; this path was missed).
+                if (e == error.AlreadyMapped) {
+                    @import("../debug/kdbg.zig").pfEvent(@intCast(cur), cr2, @truncate(error_code), 0, true);
+                    return true;
+                }
                 debug.klog("[shm] mapUserPage failed va=0x{X} phys=0x{X} err={s}\n", .{ va_aligned, phys, @errorName(e) });
                 return false;
             };
@@ -972,7 +951,16 @@ pub fn prefaultUserRange(addr: usize, len: usize) void {
                 .not_swapped => {}, // never-faulted page: fall through to fresh alloc + src copy
             }
 
-            const frame = vmm.allocAndMapUserPage(pd, page, vmm.protToMapFlags(r.prot)) catch return;
+            const frame = vmm.allocAndMapUserPage(pd, page, vmm.protToMapFlags(r.prot)) catch |e| {
+                // Benign MT race: a peer thread faulted this exact page in
+                // between our pageHasRealMapping check and the alloc (the
+                // winner did the source copy). Move on to the NEXT page —
+                // the old blanket `catch return` abandoned the rest of the
+                // range, turning the benign race into a spurious E_FAULT
+                // from allCurrentUserPagesMapped.
+                if (e == error.AlreadyMapped) break;
+                return; // OOM/BadVA: leave unmapped -> clean E_FAULT upstream
+            };
             if (r.source) |src| {
                 const page_end = page + 0x1000;
                 const src_va_end = r.src_va_base + r.src_size;
@@ -1103,7 +1091,16 @@ fn ensureUserRangeFor(owner_pcb: *process.PCB, va: usize, len: usize, need_write
                         if (pte_ptr.* & paging.READ_WRITE == 0) return false;
                     }
                 } else {
-                    _ = vmm.allocAndMapUserPage(pd, p, vmm.protToMapFlags(r.prot)) catch return false;
+                    _ = vmm.allocAndMapUserPage(pd, p, vmm.protToMapFlags(r.prot)) catch |e| {
+                        // Benign MT race: a peer thread faulted this page in
+                        // between our resolveUserPhys null-check and the alloc.
+                        // Any mapper of an anon lazy page uses these same
+                        // protToMapFlags, so the winner's mapping is the one we
+                        // wanted — failing here turned the race into a spurious
+                        // EFAULT / failed signal delivery. (tryMapCachedPage
+                        // above already tolerates AlreadyMapped the same way.)
+                        if (e != error.AlreadyMapped) return false;
+                    };
                     asm volatile ("invlpg (%[addr])"
                         :
                         : [addr] "r" (p),
