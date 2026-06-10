@@ -224,8 +224,9 @@ pub fn writeCrash(p0: u64, p1: u64, p2: u64, p3: u64, p4: u64) void {
 
 // --- Hypercall page + flush hypercall --------------------------------
 
-/// Pack the first `take` bytes of `msg` into a u64 (LE), zero-padded.
-/// Used by panic() to fit the message into the crash MSR context words.
+/// Pack up to 8 bytes of `msg` starting at `offset` into a u64 (LE),
+/// zero-padded past the end of the message. Used by panic() to fit the
+/// message into the crash MSR context words (P3 = offset 0, P4 = offset 8).
 pub fn packMsg(msg: []const u8, offset: usize) u64 {
     var out: u64 = 0;
     var i: usize = 0;
@@ -290,10 +291,23 @@ pub fn hasHypercalls() bool {
 /// Invoke a slow hypercall. RCX = call_code, RDX = input GPA, R8 = output
 /// GPA. R9-R11 are clobbered per TLFS § 3.10. Returns HV_STATUS in the
 /// low 16 bits of RAX (0 == success).
+///
+/// RCX/RDX/R8 are declared as OUTPUTS too (same-register in+out, the
+/// pattern cpuid() above uses): the hypercall ABI makes them volatile —
+/// the hypervisor may hand them back clobbered — so passing them as plain
+/// inputs would promise LLVM they survive the call, a latent miscompile
+/// the moment the optimizer reuses one afterwards. (Linux's
+/// hv_do_hypercall marks them "+c"/"+d" for the same reason.)
 inline fn hypercall(call_code: u64, input_gpa: u64, output_gpa: u64) u64 {
     var status: u64 = undefined;
+    var rcx_out: u64 = undefined;
+    var rdx_out: u64 = undefined;
+    var r8_out: u64 = undefined;
     asm volatile ("callq *%[page]"
         : [_] "={rax}" (status),
+          [_] "={rcx}" (rcx_out),
+          [_] "={rdx}" (rdx_out),
+          [_] "={r8}" (r8_out),
         : [_] "{rcx}" (call_code),
           [_] "{rdx}" (input_gpa),
           [_] "{r8}" (output_gpa),
@@ -302,10 +316,10 @@ inline fn hypercall(call_code: u64, input_gpa: u64, output_gpa: u64) u64 {
     return status;
 }
 
-/// Flush all entries (non-global) for `address_space_cr3` on every VP in
-/// the partition via a single hypercall — replaces the per-CPU IPI fan-out
-/// in tlb.shootdownAll. Caller must hold tlb.shootdown_lock (we share one
-/// input page).
+/// Flush ALL entries (global included — NON_GLOBAL_MAPPINGS_ONLY is not
+/// set) for `address_space_cr3` on every VP in the partition via a single
+/// hypercall — replaces the per-CPU IPI fan-out in tlb.shootdownAll.
+/// Caller must hold tlb.shootdown_lock (we share one input page).
 ///
 /// Returns true on success; false means caller should fall back to IPI.
 /// Possible failure modes: hypercall page not installed, host returned
@@ -329,6 +343,8 @@ pub fn flushAllProcessors(address_space_cr3: u64) bool {
 pub fn tryReset() bool {
     if (!has_reset_msr) return false;
     wrmsr(HV_MSR_RESET, 1);
-    // Should not get here; if we do, the host ignored the write.
-    return true;
+    // Reaching this line at all means the host ignored the write (an
+    // honored reset never returns) — report failure so the caller's
+    // fallback chain (ACPI / 0xCF9 / 8042) keeps going.
+    return false;
 }
