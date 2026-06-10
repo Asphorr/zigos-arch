@@ -38,14 +38,23 @@ pub const Field = struct {
 /// block whose total size is variable).
 pub fn assertFieldsNonOverlap(comptime fields: []const Field, comptime container_size: ?usize) void {
     comptime {
+        // Zero-size rejection runs UNCONDITIONALLY — including the
+        // null-container path. A zero .size means the caller's
+        // @sizeOf(@TypeOf(deref)) collapsed (field type refactored to a
+        // zero-bit type): the empty interval [x, x) overlaps nothing, so
+        // the field's protection would silently vanish while the checker
+        // keeps reporting green — the exact vacuous-pass failure mode this
+        // library exists to prevent.
+        for (fields) |f| {
+            if (f.size == 0) {
+                @compileError(std.fmt.comptimePrint(
+                    "layout: field '{s}' has zero size",
+                    .{f.name},
+                ));
+            }
+        }
         if (container_size) |cs| {
             for (fields) |f| {
-                if (f.size == 0) {
-                    @compileError(std.fmt.comptimePrint(
-                        "layout: field '{s}' has zero size",
-                        .{f.name},
-                    ));
-                }
                 const f_end = f.offset + f.size;
                 if (f_end > cs) {
                     @compileError(std.fmt.comptimePrint(
@@ -116,4 +125,11 @@ comptime {
         .{ .name = "a", .offset = 0, .size = 8 },
         .{ .name = "b", .offset = 24, .size = 8 },
     }, 32);
+
+    // Null container (variable-size block): overlap check still applies,
+    // bounds check skipped. Previously this path had no self-test coverage.
+    assertFieldsNonOverlap(&.{
+        .{ .name = "hdr", .offset = 0, .size = 8 },
+        .{ .name = "link", .offset = 8, .size = 8 },
+    }, null);
 }
