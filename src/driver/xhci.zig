@@ -256,20 +256,41 @@ pub var xhci_irq_count: u64 = 0;
 var event_drain_locked: bool = false;
 
 /// MSI-X handler. Bumps the counter (commands are drained by waitForEvent's
-/// next loop after `hlt` returns), then RAISES the HID softirq so the BSP's
-/// ksoftirqd runs pollHID in normal context (IF=1) — the event-driven HID
-/// drain (Inc 2b). This MSI-X is BSP-directed (msix.allocVector dest=0, never
-/// retargeted), so we always run on the BSP and raise(.hid) wakes the BSP's
-/// ksoftirqd; pollHID's assertBSP therefore holds. dynirq_preempt_pending makes
-/// the DynIrqStub epilogue schedule it promptly, so input is event-driven
-/// rather than quantized to the 100 Hz tick. The IRQ fires for ALL event types;
-/// on a command/MSC event pollHID bails via event_drain_locked, so the only
-/// cost there is a cheap no-op ksoftirqd hop.
+/// next loop after `hlt` returns), then drains the event ring INLINE — right
+/// here in IRQ context (Inc 2c).
+///
+/// Inc 2b deferred the drain to ksoftirqd (raise .hid → schedule → drain),
+/// a pattern adopted from NVMe where inline reaping measured 18 ms under
+/// load and earned the hop. HID never did: a drain is a handful of 16-byte
+/// TRBs routed to the input queue — microseconds — and the scheduling hop
+/// it bought was pure input-latency tax. Under host-pause storms the tax
+/// compounds: ksoftirqd must win the BSP through cli'd sched_lock spin
+/// windows, so each input event risks stacking 10-40 ms scheduler waits the
+/// old inline-in-IRQ0 path never had (user-felt as sluggish dragging/typing,
+/// 2026-06-10). Inline-in-IRQ is also the PROVEN configuration — pollHID ran
+/// in IRQ0's IF=0 context its whole life before Inc 2b, wakes included
+/// (reapCq established the same precedent on the NVMe side).
+///
+/// This MSI-X is BSP-directed (msix.allocVector dest=0, never retargeted),
+/// so pollHID's assertBSP holds. If a command/MSC wait owns the ring,
+/// pollHID self-bails via event_drain_locked exactly as before (the event
+/// then surfaces via waitForEvent's own drain or the 10 Hz backstop — the
+/// same worst case the softirq path had). dynirq_preempt_pending is still
+/// set so the DynIrqStub epilogue dispatches whatever pollHID's wakes made
+/// runnable (desktop) without waiting for the next tick. The .hid softirq
+/// machinery stays for the two non-IRQ callers: the 10 Hz lost-IRQ backstop
+/// and pollHID's own budget-overflow re-raise.
 fn xhciIrqHandler() callconv(.c) void {
     xhci_irq_count +%= 1;
-    if (@import("../proc/softirq.zig").raise(.hid)) {
-        @import("../cpu/smp.zig").myCpu().dynirq_preempt_pending = true;
-    }
+    // Close the typematic gate BEFORE draining: events are in the ring but
+    // key_state is stale until pollHID processes them. With the inline
+    // drain this window is microseconds, but the gate still matters for
+    // the event_drain_locked bail and the budget-overflow path, where the
+    // drain genuinely defers. pollHID reopens the gate once the ring is
+    // provably drained.
+    @atomicStore(bool, &keyboard.ext_events_pending, true, .release);
+    pollHID();
+    @import("../cpu/smp.zig").myCpu().dynirq_preempt_pending = true;
 }
 
 // --- MMIO register helpers ---
@@ -967,6 +988,9 @@ fn waitForEvent(event_type: u8, max_polls: u32) ?TRB {
                 const erdp_phys = evt_ring.phys + evt_dequeue * 16;
                 const ir0_base = rt_base + 0x20;
                 writeReg64(ir0_base + 0x18, @as(u64, erdp_phys) | (1 << 3));
+                // HID events interleaved with the awaited one: process,
+                // don't drop (and don't mis-return them as OUR transfer).
+                if (trb_type == TRB_EVENT_TRANSFER and routeHidEventDuringWait(evt_trb)) continue;
                 if (trb_type == event_type) return evt_trb;
                 continue; // different event type, look at the next slot
             }
@@ -995,6 +1019,8 @@ fn waitForEvent(event_type: u8, max_polls: u32) ?TRB {
         const erdp_phys = evt_ring.phys + evt_dequeue * 16;
         const ir0_base = rt_base + 0x20;
         writeReg64(ir0_base + 0x18, @as(u64, erdp_phys) | (1 << 3));
+        // Same HID routing as the MSI-X path above.
+        if (trb_type == TRB_EVENT_TRANSFER and routeHidEventDuringWait(evt_trb)) continue;
         if (trb_type == event_type) return evt_trb;
     }
     return null;
@@ -2356,8 +2382,112 @@ var mouse_requeue_count: u32 = 0;
 var kbd_requeue_count: u32 = 0;
 const MOUSE_WATCHDOG_TICKS: u64 = 500; // 5 seconds at 100Hz
 
+/// Process one TRB_EVENT_TRANSFER from the event ring: route the completed
+/// report to its HID consumer and re-queue the transfer TRB (ALWAYS — even
+/// on errors, or the in-flight pool starves). Shared by pollHID (batched
+/// doorbells via db_mask) and waitForEvent (immediate doorbell). Returns
+/// the device index needing a doorbell, or null.
+fn handleHidTransferEvent(evt_trb: TRB) ?u8 {
+    const cc = @as(u8, @truncate(evt_trb.status >> 24));
+    const slot_id = @as(u8, @truncate(evt_trb.control >> 24));
+
+    var di: ?u8 = null;
+    for (0..device_count) |i| {
+        if (devices[i].slot_id == slot_id and devices[i].active) {
+            di = @intCast(i);
+            break;
+        }
+    }
+    const dev_i = di orelse return null;
+
+    const trb_ptr = evt_trb.param_lo;
+    if (trb_ptr == 0) return null;
+    // trb_ptr points at the data-stage TRB we issued — its phys was
+    // written into the transfer ring; we read it back here. Map through
+    // the physmap so kernel deref works without the legacy low identity.
+    const completed_words: [*]volatile u32 = @ptrFromInt(paging.physToVirt(trb_ptr));
+    const data_addr = completed_words[0];
+    if (data_addr == 0) return null;
+
+    // Only process data on success/short packet
+    if (cc == 1 or cc == 13) {
+        const data: [*]volatile const u8 = @ptrFromInt(paging.physToVirt(data_addr));
+        if (devices[dev_i].is_keyboard) {
+            processKeyboardReport(data);
+        } else if (devices[dev_i].is_mouse or devices[dev_i].is_tablet) {
+            if (devices[dev_i].is_tablet) {
+                processTabletReport(data);
+            } else {
+                processMouseReport(data);
+            }
+            mouse_event_tick = process.tick_count;
+            mouse_ever_worked = true;
+        }
+    }
+
+    if (!hid_ring_active[dev_i]) return null;
+    const ring = &hid_rings[dev_i];
+    if (ring.enqueue < RING_SIZE - 1) {
+        const idx = ring.enqueue;
+        ring.trbs[idx].param_lo = data_addr;
+        ring.trbs[idx].param_hi = 0;
+        ring.trbs[idx].status = 8; // Always 8 bytes (prevents Babble Error)
+        asm volatile ("sfence" ::: .{ .memory = true });
+        ring.trbs[idx].control = (TRB_NORMAL << 10) | (1 << 5) |
+            (if (ring.cycle) @as(u32, 1) else @as(u32, 0));
+        ring.enqueue = idx + 1;
+        if (ring.enqueue >= RING_SIZE - 1) {
+            asm volatile ("sfence" ::: .{ .memory = true });
+            ring.trbs[RING_SIZE - 1].control = (TRB_LINK << 10) | (1 << 1) |
+                (if (ring.cycle) @as(u32, 1) else @as(u32, 0));
+            ring.enqueue = 0;
+            ring.cycle = !ring.cycle;
+        }
+    }
+    requeue_count +%= 1;
+    if (devices[dev_i].is_mouse or devices[dev_i].is_tablet) mouse_requeue_count +%= 1;
+    if (devices[dev_i].is_keyboard) kbd_requeue_count +%= 1;
+    return dev_i;
+}
+
+/// While a command/MSC wait drains the event ring, transfer events from
+/// HID slots interleave with the awaited event. waitForEvent used to
+/// silently DISCARD them: key releases were eaten (stuck/spamming keys —
+/// live on usb-mouse configs where the idle watchdog issues commands mid-
+/// typing), one in-flight TRB leaked per drop, and a TRANSFER wait for MSC
+/// could even return a KEYBOARD completion as its own. Route HID-slot
+/// events through the normal path instead; true = consumed, keep waiting.
+fn routeHidEventDuringWait(evt_trb: TRB) bool {
+    const slot_id = @as(u8, @truncate(evt_trb.control >> 24));
+    for (0..device_count) |i| {
+        if (devices[i].slot_id == slot_id and devices[i].active and
+            (devices[i].is_keyboard or devices[i].is_mouse or devices[i].is_tablet))
+        {
+            if (handleHidTransferEvent(evt_trb)) |dev_i| {
+                ringDoorbell(devices[dev_i].slot_id, devices[dev_i].ep_dci);
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
 pub fn pollHID() void {
     @import("../cpu/smp.zig").assertBSP("xhci.pollHID");
+    // Self-serialize via IRQ-disable (Inc 2c). The drain mutates non-atomic
+    // ring cursors (evt_dequeue/evt_cycle); with the MSI-X handler now
+    // draining INLINE, an xHCI IRQ landing mid-way through a TASK-context
+    // drain (ksoftirqd: 10 Hz backstop or budget-overflow re-raise) would
+    // NEST a second drain over the same cursors — double-processed input
+    // events at best, a desynced cycle bit at worst. cli for the drain's
+    // duration (≤128 tiny TRBs, microseconds — exactly the old IRQ0-inline
+    // posture) makes every drain atomic on the BSP regardless of caller.
+    // No-op cost when already in IRQ context (IF=0 → restore is a no-op).
+    var irq_flags: u64 = 0;
+    asm volatile ("pushfq; pop %[f]; cli"
+        : [f] "=r" (irq_flags),
+    );
+    defer if (irq_flags & 0x200 != 0) asm volatile ("sti");
     // iretq-frame tripwire (task #230). pollHID runs every IRQ0 tick on
     // BSP and consumes user-mode pointers from completed transfer TRBs;
     // it's a prime candidate for wild writes during paint clicks. Check
@@ -2369,21 +2499,34 @@ pub fn pollHID() void {
     // sendCommand / mscScsiCommand are mid-flight on some CPU and have
     // claimed the event ring — deferring HID drain by one tick (10 ms)
     // is invisible to the user, while letting pollHID drain here would
-    // race the awaited event out from under them.
+    // race the awaited event out from under them. (HID events that land
+    // during the op are processed inline by routeHidEventDuringWait, so
+    // input isn't lost — but the typematic gate is deliberately NOT
+    // reopened here: between lock-set and the wait loop's next ring walk
+    // a release can sit queued, and reopening would re-admit the stale-
+    // key spam window. Gate liveness instead rides irq0.zig's 10 Hz .hid
+    // backstop, which must stay unconditional — see the ⚠ there.)
     if (event_drain_locked) return;
     poll_count +%= 1;
+
+    // Snapshot for the typematic-gate reopen below: only a drain that saw
+    // no NEW interrupt land mid-flight may declare key_state current.
+    // (BSP-only access — MSI-X is BSP-directed and assertBSP holds above.)
+    const irq_seq_at_entry = xhci_irq_count;
 
     // Process all pending events from the event ring
     var processed: u32 = 0;
     var db_mask: u8 = 0; // devices needing a doorbell after the loop
+    var ring_emptied = false; // exited on cycle mismatch vs the 128 budget
     while (processed < 128) : (processed += 1) {
         const evt_trb = evt_ring.trbs[evt_dequeue];
         const cycle_bit = (evt_trb.control & 1) != 0;
-        if (cycle_bit != evt_cycle) break;
+        if (cycle_bit != evt_cycle) {
+            ring_emptied = true;
+            break;
+        }
 
         const trb_type = @as(u8, @truncate((evt_trb.control >> 10) & 0x3F));
-        const cc = @as(u8, @truncate(evt_trb.status >> 24));
-        const slot_id = @as(u8, @truncate(evt_trb.control >> 24));
 
         evt_dequeue += 1;
         if (evt_dequeue >= EVT_RING_SIZE) {
@@ -2394,64 +2537,7 @@ pub fn pollHID() void {
 
         event_count +%= 1;
         if (trb_type != TRB_EVENT_TRANSFER) continue;
-
-        var di: ?u8 = null;
-        for (0..device_count) |i| {
-            if (devices[i].slot_id == slot_id and devices[i].active) {
-                di = @intCast(i);
-                break;
-            }
-        }
-        const dev_i = di orelse continue;
-
-        const trb_ptr = evt_trb.param_lo;
-        if (trb_ptr == 0) continue;
-        // trb_ptr points at the data-stage TRB we issued — its phys was
-        // written into the transfer ring; we read it back here. Map through
-        // the physmap so kernel deref works without the legacy low identity.
-        const completed_words: [*]volatile u32 = @ptrFromInt(paging.physToVirt(trb_ptr));
-        const data_addr = completed_words[0];
-        if (data_addr == 0) continue;
-
-        // Only process data on success/short packet
-        if (cc == 1 or cc == 13) {
-            const data: [*]volatile const u8 = @ptrFromInt(paging.physToVirt(data_addr));
-            if (devices[dev_i].is_keyboard) {
-                processKeyboardReport(data);
-            } else if (devices[dev_i].is_mouse or devices[dev_i].is_tablet) {
-                if (devices[dev_i].is_tablet) {
-                    processTabletReport(data);
-                } else {
-                    processMouseReport(data);
-                }
-                mouse_event_tick = process.tick_count;
-                mouse_ever_worked = true;
-            }
-        }
-
-        // ALWAYS re-queue TRB — even on errors! Otherwise the ring starves.
-        if (hid_ring_active[dev_i]) {
-            const ring = &hid_rings[dev_i];
-            if (ring.enqueue < RING_SIZE - 1) {
-                const idx = ring.enqueue;
-                ring.trbs[idx].param_lo = data_addr;
-                ring.trbs[idx].param_hi = 0;
-                ring.trbs[idx].status = 8; // Always 8 bytes (prevents Babble Error)
-                asm volatile ("sfence" ::: .{ .memory = true });
-                ring.trbs[idx].control = (TRB_NORMAL << 10) | (1 << 5) |
-                    (if (ring.cycle) @as(u32, 1) else @as(u32, 0));
-                ring.enqueue = idx + 1;
-                if (ring.enqueue >= RING_SIZE - 1) {
-                    asm volatile ("sfence" ::: .{ .memory = true });
-                    ring.trbs[RING_SIZE - 1].control = (TRB_LINK << 10) | (1 << 1) |
-                        (if (ring.cycle) @as(u32, 1) else @as(u32, 0));
-                    ring.enqueue = 0;
-                    ring.cycle = !ring.cycle;
-                }
-            }
-            requeue_count +%= 1;
-            if (devices[dev_i].is_mouse or devices[dev_i].is_tablet) mouse_requeue_count +%= 1;
-            if (devices[dev_i].is_keyboard) kbd_requeue_count +%= 1;
+        if (handleHidTransferEvent(evt_trb)) |dev_i| {
             db_mask |= @as(u8, 1) << @intCast(dev_i);
         }
     }
@@ -2476,6 +2562,23 @@ pub fn pollHID() void {
         const erdp_phys = evt_ring.phys + @as(usize, evt_dequeue) * 16;
         const ir0_base = rt_base + 0x20;
         writeReg64(ir0_base + 0x18, erdp_phys | (1 << 3));
+    }
+
+    // Budget exhausted with events still queued (storm pile-up). Re-raise
+    // so ksoftirqd finishes the drain promptly instead of leaving the tail
+    // to the 10 Hz backstop — a key-release stuck in that tail for 100 ms
+    // is typematic spam fuel. Task-context raise: safe (we ARE ksoftirqd's
+    // .hid action; the pending bit just re-runs us before it sleeps).
+    if (!ring_emptied) {
+        _ = @import("../proc/softirq.zig").raise(.hid);
+    }
+
+    // Reopen the typematic gate only if the ring is actually EMPTY (a
+    // budget exit may leave a release queued past our exit point) and no
+    // new IRQ landed mid-drain — either way the pending re-raise / the new
+    // IRQ's raise(.hid) re-runs us to clear it then.
+    if (ring_emptied and xhci_irq_count == irq_seq_at_entry) {
+        @atomicStore(bool, &keyboard.ext_events_pending, false, .release);
     }
 
     // Watchdog: if mouse was working and stopped, flag for reset (done from main loop, not IRQ)

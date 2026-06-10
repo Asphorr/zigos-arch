@@ -343,6 +343,14 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
             // pending is per-CPU and their sweep handlers are CPU-agnostic.
             // raise()==false only before ksoftirqd exists (early boot) → inline-
             // sweep fallback so no backstop is ever dropped.
+            //
+            // ⚠ GATE LIVENESS: this .hid raise must stay UNCONDITIONAL (in
+            // particular: never skipped while xhci.event_drain_locked is
+            // held). pollHID early-returns under that lock WITHOUT reopening
+            // keyboard.ext_events_pending — by design, since reopening mid-op
+            // would re-admit a stale-key spam window — so this 10 Hz raise is
+            // what guarantees the typematic gate reopens ≤100 ms after the op
+            // ends. Gating it would wedge auto-repeat closed silently.
             if (process.tick_count % 10 == 0) {
                 const softirq = @import("../../proc/softirq.zig");
                 if (!softirq.raise(.hid)) xhci.pollHID();

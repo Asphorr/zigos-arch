@@ -58,6 +58,16 @@ pub var stall_win_end_tsc: u64 = 0;
 var last_pm: u32 = 0;
 var sample_count: u64 = 0;
 pub var stall_events: u64 = 0;
+/// Subset of stall_events with duration ≥ BIG_STALL_US — the only stalls
+/// that can swallow a key-release long enough to fabricate a phantom
+/// 200ms "hold" (keyboard typematic quarantine trigger). The 15-50ms
+/// drizzle of nested-virt vCPU-steal slices freezes the tick clock along
+/// with the input path (one-shot timer → ~1 late tick per stall), so it
+/// can't manufacture phantom holds — quarantining on every drizzle event
+/// starved legit auto-repeat ("hold-to-delete is slow", 2026-06-10: 84%
+/// of one boot's 991 stalls were <50ms).
+pub var big_stall_events: u64 = 0;
+const BIG_STALL_US: u64 = 50_000;
 pub var max_stall_us: u64 = 0;
 var last_log_tick: u64 = 0;
 
@@ -110,8 +120,15 @@ pub fn tick() void {
     }
 
     if (delta < STALL_THRESHOLD_PM) return;
-    stall_events +%= 1;
+    // Atomic store: keyboard.pollRepeat reads this cross-CPU (desktop loop
+    // may run on an AP) to quarantine typematic repeat across host pauses.
+    // The plain read in the +% is fine — BSP IRQ0 is the ONLY writer, so
+    // this is not a racy RMW; don't "fix" it into @atomicRmw or a lock.
+    @atomicStore(u64, &stall_events, stall_events +% 1, .monotonic);
     const us = delta * 1_000_000 / PM_TMR_HZ;
+    if (us >= BIG_STALL_US) {
+        @atomicStore(u64, &big_stall_events, big_stall_events +% 1, .monotonic);
+    }
     if (us > max_stall_us) max_stall_us = us;
     if (tsc_per_quantum > 0) {
         // PM ticks per 10ms quantum = PM_TMR_HZ/100; gap in TSC ≈

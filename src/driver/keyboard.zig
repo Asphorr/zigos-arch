@@ -2,6 +2,7 @@ const io = @import("../io.zig");
 const debug = @import("../debug/debug.zig");
 const perf = @import("../debug/perf.zig");
 const apic = @import("../time/apic.zig");
+const smi = @import("../time/smi.zig");
 
 /// True after initPS2() succeeds. Read by main.zig at the end of hardware
 /// probe to decide whether to warn about missing input devices.
@@ -296,6 +297,44 @@ var repeat_last_tick: u64 = 0;
 /// fires. Helps confirm pollRepeat is actually being driven by the
 /// desktop loop without filling serial.log on every repeat tick.
 var repeat_logged_for_scancode: u8 = 0;
+/// smi.big_stall_events snapshot taken when repeat tracking (re)starts. A
+/// BIG host vCPU pause can swallow the user's key-RELEASE on the host side
+/// of the freeze (vmconnect/QEMU input pipe) — no ring event, no IRQ,
+/// nothing the ext_events_pending gate can see — and during the congested
+/// aftermath the host input path lags 100s of ms behind guest tick
+/// delivery, so a quick tap looks like a 200ms+ hold and typematic spams
+/// chars. From in here a key "held across a pause" and one released-
+/// during-the-pause are indistinguishable, so when pollRepeat observes a
+/// big stall it RE-BASES the delay instead of firing: a genuine hold
+/// resumes REPEAT_DELAY_TICKS after the last big stall, while a host-
+/// buffered release floods in well inside that window and clears the
+/// tracking first. (The 'g'/'l' char spam under the 2026-06-10 storm —
+/// 1.49s pauses — was exactly this.)
+///
+/// Deliberately the ≥50ms subset, NOT smi.stall_events: the 15-50ms
+/// vCPU-steal drizzle fires several times per second under load, and
+/// re-basing on it starves legit auto-repeat outright (the "hold-to-
+/// delete is slow" regression) — while physically it can't fabricate a
+/// phantom hold (tick clock freezes with the stall; pipe flushes in ms).
+var repeat_stall_seq: u64 = 0;
+
+/// Typematic gate: set by the xHCI MSI-X handler the instant a HID
+/// interrupt fires, cleared by pollHID once the event ring is provably
+/// drained. While set, key_state[] may be STALE — a key-RELEASE report
+/// can sit undrained in the event ring for 100s of ms when the BSP
+/// ksoftirqd is starved (host-pause storm), while the desktop loop keeps
+/// calling pollRepeat against the stale held-bit and fabricates repeats:
+/// the `hellllllllllp` bug. The hard-IRQ handler always runs promptly
+/// even when the drain task lags, so it closes this gate; worst case the
+/// repeat PAUSES until the drain instead of spamming. PS/2 input never
+/// sets it (its release path runs in the IRQ itself).
+///
+/// Known by-design side effect: the xHCI vector is shared by ALL its
+/// endpoints, so heavy mouse/tablet/MSC traffic keeps re-closing the gate
+/// and a held key's repeat can stutter while the pointer is in motion.
+/// Self-heals the first tick USB goes quiet; "repeat feels laggy while
+/// moving the mouse" is this mechanism, not a bug.
+pub var ext_events_pending: bool = false;
 
 /// Begin tracking a held key for typematic auto-repeat. Called from both
 /// PS/2 (`handleScancode`) and USB (`xhci.processKeyboardReport`) on every
@@ -306,6 +345,7 @@ pub fn beginRepeatTracking(scancode: u8, ch: u8, now: u64) void {
     repeat_char = ch;
     repeat_press_tick = now;
     repeat_last_tick = now;
+    repeat_stall_seq = @atomicLoad(u64, &smi.big_stall_events, .monotonic);
 }
 
 /// Stop tracking the typematic-repeat key. Useful when a USB report shows
@@ -326,6 +366,21 @@ pub fn pollRepeat(now: u64) void {
         repeat_logged_for_scancode = 0;
         return;
     }
+    // Host-pause quarantine: a BIG (≥50ms) stall since the press means the
+    // press→now timeline is untrustworthy (the release may have spent the
+    // pause buffered host-side, invisible to the guest). Re-base the delay
+    // instead of firing — see repeat_stall_seq for why only big stalls.
+    const stalls = @atomicLoad(u64, &smi.big_stall_events, .monotonic);
+    if (stalls != repeat_stall_seq) {
+        repeat_stall_seq = stalls;
+        repeat_press_tick = now;
+        repeat_last_tick = now;
+        return;
+    }
+    // Undrained HID events → key_state may be stale (the release could be
+    // in the ring). Pause, don't fabricate; resumes on its own once the
+    // drain catches up (and stops entirely if the drain was a release).
+    if (@atomicLoad(bool, &ext_events_pending, .acquire)) return;
     if (now -% repeat_press_tick < REPEAT_DELAY_TICKS) return;
     if (now -% repeat_last_tick < REPEAT_INTERVAL_TICKS) return;
     if (repeat_logged_for_scancode != repeat_scancode) {
@@ -342,6 +397,11 @@ pub fn pollRepeat(now: u64) void {
 pub fn repeatDue(now: u64) bool {
     if (repeat_scancode == 0) return false;
     if (!key_state[repeat_scancode]) return false;
+    // Asymmetric on purpose: ext_events_pending is honored (pause — the
+    // IRQ that set it wakes the desktop through input delivery anyway),
+    // but smi.stall_events is NOT checked here — a stale-timeline `true`
+    // must still wake the sleeping desktop so pollRepeat can re-base.
+    if (@atomicLoad(bool, &ext_events_pending, .acquire)) return false;
     if (now -% repeat_press_tick < REPEAT_DELAY_TICKS) return false;
     return (now -% repeat_last_tick) >= REPEAT_INTERVAL_TICKS;
 }
