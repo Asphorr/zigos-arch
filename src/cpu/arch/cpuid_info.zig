@@ -209,6 +209,16 @@ pub fn dumpMtrrs() void {
         const t: u8 = @truncate(base & 0xFF);
         const phys_base = base & addr_mask;
         const phys_mask = mask & addr_mask;
+        // A valid MTRR whose mask region is all-zero matches the entire
+        // physical address space (also the shape we'd see if a CPU/hypervisor
+        // misreported MAXPHYADDR and collapsed addr_mask to 0). @ctz(0) is 64,
+        // which would overflow the u6 shift amount below and panic in
+        // ReleaseSafe — so report it explicitly instead of crashing the very
+        // boot dump that exists to triage odd hardware.
+        if (phys_mask == 0) {
+            serial.print("[mtrr] var[{d}] {s} base=0x{X} size=whole-addr-space\n", .{ i, mtrrTypeName(t), phys_base });
+            continue;
+        }
         // MTRR masks are required to be a contiguous run of 1s in the upper
         // bits — region size = 1 << ctz(mask). (Intel SDM Vol 3A §11.11.3)
         const size_ctz = @ctz(phys_mask);
