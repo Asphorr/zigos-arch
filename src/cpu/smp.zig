@@ -976,13 +976,15 @@ fn initPerCpuGdt(cpu: *CpuLocal) void {
     // this initial value matters only for the brief window before the
     // first process is dispatched.
     cpu.tss.rsp0 = @intFromPtr(&cpu.isr_stack) + cpu.isr_stack.len;
-    // IST1 = dedicated per-CPU stack for IRQs marked with ist=1 (currently
-    // IRQ0 + dynamic IRQs — see idt.init). The CPU loads RSP from here on
-    // every entry to those vectors regardless of CPL, so the IRQ handler
-    // chain (handleIRQ0 → schedule → ...) NEVER runs on the preempted
-    // task's kstack. Fixes the netstat-desktop saved-kesp+48 corruption
-    // class. Re-uses the isr_stack buffer (which is otherwise unused after
-    // setTssRsp0 takes over rsp0 management).
+    // IST1 = per-CPU stack for the #DF gate (idt.init installs vector 8 with
+    // ist=1; everything else is IST=0 — the 2026-05-17 attempt to put IRQ0 /
+    // dyn IRQs here was reverted, see idt.init). The CPU loads RSP from here
+    // on #DF delivery regardless of CPL, so a "couldn't push the exception
+    // frame" double fault (kernel stack overflow into a guard page) still
+    // reaches handleException's dump instead of triple-faulting. Re-uses the
+    // isr_stack buffer top — the same buffer the dyn-IRQ Shape-D trampoline
+    // uses in software; aliasing is safe because the #DF path is terminal
+    // and never resumes what it interrupted.
     cpu.tss.ist1 = @intFromPtr(&cpu.isr_stack) + cpu.isr_stack.len;
 
     // Build TSS descriptor pointing to our TSS

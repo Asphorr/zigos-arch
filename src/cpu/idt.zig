@@ -164,8 +164,21 @@ pub fn init() void {
     @memset(std.mem.asBytes(&entries), 0);
 
     // Exception handlers (comptime-generated stubs — body in idt/exception.zig)
+    //
+    // #DF (8) runs on IST1: its trigger is frequently "the CPU could not push
+    // an exception frame on the current RSP" — i.e. a kernel stack overflow
+    // into the slot guard page (the push #PFs, the #PF frame push fails on the
+    // same dead RSP, the CPU escalates to #DF). With IST=0 that second push
+    // failure is a silent triple fault, so the kstack guard pages could never
+    // actually produce a diagnostic. IST1 (per-CPU isr_stack top, populated in
+    // both the legacy and per-CPU TSS) hands the #DF stub a known-good stack.
+    // The IST-vs-switchTo hazard that reverted IRQ0/dyn IRQs off IST1 (see
+    // below) does not apply: the #DF path is terminal — ring-0 dump + halt,
+    // or destroyCurrent of a doomed task — and never resumes the interrupted
+    // context from the IST stack.
     inline for (exception.exceptions) |exc| {
-        setGate(exc.num, @intFromPtr(&exception.ExcStub(exc).handler), 0x8E);
+        const ist: u3 = if (exc.num == 8) 1 else 0;
+        setGateIst(exc.num, @intFromPtr(&exception.ExcStub(exc).handler), 0x8E, ist);
     }
 
     // IRQs

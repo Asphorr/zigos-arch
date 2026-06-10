@@ -87,6 +87,50 @@ fn printSym(addr: u64, app_syms: ?*const symbols.SymTable) void {
     }
     serial.print("??", .{});
 }
+
+// CR2 holds the faulting linear address after a #PF. Stable for the whole
+// handler: every deref the dump paths perform is isMapped-gated, so nothing
+// in here can re-fault and overwrite it before the last reader.
+inline fn readCr2() u64 {
+    return asm volatile ("movq %%cr2, %[ret]"
+        : [ret] "=r" (-> u64),
+    );
+}
+
+// Walk a kernel RBP chain and print symbolized frames. Per-frame validity:
+// the legacy low boot window [0x100000, 0x4000000) (boot stack — only alive
+// pre-enterFirstTask) OR the canonical high half, where every kstack now
+// lives (kstack_pool + heap kstacks in the physmap at 0xFFFF8000_...., the
+// per-CPU isr_stack in kernel-image BSS at 0xFFFFFFFF8...). The high half
+// contains unmapped holes (kstack guard pages, unbacked physmap), so both
+// frame words are isMapped-gated — a corrupt rbp must degrade the backtrace,
+// never #PF the crash dump itself. Mirrors the watch.zig / main.zig walkers;
+// this file predated the kstack pool's BSS→physmap move (2026-06-04) and its
+// low-only range silently printed ZERO frames for any crash on a pool kstack.
+fn printKernelBacktrace(start_rbp: u64, max_depth: u32) void {
+    const paging_mod = @import("../../mm/paging.zig");
+    var rbp = start_rbp;
+    var depth: u32 = 0;
+    while (depth < max_depth) : (depth += 1) {
+        const in_low = rbp >= 0x100000 and rbp < 0x4000000;
+        const in_high = rbp >= 0xFFFF_8000_0000_0000;
+        if (!in_low and !in_high) break;
+        if ((rbp & 7) != 0) break; // misaligned — corrupt chain (and a
+        // ReleaseSafe @ptrFromInt alignment panic-in-panic without this)
+        if (!paging_mod.isMapped(rbp) or !paging_mod.isMapped(rbp + 8)) break;
+        const frame: [*]const u64 = @ptrFromInt(rbp);
+        const ret_addr = frame[1];
+        if (ret_addr == 0) break;
+        if (symbols.resolveKernel(ret_addr)) |r| {
+            serial.print("    [{d}] {s}+0x{X} (0x{X:0>16})\n", .{ depth, r.name, r.offset, ret_addr });
+        } else {
+            serial.print("    [{d}] 0x{X:0>16}\n", .{ depth, ret_addr });
+        }
+        const next = frame[0];
+        if (next <= rbp) break; // frames must climb
+        rbp = next;
+    }
+}
 // Unified exception handler — called from isr_common_exc
 // Stack layout (RSP points to):
 //   [0]  r15  [1]  r14  [2]  r13  [3]  r12
@@ -165,8 +209,11 @@ export fn handleException(rsp: u64) callconv(.c) void {
     // KASAN: the saved-register area + iretq frame above us must be on a
     // *live* kstack. If it's been poisoned (process exited / kstack returned
     // to pool while still in use), KASAN trips here with the writer's
-    // backtrace ahead of the eventual ret-to-garbage crash.
-    @import("../../debug/kasan.zig").expectValid(rsp, 160);
+    // backtrace ahead of the eventual ret-to-garbage crash. 176 = 15 GPRs
+    // (120) + int_no/error_code (16) + the 5-qword iretq frame (40) — in
+    // 64-bit mode the CPU pushes SS:RSP unconditionally, so the frame is
+    // always the full 40 bytes.
+    @import("../../debug/kasan.zig").expectValid(rsp, 176);
 
     // CpuLocal end-canary check (task #229).
     @import("../smp.zig").verifyEndCanary();
@@ -249,9 +296,7 @@ export fn handleException(rsp: u64) callconv(.c) void {
     // Catches writes that DR0 missed (anything outside the watched 4 bytes).
     // Scans ww_entries[]; on a hit, applies that page's whitelist.
     if (int_no == 14) {
-        const cr2 = asm volatile ("movq %%cr2, %[ret]"
-            : [ret] "=r" (-> u64),
-        );
+        const cr2 = readCr2();
         const w_bit = (error_code >> 1) & 1;
         const u_bit = (error_code >> 2) & 1;
         if (w_bit != 0 and u_bit == 0) {
@@ -296,25 +341,8 @@ export fn handleException(rsp: u64) callconv(.c) void {
                 serial.print("  Code:", .{});
                 for (0..@intCast(safe_len)) |i| serial.print(" {X:0>2}", .{code[i]});
                 serial.print("\n", .{});
-                const saved_rbp = stack[10];
-                if (saved_rbp >= 0x100000 and saved_rbp < 0x4000000) {
-                    serial.print("  Backtrace:\n", .{});
-                    var rbp: usize = @intCast(saved_rbp);
-                    var depth: u32 = 0;
-                    while (rbp >= 0x100000 and rbp < 0x4000000 and depth < 16) : (depth += 1) {
-                        const frame: [*]const usize = @ptrFromInt(rbp);
-                        const ret_addr: u64 = @intCast(frame[1]);
-                        if (ret_addr == 0) break;
-                        serial.print("    [{d}] 0x{X:0>16}", .{ depth, ret_addr });
-                        if (sym_mod.resolveKernel(ret_addr)) |r| {
-                            serial.print("  {s}+0x{X}", .{ r.name, r.offset });
-                        }
-                        serial.print("\n", .{});
-                        const next_rbp: usize = @intCast(frame[0]);
-                        if (next_rbp <= rbp) break;
-                        rbp = next_rbp;
-                    }
-                }
+                serial.print("  Backtrace:\n", .{});
+                printKernelBacktrace(stack[10], 16);
                 // Disarm all watches so panic's own writes don't recurse.
                 for (&ww_entries) |*entry| {
                     if (entry.page != 0) @import("../../mm/paging.zig").setWriteWatchRW(@intCast(entry.page), true);
@@ -361,10 +389,7 @@ export fn handleException(rsp: u64) callconv(.c) void {
     if (int_no >= 6) {
         const from_user = (saved_cs & 3) != 0;
         if (!from_user or int_no != 14) {
-            const cr2 = asm volatile ("movq %%cr2, %[ret]"
-                : [ret] "=r" (-> u64),
-            );
-            @import("../../debug/serial.zig").print("[exc] vec={d} err=0x{X} rip=0x{X} cs=0x{X} cr2=0x{X}\n", .{ int_no, error_code, saved_rip, saved_cs, cr2 });
+            @import("../../debug/serial.zig").print("[exc] vec={d} err=0x{X} rip=0x{X} cs=0x{X} cr2=0x{X}\n", .{ int_no, error_code, saved_rip, saved_cs, readCr2() });
         }
     }
 
@@ -388,9 +413,7 @@ export fn handleException(rsp: u64) callconv(.c) void {
         // Page fault: try lazy fault-in before treating as a crash. Resolves
         // any access to a registered lazy region (currently the user stack).
         if (int_no == 14) {
-            const cr2 = asm volatile ("movq %%cr2, %[ret]"
-                : [ret] "=r" (-> u64),
-            );
+            const cr2 = readCr2();
             if (process.handleUserPageFault(@intCast(cr2), error_code)) {
                 asm volatile ("sti");
                 return;
@@ -429,10 +452,7 @@ export fn handleException(rsp: u64) callconv(.c) void {
                 var fault_addr: u64 = 0;
                 var si_code: u32 = signals.SI_KERNEL;
                 if (int_no == 14) {
-                    const cr2 = asm volatile ("movq %%cr2, %[ret]"
-                        : [ret] "=r" (-> u64),
-                    );
-                    fault_addr = cr2;
+                    fault_addr = readCr2();
                     si_code = if ((error_code & 1) == 0) signals.SEGV_MAPERR else signals.SEGV_ACCERR;
                 } else if (int_no == 6) {
                     fault_addr = saved_rip;
@@ -458,9 +478,7 @@ export fn handleException(rsp: u64) callconv(.c) void {
         // a single function with large locals overflowing past the lazy stack.
         var is_stack_overflow = false;
         if (int_no == 14) {
-            const cr2 = asm volatile ("movq %%cr2, %[ret]"
-                : [ret] "=r" (-> u64),
-            );
+            const cr2 = readCr2();
             if (process.currentPCB()) |pcb| {
                 const guard_size: usize = 16 * 4096;
                 if (pcb.stack_base != 0 and cr2 < pcb.stack_base and
@@ -492,9 +510,7 @@ export fn handleException(rsp: u64) callconv(.c) void {
         serial.print("  RSP=0x{X:0>16}  RBP=0x{X:0>16}\n", .{ saved_rsp, saved_rbp });
 
         if (int_no == 14) {
-            const cr2 = asm volatile ("movq %%cr2, %[ret]"
-                : [ret] "=r" (-> u64),
-            );
+            const cr2 = readCr2();
             const p_bit = error_code & 1;
             const w_bit = (error_code >> 1) & 1;
             const u_bit = (error_code >> 2) & 1;
@@ -617,9 +633,7 @@ export fn handleException(rsp: u64) callconv(.c) void {
         // — e.g. "shell faulted at 0x25 because RDI was 0x25, and frame
         // X under shell's PT[1] was last allocated by Y three events ago."
         if (int_no == 14) {
-            const cr2 = asm volatile ("movq %%cr2, %[ret]"
-                : [ret] "=r" (-> u64),
-            );
+            const cr2 = readCr2();
             const cur_pd = if (process.currentPCB()) |pcb| pcb.page_dir_phys else 0;
             @import("../../debug/kdbg.zig").walkUserPT(cur_pd, cr2);
             // Hex dump of the bytes around RSP — most useful when the RBP
@@ -708,9 +722,7 @@ export fn handleException(rsp: u64) callconv(.c) void {
     serial.print("  RSP={X:0>16} SS={X:0>4} RFLAGS={X:0>16}\n", .{ stack[20], stack[21], stack[19] });
 
     // Control registers (read early for crash classifier)
-    const cr2 = asm volatile ("movq %%cr2, %[ret]"
-        : [ret] "=r" (-> u64),
-    );
+    const cr2 = readCr2();
     const cr3 = asm volatile ("movq %%cr3, %[ret]"
         : [ret] "=r" (-> u64),
     );
@@ -765,24 +777,34 @@ export fn handleException(rsp: u64) callconv(.c) void {
         }
     }
 
+    // #DF decode: if the faulting RSP sits inside the kstack pool, name the
+    // slot — and when it's in the slot's guard page, that's THE kernel-stack-
+    // overflow signature (a push into the guard #PFs; the #PF frame push then
+    // fails on the same dead RSP; the CPU escalates to #DF). Vector 8 only
+    // reaches this dump at all because its gate runs on IST1 (see idt.init) —
+    // with IST=0 the same push failure escalates straight to triple fault.
+    if (int_no == 8 and process.kstack_pool_phys_base != 0) {
+        const cfg = @import("../../config.zig");
+        const pool_base = @intFromPtr(process.kstack_pool);
+        const fault_rsp = stack[20];
+        if (fault_rsp >= pool_base and fault_rsp < pool_base + process.KSTACK_POOL_BYTES) {
+            const slot = (fault_rsp - pool_base) / cfg.KSTACK_SLOT_SIZE;
+            const off = (fault_rsp - pool_base) % cfg.KSTACK_SLOT_SIZE;
+            serial.print("  [#DF] RSP in kstack slot {d} off=0x{X}{s}\n", .{
+                slot,
+                off,
+                if (off < cfg.KSTACK_GUARD_SIZE) " — GUARD page: kernel stack overflow" else "",
+            });
+        }
+    }
+
     // Stack backtrace with symbol resolution (follow RBP chain)
     serial.print("  Backtrace:\n", .{});
     // Resolve crash RIP
     if (symbols.resolveKernel(saved_rip)) |r| {
         serial.print("  Crash in: {s}+0x{X}\n", .{ r.name, r.offset });
     }
-    var rbp: usize = @intCast(stack[10]); // saved RBP
-    var depth: u32 = 0;
-    while (rbp > 0x100000 and rbp < 0x4000000 and depth < 10) : (depth += 1) {
-        const frame: [*]const usize = @ptrFromInt(rbp);
-        const ret_addr: u64 = @intCast(frame[1]);
-        if (symbols.resolveKernel(ret_addr)) |r| {
-            serial.print("    [{d}] {s}+0x{X} (0x{X:0>16})\n", .{ depth, r.name, r.offset, ret_addr });
-        } else {
-            serial.print("    [{d}] 0x{X:0>16}\n", .{ depth, ret_addr });
-        }
-        rbp = frame[0];
-    }
+    printKernelBacktrace(stack[10], 16);
 
     // Full kdbg autopsy: cross-CPU snapshot, all-PCB state, ring dumps,
     // hex dump near the kernel RSP, optional PT walk for #PF. Newly added
@@ -853,11 +875,8 @@ fn writeCrashLog(pid: u32, int_no: u64, error_code: u64, rip: u64, name: []const
     pos += writeStr(&buf, pos, " ERR=");
     pos += writeHex64(&buf, pos, error_code);
     if (int_no == 14) {
-        const cr2 = asm volatile ("movq %%cr2, %[ret]"
-            : [ret] "=r" (-> usize),
-        );
         pos += writeStr(&buf, pos, " CR2=");
-        pos += writeHex64(&buf, pos, cr2);
+        pos += writeHex64(&buf, pos, readCr2());
     }
     pos += writeStr(&buf, pos, "\n---\n");
 

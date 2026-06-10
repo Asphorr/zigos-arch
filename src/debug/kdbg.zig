@@ -766,9 +766,14 @@ fn dumpProcSnapshot() void {
 
 /// Dump `qwords` u64s starting at `base`. Resolves possible kernel return
 /// addresses (any value in the kernel .text range) so a stack frame's
-/// saved RIPs are immediately readable. Defensive: refuses non-canonical
-/// or null-page addresses to avoid faulting the autopsy itself.
-pub fn hexDump(base: u64, qwords: u32, label: []const u8) void {
+/// saved RIPs are immediately readable. Defensive: refuses non-canonical,
+/// null-page, or UNMAPPED addresses to avoid faulting the autopsy itself —
+/// crashAutopsy hands this the crashing context's RSP, and the flagship
+/// "kernel stack overflow" #DF has that RSP inside an unmapped kstack
+/// guard page. Base is also 8-aligned down: a corrupt RSP can be odd, and
+/// a misaligned @ptrFromInt(*const u64) is a ReleaseSafe panic-in-autopsy.
+pub fn hexDump(base_raw: u64, qwords: u32, label: []const u8) void {
+    const base = base_raw & ~@as(u64, 7);
     serial.print("[kdbg] Hex dump ({s}) at 0x{X:0>16}:\n", .{ label, base });
     var i: u32 = 0;
     while (i < qwords) : (i += 1) {
@@ -778,6 +783,11 @@ pub fn hexDump(base: u64, qwords: u32, label: []const u8) void {
             (addr >= 0x0000_8000_0000_0000 and addr < 0xFFFF_8000_0000_0000))
         {
             serial.print("  +0x{X:0>3}: <invalid 0x{X}>\n", .{ i * 8, addr });
+            return;
+        }
+        // 8-aligned read never straddles a page, so one walk covers it.
+        if (!@import("../mm/paging.zig").isMapped(addr)) {
+            serial.print("  +0x{X:0>3}: <unmapped 0x{X}>\n", .{ i * 8, addr });
             return;
         }
         const ptr: *const u64 = @ptrFromInt(@as(usize, @intCast(addr)));

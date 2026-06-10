@@ -224,7 +224,7 @@ pub fn init() void {
     // only pre-SMP; smp.init's initPerCpuGdt migrates BSP to per-CPU TSS
     // shortly after this).
     tss.rsp0 = @intFromPtr(&isr_stack) + isr_stack.len;
-    // IST1 for IRQ0 / dyn IRQs (see smp.initPerCpuGdt comment) — same
+    // IST1 for the #DF gate (see smp.initPerCpuGdt comment) — same
     // buffer as RSP0 here since this TSS is only live for the brief
     // pre-SMP window; per-CPU TSS takes over before any task is running.
     tss.ist1 = @intFromPtr(&isr_stack) + isr_stack.len;
