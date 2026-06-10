@@ -997,7 +997,13 @@ pub fn allocFrame() ?usize {
 /// Walks only regions whose end frame is below the 4GB boundary.
 pub fn allocFrameBelow4G() ?usize {
     const max_frame_32: u32 = 0x100000; // 4GB / 4KB
-    const max_region: u32 = max_frame_32 / REGION_FRAMES; // exclusive upper
+    // Clamp to REGIONS_COUNT: every PMM region is already below 4 GB
+    // (MAX_FRAMES caps at 1 GB), so 4GB/REGION_FRAMES (=1024) overshoots the
+    // 256-entry `regions` array. Without the clamp, a below-4G alloc that no
+    // region can satisfy walks ri past REGIONS_COUNT and indexes
+    // regions[256..] — a ReleaseSafe out-of-bounds panic on OOM/fragmentation
+    // instead of the intended null return.
+    const max_region: u32 = @min(max_frame_32 / REGION_FRAMES, REGIONS_COUNT); // exclusive upper
 
     const irq_flags = saveAndDisableIrq();
     defer restoreIrq(irq_flags);
@@ -1312,7 +1318,11 @@ pub fn allocContiguousBelow4G(count: u32) ?usize {
     if (count == 1) return allocFrameBelow4G();
     const ra = @returnAddress();
     const max_frame_32: u32 = 0x100000; // 4GB / 4KB
-    const max_region: u32 = max_frame_32 / REGION_FRAMES;
+    // Clamp to REGIONS_COUNT — see allocFrameBelow4G. 4GB/REGION_FRAMES
+    // overshoots the 256-entry regions array; without the clamp a request
+    // that no below-4G region can satisfy indexes regions[256..] and panics
+    // before the allocContiguousCrossRegion fallback is even reached.
+    const max_region: u32 = @min(max_frame_32 / REGION_FRAMES, REGIONS_COUNT);
 
     var base_opt: ?usize = null;
     if (count <= REGION_FRAMES) {
