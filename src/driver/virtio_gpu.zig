@@ -949,6 +949,10 @@ fn sendCmdViaPhys(cmd_len: u32, resp_len: u32) bool {
 }
 
 pub fn sendCmd(cmd_buf: [*]const u8, cmd_len: u32, resp_buf: [*]u8, resp_len: u32) bool {
+    // LIFO defers: runs AFTER the release below. If a flush-completion
+    // softirq landed while we held the lock (ksoftirqd tryAcquire missed),
+    // re-kick so pending damage doesn't wait on the 10 Hz backstop.
+    defer kickPendingFromTask();
     ctrl_lock.acquire();
     defer ctrl_lock.release();
     // An async flush pair may still be outstanding — wait for + reap it so
@@ -1003,6 +1007,7 @@ fn sendSimpleCmdPair(
     cmd1_buf: [*]const u8,
     cmd1_len: u32,
 ) bool {
+    defer kickPendingFromTask(); // see sendCmd — runs after the release
     ctrl_lock.acquire();
     defer ctrl_lock.release();
     // See sendCmd: drain any outstanding async flush pair first.
@@ -1213,22 +1218,62 @@ fn sendSimpleCmdPair(
 // outstanding ctrl op" invariant that sendCmdViaPhys/sendSimpleCmdPair's
 // last_used_idx accounting relies on, and reusing cmd/resp slots 0+1 safely.
 //
-// Tradeoff: the compositor may scribble the framebuffer while the host DMA
-// still reads it for an in-flight transfer (2D path), or draw into the old
-// front for a moment before SetScanoutBlob lands (flip path) — transient
-// tearing bounded by the one-in-flight rule, in exchange for never stalling
-// the UI on a host present again.
+// Consistency (the v2 "staging snapshot" rework): the first cut let the
+// host DMA read the LIVE framebuffer while the compositor kept drawing the
+// next frame into it — under a fast print burst (`help` scrolling a
+// terminal) QEMU captured half-drawn frames and presented shredded text.
+// The old sync path never showed this because the blocking wait serialized
+// draw → transfer → present. v2 restores that consistency without the
+// blocking: the resource's attached BACKING is a driver-private staging
+// buffer the compositor never sees; at submit time the dirty rects are
+// memcpy'd live FB → staging (complete frames only — the copy runs after
+// the compositor finished drawing and called flush), and the device only
+// ever DMAs from staging. Presents are complete-frame snapshots again.
+//
+// Batch shape (also v2): pending damage is a LIST of up to 16 rects
+// (mirroring ui/desktop/dirty.zig MAX_RECTS) instead of one union bbox —
+// one submission = N precise TransferToHost2D + ONE ResourceFlush of the
+// bbox, one used-ring interrupt at the end. Precise transfers keep DMA
+// bytes proportional to true damage (clock + dock dirty no longer
+// transfers the whole screen); the single flush keeps it to one host
+// present per batch. Single-blob configs never get here; the 2-blob flip
+// path keeps its own pair shape (flip presents the whole frame anyway).
+
+const ABATCH_MAX_RECTS: u32 = 16; // mirrors ui/desktop/dirty.zig MAX_RECTS
+const ABATCH_MAX_CMDS: u32 = ABATCH_MAX_RECTS + 1; // + trailing ResourceFlush
+/// Response-slot stride within resp_phys for the async batch (CtrlHdr is
+/// 24 B; cache-line spacing keeps the device writes from false-sharing).
+/// The sync pair path keeps its historical PAIR_CMD_SLOT_BYTES layout.
+const ABATCH_RESP_STRIDE: u32 = 64;
+comptime {
+    if (ABATCH_MAX_CMDS * PAIR_CMD_SLOT_BYTES > CMD_PAGES * 4096) @compileError("async batch overflows cmd_phys");
+    if (ABATCH_MAX_CMDS * ABATCH_RESP_STRIDE > 4096) @compileError("async batch overflows resp_phys");
+    if (@sizeOf(CtrlHdr) > ABATCH_RESP_STRIDE) @compileError("CtrlHdr exceeds resp stride");
+}
 
 var aflush_in_flight: bool = false;
 var aflush_target_idx: u16 = 0;
-var aflush_descs: [4]u16 = .{ 0, 0, 0, 0 };
+var aflush_ncmds: u32 = 0; // cmds in the in-flight batch (2 for a blob pair)
+var aflush_descs: [2 * ABATCH_MAX_CMDS]u16 = [_]u16{0} ** (2 * ABATCH_MAX_CMDS);
 var aflush_submit_tsc: u64 = 0;
+/// Lock-free mirror of `apend_count != 0` for the IRQ/tickSweep gates.
 var aflush_pending: bool = false;
-// Coalesced dirty rect (exclusive max corner); valid while aflush_pending.
-var aflush_px0: u32 = 0;
-var aflush_py0: u32 = 0;
-var aflush_px1: u32 = 0;
-var aflush_py1: u32 = 0;
+// Pending damage list (exclusive max corners). All mutation under ctrl_lock.
+var apend_rects: [ABATCH_MAX_RECTS][4]u32 = undefined;
+var apend_count: u32 = 0;
+
+// --- Staging snapshot buffer (the resource's attached backing) ---
+// Contiguous PMM allocation, IOMMU-mapped, fb_num_pages long. When
+// staging_active the device NEVER reads the live framebuffer; every
+// transfer site copies its rect live → staging first (async batch path:
+// submitBatchLocked; sync fallbacks: copyRectToStaging at the call sites).
+// Allocation failure falls back to attaching the live FB (pre-v2
+// behavior: correct content, transient tear) and disables the 2D async
+// path so sync blocking keeps presents consistent.
+var staging_phys: usize = 0;
+var staging_pages: u32 = 0;
+var staging_virt: [*]u8 = undefined;
+var staging_active: bool = false;
 
 /// Async needs a working MSI-X → softirq completion path. Early boot and
 /// the S3-resume forced-poll window fall back to the synchronous pair.
@@ -1241,18 +1286,54 @@ fn asyncFlushEligible() bool {
     return @import("../cpu/smp.zig").myCpu().ksoftirqd_pid != null;
 }
 
-fn unionPendingLocked(x0: u32, y0: u32, x1: u32, y1: u32) void {
-    if (aflush_pending) {
-        aflush_px0 = @min(aflush_px0, x0);
-        aflush_py0 = @min(aflush_py0, y0);
-        aflush_px1 = @max(aflush_px1, x1);
-        aflush_py1 = @max(aflush_py1, y1);
-    } else {
-        aflush_px0 = x0;
-        aflush_py0 = y0;
-        aflush_px1 = x1;
-        aflush_py1 = y1;
-        @atomicStore(bool, &aflush_pending, true, .release);
+/// Append a damage rect to the pending list. Overlapping/touching rects
+/// merge in place (successive frames usually dirty the same tiles, so the
+/// list stays short); a full list collapses to its bbox first — bounded
+/// state, worst case = the old single-union behavior. Caller holds
+/// ctrl_lock.
+fn addPendingRectLocked(x0: u32, y0: u32, x1: u32, y1: u32) void {
+    var i: u32 = 0;
+    while (i < apend_count) : (i += 1) {
+        const r = &apend_rects[i];
+        if (x0 <= r[2] and r[0] <= x1 and y0 <= r[3] and r[1] <= y1) {
+            r[0] = @min(r[0], x0);
+            r[1] = @min(r[1], y0);
+            r[2] = @max(r[2], x1);
+            r[3] = @max(r[3], y1);
+            return;
+        }
+    }
+    if (apend_count == ABATCH_MAX_RECTS) {
+        var b = apend_rects[0];
+        i = 1;
+        while (i < apend_count) : (i += 1) {
+            b[0] = @min(b[0], apend_rects[i][0]);
+            b[1] = @min(b[1], apend_rects[i][1]);
+            b[2] = @max(b[2], apend_rects[i][2]);
+            b[3] = @max(b[3], apend_rects[i][3]);
+        }
+        apend_rects[0] = b;
+        apend_count = 1;
+    }
+    apend_rects[apend_count] = .{ x0, y0, x1, y1 };
+    apend_count += 1;
+    @atomicStore(bool, &aflush_pending, true, .release);
+}
+
+/// Snapshot a rect of the live framebuffer into the staging backing. The
+/// device only DMAs from staging, so what the host presents is whatever
+/// the compositor had finished drawing when the submit path ran — never a
+/// mid-draw frame. No-op when staging is unattached (fallback config).
+fn copyRectToStaging(x0: u32, y0: u32, x1: u32, y1: u32) void {
+    if (!staging_active) return;
+    const fb_bytes: [*]const u8 = @ptrCast(@volatileCast(framebuffer));
+    const row_bytes: usize = @as(usize, x1 - x0) * 4;
+    const stride: usize = @as(usize, width) * 4;
+    var off: usize = @as(usize, y0) * stride + @as(usize, x0) * 4;
+    var y: u32 = y0;
+    while (y < y1) : (y += 1) {
+        @memcpy(staging_virt[off .. off + row_bytes], fb_bytes[off .. off + row_bytes]);
+        off += stride;
     }
 }
 
@@ -1275,7 +1356,7 @@ fn submitPairAsyncLocked(
     @memcpy(@as([*]volatile u8, @ptrFromInt(cmd_base))[0..cmd0_len], cmd0_buf[0..cmd0_len]);
     @memcpy(@as([*]volatile u8, @ptrFromInt(cmd_base + PAIR_CMD_SLOT_BYTES))[0..cmd1_len], cmd1_buf[0..cmd1_len]);
     @memset(@as([*]volatile u8, @ptrFromInt(resp_base))[0..@sizeOf(CtrlHdr)], 0);
-    @memset(@as([*]volatile u8, @ptrFromInt(resp_base + PAIR_CMD_SLOT_BYTES))[0..@sizeOf(CtrlHdr)], 0);
+    @memset(@as([*]volatile u8, @ptrFromInt(resp_base + ABATCH_RESP_STRIDE))[0..@sizeOf(CtrlHdr)], 0);
 
     const c0d0_idx = ctrl_vq.free_head;
     const c0d0 = ctrl_vq.descPtr(c0d0_idx);
@@ -1301,7 +1382,7 @@ fn submitPairAsyncLocked(
     c1d0.len = cmd1_len;
     c1d0.flags = VRING_DESC_F_NEXT;
     c1d0.next = c1d1_idx;
-    c1d1.addr = resp_phys + PAIR_CMD_SLOT_BYTES;
+    c1d1.addr = resp_phys + ABATCH_RESP_STRIDE;
     c1d1.len = @sizeOf(CtrlHdr);
     c1d1.flags = VRING_DESC_F_WRITE;
     c1d1.next = 0;
@@ -1321,20 +1402,28 @@ fn submitPairAsyncLocked(
     notifyQueue(0, &ctrl_vq);
 
     aflush_target_idx = ctrl_vq.last_used_idx +% 2;
-    aflush_descs = .{ c0d0_idx, c0d1_idx, c1d0_idx, c1d1_idx };
+    aflush_ncmds = 2;
+    aflush_descs[0] = c0d0_idx;
+    aflush_descs[1] = c0d1_idx;
+    aflush_descs[2] = c1d0_idx;
+    aflush_descs[3] = c1d1_idx;
     aflush_submit_tsc = perf.rdtsc();
     @atomicStore(bool, &aflush_in_flight, true, .release);
     return true;
 }
 
 fn freeAflushDescsLocked() void {
-    const d = aflush_descs;
-    ctrl_vq.descPtr(d[3]).next = ctrl_vq.free_head;
-    ctrl_vq.descPtr(d[2]).next = d[3];
-    ctrl_vq.descPtr(d[1]).next = d[2];
-    ctrl_vq.descPtr(d[0]).next = d[1];
-    ctrl_vq.free_head = d[0];
-    ctrl_vq.num_free += 4;
+    const n: u32 = aflush_ncmds * 2;
+    if (n == 0) return;
+    var next: u16 = ctrl_vq.free_head;
+    var i: u32 = n;
+    while (i > 0) {
+        i -= 1;
+        ctrl_vq.descPtr(aflush_descs[i]).next = next;
+        next = aflush_descs[i];
+    }
+    ctrl_vq.free_head = next;
+    ctrl_vq.num_free += @intCast(n);
 }
 
 /// Reap the in-flight async pair if complete — free its descriptors,
@@ -1351,11 +1440,16 @@ fn reapAsyncFlushLocked() bool {
         // timeout: resync, free, count a failure.
         const tpq = apic.tscPerQuantum();
         if (tpq != 0 and (perf.rdtsc() -% aflush_submit_tsc) > tpq *% 200) {
+            // KNOWN LIMITATION (same as sendSimpleCmdPair's sync timeout
+            // resync): the device still owns these descriptor indices; a
+            // LATE completion after they're reused can alias onto the next
+            // batch's accounting. Accepted for a host that's already dead
+            // for 2s+; a generation stamp would close it properly.
             ctrl_vq.last_used_idx = usedIdxCoherent(&ctrl_vq);
             freeAflushDescsLocked();
             @atomicStore(bool, &aflush_in_flight, false, .release);
             _ = noteFlushResult(false);
-            debug.klog("[virtio-gpu] async pair ABANDONED after ~2s (host unresponsive)\n", .{});
+            debug.klog("[virtio-gpu] async batch ABANDONED after ~2s (host unresponsive)\n", .{});
             return true;
         }
         return false;
@@ -1365,13 +1459,16 @@ fn reapAsyncFlushLocked() bool {
     @atomicStore(bool, &aflush_in_flight, false, .release);
 
     const resp_base: usize = paging.physToVirt(resp_phys);
-    clflushRange(resp_base, @sizeOf(CtrlHdr));
-    clflushRange(resp_base + PAIR_CMD_SLOT_BYTES, @sizeOf(CtrlHdr));
-    const resp0: *const CtrlHdr = @ptrFromInt(resp_base);
-    const resp1: *const CtrlHdr = @ptrFromInt(resp_base + PAIR_CMD_SLOT_BYTES);
-    const ok = resp0.cmd_type == RESP_OK_NODATA and resp1.cmd_type == RESP_OK_NODATA;
-    if (!ok) {
-        debug.klog("[virtio-gpu] async pair error: resp0=0x{X} resp1=0x{X}\n", .{ resp0.cmd_type, resp1.cmd_type });
+    var ok = true;
+    var ci: u32 = 0;
+    while (ci < aflush_ncmds) : (ci += 1) {
+        const slot = resp_base + ci * ABATCH_RESP_STRIDE;
+        clflushRange(slot, @sizeOf(CtrlHdr));
+        const resp: *const CtrlHdr = @ptrFromInt(slot);
+        if (resp.cmd_type != RESP_OK_NODATA) {
+            ok = false;
+            debug.klog("[virtio-gpu] async batch error: cmd {d}/{d} resp=0x{X}\n", .{ ci, aflush_ncmds, resp.cmd_type });
+        }
     }
     _ = noteFlushResult(ok);
     return true;
@@ -1409,126 +1506,224 @@ fn waitAsyncFlushIdleLocked() void {
     }
 }
 
-/// Build + submit the present pair for the (already clipped, exclusive-max)
-/// rect — fire-and-forget. Caller holds ctrl_lock with nothing outstanding.
-/// Handles the double-buffered flip and 2D transfer+flush shapes; single-
-/// blob configs never get here (flushRectAsyncSubmit rejects them).
-fn submitFlushRectLocked(x0: u32, y0: u32, x1: u32, y1: u32) bool {
-    if (scanout_is_blob and blob_count >= 2) {
-        const new_front = 1 - blob_front;
-        var sb = SetScanoutBlob{
-            .hdr = .{ .cmd_type = CMD_SET_SCANOUT_BLOB },
-            .r = .{ .x = 0, .y = 0, .width = width, .height = height },
-            .scanout_id = 0,
-            .resource_id = blob_resource_ids[new_front],
-            .width = width,
-            .height = height,
-            .format = FORMAT_B8G8R8X8_UNORM,
-            .strides = .{ width * 4, 0, 0, 0 },
-        };
-        var rf = ResourceFlush{
-            .hdr = .{ .cmd_type = CMD_RESOURCE_FLUSH },
-            .r = .{ .x = 0, .y = 0, .width = width, .height = height },
-            .resource_id = blob_resource_ids[new_front],
-            .padding = 0,
-        };
-        if (!submitPairAsyncLocked(
-            @as([*]const u8, @ptrCast(&sb)),
-            @sizeOf(SetScanoutBlob),
-            @as([*]const u8, @ptrCast(&rf)),
-            @sizeOf(ResourceFlush),
-        )) {
-            _ = noteFlushResult(false);
-            return false;
-        }
-        // Flip immediately: the compositor draws the next frame into the
-        // old front. Until the host processes SetScanoutBlob it still
-        // scans out from that buffer — a transient tear, bounded by the
-        // one-in-flight rule, traded for never blocking on present.
-        blob_front = new_front;
-        framebuffer = blob_virt[1 - new_front];
-        current_resource_id = blob_resource_ids[1 - new_front];
-        return true;
-    }
-    const w = x1 - x0;
-    const h = y1 - y0;
-    const offset: u64 = @as(u64, y0) * @as(u64, width) * 4 + @as(u64, x0) * 4;
-    var th = TransferToHost2D{
-        .hdr = .{ .cmd_type = CMD_TRANSFER_TO_HOST_2D },
-        .r = .{ .x = x0, .y = y0, .width = w, .height = h },
-        .offset = offset,
-        .resource_id = current_resource_id,
-        .padding = 0,
+/// Double-buffered blob present — fire-and-forget flip. Caller holds
+/// ctrl_lock with nothing outstanding. Rect args are irrelevant: a flip
+/// always presents the whole back buffer.
+fn submitBlobFlipAsyncLocked() bool {
+    const new_front = 1 - blob_front;
+    var sb = SetScanoutBlob{
+        .hdr = .{ .cmd_type = CMD_SET_SCANOUT_BLOB },
+        .r = .{ .x = 0, .y = 0, .width = width, .height = height },
+        .scanout_id = 0,
+        .resource_id = blob_resource_ids[new_front],
+        .width = width,
+        .height = height,
+        .format = FORMAT_B8G8R8X8_UNORM,
+        .strides = .{ width * 4, 0, 0, 0 },
     };
     var rf = ResourceFlush{
         .hdr = .{ .cmd_type = CMD_RESOURCE_FLUSH },
-        .r = .{ .x = x0, .y = y0, .width = w, .height = h },
-        .resource_id = current_resource_id,
+        .r = .{ .x = 0, .y = 0, .width = width, .height = height },
+        .resource_id = blob_resource_ids[new_front],
         .padding = 0,
     };
     if (!submitPairAsyncLocked(
-        @as([*]const u8, @ptrCast(&th)),
-        @sizeOf(TransferToHost2D),
+        @as([*]const u8, @ptrCast(&sb)),
+        @sizeOf(SetScanoutBlob),
         @as([*]const u8, @ptrCast(&rf)),
         @sizeOf(ResourceFlush),
     )) {
         _ = noteFlushResult(false);
         return false;
     }
+    // Flip immediately: the compositor draws the next frame into the
+    // old front. Until the host processes SetScanoutBlob it still
+    // scans out from that buffer — a transient tear, bounded by the
+    // one-in-flight rule, traded for never blocking on present.
+    blob_front = new_front;
+    framebuffer = blob_virt[1 - new_front];
+    current_resource_id = blob_resource_ids[1 - new_front];
     return true;
 }
 
-/// Submit any coalesced pending rect once the queue is free. Caller holds
-/// ctrl_lock. On submit failure the rect goes back to pending (retried by
+/// Snapshot + submit a damage batch: each rect is copied live FB →
+/// staging, then N TransferToHost2D + one ResourceFlush of the bbox go
+/// out as a single virtqueue submission with ONE completion interrupt
+/// (usedEvent armed at the last command). Caller holds ctrl_lock with
+/// nothing outstanding; 2D-scanout + staging_active only.
+fn submitBatchLocked(rects: []const [4]u32) bool {
+    var n: u32 = @intCast(rects.len);
+    if (n == 0) return true;
+    var local: [ABATCH_MAX_RECTS][4]u32 = undefined;
+    @memcpy(local[0..n], rects);
+
+    // Descriptor pressure (sync ops sharing the queue): degrade to the
+    // bbox — 2 cmds, 4 descs — before giving up entirely.
+    if (ctrl_vq.num_free < 2 * (n + 1) and n > 1) {
+        var b = local[0];
+        var i: u32 = 1;
+        while (i < n) : (i += 1) {
+            b[0] = @min(b[0], local[i][0]);
+            b[1] = @min(b[1], local[i][1]);
+            b[2] = @max(b[2], local[i][2]);
+            b[3] = @max(b[3], local[i][3]);
+        }
+        local[0] = b;
+        n = 1;
+    }
+    const ncmds: u32 = n + 1;
+    if (ctrl_vq.num_free < 2 * ncmds) return false;
+
+    const cmd_base: usize = paging.physToVirt(cmd_phys);
+    const resp_base: usize = paging.physToVirt(resp_phys);
+
+    // Stage commands: one transfer per rect, tracking the bbox for the
+    // trailing flush. The staging copy happens HERE — the device reads
+    // only staging, so this batch presents exactly what the compositor
+    // had finished drawing at this moment.
+    var bx0: u32 = 0xFFFF_FFFF;
+    var by0: u32 = 0xFFFF_FFFF;
+    var bx1: u32 = 0;
+    var by1: u32 = 0;
+    var ci: u32 = 0;
+    while (ci < n) : (ci += 1) {
+        const r = local[ci];
+        copyRectToStaging(r[0], r[1], r[2], r[3]);
+        bx0 = @min(bx0, r[0]);
+        by0 = @min(by0, r[1]);
+        bx1 = @max(bx1, r[2]);
+        by1 = @max(by1, r[3]);
+        var th = TransferToHost2D{
+            .hdr = .{ .cmd_type = CMD_TRANSFER_TO_HOST_2D },
+            .r = .{ .x = r[0], .y = r[1], .width = r[2] - r[0], .height = r[3] - r[1] },
+            .offset = @as(u64, r[1]) * @as(u64, width) * 4 + @as(u64, r[0]) * 4,
+            .resource_id = current_resource_id,
+            .padding = 0,
+        };
+        const dst: [*]volatile u8 = @ptrFromInt(cmd_base + ci * PAIR_CMD_SLOT_BYTES);
+        @memcpy(dst[0..@sizeOf(TransferToHost2D)], @as([*]const u8, @ptrCast(&th))[0..@sizeOf(TransferToHost2D)]);
+    }
+    var rf = ResourceFlush{
+        .hdr = .{ .cmd_type = CMD_RESOURCE_FLUSH },
+        .r = .{ .x = bx0, .y = by0, .width = bx1 - bx0, .height = by1 - by0 },
+        .resource_id = current_resource_id,
+        .padding = 0,
+    };
+    const rf_dst: [*]volatile u8 = @ptrFromInt(cmd_base + n * PAIR_CMD_SLOT_BYTES);
+    @memcpy(rf_dst[0..@sizeOf(ResourceFlush)], @as([*]const u8, @ptrCast(&rf))[0..@sizeOf(ResourceFlush)]);
+
+    ci = 0;
+    while (ci < ncmds) : (ci += 1) {
+        @memset(@as([*]volatile u8, @ptrFromInt(resp_base + ci * ABATCH_RESP_STRIDE))[0..@sizeOf(CtrlHdr)], 0);
+    }
+
+    // Descriptor chains + avail entries (same dance as the pair path,
+    // generalized to ncmds 2-desc chains).
+    const ai = ctrl_vq.availIdx().*;
+    ci = 0;
+    while (ci < ncmds) : (ci += 1) {
+        const d0_idx = ctrl_vq.free_head;
+        const d0 = ctrl_vq.descPtr(d0_idx);
+        const d1_idx: u16 = @intCast(d0.next);
+        const d1 = ctrl_vq.descPtr(d1_idx);
+        ctrl_vq.free_head = @intCast(d1.next);
+        d0.addr = cmd_phys + ci * PAIR_CMD_SLOT_BYTES;
+        d0.len = if (ci < n) @sizeOf(TransferToHost2D) else @sizeOf(ResourceFlush);
+        d0.flags = VRING_DESC_F_NEXT;
+        d0.next = d1_idx;
+        d1.addr = resp_phys + ci * ABATCH_RESP_STRIDE;
+        d1.len = @sizeOf(CtrlHdr);
+        d1.flags = VRING_DESC_F_WRITE;
+        d1.next = 0;
+        aflush_descs[ci * 2] = d0_idx;
+        aflush_descs[ci * 2 + 1] = d1_idx;
+        ctrl_vq.availRing((ai +% @as(u16, @intCast(ci))) % ctrl_vq.queue_size).* = d0_idx;
+    }
+    ctrl_vq.num_free -= @intCast(2 * ncmds);
+    asm volatile ("" ::: .{ .memory = true });
+    ctrl_vq.availIdx().* = ai +% @as(u16, @intCast(ncmds));
+
+    if (use_event_idx) {
+        // Interrupt once, at the LAST completion (same math as the pair's
+        // +1-for-2: device signals when used_idx crosses usedEvent).
+        ctrl_vq.usedEvent().* = ctrl_vq.last_used_idx +% @as(u16, @intCast(ncmds - 1));
+        asm volatile ("" ::: .{ .memory = true });
+    }
+
+    notifyQueue(0, &ctrl_vq);
+
+    aflush_target_idx = ctrl_vq.last_used_idx +% @as(u16, @intCast(ncmds));
+    aflush_ncmds = ncmds;
+    aflush_submit_tsc = perf.rdtsc();
+    @atomicStore(bool, &aflush_in_flight, true, .release);
+    return true;
+}
+
+/// Submit the pending damage list once the queue is free. Caller holds
+/// ctrl_lock. On submit failure the rects go back to pending (retried by
 /// the next flush call / softirq / tick).
 fn kickPendingFlushLocked() void {
-    if (aflush_in_flight or !aflush_pending) return;
+    if (aflush_in_flight or apend_count == 0) return;
     if (!asyncFlushEligible()) return;
-    if (scanout_is_blob and blob_count < 2) {
-        // Shape changed under us to single-blob (sync-only) — drop it; the
-        // compositor's next flush repaints through the sync path.
+    if (scanout_is_blob) {
+        apend_count = 0;
+        @atomicStore(bool, &aflush_pending, false, .release);
+        if (blob_count >= 2) {
+            // A flip presents the whole frame — the pending damage (drawn
+            // into the current back buffer) rides it; rect values moot.
+            _ = submitBlobFlipAsyncLocked();
+        }
+        // Single-blob: sync path owns presentation; drop (next flush
+        // repaints through it).
+        return;
+    }
+    if (!staging_active) {
+        // Shape changed under us (staging lost) — drop; the sync fallback
+        // paths repaint consistently by blocking.
+        apend_count = 0;
         @atomicStore(bool, &aflush_pending, false, .release);
         return;
     }
-    const x0 = aflush_px0;
-    const y0 = aflush_py0;
-    const x1 = aflush_px1;
-    const y1 = aflush_py1;
+    const local: [ABATCH_MAX_RECTS][4]u32 = apend_rects;
+    const cnt = apend_count;
+    apend_count = 0;
     @atomicStore(bool, &aflush_pending, false, .release);
-    if (!submitFlushRectLocked(x0, y0, x1, y1)) unionPendingLocked(x0, y0, x1, y1);
+    if (!submitBatchLocked(local[0..cnt])) {
+        var i: u32 = 0;
+        while (i < cnt) : (i += 1) {
+            addPendingRectLocked(local[i][0], local[i][1], local[i][2], local[i][3]);
+        }
+    }
 }
 
 /// Async entry for the flush paths. Returns true if the rect was handled
-/// (submitted or coalesced) — the caller is done. False = not eligible;
-/// the caller runs the original synchronous body.
+/// (submitted or queued) — the caller is done. False = not eligible; the
+/// caller runs the original synchronous body.
 fn flushRectAsyncSubmit(x0: u32, y0: u32, x1: u32, y1: u32) bool {
     if (!asyncFlushEligible()) return false;
     if (scanout_is_blob and blob_count < 2) return false; // single-cmd shape — sync path
+    if (!scanout_is_blob and !staging_active) return false; // no snapshot buffer — sync path stays consistent by blocking
     ctrl_lock.acquire();
     defer ctrl_lock.release();
     _ = reapAsyncFlushLocked();
-    if (aflush_in_flight) {
-        // One pair in flight max: this frame's damage rides the next
-        // submit, unioned with whatever else lands meanwhile. No wait —
-        // that's the whole point.
-        unionPendingLocked(x0, y0, x1, y1);
-        return true;
-    }
-    var fx0 = x0;
-    var fy0 = y0;
-    var fx1 = x1;
-    var fy1 = y1;
-    if (aflush_pending) {
-        fx0 = @min(fx0, aflush_px0);
-        fy0 = @min(fy0, aflush_py0);
-        fx1 = @max(fx1, aflush_px1);
-        fy1 = @max(fy1, aflush_py1);
-        @atomicStore(bool, &aflush_pending, false, .release);
-    }
-    if (!submitFlushRectLocked(fx0, fy0, fx1, fy1)) {
-        unionPendingLocked(fx0, fy0, fx1, fy1);
-    }
+    // Queue the damage; kick no-ops while a batch is still in flight (the
+    // rects ride the next kick, merged with whatever else lands meanwhile).
+    addPendingRectLocked(x0, y0, x1, y1);
+    kickPendingFlushLocked();
     return true;
+}
+
+/// Post-release hook for the sync ctrl-op paths: a completion interrupt
+/// that fired while WE held ctrl_lock made ksoftirqd's tryAcquire miss —
+/// without this, a pending damage batch would sit until the 10 Hz backstop
+/// (~100 ms of stale screen). Raised from task context, never from the
+/// drain itself, so ksoftirqd can't self-wake-spin (the Inc1 lesson).
+fn kickPendingFromTask() void {
+    if (@atomicLoad(bool, &aflush_pending, .acquire) and
+        !@atomicLoad(bool, &aflush_in_flight, .acquire))
+    {
+        _ = @import("../proc/softirq.zig").raise(.virtio_gpu);
+    }
 }
 
 // --- GPU commands ---
@@ -1712,6 +1907,75 @@ fn attachBacking(resource_id: u32, pages: []const usize, page_count: u32) bool {
         return false;
     }
     return true;
+}
+
+/// attachBacking for the contiguous staging allocation — one MemEntry, no
+/// per-page array. Unlike the boot-only attachBacking, this quiesces any
+/// in-flight async batch BEFORE staging into cmd_phys (mode changes can
+/// run with async live).
+fn attachBackingContiguous(resource_id: u32, base_phys: usize, npages: u32) bool {
+    ctrl_lock.acquire();
+    defer ctrl_lock.release();
+    waitAsyncFlushIdleLocked();
+
+    const cmd_dst: [*]volatile u8 = @ptrFromInt(paging.physToVirt(cmd_phys));
+    @memset(cmd_dst[0..4096], 0);
+    const attach: *volatile AttachBacking = @ptrFromInt(paging.physToVirt(cmd_phys));
+    attach.hdr.cmd_type = CMD_RESOURCE_ATTACH_BACKING;
+    attach.resource_id = resource_id;
+    attach.nr_entries = 1;
+    const entries: [*]volatile MemEntry = @ptrFromInt(paging.physToVirt(cmd_phys + @sizeOf(AttachBacking)));
+    entries[0] = .{ .addr = base_phys, .length = @intCast(@as(usize, npages) * 4096), .padding = 0 };
+    const total_len: u32 = @sizeOf(AttachBacking) + @sizeOf(MemEntry);
+
+    const resp_dst: [*]volatile u8 = @ptrFromInt(paging.physToVirt(resp_phys));
+    @memset(resp_dst[0..@sizeOf(CtrlHdr)], 0);
+    if (!sendCmdViaPhys(total_len, @sizeOf(CtrlHdr))) return false;
+
+    clflushRange(paging.physToVirt(resp_phys), @sizeOf(CtrlHdr)); // gap #2
+    const resp: *const CtrlHdr = @ptrFromInt(paging.physToVirt(resp_phys));
+    if (resp.cmd_type != RESP_OK_NODATA) {
+        debug.klog("[virtio-gpu] staging ATTACH_BACKING failed: 0x{X}\n", .{resp.cmd_type});
+        return false;
+    }
+    return true;
+}
+
+/// (Re)allocate the staging snapshot buffer to match fb_num_pages. Reuse
+/// across S3 resume (same size, RAM + IOMMU domain survive); realloc on
+/// mode change. Failure is non-fatal: staging_active stays false, the
+/// resource gets the live FB as backing (pre-v2 behavior) and the 2D
+/// async path disables itself.
+fn ensureStaging() void {
+    if (staging_active and staging_pages == fb_num_pages) return;
+    // Serialize against the flush path: ksoftirqd's pending-kick memcpys
+    // into staging under ctrl_lock — freeing the old buffer outside it
+    // would be a use-after-free of a live DMA target (mode change racing
+    // a leftover-damage kick). Also drop pending damage here: those rects
+    // describe the buffer being freed. Boot/S3 callers are uncontended;
+    // the S3 path is force_polled so the idle-wait pause-spins, no park.
+    ctrl_lock.acquire();
+    defer ctrl_lock.release();
+    waitAsyncFlushIdleLocked();
+    apend_count = 0;
+    @atomicStore(bool, &aflush_pending, false, .release);
+    if (staging_phys != 0) {
+        staging_active = false;
+        iommu.dmaUnmap(pci_bus, pci_dev, pci_func, staging_phys, @as(usize, staging_pages) * 4096);
+        pmm.freeContiguous(staging_phys, staging_pages);
+        staging_phys = 0;
+        staging_pages = 0;
+    }
+    const phys = pmm.allocContiguous(fb_num_pages) orelse {
+        debug.klog("[virtio-gpu] staging alloc failed ({d} pages) — live-FB backing, 2D async flush disabled\n", .{fb_num_pages});
+        return;
+    };
+    staging_phys = phys;
+    staging_pages = fb_num_pages;
+    staging_virt = @ptrFromInt(paging.physToVirt(phys));
+    _ = iommu.dmaMap(pci_bus, pci_dev, pci_func, phys, @as(usize, fb_num_pages) * 4096, .{});
+    @memset(staging_virt[0 .. @as(usize, fb_num_pages) * 4096], 0);
+    staging_active = true;
 }
 
 fn setScanout(resource_id: u32, w: u32, h: u32) bool {
@@ -2118,6 +2382,8 @@ pub fn resumeFromS3() bool {
     // stale descriptor indices into the rebuilt free list.
     @atomicStore(bool, &aflush_in_flight, false, .release);
     @atomicStore(bool, &aflush_pending, false, .release);
+    aflush_ncmds = 0;
+    apend_count = 0;
 
     // --- Re-drive the device handshake (per virtio §3.1.1) ---
     // Unlike init (which runs against an already-reset device at boot), here the
@@ -2277,10 +2543,12 @@ pub fn dumpWaiterForTarget(target: u32) void {
     debug.klog("    num_free      = {d}\n", .{ctrl_vq.num_free});
     debug.klog("    irq_count     = {d}\n", .{virtio_gpu_irq_count});
     debug.klog("    ipis_sent     = {d}\n", .{virtio_gpu_wake_ipis_sent});
-    debug.klog("    aflush: in_flight={any} pending={any} target={d}\n", .{
+    debug.klog("    aflush: in_flight={any} ncmds={d} pend_rects={d} target={d} staging={any}\n", .{
         @atomicLoad(bool, &aflush_in_flight, .acquire),
-        @atomicLoad(bool, &aflush_pending, .acquire),
+        aflush_ncmds,
+        apend_count,
         aflush_target_idx,
+        staging_active,
     });
     if (hw_used != ctrl_vq.last_used_idx) {
         debug.klog("    ===> HW advanced beyond SW; tickSweep should pick this up next tick\n", .{});
@@ -2298,8 +2566,16 @@ fn setupDisplay(w: u32, h: u32) bool {
         debug.klog("[virtio-gpu] RESOURCE_CREATE_2D failed\n", .{});
         return false;
     }
-    debug.klog("[virtio-gpu] Attaching {d} pages...\n", .{fb_num_pages});
-    if (!attachBacking(current_resource_id, fb_page_phys[0..fb_num_pages], fb_num_pages)) {
+    ensureStaging();
+    debug.klog("[virtio-gpu] Attaching {d} pages ({s} backing)...\n", .{
+        fb_num_pages,
+        if (staging_active) @as([]const u8, "staging") else "live-FB",
+    });
+    const attached = if (staging_active)
+        attachBackingContiguous(current_resource_id, staging_phys, staging_pages)
+    else
+        attachBacking(current_resource_id, fb_page_phys[0..fb_num_pages], fb_num_pages);
+    if (!attached) {
         debug.klog("[virtio-gpu] ATTACH_BACKING failed\n", .{});
         return false;
     }
@@ -2308,6 +2584,7 @@ fn setupDisplay(w: u32, h: u32) bool {
         debug.klog("[virtio-gpu] SET_SCANOUT failed\n", .{});
         return false;
     }
+    copyRectToStaging(0, 0, w, h);
     _ = transferToHost(current_resource_id, 0, 0, w, h);
     _ = resourceFlushCmd(current_resource_id, 0, 0, w, h);
     return true;
@@ -2594,7 +2871,12 @@ pub fn flushUnconditional() void {
         _ = noteFlushResult(resourceFlushCmd(current_resource_id, 0, 0, width, height));
     } else {
         // 2D fallback: full transfer + flush — also batched into one
-        // virtqueue submit + single MSI-X round-trip.
+        // virtqueue submit + single MSI-X round-trip. Snapshot first: the
+        // attached backing is the staging buffer, not the live FB. (If an
+        // async batch is somehow still in flight — panic mid-flight — the
+        // device may read a torn staging once; sendSimpleCmdPair drains it
+        // before this transfer, so the FINAL present is consistent.)
+        copyRectToStaging(0, 0, width, height);
         var th = TransferToHost2D{
             .hdr = .{ .cmd_type = CMD_TRANSFER_TO_HOST_2D },
             .r = .{ .x = 0, .y = 0, .width = width, .height = height },
@@ -2670,7 +2952,9 @@ pub fn flushRectUnconditional(x: u32, y: u32, w: u32, h: u32) void {
     } else if (scanout_is_blob) {
         _ = noteFlushResult(resourceFlushCmd(current_resource_id, x0, y0, x1 - x0, y1 - y0));
     } else {
-        // 2D fallback dirty-rect path — transfer + flush batched.
+        // 2D fallback dirty-rect path — transfer + flush batched. Snapshot
+        // first (see flushUnconditional).
+        copyRectToStaging(x0, y0, x1, y1);
         const xferw = x1 - x0;
         const xferh = y1 - y0;
         const offset: u64 = @as(u64, y0) * @as(u64, width) * 4 + @as(u64, x0) * 4;
@@ -2729,6 +3013,7 @@ pub fn markFullDirty() void {
 pub fn flushDirty() void {
     if (!active) return;
     if (dirty_x_min >= dirty_x_max or dirty_y_min >= dirty_y_max) return;
+    if (!scanout_is_blob) copyRectToStaging(dirty_x_min, dirty_y_min, dirty_x_max, dirty_y_max);
     _ = transferToHost(current_resource_id, dirty_x_min, dirty_y_min, dirty_x_max - dirty_x_min, dirty_y_max - dirty_y_min);
     _ = resourceFlushCmd(current_resource_id, dirty_x_min, dirty_y_min, dirty_x_max - dirty_x_min, dirty_y_max - dirty_y_min);
     dirty_x_min = 0xFFFFFFFF;
