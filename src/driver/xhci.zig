@@ -635,6 +635,14 @@ pub fn init() bool {
     var iman = readReg(ir0_base + 0x00);
     iman |= 0x02; // IE (Interrupt Enable)
     writeReg(ir0_base + 0x00, iman);
+    // Interrupt moderation: IMODI = 4000 × 250 ns = 1 ms. An isolated event
+    // still interrupts immediately (the moderation counter expired long
+    // ago) — only bursts coalesce. Without this every HID transfer event
+    // fired its own MSI-X → raise(.hid) → wake(ksoftirqd) → two schedule
+    // passes; a mouse drag is hundreds of events/s, so that chain ran
+    // hundreds of times/s. 1 ms caps it at ≤1000 IRQs/s and pollHID
+    // batch-drains whatever accumulated.
+    writeReg(ir0_base + 0x04, 4000);
 
     // --- Start controller ---
     cmd = readReg(op_base + USBCMD);
@@ -806,6 +814,7 @@ pub fn resumeFromS3() bool {
     var iman = readReg(ir0_base + 0x00);
     iman |= 0x02; // IE
     writeReg(ir0_base + 0x00, iman);
+    writeReg(ir0_base + 0x04, 4000); // IMODI = 1 ms moderation (see init)
 
     // --- Start the controller ---
     cmd = readReg(op_base + USBCMD);
@@ -2366,6 +2375,7 @@ pub fn pollHID() void {
 
     // Process all pending events from the event ring
     var processed: u32 = 0;
+    var db_mask: u8 = 0; // devices needing a doorbell after the loop
     while (processed < 128) : (processed += 1) {
         const evt_trb = evt_ring.trbs[evt_dequeue];
         const cycle_bit = (evt_trb.control & 1) != 0;
@@ -2442,9 +2452,22 @@ pub fn pollHID() void {
             requeue_count +%= 1;
             if (devices[dev_i].is_mouse or devices[dev_i].is_tablet) mouse_requeue_count +%= 1;
             if (devices[dev_i].is_keyboard) kbd_requeue_count +%= 1;
-            // Doorbell immediately per event
-            asm volatile ("sfence" ::: .{ .memory = true });
-            ringDoorbell(devices[dev_i].slot_id, devices[dev_i].ep_dci);
+            db_mask |= @as(u8, 1) << @intCast(dev_i);
+        }
+    }
+
+    // Ring each dirty device's doorbell ONCE for all its re-queued TRBs.
+    // The doorbell is an idempotent "check your ring" kick and each MMIO
+    // write is a VM exit — the old per-event ringing cost a 128-event
+    // burst 128 exits. The single sfence orders every TRB control-bit
+    // write above before any kick. No refill beyond the re-queues: the
+    // ring self-sustains, 1 event in = 1 TRB re-queued.
+    if (db_mask != 0) {
+        asm volatile ("sfence" ::: .{ .memory = true });
+        for (0..device_count) |i| {
+            if (db_mask & (@as(u8, 1) << @intCast(i)) != 0) {
+                ringDoorbell(devices[i].slot_id, devices[i].ep_dci);
+            }
         }
     }
 
@@ -2453,17 +2476,6 @@ pub fn pollHID() void {
         const erdp_phys = evt_ring.phys + @as(usize, evt_dequeue) * 16;
         const ir0_base = rt_base + 0x20;
         writeReg64(ir0_base + 0x18, erdp_phys | (1 << 3));
-    }
-
-    // Doorbells are rung per-event above (not batched).
-    // No refill — each completed transfer is re-queued individually.
-    // The ring self-sustains: 1 event in = 1 TRB re-queued.
-    for (0..device_count) |i| {
-        if (!devices[i].active) continue;
-        if (devices[i].is_msc) continue;
-        if (devices[i].tr_ring) |*ring| {
-            _ = ring;
-        }
     }
 
     // Watchdog: if mouse was working and stopped, flag for reset (done from main loop, not IRQ)
