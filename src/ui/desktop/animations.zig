@@ -124,7 +124,20 @@ pub fn start(idx: u8, atype: AnimationType) void {
 }
 
 pub fn advance() void {
-    for (wm.z_stack[0..wm.z_count]) |i| {
+    // Iterate slots, NOT z_stack. A closing window's final frame calls
+    // process.killProcess → desktop.destroyGuiWindow → removeWindow, which
+    // splices the closing window (and any same-PID siblings) out of z_stack
+    // mid-iteration. Walking z_stack here would then skip whatever shifted
+    // into the freed z-position and read a stale trailing entry on the final
+    // iteration — masked only because the common case closes the topmost
+    // window (the last iteration, where the splice just drops the tail).
+    // Advancing animations is order-independent, and stable slot IDs mean
+    // removeWindow never relocates another window's data, so slot order is
+    // both correct and immune to the splice. (destroyGuiWindow iterates
+    // slots for exactly this reason — see its comment.)
+    for (0..wm.MAX_WINDOWS) |k| {
+        const i: u8 = @intCast(k);
+        if (!wm.slot_used[i]) continue;
         const w = &wm.windows[i];
         if (w.anim_type == .none) continue;
 
