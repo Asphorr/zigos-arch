@@ -43,35 +43,59 @@ var lock: @import("../proc/spinlock.zig").SpinLock = .{};
 /// Allocate a new shared region of `size_pages` 4 KB pages. Frames are
 /// zeroed (POSIX requires zero-initialized anon memory). Returns the
 /// region id on success, null on full table / OOM / oversize.
+///
+/// Three-phase to keep the cli windows tiny: the old single-lock version
+/// held the cli'd shm lock across up to 256 allocFrameUser calls (each
+/// nesting pmm's region lock) plus 1 MB of memset — the largest avoidable
+/// cli window in the kernel, [cli-hold]-visible past 5 ms. Only the slot
+/// reserve and the publish need the lock; the alloc+zero in between
+/// touches a slot nothing else can reach: the id isn't stored in any
+/// LazyRegion until we return it, acquire() rejects refcount==0, and
+/// size_pages==0 makes frameAt reject every page_idx by construction.
 pub fn create(size_pages: u32) ?u32 {
     if (size_pages == 0 or size_pages > MAX_PAGES_PER_REGION) return null;
-    const flags = lock.acquireIrqSave();
-    defer lock.releaseIrqRestore(flags);
 
+    // Phase 1 — reserve a slot (in_use=true blocks other creators; the
+    // refcount=0 + size_pages=0 combo marks "mid-create, inert").
     var id: u32 = 0;
-    while (id < MAX_SHM_REGIONS) : (id += 1) {
-        if (!regions[id].in_use) break;
+    {
+        const flags = lock.acquireIrqSave();
+        defer lock.releaseIrqRestore(flags);
+        while (id < MAX_SHM_REGIONS) : (id += 1) {
+            if (!regions[id].in_use) break;
+        }
+        if (id == MAX_SHM_REGIONS) return null;
+        regions[id].in_use = true;
+        regions[id].size_pages = 0;
+        regions[id].refcount = 0;
     }
-    if (id == MAX_SHM_REGIONS) return null;
 
-    var allocated: u16 = 0;
+    // Phase 2 — allocate + zero with interrupts ON.
+    var allocated: u32 = 0;
     while (allocated < size_pages) : (allocated += 1) {
-        const phys = pmm.allocFrameUser() orelse {
-            while (allocated > 0) {
-                allocated -= 1;
-                pmm.freeFrame(regions[id].frames[allocated]);
-                regions[id].frames[allocated] = 0;
-            }
-            return null;
-        };
+        const phys = pmm.allocFrameUser() orelse break;
         const vptr: [*]u8 = @ptrFromInt(paging.physToVirt(phys));
         @memset(vptr[0..4096], 0);
         regions[id].frames[allocated] = phys;
     }
+    if (allocated < size_pages) {
+        // OOM unwind: free what we got, un-reserve the slot.
+        while (allocated > 0) {
+            allocated -= 1;
+            pmm.freeFrame(regions[id].frames[allocated]);
+            regions[id].frames[allocated] = 0;
+        }
+        const flags = lock.acquireIrqSave();
+        regions[id].in_use = false;
+        lock.releaseIrqRestore(flags);
+        return null;
+    }
 
-    regions[id].in_use = true;
+    // Phase 3 — publish.
+    const flags = lock.acquireIrqSave();
     regions[id].size_pages = @intCast(size_pages);
     regions[id].refcount = 1;
+    lock.releaseIrqRestore(flags);
     return id;
 }
 
@@ -84,6 +108,13 @@ pub fn acquire(id: u32) bool {
     const flags = lock.acquireIrqSave();
     defer lock.releaseIrqRestore(flags);
     if (!regions[id].in_use) return false;
+    // refcount==0 while in_use means mid-create (phase 2, lock dropped) —
+    // the id was never published, so a caller passing it holds a bogus id.
+    if (regions[id].refcount == 0) return false;
+    // Saturate, don't wrap: an unchecked u16 += at 65535 is an overflow
+    // PANIC in the ReleaseSafe oracle build. Unreachable today (attachers
+    // are bounded by MAX_PROCS), but fail the acquire rather than the box.
+    if (regions[id].refcount == std.math.maxInt(u16)) return false;
     regions[id].refcount += 1;
     return true;
 }
@@ -115,11 +146,19 @@ pub fn release(id: u32) void {
 /// Caller must hold a refcount on the region (otherwise the lookup races
 /// with release). The page-fault handler is the only legitimate caller
 /// and runs in the context of a process whose LazyRegion holds the ref.
+///
+/// Lock-free by design: the held refcount keeps in_use=true and frames[]
+/// stable, and x86-TSO store ordering means a (hypothetical) racing reader
+/// can't see in_use before the frames that were written first. Belt-and-
+/// suspenders: a 0 frame reads as null rather than as "map phys page 0
+/// into userspace" — the failure mode if the refcount invariant is ever
+/// broken and we race a teardown's frames[i]=0.
 pub fn frameAt(id: u32, page_idx: u32) ?u64 {
     if (id >= MAX_SHM_REGIONS) return null;
     if (!regions[id].in_use) return null;
     if (page_idx >= regions[id].size_pages) return null;
-    return regions[id].frames[page_idx];
+    const f = regions[id].frames[page_idx];
+    return if (f == 0) null else f;
 }
 
 pub fn sizePages(id: u32) u32 {
