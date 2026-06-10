@@ -45,6 +45,15 @@ pub const Phase = enum(u8) {
     /// time visible. Never passed to leave() by a caller — set only internally by
     /// recordPause. (2026-06-05)
     host_pause,
+    /// Samples whose [start,end] overlaps an smi-detected IRQ0 stall window
+    /// (≥15ms PM_TMR gap). Catches what the magnitude ceilings can't: a
+    /// 9-12ms L1-CFS vCPU-steal slice inside a µs-scale schedule() sample
+    /// sits far below CEIL_COMPUTE yet inflates that phase's mean 1000×.
+    /// cli'd phases get the verdict DEFERRED one tick (see the pending slot
+    /// in leave()) because smi can only publish the window at the IRQ0
+    /// AFTER the stall — which, for an IF=0 sample, is after leave() has
+    /// already run. Never passed to leave() by a caller. (2026-06-10)
+    smi_stall,
 };
 
 const PHASE_COUNT: usize = @typeInfo(Phase).@"enum".fields.len;
@@ -65,6 +74,7 @@ pub const phase_name: [PHASE_COUNT][]const u8 = .{
     "comp_corner_blit",
     "comp_flush",
     "host_pause",
+    "smi_stall",
 };
 
 pub const Counter = struct {
@@ -144,6 +154,67 @@ inline fn recordPause(cpu_id: usize, dt: u64) void {
     if (dt > c.max) c.max = dt;
 }
 
+/// True when [start,end] overlaps smi's most-recent stall window — the
+/// sample contains an smi-detected (≥15ms) IRQ0 gap and its dt is freeze
+/// time, not on-CPU cost. Window vars are 0 until the first stall.
+inline fn stallOverlaps(start: u64, end: u64) bool {
+    const smi = @import("../time/smi.zig");
+    const w_end = @atomicLoad(u64, &smi.stall_win_end_tsc, .acquire);
+    if (w_end == 0) return false;
+    const w_start = @atomicLoad(u64, &smi.stall_win_start_tsc, .monotonic);
+    return start < w_end and w_start < end;
+}
+
+/// Final classification of a sample: stall-overlap quarantine first (precise),
+/// then the magnitude ceiling (catch-all), then the real phase.
+fn commitSample(cpu_id: usize, phase: Phase, start: u64, end: u64) void {
+    const dt = end -% start;
+    if (phase != .host_pause and phase != .smi_stall) {
+        if (stallOverlaps(start, end)) {
+            const c = &phases[cpu_id][@intFromEnum(Phase.smi_stall)];
+            c.total +%= dt;
+            c.count +%= 1;
+            if (dt > c.max) c.max = dt;
+            return;
+        }
+        if (dt > pauseCeiling(phase)) {
+            recordPause(cpu_id, dt);
+            return;
+        }
+    }
+    const c = &phases[cpu_id][@intFromEnum(phase)];
+    c.total +%= dt;
+    c.count +%= 1;
+    if (dt > c.max) c.max = dt;
+}
+
+/// Deferred-verdict slot, one per CPU. cli'd phases (the CEIL_COMPUTE set:
+/// schedule + IRQ handlers + exceptions) run with IRQ0 masked, so a stall
+/// inside them is only published by smi at the IRQ0 AFTER leave() ran — an
+/// immediate stallOverlaps() check always misses. Suspicious samples
+/// (≥SUSPECT_FLOOR — genuine sched/IRQ bodies are µs-scale, steal slices
+/// are ms-scale) park here for ~3 quanta so smi's window can arrive, then
+/// classify. Single-slot is enough: suspicious samples are a few/s even
+/// mid-storm; an overflow just classifies immediately (worst case one
+/// mis-binned sample). Owned by its CPU; pending_busy guards against a
+/// nested leave() (IRQ landing inside a task-context leave) re-entering.
+const Pending = struct {
+    phase: Phase = .syscall,
+    start: u64 = 0,
+    end: u64 = 0,
+    valid: bool = false,
+};
+var pending: [MAX_CPUS]Pending = [_]Pending{.{}} ** MAX_CPUS;
+var pending_busy: [MAX_CPUS]bool = [_]bool{false} ** MAX_CPUS;
+
+/// ~1.7ms at 3GHz. Genuine schedule/IRQ bodies are µs-scale; a sample this
+/// long in a cli'd phase is steal-slice-shaped and worth holding one tick.
+const SUSPECT_FLOOR: u64 = 5_000_000;
+
+inline fn deferEligible(phase: Phase) bool {
+    return pauseCeiling(phase) == CEIL_COMPUTE;
+}
+
 pub fn leave(phase: Phase, start_tsc: u64) void {
     const end = rdtsc();
     const dt = end -% start_tsc;
@@ -152,17 +223,34 @@ pub fn leave(phase: Phase, start_tsc: u64) void {
     if (cpu_id >= MAX_CPUS) return;
     if (wall_start_tsc[cpu_id] == 0) wall_start_tsc[cpu_id] = start_tsc;
     wall_last_tsc[cpu_id] = end;
-    // A span past this phase's ceiling isn't on-CPU work — a host vCPU pause landed
-    // inside the measured window. Divert it so it doesn't poison this phase's
-    // mean/total/max. (host_pause is the sink itself — never re-divert it.)
-    if (phase != .host_pause and dt > pauseCeiling(phase)) {
-        recordPause(cpu_id, dt);
+
+    if (pending_busy[cpu_id]) {
+        // Nested inside this CPU's own pending-slot manipulation — classify
+        // with whatever stall info exists now rather than touching the slot.
+        commitSample(cpu_id, phase, start_tsc, end);
         return;
     }
-    const c = &phases[cpu_id][@intFromEnum(phase)];
-    c.total +%= dt;
-    c.count +%= 1;
-    if (dt > c.max) c.max = dt;
+    pending_busy[cpu_id] = true;
+    defer pending_busy[cpu_id] = false;
+
+    // Resolve an aged pending sample: 3 quanta past its end, smi has had
+    // its post-stall tick (or there was no stall) — verdict is in.
+    if (pending[cpu_id].valid) {
+        const tpq = @import("../time/apic.zig").tscPerQuantum();
+        if (tpq == 0 or end -% pending[cpu_id].end > 3 *% tpq) {
+            const pd = pending[cpu_id];
+            pending[cpu_id].valid = false;
+            commitSample(cpu_id, pd.phase, pd.start, pd.end);
+        }
+    }
+
+    // Park a suspicious cli'd-phase sample for the deferred verdict.
+    // Over-ceiling samples skip the wait — commitSample diverts them anyway.
+    if (deferEligible(phase) and dt >= SUSPECT_FLOOR and dt <= pauseCeiling(phase) and !pending[cpu_id].valid) {
+        pending[cpu_id] = .{ .phase = phase, .start = start_tsc, .end = end, .valid = true };
+        return;
+    }
+    commitSample(cpu_id, phase, start_tsc, end);
 }
 
 /// Bump the per-syscall-number counter. Called from doSyscall around the
@@ -175,6 +263,12 @@ pub fn syscallSample(num: u32, dt: u64) void {
     // per-number mean) — the paired leave(.syscall) already bucketed it into
     // host_pause, so recording here too would double-count.
     if (dt > CEIL_SYSCALL) return;
+    // Stall-overlap guard: syscalls run IF=1, so a host pause inside one has
+    // already latched-and-fired IRQ0 on resume → smi published the window
+    // BEFORE the syscall returned. end≈now (called right after measurement;
+    // µs of skew vs a ≥15ms window is noise), start = end - dt.
+    const end = rdtsc();
+    if (stallOverlaps(end -% dt, end)) return;
     const c = &syscalls[num];
     c.total +%= dt;
     c.count +%= 1;
@@ -188,6 +282,7 @@ pub fn resetAll() void {
     for (&syscalls) |*c| c.reset();
     @memset(&wall_start_tsc, 0);
     @memset(&wall_last_tsc, 0);
+    for (&pending) |*p| p.valid = false;
 }
 
 /// Print a formatted summary to serial. Caller is responsible for any preamble
@@ -213,7 +308,7 @@ pub fn dumpAll() void {
             // phases now read an honest %wall ≤100 on their own, because the pause
             // spikes that used to push schedule past 200% are diverted out of their
             // totals before we get here.
-            if (p == @intFromEnum(Phase.host_pause)) {
+            if (p == @intFromEnum(Phase.host_pause) or p == @intFromEnum(Phase.smi_stall)) {
                 serial.print(
                     "[perf] {s:11} {d:>3} {d:>10} {d:>14} {d:>11} {d:>10}     --\n",
                     .{ phase_name[p], cpu_id, c.count, c.total, mean, c.max },

@@ -44,6 +44,17 @@ var pm_tmr_port: u16 = 0;
 var pm_tmr_mask: u32 = 0;
 var initialized: bool = false;
 
+/// Most-recent stall window in BSP TSC, published for perf.zig's sample
+/// quarantine (a perf sample whose [start,end] overlaps this window was
+/// host-pause-contaminated, regardless of its magnitude). start is derived
+/// from the PM_TMR gap via tsc_per_quantum — approximate, which is fine:
+/// this drives quarantine decisions, not accounting. end published LAST
+/// with .release so a reader that observes it sees the matching start.
+/// Published unconditionally per detected stall (NOT behind the 1/s log
+/// rate-limit) — perf needs every window.
+pub var stall_win_start_tsc: u64 = 0;
+pub var stall_win_end_tsc: u64 = 0;
+
 var last_pm: u32 = 0;
 var sample_count: u64 = 0;
 pub var stall_events: u64 = 0;
@@ -102,6 +113,13 @@ pub fn tick() void {
     stall_events +%= 1;
     const us = delta * 1_000_000 / PM_TMR_HZ;
     if (us > max_stall_us) max_stall_us = us;
+    if (tsc_per_quantum > 0) {
+        // PM ticks per 10ms quantum = PM_TMR_HZ/100; gap in TSC ≈
+        // delta * tsc_per_quantum / that. Publish for perf's quarantine.
+        const delta_tsc = delta * tsc_per_quantum / (PM_TMR_HZ / 100);
+        @atomicStore(u64, &stall_win_start_tsc, now_tsc -% delta_tsc, .monotonic);
+        @atomicStore(u64, &stall_win_end_tsc, now_tsc, .release);
+    }
     // Rate limit: log at most once per second (every 100 BSP IRQ0s).
     if (sample_count - last_log_tick < 100) return;
     last_log_tick = sample_count;
