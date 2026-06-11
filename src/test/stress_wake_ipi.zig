@@ -70,36 +70,54 @@ var hist_tick: u32 = 0; // < 50M cyc   (~14 ms)
 var hist_slow: u32 = 0; // < 500M cyc  (~140 ms)
 var hist_broken: u32 = 0; // >= 500M cyc
 var hist_neg: u32 = 0; // negative (TSC went backward across CPUs)
+var hist_spurious: u32 = 0; // same iter_index seen twice (double wake)
 var max_latency: u64 = 0;
 var sum_latency: u64 = 0;
 
 fn workerEntry() callconv(.c) noreturn {
     var counter: u32 = 0;
+    var last_iter: u32 = 0xFFFF_FFFF;
     while (@atomicLoad(u32, &worker_should_exit, .acquire) == 0) {
         const target: u32 = @truncate(@intFromPtr(&iter_done));
         process.blockOn(.futex, target);
         const tsc = perf.rdtsc();
-        const send = @atomicLoad(u64, &send_tsc, .acquire);
-
-        // Treat backward TSC (host paused TSC during VMEXIT, or cross-
-        // CPU skew) as a separate bucket. Don't fold it into instant —
-        // the read would be misleading.
-        if (send > tsc) {
-            hist_neg +%= 1;
+        // The SHUTDOWN wake must not be measured: it arrives with a stale
+        // send_tsc from the last real iteration, so it used to book one
+        // bogus slow/broken tally — a perfect run still summarized 1001
+        // wakes for 1000 driven, with 1 "broken" scaring the reader.
+        if (@atomicLoad(u32, &worker_should_exit, .acquire) != 0) break;
+        // Spurious-wake dedup: a doubled delivery (wake_pending latched
+        // while we hadn't re-blocked yet) re-measures the SAME iteration
+        // against the same send_tsc, second time with inflated latency.
+        // iter_index is written by the driver before each wake precisely
+        // for this; the worker just never read it until now.
+        const cur_iter = @atomicLoad(u32, &iter_index, .acquire);
+        if (cur_iter == last_iter) {
+            hist_spurious +%= 1;
         } else {
-            const latency = tsc - send;
-            sum_latency +%= latency;
-            if (latency > max_latency) max_latency = latency;
-            if (latency < 100_000) {
-                hist_instant +%= 1;
-            } else if (latency < 1_000_000) {
-                hist_fast +%= 1;
-            } else if (latency < 50_000_000) {
-                hist_tick +%= 1;
-            } else if (latency < 500_000_000) {
-                hist_slow +%= 1;
+            last_iter = cur_iter;
+            const send = @atomicLoad(u64, &send_tsc, .acquire);
+
+            // Treat backward TSC (host paused TSC during VMEXIT, or cross-
+            // CPU skew) as a separate bucket. Don't fold it into instant —
+            // the read would be misleading.
+            if (send > tsc) {
+                hist_neg +%= 1;
             } else {
-                hist_broken +%= 1;
+                const latency = tsc - send;
+                sum_latency +%= latency;
+                if (latency > max_latency) max_latency = latency;
+                if (latency < 100_000) {
+                    hist_instant +%= 1;
+                } else if (latency < 1_000_000) {
+                    hist_fast +%= 1;
+                } else if (latency < 50_000_000) {
+                    hist_tick +%= 1;
+                } else if (latency < 500_000_000) {
+                    hist_slow +%= 1;
+                } else {
+                    hist_broken +%= 1;
+                }
             }
         }
         counter +%= 1;
@@ -111,6 +129,15 @@ fn workerEntry() callconv(.c) noreturn {
 pub fn taskEntry() callconv(.c) noreturn {
     serial.print("[wake-ipi] cross-CPU wake latency test (v2)\n", .{});
     serial.print("[wake-ipi] worker pinned to cpu{d}; {d} iters, {d}ms per iter\n", .{ TARGET_CPU, ITERATIONS, SLEEP_MS });
+
+    // A cross-CPU wake test needs the cross CPU. Booted single-CPU
+    // (safe mode / no-APIC), the worker would be created pinned to a CPU
+    // that never runs it: 1000 silent no_wakes and a "broken" verdict
+    // about a bug that isn't there.
+    if (smp.cpu_count <= TARGET_CPU) {
+        serial.print("[wake-ipi] FATAL: needs cpu{d} online (cpu_count={d}) — boot full SMP\n", .{ TARGET_CPU, smp.cpu_count });
+        while (true) asm volatile ("cli; hlt");
+    }
 
     const w_pid_opt = process.createKernelTask(
         @intFromPtr(&workerEntry),
@@ -186,6 +213,7 @@ pub fn taskEntry() callconv(.c) noreturn {
     serial.print("[wake-ipi] slow    <500M cyc   = {d} ({d}%)\n", .{ fs, pct(fs, counted) });
     serial.print("[wake-ipi] broken >=500M cyc   = {d} ({d}%)\n", .{ fb, pct(fb, counted) });
     serial.print("[wake-ipi] negative (TSC skew) = {d}\n", .{fn_});
+    serial.print("[wake-ipi] spurious (dup wake, deduped) = {d}\n", .{@atomicLoad(u32, &hist_spurious, .acquire)});
     serial.print("[wake-ipi] no_wake (driver didn't see iter_done bump) = {d}\n", .{no_wake_count});
     serial.print("[wake-ipi] avg latency = {d} cyc, max = {d} cyc\n", .{ avg, max_latency });
     serial.print("[wake-ipi] Reading the result:\n", .{});
