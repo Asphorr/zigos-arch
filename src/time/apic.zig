@@ -5,6 +5,8 @@ const io = @import("../io.zig");
 const paging = @import("../mm/paging.zig");
 const acpi = @import("../acpi/acpi.zig");
 const debug = @import("../debug/debug.zig");
+const pit = @import("pit.zig");
+const pic = @import("pic.zig");
 
 // Local APIC + IOAPIC bases — stored as kernel-pointer VAs through the
 // physmap (PHYSMAP_BASE + phys). Phase 3 dropped PML4[0], so the raw
@@ -649,6 +651,24 @@ pub fn init() bool {
     // Sanity check
     if (apic_timer_count < 100 or apic_timer_count > 100000000) {
         debug.klog("[apic] WARNING: calibration seems wrong, falling back to PIC\n", .{});
+        // The takeover above must be UNWOUND or the fallback banner is a
+        // lie: disablePIC() left the 8259 remapped to 0xF0/0xF8 with every
+        // line masked, and initLAPIC() software-enabled the LAPIC — whose
+        // LVT LINT0 is reset-masked, so even an unmasked PIC's INTR dies
+        // at the LAPIC. Net effect was NO tick + NO keyboard: scheduler
+        // frozen at the first sleep, input dead — a wedge, not a fallback.
+        // Repair: re-mask the two IOAPIC pins we unmasked (the i8042 lines
+        // are wired to both controllers — leaving them open would deliver
+        // keystrokes twice), open a virtual-wire path through the enabled
+        // LAPIC (LVT LINT0 = ExtINT, unmasked — the CPU then INTAs the
+        // 8259 directly, MP-spec virtual wire; same config Linux programs
+        // in init_bsp_APIC), and re-program the PIC back to vectors
+        // 0x20/0x28 with IRQ0+IRQ1 open. apic_active stays false, so
+        // sendEOI and pic.enableIRQ keep talking to the 8259.
+        maskIsaIrq(1, 33);
+        maskIsaIrq(12, 44);
+        lapicWrite(LAPIC_LVT_LINT0, 0x700); // delivery mode 111 = ExtINT, unmasked
+        pic.init();
         return false;
     }
     if (tsc_deadline_active and (tsc_per_quantum < 1_000_000 or tsc_per_quantum > 100_000_000_000)) {
@@ -662,6 +682,12 @@ pub fn init() bool {
     startTimer();
 
     apic_active = true;
+
+    // The LAPIC timer owns the tick now — halt PIT channel 0. It was left
+    // free-running at 100 Hz into a dead-ended line (PIC remapped+masked,
+    // IOAPIC's ISA-IRQ0 GSI never unmasked). Stopping it also matches the
+    // post-S3 steady state, where the PIT comes back unprogrammed/silent.
+    pit.stop();
     debug.klog("[apic] timer config: source={s} mode={s} freq=100Hz\n", .{
         if (calibrated_via_hyperv) "Hyper-V" else if (calibrated_via_hpet) "HPET" else "PIT",
         if (tsc_deadline_active) "TSC-deadline" else "LAPIC-count",

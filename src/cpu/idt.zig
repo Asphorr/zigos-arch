@@ -196,6 +196,12 @@ pub fn init() void {
     setGate(33, @intFromPtr(&misc_irq.isr_irq1), 0x8E);
     setGate(44, @intFromPtr(&misc_irq.isr_irq12), 0x8E); // Mouse
 
+    // 8259 spurious vectors (legacy-PIC mode only): master IRQ7 → 0x27,
+    // slave IRQ15 → 0x2F. These were non-present entries, turning line
+    // noise on a PIC-fallback boot into a #GP panic. See misc_irq.zig.
+    setGate(0x27, @intFromPtr(&misc_irq.isr_pic7_spurious), 0x8E);
+    setGate(0x2F, @intFromPtr(&misc_irq.isr_pic15_spurious), 0x8E);
+
     // TLB shootdown IPI (vector from mmu/tlb.zig). Receiver: full local TLB flush + ack.
     setGate(@import("mmu/tlb.zig").TLB_VECTOR, @intFromPtr(&misc_irq.isr_tlb_shootdown), 0x8E);
 
