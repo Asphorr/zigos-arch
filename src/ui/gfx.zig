@@ -600,10 +600,60 @@ pub fn drawString32(x: i32, y: i32, str: []const u8, fg: u32, bg: u32) void {
     }
 }
 
-// --- 16x16 icon rendering ---
+// --- App icon rendering ---
+//
+// Modern set (icons.zig, generated): 32x32 straight-alpha ARGB tiles,
+// composited with blendPixel so the anti-aliased edges sit correctly on
+// any background (glass dock, wallpaper, drag ghosts).
+// Classic set (icons.classic): the original hand-authored 16x16 pixel
+// art, drawn 2x pixel-doubled with 0 = transparent. Not wired to any
+// surface today — preserved for a future Settings appearance toggle.
 
-/// Draw a 16x16 icon scaled 2x to 32x32.
-pub fn drawIcon32(x: i32, y: i32, icon: *const [16][16]u32) void {
+/// Draw a 32x32 ARGB icon 1:1, alpha-blending onto the target.
+pub fn drawIcon32(x: i32, y: i32, icon: *const icons.Icon) void {
+    for (0..icons.SIZE) |row| {
+        const py = y + @as(i32, @intCast(row));
+        if (py < 0) continue;
+        if (py >= @as(i32, @intCast(target_h))) break;
+        const row_off = @as(u32, @intCast(py)) * target_w;
+        for (0..icons.SIZE) |col| {
+            const argb = icon[row][col];
+            if (argb >> 24 == 0) continue; // fully transparent
+            const px = x + @as(i32, @intCast(col));
+            if (px < 0) continue;
+            if (px >= @as(i32, @intCast(target_w))) break;
+            const off = row_off + @as(u32, @intCast(px));
+            target[off] = blendPixel(target[off], argb);
+        }
+    }
+}
+
+/// Like `drawIcon32` but scales the icon's baked alpha by `alpha`
+/// (0..255). Used for drag-ghost preview: the icon follows the cursor at
+/// ~63% opacity, so the user sees both the desktop underneath AND what
+/// they're moving.
+pub fn drawIcon32Alpha(x: i32, y: i32, icon: *const icons.Icon, alpha: u8) void {
+    if (alpha == 0) return;
+    for (0..icons.SIZE) |row| {
+        const py = y + @as(i32, @intCast(row));
+        if (py < 0) continue;
+        if (py >= @as(i32, @intCast(target_h))) break;
+        const row_off = @as(u32, @intCast(py)) * target_w;
+        for (0..icons.SIZE) |col| {
+            const argb = icon[row][col];
+            const a = (argb >> 24) * alpha / 255;
+            if (a == 0) continue;
+            const px = x + @as(i32, @intCast(col));
+            if (px < 0) continue;
+            if (px >= @as(i32, @intCast(target_w))) break;
+            const off = row_off + @as(u32, @intCast(px));
+            target[off] = blendPixel(target[off], (a << 24) | (argb & 0x00FFFFFF));
+        }
+    }
+}
+
+/// Draw a classic 16x16 icon scaled 2x to 32x32 (opaque, 0 = transparent).
+pub fn drawIconClassic32(x: i32, y: i32, icon: *const icons.classic.Icon) void {
     for (0..16) |row| {
         const py0 = y + @as(i32, @intCast(row * 2));
         const py1 = py0 + 1;
@@ -620,11 +670,8 @@ pub fn drawIcon32(x: i32, y: i32, icon: *const [16][16]u32) void {
     }
 }
 
-/// Like `drawIcon32` but blends each non-transparent pixel onto the
-/// existing FB content at `alpha` (0..255). Used for drag-ghost preview:
-/// the icon follows the cursor at ~63% opacity, so the user sees both
-/// the desktop underneath AND what they're moving.
-pub fn drawIcon32Alpha(x: i32, y: i32, icon: *const [16][16]u32, alpha: u8) void {
+/// Classic-set counterpart of `drawIcon32Alpha`.
+pub fn drawIconClassic32Alpha(x: i32, y: i32, icon: *const icons.classic.Icon, alpha: u8) void {
     if (alpha == 0) return;
     for (0..16) |row| {
         const py0 = y + @as(i32, @intCast(row * 2));
@@ -651,23 +698,6 @@ pub fn drawIcon32Alpha(x: i32, y: i32, icon: *const [16][16]u32, alpha: u8) void
                 const off = @as(u32, @intCast(py1)) * target_w + @as(u32, @intCast(px1));
                 target[off] = blendPixel(target[off], argb);
             }
-        }
-    }
-}
-
-pub fn drawIcon16(x: i32, y: i32, icon: *const [16][16]u32) void {
-    for (0..16) |row| {
-        const py = y + @as(i32, @intCast(row));
-        if (py < 0) continue;
-        if (py >= @as(i32, @intCast(target_h))) break;
-        const row_off = @as(u32, @intCast(py)) * target_w;
-        for (0..16) |col| {
-            const color = icon[row][col];
-            if (color == 0x00000000) continue; // transparent
-            const px = x + @as(i32, @intCast(col));
-            if (px < 0) continue;
-            if (px >= @as(i32, @intCast(target_w))) break;
-            target[row_off + @as(u32, @intCast(px))] = color;
         }
     }
 }

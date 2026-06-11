@@ -12,7 +12,7 @@ const icons = @import("../icons.zig");
 pub const Shortcut = struct {
     name: []const u8,
     cmd: []const u8,
-    icon: *const [16][16]u32,
+    icon: *const icons.Icon,
 };
 
 pub const list = [_]Shortcut{
