@@ -64,6 +64,12 @@ fn insertCache(inum: u32, ino: layout.Inode) void {
 /// bitmap, so the linear first-free-bit scan walks past them naturally.
 pub fn allocInode(is_dir: bool) ?u32 {
     const m = block.getMount() orelse return null;
+    // Whole-op hold: the bitmap RMW below is readBlockBytes + writeBlockBytes
+    // — two separate lock sections without this. Two concurrent allocInode
+    // calls could both observe the same bit clear and return the SAME inum,
+    // silently fusing two files into one inode.
+    block.lockMount(m);
+    defer block.unlockMount(m);
     var g: u32 = 0;
     while (g < m.bgd_count) : (g += 1) {
         if (m.bgd[g].free_inodes_count == 0) continue;
@@ -127,6 +133,10 @@ fn allocInodeInGroup(m: *block.Mount, group: u32, is_dir: bool) ?u32 {
 pub fn freeInode(inum: u32, was_dir: bool) bool {
     if (inum == 0) return false;
     const m = block.getMount() orelse return false;
+    // Same whole-op hold as allocInode: the bitmap read-modify-write and the
+    // BGD/SB counter updates must not interleave with a concurrent alloc/free.
+    block.lockMount(m);
+    defer block.unlockMount(m);
     if (m.sb.rev_level >= 1 and inum < m.sb.first_ino) return false;
     const group: u32 = (inum - 1) / m.sb.inodes_per_group;
     if (group >= m.bgd_count) return false;
@@ -168,6 +178,9 @@ pub fn freeInode(inum: u32, was_dir: bool) bool {
 /// Drop a cached inode by number. Phase 2 calls this on unlink so a
 /// recycled inum doesn't return stale data. No-op if not cached.
 pub fn invalidate(inum: u32) void {
+    const m = block.getMount() orelse return;
+    block.lockMount(m);
+    defer block.unlockMount(m);
     if (lookupCached(inum)) |idx| {
         cache[idx].inum = 0;
     }
@@ -179,6 +192,10 @@ pub fn invalidate(inum: u32) void {
 pub fn writeInode(inum: u32, ino: *const layout.Inode) bool {
     if (inum == 0) return false;
     const m = block.getMount() orelse return false;
+    // Covers the disk write + the cache refresh as one unit (the cache has
+    // no lock of its own — see readInode).
+    block.lockMount(m);
+    defer block.unlockMount(m);
     const group: u32 = (inum - 1) / m.sb.inodes_per_group;
     if (group >= m.bgd_count) return false;
     const idx_in_group: u32 = (inum - 1) % m.sb.inodes_per_group;
@@ -205,12 +222,19 @@ pub fn writeInode(inum: u32, ino: *const layout.Inode) bool {
 /// hold across other inode operations.
 pub fn readInode(inum: u32) ?layout.Inode {
     if (inum == 0) return null;
+    const m = block.getMount() orelse return null;
+    // The 16-entry inode cache is shared mutable state with NO lock of its
+    // own; the per-mount lock (reentrant, so already-holding compound ops
+    // just nest) covers it. Without this, one CPU's insertCache/writeInode
+    // could tear the 128-byte struct copy out from under another CPU's
+    // read — torn inode = wild block pointers.
+    block.lockMount(m);
+    defer block.unlockMount(m);
     if (lookupCached(inum)) |idx| {
         lru_counter += 1;
         cache[idx].last_use = lru_counter;
         return cache[idx].inode;
     }
-    const m = block.getMount() orelse return null;
     const group: u32 = (inum - 1) / m.sb.inodes_per_group;
     if (group >= m.bgd_count) return null;
     const idx_in_group: u32 = (inum - 1) % m.sb.inodes_per_group;
@@ -333,6 +357,10 @@ pub fn isSymlink(inode: *const layout.Inode) bool {
 /// Returns null if the filesystem is full at any allocation step. Partial
 /// allocations earlier in the call ARE persisted (bitmap + inode mutated)
 /// — caller's writeInode at the end is the commit boundary.
+///
+/// PRECONDITION: caller holds the mount lock (all current callers are the
+/// whole-op-locked compound mutators in ext2.zig). The indirect-pointer
+/// get-or-allocate below is readPointer + writePointer — racy on its own.
 pub fn ensurePhysicalBlock(m: *block.Mount, ino: *layout.Inode, logical: u32) ?u32 {
     const ptrs_per_block: u32 = m.block_size / 4;
     return switch (layout.classifyBlock(logical, ptrs_per_block)) {
@@ -421,6 +449,10 @@ fn allocAndZeroIndirect(m: *block.Mount) ?u32 {
 /// indirect blocks, so an interrupted truncate can be resumed by re-
 /// reading the inode and walking again (entries already freed are no-ops
 /// after freeBlock's double-free klog, which logs but doesn't corrupt).
+///
+/// PRECONDITION: caller holds the mount lock (truncate/unlink/rmdir/mkdir
+/// rollback — all whole-op-locked). Also non-reentrant with itself via the
+/// shared `indir_scratch` BSS buffers below, which the lock now guarantees.
 pub fn freeAllBlocks(m: *block.Mount, ino: *layout.Inode) void {
     // Direct.
     for (0..layout.N_DIRECT) |i| {

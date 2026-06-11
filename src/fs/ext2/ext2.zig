@@ -135,6 +135,13 @@ pub fn closeFile(_: Handle) void {}
 pub fn writeFile(handle: *Handle, src: [*]const u8, count: u32) u32 {
     if (count == 0) return 0;
     const m = block.getMount() orelse return 0;
+    // Whole-op hold (reentrant — the nested block ops just bump depth).
+    // Block-op granularity alone left the readInode → allocate → writeInode
+    // sequence racy: two writers to the same file could lose one side's
+    // block-map updates, and any concurrent compound op could interleave
+    // with our bitmap/BGD updates.
+    block.lockMount(m);
+    defer block.unlockMount(m);
     var ino = inode.readInode(handle.inum) orelse return 0;
     if (!inode.isReg(&ino)) return 0;
 
@@ -175,7 +182,12 @@ pub fn writeFile(handle: *Handle, src: [*]const u8, count: u32) u32 {
 
     const new_end: u64 = handle.current_offset + done;
     if (new_end > inode.fileSize(&ino)) {
+        // LARGE_FILE: regular files keep the high 32 size bits in dir_acl
+        // (fileSize() composes them). @truncate alone silently wrapped the
+        // size at 4 GiB — a file grown past it would report size new_end %
+        // 4Gi with all its data blocks still allocated.
         ino.size = @truncate(new_end);
+        ino.dir_acl = @intCast(new_end >> 32);
     }
     if (done > 0) {
         const sec: u32 = @truncate(time.now().sec);
@@ -209,6 +221,10 @@ pub fn writeFile(handle: *Handle, src: [*]const u8, count: u32) u32 {
 /// `page_off` must be page-aligned. Returns bytes written.
 pub fn writebackPage(inum: u32, page_off: u64, src: [*]const u8) u32 {
     const m = block.getMount() orelse return 0;
+    // Whole-op hold — same reasoning as writeFile (sparse-hole fill mutates
+    // the block map + bitmaps).
+    block.lockMount(m);
+    defer block.unlockMount(m);
     var ino = inode.readInode(inum) orelse return 0;
     if (!inode.isReg(&ino)) return 0;
     const fsize = inode.fileSize(&ino);
@@ -290,6 +306,13 @@ pub fn createFile(parent_inum: u32, name: []const u8) ?u32 {
     if (name.len == 0 or name.len > 255) return null;
     if (containsSlash(name)) return null;
     const m = block.getMount() orelse return null;
+    // Whole-op hold: exists-check → allocInode → dirInsert → parent update
+    // must be atomic. Without it, two concurrent creates of the same name
+    // both passed the lookupInDir check (double entry), and two dirInserts
+    // into the same directory block lost one side's dirent (read-block /
+    // modify-stack-copy / write-block interleave).
+    block.lockMount(m);
+    defer block.unlockMount(m);
     var parent = inode.readInode(parent_inum) orelse return null;
     if (!inode.isDir(&parent)) return null;
     if (lookupInDir(&parent, name) != null) return null;
@@ -313,7 +336,7 @@ pub fn createFile(parent_inum: u32, name: []const u8) ?u32 {
         return null;
     }
 
-    if (!dirInsert(m, parent_inum, &parent, name, new_inum, layout.FT_REG_FILE)) {
+    if (!dirInsert(m, &parent, name, new_inum, layout.FT_REG_FILE)) {
         // Roll back inode alloc on directory-insert failure.
         _ = inode.freeInode(new_inum, false);
         return null;
@@ -335,15 +358,17 @@ pub fn createFile(parent_inum: u32, name: []const u8) ?u32 {
 /// looks for slack space in any existing entry, splits it. If no slack in
 /// any existing block, allocates a new block and lays the entry as the
 /// sole resident.
-fn dirInsert(m: *block.Mount, dir_inum: u32, dir_ino: *layout.Inode, name: []const u8, child_inum: u32, file_type: u8) bool {
+fn dirInsert(m: *block.Mount, dir_ino: *layout.Inode, name: []const u8, child_inum: u32, file_type: u8) bool {
     const bs = m.block_size;
     const needed: u16 = layout.dirEntryAlign(@intCast(name.len));
     if (needed > bs) return false; // pathological — name fills whole block
 
     const total = inode.fileSize(dir_ino);
+    // Hostile-image guard: a directory size at/near 4 GiB would overflow the
+    // `total + bs` u32 cast in the extend path below (ReleaseSafe panic).
+    if (total + bs > std.math.maxInt(u32)) return false;
     var lblock: u32 = 0;
     var dir_buf: [4096]u8 align(8) = undefined;
-    _ = dir_inum;
     while (@as(u64, lblock) * bs < total) : (lblock += 1) {
         if (!inode.readInodeBlock(dir_ino, lblock, dir_buf[0..bs])) return false;
         var w = DirWalk{ .buf = dir_buf[0..bs] };
@@ -408,6 +433,9 @@ pub fn mkdirPath(path: []const u8) bool {
 
     const m = block.getMount() orelse return false;
     const parent_inum = if (parent_path.len == 0) layout.ROOT_INO else (cachedWalk(parent_path) orelse return false);
+    // Whole-op hold — same compound-atomicity reasoning as createFile.
+    block.lockMount(m);
+    defer block.unlockMount(m);
     var parent = inode.readInode(parent_inum) orelse return false;
     if (!inode.isDir(&parent)) return false;
     if (lookupInDir(&parent, leaf) != null) return false;
@@ -467,7 +495,7 @@ pub fn mkdirPath(path: []const u8) bool {
         return false;
     }
 
-    if (!dirInsert(m, parent_inum, &parent, leaf, new_inum, layout.FT_DIR)) {
+    if (!dirInsert(m, &parent, leaf, new_inum, layout.FT_DIR)) {
         inode.freeAllBlocks(m, &new_ino);
         _ = inode.freeInode(new_inum, true);
         return false;
@@ -493,6 +521,13 @@ pub fn rmdirPath(path: []const u8) bool {
     if (leaf.len == 0) return false;
 
     const parent_inum = if (parent_path.len == 0) layout.ROOT_INO else (cachedWalk(parent_path) orelse return false);
+    // Whole-op hold so the emptiness check and the removal are atomic: a
+    // concurrent create into this directory between dirIsEmpty and
+    // unlinkInDir would otherwise orphan the new file in a freed dir.
+    // unlinkInDir re-locks — reentrant, just bumps depth.
+    const m = block.getMount() orelse return false;
+    block.lockMount(m);
+    defer block.unlockMount(m);
     var parent = inode.readInode(parent_inum) orelse return false;
     if (!inode.isDir(&parent)) return false;
     const child_inum = lookupInDir(&parent, leaf) orelse return false;
@@ -543,6 +578,10 @@ const UnlinkPolicy = enum { file_only, dir_only };
 /// directory (rmdir). Cross-violations return false.
 pub fn unlinkInDir(parent_inum: u32, name: []const u8, policy: UnlinkPolicy) bool {
     const m = block.getMount() orelse return false;
+    // Whole-op hold: lookup → dirRemove → freeAllBlocks → freeInode must
+    // not interleave with other mutators (lost dirent merges, double frees).
+    block.lockMount(m);
+    defer block.unlockMount(m);
     var parent = inode.readInode(parent_inum) orelse return false;
     if (!inode.isDir(&parent)) return false;
     const child_inum = lookupInDir(&parent, name) orelse return false;
@@ -551,6 +590,13 @@ pub fn unlinkInDir(parent_inum: u32, name: []const u8, policy: UnlinkPolicy) boo
         .file_only => if (inode.isDir(&child)) return false,
         .dir_only => if (!inode.isDir(&child)) return false,
     }
+    // No open-file reference counting exists in this fs, so unlinking a
+    // running process's text image would free (and let reallocate) the
+    // blocks its lazy page-cache fills still read from. POSIX allows
+    // unlink-of-running-binary only because the inode survives until the
+    // last ref closes — we can't honor that, so refuse like truncate does
+    // (the 2026-06-04 ETXTBSY rule, extended to unlink).
+    if (policy == .file_only and @import("../../proc/process.zig").isTextBusy(child_inum)) return false;
     // For dir_only: caller (rmdir) must have already verified the dir is
     // empty — we don't re-check here.
 
@@ -632,6 +678,11 @@ pub fn truncate(inum: u32) bool {
     // path that took redteam.elf to size 0 and bricked its reload. (2026-06-04)
     if (@import("../../proc/process.zig").isTextBusy(inum)) return false;
     const m = block.getMount() orelse return false;
+    // Whole-op hold: freeAllBlocks + the inode rewrite must be atomic vs
+    // concurrent writers to the same file (and freeAllBlocks' shared
+    // indirect-walk scratch buffers need the mutual exclusion).
+    block.lockMount(m);
+    defer block.unlockMount(m);
     var ino = inode.readInode(inum) orelse return false;
     if (!inode.isReg(&ino)) return false;
     inode.freeAllBlocks(m, &ino);

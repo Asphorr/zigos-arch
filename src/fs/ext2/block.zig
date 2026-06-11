@@ -86,7 +86,18 @@ pub const Mount = struct {
 
 /// Acquire the per-mount lock (see Mount.lock_owner). No-op before the
 /// scheduler is up (mount/boot reads run single-threaded with no current_pid).
-fn lockMount(self: *Mount) void {
+///
+/// PUBLIC since the compound-op locking round: the lock is REENTRANT
+/// precisely so ext2.zig/inode.zig can hold it across whole read-modify-
+/// write sequences (createFile, writeFile, bitmap RMW...) while the nested
+/// per-block ops here just bump the depth. Block-op granularity alone
+/// serialized single reads/writes but left every multi-step op racy:
+/// concurrent creates could lose dirents (read-block / modify-stack-copy /
+/// write-block interleave) and two allocInode calls could hand out the
+/// SAME inum (bitmap read and write are separate lock sections).
+/// Lock order: mount lock -> page_cache.lock (invalidate* under hold is
+/// fine — page_cache never calls back into the fs while holding its lock).
+pub fn lockMount(self: *Mount) void {
     const smp = @import("../../cpu/smp.zig");
     const sched = @import("../../proc/sched.zig");
     const me: u16 = if (smp.myCpu().current_pid) |p| @intCast(p) else return;
@@ -105,7 +116,7 @@ fn lockMount(self: *Mount) void {
     }
 }
 
-fn unlockMount(self: *Mount) void {
+pub fn unlockMount(self: *Mount) void {
     const smp = @import("../../cpu/smp.zig");
     const sched = @import("../../proc/sched.zig");
     const me: u16 = if (smp.myCpu().current_pid) |p| @intCast(p) else return;
