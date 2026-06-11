@@ -470,3 +470,120 @@ test "fast retransmit: 3 duplicate ACKs resend immediately, before any RTO" {
     try expectEqual(first_seq, r.seq);
     try expect(r.payload.len > 0);
 }
+
+test "lying data offset is dropped, not parsed (header bytes used to leak into the stream)" {
+    resolveGateway();
+    nic.txClear();
+    const peer = [4]u8{ 10, 0, 2, 99 };
+    const e = try establishServer(8090, peer, 40010, 81000);
+    defer net.tcpUnlisten(e.lst);
+    nic.txClear();
+
+    var b: [1600]u8 = undefined;
+    // In-order segment whose data-offset nibble is 0 (claims an 0-byte TCP
+    // header). Pre-guard, payload_len = tcp.len -| 0 = 20 swallowed the TCP
+    // HEADER as stream data (and a nibble > tcp.len/4 walked options past
+    // the segment end — ReleaseSafe panic). Both must be dropped now.
+    const n = buildSeg(&b, peer, e.client_port, 8090, 81000 +% 1, e.siss +% 1, ACK | PSH, 16384, "");
+    b[14 + 20 + 12] = 0; // doff = 0 words
+    deliver(b[0..n]);
+
+    var rb: [64]u8 = undefined;
+    try expectEqual(@as(usize, 0), net.tcpRecv(e.srv, &rb));
+
+    // And the oversized variant: doff = 24 with only 20 bytes on the wire.
+    const n2 = buildSeg(&b, peer, e.client_port, 8090, 81000 +% 1, e.siss +% 1, ACK | PSH, 16384, "");
+    b[14 + 20 + 12] = 6 << 4; // doff = 24 > tcp.len = 20
+    deliver(b[0..n2]);
+    try expectEqual(@as(usize, 0), net.tcpRecv(e.srv, &rb));
+}
+
+test "seq wrap: peer ISS at 0xFFFFFFFE establishes and FINs across the wrap" {
+    resolveGateway();
+    nic.txClear();
+    const peer = [4]u8{ 10, 0, 2, 99 };
+    // rcv_nxt after the SYN = 0xFFFFFFFF; the FIN below sits exactly on the
+    // wrap point. Pre-fix, the non-wrapping `rcv_nxt += 1` was a ReleaseSafe
+    // overflow panic — a peer-controlled remote crash.
+    const e = try establishServer(8091, peer, 40011, 0xFFFF_FFFE);
+    defer net.tcpUnlisten(e.lst);
+    nic.txClear();
+
+    var b: [1600]u8 = undefined;
+    deliver(b[0..buildSeg(&b, peer, e.client_port, 8091, 0xFFFF_FFFF, e.siss +% 1, ACK | FIN, 16384, "")]);
+    try expect(net.tcpPeerClosed(e.srv));
+    const a = popFor(e.client_port) orelse return error.NoFinAck;
+    try expect(a.flags & ACK != 0);
+    try expectEqual(@as(u32, 0), a.ack); // 0xFFFFFFFF +% 1
+}
+
+test "FIN beyond a reassembly gap is not consumed early" {
+    resolveGateway();
+    nic.txClear();
+    const peer = [4]u8{ 10, 0, 2, 99 };
+    const e = try establishServer(8092, peer, 40012, 91000);
+    defer net.tcpUnlisten(e.lst);
+    nic.txClear();
+
+    var b: [1600]u8 = undefined;
+    // Data+FIN arrives 7 bytes AHEAD of rcv_nxt (gap). Pre-fix the FIN was
+    // consumed unconditionally: rcv_nxt jumped the hole and peer_closed went
+    // up while the gap data was still missing (silent truncation).
+    deliver(b[0..buildSeg(&b, peer, e.client_port, 8092, 91000 +% 1 +% 7, e.siss +% 1, ACK | PSH | FIN, 16384, "XYZ")]);
+    try expect(!net.tcpPeerClosed(e.srv));
+    const da = popFor(e.client_port) orelse return error.NoDupAck;
+    try expectEqual(@as(u32, 91000 +% 1), da.ack); // still at the gap
+
+    // Gap fills -> data reassembles -> NOW the retransmitted FIN counts.
+    deliver(b[0..buildSeg(&b, peer, e.client_port, 8092, 91000 +% 1, e.siss +% 1, ACK | PSH, 16384, "ABCDEFG")]);
+    var rb: [64]u8 = undefined;
+    try expectEqual(@as(usize, 10), net.tcpRecv(e.srv, &rb));
+    try expect(std.mem.eql(u8, rb[0..10], "ABCDEFGXYZ"));
+    nic.txClear();
+    deliver(b[0..buildSeg(&b, peer, e.client_port, 8092, 91000 +% 1 +% 10, e.siss +% 1, ACK | FIN, 16384, "")]);
+    try expect(net.tcpPeerClosed(e.srv));
+}
+
+test "IP fragments are dropped (no reassembly, no mis-parse)" {
+    resolveGateway();
+    nic.txClear();
+    const peer = [4]u8{ 10, 0, 2, 99 };
+    const e = try establishServer(8093, peer, 40013, 95000);
+    defer net.tcpUnlisten(e.lst);
+    nic.txClear();
+
+    var b: [1600]u8 = undefined;
+    // In-order data but flagged More-Fragments: must be ignored wholesale.
+    const n = buildSeg(&b, peer, e.client_port, 8093, 95000 +% 1, e.siss +% 1, ACK | PSH, 16384, "FRAG");
+    b[14 + 6] = 0x20; // MF set, offset 0
+    deliver(b[0..n]);
+    var rb: [64]u8 = undefined;
+    try expectEqual(@as(usize, 0), net.tcpRecv(e.srv, &rb));
+    try expect(popFor(e.client_port) == null); // no ACK either
+
+    // Non-first fragment (offset != 0): also dropped.
+    const n2 = buildSeg(&b, peer, e.client_port, 8093, 95000 +% 1, e.siss +% 1, ACK | PSH, 16384, "FRAG");
+    b[14 + 6] = 0x00;
+    b[14 + 7] = 0x05; // fragment offset 5*8 bytes
+    deliver(b[0..n2]);
+    try expectEqual(@as(usize, 0), net.tcpRecv(e.srv, &rb));
+}
+
+test "RST on a half-open conn frees the slot (40 SYN+RST cycles never exhaust the table)" {
+    resolveGateway();
+    nic.txClear();
+    const peer = [4]u8{ 10, 0, 2, 77 };
+    const lst = net.tcpListen(8094) orelse return error.ListenFailed;
+    defer net.tcpUnlisten(lst);
+
+    var b: [1600]u8 = undefined;
+    var i: u16 = 0;
+    while (i < 40) : (i += 1) {
+        const cport: u16 = 41000 + i;
+        deliver(b[0..buildSeg(&b, peer, cport, 8094, 50000 +% i, 0, SYN, 16384, "")]);
+        // Pre-fix, each RST below left an active SYN-RECEIVED corpse; after
+        // the table filled (16 slots), SYN-ACKs stopped forever.
+        _ = popFor(cport) orelse return error.TableExhausted;
+        deliver(b[0..buildSeg(&b, peer, cport, 8094, 50000 +% i +% 1, 0, RST, 16384, "")]);
+    }
+}

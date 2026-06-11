@@ -164,8 +164,13 @@ fn pollMaskConsole(pid: u8, _: u16) u16 {
 /// pass back to unregister). null = registry full; iouring should
 /// surface this as ENOMEM on the CQE.
 pub fn register(inst_id: u8, slot_idx: u8, pid: u8, h: FdHandle, events: u16, gen: u16) ?u8 {
-    lock.acquire();
-    defer lock.release();
+    // IrqSave on every acquisition of this lock: wakePollers runs in
+    // NIC-IRQ context (net.rxPush off the virtio-net RX path). A plain
+    // acquire here would let that IRQ land while THIS CPU holds the lock
+    // and spin cli'd against its own interrupted holder forever — the
+    // same deadlock class as nvme ioCommand 2026-05-20.
+    const f = lock.acquireIrqSave();
+    defer lock.releaseIrqRestore(f);
     for (&waiters, 0..) |*w, i| {
         if (w.in_use) continue;
         w.* = .{
@@ -187,16 +192,16 @@ pub fn register(inst_id: u8, slot_idx: u8, pid: u8, h: FdHandle, events: u16, ge
 /// blindly unregister all slots without tracking which ones are live.
 pub fn unregister(idx: u8) void {
     if (idx >= MAX_WAITERS) return;
-    lock.acquire();
-    defer lock.release();
+    const f = lock.acquireIrqSave();
+    defer lock.releaseIrqRestore(f);
     waiters[idx].in_use = false;
 }
 
 /// Drop every waiter belonging to `pid`. Called from process teardown
 /// (tearDownTask) so a dying process can't leak entries.
 pub fn releaseAllForPid(pid: u8) void {
-    lock.acquire();
-    defer lock.release();
+    const f = lock.acquireIrqSave();
+    defer lock.releaseIrqRestore(f);
     for (&waiters) |*w| {
         if (w.in_use and w.pid == pid) w.in_use = false;
     }
@@ -217,7 +222,7 @@ pub fn wakePollers(kind: process.FsType, id: u16) void {
     // don't want to block fresh register() calls behind it.
     var to_fire: [MAX_WAITERS]struct { inst_id: u8, slot_idx: u8, expected_gen: u16, mask: u16 } = undefined;
     var n: usize = 0;
-    lock.acquire();
+    const f = lock.acquireIrqSave();
     for (&waiters, 0..) |*w, i| {
         if (!w.in_use) continue;
         if (w.handle.kind != kind) continue;
@@ -232,6 +237,6 @@ pub fn wakePollers(kind: process.FsType, id: u16) void {
         w.in_use = false;
         _ = i;
     }
-    lock.release();
+    lock.releaseIrqRestore(f);
     for (to_fire[0..n]) |entry| cb(entry.inst_id, entry.slot_idx, entry.expected_gen, entry.mask);
 }

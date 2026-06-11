@@ -3,6 +3,23 @@ const vga = @import("../ui/vga.zig");
 const nic = @import("../driver/nic.zig");
 const debug = @import("../debug/debug.zig");
 const process = @import("../proc/process.zig");
+const SpinLock = @import("../proc/spinlock.zig").SpinLock;
+
+/// Serializes ALL mutable net state (tcp_conns, tcp_listeners, udp_listeners,
+/// the ARP cache, ip_id, rx counters). The live virtio-net driver runs the
+/// ENTIRE RX path — handleRxFrame → handleTcpPacket → ACK synthesis/flush —
+/// in NIC-IRQ context, racing task-side syscalls (tcpSend/tcpRecv/poll) that
+/// can run on ANY CPU; before this lock the two sides did unprotected
+/// read-modify-writes on the same rings (snd_buf_len, rx_count, snd_nxt...).
+/// Discipline:
+///   * public entry points acquire IrqSave; internal helpers (emitSegment,
+///     flushSnd, receiveData, tcpTick, handle*Packet...) assume it's held;
+///   * NEVER held across kernelSleepMs — blocking APIs unlock around their
+///     poll+sleep loops (spinlock-held-across-schedule = deadlock class);
+///   * read-only probes (tcpPollMask, tcpIsConnected, tcpPeerClosed,
+///     renderProc*) stay LOCK-FREE: fdpoll.wakePollers calls tcpPollMask
+///     while net_lock is already held by the RX path.
+var net_lock: SpinLock = .{};
 
 // --- Ethernet ---
 const ETH_ALEN = 6;
@@ -180,7 +197,10 @@ fn buildIPv4Header(buf: []u8, protocol: u8, dst_ip: [4]u8, payload_len: u16) voi
 fn dispatchPacket(dst_ip: [4]u8, pkt: []u8) bool {
     if (isLoopback(dst_ip)) {
         const vptr: [*]volatile u8 = @ptrCast(pkt.ptr);
-        handleRxFrame(vptr[0..pkt.len]);
+        // Direct call, NOT handleRxFrame: every dispatchPacket caller already
+        // holds net_lock (public-API discipline) and the ticket lock is not
+        // reentrant — re-acquiring here would self-deadlock loopback sends.
+        processReceivedPacket(vptr[0..pkt.len]);
         return true;
     }
     return nic.send(pkt);
@@ -217,11 +237,13 @@ const UdpListener = struct {
 var udp_listeners: [4]UdpListener = [_]UdpListener{.{}} ** 4;
 
 pub fn udpListen(port: u16) ?u8 {
+    const lk = net_lock.acquireIrqSave();
+    defer net_lock.releaseIrqRestore(lk);
     for (&udp_listeners, 0..) |*l, i| {
         if (!l.active) {
-            l.active = true;
             l.port = port;
             l.has_data = false;
+            l.active = true;
             return @intCast(i);
         }
     }
@@ -229,6 +251,8 @@ pub fn udpListen(port: u16) ?u8 {
 }
 
 pub fn udpUnlisten(slot: u8) void {
+    const lk = net_lock.acquireIrqSave();
+    defer net_lock.releaseIrqRestore(lk);
     if (slot < 4) udp_listeners[slot].active = false;
 }
 
@@ -237,6 +261,10 @@ pub fn udpUnlisten(slot: u8) void {
 /// Three-step (has/data/consume) instead of one-shot so the buffer stays
 /// pinned during the caller's parse — handleUdpPacket only writes when
 /// `!has_data`, so leaving has_data true keeps subsequent packets out.
+/// udpHasData/udpData stay lock-free: the has_data flag is a classic SPSC
+/// handoff (writer fills data THEN sets the flag; x86-TSO keeps the order)
+/// and the consumer's parse of the pinned buffer couldn't be covered by a
+/// lock anyway.
 pub fn udpHasData(slot: u8) bool {
     if (slot >= udp_listeners.len) return false;
     return udp_listeners[slot].has_data;
@@ -251,13 +279,17 @@ pub fn udpData(slot: u8) []const u8 {
 
 pub fn udpConsume(slot: u8) void {
     if (slot >= udp_listeners.len) return;
+    // Plain store: flag-clear is the consumer's half of the SPSC handoff.
     udp_listeners[slot].has_data = false;
 }
 
 pub fn udpSend(dst_ip: [4]u8, dst_port: u16, src_port: u16, payload: []const u8) bool {
     if (payload.len > 1400) return false;
     const loop = isLoopback(dst_ip);
+    // Blocking ARP resolution OUTSIDE the lock (it polls + sleeps).
     if (!loop and !arpResolveGateway()) return false;
+    const lk = net_lock.acquireIrqSave();
+    defer net_lock.releaseIrqRestore(lk);
     var pkt: [1514]u8 = undefined;
     const src_mac = nic.getMac();
     const dst_mac = if (loop) src_mac else gateway_mac;
@@ -281,6 +313,8 @@ pub fn udpSend(dst_ip: [4]u8, dst_port: u16, src_port: u16, payload: []const u8)
 /// every other UDP send path should go through `udpSend()`.
 pub fn udpSendBroadcast(src_port: u16, dst_port: u16, payload: []const u8) bool {
     if (payload.len > 1400) return false;
+    const lk = net_lock.acquireIrqSave();
+    defer net_lock.releaseIrqRestore(lk);
     var pkt: [1514]u8 = undefined;
     const src_mac = nic.getMac();
     buildEthHeader(&pkt, BROADCAST_MAC, src_mac, ETHERTYPE_IPV4);
@@ -473,16 +507,14 @@ pub fn nslookupCommand(hostname: []const u8) void {
 
 const TcpState = enum { closed, listen, syn_sent, syn_received, established, fin_wait_1, fin_wait_2, time_wait, close_wait, last_ack };
 
-// TcpConn / TcpListener slots carry no per-table lock today. The two
-// access paths are (a) NIC-RX, driven by net.handleRxFrame called from
-// driver IRQ handlers + net.poll() in syscall context; (b) syscall
-// handlers in cpu/syscall/net.zig that read/write a specific slot.
-// Both currently run effectively single-threaded relative to each
-// other — NIC IRQs land on BSP and syscalls touch slots only at
-// well-defined points — so there's no fine-grained protection. The
-// day NIC IRQs get distributed across CPUs, this table needs a lock
-// (and these annotations should change from blank to (p:tcp_lock)).
-// See docs/STYLE.md.
+// TcpConn / TcpListener slots are protected by `net_lock` (top of file).
+// The two access paths — (a) NIC-RX via net.handleRxFrame in driver IRQ
+// context (the live virtio-net mode) and (b) syscall handlers on ANY CPU
+// going through the public tcp*/udp*/poll API — were NOT actually
+// single-threaded relative to each other as this comment used to claim:
+// an IRQ landing mid-tcpSend (same CPU) or running in parallel with a
+// task on an AP could tear snd_buf_len/rx_count read-modify-writes and
+// double-run flushSnd. Field annotations: (p:net_lock) unless marked.
 const TcpConn = struct {
     state: TcpState = .closed,
     active: bool = false,
@@ -561,12 +593,16 @@ fn listenerSlotIndex(l: *const TcpListener) u8 {
     return @intCast(off / @sizeOf(TcpListener));
 }
 
-fn enqueueAccepted(lst: *TcpListener, conn_slot: u8) void {
+/// False if the ring is full — the caller must then drop the conn slot
+/// entirely; an ESTABLISHED conn that never reaches accept() has no owner
+/// and would leak its slot forever.
+fn enqueueAccepted(lst: *TcpListener, conn_slot: u8) bool {
     const ring_size = TCP_ACCEPT_RING_SIZE;
     const next = (lst.accept_head + 1) % ring_size;
-    if (next == lst.accept_tail) return; // ring full — drop (peer will retry SYN-ACK timeout style)
+    if (next == lst.accept_tail) return false; // ring full
     lst.accept_ring[lst.accept_head] = conn_slot;
     lst.accept_head = next;
+    return true;
 }
 
 /// Build and transmit a single TCP segment stamped with an explicit sequence
@@ -575,7 +611,16 @@ fn enqueueAccepted(lst: *TcpListener, conn_slot: u8) void {
 /// unacked bytes (seq == snd_una) rather than whatever went out last.
 fn emitSegment(conn: *TcpConn, seq: u32, flags: u8, payload: ?[]const u8, include_mss: bool) bool {
     const loop = isLoopback(conn.remote_ip);
-    if (!loop and !arpResolveGateway()) return false;
+    // Non-blocking gateway check. Blocking resolution (poll + sleep) happens
+    // in the task-context prologues (tcpConnect/tcpSend/udpSend); this
+    // function also runs in NIC-IRQ context (ACK/SYN-ACK synthesis off the
+    // RX path), where arpResolveGateway's kernelSleepMs would schedule from
+    // an IRQ — and its poll() would self-deadlock on net_lock besides. Fire
+    // one request so the cache warms by the peer's retransmit.
+    if (!loop and !gateway_mac_valid) {
+        arpRequestGateway();
+        return false;
+    }
     var pkt: [1514]u8 = undefined;
     const src_mac = nic.getMac();
     const dst_mac = if (loop) src_mac else gateway_mac;
@@ -649,43 +694,56 @@ fn sendTcpPacket(conn: *TcpConn, flags: u8, payload: ?[]const u8, include_mss: b
 }
 
 pub fn tcpConnect(dst_ip: [4]u8, dst_port: u16) ?u8 {
-    // Find free connection slot
+    // Resolve the gateway up front, outside the lock — it blocks (poll +
+    // sleep); emitSegment's own gateway check is non-blocking by design.
+    if (!isLoopback(dst_ip) and !arpResolveGateway()) return null;
+
     var slot: u8 = 0;
-    while (slot < TCP_MAX_CONNS) : (slot += 1) {
-        if (!tcp_conns[slot].active) break;
+    var conn: *TcpConn = undefined;
+    {
+        const lk = net_lock.acquireIrqSave();
+        defer net_lock.releaseIrqRestore(lk);
+
+        // Find free connection slot
+        while (slot < TCP_MAX_CONNS) : (slot += 1) {
+            if (!tcp_conns[slot].active) break;
+        }
+        if (slot >= TCP_MAX_CONNS) return null;
+
+        conn = &tcp_conns[slot];
+        conn.* = .{};
+        conn.active = true;
+        conn.state = .syn_sent;
+        conn.local_port = next_ephemeral;
+        next_ephemeral +%= 1;
+        if (next_ephemeral < 49200) next_ephemeral = 49200;
+        conn.remote_port = dst_port;
+        conn.remote_ip = dst_ip;
+        conn.snd_iss = @truncate(process.tick_count *% 1103515245 +% 12345);
+        conn.snd_nxt = conn.snd_iss;
+        conn.snd_una = conn.snd_iss;
+
+        // Send SYN
+        if (!sendTcpPacket(conn, TCP_SYN, null, true)) {
+            conn.active = false;
+            return null;
+        }
+        conn.snd_nxt +%= 1; // SYN consumes one seq number
     }
-    if (slot >= TCP_MAX_CONNS) return null;
 
-    var conn = &tcp_conns[slot];
-    conn.* = .{};
-    conn.active = true;
-    conn.state = .syn_sent;
-    conn.local_port = next_ephemeral;
-    next_ephemeral +%= 1;
-    if (next_ephemeral < 49200) next_ephemeral = 49200;
-    conn.remote_port = dst_port;
-    conn.remote_ip = dst_ip;
-    conn.snd_iss = @truncate(process.tick_count *% 1103515245 +% 12345);
-    conn.snd_nxt = conn.snd_iss;
-    conn.snd_una = conn.snd_iss;
-
-    // Send SYN
-    if (!sendTcpPacket(conn, TCP_SYN, null, true)) {
-        conn.active = false;
-        return null;
-    }
-    conn.snd_nxt += 1; // SYN consumes one seq number
-
-    // Wait for SYN-ACK. Tick-based 5s deadline + 10ms sleep between polls so
-    // the BSP isn't locked while we're waiting on a possibly-slow handshake.
+    // Wait for SYN-ACK, unlocked — state/error_flag are single-byte reads
+    // and the RX path owns the transitions. Tick-based 5s deadline + 10ms
+    // sleep between polls so the BSP isn't locked during a slow handshake.
     const syn_deadline: u64 = process.tick_count + 500;
     while (process.tick_count < syn_deadline) {
         poll();
         if (conn.state == .established) return slot;
-        if (conn.error_flag) { conn.active = false; return null; }
+        if (conn.error_flag) break;
         process.kernelSleepMs(10);
     }
+    const lk = net_lock.acquireIrqSave();
     conn.active = false;
+    net_lock.releaseIrqRestore(lk);
     return null;
 }
 
@@ -694,7 +752,7 @@ pub fn tcpConnect(dst_ip: [4]u8, dst_port: u16) ?u8 {
 /// our chosen ISS, and immediately replies with SYN+ACK. The slot stays in
 /// SYN-RECEIVED until the peer's ACK promotes it to ESTABLISHED — only then
 /// does it become visible to user-space accept().
-fn tryAcceptIncomingSyn(ip_data: []volatile u8, local_port: u16, remote_port: u16, peer_seq: u32) void {
+fn tryAcceptIncomingSyn(ip_data: []volatile u8, ihl: usize, local_port: u16, remote_port: u16, peer_seq: u32) void {
     var listener: ?*TcpListener = null;
     for (&tcp_listeners) |*l| {
         if (l.active and l.port == local_port) {
@@ -731,7 +789,11 @@ fn tryAcceptIncomingSyn(ip_data: []volatile u8, local_port: u16, remote_port: u1
     // local Linux client) is happy to take 1460. Same option-walk shape
     // as the client-side parser in the .syn_sent branch of
     // handleTcpPacket — kept in sync by hand.
-    const tcp = ip_data[20..]; // assume ihl=20; SYN with options never extends ihl
+    //
+    // Use the REAL ihl: the old hardcoded [20..] confused TCP options
+    // (which extend data_offset, not ihl) with IP options — a SYN carrying
+    // IP options had its TCP header parsed 4+ bytes early.
+    const tcp = ip_data[ihl..];
     if (tcp.len >= TCP_HDR_SIZE) {
         const data_offset = @as(usize, tcp[12] >> 4) * 4;
         if (data_offset > 20 and data_offset <= tcp.len) {
@@ -757,7 +819,7 @@ fn tryAcceptIncomingSyn(ip_data: []volatile u8, local_port: u16, remote_port: u1
         conn.active = false;
         return;
     }
-    conn.snd_nxt += 1; // our SYN consumes one
+    conn.snd_nxt +%= 1; // our SYN consumes one
 }
 
 /// Bind a server-side TCP socket to `port`. Returns the listener slot id, or
@@ -767,6 +829,8 @@ fn tryAcceptIncomingSyn(ip_data: []volatile u8, local_port: u16, remote_port: u1
 /// the listener's accept ring for `tcpAccept` to consume.
 pub fn tcpListen(port: u16) ?u8 {
     if (port == 0) return null;
+    const lk = net_lock.acquireIrqSave();
+    defer net_lock.releaseIrqRestore(lk);
     // Reject duplicates so accept rings stay sane.
     for (tcp_listeners) |l| {
         if (l.active and l.port == port) return null;
@@ -784,6 +848,8 @@ pub fn tcpListen(port: u16) ?u8 {
 
 pub fn tcpUnlisten(listen_slot: u8) void {
     if (listen_slot >= TCP_MAX_LISTENERS) return;
+    const lk = net_lock.acquireIrqSave();
+    defer net_lock.releaseIrqRestore(lk);
     const l = &tcp_listeners[listen_slot];
     if (!l.active) return;
     l.* = .{}; // accepted-but-undelivered conns stay live; user can still close them
@@ -793,6 +859,8 @@ pub fn tcpUnlisten(listen_slot: u8) void {
 /// nothing is queued yet. Non-blocking — the caller polls.
 pub fn tcpAccept(listen_slot: u8) ?u8 {
     if (listen_slot >= TCP_MAX_LISTENERS) return null;
+    const lk = net_lock.acquireIrqSave();
+    defer net_lock.releaseIrqRestore(lk);
     const l = &tcp_listeners[listen_slot];
     if (!l.active) return null;
     if (l.accept_head == l.accept_tail) return null; // ring empty
@@ -921,27 +989,43 @@ pub fn tcpSend(slot: u8, data: []const u8) bool {
     if (slot >= TCP_MAX_CONNS) return false;
     const conn = &tcp_conns[slot];
     if (!conn.active or conn.state != .established) return false;
+    // Blocking gateway resolution up front, outside the lock — emitSegment
+    // itself must never block (it also runs in NIC-IRQ context).
+    if (!isLoopback(conn.remote_ip) and !arpResolveGateway()) return false;
 
     var off: usize = 0;
     while (off < data.len) {
-        // Block (bounded) for ring space when the unacked window is full; ACKs
-        // arriving via poll() drain it. The deadline keeps a stalled peer from
-        // wedging the caller forever.
-        if (conn.snd_buf_len >= TCP_SND_BUF_SIZE) {
-            const deadline = process.tick_count + 500;
-            while (conn.snd_buf_len >= TCP_SND_BUF_SIZE and process.tick_count < deadline) {
-                poll();
-                if (conn.error_flag or conn.state != .established) return false;
-                process.kernelSleepMs(10);
+        // Append + flush under the lock; space is recomputed under the lock
+        // so an IRQ-side ACK between iterations can only GROW it.
+        {
+            const lk = net_lock.acquireIrqSave();
+            defer net_lock.releaseIrqRestore(lk);
+            if (conn.error_flag or conn.state != .established) return false;
+            const space: usize = TCP_SND_BUF_SIZE - conn.snd_buf_len;
+            if (space > 0) {
+                const chunk = @min(data.len - off, space);
+                appendSnd(conn, data[off..][0..chunk]);
+                off += chunk;
+                flushSnd(conn);
+                continue;
             }
-            if (conn.snd_buf_len >= TCP_SND_BUF_SIZE) return false; // timed out
         }
-        const space: usize = TCP_SND_BUF_SIZE - conn.snd_buf_len;
-        const chunk = @min(data.len - off, space);
-        appendSnd(conn, data[off..][0..chunk]);
-        off += chunk;
-        flushSnd(conn);
-        poll(); // pick up ACKs so the next iteration sees freed window
+        // Ring full: wait (unlocked, bounded) for ACKs to drain it — via the
+        // NIC IRQ in IRQ-driven mode, via poll() in polled mode. The deadline
+        // keeps a stalled peer from wedging the caller forever.
+        poll();
+        const deadline = process.tick_count + 500;
+        var have_space = false;
+        while (process.tick_count < deadline) {
+            if (conn.error_flag or conn.state != .established) return false;
+            if (conn.snd_buf_len < TCP_SND_BUF_SIZE) {
+                have_space = true;
+                break;
+            }
+            process.kernelSleepMs(10);
+            poll();
+        }
+        if (!have_space) return false; // timed out
     }
     return true;
 }
@@ -949,6 +1033,8 @@ pub fn tcpSend(slot: u8, data: []const u8) bool {
 pub fn tcpRecv(slot: u8, buf: []u8) usize {
     if (slot >= TCP_MAX_CONNS) return 0;
     const conn = &tcp_conns[slot];
+    const lk = net_lock.acquireIrqSave();
+    defer net_lock.releaseIrqRestore(lk);
     if (!conn.active) return 0;
     if (conn.rx_count == 0) return 0;
 
@@ -978,12 +1064,43 @@ pub fn tcpClose(slot: u8) void {
     if (slot >= TCP_MAX_CONNS) return;
     var conn = &tcp_conns[slot];
     if (!conn.active) return;
-    if (conn.state == .established or conn.state == .close_wait) {
-        _ = sendTcpPacket(conn, TCP_FIN | TCP_ACK, null, false);
-        conn.snd_nxt += 1;
-        conn.state = if (conn.state == .close_wait) .last_ack else .fin_wait_1;
-        // Wait up to 1s for FIN-ACK with 10ms sleeps. The peer almost always
-        // ACKs within a single RTT so this rarely runs to the deadline.
+
+    // Drain the send ring (bounded) BEFORE the FIN. Close used to abandon
+    // any buffered-but-unsent tail: the FIN went out at snd_nxt, the bytes
+    // beyond it were never flushed, and tcpTick's retransmit logic only
+    // re-sent the FIN — classic send-then-close data loss.
+    const drain_deadline: u64 = process.tick_count + 200;
+    while (process.tick_count < drain_deadline) {
+        var pending = false;
+        {
+            const lk = net_lock.acquireIrqSave();
+            defer net_lock.releaseIrqRestore(lk);
+            if ((conn.state == .established or conn.state == .close_wait) and
+                !conn.error_flag and conn.snd_buf_len > 0)
+            {
+                flushSnd(conn);
+                pending = conn.snd_buf_len > 0;
+            }
+        }
+        if (!pending) break;
+        poll();
+        process.kernelSleepMs(10);
+    }
+
+    var sent_fin = false;
+    {
+        const lk = net_lock.acquireIrqSave();
+        defer net_lock.releaseIrqRestore(lk);
+        if (conn.state == .established or conn.state == .close_wait) {
+            _ = sendTcpPacket(conn, TCP_FIN | TCP_ACK, null, false);
+            conn.snd_nxt +%= 1;
+            conn.state = if (conn.state == .close_wait) .last_ack else .fin_wait_1;
+            sent_fin = true;
+        }
+    }
+    if (sent_fin) {
+        // Wait up to 1s for FIN-ACK with 10ms sleeps (unlocked; state is a
+        // single-byte read). The peer almost always ACKs within one RTT.
         const close_deadline: u64 = process.tick_count + 100;
         while (process.tick_count < close_deadline) {
             poll();
@@ -991,10 +1108,17 @@ pub fn tcpClose(slot: u8) void {
             process.kernelSleepMs(10);
         }
     }
+    const lk = net_lock.acquireIrqSave();
     conn.active = false;
     conn.state = .closed;
+    net_lock.releaseIrqRestore(lk);
 }
 
+// tcpIsConnected/tcpPeerClosed/tcpPollMask/tcpListenerPollMask are LOCK-FREE
+// readiness probes by design: every field they touch is a single-byte/u32
+// load (momentary staleness is inherent to polling), and tcpPollMask is
+// called by fdpoll.wakePollers WHILE the RX path holds net_lock — taking
+// the lock here would self-deadlock.
 pub fn tcpIsConnected(slot: u8) bool {
     if (slot >= TCP_MAX_CONNS) return false;
     return tcp_conns[slot].active and tcp_conns[slot].state == .established;
@@ -1148,7 +1272,15 @@ fn handleTcpPacket(ip_data: []volatile u8, ihl: usize) void {
     const ack = readU32BE(tcp[8..12]);
     const data_offset = @as(usize, tcp[12] >> 4) * 4;
     const flags = tcp[13];
-    const payload_len = tcp.len -| data_offset;
+
+    // Reject lying headers up front. data_offset < 20 would alias header
+    // bytes into the payload; data_offset > tcp.len (claimed options that
+    // aren't on the wire) would index past the segment end in the MSS
+    // option walk below — a remote ReleaseSafe panic via a short SYN-ACK
+    // carrying a fat data-offset nibble. (The server-side walk in
+    // tryAcceptIncomingSyn already bounded this; the client side didn't.)
+    if (data_offset < TCP_HDR_SIZE or data_offset > tcp.len) return;
+    const payload_len = tcp.len - data_offset;
 
     // Find matching connection (full 4-tuple match)
     var conn: ?*TcpConn = null;
@@ -1166,12 +1298,19 @@ fn handleTcpPacket(ip_data: []volatile u8, ihl: usize) void {
     // bound to dst_port — that's the inbound-handshake path.
     const c = conn orelse {
         if ((flags & TCP_SYN) != 0 and (flags & TCP_ACK) == 0) {
-            tryAcceptIncomingSyn(ip_data, dst_port, src_port, seq);
+            tryAcceptIncomingSyn(ip_data, ihl, dst_port, src_port, seq);
         }
         return;
     };
 
     if (flags & TCP_RST != 0) {
+        // A SYN-RECEIVED conn was never handed to accept(): no owner exists
+        // to close() it, so free the slot here — RST-killed handshakes used
+        // to leak conn slots until the table was permanently full.
+        if (c.state == .syn_received) {
+            c.* = .{};
+            return;
+        }
         c.error_flag = true;
         c.state = .closed;
         return;
@@ -1204,7 +1343,14 @@ fn handleTcpPacket(ip_data: []volatile u8, ihl: usize) void {
                 c.retransmit_count = 0;
                 initCwnd(c);
                 if (c.listener_slot != TCP_NO_LISTENER and c.listener_slot < TCP_MAX_LISTENERS) {
-                    enqueueAccepted(&tcp_listeners[c.listener_slot], connSlotIndex(c));
+                    if (!enqueueAccepted(&tcp_listeners[c.listener_slot], connSlotIndex(c))) {
+                        // Accept ring full: this conn can never be handed
+                        // out — drop it whole (the peer RTOs and retries)
+                        // instead of leaking the slot as an ESTABLISHED
+                        // orphan nobody can ever close.
+                        c.* = .{};
+                        return;
+                    }
                     @import("../cpu/ipc/fdpoll.zig").wakePollers(.tcp_listener, @as(u16, c.listener_slot));
                 }
                 // Bundled data on the ACK that completes the handshake.
@@ -1214,7 +1360,10 @@ fn handleTcpPacket(ip_data: []volatile u8, ihl: usize) void {
         .syn_sent => {
             if (flags & TCP_SYN != 0 and flags & TCP_ACK != 0) {
                 if (ack == c.snd_nxt) {
-                    c.rcv_nxt = seq + 1;
+                    // All sequence math is +% — seq numbers wrap by design,
+                    // and a peer ISS of 0xFFFFFFFF used to be a ReleaseSafe
+                    // overflow panic here (remote crash, peer-controlled).
+                    c.rcv_nxt = seq +% 1;
                     c.snd_una = ack;
                     // Parse MSS from options
                     if (data_offset > 20) {
@@ -1274,9 +1423,15 @@ fn handleTcpPacket(ip_data: []volatile u8, ihl: usize) void {
             // Data: in-order, out-of-order (buffered), or duplicate. receiveData
             // always ACKs, so a gap yields the duplicate ACKs fast-retransmit needs.
             receiveData(c, seq, tcp, data_offset, payload_len);
-            // FIN
-            if (flags & TCP_FIN != 0) {
-                c.rcv_nxt += 1;
+            // FIN — only consume it when it's IN ORDER: the FIN's own seq is
+            // seq+payload_len, which must equal rcv_nxt after receiveData
+            // accepted the payload. A FIN beyond a reassembly gap, a stale
+            // duplicate, or one whose payload only partially fit the rx ring
+            // must wait for the peer's retransmit; consuming it eagerly used
+            // to bump rcv_nxt past a hole and flip peer_closed while the gap
+            // data was still missing (silent stream truncation for the app).
+            if (flags & TCP_FIN != 0 and c.rcv_nxt == seq +% @as(u32, @intCast(payload_len))) {
+                c.rcv_nxt +%= 1;
                 c.peer_closed = true;
                 _ = sendTcpPacket(c, TCP_ACK, null, false);
                 c.state = .close_wait;
@@ -1284,19 +1439,25 @@ fn handleTcpPacket(ip_data: []volatile u8, ihl: usize) void {
             }
         },
         .fin_wait_1 => {
-            if (flags & TCP_ACK != 0) {
-                if (flags & TCP_FIN != 0) {
-                    c.rcv_nxt = seq + 1;
-                    _ = sendTcpPacket(c, TCP_ACK, null, false);
-                    c.state = .time_wait;
-                } else {
-                    c.state = .fin_wait_2;
-                }
+            // fin_wait_2 needs OUR FIN acked (ack == snd_nxt) — any old ACK
+            // used to advance the state with the FIN still unacknowledged,
+            // after which nothing would ever retransmit it. The FIN-bearing
+            // branch stays lenient (simultaneous close / FIN-without-full-ACK
+            // still tears down; time_wait bounds it). rcv_nxt accounts for
+            // any payload riding along with the peer's FIN — data sent after
+            // our close is discarded, but our final ACK must cover it or the
+            // peer retransmits the FIN until its own timeout.
+            if (flags & TCP_FIN != 0) {
+                c.rcv_nxt = seq +% @as(u32, @intCast(payload_len)) +% 1;
+                _ = sendTcpPacket(c, TCP_ACK, null, false);
+                c.state = .time_wait;
+            } else if (flags & TCP_ACK != 0 and ack == c.snd_nxt) {
+                c.state = .fin_wait_2;
             }
         },
         .fin_wait_2 => {
             if (flags & TCP_FIN != 0) {
-                c.rcv_nxt = seq + 1;
+                c.rcv_nxt = seq +% @as(u32, @intCast(payload_len)) +% 1;
                 _ = sendTcpPacket(c, TCP_ACK, null, false);
                 c.state = .time_wait;
             }
@@ -1328,6 +1489,13 @@ fn tcpTick() void {
             process.tick_count -% c.last_send_tick >= c.rto)
         {
             if (c.retransmit_count >= TCP_MAX_RETRIES) {
+                // An orphaned server-side handshake (SYN-RECEIVED never
+                // promoted to the accept ring) has no owner to close() it —
+                // free the slot or dead half-opens accumulate forever.
+                if (c.state == .syn_received) {
+                    c.* = .{};
+                    continue;
+                }
                 c.error_flag = true;
                 c.state = .closed;
                 continue;
@@ -1484,6 +1652,11 @@ fn handleIcmpPacket(ip_data: []volatile u8, ihl: usize) void {
         ping_reply_seq = readU16BE(icmp[6..8]);
         ping_got_reply = true;
     } else if (icmp[0] == ICMP_ECHO_REQUEST) {
+        // Only answer requests addressed to US — without this we replied to
+        // broadcast pings and to other hosts' packets leaking through
+        // promiscuous/bridged reception (smurf-amplifier behavior).
+        if (!(ip_data[16] == local_ip[0] and ip_data[17] == local_ip[1] and
+            ip_data[18] == local_ip[2] and ip_data[19] == local_ip[3])) return;
         var reply: [1514]u8 = undefined;
         // Reconstruct full frame including eth header
         const eth_start = @intFromPtr(ip_data.ptr) - ETH_HDR_SIZE;
@@ -1517,6 +1690,11 @@ fn handleIPv4Packet(data: []volatile u8) void {
     const ip = data[ETH_HDR_SIZE..];
     if (ip[0] & 0xF0 != 0x40) return;
     const ihl = @as(usize, ip[0] & 0x0F) * 4;
+    if (ihl < IPV4_HDR_SIZE) return; // header can't be shorter than 20
+    // No reassembly: drop fragments. A non-first fragment (offset != 0)
+    // would have its payload parsed as an L4 header; a first fragment
+    // (MF set) would be processed as if complete. DF (0x4000) passes.
+    if (readU16BE(ip[6..8]) & 0x3FFF != 0) return;
     // Use IP total length to avoid Ethernet padding being counted as payload
     const ip_total_len: usize = readU16BE(ip[2..4]);
     if (ip_total_len < ihl or ip_total_len > ip.len) return;
@@ -1599,10 +1777,16 @@ pub var rx_frame_count: u64 = 0;
 pub var rx_frame_total_bytes: u64 = 0;
 
 pub fn handleRxFrame(data: []volatile u8) void {
+    // Typically NIC-IRQ context (IF already 0); IrqSave also covers the
+    // polled-mode drivers calling in from task context.
+    const lk = net_lock.acquireIrqSave();
+    defer net_lock.releaseIrqRestore(lk);
     processReceivedPacket(data);
 }
 
 pub fn poll() void {
+    const lk = net_lock.acquireIrqSave();
+    defer net_lock.releaseIrqRestore(lk);
     while (nic.recv()) |data| {
         processReceivedPacket(data);
         nic.rxRelease();
@@ -1610,8 +1794,10 @@ pub fn poll() void {
     tcpTick();
 }
 
-fn arpResolveGateway() bool {
-    if (gateway_mac_valid) return true;
+/// Fire one ARP request for the gateway without waiting. IRQ-safe (no
+/// sleep, no poll, no net_lock) — emitSegment uses it when the cache is
+/// cold so the peer's retransmit finds the MAC resolved.
+fn arpRequestGateway() void {
     var pkt: [ETH_HDR_SIZE + ARP_HDR_SIZE]u8 = undefined;
     const src_mac = nic.getMac();
     buildEthHeader(&pkt, BROADCAST_MAC, src_mac, ETHERTYPE_ARP);
@@ -1623,6 +1809,14 @@ fn arpResolveGateway() bool {
     @memset(a[18..24], 0);
     @memcpy(a[24..28], &gateway_ip);
     _ = nic.send(pkt[0 .. ETH_HDR_SIZE + ARP_HDR_SIZE]);
+}
+
+/// Blocking gateway resolution — TASK CONTEXT ONLY (sleeps, and poll()
+/// takes net_lock). Public senders call this in their prologue, BEFORE
+/// taking net_lock.
+fn arpResolveGateway() bool {
+    if (gateway_mac_valid) return true;
+    arpRequestGateway();
 
     // 2-second tick deadline; 10ms sleep between polls so ARP doesn't lock
     // up the BSP either (lookups during boot used to spin here for ~1.5s).
@@ -1813,8 +2007,11 @@ pub fn pingCommand(ip_str: []const u8) void {
             vga.fg = .LightGray;
             continue;
         }
-        var timeout: u32 = 0;
-        while (timeout < 200000) : (timeout += 1) {
+        // Tick deadline + sleep, not a pause-spin — tight kernel spin loops
+        // starve sibling vCPUs under Hyper-V (same lesson as the DNS/ARP/TCP
+        // waits, which were converted earlier; this one was missed).
+        const reply_deadline: u64 = process.tick_count + 100;
+        while (process.tick_count < reply_deadline) {
             poll();
             if (ping_got_reply and ping_reply_seq == sent + 1) {
                 received += 1;
@@ -1823,8 +2020,7 @@ pub fn pingCommand(ip_str: []const u8) void {
                 vga.fg = .LightGray;
                 break;
             }
-            var j: u32 = 0;
-            while (j < 1000) : (j += 1) asm volatile ("pause");
+            process.kernelSleepMs(10);
         }
         if (!ping_got_reply) vga.print("  request timeout seq={d}\n", .{sent + 1});
     }
