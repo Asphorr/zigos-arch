@@ -352,6 +352,24 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     // PIT-based calibration would silently produce tsc_per_quantum=0).
     @import("time/hpet.zig").init();
     blog.ok("HPET");
+    // VT-x (VMX) probe + the full ZigOS-as-hypervisor boot diagnostic on the
+    // BSP. detect() is pure CPUID/MSR reads (logs host-a-guest capability +
+    // EPT/unrestricted availability); enableBsp() then runs VMXON → VMCS
+    // lifecycle proof → first real-mode guest VMLAUNCH → the Phase-2c
+    // trap-and-emulate dispatch loop (guest console I/O + spoofed CPUID) →
+    // VMXOFF. No-op unless USABLE; single-threaded here before AP startup;
+    // holds no VMX root state once it returns.
+    //
+    // ORDER NOTE: this deliberately runs BEFORE the Hyper-V hypercall
+    // activation below. enableHypercalls() writes HV GUEST_OS_ID + HYPERCALL,
+    // which flips KVM's Hyper-V emulation ON for this vCPU — after which
+    // KVM-under-Hyper-V may expect the *enlightened* VMCS protocol for nested
+    // VMX. (The original VMXON VMfail this order was chasing turned out to be
+    // the base+disp operand-GVA mis-decode — fixed with register-indirect
+    // operands in vmx.zig — but pre-announcement remains the conservative,
+    // boot-verified order, so it stays.)
+    @import("virt/vmx.zig").detect();
+    @import("virt/vmx.zig").enableBsp();
     // Hyper-V enlightenment detection. When QEMU exposes the frequency
     // MSRs (`-cpu host,hv-frequencies`) apic.calibrateTimer() reads them
     // directly instead of running the 10 ms HPET gate. enableHypercalls()
@@ -359,14 +377,6 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     // HvCallFlushVirtualAddressSpace instead of IPI fan-out.
     @import("virt/hyperv.zig").detect();
     @import("virt/hyperv.zig").enableHypercalls();
-    // VT-x (VMX) capability probe — Phase 0 of ZigOS-as-hypervisor. Pure
-    // CPUID/MSR reads: logs whether we can host a guest (and whether the
-    // EPT + unrestricted-guest path is available). No VMXON yet; that is
-    // gated on this verdict. See virt/vmx.zig.
-    @import("virt/vmx.zig").detect();
-    // Phase 1: VMXON/VMXOFF round-trip on the BSP (no-op unless USABLE).
-    // Single-threaded here — runs before AP startup.
-    @import("virt/vmx.zig").enableBsp();
     if (@import("time/apic.zig").init()) {
         blog.ok("Local APIC + IOAPIC");
     } else {
