@@ -5,10 +5,12 @@
 //! raises #DB (vector 1) and latches a sticky bit B0..B3 in DR6.
 //!
 //! Registers are PER-CPU, so a watch armed on BSP does NOT fire for AP
-//! activity. The public `arm*` and `disarm` functions automatically
-//! broadcast via IPI (`broadcastSync`) so all alive CPUs apply the new
-//! `entries[]` to their DR registers within microseconds — by the time
-//! the caller returns past the arm/disarm, every CPU is in sync.
+//! activity. The public `arm*` and `disarm` functions broadcast an IPI
+//! (`broadcastSync`) so all alive CPUs apply the new `entries[]` to their
+//! DR registers. The IPI is fire-and-forget — remote CPUs typically
+//! converge within microseconds, but nothing waits for an ack, so a
+//! hardware hit on a remote CPU can race a just-issued disarm/republish;
+//! onDebugException re-checks `armed` and suppresses such hits.
 //!
 //! DR7 layout (only fields we use):
 //!   bit 0   L0  / bit 1   G0   — slot 0 enable (local / global)
@@ -56,6 +58,10 @@ pub const Policy = enum {
     silent,
 };
 
+/// NOTE: every value-based filter below (value_threshold / skip_value /
+/// cs_slot_check / mirror compare) and the hit printer read a full 8 bytes
+/// at `addr` regardless of `len`. Keep watched addresses at least 8 bytes
+/// clear of an unmapped page boundary or the #DB handler itself faults.
 pub const WatchEntry = struct {
     armed: bool = false,
     addr: u64 = 0,
@@ -132,6 +138,25 @@ pub const WatchEntry = struct {
 /// remote CPUs).
 pub var entries: [4]WatchEntry = [_]WatchEntry{.{}} ** 4;
 
+/// Publish a new configuration for a slot. entries[] is read lock-free by
+/// every other CPU (computeDr7 on its per-tick/per-switch applyLocal, and
+/// onDebugException on a hardware hit), so a plain `entries[slot] = .{...}`
+/// multi-field store can be observed half-written — worst case a remote CPU
+/// arms a torn addr/whitelist combination, takes a phantom hit, and
+/// panic-dumps with an inconsistent entry. Protocol: disarm (seq_cst) →
+/// write fields → arm (release). Readers acquire-load `armed` first; fields
+/// only change while armed==false, so observing armed==true implies the
+/// fields are consistent. (The whole-struct store below rewrites `armed`
+/// with the same false byte it already holds — benign on x86.)
+pub fn setEntry(slot: u2, new: WatchEntry) void {
+    const e = &entries[slot];
+    @atomicStore(bool, &e.armed, false, .seq_cst);
+    var tmp = new;
+    tmp.armed = false;
+    e.* = tmp;
+    @atomicStore(bool, &e.armed, new.armed, .release);
+}
+
 inline fn writeDr0(addr: u64) void {
     asm volatile ("mov %[a], %%dr0"
         :
@@ -200,8 +225,10 @@ inline fn isPidFullyParked(pid: u8) bool {
 /// `gate_pid_parked_plus1` gate so a watch can opt into "only fire while
 /// the watched pid is parked" semantics without rewriting the suppression
 /// logic in onDebugException.
-inline fn entryEffectivelyArmed(e: WatchEntry) bool {
-    if (!e.armed) return false;
+inline fn entryEffectivelyArmed(e: *const WatchEntry) bool {
+    // Acquire pairs with setEntry's release: armed==true implies the other
+    // fields are fully published (see setEntry).
+    if (!@atomicLoad(bool, &e.armed, .acquire)) return false;
     if (e.gate_pid_parked_plus1 != 0) {
         return isPidFullyParked(e.gate_pid_parked_plus1 - 1);
     }
@@ -211,7 +238,7 @@ inline fn entryEffectivelyArmed(e: WatchEntry) bool {
 /// Compute DR7 from `entries[]`. Bit 10 is reserved-must-be-1.
 fn computeDr7() u64 {
     var dr7: u64 = (1 << 10);
-    for (entries, 0..) |e, i| {
+    for (&entries, 0..) |*e, i| {
         if (entryEffectivelyArmed(e)) {
             const shift_en: u6 = @intCast(2 * i + 1);
             const shift_rw: u6 = @intCast(16 + 4 * i);
@@ -239,6 +266,40 @@ var last_applied_dr7: [smp.MAX_CPUS]u64 = [_]u64{0xFFFF_FFFF_FFFF_FFFF} ** smp.M
 var last_applied_addrs: [smp.MAX_CPUS][4]u64 =
     [_][4]u64{[_]u64{0xFFFF_FFFF_FFFF_FFFF} ** 4} ** smp.MAX_CPUS;
 
+/// While true, gdb_stub owns the debug registers (a remote 'Z' hw-breakpoint
+/// command wrote them raw) and applyLocal() must not stomp them. Without
+/// this, the gated kesp watches flip computeDr7's output on every pid
+/// park/unpark, so the per-tick applyLocal cache-misses and overwrites
+/// gdb's breakpoints within milliseconds of being set. entries[] keeps
+/// accumulating watch-side changes while parked; gdb_stub clears the flag
+/// and calls reapplyAfterDrReset() when its last hw breakpoint is removed,
+/// pushing the canonical state back onto the hardware.
+pub var dr_foreign_owner: bool = false;
+
+/// Forget this CPU's last-applied cache so the next applyLocal()
+/// unconditionally rewrites the hardware. MUST be called after anything
+/// outside applyLocal touches the debug registers raw:
+///   - S3 resume (BSP + each re-onlined AP): the CPU comes back with
+///     power-on DR state while this BSS cache survived in RAM — without
+///     invalidation every post-resume applyLocal cache-hits against the
+///     pre-suspend value and the kesp watchdog stays silently disarmed.
+///   - gdb_stub's applyHwBreakpoints handback (see dr_foreign_owner).
+///   - disarmAll's raw writeDr7(0).
+pub fn invalidateLocalCache() void {
+    const cpu_id = smp.myCpu().cpu_id;
+    if (cpu_id < smp.MAX_CPUS) {
+        last_applied_dr7[cpu_id] = 0xFFFF_FFFF_FFFF_FFFF;
+    }
+}
+
+/// invalidateLocalCache + immediate re-apply: the one-call hook for paths
+/// where the hardware DR state was reset/foreign-written and the canonical
+/// entries[] should go back onto this CPU right away.
+pub fn reapplyAfterDrReset() void {
+    invalidateLocalCache();
+    applyLocal();
+}
+
 /// Push the current `entries[]` to the local CPU's DR registers. Idempotent.
 /// Per-CPU cached — when neither the effective DR7 (which depends on the
 /// scheduling-out gate state of any kesp-gated watch) nor any of the four
@@ -247,6 +308,8 @@ var last_applied_addrs: [smp.MAX_CPUS][4]u64 =
 /// preserved because computeDr7() re-evaluates entryEffectivelyArmed every
 /// call — the gate state IS part of the cache key.
 pub fn applyLocal() void {
+    // gdb_stub owns the DRs during a hw-breakpoint session — don't stomp.
+    if (@atomicLoad(bool, &dr_foreign_owner, .monotonic)) return;
     const cpu_id = smp.myCpu().cpu_id;
     const new_dr7 = computeDr7();
     const a0 = entries[0].addr;
@@ -330,14 +393,14 @@ pub fn broadcastSync() void {
 }
 
 pub fn arm(slot: u2, addr: u64, kind: Kind, len: Len, policy: Policy, label: []const u8) void {
-    entries[slot] = .{
+    setEntry(slot, .{
         .armed = true,
         .addr = addr,
         .kind = kind,
         .len = len,
         .policy = policy,
         .label = label,
-    };
+    });
     applyLocal();
     broadcastSync();
 }
@@ -352,7 +415,7 @@ pub fn armWithWhitelist(
     sym: []const u8,
     max_off: u32,
 ) void {
-    entries[slot] = .{
+    setEntry(slot, .{
         .armed = true,
         .addr = addr,
         .kind = kind,
@@ -361,7 +424,7 @@ pub fn armWithWhitelist(
         .label = label,
         .whitelist_sym = sym,
         .whitelist_max_offset = max_off,
-    };
+    });
     applyLocal();
     broadcastSync();
 }
@@ -378,7 +441,7 @@ pub fn armValueThreshold(
     label: []const u8,
     value_threshold: u64,
 ) void {
-    entries[slot] = .{
+    setEntry(slot, .{
         .armed = true,
         .addr = addr,
         .kind = .write,
@@ -386,7 +449,7 @@ pub fn armValueThreshold(
         .policy = policy,
         .label = label,
         .value_threshold = value_threshold,
-    };
+    });
     applyLocal();
     broadcastSync();
 }
@@ -403,7 +466,7 @@ pub fn armSkipValue(
     label: []const u8,
     skip_value: u64,
 ) void {
-    entries[slot] = .{
+    setEntry(slot, .{
         .armed = true,
         .addr = addr,
         .kind = .write,
@@ -411,7 +474,7 @@ pub fn armSkipValue(
         .policy = policy,
         .label = label,
         .skip_value = skip_value,
-    };
+    });
     applyLocal();
     broadcastSync();
 }
@@ -421,7 +484,7 @@ pub fn armSkipValue(
 /// scrambled writes AND the shifted-frame-write race where the post-
 /// write value looks plausible by magnitude but is wrong by structure.
 pub fn armCsSlot(slot: u2, addr: u64, label: []const u8) void {
-    entries[slot] = .{
+    setEntry(slot, .{
         .armed = true,
         .addr = addr,
         .kind = .write,
@@ -429,21 +492,32 @@ pub fn armCsSlot(slot: u2, addr: u64, label: []const u8) void {
         .policy = .panic_dump,
         .label = label,
         .cs_slot_check = true,
-    };
+    });
     applyLocal();
     broadcastSync();
 }
 
 pub fn disarm(slot: u2) void {
-    entries[slot].armed = false;
+    @atomicStore(bool, &entries[slot].armed, false, .release);
     applyLocal();
     broadcastSync();
 }
 
+/// Disarm every slot, locally AND remotely. The raw writeDr7(0) bypasses
+/// applyLocal's per-CPU cache, so the cache must be invalidated — otherwise
+/// a later re-arm with an IDENTICAL configuration compares equal against
+/// the stale cache, skips the hardware write, and the "re-armed" watch
+/// silently never reaches DR7 (rotateKernelEspWatches' documented
+/// re-arm-after-disarmAll safety relied on exactly that broken path).
 pub fn disarmAll() void {
-    for (&entries) |*e| e.armed = false;
+    for (&entries) |*e| @atomicStore(bool, &e.armed, false, .release);
     writeDr7(0);
     writeDr6(0);
+    invalidateLocalCache();
+    // Converge remote CPUs now (entries[] is already disarmed, so their
+    // applyLocal computes an empty DR7) instead of waiting up to a tick
+    // on the lazy path.
+    broadcastSync();
 }
 
 /// Called from idt.zig handleException for int_no==1. `rsp` is the saved-
@@ -451,12 +525,30 @@ pub fn disarmAll() void {
 /// Returns true iff a watchpoint actually triggered (and so the caller
 /// should skip the rest of the #DB path).
 pub fn onDebugException(rsp: u64, saved_rip: u64) bool {
+    // While gdb_stub owns the debug registers, every hardware hit belongs
+    // to ITS breakpoints. entries[] is parked state, NOT what's in the
+    // hardware — matching a Bn latch against it would fire a watch policy
+    // on a gdb breakpoint hit. Return "not ours" so the #DB falls through
+    // to the gdb dispatch below us in exception.zig.
+    if (@atomicLoad(bool, &dr_foreign_owner, .monotonic)) return false;
     const dr6 = readDr6();
-    var any_hit = false;
+    const bn_mask = dr6 & 0xF;
     for (&entries, 0..) |*e, i| {
         const bit_idx: u6 = @intCast(i);
         if ((dr6 >> bit_idx) & 1 == 0) continue;
-        any_hit = true;
+        // Re-check the canonical state before firing the policy. Two ways
+        // a latched Bn can belong to a slot that is NOT logically armed:
+        //   (a) the SDM latches Bn on an address-condition match even when
+        //       the slot is DISABLED in DR7 — a single-step or other-slot
+        //       #DB can carry a stale condition match for a disarmed slot;
+        //   (b) a remote disarm/setEntry republish raced this hit
+        //       (broadcastSync is fire-and-forget; this CPU's DR7 may still
+        //       hold the old config for a few microseconds).
+        // Firing the policy against the stale/half-updated entry would be
+        // a phantom panic_dump; suppress, and let the bottom-of-function
+        // DR6 clear drop the latch. Acquire pairs with setEntry's release
+        // so armed==true implies consistent fields.
+        if (!@atomicLoad(bool, &e.armed, .acquire)) continue;
         e.hits +%= 1;
 
         // Whitelist: known-legitimate writers don't crash the system.
@@ -546,9 +638,28 @@ pub fn onDebugException(rsp: u64, saved_rip: u64) bool {
                 @panic("watchpoint hit (panic_dump)");
             },
         }
+        // Instruction (exec) breakpoints are FAULT-type: #DB fires BEFORE
+        // the instruction executes, so a plain iretq re-fetches the same
+        // instruction and re-faults forever. Set RF in the saved RFLAGS so
+        // the first re-fetch ignores instruction breakpoints (hardware
+        // clears RF after one successful instruction). Data watches are
+        // trap-type and don't need this; panic_dump never returns, so only
+        // the continue policies reach here.
+        if (e.kind == .exec) {
+            const stk: [*]volatile u64 = @ptrFromInt(rsp);
+            stk[19] |= @as(u64, 1) << 16;
+        }
     }
-    if (any_hit) writeDr6(0); // clear sticky B0..B3
-    return any_hit;
+    // Clear ONLY the sticky B0..B3 latches; preserve BS/BD for the legacy
+    // single-step consumers behind us in the #DB path (the MMU write-watch
+    // reprotect reads BS after we return false). The clear must happen even
+    // when every latched bit was suppressed above — a stale Bn surviving in
+    // DR6 would re-trigger phantom processing on every subsequent #DB.
+    if (bn_mask != 0) writeDr6(dr6 & ~@as(u64, 0xF));
+    // Same return contract as always: "a watch condition was involved in
+    // this #DB" (even if suppressed) — the caller skips the rest of the
+    // #DB path in that case.
+    return bn_mask != 0;
 }
 
 fn printHit(slot: u8, e: *const WatchEntry, rsp: u64, saved_rip: u64, full: bool) void {
@@ -913,7 +1024,7 @@ pub fn rotateKernelEspWatches() void {
         // applyLocal churn on the steady state.
         if (e.armed and e.addr == want_addr and e.whitelist_fn != null and
             e.gate_pid_parked_plus1 == pid + 1) continue;
-        e.* = .{
+        setEntry(@intCast(i), .{
             .armed = true,
             .addr = want_addr,
             .kind = .write,
@@ -929,7 +1040,7 @@ pub fn rotateKernelEspWatches() void {
             // switchTo because those happen with the pid parked (the
             // attacker pid races against the watched pid's PCB slot).
             .gate_pid_parked_plus1 = pid + 1,
-        };
+        });
         any_change = true;
     }
     // Memory watch on *(kesp+48) for the netstat-desktop saved-RIP corruption
@@ -955,14 +1066,14 @@ pub fn rotateKernelEspWatches() void {
         };
         if (want_addr == 0) {
             if (e.armed) {
-                e.armed = false;
+                @atomicStore(bool, &e.armed, false, .release);
                 any_change = true;
             }
             continue;
         }
         if (e.armed and e.addr == want_addr and e.mirror_pid_plus1 == pid + 1 and
             e.gate_pid_parked_plus1 == pid + 1) continue;
-        e.* = .{
+        setEntry(slot, .{
             .armed = true,
             .addr = want_addr,
             .kind = .write,
@@ -978,7 +1089,7 @@ pub fn rotateKernelEspWatches() void {
             // parked and the slot is supposed to hold the next dispatch's
             // RA.
             .gate_pid_parked_plus1 = pid + 1,
-        };
+        });
         any_change = true;
     }
     // Deep-kstack watch — slot KESP_WATCHED_PIDS.len + KESP_PLUS48_WATCHED_PIDS.len
@@ -998,13 +1109,13 @@ pub fn rotateKernelEspWatches() void {
         const want_addr: u64 = if (top == 0) 0 else top - KSTACK_DEEP_OFFSET_FROM_TOP;
         if (want_addr == 0) {
             if (e.armed) {
-                e.armed = false;
+                @atomicStore(bool, &e.armed, false, .release);
                 any_change = true;
             }
             continue;
         }
         if (e.armed and e.addr == want_addr and e.whitelist_fn != null) continue;
-        e.* = .{
+        setEntry(slot, .{
             .armed = true,
             .addr = want_addr,
             .kind = .write,
@@ -1018,7 +1129,7 @@ pub fn rotateKernelEspWatches() void {
             // "Zig undefined-init noise" rationale doesn't apply here
             // because the depth + isLegitDeepKstackWriter filter
             // already gates same-stack writers.
-        };
+        });
         any_change = true;
     }
     }

@@ -337,6 +337,13 @@ pub fn suspendToRam() u32 {
         serial.print("[s3] resumed: xhci re-init failed — USB input stays dead\n", .{});
     }
 
+    // The BSP's DR0-DR3/DR7 were reset by S3 like everything else, but
+    // watch.zig's per-CPU applied-cache survived in RAM — without an explicit
+    // invalidate+reapply every later applyLocal() cache-hits against the
+    // pre-suspend value and the hardware watchpoints (kesp watchdog) stay
+    // silently disarmed. The re-onlined APs do the same in apEntryS3Resume.
+    @import("../debug/watch.zig").reapplyAfterDrReset();
+
     serial.print("[s3] resumed: APs re-onlined, devices + low identity restored — returning to userspace\n", .{});
     // return 0 -> sysShutdown -> syscall dispatcher -> sysret restores the app's
     // RFLAGS (IF=1) and lands it back in userspace; the LAPIC timer re-armed in

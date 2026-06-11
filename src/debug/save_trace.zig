@@ -269,7 +269,7 @@ pub export fn save_trace_record(kesp_ptr: usize) callconv(.c) void {
             if (pid == 2 or pid == 3) {
                 const hw_slot: u2 = if (pid == 2) HWBP_SLOT_PID2 else HWBP_SLOT_PID3;
                 const label = if (pid == 2) "kesp48_pid2" else "kesp48_pid3";
-                watch.entries[hw_slot] = .{
+                watch.setEntry(hw_slot, .{
                     .armed = true,
                     .addr = rip_slot,
                     .kind = .write,
@@ -278,7 +278,7 @@ pub export fn save_trace_record(kesp_ptr: usize) callconv(.c) void {
                     .label = label,
                     .mirror_pid_plus1 = pid + 1,
                     .whitelist_fn = &watch.isLegitKesp48Writer,
-                };
+                });
                 watch.applyLocal();
                 watch.broadcastSync();
             }

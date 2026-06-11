@@ -673,11 +673,14 @@ fn handleQuery(pkt: []const u8) void {
 // --- Debug register management ---
 
 fn applyHwBreakpoints() void {
+    const watch = @import("watch.zig");
     var dr7: u64 = 0;
+    var any_active = false;
 
     for (0..4) |i| {
         const bp = hw_breakpoints[i];
         if (bp.active) {
+            any_active = true;
             // Set DRn address
             switch (i) {
                 0 => asm volatile ("movq %[addr], %%dr0"
@@ -718,10 +721,25 @@ fn applyHwBreakpoints() void {
         }
     }
 
+    // Ownership handshake with the kernel's own watch.zig manager (kesp
+    // watchdog). Without it the two stomp each other: watch's per-tick
+    // applyLocal recomputes DR7 on every watched-pid park/unpark (the
+    // parked-gate flips the enable bits) and overwrites gdb's breakpoints
+    // within milliseconds; and once gdb removes its last breakpoint, the
+    // raw dr7=0 above leaves watch's applied-cache stale so its watches
+    // stay silently dead. Claim the registers BEFORE the raw write while
+    // any gdb breakpoint is active; hand them back (invalidate cache +
+    // re-apply canonical entries[]) when the last one is removed.
+    @atomicStore(bool, &watch.dr_foreign_owner, any_active, .release);
+
     asm volatile ("movq %[val], %%dr7"
         :
         : [val] "r" (dr7),
     );
+
+    if (!any_active) {
+        watch.reapplyAfterDrReset();
+    }
 }
 
 fn clearDR6() void {

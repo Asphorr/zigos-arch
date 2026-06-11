@@ -778,6 +778,12 @@ export fn apEntryS3Resume() callconv(.c) noreturn {
 
     serial.print("[smp] AP {d} re-online after S3\n", .{my_id});
 
+    // S3 reset this AP's debug registers to power-on state while watch.zig's
+    // per-CPU applied-cache survived in RAM. Force a fresh apply, otherwise
+    // the cache compares equal against the pre-suspend value, every rewrite
+    // is skipped, and the kesp watchdog stays silently dead on this CPU.
+    @import("../debug/watch.zig").reapplyAfterDrReset();
+
     process.enterFirstTaskAp(idle_pid);
 }
 
