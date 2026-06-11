@@ -16,8 +16,6 @@ pub var moved: bool = false;
 // Accumulated deltas since last read (for FPS-style mouse input)
 pub var accum_dx: i32 = 0;
 pub var accum_dy: i32 = 0;
-pub var prev_accum_x: i32 = 640;
-pub var prev_accum_y: i32 = 360;
 
 // Raw, pre-clamp relative motion accumulated by the HID/PS2 mouse drivers and
 // drained by desktop.getMouseRelative into the per-app FPS delta channel
@@ -53,14 +51,21 @@ var syn_finger_down: bool = false;
 // touch (< TAP_MAX_TICKS) without significant movement = synthetic click.
 var syn_tap_ticks: u32 = 0;
 var syn_tap_moved: bool = false;
-const TAP_MAX_TICKS: u32 = 8;       // ≈ 80 ms at default 100 Hz sample rate
-const TAP_MOVE_THRESHOLD: i32 = 10; // pad coords; ≈ 1.5 mm typical
+const TAP_MAX_TICKS: u32 = 8; // ≈ 80 ms at default 100 Hz sample rate
+// Compared against per-packet |dx|+|dy| AFTER the /4 mouse-feel scaling
+// (and speed scaling), so in raw pad units this is ~40+ per sample — a
+// single-packet jerk. Slow drags rely on TAP_MAX_TICKS to disqualify.
+const TAP_MOVE_THRESHOLD: i32 = 10;
 // Two-finger scroll: when W reports two fingers, accumulate vertical motion
 // into the wheel accumulator instead of moving the cursor.
 const SYN_W_TWO_FINGERS: u8 = 0;
 // Pending synthetic-click button mask, OR'd into `buttons` for one IRQ then
 // cleared. Lets the desktop see a real press+release transition.
 var syn_synth_click: u8 = 0;
+// True while `buttons` carries a synthetic tap-click whose release edge has
+// not been published yet. handleIRQ drops it on the very next aux byte —
+// see the comment there for why waiting for a full packet was too late.
+var syn_synth_latched: bool = false;
 
 /// Wait for the i8042 controller to be ready. Returns false if the budget
 /// elapsed without the condition becoming true — caller treats as a missing
@@ -167,6 +172,7 @@ fn enableSynaptics() bool {
     syn_tap_ticks = 0;
     syn_tap_moved = false;
     syn_synth_click = 0;
+    syn_synth_latched = false;
     return true;
 }
 
@@ -234,15 +240,43 @@ pub fn init() bool {
 }
 
 pub fn handleIRQ() void {
+    // Gate on the i8042 status byte BEFORE touching the data port: bit 0
+    // (output buffer full) must be set — IRQ12 can fire spuriously — and
+    // bit 5 (AUX) must mark the byte as mouse data. The controller is
+    // shared with the keyboard; the old unconditional read could steal a
+    // pending KEYBOARD byte (one eaten keystroke) and feed it to the
+    // packet state machine as mouse data.
+    const st = io.inb(STATUS_PORT);
+    if (st & 0x01 == 0 or st & 0x20 == 0) return;
     const data = io.inb(DATA_PORT);
+
+    // A latched synthetic tap-click must not outlive the stream: its
+    // release edge only becomes visible when `buttons` is next recomputed,
+    // which used to require a complete subsequent packet (3-6 bytes). Any
+    // aux byte is proof the stream is alive — publish the release NOW.
+    // (A pad that sends nothing at all after the lift packet still strands
+    // the latch; accepted residual — the next touch clears it.)
+    if (syn_synth_latched) {
+        syn_synth_latched = false;
+        buttons &= ~@as(u8, 0x01);
+        moved = true;
+    }
 
     switch (cycle) {
         0 => {
-            // First byte must have bit 3 set. Synaptics absolute packets
-            // use bits 7,6 = 1,0 in byte 0 (also matches "bit 3 set"
-            // because the low button bits are independent — we conservatively
-            // accept anything with bit 3 high).
-            if (data & 0x08 != 0) {
+            // First-byte sync check, mode-aware. Standard/IntelliMouse
+            // byte 0 always has bit 3 set. Synaptics ABSOLUTE-mode byte 0
+            // is `1 0 Yo Xo Bp Wn3 R L` — bit 3 there is the pad-button
+            // bit, LOW with no button held, so the old bit-3-only gate
+            // dropped byte 0 of essentially every unclicked touchpad
+            // packet and re-synced on interior bytes: permanent framing
+            // garbage. Absolute byte 0 is `10xxxxxx` (byte 3 is
+            // `11xxxxxx`), which is the sync property to key on.
+            const in_sync = if (is_synaptics)
+                (data & 0xC0) == 0x80
+            else
+                (data & 0x08) != 0;
+            if (in_sync) {
                 mouse_bytes[0] = data;
                 cycle = 1;
             }
@@ -395,7 +429,11 @@ fn processSynapticsPacket() void {
         if (syn_finger_down) {
             // Lift event. If the touch was brief and didn't move much,
             // synthesize a one-packet left-click for the desktop to see.
-            if (!syn_tap_moved and syn_tap_ticks <= TAP_MAX_TICKS) {
+            // Skip when the physical left button is held: the synth bit
+            // aliases real bit 0, and handleIRQ's latch-clear would then
+            // briefly release a genuinely-held button (phantom double-
+            // click edge).
+            if (!syn_tap_moved and syn_tap_ticks <= TAP_MAX_TICKS and (real_btns & 0x01) == 0) {
                 syn_synth_click = 0x01; // left button
             }
             syn_finger_down = false;
@@ -408,8 +446,9 @@ fn processSynapticsPacket() void {
     // OR'd with any pending synthetic click for one packet.
     buttons = real_btns | syn_synth_click;
     if (syn_synth_click != 0) {
-        // Schedule clear: one IRQ later we want desktop to see release.
+        // Arm the release: handleIRQ publishes it on the next aux byte.
         syn_synth_click = 0;
+        syn_synth_latched = true;
         moved = true;
     }
 }

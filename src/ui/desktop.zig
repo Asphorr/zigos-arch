@@ -2300,8 +2300,11 @@ fn handleMouseEvents() DirtyKind {
     // Mouse-wheel scroll: route to terminal window under cursor (or focused
     // terminal if not directly hovered). 3 lines per notch.
     if (mouse.wheel != 0) {
-        const w_delta = mouse.wheel;
-        mouse.wheel = 0;
+        // Atomic drain: producers run in IRQ context (xHCI inline drain
+        // since Inc2c, PS/2 IRQ12) — a plain read-then-clear loses notches
+        // added in between. Producers are BSP-only, so Xchg vs a same-CPU
+        // IRQ `+=` is a complete fix, not just a narrower window.
+        const w_delta = @atomicRmw(i32, &mouse.wheel, .Xchg, 0, .acq_rel);
         const target_idx: ?u8 = if (windowAt(mx, my)) |hi|
             (if (windows[hi].term != null) hi else null)
         else if (slot_used[wm.focused] and windows[wm.focused].term != null)
