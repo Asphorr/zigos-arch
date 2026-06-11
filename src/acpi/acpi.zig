@@ -812,6 +812,17 @@ pub fn init(boot_rsdp: u64) void {
         if (nfit != null) "yes" else "no",
     });
 
+    // Hand the (leaf) AML interpreter its kernel service hooks before any
+    // firmware method runs: real Sleep/Stall delays, the monotonic Timer
+    // clock, and the current-task id for its recursive interpreter lock. All
+    // are safe from boot context — kernelSleepMs returns immediately when no
+    // current task exists, and a zero Timer falls back to aml's own counter.
+    const amlmod = @import("aml.zig");
+    amlmod.sleep_ms_fn = &amlSleepMs;
+    amlmod.stall_us_fn = &amlStallUs;
+    amlmod.timer_100ns_fn = &amlTimer100ns;
+    amlmod.task_id_fn = &amlTaskId;
+
     // Dynamic ACPI (Slice B): decode the DSDT's AML into a namespace. Best-
     // effort + fully bounds-checked; a malformed DSDT yields a partial walk,
     // never a fault. For bring-up this dumps the discovered objects to serial.
@@ -829,6 +840,40 @@ pub fn init(boot_rsdp: u64) void {
     } else if (cst.found) {
         debug.klog("[acpi] _CST advertises C{d} (hint 0x{X}) but the CPU enumerates no MWAIT substate for it — idle stays C1\n", .{ cst.ctype, cst.hint });
     }
+}
+
+// --- AML interpreter kernel-service hooks ------------------------------------
+// aml.zig is a leaf module (it must build in the native test harness against
+// thin stubs), so the kernel services it needs are injected here as function
+// pointers rather than imported there. The lazy @imports keep this file's
+// top-level dependency set unchanged.
+
+fn amlSleepMs(ms: u64) void {
+    // Per-call clamp; aml.zig additionally enforces a per-method Sleep budget.
+    @import("../proc/sched.zig").kernelSleepMs(@intCast(@min(ms, 1_000)));
+}
+
+fn amlStallUs(us: u64) void {
+    const apic = @import("../time/apic.zig");
+    const tpq = apic.tscPerQuantum(); // TSC ticks per 10ms quantum
+    if (tpq == 0) return; // pre-calibration: nothing to time against
+    const ticks = @min(us, 1_000) * tpq / 10_000; // 10_000 µs per quantum
+    const start = apic.readTsc();
+    while (apic.readTsc() -% start < ticks) std.atomic.spinLoopHint();
+}
+
+fn amlTimer100ns() u64 {
+    const apic = @import("../time/apic.zig");
+    const tpq = apic.tscPerQuantum();
+    if (tpq == 0) return 0; // aml falls back to its monotonic counter
+    // 10ms quantum = 100_000 × 100ns; u128 so the product can't wrap (a u64
+    // intermediate overflows after ~17h of 3GHz TSC).
+    return @intCast(@as(u128, apic.readTsc()) * 100_000 / tpq);
+}
+
+fn amlTaskId() u64 {
+    const cpu = @import("../cpu/smp.zig").myCpu();
+    return if (cpu.current_pid) |p| @as(u64, @intCast(p)) else 0xFFFF_FFFF;
 }
 
 // --- MADT iterator ----------------------------------------------------------

@@ -36,6 +36,63 @@ const paging = @import("../mm/paging.zig"); // SystemMemory field access (B2c)
 // boot noise). Kept on through Slice B bring-up so each boot shows the walk.
 const DUMP = true;
 
+// --- kernel service hooks ----------------------------------------------------
+// aml.zig is a LEAF module (std/acpi/debug/io/paging only) so the native test
+// harness builds it against thin stubs. Kernel services it must not import —
+// real sleeps, µs stalls, a monotonic clock, the current task id — are injected
+// as nullable function pointers instead, registered by acpi.init() before
+// load() runs the first firmware method. All default to null, which degrades
+// to the prior behavior (Sleep/Stall no-op, Timer counts calls, lock id 0) —
+// so the harness and anything pre-registration run unchanged.
+
+/// Sleep(ms): block the calling task. Registered to sched.kernelSleepMs (which
+/// itself returns immediately when no current task exists, e.g. early boot).
+pub var sleep_ms_fn: ?*const fn (ms: u64) void = null;
+/// Stall(µs): bounded busy-wait below the scheduler's resolution.
+pub var stall_us_fn: ?*const fn (us: u64) void = null;
+/// Timer clock: monotonic 100ns ticks (ACPI 6.4 §19.6.143). 0 = not ready yet
+/// (pre-TSC-calibration) — timerNow() then falls back to a call counter.
+pub var timer_100ns_fn: ?*const fn () u64 = null;
+/// Current task id for the recursive interpreter lock: stable per task,
+/// distinct between concurrently-runnable tasks (the kernel hands back its pid).
+pub var task_id_fn: ?*const fn () u64 = null;
+
+// --- interpreter lock ----------------------------------------------------------
+// The arenas, the namespace's runtime Name values and the dynamic-node
+// high-water mark are GLOBAL: the interpreter was built on "acpid runs every
+// AML method serially". But the public entries are reachable from other tasks
+// too (the acpidev/acpiprt CLI, pmem's callDsm), and two concurrent
+// evaluations would interleave arena resets mid-method. This recursive,
+// task-keyed lock serializes every public entry; nested public calls from the
+// same task (load() → reportThermal, runGpeHandler → evalMethod) just bump the
+// depth. Waiters sleep-poll via sleep_ms_fn — the holder may legitimately
+// Sleep() for milliseconds inside a method — or spin-hint when no scheduler is
+// registered (native harness / early boot, both single-threaded anyway).
+const NO_OWNER: u64 = ~@as(u64, 0);
+var ilock_owner: u64 = NO_OWNER;
+var ilock_depth: u32 = 0; // touched only by the owner
+
+fn selfTaskId() u64 {
+    return if (task_id_fn) |f| f() else 0;
+}
+
+fn ilockAcquire() void {
+    const me = selfTaskId();
+    if (@atomicLoad(u64, &ilock_owner, .acquire) == me) {
+        ilock_depth += 1;
+        return;
+    }
+    while (@cmpxchgWeak(u64, &ilock_owner, NO_OWNER, me, .acq_rel, .acquire) != null) {
+        if (sleep_ms_fn) |f| f(1) else std.atomic.spinLoopHint();
+    }
+    ilock_depth = 1;
+}
+
+fn ilockRelease() void {
+    ilock_depth -= 1;
+    if (ilock_depth == 0) @atomicStore(u64, &ilock_owner, NO_OWNER, .release);
+}
+
 // --- AML object value (tagged union) ----------------------------------------
 // The evaluator (Slice B2+) produces these. Defined now so the namespace can
 // carry resolved constant Names and so the type is stable across slices.
@@ -693,6 +750,8 @@ fn childExists(dev_path: []const u8, seg: []const u8) bool {
 /// half of NVDIMM discovery: the static NFIT gives the memory geometry, this
 /// confirms the firmware's dynamic (DSM-mailbox) interface exists.
 pub fn nvdimmInfo() ?NvdimmInfo {
+    ilockAcquire();
+    defer ilockRelease();
     var i: usize = 0;
     while (i < nnodes) : (i += 1) {
         const n = &nodes[i];
@@ -789,9 +848,17 @@ fn newBuf(n: usize) ?[]u8 {
 // buffer/package/ref would dangle. Integer/string runtime values survive, so a
 // Name written by one method (e.g. \PICF set by _PIC, read later by _PRT) keeps
 // its value across calls; only arena-backed objects are dropped.
+/// Per-top-level-evaluation Sleep() budget. A firmware wait loop with a
+/// generous poll interval (`While (BUSY) { Sleep(10) }`) must not be able to
+/// park acpid unboundedly: once one method-call tree has slept this much,
+/// further Sleeps degrade to no-ops and the While iteration cap ends the loop.
+const SLEEP_BUDGET_MS: u64 = 2_000;
+var sleep_budget_ms: u64 = SLEEP_BUDGET_MS;
+
 fn arenaReset() void {
     arena_top = 0;
     byte_top = 0;
+    sleep_budget_ms = SLEEP_BUDGET_MS;
     if (nnodes > static_nnodes) nnodes = static_nnodes; // drop dynamic CreateField nodes
     var i: usize = 0;
     while (i < nnodes) : (i += 1) {
@@ -956,6 +1023,8 @@ fn evalRegionBase(r: *Reader, scope: []const u8) u64 {
 /// scan; usable by the shutdown path later). Null if \_S5_ is absent or not a
 /// Package of integers. Call after load() has populated the store.
 pub fn s5SlpTyp() ?u8 {
+    ilockAcquire();
+    defer ilockRelease();
     if (nbodies == 0) return null;
     const n = findExact("\\_S5_") orelse return null;
     arenaReset();
@@ -1161,14 +1230,17 @@ fn skipSuperName(r: *Reader) bool {
     return readNameString(r) != null;
 }
 
-/// Extended (0x5B-prefixed) opcodes in expression/statement position. The
-/// synchronization ops are modeled as no-ops: acpid runs every GPE/AML handler
-/// serially in a single thread, so a Mutex is always uncontended — Acquire
+/// Extended (0x5B-prefixed) opcodes in expression/statement position. Mutexes
+/// stay modeled as no-ops — the interpreter lock already serializes every AML
+/// evaluation, so an AML Mutex is by construction uncontended: Acquire
 /// "succeeds" (returns 0 = no timeout) and Release does nothing. This lets real
 /// firmware methods run *past* their lock: e.g. the PCI-hotplug \_GPE._E01
 /// serializes on \_SB.PCI0.BLCK before touching the controller, then walks the
-/// slots (PCIU/PCID field I/O) and Notifies. Any other extended opcode stays
-/// unmodeled → null so the caller bails cleanly.
+/// slots (PCIU/PCID field I/O) and Notifies. Sleep/Stall are REAL delays when
+/// the kernel registered hooks (an EC-style poll loop actually paces); Events
+/// have exact single-threaded counter semantics (evalEventOp); Timer reads the
+/// monotonic clock. Any other extended opcode stays unmodeled → null so the
+/// caller bails cleanly.
 fn evalExtTerm(r: *Reader, st: *ExecState) ?Value {
     const ext = r.peek(1) orelse return null;
     switch (ext) {
@@ -1195,13 +1267,125 @@ fn evalExtTerm(r: *Reader, st: *ExecState) ?Value {
             const ns = readNameString(r) orelse return null;
             return bindBufferField(st, ns, src, @intCast(bit_index & 0xFFFF_FFFF), @intCast(num_bits & 0xFFFF_FFFF));
         },
-        0x21, 0x22 => { // Stall(usec) / Sleep(msec): consume the TermArg, no-op.
+        0x21, 0x22 => { // Stall(usec) / Sleep(msec): real, bounded delays.
             _ = r.next(); // 0x5B
-            _ = r.next(); // 0x21 / 0x22
-            _ = evalTermArg(r, st); // acpid runs serially and the QEMU mailbox is
-            return .uninit; // synchronous, so pacing delays are unnecessary here.
+            const which = r.next().?; // 0x21 / 0x22
+            const amt = toInt(evalTermArg(r, st) orelse .uninit);
+            if (which == 0x22) {
+                // Sleep: capped by the per-evaluation budget so a stuck firmware
+                // poll loop can't park acpid forever (the While iteration cap
+                // then ends the loop). No hook (harness/early boot) ⇒ no-op.
+                if (sleep_ms_fn) |f| {
+                    const ms = @min(amt, sleep_budget_ms);
+                    sleep_budget_ms -= ms;
+                    if (ms != 0) f(ms);
+                }
+            } else {
+                // Stall: spec says < 100µs (longer waits must use Sleep); clamp
+                // at 1ms so malformed firmware can't busy-spin the CPU for long.
+                if (stall_us_fn) |f| f(@min(amt, 1_000));
+            }
+            return .uninit;
+        },
+        0x24, 0x25, 0x26 => return evalEventOp(r, st, ext), // Signal / Wait / Reset
+        0x28, 0x29 => { // FromBCD / ToBCD: Operand Target
+            _ = r.next(); // 0x5B
+            const which = r.next().?; // 0x28 / 0x29
+            const a = toInt(evalTermArg(r, st) orelse return null);
+            const res: u64 = if (which == 0x28) fromBcd(a) else toBcd(a);
+            if (!storeTarget(r, st, .{ .integer = res })) return null;
+            return .{ .integer = res };
+        },
+        0x33 => { // Timer: the monotonic 100ns clock
+            _ = r.next(); // 0x5B
+            _ = r.next(); // 0x33
+            return .{ .integer = timerNow() };
         },
         else => return null, // unmodeled extended op — bail cleanly
+    }
+}
+
+/// Monotonic 100ns clock for Timer (ACPI 6.4 §19.6.143). Falls back to a
+/// strictly increasing call counter when no kernel clock is registered (native
+/// harness / pre-calibration boot) — firmware only uses Timer for deltas and
+/// timeouts, so monotonicity is the contract that matters, not wall accuracy.
+var timer_fallback: u64 = 0;
+fn timerNow() u64 {
+    if (timer_100ns_fn) |f| {
+        const v = f();
+        if (v != 0) return v;
+    }
+    timer_fallback += 100;
+    return timer_fallback;
+}
+
+/// BCD ↔ binary (ACPI 6.4 §19.6.51/§19.6.141): each nibble one decimal digit.
+fn fromBcd(v: u64) u64 {
+    var out: u64 = 0;
+    var mul: u64 = 1;
+    var x = v;
+    while (x != 0) : (x >>= 4) {
+        out +%= @min(x & 0xF, 9) * mul;
+        mul *%= 10;
+    }
+    return out;
+}
+
+fn toBcd(v: u64) u64 {
+    var out: u64 = 0;
+    var shift: u6 = 0;
+    var x = v;
+    while (x != 0) : (x /= 10) {
+        out |= (x % 10) << shift;
+        if (shift == 60) break; // 16 BCD digits = a full u64
+        shift += 4;
+    }
+    return out;
+}
+
+/// Signal(0x24)/Wait(0x25)/Reset(0x26) over a named Event, with exact
+/// single-threaded semantics: the interpreter lock serializes all AML, so the
+/// only signals a Wait could ever observe are ones executed EARLIER in the same
+/// serial stream — modeled as a per-Event pending count (the node's
+/// runtime_val). Wait therefore never blocks: with no second thread to signal
+/// mid-wait, sleeping out the timeout adds latency and changes nothing, so a
+/// zero count returns "timed out" immediately. Returns Zero = acquired,
+/// non-zero = timeout (ACPI 6.4 §19.6.150).
+fn evalEventOp(r: *Reader, st: *ExecState, ext: u8) ?Value {
+    _ = r.next(); // 0x5B
+    _ = r.next(); // 0x24 / 0x25 / 0x26
+    const lead = r.peek(0) orelse return null;
+    var node: ?*StoredNode = null;
+    if (isNameLead(lead)) {
+        const ns = readNameString(r) orelse return null;
+        node = resolve(st.scope, ns);
+    } else {
+        _ = evalTermArg(r, st); // a Local/Arg-held reference: consume, unmodeled
+    }
+    const timed_out = Value{ .integer = boolVal(true) };
+    if (ext == 0x25) _ = toInt(evalTermArg(r, st) orelse .uninit); // Wait's timeout TermArg
+    const n = node orelse return if (ext == 0x25) timed_out else .uninit;
+    if (n.kind != .event) return if (ext == 0x25) timed_out else .uninit;
+    const count: u64 = if (n.has_runtime and n.runtime_val == .integer) n.runtime_val.integer else 0;
+    switch (ext) {
+        0x24 => { // Signal: one more pending wakeup
+            n.runtime_val = .{ .integer = count +| 1 };
+            n.has_runtime = true;
+            return .uninit;
+        },
+        0x26 => { // Reset: clear all pending signals
+            n.runtime_val = .{ .integer = 0 };
+            n.has_runtime = true;
+            return .uninit;
+        },
+        else => { // Wait: consume one pending signal, or time out immediately
+            if (count > 0) {
+                n.runtime_val = .{ .integer = count - 1 };
+                n.has_runtime = true;
+                return .{ .integer = 0 }; // Zero ⇒ acquired
+            }
+            return timed_out;
+        },
     }
 }
 
@@ -1255,8 +1439,10 @@ fn evalTermArg(r: *Reader, st: *ExecState) ?Value {
         0x71 => return evalRefOf(r, st), // RefOf → reference
         0x8A, 0x8B, 0x8C, 0x8D, 0x8F => return evalCreateField(r, st, op), // CreateDWord/Word/Byte/Bit/QWordField
         0x73 => return evalConcat(r, st), // Concatenate
+        0x89 => return evalMatch(r, st), // Match
         0x96 => return evalToBuffer(r, st), // ToBuffer
         0x99 => return evalToInteger(r, st), // ToInteger
+        0x97 => return evalToDecimalString(r, st), // ToDecimalString
         0x98 => return evalToHexString(r, st), // ToHexString
         0x9C => return evalToString(r, st), // ToString
         0x9E => return evalMid(r, st), // Mid
@@ -1773,6 +1959,73 @@ fn evalToHexString(r: *Reader, st: *ExecState) ?Value {
     return res;
 }
 
+/// ToDecimalString(int): minimal decimal digits. Strings pass through; a buffer
+/// falls back to its first 8 LE bytes as an integer (mirrors ToHexString — the
+/// spec's comma-separated byte list has no firmware consumer worth the bytes).
+fn evalToDecimalString(r: *Reader, st: *ExecState) ?Value {
+    _ = r.next(); // 0x97 ToDecimalStringOp
+    const s = derefValue(evalTermArg(r, st) orelse return null);
+    const iv: u64 = switch (s) {
+        .integer => |x| x,
+        .buffer => |b| readLeBytes(b),
+        .string => {
+            if (!storeTarget(r, st, s)) return null;
+            return s;
+        },
+        else => 0,
+    };
+    var tmp: [20]u8 = undefined;
+    var n: usize = tmp.len;
+    var x = iv;
+    while (true) {
+        n -= 1;
+        tmp[n] = '0' + @as(u8, @intCast(x % 10));
+        x /= 10;
+        if (x == 0) break;
+    }
+    const out = bufAlloc(tmp.len - n) orelse return null;
+    @memcpy(out, tmp[n..]);
+    const res = Value{ .string = out };
+    if (!storeTarget(r, st, res)) return null;
+    return res;
+}
+
+/// One Match() predicate: 0 MTR (always true), 1 MEQ, 2 MLE, 3 MLT, 4 MGE,
+/// 5 MGT — over compareValues so strings/buffers compare byte-wise.
+fn matchCmp(op: u64, elem: Value, obj: Value) bool {
+    if (op == 0) return true;
+    const ord = compareValues(elem, obj);
+    return switch (op) {
+        1 => ord == 0,
+        2 => ord <= 0,
+        3 => ord < 0,
+        4 => ord >= 0,
+        5 => ord > 0,
+        else => false,
+    };
+}
+
+/// Match(SearchPkg, Op1, Obj1, Op2, Obj2, StartIndex): index of the first
+/// element from StartIndex satisfying BOTH predicates, else Ones (ACPI 6.4
+/// §19.6.85). The two MatchOpcodes are raw ByteData, not TermArgs.
+fn evalMatch(r: *Reader, st: *ExecState) ?Value {
+    _ = r.next(); // 0x89 MatchOp
+    const pkg_v = derefValue(evalTermArg(r, st) orelse return null);
+    const op1 = r.next() orelse return null;
+    const obj1 = derefValue(evalTermArg(r, st) orelse return null);
+    const op2 = r.next() orelse return null;
+    const obj2 = derefValue(evalTermArg(r, st) orelse return null);
+    const start = toInt(evalTermArg(r, st) orelse return null);
+    if (pkg_v != .package) return .{ .integer = ~@as(u64, 0) };
+    const pkg = pkg_v.package;
+    var i: usize = @intCast(@min(start, pkg.len));
+    while (i < pkg.len) : (i += 1) {
+        const e = derefValue(pkg[i]);
+        if (matchCmp(op1, e, obj1) and matchCmp(op2, e, obj2)) return .{ .integer = i };
+    }
+    return .{ .integer = ~@as(u64, 0) };
+}
+
 /// ToString(Source, Length): a String of Source's bytes up to a NUL or Length
 /// (whichever first); Length = Ones (0xFFFF_FFFF…) means "to the NUL".
 fn evalToString(r: *Reader, st: *ExecState) ?Value {
@@ -1998,6 +2251,24 @@ fn storeTarget(r: *Reader, st: *ExecState, v: Value) bool {
             st.frame.args[@as(usize, op) - 0x68] = v;
             return true;
         },
+        0x5B => {
+            // ExtOpPrefix in Target position: the Debug object (0x5B 0x31) —
+            // firmware's printf, routed to the kernel log. Before this case,
+            // Store(x, Debug) fell into evalExtTerm's unmodeled bail and KILLED
+            // the whole method — the opposite of what a debug aid should do.
+            if (r.peek(1)) |ext2| {
+                if (ext2 == 0x31) {
+                    _ = r.next(); // 0x5B
+                    _ = r.next(); // 0x31 DebugOp
+                    klogDebugValue(v);
+                    return true;
+                }
+            }
+            // Some other extended op as a target — evaluate for side effect.
+            const tv = evalTermArg(r, st) orelse return false;
+            if (tv == .ref) return writeThroughRef(tv.ref, v);
+            return true;
+        },
         else => {
             if (isNameLead(op)) {
                 const ns = readNameString(r) orelse return false;
@@ -2046,6 +2317,23 @@ fn storeTarget(r: *Reader, st: *ExecState, v: Value) bool {
             if (tv == .ref) return writeThroughRef(tv.ref, v);
             return true;
         },
+    }
+}
+
+/// Store-to-Debug rendering (ACPI 6.4 §19.6.33): one klog line per store, typed
+/// like ACPICA's — invaluable when chasing a misbehaving method on real metal.
+fn klogDebugValue(v: Value) void {
+    switch (derefValue(v)) {
+        .integer => |iv| debug.klog("[aml] Debug = 0x{X} ({d})\n", .{ iv, iv }),
+        .string => |s| debug.klog("[aml] Debug = \"{s}\"\n", .{s}),
+        .buffer => |b| {
+            const n = @min(b.len, 16);
+            debug.klog("[aml] Debug = Buffer({d}){{", .{b.len});
+            for (b[0..n]) |x| debug.klog(" {X:0>2}", .{x});
+            debug.klog("{s} }}\n", .{if (b.len > n) " …" else ""});
+        },
+        .package => |p| debug.klog("[aml] Debug = Package({d})\n", .{p.len}),
+        else => debug.klog("[aml] Debug = (uninit)\n", .{}),
     }
 }
 
@@ -2168,6 +2456,12 @@ fn execWhile(r: *Reader, st: *ExecState) void {
             st.break_loop = false;
             break;
         }
+    }
+    // The cap predates this log line; what it caught used to be silent. A loop
+    // that burns it is firmware polling hardware we don't model (or a real
+    // firmware bug) — name the scope so the gap is attributable.
+    if (iters >= MAX_LOOP_ITERS) {
+        debug.klog("[aml] While exceeded {d} iterations in {s} — aborted (stuck poll loop / unmodeled hw?)\n", .{ MAX_LOOP_ITERS, st.scope });
     }
     r.pos = pkg_end;
 }
@@ -2346,6 +2640,8 @@ fn callMethod(node: *StoredNode, args: []const Value, depth: u8) ?Value {
 /// Evaluate a no-argument control method by absolute path (e.g.
 /// "\\_SB_.PCI0._PRT"). Public entry for GPE dispatch (Slice C) + diagnostics.
 pub fn evalMethod(abs: []const u8) ?Value {
+    ilockAcquire();
+    defer ilockRelease();
     const n = findExact(abs) orelse return null;
     if (n.kind != .method) return null;
     arenaReset();
@@ -2355,6 +2651,8 @@ pub fn evalMethod(abs: []const u8) ?Value {
 /// Like evalMethod but passes one argument — e.g. _PIC(1) to tell the firmware we
 /// use the IOAPIC, so _PRT yields GSI (not 8259 IRQ) routing.
 pub fn evalMethodArg1(abs: []const u8, arg: Value) ?Value {
+    ilockAcquire();
+    defer ilockRelease();
     const n = findExact(abs) orelse return null;
     if (n.kind != .method) return null;
     arenaReset();
@@ -2385,6 +2683,8 @@ pub fn asBuffer(v: Value) ?[]const u8 {
 /// lives through the call; the returned buffer (arena-backed) is valid only
 /// until the next public AML entry — copy/parse it immediately.
 pub fn callDsm(dev_path: []const u8, uuid: *const [16]u8, rev: u32, func: u32, input: ?[]const u8) ?Value {
+    ilockAcquire();
+    defer ilockRelease();
     var path_buf: [PATH_MAX]u8 = undefined;
     if (dev_path.len + 5 > path_buf.len) return null;
     @memcpy(path_buf[0..dev_path.len], dev_path);
@@ -2469,6 +2769,8 @@ pub fn pciOscResult() OscResult {
 /// callDsm but Arg3 is a flat Buffer (not a Package), modified + returned in
 /// place. The returned buffer is arena-backed — decode it before the next entry.
 pub fn callOsc(dev_path: []const u8, uuid: *const [16]u8, rev: u32, caps: []const u32) ?Value {
+    ilockAcquire();
+    defer ilockRelease();
     var path_buf: [PATH_MAX]u8 = undefined;
     if (dev_path.len + 5 > path_buf.len) return null;
     @memcpy(path_buf[0..dev_path.len], dev_path);
@@ -2503,6 +2805,8 @@ fn oscYN(b: bool) []const u8 {
 /// Requests native hotplug + PME + AER + cap-structure and logs what firmware
 /// granted; records it for pciOscResult(). Returns true if it ran.
 pub fn reportOsc() bool {
+    ilockAcquire();
+    defer ilockRelease();
     const request: u32 = OSC_CTRL_PCIE_HOTPLUG | OSC_CTRL_PCIE_PME | OSC_CTRL_PCIE_AER | OSC_CTRL_PCIE_CAP;
     // DWORD0 status=0; DWORD1 support (extended-config + MSI); DWORD2 control req.
     const caps = [_]u32{ 0, 0x00000011, request };
@@ -2568,6 +2872,8 @@ const synth_pci = [_]u8{
 /// the root (which handles _FIT). Returns the child's absolute path (into stable
 /// store storage), or null. Direct children only.
 pub fn nvdimmFirstDevice(root_path: []const u8) ?[]const u8 {
+    ilockAcquire();
+    defer ilockRelease();
     var i: usize = 0;
     while (i < nnodes) : (i += 1) {
         const n = &nodes[i];
@@ -2589,6 +2895,8 @@ pub fn nvdimmFirstDevice(root_path: []const u8) ?[]const u8 {
 /// `is_level.*`. Null if neither method exists. (Slice C uses this to decide
 /// which GPEs to enable and which method to run when one fires.)
 pub fn gpeHandler(n: u8, is_level: *bool) ?[]const u8 {
+    ilockAcquire();
+    defer ilockRelease();
     const hex = "0123456789ABCDEF";
     var buf = [_]u8{ '\\', '_', 'G', 'P', 'E', '.', '_', 'E', 0, 0 };
     buf[8] = hex[(n >> 4) & 0xF];
@@ -2613,6 +2921,8 @@ pub fn gpeHandler(n: u8, is_level: *bool) ?[]const u8 {
 /// MUST be called from thread context — it evaluates AML (field I/O, Notify),
 /// which is unsafe in the SCI IRQ.
 pub fn runGpeHandler(n: u8) bool {
+    ilockAcquire();
+    defer ilockRelease();
     var lvl: bool = false;
     const path = gpeHandler(n, &lvl) orelse return false;
     _ = evalMethod(path);
@@ -2722,6 +3032,56 @@ fn stWideFieldTest(fails: *u32) void {
         0xA4, 0x83, 0x88, 0x61, 0x0A, 0x05, 0x00, // Return DerefOf(Index(L1,5)) == 0x06
     }));
     stCheck("wide field buffer r/w", got, 0x06, fails);
+}
+
+/// Backing store + handlers for the region-registry self-test: a fake address
+/// space (0x7E — a reserved id no real firmware uses) backed by a tiny array.
+/// Proves an unmodeled space routes through a registered handler for both read
+/// and write — the exact plug-in point a real EmbeddedControl driver will use.
+var st_fake_space: [8]u8 = [_]u8{0} ** 8;
+
+fn stFakeSpaceRead(space: u8, off: u64, width: u32) ?u64 {
+    _ = space;
+    if (width != 1 or off >= st_fake_space.len) return null;
+    return st_fake_space[@intCast(off)];
+}
+
+fn stFakeSpaceWrite(space: u8, off: u64, width: u32, val: u64) bool {
+    _ = space;
+    if (width != 1 or off >= st_fake_space.len) return false;
+    st_fake_space[@intCast(off)] = @truncate(val);
+    return true;
+}
+
+/// Region handler registry round-trip: an OperationRegion in space 0x7E with a
+/// ByteAcc field; Store + read-back must land in st_fake_space via the handler
+/// (region base 2 + field byte 1 ⇒ backing offset 3).
+fn stRegistryTest(fails: *u32) void {
+    tNsReset();
+    @memset(&st_fake_space, 0);
+    if (!registerRegionHandler(0x7E, .{ .read = &stFakeSpaceRead, .write = &stFakeSpaceWrite })) {
+        stCheck("region handler register", 0, 1, fails);
+        return;
+    }
+    const reg = stMakeNode("\\FAKE") orelse return;
+    reg.kind = .op_region;
+    reg.region_space = 0x7E;
+    reg.region_off = 2;
+    reg.region_len = 4;
+    const reg_idx = nnodes - 1;
+    const fld = stMakeNode("\\FFLD") orelse return;
+    fld.kind = .field;
+    fld.field_region = @intCast(reg_idx);
+    fld.field_bit_off = 8; // second byte of the region
+    fld.field_bit_width = 8;
+    fld.field_access = 1; // ByteAcc
+    static_nnodes = nnodes;
+    const got = toInt(runProgKeepNs(&[_]u8{
+        0x70, 0x0A, 0xA5, 'F', 'F', 'L', 'D', // Store(0xA5, FFLD)
+        0xA4, 'F', 'F', 'L', 'D', // Return(FFLD)
+    }));
+    stCheck("region handler r/w", got, 0xA5, fails);
+    stCheck("region handler backing", st_fake_space[3], 0xA5, fails);
 }
 
 /// Slice E proof: decode the synthetic Processor _CST (the exact blob injected at
@@ -2910,6 +3270,8 @@ fn stCheck(name: []const u8, got: u64, want: u64, fails: *u32) void {
 /// Self-contained: each check resets the namespace it needs, so calling this at
 /// the very top of load() leaves the real DSDT walk a clean store.
 pub fn selfTestExtended() u32 {
+    ilockAcquire();
+    defer ilockRelease();
     var fails: u32 = 0;
 
     // Executor smoke test: Add(2,3) -> Local0; Return(Local0) == 5. Proves
@@ -3124,6 +3486,88 @@ pub fn selfTestExtended() u32 {
 
     // Slice J: resolve a PCI_Config region's BDF from _BBN/_ADR + config address math.
     stPciTest(&fails);
+
+    // === Tier A: Debug target, Timer, delays, conversions, Match, BCD, events,
+    // region-handler registry ===============================================
+
+    // Store-to-Debug must NOT abort the method (it used to: 0x5B 0x31 fell into
+    // evalExtTerm's unmodeled bail and killed every method that logged).
+    stCheck("Store→Debug continues", toInt(runProg(&[_]u8{
+        0x70, 0x0A, 0x42, 0x5B, 0x31, // Store(0x42, Debug)
+        0xA4, 0x0A, 0x07, // Return(7)
+    })), 7, &fails);
+
+    // Timer is monotonic: L0=Timer; L1=Timer; LNot(LGreater(L0,L1)) ⇔ L0 <= L1.
+    stCheck("Timer monotonic", toInt(runProg(&[_]u8{
+        0x70, 0x5B, 0x33, 0x60, // Store(Timer, Local0)
+        0x70, 0x5B, 0x33, 0x61, // Store(Timer, Local1)
+        0xA4, 0x92, 0x94, 0x60, 0x61, // Return(LNot(LGreater(L0, L1)))
+    })), ~@as(u64, 0), &fails);
+
+    // Sleep/Stall consume their argument and execution continues (no hooks in
+    // the harness ⇒ no-op; with kernel hooks ⇒ a real bounded delay).
+    stCheck("Sleep+Stall continue", toInt(runProg(&[_]u8{
+        0x5B, 0x22, 0x01, // Sleep(1)
+        0x5B, 0x21, 0x01, // Stall(1)
+        0xA4, 0x0A, 0x09, // Return(9)
+    })), 9, &fails);
+
+    // ToDecimalString(123) == "123": three chars, first is '1'.
+    stCheck("ToDecimalString len", toInt(runProg(&[_]u8{
+        0x97, 0x0A, 0x7B, 0x60, // ToDecimalString(123, Local0)
+        0xA4, 0x87, 0x60, // Return(SizeOf(Local0))
+    })), 3, &fails);
+    stCheck("ToDecimalString digit", toInt(runProg(&[_]u8{
+        0x97, 0x0A, 0x7B, 0x60,
+        0xA4, 0x83, 0x88, 0x60, 0x00, 0x00, // Return(DerefOf(Index(Local0, 0)))
+    })), '1', &fails);
+
+    // FromBCD(0x42) == 42; ToBCD(42) == 0x42 (each writes its Target).
+    stCheck("FromBCD(0x42)", toInt(runProg(&[_]u8{ 0x5B, 0x28, 0x0A, 0x42, 0x60, 0xA4, 0x60 })), 42, &fails);
+    stCheck("ToBCD(42)", toInt(runProg(&[_]u8{ 0x5B, 0x29, 0x0A, 0x2A, 0x60, 0xA4, 0x60 })), 0x42, &fails);
+
+    // Match over Package(4){1,4,9,16}: first element >= 9 (MGE) ⇒ index 2; no
+    // element == 5 (MEQ) ⇒ Ones. Second predicate MTR(0) = always-true.
+    stCheck("Match first >= 9", toInt(runProg(&[_]u8{
+        0xA4, 0x89, // Return(Match(
+        0x12, 0x09, 0x04, 0x01, 0x0A, 0x04, 0x0A, 0x09, 0x0A, 0x10, // Package(4){1,4,9,16},
+        0x04, 0x0A, 0x09, // MGE, 9,
+        0x00, 0x00, // MTR, Zero,
+        0x00, // StartIndex 0))
+    })), 2, &fails);
+    stCheck("Match miss → Ones", toInt(runProg(&[_]u8{
+        0xA4, 0x89,
+        0x12, 0x09, 0x04, 0x01, 0x0A, 0x04, 0x0A, 0x09, 0x0A, 0x10,
+        0x01, 0x0A, 0x05, // MEQ, 5,
+        0x00, 0x00,
+        0x00,
+    })), ~@as(u64, 0), &fails);
+
+    // Events, single-threaded counter semantics. Wait with nothing pending times
+    // out immediately (Ones); Signal-then-Wait acquires (Zero); Reset discards
+    // pending signals so the next Wait times out again.
+    stCheck("Wait unsignaled → Ones", toInt(tWalkEval(&[_]u8{
+        0x5B, 0x02, 'E', 'V', 'T', '_', // Event(EVT_)
+        0x14, 0x0E, 'T', 'S', 'T', '_', 0x00, // Method(TST_, 0) {
+        0xA4, 0x5B, 0x25, 'E', 'V', 'T', '_', 0x00, //   Return(Wait(EVT_, 0)) }
+    }, "\\TST_")), ~@as(u64, 0), &fails);
+    stCheck("Signal;Wait → Zero", toInt(tWalkEval(&[_]u8{
+        0x5B, 0x02, 'E', 'V', 'T', '_', // Event(EVT_)
+        0x14, 0x14, 'T', 'S', 'T', '_', 0x00, // Method(TST_, 0) {
+        0x5B, 0x24, 'E', 'V', 'T', '_', //   Signal(EVT_)
+        0xA4, 0x5B, 0x25, 'E', 'V', 'T', '_', 0x00, //   Return(Wait(EVT_, 0)) }
+    }, "\\TST_")), 0, &fails);
+    stCheck("Signal;Reset;Wait → Ones", toInt(tWalkEval(&[_]u8{
+        0x5B, 0x02, 'E', 'V', 'T', '_', // Event(EVT_)
+        0x14, 0x20, 'T', 'S', 'T', '_', 0x00, // Method(TST_, 0) {
+        0x5B, 0x24, 'E', 'V', 'T', '_', //   Signal(EVT_)
+        0x5B, 0x24, 'E', 'V', 'T', '_', //   Signal(EVT_)
+        0x5B, 0x26, 'E', 'V', 'T', '_', //   Reset(EVT_)
+        0xA4, 0x5B, 0x25, 'E', 'V', 'T', '_', 0x00, //   Return(Wait(EVT_, 0)) }
+    }, "\\TST_")), ~@as(u64, 0), &fails);
+
+    // Region-space handler registry: an unmodeled space served by a plug-in.
+    stRegistryTest(&fails);
 
     return fails;
 }
@@ -3366,6 +3810,8 @@ fn resolvePciRegions() void {
 /// the DSDT declares, log its resolved BDF and read its first field (config reads
 /// are side-effect-free, so this is safe to run every boot).
 pub fn reportPciConfig() void {
+    ilockAcquire();
+    defer ilockRelease();
     const id = pciCfgReadDword(.{ .bus = 0, .dev = 0, .func = 0 }, 0);
     debug.klog("[aml] PCI cfg probe: host bridge 0:0:0 vendor=0x{X:0>4} device=0x{X:0>4}\n", .{ id & 0xFFFF, (id >> 16) & 0xFFFF });
 
@@ -3392,6 +3838,51 @@ pub fn reportPciConfig() void {
         }
     }
     if (n_regions == 0) debug.klog("[aml] (DSDT declares no PCI_Config regions — host-bridge probe is the liveness proof)\n", .{});
+}
+
+// --- region-space handler registry -------------------------------------------
+// SystemMemory / SystemIO / PCI_Config are built in below; every OTHER address
+// space (EmbeddedControl 0x03, SMBus 0x04, CMOS 0x05, GPIO 0x08, vendor 0x80+)
+// used to silently degrade to uninit — which kills the method mid-body on any
+// real laptop (battery/thermal/hotkeys all sit behind the EC). A driver — or
+// the native harness, with a fake — now registers a handler per space id and
+// the field engine routes that space's unit accesses through it: the ACPICA
+// "address space handler" idea sized down to a fixed table. aml.zig stays a
+// leaf; the EC/SMBus drivers depend on it, never the reverse. `off` is the
+// absolute offset (region base + field byte offset).
+pub const RegionHandler = struct {
+    read: *const fn (space: u8, off: u64, width: u32) ?u64,
+    write: *const fn (space: u8, off: u64, width: u32, val: u64) bool,
+};
+
+const RegionHandlerSlot = struct { space: u8, h: RegionHandler };
+const MAX_REGION_HANDLERS = 8;
+var region_handlers: [MAX_REGION_HANDLERS]RegionHandlerSlot = undefined;
+var n_region_handlers: usize = 0;
+
+/// Register (or replace) the handler for one region space id. False when the
+/// table is full. The built-in MEM/IO/PCI spaces are not overridable — they're
+/// hit before the registry is consulted.
+pub fn registerRegionHandler(space: u8, h: RegionHandler) bool {
+    var i: usize = 0;
+    while (i < n_region_handlers) : (i += 1) {
+        if (region_handlers[i].space == space) {
+            region_handlers[i].h = h;
+            return true;
+        }
+    }
+    if (n_region_handlers >= MAX_REGION_HANDLERS) return false;
+    region_handlers[n_region_handlers] = .{ .space = space, .h = h };
+    n_region_handlers += 1;
+    return true;
+}
+
+fn regionHandlerFor(space: u8) ?*const RegionHandler {
+    var i: usize = 0;
+    while (i < n_region_handlers) : (i += 1) {
+        if (region_handlers[i].space == space) return &region_handlers[i].h;
+    }
+    return null;
 }
 
 /// Read one access-width unit (1/2/4/8 bytes) from a region at a byte offset.
@@ -3422,7 +3913,11 @@ fn readRegionUnit(region: *const StoredNode, byte_off: u64, width: u32) ?u64 {
             };
         },
         SPACE_PCI => return pciCfgRead(unpackBdf(region.pci_bdf), region.region_off + byte_off, width),
-        else => return null, // unmodeled address spaces: degrade to uninit
+        else => {
+            if (regionHandlerFor(region.region_space)) |h|
+                return h.read(region.region_space, region.region_off + byte_off, width);
+            return null; // unhandled address space: degrade to uninit
+        },
     }
 }
 
@@ -3458,7 +3953,11 @@ fn writeRegionUnit(region: *const StoredNode, byte_off: u64, width: u32, val: u6
             return true;
         },
         SPACE_PCI => return pciCfgWrite(unpackBdf(region.pci_bdf), region.region_off + byte_off, width, val),
-        else => return false,
+        else => {
+            if (regionHandlerFor(region.region_space)) |h|
+                return h.write(region.region_space, region.region_off + byte_off, width, val);
+            return false;
+        },
     }
 }
 
@@ -3711,6 +4210,8 @@ fn logTempDeciK(path: []const u8, deci_k: u64) void {
 /// (e.g. an embedded controller) just won't evaluate to an integer and is
 /// skipped — best-effort, never a fault. Public so a CLI/acpid can re-poll.
 pub fn reportThermal() u32 {
+    ilockAcquire();
+    defer ilockRelease();
     var found: u32 = 0;
     var i: usize = 0;
     while (i < nnodes) : (i += 1) {
@@ -3758,6 +4259,8 @@ fn logBattery(path: []const u8, state: u64, rate: u64, remaining: u64, voltage: 
 /// that doesn't yield a 4+ element Package is skipped — never a fault. Public so
 /// a CLI/acpid can re-poll.
 pub fn reportBattery() u32 {
+    ilockAcquire();
+    defer ilockRelease();
     var found: u32 = 0;
     var i: usize = 0;
     while (i < nnodes) : (i += 1) {
@@ -3924,6 +4427,8 @@ fn spaceName(space: u8) []const u8 {
 /// Returns the number of _CST methods read. Best-effort; public so acpid/a CLI can
 /// re-poll.
 pub fn reportCStates() u32 {
+    ilockAcquire();
+    defer ilockRelease();
     cst_choice = .{};
     var found: u32 = 0;
     var i: usize = 0;
@@ -4153,6 +4658,8 @@ fn printCrsResources(buf: []const u8) u32 {
 /// Returns the present-device count. Public so the `acpidev` CLI and boot path
 /// can list the platform's ACPI-described hardware.
 pub fn reportDevices() u32 {
+    ilockAcquire();
+    defer ilockRelease();
     debug.klog("[acpi] ACPI namespace devices (Device + _HID/_CID + _CRS):\n", .{});
     var shown: u32 = 0;
     var hidden: u32 = 0;
@@ -4367,6 +4874,8 @@ fn deviceMatchesId(path: []const u8, id: []const u8) bool {
 /// or late-binder pulls its I/O base / IRQ / MMIO from ACPI rather than hardcoding
 /// it. `id` is a 7-char EISA id like "PNP0501" or a vendor string like "QEMU0002".
 pub fn findByHid(id: []const u8) ?DevResources {
+    ilockAcquire();
+    defer ilockRelease();
     var i: usize = 0;
     while (i < nnodes) : (i += 1) {
         const n = &nodes[i];
@@ -4483,6 +4992,8 @@ fn lookupLink(seg: [4]u8) ?u32 {
 /// Slice H: build the PCI INTx → GSI routing table from \_SB.PCI0._PRT and cache
 /// it for gsiForPciPin(). Returns the number of pins routed.
 pub fn buildPrt() u32 {
+    ilockAcquire();
+    defer ilockRelease();
     prt_nroutes = 0;
     // Announce APIC mode so q35 returns IOAPIC (GSIx) routing, not the 8259 table.
     _ = evalMethodArg1("\\_PIC", .{ .integer = 1 });
@@ -4574,6 +5085,8 @@ pub fn reportPrtPciJoin() void {
 /// logs a summary; a malformed table yields a partial walk, never a fault.
 /// Returns the total named-object count.
 pub fn load() u32 {
+    ilockAcquire();
+    defer ilockRelease();
     // Deterministic interpreter self-tests first. Each is self-contained (walks
     // its own hand-assembled table into the store), so it must run BEFORE the
     // reset below — which then hands the real DSDT walk a clean namespace.
