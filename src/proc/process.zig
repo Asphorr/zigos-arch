@@ -435,6 +435,17 @@ pub const PCB = struct {
     // the kill-vs-save race without the dead-letter machinery. Phase 1
     // only stores the field; the consumer lands in Phase 2's cutover.
     exit_requested: bool = false, // (a) cross-CPU; set by killer, observed in schedule()
+    // Teardown claim mark (lifecycle.claimTeardown). Two roles:
+    //   1. Set under teardown_count_lock before counting surviving group
+    //      members, so concurrent teardowns of two members can't BOTH see
+    //      "someone else is alive" (AS leaked) or BOTH see "I'm last"
+    //      (double destroyAddressSpace).
+    //   2. Gates schedule()'s exit_requested escalation: teardown can reach
+    //      schedule() (GPU ctxDestroy contending ctrl_lock → blockOnMutex →
+    //      yield), and without this gate the still-set exit_requested would
+    //      re-enter destroyCurrentWithStatus mid-teardown.
+    // Cleared on slot reuse by resetPcbExceptState.
+    teardown_marked: bool = false, // (a) set under lifecycle.teardown_count_lock; read in schedule()
 
     // --- CFS-style vruntime (scheduler rewrite, post-Phase 7) -------------
     // Accumulated CPU "fair-share" time in ticks. Bumped by accountRunningTick
@@ -486,6 +497,12 @@ pub const PCB = struct {
     /// Tick at which this PCB entered its first non-unused state.
     /// `tick_count - acct_start_tick` = process uptime in ticks.
     acct_start_tick: u64 = 0,
+    /// Tick at which this PCB became a zombie (stamped in tearDownTask).
+    /// The stale-zombie sweep ages from THIS — it used to age from
+    /// acct_start_tick (creation), which gave any process that had lived
+    /// longer than the 30 s threshold a ZERO-second grace window between
+    /// exit and force-reap, racing the parent's waitpid out of its status.
+    death_tick: u64 = 0,
 
     // --- Diagnostic syscall ring ---------------------------------------
     // 8-entry circular buffer of the most recent syscall numbers (high

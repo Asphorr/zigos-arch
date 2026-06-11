@@ -1163,10 +1163,9 @@ fn killKickHandler() callconv(.c) void {
     const cpu = smp.myCpu();
     if (cpu.cpu_id < smp.MAX_CPUS) process.kick_handler_runs[cpu.cpu_id] +%= 1;
     // Receiving CPU: force a reschedule. The currently-running task may be
-    // the kill target — schedule() will demote it through the normal path
-    // and pick anything else (idle if nothing's ready). After this, the
-    // victim CPU's `current_pid` no longer points at the dying pid, which
-    // is what waitForPidOffCpu's polling loop is waiting for.
+    // the kill target — schedule()'s exit_requested escalation tears it
+    // down on its own kstack, and the killer's spin loop in
+    // killProcessWithStatus (case 2) sees the state leave .running.
     //
     // Shape D: do NOT call schedule() directly here. This handler dispatches
     // through DynIrqStub, whose body now runs on the per-CPU isr_stack — a
@@ -1306,8 +1305,16 @@ pub fn schedule() void {
     {
         const cpu_now = smp.myCpu();
         if (cpu_now.current_pid) |cur_pid| {
+            // teardown_marked gate: once this pid's OWN teardown has started
+            // (lifecycle.claimTeardown marks it first thing), exit_requested
+            // is stale — teardown legitimately reaches schedule() (GPU
+            // ctxDestroy contending ctrl_lock → blockOnMutex → yield), and
+            // escalating again would restart teardown from the top, re-free
+            // group resources the outer pass is still walking, and strand
+            // the outer frame (the task dies inside the inner schedule()).
             if (!process.procs[cur_pid].is_idle and
-                @atomicLoad(bool, &process.procs[cur_pid].exit_requested, .acquire))
+                @atomicLoad(bool, &process.procs[cur_pid].exit_requested, .acquire) and
+                !@atomicLoad(bool, &process.procs[cur_pid].teardown_marked, .acquire))
             {
                 process.destroyCurrentWithStatus(process.procs[cur_pid].exit_status);
                 unreachable;

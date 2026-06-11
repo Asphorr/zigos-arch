@@ -11,8 +11,6 @@
 //!     dispatch lands in the right ring-3 RIP/RSP.
 //!   * kernelIdle + createKernelIdle / createIdleProcess / createKernelTask
 //!     — kernel-mode PCBs (one idle per CPU, plus desktop and friends).
-//!   * waitForPidOffCpu — pre-teardown synchronization that IPIs peer CPUs
-//!     off the dying pid before its kstack/PT pages get reclaimed.
 //!   * setInflightSlot / clearInflightSlot / reclaimInflightSlot — swap-
 //!     evict in-flight slot bookkeeping (so a thread killed mid-swap doesn't
 //!     leak its NVMe slot).
@@ -21,9 +19,10 @@
 //!     destroyCurrent, reapZombie, findZombieChild, reparentChildren,
 //!     maybeReapZombies, reapStaleZombies).
 //!   * freeElfBuf — internal helper that drops the per-process ELF buffer.
-//!   * countThreadsInGroup — used by tearDownTask to decide whether this is
-//!     the last thread of the tgid (and therefore whether to free shared
-//!     resources like the page directory + GUI window + ELF buf).
+//!   * claimTeardown / countThreadsInGroup — the "am I the last thread of
+//!     the tgid" decision (and therefore whether to free shared resources
+//!     like the page directory + GUI window + ELF buf). claimTeardown is
+//!     the lock-serialized form tearDownTask uses.
 //!
 //! Re-exported from process.zig so external callers keep using process.X
 //! paths unchanged.
@@ -182,9 +181,10 @@ pub fn create(entry: usize, user_stack: usize) ?usize {
     return i;
 }
 
-/// Number of *live* PCBs sharing `tgid`. Used at exit/kill to decide
-/// whether to keep or free the shared page directory + GUI window + ELF
-/// buf. "Live" means actually running or runnable: .ready, .running,
+/// Number of *live* PCBs sharing `tgid`. (tearDownTask itself now uses
+/// claimTeardown — the lock-serialized, self-excluding form — for the
+/// last-thread decision; this plain count remains for diagnostics/future
+/// callers.) "Live" means actually running or runnable: .ready, .running,
 /// .sleeping, .switching_out. Excluded:
 ///   - .unused: slot is free, no thread.
 ///   - .loading: slot was claimed by process.create but never finished
@@ -307,16 +307,20 @@ pub fn cloneCurrent(entry: usize, stack_top: usize, arg: usize, fs_base: u64) ?u
 pub fn forkCurrent(frame: *signals.SyscallFrame) ?usize {
     const parent = process.currentPCB() orelse return null;
     const parent_pid_u8: u8 = @intCast(smp.myCpu().current_pid orelse return null);
-    const parent_pml4 = parent.page_directory orelse return null;
+    // Process-level state (address space, lazy regions, fd table, argv…)
+    // lives on the LEAD thread. fork() from a cloned worker used to copy the
+    // WORKER's own fields — empty lazy_regions, default brk/mmap_top — so
+    // the child faulted on its first instruction. Read through the lead.
+    const parent_lead_src = process.leader(parent);
+    const parent_pml4 = parent_lead_src.page_directory orelse return null;
 
     // AS-stability lock on PARENT — cloneAddressSpace walks every PTE,
     // mutating R/W bits for COW. Concurrent sysMunmap / io_uring worker
     // memcpy on the parent's AS would race the walk. Released after the
     // child PML4 is built; the new child PCB gets its own as_lock (default
     // unowned). See PCB.as_lock.
-    const parent_lead = process.leader(parent);
-    parent_lead.as_lock.acquire();
-    defer parent_lead.as_lock.release();
+    parent_lead_src.as_lock.acquire();
+    defer parent_lead_src.as_lock.release();
 
     const i = allocSlot() orelse return null;
     resetPcbExceptState(&process.procs[i]); // state stays .loading from allocSlot's CAS
@@ -340,12 +344,13 @@ pub fn forkCurrent(frame: *signals.SyscallFrame) ?usize {
 
     // Per-AS state — fork has its own AS so lazy regions and brk/mmap state
     // are inherited as values (not aliased through tgid like clone does).
-    process.procs[i].lazy_regions = parent.lazy_regions;
-    process.procs[i].lazy_count = parent.lazy_count;
-    process.procs[i].heap_lazy_idx = parent.heap_lazy_idx;
-    process.procs[i].user_brk = parent.user_brk;
-    process.procs[i].mmap_top = parent.mmap_top;
-    process.procs[i].stack_base = parent.stack_base;
+    // All of it lives on the lead (see parent_lead_src above).
+    process.procs[i].lazy_regions = parent_lead_src.lazy_regions;
+    process.procs[i].lazy_count = parent_lead_src.lazy_count;
+    process.procs[i].heap_lazy_idx = parent_lead_src.heap_lazy_idx;
+    process.procs[i].user_brk = parent_lead_src.user_brk;
+    process.procs[i].mmap_top = parent_lead_src.mmap_top;
+    process.procs[i].stack_base = parent_lead_src.stack_base;
 
     // Shared-anon regions: bump refcount per inherited LazyRegion. The
     // PT-level COW path covers private anon (each AS gets a fresh frame on
@@ -377,8 +382,8 @@ pub fn forkCurrent(frame: *signals.SyscallFrame) ?usize {
 
     // FD table — copy entries verbatim, then bump pipe-side refcounts so the
     // parent closing its end doesn't drop the last reference while child
-    // still holds the inherited fd.
-    process.procs[i].fd_table = parent.fd_table;
+    // still holds the inherited fd. fd_table is process-level → lead's.
+    process.procs[i].fd_table = parent_lead_src.fd_table;
     {
         const pipe = @import("pipe.zig");
         for (process.procs[i].fd_table) |fd| {
@@ -389,20 +394,21 @@ pub fn forkCurrent(frame: *signals.SyscallFrame) ?usize {
         }
     }
 
-    // Inherit cwd, name, sigactions, argv, priority, fs_base.
-    process.procs[i].cwd = parent.cwd;
-    process.procs[i].cwd_len = parent.cwd_len;
-    process.procs[i].name = parent.name;
-    process.procs[i].name_len = parent.name_len;
-    process.procs[i].sigactions = parent.sigactions;
-    process.procs[i].argv = parent.argv;
-    process.procs[i].arg_lens = parent.arg_lens;
-    process.procs[i].argc = parent.argc;
+    // Inherit cwd, name, sigactions, argv (process-level → lead) and
+    // priority, fs_base (per-thread → the calling thread).
+    process.procs[i].cwd = parent_lead_src.cwd;
+    process.procs[i].cwd_len = parent_lead_src.cwd_len;
+    process.procs[i].name = parent_lead_src.name;
+    process.procs[i].name_len = parent_lead_src.name_len;
+    process.procs[i].sigactions = parent_lead_src.sigactions;
+    process.procs[i].argv = parent_lead_src.argv;
+    process.procs[i].arg_lens = parent_lead_src.arg_lens;
+    process.procs[i].argc = parent_lead_src.argc;
     process.procs[i].priority = parent.priority;
     process.procs[i].fs_base = parent.fs_base;
     // A Linux process's forked children are Linux too — inherit the ABI
     // personality so the child's syscalls route to the same translation layer.
-    process.procs[i].personality = parent.personality;
+    process.procs[i].personality = parent_lead_src.personality;
 
     process.procs[i].parent_pid = parent_pid_u8;
     process.procs[i].tgid = @intCast(i); // lead thread of the new process group
@@ -670,59 +676,6 @@ pub fn createKernelTask(
     return i;
 }
 
-/// Block until no CPU has `cpu.current_pid == pid`. Used by killProcess
-/// before tearing down a process's address space and PCB.
-///
-/// Phase 3 simplification: the save_in_flight_prev bracket is no longer
-/// load-bearing because schedule() now redirects switchTo's save target
-/// to dead_letter when prev's state is .zombie/.unused (set by the
-/// killer before this wait). So a save into the doomed PCB never lands
-/// in the to-be-recycled slot — we just need to confirm cpu has actually
-/// switched off pid (current_pid != pid).
-fn waitForPidOffCpu(pid: u8) void {
-    const apic = @import("../time/apic.zig");
-    const my_lapic = apic.getLapicId();
-
-    var attempts: u32 = 0;
-    while (attempts < 8) : (attempts += 1) {
-        var found_cid: ?u8 = null;
-        var found_lapic: u32 = 0;
-        for (&smp.cpus) |*cpu| {
-            if (!cpu.alive) continue;
-            if (cpu.lapic_id == my_lapic) continue; // self can't be on the dying pid (we're killing it)
-            const on_cpu = if (cpu.current_pid) |cur| cur == pid else false;
-            if (on_cpu) {
-                found_cid = cpu.cpu_id;
-                found_lapic = cpu.lapic_id;
-                break;
-            }
-        }
-        const cid = found_cid orelse return; // pid is not on any other CPU
-
-        // Kick the target CPU into schedule(). schedule() at the top
-        // checks exit_requested[cur] and routes through
-        // destroyCurrentWithStatus, so the target tears itself down on
-        // its own kstack (no remote teardown race). Without the IPI
-        // vector (early boot), natural preemption (~10ms) does the same.
-        if (process.kickVector()) |v| apic.sendIPI(found_lapic, v);
-
-        // Spin-wait until current_pid changes. No save_in_flight check
-        // needed — schedule() bypasses the save into the doomed PCB.
-        var spin: u32 = 0;
-        while (spin < 2_000_000) : (spin += 1) {
-            const cur_now = smp.cpus[cid].current_pid;
-            if (cur_now == null or cur_now.? != pid) break;
-            asm volatile ("pause" ::: .{ .memory = true });
-        }
-        if (spin >= 2_000_000) {
-            debug.klog("[kill] WARN: cpu{d} stuck on pid={d} after IPI (attempt {d})\n", .{ cid, pid, attempts });
-            // Don't return — retry. Most likely cause: IRQs masked on
-            // target during a long critical section, will release soon.
-        }
-    }
-    debug.klog("[kill] WARN: gave up evicting pid={d} after 8 attempts\n", .{pid});
-}
-
 /// Publish the swap slot the calling thread has in-flight (between
 /// evictFrame's phase-1 and phase-3 CAS) so process teardown can free the
 /// slot if the thread is killed while parked in blockOn(.nvme_io). Called
@@ -788,16 +741,58 @@ fn parentIsWaiting(child_pid: u8) bool {
 /// TSS rsp0 to its idle kstack before the dying slot becomes free.
 const TerminateOp = enum { kill, destroy };
 
+const SpinLock = @import("spinlock.zig").SpinLock;
+var teardown_count_lock: SpinLock = .{};
+
+/// Atomically decide whether `pid`'s teardown is the one that must free the
+/// group-shared resources (page directory, GUI window, ELF buf, lazy
+/// regions): true iff NO other live, unclaimed member of `tgid` remains.
+///
+/// Replaces the old `countThreadsInGroup(tgid) <= 1`, which was wrong twice:
+///   * Kill path: the victim is already .zombie (killProcessWithStatus flips
+///     state BEFORE tearDownTask), so it never counted itself — killing the
+///     second-to-last member counted ONE survivor, passed `<= 1`, and freed
+///     the page directory the survivor was still running on. killThreadGroup
+///     walked straight into this on every multi-thread group kill.
+///   * Concurrency: two members dying on different CPUs could both count the
+///     other as live (nobody frees → AS leaked) or — kill+destroy interleave
+///     — both reach `<= 1` (double destroyAddressSpace). The mark below is
+///     serialized by the lock, so exactly the LAST claimant sees zero
+///     survivors.
+///
+/// The mark doubles as schedule()'s re-entry gate (see PCB.teardown_marked).
+/// Lock hold is a bounded 64-slot scan with no sleeps; SpinLock's preempt
+/// pin keeps the holder from being preempted mid-count.
+fn claimTeardown(pid: usize, tgid: u8) bool {
+    teardown_count_lock.acquire();
+    defer teardown_count_lock.release();
+    @atomicStore(bool, &process.procs[pid].teardown_marked, true, .release);
+    for (0..MAX_PROCS) |k| {
+        if (k == pid) continue;
+        const p = &process.procs[k];
+        const s = p.state;
+        // .loading excluded like countThreadsInGroup: a slot stranded
+        // mid-construction (CPU panicked in clone) must not pin the
+        // group's cleanup forever.
+        if (s == .unused or s == .loading or s == .zombie) continue;
+        if (@atomicLoad(bool, &p.teardown_marked, .acquire)) continue;
+        if (p.tgid == tgid) return false;
+    }
+    return true;
+}
+
 /// Common teardown for both external kill and self-destroy. Caller
 /// is responsible for the entry/exit dance unique to each:
 ///
-///   * `kill`: flip state→.zombie + waitForPidOffCpu BEFORE calling here
-///     (so no other CPU still references the dying PCB).
+///   * `kill`: flip state→.zombie BEFORE calling here (the killer owns the
+///     pid via the exit_requested claim; a .running victim is evicted via
+///     killProcessWithStatus's case-2 IPI loop instead of being torn down
+///     remotely).
 ///   * `destroy`: call `schedule()` + halt AFTER this returns (the
 ///     dying CPU is still on the dying kstack until it reschedules).
 fn tearDownTask(pid: usize, status: u32, op: TerminateOp, persist_shared_dirty: bool) void {
     const my_tgid: u8 = process.procs[pid].tgid;
-    const last_in_group = countThreadsInGroup(my_tgid) <= 1;
+    const last_in_group = claimTeardown(pid, my_tgid);
     debug.klog("[proc] {s} {d} {s} (status=0x{X})\n", .{
         if (last_in_group) "Process" else "Thread",
         pid,
@@ -851,20 +846,27 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp, persist_shared_dirty: 
     // Resources reachable in any address space (GUI window state, GPU
     // contexts, debug symbols all live in heap / driver structures, not
     // user memory). Safe to free before the CR3 switch below.
+    //
+    // All three live on the LEAD PCB (loadAndStart / GUI / GPU attach to the
+    // exec'd process, which is its own lead) — index by my_tgid, not pid:
+    // when the last dier is a WORKER (lead exited earlier and sits pinned as
+    // a zombie), indexing by pid freed the worker's (empty) fields and
+    // leaked the lead's window/ctx/symbols.
     if (last_in_group) {
+        const lead_res = &process.procs[my_tgid];
         const desktop = @import("../ui/desktop.zig");
-        desktop.destroyGuiWindow(@intCast(pid));
-        if (process.procs[pid].gpu_has_ctx) {
+        desktop.destroyGuiWindow(my_tgid);
+        if (lead_res.gpu_has_ctx) {
             const virtio_gpu = @import("../driver/virtio_gpu.zig");
-            if (!virtio_gpu.ctxDestroy(process.procs[pid].gpu_ctx_id)) {
-                debug.klog("[proc] GPU ctx {d} destroy failed for pid {d}\n", .{ process.procs[pid].gpu_ctx_id, pid });
+            if (!virtio_gpu.ctxDestroy(lead_res.gpu_ctx_id)) {
+                debug.klog("[proc] GPU ctx {d} destroy failed for pid {d}\n", .{ lead_res.gpu_ctx_id, my_tgid });
             }
-            process.procs[pid].gpu_has_ctx = false;
-            process.procs[pid].gpu_ctx_id = 0;
+            lead_res.gpu_has_ctx = false;
+            lead_res.gpu_ctx_id = 0;
         }
-        if (process.procs[pid].sym_table) |st| {
+        if (lead_res.sym_table) |st| {
             symbols.freeSymTable(st);
-            process.procs[pid].sym_table = null;
+            lead_res.sym_table = null;
         }
     }
 
@@ -935,10 +937,16 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp, persist_shared_dirty: 
         lead.heap_lazy_idx = -1;
     }
 
-    // Per-thread: drop borrowed page directory pointer so a future zombie
-    // reap doesn't double-free, and stamp exit_status for waitpid.
-    process.procs[pid].page_directory = null;
-    process.procs[pid].page_dir_phys = 0;
+    // Per-thread: drop the borrowed page directory pointer so a future
+    // zombie reap doesn't double-free, and stamp exit_status for waitpid.
+    // EXCEPT for a lead about to be pinned (workers still live): the last
+    // worker's group cleanup frees the address space THROUGH this PCB —
+    // nulling it here would skip that destroyAddressSpace and leak the
+    // whole AS. The cleanup itself nulls the fields after the free.
+    if (pid != my_tgid or last_in_group) {
+        process.procs[pid].page_directory = null;
+        process.procs[pid].page_dir_phys = 0;
+    }
     process.procs[pid].exit_status = status;
 
     // Self-destroy: steer this CPU's TSS rsp0 to its own idle kstack
@@ -975,6 +983,15 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp, persist_shared_dirty: 
     const parent = process.procs[pid].parent_pid;
     const parent_alive = parent < MAX_PROCS and process.procs[parent].state != .unused and parent != 0;
     const is_worker_thread = pid != my_tgid;
+    // A LEAD that dies before its workers must stay pinned as a zombie even
+    // with no parent to reap it: every worker derefs procs[tgid] via
+    // leader() on each page fault / mmap / brk, and the last worker's
+    // teardown frees the group resources THROUGH this PCB. Letting the slot
+    // go .unused (or be waitpid-reaped early — findZombieChild's guard)
+    // while workers live means the slot gets reused and the workers read a
+    // stranger's PCB — and the last worker then destroys the new occupant's
+    // address space. Linux pins group leaders the same way.
+    const must_pin_as_lead = !is_worker_thread and !last_in_group;
 
     // Reparent children before changing state — otherwise a child's
     // parent_pid could point at a slot that gets reused by a future
@@ -984,20 +1001,38 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp, persist_shared_dirty: 
         reparentChildren(@intCast(pid));
     }
 
-    if (parent_alive and !is_worker_thread) {
+    if ((parent_alive and !is_worker_thread) or must_pin_as_lead) {
         // setState rqLeave's pid if it was somehow .ready (shouldn't be —
-        // tearDownTask is preceded by waitForPidOffCpu in the kill path
-        // and by self-yield in the destroy path — but defensive).
+        // the kill path pre-flips .zombie under the exit_requested claim
+        // and the destroy path comes off .running — but defensive).
+        process.procs[pid].death_tick = process.tick_count;
         process.setState(pid, .zombie);
-        if (parentIsWaiting(@intCast(pid))) process.wake(parent);
-        // SIGCHLD is default-ignored, so this is a no-op for shells
-        // that don't care; shells with a SIGCHLD handler can do
-        // non-blocking reaping. Sent regardless of waitpid state per POSIX.
-        _ = signals.send(parent, signals.SIGCHLD);
+        if (parent_alive) {
+            if (parentIsWaiting(@intCast(pid))) process.wake(parent);
+            // SIGCHLD is default-ignored, so this is a no-op for shells
+            // that don't care; shells with a SIGCHLD handler can do
+            // non-blocking reaping. Sent regardless of waitpid state per POSIX.
+            _ = signals.send(parent, signals.SIGCHLD);
+        }
     } else {
         process.setState(pid, .unused);
         @atomicStore(usize, &process.expected_kstack_tops[pid], 0, .release);
         @import("../debug/kasan.zig").markPcbDead(@intFromPtr(&process.kstack_pool[pid]) + KSTACK_GUARD_SIZE, KSTACK_SIZE);
+    }
+
+    // Last dier was a worker and the lead sits pinned as a zombie: the
+    // group is now empty, so unpin it — wake the lead's parent (its
+    // waitpid has been blocking on findZombieChild's group-alive guard)
+    // or, with no parent to reap it, free the slot right here.
+    if (last_in_group and is_worker_thread and process.procs[my_tgid].state == .zombie) {
+        const lp = process.procs[my_tgid].parent_pid;
+        const lp_alive = lp != 0 and lp < MAX_PROCS and process.procs[lp].state != .unused;
+        if (lp_alive) {
+            if (parentIsWaiting(my_tgid)) process.wake(lp);
+            _ = signals.send(lp, signals.SIGCHLD);
+        } else {
+            reapZombie(my_tgid);
+        }
     }
 
     // Release the outbound TOCTOU bracket — pid's state is no longer
@@ -1036,10 +1071,13 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp, persist_shared_dirty: 
 ///     and runs destroyCurrentWithStatus on its own kstack — the
 ///     teardown happens there. Killer just observes the resulting
 ///     .zombie/.unused state and returns.
-///   * .ready / .sleeping / .loading: killer owns pid (exit_requested
-///     gate in pickNext keeps any racing CPU from dispatching it), so
-///     killer sets state=.zombie via setState (rqLeave fires) and runs
+///   * .ready / .sleeping: killer owns pid (exit_requested gate in
+///     pickNext keeps any racing CPU from dispatching it), so killer
+///     sets state=.zombie via setState (rqLeave fires) and runs
 ///     tearDownTask directly.
+///   * .loading: wait (bounded) for the constructor to finish, then
+///     handle as above — tearing down a mid-construction PCB races the
+///     constructing CPU's writes.
 ///
 /// The schedule()-side save bypass (prev_save→NONE_PID when prev's
 /// state is .zombie/.unused) means switchTo never lands an asm save in
@@ -1083,10 +1121,39 @@ pub fn killProcessWithStatus(pid: u8, status: u32) void {
     const apic = @import("../time/apic.zig");
     const my_lapic = apic.getLapicId();
     var ipi_attempts: u32 = 0;
+    var loading_waits: u32 = 0;
 
     while (true) {
         const snap = @atomicLoad(u8, @as(*const u8, @ptrCast(&process.procs[pid].state)), .acquire);
         if (snap == @intFromEnum(State.zombie) or snap == @intFromEnum(State.unused)) return;
+
+        if (snap == @intFromEnum(State.loading)) {
+            // Mid-construction: cloneCurrent/create on another CPU is still
+            // writing this PCB + kstack. Tearing it down NOW races the
+            // constructor — it would keep initializing a freed slot and its
+            // final setState(.ready) would revive it (reachable via ^C →
+            // killThreadGroup landing on a clone child mid-pthread_create:
+            // tgid is set early in the constructor). Wait for construction
+            // to finish; our exit_requested claim already blocks pickNext
+            // from ever dispatching it, so the next loop round kills the
+            // then-.ready pid cleanly on this CPU.
+            loading_waits += 1;
+            if (loading_waits > 64) {
+                // Stranded .loading (constructor's CPU panicked mid-clone).
+                // Pre-existing leak shape — leave the slot rather than
+                // corrupt it; countThreadsInGroup/claimTeardown both
+                // already exclude .loading so it can't pin a group.
+                debug.klog("[kill] WARN: pid={d} stuck .loading, giving up\n", .{pid});
+                return;
+            }
+            var lspin: u32 = 0;
+            while (lspin < 1_000_000) : (lspin += 1) {
+                const s2 = @atomicLoad(u8, @as(*const u8, @ptrCast(&process.procs[pid].state)), .acquire);
+                if (s2 != @intFromEnum(State.loading)) break;
+                asm volatile ("pause" ::: .{ .memory = true });
+            }
+            continue;
+        }
 
         if (snap == @intFromEnum(State.running)) {
             // Case 2: another CPU is running pid. IPI to wake it into
@@ -1120,7 +1187,8 @@ pub fn killProcessWithStatus(pid: u8, status: u32) void {
             continue;
         }
 
-        // Case 3: .ready / .sleeping / .loading. Killer owns pid via
+        // Case 3: .ready / .sleeping (.loading is parked above until the
+        // constructor finishes). Killer owns pid via
         // exit_requested xchg + pickNext skip → no CPU will dispatch it.
         // Safe to setState + tearDown directly. (parent reaping AFTER
         // tearDown is naturally serialized via the wake() inside tearDown
@@ -1257,7 +1325,13 @@ pub fn reapStaleZombies(max_age_ticks: u64) u32 {
         // Parent might be waiting; if so, leave it for the normal path.
         // (parentIsWaiting is the same predicate killProcessWithStatus uses.)
         if (parentIsWaiting(i)) continue;
-        const age = process.tick_count -% process.procs[i].acct_start_tick;
+        // Pinned lead — live workers still deref this PCB via leader().
+        if (groupHasOtherLive(i)) continue;
+        // Age from the DEATH stamp, not acct_start_tick: aging from creation
+        // gave any process older than the threshold a zero-second grace
+        // window between exit and force-reap, racing the parent's waitpid
+        // out of its exit status.
+        const age = process.tick_count -% process.procs[i].death_tick;
         if (age < max_age_ticks) continue;
         // Force-reap: same teardown as the .unused branch in killProcessWithStatus.
         // setState handles the rq book-keeping (zombie isn't runnable so the
@@ -1335,9 +1409,29 @@ pub fn destroyCurrent() void {
 pub fn reapZombie(pid: u8) void {
     if (pid >= MAX_PROCS) return;
     if (process.procs[pid].state != .zombie) return;
+    // Pinned lead (exited before its workers): the slot must survive until
+    // the last worker's teardown — workers deref procs[tgid] via leader()
+    // on every fault, and the group cleanup runs through this PCB.
+    if (groupHasOtherLive(pid)) return;
     process.setState(pid, .unused);
     @atomicStore(usize, &process.expected_kstack_tops[pid], 0, .release);
     @import("../debug/kasan.zig").markPcbDead(@intFromPtr(&process.kstack_pool[pid]) + KSTACK_GUARD_SIZE, KSTACK_SIZE);
+}
+
+/// True if any live thread OTHER than `tgid` itself still belongs to the
+/// group — i.e. the zombie lead must stay pinned (not reapable). Excludes
+/// .loading like countThreadsInGroup (a slot stranded mid-construction must
+/// not pin the lead forever) but does NOT exclude teardown_marked members:
+/// a marked worker is still mid-teardown and reads the lead PCB for the
+/// group cleanup, so the lead must outlive it.
+fn groupHasOtherLive(tgid: u8) bool {
+    for (0..MAX_PROCS) |k| {
+        if (k == tgid) continue;
+        const s = process.procs[k].state;
+        if (s == .unused or s == .loading or s == .zombie) continue;
+        if (process.procs[k].tgid == tgid) return true;
+    }
+    return false;
 }
 
 /// Find the lowest-pid zombie child of `parent`. Returns null if none.
@@ -1348,6 +1442,10 @@ pub fn findZombieChild(parent: u8, target_pid: u32) ?u8 {
         if (process.procs[i].state != .zombie) continue;
         if (process.procs[i].parent_pid != parent) continue;
         if (target_pid != 0xFFFFFFFF and i != @as(usize, @intCast(target_pid))) continue;
+        // Pinned lead — the process isn't fully dead until its workers exit
+        // (POSIX: waitpid returns when the whole process is gone). The last
+        // worker's teardown re-wakes the parent once the group empties.
+        if (groupHasOtherLive(@intCast(i))) continue;
         return @intCast(i);
     }
     return null;
