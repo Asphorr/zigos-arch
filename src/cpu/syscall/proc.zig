@@ -293,11 +293,21 @@ pub fn sysFutex(uaddr: u32, op: u32, val: u32) u32 {
             };
         },
         FUTEX_WAKE => {
+            const me = process.currentPCB() orelse return E_FAULT;
             var woken: u32 = 0;
             for (0..process.MAX_PROCS) |i| {
                 if (woken >= val) break;
                 const t = &process.procs[i];
                 if (t.wait_kind != .futex or t.wait_target != uaddr) continue;
+                // Futexes are keyed by raw user VA, which is only meaningful
+                // within ONE address space — and threads (the only sharers of
+                // an address space) share tgid. Without this filter, process
+                // A waking VA X could spend its wake count on process B's
+                // unrelated waiter parked on B's own VA X: B's waiter just
+                // re-checks and re-parks (spurious wakes are in-contract),
+                // but A's REAL waiter never gets woken (val exhausted) —
+                // a lost wakeup, i.e. a stuck pthread_mutex/cond.
+                if (t.tgid != me.tgid) continue;
                 if (t.state == .unused or t.state == .zombie) continue;
                 // Route through wake(): it sets wake_pending (so a waiter still
                 // mid-enroll in blockOnFutex catches us via its Race B re-check)
@@ -341,6 +351,21 @@ pub fn sysSleep(ms: u32) u32 {
 }
 
 pub fn sysExec(name_ptr: u32, name_len: u32) u32 {
+    return execCommon(name_ptr, name_len, false);
+}
+
+/// Shared body of sysExec/sysExecAs. The child is created HELD (.loading —
+/// see LaunchInfo.start_held): until release, no AP's pickNext can dispatch
+/// it, so the parent→child inheritance below (fd 0/1/2, cwd, pgid/sid,
+/// nice/pin) is applied before the child can observe its own state. The old
+/// flip-then-inherit order was an SMP race: an idle CPU could run the child
+/// with console fds (output invisible in graphics mode), the default cwd,
+/// and its own pgid (foreground Ctrl+C miss) for the first quantum.
+///
+/// hold_for_caller=true returns with the child STILL held — sysExecAs needs
+/// to apply fd remaps first. That caller MUST release via
+/// process.assignInitialCpu + setState(.ready), in that order.
+fn execCommon(name_ptr: u32, name_len: u32, hold_for_caller: bool) u32 {
     const actual_len = @min(name_len, 100);
     if (!validateUserPtr(name_ptr, actual_len)) return E_FAULT;
     const name_bytes: [*]const u8 = @ptrFromInt(@as(usize, name_ptr));
@@ -394,6 +419,7 @@ pub fn sysExec(name_ptr: u32, name_len: u32) u32 {
             .name = clean_name[0..nl],
             .raw = name_buf[0..actual_len],
             .fname_len = fname_len,
+            .start_held = true, // released below, after inheritance
         };
         if (elf_loader.loadAndStart(fresh.buf, fresh.size, fresh.pages, fresh.inode, launch)) |p| {
             pid = @intCast(p);
@@ -452,22 +478,27 @@ pub fn sysExec(name_ptr: u32, name_len: u32) u32 {
                     // wrapper's setaffinity/setnice was a no-op for the
                     // actual workload.
                     //
-                    // pinned_cpu inheritance is two-step: loadAndStart
-                    // already called assignInitialCpu (which saw the
-                    // default pinned_cpu=0xFF and picked min-load CPU),
-                    // so we now have to migrate the child to the actual
-                    // pin destination if it differs.
+                    // The child is still HELD (.loading) here, so its
+                    // assigned_cpu is still 0xFF — the assignInitialCpu at
+                    // release honors pinned_cpu directly. (The old two-step
+                    // — migrate after loadAndStart's own assignInitialCpu —
+                    // is gone with the flip-then-inherit race.)
                     child_pcb.nice = parent.nice;
                     child_pcb.pinned_cpu = parent.pinned_cpu;
-                    if (parent.pinned_cpu != 0xFF and child_pcb.assigned_cpu != parent.pinned_cpu) {
-                        _ = process.migrate(@intCast(p), parent.pinned_cpu);
-                    }
                 } else {
                     @import("../../debug/debug.zig").klog("[sysExec] WARN: child_pid == parent_pid={d} — inheritance skipped\n", .{process.getCurrentPid()});
                 }
             }
             // (name + real argv were set inside loadAndStart, before the Linux
             // initial stack was built — see the LaunchInfo passed above.)
+
+            // Release the held child unless sysExecAs still has fd remaps to
+            // apply. assignInitialCpu BEFORE setState — rqEnter must land on
+            // the right per-CPU runqueue (same order as elf_loader's flip).
+            if (!hold_for_caller) {
+                process.assignInitialCpu(@intCast(p));
+                process.setState(@intCast(p), .ready);
+            }
         }
     }
 
@@ -799,17 +830,32 @@ pub fn sysSigsuspend(mask_ptr: u32) u32 {
     pcb.signal_mask = mp.* & filter;
 
     // Park until a deliverable signal lands. Same idiom as sysSleep: state =
-    // .sleeping + int $0x20; signals.send → process.wake → re-check.
+    // .sleeping + soft yield; signals.send → process.wake → re-check.
     const cur_pid = smp.myCpu().current_pid orelse return E_FAULT;
     while (!signals.hasDeliverable(pcb)) {
-        process.setState(cur_pid, .sleeping);
+        // wake_tick BEFORE setState (sysSleep's order) — never visible as
+        // .sleeping with a stale previous-sleep deadline.
         @atomicStore(u64, &pcb.wake_tick, std.math.maxInt(u64), .release); // sleep "forever" — only signals wake us
+        process.setState(cur_pid, .sleeping);
+        // Park-entry race re-check: a signal posted between the loop's
+        // hasDeliverable check and our setState may have observed us
+        // .running/wait_kind=.none — and this raw idiom (unlike blockOn) has
+        // no wake_pending re-check, so without this we'd park forever on a
+        // signal that's already pending (no timer backstop at maxInt).
+        // send's seq_cst OR vs our setState means either send sees .sleeping
+        // (wake flips us .ready) or we see the bit here (Dekker).
+        if (signals.hasDeliverable(pcb)) {
+            process.setState(cur_pid, .running);
+            break;
+        }
         const t_pause = perf.rdtsc();
         smp.myCpu().pending_soft_yield = true;
         sched_asm.softYield();
         const t_resume = perf.rdtsc();
         pcb.perf_gap_cyc +%= t_resume -% t_pause;
     }
+    // Don't leave the "forever" deadline behind on the now-running PCB.
+    @atomicStore(u64, &pcb.wake_tick, 0, .release);
     return E_INVAL;
 }
 
@@ -820,14 +866,21 @@ pub fn sysPause() u32 {
     const cur_pid = smp.myCpu().current_pid orelse return E_FAULT;
     const pcb = &process.procs[cur_pid];
     while (!signals.hasDeliverable(pcb)) {
-        process.setState(cur_pid, .sleeping);
         @atomicStore(u64, &pcb.wake_tick, std.math.maxInt(u64), .release);
+        process.setState(cur_pid, .sleeping);
+        // Park-entry race re-check — see sysSigsuspend for the full rationale
+        // (signal posted in the check→setState window + no timer backstop).
+        if (signals.hasDeliverable(pcb)) {
+            process.setState(cur_pid, .running);
+            break;
+        }
         const t_pause = perf.rdtsc();
         smp.myCpu().pending_soft_yield = true;
         sched_asm.softYield();
         const t_resume = perf.rdtsc();
         pcb.perf_gap_cyc +%= t_resume -% t_pause;
     }
+    @atomicStore(u64, &pcb.wake_tick, 0, .release);
     return E_INVAL;
 }
 
@@ -981,10 +1034,11 @@ pub fn sysExecAs(name_ptr: u32, name_len: u32, remap_ptr: u32) u32 {
         if (!parent_pcb.fd_table[pf].in_use) return E_INVAL;
     }
 
-    // Run the existing exec path. It returns a child pid (or 0xFFFFFFFF).
-    @import("../../debug/serial.zig").print("[execAs] before sysExec name_len={d} n_remap={d}\n", .{ name_len, n_remap });
-    const child_pid = sysExec(name_ptr, name_len);
-    @import("../../debug/serial.zig").print("[execAs] sysExec returned pid={d}\n", .{child_pid});
+    // Run the exec path with the child HELD (.loading) so the remaps below
+    // land before the child can be dispatched — otherwise an idle AP could
+    // run it against the not-yet-remapped fd table (pipeline child writing
+    // to the console instead of its pipe for the first quantum).
+    const child_pid = execCommon(name_ptr, name_len, true);
     if (child_pid == 0xFFFFFFFF) return E_INVAL;
 
     // Apply remaps + bump pipe refcounts so parent-side closes don't drop the
@@ -994,26 +1048,24 @@ pub fn sysExecAs(name_ptr: u32, name_len: u32, remap_ptr: u32) u32 {
     // refcount before installing the new entry, otherwise we leak.
     const child = process.getPCB(@intCast(child_pid));
     child.parent_pid = parent_pid;
-    @import("../../debug/serial.zig").print("[execAs] set parent_pid done\n", .{});
     for (0..n_remap) |i| {
         const pf = remap[i].parent_fd;
         const cf = remap[i].child_fd;
-        @import("../../debug/serial.zig").print("[execAs] remap[{d}] pf={d} cf={d}\n", .{ i, pf, cf });
         const old = child.fd_table[cf];
         if (old.in_use and old.fs_type == .pipe) {
             if (old.flags == 0) pipe.closeReader(old.pipe_id) else pipe.closeWriter(old.pipe_id);
         }
         const src = parent_pcb.fd_table[pf];
-        @import("../../debug/serial.zig").print("[execAs] read parent fd_table[{d}] in_use={} fs_type={} pipe_id={d} flags={d}\n", .{ pf, src.in_use, src.fs_type, src.pipe_id, src.flags });
         child.fd_table[cf] = src;
-        @import("../../debug/serial.zig").print("[execAs] wrote child fd_table[{d}]\n", .{cf});
         if (src.fs_type == .pipe) {
             if (src.flags == 0) pipe.addReader(src.pipe_id) else pipe.addWriter(src.pipe_id);
-            @import("../../debug/serial.zig").print("[execAs] bumped pipe refcount\n", .{});
         }
     }
 
-    @import("../../debug/serial.zig").print("[execAs] returning pid={d}\n", .{child_pid});
+    // Child fully wired — release it. assignInitialCpu BEFORE setState
+    // (rqEnter must land on the right runqueue), same order as elf_loader.
+    process.assignInitialCpu(@intCast(child_pid));
+    process.setState(@intCast(child_pid), .ready);
     return child_pid;
 }
 

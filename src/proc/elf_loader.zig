@@ -22,6 +22,13 @@ pub const LaunchInfo = struct {
     raw: []const u8,
     /// Index in `raw` where the filename ends (the first space, or raw.len).
     fname_len: usize,
+    /// When true, loadAndStart leaves the PCB in .loading instead of flipping
+    /// it .ready — the caller (sysExec/sysExecAs) still has parent→child
+    /// inheritance (fd 0/1/2, cwd, pgid/sid, nice/pin) and fd remaps to apply,
+    /// and an AP's pickNext must not dispatch the child until those are done.
+    /// The caller releases via process.assignInitialCpu + setState(.ready),
+    /// in that order (rqEnter must land on the right per-CPU runqueue).
+    start_held: bool = false,
 };
 
 const Header = extern struct {
@@ -562,8 +569,16 @@ pub fn loadAndStart(elf_buf: [*]align(4) u8, file_size: usize, elf_buf_pages: u3
     // and the iretq will land on a fully-initialized address space + lazy
     // region table. assignInitialCpu BEFORE the state flip so the rqEnter
     // setState triggers lands on the right per-CPU runqueue.
-    process.assignInitialCpu(pid);
-    process.setState(pid, .ready);
+    //
+    // start_held callers keep the slot in .loading: sysExec used to flip the
+    // child runnable HERE and then apply fd/cwd/pgid/nice inheritance after —
+    // an idle AP could dispatch the child in that window and it would run
+    // with console fds / wrong cwd / its own pgid (Ctrl+C miss).
+    const hold = if (launch) |li| li.start_held else false;
+    if (!hold) {
+        process.assignInitialCpu(pid);
+        process.setState(pid, .ready);
+    }
 
     return pid;
 }

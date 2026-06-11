@@ -329,11 +329,20 @@ pub fn send(target: u8, signo: u32) bool {
     // RMW. seq_cst pairs with the matching @atomicRmw .And in delivery.
     _ = @atomicRmw(u32, &pcb.pending_signals, .Or, @as(u32, 1) << @intCast(signo), .seq_cst);
 
-    // Make sure parked processes notice. wake() is a no-op for .running and
-    // .ready, so this is safe to call unconditionally.
-    if (pcb.state == .sleeping or pcb.wait_kind != .none) {
-        process.wake(target);
-    }
+    // Make sure parked — or PARKING — processes notice. The old conditional
+    // (`if .sleeping or wait_kind != .none`) raced with a target between its
+    // caller-side condition check and blockOn's setWait/setState: we observed
+    // .running + wait_kind==.none, skipped the wake, and the target parked
+    // having missed the signal. For waits with no second waker (sigsuspend,
+    // pause: wake_tick=maxInt) that's park-forever — wakeExpired only logs
+    // [wake-skip], it never re-delivers. Unconditional wake() closes it:
+    // wake_pending is latched even for .running targets, and every
+    // blockOn-family parker re-checks wake_pending after its setState
+    // (Dekker: the seq_cst OR above + wake's store vs the parker's setState).
+    // State-wise wake() is still a no-op for .running/.ready, and a stale
+    // latched wake_pending costs one spurious early-return at the target's
+    // next blockOn — which re-checks its condition by contract.
+    process.wake(target);
     return true;
 }
 
