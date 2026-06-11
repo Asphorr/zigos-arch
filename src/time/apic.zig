@@ -464,6 +464,10 @@ var calibrated_via_hpet: bool = false;
 /// True if Hyper-V frequency MSRs supplied calibration directly. Skips
 /// the 10 ms HPET gate when running under QEMU/KVM with `hv-frequencies`.
 var calibrated_via_hyperv: bool = false;
+/// True if rates were derived from CPUID leaves 15H/16H (no timing source
+/// at all: HPET failed AND the PIT gate never fired — seen on real boards
+/// where firmware disables the PIT outright).
+var calibrated_via_cpuid: bool = false;
 
 /// Hyper-V-direct calibration. Reads HV_X64_MSR_TSC_FREQUENCY +
 /// HV_X64_MSR_APIC_FREQUENCY (one rdmsr each, no busy-wait gate).
@@ -521,10 +525,73 @@ fn calibrateTimer() void {
     if (calibrateTimerHyperv()) return;
     if (calibrateTimerHpet()) return;
     debug.klog("[apic] HPET unavailable — falling back to PIT Channel 2\n", .{});
-    calibrateTimerPit();
+    if (calibrateTimerPit()) return;
+    debug.klog("[apic] PIT dead — deriving rates from CPUID leaves 15H/16H\n", .{});
+    if (calibrateTimerCpuid()) return;
+    // Leave apic_timer_count = 0: init()'s post-calibration sanity check
+    // catches it and unwinds to the 8259 virtual-wire fallback — a degraded
+    // but ticking system instead of the unbounded PIT spin this used to be.
+    debug.klog("[apic] CRITICAL: no calibration source (HPET fail, PIT dead, no CPUID 15H) — falling back to PIC\n", .{});
 }
 
-fn calibrateTimerPit() void {
+/// Raw CPUID — all four registers for one (sub)leaf.
+const CpuidRegs = struct { eax: u32, ebx: u32, ecx: u32, edx: u32 };
+
+fn cpuidRaw(leaf: u32) CpuidRegs {
+    var a: u32 = undefined;
+    var b: u32 = undefined;
+    var c: u32 = undefined;
+    var d: u32 = undefined;
+    asm volatile ("cpuid"
+        : [a] "={eax}" (a),
+          [b] "={ebx}" (b),
+          [c] "={ecx}" (c),
+          [d] "={edx}" (d),
+        : [leaf] "{eax}" (leaf),
+          [sub] "{ecx}" (@as(u32, 0)),
+    );
+    return .{ .eax = a, .ebx = b, .ecx = c, .edx = d };
+}
+
+/// CPUID-derived calibration — no timing source needed at all. Leaf 0x15
+/// gives the TSC/crystal ratio (EBX/EAX) and, on newer parts, the crystal
+/// frequency itself (ECX, Hz). Skylake-era client parts report ECX=0; there
+/// leaf 0x16's base frequency (EAX, MHz) approximates the TSC rate (±2%,
+/// fine for a 10ms quantum) and the crystal follows from the inverse ratio.
+/// The LAPIC timer counts at the crystal clock on the same parts that
+/// populate these leaves, so one leaf pair yields BOTH rates. AMD doesn't
+/// implement 0x15 (max leaf below it) → returns false, callers move on.
+fn calibrateTimerCpuid() bool {
+    const max_leaf = cpuidRaw(0).eax;
+    if (max_leaf < 0x15) return false;
+    const l15 = cpuidRaw(0x15);
+    const den: u64 = l15.eax; // crystal-to-TSC ratio denominator
+    const num: u64 = l15.ebx; // numerator
+    if (den == 0 or num == 0) return false;
+    var crystal_hz: u64 = l15.ecx;
+    var tsc_hz: u64 = 0;
+    if (crystal_hz != 0) {
+        tsc_hz = crystal_hz * num / den;
+    } else if (max_leaf >= 0x16) {
+        const base_mhz: u64 = cpuidRaw(0x16).eax;
+        if (base_mhz == 0) return false;
+        tsc_hz = base_mhz * 1_000_000;
+        crystal_hz = tsc_hz * den / num;
+    } else return false;
+    // Sanity: a TSC outside [100 MHz, 10 GHz] means the leaves are lying.
+    if (tsc_hz < 100_000_000 or tsc_hz > 10_000_000_000) return false;
+    // 100 Hz quantum, LAPIC divider 16 (DCR=0x03) → crystal_hz / 100 / 16.
+    tsc_per_quantum = tsc_hz / 100;
+    apic_timer_count = @intCast(crystal_hz / 1600);
+    calibrated_via_cpuid = true;
+    debug.klog("[apic] CPUID calibration: TSC={d} Hz crystal={d} Hz → {d} TSC / {d} LAPIC ticks per 10ms\n", .{ tsc_hz, crystal_hz, tsc_per_quantum, apic_timer_count });
+    return true;
+}
+
+/// PIT Channel 2 calibration. Returns false if the PIT output never rises —
+/// modern firmware often disables the PIT outright, and the old unbounded
+/// poll turned that into a silent boot hang once HPET had already failed.
+fn calibrateTimerPit() bool {
     // Set PIT Channel 2 for one-shot, 10ms (11932 ticks at 1193182 Hz)
     const PIT_10MS: u16 = 11932;
 
@@ -548,9 +615,20 @@ fn calibrateTimerPit() void {
     // started; LAPIC counter is decrementing.
     const tsc_start = rdtsc();
 
-    // Wait for PIT Channel 2 output (bit 5 of port 0x61 goes high)
+    // Wait for PIT Channel 2 output (bit 5 of port 0x61 goes high). BOUNDED:
+    // each iteration's inb is ~1µs of bus time on real hardware, so the 10ms
+    // window is ~10K spins and the cap is ~100× that — generous for any live
+    // PIT, finite for a dead one.
+    const PIT_SPIN_CAP: u32 = 1_000_000;
+    var spins: u32 = 0;
     while (io.inb(0x61) & 0x20 == 0) {
         asm volatile ("pause");
+        spins += 1;
+        if (spins >= PIT_SPIN_CAP) {
+            lapicWrite(LAPIC_LVT_TIMER, 1 << 16); // mask the free-running timer
+            debug.klog("[apic] PIT gate never fired ({d} polls) — PIT disabled/absent\n", .{spins});
+            return false;
+        }
     }
 
     const tsc_end = rdtsc();
@@ -563,6 +641,7 @@ fn calibrateTimerPit() void {
     apic_timer_count = elapsed;
     tsc_per_quantum = tsc_end - tsc_start;
     debug.klog("[apic] Timer calibration: {d} LAPIC / {d} TSC ticks per 10ms\n", .{ elapsed, tsc_per_quantum });
+    return true;
 }
 
 fn startTimer() void {
@@ -689,7 +768,7 @@ pub fn init() bool {
     // post-S3 steady state, where the PIT comes back unprogrammed/silent.
     pit.stop();
     debug.klog("[apic] timer config: source={s} mode={s} freq=100Hz\n", .{
-        if (calibrated_via_hyperv) "Hyper-V" else if (calibrated_via_hpet) "HPET" else "PIT",
+        if (calibrated_via_hyperv) "Hyper-V" else if (calibrated_via_hpet) "HPET" else if (calibrated_via_cpuid) "CPUID" else "PIT",
         if (tsc_deadline_active) "TSC-deadline" else "LAPIC-count",
     });
     return true;

@@ -63,7 +63,7 @@ fn paintBg() void {
 pub fn show(has_backbuf: bool) void {
     const sw = gfx.screen_w;
     const sh = gfx.screen_h;
-    const vgpu = @import("../../driver/virtio_gpu.zig");
+    const display = @import("../display.zig");
 
     const logo = "ZigOS";
     const logo_w: u32 = @as(u32, logo.len) * gfx.FONT32_ADV;
@@ -137,7 +137,7 @@ pub fn show(has_backbuf: bool) void {
         }
 
         if (has_backbuf) gfx.blitToScreen();
-        if (vgpu.active) vgpu.flush();
+        display.flush();
         busyWaitMs(25);
 
         if (frame == 14) sound.startup();
@@ -162,12 +162,12 @@ pub fn show(has_backbuf: bool) void {
         gfx.fillRect(accent_cx - @as(i32, @intCast(accent_max_w)), accent_y, accent_max_w * 2, accent_h, accent_color);
 
         if (has_backbuf) gfx.blitToScreen();
-        if (vgpu.active) vgpu.flush();
+        display.flush();
         busyWaitMs(20);
     }
 
     // Clear before desktop chrome paints over.
     gfx.fillRect(0, 0, sw, sh, 0x000000);
     if (has_backbuf) gfx.blitToScreen();
-    if (vgpu.active) vgpu.flush();
+    display.flush();
 }

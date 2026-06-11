@@ -1,6 +1,7 @@
 const std = @import("std");
 const gfx = @import("gfx.zig");
 const bga = @import("bga.zig");
+const display = @import("display.zig");
 const mouse = @import("../driver/mouse.zig");
 const keyboard = @import("../driver/keyboard.zig");
 const vga = @import("vga.zig");
@@ -1891,11 +1892,9 @@ fn eraseCursor() void {
     const cx: u32 = if (last_cursor_x < 0) 0 else @intCast(last_cursor_x);
     const cy: u32 = if (last_cursor_y < 0) 0 else @intCast(last_cursor_y);
     gfx.blitRectToScreen(cx, cy, CURSOR_W, CURSOR_H);
-    // Flush erased region for virtio-gpu
-    if (gfx.post_blit_fn != null) {
-        const virtio_gpu = @import("../driver/virtio_gpu.zig");
-        virtio_gpu.flushRect(cx, cy, CURSOR_W, CURSOR_H);
-    }
+    // Flush erased region to the scanout (virtio rect / GOP blit; no-op on
+    // a live framebuffer like BGA or GOP-direct).
+    display.flushRect(cx, cy, CURSOR_W, CURSOR_H);
 }
 
 fn drawCursorOnScreen() void {
@@ -1912,12 +1911,12 @@ fn drawCursorOnScreen() void {
     }
     last_cursor_x = mx;
     last_cursor_y = my;
-    // Flush cursor region for virtio-gpu (direct writes need explicit flush)
-    if (gfx.post_blit_fn != null) {
+    // Flush cursor region (direct screen writes need an explicit flush on
+    // flush-based scanouts — virtio resource or GOP blit).
+    {
         const cx: u32 = if (mx < 0) 0 else @intCast(mx);
         const cy: u32 = if (my < 0) 0 else @intCast(my);
-        const virtio_gpu = @import("../driver/virtio_gpu.zig");
-        virtio_gpu.flushRect(cx, cy, CURSOR_W, CURSOR_H);
+        display.flushRect(cx, cy, CURSOR_W, CURSOR_H);
     }
 }
 
@@ -2627,8 +2626,19 @@ fn blitWindowBounds(idx: u8) void {
     gfx.blitRectToScreen(bx, by, w.width + BORDER * 2 + 26, w.height + BORDER * 2 + 26);
 }
 
+/// True when run() picked the GOP scanout as the desktop's display (real
+/// hardware: no virtio, no BGA). Resolution is then immutable — GOP SetMode
+/// is a boot service, gone after ExitBootServices — and the back-buffer
+/// policy treats GUEST_FB as the compositing surface in blit mode.
+var display_is_gop: bool = false;
+
 fn changeResolution(new_w: u16, new_h: u16) void {
     const virtio_gpu = @import("../driver/virtio_gpu.zig");
+
+    if (display_is_gop) {
+        debug.klog("[desktop] resolution change unavailable on GOP scanout (SetMode died with boot services)\n", .{});
+        return;
+    }
 
     // Free old back buffer (only allocated in BGA mode — virtio-gpu shares
     // the resource backing). bb_pages == 0 signals the no-alloc path.
@@ -2748,6 +2758,7 @@ pub fn run() void {
     // Try virtio-gpu first, fallback to BGA
     var disp_w: u32 = 0;
     var disp_h: u32 = 0;
+    const gop = @import("../driver/gop_fb.zig");
     if (virtio_gpu.init(1920, 1080)) {
         disp_w = virtio_gpu.width;
         disp_h = virtio_gpu.height;
@@ -2763,6 +2774,17 @@ pub fn run() void {
         disp_h = bga.height;
         gfx.setScreen(bga.framebuffer, disp_w, disp_h);
         debug.klog("[desktop] Using BGA {d}x{d}\n", .{ disp_w, disp_h });
+    } else if (gop.active) {
+        // Real hardware: no virtio, no BGA — the UEFI GOP framebuffer that
+        // early_fb adopted at kernelMain entry is the display. Direct mode
+        // (BGRA, packed stride) scans out live like BGA; blit mode renders
+        // into GUEST_FB and display.flush() pushes rows to the panel.
+        disp_w = gop.width;
+        disp_h = gop.height;
+        gfx.setScreen(gop.framebuffer, disp_w, disp_h);
+        gfx.post_blit_fn = &gop.flush;
+        display_is_gop = true;
+        debug.klog("[desktop] Using GOP scanout {d}x{d} ({s})\n", .{ disp_w, disp_h, if (gop.direct) "direct" else "blit" });
     } else {
         vga.fg = .LightRed;
         vga.print("No display available!\n", .{});
@@ -2790,6 +2812,13 @@ pub fn run() void {
         bb_pages = 0;
         gfx.useFramebuffer(); // target := screen (= virtio-gpu resource backing)
         debug.klog("[desktop] Compositor: direct-to-resource (no back buffer)\n", .{});
+    } else if (display_is_gop and !gop.direct and !force_back_buffer) {
+        // GOP blit mode: GUEST_FB only reaches the panel on flush — it IS a
+        // back buffer already, the same shape as virtio's direct-to-resource.
+        backbuf = @as([*]volatile u32, @ptrCast(gop.framebuffer));
+        bb_pages = 0;
+        gfx.useFramebuffer(); // target := screen (= GUEST_FB blit source)
+        debug.klog("[desktop] Compositor: direct-to-GUEST_FB (no extra back buffer)\n", .{});
     } else {
         bb_pages = (disp_w * disp_h * 4 + 4095) / 4096;
         if (paging.allocBackBuffer(bb_pages)) |buf| {
@@ -3319,7 +3348,6 @@ pub fn run() void {
         }
 
         // Render based on what changed
-        const vgpu = @import("../driver/virtio_gpu.zig");
         if (backbuf != null) {
             switch (dirty) {
                 .full => {
@@ -3331,7 +3359,7 @@ pub fn run() void {
                     if (!use_hw_cursor) bakeCursorToBackBuffer();
                     gfx.blitToScreen();
                     if (!use_hw_cursor) unbakeCursorFromBackBuffer();
-                    if (vgpu.active) vgpu.flush();
+                    display.flush();
                     resetDirtyRects();
                 },
                 .drag => {
@@ -3340,7 +3368,7 @@ pub fn run() void {
                     if (!use_hw_cursor) bakeCursorToBackBuffer();
                     gfx.blitToScreen();
                     if (!use_hw_cursor) unbakeCursorFromBackBuffer();
-                    if (vgpu.active) vgpu.flush();
+                    display.flush();
                     resetDirtyRects();
                 },
                 .gui_only => {
@@ -3357,16 +3385,14 @@ pub fn run() void {
                         gfx.blitToScreen();
                     }
                     if (!use_hw_cursor) unbakeCursorFromBackBuffer();
-                    if (vgpu.active) {
-                        if (dr_count > 0) {
-                            var di: u8 = 0;
-                            while (di < dr_count) : (di += 1) {
-                                const r = dirty_rects_mod.getRect(di);
-                                vgpu.flushRect(r[0], r[1], r[2], r[3]);
-                            }
-                        } else {
-                            vgpu.flush();
+                    if (dr_count > 0) {
+                        var di: u8 = 0;
+                        while (di < dr_count) : (di += 1) {
+                            const r = dirty_rects_mod.getRect(di);
+                            display.flushRect(r[0], r[1], r[2], r[3]);
                         }
+                    } else {
+                        display.flush();
                     }
                     // Mode 9: hand the rect snapshot to the GPU compositor
                     // before the reset clears them. requestRenderFromDirty
@@ -3387,7 +3413,7 @@ pub fn run() void {
                             gfx.blitRectToScreen(if (cw.x < 0) 0 else @intCast(cw.x), uy, cw.width, FONT_H);
                             if (swCursorActive(use_hw_cursor)) drawCursorOnScreen();
                             // Partial flush: just the text row band
-                            if (vgpu.active) vgpu.flushRect(0, uy, gfx.screen_w, FONT_H);
+                            display.flushRect(0, uy, gfx.screen_w, FONT_H);
                             // Mode 9: terminal row → compositor.
                             const cwx: u32 = if (cw.x < 0) 0 else @intCast(cw.x);
                             @import("gpu_compositor.zig").requestRenderRect(cwx, uy, cw.width, FONT_H);
@@ -3398,9 +3424,9 @@ pub fn run() void {
                         blitWindowBounds(wm.focused);
                         if (swCursorActive(use_hw_cursor)) drawCursorOnScreen();
                         // Flush window region
-                        if (vgpu.active) {
-                            const wy: u32 = if (cw.y < 0) 0 else @intCast(cw.y);
-                            vgpu.flushRect(0, wy, gfx.screen_w, cw.height + TITLEBAR_H + 8);
+                        {
+                            const fy: u32 = if (cw.y < 0) 0 else @intCast(cw.y);
+                            display.flushRect(0, fy, gfx.screen_w, cw.height + TITLEBAR_H + 8);
                         }
                         // Mode 9: window region → compositor.
                         const wy: u32 = if (cw.y < 0) 0 else @intCast(cw.y);
@@ -3412,7 +3438,7 @@ pub fn run() void {
                         eraseCursor();
                         if (swCursorActive(use_hw_cursor)) drawCursorOnScreen();
                         // Software cursor: flush cursor bands
-                        if (vgpu.active) vgpu.flush();
+                        display.flush();
                     }
                     // Hardware cursor: nothing to flush (moveCursor already sent)
                 },
@@ -3421,7 +3447,7 @@ pub fn run() void {
         } else if (dirty != .none) {
             renderScene();
             if (swCursorActive(use_hw_cursor)) drawCursorOnScreen();
-            if (vgpu.active) vgpu.flush();
+            display.flush();
         }
 
     }

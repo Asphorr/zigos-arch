@@ -41,36 +41,30 @@ pub fn init(boot_info: *const boot_info_mod.BootInfo) bool {
         // gfx has no row-pitch concept: every primitive addresses pixels as
         // `y * width + x` (see gfx.putPixel/fillRect/drawChar), and it writes
         // 0x00RRGGBB, which only scans out correctly on a little-endian BGRA
-        // framebuffer. So the early path can only adopt a GOP whose stride
-        // (pixels-per-scanline) equals its visible width AND whose format is
-        // BGRA (boot_info format 0). A padded stride would shear the whole boot
-        // screen diagonally; an RGBA (1) or unknown/Blt-only (2) format would
-        // swap R/B or have no linear FB to write at all.
-        //
-        // We can't honor either here — there's no back buffer and no PMM yet to
-        // make one — so rather than paint a corrupt boot screen we decline the
-        // GOP FB and stay in always-correct VGA text mode. tryVirtioGpu() still
-        // upgrades to graphical later via the width-packed BGRA virtio/BGA
-        // device once PMM/heap are up. (On QEMU/OVMF stride == width and
-        // format == BGRA, so this adopts exactly as before — no behavior change
-        // on the path we can actually boot.)
-        if (fb.stride != fb.width or fb.format != 0) {
-            serial.print("[early-fb] UEFI GOP unsupported by early gfx (stride={d} width={d} fmt={d}); VGA text, awaiting tryVirtioGpu\n", .{ fb.stride, fb.width, fb.format });
+        // framebuffer. The GOP scanout driver bridges both real-firmware gaps:
+        // direct mode for BGRA-with-stride==width (QEMU/OVMF — gfx draws
+        // straight to the panel, byte-identical to the old path here), blit
+        // mode for padded strides / RGBA (gfx draws into the fixed GUEST_FB
+        // region — no PMM needed, it's a reserved layout region — and every
+        // post_blit flush copies rows out with stride/byte-order fixup).
+        // This matters because real CSM-less UEFI has NO VGA text mode: the
+        // old "decline and stay in text" fallback was a dark machine there.
+        const gop = @import("../driver/gop_fb.zig");
+        if (!gop.init(fb)) {
+            serial.print("[early-fb] UEFI GOP unusable (stride={d} width={d} fmt={d}); VGA text, awaiting tryVirtioGpu\n", .{ fb.stride, fb.width, fb.format });
             return false;
         }
-        // GOP framebuffer phys (typ. 0x80000000) reached through the
-        // kernel physmap. Phase 3 dropped PML4[0], so a raw phys
-        // pointer would fault on the first fillRect once the desktop
-        // takes over. The physmap covers all phys < 64 GB.
-        const ptr: [*]volatile u32 = @ptrFromInt(paging.physToVirt(@as(usize, fb.base)));
-        gfx.setScreen(ptr, fb.width, fb.height);
+        gfx.setScreen(gop.framebuffer, gop.width, gop.height);
         // gfx primitives (fillRect/drawString) write to `target`, not
-        // `screen`. Point target at the live FB so boot_screen draws
-        // straight to the panel — no back buffer this early in boot
-        // (no PMM, no place to put one).
+        // `screen`. Point target at the render surface so boot_screen draws
+        // without a separate back buffer this early in boot.
         gfx.useFramebuffer();
+        // In blit mode the panel only updates on flush; boot_screen and the
+        // panic screen already call post_blit_fn after drawing. In direct
+        // mode this is a cheap no-op.
+        gfx.post_blit_fn = &gop.flush;
         active = true;
-        serial.print("[early-fb] UEFI GOP {d}x{d} fb=0x{X}\n", .{ fb.width, fb.height, fb.base });
+        serial.print("[early-fb] UEFI GOP {d}x{d} fb=0x{X} ({s})\n", .{ gop.width, gop.height, fb.base, if (gop.direct) "direct" else "blit" });
         return true;
     }
 

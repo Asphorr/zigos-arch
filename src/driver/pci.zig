@@ -114,11 +114,12 @@ pub const PciDevice = struct {
 //   - drivers stop duplicating the "vendor==0xFFFF / multi-function /
 //     readBar64 / read IRQ line" boilerplate
 //
-// MAX_DEVICES is generously sized — a typical QEMU + UEFI guest has ~12
-// devices (host bridge, ISA bridge, virtio-gpu, virtio-net, NVMe, AHCI,
-// xHCI, AC97, ...) and even a server-class board with two PCIe roots and
-// hot-plug slots stays well under 64.
-const MAX_DEVICES: usize = 64;
+// MAX_DEVICES: a typical QEMU + UEFI guest has ~12 devices, but REAL machines
+// routinely exceed 64 PCI functions (every PCIe root port is one, plus iGPU,
+// ME/HECI, SMBus, audio, thermal, xHCI, NVMe, WiFi, card reader, ...). The old
+// cap of 64 silently dropped whatever enumerated late — possibly the NVMe or
+// xHCI the boot needs ("cache full" klog below). 256 × ~32 B is cheap BSS.
+const MAX_DEVICES: usize = 256;
 var devices: [MAX_DEVICES]PciDevice = undefined;
 var device_count: usize = 0;
 // Parallel "did some driver claim this slot?" array. Each driver calls

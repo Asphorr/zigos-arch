@@ -70,10 +70,10 @@ pub var is_uefi: bool = false;
 /// Multiboot path leaves this as 0. Read by smp.init() etc. to gate behavior.
 pub var boot_mode: u32 = 0;
 
-// Static storage for converted memory regions. 256 matches the UEFI path's
-// max_regions; real HW emits 80-200 descriptors typically. Multiboot
-// usually has 10-20, so most slots stay unused on that path.
-var regions: [256]MemoryRegion = undefined;
+// Static storage for converted memory regions. 512 matches the UEFI path's
+// max_regions; real HW emits 80-200 descriptors typically (more on fragmented
+// boards). Multiboot usually has 10-20, so most slots stay unused on that path.
+var regions: [512]MemoryRegion = undefined;
 
 /// Convert a Multiboot1 memory map to a BootInfo struct.
 pub fn fromMultiboot(info: *multiboot.MultibootInfo) BootInfo {
@@ -81,7 +81,7 @@ pub fn fromMultiboot(info: *multiboot.MultibootInfo) BootInfo {
 
     if (info.flags & (1 << 6) != 0) {
         var offset: u32 = 0;
-        while (offset < info.mmap_length and count < 256) {
+        while (offset < info.mmap_length and count < regions.len) {
             const paging = @import("../mm/paging.zig");
             const entry: *const multiboot.MultibootMmapEntry = @ptrFromInt(paging.physToVirt(@as(u64, info.mmap_addr) + offset));
             regions[count] = .{

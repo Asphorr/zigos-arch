@@ -151,6 +151,64 @@ fn serialHex(val: u64) void {
     }
 }
 
+/// Re-program GOP to the most kernel-friendly mode before the framebuffer
+/// descriptor is read out. Preference tiers:
+///   3 — BGRA with stride == width: the kernel's gfx writes 0x00RRGGBB at
+///       y*width+x, so this scans out with zero conversion (direct mode)
+///   2 — BGRA, padded stride: kernel blits through its GUEST_FB back buffer
+///   1 — RGBA, any stride: blit + R/B swap
+/// Within a tier the largest area wins. Two hard caps, both kernel limits:
+/// width*height*4 must fit the 8 MB GUEST_FB/BACK_BUFFER compositing regions,
+/// and the area is capped at 1920x1080 (the desktop's window-math ceiling).
+/// The CURRENT mode seeds the comparison, so SetMode (which blanks the panel
+/// for a frame) only runs on a strict improvement — QEMU/OVMF's default
+/// 1920x1080 BGRA packed mode is already tier-3 max and never re-sets.
+fn pickBestGopMode(gop: *GraphicsOutput) void {
+    const Rating = struct {
+        const MAX_BYTES: u64 = uefi_layout.GUEST_FB_SIZE;
+        const MAX_AREA: u64 = 1920 * 1080;
+
+        fn rate(info: anytype) struct { tier: u8, area: u64 } {
+            const w: u64 = info.horizontal_resolution;
+            const h: u64 = info.vertical_resolution;
+            const area = w * h;
+            if (area == 0 or area > MAX_AREA or area * 4 > MAX_BYTES) return .{ .tier = 0, .area = 0 };
+            const tier: u8 = switch (info.pixel_format) {
+                .blue_green_red_reserved_8_bit_per_color => if (info.pixels_per_scan_line == info.horizontal_resolution) @as(u8, 3) else @as(u8, 2),
+                .red_green_blue_reserved_8_bit_per_color => 1,
+                else => 0,
+            };
+            return .{ .tier = tier, .area = if (tier == 0) 0 else area };
+        }
+    };
+
+    const cur = Rating.rate(gop.mode.info);
+    var best_tier: u8 = cur.tier;
+    var best_area: u64 = cur.area;
+    var best_mode: u32 = gop.mode.mode;
+
+    var i: u32 = 0;
+    while (i < gop.mode.max_mode) : (i += 1) {
+        const info = gop.queryMode(i) catch continue;
+        const r = Rating.rate(info);
+        if (r.tier > best_tier or (r.tier == best_tier and r.area > best_area)) {
+            best_tier = r.tier;
+            best_area = r.area;
+            best_mode = i;
+        }
+    }
+
+    if (best_tier == 0 or best_mode == gop.mode.mode) return;
+    serialPrint("[uefi] GOP SetMode ");
+    serialHex(gop.mode.mode);
+    serialPrint(" -> ");
+    serialHex(best_mode);
+    serialPut('\n');
+    gop.setMode(best_mode) catch {
+        serialPrint("[uefi] SetMode failed; keeping current mode\n");
+    };
+}
+
 pub fn main() uefi.Status {
     const system_table = uefi.system_table;
     const image_handle = uefi.handle;
@@ -212,6 +270,7 @@ pub fn main() uefi.Status {
 
     const gop_result = boot_services.locateProtocol(GraphicsOutput, null) catch null;
     if (gop_result) |gop| {
+        pickBestGopMode(gop);
         const mode = gop.mode;
         const info = mode.info;
         fb_info.base = mode.frame_buffer_base;
@@ -605,11 +664,13 @@ pub fn main() uefi.Status {
 
     // Convert UEFI memory map to BootInfo MemoryRegion array BEFORE ExitBootServices
     // (We write to fixed physical addresses that are in conventional memory).
-    // 256 × 24 B = 6 KB, fits in MMAP_REGIONS_ADDR..BOOT_STACK_TOP (60 KB room).
-    // Real-HW UEFI emits 80-200 descriptors typically; QEMU emits ~10.
+    // 512 × 24 B = 12 KB; the boot stack descends from BOOT_STACK_TOP toward this
+    // array through the same 60 KB window, so 48 KB of stack room remains.
+    // Real-HW UEFI emits 80-200 descriptors typically (fragmented boards more);
+    // QEMU emits ~10. A dropped entry is lost RAM or an invisible high MMIO BAR.
     const regions: [*]MemoryRegion = @ptrFromInt(@as(usize, @intCast(MMAP_REGIONS_ADDR)));
     var region_count: u32 = 0;
-    const max_regions: u32 = 256;
+    const max_regions: u32 = 512;
 
     // Per-type histogram for first-real-HW-boot diagnostics. The first time
     // something feels off on a new machine, the serial log already has the
