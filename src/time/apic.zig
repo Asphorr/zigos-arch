@@ -159,6 +159,15 @@ fn detectTscDeadline() bool {
     return (ecx & (1 << 24)) != 0;
 }
 
+fn detectX2Apic() bool {
+    var ecx: u32 = undefined;
+    asm volatile ("cpuid"
+        : [ecx] "={ecx}" (ecx)
+        : [eax] "{eax}" (@as(u32, 1))
+        : .{ .ebx = true, .edx = true });
+    return (ecx & (1 << 21)) != 0;
+}
+
 // --- LAPIC MMIO access ---
 
 const LAPIC_ICR_LO: u32 = 0x300;
@@ -405,16 +414,22 @@ fn initIOAPIC() void {
 // --- LAPIC initialization ---
 
 fn initLAPIC() void {
-    // Enable APIC via MSR. We OR in the global-enable bit but preserve
-    // bit 10 (x2APIC enable) — some firmware turns x2APIC on, and once
-    // it's on we can't go back without a CPU reset. After the write we
-    // re-read to see whether bit 10 stuck and switch to MSR access if so.
+    // Enable APIC via MSR. We opt INTO x2APIC when the CPU offers it
+    // (CPUID.01H ECX bit 21): MSR access replaces the MMIO decode on
+    // every LAPIC register touch, and the ICR becomes a single 64-bit
+    // write with no delivery-status poll — under a hypervisor that's one
+    // cheap wrmsr exit per IPI instead of 2 MMIO exits plus poll reads.
+    // xAPIC→x2APIC (EN=1,EXTD=0 → EN=1,EXTD=1) is a legal transition in
+    // one write; the reverse needs a CPU reset, which is also why we
+    // preserve bit 10 if firmware already set it. After the write we
+    // re-read to see what stuck and pick the access mode from that.
     var lo: u32 = undefined;
     var hi: u32 = undefined;
     asm volatile ("rdmsr"
         : [lo] "={eax}" (lo), [hi] "={edx}" (hi)
         : [msr] "{ecx}" (IA32_APIC_BASE_MSR));
     lo |= (1 << 11); // Global enable
+    if (detectX2Apic()) lo |= (1 << 10); // x2APIC enable (opt-in)
     asm volatile ("wrmsr"
         :
         : [msr] "{ecx}" (IA32_APIC_BASE_MSR),
@@ -427,7 +442,7 @@ fn initLAPIC() void {
         : [lo] "={eax}" (lo), [hi] "={edx}" (hi)
         : [msr] "{ecx}" (IA32_APIC_BASE_MSR));
     x2apic_active = (lo & (1 << 10)) != 0;
-    if (x2apic_active) debug.klog("[apic] x2APIC mode active (firmware-enabled)\n", .{});
+    if (x2apic_active) debug.klog("[apic] x2APIC mode active\n", .{});
 
     // Set Spurious Interrupt Vector Register: vector 0xFF + software enable (bit 8)
     lapicWrite(LAPIC_SVR, 0x1FF);
@@ -815,9 +830,36 @@ pub fn sendNMI(target_id: u32) void {
     icrSend(target_id, 0x00004400);
 }
 
+/// Switch THIS CPU into x2APIC mode iff the BSP runs in it. Pure
+/// IA32_APIC_BASE MSR write — touches no LAPIC register — so it is safe
+/// as the very FIRST thing an AP does out of SIPI, before its IDT exists.
+/// APs wake in xAPIC mode, but `x2apic_active` is a global flag: any
+/// lapicRead before this (e.g. the getLapicId an AP uses to find its
+/// per-CPU slot) takes the MSR path and #GPs → no-IDT triple fault →
+/// QEMU exits under -no-reboot with serial cut mid-bringup. (Exactly
+/// that killed the first x2APIC boot, 2026-06-12.)
+pub fn enterX2ApicEarlyAp() void {
+    if (!x2apic_active) return;
+    var lo: u32 = undefined;
+    var hi: u32 = undefined;
+    asm volatile ("rdmsr"
+        : [lo] "={eax}" (lo), [hi] "={edx}" (hi)
+        : [msr] "{ecx}" (IA32_APIC_BASE_MSR));
+    lo |= (1 << 11) | (1 << 10);
+    asm volatile ("wrmsr"
+        :
+        : [msr] "{ecx}" (IA32_APIC_BASE_MSR),
+          [lo] "{eax}" (lo),
+          [hi] "{edx}" (hi));
+}
+
 /// Initialize LAPIC for an AP (does NOT touch IOAPIC or PIC)
 pub fn initLAPICForAP() void {
-    // Enable APIC via MSR
+    // Enable APIC via MSR. MUST mirror the BSP's APIC mode: x2apic_active
+    // is a single global flag, so the lapicWrite(SVR) below already takes
+    // the MSR path when the BSP went x2APIC — an AP still in xAPIC mode
+    // at that point would #GP on the 0x80F wrmsr. Bit 10 goes in the same
+    // write as bit 11 (EN=1,EXTD=1 from disabled is a legal transition).
     var lo: u32 = undefined;
     var hi: u32 = undefined;
     asm volatile ("rdmsr"
@@ -825,6 +867,7 @@ pub fn initLAPICForAP() void {
         : [msr] "{ecx}" (IA32_APIC_BASE_MSR)
     );
     lo |= (1 << 11);
+    if (x2apic_active) lo |= (1 << 10);
     asm volatile ("wrmsr"
         :
         : [msr] "{ecx}" (IA32_APIC_BASE_MSR),

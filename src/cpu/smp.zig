@@ -649,6 +649,12 @@ fn busyWait(ms: u32) void {
 /// keep any vmm-allocated / NX-mapped access *after* syscall_entry.init(). Same
 /// deferral as boot.asm's BSP path.
 fn apInitPerCpu() u8 {
+    // MUST run before getLapicId below: we wake from SIPI in xAPIC mode,
+    // and with the BSP in x2APIC the global flag routes lapicRead through
+    // rdmsr — a #GP (no IDT yet → triple fault) until EXTD is set on THIS
+    // CPU. Pure IA32_APIC_BASE write; no LAPIC register access.
+    apic.enterX2ApicEarlyAp();
+
     // Figure out our LAPIC ID
     const my_id: u8 = @truncate(apic.getLapicId());
 
