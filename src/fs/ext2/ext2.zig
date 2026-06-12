@@ -142,6 +142,10 @@ pub fn writeFile(handle: *Handle, src: [*]const u8, count: u32) u32 {
     // with our bitmap/BGD updates.
     block.lockMount(m);
     defer block.unlockMount(m);
+    // Batch the per-alloc BGD+SB flushes into one pair at scope exit
+    // (defer order: endMetaDefer runs before unlockMount).
+    block.beginMetaDefer(m);
+    defer block.endMetaDefer(m);
     var ino = inode.readInode(handle.inum) orelse return 0;
     if (!inode.isReg(&ino)) return 0;
 
@@ -149,35 +153,83 @@ pub fn writeFile(handle: *Handle, src: [*]const u8, count: u32) u32 {
     // new_end at the end, so we can't read the write's start offset there.
     const start_off = handle.current_offset;
     const bs = m.block_size;
-    var done: u32 = 0;
 
-    while (done < count) {
-        const file_off: u64 = handle.current_offset + done;
+    // `done` = bytes COMMITTED to disk. Full-block writes whose phys blocks
+    // are adjacent accumulate into a pending run covering
+    // [done, done + pend_blocks*bs) and flush as ONE writeBlockRun —
+    // sequential allocBlock results are adjacent on anything but a
+    // fragmented fs, so a bulk save is a handful of multi-block commands
+    // instead of one per 4 KiB. Partial blocks flush the run, then take
+    // the read-modify-write path as before.
+    //
+    // KNOWN CRASH-WINDOW (reviewed 2026-06-12, deliberately accepted):
+    // for indirect-tree leaves, ensurePhysicalBlock persists the leaf
+    // POINTER immediately while the data sits in the pending run, so a
+    // crash inside this op can leave a pointer to stale previous-occupant
+    // disk content. The per-block baseline had the same window at
+    // microsecond width; batching stretches it to run width. Closing it
+    // (alloc-time leaf zeroing, or run-flush before every writePointer)
+    // would re-double the command count — wrong trade for a journal-less
+    // fs where a mid-save crash already loses the save.
+    var done: u32 = 0;
+    var pend_phys: u32 = 0;
+    var pend_blocks: u32 = 0;
+
+    while (true) {
+        const scanned: u32 = done + pend_blocks * bs;
+        if (scanned >= count) break;
+        const file_off: u64 = handle.current_offset + scanned;
         const lblk = file_off / bs;
         if (lblk > std.math.maxInt(u32)) break; // logical block beyond u32
         const logical: u32 = @intCast(lblk);
         const in_block_off: u32 = @intCast(file_off % bs);
         const can: u32 = bs - in_block_off;
-        const remain: u32 = count - done;
+        const remain: u32 = count - scanned;
         const take: u32 = if (remain < can) remain else can;
 
         // Detect first-use of this logical slot so we know whether to
         // pre-zero the block (alloc returns whatever was last on disk).
         const was_unallocated = (inode.blockMapLookup(&ino, logical) == null);
         const phys = inode.ensurePhysicalBlock(m, &ino, logical) orelse break;
-        if (was_unallocated and (in_block_off != 0 or take != bs)) {
+
+        if (in_block_off == 0 and take == bs) {
+            // Full block — no pre-zero needed (whole block overwritten).
+            if (pend_blocks != 0 and phys == pend_phys + pend_blocks) {
+                pend_blocks += 1; // extends the run
+                continue;
+            }
+            if (pend_blocks != 0) { // adjacency broke — flush, start anew
+                if (!block.writeBlockRun(m, pend_phys, pend_blocks, src + done)) {
+                    pend_blocks = 0;
+                    break;
+                }
+                done += pend_blocks * bs;
+                pend_blocks = 0;
+            }
+            pend_phys = phys;
+            pend_blocks = 1;
+            continue;
+        }
+
+        // Partial block: flush any pending run first so `done` is honest.
+        if (pend_blocks != 0) {
+            if (!block.writeBlockRun(m, pend_phys, pend_blocks, src + done)) {
+                pend_blocks = 0;
+                break;
+            }
+            done += pend_blocks * bs;
+            pend_blocks = 0;
+        }
+        if (was_unallocated) {
             // Zero the slack we won't immediately overwrite. zero_block
             // lives in BSS so this doesn't burn 4 KB of kernel stack.
             _ = block.writeBlock(m, phys, block.zero_block[0..bs]);
         }
-
-        const ok = if (in_block_off == 0 and take == bs)
-            block.writeBlock(m, phys, src[done .. done + take])
-        else
-            block.writeBlockBytes(m, phys, in_block_off, src[done .. done + take]);
-        if (!ok) break;
-
+        if (!block.writeBlockBytes(m, phys, in_block_off, src[done .. done + take])) break;
         done += take;
+    }
+    if (pend_blocks != 0) {
+        if (block.writeBlockRun(m, pend_phys, pend_blocks, src + done)) done += pend_blocks * bs;
     }
 
     const new_end: u64 = handle.current_offset + done;
@@ -225,6 +277,8 @@ pub fn writebackPage(inum: u32, page_off: u64, src: [*]const u8) u32 {
     // the block map + bitmaps).
     block.lockMount(m);
     defer block.unlockMount(m);
+    block.beginMetaDefer(m);
+    defer block.endMetaDefer(m);
     var ino = inode.readInode(inum) orelse return 0;
     if (!inode.isReg(&ino)) return 0;
     const fsize = inode.fileSize(&ino);
@@ -582,6 +636,9 @@ pub fn unlinkInDir(parent_inum: u32, name: []const u8, policy: UnlinkPolicy) boo
     // not interleave with other mutators (lost dirent merges, double frees).
     block.lockMount(m);
     defer block.unlockMount(m);
+    // One BGD+SB flush for the whole unlink (freeAllBlocks loop + freeInode).
+    block.beginMetaDefer(m);
+    defer block.endMetaDefer(m);
     var parent = inode.readInode(parent_inum) orelse return false;
     if (!inode.isDir(&parent)) return false;
     const child_inum = lookupInDir(&parent, name) orelse return false;
@@ -683,6 +740,9 @@ pub fn truncate(inum: u32) bool {
     // indirect-walk scratch buffers need the mutual exclusion).
     block.lockMount(m);
     defer block.unlockMount(m);
+    // One BGD+SB flush for the whole free walk instead of one per block.
+    block.beginMetaDefer(m);
+    defer block.endMetaDefer(m);
     var ino = inode.readInode(inum) orelse return false;
     if (!inode.isReg(&ino)) return false;
     inode.freeAllBlocks(m, &ino);

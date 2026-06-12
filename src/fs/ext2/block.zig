@@ -82,6 +82,20 @@ pub const Mount = struct {
     /// (allocBlock -> writeBgdTable -> writeBlock). 0xFFFF owner = free.
     lock_owner: u16 = 0xFFFF, // (a) pid holding the lock
     lock_depth: u32 = 0, // recursion depth — only the owner mutates
+
+    /// Metadata-flush deferral (2026-06-12). depth > 0 = a compound op
+    /// (writeFile / truncate / unlink) is batching: writeBgdTable /
+    /// writeSuperblock just set `meta_dirty` and return true, and the
+    /// outermost endMetaDefer issues ONE BGD+SB flush pair for the whole
+    /// op — was one pair per allocBlock/freeBlock, which made metadata
+    /// the dominant command count of any bulk save or truncate. Guarded
+    /// by the mount lock like the rest of this struct.
+    /// Crash-consistency: within a deferred scope the on-disk BGD/SB
+    /// free counts lag the (still eagerly-written) bitmaps; this
+    /// journal-less fs already had that window per block op, it's just
+    /// op-wide now — same fsck-class repair either way.
+    meta_defer_depth: u32 = 0,
+    meta_dirty: bool = false,
 };
 
 /// Acquire the per-mount lock (see Mount.lock_owner). No-op before the
@@ -138,6 +152,11 @@ pub fn releaseLockIfHeld(pid: u16) void {
     const self = &mount_storage;
     if (@atomicLoad(u16, &self.lock_owner, .acquire) != pid) return;
     self.lock_depth = 0;
+    // Died mid-compound-op: reset the defer depth or every future flush
+    // stays deferred forever. meta_dirty is left as-is — the next eager
+    // writeBgdTable/writeSuperblock (any alloc/free outside a defer
+    // scope) persists current state, which subsumes the lost flush.
+    self.meta_defer_depth = 0;
     const tid: u32 = @truncate(@intFromPtr(&self.lock_owner));
     @atomicStore(u16, &self.lock_owner, 0xFFFF, .release);
     @import("../../proc/sched.zig").wakeMutexWaiters(tid);
@@ -326,6 +345,10 @@ pub fn writeBlockBytes(self: *Mount, block_num: u32, byte_off: u32, src: []const
 pub fn writeSuperblock(self: *Mount) bool {
     lockMount(self);
     defer unlockMount(self);
+    if (self.meta_defer_depth > 0) {
+        self.meta_dirty = true;
+        return true;
+    }
     const sb_bytes: [*]const u8 = @ptrCast(&self.sb);
     return self.write_sectors(self.partition_lba + 2, 2, sb_bytes);
 }
@@ -337,6 +360,10 @@ pub fn writeSuperblock(self: *Mount) bool {
 pub fn writeBgdTable(self: *Mount) bool {
     lockMount(self);
     defer unlockMount(self);
+    if (self.meta_defer_depth > 0) {
+        self.meta_dirty = true;
+        return true;
+    }
     const bgd_start_block: u32 = if (self.block_size == 1024) 2 else 1;
     const bytes_total: u32 = self.bgd_count * @sizeOf(layout.BlockGroupDescriptor);
     const blocks_needed: u32 = (bytes_total + self.block_size - 1) / self.block_size;
@@ -350,6 +377,65 @@ pub fn writeBgdTable(self: *Mount) bool {
             if (!writeBlock(self, block_num, bgd_bytes[dst_off .. dst_off + self.block_size])) return false;
         } else {
             if (!writeBlockBytes(self, block_num, 0, bgd_bytes[dst_off .. dst_off + take])) return false;
+        }
+    }
+    return true;
+}
+
+/// Enter a metadata-flush deferral scope (see Mount.meta_defer_depth).
+/// Nests like the mount lock; caller MUST pair with endMetaDefer before
+/// releasing its mount-lock hold.
+pub fn beginMetaDefer(self: *Mount) void {
+    lockMount(self);
+    defer unlockMount(self);
+    self.meta_defer_depth += 1;
+}
+
+/// Leave a deferral scope; the outermost exit flushes the accumulated
+/// BGD-table + superblock state in one pair of writes.
+pub fn endMetaDefer(self: *Mount) void {
+    lockMount(self);
+    defer unlockMount(self);
+    if (self.meta_defer_depth == 0) return; // unbalanced — be forgiving
+    self.meta_defer_depth -= 1;
+    if (self.meta_defer_depth == 0 and self.meta_dirty) {
+        self.meta_dirty = false;
+        // Attempt both even if the first fails — they cover disjoint LBAs.
+        const bgd_ok = writeBgdTable(self);
+        const sb_ok = writeSuperblock(self);
+        if (!bgd_ok or !sb_ok) {
+            debug.klog("[ext2] endMetaDefer: deferred flush failed (bgd={} sb={})\n", .{ bgd_ok, sb_ok });
+        }
+    }
+}
+
+/// Write `n_blocks` physically-CONTIGUOUS fs blocks from `src` as one
+/// chunked multi-sector write — writeFile's bulk-save path. Bypasses the
+/// per-block cache patch; any cache way overlapping the written LBA range
+/// is invalidated instead (next read refills). One NVMe command per
+/// MAX_SECTORS_PER_CMD sectors instead of one per block.
+pub fn writeBlockRun(self: *Mount, first_block: u32, n_blocks: u32, src: [*]const u8) bool {
+    if (n_blocks == 0) return true;
+    lockMount(self);
+    defer unlockMount(self);
+    if (first_block == 0 or first_block >= self.sb.blocks_count) return false;
+    if (n_blocks > self.sb.blocks_count - first_block) return false;
+    const lba = blockLba(self, first_block);
+    const total_sectors: u32 = n_blocks * self.sectors_per_block;
+    var done: u32 = 0;
+    while (done < total_sectors) {
+        // Chunk to the dispatch layer's u16 count; the driver re-chunks at
+        // MAX_SECTORS_PER_CMD anyway, so this costs no extra commands.
+        const chunk: u32 = @min(total_sectors - done, 0xF000);
+        if (!self.write_sectors(lba + done, @intCast(chunk), src + done * SECTOR_SIZE)) return false;
+        done += chunk;
+    }
+    var w: u8 = 0;
+    while (w < CACHE_WAYS) : (w += 1) {
+        const base = self.cache_base_lba[w];
+        if (base == 0xFFFFFFFF) continue;
+        if (base < lba + total_sectors and lba < base + CACHE_SECTORS) {
+            self.cache_base_lba[w] = 0xFFFFFFFF; // overlaps the run — drop it
         }
     }
     return true;
