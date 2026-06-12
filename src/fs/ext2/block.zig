@@ -45,7 +45,7 @@ const CACHE_WAYS: u32 = 2;
 // (secondary → primary) without touching ext2/ internals. Same idea as
 // the block driver's own backend dispatch.
 const ReadFn = *const fn (lba: u32, count: u16, dest: [*]u8) bool;
-const WriteFn = *const fn (lba: u32, src: [*]const u8) void;
+const WriteFn = *const fn (lba: u32, count: u16, src: [*]const u8) bool;
 
 pub const Mount = struct {
     sb: layout.Superblock,
@@ -58,7 +58,7 @@ pub const Mount = struct {
     /// disk is one big ext2 fs (no partition table).
     partition_lba: u32,
     read_sectors: ReadFn,
-    write_sector: WriteFn,
+    write_sectors: WriteFn,
     /// Set-associative cache: CACHE_WAYS independent windows, each
     /// CACHE_SECTORS-aligned. cache_base_lba[i] is in disk LBAs, not
     /// fs blocks. 0xFFFFFFFF = empty slot. `cache_next_evict` is a
@@ -217,7 +217,7 @@ pub fn mount(partition_lba: u32) bool {
         .bgd = bgd_storage[0..bgd_count],
         .partition_lba = partition_lba,
         .read_sectors = blkdev.readSectorsSecondary,
-        .write_sector = blkdev.writeSectorSecondary,
+        .write_sectors = blkdev.writeSectorsSecondary,
     };
 
     if (!readBgdTable(&mount_storage)) {
@@ -265,9 +265,10 @@ pub fn readBlockBytes(self: *Mount, block_num: u32, byte_off: u32, dst: []u8) bo
 // Phase 2 — writes
 // =============================================================================
 
-/// Write one fs block from `src` (must equal mount.block_size). Issues
-/// `sectors_per_block` per-sector writes through the underlying block
-/// driver; updates the read cache in-place if the cache currently covers
+/// Write one fs block from `src` (must equal mount.block_size). Issues a
+/// single multi-sector write through the underlying block driver (one NVMe
+/// command per block — was 8 single-sector round-trips pre-2026-06-12);
+/// updates the read cache in-place if the cache currently covers
 /// this block (no extra read needed). All write paths funnel through here
 /// so a single cache-invalidation strategy covers everything.
 pub fn writeBlock(self: *Mount, block_num: u32, src: []const u8) bool {
@@ -276,11 +277,7 @@ pub fn writeBlock(self: *Mount, block_num: u32, src: []const u8) bool {
     if (block_num == 0 or block_num >= self.sb.blocks_count) return false;
     if (src.len != self.block_size) return false;
     const lba = blockLba(self, block_num);
-    var s: u32 = 0;
-    while (s < self.sectors_per_block) : (s += 1) {
-        const sec_off = s * SECTOR_SIZE;
-        self.write_sector(lba + s, src.ptr + sec_off);
-    }
+    if (!self.write_sectors(lba, @intCast(self.sectors_per_block), src.ptr)) return false;
     // Refresh whichever cache way currently covers this LBA window so a
     // subsequent read sees the new bytes without a re-fetch. With 2-way
     // LRU either way could hold the window; check both.
@@ -320,12 +317,7 @@ pub fn writeBlockBytes(self: *Mount, block_num: u32, byte_off: u32, src: []const
         self.cache_buf[way][cache_off_base + byte_off .. cache_off_base + byte_off + src.len],
         src,
     );
-    var s: u32 = 0;
-    while (s < self.sectors_per_block) : (s += 1) {
-        const sec_off: u32 = cache_off_base + s * SECTOR_SIZE;
-        self.write_sector(lba + s, @as([*]const u8, @ptrCast(&self.cache_buf[way])) + sec_off);
-    }
-    return true;
+    return self.write_sectors(lba, @intCast(self.sectors_per_block), @as([*]const u8, @ptrCast(&self.cache_buf[way])) + cache_off_base);
 }
 
 /// Persist the in-memory superblock to its on-disk slot (LBAs 2..3 within
@@ -335,9 +327,7 @@ pub fn writeSuperblock(self: *Mount) bool {
     lockMount(self);
     defer unlockMount(self);
     const sb_bytes: [*]const u8 = @ptrCast(&self.sb);
-    self.write_sector(self.partition_lba + 2, sb_bytes);
-    self.write_sector(self.partition_lba + 3, sb_bytes + SECTOR_SIZE);
-    return true;
+    return self.write_sectors(self.partition_lba + 2, 2, sb_bytes);
 }
 
 /// Persist the in-memory BGD table back to disk. The cached array
@@ -414,11 +404,7 @@ pub fn freeBlock(self: *Mount, block_num: u32) bool {
         return false;
     }
     slice[byte_idx] &= ~mask;
-    var s: u32 = 0;
-    while (s < self.sectors_per_block) : (s += 1) {
-        const sec_off: u32 = cache_off_base + s * SECTOR_SIZE;
-        self.write_sector(bitmap_lba + s, @as([*]const u8, @ptrCast(&self.cache_buf[way])) + sec_off);
-    }
+    if (!self.write_sectors(bitmap_lba, @intCast(self.sectors_per_block), @as([*]const u8, @ptrCast(&self.cache_buf[way])) + cache_off_base)) return false;
     bgd.free_blocks_count +%= 1;
     self.sb.free_blocks_count +%= 1;
     if (!writeBgdTable(self)) return false;
@@ -459,11 +445,7 @@ fn allocBlockInGroup(self: *Mount, group: u32) ?u32 {
                 }
                 slice[byte_idx] |= mask;
                 // Persist the bitmap directly from the cache.
-                var s: u32 = 0;
-                while (s < self.sectors_per_block) : (s += 1) {
-                    const sec_off: u32 = cache_off_base + s * SECTOR_SIZE;
-                    self.write_sector(bitmap_lba + s, @as([*]const u8, @ptrCast(&self.cache_buf[way])) + sec_off);
-                }
+                if (!self.write_sectors(bitmap_lba, @intCast(self.sectors_per_block), @as([*]const u8, @ptrCast(&self.cache_buf[way])) + cache_off_base)) return null;
                 bgd.free_blocks_count -|= 1;
                 self.sb.free_blocks_count -|= 1;
                 if (!writeBgdTable(self)) return null;

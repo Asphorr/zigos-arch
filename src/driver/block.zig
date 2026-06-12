@@ -114,6 +114,35 @@ pub fn writeSectorSecondary(lba: u32, src: [*]const u8) void {
     }
 }
 
+/// Multi-sector write to the secondary disk. Returns false on a propagated
+/// write error — only the NVMe backend reports failures (ext2 lives on NVMe
+/// controller #1); ata/ahci loop per-sector and are wrapped as `true`, same
+/// contract as readSectorsSecondary above.
+pub fn writeSectorsSecondary(lba: u32, count: u16, src: [*]const u8) bool {
+    {
+        // Tripwire scans each 512-byte sector independently — same
+        // per-sector semantics as the single-sector entry above.
+        var s: u32 = 0;
+        while (s < count) : (s += 1) {
+            elfWriteTripwire(lba + s, src + s * 512, @returnAddress());
+        }
+    }
+    return switch (backend) {
+        .none => false,
+        .ata => blk: {
+            var i: u32 = 0;
+            while (i < count) : (i += 1) ata.writeSectorSecondary(lba + i, src + i * 512);
+            break :blk true;
+        },
+        .ahci => blk: {
+            var i: u32 = 0;
+            while (i < count) : (i += 1) ahci.writeSectorSecondary(lba + i, src + i * 512);
+            break :blk true;
+        },
+        .nvme => nvme.writeSectorsSecondary(lba, count, src),
+    };
+}
+
 /// [write-tripwire] (2026-06-04) — catch the ext2 on-disk corruptor in the act.
 /// A 512-byte sector carrying a 7-byte ELF header (`7F 45 4C 46 02 01 01`) at a
 /// NON-ZERO offset is a misplaced header: the exact signature of the unsynced

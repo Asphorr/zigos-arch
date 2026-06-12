@@ -2397,6 +2397,23 @@ pub fn writeSectorSecondary(lba: u32, src: [*]const u8) void {
     _ = ioCommand(&controllers[1], IO_WRITE, lba, @intFromPtr(src), 1);
 }
 
+/// Multi-sector write twin of readSectorsSecondary — chunks at
+/// MAX_SECTORS_PER_CMD. ext2's writeBlock/bitmap/superblock paths land
+/// here: a 4 KiB block write is one 8-sector command instead of eight
+/// single-sector round-trips (each a full SQE+doorbell+completion wait).
+pub fn writeSectorsSecondary(lba: u32, count: u16, src: [*]const u8) bool {
+    if (num_controllers < 2) return false;
+    const c = &controllers[1];
+    const total: u32 = if (count == 0) 256 else @as(u32, count);
+    var done: u32 = 0;
+    while (done < total) {
+        const chunk: u32 = @min(total - done, MAX_SECTORS_PER_CMD);
+        if (!ioCommand(c, IO_WRITE, lba + done, @intFromPtr(src) + done * c.block_size, chunk)) return false;
+        done += chunk;
+    }
+    return true;
+}
+
 // =========================================================================
 // Gap #7: TRIM (DSM Deallocate) — tell the SSD's flash translation layer
 // the named LBA range is no longer in use. Big SSD-lifespan and write-
