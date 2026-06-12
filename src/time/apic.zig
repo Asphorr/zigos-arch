@@ -683,6 +683,13 @@ fn startTimer() void {
 // --- Public API ---
 
 pub fn eoi() void {
+    // KVM PV EOI fast path: when the host pre-marked this interrupt as
+    // EOI-elidable (edge-triggered, no IOAPIC notify), claim the per-CPU
+    // flag and skip the register write — saves one vmexit per interrupt.
+    // Level IRQs never get the mark; bare metal / unarmed CPUs fall
+    // through. MUST stay first: claiming and then also writing EOI would
+    // ack the NEXT in-service interrupt.
+    if (@import("../virt/kvm.zig").pvEoiClaimSelf()) return;
     lapicWrite(LAPIC_EOI, 0);
 }
 

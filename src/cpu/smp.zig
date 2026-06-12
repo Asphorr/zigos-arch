@@ -704,6 +704,11 @@ fn apInitPerCpu() u8 {
     // Enable our LAPIC
     apic.initLAPICForAP();
 
+    // Arm KVM PV MSRs (steal time + PV EOI) for this CPU — they're
+    // per-CPU, and on the S3 path this doubles as the RE-arm (S3 reset
+    // them). No-op without KVM.
+    @import("../virt/kvm.zig").enablePerCpuPv(my_id);
+
     // CR0.WP is per-CPU. Without this on APs, kernel-mode writes ignore
     // R/W=0 PTEs, so the MMU write-watch (idt.zig ww_page) only catches
     // BSP-side wild writes. Make it symmetric.
@@ -814,6 +819,12 @@ pub fn reinitForS3Resume() void {
     // and #GP. Enabling the LAPIC this early is safe: IF is still 0 (the wake
     // trampoline cli'd and never sti'd) and the timer isn't armed until the end.
     apic.reinitLapicForS3Resume();
+
+    // Re-arm the BSP's KVM PV MSRs (steal time + PV EOI) — S3 reset them
+    // along with the rest of CPU state. Until this runs, the PV EOI flag
+    // byte just stays 0 and eoi() takes the real-write path (safe). APs
+    // re-arm via the shared apInitPerCpu.
+    @import("../virt/kvm.zig").enablePerCpuPv(0);
 
     // Per-CPU syscall scratch + per-CPU GDT/TSS. Preserve tss.rsp0 (the CURRENT
     // process's kernel stack, set by the last setTssRsp0) across initPerCpuGdt,

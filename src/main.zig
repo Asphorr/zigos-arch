@@ -377,10 +377,12 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     // HvCallFlushVirtualAddressSpace instead of IPI fan-out.
     @import("virt/hyperv.zig").detect();
     @import("virt/hyperv.zig").enableHypercalls();
-    // KVM PV leaf probe (relocated to 0x40000100 when hv-* flags are on).
-    // Detection only — PV EOI / steal time / unhalt activate separately,
-    // each gated on its kvm.has*() getter.
+    // KVM PV leaf probe (relocated to 0x40000100 when hv-* flags are on),
+    // then arm the per-CPU PV areas for the BSP: steal time (ground-truth
+    // host-preemption for perf's stall quarantine) + PV EOI (elides the
+    // EOI vmexit on every edge interrupt). APs arm in apInitPerCpu.
     @import("virt/kvm.zig").detect();
+    @import("virt/kvm.zig").initPerCpuPv();
     if (@import("time/apic.zig").init()) {
         blog.ok("Local APIC + IOAPIC");
     } else {

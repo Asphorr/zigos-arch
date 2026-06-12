@@ -289,6 +289,17 @@ pub fn resetAll() void {
 /// (e.g., a CLI section header). One row per CPU per phase plus the syscall-
 /// num breakdown for syscalls with a nonzero count.
 pub fn dumpAll() void {
+    // Ground-truth host preemption (KVM steal time) — context for the
+    // host_pause / smi_stall rows below: those are guest-side heuristics,
+    // this is the host's own accounting of time it descheduled each vCPU.
+    {
+        const kvm = @import("../virt/kvm.zig");
+        var c: u32 = 0;
+        while (c < @import("../cpu/smp.zig").MAX_CPUS) : (c += 1) {
+            const ns = kvm.stealNs(c);
+            if (ns != 0) serial.print("[perf] steal cpu{d}: {d} ms host-preempted (KVM ground truth)\n", .{ c, ns / 1_000_000 });
+        }
+    }
     serial.print("[perf] {s:11} {s:>3} {s:>10} {s:>14} {s:>11} {s:>10} {s:>6}\n", .{
         "phase", "cpu", "count", "total_cyc", "mean_cyc", "max_cyc", "%wall",
     });
