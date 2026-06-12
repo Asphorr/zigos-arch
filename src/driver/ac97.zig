@@ -183,6 +183,12 @@ pub fn writeSamples(src: [*]const i16, stereo_samples: u32) void {
     playBuffer(stereo_samples);
 }
 
+/// True while playback is live and tick() still has work (the DMA-stop
+/// deadline check). Unlocked read — gates the tickless-idle stretch only.
+pub fn isActive() bool {
+    return playing;
+}
+
 /// Called from IRQ0 — stop DMA when playback duration has elapsed.
 pub fn tick() void {
     if (!playing) return;

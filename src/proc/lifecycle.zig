@@ -507,6 +507,13 @@ fn kernelIdle() callconv(.c) noreturn {
         } else {
             asm volatile ("sti; hlt");
         }
+        // Tickless idle: if the one-shot was stretched while we slept and
+        // the wake came from a device IRQ / kick (not the timer), restore
+        // the 10ms cadence BEFORE scheduling whatever just became
+        // runnable — otherwise it runs up to the full stretch with no
+        // preemption and (on BSP) no wallclock advance. No-op when the
+        // timer itself woke us (its handler already re-armed).
+        @import("../cpu/idt/irq0.zig").shortenAfterIdleWake();
         process.schedule();
     }
 }

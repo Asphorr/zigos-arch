@@ -30,6 +30,17 @@ const hrtimer = @import("../../proc/hrtimer.zig");
 var last_tick_tsc: u64 = 0;
 var tick_tsc_seeded: bool = false;
 
+// Due-ticks for the BSP's periodic jobs. Tickless idle makes tick_count
+// advance in JUMPS (catch-up), so `tick_count % N == 0` can step right
+// over a boundary and silently starve a job — these are compared with >=
+// and re-armed relative to the tick that actually ran them. BSP-only
+// (same single-writer regime as last_tick_tsc above). perf dump starts
+// at 500 so the boot doesn't open with an empty dump.
+var next_backstop_tick: u64 = 10;
+var next_perfdump_tick: u64 = 500;
+var next_kesp_tick: u64 = @import("../../debug/watch.zig").KESP_REROTATE_TICKS;
+var next_lb_tick: u64 = 50;
+
 /// IRQ0 stack-canary magic — pushed below the 15 GPRs at IRQ entry, verified
 /// before iretq. Used by both the isr_irq0 asm (literal embedded for the
 /// pushq immediate / cmpq immediate via comptimePrint) AND
@@ -351,7 +362,12 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
             // would re-admit a stale-key spam window — so this 10 Hz raise is
             // what guarantees the typematic gate reopens ≤100 ms after the op
             // ends. Gating it would wedge auto-repeat closed silently.
-            if (process.tick_count % 10 == 0) {
+            // Due-tick (>=) rather than modulo: tickless idle advances
+            // tick_count in JUMPS (ticksToAdvance catch-up), and a jump
+            // from 9 to 21 skips both %10 boundaries — modulo would
+            // silently starve every periodic job below across idle.
+            if (process.tick_count >= next_backstop_tick) {
+                next_backstop_tick = process.tick_count + 10;
                 const softirq = @import("../../proc/softirq.zig");
                 if (!softirq.raise(.hid)) xhci.pollHID();
                 if (!softirq.raise(.nvme)) @import("../../driver/nvme.zig").tickSweep();
@@ -363,7 +379,8 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
             // Auto-dump perf counters every ~5 seconds (500 ticks at 100Hz). The
             // counters survive the dump (no implicit reset) so the next dump shows
             // accumulated cost since boot. Use `perf reset` from the CLI to zero.
-            if (process.tick_count % 500 == 0 and process.tick_count > 0) {
+            if (process.tick_count >= next_perfdump_tick) {
+                next_perfdump_tick = process.tick_count + 500;
                 @import("../../debug/perf.zig").dumpAll();
             }
 
@@ -373,9 +390,8 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
             // applyLocal at their next IRQ entry. Cadence chosen to avoid
             // IPI-flood heisendetector — see watch.rotateKernelEspWatches docs.
             const watch_mod = @import("../../debug/watch.zig");
-            if (process.tick_count % watch_mod.KESP_REROTATE_TICKS == 0 and
-                process.tick_count > 0)
-            {
+            if (process.tick_count >= next_kesp_tick) {
+                next_kesp_tick = process.tick_count + watch_mod.KESP_REROTATE_TICKS;
                 watch_mod.rotateKernelEspWatches();
             }
 
@@ -383,7 +399,8 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
             // → idlest cpu when delta >= threshold. ~500 ms cadence keeps the
             // overhead minimal while still converging within a few balance
             // rounds after a load shift.
-            if (process.tick_count % 50 == 0 and process.tick_count > 0) {
+            if (process.tick_count >= next_lb_tick) {
+                next_lb_tick = process.tick_count + 50;
                 process.loadBalance();
             }
         }
@@ -496,16 +513,57 @@ fn deliverPendingToReturnFrame(cpu: *@import("../smp.zig").CpuLocal, new_rsp: u6
     signals.deliverFromIrqFrame(pcb, frame);
 }
 
+/// Set when a CPU's one-shot was deliberately stretched past one quantum
+/// (tickless idle). The idle loop's post-wake shorten hook reads it so a
+/// device-IRQ/kick wake mid-stretch restores the 10ms cadence before the
+/// woken task runs. Own-CPU access only; benign race with own IRQ0.
+var timer_long_armed: [@import("../smp.zig").MAX_CPUS]bool =
+    .{false} ** @import("../smp.zig").MAX_CPUS;
+
+/// Quanta until an absolute tick-deadline (1 = due now/overdue —
+/// next fire handles it). Deadline caches hold maxInt when empty, which
+/// just means "no clamp" here.
+inline fn quantaUntil(deadline: u64, tc: u64) u64 {
+    return if (deadline > tc) deadline - tc else 1;
+}
+
 /// Re-arm LAPIC for the right deadline based on what's about to run.
-/// APs running idle sleep ~10x longer (≈100ms) — no useful work to wake for.
-/// Everyone else gets one quantum (≈10ms).
+/// Idle CPUs stretch the one-shot (tickless idle): APs to a flat 10
+/// quanta (no global tick duties); the BSP — which owes wakeExpired /
+/// deliverDueAlarms to every tick-keyed sleeper — to min(10 quanta,
+/// nearest due deadline), and never while a tick-pumped sound effect is
+/// live. Hires usleep deadlines are handled below by armDelta's clamp.
+/// Everyone busy gets one quantum (≈10ms). The 10-quanta cap keeps the
+/// watchdog peer-check, backstop sweeps and load balancer within ~10x
+/// of their normal cadence — degrade, never starve.
 fn rearmTimerForCurrent(cpu: *@import("../smp.zig").CpuLocal) void {
     const quantum = apic.timerQuantum();
-    const is_ap_idle = cpu.cpu_id != 0 and blk: {
+    const cur_is_idle = blk: {
         const cur = cpu.current_pid orelse break :blk false;
         break :blk process.procs[cur].is_idle;
     };
-    const base = if (is_ap_idle) quantum *| 10 else quantum;
+
+    var quanta: u32 = 1;
+    if (cur_is_idle) {
+        if (cpu.cpu_id != 0) {
+            quanta = 10;
+        } else if (!@import("../../driver/sound.zig").needsTick()) {
+            const sched_mod = @import("../../proc/sched.zig");
+            const tc = process.tick_count;
+            var stretch: u64 = 10;
+            const until_wake = quantaUntil(sched_mod.earliest_wake_tick.load(.acquire), tc);
+            if (until_wake < stretch) stretch = until_wake;
+            const until_alarm = quantaUntil(sched_mod.earliest_alarm_tick.load(.acquire), tc);
+            if (until_alarm < stretch) stretch = until_alarm;
+            quanta = @intCast(stretch); // ≤10 by construction
+        }
+    }
+    timer_long_armed[cpu.cpu_id] = quanta > 1;
+    // Tell the stall detector about deliberate stretches — a 100ms gap we
+    // armed ourselves must not read as a fake HOST-L0 stall.
+    if (cpu.cpu_id == 0) @import("../../time/smi.zig").noteArmed(quanta);
+
+    const base = quantum *| quanta;
     // BSP clamps the one-shot to the soonest precise-usleep deadline so it fires
     // exactly when a usleep is due (#1006). Only BSP runs wakeHiresExpired, so
     // only BSP needs the early fire. Gated on TSC-deadline mode: our deadlines
@@ -515,6 +573,20 @@ fn rearmTimerForCurrent(cpu: *@import("../smp.zig").CpuLocal) void {
         return;
     }
     apic.armOneShot(base);
+}
+
+/// Called by the idle loop right after waking (hlt/mwait return), BEFORE
+/// schedule(). If this CPU's one-shot was stretched for tickless idle and
+/// the wake came from a device IRQ or kick rather than the timer itself,
+/// the incoming task would otherwise run up to the full stretch with no
+/// preemption and (on BSP) no wallclock advance. One MSR write, and only
+/// when actually stretched — a timer-driven wake already re-armed via
+/// rearmTimerForCurrent and cleared the flag.
+pub fn shortenAfterIdleWake() void {
+    const cpu = @import("../smp.zig").myCpu();
+    if (!timer_long_armed[cpu.cpu_id]) return;
+    timer_long_armed[cpu.cpu_id] = false;
+    apic.armOneShot(apic.timerQuantum());
 }
 
 // Timer IRQ stub — push 15 GPRs, call handleIRQ0 (context switch),

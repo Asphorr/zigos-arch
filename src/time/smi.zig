@@ -41,6 +41,19 @@ const QUANTUM_MS: u64 = 10;
 // can hit 1-3 ms; SMM stalls start at 5+ ms.
 const STALL_THRESHOLD_PM: u64 = 15 * PM_TMR_HZ / 1000;
 
+/// Largest one-shot interval (in 10ms quanta) armed on the BSP since the
+/// last tick() sample. Tickless idle deliberately stretches the BSP
+/// one-shot (up to 10 quanta); without this the stretched gap reads as a
+/// ~100ms HOST-L0 stall — steal=0, exactly the L0 signature, a fake.
+/// rearmTimerForCurrent + the idle-wake shorten hook report every arm;
+/// tick() raises its stall threshold by the noted stretch and resets to
+/// 1 (the next arm re-notes). BSP-only, like everything in this file.
+var armed_quanta_max: u32 = 1;
+
+pub fn noteArmed(quanta: u32) void {
+    if (quanta > armed_quanta_max) armed_quanta_max = quanta;
+}
+
 var pm_tmr_port: u16 = 0;
 var pm_tmr_mask: u32 = 0;
 var initialized: bool = false;
@@ -134,7 +147,13 @@ pub fn tick() void {
         flushCliHolds(tsc_per_quantum);
     }
 
-    if (delta < STALL_THRESHOLD_PM) return;
+    // Threshold scales with the deliberately-armed interval: a tickless
+    // BSP sleeping 10 quanta produces a 100ms PM gap BY DESIGN — only
+    // time beyond (armed - one quantum) + slop is an anomaly.
+    const pm_per_quantum: u64 = PM_TMR_HZ / 100;
+    const stall_threshold = STALL_THRESHOLD_PM + @as(u64, armed_quanta_max - 1) * pm_per_quantum;
+    armed_quanta_max = 1;
+    if (delta < stall_threshold) return;
     // Atomic store: keyboard.pollRepeat reads this cross-CPU (desktop loop
     // may run on an AP) to quarantine typematic repeat across host pauses.
     // The plain read in the +% is fine — BSP IRQ0 is the ONLY writer, so

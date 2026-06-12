@@ -117,3 +117,15 @@ pub fn tick() void {
         speaker.tick();
     }
 }
+
+/// True when the active backend needs the 10ms tick cadence RIGHT NOW
+/// (something is audibly playing through a tick-pumped path). Gates the
+/// BSP tickless-idle stretch: stretching while AC97 LFO effects or a
+/// speaker note queue is live would distort audio. IRQ-driven backends
+/// (virtio, HDA) never need it. Unlocked heuristic read — worst case is
+/// one stretched-or-not arm decision, self-corrects next fire.
+pub fn needsTick() bool {
+    if (use_ac97) return ac97.isActive();
+    if (!use_virtio and !use_hda) return speaker.isActive();
+    return false;
+}

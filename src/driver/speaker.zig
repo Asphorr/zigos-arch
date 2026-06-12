@@ -58,6 +58,12 @@ fn playSeq(notes: []const Note) void {
     }
 }
 
+/// True while a note queue is mid-playback (tick() still counts beats).
+/// Unlocked read — gates the tickless-idle stretch only.
+pub fn isActive() bool {
+    return queue_len != 0;
+}
+
 /// Called from timer IRQ handler.
 pub fn tick() void {
     if (queue_len == 0) return;
