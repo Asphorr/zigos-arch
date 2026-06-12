@@ -514,6 +514,13 @@ fn kernelIdle() callconv(.c) noreturn {
         // preemption and (on BSP) no wallclock advance. No-op when the
         // timer itself woke us (its handler already re-armed).
         @import("../cpu/idt/irq0.zig").shortenAfterIdleWake();
+        // Parked-desktop instant wake: input IRQs land on the BSP and
+        // break its hlt — hand the event to the desktop NOW, in this
+        // lock-clean context (sched.wake is not IRQ-safe; the idle loop
+        // is the earliest safe point after the IRQ). µs-class input
+        // latency instead of waiting for the next tick. No-op off-BSP
+        // or when the desktop isn't parked/due.
+        @import("../ui/desktop.zig").wakeIfDueFromIdle();
         process.schedule();
     }
 }

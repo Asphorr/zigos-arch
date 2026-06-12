@@ -69,3 +69,10 @@ pub fn consume() void {
     @atomicStore(bool, &wake_pending, false, .release);
     @atomicStore(u64, &self_wake_due_at, 0, .release);
 }
+
+/// Pending self-wake deadline (absolute tick), 0 = none. The desktop's
+/// park path uses it as the wake_tick deadline so wakeExpired brings
+/// the loop back exactly when the next animation/toast frame is due.
+pub fn selfWakeAt() u64 {
+    return @atomicLoad(u64, &self_wake_due_at, .acquire);
+}

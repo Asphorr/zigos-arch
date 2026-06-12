@@ -175,6 +175,7 @@ fn waitKindName(k: process.WaitKind) []const u8 {
         .iouring_work => "iouring_work",
         .iouring_cq => "iouring_cq",
         .softirq => "softirq",
+        .desktop => "desktop",
     };
 }
 
@@ -213,6 +214,7 @@ fn dumpResourceState(pid: usize, kind: process.WaitKind, target: u32) void {
         .iouring_work => serial.print("  iouring_work instance={d} (worker idle, wake from io_uring_enter or NVMe IRQ callback)\n", .{target}),
         .iouring_cq => serial.print("  iouring_cq instance={d} (enter() parked, wake from worker after CQE)\n", .{target}),
         .softirq => serial.print("  softirq cpu={d} — ksoftirqd idle (no bottom-half pending)\n", .{target}),
+        .desktop => serial.print("  desktop parked (no wake source due; wakers: idle-loop, IRQ0 due-check, wakeExpired backstop)\n", .{}),
     }
 }
 

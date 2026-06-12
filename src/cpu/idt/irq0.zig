@@ -318,6 +318,24 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
         if (n_ticks > 0) {
             process.tick_count += n_ticks;
             bisectPoint("after tick++", frame_for_validate, irq_snap);
+            // Parked-desktop due-check, BEFORE wakeExpired so the wake
+            // lands THIS fire (not 10ms later): input/self-wake sources
+            // that don't call sched.wake() (keyboard ring, mouse.moved,
+            // wake.requestWake from other tasks) become visible here.
+            // Same store pattern as the virtio-gpu IRQ waker — wake_tick
+            // to "now" + wake_pending + deadline registration; the
+            // battle-tested wakeExpired transition does the setState.
+            {
+                const desktop_mod = @import("../../ui/desktop.zig");
+                if (desktop_mod.desktopParkedAndDue()) {
+                    if (desktop_mod.desktopPid()) |dp| {
+                        const dpcb = process.getPCB(dp);
+                        @atomicStore(u64, &dpcb.wake_tick, process.tick_count, .release);
+                        @atomicStore(bool, &dpcb.wake_pending, true, .release);
+                        @import("../../proc/sched.zig").registerWakeDeadline(process.tick_count);
+                    }
+                }
+            }
             process.wakeExpired();
             bisectPoint("after wakeExpired", frame_for_validate, irq_snap);
             process.deliverDueAlarms();

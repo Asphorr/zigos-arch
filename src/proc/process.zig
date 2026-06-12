@@ -159,6 +159,7 @@ pub const WaitKind = enum(u8) {
     iouring_work, // wait_target = io_uring instance index. Worker task idles here; both io_uring_enter (fresh SQEs) and the NVMe IRQ callback (in-flight completion) wake the matching worker.
     iouring_cq, // wait_target = io_uring instance index. io_uring_enter parks here when caller asked for min_complete > 0; worker wakes it after writing each CQE.
     softirq, // wait_target = cpu_id. This CPU's ksoftirqd parks here when its softirq_pending mask is empty; softirq.raise wakes it by pid (target is informational only).
+    desktop, // wait_target = 0. The desktop task parks here when wake.isDue() + all input checks are idle; woken by the BSP idle loop (instant, input path), the IRQ0 due-check (≤10ms backstop), or wakeExpired at its self-wake deadline.
 };
 
 // Per-fd table entry. All fields are owner-pid only — fd_table lives on

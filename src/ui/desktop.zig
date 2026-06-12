@@ -2723,6 +2723,7 @@ pub fn taskEntry() callconv(.c) noreturn {
 
 pub fn run() void {
     @import("../cpu/smp.zig").assertBSP("desktop.run");
+    if (@import("../cpu/smp.zig").myCpu().current_pid) |p| desktop_pid = @intCast(p);
     debug.klog("[desktop] Starting graphical desktop...\n", .{});
 
     // Register the back-buffer reclaim callback with PMM. When an
@@ -2953,9 +2954,12 @@ pub fn run() void {
         // exec'd a child that exited but the shell got distracted).
         process.maybeReapZombies();
         // Yield to Ring 3 scheduler — processes run preemptively until
-        // the timer decides the desktop needs attention (input, periodic render)
+        // the timer decides the desktop needs attention (input, periodic
+        // render). When NOTHING is due, parkOrYield blocks this task
+        // instead, letting the BSP reach its idle PCB (hlt + tickless
+        // stretch) — see the parking block comment near `parked`.
         last_desktop_tick = process.tick_count;
-        yieldToScheduler();
+        parkOrYield();
 
         // Apply config changes from settings app
         if (config_changed) {
@@ -4081,6 +4085,87 @@ pub fn getWindowAllocSize(pid: u8, buf: [*]u32) void {
 // --- Preemptive multitasking ---
 
 pub var active: bool = false;
+
+// --- Desktop parking (the BSP-spin fix, 2026-06-12) -----------------
+//
+// The desktop is an ordinary .interactive kernel task that historically
+// NEVER blocked: its loop ran schedule(), and with no ready user task
+// pickNext handed the CPU straight back — an eternal spin that burned
+// ~98% of a host core at an idle desktop (measured via host-side
+// pidstat; invisible to the in-OS meter because the spin owned the CPU
+// it was sampled from). parkOrYield() makes the loop BLOCK on
+// .desktop when nothing is due, so pickNext falls through to the idle
+// PCB → hlt/mwait → the tickless BSP stretch finally engages.
+//
+// Wake paths, fastest first:
+//   1. BSP idle loop (wakeIfDueFromIdle): an input IRQ breaks hlt, the
+//      idle loop re-checks shouldResumeDesktop() in a lock-clean
+//      context and sched.wake()s us — µs latency on keystrokes/mouse.
+//   2. IRQ0 tick block due-check (irq0.zig): catches wake sources that
+//      arrived while a USER task was running (no idle transition) —
+//      ≤10ms, same as the pre-parking force_yield cadence.
+//   3. wakeExpired at wake_tick: the pending self-wake deadline
+//      (animations, toast) or the 1s liveness backstop (menubar clock,
+//      zombie reaper).
+
+/// PCB pid of the desktop task; captured at run() entry. null until then.
+var desktop_pid: ?u8 = null;
+/// True while the desktop task is blocked in parkOrYield. Read by the
+/// IRQ0 due-check and the idle-loop waker (both BSP-local).
+var parked: bool = false;
+
+pub fn desktopParkedAndDue() bool {
+    if (!@atomicLoad(bool, &parked, .acquire)) return false;
+    return shouldResumeDesktop();
+}
+
+pub fn desktopPid() ?u8 {
+    return desktop_pid;
+}
+
+/// Called from the BSP idle loop right after an IRQ broke hlt/mwait:
+/// if the desktop is parked and something is now due, wake it here in a
+/// lock-clean context (sched.wake is NOT IRQ-safe, but idle-loop is).
+pub fn wakeIfDueFromIdle() void {
+    if (@import("../cpu/smp.zig").myCpu().cpu_id != 0) return;
+    if (!desktopParkedAndDue()) return;
+    if (desktop_pid) |dp| @import("../proc/sched.zig").wake(dp);
+}
+
+/// Liveness backstop when no self-wake is pending: 1 s. Covers slow
+/// periodic housekeeping (menubar clock repaint, zombie reaping) if
+/// every event-driven wake source goes quiet.
+const PARK_BACKSTOP_TICKS: u64 = 100;
+
+/// The desktop loop's yield point. Anything due → plain yield (user
+/// tasks run; the timer's force_yield/shouldResumeDesktop brings us
+/// back, exactly as before). Nothing due → BLOCK until a wake path
+/// fires. wake_tick is set BEFORE blockOn so a wakeExpired deadline
+/// can't be missed; blockOn's wake_pending handshake covers racing
+/// sched.wake() calls.
+fn parkOrYield() void {
+    if (shouldResumeDesktop()) {
+        yieldToScheduler();
+        return;
+    }
+    const cpu = @import("../cpu/smp.zig").myCpu();
+    const me: usize = cpu.current_pid orelse {
+        yieldToScheduler();
+        return;
+    };
+    const sched = @import("../proc/sched.zig");
+    const pcb = process.getPCB(me);
+    const self_due = wake.selfWakeAt();
+    const deadline: u64 = if (self_due != 0) self_due else process.tick_count + PARK_BACKSTOP_TICKS;
+    @atomicStore(u64, &pcb.wake_tick, deadline, .release);
+    sched.registerWakeDeadline(deadline);
+    @atomicStore(bool, &parked, true, .release);
+    sched.blockOn(.desktop, 0);
+    @atomicStore(bool, &parked, false, .release);
+    // wake_tick is one-shot; clear so a stale deadline can't re-trip the
+    // orphan-sleep diagnostics on a future unrelated park.
+    @atomicStore(u64, &pcb.wake_tick, 0, .release);
+}
 
 // Desktop update interval: timer returns control every N ticks (~50fps at 100Hz)
 var last_desktop_tick: u64 = 0;
