@@ -32,6 +32,7 @@ const io = @import("../io.zig");
 const exectrail = @import("../debug/exectrail.zig");
 const symbols = @import("../debug/symbols.zig");
 const spinlock = @import("../proc/spinlock.zig");
+const kvm = @import("../virt/kvm.zig");
 
 const PM_TMR_HZ: u64 = 3_579_545;
 const QUANTUM_MS: u64 = 10;
@@ -57,6 +58,9 @@ pub var stall_win_end_tsc: u64 = 0;
 
 var last_pm: u32 = 0;
 var sample_count: u64 = 0;
+/// KVM steal-time reading at the previous tick (ns); 0 = not sampled yet.
+/// BSP-only like everything here (tick() is BSP IRQ0).
+var last_steal_ns: u64 = 0;
 pub var stall_events: u64 = 0;
 /// Subset of stall_events with duration ≥ BIG_STALL_US — the only stalls
 /// that can swallow a key-release long enough to fabricate a phantom
@@ -108,6 +112,17 @@ pub fn tick() void {
     }
     const delta = pmDelta(last_pm, now);
     last_pm = now;
+
+    // KVM steal across this tick window. Sampled EVERY tick so a stall
+    // tick's delta spans exactly its gap — the ground truth that splits
+    // host pauses into layers: steal covering the gap = L1 (zigvm's
+    // scheduler descheduled our vCPU thread); steal ≈ 0 with a big gap =
+    // L0 (Hyper-V paused all of zigvm — invisible to KVM's accounting,
+    // no L1 runqueue wait ever happens). Cheap: seqlock read of a
+    // guest-RAM struct, no exit. 0 on bare metal / pre-arm.
+    const cur_steal_ns = kvm.stealNs(@import("../cpu/smp.zig").myCpu().cpu_id);
+    const steal_delta_ns = if (last_steal_ns == 0) 0 else cur_steal_ns -% last_steal_ns;
+    last_steal_ns = cur_steal_ns;
 
     const tsc_per_quantum = apic.tscPerQuantum();
     var now_tsc: u64 = 0;
@@ -173,7 +188,7 @@ pub fn tick() void {
     // exectrail.recordIrq()). The verdict is decided by cli_us — an ACTUAL
     // recorded cli-hold — not guessed from prev_rip; prev_rip is only
     // context for where a host pause happened to sample us.
-    classifyAndLog(us, cli_us, cli_ra, cli_vm_frozen);
+    classifyAndLog(us, cli_us, cli_ra, cli_vm_frozen, steal_delta_ns / 1000);
 }
 
 inline fn rdtsc() u64 {
@@ -271,8 +286,23 @@ const KERNEL_HIGH_HALF: u64 = 0xFFFF800000000000;
 // then the corroboration rework still mislabeled host-freezes-inside-cli as
 // OURS because the TSC counts through a freeze. cli_ra is the hold's
 // acquire site = the authoritative location.
-fn classifyAndLog(us: u64, cli_us: u64, cli_ra: u64, cli_vm_frozen: bool) void {
+fn classifyAndLog(us: u64, cli_us: u64, cli_ra: u64, cli_vm_frozen: bool, steal_us: u64) void {
     const accounted = cli_us != 0 and cli_us * 2 >= us;
+
+    // Layer split for host verdicts, from KVM's own accounting (ground
+    // truth, not a heuristic): steal covering ≥half the gap = the L1
+    // zigvm scheduler descheduled our vCPU thread; steal ≈ 0 against a
+    // big gap = L0 Hyper-V paused all of zigvm (KVM never sees a runqueue
+    // wait, so steal stays flat — the 2026-06-12 52ms-steal-vs-307ms-stall
+    // decomposition). "HOST?" when steal isn't armed (bare metal: PM_TMR
+    // gaps there are real SMIs, which steal can't speak to either way).
+    const steal_armed = last_steal_ns != 0;
+    const host_tag: []const u8 = if (!steal_armed)
+        "HOST?"
+    else if (steal_us * 2 >= us)
+        "HOST-L1 (zigvm steal)"
+    else
+        "HOST-L0 (hypervisor pause)";
 
     if (accounted) {
         if (cli_vm_frozen) {
@@ -280,26 +310,30 @@ fn classifyAndLog(us: u64, cli_us: u64, cli_ra: u64, cli_vm_frozen: bool) void {
             // through it (vm_alive_pulse unchanged): the host froze us
             // INSIDE the cli window. Freeze time, not kernel work.
             if (symbols.resolveKernel(cli_ra)) |r| {
-                debug.klog("[smi] stall: {d}us — HOST (froze {d}us inside cli window at {s}+0x{X}; VM silent) — events={d} max={d}us\n", .{ us, cli_us, r.name, r.offset, stall_events, max_stall_us });
+                debug.klog("[smi] stall: {d}us — {s} (froze {d}us inside cli window at {s}+0x{X}; VM silent; steal={d}us) — events={d} max={d}us\n", .{ us, host_tag, cli_us, r.name, r.offset, steal_us, stall_events, max_stall_us });
             } else {
-                debug.klog("[smi] stall: {d}us — HOST (froze {d}us inside cli window at ra=0x{X:0>16}; VM silent) — events={d} max={d}us\n", .{ us, cli_us, cli_ra, stall_events, max_stall_us });
+                debug.klog("[smi] stall: {d}us — {s} (froze {d}us inside cli window at ra=0x{X:0>16}; VM silent; steal={d}us) — events={d} max={d}us\n", .{ us, host_tag, cli_us, cli_ra, steal_us, stall_events, max_stall_us });
             }
             return;
         }
+        // OURS — but a nonzero steal here means the hold itself was
+        // stretched by L1 preemption mid-window; the printed steal lets
+        // the reader subtract before blaming the acquire site.
         if (symbols.resolveKernel(cli_ra)) |r| {
-            debug.klog("[smi] stall: {d}us — OURS (cli-hold {d}us at {s}+0x{X}) — events={d} max={d}us\n", .{ us, cli_us, r.name, r.offset, stall_events, max_stall_us });
+            debug.klog("[smi] stall: {d}us — OURS (cli-hold {d}us at {s}+0x{X}; steal={d}us) — events={d} max={d}us\n", .{ us, cli_us, r.name, r.offset, steal_us, stall_events, max_stall_us });
         } else {
-            debug.klog("[smi] stall: {d}us — OURS (cli-hold {d}us at ra=0x{X:0>16}) — events={d} max={d}us\n", .{ us, cli_us, cli_ra, stall_events, max_stall_us });
+            debug.klog("[smi] stall: {d}us — OURS (cli-hold {d}us at ra=0x{X:0>16}; steal={d}us) — events={d} max={d}us\n", .{ us, cli_us, cli_ra, steal_us, stall_events, max_stall_us });
         }
         return;
     }
 
-    // No cli-hold accounts for the gap → host vCPU pause. Report WHERE cpu0
-    // was sampled (prev_rip) as context, plus cli-acct (the largest hold we
-    // did see, ~0) to make the "nothing actually held cli" basis explicit.
+    // No cli-hold accounts for the gap → host pause; host_tag carries the
+    // L0/L1 layer verdict. Report WHERE cpu0 was sampled (prev_rip) as
+    // context, plus cli-acct (the largest hold we did see, ~0) to make
+    // the "nothing actually held cli" basis explicit.
     const prev_rip_opt = exectrail.peekHeadMinusOne(0);
     if (prev_rip_opt == null) {
-        debug.klog("[smi] stall: {d}us — likely HOST (vCPU pause; cli-acct={d}us) — no trail (events={d} max={d}us)\n", .{ us, cli_us, stall_events, max_stall_us });
+        debug.klog("[smi] stall: {d}us — {s} (steal={d}us cli-acct={d}us) — no trail (events={d} max={d}us)\n", .{ us, host_tag, steal_us, cli_us, stall_events, max_stall_us });
         return;
     }
     const prev_rip = prev_rip_opt.?;
@@ -309,13 +343,13 @@ fn classifyAndLog(us: u64, cli_us: u64, cli_ra: u64, cli_vm_frozen: bool) void {
     // CPU was mid-syscall when the pause began.
     if (prev_rip >= exectrail.MARKER_BASE and prev_rip < KERNEL_HIGH_HALF) {
         const sys_num = prev_rip & 0xFFFF;
-        debug.klog("[smi] stall: {d}us — likely HOST (vCPU pause; was in sc#{d}, cli-acct={d}us) — events={d} max={d}us\n", .{ us, sys_num, cli_us, stall_events, max_stall_us });
+        debug.klog("[smi] stall: {d}us — {s} (was in sc#{d}; steal={d}us cli-acct={d}us) — events={d} max={d}us\n", .{ us, host_tag, sys_num, steal_us, cli_us, stall_events, max_stall_us });
         return;
     }
 
     // User-space RIP — IRQs were unmasked, so it can't be our cli-hold → host.
     if (prev_rip < KERNEL_HIGH_HALF) {
-        debug.klog("[smi] stall: {d}us — likely HOST (user RIP 0x{X:0>16}) — events={d} max={d}us\n", .{ us, prev_rip, stall_events, max_stall_us });
+        debug.klog("[smi] stall: {d}us — {s} (user RIP 0x{X:0>16}; steal={d}us) — events={d} max={d}us\n", .{ us, host_tag, prev_rip, steal_us, stall_events, max_stall_us });
         return;
     }
 
@@ -325,9 +359,9 @@ fn classifyAndLog(us: u64, cli_us: u64, cli_ra: u64, cli_vm_frozen: bool) void {
         const is_idle = std.mem.indexOf(u8, r.name, "idle") != null or
             std.mem.indexOf(u8, r.name, "Idle") != null;
         const why = if (is_idle) "kernel idle/hlt" else "vCPU pause";
-        debug.klog("[smi] stall: {d}us — likely HOST ({s}; was at {s}+0x{X}, cli-acct={d}us) — events={d} max={d}us\n", .{ us, why, r.name, r.offset, cli_us, stall_events, max_stall_us });
+        debug.klog("[smi] stall: {d}us — {s} ({s}; was at {s}+0x{X}; steal={d}us cli-acct={d}us) — events={d} max={d}us\n", .{ us, host_tag, why, r.name, r.offset, steal_us, cli_us, stall_events, max_stall_us });
     } else {
-        debug.klog("[smi] stall: {d}us — likely HOST (vCPU pause; kernel RIP 0x{X:0>16} unresolved, cli-acct={d}us) — events={d} max={d}us\n", .{ us, prev_rip, cli_us, stall_events, max_stall_us });
+        debug.klog("[smi] stall: {d}us — {s} (kernel RIP 0x{X:0>16} unresolved; steal={d}us cli-acct={d}us) — events={d} max={d}us\n", .{ us, host_tag, prev_rip, steal_us, cli_us, stall_events, max_stall_us });
     }
 }
 
