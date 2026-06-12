@@ -83,8 +83,11 @@ var msix_entry_addr: usize = 0;
 /// (used_idx advance) happens in the next iteration of sendCmd's
 /// `sti; hlt` loop. Same shape as `nvmeIrqHandler`.
 /// MSI-X target landing breakdown (read at any time via virtioGpuIrqStats).
-/// Even with `retargetEntry` writing the correct destination APIC ID,
-/// QEMU/KVM/Hyper-V routes all virtio-gpu MSI-X to cpu0 in practice.
+/// Delivery follows the table entry exactly — verified 2026-06-11 by arming
+/// the entry at APIC 1: dynirq on cpu1 tracked flush_rect 1:1 while cpu0
+/// stayed frozen. The old "everything lands on cpu0" reading was a confound:
+/// the async path never retargets (entry stays at the arm-time dest=0) and
+/// sync submitters run on the BSP, so every IRQ was *aimed* at cpu0.
 /// Kept as a counter (not periodic log) so the CLI can sample on demand.
 /// Sized to smp.MAX_CPUS so we don't silently truncate IRQ counts on
 /// CPUs ≥ 4 (was hardcoded [4]u64 — gap #15).
@@ -745,7 +748,7 @@ fn sendCmdViaPhys(cmd_len: u32, resp_len: u32) bool {
     // Re-target MSI-X to the calling CPU's APIC ID BEFORE notifying the
     // host. Hyper-V halts a vCPU while it's in HLT — virtual LAPIC stops
     // ticking, so the only thing that wakes our `sti; hlt` is the actual
-    // completion IRQ. If MSI-X is hardwired to cpu0 and we're waiting on
+    // completion IRQ. If MSI-X is aimed at another CPU while we wait on
     // cpu1, the wake never arrives directly; cube only resumes when some
     // other CPU IPIs/NMIs cpu1 (e.g. spinlock NMI broadcast at ~50ms),
     // so wait_ms ends up dominated by that side-channel rather than real
@@ -1340,8 +1343,8 @@ fn copyRectToStaging(x0: u32, y0: u32, x1: u32, y1: u32) void {
 /// Stage + submit a cmd pair WITHOUT waiting. Caller holds ctrl_lock and
 /// has ensured nothing is outstanding (reapAsyncFlushLocked returned true).
 /// Same staging/descriptor dance as sendSimpleCmdPair minus the wait; no
-/// MSI-X retarget (the reap runs wherever ksoftirqd picks it up — QEMU
-/// routes virtio-gpu MSI-X to cpu0 in practice anyway).
+/// MSI-X retarget (the reap runs wherever ksoftirqd picks it up, so
+/// steering the completion IRQ buys nothing here).
 fn submitPairAsyncLocked(
     cmd0_buf: [*]const u8,
     cmd0_len: u32,
