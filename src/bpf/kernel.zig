@@ -33,7 +33,10 @@
 const std = @import("std");
 const insn = @import("insn.zig");
 const vm = @import("vm.zig");
+const verifier = @import("verifier.zig");
 const process = @import("../proc/process.zig");
+const spinlock = @import("../proc/spinlock.zig");
+const serial = @import("../debug/serial.zig");
 
 /// Hook context handed to syscall-entry programs, read-only. Field order is
 /// ABI for the programs below — extend by APPENDING (programs address it by
@@ -76,6 +79,32 @@ const HELPERS = [_]?vm.HelperFn{
     helperCountPid, // 1: count(pid) -> 0 ok, 1 rejected
 };
 
+// === verifier contract (M3a) ===
+// The STATIC mirror of the run-time Env above: the program's ctx is a read-only
+// SyscallCtx, and helper id 1 reads one argument (the pid). verify() uses this
+// to prove a loaded program can only ever touch this region and call these
+// helpers — before it is allowed anywhere near the syscall path. Helper id 0
+// stays unregistered here too, so the two views agree on what a valid CALL is.
+const VERIFIER_HELPERS = [_]?verifier.HelperSig{
+    null, // 0: reserved — must stay unregistered
+    .{ .n_args = 1 }, // 1: count(pid)
+};
+const BUILTIN_CFG = verifier.Config{
+    .ctx_len = @sizeOf(SyscallCtx),
+    .ctx_writable = false,
+    .helpers = &VERIFIER_HELPERS,
+};
+
+/// Serializes verify()'s module-static analysis scratch (see verifier.zig's
+/// NOT-REENTRANT note). Today only init() takes it, once, at boot — but it is
+/// the chokepoint a future sys_bpf load path shares. Leaf lock, never from IRQ.
+var verify_lock: spinlock.SpinLock = .{};
+
+/// Set true once the builtin passes verification at init(); surfaced on
+/// /proc/bpf. If the builtin ever FAILS to verify, the hook is force-disabled —
+/// an unverified program must never run on the syscall path.
+pub var builtin_verified: bool = false;
+
 // === the builtin program ===
 // Assembled at comptime from the same builders the harness uses — the ISA
 // is dogfooded, not bypassed. Logic:
@@ -92,6 +121,31 @@ const BUILTIN_PROG = [_]insn.Insn{
     insn.mov64Imm(0, 0),
     insn.exit(),
 };
+
+// === load-time verification (M3a) ===
+
+/// Verify a program through the serialized verifier — the gated entry point a
+/// future sys_bpf load path shares with init().
+fn verifyProgram(prog: []const insn.Insn, cfg: verifier.Config) verifier.VerifyError!void {
+    verify_lock.acquire();
+    defer verify_lock.release();
+    return verifier.verify(prog, cfg);
+}
+
+/// Verify the builtin at boot — called from kmain before the first syscall can
+/// fire. Proves the dogfood in the live FREESTANDING kernel (not just under the
+/// off-target harness) and refuses to run it if it somehow fails to verify, so
+/// the program on the syscall path is always one the verifier has approved.
+pub fn init() void {
+    if (verifyProgram(&BUILTIN_PROG, BUILTIN_CFG)) |_| {
+        builtin_verified = true;
+        serial.print("[zbpf] verifier: builtin verified OK ({d} insns)\n", .{BUILTIN_PROG.len});
+    } else |e| {
+        builtin_verified = false;
+        enabled = false;
+        serial.print("[zbpf] verifier: builtin FAILED ({s}) — syscall hook DISABLED\n", .{@errorName(e)});
+    }
+}
 
 // === the hook ===
 
@@ -128,6 +182,7 @@ pub fn onSyscallEnter(sys_num: u32) void {
 pub fn renderProc(buf: []u8) usize {
     var n: usize = 0;
     n += fmt(buf[n..], "zbpf: syscall-entry hook (builtin counter, {d} insns)\n", .{BUILTIN_PROG.len});
+    n += fmt(buf[n..], "verifier: builtin {s} (M3a: structural + DAG + memory-safety)\n", .{if (builtin_verified) "VERIFIED" else "UNVERIFIED"});
     n += fmt(buf[n..], "enabled: {}\nruns:    {d}\nerrors:  {d}", .{ @atomicLoad(bool, &enabled, .acquire), run_count, err_count });
     if (last_err) |e| {
         n += fmt(buf[n..], " (last: {s})", .{@errorName(e)});

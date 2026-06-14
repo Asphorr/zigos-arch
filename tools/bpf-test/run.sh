@@ -13,7 +13,9 @@ ZIG="${ZIG:-zig}"
 mkdir -p "$HERE/src/bpf"
 cp "$HERE/../../src/bpf/insn.zig" "$HERE/src/bpf/insn.zig"
 cp "$HERE/../../src/bpf/vm.zig" "$HERE/src/bpf/vm.zig"
+cp "$HERE/../../src/bpf/verifier.zig" "$HERE/src/bpf/verifier.zig"
 
 cd "$HERE"
-"$ZIG" test test.zig
+"$ZIG" test test.zig        # interpreter (M1)
+"$ZIG" test verify_test.zig # verifier   (M3a)
 echo "EXIT=$?"

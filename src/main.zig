@@ -617,6 +617,11 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     //            miss, set eviction frees the victim frame, refcount pinning
     //            prevents eviction, no frame leak — see
     //            src/test/page_cache_selftest.zig)
+    //   15     → zBPF verifier self-test (bpf/verifier.zig in the freestanding
+    //            kernel: accepts the builtin + pointer-arith + branch joins,
+    //            rejects loops / OOB / uninit / r10-write / bad helper / atomics
+    //            — the in-kernel mirror of tools/bpf-test/verify_test.zig; see
+    //            src/test/bpf_verifier_selftest.zig)
     const desktop_mod = @import("ui/desktop.zig");
     // Read from the module global (set in line 118) rather than the
     // function-parameter pointer. The boot_info struct lives in a
@@ -625,6 +630,13 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     // 0 here despite the early-kmain log showing the right value. Closes
     // project_mode5_dispatch_mystery.md.
     const live_mode = boot_info_mod.boot_mode;
+
+    // Verify the zBPF builtin in the live kernel before any syscall can run it
+    // (M3a). Off-target the harness proves the verifier's logic; this proves the
+    // same code compiled freestanding accepts our own program, and gates the
+    // syscall hook on that result. Logs "[zbpf] verifier: builtin verified OK".
+    @import("bpf/kernel.zig").init();
+
     const entry: usize = switch (live_mode) {
         3 => @intFromPtr(&@import("test/stress_kstack.zig").taskEntry),
         4 => @intFromPtr(&@import("test/stress_iretq.zig").taskEntry),
@@ -637,6 +649,7 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
         12 => @intFromPtr(&@import("test/stress_pmm.zig").taskEntry),
         13 => @intFromPtr(&@import("test/witness_selftest.zig").taskEntry),
         14 => @intFromPtr(&@import("test/page_cache_selftest.zig").taskEntry),
+        15 => @intFromPtr(&@import("test/bpf_verifier_selftest.zig").taskEntry),
         // Mode 9 (GPU compositor) boots the regular desktop; the desktop
         // detects boot_mode==9 and spawns ui/gpu_compositor.zig as a
         // side-by-side kernel task so they share one screen.
