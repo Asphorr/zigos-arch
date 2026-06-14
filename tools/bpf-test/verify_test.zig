@@ -159,14 +159,35 @@ test "reject: write to the read-only frame pointer r10" {
     try expectError(error.WriteToR10, ok(&prog));
 }
 
-test "reject: backward jump (loop)" {
+// --- M4 loops: back-edges are now allowed, but must provably terminate ---
+
+test "accept (M4): a bounded counted loop" {
     const prog = [_]i.Insn{
-        i.mov64Imm(0, 0),
-        i.alu64Imm(.add, 0, 1),
-        i.ja(-2), // back to the add → cycle
+        i.mov64Imm(0, 0), // r0 = 0
+        i.jmpImm(.jge, 0, 5, 2), // L: if r0 >= 5 goto E
+        i.alu64Imm(.add, 0, 1), //    r0 += 1
+        i.ja(-3), //    goto L
+        i.exit(), // E: exit
+    };
+    try ok(&prog); // unrolls r0 = 0..5, exit edge fires — provably terminates
+}
+
+test "reject (M4): an infinite self-loop is UnboundedLoop" {
+    const prog = [_]i.Insn{
+        i.ja(-1), // jumps to itself with an unchanging state
         i.exit(),
     };
-    try expectError(error.BackEdge, ok(&prog));
+    try expectError(error.UnboundedLoop, ok(&prog));
+}
+
+test "reject (M4): a counter that never reaches an exit is TooComplex" {
+    const prog = [_]i.Insn{
+        i.mov64Imm(0, 0),
+        i.alu64Imm(.add, 0, 1), // r0 grows forever; state never repeats
+        i.ja(-2), // ... so it is rejected only when it exhausts the step budget
+        i.exit(),
+    };
+    try expectError(error.TooComplex, ok(&prog));
 }
 
 test "reject: jump target out of range" {

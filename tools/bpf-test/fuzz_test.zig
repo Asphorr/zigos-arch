@@ -75,6 +75,14 @@ fn gen(r: std.Random, buf: *[MAXLEN]i.Insn) usize {
     while (pc < len) {
         const room = len - pc - 1; // instructions after this one
         const fwd: i16 = if (room == 0) 0 else @intCast(r.intRangeAtMost(usize, 0, room - 1));
+        // A jump displacement that is forward ~half the time and BACKWARD the
+        // rest (a loop) — this is what exercises the M4 path simulator: most
+        // back-edges are infinite (rejected fast as UnboundedLoop / by budget),
+        // and any that the verifier ACCEPTS must still run + terminate below.
+        const jdisp: i16 = if (pc > 0 and r.boolean())
+            @intCast(@as(i64, @intCast(r.intRangeAtMost(usize, 0, pc))) - @as(i64, @intCast(pc)) - 1)
+        else
+            fwd;
         const small_off: i16 = @intCast(r.intRangeAtMost(i32, -16, 16));
         const small_imm: i32 = r.intRangeAtMost(i32, -64, 64);
 
@@ -91,9 +99,9 @@ fn gen(r: std.Random, buf: *[MAXLEN]i.Insn) usize {
             5 => buf[pc] = i.ldx(aSize(r), dstReg(r), anyReg(r), small_off),
             6 => buf[pc] = i.st(aSize(r), anyReg(r), small_off, small_imm),
             7 => buf[pc] = i.stx(aSize(r), anyReg(r), anyReg(r), small_off),
-            8 => buf[pc] = i.jmpImm(jmpCode(r), dstReg(r), small_imm, fwd),
-            9 => buf[pc] = i.jmpReg(jmpCode(r), anyReg(r), anyReg(r), fwd),
-            10 => buf[pc] = i.ja(fwd),
+            8 => buf[pc] = i.jmpImm(jmpCode(r), dstReg(r), small_imm, jdisp),
+            9 => buf[pc] = i.jmpReg(jmpCode(r), anyReg(r), anyReg(r), jdisp),
+            10 => buf[pc] = i.ja(jdisp),
             11 => buf[pc] = i.call(r.intRangeAtMost(i32, 0, 2)),
             12 => {
                 if (pc + 1 < len - 1) { // LD_IMM64 needs two slots before the EXIT

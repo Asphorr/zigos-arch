@@ -116,9 +116,23 @@ pub fn taskEntry() callconv(.c) noreturn {
         const p = [_]insn.Insn{ insn.mov64Imm(10, 0), insn.exit() };
         reject(&p, error.WriteToR10, "write to frame pointer r10");
     }
-    {
+    { // M4: a bounded counted loop provably terminates -> accepted
+        const p = [_]insn.Insn{
+            insn.mov64Imm(0, 0), // r0 = 0
+            insn.jmpImm(.jge, 0, 5, 2), // L: if r0 >= 5 goto E
+            insn.alu64Imm(.add, 0, 1), //    r0 += 1
+            insn.ja(-3), //    goto L
+            insn.exit(), // E:
+        };
+        accept(&p, "M4 bounded counted loop");
+    }
+    { // M4: an infinite self-loop is caught as a non-progressing cycle
+        const p = [_]insn.Insn{ insn.ja(-1), insn.exit() };
+        reject(&p, error.UnboundedLoop, "M4 infinite self-loop");
+    }
+    { // M4: an unbounded-growth loop exhausts the budget
         const p = [_]insn.Insn{ insn.mov64Imm(0, 0), insn.alu64Imm(.add, 0, 1), insn.ja(-2), insn.exit() };
-        reject(&p, error.BackEdge, "backward jump (loop)");
+        reject(&p, error.TooComplex, "M4 unbounded growth loop");
     }
     {
         const p = [_]insn.Insn{ insn.st(.dw, 10, 0, 0), insn.exit() };
@@ -148,7 +162,7 @@ pub fn taskEntry() callconv(.c) noreturn {
     }
 
     if (fail_count == 0) {
-        serial.print("[zbpf-vrf] PASS — all {d} checks green (accept builtin/ptr-arith/join/M3b-mask/M3b-narrow; reject uninit/r10/loop/OOB-stack/OOB-ctx/RO/scalar/helper/atomic)\n", .{pass_count});
+        serial.print("[zbpf-vrf] PASS — all {d} checks green (accept builtin/ptr-arith/join/M3b-mask/M3b-narrow/M4-loop; reject uninit/r10/OOB-stack/OOB-ctx/RO/scalar/helper/atomic/M4-infinite/M4-toobig)\n", .{pass_count});
     } else {
         serial.print("[zbpf-vrf] FAIL — {d} of {d} checks failed (see [zbpf-vrf] FAIL lines above)\n", .{ fail_count, pass_count + fail_count });
     }
