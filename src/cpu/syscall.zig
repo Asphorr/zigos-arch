@@ -343,6 +343,7 @@ const SYSCALLS = [_]SyscallSpec{
     .{ .num = 119, .name = "msync",                   .handler = wrap(mem.sysMsync) },
     .{ .num = 120, .name = "getrandom",               .handler = wrap(sys.sysGetRandom) },
     .{ .num = 121, .name = "mmap_pmem",               .handler = wrap(mem.sysMmapPmem) },
+    .{ .num = 122, .name = "bpf",                     .handler = wrap(@import("../bpf/kernel.zig").sysBpf) },
 };
 
 // Thin shims so the dispatch table can route into the iouring module
@@ -494,6 +495,7 @@ fn doSyscallInner(sys_num: u32, arg1: u32, arg2: u32, arg3: u32, frame: *signals
         109 => net.sysTlsRecv(arg1, arg2, arg3),
         110 => net.sysTlsClose(arg1),
         111 => fs.sysSeek(arg1, arg2, arg3),
+        122 => @import("../bpf/kernel.zig").sysBpf(arg1, arg2, arg3),
         else => E_NOSYS,
     };
 }

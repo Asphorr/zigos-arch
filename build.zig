@@ -452,6 +452,7 @@ pub fn build(b: *std.Build) void {
         .{ "touch.elf", "app/touch.zig" },
         .{ "shutdown.elf", "app/shutdown.zig" },
         .{ "dmesg.elf", "app/dmesg.zig" },
+        .{ "zbpf.elf", "app/zbpf.zig" },
         .{ "about.elf", "app/about.zig" },
         .{ "fastfetch.elf", "app/fastfetch.zig" },
         .{ "zigtop.elf", "app/zigtop.zig" },

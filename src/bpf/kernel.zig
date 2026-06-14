@@ -37,6 +37,7 @@ const verifier = @import("verifier.zig");
 const process = @import("../proc/process.zig");
 const spinlock = @import("../proc/spinlock.zig");
 const serial = @import("../debug/serial.zig");
+const common = @import("../cpu/syscall/common.zig");
 
 /// Hook context handed to syscall-entry programs, read-only. Field order is
 /// ABI for the programs below — extend by APPENDING (programs address it by
@@ -147,6 +148,107 @@ pub fn init() void {
     }
 }
 
+// === userspace loading: sys_bpf (verify-and-run) ===
+//
+// The whole point of the verifier: let an UNTRUSTED program — handed in from
+// userspace — be cleared to run in ring 0. cmd 0 verifies a program and, if it
+// passes, runs it ONCE in the sandbox against a copied-in context, returning r0
+// and any context writes. The program can only ever touch its own 512-byte
+// stack and the ctx buffer the kernel owns; it is fuel-bounded; and it was
+// proven (no OOB, no bad jump, bounded loops) before a single instruction ran.
+// v1 exposes NO helpers — the ctx in/out is the only I/O channel — so any CALL
+// is rejected at verification.
+
+const MAX_USER_CTX: u32 = 1024;
+const USER_BPF_FUEL: u64 = 4096; // the verifier proved <= MAX_DEPTH (1024) concrete steps
+
+/// The userspace ABI struct: a pointer to one of these is passed as the syscall
+/// `attr`. Layout is shared verbatim with app/zbpf.zig — extend by APPENDING.
+pub const BpfAttr = extern struct {
+    ret: u64 = 0, // OUT: r0 from the run (valid only when the call returns 0)
+    prog: u32 = 0, // user ptr to `prog_cnt` 8-byte instructions
+    prog_cnt: u32 = 0,
+    ctx: u32 = 0, // user ptr to the context buffer (0 if none)
+    ctx_len: u32 = 0, // <= MAX_USER_CTX
+    ctx_writable: u32 = 0, // 0/1 — may the program write its context?
+    flags: u32 = 0, // reserved, must be 0
+};
+
+// Kernel staging buffers, serialized by verify_lock: the program and ctx are
+// copied here so the verifier/interpreter never dereference user VA and a
+// concurrent thread can't mutate the program between verify and run.
+var ub_prog: [insn.MAX_INSNS]insn.Insn = undefined;
+var ub_ctx: [MAX_USER_CTX]u8 align(8) = undefined;
+const USER_HELPERS = [_]?verifier.HelperSig{}; // v1: no helpers for userspace programs
+
+pub var user_loads: u64 = 0;
+pub var user_rejects: u64 = 0;
+
+/// sys_bpf(cmd, attr_ptr, attr_len). Returns 0 on a completed run (result in
+/// attr.ret), EINVAL on bad args or a verifier rejection, EFAULT on a bad user
+/// pointer.
+pub fn sysBpf(cmd: u32, attr_ptr: u32, attr_len: u32) u32 {
+    if (cmd != 0) return common.E_INVAL; // only verify-and-run for now
+    if (attr_len != @sizeOf(BpfAttr)) return common.E_INVAL;
+    if (!common.validateUserPtrWriteAligned(attr_ptr, @sizeOf(BpfAttr), 8)) return common.E_FAULT;
+
+    var attr: BpfAttr = undefined;
+    @memcpy(std.mem.asBytes(&attr), @as([*]const u8, @ptrFromInt(attr_ptr))[0..@sizeOf(BpfAttr)]);
+
+    if (attr.prog_cnt == 0 or attr.prog_cnt > insn.MAX_INSNS) return common.E_INVAL;
+    if (attr.ctx_len > MAX_USER_CTX) return common.E_INVAL;
+    if (attr.flags != 0) return common.E_INVAL;
+
+    const prog_bytes = @as(usize, attr.prog_cnt) * @sizeOf(insn.Insn);
+    if (!common.validateUserPtr(attr.prog, prog_bytes)) return common.E_FAULT;
+    if (attr.ctx_len > 0) {
+        const ok = if (attr.ctx_writable != 0)
+            common.validateUserPtrWrite(attr.ctx, attr.ctx_len)
+        else
+            common.validateUserPtr(attr.ctx, attr.ctx_len);
+        if (!ok) return common.E_FAULT;
+    }
+
+    verify_lock.acquire();
+    defer verify_lock.release();
+
+    @memcpy(std.mem.sliceAsBytes(ub_prog[0..attr.prog_cnt]), @as([*]const u8, @ptrFromInt(attr.prog))[0..prog_bytes]);
+    if (attr.ctx_len > 0)
+        @memcpy(ub_ctx[0..attr.ctx_len], @as([*]const u8, @ptrFromInt(attr.ctx))[0..attr.ctx_len]);
+
+    const prog = ub_prog[0..attr.prog_cnt];
+    const cfg = verifier.Config{
+        .ctx_len = attr.ctx_len,
+        .ctx_writable = attr.ctx_writable != 0,
+        .helpers = &USER_HELPERS,
+    };
+
+    user_loads +%= 1;
+    verifier.verify(prog, cfg) catch {
+        user_rejects +%= 1;
+        return common.E_INVAL; // the verifier refused the program
+    };
+
+    // Verified — run it once. The ctx region points at our kernel copy, so the
+    // program's reach is exactly its stack + these `ctx_len` bytes.
+    const regions = [_]vm.Region{.{ .base = @intFromPtr(&ub_ctx), .len = attr.ctx_len, .writable = attr.ctx_writable != 0 }};
+    const env = vm.Env{
+        .regions = if (attr.ctx_len > 0) regions[0..1] else regions[0..0],
+        .helpers = &[_]?vm.HelperFn{},
+    };
+    var machine = vm.Vm{};
+    const res = machine.runEnv(prog, @intFromPtr(&ub_ctx), USER_BPF_FUEL, env) catch {
+        return common.E_FAULT; // unreachable for a verified program — defence in depth
+    };
+
+    attr.ret = res.r0;
+    @memcpy(@as([*]u8, @ptrFromInt(attr_ptr))[0..@sizeOf(BpfAttr)], std.mem.asBytes(&attr));
+    if (attr.ctx_len > 0 and attr.ctx_writable != 0)
+        @memcpy(@as([*]u8, @ptrFromInt(attr.ctx))[0..attr.ctx_len], ub_ctx[0..attr.ctx_len]);
+
+    return 0;
+}
+
 // === the hook ===
 
 /// Called from doSyscall on every syscall entry. Must be cheap when
@@ -182,7 +284,8 @@ pub fn onSyscallEnter(sys_num: u32) void {
 pub fn renderProc(buf: []u8) usize {
     var n: usize = 0;
     n += fmt(buf[n..], "zbpf: syscall-entry hook (builtin counter, {d} insns)\n", .{BUILTIN_PROG.len});
-    n += fmt(buf[n..], "verifier: builtin {s} (M3a: structural + DAG + memory-safety)\n", .{if (builtin_verified) "VERIFIED" else "UNVERIFIED"});
+    n += fmt(buf[n..], "verifier: builtin {s} (structural + ranges + bounded loops)\n", .{if (builtin_verified) "VERIFIED" else "UNVERIFIED"});
+    n += fmt(buf[n..], "sys_bpf:  {d} user loads, {d} rejected by verifier\n", .{ user_loads, user_rejects });
     n += fmt(buf[n..], "enabled: {}\nruns:    {d}\nerrors:  {d}", .{ @atomicLoad(bool, &enabled, .acquire), run_count, err_count });
     if (last_err) |e| {
         n += fmt(buf[n..], " (last: {s})", .{@errorName(e)});
