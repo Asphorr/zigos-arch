@@ -1,4 +1,4 @@
-//! bpf/verifier — zBPF's static safety pass (M3a).
+//! bpf/verifier — zBPF's static safety pass (M3a structural + M3b ranges).
 //!
 //! Runs BEFORE an untrusted program is accepted, proving ahead of time the
 //! properties the interpreter (vm.zig) otherwise has to enforce at run time.
@@ -7,8 +7,10 @@
 //! (OutOfBounds / BadJump / BadHelperId / TimeLimit). The interpreter keeps its
 //! own checks regardless — defence in depth — but a verified program never
 //! trips them. The verifier is deliberately a CONSERVATIVE under-approximation:
-//! it may reject a safe-but-clever program (those are M3b/M4's job to admit),
-//! but it must never accept an unsafe one.
+//! it may reject a safe-but-clever program (those are later milestones to
+//! admit), but it must never accept an unsafe one. tools/bpf-test/fuzz_test.zig
+//! hammers that contract: random programs in, and every accepted one is run to
+//! prove it never faults.
 //!
 //! ============================== THREE PASSES =================================
 //! Pass A1 (linear decode): every opcode is known & permitted, register fields
@@ -22,26 +24,32 @@
 //!   back-edges makes the CFG a DAG, which (a) proves the program halts without
 //!   any loop-bound reasoning — fuel in the interpreter is then pure belt-and-
 //!   suspenders — and (b) means every predecessor of an instruction has a lower
-//!   index, so Pass B is a single forward sweep with no fixpoint iteration.
-//!   Bounded loops need numeric range tracking; they are M4, not here.
+//!   index, so Pass B is a single forward sweep with NO fixpoint iteration.
 //!
 //! Pass B (abstract interpretation): a forward sweep over the DAG carrying an
-//!   abstract register file. A tiny lattice — uninit / scalar / ctx_ptr(off) /
-//!   stack_ptr(off) — is enough to prove: no read of an uninitialized register,
-//!   every memory access in-bounds of its region (size-aware), no store into a
-//!   read-only region, and every CALL's argument registers initialized. At a
-//!   join (two paths into one instruction) the per-register states are merged
-//!   conservatively: uninit ⊔ anything = uninit (so a maybe-unset register
-//!   poisons any later read), and a pointer that loses its exact offset becomes
-//!   un-dereferenceable rather than silently in-bounds.
+//!   abstract register file. Lattice: uninit / scalar[lo,hi] / ctx_ptr[lo,hi] /
+//!   stack_ptr[lo,hi]. A scalar carries an inclusive value range; a pointer
+//!   carries an inclusive byte-offset range from its region base. This proves:
+//!   no read of an uninitialized register, every memory access in-bounds of its
+//!   region for the WHOLE offset range (size-aware), no store into a read-only
+//!   region, every CALL's argument registers initialized.
 //!
-//! M3a tracks pointer OFFSETS as exact constants (needed to bounds-check), but
-//! does NOT track scalar VALUES — so a pointer derived via a runtime-computed
-//! offset is conservatively un-dereferenceable until M3b adds value ranges.
+//!   M3b's ranges are why a *computed* pointer offset can now be proven safe:
+//!   `r2 = r10; r2 += (idx & 31)` gives an offset range, and a load through it
+//!   is admitted iff that whole range fits the region. Conditional branches
+//!   NARROW the range along each edge (`if r2 < 8` ⇒ taken edge has r2 ∈ [0,7]),
+//!   which is how a bounds-checked variable index is admitted.
+//!
+//!   Termination is trivial here precisely BECAUSE loops are banned: over a DAG
+//!   each node's range is computed once, from already-finished predecessors, so
+//!   the interval domain never needs a widening operator to converge (that —
+//!   range tracking across a back-edge — is the hard problem M4 takes on).
 //!
 //! NOT REENTRANT: the analysis scratch lives in module statics, so the kernel
-//! load path must serialize calls behind a load lock (wired in the kernel-
-//! integration slice). The off-target harness drives it single-threaded.
+//! load path must serialize calls behind a load lock (bpf/kernel.zig's
+//! verify_lock). Keeping verifier.zig free of kernel imports is deliberate — it
+//! is what lets the off-target harness test it in isolation. The off-target
+//! harness drives it single-threaded.
 
 const std = @import("std");
 const insn = @import("insn.zig");
@@ -56,13 +64,13 @@ pub const VerifyError = error{
     BadImm64, // malformed LD_IMM64 pair (missing/!=0 second slot)
     JumpOutOfRange, // jump target outside [0, len)
     JumpIntoImm64, // jump target lands on an LD_IMM64's second slot
-    BackEdge, // a backward jump (loop) — not permitted in M3a
+    BackEdge, // a backward jump (loop) — not permitted yet
     NoExit, // a reachable path runs off the end without EXIT
     UninitReg, // reads a register that may be uninitialized
     UnknownHelper, // CALL to an unregistered helper id
     BadCall, // unsupported CALL flavor (bpf-to-bpf, runtime fn)
-    NotAPointer, // memory access through a non-pointer / unbounded register
-    OutOfBoundsAccess, // static access outside the region bounds
+    NotAPointer, // memory access through a non-pointer register
+    OutOfBoundsAccess, // access can fall outside the region bounds
     WriteToReadonly, // store into a read-only region (e.g. ctx)
 };
 
@@ -84,45 +92,69 @@ pub const Config = struct {
 
 const Kind = enum(u8) { uninit, scalar, ctx_ptr, stack_ptr };
 
+// "Don't know anything" range — the full i64 interval. A scalar set to this is
+// any 64-bit value; a pointer offset set to this is un-dereferenceable (the
+// bounds check below can never prove it fits). All range math saturates to
+// these rather than wrapping, so an over/underflow only ever loses precision.
+const FULL_LO: i64 = std.math.minInt(i64);
+const FULL_HI: i64 = std.math.maxInt(i64);
+
 const RegState = struct {
     kind: Kind = .uninit,
-    /// Pointer kinds only: is `off` a compile-time constant? A pointer whose
-    /// offset became runtime-dependent is still a pointer, just one we cannot
-    /// bounds-check — so any dereference of it is rejected.
-    off_known: bool = true,
-    /// Pointer kinds only: byte offset from the region base. For stack_ptr the
-    /// region base is the LOW end of the 512-byte stack, so r10 (the frame
-    /// pointer, which points at the TOP) starts at off = STACK_SIZE and programs
-    /// reach into the stack with negative instruction offsets.
-    off: i64 = 0,
+    /// scalar: inclusive value range. pointer: inclusive byte-offset range from
+    /// the region base (stack's base is its LOW end, so r10 — the frame pointer
+    /// at the TOP — starts at lo=hi=STACK_SIZE and programs reach in with
+    /// negative offsets). lo == hi means an exact constant.
+    lo: i64 = 0,
+    hi: i64 = 0,
 
     fn isPtr(self: RegState) bool {
         return self.kind == .ctx_ptr or self.kind == .stack_ptr;
     }
-
     fn eql(a: RegState, b: RegState) bool {
-        if (a.kind != b.kind) return false;
-        if (a.isPtr()) return a.off_known == b.off_known and (!a.off_known or a.off == b.off);
-        return true;
+        return a.kind == b.kind and a.lo == b.lo and a.hi == b.hi;
     }
 };
 
+fn scalar(lo: i64, hi: i64) RegState {
+    return .{ .kind = .scalar, .lo = lo, .hi = hi };
+}
+fn scalarConst(v: i64) RegState {
+    return .{ .kind = .scalar, .lo = v, .hi = v };
+}
+fn scalarFull() RegState {
+    return .{ .kind = .scalar, .lo = FULL_LO, .hi = FULL_HI };
+}
+
 const RegFile = [insn.NUM_REGS]RegState;
 
-/// Lattice join of two register states. Monotone and bounded-height, so the
-/// forward sweep converges trivially (and would even over a cyclic CFG, which
-/// is why this same shape is what a future bounded-loop verifier builds on).
+/// Lattice join of two register states (a UNION of ranges — a conservative
+/// superset, hence sound). Over a DAG this is computed once per node from
+/// finished predecessors, so it never needs to iterate to a fixpoint.
 fn joinReg(a: RegState, b: RegState) RegState {
     if (a.eql(b)) return a;
     // If either side might be uninitialized, the merge might be — poison it so
     // a later read is rejected. (uninit is the conservative top for liveness.)
     if (a.kind == .uninit or b.kind == .uninit) return .{ .kind = .uninit };
-    // Same region, differing offset/knownness → still that pointer, but we no
-    // longer know where, so it becomes un-dereferenceable.
-    if (a.kind == b.kind and a.isPtr()) return .{ .kind = a.kind, .off_known = false };
-    // Differing kinds (ptr vs scalar, ctx vs stack) collapse to scalar. Sound:
-    // a scalar can't be dereferenced, which is exactly the uncertainty here.
-    return .{ .kind = .scalar };
+    // Same region: keep it a pointer, widening the offset to the union range.
+    if (a.kind == b.kind and a.isPtr()) {
+        return .{ .kind = a.kind, .lo = @min(a.lo, b.lo), .hi = @max(a.hi, b.hi) };
+    }
+    if (a.kind == .scalar and b.kind == .scalar) {
+        return scalar(@min(a.lo, b.lo), @max(a.hi, b.hi));
+    }
+    // Differing kinds (ptr vs scalar, ctx vs stack): we no longer know what it
+    // is or holds — a scalar of unknown value, which can't be dereferenced.
+    return scalarFull();
+}
+
+// Saturating arithmetic — overflow only ever loses precision (widens), never
+// wraps into a falsely-narrow range.
+fn satAdd(a: i64, b: i64) i64 {
+    return std.math.add(i64, a, b) catch (if (b >= 0) FULL_HI else FULL_LO);
+}
+fn satSub(a: i64, b: i64) i64 {
+    return std.math.sub(i64, a, b) catch (if (b >= 0) FULL_LO else FULL_HI);
 }
 
 // === analysis scratch (see NOT REENTRANT note in the header) ===
@@ -156,8 +188,8 @@ pub fn verify(prog: []const Insn, cfg: Config) VerifyError!void {
     for (0..len) |k| g_seen[k] = false;
     var entry: RegFile = undefined;
     for (&entry) |*r| r.* = .{}; // all uninit
-    entry[1] = .{ .kind = .ctx_ptr, .off = 0 }; // r1 = ctx pointer at entry
-    entry[10] = .{ .kind = .stack_ptr, .off = @intCast(insn.STACK_SIZE) }; // r10 = frame ptr
+    entry[1] = .{ .kind = .ctx_ptr, .lo = 0, .hi = 0 }; // r1 = ctx pointer at entry
+    entry[10] = .{ .kind = .stack_ptr, .lo = @intCast(insn.STACK_SIZE), .hi = @intCast(insn.STACK_SIZE) };
     g_states[0] = entry;
     g_seen[0] = true;
 
@@ -200,11 +232,13 @@ fn step(prog: []const Insn, pc: usize, len: usize, cfg: Config) VerifyError!void
             try fallthrough(pc, len, out);
         },
         insn.CLASS_LD => {
-            // LD_IMM64 (shape validated in A1): loads a 64-bit constant scalar
-            // and consumes two slots, so the successor is pc+2.
+            // LD_IMM64 (shape validated in A1): loads a 64-bit constant and
+            // consumes two slots, so the successor is pc+2.
             const d = i.dst();
             if (d == 10) return error.WriteToR10;
-            out[d] = .{ .kind = .scalar };
+            const lo_bits: u64 = @as(u32, @bitCast(i.imm));
+            const hi_bits: u64 = @as(u32, @bitCast(prog[pc + 1].imm));
+            out[d] = scalarConst(@bitCast(lo_bits | (hi_bits << 32)));
             const nxt = pc + 2;
             if (nxt >= len) return error.NoExit;
             pushSucc(nxt, out);
@@ -229,7 +263,7 @@ fn step(prog: []const Insn, pc: usize, len: usize, cfg: Config) VerifyError!void
                 }
                 // eBPF calling convention: r0 = return scalar, r1..r5 clobbered,
                 // r6..r9 + r10 preserved.
-                out[0] = .{ .kind = .scalar };
+                out[0] = scalarFull();
                 var r: usize = 1;
                 while (r <= 5) : (r += 1) out[r] = .{};
                 try fallthrough(pc, len, out);
@@ -243,15 +277,70 @@ fn step(prog: []const Insn, pc: usize, len: usize, cfg: Config) VerifyError!void
                 return;
             }
 
-            // Conditional branch: both operands are read, two successors. M3a
-            // does not narrow register state along the taken/not-taken edges
-            // (that refinement is M3b), so both successors get the same state.
-            if (out[i.dst()].kind == .uninit) return error.UninitReg;
-            if ((i.opcode & insn.SRC_X) != 0 and out[i.src()].kind == .uninit) return error.UninitReg;
-            pushSucc(jumpTarget(pc, i.offset), out); // taken
-            try fallthrough(pc, len, out); // not taken
+            // Conditional branch: both operands are read; two successors, each
+            // with the compared register's range NARROWED by the condition.
+            const d = i.dst();
+            if (out[d].kind == .uninit) return error.UninitReg;
+            const src_x = (i.opcode & insn.SRC_X) != 0;
+            if (src_x and out[i.src()].kind == .uninit) return error.UninitReg;
+
+            var taken = out;
+            var fall = out;
+            // Narrow only 64-bit register-vs-immediate compares (a JMP32 only
+            // constrains the low 32 bits; reg-vs-reg narrowing is M3b+).
+            if (!is32 and !src_x) narrowImm(out[d], op, i.imm, &taken[d], &fall[d]);
+
+            const nxt = pc + 1;
+            if (nxt >= len) return error.NoExit;
+            pushSucc(jumpTarget(pc, i.offset), taken); // taken (target validated in A2)
+            pushSucc(nxt, fall); // not taken
         },
         else => unreachable, // classes 0..7 are all handled above
+    }
+}
+
+/// Refine a scalar register's range along the taken / not-taken edges of an
+/// unsigned register-vs-immediate compare. Only fires for a non-negative scalar
+/// against a non-negative immediate — the bounds-check idiom — and only ever
+/// SHRINKS a range, so it is always sound; anything else passes through.
+fn narrowImm(orig: RegState, op: u8, imm: i32, taken: *RegState, fall: *RegState) void {
+    taken.* = orig;
+    fall.* = orig;
+    if (orig.kind != .scalar or orig.lo < 0 or imm < 0) return;
+    const K: i64 = imm;
+    const lo = orig.lo;
+    const hi = orig.hi;
+    const J = insn.JmpCode;
+    switch (op) {
+        @intFromEnum(J.jlt) => { // unsigned <
+            setRange(taken, lo, @min(hi, K - 1));
+            setRange(fall, @max(lo, K), hi);
+        },
+        @intFromEnum(J.jle) => {
+            setRange(taken, lo, @min(hi, K));
+            setRange(fall, @max(lo, K + 1), hi);
+        },
+        @intFromEnum(J.jgt) => {
+            setRange(taken, @max(lo, K + 1), hi);
+            setRange(fall, lo, @min(hi, K));
+        },
+        @intFromEnum(J.jge) => {
+            setRange(taken, @max(lo, K), hi);
+            setRange(fall, lo, @min(hi, K - 1));
+        },
+        @intFromEnum(J.jeq) => setRange(taken, K, K), // fall unchanged
+        @intFromEnum(J.jne) => setRange(fall, K, K), // taken unchanged
+        else => {},
+    }
+}
+
+/// Apply a narrowed [lo,hi] only if it is a non-empty interval — an empty one
+/// would mean that edge is infeasible, which we conservatively ignore (leave
+/// the pre-narrow range) rather than encode.
+fn setRange(s: *RegState, lo: i64, hi: i64) void {
+    if (lo <= hi) {
+        s.lo = lo;
+        s.hi = hi;
     }
 }
 
@@ -263,19 +352,24 @@ fn execAlu(out: *RegFile, i: Insn, is64: bool) VerifyError!void {
     if (d == 10) return error.WriteToR10;
     if (src_x and out[s].kind == .uninit) return error.UninitReg;
 
-    const mov = @intFromEnum(insn.AluCode.mov);
-    const add = @intFromEnum(insn.AluCode.add);
-    const sub = @intFromEnum(insn.AluCode.sub);
+    const A = insn.AluCode;
+    const mov = @intFromEnum(A.mov);
+    const add = @intFromEnum(A.add);
+    const sub = @intFromEnum(A.sub);
+    const @"and" = @intFromEnum(A.@"and");
 
     if (op == mov) {
         if (!src_x) {
-            out[d] = .{ .kind = .scalar }; // mov imm
+            // mov imm: 64-bit sign-extends the i32; 32-bit zero-extends to u32.
+            out[d] = if (is64) scalarConst(i.imm) else scalarConst(@as(i64, @as(u32, @bitCast(i.imm))));
         } else if (i.offset != 0) {
-            out[d] = .{ .kind = .scalar }; // MOVSX reinterprets — never a pointer
+            out[d] = scalarFull(); // MOVSX reinterprets — never a pointer
         } else if (!is64 and out[s].isPtr()) {
-            out[d] = .{ .kind = .scalar }; // 32-bit mov truncates a pointer away
+            out[d] = scalar(0, 0xFFFF_FFFF); // 32-bit mov truncates a pointer to a u32 scalar
+        } else if (!is64 and out[s].kind == .scalar) {
+            out[d] = trunc32(out[s]); // 32-bit mov zero-extends low 32 bits
         } else {
-            out[d] = out[s]; // pointer-preserving copy
+            out[d] = out[s]; // 64-bit pointer/scalar-preserving copy
         }
         return;
     }
@@ -283,36 +377,91 @@ fn execAlu(out: *RegFile, i: Insn, is64: bool) VerifyError!void {
     // Every non-mov ALU op reads dst as an operand.
     if (out[d].kind == .uninit) return error.UninitReg;
 
-    // The one pointer-preserving arithmetic: 64-bit add/sub of a constant just
-    // shifts the offset (this is how programs form &stack[-8] etc.).
+    // Pointer arithmetic: 64-bit add/sub keeps a pointer, shifting its offset
+    // range by the (constant or ranged) operand. This is how programs form
+    // &stack[-8], &ctx[idx], etc.
     if ((op == add or op == sub) and is64 and out[d].isPtr()) {
-        const dstate = out[d];
+        const p = out[d];
         if (!src_x) {
-            const imm: i64 = i.imm;
-            const delta: i64 = if (op == sub) -imm else imm;
-            out[d] = if (dstate.off_known)
-                .{ .kind = dstate.kind, .off = dstate.off + delta }
+            const k: i64 = i.imm;
+            out[d] = .{ .kind = p.kind, .lo = satAdd(p.lo, if (op == sub) -k else k), .hi = satAdd(p.hi, if (op == sub) -k else k) };
+        } else if (out[s].kind == .scalar) {
+            const v = out[s];
+            out[d] = if (op == add)
+                .{ .kind = p.kind, .lo = satAdd(p.lo, v.lo), .hi = satAdd(p.hi, v.hi) }
             else
-                dstate;
-        } else if (out[s].isPtr()) {
-            out[d] = .{ .kind = .scalar }; // ptr ± ptr is not a pointer
+                .{ .kind = p.kind, .lo = satSub(p.lo, v.hi), .hi = satSub(p.hi, v.lo) };
         } else {
-            out[d] = .{ .kind = dstate.kind, .off_known = false }; // ptr ± unknown scalar
+            out[d] = scalarFull(); // ptr ± ptr is not a pointer
         }
         return;
     }
 
-    // Anything else (mul/div/and/shifts/neg/bswap, or pointer math we don't
-    // model) yields a scalar — sound, just no longer dereferenceable.
-    out[d] = .{ .kind = .scalar };
+    // Scalar arithmetic with a little range precision where it is cheap and
+    // load-bearing (constants, add/sub, the AND mask); everything else widens.
+    const dval = out[d];
+    if (op == add or op == sub) {
+        const v = if (src_x) out[s] else scalarConst(i.imm);
+        // A pointer operand here means we've lost the pointer (e.g. scalar+ptr) —
+        // treat the result as an unknown scalar.
+        if (dval.kind != .scalar or v.kind != .scalar) {
+            out[d] = clampWidth(scalarFull(), is64);
+        } else {
+            const r = if (op == add)
+                scalar(satAdd(dval.lo, v.lo), satAdd(dval.hi, v.hi))
+            else
+                scalar(satSub(dval.lo, v.hi), satSub(dval.hi, v.lo));
+            out[d] = clampWidth(r, is64);
+        }
+    } else if (op == @"and") {
+        out[d] = clampWidth(andRange(dval, if (src_x) out[s] else scalarConst(i.imm), is64), is64);
+    } else {
+        // mul/div/mod/or/xor/shifts/neg/bswap and anything else: widen. A 32-bit
+        // result is still zero-extended into [0, 2^32), which is tighter than full.
+        out[d] = clampWidth(scalarFull(), is64);
+    }
+}
+
+/// AND can only clear bits, so `x & y` is bounded above by whichever operand we
+/// can bound — provided both are known non-negative (so the high bit is clear).
+fn andRange(a: RegState, b: RegState, is64: bool) RegState {
+    var ub: i64 = FULL_HI;
+    if (a.kind == .scalar and a.lo >= 0) ub = @min(ub, a.hi);
+    if (b.kind == .scalar and b.lo >= 0) ub = @min(ub, b.hi);
+    if (ub == FULL_HI) return scalarFull();
+    _ = is64;
+    return scalar(0, ub);
+}
+
+/// Zero-extension of a 32-bit ALU result: clamp the range into [0, 2^32) unless
+/// the operation was 64-bit. Saturates conservatively — if the range can't be
+/// represented as a sub-interval of [0, 2^32), fall back to that whole window.
+fn clampWidth(r: RegState, is64: bool) RegState {
+    if (is64) return r;
+    if (r.kind != .scalar) return scalar(0, 0xFFFF_FFFF);
+    if (r.lo >= 0 and r.hi <= 0xFFFF_FFFF) return r; // already inside the 32-bit window
+    return scalar(0, 0xFFFF_FFFF);
+}
+
+fn trunc32(s: RegState) RegState {
+    if (s.lo >= 0 and s.hi <= 0xFFFF_FFFF) return s;
+    return scalar(0, 0xFFFF_FFFF);
 }
 
 fn execLoad(out: *RegFile, i: Insn, cfg: Config) VerifyError!void {
     const d = i.dst();
     if (d == 10) return error.WriteToR10;
     const size: insn.Size = @enumFromInt(i.opcode & 0x18);
-    try checkAccess(out.*, i.src(), i.offset, size.bytes(), cfg, false);
-    out[d] = .{ .kind = .scalar }; // a loaded value is opaque in M3a
+    const n = size.bytes();
+    try checkAccess(out.*, i.src(), i.offset, n, cfg, false);
+    // A plain (zero-extending) load of n<8 bytes lands in [0, 2^(8n)). This is
+    // load-bearing: it is what lets a loaded byte/half/word later be narrowed
+    // and used as a bounded index. A sign-extending load can be negative.
+    const mode = i.opcode & 0xe0;
+    out[d] = if (mode == insn.MODE_MEM and n < 8)
+        scalar(0, (@as(i64, 1) << @intCast(8 * n)) - 1)
+    else
+        scalarFull();
 }
 
 fn execStore(rf: RegFile, i: Insn, cfg: Config, from_reg: bool) VerifyError!void {
@@ -322,8 +471,8 @@ fn execStore(rf: RegFile, i: Insn, cfg: Config, from_reg: bool) VerifyError!void
 }
 
 /// The static analogue of vm.zig's checkMem: prove that `*(n bytes)(base+off)`
-/// lands wholly inside the region `base` points at, with write permission if
-/// this is a store.
+/// lands wholly inside the region `base` points at, for the WHOLE offset range,
+/// with write permission if this is a store.
 fn checkAccess(rf: RegFile, base_reg: u4, off: i16, n: u64, cfg: Config, write: bool) VerifyError!void {
     const p = rf[base_reg];
     switch (p.kind) {
@@ -331,15 +480,15 @@ fn checkAccess(rf: RegFile, base_reg: u4, off: i16, n: u64, cfg: Config, write: 
         .scalar => return error.NotAPointer,
         .ctx_ptr, .stack_ptr => {},
     }
-    if (!p.off_known) return error.NotAPointer; // unbounded offset → cannot prove safe
-
     const region_len: i64 = if (p.kind == .stack_ptr) @intCast(insn.STACK_SIZE) else @intCast(cfg.ctx_len);
     const writable = if (p.kind == .stack_ptr) true else cfg.ctx_writable;
     if (write and !writable) return error.WriteToReadonly;
 
-    const eff: i64 = p.off + off;
-    if (eff < 0) return error.OutOfBoundsAccess;
-    if (eff + @as(i64, @intCast(n)) > region_len) return error.OutOfBoundsAccess;
+    // Lowest and highest byte the access can touch, across the offset range.
+    const lo = satAdd(p.lo, off);
+    const hi = satAdd(satAdd(p.hi, off), @as(i64, @intCast(n)));
+    if (lo < 0) return error.OutOfBoundsAccess; // some offset could dip below the region
+    if (hi > region_len) return error.OutOfBoundsAccess; // some offset could run past it
 }
 
 // === Pass A1: per-instruction shape validation; returns slot width (1 or 2) ===

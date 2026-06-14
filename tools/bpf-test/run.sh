@@ -17,5 +17,6 @@ cp "$HERE/../../src/bpf/verifier.zig" "$HERE/src/bpf/verifier.zig"
 
 cd "$HERE"
 "$ZIG" test test.zig        # interpreter (M1)
-"$ZIG" test verify_test.zig # verifier   (M3a)
+"$ZIG" test verify_test.zig # verifier    (M3a/M3b unit)
+"$ZIG" test fuzz_test.zig   # verifier    (M3b soundness fuzz)
 echo "EXIT=$?"

@@ -79,6 +79,47 @@ test "accept: ctx loads at the exact end boundary" {
     try ok(&prog);
 }
 
+// --- M3b range tracking: computed offsets that M3a could not prove ---
+
+test "accept (M3b): masked index gives a bounded stack offset" {
+    const prog = [_]i.Insn{
+        i.ldx(.w, 2, 1, 0), // r2 = ctx word -> [0, 2^32)
+        i.alu64Imm(.@"and", 2, 0x1F), // r2 &= 31 -> [0,31]
+        i.mov64Reg(3, 10), // r3 = frame ptr (off 512)
+        i.alu64Imm(.add, 3, -64), // r3 -> off 448
+        i.alu64Reg(.add, 3, 2), // r3 -> off [448, 479]
+        i.ldx(.dw, 4, 3, 0), // [448,479]+8 <= 512 — provably in-stack
+        i.mov64Imm(0, 0),
+        i.exit(),
+    };
+    try ok(&prog);
+}
+
+test "accept (M3b): bounds-checked variable ctx index via narrowing" {
+    const prog = [_]i.Insn{
+        i.ldx(.w, 2, 1, 0), // r2 = ctx word -> [0, 2^32)
+        i.jmpImm(.jgt, 2, 7, 3), // if r2 > 7 -> skip the access
+        i.mov64Reg(3, 1), // r3 = ctx ptr (off 0)
+        i.alu64Reg(.add, 3, 2), // fall-through: r2 in [0,7] -> off [0,7]
+        i.ldx(.b, 4, 3, 0), // [0,7]+1 <= 16 — provably in-ctx
+        i.mov64Imm(0, 0), // <- jgt target
+        i.exit(),
+    };
+    try ok(&prog);
+}
+
+test "reject (M3b): an UNchecked variable index stays out of bounds" {
+    const prog = [_]i.Insn{
+        i.ldx(.w, 2, 1, 0), // r2 = ctx word -> [0, 2^32), never narrowed
+        i.mov64Reg(3, 1), // r3 = ctx ptr
+        i.alu64Reg(.add, 3, 2), // r3 -> off [0, 2^32)
+        i.ldx(.b, 4, 3, 0), // hi = 2^32 > ctx_len 16
+        i.mov64Imm(0, 0),
+        i.exit(),
+    };
+    try expectError(error.OutOfBoundsAccess, ok(&prog));
+}
+
 // =========================== REJECT (one per VerifyError) ===========================
 
 test "reject: empty program" {

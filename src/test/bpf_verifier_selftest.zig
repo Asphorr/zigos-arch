@@ -81,6 +81,31 @@ pub fn taskEntry() callconv(.c) noreturn {
         };
         accept(&p, "forward branch with clean join");
     }
+    { // M3b: an AND-masked index gives a bounded stack offset
+        const p = [_]insn.Insn{
+            insn.ldx(.w, 2, 1, 0), // r2 = ctx word -> [0, 2^32)
+            insn.alu64Imm(.@"and", 2, 0x1F), // r2 &= 31 -> [0,31]
+            insn.mov64Reg(3, 10), // r3 = frame ptr (off 512)
+            insn.alu64Imm(.add, 3, -64), // r3 -> off 448
+            insn.alu64Reg(.add, 3, 2), // r3 -> off [448,479]
+            insn.ldx(.dw, 4, 3, 0), // +8 <= 512: provably in-stack
+            insn.mov64Imm(0, 0),
+            insn.exit(),
+        };
+        accept(&p, "M3b masked index -> bounded stack offset");
+    }
+    { // M3b: a bounds-checked variable index, admitted via branch narrowing
+        const p = [_]insn.Insn{
+            insn.ldx(.w, 2, 1, 0), // r2 = ctx word -> [0, 2^32)
+            insn.jmpImm(.jgt, 2, 7, 3), // if r2 > 7 -> skip the access
+            insn.mov64Reg(3, 1), // r3 = ctx ptr (off 0)
+            insn.alu64Reg(.add, 3, 2), // fall-through: r2 in [0,7] -> off [0,7]
+            insn.ldx(.b, 4, 3, 0), // +1 <= 16: provably in-ctx
+            insn.mov64Imm(0, 0),
+            insn.exit(),
+        };
+        accept(&p, "M3b bounds-checked ctx index via narrowing");
+    }
 
     // --- REJECT (one per representative class) ---
     {
@@ -123,7 +148,7 @@ pub fn taskEntry() callconv(.c) noreturn {
     }
 
     if (fail_count == 0) {
-        serial.print("[zbpf-vrf] PASS — all {d} checks green (accept builtin/ptr-arith/join; reject uninit/r10/loop/OOB-stack/OOB-ctx/RO/scalar/helper/atomic)\n", .{pass_count});
+        serial.print("[zbpf-vrf] PASS — all {d} checks green (accept builtin/ptr-arith/join/M3b-mask/M3b-narrow; reject uninit/r10/loop/OOB-stack/OOB-ctx/RO/scalar/helper/atomic)\n", .{pass_count});
     } else {
         serial.print("[zbpf-vrf] FAIL — {d} of {d} checks failed (see [zbpf-vrf] FAIL lines above)\n", .{ fail_count, pass_count + fail_count });
     }
