@@ -22,6 +22,16 @@
 // stumbles onto them. Each combo allocates and frees its own resources, so it
 // can never wedge the fuzzer.
 //
+// V4 adds the BPF load path (sys#122 / app/zbpf): the kernel's eBPF verifier is
+// a SECURITY BOUNDARY — untrusted userspace code cleared to run in ring 0 — so
+// it is the highest-value target here. ~1-in-8 iters target sys#122 with a
+// FRESHLY-GENERATED random eBPF program (curated-opcode mix + garbage, forward
+// AND backward jumps, random regs/imm) wrapped in a real BpfAttr. The kernel
+// must verify-or-reject every one without ever accepting an unsafe program or
+// faulting in ring 0. Complements the off-target tools/bpf-test/fuzz_test.zig
+// (which fuzzes verifier LOGIC on the host) by exercising the LIVE syscall path:
+// user-ptr copy-in, the lock, verify, sandboxed run, copy-out.
+//
 // Tracked:
 //   - file descriptors: sys#9 (open), sys#51 (pipe — both ends)
 //   - mmap regions:     sys#57
@@ -168,6 +178,78 @@ var n_wids: u32 = 0;
 var pipe_buf: [2]u32 = .{ 0, 0 };
 var path_buf: [128]u8 = undefined;
 var io_buf: [256]u8 = undefined;
+
+// === sys_bpf (#122) program fuzzer ===
+// Byte-identical to bpf/kernel.zig's BpfAttr and insn.Insn.
+const BpfAttr = extern struct {
+    ret: u64 = 0,
+    prog: u32 = 0,
+    prog_cnt: u32 = 0,
+    ctx: u32 = 0,
+    ctx_len: u32 = 0,
+    ctx_writable: u32 = 0,
+    flags: u32 = 0,
+};
+const FuzzInsn = extern struct { opcode: u8, regs: u8, offset: i16, imm: i32 };
+
+const MAX_FUZZ_INSNS = 32;
+var bpf_attr_buf: BpfAttr = .{};
+var bpf_prog_buf: [MAX_FUZZ_INSNS]FuzzInsn = undefined;
+var bpf_ctx_buf: [64]u8 align(8) = undefined;
+var bpf_calls: u32 = 0;
+
+// A spread of real RFC 9669 opcodes (so programs decode and reach deep into the
+// verifier) — mov/alu imm+reg, ldx/st/stx at several widths, the jump family
+// incl. ja, exit, call, ld_imm64, bswap. buildBpfAttr also injects fully-random
+// opcodes ~1-in-8 so the structural-reject paths get hit too.
+const FUZZ_OPCODES = [_]u8{
+    0xb7, 0x07, 0x0f, 0xbf, 0xb4, 0x04, 0x0c, // mov/add imm+reg (alu64 + alu32)
+    0x79, 0x71, 0x61, 0x69, // ldx dw/b/w/h
+    0x7a, 0x62, 0x7b, 0x63, // st/stx dw+w
+    0x05, 0x15, 0x1d, 0x25, 0x35, 0x55, 0xa5, 0xb5, // ja/jeq/jgt/jge/jne/jlt/jle
+    0x95, 0x85, 0x18, 0x00, 0xd4, // exit, call, ld_imm64(+hi), bswap
+};
+
+/// Generate a random eBPF program + BpfAttr into the static buffers; return the
+/// attr pointer. Programs are small (the verifier budget rejects huge unrolls
+/// fast) with both forward and BACKWARD jumps so the M4 loop path is exercised.
+fn buildBpfAttr() u32 {
+    const cnt: u32 = 1 + (next() % MAX_FUZZ_INSNS);
+    var k: u32 = 0;
+    while (k < cnt) : (k += 1) {
+        var op = FUZZ_OPCODES[next() % FUZZ_OPCODES.len];
+        if ((next() % 8) == 0) op = @truncate(next()); // garbage opcode → structural reject
+        const back = (next() % 2) == 0 and k > 0;
+        const off: i16 = if (back)
+            -@as(i16, @intCast(1 + (next() % k))) // backward = a loop
+        else
+            @as(i16, @intCast(next() % MAX_FUZZ_INSNS));
+        bpf_prog_buf[k] = .{
+            .opcode = op,
+            .regs = @truncate(next()), // random nibbles — sometimes r11..r15 (BadRegister)
+            .offset = off,
+            .imm = @bitCast(next()),
+        };
+    }
+    if ((next() % 10) < 6) bpf_prog_buf[cnt - 1] = .{ .opcode = 0x95, .regs = 0, .offset = 0, .imm = 0 }; // mostly end in EXIT
+
+    const ctx_len: u32 = switch (next() % 5) {
+        0 => 0,
+        1 => 8,
+        2 => 16,
+        3 => next() % 65, // within bpf_ctx_buf
+        else => 1 + (next() % 4096), // sometimes > MAX_USER_CTX → EINVAL bound test
+    };
+    bpf_attr_buf = .{
+        .prog = @truncate(@intFromPtr(&bpf_prog_buf)),
+        .prog_cnt = cnt,
+        .ctx = @truncate(@intFromPtr(&bpf_ctx_buf)),
+        .ctx_len = ctx_len,
+        .ctx_writable = next() % 2,
+        .flags = if ((next() % 16) == 0) next() else 0,
+    };
+    return @truncate(@intFromPtr(&bpf_attr_buf));
+}
 
 fn addFd(fd: u32) void {
     // Don't track absurd values that aren't real fds (sanity guard against
@@ -364,6 +446,9 @@ fn isPathArg1(sys_no: u32) bool {
 // which only triggers when arg is e.g. a *closed* fd or a freed addr, and
 // pure-bias would never produce that.
 fn smartArg1(sys_no: u32) u32 {
+    // sys_bpf(cmd, ...): cmd 0 reaches the verify-and-run path; ~20% garbage
+    // cmd exercises the cmd-validation reject.
+    if (sys_no == 122) return if ((next() % 10) < 8) 0 else spicyArg();
     const bias = (next() % 10) < 7;
     if (bias) {
         if (isFdArg1(sys_no)) return pickFd();
@@ -405,6 +490,10 @@ fn smartArg2(sys_no: u32) u32 {
         // looking like a normal open and makes any future flag validation
         // exercise normal paths.
         9 => if ((next() % 10) < 8) (next() % 4) else spicyArg(),
+        // sys_bpf(_, attr_ptr, _): ~80% a freshly-built random program+attr (so
+        // the verifier actually runs on adversarial bytes), ~20% a spicy/garbage
+        // pointer (the copy-in / validateUserPtr robustness angle).
+        122 => if ((next() % 10) < 8) buildBpfAttr() else spicyArg(),
         // Default arg2 is often a write-back pointer (stat buf, size out,
         // etc.). 1-in-4, feed a read-only pointer so any write-target syscall
         // that skipped the writability check trips here instead of in prod.
@@ -425,6 +514,9 @@ fn smartArg3(sys_no: u32) u32 {
             if (r < 8) break :blk overflowLen(@intCast(@intFromPtr(&io_buf)));
             break :blk spicyArg();
         },
+        // sys_bpf attr_len: mostly the exact struct size (so the call proceeds),
+        // ~20% spicy (the attr_len-validation reject).
+        122 => if ((next() % 10) < 8) @sizeOf(BpfAttr) else spicyArg(),
         else => spicyArg(),
     };
 }
@@ -650,7 +742,11 @@ export fn _start() linksection(".text.entry") callconv(.c) void {
             libc.klogFmt("[redteam] iter={d} COMBO#{d} live[fd={d} rg={d} wid={d}]\n", .{ i, c, n_fds, n_regions, n_wids });
             continue;
         }
-        const sys_no: u32 = next() % 130;
+        var sys_no: u32 = next() % 130;
+        // Bias ~1-in-8 toward sys_bpf (#122) so the live verifier — the ring-0
+        // security boundary — actually gets hammered, not visited ~0.8% of the time.
+        if ((next() % 8) == 0) sys_no = 122;
+        if (sys_no == 122) bpf_calls += 1;
         if (isBlocked(sys_no)) {
             skipped += 1;
             continue;
@@ -717,7 +813,9 @@ export fn _start() linksection(".text.entry") callconv(.c) void {
     libc.printNum(n_regions);
     libc.print(" wid=");
     libc.printNum(n_wids);
-    libc.print("] — kernel survived\n");
+    libc.print("] bpf_loads=");
+    libc.printNum(bpf_calls);
+    libc.print(" — kernel survived\n");
 
     libc.exit();
 }
