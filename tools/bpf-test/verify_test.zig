@@ -283,11 +283,71 @@ test "reject: register field names r12" {
     try expectError(error.BadRegister, ok(&prog));
 }
 
-test "reject: atomic store (unsupported mode)" {
-    var atomic = i.stx(.dw, 2, 0, 0);
-    atomic.opcode = i.MODE_ATOMIC | 0x18 | i.CLASS_STX;
-    const prog = [_]i.Insn{ atomic, i.exit() };
+// --- atomics (STX | MODE_ATOMIC): accepted when well-formed and in-bounds ---
+
+test "accept: atomic add on the stack" {
+    const prog = [_]i.Insn{
+        i.mov64Imm(2, 1),
+        i.atomic(.dw, i.ATOMIC_ADD, 10, 2, -8), // *(u64*)(r10-8) += r2
+        i.mov64Imm(0, 0),
+        i.exit(),
+    };
+    try ok(&prog);
+}
+
+test "accept: atomic fetch-add initializes its destination register" {
+    const prog = [_]i.Insn{
+        i.mov64Imm(2, 1),
+        i.atomic(.dw, i.ATOMIC_ADD | i.ATOMIC_FETCH, 10, 2, -8), // r2 = old value (a scalar)
+        i.alu64Imm(.add, 2, 1), // reading r2 is now legal
+        i.mov64Imm(0, 0),
+        i.exit(),
+    };
+    try ok(&prog);
+}
+
+test "accept: atomic cmpxchg reads r0 and src" {
+    const prog = [_]i.Insn{
+        i.mov64Imm(0, 0), // comparand
+        i.mov64Imm(2, 5), // new value
+        i.atomic(.dw, i.ATOMIC_CMPXCHG, 10, 2, -8), // r0 = old
+        i.exit(),
+    };
+    try ok(&prog);
+}
+
+test "reject: atomic with a byte size" {
+    var a = i.atomic(.dw, i.ATOMIC_ADD, 10, 2, -8);
+    a.opcode = i.MODE_ATOMIC | @intFromEnum(i.Size.b) | i.CLASS_STX; // B — not allowed
+    const prog = [_]i.Insn{ i.mov64Imm(2, 1), a, i.exit() };
     try expectError(error.UnknownOpcode, ok(&prog));
+}
+
+test "reject: atomic with an unknown operation in imm" {
+    const prog = [_]i.Insn{
+        i.mov64Imm(2, 1),
+        i.atomic(.dw, 0x33, 10, 2, -8), // 0x33 names no atomic op
+        i.exit(),
+    };
+    try expectError(error.UnknownOpcode, ok(&prog));
+}
+
+test "reject: atomic into the read-only ctx" {
+    const prog = [_]i.Insn{
+        i.mov64Imm(2, 1),
+        i.atomic(.dw, i.ATOMIC_ADD, 1, 2, 0), // base = ctx pointer (read-only)
+        i.exit(),
+    };
+    try expectError(error.WriteToReadonly, ok(&prog));
+}
+
+test "reject: cmpxchg with an uninitialized comparand r0" {
+    const prog = [_]i.Insn{
+        i.mov64Imm(2, 5), // src set, but r0 (comparand) never is
+        i.atomic(.dw, i.ATOMIC_CMPXCHG, 10, 2, -8),
+        i.exit(),
+    };
+    try expectError(error.UninitReg, ok(&prog));
 }
 
 test "reject: malformed LD_IMM64 (missing second slot)" {

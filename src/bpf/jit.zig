@@ -17,13 +17,15 @@
 //! COVERAGE. Emits nearly the whole ISA: ALU64/ALU32 (add/sub/mul/div/mod/and/
 //! or/xor/lsh/rsh/arsh/neg/mov — incl. signed div/mod, MOVSX, and endian/bswap),
 //! LD_IMM64, LDX/ST/STX (b/h/w/dw) including MODE_MEMSX sign-extending loads,
-//! and every CLASS_JMP + CLASS_JMP32 branch (the 32-bit-compare forms and the
-//! JMP32 long JA included) plus JA + EXIT. The only forms still handed back as
-//! error.Unsupported — for the caller to run on the interpreter — are the helper
-//! CALL (needs the embedder's helper table) and atomics (MODE_ATOMIC); both are
-//! rare and land next, one opcode at a time. Partial coverage + clean fallback
-//! is the design: every opcode emitted here is one the differential harness has
-//! already proven byte-identical to vm.zig.
+//! every CLASS_JMP + CLASS_JMP32 branch (the 32-bit-compare forms and the JMP32
+//! long JA included) plus JA + EXIT, the helper CALL (an aligned native call
+//! into the embedder's helper table), and the common atomics (lock add/or/and/
+//! xor, fetch-add via xadd, xchg, cmpxchg). The only forms still handed back as
+//! error.Unsupported — for the caller to run on the interpreter — are the
+//! fetch-and-bitwise atomics (OR/AND/XOR with BPF_FETCH, which need a cmpxchg
+//! retry loop). Partial coverage + clean fallback is the design: every opcode
+//! emitted here is one the differential harness has proven byte-identical to
+//! vm.zig.
 //!
 //! REGISTER ALLOCATION (no spills — 11 eBPF regs fit). The mapping is chosen so
 //! it agrees with BOTH calling conventions at once: eBPF callee-saved r6..r9 +
@@ -333,7 +335,12 @@ fn condCode(op: u8) ?u8 {
 /// `out.ptr` is then callable as a CompiledFn once made executable. NOT
 /// reentrant (module-static scratch); callers serialize (the verify_lock the
 /// run path already holds). MUST be called only on verifier-accepted programs.
-pub fn compile(prog: []const Insn, out: []u8) JitError!usize {
+///
+/// `helpers` is the embedder's helper table (indexed by the CALL immediate, null
+/// slots unregistered) — the SAME table the interpreter runs under. A CALL is
+/// lowered to a native call of helpers[id]; an empty table means any CALL falls
+/// back (error.Unsupported), exactly as the verifier-rejected case would.
+pub fn compile(prog: []const Insn, out: []u8, helpers: []const ?insn.HelperFn) JitError!usize {
     if (prog.len == 0 or prog.len > insn.MAX_INSNS) return error.BadProgram;
 
     var e = Emit{ .buf = out };
@@ -352,11 +359,11 @@ pub fn compile(prog: []const Insn, out: []u8) JitError!usize {
                 pc += 1;
             },
             insn.CLASS_JMP => {
-                if (!try emitJmp(&e, i, pc, false)) return error.Unsupported;
+                if (!try emitJmp(&e, i, pc, false, helpers)) return error.Unsupported;
                 pc += 1;
             },
             insn.CLASS_JMP32 => {
-                if (!try emitJmp(&e, i, pc, true)) return error.Unsupported;
+                if (!try emitJmp(&e, i, pc, true, helpers)) return error.Unsupported;
                 pc += 1;
             },
             insn.CLASS_LDX => {
@@ -409,10 +416,10 @@ fn emitPrologue(e: *Emit) void {
     for (SAVED) |r| e.pushR(r);
     // STACK ALIGNMENT: on entry RSP ≡ 8 (mod 16) — the caller's CALL pushed the
     // return address. SAVED is 6 regs = 48 bytes ≡ 0 (mod 16), so the body runs
-    // at RSP ≡ 8 (mod 16). Fine today: the body emits no `call`, so SysV's
-    // "RSP ≡ 0 at a CALL site" rule is never engaged. WHEN helper-CALL emission
-    // lands, it MUST realign to 16 first (pad SAVED to an odd count, or bracket
-    // the call with `sub rsp,8`/`add rsp,8`) or an aligned-SSE callee can #GP.
+    // at RSP ≡ 8 (mod 16). The body itself never touches the native stack, so
+    // this invariant holds everywhere — EXCEPT a helper CALL, where SysV demands
+    // RSP ≡ 0 at the call site; emitCall brackets the `call` with sub/add rsp,8
+    // to realign just there, keeping the rest of the body at the ≡ 8 invariant.
     // r10 (frame pointer) = stack_base (rsi) + 512, BEFORE we clobber rsi (=r0).
     //   lea r12, [rsi + 512]
     e.mem(true, false, &.{0x8D}, R12, RSI, STACK_TOP_OFFSET);
@@ -673,14 +680,18 @@ fn signExtendBitsC(val: u64, bits: u32) u64 {
     return @bitCast(sv >> shift);
 }
 
-fn emitJmp(e: *Emit, i: Insn, pc: usize, is32: bool) JitError!bool {
+fn emitJmp(e: *Emit, i: Insn, pc: usize, is32: bool, helpers: []const ?insn.HelperFn) JitError!bool {
     const op = i.opcode & 0xF0;
 
     if (op == @intFromEnum(insn.JmpCode.exit)) {
         emitEpilogue(e);
         return true;
     }
-    if (op == @intFromEnum(insn.JmpCode.call)) return false; // -> Unsupported
+    if (op == @intFromEnum(insn.JmpCode.call)) {
+        // CALL exists only in CLASS_JMP; a JMP32 "call" is malformed — fall back.
+        if (is32) return false;
+        return emitCall(e, i, helpers);
+    }
     if (op == @intFromEnum(insn.JmpCode.ja)) {
         // CLASS_JMP JA uses the 16-bit offset; the CLASS_JMP32 long JA (v4) takes
         // its 32-bit displacement from imm instead.
@@ -719,6 +730,47 @@ fn emitJmp(e: *Emit, i: Insn, pc: usize, is32: bool) JitError!bool {
     return true;
 }
 
+/// Helper CALL: native call of helpers[imm]. eBPF arg regs r1..r5 are shuffled
+/// into the SysV integer arg regs, the stack is realigned to 16 for the call,
+/// and r0 takes the return value — matching vm.zig's `h(r1,r2,r3,r4,r5)` exactly.
+/// Returns false (→ fall back to the interpreter) for any form not lowered:
+/// src!=0 (bpf-to-bpf / runtime-fn) or an unregistered id. Those are also what
+/// the verifier rejects, so this never fires for a verified program; it is the
+/// JIT's own belt-and-suspenders, since compile() trusts but never re-verifies.
+fn emitCall(e: *Emit, i: Insn, helpers: []const ?insn.HelperFn) bool {
+    if (i.src() != 0) return false; // only helper-by-id is emitted
+    const id = i.imm;
+    if (id < 0 or @as(usize, @intCast(id)) >= helpers.len) return false;
+    const h = helpers[@intCast(id)] orelse return false;
+    const addr: u64 = @intFromPtr(h);
+
+    // eBPF -> SysV argument shuffle. r1 already lives in rdi (arg0). r2..r5 live
+    // in r8..r11; move them down to rsi/rdx/rcx/r8. ORDER: r2's home (r8) is also
+    // arg5's destination, so write rsi (from r8) BEFORE clobbering r8 from r11.
+    e.rr(true, 0x89, REG[2], RSI); // mov rsi, r8   (arg2 = r2)
+    e.rr(true, 0x89, REG[3], RDX); // mov rdx, r9   (arg3 = r3)
+    e.rr(true, 0x89, REG[4], RCX); // mov rcx, r10  (arg4 = r4)
+    e.rr(true, 0x89, REG[5], REG[2]); // mov r8, r11   (arg5 = r5) — last
+
+    // Realign to RSP ≡ 0 (mod 16) across the call (the body runs at ≡ 8). eBPF
+    // r6..r10 sit in x86 callee-saved registers, so the helper preserves them;
+    // r0..r5 (caller-saved) are clobbered, exactly as eBPF mandates after a CALL.
+    e.byte(0x48);
+    e.byte(0x83);
+    e.byte(0xEC);
+    e.byte(0x08); // sub rsp, 8
+    e.movImm64(RAX, addr); // movabs rax, &helper
+    e.byte(0xFF);
+    e.byte(0xD0); // call rax
+    e.byte(0x48);
+    e.byte(0x83);
+    e.byte(0xC4);
+    e.byte(0x08); // add rsp, 8
+
+    e.rr(true, 0x89, RAX, REG[0]); // mov rsi, rax  (r0 = return value)
+    return true;
+}
+
 fn emitLoad(e: *Emit, i: Insn) JitError!void {
     const mode = i.opcode & 0xE0;
     const size: insn.Size = @enumFromInt(i.opcode & 0x18);
@@ -745,7 +797,11 @@ fn emitLoad(e: *Emit, i: Insn) JitError!void {
 
 fn emitStore(e: *Emit, i: Insn, from_reg: bool) JitError!void {
     const mode = i.opcode & 0xE0;
-    if (mode != insn.MODE_MEM) return error.Unsupported; // atomics later
+    if (mode == insn.MODE_ATOMIC) {
+        if (!from_reg) return error.Unsupported; // atomics are STX only
+        return emitAtomic(e, i);
+    }
+    if (mode != insn.MODE_MEM) return error.Unsupported;
     const size: insn.Size = @enumFromInt(i.opcode & 0x18);
     const base = REG[i.dst()];
     const disp: i32 = i.offset;
@@ -784,6 +840,56 @@ fn emitStore(e: *Emit, i: Insn, from_reg: bool) JitError!void {
             },
         }
     }
+}
+
+/// Atomic RMW (STX | MODE_ATOMIC), size W or DW. Each form is the x86 lock op
+/// whose value semantics match vm.zig's execAtomic exactly (the sandbox is
+/// single-threaded, so the lock is invisible to the program — but free, and it
+/// keeps the kernel-side map updates well-defined). The rare fetch-and-bitwise
+/// forms (OR/AND/XOR | BPF_FETCH) would need a cmpxchg retry loop; they return
+/// error.Unsupported and run on the interpreter instead — clean partial coverage.
+fn emitAtomic(e: *Emit, i: Insn) JitError!void {
+    const size: insn.Size = @enumFromInt(i.opcode & 0x18);
+    if (size != .w and size != .dw) return error.Unsupported;
+    const w = (size == .dw); // REX.W for the 64-bit form; 32-bit zero-extends
+    const base = REG[i.dst()]; // memory base pointer
+    const src = REG[i.src()]; // operand (and, for fetch/xchg, receives the old)
+    const disp: i32 = i.offset;
+
+    switch (i.imm) {
+        // Non-fetch RMW: lock <op> [base+disp], src
+        insn.ATOMIC_ADD => emitLockRM(e, w, 0x01, src, base, disp), // lock add
+        insn.ATOMIC_OR => emitLockRM(e, w, 0x09, src, base, disp), // lock or
+        insn.ATOMIC_AND => emitLockRM(e, w, 0x21, src, base, disp), // lock and
+        insn.ATOMIC_XOR => emitLockRM(e, w, 0x31, src, base, disp), // lock xor
+
+        // ADD|FETCH: lock xadd [mem], src — src receives the pre-add value.
+        insn.ATOMIC_ADD | insn.ATOMIC_FETCH => {
+            e.byte(0xF0); // lock
+            e.mem(w, false, &.{ 0x0F, 0xC1 }, src, base, disp); // xadd r/m, src
+        },
+
+        // XCHG: a memory-operand xchg is implicitly locked; src <- old mem.
+        insn.ATOMIC_XCHG => e.mem(w, false, &.{0x87}, src, base, disp), // xchg r/m, src
+
+        // CMPXCHG: stage r0 in (e/r)ax, lock cmpxchg, then read the old value —
+        // which cmpxchg always leaves in (e/r)ax — back into r0.
+        insn.ATOMIC_CMPXCHG => {
+            e.rr(w, 0x89, REG[0], RAX); // mov (e)ax, r0
+            e.byte(0xF0); // lock
+            e.mem(w, false, &.{ 0x0F, 0xB1 }, src, base, disp); // cmpxchg r/m, src
+            e.rr(w, 0x89, RAX, REG[0]); // mov r0, (e)ax
+        },
+
+        else => return error.Unsupported, // OR/AND/XOR | FETCH: interpreter handles it
+    }
+}
+
+/// lock <op> [base+disp], src — the shared shape of the non-fetch atomics. The
+/// LOCK (0xF0) prefix precedes REX, which e.mem emits next.
+fn emitLockRM(e: *Emit, w: bool, op: u8, src: u8, base: u8, disp: i32) void {
+    e.byte(0xF0);
+    e.mem(w, false, &.{op}, src, base, disp);
 }
 
 /// next_pc = (pc + 1) + delta, per RFC (delta relative to the FOLLOWING insn).

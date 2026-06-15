@@ -67,9 +67,11 @@ pub const Region = struct {
 };
 
 /// Kernel helper, eBPF calling convention: args in r1..r5, result to r0.
-/// Runs NATIVE — a helper is trusted kernel code and must do its own
-/// argument validation (the program controls all five values).
-pub const HelperFn = *const fn (u64, u64, u64, u64, u64) u64;
+/// Runs NATIVE — a helper is trusted kernel code and must do its own argument
+/// validation (the program controls all five values). The canonical type lives
+/// in insn.zig (callconv(.c) — pinned so the interpreter and the JIT call
+/// helpers through the identical ABI); re-exported here for vm.Env users.
+pub const HelperFn = insn.HelperFn;
 
 /// Embedder-supplied execution environment. `helpers` is indexed by the
 /// CALL immediate; null slots are unregistered ids. Defaults reproduce the
@@ -312,7 +314,10 @@ pub const Vm = struct {
     fn execStore(self: *Vm, i: Insn, env: Env, from_reg: bool) Error!void {
         const size: insn.Size = @enumFromInt(i.opcode & 0x18);
         const mode = i.opcode & 0xe0;
-        if (mode == insn.MODE_ATOMIC) return error.UnknownOpcode; // M3+
+        if (mode == insn.MODE_ATOMIC) {
+            if (!from_reg) return error.UnknownOpcode; // atomics are STX only
+            return self.execAtomic(i, env);
+        }
         if (mode != insn.MODE_MEM) return error.UnknownOpcode;
 
         const addr = self.regs[i.dst()] +% @as(u64, @bitCast(@as(i64, i.offset)));
@@ -325,6 +330,53 @@ pub const Vm = struct {
             .h => @as(*align(1) u16, @ptrFromInt(@as(usize, @intCast(addr)))).* = @truncate(val),
             .w => @as(*align(1) u32, @ptrFromInt(@as(usize, @intCast(addr)))).* = @truncate(val),
             .dw => @as(*align(1) u64, @ptrFromInt(@as(usize, @intCast(addr)))).* = val,
+        }
+    }
+
+    // --- atomic read-modify-write (STX | MODE_ATOMIC), size W or DW ---
+    // The sandbox runs single-threaded against private memory, so a plain
+    // load-op-store yields the SAME observable result a hardware lock op would
+    // (which is what the JIT emits) — atomicity is unobservable here. We model
+    // the value semantics exactly: the operation, the optional fetch of the old
+    // value (into src, or into r0 for CMPXCHG), and 32-bit zero-extension.
+    fn execAtomic(self: *Vm, i: Insn, env: Env) Error!void {
+        const size: insn.Size = @enumFromInt(i.opcode & 0x18);
+        if (size != .w and size != .dw) return error.UnknownOpcode;
+        const is64 = (size == .dw);
+        const n = size.bytes();
+
+        const addr = self.regs[i.dst()] +% @as(u64, @bitCast(@as(i64, i.offset)));
+        try self.checkMem(env, addr, n, true); // reads AND writes → must be writable
+
+        const src = self.regs[i.src()];
+        const fetch = (i.imm & insn.ATOMIC_FETCH) != 0;
+        const op = i.imm & ~insn.ATOMIC_FETCH; // 0x00/0x40/0x50/0xa0/0xe0/0xf0
+
+        const old = atomicLoad(addr, n);
+        var new_val: u64 = old;
+        var store_it = true;
+        switch (op) {
+            insn.ATOMIC_ADD => new_val = old +% src,
+            insn.ATOMIC_OR => new_val = old | src,
+            insn.ATOMIC_AND => new_val = old & src,
+            insn.ATOMIC_XOR => new_val = old ^ src,
+            0xe0 => new_val = src, // XCHG
+            0xf0 => { // CMPXCHG: store src only if *p == r0 (compared at width)
+                const want = if (is64) self.regs[0] else (self.regs[0] & 0xFFFF_FFFF);
+                const cur = if (is64) old else (old & 0xFFFF_FFFF);
+                if (cur == want) new_val = src else store_it = false;
+            },
+            else => return error.UnknownOpcode,
+        }
+        if (store_it) atomicStore(addr, n, new_val);
+
+        // Fetch writeback: CMPXCHG always returns the old value in r0; XCHG and
+        // the FETCH-flagged arithmetic return it in src. 32-bit zero-extends.
+        const old_w = if (is64) old else (old & 0xFFFF_FFFF);
+        if (op == 0xf0) {
+            self.regs[0] = old_w;
+        } else if (fetch) {
+            self.regs[i.src()] = old_w;
         }
     }
 
@@ -464,6 +516,22 @@ fn movMaybeSx(i: Insn, src_val: u64, is64: bool) u64 {
     const bits: u6 = @intCast(i.offset);
     const r = signExtendBits(src_val, bits);
     return if (is64) r else (r & 0xFFFF_FFFF);
+}
+
+// Width-dispatched unaligned access for atomics (n is 4 or 8, verifier-checked).
+fn atomicLoad(addr: u64, n: u64) u64 {
+    const p: usize = @intCast(addr);
+    return if (n == 4)
+        @as(*align(1) const u32, @ptrFromInt(p)).*
+    else
+        @as(*align(1) const u64, @ptrFromInt(p)).*;
+}
+fn atomicStore(addr: u64, n: u64, val: u64) void {
+    const p: usize = @intCast(addr);
+    if (n == 4)
+        @as(*align(1) u32, @ptrFromInt(p)).* = @truncate(val)
+    else
+        @as(*align(1) u64, @ptrFromInt(p)).* = val;
 }
 
 fn signExtend(val: u64, n_bytes: u64) u64 {

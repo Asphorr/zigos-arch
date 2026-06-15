@@ -24,6 +24,21 @@ const CFG = v.Config{ .ctx_len = CTX_LEN, .ctx_writable = false, .helpers = &.{}
 const IHELPERS = [_]?vm.HelperFn{};
 const FUEL: u64 = 1 << 20; // huge: a verified DAG always finishes well under this
 
+// Helper table for CALL tests, callconv(.c) — the pinned helper ABI both the
+// interpreter and the JIT call through. hWeighted's distinct per-argument
+// coefficients make a mis-ordered argument shuffle observable; hConst99 ignores
+// its args; hInc has a result that chains into later instructions.
+fn hWeighted(a: u64, b: u64, c: u64, d: u64, e: u64) callconv(.c) u64 {
+    return a +% (b *% 2) +% (c *% 3) +% (d *% 4) +% (e *% 5);
+}
+fn hConst99(_: u64, _: u64, _: u64, _: u64, _: u64) callconv(.c) u64 {
+    return 99;
+}
+fn hInc(a: u64, _: u64, _: u64, _: u64, _: u64) callconv(.c) u64 {
+    return a +% 1;
+}
+const THELPERS = [_]?vm.HelperFn{ null, hWeighted, hConst99, hInc };
+
 // === executable code buffer (host) ===
 
 var code_page: []align(std.heap.page_size_min) u8 = undefined;
@@ -39,9 +54,9 @@ fn mapCode() !void {
     );
 }
 
-/// Compile + execute. Returns null if the JIT doesn't support the program.
-fn runJit(prog: []const i.Insn, ctx_ptr: u64) !?u64 {
-    const n = jit.compile(prog, code_page) catch |err| switch (err) {
+/// Compile + execute under `helpers`. Returns null if the JIT can't lower it.
+fn runJitH(prog: []const i.Insn, ctx_ptr: u64, helpers: []const ?vm.HelperFn) !?u64 {
+    const n = jit.compile(prog, code_page, helpers) catch |err| switch (err) {
         error.Unsupported => return null,
         else => return err,
     };
@@ -50,25 +65,34 @@ fn runJit(prog: []const i.Insn, ctx_ptr: u64) !?u64 {
     const f: jit.CompiledFn = @ptrFromInt(@intFromPtr(code_page.ptr));
     return f(ctx_ptr, @intFromPtr(&stack));
 }
+fn runJit(prog: []const i.Insn, ctx_ptr: u64) !?u64 {
+    return runJitH(prog, ctx_ptr, &IHELPERS);
+}
 
-fn runInterp(prog: []const i.Insn, ctx: *[CTX_LEN]u8) !u64 {
+fn runInterpH(prog: []const i.Insn, ctx: *[CTX_LEN]u8, helpers: []const ?vm.HelperFn) !u64 {
     const env = vm.Env{
         .regions = &[_]vm.Region{.{ .base = @intFromPtr(ctx), .len = CTX_LEN, .writable = false }},
-        .helpers = &IHELPERS,
+        .helpers = helpers,
     };
     var machine = vm.Vm{};
     const res = try machine.runEnv(prog, @intFromPtr(ctx), FUEL, env);
     return res.r0;
 }
+fn runInterp(prog: []const i.Insn, ctx: *[CTX_LEN]u8) !u64 {
+    return runInterpH(prog, ctx, &IHELPERS);
+}
 
 // === hand-written sanity programs ===
 
-fn expectProg(prog: []const i.Insn, want: u64) !void {
+fn expectProgH(prog: []const i.Insn, want: u64, helpers: []const ?vm.HelperFn) !void {
     var ctx: [CTX_LEN]u8 align(8) = [_]u8{0} ** CTX_LEN;
-    const interp = try runInterp(prog, &ctx);
-    const jitted = (try runJit(prog, @intFromPtr(&ctx))) orelse return error.UnexpectedUnsupported;
+    const interp = try runInterpH(prog, &ctx, helpers);
+    const jitted = (try runJitH(prog, @intFromPtr(&ctx), helpers)) orelse return error.UnexpectedUnsupported;
     try std.testing.expectEqual(want, interp);
     try std.testing.expectEqual(want, jitted);
+}
+fn expectProg(prog: []const i.Insn, want: u64) !void {
+    return expectProgH(prog, want, &IHELPERS);
 }
 
 test "jit: mov imm + exit" {
@@ -154,6 +178,78 @@ test "jit: ja forward" {
         i.mov64Imm(0, 2),
         i.exit(),
     }, 1);
+}
+
+// === helper CALL ===
+// NOTE: r1..r5 are caller-saved — undefined after a CALL (the verifier marks
+// them uninit; the JIT really clobbers them; the interpreter happens to leave
+// them intact). These programs therefore never READ r1..r5 after a call, which
+// is exactly the contract a verified program obeys, so interp and JIT agree.
+
+test "jit: call helper passes args in order, returns r0" {
+    try mapCode();
+    // r1..r5 = 1,2,3,4,5; hWeighted = 1 + 2*2 + 3*3 + 4*4 + 5*5 = 55.
+    // A swapped argument shuffle would give a different weighted sum.
+    try expectProgH(&.{
+        i.mov64Imm(1, 1),
+        i.mov64Imm(2, 2),
+        i.mov64Imm(3, 3),
+        i.mov64Imm(4, 4),
+        i.mov64Imm(5, 5),
+        i.call(1),
+        i.exit(),
+    }, 55, &THELPERS);
+}
+
+test "jit: call helper ignoring its args" {
+    try expectProgH(&.{
+        i.mov64Imm(1, 123),
+        i.call(2), // hConst99
+        i.exit(),
+    }, 99, &THELPERS);
+}
+
+test "jit: call result chains into later instructions" {
+    // r1=10; r0 = hInc(10) = 11; r0 += 1 => 12  (reads r0, never the clobbered r1)
+    try expectProgH(&.{
+        i.mov64Imm(1, 10),
+        i.call(3),
+        i.alu64Imm(.add, 0, 1),
+        i.exit(),
+    }, 12, &THELPERS);
+}
+
+test "jit: two calls — arg re-set between them" {
+    // r1=10 -> hInc=11; r1=20 -> hInc=21; exit 21
+    try expectProgH(&.{
+        i.mov64Imm(1, 10),
+        i.call(3),
+        i.mov64Imm(1, 20),
+        i.call(3),
+        i.exit(),
+    }, 21, &THELPERS);
+}
+
+test "jit: call preserves callee-saved eBPF regs r6..r9" {
+    // Set r6=1000 BEFORE a call; the helper (native C) must preserve x86 rbx/r13/
+    // r14/r15 where r6..r9 live, so r6 survives. r0 = r6 + hInc(0)=1 => 1001.
+    try expectProgH(&.{
+        i.mov64Imm(6, 1000),
+        i.mov64Imm(1, 0),
+        i.call(3), // r0 = 1
+        i.alu64Reg(.add, 0, 6), // r0 += r6 (1000) => 1001
+        i.exit(),
+    }, 1001, &THELPERS);
+}
+
+test "jit: unregistered helper id is declined (falls back to interpreter)" {
+    try mapCode();
+    // Id 0 is null in THELPERS: the JIT must NOT emit it (returns Unsupported so
+    // the caller interprets, where it would surface as BadHelperId).
+    var ctx: [CTX_LEN]u8 align(8) = [_]u8{0} ** CTX_LEN;
+    const prog = [_]i.Insn{ i.mov64Imm(1, 0), i.call(0), i.exit() };
+    const r = try runJitH(&prog, @intFromPtr(&ctx), &THELPERS);
+    try std.testing.expect(r == null);
 }
 
 // === new opcodes (increment 1b): div/mod, endian/bswap, MOVSX, MEMSX, JMP32 ===
@@ -260,6 +356,121 @@ test "jit: JMP32 long JA uses the imm displacement" {
     }, 1);
 }
 
+// === atomics (STX | MODE_ATOMIC) ===
+// expectProg runs both interp and JIT and compares to `want`; each program
+// surfaces the atomic's memory and/or register effect into r0 so any divergence
+// shows up. All accesses are 8-aligned stack slots (in-bounds by construction).
+
+test "jit: atomic add writes memory (dw and w)" {
+    try mapCode();
+    try expectProg(&.{ // dw: 100 + 5 = 105
+        i.st(.dw, 10, -8, 100),
+        i.mov64Imm(2, 5),
+        i.atomic(.dw, i.ATOMIC_ADD, 10, 2, -8),
+        i.ldx(.dw, 0, 10, -8),
+        i.exit(),
+    }, 105);
+    try expectProg(&.{ // w: 0 + 7 = 7
+        i.st(.w, 10, -8, 0),
+        i.mov64Imm(2, 7),
+        i.atomic(.w, i.ATOMIC_ADD, 10, 2, -8),
+        i.ldx(.w, 0, 10, -8),
+        i.exit(),
+    }, 7);
+}
+
+test "jit: atomic or/and/xor (non-fetch)" {
+    try mapCode();
+    try expectProg(&.{ i.st(.dw, 10, -8, 0xF0), i.mov64Imm(2, 0x0F), i.atomic(.dw, i.ATOMIC_OR, 10, 2, -8), i.ldx(.dw, 0, 10, -8), i.exit() }, 0xFF);
+    try expectProg(&.{ i.st(.dw, 10, -8, 0xFF), i.mov64Imm(2, 0x0F), i.atomic(.dw, i.ATOMIC_AND, 10, 2, -8), i.ldx(.dw, 0, 10, -8), i.exit() }, 0x0F);
+    try expectProg(&.{ i.st(.dw, 10, -8, 0xFF), i.mov64Imm(2, 0x0F), i.atomic(.dw, i.ATOMIC_XOR, 10, 2, -8), i.ldx(.dw, 0, 10, -8), i.exit() }, 0xF0);
+}
+
+test "jit: atomic fetch-add returns old value, updates memory" {
+    try mapCode();
+    try expectProg(&.{ // r2 receives the old value (100)
+        i.st(.dw, 10, -8, 100),
+        i.mov64Imm(2, 5),
+        i.atomic(.dw, i.ATOMIC_ADD | i.ATOMIC_FETCH, 10, 2, -8),
+        i.mov64Reg(0, 2),
+        i.exit(),
+    }, 100);
+    try expectProg(&.{ // memory became 105
+        i.st(.dw, 10, -8, 100),
+        i.mov64Imm(2, 5),
+        i.atomic(.dw, i.ATOMIC_ADD | i.ATOMIC_FETCH, 10, 2, -8),
+        i.ldx(.dw, 0, 10, -8),
+        i.exit(),
+    }, 105);
+}
+
+test "jit: atomic xchg swaps register and memory" {
+    try mapCode();
+    // r2=0xBB -> mem; r2 receives old 0xAA. r0 = (old<<8) | new_mem = 0xAABB.
+    try expectProg(&.{
+        i.st(.dw, 10, -8, 0xAA),
+        i.mov64Imm(2, 0xBB),
+        i.atomic(.dw, i.ATOMIC_XCHG, 10, 2, -8),
+        i.ldx(.dw, 3, 10, -8), // r3 = mem = 0xBB
+        i.alu64Imm(.lsh, 2, 8), // r2 = 0xAA00
+        i.alu64Reg(.add, 2, 3), // r2 = 0xAABB
+        i.mov64Reg(0, 2),
+        i.exit(),
+    }, 0xAABB);
+}
+
+test "jit: atomic cmpxchg — match stores new" {
+    try mapCode();
+    try expectProg(&.{
+        i.st(.dw, 10, -8, 100),
+        i.mov64Imm(0, 100), // comparand == mem
+        i.mov64Imm(2, 999), // new value
+        i.atomic(.dw, i.ATOMIC_CMPXCHG, 10, 2, -8), // mem 100->999, r0=old 100
+        i.ldx(.dw, 0, 10, -8), // r0 = mem = 999
+        i.exit(),
+    }, 999);
+}
+
+test "jit: atomic cmpxchg — mismatch leaves memory, returns current" {
+    try mapCode();
+    try expectProg(&.{
+        i.st(.dw, 10, -8, 100),
+        i.mov64Imm(0, 55), // comparand != mem
+        i.mov64Imm(2, 999),
+        i.atomic(.dw, i.ATOMIC_CMPXCHG, 10, 2, -8), // no store; r0 = old 100
+        i.ldx(.dw, 3, 10, -8), // r3 = mem (still 100)
+        i.alu64Reg(.add, 0, 3), // 100 + 100 = 200
+        i.exit(),
+    }, 200);
+}
+
+test "jit: atomic cmpxchg 32-bit zero-extends the old value into r0" {
+    try mapCode();
+    const a = i.ldImm64(0, 0x8000_0000); // r0 low32 matches the stored word
+    try expectProg(&.{
+        a[0], a[1],
+        i.st(.w, 10, -8, @bitCast(@as(u32, 0x8000_0000))),
+        i.mov64Imm(2, 1),
+        i.atomic(.w, i.ATOMIC_CMPXCHG, 10, 2, -8), // matches; r0 = old (zero-extended)
+        i.exit(),
+    }, 0x8000_0000);
+}
+
+test "jit: fetch-and-bitwise atomics fall back to the interpreter" {
+    try mapCode();
+    var ctx: [CTX_LEN]u8 align(8) = [_]u8{0} ** CTX_LEN;
+    inline for (.{ i.ATOMIC_OR, i.ATOMIC_AND, i.ATOMIC_XOR }) |base_op| {
+        const prog = [_]i.Insn{
+            i.st(.dw, 10, -8, 0),
+            i.mov64Imm(2, 1),
+            i.atomic(.dw, base_op | i.ATOMIC_FETCH, 10, 2, -8),
+            i.exit(),
+        };
+        const r = try runJit(&prog, @intFromPtr(&ctx));
+        try std.testing.expect(r == null); // declined → interpreter handles it
+    }
+}
+
 // === random differential ===
 
 const MAXLEN = 48;
@@ -288,6 +499,27 @@ fn aSize(r: std.Random) i.Size {
         1 => .h,
         2 => .w,
         else => .dw,
+    };
+}
+fn aSizeWDw(r: std.Random) i.Size {
+    return if (r.boolean()) .w else .dw; // atomics are 32/64-bit only
+}
+fn aOff(r: std.Random) i16 {
+    // 8-aligned stack slot in [-64,-8]: in-bounds for both .w and .dw atomics.
+    return @as(i16, @intCast(r.intRangeAtMost(i32, -8, -1))) * 8;
+}
+fn atomicOp(r: std.Random) i32 {
+    return switch (r.intRangeAtMost(u8, 0, 9)) {
+        0 => i.ATOMIC_ADD,
+        1 => i.ATOMIC_ADD | i.ATOMIC_FETCH,
+        2 => i.ATOMIC_OR,
+        3 => i.ATOMIC_OR | i.ATOMIC_FETCH,
+        4 => i.ATOMIC_AND,
+        5 => i.ATOMIC_AND | i.ATOMIC_FETCH,
+        6 => i.ATOMIC_XOR,
+        7 => i.ATOMIC_XOR | i.ATOMIC_FETCH,
+        8 => i.ATOMIC_XCHG,
+        else => i.ATOMIC_CMPXCHG,
     };
 }
 fn aluCode(r: std.Random) i.AluCode {
@@ -364,7 +596,7 @@ fn gen(r: std.Random, buf: *[MAXLEN]i.Insn) usize {
             buf[pc] = i.exit();
             break;
         }
-        switch (r.intRangeAtMost(u8, 0, 13)) {
+        switch (r.intRangeAtMost(u8, 0, 14)) {
             0 => buf[pc] = i.mov64Imm(valReg(r), small_imm),
             1 => buf[pc] = i.mov64Reg(valReg(r), valReg(r)),
             2 => buf[pc] = i.alu64Imm(aluCode(r), valReg(r), small_imm),
@@ -400,6 +632,7 @@ fn gen(r: std.Random, buf: *[MAXLEN]i.Insn) usize {
                 }
                 buf[pc] = i.mov64Imm(valReg(r), small_imm);
             },
+            13 => buf[pc] = i.atomic(aSizeWDw(r), atomicOp(r), 10, valReg(r), aOff(r)), // stack-only (writable)
             else => buf[pc] = i.exit(),
         }
         pc += 1;
@@ -554,7 +787,7 @@ test "jit: ALU/JMP differential without memory (full opcode coverage)" {
         const len = genAlu(r, &buf);
         const prog = buf[0..len];
 
-        const n = jit.compile(prog, code_page) catch |err| switch (err) {
+        const n = jit.compile(prog, code_page, &IHELPERS) catch |err| switch (err) {
             error.Unsupported => continue, // every ALU/JMP form should emit; tolerate gaps
             else => {
                 std.debug.print("\nJIT compile error {s}:\n", .{@errorName(err)});
@@ -637,7 +870,7 @@ test "jit: perf — native JIT vs interpreter (informational)" {
         i.exit(),
     };
 
-    const code_len = try jit.compile(&prog, code_page);
+    const code_len = try jit.compile(&prog, code_page, &IHELPERS);
     std.debug.assert(code_len <= code_page.len);
     const f: jit.CompiledFn = @ptrFromInt(@intFromPtr(code_page.ptr));
 

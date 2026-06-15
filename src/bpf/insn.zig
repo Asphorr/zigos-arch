@@ -24,10 +24,11 @@
 //! r6-r9 = callee-saved, r10 = read-only frame pointer (top of the 512-byte
 //! stack; programs address it with negative offsets).
 //!
-//! M1 scope note: the constants below cover the full base ISA plus the v4
-//! additions vm.zig implements (sdiv/smod via offset, movsx, bswap, memsx,
-//! jmp32-class long JA). Legacy packet-access modes (ABS/IND) and atomics
-//! are encoded here for completeness but rejected by the interpreter.
+//! Scope note: the constants below cover the full base ISA plus the v4 additions
+//! vm.zig implements (sdiv/smod via offset, movsx, bswap, memsx, jmp32-class long
+//! JA) and the atomics (add/or/and/xor ±fetch, xchg, cmpxchg). Only the legacy
+//! cBPF packet-access modes (ABS/IND) remain encoded for completeness yet
+//! rejected by the interpreter and verifier.
 
 const std = @import("std");
 
@@ -61,6 +62,15 @@ pub const MAX_INSNS: usize = 4096;
 pub const STACK_SIZE: usize = 512;
 
 pub const NUM_REGS: usize = 11; // r0..r10
+
+/// A kernel helper, eBPF calling convention (args in r1..r5, result to r0)
+/// lowered to the host C ABI. PINNED to callconv(.c) on purpose: the JIT emits a
+/// hardcoded SysV `call` (args in rdi/rsi/rdx/rcx/r8, result in rax), so the
+/// interpreter MUST call helpers through the very same ABI or the two diverge.
+/// A helper runs NATIVE — trusted kernel code — and validates its own args
+/// (the program controls all five values). Defined here, the leaf both vm.zig
+/// and jit.zig already import, so neither has to depend on the other for it.
+pub const HelperFn = *const fn (u64, u64, u64, u64, u64) callconv(.c) u64;
 
 // === Instruction classes (opcode bits 0..2) ===
 pub const CLASS_LD: u8 = 0x00; // non-standard loads (ld_imm64; legacy ABS/IND)
@@ -141,6 +151,20 @@ pub const MODE_ATOMIC: u8 = 0xc0; // atomic ops — rejected until M2+
 
 /// The full LD_IMM64 opcode (CLASS_LD | MODE_IMM | Size.dw).
 pub const OP_LD_IMM64: u8 = 0x18;
+
+// === Atomic operations (RFC 9669 §4.5.3) ===
+// Encoded as a CLASS_STX | MODE_ATOMIC store, size W or DW only. The operation
+// lives in the `imm` field: its high nibble reuses the ALU op encoding, and the
+// BPF_FETCH bit makes the op ALSO return the PRE-operation memory value (into the
+// src register for arithmetic/XCHG, into r0 for CMPXCHG). XCHG and CMPXCHG are
+// inherently fetching. Anything else in imm is malformed (verifier-rejected).
+pub const ATOMIC_FETCH: i32 = 0x01; // modifier: also load the old value
+pub const ATOMIC_ADD: i32 = 0x00; // *p += src
+pub const ATOMIC_OR: i32 = 0x40; // *p |= src
+pub const ATOMIC_AND: i32 = 0x50; // *p &= src
+pub const ATOMIC_XOR: i32 = 0xa0; // *p ^= src
+pub const ATOMIC_XCHG: i32 = 0xe1; // old = *p; *p = src; src = old   (0xe0 | FETCH)
+pub const ATOMIC_CMPXCHG: i32 = 0xf1; // old = *p; if (*p==r0) *p = src; r0 = old (0xf0 | FETCH)
 
 // =========================================================================
 // Builders — Zig spellings of the kernel's BPF_* macros, so harness tests
@@ -238,6 +262,12 @@ pub fn st(size: Size, d: u4, off: i16, imm: i32) Insn {
 /// *(size *)(dst + off) = src
 pub fn stx(size: Size, d: u4, s: u4, off: i16) Insn {
     return .{ .opcode = MODE_MEM | @intFromEnum(size) | CLASS_STX, .regs = packRegs(d, s), .offset = off, .imm = 0 };
+}
+
+/// Atomic read-modify-write on *(size *)(dst + off) with operand `src`. `size`
+/// is .w or .dw; `op` is one of the ATOMIC_* values (optionally | ATOMIC_FETCH).
+pub fn atomic(size: Size, op: i32, d: u4, s: u4, off: i16) Insn {
+    return .{ .opcode = MODE_ATOMIC | @intFromEnum(size) | CLASS_STX, .regs = packRegs(d, s), .offset = off, .imm = op };
 }
 
 /// dst = imm64 — occupies two slots.

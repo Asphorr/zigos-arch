@@ -70,7 +70,7 @@ const HOOK_FUEL: u64 = 256;
 // Table indexed by the CALL immediate. Id 0 is deliberately unregistered —
 // a zero-initialized/garbage CALL must fail, not silently hit a real helper.
 
-fn helperCountPid(pid: u64, _: u64, _: u64, _: u64, _: u64) u64 {
+fn helperCountPid(pid: u64, _: u64, _: u64, _: u64, _: u64) callconv(.c) u64 {
     // The program controls this argument — validate like any user input.
     if (pid >= process.MAX_PROCS) return 1;
     _ = @atomicRmw(u64, &counts[@intCast(pid)], .Add, 1, .monotonic);
@@ -150,6 +150,7 @@ pub fn init() void {
         serial.print("[zbpf] verifier: builtin FAILED ({s}) — syscall hook DISABLED\n", .{@errorName(e)});
     }
     jitInit();
+    hookJitInit();
 }
 
 // === userspace loading: sys_bpf (verify-and-run) ===
@@ -201,11 +202,12 @@ pub var user_rejects: u64 = 0;
 // Safety model: the JIT runs with NO runtime fuel or bounds checks — it trusts
 // the verifier's proofs (every memory access in range, loops bounded), exactly
 // as a production JIT trusts its verifier. The interpreter remains the fallback
-// and keeps all of its own runtime checks. Any program the JIT can't lower yet
-// (helper CALL, atomics) or that overflows the buffer simply runs on the
-// interpreter — a miss is never a failure. The whole path is serialized by
-// verify_lock, which also guards jit.zig's module-static codegen scratch and the
-// single shared code buffer below.
+// and keeps all of its own runtime checks. The JIT now lowers helper CALLs (a
+// native call into the helper table) and the common atomics; only the rare
+// fetch-and-bitwise atomics, or a program that overflows the buffer, fall back
+// to the interpreter — a miss is never a failure. The userspace run path is
+// serialized by verify_lock, which also guards jit.zig's module-static codegen
+// scratch and the single shared code buffer below.
 const JIT_CODE_FRAMES: u32 = 16; // 64 KB — comfortably past the worst-case expansion of a ~1000-insn program
 const JIT_CODE_SIZE: usize = JIT_CODE_FRAMES * 4096;
 var jit_code: ?[]u8 = null; // executable code buffer (physmap VA); null if PMM couldn't spare the run
@@ -215,6 +217,18 @@ var jit_stack: [insn.STACK_SIZE]u8 align(16) = undefined;
 pub var jit_enabled: bool = true; // runtime kill-switch — force the interpreter path if ever needed
 pub var jit_runs: u64 = 0; // programs executed as native code
 pub var jit_misses: u64 = 0; // programs that fell back to the interpreter
+
+// The syscall-entry hook, JIT-compiled ONCE at boot into its own buffer. Unlike
+// the userspace path (which recompiles into jit_code under verify_lock per call),
+// the builtin is fixed, so we compile it once and run the native code on every
+// syscall with NO lock — the buffer is immutable after init(), written on the
+// BSP before any task (hence any syscall) exists, so concurrent execution from
+// every CPU is safe. This is the only in-kernel exercise of the JIT's helper
+// CALL path: the builtin's `call count(pid)` becomes a real native call. Stays
+// null (→ the hook interprets) if PMM can't spare a frame, compilation fails, or
+// the boot self-test below finds native and interpreter disagree.
+const HOOK_CODE_FRAMES: u32 = 1; // the 5-insn builtin compiles to ~120 bytes
+var hook_code: ?[]u8 = null;
 
 /// One-time JIT code-buffer allocation. Optional: on failure the JIT stays off
 /// and every program runs on the interpreter.
@@ -227,15 +241,72 @@ fn jitInit() void {
     }
 }
 
+/// Compile the builtin syscall-entry program ONCE into its own immutable buffer
+/// and, only if a live native-vs-interpreter self-test agrees, arm the native
+/// hook. This is what makes the builtin's `call count(pid)` run as a real native
+/// CALL on every syscall. Best-effort: any failure leaves hook_code null and the
+/// hook keeps interpreting — observation must never break the observed.
+fn hookJitInit() void {
+    if (!jit_enabled or !builtin_verified) return; // never run an unverified program native
+    const phys = pmm.allocContiguous(HOOK_CODE_FRAMES) orelse {
+        serial.print("[zbpf] jit: no hook buffer — syscall hook stays interpreted\n", .{});
+        return;
+    };
+    const buf = @as([*]u8, @ptrFromInt(paging.physToVirt(phys)))[0 .. HOOK_CODE_FRAMES * 4096];
+    const n = jit.compile(&BUILTIN_PROG, buf, &HELPERS) catch {
+        serial.print("[zbpf] jit: hook compile failed — syscall hook stays interpreted\n", .{});
+        return;
+    };
+    if (!hookSelfTest(buf)) {
+        serial.print("[zbpf] jit: hook self-test MISMATCH — syscall hook stays interpreted\n", .{});
+        return;
+    }
+    hook_code = buf;
+    serial.print("[zbpf] jit: syscall hook runs NATIVE ({d} bytes, helper CALL emitted)\n", .{n});
+}
+
+/// Run the freshly-compiled hook native AND on the interpreter against the same
+/// fake ctx; require identical r0 (0) and that BOTH actually invoked the helper
+/// (the per-pid count advances by 2). Side effects on the shared map are snapshot
+/// and restored, so the self-test leaves /proc/bpf untouched. Returns false on
+/// any disagreement — proving the native CALL path correct in the live kernel
+/// (real KVM/HW), not just under the off-target differential harness.
+fn hookSelfTest(buf: []u8) bool {
+    const tp: usize = 0; // a real pid slot; restored below so nothing leaks
+    const save_c = @atomicLoad(u64, &counts[tp], .monotonic);
+    const save_t = @atomicLoad(u64, &total, .monotonic);
+    defer {
+        @atomicStore(u64, &counts[tp], save_c, .monotonic);
+        @atomicStore(u64, &total, save_t, .monotonic);
+    }
+
+    var ctx = SyscallCtx{ .nr = 0xABC, .pid = tp };
+    var stack: [insn.STACK_SIZE]u8 align(16) = undefined;
+    @memset(&stack, 0);
+    const f: jit.CompiledFn = @ptrFromInt(@intFromPtr(buf.ptr));
+    const r_native = f(@intFromPtr(&ctx), @intFromPtr(&stack));
+
+    const env = vm.Env{
+        .regions = &[_]vm.Region{.{ .base = @intFromPtr(&ctx), .len = @sizeOf(SyscallCtx), .writable = false }},
+        .helpers = &HELPERS,
+    };
+    var machine = vm.Vm{};
+    const r_interp = (machine.runEnv(&BUILTIN_PROG, @intFromPtr(&ctx), HOOK_FUEL, env) catch return false).r0;
+
+    const helper_ran_twice = @atomicLoad(u64, &counts[tp], .monotonic) == save_c +% 2;
+    return r_native == 0 and r_interp == 0 and helper_ran_twice;
+}
+
 /// Run a VERIFIED program and return r0: native via the JIT when it can lower
-/// the whole program and there are no helpers (CALL isn't emitted yet), else the
-/// interpreter. The CALLER MUST hold verify_lock — the JIT shares the global
-/// codegen scratch and the single code buffer. The native run gets a fresh,
-/// zeroed 512-byte eBPF stack and `ctx_ptr` as r1; its raw accesses land in
-/// exactly the stack + the ctx region the verifier already bounded.
+/// the whole program, else the interpreter. `env.helpers` is handed to the
+/// compiler so a CALL becomes a native call of the same helper the interpreter
+/// would invoke — same table, same ABI. The CALLER MUST hold verify_lock — the
+/// JIT shares the global codegen scratch and the single code buffer. The native
+/// run gets a fresh, zeroed 512-byte eBPF stack and `ctx_ptr` as r1; its raw
+/// accesses land in exactly the stack + the ctx region the verifier bounded.
 fn runVerified(prog: []const insn.Insn, ctx_ptr: u64, fuel: u64, env: vm.Env) vm.Error!u64 {
-    if (jit_enabled and jit_code != null and env.helpers.len == 0) {
-        if (jit.compile(prog, jit_code.?)) |_| {
+    if (jit_enabled and jit_code != null) {
+        if (jit.compile(prog, jit_code.?, env.helpers)) |_| {
             const f: jit.CompiledFn = @ptrFromInt(@intFromPtr(jit_code.?.ptr));
             // Zero the eBPF stack per run (vm.zig does the same): no read-before-
             // write proof, so a stale slot must not leak kernel bytes to userspace.
@@ -331,6 +402,20 @@ pub fn onSyscallEnter(sys_num: u32) void {
     if (pid == 0xFFFFFFFF) return; // pre-enterFirstTask: nothing to bill
 
     var ctx = SyscallCtx{ .nr = sys_num, .pid = pid };
+
+    if (hook_code) |buf| {
+        // Native: the boot-self-tested builtin. The buffer is immutable, so no
+        // lock; the eBPF stack is this kstack frame (per-call → reentrant-safe).
+        // A verified, fuel-free program with a non-faulting helper cannot error,
+        // so there is nothing to catch — it just runs.
+        var stack: [insn.STACK_SIZE]u8 align(16) = undefined;
+        @memset(&stack, 0);
+        const f: jit.CompiledFn = @ptrFromInt(@intFromPtr(buf.ptr));
+        _ = f(@intFromPtr(&ctx), @intFromPtr(&stack));
+        _ = @atomicRmw(u64, &run_count, .Add, 1, .monotonic);
+        return;
+    }
+
     const env = vm.Env{
         .regions = &[_]vm.Region{
             .{ .base = @intFromPtr(&ctx), .len = @sizeOf(SyscallCtx), .writable = false },
@@ -340,7 +425,7 @@ pub fn onSyscallEnter(sys_num: u32) void {
 
     var machine = vm.Vm{};
     if (machine.runEnv(&BUILTIN_PROG, @intFromPtr(&ctx), HOOK_FUEL, env)) |_| {
-        run_count +%= 1;
+        _ = @atomicRmw(u64, &run_count, .Add, 1, .monotonic);
     } else |e| {
         // Observation must never break the observed: record and move on.
         err_count +%= 1;
@@ -358,7 +443,8 @@ pub fn renderProc(buf: []u8) usize {
     n += fmt(buf[n..], "verifier: builtin {s} (structural + ranges + bounded loops)\n", .{if (builtin_verified) "VERIFIED" else "UNVERIFIED"});
     n += fmt(buf[n..], "sys_bpf:  {d} user loads, {d} rejected by verifier\n", .{ user_loads, user_rejects });
     n += fmt(buf[n..], "jit:      {s}, {d} native runs, {d} interpreter fallbacks\n", .{ if (jit_code != null and jit_enabled) "on" else "off", jit_runs, jit_misses });
-    n += fmt(buf[n..], "enabled: {}\nruns:    {d}\nerrors:  {d}", .{ @atomicLoad(bool, &enabled, .acquire), run_count, err_count });
+    n += fmt(buf[n..], "hook jit: {s}\n", .{if (hook_code != null) "native (helper CALL emitted)" else "interpreted"});
+    n += fmt(buf[n..], "enabled: {}\nruns:    {d}\nerrors:  {d}", .{ @atomicLoad(bool, &enabled, .acquire), @atomicLoad(u64, &run_count, .monotonic), err_count });
     if (last_err) |e| {
         n += fmt(buf[n..], " (last: {s})", .{@errorName(e)});
     }

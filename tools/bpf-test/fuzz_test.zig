@@ -19,7 +19,7 @@ const v = @import("src/bpf/verifier.zig");
 const VHELPERS = [_]?v.HelperSig{ null, .{ .n_args = 1 } };
 const CFG = v.Config{ .ctx_len = 16, .ctx_writable = false, .helpers = &VHELPERS };
 
-fn dummyHelper(_: u64, _: u64, _: u64, _: u64, _: u64) u64 {
+fn dummyHelper(_: u64, _: u64, _: u64, _: u64, _: u64) callconv(.c) u64 {
     return 0;
 }
 const IHELPERS = [_]?vm.HelperFn{ null, dummyHelper };

@@ -465,13 +465,19 @@ test "fuel is accounted" {
     try expectEqual(@as(u64, 2), res.steps);
 }
 
-test "atomics and legacy packet loads are cleanly rejected" {
-    var atomic = i.stx(.w, 10, 1, -4);
-    atomic.opcode = i.MODE_ATOMIC | @intFromEnum(i.Size.w) | i.CLASS_STX;
-    const a_prog = [_]i.Insn{ atomic, i.exit() };
-    _ = &atomic;
-    try expectError(error.UnknownOpcode, run(&a_prog));
+test "malformed atomics and legacy packet loads are cleanly rejected" {
+    // Atomics are now supported (see the atomic tests) — but a BYTE-size atomic
+    // is malformed (W/DW only), and the interpreter rejects it defence-in-depth.
+    var bad_size = i.atomic(.w, i.ATOMIC_ADD, 10, 1, -4);
+    bad_size.opcode = i.MODE_ATOMIC | @intFromEnum(i.Size.b) | i.CLASS_STX;
+    const sz_prog = [_]i.Insn{ i.mov64Imm(1, 1), bad_size, i.exit() };
+    try expectError(error.UnknownOpcode, run(&sz_prog));
 
+    // An unknown atomic operation in imm is rejected too.
+    const op_prog = [_]i.Insn{ i.mov64Imm(1, 1), i.atomic(.dw, 0x33, 10, 1, -8), i.exit() };
+    try expectError(error.UnknownOpcode, run(&op_prog));
+
+    // Legacy cBPF ABS packet load — still unsupported.
     var abs = i.ldx(.w, 0, 0, 0);
     abs.opcode = i.MODE_ABS | @intFromEnum(i.Size.w) | i.CLASS_LD;
     const l_prog = [_]i.Insn{ abs, i.exit() };
@@ -576,12 +582,12 @@ test "region edges: access straddling a region boundary is OutOfBounds" {
 // Helper-call scaffolding: module-level state because HelperFn is a plain
 // fn pointer (no closure ctx) — exactly the constraint kernel helpers have.
 var helper_log: [5]u64 = undefined;
-fn helperRecordArgs(a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) u64 {
+fn helperRecordArgs(a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) callconv(.c) u64 {
     helper_log = .{ a1, a2, a3, a4, a5 };
     return a1 + a2 + a3 + a4 + a5;
 }
 var counter_slots: [4]u64 = [_]u64{0} ** 4;
-fn helperCount(idx: u64, _: u64, _: u64, _: u64, _: u64) u64 {
+fn helperCount(idx: u64, _: u64, _: u64, _: u64, _: u64) callconv(.c) u64 {
     if (idx >= counter_slots.len) return 1; // helper validates its own args
     counter_slots[@intCast(idx)] += 1;
     return 0;
@@ -702,4 +708,52 @@ test "end-to-end: classify ctx value via div/mod/branches" {
     try expectEqual(@as(u64, 1), try runCtx(&prog, 9));
     try expectEqual(@as(u64, 2), try runCtx(&prog, 10));
     try expectEqual(@as(u64, 0), try runCtx(&prog, 7));
+}
+
+// === atomics — the interpreter is the semantic contract the JIT matches ===
+
+fn runProg(prog: []const i.Insn) !u64 {
+    var vm = bpf.Vm{};
+    return (try vm.run(prog, 0, FUEL)).r0; // M1 run: own stack, runtime-checked
+}
+
+test "atomic: add / fetch-add / xchg / cmpxchg on the stack" {
+    // add: 100 + 5, read back => 105
+    try expectEqual(@as(u64, 105), try runProg(&.{
+        i.st(.dw, 10, -8, 100), i.mov64Imm(2, 5),
+        i.atomic(.dw, i.ATOMIC_ADD, 10, 2, -8),
+        i.ldx(.dw, 0, 10, -8), i.exit(),
+    }));
+    // fetch-add: the old value (100) lands in the src register
+    try expectEqual(@as(u64, 100), try runProg(&.{
+        i.st(.dw, 10, -8, 100), i.mov64Imm(2, 5),
+        i.atomic(.dw, i.ATOMIC_ADD | i.ATOMIC_FETCH, 10, 2, -8),
+        i.mov64Reg(0, 2), i.exit(),
+    }));
+    // xchg: memory becomes the new value
+    try expectEqual(@as(u64, 0xBB), try runProg(&.{
+        i.st(.dw, 10, -8, 0xAA), i.mov64Imm(2, 0xBB),
+        i.atomic(.dw, i.ATOMIC_XCHG, 10, 2, -8),
+        i.ldx(.dw, 0, 10, -8), i.exit(),
+    }));
+    // cmpxchg match: stores the new value
+    try expectEqual(@as(u64, 999), try runProg(&.{
+        i.st(.dw, 10, -8, 100), i.mov64Imm(0, 100), i.mov64Imm(2, 999),
+        i.atomic(.dw, i.ATOMIC_CMPXCHG, 10, 2, -8),
+        i.ldx(.dw, 0, 10, -8), i.exit(),
+    }));
+    // cmpxchg mismatch: r0 receives the current value, memory untouched
+    try expectEqual(@as(u64, 100), try runProg(&.{
+        i.st(.dw, 10, -8, 100), i.mov64Imm(0, 55), i.mov64Imm(2, 999),
+        i.atomic(.dw, i.ATOMIC_CMPXCHG, 10, 2, -8),
+        i.exit(), // r0 = old = 100
+    }));
+}
+
+test "atomic: 32-bit add operates on the low word only" {
+    try expectEqual(@as(u64, 3), try runProg(&.{
+        i.st(.w, 10, -8, 1), i.mov64Imm(2, 2),
+        i.atomic(.w, i.ATOMIC_ADD, 10, 2, -8),
+        i.ldx(.w, 0, 10, -8), i.exit(),
+    }));
 }

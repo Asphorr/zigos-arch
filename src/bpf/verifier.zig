@@ -266,8 +266,16 @@ fn simulateOne(prog: []const Insn, pc: usize, len: usize, cfg: Config, in: RegFi
             try execLoad(&out, i, cfg);
             return emit1(pc + 1, len, out, spc, sst);
         },
-        insn.CLASS_ST, insn.CLASS_STX => {
-            try execStore(out, i, cfg, class == insn.CLASS_STX);
+        insn.CLASS_ST => {
+            try execStore(out, i, cfg, false);
+            return emit1(pc + 1, len, out, spc, sst);
+        },
+        insn.CLASS_STX => {
+            if ((i.opcode & 0xe0) == insn.MODE_ATOMIC) {
+                try execAtomic(&out, i, cfg);
+            } else {
+                try execStore(out, i, cfg, true);
+            }
             return emit1(pc + 1, len, out, spc, sst);
         },
         insn.CLASS_JMP, insn.CLASS_JMP32 => {
@@ -512,6 +520,29 @@ fn execStore(rf: RegFile, i: Insn, cfg: Config, from_reg: bool) VerifyError!void
     try checkAccess(rf, i.dst(), i.offset, size.bytes(), cfg, true);
 }
 
+/// Atomic RMW (STX | MODE_ATOMIC). Like a store it reads-and-writes memory, so
+/// the access must be in-bounds and WRITABLE; additionally it has register
+/// effects the abstract state must track. src always supplies an operand;
+/// CMPXCHG also reads r0 (the comparand). A fetched OLD value (FETCH/XCHG → src,
+/// CMPXCHG → r0) becomes an unknown scalar of the access width.
+fn execAtomic(out: *RegFile, i: Insn, cfg: Config) VerifyError!void {
+    const size: insn.Size = @enumFromInt(i.opcode & 0x18);
+    const n = size.bytes();
+    const src = i.src();
+    const is_cmpxchg = (i.imm == insn.ATOMIC_CMPXCHG);
+
+    if (out[src].kind == .uninit) return error.UninitReg;
+    if (is_cmpxchg and out[0].kind == .uninit) return error.UninitReg;
+
+    try checkAccess(out.*, i.dst(), i.offset, n, cfg, true);
+
+    if ((i.imm & insn.ATOMIC_FETCH) != 0) {
+        const dstreg: u4 = if (is_cmpxchg) 0 else src;
+        if (dstreg == 10) return error.WriteToR10; // can't fetch into the frame pointer
+        out[dstreg] = if (n < 8) scalar(0, (@as(i64, 1) << @intCast(8 * n)) - 1) else scalarFull();
+    }
+}
+
 /// The static analogue of vm.zig's checkMem: prove `*(n bytes)(base+off)` lands
 /// wholly inside the region `base` points at, for the WHOLE offset range.
 fn checkAccess(rf: RegFile, base_reg: u4, off: i16, n: u64, cfg: Config, write: bool) VerifyError!void {
@@ -550,9 +581,18 @@ fn decodeShape(i: Insn, prog: []const Insn, pc: usize, len: usize, cfg: Config) 
             if (mode != insn.MODE_MEM and mode != insn.MODE_MEMSX) return error.UnknownOpcode;
             return 1;
         },
-        insn.CLASS_ST, insn.CLASS_STX => {
-            if ((i.opcode & 0xe0) != insn.MODE_MEM) return error.UnknownOpcode; // reject ATOMIC/legacy
+        insn.CLASS_ST => {
+            if ((i.opcode & 0xe0) != insn.MODE_MEM) return error.UnknownOpcode; // ST has no atomic form
             return 1;
+        },
+        insn.CLASS_STX => {
+            const mode = i.opcode & 0xe0;
+            if (mode == insn.MODE_MEM) return 1;
+            if (mode == insn.MODE_ATOMIC) {
+                try validAtomic(i);
+                return 1;
+            }
+            return error.UnknownOpcode; // legacy/other store modes
         },
         insn.CLASS_LD => {
             if (i.opcode != insn.OP_LD_IMM64) return error.UnknownOpcode;
@@ -595,6 +635,28 @@ fn validJmpOp(op: u8, is32: bool, i: Insn, cfg: Config) VerifyError!void {
         @intFromEnum(J.exit) => {
             if (is32) return error.UnknownOpcode; // EXIT only exists in CLASS_JMP
         },
+        else => return error.UnknownOpcode,
+    }
+}
+
+/// An atomic (STX | MODE_ATOMIC) is well-formed iff its size is W or DW and its
+/// imm names a known operation. The exact-value match also rejects a stray
+/// FETCH bit on XCHG/CMPXCHG (which already carry it) or a missing one.
+fn validAtomic(i: Insn) VerifyError!void {
+    const size: insn.Size = @enumFromInt(i.opcode & 0x18);
+    if (size != .w and size != .dw) return error.UnknownOpcode; // 32/64-bit only
+    switch (i.imm) {
+        insn.ATOMIC_ADD,
+        insn.ATOMIC_ADD | insn.ATOMIC_FETCH,
+        insn.ATOMIC_OR,
+        insn.ATOMIC_OR | insn.ATOMIC_FETCH,
+        insn.ATOMIC_AND,
+        insn.ATOMIC_AND | insn.ATOMIC_FETCH,
+        insn.ATOMIC_XOR,
+        insn.ATOMIC_XOR | insn.ATOMIC_FETCH,
+        insn.ATOMIC_XCHG,
+        insn.ATOMIC_CMPXCHG,
+        => {},
         else => return error.UnknownOpcode,
     }
 }

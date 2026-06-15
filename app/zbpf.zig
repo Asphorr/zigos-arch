@@ -29,9 +29,13 @@ fn ins(opcode: u8, dst: u4, src: u4, offset: i16, imm: i32) Insn {
 
 // The few opcodes this demo needs (class | source | op, per RFC 9669).
 const LDX_DW = 0x79; // r[dst] = *(u64*)(r[src] + off)
+const ST_DW = 0x7a; // *(u64*)(r[dst] + off) = imm
 const MOV64_K = 0xb7; // r[dst] = imm
+const MOV64_X = 0xbf; // r[dst] = r[src]
 const ADD64_K = 0x07; // r[dst] += imm
 const ADD64_X = 0x0f; // r[dst] += r[src]
+const ATOMIC_DW = 0xdb; // atomic *(u64*)(r[dst]+off) op= r[src], op in imm (STX|DW|ATOMIC)
+const ATOMIC_FETCH_ADD = 0x01; // imm: BPF_ADD | BPF_FETCH — return the old value in src
 const JGE_K = 0x35; // if r[dst] >= imm goto +off  (unsigned)
 const JA = 0x05; // goto +off
 const EXIT = 0x95;
@@ -114,6 +118,21 @@ export fn _start() linksection(".text.entry") callconv(.c) void {
         report("[4] redteam: infinite loop", runBpf(&prog, null, false));
     }
 
-    libc.println("zbpf: done — [1]/[2] ran in the kernel sandbox; [3]/[4] never executed a single instruction.");
+    // [5] atomic fetch-add on the program's own stack — verified, then JIT-
+    //     compiled to a native `lock xadd`. r0 = old(100) + new_mem(108) = 208.
+    {
+        const prog = [_]Insn{
+            ins(ST_DW, 10, 0, -8, 100), // *(u64*)(r10-8) = 100
+            ins(MOV64_K, 1, 0, 0, 8), // r1 = 8
+            ins(ATOMIC_DW, 10, 1, -8, ATOMIC_FETCH_ADD), // r1 = old(100); mem = 108
+            ins(MOV64_X, 0, 1, 0, 0), // r0 = r1 = 100
+            ins(LDX_DW, 2, 10, -8, 0), // r2 = mem = 108
+            ins(ADD64_X, 0, 2, 0, 0), // r0 = 100 + 108
+            ins(EXIT, 0, 0, 0, 0),
+        };
+        report("[5] atomic fetch-add (expect old+new = 208)", runBpf(&prog, null, false));
+    }
+
+    libc.println("zbpf: done — [1]/[2]/[5] ran in the kernel sandbox; [3]/[4] never executed a single instruction.");
     libc.exit();
 }
