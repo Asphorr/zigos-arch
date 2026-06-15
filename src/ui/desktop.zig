@@ -3496,11 +3496,19 @@ pub fn createGuiWindow(pid: u8, fb: [*]volatile u32, fb_backs: [3]?[*]volatile u
     // Center first window, cascade subsequent ones so they don't all stack
     // at the exact same position (otherwise the top window fully occludes
     // the rest and apps look like they're queueing up).
+    //
+    // Saturating subtraction (-|) on the centering offsets: window dims are
+    // clamped to alloc dims (<= 1920x1080) but NOT to the actual screen, so a
+    // window larger than the current framebuffer — e.g. a fuzzer asking for
+    // 1920x1080 on a smaller screen, or a legit maximize on a small display —
+    // would underflow these u32 subtractions and @panic("integer overflow"),
+    // taking down the kernel from an unprivileged sysCreateWindow. Clamp the
+    // offset to 0 instead so an oversized window just pins to the top-left.
     const outer_w = w + BORDER * 2;
     const outer_h = h + TITLEBAR_H + BORDER * 2;
     const cascade: i32 = @intCast((wm.z_count % 8) * 28);
-    const cx: i32 = @intCast((gfx.screen_w - outer_w) / 2);
-    const cy: i32 = @intCast(MENUBAR_H + (gfx.screen_h - MENUBAR_H - TASKBAR_H - outer_h) / 2);
+    const cx: i32 = @intCast((gfx.screen_w -| outer_w) / 2);
+    const cy: i32 = @intCast(MENUBAR_H + (gfx.screen_h -| MENUBAR_H -| TASKBAR_H -| outer_h) / 2);
     windows[slot].x = cx + cascade - 56;
     windows[slot].y = cy + cascade - 56;
     windows[slot].width = w;
