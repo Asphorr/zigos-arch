@@ -456,19 +456,68 @@ test "jit: atomic cmpxchg 32-bit zero-extends the old value into r0" {
     }, 0x8000_0000);
 }
 
-test "jit: fetch-and-bitwise atomics fall back to the interpreter" {
+test "jit: fetch-and-bitwise atomics — old value into src, op into memory" {
     try mapCode();
-    var ctx: [CTX_LEN]u8 align(8) = [_]u8{0} ** CTX_LEN;
-    inline for (.{ i.ATOMIC_OR, i.ATOMIC_AND, i.ATOMIC_XOR }) |base_op| {
-        const prog = [_]i.Insn{
-            i.st(.dw, 10, -8, 0),
-            i.mov64Imm(2, 1),
-            i.atomic(.dw, base_op | i.ATOMIC_FETCH, 10, 2, -8),
-            i.exit(),
-        };
-        const r = try runJit(&prog, @intFromPtr(&ctx));
-        try std.testing.expect(r == null); // declined → interpreter handles it
-    }
+    // Each pair surfaces the SAME atomic two ways: the register writeback (src
+    // gets the pre-op value) and the memory effect (a later load reads the result).
+    // OR|FETCH:  mem 0xF0 | 0x0F -> 0xFF, old 0xF0.
+    try expectProg(&.{
+        i.st(.dw, 10, -8, 0xF0),
+        i.mov64Imm(2, 0x0F),
+        i.atomic(.dw, i.ATOMIC_OR | i.ATOMIC_FETCH, 10, 2, -8),
+        i.mov64Reg(0, 2), // r0 = old = 0xF0
+        i.exit(),
+    }, 0xF0);
+    try expectProg(&.{
+        i.st(.dw, 10, -8, 0xF0),
+        i.mov64Imm(2, 0x0F),
+        i.atomic(.dw, i.ATOMIC_OR | i.ATOMIC_FETCH, 10, 2, -8),
+        i.ldx(.dw, 0, 10, -8), // r0 = mem = 0xFF
+        i.exit(),
+    }, 0xFF);
+    // AND|FETCH: mem 0xFF & 0x0F -> 0x0F, old 0xFF.
+    try expectProg(&.{
+        i.st(.dw, 10, -8, 0xFF),
+        i.mov64Imm(2, 0x0F),
+        i.atomic(.dw, i.ATOMIC_AND | i.ATOMIC_FETCH, 10, 2, -8),
+        i.mov64Reg(0, 2),
+        i.exit(),
+    }, 0xFF);
+    try expectProg(&.{
+        i.st(.dw, 10, -8, 0xFF),
+        i.mov64Imm(2, 0x0F),
+        i.atomic(.dw, i.ATOMIC_AND | i.ATOMIC_FETCH, 10, 2, -8),
+        i.ldx(.dw, 0, 10, -8),
+        i.exit(),
+    }, 0x0F);
+    // XOR|FETCH: mem 0xFF ^ 0x0F -> 0xF0, old 0xFF.
+    try expectProg(&.{
+        i.st(.dw, 10, -8, 0xFF),
+        i.mov64Imm(2, 0x0F),
+        i.atomic(.dw, i.ATOMIC_XOR | i.ATOMIC_FETCH, 10, 2, -8),
+        i.mov64Reg(0, 2),
+        i.exit(),
+    }, 0xFF);
+    try expectProg(&.{
+        i.st(.dw, 10, -8, 0xFF),
+        i.mov64Imm(2, 0x0F),
+        i.atomic(.dw, i.ATOMIC_XOR | i.ATOMIC_FETCH, 10, 2, -8),
+        i.ldx(.dw, 0, 10, -8),
+        i.exit(),
+    }, 0xF0);
+}
+
+test "jit: fetch-and-bitwise atomic 32-bit zero-extends the old value" {
+    try mapCode();
+    // .w OR|FETCH: store 0x8000_0000, OR with 1 -> mem 0x8000_0001; the old word
+    // is delivered to src zero-extended to 0x0000_0000_8000_0000 (not sign-ext).
+    try expectProg(&.{
+        i.st(.w, 10, -8, @bitCast(@as(u32, 0x8000_0000))),
+        i.mov64Imm(2, 1),
+        i.atomic(.w, i.ATOMIC_OR | i.ATOMIC_FETCH, 10, 2, -8),
+        i.mov64Reg(0, 2), // r0 = old, zero-extended
+        i.exit(),
+    }, 0x8000_0000);
 }
 
 // === random differential ===

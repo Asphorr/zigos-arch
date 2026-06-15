@@ -36,6 +36,7 @@ const ADD64_K = 0x07; // r[dst] += imm
 const ADD64_X = 0x0f; // r[dst] += r[src]
 const ATOMIC_DW = 0xdb; // atomic *(u64*)(r[dst]+off) op= r[src], op in imm (STX|DW|ATOMIC)
 const ATOMIC_FETCH_ADD = 0x01; // imm: BPF_ADD | BPF_FETCH — return the old value in src
+const ATOMIC_FETCH_OR = 0x41; // imm: BPF_OR | BPF_FETCH — return old, OR src into memory
 const JGE_K = 0x35; // if r[dst] >= imm goto +off  (unsigned)
 const JA = 0x05; // goto +off
 const EXIT = 0x95;
@@ -133,6 +134,22 @@ export fn _start() linksection(".text.entry") callconv(.c) void {
         report("[5] atomic fetch-add (expect old+new = 208)", runBpf(&prog, null, false));
     }
 
-    libc.println("zbpf: done — [1]/[2]/[5] ran in the kernel sandbox; [3]/[4] never executed a single instruction.");
+    // [6] atomic fetch-OR on the stack — verified, then JIT-compiled to a cmpxchg
+    //     retry loop (x86 has no single fetching lock-or). r1 = old(0xF0); memory
+    //     becomes 0xF0|0x0F = 0xFF. r0 = old(240) + new_mem(255) = 495.
+    {
+        const prog = [_]Insn{
+            ins(ST_DW, 10, 0, -8, 0xF0), // *(u64*)(r10-8) = 0xF0
+            ins(MOV64_K, 1, 0, 0, 0x0F), // r1 = 0x0F
+            ins(ATOMIC_DW, 10, 1, -8, ATOMIC_FETCH_OR), // r1 = old(0xF0); mem = 0xFF
+            ins(MOV64_X, 0, 1, 0, 0), // r0 = r1 = 0xF0
+            ins(LDX_DW, 2, 10, -8, 0), // r2 = mem = 0xFF
+            ins(ADD64_X, 0, 2, 0, 0), // r0 = 0xF0 + 0xFF
+            ins(EXIT, 0, 0, 0, 0),
+        };
+        report("[6] atomic fetch-OR (cmpxchg-loop JIT; expect old+new = 495)", runBpf(&prog, null, false));
+    }
+
+    libc.println("zbpf: done — [1]/[2]/[5]/[6] ran in the kernel sandbox; [3]/[4] never executed a single instruction.");
     libc.exit();
 }

@@ -19,13 +19,14 @@
 //! LD_IMM64, LDX/ST/STX (b/h/w/dw) including MODE_MEMSX sign-extending loads,
 //! every CLASS_JMP + CLASS_JMP32 branch (the 32-bit-compare forms and the JMP32
 //! long JA included) plus JA + EXIT, the helper CALL (an aligned native call
-//! into the embedder's helper table), and the common atomics (lock add/or/and/
-//! xor, fetch-add via xadd, xchg, cmpxchg). The only forms still handed back as
-//! error.Unsupported — for the caller to run on the interpreter — are the
-//! fetch-and-bitwise atomics (OR/AND/XOR with BPF_FETCH, which need a cmpxchg
-//! retry loop). Partial coverage + clean fallback is the design: every opcode
-//! emitted here is one the differential harness has proven byte-identical to
-//! vm.zig.
+//! into the embedder's helper table), and the FULL atomic set (lock add/or/and/
+//! xor, fetch-add via xadd, xchg, cmpxchg, plus the fetch-and-bitwise OR/AND/XOR
+//! lowered to a cmpxchg retry loop). The only forms still handed back as
+//! error.Unsupported — for the caller to run on the interpreter — are the legacy
+//! BPF_ABS/BPF_IND packet loads, which the verifier itself rejects; so for every
+//! verified program the JIT now emits the whole body. Clean fallback remains the
+//! design, but every opcode emitted here is one the differential harness has
+//! proven byte-identical to vm.zig.
 //!
 //! REGISTER ALLOCATION (no spills — 11 eBPF regs fit). The mapping is chosen so
 //! it agrees with BOTH calling conventions at once: eBPF callee-saved r6..r9 +
@@ -284,6 +285,19 @@ const Emit = struct {
         if (at + 4 > self.len) return;
         const rel: i64 = @as(i64, @intCast(self.len)) - @as(i64, @intCast(at)) - 4;
         self.patch32(at, @intCast(rel));
+    }
+
+    /// LOCAL backward branch to an already-emitted label (its byte offset, taken
+    /// before the loop body). The target sits behind us so the rel32 is known
+    /// immediately — no s_fixups entry. Used by the cmpxchg retry loop. The rel32
+    /// is written via i32le (err-guarded); if a prior overflow froze `len`, the
+    /// computed displacement is still a small in-range negative and nothing is
+    /// written, so compile() just returns the pending error.
+    fn jccBack(self: *Emit, cc: u8, label: usize) void {
+        self.byte(0x0F);
+        self.byte(0x80 + cc);
+        const next: i64 = @as(i64, @intCast(self.len)) + 4; // addr after the rel32
+        self.i32le(@intCast(@as(i64, @intCast(label)) - next));
     }
 };
 
@@ -845,9 +859,10 @@ fn emitStore(e: *Emit, i: Insn, from_reg: bool) JitError!void {
 /// Atomic RMW (STX | MODE_ATOMIC), size W or DW. Each form is the x86 lock op
 /// whose value semantics match vm.zig's execAtomic exactly (the sandbox is
 /// single-threaded, so the lock is invisible to the program — but free, and it
-/// keeps the kernel-side map updates well-defined). The rare fetch-and-bitwise
-/// forms (OR/AND/XOR | BPF_FETCH) would need a cmpxchg retry loop; they return
-/// error.Unsupported and run on the interpreter instead — clean partial coverage.
+/// keeps the kernel-side map updates well-defined). The fetch-and-bitwise forms
+/// (OR/AND/XOR | BPF_FETCH) have no single fetching lock-bitwise instruction on
+/// x86, so emitFetchBitwise lowers them to a cmpxchg retry loop — completing the
+/// atomic set.
 fn emitAtomic(e: *Emit, i: Insn) JitError!void {
     const size: insn.Size = @enumFromInt(i.opcode & 0x18);
     if (size != .w and size != .dw) return error.Unsupported;
@@ -881,7 +896,14 @@ fn emitAtomic(e: *Emit, i: Insn) JitError!void {
             e.rr(w, 0x89, RAX, REG[0]); // mov r0, (e)ax
         },
 
-        else => return error.Unsupported, // OR/AND/XOR | FETCH: interpreter handles it
+        // OR/AND/XOR | FETCH: no single fetching lock-bitwise op on x86 — emit a
+        // cmpxchg retry loop. src receives the pre-op (old) value, zero-extended
+        // for the .w form, matching vm.zig. The op byte is the x86 r/m,r encoding.
+        insn.ATOMIC_OR | insn.ATOMIC_FETCH => emitFetchBitwise(e, w, 0x09, src, base, disp),
+        insn.ATOMIC_AND | insn.ATOMIC_FETCH => emitFetchBitwise(e, w, 0x21, src, base, disp),
+        insn.ATOMIC_XOR | insn.ATOMIC_FETCH => emitFetchBitwise(e, w, 0x31, src, base, disp),
+
+        else => return error.Unsupported, // unknown atomic op (the verifier rejects it)
     }
 }
 
@@ -890,6 +912,32 @@ fn emitAtomic(e: *Emit, i: Insn) JitError!void {
 fn emitLockRM(e: *Emit, w: bool, op: u8, src: u8, base: u8, disp: i32) void {
     e.byte(0xF0);
     e.mem(w, false, &.{op}, src, base, disp);
+}
+
+/// OR/AND/XOR with BPF_FETCH. x86 has no fetching lock-bitwise instruction, so
+/// emit the textbook compare-and-swap retry loop:
+///
+///       mov   (e)ax, [mem]          ; old — the compare value for the first try
+///     L:
+///       mov   (e)cx, (e)ax          ; candidate = old
+///       <op>  (e)cx, src            ;           = old OP src
+///       lock cmpxchg [mem], (e)cx   ; if [mem]==(e)ax: [mem]=candidate, ZF=1
+///       jne   L                     ; else cmpxchg reloaded (e)ax = new current — retry
+///       mov   src, (e)ax            ; FETCH: deliver the pre-op (old) value into src
+///
+/// rax and rcx are JIT scratch (never an eBPF register, never the mem base), so
+/// the loop clobbers nothing live. For the 32-bit form the trailing `mov src32,
+/// eax` zero-extends, matching vm.zig's `old & 0xFFFF_FFFF` writeback; the 64-bit
+/// form is exact. `alu_op` is the x86 r/m,r opcode (or 0x09 / and 0x21 / xor 0x31).
+fn emitFetchBitwise(e: *Emit, w: bool, alu_op: u8, src: u8, base: u8, disp: i32) void {
+    e.mem(w, false, &.{0x8B}, RAX, base, disp); // mov (e)ax, [mem]
+    const loop = e.len; // L:
+    e.rr(w, 0x89, RAX, RCX); // mov (e)cx, (e)ax
+    e.rr(w, alu_op, src, RCX); // <op> (e)cx, src   (rm=rcx, reg=src)
+    e.byte(0xF0); // lock
+    e.mem(w, false, &.{ 0x0F, 0xB1 }, RCX, base, disp); // cmpxchg [mem], (e)cx
+    e.jccBack(0x5, loop); // jne L
+    e.rr(w, 0x89, RAX, src); // mov src, (e)ax  (old -> src; FETCH)
 }
 
 /// next_pc = (pc + 1) + delta, per RFC (delta relative to the FOLLOWING insn).
