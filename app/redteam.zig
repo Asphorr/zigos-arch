@@ -174,10 +174,41 @@ var n_regions: u32 = 0;
 var live_wids: [MAX_WINDOWS]u32 = undefined;
 var n_wids: u32 = 0;
 
+// Set once the fuzzer successfully installs a wallpaper (sys#98 with a real
+// buffer). Drives the exit-time restore: a fuzzed wallpaper is a tiny garbage
+// image rendered centered on the desktop, so we clear it back to the gradient
+// when the run ends (sysSetWallpaper(0,0,0) is the kernel's clear path). Stays
+// false if the fuzzer never installed one, so we never wipe a wallpaper we
+// didn't set. (2026-06-15)
+var wallpaper_dirty: bool = false;
+
 // Reserved buffers we pass to syscalls that write back ids/data.
 var pipe_buf: [2]u32 = .{ 0, 0 };
 var path_buf: [128]u8 = undefined;
 var io_buf: [256]u8 = undefined;
+
+// The redteam process creates real GUI windows (sys#13) to fuzz the window
+// path — and that maps a LIVE, writable framebuffer at GUI_FB_BASE in our own
+// address space that the compositor draws onto the desktop every frame. Hand a
+// copy-OUT syscall (read/fread/stat-into-buf) a buffer pointer inside this span
+// and the kernel dumps file/garbage bytes straight into the live FB → a band of
+// "random pixels" smeared across the wallpaper that outlives the run (the random
+// walk almost never tears its own window down: create_window returns
+// GUI_FB_BASE, which our >=256 wid filter drops, so present/destroy never
+// re-target it). We still WANT to fuzz window dims and handles — we just must
+// never use the live FB as a scratch buffer. Redirect any copy-out pointer that
+// lands in the span back to our own io_buf; the window itself is destroyed on
+// exit (see _start). roPtr()'s landmarks all sit below this span, so the RO
+// write-tripwire is untouched. (2026-06-15 — stop redteam painting the desktop.)
+const GUI_FB_BASE: u32 = 0x08000000;
+const GUI_FB_SPAN: u32 = 1920 * 1080 * 4; // widest FB the kernel will ever map
+
+fn scrubFbPtr(p: u32) u32 {
+    if (p >= GUI_FB_BASE and p < GUI_FB_BASE + GUI_FB_SPAN) {
+        return @intCast(@intFromPtr(&io_buf));
+    }
+    return p;
+}
 
 // === sys_bpf (#122) program fuzzer ===
 // Byte-identical to bpf/kernel.zig's BpfAttr and insn.Insn.
@@ -533,6 +564,12 @@ fn postProcess(sys_no: u32, a1: u32, ret: u32) void {
         12 => if (!isError(ret)) removeFd(a1), // close
         13 => if (!isError(ret)) addWid(ret), // create_window returns wid
         16 => if (!isError(ret)) removeWid(a1), // destroy_window
+        // set_wallpaper: a success with a non-null buffer INSTALLED a (garbage)
+        // wallpaper that renders centered on the desktop. Flag it so we restore
+        // the gradient on exit. a1==0 is the clear path — don't flag that.
+        98 => if (!isError(ret) and a1 != 0) {
+            wallpaper_dirty = true;
+        },
         // sys#51 (pipe) deliberately NOT tracked: a read on an empty pipe
         // with no writer blocks forever. Single-process fuzz can't make
         // useful progress on pipes — that's option-2 (multi-process race)
@@ -616,6 +653,7 @@ const SYS_STAT = 44;
 const SYS_MMAP = 57;
 const SYS_MUNMAP = 58;
 const SYS_MPROTECT = 59;
+const SYS_SET_WALLPAPER = 98;
 
 fn isUserAddr(a: u32) bool {
     return a >= 0x500000 and a < 0x10000000;
@@ -753,7 +791,11 @@ export fn _start() linksection(".text.entry") callconv(.c) void {
         }
 
         const a1 = forceArg1(sys_no) orelse smartArg1(sys_no);
-        const a2 = smartArg2(sys_no);
+        // a2 is the copy-out buffer for the read/write/stat/readdir family;
+        // keep it out of the live window FB so a fuzzed read never paints
+        // garbage onto the desktop (a3 stays untouched — it's a length, never a
+        // buffer, and scrubbing it would muddy the overflow-len probes).
+        const a2 = scrubFbPtr(smartArg2(sys_no));
         const a3 = smartArg3(sys_no);
 
         // Note for the report: did we use a tracked resource here?
@@ -816,6 +858,21 @@ export fn _start() linksection(".text.entry") callconv(.c) void {
     libc.print("] bpf_loads=");
     libc.printNum(bpf_calls);
     libc.print(" — kernel survived\n");
+
+    // Tear down any GUI window the run left up. The random walk creates windows
+    // (sys#13) but rarely destroys its OWN — create_window returns GUI_FB_BASE,
+    // which addWid's >=256 filter drops, so the tracked-wid path never feeds it
+    // back to present/destroy. sysDestroyWindow ignores its args and acts on
+    // THIS pid's window, forcing a full desktop repaint underneath (safe no-op
+    // if we own none). Without it the wallpaper keeps whatever we last presented.
+    _ = libc.syscall3(SYS_DESTROY_WINDOW, 0, 0, 0);
+
+    // Restore the desktop gradient if the run installed a wallpaper. A fuzzed
+    // wallpaper is a small garbage image drawn centered on the screen (the
+    // fuzzer feeds sys#98 a readable buffer — its own .text — with tiny dims);
+    // sysSetWallpaper(0,0,0) is the kernel's clear path. Only fires if we
+    // actually set one, so a real user wallpaper we never touched is left alone.
+    if (wallpaper_dirty) _ = libc.syscall3(SYS_SET_WALLPAPER, 0, 0, 0);
 
     libc.exit();
 }
