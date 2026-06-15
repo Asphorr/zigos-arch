@@ -687,7 +687,19 @@ pub fn getBackBufferAddr() usize {
 }
 
 pub fn freeBackBuffer(num_pages: u32) void {
-    pmm.markRegionFree(BB_BASE, @as(usize, num_pages) * 4096);
+    // NO-OP BY DESIGN. BACK_BUFFER is a FIXED region reserved once at boot
+    // (pmm.init: markRegionUsed(BACK_BUFFER_BASE, BACK_BUFFER_SIZE)) and
+    // allocBackBuffer always hands back the SAME physToVirt(BB_BASE) — the
+    // frames never move. Calling pmm.markRegionFree here returns the singleton
+    // region to the GENERAL allocator, so between this free and the next
+    // allocBackBuffer (e.g. across a resolution change) pmm.allocFrame can hand
+    // one of these frames to another subsystem (vmalloc/wallpaper, a page
+    // table, ...). The next allocBackBuffer's markRegionUsed then silently
+    // steals it back and the back buffer overwrites it — frame double-ownership
+    // → use-after-free. Same defect class as freeGuestFB below; see that note
+    // for the live crash it caused. The region stays reserved for the boot's
+    // lifetime, so there is nothing to free. (2026-06-15)
+    _ = num_pages;
 }
 
 // --- Guest FB (virtio-gpu) ---
@@ -709,7 +721,19 @@ pub fn getGuestFBAddr() usize {
 }
 
 pub fn freeGuestFB(num_pages: u32) void {
-    pmm.markRegionFree(GFB_BASE, @as(usize, num_pages) * 4096);
+    // NO-OP BY DESIGN — see the freeBackBuffer note above. GUEST_FB is a FIXED
+    // 8 MB region reserved once at boot (pmm.init); allocGuestFB always returns
+    // the SAME physToVirt(GFB_BASE) and the device always scans out of GFB_BASE,
+    // so the physical frames never change across a mode change. The old code
+    // pmm.markRegionFree'd the region on every virtio_gpu.changeMode (resolution
+    // toggle), donating the singleton FB frames to the general PMM pool. A
+    // vmalloc wallpaper allocated in that window grabbed a GFB frame for its
+    // arena page-table; the next changeMode's allocGuestFB markRegionUsed stole
+    // it back and the 1920x1080 scanout overwrote the page table, zeroing the
+    // wallpaper's PTE → compositor #PF in renderWallpaper (not-present read at
+    // the vmalloc arena base). The region must stay reserved; freeing it is the
+    // bug, so this does nothing. (2026-06-15 — redteam-surfaced)
+    _ = num_pages;
 }
 
 // --- Helpers ---
