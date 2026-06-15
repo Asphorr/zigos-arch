@@ -34,10 +34,13 @@ const std = @import("std");
 const insn = @import("insn.zig");
 const vm = @import("vm.zig");
 const verifier = @import("verifier.zig");
+const jit = @import("jit.zig");
 const process = @import("../proc/process.zig");
 const spinlock = @import("../proc/spinlock.zig");
 const serial = @import("../debug/serial.zig");
 const common = @import("../cpu/syscall/common.zig");
+const pmm = @import("../mm/pmm.zig");
+const paging = @import("../mm/paging.zig");
 
 /// Hook context handed to syscall-entry programs, read-only. Field order is
 /// ABI for the programs below — extend by APPENDING (programs address it by
@@ -146,6 +149,7 @@ pub fn init() void {
         enabled = false;
         serial.print("[zbpf] verifier: builtin FAILED ({s}) — syscall hook DISABLED\n", .{@errorName(e)});
     }
+    jitInit();
 }
 
 // === userspace loading: sys_bpf (verify-and-run) ===
@@ -183,6 +187,71 @@ const USER_HELPERS = [_]?verifier.HelperSig{}; // v1: no helpers for userspace p
 
 pub var user_loads: u64 = 0;
 pub var user_rejects: u64 = 0;
+
+// === JIT: native execution of verified programs (interpreter fallback) ===
+//
+// jit.zig lowers a verified program to x86-64; running that instead of
+// interpreting is byte-identical (proven off-target over ~700k differential
+// runs) and skips per-instruction decode/dispatch. The code buffer is dedicated
+// PMM frames reached through the physmap, which is EXECUTABLE: boot.asm maps the
+// physmap 1 GB pages P|RW|PS|G (0x183, no NX), so physToVirt() memory is RWX —
+// no page-table work needed here. (If the physmap ever gains NX, this is the one
+// spot that needs a paging.makeExecutable.)
+//
+// Safety model: the JIT runs with NO runtime fuel or bounds checks — it trusts
+// the verifier's proofs (every memory access in range, loops bounded), exactly
+// as a production JIT trusts its verifier. The interpreter remains the fallback
+// and keeps all of its own runtime checks. Any program the JIT can't lower yet
+// (helper CALL, atomics) or that overflows the buffer simply runs on the
+// interpreter — a miss is never a failure. The whole path is serialized by
+// verify_lock, which also guards jit.zig's module-static codegen scratch and the
+// single shared code buffer below.
+const JIT_CODE_FRAMES: u32 = 16; // 64 KB — comfortably past the worst-case expansion of a ~1000-insn program
+const JIT_CODE_SIZE: usize = JIT_CODE_FRAMES * 4096;
+var jit_code: ?[]u8 = null; // executable code buffer (physmap VA); null if PMM couldn't spare the run
+// The native run's eBPF stack. Static (not on the lean syscall kstack), zeroed
+// per run, and verify_lock-serialized — same single-owner discipline as ub_ctx.
+var jit_stack: [insn.STACK_SIZE]u8 align(16) = undefined;
+pub var jit_enabled: bool = true; // runtime kill-switch — force the interpreter path if ever needed
+pub var jit_runs: u64 = 0; // programs executed as native code
+pub var jit_misses: u64 = 0; // programs that fell back to the interpreter
+
+/// One-time JIT code-buffer allocation. Optional: on failure the JIT stays off
+/// and every program runs on the interpreter.
+fn jitInit() void {
+    if (pmm.allocContiguous(JIT_CODE_FRAMES)) |phys| {
+        jit_code = @as([*]u8, @ptrFromInt(paging.physToVirt(phys)))[0..JIT_CODE_SIZE];
+        serial.print("[zbpf] jit: {d} KB code buffer @ phys 0x{X} (physmap-exec)\n", .{ JIT_CODE_SIZE / 1024, phys });
+    } else {
+        serial.print("[zbpf] jit: no code buffer — interpreter only\n", .{});
+    }
+}
+
+/// Run a VERIFIED program and return r0: native via the JIT when it can lower
+/// the whole program and there are no helpers (CALL isn't emitted yet), else the
+/// interpreter. The CALLER MUST hold verify_lock — the JIT shares the global
+/// codegen scratch and the single code buffer. The native run gets a fresh,
+/// zeroed 512-byte eBPF stack and `ctx_ptr` as r1; its raw accesses land in
+/// exactly the stack + the ctx region the verifier already bounded.
+fn runVerified(prog: []const insn.Insn, ctx_ptr: u64, fuel: u64, env: vm.Env) vm.Error!u64 {
+    if (jit_enabled and jit_code != null and env.helpers.len == 0) {
+        if (jit.compile(prog, jit_code.?)) |_| {
+            const f: jit.CompiledFn = @ptrFromInt(@intFromPtr(jit_code.?.ptr));
+            // Zero the eBPF stack per run (vm.zig does the same): no read-before-
+            // write proof, so a stale slot must not leak kernel bytes to userspace.
+            @memset(&jit_stack, 0);
+            const r0 = f(ctx_ptr, @intFromPtr(&jit_stack));
+            jit_runs +%= 1;
+            return r0;
+        } else |_| {
+            // Unsupported opcode / buffer overflow / malformed — interpret instead.
+        }
+    }
+    var machine = vm.Vm{};
+    const res = try machine.runEnv(prog, ctx_ptr, fuel, env);
+    jit_misses +%= 1;
+    return res.r0;
+}
 
 /// sys_bpf(cmd, attr_ptr, attr_len). Returns 0 on a completed run (result in
 /// attr.ret), EINVAL on bad args or a verifier rejection, EFAULT on a bad user
@@ -236,12 +305,14 @@ pub fn sysBpf(cmd: u32, attr_ptr: u32, attr_len: u32) u32 {
         .regions = if (attr.ctx_len > 0) regions[0..1] else regions[0..0],
         .helpers = &[_]?vm.HelperFn{},
     };
-    var machine = vm.Vm{};
-    const res = machine.runEnv(prog, @intFromPtr(&ub_ctx), USER_BPF_FUEL, env) catch {
+    // Native via the JIT when possible (no helpers on this path), else the
+    // interpreter. Either way ctx mutations go straight into ub_ctx through r1,
+    // so the copy-back below is unchanged.
+    const r0 = runVerified(prog, @intFromPtr(&ub_ctx), USER_BPF_FUEL, env) catch {
         return common.E_FAULT; // unreachable for a verified program — defence in depth
     };
 
-    attr.ret = res.r0;
+    attr.ret = r0;
     @memcpy(@as([*]u8, @ptrFromInt(attr_ptr))[0..@sizeOf(BpfAttr)], std.mem.asBytes(&attr));
     if (attr.ctx_len > 0 and attr.ctx_writable != 0)
         @memcpy(@as([*]u8, @ptrFromInt(attr.ctx))[0..attr.ctx_len], ub_ctx[0..attr.ctx_len]);
@@ -286,6 +357,7 @@ pub fn renderProc(buf: []u8) usize {
     n += fmt(buf[n..], "zbpf: syscall-entry hook (builtin counter, {d} insns)\n", .{BUILTIN_PROG.len});
     n += fmt(buf[n..], "verifier: builtin {s} (structural + ranges + bounded loops)\n", .{if (builtin_verified) "VERIFIED" else "UNVERIFIED"});
     n += fmt(buf[n..], "sys_bpf:  {d} user loads, {d} rejected by verifier\n", .{ user_loads, user_rejects });
+    n += fmt(buf[n..], "jit:      {s}, {d} native runs, {d} interpreter fallbacks\n", .{ if (jit_code != null and jit_enabled) "on" else "off", jit_runs, jit_misses });
     n += fmt(buf[n..], "enabled: {}\nruns:    {d}\nerrors:  {d}", .{ @atomicLoad(bool, &enabled, .acquire), run_count, err_count });
     if (last_err) |e| {
         n += fmt(buf[n..], " (last: {s})", .{@errorName(e)});

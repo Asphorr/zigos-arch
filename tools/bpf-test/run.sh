@@ -14,9 +14,11 @@ mkdir -p "$HERE/src/bpf"
 cp "$HERE/../../src/bpf/insn.zig" "$HERE/src/bpf/insn.zig"
 cp "$HERE/../../src/bpf/vm.zig" "$HERE/src/bpf/vm.zig"
 cp "$HERE/../../src/bpf/verifier.zig" "$HERE/src/bpf/verifier.zig"
+cp "$HERE/../../src/bpf/jit.zig" "$HERE/src/bpf/jit.zig"
 
 cd "$HERE"
 "$ZIG" test test.zig        # interpreter (M1)
 "$ZIG" test verify_test.zig # verifier    (M3a/M3b unit)
 "$ZIG" test fuzz_test.zig   # verifier    (M3b soundness fuzz)
+"$ZIG" test jit_test.zig    # x86-64 JIT  (differential vs interpreter)
 echo "EXIT=$?"
