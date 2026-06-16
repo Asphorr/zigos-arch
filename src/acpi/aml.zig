@@ -603,7 +603,11 @@ fn record(kind: NodeKind, path: *PathBuf, ns: NameString, depth: u8) void {
 // is B2b; OperationRegion/Field I/O is B2c.
 
 const PATH_MAX = 64;
-const MAX_NODES = 512;
+// Real laptops declare thousands of namespace nodes (deep EC/battery/thermal/GPE
+// device trees + per-processor objects); 512 overflowed silently on them. Each
+// StoredNode is ~160 B, so 2048 ≈ 320 KB of BSS (in line with the kernel's other
+// static ACPI/verifier tables). store_overflow still guards the cap.
+const MAX_NODES = 2048;
 
 /// One resolved namespace entry. Which payload fields matter depends on `kind`:
 ///   .name      -> val_off/val_len: the DataRefObject's byte range in the body
@@ -3583,6 +3587,7 @@ pub fn selfTestExtended() u32 {
 const SPACE_MEM: u8 = 0;
 const SPACE_IO: u8 = 1;
 const SPACE_PCI: u8 = 2;
+pub const SPACE_EC: u8 = 3; // EmbeddedControl — not built-in; serviced via the registry (ec.zig)
 const SPACE_FFH: u8 = 0x7F; // Functional Fixed Hardware (native C-state entry via MWAIT)
 
 fn nodeIndexOf(n: *StoredNode) usize {
@@ -4417,6 +4422,7 @@ fn spaceName(space: u8) []const u8 {
         SPACE_MEM => "SystemMemory",
         SPACE_IO => "SystemIO",
         SPACE_PCI => "PCI_Config",
+        SPACE_EC => "EmbeddedControl",
         SPACE_FFH => "FFixedHW",
         else => "other",
     };

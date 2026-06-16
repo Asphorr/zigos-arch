@@ -823,10 +823,20 @@ pub fn init(boot_rsdp: u64) void {
     amlmod.timer_100ns_fn = &amlTimer100ns;
     amlmod.task_id_fn = &amlTaskId;
 
+    // Tier B: register the Embedded Controller handler (EmbeddedControl space
+    // 0x03) BEFORE the DSDT walk, so a real laptop's EC OperationRegion fields
+    // (battery/thermal/lid/hotkeys) resolve to it. q35 ships no EC, so the
+    // transaction protocol is proven by ec.selfTest() (below) against a software
+    // model instead of a physical chip.
+    const ec = @import("ec.zig");
+    ec.init();
+
     // Dynamic ACPI (Slice B): decode the DSDT's AML into a namespace. Best-
     // effort + fully bounds-checked; a malformed DSDT yields a partial walk,
     // never a fault. For bring-up this dumps the discovered objects to serial.
     _ = @import("aml.zig").load();
+
+    _ = ec.selfTest();
 
     // Slice E: adopt the deepest CPU-supported processor C-state from _CST as the
     // idle MWAIT hint. mwait.detect() ran earlier in boot, so its CPUID enumeration
