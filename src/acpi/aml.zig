@@ -683,6 +683,16 @@ var nbodies: u8 = 0;
 /// (walkBody) so nodes inherit the body they came from.
 var cur_table_id: u8 = 0;
 
+/// Parallel to bodies[]: the installed SdtHeader pointer (as usize) each table was
+/// walked from, or 0 for a header-less load (synthetic body / Load-from-region).
+/// LoadTable (ACPI 6.4 §19.6.67) consults this to stay idempotent — every SSDT in
+/// the (X)SDT is already walked at boot, so a LoadTable that matches one returns
+/// its existing handle instead of walking it again (storeNode does not dedup, so a
+/// re-walk would duplicate every node). walkBody clears the slot; walkTable stamps
+/// the real header — so a slot is never read stale (reads are bounded by nbodies,
+/// and every accepted table overwrites its own slot before the bound advances).
+var table_src: [MAX_TABLES]usize = [_]usize{0} ** MAX_TABLES;
+
 /// Runtime-loaded Definition Blocks (the Load opcode, ACPI 6.4 §19.6.66) are
 /// copied here so their bytes outlive the per-call byte arena: the namespace
 /// nodes a Load creates index into bodies[table_id], which must stay valid for
@@ -1315,6 +1325,34 @@ fn evalExtTerm(r: *Reader, st: *ExecState) ?Value {
             _ = r.next(); // 0x33
             return .{ .integer = timerNow() };
         },
+        0x1F => { // LoadTableOp — find an installed table by sig/OEM & load it.
+            _ = r.next(); // 0x5B
+            _ = r.next(); // 0x1F
+            // LoadTable(Sig, OEMID, OEMTableID, RootPath, ParamPath, ParamData)
+            // (ACPI 6.4 §19.6.67) is an expression yielding a DDBHandle (no Target).
+            // Evaluate all six TermArgs first — every one MUST be consumed so the
+            // instruction stream stays aligned even when we decline the load.
+            const sig_v = evalTermArg(r, st) orelse return null;
+            const oemid_v = evalTermArg(r, st) orelse return null;
+            const oemtid_v = evalTermArg(r, st) orelse return null;
+            const root_v = evalTermArg(r, st) orelse return null;
+            const ppath_v = evalTermArg(r, st) orelse return null;
+            const pdata_v = evalTermArg(r, st) orelse return null;
+            // RootPath != root means relocating the loaded table's objects under a
+            // named scope; ParamPath/ParamData inject a value into the loaded table.
+            // We load every table at the namespace root and don't model parameter
+            // injection — so a relocating RootPath reports no-match rather than
+            // mislocating objects. (Both unused args are still fully consumed.)
+            _ = ppath_v;
+            _ = pdata_v;
+            const root = valStr(root_v);
+            const at_root = root.len == 0 or std.mem.eql(u8, root, "\\");
+            const handle: u64 = if (at_root)
+                @as(u64, loadTableBySignature(valStr(sig_v), valStr(oemid_v), valStr(oemtid_v)))
+            else
+                0;
+            return .{ .integer = handle };
+        },
         0x20 => { // LoadOp Object DDBHandleObject (ACPI 6.4 §19.6.66)
             _ = r.next(); // 0x5B
             _ = r.next(); // 0x20
@@ -1457,6 +1495,20 @@ fn osiVerdict(arg: Value) u64 {
         if (std.mem.eql(u8, s, k)) return ~@as(u64, 0);
     }
     return 0;
+}
+
+/// Coerce a TermArg value to its string bytes, or an empty slice if it is not a
+/// string (LoadTable's signature/OEM/path operands are all strings).
+fn valStr(v: Value) []const u8 {
+    return switch (derefValue(v)) {
+        .string => |s| s,
+        else => &[_]u8{},
+    };
+}
+
+/// bool → the u64 stCheck() expects (avoids the `if (...) 1 else 0` boilerplate).
+fn b2i(b: bool) u64 {
+    return if (b) 1 else 0;
 }
 
 fn evalTermArg(r: *Reader, st: *ExecState) ?Value {
@@ -3249,6 +3301,60 @@ fn stLoadTest(fails: *u32) void {
     stCheck("Load region SSDT", got, 0x1234, fails);
 }
 
+/// Backing store for the LoadTable self-test's synthetic installed SSDT.
+var lt_table_buf: [64]u8 = undefined;
+
+/// LoadTable proof (ACPI 6.4 §19.6.67), in three parts:
+///   (a) the full opcode path with a signature no installed table carries — must
+///       parse all six TermArgs, stay stream-aligned, and return 0 (no-match);
+///   (b) the matcher (tableHeaderMatches) against a hand-built SSDT header — accept
+///       on sig+OEM, reject on a wrong signature;
+///   (c) the load action (loadMatchedHeader): walk the header in, read its object
+///       back, then confirm a second load is idempotent (same handle, no new node).
+/// (a) needs no installed table; (b)/(c) drive a synthetic header directly because
+/// QEMU's stock (X)SDT ships no SSDT for the opcode's acpi.getSsdt scan to find.
+fn stLoadTableTest(fails: *u32) void {
+    tNsReset();
+    // (a) no-match through the real opcode: Return(LoadTable("LTXX","","","\","",0))
+    const nomatch = toInt(runProgKeepNs(&[_]u8{
+        0xA4, 0x5B, 0x1F, // Return( LoadTableOp
+        0x0D, 'L', 'T', 'X', 'X', 0x00, // Signature "LTXX"
+        0x0D, 0x00, // OEMID ""  (wildcard)
+        0x0D, 0x00, // OEMTableID ""  (wildcard)
+        0x0D, '\\', 0x00, // RootPath "\"
+        0x0D, 0x00, // ParamPath ""
+        0x00, // ParamData = Zero
+    }));
+    stCheck("LoadTable no-match", nomatch, 0, fails);
+
+    // (b)+(c) build a synthetic SSDT: header + Name(\LTDT, 0x5678).
+    const hdr_len = @sizeOf(acpi.SdtHeader);
+    const body = [_]u8{ 0x08, 0x5C, 'L', 'T', 'D', 'T', 0x0B, 0x78, 0x56 };
+    const total = hdr_len + body.len;
+    @memset(&lt_table_buf, 0);
+    @memcpy(lt_table_buf[0..4], "OEMX"); // signature
+    lt_table_buf[4] = @intCast(total); // length (LE; total < 256)
+    lt_table_buf[8] = 2; // revision
+    @memcpy(lt_table_buf[10..16], "ZIGOS "); // oem_id[6] (space-padded)
+    @memcpy(lt_table_buf[16..24], "TESTTBL "); // oem_table_id[8]
+    @memcpy(lt_table_buf[hdr_len..][0..body.len], &body);
+    const hdr: *align(1) const acpi.SdtHeader = @ptrCast(&lt_table_buf);
+
+    // (b) matcher: accept on sig + padding-insensitive OEM, reject on wrong sig.
+    stCheck("LoadTable match sig+OEM", b2i(tableHeaderMatches(hdr, "OEMX", "ZIGOS", "TESTTBL")), 1, fails);
+    stCheck("LoadTable reject sig", b2i(tableHeaderMatches(hdr, "OEMY", "", "")), 0, fails);
+
+    // (c) load action + idempotency.
+    static_nnodes = nnodes;
+    const h1 = loadMatchedHeader(hdr);
+    stCheck("LoadTable load handle", b2i(h1 != 0), 1, fails);
+    stCheck("LoadTable loaded value", toInt(runProgKeepNs(&[_]u8{ 0xA4, 0x5C, 'L', 'T', 'D', 'T' })), 0x5678, fails);
+    const before = nnodes;
+    const h2 = loadMatchedHeader(hdr);
+    stCheck("LoadTable idempotent handle", b2i(h2 == h1), 1, fails);
+    stCheck("LoadTable idempotent no-dup", @as(u64, nnodes - before), 0, fails);
+}
+
 /// Slice E proof: decode the synthetic Processor _CST (the exact blob injected at
 /// boot) and check each C-state's type/hint/latency/power, then confirm selection
 /// picks the deepest FFixedHW state (C3, MWAIT hint 0x20).
@@ -3736,6 +3842,9 @@ pub fn selfTestExtended() u32 {
 
     // Load opcode: a Definition Block loaded from a region into the namespace.
     stLoadTest(&fails);
+
+    // LoadTable opcode: find an installed table by signature/OEM and load it.
+    stLoadTableTest(&fails);
 
     return fails;
 }
@@ -4273,6 +4382,7 @@ fn walkBody(body: []const u8) u32 {
     }
     const id = nbodies;
     bodies[id] = body;
+    table_src[id] = 0; // header-less by default; walkTable stamps the real header
     nbodies += 1;
     cur_table_id = id;
     const before = node_count;
@@ -4289,8 +4399,11 @@ fn walkBody(body: []const u8) u32 {
 fn walkTable(hdr: *align(1) const acpi.SdtHeader) u32 {
     const hdr_len = @sizeOf(acpi.SdtHeader);
     if (hdr.length <= hdr_len) return 0;
+    const id = nbodies; // walkBody assigns this id IFF it accepts the table
     const body = @as([*]const u8, @ptrCast(hdr))[hdr_len..hdr.length];
-    return walkBody(body);
+    const added = walkBody(body);
+    if (nbodies > id) table_src[id] = @intFromPtr(hdr); // record source for idempotency
+    return added;
 }
 
 /// Walk a runtime-loaded Definition Block `body` (already past the 36-byte SDT
@@ -4331,6 +4444,59 @@ fn loadFromRegion(region: *const StoredNode) ?u8 {
     @memcpy(dst, @as([*]const u8, @ptrFromInt(paging.physToVirt(phys)))[0..len]);
     loaded_pool_used += len;
     return loadDefinitionBlock(dst[hdr_len..len]);
+}
+
+/// Trailing-space/NUL-trimmed view of a fixed SdtHeader text field (oem_id is
+/// space-padded to 6, oem_table_id to 8) so a short LoadTable argument ("INTEL")
+/// compares equal to the padded field ("INTEL ").
+fn trimPad(s: []const u8) []const u8 {
+    var e = s.len;
+    while (e > 0 and (s[e - 1] == ' ' or s[e - 1] == 0)) e -= 1;
+    return s[0..e];
+}
+
+/// LoadTable's table-selection predicate (ACPI 6.4 §19.6.67): the 4-char signature
+/// must match exactly; an empty OEMID / OEMTableID argument is a wildcard, else it
+/// is compared padding-insensitively against the header field.
+fn tableHeaderMatches(hdr: *align(1) const acpi.SdtHeader, sig: []const u8, oemid: []const u8, oemtid: []const u8) bool {
+    if (sig.len != 4 or !std.mem.eql(u8, hdr.signature[0..], sig)) return false;
+    if (oemid.len != 0 and !std.mem.eql(u8, trimPad(hdr.oem_id[0..]), trimPad(oemid))) return false;
+    if (oemtid.len != 0 and !std.mem.eql(u8, trimPad(hdr.oem_table_id[0..]), trimPad(oemtid))) return false;
+    return true;
+}
+
+/// Load an installed-table header into the namespace and return its DDB handle
+/// (table_id + 1; 0 = failure, since table_id 0 is the DSDT). Idempotent: a header
+/// already walked (e.g. an SSDT auto-loaded at boot) returns its existing handle
+/// rather than being walked again — storeNode does not dedup, so a second walk
+/// would duplicate every node. The newly loaded objects are promoted to permanent
+/// (static_nnodes = nnodes), exactly like Load.
+fn loadMatchedHeader(hdr: *align(1) const acpi.SdtHeader) u8 {
+    const want = @intFromPtr(hdr);
+    var t: usize = 0;
+    while (t < nbodies) : (t += 1) {
+        if (table_src[t] == want) return @as(u8, @intCast(t)) + 1; // already loaded
+    }
+    if (nbodies >= MAX_TABLES) return 0;
+    const id = nbodies;
+    _ = walkTable(hdr);
+    if (nbodies <= id) return 0; // walkBody rejected (registry full / empty body)
+    static_nnodes = nnodes;
+    return @as(u8, @intCast(id)) + 1;
+}
+
+/// LoadTable's runtime action: scan the installed SSDTs in the (X)SDT for the
+/// first signature/OEM match and load it. Returns the DDB handle, or 0 if nothing
+/// matched. (The DSDT is intentionally not searched — it is not in the (X)SDT and
+/// is already table 0.) Only the namespace root is supported as a load target; the
+/// opcode handler rejects a relocating RootPath before reaching here.
+fn loadTableBySignature(sig: []const u8, oemid: []const u8, oemtid: []const u8) u8 {
+    var i: usize = 0;
+    while (i < acpi.ssdtCount()) : (i += 1) {
+        const hdr = acpi.getSsdt(i) orelse continue;
+        if (tableHeaderMatches(hdr, sig, oemid, oemtid)) return loadMatchedHeader(hdr);
+    }
+    return 0;
 }
 
 /// Compile in a deterministic thermal zone so Slice D's readout has a target on
