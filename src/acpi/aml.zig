@@ -2893,6 +2893,72 @@ pub fn nvdimmFirstDevice(root_path: []const u8) ?[]const u8 {
     return null;
 }
 
+// --- native GPE handlers (ACPI 6.4 §12.6, the Embedded Controller case) ------
+//
+// Most GPE0 bits dispatch through an AML method (`\_GPE._Lxx/_Exx`). The EC is
+// the exception: its SCI GPE has NO such method — the EC *driver* owns it
+// (ACPICA's acpi_install_gpe_handler). ec.zig registers a native Zig callback
+// for the EC's `_GPE` bit here, and runGpeHandler() invokes it in acpid thread
+// context under the interpreter lock — the same contract an AML handler runs
+// under. aml stays a LEAF: it only stores the fn pointer ec.zig hands it (no
+// import of ec.zig). (Arming the bit in the GPE0_EN hardware register, with the
+// storm protection a source-held EC GPE needs, is deferred to inc2c — see the
+// note in sci.zig's enableHandledGpes; the dispatch path here is independently
+// proven by ec.zig's boot self-test calling runGpeHandler directly.)
+
+/// Native GPE handler — runs in acpid thread context with the interpreter lock
+/// held (runGpeHandler holds it across the call), so the callback may freely
+/// re-enter the interpreter (e.g. evaluate `_Qxx`).
+pub const GpeNativeFn = *const fn () void;
+
+const GpeNative = struct { bit: u8 = 0, level: bool = false, handler: ?GpeNativeFn = null };
+const MAX_GPE_NATIVE = 4;
+// Slots [0, n_gpe_natives) are written in full before the count is bumped, so the
+// scans below never read an uninitialized entry (same idiom as region_handlers).
+var gpe_natives: [MAX_GPE_NATIVE]GpeNative = undefined;
+var n_gpe_natives: usize = 0;
+
+/// Register a native handler for GPE0 bit `bit` (e.g. the EC's `_GPE`). Replace-
+/// on-dup (re-registering the same bit overwrites). Silently ignored past
+/// capacity. Never reset by load(), so a re-load (acpidev) keeps the registration
+/// — mirrors the region-handler registry. `level` is diagnostic only (sciHandler
+/// write-1-to-clears either kind); real EC GPEs are conventionally level.
+pub fn registerGpeNativeHandler(bit: u8, level: bool, handler: GpeNativeFn) void {
+    ilockAcquire();
+    defer ilockRelease();
+    var i: usize = 0;
+    while (i < n_gpe_natives) : (i += 1) {
+        if (gpe_natives[i].handler != null and gpe_natives[i].bit == bit) {
+            gpe_natives[i] = .{ .bit = bit, .level = level, .handler = handler };
+            return;
+        }
+    }
+    if (n_gpe_natives >= MAX_GPE_NATIVE) return;
+    gpe_natives[n_gpe_natives] = .{ .bit = bit, .level = level, .handler = handler };
+    n_gpe_natives += 1;
+}
+
+fn gpeNativeFor(n: u8) ?*GpeNative {
+    var i: usize = 0;
+    while (i < n_gpe_natives) : (i += 1) {
+        if (gpe_natives[i].handler != null and gpe_natives[i].bit == n) return &gpe_natives[i];
+    }
+    return null;
+}
+
+/// True if a native (non-AML) handler is registered for GPE0 bit `n`; sets
+/// `is_level`. The inc2c sci.zig arming path will arm a bit when this OR
+/// gpeHandler() reports a handler (it is not consulted by sci.zig yet).
+pub fn gpeNativeHandler(n: u8, is_level: *bool) bool {
+    ilockAcquire();
+    defer ilockRelease();
+    if (gpeNativeFor(n)) |gn| {
+        is_level.* = gn.level;
+        return true;
+    }
+    return false;
+}
+
 /// Find the AML handler method for GPE bit `n` of block 0: `\_GPE._E<nn>` (edge)
 /// or `\_GPE._L<nn>` (level), where nn is the two uppercase hex digits of n.
 /// Returns the method's absolute path (into the static store) and sets
@@ -2921,16 +2987,28 @@ pub fn gpeHandler(n: u8, is_level: *bool) ?[]const u8 {
     return null;
 }
 
-/// Run the GPE handler for bit `n` (block 0) if one exists; true if it ran.
-/// MUST be called from thread context — it evaluates AML (field I/O, Notify),
-/// which is unsafe in the SCI IRQ.
+/// Run the handler(s) for GPE bit `n` (block 0) if any exist; true if one ran.
+/// Dispatches the AML method (`\_GPE._Lxx/_Exx`) and/or a native handler (the EC
+/// — see registerGpeNativeHandler); a bit normally has exactly one. The native
+/// callback runs UNDER the interpreter lock held here, so it may re-enter the
+/// evaluator (the EC's _Qxx). MUST be called from thread context — AML field I/O
+/// / Notify and EC port transactions are unsafe in the SCI IRQ.
 pub fn runGpeHandler(n: u8) bool {
     ilockAcquire();
     defer ilockRelease();
+    var ran = false;
     var lvl: bool = false;
-    const path = gpeHandler(n, &lvl) orelse return false;
-    _ = evalMethod(path);
-    return true;
+    if (gpeHandler(n, &lvl)) |path| {
+        _ = evalMethod(path);
+        ran = true;
+    }
+    if (gpeNativeFor(n)) |gn| {
+        if (gn.handler) |h| {
+            h();
+            ran = true;
+        }
+    }
+    return ran;
 }
 
 // === deterministic self-tests (firmware-independent) ========================
@@ -4191,8 +4269,11 @@ const synth_battery = [_]u8{
 /// (lower node index) and this stand-in is ignored. The query handler _Q01 stores
 /// a sentinel (0x99) into the root Name \ECQF; \QCHK reads it back, so ec.zig can
 /// confirm a simulated EC query actually ran the right method. _GPE (0x18) is the
-/// EC's SCI bit, consumed by the GPE-trigger wiring in the next increment. Every
-/// PkgLength is the 1-byte form (the whole device stays under 64 bytes).
+/// EC's SCI bit, consumed by the GPE-trigger wiring (inc2b): ec.zig reads it via
+/// deviceChildInteger and registers a native GPE handler. \QRST resets \ECQF to 0
+/// so the inc2b self-test can observe the 0→0x99 transition the GPE-routed _Q01
+/// produces (order-independent vs. inc2a's direct dispatch, which leaves 0x99).
+/// Every PkgLength is the 1-byte form (the whole device stays under 64 bytes).
 const synth_ec = [_]u8{
     // Name(\ECQF, 0) — query-fired sentinel (root)
     0x08, 0x5C, 0x45, 0x43, 0x51, 0x46, 0x00, // NameOp '\' "ECQF" Zero
@@ -4201,6 +4282,11 @@ const synth_ec = [_]u8{
     0x5C, 0x51, 0x43, 0x48, 0x4B, // '\' "QCHK"
     0x00, // MethodFlags (0 args)
     0xA4, 0x5C, 0x45, 0x43, 0x51, 0x46, // Return(\ECQF)
+    // Method(\QRST, 0) { Store(Zero, \ECQF) } — reset the sentinel (inc2b test)
+    0x14, 0x0E, // MethodOp, PkgLength=14
+    0x5C, 0x51, 0x52, 0x53, 0x54, // '\' "QRST"
+    0x00, // MethodFlags (0 args)
+    0x70, 0x00, 0x5C, 0x45, 0x43, 0x51, 0x46, // Store(Zero, \ECQF)
     // Scope(\_SB) { Device(EC0) { ... } }
     0x10, 0x31, // ScopeOp, PkgLength=49
     0x5C, 0x5F, 0x53, 0x42, 0x5F, // RootChar '\' + "_SB_"
@@ -4542,6 +4628,18 @@ fn evalNamedNode(n: *StoredNode) ?Value {
         .method => return callMethod(n, &.{}, 0),
         else => return null,
     }
+}
+
+/// Public: read an integer-valued child Name of a device — e.g. an EC's `_GPE`
+/// SCI bit (ec.zig, for the GPE-trigger wiring) or a `_UID`. Null if the device
+/// or child is absent, or the stored DataRefObject isn't an integer. Acquires the
+/// interpreter lock (evalNamedNode resets the arena, so a complex value would be
+/// arena-backed — but an integer is value-typed and survives).
+pub fn deviceChildInteger(dev_path: []const u8, seg: []const u8) ?u64 {
+    ilockAcquire();
+    defer ilockRelease();
+    const v = evalDeviceChild(dev_path, seg) orelse return null;
+    return if (v == .integer) v.integer else null;
 }
 
 /// Evaluate `<dev_path>.<seg>` (e.g. "\_SB_.COM1" + "_HID") if that child object

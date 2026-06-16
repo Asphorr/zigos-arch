@@ -19,11 +19,21 @@
 //! physical chip at 0x66/0x62; the software model is engaged ONLY for the duration
 //! of selfTest() (it flips `sim_active`, then restores real-port I/O).
 //!
-//! INCREMENT 1 SCOPE: the EmbeddedControl region handler (byte read/write
-//! transactions, multi-byte assembled little-endian) + registry registration +
-//! the software-EC loopback proof + MAX_NODES bump (in aml.zig). DEFERRED to a
-//! follow-up (all need the GPE/SCI wiring or table parsing): ECDT/_CRS-based port
-//! & GPE discovery, _Qxx SCI query dispatch, and burst mode.
+//! INCREMENT 1: the EmbeddedControl region handler (byte read/write transactions,
+//! multi-byte assembled little-endian) + registry registration + the software-EC
+//! loopback proof + MAX_NODES bump (in aml.zig).
+//! INCREMENT 2a: _Qxx SCI query dispatch (queryByte → runQuery → evalMethod;
+//! processQueries drain) + discover() locating the EC device by _HID.
+//! INCREMENT 2b: GPE-dispatch plumbing — discover() reads the EC's `_GPE` bit and
+//! registers a native GPE handler (aml.registerGpeNativeHandler) so a fired EC
+//! GPE routes through aml.runGpeHandler → processQueries. The dispatch path is
+//! proven by selfTest() driving runGpeHandler directly against the software EC.
+//! DEFERRED to inc2c: actually arming the EC's GPE0_EN bit in sci.zig together
+//! with the storm protection a source-held LEVEL GPE needs (mask-in-IRQ /
+//! re-enable-after-drain, behind an IRQ-safe GPE-enable lock — unverifiable on
+//! QEMU). Also deferred: ECDT/_CRS port & GPE-bit override (we default 0x66/0x62
+//! and the integer `_GPE`), the package form of `_GPE`, burst mode (BE_EC/BD_EC),
+//! and a query-aware stale-OBF drain at readByte start.
 
 const std = @import("std");
 const io = @import("../io.zig");
@@ -159,11 +169,19 @@ pub fn init() void {
 
 var ec_path_buf: [96]u8 = undefined; // the EC device's namespace path (e.g. "\_SB_.EC0_")
 var ec_path_len: usize = 0;
+var ec_gpe_bit: u8 = 0; // the EC's _GPE SCI bit (block 0)
+var ec_gpe_valid: bool = false; // _GPE found (integer form) + native handler registered
 
 /// After aml.load(): locate the EC device (a real one wins; the synthetic q35
-/// stand-in otherwise) so its _Qxx handlers can be run by path.
+/// stand-in otherwise) so its _Qxx handlers can be run by path, and prepare its
+/// SCI dispatch: read the EC's `_GPE` bit and register a native GPE handler so a
+/// fired EC GPE routes to processQueries (ACPI 6.4 §12.6 — the EC GPE carries no
+/// `\_GPE._Lxx/_Exx` method; the driver itself is the handler). acpid runs us via
+/// aml.runGpeHandler. (Arming the GPE0_EN bit in hardware is deferred to inc2c —
+/// see the header and sci.zig — but the dispatch is live and self-tested now.)
 pub fn discover() void {
     ec_path_len = 0;
+    ec_gpe_valid = false;
     const p = aml.findDevicePathByHid("PNP0C09") orelse {
         debug.klog("[ec] no PNP0C09 device in namespace — query dispatch idle\n", .{});
         return;
@@ -171,7 +189,22 @@ pub fn discover() void {
     if (p.len > ec_path_buf.len) return;
     @memcpy(ec_path_buf[0..p.len], p);
     ec_path_len = p.len;
-    debug.klog("[ec] EC device: {s} — _Qxx query dispatch armed\n", .{ec_path_buf[0..ec_path_len]});
+
+    // _GPE names the EC's SCI GPE bit. The integer form (`Name(_GPE, n)`) is what
+    // QEMU/most firmware use; the alternate package form (a referenced GPE-block
+    // device) returns non-integer → we fall back to poll-only drain (deferred).
+    if (aml.deviceChildInteger(ec_path_buf[0..ec_path_len], "_GPE")) |bit| {
+        if (bit <= 0xFF) {
+            ec_gpe_bit = @intCast(bit);
+            // level=true: EC GPEs are conventionally level-triggered; the flag is
+            // diagnostic only (sciHandler write-1-to-clears either kind).
+            aml.registerGpeNativeHandler(ec_gpe_bit, true, &processQueries);
+            ec_gpe_valid = true;
+            debug.klog("[ec] EC device: {s} — _Qxx dispatch armed, GPE bit 0x{X:0>2}\n", .{ ec_path_buf[0..ec_path_len], ec_gpe_bit });
+            return;
+        }
+    }
+    debug.klog("[ec] EC device: {s} — _Qxx dispatch armed (no integer _GPE; SCI auto-trigger off)\n", .{ec_path_buf[0..ec_path_len]});
 }
 
 /// Issue QR_EC and return the pending query byte (0 = no event), null on timeout.
@@ -319,6 +352,28 @@ pub fn selfTest() u32 {
         }
         if (got != 0x99) fails += 1;
         if ((scRead() & ST_SCI) != 0) fails += 1; // the query must have been consumed
+    }
+
+    // (4) inc2b: prove the GPE-trigger wiring — a fired EC GPE routes through
+    //     aml.runGpeHandler → our native handler → processQueries → _Qxx, the
+    //     exact path acpid takes for a real EC SCI. Reset the sentinel to 0
+    //     (\QRST), raise a sim query, dispatch by the discovered GPE bit, and
+    //     confirm the GPE-routed _Q01 ran (0 → 0x99) and the event was consumed.
+    if (ec_path_len > 0 and ec_gpe_valid) {
+        _ = aml.evalMethod("\\QRST"); // \ECQF = 0
+        var pre: u64 = 0xDEAD;
+        if (aml.evalMethod("\\QCHK")) |v| {
+            if (v == .integer) pre = v.integer;
+        }
+        if (pre != 0) fails += 1; // the reset must have taken
+        simRaiseQuery(0x01);
+        if (!aml.runGpeHandler(ec_gpe_bit)) fails += 1; // a handler dispatched
+        var post: u64 = 0xDEAD;
+        if (aml.evalMethod("\\QCHK")) |v| {
+            if (v == .integer) post = v.integer;
+        }
+        if (post != 0x99) fails += 1; // GPE-routed _Q01 actually ran
+        if ((scRead() & ST_SCI) != 0) fails += 1; // event consumed
     }
 
     debug.klog("[ec] software-EC self-test: {s} ({d} checks failed)\n", .{ if (fails == 0) "PASS" else "FAIL", fails });

@@ -190,6 +190,17 @@ fn enableHandledGpes(f: *align(1) const acpi.Fadt) u32 {
         debug.klog("[sci] GPE 0x{X:0>2} -> {s} ({s}) armed\n", .{ n, path, if (lvl) "level" else "edge" });
         armed += 1;
     }
+    // NOTE: native-handler GPE bits (the Embedded Controller's SCI — aml.zig's
+    // gpeNativeHandler / registerGpeNativeHandler) are intentionally NOT armed
+    // here yet. The EC GPE is the first source-held, LEVEL-triggered GPE: once
+    // armed, a fired EC line would re-assert the shared SCI in a tight storm until
+    // acpid drains it via QR_EC (~250 ms later). Arming it safely needs the
+    // mask-in-IRQ / re-enable-after-drain cycle (ACPICA's conditional-enable),
+    // which adds an IRQ-vs-acpid RMW on GPE0_EN that requires an IRQ-safe lock
+    // (the SCI is BSP-pinned; acpid runs on any CPU). That concurrency path can't
+    // be exercised on QEMU (no EC fires the GPE), so it is deferred to inc2c. The
+    // dispatch plumbing (registry + runGpeHandler) is already proven by ec.zig's
+    // boot self-test, which invokes runGpeHandler directly.
     return armed;
 }
 
