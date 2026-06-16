@@ -683,6 +683,16 @@ var nbodies: u8 = 0;
 /// (walkBody) so nodes inherit the body they came from.
 var cur_table_id: u8 = 0;
 
+/// Runtime-loaded Definition Blocks (the Load opcode, ACPI 6.4 §19.6.66) are
+/// copied here so their bytes outlive the per-call byte arena: the namespace
+/// nodes a Load creates index into bodies[table_id], which must stay valid for
+/// the life of the namespace. (Boot SSDTs/DSDT and LoadTable load in-place from
+/// stable ACPI memory; only Load-from-a-region needs this copy.) Reset whenever
+/// the namespace is (tNsReset / the head of load()), so a re-load starts clean.
+const LOADED_POOL = 16 * 1024;
+var loaded_pool: [LOADED_POOL]u8 = undefined;
+var loaded_pool_used: usize = 0;
+
 /// The AML body a stored node's offsets index into (its source table).
 fn bodyOf(n: *const StoredNode) []const u8 {
     return if (n.table_id < nbodies) bodies[n.table_id] else &[_]u8{};
@@ -1304,6 +1314,38 @@ fn evalExtTerm(r: *Reader, st: *ExecState) ?Value {
             _ = r.next(); // 0x5B
             _ = r.next(); // 0x33
             return .{ .integer = timerNow() };
+        },
+        0x20 => { // LoadOp Object DDBHandleObject (ACPI 6.4 §19.6.66)
+            _ = r.next(); // 0x5B
+            _ = r.next(); // 0x20
+            // DDB handle is the loaded table_id BIASED by +1 so that 0 is an
+            // unambiguous failure sentinel (table_id 0 is the DSDT, a valid id).
+            var handle: u64 = 0;
+            const lead = r.peek(0) orelse return null;
+            if (isNameLead(lead)) {
+                const ns = readNameString(r) orelse return null;
+                if (resolve(st.scope, ns)) |node| {
+                    if (loadFromRegion(node)) |id| handle = @as(u64, id) + 1;
+                }
+            } else {
+                // The spec also permits a SuperName source (a Local/Arg holding
+                // the table). We load only from a named SystemMemory region today,
+                // so consume the operand and report failure for other forms —
+                // keeping the instruction stream aligned regardless.
+                if (!skipSuperName(r)) return null;
+            }
+            // Always consume the DDBHandle target — even on a failed load — so the
+            // instruction stream stays aligned.
+            if (!storeTarget(r, st, .{ .integer = handle })) return null;
+            return .uninit;
+        },
+        0x2A => { // UnloadOp SuperName — parse + graceful no-op.
+            // A loaded table's nodes are not reclaimed (Unload is rare — for
+            // ejectable SSDTs); the handle is consumed and its objects persist.
+            _ = r.next(); // 0x5B
+            _ = r.next(); // 0x2A
+            if (!skipSuperName(r)) return null;
+            return .uninit;
         },
         else => return null, // unmodeled extended op — bail cleanly
     }
@@ -3028,6 +3070,7 @@ fn tNsReset() void {
     static_nnodes = 0;
     store_overflow = false;
     nbodies = 0;
+    loaded_pool_used = 0;
     arenaReset();
 }
 
@@ -3164,6 +3207,46 @@ fn stRegistryTest(fails: *u32) void {
     }));
     stCheck("region handler r/w", got, 0xA5, fails);
     stCheck("region handler backing", st_fake_space[3], 0xA5, fails);
+}
+
+/// Backing for stLoadTest: a kernel-owned buffer we fill with a minimal SSDT and
+/// then Load via a SystemMemory OperationRegion pointing at its physical address
+/// (same real-buffer trick the wide-field self-test uses, so it works at boot AND
+/// in the native harness's identity-mapped paging stub).
+var ld_table_buf: [64]u8 = undefined;
+
+/// Load opcode round-trip: build a tiny SSDT (header + `Name(\LDDT, 0x1234)`) in
+/// ld_table_buf, point a SystemMemory region at it, then `Load(\LRGN, Local0)`.
+/// The loaded definition block must inject \LDDT into the live namespace, so
+/// `Return(\LDDT)` reads back 0x1234 — proving header validation, the pool copy,
+/// the body walk, and node permanence (the loaded node survives, addressed after
+/// the Load that created it).
+fn stLoadTest(fails: *u32) void {
+    tNsReset();
+    const phys = paging.virtToPhys(@intFromPtr(&ld_table_buf)) orelse {
+        debug.klog("[aml] selftest Load region SSDT: SKIP (test buffer not mapped)\n", .{});
+        return;
+    };
+    const hdr_len = @sizeOf(acpi.SdtHeader);
+    // Definition Block: Name(\LDDT, 0x1234) — WordPrefix 0x0B carries the value.
+    const body = [_]u8{ 0x08, 0x5C, 'L', 'D', 'D', 'T', 0x0B, 0x34, 0x12 };
+    const total = hdr_len + body.len;
+    @memset(&ld_table_buf, 0);
+    @memcpy(ld_table_buf[0..4], "SSDT"); // signature
+    ld_table_buf[4] = @intCast(total); // length (LE; total < 256, so one byte)
+    ld_table_buf[8] = 2; // revision (checksum left 0 — we don't verify it)
+    @memcpy(ld_table_buf[hdr_len..][0..body.len], &body);
+    const reg = stMakeNode("\\LRGN") orelse return;
+    reg.kind = .op_region;
+    reg.region_space = SPACE_MEM;
+    reg.region_off = phys;
+    reg.region_len = ld_table_buf.len;
+    static_nnodes = nnodes;
+    const got = toInt(runProgKeepNs(&[_]u8{
+        0x5B, 0x20, 0x5C, 'L', 'R', 'G', 'N', 0x60, // Load(\LRGN, Local0)
+        0xA4, 0x5C, 'L', 'D', 'D', 'T', // Return(\LDDT)
+    }));
+    stCheck("Load region SSDT", got, 0x1234, fails);
 }
 
 /// Slice E proof: decode the synthetic Processor _CST (the exact blob injected at
@@ -3650,6 +3733,9 @@ pub fn selfTestExtended() u32 {
 
     // Region-space handler registry: an unmodeled space served by a plug-in.
     stRegistryTest(&fails);
+
+    // Load opcode: a Definition Block loaded from a region into the namespace.
+    stLoadTest(&fails);
 
     return fails;
 }
@@ -4205,6 +4291,46 @@ fn walkTable(hdr: *align(1) const acpi.SdtHeader) u32 {
     if (hdr.length <= hdr_len) return 0;
     const body = @as([*]const u8, @ptrCast(hdr))[hdr_len..hdr.length];
     return walkBody(body);
+}
+
+/// Walk a runtime-loaded Definition Block `body` (already past the 36-byte SDT
+/// header) into the live namespace as a new permanent table, then promote the
+/// new nodes to permanent (static_nnodes = nnodes) so the next arenaReset can't
+/// truncate them — Load adds permanent objects, unlike a call-scoped CreateField
+/// window. Returns the new table_id, or null if the table registry is full.
+/// `body` must live for the namespace's lifetime (caller copies it into
+/// loaded_pool, or passes stable ACPI-table memory).
+fn loadDefinitionBlock(body: []const u8) ?u8 {
+    if (body.len == 0 or nbodies >= MAX_TABLES) return null;
+    const id = nbodies; // walkBody assigns this id and bumps nbodies
+    _ = walkBody(body);
+    static_nnodes = nnodes; // the loaded objects are permanent
+    return id;
+}
+
+/// The Load opcode's source: a named SystemMemory OperationRegion holding a
+/// complete ACPI table (36-byte SDT header + Definition Block). Validate the
+/// header length against the region and the pool, copy the table into loaded_pool
+/// (stable storage), and load its body. Returns the DDB handle (the new table_id)
+/// or null on any failure (non-memory space, unmapped, bad length, pool/registry
+/// full). Best-effort — never faults (physMapped gates every access).
+fn loadFromRegion(region: *const StoredNode) ?u8 {
+    const hdr_len = @sizeOf(acpi.SdtHeader);
+    if (region.kind != .op_region or region.region_space != SPACE_MEM) return null;
+    // Reject a full table registry up front, before consuming any pool space —
+    // loadDefinitionBlock would otherwise reject after the copy already advanced
+    // loaded_pool_used (a wasted-pool leak).
+    if (nbodies >= MAX_TABLES) return null;
+    const phys = region.region_off;
+    if (!physMapped(phys, hdr_len)) return null;
+    const hdr: *align(1) const acpi.SdtHeader = @ptrFromInt(paging.physToVirt(phys));
+    const len: usize = hdr.length;
+    if (len < hdr_len or len > region.region_len or len > LOADED_POOL - loaded_pool_used) return null;
+    if (!physMapped(phys, len)) return null;
+    const dst = loaded_pool[loaded_pool_used..][0..len];
+    @memcpy(dst, @as([*]const u8, @ptrFromInt(paging.physToVirt(phys)))[0..len]);
+    loaded_pool_used += len;
+    return loadDefinitionBlock(dst[hdr_len..len]);
 }
 
 /// Compile in a deterministic thermal zone so Slice D's readout has a target on
@@ -5261,6 +5387,7 @@ pub fn load() u32 {
     nnodes = 0;
     store_overflow = false;
     nbodies = 0;
+    loaded_pool_used = 0;
     arenaReset();
 
     // Table 0: the DSDT — the namespace root. SSDTs (next) re-open \_SB etc. by
