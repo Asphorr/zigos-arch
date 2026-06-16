@@ -3355,6 +3355,34 @@ fn stLoadTableTest(fails: *u32) void {
     stCheck("LoadTable idempotent no-dup", @as(u64, nnodes - before), 0, fails);
 }
 
+/// Notify re-eval proof (ACPI 6.4 §5.6.6): the synthetic battery (\_SB_.BAT0 with
+/// _BST/_BIF) and thermal zone (\_SB_.TZ0_ with _TMP) give Notify routing a target
+/// on QEMU (which fires no real device Notify). Checks the device disambiguation
+/// (0x80 on a battery → _BST, on a zone → _TMP), the 0x81 battery-info case, the
+/// not-a-device / unknown-value no-ops, and the deferred-queue drain count.
+fn stNotifyReevalTest(fails: *u32) void {
+    tNsReset();
+    _ = walkBody(&synth_ssdt); // \_SB_.TZ0_._TMP
+    _ = walkBody(&synth_battery); // \_SB_.BAT0._BST + _BIF
+    static_nnodes = nnodes;
+
+    stCheck("Notify 0x80 battery->_BST", b2i(reevalNotify("\\_SB_.BAT0", 0x80)), 1, fails);
+    stCheck("Notify 0x80 zone->_TMP", b2i(reevalNotify("\\_SB_.TZ0_", 0x80)), 1, fails);
+    stCheck("Notify 0x81 battery->_BIF", b2i(reevalNotify("\\_SB_.BAT0", 0x81)), 1, fails);
+    stCheck("Notify 0x81 zone no-op", b2i(reevalNotify("\\_SB_.TZ0_", 0x81)), 0, fails);
+    stCheck("Notify unknown device", b2i(reevalNotify("\\_SB_.NONE", 0x80)), 0, fails);
+    stCheck("Notify unknown value", b2i(reevalNotify("\\_SB_.BAT0", 0x70)), 0, fails);
+
+    // Deferred queue: enqueue two device notifies + one ignored value, drain == 2.
+    notify_q_head = 0;
+    notify_q_count = 0;
+    queueNotifyReeval("\\_SB_.BAT0", 0x80);
+    queueNotifyReeval("\\_SB_.TZ0_", 0x80);
+    queueNotifyReeval("\\_SB_.BAT0", 0x99); // not 0x80/0x81 — dropped at enqueue
+    stCheck("Notify queue drain count", @as(u64, drainNotifyReevals()), 2, fails);
+    stCheck("Notify queue empty after", @as(u64, notify_q_count), 0, fails);
+}
+
 /// Slice E proof: decode the synthetic Processor _CST (the exact blob injected at
 /// boot) and check each C-state's type/hint/latency/power, then confirm selection
 /// picks the deepest FFixedHW state (C3, MWAIT hint 0x20).
@@ -3845,6 +3873,9 @@ pub fn selfTestExtended() u32 {
 
     // LoadTable opcode: find an installed table by signature/OEM and load it.
     stLoadTableTest(&fails);
+
+    // Notify re-eval: device-specific Notify (0x80/0x81) → re-eval _BST/_TMP.
+    stNotifyReevalTest(&fails);
 
     return fails;
 }
@@ -4621,6 +4652,19 @@ fn logTempDeciK(path: []const u8, deci_k: u64) void {
     });
 }
 
+/// Evaluate one thermal-zone _TMP method node and log its reading. Returns true
+/// on a valid integer result. Caller holds the interpreter lock; this resets the
+/// value arena per call. Shared by the full scan (reportThermal) and the targeted
+/// re-eval a Notify(zone, 0x80) triggers (reevalNotify).
+fn evalThermalNode(n: *StoredNode) bool {
+    if (n.kind != .method) return false;
+    arenaReset();
+    const v = callMethod(n, &.{}, 0) orelse return false;
+    if (v != .integer) return false;
+    logTempDeciK(n.path[0..n.path_len], v.integer);
+    return true;
+}
+
 /// Slice D: evaluate every thermal-zone temperature method (\..._TMP) and report
 /// it. Returns the count read. A zone whose _TMP needs an unsupported region
 /// (e.g. an embedded controller) just won't evaluate to an integer and is
@@ -4632,13 +4676,8 @@ pub fn reportThermal() u32 {
     var i: usize = 0;
     while (i < nnodes) : (i += 1) {
         const n = &nodes[i];
-        if (n.kind != .method) continue;
         if (!pathEndsWithSeg(n.path[0..n.path_len], "_TMP")) continue;
-        arenaReset();
-        const v = callMethod(n, &.{}, 0) orelse continue;
-        if (v != .integer) continue;
-        logTempDeciK(n.path[0..n.path_len], v.integer);
-        found += 1;
+        if (evalThermalNode(n)) found += 1;
     }
     if (found == 0) debug.klog("[aml] no readable thermal zones (_TMP) in namespace\n", .{});
     return found;
@@ -4669,6 +4708,47 @@ fn logBattery(path: []const u8, state: u64, rate: u64, remaining: u64, voltage: 
     }
 }
 
+/// Evaluate one battery _BST method node, pairing its sibling _BIF (last-full-
+/// charge capacity at index 2) for a charge percentage, and log it. Returns true
+/// on a valid 4+ element Package. Caller holds the interpreter lock; this resets
+/// the value arena per call. Shared by the full scan (reportBattery) and the
+/// targeted re-eval a Notify(battery, 0x80/0x81) triggers (reevalNotify).
+fn evalBatteryNode(n: *StoredNode) bool {
+    if (n.kind != .method) return false;
+    const path = n.path[0..n.path_len];
+    arenaReset();
+    const bst = callMethod(n, &.{}, 0) orelse return false;
+    if (bst != .package or bst.package.len < 4) return false;
+    // Copy the fields out before any further eval reuses the value arena.
+    const state = pkgInt(bst.package, 0);
+    const rate = pkgInt(bst.package, 1);
+    const remaining = pkgInt(bst.package, 2);
+    const voltage = pkgInt(bst.package, 3);
+
+    // Sibling _BIF (rewrite the trailing "_BST" seg -> "_BIF"): index 2 is the
+    // last-full-charge capacity, which turns remaining mWh into a percentage.
+    var full: u64 = 0;
+    if (path.len <= PATH_MAX and path.len >= 4) {
+        var bif_buf: [PATH_MAX]u8 = undefined;
+        @memcpy(bif_buf[0..path.len], path);
+        bif_buf[path.len - 2] = 'I';
+        bif_buf[path.len - 1] = 'F';
+        if (findExact(bif_buf[0..path.len])) |bn| {
+            if (bn.kind == .method) {
+                arenaReset();
+                if (callMethod(bn, &.{}, 0)) |bif| {
+                    if (bif == .package) full = pkgInt(bif.package, 2);
+                }
+            }
+        }
+    }
+
+    // Guard the multiply: a garbage remaining could otherwise overflow u64.
+    const pct: u64 = if (full != 0 and remaining <= 100_000_000) @min(remaining * 100 / full, 100) else 0;
+    logBattery(path, state, rate, remaining, voltage, full, pct);
+    return true;
+}
+
 /// Slice D: evaluate every battery status method (\..._BST) and report it,
 /// pairing each with its sibling _BIF (last-full-charge capacity at index 2) for
 /// a charge percentage when present. Returns the count read. Best-effort: a _BST
@@ -4681,43 +4761,108 @@ pub fn reportBattery() u32 {
     var i: usize = 0;
     while (i < nnodes) : (i += 1) {
         const n = &nodes[i];
-        if (n.kind != .method) continue;
-        const path = n.path[0..n.path_len];
-        if (!pathEndsWithSeg(path, "_BST")) continue;
-        arenaReset();
-        const bst = callMethod(n, &.{}, 0) orelse continue;
-        if (bst != .package or bst.package.len < 4) continue;
-        // Copy the fields out before any further eval reuses the value arena.
-        const state = pkgInt(bst.package, 0);
-        const rate = pkgInt(bst.package, 1);
-        const remaining = pkgInt(bst.package, 2);
-        const voltage = pkgInt(bst.package, 3);
-
-        // Sibling _BIF (rewrite the trailing "_BST" seg -> "_BIF"): index 2 is the
-        // last-full-charge capacity, which turns remaining mWh into a percentage.
-        var full: u64 = 0;
-        if (path.len <= PATH_MAX and path.len >= 4) {
-            var bif_buf: [PATH_MAX]u8 = undefined;
-            @memcpy(bif_buf[0..path.len], path);
-            bif_buf[path.len - 2] = 'I';
-            bif_buf[path.len - 1] = 'F';
-            if (findExact(bif_buf[0..path.len])) |bn| {
-                if (bn.kind == .method) {
-                    arenaReset();
-                    if (callMethod(bn, &.{}, 0)) |bif| {
-                        if (bif == .package) full = pkgInt(bif.package, 2);
-                    }
-                }
-            }
-        }
-
-        // Guard the multiply: a garbage remaining could otherwise overflow u64.
-        const pct: u64 = if (full != 0 and remaining <= 100_000_000) @min(remaining * 100 / full, 100) else 0;
-        logBattery(path, state, rate, remaining, voltage, full, pct);
-        found += 1;
+        if (!pathEndsWithSeg(n.path[0..n.path_len], "_BST")) continue;
+        if (evalBatteryNode(n)) found += 1;
     }
     if (found == 0) debug.klog("[aml] no batteries (_BST) in namespace\n", .{});
     return found;
+}
+
+// === Tier C: device-specific Notify re-evaluation (ACPI 6.4 §5.6.6) =========
+// Firmware signals that a device's state changed by executing Notify(device,
+// value): 0x80 on a battery (PNP0C0A) means _BST changed, 0x80 on a thermal zone
+// means _TMP changed, 0x81 on a battery means _BIF/_BIX changed. The OS reacts by
+// RE-EVALUATING the affected method. We disambiguate the device kind by which
+// status method hangs off the notified path (no _HID/_CID dependency).
+//
+// The Notify hook runs mid-GPE-handler under the (recursive) interpreter lock, so
+// it must NOT re-eval there — that would nest a method call inside the firmware's
+// running handler. Instead queueNotifyReeval() records (path, value) and acpid
+// drains it via drainNotifyReevals() OUTSIDE the interpreter call stack, mirroring
+// the PCI-rescan deferral. Single-reader/-writer (acpid), like pci_rescan: the
+// queue ops need no atomics.
+
+/// Resolve "<dev>.<seg>" (a 4-char NameSeg child of an absolute device path) to a
+/// method node, or null. Used to tell a battery (has _BST) from a thermal zone
+/// (has _TMP) when routing a device-specific Notify.
+fn childMethod(dev: []const u8, seg: []const u8) ?*StoredNode {
+    if (seg.len != 4 or dev.len == 0 or dev.len + 1 + seg.len > PATH_MAX) return null;
+    var buf: [PATH_MAX]u8 = undefined;
+    @memcpy(buf[0..dev.len], dev);
+    buf[dev.len] = '.';
+    @memcpy(buf[dev.len + 1 ..][0..seg.len], seg);
+    const n = findExact(buf[0 .. dev.len + 1 + seg.len]) orelse return null;
+    return if (n.kind == .method) n else null;
+}
+
+/// Re-evaluate the status method a device-specific Notify invalidates for the
+/// device at `obj_path`. 0x80 → _BST (battery) or _TMP (thermal zone); 0x81 →
+/// _BST(+_BIF) refresh for a battery info change. Returns true if a method was
+/// re-evaluated. Best-effort: an unknown value / absent method / non-device path
+/// is a silent no-op. Takes the (recursive) interpreter lock itself, so it is safe
+/// to call from acpid thread context.
+pub fn reevalNotify(obj_path: []const u8, value: u64) bool {
+    ilockAcquire();
+    defer ilockRelease();
+    switch (value) {
+        0x80, 0x81 => {
+            // Battery: _BST carries status; its _BIF sibling carries the info that
+            // 0x81 changed — evalBatteryNode re-reads both, so it serves both.
+            if (childMethod(obj_path, "_BST")) |n| return evalBatteryNode(n);
+            // Thermal zone (only the 0x80 "temperature changed" notification).
+            if (value == 0x80) {
+                if (childMethod(obj_path, "_TMP")) |n| return evalThermalNode(n);
+            }
+        },
+        else => {},
+    }
+    return false;
+}
+
+const NOTIFY_Q_LEN = 8;
+const NotifyReq = struct { path: [PATH_MAX]u8 = undefined, len: u8 = 0, value: u8 = 0 };
+var notify_q: [NOTIFY_Q_LEN]NotifyReq = [_]NotifyReq{.{}} ** NOTIFY_Q_LEN;
+var notify_q_head: usize = 0; // index of the next entry to drain
+var notify_q_count: usize = 0;
+
+/// Queue a device-specific Notify (value 0x80/0x81) for deferred re-evaluation by
+/// acpid. Called from the Notify hook (mid-GPE-handler, under the interpreter
+/// lock) — so it records rather than re-evaluating here. The device path is COPIED
+/// (the caller's slice points into node storage). On a full queue the oldest entry
+/// is dropped — a missed re-read is idempotent and the next notify refreshes it.
+/// Values other than 0x80/0x81 are ignored (PCI hotplug 0x00/0x01/0x03 is handled
+/// by the integrator's own hook path, not here).
+pub fn queueNotifyReeval(obj_path: []const u8, value: u64) void {
+    if (obj_path.len == 0 or obj_path.len > PATH_MAX) return;
+    if (value != 0x80 and value != 0x81) return;
+    const slot = (notify_q_head + notify_q_count) % NOTIFY_Q_LEN;
+    const e = &notify_q[slot];
+    @memcpy(e.path[0..obj_path.len], obj_path);
+    e.len = @intCast(obj_path.len);
+    e.value = @intCast(value);
+    if (notify_q_count < NOTIFY_Q_LEN) {
+        notify_q_count += 1;
+    } else {
+        notify_q_head = (notify_q_head + 1) % NOTIFY_Q_LEN; // we overwrote the oldest
+    }
+}
+
+/// Drain the deferred Notify re-eval queue (acpid thread context): re-evaluate
+/// each queued device's status method and log the fresh reading. Returns the
+/// number actually re-evaluated. A no-op when the queue is empty.
+pub fn drainNotifyReevals() u32 {
+    var done: u32 = 0;
+    while (notify_q_count > 0) {
+        // Pop (copy the entry + advance head/count) BEFORE the re-eval, so the ring
+        // stays consistent even if the _BST/_TMP method body were itself to Notify
+        // and re-enter queueNotifyReeval mid-drain: the freed slot is valid and the
+        // outer loop just drains the new entry. Real status methods don't Notify.
+        const e = notify_q[notify_q_head];
+        notify_q_head = (notify_q_head + 1) % NOTIFY_Q_LEN;
+        notify_q_count -= 1;
+        if (reevalNotify(e.path[0..e.len], e.value)) done += 1;
+    }
+    return done;
 }
 
 // === Slice E: processor power states (_CST C-states) ========================

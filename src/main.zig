@@ -874,11 +874,14 @@ var pci_rescan_requested: bool = false;
 
 /// aml's Notify hook. ACPI device-presence notifications — 0x00 Bus Check,
 /// 0x01 Device Check, 0x03 Eject Request — all mean the PCI topology changed:
-/// request a rescan. Other values (0x80 thermal/battery) are for later slices.
+/// request a rescan. Device-specific notifications — 0x80 (status changed) and
+/// 0x81 (info changed) — are queued for deferred re-evaluation of the device's
+/// _BST/_TMP method (the hook runs mid-GPE-handler under the interpreter lock, so
+/// the re-eval can't happen here; acpid drains the queue). Runs in acpid context.
 fn acpiNotifyDispatch(obj_path: []const u8, value: u64) void {
-    _ = obj_path;
     switch (value) {
         0x00, 0x01, 0x03 => pci_rescan_requested = true,
+        0x80, 0x81 => @import("acpi/aml.zig").queueNotifyReeval(obj_path, value),
         else => {},
     }
 }
@@ -914,6 +917,11 @@ fn acpidEntry() callconv(.c) noreturn {
             const added = @import("driver/pci.zig").rescan();
             if (added != 0) debug.klog("[acpid] PCI hotplug: {d} new device(s) online\n", .{added});
         }
+        // A GPE handler that Notify'd a device-specific change (0x80 status / 0x81
+        // info on a battery or thermal zone) queued a re-eval; run it here, outside
+        // the interpreter call stack, so the fresh _BST/_TMP reading is logged.
+        const reevaled = aml.drainNotifyReevals();
+        if (reevaled != 0) debug.klog("[acpid] re-evaluated {d} ACPI device notification(s)\n", .{reevaled});
         // One-time GPE dispatch self-test, once boot has settled (Slice C).
         if (!did_selftest) {
             did_selftest = true;
