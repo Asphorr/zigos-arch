@@ -4185,6 +4185,39 @@ const synth_battery = [_]u8{
     0x0B, 0xE0, 0x2E, // 0x2EE0 = 12000 mV design voltage
 };
 
+/// A synthetic Embedded Controller (\_SB.EC0, _HID "PNP0C09") so the EC _Qxx
+/// query-dispatch path has a deterministic target on QEMU q35, which ships no EC.
+/// Injected AFTER the firmware walk, so on real hardware a real EC wins discovery
+/// (lower node index) and this stand-in is ignored. The query handler _Q01 stores
+/// a sentinel (0x99) into the root Name \ECQF; \QCHK reads it back, so ec.zig can
+/// confirm a simulated EC query actually ran the right method. _GPE (0x18) is the
+/// EC's SCI bit, consumed by the GPE-trigger wiring in the next increment. Every
+/// PkgLength is the 1-byte form (the whole device stays under 64 bytes).
+const synth_ec = [_]u8{
+    // Name(\ECQF, 0) — query-fired sentinel (root)
+    0x08, 0x5C, 0x45, 0x43, 0x51, 0x46, 0x00, // NameOp '\' "ECQF" Zero
+    // Method(\QCHK, 0) { Return(\ECQF) } — read the sentinel back
+    0x14, 0x0D, // MethodOp, PkgLength=13
+    0x5C, 0x51, 0x43, 0x48, 0x4B, // '\' "QCHK"
+    0x00, // MethodFlags (0 args)
+    0xA4, 0x5C, 0x45, 0x43, 0x51, 0x46, // Return(\ECQF)
+    // Scope(\_SB) { Device(EC0) { ... } }
+    0x10, 0x31, // ScopeOp, PkgLength=49
+    0x5C, 0x5F, 0x53, 0x42, 0x5F, // RootChar '\' + "_SB_"
+    0x5B, 0x82, 0x29, // DeviceOp, PkgLength=41
+    0x45, 0x43, 0x30, 0x5F, // "EC0_"
+    // Name(_HID, "PNP0C09")
+    0x08, 0x5F, 0x48, 0x49, 0x44, // NameOp "_HID"
+    0x0D, 0x50, 0x4E, 0x50, 0x30, 0x43, 0x30, 0x39, 0x00, // StringPrefix "PNP0C09" NUL
+    // Name(_GPE, 0x18) — the EC's SCI GPE bit
+    0x08, 0x5F, 0x47, 0x50, 0x45, 0x0A, 0x18, // NameOp "_GPE" BytePrefix 0x18
+    // Method(_Q01, 0) { Store(0x99, \ECQF) }
+    0x14, 0x0E, // MethodOp, PkgLength=14
+    0x5F, 0x51, 0x30, 0x31, // "_Q01"
+    0x00, // MethodFlags (0 args)
+    0x70, 0x0A, 0x99, 0x5C, 0x45, 0x43, 0x51, 0x46, // Store(BytePrefix 0x99, \ECQF)
+};
+
 /// True when `path`'s final '.'-separated component equals `seg` (a 4-char
 /// NameSeg like "_TMP"/"_BST"). Finds a well-known method anywhere in the
 /// namespace without caring which device/zone it hangs off.
@@ -4901,6 +4934,32 @@ pub fn findByHid(id: []const u8) ?DevResources {
     return null;
 }
 
+/// Like findByHid but returns the matched device's namespace PATH (a slice into
+/// the static node table, stable for the kernel's life — copy it if you need to
+/// outlive the next load()) instead of its _CRS. For callers that evaluate the
+/// device's child methods by path — e.g. the EC driver, which must run
+/// `<ec>._Qxx` query handlers. First *present* _HID/_CID match wins; because the
+/// synthetic test devices are injected AFTER the firmware walk, a real device of
+/// the same id always has the lower index and wins over a synthetic stand-in.
+pub fn findDevicePathByHid(id: []const u8) ?[]const u8 {
+    ilockAcquire();
+    defer ilockRelease();
+    var i: usize = 0;
+    while (i < nnodes) : (i += 1) {
+        const n = &nodes[i];
+        if (n.kind != .device) continue;
+        const path = n.path[0..n.path_len];
+        var sta: u64 = 0x0F;
+        if (evalDeviceChild(path, "_STA")) |v| {
+            if (v == .integer) sta = v.integer;
+        }
+        if (sta & 0x01 == 0) continue; // not present
+        if (!deviceMatchesId(path, id)) continue;
+        return path;
+    }
+    return null;
+}
+
 /// Slice G proof: cross-check a few enumerated legacy-device resources against
 /// the values the kernel independently knows — proving the namespace yields
 /// correct, consumable resource data.
@@ -5130,6 +5189,7 @@ pub fn load() u32 {
         _ = walkBody(&synth_ssdt); // thermal zone \_SB.TZ0
         _ = walkBody(&synth_battery); // battery \_SB.BAT0
         _ = walkBody(&synth_cst); // processor C-states \_SB.CPUT._CST
+        _ = walkBody(&synth_ec); // Embedded Controller \_SB.EC0 (+ _Q01/\ECQF/\QCHK)
     }
 
     // Freeze the static namespace size: everything walked so far is permanent;

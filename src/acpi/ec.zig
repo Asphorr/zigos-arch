@@ -149,6 +149,76 @@ pub fn init() void {
     }
 }
 
+// --- _Qxx query dispatch (ACPI 6.x §12.3, QR_EC) -----------------------------
+// When the EC has an event (lid, hotkey, AC, battery, thermal) it sets SCI_EVT
+// and asserts its GPE; the OS answers by issuing QR_EC to read a one-byte query
+// code Q, then runs the EC device's `_Q<XX>` method. discover() locates the EC
+// device in the namespace so those handlers can be addressed by path. (The GPE
+// that TRIGGERS this is wired in the next increment; here processQueries() is
+// driven by the boot self-test against the software model.)
+
+var ec_path_buf: [96]u8 = undefined; // the EC device's namespace path (e.g. "\_SB_.EC0_")
+var ec_path_len: usize = 0;
+
+/// After aml.load(): locate the EC device (a real one wins; the synthetic q35
+/// stand-in otherwise) so its _Qxx handlers can be run by path.
+pub fn discover() void {
+    ec_path_len = 0;
+    const p = aml.findDevicePathByHid("PNP0C09") orelse {
+        debug.klog("[ec] no PNP0C09 device in namespace — query dispatch idle\n", .{});
+        return;
+    };
+    if (p.len > ec_path_buf.len) return;
+    @memcpy(ec_path_buf[0..p.len], p);
+    ec_path_len = p.len;
+    debug.klog("[ec] EC device: {s} — _Qxx query dispatch armed\n", .{ec_path_buf[0..ec_path_len]});
+}
+
+/// Issue QR_EC and return the pending query byte (0 = no event), null on timeout.
+pub fn queryByte() ?u8 {
+    if (!waitStatus(ST_IBF, false)) return null;
+    cmdWrite(QR_EC);
+    if (!waitStatus(ST_OBF, true)) return null;
+    return dataRead();
+}
+
+fn hexU(nib: u8) u8 {
+    return "0123456789ABCDEF"[nib & 0x0F];
+}
+
+/// Run "<ec_path>._Q<XX>" (XX = uppercase hex of q). A missing handler is a clean
+/// no-op (evalMethod returns null). evalMethod serializes on the interpreter lock.
+fn runQuery(q: u8) void {
+    if (ec_path_len == 0) return;
+    var buf: [104]u8 = undefined;
+    if (ec_path_len + 5 > buf.len) return;
+    @memcpy(buf[0..ec_path_len], ec_path_buf[0..ec_path_len]);
+    var n = ec_path_len;
+    buf[n] = '.';
+    buf[n + 1] = '_';
+    buf[n + 2] = 'Q';
+    buf[n + 3] = hexU(q >> 4);
+    buf[n + 4] = hexU(q & 0x0F);
+    n += 5;
+    _ = aml.evalMethod(buf[0..n]);
+}
+
+/// Drain pending EC SCI queries: while SCI_EVT is set, QR_EC → run `_Q<XX>`.
+/// Bounded so a wedged EC can't spin the caller. MUST be called under the AML
+/// interpreter lock in production (it shares the EC ports with AML field access);
+/// the GPE-trigger wiring that will call this holds it, and the boot self-test is
+/// single-threaded.
+pub fn processQueries() void {
+    if (ec_path_len == 0) return;
+    var guard: u32 = 0;
+    while (guard < 64) : (guard += 1) { // ACPI allows ≤255 query slots; ample per SCI
+        if ((scRead() & ST_SCI) == 0) break; // no events pending
+        const q = queryByte() orelse break;
+        if (q == 0) break; // spurious / no event
+        runQuery(q);
+    }
+}
+
 // --- software EC (self-test backend) -----------------------------------------
 // A faithful-enough ACPI EC: a 256-byte register file plus the command/handshake
 // state machine readByte/writeByte drive. Synchronous — IBF is never left set,
@@ -158,6 +228,7 @@ var ec_ram: [256]u8 = [_]u8{0} ** 256;
 var sim_status: u8 = 0;
 var sim_data_out: u8 = 0;
 var sim_addr: u8 = 0;
+var sim_query: u8 = 0; // a pending SCI query code (0 = none), returned by QR_EC
 const SimState = enum { idle, rd_addr, wr_addr, wr_data };
 var sim_state: SimState = .idle;
 
@@ -168,7 +239,14 @@ fn simCmd(v: u8) void {
     switch (v) {
         RD_EC => sim_state = .rd_addr,
         WR_EC => sim_state = .wr_addr,
-        else => {}, // QR_EC / burst enable/disable: not modeled in increment 1
+        QR_EC => {
+            sim_data_out = sim_query; // hand back the queued query code
+            sim_status |= ST_OBF; // ...ready to read
+            sim_status &= ~ST_SCI; // the event is consumed
+            sim_query = 0; // one-shot
+            sim_state = .idle;
+        },
+        else => {}, // burst enable/disable: not modeled
     }
 }
 fn simData(v: u8) void {
@@ -194,6 +272,13 @@ fn simDataRead() u8 {
     return sim_data_out;
 }
 
+/// Queue one SCI query event (raise SCI_EVT) — the self-test's stand-in for an EC
+/// asserting its GPE with a pending _Qxx.
+fn simRaiseQuery(q: u8) void {
+    sim_query = q;
+    sim_status |= ST_SCI;
+}
+
 /// Boot proof: drive the REAL transaction protocol against the software EC and
 /// confirm a single-byte round-trip plus a multi-byte little-endian unit through
 /// the region handler. Returns the failure count (0 = pass). This is what
@@ -205,6 +290,7 @@ pub fn selfTest() u32 {
     defer sim_active = false;
     sim_state = .idle;
     sim_status = 0;
+    sim_query = 0;
     @memset(&ec_ram, 0);
 
     // (1) single-byte write/read round-trip via readByte/writeByte.
@@ -220,6 +306,21 @@ pub fn selfTest() u32 {
     // byte order in RAM must be LE: 0xAA at the lowest address, 0xDD highest.
     if (ec_ram[0x10] != 0xAA or ec_ram[0x11] != 0xBB or ec_ram[0x12] != 0xCC or ec_ram[0x13] != 0xDD) fails += 1;
 
-    debug.klog("[ec] software-EC self-test: {s} ({d}/6 checks failed)\n", .{ if (fails == 0) "PASS" else "FAIL", fails });
+    // (3) _Qxx query dispatch (only if an EC device was discovered): raise a
+    //     simulated SCI query 0x01 and confirm the EC's _Q01 handler actually ran
+    //     — it stores 0x99 into \ECQF, which \QCHK reads back — and that the event
+    //     was consumed (SCI_EVT cleared). Exercises queryByte→runQuery→evalMethod.
+    if (ec_path_len > 0) {
+        simRaiseQuery(0x01);
+        processQueries();
+        var got: u64 = 0xDEAD;
+        if (aml.evalMethod("\\QCHK")) |v| {
+            if (v == .integer) got = v.integer;
+        }
+        if (got != 0x99) fails += 1;
+        if ((scRead() & ST_SCI) != 0) fails += 1; // the query must have been consumed
+    }
+
+    debug.klog("[ec] software-EC self-test: {s} ({d} checks failed)\n", .{ if (fails == 0) "PASS" else "FAIL", fails });
     return fails;
 }

@@ -836,6 +836,9 @@ pub fn init(boot_rsdp: u64) void {
     // never a fault. For bring-up this dumps the discovered objects to serial.
     _ = @import("aml.zig").load();
 
+    // EC namespace discovery (needs the built namespace) + the boot proof: the
+    // software-EC loopback AND a simulated _Qxx query running its handler.
+    ec.discover();
     _ = ec.selfTest();
 
     // Slice E: adopt the deepest CPU-supported processor C-state from _CST as the
