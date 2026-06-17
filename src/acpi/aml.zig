@@ -1377,12 +1377,36 @@ fn evalExtTerm(r: *Reader, st: *ExecState) ?Value {
             if (!storeTarget(r, st, .{ .integer = handle })) return null;
             return .uninit;
         },
-        0x2A => { // UnloadOp SuperName — parse + graceful no-op.
-            // A loaded table's nodes are not reclaimed (Unload is rare — for
-            // ejectable SSDTs); the handle is consumed and its objects persist.
+        0x2A => { // UnloadOp SuperName — Tier C state-pruning (reverses Load/LoadTable).
             _ = r.next(); // 0x5B
             _ = r.next(); // 0x2A
-            if (!skipSuperName(r)) return null;
+            // The SuperName holds the DDBHandle a prior Load/LoadTable produced
+            // (table_id + 1). Recover it WITHOUT side effects — table_id 0 is the
+            // DSDT and 0 is the failure sentinel, so only h >= 2 (table_id >= 1)
+            // in range is unloadable; bogus handles fall through untouched.
+            const lead = r.peek(0) orelse return null;
+            if (lead >= 0x60 and lead <= 0x6E) {
+                // Local0..7 / Arg0..6: a pure one-byte read, consuming exactly
+                // what skipSuperName would.
+                const h = toInt(evalTermArg(r, st) orelse return null);
+                if (h >= 2 and h - 1 < nbodies) _ = unloadTable(@intCast(h - 1));
+            } else if (isNameLead(lead)) {
+                // The usual `Unload(\HND)` — Load stashed the handle in Name \HND.
+                // Consume the name (same bytes skipSuperName takes) and read the
+                // object DIRECTLY via readThroughRef, NOT evalNameRef: the latter
+                // would *invoke* a Method (or special-case _OSI) if the name
+                // resolved to one — a side effect a malformed/adversarial Unload
+                // could smuggle in. A real DDB lives in a .name (a pure read).
+                const ns = readNameString(r) orelse return null;
+                if (resolve(st.scope, ns)) |node| {
+                    const h = toInt(readThroughRef(.{ .node = nodeIndexOf(node) }));
+                    if (h >= 2 and h - 1 < nbodies) _ = unloadTable(@intCast(h - 1));
+                }
+            } else {
+                // Type6 / DebugObj SuperName never carries a DDB; consume + no-op
+                // (skipSuperName bails to null on these, exactly as before).
+                if (!skipSuperName(r)) return null;
+            }
             return .uninit;
         },
         else => return null, // unmodeled extended op — bail cleanly
@@ -3399,6 +3423,49 @@ fn stRenderProcTest(fails: *u32) void {
     stCheck("renderProc has temp", b2i(std.mem.indexOf(u8, out, " C (") != null), 1, fails);
 }
 
+/// Unload (Tier C state-pruning) proof: load a one-Name definition block, confirm
+/// the object resolves, then prune it by DDB handle and confirm it is gone, the
+/// body slot is cleared, and the trailing table id is retired. The opcode path is
+/// checked separately for stream alignment under the guarded 0-handle no-op.
+fn stUnloadTest(fails: *u32) void {
+    tNsReset();
+    // BASE keeps table_id 0 occupied (the live-namespace DSDT slot the opcode's
+    // h >= 2 guard reserves), so the tables under test get id >= 1 / handle >= 2.
+    // Inline literals have static storage, so their bodies outlive the walk.
+    _ = loadDefinitionBlock(&[_]u8{ 0x08, 0x5C, 'B', 'A', 'S', 'E', 0x0A, 0x01 }) orelse return; // id 0
+    const id = loadDefinitionBlock(&[_]u8{ 0x08, 0x5C, 'U', 'N', 'L', 'D', 0x0A, 0x77 }) orelse return; // id 1
+    stCheck("Unload object present", toInt(runProgKeepNs(&[_]u8{ 0xA4, 0x5C, 'U', 'N', 'L', 'D' })), 0x77, fails);
+
+    // (a) Direct prune by id: object gone, body cleared, the trailing id retired.
+    const pruned = unloadTable(id);
+    stCheck("Unload pruned >=1", b2i(pruned >= 1), 1, fails);
+    stCheck("Unload object gone", b2i(findExact("\\UNLD") == null), 1, fails);
+    stCheck("Unload body cleared", b2i(bodies[id].len == 0), 1, fails);
+    stCheck("Unload id retired", @as(u64, nbodies), 1, fails); // id 1 (top) retired → nbodies 2→1
+
+    // (b) Full opcode + NameString arm: stash a real table's handle (id 1, reusing
+    // the retired slot → handle 2) in Name \HND_, then Unload(\HND_). Exercises the
+    // side-effect-free value read and prunes through the 0x2A path.
+    const id2 = loadDefinitionBlock(&[_]u8{ 0x08, 0x5C, 'U', 'N', 'L', '2', 0x0A, 0x33 }) orelse return; // id 1
+    const hnd = stMakeNode("\\HND_") orelse return;
+    hnd.kind = .name;
+    hnd.runtime_val = .{ .integer = @as(u64, id2) + 1 };
+    hnd.has_runtime = true;
+    static_nnodes = nnodes;
+    _ = runProgKeepNs(&[_]u8{ 0x5B, 0x2A, 0x5C, 'H', 'N', 'D', '_' }); // Unload(\HND_)
+    stCheck("Unload via Name handle", b2i(findExact("\\UNL2") == null), 1, fails);
+
+    // (c) Opcode alignment under the guarded 0-handle no-op: Store(0,Local0);
+    // Unload(Local0); Return(0x55) — the no-op consumes its SuperName and the
+    // Return still runs, proving the 0x2A handler stays stream-aligned.
+    const aligned = toInt(runProgKeepNs(&[_]u8{
+        0x70, 0x00, 0x60, // Store(Zero, Local0)
+        0x5B, 0x2A, 0x60, // Unload(Local0)
+        0xA4, 0x0A, 0x55, // Return(0x55)
+    }));
+    stCheck("Unload opcode aligned", aligned, 0x55, fails);
+}
+
 /// Slice E proof: decode the synthetic Processor _CST (the exact blob injected at
 /// boot) and check each C-state's type/hint/latency/power, then confirm selection
 /// picks the deepest FFixedHW state (C3, MWAIT hint 0x20).
@@ -3895,6 +3962,9 @@ pub fn selfTestExtended() u32 {
 
     // /proc/acpi renderer: namespace + tables + live thermal/battery snapshot.
     stRenderProcTest(&fails);
+
+    // Unload: Tier C state-pruning — DDB handle → remove a loaded table's nodes.
+    stUnloadTest(&fails);
 
     return fails;
 }
@@ -4494,6 +4564,35 @@ fn loadFromRegion(region: *const StoredNode) ?u8 {
     @memcpy(dst, @as([*]const u8, @ptrFromInt(paging.physToVirt(phys)))[0..len]);
     loaded_pool_used += len;
     return loadDefinitionBlock(dst[hdr_len..len]);
+}
+
+/// Tier C state-pruning — the inverse of loadDefinitionBlock/loadMatchedHeader:
+/// remove every namespace node a prior Load/LoadTable stamped with `tid` (its DDB
+/// handle is tid + 1). Nodes are NOT compacted out of `nodes[]`: a .field element
+/// references its OperationRegion by node index (field_region), as do CreateField
+/// windows, so shifting the array would dangle those indices. Each pruned node is
+/// instead neutralized by zeroing path_len — every real lookup passes a non-empty
+/// absolute path, so findExact (and the scope search built on it) can never match
+/// a 0-length path again. The body slot is cleared so bodyOf() yields empty and
+/// /proc/acpi shows the table unloaded; if `tid` was the last-loaded table its id
+/// is retired (nbodies--) so the next Load reuses the slot instead of leaking ids.
+/// loaded_pool bytes are not reclaimed (a bounded <=16 KiB best-effort leak —
+/// Unload is rare, and LoadTable loads in place without touching the pool).
+/// Returns the number of nodes pruned.
+fn unloadTable(tid: u8) u32 {
+    if (tid >= nbodies or bodies[tid].len == 0) return 0; // unknown or already gone
+    var pruned: u32 = 0;
+    var i: usize = 0;
+    while (i < nnodes) : (i += 1) {
+        if (nodes[i].path_len != 0 and nodes[i].table_id == tid) {
+            nodes[i].path_len = 0; // tombstone: unmatchable in findExact
+            pruned += 1;
+        }
+    }
+    bodies[tid] = &[_]u8{};
+    table_src[tid] = 0;
+    if (@as(usize, tid) + 1 == nbodies) nbodies -= 1; // retire a trailing id
+    return pruned;
 }
 
 /// Trailing-space/NUL-trimmed view of a fixed SdtHeader text field (oem_id is
