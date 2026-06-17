@@ -1094,6 +1094,21 @@ pub fn pickNext(exclude_pid: ?u8) ?usize {
     @import("../debug/iretq_canary.zig").check(@src());
 
     const cpu = smp.myCpu();
+
+    // Pre-suspend quiesce (S3 CP2b-2c): steer every AP to its idle PCB so its
+    // current task is descheduled — switchTo saves the task's context into its PCB
+    // (surviving S3 → re-dispatched on resume) — and the AP can reach kernelIdle's
+    // lock-free park point instead of re-dispatching work into the suspend. The BSP
+    // is exempt: it runs the shutdown syscall driving the suspend and must NOT be
+    // steered away from it. Gated on the cheap quiesceRequested() bool, so normal
+    // scheduling is untouched. Returns before taking rq.lock (the idle fallback
+    // below doesn't need it either).
+    if (smp.quiesceRequested() and !smp.isBSP()) {
+        if (cpu.idle_pid) |idle| {
+            if (process.procs[idle].idle_cpu == cpu.cpu_id) return idle;
+        }
+    }
+
     const rq = &cpu.runqueue;
     // M5: hold rq.lock across the pickMinVruntime walks. A peer CPU's
     // setState→rqEnter (waking a pid whose assigned_cpu = this cpu) can

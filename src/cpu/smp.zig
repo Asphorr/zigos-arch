@@ -975,6 +975,128 @@ pub fn reonlineApsForS3Resume(resume_cr3: u64) void {
     debug.klog("[smp] S3 re-online: {d}/{d} AP(s) back, {d} CPU(s) online\n", .{ brought, ap_count, cpu_count });
 }
 
+// ── Pre-suspend AP quiesce (S3 CP2b-2c) ──────────────────────────────────────
+// S3 powers the APs down without warning. If an AP is powered off (1) running a
+// task, that task's live registers are lost (only the BSP's context is saved by
+// the suspend) → the task is stranded; or (2) holding a lock, that lock stays
+// stuck-held in surviving RAM → the re-onlined AP deadlocks on it (its own
+// per-CPU sched_lock is the sharpest case — it survives S3 in cpus[] and the
+// re-onlined AP is the only one that ever takes it). The fix is to drive every AP
+// to a lock-free safe point and cleanly deschedule its task BEFORE SLP_EN.
+//
+// Protocol: the BSP sets `quiesce_requested`; each AP's pickNext then steers it to
+// its idle PCB (descheduling — and thus context-SAVING via switchTo — whatever it
+// was running, so the task survives S3 in its PCB and is re-dispatched on resume),
+// and kernelIdle parks it. The park is `cli; hlt`, NOT `sti; hlt`: once parked the
+// AP runs no further code (no timer tick → no schedule() → no sched_lock), so it
+// is guaranteed to be powered off holding nothing. A parked AP also marks itself
+// `alive=false` so it drops out of every cross-CPU IPI broadcast — crucially TLB
+// shootdowns (doShootdown skips !alive CPUs and otherwise spins forever on a
+// cli;hlt AP that can never ack the shootdown IPI), and the watchdog. An AP leaves
+// the park only via INIT/SIPI (reonlineApsForS3Resume, on real resume OR an aborted
+// suspend), which resets it into apEntryS3Resume — the park frame is abandoned, so
+// there is no flag for it to re-test.
+var quiesce_requested: bool = false;
+var quiesce_acked: [MAX_CPUS]bool = [_]bool{false} ** MAX_CPUS;
+
+/// True while a pre-suspend quiesce is in effect. The cheap gate pickNext and
+/// kernelIdle consult before any quiesce-specific work — a single bool load that
+/// is false in all normal operation, so the quiesce path adds nothing measurable
+/// to the scheduler/idle hot paths.
+pub inline fn quiesceRequested() bool {
+    return @atomicLoad(bool, &quiesce_requested, .acquire);
+}
+
+/// Called from an AP's kernelIdle at the lock-clean top of its loop. If a
+/// pre-suspend quiesce is in effect, acknowledge it and park the AP holding NO
+/// lock until power-off. The BSP is exempt — it drives the suspend and must keep
+/// running the shutdown syscall. cli BEFORE the ack so that once the BSP observes
+/// the ack this CPU is guaranteed IF=0 and will only hlt (no tick can sneak a
+/// schedule() in between). Never returns when it parks.
+pub fn parkForQuiesceIfRequested() void {
+    if (!quiesceRequested()) return;
+    if (isBSP()) return; // BSP drives the suspend; never parks itself
+    const id = myCpu().lapic_id;
+    asm volatile ("cli"); // no further IRQ/schedule on this CPU before power-off
+    // Mark offline BEFORE acking. A parked cli;hlt AP can't service an inbound
+    // IPI, so it MUST NOT remain a TLB-shootdown target: doShootdown skips
+    // !alive CPUs (tlb.zig — `if (!cpus[i].alive) continue`), so any shootdown
+    // the BSP issues between here and SLP_EN (e.g. a kernel-master page-table
+    // mutation while it finishes staging/printing) would otherwise spin forever
+    // on this CPU's missing ack. Publishing alive=false before quiesce_acked
+    // (release/acquire) guarantees the BSP sees us offline the moment it sees us
+    // parked. Also makes the watchdog skip our now-frozen tick. reonline resets it.
+    @atomicStore(bool, &cpus[id].alive, false, .release);
+    @atomicStore(bool, &quiesce_acked[id], true, .release);
+    // Park. IF=0 hlt wakes only on NMI/SMI/INIT; the loop re-hlts on the first
+    // two, and INIT (reonlineApsForS3Resume) resets the CPU out of this frame.
+    while (true) asm volatile ("hlt");
+}
+
+/// BSP-only: drive every AP to its lock-free park point before suspending, then
+/// wait up to `timeout_ms` for each alive AP to ack. Returns the number of APs
+/// that did NOT park (0 = clean full quiesce). Best-effort: an AP that doesn't
+/// reach the safe point in time (busy in a cli'd loop, or wedged) is logged and
+/// left as-is — strictly no worse than the pre-quiesce behavior. The caller holds
+/// IF=0, so this wait can't be preempted. APs in user mode or already idling park
+/// within ~1-2 timer ticks (≤10 ms each: the tick preempts → schedule()→idle→park).
+/// A kernel-busy AP (kernel thread, ksoftirqd, or a user thread mid-syscall) is NOT
+/// steered by the tick — handleIRQ0 only preempts on from_user/soft-yield — so it
+/// parks only when it next *voluntarily* reaches schedule(); otherwise the timeout
+/// falls through, leaving exactly the busy-suspend hazard reonlineApsForS3Resume's
+/// LIMITATION documents. (Forcibly preempting a kernel-busy AP would be worse — it
+/// could deschedule the task mid-lock-hold; cooperative parking is the safe choice.)
+pub fn quiesceApsForS3(timeout_ms: u32) u32 {
+    if (!apic.apic_active) return 0;
+    if (@import("../boot/boot_info.zig").boot_mode == 2) return 0; // already single-CPU
+
+    const bsp_id: u8 = @truncate(apic.getLapicId());
+    var ap_ids: [MAX_CPUS]u8 = undefined;
+    const ap_count = collectApIds(bsp_id, &ap_ids);
+
+    // Clear acks BEFORE publishing the request, so an AP can't observe a stale ack.
+    var k: usize = 0;
+    while (k < ap_count) : (k += 1) @atomicStore(bool, &quiesce_acked[ap_ids[k]], false, .release);
+    @atomicStore(bool, &quiesce_requested, true, .release);
+
+    var waited: u32 = 0;
+    while (waited < timeout_ms) : (waited += 1) {
+        var all_parked = true;
+        var i: usize = 0;
+        while (i < ap_count) : (i += 1) {
+            const ap = ap_ids[i];
+            if (!@atomicLoad(bool, &cpus[ap].alive, .acquire)) continue; // already offline
+            if (!@atomicLoad(bool, &quiesce_acked[ap], .acquire)) {
+                all_parked = false;
+                break;
+            }
+        }
+        if (all_parked) break;
+        busyWait(1); // ~1 ms via port-0x80 I/O — IF=0 safe (no tick dependency)
+    }
+
+    var not_parked: u32 = 0;
+    var i: usize = 0;
+    while (i < ap_count) : (i += 1) {
+        const ap = ap_ids[i];
+        if (@atomicLoad(bool, &cpus[ap].alive, .acquire) and !@atomicLoad(bool, &quiesce_acked[ap], .acquire)) {
+            not_parked += 1;
+            debug.klog("[smp] S3 quiesce: AP {d} did NOT park ({d}ms) — left running (busy/wedged)\n", .{ ap, timeout_ms });
+        }
+    }
+    if (not_parked == 0)
+        debug.klog("[smp] S3 quiesce: all {d} AP(s) parked at lock-free safe point ({d}ms)\n", .{ ap_count, waited });
+    return not_parked;
+}
+
+/// End a pre-suspend quiesce: clear the request so APs brought back by
+/// reonlineApsForS3Resume (a real resume OR an aborted suspend) resume normal idle
+/// instead of immediately re-parking. MUST be called before reonline on every path
+/// that re-onlines the APs.
+pub fn endQuiesceAps() void {
+    @atomicStore(bool, &quiesce_requested, false, .release);
+}
+
 /// Initialize this CPU's per-CPU syscall scratch slot. The kstack pointer
 /// itself lives in cpus[cpu_id].tss.rsp0 and is stamped by setTssRsp0 on
 /// the first per-process dispatch; until then no syscall can fire on this

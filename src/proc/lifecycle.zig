@@ -488,6 +488,12 @@ pub fn forkCurrent(frame: *signals.SyscallFrame) ?usize {
 fn kernelIdle() callconv(.c) noreturn {
     const mwait = @import("../cpu/arch/mwait.zig");
     while (true) {
+        // Pre-suspend AP quiesce (S3 CP2b-2c) safe point. This is the lock-clean
+        // top of the idle loop — the previous schedule() released sched_lock and we
+        // hold nothing. If the BSP has requested a quiesce, an AP acks and parks
+        // here in cli; hlt until S3 powers it down (or INIT/SIPI re-onlines it). No
+        // effect on the BSP or in normal operation (the gate is a single bool load).
+        smp.parkForQuiesceIfRequested();
         // Drain any pending async app load (file-read offload). Used to be
         // serviced by apEntry's scheduler-context loop, but per-CPU idle
         // (task #235) made that loop dead code on APs. Idle is the right

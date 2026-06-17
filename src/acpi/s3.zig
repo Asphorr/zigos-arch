@@ -105,6 +105,17 @@ fn writeTsc(val: u64) void {
     );
 }
 
+/// Write a string straight to COM1 (0x3F8), bypassing serial.print's deferred-mode
+/// ring buffer + write_lock entirely — the same raw path s3ResumeEntry uses for
+/// S3WAKE. This is the ONLY reliable logging across the suspend window: the BSP is
+/// cli'd and the APs are parked, so the deferred klog buffer is never drained (no
+/// ksoftirqd runs) and a normal serial.print only buffers, never reaching the port
+/// (serial.log). Raw outb always lands, so the suspend-progress markers below are
+/// the trustworthy record of how far a suspend got — and, if it ever hangs, where.
+fn rawDbg(s: []const u8) void {
+    for (s) |c| io.outb(0x3F8, c);
+}
+
 /// Entry point the wake trampoline jumps to in 64-bit mode. Re-establishes the
 /// BSP CPU state torn down by S3, then longjmps back into suspendToRam's resume
 /// branch (never returns here).
@@ -266,6 +277,21 @@ pub fn suspendToRam() u32 {
     facs.firmware_waking_vector = WAKE_TRAMP_BASE;
     facs.x_firmware_waking_vector = 0; // force the 32-bit real-mode entry
 
+    // Pre-suspend AP quiesce (CP2b-2c): park every AP at a lock-free safe point so
+    // none is powered off holding a lock (which would deadlock the re-onlined AP on
+    // its own surviving sched_lock) or running an unsaved task (lost regs →
+    // stranded). Best-effort with a timeout; a busy/wedged AP is logged and left as
+    // today's behavior. IF is already 0 (we cli'd above) so this wait can't be
+    // preempted. APs in user mode or idle park within a tick or two; a kernel-busy
+    // AP only parks when it next reaches schedule(), else the timeout falls through.
+    const not_parked = smp.quiesceApsForS3(200);
+    // Raw COM1 marker: quiesce returned without deadlocking (a parked AP that still
+    // answered TLB shootdowns would have hung the BSP here). serial.print can't be
+    // trusted from here on — the deferred klog buffer won't drain with the BSP cli'd.
+    rawDbg("\r\n[s3] APs quiesced; arming sleep\r\n");
+    if (not_parked != 0)
+        serial.print("[s3] {d} AP(s) did not quiesce — suspending anyway (busy-suspend hazard remains for those)\n", .{not_parked});
+
     // setjmp: 0 = first pass (arm + suspend). On S3 wake the trampoline ->
     // s3ResumeEntry -> reinitForS3Resume -> s3_longjmp makes this "return" 1 and
     // execution falls through to the resume branch below.
@@ -273,6 +299,8 @@ pub fn suspendToRam() u32 {
         const word_a = sleepWord(s3.a);
         const word_b = sleepWord(s3.b);
         serial.print("[s3] suspending: wake_vector=0x{x} resume_cr3=0x{x}; PM1a_CNT port=0x{x} <- 0x{x}\n", .{ @as(u64, WAKE_TRAMP_BASE), resume_cr3, @as(u16, @truncate(f.pm1a_cnt_blk)), word_a });
+        // Last marker that reliably lands before the CPU halts (raw, see rawDbg).
+        rawDbg("[s3] SLP_EN -> platform suspends\r\n");
 
         // Continuous-time baseline restored on resume (writeTsc in s3ResumeEntry).
         // Capture as late as possible so the restored TSC is closest to real time.
@@ -281,8 +309,15 @@ pub fn suspendToRam() u32 {
         io.outw(@truncate(f.pm1a_cnt_blk), word_a);
         if (f.pm1b_cnt_blk != 0) io.outw(@truncate(f.pm1b_cnt_blk), word_b);
 
-        // Reached only if the platform ignored the sleep request.
-        serial.print("[s3] SLP_EN write returned — platform did not suspend\n", .{});
+        // Reached only if the platform ignored the sleep request. The APs we
+        // quiesced are parked in cli; hlt — bring them back the same way resume
+        // does (INIT/SIPI re-online), clearing the request first so they don't
+        // re-park, and restore the null guard the staging borrowed.
+        serial.print("[s3] SLP_EN write returned — platform did not suspend; un-parking APs\n", .{});
+        smp.endQuiesceAps();
+        smp.offlineApsForS3Resume();
+        smp.reonlineApsForS3Resume(resume_cr3);
+        removeLowIdentity();
         asm volatile ("sti");
         return common.E_BUSY;
     }
@@ -298,6 +333,10 @@ pub fn suspendToRam() u32 {
     // load this same resume CR3 (PCID stripped), exactly as the BSP's own wake
     // trampoline did. IF is still 0, so the whole bring-up is atomic w.r.t. the
     // watchdog/scheduler (no IRQ0 fires until we sysret back to userspace).
+    // Clear the pre-suspend quiesce request FIRST: the APs parked themselves before
+    // suspend, and on re-online they pass through kernelIdle's park check again — if
+    // the request were still set they'd immediately re-park instead of idling.
+    smp.endQuiesceAps();
     smp.offlineApsForS3Resume();
     smp.reonlineApsForS3Resume(readCr3() & paging.PAGE_MASK);
 
