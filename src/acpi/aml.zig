@@ -3383,6 +3383,22 @@ fn stNotifyReevalTest(fails: *u32) void {
     stCheck("Notify queue empty after", @as(u64, notify_q_count), 0, fails);
 }
 
+var rp_buf: [1024]u8 = undefined;
+
+/// /proc/acpi renderer proof: render the synthetic battery + thermal zone snapshot
+/// into a buffer and confirm it carries the device paths and a formatted reading.
+fn stRenderProcTest(fails: *u32) void {
+    tNsReset();
+    _ = walkBody(&synth_ssdt); // \_SB_.TZ0_._TMP
+    _ = walkBody(&synth_battery); // \_SB_.BAT0._BST + _BIF
+    static_nnodes = nnodes;
+    const out = rp_buf[0..renderProc(&rp_buf)];
+    stCheck("renderProc nonempty", b2i(out.len > 0), 1, fails);
+    stCheck("renderProc has zone path", b2i(std.mem.indexOf(u8, out, "TZ0_") != null), 1, fails);
+    stCheck("renderProc has battery path", b2i(std.mem.indexOf(u8, out, "BAT0") != null), 1, fails);
+    stCheck("renderProc has temp", b2i(std.mem.indexOf(u8, out, " C (") != null), 1, fails);
+}
+
 /// Slice E proof: decode the synthetic Processor _CST (the exact blob injected at
 /// boot) and check each C-state's type/hint/latency/power, then confirm selection
 /// picks the deepest FFixedHW state (C3, MWAIT hint 0x20).
@@ -3876,6 +3892,9 @@ pub fn selfTestExtended() u32 {
 
     // Notify re-eval: device-specific Notify (0x80/0x81) → re-eval _BST/_TMP.
     stNotifyReevalTest(&fails);
+
+    // /proc/acpi renderer: namespace + tables + live thermal/battery snapshot.
+    stRenderProcTest(&fails);
 
     return fails;
 }
@@ -4652,16 +4671,24 @@ fn logTempDeciK(path: []const u8, deci_k: u64) void {
     });
 }
 
-/// Evaluate one thermal-zone _TMP method node and log its reading. Returns true
-/// on a valid integer result. Caller holds the interpreter lock; this resets the
-/// value arena per call. Shared by the full scan (reportThermal) and the targeted
-/// re-eval a Notify(zone, 0x80) triggers (reevalNotify).
-fn evalThermalNode(n: *StoredNode) bool {
-    if (n.kind != .method) return false;
+/// Evaluate one thermal-zone _TMP method node to its raw tenths-of-Kelvin reading,
+/// or null on a non-method / non-integer result. Caller holds the interpreter
+/// lock; resets the value arena. The decode half shared by the klog reporter
+/// (evalThermalNode) and the /proc/acpi renderer (renderProc).
+fn readThermalNode(n: *StoredNode) ?u64 {
+    if (n.kind != .method) return null;
     arenaReset();
-    const v = callMethod(n, &.{}, 0) orelse return false;
-    if (v != .integer) return false;
-    logTempDeciK(n.path[0..n.path_len], v.integer);
+    const v = callMethod(n, &.{}, 0) orelse return null;
+    if (v != .integer) return null;
+    return v.integer;
+}
+
+/// Evaluate + log one _TMP reading. Returns true on a valid integer result. Shared
+/// by the full scan (reportThermal) and the targeted re-eval a Notify(zone, 0x80)
+/// triggers (reevalNotify).
+fn evalThermalNode(n: *StoredNode) bool {
+    const dk = readThermalNode(n) orelse return false;
+    logTempDeciK(n.path[0..n.path_len], dk);
     return true;
 }
 
@@ -4708,17 +4735,21 @@ fn logBattery(path: []const u8, state: u64, rate: u64, remaining: u64, voltage: 
     }
 }
 
+/// A decoded battery reading: _BST's four fields plus the last-full-charge
+/// capacity from the sibling _BIF (index 2) and a derived percentage.
+const BatteryReading = struct { state: u64, rate: u64, remaining: u64, voltage: u64, full: u64, pct: u64 };
+
 /// Evaluate one battery _BST method node, pairing its sibling _BIF (last-full-
-/// charge capacity at index 2) for a charge percentage, and log it. Returns true
-/// on a valid 4+ element Package. Caller holds the interpreter lock; this resets
-/// the value arena per call. Shared by the full scan (reportBattery) and the
-/// targeted re-eval a Notify(battery, 0x80/0x81) triggers (reevalNotify).
-fn evalBatteryNode(n: *StoredNode) bool {
-    if (n.kind != .method) return false;
+/// charge capacity at index 2) for a charge percentage, into a decoded reading —
+/// or null if it doesn't yield a 4+ element Package. Caller holds the interpreter
+/// lock; this resets the value arena per call. The decode half shared by the klog
+/// reporter (evalBatteryNode) and the /proc/acpi renderer (renderProc).
+fn readBatteryNode(n: *StoredNode) ?BatteryReading {
+    if (n.kind != .method) return null;
     const path = n.path[0..n.path_len];
     arenaReset();
-    const bst = callMethod(n, &.{}, 0) orelse return false;
-    if (bst != .package or bst.package.len < 4) return false;
+    const bst = callMethod(n, &.{}, 0) orelse return null;
+    if (bst != .package or bst.package.len < 4) return null;
     // Copy the fields out before any further eval reuses the value arena.
     const state = pkgInt(bst.package, 0);
     const rate = pkgInt(bst.package, 1);
@@ -4745,7 +4776,15 @@ fn evalBatteryNode(n: *StoredNode) bool {
 
     // Guard the multiply: a garbage remaining could otherwise overflow u64.
     const pct: u64 = if (full != 0 and remaining <= 100_000_000) @min(remaining * 100 / full, 100) else 0;
-    logBattery(path, state, rate, remaining, voltage, full, pct);
+    return .{ .state = state, .rate = rate, .remaining = remaining, .voltage = voltage, .full = full, .pct = pct };
+}
+
+/// Evaluate + log one battery's status. Returns true on a valid reading. Shared by
+/// the full scan (reportBattery) and the targeted re-eval a Notify(battery,
+/// 0x80/0x81) triggers (reevalNotify).
+fn evalBatteryNode(n: *StoredNode) bool {
+    const r = readBatteryNode(n) orelse return false;
+    logBattery(n.path[0..n.path_len], r.state, r.rate, r.remaining, r.voltage, r.full, r.pct);
     return true;
 }
 
@@ -4863,6 +4902,76 @@ pub fn drainNotifyReevals() u32 {
         if (reevalNotify(e.path[0..e.len], e.value)) done += 1;
     }
     return done;
+}
+
+/// bufPrint at `buf[off..]`, returning the bytes written (0 on overflow → graceful
+/// truncation). Local to the /proc/acpi renderer.
+fn pfmt(buf: []u8, off: usize, comptime f: []const u8, args: anytype) usize {
+    if (off >= buf.len) return 0;
+    const out = std.fmt.bufPrint(buf[off..], f, args) catch return 0;
+    return out.len;
+}
+
+/// Render a human-readable /proc/acpi snapshot into `buf`, returning the byte
+/// length written. Shows the namespace size, the loaded tables (signatures for
+/// installed ones via table_src[], "synth/loaded" for header-less bodies), and
+/// live thermal-zone / battery readings — the same data the Slice-D klog reporters
+/// produce, but pulled on demand by a userspace read. Holds the interpreter lock
+/// and evaluates _TMP/_BST live (best-effort; a method needing an absent region
+/// just doesn't appear), so it is safe from a procfs read the same way
+/// reportThermal/reportBattery are CLI-callable.
+pub fn renderProc(buf: []u8) usize {
+    ilockAcquire();
+    defer ilockRelease();
+    var n: usize = 0;
+
+    // Namespace + loaded-table summary.
+    n += pfmt(buf, n, "ACPI namespace: {d} objects, {d} table(s)\n", .{ nnodes, nbodies });
+    var t: usize = 0;
+    while (t < nbodies) : (t += 1) {
+        if (table_src[t] != 0) {
+            const hdr: *align(1) const acpi.SdtHeader = @ptrFromInt(table_src[t]);
+            n += pfmt(buf, n, "  [{d}] {s} ({d} bytes)\n", .{ t, hdr.signature[0..4], bodies[t].len });
+        } else {
+            n += pfmt(buf, n, "  [{d}] synth/loaded ({d} bytes)\n", .{ t, bodies[t].len });
+        }
+    }
+
+    // Live thermal-zone temperatures (_TMP).
+    n += pfmt(buf, n, "thermal zones:\n", .{});
+    var tz: u32 = 0;
+    var i: usize = 0;
+    while (i < nnodes) : (i += 1) {
+        const node = &nodes[i];
+        if (!pathEndsWithSeg(node.path[0..node.path_len], "_TMP")) continue;
+        const dk = readThermalNode(node) orelse continue;
+        const capped: i64 = if (dk > 1_000_000) 1_000_000 else @intCast(dk);
+        const centi: i64 = capped * 10 - 27315; // tenths-K → centi-Celsius
+        const neg = centi < 0;
+        const mag: u64 = @intCast(if (neg) -centi else centi);
+        n += pfmt(buf, n, "  {s}: {s}{d}.{d:0>2} C ({d} dK)\n", .{ node.path[0..node.path_len], if (neg) "-" else "", mag / 100, mag % 100, dk });
+        tz += 1;
+    }
+    if (tz == 0) n += pfmt(buf, n, "  (none)\n", .{});
+
+    // Live battery status (_BST + sibling _BIF).
+    n += pfmt(buf, n, "batteries:\n", .{});
+    var bnum: u32 = 0;
+    i = 0;
+    while (i < nnodes) : (i += 1) {
+        const node = &nodes[i];
+        if (!pathEndsWithSeg(node.path[0..node.path_len], "_BST")) continue;
+        const r = readBatteryNode(node) orelse continue;
+        if (r.full != 0) {
+            n += pfmt(buf, n, "  {s}: {s} {d}% ({d}/{d} mWh, {d} mW, {d} mV)\n", .{ node.path[0..node.path_len], batteryState(r.state), r.pct, r.remaining, r.full, r.rate, r.voltage });
+        } else {
+            n += pfmt(buf, n, "  {s}: {s} ({d} mWh, {d} mW, {d} mV)\n", .{ node.path[0..node.path_len], batteryState(r.state), r.remaining, r.rate, r.voltage });
+        }
+        bnum += 1;
+    }
+    if (bnum == 0) n += pfmt(buf, n, "  (none)\n", .{});
+
+    return n;
 }
 
 // === Slice E: processor power states (_CST C-states) ========================
