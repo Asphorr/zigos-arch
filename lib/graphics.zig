@@ -112,6 +112,72 @@ pub const Canvas = struct {
         if (rw > 1) self.drawVLine(rx + rw - 1, ry, rh, color);
     }
 
+    /// Nearest-neighbor scale + src-over alpha blit of a row-major RGBA pixmap
+    /// (4 bytes/pixel — stb_image channels=4) into a dw×dh box at (dx,dy),
+    /// clipped to the rect (clip_x,clip_y,clip_w,clip_h) intersected with the
+    /// canvas. This is the browser's image primitive: web images arrive at
+    /// arbitrary sizes and must be scaled to the content column and clipped to
+    /// the scroll viewport. Signed (dx,dy) so partially-scrolled-off images
+    /// clip correctly at the top edge.
+    pub fn blitRGBAScaled(
+        self: *Canvas,
+        src: [*]const u8,
+        sw: u32,
+        sh: u32,
+        dx: i32,
+        dy: i32,
+        dw: u32,
+        dh: u32,
+        clip_x: i32,
+        clip_y: i32,
+        clip_w: u32,
+        clip_h: u32,
+    ) void {
+        if (dw == 0 or dh == 0 or sw == 0 or sh == 0) return;
+        const cx0 = @max(dx, clip_x);
+        const cy0 = @max(dy, clip_y);
+        var cx1 = @min(dx + @as(i32, @intCast(dw)), clip_x + @as(i32, @intCast(clip_w)));
+        var cy1 = @min(dy + @as(i32, @intCast(dh)), clip_y + @as(i32, @intCast(clip_h)));
+        if (cx1 > @as(i32, @intCast(self.width))) cx1 = @intCast(self.width);
+        if (cy1 > @as(i32, @intCast(self.height))) cy1 = @intCast(self.height);
+        if (cx0 < 0 or cy0 < 0 or cx1 <= cx0 or cy1 <= cy0) return;
+
+        var py: i32 = cy0;
+        while (py < cy1) : (py += 1) {
+            const ry: u32 = @intCast(py - dy); // 0..dh inside the dest box
+            // u64 widen: ry can reach ~65535 and sh the full decoded height,
+            // so ry*sh overflows u32 for tall images (ReleaseSafe panic).
+            const sy: u32 = @intCast(@min(@as(u64, ry) * sh / dh, @as(u64, sh - 1)));
+            const src_row: usize = @as(usize, sy) * sw * 4;
+            const dst_base: usize = @as(usize, @intCast(py)) * self.width;
+            var px: i32 = cx0;
+            while (px < cx1) : (px += 1) {
+                const rx: u32 = @intCast(px - dx);
+                const sx: u32 = @intCast(@min(@as(u64, rx) * sw / dw, @as(u64, sw - 1)));
+                const s = src_row + @as(usize, sx) * 4;
+                const a: u32 = src[s + 3];
+                if (a == 0) continue;
+                const idx = dst_base + @as(usize, @intCast(px));
+                const sr: u32 = src[s];
+                const sg: u32 = src[s + 1];
+                const sb: u32 = src[s + 2];
+                if (a == 255) {
+                    self.fb[idx] = (sr << 16) | (sg << 8) | sb;
+                    continue;
+                }
+                const inv: u32 = 255 - a;
+                const dst = self.fb[idx];
+                const dr = (dst >> 16) & 0xFF;
+                const dg = (dst >> 8) & 0xFF;
+                const db = dst & 0xFF;
+                const r = (sr * a + dr * inv + 127) / 255;
+                const g = (sg * a + dg * inv + 127) / 255;
+                const b = (sb * a + db * inv + 127) / 255;
+                self.fb[idx] = (r << 16) | (g << 8) | b;
+            }
+        }
+    }
+
     /// Blit an opaque RGB pixmap onto the canvas. `pixels` is row-major
     /// R,G,B triples (3 bytes/pixel — what stb_image returns for `channels=3`).
     /// Every source pixel overwrites the destination; clips to canvas

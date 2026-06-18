@@ -92,6 +92,11 @@ pub const Request = struct {
     headers: []const Header = &.{},
     body: []const u8 = "",
     follow_redirects: bool = true,
+    /// When true, a body that exceeds `buf` is truncated to whatever fits and
+    /// returned with `Response.truncated = true` instead of failing with
+    /// `ResponseTooLarge`. The reader-browser opts in so huge pages (e.g.
+    /// Wikipedia) still render their first chunk; strict callers leave it off.
+    truncate_oversize: bool = false,
 };
 
 pub const Response = struct {
@@ -100,6 +105,9 @@ pub const Response = struct {
     headers_buf: [MAX_HEADERS]Header,
     n_headers: u8,
     body: []const u8,
+    /// Body was cut short to fit the caller's buffer (only when the request
+    /// set `truncate_oversize`).
+    truncated: bool = false,
 
     pub fn headers(self: *const Response) []const Header {
         return self.headers_buf[0..self.n_headers];
@@ -268,7 +276,7 @@ pub fn send(req: Request, buf: []u8) Error!Response {
     var redirects: u8 = 0;
     while (true) {
         const url = try parseUrl(current);
-        const resp = try sendOnce(req.method, url, req.headers, req.body, buf);
+        const resp = try sendOnce(req.method, url, req.headers, req.body, buf, req.truncate_oversize);
 
         if (!req.follow_redirects) return resp;
         if (resp.status < 300 or resp.status >= 400) return resp;
@@ -658,6 +666,7 @@ fn sendOnce(
     extra_headers: []const Header,
     body: []const u8,
     buf: []u8,
+    truncate: bool,
 ) Error!Response {
     var conn = try Conn.open(url);
     defer conn.close();
@@ -716,11 +725,24 @@ fn sendOnce(
     if (is_chunked) {
         // Drain until terminating "0\r\n\r\n", then collapse chunk frames
         // out of the buffer so resp.body is a contiguous slice.
-        const decoded_end = try drainAndDecodeChunked(&conn, buf, header_end, &total);
+        var chunk_trunc = false;
+        const decoded_end = try drainAndDecodeChunked(&conn, buf, header_end, &total, truncate, &chunk_trunc);
         resp.body = buf[header_end..decoded_end];
+        resp.truncated = chunk_trunc;
     } else if (cl_opt) |cl| {
         const body_end = header_end + cl;
-        if (body_end > buf.len) return Error.ResponseTooLarge;
+        if (body_end > buf.len) {
+            if (!truncate) return Error.ResponseTooLarge;
+            // Fill with as much body as fits, then stop short.
+            while (total < buf.len) {
+                const n = try conn.recv(buf[total..]);
+                if (n == 0) break;
+                total += n;
+            }
+            resp.body = buf[header_end..total];
+            resp.truncated = true;
+            return resp;
+        }
         while (total < body_end) {
             const n = try conn.recv(buf[total..body_end]);
             if (n == 0) return Error.BadResponse;
@@ -849,6 +871,8 @@ fn drainAndDecodeChunked(
     buf: []u8,
     header_end: usize,
     total_ptr: *usize,
+    truncate: bool,
+    trunc_out: *bool,
 ) Error!usize {
     var read_cursor: usize = header_end; // next raw byte to consume
     var write_cursor: usize = header_end; // next decoded byte to emit
@@ -895,7 +919,13 @@ fn drainAndDecodeChunked(
             while (true) {
                 // Need at least 2 bytes for CRLF.
                 while (read_cursor + 2 > total_ptr.*) {
-                    if (total_ptr.* >= buf.len) return Error.ResponseTooLarge;
+                    // The whole body is already decoded here (this is the
+                    // trailer/terminator hunt) — if the buffer is full, the
+                    // body is still complete, so just return it.
+                    if (total_ptr.* >= buf.len) {
+                        if (truncate) return write_cursor;
+                        return Error.ResponseTooLarge;
+                    }
                     const n = try conn.recv(buf[total_ptr.*..]);
                     if (n == 0) break;
                     total_ptr.* += n;
@@ -914,7 +944,15 @@ fn drainAndDecodeChunked(
 
         // Make sure we have `size + 2` bytes (data + trailing CRLF) buffered.
         const needed_end = read_cursor + size + 2;
-        if (needed_end > buf.len) return Error.ResponseTooLarge;
+        if (needed_end > buf.len) {
+            // Buffer can't hold the next chunk. In truncate mode, return the
+            // decoded prefix instead of failing the whole fetch.
+            if (truncate) {
+                trunc_out.* = true;
+                return write_cursor;
+            }
+            return Error.ResponseTooLarge;
+        }
         while (total_ptr.* < needed_end) {
             const n = try conn.recv(buf[total_ptr.*..]);
             if (n == 0) return Error.BadChunk;

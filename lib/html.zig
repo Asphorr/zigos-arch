@@ -221,32 +221,51 @@ fn handleEntity(html: []const u8, i: usize) usize {
 // ---------------------------------------------------------------------
 // href extraction (case-insensitive, quoted or bare).
 
-fn findHref(tag_inner: []const u8) ?[]const u8 {
+// Find attribute `attr` (lowercase) in a tag's inner text, returning its
+// value (quoted or bare), or null. Requires a word boundary before the name
+// so "src" doesn't match inside "datasrc".
+fn findAttr(tag_inner: []const u8, attr: []const u8) ?[]const u8 {
+    const alen = attr.len;
+    if (alen == 0) return null;
     var i: usize = 0;
-    while (i + 4 <= tag_inner.len) : (i += 1) {
-        if (lower(tag_inner[i]) == 'h' and eqlLower(tag_inner[i .. i + 4], "href")) {
-            var j = i + 4;
-            while (j < tag_inner.len and (tag_inner[j] == ' ' or tag_inner[j] == '\t')) : (j += 1) {}
-            if (j >= tag_inner.len or tag_inner[j] != '=') {
-                i = j;
-                continue;
-            }
+    while (i + alen <= tag_inner.len) : (i += 1) {
+        if (!eqlLower(tag_inner[i .. i + alen], attr)) continue;
+        if (i > 0 and isAlnum(tag_inner[i - 1])) continue; // word boundary
+        var j = i + alen;
+        while (j < tag_inner.len and (tag_inner[j] == ' ' or tag_inner[j] == '\t')) : (j += 1) {}
+        if (j >= tag_inner.len or tag_inner[j] != '=') {
+            i = j;
+            continue;
+        }
+        j += 1;
+        while (j < tag_inner.len and (tag_inner[j] == ' ' or tag_inner[j] == '\t')) : (j += 1) {}
+        if (j >= tag_inner.len) return null;
+        if (tag_inner[j] == '"' or tag_inner[j] == '\'') {
+            const q = tag_inner[j];
             j += 1;
-            while (j < tag_inner.len and (tag_inner[j] == ' ' or tag_inner[j] == '\t')) : (j += 1) {}
-            if (j >= tag_inner.len) return null;
-            if (tag_inner[j] == '"' or tag_inner[j] == '\'') {
-                const q = tag_inner[j];
-                j += 1;
-                const start = j;
-                while (j < tag_inner.len and tag_inner[j] != q) : (j += 1) {}
-                return tag_inner[start..j];
-            }
             const start = j;
-            while (j < tag_inner.len and tag_inner[j] != ' ' and tag_inner[j] != '\t' and tag_inner[j] != '>') : (j += 1) {}
+            while (j < tag_inner.len and tag_inner[j] != q) : (j += 1) {}
             return tag_inner[start..j];
         }
+        const start = j;
+        while (j < tag_inner.len and tag_inner[j] != ' ' and tag_inner[j] != '\t' and tag_inner[j] != '>') : (j += 1) {}
+        return tag_inner[start..j];
     }
     return null;
+}
+
+fn findHref(tag_inner: []const u8) ?[]const u8 {
+    return findAttr(tag_inner, "href");
+}
+
+fn parseUint(s: []const u8) u32 {
+    var v: u32 = 0;
+    for (s) |c| {
+        if (c < '0' or c > '9') break;
+        v = v *% 10 +% (c - '0');
+        if (v > 20000) return 20000; // clamp absurd width/height
+    }
+    return v;
 }
 
 // ---------------------------------------------------------------------
@@ -432,6 +451,23 @@ fn handleTag(name: []const u8, tag_inner: []const u8, closing: bool) void {
     // --- inline line break ---
     if (eqlLower(name, "br")) {
         emitBreak();
+        return;
+    }
+
+    // --- image (void element) → a block-level picture ---
+    if (eqlLower(name, "img")) {
+        if (!closing) {
+            if (findAttr(tag_inner, "src")) |src| {
+                if (src.len > 0 and !(src.len >= 5 and eqlLower(src[0..5], "data:"))) {
+                    var w: u32 = 0;
+                    var h: u32 = 0;
+                    if (findAttr(tag_inner, "width")) |ws| w = parseUint(ws);
+                    if (findAttr(tag_inner, "height")) |hs| h = parseUint(hs);
+                    const id = doc.addImage(src, w, h);
+                    if (id >= 0) doc.addImageBlock(currentIndent(), 6, 6, id, cur_link);
+                }
+            }
+        }
         return;
     }
 

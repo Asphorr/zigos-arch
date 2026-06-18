@@ -5,8 +5,9 @@
 //   * webnav    — URL normalize / relative resolve / back-forward history
 //
 // It renders the *readable* web: headings, bold, monospace <pre>/<code>,
-// indented blockquotes/lists, and clickable (hover-highlighted) links. No
-// script engine, no images, no CSS — JS apps won't render.
+// indented blockquotes/lists, clickable (hover-highlighted) links, and
+// images (<img>, decoded via stb_image, streamed in after the text). No
+// script engine, no CSS layout — JS apps won't render.
 //
 // Controls:
 //   - type a URL + Enter         → load it (https:// assumed if no scheme)
@@ -23,6 +24,7 @@ const http = @import("http");
 const render = @import("render");
 const html = @import("html");
 const webnav = @import("webnav");
+const image = @import("image");
 
 const INIT_W: u32 = 760;
 const INIT_H: u32 = 560;
@@ -52,10 +54,18 @@ const theme = render.Theme{
     .bg = BG,
 };
 
+// Image limits. Each fetch reuses img_buf; decoded pixels live on the heap
+// (freed on the next page load). Bounded so one page can't exhaust memory.
+const MAX_FETCH_IMAGES: u32 = 12;
+const MAX_IMG_PIXELS: u64 = 3_000_000; // ~12 MB RGBA — skip anything bigger
+
 // --- Big buffers (.bss) ---
-var resp_buf: [256 * 1024]u8 = undefined;
+var resp_buf: [1024 * 1024]u8 = undefined; // page HTML (truncated past 1 MiB)
+var img_buf: [1024 * 1024]u8 = undefined; // per-image fetch scratch (reused)
 var doc: render.Document = .{};
 var history: webnav.History = .{};
+var decoded: [render.MAX_IMAGES]?image.Pixel = [_]?image.Pixel{null} ** render.MAX_IMAGES;
+var g_canvas: gfx.Canvas = undefined; // global so the loader can stream repaints
 
 var current_url: [webnav.MAX_URL]u8 = undefined;
 var current_url_len: usize = 0;
@@ -151,9 +161,13 @@ fn loadUrl(u: []const u8) void {
     input_len = un;
 
     hovered_link = -1;
+    freeImages(); // release the previous page's decoded pixels
     setStatusStr("Loading...", false);
 
-    const resp = http.get(current_url[0..current_url_len], resp_buf[0..]) catch |err| {
+    const resp = http.send(.{
+        .url = current_url[0..current_url_len],
+        .truncate_oversize = true, // render the first chunk of huge pages
+    }, resp_buf[0..]) catch |err| {
         doc.reset();
         relayout();
         var b: [160]u8 = undefined;
@@ -183,13 +197,80 @@ fn loadUrl(u: []const u8) void {
     const suf = " links";
     @memcpy(b[p..][0..suf.len], suf);
     p += suf.len;
-    if (doc.truncated) {
+    if (doc.truncated or resp.truncated) {
         const t = "  (truncated)";
         const tn = @min(t.len, b.len - p);
         @memcpy(b[p..][0..tn], t[0..tn]);
         p += tn;
     }
     setStatusStr(b[0..p], resp.status >= 400);
+
+    // Paint the readable text right away, then stream images in on top.
+    drawAll(&g_canvas);
+    libc.present();
+    fetchImages();
+}
+
+/// Free all decoded image pixels (stb-allocated on the heap).
+fn freeImages() void {
+    for (&decoded) |*slot| {
+        if (slot.*) |pic| {
+            pic.deinit();
+            slot.* = null;
+        }
+    }
+}
+
+/// Fetch + decode each <img> referenced by the current document, reflowing and
+/// repainting after each so pictures pop in progressively. Bounded in count
+/// and per-image pixel size; anything over budget becomes a placeholder box.
+fn fetchImages() void {
+    var fetched: u32 = 0;
+    var i: u32 = 0;
+    while (i < doc.image_count) : (i += 1) {
+        const id: i32 = @intCast(i);
+        if (fetched >= MAX_FETCH_IMAGES) {
+            doc.setImageFailed(id);
+            continue;
+        }
+        const raw = doc.imageUrl(id);
+        if (raw.len == 0) {
+            doc.setImageFailed(id);
+            continue;
+        }
+        var abs: [webnav.MAX_URL]u8 = undefined;
+        const url = webnav.resolveHref(current_url[0..current_url_len], raw, &abs) orelse {
+            doc.setImageFailed(id);
+            continue;
+        };
+        const resp = http.get(url, img_buf[0..]) catch {
+            doc.setImageFailed(id);
+            continue;
+        };
+        if (resp.status != 200 or resp.body.len == 0) {
+            doc.setImageFailed(id);
+            continue;
+        }
+        const pic = image.decode(resp.body, 4) catch {
+            doc.setImageFailed(id);
+            continue;
+        };
+        if (pic.width == 0 or pic.height == 0 or
+            pic.width > 10000 or pic.height > 10000 or
+            @as(u64, pic.width) * pic.height > MAX_IMG_PIXELS)
+        {
+            pic.deinit();
+            doc.setImageFailed(id);
+            continue;
+        }
+        decoded[i] = pic;
+        doc.setImageDecoded(id, pic.width, pic.height, pic.pixels.ptr);
+        fetched += 1;
+        // Progressive: reflow (image now has real dims) and repaint.
+        relayout();
+        drawAll(&g_canvas);
+        libc.present();
+    }
 }
 
 /// Navigate to a freshly-typed/followed URL: normalize, record history, load.
@@ -346,13 +427,13 @@ export fn _start() linksection(".text.entry") callconv(.c) void {
     };
     alloc_w = win.alloc_w;
     alloc_h = win.alloc_h;
-    var canvas = gfx.Canvas.init(win.fb, alloc_w, alloc_h);
+    g_canvas = gfx.Canvas.init(win.fb, alloc_w, alloc_h);
     _ = libc.getWindowAlloc();
 
     scrollbar.lines_per_notch = 3 * lineStep(); // pixel-mode wheel step
 
     go("example.com");
-    drawAll(&canvas);
+    drawAll(&g_canvas);
     libc.present();
 
     var needs_redraw = false;
@@ -367,7 +448,7 @@ export fn _start() linksection(".text.entry") callconv(.c) void {
                     const ch: u8 = @truncate(ev.a);
                     if (ch == '\n' or ch == '\r') {
                         setStatusStr("Loading...", false);
-                        drawAll(&canvas);
+                        drawAll(&g_canvas);
                         libc.present();
                         submit();
                         needs_redraw = true;
@@ -448,7 +529,7 @@ export fn _start() linksection(".text.entry") callconv(.c) void {
                     if (wa.w != 0 and (wa.w != alloc_w or wa.h != alloc_h)) {
                         alloc_w = wa.w;
                         alloc_h = wa.h;
-                        canvas = gfx.Canvas.init(win.fb, alloc_w, alloc_h);
+                        g_canvas = gfx.Canvas.init(win.fb, alloc_w, alloc_h);
                     }
                     const new_w = @min(ev.a, alloc_w);
                     const new_h = @min(ev.b, alloc_h);
@@ -466,7 +547,7 @@ export fn _start() linksection(".text.entry") callconv(.c) void {
         if (needs_redraw) {
             needs_redraw = false;
             clampScroll();
-            drawAll(&canvas);
+            drawAll(&g_canvas);
             libc.present();
         }
         libc.sleep(20);

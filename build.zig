@@ -504,7 +504,7 @@ pub fn build(b: *std.Build) void {
         .{ "jq.elf", "app/jq.zig" },
         .{ "wx.elf", "app/wx.zig" },
         .{ "weather.elf", "app/weather.zig" },
-        .{ "web.elf", "app/web.zig" },
+        // web.elf is built standalone below — it links stb_image for <img> decode.
     };
 
     inline for (gui_apps) |entry| {
@@ -931,6 +931,33 @@ pub fn build(b: *std.Build) void {
     photo.setLinkerScript(b.path("app/linker.ld"));
     photo.linkLibrary(stb_lib);
     b.installArtifact(photo);
+
+    // --- WEB BROWSER (standalone — links stb_image for <img> decode) ---
+    // Moved out of the gui_apps loop because, like photo/settings, it needs
+    // the image module + stb_image static lib (the shared gui_imports tuple
+    // carries neither). Keeps its render/html/webnav/http primitives.
+    const web = b.addExecutable(.{
+        .name = "web.elf",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("app/web.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "libc", .module = libc_mod },
+                .{ .name = "graphics", .module = graphics_mod },
+                .{ .name = "font_atlas", .module = font_atlas_mod },
+                .{ .name = "ui", .module = ui_mod },
+                .{ .name = "http", .module = http_mod },
+                .{ .name = "render", .module = render_mod },
+                .{ .name = "html", .module = html_mod },
+                .{ .name = "webnav", .module = webnav_mod },
+                .{ .name = "image", .module = image_mod },
+            },
+        }),
+    });
+    web.setLinkerScript(b.path("app/linker.ld"));
+    web.linkLibrary(stb_lib);
+    b.installArtifact(web);
 
     // --- WALLPAPER (one-shot boot helper) ---
     const wallpaper = b.addExecutable(.{

@@ -102,9 +102,28 @@ const Block = struct {
     space_before: u16 = 0,
     space_after: u16 = 0,
     bullet: Bullet = .none,
+    /// >= 0 for an image block (a self-contained block with no text whose one
+    /// line is the image). `image_link` carries an enclosing <a>'s link id.
+    image_id: i32 = -1,
+    image_link: i32 = -1,
 };
 
 const Link = struct { off: u32 = 0, len: u32 = 0 };
+
+/// A referenced image. `url` lives in the shared href_pool. Intrinsic decode
+/// dims (`src_w`/`src_h`) and `pixels` are filled in by the app after it
+/// fetches + decodes; `nat_w`/`nat_h` are the optional <img width/height>
+/// request. `pixels` null + `failed` distinguishes pending from broken.
+pub const Image = struct {
+    url_off: u32 = 0,
+    url_len: u32 = 0,
+    nat_w: u32 = 0,
+    nat_h: u32 = 0,
+    src_w: u32 = 0,
+    src_h: u32 = 0,
+    pixels: ?[*]const u8 = null,
+    failed: bool = false,
+};
 
 // Layout output.
 const Span = struct {
@@ -126,6 +145,11 @@ const LineBox = struct {
     height: u16,
     baseline: u16,
     bullet: Bullet,
+    // Image lines carry no spans; these describe the picture instead.
+    image_id: i32 = -1,
+    img_w: u16 = 0,
+    img_h: u16 = 0,
+    image_link: i32 = -1,
 };
 
 // Buffer caps. Generous but bounded; overflow trips `truncated` and stops.
@@ -136,6 +160,7 @@ pub const MAX_HREF: usize = 48 * 1024;
 pub const MAX_LINKS: usize = 1024;
 pub const MAX_SPANS: usize = 14000;
 pub const MAX_LINES: usize = 9000;
+pub const MAX_IMAGES: usize = 24;
 
 pub const Document = struct {
     // Source content.
@@ -151,6 +176,9 @@ pub const Document = struct {
     link_count: u32 = 0,
 
     // Layout output.
+    images: [MAX_IMAGES]Image = undefined,
+    image_count: u32 = 0,
+
     spans: [MAX_SPANS]Span = undefined,
     span_count: u32 = 0,
     lines: [MAX_LINES]LineBox = undefined,
@@ -175,6 +203,7 @@ pub const Document = struct {
         self.block_count = 0;
         self.href_len = 0;
         self.link_count = 0;
+        self.image_count = 0;
         self.span_count = 0;
         self.line_count = 0;
         self.doc_height = 0;
@@ -282,6 +311,81 @@ pub const Document = struct {
         if (id < 0 or @as(u32, @intCast(id)) >= self.link_count) return "";
         const l = self.links[@intCast(id)];
         return self.href_pool[l.off..][0..l.len];
+    }
+
+    /// Register an image by source URL (stored in the href pool). `nat_w/h`
+    /// are the optional <img width/height> request (0 = use decoded size).
+    pub fn addImage(self: *Document, url: []const u8, nat_w: u32, nat_h: u32) i32 {
+        if (self.image_count >= MAX_IMAGES) {
+            self.truncated = true;
+            return -1;
+        }
+        const off = self.href_len;
+        const n = @min(url.len, MAX_HREF - self.href_len);
+        if (n == 0 and url.len != 0) {
+            self.truncated = true;
+            return -1;
+        }
+        @memcpy(self.href_pool[off..][0..n], url[0..n]);
+        self.href_len += @intCast(n);
+        const id: i32 = @intCast(self.image_count);
+        self.images[self.image_count] = .{
+            .url_off = off,
+            .url_len = @intCast(n),
+            .nat_w = nat_w,
+            .nat_h = nat_h,
+        };
+        self.image_count += 1;
+        return id;
+    }
+
+    pub fn imageUrl(self: *const Document, id: i32) []const u8 {
+        if (id < 0 or @as(u32, @intCast(id)) >= self.image_count) return "";
+        const im = self.images[@intCast(id)];
+        return self.href_pool[im.url_off..][0..im.url_len];
+    }
+
+    /// App calls this once it has fetched + decoded image `id` (RGBA pixels).
+    pub fn setImageDecoded(self: *Document, id: i32, src_w: u32, src_h: u32, pixels: [*]const u8) void {
+        if (id < 0 or @as(u32, @intCast(id)) >= self.image_count) return;
+        const im = &self.images[@intCast(id)];
+        im.src_w = src_w;
+        im.src_h = src_h;
+        im.pixels = pixels;
+        im.failed = false;
+    }
+
+    pub fn setImageFailed(self: *Document, id: i32) void {
+        if (id < 0 or @as(u32, @intCast(id)) >= self.image_count) return;
+        const im = &self.images[@intCast(id)];
+        im.pixels = null;
+        im.failed = true;
+    }
+
+    /// Emit a self-contained image block (its one line is the picture).
+    pub fn addImageBlock(self: *Document, indent: u16, sb: u16, sa: u16, image_id: i32, link_id: i32) void {
+        self.endBlock();
+        if (self.block_count >= MAX_BLOCKS) {
+            self.truncated = true;
+            return;
+        }
+        self.blocks[self.block_count] = .{
+            .text_start = self.text_len,
+            .text_end = self.text_len,
+            .run_start = self.run_count,
+            .run_end = self.run_count,
+            .indent = indent,
+            .space_before = sb,
+            .space_after = sa,
+            .bullet = .none,
+            .image_id = image_id,
+            .image_link = link_id,
+        };
+        self.block_count += 1;
+        // Self-contained: no open block/run trails it.
+        self.b_block_open = false;
+        self.b_run_open = false;
+        self.b_run_start = self.text_len;
     }
 
     /// Flush any open run/block. Call once after the last putByte.
@@ -393,6 +497,44 @@ pub fn layout(doc: *Document, content_w: u32) void {
 
         const avail: u32 = if (content_w > blk.indent) content_w - blk.indent else 8;
 
+        // Image block: one line, sized to the image (aspect-preserved, clamped
+        // to the content column). No spans.
+        if (blk.image_id >= 0 and blk.image_id < @as(i32, @intCast(doc.image_count))) {
+            const img = doc.images[@intCast(blk.image_id)];
+            var nw: u32 = if (img.nat_w > 0) img.nat_w else img.src_w;
+            var nh: u32 = if (img.nat_h > 0) img.nat_h else img.src_h;
+            if (nw == 0 or nh == 0) {
+                // Pending / failed / dimensionless — a modest placeholder box.
+                nw = @min(avail, 240);
+                nh = 120;
+            }
+            if (nw > avail and nw > 0) {
+                nh = @intCast(@as(u64, nh) * avail / nw);
+                nw = avail;
+            }
+            if (nh == 0) nh = 1;
+            if (doc.line_count < MAX_LINES) {
+                doc.lines[doc.line_count] = .{
+                    .span_start = doc.span_count,
+                    .span_end = doc.span_count,
+                    .indent = blk.indent,
+                    .top = y,
+                    .height = @intCast(@min(nh, 65535)),
+                    .baseline = 0,
+                    .bullet = .none,
+                    .image_id = blk.image_id,
+                    .img_w = @intCast(@min(nw, 65535)),
+                    .img_h = @intCast(@min(nh, 65535)),
+                    .image_link = blk.image_link,
+                };
+                doc.line_count += 1;
+            } else doc.truncated = true;
+            y += nh;
+            prev_after = blk.space_after;
+            if (doc.line_count >= MAX_LINES) break;
+            continue;
+        }
+
         if (blk.text_start >= blk.text_end) {
             // Empty block (a wrapper div, an <hr>, a structural container) —
             // emits no line; only its margins survive (collapsed). This keeps
@@ -484,6 +626,16 @@ fn clampedFill(canvas: *gfx.Canvas, x: i32, y: i32, w: u32, h: u32, view_x: i32,
     canvas.fillRect(@intCast(x0), @intCast(y0), @intCast(x1 - x0), @intCast(y1 - y0), color);
 }
 
+// A 1px bordered box standing in for a not-yet-loaded or broken image.
+fn drawImagePlaceholder(canvas: *gfx.Canvas, x: i32, y: i32, w: u16, h: u16, vx: i32, vy: i32, vw: u32, vh: u32, color: u32) void {
+    const wi: u32 = w;
+    const hi: u32 = h;
+    clampedFill(canvas, x, y, wi, 1, vx, vy, vw, vh, color); // top
+    clampedFill(canvas, x, y + @as(i32, @intCast(hi)) - 1, wi, 1, vx, vy, vw, vh, color); // bottom
+    clampedFill(canvas, x, y, 1, hi, vx, vy, vw, vh, color); // left
+    clampedFill(canvas, x + @as(i32, @intCast(wi)) - 1, y, 1, hi, vx, vy, vw, vh, color); // right
+}
+
 fn drawDisc(canvas: *gfx.Canvas, cx: i32, cy: i32, r: i32, color: u32) void {
     var dy: i32 = -r;
     while (dy <= r) : (dy += 1) {
@@ -514,6 +666,17 @@ pub fn paint(
         const line = doc.lines[li];
         if (line.top >= scroll_y + view_h) break;
         const line_y: i32 = y0 + @as(i32, @intCast(line.top)) - @as(i32, @intCast(scroll_y));
+
+        if (line.image_id >= 0 and line.image_id < @as(i32, @intCast(doc.image_count))) {
+            const img = doc.images[@intCast(line.image_id)];
+            const ix: i32 = x0 + @as(i32, @intCast(line.indent));
+            if (img.pixels) |px| {
+                canvas.blitRGBAScaled(px, img.src_w, img.src_h, ix, line_y, line.img_w, line.img_h, x0, y0, view_w, view_h);
+            } else {
+                drawImagePlaceholder(canvas, ix, line_y, line.img_w, line.img_h, x0, y0, view_w, view_h, theme.muted);
+            }
+            continue;
+        }
 
         if (line.bullet == .disc) {
             const bx: i32 = x0 + @as(i32, @intCast(line.indent)) - 12;
@@ -552,6 +715,13 @@ pub fn linkAt(doc: *const Document, content_x: i32, content_y: i32) i32 {
     if (li >= doc.line_count) return -1;
     const line = doc.lines[li];
     if (cy < line.top or cy >= line.top + line.height) return -1;
+    if (line.image_id >= 0) {
+        if (line.image_link >= 0) {
+            const ilx = content_x - @as(i32, @intCast(line.indent));
+            if (ilx >= 0 and ilx < @as(i32, @intCast(line.img_w))) return line.image_link;
+        }
+        return -1;
+    }
     const lx = content_x - @as(i32, @intCast(line.indent));
     var si = line.span_start;
     while (si < line.span_end) : (si += 1) {
