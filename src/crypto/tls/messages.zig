@@ -157,9 +157,14 @@ pub fn buildClientHello(buf: []u8, p: ClientHelloParams) usize {
     // which we skip.
     writeU8(buf, &pos, 0);
 
-    // cipher_suites<2..2^16-2>: just chacha20-poly1305-sha256.
-    writeU16(buf, &pos, 2); // suites_len = 1 suite × 2 bytes
+    // cipher_suites<2..2^16-2>: ChaCha20-Poly1305 first (our preference —
+    // software-fast, no AES-NI dependency), then AES-128-GCM. AES-128-GCM is
+    // mandatory-to-implement in TLS 1.3 (RFC 8446 §9.1), so offering it is what
+    // lets AES-only servers complete the handshake instead of replying
+    // handshake_failure. Both share the SHA-256 key schedule.
+    writeU16(buf, &pos, 4); // suites_len = 2 suites × 2 bytes
     writeU16(buf, &pos, @intFromEnum(types.CipherSuite.chacha20_poly1305_sha256));
+    writeU16(buf, &pos, @intFromEnum(types.CipherSuite.aes_128_gcm_sha256));
 
     // legacy_compression_methods<1..2^8-1>: [null]
     writeU8(buf, &pos, 1);
@@ -281,10 +286,11 @@ pub fn parseServerHello(data: []const u8) ParseError!ServerHello {
     out.session_id_len = sid_len;
     if (sid_len > 0) @memcpy(out.session_id[0..sid_len], try r.readBytes(sid_len));
 
+    // Accept only the suites we advertise + can run. AES-256-GCM (0x1302) is
+    // excluded: it needs the SHA-384 transcript/key schedule we don't have.
     const suite_raw = try r.readU16();
     if (suite_raw != @intFromEnum(types.CipherSuite.chacha20_poly1305_sha256) and
-        suite_raw != @intFromEnum(types.CipherSuite.aes_128_gcm_sha256) and
-        suite_raw != @intFromEnum(types.CipherSuite.aes_256_gcm_sha384))
+        suite_raw != @intFromEnum(types.CipherSuite.aes_128_gcm_sha256))
     {
         return ParseError.BadCipher;
     }

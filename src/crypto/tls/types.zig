@@ -23,10 +23,10 @@ pub const HandshakeType = enum(u8) {
     finished = 20,
 };
 
-/// Cipher suite identifiers. TLS 1.3 only defines five; we support
-/// ChaCha20-Poly1305 first (software-only, fast, no AES-NI dependency).
-/// AES-GCM variants would come later — they're easy with std.crypto but
-/// less interesting until we hit servers that don't offer ChaCha.
+/// Cipher suite identifiers. We advertise + run ChaCha20-Poly1305 (software-
+/// fast, no AES-NI dependency) and AES-128-GCM (mandatory-to-implement, so it
+/// lets AES-only servers handshake) — both SHA-256, so one key schedule. AES-
+/// 256-GCM (SHA-384) is listed for parsing only; we never offer it.
 pub const CipherSuite = enum(u16) {
     aes_128_gcm_sha256 = 0x1301,
     aes_256_gcm_sha384 = 0x1302,

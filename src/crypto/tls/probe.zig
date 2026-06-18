@@ -205,6 +205,14 @@ pub fn run() void {
     klogHex("server_random", &sh.server_random);
     klogHex("server_pk", &sh.server_x25519_pub);
 
+    // Pin the negotiated AEAD (ChaCha20-Poly1305 or AES-128-GCM); governs key
+    // length + which primitive the record layer runs.
+    const cipher = record_mod.Cipher.fromSuite(@intFromEnum(sh.cipher_suite)) orelse {
+        debug.klog("[tls] unsupported cipher 0x{x:0>4}\n", .{@intFromEnum(sh.cipher_suite)});
+        return;
+    };
+    const key_len = cipher.keyLen();
+
     // 9) Derive shared secret. This is the X25519 ECDH result that
     //    feeds the HKDF key schedule in step 3.
     const shared = X25519.scalarmult(our_sk, sh.server_x25519_pub) catch {
@@ -233,7 +241,7 @@ pub fn run() void {
     }
     klogHex("transcript_hash", &th);
 
-    var keys = keys_mod.deriveHandshakeKeys(shared, th);
+    var keys = keys_mod.deriveHandshakeKeys(shared, th, key_len);
     klogHex("server_hs_key", &keys.server_key);
     klogHex("server_hs_iv", &keys.server_iv);
 
@@ -292,6 +300,7 @@ pub fn run() void {
             &pt_static,
             ct_static[0..next_rec_len],
             &hdr2,
+            cipher,
             keys.server_key,
             keys.server_iv,
             keys.server_seq,
@@ -558,6 +567,7 @@ pub fn run() void {
         &tx_record,
         &fin_msg,
         22, // inner_content_type = handshake
+        cipher,
         keys.client_key,
         keys.client_iv,
         keys.client_seq,
@@ -576,7 +586,7 @@ pub fn run() void {
     // Derive application traffic keys. From now on both sides MUST use
     // these for any record. (We don't actually exchange app data yet —
     // step 5+ wires that in.)
-    const app_keys = keys_mod.deriveApplicationKeys(keys.handshake_secret, th_after_sfin);
+    const app_keys = keys_mod.deriveApplicationKeys(keys.handshake_secret, th_after_sfin, key_len);
     klogHex("client_app_key", &app_keys.client_key);
     klogHex("server_app_key", &app_keys.server_key);
 

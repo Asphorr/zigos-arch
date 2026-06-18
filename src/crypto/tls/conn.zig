@@ -39,6 +39,10 @@ pub const TlsConn = struct {
     state: State,
     tcp_slot: u8,
 
+    // Negotiated AEAD (selected from ServerHello). Governs key length + which
+    // primitive the record layer runs for this conn's app-data direction.
+    cipher: record_mod.Cipher,
+
     // Application traffic keys + per-direction sequence numbers.
     server_key: [32]u8,
     server_iv: [12]u8,
@@ -61,6 +65,7 @@ pub var pool: [POOL_SIZE]TlsConn = blk: {
             .in_use = false,
             .state = .idle,
             .tcp_slot = 0,
+            .cipher = .chacha20_poly1305,
             .server_key = [_]u8{0} ** 32,
             .server_iv = [_]u8{0} ** 12,
             .server_seq = 0,
@@ -221,6 +226,19 @@ pub fn tlsConnect(ip: [4]u8, port: u16, sni: []const u8) ?u8 {
         return null;
     };
 
+    // Pin the negotiated AEAD. parseServerHello already rejected anything but
+    // the two suites we advertise, so fromSuite can't realistically miss — but
+    // fail closed rather than mis-derive if it ever does.
+    const cipher = record_mod.Cipher.fromSuite(@intFromEnum(sh.cipher_suite)) orelse {
+        debug.klog("[tls-conn] unsupported cipher suite 0x{x:0>4}\n", .{@intFromEnum(sh.cipher_suite)});
+        return null;
+    };
+    const key_len = cipher.keyLen();
+    debug.klog("[tls-conn] negotiated cipher=0x{x:0>4} ({s})\n", .{
+        @intFromEnum(sh.cipher_suite),
+        if (cipher == .aes128_gcm) "AES-128-GCM" else "ChaCha20-Poly1305",
+    });
+
     // 6. Derive shared secret + handshake keys.
     const shared = X25519.scalarmult(our_sk, sh.server_x25519_pub) catch return null;
     var transcript = Sha256.init(.{});
@@ -231,7 +249,7 @@ pub fn tlsConnect(ip: [4]u8, port: u16, sni: []const u8) ?u8 {
         var snap = transcript;
         snap.final(&th);
     }
-    var keys = keys_mod.deriveHandshakeKeys(shared, th);
+    var keys = keys_mod.deriveHandshakeKeys(shared, th, key_len);
 
     // 7. Walk encrypted records (EE / Cert / CertVerify / Finished).
     var hs_acc_len: usize = 0;
@@ -271,6 +289,7 @@ pub fn tlsConnect(ip: [4]u8, port: u16, sni: []const u8) ?u8 {
             &pt_buf,
             ct_buf[0..next_rec_len],
             &hdr2,
+            cipher,
             keys.server_key,
             keys.server_iv,
             keys.server_seq,
@@ -460,6 +479,7 @@ pub fn tlsConnect(ip: [4]u8, port: u16, sni: []const u8) ?u8 {
         &tx_record,
         &fin_msg,
         22,
+        cipher,
         keys.client_key,
         keys.client_iv,
         keys.client_seq,
@@ -467,10 +487,11 @@ pub fn tlsConnect(ip: [4]u8, port: u16, sni: []const u8) ?u8 {
     keys.client_seq += 1;
     if (!net.tcpSend(tcp_slot, tx_record[0..tx_len])) return null;
 
-    const app_keys = keys_mod.deriveApplicationKeys(keys.handshake_secret, th_after_sfin);
+    const app_keys = keys_mod.deriveApplicationKeys(keys.handshake_secret, th_after_sfin, key_len);
 
     // 11. Move app keys into the conn. Sequence numbers reset to 0 for
     //     the application_data direction (different traffic-secret).
+    pool[slot].cipher = cipher;
     pool[slot].server_key = app_keys.server_key;
     pool[slot].server_iv = app_keys.server_iv;
     pool[slot].server_seq = 0;
@@ -495,6 +516,7 @@ pub fn tlsSend(slot: u8, data: []const u8) isize {
         &io_ct_buf,
         data,
         23, // application_data inner type
+        c.cipher,
         c.client_key,
         c.client_iv,
         c.client_seq,
@@ -559,6 +581,7 @@ pub fn tlsRecv(slot: u8, out: []u8) isize {
             &io_pt_buf,
             io_ct_buf[0..rec_len],
             &hdr,
+            c.cipher,
             c.server_key,
             c.server_iv,
             c.server_seq,
@@ -620,6 +643,7 @@ pub fn tlsClose(slot: u8) void {
             &io_ct_buf,
             &alert,
             21, // alert inner type
+            c.cipher,
             c.client_key,
             c.client_iv,
             c.client_seq,

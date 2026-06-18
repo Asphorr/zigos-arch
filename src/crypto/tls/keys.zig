@@ -82,7 +82,13 @@ pub const HandshakeKeys = struct {
 ///   CHTS         = HKDF-Expand-Label(Handshake, "c hs traffic", H(CH..SH))
 ///   SHTS         = HKDF-Expand-Label(Handshake, "s hs traffic", H(CH..SH))
 ///   key/iv       = HKDF-Expand-Label(CHTS/SHTS, "key"/"iv", "")
-pub fn deriveHandshakeKeys(shared_secret: [32]u8, transcript_hash: [32]u8) HandshakeKeys {
+///
+/// `key_len` is the AEAD key length (32 for ChaCha20-Poly1305 / AES-256-GCM,
+/// 16 for AES-128-GCM). The keys are stored in 32-byte buffers; bytes past
+/// `key_len` are left zero and the record layer only reads `key_len` of them.
+/// HKDF-Expand encodes the output length in its label, so a 16-byte key is a
+/// distinct derivation — never the first 16 bytes of a 32-byte expansion.
+pub fn deriveHandshakeKeys(shared_secret: [32]u8, transcript_hash: [32]u8, key_len: usize) HandshakeKeys {
     // SHA-256("") = empty-string digest. Used as context for the
     // "derived" label since at that point we have no transcript yet.
     var empty_hash: [32]u8 = undefined;
@@ -104,13 +110,14 @@ pub fn deriveHandshakeKeys(shared_secret: [32]u8, transcript_hash: [32]u8) Hands
     deriveSecret(&chts, handshake_secret, "c hs traffic", transcript_hash);
     deriveSecret(&shts, handshake_secret, "s hs traffic", transcript_hash);
 
-    var ck: [32]u8 = undefined;
+    var ck: [32]u8 = [_]u8{0} ** 32;
     var civ: [12]u8 = undefined;
-    var sk: [32]u8 = undefined;
+    var sk: [32]u8 = [_]u8{0} ** 32;
     var siv: [12]u8 = undefined;
-    hkdfExpandLabel(&ck, chts, "key", "");
+    const kl = @min(key_len, 32);
+    hkdfExpandLabel(ck[0..kl], chts, "key", "");
     hkdfExpandLabel(&civ, chts, "iv", "");
-    hkdfExpandLabel(&sk, shts, "key", "");
+    hkdfExpandLabel(sk[0..kl], shts, "key", "");
     hkdfExpandLabel(&siv, shts, "iv", "");
 
     return .{
@@ -155,7 +162,9 @@ pub const ApplicationKeys = struct {
 ///   CATS          = HKDF-Expand-Label(Master, "c ap traffic", H(CH..serverFinished))
 ///   SATS          = HKDF-Expand-Label(Master, "s ap traffic", H(CH..serverFinished))
 ///   key / iv      = HKDF-Expand-Label(CATS|SATS, "key"|"iv", "")
-pub fn deriveApplicationKeys(handshake_secret: [32]u8, transcript_through_server_finished: [32]u8) ApplicationKeys {
+///
+/// `key_len` matches the negotiated AEAD (see deriveHandshakeKeys).
+pub fn deriveApplicationKeys(handshake_secret: [32]u8, transcript_through_server_finished: [32]u8, key_len: usize) ApplicationKeys {
     var empty_hash: [32]u8 = undefined;
     Sha256.hash("", &empty_hash, .{});
 
@@ -170,13 +179,14 @@ pub fn deriveApplicationKeys(handshake_secret: [32]u8, transcript_through_server
     deriveSecret(&cats, master_secret, "c ap traffic", transcript_through_server_finished);
     deriveSecret(&sats, master_secret, "s ap traffic", transcript_through_server_finished);
 
-    var ck: [32]u8 = undefined;
+    var ck: [32]u8 = [_]u8{0} ** 32;
     var civ: [12]u8 = undefined;
-    var sk: [32]u8 = undefined;
+    var sk: [32]u8 = [_]u8{0} ** 32;
     var siv: [12]u8 = undefined;
-    hkdfExpandLabel(&ck, cats, "key", "");
+    const kl = @min(key_len, 32);
+    hkdfExpandLabel(ck[0..kl], cats, "key", "");
     hkdfExpandLabel(&civ, cats, "iv", "");
-    hkdfExpandLabel(&sk, sats, "key", "");
+    hkdfExpandLabel(sk[0..kl], sats, "key", "");
     hkdfExpandLabel(&siv, sats, "iv", "");
 
     return .{
