@@ -354,6 +354,37 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // Browser primitives. `render` is a generic allocation-free rich-text
+    // layout/paint engine; `html` turns HTML into a render.Document; `webnav`
+    // is URL normalize/resolve + back-forward history. Built on graphics/
+    // font_atlas (render) and http (webnav) so the baby browser (app/web.zig)
+    // — and any future reader — share one rendering + navigation core.
+    const render_mod = b.createModule(.{
+        .root_source_file = b.path("lib/render.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "graphics", .module = graphics_mod },
+            .{ .name = "font_atlas", .module = font_atlas_mod },
+        },
+    });
+    const html_mod = b.createModule(.{
+        .root_source_file = b.path("lib/html.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "render", .module = render_mod },
+        },
+    });
+    const webnav_mod = b.createModule(.{
+        .root_source_file = b.path("lib/webnav.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "http", .module = http_mod },
+        },
+    });
+
     // MTProto client library (tl/ige/factorize/rsa_pad/transport). The pure
     // crypto is zig-test'd off-target; transport/auth are the live pieces.
     const mtproto_mod = b.createModule(.{
@@ -376,6 +407,9 @@ pub fn build(b: *std.Build) void {
         .{ .name = "json", .module = json_mod },
         .{ .name = "weather", .module = weather_mod },
         .{ .name = "mtproto", .module = mtproto_mod },
+        .{ .name = "render", .module = render_mod },
+        .{ .name = "html", .module = html_mod },
+        .{ .name = "webnav", .module = webnav_mod },
     };
 
     // --- 2. USER APPS ---
