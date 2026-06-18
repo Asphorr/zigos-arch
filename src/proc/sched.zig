@@ -481,6 +481,10 @@ pub fn loadBalance() void {
                 const pcb = &process.procs[candidate];
                 if (pcb.is_idle) continue;
                 if (pcb.pinned_cpu != 0xFF) continue;
+                // Job-control-stopped: pickNext won't run it on the idlest CPU
+                // either, so migrating it is pure churn (and keeps it counted as
+                // movable load). Skip.
+                if (@atomicLoad(bool, &pcb.job_stopped, .acquire)) continue;
                 pick = candidate;
                 break :outer;
             }
@@ -907,6 +911,27 @@ fn maybePreemptOnWake(pid: usize) void {
     }
 }
 
+/// Force `pid`'s owning CPU to take a reschedule decision NOW. Used by
+/// job-control resume (signals.send clearing job_stopped on SIGCONT/SIGKILL):
+/// the resumed task sits .ready-but-skipped in its runqueue, and if its CPU is
+/// idle/tickless it won't re-pick it until the next timer fire. The kill-kick
+/// IPI handler is schedule(), so this makes that CPU re-run pickNext at once.
+/// No-op for the local CPU (the running schedule loop will pick it on the next
+/// preempt) or a dead/out-of-range target. Mirrors maybePreemptOnWake's
+/// remote-CPU guard but unconditional (no priority gate — resume always wants
+/// the task reconsidered).
+pub fn kickReschedule(pid: usize) void {
+    if (pid >= MAX_PROCS) return;
+    const target_cpu_id = process.procs[pid].assigned_cpu;
+    if (target_cpu_id >= smp.MAX_CPUS) return;
+    if (target_cpu_id == smp.myCpu().cpu_id) return; // same-cpu: local schedule picks it
+    const target_cpu = &smp.cpus[target_cpu_id];
+    if (!target_cpu.alive) return;
+    if (kill_kick_vector) |v| {
+        @import("../time/apic.zig").sendIPI(target_cpu.lapic_id, v);
+    }
+}
+
 /// Two CAS sites (allocSlot's .unused→.loading and schedule()'s pickNext
 /// claim .ready→.running) flip the state byte directly without going
 /// through setState — they need atomicity that wraps both the read and
@@ -1058,6 +1083,11 @@ fn pickMinVruntime(q: *const runqueue.PriQueue, exclude_pid: ?u8) ?u8 {
         // .release under the waiter's setstate lock, which this picker
         // does NOT hold (it holds rq.lock). Matches waitsOn's discipline.
         if (@atomicLoad(u8, @as(*const u8, @ptrCast(&process.procs[pid].wait_kind)), .acquire) != @intFromEnum(WaitKind.none)) continue;
+        // Job-control stopped (SIGSTOP/SIGTSTP): skip so it consumes no CPU.
+        // It sits .ready in the rq until SIGCONT/SIGKILL clears the flag (see
+        // signals.stopForJobControl / send()); this is the single dispatch
+        // chokepoint that realizes "stopped" — there is no other path to CPU.
+        if (@atomicLoad(bool, &process.procs[pid].job_stopped, .acquire)) continue;
         const vr = process.procs[pid].vruntime;
         if (best == null or vr < best_vr) {
             best = pid;

@@ -77,8 +77,10 @@ pub const SIG_SETMASK: u32 = 2;
 pub const Action = enum(u8) { term, core, ignore, stop, cont };
 
 /// Default action per signal — POSIX-mandated. Slot 0 unused. Anything past
-/// the standard set defaults to `term`. Stop/cont are accepted but currently
-/// no-op (job control isn't wired up yet — the scheduler has no .stopped state).
+/// the standard set defaults to `term`. `.stop`/`.cont` ARE wired now: a `.stop`
+/// signal (SIGSTOP/SIGTSTP) suspends the process via the `job_stopped` flag that
+/// pickNext skips, and SIGCONT/SIGKILL resume it (see send() + stopForJobControl);
+/// only the waitpid(WUNTRACED/WCONTINUED) reporting of stops is still a follow-up.
 pub const default_actions: [NSIG]Action = blk: {
     var a: [NSIG]Action = [_]Action{.term} ** NSIG;
     a[0] = .ignore;
@@ -324,10 +326,35 @@ pub fn send(target: u8, signo: u32) bool {
         if (sa.handler == SIG_DFL and default_actions[signo] == .ignore) return true;
     }
 
-    // Atomic OR — two CPUs sending different signals to the same pid (or
-    // a sender vs the deliver-clear path) must not lose bits via a torn
-    // RMW. seq_cst pairs with the matching @atomicRmw .And in delivery.
+    // Set the pending bit FIRST. Besides the wake handshake (see wake() below),
+    // this ordering is load-bearing for job control: it is the SEND-side write
+    // of a seq_cst store-load (Dekker) handshake with stopForJobControl. A
+    // target mid-delivering a SIGSTOP on another CPU stores job_stopped=true and
+    // then RE-READS pending; pairing that against our {write pending → read
+    // job_stopped} below guarantees at least one side observes the other, so a
+    // SIGKILL/SIGCONT can never be lost into a task that is concurrently
+    // stopping (which would otherwise strand it unkillable, or with a lost
+    // continue — a silent, undiagnosable hang, since pickNext skips it forever
+    // and the stuck-waiter detector is .sleeping-only).
     _ = @atomicRmw(u32, &pcb.pending_signals, .Or, @as(u32, 1) << @intCast(signo), .seq_cst);
+
+    // Job-control transitions that must take effect at SEND time, because a
+    // stopped target is parked off-CPU (pickNext-skipped) and can't reach a
+    // signal-delivery point on its own to act on the bit we just set:
+    //   - SIGCONT (default action .cont): resume now, and annihilate any
+    //     still-pending stop signals (POSIX). The SIGCONT bit set above stays
+    //     pending so an installed SIGCONT *handler* runs once the task resumes.
+    //   - SIGKILL: resume so the task can run far enough to hit a delivery
+    //     point and die (a stopped, unschedulable task is otherwise unkillable).
+    // resumeFromStop's seq_cst load of job_stopped is the READ half of the
+    // handshake above. No-op when the target wasn't stopped; only a real resume
+    // kicks its CPU (which may be idle/tickless and otherwise slow to re-pick).
+    if (default_actions[signo] == .cont) {
+        _ = @atomicRmw(u32, &pcb.pending_signals, .And, ~STOP_SIGMASK, .seq_cst);
+        if (resumeFromStop(pcb)) process.kickReschedule(target);
+    } else if (signo == SIGKILL) {
+        if (resumeFromStop(pcb)) process.kickReschedule(target);
+    }
 
     // Make sure parked — or PARKING — processes notice. The old conditional
     // (`if .sleeping or wait_kind != .none`) raced with a target between its
@@ -368,12 +395,108 @@ fn clearPending(pcb: *process.PCB, signo: u32) void {
     _ = @atomicRmw(u32, &pcb.pending_signals, .And, ~(@as(u32, 1) << @intCast(signo)), .seq_cst);
 }
 
+// =============================================================================
+// Job control (POSIX stop/cont)
+// =============================================================================
+
+/// Bitmask of every signal whose default action is `.stop`
+/// (SIGSTOP/SIGTSTP/SIGTTIN/SIGTTOU). Used to annihilate pending stop signals
+/// when a SIGCONT arrives, and vice-versa — POSIX: a stop and a continue posted
+/// to the same target before either is consumed cancel each other.
+const STOP_SIGMASK: u32 = blk: {
+    var m: u32 = 0;
+    var s: u32 = 1;
+    while (s < NSIG) : (s += 1) {
+        if (default_actions[s] == .stop) m |= (@as(u32, 1) << @intCast(s));
+    }
+    break :blk m;
+};
+const CONT_BIT: u32 = @as(u32, 1) << @intCast(SIGCONT);
+const KILL_BIT: u32 = @as(u32, 1) << @intCast(SIGKILL);
+
+/// Realize a job-control stop on the CURRENT task — the `.stop` arm of
+/// applyDefault, reached when a stop signal is delivered with default
+/// disposition. We deschedule cooperatively: set `job_stopped` (pickNext skips
+/// it) and leave the task in its normal runnable state. It keeps running until
+/// the next timer tick demotes .running→.ready, where it then sits in the
+/// runqueue burning zero CPU until SIGCONT or SIGKILL clears the flag in send().
+/// We deliberately do NOT touch `state` here (see the PCB.job_stopped comment
+/// for the running-but-marked-sleeping hazard, and why the IRQ-return delivery
+/// path forbids a real park). Reschedule latency: on the IRQ-return delivery
+/// path handleIRQ0 reschedules immediately after delivery; on the syscall-return
+/// path there is no in-line reschedule, so a *self*-stopped task runs at most
+/// one more quantum (≤1 timer tick) before the next `from_user` preempt
+/// deschedules it — bounded latency, never a hang.
+fn stopForJobControl(pcb: *process.PCB, signo: u32) void {
+    pcb.stop_signo = @intCast(signo);
+    // Store job_stopped, THEN re-read pending — the stop side of a seq_cst
+    // store-load (Dekker) handshake with send(). A SIGKILL or SIGCONT that
+    // landed in the window between this delivery clearing the stop's pending bit
+    // and this store read job_stopped==false, so its send-side resume no-op'd;
+    // the recheck below catches that and undoes our stop, so we never strand the
+    // task stopped-with-a-pending-kill (unkillable — pickNext skips it forever,
+    // and the stuck-waiter detector is .sleeping-only, so it is a SILENT hang)
+    // or stopped-with-a-lost-continue.
+    @atomicStore(bool, &pcb.job_stopped, true, .seq_cst);
+    if ((@atomicLoad(u32, &pcb.pending_signals, .seq_cst) & (KILL_BIT | CONT_BIT)) != 0) {
+        // A resume raced us: undo the stop and let delivery proceed / the task
+        // die. The racing SIGKILL/SIGCONT owns the outcome — annihilate nothing.
+        pcb.stop_signo = 0;
+        @atomicStore(bool, &pcb.job_stopped, false, .seq_cst);
+        return;
+    }
+    // No concurrent resume: safe to annihilate any stale pending SIGCONT
+    // (POSIX stop⊥cont — only NOW, after the recheck, so we can't erase a racing
+    // resumer's CONT bit before it's observed) and notify the parent.
+    _ = @atomicRmw(u32, &pcb.pending_signals, .And, ~CONT_BIT, .seq_cst);
+    notifyParentStateChange(pcb);
+}
+
+/// Clear a job-control stop. Returns true iff the task was actually stopped
+/// (so the caller can fire a reschedule kick only when it did real work).
+/// Called from send() on SIGCONT (resume) / SIGKILL (so a stopped task can run
+/// far enough to die), and from applyDefault's `.cont` residual arm.
+fn resumeFromStop(pcb: *process.PCB) bool {
+    // seq_cst load — the READ half of the Dekker handshake in send()/
+    // stopForJobControl. Must pair with the seq_cst pending write that precedes
+    // every send()-side call and the seq_cst job_stopped store on the stop side.
+    if (!@atomicLoad(bool, &pcb.job_stopped, .seq_cst)) return false;
+    @atomicStore(bool, &pcb.job_stopped, false, .release);
+    pcb.stop_signo = 0;
+    notifyParentStateChange(pcb);
+    return true;
+}
+
+/// POSIX: a child stopping or continuing posts SIGCHLD to its parent. Sent
+/// regardless of whether the parent is in waitpid — a parent on the default
+/// (ignore) disposition sees no effect; one with a handler is notified, and
+/// send() wakes it if the handler makes the signal deliverable. The
+/// waitpid(WUNTRACED/WCONTINUED) reporting path is a separate, ABI-touching
+/// follow-up (sysWaitpid has no options arg today). One level of send()
+/// recursion: SIGCHLD is neither `.cont` nor SIGKILL, so it never re-enters the
+/// job-control branch.
+fn notifyParentStateChange(pcb: *process.PCB) void {
+    const parent = pcb.parent_pid;
+    if (parent == 0 or parent >= process.MAX_PROCS) return;
+    const ps = &process.procs[parent];
+    if (ps.state == .unused or ps.state == .zombie) return;
+    _ = send(parent, SIGCHLD);
+}
+
 fn applyDefault(pcb: *process.PCB, signo: u32) void {
     const action = default_actions[signo];
     switch (action) {
-        .ignore, .stop, .cont => {
-            // .stop/.cont currently no-op — job control needs a .stopped
-            // scheduler state we don't have yet.
+        .ignore => {},
+        .stop => stopForJobControl(pcb, signo),
+        .cont => {
+            // Default SIGCONT delivered to a RUNNING task. The prompt resume of
+            // a *stopped* task happens at send() time (a stopped task is parked
+            // off-CPU and can't reach this delivery point on its own), so this
+            // arm is normally a no-op; it just covers the harmless residual case
+            // and keeps the cont path symmetric. A user SIGCONT *handler*, if
+            // installed, is run by the catchable-signal path before we ever get
+            // here, so reaching this arm means default disposition.
+            _ = resumeFromStop(pcb);
         },
         .term, .core => {
             // POSIX exit_group: for a multi-threaded process, a fatal default

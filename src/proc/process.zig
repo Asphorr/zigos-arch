@@ -340,6 +340,26 @@ pub const PCB = struct {
     // Compared against tick_count in process.deliverDueAlarms each timer.
     alarm_tick: u64 = 0,
 
+    // --- Job control (POSIX stop/cont) ----------------------------------
+    // True while job-control-stopped (default action of SIGSTOP/SIGTSTP/
+    // SIGTTIN/SIGTTOU). pickNext skips a job_stopped pid so it burns zero CPU,
+    // but the task stays in a NORMAL runnable state (.running→.ready), never
+    // .sleeping — flipping a still-running, mid-delivery task to .sleeping is
+    // the "running-but-marked-sleeping" double-dispatch hazard the blockOn
+    // idiom avoids by descheduling in the same breath, which we can't do from
+    // the IRQ-return delivery path (handleIRQ0's tail is not yield-safe). See
+    // signals.stopForJobControl. Cleared by SIGCONT (resume) or SIGKILL (so the
+    // task can run far enough to die), both in signals.send(). Atomic: set by
+    // the stopping thread at its own delivery point; cleared by a signal sender
+    // on any CPU; read by the picker on any CPU.
+    job_stopped: bool = false, // (a)
+    // Signal number of the current/last stop — for a parent's waitpid(WUNTRACED)
+    // WIFSTOPPED status once that's wired up. 0 = never stopped. Plain (non-(a))
+    // access is intentional: it's a single byte (atomic on x86), written only by
+    // the stopping thread / a remote resumer alongside the seq_cst job_stopped
+    // store-load that orders them, and read only by the not-yet-wired waitpid.
+    stop_signo: u8 = 0,
+
     // --- Threads (sysClone) ---------------------------------------------
     // Thread group ID = pid of the lead thread that started the process.
     // Threads spawned via sysClone copy the parent's tgid; lead-thread
@@ -959,6 +979,7 @@ pub const rqAudit = @import("sched.zig").rqAudit;
 pub const initKillKickIpi = @import("sched.zig").initKillKickIpi;
 pub const initWakeIpi = @import("sched.zig").initWakeIpi;
 pub const kickVector = @import("sched.zig").kickVector;
+pub const kickReschedule = @import("sched.zig").kickReschedule;
 pub const wakeVector = @import("sched.zig").wakeVector;
 pub const enterFirstTask = @import("sched.zig").enterFirstTask;
 pub const enterFirstTaskAp = @import("sched.zig").enterFirstTaskAp;

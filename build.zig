@@ -428,6 +428,7 @@ pub fn build(b: *std.Build) void {
         .{ "synctest.elf", "app/synctest.zig" },
         .{ "babel.elf", "app/babel.zig" },
         .{ "sigtest.elf", "app/sigtest.zig" },
+        .{ "stoptest.elf", "app/stoptest.zig" },
         .{ "forktest.elf", "app/forktest.zig" },
         .{ "daemontest.elf", "app/daemontest.zig" },
         .{ "schedstress.elf", "app/schedstress.zig" },
@@ -1205,7 +1206,7 @@ pub fn build(b: *std.Build) void {
         \\tar cf ../../disk.tar \
         \\  BUILD.ID KERNEL.SYM KERNEL.LINE \
         \\  app.elf \
-        \\  gui_demo.elf pipetest.elf sigtest.elf \
+        \\  gui_demo.elf pipetest.elf sigtest.elf stoptest.elf \
         \\  cat.elf ls.elf wc.elf echo.elf grep.elf head.elf sleep.elf taskset.elf nice.elf yes.elf iretq_spin.elf \
         \\  ps.elf dmesg.elf mkdir.elf rmdir.elf rm.elf touch.elf shutdown.elf beep.elf \
         \\  sysmon.elf calc.elf settings.elf files.elf about.elf fastfetch.elf zigtop.elf sigil.elf tg.elf \
