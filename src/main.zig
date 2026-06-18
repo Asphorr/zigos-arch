@@ -518,21 +518,18 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     }
     if (nic.init()) {
         blog.ok("Network interface");
-        // Acquire a DHCP lease so we don't depend on the QEMU-SLIRP-only
-        // hardcoded IP/gateway/DNS triple. Total deadline is 5s (500 ticks
-        // @ 100 Hz) split across up to 3 DISCOVER attempts. Failure is
-        // soft: we fall back to the static SLIRP defaults still set in
-        // src/net/net.zig so QEMU SLIRP keeps working.
-        const dhcp = @import("net/dhcp.zig");
-        const net = @import("net/net.zig");
-        const proc = @import("proc/process.zig");
-        if (dhcp.acquire(proc.tick_count + 500)) {
-            blog.okNote("DHCP lease", "{d}.{d}.{d}.{d} via {d}.{d}.{d}.{d}", .{
-                net.local_ip[0], net.local_ip[1], net.local_ip[2], net.local_ip[3],
-                net.gateway_ip[0], net.gateway_ip[1], net.gateway_ip[2], net.gateway_ip[3],
-            });
+        // DHCP runs in the BACKGROUND (dhcpdEntry) so boot no longer blocks on
+        // the lease. It was ~1007 ms — 32% of a ~3.1 s boot — because QEMU's
+        // polled e1000/SLIRP takes ~1 s to answer the first DISCOVER, and
+        // NOTHING at boot needs the IP yet (the boot-time TLS probe right after
+        // already runs/fails on the static defaults). The hardcoded SLIRP
+        // IP/gateway/DNS triple in src/net/net.zig keeps the network usable
+        // until (and if) the real lease lands. net.poll() is net_lock-serialized
+        // so the task polling concurrently with the desktop/apps is safe.
+        if (@import("proc/lifecycle.zig").createKernelTask(@intFromPtr(&dhcpdEntry), "dhcpd", 0, .normal, 32 * 1024)) |_| {
+            blog.okNote("DHCP lease", "acquiring in background (dhcpd)", .{});
         } else {
-            blog.skip("DHCP lease", "no server reply, using static SLIRP defaults", .{});
+            blog.skip("DHCP lease", "dhcpd spawn failed — using static SLIRP defaults", .{});
         }
     } else {
         blog.skip("Network interface", "no NIC found", .{});
@@ -855,6 +852,31 @@ fn pgflushdEntry() callconv(.c) noreturn {
         sched.kernelSleepMs(PGFLUSH_INTERVAL_MS);
         _ = vfs.flushAllDirty();
     }
+}
+
+/// dhcpd kernel-thread entry. Runs the DHCP DISCOVER→OFFER→REQUEST→ACK exchange
+/// in the BACKGROUND so boot no longer blocks on the ~1 s lease (it was 32% of a
+/// ~3.1 s boot — QEMU's polled e1000/SLIRP is slow to answer the first DISCOVER,
+/// and nothing at boot needs the IP). waitForReply self-drives net.poll() and
+/// yields via kernelSleepMs, so the task doesn't hog its CPU; net_lock serializes
+/// the poll against the desktop/app network paths. One-shot: a 24 h SLIRP lease
+/// needs no near-term renewal for this workload, so after it lands (or fails to)
+/// the task parks. On failure the static SLIRP defaults in net.zig stay in force.
+fn dhcpdEntry() callconv(.c) noreturn {
+    const dhcp = @import("net/dhcp.zig");
+    const net = @import("net/net.zig");
+    const proc = @import("proc/process.zig");
+    const sched = @import("proc/sched.zig");
+    const klog = @import("debug/debug.zig").klog;
+    if (dhcp.acquire(proc.tick_count + 500)) {
+        klog("[dhcp] background lease OK — {d}.{d}.{d}.{d} via {d}.{d}.{d}.{d}\n", .{
+            net.local_ip[0],   net.local_ip[1],   net.local_ip[2],   net.local_ip[3],
+            net.gateway_ip[0], net.gateway_ip[1], net.gateway_ip[2], net.gateway_ip[3],
+        });
+    } else {
+        klog("[dhcp] background acquire failed — keeping static SLIRP defaults\n", .{});
+    }
+    while (true) sched.kernelSleepMs(3_600_000); // one-shot; park (lease is 24 h)
 }
 
 /// acpid kernel-thread entry (dynamic-ACPI Slice A). Polls the power-button flag
