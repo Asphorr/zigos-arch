@@ -315,6 +315,112 @@ fn skipUntilClose(html: []const u8, from: usize, close: []const u8) ?usize {
 }
 
 // ---------------------------------------------------------------------
+// <title> capture. Display-only; whitespace-collapsed, ASCII, light entity
+// decode. Kept separate from the body text pipeline.
+
+fn setTitleClean(s: []const u8) void {
+    var buf: [render.MAX_TITLE]u8 = undefined;
+    var n: usize = 0;
+    var sp = false; // a run of whitespace is pending (leading run suppressed)
+    var i: usize = 0;
+    while (i < s.len) {
+        var ch: u8 = 0;
+        var have = false;
+        const c = s[i];
+        if (c == ' ' or c == '\t' or c == '\r' or c == '\n') {
+            if (n > 0) sp = true;
+            i += 1;
+        } else if (c == '&') {
+            var j = i + 1;
+            const limit = @min(s.len, i + 12);
+            while (j < limit and s[j] != ';') : (j += 1) {}
+            if (j < limit and s[j] == ';') {
+                const nm = s[i + 1 .. j];
+                if (eqlLower(nm, "amp")) {
+                    ch = '&';
+                    have = true;
+                } else if (eqlLower(nm, "lt")) {
+                    ch = '<';
+                    have = true;
+                } else if (eqlLower(nm, "gt")) {
+                    ch = '>';
+                    have = true;
+                } else if (eqlLower(nm, "quot")) {
+                    ch = '"';
+                    have = true;
+                } else if (eqlLower(nm, "apos") or eqlLower(nm, "#39")) {
+                    ch = '\'';
+                    have = true;
+                } else if (eqlLower(nm, "nbsp")) {
+                    if (n > 0) sp = true;
+                } else if (eqlLower(nm, "mdash") or eqlLower(nm, "ndash")) {
+                    ch = '-';
+                    have = true;
+                }
+                // else: unknown entity — dropped.
+                i = j + 1;
+            } else {
+                i += 1; // lone '&' — drop
+            }
+        } else if (c >= 0x20 and c <= 0x7E) {
+            ch = c;
+            have = true;
+            i += 1;
+        } else {
+            i += 1; // non-ASCII — drop
+        }
+        if (have) {
+            if (sp and n < buf.len) {
+                buf[n] = ' ';
+                n += 1;
+            }
+            sp = false;
+            if (n < buf.len) {
+                buf[n] = ch;
+                n += 1;
+            } else break;
+        }
+    }
+    doc.setTitle(buf[0..n]);
+}
+
+// `from` is just past the opening <title…>'s '>'. Capture the inner text into
+// the document title; return the index just past the matching </title…>'s '>'.
+fn captureTitle(html: []const u8, from: usize) usize {
+    var k = from;
+    while (k < html.len) : (k += 1) {
+        if (html[k] == '<' and k + 7 <= html.len and eqlLower(html[k .. k + 7], "</title")) break;
+    }
+    setTitleClean(html[from..@min(k, html.len)]);
+    if (k >= html.len) return html.len;
+    var m = k + 7;
+    while (m < html.len and html[m] != '>') : (m += 1) {}
+    return if (m < html.len) m + 1 else html.len;
+}
+
+// Find a <title> anywhere in [from, to) (used to lift a title out of a <head>
+// whose contents we otherwise drop) and capture it.
+fn scanTitleIn(html: []const u8, from: usize, to: usize) void {
+    const lim = @min(to, html.len);
+    var k = from;
+    while (k + 6 < lim) : (k += 1) { // k+6 < lim <= html.len → after_name read is safe
+        if (html[k] != '<') continue;
+        if (!eqlLower(html[k .. k + 6], "<title")) continue;
+        // Only a real <title> (the next char ends the tag name).
+        const after_name = html[k + 6];
+        if (after_name == '>' or after_name == ' ' or after_name == '\t' or
+            after_name == '\r' or after_name == '\n' or after_name == '/')
+        {
+            var m = k + 6;
+            while (m < html.len and html[m] != '>') : (m += 1) {}
+            const inner_from = if (m < html.len) m + 1 else html.len;
+            _ = captureTitle(html, inner_from);
+            return;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
 // Main pass.
 
 pub fn parse(d: *render.Document, html: []const u8, th: render.Theme) void {
@@ -367,15 +473,25 @@ pub fn parse(d: *render.Document, html: []const u8, th: render.Theme) void {
             const tag_inner = html[name_start..tag_end];
             const after = if (tag_end < html.len) tag_end + 1 else html.len;
 
-            // Raw-text / head elements: drop their contents.
+            // Raw-text / head elements: drop their contents — but lift out the
+            // <title> (the page title), wherever it lives.
             if (!closing and (eqlLower(name, "script") or eqlLower(name, "style") or
                 eqlLower(name, "title") or eqlLower(name, "head")))
             {
-                const close: []const u8 = if (eqlLower(name, "script")) "</script" else if (eqlLower(name, "style")) "</style" else if (eqlLower(name, "title")) "</title" else "</head";
-                if (skipUntilClose(html, after, close)) |nx| {
-                    i = nx;
-                } else {
-                    i = after;
+                if (eqlLower(name, "script")) {
+                    i = skipUntilClose(html, after, "</script") orelse after;
+                } else if (eqlLower(name, "style")) {
+                    i = skipUntilClose(html, after, "</style") orelse after;
+                } else if (eqlLower(name, "title")) {
+                    if (doc.title_len == 0) {
+                        i = captureTitle(html, after);
+                    } else {
+                        i = skipUntilClose(html, after, "</title") orelse after;
+                    }
+                } else { // head — drop contents, but capture the title first
+                    const head_end = skipUntilClose(html, after, "</head") orelse html.len;
+                    if (doc.title_len == 0) scanTitleIn(html, after, head_end);
+                    i = head_end;
                 }
                 continue;
             }

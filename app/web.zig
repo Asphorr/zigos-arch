@@ -50,9 +50,14 @@ const theme = render.Theme{
     .text = 0xD6DAE0,
     .link = 0x6FB0FF,
     .link_hover = 0xA9D2FF,
+    .link_visited = 0xB49AD6,
     .muted = MUTED,
     .bg = BG,
 };
+
+// Cap the readable text column so long lines don't stretch edge-to-edge on a
+// wide window; the column is centered in the available body width.
+const MAX_CONTENT_W: u32 = 720;
 
 // Image limits. Each fetch reuses img_buf; decoded pixels live on the heap
 // (freed on the next page load). Bounded so one page can't exhaust memory.
@@ -87,6 +92,56 @@ var alloc_w: u32 = 0;
 var alloc_h: u32 = 0;
 
 var scrollbar: ui.Scrollbar = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
+
+// Session history of visited URLs, stored as FNV-1a hashes (a bounded ring;
+// collisions only ever over-dim a link, never under-dim). Links pointing at a
+// visited URL paint in the muted "visited" color.
+const VISITED_CAP: usize = 512;
+var visited_hashes: [VISITED_CAP]u64 = [_]u64{0} ** VISITED_CAP;
+var visited_count: usize = 0;
+
+fn hashUrl(u: []const u8) u64 {
+    var h: u64 = 0xcbf29ce484222325;
+    for (u) |c| {
+        h ^= c;
+        h = h *% 0x100000001b3;
+    }
+    return h;
+}
+
+fn isVisited(u: []const u8) bool {
+    const h = hashUrl(u);
+    const n = @min(visited_count, VISITED_CAP);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        if (visited_hashes[i] == h) return true;
+    }
+    return false;
+}
+
+fn markVisited(u: []const u8) void {
+    if (u.len == 0) return;
+    const h = hashUrl(u);
+    const n = @min(visited_count, VISITED_CAP);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        if (visited_hashes[i] == h) return; // already known
+    }
+    visited_hashes[visited_count % VISITED_CAP] = h;
+    visited_count += 1;
+}
+
+// Dim every link in the current document that resolves to a URL we've visited.
+fn applyVisited() void {
+    var i: u32 = 0;
+    while (i < doc.link_count) : (i += 1) {
+        const href = doc.linkHref(@intCast(i));
+        if (href.len == 0) continue;
+        var abs: [webnav.MAX_URL]u8 = undefined;
+        const u = webnav.resolveHref(current_url[0..current_url_len], href, &abs) orelse continue;
+        if (isVisited(u)) doc.setLinkVisited(@intCast(i), true);
+    }
+}
 
 // ---------------------------------------------------------------------
 // Small helpers.
@@ -127,8 +182,15 @@ fn bodyOriginY() u32 {
 fn bodyHeight() u32 {
     return vis_h -| URLBAR_H -| STATUS_H -| 4;
 }
-fn contentWidth() u32 {
+fn availWidth() u32 {
     return vis_w -| (PAD * 2) -| SB_W;
+}
+fn contentWidth() u32 {
+    return @min(availWidth(), MAX_CONTENT_W);
+}
+// Left edge of the (possibly capped) text column, centered in the body width.
+fn contentX() u32 {
+    return PAD + (availWidth() -| contentWidth()) / 2;
 }
 fn lineStep() u32 {
     return fa.default_16.line_height;
@@ -160,9 +222,14 @@ fn loadUrl(u: []const u8) void {
     @memcpy(input_buf[0..un], u[0..un]);
     input_len = un;
 
+    markVisited(current_url[0..current_url_len]);
     hovered_link = -1;
-    freeImages(); // release the previous page's decoded pixels
     setStatusStr("Loading...", false);
+    // Show the new address + "Loading..." over the (still-valid) old page for
+    // immediate feedback, THEN release the old page's images and fetch.
+    drawAll(&g_canvas);
+    libc.present();
+    freeImages(); // release the previous page's decoded pixels
 
     const resp = http.send(.{
         .url = current_url[0..current_url_len],
@@ -183,12 +250,22 @@ fn loadUrl(u: []const u8) void {
     html.parse(&doc, resp.body, theme);
     scroll_y = 0;
     relayout();
+    applyVisited();
 
+    // Idle status: [title]   HTTP NNN   N links [   (truncated)]
     var b: [160]u8 = undefined;
     var p: usize = 0;
+    const ttl = doc.title();
+    if (ttl.len > 0) {
+        const tn = @min(ttl.len, 84);
+        @memcpy(b[0..tn], ttl[0..tn]);
+        p = tn;
+        @memcpy(b[p..][0..3], "   ");
+        p += 3;
+    }
     const pfx = "HTTP ";
-    @memcpy(b[0..pfx.len], pfx);
-    p = pfx.len;
+    @memcpy(b[p..][0..pfx.len], pfx);
+    p += pfx.len;
     p = appendNum(b[0..], p, resp.status);
     const mid = "   ";
     @memcpy(b[p..][0..mid.len], mid);
@@ -198,7 +275,7 @@ fn loadUrl(u: []const u8) void {
     @memcpy(b[p..][0..suf.len], suf);
     p += suf.len;
     if (doc.truncated or resp.truncated) {
-        const t = "  (truncated)";
+        const t = "   (truncated)";
         const tn = @min(t.len, b.len - p);
         @memcpy(b[p..][0..tn], t[0..tn]);
         p += tn;
@@ -319,8 +396,10 @@ fn hitTestLink(mx: i32, my: i32) i32 {
     const by0: i32 = @intCast(bodyOriginY());
     const bh: i32 = @intCast(bodyHeight());
     if (my < by0 or my >= by0 + bh) return -1;
-    if (mx < @as(i32, @intCast(PAD)) or mx >= @as(i32, @intCast(vis_w -| SB_W))) return -1;
-    const content_x = mx - @as(i32, @intCast(PAD));
+    const cx0: i32 = @intCast(contentX());
+    const cw: i32 = @intCast(contentWidth());
+    if (mx < cx0 or mx >= cx0 + cw) return -1;
+    const content_x = mx - cx0;
     const content_y = @as(i32, @intCast(scroll_y)) + (my - by0);
     return render.linkAt(&doc, content_x, content_y);
 }
@@ -383,10 +462,10 @@ fn drawAll(canvas: *gfx.Canvas) void {
     canvas.fillRect(0, 0, vis_w, vis_h, BG);
     drawUrlBar(canvas);
 
-    // Body.
+    // Body (centered, width-capped readable column).
     const body_y0 = bodyOriginY();
     const body_h = bodyHeight();
-    render.paint(&doc, canvas, @intCast(PAD), @intCast(body_y0), contentWidth(), body_h, scroll_y, theme, hovered_link);
+    render.paint(&doc, canvas, @intCast(contentX()), @intCast(body_y0), contentWidth(), body_h, scroll_y, theme, hovered_link);
 
     // Scrollbar (pixel units).
     scrollbar.x = vis_w -| SB_W;
@@ -395,13 +474,26 @@ fn drawAll(canvas: *gfx.Canvas) void {
     scrollbar.h = vis_h -| URLBAR_H -| STATUS_H;
     scrollbar.draw(canvas, doc.doc_height, body_h, scroll_y);
 
-    // Status bar.
+    // Status bar. While hovering a link, show its resolved destination URL
+    // (like a real browser); otherwise the page status (title / HTTP / errors).
     const sy = vis_h -| STATUS_H;
     canvas.fillRect(0, sy, vis_w, STATUS_H, URLBAR_BG);
     canvas.fillRect(0, sy, vis_w, 1, URLBAR_BORDER);
     const st_y: i32 = @intCast(sy + (STATUS_H -| lh) / 2);
-    const st_color: u32 = if (status_is_err) ERRCOL else MUTED;
-    fa.drawTextClipped(canvas, @intCast(PAD), st_y, status_buf[0..status_len], st_color, atlas, fa.Clip.fromRect(PAD, sy, vis_w -| PAD * 2, STATUS_H));
+
+    var hov_buf: [webnav.MAX_URL]u8 = undefined;
+    var st_text: []const u8 = status_buf[0..status_len];
+    var st_color: u32 = if (status_is_err) ERRCOL else MUTED;
+    if (hovered_link >= 0) {
+        const href = doc.linkHref(hovered_link);
+        if (href.len > 0) {
+            if (webnav.resolveHref(current_url[0..current_url_len], href, &hov_buf)) |u| {
+                st_text = u;
+                st_color = ACCENT;
+            }
+        }
+    }
+    fa.drawTextClipped(canvas, @intCast(PAD), st_y, st_text, st_color, atlas, fa.Clip.fromRect(PAD, sy, vis_w -| PAD * 2, STATUS_H));
 }
 
 // ---------------------------------------------------------------------

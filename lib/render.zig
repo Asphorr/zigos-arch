@@ -78,6 +78,7 @@ pub const Theme = struct {
     text: u32 = 0xD6DAE0,
     link: u32 = 0x6FB0FF,
     link_hover: u32 = 0xA9D2FF,
+    link_visited: u32 = 0xB49AD6, // already-followed links (muted lavender)
     muted: u32 = 0x808898,
     bg: u32 = 0x16171A,
 };
@@ -108,7 +109,7 @@ const Block = struct {
     image_link: i32 = -1,
 };
 
-const Link = struct { off: u32 = 0, len: u32 = 0 };
+const Link = struct { off: u32 = 0, len: u32 = 0, visited: bool = false };
 
 /// A referenced image. `url` lives in the shared href_pool. Intrinsic decode
 /// dims (`src_w`/`src_h`) and `pixels` are filled in by the app after it
@@ -161,6 +162,7 @@ pub const MAX_LINKS: usize = 1024;
 pub const MAX_SPANS: usize = 14000;
 pub const MAX_LINES: usize = 9000;
 pub const MAX_IMAGES: usize = 24;
+pub const MAX_TITLE: usize = 256; // document title (e.g. <title>), display-only
 
 pub const Document = struct {
     // Source content.
@@ -174,6 +176,10 @@ pub const Document = struct {
     href_len: u32 = 0,
     links: [MAX_LINKS]Link = undefined,
     link_count: u32 = 0,
+
+    // Optional document title (set by the producer; not laid out).
+    title_buf: [MAX_TITLE]u8 = undefined,
+    title_len: u32 = 0,
 
     // Layout output.
     images: [MAX_IMAGES]Image = undefined,
@@ -203,6 +209,7 @@ pub const Document = struct {
         self.block_count = 0;
         self.href_len = 0;
         self.link_count = 0;
+        self.title_len = 0;
         self.image_count = 0;
         self.span_count = 0;
         self.line_count = 0;
@@ -311,6 +318,23 @@ pub const Document = struct {
         if (id < 0 or @as(u32, @intCast(id)) >= self.link_count) return "";
         const l = self.links[@intCast(id)];
         return self.href_pool[l.off..][0..l.len];
+    }
+
+    /// Mark a link as visited (paint dims it via `Theme.link_visited`).
+    pub fn setLinkVisited(self: *Document, id: i32, v: bool) void {
+        if (id < 0 or @as(u32, @intCast(id)) >= self.link_count) return;
+        self.links[@intCast(id)].visited = v;
+    }
+
+    /// Set the document title (display-only metadata; copied, clamped).
+    pub fn setTitle(self: *Document, s: []const u8) void {
+        const n = @min(s.len, MAX_TITLE);
+        @memcpy(self.title_buf[0..n], s[0..n]);
+        self.title_len = @intCast(n);
+    }
+
+    pub fn title(self: *const Document) []const u8 {
+        return self.title_buf[0..self.title_len];
     }
 
     /// Register an image by source URL (stored in the href pool). `nat_w/h`
@@ -691,8 +715,14 @@ pub fn paint(
             const sx: i32 = x0 + @as(i32, @intCast(line.indent)) + sp.x;
             const cell_y: i32 = line_y + @as(i32, @intCast(line.baseline)) - @as(i32, @intCast(sp.font.atlas().baseline));
 
-            const is_hover = sp.link_id >= 0 and sp.link_id == hovered_link;
-            const color = if (is_hover) theme.link_hover else sp.color;
+            const is_link = sp.link_id >= 0 and @as(u32, @intCast(sp.link_id)) < doc.link_count;
+            const is_hover = is_link and sp.link_id == hovered_link;
+            var color = sp.color;
+            if (is_hover) {
+                color = theme.link_hover;
+            } else if (is_link and doc.links[@intCast(sp.link_id)].visited) {
+                color = theme.link_visited;
+            }
 
             fa.drawTextClipped(canvas, sx, cell_y, seg, color, sp.font.atlas(), clip);
             if (sp.font.isBold())
