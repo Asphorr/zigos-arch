@@ -193,14 +193,24 @@ pub fn buildClientHello(buf: []u8, p: ClientHelloParams) usize {
     writeU16(buf, &pos, 2);
     writeU16(buf, &pos, @intFromEnum(types.NamedGroup.x25519));
 
-    // -- signature_algorithms: ECDSA P-256, RSA-PSS, RSA-PKCS1, Ed25519 --
+    // -- signature_algorithms --
+    // Advertise EXACTLY the schemes cert_verify.verifyServer can actually
+    // check: ECDSA P-256/P-384 and RSA-PSS SHA-256/384/512, plus RSA-PKCS1
+    // SHA-256 (for cert-chain signatures; TLS 1.3 servers won't pick it for
+    // CertificateVerify). Advertising a scheme we can't verify (the old
+    // ed25519 entry) is a trap — a server with that cert key picks it and we
+    // fail *after* committing to the handshake. Withholding P-384/PSS-384/512
+    // (which we CAN verify) made every P-384-cert server send
+    // handshake_failure (desc=40) right after ServerHello.
     writeU16(buf, &pos, @intFromEnum(types.ExtensionType.signature_algorithms));
-    writeU16(buf, &pos, 10);
-    writeU16(buf, &pos, 8);
+    writeU16(buf, &pos, 14); // ext_len: 1×u16 list_len + 6×u16 schemes
+    writeU16(buf, &pos, 12); // schemes list_len in bytes
     writeU16(buf, &pos, @intFromEnum(types.SignatureScheme.ecdsa_secp256r1_sha256));
+    writeU16(buf, &pos, @intFromEnum(types.SignatureScheme.ecdsa_secp384r1_sha384));
     writeU16(buf, &pos, @intFromEnum(types.SignatureScheme.rsa_pss_rsae_sha256));
+    writeU16(buf, &pos, @intFromEnum(types.SignatureScheme.rsa_pss_rsae_sha384));
+    writeU16(buf, &pos, @intFromEnum(types.SignatureScheme.rsa_pss_rsae_sha512));
     writeU16(buf, &pos, @intFromEnum(types.SignatureScheme.rsa_pkcs1_sha256));
-    writeU16(buf, &pos, @intFromEnum(types.SignatureScheme.ed25519));
 
     // -- key_share: [x25519: our_pub] --
     writeU16(buf, &pos, @intFromEnum(types.ExtensionType.key_share));

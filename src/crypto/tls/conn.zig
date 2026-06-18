@@ -84,8 +84,13 @@ var hs_busy: bool = false;
 var hs_buf: [512]u8 = undefined;
 var rec_buf: [600]u8 = undefined;
 var body_buf: [4096]u8 = undefined;
-var ct_buf: [4096]u8 = undefined;
-var pt_buf: [4096]u8 = undefined;
+// A single TLS 1.3 record can be up to ~16 KiB (2^14 + overhead). RSA cert
+// chains routinely exceed 4 KiB and arrive as one Certificate record, so these
+// must be full-record-sized — a 4 KiB cap here silently rejected every RSA-
+// served site (ECDSA chains are small and slipped through, which is why it
+// looked random). Match the steady-state io_ct_buf/io_pt_buf sizing.
+var ct_buf: [MAX_RECORD_CIPHERTEXT + 5]u8 = undefined;
+var pt_buf: [MAX_RECORD_PLAINTEXT]u8 = undefined;
 var hs_acc: [16384]u8 = undefined;
 var tx_record: [128]u8 = undefined;
 var cert_msg_buf: [16384]u8 = undefined;
@@ -199,13 +204,22 @@ pub fn tlsConnect(ip: [4]u8, port: u16, sni: []const u8) ?u8 {
         return null;
     }
     const body_len: usize = (@as(usize, hdr[3]) << 8) | @as(usize, hdr[4]);
-    if (body_len > body_buf.len) return null;
-    if (readAtLeast(tcp_slot, body_buf[0..body_len], body_len, process.tick_count + 500) != body_len) return null;
+    if (body_len > body_buf.len) {
+        debug.klog("[tls-conn] ServerHello body too big: {d}\n", .{body_len});
+        return null;
+    }
+    if (readAtLeast(tcp_slot, body_buf[0..body_len], body_len, process.tick_count + 500) != body_len) {
+        debug.klog("[tls-conn] ServerHello body read timeout\n", .{});
+        return null;
+    }
 
     if (body_buf[0] != @intFromEnum(types.HandshakeType.server_hello)) return null;
     const sh_body_len: usize = (@as(usize, body_buf[1]) << 16) | (@as(usize, body_buf[2]) << 8) | @as(usize, body_buf[3]);
     if (sh_body_len + 4 > body_len) return null;
-    const sh = messages.parseServerHello(body_buf[4 .. 4 + sh_body_len]) catch return null;
+    const sh = messages.parseServerHello(body_buf[4 .. 4 + sh_body_len]) catch |e| {
+        debug.klog("[tls-conn] parseServerHello failed: {s}\n", .{@errorName(e)});
+        return null;
+    };
 
     // 6. Derive shared secret + handshake keys.
     const shared = X25519.scalarmult(our_sk, sh.server_x25519_pub) catch return null;
@@ -232,7 +246,10 @@ pub fn tlsConnect(ip: [4]u8, port: u16, sni: []const u8) ?u8 {
 
     while (!saw_server_finished and record_count < 16) : (record_count += 1) {
         var hdr2: [5]u8 = undefined;
-        if (readAtLeast(tcp_slot, &hdr2, 5, process.tick_count + 500) != 5) return null;
+        if (readAtLeast(tcp_slot, &hdr2, 5, process.tick_count + 500) != 5) {
+            debug.klog("[tls-conn] flight record header read timeout (rec #{d})\n", .{record_count});
+            return null;
+        }
         const rec_type = hdr2[0];
         const next_rec_len: usize = (@as(usize, hdr2[3]) << 8) | @as(usize, hdr2[4]);
         if (rec_type == 0x14) {
@@ -240,8 +257,14 @@ pub fn tlsConnect(ip: [4]u8, port: u16, sni: []const u8) ?u8 {
             _ = readAtLeast(tcp_slot, ccs_body[0..next_rec_len], next_rec_len, process.tick_count + 500);
             continue;
         }
-        if (rec_type != @intFromEnum(types.ContentType.application_data)) return null;
-        if (next_rec_len > ct_buf.len) return null;
+        if (rec_type != @intFromEnum(types.ContentType.application_data)) {
+            debug.klog("[tls-conn] unexpected flight record type 0x{x:0>2}\n", .{rec_type});
+            return null;
+        }
+        if (next_rec_len > ct_buf.len) {
+            debug.klog("[tls-conn] record too big: {d} > {d}\n", .{ next_rec_len, ct_buf.len });
+            return null;
+        }
         if (readAtLeast(tcp_slot, ct_buf[0..next_rec_len], next_rec_len, process.tick_count + 500) != next_rec_len) return null;
 
         const pt_len = record_mod.decrypt(
@@ -251,12 +274,29 @@ pub fn tlsConnect(ip: [4]u8, port: u16, sni: []const u8) ?u8 {
             keys.server_key,
             keys.server_iv,
             keys.server_seq,
-        ) catch return null;
+        ) catch {
+            debug.klog("[tls-conn] record decrypt failed (seq={d})\n", .{keys.server_seq});
+            return null;
+        };
         keys.server_seq += 1;
 
         const stripped = record_mod.stripInnerType(pt_buf[0..pt_len]);
-        if (stripped.inner_type != 22) return null;
-        if (hs_acc_len + stripped.content.len > hs_acc.len) return null;
+        if (stripped.inner_type != 22) {
+            // type 23 = early app_data, 21 = alert mid-handshake; either way
+            // we can't proceed. Decode the alert {level, desc} when present so
+            // we know *why* the server aborted (40=handshake_failure,
+            // 47=illegal_parameter, 70=protocol_version, 109=missing_ext, …).
+            if (stripped.inner_type == 21 and stripped.content.len >= 2) {
+                debug.klog("[tls-conn] handshake alert level={d} desc={d}\n", .{ stripped.content[0], stripped.content[1] });
+            } else {
+                debug.klog("[tls-conn] unexpected inner type {d} mid-handshake (len={d})\n", .{ stripped.inner_type, stripped.content.len });
+            }
+            return null;
+        }
+        if (hs_acc_len + stripped.content.len > hs_acc.len) {
+            debug.klog("[tls-conn] handshake accumulator overflow\n", .{});
+            return null;
+        }
         @memcpy(hs_acc[hs_acc_len..][0..stripped.content.len], stripped.content);
         hs_acc_len += stripped.content.len;
 
@@ -279,7 +319,10 @@ pub fn tlsConnect(ip: [4]u8, port: u16, sni: []const u8) ?u8 {
             transcript.update(hs_acc[walk..][0..total]);
 
             if (hs_type == 11) {
-                if (hs_body_len_w > cert_msg_buf.len) return null;
+                if (hs_body_len_w > cert_msg_buf.len) {
+                    debug.klog("[tls-conn] cert message too big: {d}\n", .{hs_body_len_w});
+                    return null;
+                }
                 @memcpy(cert_msg_buf[0..hs_body_len_w], hs_acc[walk + 4 .. walk + 4 + hs_body_len_w]);
                 cert_msg_len = hs_body_len_w;
                 saw_cert = true;
@@ -296,7 +339,10 @@ pub fn tlsConnect(ip: [4]u8, port: u16, sni: []const u8) ?u8 {
                 var expected: [32]u8 = undefined;
                 keys_mod.computeFinishedMac(&expected, keys.server_hs_traffic_secret, th_before_finished);
                 const actual = hs_acc[walk + 4 .. walk + 4 + 32];
-                if (!std.mem.eql(u8, &expected, actual)) return null;
+                if (!std.mem.eql(u8, &expected, actual)) {
+                    debug.klog("[tls-conn] server Finished MAC mismatch\n", .{});
+                    return null;
+                }
                 saw_server_finished = true;
             }
             walk += total;
@@ -308,7 +354,10 @@ pub fn tlsConnect(ip: [4]u8, port: u16, sni: []const u8) ?u8 {
         }
     }
 
-    if (!saw_server_finished or !saw_cert or !saw_cv) return null;
+    if (!saw_server_finished or !saw_cert or !saw_cv) {
+        debug.klog("[tls-conn] incomplete flight: fin={} cert={} cv={} records={d}\n", .{ saw_server_finished, saw_cert, saw_cv, record_count });
+        return null;
+    }
 
     // 8. Verify CertificateVerify.
     const leaf_der = cert_verify.extractLeafDer(cert_msg_buf[0..cert_msg_len]) catch return null;

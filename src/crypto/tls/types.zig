@@ -64,7 +64,10 @@ pub const NamedGroup = enum(u16) {
 /// but trivially supported via std.crypto.
 pub const SignatureScheme = enum(u16) {
     ecdsa_secp256r1_sha256 = 0x0403,
+    ecdsa_secp384r1_sha384 = 0x0503,
     rsa_pss_rsae_sha256 = 0x0804,
+    rsa_pss_rsae_sha384 = 0x0805,
+    rsa_pss_rsae_sha512 = 0x0806,
     rsa_pkcs1_sha256 = 0x0401,
     ed25519 = 0x0807,
     _,
