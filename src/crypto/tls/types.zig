@@ -49,9 +49,10 @@ pub const ExtensionType = enum(u16) {
     _,
 };
 
-/// Named group for ECDH key agreement. We offer x25519 only; ECDHE
-/// P-256 / secp384r1 etc. would each need their own keygen + scalarmult
-/// path.
+/// Named group for ECDH key agreement. We offer x25519 and secp256r1
+/// (NIST P-256) — see kex.zig for both keygen + scalarmult paths and
+/// messages.zig for the key_share wire encoding. secp384r1 etc. would each
+/// need their own entry here plus a curve in kex.zig.
 pub const NamedGroup = enum(u16) {
     secp256r1 = 0x0017,
     x25519 = 0x001d,

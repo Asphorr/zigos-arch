@@ -22,6 +22,7 @@ const record_mod = @import("record.zig");
 const x509 = @import("../x509.zig");
 const cert_verify = @import("cert_verify.zig");
 const trust_store = @import("trust_store.zig");
+const kex = @import("kex.zig");
 
 const X25519 = std.crypto.dh.X25519;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -128,6 +129,13 @@ pub fn run() void {
     };
     klogHex("our_pk", &our_pk);
 
+    // 1b) Ephemeral P-256 keypair — offered alongside x25519 so a
+    //     secp256r1-preferring server completes in one round trip.
+    const p256 = kex.genP256() orelse {
+        debug.klog("[tls] P-256 keygen failed: random source degraded\n", .{});
+        return;
+    };
+
     // 2) client_random — 32 bytes.
     var client_random: [32]u8 = undefined;
     _ = random.fillRandom(&client_random);
@@ -136,6 +144,7 @@ pub fn run() void {
     const hs_len = messages.buildClientHello(&hs_buf_static, .{
         .client_random = client_random,
         .x25519_pub = our_pk,
+        .p256_pub = p256.public,
         .server_name = TARGET_SNI,
     });
     if (hs_len == 0) {
@@ -203,7 +212,8 @@ pub fn run() void {
     };
     debug.klog("[tls] ServerHello: cipher=0x{x:0>4}\n", .{@intFromEnum(sh.cipher_suite)});
     klogHex("server_random", &sh.server_random);
-    klogHex("server_pk", &sh.server_x25519_pub);
+    debug.klog("[tls] key_share group=0x{x:0>4}\n", .{@intFromEnum(sh.kex_group)});
+    klogHex("server_pk", sh.kex_pub[0..sh.kex_pub_len]);
 
     // Pin the negotiated AEAD (ChaCha20-Poly1305 or AES-128-GCM); governs key
     // length + which primitive the record layer runs.
@@ -213,11 +223,21 @@ pub fn run() void {
     };
     const key_len = cipher.keyLen();
 
-    // 9) Derive shared secret. This is the X25519 ECDH result that
-    //    feeds the HKDF key schedule in step 3.
-    const shared = X25519.scalarmult(our_sk, sh.server_x25519_pub) catch {
-        debug.klog("[tls] X25519.scalarmult FAILED (server pubkey contributed weak point?)\n", .{});
-        return;
+    // 9) Derive shared secret via the ECDH for the group the server picked.
+    //    Either way it feeds the same HKDF key schedule in step 3.
+    const shared: [32]u8 = switch (sh.kex_group) {
+        .x25519 => X25519.scalarmult(our_sk, sh.kex_pub[0..32].*) catch {
+            debug.klog("[tls] X25519.scalarmult FAILED (server pubkey contributed weak point?)\n", .{});
+            return;
+        },
+        .secp256r1 => kex.p256Ecdh(p256.secret, sh.kex_pub[0..sh.kex_pub_len]) orelse {
+            debug.klog("[tls] P-256 ECDH FAILED (bad server point?)\n", .{});
+            return;
+        },
+        else => {
+            debug.klog("[tls] server chose unsupported group 0x{x:0>4}\n", .{@intFromEnum(sh.kex_group)});
+            return;
+        },
     };
     klogHex("shared_secret", &shared);
 

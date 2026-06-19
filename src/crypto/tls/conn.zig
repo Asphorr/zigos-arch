@@ -24,6 +24,7 @@ const record_mod = @import("record.zig");
 const x509 = @import("../x509.zig");
 const cert_verify = @import("cert_verify.zig");
 const trust_store = @import("trust_store.zig");
+const kex = @import("kex.zig");
 
 const X25519 = std.crypto.dh.X25519;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -161,17 +162,20 @@ pub fn tlsConnect(ip: [4]u8, port: u16, sni: []const u8) ?u8 {
     const slot = alloc() orelse return null;
     errdefer free(slot);
 
-    // 1. Ephemeral X25519 keypair + client_random.
-    var our_sk: [32]u8 = undefined;
-    if (!random.fillRandom(&our_sk)) return null;
-    const our_pk = X25519.recoverPublicKey(our_sk) catch return null;
+    // 1. Ephemeral key shares (x25519 + P-256) + client_random. We send a
+    //    share for both groups so the server picks either in one round trip.
+    var x25519_sk: [32]u8 = undefined;
+    if (!random.fillRandom(&x25519_sk)) return null;
+    const x25519_pk = X25519.recoverPublicKey(x25519_sk) catch return null;
+    const p256 = kex.genP256() orelse return null;
     var client_random: [32]u8 = undefined;
     _ = random.fillRandom(&client_random);
 
     // 2. Build ClientHello + record wrap.
     const hs_len = messages.buildClientHello(&hs_buf, .{
         .client_random = client_random,
-        .x25519_pub = our_pk,
+        .x25519_pub = x25519_pk,
+        .p256_pub = p256.public,
         .server_name = sni,
     });
     if (hs_len == 0) return null;
@@ -239,8 +243,16 @@ pub fn tlsConnect(ip: [4]u8, port: u16, sni: []const u8) ?u8 {
         if (cipher == .aes128_gcm) "AES-128-GCM" else "ChaCha20-Poly1305",
     });
 
-    // 6. Derive shared secret + handshake keys.
-    const shared = X25519.scalarmult(our_sk, sh.server_x25519_pub) catch return null;
+    // 6. Derive shared secret + handshake keys. Run the ECDH that matches
+    //    the group the server selected in its key_share.
+    const shared: [32]u8 = switch (sh.kex_group) {
+        .x25519 => X25519.scalarmult(x25519_sk, sh.kex_pub[0..32].*) catch return null,
+        .secp256r1 => kex.p256Ecdh(p256.secret, sh.kex_pub[0..sh.kex_pub_len]) orelse return null,
+        else => {
+            debug.klog("[tls-conn] server chose unsupported group 0x{x:0>4}\n", .{@intFromEnum(sh.kex_group)});
+            return null;
+        },
+    };
     var transcript = Sha256.init(.{});
     transcript.update(hs_buf[0..hs_len]);
     transcript.update(body_buf[0 .. 4 + sh_body_len]);

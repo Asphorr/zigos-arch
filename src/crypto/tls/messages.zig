@@ -129,6 +129,10 @@ pub const ClientHelloParams = struct {
     /// Server multiplies its private key by this to derive the shared
     /// secret; we do the same with the server's reply.
     x25519_pub: [32]u8,
+    /// Our ephemeral secp256r1 (P-256) public key, uncompressed SEC1
+    /// (0x04 || X || Y), 65 bytes. Sent as a second key_share entry so a
+    /// P-256-preferring server completes without a HelloRetryRequest.
+    p256_pub: [65]u8,
     /// SNI hostname. Sent in the server_name extension so virtual hosts
     /// can pick the right cert. Empty disables SNI (some servers will
     /// reject — github.com does).
@@ -139,7 +143,13 @@ pub const ClientHelloParams = struct {
 /// header — caller wraps it). Returns the number of bytes written, or
 /// 0 if buf was too small.
 pub fn buildClientHello(buf: []u8, p: ClientHelloParams) usize {
-    if (buf.len < 256) return 0; // crude safety net; real bound is ~150 bytes for our shape
+    // The write helpers below don't bounds-check, so refuse up front rather
+    // than smash `buf` if it's too small. Worst case for our shape is ~225
+    // bytes of fixed fields + extensions (incl. BOTH key_share entries:
+    // x25519 36B + secp256r1 69B) plus the SNI hostname. Tie the requirement
+    // to the actual input + a small margin instead of trusting the caller's
+    // buffer to be "big enough".
+    if (buf.len < 240 + p.server_name.len) return 0;
 
     var pos: usize = 0;
 
@@ -192,11 +202,14 @@ pub fn buildClientHello(buf: []u8, p: ClientHelloParams) usize {
     writeU8(buf, &pos, 2); // versions list_len in bytes
     writeU16(buf, &pos, types.PROTOCOL_TLS_1_3);
 
-    // -- supported_groups: [x25519] --
+    // -- supported_groups: [x25519, secp256r1] --
+    // x25519 listed first = our preference (faster, no point validation),
+    // but we send a key_share for both below so either choice is one round trip.
     writeU16(buf, &pos, @intFromEnum(types.ExtensionType.supported_groups));
-    writeU16(buf, &pos, 4);
-    writeU16(buf, &pos, 2);
+    writeU16(buf, &pos, 6); // ext_len: 1×u16 list_len + 2×u16 groups
+    writeU16(buf, &pos, 4); // groups list_len in bytes
     writeU16(buf, &pos, @intFromEnum(types.NamedGroup.x25519));
+    writeU16(buf, &pos, @intFromEnum(types.NamedGroup.secp256r1));
 
     // -- signature_algorithms --
     // Advertise EXACTLY the schemes cert_verify.verifyServer can actually
@@ -217,13 +230,21 @@ pub fn buildClientHello(buf: []u8, p: ClientHelloParams) usize {
     writeU16(buf, &pos, @intFromEnum(types.SignatureScheme.rsa_pss_rsae_sha512));
     writeU16(buf, &pos, @intFromEnum(types.SignatureScheme.rsa_pkcs1_sha256));
 
-    // -- key_share: [x25519: our_pub] --
+    // -- key_share: [x25519: 32B, secp256r1: 65B uncompressed] --
+    // Offer a share for both advertised groups so the server can pick either
+    // without costing us a HelloRetryRequest round trip (which we don't
+    // implement). Each KeyShareEntry = group(u16) + key_exchange<u16-len>.
+    //   x25519   entry = 2 + 2 + 32 = 36 bytes
+    //   secp256r1 entry = 2 + 2 + 65 = 69 bytes
     writeU16(buf, &pos, @intFromEnum(types.ExtensionType.key_share));
-    writeU16(buf, &pos, 38); // ext_len: 2 (list_len) + 2 (group) + 2 (kex_len) + 32 (key)
-    writeU16(buf, &pos, 36); // client_shares list_len
+    writeU16(buf, &pos, 107); // ext_len: 2 (list_len) + 36 + 69
+    writeU16(buf, &pos, 105); // client_shares list_len: 36 + 69
     writeU16(buf, &pos, @intFromEnum(types.NamedGroup.x25519));
     writeU16(buf, &pos, 32);
     writeBytes(buf, &pos, &p.x25519_pub);
+    writeU16(buf, &pos, @intFromEnum(types.NamedGroup.secp256r1));
+    writeU16(buf, &pos, 65);
+    writeBytes(buf, &pos, &p.p256_pub);
 
     // -- psk_key_exchange_modes: [psk_dhe_ke] --
     // RFC 8446 §4.2.9. We don't offer PSK identities, but advertising
@@ -259,9 +280,15 @@ pub fn buildClientHello(buf: []u8, p: ClientHelloParams) usize {
 pub const ServerHello = struct {
     server_random: [32]u8,
     cipher_suite: types.CipherSuite,
-    /// Server's ephemeral X25519 public key, extracted from key_share.
-    /// Combined with our private key via X25519.scalarmult → shared secret.
-    server_x25519_pub: [32]u8,
+    /// Which named group the server selected in its key_share — tells the
+    /// caller whether to run X25519 or P-256 ECDH against `kex_pub`.
+    kex_group: types.NamedGroup,
+    /// Server's ephemeral public key from key_share. For x25519 it's the
+    /// 32-byte raw point in `kex_pub[0..32]`; for secp256r1 it's the
+    /// 65-byte uncompressed SEC1 point (0x04 || X || Y) in `kex_pub[0..65]`.
+    /// `kex_pub_len` (32 or 65) says which is live.
+    kex_pub: [65]u8,
+    kex_pub_len: u8,
     /// Echoed legacy_session_id_echo. Captured for the transcript hash
     /// even though we don't use it for resumption.
     session_id_len: u8,
@@ -317,12 +344,24 @@ pub fn parseServerHello(data: []const u8) ParseError!ServerHello {
             },
             .key_share => {
                 // ServerHello.key_share is just one KeyShareEntry, not a list.
+                // The server echoes exactly one of the two groups we offered.
                 if (ext_data.len < 4) return ParseError.BadExtension;
                 const group: u16 = (@as(u16, ext_data[0]) << 8) | @as(u16, ext_data[1]);
-                if (group != @intFromEnum(types.NamedGroup.x25519)) return ParseError.UnsupportedGroup;
                 const key_len: u16 = (@as(u16, ext_data[2]) << 8) | @as(u16, ext_data[3]);
-                if (key_len != 32 or ext_data.len != 4 + 32) return ParseError.BadExtension;
-                @memcpy(&out.server_x25519_pub, ext_data[4..36]);
+                if (group == @intFromEnum(types.NamedGroup.x25519)) {
+                    if (key_len != 32 or ext_data.len != 4 + 32) return ParseError.BadExtension;
+                    out.kex_group = .x25519;
+                    @memcpy(out.kex_pub[0..32], ext_data[4..36]);
+                    out.kex_pub_len = 32;
+                } else if (group == @intFromEnum(types.NamedGroup.secp256r1)) {
+                    // Uncompressed SEC1 point: 0x04 || X(32) || Y(32) = 65 bytes.
+                    if (key_len != 65 or ext_data.len != 4 + 65) return ParseError.BadExtension;
+                    out.kex_group = .secp256r1;
+                    @memcpy(out.kex_pub[0..65], ext_data[4..69]);
+                    out.kex_pub_len = 65;
+                } else {
+                    return ParseError.UnsupportedGroup;
+                }
                 got_keyshare = true;
             },
             else => {}, // ignore unknown / unused extensions
