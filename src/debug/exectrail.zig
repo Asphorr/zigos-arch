@@ -25,12 +25,19 @@ const perf = @import("perf.zig");
 
 pub const TRAIL_ENTRIES: u8 = 128;
 
-/// Sentinel RIP values for synthetic "I entered XXX" markers. Anything
-/// >= MARKER_BASE is decoded as `(syscall N entry)` instead of resolved
-/// as a normal kernel RIP. Picked to be unmistakably-not-a-real-RIP
-/// (above the canonical user range, below the kernel high half).
+/// Sentinel RIP values for synthetic "I entered XXX" markers. Anything in
+/// [MARKER_BASE, MARKER_BAND_TOP) is decoded as `(syscall N entry)` instead of
+/// resolved as a normal kernel RIP. Picked to be unmistakably-not-a-real-RIP:
+/// in the non-canonical hole, above the canonical user range and BELOW the
+/// kernel high half.
 pub const MARKER_BASE: u64 = 0x0000_8000_0000_0000;
 pub const MARKER_SYSCALL_BIT: u64 = 0x0001_0000_0000_0000;
+/// Exclusive upper bound of the marker band = start of the canonical high
+/// half. Critical: real kernel RIPs (0xFFFF_8000_…) are ALSO >= MARKER_BASE,
+/// so a marker test that omits this bound misreads every kernel-mode IRQ0
+/// sample as a bogus "(syscall #<low16-of-RIP> entry)". Matches smi.zig's
+/// KERNEL_HIGH_HALF; smi.tick already bounds correctly — dump() did not.
+pub const MARKER_BAND_TOP: u64 = 0xFFFF_8000_0000_0000;
 
 const TrailEntry = struct {
     tsc: u64,
@@ -97,7 +104,7 @@ pub fn dump(cpu_id: u8, n: u8) void {
         const idx = (head + TRAIL_ENTRIES - 1 - i) % TRAIL_ENTRIES;
         const e = trails[cpu_id][idx];
         if (e.tsc == 0) continue; // never written
-        if (e.rip >= MARKER_BASE) {
+        if (e.rip >= MARKER_BASE and e.rip < MARKER_BAND_TOP) {
             const sys_num = e.rip & 0xFFFF;
             serial.print("  tsc={d} (syscall #{d} entry)\n", .{ e.tsc, sys_num });
         } else if (symbols.resolveKernel(e.rip)) |r| {

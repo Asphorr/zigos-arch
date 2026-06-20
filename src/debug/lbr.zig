@@ -55,6 +55,14 @@ pub const LbrSnap = struct {
 pub fn snapshot() LbrSnap {
     var snap: LbrSnap = std.mem.zeroes(LbrSnap);
     if (!enabled) return snap;
+    // Freeze recording BEFORE reading. Reading the 32 MSR pairs is a loop
+    // whose own backedge is a taken branch — left recording, that loop would
+    // overwrite the very ring we came to capture with ~31 copies of
+    // snapshot()'s own backedge, evicting the spin loop / frame corruptor.
+    // Clearing DEBUGCTL.LBR stops recording; the FROM/TO MSRs retain their
+    // frozen contents and stay readable. Every caller is on a terminal panic
+    // / halt path, so leaving recording off afterwards is harmless.
+    freezeRecording();
     snap.tos = readMsr(MSR_LBR_TOS);
     for (0..LBR_DEPTH) |i| {
         snap.from[i] = readMsr(MSR_LBR_FROM_0 + @as(u32, @intCast(i)));
@@ -63,15 +71,37 @@ pub fn snapshot() LbrSnap {
     return snap;
 }
 
+/// Stop LBR recording, preserving every other DEBUGCTL bit. Private —
+/// callers reach it via snapshot(), which freezes so its own read loop can't
+/// pollute the ring. No-op if LBR was never enabled.
+fn freezeRecording() void {
+    if (!enabled) return;
+    var debugctl = readMsr(MSR_DEBUGCTL);
+    debugctl &= ~DEBUGCTL_LBR_BIT;
+    writeMsr(MSR_DEBUGCTL, debugctl);
+}
+
 /// Print the ring most-recent-first. `tos` is the index of the most
 /// recently retired branch; we walk backwards modulo LBR_DEPTH.
 pub fn dump(snap: *const LbrSnap) void {
+    dumpImpl(snap, false);
+}
+
+/// Lock-free variant for NMI / panic-handler context. Uses
+/// serial.emergencyPrint so it can't deadlock on a CPU that may hold
+/// serial's write_lock — e.g. a wedged CPU caught by the watchdog NMI,
+/// dumping its own LBR from inside nmiSnapshot before it halts.
+pub fn emergencyDump(snap: *const LbrSnap) void {
+    dumpImpl(snap, true);
+}
+
+fn dumpImpl(snap: *const LbrSnap, comptime emergency: bool) void {
     if (!enabled) {
-        serial.print("[lbr] dump skipped — never enabled\n", .{});
+        emit(emergency, "[lbr] dump skipped — never enabled\n", .{});
         return;
     }
-    serial.print("\n[lbr] last {d} branches (most recent first):\n", .{LBR_DEPTH});
-    serial.print("  tos={d}\n", .{snap.tos});
+    emit(emergency, "\n[lbr] last {d} branches (most recent first):\n", .{LBR_DEPTH});
+    emit(emergency, "  tos={d}\n", .{snap.tos});
     var i: isize = @intCast(snap.tos);
     var n: usize = 0;
     while (n < LBR_DEPTH) : (n += 1) {
@@ -82,13 +112,19 @@ pub fn dump(snap: *const LbrSnap) void {
             i -= 1;
             continue;
         }
-        serial.print("  [{d:>2}] ", .{n});
-        printSym(from);
-        serial.print(" -> ", .{});
-        printSym(to);
-        serial.print("\n", .{});
+        emit(emergency, "  [{d:>2}] ", .{n});
+        printSym(from, emergency);
+        emit(emergency, " -> ", .{});
+        printSym(to, emergency);
+        emit(emergency, "\n", .{});
         i -= 1;
     }
+}
+
+/// Route a formatted line through the normal locked logger or the lock-free
+/// emergency path, chosen at comptime so there is no per-call branch cost.
+inline fn emit(comptime emergency: bool, comptime fmt: []const u8, args: anytype) void {
+    if (emergency) serial.emergencyPrint(fmt, args) else serial.print(fmt, args);
 }
 
 inline fn cleanAddr(raw: u64) u64 {
@@ -98,11 +134,11 @@ inline fn cleanAddr(raw: u64) u64 {
     return raw & 0x0000FFFFFFFFFFFF;
 }
 
-fn printSym(addr: u64) void {
+fn printSym(addr: u64, comptime emergency: bool) void {
     if (symbols.resolveKernel(addr)) |r| {
-        serial.print("{s}+0x{X}", .{ r.name, r.offset });
+        emit(emergency, "{s}+0x{X}", .{ r.name, r.offset });
     } else {
-        serial.print("0x{X:0>16}", .{addr});
+        emit(emergency, "0x{X:0>16}", .{addr});
     }
 }
 

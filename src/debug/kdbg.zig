@@ -993,6 +993,31 @@ const MAX_CPUS_NMI = @import("../cpu/smp.zig").MAX_CPUS;
 var nmi_ack: [MAX_CPUS_NMI]bool = [_]bool{false} ** MAX_CPUS_NMI;
 
 pub fn nmiSnapshot(rsp: u64, saved_rip: u64, saved_cs: u64) void {
+    // Profiling fast-path — if the watchdog is RIP-sampling this CPU (see
+    // profileWedgedCpu), record the interrupted RIP and IRET immediately,
+    // ahead of and lighter than the LBR/snapshot work below, so the sampled
+    // CPU returns to its wedged state fast and can be re-sampled.
+    if (@atomicLoad(bool, &prof_active, .acquire)) {
+        const apic_p = @import("../time/apic.zig");
+        if (@as(u32, @intCast(apic_p.getLapicId())) == prof_target_lapic) {
+            profileRecord(saved_rip);
+            return;
+        }
+    }
+
+    // FIRST action — capture THIS cpu's Last Branch Records before any of the
+    // prints below add taken branches that would evict the ring's real
+    // content. We run ON the (possibly wedged) CPU here, the only context
+    // where these MSRs are this CPU's, so the last 32 branches it took pin the
+    // exact loop the single leaf RIP can't: a tight cli-spin fills the whole
+    // ring with one repeated from->to. snapshot() freezes recording first so
+    // its own read loop can't self-pollute. Halt path only (wedge / panic
+    // autopsy); benign diagnostic NMIs IRET back and must keep recording.
+    const lbr = @import("lbr.zig");
+    const want_lbr = nmi_halt_after_snapshot;
+    var lbr_snap: lbr.LbrSnap = undefined;
+    if (want_lbr) lbr_snap = lbr.snapshot();
+
     // Do NOT enter the panic critical section here — the caller of
     // broadcastNMI() likely holds it, and we'd deadlock waiting forever.
     // Each NMI snapshot is short so even interleaved output stays
@@ -1035,6 +1060,15 @@ pub fn nmiSnapshot(rsp: u64, saved_rip: u64, saved_cs: u64) void {
         }
     } else {
         serial.emergencyPrint("\n[nmi-snap cpu{d}] current_pid=null (no task on this CPU)\n", .{cpu_id});
+    }
+
+    // Dump the LBR we captured at entry (lock-free; won't deadlock on a held
+    // serial lock). Before publishing the ack so the broadcaster waits for it
+    // to finish — keeps these lines from interleaving with the crash summary
+    // it prints next.
+    if (want_lbr) {
+        serial.emergencyPrint("[nmi-snap cpu{d}] LBR — last branches on this CPU (tight cli-spin = same from->to repeated):\n", .{cpu_id});
+        lbr.emergencyDump(&lbr_snap);
     }
 
     // Publish completion so broadcastNMI's ack-wait can return as soon as
@@ -1099,6 +1133,158 @@ pub fn broadcastNMI() void {
     // the caller halts — otherwise the last ~16 bytes sit in QEMU's FIFO and
     // are lost from serial.log at the exact moment they matter most.
     serial.drainFifo();
+}
+
+// === NMI-sampled wedge profiler ("poor-man's LBR") =========================
+//
+// LBR is masked under nested Hyper-V — the L0 won't expose a vPMU/LBR stack to
+// a guest that itself runs nested guests (ExposeVirtualizationExtensions +
+// Perfmon is rejected at partition-create, 0xC0350005). To still pin a
+// cli-wedged CPU's spin loop, the watchdog RIP-samples the stuck CPU via
+// repeated NMIs: an NMI is delivered even with IF=0, so each one catches the
+// spinning RIP. Aggregating ~32 samples gives a histogram that clusters in the
+// loop body — function+offset, not the exact backedge, but enough to NAME the
+// loop. Hypervisor-independent (needs only NMI), and complements LBR where LBR
+// exists (bare metal): there you get both the histogram and the real backedge.
+
+const PROFILE_SLOTS = 48;
+var prof_active: bool = false;
+var prof_target_lapic: u32 = 0xFFFF_FFFF;
+var prof_rip: [PROFILE_SLOTS]u64 = [_]u64{0} ** PROFILE_SLOTS;
+var prof_cnt: [PROFILE_SLOTS]u32 = [_]u32{0} ** PROFILE_SLOTS;
+var prof_used: u32 = 0;
+var prof_total: u32 = 0;
+var prof_overflow: u32 = 0;
+var prof_sample_ack: u32 = 0;
+
+/// Record one RIP sample. Runs ON the sampled CPU inside its NMI handler. Only
+/// the sampled CPU writes the histogram; the watcher reads it only after
+/// clearing prof_active, and the release ack store below provides the
+/// happens-before for those reads.
+fn profileRecord(saved_rip: u64) void {
+    var i: u32 = 0;
+    while (i < prof_used) : (i += 1) {
+        if (prof_rip[i] == saved_rip) {
+            prof_cnt[i] += 1;
+            prof_total += 1;
+            _ = @atomicRmw(u32, &prof_sample_ack, .Add, 1, .release);
+            return;
+        }
+    }
+    if (prof_used < PROFILE_SLOTS) {
+        prof_rip[prof_used] = saved_rip;
+        prof_cnt[prof_used] = 1;
+        prof_used += 1;
+        prof_total += 1;
+    } else {
+        prof_overflow += 1;
+    }
+    _ = @atomicRmw(u32, &prof_sample_ack, .Add, 1, .release);
+}
+
+/// Sample `target_lapic`'s RIP `n` times via NMI and print a histogram of
+/// where it's stuck. Runs on the WATCHER CPU (not the target). The caller must
+/// NOT have set nmi_halt_after_snapshot — the target IRETs back after each
+/// sample so it can be sampled again. NMI reaches a CPU even with IF=0, so this
+/// catches a cli-spin the IRQ0-sampled exec-trail (frozen during the wedge)
+/// cannot. Bounded: each sample waits a hard cap for the target's ack, so an
+/// already-halted / host-paused target can't hang the autopsy.
+pub fn profileWedgedCpu(target_lapic: u32, n: u32) void {
+    const apic = @import("../time/apic.zig");
+
+    // Reset histogram. Plain stores are safe ONLY because the caller
+    // guarantees no prior round's sample NMI is still in flight — watchdog
+    // fire() is single-fire CAS-gated (watchdog.zig), so rounds never overlap.
+    // A second call site without that guarantee would need this fenced.
+    prof_used = 0;
+    prof_total = 0;
+    prof_overflow = 0;
+    prof_target_lapic = target_lapic;
+    @atomicStore(u32, &prof_sample_ack, 0, .release);
+    @atomicStore(bool, &prof_active, true, .release);
+
+    serial.emergencyPrint("[wedge-prof] RIP-sampling cpu(lapic={d}) x{d} via NMI (poor-man's LBR; real LBR masked under nested virt)...\n", .{ target_lapic, n });
+
+    var s: u32 = 0;
+    while (s < n) : (s += 1) {
+        const want = @atomicLoad(u32, &prof_sample_ack, .acquire) + 1;
+        apic.sendNMI(target_lapic);
+        // Wait (bounded) for the target to record this sample. If it never
+        // takes the NMI (already halted, or a host-pause false positive), give
+        // up this sample and move on.
+        var spins: u32 = 0;
+        while (@atomicLoad(u32, &prof_sample_ack, .acquire) < want) {
+            spins += 1;
+            if (spins > 5_000_000) break;
+            asm volatile ("pause");
+        }
+        // Brief settle so a multi-instruction loop advances between samples —
+        // a tight 2-insn spin stays put (still pins the loop); a longer loop
+        // spreads across its body so the histogram shows the loop's extent.
+        var d: u32 = 0;
+        while (d < 4000) : (d += 1) asm volatile ("pause");
+    }
+
+    @atomicStore(bool, &prof_active, false, .release);
+    // Best-effort: give a last in-flight NMI time to observe prof_active=false
+    // (or finish its in-progress profileRecord) before we read the histogram.
+    // NOT a hard fence — a late sample can still land here, but it only adds
+    // diagnostic noise (one extra count / one slot), never corruption: every
+    // write targets a fixed BSS array under the prof_used<PROFILE_SLOTS bound.
+    var settle: u32 = 0;
+    while (settle < 100_000) : (settle += 1) asm volatile ("pause");
+
+    dumpProfile(target_lapic);
+}
+
+fn dumpProfile(target_lapic: u32) void {
+    serial.emergencyPrint("[wedge-prof] cpu(lapic={d}) RIP histogram: {d} samples, {d} distinct{s}\n", .{
+        target_lapic, prof_total, prof_used,
+        if (prof_overflow > 0) " (+overflow: >48 distinct RIPs — NOT a tight loop)" else "",
+    });
+    if (prof_used == 0) {
+        serial.emergencyPrint("  (no samples — target never took an NMI: already halted, or a host-pause)\n", .{});
+        return;
+    }
+    // Selection sort slot indices by count descending (prof_used <= 48).
+    var order: [PROFILE_SLOTS]u32 = undefined;
+    var i: u32 = 0;
+    while (i < prof_used) : (i += 1) order[i] = i;
+    var a: u32 = 0;
+    while (a < prof_used) : (a += 1) {
+        var max_i = a;
+        var b = a + 1;
+        while (b < prof_used) : (b += 1) {
+            if (prof_cnt[order[b]] > prof_cnt[order[max_i]]) max_i = b;
+        }
+        const t = order[a];
+        order[a] = order[max_i];
+        order[max_i] = t;
+    }
+    const denom: u32 = if (prof_total == 0) 1 else prof_total;
+    var shown: u32 = 0;
+    var k: u32 = 0;
+    while (k < prof_used) : (k += 1) {
+        const idx = order[k];
+        const rip = prof_rip[idx];
+        const cnt = prof_cnt[idx];
+        const pct = (cnt * 100) / denom;
+        serial.emergencyPrint("  {d:>3}x ({d:>2}%) ", .{ cnt, pct });
+        if (symbols.resolveKernel(rip)) |r| {
+            serial.emergencyPrint("{s}+0x{X} (0x{X:0>16})", .{ r.name, r.offset, rip });
+        } else if (symbols.resolveKernelNearest(rip)) |r| {
+            serial.emergencyPrint("(near {s}+0x{X}) (0x{X:0>16})", .{ r.name, r.offset, rip });
+        } else {
+            serial.emergencyPrint("0x{X:0>16}", .{rip});
+        }
+        if (k == 0) serial.emergencyPrint("  <-- HOT (spin pinned here)", .{});
+        serial.emergencyPrint("\n", .{});
+        shown += 1;
+        if (shown >= 16 and prof_used > 16) {
+            serial.emergencyPrint("  ...({d} more buckets)\n", .{prof_used - shown});
+            break;
+        }
+    }
 }
 
 /// Cross-CPU panic-section serialization. Without this, two CPUs panicing

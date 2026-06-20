@@ -171,6 +171,14 @@ fn nextAlivePeer(self: *smp.CpuLocal) ?*smp.CpuLocal {
 }
 
 fn fire(self: *smp.CpuLocal, peer: *smp.CpuLocal) void {
+    // Pin the wedge BEFORE halting peers: RIP-sample the stuck CPU via NMI (it
+    // IRETs back after each sample) to locate the spin loop. LBR would be ideal
+    // but it's masked under nested virt; this histogram is the substitute. MUST
+    // run before nmi_halt_after_snapshot is set below — once that's set, the
+    // first sample NMI would halt the target instead of returning it for
+    // re-sampling.
+    kdbg.profileWedgedCpu(@as(u32, peer.lapic_id), 32);
+
     // FIRST broadcast NMI with halt-after so peers stop running BEFORE we
     // print the autopsy. Otherwise the wedge log byte-interleaves with
     // whatever the peer was klog'ing (slow-sc, perf, etc.) and the
