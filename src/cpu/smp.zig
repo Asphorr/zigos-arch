@@ -1106,6 +1106,19 @@ fn initPerCpuAsm(cpu_id: u8) void {
     per_cpu_user_rsp[cpu_id] = 0;
 }
 
+/// Dedicated per-CPU NMI stack (TSS IST2, wired to vector 2 in idt.init). NMI
+/// is non-maskable and can fire while RSP is invalid — most dangerously in the
+/// SYSCALL-entry window, where `syscall` has set CPL=0 but the kernel hasn't
+/// switched RSP off the USER stack yet (entry.zig). With IST=0 the CPU pushes
+/// the NMI frame onto that user RSP; the user stack grows down lazily, so the
+/// page below is typically unmapped → #PF → #DF. A dedicated IST makes NMI
+/// delivery independent of the interrupted RSP. Kept OUT of CpuLocal (whose
+/// layout is cache-line-sensitive — tss.rsp0 must not straddle a line) as its
+/// own BSS array. Separate from IST1 (#DF) + the isr_stack dyn-IRQ trampoline
+/// to avoid frame clobber; safe because nmiSnapshot never resumes-via-switchTo.
+/// 8 KiB is ample: nmiSnapshot's deepest local is the ~520 B LbrSnap.
+var nmi_stacks: [MAX_CPUS][8192]u8 align(16) = [_][8192]u8{[_]u8{0} ** 8192} ** MAX_CPUS;
+
 fn initPerCpuGdt(cpu: *CpuLocal) void {
     // Copy standard segment entries from BSP
     const bsp_entries = gdt.getEntries();
@@ -1131,6 +1144,13 @@ fn initPerCpuGdt(cpu: *CpuLocal) void {
     // uses in software; aliasing is safe because the #DF path is terminal
     // and never resumes what it interrupted.
     cpu.tss.ist1 = @intFromPtr(&cpu.isr_stack) + cpu.isr_stack.len;
+    // IST2 = dedicated per-CPU NMI stack (vector 2 → ist=2 in idt.init). Lets a
+    // non-maskable interrupt that lands while RSP is the user stack (the
+    // syscall-entry window, CPL=0 pre stack-switch) push its frame onto a
+    // known-good stack instead of an unmapped user page → no #DF. See nmi_stacks.
+    if (cpu.cpu_id < MAX_CPUS) {
+        cpu.tss.ist2 = @intFromPtr(&nmi_stacks[cpu.cpu_id]) + nmi_stacks[cpu.cpu_id].len;
+    }
 
     // Build TSS descriptor pointing to our TSS
     const tss_base: u64 = @intFromPtr(&cpu.tss);

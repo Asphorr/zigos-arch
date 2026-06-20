@@ -176,8 +176,17 @@ pub fn init() void {
     // below) does not apply: the #DF path is terminal — ring-0 dump + halt,
     // or destroyCurrent of a doomed task — and never resumes the interrupted
     // context from the IST stack.
+    // #DF(8)→IST1 (above). NMI(2)→IST2, a dedicated per-CPU stack: NMI is
+    // non-maskable and can fire while RSP is the USER stack — the syscall-entry
+    // window, where `syscall` has set CPL=0 but the kernel hasn't switched RSP
+    // off the user stack yet (entry.zig). With IST=0 the CPU pushes the NMI
+    // frame onto that user RSP, and since the user stack grows down lazily the
+    // page below it is typically unmapped → #PF → #DF. (Hit 2026-06-20 when the
+    // watchdog's NMI wedge-profiler bursted NMIs at a CPU mid-syscall.) A
+    // dedicated IST makes NMI delivery independent of the interrupted RSP. The
+    // IST-vs-switchTo hazard doesn't apply — nmiSnapshot never reschedules.
     inline for (exception.exceptions) |exc| {
-        const ist: u3 = if (exc.num == 8) 1 else 0;
+        const ist: u3 = if (exc.num == 8) 1 else if (exc.num == 2) 2 else 0;
         setGateIst(exc.num, @intFromPtr(&exception.ExcStub(exc).handler), 0x8E, ist);
     }
 
