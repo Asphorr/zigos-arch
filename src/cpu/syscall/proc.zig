@@ -63,11 +63,9 @@ pub fn sysYield() u32 {
     // handleIRQ0 funnels into schedule() which can dispatch a different
     // process. See process.zig State enum / switchTo asm for why we don't
     // pre-set state=.ready here.
-    const t_pause = perf.rdtsc();
+    // softYield self-accounts the descheduled span into perf_gap_cyc.
     smp.myCpu().pending_soft_yield = true;
     sched_asm.softYield();
-    const t_resume = perf.rdtsc();
-    if (process.currentPCB()) |pcb| pcb.perf_gap_cyc +%= t_resume -% t_pause;
     return 0;
 }
 
@@ -342,11 +340,9 @@ pub fn sysSleep(ms: u32) u32 {
     // Force the scheduler to actually deschedule us. Same alignment dance as
     // sys#07 — see comments there. wakeExpired() flips us back to .ready once
     // tick_count >= wake_tick.
-    const t_pause = perf.rdtsc();
+    // softYield self-accounts the descheduled span into perf_gap_cyc.
     smp.myCpu().pending_soft_yield = true;
     sched_asm.softYield();
-    const t_resume = perf.rdtsc();
-    if (process.currentPCB()) |p| p.perf_gap_cyc +%= t_resume -% t_pause;
     return 0;
 }
 
@@ -681,7 +677,7 @@ pub fn sysGetNice(target_pid: u32) u32 {
 /// Returns 0xFFFFFFFF if there is no such child (or the target isn't ours).
 pub fn sysWaitpid(target_pid: u32, status_ptr: u32) u32 {
     if (status_ptr != 0 and !validateUserPtrWrite(status_ptr, 4)) return E_INVAL;
-    const me_pcb = process.currentPCB() orelse return E_FAULT;
+    _ = process.currentPCB() orelse return E_FAULT; // guard: must have a current task
     const me: u8 = @intCast(process.getCurrentPid());
 
     // Validate target — if a specific pid was named, it must be a child of us
@@ -726,10 +722,8 @@ pub fn sysWaitpid(target_pid: u32, status_ptr: u32) u32 {
         // on entry or arriving while parked — and we propagate -EINTR so the
         // handler delivery path on syscall-return doesn't fight a syscall
         // that would otherwise re-park immediately.
-        const t_pause = perf.rdtsc();
+        // blockOnInterruptible → softYield self-accounts the descheduled span.
         const br = process.blockOnInterruptible(.waitpid, target_pid);
-        const t_resume = perf.rdtsc();
-        me_pcb.perf_gap_cyc +%= t_resume -% t_pause;
         if (br == .signalled) return E_INTR;
     }
 }
@@ -848,11 +842,9 @@ pub fn sysSigsuspend(mask_ptr: u32) u32 {
             process.setState(cur_pid, .running);
             break;
         }
-        const t_pause = perf.rdtsc();
+        // softYield self-accounts the descheduled span into perf_gap_cyc.
         smp.myCpu().pending_soft_yield = true;
         sched_asm.softYield();
-        const t_resume = perf.rdtsc();
-        pcb.perf_gap_cyc +%= t_resume -% t_pause;
     }
     // Don't leave the "forever" deadline behind on the now-running PCB.
     @atomicStore(u64, &pcb.wake_tick, 0, .release);
@@ -874,11 +866,9 @@ pub fn sysPause() u32 {
             process.setState(cur_pid, .running);
             break;
         }
-        const t_pause = perf.rdtsc();
+        // softYield self-accounts the descheduled span into perf_gap_cyc.
         smp.myCpu().pending_soft_yield = true;
         sched_asm.softYield();
-        const t_resume = perf.rdtsc();
-        pcb.perf_gap_cyc +%= t_resume -% t_pause;
     }
     @atomicStore(u64, &pcb.wake_tick, 0, .release);
     return E_INVAL;
@@ -1144,11 +1134,9 @@ pub fn sysUsleep(usec: u32) u32 {
         @atomicStore(u64, &pcb.hires_wake_tsc, deadline, .release);
         sched.registerHiresWake(deadline);
         process.setState(cur_pid, .sleeping);
-        const t_pause = perf.rdtsc();
+        // softYield self-accounts the descheduled span into perf_gap_cyc.
         smp.myCpu().pending_soft_yield = true;
         sched_asm.softYield();
-        const t_resume = perf.rdtsc();
-        if (process.currentPCB()) |p| p.perf_gap_cyc +%= t_resume -% t_pause;
     }
     // Leave no stale deadline behind (broke out on signal, or woken early).
     @atomicStore(u64, &pcb.hires_wake_tsc, 0, .release);

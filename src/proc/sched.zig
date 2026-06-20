@@ -2425,7 +2425,7 @@ pub fn blockOnFutex(target: u32, word: *const volatile u32, val: u32) FutexResul
     }
 
     smp.myCpu().pending_soft_yield = true;
-    @import("sched_asm.zig").softYield();
+    @import("sched_asm.zig").softYield(); // self-accounts the descheduled span
     clearWait(pcb);
     if (hasPendingDeliverable(pcb)) return .signalled;
     return .woke;

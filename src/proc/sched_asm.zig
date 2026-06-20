@@ -133,7 +133,27 @@ pub inline fn switchToCall(prev_save: ?*u64, next_kesp: u64) void {
 ///     this from a real hardware timer firing.
 ///   - Set any wait_kind / wait_target / wake_tick the caller depends on
 ///     for the wake-back-up signal.
+/// NOTE: `softYield` is the CENTRAL descheduled-time accounting point. The
+/// caller is descheduled across this call, so we bracket the raw yield with
+/// rdtsc and add the span to the current task's `perf_gap_cyc` — that's how a
+/// syscall's CPU-time excludes block/yield waits. EVERY voluntary yield/block
+/// funnels through here, so this one spot covers them all. History: blocking
+/// syscalls used to bracket their own yields and ~10 of 16 sites forgot, so a
+/// normal multi-ms block read as on-CPU time → tripped [slow-sc] → the logging
+/// cli-held serial.write long enough to starve a CPU's timer IRQ → watchdog
+/// wedge (schedstress "serial-choke", 2026-06-20). Centralizing makes the
+/// omission impossible. Preemption is a hardware IRQ0, not softYield, so this
+/// counts exactly the voluntary-yield gaps the old per-site brackets did.
 pub fn softYield() void {
+    const perf = @import("../debug/perf.zig");
+    const process = @import("../proc/process.zig");
+    const t0 = perf.rdtsc();
+    softYieldRaw();
+    const t1 = perf.rdtsc();
+    if (process.currentPCB()) |p| p.perf_gap_cyc +%= t1 -% t0;
+}
+
+fn softYieldRaw() void {
     asm volatile (
         \\ movq %%rsp, %%rax
         \\ andq $-16, %%rsp
