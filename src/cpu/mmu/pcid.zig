@@ -243,6 +243,29 @@ pub fn bumpAfterShootdown(pcid: u16, cpu_id: u8) void {
     }
 }
 
+/// Force EVERY CPU (including the caller's) to drop any cached (pcid, *) TLB
+/// entries before its next use of `pcid`, via the reliable CR3-reload flush:
+/// the next `loadCr3(pcid)` sees the gen mismatch and writes CR3 with bit
+/// 63 = 0 (a hardware non-global flush for the loaded PCID — NOT INVPCID,
+/// so it sidesteps the type-0/type-1 under-invalidation observed under
+/// nested virt; see bumpAfterShootdown).
+///
+/// Called from sched.migrate when a task moves between CPUs. A task builds
+/// up (pcid, va) TLB entries on its old CPU; the COW / lazy-remap paths
+/// (handleCowFault, the present-no-USER → USER lazy fault-in) flush only
+/// LOCALLY — no shootdown, no gen bump — under the implicit "a single-
+/// threaded AS is only ever live on one CPU" assumption. Migration breaks
+/// that assumption: the destination CPU's preserve-on-reload could otherwise
+/// resurrect a stale (pcid, va) entry, and the source CPU keeps its own
+/// stale entries until it next runs a different PCID. One global_gen bump
+/// closes both: unlike bumpAfterShootdown it updates NO local_gen, so the
+/// migrating (destination) CPU itself also flushes on the imminent dispatch.
+/// Bumps between successive migrations collapse to one flush per reload.
+pub fn invalidateForMigration(pcid: u16) void {
+    if (!protect.pcid_supported or pcid == 0 or pcid >= MAX_PCID) return;
+    _ = global_gen[pcid].fetchAdd(1, .acq_rel);
+}
+
 // ---------------------------------------------------------------------------
 // INVPCID — selective TLB invalidation
 // ---------------------------------------------------------------------------

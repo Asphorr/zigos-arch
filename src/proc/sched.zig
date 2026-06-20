@@ -350,6 +350,18 @@ pub fn migrate(pid: u8, new_cpu: u8) bool {
     _ = @atomicRmw(u64, &smp.cpus[new_cpu].migrations_in, .Add, 1, .monotonic);
 
     pcb.assigned_cpu = new_cpu;
+
+    // TLB coherence across the move. migrate() does no per-page flush; it
+    // relies on loadCr3's preserve-on-reload being safe. That holds only if
+    // every present→change remap of this AS bumped the PCID generation — but
+    // the COW and lazy-remap fault paths flush LOCAL-only (no shootdown, no
+    // bump) on the assumption a single-threaded AS lives on one CPU. Moving it
+    // violates that, so force a gen bump here: the next loadCr3(pcid) on the
+    // destination (and on the source, when it next runs this AS) does a real
+    // CR3-reload flush, dropping any stale (pcid, va) entry. Done under both rq
+    // locks so it's ordered before the destination's pickNext observes the
+    // task in new_rq. Cheap: one atomic increment; one flush per reload.
+    pcid_mod.invalidateForMigration(pcb.pcid);
     return true;
 }
 
@@ -463,37 +475,83 @@ pub fn loadBalance() void {
     if (busiest_cpu == idlest_cpu) return;
     if (busiest_load < idlest_load + BALANCE_THRESHOLD) return;
 
-    // Pick a migration candidate: lowest-priority queue, tail-end.
-    const busy_rq = &smp.cpus[busiest_cpu].runqueue;
-    var pick: ?u8 = null;
-    {
-        const f = busy_rq.lock.acquireIrqSave();
-        defer busy_rq.lock.releaseIrqRestore(f);
-        const queues = [_]*const runqueue.PriQueue{
-            &busy_rq.background, &busy_rq.normal, &busy_rq.interactive,
-        };
-        outer: for (queues) |q| {
-            if (q.count == 0) continue;
-            var idx: i32 = @as(i32, @intCast(q.count)) - 1;
-            while (idx >= 0) : (idx -= 1) {
-                const candidate = q.pids[@intCast(idx)];
-                if (candidate >= MAX_PROCS) continue;
-                const pcb = &process.procs[candidate];
-                if (pcb.is_idle) continue;
-                if (pcb.pinned_cpu != 0xFF) continue;
-                // Job-control-stopped: pickNext won't run it on the idlest CPU
-                // either, so migrating it is pure churn (and keeps it counted as
-                // movable load). Skip.
-                if (@atomicLoad(bool, &pcb.job_stopped, .acquire)) continue;
-                pick = candidate;
-                break :outer;
-            }
-        }
-    }
-
-    if (pick) |p| {
+    // Pick a migration candidate from the busiest CPU and move it to the
+    // idlest. pickMigrationCandidate takes the source rq.lock for the scan;
+    // migrate() re-validates the pick under both rq locks.
+    if (pickMigrationCandidate(busiest_cpu)) |p| {
         _ = migrate(p, idlest_cpu);
     }
+}
+
+/// Pick a migratable task from `cpu_idx`'s runqueue: lowest-priority band first
+/// (least disruption to interactive/normal work), tail-end within the band
+/// (least recently dispatched, coldest in cache). Skips idle, pinned, and
+/// job-control-stopped pids. Takes the target rq.lock for the scan; the
+/// returned pid is re-validated under both rq locks by migrate(), so a race
+/// between this scan and the move is benign (migrate() just returns false).
+/// Shared by loadBalance (periodic push) and tryStealWork (pull-on-idle).
+fn pickMigrationCandidate(cpu_idx: u8) ?u8 {
+    const rq = &smp.cpus[cpu_idx].runqueue;
+    const f = rq.lock.acquireIrqSave();
+    defer rq.lock.releaseIrqRestore(f);
+    const queues = [_]*const runqueue.PriQueue{
+        &rq.background, &rq.normal, &rq.interactive,
+    };
+    for (queues) |q| {
+        if (q.count == 0) continue;
+        var idx: i32 = @as(i32, @intCast(q.count)) - 1;
+        while (idx >= 0) : (idx -= 1) {
+            const candidate = q.pids[@intCast(idx)];
+            if (candidate >= MAX_PROCS) continue;
+            const pcb = &process.procs[candidate];
+            if (pcb.is_idle) continue;
+            if (pcb.pinned_cpu != 0xFF) continue;
+            if (@atomicLoad(bool, &pcb.job_stopped, .acquire)) continue;
+            return candidate;
+        }
+    }
+    return null;
+}
+
+/// Pull-on-idle work stealing. Called from kernelIdle (lock-clean) when a CPU
+/// has drained its runqueue and is about to sleep. If a peer is backed up, move
+/// one of its queued tasks to THIS CPU and return true so the caller dispatches
+/// it now — instead of sleeping while a peer churns through a backlog and we
+/// wait up to a full BALANCE_INTERVAL_TICKS (~50 ticks) for the BSP's periodic,
+/// one-task-at-a-time push. Reuses migrate()'s two-rq-lock atomicity and its
+/// current_pid stale-`kernel_esp` guard, so a task another CPU is mid-dispatch
+/// is never stolen. Returns false (→ caller sleeps as before) when we already
+/// have local work, no peer has a surplus, or the chosen task slips away.
+pub fn tryStealWork() bool {
+    const self_cpu = smp.myCpu().cpu_id;
+    if (self_cpu >= smp.MAX_CPUS) return false;
+    // Only steal when genuinely idle: never pull a peer's task ahead of our own
+    // runnable work. (A task can become .ready on us between schedule() picking
+    // idle and this check; if so, fall through — the normal path runs it.)
+    if (effectiveLoad(self_cpu) != 0) return false;
+
+    // Find the busiest peer.
+    var busiest_cpu: u8 = 0xFF;
+    var busiest_load: u16 = 0;
+    var i: u8 = 0;
+    while (i < smp.MAX_CPUS) : (i += 1) {
+        if (i == self_cpu) continue;
+        if (!smp.cpus[i].alive) continue;
+        const load = effectiveLoad(i);
+        if (load > busiest_load) {
+            busiest_load = load;
+            busiest_cpu = i;
+        }
+    }
+    if (busiest_cpu == 0xFF) return false;
+    // Only steal a genuine surplus. effectiveLoad counts the running task, so
+    // load >= BALANCE_THRESHOLD (2) means >= 1 task is queued behind it: we take
+    // a queued one and leave the peer its current task. Same threshold the
+    // periodic balancer uses, so the two can't fight over the last task.
+    if (busiest_load < BALANCE_THRESHOLD) return false;
+
+    const pick = pickMigrationCandidate(busiest_cpu) orelse return false;
+    return migrate(pick, self_cpu);
 }
 
 /// Map a `Priority` enum value to the matching PriQueue inside an Rq.

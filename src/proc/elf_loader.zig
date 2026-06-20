@@ -9,6 +9,7 @@ const paging = @import("../mm/paging.zig");
 const symbols = @import("../debug/symbols.zig");
 const memmap = @import("../mm/memmap.zig");
 const config = @import("../config.zig");
+const elf_rc = @import("elf_rc.zig");
 
 /// Optional launch descriptor handed to loadAndStart so it can set the new
 /// process's name + real argv BEFORE building a Linux binary's SysV initial
@@ -562,6 +563,11 @@ pub fn loadAndStart(elf_buf: [*]align(4) u8, file_size: usize, elf_buf_pages: u3
         freePmmRange(@intFromPtr(elf_buf), elf_buf_pages);
         pcb.elf_buf = null;
         pcb.elf_buf_pages = 0;
+    } else {
+        // Buffer is kept to source lazy PT_LOAD pages — give it a shared
+        // refcount so a later fork() can hand it to the child without the
+        // pages dangling when one of them exits first (see elf_rc.zig).
+        pcb.elf_buf_rc = elf_rc.create();
     }
 
     // Init complete — transition .loading → .ready. Until this store, an AP
@@ -668,6 +674,9 @@ pub fn loadAndExecute(elf_buf: [*]align(4) u8, file_size: usize, elf_buf_pages: 
         freePmmRange(@intFromPtr(elf_buf), elf_buf_pages);
         pcb.elf_buf = null;
         pcb.elf_buf_pages = 0;
+    } else {
+        // Kept buffer → shared refcount for fork inheritance (see elf_rc.zig).
+        pcb.elf_buf_rc = elf_rc.create();
     }
 
     // Init complete — flip .loading → .ready so an AP's pickNext can see it

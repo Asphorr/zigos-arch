@@ -44,6 +44,14 @@ const config = @import("../config.zig");
 const signals = @import("signals.zig");
 
 const process = @import("process.zig");
+const elf_rc = @import("elf_rc.zig");
+// Pull-on-idle work stealing: an idle CPU steals one queued task from the
+// busiest peer (via migrate()) instead of waiting up to a full load-balance
+// interval for the BSP's periodic push. The migrate() PCID gen-bump
+// (pcid.invalidateForMigration) makes the cross-CPU move TLB-safe. Confirmed
+// not to cause the schedstress cpu0 hang — that wedges with this off too
+// (a pre-existing scheduler livelock under a sysYield storm).
+const STEAL_ON_IDLE = true;
 const PCB = process.PCB;
 const State = process.State;
 const Priority = process.Priority;
@@ -367,18 +375,32 @@ pub fn forkCurrent(frame: *signals.SyscallFrame) ?usize {
             if (sid != shm.SHM_INVALID) _ = shm.acquire(sid);
         }
     }
-    // ELF buf is the parent's source-of-truth for demand paging; child shares
-    // a *reference* to it (lazy_regions point at parent's buf). Don't free
-    // it twice on exit — child sets its own elf_buf to null so destroyCurrent
-    // skips freeing on this PCB. Parent owns the lifetime; if parent exits
-    // first, the buffer outlives via ELF-page refcounts (each lazy fault-in
-    // copies bytes through the kernel buffer; once all child faults are
-    // resolved, the buffer is no longer needed). For correctness today we
-    // accept that child's lazy_regions[].source pointers may dangle if
-    // parent execs / exits before child finishes faulting in. Practical fix
-    // requires elf_buf refcounting — deferred.
-    process.procs[i].elf_buf = null;
-    process.procs[i].elf_buf_pages = 0;
+    // ELF buf is the parent's source-of-truth for demand paging; the child's
+    // copied lazy_regions[].source point straight into it (COW doesn't remap a
+    // kernel buffer). Share it under a refcount so it survives whichever of
+    // {parent, child} faults in its last PT_LOAD page — freeElfBuf drops a ref
+    // and frees the PMM pages only at zero. (This closes the prior UAF: the
+    // child used to null its own elf_buf and dangle if the parent exited first.)
+    if (parent_lead_src.elf_buf != null) {
+        if (parent_lead_src.elf_buf_rc) |rc| {
+            elf_rc.acquire(rc);
+            process.procs[i].elf_buf = parent_lead_src.elf_buf;
+            process.procs[i].elf_buf_pages = parent_lead_src.elf_buf_pages;
+            process.procs[i].elf_buf_rc = rc;
+        } else {
+            // Parent's buffer is un-refcounted (rc pool was exhausted at load):
+            // can't share it safely, so the child goes without — same as before.
+            // Its still-lazy ELF pages will fault as zero-fill; acceptable in the
+            // can't-happen-in-practice exhaustion corner (see elf_rc.zig).
+            process.procs[i].elf_buf = null;
+            process.procs[i].elf_buf_pages = 0;
+            process.procs[i].elf_buf_rc = null;
+        }
+    } else {
+        process.procs[i].elf_buf = null;
+        process.procs[i].elf_buf_pages = 0;
+        process.procs[i].elf_buf_rc = null;
+    }
 
     // FD table — copy entries verbatim, then bump pipe-side refcounts so the
     // parent closing its end doesn't drop the last reference while child
@@ -501,6 +523,18 @@ fn kernelIdle() callconv(.c) noreturn {
         // CAS pending->loading inside apProcessLoadQueue prevents two
         // idles from racing on the same request.
         smp.apProcessLoadQueue();
+        // Pull-on-idle work stealing. We're the idle task → this CPU has no
+        // local runnable work. If a peer is backed up, steal one of its queued
+        // tasks and dispatch it NOW instead of sleeping — work reaches a free
+        // core in µs rather than waiting up to a full load-balance interval
+        // (~50 ticks) for the BSP's periodic one-task push. Lock-clean here;
+        // tryStealWork goes through migrate() (two-rq-lock safe, current_pid
+        // guarded). On a steal, schedule() runs it; the loop re-checks for more
+        // before ever sleeping. No steal → fall through to the normal sleep.
+        if (STEAL_ON_IDLE and process.tryStealWork()) {
+            process.schedule();
+            continue;
+        }
         if (mwait.mwait_supported) {
             // sti + monitor + mwait. MWAIT(EAX=C1 hint, ECX[0]=1) wakes on
             // either a write to the monitored line or an interrupt — IRQs
@@ -801,6 +835,20 @@ fn claimTeardown(pid: usize, tgid: u8) bool {
     return true;
 }
 
+/// Rate-limit the per-teardown diagnostics. A thread-churn workload
+/// (schedstress spawns+reaps ~100 threads/s) makes the three klogs per
+/// teardown — `[proc] destroyed` + the `[pmm-diag]` pre/post pair — a ~280
+/// line/s flood of near-constant data. That doesn't wedge anymore (serial
+/// load-sheds), but the ksoftirqd drain of it (slow nested-virt `outb`
+/// VM-exits) still starves the compositor on cpu0 → "works but the UI is
+/// frozen" (2026-06-20). Throttle to a few per ~100ms; the per-pid lifecycle
+/// is still captured unconditionally in the kdbg autopsy ring
+/// (procEvent(.kill/.destroy) below), so no forensic signal is lost. The
+/// suppressed count is folded into the next emitted block as `hidden=N`.
+const TEARDOWN_DIAG_GAP_TICKS: u64 = 10; // ~100 ms at 10 ms/tick → ≤ ~10 blocks/s
+var teardown_diag_last_tick: u64 = 0; // (a) tick of the last emitted block
+var teardown_diag_suppressed: u32 = 0; // (a) teardowns hidden since then
+
 /// Common teardown for both external kill and self-destroy. Caller
 /// is responsible for the entry/exit dance unique to each:
 ///
@@ -813,17 +861,31 @@ fn claimTeardown(pid: usize, tgid: u8) bool {
 fn tearDownTask(pid: usize, status: u32, op: TerminateOp, persist_shared_dirty: bool) void {
     const my_tgid: u8 = process.procs[pid].tgid;
     const last_in_group = claimTeardown(pid, my_tgid);
-    debug.klog("[proc] {s} {d} {s} (status=0x{X})\n", .{
-        if (last_in_group) "Process" else "Thread",
-        pid,
-        if (op == .kill) "killed" else "destroyed",
-        status,
-    });
-    // PMM diagnostic: free frames immediately before this proc's pages
-    // get reclaimed. Pair with the [pmm-diag] line on the next sysExec
-    // to see whether teardown returned everything to PMM.
+    // Throttle the teardown diagnostics (see TEARDOWN_DIAG_GAP_TICKS). One
+    // decision gates the [proc] line + both [pmm-diag] lines below, so the
+    // pre/post pair stays consistent (both emit or both suppress). tick_count
+    // is BSP-advanced, so the gate always reopens — forward progress is
+    // guaranteed even under a churn storm.
+    const now_tick = process.tick_count;
+    const log_teardown = (now_tick -% @atomicLoad(u64, &teardown_diag_last_tick, .monotonic)) >= TEARDOWN_DIAG_GAP_TICKS;
     const pmm_diag = @import("../mm/pmm.zig");
-    debug.klog("[pmm-diag] pre-teardown free={d}/{d}\n", .{ pmm_diag.freeFrameCount(), pmm_diag.managedFrameCount() });
+    if (log_teardown) {
+        @atomicStore(u64, &teardown_diag_last_tick, now_tick, .monotonic);
+        const hidden = @atomicRmw(u32, &teardown_diag_suppressed, .Xchg, 0, .monotonic);
+        debug.klog("[proc] {s} {d} {s} (status=0x{X}) hidden={d}\n", .{
+            if (last_in_group) "Process" else "Thread",
+            pid,
+            if (op == .kill) "killed" else "destroyed",
+            status,
+            hidden,
+        });
+        // PMM diagnostic: free frames immediately before this proc's pages
+        // get reclaimed. Pair with the post-teardown [pmm-diag] line below to
+        // see whether teardown returned everything to PMM.
+        debug.klog("[pmm-diag] pre-teardown free={d}/{d}\n", .{ pmm_diag.freeFrameCount(), pmm_diag.managedFrameCount() });
+    } else {
+        _ = @atomicRmw(u32, &teardown_diag_suppressed, .Add, 1, .monotonic);
+    }
 
     // Force-release any registered Mutex held by the dying pid. Done
     // BEFORE the cleanup steps below because some of them
@@ -1074,8 +1136,11 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp, persist_shared_dirty: 
     // Post-teardown PMM count. Diff against [pmm-diag] pre-teardown
     // above to see how many frames this exit returned to the pool. A
     // process holding 1 MB of user pages should give back ~256 frames;
-    // anything less is a leak in the destroy path.
-    debug.klog("[pmm-diag] post-teardown free={d}/{d} (pid={d})\n", .{ pmm_diag.freeFrameCount(), pmm_diag.managedFrameCount(), pid });
+    // anything less is a leak in the destroy path. Gated on the same throttle
+    // decision as the pre-teardown line so the pair stays matched.
+    if (log_teardown) {
+        debug.klog("[pmm-diag] post-teardown free={d}/{d} (pid={d})\n", .{ pmm_diag.freeFrameCount(), pmm_diag.managedFrameCount(), pid });
+    }
 }
 
 /// External kill (Phase 3 protocol).
@@ -1471,15 +1536,24 @@ pub fn findZombieChild(parent: u8, target_pid: u32) ?u8 {
     return null;
 }
 
-/// Free the per-process ELF buffer (PMM-allocated contiguous frames).
+/// Drop this PCB's reference to the per-process ELF buffer (PMM-allocated
+/// contiguous frames). The pages are freed only when the last referrer lets go
+/// — a fork child shares the parent's buffer under a refcount (see elf_rc.zig /
+/// forkCurrent), so freeing on the first exit would dangle the survivor's
+/// lazy_regions[].source. An un-refcounted buffer (rc == null) is a single
+/// owner and frees immediately, as before.
 fn freeElfBuf(pcb: *PCB) void {
     if (pcb.elf_buf) |buf| {
-        // pcb.elf_buf is a kernel-side physmap VA (set from vfs.loadFileFresh's
-        // physToVirt result). PMM speaks phys, translate.
-        const paging = @import("../mm/paging.zig");
-        const base: usize = paging.virtToPhys(@intFromPtr(buf)).?;
-        pmm.freeContiguous(base, pcb.elf_buf_pages);
+        const should_free = if (pcb.elf_buf_rc) |rc| elf_rc.release(rc) else true;
+        if (should_free) {
+            // pcb.elf_buf is a kernel-side physmap VA (set from vfs.loadFileFresh's
+            // physToVirt result). PMM speaks phys, translate.
+            const paging = @import("../mm/paging.zig");
+            const base: usize = paging.virtToPhys(@intFromPtr(buf)).?;
+            pmm.freeContiguous(base, pcb.elf_buf_pages);
+        }
         pcb.elf_buf = null;
         pcb.elf_buf_pages = 0;
+        pcb.elf_buf_rc = null;
     }
 }

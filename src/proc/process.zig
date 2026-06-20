@@ -299,6 +299,12 @@ pub const PCB = struct {
     // Lazy regions for PT_LOAD segments reference this; freed on process destroy.
     elf_buf: ?[*]u8 = null, // (c) set at exec
     elf_buf_pages: u32 = 0, // (c)
+    // Shared refcount for elf_buf (see elf_rc.zig). fork() hands the parent's
+    // buffer to the child — the child's lazy_regions[].source point into it —
+    // so the PMM pages must live until the LAST referrer frees them, not the
+    // original owner. null = un-refcounted single owner (buffer dropped at
+    // load, or rc pool exhausted): never shared, so it can't dangle.
+    elf_buf_rc: ?*u32 = null, // (c)
     // Bottom of the user stack (lazy region start). Set by elf_loader. The
     // page-fault handler treats faults in [stack_base - GUARD_SIZE, stack_base)
     // as stack overflow rather than a generic segfault.
@@ -972,6 +978,7 @@ pub const pickNext = @import("sched.zig").pickNext;
 pub const checkPreempt = @import("sched.zig").checkPreempt;
 pub const migrate = @import("sched.zig").migrate;
 pub const loadBalance = @import("sched.zig").loadBalance;
+pub const tryStealWork = @import("sched.zig").tryStealWork;
 pub const setAffinity = @import("sched.zig").setAffinity;
 pub const getAffinity = @import("sched.zig").getAffinity;
 pub const assignInitialCpu = @import("sched.zig").assignInitialCpu;
