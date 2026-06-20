@@ -158,6 +158,13 @@ pub fn peerCheck(self: *smp.CpuLocal) void {
     wd_suspect_age[self.cpu_id] = 0;
     const locked = @import("../proc/spinlock.zig").cpuHoldsAnyLock(peer.cpu_id);
     serial.print("\n[watchdog] cpu{d} tick frozen ~{d}s (holds_lock={any}) — probing host-pause vs wedge before halting\n", .{ peer.cpu_id, WATCHDOG_STRIKES, locked });
+    // Name what the frozen peer is spinning on RIGHT NOW. Catches the
+    // unregistered setstate_locks[]/rq.lock contention even on a freeze that
+    // later RESUMES — so we get the lock without needing a hard watchdog halt
+    // (which only fires on the minority of bursts that don't self-recover). A
+    // spin_target of 0 here also discriminates a genuine host-pause (peer
+    // descheduled, not spinning) from a cli-spin livelock.
+    @import("../proc/spinlock.zig").dumpSpinTargets();
 }
 
 fn nextAlivePeer(self: *smp.CpuLocal) ?*smp.CpuLocal {
@@ -253,6 +260,10 @@ fn fire(self: *smp.CpuLocal, peer: *smp.CpuLocal) void {
     // holding a lock the other is spinning on; this names the holder
     // by symbol so we don't have to puzzle over raw return addresses.
     @import("../proc/spinlock.zig").dumpAllLocks();
+    // ...and the lock each CPU is CURRENTLY spinning to acquire — names the
+    // contended lock even when it's unregistered (setstate_locks[]/rq.lock) or
+    // free again by now, which is exactly the schedstress-wedge case.
+    @import("../proc/spinlock.zig").dumpSpinTargets();
 
     // Last-N kdbg ring entries (sched / irq / proc events across all
     // CPUs). The sched ring especially captures "who picked what when"

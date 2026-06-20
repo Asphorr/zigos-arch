@@ -65,6 +65,9 @@ pub const SpinLock = struct {
         const ticket = @atomicRmw(u32, &self.next_ticket, .Add, 1, .seq_cst);
         var spins: u64 = 0;
         var warned = false;
+        // Publish what we're about to wait on so a wedge autopsy can name this
+        // lock even when it's unregistered / free again by the time we dump.
+        if (cpu < MAX_HOLD_CPUS) @atomicStore(usize, &spin_target[cpu], @intFromPtr(self), .monotonic);
         while (true) {
             const serving = @atomicLoad(u32, &self.now_serving, .acquire);
             if (serving == ticket) {
@@ -79,6 +82,7 @@ pub const SpinLock = struct {
                         witness.spinAcquire(self.witness_class, cpu, smp.myCpu().current_pid, ra);
                     }
                 }
+                if (cpu < MAX_HOLD_CPUS) @atomicStore(usize, &spin_target[cpu], 0, .monotonic);
                 return;
             }
             // u32 wrapping subtract: handles next_ticket overflow correctly
@@ -283,6 +287,16 @@ comptime {
 //     save/restore across switches is needed.
 // =============================================================================
 var preempt_pin: [MAX_HOLD_CPUS]u32 = [_]u32{0} ** MAX_HOLD_CPUS;
+
+/// Per-CPU "currently spinning to acquire" target (lock address, 0 = none).
+/// Set while a CPU waits in acquire()'s spin loop, cleared the instant it wins.
+/// Read cross-CPU by the wedge autopsy (dumpSpinTargets) to name the exact lock
+/// a stuck CPU is on — the one thing the post-hoc [lock-dump] can't show: the
+/// hot lock is usually free again by dump time, and per-PID setstate_locks[] /
+/// per-rq rq.lock aren't individually registered. Plain per-CPU slot (only this
+/// CPU writes its own; the autopsy reads cross-CPU with a relaxed load — a
+/// momentarily-stale value is fine for a diagnostic).
+var spin_target: [MAX_HOLD_CPUS]usize = [_]usize{0} ** MAX_HOLD_CPUS;
 
 /// True when the calling CPU currently holds (or is acquiring) at least one
 /// plain-acquired SpinLock and must not be involuntarily preempted. Called
@@ -849,6 +863,41 @@ pub fn cpuHoldsAnyLock(cpu_id: u8) bool {
         if (@atomicLoad(u8, &lock.holder_cpu, .acquire) == cpu_id) return true;
     }
     return false;
+}
+
+/// Autopsy helper: dump, per CPU, the lock it is currently spinning to
+/// acquire — address, registered class name if any, and the lock's
+/// current/last holder + holder RA (the critical section on the FAR side of
+/// the contention). dumpAllLocks() below lists only HELD, individually-
+/// REGISTERED locks; a CPU wedged spinning on a momentarily-free or
+/// unregistered lock (per-PID setstate_locks[], per-rq rq.lock) is invisible
+/// there — this is the line that names it. Call after peers are halted.
+pub fn dumpSpinTargets() void {
+    const serial = @import("../debug/serial.zig");
+    const symbols = @import("../debug/symbols.zig");
+    serial.print("[spin-targets] lock each CPU is spinning to acquire (the contended lock [lock-dump] can't show):\n", .{});
+    var any = false;
+    var c: usize = 0;
+    while (c < MAX_HOLD_CPUS) : (c += 1) {
+        const addr = @atomicLoad(usize, &spin_target[c], .monotonic);
+        if (addr == 0) continue;
+        any = true;
+        const lock: *SpinLock = @ptrFromInt(addr);
+        serial.print("  cpu{d} -> lock@0x{X}", .{ c, addr });
+        const cls = lock.witness_class;
+        if (cls != 0xFF and cls < named_lock_count) serial.print(" '{s}'", .{named_locks[cls].name});
+        const hcpu = @atomicLoad(u8, &lock.holder_cpu, .acquire);
+        if (hcpu == 0xFF) serial.print(" holder=free(last", .{}) else serial.print(" holder_cpu={d}(at", .{hcpu});
+        if (lock.holder_ra != 0) {
+            if (symbols.resolveKernel(lock.holder_ra)) |r| {
+                serial.print(" {s}+0x{X})", .{ r.name, r.offset });
+            } else {
+                serial.print(" 0x{X})", .{lock.holder_ra});
+            }
+        } else serial.print(" ?)", .{});
+        serial.print("\n", .{});
+    }
+    if (!any) serial.print("  (no CPU currently spinning)\n", .{});
 }
 
 /// Dump every registered lock's state: SpinLocks print holder cpu +
