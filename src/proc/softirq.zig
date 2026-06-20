@@ -139,6 +139,12 @@ fn ksoftirqdEntry() callconv(.c) noreturn {
     // diagnostics. Flipping here keeps boot output synchronous until the
     // drainer is provably live.
     if (smp.myCpu().cpu_id == 0) {
+        // Start the drainer caught up to the synchronous boot output — nothing
+        // before now is pending on the UART. Required before deferred goes live
+        // so serial's load-shed backstop doesn't see the whole boot log as
+        // backlog and drop the first post-boot lines. Runs while deferred is
+        // still false, so drainToPort (gated on deferred) can't race the store.
+        serial.syncDrainCursor();
         @atomicStore(bool, &serial.deferred, true, .release);
         serial.print("[klog] serial port drain deferred to ksoftirqd\n", .{});
     }

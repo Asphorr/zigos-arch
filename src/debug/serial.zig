@@ -93,6 +93,23 @@ var drain_pos: u32 = 0;
 /// output lost them; the in-ring /dev/kmsg view saw them until lapped).
 var port_lost_bytes: u32 = 0;
 
+/// Load-shed high-water mark (bytes of unsent backlog). When deferred-mode
+/// output outruns ksoftirqd's drainToPort by more than this, `write` DROPS the
+/// message instead of appending. Rationale: a self-amplifying klog flood (e.g.
+/// a [slow-sc] storm during a scheduler stress test — each line's serial cost
+/// makes the next syscall slower, so more lines) makes the backlog grow without
+/// bound; appending anyway only lengthens the cli'd `write_lock` critical
+/// section that EVERY CPU contends on, until a CPU spins there long enough for
+/// the hang watchdog to NMI the box (observed 2026-06-20). Past this mark the
+/// drainer is already >3/4 of a ring behind and about to lap (lose bytes)
+/// anyway, so dropping loses no more than lapping would — but keeps the write
+/// path O(1) so logging can never starve the scheduler. The in-ring /dev/kmsg
+/// view still holds the most-recent RING_LEN bytes. Checked locklessly BEFORE
+/// lockWrite so a flooding CPU never even contends for the lock.
+const DROP_HIGH_WATER: u32 = (RING_LEN / 4) * 3; // 48 KiB of 64 KiB
+/// Bytes dropped by the load-shed path since the last recovery report.
+var dropped_bytes: u32 = 0;
+
 pub fn init() void {
     io.outb(PORT + 1, 0x00); // Disable interrupts
     io.outb(PORT + 3, 0x80); // Enable DLAB
@@ -128,6 +145,26 @@ pub fn write(msg: []const u8) void {
         emergencyWrite(msg);
         return;
     }
+    // Load-shed under a log flood (see DROP_HIGH_WATER). Only in deferred mode,
+    // where a backlog can build; the check is lockless so a flooding CPU bails
+    // before contending for write_lock. Synchronous mode has no backlog — every
+    // byte goes straight out — so it skips this and always appends.
+    if (@atomicLoad(bool, &deferred, .monotonic)) {
+        // Sample drain_pos (the chasing cursor) BEFORE total_written (the head).
+        // We're preemptible here (pre-lockWrite, IF may be 1), so the drainer can
+        // advance drain_pos between the two reads. Reading the cursor first means
+        // head >= cursor always holds for the pair, so `head -% cursor` can only
+        // OVER-estimate the backlog (shed a touch early) — never wrap to ~4 GiB
+        // and shed everything, which reading the head first would allow. drain_pos
+        // read plain (single BSP-drainer writer; aligned-u32 access is atomic on
+        // x86) — same convention as pendingToPort.
+        const dp = drain_pos;
+        const backlog = @atomicLoad(u32, &total_written, .monotonic) -% dp;
+        if (backlog > DROP_HIGH_WATER) {
+            _ = @atomicRmw(u32, &dropped_bytes, .Add, @as(u32, @truncate(msg.len)), .monotonic);
+            return;
+        }
+    }
     const flags = lockWrite();
     defer unlockWrite(flags);
     const to_port = !@atomicLoad(bool, &deferred, .monotonic);
@@ -135,6 +172,17 @@ pub fn write(msg: []const u8) void {
         if (to_port) putChar(c);
         ringPush(c);
     }
+}
+
+/// Sync the drain cursor to the current write head. Called once when flipping
+/// INTO deferred mode: everything written so far went out synchronously, so the
+/// drainer must start "caught up" rather than re-walking the whole boot log —
+/// and, with load-shedding live, so the backlog isn't ~48 KiB at the cutover
+/// (which would false-trip DROP_HIGH_WATER and drop the first post-boot lines).
+/// Single caller, runs on the BSP drainer BEFORE `deferred` is published true,
+/// so no drainToPort races it.
+pub fn syncDrainCursor() void {
+    drain_pos = @atomicLoad(u32, &total_written, .monotonic);
 }
 
 /// Bytes appended but not yet sent to the UART. 0 whenever deferred mode is
@@ -175,6 +223,16 @@ pub fn drainToPort() void {
         const lost = port_lost_bytes;
         port_lost_bytes = 0;
         print("[klog] {d} bytes lost to port (ring lapped the drainer)\n", .{lost});
+    }
+    // Report load-shed drops once the backlog has recovered, so the gap is
+    // visible without the report itself re-flooding (only fires when we're
+    // back under a quarter ring — i.e. the flood is over). The read+reset
+    // isn't a strict CAS; an overlapping write's increment can be missed and
+    // folded into the next report, which is fine for a diagnostic counter.
+    const dropped = @atomicLoad(u32, &dropped_bytes, .monotonic);
+    if (dropped != 0 and (@atomicLoad(u32, &total_written, .monotonic) -% drain_pos) < (RING_LEN / 4)) {
+        @atomicStore(u32, &dropped_bytes, 0, .monotonic);
+        print("[klog] {d} bytes load-shed (dropped under flood to keep the scheduler live)\n", .{dropped});
     }
 }
 
@@ -306,6 +364,16 @@ fn writeFn(_: void, bytes: []const u8) error{}!usize {
     if (@atomicLoad(bool, &emergency_mode, .acquire)) {
         emergencyWrite(bytes);
         return bytes.len;
+    }
+    // Mirror write()'s load-shed backstop (see DROP_HIGH_WATER). drain_pos
+    // sampled before total_written for the same anti-wrap reason as write().
+    if (@atomicLoad(bool, &deferred, .monotonic)) {
+        const dp = drain_pos;
+        const backlog = @atomicLoad(u32, &total_written, .monotonic) -% dp;
+        if (backlog > DROP_HIGH_WATER) {
+            _ = @atomicRmw(u32, &dropped_bytes, .Add, @as(u32, @truncate(bytes.len)), .monotonic);
+            return bytes.len;
+        }
     }
     const flags = lockWrite();
     defer unlockWrite(flags);

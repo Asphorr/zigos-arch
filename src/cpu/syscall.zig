@@ -29,6 +29,17 @@ const sys = @import("syscall/sys.zig");
 /// blocks for seconds" class without spamming normal blocking primitives.
 const SLOW_SYSCALL_THRESHOLD_MS: u64 = 5;
 
+/// Minimum spacing (timer ticks, ~10 ms each) between [slow-sc] emissions.
+/// The sentinel is self-amplifying under load: a slow syscall logs a line,
+/// the line's serial cost slows the next syscall past the threshold, and the
+/// rate runs away into a flood that buries the log path (a scheduler stress
+/// test wedged the box this way, 2026-06-20). Rate-limit to ≤ ~50 lines/s and
+/// fold the count of suppressed crossings into the next line (`hidden=N`), so
+/// the signal — syscalls ARE slow, and how many — survives without the cascade.
+const SLOW_SC_MIN_GAP_TICKS: u64 = 2;
+var slow_sc_last_tick: u64 = 0; // (a) tick of the last emitted [slow-sc]
+var slow_sc_suppressed: u32 = 0; // (a) crossings hidden since that emission
+
 export fn doSyscall(sys_num: u32, arg1: u32, arg2: u32, arg3: u32, frame_raw: *anyopaque) callconv(.c) u64 {
     // Per-CPU breadcrumb — stamp BEFORE everything else so even if we panic
     // mid-syscall, the autopsy reflects what this CPU was doing.
@@ -119,14 +130,29 @@ export fn doSyscall(sys_num: u32, arg1: u32, arg2: u32, arg3: u32, frame_raw: *a
         // signal we actually want for "what's blocking ctrl_lock for 10s".
         const dt_ms = apic.tscToMs(dt);
         if (dt_ms >= SLOW_SYSCALL_THRESHOLD_MS) {
-            const cur_pid = process.getCurrentPid();
-            debug.klog(
-                "[slow-sc] sys#{d} pid={d} dt={d}ms args=0x{x} 0x{x} 0x{x}\n",
-                .{ sys_num, cur_pid, dt_ms, arg1, arg2, arg3 },
-            );
-            // Per-phase breakdown — only fires when at least one
-            // instrumented site recorded something.
-            @import("../debug/syscall_perf.zig").dump();
+            // Rate-limit so a slow-syscall storm can't cascade into a log flood
+            // (see SLOW_SC_MIN_GAP_TICKS). Within the gap, just tally and bail —
+            // no klog, no phase dump — so the suppressed path adds zero serial
+            // cost and can't feed the loop.
+            // tick_count: plain BSP-advanced counter, read plain here (same as
+            // sched.zig's slice_start tracking). It only needs to advance for the
+            // gate to reopen — exact value/freshness is immaterial — so no
+            // ordering requirement beyond x86's coherent aligned-u64 loads.
+            const now_tick = process.tick_count;
+            if (now_tick -% @atomicLoad(u64, &slow_sc_last_tick, .monotonic) >= SLOW_SC_MIN_GAP_TICKS) {
+                @atomicStore(u64, &slow_sc_last_tick, now_tick, .monotonic);
+                const hidden = @atomicRmw(u32, &slow_sc_suppressed, .Xchg, 0, .monotonic);
+                const cur_pid = process.getCurrentPid();
+                debug.klog(
+                    "[slow-sc] sys#{d} pid={d} dt={d}ms args=0x{x} 0x{x} 0x{x} hidden={d}\n",
+                    .{ sys_num, cur_pid, dt_ms, arg1, arg2, arg3, hidden },
+                );
+                // Per-phase breakdown — only fires when at least one
+                // instrumented site recorded something.
+                @import("../debug/syscall_perf.zig").dump();
+            } else {
+                _ = @atomicRmw(u32, &slow_sc_suppressed, .Add, 1, .monotonic);
+            }
         }
     }
 
