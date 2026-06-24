@@ -762,6 +762,70 @@ pub var setstate_in_flight: [MAX_PROCS]u8 = [_]u8{0} ** MAX_PROCS;
 /// right before all four pids stalled on (.nvme_io, target=0x10000).
 var setstate_locks: [MAX_PROCS]SpinLock = [_]SpinLock{.{}} ** MAX_PROCS;
 
+// =============================================================================
+// Mode-A wedge diagnostics — candidate-claim-loop spin tracking.
+//
+// schedule()'s claim loop (see below) re-picks a candidate whenever another CPU
+// wins the CAS for the same PID first. Under a sched_yield storm + work
+// stealing, two CPUs can fight over the same runqueue entries and one (cpu0,
+// where the desktop is pinned) can livelock re-picking with IF=0 — starving its
+// own 100Hz timer IRQ until the watchdog halts it. These per-CPU counters let
+// the wedge autopsy SEE that spin: sched_loop_iters[cpu] is the retry count of
+// the schedule() currently running on that CPU (reset to 0 between calls), and
+// sched_loop_max[cpu] is the high-water mark ever observed. Only the owning CPU
+// writes its own slots; the autopsy reads them cross-CPU with relaxed loads.
+// Paired with the NMI profiler's spin-target histogram: a large in-flight value
+// here + ZERO spin-target samples there = the claim loop is the live spin (not
+// a SpinLock.acquire wait), which is exactly the Mode-A signature.
+// =============================================================================
+var sched_loop_iters: [smp.MAX_CPUS]u64 = [_]u64{0} ** smp.MAX_CPUS;
+var sched_loop_max: [smp.MAX_CPUS]u64 = [_]u64{0} ** smp.MAX_CPUS;
+
+/// Dump per-CPU claim-loop retry counts. Called from the wedge autopsy. A large
+/// in-flight value names the claim loop as the live, IF=0 spin; a large
+/// max-ever with 0 in-flight says it spikes under contention but recovers.
+pub fn dumpSchedLoopStats() void {
+    const serial = @import("../debug/serial.zig");
+    serial.print("[sched-loop] schedule() candidate-claim retry counts (in-flight = live spin):\n", .{});
+    var c: usize = 0;
+    var any = false;
+    while (c < smp.MAX_CPUS) : (c += 1) {
+        const inflight = @atomicLoad(u64, &sched_loop_iters[c], .monotonic);
+        const mx = @atomicLoad(u64, &sched_loop_max[c], .monotonic);
+        if (inflight == 0 and mx <= 1) continue;
+        any = true;
+        serial.print("  cpu{d}: in-flight={d} max-ever={d}{s}\n", .{
+            c, inflight, mx,
+            if (inflight > 64) "  <-- LIVELOCK (re-picking in the claim loop NOW, IF=0)" else "",
+        });
+    }
+    if (!any) serial.print("  (no CPU has spun the claim loop more than once)\n", .{});
+}
+
+/// Classify a raw lock address as one of the scheduler's INTERNAL, normally-
+/// unregistered locks — the ones the registry-based [lock-dump] can't name.
+/// Writes the family index into `idx_out`. Returns a static family name or
+/// null. Covers setstate_locks[] (per-PID, indexed) and each CPU's sched_lock
+/// (lives in CpuLocal). Used by the wedge profiler to label a bare lock addr.
+pub fn classifySchedLock(addr: usize, idx_out: *usize) ?[]const u8 {
+    idx_out.* = 0;
+    if (addr == 0) return null;
+    const ss_base = @intFromPtr(&setstate_locks[0]);
+    const ss_end = ss_base + @sizeOf(SpinLock) * setstate_locks.len;
+    if (addr >= ss_base and addr < ss_end) {
+        idx_out.* = (addr - ss_base) / @sizeOf(SpinLock);
+        return "setstate_locks";
+    }
+    var c: usize = 0;
+    while (c < smp.MAX_CPUS) : (c += 1) {
+        if (addr == @intFromPtr(&smp.cpus[c].sched_lock)) {
+            idx_out.* = c;
+            return "sched_lock";
+        }
+    }
+    return null;
+}
+
 pub fn setState(pid: usize, new_state: State) void {
     if (pid >= MAX_PROCS) return;
     const lock_flags = setstate_locks[pid].acquireIrqSave();
@@ -1516,7 +1580,14 @@ pub fn schedule() void {
     // its .normal-priority queueing a turn instead of immediately re-
     // dispatching itself. Falls back to cur if no alternative exists.
     const exclude: ?u8 = if (cpu.current_pid) |c| @intCast(c) else null;
+    // Mode-A diagnostic: count re-picks so the wedge autopsy can SEE a
+    // claim-loop livelock. Published to a per-CPU slot only once we re-pick
+    // (loop_iters > 1) so the common single-pass dispatch pays nothing extra.
+    var loop_iters: u64 = 0;
     const next_opt: ?usize = blk: while (true) {
+        loop_iters +%= 1;
+        if (loop_iters > 1 and cpu.cpu_id < smp.MAX_CPUS)
+            @atomicStore(u64, &sched_loop_iters[cpu.cpu_id], loop_iters, .monotonic);
         const cand = pickNext(exclude) orelse break :blk null;
         const ready_val = @intFromEnum(State.ready);
         const running_val = @intFromEnum(State.running);
@@ -1588,6 +1659,16 @@ pub fn schedule() void {
         setstate_locks[cand].releaseIrqRestore(ss_flags);
         // CAS failed — another CPU got it first. Try again.
     };
+
+    // Finalize the claim-loop spin diagnostic: bump the high-water mark and
+    // clear the in-flight counter (so a cross-CPU autopsy read sees 0 = "not
+    // currently spinning"). Only touch the in-flight slot if we actually
+    // re-picked, to keep the single-pass fast path free of the extra store.
+    if (cpu.cpu_id < smp.MAX_CPUS) {
+        if (loop_iters > @atomicLoad(u64, &sched_loop_max[cpu.cpu_id], .monotonic))
+            @atomicStore(u64, &sched_loop_max[cpu.cpu_id], loop_iters, .monotonic);
+        if (loop_iters > 1) @atomicStore(u64, &sched_loop_iters[cpu.cpu_id], 0, .monotonic);
+    }
 
     if (next_opt) |next| {
         // Self-switch guard (task #235). When pickNext falls back to own

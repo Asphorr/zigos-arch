@@ -1157,11 +1157,45 @@ var prof_total: u32 = 0;
 var prof_overflow: u32 = 0;
 var prof_sample_ack: u32 = 0;
 
+// Parallel histogram of the CONTENDED LOCK sampled alongside each RIP. When the
+// wedged CPU is inside SpinLock.acquire's spin loop, spin_target names the lock
+// it's waiting on; sampling it here turns the RIP histogram's "spinning in
+// SpinLock.acquire" into "spinning on lock@0x… (sched_lock[0])". Smaller than
+// the RIP histogram — a livelock contends one or two locks. prof_lock_samples
+// counts samples that HAD a spin-target: if it stays 0 while prof_total grows,
+// the wedge is NOT a SpinLock spin (claim-loop re-pick / rq op / switchTo).
+const PROFILE_LOCK_SLOTS = 16;
+var prof_lock: [PROFILE_LOCK_SLOTS]usize = [_]usize{0} ** PROFILE_LOCK_SLOTS;
+var prof_lock_cnt: [PROFILE_LOCK_SLOTS]u32 = [_]u32{0} ** PROFILE_LOCK_SLOTS;
+var prof_lock_used: u32 = 0;
+var prof_lock_samples: u32 = 0;
+
 /// Record one RIP sample. Runs ON the sampled CPU inside its NMI handler. Only
 /// the sampled CPU writes the histogram; the watcher reads it only after
 /// clearing prof_active, and the release ack store below provides the
 /// happens-before for those reads.
 fn profileRecord(saved_rip: u64) void {
+    // Attribute the contended lock, if this CPU is mid-acquire spin. spin_target
+    // is the lock SpinLock.acquire is currently waiting on (0 = not spinning),
+    // indexed by LAPIC id — and only this CPU runs profileRecord, so its id is
+    // prof_target_lapic. Done first so it covers both return paths below.
+    const lk = @import("../proc/spinlock.zig").spinTargetOf(@as(usize, prof_target_lapic));
+    if (lk != 0) {
+        prof_lock_samples += 1;
+        var j: u32 = 0;
+        while (j < prof_lock_used) : (j += 1) {
+            if (prof_lock[j] == lk) {
+                prof_lock_cnt[j] += 1;
+                break;
+            }
+        }
+        if (j == prof_lock_used and prof_lock_used < PROFILE_LOCK_SLOTS) {
+            prof_lock[prof_lock_used] = lk;
+            prof_lock_cnt[prof_lock_used] = 1;
+            prof_lock_used += 1;
+        }
+    }
+
     var i: u32 = 0;
     while (i < prof_used) : (i += 1) {
         if (prof_rip[i] == saved_rip) {
@@ -1199,6 +1233,8 @@ pub fn profileWedgedCpu(target_lapic: u32, n: u32) void {
     prof_used = 0;
     prof_total = 0;
     prof_overflow = 0;
+    prof_lock_used = 0;
+    prof_lock_samples = 0;
     prof_target_lapic = target_lapic;
     @atomicStore(u32, &prof_sample_ack, 0, .release);
     @atomicStore(bool, &prof_active, true, .release);
@@ -1284,6 +1320,49 @@ fn dumpProfile(target_lapic: u32) void {
             serial.emergencyPrint("  ...({d} more buckets)\n", .{prof_used - shown});
             break;
         }
+    }
+
+    // Contended-lock histogram — which lock the spin-RIP was waiting on. This
+    // turns "HOT in SpinLock.acquire" into the actual lock, including the
+    // unregistered scheduler locks ([lock-dump] can't show those). When NO
+    // sample carried a spin-target, the wedge is provably not a SpinLock spin —
+    // an answer just as useful (look at the claim-loop retry count instead).
+    if (prof_lock_samples > 0) {
+        serial.emergencyPrint("[wedge-prof] contended lock ({d}/{d} samples were mid-acquire spin):\n", .{ prof_lock_samples, prof_total });
+        var lorder: [PROFILE_LOCK_SLOTS]u32 = undefined;
+        var li: u32 = 0;
+        while (li < prof_lock_used) : (li += 1) lorder[li] = li;
+        var la: u32 = 0;
+        while (la < prof_lock_used) : (la += 1) {
+            var mi = la;
+            var lb = la + 1;
+            while (lb < prof_lock_used) : (lb += 1) {
+                if (prof_lock_cnt[lorder[lb]] > prof_lock_cnt[lorder[mi]]) mi = lb;
+            }
+            const tmp = lorder[la];
+            lorder[la] = lorder[mi];
+            lorder[mi] = tmp;
+        }
+        var lk_i: u32 = 0;
+        while (lk_i < prof_lock_used) : (lk_i += 1) {
+            const idx = lorder[lk_i];
+            const addr = prof_lock[idx];
+            serial.emergencyPrint("  {d:>3}x lock@0x{X}", .{ prof_lock_cnt[idx], addr });
+            if (@import("../proc/spinlock.zig").lockName(addr)) |nm| {
+                serial.emergencyPrint(" '{s}'", .{nm});
+            } else {
+                var fidx: usize = 0;
+                if (@import("../proc/sched.zig").classifySchedLock(addr, &fidx)) |nm| {
+                    serial.emergencyPrint(" '{s}[{d}]'", .{ nm, fidx });
+                } else {
+                    serial.emergencyPrint(" (unregistered)", .{});
+                }
+            }
+            if (lk_i == 0) serial.emergencyPrint("  <-- most-contended", .{});
+            serial.emergencyPrint("\n", .{});
+        }
+    } else if (prof_total > 0) {
+        serial.emergencyPrint("[wedge-prof] no spin-target on any sample — the wedge is NOT a SpinLock.acquire spin (look at [sched-loop] retry counts: claim-loop re-pick / rq op / switchTo / raw cli-spin)\n", .{});
     }
 }
 

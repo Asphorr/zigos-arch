@@ -165,6 +165,9 @@ pub fn peerCheck(self: *smp.CpuLocal) void {
     // spin_target of 0 here also discriminates a genuine host-pause (peer
     // descheduled, not spinning) from a cli-spin livelock.
     @import("../proc/spinlock.zig").dumpSpinTargets();
+    // Claim-loop retry counts too — caught even on a freeze that later
+    // self-recovers, so we get the Mode-A signature without needing a hard halt.
+    @import("../proc/sched.zig").dumpSchedLoopStats();
 }
 
 fn nextAlivePeer(self: *smp.CpuLocal) ?*smp.CpuLocal {
@@ -264,6 +267,11 @@ fn fire(self: *smp.CpuLocal, peer: *smp.CpuLocal) void {
     // contended lock even when it's unregistered (setstate_locks[]/rq.lock) or
     // free again by now, which is exactly the schedstress-wedge case.
     @import("../proc/spinlock.zig").dumpSpinTargets();
+    // ...and per-CPU schedule() claim-loop retry counts. A large in-flight
+    // value here = the wedged CPU is livelocked re-picking a candidate with
+    // IF=0 (Mode-A), the thing the spin-target dump can't show because the
+    // claim loop isn't a single SpinLock spin.
+    @import("../proc/sched.zig").dumpSchedLoopStats();
 
     // Last-N kdbg ring entries (sched / irq / proc events across all
     // CPUs). The sched ring especially captures "who picked what when"

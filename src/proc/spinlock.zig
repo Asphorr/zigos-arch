@@ -298,6 +298,27 @@ var preempt_pin: [MAX_HOLD_CPUS]u32 = [_]u32{0} ** MAX_HOLD_CPUS;
 /// momentarily-stale value is fine for a diagnostic).
 var spin_target: [MAX_HOLD_CPUS]usize = [_]usize{0} ** MAX_HOLD_CPUS;
 
+/// Read `cpu`'s current spin target — the address of the lock its
+/// SpinLock.acquire is waiting on, or 0 when it isn't spinning. `cpu` is a
+/// LAPIC id (the slot index). Used by the NMI wedge profiler to attribute a
+/// sample that landed in SpinLock.acquire to the specific contended lock:
+/// spin_target is non-zero ONLY while inside acquire()'s spin loop, so a
+/// non-zero read here means "this CPU is contending that lock RIGHT NOW",
+/// whereas 0 across every sample means the wedge is not a SpinLock spin (it's
+/// the claim-loop re-pick, an rq op, switchTo, or a raw cli/sti loop).
+///
+/// Indexing note: callers pass a LAPIC id (the profiler passes
+/// prof_target_lapic), but `acquire()` WRITES spin_target indexed by
+/// currentCpuId() (a logical cpu id). Those agree only because lapic_id ==
+/// cpu_id system-wide on this board — the same aliasing the WITNESS-lite
+/// per-CPU slots already assume. If a future board breaks that identity, lock
+/// ATTRIBUTION would mislabel, but never fault: this read is bounds-checked and
+/// returns a plain usize without dereferencing it.
+pub fn spinTargetOf(cpu: usize) usize {
+    if (cpu >= MAX_HOLD_CPUS) return 0;
+    return @atomicLoad(usize, &spin_target[cpu], .monotonic);
+}
+
 /// True when the calling CPU currently holds (or is acquiring) at least one
 /// plain-acquired SpinLock and must not be involuntarily preempted. Called
 /// by check_and_preempt_dynirq at IF=0; own-CPU counter, plain read.
@@ -863,6 +884,28 @@ pub fn cpuHoldsAnyLock(cpu_id: u8) bool {
         if (@atomicLoad(u8, &lock.holder_cpu, .acquire) == cpu_id) return true;
     }
     return false;
+}
+
+/// Resolve a lock address to its registered family/instance name, or null if
+/// unregistered. Matches by pointer against the registry first (individually
+/// registered locks + family representatives), then falls back to the lock's
+/// own `witness_class` — so a per-CPU/per-instance member tagged with a
+/// registered FAMILY class (registerLockClass) resolves to that family's name
+/// even though only the representative is in the registry by pointer. Used by
+/// the wedge profiler's contended-lock histogram. The address always comes
+/// from spin_target (= `@intFromPtr(self)` of a live SpinLock), so the deref is
+/// safe.
+pub fn lockName(addr: usize) ?[]const u8 {
+    if (addr == 0) return null;
+    var i: u8 = 0;
+    while (i < named_lock_count) : (i += 1) {
+        if (named_locks[i].ptr == addr) return named_locks[i].name;
+    }
+    const lock: *const SpinLock = @ptrFromInt(addr);
+    const cls = lock.witness_class;
+    if (cls != 0xFF and cls < named_lock_count and named_locks[cls].kind == .spin)
+        return named_locks[cls].name;
+    return null;
 }
 
 /// Autopsy helper: dump, per CPU, the lock it is currently spinning to
