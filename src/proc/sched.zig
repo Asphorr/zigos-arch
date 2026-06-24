@@ -2029,6 +2029,48 @@ pub fn schedule() void {
         // task's entire descheduled duration — idle/wait time, not scheduler cost.
         @import("../debug/perf.zig").leave(.schedule, t);
         sched_measured = true;
+        // LATE saved-RIP re-validation (2026-06-24 PID-recycle/dispatch race).
+        // The pre-dispatch rip-guard above runs BEFORE setTssRsp0/loadCr3/
+        // setCurrentPid and a window of other code; a #PF at RIP=0x1 with the
+        // rip-guard CLEAN proved the restore frame is valid at guard time but
+        // clobbered before switchTo's `ret` consumes [kesp+48] — a TOCTOU some
+        // other agent wins inside this window (violates the "only assigned_cpu
+        // touches kernel_esp" invariant the early guards rely on). Re-read it as
+        // the very last act before the switch: a catch here carries the
+        // save-mirror verdict (overwritten SINCE save? how many cycles ago?)
+        // instead of a bare wild-RIP #PF with no backtrace. If this PASSES but
+        // the ret still faults, the writer strikes inside switchTo's own few
+        // instructions — itself a sharp clue. sched_lock is already released
+        // (above), so we just panic; state stays .running (consistent with the
+        // setCurrentPid already done) and nmi_halt_after_snapshot stops peers.
+        {
+            const rip_slot_l = next_kesp +% 48;
+            const kstop_l = process.procs[next].kernel_stack_top;
+            if (rip_slot_l + 8 <= kstop_l and rip_slot_l >= kstop_l -% (4 * @import("../config.zig").KSTACK_SIZE)) {
+                const rip_l = @as(*const u64, @ptrFromInt(rip_slot_l)).*;
+                if (rip_l < memmap.KERNEL_VIRT_BASE or rip_l >= memmap.kernelEnd()) {
+                    const st = @import("../debug/save_trace.zig");
+                    const now_tsc: u64 = asm volatile (
+                        "rdtsc\n\tshlq $32, %%rdx\n\torq %%rdx, %%rax"
+                        : [r] "={rax}" (-> u64),
+                        :: .{ .rdx = true });
+                    debug.klog("\n[sched-rip-LATE] !!! pid={d} saved RIP went WILD between guard and switchTo: 0x{X:0>16} (CAUGHT POST-GUARD = TOCTOU on restore frame) !!!\n", .{ next, rip_l });
+                    debug.klog("[sched-rip-LATE]   kernel_esp = 0x{X:0>16}  from_pid = {d}  cpu = {d}\n", .{ next_kesp, from_pid_a, cpu.cpu_id });
+                    debug.klog("[sched-rip-LATE]   last_save kesp = 0x{X:0>16}  last_save +48 = 0x{X:0>16}\n", .{ st.last_save_kesp[next], st.last_save_plus48[next] });
+                    debug.klog("[sched-rip-LATE]   save tsc = 0x{X:0>12}  now = 0x{X:0>12}  delta = {d} cyc\n", .{ st.last_save_tsc[next], now_tsc, now_tsc -% st.last_save_tsc[next] });
+                    if (st.last_save_kesp[next] != next_kesp) {
+                        debug.klog("[sched-rip-LATE]   *** PCB.kernel_esp DIFFERS from last save (changed by a non-switchTo writer) ***\n", .{});
+                    } else if (st.last_save_plus48[next] != rip_l) {
+                        debug.klog("[sched-rip-LATE]   *** kesp+48 OVERWRITTEN since save — a racing writer hit this frame ***\n", .{});
+                    } else {
+                        debug.klog("[sched-rip-LATE]   *** save mirror MATCHES — frame was already wild at save time (missed by guard?) ***\n", .{});
+                    }
+                    @import("../debug/kdbg.zig").nmi_halt_after_snapshot = true;
+                    @import("../debug/save_trace.zig").dumpAll();
+                    @panic("dispatch with wild saved RIP (caught late — TOCTOU on restore frame)");
+                }
+            }
+        }
         @import("sched_asm.zig").switchToCall(prev_save, next_kesp);
         // When we get here, this caller has been re-scheduled.
         @import("../debug/kdbg.zig").schedEvent(.switch_out, from_pid_a, 0, 0, @intCast(next));
