@@ -1226,10 +1226,13 @@ fn profileRecord(saved_rip: u64) void {
 pub fn profileWedgedCpu(target_lapic: u32, n: u32) void {
     const apic = @import("../time/apic.zig");
 
-    // Reset histogram. Plain stores are safe ONLY because the caller
-    // guarantees no prior round's sample NMI is still in flight — watchdog
-    // fire() is single-fire CAS-gated (watchdog.zig), so rounds never overlap.
-    // A second call site without that guarantee would need this fenced.
+    // Reset histogram. Plain stores are safe because the two callers serialize
+    // this function: watchdog fire() is single-fire CAS-gated, and the other —
+    // watchdog peerIsSpinning's host-pause probe — holds wd_probe_busy and bails
+    // when `fired` is already set (watchdog.zig). On the deployed 2-CPU board
+    // rounds never overlap; a ≥3-CPU fire()-vs-probe overlap can only add
+    // diagnostic noise (every write is bounded by prof_used < PROFILE_SLOTS into
+    // fixed .bss), never corruption — it would need this fenced to be exact.
     prof_used = 0;
     prof_total = 0;
     prof_overflow = 0;
@@ -1271,6 +1274,25 @@ pub fn profileWedgedCpu(target_lapic: u32, n: u32) void {
     while (settle < 100_000) : (settle += 1) asm volatile ("pause");
 
     dumpProfile(target_lapic);
+}
+
+/// Verdict from the most recent profileWedgedCpu run, for the watchdog's
+/// host-pause gate. true = the samples look like a GUEST SPIN to HALT on;
+/// false = a host pause to ride out:
+///   - prof_total < MIN  → too few NMIs landed = the vCPU isn't running (the
+///     host descheduled it). A host pause, not a spin.
+///   - prof_lock_samples > 0 → ≥1 sample caught the peer mid-SpinLock.acquire
+///     → a real lock spin → halt.
+///   - prof_used <= TIGHT → only a handful of distinct RIPs over many samples
+///     = a tight loop pinned there → halt. DISPERSED RIPs (alive but host-
+///     starved, executing varied code — the 2026-06-24 schedstress case: 23
+///     distinct / 32 samples) → NOT a spin → ride out.
+pub fn profileSawSpin() bool {
+    const MIN_SAMPLES: u32 = 8;
+    const TIGHT_DISTINCT: u32 = 6;
+    if (prof_total < MIN_SAMPLES) return false;
+    if (prof_lock_samples > 0) return true;
+    return prof_used <= TIGHT_DISTINCT;
 }
 
 fn dumpProfile(target_lapic: u32) void {

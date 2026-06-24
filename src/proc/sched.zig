@@ -781,6 +781,15 @@ var setstate_locks: [MAX_PROCS]SpinLock = [_]SpinLock{.{}} ** MAX_PROCS;
 var sched_loop_iters: [smp.MAX_CPUS]u64 = [_]u64{0} ** smp.MAX_CPUS;
 var sched_loop_max: [smp.MAX_CPUS]u64 = [_]u64{0} ** smp.MAX_CPUS;
 
+/// The live candidate-claim retry count for `cpu` (0 if not currently in the
+/// loop). Read cross-CPU by the watchdog's host-pause gate: a high value means
+/// the CPU is livelocking schedule()'s claim loop with IF=0 (Mode-A) and must
+/// be HALTED, not ridden out as a host pause.
+pub fn claimLoopInFlight(cpu: usize) u64 {
+    if (cpu >= smp.MAX_CPUS) return 0;
+    return @atomicLoad(u64, &sched_loop_iters[cpu], .monotonic);
+}
+
 /// Dump per-CPU claim-loop retry counts. Called from the wedge autopsy. A large
 /// in-flight value names the claim loop as the live, IF=0 spin; a large
 /// max-ever with 0 in-flight says it spikes under contention but recovers.

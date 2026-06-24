@@ -43,6 +43,19 @@ const WATCHDOG_STRIKES: u8 = 3;
 /// propagating to the watcher before it can autopsy).
 const WATCHDOG_GRACE_FREE: u8 = 7; // ~10s total before halting a lockless freeze
 const WATCHDOG_GRACE_LOCKED: u8 = 2; // ~5s total when a cli-lock is held
+/// Host-pause hardening (2026-06-24). Once the grace window expires we don't
+/// halt blindly: a genuine guest wedge (a lock-acquire spin-target, a claim-
+/// loop livelock, or a tight RIP loop the NMI profiler pins) halts immediately,
+/// but a freeze with NO spin signature — dispersed/parked RIPs, no spin-target,
+/// no claim-loop — is the host starving our vCPU's tick, so we ride it out for
+/// up to WATCHDOG_EXTEND_CAP more grace windows before halting anyway (fail-
+/// safe). Only the LOCKLESS case extends; a lock-held freeze keeps the short
+/// grace (a real wedge there can propagate to the watcher). The schedstress
+/// halt of 2026-06-24 was exactly this false positive (625ms HOST-L0 pauses,
+/// cli-acct=0, profiler showed 23 distinct RIPs / 32 samples = alive, not spinning).
+const WATCHDOG_EXTEND_CAP: u8 = 6; // ~6 extra grace windows (~40s) of ride-out
+const WATCHDOG_PROBE_SAMPLES: u32 = 16; // NMI RIP samples for the spin test
+const CLAIM_LIVELOCK_THRESH: u64 = 64; // sched claim-loop in-flight above this = Mode-A
 
 var armed: bool = false;
 var fired: bool = false;
@@ -57,6 +70,13 @@ var fired: bool = false;
 var wd_suspecting: [smp.MAX_CPUS]bool = [_]bool{false} ** smp.MAX_CPUS;
 var wd_suspect_tick: [smp.MAX_CPUS]u64 = [_]u64{0} ** smp.MAX_CPUS;
 var wd_suspect_age: [smp.MAX_CPUS]u8 = [_]u8{0} ** smp.MAX_CPUS;
+/// Extra grace windows granted to a corroborated host-pause on this watcher
+/// (reset when the peer resumes / progresses / re-enters suspect). Bounds the
+/// ride-out so a spin-signature-less but genuine wedge still halts. See
+/// WATCHDOG_EXTEND_CAP.
+var wd_extended: [smp.MAX_CPUS]u8 = [_]u8{0} ** smp.MAX_CPUS;
+/// Serializes the NMI spin-probe across watchers (kdbg's prof_* state is global).
+var wd_probe_busy: bool = false;
 
 /// Enable the watchdog. Call after smp.init() so peer CPUs exist. No-op
 /// before that; the per-CPU tick fields default to 0, and a freshly-zeroed
@@ -104,6 +124,7 @@ pub fn peerCheck(self: *smp.CpuLocal) void {
         self.watchdog_peer_strikes = 0;
         wd_suspecting[self.cpu_id] = false;
         wd_suspect_age[self.cpu_id] = 0;
+        wd_extended[self.cpu_id] = 0;
         return;
     }
 
@@ -121,6 +142,7 @@ pub fn peerCheck(self: *smp.CpuLocal) void {
             serial.print("[watchdog] cpu{d} RESUMED after ~{d}s frozen (tick advanced) — host vCPU pause / long SMI, NOT a guest wedge; not halting\n", .{ peer.cpu_id, frozen_s });
             wd_suspecting[self.cpu_id] = false;
             wd_suspect_age[self.cpu_id] = 0;
+            wd_extended[self.cpu_id] = 0;
             self.watchdog_peer_last_tick = peer_tick;
             self.watchdog_peer_strikes = 0;
             return;
@@ -128,13 +150,25 @@ pub fn peerCheck(self: *smp.CpuLocal) void {
         // Still frozen. Wait up to the grace window — shorter if the peer is
         // sitting on a cli-lock (a real wedge there can propagate to us).
         wd_suspect_age[self.cpu_id] +|= 1;
-        const grace: u8 = if (@import("../proc/spinlock.zig").cpuHoldsAnyLock(peer.cpu_id))
-            WATCHDOG_GRACE_LOCKED
-        else
-            WATCHDOG_GRACE_FREE;
+        const locked = @import("../proc/spinlock.zig").cpuHoldsAnyLock(peer.cpu_id);
+        const grace: u8 = if (locked) WATCHDOG_GRACE_LOCKED else WATCHDOG_GRACE_FREE;
         if (wd_suspect_age[self.cpu_id] < grace) return;
-        // Never resumed through the full grace window → genuine wedge.
-        // Race-free single-fire via CAS: first detector dumps, others bail.
+
+        // Grace expired. HOST-PAUSE GATE: don't halt a freeze that's really the
+        // host starving our vCPU's tick (the tick can't advance, but the CPU
+        // isn't wedged). Halt immediately on a real guest spin; otherwise ride
+        // the pause out for a bounded number of extra windows. Only the
+        // lockless case extends — a lock-held freeze keeps the short grace.
+        if (!locked and wd_extended[self.cpu_id] < WATCHDOG_EXTEND_CAP and
+            !peerIsSpinning(peer))
+        {
+            wd_extended[self.cpu_id] +|= 1;
+            wd_suspect_age[self.cpu_id] = 0; // fresh grace window
+            serial.print("[watchdog] cpu{d} frozen but NOT spinning (no spin-target / no claim-loop / dispersed or parked RIPs) — host vCPU pause; extending grace {d}/{d}, not halting\n", .{ peer.cpu_id, wd_extended[self.cpu_id], WATCHDOG_EXTEND_CAP });
+            return;
+        }
+        // Real spin, lock-held freeze, or ride-out cap exhausted → genuine
+        // wedge. Race-free single-fire via CAS: first detector dumps, others bail.
         if (@cmpxchgStrong(bool, &fired, false, true, .acq_rel, .acquire) != null) return;
         fire(self, peer);
         return;
@@ -156,6 +190,7 @@ pub fn peerCheck(self: *smp.CpuLocal) void {
     wd_suspecting[self.cpu_id] = true;
     wd_suspect_tick[self.cpu_id] = peer_tick;
     wd_suspect_age[self.cpu_id] = 0;
+    wd_extended[self.cpu_id] = 0;
     const locked = @import("../proc/spinlock.zig").cpuHoldsAnyLock(peer.cpu_id);
     serial.print("\n[watchdog] cpu{d} tick frozen ~{d}s (holds_lock={any}) — probing host-pause vs wedge before halting\n", .{ peer.cpu_id, WATCHDOG_STRIKES, locked });
     // Name what the frozen peer is spinning on RIGHT NOW. Catches the
@@ -178,6 +213,33 @@ fn nextAlivePeer(self: *smp.CpuLocal) ?*smp.CpuLocal {
         if (peer.alive) return peer;
     }
     return null;
+}
+
+/// True if a frozen peer shows a GENUINE guest-spin signature the watchdog
+/// must halt on, vs a host pause to ride out. Cheap no-NMI checks first; only
+/// RIP-samples the peer (bounded NMI burst) if neither fires.
+fn peerIsSpinning(peer: *smp.CpuLocal) bool {
+    // (1) Spinning to acquire a lock (registered or not) → real wedge.
+    if (@import("../proc/spinlock.zig").spinTargetOf(peer.cpu_id) != 0) return true;
+    // (2) Livelocking schedule()'s candidate-claim loop with IF=0 (Mode-A).
+    if (@import("../proc/sched.zig").claimLoopInFlight(peer.cpu_id) > CLAIM_LIVELOCK_THRESH) return true;
+    // (3) Positive test: RIP-sample via NMI. A tight loop pins few RIPs (or a
+    // sample catches a SpinLock.acquire); dispersed RIPs = alive-but-host-
+    // starved; few/no samples landing = the vCPU is host-descheduled. The
+    // latter two are host pauses, not spins.
+    //
+    // If a halt is already in progress (another watcher won the fire() CAS),
+    // skip the probe — its prof_* writes would race fire()'s own profile (the
+    // ≥3-CPU case; can't happen on a 2-CPU board). The verdict is moot anyway
+    // (our caller's fire() CAS will fail); bias to "spinning" so we don't
+    // spuriously log a grace extension while the box is already halting.
+    if (@atomicLoad(bool, &fired, .acquire)) return true;
+    // Serialize the probe across watchers — kdbg's prof_* is global. If another
+    // probe is in flight, defer (treat as not-spinning; next grace tick re-decides).
+    if (@cmpxchgStrong(bool, &wd_probe_busy, false, true, .acq_rel, .acquire) != null) return false;
+    defer @atomicStore(bool, &wd_probe_busy, false, .release);
+    kdbg.profileWedgedCpu(@as(u32, peer.lapic_id), WATCHDOG_PROBE_SAMPLES);
+    return kdbg.profileSawSpin();
 }
 
 fn fire(self: *smp.CpuLocal, peer: *smp.CpuLocal) void {
