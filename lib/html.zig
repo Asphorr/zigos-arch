@@ -69,7 +69,7 @@ fn baseColorForDepth() u32 {
 // Style application + block management.
 
 fn computeStyle() render.Style {
-    var s = render.Style{ .font = base_font, .color = base_color, .underline = false, .link_id = -1 };
+    var s = render.Style{ .font = base_font, .color = currentInlineColor(), .underline = false, .link_id = -1 };
     if (cur_link >= 0) {
         s.color = theme.link;
         s.underline = true;
@@ -94,6 +94,7 @@ fn openBlock(font: render.Font, color: u32, indent: u16, sb: u16, sa: u16, bulle
     cur_block_open = true;
     sp_pending = false;
     nl_run = 0;
+    resetColorStack(); // inline <span>/<font> colors don't cross block boundaries
     applyStyle();
 }
 
@@ -269,6 +270,166 @@ fn parseUint(s: []const u8) u32 {
 }
 
 // ---------------------------------------------------------------------
+// Author colors. style="color:…" and <font color> become a render Style.color;
+// the render engine already threads per-run color through layout + paint
+// (render.zig:473/720), so this is purely a parser feature. Colors are kept
+// legible on the dark reader theme by readableOnDark().
+
+const MIN_LUM: u32 = 90; // floor for author colors on the ~0x16 dark bg
+const COLOR_STACK_MAX = 24; // inline <span>/<font> color nesting depth
+
+// Inline color stack: each <span>/<font> open pushes a color, its close pops.
+// color_skip keeps push/pop balanced when the stack is full so a deep page
+// can't desync the nesting (worst case a stray color bleeds — acceptable, the
+// same tolerance the rest of this forgiving parser already has).
+var color_stack: [COLOR_STACK_MAX]u32 = undefined;
+var color_sp: u32 = 0;
+var color_skip: u32 = 0;
+
+fn currentInlineColor() u32 {
+    return if (color_sp > 0) color_stack[color_sp - 1] else base_color;
+}
+fn pushColor(c: u32) void {
+    if (color_sp < COLOR_STACK_MAX) {
+        color_stack[color_sp] = c;
+        color_sp += 1;
+    } else color_skip += 1;
+}
+fn popColor() void {
+    if (color_skip > 0) color_skip -= 1 else if (color_sp > 0) color_sp -= 1;
+}
+fn resetColorStack() void {
+    color_sp = 0;
+    color_skip = 0;
+}
+
+const NamedColor = struct { name: []const u8, rgb: u32 };
+const named_colors = [_]NamedColor{
+    .{ .name = "black", .rgb = 0x000000 },     .{ .name = "white", .rgb = 0xFFFFFF },
+    .{ .name = "red", .rgb = 0xFF0000 },       .{ .name = "lime", .rgb = 0x00FF00 },
+    .{ .name = "green", .rgb = 0x008000 },     .{ .name = "blue", .rgb = 0x0000FF },
+    .{ .name = "yellow", .rgb = 0xFFFF00 },    .{ .name = "cyan", .rgb = 0x00FFFF },
+    .{ .name = "aqua", .rgb = 0x00FFFF },      .{ .name = "magenta", .rgb = 0xFF00FF },
+    .{ .name = "fuchsia", .rgb = 0xFF00FF },   .{ .name = "silver", .rgb = 0xC0C0C0 },
+    .{ .name = "gray", .rgb = 0x808080 },      .{ .name = "grey", .rgb = 0x808080 },
+    .{ .name = "maroon", .rgb = 0x800000 },    .{ .name = "olive", .rgb = 0x808000 },
+    .{ .name = "purple", .rgb = 0x800080 },    .{ .name = "teal", .rgb = 0x008080 },
+    .{ .name = "navy", .rgb = 0x000080 },      .{ .name = "orange", .rgb = 0xFFA500 },
+    .{ .name = "pink", .rgb = 0xFFC0CB },      .{ .name = "brown", .rgb = 0xA52A2A },
+    .{ .name = "gold", .rgb = 0xFFD700 },      .{ .name = "indigo", .rgb = 0x4B0082 },
+    .{ .name = "violet", .rgb = 0xEE82EE },    .{ .name = "crimson", .rgb = 0xDC143C },
+    .{ .name = "salmon", .rgb = 0xFA8072 },    .{ .name = "coral", .rgb = 0xFF7F50 },
+    .{ .name = "tomato", .rgb = 0xFF6347 },    .{ .name = "khaki", .rgb = 0xF0E68C },
+    .{ .name = "lightgray", .rgb = 0xD3D3D3 }, .{ .name = "lightgrey", .rgb = 0xD3D3D3 },
+    .{ .name = "darkgray", .rgb = 0xA9A9A9 },  .{ .name = "darkgrey", .rgb = 0xA9A9A9 },
+    .{ .name = "lightblue", .rgb = 0xADD8E6 }, .{ .name = "steelblue", .rgb = 0x4682B4 },
+    .{ .name = "royalblue", .rgb = 0x4169E1 }, .{ .name = "skyblue", .rgb = 0x87CEEB },
+    .{ .name = "darkred", .rgb = 0x8B0000 },   .{ .name = "darkgreen", .rgb = 0x006400 },
+    .{ .name = "darkblue", .rgb = 0x00008B },  .{ .name = "tan", .rgb = 0xD2B48C },
+};
+
+fn hexNibble(c: u8) ?u32 {
+    return switch (c) {
+        '0'...'9' => c - '0',
+        'a'...'f' => @as(u32, c - 'a') + 10,
+        'A'...'F' => @as(u32, c - 'A') + 10,
+        else => null,
+    };
+}
+
+fn trimWs(s: []const u8) []const u8 {
+    var a: usize = 0;
+    var b: usize = s.len;
+    while (a < b and (s[a] == ' ' or s[a] == '\t' or s[a] == '\r' or s[a] == '\n')) a += 1;
+    while (b > a and (s[b - 1] == ' ' or s[b - 1] == '\t' or s[b - 1] == '\r' or s[b - 1] == '\n')) b -= 1;
+    return s[a..b];
+}
+
+/// Lift a color's luminance so it stays legible on the dark reader theme.
+/// Pages author colors for LIGHT backgrounds (black body text, navy headings),
+/// which would vanish on our dark bg; too-dark values are scaled up channel-
+/// wise (hue-preserving, bright channels saturate) until they clear MIN_LUM.
+fn readableOnDark(rgb: u32) u32 {
+    const r: u32 = (rgb >> 16) & 0xFF;
+    const g: u32 = (rgb >> 8) & 0xFF;
+    const b: u32 = rgb & 0xFF;
+    const lum = (r * 30 + g * 59 + b * 11) / 100;
+    if (lum >= MIN_LUM) return rgb;
+    if (lum == 0) return 0xD6DAE0; // pure black → default light text
+    const nr: u32 = @min(@as(u32, 255), r * MIN_LUM / lum);
+    const ng: u32 = @min(@as(u32, 255), g * MIN_LUM / lum);
+    const nb: u32 = @min(@as(u32, 255), b * MIN_LUM / lum);
+    return (nr << 16) | (ng << 8) | nb;
+}
+
+/// Parse a CSS color value (#rgb, #rrggbb, or a named color) → 0xRRGGBB,
+/// luminance-lifted for the dark theme. null for anything else (rgb()/hsl()/
+/// inherit/…), so the caller keeps the inherited color.
+fn parseColor(raw: []const u8) ?u32 {
+    const s = trimWs(raw);
+    if (s.len == 0) return null;
+    if (s[0] == '#') {
+        const hex = s[1..];
+        if (hex.len == 3) {
+            var v: u32 = 0;
+            for (hex) |c| {
+                const n = hexNibble(c) orelse return null;
+                v = (v << 8) | (n << 4) | n; // #abc → #aabbcc
+            }
+            return readableOnDark(v);
+        } else if (hex.len == 6) {
+            var v: u32 = 0;
+            for (hex) |c| {
+                const n = hexNibble(c) orelse return null;
+                v = (v << 4) | n;
+            }
+            return readableOnDark(v);
+        }
+        return null;
+    }
+    for (named_colors) |nc| {
+        if (eqlLower(s, nc.name)) return readableOnDark(nc.rgb);
+    }
+    return null;
+}
+
+/// Within a CSS `style` attribute value, return the `color` property's value
+/// (NOT background-color). Matches `color` only at a property boundary (start,
+/// ';', or whitespace) so `background-color` is skipped.
+fn findStyleColor(style: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (i + 5 <= style.len) : (i += 1) {
+        if (!eqlLower(style[i .. i + 5], "color")) continue;
+        if (i > 0) {
+            const p = style[i - 1];
+            if (isAlpha(p) or p == '-') continue; // e.g. background-color
+        }
+        var j = i + 5;
+        while (j < style.len and (style[j] == ' ' or style[j] == '\t')) : (j += 1) {}
+        if (j >= style.len or style[j] != ':') continue;
+        j += 1;
+        const start = j;
+        while (j < style.len and style[j] != ';') : (j += 1) {}
+        return style[start..j];
+    }
+    return null;
+}
+
+/// Author color from a tag's attributes: `style="…color:…"` first, then a
+/// legacy `color="…"` attribute (<font color>). null = no author color.
+fn colorFromAttrs(tag_inner: []const u8) ?u32 {
+    if (findAttr(tag_inner, "style")) |st| {
+        if (findStyleColor(st)) |cv| {
+            if (parseColor(cv)) |c| return c;
+        }
+    }
+    if (findAttr(tag_inner, "color")) |cv| {
+        if (parseColor(cv)) |c| return c;
+    }
+    return null;
+}
+
+// ---------------------------------------------------------------------
 // Block-tag → block parameters. Returns null for tags we don't open a block
 // for (inline / container / unknown).
 
@@ -439,6 +600,7 @@ pub fn parse(d: *render.Document, html: []const u8, th: render.Theme) void {
     pre_depth = 0;
     sp_pending = false;
     nl_run = 0;
+    resetColorStack();
 
     var i: usize = 0;
     while (i < html.len) {
@@ -556,7 +718,17 @@ fn handleTag(name: []const u8, tag_inner: []const u8, closing: bool) void {
         applyStyle();
         return;
     }
-    if (eqlLower(name, "i") or eqlLower(name, "em") or eqlLower(name, "span") or
+    if (eqlLower(name, "span") or eqlLower(name, "font")) {
+        // Inline color carrier. Push this element's author color (or inherit
+        // the current one so the matching close pops cleanly). No font/face or
+        // size handling — we have no italic/size variants.
+        if (!closing) {
+            pushColor(colorFromAttrs(tag_inner) orelse currentInlineColor());
+        } else popColor();
+        applyStyle();
+        return;
+    }
+    if (eqlLower(name, "i") or eqlLower(name, "em") or
         eqlLower(name, "u") or eqlLower(name, "small") or eqlLower(name, "abbr") or
         eqlLower(name, "cite") or eqlLower(name, "sub") or eqlLower(name, "sup"))
     {
@@ -607,14 +779,14 @@ fn handleTag(name: []const u8, tag_inner: []const u8, closing: bool) void {
     if (eqlLower(name, "li")) {
         if (!closing) {
             const ind = currentIndent() + BULLET_GAP;
-            openBlock(.body, baseColorForDepth(), ind, 2, 2, .disc);
+            openBlock(.body, colorFromAttrs(tag_inner) orelse baseColorForDepth(), ind, 2, 2, .disc);
         } else closeBlock();
         return;
     }
     if (eqlLower(name, "pre")) {
         if (!closing) {
             pre_depth += 1;
-            openBlock(.mono, baseColorForDepth(), currentIndent(), 8, 8, .none);
+            openBlock(.mono, colorFromAttrs(tag_inner) orelse baseColorForDepth(), currentIndent(), 8, 8, .none);
         } else {
             closeBlock();
             if (pre_depth > 0) pre_depth -= 1;
@@ -623,13 +795,13 @@ fn handleTag(name: []const u8, tag_inner: []const u8, closing: bool) void {
     }
     if (eqlLower(name, "p")) {
         if (!closing) {
-            openBlock(.body, baseColorForDepth(), currentIndent(), PARA_GAP, PARA_GAP, .none);
+            openBlock(.body, colorFromAttrs(tag_inner) orelse baseColorForDepth(), currentIndent(), PARA_GAP, PARA_GAP, .none);
         } else closeBlock();
         return;
     }
     if (headingSpec(name)) |spec| {
         if (!closing) {
-            openBlock(spec.font, theme.text, currentIndent(), spec.sb, spec.sa, .none);
+            openBlock(spec.font, colorFromAttrs(tag_inner) orelse theme.text, currentIndent(), spec.sb, spec.sa, .none);
         } else closeBlock();
         return;
     }
@@ -642,7 +814,7 @@ fn handleTag(name: []const u8, tag_inner: []const u8, closing: bool) void {
     }
     if (isStructuralBlock(name)) {
         if (!closing) {
-            openBlock(.body, baseColorForDepth(), currentIndent(), 0, 0, .none);
+            openBlock(.body, colorFromAttrs(tag_inner) orelse baseColorForDepth(), currentIndent(), 0, 0, .none);
         } else closeBlock();
         return;
     }

@@ -214,6 +214,54 @@ fn relayout() void {
 // ---------------------------------------------------------------------
 // Fetch + navigation.
 
+// Built-in start page (about:home). Rendered from this baked-in document
+// instead of fetched — it's the launch page and doubles as a showcase of the
+// inline author-color support (style="color:" + <font color>, hex + named,
+// nested, dark-value lift). Bookmarks are full URLs so followLink resolves
+// them straight through.
+const HOME_HTML =
+    \\<h1 style="color:#6fb0ff">ZigOS Browser</h1>
+    \\<p style="color:#9aa4b2">A small from-scratch TLS&nbsp;1.3 reader. Type a URL in the bar above and press Enter, or follow a link below.</p>
+    \\<h2 style="color:gold">Author colors</h2>
+    \\<p>Inline colors now render &mdash;
+    \\<span style="color:red">red</span>,
+    \\<span style="color:orange">orange</span>,
+    \\<span style="color:gold">gold</span>,
+    \\<span style="color:lime">lime</span>,
+    \\<span style="color:cyan">cyan</span>,
+    \\<span style="color:#b48aff">#b48aff</span>, and
+    \\<font color="violet">&lt;font color&gt;</font> too.
+    \\They <span style="color:lime">nest <span style="color:tomato">correctly</span> like this</span>,
+    \\and dark values stay legible on the dark theme:
+    \\<span style="color:black">black</span>,
+    \\<span style="color:navy">navy</span>,
+    \\<span style="color:darkred">darkred</span>.</p>
+    \\<h2 style="color:gold">Bookmarks</h2>
+    \\<ul>
+    \\<li><a href="https://example.com">example.com</a> &mdash; the canonical test page</li>
+    \\<li><a href="https://info.cern.ch">info.cern.ch</a> &mdash; the first website (1991)</li>
+    \\<li><a href="https://danluu.com">danluu.com</a> &mdash; plain-text essays</li>
+    \\<li><a href="https://motherfuckingwebsite.com">motherfuckingwebsite.com</a> &mdash; minimalism</li>
+    \\<li><a href="https://en.wikipedia.org/wiki/Operating_system">Wikipedia: Operating system</a> &mdash; text + images</li>
+    \\</ul>
+    \\<h2 style="color:gold">Keys</h2>
+    \\<ul>
+    \\<li>Type a URL + <b>Enter</b> to load (https:// assumed)</li>
+    \\<li>Click links; <b>Backspace</b> edits the address, <b>Esc</b> clears it</li>
+    \\<li><b>Arrows</b> / PgUp / PgDn / Home / End / wheel to scroll</li>
+    \\<li><b>Alt</b>+arrows for back / forward</li>
+    \\</ul>
+;
+
+fn isHome(u: []const u8) bool {
+    const h = "about:home";
+    if (u.len != h.len) return false;
+    for (u, h) |a, b| {
+        if (a != b) return false;
+    }
+    return true;
+}
+
 fn loadUrl(u: []const u8) void {
     const un = @min(u.len, current_url.len);
     @memcpy(current_url[0..un], u[0..un]);
@@ -224,6 +272,20 @@ fn loadUrl(u: []const u8) void {
 
     markVisited(current_url[0..current_url_len]);
     hovered_link = -1;
+
+    // Built-in start page — render the baked-in document instead of fetching.
+    if (isHome(u)) {
+        freeImages();
+        html.parse(&doc, HOME_HTML, theme);
+        scroll_y = 0;
+        relayout();
+        applyVisited();
+        setStatusStr("ZigOS Browser — start page", false);
+        drawAll(&g_canvas);
+        libc.present();
+        return;
+    }
+
     setStatusStr("Loading...", false);
     // Show the new address + "Loading..." over the (still-valid) old page for
     // immediate feedback, THEN release the old page's images and fetch.
@@ -352,6 +414,13 @@ fn fetchImages() void {
 
 /// Navigate to a freshly-typed/followed URL: normalize, record history, load.
 fn go(raw: []const u8) void {
+    // about:home is a sentinel, not a real URL — skip normalize (which would
+    // prepend https://) and render the baked-in start page.
+    if (isHome(raw)) {
+        history.visit("about:home");
+        loadUrl("about:home");
+        return;
+    }
     var norm: [webnav.MAX_URL]u8 = undefined;
     const url = webnav.normalizeUrl(raw, &norm);
     if (url.len == 0) return;
@@ -524,7 +593,7 @@ export fn _start() linksection(".text.entry") callconv(.c) void {
 
     scrollbar.lines_per_notch = 3 * lineStep(); // pixel-mode wheel step
 
-    go("example.com");
+    go("about:home");
     drawAll(&g_canvas);
     libc.present();
 
