@@ -845,15 +845,39 @@ pub fn isValidKstackTopShape(top: usize) bool {
 ///   - stale PCB residue after slot recycle
 pub var expected_kstack_tops: [MAX_PROCS]usize = [_]usize{0} ** MAX_PROCS;
 
+/// Verdict for a dispatch-time kernel_stack_top check. Separates the BENIGN
+/// "no witness recorded" case from a genuine cross-PCB leak:
+///   - .ok         expected != 0 AND top == expected (verified good)
+///   - .no_witness expected == 0 — the witness isn't recorded (yet). Happens
+///                 in two documented races and is NOT corruption: create
+///                 (scheduler observed the slot .ready before the witness
+///                 .release store landed) and teardown (a kill on another CPU
+///                 zeroed the witness while a stale dispatch was in flight).
+///                 Can't be cross-checked, so callers must treat it as
+///                 not-applicable — exactly as checkStackCanary, watch.zig and
+///                 pcb_invariants already do. Treating it as corruption was a
+///                 box-wedging false positive under schedstress (2026-06-24).
+///   - .mismatch   expected != 0 AND top != expected — a DIFFERENT valid-
+///                 looking value leaked into kernel_stack_top: the real wild-
+///                 write this detector exists for.
+pub const KstackTopVerdict = enum { ok, no_witness, mismatch };
+
+pub fn kstackTopVerdict(pid: usize, top: usize) KstackTopVerdict {
+    if (pid >= MAX_PROCS) return .mismatch; // out-of-range pid: a real bug, not a race
+    const expected = @atomicLoad(usize, &expected_kstack_tops[pid], .acquire);
+    if (expected == 0) return .no_witness; // witness not recorded (create-pre-stamp / teardown race)
+    return if (top == expected) .ok else .mismatch;
+}
+
 /// True iff `top` matches the expected kernel_stack_top recorded at create
 /// time for `pid`. Tightened from isValidKstackTopShape (which only
 /// checks "is this any plausible top") to a per-PID exact match —
 /// catches cross-PCB leaks that the shape check would silently accept.
+/// A witness-less slot (expected==0) returns false here, preserving the old
+/// contract; callers that must distinguish "no witness" from "real mismatch"
+/// (e.g. gdt.setTssRsp0) use kstackTopVerdict instead.
 pub fn isValidKstackTop(pid: usize, top: usize) bool {
-    if (pid >= MAX_PROCS) return false;
-    const expected = @atomicLoad(usize, &expected_kstack_tops[pid], .acquire);
-    if (expected == 0) return false; // slot never initialized
-    return top == expected;
+    return kstackTopVerdict(pid, top) == .ok;
 }
 
 /// True if `addr` falls inside any kstack pool guard region (bottom 4KB of a

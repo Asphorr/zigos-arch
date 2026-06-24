@@ -9,11 +9,26 @@ const PORT: u16 = 0x3F8; // COM1
 const LSR: u16 = PORT + 5;
 const LSR_THR_EMPTY: u8 = 0x20; // bit 5 — holding reg empty, OK to queue a byte
 const LSR_TEMT: u8 = 0x40; // bit 6 — transmitter fully drained (FIFO + shift reg)
-// Hard spin cap for every emergency LSR poll, so a wedged or absent UART
-// can never turn a crash dump into a *second* hang. ~1M pause-spins is
-// well under a millisecond of real time but far longer than QEMU needs to
-// drain one byte.
-const EMERG_SPIN_CAP: u32 = 1_000_000;
+// Per-byte cap for emergency LSR THR-empty polls. Each poll is an `inb`
+// VM-exit under nested Hyper-V, so the old 1M cap could cost ~0.5s PER BYTE
+// on a non-draining UART — a multi-KB dumpAll() at IF=0 then ran for tens of
+// seconds and tripped the peer watchdog (the schedstress setTssRsp0 autopsy
+// wedge, 2026-06-24). 8192 is ample headroom for a healthy-but-busy FIFO yet
+// bails in <10ms when the UART is wedged. emergencyPutChar layers two TOTAL
+// bounds on top of this per-byte cap (stall-streak giveup + throttle-byte
+// budget) so an oversized or stalled crash dump can never outlive the watchdog.
+const EMERG_SPIN_CAP: u32 = 8192;
+// After this many consecutive bytes each hit the full poll cap, the UART is
+// deemed not draining at all (host detached / serial load-shed) and the
+// emergency writer stops waiting entirely — fire-and-forget for the rest.
+const EMERG_STALL_GIVEUP: u32 = 32;
+// Total bytes the emergency writer will THR-throttle (wait for FIFO space)
+// before degrading to fire-and-forget. Serial is ~11.5 KB/s at 115200 baud
+// and this path runs with interrupts off, so a dump larger than this can't
+// shift out within the watchdog's ~3s tick-stall budget; past it we stop
+// waiting (bytes may drop if the FIFO is full, but the CPU keeps moving and
+// the in-memory ring still holds the full text for /dev/kmsg).
+const EMERG_THROTTLE_BUDGET: u32 = 12 * 1024;
 
 // Cross-CPU write lock. Without this, fire-and-forget putChar calls from
 // BSP and AP interleave at byte granularity (a `[smp.timing]` line gets
@@ -266,12 +281,43 @@ fn ringPushSafe(c: u8) void {
 /// (capped) for THR-empty so the FIFO doesn't drop bytes, then writes.
 /// Takes NO lock and does NO cli — safe to call from an NMI handler that
 /// may have interrupted a normal `write` that still holds write_lock.
+// Emergency-path degrade state. Module-level so the panicking CPU and a
+// peer's NMI snapshot share it. Monotonic atomics — torn races are fine (same
+// tolerance as ringPushSafe); never reset except the streak on a good drain.
+// emergency_mode is a one-way latch, so this is a one-shot panic-path counter.
+var emerg_stall_streak: u32 = 0;
+var emerg_slow_bytes: u32 = 0;
+
 fn emergencyPutChar(c: u8) void {
+    // Two TOTAL degrade paths keep an oversized or stalled crash dump from
+    // becoming a multi-second IF=0 hang that trips the peer watchdog (the
+    // schedstress setTssRsp0 autopsy wedge, 2026-06-24):
+    //   (a) UART not draining at all — once EMERG_STALL_GIVEUP bytes in a row
+    //       hit the full poll cap, stop waiting.
+    //   (b) UART draining but baud-limited — after EMERG_THROTTLE_BUDGET bytes
+    //       of throttled output, stop waiting so the tail can't run past the
+    //       watchdog.
+    // In either degraded state we still outb the byte (it may drop if the FIFO
+    // is full); the in-memory ring keeps the full text for /dev/kmsg.
+    const stalled = @atomicLoad(u32, &emerg_stall_streak, .monotonic) >= EMERG_STALL_GIVEUP;
+    const over_budget = @atomicLoad(u32, &emerg_slow_bytes, .monotonic) >= EMERG_THROTTLE_BUDGET;
+    if (stalled or over_budget) {
+        io.outb(PORT, c);
+        return;
+    }
+    _ = @atomicRmw(u32, &emerg_slow_bytes, .Add, 1, .monotonic);
     var spins: u32 = 0;
     while (spins < EMERG_SPIN_CAP) : (spins += 1) {
-        if (io.inb(LSR) & LSR_THR_EMPTY != 0) break;
+        if (io.inb(LSR) & LSR_THR_EMPTY != 0) {
+            @atomicStore(u32, &emerg_stall_streak, 0, .monotonic); // drained → reset streak
+            io.outb(PORT, c);
+            return;
+        }
         asm volatile ("pause");
     }
+    // Hit the cap — this byte didn't drain. Bump the stall streak; once it
+    // crosses EMERG_STALL_GIVEUP we stop waiting on subsequent bytes.
+    _ = @atomicRmw(u32, &emerg_stall_streak, .Add, 1, .monotonic);
     io.outb(PORT, c);
 }
 

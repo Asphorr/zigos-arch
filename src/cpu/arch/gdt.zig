@@ -94,23 +94,63 @@ pub fn setTssRsp0(pid: usize, rsp0: u64) void {
     // lives in a separate static array (not inside procs[]) so a wild
     // writer scribbling inside one PCB can't simultaneously corrupt the
     // witness.
-    if (!process.isValidKstackTop(pid, rsp0)) {
-        const debug = @import("../../debug/debug.zig");
-        const expected = if (pid < @import("../../config.zig").MAX_PROCS)
-            @atomicLoad(usize, &process.expected_kstack_tops[pid], .acquire)
-        else
-            0;
-        const shape_ok = process.isValidKstackTopShape(rsp0);
-        debug.klog(
-            "[setTssRsp0] CORRUPTION pid={d} rsp0=0x{X:0>16} expected=0x{X:0>16} shape_ok={any}\n",
-            .{ pid, rsp0, expected, shape_ok },
-        );
-        // Dump all kdbg rings so we can see who else dispatched this
-        // slot — typically the wild writer's PID is the dispatch
-        // immediately before the corruption.
-        @import("../../debug/kdbg.zig").enterCritical();
-        @import("../../debug/kdbg.zig").dumpAll();
-        @panic("setTssRsp0: rsp0 mismatch — pcb.kernel_stack_top corrupted (cross-PCB leak?)");
+    switch (process.kstackTopVerdict(pid, rsp0)) {
+        .ok => {},
+        .no_witness => {
+            // expected_kstack_tops[pid] == 0: the immutable witness isn't
+            // recorded. BENIGN, NOT corruption. The live case is the TEARDOWN
+            // race — a kill on another CPU zeros the witness (lifecycle
+            // teardown) while this stale dispatch is already in flight.
+            // sched.zig's kill-kick race doc already redirects the prev_save
+            // side to dead-letter on expected==0; this is the matching guard
+            // for the dispatch side — the lone unguarded path.
+            //   (The create direction can't actually reach here: the witness
+            //   is .release-stamped BEFORE setState(.ready) and pickNext only
+            //   dispatches .ready tasks, so on x86-TSO any CPU that observes
+            //   .ready also observes witness != 0. Handled for completeness.)
+            // No witness ⇒ nothing to cross-check ⇒ panicking here was a false
+            // positive that WEDGED the box under schedstress (2026-06-24): the
+            // autopsy ran via the emergency serial path under sched_lock with
+            // IF=0. Mirror checkStackCanary / watch.zig / pcb_invariants, which
+            // all treat expected==0 as not-applicable.
+            //
+            // In the live teardown case kernel_stack_top is NOT zeroed (only
+            // the witness is), so rsp0 is still the previous valid pool top ⇒
+            // shape-valid ⇒ we fall through and write it harmlessly. The
+            // skip-write below is a defensive net for a "can't happen"
+            // witness-less + bad-shape state: rather than load a known-bad
+            // rsp0 (instant #DF on the next ring transition) we leave TSS.RSP0
+            // stale (itself unusual, but the lesser evil) and log via the
+            // normal fire-and-forget klog, never the box-wedging emergency dump.
+            if (!process.isValidKstackTopShape(rsp0)) {
+                @import("../../debug/debug.zig").klog(
+                    "[setTssRsp0] witness-less AND bad-shape rsp0=0x{X:0>16} pid={d} — skipping TSS.RSP0 write\n",
+                    .{ rsp0, pid },
+                );
+                return;
+            }
+            // shape-valid witness-less top: a real kstack edge, safe to load.
+        },
+        .mismatch => {
+            // expected != 0 AND rsp0 != expected: a DIFFERENT valid-looking
+            // value leaked into procs[pid].kernel_stack_top — the genuine
+            // cross-PCB-leak / wild-write this detector exists for. Dump all
+            // kdbg rings (the wild writer's PID is usually the dispatch
+            // immediately before) and panic at the bad slot rather than letting
+            // the value reach TSS.RSP0 and crash deep inside doSyscall.
+            const debug = @import("../../debug/debug.zig");
+            const expected = if (pid < @import("../../config.zig").MAX_PROCS)
+                @atomicLoad(usize, &process.expected_kstack_tops[pid], .acquire)
+            else
+                0;
+            debug.klog(
+                "[setTssRsp0] CORRUPTION pid={d} rsp0=0x{X:0>16} expected=0x{X:0>16} shape_ok={any}\n",
+                .{ pid, rsp0, expected, process.isValidKstackTopShape(rsp0) },
+            );
+            @import("../../debug/kdbg.zig").enterCritical();
+            @import("../../debug/kdbg.zig").dumpAll();
+            @panic("setTssRsp0: rsp0 mismatch — pcb.kernel_stack_top corrupted (cross-PCB leak?)");
+        },
     }
     const cpu = smp.myCpu();
     // KCSAN-lite: watch the TSS slot we're about to overwrite for an
