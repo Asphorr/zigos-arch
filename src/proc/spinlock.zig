@@ -1,19 +1,137 @@
-const std = @import("std");
-const witness = @import("../debug/witness.zig");
+// spinlock — SMP locking primitives: the ticket SpinLock, the sleep-aware
+// Mutex, and the autopsy machinery around them (lock registry, cli-hold
+// records, spin-target tracking) that lets a wedged boot name its own killer.
+//
+// ============================ STYLE ORIENTIR =================================
+//
+// This file is the reference for how ZigOS kernel code wants to be written.
+// It was chosen because locking primitives stabilize early and change rarely,
+// so the rules can live next to code that demonstrates every one of them
+// without churning. When an older file and a rule below disagree, the rule
+// wins for NEW code; old files converge when touched. New rules are ratified
+// by adding them here — and by making this file obey them first.
+//
+//  1. IMPORTS AT THE TOP, GROUPED, HONEST. The import block below is the
+//     file's true dependency list — a reader learns what this file can touch
+//     without reading a thousand lines. No mid-function @import. Core deps
+//     are grouped apart from diagnostics-only deps so the coupling that
+//     matters stands out. (@import resolves at comptime and file-scope cycles
+//     are legal in Zig, so hoisting costs nothing.)
+//
+//  2. COMMENTS STATE THE CURRENT INVARIANT AND WHY IT HOLDS — never what the
+//     next line does, and never only a story. When history genuinely explains
+//     the shape of the code, label it "History:" so the reader knows it
+//     describes the past (see the cli-hold banner). A comment describing
+//     behavior the code no longer has is a bug — the fossil-comment class the
+//     2026-06-11 workaround audit dug out of virtio_gpu.zig.
+//
+//  3. EVERY ATOMIC CARRIES ITS PROTOCOL. State the pairing rule once ("every
+//     cross-CPU reader of holder_cpu atomic-loads .acquire; the winning
+//     acquirer stores .release" — see the field doc) and follow it at every
+//     site. Never a bare .seq_cst "to be safe": if you can't say why an
+//     ordering is needed, you don't yet understand the race you're in.
+//
+//  4. SENTINELS AND TUNABLES HAVE NAMES, AT THEIR DEFINITION, WITH UNITS IN
+//     THE NAME (_MS, _TSC, _ROUNDS): NO_HOLDER_CPU, SPIN_WARN_ROUNDS,
+//     CLI_HOLD_THRESHOLD_MS. A bare 0xFFFF in a comparison is a landmine for
+//     the next grep.
+//
+//  5. RELATED BOUNDS ARE TIED TOGETHER BY comptime ASSERTS, not by hope.
+//     MAX_HOLD_CPUS ↔ smp.MAX_CPUS and MAX_NAMED_LOCKS ↔ witness.MAX_CLASSES
+//     below turn silent drift into compile errors.
+//
+//  6. DIAGNOSTICS ARE BOUNDED AND OFF THE HOT PATH. Rate-cap or one-shot
+//     every print (acquire()'s `warned`); on hot paths RECORD-only into fixed
+//     slots and let a slow drain print under a budget (the cli-hold seqlock
+//     slots → smi.tick). An unbounded klog storm once NMI-wedged the whole
+//     box (2026-06-20 serial flood) — a diagnostic that can kill the patient
+//     is worse than the disease.
+//
+//  7. EVERY pub DECL DOCUMENTS ITS CONTRACT, NOT ITS IMPLEMENTATION: who
+//     calls it, from what context (IRQ? cli'd? cross-CPU?), what may be
+//     stale, and what the caller owes afterward (see releaseIrqRestore,
+//     sampleHold, forceReleaseIfOwnedBy).
+//
+//  8. CONTEXT REQUIREMENTS ARE EXPLICIT AND, WHERE CHEAP, ASSERTED.
+//     "Requires the lock" is assertHeld at the top of the function, not a
+//     comment somebody will skip (Linux lockdep_assert_held analogue).
+//
+//  9. FIXED-SIZE, ALLOCATION-FREE BY DEFAULT; the overflow / registry-full
+//     behavior is stated at the definition (registry full ⇒ the lock stays
+//     functional, just unnamed in autopsies).
+//
+// 10. A PRIMITIVE'S DOC ANSWERS "WHEN DO I USE THIS INSTEAD OF THAT" at the
+//     type itself — see the Mutex banner's SpinLock-vs-Mutex guide. If
+//     choosing wrong deadlocks the kernel, the type definition is where the
+//     guidance belongs, not a wiki.
+//
+// 11. FUNCTIONS STAY SMALL ENOUGH TO HOLD THEIR INVARIANTS IN ONE READ. When
+//     a function grows phases, the phases get names (helpers or labeled
+//     blocks). schedule()'s 672 lines is the cautionary tale, not the
+//     license.
+//
+// 12. FAIL LOUDLY, WITH THE REASON IN THE LOG. No `catch {}`; no silent
+//     `return null` on a failure path that took hours to reach — the TLS
+//     hunt (2026-06-18) burned a day on exactly that. Every bail says why
+//     (see Mutex.acquire's no-task CAS-failure breadcrumb).
+// =============================================================================
 
-/// Ticket-based spinlock for SMP synchronization.
-/// Uses @atomicRmw for lock-free ticket acquisition.
+const std = @import("std");
+
+// Core — what the primitives themselves need to function.
+const smp = @import("../cpu/smp.zig");
+const apic = @import("../time/apic.zig"); // LAPIC id = this file's CPU identity
+const process = @import("process.zig"); // Mutex block/wake integration
+
+// Diagnostics-only — autopsy, tracing, liveness. Nothing in this group
+// affects lock SEMANTICS: a build that stubbed these out would still lock
+// correctly, it just couldn't tell you anything when it wedges.
+const witness = @import("../debug/witness.zig");
+const serial = @import("../debug/serial.zig");
+const symbols = @import("../debug/symbols.zig");
+const kdbg = @import("../debug/kdbg.zig");
+const perf = @import("../debug/perf.zig");
+const smi = @import("../time/smi.zig");
+
+/// SpinLock.holder_cpu value meaning "held by nobody".
+pub const NO_HOLDER_CPU: u8 = 0xFF;
+/// witness_class value meaning "never registered with the lock registry".
+pub const UNREGISTERED_CLASS: u8 = 0xFF;
+
+// --- Spin-loop tunables (rule 4: named, units in the name) -------------------
+/// Cap on `pause` instructions per backoff burst — the ceiling of acquire()'s
+/// ticket-distance-proportional backoff.
+const BACKOFF_MAX_PAUSES: u32 = 32;
+/// Spin rounds between vm_alive_pulse bumps from a contended waiter.
+/// Power of two; used as a mask.
+const ALIVE_PULSE_EVERY_ROUNDS: u64 = 4096;
+/// Same-CPU-holder diagnosis threshold (~4M rounds, order 100 ms): that
+/// situation can never resolve by waiting (see acquire()), so diagnose early
+/// instead of sitting out the generic warn threshold.
+const SAME_CPU_DIAG_ROUNDS: u64 = 1 << 22;
+/// Generic long-spin warning threshold, ≈ seconds on KVM (longer on real HW
+/// once backoff distance stretches each round). Long spin = almost always a
+/// missing release or a cross-CPU deadlock.
+const SPIN_WARN_ROUNDS: u64 = 200_000_000;
+
+/// Ticket spinlock for SMP synchronization. FIFO by construction: waiters
+/// take a ticket (@atomicRmw Add) and spin until now_serving reaches it, so
+/// no waiter starves. Every field beyond the two counters is diagnostics
+/// riding along so autopsies can name holders — none of it affects exclusion.
 pub const SpinLock = struct {
     next_ticket: u32 = 0,
     now_serving: u32 = 0,
-    /// WITNESS lock-order class, set by registerLock. 0xFF = unregistered
+    /// WITNESS lock-order class, set by registerLock. UNREGISTERED_CLASS
     /// (the common case) → the lock-order hooks below are skipped entirely.
-    witness_class: u8 = 0xFF,
+    witness_class: u8 = UNREGISTERED_CLASS,
     /// Holder diagnostics — populated after acquire wins, cleared on
     /// release. Read by the spin-warn diagnostic so a deadlock dump
     /// names not just the spinner but the CPU + RIP that's still
-    /// sitting on the lock. 0xFF cpu = unheld.
-    holder_cpu: u8 = 0xFF,
+    /// sitting on the lock. NO_HOLDER_CPU = unheld. Protocol (rule 3):
+    /// every cross-CPU reader (assertHeld, the same-CPU spin diag,
+    /// dumpHeldLocksOlderThan, cpuHoldsAnyLock) atomic-loads holder_cpu
+    /// .acquire; the winning acquirer stores it .release.
+    holder_cpu: u8 = NO_HOLDER_CPU,
     holder_ra: u64 = 0,
     /// TSC at the moment `acquireIrqSave` returned. Read by
     /// `releaseIrqRestore` to compute the cli-held duration and record
@@ -38,12 +156,9 @@ pub const SpinLock = struct {
     /// next-in-line waiter (D==1) still polls at ~max rate so handoff
     /// latency is unchanged from the unbacked-off case.
     ///
-    /// After ~200M poll iterations (≈seconds on KVM, longer on real HW
-    /// once distance>1 stretches each iteration) we log a one-shot
-    /// warning naming both the caller (return address) and the current
-    /// holder (cpu + ra). Long spin = almost always a missing release
-    /// or a cross-CPU deadlock; the log line is enough for symbols.zig
-    /// to resolve both ends.
+    /// After SPIN_WARN_ROUNDS poll iterations we log a one-shot warning
+    /// naming both the caller (return address) and the current holder
+    /// (cpu + ra) — enough for symbols.zig to resolve both ends.
     ///
     /// Involuntary-preemption pin: the whole acquire+hold window bumps
     /// this CPU's `preempt_pin`, dropped by release() — see the
@@ -77,8 +192,7 @@ pub const SpinLock = struct {
                 @atomicStore(u8, &self.holder_cpu, cpu, .release);
                 self.holder_ra = ra;
                 if (comptime witness.enabled) {
-                    if (self.witness_class != 0xFF) {
-                        const smp = @import("../cpu/smp.zig");
+                    if (self.witness_class != UNREGISTERED_CLASS) {
                         witness.spinAcquire(self.witness_class, cpu, smp.myCpu().current_pid, ra);
                     }
                 }
@@ -88,7 +202,7 @@ pub const SpinLock = struct {
             // u32 wrapping subtract: handles next_ticket overflow correctly
             // since both values are mod 2^32 of the same monotonic counter.
             const distance: u32 = ticket -% serving;
-            const cap: u32 = if (distance > 32) 32 else distance;
+            const cap: u32 = if (distance > BACKOFF_MAX_PAUSES) BACKOFF_MAX_PAUSES else distance;
             var i: u32 = 0;
             while (i < cap) : (i += 1) asm volatile ("pause");
             spins +%= 1;
@@ -96,25 +210,25 @@ pub const SpinLock = struct {
             // (acquireIrqSave spins cli'd) — pulse the VM-liveness witness
             // so a peer's long hold that we're queued on isn't mistaken
             // for a whole-VM host freeze (see cliHoldCheck's verdict).
-            if (spins & 0xFFF == 0) {
+            if (spins & (ALIVE_PULSE_EVERY_ROUNDS - 1) == 0) {
                 noteAlivePulse();
                 // Same-CPU holder while we spin can never resolve on its
                 // own: the preempt pin means a holder is never parked
                 // mid-hold, so a holder_cpu equal to OURS is either our own
                 // caller (recursion) or this CPU's interrupted context (an
                 // IRQ path acquiring what its interruptee holds) — both
-                // spin forever. Diagnose at ~4M rounds (order 100ms)
-                // instead of waiting out the generic 200M warn. (A task
-                // that slept holding the lock and resumed on another CPU
-                // can clear this — recoverable, hence diag, not panic.)
-                if (!warned and spins >= (1 << 22) and
+                // spin forever. Diagnose at SAME_CPU_DIAG_ROUNDS instead of
+                // waiting out the generic warn. (A task that slept holding
+                // the lock and resumed on another CPU can clear this —
+                // recoverable, hence diag, not panic.)
+                if (!warned and spins >= SAME_CPU_DIAG_ROUNDS and
                     @atomicLoad(u8, &self.holder_cpu, .acquire) == cpu)
                 {
                     warned = true;
                     printSpinDiag(self, ticket, serving, ra);
                 }
             }
-            if (!warned and spins > 200_000_000) {
+            if (!warned and spins > SPIN_WARN_ROUNDS) {
                 warned = true;
                 printSpinDiag(self, ticket, serving, ra);
             }
@@ -141,9 +255,9 @@ pub const SpinLock = struct {
         // id (an uncached MMIO load) for witness + the unpin below.
         const cpu = self.holder_cpu;
         if (comptime witness.enabled) {
-            if (self.witness_class != 0xFF) witness.spinRelease(self.witness_class, cpu);
+            if (self.witness_class != UNREGISTERED_CLASS) witness.spinRelease(self.witness_class, cpu);
         }
-        @atomicStore(u8, &self.holder_cpu, 0xFF, .release);
+        @atomicStore(u8, &self.holder_cpu, NO_HOLDER_CPU, .release);
         // Clear the IrqSave bracket stamp here too: a lock acquired via
         // acquireIrqSave but released via plain release() would otherwise
         // keep a stale acquire_tsc, and the NEXT plain acquire/release
@@ -159,8 +273,9 @@ pub const SpinLock = struct {
         // handler nets ZERO on the pin (its own acquire/release pair), so an
         // in-flight decrement can't be lost to interleaving — and preemption
         // from here is impossible while the count is still raised.
-        // The 0xFF guard makes a double-release skip the decrement instead
-        // of underflowing the pin into a permanently-unpreemptible CPU.
+        // A double-release reads cpu == NO_HOLDER_CPU (≥ MAX_HOLD_CPUS), so
+        // the bounds guard skips the decrement instead of underflowing the
+        // pin into a permanently-unpreemptible CPU.
         if (cpu < MAX_HOLD_CPUS and preempt_pin[cpu] != 0) preempt_pin[cpu] -= 1;
     }
 
@@ -169,7 +284,7 @@ pub const SpinLock = struct {
         const flags = saveAndDisableIrq();
         self.acquire();
         self.acquire_pulse = @atomicLoad(u64, &vm_alive_pulse, .monotonic);
-        self.acquire_tsc = @import("../debug/perf.zig").rdtsc();
+        self.acquire_tsc = perf.rdtsc();
         return flags;
     }
 
@@ -195,6 +310,12 @@ pub const SpinLock = struct {
 /// floor the SMI classifier uses; anything above that is provably too
 /// long regardless of why.
 const CLI_HOLD_THRESHOLD_MS: u64 = 5;
+
+/// Minimum hold duration for the freeze-vs-hold verdict to run. 250 ms =
+/// 2.5× the AP idle one-shot cap (10 quanta, rearmTimerForCurrent), so an
+/// alive-but-idle AP is guaranteed ≥2 pulses inside the window. Below this
+/// the witness has no resolution and the verdict stays .unverified.
+const FREEZE_VERDICT_MIN_MS: u64 = 250;
 
 // =============================================================================
 // cli-hold recording — record-only at release; smi.tick prints.
@@ -241,12 +362,12 @@ pub inline fn noteAlivePulse() void {
 }
 
 /// == smp.MAX_CPUS (LAPIC ids are bounded below it at MADT collection).
-/// Kept as a local constant so this file stays a top-level leaf; the
-/// comptime check below keeps the two from drifting apart.
+/// Local mirror so every per-CPU array in this file reads as this file's
+/// own bound; the comptime check keeps the two from drifting (rule 5).
 pub const MAX_HOLD_CPUS: usize = 32;
 
 comptime {
-    if (MAX_HOLD_CPUS != @import("../cpu/smp.zig").MAX_CPUS) {
+    if (MAX_HOLD_CPUS != smp.MAX_CPUS) {
         @compileError("MAX_HOLD_CPUS must equal smp.MAX_CPUS — per-CPU slots below are indexed by LAPIC id");
     }
 }
@@ -328,6 +449,33 @@ pub fn preemptionPinned() bool {
     return preempt_pin[cpu] != 0;
 }
 
+/// Pin this CPU against involuntary dynirq preemption WITHOUT holding a
+/// SpinLock — for code whose correctness depends on not migrating mid-flight
+/// (tlb.doShootdown: its cached sender identity and ack accounting both break
+/// if schedule() moves it to another CPU). Same per-CPU counter as the
+/// SpinLock hold window, same cli microwindow so an IRQ can't land between
+/// reading the CPU id and bumping that CPU's counter. IRQs stay serviced
+/// while pinned; only the epilogue reschedule is deferred. Returns the pinned
+/// CPU's LAPIC id: pass it unmodified to unpinPreemption (the pin makes
+/// migration impossible, so the id stays this CPU's for the whole window),
+/// and it doubles as a migration-stable "who am I" for the pinned region.
+pub fn pinPreemption() u8 {
+    const flags = saveAndDisableIrq();
+    const cpu = currentCpuId();
+    if (cpu < MAX_HOLD_CPUS) preempt_pin[cpu] += 1;
+    restoreIrq(flags);
+    return cpu;
+}
+
+/// Drop a pinPreemption pin. `cpu` MUST be the id pinPreemption returned.
+/// Non-cli decrement is safe for the same reason release()'s is: IRQ handlers
+/// net the counter to zero, and migration is impossible while the count is
+/// raised. Bounds/zero guards mirror release() — a bogus id or double-unpin
+/// must not underflow a counter into a permanently-unpreemptible CPU.
+pub fn unpinPreemption(cpu: u8) void {
+    if (cpu < MAX_HOLD_CPUS and preempt_pin[cpu] != 0) preempt_pin[cpu] -= 1;
+}
+
 pub const HoldVerdict = enum(u8) { unverified, vm_alive, vm_frozen };
 
 /// One recorded cli-hold. Written by the owning CPU under the seqlock
@@ -393,10 +541,8 @@ inline fn isKernelTextAddr(v: u64) bool {
 }
 
 fn cliHoldCheck(self: *SpinLock, start_tsc: u64, start_pulse: u64, ra: u64, cpu_id: u8) void {
-    const apic = @import("../time/apic.zig");
     const per_q = apic.tscPerQuantum();
     if (per_q == 0) return; // pre-calibration; no useful conversion
-    const perf = @import("../debug/perf.zig");
     const delta = perf.rdtsc() -% start_tsc;
     // tsc_per_quantum covers 10 ms; threshold in TSC = per_q * (ms/10)
     const threshold_tsc = per_q * CLI_HOLD_THRESHOLD_MS / 10;
@@ -406,10 +552,9 @@ fn cliHoldCheck(self: *SpinLock, start_tsc: u64, start_pulse: u64, ra: u64, cpu_
     // Freeze-vs-hold verdict — see the vm_alive_pulse block comment.
     var verdict: HoldVerdict = .unverified;
     var pulse_delta: u64 = 0;
-    const verdict_min_tsc = per_q * 25; // 250 ms = 2.5× the AP idle one-shot cap
+    const verdict_min_tsc = per_q * FREEZE_VERDICT_MIN_MS / 10;
     if (delta >= verdict_min_tsc) {
         pulse_delta = @atomicLoad(u64, &vm_alive_pulse, .monotonic) -% start_pulse;
-        const smp = @import("../cpu/smp.zig");
         if (smp.cpu_count > 1) {
             verdict = if (pulse_delta == 0) .vm_frozen else if (pulse_delta >= 2) .vm_alive else .unverified;
         }
@@ -455,15 +600,15 @@ fn cliHoldCheck(self: *SpinLock, start_tsc: u64, start_pulse: u64, ra: u64, cpu_
     @atomicStore(u32, &slot.seq, s +% 2, .release); // even: stable
 
     // No PM_TMR on this board → smi.tick never drains the slots. Rare
-    // config (q35 always has one); print directly, hard-capped per boot.
-    if (!@import("../time/smi.zig").isActive()) {
+    // config (q35 always has one); print directly, hard-capped per boot
+    // (rule 6: even the fallback path has a budget).
+    if (!smi.isActive()) {
         const S = struct {
+            const PRINT_CAP: u32 = 32;
             var printed: u32 = 0;
         };
-        if (S.printed < 32) {
+        if (S.printed < S.PRINT_CAP) {
             S.printed += 1;
-            const symbols = @import("../debug/symbols.zig");
-            const serial = @import("../debug/serial.zig");
             const ms = delta * 10 / per_q;
             if (symbols.resolveKernel(ra)) |r| {
                 serial.print("[cli-hold] cpu{d} lock@0x{X} {d} ms at {s}+0x{X} (no-smi fallback)\n", .{ cpu_id, @intFromPtr(self), ms, r.name, r.offset });
@@ -474,8 +619,10 @@ fn cliHoldCheck(self: *SpinLock, start_tsc: u64, start_pulse: u64, ra: u64, cpu_
     }
 }
 
+/// This CPU's LAPIC id — the identity every per-CPU slot in this file is
+/// indexed by. 0 before the APIC comes up (early boot is single-threaded,
+/// so the aliasing is harmless).
 fn currentCpuId() u8 {
-    const apic = @import("../time/apic.zig");
     if (!apic.apic_active) return 0;
     return @as(u8, @truncate(apic.getLapicId()));
 }
@@ -491,9 +638,6 @@ fn currentCpuId() u8 {
 /// currently IS (could be in the wait loop, past it but stuck on a
 /// nested call, etc.). NMI snapshots dump live RIP from every CPU.
 fn printSpinDiag(self: *SpinLock, ticket: u32, serving: u32, ra: usize) void {
-    const symbols = @import("../debug/symbols.zig");
-    const serial = @import("../debug/serial.zig");
-    const kdbg = @import("../debug/kdbg.zig");
     const caller = symbols.resolveKernel(ra);
     const holder = symbols.resolveKernel(self.holder_ra);
     serial.print("[lock-spin] cpu{d} waiting on lock@0x{X} ticket={d} now_serving={d} caller=", .{
@@ -557,29 +701,31 @@ fn restoreIrq(flags: u64) void {
 // is negligible vs the wait time we're already paying.
 // =============================================================================
 
+/// Mutex.owner_pid sentinel: nobody holds it.
+pub const NO_OWNER: u16 = 0xFFFF;
+
 /// Mutex.owner_pid sentinel for holds taken from a context with no
 /// current_pid. Outside the valid pid range (MAX_PROCS=64) and distinct
-/// from the 0xFFFF "unowned" sentinel, so forceReleaseIfOwnedBy(real pid)
-/// can never match it.
+/// from NO_OWNER, so forceReleaseIfOwnedBy(real pid) can never match it.
 pub const NO_TASK_OWNER: u16 = 0xFFFE;
 
 pub const Mutex = struct {
-    /// 0xFFFF = unowned. 0xFFFE (NO_TASK_OWNER) = held from a no-task
-    /// context (pre-scheduler boot thread, or an IRQ that landed before the
+    /// NO_OWNER = unowned. NO_TASK_OWNER = held from a no-task context
+    /// (pre-scheduler boot thread, or an IRQ that landed before the
     /// first dispatch). Otherwise = PID of holder.
-    owner_pid: u16 = 0xFFFF,
+    owner_pid: u16 = NO_OWNER,
     /// Diagnostic: where the current/last holder acquired the lock.
     /// Held across release as a "last holder" hint for post-mortems.
     holder_ra: u64 = 0,
-    /// WITNESS lock-order class, set by registerMutex. 0xFF = unregistered.
-    witness_class: u8 = 0xFF,
+    /// WITNESS lock-order class, set by registerMutex.
+    witness_class: u8 = UNREGISTERED_CLASS,
 
     /// Non-blocking, non-trapping observe: is this mutex currently held by
     /// SOMEBODY (any pid)? Snapshot only — value may be stale by the time
     /// the caller acts. Used by panic_screen to decide whether to skip a
     /// GPU flush that would recursively acquire ctrl_lock and self-deadlock.
     pub fn isHeld(self: *const Mutex) bool {
-        return @atomicLoad(u16, &self.owner_pid, .acquire) != 0xFFFF;
+        return @atomicLoad(u16, &self.owner_pid, .acquire) != NO_OWNER;
     }
 
     /// Runtime check that THIS PID holds the lock. Inline call at the
@@ -587,15 +733,19 @@ pub const Mutex = struct {
     /// for the rationale.
     pub inline fn assertHeld(self: *const Mutex) void {
         if (std.debug.runtime_safety) {
-            const smp = @import("../cpu/smp.zig");
             const cur = smp.myCpu().current_pid orelse return;
             std.debug.assert(@atomicLoad(u16, &self.owner_pid, .acquire) == @as(u16, @intCast(cur)));
         }
     }
 
+    /// Acquire, sleeping on contention (blockOnMutex — NOT IRQ-safe; task
+    /// context only, though a no-task boot/IRQ caller degrades to a sentinel
+    /// claim, see below). Recursive acquire by the owning pid would sleep
+    /// waiting for itself, so it panics immediately with both acquire sites
+    /// symbol-resolved (reproduced 2026-05-17: desktop's GPU flush nested
+    /// ctrl_lock; root-caused via [lock-dump] + [wake-skip] cross-reference).
     pub fn acquire(self: *Mutex) void {
         const ra = @returnAddress();
-        const smp = @import("../cpu/smp.zig");
         const cur_opt = smp.myCpu().current_pid;
         if (cur_opt == null) {
             // No-task context — pre-scheduler boot. The old stamp-only
@@ -608,25 +758,18 @@ pub const Mutex = struct {
             // code (a no-task acquire of a held mutex can only be the
             // boot thread self-nesting — excluding would self-wedge the
             // boot) but say so: it means the inner release will free the
-            // outer hold early, which is worth a breadcrumb.
-            if (@cmpxchgStrong(u16, &self.owner_pid, 0xFFFF, NO_TASK_OWNER, .acquire, .monotonic) != null) {
-                const serial = @import("../debug/serial.zig");
+            // outer hold early, which is worth a breadcrumb (rule 12).
+            if (@cmpxchgStrong(u16, &self.owner_pid, NO_OWNER, NO_TASK_OWNER, .acquire, .monotonic) != null) {
                 serial.print("[mutex] no-task acquire of held mutex@0x{X} (boot self-nest?)\n", .{@intFromPtr(self)});
             }
             self.holder_ra = ra;
             return;
         }
         const my_pid: u16 = @intCast(cur_opt.?);
-        // Recursive-acquire detector. If we're already the holder, sleeping
-        // on the contended path would be a permanent self-deadlock — only
-        // we can release, and we're about to sleep waiting for ourselves.
-        // Panic HERE with the original acquire site + the recursive caller
-        // so the bug is debuggable. (Reproduced 2026-05-17: desktop's
-        // GPU flush path nested ctrl_lock.acquire while already holding;
-        // root-caused via [lock-dump] + [wake-skip] cross-reference.)
+        // Recursive-acquire detector — see the doc comment. Panic HERE with
+        // the original acquire site + the recursive caller so the bug is
+        // debuggable at first occurrence, not after a timing-lucky boot.
         if (@atomicLoad(u16, &self.owner_pid, .acquire) == my_pid) {
-            const serial = @import("../debug/serial.zig");
-            const symbols = @import("../debug/symbols.zig");
             serial.print("\n!!! Mutex RECURSIVE ACQUIRE by pid={d} !!!\n", .{my_pid});
             serial.print("  mutex @ 0x{X:0>16}\n", .{@intFromPtr(self)});
             if (symbols.resolveKernel(self.holder_ra)) |h| {
@@ -647,12 +790,11 @@ pub const Mutex = struct {
             // Use currentCpuId() (LAPIC id) to match the spin hooks — both
             // index witness's spin_held[] and must agree on the numbering, or
             // the sleep-with-spinlock check reads the wrong CPU's held-set.
-            if (self.witness_class != 0xFF) witness.mutexAcquire(self.witness_class, currentCpuId(), my_pid, ra);
+            if (self.witness_class != UNREGISTERED_CLASS) witness.mutexAcquire(self.witness_class, currentCpuId(), my_pid, ra);
         }
-        const process = @import("process.zig");
         while (true) {
             // Fast path: claim the lock atomically.
-            if (@cmpxchgStrong(u16, &self.owner_pid, 0xFFFF, my_pid, .acquire, .monotonic) == null) {
+            if (@cmpxchgStrong(u16, &self.owner_pid, NO_OWNER, my_pid, .acquire, .monotonic) == null) {
                 self.holder_ra = ra;
                 return;
             }
@@ -670,54 +812,54 @@ pub const Mutex = struct {
     /// about. No-task context mirrors acquire(): stamp and succeed.
     pub fn tryAcquire(self: *Mutex) bool {
         const ra = @returnAddress();
-        const smp = @import("../cpu/smp.zig");
         const cur_opt = smp.myCpu().current_pid;
         if (cur_opt == null) {
             // Honest even with no task: claim the sentinel or report
             // failure. (The old unconditional `return true` let an
             // IRQ-context tryAcquire during a boot-thread hold walk
             // straight into the live critical section.)
-            if (@cmpxchgStrong(u16, &self.owner_pid, 0xFFFF, NO_TASK_OWNER, .acquire, .monotonic) != null) {
+            if (@cmpxchgStrong(u16, &self.owner_pid, NO_OWNER, NO_TASK_OWNER, .acquire, .monotonic) != null) {
                 return false;
             }
             self.holder_ra = ra;
             return true;
         }
         const my_pid: u16 = @intCast(cur_opt.?);
-        if (@cmpxchgStrong(u16, &self.owner_pid, 0xFFFF, my_pid, .acquire, .monotonic) != null) {
+        if (@cmpxchgStrong(u16, &self.owner_pid, NO_OWNER, my_pid, .acquire, .monotonic) != null) {
             return false;
         }
         if (comptime witness.enabled) {
             // After the CAS (we never sleep here, so the pre-park ordering
             // concern in acquire() doesn't apply) — but still recorded, so
             // release()'s witness.mutexRelease stays balanced.
-            if (self.witness_class != 0xFF) witness.mutexAcquire(self.witness_class, currentCpuId(), my_pid, ra);
+            if (self.witness_class != UNREGISTERED_CLASS) witness.mutexAcquire(self.witness_class, currentCpuId(), my_pid, ra);
         }
         self.holder_ra = ra;
         return true;
     }
 
+    /// Release and wake ALL waiters (thundering-herd policy — see the
+    /// banner). Contract: caller owns the mutex (or the no-task sentinel).
+    /// Ownership clears BEFORE the wake so woken waiters observe the free
+    /// state and can win their retry CAS.
     pub fn release(self: *Mutex) void {
-        const smp = @import("../cpu/smp.zig");
         if (smp.myCpu().current_pid == null) {
             // No-task context: clear the sentinel claim (no-op if a boot
             // self-nest's inner release already freed it). Wake on success
             // is cheap pre-scheduler (procs[] all .unused → no-op) and
             // closes the lost-wake hole if a task ever DOES contend a
             // sentinel-held mutex.
-            if (@cmpxchgStrong(u16, &self.owner_pid, NO_TASK_OWNER, 0xFFFF, .release, .monotonic) == null) {
-                const process = @import("process.zig");
+            if (@cmpxchgStrong(u16, &self.owner_pid, NO_TASK_OWNER, NO_OWNER, .release, .monotonic) == null) {
                 process.wakeMutexWaiters(@truncate(@intFromPtr(self)));
             }
             return;
         }
         if (comptime witness.enabled) {
-            if (self.witness_class != 0xFF) witness.mutexRelease(self.witness_class, smp.myCpu().current_pid.?);
+            if (self.witness_class != UNREGISTERED_CLASS) witness.mutexRelease(self.witness_class, smp.myCpu().current_pid.?);
         }
         // Clear ownership BEFORE waking waiters: they retry CAS on wake
         // and need to observe the free state.
-        @atomicStore(u16, &self.owner_pid, 0xFFFF, .release);
-        const process = @import("process.zig");
+        @atomicStore(u16, &self.owner_pid, NO_OWNER, .release);
         process.wakeMutexWaiters(@truncate(@intFromPtr(self)));
     }
 
@@ -734,10 +876,9 @@ pub const Mutex = struct {
     /// double-wake. Wake waiters AFTER the CAS so they observe the free
     /// state and re-CAS for acquire.
     pub fn forceReleaseIfOwnedBy(self: *Mutex, pid: u16) bool {
-        if (@cmpxchgStrong(u16, &self.owner_pid, pid, 0xFFFF, .release, .monotonic) != null) {
+        if (@cmpxchgStrong(u16, &self.owner_pid, pid, NO_OWNER, .release, .monotonic) != null) {
             return false; // not held by `pid` (or not held at all)
         }
-        const process = @import("process.zig");
         process.wakeMutexWaiters(@truncate(@intFromPtr(self)));
         return true;
     }
@@ -748,7 +889,6 @@ pub const Mutex = struct {
 /// O(named_lock_count) — small fixed bound, runs once per teardown.
 /// Spin locks are skipped (no per-pid ownership; they're held by CPU).
 pub fn releaseMutexesOwnedBy(pid: u16) void {
-    const serial = @import("../debug/serial.zig");
     // Drop WITNESS's per-pid mutex-held bits so a force-release doesn't
     // strand a stale bit into the next task that reuses this pid slot.
     if (comptime witness.enabled) witness.threadExit(pid);
@@ -819,8 +959,8 @@ pub fn registerMutex(name: []const u8, lock: *Mutex) void {
 /// single WITNESS lock-order class. Returns the class so the caller can tag
 /// every instance (`lock.witness_class = class`); `representative` is tagged
 /// here and is the instance the [lock-dump] autopsy will name (one class can't
-/// name N distinct holders anyway). Returns 0xFF if the registry is full, in
-/// which case the caller must skip tagging.
+/// name N distinct holders anyway). Returns UNREGISTERED_CLASS if the registry
+/// is full, in which case the caller must skip tagging.
 ///
 /// SOUND ONLY when no single CPU ever holds two instances of the family at
 /// once: the held-set carries one bit per CPU, so a second same-class acquire
@@ -830,7 +970,7 @@ pub fn registerMutex(name: []const u8, lock: *Mutex) void {
 /// own (see sched.zig); cross-CPU wakeups go through the reschedule IPI, which
 /// makes the *remote* CPU take its own lock.
 pub fn registerLockClass(name: []const u8, representative: *SpinLock) u8 {
-    if (named_lock_count >= MAX_NAMED_LOCKS) return 0xFF;
+    if (named_lock_count >= MAX_NAMED_LOCKS) return UNREGISTERED_CLASS;
     const class = named_lock_count;
     representative.witness_class = class;
     named_locks[class] = .{ .name = name, .kind = .spin, .ptr = @intFromPtr(representative) };
@@ -846,15 +986,13 @@ pub fn registerLockClass(name: []const u8, representative: *SpinLock) u8 {
 /// does not hold cli and cannot cause an SMI-style stall. Cheap O(N) over
 /// MAX_NAMED_LOCKS (=32) — safe to call from smi.tick().
 pub fn dumpHeldLocksOlderThan(now_tsc: u64, threshold_ticks: u64) void {
-    const serial = @import("../debug/serial.zig");
-    const symbols = @import("../debug/symbols.zig");
     var i: u8 = 0;
     while (i < named_lock_count) : (i += 1) {
         const ent = &named_locks[i];
         if (ent.ptr == 0 or ent.kind != .spin) continue;
         const lock: *SpinLock = @ptrFromInt(ent.ptr);
         const cpu = @atomicLoad(u8, &lock.holder_cpu, .acquire);
-        if (cpu == 0xFF) continue;
+        if (cpu == NO_HOLDER_CPU) continue;
         const ts = @atomicLoad(u64, &lock.acquire_tsc, .acquire);
         if (ts == 0 or now_tsc <= ts) continue;
         const held = now_tsc - ts;
@@ -903,7 +1041,7 @@ pub fn lockName(addr: usize) ?[]const u8 {
     }
     const lock: *const SpinLock = @ptrFromInt(addr);
     const cls = lock.witness_class;
-    if (cls != 0xFF and cls < named_lock_count and named_locks[cls].kind == .spin)
+    if (cls != UNREGISTERED_CLASS and cls < named_lock_count and named_locks[cls].kind == .spin)
         return named_locks[cls].name;
     return null;
 }
@@ -916,8 +1054,6 @@ pub fn lockName(addr: usize) ?[]const u8 {
 /// unregistered lock (per-PID setstate_locks[], per-rq rq.lock) is invisible
 /// there — this is the line that names it. Call after peers are halted.
 pub fn dumpSpinTargets() void {
-    const serial = @import("../debug/serial.zig");
-    const symbols = @import("../debug/symbols.zig");
     serial.print("[spin-targets] lock each CPU is spinning to acquire (the contended lock [lock-dump] can't show):\n", .{});
     var any = false;
     var c: usize = 0;
@@ -928,9 +1064,9 @@ pub fn dumpSpinTargets() void {
         const lock: *SpinLock = @ptrFromInt(addr);
         serial.print("  cpu{d} -> lock@0x{X}", .{ c, addr });
         const cls = lock.witness_class;
-        if (cls != 0xFF and cls < named_lock_count) serial.print(" '{s}'", .{named_locks[cls].name});
+        if (cls != UNREGISTERED_CLASS and cls < named_lock_count) serial.print(" '{s}'", .{named_locks[cls].name});
         const hcpu = @atomicLoad(u8, &lock.holder_cpu, .acquire);
-        if (hcpu == 0xFF) serial.print(" holder=free(last", .{}) else serial.print(" holder_cpu={d}(at", .{hcpu});
+        if (hcpu == NO_HOLDER_CPU) serial.print(" holder=free(last", .{}) else serial.print(" holder_cpu={d}(at", .{hcpu});
         if (lock.holder_ra != 0) {
             if (symbols.resolveKernel(lock.holder_ra)) |r| {
                 serial.print(" {s}+0x{X})", .{ r.name, r.offset });
@@ -948,8 +1084,6 @@ pub fn dumpSpinTargets() void {
 /// last acquire site. Called from the panic / watchdog autopsy AFTER
 /// peer CPUs are halted via broadcastNMI.
 pub fn dumpAllLocks() void {
-    const serial = @import("../debug/serial.zig");
-    const symbols = @import("../debug/symbols.zig");
     serial.print("[lock-dump] ({d} registered locks)\n", .{named_lock_count});
     var i: u8 = 0;
     while (i < named_lock_count) : (i += 1) {
@@ -961,7 +1095,7 @@ pub fn dumpAllLocks() void {
                 const serving = @atomicLoad(u32, &lock.now_serving, .acquire);
                 const ticket = @atomicLoad(u32, &lock.next_ticket, .acquire);
                 const waiters = ticket -% serving;
-                const held = lock.holder_cpu != 0xFF;
+                const held = lock.holder_cpu != NO_HOLDER_CPU;
                 if (held) {
                     serial.print("[lock-dump]   {s}: HELD by cpu{d} (waiters={d}) ra=", .{
                         ent.name, lock.holder_cpu, if (waiters > 0) waiters - 1 else 0,
@@ -989,7 +1123,7 @@ pub fn dumpAllLocks() void {
                     } else {
                         serial.print("0x{X}\n", .{lock.holder_ra});
                     }
-                } else if (owner != 0xFFFF) {
+                } else if (owner != NO_OWNER) {
                     serial.print("[lock-dump]   {s}: HELD by pid={d} ra=", .{ ent.name, owner });
                     if (symbols.resolveKernel(lock.holder_ra)) |r| {
                         serial.print("{s}+0x{X}\n", .{ r.name, r.offset });
