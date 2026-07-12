@@ -129,7 +129,13 @@ pub fn init() void {
     defer lock.release();
     for (&sets) |*set| {
         for (&set.ways) |*e| {
-            if (e.valid and pmm.frameRefCount(e.frame) == 1) pmm.releaseFrame(e.frame);
+            // Drop the CACHE's reference unconditionally (mirrors invalidate):
+            // refcount 1 → frame freed here; refcount > 1 → a mapper still
+            // holds it and it's freed by that mapper's own release. Gating
+            // this on refcount == 1 (the original code) ORPHANED the cache's
+            // ref for still-mapped frames: the mapper's later release parked
+            // the count at 1 forever — a permanent frame leak.
+            if (e.valid) pmm.releaseFrame(e.frame);
             e.* = .{};
         }
         set.hand = 0;
@@ -161,10 +167,11 @@ pub fn setIndexFor(file_id: u64, page_off: u64) u32 {
     return @intCast((h >> 17) & SET_MASK);
 }
 
-/// Find a resident page WITHOUT pinning it. The returned frame is only
-/// guaranteed alive for transient use under a higher-level lock (the eventual
-/// read() path copies out under `lock` via a future helper). For anything that
-/// outlives the call (a mapping), use `pin`. Returns null on miss.
+/// ⚠️ SELF-TEST ONLY. Find a resident page WITHOUT pinning it. The frame is
+/// unprotected the moment `lock` drops at return — concurrent eviction /
+/// invalidation can free it before the caller dereferences (UAF). That is
+/// tolerable only in the single-threaded self-test. Production readers use
+/// `pin` (see vfs.readThroughCache): copy under the pin, then releaseFrame.
 pub fn lookup(file_id: u64, page_off: u64) ?usize {
     lock.acquire();
     defer lock.release();
@@ -204,13 +211,20 @@ pub const GetResult = struct {
     fresh: bool, // true: freshly allocated, caller must fill it from disk; false: cache hit, already filled
 };
 
-/// Get the frame for (file_id, page_off), allocating + inserting a fresh frame
-/// on miss. On a hit returns {frame, fresh=false} (already populated). On a miss
-/// allocates a zeroed-by-pmm frame, inserts it (evicting an unpinned way of the
-/// set if the set is full), and returns {frame, fresh=true} so the caller fills
-/// it from disk. Returns null only if the set is entirely pinned AND no fresh
-/// frame is available — the caller then proceeds uncached (read into a private
-/// frame, exactly as today).
+/// ⚠️ SELF-TEST ONLY. Get the frame for (file_id, page_off), allocating +
+/// inserting a fresh frame on miss. On a hit returns {frame, fresh=false}
+/// (already populated). On a miss allocates a zeroed-by-pmm frame, inserts it,
+/// and returns {frame, fresh=true} for the caller to fill. Returns null only
+/// if the set is entirely pinned AND no fresh frame is available.
+///
+/// Why production paths must NOT use this: the miss path PUBLISHES the frame
+/// before the caller fills it — a concurrent pin() would map a garbage page —
+/// and the published frame is refcount-1 (cache-only), i.e. EVICTABLE while
+/// the caller's fill I/O is still writing into it (write-into-freed-frame).
+/// Both hazards vanish in the single-threaded self-test, which is what this
+/// predates-insertFilled API is kept for. Real code uses pin + insertFilled
+/// (fill a private frame with no lock held, publish atomically) — see
+/// vfs.readThroughCache and fault.faultInCachePage.
 pub fn getOrAlloc(file_id: u64, page_off: u64) ?GetResult {
     lock.acquire();
     defer lock.release();

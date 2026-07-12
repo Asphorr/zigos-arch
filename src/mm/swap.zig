@@ -15,12 +15,16 @@
 // entirely ours. It's the 3rd `-device nvme` in run-uefi-ext2.sh and
 // enumerates as NVMe controller index SWAP_CTRL_IDX.
 
+const std = @import("std");
 const debug = @import("../debug/debug.zig");
 const pmm = @import("pmm.zig");
 const paging = @import("paging.zig");
 const nvme = @import("../driver/nvme.zig");
 const tlb = @import("../cpu/mmu/tlb.zig");
-const SpinLock = @import("../proc/spinlock.zig").SpinLock;
+const smp = @import("../cpu/smp.zig");
+const process = @import("../proc/process.zig");
+const spinlock = @import("../proc/spinlock.zig");
+const SpinLock = spinlock.SpinLock;
 
 // The swap device is the 3rd NVMe controller (0 = tarfs, 1 = ext2, 2 = swap).
 const SWAP_CTRL_IDX: usize = 2;
@@ -38,6 +42,20 @@ pub var available: bool = false;                                // (c) set in in
 var slot_used: [NUM_SLOTS / 8]u8 = [_]u8{0} ** (NUM_SLOTS / 8); // (p:slot_lock) free-slot bitmap
 var used_count: usize = 0;                                       // (a) bumped by alloc/freeSlot; consumers may read outside slot_lock
 var next_scan: usize = 0;                                        // (p:slot_lock) round-robin hint for allocSlot
+// Per-slot generation tag, embedded in every SWAPPED PTE (see makeSwapPte) and
+// bumped on every freeSlot. Kills the slot-reuse ABA in swapInFrame: it loads
+// the PTE (slot S), does a BLOCKING readPage(S), then commit-CASes — if in that
+// window another thread swapped the page in (freeing S), the user modified the
+// page, and it was re-evicted INTO S again (round-robin wrap), the PTE would be
+// bit-identical and the stale CAS would install pre-modification bytes: silent
+// user-data corruption. With the tag, a freed+reused slot can never reproduce
+// the old PTE, so the stale commit loses and the loser re-faults. A u8 wraps
+// only after 256 free+reuse cycles of the SAME slot within one load-to-CAS
+// window (each cycle a full evict+swap-in round trip) — not physical.
+// Writes are atomic RMW under slot_lock; makeSwapPte reads with @atomicLoad
+// monotonic (the slot's owner allocSlot'd it through the lock, which publishes
+// every prior bump; nobody can bump an owned slot's gen).
+var slot_gen: [NUM_SLOTS]u8 = [_]u8{0} ** NUM_SLOTS;
 // Guards slot_used + next_scan. Evict / swap-in run in the page-fault handler
 // on any CPU, so allocSlot/freeSlot must be serialized. NVMe I/O is done
 // OUTSIDE this lock (no I/O is held under it).
@@ -101,6 +119,8 @@ pub fn freeSlot(slot: u32) void {
         return;
     }
     bitClear(slot);
+    // Retire this slot's SWAPPED-PTE encoding (ABA guard — see slot_gen).
+    _ = @atomicRmw(u8, &slot_gen[slot], .Add, 1, .monotonic);
     _ = @atomicRmw(usize, &used_count, .Sub, 1, .monotonic);
 }
 
@@ -140,7 +160,7 @@ pub fn init() void {
     // WITNESS: track the slot-allocator lock (taken in the page-fault evict /
     // swap-in path) vs other subsystem locks. Registered only when swap is
     // actually live — past the no-device early return above.
-    @import("../proc/spinlock.zig").registerLock("swap.slots", &slot_lock);
+    spinlock.registerLock("swap.slots", &slot_lock);
     // Self-test runs SYNCHRONOUSLY because nvme.enableAsync() hasn't fired yet
     // at this point in init — async_mode is false on every controller. Once
     // enableAsync() flips this controller too (we no longer markSyncOnly), all
@@ -221,7 +241,8 @@ fn selfTest() void {
 //                                            .swap_evict until the eviction
 //                                            CASes the PTE to SWAPPED.
 //   SWAPPED       (bit 10 set, PRESENT=0) = page is on the swap disk. Slot
-//                                            index in bits 12+.
+//                                            index in bits 12+, slot generation
+//                                            tag above it (ABA guard, slot_gen).
 //   0                            = never faulted / discarded; first-fault path.
 //
 // COW is bit 9 — never collides with SWAPPED (10) or SWAP_INFLIGHT (11). The
@@ -241,13 +262,20 @@ const SLOT_SHIFT: u6 = 12;
 // physical-address field, since the SWAPPED PTE encoding lives there.
 const SLOT_BITS: u6 = @intCast(@bitSizeOf(usize) - @clz(@as(usize, NUM_SLOTS - 1)));
 const SLOT_MASK: u64 = (@as(u64, 1) << SLOT_BITS) - 1;
+// The slot's generation tag sits directly above the slot field (see slot_gen).
+// Only PTE bit-equality consumes it — nothing ever decodes it back out.
+const GEN_SHIFT: u6 = SLOT_SHIFT + SLOT_BITS;
 comptime {
-    @import("std").debug.assert(SLOT_SHIFT + SLOT_BITS <= 52);
-    @import("std").debug.assert((@as(usize, 1) << SLOT_BITS) >= NUM_SLOTS);
+    std.debug.assert(GEN_SHIFT + 8 <= 52); // gen tag inside the 52-bit phys field
+    std.debug.assert((@as(usize, 1) << SLOT_BITS) >= NUM_SLOTS);
 }
 
 inline fn makeSwapPte(slot: u32) u64 {
-    return (@as(u64, slot) << SLOT_SHIFT) | SWAPPED;
+    // Gen read is lock-free: the caller OWNS `slot` (between its allocSlot and
+    // freeSlot), and only freeSlot bumps a slot's gen — so the value is stable
+    // here. allocSlot's lock acquire published any prior owner's bump.
+    const gen = @atomicLoad(u8, &slot_gen[slot], .monotonic);
+    return (@as(u64, gen) << GEN_SHIFT) | (@as(u64, slot) << SLOT_SHIFT) | SWAPPED;
 }
 
 inline fn makeInflightPte(frame_phys: usize) u64 {
@@ -353,7 +381,6 @@ pub fn evictFrame(pte_ptr: *u64, va: usize, pcid: u16) bool {
     // [mtswap-trace] gated to stress-test pids (current_pid >= 4). evictFrame
     // is on the hot reclaim path; ungated logging would drown the log under
     // normal swap activity.
-    const smp = @import("../cpu/smp.zig");
     const evict_pid: u32 = if (smp.myCpu().current_pid) |p| @intCast(p) else 0xFF;
     const etrace = evict_pid >= 4;
     const ecpu = smp.myCpu().cpu_id;
@@ -383,7 +410,7 @@ pub fn evictFrame(pte_ptr: *u64, va: usize, pcid: u16) bool {
     // Publish the in-flight slot to the calling thread's PCB so process
     // teardown can free it if this thread is killed mid-writePage. Cleared
     // again at phase-3 commit / writePage-fail rollback.
-    @import("../proc/process.zig").setInflightSlot(slot);
+    process.setInflightSlot(slot);
     if (etrace) debug.klog("[mtswap-trace] pid={d} cpu{d} evict_p2_shootdown_begin va=0x{X} slot={d}\n", .{ evict_pid, ecpu, va, slot });
     // Shootdown BEFORE writePage so peers' TLBs can't satisfy writes via the
     // pre-CAS PRESENT entry. After shootdownPage returns, every CPU has
@@ -404,7 +431,7 @@ pub fn evictFrame(pte_ptr: *u64, va: usize, pcid: u16) bool {
         if (@cmpxchgStrong(u64, pte_ptr, inflight, original, .seq_cst, .seq_cst) == null) {
             tlb.shootdownPage(pcid, va);
         }
-        @import("../proc/process.zig").clearInflightSlot();
+        process.clearInflightSlot();
         freeSlot(slot);
         wakeSwapEvictWaiters(evictWaitTarget(pte_ptr));
         return false;
@@ -417,7 +444,7 @@ pub fn evictFrame(pte_ptr: *u64, va: usize, pcid: u16) bool {
         // unmapUserRange's PRESENT-branch race (which already freed the frame).
         // Don't double-free. The slot holds data nobody will ever read; free it.
         if (etrace) debug.klog("[mtswap-trace] pid={d} cpu{d} evict_p3_cas_lost\n", .{ evict_pid, ecpu });
-        @import("../proc/process.zig").clearInflightSlot();
+        process.clearInflightSlot();
         freeSlot(slot);
         wakeSwapEvictWaiters(evictWaitTarget(pte_ptr));
         return false;
@@ -425,7 +452,7 @@ pub fn evictFrame(pte_ptr: *u64, va: usize, pcid: u16) bool {
     // Frame is no longer referenced by any PTE; release it. No shootdown
     // needed here — phase 1's shootdown already cleared the present mapping,
     // and the in-flight→SWAPPED transition keeps PRESENT=0.
-    @import("../proc/process.zig").clearInflightSlot();
+    process.clearInflightSlot();
     pmm.freeFrame(frame);
     wakeSwapEvictWaiters(evictWaitTarget(pte_ptr));
     if (etrace) debug.klog("[mtswap-trace] pid={d} cpu{d} evict_done slot={d}\n", .{ evict_pid, ecpu, slot });
@@ -443,11 +470,9 @@ pub fn evictFrame(pte_ptr: *u64, va: usize, pcid: u16) bool {
 }
 
 /// Wake every thread blocked on `.swap_evict` with this target. Mirrors
-/// `wakeMutexWaiters`. Defined inline as a forward dispatch into process.zig
-/// so swap.zig doesn't take a hard dependency on the proc subsystem at file
-/// scope.
+/// `wakeMutexWaiters`; thin dispatch into the proc subsystem.
 fn wakeSwapEvictWaiters(target: u32) void {
-    @import("../proc/process.zig").wakeSwapEvictWaiters(target);
+    process.wakeSwapEvictWaiters(target);
 }
 
 /// Discard a clean, file-backed page: zero the PTE, shootdown, free the frame.
@@ -515,7 +540,6 @@ pub fn swapInFrame(pte_ptr: *u64, va: usize, flags: u64, pcid: u16) bool {
     }
     const slot = pteSlot(original);
     // [mtswap-trace] for the parked MT-stress wedge — see fault.zig.
-    const smp = @import("../cpu/smp.zig");
     const cur_pid: u32 = if (smp.myCpu().current_pid) |p| @intCast(p) else 0xFF;
     if (cur_pid >= 4) debug.klog("[mtswap-trace] pid={d} cpu{d} swapIn slot={d} alloc...\n", .{
         cur_pid, smp.myCpu().cpu_id, slot,
@@ -544,21 +568,25 @@ pub fn swapInFrame(pte_ptr: *u64, va: usize, flags: u64, pcid: u16) bool {
     });
     // CAS so two threads racing to swap-in the same VA don't both install
     // PTEs / free the slot. The loser frees its freshly-read frame; the
-    // slot was already freed by the winner. We then distinguish "lost race
-    // (PTE now PRESENT)" from genuine failure: if the PTE is PRESENT we
-    // return true so the caller treats this as a successful swap-in and
-    // retries the user access. (Returning false would cascade to
-    // trySwapInPage → .oom → handleUserPageFault OOM-killing the process.
-    // Reviewer-caught regression 2026-05-23.)
+    // slot was already freed by whoever moved the PTE on.
     const new_pte = (frame & paging.PAGE_MASK) | flags | paging.PRESENT;
     if (@cmpxchgStrong(u64, pte_ptr, original, new_pte, .seq_cst, .seq_cst)) |_| {
         pmm.freeFrame(frame);
-        // Re-read with acquire so the winner's PRESENT store is observed.
-        const post = @atomicLoad(u64, pte_ptr, .acquire);
         if (cur_pid >= 4) debug.klog("[mtswap-trace] pid={d} cpu{d} swapIn CAS_LOST post=0x{X}\n", .{
-            cur_pid, smp.myCpu().cpu_id, post,
+            cur_pid, smp.myCpu().cpu_id, @atomicLoad(u64, pte_ptr, .acquire),
         });
-        return (post & paging.PRESENT) != 0;
+        // CAS loss ⇒ another thread made progress on this PTE since our read.
+        // Every possible current state resolves through the caller's re-fault:
+        // PRESENT (winner installed — access just works), 0 (teardown/munmap —
+        // lazy reload or SIGSEGV, both correct), SWAPPED again (winner + user
+        // write + re-evict — next fault swaps it back in), SWAP_INFLIGHT
+        // (re-evict in progress — faulter blocks on .swap_evict). So report
+        // success unconditionally; only OUR OWN alloc/IO failures may return
+        // false. The old `post & PRESENT` filter wrongly cascaded the 0 and
+        // re-SWAPPED shapes to trySwapInPage → .oom → OOM-kill of an innocent
+        // process — the same CAS-loss regression class as 2026-05-23/24, one
+        // more spot those sweeps missed.
+        return true;
     }
     if (cur_pid >= 4) debug.klog("[mtswap-trace] pid={d} cpu{d} swapIn CAS_WON shootdown va=0x{X}\n", .{
         cur_pid, smp.myCpu().cpu_id, va,
