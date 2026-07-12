@@ -46,13 +46,20 @@
 // kvmalloc / kvfree (PMM-backed, page-multiples) are unchanged at the bottom
 // of this file. They're the right answer for >= KVMALLOC_THRESHOLD allocs.
 
+// Core:
 const std = @import("std");
+const memmap = @import("memmap.zig");
+const pmm = @import("pmm.zig");
+const paging = @import("paging.zig");
+const spinlock = @import("../proc/spinlock.zig");
+const SpinLock = spinlock.SpinLock;
+// Diagnostics:
 const debug = @import("../debug/debug.zig");
 const serial = @import("../debug/serial.zig");
 const vga = @import("../ui/vga.zig");
-const SpinLock = @import("../proc/spinlock.zig").SpinLock;
-const memmap = @import("memmap.zig");
-const pmm = @import("pmm.zig");
+const kasan = @import("../debug/kasan.zig");
+const kdbg = @import("../debug/kdbg.zig");
+const layout = @import("../debug/layout.zig");
 
 pub const HEAP_START: usize = memmap.PHYSMAP_BASE + memmap.KERNEL_HEAP_BASE;
 pub const HEAP_SIZE: usize = memmap.KERNEL_HEAP_SIZE;
@@ -68,11 +75,18 @@ const USER_OFFSET: usize = 16;
 const CANARY_TAIL_SIZE: usize = 4;
 // Min total block size: header + next + prev + footer = 32. Shrinking this
 // would silently overlap the prev pointer (offset 16) with the footer
-// (offset size-8) — see prevFreePtr at line ~165. Comptime-locked.
+// (offset size-8) — see prevFreePtr. Comptime-locked.
 const MIN_BLOCK_SIZE: usize = 32;
 comptime {
     if (MIN_BLOCK_SIZE < 32) @compileError("MIN_BLOCK_SIZE < 32 overlaps prev pointer with footer");
 }
+
+// The last MIN_BLOCK_SIZE bytes of the heap are a permanently-allocated
+// sentinel "wall" (written once in init): the last real block always has a
+// non-free, in-bounds neighbor, so coalesce-forward stops cleanly without
+// bounds-checking the heap end on every free. Never on a freelist, never
+// user-visible, carries no canaries.
+const WALL_ADDR: usize = HEAP_START + HEAP_SIZE - MIN_BLOCK_SIZE;
 
 const FLAG_THIS_FREE: usize = 1 << 0;
 const FLAG_PREV_FREE: usize = 1 << 1;
@@ -87,7 +101,6 @@ comptime {
     // naturally-aligned allocs. If any field widens, the user pointer math
     // breaks silently. See debug/layout.zig for why hand-overlaid storage
     // needs this gate (2026-05-28 heap freelist bug post-mortem).
-    const layout = @import("../debug/layout.zig");
     layout.assertFieldsExactFill(&.{
         .{ .name = "header",      .offset = 0,  .size = HEADER_SIZE },
         .{ .name = "user_size",   .offset = 8,  .size = @sizeOf(u32) },
@@ -143,9 +156,10 @@ var current_bytes: u64 = 0;
 var peak_bytes: u64 = 0;
 var free_bytes_remaining: u64 = 0;
 var free_block_count: u32 = 0;
+// Upper bound between recomputes: insertFreeBlock grows it, nothing shrinks
+// it on alloc. Every consumer that needs the true value (printDetailedStats,
+// snapshot, the alloc-fail log) calls recomputeLargestFreeBlock first.
 var largest_free_block: usize = 0;
-var ops_since_largest_recompute: u32 = 0;
-const RECOMPUTE_INTERVAL: u32 = 1024;
 
 // === Header helpers ===
 
@@ -196,7 +210,6 @@ comptime {
     // footer[MIN_BLOCK_SIZE-8..MIN_BLOCK_SIZE]. The .size for each link is
     // computed from @sizeOf(@TypeOf(deref)) so any future widening (e.g., a
     // refactor back to ?usize @ 16B) trips the assertion at compile time.
-    const layout = @import("../debug/layout.zig");
     layout.assertFieldsNonOverlap(&.{
         .{ .name = "header",    .offset = 0,                    .size = HEADER_SIZE },
         .{ .name = "next_free", .offset = 8,                    .size = @sizeOf(@TypeOf(nextFreePtr(0).*)) },
@@ -287,7 +300,6 @@ fn removeFreeBlock(addr: usize) void {
         }
     }
     if (free_block_count > 0) free_block_count -= 1;
-    ops_since_largest_recompute += 1;
 }
 
 // === Coalesce ===
@@ -297,25 +309,14 @@ inline fn prevPhysAddr(addr: usize) usize {
     const prev_size = readFooterAt(addr - FOOTER_SIZE);
     return addr - (prev_size & SIZE_MASK);
 }
-inline fn nextPhysAddr(addr: usize) usize {
-    return addr + blockSize(addr);
-}
-inline fn isLastBlock(addr: usize) bool {
-    return addr + blockSize(addr) >= HEAP_START + HEAP_SIZE;
-}
 
 // === Init ===
 
 pub fn init() void {
-    @import("../proc/spinlock.zig").registerLock("heap.lock", &lock);
-    // One big free block covering the whole heap, minus a synthetic
-    // sentinel at the very end (so the last real block's nextPhysAddr is
-    // never read past the heap). We just reserve 16 bytes at the end as a
-    // permanently-allocated "wall" — its only purpose is to give the last
-    // real block a non-free neighbor in front, so coalesce-forward stops
-    // cleanly without bounds-checking the heap end on every free.
-    const wall_addr = HEAP_START + HEAP_SIZE - MIN_BLOCK_SIZE;
-    const big_size = wall_addr - HEAP_START;
+    spinlock.registerLock("heap.lock", &lock);
+    // One big free block covering the whole heap, minus the sentinel wall
+    // at the very end (see WALL_ADDR).
+    const big_size = WALL_ADDR - HEAP_START;
 
     writeHeader(HEAP_START, big_size, true, false);
     writeFooter(HEAP_START);
@@ -324,7 +325,7 @@ pub fn init() void {
 
     // Sentinel "wall" — allocated, never freed, PREV_FREE set (the big
     // block in front of it IS free initially).
-    writeHeader(wall_addr, MIN_BLOCK_SIZE, false, true);
+    writeHeader(WALL_ADDR, MIN_BLOCK_SIZE, false, true);
 
     fl_bitmap = 0;
     @memset(sl_bitmaps[0..], 0);
@@ -364,6 +365,14 @@ pub fn kmallocAligned(size: usize, alignment: usize) ?[*]u8 {
         debug.klog("[tlsf] alloc fail: alignment {d} not power-of-two\n", .{alignment});
         return null;
     }
+    // Reject absurd requests up front: nothing past this point can succeed,
+    // and the size arithmetic below (prefix sums, the u32 user_size store)
+    // would otherwise trip ReleaseSafe overflow panics mid-computation
+    // instead of failing the documented way (log + null).
+    if (size > HEAP_SIZE or alignment > HEAP_SIZE) {
+        debug.klog("[tlsf] alloc fail: size={d} align={d} exceeds heap ({d})\n", .{ size, alignment, HEAP_SIZE });
+        return null;
+    }
     const irq_flags = lock.acquireIrqSave();
     defer lock.releaseIrqRestore(irq_flags);
 
@@ -387,6 +396,9 @@ pub fn kmallocAligned(size: usize, alignment: usize) ?[*]u8 {
     const m = mapping(rounded);
     const found = searchSuitableBlock(m.fl, m.sl) orelse {
         debug.klog("[tlsf] alloc fail: no block for size={d} align={d} need_block={d} search={d}\n", .{ size, alignment, need_block, search_size });
+        // largest_free_block is a stale upper bound between recomputes —
+        // refresh it so the OOM post-mortem shows the real ceiling.
+        recomputeLargestFreeBlock();
         debug.klog("[tlsf]   fl_bitmap=0x{X} free_blocks={d} free_bytes={d} largest={d}\n", .{ fl_bitmap, free_block_count, free_bytes_remaining, largest_free_block });
         return null;
     };
@@ -484,9 +496,8 @@ pub fn kmallocAligned(size: usize, alignment: usize) ?[*]u8 {
     if (current_alloc > peak_alloc) peak_alloc = current_alloc;
     if (current_bytes > peak_bytes) peak_bytes = current_bytes;
     free_bytes_remaining -= final_block_size;
-    ops_since_largest_recompute += 1;
 
-    @import("../debug/kasan.zig").allocHook(user_ptr, size);
+    kasan.allocHook(user_ptr, size);
     return @ptrFromInt(user_ptr);
 }
 
@@ -498,19 +509,26 @@ pub fn kfree(ptr: [*]u8) void {
     // and is intentionally never user-visible. Reject pointers into it so a
     // stale ptr can't trick scan-back into reading the wall's header and
     // then freeing the real block in front of it (H5).
-    if (addr < HEAP_START or addr >= HEAP_START + HEAP_SIZE - MIN_BLOCK_SIZE) return;
+    if (addr < HEAP_START or addr >= WALL_ADDR) return;
     const irq_flags = lock.acquireIrqSave();
     defer lock.releaseIrqRestore(irq_flags);
 
     // Find block_addr by scanning back from (addr - USER_OFFSET) at 16-byte
-    // grains. For natural alignment this finds the header immediately.
-    // For over-aligned allocs, scan up to (max alignment) bytes — bounded.
-    const SCAN_LIMIT: usize = 8192;
+    // grains. TWO grains suffice, provably: kmallocAligned yields exactly
+    // two layouts. Natural (alignment <= 16, or an over-aligned request
+    // whose front pad reached MIN_BLOCK_SIZE and was split off as its own
+    // free block): user_ptr = block + USER_OFFSET — header on the first
+    // probe. Buried pad (over-aligned, pad too small to split): the pad is
+    // a nonzero 16-multiple < MIN_BLOCK_SIZE=32, i.e. exactly 16 — header
+    // one grain lower. A miss within two grains is a wild pointer; keeping
+    // the limit tight fails wild frees fast and gives stale user bytes no
+    // room to masquerade as a header.
+    const SCAN_LIMIT: usize = 2 * BLOCK_ALIGN;
     var block_addr: usize = (addr - USER_OFFSET) & ~BLOCK_ALIGN_MASK;
     var found = false;
     var scanned: usize = 0;
     while (scanned < SCAN_LIMIT) : (scanned += BLOCK_ALIGN) {
-        if (block_addr < HEAP_START) return;
+        if (block_addr < HEAP_START) break; // ran off the heap start → wild
         const hdr_raw = headerPtr(block_addr).*;
         const sz = hdr_raw & SIZE_MASK;
         const this_free = (hdr_raw & FLAG_THIS_FREE) != 0;
@@ -529,7 +547,7 @@ pub fn kfree(ptr: [*]u8) void {
                 break;
             }
         }
-        if (block_addr <= HEAP_START or block_addr < BLOCK_ALIGN) return;
+        if (block_addr <= HEAP_START) break; // next step would leave the heap
         block_addr -= BLOCK_ALIGN;
     }
     if (!found) {
@@ -545,7 +563,7 @@ pub fn kfree(ptr: [*]u8) void {
         // For the no-header case it most often points at "the kernel heap
         // tore through whoever owns this page" so the surfacing is doubly
         // useful.
-        @import("../debug/kdbg.zig").attributeHeapCorruptor(addr);
+        kdbg.attributeHeapCorruptor(addr);
         // Release before @panic: Zig's @panic does not unwind, so the
         // outer `defer lock.releaseIrqRestore` would never run and the
         // lock-dump autopsy reports heap.lock as held. Cosmetic (kernel
@@ -565,7 +583,7 @@ pub fn kfree(ptr: [*]u8) void {
             // Auto-bisect: surface the most-recent alloc/free for this frame
             // and a window-event count, so the human sees the strongest
             // culprit immediately rather than greping the rings by hand.
-            @import("../debug/kdbg.zig").attributeHeapCorruptor(tail_addr);
+            kdbg.attributeHeapCorruptor(tail_addr);
             // Release before @panic — same reason as the no-header path.
             lock.releaseIrqRestore(irq_flags);
             @panic("tlsf: buffer overflow — tail canary corrupted");
@@ -577,7 +595,7 @@ pub fn kfree(ptr: [*]u8) void {
     if (current_alloc > 0) current_alloc -= 1;
     if (current_bytes >= user_size) current_bytes -= user_size;
 
-    @import("../debug/kasan.zig").freeHook(addr, user_size);
+    kasan.freeHook(addr, user_size);
 
     // Coalesce-backward via PREV_FREE flag + footer.
     // We add only `freed_size` (the block being released) to
@@ -591,7 +609,22 @@ pub fn kfree(ptr: [*]u8) void {
     var merge_size = freed_size;
     if (blockPrevFree(block_addr)) {
         const prev_addr = prevPhysAddr(block_addr);
-        if (prev_addr >= HEAP_START and blockIsFree(prev_addr)) {
+        // The footer is allocator-owned, but it borders the previous
+        // block's user region — a heap underflow shreds it, and then
+        // prev_addr is garbage. Structurally-insane values get the same
+        // loud treatment as the canary paths above: a silent merge-skip
+        // would leave adjacent free blocks and let the corruption
+        // metastasize until validateInvariants trips much later.
+        if (prev_addr < HEAP_START or prev_addr >= block_addr or
+            (prev_addr & BLOCK_ALIGN_MASK) != 0)
+        {
+            serial.print("\n!!! HEAP CORRUPTION: footer before 0x{X:0>16} decodes to prev=0x{X:0>16}\n", .{ block_addr, prev_addr });
+            kdbg.attributeHeapCorruptor(block_addr - FOOTER_SIZE);
+            // Release before @panic — same reason as the paths above.
+            lock.releaseIrqRestore(irq_flags);
+            @panic("tlsf: prev-block footer corrupted — heap underflow");
+        }
+        if (blockIsFree(prev_addr)) {
             removeFreeBlock(prev_addr);
             merge_addr = prev_addr;
             merge_size = blockSize(prev_addr) + merge_size;
@@ -617,7 +650,6 @@ pub fn kfree(ptr: [*]u8) void {
     if (after < HEAP_START + HEAP_SIZE) {
         setPrevFreeFlag(after, true);
     }
-    ops_since_largest_recompute += 1;
 }
 
 // === Heap walk / validation ===
@@ -642,11 +674,11 @@ fn recomputeLargestFreeBlock() void {
         }
     }
     largest_free_block = best;
-    ops_since_largest_recompute = 0;
 }
 
 /// Walk the entire heap, validate every block's header consistency, every
-/// allocated block's canaries, and prev-free flag agreement.
+/// allocated block's canaries (head AND tail, both layouts — the sentinel
+/// wall is the one exemption), and prev-free flag agreement.
 pub fn validateHeap() bool {
     if (!initialized) return true;
     const irq_flags = lock.acquireIrqSave();
@@ -680,22 +712,45 @@ fn validateHeapLocked() bool {
                 errors += 1;
             }
             prev_was_free = true;
-        } else {
-            // Sanity check on canary_head at offset 12 (natural alloc).
-            // For over-aligned allocs the canary is at (user_ptr - 4); we
-            // can't easily find user_ptr here without the size field.
-            // We trust user_size at offset 8 to be sane, then canary at
-            // offset 12 OR at (offset 12 + pad).
-            // For now: only check natural-alignment case.
-            const us: *const u32 = @ptrFromInt(addr + 8);
-            const ch: *const u32 = @ptrFromInt(addr + 12);
-            if (ch.* != CANARY_HEAD) {
-                // May be an over-aligned alloc; canary is at user_ptr - 4.
-                // user_ptr = addr + USER_OFFSET + align_pad. We don't know
-                // align_pad cheaply. Skip — kfree's canary check guards
-                // those.
-                _ = us;
+        } else if (addr != WALL_ADDR) {
+            // Allocated block: full canary validation. Only two layouts
+            // exist (proof at kfree's scan-back): natural — user_ptr at
+            // addr+USER_OFFSET, canary_head at +12 — or buried-pad (over-
+            // aligned alloc, exactly one dead grain) — user_ptr at
+            // addr+USER_OFFSET+16, canary_head at +28. Natural is checked
+            // first: for buried blocks +12 holds the upper half of a stale
+            // freelist link (a kernel VA or 0), never CANARY_HEAD, so the
+            // order can't misattribute. Both probe offsets sit inside the
+            // block (sz >= MIN_BLOCK_SIZE = 32).
+            const BURIED_USER_OFFSET: usize = USER_OFFSET + BLOCK_ALIGN;
+            const ch_nat: *const u32 = @ptrFromInt(addr + USER_OFFSET - 4);
+            const ch_pad: *const u32 = @ptrFromInt(addr + BURIED_USER_OFFSET - 4);
+            const user_off: usize = if (ch_nat.* == CANARY_HEAD)
+                USER_OFFSET
+            else if (ch_pad.* == CANARY_HEAD)
+                BURIED_USER_OFFSET
+            else blk: {
+                serial.print("[tlsf] validate: head canary missing at 0x{X:0>16} (sz={d})\n", .{ addr, sz });
+                errors += 1;
+                break :blk 0;
+            };
+            if (user_off != 0) {
+                const us: *const u32 = @ptrFromInt(addr + user_off - 8);
+                const user_size: usize = us.*;
+                if (user_off + user_size + CANARY_TAIL_SIZE > sz) {
+                    serial.print("[tlsf] validate: user_size {d} overflows block at 0x{X:0>16} (sz={d})\n", .{ user_size, addr, sz });
+                    errors += 1;
+                } else {
+                    const tail: *align(1) const u32 = @ptrFromInt(addr + user_off + user_size);
+                    if (tail.* != CANARY_TAIL) {
+                        serial.print("[tlsf] validate: tail canary at 0x{X:0>16}: got 0x{X:0>8} want 0x{X:0>8}\n", .{ addr + user_off + user_size, tail.*, CANARY_TAIL });
+                        errors += 1;
+                    }
+                }
             }
+            prev_was_free = false;
+        } else {
+            // The sentinel wall: allocated forever, carries no canaries.
             prev_was_free = false;
         }
         addr += sz;
@@ -1014,12 +1069,19 @@ pub fn kfreeAuto(ptr: [*]u8) void {
         kfree(ptr);
         return;
     }
-    const page_base = addr & ~@as(usize, 0xFFF);
-    if (page_base != 0) {
-        const hdr: *const KvHeader = @ptrFromInt(page_base);
-        if (hdr.magic == KV_MAGIC and addr - page_base == hdr.user_offset) {
-            kvfree(ptr);
-            return;
+    // The KvHeader lives at the start of the page containing (addr - 1) —
+    // NOT the page containing addr: a 4096-aligned kvmalloc places the user
+    // pointer exactly one page past the header, and `addr & ~0xFFF` would
+    // land on the user's own first page and read their data as a header
+    // (legit free → "orphan pointer" panic).
+    if (addr != 0) {
+        const page_base = (addr - 1) & ~@as(usize, 0xFFF);
+        if (page_base != 0) {
+            const hdr: *const KvHeader = @ptrFromInt(page_base);
+            if (hdr.magic == KV_MAGIC and addr - page_base == hdr.user_offset) {
+                kvfree(ptr);
+                return;
+            }
         }
     }
     serial.print("[tlsf] kfreeAuto: ptr 0x{X} matches no allocator (heap or kv)\n", .{addr});
@@ -1031,12 +1093,14 @@ pub fn kvmalloc(size: usize, alignment: usize) ?[*]u8 {
     // Same power-of-two requirement as kmallocAligned (M3).
     if (alignment != 0 and (alignment & (alignment - 1)) != 0) return null;
     const align_real = if (alignment < 16) 16 else alignment;
+    // 4096 is the hard ceiling: kvfree finds the header at the start of the
+    // page containing (user_ptr - 1), which only works while the header pad
+    // is at most one page.
     if (align_real > 4096) return null;
     const header_pad = alignUp(@sizeOf(KvHeader), align_real);
     const total = header_pad + size;
     const pages: u32 = @intCast((total + 4095) / 4096);
     const phys = pmm.allocContiguous(pages) orelse return null;
-    const paging = @import("paging.zig");
     const virt_base = paging.physToVirt(phys);
     const hdr: *KvHeader = @ptrFromInt(virt_base);
     hdr.* = .{
@@ -1049,7 +1113,14 @@ pub fn kvmalloc(size: usize, alignment: usize) ?[*]u8 {
 
 pub fn kvfree(ptr: [*]u8) void {
     const addr = @intFromPtr(ptr);
-    const page_base = addr & ~@as(usize, 0xFFF);
+    // Header page = the page containing (addr - 1). See kfreeAuto for why
+    // this is NOT `addr & ~0xFFF`: a 4096-aligned kvmalloc puts the user
+    // pointer exactly one page past the header.
+    if (addr == 0) {
+        serial.print("[tlsf] kvfree: bad ptr 0x{X}\n", .{addr});
+        return;
+    }
+    const page_base = (addr - 1) & ~@as(usize, 0xFFF);
     if (page_base == 0) {
         serial.print("[tlsf] kvfree: bad ptr 0x{X}\n", .{addr});
         return;
@@ -1066,6 +1137,5 @@ pub fn kvfree(ptr: [*]u8) void {
     const pages = hdr.pages;
     const hdr_mut: *KvHeader = @ptrFromInt(page_base);
     hdr_mut.magic = 0xDEADDEADDEADDEAD;
-    const paging = @import("paging.zig");
     pmm.freeContiguous(paging.virtToPhys(page_base).?, pages);
 }
