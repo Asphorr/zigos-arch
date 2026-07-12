@@ -46,6 +46,7 @@ const perf = @import("../../debug/perf.zig");
 const pcid = @import("pcid.zig");
 const protect = @import("../arch/protect.zig");
 const hyperv = @import("../../virt/hyperv.zig");
+const spinlock = @import("../../proc/spinlock.zig");
 
 // Slow-shootdown threshold (cycles). At Kaby Lake 2.4 GHz nominal TSC,
 // 2.5M cycles ≈ 1 ms — well above the few-μs IPI round-trip budget.
@@ -83,7 +84,7 @@ var shootdown_lock: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
 /// before broadcasting; read by `handleTlbShootdown` on each target. The
 /// lock serializes one shootdown at a time, but does NOT by itself drain
 /// the sender's store buffer before the IPI fires — see the explicit
-/// `@fence(.seq_cst)` in `doShootdown` between publishing stores and
+/// `mfence` in `doShootdown` between publishing stores and
 /// `apic.sendIPI`. x2APIC's `wrmsr 0x830` is NOT a serializing instruction
 /// (SDM Vol 3A §10.12.3) so the fence is load-bearing on every modern host
 /// (Hyper-V, KVM, SNB+ where x2apic is active). xAPIC's MMIO path drains
@@ -204,7 +205,16 @@ pub export fn handleTlbShootdown() callconv(.c) void {
     flushLocalForMode();
     const me_full = apic.getLapicId();
     if (me_full < smp.MAX_CPUS) {
-        _ = ack_pending[me_full].fetchSub(1, .acq_rel);
+        // Decrement only a nonzero slot. Only THIS cpu ever decrements its
+        // own slot, so the load→sub pair can't race another decrementer; a
+        // zero slot here means a spurious vector-0x50 delivery (APIC errata,
+        // nested-virt replay) — an unguarded fetchSub would wrap the counter
+        // to 0xFFFFFFFF and wedge every future sender's ack wait.
+        if (ack_pending[me_full].load(.monotonic) > 0) {
+            _ = ack_pending[me_full].fetchSub(1, .acq_rel);
+        } else {
+            debug.kwarn(@src(), "spurious TLB IPI on cpu{d} (ack slot already 0)", .{me_full});
+        }
     } else {
         // Should be impossible — smp.init filters MADT entries with apic_id
         // >= MAX_CPUS. If we ever get here the sender will spin forever
@@ -219,7 +229,20 @@ pub export fn handleTlbShootdown() callconv(.c) void {
 /// for both `shootdownAll` (single_context / full) and `shootdownPage`
 /// (single_page).
 fn doShootdown(mode: Mode, affected_pcid: u16, va: u64) void {
-    const me_full = apic.getLapicId();
+    // Pin against involuntary preemption for the WHOLE shootdown. dynirq's
+    // check_and_preempt runs at every device-IRQ epilogue with no from_user
+    // gate, and shootdown_lock is a raw atomic (not a SpinLock), so nothing
+    // else pins us. Without this, an IRQ landing in any IF=1 stretch of this
+    // function (most callers arrive IF=1; the cli'd ones sti during the lock
+    // spin below) can schedule() and MIGRATE us mid-shootdown — then `me`
+    // names the WRONG cpu: the old cpu is skipped as "self" (missed flush,
+    // and bumpAfterShootdown wrongly exempts it from the lazy gen-flush —
+    // i.e. a USABLE stale TLB entry), while the new cpu receives a self-IPI
+    // whose ack a cli'd caller can never service (permanent wedge). The pin
+    // defers only the reschedule — IRQs and inbound IPIs stay serviced — and
+    // its return value is a migration-stable LAPIC id by construction.
+    const me_full: u32 = spinlock.pinPreemption();
+    defer spinlock.unpinPreemption(@intCast(me_full));
     if (me_full >= smp.MAX_CPUS) {
         // Cannot recover safely: the `else 0` fallback below would make us
         // self-IPI cpu 0 and double-flush an unrelated slot. smp.init should
@@ -286,7 +309,15 @@ fn doShootdown(mode: Mode, affected_pcid: u16, va: u64) void {
         const cr3 = asm volatile ("movq %%cr3, %[ret]"
             : [ret] "=r" (-> u64),
         );
-        if (hyperv.flushAllProcessors(cr3)) {
+        // The hypercall flushes the address space OF THE CR3 WE PASS — the
+        // currently-loaded one. That is the affected AS only when this CPU is
+        // actually running it (CR3's PCID field == affected_pcid). A shootdown
+        // aimed at a FOREIGN AS — e.g. destroyAddressSpace of a reaped child
+        // from the parent's context — would flush the WRONG space on every VP
+        // and then skip the IPI fan-out entirely, leaving live peers' stale
+        // entries for the affected AS intact. Fall through to the IPI path in
+        // that case. (CR3 bits 11:0 = PCID under CR4.PCIDE.)
+        if ((cr3 & 0xFFF) == affected_pcid and hyperv.flushAllProcessors(cr3)) {
             via_hypercall = true;
             _ = @atomicRmw(u64, &n_shootdowns_via_hypercall, .Add, 1, .monotonic);
         }
