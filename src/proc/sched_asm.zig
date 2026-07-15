@@ -35,7 +35,7 @@ comptime {
 /// re-scheduled, `switchTo` "returns" to its caller as if nothing
 /// happened.
 ///
-/// Caller convention (SysV first/second args):
+/// Caller convention (SysV first/second/third args):
 ///   RDI = &prev.kernel_esp or NULL — current task's kernel_esp slot
 ///         to save into. NULL means "skip the save" (used when prev is
 ///         being torn down — destroyCurrentWithStatus's schedule call
@@ -44,12 +44,22 @@ comptime {
 ///         first-dispatch paths enterFirstTask{,Ap} where there's no
 ///         PCB to save into).
 ///   RSI = next.kernel_esp — next task's saved RSP value.
+///   RDX = &prev.on_cpu or NULL — cleared (single byte store) AFTER the
+///         RSP swap onto next's kstack, i.e. once prev's context is
+///         fully saved AND its kstack is quiesced. This is the publish
+///         point for the cross-CPU dispatch gate (PCB.on_cpu): before
+///         this store, another CPU dispatching prev would load a stale
+///         kernel_esp and run prev's live kstack in parallel (the tgmt
+///         RIP=0 double-dispatch, 2026-07-16). Passed for EVERY real
+///         prev — including doomed ones whose kesp save is skipped.
 ///
-/// (Phase 5 retired: the third `save_in_flight_clear` arg + the asm-side
-/// `movl $-1, (%%rdx)` clear. Per-CPU dispatch (Phase 2) eliminated the
-/// cross-CPU dispatch race; exit_requested + schedule's prev_save→null
-/// when state is .zombie/.unused (Phase 3) eliminated the kill-vs-save
-/// race. The save_in_flight_prev gate had no remaining readers.)
+/// (History: Phase 5 retired a third `save_in_flight_clear` arg + asm
+/// clear on the reasoning that per-CPU dispatch (Phase 2) made the
+/// cross-CPU dispatch race structurally impossible. Work stealing and
+/// wake-time placement later reintroduced cross-CPU reach, and a 39ms
+/// host pause inside sysSleep proved it — RDX resurrects that guard
+/// with the clear at the correct point: after the stack switch, not
+/// after the save.)
 ///
 /// Callers must already have:
 ///   - committed CR3 to the next task's address space (vmm.switchAddressSpace)
@@ -63,6 +73,11 @@ pub fn switchTo() callconv(.naked) void {
         \\ pushq %%r13
         \\ pushq %%r14
         \\ pushq %%r15
+        // Carry the on_cpu-clear pointer (RDX, may be 0) in RBX for the
+        // whole switch body: prev's live RBX was just saved by the push
+        // above, RBX is callee-saved across save_trace_record, and
+        // next's RBX is restored by the pops below — so it's free here.
+        \\ movq %%rdx, %%rbx
         // Save prev's RSP — but skip if RDI==0 (doomed-prev / first-dispatch).
         \\ testq %%rdi, %%rdi
         \\ jz 1f
@@ -82,6 +97,17 @@ pub fn switchTo() callconv(.naked) void {
         // ---------------------------------------------------------------
         \\ 1:
         \\ movq %%rsi, %%rsp
+        // Prev's context is saved AND this CPU is off prev's kstack —
+        // only NOW may another CPU dispatch prev. Publish by clearing
+        // prev.on_cpu (x86 TSO orders this store after the kesp save and
+        // every push above). Clearing after the RSP swap, not after the
+        // save, is load-bearing: between save and swap this CPU still
+        // EXECUTES on prev's kstack (the save_trace call above pushes to
+        // it), so a remote dispatch in that window would still collide.
+        \\ testq %%rbx, %%rbx
+        \\ jz 2f
+        \\ movb $0, (%%rbx)
+        \\ 2:
         \\ popq %%r15
         \\ popq %%r14
         \\ popq %%r13
@@ -99,12 +125,13 @@ pub fn switchTo() callconv(.naked) void {
 /// saved/restored callee-saves only via Zig's normal frame, which the
 /// indirect call preserves because it goes through the standard
 /// call+ret pattern.
-pub inline fn switchToCall(prev_save: ?*u64, next_kesp: u64) void {
+pub inline fn switchToCall(prev_save: ?*u64, next_kesp: u64, prev_on_cpu: ?*bool) void {
     asm volatile ("callq *%[addr]"
         :
         : [addr] "r" (@intFromPtr(&switchTo)),
           [_] "{rdi}" (if (prev_save) |p| @intFromPtr(p) else @as(usize, 0)),
           [_] "{rsi}" (next_kesp),
+          [_] "{rdx}" (if (prev_on_cpu) |p| @intFromPtr(p) else @as(usize, 0)),
         : .{
             .rax = true, .rcx = true, .rdx = true,
             .rsi = true, .rdi = true,

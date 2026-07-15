@@ -658,6 +658,10 @@ pub fn resetKernelIdleForResume(idle_pid: usize) void {
 
     process.procs[i].kernel_esp = stack_top - FRAME_BYTES;
     process.procs[i].kernel_stack_top = stack_top;
+    // Stale dispatch-claim from before the suspend (this idle was current
+    // on the AP at power-off; the clear in switchTo's asm never ran).
+    // enterFirstTaskAp re-sets it at the re-dispatch.
+    @atomicStore(bool, &process.procs[i].on_cpu, false, .release);
     process.plantStackCanary(i); // re-plant base canary before re-publishing runnable
     @atomicStore(usize, &process.expected_kstack_tops[i], stack_top, .release);
 

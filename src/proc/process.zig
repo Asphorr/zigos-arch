@@ -231,6 +231,27 @@ pub const PCB = struct {
     // dead" — both apps eventually call blockOn (via pipe.read or sysSleep)
     // and lose a wake to this race. Atomic for cross-CPU visibility.
     wake_pending: bool = false, // (a) wake-handshake; cross-CPU
+    // Dispatch-claim latch for the cross-CPU dispatch gate. TRUE from the
+    // moment a CPU claims this task for dispatch (schedule, right before
+    // switchTo) until switchTo's asm has BOTH saved its context (the
+    // kernel_esp write) AND moved off its kstack (RSP swapped to next) —
+    // the asm clears it via its RDX arg, at the only instant "context
+    // save complete" is actually true. pickMinVruntime refuses candidates
+    // with on_cpu=true whose last_cpu is a DIFFERENT cpu: their
+    // kernel_esp is stale and their kstack is still live over there, so
+    // dispatching them runs two CPUs on one kernel stack (the tgmt RIP=0
+    // crash, 2026-07-16: a 39ms host pause inside sysSleep — after
+    // setState(.sleeping), before the context save — let the BSP's
+    // wakeExpired wake + dispatch tgmt on its STALE kesp while cpu1 was
+    // still executing on the same kstack; [stack-alias] caught both TSS
+    // rsp0 on tgmt's kstack one line before the fault). Covers the
+    // preempt shape too: a .running→.ready demotee sits in the rq pre-
+    // save and must not be picked remotely until its save lands.
+    // Resurrects Phase-5's retired save_in_flight guard — the "per-CPU
+    // rq makes cross-CPU dispatch impossible" retirement rationale
+    // predates work stealing and wake-time placement, which reintroduced
+    // the cross-CPU reach.
+    on_cpu: bool = false, // (a) cross-CPU; set at dispatch claim, cleared by switchTo asm post-save
     // Swap slot owned by an evictFrame call currently in progress on this PCB
     // (between phase-1 CAS and phase-3 CAS). 0xFFFFFFFF = no in-flight slot.
     // Lets process teardown free the slot if this thread is killed while

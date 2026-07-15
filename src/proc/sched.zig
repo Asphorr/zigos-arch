@@ -1159,11 +1159,12 @@ pub fn enterFirstTask(desktop_entry: usize) noreturn {
     @import("../debug/pid_trace.zig").setCurrentPid(cpu, desktop_pid);
     setState(desktop_pid, .running);
     process.procs[desktop_pid].last_cpu = 0;
+    @atomicStore(bool, &process.procs[desktop_pid].on_cpu, true, .release);
     gdt.setTssRsp0(desktop_pid, process.procs[desktop_pid].kernel_stack_top);
 
-    // First dispatch — kmain's stack is abandoned. Pass null prev_save
-    // so switchTo asm skips the save entirely (no PCB to write into).
-    @import("sched_asm.zig").switchToCall(null, process.procs[desktop_pid].kernel_esp);
+    // First dispatch — kmain's stack is abandoned. Pass null prev_save +
+    // null on_cpu-clear so switchTo asm skips both (no PCB to write into).
+    @import("sched_asm.zig").switchToCall(null, process.procs[desktop_pid].kernel_esp, null);
     unreachable;
 }
 
@@ -1186,12 +1187,30 @@ pub fn enterFirstTaskAp(ap_idle_pid: usize) noreturn {
     // through setState anyway for path uniformity.
     setState(ap_idle_pid, .running);
     process.procs[ap_idle_pid].last_cpu = cpu.cpu_id;
+    @atomicStore(bool, &process.procs[ap_idle_pid].on_cpu, true, .release);
     gdt.setTssRsp0(ap_idle_pid, process.procs[ap_idle_pid].kernel_stack_top);
 
     // First dispatch — trampoline stack is abandoned. Same null-prev_save
     // rationale as enterFirstTask: no PCB to write into.
-    @import("sched_asm.zig").switchToCall(null, process.procs[ap_idle_pid].kernel_esp);
+    @import("sched_asm.zig").switchToCall(null, process.procs[ap_idle_pid].kernel_esp, null);
     unreachable;
+}
+
+/// Per-CPU "pickMinVruntime skipped an on_cpu-gated candidate" latch.
+/// Consumed by irq0's rearmTimerForCurrent via consumeGatedPickSkip():
+/// an idle CPU with a gated pid queued re-arms at 1 quantum instead of
+/// its tickless stretch, so the retry lands ≤10ms after the gate clears.
+/// Own-CPU access only (same benign-own-IRQ-race class as irq0's
+/// timer_long_armed).
+var gated_pick_skip: [smp.MAX_CPUS]bool = .{false} ** smp.MAX_CPUS;
+
+/// Test-and-clear this CPU's gated-pick latch. Called by the timer
+/// re-arm path when the CPU is about to idle.
+pub fn consumeGatedPickSkip(cpu_id: u8) bool {
+    if (cpu_id >= smp.MAX_CPUS) return false;
+    if (!gated_pick_skip[cpu_id]) return false;
+    gated_pick_skip[cpu_id] = false;
+    return true;
 }
 
 /// Linear scan of a single priority queue picking the pid with the
@@ -1204,12 +1223,34 @@ pub fn enterFirstTaskAp(ap_idle_pid: usize) noreturn {
 fn pickMinVruntime(q: *const runqueue.PriQueue, exclude_pid: ?u8) ?u8 {
     var best: ?u8 = null;
     var best_vr: u64 = std.math.maxInt(u64);
+    const my_id = smp.myCpu().cpu_id;
     var i: u8 = 0;
     while (i < q.count) : (i += 1) {
         const pid: u8 = q.pids[i];
         if (pid >= MAX_PROCS) continue;
         if (exclude_pid) |xp| if (pid == xp) continue;
         if (@atomicLoad(bool, &process.procs[pid].exit_requested, .acquire)) continue;
+        // Cross-CPU dispatch gate: on_cpu ⇒ the pid's context save hasn't
+        // completed on the CPU it last ran on — its kernel_esp is stale
+        // and its kstack is still live there. Dispatching it HERE would
+        // run two CPUs on one kernel stack (the tgmt RIP=0 crash,
+        // 2026-07-16; see PCB.on_cpu). Reaches this shape via a preempt
+        // demote (.running→.ready sits in the rq pre-save) or a wake of
+        // a sleeper that hasn't finished descheduling (host pauses
+        // stretch that window to ms). Same-CPU re-pick stays allowed:
+        // that's the normal "resume prev" shape and the next==cur path
+        // never loads kernel_esp. Ordering: acquire on on_cpu pairs with
+        // the dispatcher's release store, making last_cpu valid to read.
+        // The pid stays queued; latch a 1-quantum re-arm for THIS cpu so
+        // going idle over a gated pid can't tickless-stretch 100ms —
+        // per-CPU latch instead of the global deadline cache because APs
+        // deliberately ignore that cache (deadlines are BSP work).
+        if (@atomicLoad(bool, &process.procs[pid].on_cpu, .acquire) and
+            process.procs[pid].last_cpu != my_id)
+        {
+            if (my_id < smp.MAX_CPUS) gated_pick_skip[my_id] = true;
+            continue;
+        }
         // Atomic read — wait_kind is tagged (a): setWait stores it with
         // .release under the waiter's setstate lock, which this picker
         // does NOT hold (it holds rq.lock). Matches waitsOn's discipline.
@@ -1539,6 +1580,14 @@ pub fn schedule() void {
         break :blk null;
     };
 
+    // The on_cpu-clear slot for switchTo's asm tail — tracked for EVERY
+    // real prev, including the doomed (.zombie/.unused) shapes whose kesp
+    // save is skipped: their slot may be reallocated, and a stale
+    // on_cpu=true would gate the fresh occupant's first remote dispatch
+    // (resetPcbExceptState also clears it on reuse; this is the belt for
+    // the running→zombie switch itself).
+    const prev_on_cpu: ?*bool = if (cpu.current_pid) |cur| &process.procs[cur].on_cpu else null;
+
     // Demote prev .running → .ready directly. Per-CPU rq dispatch (Phase 2)
     // means no other CPU can pick prev — only this cpu reads its own rq.
     // setState routes through rqEnter so prev appears in this cpu's rq
@@ -1581,8 +1630,8 @@ pub fn schedule() void {
     // EXCEPTION: own-cpu idle (is_idle=true && idle_cpu==my_cpu) skips the
     // CAS — only this cpu ever dispatches its own idle, so no race possible
     // and the idle's state may be anything (.ready, .running). pickNext's
-    // own gate-check (skip pids matching any cpu.save_in_flight_prev) keeps
-    // prev out of the candidate set during the in-flight save.
+    // on_cpu gate (pickMinVruntime) keeps any mid-save pid out of the
+    // REMOTE candidate set until switchTo's asm publishes save-complete.
     // Pass cur as exclude_pid so pickNext's Phase A prefers any other
     // runnable candidate first — relaxes strict priority just enough that
     // a cpu running an interactive task (e.g. desktop on cpu0) gives
@@ -1722,6 +1771,12 @@ pub fn schedule() void {
         // const cs_slot_addr = procs[next].kernel_stack_top -% 32;
         // watch.armCsSlot(1, cs_slot_addr, "iretq_CS");
         process.procs[next].last_cpu = cpu.cpu_id;
+        // Cross-CPU dispatch gate: publish the claim (see PCB.on_cpu).
+        // Order matters — last_cpu first, then on_cpu with .release, so a
+        // peer that acquire-loads on_cpu==true reads a valid last_cpu.
+        // Stays set for next's whole on-CPU tenure; cleared by switchTo's
+        // asm tail when next is later switched OUT and its save landed.
+        @atomicStore(bool, &process.procs[next].on_cpu, true, .release);
         gdt.setTssRsp0(next, process.procs[next].kernel_stack_top);
         if (process.procs[next].page_dir_phys != 0) {
             pcid_mod.loadCr3(process.procs[next].page_dir_phys, process.procs[next].pcid, cpu.cpu_id);
@@ -2071,7 +2126,7 @@ pub fn schedule() void {
                 }
             }
         }
-        @import("sched_asm.zig").switchToCall(prev_save, next_kesp);
+        @import("sched_asm.zig").switchToCall(prev_save, next_kesp, prev_on_cpu);
         // When we get here, this caller has been re-scheduled.
         @import("../debug/kdbg.zig").schedEvent(.switch_out, from_pid_a, 0, 0, @intCast(next));
         if ((flags & 0x200) != 0) asm volatile ("sti");

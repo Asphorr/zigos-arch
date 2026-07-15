@@ -563,7 +563,13 @@ fn rearmTimerForCurrent(cpu: *@import("../smp.zig").CpuLocal) void {
 
     var quanta: u32 = 1;
     if (cur_is_idle) {
-        if (cpu.cpu_id != 0) {
+        if (@import("../../proc/sched.zig").consumeGatedPickSkip(cpu.cpu_id)) {
+            // pickMinVruntime skipped an on_cpu-gated pid this schedule —
+            // it's queued here but its context save hasn't landed on its
+            // last CPU. Keep quanta=1 so the retry is ≤10ms, instead of
+            // tickless-stretching up to 100ms over runnable work. (L1
+            // from the on_cpu-gate review, 2026-07-16.)
+        } else if (cpu.cpu_id != 0) {
             quanta = 10;
         } else if (!@import("../../driver/sound.zig").needsTick()) {
             const sched_mod = @import("../../proc/sched.zig");
