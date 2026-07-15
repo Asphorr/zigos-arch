@@ -337,7 +337,7 @@ pub fn forkCurrent(frame: *signals.SyscallFrame) ?usize {
     // partially built; tear it down via destroyAddressSpace, which drops every
     // refcount we bumped and frees every page-table page we allocated.
     var child_pml4_phys: usize = 0;
-    const child_pml4 = vmm.cloneAddressSpace(parent_pml4, &child_pml4_phys) orelse {
+    const child_pml4 = vmm.cloneAddressSpace(parent_pml4, parent_lead_src.pcid, &child_pml4_phys) orelse {
         if (child_pml4_phys != 0) {
             const paging = @import("../mm/paging.zig");
             const pml4_ptr: [*]align(4096) u64 = @ptrFromInt(paging.physToVirt(child_pml4_phys));

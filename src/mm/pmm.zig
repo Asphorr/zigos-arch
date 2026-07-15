@@ -1650,6 +1650,31 @@ pub fn acquireFrame(phys_addr: usize) void {
     }
 }
 
+/// Conditional acquireFrame: bump the refcount ONLY if the frame is currently
+/// live (refcount >= 1); return false — count untouched — when it is free.
+/// For lock-free walkers that sampled a PTE and must take a reference on the
+/// frame it named WITHOUT trusting the sample to still be current
+/// (cloneAddressSpace vs a concurrent eviction: plain acquireFrame would
+/// panic on the freed frame — or worse, silently bump a reallocated
+/// STRANGER's frame). Contract: after a `true` return the caller re-validates
+/// its PTE sample and releases on mismatch; a `true` + unchanged-PTE pair
+/// proves continuous ownership (every unmap/evict path rewrites the PTE
+/// before dropping its reference). Saturation panics, same as acquireFrame.
+pub fn acquireFrameIfLive(phys_addr: usize) bool {
+    const frame_num_us = phys_addr / FRAME_SIZE;
+    if (frame_num_us >= MAX_FRAMES) return false;
+    const frame_num: u32 = @intCast(frame_num_us);
+    while (true) {
+        const cur = @atomicLoad(u8, &frame_refs[frame_num], .acquire);
+        if (cur == 0) return false;
+        if (cur == 0xFF) {
+            @import("../debug/serial.zig").print("[pmm] PANIC: acquireFrameIfLive saturation phys=0x{X}\n", .{phys_addr});
+            @panic("pmm: acquireFrame refcount saturation (>255)");
+        }
+        if (@cmpxchgWeak(u8, &frame_refs[frame_num], cur, cur + 1, .acq_rel, .acquire) == null) return true;
+    }
+}
+
 /// Drop one reference to a frame; if refcount hits 0, returns the frame to the
 /// free pool. Functionally identical to freeFrame — both decrement and free-
 /// when-zero. Use this name when releasing a COW-shared frame to make intent

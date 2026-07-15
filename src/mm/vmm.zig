@@ -8,6 +8,7 @@ const debug = @import("../debug/debug.zig");
 const heap = @import("heap.zig");
 const memmap = @import("memmap.zig");
 const swap = @import("swap.zig");
+const tlb = @import("../cpu/mmu/tlb.zig");
 
 const PRESENT: u64 = paging.PRESENT;
 const READ_WRITE: u64 = paging.READ_WRITE;
@@ -28,17 +29,20 @@ pub const USER_SPACE_END: u64 = memmap.USER_SPACE_END;
 ///   BadVA         — virt outside USER_SPACE_START..USER_SPACE_END.
 ///                   Programmer bug or malicious user-VA in syscall arg.
 ///                   Caller should fail the syscall with E_FAULT / SIGSEGV.
-///   KernelHeap    — virt collides with the kernel heap reservation.
-///                   Same response as BadVA.
 ///   Oom           — PT/PD/PDPT alloc failed under PMM pressure. Caller
 ///                   should run reclaim + retry, then OOM-kill if still
 ///                   short. Not a programmer bug.
-///   AlreadyMapped — virt already has a *different* physical frame
-///                   installed. Either a race (two CPUs faulting on the
-///                   same page) or a caller bug (double-mmap without
-///                   unmap). `allocAndMapUserPage` treats this as a race
-///                   and returns the winning frame; explicit syscall
-///                   paths should roll back and return E_BUSY / E_INVAL.
+///   AlreadyMapped — virt already has a binding that isn't ours to
+///                   overwrite: a *different* physical frame installed
+///                   (a two-CPU same-page fault race, or a double-mmap
+///                   caller bug), or a swap-marked non-present PTE
+///                   (SWAPPED/SWAP_INFLIGHT — blind-installing would leak
+///                   the slot and destroy the swapped bytes).
+///                   `allocAndMapUserPage` resolves the present case to
+///                   the winning frame and propagates the rest; fault
+///                   paths treat it as "handled, retry the access".
+/// (History: a `KernelHeap` variant existed pre-Phase-3; the heap-collision
+/// check it reported was removed 2026-05-20 — see mapUserPage's body.)
 pub const MapError = error{ BadVA, Oom, AlreadyMapped };
 
 /// Invalidate the TLB entry for a single virtual address on the local
@@ -216,16 +220,12 @@ pub fn mapUserPage(pml4: [*]align(4096) u64, virt: usize, phys: usize, flags: u6
     // 511 kernel-only sibling PTEs that the user then re-faults through
     // one at a time (and which would also collide with the new
     // gap #2 AlreadyMapped check, producing spurious lazy-fault rejects).
-    var pt: [*]u64 = undefined;
     if (pd[pd_idx] & PRESENT != 0 and pd[pd_idx] & PAGE_SIZE_FLAG != 0) {
         @panic("mapUserPage: 2 MB huge in user PD — Phase 3 invariant violated");
-    } else if (pd[pd_idx] & PRESENT != 0) {
-        pt = tableFromEntry(pd[pd_idx]);
-    } else {
-        const alloc = allocZeroedTable() orelse return error.Oom;
-        pd[pd_idx] = makeEntry(alloc.phys, PRESENT | READ_WRITE | USER);
-        pt = alloc.ptr;
     }
+    // Same CAS-guarded resolve as the PDPT level (this used to be a hand-
+    // rolled copy of resolveOrAlloc minus the race handling).
+    const pt = try resolveOrAlloc(pd, pd_idx);
 
     // --- Level 4: Check the 4KB PTE, then write ---
     // Gap #2 fix: detect double-install. The previous `pt[pt_idx] = ...`
@@ -240,19 +240,39 @@ pub fn mapUserPage(pml4: [*]align(4096) u64, virt: usize, phys: usize, flags: u6
     //   - Different phys: error.AlreadyMapped. Caller (typically
     //     allocAndMapUserPage) frees its newly-allocated frame and
     //     uses the winner's mapping.
+    // The whole policy runs as a CAS loop: the fault path holds no as_lock,
+    // so two CPUs installing the SAME page used to both pass the not-present
+    // check and plain-store — last writer won and the loser's frame leaked
+    // WITHOUT the AlreadyMapped protocol ever firing (it only caught losers
+    // that arrived after the winner's store became visible). A CAS makes
+    // exactly one installer win; the loser re-reads and takes the
+    // present-branch policy against the winner's PTE.
     const new_pte: u64 = (paddr & PAGE_MASK) | flags | PRESENT;
-    const old_pte = pt[pt_idx];
-    if (old_pte & PRESENT != 0) {
-        // Compare phys in u64 form on both sides to dodge usize/u64
-        // mismatch (paddr is u64 since line 109's @intCast, old_pte is
-        // u64 from pt[*u64]). Same-phys → flag update or no-op; different
-        // phys → AlreadyMapped.
-        if ((old_pte & PAGE_MASK) != (paddr & PAGE_MASK)) return error.AlreadyMapped;
-        if (old_pte == new_pte) return; // already exactly what we want
-        pt[pt_idx] = new_pte;
-        invlpg(virt);
-    } else {
-        pt[pt_idx] = new_pte;
+    while (true) {
+        const old_pte = @atomicLoad(u64, &pt[pt_idx], .acquire);
+        if (old_pte & PRESENT != 0) {
+            // Compare phys in u64 form on both sides to dodge usize/u64
+            // mismatch. Same-phys → flag update or no-op; different phys →
+            // AlreadyMapped.
+            if ((old_pte & PAGE_MASK) != (paddr & PAGE_MASK)) return error.AlreadyMapped;
+            if (old_pte == new_pte) return; // already exactly what we want
+            if (@cmpxchgStrong(u64, &pt[pt_idx], old_pte, new_pte, .seq_cst, .seq_cst) != null) continue;
+            invlpg(virt);
+            break;
+        }
+        if (old_pte != 0) {
+            // Non-present but nonzero: SWAPPED or SWAP_INFLIGHT. Blind-
+            // installing here would leak the swap slot and REPLACE the
+            // swapped-out bytes with a fresh frame (silent data loss) — the
+            // shape is reachable when a full map+evict cycle completes
+            // inside our fault window (host vCPU pauses make such windows
+            // arbitrarily long on this rig). The VA has a live binding that
+            // isn't ours to overwrite: report AlreadyMapped and let the
+            // caller's retried access resolve through the swap-in path.
+            return error.AlreadyMapped;
+        }
+        if (@cmpxchgStrong(u64, &pt[pt_idx], 0, new_pte, .seq_cst, .seq_cst) != null) continue;
+        break;
     }
 
     // kdbg: record the install so post-mortem can answer "who mapped CR2?".
@@ -274,11 +294,27 @@ pub fn mapUserPage(pml4: [*]align(4096) u64, virt: usize, phys: usize, flags: u6
 /// copy-on-write. If the entry is present we hand back the existing
 /// table; if not we alloc a fresh one.
 fn resolveOrAlloc(table: [*]u64, idx: u64) MapError![*]u64 {
-    if (table[idx] & PRESENT != 0) {
-        return tableFromEntry(table[idx]);
+    const cur = @atomicLoad(u64, &table[idx], .acquire);
+    if (cur & PRESENT != 0) {
+        return tableFromEntry(cur);
     }
     const alloc = allocZeroedTable() orelse return error.Oom;
-    table[idx] = makeEntry(alloc.phys, PRESENT | READ_WRITE | USER);
+    const new = makeEntry(alloc.phys, PRESENT | READ_WRITE | USER);
+    // CAS the install: the fault path holds no as_lock, so concurrent lazy
+    // faults on two DIFFERENT pages of the same span both used to pass the
+    // not-present check and plain-store their fresh table — last writer won,
+    // and the loser's table page plus every PTE subsequently installed into
+    // it leaked (the mapping silently vanished; the page re-faulted later
+    // with a new frame). Exactly one installer wins the CAS; the loser frees
+    // its table and continues through the winner's.
+    if (@cmpxchgStrong(u64, &table[idx], cur, new, .acq_rel, .acquire)) |winner| {
+        pmm.freeFrame(alloc.phys);
+        // A non-present rewrite (munmap's empty-table reclaim racing us) —
+        // pre-existing fault-vs-munmap class; fail the map rather than walk
+        // a freed table.
+        if (winner & PRESENT == 0) return error.Oom;
+        return tableFromEntry(winner);
+    }
     return alloc.ptr;
 }
 
@@ -386,13 +422,16 @@ pub fn allocAndMapUserPage(pml4: [*]align(4096) u64, virt: usize, flags: u64) Ma
     mapUserPage(pml4, virt, frame, flags) catch |e| switch (e) {
         // Race resolved — another CPU faulted in this page while we were
         // allocating. Give our frame back; tell the caller to use the
-        // existing one. resolveUserPhys can only fail here if the
-        // winner's mapping got torn down between mapUserPage's PRESENT
-        // check and our walk — vanishingly rare, but possible during
-        // teardown; surface as Oom so the fault handler kills the proc.
+        // existing one. resolveUserPhys can fail here when the winner's
+        // mapping is already being torn down, or when the PTE is swap-marked
+        // (mapUserPage's non-present-nonzero guard). Neither is OOM —
+        // propagate AlreadyMapped so the fault handler reports the fault
+        // handled and the retried access resolves through the right path
+        // (the old `orelse error.Oom` OOM-killed the process on this
+        // benign race).
         error.AlreadyMapped => {
             pmm.freeFrame(frame);
-            return resolveUserPhys(pml4, virt) orelse error.Oom;
+            return resolveUserPhys(pml4, virt) orelse error.AlreadyMapped;
         },
         // Genuine failures — give the frame back, propagate the cause.
         // (Including Oom-from-PT-alloc-deep-in-mapUserPage: our user
@@ -749,11 +788,17 @@ pub fn destroyAddressSpace(pml4: [*]align(4096) u64, pml4_phys: usize) void {
 /// Parent's already-marked-COW PTEs stay COW; the next parent write will
 /// fault, see refcount==1, and resolve cleanly via the COW handler.
 ///
-/// After a successful clone, this function flushes the local TLB by reloading
-/// CR3 — parent's old R/W TLB entries would otherwise let writes bypass the
-/// new R/O+COW marking. Caller is presumed to be running on parent's CR3
-/// (sysFork's natural context). Other CPUs are safe by inspection: no thread
-/// model yet means no other CPU runs in the parent's address space.
+/// After a successful clone, this function shoots down the parent's PCID on
+/// EVERY cpu (tlb.shootdownAll) — the parent's old R/W TLB entries would
+/// otherwise let writes bypass the new R/O+COW marking. The sender's local
+/// flush rides the shootdown. This used to be a local-only CR3 reload with a
+/// "no thread model yet" justification; threads exist now, and a sibling
+/// thread on another CPU writing through a stale R/W entry would leak
+/// post-fork stores into frames the child shares (fork-snapshot corruption).
+/// On the OOM abort paths the shootdown is skipped: the caller's
+/// destroyAddressSpace cleanup drops every child ref, so parent frames are
+/// sole-owned again and stale R/W entries are benign (the COW bit resolves
+/// in place on the next fault).
 ///
 /// Gap #13 (2026-05-20, deferred): the all-R/O PT case (text segments,
 /// PROT_READ mmaps) currently allocates a fresh child PT and copies entries
@@ -775,7 +820,7 @@ pub fn destroyAddressSpace(pml4: [*]align(4096) u64, pml4_phys: usize) void {
 /// not the parent's copy. Harmless in practice (fork is ~always followed by
 /// exec, which tears down PML4[0]); a complete fix would swap the parent's
 /// pages in before cloning. Tracked as a swap follow-up.
-pub fn cloneAddressSpace(parent_pml4: [*]align(4096) u64, phys_out: *usize) ?[*]align(4096) u64 {
+pub fn cloneAddressSpace(parent_pml4: [*]align(4096) u64, parent_pcid: u16, phys_out: *usize) ?[*]align(4096) u64 {
     const pml4_alloc = allocZeroedTable() orelse return null;
     const child_pml4: [*]align(4096) u64 = @alignCast(pml4_alloc.ptr);
     phys_out.* = pml4_alloc.phys;
@@ -823,40 +868,71 @@ pub fn cloneAddressSpace(parent_pml4: [*]align(4096) u64, phys_out: *usize) ?[*]
             child_pd[pd_i] = makeEntry(child_pt_alloc.phys, parent_pde & 0xFFF);
 
             for (0..512) |pt_i| {
-                const parent_pte = parent_pt[pt_i];
-                if (parent_pte & PRESENT == 0) continue;
-                if (parent_pte & USER == 0) continue; // skip non-user (shouldn't appear under PML4[0] anyway)
+                // CAS-clean per-PTE snapshot. The parent's OTHER threads keep
+                // running during fork (fork-from-worker is a supported path),
+                // and the fault/reclaim machinery rewrites PTEs lock-free: a
+                // concurrent COW resolution CASes in a private frame, an
+                // eviction flips PRESENT → SWAP_INFLIGHT and then FREES the
+                // frame. The old plain read-acquire-store here (a) could call
+                // acquireFrame on a phys a completed eviction had already
+                // freed — a panic on the free frame, or a silent refcount
+                // bump on a reallocated STRANGER's frame the child then maps —
+                // and (b) stomped concurrent PTE rewrites: overwriting a
+                // just-resolved COW PTE threw away the writer's private copy,
+                // so its post-fork stores landed in the frame the child now
+                // shares (fork-snapshot corruption).
+                while (true) {
+                    const parent_pte = @atomicLoad(u64, &parent_pt[pt_i], .acquire);
+                    // Never-faulted, SWAPPED, or SWAP_INFLIGHT: child skips
+                    // (see the SWAPPED PAGES note above).
+                    if (parent_pte & PRESENT == 0) break;
+                    if (parent_pte & USER == 0) break; // non-user under PML4[0]: shouldn't appear
 
-                const phys = entryPhys(parent_pte);
-                pmm.acquireFrame(phys);
+                    const phys = entryPhys(parent_pte);
+                    // Refuse a frame whose refcount already hit 0 — our PTE
+                    // sample is stale (eviction completed and freed it). The
+                    // re-read is guaranteed to see a different PTE: every
+                    // freeing path rewrites the PTE before dropping its ref.
+                    if (!pmm.acquireFrameIfLive(phys)) continue;
 
-                if (parent_pte & READ_WRITE != 0) {
-                    // Writable page: mark BOTH sides R/O+COW. First write on
-                    // either side faults into the COW handler, which alloc's
-                    // a private copy and clears COW for that side.
-                    const cow_pte = (parent_pte & ~READ_WRITE) | paging.COW;
-                    parent_pt[pt_i] = cow_pte;
-                    child_pt[pt_i] = cow_pte;
-                } else {
-                    // Already read-only (text/rodata or PROT_READ mmap): no
-                    // need to mark COW — a write was illegal before fork and
-                    // stays illegal after. Share the PTE as-is.
-                    child_pt[pt_i] = parent_pte;
+                    if (parent_pte & READ_WRITE != 0) {
+                        // Writable page: mark BOTH sides R/O+COW. First write
+                        // on either side faults into the COW handler, which
+                        // allocs a private copy and clears COW for that side.
+                        // The CAS doubles as post-acquire validation: if the
+                        // PTE moved since the sample, undo the ref and
+                        // re-decide from fresh state.
+                        const cow_pte = (parent_pte & ~READ_WRITE) | paging.COW;
+                        if (@cmpxchgStrong(u64, &parent_pt[pt_i], parent_pte, cow_pte, .seq_cst, .seq_cst) != null) {
+                            pmm.releaseFrame(phys);
+                            continue;
+                        }
+                        child_pt[pt_i] = cow_pte;
+                    } else {
+                        // Already read-only (text/rodata or PROT_READ mmap):
+                        // no COW marking needed — but the parent PTE isn't
+                        // rewritten either, so validate the sample explicitly
+                        // in place of the CAS. Unchanged PTE + successful
+                        // IfLive-acquire proves the frame stayed continuously
+                        // owned by this mapping.
+                        if (@atomicLoad(u64, &parent_pt[pt_i], .acquire) != parent_pte) {
+                            pmm.releaseFrame(phys);
+                            continue;
+                        }
+                        child_pt[pt_i] = parent_pte;
+                    }
+                    break;
                 }
             }
         }
     }
 
-    // Flush parent's stale R/W TLB entries. Full CR3 reload is the cheapest
-    // way for any non-trivial process — invlpg per page would loop thousands
-    // of times for a healthy address space.
-    asm volatile (
-        \\movq %%cr3, %%rax
-        \\movq %%rax, %%cr3
-        :
-        :
-        : .{ .rax = true, .memory = true }
-    );
+    // Flush the parent's stale R/W TLB entries on EVERY cpu — a sibling
+    // thread running on another CPU would otherwise write through its stale
+    // R/W entry, bypassing the COW protection we just installed (see the
+    // doc-comment). shootdownAll includes the sender's local flush, replacing
+    // the old local-only CR3 reload.
+    tlb.shootdownAll(parent_pcid);
 
     return child_pml4;
 }

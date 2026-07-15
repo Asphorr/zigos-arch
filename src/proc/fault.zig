@@ -738,6 +738,17 @@ pub fn handleUserPageFault(cr2: usize, error_code: u64) bool {
                             frame_opt = f3;
                         } else |_| {}
                     }
+                } else if (e1 == error.AlreadyMapped) {
+                    // The PTE acquired a binding we must not blind-install
+                    // over, and it didn't resolve to a present frame: the
+                    // racing winner's mapping is mid-teardown, or a full
+                    // map+evict cycle inside our fault window left the PTE
+                    // swap-marked. Not OOM, not a bad region — report the
+                    // fault handled; the retried access takes the correct
+                    // path (swap-in or a fresh fault). This shape used to
+                    // fall through to the OOM-kill below.
+                    @import("../debug/kdbg.zig").pfEvent(@intCast(cur), cr2, @truncate(error_code), 0, true);
+                    return true;
                 } else {
                     debug.klog("[vmm] lazy fault REJECTED virt=0x{X} {s} — region[{d}] (0x{X}..0x{X}) prot=0x{X}\n", .{
                         va_aligned, @errorName(e1), i, r.start, r.end, r.prot,
