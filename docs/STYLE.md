@@ -189,16 +189,21 @@ before deref" contract is invisible at the deref site. Wrap user
 pointers in `util/user_ptr.zig`'s `UserPtr(T)`:
 
 ```zig
+// Read arg:
 const up = UserPtr(u32).fromRaw(arg).validate() orelse return E_FAULT;
-const value = up.copyIn();  // or up.copyOut(value)
+const value = up.copyIn();
+// Write target (proves the page writable, breaks COW):
+const out = UserPtr(u32).fromRaw(arg).validateWrite() orelse return E_FAULT;
+out.copyOut(value);
 ```
 
-`UserPtr` has no direct dereference path — the only way to touch the
-underlying memory is via `copyIn` / `copyOut`, and reaching those
-methods requires going through `validate()` first. Direct
-`@ptrFromInt(arg).*` becomes a type error. The Zig-native equivalent
-of Linux's SPARSE `__user` annotation, but enforced at compile time
-rather than by an external tool.
+`UserPtr` itself has no dereference methods — `copyIn` lives only on
+the proof handle `validate()` returns, and `copyOut` only on the one
+from `validateWrite()`. Deref of an unvalidated pointer, or a write
+through a read-proof, is a compile error — as is direct
+`@ptrFromInt(arg).*`. The Zig-native equivalent of Linux's SPARSE
+`__user` annotation, but enforced at compile time rather than by an
+external tool.
 
 **Reference exemplar:** `sysSigpending` in `cpu/syscall/proc.zig`.
 Mass-rollout across ~50 syscall sites is incremental — new syscalls

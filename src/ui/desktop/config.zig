@@ -22,8 +22,8 @@ pub var resolution: u8 = 1; // 0=720p, 1=1080p (default to current)
 pub const PATH = "/etc/zigos.conf";
 
 /// Read PATH at boot and apply persisted UI settings. Missing file is
-/// fine — defaults stand. Bad values are clamped per-key (same range
-/// checks as the setConfig syscall).
+/// fine — defaults stand. Out-of-range values are ignored per-key (same
+/// range checks as the setConfig syscall).
 pub fn load() void {
     var staging: [4096]u8 align(4) = undefined;
     const size = @import("../../fs/vfs.zig").loadFile(PATH, &staging, null) orelse return;
