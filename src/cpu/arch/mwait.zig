@@ -106,6 +106,17 @@ pub fn detect() void {
 /// ECX[0]=1 makes interrupt break wake mwait even with EFLAGS.IF=0,
 /// matching the `sti; hlt` semantics the caller wraps this in.
 pub inline fn idleWait(addr: *volatile u32) void {
+    monitorArm(addr);
+    mwaitEnter();
+}
+
+/// Arm MONITOR only. Callers that must not sleep over a racing wake arm
+/// the monitor FIRST, re-check their wake condition, then mwaitEnter():
+/// any store to the armed line that lands after the arm — even before
+/// MWAIT executes — puts the monitor in the triggered state and the MWAIT
+/// returns immediately. That ordering closes the check→sleep window that
+/// a plain check-then-idleWait sequence leaves open.
+pub inline fn monitorArm(addr: *volatile u32) void {
     const a = @intFromPtr(addr);
     asm volatile (
         \\monitor
@@ -114,6 +125,11 @@ pub inline fn idleWait(addr: *volatile u32) void {
           [c] "{rcx}" (@as(u64, 0)),
           [d] "{rdx}" (@as(u64, 0)),
     );
+}
+
+/// MWAIT on the previously armed monitor (see monitorArm). ECX[0]=1 keeps
+/// the IF=0-interrupt-break semantics of idleWait.
+pub inline fn mwaitEnter() void {
     asm volatile (
         \\mwait
         :

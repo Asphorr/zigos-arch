@@ -36,10 +36,20 @@ var self_wake_due_at: u64 = 0;
 /// back without recompiling.
 pub var event_driven: bool = true;
 
-/// Request an immediate wake on the next timer tick. Single atomic
-/// store; safe from any context (IRQ, syscall, kernel task).
+/// Request an immediate wake. Safe from any context (IRQ, syscall,
+/// kernel task, any CPU). Two stores:
+///   1. wake_pending — the level-triggered flag shouldResumeDesktop reads.
+///   2. a bump of the BSP's MWAIT monitor word — if the BSP idles in
+///      mwait, the store pops it instantly and the idle loop's pre-/post-
+///      sleep wake checks run. This is what makes an AP-side producer
+///      (async app load, a task's pipe write) wake the compositor in µs
+///      instead of "whenever the next input IRQ happens to arrive".
+///      Harmless when the BSP is busy or hlt-idling (the timer catches
+///      those within its ≤100 ms stretch cap).
 pub fn requestWake() void {
     @atomicStore(bool, &wake_pending, true, .release);
+    const smp = @import("../../cpu/smp.zig");
+    _ = @atomicRmw(u32, &smp.cpus[0].idle_monitor_word, .Add, 1, .release);
 }
 
 /// Schedule a self-wake at `at_tick` (absolute tick count). Coalesces

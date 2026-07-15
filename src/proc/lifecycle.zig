@@ -539,12 +539,35 @@ fn kernelIdle() callconv(.c) noreturn {
             // sti + monitor + mwait. MWAIT(EAX=C1 hint, ECX[0]=1) wakes on
             // either a write to the monitored line or an interrupt — IRQs
             // break it just like HLT, with the added bonus of letting the
-            // CPU drop into C1/C1E. The monitored word is per-CPU; future
-            // wake-from-kernel paths can bump it to wake without an IPI.
+            // CPU drop into C1/C1E. The monitored word is per-CPU; the
+            // compositor's wake.requestWake() bumps the BSP's word so a
+            // producer on any CPU pops this mwait without an IPI.
+            //
+            // Order matters: arm MONITOR, THEN check the parked desktop,
+            // THEN mwait. A requestWake that lands after the check writes
+            // the already-armed line, so the MWAIT returns immediately —
+            // no check→sleep window. (Pre-fix this loop slept straight
+            // over wakes posted while this CPU was busy: the desktop's
+            // wake check only ran AFTER an IRQ broke mwait, which is why
+            // a freshly-launched terminal or a terminal app's output sat
+            // invisible until the next mouse/keyboard IRQ.)
             const cpu = smp.myCpu();
+            mwait.monitorArm(&cpu.idle_monitor_word);
+            if (@import("../ui/desktop.zig").wakeIfDueFromIdle()) {
+                process.schedule();
+                continue;
+            }
             asm volatile ("sti");
-            mwait.idleWait(&cpu.idle_monitor_word);
+            mwait.mwaitEnter();
         } else {
+            // No MONITOR/MWAIT (common under KVM): the pre-sleep check
+            // still closes the busy→idle lost-wake path; a wake that
+            // races past it is caught by the next timer fire (the BSP
+            // stretch is capped by earliest_wake_tick, ≤100 ms).
+            if (@import("../ui/desktop.zig").wakeIfDueFromIdle()) {
+                process.schedule();
+                continue;
+            }
             asm volatile ("sti; hlt");
         }
         // Tickless idle: if the one-shot was stretched while we slept and
@@ -560,7 +583,7 @@ fn kernelIdle() callconv(.c) noreturn {
         // is the earliest safe point after the IRQ). µs-class input
         // latency instead of waiting for the next tick. No-op off-BSP
         // or when the desktop isn't parked/due.
-        @import("../ui/desktop.zig").wakeIfDueFromIdle();
+        _ = @import("../ui/desktop.zig").wakeIfDueFromIdle();
         process.schedule();
     }
 }

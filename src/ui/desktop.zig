@@ -4106,15 +4106,29 @@ pub var active: bool = false;
 // PCB → hlt/mwait → the tickless BSP stretch finally engages.
 //
 // Wake paths, fastest first:
-//   1. BSP idle loop (wakeIfDueFromIdle): an input IRQ breaks hlt, the
-//      idle loop re-checks shouldResumeDesktop() in a lock-clean
-//      context and sched.wake()s us — µs latency on keystrokes/mouse.
-//   2. IRQ0 tick block due-check (irq0.zig): catches wake sources that
+//   1. BSP idle loop (wakeIfDueFromIdle): checked BEFORE entering
+//      mwait/hlt (with MONITOR already armed — no check→sleep window)
+//      and again after an IRQ breaks the wait. µs latency on
+//      keystrokes/mouse, and on any producer that fired while the BSP
+//      was busy running a task.
+//   2. wake.requestWake's monitor-word kick: a producer on ANY CPU
+//      (AP app-load completion, a task's terminal-pipe write) bumps the
+//      BSP's idle_monitor_word — pops an in-progress mwait instantly,
+//      then path 1's post-wake check runs.
+//   3. IRQ0 tick block due-check (irq0.zig): catches wake sources that
 //      arrived while a USER task was running (no idle transition) —
-//      ≤10ms, same as the pre-parking force_yield cadence.
-//   3. wakeExpired at wake_tick: the pending self-wake deadline
-//      (animations, toast) or the 1s liveness backstop (menubar clock,
-//      zombie reaper).
+//      ≤10ms; it retargets wake_tick to "now" and wakeExpired's
+//      .desktop branch does the setState.
+//   4. wakeExpired at wake_tick: the pending self-wake deadline
+//      (animations, toast, the GUI auto-refresh floor) or the 1s
+//      liveness backstop (menubar clock, zombie reaper).
+//
+// Paths 3 and 4 were DEAD until 2026-07-16: wakeExpired had no .desktop
+// branch (only .gpu_io/.none honor wake_tick), so every wake funneled
+// through path 1's post-IRQ check — which itself only ran after an IRQ
+// broke the sleep. Net effect: launch-a-window / write-to-a-terminal
+// while the desktop was parked drew NOTHING until the next mouse or
+// keyboard IRQ. Path 2 didn't exist (idle_monitor_word had no writer).
 
 /// PCB pid of the desktop task; captured at run() entry. null until then.
 var desktop_pid: ?u8 = null;
@@ -4131,19 +4145,35 @@ pub fn desktopPid() ?u8 {
     return desktop_pid;
 }
 
-/// Called from the BSP idle loop right after an IRQ broke hlt/mwait:
-/// if the desktop is parked and something is now due, wake it here in a
-/// lock-clean context (sched.wake is NOT IRQ-safe, but idle-loop is).
-pub fn wakeIfDueFromIdle() void {
-    if (@import("../cpu/smp.zig").myCpu().cpu_id != 0) return;
-    if (!desktopParkedAndDue()) return;
-    if (desktop_pid) |dp| @import("../proc/sched.zig").wake(dp);
+/// Called from the BSP idle loop, both BEFORE sleeping (so a wake posted
+/// while this CPU was busy isn't slept over) and right after an IRQ broke
+/// hlt/mwait. Wakes the parked desktop in a lock-clean context
+/// (sched.wake is NOT IRQ-safe, but idle-loop is). Returns true if it
+/// woke the desktop — the pre-sleep caller then schedules instead of
+/// entering mwait/hlt.
+pub fn wakeIfDueFromIdle() bool {
+    if (@import("../cpu/smp.zig").myCpu().cpu_id != 0) return false;
+    if (!desktopParkedAndDue()) return false;
+    if (desktop_pid) |dp| {
+        @import("../proc/sched.zig").wake(dp);
+        return true;
+    }
+    return false;
 }
 
 /// Liveness backstop when no self-wake is pending: 1 s. Covers slow
 /// periodic housekeeping (menubar clock repaint, zombie reaping) if
 /// every event-driven wake source goes quiet.
 const PARK_BACKSTOP_TICKS: u64 = 100;
+
+/// Self-wake floor while any GUI-framebuffer window is visible: 10 Hz.
+/// Apps that don't call sysPresent (sysmon, settings) are repainted by
+/// the loop's auto-refresh, which only runs while the desktop is AWAKE —
+/// an unconditional park would freeze their windows at whatever frame
+/// was last composited. Terminal windows don't need this (pipe writes
+/// and keystrokes wake us), so an all-terminal desktop still parks
+/// indefinitely.
+const GUI_PARK_REFRESH_TICKS: u64 = 10;
 
 /// The desktop loop's yield point. Anything due → plain yield (user
 /// tasks run; the timer's force_yield/shouldResumeDesktop brings us
@@ -4163,6 +4193,12 @@ fn parkOrYield() void {
     };
     const sched = @import("../proc/sched.zig");
     const pcb = process.getPCB(me);
+    // GUI refresh floor (see GUI_PARK_REFRESH_TICKS). Coalesces with any
+    // earlier pending self-wake — the min wins. gui_windows_active is one
+    // iteration stale here (set mid-loop, read post-loop) — intentional:
+    // worst case the floor starts/stops one ~100 ms cycle late when a GUI
+    // window is first created/destroyed, then self-corrects.
+    if (gui_windows_active) wake.requestSelfWake(process.tick_count + GUI_PARK_REFRESH_TICKS);
     const self_due = wake.selfWakeAt();
     const deadline: u64 = if (self_due != 0) self_due else process.tick_count + PARK_BACKSTOP_TICKS;
     @atomicStore(u64, &pcb.wake_tick, deadline, .release);

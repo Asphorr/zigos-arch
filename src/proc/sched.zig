@@ -2198,7 +2198,19 @@ pub fn wakeExpired() void {
         // handle .gpu_io here (not in the .none branch) so the wake
         // clears wait_kind back to .none on the same path as the IRQ
         // wake — keeping a single "waiter resumed" code path.
-        if (pcb.wait_kind == .gpu_io and wt != 0 and process.tick_count >= wt) {
+        //
+        // .desktop is deadline-woken on the same path: parkOrYield stores
+        // wake_tick (the pending self-wake, else the 1 s liveness
+        // backstop) before blocking, and the IRQ0 due-check retargets it
+        // to "now" when an input/wake source turns up mid-park. This
+        // branch is what makes both of those actually fire — it was
+        // MISSING until 2026-07-16, so the desktop's only real waker was
+        // the BSP idle loop after an input IRQ: freshly-launched windows
+        // and terminal output sat unrendered until the user moved the
+        // mouse, and the park backstop/self-wake deadlines were dead
+        // letters (animations/toasts survived only because the idle loop
+        // re-checked shouldResumeDesktop after every IRQ).
+        if ((pcb.wait_kind == .gpu_io or pcb.wait_kind == .desktop) and wt != 0 and process.tick_count >= wt) {
             @atomicStore(u64, &pcb.wake_tick, 0, .release);
             clearWait(pcb);
             setState(i, .ready);
@@ -2226,10 +2238,11 @@ pub fn wakeExpired() void {
             continue;
         }
         // Sleeper remains parked. If it has a future deadline this function
-        // would honor (.gpu_io or .none with wt > now), track it for the
-        // post-scan earliest_wake_tick store. Other wait kinds are woken by
-        // explicit paths and their wake_tick (if any) is informational only.
-        if ((pcb.wait_kind == .gpu_io or pcb.wait_kind == .none)
+        // would honor (.gpu_io/.desktop or .none with wt > now), track it
+        // for the post-scan earliest_wake_tick store. Other wait kinds are
+        // woken by explicit paths and their wake_tick (if any) is
+        // informational only.
+        if ((pcb.wait_kind == .gpu_io or pcb.wait_kind == .desktop or pcb.wait_kind == .none)
             and wt > process.tick_count and wt < new_earliest)
         {
             new_earliest = wt;
@@ -2258,6 +2271,11 @@ pub fn wakeExpired() void {
             } else {
                 continue; // race: wt became eligible, we'll wake on next pass
             }
+        } else if (kind == .desktop and wt != 0 and process.tick_count < wt) {
+            // Parked desktop with a live deadline — the branch above wakes
+            // it at wt. Same shape as the .none "sleep still pending" case,
+            // not a stuck waiter.
+            continue;
         } else {
             debug.klog("[wake-skip] pid={d} state=sleeping wait_kind={d} wait_target=0x{x} (explicit waker not firing)\n", .{
                 i, @intFromEnum(kind), target,
