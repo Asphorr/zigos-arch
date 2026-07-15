@@ -352,9 +352,11 @@ fn enableIsaPin(isa_irq: u8, vector: u8) void {
 
 /// Mask an ISA IRQ at the IOAPIC. The redirection-table mask bit (bit 16)
 /// stops the line from delivering regardless of upstream chipset state —
-/// used to kill QEMU's spurious i8042 IRQ1 storm when the i8042
-/// controller-config-byte mask is ignored. Preserves polarity/trigger
-/// from MADT; re-writes vector + mask bit.
+/// keyboard.disableIRQ1 uses it as belt-and-braces when PS/2 is retired
+/// in favor of USB. (Added to kill a "QEMU IRQ1 storm" that turned out
+/// to be our own reEnable-per-yield config traffic — falsified
+/// 2026-07-13; see disableIRQ1's doc.) Preserves polarity/trigger from
+/// MADT; re-writes vector + mask bit.
 pub fn maskIsaIrq(isa_irq: u8, vector: u8) void {
     const e = isaPinElectrical(isa_irq);
     const gsi = isaToGsi(isa_irq);

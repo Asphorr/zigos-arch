@@ -130,10 +130,23 @@ pub fn initPS2() bool {
 
 /// Mask PS/2 IRQ1 in the i8042 controller config and disable port 1
 /// (keyboard) entirely. Called when a USB keyboard is up and PS/2 input
-/// is redundant — QEMU's i8042 emulation otherwise spuriously asserts
-/// IRQ1 at ~2200/sec on an idle system (the IRQ-status-bit-stuck class
-/// of i8042 quirks), burning ~4 % of one CPU in handleIRQ1 + EOI for
-/// nothing.
+/// is redundant — one live input path is enough, and stray i8042 bytes
+/// would each cost an IRQ + port-IO round-trip (VM exits under nested
+/// virt) for input we'd discard anyway.
+///
+/// The original justification — "QEMU's i8042 spuriously asserts IRQ1 at
+/// ~2200/sec on an idle system" — was FALSIFIED 2026-07-13: a host-side
+/// ioapic_set_irq trace with IRQ1 left fully unmasked showed 14
+/// assertions in 100 s, all solicited by the init handshake, none at
+/// idle. The "storm" was claim-era yieldToScheduler() calling reEnable()
+/// every yield (~28×/tick ≈ the measured rate): each 0x20 config-read's
+/// response byte set OBF → one IRQ1 edge per call. That call was removed
+/// 2026-05-26; the storm died with it. This mask is policy, not necessity.
+///
+/// ⚠️ Real-HW consequence: on a laptop whose internal keyboard is i8042,
+/// plugging in a USB keyboard permanently retires the internal one
+/// (ps2_present=false, no path back) — policy inherited from the
+/// falsified rationale, not yet revisited.
 ///
 /// We don't disable IRQ12 (mouse) here — if the user has a PS/2 mouse
 /// alongside a USB keyboard, dropping IRQ12 would silently kill mouse
@@ -173,10 +186,13 @@ pub fn disableIRQ1() void {
     ps2_present = false; // input ring stays drained from here on
     debug.klog("[kbd] PS/2 IRQ1 masked at i8042 (USB keyboard active)\n", .{});
     asm volatile ("sti");
-    // Belt-and-braces: also mask at the IOAPIC. QEMU's i8042 emulation
-    // ignores the controller-config-byte mask and keeps asserting IRQ1
-    // at ~7500/sec (measured 2026-05-19). The IOAPIC redirection-entry
-    // mask bit stops delivery regardless of upstream chipset state.
+    // Belt-and-braces: also mask at the IOAPIC, so delivery stays dead
+    // even if something reprograms the controller config later. That
+    // "something" was real once: the 2026-05-19 "config mask ignored,
+    // still ~7500/sec" reading was claim-era reEnable() running every
+    // yield, unconditionally re-setting config bit 0 and soliciting a
+    // fresh response byte — our own re-arm loop, not QEMU (removed
+    // 2026-05-26; falsified 2026-07-13, see the doc comment above).
     @import("../time/apic.zig").maskIsaIrq(1, 0x21);
 }
 

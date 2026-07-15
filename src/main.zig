@@ -509,10 +509,11 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
         blog.skip("Input devices", "no PS/2 nor USB HID keyboard found", .{});
         serial.print("[boot] WARNING: no keyboard input source detected — system will boot but won't be interactive.\n", .{});
     }
-    // If a USB keyboard came up alongside PS/2, drop PS/2 IRQ1 — QEMU's
-    // i8042 emulation otherwise spuriously asserts IRQ1 at ~2200/sec on
-    // an idle guest, costing ~4 % of one CPU in handleIRQ1 + EOI for
-    // no input. USB is the real input path; PS/2 is dead weight.
+    // If a USB keyboard came up alongside PS/2, drop PS/2 IRQ1 — USB is
+    // the real input path and PS/2 is dead weight. (The old "QEMU asserts
+    // IRQ1 at ~2200/sec" rationale was falsified 2026-07-13: that storm
+    // was our own reEnable-per-yield traffic, gone since 2026-05-26; see
+    // keyboard.disableIRQ1's doc.)
     if (keyboard.ps2_present and xhci_up and xhci.hasUsbKeyboard()) {
         keyboard.disableIRQ1();
     }
