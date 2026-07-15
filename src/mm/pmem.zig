@@ -19,6 +19,14 @@
 // boot counter in the region itself to prove the contents survive a VM restart
 // (the backing file does the persisting; under QEMU-without-libpmem the flushes
 // are advisory and durability lands when QEMU msyncs the mapping on exit).
+//
+// N2.5: typed persistent objects — Persistent(T) proves at compile time that
+// a struct may live in the region (every bit pattern a valid value, explicit
+// layout, no pointers, no implicit padding), pins the layout with a comptime
+// fingerprint, and hands out only durable stores. The boot-counter header is
+// its reference consumer.
+
+const std = @import("std"); // comptime-only: @typeInfo walks + comptimePrint
 
 const acpi = @import("../acpi/acpi.zig");
 const aml = @import("../acpi/aml.zig");
@@ -165,6 +173,169 @@ pub fn writeAt(off: u64, src: []const u8) usize {
     return n;
 }
 
+// --- N2.5: typed persistent objects — the compiler as format police ---------
+//
+// Bytes in this region have two failure modes ordinary RAM never shows:
+//   1. they OUTLIVE THE BINARY — next boot's kernel, possibly rebuilt from
+//      changed source, reinterprets them, so a struct stored here is an
+//      on-disk format, not an in-memory convenience;
+//   2. they can be TORN — a crash mid-store leaves any byte pattern, so a
+//      field type with invalid representations (bool, enum, pointer) makes
+//      the post-crash *load* undefined behavior, not merely wrong data.
+// Persistent(T) turns both into compile errors:
+//   - assertPersistable walks T recursively and rejects, naming the field
+//     path, everything whose bit patterns are not all valid values (bool,
+//     enum, union, optional), everything the compiler may re-lay-out
+//     (auto-layout structs), pointer-sized integers, implicit padding (torn
+//     padding makes checksums lie), and the pmem classic — pointers: a
+//     virtual address is garbage after reboot;
+//   - layoutId folds the recursive layout (field names, offsets, widths)
+//     into a comptime fingerprint; locking it (HEADER_LAYOUT_ID below) makes
+//     editing a persistent struct fail the build until the on-pmem format
+//     bump is made consciously — rule 5's comptime-assert idea aimed at
+//     persistence instead of bounds;
+//   - the handle exposes only load (snapshot out) and store (write-through +
+//     persistRange): through the handle, a store that skips the persistence
+//     domain does not compile — the same split user_ptr.zig makes with its
+//     validate()/copyIn proof handles.
+// The validator is what makes load() sound: copying raw — possibly torn —
+// bytes into a T is defensible only because every bit pattern of a
+// persistable T is a valid T.
+//
+// Concurrency: like readAt/writeAt, handles do not lock; the caller owns
+// exclusion over its window (the boot self-test runs single-threaded).
+
+/// Reject, at compile time and naming the offending field path, any type
+/// whose bytes cannot safely live in persistent memory. Admission rule:
+/// every bit pattern is a valid value, the layout is explicit, and nothing
+/// address-shaped hides inside.
+fn assertPersistable(comptime T: type, comptime path: []const u8) void {
+    switch (@typeInfo(T)) {
+        .int => if (T == usize or T == isize) @compileError(path ++
+            ": pointer-sized integer in a persistent format — spell the width (u64)"),
+        .float => {},
+        .array => |a| assertPersistable(a.child, path ++ "[i]"),
+        .@"struct" => |s| switch (s.layout) {
+            .auto => @compileError(path ++
+                ": auto struct layout is not ABI-stable and these bytes outlive the binary — use extern struct"),
+            .@"extern" => {
+                comptime var expect: usize = 0;
+                inline for (s.fields) |f| {
+                    if (@offsetOf(T, f.name) != expect) @compileError(path ++ "." ++ f.name ++
+                        ": implicit padding before this field — torn padding bytes make checksums lie; pad explicitly with [N]u8");
+                    assertPersistable(f.type, path ++ "." ++ f.name);
+                    expect = @offsetOf(T, f.name) + @sizeOf(f.type);
+                }
+                if (expect != @sizeOf(T)) @compileError(path ++
+                    ": implicit trailing padding — pad explicitly with [N]u8");
+            },
+            .@"packed" => {
+                if (@bitSizeOf(T) != 8 * @sizeOf(T)) @compileError(path ++
+                    ": packed struct has padding bits (@bitSizeOf < 8*@sizeOf) — undefined padding makes persisted bytes non-deterministic and byte checksums lie; pad to whole bytes");
+                inline for (s.fields) |f| {
+                    assertPersistable(f.type, path ++ "." ++ f.name);
+                }
+            },
+        },
+        .pointer => @compileError(path ++
+            ": pointer in a persistent format — a virtual address does not survive reboot"),
+        .bool, .@"enum" => @compileError(path ++
+            ": has invalid bit patterns, so loading a torn write is undefined behavior — store an explicit-width integer and convert with checked casts"),
+        .optional => @compileError(path ++
+            ": optional layout is not ABI-stable — encode absence as an explicit field"),
+        .@"union" => @compileError(path ++
+            ": a union hides which arm was live from crash recovery — store an integer tag + extern payload"),
+        else => @compileError(path ++ ": " ++ @typeName(T) ++ " cannot live in persistent memory"),
+    }
+}
+
+/// FNV-1a over the recursive layout of T — container kinds, field names,
+/// offsets, widths. Two types agree iff the same bytes mean the same thing,
+/// so a locked layoutId is a compile-time regression test for an on-pmem
+/// format.
+const FNV1A_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+const FNV1A_PRIME: u64 = 0x100000001b3;
+
+fn layoutId(comptime T: type) u64 {
+    return comptime layoutFold(T, FNV1A_OFFSET_BASIS);
+}
+
+fn layoutFold(comptime T: type, comptime h: u64) u64 {
+    switch (@typeInfo(T)) {
+        .int, .float => return fnv1a(h, @typeName(T)),
+        .array => |a| return layoutFold(a.child, fnv1a(h, std.fmt.comptimePrint("[{d}]", .{a.len}))),
+        .@"struct" => |s| {
+            comptime var x = fnv1a(h, if (s.layout == .@"packed") "packed{" else "extern{");
+            inline for (s.fields) |f| {
+                const off = if (s.layout == .@"packed") @bitOffsetOf(T, f.name) else @offsetOf(T, f.name);
+                x = layoutFold(f.type, fnv1a(x, std.fmt.comptimePrint("{s}@{d};", .{ f.name, off })));
+            }
+            return fnv1a(x, "}");
+        },
+        else => unreachable, // assertPersistable admits nothing else
+    }
+}
+
+fn fnv1a(comptime h: u64, comptime s: []const u8) u64 {
+    comptime var x = h;
+    inline for (s) |b| {
+        x ^= b;
+        x *%= FNV1A_PRIME;
+    }
+    return x;
+}
+
+/// Typed handle to a T at a fixed byte offset of the pmem region.
+/// Instantiating Persistent(T) is itself the proof that T is persistable;
+/// map() adds the runtime proof that the window exists. store() is durable
+/// on return. The raw region pointer never escapes the handle, so the
+/// store-without-flush bug class does not compile here — byte-granular
+/// callers (/dev/pmem0, DAX mmap) keep using readAt/writeAt/ptr().
+pub fn Persistent(comptime T: type) type {
+    assertPersistable(T, @typeName(T));
+    if (@sizeOf(T) == 0) @compileError(@typeName(T) ++ ": zero-size type — nothing to persist");
+    return struct {
+        window: [*]volatile u8, // region + off, established by map()
+        off: u64, // byte offset in the region — persistRange speaks offsets
+
+        const Self = @This();
+
+        /// Bind byte offset `off` of the region to a T. Null when no NVDIMM
+        /// is present, [off, off+@sizeOf(T)) overruns the region, or the
+        /// mapped address misaligns T. The caller owns exclusion of the
+        /// window, same contract as readAt/writeAt.
+        pub fn map(off: u64) ?Self {
+            if (!present) return null;
+            if (off > len_bytes or len_bytes - off < @sizeOf(T)) return null;
+            const delta: usize = @intCast(off);
+            // Stricter than the bytewise load/store need — kept so the handle
+            // stays sound if a raw *T view is ever exposed later.
+            if ((@intFromPtr(region) + delta) % @alignOf(T) != 0) return null;
+            return .{ .window = region + delta, .off = off };
+        }
+
+        /// Snapshot the persistent value into a kernel local. Sound even
+        /// against a torn prior store: every bit pattern of a persistable T
+        /// is a valid T (assertPersistable's admission rule).
+        pub fn load(self: Self) T {
+            var v: T = undefined;
+            const dst: [*]u8 = @ptrCast(&v);
+            var i: usize = 0;
+            while (i < @sizeOf(T)) : (i += 1) dst[i] = self.window[i];
+            return v;
+        }
+
+        /// Write `v` through to the region and push it to the persistence
+        /// domain — durable on return. The only mutator on the handle.
+        pub fn store(self: Self, v: T) void {
+            const src: [*]const u8 = @ptrCast(&v);
+            var i: usize = 0;
+            while (i < @sizeOf(T)) : (i += 1) self.window[i] = src[i];
+            persistRange(self.off, @sizeOf(T));
+        }
+    };
+}
+
 // --- N2: boot-survival self-test -------------------------------------------
 //
 // Keep a small header at offset 0: a magic, a monotonic boot counter, and an
@@ -183,6 +354,23 @@ const Header = extern struct {
     boot_count: u64,
     check: u64, // = magic ^ boot_count ^ salt — rejects a blank/torn header
 };
+
+/// Locked layout fingerprint of the on-pmem Header. If editing Header fires
+/// the assert below, the new binary would misread regions the old one wrote:
+/// bump PMEM_MAGIC (old headers then read as blank instead of as garbage),
+/// paste the new id from the error message, and re-lock.
+const HEADER_LAYOUT_ID: u64 = 0x5f1186780d92b64d;
+
+comptime {
+    // Validate first so an unsupported field type reports its field path here
+    // instead of tripping layoutFold's unreachable.
+    assertPersistable(Header, @typeName(Header));
+    const got = layoutId(Header);
+    if (got != HEADER_LAYOUT_ID) @compileError(std.fmt.comptimePrint(
+        "on-pmem Header layout changed: layoutId 0x{x} != locked 0x{x} — bump PMEM_MAGIC and re-lock",
+        .{ got, HEADER_LAYOUT_ID },
+    ));
+}
 
 var boot_seq: u64 = 0;
 
@@ -203,13 +391,12 @@ fn headerValid(h: Header) bool {
 }
 
 /// Read the persistent boot counter, bump it, write it back durably, and log
-/// the survival count. Run once at boot after the region is mapped.
+/// the survival count. Run once at boot after the region is mapped. This is
+/// Persistent(T)'s reference consumer: the store is durable by construction,
+/// not because anyone remembered persistRange.
 fn persistenceSelfTest() void {
-    if (!present or len_bytes < @sizeOf(Header)) return;
-    const h: *volatile Header = @ptrCast(@alignCast(region));
-
-    // Volatile field reads — pull the prior boot's header out of pmem.
-    const cur = Header{ .magic = h.magic, .boot_count = h.boot_count, .check = h.check };
+    const hdr = Persistent(Header).map(0) orelse return;
+    const cur = hdr.load();
 
     var next: Header = undefined;
     if (headerValid(cur)) {
@@ -224,11 +411,7 @@ fn persistenceSelfTest() void {
     next.magic = PMEM_MAGIC;
     next.check = next.magic ^ next.boot_count ^ PMEM_CHECK_SALT;
 
-    // Write the header back and push it to the persistence domain.
-    h.magic = next.magic;
-    h.boot_count = next.boot_count;
-    h.check = next.check;
-    persistRange(0, @sizeOf(Header));
+    hdr.store(next);
     boot_seq = next.boot_count;
 
     debug.klog("[pmem] persistence: header committed via {s}+sfence (counter now {d})\n", .{

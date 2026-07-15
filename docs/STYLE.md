@@ -209,6 +209,34 @@ external tool.
 Mass-rollout across ~50 syscall sites is incremental — new syscalls
 should use UserPtr; existing ones migrate when touched.
 
+## `Persistent(T)` — compile-time persistable proofs (pmem)
+
+Bytes in the NVDIMM region outlive the kernel binary and can be torn
+by a crash mid-store — two hazards ordinary RAM never shows.
+`mm/pmem.zig`'s `Persistent(T)` makes the resulting bug classes
+compile errors:
+
+- instantiating it runs `assertPersistable(T)`, which rejects (naming
+  the field path) pointers, bool/enum/union/optional (types with
+  invalid bit patterns — loading a torn write would be UB),
+  auto-layout structs, `usize`, and implicit padding;
+- a locked `layoutId(T)` fingerprint (FNV-1a over field names,
+  offsets, widths) turns "someone edited a persistent struct" into a
+  build failure instead of a silent misread of last boot's bytes;
+- the handle exposes only `load()` (snapshot out) and `store()`
+  (write-through + `persistRange` — durable on return), so a store
+  that skips the persistence domain does not compile through it.
+
+```zig
+const hdr = Persistent(Header).map(0) orelse return; // bounds+align proof
+const cur = hdr.load();  // sound even after a torn write
+hdr.store(next);         // durable on return
+```
+
+**Reference exemplar:** `persistenceSelfTest` in `mm/pmem.zig` (the
+boot counter). New on-pmem structures go through `Persistent(T)`; the
+raw `readAt`/`writeAt` byte path remains for /dev/pmem0 file I/O.
+
 ## `kwarn` — recoverable warnings
 
 Three-level severity in `debug/debug.zig`:
@@ -247,4 +275,5 @@ silent self-recovery into observable metric.
 | Lock-Guard          | `src/mm/pmm.zig` `Region.Guard.pushRun`         |
 | `assertHeld()`      | `src/mm/pmm.zig` `pushRunLocked` line 1         |
 | `UserPtr(T)`        | `src/cpu/syscall/proc.zig` `sysSigpending`      |
+| `Persistent(T)`     | `src/mm/pmem.zig` `persistenceSelfTest`         |
 | `kwarn(@src(),...)` | `src/debug/debug.zig` `kwarn`                   |
