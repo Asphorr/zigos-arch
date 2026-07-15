@@ -144,6 +144,11 @@ const launch_queue = @import("desktop/launch_queue.zig");
 // doc-comment for the model.
 pub const wake = @import("desktop/wake.zig");
 
+// Frame-time percentiles ([frameperf] serial dump every ~30 s). Phase
+// stamps live in the main loop; flush time is accumulated inside
+// display.flush/flushRect.
+const frameperf = @import("desktop/frameperf.zig");
+
 pub fn showNotification(text: []const u8) void {
     toast.show(text);
     dirty_rects_mod.force_full_kind = true;
@@ -2960,6 +2965,9 @@ pub fn run() void {
         // stretch) — see the parking block comment near `parked`.
         last_desktop_tick = process.tick_count;
         parkOrYield();
+        // Frame clock starts AFTER parkOrYield returns — parked/yielded
+        // time belongs to the scheduler, not to this frame.
+        frameperf.frameBegin();
 
         // Apply config changes from settings app
         if (config_changed) {
@@ -3352,6 +3360,7 @@ pub fn run() void {
         }
 
         // Render based on what changed
+        frameperf.prepDone();
         if (backbuf != null) {
             switch (dirty) {
                 .full => {
@@ -3453,6 +3462,14 @@ pub fn run() void {
             if (swCursorActive(use_hw_cursor)) drawCursorOnScreen();
             display.flush();
         }
+        frameperf.frameEnd(switch (dirty) {
+            .none => .none,
+            .cursor_only => .cursor,
+            .text_only => .text,
+            .gui_only => .gui,
+            .drag => .drag,
+            .full => .full,
+        }, process.tick_count);
 
     }
     active = false;

@@ -13,9 +13,15 @@
 
 const virtio_gpu = @import("../driver/virtio_gpu.zig");
 const gop = @import("../driver/gop_fb.zig");
+// Frame-time accounting: flush spans are billed to the desktop's current
+// frame ([frameperf]). flushBegin returns 0 (→ flushEnd no-op) when the
+// desktop isn't mid-frame, so boot/compositor-task flushes aren't counted.
+const frameperf = @import("desktop/frameperf.zig");
 
 /// Push the full frame to whatever scans out.
 pub fn flush() void {
+    const t = frameperf.flushBegin();
+    defer frameperf.flushEnd(t);
     if (virtio_gpu.active) {
         virtio_gpu.flush();
         return;
@@ -25,6 +31,8 @@ pub fn flush() void {
 
 /// Push one rectangle to whatever scans out.
 pub fn flushRect(x: u32, y: u32, w: u32, h: u32) void {
+    const t = frameperf.flushBegin();
+    defer frameperf.flushEnd(t);
     if (virtio_gpu.active) {
         virtio_gpu.flushRect(x, y, w, h);
         return;
