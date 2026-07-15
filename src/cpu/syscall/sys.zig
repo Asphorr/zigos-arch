@@ -71,22 +71,27 @@ pub fn sysGetRandom(buf_ptr: u32, len: u32) u32 {
 }
 
 pub fn sysSetConfig(key: u32, value: u32) u32 {
-    const val: u8 = @truncate(value);
+    // Range-check the FULL u32 before truncating. Truncating first
+    // (`@truncate(value)` then `if (val <= N)`) lets a large value alias
+    // onto an in-range one: setConfig(bg, 0x100) truncated to 0 and set the
+    // background to blue instead of rejecting the garbage. The desktop conf
+    // parser (config.zig applyKv) already checks the pre-truncation value;
+    // this is the syscall side of the same contract.
     switch (key) {
         0 => { // resolution: 0=720p, 1=1080p
-            if (val <= 1) desktop.conf.resolution = val;
+            if (value <= 1) desktop.conf.resolution = @truncate(value);
         },
         1 => { // background: 0=blue, 1=purple, 2=green, 3=red
-            if (val <= 3) desktop.conf.bg = val;
+            if (value <= 3) desktop.conf.bg = @truncate(value);
         },
         2 => { // theme: 0=light, 1=dark
-            if (val <= 1) desktop.conf.theme = val;
+            if (value <= 1) desktop.conf.theme = @truncate(value);
         },
         3 => { // mouse speed: 0=slow, 1=normal, 2=fast
-            if (val <= 2) desktop.conf.mouse_speed = val;
+            if (value <= 2) desktop.conf.mouse_speed = @truncate(value);
         },
         4 => { // dock position: 0=bottom, 1=top
-            if (val <= 1) desktop.conf.dock_pos = val;
+            if (value <= 1) desktop.conf.dock_pos = @truncate(value);
         },
         255 => { // apply
             desktop.config_changed = true;

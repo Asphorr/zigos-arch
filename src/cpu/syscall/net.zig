@@ -119,15 +119,23 @@ pub fn sysNetHttpGet(url_ptr: u32, url_len: u32, req_ptr: u32) u32 {
     const HttpReq = extern struct { buf_ptr: u32, buf_len: u32 };
     if (!validateUserPtrAligned(req_ptr, @sizeOf(HttpReq), @alignOf(HttpReq))) return E_FAULT;
     const req: *const HttpReq = @ptrFromInt(@as(usize, req_ptr));
-    if (req.buf_len == 0 or req.buf_len > 1024 * 1024) return E_INVAL;
-    if (!validateUserPtrWrite(req.buf_ptr, req.buf_len)) return E_FAULT;
+    // Snapshot the fields ONCE. Re-reading req.buf_len off the user pointer at
+    // the check, the validate, AND the slice is a TOCTOU: a sibling thread that
+    // grows buf_len between validateUserPtrWrite and buf[0..buf_len] would turn
+    // a validated small buffer into an OOB kernel write. Capturing the pair here
+    // means we validate exactly the (buf_ptr, buf_len) we then use. sysTlsConnect
+    // copies its whole args struct for the same reason.
+    const buf_ptr = req.buf_ptr;
+    const buf_len = req.buf_len;
+    if (buf_len == 0 or buf_len > 1024 * 1024) return E_INVAL;
+    if (!validateUserPtrWrite(buf_ptr, buf_len)) return E_FAULT;
 
     var url_buf: [1024]u8 = undefined;
     const url_src: [*]const u8 = @ptrFromInt(@as(usize, url_ptr));
     @memcpy(url_buf[0..url_len], url_src[0..url_len]);
 
-    const buf: [*]u8 = @ptrFromInt(@as(usize, req.buf_ptr));
-    const buf_slice = buf[0..req.buf_len];
+    const buf: [*]u8 = @ptrFromInt(@as(usize, buf_ptr));
+    const buf_slice = buf[0..buf_len];
 
     const net = @import("../../net/net.zig");
     const n = net.httpGet(url_buf[0..url_len], buf_slice) orelse return E_INVAL;

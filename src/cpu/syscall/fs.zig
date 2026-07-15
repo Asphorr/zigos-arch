@@ -51,10 +51,21 @@ pub fn sysOpen(name_ptr: u32, flags: u32) u32 {
 
     const pcb = process.currentPCB() orelse return E_FAULT;
 
-    // Read filename from user space (null-terminated, max 100 chars)
+    // Read filename from user space (null-terminated, max 100 chars).
+    // validateUserPtr above only proved name_ptr's OWN page is mapped; a NUL
+    // that appears only in the NEXT page would walk this scan into unmapped
+    // memory and #PF in ring 0 (SMAP is open, so the read isn't blocked — it
+    // just faults on an unserviceable kernel-mode access → panic). Revalidate
+    // whenever the scan crosses a page boundary. Cheap on the hot path (a
+    // single-page name pays nothing); sysMkdir/sysChdir/sysReaddir carry the
+    // same guard as a per-byte loop, sysOpen predated it.
     const name_bytes: [*]const u8 = @ptrFromInt(@as(usize, name_ptr));
     var name_len: usize = 0;
-    while (name_len < 100 and name_bytes[name_len] != 0) : (name_len += 1) {}
+    while (name_len < 100) : (name_len += 1) {
+        const addr = name_ptr + @as(u32, @intCast(name_len));
+        if (name_len != 0 and (addr & 0xFFF) == 0 and !validateUserPtr(addr, 1)) return E_FAULT;
+        if (name_bytes[name_len] == 0) break;
+    }
     if (name_len == 0) return E_INVAL;
 
     return vfs.openFlags(pcb, name_bytes[0..name_len], flags) orelse 0xFFFFFFFF;
@@ -260,9 +271,16 @@ pub fn isElfName(name: []const u8) bool {
 
 pub fn sysFsize(name_ptr: u32) u32 {
     if (!validateUserPtr(name_ptr, 1)) return E_FAULT;
+    // Same page-crossing guard as sysOpen: only name_ptr's page is proven
+    // mapped, so revalidate when the scan enters a new page or a name whose
+    // NUL lands past the boundary #PFs in ring 0.
     const name_bytes: [*]const u8 = @ptrFromInt(@as(usize, name_ptr));
     var name_len: usize = 0;
-    while (name_len < 100 and name_bytes[name_len] != 0) : (name_len += 1) {}
+    while (name_len < 100) : (name_len += 1) {
+        const addr = name_ptr + @as(u32, @intCast(name_len));
+        if (name_len != 0 and (addr & 0xFFF) == 0 and !validateUserPtr(addr, 1)) return E_FAULT;
+        if (name_bytes[name_len] == 0) break;
+    }
     if (name_len == 0) return E_INVAL;
     const result = vfs.fileSize(name_bytes[0..name_len]) orelse 0xFFFFFFFF;
     if (process.getCurrentPid() == 4) {
