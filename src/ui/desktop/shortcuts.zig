@@ -87,9 +87,42 @@ pub fn isDragging() bool {
 }
 
 pub fn render() void {
+    renderImpl(null);
+}
+
+/// render() restricted to icons whose padded cell intersects the given
+/// rect ([x0, y0, x1, y1) in screen coords) — the tight drag path's icon
+/// pass. The caller guarantees (by closure expansion over cellRect) that
+/// an intersecting cell lies FULLY inside the restored region, so the
+/// alpha icon/label blend never lands on stale pixels.
+pub fn renderRect(cx0: i32, cy0: i32, cx1: i32, cy1: i32) void {
+    renderImpl(.{ .x0 = cx0, .y0 = cy0, .x1 = cx1, .y1 = cy1 });
+}
+
+/// Number of icon cells (for the tight drag path's closure walk).
+pub fn cellCount() usize {
+    return pinned.list.len;
+}
+
+/// Padded cell rect [x, y, w, h] — matches renderImpl's dirty add and the
+/// selection fill's extents, so "cell fully inside the restored region"
+/// covers every pixel the icon pass can touch.
+pub fn cellRect(si: usize) [4]i32 {
+    const cell = iconCell(si);
+    return .{ cell.x - 4, cell.y - 2, ICON_CELL_W + 8, ICON_CELL_H };
+}
+
+const ClipRect = struct { x0: i32, y0: i32, x1: i32, y1: i32 };
+
+fn renderImpl(clip: ?ClipRect) void {
     const label_atlas = aa_font.getDefault16();
     for (pinned.list, 0..) |sc, si| {
         const cell = iconCell(si);
+        if (clip) |c| {
+            const r = cellRect(si);
+            const inside = r[0] < c.x1 and r[0] + r[2] > c.x0 and r[1] < c.y1 and r[1] + r[3] > c.y0;
+            if (!inside) continue;
+        }
         // Mark the cell dirty so background restore + redraw covers it.
         const cx0: u32 = if (cell.x < 4) 0 else @intCast(cell.x - 4);
         const cy0: u32 = if (cell.y < 2) 0 else @intCast(cell.y - 2);

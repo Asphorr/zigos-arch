@@ -449,6 +449,15 @@ fn copyRowSSE2(dst: usize, src: usize, count: u32) void {
     }
 }
 
+/// SSE2 row copy INTO the render target: `count` pixels from `src` to target
+/// pixel offset `dst_off`. Bulk pixel sources (the wallpaper blit) must go
+/// through this rather than a scalar loop — the target pointer is volatile,
+/// so the compiler can't vectorize or coalesce per-pixel stores, and a 2M-px
+/// scalar loop was the dominant cost of every full background restore.
+pub fn copyRowIntoTarget(dst_off: usize, src: [*]const u32, count: u32) void {
+    copyRowSSE2(@intFromPtr(target) + dst_off * 4, @intFromPtr(src), count);
+}
+
 /// Blit entire back buffer to screen framebuffer using SSE2.
 ///
 /// No-op when target == screen — see desktop.zig setupBackBuffer: in virtio-gpu

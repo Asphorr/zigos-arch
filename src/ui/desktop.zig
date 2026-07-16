@@ -264,6 +264,39 @@ var drag_ox: i32 = 0;
 var drag_oy: i32 = 0;
 var drag_old_x: i32 = 0;
 var drag_old_y: i32 = 0;
+
+// Vacated-region accumulator for the tight drag repaint (renderDragTight).
+// Each move event unions the dragged window's OLD padded rect in here.
+// Today handleMouseEvents runs once per frame so this sees one rect per
+// frame; the union is defensive so every vacated strip is restored even if
+// that ever changes. Screen-unclamped signed coords; consumed and
+// invalidated once per rendered frame.
+var drag_accum_valid: bool = false;
+var drag_accum_x0: i32 = 0;
+var drag_accum_y0: i32 = 0;
+var drag_accum_x1: i32 = 0;
+var drag_accum_y1: i32 = 0;
+
+/// Union the shadow-padded rect of a (about to be vacated) window position
+/// into the drag accumulator.
+fn accumVacated(x: i32, y: i32, w_px: u32, h_px: u32) void {
+    const x0 = x - SHADOW_SPAD;
+    const y0 = y - SHADOW_SPAD;
+    const x1 = x + @as(i32, @intCast(w_px)) + SHADOW_SPAD;
+    const y1 = y + @as(i32, @intCast(h_px)) + SHADOW_SPAD;
+    if (!drag_accum_valid) {
+        drag_accum_x0 = x0;
+        drag_accum_y0 = y0;
+        drag_accum_x1 = x1;
+        drag_accum_y1 = y1;
+        drag_accum_valid = true;
+    } else {
+        drag_accum_x0 = @min(drag_accum_x0, x0);
+        drag_accum_y0 = @min(drag_accum_y0, y0);
+        drag_accum_x1 = @max(drag_accum_x1, x1);
+        drag_accum_y1 = @max(drag_accum_y1, y1);
+    }
+}
 var prev_buttons: u8 = 0;
 /// Double-click detection on the titlebar — when the same window's
 /// Titlebar double-click → maximize was removed: too many drags
@@ -1073,6 +1106,147 @@ fn renderScene() void {
     // samples bb mid-paint or empty-on-first-frame, then idles forever
     // → pitch-black screen. No-op when the compositor task isn't up.
     @import("gpu_compositor.zig").requestRender();
+}
+
+// ─── Tight drag repaint ─────────────────────────────────────────────────────
+// The frameperf "drag p90 16 ms" lever: window drags used to markDirtyFull →
+// full renderScene → full-screen flush on every mouse delta. renderDragTight
+// repaints only the closure of the drag-affected union instead.
+
+/// Expandable bbox for the drag-union closure. growOver unions a rect in
+/// only when it intersects and isn't already contained, and records growth
+/// so the fixpoint loop knows when to stop.
+const Bbox = struct {
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+    grew: bool = false,
+
+    fn growOver(self: *Bbox, bx0: i32, by0: i32, bx1: i32, by1: i32) void {
+        const intersects = bx0 < self.x1 and self.x0 < bx1 and by0 < self.y1 and self.y0 < by1;
+        if (!intersects) return;
+        const contained = bx0 >= self.x0 and by0 >= self.y0 and bx1 <= self.x1 and by1 <= self.y1;
+        if (contained) return;
+        self.x0 = @min(self.x0, bx0);
+        self.y0 = @min(self.y0, by0);
+        self.x1 = @max(self.x1, bx1);
+        self.y1 = @max(self.y1, by1);
+        self.grew = true;
+    }
+};
+
+/// Shadow-padded outer rect [x0, y0, x1, y1) of a window — the full extent
+/// renderWindow can paint (shadow band ⊂ SHADOW_SPAD pad, see SHADOW_*).
+fn paddedWinRect(i: u8) [4]i32 {
+    const w = &windows[i];
+    return .{
+        w.x - SHADOW_SPAD,
+        w.y - SHADOW_SPAD,
+        w.x + @as(i32, @intCast(w.width)) + SHADOW_SPAD,
+        w.y + @as(i32, @intCast(w.height)) + SHADOW_SPAD,
+    };
+}
+
+/// Repaint only the drag-affected region: the vacated rects accumulated by
+/// the move events (drag_accum) ∪ the dragged window's current padded rect,
+/// closure-expanded until every alpha layer that intersects the union lies
+/// FULLY inside it — window shadows, icon cells, and the menubar/dock glass
+/// bands (glass READS the pixels beneath, and any alpha re-blend onto
+/// non-restored pixels accumulates: the shadow-darkening bug class). Inside
+/// the union the paint order mirrors renderScene exactly, so the result is
+/// pixel-identical there; outside, nothing is touched — correct because a
+/// pure-.drag frame changes nothing else (anything else escalates to .full,
+/// and prep-phase GUI stamps carry their own dirty rects).
+///
+/// Returns false — the caller falls back to the full-scene path — for icon
+/// (ghost) drags, under the software cursor (its previous position isn't
+/// modeled here), when an unmodeled overlay is live (toast, context menu,
+/// dock tooltip), or when this frame was already forced full.
+fn renderDragTight(use_hw_cursor: bool) bool {
+    if (!use_hw_cursor) return false;
+    if (!dragging or shortcuts.isDragging()) return false;
+    if (!drag_accum_valid) return false;
+    if (toast.isActive() or context_menu.active or dock.isTooltipVisible()) return false;
+    if (dirty_rects_mod.isFull()) return false;
+
+    // Seed: vacated bbox ∪ the dragged window's current (post-move) rect.
+    var u = Bbox{ .x0 = drag_accum_x0, .y0 = drag_accum_y0, .x1 = drag_accum_x1, .y1 = drag_accum_y1 };
+    {
+        const r = paddedWinRect(drag_win);
+        u.x0 = @min(u.x0, r[0]);
+        u.y0 = @min(u.y0, r[1]);
+        u.x1 = @max(u.x1, r[2]);
+        u.y1 = @max(u.y1, r[3]);
+    }
+
+    // Glass reach: menubar blurRegion radius 6 (+saturate), dock fillGlass
+    // radius 8 + pill soft shadow +2 — both bands join the closure padded by
+    // their kernel reach so the glass never samples stale pixels.
+    const mb_reach: i32 = @as(i32, MENUBAR_H) + 8;
+    const dock_y0: i32 = dock.dockY() - 12;
+    const dock_y1: i32 = dock.dockY() + @as(i32, TASKBAR_H) + 12;
+    const sw_i: i32 = @intCast(gfx.screen_w);
+
+    // Fixpoint: each pass only grows the union over a fixed item set, so it
+    // terminates in ≤ items passes (1–2 in practice).
+    u.grew = true;
+    while (u.grew) {
+        u.grew = false;
+        var k: u8 = 0;
+        while (k < wm.z_count) : (k += 1) {
+            const i = z_stack[k];
+            if (!windows[i].visible or windows[i].minimized) continue;
+            const r = paddedWinRect(i);
+            u.growOver(r[0], r[1], r[2], r[3]);
+        }
+        var si: usize = 0;
+        while (si < shortcuts.cellCount()) : (si += 1) {
+            const c = shortcuts.cellRect(si);
+            u.growOver(c[0], c[1], c[0] + c[2], c[1] + c[3]);
+        }
+        u.growOver(0, 0, sw_i, mb_reach);
+        u.growOver(0, dock_y0, sw_i, dock_y1);
+    }
+
+    // Clamp to the screen.
+    const ux: u32 = if (u.x0 < 0) 0 else @intCast(u.x0);
+    const uy: u32 = if (u.y0 < 0) 0 else @intCast(u.y0);
+    const ux1: u32 = if (u.x1 < 0) 0 else @min(@as(u32, @intCast(u.x1)), gfx.screen_w);
+    const uy1: u32 = if (u.y1 < 0) 0 else @min(@as(u32, @intCast(u.y1)), gfx.screen_h);
+    if (ux1 <= ux or uy1 <= uy) return false;
+
+    // Paint — renderScene's order, restricted to the union.
+    background.renderRect(ux, uy, ux1 - ux, uy1 - uy);
+    shortcuts.renderRect(u.x0, u.y0, u.x1, u.y1);
+    var k2: u8 = 0;
+    while (k2 < wm.z_count) : (k2 += 1) {
+        const i = z_stack[k2];
+        if (!windows[i].visible or windows[i].minimized) continue;
+        const r = paddedWinRect(i);
+        const inter = r[0] < u.x1 and u.x0 < r[2] and r[1] < u.y1 and u.y0 < r[3];
+        if (!inter) continue;
+        // Mirror renderScene's containment skip — a fully-covered window's
+        // shadow is never painted there, and painting it here would show a
+        // shadow sliver poking past the coverer that pops away on release.
+        if (isCoveredByUpper(k2, i)) continue;
+        // The closure put this window's whole padded rect on freshly restored
+        // wallpaper, so the shadow re-blend can't accumulate frame-over-frame.
+        // (Two overlapping non-containing shadows double-blend exactly like
+        // renderScene does — same pixels, not a divergence.)
+        windows[i].shadow_dirty = true;
+        renderWindow(i);
+    }
+    if (u.y0 < mb_reach) {
+        const focused_title: ?[]const u8 = if (slot_used[wm.focused] and windows[wm.focused].visible)
+            windows[wm.focused].title[0..windows[wm.focused].title_len]
+        else
+            null;
+        menubar.render(focused_title);
+    }
+    if (u.y1 > dock_y0) dock.render();
+    addDirtyRect(ux, uy, ux1 - ux, uy1 - uy);
+    return true;
 }
 
 fn launchShortcut(idx: usize) void {
@@ -2516,10 +2690,13 @@ fn handleMouseEvents() DirtyKind {
         if (new_x != windows[drag_win].x or new_y != windows[drag_win].y) {
             drag_old_x = windows[drag_win].x;
             drag_old_y = windows[drag_win].y;
+            // Record the vacated region for the tight drag repaint instead of
+            // the old markDirtyFull() — renderDragTight restores exactly this
+            // (plus the closure) rather than re-rendering the whole scene.
+            accumVacated(drag_old_x, drag_old_y, windows[drag_win].width, windows[drag_win].height);
             windows[drag_win].x = new_x;
             windows[drag_win].y = new_y;
             if (result != .full) result = .drag;
-            markDirtyFull();
         }
     }
 
@@ -3219,7 +3396,15 @@ pub fn run() void {
             switch (mr) {
                 .full => dirty = .full,
                 .drag => {
-                    if (dirty != .full) dirty = .drag;
+                    // A pending .text_only (keypress / cursor blink) renders its
+                    // row only in the .text_only arm — the tight drag path would
+                    // drop it if the terminal sits outside the drag union, so
+                    // the coincidence escalates to .full (the historical cost).
+                    if (dirty == .text_only) {
+                        dirty = .full;
+                    } else if (dirty != .full) {
+                        dirty = .drag;
+                    }
                 },
                 else => {},
             }
@@ -3376,13 +3561,40 @@ pub fn run() void {
                     resetDirtyRects();
                 },
                 .drag => {
-                    // Window drag — full re-render needed to repaint background behind old position
-                    renderScene();
-                    if (!use_hw_cursor) bakeCursorToBackBuffer();
-                    gfx.blitToScreen();
-                    if (!use_hw_cursor) unbakeCursorFromBackBuffer();
-                    display.flush();
-                    resetDirtyRects();
+                    // Tight path (hw cursor only): repaint just the drag-union
+                    // closure and flush its rects. Falls back to the historical
+                    // full-scene path when renderDragTight's preconditions
+                    // don't hold.
+                    if (renderDragTight(use_hw_cursor)) {
+                        const dr_count = dirty_rects_mod.rectCount(); // can flip to full on cap overflow
+                        if (dirty_rects_mod.isFull() or dr_count == 0) {
+                            gfx.blitToScreen();
+                            display.flush();
+                        } else {
+                            var bi: u8 = 0;
+                            while (bi < dr_count) : (bi += 1) {
+                                const r = dirty_rects_mod.getRect(bi);
+                                gfx.blitRectToScreen(r[0], r[1], r[2], r[3]);
+                            }
+                            var fi: u8 = 0;
+                            while (fi < dr_count) : (fi += 1) {
+                                const r = dirty_rects_mod.getRect(fi);
+                                display.flushRect(r[0], r[1], r[2], r[3]);
+                            }
+                        }
+                        // Mode 9: rect snapshot → GPU compositor (no-op otherwise).
+                        @import("gpu_compositor.zig").requestRenderFromDirty();
+                        resetDirtyRects();
+                    } else {
+                        // Window drag — full re-render repaints the background
+                        // behind the old position.
+                        renderScene();
+                        if (!use_hw_cursor) bakeCursorToBackBuffer();
+                        gfx.blitToScreen();
+                        if (!use_hw_cursor) unbakeCursorFromBackBuffer();
+                        display.flush();
+                        resetDirtyRects();
+                    }
                 },
                 .gui_only => {
                     // GUI app content update — only blit the window's dirty rect
@@ -3462,6 +3674,10 @@ pub fn run() void {
             if (swCursorActive(use_hw_cursor)) drawCursorOnScreen();
             display.flush();
         }
+        // Any rendered frame consumed (tight path) or superseded (full paths)
+        // the vacated-region accumulator; a valid accum implies dirty ≥ .drag,
+        // so no repaint is ever lost by clearing here.
+        drag_accum_valid = false;
         frameperf.frameEnd(switch (dirty) {
             .none => .none,
             .cursor_only => .cursor,

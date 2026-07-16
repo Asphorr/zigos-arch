@@ -145,27 +145,39 @@ pub fn wallpaperDims() struct { w: u32, h: u32 } {
 // --- Render --------------------------------------------------------------
 
 pub fn render() void {
-    // Hold the lock for the whole render — without it, sysSetWallpaper
-    // can call vmalloc.free on the buffer mid-blit and the cross-CPU
-    // TLB shootdown unmaps our source pointer. ~600 µs on 1920×1080.
+    renderRect(0, 0, gfx.screen_w, gfx.screen_h);
+}
+
+/// Restore wallpaper/gradient ONLY inside the given screen-space rect —
+/// the tight drag path's background pass. Pixel-identical to a full
+/// render() restricted to the rect (gradient rows keyed by absolute row;
+/// the wallpaper sub-blit uses the same centering math). Holds wp_lock
+/// for the whole paint — without it, sysSetWallpaper can vmalloc.free the
+/// buffer mid-blit and the cross-CPU TLB shootdown unmaps our source.
+pub fn renderRect(rx: u32, ry: u32, rw: u32, rh: u32) void {
+    if (rx >= gfx.screen_w or ry >= gfx.screen_h) return;
+    const rx1 = @min(rx + rw, gfx.screen_w);
+    const ry1 = @min(ry + rh, gfx.screen_h);
+    if (rx1 <= rx or ry1 <= ry) return;
+
     wp_lock.acquire();
     defer wp_lock.release();
     if (wp_pixels) |pixels| {
-        renderWallpaper(pixels);
+        renderWallpaperRect(pixels, rx, ry, rx1, ry1);
         return;
     }
-    renderGradient();
+    renderGradientRect(rx, ry, rx1, ry1);
 }
 
-fn renderGradient() void {
-    var row: u32 = 0;
-    while (row < gfx.screen_h) : (row += 1) {
+fn renderGradientRect(rx: u32, ry: u32, rx1: u32, ry1: u32) void {
+    var row: u32 = ry;
+    while (row < ry1) : (row += 1) {
         const color = lerpColor(bgTop(), bgBot(), row, gfx.screen_h);
-        gfx.fillRect(0, @intCast(row), gfx.screen_w, 1, color);
+        gfx.fillRect(@intCast(rx), @intCast(row), rx1 - rx, 1, color);
     }
 }
 
-fn renderWallpaper(src: [*]u32) void {
+fn renderWallpaperRect(src: [*]u32, rx: u32, ry: u32, rx1: u32, ry1: u32) void {
     const sw = gfx.target_w;
     const sh = gfx.target_h;
     const w = wp_w;
@@ -173,8 +185,8 @@ fn renderWallpaper(src: [*]u32) void {
 
     // Letterbox: if image smaller than screen, paint gradient first so the
     // edges don't stay stale from a prior frame. If equal/bigger, the blit
-    // covers the whole screen so the gradient pre-pass is redundant.
-    if (w < sw or h < sh) renderGradient();
+    // covers the requested rect so the gradient pre-pass is redundant.
+    if (w < sw or h < sh) renderGradientRect(rx, ry, rx1, ry1);
 
     // Centered top-left of the visible image region in screen coords.
     const off_x: i32 = @as(i32, @intCast(sw)) - @as(i32, @intCast(w));
@@ -191,21 +203,27 @@ fn renderWallpaper(src: [*]u32) void {
     const blit_h_i: i32 = @min(@as(i32, @intCast(h)) - src_y0, @as(i32, @intCast(sh)) - dy_clipped);
     if (blit_w_i <= 0 or blit_h_i <= 0) return;
 
-    const blit_w: usize = @intCast(blit_w_i);
-    const blit_h: usize = @intCast(blit_h_i);
-    const dx0: usize = @intCast(dx_clipped);
-    const dy0: usize = @intCast(dy_clipped);
-    const sx0: usize = @intCast(src_x0);
-    const sy0: usize = @intCast(src_y0);
+    // Intersect the image's destination region with the requested rect.
+    const img_x0: u32 = @intCast(dx_clipped);
+    const img_y0: u32 = @intCast(dy_clipped);
+    const img_x1: u32 = img_x0 + @as(u32, @intCast(blit_w_i));
+    const img_y1: u32 = img_y0 + @as(u32, @intCast(blit_h_i));
+    const cx0 = @max(rx, img_x0);
+    const cy0 = @max(ry, img_y0);
+    const cx1 = @min(rx1, img_x1);
+    const cy1 = @min(ry1, img_y1);
+    if (cx1 <= cx0 or cy1 <= cy0) return;
 
+    const sx0: usize = @as(usize, @intCast(src_x0)) + (cx0 - img_x0);
+    const sy0: usize = @as(usize, @intCast(src_y0)) + (cy0 - img_y0);
+    const count: u32 = cx1 - cx0;
+
+    // SSE2 rows — the target pointer is volatile, so a scalar loop here
+    // compiles to 2M un-vectorizable stores for a full 1080p restore.
     var row: usize = 0;
-    while (row < blit_h) : (row += 1) {
-        const dst_off = (dy0 + row) * gfx.target_w + dx0;
+    while (row < cy1 - cy0) : (row += 1) {
+        const dst_off = (@as(usize, cy0) + row) * gfx.target_w + cx0;
         const src_off = (sy0 + row) * @as(usize, w) + sx0;
-        const dst_ptr: [*]volatile u32 = gfx.target + dst_off;
-        var col: usize = 0;
-        while (col < blit_w) : (col += 1) {
-            dst_ptr[col] = src[src_off + col];
-        }
+        gfx.copyRowIntoTarget(dst_off, src + src_off, count);
     }
 }
