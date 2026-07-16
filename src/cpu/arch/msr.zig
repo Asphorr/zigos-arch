@@ -63,7 +63,14 @@ pub fn fixupRip(rip: u64) ?u64 {
 /// #GP at label 1 the handler redirects to label 2 (ok=0); the success path
 /// sets ok=1. %r8 is the address scratch so the MSR-input register (ecx) is
 /// untouched. Modelled on vmx.zig's vmlaunch fixup asm.
-pub fn rdmsrSafe(msr: u32) ?u64 {
+///
+/// noinline is load-bearing: the "fixed instruction site" premise dies if
+/// the compiler inlines this into multiple callers — each instance would
+/// republish ITS OWN addresses into the shared globals, and two instances
+/// racing on different CPUs leave one of them unmatched at fault time
+/// (= unrecovered #GP panic). One pinned copy keeps the site link-time
+/// invariant for real. Same rule in usercopy.zig / extable.zig.
+pub noinline fn rdmsrSafe(msr: u32) ?u64 {
     var value: u64 = undefined;
     var ok: u64 = undefined;
     asm volatile (
@@ -92,7 +99,8 @@ pub fn rdmsrSafe(msr: u32) ?u64 {
 
 /// Write `value` to `msr`, returning false if the access raised #GP (MSR
 /// not present / reserved-bit violation / not emulated). Never panics.
-pub fn wrmsrSafe(msr: u32, value: u64) bool {
+/// noinline: see rdmsrSafe.
+pub noinline fn wrmsrSafe(msr: u32, value: u64) bool {
     var ok: u64 = undefined;
     const lo: u32 = @truncate(value);
     const hi: u32 = @truncate(value >> 32);

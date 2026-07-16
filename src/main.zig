@@ -245,6 +245,12 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     // relies on it. IDT is live (idt.init above), so a #GP here recovers.
     @import("cpu/arch/msr.zig").selfTest();
     blog.ok("safe-MSR fixup self-test");
+    // Faultable user-copy: self-test the kernel #PF extable fixup (a copy
+    // from an unmapped user VA must recover with 0 bytes, a valid copy
+    // through the same site must complete, the NUL-scan must discriminate
+    // found/saturated/faulted) before any syscall path relies on it.
+    @import("cpu/arch/usercopy.zig").selfTest();
+    blog.ok("usercopy fault-fixup self-test");
     // Thermal + power telemetry: enumerate DTS / RAPL / APERF-MPERF via
     // CPUID leaf 6, latch Tj_max + the RAPL energy unit. Read-only, no CR
     // bits, no interrupt. MSR reads stay suppressed under a hypervisor

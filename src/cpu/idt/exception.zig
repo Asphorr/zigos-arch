@@ -224,16 +224,25 @@ export fn handleException(rsp: u64) callconv(.c) void {
     const saved_cs = stack[18];
     const saved_rip = stack[17];
 
-    // Safe-MSR exception fixup (rdmsrSafe/wrmsrSafe). A #GP (13) at a
-    // registered MSR-probe instruction site, in kernel mode, is recovered
-    // by redirecting the saved RIP to the accessor's fixup landing pad —
-    // which returns "failed" to the caller instead of panicking. The sites
-    // are link-time invariants, so this needs no per-CPU state and is safe
-    // under reentrancy/SMP. Must precede the panic/user-signal dispatch.
-    // Kernel-CS gate: a ring-3 #GP can never sit at a kernel probe address,
-    // but gating is belt-and-braces and keeps user faults on their path.
-    if (int_no == 13 and (saved_cs & 3) == 0) {
-        if (@import("../arch/msr.zig").fixupRip(saved_rip)) |fixup| {
+    // Kernel exception-table fixup (extable.zig). A #GP (13) or #PF (14)
+    // in kernel mode at a registered fault site — an MSR probe
+    // (rdmsrSafe/wrmsrSafe) or a faultable user copy (usercopy.zig) — is
+    // recovered by redirecting the saved RIP to the site's fixup landing
+    // pad, which reports "failed/partial" to the caller instead of
+    // panicking. Sites are link-time invariants, so this needs no per-CPU
+    // state and is safe under reentrancy/SMP; the redirect itself never
+    // blocks, so it's legal even for faults taken under spinlocks with
+    // IRQs off. Must precede the panic/user-signal dispatch. Ordering vs
+    // the ww write-watch scan below: extable wins, so a usercopy write
+    // whose KERNEL destination lands on a ww-protected page EFAULTs via
+    // the fixup instead of reaching the ww whitelist — fails closed, and
+    // no current consumer copies into a watchable page (dsts are stack
+    // temps / user VAs).
+    // Kernel-CS gate: a ring-3 fault can never sit at a kernel site
+    // address, but gating is belt-and-braces and keeps user faults on
+    // their path (lazy/COW service, signal delivery).
+    if ((int_no == 13 or int_no == 14) and (saved_cs & 3) == 0) {
+        if (@import("../arch/extable.zig").fixupRip(saved_rip)) |fixup| {
             const wframe: [*]u64 = @ptrFromInt(rsp);
             wframe[17] = fixup;
             return;
