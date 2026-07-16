@@ -1,3 +1,18 @@
+// vfs — the filesystem dispatch hub: mount table (longest-prefix path
+// resolution), per-process fd operations (open/read/write/close), the
+// kernel-context loaders (loadFile/loadFileFresh), and the ext2 page-cache
+// read + writeback orchestration (readThroughCache/syncCacheFile/
+// flushAllDirty).
+//
+// Dispatch contract: the FsType/FdType switches below are exhaustive on
+// purpose — adding a filesystem is adding an enum variant, after which the
+// compiler names every dispatch point that still needs an arm. That IS the
+// backend interface; five static filesystems don't need vtable indirection.
+//
+// Error convention: fd ops return VFS_ERR for "bad fd / not permitted" and
+// 0 for "nothing transferred" (write may also return an errno encoding —
+// see the ext2 ETXTBSY arm); path helpers return null.
+
 const std = @import("std");
 const fat32 = @import("fat32.zig");
 const tarfs = @import("tarfs.zig");
@@ -15,6 +30,10 @@ const page_cache = @import("../mm/page_cache.zig");
 pub const O_CREATE: u32 = 0x100;
 pub const O_APPEND: u32 = 0x400; // start the fd's offset at file_size so writes append
 pub const O_TRUNC: u32 = 0x200; // truncate to zero on open (writers replacing content)
+
+/// fd-op failure sentinel — the u32 the syscall layer treats as -1. Distinct
+/// from the errno encodings some arms return (write's ETXTBSY).
+const VFS_ERR: u32 = 0xFFFFFFFF;
 
 pub const FsType = enum { tarfs, fat32, devfs, procfs, ext2 };
 
@@ -157,122 +176,92 @@ pub fn openFlags(pcb: *process.PCB, name: []const u8, flags: u32) ?u32 {
     var path_buf: [256]u8 = undefined;
     const resolved = resolvePath(pcb, name, &path_buf) orelse return null;
 
-    switch (resolved.fs) {
-        .tarfs => {
-            if (tarfs.openFile(resolved.path)) |tar_idx| {
-                if (allocFd(pcb)) |fd_idx| {
-                    pcb.fd_table[fd_idx] = .{
-                        .in_use = true,
-                        .inode = tar_idx,
-                        .offset = 0,
-                        .flags = 2,
-                        .fs_type = .tarfs,
-                    };
-                    return @intCast(fd_idx);
-                }
-                tarfs.closeFile(tar_idx);
-            }
-            return null;
+    // Claim the fd index up front. allocFd only names a free slot — nothing
+    // is reserved until the single install below — so an early return leaks
+    // nothing, and no fs-side open (or truncate) can run for a process whose
+    // table is already full. This ordering is load-bearing for O_TRUNC: the
+    // truncate used to run before the fd allocation, so open() on a full
+    // table destroyed the file's contents and then failed.
+    const fd_idx = allocFd(pcb) orelse return null;
+
+    // Each arm resolves the fs-specific open to the FileDesc to install, or
+    // null. Exactly one install point below — per-arm fd bookkeeping is how
+    // the truncate-before-alloc bug stayed hidden.
+    const maybe_desc: ?process.FileDesc = switch (resolved.fs) {
+        .tarfs => blk: {
+            const tar_idx = tarfs.openFile(resolved.path) orelse break :blk null;
+            break :blk .{ .in_use = true, .inode = tar_idx, .offset = 0, .flags = 2, .fs_type = .tarfs };
         },
-        .fat32 => {
-            // Try to open existing file
+        .fat32 => blk: {
             if (fat32.openFile(resolved.path)) |handle| {
-                if (allocFd(pcb)) |fd_idx| {
-                    // O_APPEND positions the offset at end-of-file so the first
-                    // write extends rather than overwrites. fat32.writeFile
-                    // already handles offset > file_size by allocating new
-                    // clusters as needed.
-                    const start_offset: u32 = if (flags & O_APPEND != 0) handle.file_size else 0;
-                    pcb.fd_table[fd_idx] = .{
+                // O_APPEND positions the offset at end-of-file so the first
+                // write extends rather than overwrites. fat32.writeFile
+                // already handles offset > file_size by allocating new
+                // clusters as needed.
+                const start_offset: u32 = if (flags & O_APPEND != 0) handle.file_size else 0;
+                break :blk .{
+                    .in_use = true,
+                    .inode = handle.dir_index,
+                    .offset = start_offset,
+                    .flags = 2,
+                    .fs_type = .fat32,
+                    .fat_dir_cluster = handle.dir_cluster,
+                };
+            }
+            // Not found — create if O_CREATE flag set.
+            if (flags & O_CREATE != 0) {
+                if (fat32.createFile(resolved.path)) |handle| {
+                    break :blk .{
                         .in_use = true,
                         .inode = handle.dir_index,
-                        .offset = start_offset,
+                        .offset = 0,
                         .flags = 2,
                         .fs_type = .fat32,
                         .fat_dir_cluster = handle.dir_cluster,
                     };
-                    return @intCast(fd_idx);
-                }
-                return null;
-            }
-
-            // Not found — create if O_CREATE flag set
-            if (flags & O_CREATE != 0) {
-                if (fat32.createFile(resolved.path)) |handle| {
-                    if (allocFd(pcb)) |fd_idx| {
-                        pcb.fd_table[fd_idx] = .{
-                            .in_use = true,
-                            .inode = handle.dir_index,
-                            .offset = 0,
-                            .flags = 2,
-                            .fs_type = .fat32,
-                            .fat_dir_cluster = handle.dir_cluster,
-                        };
-                        return @intCast(fd_idx);
-                    }
                 }
             }
-            return null;
+            break :blk null;
         },
-        .devfs => {
-            const dev_idx = devfs.openFile(resolved.path) orelse return null;
-            const fd_idx = allocFd(pcb) orelse return null;
-            pcb.fd_table[fd_idx] = .{
-                .in_use = true,
-                .inode = dev_idx,
-                .offset = 0,
-                .flags = 2,
-                .fs_type = .devfs,
-            };
-            return @intCast(fd_idx);
+        .devfs => blk: {
+            const dev_idx = devfs.openFile(resolved.path) orelse break :blk null;
+            break :blk .{ .in_use = true, .inode = dev_idx, .offset = 0, .flags = 2, .fs_type = .devfs };
         },
-        .procfs => {
-            const inode = procfs.openFile(resolved.path) orelse return null;
-            const fd_idx = allocFd(pcb) orelse return null;
-            pcb.fd_table[fd_idx] = .{
-                .in_use = true,
-                .inode = inode,
-                .offset = 0,
-                .flags = 0, // procfs is read-only
-                .fs_type = .procfs,
-            };
-            return @intCast(fd_idx);
+        .procfs => blk: {
+            const inode = procfs.openFile(resolved.path) orelse break :blk null;
+            // flags = 0: procfs is read-only.
+            break :blk .{ .in_use = true, .inode = inode, .offset = 0, .flags = 0, .fs_type = .procfs };
         },
-        .ext2 => {
-            // Try open existing first.
+        .ext2 => blk: {
             if (ext2.openFile(resolved.path)) |handle| {
                 // O_TRUNC on an existing file: free all data + indirect-tree
                 // blocks and reset size to 0. The next writeFile re-allocates.
+                // Safe to do here — with the fd already claimed, nothing after
+                // this point can fail and turn the open into a destructive no-op.
                 if (flags & O_TRUNC != 0) _ = ext2.truncate(handle.inum);
-                const start_offset: u32 = if (flags & O_APPEND != 0) @intCast(handle.file_size) else 0;
-                const fd_idx = allocFd(pcb) orelse return null;
-                pcb.fd_table[fd_idx] = .{
-                    .in_use = true,
-                    .inode = handle.inum,
-                    .offset = start_offset,
-                    .flags = 2,
-                    .fs_type = .ext2,
-                };
-                return @intCast(fd_idx);
+                // ext2 LARGE_FILE sizes exceed the fd's u32 offset — refuse
+                // O_APPEND there instead of panicking on the cast (corrupt-
+                // image class). handle.file_size is the pre-truncate snapshot,
+                // so O_TRUNC|O_APPEND on such a file also refuses — strictly
+                // better than the checked-@intCast panic it replaces.
+                const start_offset: u32 = if (flags & O_APPEND != 0)
+                    (std.math.cast(u32, handle.file_size) orelse break :blk null)
+                else
+                    0;
+                break :blk .{ .in_use = true, .inode = handle.inum, .offset = start_offset, .flags = 2, .fs_type = .ext2 };
             }
-
             // Not found — create if O_CREATE flag set.
             if (flags & O_CREATE != 0) {
                 if (ext2.createFilePath(resolved.path)) |handle| {
-                    const fd_idx = allocFd(pcb) orelse return null;
-                    pcb.fd_table[fd_idx] = .{
-                        .in_use = true,
-                        .inode = handle.inum,
-                        .offset = 0,
-                        .flags = 2,
-                        .fs_type = .ext2,
-                    };
-                    return @intCast(fd_idx);
+                    break :blk .{ .in_use = true, .inode = handle.inum, .offset = 0, .flags = 2, .fs_type = .ext2 };
                 }
             }
-            return null;
+            break :blk null;
         },
-    }
+    };
+    const desc = maybe_desc orelse return null;
+    pcb.fd_table[fd_idx] = desc;
+    return @intCast(fd_idx);
 }
 
 /// Open a directory for getdents-style enumeration (ext2 only — the writable
@@ -315,8 +304,22 @@ pub fn statPath(pcb: *process.PCB, name: []const u8, out: *StatInfo) bool {
     return ext2.getFileStat(resolved.path, out);
 }
 
+/// Rebuild the fat32 handle a FileDesc describes. read/write/close all need
+/// the same reconstruction; one definition keeps the dir-cluster default
+/// ("0 means root" — see FileDesc.fat_dir_cluster) in a single place.
+fn fatHandle(fd_entry: *const process.FileDesc) fat32.Handle {
+    const dc = if (fd_entry.fat_dir_cluster != 0) fd_entry.fat_dir_cluster else fat32.root_cluster;
+    return .{
+        .dir_cluster = dc,
+        .dir_index = fd_entry.inode,
+        .first_cluster = fat32.getFirstClusterAt(dc, fd_entry.inode),
+        .file_size = fat32.getFileSizeAt(dc, fd_entry.inode),
+        .current_offset = fd_entry.offset,
+    };
+}
+
 pub fn read(pcb: *process.PCB, fd: u32, buf: [*]u8, count: u32) u32 {
-    if (fd >= pcb.fd_table.len or !pcb.fd_table[fd].in_use) return 0xFFFFFFFF;
+    if (fd >= pcb.fd_table.len or !pcb.fd_table[fd].in_use) return VFS_ERR;
     const fd_entry = &pcb.fd_table[fd];
 
     switch (fd_entry.fs_type) {
@@ -336,14 +339,7 @@ pub fn read(pcb: *process.PCB, fd: u32, buf: [*]u8, count: u32) u32 {
             return bytes_read;
         },
         .fat32 => {
-            const dc = if (fd_entry.fat_dir_cluster != 0) fd_entry.fat_dir_cluster else fat32.root_cluster;
-            const handle = fat32.Handle{
-                .dir_cluster = dc,
-                .dir_index = fd_entry.inode,
-                .first_cluster = fat32.getFirstClusterAt(dc, fd_entry.inode),
-                .file_size = fat32.getFileSizeAt(dc, fd_entry.inode),
-                .current_offset = fd_entry.offset,
-            };
+            const handle = fatHandle(fd_entry);
             var new_cluster: u32 = 0;
             var new_off: u32 = 0;
             const bytes_read = fat32.readFileAt(handle, buf, count, fd_entry.fat_cluster, fd_entry.fat_cluster_off, &new_cluster, &new_off);
@@ -359,7 +355,7 @@ pub fn read(pcb: *process.PCB, fd: u32, buf: [*]u8, count: u32) u32 {
         },
         .pipe => {
             // Pipes only valid as read-side here. Write-side fds use sysFwrite path.
-            if (fd_entry.flags != 0) return 0xFFFFFFFF;
+            if (fd_entry.flags != 0) return VFS_ERR;
             const n = pipe.read(fd_entry.pipe_id, buf[0..count]);
             return @intCast(n);
         },
@@ -390,7 +386,7 @@ pub fn read(pcb: *process.PCB, fd: u32, buf: [*]u8, count: u32) u32 {
             net.poll();
             return @intCast(net.tcpRecv(@intCast(fd_entry.inode), buf[0..count]));
         },
-        .tcp_listener => return 0xFFFFFFFF, // listeners aren't readable; use accept()
+        .tcp_listener => return VFS_ERR, // listeners aren't readable; use accept()
     }
 }
 
@@ -556,7 +552,7 @@ pub fn flushAllDirty() u32 {
 }
 
 pub fn write(pcb: *process.PCB, fd: u32, buf: [*]const u8, count: u32) u32 {
-    if (fd >= pcb.fd_table.len or !pcb.fd_table[fd].in_use) return 0xFFFFFFFF;
+    if (fd >= pcb.fd_table.len or !pcb.fd_table[fd].in_use) return VFS_ERR;
     const fd_entry = &pcb.fd_table[fd];
 
     switch (fd_entry.fs_type) {
@@ -571,33 +567,26 @@ pub fn write(pcb: *process.PCB, fd: u32, buf: [*]const u8, count: u32) u32 {
             return count;
         },
         .fat32 => {
-            const dc = if (fd_entry.fat_dir_cluster != 0) fd_entry.fat_dir_cluster else fat32.root_cluster;
-            var handle = fat32.Handle{
-                .dir_cluster = dc,
-                .dir_index = fd_entry.inode,
-                .first_cluster = fat32.getFirstClusterAt(dc, fd_entry.inode),
-                .file_size = fat32.getFileSizeAt(dc, fd_entry.inode),
-                .current_offset = fd_entry.offset,
-            };
+            var handle = fatHandle(fd_entry);
             const bytes_written = fat32.writeFile(&handle, buf, count);
             fd_entry.offset += @intCast(bytes_written);
             return @intCast(bytes_written);
         },
         .tarfs => {
-            return 0xFFFFFFFF; // tarfs is read-only
+            return VFS_ERR; // tarfs is read-only
         },
         .pipe => {
             // Only valid as write-side here. Read-side fds use sysFread path.
-            if (fd_entry.flags != 1) return 0xFFFFFFFF;
+            if (fd_entry.flags != 1) return VFS_ERR;
             const n = pipe.write(fd_entry.pipe_id, buf[0..count]);
             return @intCast(n);
         },
         .devfs => {
             const n = devfs.write(fd_entry.inode, fd_entry.offset, buf, count);
-            if (n != 0xFFFFFFFF) fd_entry.offset += n;
+            if (n != VFS_ERR) fd_entry.offset += n;
             return n;
         },
-        .procfs => return 0xFFFFFFFF, // read-only
+        .procfs => return VFS_ERR, // read-only
         .ext2 => {
             // ETXTBSY: refuse to overwrite the text image of a live process.
             // This is the choke-point the fuzzer hit — fwrite-ing into its own
@@ -615,29 +604,22 @@ pub fn write(pcb: *process.PCB, fd: u32, buf: [*]const u8, count: u32) u32 {
         },
         .tcp_sock => {
             const net = @import("../net/net.zig");
-            if (!net.tcpSend(@intCast(fd_entry.inode), buf[0..count])) return 0xFFFFFFFF;
+            if (!net.tcpSend(@intCast(fd_entry.inode), buf[0..count])) return VFS_ERR;
             return count;
         },
-        .tcp_listener => return 0xFFFFFFFF, // listeners aren't writable
+        .tcp_listener => return VFS_ERR, // listeners aren't writable
     }
 }
 
 pub fn close(pcb: *process.PCB, fd: u32) u32 {
-    if (fd >= pcb.fd_table.len or !pcb.fd_table[fd].in_use) return 0xFFFFFFFF;
-    if (fd < 3) return 0xFFFFFFFF; // can't close stdin/stdout/stderr
+    if (fd >= pcb.fd_table.len or !pcb.fd_table[fd].in_use) return VFS_ERR;
+    if (fd < 3) return VFS_ERR; // can't close stdin/stdout/stderr
     const fd_entry = &pcb.fd_table[fd];
 
     switch (fd_entry.fs_type) {
         .console => {},
         .fat32 => {
-            const dc = if (fd_entry.fat_dir_cluster != 0) fd_entry.fat_dir_cluster else fat32.root_cluster;
-            fat32.closeFile(fat32.Handle{
-                .dir_cluster = dc,
-                .dir_index = fd_entry.inode,
-                .first_cluster = fat32.getFirstClusterAt(dc, fd_entry.inode),
-                .file_size = fat32.getFileSizeAt(dc, fd_entry.inode),
-                .current_offset = fd_entry.offset,
-            });
+            fat32.closeFile(fatHandle(fd_entry));
         },
         .tarfs => {
             tarfs.closeFile(@intCast(fd_entry.inode));
@@ -676,34 +658,71 @@ pub fn ls() void {
     fat32.listFiles();
 }
 
-/// `out_inode`, if non-null, receives the ext2 inode number of the file that
-/// was actually read — or 0 if the file came from a non-ext2 mount (tarfs/fat32)
-/// or wasn't found. Callers that cache-key on the file (ELF text sharing, Slice
-/// 3e) use it; everyone else passes null. The inum is captured from the SAME
-/// resolution that read the bytes (ext2.loadFileInum), so it can never name a
-/// different file than the one whose contents landed in `dest`.
-pub fn loadFile(name: []const u8, dest: []align(4) u8, out_inode: ?*u32) ?usize {
-    if (out_inode) |p| p.* = 0; // default: no ext2 cache key
+// --- Kernel-context name resolution (loadFile / fileSize) -------------------
+//
+// Both loaders resolve a name the same way: absolute paths dispatch through
+// the mount table; bare names walk the legacy fallback chain (ext2 root →
+// ext2 /bin → tarfs → fat32). loadFileFresh sizes the file with one and
+// reads it with the other, so if the two ever disagreed about WHICH file a
+// name means, it would allocate the wrong buffer. That used to be a "keep
+// the two paths in lock-step" comment; now the sequence exists once, in
+// resolveFirst, and the two only differ in the per-fs operation applied —
+// drift is structurally impossible (rule 5, aimed at control flow).
 
-    // Kernel-context load (no PCB, so no cwd) — strictly absolute paths.
-    // Mount table dispatch matches the per-fs `read`/`open` paths used
-    // from user processes, so behavior is consistent across both.
+/// Walk the name-resolution sequence and return the first non-null result of
+/// `op.run(fs, rel)`. `op` is duck-typed: any struct with
+/// `fn run(self, fs: FsType, rel: []const u8) ?R`.
+fn resolveFirst(comptime R: type, name: []const u8, op: anytype) ?R {
+    // Absolute path → longest-prefix mount dispatch, one candidate.
     if (name.len > 0 and name[0] == '/') {
         const m = findMount(name) orelse return null;
-        const rel = name[m.prefix.len..];
-        return switch (m.fs) {
-            .tarfs => tarfs.loadFile(rel, dest),
-            .ext2 => blk_ext2: {
-                const r = ext2.loadFileInum(rel, dest) orelse break :blk_ext2 null;
-                if (out_inode) |p| p.* = r.inum;
-                break :blk_ext2 r.size;
+        return op.run(m.fs, name[m.prefix.len..]);
+    }
+    // Bare-filename fallback for legacy callers (sysExec passing "cat.elf"
+    // unqualified, KERNEL.SYM / BUILD.ID lookups). Resolution order:
+    //   1. ext2 root  — for files at `/` like KERNEL.SYM, BUILD.ID
+    //   2. ext2 /bin  — for shell-style `cat` → /bin/cat.elf (PATH analogue)
+    //   3. tarfs      — legacy fallback during migration
+    //   4. fat32      — only matters with /fat/ disk attached
+    if (op.run(.ext2, name)) |r| return r;
+    var bin_buf: [128]u8 = undefined;
+    if (binPath(&bin_buf, name)) |bp| {
+        if (op.run(.ext2, bp)) |r| return r;
+    }
+    if (op.run(.tarfs, name)) |r| return r;
+    return op.run(.fat32, name);
+}
+
+/// "bin/" ++ name into `buf`, or null if it doesn't fit.
+fn binPath(buf: *[128]u8, name: []const u8) ?[]const u8 {
+    const prefix = "bin/";
+    if (name.len + prefix.len > buf.len) return null;
+    @memcpy(buf[0..prefix.len], prefix);
+    @memcpy(buf[prefix.len..][0..name.len], name);
+    return buf[0 .. prefix.len + name.len];
+}
+
+/// The loadFile operation: read the candidate into `dest`, reporting the ext2
+/// inum through `out_inode` from the SAME resolution that read the bytes — so
+/// it can never name a different file than the one whose contents landed.
+const LoadOp = struct {
+    dest: []align(4) u8,
+    out_inode: ?*u32,
+
+    fn run(self: @This(), fs: FsType, rel: []const u8) ?usize {
+        return switch (fs) {
+            .tarfs => tarfs.loadFile(rel, self.dest),
+            .ext2 => blk: {
+                const r = ext2.loadFileInum(rel, self.dest) orelse break :blk null;
+                if (self.out_inode) |p| p.* = r.inum;
+                break :blk r.size;
             },
             .fat32 => blk: {
                 if (fat32.openFile(rel)) |handle| {
                     const size = handle.file_size;
                     if (size > 0) {
-                        const want: u32 = @intCast(@min(@as(u64, size), dest.len));
-                        const r = fat32.readFile(handle, @ptrCast(dest.ptr), want);
+                        const want: u32 = @intCast(@min(@as(u64, size), self.dest.len));
+                        const r = fat32.readFile(handle, @ptrCast(self.dest.ptr), want);
                         fat32.closeFile(handle);
                         if (r > 0) break :blk r;
                     } else {
@@ -713,69 +732,24 @@ pub fn loadFile(name: []const u8, dest: []align(4) u8, out_inode: ?*u32) ?usize 
                 break :blk null;
             },
             // devfs/procfs aren't loadable as files (they're streamed) — kernel
-            // load callers shouldn't be asking for them.
-            else => null,
+            // load callers shouldn't be asking for them. fileSize DOES report
+            // their sizes (SizeOp below), so a loadFileFresh of one sizes fine
+            // and then fails here — wasteful but unreachable from real callers.
+            .devfs, .procfs => null,
         };
     }
+};
 
-    // Bare-filename fallback for legacy callers (sysExec passing "cat.elf"
-    // unqualified, KERNEL.SYM / BUILD.ID lookups). Resolution order:
-    //   1. ext2 root  — for files at `/` like KERNEL.SYM, BUILD.ID
-    //   2. ext2 /bin  — for shell-style `cat` → /bin/cat.elf (PATH analogue)
-    //   3. tarfs      — legacy fallback during migration
-    //   4. fat32      — only matters with /fat/ disk attached
-    if (ext2.loadFileInum(name, dest)) |r| {
-        if (out_inode) |p| p.* = r.inum;
-        return r.size;
-    }
-    if (binFallback(name, dest, out_inode)) |size| return size;
-    if (tarfs.loadFile(name, dest)) |size| return size;
-    if (fat32.openFile(name)) |handle| {
-        const size = handle.file_size;
-        if (size > 0) {
-            const want: u32 = @intCast(@min(@as(u64, size), dest.len));
-            const r = fat32.readFile(handle, @ptrCast(dest.ptr), want);
-            fat32.closeFile(handle);
-            if (r > 0) return r;
-        } else {
-            fat32.closeFile(handle);
-        }
-    }
-    return null;
-}
-
-/// Try `ext2.loadFile("bin/" ++ name)`. Used by the bare-name fallback
-/// path so that `sysExec("cat.elf")` finds `/bin/cat.elf` without the
-/// shell having to prepend the prefix itself.
-fn binFallback(name: []const u8, dest: []align(4) u8, out_inode: ?*u32) ?usize {
-    var buf: [128]u8 = undefined;
-    const prefix = "bin/";
-    if (name.len + prefix.len > buf.len) return null;
-    @memcpy(buf[0..prefix.len], prefix);
-    @memcpy(buf[prefix.len..][0..name.len], name);
-    const r = ext2.loadFileInum(buf[0 .. prefix.len + name.len], dest) orelse return null;
-    if (out_inode) |p| p.* = r.inum;
-    return r.size;
-}
-
-fn binFallbackSize(name: []const u8) ?u64 {
-    var buf: [128]u8 = undefined;
-    const prefix = "bin/";
-    if (name.len + prefix.len > buf.len) return null;
-    @memcpy(buf[0..prefix.len], prefix);
-    @memcpy(buf[prefix.len..][0..name.len], name);
-    return ext2.fileSize(buf[0 .. prefix.len + name.len]);
-}
-
-pub fn fileSize(name: []const u8) ?u32 {
-    // Mount-table dispatch — matches `loadFile` exactly so any path that
-    // succeeds in one will succeed in the other.
-    if (name.len > 0 and name[0] == '/') {
-        const m = findMount(name) orelse return null;
-        const rel = name[m.prefix.len..];
-        return switch (m.fs) {
-            .tarfs => if (tarfs.fileSize(rel)) |s| @as(?u32, @intCast(s)) else null,
-            .ext2 => if (ext2.fileSize(rel)) |s| @as(?u32, @intCast(s)) else null,
+/// The fileSize operation. ext2/tarfs report u64 sizes (ext2 LARGE_FILE
+/// reaches 2^48): a size that doesn't fit the u32 world of fd offsets and
+/// loadFileFresh is "no usable size" (null), never a checked-cast panic —
+/// the size is fs-image-provided data, and a corrupt image must not be able
+/// to crash the kernel (the NVMe LBADS lesson).
+const SizeOp = struct {
+    fn run(_: @This(), fs: FsType, rel: []const u8) ?u32 {
+        return switch (fs) {
+            .tarfs => std.math.cast(u32, tarfs.fileSize(rel) orelse return null),
+            .ext2 => std.math.cast(u32, ext2.fileSize(rel) orelse return null),
             .fat32 => blk: {
                 if (fat32.openFile(rel)) |handle| {
                     const size = handle.file_size;
@@ -788,19 +762,22 @@ pub fn fileSize(name: []const u8) ?u32 {
             .procfs => procfs.fileSize(rel),
         };
     }
+};
 
-    // Bare-filename fallback — same chain as `loadFile`: ext2 root,
-    // ext2 /bin, tarfs, fat32. Keep the two paths in lock-step or
-    // `loadFileFresh` will allocate the wrong buffer size.
-    if (ext2.fileSize(name)) |s| return @intCast(s);
-    if (binFallbackSize(name)) |s| return @intCast(s);
-    if (tarfs.fileSize(name)) |s| return @intCast(s);
-    if (fat32.openFile(name)) |handle| {
-        const size = handle.file_size;
-        fat32.closeFile(handle);
-        return size;
-    }
-    return null;
+/// `out_inode`, if non-null, receives the ext2 inode number of the file that
+/// was actually read — or 0 if the file came from a non-ext2 mount (tarfs/fat32)
+/// or wasn't found. Callers that cache-key on the file (ELF text sharing, Slice
+/// 3e) use it; everyone else passes null. Kernel-context load (no PCB, so no
+/// cwd) — absolute paths plus the bare-name chain, see resolveFirst.
+pub fn loadFile(name: []const u8, dest: []align(4) u8, out_inode: ?*u32) ?usize {
+    if (out_inode) |p| p.* = 0; // default: no ext2 cache key
+    return resolveFirst(usize, name, LoadOp{ .dest = dest, .out_inode = out_inode });
+}
+
+/// Size of the file `name` resolves to, via the SAME candidate sequence
+/// loadFile reads through (resolveFirst) — the pairing loadFileFresh relies on.
+pub fn fileSize(name: []const u8) ?u32 {
+    return resolveFirst(u32, name, SizeOp{});
 }
 
 /// A PMM-allocated file buffer ready to hand to elf_loader.loadAndStart
@@ -907,6 +884,11 @@ pub fn loadFileFresh(name: []const u8) ?FreshFile {
     return null;
 }
 
+/// Find a free fd index. NAMES a slot only — nothing is reserved until the
+/// caller installs into fd_table[fd_idx]. Safe because every fd_table has
+/// exactly one accessor today (tables are COPIED on clone, never shared —
+/// lifecycle.cloneCurrent). If CLONE_FILES sharing ever lands, this needs a
+/// reservation (in_use placeholder) or an fd-table lock.
 pub fn allocFd(pcb: *process.PCB) ?usize {
     for (3..pcb.fd_table.len) |fd_idx| {
         if (!pcb.fd_table[fd_idx].in_use) return fd_idx;
