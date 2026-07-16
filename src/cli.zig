@@ -144,6 +144,7 @@ pub fn execute(cmd: []const u8) void {
         printCmd("acpiprt", "ACPI PCI interrupt routing (_PRT) + live PCI join");
         printCmd("gpu", "Detect display controllers (vendor/family/resources)");
         printCmd("uas", "Report detected USB Attached SCSI (UAS) device");
+        printCmd("thermal", "CPU temperature / power (RAPL) / effective freq");
     } else if (std.mem.eql(u8, cmd, "clear")) {
         vga.clear();
     } else if (std.mem.eql(u8, cmd, "ls")) {
@@ -247,6 +248,8 @@ pub fn execute(cmd: []const u8) void {
         @import("driver/gpu.zig").report();
     } else if (std.mem.eql(u8, cmd, "uas")) {
         @import("driver/xhci.zig").uasReport();
+    } else if (std.mem.eql(u8, cmd, "thermal")) {
+        cmdThermal();
     } else {
         printErr("Unknown command: {s}\n", .{cmd});
         vga.fg = .DarkGray;
@@ -906,6 +909,95 @@ fn cmdPerf() void {
     printSection("Performance counters");
     vga.print("(also dumped to serial)\n", .{});
     @import("debug/perf.zig").dumpAll();
+}
+
+/// Busy-spin ~`ms` milliseconds off the calibrated TSC — used to bracket a
+/// RAPL/APERF interval sample. The shell runs in kernel context, so this
+/// blocks the shell (fine for a one-shot diagnostic). Falls back to a
+/// bounded pause loop if the TSC rate isn't known yet.
+fn spinMs(ms: u64) void {
+    const apic = @import("time/apic.zig");
+    const per_quantum = apic.tscPerQuantum(); // TSC ticks per 10ms
+    if (per_quantum == 0) {
+        var i: u64 = 0;
+        while (i < ms * 200_000) : (i += 1) asm volatile ("pause");
+        return;
+    }
+    const target = apic.readTsc() + per_quantum * (ms / 10 + 1);
+    while (apic.readTsc() < target) asm volatile ("pause");
+}
+
+fn printThrottle(comptime label: []const u8, th: anytype) void {
+    if (!th.any()) {
+        vga.fg = .DarkGray;
+        vga.print(label ++ " throttle: none (no sticky event since boot)\n", .{});
+        vga.fg = .LightGray;
+        return;
+    }
+    vga.fg = .Yellow;
+    vga.print(label ++ " throttle:", .{});
+    if (th.thermal) vga.print(" thermal", .{});
+    if (th.prochot) vga.print(" prochot", .{});
+    if (th.critical) vga.print(" CRITICAL", .{});
+    if (th.threshold1) vga.print(" thresh1", .{});
+    if (th.threshold2) vga.print(" thresh2", .{});
+    if (th.power_limit) vga.print(" power-limit", .{});
+    if (th.current_limit) vga.print(" current-limit", .{});
+    if (th.cross_domain) vga.print(" cross-domain", .{});
+    vga.print("\n", .{});
+    vga.fg = .LightGray;
+}
+
+fn cmdThermal() void {
+    const thermal = @import("cpu/arch/thermal.zig");
+    printSection("CPU thermal / power");
+
+    if (!thermal.supported) {
+        printErr("No thermal/power sensors available on this platform\n", .{});
+        vga.fg = .DarkGray;
+        vga.print("(CPUID leaf 6 absent, or the MSRs #GP on this host)\n", .{});
+        vga.fg = .LightGray;
+        return;
+    }
+
+    vga.print("Tj_max: {d} C   base clock: {d} MHz", .{ thermal.tj_max, thermal.base_mhz });
+    if (thermal.under_hypervisor) {
+        vga.fg = .DarkGray;
+        vga.print("   [virtualized]", .{});
+        vga.fg = .LightGray;
+    }
+    vga.print("\n", .{});
+
+    const t = thermal.readTemps();
+    if (t.core_c) |c| vga.print("core temp: {d} C\n", .{c});
+    if (t.pkg_c) |c| vga.print("pkg  temp: {d} C\n", .{c});
+    if (t.core_throttle) |th| printThrottle("core", th);
+    if (t.pkg_throttle) |th| printThrottle("pkg ", th);
+
+    if (thermal.has_rapl or thermal.has_aperf) {
+        vga.fg = .DarkGray;
+        vga.print("sampling power/frequency over ~250ms...\n", .{});
+        vga.fg = .LightGray;
+        thermal.beginSample();
+        spinMs(250);
+        if (thermal.sampleRates()) |r| {
+            if (r.pkg_mw) |mw| vga.print("pkg  power: {d}.{d:0>3} W\n", .{ mw / 1000, mw % 1000 });
+            if (r.pp0_mw) |mw| vga.print("core power: {d}.{d:0>3} W\n", .{ mw / 1000, mw % 1000 });
+            if (r.eff_mhz) |mhz| {
+                if (r.eff_pct) |pct| {
+                    vga.print("eff freq:  {d} MHz ({d}% of base)\n", .{ mhz, pct });
+                } else {
+                    vga.print("eff freq:  {d} MHz\n", .{mhz});
+                }
+            } else if (r.eff_pct) |pct| {
+                vga.print("eff freq:  {d}% of base\n", .{pct});
+            }
+        } else {
+            vga.fg = .DarkGray;
+            vga.print("(no interval rates available)\n", .{});
+            vga.fg = .LightGray;
+        }
+    }
 }
 
 fn cmdIpi() void {

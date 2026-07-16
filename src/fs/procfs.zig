@@ -50,6 +50,7 @@ pub const Kind = enum(u8) {
     pcid_stats,
     bpf,
     acpi,
+    thermal,
     pid_cmdline,
     pid_status,
 };
@@ -74,6 +75,7 @@ const STATIC_FILES = [_]StaticFile{
     .{ .name = "pcid_stats", .kind = .pcid_stats },
     .{ .name = "bpf", .kind = .bpf },
     .{ .name = "acpi", .kind = .acpi },
+    .{ .name = "thermal", .kind = .thermal },
 };
 
 const PER_PID_FILES = [_]StaticFile{
@@ -151,6 +153,7 @@ pub fn read(inode: u32, offset: u32, buf: [*]u8, count: u32) u32 {
         .pcid_stats => renderPcidStats(rendered),
         .bpf => @import("../bpf/kernel.zig").renderProc(rendered),
         .acpi => @import("../acpi/aml.zig").renderProc(rendered),
+        .thermal => @import("../cpu/arch/thermal.zig").renderProc(rendered),
         .pid_cmdline => renderPidCmdline(pid, rendered),
         .pid_status => renderPidStatus(pid, rendered),
     };

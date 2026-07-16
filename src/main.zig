@@ -240,6 +240,18 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     // armed from the kernel via pmu.start(...) at any later point.
     @import("cpu/arch/pmu.zig").detect();
     blog.ok("PMU detected");
+    // Fault-tolerant MSR access: self-test the #GP fixup (reserved-MSR read
+    // must recover to null; a valid MSR must still read) before any probe
+    // relies on it. IDT is live (idt.init above), so a #GP here recovers.
+    @import("cpu/arch/msr.zig").selfTest();
+    blog.ok("safe-MSR fixup self-test");
+    // Thermal + power telemetry: enumerate DTS / RAPL / APERF-MPERF via
+    // CPUID leaf 6, latch Tj_max + the RAPL energy unit. Read-only, no CR
+    // bits, no interrupt. MSR reads stay suppressed under a hypervisor
+    // (CPUID may advertise a sensor whose MSR would #GP); the real-HW pass
+    // gets the full readout. Surfaced via `thermal` + /proc/thermal.
+    @import("cpu/arch/thermal.zig").detect();
+    blog.ok("thermal/power telemetry");
     // Capture the FPU/SSE "init" state used to seed every new process. Must
     // run after enableSSE() (CR0/CR4 already set) and before process.create()
     // can be called.
