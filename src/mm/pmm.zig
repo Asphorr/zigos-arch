@@ -639,6 +639,18 @@ extern var _kernel_end: u8;
 // "fetch_um" bytes from a Zig binary's .strtab).
 var kernel_phys_end: usize = 0;
 
+// Highest usable-RAM end address consumed by init() (post-4GB-truncation,
+// so it is also the ceiling on any frame allocFrame can ever return).
+// The IOMMU sizes its DMA identity-map span from this — a device must be
+// able to reach every frame a driver can hand it.
+var highest_usable_phys: usize = 0;
+
+/// End of the highest usable RAM region PMM manages (exclusive). 0 before
+/// init(). Every allocFrame result lies strictly below this.
+pub fn highestUsablePhys() usize {
+    return highest_usable_phys;
+}
+
 const KERNEL_PHYS_START: usize = 0x100000;
 
 fn checkPhysSafety(phys: usize, op: []const u8) void {
@@ -798,6 +810,7 @@ pub fn init(info: *const boot_info.BootInfo) void {
         const base: usize = @intCast(region.base);
         const length: usize = @intCast(@min(region.length, 0x100000000 - region.base));
         markRegionFree(base, length);
+        if (base + length > highest_usable_phys) highest_usable_phys = base + length;
         consumed += 1;
         if (region.base + region.length > 0x100000000) {
             // Region straddles 4GB — count the truncated tail

@@ -347,12 +347,14 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     // compositor draws into — the CLI reads this cache instead.
     const gpu_count = @import("driver/gpu.zig").init();
     blog.okNote("GPU inventory", "{d} found", .{gpu_count});
-    // IOMMU (Intel VT-d) — pass-through phase. Programs every PCI
-    // device's context entry as Translation-Type=pass-through so the
-    // IOMMU is on but DMA addresses are 1:1. Buys us fault-recording
-    // for off-the-rails DMA without changing driver semantics. No-op
-    // when no DMAR table is present (no -device intel-iommu in QEMU,
-    // or BIOS-mode boot on real hardware).
+    // IOMMU (Intel VT-d) — identity-translation phase (the comment used
+    // to say "pass-through", which is a different context-entry type the
+    // module deliberately does NOT use). Every PCI device's context entry
+    // runs REAL second-level translation through a shared identity map
+    // covering PMM's whole allocatable range, so DMA is 1:1 but off-range
+    // DMA faults; drivers opt into per-device isolation (enableIsolation/
+    // dmaMap) on top. No-op when no DMAR table is present (no -device
+    // intel-iommu in QEMU, or VT-d disabled in firmware on real hardware).
     @import("cpu/mmu/iommu.zig").init();
     blog.ok("IOMMU (VT-d pass-through)");
     // SMI / scheduler stall detector. Reads FADT.pm_tmr_blk for sampling.
