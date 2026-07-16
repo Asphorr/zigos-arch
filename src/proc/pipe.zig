@@ -8,6 +8,12 @@
 // "Static pool" means: no heap allocation. Allocate-on-first-use is via a
 // `pipes[i].in_use` flag scan. Pool size and per-pipe ring size are both in
 // config.zig — bump them there if more concurrent pipes are needed.
+//
+// Ring↔caller copies in the blocking read()/write() go through the faultable
+// usercopy site (cpu/arch/usercopy.zig): the caller's buffer is usually USER
+// memory, and a validated page can be swap-evicted while the syscall is
+// parked — the copy truncates at the fault and the page is faulted back in
+// OUTSIDE the lock instead of the old bare @memcpy panicking inside it.
 
 const std = @import("std");
 const process = @import("process.zig");
@@ -15,9 +21,16 @@ const debug = @import("../debug/debug.zig");
 const config = @import("../config.zig");
 const fdpoll = @import("../cpu/ipc/fdpoll.zig");
 const spinlock = @import("spinlock.zig");
+const usercopy = @import("../cpu/arch/usercopy.zig");
 
 pub const PIPE_BUF_SIZE: u32 = config.PIPE_BUF_SIZE;
 pub const MAX_PIPES: u8 = config.MAX_PIPES;
+
+/// Error sentinel returned by write() (EPIPE: read side fully closed) and by
+/// read()/write() on an unresolvable caller-buffer fault with zero progress
+/// (EFAULT — only reachable with a user buffer). Numerically identical to
+/// vfs.VFS_ERR, so the vfs pipe arms' @intCast passes it straight through.
+pub const PIPE_ERR: usize = 0xFFFF_FFFF;
 
 pub const Pipe = struct {
     buf: [PIPE_BUF_SIZE]u8 = undefined,
@@ -56,8 +69,10 @@ pub const Pipe = struct {
     /// on ordinary `a | b` teardown), and the unlocked `readers -= 1`
     /// RMWs could lose updates under concurrent close/spawn (premature
     /// slot free while an fd still referenced it).
-    /// Held with interrupts OFF (acquireIrqSave) across only the memcpy +
-    /// counter update — NEVER across blockOnInterruptible, process.wake,
+    /// Held with interrupts OFF (acquireIrqSave) across only the ring copy +
+    /// counter update (the copy is the faultable usercopy site, so a user
+    /// page fault truncates instead of wedging the cli window — resolution
+    /// happens outside) — NEVER across blockOnInterruptible, process.wake,
     /// or serial logging — so it stays a leaf lock and a CPU's own IRQ0
     /// validator can never interrupt a holder on that CPU and
     /// self-deadlock. validate() takes the same lock to read a consistent
@@ -121,7 +136,11 @@ pub fn setDesktopDrain(id: u8) void {
 
 /// Read up to `out.len` bytes from pipe `id`. Blocks if the ring is empty and
 /// there's still at least one writer. Returns the number of bytes read; 0
-/// indicates EOF (writer side fully closed). Caller is the current process.
+/// indicates EOF (writer side fully closed); PIPE_ERR means `out` faulted
+/// unresolvably with nothing yet copied (EFAULT). If bytes were already
+/// copied when the buffer went bad, that partial count is returned instead
+/// (POSIX: transferred data wins) and the error surfaces on the next call.
+/// Caller is the current process.
 pub fn read(id: u8, out: []u8) usize {
     if (id >= MAX_PIPES) return 0;
     const p = &pipes[id];
@@ -129,6 +148,7 @@ pub fn read(id: u8, out: []u8) usize {
 
     var copied: usize = 0;
     var freed_space = false;
+    var fault_tries: u8 = 0;
     while (copied < out.len) {
         const flags = p.lock.acquireIrqSave();
         if (p.count > 0) {
@@ -137,19 +157,45 @@ pub fn read(id: u8, out: []u8) usize {
             // Copy up to min(wanted, remaining, contiguous-in-ring)
             const contiguous = @min(remaining, PIPE_BUF_SIZE - p.tail);
             const n = @min(wanted, contiguous);
-            @memcpy(out[copied..][0..n], p.buf[p.tail..][0..n]);
-            p.tail = (p.tail + @as(u32, @intCast(n))) % PIPE_BUF_SIZE;
-            p.count -= @intCast(n);
-            copied += n;
-            freed_space = true;
+            // Ring → caller buffer through the faultable copy site. `out`
+            // is usually a USER slice (sysFread): validated at entry, but
+            // a blocking read parks for arbitrarily long, and swap eviction
+            // (even by a sibling thread of this process) can take a
+            // validated page away meanwhile — a bare @memcpy would then eat
+            // an unrecoverable kernel #PF inside this cli'd leaf lock. The
+            // raw copy truncates at the fault; the ring consumes exactly
+            // the bytes that landed, and the missing page is faulted back
+            // in below, OUTSIDE the lock (fault-in can block on swap-in
+            // disk I/O, which must never happen under a spinlock).
+            const done = usercopy.copyToUserRaw(@intFromPtr(out.ptr) + copied, p.buf[p.tail..][0..n]);
+            p.tail = (p.tail + @as(u32, @intCast(done))) % PIPE_BUF_SIZE;
+            p.count -= @intCast(done);
+            copied += done;
+            if (done > 0) freed_space = true;
 
             // Capture the blocked writer, then drop the lock BEFORE waking:
             // process.wake may take sched_lock, which must never nest under
-            // the (cli-held) pipe lock.
-            const w = p.blocked_writer_pid;
-            if (w != 0xFF) p.blocked_writer_pid = 0xFF;
+            // the (cli-held) pipe lock. Steal the registration only when the
+            // copy made progress — clearing it on a zero-progress fault and
+            // then bailing on EFAULT would leave the writer parked with
+            // nobody left to wake it.
+            var w: u8 = 0xFF;
+            if (done > 0 and p.blocked_writer_pid != 0xFF) {
+                w = p.blocked_writer_pid;
+                p.blocked_writer_pid = 0xFF;
+            }
             p.lock.releaseIrqRestore(flags);
             if (w != 0xFF) process.wake(w);
+            if (done < n) {
+                // Copy faulted — resolve outside the lock, or give up.
+                fault_tries += 1;
+                if (fault_tries > usercopy.MAX_FAULT_RETRIES or
+                    !usercopy.faultInWritable(@intFromPtr(out.ptr) + copied, out.len - copied))
+                {
+                    if (freed_space) fdpoll.wakePollers(.pipe, id);
+                    return if (copied > 0) copied else PIPE_ERR;
+                }
+            }
             continue;
         }
 
@@ -213,6 +259,10 @@ pub fn read(id: u8, out: []u8) usize {
 /// touches wait_kind / yields. Returns 0 if the ring is empty (caller can
 /// poll again next tick) — does not signal EOF specially because the desktop
 /// owns the write side and can detect close itself.
+/// `out` must be KERNEL memory: this path keeps the bare @memcpy (no fault
+/// recovery), which is fine for its only callers (desktop drain_buf, the
+/// window.zig fd0 poll) — all kernel statics/stack. Route user buffers
+/// through read().
 pub fn tryRead(id: u8, out: []u8) usize {
     if (id >= MAX_PIPES) return 0;
     const p = &pipes[id];
@@ -241,23 +291,26 @@ pub fn tryRead(id: u8, out: []u8) usize {
 }
 
 /// Write up to `data.len` bytes to pipe `id`. Blocks if the ring is full and
-/// there's still at least one reader. Returns bytes written, or 0xFFFFFFFF
-/// if the read side has fully closed (analogous to EPIPE — caller should treat
-/// as a fatal error and not retry).
+/// there's still at least one reader. Returns bytes written, or PIPE_ERR if
+/// the read side has fully closed (EPIPE — caller should treat as a fatal
+/// error and not retry) or if `data` faulted unresolvably with nothing yet
+/// written (EFAULT). A partial count is returned if bytes were already
+/// pushed before the buffer went bad — those bytes are real ring data.
 pub fn write(id: u8, data: []const u8) usize {
     if (id >= MAX_PIPES) return 0;
     const p = &pipes[id];
-    if (!p.in_use) return 0xFFFFFFFF;
+    if (!p.in_use) return PIPE_ERR;
 
     var written: usize = 0;
     var pushed_data = false;
+    var fault_tries: u8 = 0;
     while (written < data.len) {
         const flags = p.lock.acquireIrqSave();
         if (p.readers == 0) {
             // No one to read this. Treat as EPIPE.
             p.lock.releaseIrqRestore(flags);
             if (pushed_data) fdpoll.wakePollers(.pipe, id);
-            return 0xFFFFFFFF;
+            return PIPE_ERR;
         }
 
         if (p.count < PIPE_BUF_SIZE) {
@@ -265,20 +318,39 @@ pub fn write(id: u8, data: []const u8) usize {
             const wanted = data.len - written;
             const contiguous = @min(free, PIPE_BUF_SIZE - p.head);
             const n = @min(wanted, contiguous);
-            @memcpy(p.buf[p.head..][0..n], data[written..][0..n]);
-            p.head = (p.head + @as(u32, @intCast(n))) % PIPE_BUF_SIZE;
-            p.count += @intCast(n);
-            written += n;
-            pushed_data = true;
+            // Caller buffer → ring through the faultable copy site — see
+            // read() for the full rationale. Source-side fault: the bytes
+            // that DID land before the fault are real data and stay
+            // published; the missing tail is faulted back in below,
+            // outside the lock.
+            const done = usercopy.copyFromUserRaw(p.buf[p.head..][0..n], @intFromPtr(data.ptr) + written);
+            p.head = (p.head + @as(u32, @intCast(done))) % PIPE_BUF_SIZE;
+            p.count += @intCast(done);
+            written += done;
+            if (done > 0) pushed_data = true;
 
             // Capture wake targets, drop the lock, THEN wake — keep
             // process.wake / the compositor wake out of the cli section.
-            const r = p.blocked_reader_pid;
-            if (r != 0xFF) p.blocked_reader_pid = 0xFF;
-            const wake_desktop = p.wake_desktop_on_write;
+            // Registration stolen only on progress — see read().
+            var r: u8 = 0xFF;
+            if (done > 0 and p.blocked_reader_pid != 0xFF) {
+                r = p.blocked_reader_pid;
+                p.blocked_reader_pid = 0xFF;
+            }
+            const wake_desktop = p.wake_desktop_on_write and done > 0;
             p.lock.releaseIrqRestore(flags);
             if (r != 0xFF) process.wake(r);
             if (wake_desktop) @import("../ui/desktop/wake.zig").requestWake();
+            if (done < n) {
+                // Copy faulted — resolve outside the lock, or give up.
+                fault_tries += 1;
+                if (fault_tries > usercopy.MAX_FAULT_RETRIES or
+                    !usercopy.faultInReadable(@intFromPtr(data.ptr) + written, data.len - written))
+                {
+                    if (pushed_data) fdpoll.wakePollers(.pipe, id);
+                    return if (written > 0) written else PIPE_ERR;
+                }
+            }
             continue;
         }
 
@@ -313,7 +385,8 @@ pub fn write(id: u8, data: []const u8) usize {
 /// terminal's stdin pipe without parking the desktop process. Returns the
 /// byte count written; 0 means the ring is full (or pipe has no readers) —
 /// caller decides whether to drop or retry. Like tryRead, never touches
-/// wait_kind / yields.
+/// wait_kind / yields, and like tryRead `data` must be KERNEL memory (bare
+/// @memcpy, no fault recovery — the desktop keystroke buffers all are).
 pub fn tryWrite(id: u8, data: []const u8) usize {
     if (id >= MAX_PIPES) return 0;
     const p = &pipes[id];

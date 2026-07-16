@@ -27,6 +27,11 @@
 //       BLOCKABLE CONTEXT ONLY: current-process syscall path, no spinlocks
 //       held, IRQs on. This is the layer that makes swap eviction
 //       transparent to syscalls.
+//   faultInReadable / faultInWritable
+//       The resolve half of the retry layer, exported standalone for
+//       adopters whose copy must run under a lock the resolution can't
+//       happen under (pipe's ring copy: raw copy inside the cli'd leaf
+//       lock, resolve outside, retry). Blockable context only.
 //
 // ── How the recovery works (msr.zig's extable pattern, generalized) ─────
 // The accessor publishes (fault_rip, fixup_rip) into module globals via
@@ -205,8 +210,29 @@ pub fn strnlenUserRaw(user_ptr: usize, max: usize) ?usize {
 /// re-evicted (or re-CoWed) in the window between fault-in and the copy
 /// resuming — each iteration makes byte progress or fails fault-in, so
 /// this bounds pathological eviction races, not normal operation (which
-/// takes 0 or 1 retries).
-const MAX_FAULT_RETRIES: u8 = 4;
+/// takes 0 or 1 retries). Pub: external adopters running their own
+/// raw-copy/resolve loops (pipe) share the same cap.
+pub const MAX_FAULT_RETRIES: u8 = 4;
+
+/// Fault the user range in for READING (swap-in / lazy alloc — MAY BLOCK
+/// on disk I/O) and report whether every page is now present. This is the
+/// resolve half of copyFromUser, exported standalone for callers whose
+/// copy runs under a lock the resolution can't happen under.
+/// BLOCKABLE CONTEXT ONLY. false → not user space / can't be made present.
+pub fn faultInReadable(user_va: usize, len: usize) bool {
+    if (len == 0) return true;
+    if (!memmap.userDataRangeOk(user_va, len)) return false;
+    process.prefaultUserRange(user_va, len);
+    return process.allCurrentUserPagesMapped(user_va, len);
+}
+
+/// faultInReadable's WRITE-side twin: additionally breaks COW and rejects
+/// genuinely read-only targets (ensureUserRangeWritable). Same contract.
+pub fn faultInWritable(user_va: usize, len: usize) bool {
+    if (len == 0) return true;
+    if (!memmap.userDataRangeOk(user_va, len)) return false;
+    return process.ensureUserRangeWritable(user_va, len);
+}
 
 /// Copy from user with fault-in retry: on a partial copy, page the missing
 /// range back in (swap-in, lazy alloc — MAY BLOCK on disk I/O) and resume
@@ -223,8 +249,7 @@ pub fn copyFromUser(dst: []u8, user_src: usize) bool {
         if (done == dst.len) return true;
         tries += 1;
         if (tries > MAX_FAULT_RETRIES) return false;
-        process.prefaultUserRange(user_src + done, dst.len - done);
-        if (!process.allCurrentUserPagesMapped(user_src + done, dst.len - done)) return false;
+        if (!faultInReadable(user_src + done, dst.len - done)) return false;
     }
 }
 
@@ -241,7 +266,7 @@ pub fn copyToUser(user_dst: usize, src: []const u8) bool {
         if (done == src.len) return true;
         tries += 1;
         if (tries > MAX_FAULT_RETRIES) return false;
-        if (!process.ensureUserRangeWritable(user_dst + done, src.len - done)) return false;
+        if (!faultInWritable(user_dst + done, src.len - done)) return false;
     }
 }
 
@@ -257,8 +282,7 @@ pub fn strnlenUser(user_ptr: usize, max: usize) ?usize {
         if (strnlenUserRaw(user_ptr, max)) |len| return len;
         tries += 1;
         if (tries > MAX_FAULT_RETRIES) return null;
-        process.prefaultUserRange(user_ptr, max);
-        if (!process.allCurrentUserPagesMapped(user_ptr, max)) return null;
+        if (!faultInReadable(user_ptr, max)) return null;
     }
 }
 
