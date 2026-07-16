@@ -73,13 +73,24 @@ pub fn UserPtr(comptime T: type) type {
 
         /// Proof of `validate()`: page present + aligned, NOT proven
         /// writable. Read access only.
+        ///
+        /// The copies go through the faultable usercopy layer (extable-
+        /// recovered `rep movsb` + fault-in retry), NOT a bare deref: the
+        /// validation prefaults the page, but a blocking syscall can park
+        /// long enough for swap eviction (or a sibling thread's munmap) to
+        /// revoke residency afterwards. With a bare deref that's a ring-0
+        /// #PF panic; here it's a transparent re-fault-in, or a clean
+        /// null/false the caller maps to E_FAULT.
         pub const Validated = struct {
             addr: u64,
 
-            /// Read one `T` out of user memory.
-            pub inline fn copyIn(self: Validated) T {
-                const p: *const T = @ptrFromInt(@as(usize, @intCast(self.addr)));
-                return p.*;
+            /// Read one `T` out of user memory. null = the page went away
+            /// after validation and could not be brought back (E_FAULT).
+            pub inline fn copyIn(self: Validated) ?T {
+                const usercopy = @import("../cpu/arch/usercopy.zig");
+                var v: T = undefined;
+                if (!usercopy.copyFromUser(std.mem.asBytes(&v), @intCast(self.addr))) return null;
+                return v;
             }
 
             pub inline fn raw(self: Validated) u64 {
@@ -88,21 +99,25 @@ pub fn UserPtr(comptime T: type) type {
         };
 
         /// Proof of `validateWrite()`: page present + aligned + writable
-        /// (COW broken). Both directions.
+        /// (COW broken). Both directions. Copies are faultable — see
+        /// `Validated` for why.
         pub const ValidatedWrite = struct {
             addr: u64,
 
-            /// Read one `T` out of user memory.
-            pub inline fn copyIn(self: ValidatedWrite) T {
-                const p: *const T = @ptrFromInt(@as(usize, @intCast(self.addr)));
-                return p.*;
+            /// Read one `T` out of user memory. null = E_FAULT (see Validated).
+            pub inline fn copyIn(self: ValidatedWrite) ?T {
+                const usercopy = @import("../cpu/arch/usercopy.zig");
+                var v: T = undefined;
+                if (!usercopy.copyFromUser(std.mem.asBytes(&v), @intCast(self.addr))) return null;
+                return v;
             }
 
             /// Write one `T` to user memory. Only reachable here — the
-            /// writable-page proof is in the type.
-            pub inline fn copyOut(self: ValidatedWrite, value: T) void {
-                const p: *T = @ptrFromInt(@as(usize, @intCast(self.addr)));
-                p.* = value;
+            /// writable-page proof is in the type. false = the target went
+            /// away after validation and could not be restored (E_FAULT).
+            pub inline fn copyOut(self: ValidatedWrite, value: T) bool {
+                const usercopy = @import("../cpu/arch/usercopy.zig");
+                return usercopy.copyToUser(@intCast(self.addr), std.mem.asBytes(&value));
             }
 
             pub inline fn raw(self: ValidatedWrite) u64 {

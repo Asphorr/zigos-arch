@@ -803,7 +803,7 @@ pub fn sysSigpending(set_ptr: u32) u32 {
     const up = UserPtr(u32).fromRaw(set_ptr).validateWrite() orelse return E_FAULT;
     const pcb = process.currentPCB() orelse return E_FAULT;
     const value = @atomicLoad(u32, &pcb.pending_signals, .acquire) & pcb.signal_mask;
-    up.copyOut(value);
+    if (!up.copyOut(value)) return E_FAULT;
     return 0;
 }
 

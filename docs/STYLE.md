@@ -191,10 +191,10 @@ pointers in `util/user_ptr.zig`'s `UserPtr(T)`:
 ```zig
 // Read arg:
 const up = UserPtr(u32).fromRaw(arg).validate() orelse return E_FAULT;
-const value = up.copyIn();
+const value = up.copyIn() orelse return E_FAULT;
 // Write target (proves the page writable, breaks COW):
 const out = UserPtr(u32).fromRaw(arg).validateWrite() orelse return E_FAULT;
-out.copyOut(value);
+if (!out.copyOut(value)) return E_FAULT;
 ```
 
 `UserPtr` itself has no dereference methods — `copyIn` lives only on
@@ -204,6 +204,13 @@ through a read-proof, is a compile error — as is direct
 `@ptrFromInt(arg).*`. The Zig-native equivalent of Linux's SPARSE
 `__user` annotation, but enforced at compile time rather than by an
 external tool.
+
+The copies themselves are *faultable* (`cpu/arch/usercopy.zig`): the
+copy instruction is a kernel exception-table site, so a validated page
+that stops being resident mid-syscall (swap eviction while parked, a
+sibling thread's munmap) is re-faulted-in transparently — or surfaces
+as the null/false the caller maps to E_FAULT — instead of a ring-0 #PF
+panic. That's why `copyIn` returns `?T` and `copyOut` returns `bool`.
 
 **Reference exemplar:** `sysSigpending` in `cpu/syscall/proc.zig`.
 Mass-rollout across ~50 syscall sites is incremental — new syscalls
