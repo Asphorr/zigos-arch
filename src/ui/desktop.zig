@@ -2937,12 +2937,16 @@ pub fn run() void {
     @import("vga.zig").available = false;
 
     const virtio_gpu = @import("../driver/virtio_gpu.zig");
+    const gpu_kit = @import("../driver/gpu.zig");
 
-    // Try virtio-gpu first, fallback to BGA
+    // Try virtio-gpu first, fallback to BGA. The virtio attempt is gated on
+    // the boot GPU inventory: on real hardware (no virtio function on the
+    // bus) the probe is a guaranteed miss, so skip straight to the fallbacks
+    // instead of re-scanning the bus to learn what boot already knew.
     var disp_w: u32 = 0;
     var disp_h: u32 = 0;
     const gop = @import("../driver/gop_fb.zig");
-    if (virtio_gpu.init(1920, 1080)) {
+    if (gpu_kit.mayHaveVirtioGpu() and virtio_gpu.init(1920, 1080)) {
         disp_w = virtio_gpu.width;
         disp_h = virtio_gpu.height;
         gfx.setScreen(virtio_gpu.framebuffer, disp_w, disp_h);

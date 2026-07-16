@@ -758,6 +758,42 @@ pub fn getBarSize(dev: PciDevice, bar_idx: u8) u32 {
     return (~masked) +% 1;
 }
 
+/// 64-bit-aware BAR size probe: sizes BOTH dwords of a mem64 BAR pair.
+/// getBarSize masks only the low dword, so a BAR of 4 GiB or more (every
+/// modern dGPU VRAM aperture once resizable BAR is on) reads back size 0
+/// there — the high dword holds the interesting mask bits. Same discipline
+/// as getBarSize: MEM-decode off across the probe, both dwords restored
+/// exactly, the whole sequence under pci_lock.
+pub fn getBarSize64(dev: PciDevice, bar_idx: u8) u64 {
+    if (bar_idx >= 5) return 0; // needs bar_idx+1 for the high dword
+
+    const flags = pci_lock.acquireIrqSave();
+    defer pci_lock.releaseIrqRestore(flags);
+
+    const cmd_off: u8 = 0x04;
+    const orig_cmd = configRead16Unlocked(dev.bus, dev.dev, dev.func, cmd_off);
+    configWrite16Unlocked(dev.bus, dev.dev, dev.func, cmd_off, orig_cmd & ~@as(u16, 0x02));
+
+    const lo_off: u8 = 0x10 + bar_idx * 4;
+    const hi_off: u8 = lo_off + 4;
+    const orig_lo = configReadUnlocked(dev.bus, dev.dev, dev.func, lo_off);
+    const orig_hi = configReadUnlocked(dev.bus, dev.dev, dev.func, hi_off);
+    configWriteUnlocked(dev.bus, dev.dev, dev.func, lo_off, 0xFFFFFFFF);
+    configWriteUnlocked(dev.bus, dev.dev, dev.func, hi_off, 0xFFFFFFFF);
+    const mask_lo = configReadUnlocked(dev.bus, dev.dev, dev.func, lo_off);
+    const mask_hi = configReadUnlocked(dev.bus, dev.dev, dev.func, hi_off);
+    configWriteUnlocked(dev.bus, dev.dev, dev.func, lo_off, orig_lo);
+    configWriteUnlocked(dev.bus, dev.dev, dev.func, hi_off, orig_hi);
+
+    configWrite16Unlocked(dev.bus, dev.dev, dev.func, cmd_off, orig_cmd);
+
+    // All-ones on both dwords = no device behind the reads (master abort).
+    if (mask_lo == 0xFFFFFFFF and mask_hi == 0xFFFFFFFF) return 0;
+    const mask: u64 = (@as(u64, mask_hi) << 32) | (mask_lo & 0xFFFFFFF0);
+    if (mask == 0) return 0;
+    return (~mask) +% 1;
+}
+
 /// Enable PCI bus mastering (required for DMA).
 pub fn enableBusMaster(dev: PciDevice) void {
     var cmd = configRead16(dev.bus, dev.dev, dev.func, 0x04);

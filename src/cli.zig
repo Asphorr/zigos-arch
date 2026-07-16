@@ -142,6 +142,8 @@ pub fn execute(cmd: []const u8) void {
         printCmd("perf [reset]", "Per-CPU phase + per-syscall cycle counters");
         printCmd("acpidev", "ACPI namespace devices + decoded _CRS resources");
         printCmd("acpiprt", "ACPI PCI interrupt routing (_PRT) + live PCI join");
+        printCmd("gpu", "Detect display controllers (vendor/family/resources)");
+        printCmd("uas", "Report detected USB Attached SCSI (UAS) device");
     } else if (std.mem.eql(u8, cmd, "clear")) {
         vga.clear();
     } else if (std.mem.eql(u8, cmd, "ls")) {
@@ -241,6 +243,10 @@ pub fn execute(cmd: []const u8) void {
     } else if (std.mem.eql(u8, cmd, "acpiprt")) {
         _ = @import("acpi/aml.zig").buildPrt();
         @import("acpi/aml.zig").reportPrtPciJoin();
+    } else if (std.mem.eql(u8, cmd, "gpu")) {
+        @import("driver/gpu.zig").report();
+    } else if (std.mem.eql(u8, cmd, "uas")) {
+        @import("driver/xhci.zig").uasReport();
     } else {
         printErr("Unknown command: {s}\n", .{cmd});
         vga.fg = .DarkGray;

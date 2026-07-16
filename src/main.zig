@@ -334,6 +334,19 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     // instead of re-walking the bus per init() call.
     @import("driver/pci.zig").enumerate();
     blog.ok("PCI bus enumeration");
+    // GPU inventory — name every display controller (vendor/family/kind,
+    // BAR apertures, PCIe link) into gpu.zig's boot cache. Runs here, before
+    // any of OUR display drivers bind: the aperture probe flips each BAR's
+    // memory decode for a few config cycles — the same restore-exact sizing
+    // walk Linux does at this exact point, with firmware GOP scanout equally
+    // live. Safe because the probe is synchronous under the IRQ-disabled PCI
+    // lock: nothing reads or writes the aperture (or legacy VGA windows,
+    // which the same bit gates) during the microwindow, and the display
+    // engine's own scanout DMA doesn't go through host-side BAR decode.
+    // What it must NOT become is a `gpu`-CLI-time poke at a BAR the running
+    // compositor draws into — the CLI reads this cache instead.
+    const gpu_count = @import("driver/gpu.zig").init();
+    blog.okNote("GPU inventory", "{d} found", .{gpu_count});
     // IOMMU (Intel VT-d) — pass-through phase. Programs every PCI
     // device's context entry as Translation-Type=pass-through so the
     // IOMMU is on but DMA addresses are 1:1. Buys us fault-recording
