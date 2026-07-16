@@ -224,6 +224,22 @@ export fn handleException(rsp: u64) callconv(.c) void {
     const saved_cs = stack[18];
     const saved_rip = stack[17];
 
+    // Safe-MSR exception fixup (rdmsrSafe/wrmsrSafe). A #GP (13) at a
+    // registered MSR-probe instruction site, in kernel mode, is recovered
+    // by redirecting the saved RIP to the accessor's fixup landing pad —
+    // which returns "failed" to the caller instead of panicking. The sites
+    // are link-time invariants, so this needs no per-CPU state and is safe
+    // under reentrancy/SMP. Must precede the panic/user-signal dispatch.
+    // Kernel-CS gate: a ring-3 #GP can never sit at a kernel probe address,
+    // but gating is belt-and-braces and keeps user faults on their path.
+    if (int_no == 13 and (saved_cs & 3) == 0) {
+        if (@import("../arch/msr.zig").fixupRip(saved_rip)) |fixup| {
+            const wframe: [*]u64 = @ptrFromInt(rsp);
+            wframe[17] = fixup;
+            return;
+        }
+    }
+
     // Breadcrumb: vec in high 32, pid in low 32. Stamped before the NMI
     // fast-path return so even NMI-snapshotted CPUs leave a trace.
     {
