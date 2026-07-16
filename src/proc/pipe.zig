@@ -39,22 +39,31 @@ pub const Pipe = struct {
     /// pipes never touch this path.
     wake_desktop_on_write: bool = false,
 
-    /// Per-pipe ticket spinlock serialising ALL ring-state access
-    /// (head / tail / count / buf). Added 2026-06-04 after the fuzzer
-    /// tripped pcb_invariants' pipe.validate with `count=0 but head=N
-    /// tail=N-1`. The ring was being mutated lock-free from two CPUs —
-    /// the shell's blocking write() vs the desktop's non-blocking
-    /// tryRead() draining a terminal out_pipe (the shell→desktop drain
-    /// path) — so a `count += n` and a `count -= n` could race and lose
-    /// an update, and the IRQ0 validator on the other CPU could sample a
-    /// torn (head bumped, count not yet) intermediate and false-panic.
+    /// Per-pipe ticket spinlock serialising ALL pipe state: the ring
+    /// (head / tail / count / buf), the reader/writer refcounts, the
+    /// blocked_*_pid registrations, and the in_use lifecycle (alloc claim
+    /// + close free). Added 2026-06-04 after the fuzzer tripped
+    /// pcb_invariants' pipe.validate with `count=0 but head=N tail=N-1`.
+    /// The ring was being mutated lock-free from two CPUs — the shell's
+    /// blocking write() vs the desktop's non-blocking tryRead() draining
+    /// a terminal out_pipe (the shell→desktop drain path) — so a
+    /// `count += n` and a `count -= n` could race and lose an update, and
+    /// the IRQ0 validator on the other CPU could sample a torn (head
+    /// bumped, count not yet) intermediate and false-panic. Refcounts and
+    /// blocked pids were brought under it 2026-07-16: closeWriter reading
+    /// blocked_reader_pid unlocked could interleave with a parking reader
+    /// such that neither the EOF-check nor the wake fired (permanent park
+    /// on ordinary `a | b` teardown), and the unlocked `readers -= 1`
+    /// RMWs could lose updates under concurrent close/spawn (premature
+    /// slot free while an fd still referenced it).
     /// Held with interrupts OFF (acquireIrqSave) across only the memcpy +
-    /// counter update — NEVER across blockOnInterruptible or process.wake
-    /// — so it stays a leaf lock and a CPU's own IRQ0 validator can never
-    /// interrupt a holder on that CPU and self-deadlock. validate() takes
-    /// the same lock to read a consistent snapshot. Left unregistered (no
-    /// WITNESS class) — 32 pipes would blow the named-lock budget, and the
-    /// lock acquires nothing else while held so order tracking is moot.
+    /// counter update — NEVER across blockOnInterruptible, process.wake,
+    /// or serial logging — so it stays a leaf lock and a CPU's own IRQ0
+    /// validator can never interrupt a holder on that CPU and
+    /// self-deadlock. validate() takes the same lock to read a consistent
+    /// snapshot. Left unregistered (no WITNESS class) — 32 pipes would
+    /// blow the named-lock budget, and the lock acquires nothing else
+    /// while held so order tracking is moot.
     lock: spinlock.SpinLock = .{},
 };
 
@@ -65,27 +74,36 @@ pub var pipes: [MAX_PIPES]Pipe = [_]Pipe{.{}} ** MAX_PIPES;
 /// process's fd_table.
 pub fn alloc() ?u8 {
     for (0..MAX_PIPES) |i| {
-        if (!pipes[i].in_use) {
-            const p = &pipes[i];
-            // Reset ring + refcount state field-by-field, DELIBERATELY
-            // leaving `lock` untouched: a whole-struct `.{}` assign would
-            // reset the ticket counters, which (very rarely) corrupts a
-            // cross-CPU validator that's mid-acquire on this slot's lock.
-            // A freed slot's lock is unheld, so preserving it is safe and
-            // makes the lock's lifecycle airtight. `in_use` is written LAST
-            // — on x86-TSO that publishes the field writes before any other
-            // CPU can observe the slot as live.
-            p.head = 0;
-            p.tail = 0;
-            p.count = 0;
-            p.readers = 1;
-            p.writers = 1;
-            p.blocked_reader_pid = 0xFF;
-            p.blocked_writer_pid = 0xFF;
-            p.wake_desktop_on_write = false;
-            @atomicStore(bool, &p.in_use, true, .release);
-            return @intCast(i);
+        const p = &pipes[i];
+        // Unlocked fast filter only — the claim itself happens under the
+        // slot lock below. Without it, two sysPipe calls on two CPUs could
+        // both pass this check and initialise the same slot (double-claim:
+        // two unrelated pipe() calls sharing one ring with stomped 1/1
+        // refcounts).
+        if (p.in_use) continue;
+        const flags = p.lock.acquireIrqSave();
+        if (p.in_use) { // lost the claim race to another CPU's alloc
+            p.lock.releaseIrqRestore(flags);
+            continue;
         }
+        // Reset ring + refcount state field-by-field, DELIBERATELY
+        // leaving `lock` untouched: a whole-struct `.{}` assign would
+        // reset the ticket counters we are currently HOLDING (and which
+        // a cross-CPU validator may be mid-acquire on). `in_use` is
+        // written LAST via release-store — read()/write()/tryRead() check
+        // it unlocked on entry, so on x86-TSO the field writes must be
+        // visible before any CPU can observe the slot as live.
+        p.head = 0;
+        p.tail = 0;
+        p.count = 0;
+        p.readers = 1;
+        p.writers = 1;
+        p.blocked_reader_pid = 0xFF;
+        p.blocked_writer_pid = 0xFF;
+        p.wake_desktop_on_write = false;
+        @atomicStore(bool, &p.in_use, true, .release);
+        p.lock.releaseIrqRestore(flags);
+        return @intCast(i);
     }
     return null;
 }
@@ -95,8 +113,10 @@ pub fn alloc() ?u8 {
 /// out. Idempotent.
 pub fn setDesktopDrain(id: u8) void {
     if (id >= MAX_PIPES) return;
-    if (!pipes[id].in_use) return;
-    pipes[id].wake_desktop_on_write = true;
+    const p = &pipes[id];
+    const flags = p.lock.acquireIrqSave();
+    if (p.in_use) p.wake_desktop_on_write = true;
+    p.lock.releaseIrqRestore(flags);
 }
 
 /// Read up to `out.len` bytes from pipe `id`. Blocks if the ring is empty and
@@ -158,12 +178,25 @@ pub fn read(id: u8, out: []u8) usize {
         // release before parking — blockOnInterruptible must never run
         // with the pipe lock (or cli) held.
         const my_pid: u8 = @intCast(process.getCurrentPid());
+        const displaced = p.blocked_reader_pid;
         p.blocked_reader_pid = my_pid;
         p.lock.releaseIrqRestore(flags);
+        // Single-slot waiter registry: a second parked reader displaces the
+        // first, which then sleeps until a signal or writer-close. No
+        // workload parks two readers on one pipe today (pipelines are 1:1;
+        // a shell waits in waitpid while its child owns stdin) — logged
+        // AFTER the lock drop (serial takes its own lock; this one is a
+        // leaf) so it's loud if that ever changes.
+        if (displaced != 0xFF and displaced != my_pid) {
+            debug.klog("[pipe] WARN: reader wait-slot collision pipe={d} displaced pid={d} by pid={d}\n", .{ id, displaced, my_pid });
+        }
         const br = process.blockOnInterruptible(.pipe_read, id);
         if (br == .signalled) {
             const f2 = p.lock.acquireIrqSave();
-            p.blocked_reader_pid = 0xFF;
+            // Clear only OUR registration — a waker may have already
+            // cleared it and a different reader re-registered meanwhile;
+            // stomping that would strand them.
+            if (p.blocked_reader_pid == my_pid) p.blocked_reader_pid = 0xFF;
             p.lock.releaseIrqRestore(f2);
             if (freed_space) fdpoll.wakePollers(.pipe, id);
             return copied;
@@ -254,12 +287,18 @@ pub fn write(id: u8, data: []const u8) usize {
         // delivery path runs. Caller can retry after handler returns.
         // blocked_writer_pid set under the lock, released before parking.
         const my_pid: u8 = @intCast(process.getCurrentPid());
+        const displaced = p.blocked_writer_pid;
         p.blocked_writer_pid = my_pid;
         p.lock.releaseIrqRestore(flags);
+        // Same single-slot collision diagnostic as read() — see there.
+        if (displaced != 0xFF and displaced != my_pid) {
+            debug.klog("[pipe] WARN: writer wait-slot collision pipe={d} displaced pid={d} by pid={d}\n", .{ id, displaced, my_pid });
+        }
         const br = process.blockOnInterruptible(.pipe_write, id);
         if (br == .signalled) {
             const f2 = p.lock.acquireIrqSave();
-            p.blocked_writer_pid = 0xFF;
+            // Clear only OUR registration — see read()'s .signalled path.
+            if (p.blocked_writer_pid == my_pid) p.blocked_writer_pid = 0xFF;
             p.lock.releaseIrqRestore(f2);
             if (pushed_data) fdpoll.wakePollers(.pipe, id);
             return written;
@@ -310,66 +349,99 @@ pub fn tryWrite(id: u8, data: []const u8) usize {
 /// Decrement the reader refcount. If it hits zero AND no writers remain, free
 /// the pipe slot. Wakes any blocked writer (so it sees readers==0 and returns
 /// EPIPE instead of sleeping forever).
+///
+/// Runs under the pipe lock (2026-07-16). Unlocked, this raced the writer's
+/// park in write(): the closer could read blocked_writer_pid before the
+/// writer published it, while the writer read readers==1 before the
+/// decrement landed — a plain interleaving where neither the EPIPE-check
+/// nor the wake fires, leaving the writer parked forever. The lock forces
+/// the ordering: either the closer sees the registration (and wakes), or
+/// the parking side sees the new refcount (and returns EPIPE/EOF). It also
+/// makes the `readers -= 1` RMW atomic against a concurrent close/addReader
+/// on another CPU (lost update → premature free or slot leak).
 pub fn closeReader(id: u8) void {
     if (id >= MAX_PIPES) return;
     const p = &pipes[id];
-    if (!p.in_use) return;
-    if (p.readers > 0) p.readers -= 1;
-
-    if (p.blocked_writer_pid != 0xFF) {
-        const w = p.blocked_writer_pid;
-        p.blocked_writer_pid = 0xFF;
-        process.wake(w);
+    const flags = p.lock.acquireIrqSave();
+    if (!p.in_use) {
+        p.lock.releaseIrqRestore(flags);
+        return;
     }
+    if (p.readers > 0) p.readers -= 1;
+    // Capture the wake target under the lock, wake AFTER release —
+    // process.wake may take sched_lock, which must never nest under the
+    // (cli-held) pipe leaf lock. Same pattern as read()/write().
+    var w: u8 = 0xFF;
+    if (p.blocked_writer_pid != 0xFF) {
+        w = p.blocked_writer_pid;
+        p.blocked_writer_pid = 0xFF;
+    }
+    if (p.readers == 0 and p.writers == 0) {
+        p.in_use = false;
+    }
+    p.lock.releaseIrqRestore(flags);
+    if (w != 0xFF) process.wake(w);
 
     // readers→0 means any POLLOUT poller now has to see POLLERR (next
     // write would EPIPE). Wake regardless of whether refcount actually
     // hit zero — pollers may have been racing in.
     fdpoll.wakePollers(.pipe, id);
-
-    if (p.readers == 0 and p.writers == 0) {
-        p.in_use = false;
-    }
 }
 
 /// Decrement the writer refcount. If it hits zero AND no readers remain, free
 /// the pipe slot. Wakes any blocked reader (so it sees writers==0 and returns
 /// 0 / EOF instead of sleeping forever).
+///
+/// Locking rationale: see closeReader. This side is the one ordinary
+/// pipeline teardown exercises — the producer of `a | b` exiting (lifecycle
+/// closePipeFds) while the consumer is parked in read() on another CPU.
 pub fn closeWriter(id: u8) void {
     if (id >= MAX_PIPES) return;
     const p = &pipes[id];
-    if (!p.in_use) return;
-    if (p.writers > 0) p.writers -= 1;
-
-    if (p.blocked_reader_pid != 0xFF) {
-        const r = p.blocked_reader_pid;
-        p.blocked_reader_pid = 0xFF;
-        process.wake(r);
+    const flags = p.lock.acquireIrqSave();
+    if (!p.in_use) {
+        p.lock.releaseIrqRestore(flags);
+        return;
     }
+    if (p.writers > 0) p.writers -= 1;
+    var r: u8 = 0xFF;
+    if (p.blocked_reader_pid != 0xFF) {
+        r = p.blocked_reader_pid;
+        p.blocked_reader_pid = 0xFF;
+    }
+    if (p.readers == 0 and p.writers == 0) {
+        p.in_use = false;
+    }
+    p.lock.releaseIrqRestore(flags);
+    if (r != 0xFF) process.wake(r);
 
     // writers→0 means any POLLIN poller now sees POLLHUP (next read
     // returns 0/EOF). Wake unconditionally — same reasoning as closeReader.
     fdpoll.wakePollers(.pipe, id);
-
-    if (p.readers == 0 and p.writers == 0) {
-        p.in_use = false;
-    }
 }
 
 /// Bump the reader refcount — used by sysExecAs when a parent's read-end fd
 /// is inherited by a child (logical "dup"), so that the parent later closing
 /// its end doesn't drop the count to zero while the child is still reading.
+/// Locked: the +|= RMW racing a concurrent closeReader's -= on another CPU
+/// (spawn inheriting while a sibling exits) could lose the increment —
+/// refcount hits zero early, slot frees and gets reallocated while this
+/// process's fd still points at it.
 pub fn addReader(id: u8) void {
     if (id >= MAX_PIPES) return;
-    if (!pipes[id].in_use) return;
-    pipes[id].readers +|= 1;
+    const p = &pipes[id];
+    const flags = p.lock.acquireIrqSave();
+    if (p.in_use) p.readers +|= 1;
+    p.lock.releaseIrqRestore(flags);
 }
 
 /// Bump the writer refcount — same idea, for write-side inheritance.
 pub fn addWriter(id: u8) void {
     if (id >= MAX_PIPES) return;
-    if (!pipes[id].in_use) return;
-    pipes[id].writers +|= 1;
+    const p = &pipes[id];
+    const flags = p.lock.acquireIrqSave();
+    if (p.in_use) p.writers +|= 1;
+    p.lock.releaseIrqRestore(flags);
 }
 
 /// Walk every in-use pipe and verify ring invariants:
@@ -396,6 +468,14 @@ pub fn validate() bool {
         // so this CPU's IRQ0 can never interrupt a holder on THIS cpu; a
         // holder on another CPU releases within one memcpy.
         const flags = p.lock.acquireIrqSave();
+        // Re-check in_use under the lock: the unlocked check above can race
+        // a concurrent close freeing the slot, and a freed slot legally
+        // retains count>0 with readers==writers==0 (undrained data at
+        // close) — sampling that would false-flag the orphan invariant.
+        if (!p.in_use) {
+            p.lock.releaseIrqRestore(flags);
+            continue;
+        }
         const head = p.head;
         const tail = p.tail;
         const count = p.count;
