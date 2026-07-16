@@ -746,6 +746,56 @@ fn printHit(slot: u8, e: *const WatchEntry, rsp: u64, saved_rip: u64, full: bool
             rbp = next;
         }
     }
+
+    // Raw return-address scan of the interrupted stack. ReleaseSafe omits
+    // frame pointers in most functions, so the rbp walk above usually
+    // produces one or two junk frames — this scan finds every qword on the
+    // stack that decodes to a plausible kernel-text return site instead.
+    // Noisy by design (stale values included); read it as "the set of
+    // functions recently live on this stack", newest first.
+    const int_rsp = stack[20];
+    if (int_rsp >= 0xFFFF_8000_0000_0000 and (int_rsp & 7) == 0) {
+        serial.print("  RA scan (raw, from interrupted RSP):\n", .{});
+        const sp: [*]const u64 = @ptrFromInt(int_rsp);
+        var printed: u32 = 0;
+        var k: usize = 0;
+        while (k < 192 and printed < 24) : (k += 1) {
+            const v = sp[k];
+            if (v < 0xFFFF_FFFF_8000_0000) continue;
+            const r = symbols.resolveKernel(v) orelse continue;
+            if (r.offset >= 0x8000) continue; // data symbol / wild — not a call site
+            serial.print("    rsp+0x{X:0>3}: 0x{X:0>16}  {s}+0x{X}\n", .{ k * 8, v, r.name, r.offset });
+            printed += 1;
+        }
+    }
+
+    // Decode the watched address against procs[] — WHICH pid and field
+    // offset — plus the low pids' stack geometry, so cross-stack aliasing
+    // is readable straight off the dump.
+    {
+        const process = @import("../proc/process.zig");
+        const procs_base = @intFromPtr(&process.procs[0]);
+        const pcb_size = @sizeOf(process.PCB);
+        serial.print("  procs[] decode: base=0x{X} sizeof(PCB)=0x{X} off(kernel_esp)=0x{X}\n", .{
+            procs_base, pcb_size, @offsetOf(process.PCB, "kernel_esp"),
+        });
+        if (e.addr >= procs_base and e.addr < procs_base + pcb_size * process.MAX_PROCS) {
+            const rel: usize = @intCast(e.addr - procs_base);
+            serial.print("  watched addr = procs[{d}] + 0x{X}\n", .{ rel / pcb_size, rel % pcb_size });
+        }
+        var pid: usize = 0;
+        while (pid < 10) : (pid += 1) {
+            const p = &process.procs[pid];
+            const top = @atomicLoad(usize, &process.expected_kstack_tops[pid], .monotonic);
+            serial.print("  pid{d} '{s}' state={d} kesp=0x{X:0>16} kstack_top=0x{X:0>16}\n", .{
+                pid,
+                std.mem.sliceTo(&p.name, 0),
+                @intFromEnum(@atomicLoad(@TypeOf(p.state), &p.state, .monotonic)),
+                @atomicLoad(usize, &p.kernel_esp, .monotonic),
+                top,
+            });
+        }
+    }
 }
 
 // ----------- C.1: kernel_esp watchdog on user PIDs ----------------------
@@ -919,32 +969,49 @@ fn isLegitKernelEspWriter(rip: u64, addr: u64) bool {
     const process = @import("../proc/process.zig");
     const config = @import("../config.zig");
 
-    // Step 1: identify the writer first. Any write from outside the known
-    // legit functions is wild regardless of value/PCB-state.
-    const r = symbols.resolveKernel(rip) orelse return false;
-    // After commit ??? these moved from proc.process.* to proc.lifecycle.*.
-    // Re-exports in process.zig don't change the symbol the linker assigns to
-    // the function BODY — that stays in lifecycle.zig — so the resolver
-    // returns "proc.lifecycle.X" for any RIP inside one of these now. Accept
-    // both prefixes so the whitelist survives the split.
-    const is_create =
-        std.mem.eql(u8, r.name, "proc.lifecycle.create") or
-        std.mem.eql(u8, r.name, "proc.lifecycle.cloneCurrent") or
-        std.mem.eql(u8, r.name, "proc.lifecycle.createKernelIdle") or
-        std.mem.eql(u8, r.name, "proc.lifecycle.createKernelTask") or
-        std.mem.eql(u8, r.name, "proc.lifecycle.forkCurrent") or
-        std.mem.eql(u8, r.name, "proc.process.create") or
-        std.mem.eql(u8, r.name, "proc.process.cloneCurrent") or
-        std.mem.eql(u8, r.name, "proc.process.createKernelIdle") or
-        std.mem.eql(u8, r.name, "proc.process.createKernelTask") or
-        std.mem.eql(u8, r.name, "proc.process.forkCurrent");
-    const is_switch = std.mem.eql(u8, r.name, "proc.sched_asm.switchTo");
+    // Step 1: identify the writer. switchTo — the steady-state writer, hit on
+    // every context switch — is matched by COMPILE-TIME ADDRESS RANGE, before
+    // any symbol lookup. KERNEL.SYM is loaded from disk at boot and can drift
+    // from the running kernel (kernel.elf rebuilt without repacking the symbol
+    // table — the boot path already shouts "BUILD ID MISMATCH" when it does).
+    // Under drift switchTo's RIP resolves to whatever symbol sat at its
+    // address in the STALE table, a name-only is_switch goes false, and this
+    // predicate wrongly rejects a legitimate save → a phantom cross-stack-
+    // alias panic ~30 s into every stale-table boot. `&sched_asm.switchTo` is
+    // linker-resolved, immune to that drift. (Root-caused 2026-07-16.)
+    const sched_asm = @import("../proc/sched_asm.zig");
+    const switch_lo = @intFromPtr(&sched_asm.switchTo);
+    // switchTo is hand-written naked asm ~0x34 bytes; 0x100 is a generous
+    // ceiling that still can't reach an unrelated kernel_esp writer.
+    const is_switch = rip >= switch_lo and rip < switch_lo + 0x100;
+
+    // The create/bulk-copy writers are rarer (task creation only) and have no
+    // single naked-asm body to range-check, so they stay name-based — a stale
+    // table only mis-gates a creation-time write, not the every-switch path
+    // that caused the crash. resolveKernel-null only matters for these.
+    const is_create = !is_switch and blk: {
+        const r = symbols.resolveKernel(rip) orelse break :blk false;
+        // After the process→lifecycle split the resolver returns
+        // "proc.lifecycle.X" for these bodies; accept both prefixes.
+        break :blk std.mem.eql(u8, r.name, "proc.lifecycle.create") or
+            std.mem.eql(u8, r.name, "proc.lifecycle.cloneCurrent") or
+            std.mem.eql(u8, r.name, "proc.lifecycle.createKernelIdle") or
+            std.mem.eql(u8, r.name, "proc.lifecycle.createKernelTask") or
+            std.mem.eql(u8, r.name, "proc.lifecycle.forkCurrent") or
+            std.mem.eql(u8, r.name, "proc.process.create") or
+            std.mem.eql(u8, r.name, "proc.process.cloneCurrent") or
+            std.mem.eql(u8, r.name, "proc.process.createKernelIdle") or
+            std.mem.eql(u8, r.name, "proc.process.createKernelTask") or
+            std.mem.eql(u8, r.name, "proc.process.forkCurrent");
+    };
     // memcpy/memset called from resetPcbExceptState during create — the
     // bulk PCB zero. Whitelisted unconditionally; the explicit caller-side
     // store immediately after IS what we want the watch to validate.
-    const is_bulk_copy =
-        std.mem.eql(u8, r.name, "memcpy") or
-        std.mem.eql(u8, r.name, "memset");
+    const is_bulk_copy = !is_switch and !is_create and blk: {
+        const r = symbols.resolveKernel(rip) orelse break :blk false;
+        break :blk std.mem.eql(u8, r.name, "memcpy") or
+            std.mem.eql(u8, r.name, "memset");
+    };
     if (!is_create and !is_switch and !is_bulk_copy) return false;
 
     // Create-path AND bulk-copy writes can happen BEFORE expected_kstack_tops
