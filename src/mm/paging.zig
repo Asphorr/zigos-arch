@@ -466,6 +466,16 @@ pub fn setRangeWriteCombining(phys: u64, size: u64) void {
     var p = phys & ~@as(u64, 0x1FFFFF);
     const end = (phys + size + 0x1FFFFF) & ~@as(u64, 0x1FFFFF);
 
+    // Physmap PDEs are global — must flush globals or the WC upgrade is
+    // invisible to the CPU until eviction. `defer`, not a call after the
+    // loop: the OOM bail below returns from the middle of the range with
+    // earlier PDEs already flipped WB→WC, and SDM Vol 3A §4.10.4.1 requires
+    // invalidation after changing the memory type of a live entry. Leaving
+    // those unflushed is invisible under QEMU (the hypervisor's own MTRR
+    // handling papers over it) and on real hardware opens a window where
+    // part of the framebuffer is still write-back.
+    defer flushTLBGlobal();
+
     while (p < end) {
         const pdpt_idx = (p >> 30) & 0x1FF;
         var pdpte = pdpt[pdpt_idx];
@@ -504,9 +514,6 @@ pub fn setRangeWriteCombining(phys: u64, size: u64) void {
         }
         p += 0x200000;
     }
-    // Physmap PDEs are global — must flush globals or the WC upgrade
-    // is invisible to the CPU until eviction.
-    flushTLBGlobal();
 }
 
 /// Ensure a physical address range is identity-mapped via 2MB pages.
