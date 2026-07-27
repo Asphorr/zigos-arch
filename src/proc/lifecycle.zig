@@ -11,9 +11,11 @@
 //!     dispatch lands in the right ring-3 RIP/RSP.
 //!   * kernelIdle + createKernelIdle / createIdleProcess / createKernelTask
 //!     — kernel-mode PCBs (one idle per CPU, plus desktop and friends).
-//!   * setInflightSlot / clearInflightSlot / reclaimInflightSlot — swap-
-//!     evict in-flight slot bookkeeping (so a thread killed mid-swap doesn't
-//!     leak its NVMe slot).
+//!   * setInflightSlot / clearInflightSlot / reclaimInflightSlot and the
+//!     setInflightFrame / clearInflightFrame / reclaimInflightFrame mirror —
+//!     in-flight swap bookkeeping, so a thread killed while parked in
+//!     blockOn(.nvme_io) leaks neither its NVMe slot (evict direction) nor
+//!     its freshly allocated frame (swap-in direction).
 //!   * tearDownTask + the kill / destroy / reap surface
 //!     (killProcessWithStatus, killProcess, destroyCurrentWithStatus,
 //!     destroyCurrent, reapZombie, findZombieChild, reparentChildren,
@@ -774,13 +776,47 @@ pub fn clearInflightSlot() void {
 
 /// Release any in-flight swap slot owned by `pid` so it isn't leaked when
 /// the thread is torn down. Called from kill / destroy paths just before
-/// freeing the PCB. Idempotent — clears the field after freeing.
+/// freeing the PCB. Idempotent — the exchange makes exactly one caller the
+/// owner, so a racing clearInflightSlot can't produce a double free.
 pub fn reclaimInflightSlot(pid: usize) void {
     if (pid >= MAX_PROCS) return;
-    const cur = @atomicLoad(u32, &process.procs[pid].swap_inflight_slot, .acquire);
+    // Exchange, not load-then-store: whoever reads a real slot out of the
+    // channel owns it, and everyone else reads NO_SLOT. Two callers can no
+    // longer both see the same slot and both free it.
+    const cur = @atomicRmw(u32, &process.procs[pid].swap_inflight_slot, .Xchg, 0xFFFFFFFF, .acq_rel);
     if (cur == 0xFFFFFFFF) return;
-    @atomicStore(u32, &process.procs[pid].swap_inflight_slot, 0xFFFFFFFF, .release);
     swap.freeSlot(cur);
+}
+
+/// Publish the frame `swapInFrame` is reading into, across the blocking
+/// readPage. Counterpart of setInflightSlot for the swap-IN direction; see the
+/// `swap_inflight_frame` comment in process.zig for why the leak it prevents
+/// is self-amplifying.
+pub fn setInflightFrame(frame: usize) void {
+    const cur = smp.myCpu().current_pid orelse return;
+    @atomicStore(usize, &process.procs[cur].swap_inflight_frame, frame, .release);
+}
+
+pub fn clearInflightFrame() void {
+    const cur = smp.myCpu().current_pid orelse return;
+    @atomicStore(usize, &process.procs[cur].swap_inflight_frame, 0, .release);
+}
+
+/// Release any in-flight swap-in frame owned by `pid`. Same exchange-owns-it
+/// discipline as reclaimInflightSlot.
+///
+/// Caveat, inherited rather than introduced: the NVMe read that was filling
+/// this frame may still be in flight, so the frame can be handed back to the
+/// PMM while a DMA write is pending against it. That is the same exposure the
+/// existing writePage/CID reclaims already accept (a late CQE lands in reapCq's
+/// orphan branch) — fixing it properly means teaching the NVMe layer to hold a
+/// reference on the target buffer, which is a separate job. Leaking every such
+/// frame instead is strictly worse: it is unbounded and it compounds.
+pub fn reclaimInflightFrame(pid: usize) void {
+    if (pid >= MAX_PROCS) return;
+    const cur = @atomicRmw(usize, &process.procs[pid].swap_inflight_frame, .Xchg, 0, .acq_rel);
+    if (cur == 0) return;
+    pmm.freeFrame(cur);
 }
 
 /// Walk a dying process's fd_table and close any pipe fds so the pipe pool's
@@ -927,6 +963,13 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp, persist_shared_dirty: 
     // slot would leak. Reclaim it before the AS teardown frees the in-flight
     // frame via teardownNonPresent. (Reviewer-caught 2026-05-23.)
     reclaimInflightSlot(pid);
+
+    // Mirror for the swap-IN direction: a thread killed while parked in
+    // blockOn(.nvme_io) inside swapInFrame's readPage holds a freshly
+    // allocated frame that no PTE and no other field names (the PTE still
+    // reads SWAPPED, so the AS teardown below frees the slot and never the
+    // frame). Without this the 4 KiB is gone for the uptime of the machine.
+    reclaimInflightFrame(pid);
 
     // Same hazard for the FS read path: a thread killed while parked in
     // nvme.readSectorsPipelined's wave-wait holds up to PIPELINE_DEPTH NVMe

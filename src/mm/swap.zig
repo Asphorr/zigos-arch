@@ -371,6 +371,16 @@ pub fn teardownNonPresent(pte_ptr: *u64) bool {
 ///   - Phase-3 CAS fails → teardownNonPresent (or unmapUserRange's racing
 ///     PRESENT-branch) wiped the PTE and already freed the frame. freeSlot,
 ///     wake waiters, return false — no freeFrame here.
+///
+/// Slot ownership (the rule the phases exist to preserve): the slot is named by
+/// exactly ONE owner at every instant — this stack frame before phase 1's CAS,
+/// the PCB channel (`swap_inflight_slot`) across the blocking writePage, the
+/// SWAPPED PTE after phase 3. Two simultaneous names means a kill frees the
+/// slot twice and can hand a live slot back to the allocator; zero names means
+/// it leaks. Each handoff therefore runs under `spinlock.pinPreemption` —
+/// this code IS preemptible (device-IRQ epilogue → check_and_preempt_dynirq →
+/// schedule), and a thread demoted to .ready is torn down by
+/// killProcessWithStatus's case 3 without waiting for it to finish.
 pub fn evictFrame(pte_ptr: *u64, va: usize, pcid: u16) bool {
     // Non-atomic snapshot is fine because the CAS below rejects a stale
     // sample, but promote to atomicLoad for consistency with the sibling
@@ -399,18 +409,28 @@ pub fn evictFrame(pte_ptr: *u64, va: usize, pcid: u16) bool {
 
     // --- Phase 1: claim the page via CAS to the in-flight encoding ---
     const inflight = makeInflightPte(frame);
+    // Pin across [CAS, setInflightSlot]. In that gap the slot is named ONLY by
+    // this stack frame while the PTE already reads in-flight, so a kill landing
+    // there leaks it: teardownNonPresent takes the in-flight branch and frees
+    // the FRAME, and nothing frees the slot. Kernel code is preemptible here —
+    // a device IRQ (most often our own NVMe) sets dynirq_preempt_pending and
+    // check_and_preempt_dynirq calls schedule() from the stub epilogue; no
+    // spinlock is held across swap I/O by design, so the pin is otherwise 0.
+    const pin1 = spinlock.pinPreemption();
     if (@cmpxchgStrong(u64, pte_ptr, original, inflight, .seq_cst, .seq_cst)) |_| {
         // Lost the race — another CPU evicted, the page was unmapped, or it
         // got modified between the read and the CAS. Bail with no side effects
         // beyond the slot bookkeeping.
-        if (etrace) debug.klog("[mtswap-trace] pid={d} cpu{d} evict_p1_cas_lost va=0x{X}\n", .{ evict_pid, ecpu, va });
         freeSlot(slot);
+        spinlock.unpinPreemption(pin1);
+        if (etrace) debug.klog("[mtswap-trace] pid={d} cpu{d} evict_p1_cas_lost va=0x{X}\n", .{ evict_pid, ecpu, va });
         return false;
     }
     // Publish the in-flight slot to the calling thread's PCB so process
     // teardown can free it if this thread is killed mid-writePage. Cleared
     // again at phase-3 commit / writePage-fail rollback.
     process.setInflightSlot(slot);
+    spinlock.unpinPreemption(pin1);
     if (etrace) debug.klog("[mtswap-trace] pid={d} cpu{d} evict_p2_shootdown_begin va=0x{X} slot={d}\n", .{ evict_pid, ecpu, va, slot });
     // Shootdown BEFORE writePage so peers' TLBs can't satisfy writes via the
     // pre-CAS PRESENT entry. After shootdownPage returns, every CPU has
@@ -431,28 +451,58 @@ pub fn evictFrame(pte_ptr: *u64, va: usize, pcid: u16) bool {
         if (@cmpxchgStrong(u64, pte_ptr, inflight, original, .seq_cst, .seq_cst) == null) {
             tlb.shootdownPage(pcid, va);
         }
+        // Clear + free as one indivisible step. Between them the slot is named
+        // by nobody — the PTE is PRESENT again and the PCB channel is already
+        // empty — so a kill in that gap leaks it. (Before the clear the pair is
+        // consistent: reclaimInflightSlot frees the slot, destroyAddressSpace
+        // frees the frame via the PRESENT path.) The shootdown stays OUTSIDE
+        // the pin — doShootdown pins on its own account and waits for acks.
+        const pin_rb = spinlock.pinPreemption();
         process.clearInflightSlot();
         freeSlot(slot);
+        spinlock.unpinPreemption(pin_rb);
         wakeSwapEvictWaiters(evictWaitTarget(pte_ptr));
         return false;
     }
 
     // --- Phase 3: commit by transitioning in-flight → SWAPPED ---
     if (etrace) debug.klog("[mtswap-trace] pid={d} cpu{d} evict_p3_commit_begin\n", .{ evict_pid, ecpu });
+    // Hand the slot from the PCB channel to the PTE: clear the channel BEFORE
+    // the CAS publishes the slot, and pin across the handoff.
+    //
+    // Ordering is the whole point. Clearing AFTER the CAS leaves a window where
+    // the slot is named TWICE — by the freshly-written SWAPPED PTE and by the
+    // still-populated PCB field. A kill landing there frees it twice:
+    // reclaimInflightSlot releases it from the PCB, then destroyAddressSpace →
+    // teardownNonPresent sees the SWAPPED PTE and releases the SAME slot again.
+    // If any CPU ran allocSlot in between, that second free un-allocates a LIVE
+    // slot belonging to its new owner — two pages then share 4 KiB of swap and
+    // swap-in hands back another process's data, plus used_count drifts toward
+    // a premature SwapFull. freeSlot's double-free kwarn does NOT catch that
+    // case: the bit has been set again by the new owner, so the second free
+    // looks legitimate and passes silently. Only the harmless interleaving
+    // (nobody re-allocated) trips the warning.
+    //
+    // Clearing first makes the slot named by exactly one owner at every
+    // instant, and the pin covers the gap where it is named by neither. The
+    // pin is honoured by check_and_preempt_dynirq, which DEFERS the reschedule
+    // rather than dropping it.
+    const pin3 = spinlock.pinPreemption();
+    process.clearInflightSlot();
     if (@cmpxchgStrong(u64, pte_ptr, inflight, makeSwapPte(slot), .seq_cst, .seq_cst)) |_| {
         // Phase-3 CAS failed → PTE was cleared by either teardownNonPresent or
         // unmapUserRange's PRESENT-branch race (which already freed the frame).
         // Don't double-free. The slot holds data nobody will ever read; free it.
-        if (etrace) debug.klog("[mtswap-trace] pid={d} cpu{d} evict_p3_cas_lost\n", .{ evict_pid, ecpu });
-        process.clearInflightSlot();
         freeSlot(slot);
+        spinlock.unpinPreemption(pin3);
+        if (etrace) debug.klog("[mtswap-trace] pid={d} cpu{d} evict_p3_cas_lost\n", .{ evict_pid, ecpu });
         wakeSwapEvictWaiters(evictWaitTarget(pte_ptr));
         return false;
     }
+    spinlock.unpinPreemption(pin3);
     // Frame is no longer referenced by any PTE; release it. No shootdown
     // needed here — phase 1's shootdown already cleared the present mapping,
     // and the in-flight→SWAPPED transition keeps PRESENT=0.
-    process.clearInflightSlot();
     pmm.freeFrame(frame);
     wakeSwapEvictWaiters(evictWaitTarget(pte_ptr));
     if (etrace) debug.klog("[mtswap-trace] pid={d} cpu{d} evict_done slot={d}\n", .{ evict_pid, ecpu, slot });
@@ -491,6 +541,18 @@ fn wakeSwapEvictWaiters(target: u32) void {
 pub fn discardFrame(pte_ptr: *u64, va: usize, pcid: u16) bool {
     const original = @atomicLoad(u64, pte_ptr, .acquire);
     if ((original & paging.PRESENT) == 0) return false;
+    // Re-check DIRTY on OUR sample, not just the caller's. The caller
+    // (fault.zig's reclaim sweep) tested DIRTY on a different, earlier read;
+    // in the gap a user thread on another CPU can write the page and the CPU
+    // sets DIRTY with a locked RMW. We would then load an already-dirty PTE
+    // into `original`, CAS it against itself successfully, and drop a page
+    // holding a user write — the next fault reloads the stale image from
+    // `source` and the write is silently gone. A caller-side check cannot
+    // close this: there is always a gap between its read and ours (with
+    // mtswap-trace on, a klog sits in it). Re-checking here IS airtight,
+    // because from this load onward any write must set DIRTY, which changes
+    // the PTE and makes the CAS below fail.
+    if ((original & paging.DIRTY) != 0) return false;
     const frame = original & paging.PAGE_MASK;
     if (pmm.frameRefCount(frame) != 1) return false;
     // CAS to 0 so a concurrent evictor / teardown of the same VA can't both
@@ -553,14 +615,23 @@ pub fn swapInFrame(pte_ptr: *u64, va: usize, flags: u64, pcid: u16) bool {
         });
         return false;
     };
+    // Publish the frame before readPage parks us in blockOn(.nvme_io). Until
+    // the CAS below installs it, this PCB field is the ONLY name for it: the
+    // PTE still reads SWAPPED, so a teardown frees the slot and would walk
+    // straight past the frame. Same channel discipline as the evict path's
+    // swap_inflight_slot — see evictFrame's ownership note.
+    process.setInflightFrame(frame);
     if (cur_pid >= 4) debug.klog("[mtswap-trace] pid={d} cpu{d} swapIn readPage frame=0x{X}...\n", .{
         cur_pid, smp.myCpu().cpu_id, frame,
     });
     if (!readPage(slot, frame)) {
+        const pin_rf = spinlock.pinPreemption();
+        process.clearInflightFrame();
+        pmm.freeFrame(frame);
+        spinlock.unpinPreemption(pin_rf);
         if (cur_pid >= 4) debug.klog("[mtswap-trace] pid={d} cpu{d} swapIn readPage FAILED\n", .{
             cur_pid, smp.myCpu().cpu_id,
         });
-        pmm.freeFrame(frame);
         return false;
     }
     if (cur_pid >= 4) debug.klog("[mtswap-trace] pid={d} cpu{d} swapIn readPage OK, CAS...\n", .{
@@ -570,8 +641,17 @@ pub fn swapInFrame(pte_ptr: *u64, va: usize, flags: u64, pcid: u16) bool {
     // PTEs / free the slot. The loser frees its freshly-read frame; the
     // slot was already freed by whoever moved the PTE on.
     const new_pte = (frame & paging.PAGE_MASK) | flags | paging.PRESENT;
+    // Hand the frame from the PCB channel to the PTE, clearing first and
+    // pinning across the handoff — exactly the phase-3 ordering rule, and for
+    // the same reason: while both name the frame, a kill frees it twice
+    // (reclaimInflightFrame from the channel, then destroyAddressSpace from the
+    // now-PRESENT PTE), and a double-freed frame comes back out of the PMM to a
+    // second owner.
+    const pin_in = spinlock.pinPreemption();
+    process.clearInflightFrame();
     if (@cmpxchgStrong(u64, pte_ptr, original, new_pte, .seq_cst, .seq_cst)) |_| {
         pmm.freeFrame(frame);
+        spinlock.unpinPreemption(pin_in);
         if (cur_pid >= 4) debug.klog("[mtswap-trace] pid={d} cpu{d} swapIn CAS_LOST post=0x{X}\n", .{
             cur_pid, smp.myCpu().cpu_id, @atomicLoad(u64, pte_ptr, .acquire),
         });
@@ -588,6 +668,7 @@ pub fn swapInFrame(pte_ptr: *u64, va: usize, flags: u64, pcid: u16) bool {
         // more spot those sweeps missed.
         return true;
     }
+    spinlock.unpinPreemption(pin_in);
     if (cur_pid >= 4) debug.klog("[mtswap-trace] pid={d} cpu{d} swapIn CAS_WON shootdown va=0x{X}\n", .{
         cur_pid, smp.myCpu().cpu_id, va,
     });

@@ -260,6 +260,15 @@ pub const PCB = struct {
     // success, clears at phase-3 / writePage-fail. Atomic so killProcess can
     // read it safely from another CPU.
     swap_inflight_slot: u32 = 0xFFFFFFFF, // (a) cross-CPU readable by killProcess
+    // Mirror of the above for the swap-IN direction: the frame swapInFrame
+    // allocated and is reading into, published across the blocking readPage.
+    // 0 = none (frame 0 is never a user page). Without it a thread killed while
+    // parked in blockOn(.nvme_io) inside readPage leaks 4 KiB permanently — the
+    // frame is in no PTE (the PTE still reads SWAPPED, so teardown frees only
+    // the slot) and in no PCB field, so nothing can find it. That leak lands
+    // exactly under memory pressure, where swap-in parks and OOM-kills cluster,
+    // so it feeds back into the pressure that caused it.
+    swap_inflight_frame: usize = 0, // (a) cross-CPU readable by killProcess
     // Process name (for window titles / icon matching)
     name: [16]u8 = [_]u8{0} ** 16, // (c) set at create/exec
     name_len: u8 = 0, // (c)
@@ -1065,6 +1074,9 @@ pub const createKernelTask = @import("lifecycle.zig").createKernelTask;
 pub const setInflightSlot = @import("lifecycle.zig").setInflightSlot;
 pub const clearInflightSlot = @import("lifecycle.zig").clearInflightSlot;
 pub const reclaimInflightSlot = @import("lifecycle.zig").reclaimInflightSlot;
+pub const setInflightFrame = @import("lifecycle.zig").setInflightFrame;
+pub const clearInflightFrame = @import("lifecycle.zig").clearInflightFrame;
+pub const reclaimInflightFrame = @import("lifecycle.zig").reclaimInflightFrame;
 pub const killProcessWithStatus = @import("lifecycle.zig").killProcessWithStatus;
 pub const killProcess = @import("lifecycle.zig").killProcess;
 pub const killThreadGroup = @import("lifecycle.zig").killThreadGroup;
