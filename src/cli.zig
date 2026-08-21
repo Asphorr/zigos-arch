@@ -145,6 +145,9 @@ pub fn execute(cmd: []const u8) void {
         printCmd("gpu", "Detect display controllers (vendor/family/resources)");
         printCmd("uas", "Report detected USB Attached SCSI (UAS) device");
         printCmd("thermal", "CPU temperature / power (RAPL) / effective freq");
+        printSection("Disks");
+        printCmd("lsblk", "Partition table of the install target disk");
+        printCmd("mkdisk go", "Partition + format the install target (ERASES it)");
     } else if (std.mem.eql(u8, cmd, "clear")) {
         vga.clear();
     } else if (std.mem.eql(u8, cmd, "ls")) {
@@ -250,6 +253,10 @@ pub fn execute(cmd: []const u8) void {
         @import("driver/xhci.zig").uasReport();
     } else if (std.mem.eql(u8, cmd, "thermal")) {
         cmdThermal();
+    } else if (std.mem.eql(u8, cmd, "lsblk")) {
+        cmdLsblk();
+    } else if (std.mem.eql(u8, cmd, "mkdisk") or std.mem.startsWith(u8, cmd, "mkdisk ")) {
+        cmdMkdisk(if (cmd.len > 7) cmd[7..] else "");
     } else {
         printErr("Unknown command: {s}\n", .{cmd});
         vga.fg = .DarkGray;
@@ -1038,6 +1045,208 @@ fn cmdBt() void {
         vga.print("  (no frames)\n", .{});
         vga.fg = .LightGray;
     }
+}
+
+// --- Disks -------------------------------------------------------------------
+//
+// These two drive the partitioning / mkfs machinery, which has no other user
+// yet. `lsblk` is the read-only half and safe to run any time; `mkdisk`
+// destroys the target disk and demands an explicit confirmation word so a
+// mistyped command can't do it.
+
+/// Prints the GPT on the install target, or explains why there isn't one.
+fn cmdLsblk() void {
+    const gpt = @import("fs/gpt.zig");
+
+    printSection("Install target");
+    const dev = gpt.targetDevice() orelse {
+        printErr("No install target disk attached\n", .{});
+        vga.fg = .DarkGray;
+        vga.print("  Expected an NVMe controller #3 — see run-uefi-ext2.sh\n", .{});
+        vga.fg = .LightGray;
+        return;
+    };
+
+    const mib = dev.sectors / 2048;
+    vga.print("  disk: {d} sectors ({d} MiB)\n", .{ dev.sectors, mib });
+
+    const table = gpt.parse(dev) orelse {
+        vga.fg = .DarkGray;
+        vga.print("  no valid GPT (run 'mkdisk go' to create one)\n", .{});
+        vga.fg = .LightGray;
+        return;
+    };
+
+    if (table.from_backup) {
+        vga.fg = .Yellow;
+        vga.print("  primary header was bad — read from the backup copy\n", .{});
+        vga.fg = .LightGray;
+    }
+    vga.print("  usable: {d}..{d}\n", .{ table.first_usable_lba, table.last_usable_lba });
+
+    var i: usize = 0;
+    while (i < table.count) : (i += 1) {
+        const p = table.parts[i];
+        vga.fg = .LightGreen;
+        vga.print("  {d}  ", .{p.index + 1});
+        vga.fg = .LightGray;
+        vga.print("{s: <12} {d: >8}..{d: <8} {d: >6} MiB {s}\n", .{
+            p.name[0..p.name_len],
+            p.start_lba,
+            p.end_lba,
+            p.sectorCount() / 2048,
+            if (p.isEsp()) "[ESP]" else "",
+        });
+    }
+    if (table.truncated) {
+        vga.fg = .Yellow;
+        vga.print("  (more partitions present than shown)\n", .{});
+        vga.fg = .LightGray;
+    }
+}
+
+/// Lays a fresh GPT on the install target: a 64 MiB EFI System Partition
+/// followed by an ext2 root filling the rest. Requires the literal argument
+/// "go" — this erases the disk.
+fn cmdMkdisk(arg: []const u8) void {
+    const gpt = @import("fs/gpt.zig");
+
+    if (!std.mem.eql(u8, arg, "go")) {
+        printErr("mkdisk ERASES the install target disk\n", .{});
+        vga.fg = .DarkGray;
+        vga.print("  Run 'mkdisk go' to confirm\n", .{});
+        vga.fg = .LightGray;
+        return;
+    }
+
+    const dev = gpt.targetDevice() orelse {
+        printErr("No install target disk attached\n", .{});
+        return;
+    };
+
+    // 64 MiB ESP — the size the firmware conventions expect, and enough for
+    // BOOTX64.EFI plus kernel.elf many times over. The root takes everything
+    // left between it and the backup table at the tail of the disk.
+    const esp_sectors: u64 = 64 * 2048;
+    // Both ends on 1 MiB boundaries — see gpt.ALIGN_SECTORS for why.
+    const esp_start = gpt.alignUp(gpt.FIRST_USABLE_LBA);
+    const esp_end = esp_start + esp_sectors - 1;
+    const root_start = esp_end + 1;
+    const root_end = gpt.alignEndDown(dev.sectors - 1 - gpt.ENTRY_ARRAY_SECTORS - 1);
+
+    if (root_start >= root_end) {
+        printErr("Target disk too small for a 64 MiB ESP plus a root\n", .{});
+        return;
+    }
+
+    printSection("Partitioning");
+    vga.print("  ESP   {d}..{d}\n", .{ esp_start, esp_end });
+    vga.print("  root  {d}..{d}\n", .{ root_start, root_end });
+
+    const specs = [_]gpt.PartSpec{
+        .{ .type_guid = gpt.TYPE_ESP, .start_lba = esp_start, .end_lba = esp_end, .name = "EFI System" },
+        .{ .type_guid = gpt.TYPE_LINUX_DATA, .start_lba = root_start, .end_lba = root_end, .name = "ZIGOS" },
+    };
+
+    if (!gpt.create(dev, &specs)) {
+        printErr("GPT write failed — see serial log\n", .{});
+        return;
+    }
+    vga.fg = .LightGreen;
+    vga.print("  GPT written\n", .{});
+    vga.fg = .LightGray;
+
+    // Read the table back through the parse path rather than trusting the
+    // write: a table only we can read is not a table.
+    const table = gpt.parse(dev) orelse {
+        printErr("Wrote a GPT our own parser rejects\n", .{});
+        return;
+    };
+    if (table.count != specs.len) {
+        printErr("Re-read found {d} partitions, wrote {d}\n", .{ table.count, specs.len });
+        return;
+    }
+    vga.fg = .LightGreen;
+    vga.print("  GPT verified by re-read\n", .{});
+    vga.fg = .LightGray;
+
+    // Formats run off the RE-READ table, not the specs we just built. If the
+    // partition table round-tripped wrong, the mkfs lands in the wrong place
+    // and the mistake is visible immediately rather than at first mount.
+    printSection("Formatting");
+
+    const fat_mkfs = @import("fs/fat32_mkfs.zig");
+    const ext2_mkfs = @import("fs/ext2/mkfs.zig");
+
+    for (table.parts[0..table.count]) |part| {
+        const sectors: u32 = @intCast(part.sectorCount());
+        const part_start: u32 = @intCast(part.start_lba);
+
+        if (part.isEsp()) {
+            vga.print("  {d}  FAT32 ({d} MiB)... ", .{ part.index + 1, sectors / 2048 });
+            if (!fat_mkfs.format(.{ .dev = dev, .part_lba = part_start, .part_sectors = sectors }, "ZIGOS ESP")) {
+                printErr("failed — see serial log\n", .{});
+                return;
+            }
+        } else {
+            vga.print("  {d}  ext2  ({d} MiB)... ", .{ part.index + 1, sectors / 2048 });
+            if (!ext2_mkfs.format(.{ .dev = dev, .part_lba = part_start, .part_sectors = sectors }, "ZIGOS")) {
+                printErr("failed — see serial log\n", .{});
+                return;
+            }
+        }
+        vga.fg = .LightGreen;
+        vga.print("ok\n", .{});
+        vga.fg = .LightGray;
+    }
+
+    if (!verifyFormats(dev, table)) return;
+
+    vga.fg = .LightGreen;
+    vga.print("\n  Target disk partitioned and formatted\n", .{});
+    vga.fg = .DarkGray;
+    vga.print("  Host check: sgdisk -v / e2fsck -fn / fsck.fat -n on install.img\n", .{});
+    vga.fg = .LightGray;
+}
+
+/// Reads back the signature bytes each formatter claims to have written. This
+/// is a smoke test, not a checker — the real oracles are the host's e2fsck and
+/// fsck.fat, which know things we do not. It exists to catch the failure mode
+/// where a format writes to the wrong LBA and reports success.
+fn verifyFormats(dev: @import("driver/block.zig").Device, table: @import("fs/gpt.zig").Table) bool {
+    const ext2_layout = @import("fs/ext2/layout.zig");
+
+    printSection("Verify");
+    for (table.parts[0..table.count]) |part| {
+        const part_start: u32 = @intCast(part.start_lba);
+        var buf: [512]u8 = undefined;
+
+        if (part.isEsp()) {
+            if (!dev.readSectors(part_start, 1, &buf)) {
+                printErr("  ESP read-back failed\n", .{});
+                return false;
+            }
+            if (buf[510] != 0x55 or buf[511] != 0xAA) {
+                printErr("  ESP boot signature missing\n", .{});
+                return false;
+            }
+            vga.print("  ESP  boot signature ok\n", .{});
+        } else {
+            // The ext2 superblock lives at byte 1024 of the partition — two
+            // sectors in — and carries its magic at offset 56.
+            if (!dev.readSectors(part_start + 2, 1, &buf)) {
+                printErr("  ext2 read-back failed\n", .{});
+                return false;
+            }
+            const magic = @as(u16, buf[56]) | (@as(u16, buf[57]) << 8);
+            if (magic != ext2_layout.MAGIC) {
+                printErr("  ext2 magic 0x{X} != 0x{X}\n", .{ magic, ext2_layout.MAGIC });
+                return false;
+            }
+            vga.print("  ext2 magic ok\n", .{});
+        }
+    }
+    return true;
 }
 
 fn printSymAddr(addr: u64, is_kernel: bool, app_table: ?*const symbols.SymTable) void {

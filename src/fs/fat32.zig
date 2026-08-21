@@ -23,8 +23,11 @@ const LFN_LAST_ENTRY: u8 = 0x40; // Flag on last LFN sequence entry
 const LFN_SEQ_MASK: u8 = 0x1F; // Sequence number mask (1-20)
 const MAX_LFN_LEN: usize = 255; // Max long filename length
 
-// BPB (BIOS Parameter Block) — FAT32 extended
-const BPB = extern struct {
+// BPB (BIOS Parameter Block) — FAT32 extended.
+// `pub` so fat32_mkfs.zig writes the same declaration this driver reads:
+// a formatter with its own private copy of the layout is a divergence waiting
+// to happen, and the comptime offset asserts below then only guard one side.
+pub const BPB = extern struct {
     jmp_boot: [3]u8,
     oem_name: [8]u8,
     bytes_per_sector: u16 align(1),

@@ -190,7 +190,7 @@ const Q_DEPTH: u16 = 16;
 /// completion ever arriving. Pre-fix `allocCid` scanned `i < Q_DEPTH`.
 const MAX_INFLIGHT: u16 = Q_DEPTH - 1;
 
-const MAX_CONTROLLERS: usize = 3; // 0 = tarfs, 1 = ext2, 2 = swap
+const MAX_CONTROLLERS: usize = 4; // 0 = tarfs, 1 = ext2 root, 2 = swap, 3 = install target
 const SECTOR_SIZE: u32 = 512;
 
 /// Compile-time toggle for the async I/O path. When **true** (default
@@ -347,6 +347,12 @@ const Controller = struct {
 
     nsid: u32 = 0, // (c) first active namespace ID
     block_size: u32 = SECTOR_SIZE, // (c)
+    /// (c) Namespace size in `block_size` units — Identify Namespace NSZE.
+    /// Every existing caller addresses a namespace whose extent it already
+    /// knows from outside (ext2's superblock, swap's compile-time slot
+    /// count), so this stayed unread until mkfs/GPT needed to lay out a
+    /// table across a disk whose size is not known a priori.
+    ns_sectors: u64 = 0,
 
     next_cid: u16 = 1, // (p:io_lock) allocCid bumps under io_lock
     initialized: bool = false, // (c) flipped true at end of initController, RO after
@@ -400,7 +406,11 @@ const Controller = struct {
     queue_full_retries: u64 = 0, // (p:io_lock) diagnostic counter
 };
 
-var controllers: [MAX_CONTROLLERS]Controller = .{ .{}, .{}, .{} };
+// Derived from MAX_CONTROLLERS rather than spelled out per element, so
+// raising the cap doesn't need a matching edit here (it did once, and the
+// mismatch is a build error rather than anything subtle — but a build error
+// is still churn this shape avoids).
+var controllers: [MAX_CONTROLLERS]Controller = [_]Controller{.{}} ** MAX_CONTROLLERS;
 var num_controllers: usize = 0;
 pub var irq_count: u64 = 0;
 
@@ -684,6 +694,15 @@ fn initController(c: *Controller, dev: pci.PciDevice, idx: usize) bool {
         return false;
     }
     const id_ns: [*]const u8 = @ptrFromInt(paging.physToVirt(ns_list_phys));
+    // NSZE (namespace size in logical blocks) is the first 8 bytes of the
+    // Identify Namespace structure, little-endian. Read before FLBAS so the
+    // size is recorded even on controllers we go on to refuse below.
+    {
+        var nsze: u64 = 0;
+        var b: u6 = 0;
+        while (b < 8) : (b += 1) nsze |= @as(u64, id_ns[b]) << (@as(u6, b) * 8);
+        c.ns_sectors = nsze;
+    }
     const flbas = id_ns[26];
     const lbaf_idx: usize = flbas & 0x0F;
     const lbads = id_ns[128 + lbaf_idx * 4 + 2];
@@ -2347,6 +2366,15 @@ pub fn maxSectorsPerCmd() u32 {
 /// dedicated device is present).
 pub fn controllerCount() usize {
     return num_controllers;
+}
+
+/// Namespace capacity of `ctrl_idx` in 512-byte sectors, or 0 if that
+/// controller was never initialized. Read from Identify Namespace at probe
+/// time, so no bus traffic here. Used by the partition/mkfs path, which has
+/// to lay out a table across a disk whose size it can't assume.
+pub fn namespaceSectors(ctrl_idx: usize) u64 {
+    if (ctrl_idx >= num_controllers) return 0;
+    return controllers[ctrl_idx].ns_sectors;
 }
 
 /// Commit any in-flight writes to non-volatile storage on the primary

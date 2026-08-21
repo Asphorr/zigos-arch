@@ -163,6 +163,114 @@ fn elfWriteTripwire(lba: u32, src: [*]const u8, ra: usize) void {
     }
 }
 
+// =============================================================================
+// Install target disk
+// =============================================================================
+//
+// A dedicated scratch disk that the partitioning and mkfs code writes to. It
+// exists as a separate device on purpose: `writeSectorsSecondary` addresses the
+// live ext2 root, so a mkfs aimed there would destroy the running system on its
+// first sector. Keeping the target a distinct index makes "format the wrong
+// disk" a compile-site choice rather than an off-by-one in an LBA.
+//
+// Only the NVMe backend carries one (the run scripts attach it as a fourth
+// controller). Under ata/ahci there is no fourth disk and `targetSectors()`
+// reports 0, which callers surface as "no install target present" — see
+// cli.zig's mkdisk command.
+
+/// NVMe controller index of the install target. 0 = tarfs, 1 = ext2 root,
+/// 2 = swap, 3 = target — the same ordering the run scripts attach.
+const TARGET_CTRL_IDX: usize = 3;
+
+/// A block device as a handle: how to reach its sectors, plus how many there
+/// are. Lives here rather than in a filesystem because "what a block device
+/// is" is this layer's question — `fs/gpt.zig` and `fs/ext2/mkfs.zig` both
+/// take one, and neither should have to depend on the other to say so.
+///
+/// `writeSectors` is optional: null means a read-only view, and the writers
+/// refuse such a device rather than trusting callers to keep track. That is
+/// the difference between a partition table you can inspect and one you can
+/// destroy, made visible in the type.
+pub const Device = struct {
+    readSectors: *const fn (lba: u32, count: u32, dest: [*]u8) bool,
+    writeSectors: ?*const fn (lba: u32, count: u32, src: [*]const u8) bool,
+    /// Capacity in 512-byte sectors.
+    sectors: u64,
+};
+
+/// Sectors per zero-fill command. Formatters zero large regions — a FAT copy
+/// is ~1000 sectors, an ext2 inode table 512 — and doing that one sector at a
+/// time means thousands of separate NVMe commands.
+///
+/// History: mkfs.fat32 originally wrote its FATs a sector at a time, 2032
+/// commands for the pair. That was slow, and on 2026-07-26 it also tripped
+/// `[nvme] waitCompletion timeout (qid=1 head=14 csts=0x1)` partway through —
+/// a completion the driver never reaped under sustained single-sector load.
+/// Batching cuts the command count ~32x and has been stable since. NOTE that
+/// this makes the driver issue worth investigating separately: fewer commands
+/// is a better shape, not a fix for whatever dropped that completion.
+pub const ZERO_CHUNK_SECTORS: u32 = 32;
+
+/// A run of zero bytes long enough for one batched command. `const` so it
+/// lives in rodata rather than costing .bss, and shared so the two formatters
+/// don't each carry a copy.
+const zero_chunk: [ZERO_CHUNK_SECTORS * 512]u8 = .{0} ** (ZERO_CHUNK_SECTORS * 512);
+
+/// Writes `count` zero sectors starting at `lba`, batching into multi-sector
+/// commands. Returns false on the first failed write.
+pub fn writeZeroRun(dev: Device, lba: u32, count: u32) bool {
+    const write = dev.writeSectors orelse return false;
+    var done: u32 = 0;
+    while (done < count) {
+        const chunk = @min(count - done, ZERO_CHUNK_SECTORS);
+        if (!write(lba + done, chunk, &zero_chunk)) return false;
+        done += chunk;
+    }
+    return true;
+}
+
+/// The install target as a writable Device, or null when no target disk is
+/// attached. The only constructor callers need today; the primary/secondary
+/// disks keep their direct entry points because their users predate this type.
+pub fn targetDevice() ?Device {
+    const n = targetSectors();
+    if (n == 0) return null;
+    return .{
+        .readSectors = readSectorsTarget,
+        .writeSectors = writeSectorsTarget,
+        .sectors = n,
+    };
+}
+
+/// Capacity of the install target in 512-byte sectors, or 0 when no target
+/// disk is attached. Callers must check this before issuing target I/O; it is
+/// the presence test, and 0 is the only "not here" signal (the read/write
+/// entry points below return false for real I/O errors, not for absence).
+pub fn targetSectors() u64 {
+    if (backend != .nvme) return 0;
+    return nvme.namespaceSectors(TARGET_CTRL_IDX);
+}
+
+/// Read from the install target. Returns false on a propagated I/O error or
+/// if no target disk is attached. Deliberately has no primary/secondary twin:
+/// the target is addressed only by the partitioning and mkfs paths.
+pub fn readSectorsTarget(lba: u32, count: u32, dest: [*]u8) bool {
+    if (backend != .nvme) return false;
+    return nvme.readSectorsOn(TARGET_CTRL_IDX, lba, count, dest);
+}
+
+/// Write to the install target. Returns false on a propagated I/O error or if
+/// no target disk is attached.
+///
+/// Unlike `writeSectorsSecondary` this path runs no ELF write-tripwire. That
+/// tripwire hunts a specific ext2-root corruptor by pattern-matching sector
+/// content, and mkfs legitimately writes bitmaps and zero-fill that would trip
+/// it; the target disk is also not the corruptor's victim by construction.
+pub fn writeSectorsTarget(lba: u32, count: u32, src: [*]const u8) bool {
+    if (backend != .nvme) return false;
+    return nvme.writeSectorsOn(TARGET_CTRL_IDX, lba, count, src);
+}
+
 /// Used by ata.zig for cross-CPU serialisation of legacy port I/O.
 /// AHCI is per-port and doesn't need a global lock; the call is a no-op
 /// in that backend so callers can use it unconditionally.

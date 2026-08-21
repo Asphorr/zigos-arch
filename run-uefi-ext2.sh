@@ -31,6 +31,15 @@ if [ ! -f swap.img ]; then
     echo "[run-uefi-ext2] Created swap.img (128 MiB swap disk)"
 fi
 
+# Install target — the scratch disk the in-kernel partitioner and mkfs write
+# to. Deliberately a separate device from ext2.img: the mkfs path must never be
+# able to address the live root. Not recreated if present, so a formatted image
+# survives across runs and can be inspected from the host with sgdisk/e2fsck.
+if [ ! -f install.img ]; then
+    dd if=/dev/zero of=install.img bs=1M count=256 status=none
+    echo "[run-uefi-ext2] Created install.img (256 MiB install target)"
+fi
+
 # Archive previous serial.log into crashes/ (last 20). Same scheme as run-uefi.sh.
 mkdir -p crashes
 if [ -f serial.log ]; then
@@ -81,6 +90,8 @@ VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json \
     -device nvme,drive=nvm_ext2,serial=zigos-ext2 \
     -drive file=swap.img,format=raw,if=none,id=nvm_swap \
     -device nvme,drive=nvm_swap,serial=zigos-swap \
+    -drive file=install.img,format=raw,if=none,id=nvm_install \
+    -device nvme,drive=nvm_install,serial=zigos-install \
     -serial file:serial.log "$@"
 
 # Post-mortem: parse [crash-fp] lines into crashes/db.csv and warn on dups.

@@ -38,6 +38,7 @@
 // by one per boot while the simulated mid-append crash is skipped every time.
 
 const pmem = @import("pmem.zig");
+const crc32 = @import("../util/crc32.zig");
 const debug = @import("../debug/debug.zig");
 
 const LOG_BASE: u64 = 64 * 1024; // 0x10000 — past the N2 header + pmemdax window
@@ -60,31 +61,11 @@ pub fn count() u64 {
     return committed;
 }
 
-// --- CRC-32 (ISO-HDLC / zlib, reflected poly 0xEDB88320) -------------------
-// Table-free Sarwate, exposed as a rolling start/feed/end so a record's crc can
-// be computed over its header slice and payload slice without copying them into
-// one contiguous buffer. Fine for the small records we checksum.
-
-fn crc32Start() u32 {
-    return 0xFFFFFFFF;
-}
-
-fn crc32Feed(crc_in: u32, bytes: []const u8) u32 {
-    var crc = crc_in;
-    for (bytes) |b| {
-        crc ^= b;
-        var k: u8 = 0;
-        while (k < 8) : (k += 1) {
-            const mask: u32 = @bitCast(-@as(i32, @intCast(crc & 1)));
-            crc = (crc >> 1) ^ (0xEDB88320 & mask);
-        }
-    }
-    return crc;
-}
-
-fn crc32End(crc: u32) u32 {
-    return ~crc;
-}
+// The commit-marker checksum lives in util/crc32.zig — the same ISO-HDLC
+// variant the GPT header uses, so there is one implementation rather than
+// one per subsystem. The rolling start/feed/end shape is kept because a
+// record's crc spans a header slice and a payload slice that are not
+// contiguous in memory.
 
 // --- little-endian scalar helpers over the pmem byte interface -------------
 
@@ -149,9 +130,7 @@ fn writeBody(off: u64, seq: u64, payload: []const u8) ?u32 {
     @memcpy(body[12..][0..payload.len], payload);
     const body_len: usize = 12 + payload.len;
     if (pmem.writeAt(off, body[0..body_len]) != body_len) return null;
-    var crc = crc32Start();
-    crc = crc32Feed(crc, body[0..body_len]);
-    return crc32End(crc);
+    return crc32.oneShot(body[0..body_len]);
 }
 
 /// Append `payload` as a committed record. Body is written + persisted first,
@@ -192,10 +171,7 @@ fn entryValid(off: u64, len: u32) bool {
     var buf: [12 + MAX_PAYLOAD]u8 = undefined;
     const body_len: usize = 12 + @as(usize, len);
     if (pmem.readAt(off, buf[0..body_len]) != body_len) return false;
-    var crc = crc32Start();
-    crc = crc32Feed(crc, buf[0..body_len]);
-    const want = crc32End(crc);
-    return get32(off + 12 + len) == want;
+    return get32(off + 12 + len) == crc32.oneShot(buf[0..body_len]);
 }
 
 // --- recover (derive the committed tail by scanning) -----------------------

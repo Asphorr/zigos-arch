@@ -54,10 +54,18 @@ pub fn build(b: *std.Build) void {
         _ = std.os.linux.clock_gettime(.REALTIME, &ts);
         break :blk @intCast(ts.sec);
     };
+    // Force boot_mode at compile time, bypassing the interactive UEFI menu.
+    // Every self-test entry (13 witness, 14 page cache, 15 bpf verifier, 16
+    // disk) was previously reachable only by selecting it in a graphical menu
+    // with a keyboard, which makes them unrunnable from a script or over ssh.
+    // With this set, a headless QEMU run boots straight into the chosen mode.
+    const forced_boot_mode = b.option(u32, "boot-mode", "Force boot_mode, bypassing the UEFI menu (scripted self-test runs)");
+
     const build_options = b.addOptions();
     build_options.addOption(u64, "build_id", build_id_value);
     build_options.addOption(bool, "kasan_enabled", kasan_enabled);
     build_options.addOption(bool, "kcsan_enabled", kcsan_enabled);
+    build_options.addOption(?u32, "forced_boot_mode", forced_boot_mode);
 
     // --- 1. KERNEL ---
     // Forward-declare the shapes module here so the kernel module can
