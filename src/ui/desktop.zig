@@ -2937,47 +2937,19 @@ pub fn run() void {
     @import("vga.zig").available = false;
 
     const virtio_gpu = @import("../driver/virtio_gpu.zig");
-    const gpu_kit = @import("../driver/gpu.zig");
-
-    // Try virtio-gpu first, fallback to BGA. The virtio attempt is gated on
-    // the boot GPU inventory: on real hardware (no virtio function on the
-    // bus) the probe is a guaranteed miss, so skip straight to the fallbacks
-    // instead of re-scanning the bus to learn what boot already knew.
-    var disp_w: u32 = 0;
-    var disp_h: u32 = 0;
     const gop = @import("../driver/gop_fb.zig");
-    if (gpu_kit.mayHaveVirtioGpu() and virtio_gpu.init(1920, 1080)) {
-        disp_w = virtio_gpu.width;
-        disp_h = virtio_gpu.height;
-        gfx.setScreen(virtio_gpu.framebuffer, disp_w, disp_h);
-        gfx.post_blit_fn = &virtio_gpu.flush;
-        debug.klog("[desktop] Using virtio-gpu {d}x{d}\n", .{ disp_w, disp_h });
-    } else if (bga.init(1280, 720)) {
-        // Pull dimensions from the BGA device — `gfx.screen_w` is still 0 here
-        // because setScreen hasn't run yet. Reading it gave (0,0), which then
-        // propagated through showSplash's centering math (`(sw - logo_w) / 2`)
-        // and overflowed in ReleaseSafe right at boot.
-        disp_w = bga.width;
-        disp_h = bga.height;
-        gfx.setScreen(bga.framebuffer, disp_w, disp_h);
-        debug.klog("[desktop] Using BGA {d}x{d}\n", .{ disp_w, disp_h });
-    } else if (gop.active) {
-        // Real hardware: no virtio, no BGA — the UEFI GOP framebuffer that
-        // early_fb adopted at kernelMain entry is the display. Direct mode
-        // (BGRA, packed stride) scans out live like BGA; blit mode renders
-        // into GUEST_FB and display.flush() pushes rows to the panel.
-        disp_w = gop.width;
-        disp_h = gop.height;
-        gfx.setScreen(gop.framebuffer, disp_w, disp_h);
-        gfx.post_blit_fn = &gop.flush;
-        display_is_gop = true;
-        debug.klog("[desktop] Using GOP scanout {d}x{d} ({s})\n", .{ disp_w, disp_h, if (gop.direct) "direct" else "blit" });
-    } else {
+
+    // Device selection (virtio-gpu → BGA → GOP) lives in ui/scanout.zig so the
+    // installer boots onto the same display the desktop would have picked.
+    const so = @import("scanout.zig").bringUp() orelse {
         vga.fg = .LightRed;
         vga.print("No display available!\n", .{});
         vga.fg = .LightGray;
         return;
-    }
+    };
+    const disp_w = so.width;
+    const disp_h = so.height;
+    display_is_gop = (so.kind == .gop);
 
     // Back-buffer policy:
     //   * virtio-gpu mode: composite directly into the device resource backing.

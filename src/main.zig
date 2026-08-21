@@ -648,6 +648,10 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     //            miss, set eviction frees the victim frame, refcount pinning
     //            prevents eviction, no frame leak — see
     //            src/test/page_cache_selftest.zig)
+    //   16     → disk self-test (GPT + mkfs.ext2 + mkfs.fat32 against the
+    //            install-target disk; see src/test/disk_selftest.zig — the
+    //            only non-interactive driver of the partitioning path, and
+    //            the one a host-side sgdisk/e2fsck/fsck.fat run checks)
     //   15     → zBPF verifier self-test (bpf/verifier.zig in the freestanding
     //            kernel: accepts the builtin + pointer-arith + branch joins,
     //            rejects loops / OOB / uninit / r10-write / bad helper / atomics
@@ -660,7 +664,10 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     // allocations clobber it, which is why `boot_info.boot_mode` reads as
     // 0 here despite the early-kmain log showing the right value. Closes
     // project_mode5_dispatch_mystery.md.
-    const live_mode = boot_info_mod.boot_mode;
+    // -Dboot-mode=N overrides the menu selection. Absent (the normal build),
+    // the menu's choice stands — so this cannot change a user-facing boot,
+    // only a build someone deliberately asked to be scripted.
+    const live_mode = @import("build_options").forced_boot_mode orelse boot_info_mod.boot_mode;
 
     // Verify the zBPF builtin in the live kernel before any syscall can run it
     // (M3a). Off-target the harness proves the verifier's logic; this proves the
@@ -681,6 +688,24 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
         13 => @intFromPtr(&@import("test/witness_selftest.zig").taskEntry),
         14 => @intFromPtr(&@import("test/page_cache_selftest.zig").taskEntry),
         15 => @intFromPtr(&@import("test/bpf_verifier_selftest.zig").taskEntry),
+        // Compiled in ONLY when -Dboot-mode asked for it. Unlike modes 13-15
+        // this entry is unreachable from the menu (it is the scripted-run
+        // path), so shipping it in the default kernel buys nothing.
+        //
+        // It also sidesteps a real toolchain failure: with disk_selftest.zig
+        // and the desktop emitted into the same binary, Zig 0.15.2 + LLVM
+        // 20.1.2 aborts the kernel link with "Invalid TYPE table: Only named
+        // structs can be forward referenced". Either alone compiles clean, and
+        // -Dboot-mode=16 (which folds the desktop away) compiles clean. NOT
+        // diagnosed — this gate avoids the combination, it does not fix it.
+        16 => if (@import("build_options").forced_boot_mode != null)
+            @intFromPtr(&@import("test/disk_selftest.zig").taskEntry)
+        else
+            @intFromPtr(&desktop_mod.taskEntry),
+        // The graphical installer. Unlike mode 16 this one IS meant to be
+        // reachable from the boot menu — installing is something a person
+        // does, not a script — so it is compiled in unconditionally.
+        17 => @intFromPtr(&@import("ui/installer.zig").taskEntry),
         // Mode 9 (GPU compositor) boots the regular desktop; the desktop
         // detects boot_mode==9 and spawns ui/gpu_compositor.zig as a
         // side-by-side kernel task so they share one screen.
