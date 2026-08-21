@@ -935,19 +935,90 @@ fn waitCompletion(c: *const Controller, cq_phys: usize, head_ptr: *u16, phase_pt
     // logic above is now a no-op for waking us but still ensures the IRQ
     // handler runs on the right CPU when the device completes.
     const t_start = @import("../debug/perf.zig").rdtsc();
-    // ~2s at 1 GHz min TSC freq — generous on any modern CPU.
-    const TIMEOUT_CYC: u64 = 2_000_000_000;
+    // Two deadlines (2026-08-22, the "waitCompletion timeout" root cause).
+    // The old single 2e9-cycle deadline is ~0.55 s of WALL-clock TSC on this
+    // host — guest TSC keeps counting while the vCPU isn't running — and
+    // host-side stalls provably exceed it (SMI hits measured up to 773 ms;
+    // nested-Hyper-V vCPU deschedules are unbounded; a kill -STOP repro
+    // reproduced the 2026-07-26 mkfs timeout exactly: healthy csts=0x1,
+    // CQE posted the instant the world resumed). So for I/O commands the
+    // old deadline is now a DIAGNOSTIC CHECKPOINT — log and keep waiting —
+    // and the hard failure sits at ~30 s (Linux nvme io_timeout parity).
+    // Admin commands (qid 0) keep the fast deadline: they run at init on
+    // an otherwise-idle machine, where 0.5 s of silence really does mean
+    // a broken controller, and boot must not hang 30 s to say so.
+    const SOFT_CYC: u64 = 2_000_000_000;
+    const HARD_CYC: u64 = if (qid == 0) 2_000_000_000 else 120_000_000_000;
+    var soft_warned = false;
     while (true) {
-        if (@import("../debug/perf.zig").rdtsc() -% t_start > TIMEOUT_CYC) {
+        const elapsed = @import("../debug/perf.zig").rdtsc() -% t_start;
+        if (qid != 0 and !soft_warned and elapsed > SOFT_CYC) {
+            soft_warned = true;
+            debug.klog("[nvme] slow completion on qid={d}: >{d} Mcyc and still waiting (host stall?)\n", .{ qid, SOFT_CYC / 1_000_000 });
+        }
+        if (elapsed > HARD_CYC) {
             const csts = r32(c, REG_CSTS);
             debug.klog("[nvme] waitCompletion timeout (qid={d} head={d} csts=0x{x})\n", .{ qid, head_ptr.*, csts });
+            // Post-mortem for the dropped-completion hunt (2026-08-22): dump
+            // the raw CQ ring so the failure mode is readable from serial —
+            // a CQE at head with the WRONG phase bit = our phase/head
+            // tracking desynced from the device; all-stale entries = the
+            // device never posted (command never fetched or wedged); a fresh
+            // CQE at head+1 = head desync. Also record the submit-side state.
+            debug.klog("[nvme]   expected phase={d} io_sq_tail={d} next_cid={d}\n", .{
+                @intFromBool(phase_ptr.*), c.io_sq_tail, c.next_cid,
+            });
+            var dump_i: u16 = 0;
+            while (dump_i < Q_DEPTH) : (dump_i += 1) {
+                const e = &cq[dump_i];
+                asm volatile ("clflush (%[ptr])"
+                    :
+                    : [ptr] "r" (@intFromPtr(e)),
+                    : .{ .memory = true });
+                asm volatile ("mfence" ::: .{ .memory = true });
+                debug.klog("[nvme]   cq[{d:0>2}] status=0x{x:0>4} cid={d} sq_head={d} res=0x{x}{s}\n", .{
+                    dump_i, e.status, e.cid, e.sq_head, e.result,
+                    if (dump_i == head_ptr.*) " <-- head" else "",
+                });
+            }
             // Gap #4 (2026-05-20): CSTS.CFS = controller fatal status.
             // If set, the device has irrecoverably failed and is dropping
             // every command. Call it out explicitly — otherwise the
             // recurring timeouts look like SW bugs.
             if (csts & CSTS_CFS != 0) {
                 debug.klog("[nvme] ===> CSTS.CFS set: CONTROLLER IN FATAL STATE — all subsequent commands will fail\n", .{});
+                return false;
             }
+            // Late-arrival scan + queue resync (2026-08-22). Even past the
+            // hard deadline, keep polling a few more seconds: a CQE that
+            // shows up now is logged with HOW late it was — and CONSUMED,
+            // keeping the ring in sync. Without the consume, the abandoned
+            // CQE is read by the NEXT command's wait as its own completion
+            // (the phase matches), i.e. a success reported for the wrong
+            // command, and head/phase are off-by-one from there on. The
+            // kill -STOP repro drove exactly this branch before the soft/
+            // hard split existed: timeout, then the CQE consumed 3490 Mcyc
+            // late, textbook-consistent ring in the dump.
+            const LATE_SCAN_CYC: u64 = 12_000_000_000; // ~3 s past the hard fail
+            while (@import("../debug/perf.zig").rdtsc() -% t_start <= HARD_CYC + LATE_SCAN_CYC) {
+                asm volatile ("clflush (%[ptr])"
+                    :
+                    : [ptr] "r" (@intFromPtr(&cq[head_ptr.*])),
+                    : .{ .memory = true });
+                asm volatile ("mfence" ::: .{ .memory = true });
+                const late_status = cq[head_ptr.*].status;
+                if (((late_status & 1) != 0) == phase_ptr.*) {
+                    debug.klog("[nvme] LATE completion after {d} extra Mcyc (status=0x{x:0>4}) — consumed, queue resynced\n", .{
+                        (@import("../debug/perf.zig").rdtsc() -% t_start -% HARD_CYC) / 1_000_000, late_status,
+                    });
+                    head_ptr.* = (head_ptr.* + 1) % Q_DEPTH;
+                    if (head_ptr.* == 0) phase_ptr.* = !phase_ptr.*;
+                    cqDoorbell(c, qid).* = head_ptr.*;
+                    return false;
+                }
+                asm volatile ("pause");
+            }
+            debug.klog("[nvme] no late completion within the scan window — genuinely lost\n", .{});
             return false;
         }
 
@@ -970,6 +1041,14 @@ fn waitCompletion(c: *const Controller, cq_phys: usize, head_ptr: *u16, phase_pt
         const status_word = cq[head_ptr.*].status;
         const phase_bit = (status_word & 1) != 0;
         if (phase_bit == phase_ptr.*) {
+            // Slow-but-successful diagnostic (2026-08-22): a wait that ran
+            // >200 Mcyc (~55 ms) yet completed is the host-stall signature
+            // in its sub-deadline form — log it so stalls are visible even
+            // when they don't blow the timeout.
+            const waited = @import("../debug/perf.zig").rdtsc() -% t_start;
+            if (waited > 200_000_000) {
+                debug.klog("[nvme] slow completion: {d} Mcyc on qid={d} (host stall?)\n", .{ waited / 1_000_000, qid });
+            }
             const sc = status_word >> 1;
             head_ptr.* = (head_ptr.* + 1) % Q_DEPTH;
             // Phase flips each time the head wraps the queue.
