@@ -18,6 +18,7 @@
 
 const std = @import("std");
 const boot_info_mod = @import("boot_info.zig");
+const debug = @import("../debug/debug.zig");
 
 // Microsoft x64 calling convention — UEFI on x86_64 uses MS ABI.
 // In Zig 0.15.2 CallingConvention is a tagged union; the win64 variant
@@ -254,4 +255,184 @@ pub fn setBootStatus(status: u8) void {
 pub fn setCrashFp(fp: []const u8) void {
     const trimmed = fp[0..@min(fp.len, 256)];
     writeRaw(NAME_CRASH_FP, trimmed);
+}
+
+// =============================================================================
+// Firmware boot entries — Boot#### / BootOrder (the installer's last step)
+// =============================================================================
+//
+// Everything above talks to OUR variables under the ZigOS vendor GUID. Boot
+// entries live under the spec's EFI_GLOBAL_VARIABLE GUID and carry a
+// serialized EFI_LOAD_OPTION: attributes, a UTF-16 description, and a device
+// path pinning WHICH partition and WHICH file to boot. The device path is
+// the part firmware actually matches on — a HD() node naming the GPT
+// partition by its unique GUID, then a FILEPATH node, then an end node.
+//
+// CAVEAT for the QEMU workflow: run-installer.sh refreshes OVMF_VARS every
+// run precisely because Boot#### entries recorded under one virtual PCI
+// layout make OVMF drop to the EFI Shell under another. The entry written
+// here is validated by reading it back; whether the NEXT boot consumes it
+// depends on the machine keeping its layout — real hardware does, a
+// reshuffled QEMU invocation does not (it falls back to \EFI\BOOT\BOOTX64.EFI,
+// which the installer also provides).
+
+/// EFI_GLOBAL_VARIABLE — 8BE4DF61-93CA-11D2-AA0D-00E098032B8C.
+const GLOBAL_GUID = Guid{
+    .time_low = 0x8BE4DF61,
+    .time_mid = 0x93CA,
+    .time_high_and_version = 0x11D2,
+    .clock_seq_high_and_reserved = 0xAA,
+    .clock_seq_low = 0x0D,
+    .node = [_]u8{ 0x00, 0xE0, 0x98, 0x03, 0x2B, 0x8C },
+};
+
+const NAME_BOOT_ORDER = std.unicode.utf8ToUtf16LeStringLiteral("BootOrder");
+
+const EFI_ERR_BIT: usize = 1 << 63;
+const EFI_NOT_FOUND: usize = EFI_ERR_BIT | 14;
+
+const LOAD_OPTION_ACTIVE: u32 = 0x1;
+
+/// The GPT partition a boot entry points into. `partition_guid` is the
+/// entry's unique GUID in raw on-disk byte order (gpt.Partition.unique_guid).
+pub const BootEntryDisk = struct {
+    /// 1-based slot number, the way tools display it.
+    partition_number: u32,
+    partition_start: u64,
+    partition_sectors: u64,
+    partition_guid: [16]u8,
+};
+
+/// True when a variable of this name exists under the global GUID. Probed
+/// with a zero-length read: EFI_BUFFER_TOO_SMALL = exists, EFI_NOT_FOUND =
+/// free slot. Caller has checked rsCallable.
+fn globalVarExists(name: [*:0]const u16) bool {
+    const rs = rs_ptr.?;
+    var size: usize = 0;
+    const protect = @import("../cpu/arch/protect.zig");
+    const saved = protect.beginNonSmepCall();
+    const status = rs._getVariable(name, &GLOBAL_GUID, null, &size, null);
+    protect.endNonSmepCall(saved);
+    return status != EFI_NOT_FOUND;
+}
+
+/// Register a Boot#### entry for \EFI\BOOT\BOOTX64.EFI on `disk` and put it
+/// at the head of BootOrder. Returns the #### index, or null with the reason
+/// logged — the installer surfaces failure but does not fail the install
+/// over it (the removable-media fallback path still boots the disk).
+pub fn addBootEntry(description: []const u8, disk: BootEntryDisk) ?u16 {
+    if (!rsCallable()) {
+        debug.klog("[nvram] runtime services unreachable — no boot entry\n", .{});
+        return null;
+    }
+
+    // A free Boot#### slot. 64 is far past anything OVMF or a laptop hoards.
+    var name_buf: [9]u16 = .{ 'B', 'o', 'o', 't', '0', '0', '0', '0', 0 };
+    var idx: u16 = 0;
+    const slot: u16 = while (idx < 64) : (idx += 1) {
+        fillHex16(name_buf[4..8], idx);
+        const nm: [*:0]const u16 = @ptrCast(&name_buf);
+        if (!globalVarExists(nm)) break idx;
+    } else {
+        debug.klog("[nvram] no free Boot#### slot in 0..63\n", .{});
+        return null;
+    };
+
+    // --- Serialize the EFI_LOAD_OPTION ---
+    var buf: [256]u8 = undefined;
+    var off: usize = 0;
+    std.mem.writeInt(u32, buf[off..][0..4], LOAD_OPTION_ACTIVE, .little);
+    off += 4;
+    const fpl_len_at = off; // FilePathListLength backpatched below
+    off += 2;
+    // Description: UTF-16LE, NUL-terminated.
+    for (description) |c| {
+        std.mem.writeInt(u16, buf[off..][0..2], c, .little);
+        off += 2;
+    }
+    std.mem.writeInt(u16, buf[off..][0..2], 0, .little);
+    off += 2;
+
+    const fpl_start = off;
+    // HD() media device path node: type 4, subtype 1, 42 bytes.
+    buf[off] = 0x04;
+    buf[off + 1] = 0x01;
+    std.mem.writeInt(u16, buf[off + 2 ..][0..2], 42, .little);
+    std.mem.writeInt(u32, buf[off + 4 ..][0..4], disk.partition_number, .little);
+    std.mem.writeInt(u64, buf[off + 8 ..][0..8], disk.partition_start, .little);
+    std.mem.writeInt(u64, buf[off + 16 ..][0..8], disk.partition_sectors, .little);
+    @memcpy(buf[off + 24 ..][0..16], &disk.partition_guid);
+    buf[off + 40] = 0x02; // partition format: GPT
+    buf[off + 41] = 0x02; // signature type: GUID
+    off += 42;
+    // FILEPATH node: type 4, subtype 4, header + UTF-16 path incl NUL.
+    const path = std.unicode.utf8ToUtf16LeStringLiteral("\\EFI\\BOOT\\BOOTX64.EFI");
+    const path_bytes: u16 = @intCast((path.len + 1) * 2);
+    buf[off] = 0x04;
+    buf[off + 1] = 0x04;
+    std.mem.writeInt(u16, buf[off + 2 ..][0..2], 4 + path_bytes, .little);
+    off += 4;
+    for (path) |u| {
+        std.mem.writeInt(u16, buf[off..][0..2], u, .little);
+        off += 2;
+    }
+    std.mem.writeInt(u16, buf[off..][0..2], 0, .little);
+    off += 2;
+    // End-of-device-path node.
+    buf[off] = 0x7F;
+    buf[off + 1] = 0xFF;
+    std.mem.writeInt(u16, buf[off + 2 ..][0..2], 4, .little);
+    off += 4;
+    std.mem.writeInt(u16, buf[fpl_len_at..][0..2], @intCast(off - fpl_start), .little);
+
+    // --- Write Boot#### ---
+    const rs = rs_ptr.?;
+    const protect = @import("../cpu/arch/protect.zig");
+    fillHex16(name_buf[4..8], slot);
+    const var_name: [*:0]const u16 = @ptrCast(&name_buf);
+    var saved = protect.beginNonSmepCall();
+    const st_entry = rs._setVariable(var_name, &GLOBAL_GUID, ATTRS_PERSIST, off, &buf);
+    protect.endNonSmepCall(saved);
+    if (st_entry != EFI_SUCCESS) {
+        debug.klog("[nvram] SetVariable Boot{X:0>4} failed: 0x{X}\n", .{ slot, st_entry });
+        return null;
+    }
+
+    // --- Put it first in BootOrder (keeping everything else) ---
+    var order: [65]u16 = undefined;
+    const order_bytes: [*]u8 = @ptrCast(&order);
+    var order_size: usize = 64 * 2; // read at most 64 existing entries
+    saved = protect.beginNonSmepCall();
+    const st_read = rs._getVariable(NAME_BOOT_ORDER, &GLOBAL_GUID, null, &order_size, order_bytes + 2);
+    protect.endNonSmepCall(saved);
+    var count: usize = if (st_read == EFI_SUCCESS) order_size / 2 else 0;
+    // Drop a stale occurrence of our slot, then prepend it.
+    var w: usize = 1;
+    var r: usize = 1;
+    while (r < 1 + count) : (r += 1) {
+        if (order[r] != slot) {
+            order[w] = order[r];
+            w += 1;
+        }
+    }
+    count = w - 1;
+    order[0] = slot;
+    saved = protect.beginNonSmepCall();
+    const st_write = rs._setVariable(NAME_BOOT_ORDER, &GLOBAL_GUID, ATTRS_PERSIST, (count + 1) * 2, order_bytes);
+    protect.endNonSmepCall(saved);
+    if (st_write != EFI_SUCCESS) {
+        debug.klog("[nvram] SetVariable BootOrder failed: 0x{X}\n", .{st_write});
+        return null;
+    }
+    debug.klog("[nvram] Boot{X:0>4} \"{s}\" registered, first in BootOrder ({d} entries)\n", .{ slot, description, count + 1 });
+    return slot;
+}
+
+/// Uppercase-hex the low 16 bits of `v` into 4 UTF-16 digits.
+fn fillHex16(out: []u16, v: u16) void {
+    const digits = "0123456789ABCDEF";
+    out[0] = digits[(v >> 12) & 0xF];
+    out[1] = digits[(v >> 8) & 0xF];
+    out[2] = digits[(v >> 4) & 0xF];
+    out[3] = digits[v & 0xF];
 }
