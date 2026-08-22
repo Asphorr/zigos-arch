@@ -24,6 +24,21 @@ const debug = @import("../debug/debug.zig");
 const Backend = enum { none, ata, ahci, nvme };
 var backend: Backend = .none;
 
+/// NVMe controller index the ext2 root rides on. 1 in the classic 4-disk
+/// dev topology (0=tarfs, 1=ext2 root, 2=swap, 3=install target). An
+/// INSTALLED system boots from one disk carrying GPT with the root inside
+/// it — ext2's mount discovery repoints this before mounting. NVMe only;
+/// the ata/ahci arms keep their fixed secondary channel.
+var root_ctrl_idx: usize = 1;
+
+/// Repoint the "secondary" (ext2-root) entry points at NVMe controller
+/// `ctrl`. Called by ext2's GPT discovery when the classic topology
+/// (whole-disk ext2 on controller 1) isn't what the machine has.
+pub fn setRootDisk(ctrl: usize) void {
+    root_ctrl_idx = ctrl;
+    debug.klog("[block] ext2 root routed to nvme{d}\n", .{ctrl});
+}
+
 pub fn init() void {
     if (nvme.init()) {
         backend = .nvme;
@@ -80,7 +95,7 @@ pub fn readSectorSecondary(lba: u32, dest: [*]u8) void {
         .none => {},
         .ata => ata.readSectorSecondary(lba, dest),
         .ahci => ahci.readSectorSecondary(lba, dest),
-        .nvme => nvme.readSectorSecondary(lba, dest),
+        .nvme => _ = nvme.readSectorsOn(root_ctrl_idx, lba, 1, dest),
     }
 }
 
@@ -100,7 +115,7 @@ pub fn readSectorsSecondary(lba: u32, count: u16, dest: [*]u8) bool {
             ahci.readSectorsSecondary(lba, count, dest);
             break :blk true;
         },
-        .nvme => nvme.readSectorsSecondary(lba, count, dest),
+        .nvme => nvme.readSectorsOn(root_ctrl_idx, lba, count, dest),
     };
 }
 
@@ -110,7 +125,7 @@ pub fn writeSectorSecondary(lba: u32, src: [*]const u8) void {
         .none => {},
         .ata => ata.writeSectorSecondary(lba, src),
         .ahci => ahci.writeSectorSecondary(lba, src),
-        .nvme => nvme.writeSectorSecondary(lba, src),
+        .nvme => _ = nvme.writeSectorsOn(root_ctrl_idx, lba, 1, src),
     }
 }
 
@@ -139,7 +154,7 @@ pub fn writeSectorsSecondary(lba: u32, count: u16, src: [*]const u8) bool {
             while (i < count) : (i += 1) ahci.writeSectorSecondary(lba + i, src + i * 512);
             break :blk true;
         },
-        .nvme => nvme.writeSectorsSecondary(lba, count, src),
+        .nvme => nvme.writeSectorsOn(root_ctrl_idx, lba, count, src),
     };
 }
 
@@ -269,6 +284,47 @@ pub fn readSectorsTarget(lba: u32, count: u32, dest: [*]u8) bool {
 pub fn writeSectorsTarget(lba: u32, count: u32, src: [*]const u8) bool {
     if (backend != .nvme) return false;
     return nvme.writeSectorsOn(TARGET_CTRL_IDX, lba, count, src);
+}
+
+// =============================================================================
+// Per-controller read-only views — GPT discovery
+// =============================================================================
+
+// Named per-index readers rather than a comptime generator: a Device holds
+// bare function pointers (no context word), and Zig 0.15.2's LLVM backend
+// has bitten us on anonymous struct types before — four explicit functions
+// cost twelve lines and zero surprises. Indexed by NVMe controller.
+fn readSectorsCtrl0(lba: u32, count: u32, dest: [*]u8) bool {
+    return nvme.readSectorsOn(0, lba, count, dest);
+}
+fn readSectorsCtrl1(lba: u32, count: u32, dest: [*]u8) bool {
+    return nvme.readSectorsOn(1, lba, count, dest);
+}
+fn readSectorsCtrl2(lba: u32, count: u32, dest: [*]u8) bool {
+    return nvme.readSectorsOn(2, lba, count, dest);
+}
+fn readSectorsCtrl3(lba: u32, count: u32, dest: [*]u8) bool {
+    return nvme.readSectorsOn(3, lba, count, dest);
+}
+const CTRL_READERS = [_]*const fn (lba: u32, count: u32, dest: [*]u8) bool{
+    readSectorsCtrl0, readSectorsCtrl1, readSectorsCtrl2, readSectorsCtrl3,
+};
+
+/// Number of NVMe controllers found, 0 under the other backends. The index
+/// domain of `ctrlDevice`.
+pub fn controllerCount() usize {
+    return if (backend == .nvme) nvme.controllerCount() else 0;
+}
+
+/// Read-only Device view of NVMe controller `idx`, for partition-table
+/// scans (ext2 root discovery). Null when the backend isn't NVMe, the index
+/// is out of range, or the namespace reports zero sectors.
+pub fn ctrlDevice(idx: usize) ?Device {
+    if (backend != .nvme) return null;
+    if (idx >= CTRL_READERS.len) return null;
+    const n = nvme.namespaceSectors(idx);
+    if (n == 0) return null;
+    return .{ .readSectors = CTRL_READERS[idx], .writeSectors = null, .sectors = n };
 }
 
 /// Used by ata.zig for cross-CPU serialisation of legacy port I/O.

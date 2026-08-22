@@ -481,11 +481,11 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     blog.ok("FAT32");
     @import("fs/tarfs.zig").buildIndex();
     blog.ok("TARFS index");
-    // ext2 try-mount: silently fails if IDE2 isn't an ext2 image (the
-    // common case during dev where IDE2 is FAT32). Swap disk.img →
-    // ext2.img in the QEMU args to test ext2.
-    if (@import("fs/ext2/ext2.zig").init()) {
-        blog.ok("ext2 (IDE2)");
+    // ext2 try-mount: whole-disk image on controller 1 first (the dev
+    // topology), then a GPT scan for an installed root partition — the
+    // shape our own installer writes. Silently fails when neither exists.
+    if (@import("fs/ext2/ext2.zig").initAuto()) {
+        blog.ok("ext2 root");
         // pgflushd — background page-cache writeback daemon (Slice 3d-2). Spawn
         // it only when ext2 mounts (the sole cache populator). 32 KB kstack covers
         // the writeback chain (vfs → ext2 → block → nvme). Runs once the scheduler

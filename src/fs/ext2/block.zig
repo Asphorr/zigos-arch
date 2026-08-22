@@ -47,6 +47,11 @@ const CACHE_WAYS: u32 = 2;
 const ReadFn = *const fn (lba: u32, count: u16, dest: [*]u8) bool;
 const WriteFn = *const fn (lba: u32, count: u16, src: [*]const u8) bool;
 
+// BGD table cache cap. 64 entries × 32 B = 2 KB per mount; covers ~8 GB at
+// 4 KB blocks with 32K blocks/group. Larger disks would need PMM-allocated
+// storage.
+const MAX_BGD_CACHED: u32 = 64;
+
 pub const Mount = struct {
     sb: layout.Superblock,
     block_size: u32,
@@ -54,6 +59,10 @@ pub const Mount = struct {
     inodes_per_block: u32,
     bgd_count: u32,
     bgd: []layout.BlockGroupDescriptor,
+    /// Backing store `bgd` slices into — PER MOUNT, so a second mount (the
+    /// installer's target) can't clobber the live root's descriptors, which
+    /// is exactly what the old file-scope array would have done.
+    bgd_store: [MAX_BGD_CACHED]layout.BlockGroupDescriptor align(8) = undefined,
     /// First LBA of the ext2 filesystem within the disk. 0 when the
     /// disk is one big ext2 fs (no partition table).
     partition_lba: u32,
@@ -162,11 +171,6 @@ pub fn releaseLockIfHeld(pid: u16) void {
     @import("../../proc/sched.zig").wakeMutexWaiters(tid);
 }
 
-// BGD table cache. 64 entries × 32 B = 2 KB; covers ~8 GB at 4 KB blocks
-// with 32K blocks/group. Larger disks would need PMM-allocated storage.
-const MAX_BGD_CACHED: u32 = 64;
-var bgd_storage: [MAX_BGD_CACHED]layout.BlockGroupDescriptor align(8) = undefined;
-
 /// Constant 4 KB zero block. Used as a source when a path needs to
 /// write a fully-zeroed block to disk (e.g. the partial-write zero-init
 /// in writeFile) without burning a 4 KB stack buffer per call. Lives
@@ -184,12 +188,26 @@ pub fn getMount() ?*Mount {
     return if (mounted) &mount_storage else null;
 }
 
-/// Mount the ext2 filesystem on the secondary disk starting at
-/// `partition_lba`. Use partition_lba=0 for a whole-disk image.
-/// Returns false on bad magic, unsupported block size, or BGD overflow.
+/// Mount the ext2 filesystem on the ROOT disk starting at `partition_lba`
+/// (0 for a whole-disk image) into the global mount slot. The root disk is
+/// whatever driver/block.zig's secondary entry points currently route to —
+/// see blkdev.setRootDisk and ext2.initAuto.
 pub fn mount(partition_lba: u32) bool {
+    if (!mountAt(&mount_storage, blkdev.readSectorsSecondary, blkdev.writeSectorsSecondary, partition_lba)) return false;
+    mounted = true;
+    return true;
+}
+
+/// The general form behind `mount`: mount through explicit sector accessors
+/// into an explicit Mount slot. The installer uses this to hold a SECOND
+/// mount (the freshly-formatted install target) without evicting the live
+/// root. Nothing about `slot` is registered globally — the caller owns its
+/// lifetime, and the path-based API in ext2.zig keeps addressing the global
+/// mount only. Returns false on bad magic, unsupported block size, or BGD
+/// overflow.
+pub fn mountAt(slot: *Mount, read_fn: ReadFn, write_fn: WriteFn, partition_lba: u32) bool {
     var sb: layout.Superblock = undefined;
-    if (!readSuperblock(partition_lba, &sb)) {
+    if (!readSuperblock(read_fn, partition_lba, &sb)) {
         debug.klog("[ext2] mount: superblock read failed at lba={d}\n", .{partition_lba});
         return false;
     }
@@ -227,27 +245,28 @@ pub fn mount(partition_lba: u32) bool {
         return false;
     }
 
-    mount_storage = .{
+    slot.* = .{
         .sb = sb,
         .block_size = block_size,
         .sectors_per_block = sectors_per_block,
         .inodes_per_block = block_size / sb.inode_size,
         .bgd_count = bgd_count,
-        .bgd = bgd_storage[0..bgd_count],
+        .bgd = &.{},
         .partition_lba = partition_lba,
-        .read_sectors = blkdev.readSectorsSecondary,
-        .write_sectors = blkdev.writeSectorsSecondary,
+        .read_sectors = read_fn,
+        .write_sectors = write_fn,
     };
+    // Self-referential slice, taken after the wholesale reset above settles.
+    slot.bgd = slot.bgd_store[0..bgd_count];
 
-    if (!readBgdTable(&mount_storage)) {
+    if (!readBgdTable(slot)) {
         debug.klog("[ext2] mount: BGD table read failed\n", .{});
         return false;
     }
 
-    mounted = true;
     debug.klog(
-        "[ext2] mounted: {d} blocks, {d} inodes, block_size={d}, {d} groups\n",
-        .{ sb.blocks_count, sb.inodes_count, block_size, bgd_count },
+        "[ext2] mounted: {d} blocks, {d} inodes, block_size={d}, {d} groups @ lba {d}\n",
+        .{ sb.blocks_count, sb.inodes_count, block_size, bgd_count, partition_lba },
     );
     return true;
 }
@@ -367,7 +386,7 @@ pub fn writeBgdTable(self: *Mount) bool {
     const bgd_start_block: u32 = if (self.block_size == 1024) 2 else 1;
     const bytes_total: u32 = self.bgd_count * @sizeOf(layout.BlockGroupDescriptor);
     const blocks_needed: u32 = (bytes_total + self.block_size - 1) / self.block_size;
-    const bgd_bytes: [*]const u8 = @ptrCast(&bgd_storage);
+    const bgd_bytes: [*]const u8 = @ptrCast(self.bgd.ptr);
     for (0..blocks_needed) |i| {
         const block_num: u32 = bgd_start_block + @as(u32, @intCast(i));
         const dst_off: u32 = @as(u32, @intCast(i)) * self.block_size;
@@ -592,10 +611,10 @@ fn ensureCacheLoaded(self: *Mount, lba: u32) ?u8 {
 
 /// Bypass the block cache to read the SB. The cache isn't initialized yet
 /// at this point and the SB only needs reading once per boot anyway.
-fn readSuperblock(partition_lba: u32, dst: *layout.Superblock) bool {
+fn readSuperblock(read_fn: ReadFn, partition_lba: u32, dst: *layout.Superblock) bool {
     var buf: [2 * SECTOR_SIZE]u8 align(8) = undefined;
     // SB lives at byte 1024..2048 within the FS → sectors 2..3.
-    if (!blkdev.readSectorsSecondary(partition_lba + 2, 2, &buf)) return false;
+    if (!read_fn(partition_lba + 2, 2, &buf)) return false;
     const src = std.mem.bytesAsValue(layout.Superblock, &buf);
     dst.* = src.*;
     return true;
@@ -609,7 +628,7 @@ fn readBgdTable(self: *Mount) bool {
     const bytes_needed: u32 = self.bgd_count * @sizeOf(layout.BlockGroupDescriptor);
     const blocks_needed: u32 = (bytes_needed + self.block_size - 1) / self.block_size;
 
-    var bgd_bytes: [*]u8 = @ptrCast(&bgd_storage);
+    const bgd_bytes: [*]u8 = @ptrCast(self.bgd.ptr);
     for (0..blocks_needed) |i| {
         const block_num: u32 = bgd_start_block + @as(u32, @intCast(i));
         const dst_off: u32 = @as(u32, @intCast(i)) * self.block_size;

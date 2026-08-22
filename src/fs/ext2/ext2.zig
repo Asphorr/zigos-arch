@@ -86,6 +86,39 @@ pub fn init() bool {
     return block.mount(0);
 }
 
+/// Mount the root filesystem, trying both shapes that exist in the wild:
+///
+///   dev topology — controller 1 is a whole-disk ext2 image (partition_lba
+///   0), the classic 4-disk QEMU setup;
+///
+///   installed disk — some controller carries GPT with a TYPE_LINUX_DATA
+///   partition holding the root, which is the layout our own installer
+///   writes. Found by scanning every controller's partition table and
+///   repointing the block layer's root routing at the match.
+///
+/// The classic shape goes first: it is the common case, and its probe is
+/// two sectors. A GPT hit logs which disk and partition won.
+pub fn initAuto() bool {
+    if (block.mount(0)) return true;
+
+    const blkdev = @import("../../driver/block.zig");
+    const gpt = @import("../gpt.zig");
+    var idx: usize = 0;
+    while (idx < blkdev.controllerCount()) : (idx += 1) {
+        const dev = blkdev.ctrlDevice(idx) orelse continue;
+        const table = gpt.parse(dev) orelse continue;
+        for (table.parts[0..table.count]) |p| {
+            if (!std.mem.eql(u8, &p.type_guid, &gpt.TYPE_LINUX_DATA)) continue;
+            blkdev.setRootDisk(idx);
+            if (block.mount(@intCast(p.start_lba))) {
+                debug.klog("[ext2] root from GPT: nvme{d} part {d} @ lba {d}\n", .{ idx, p.index + 1, p.start_lba });
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 pub fn isInitialized() bool {
     return block.isMounted();
 }
