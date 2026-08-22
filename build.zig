@@ -1184,7 +1184,7 @@ pub fn build(b: *std.Build) void {
         \\
         \\# Skip rebuild if every input file is older than the image.
         \\if [ -f $IMG ]; then
-        \\  newest=$( { ls -t zig-out/bin/*.elf zig-out/bin/KERNEL.SYM zig-out/bin/BUILD.ID doom1.wad www/* linux-bin/* 2>/dev/null; find share -type f -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2; } | head -1 || true)
+        \\  newest=$( { ls -t zig-out/bin/*.elf zig-out/bin/KERNEL.SYM zig-out/bin/BUILD.ID zig-out/bin/BOOTX64.efi doom1.wad www/* linux-bin/* 2>/dev/null; find share -type f -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2; } | head -1 || true)
         \\  if [ -n "$newest" ] && [ "$newest" -ot $IMG ]; then
         \\    echo "[ext2] up-to-date $(($(date +%s%3N)-T0))ms"
         \\    exit 0
@@ -1205,6 +1205,13 @@ pub fn build(b: *std.Build) void {
         \\[ -f zig-out/bin/KERNEL.SYM ] && cp zig-out/bin/KERNEL.SYM $STAGE/
         \\[ -f zig-out/bin/KERNEL.LINE ] && cp zig-out/bin/KERNEL.LINE $STAGE/
         \\[ -f zig-out/bin/BUILD.ID ] && cp zig-out/bin/BUILD.ID $STAGE/
+        \\# /boot payload — the raw bootloader + kernel images the installer
+        \\# copies onto a target disk's ESP. The running kernel cannot read its
+        \\# own boot ESP (QEMU fat:rw: over IDE, invisible to the NVMe-only
+        \\# block layer), so the bytes to install must live on the root fs.
+        \\mkdir -p $STAGE/boot
+        \\[ -f zig-out/bin/BOOTX64.efi ] && cp zig-out/bin/BOOTX64.efi $STAGE/boot/BOOTX64.EFI
+        \\[ -f zig-out/bin/kernel.elf ] && cp zig-out/bin/kernel.elf $STAGE/boot/kernel.elf
         \\[ -f doom1.wad ] && cp doom1.wad $STAGE/share/
         \\for f in www/*; do
         \\  [ -f "$f" ] && cp "$f" $STAGE/share/

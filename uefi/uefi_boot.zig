@@ -474,7 +474,24 @@ pub fn main() uefi.Status {
     serialPrint("[uefi] Loading kernel.elf...\n");
     var kernel_entry: u64 = 0;
 
-    const fs_result = boot_services.locateProtocol(SimpleFileSystem, null) catch null;
+    // Open the filesystem on OUR OWN device — the volume this bootloader was
+    // loaded from. `locateProtocol(SimpleFileSystem, null)` returns whichever
+    // FAT volume the firmware enumerated first; with more than one FAT disk
+    // attached (an installed ZigOS target next to the build ESP, say) that can
+    // be the wrong one, and kernel.elf then comes from a different install
+    // than the BOOTX64.EFI that is running. LoadedImage.device_handle pins the
+    // search to the boot volume; the old locateProtocol stays as the fallback
+    // for firmware that refuses the by-handle open.
+    var fs_result: ?*SimpleFileSystem = null;
+    if (boot_services.handleProtocol(uefi.protocol.LoadedImage, uefi.handle) catch null) |loaded_image| {
+        if (loaded_image.device_handle) |own_device| {
+            fs_result = boot_services.handleProtocol(SimpleFileSystem, own_device) catch null;
+        }
+    }
+    if (fs_result == null) {
+        serialPrint("[uefi] no fs on own device, falling back to locateProtocol\n");
+        fs_result = boot_services.locateProtocol(SimpleFileSystem, null) catch null;
+    }
     if (fs_result) |filesystem| {
         const root = filesystem.openVolume() catch null;
         if (root) |root_dir| {
