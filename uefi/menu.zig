@@ -47,6 +47,7 @@ const COLOR_BADGE_SAFE: u32 = 0x00E87C3A;
 const COLOR_BADGE_INFO: u32 = 0x009085A8;
 const COLOR_BADGE_STRESS: u32 = 0x00C04AE8; // purple — diagnostic / non-default
 const COLOR_BADGE_GPU: u32 = 0x0020D0E0; // teal — experimental / GPU compositor
+const COLOR_BADGE_INSTALL: u32 = 0x003A8BE8; // blue — matches the installer's accent
 const COLOR_BADGE_TEXT: u32 = 0x00081020;
 
 pub const Entry = struct {
@@ -69,6 +70,7 @@ pub const ENTRIES = [_]Entry{
     .{ .label = "ZigOS - Verbose klog", .desc = "Same as Normal plus verbose serial logging.", .boot_mode = 1, .badge = "VERBOSE", .badge_color = COLOR_BADGE_VERBOSE },
     .{ .label = "ZigOS - Safe (no SMP, polled IO)", .desc = "Single CPU, polled drivers. Recovery mode.", .boot_mode = 2, .badge = "SAFE", .badge_color = COLOR_BADGE_SAFE },
     .{ .label = "ZigOS - GPU Compositor (experimental)", .desc = "Vulkan/Lavapipe-driven compositor. Step 1 stub: paints solid teal and parks. Pick Normal for daily use.", .boot_mode = 9, .badge = "GPU", .badge_color = COLOR_BADGE_GPU },
+    .{ .label = "Install ZigOS to disk...", .desc = "Graphical installer: partition + format the spare disk, copy the system, install the bootloader, register the firmware boot entry.", .boot_mode = 17, .badge = "INSTALL", .badge_color = COLOR_BADGE_INSTALL },
     .{ .label = "Tests >", .desc = "Stress harnesses for hunting race + UAF bugs.", .boot_mode = BOOT_MODE_TESTS, .badge = "TESTS", .badge_color = COLOR_BADGE_STRESS },
     .{ .label = "About this build", .desc = "Show kernel info, then return.", .boot_mode = BOOT_MODE_ABOUT, .badge = "INFO", .badge_color = COLOR_BADGE_INFO },
 };

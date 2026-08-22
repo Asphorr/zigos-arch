@@ -1,10 +1,16 @@
 #!/bin/bash
 # QEMU launcher for the graphical installer (boot_mode 17).
 #
-# Boots straight into src/ui/installer.zig instead of the desktop, on a plain
-# stdvga scanout. The installer is 2D only — no Venus, no virtio-gl, no memfd
-# backing — so this script deliberately does NOT carry run-uefi-ext2.sh's
-# GPU plumbing. Fewer moving parts between a click and a written sector.
+# The installer is picked from the UEFI boot menu ("Install ZigOS to
+# disk..."), NOT baked in with -Dboot-mode=17: a forced boot mode is
+# comptime-baked into kernel.elf, and THAT kernel is what /boot stages and
+# the installer copies to the target — a 17-forced build installs a disk
+# that can only ever boot back into the installer. The plain build's menu
+# reaches everything.
+#
+# The installer runs on a plain stdvga scanout, 2D only — no Venus, no
+# virtio-gl, no memfd backing — so this script deliberately does NOT carry
+# run-uefi-ext2.sh's GPU plumbing.
 #
 # install.img is the only disk this can write. It is recreated blank on every
 # run so the installer always faces an unpartitioned target; pass -keep to
@@ -17,8 +23,10 @@
 # installer-qmp.sock (QMP: input-send-event). Keyboard goes through HMP
 # `sendkey`; the pointer MUST go through QMP abs events — HMP `mouse_move`
 # emits relative events and the usb-tablet drops those on the floor.
-# Read the outcome from serial-installer.log. Three `sendkey ret` take the
-# default target all the way through mkfs.
+# Read the outcome from serial-installer.log. Recipe: 4x `sendkey down` +
+# `ret` picks Install off the boot menu (any key skips the confirm modal),
+# then three `sendkey ret` run the default install end to end — see
+# tools/installer_headless_test.sh.
 cd "$(dirname "$(readlink -f "$0")")"
 
 ZIG=/opt/zig-x86_64-linux-0.15.2/zig
@@ -38,16 +46,18 @@ done
 # EFI Shell rather than falling back to \EFI\BOOT\BOOTX64.EFI.
 cp -f /usr/share/OVMF/OVMF_VARS_4M.fd ovmf_vars-installer.fd
 
-"$ZIG" build -Doptimize=ReleaseSafe -Dboot-mode=17 || { echo "[run-installer] build failed"; exit 1; }
+"$ZIG" build -Doptimize=ReleaseSafe || { echo "[run-installer] build failed"; exit 1; }
 
 [ -f swap.img ] || dd if=/dev/zero of=swap.img bs=1M count=128 status=none
 
+# 1 GiB, SPARSE (count=0 seek=N writes no data): the copied system tree is
+# ~230 MiB and the old 256 MiB disk left the root partition too small for it.
 if [ "$KEEP" = "0" ]; then
     rm -f install.img
-    dd if=/dev/zero of=install.img bs=1M count=256 status=none
-    echo "[run-installer] install.img recreated blank (256 MiB)"
+    dd if=/dev/zero of=install.img bs=1M count=0 seek=1024 status=none
+    echo "[run-installer] install.img recreated blank (1 GiB sparse)"
 else
-    [ -f install.img ] || dd if=/dev/zero of=install.img bs=1M count=256 status=none
+    [ -f install.img ] || dd if=/dev/zero of=install.img bs=1M count=0 seek=1024 status=none
     echo "[run-installer] keeping existing install.img"
 fi
 

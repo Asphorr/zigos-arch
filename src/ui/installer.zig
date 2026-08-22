@@ -6,18 +6,16 @@
 // macOS installer, which is the design the user asked to copy — five steps
 // down the left, one pane of content, actions bottom-right.
 //
-// What is real here and what is not:
-//
-//   real  — writing the GPT, re-reading it through our own parser, mkfs on
-//           both partitions, and reading the on-disk signatures back. Each
-//           of those is a call into the same code `mkdisk` and the boot-16
-//           self-test drive, and each can fail and say so.
-//   NOT   — copying the system onto the new root, writing BOOTX64.EFI to the
-//           ESP, and registering the firmware boot entry. Those steps do not
-//           exist yet, so the installer does not draw a progress bar for
-//           them. A fake bar that always reaches 100% is worse than an
-//           absent one: it teaches you to trust a widget that knows nothing.
-//           The final screen says plainly what still has to happen by hand.
+// The whole install is real (2026-08-22): GPT + mkfs (the same code the
+// boot-16 self-test drives), the system tree copied from the live root onto
+// the new ext2 (fs/ext2/populate.zig — a slice of dirents per frame, so the
+// bar moves because work happened, not because a timer ticked), BOOTX64.EFI
+// and kernel.elf laid into the fresh ESP (fs/fat32_populate.zig, fed from
+// /boot/ of the root fs — the kernel cannot read its own boot media), and a
+// Boot#### entry pushed through UEFI Runtime Services. The boot-entry step
+// alone is non-fatal: firmware that lost the entry (or a QEMU run whose vars
+// were refreshed) still boots the disk through the \EFI\BOOT\BOOTX64.EFI
+// removable-media fallback the installer also provides.
 //
 // The install runs one step per frame, rendering before it blocks. mkfs takes
 // long enough to see, and a step whose label goes up only *after* it finishes
@@ -42,6 +40,11 @@ const gpt = @import("../fs/gpt.zig");
 const ext2_mkfs = @import("../fs/ext2/mkfs.zig");
 const fat_mkfs = @import("../fs/fat32_mkfs.zig");
 const ext2_layout = @import("../fs/ext2/layout.zig");
+const ext2 = @import("../fs/ext2/ext2.zig");
+const ext2_blk = @import("../fs/ext2/block.zig");
+const populate = @import("../fs/ext2/populate.zig");
+const fat_pop = @import("../fs/fat32_populate.zig");
+const uefi_nvram = @import("../boot/uefi_nvram.zig");
 
 const paging = @import("../mm/paging.zig");
 const acpi = @import("../acpi/acpi.zig");
@@ -143,9 +146,12 @@ const Phase = enum(u8) {
     reread_gpt = 1,
     mkfs_esp = 2,
     mkfs_root = 3,
-    verify = 4,
-    complete = 5,
-    failed = 6,
+    copy_root = 4,
+    install_boot = 5,
+    boot_entry = 6,
+    verify = 7,
+    complete = 8,
+    failed = 9,
 
     fn label(self: Phase) []const u8 {
         return switch (self) {
@@ -153,6 +159,9 @@ const Phase = enum(u8) {
             .reread_gpt => "Re-reading the partition table",
             .mkfs_esp => "Formatting EFI System Partition (FAT32)",
             .mkfs_root => "Formatting root partition (ext2)",
+            .copy_root => "Copying the system",
+            .install_boot => "Installing the bootloader",
+            .boot_entry => "Registering the firmware boot entry",
             .verify => "Verifying on-disk signatures",
             .complete => "Done",
             .failed => "Stopped",
@@ -160,7 +169,7 @@ const Phase = enum(u8) {
     }
 };
 
-const PHASE_COUNT: u32 = 5;
+const PHASE_COUNT: u32 = 8;
 
 // =============================================================================
 // State
@@ -210,6 +219,11 @@ var phase: Phase = .write_gpt;
 var phases_done: u32 = 0;
 /// Result of the install, only meaningful once `phase` is terminal.
 var fail_reason: []const u8 = "";
+/// copy_root's first frame mounts the target + arms the walk; later frames
+/// step it. Reset when a fresh install starts.
+var copy_started: bool = false;
+/// Boot#### slot the firmware accepted, when the NVRAM step succeeded.
+var boot_entry_slot: ?u16 = null;
 
 /// Partition geometry, computed on entry to the layout screen so the table
 /// shows the numbers that will actually be written rather than a guess.
@@ -783,6 +797,9 @@ fn drawInstalling() void {
     const status = switch (phase) {
         .complete => "All steps finished.",
         .failed => fail_reason,
+        // Live totals while the tree streams across — the one phase whose
+        // duration the user would otherwise have to take on faith.
+        .copy_root => fmt("Copying the system - {d} files, {d} MiB", .{ populate.stats.files, populate.stats.bytes / (1024 * 1024) }),
         else => phase.label(),
     };
     text(x, y, status, if (phase == .failed) FAIL else INK_DIM);
@@ -824,16 +841,21 @@ fn drawDone() void {
     gfx.drawThickLineAA(cx - 4, y + 38, cx + 14, y + 20, 3, OK);
     y += 58 + 22;
 
-    aa.drawTextCentered(x, y, w, "The disk is ready", INK, aa.getDefault24());
+    aa.drawTextCentered(x, y, w, "Installation complete", INK, aa.getDefault24());
     y += 40;
 
-    y = paragraphCentered(x, y, w, fmt("nvme{d} now carries a GPT table with a FAT32 EFI System Partition and an ext2 root, both verified by reading them back.", .{disks[selected].ctrl}), INK_DIM);
+    y = paragraphCentered(x, y, w, fmt("nvme{d} now carries the full system: {d} files ({d} MiB) on the ext2 root, BOOTX64.EFI and the kernel on the EFI System Partition.", .{ disks[selected].ctrl, populate.stats.files, populate.stats.bytes / (1024 * 1024) }), INK_DIM);
     y += 16;
 
-    // The honest part. Say exactly what is missing rather than implying the
-    // machine will boot.
-    gfx.fillRoundedRect(x + 40, y, w - 80, 78, 7, WARN_BG);
-    _ = paragraph(x + 54, y + 12, w - 108, "This does not yet make the disk bootable. Copying the system onto the new root, writing BOOTX64.EFI to the ESP, and registering the firmware boot entry are not implemented.", WARN_INK);
+    if (boot_entry_slot) |slot| {
+        _ = paragraphCentered(x, y, w, fmt("Firmware entry Boot{X:0>4} points at the new disk. Restart to boot it.", .{slot}), INK_DIM);
+    } else {
+        // Honest about the one step that didn't land: no fake certainty
+        // about NVRAM, but no false alarm either — the fallback path is
+        // what most firmware boots removable disks through anyway.
+        gfx.fillRoundedRect(x + 40, y, w - 80, 58, 7, WARN_BG);
+        _ = paragraph(x + 54, y + 12, w - 108, "No firmware boot entry was written (runtime services unreachable). The disk still boots through its \\EFI\\BOOT\\BOOTX64.EFI fallback path.", WARN_INK);
+    }
 }
 
 /// Centred paragraph. Same wrapper as `paragraph` but each line is centred in
@@ -959,6 +981,8 @@ fn advance() void {
             screen = .installing;
             phase = .write_gpt;
             log_total = 0;
+            copy_started = false;
+            boot_entry_slot = null;
             logLine("target nvme{d}: {d} sectors ({d} MiB)", .{ disks[selected].ctrl, disks[selected].sectors, disks[selected].sectors / 2048 });
         },
         .installing => {},
@@ -1107,6 +1131,96 @@ fn stepInstall() void {
                 return;
             }
             logLine("ok   ext2 on partition 2 ({d} MiB)", .{p.sectorCount() / 2048});
+            finished(.copy_root);
+        },
+
+        .copy_root => {
+            if (!copy_started) {
+                const p = table.parts[1];
+                const target_mount = populate.ensureWorkingSet() orelse {
+                    fail("Out of memory for the copy working set.");
+                    return;
+                };
+                if (!ext2_blk.mountAt(target_mount, block.readSectorsTargetU16, block.writeSectorsTargetU16, @intCast(p.start_lba))) {
+                    fail("Mounting the freshly-formatted root failed.");
+                    return;
+                }
+                if (!populate.copyBegin(target_mount)) {
+                    fail("The live root is not mounted; nothing to copy from.");
+                    return;
+                }
+                copy_started = true;
+                logLine("[copy] system tree -> nvme{d} part 2", .{disks[selected].ctrl});
+                return; // paint the label before the long haul
+            }
+            // A slice of the copy per frame: enough entries that the whole
+            // tree lands in a few hundred frames, few enough that the screen
+            // stays alive. ~2 MiB or 24 entries, whichever comes first.
+            const start_bytes = populate.stats.bytes;
+            var steps: u32 = 0;
+            while (steps < 24 and populate.stats.bytes - start_bytes < 2 * 1024 * 1024) : (steps += 1) {
+                switch (populate.copyStep()) {
+                    .more => {},
+                    .failed => {
+                        fail("Copying the system failed. See the serial log.");
+                        return;
+                    },
+                    .done => {
+                        logLine("ok   {d} files, {d} dirs, {d} MiB copied", .{ populate.stats.files, populate.stats.dirs, populate.stats.bytes / (1024 * 1024) });
+                        finished(.install_boot);
+                        return;
+                    },
+                }
+            }
+        },
+
+        .install_boot => {
+            const p = table.parts[0];
+            var esp = fat_pop.open(dev, @intCast(p.start_lba)) orelse {
+                fail("Re-opening the fresh ESP failed.");
+                return;
+            };
+            const efi_name = fat_pop.name83("EFI");
+            const efi_dir = fat_pop.addDir(&esp, esp.root_cluster, &efi_name) orelse {
+                fail("Creating \\EFI on the ESP failed.");
+                return;
+            };
+            const boot_name = fat_pop.name83("BOOT");
+            const boot_dir = fat_pop.addDir(&esp, efi_dir, &boot_name) orelse {
+                fail("Creating \\EFI\\BOOT on the ESP failed.");
+                return;
+            };
+            if (!espCopyFile(&esp, "boot/BOOTX64.EFI", boot_dir, "BOOTX64.EFI")) {
+                fail("Writing BOOTX64.EFI to the ESP failed.");
+                return;
+            }
+            if (!espCopyFile(&esp, "boot/kernel.elf", esp.root_cluster, "KERNEL.ELF")) {
+                fail("Writing kernel.elf to the ESP failed.");
+                return;
+            }
+            if (!fat_pop.finalize(&esp)) {
+                fail("Updating the ESP's FSInfo failed.");
+                return;
+            }
+            logLine("ok   \\EFI\\BOOT\\BOOTX64.EFI + \\kernel.elf on the ESP", .{});
+            finished(.boot_entry);
+        },
+
+        .boot_entry => {
+            const p = table.parts[0];
+            if (uefi_nvram.addBootEntry("ZigOS", .{
+                .partition_number = p.index + 1,
+                .partition_start = p.start_lba,
+                .partition_sectors = p.sectorCount(),
+                .partition_guid = p.unique_guid,
+            })) |slot| {
+                boot_entry_slot = slot;
+                logLine("ok   firmware entry Boot{X:0>4}, first in BootOrder", .{slot});
+            } else {
+                // Non-fatal by design: the \EFI\BOOT fallback path boots the
+                // disk on any firmware, entry or no entry.
+                logLine("[nvram] entry not written - \\EFI\\BOOT fallback still boots this disk", .{});
+            }
             finished(.verify);
         },
 
@@ -1130,6 +1244,36 @@ fn fail(reason: []const u8) void {
     fail_reason = reason;
     phase = .failed;
     logLine("FAIL {s}", .{reason});
+}
+
+/// Stream one file from the live root into the target ESP, through the same
+/// PMM-backed bounce buffer the copy phase used (the copy is finished by the
+/// time this runs). `src_path` is an ext2 path without a leading slash
+/// ("boot/BOOTX64.EFI"); `dst_name` must fit 8.3, which everything this
+/// installer writes does.
+fn espCopyFile(esp: *fat_pop.Esp, src_path: []const u8, dir_cluster: u32, dst_name: []const u8) bool {
+    const buf = populate.copy_buf;
+    if (buf.len == 0) return false; // working set never armed — can't happen after copy_root
+    var h = ext2.openFile(src_path) orelse {
+        logLine("FAIL {s} missing from the live root", .{src_path});
+        return false;
+    };
+    defer ext2.closeFile(h);
+    var writer = fat_pop.beginFile(esp);
+    while (true) {
+        const got = ext2.readFile(h, buf.ptr, @intCast(buf.len));
+        if (got == 0) break;
+        h.current_offset += got;
+        if (!fat_pop.appendData(esp, &writer, buf[0..got])) return false;
+    }
+    if (writer.size != h.file_size) {
+        logLine("FAIL {s}: {d} of {d} bytes read", .{ src_path, writer.size, h.file_size });
+        return false;
+    }
+    const nm = fat_pop.name83(dst_name);
+    if (!fat_pop.endFile(esp, &writer, dir_cluster, &nm)) return false;
+    logLine("[esp] {s} ({d} KiB)", .{ dst_name, writer.size / 1024 });
+    return true;
 }
 
 /// Read back what each formatter claims to have written. A smoke test, not a
@@ -1278,9 +1422,12 @@ fn enumerateDisks() void {
 }
 
 pub fn taskEntry() callconv(.c) noreturn {
-    // Same first-task cutover the desktop does: retire the legacy low identity
-    // now that we are off the boot stack, then turn SMAP on and IRQs back up.
-    paging.dropLowIdentity();
+    // The desktop retires the legacy low identity map at this point; the
+    // installer KEEPS it. UEFI Runtime Services live in that low firmware
+    // map, the boot-entry step calls SetVariable at the very end of the
+    // install, and uefi_nvram.rsCallable() gates on exactly this mapping —
+    // dropping it would turn the NVRAM write into a silent no-op. SMAP still
+    // goes on; the EFI calls wrap themselves in beginNonSmepCall.
     @import("../cpu/arch/protect.zig").enableSmapPerCpu();
     asm volatile ("sti");
     @import("../boot/boot_phase.zig").markComplete();
