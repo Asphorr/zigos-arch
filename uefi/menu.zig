@@ -783,7 +783,8 @@ fn showImpl(
             const footer_y = panel_y + panel_h - 30;
             fillRect(fb, panel_x + 40, footer_y - 12, panel_w - 80, 1, COLOR_BORDER_OUT);
             var fs = layout.HStack.init(fb, panel_x + 28, footer_y - 4, footer_row_h);
-            const keys = [_]struct { cap: []const u8, label: []const u8 }{
+            const KeyHint = struct { cap: []const u8, label: []const u8 };
+            const keys = [_]KeyHint{
                 .{ .cap = "Up/Dn", .label = "move" },
                 .{ .cap = "1-4", .label = "jump" },
                 .{ .cap = "Enter", .label = "boot" },

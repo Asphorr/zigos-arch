@@ -54,7 +54,7 @@ const IRQ0_CANARY_STR = std.fmt.comptimePrint("0x{X}", .{IRQ0_CANARY});
 /// the only legitimate writer is handleIRQ0 below. Earlier the count shared
 /// a page with vga.col/row/bg, so the page-coarse watch fired on every
 /// vga.print and drowned out the wild writer we're hunting.
-pub var hb_state_count_page: struct {
+pub const HbCountPage = struct {
     /// (u: BSP IRQ0 only) Bumped on every non-soft-yield IRQ0 on BSP, under
     /// cli. No cross-CPU reader of `.count` itself (the MMU write-watch
     /// uses the PAGE-protection bit, not the value). If you add a remote
@@ -64,7 +64,8 @@ pub var hb_state_count_page: struct {
     /// value.
     count: u64 = 0,
     _pad: [4088]u8 = [_]u8{0} ** 4088,
-} align(4096) = .{};
+};
+pub var hb_state_count_page: HbCountPage align(4096) = .{};
 
 /// Forensic bisect — flip BISECT_ENABLED=true during a wild-writer hunt to
 /// dump a serial line whenever the iretq-frame CS or SS differs from the

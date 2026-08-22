@@ -321,7 +321,8 @@ var throttle_buf: [96]u8 = undefined;
 fn throttleSummary(t: Throttle) []const u8 {
     if (!t.any()) return "none";
     var n: usize = 0;
-    const parts = [_]struct { on: bool, name: []const u8 }{
+    const Part = struct { on: bool, name: []const u8 };
+    const parts = [_]Part{
         .{ .on = t.thermal, .name = "thermal " },
         .{ .on = t.prochot, .name = "prochot " },
         .{ .on = t.critical, .name = "critical " },

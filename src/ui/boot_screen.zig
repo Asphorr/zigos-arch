@@ -179,7 +179,8 @@ const S_RECTS = [_]Rect{
     .{ .dx = 0, .dy = 86, .w = 60, .h = 10 }, // bottom
 };
 
-const LETTERS = [_]struct { rects: []const Rect, w: u32 }{
+const Letter = struct { rects: []const Rect, w: u32 };
+const LETTERS = [_]Letter{
     .{ .rects = &Z_RECTS, .w = LETTER_W_WIDE },
     .{ .rects = &I_RECTS, .w = LETTER_W_I },
     .{ .rects = &G_RECTS, .w = LETTER_W_WIDE },

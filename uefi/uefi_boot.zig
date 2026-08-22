@@ -168,7 +168,9 @@ fn pickBestGopMode(gop: *GraphicsOutput) void {
         const MAX_BYTES: u64 = uefi_layout.GUEST_FB_SIZE;
         const MAX_AREA: u64 = 1920 * 1080;
 
-        fn rate(info: anytype) struct { tier: u8, area: u64 } {
+        const Score = struct { tier: u8, area: u64 };
+
+        fn rate(info: anytype) Score {
             const w: u64 = info.horizontal_resolution;
             const h: u64 = info.vertical_resolution;
             const area = w * h;
