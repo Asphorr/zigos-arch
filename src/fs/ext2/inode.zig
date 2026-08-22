@@ -64,6 +64,12 @@ fn insertCache(inum: u32, ino: layout.Inode) void {
 /// bitmap, so the linear first-free-bit scan walks past them naturally.
 pub fn allocInode(is_dir: bool) ?u32 {
     const m = block.getMount() orelse return null;
+    return allocInodeOn(m, is_dir);
+}
+
+/// allocInode against an explicit mount — the installer's target-mount path,
+/// and the body the global entry point delegates to.
+pub fn allocInodeOn(m: *block.Mount, is_dir: bool) ?u32 {
     // Whole-op hold: the bitmap RMW below is readBlockBytes + writeBlockBytes
     // — two separate lock sections without this. Two concurrent allocInode
     // calls could both observe the same bit clear and return the SAME inum,
@@ -214,6 +220,44 @@ pub fn writeInode(inum: u32, ino: *const layout.Inode) bool {
 }
 
 // =============================================================================
+// Explicit-mount inode I/O — the installer's target-mount path
+// =============================================================================
+//
+// Same disk math as readInode/writeInode above, but against a caller-supplied
+// Mount and WITHOUT the inode cache: the cache keys on bare inum, and with two
+// mounts alive (live root + install target) one inum names two different
+// on-disk inodes — a cache hit would serve the live root's inode for a target
+// lookup. The live-root paths keep their cache; these bypass it entirely.
+
+pub fn readInodeOn(m: *block.Mount, inum: u32) ?layout.Inode {
+    if (inum == 0) return null;
+    block.lockMount(m);
+    defer block.unlockMount(m);
+    const group: u32 = (inum - 1) / m.sb.inodes_per_group;
+    if (group >= m.bgd_count) return null;
+    const idx_in_group: u32 = (inum - 1) % m.sb.inodes_per_group;
+    const block_off: u32 = idx_in_group / m.inodes_per_block;
+    const byte_off: u32 = (idx_in_group % m.inodes_per_block) * m.sb.inode_size;
+    const table_block: u32 = m.bgd[group].inode_table + block_off;
+    var ino: layout.Inode = undefined;
+    if (!block.readBlockBytes(m, table_block, byte_off, std.mem.asBytes(&ino))) return null;
+    return ino;
+}
+
+pub fn writeInodeOn(m: *block.Mount, inum: u32, ino: *const layout.Inode) bool {
+    if (inum == 0) return false;
+    block.lockMount(m);
+    defer block.unlockMount(m);
+    const group: u32 = (inum - 1) / m.sb.inodes_per_group;
+    if (group >= m.bgd_count) return false;
+    const idx_in_group: u32 = (inum - 1) % m.sb.inodes_per_group;
+    const block_off: u32 = idx_in_group / m.inodes_per_block;
+    const byte_off: u32 = (idx_in_group % m.inodes_per_block) * m.sb.inode_size;
+    const table_block: u32 = m.bgd[group].inode_table + block_off;
+    return block.writeBlockBytes(m, table_block, byte_off, std.mem.asBytes(ino));
+}
+
+// =============================================================================
 // Public API
 // =============================================================================
 
@@ -254,6 +298,11 @@ pub fn readInode(inum: u32) ?layout.Inode {
 /// any indirect-block read failure.
 pub fn blockMapLookup(inode: *const layout.Inode, logical: u32) ?u32 {
     const m = block.getMount() orelse return null;
+    return blockMapLookupOn(m, inode, logical);
+}
+
+/// blockMapLookup against an explicit mount (installer target path).
+pub fn blockMapLookupOn(m: *block.Mount, inode: *const layout.Inode, logical: u32) ?u32 {
     const ptrs_per_block: u32 = m.block_size / 4;
     switch (layout.classifyBlock(logical, ptrs_per_block)) {
         .direct => |d| return nonzero(inode.block[d.i]),
@@ -279,8 +328,13 @@ pub fn blockMapLookup(inode: *const layout.Inode, logical: u32) ?u32 {
 /// mount.block_size. Sparse holes return all zeros.
 pub fn readInodeBlock(inode: *const layout.Inode, logical: u32, dst: []u8) bool {
     const m = block.getMount() orelse return false;
+    return readInodeBlockOn(m, inode, logical, dst);
+}
+
+/// readInodeBlock against an explicit mount (installer target path).
+pub fn readInodeBlockOn(m: *block.Mount, inode: *const layout.Inode, logical: u32, dst: []u8) bool {
     if (dst.len != m.block_size) return false;
-    if (blockMapLookup(inode, logical)) |phys| {
+    if (blockMapLookupOn(m, inode, logical)) |phys| {
         return block.readBlock(m, phys, dst);
     }
     @memset(dst, 0);

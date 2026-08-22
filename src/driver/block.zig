@@ -286,6 +286,15 @@ pub fn writeSectorsTarget(lba: u32, count: u32, src: [*]const u8) bool {
     return nvme.writeSectorsOn(TARGET_CTRL_IDX, lba, count, src);
 }
 
+/// u16-count shims matching ext2/block.zig's ReadFn/WriteFn shape, so the
+/// installer can hand the install target to a second ext2 Mount (mountAt).
+pub fn readSectorsTargetU16(lba: u32, count: u16, dest: [*]u8) bool {
+    return readSectorsTarget(lba, count, dest);
+}
+pub fn writeSectorsTargetU16(lba: u32, count: u16, src: [*]const u8) bool {
+    return writeSectorsTarget(lba, count, src);
+}
+
 // =============================================================================
 // Per-controller read-only views — GPT discovery
 // =============================================================================

@@ -41,7 +41,7 @@ fn cachedWalk(path: []const u8) ?u32 {
 /// here once.) Yields EVERY structurally-valid entry, including empty
 /// (inode == 0) slack slots so the insert/remove paths can see them; read
 /// callers skip `inode == 0 or name.len == 0` themselves.
-const DirWalk = struct {
+pub const DirWalk = struct {
     buf: []u8,
     off: u32 = 0,
 
@@ -51,7 +51,7 @@ const DirWalk = struct {
         name: []u8,
     };
 
-    fn next(self: *DirWalk) ?Entry {
+    pub fn next(self: *DirWalk) ?Entry {
         if (self.off + layout.DIR_ENTRY_HDR > self.buf.len) return null;
         const e = std.mem.bytesAsValue(layout.DirEntry, self.buf[self.off .. self.off + layout.DIR_ENTRY_HDR]);
         const rl: u32 = e.rec_len;
@@ -813,7 +813,9 @@ pub fn loadFile(path: []const u8, dest: []align(4) u8) ?usize {
 /// that wants to cache-key on the file (ELF text sharing, Slice 3e) gets the
 /// inum from the *same* resolution that read the bytes, with no chance of a
 /// second `cachedWalk` diverging to a different file.
-pub fn loadFileInum(path: []const u8, dest: []align(4) u8) ?struct { size: usize, inum: u32 } {
+pub const LoadedFile = struct { size: usize, inum: u32 };
+
+pub fn loadFileInum(path: []const u8, dest: []align(4) u8) ?LoadedFile {
     const inum = cachedWalk(path) orelse return null;
     const ino = inode.readInode(inum) orelse {
         debug.klog("[ext2-fail] loadFileInum {s}: inum={d} readInode->null (inode-table block unreadable)\n", .{ path, inum });
