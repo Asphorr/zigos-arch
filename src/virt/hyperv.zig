@@ -90,7 +90,10 @@ const FlushInput = extern struct {
     processor_mask: u64,
 };
 
-inline fn cpuid(leaf: u32, sub: u32) struct { eax: u32, ebx: u32, ecx: u32, edx: u32 } {
+// Named return type — the anonymous-struct-in-call-graph LLVM bitcode trap.
+const CpuidRegs = struct { eax: u32, ebx: u32, ecx: u32, edx: u32 };
+
+inline fn cpuid(leaf: u32, sub: u32) CpuidRegs {
     var eax: u32 = undefined;
     var ebx: u32 = undefined;
     var ecx: u32 = undefined;

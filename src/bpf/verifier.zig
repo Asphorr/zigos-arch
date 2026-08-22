@@ -349,7 +349,9 @@ fn jumpTarget(pc: usize, delta: i64) usize {
 /// pruning it is sound — and it is what lets a counted loop unroll precisely.
 /// Anything else (JMP32, reg-vs-reg, signed, negative imm, non-scalar) passes
 /// through with both edges feasible.
-fn narrowCond(out: RegFile, i: Insn, is32: bool, taken: *RegFile, fall: *RegFile) struct { taken_ok: bool, fall_ok: bool } {
+const NarrowResult = struct { taken_ok: bool, fall_ok: bool };
+
+fn narrowCond(out: RegFile, i: Insn, is32: bool, taken: *RegFile, fall: *RegFile) NarrowResult {
     taken.* = out;
     fall.* = out;
     const src_x = (i.opcode & insn.SRC_X) != 0;

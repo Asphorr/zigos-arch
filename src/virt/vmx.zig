@@ -84,7 +84,12 @@ var vmxon_region_phys: usize = 0;
 var vmxon_region_va: usize = 0;
 pub var in_vmx_operation: bool = false;
 
-inline fn cpuid(leaf: u32, sub: u32) struct { eax: u32, ebx: u32, ecx: u32, edx: u32 } {
+// Named return types (CpuidRegs, VmreadResult): anonymous struct types in
+// the kernel's call graph trip the Zig 0.15.2 → LLVM 20.1.2 bitcode bug
+// ("Invalid type" / "Only named structs can be forward referenced").
+const CpuidRegs = struct { eax: u32, ebx: u32, ecx: u32, edx: u32 };
+
+inline fn cpuid(leaf: u32, sub: u32) CpuidRegs {
     var eax: u32 = undefined;
     var ebx: u32 = undefined;
     var ecx: u32 = undefined;
@@ -274,8 +279,10 @@ inline fn vmwrite(field: u64, value: u64) VmxStatus {
     return vmxStatus(cf, zf);
 }
 
+const VmreadResult = struct { value: u64, status: VmxStatus };
+
 /// VMREAD field -> value. Field and destination both in registers.
-inline fn vmread(field: u64) struct { value: u64, status: VmxStatus } {
+inline fn vmread(field: u64) VmreadResult {
     var value: u64 = undefined;
     var cf: u8 = undefined;
     var zf: u8 = undefined;

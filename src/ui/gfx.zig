@@ -37,7 +37,14 @@ pub fn useFramebuffer() void {
 
 // --- Clipping helpers ---
 
-inline fn clipRect(x: i32, y: i32, w: u32, h: u32) ?struct { x0: u32, y0: u32, x1: u32, y1: u32 } {
+// Named rather than anonymous return types here and in roundedRowEdge:
+// anonymous struct types reachable from the kernel's call graph make Zig
+// 0.15.2 emit bitcode LLVM 20.1.2 rejects ("Invalid type" / "Only named
+// structs can be forward referenced") — which types trip it shifts with
+// module layout, so every one that CAN be named should be.
+const ClipRect = struct { x0: u32, y0: u32, x1: u32, y1: u32 };
+
+inline fn clipRect(x: i32, y: i32, w: u32, h: u32) ?ClipRect {
     const iw: i32 = @intCast(w);
     const ih: i32 = @intCast(h);
     const tw: i32 = @intCast(target_w);
@@ -746,7 +753,9 @@ inline fn blendPixelAt(px: i32, py: i32, argb: u32) void {
 /// IS the coverage of the boundary pixel — blending it turns the old
 /// stair-stepped corner into a smooth 1px-AA arc that matches the window
 /// chrome's supersampled corners.
-fn roundedRowEdge(r: u32, dy: u32) struct { inset: u32, edge_a: u32 } {
+const RowEdge = struct { inset: u32, edge_a: u32 };
+
+fn roundedRowEdge(r: u32, dy: u32) RowEdge {
     const inner = r * r -| (dy * dy);
     const s = isqrt(inner);
     const denom = 2 * s + 1;

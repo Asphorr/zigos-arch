@@ -31,7 +31,9 @@ pub var umip_enabled: bool = false;
 pub var pcid_supported: bool = false;
 pub var invpcid_supported: bool = false;
 
-inline fn cpuidLeaf(leaf: u32, subleaf: u32) struct { eax: u32, ebx: u32, ecx: u32, edx: u32 } {
+const CpuidRegs = struct { eax: u32, ebx: u32, ecx: u32, edx: u32 };
+
+inline fn cpuidLeaf(leaf: u32, subleaf: u32) CpuidRegs {
     var eax: u32 = undefined;
     var ebx: u32 = undefined;
     var ecx: u32 = undefined;

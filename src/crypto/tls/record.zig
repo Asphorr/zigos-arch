@@ -115,7 +115,9 @@ pub fn decrypt(out: []u8, ciphertext: []const u8, aad: []const u8, cipher: Ciphe
 /// skipping any zero padding, to return the inner content type. The
 /// content (handshake message, alert, application data) is the bytes
 /// BEFORE that final type byte.
-pub fn stripInnerType(plain: []const u8) struct { inner_type: u8, content: []const u8 } {
+pub const InnerRecord = struct { inner_type: u8, content: []const u8 };
+
+pub fn stripInnerType(plain: []const u8) InnerRecord {
     var end = plain.len;
     while (end > 0 and plain[end - 1] == 0) : (end -= 1) {}
     if (end == 0) return .{ .inner_type = 0, .content = plain[0..0] };

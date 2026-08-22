@@ -551,7 +551,10 @@ pub fn hasNfit() bool {
 /// length. Null if there's no NFIT or no PM range. The iterator already
 /// bounds every entry inside the table body, and the type-0 length check
 /// guarantees the full NfitSpaRange is readable before we cast.
-pub fn firstPmemRange() ?struct { base: u64, length: u64 } {
+/// Named return type — the anonymous-struct-in-call-graph LLVM bitcode trap.
+pub const PmemRange = struct { base: u64, length: u64 };
+
+pub fn firstPmemRange() ?PmemRange {
     var it = nfitEntries();
     while (it.next()) |h| {
         if (h.entry_type != 0) continue; // only SPA Range structures
@@ -573,7 +576,7 @@ pub fn firstPmemRange() ?struct { base: u64, length: u64 } {
 /// firmware's *dynamic* (DSM-mailbox) answer can be cross-checked against the
 /// static table. Every field read is bounds-checked against `buf`; a zero or
 /// truncated entry length stops the walk rather than spinning.
-pub fn pmemRangeFromFitBuffer(buf: []const u8) ?struct { base: u64, length: u64 } {
+pub fn pmemRangeFromFitBuffer(buf: []const u8) ?PmemRange {
     var off: usize = 0;
     while (off + @sizeOf(NfitStructHeader) <= buf.len) {
         const etype = @as(u16, buf[off]) | (@as(u16, buf[off + 1]) << 8);

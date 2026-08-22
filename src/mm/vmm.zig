@@ -93,7 +93,9 @@ inline fn tableFromEntry(entry: u64) [*]u64 {
 
 /// Allocate a zeroed page frame and return it as a table pointer (via the
 /// physmap so the kernel can write zeros without depending on PML4[0]).
-fn allocZeroedTable() ?struct { ptr: [*]u64, phys: usize } {
+const TableAlloc = struct { ptr: [*]u64, phys: usize };
+
+fn allocZeroedTable() ?TableAlloc {
     const phys = pmm.allocFrame() orelse return null;
     const ptr: [*]u64 = @ptrFromInt(paging.physToVirt(phys));
     @memset(ptr[0..512], 0);

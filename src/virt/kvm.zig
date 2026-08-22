@@ -31,7 +31,10 @@ const KVM_FEATURE_CLOCKSOURCE_STABLE: u32 = 1 << 24; // no need to re-read on mi
 var base: u32 = 0; // 0 = KVM leaf not found
 var features_eax: u32 = 0;
 
-inline fn cpuid(leaf: u32) struct { eax: u32, ebx: u32, ecx: u32, edx: u32 } {
+// Named return type — the anonymous-struct-in-call-graph LLVM bitcode trap.
+const CpuidRegs = struct { eax: u32, ebx: u32, ecx: u32, edx: u32 };
+
+inline fn cpuid(leaf: u32) CpuidRegs {
     var eax: u32 = undefined;
     var ebx: u32 = undefined;
     var ecx: u32 = undefined;

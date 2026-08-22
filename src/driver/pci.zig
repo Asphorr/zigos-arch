@@ -472,7 +472,9 @@ pub fn deviceCount() usize {
 /// space offset 0x2C. Useful for telling apart variants that share the
 /// same vendor/device-id (transitional virtio devices, OEM rebrands of
 /// common chipsets, etc).
-pub fn subsystemIds(dev: PciDevice) struct { svid: u16, sid: u16 } {
+pub const SubsystemIds = struct { svid: u16, sid: u16 };
+
+pub fn subsystemIds(dev: PciDevice) SubsystemIds {
     const raw = configRead(dev.bus, dev.dev, dev.func, 0x2C);
     return .{ .svid = @truncate(raw), .sid = @truncate(raw >> 16) };
 }

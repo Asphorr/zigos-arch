@@ -134,7 +134,9 @@ noinline fn copyRawInner(dst: usize, src: usize, len: usize) usize {
 /// fault would read as found=true with rem==max and underflow the length
 /// math). So found=false is guaranteed on every fault path. Caller must
 /// reject max==0 (a zero-count rep never runs and never touches flags).
-noinline fn strnlenInner(ptr: usize, max: usize) struct { rem: usize, found: bool } {
+const StrnlenResult = struct { rem: usize, found: bool };
+
+noinline fn strnlenInner(ptr: usize, max: usize) StrnlenResult {
     var rem: usize = undefined;
     var found: usize = undefined;
     asm volatile (

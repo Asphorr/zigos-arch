@@ -59,7 +59,9 @@ pub var tj_max: u32 = 100; // junction-max °C; default when 0x1A2 unreadable
 pub var base_mhz: u32 = 0; // CPUID.16H:EAX base clock (0 if leaf absent)
 var energy_nj_per_unit: u64 = 0; // RAPL energy-status unit, in nanojoules
 
-inline fn cpuid(leaf: u32, sub: u32) struct { eax: u32, ebx: u32, ecx: u32, edx: u32 } {
+const CpuidRegs = struct { eax: u32, ebx: u32, ecx: u32, edx: u32 };
+
+inline fn cpuid(leaf: u32, sub: u32) CpuidRegs {
     var eax: u32 = undefined;
     var ebx: u32 = undefined;
     var ecx: u32 = undefined;

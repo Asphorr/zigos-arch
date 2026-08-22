@@ -52,7 +52,9 @@ pub fn supportsHint(hint: u32) bool {
     return ((substates >> shift) & 0x0F) != 0;
 }
 
-inline fn cpuid(leaf: u32, sub: u32) struct { eax: u32, ebx: u32, ecx: u32, edx: u32 } {
+const CpuidRegs = struct { eax: u32, ebx: u32, ecx: u32, edx: u32 };
+
+inline fn cpuid(leaf: u32, sub: u32) CpuidRegs {
     var eax: u32 = undefined;
     var ebx: u32 = undefined;
     var ecx: u32 = undefined;

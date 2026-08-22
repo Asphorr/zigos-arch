@@ -21,7 +21,9 @@ var caps_init: bool = false;
 var has_rdrand: bool = false;
 var has_rdseed: bool = false;
 
-fn cpuid(leaf: u32, sub: u32) struct { a: u32, b: u32, c: u32, d: u32 } {
+const CpuidRegs = struct { a: u32, b: u32, c: u32, d: u32 };
+
+fn cpuid(leaf: u32, sub: u32) CpuidRegs {
     var a: u32 = leaf;
     var b: u32 = undefined;
     var c: u32 = sub;

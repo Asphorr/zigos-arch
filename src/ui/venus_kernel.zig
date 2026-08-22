@@ -402,7 +402,9 @@ pub fn encodeGetMemoryResourceProperties(
 /// Parse the vkGetMemoryResourcePropertiesMESA reply from the reply ring.
 /// Returns (VkResult, memoryTypeBits). Caller must have zeroed and
 /// Seek(0)'d the reply ring before submit.
-pub fn readGetMemoryResourcePropertiesReply(ring: [*]volatile u8) struct { result: i32, type_bits: u32 } {
+pub const MemoryPropsReply = struct { result: i32, type_bits: u32 };
+
+pub fn readGetMemoryResourcePropertiesReply(ring: [*]volatile u8) MemoryPropsReply {
     // ring[0..4]   = cmd_type (192)
     // ring[4..8]   = VkResult
     // ring[8..16]  = simple_pointer (= 1)

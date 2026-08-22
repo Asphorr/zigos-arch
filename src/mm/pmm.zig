@@ -277,7 +277,9 @@ fn removeRunLocked(region_idx: u32, start_frame: u32, count: u32) bool {
 /// Returns the run's start_frame and original count, or null if no run fits.
 /// Caller takes the first `count` frames and is responsible for pushing the
 /// remainder (count - needed) back via `pushRunLocked` if any.
-fn popRunGEInRegionLocked(region_idx: u32, count: u32) ?struct { start_frame: u32, run_count: u32 } {
+const FrameRun = struct { start_frame: u32, run_count: u32 };
+
+fn popRunGEInRegionLocked(region_idx: u32, count: u32) ?FrameRun {
     const r = &regions[region_idx];
     var order = orderForSize(count);
     while (order <= MAX_ORDER) : (order += 1) {

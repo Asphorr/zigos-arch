@@ -231,9 +231,11 @@ fn mappingAllocRoundUp(size: usize) usize {
     return size + round;
 }
 
+const FlSl = struct { fl: usize, sl: usize };
+
 // Map a size to (fl, sl). For sizes < SMALL_BLOCK_SIZE, fl=0 and sl is
 // linear in size.
-fn mapping(size: usize) struct { fl: usize, sl: usize } {
+fn mapping(size: usize) FlSl {
     if (size < (1 << FL_INDEX_SHIFT)) {
         const small_shift: u6 = FL_INDEX_SHIFT - SL_INDEX_LOG2;
         return .{ .fl = 0, .sl = size >> small_shift };
@@ -246,7 +248,7 @@ fn mapping(size: usize) struct { fl: usize, sl: usize } {
 
 // Find the smallest non-empty (fl, sl) >= the input. Returns null if no
 // satisfying block exists.
-fn searchSuitableBlock(fl_in: usize, sl_in: usize) ?struct { fl: usize, sl: usize } {
+fn searchSuitableBlock(fl_in: usize, sl_in: usize) ?FlSl {
     if (fl_in >= FL_INDEX_COUNT) return null;
     // First try same FL, SL >= sl_in.
     const sl_map: u16 = sl_bitmaps[fl_in] & (@as(u16, 0xFFFF) << @intCast(sl_in));

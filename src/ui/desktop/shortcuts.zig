@@ -68,7 +68,7 @@ var drag_anchor_y: i32 = 0;
 /// once a column runs out of vertical space, so 13+ pinned icons stay
 /// fully visible at 1280×800 without overlapping the dock. Both the
 /// hit-test and the renderer go through this so they agree on layout.
-fn iconCell(si: usize) struct { x: i32, y: i32 } {
+fn iconCell(si: usize) Pos {
     if (positions[si]) |p| return .{ .x = p.x, .y = p.y };
     // Leave ~60 px of breathing room above the dock so the bottom icon's
     // label isn't crushed against the pill.
@@ -235,7 +235,9 @@ pub const ClickResult = enum { miss, selected, launch, drop };
 /// Mouse-up. If a drag is in progress, commit the new position. If
 /// instead this was a static press, run the original click / double-
 /// click logic.
-pub fn handleMouseUp(mx: i32, my: i32, now: u32) struct { result: ClickResult, launch_idx: usize } {
+pub const MouseUpResult = struct { result: ClickResult, launch_idx: usize };
+
+pub fn handleMouseUp(mx: i32, my: i32, now: u32) MouseUpResult {
     if (drag_idx >= 0) {
         // Commit drop. New cell top-left = cursor - anchor, clamped to
         // the screen so users can't drop icons into oblivion.

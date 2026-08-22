@@ -71,7 +71,12 @@ pub fn init() void {
 /// within the current second [0, 999999]. Falls back to seconds-since-boot if
 /// HPET wasn't available — apps that need absolute time should still get a
 /// monotonic answer just with an unknown offset.
-pub fn now() struct { sec: u64, usec: u32 } {
+/// Named rather than an anonymous return type — anonymous struct types in
+/// the kernel's call graph trip the Zig 0.15.2 → LLVM 20.1.2 bitcode bug
+/// ("Invalid type" / "Only named structs can be forward referenced").
+pub const Time = struct { sec: u64, usec: u32 };
+
+pub fn now() Time {
     if (!initialized) return .{ .sec = 0, .usec = 0 };
     const now_ns = hpet.readNanos();
     // HPET counter is monotonic; saturating subtract guards against the

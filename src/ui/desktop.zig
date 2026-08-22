@@ -221,7 +221,9 @@ const BELL_FLASH_FRAMES = theme.BELL_FLASH_FRAMES;
 const CURSOR_BLINK_HALF_TICKS = theme.CURSOR_BLINK_HALF_TICKS;
 const BELL_FLASH_COLOR = theme.BELL_FLASH_COLOR;
 
-inline fn cellColors(attr: u8, fg_rgb: u32) struct { fg: u32, bg: u32 } {
+const CellColors = struct { fg: u32, bg: u32 };
+
+inline fn cellColors(attr: u8, fg_rgb: u32) CellColors {
     var fg: u32 = undefined;
     if ((attr & theme.ATTR_RGB_FG) != 0) {
         fg = fg_rgb;

@@ -81,7 +81,9 @@ fn isUserVA(addr: usize, size: usize) bool {
 /// frames in the lower-4GB identity-mapped range) and copy `file_size` bytes
 /// from `staging` into it. Returns null if PMM has no contiguous chunk that
 /// big. Caller stores the pointer in pcb.elf_buf for later free.
-fn allocAndCopyElfBuf(staging: [*]const u8, file_size: usize) ?struct { buf: [*]u8, pages: u32 } {
+const ElfBuf = struct { buf: [*]u8, pages: u32 };
+
+fn allocAndCopyElfBuf(staging: [*]const u8, file_size: usize) ?ElfBuf {
     const pages: u32 = @intCast((file_size + PAGE_SIZE - 1) / PAGE_SIZE);
     const phys = pmm.allocContiguous(pages) orelse {
         debug.klog("[elf] allocContiguous({d} pages) failed\n", .{pages});

@@ -1530,7 +1530,9 @@ fn tcpTick() void {
 
 // === HTTP ===
 
-fn parseUrl(url: []const u8) ?struct { host: []const u8, path: []const u8 } {
+const UrlParts = struct { host: []const u8, path: []const u8 };
+
+fn parseUrl(url: []const u8) ?UrlParts {
     var s = url;
     if (s.len > 7 and s[0] == 'h' and s[1] == 't' and s[2] == 't' and s[3] == 'p' and s[4] == ':' and s[5] == '/' and s[6] == '/') {
         s = s[7..];

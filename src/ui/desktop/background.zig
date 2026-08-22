@@ -138,7 +138,9 @@ pub fn hasWallpaper() bool {
     return wp_pixels != null;
 }
 
-pub fn wallpaperDims() struct { w: u32, h: u32 } {
+pub const Dims = struct { w: u32, h: u32 };
+
+pub fn wallpaperDims() Dims {
     return .{ .w = wp_w, .h = wp_h };
 }
 
