@@ -688,20 +688,13 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
         13 => @intFromPtr(&@import("test/witness_selftest.zig").taskEntry),
         14 => @intFromPtr(&@import("test/page_cache_selftest.zig").taskEntry),
         15 => @intFromPtr(&@import("test/bpf_verifier_selftest.zig").taskEntry),
-        // Compiled in ONLY when -Dboot-mode asked for it. Unlike modes 13-15
-        // this entry is unreachable from the menu (it is the scripted-run
-        // path), so shipping it in the default kernel buys nothing.
-        //
-        // It also sidesteps a real toolchain failure: with disk_selftest.zig
-        // and the desktop emitted into the same binary, Zig 0.15.2 + LLVM
-        // 20.1.2 aborts the kernel link with "Invalid TYPE table: Only named
-        // structs can be forward referenced". Either alone compiles clean, and
-        // -Dboot-mode=16 (which folds the desktop away) compiles clean. NOT
-        // diagnosed — this gate avoids the combination, it does not fix it.
-        16 => if (@import("build_options").forced_boot_mode != null)
-            @intFromPtr(&@import("test/disk_selftest.zig").taskEntry)
-        else
-            @intFromPtr(&desktop_mod.taskEntry),
+        // Used to be gated behind -Dboot-mode: with disk_selftest.zig and
+        // the desktop in one binary, Zig 0.15.2 + LLVM 20.1.2 aborted the
+        // link with "Invalid TYPE table: Only named structs can be forward
+        // referenced". The culprit turned out to be anonymous struct types
+        // (named during the installer work), so the combination links clean
+        // now and mode 16 dispatches like every other selftest.
+        16 => @intFromPtr(&@import("test/disk_selftest.zig").taskEntry),
         // The graphical installer. Unlike mode 16 this one IS meant to be
         // reachable from the boot menu — installing is something a person
         // does, not a script — so it is compiled in unconditionally.
