@@ -67,7 +67,13 @@ if [ "$HEADLESS" = "1" ]; then
     rm -f installer-mon.sock installer-qmp.sock
     DISPLAY_ARGS="-display none -monitor unix:installer-mon.sock,server,nowait -qmp unix:installer-qmp.sock,server,nowait"
 else
-    DISPLAY_ARGS="-display sdl,show-cursor=off"
+    # gl=on is presentation-only (no guest-visible GPU — the guest still sees
+    # plain stdvga): without it SDL scales the 1920x1080 surface with a
+    # nearest-neighbor blit whenever the window doesn't fit 1:1 (blurry
+    # jaggies), and the non-GL backend also mismaps usb-tablet absolute
+    # coordinates on a scaled window, which reads as a dead mouse. These are
+    # the same flags the desktop runners have always used windowed.
+    DISPLAY_ARGS="-display sdl,gl=on,show-cursor=on"
 fi
 
 # USB HID, same devices as run-uefi-ext2.sh. The first cut of this script bet

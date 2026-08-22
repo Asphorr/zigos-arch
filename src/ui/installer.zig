@@ -186,12 +186,14 @@ const Role = enum {
     unknown,
 
     fn note(self: Role) []const u8 {
+        // Longest label sets the floor for CARD_W — the full string must fit
+        // a card, and the notice below carries the long-form explanation.
         return switch (self) {
-            .tarfs => "in use - boot archive",
-            .root => "in use - live root",
+            .tarfs => "in use - archive",
+            .root => "in use - root",
             .swap => "in use - swap",
             .target => "available",
-            .unknown => "unrecognised role",
+            .unknown => "unknown role",
         };
     }
     fn selectable(self: Role) bool {
@@ -626,9 +628,18 @@ fn drawIntro() void {
 // Screen 2 — destination
 // =============================================================================
 
-const CARD_W: u32 = 168;
+// The full row of MAX_DISKS cards must fit the content strip — the dev
+// topology really does attach four disks, and at 168 px the fourth card ran
+// past the panel edge. 4*140 + 3*10 lands flush on the 590 px strip.
+const CARD_W: u32 = 140;
 const CARD_H: u32 = 118;
-const CARD_GAP: i32 = 12;
+const CARD_GAP: i32 = 10;
+
+comptime {
+    const row_w = MAX_DISKS * CARD_W + (MAX_DISKS - 1) * @as(u32, @intCast(CARD_GAP));
+    if (row_w > PANE_W - 2 * @as(u32, @intCast(PAD_X)))
+        @compileError("disk cards overflow the destination pane - shrink CARD_W/CARD_GAP");
+}
 
 fn diskCardRect(i: usize) Point {
     const stride = @as(i32, @intCast(CARD_W)) + CARD_GAP;
@@ -890,39 +901,42 @@ fn paragraphCentered(x: i32, y: i32, max_w: u32, s: []const u8, color: u32) i32 
 // Cursor
 // =============================================================================
 
-/// Classic arrow, 12x19. '#' is the fill, '.' the outline, ' ' transparent —
-/// drawn last each frame, so there is no save/restore to get wrong.
-const CURSOR = [_][]const u8{
-    "..",
-    ".#.",
-    ".##.",
-    ".###.",
-    ".####.",
-    ".#####.",
-    ".######.",
-    ".#######.",
-    ".########.",
-    ".#########.",
-    ".##########.",
-    ".######.....",
-    ".###.##.",
-    ".##. .##.",
-    ".#.   .##.",
-    "..     .##.",
-    "        .##.",
-    "         .#.",
-    "          ..",
+const CURSOR_W: u32 = 12;
+const CURSOR_H: u32 = 16;
+
+/// The desktop's arrow (1 = black outline, 2 = white fill), same pixels as
+/// ui/desktop.zig's cursor_sprite. Duplicated rather than imported: pulling
+/// desktop.zig into the forced -Dboot-mode builds' module set would reshuffle
+/// bitcode emission order, and that is the dice roll behind the LLVM
+/// "Invalid type" linker fault. Keep the two arrays in sync by hand.
+const cursor_sprite = [CURSOR_H][CURSOR_W]u8{
+    .{ 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    .{ 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    .{ 1, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    .{ 1, 2, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0 },
+    .{ 1, 2, 2, 2, 1, 0, 0, 0, 0, 0, 0, 0 },
+    .{ 1, 2, 2, 2, 2, 1, 0, 0, 0, 0, 0, 0 },
+    .{ 1, 2, 2, 2, 2, 2, 1, 0, 0, 0, 0, 0 },
+    .{ 1, 2, 2, 2, 2, 2, 2, 1, 0, 0, 0, 0 },
+    .{ 1, 2, 2, 2, 2, 2, 2, 2, 1, 0, 0, 0 },
+    .{ 1, 2, 2, 2, 2, 2, 2, 2, 2, 1, 0, 0 },
+    .{ 1, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 0 },
+    .{ 1, 2, 2, 1, 2, 2, 1, 0, 0, 0, 0, 0 },
+    .{ 1, 2, 1, 0, 1, 2, 2, 1, 0, 0, 0, 0 },
+    .{ 1, 1, 0, 0, 1, 2, 2, 1, 0, 0, 0, 0 },
+    .{ 0, 0, 0, 0, 0, 1, 2, 2, 1, 0, 0, 0 },
+    .{ 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0 },
 };
 
+/// Drawn last each frame into the back buffer, so there is no save/restore
+/// to get wrong.
 fn drawCursor() void {
-    for (CURSOR, 0..) |row, ry| {
-        for (row, 0..) |ch, rx| {
-            const color: u32 = switch (ch) {
-                '#' => 0xFFFFFF,
-                '.' => 0x000000,
-                else => continue,
-            };
-            gfx.putPixel(mouse.x + @as(i32, @intCast(rx)), mouse.y + @as(i32, @intCast(ry)), color);
+    for (0..CURSOR_H) |row| {
+        for (0..CURSOR_W) |col| {
+            const pixel = cursor_sprite[row][col];
+            if (pixel == 0) continue;
+            const color: u32 = if (pixel == 1) 0x000000 else 0xFFFFFF;
+            gfx.putPixel(mouse.x + @as(i32, @intCast(col)), mouse.y + @as(i32, @intCast(row)), color);
         }
     }
 }

@@ -27,7 +27,9 @@ rm -f serial-installed.log
 DISPLAY_ARGS="-display none"
 TIMEOUT="timeout 90"
 if [ "${1:-}" = "-display" ]; then
-    DISPLAY_ARGS="-display sdl,show-cursor=off"
+    # Same windowed flags as run-installer.sh — see the comment there for why
+    # gl=on and show-cursor=on matter (scaling quality + tablet coordinates).
+    DISPLAY_ARGS="-display sdl,gl=on,show-cursor=on"
     TIMEOUT=""
 fi
 
