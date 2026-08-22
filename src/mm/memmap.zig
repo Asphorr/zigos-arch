@@ -90,13 +90,13 @@ pub const USER_VA_FLOOR: usize = layout.USER_VA_FLOOR;
 
 // --- Static kernel-side regions (low PA, post-kernel-image) ---
 //
-// Bumped 2026-05-20 from 0x800000 → 0xA00000. The kernel image (incl.
-// BSS) grew past 0x800000 once ext2's per-mount cache_buf went from
-// 4 KB → 32 KB (gap perf-#1) — the kernel-image-fits check tripped.
-// 2 MB of headroom now between _kernel_end and KERNEL_HEAP_BASE so
-// future BSS growth doesn't require chasing this constant again.
-// Downstream regions are *derived* so a future bump only touches
-// KERNEL_HEAP_BASE here.
+// Bumped 2026-05-20 from 0x800000 → 0xA00000 (ext2 cache_buf growth), and
+// 2026-08-22 from 0xA00000 → 0xC00000 (installer campaign BSS) — each time
+// the kernel-image-fits check tripped and each time the fix was the same
+// pair: move the biggest offender out of BSS (kstack_pool then, the
+// installer working set now) AND restore ~2 MB of headroom between
+// _kernel_end and KERNEL_HEAP_BASE. Downstream regions are *derived* so a
+// future bump only touches KERNEL_HEAP_BASE in lib/uefi_layout.zig.
 // Cross-unit layout constants live in lib/uefi_layout.zig — both kernel
 // and UEFI bootloader import from there. The comptime block at the
 // bottom of this file enforces agreement; if the values diverge, build

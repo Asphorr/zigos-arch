@@ -20,7 +20,12 @@
 // UEFI_PT_BASE.
 
 // === Kernel-side region addresses (mirror of memmap.zig) ===
-pub const KERNEL_HEAP_BASE: usize = 0xA00000;
+// Bumped 2026-08-22 from 0xA00000 → 0xC00000: the installer campaign's BSS
+// (a second ext2 Mount is 265 KB alone) ate the 2 MB headroom the 2026-05-20
+// bump bought. The installer's big buffers moved to PMM at the same time;
+// this bump restores the ~2 MB margin between _kernel_end and the heap so
+// ordinary BSS growth doesn't trip assertKernelImageFits again.
+pub const KERNEL_HEAP_BASE: usize = 0xC00000;
 pub const KERNEL_HEAP_SIZE: usize = 0x1000000; // 16 MB
 
 pub const GUEST_FB_BASE: usize = KERNEL_HEAP_BASE + KERNEL_HEAP_SIZE;
