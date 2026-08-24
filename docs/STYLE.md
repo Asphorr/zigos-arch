@@ -181,6 +181,21 @@ dependent race. Linux's `lockdep_assert_held` analogue.
 hold X" or whose name ends in `_Locked`. **Reference exemplar:**
 `pmm.pushRunLocked` line 1 calls `r.lock.assertHeld()`.
 
+## `mightSleep(@src())` — assert-not-atomic at parking sites
+
+The inverse check: `spinlock.mightSleep(@src())` at the entry of every
+function that MAY park the caller (the `sched.blockOn*` family,
+`Mutex.acquire`) kwarns — once per call site — when the calling CPU
+holds a plain-acquired SpinLock or an open `pinPreemption()` window.
+Catches "sleep while atomic" on the first pass through the code path
+instead of the timing-dependent deadlock; covers the *unregistered*
+lock majority the WITNESS sleep-check can't see. Deliberately does not
+warn on IRQs-off — parking with IF=0 is legal here (#PF-context
+swap-evict waits). Linux `might_sleep()` analogue.
+
+**Where to use:** any new function that can reach `schedule()` from
+task context. **Reference exemplar:** `sched.blockOn` line 3.
+
 ## `UserPtr(T)` — type-safe user-space pointers
 
 Raw `usize` / `u32` user VAs flowing through kernel code can't be

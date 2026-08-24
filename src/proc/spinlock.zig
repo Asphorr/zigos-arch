@@ -88,6 +88,7 @@ const process = @import("process.zig"); // Mutex block/wake integration
 // correctly, it just couldn't tell you anything when it wedges.
 const witness = @import("../debug/witness.zig");
 const serial = @import("../debug/serial.zig");
+const debug = @import("../debug/debug.zig"); // kwarn only (mightSleep)
 const symbols = @import("../debug/symbols.zig");
 const kdbg = @import("../debug/kdbg.zig");
 const perf = @import("../debug/perf.zig");
@@ -440,6 +441,36 @@ pub fn spinTargetOf(cpu: usize) usize {
     return @atomicLoad(usize, &spin_target[cpu], .monotonic);
 }
 
+/// Linux might_sleep() analogue, scoped to what this kernel needs: call at
+/// the entry of any function that MAY park the caller (the sched.blockOn*
+/// family, Mutex.acquire). Catches "sleep while atomic" — parking with a
+/// plain-acquired SpinLock held or a pinPreemption() window open — on the
+/// FIRST run through the call site, instead of waiting for the
+/// timing-dependent deadlock the WITNESS sleep-check only sees for
+/// registered locks. The preempt pin counts every plain acquire, named or
+/// not, so this covers the unregistered majority (per-pipe locks,
+/// setstate_locks[], rq.lock).
+///
+/// Deliberately does NOT warn on IRQs-off: parking with IF=0 is legal
+/// here (#PF-context swap-evict waits — the switch target's rflags
+/// re-enable delivery), unlike in Linux.
+///
+/// One kwarn per call site (per-instantiation latch) — a hot buggy path
+/// can't storm the log (rule 6). The warn_count bump still fires each
+/// first hit, so a non-zero count at shutdown flags the class.
+pub fn mightSleep(comptime src: std.builtin.SourceLocation) void {
+    const S = struct {
+        var warned: bool = false;
+    };
+    if (smp.myCpu().current_pid == null) return; // no task — nothing can park
+    const cpu = currentCpuId();
+    if (cpu >= MAX_HOLD_CPUS) return;
+    if (preempt_pin[cpu] != 0 and !S.warned) {
+        S.warned = true;
+        debug.kwarn(src, "mightSleep with preempt pin {d} (SpinLock held or pinned) — parking here can deadlock the CPU", .{preempt_pin[cpu]});
+    }
+}
+
 /// True when the calling CPU currently holds (or is acquiring) at least one
 /// plain-acquired SpinLock and must not be involuntarily preempted. Called
 /// by check_and_preempt_dynirq at IF=0; own-CPU counter, plain read.
@@ -766,6 +797,9 @@ pub const Mutex = struct {
             return;
         }
         const my_pid: u16 = @intCast(cur_opt.?);
+        // May park below (blockOnMutex) — even the uncontended fast path
+        // makes this call site a sleeping site (Linux might_sleep semantic).
+        mightSleep(@src());
         // Recursive-acquire detector — see the doc comment. Panic HERE with
         // the original acquire site + the recursive caller so the bug is
         // debuggable at first occurrence, not after a timing-lucky boot.

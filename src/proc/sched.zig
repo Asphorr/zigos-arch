@@ -60,7 +60,8 @@ const config = @import("../config.zig");
 const signals = @import("signals.zig");
 const runqueue = @import("runqueue.zig");
 const swap = @import("../mm/swap.zig");
-const SpinLock = @import("spinlock.zig").SpinLock;
+const spinlock = @import("spinlock.zig");
+const SpinLock = spinlock.SpinLock;
 
 const process = @import("process.zig");
 const hrtimer = @import("hrtimer.zig");
@@ -2540,6 +2541,7 @@ pub fn blockOnInterruptible(kind: WaitKind, target: u32) BlockResult {
 pub fn blockOn(kind: WaitKind, target: u32) void {
     const cur = smp.myCpu().current_pid orelse return;
     const pcb = &process.procs[cur];
+    spinlock.mightSleep(@src());
     // Captured for the yield-loop detector call below — taken here so the
     // trip dump names the high-level yield site (e.g.
     // nvme.waitCompletionAsync, pipe.read), not blockOn itself.
@@ -2599,6 +2601,7 @@ pub const FutexResult = enum { woke, signalled, again };
 pub fn blockOnFutex(target: u32, word: *const volatile u32, val: u32) FutexResult {
     const cur = smp.myCpu().current_pid orelse return .woke;
     const pcb = &process.procs[cur];
+    spinlock.mightSleep(@src());
     if (hasPendingDeliverable(pcb)) return .signalled;
 
     // H3: test-and-clear instead of unconditional store. A signal arriving
@@ -2672,6 +2675,7 @@ pub fn wake(pid: u8) void {
 pub fn blockOnMutex(target_id: u32, owner_pid_ptr: *const u16) void {
     const cur = smp.myCpu().current_pid orelse return;
     const pcb = &process.procs[cur];
+    spinlock.mightSleep(@src());
     // H3: test-and-clear. A wake() that arrived between caller's failed
     // CAS-try and our enrollment would set wake_pending=true; unconditional
     // store(false) here would stomp it. If we see true, return — caller
@@ -2763,6 +2767,7 @@ pub fn wakeIoUringCqWaiters(instance_id: u32) void {
 pub fn blockOnSwapEvict(pte_ptr: *const u64) void {
     const cur = smp.myCpu().current_pid orelse return;
     const pcb = &process.procs[cur];
+    spinlock.mightSleep(@src());
     const target = swap.evictWaitTarget(pte_ptr);
     while (true) {
         if (!swap.pteIsInflight(@atomicLoad(u64, pte_ptr, .acquire))) return;
