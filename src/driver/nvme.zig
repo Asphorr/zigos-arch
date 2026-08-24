@@ -31,43 +31,93 @@ const msix = @import("../time/msix.zig");
 const debug = @import("../debug/debug.zig");
 const SpinLock = @import("../proc/spinlock.zig").SpinLock;
 const Deadline = @import("../util/deadline.zig").Deadline;
+const mmio = @import("../util/mmio.zig");
+const addrmod = @import("../util/addr.zig");
 
 // PCI class for "Mass Storage Controller / NVM Subsystem / NVMe I/O".
 const PCI_CLASS_STORAGE: u8 = 0x01;
 const PCI_SUBCLASS_NVM: u8 = 0x08;
 const PCI_PROGIF_NVME: u8 = 0x02;
 
-// --- Controller registers (BAR0-relative) ---
-const REG_CAP_LO: u32 = 0x00;
-const REG_CAP_HI: u32 = 0x04;
-const REG_VS: u32 = 0x08;
-const REG_INTMS: u32 = 0x0C;
-const REG_INTMC: u32 = 0x10;
-const REG_CC: u32 = 0x14;
-const REG_CSTS: u32 = 0x1C;
-const REG_AQA: u32 = 0x24;
-const REG_ASQ_LO: u32 = 0x28;
-const REG_ASQ_HI: u32 = 0x2C;
-const REG_ACQ_LO: u32 = 0x30;
-const REG_ACQ_HI: u32 = 0x34;
+// --- Controller registers (BAR0-relative), as a typed mmio window ---
+// Offsets come from the struct layout, asserted once below, instead of
+// being re-derived at every access; Ro cells reject writes at compile
+// time, and ASQ/ACQ being Split64 makes "some PCIe controllers fault on
+// a quad-word MMIO access" a property of the type, not a comment.
 
-// --- Controller Configuration (CC) bits ---
-const CC_EN: u32 = 1 << 0;
-// CC_CSS=0 (NVM command set), AMS=0 (round-robin), MPS=0 (4 KiB pages)
-const CC_IOSQES_64: u32 = 6 << 16; // log2(64) = 6 — submission entry size
-const CC_IOCQES_16: u32 = 4 << 20; // log2(16) = 4 — completion entry size
+/// Controller Configuration (0x14). Spec: NVMe 1.x §3.1.5.
+const Cc = packed struct(u32) {
+    en: bool = false,
+    _r1: u3 = 0,
+    css: u3 = 0, // command set: 0 = NVM
+    mps: u4 = 0, // page size: 0 = 4 KiB
+    ams: u3 = 0, // arbitration: 0 = round-robin
+    shn: u2 = 0,
+    iosqes: u4 = 0, // log2 submission entry size (6 = 64 B)
+    iocqes: u4 = 0, // log2 completion entry size (4 = 16 B)
+    _r2: u8 = 0,
+};
 
-const CSTS_RDY: u32 = 1 << 0;
+/// Controller Status (0x1C).
+const Csts = packed struct(u32) {
+    rdy: bool,
+    /// Controller Fatal Status. Set when the device has hit an
+    /// unrecoverable internal error and is refusing all subsequent
+    /// commands. Without checking this we just time out on every I/O
+    /// while the controller silently sits in a dead state. Gap #4
+    /// (2026-05-20).
+    cfs: bool,
+    shst: u2,
+    nssro: bool,
+    pp: bool,
+    _r: u26,
+};
+
+const Regs = extern struct {
+    cap_lo: mmio.Ro(u32),
+    cap_hi: mmio.Ro(u32),
+    vs: mmio.Ro(u32),
+    intms: mmio.Rw(u32),
+    intmc: mmio.Rw(u32),
+    cc: mmio.Rw(Cc),
+    _r18: u32,
+    csts: mmio.Ro(Csts),
+    _r20: u32, // NSSR
+    aqa: mmio.Rw(u32),
+    asq: mmio.Split64,
+    acq: mmio.Split64,
+};
+comptime {
+    const a = std.debug.assert;
+    a(@offsetOf(Regs, "cap_lo") == 0x00);
+    a(@offsetOf(Regs, "vs") == 0x08);
+    a(@offsetOf(Regs, "cc") == 0x14);
+    a(@offsetOf(Regs, "csts") == 0x1C);
+    a(@offsetOf(Regs, "aqa") == 0x24);
+    a(@offsetOf(Regs, "asq") == 0x28);
+    a(@offsetOf(Regs, "acq") == 0x30);
+}
+
+/// The typed window over this controller's BAR0. Derived on each use
+/// rather than cached on Controller: mmio_base is (c) after init, but
+/// S3 resume re-establishes the BAR — deriving keeps the two trivially
+/// consistent.
+inline fn regs(c: *const Controller) *volatile Regs {
+    return mmio.window(Regs, addrmod.Virt.of(c.mmio_base));
+}
+
+// CC/CSTS bit constants died with the typed window above — the bits live
+// as named fields on Cc/Csts now (the CFS story is on its field doc).
+
+// The queue geometry both CC writes program: log2 entry sizes.
+const CC_IOSQES_LOG2: u4 = 6; // 64 B submission entries
+const CC_IOCQES_LOG2: u4 = 4; // 16 B completion entries
+
 // Wall budget for CSTS.RDY transitions on enable/disable. The spec's own
 // figure is CAP.TO (units of 500 ms, up to 127.5 s); QEMU flips RDY
 // immediately and reports a small TO. 5 s covers every controller we run
 // on without letting a dead one wedge boot for minutes.
 const CSTS_RDY_BUDGET_MS: u64 = 5000;
-// Controller Fatal Status. Set when the device has hit an unrecoverable
-// internal error and is refusing all subsequent commands. Without checking
-// this we just time out on every I/O while the controller silently sits in
-// a dead state. Gap #4 (2026-05-20).
-const CSTS_CFS: u32 = 1 << 1;
 
 // --- Admin command opcodes ---
 const ADMIN_CREATE_SQ: u8 = 0x01;
@@ -461,17 +511,6 @@ fn nvmeIrqHandler() callconv(.c) void {
     }
 }
 
-fn r32(c: *const Controller, off: u32) u32 {
-    return @as(*volatile u32, @ptrFromInt(c.mmio_base + off)).*;
-}
-
-fn w32(c: *const Controller, off: u32, val: u32) void {
-    @as(*volatile u32, @ptrFromInt(c.mmio_base + off)).* = val;
-}
-
-fn w64(c: *const Controller, off: u32, val: u64) void {
-    @as(*volatile u64, @ptrFromInt(c.mmio_base + off)).* = val;
-}
 
 /// Submission-queue tail doorbell for queue `qid`.
 fn sqDoorbell(c: *const Controller, qid: u16) *volatile u32 {
@@ -593,16 +632,17 @@ fn initController(c: *Controller, dev: pci.PciDevice, idx: usize) bool {
         debug.klog("[nvme] ctrl#{d} MSI-X unavailable, polled mode\n", .{idx});
     }
 
-    const cap_hi = r32(c, REG_CAP_HI);
+    const cap_hi = regs(c).cap_hi.read();
     c.doorbell_stride_log = @truncate(cap_hi & 0xF); // CAP[35:32]
     debug.klog("[nvme] ctrl#{d} mmio=0x{x} dstrd_log={d}\n", .{ idx, c.mmio_base, c.doorbell_stride_log });
 
     // Disable the controller before reprogramming AQ pointers.
-    const cc = r32(c, REG_CC);
-    if (cc & CC_EN != 0) {
-        w32(c, REG_CC, cc & ~CC_EN);
+    var cc = regs(c).cc.read();
+    if (cc.en) {
+        cc.en = false;
+        regs(c).cc.write(cc);
         var d = Deadline.ms(CSTS_RDY_BUDGET_MS, "nvme csts.rdy clear (init)");
-        while ((r32(c, REG_CSTS) & CSTS_RDY) != 0 and d.live()) {}
+        while (regs(c).csts.read().rdy and d.live()) {}
     }
 
     // Allocate one page each for admin SQ (1 KiB used) + admin CQ (256 B).
@@ -615,13 +655,11 @@ fn initController(c: *Controller, dev: pci.PciDevice, idx: usize) bool {
 
     // AQA[27:16] = ACQS-1, AQA[11:0] = ASQS-1.
     const aqa: u32 = (@as(u32, Q_DEPTH - 1) << 16) | @as(u32, Q_DEPTH - 1);
-    w32(c, REG_AQA, aqa);
-    // Split 64-bit ASQ/ACQ writes into separate 32-bit MMIO ops — some
-    // PCIe controllers fault on a quad-word access; pairs always work.
-    w32(c, REG_ASQ_LO, @truncate(a_sq));
-    w32(c, REG_ASQ_HI, @truncate(a_sq >> 32));
-    w32(c, REG_ACQ_LO, @truncate(a_cq));
-    w32(c, REG_ACQ_HI, @truncate(a_cq >> 32));
+    regs(c).aqa.write(aqa);
+    // Split64: the "some PCIe controllers fault on a quad-word access"
+    // constraint is the register's type now — there is no 64-bit write.
+    regs(c).asq.writeSplit(a_sq);
+    regs(c).acq.writeSplit(a_cq);
 
     // IOMMU Phase 3: switch this device onto its own isolated SL page
     // table and explicitly map the admin queues BEFORE CC.EN flips. From
@@ -634,13 +672,13 @@ fn initController(c: *Controller, dev: pci.PciDevice, idx: usize) bool {
     _ = iommu.dmaMap(dev.bus, dev.dev, dev.func, a_cq, 4096, .{});
 
     // Set SQ/CQ entry sizes, leave CSS=NVM, MPS=0 (4 KiB), then enable.
-    w32(c, REG_CC, CC_IOSQES_64 | CC_IOCQES_16);
-    w32(c, REG_CC, CC_IOSQES_64 | CC_IOCQES_16 | CC_EN);
+    regs(c).cc.write(.{ .iosqes = CC_IOSQES_LOG2, .iocqes = CC_IOCQES_LOG2 });
+    regs(c).cc.write(.{ .iosqes = CC_IOSQES_LOG2, .iocqes = CC_IOCQES_LOG2, .en = true });
 
     var d_rdy = Deadline.ms(CSTS_RDY_BUDGET_MS, "nvme csts.rdy set (init)");
-    while ((r32(c, REG_CSTS) & CSTS_RDY) == 0 and d_rdy.live()) {}
-    if ((r32(c, REG_CSTS) & CSTS_RDY) == 0) {
-        debug.klog("[nvme] ctrl#{d} not RDY after {d} ms (csts=0x{x})\n", .{ idx, d_rdy.elapsedMs(), r32(c, REG_CSTS) });
+    while (!regs(c).csts.read().rdy and d_rdy.live()) {}
+    if (!regs(c).csts.read().rdy) {
+        debug.klog("[nvme] ctrl#{d} not RDY after {d} ms (csts=0x{x})\n", .{ idx, d_rdy.elapsedMs(), @as(u32, @bitCast(regs(c).csts.read())) });
         return false;
     }
 
@@ -963,7 +1001,7 @@ fn waitCompletion(c: *const Controller, cq_phys: usize, head_ptr: *u16, phase_pt
             debug.klog("[nvme] slow completion on qid={d}: >{d} Mcyc and still waiting (host stall?)\n", .{ qid, SOFT_CYC / 1_000_000 });
         }
         if (elapsed > HARD_CYC) {
-            const csts = r32(c, REG_CSTS);
+            const csts: u32 = @bitCast(regs(c).csts.read());
             debug.klog("[nvme] waitCompletion timeout (qid={d} head={d} csts=0x{x})\n", .{ qid, head_ptr.*, csts });
             // Post-mortem for the dropped-completion hunt (2026-08-22): dump
             // the raw CQ ring so the failure mode is readable from serial —
@@ -991,7 +1029,7 @@ fn waitCompletion(c: *const Controller, cq_phys: usize, head_ptr: *u16, phase_pt
             // If set, the device has irrecoverably failed and is dropping
             // every command. Call it out explicitly — otherwise the
             // recurring timeouts look like SW bugs.
-            if (csts & CSTS_CFS != 0) {
+            if (regs(c).csts.read().cfs) {
                 debug.klog("[nvme] ===> CSTS.CFS set: CONTROLLER IN FATAL STATE — all subsequent commands will fail\n", .{});
                 return false;
             }
@@ -1657,9 +1695,9 @@ fn ioCommandAsync(c: *Controller, ctrl_idx: u32, opcode: u8, lba: u32, user_buf:
         // Check CSTS for the controller-fatal bit. If set, the device is
         // permanently dead — log it once so the user sees something
         // other than "everything froze."
-        const csts = r32(c, REG_CSTS);
-        if (csts & CSTS_CFS != 0) {
-            debug.klog("[nvme] ctrl#{d} CONTROLLER FATAL STATUS (csts=0x{X})\n", .{ ctrl_idx, csts });
+        const csts = regs(c).csts.read();
+        if (csts.cfs) {
+            debug.klog("[nvme] ctrl#{d} CONTROLLER FATAL STATUS (csts=0x{X})\n", .{ ctrl_idx, @as(u32, @bitCast(csts)) });
         }
         // Abandon the slot. The gen counter (which allocCid bumped on
         // entry) is what makes this safe — if the CQE arrives after we
@@ -1920,11 +1958,12 @@ fn resumeController(c: *Controller, idx: usize) bool {
 
     // Disable the controller (defensive — power loss already dropped CC.EN)
     // then re-program the admin queues onto their SURVIVING frames.
-    const cc = r32(c, REG_CC);
-    if (cc & CC_EN != 0) {
-        w32(c, REG_CC, cc & ~CC_EN);
+    var cc = regs(c).cc.read();
+    if (cc.en) {
+        cc.en = false;
+        regs(c).cc.write(cc);
         var d = Deadline.ms(CSTS_RDY_BUDGET_MS, "nvme csts.rdy clear (s3)");
-        while ((r32(c, REG_CSTS) & CSTS_RDY) != 0 and d.live()) {}
+        while (regs(c).csts.read().rdy and d.live()) {}
     }
 
     // Re-zero the admin rings (stale phase bits from the boot session would
@@ -1936,18 +1975,16 @@ fn resumeController(c: *Controller, idx: usize) bool {
     c.admin_cq_phase = true;
 
     const aqa: u32 = (@as(u32, Q_DEPTH - 1) << 16) | @as(u32, Q_DEPTH - 1);
-    w32(c, REG_AQA, aqa);
-    w32(c, REG_ASQ_LO, @truncate(c.admin_sq));
-    w32(c, REG_ASQ_HI, @truncate(c.admin_sq >> 32));
-    w32(c, REG_ACQ_LO, @truncate(c.admin_cq));
-    w32(c, REG_ACQ_HI, @truncate(c.admin_cq >> 32));
+    regs(c).aqa.write(aqa);
+    regs(c).asq.writeSplit(c.admin_sq);
+    regs(c).acq.writeSplit(c.admin_cq);
 
-    w32(c, REG_CC, CC_IOSQES_64 | CC_IOCQES_16);
-    w32(c, REG_CC, CC_IOSQES_64 | CC_IOCQES_16 | CC_EN);
+    regs(c).cc.write(.{ .iosqes = CC_IOSQES_LOG2, .iocqes = CC_IOCQES_LOG2 });
+    regs(c).cc.write(.{ .iosqes = CC_IOSQES_LOG2, .iocqes = CC_IOCQES_LOG2, .en = true });
     var d_rdy = Deadline.ms(CSTS_RDY_BUDGET_MS, "nvme csts.rdy set (s3)");
-    while ((r32(c, REG_CSTS) & CSTS_RDY) == 0 and d_rdy.live()) {}
-    if ((r32(c, REG_CSTS) & CSTS_RDY) == 0) {
-        debug.klog("[nvme] ctrl#{d} S3 resume: not RDY after {d} ms (csts=0x{x})\n", .{ idx, d_rdy.elapsedMs(), r32(c, REG_CSTS) });
+    while (!regs(c).csts.read().rdy and d_rdy.live()) {}
+    if (!regs(c).csts.read().rdy) {
+        debug.klog("[nvme] ctrl#{d} S3 resume: not RDY after {d} ms (csts=0x{x})\n", .{ idx, d_rdy.elapsedMs(), @as(u32, @bitCast(regs(c).csts.read())) });
         return false;
     }
 

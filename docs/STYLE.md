@@ -328,6 +328,60 @@ apply:** required for new polled waits; existing iteration-count loops
 were converted in the 2026-08-25 sweep — any stragglers convert when
 touched.
 
+## `Phys` / `Virt` + `Dma(T)` — typed addresses and device memory
+
+A `u64` can't say which address space it lives in. `util/addr.zig`
+fences physical from kernel-virtual the way `UserPtr(T)` fences user
+pointers: a `Phys` has no deref, a `Virt` can't be handed to a device,
+and the physmap crossing is spelled `phys.toVirt()`. `Phys.of(x)` is
+the grep-able audited assertion where a raw integer (wire field, PTE,
+BAR) enters the typed world.
+
+`util/dma.zig` fuses the four-step DMA dance (contiguous alloc,
+physmap view, zeroing — IOMMU map stays at the call site, it needs the
+PCI identity) into one value whose `.device()` and `.cpu()` views
+cannot be swapped:
+
+```zig
+const ring = dma.Dma(RxDesc).alloc(NUM_RX_DESC) orelse return null;
+rx_descs = ring.cpu();               // [*]volatile RxDesc
+return ring.device().raw();          // phys, for BAL/BAH + descriptors
+```
+
+⚠ Call `Dma(T)` methods from SMALL file-scope helpers, not inline in a
+giant init() body — the inline form re-rolls the LLVM Invalid-type
+emission bug (probed 2026-08-25; e1000's alloc helpers are the shape
+that passes, and rule 11 wanted named phases anyway).
+
+**Reference exemplar:** `e1000.allocRxRing`/`allocPacketArena`.
+**How to apply:** new DMA rings/buffers go through `Dma(T)`; existing
+loose phys/virt pairs convert when touched. Full typing of the pmm API
+(allocFrame → Phys, 192 sites) is the next incremental campaign, same
+route UserPtr took.
+
+## `mmio` windows — register blocks as types
+
+Instead of per-driver `mmioRead(off)` helpers + shift-and-mask bit
+constants, describe the register file once and open a window over the
+BAR (see `util/mmio.zig`'s module doc for the full shape):
+
+```zig
+const Regs = extern struct { cap: Ro(u32), cc: Rw(Cc), csts: Ro(Csts), asq: Split64, ... };
+// + comptime offset asserts, per the wire-layout rule
+if (regs(c).csts.read().rdy) ...
+regs(c).cc.write(.{ .iosqes = 6, .iocqes = 4, .en = true });
+```
+
+Writes to `Ro` cells don't compile; bits are named fields of a
+`packed struct(uN)`; `Split64` makes "this 64-bit register must be
+programmed as two 32-bit accesses" a property of the type instead of a
+comment. Every access is volatile through the window pointer.
+
+**Reference exemplar:** `nvme.Regs`/`nvme.regs()` — the CC/CSTS bit
+constants died with the conversion. **How to apply:** new drivers
+describe their register file this way; existing drivers (ahci, e1000,
+i225, xhci, hda) convert when touched.
+
 ## `kwarn` — recoverable warnings
 
 Three-level severity in `debug/debug.zig`:
@@ -371,3 +425,5 @@ silent self-recovery into observable metric.
 | `Deadline`          | `src/driver/keyboard.zig` `ps2Wait`             |
 | `mightSleep`        | `src/proc/sched.zig` `blockOn`                  |
 | `fail()`/`errtrace` | `src/fs/gpt.zig` `readHeader` / `parse`         |
+| `Phys`/`Virt`/`Dma` | `src/driver/e1000.zig` `allocRxRing`            |
+| mmio window         | `src/driver/nvme.zig` `Regs` / `regs()`         |

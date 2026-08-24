@@ -410,24 +410,23 @@ fn cmdMeminfo() void {
 /// Living demo of the fail()+errtrace pattern: a three-deep call chain
 /// births an error via fail(), propagates it through two `try`s, and the
 /// surface point symbolizes the @errorReturnTrace(). If serial shows the
-/// full probeLevel2→probeLevel1 path, error tracing works in this build;
-/// if it prints "(no error-return trace)", the build knob regressed.
+/// full errProbeLevel2→errProbeLevel1 path, error tracing works in this
+/// build; if it prints "(no error-return trace)", the build knob
+/// regressed. (File-scope fns, not a local struct — function-local
+/// anonymous types feed the LLVM Invalid-type bug.)
+fn errProbeLevel2() !void {
+    return @import("util/fail.zig").fail(error.Timeout, "errprobe: synthetic failure, detail={d}", .{42});
+}
+fn errProbeLevel1() !void {
+    try errProbeLevel2();
+}
+fn errProbeRoot() !void {
+    try errProbeLevel1();
+}
+
 fn cmdErrProbe() void {
-    const errtrace = @import("util/errtrace.zig");
-    const F = struct {
-        const failfn = @import("util/fail.zig").fail;
-        fn probeLevel2() !void {
-            return failfn(error.Timeout, "errprobe: synthetic failure, detail={d}", .{42});
-        }
-        fn probeLevel1() !void {
-            try probeLevel2();
-        }
-        fn probeRoot() !void {
-            try probeLevel1();
-        }
-    };
-    F.probeRoot() catch |e| {
-        errtrace.dump(e, @errorReturnTrace());
+    errProbeRoot() catch |e| {
+        @import("util/errtrace.zig").dump(e, @errorReturnTrace());
         vga.print("errprobe: error.{s} surfaced — trace + fail ring on serial\n", .{@errorName(e)});
         return;
     };

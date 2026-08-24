@@ -455,21 +455,35 @@ pub fn spinTargetOf(cpu: usize) usize {
 /// here (#PF-context swap-evict waits — the switch target's rflags
 /// re-enable delivery), unlike in Linux.
 ///
-/// One kwarn per call site (per-instantiation latch) — a hot buggy path
-/// can't storm the log (rule 6). The warn_count bump still fires each
-/// first hit, so a non-zero count at shutdown flags the class.
+/// One kwarn per call site — a hot buggy path can't storm the log (rule
+/// 6). The latch is a small file-scope table keyed by a comptime hash of
+/// the call site (NOT a per-instantiation local struct: function-local
+/// anonymous types feed the LLVM Invalid-type emission bug, see
+/// reference-llvm-anon-struct-bitcode-bug). Unlocked check-then-set — a
+/// racing first hit can warn twice, which is harmless.
 pub fn mightSleep(comptime src: std.builtin.SourceLocation) void {
-    const S = struct {
-        var warned: bool = false;
-    };
+    const key: u64 = comptime std.hash.Wyhash.hash(src.line, src.file);
     if (smp.myCpu().current_pid == null) return; // no task — nothing can park
     const cpu = currentCpuId();
     if (cpu >= MAX_HOLD_CPUS) return;
-    if (preempt_pin[cpu] != 0 and !S.warned) {
-        S.warned = true;
-        debug.kwarn(src, "mightSleep with preempt pin {d} (SpinLock held or pinned) — parking here can deadlock the CPU", .{preempt_pin[cpu]});
+    if (preempt_pin[cpu] == 0) return;
+    for (&might_sleep_warned) |w| {
+        if (w == key) return; // this site already warned once
     }
+    for (&might_sleep_warned) |*w| {
+        if (w.* == 0) {
+            w.* = key;
+            break;
+        }
+        // Table full: fall through and warn unlatched — noisy beats silent.
+    }
+    debug.kwarn(src, "mightSleep with preempt pin {d} (SpinLock held or pinned) — parking here can deadlock the CPU", .{preempt_pin[cpu]});
 }
+
+/// Warned-site latch table for mightSleep — slots hold the site hash,
+/// 0 = free. Sized above the number of parking entry points; overflow
+/// degrades to unlatched warns, never to silence.
+var might_sleep_warned: [16]u64 = [_]u64{0} ** 16;
 
 /// True when the calling CPU currently holds (or is acquiring) at least one
 /// plain-acquired SpinLock and must not be involuntarily preempted. Called

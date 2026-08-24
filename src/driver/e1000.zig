@@ -30,6 +30,7 @@ const debug = @import("../debug/debug.zig");
 const net = @import("../net/net.zig");
 const iommu = @import("../cpu/mmu/iommu.zig");
 const Deadline = @import("../util/deadline.zig").Deadline;
+const dma = @import("../util/dma.zig");
 
 const E1000_VENDOR: u16 = 0x8086;
 
@@ -193,12 +194,39 @@ fn e1000IrqHandler() callconv(.c) void {
 }
 
 var rx_descs: [*]volatile RxDesc = undefined;
-var rx_buffers: usize = 0;
 var rx_tail: u32 = 0;
 
 var tx_descs: [*]volatile TxDesc = undefined;
-var tx_buffers: usize = 0;
 var tx_next: u32 = 0;
+
+// --- DMA-ring allocation helpers ---
+// Small file-scope fns, deliberately NOT inlined into init(): identical
+// Dma(T) calls pass here and trip the LLVM Invalid-type emission bug
+// when placed inside init()'s huge body (probed step by step,
+// 2026-08-25 — see reference-llvm-anon-struct-bitcode-bug). They return
+// raw u64 phys so init's body stays generic-free; the typed pairing
+// (device vs cpu view, zeroing) lives in Dma(T) itself.
+
+/// Ring of RX descriptors: allocates, zeroes, publishes the CPU view to
+/// `rx_descs`, returns the device-side base.
+fn allocRxRing() ?u64 {
+    const ring = dma.Dma(RxDesc).alloc(NUM_RX_DESC) orelse return null;
+    rx_descs = ring.cpu();
+    return ring.device().raw();
+}
+
+/// Ring of TX descriptors — counterpart of allocRxRing.
+fn allocTxRing() ?u64 {
+    const ring = dma.Dma(TxDesc).alloc(NUM_TX_DESC) orelse return null;
+    tx_descs = ring.cpu();
+    return ring.device().raw();
+}
+
+/// One packet-buffer arena (BUF_PAGES pages, zeroed), device-side base.
+fn allocPacketArena() ?u64 {
+    const bufs = dma.Dma(u8).alloc(BUF_PAGES * 4096) orelse return null;
+    return bufs.device().raw();
+}
 
 // Track the descriptor that recv() handed out so rxRelease() can mark
 // it consumed without recv() needing to return that index too.
@@ -331,18 +359,19 @@ pub fn init() bool {
     mmioWrite(REG_CTRL, CTRL_SLU | CTRL_ASDE | CTRL_FD);
 
     // === RX ring setup ===
-    const rx_desc_phys = pmm.allocContiguous(1) orelse {
+    // Dma(T) (inside the alloc helpers) fuses the phys/virt pair: the
+    // device view feeds registers and descriptors, the CPU view lands in
+    // rx_descs/tx_descs, and the memory arrives zeroed.
+    const rx_desc_phys = allocRxRing() orelse {
         debug.klog("[e1000] RX desc alloc failed\n", .{});
         return false;
     };
-    rx_descs = @ptrFromInt(paging.physToVirt(rx_desc_phys));
-    rx_buffers = pmm.allocContiguous(BUF_PAGES) orelse {
+    const rx_buffers = allocPacketArena() orelse {
         debug.klog("[e1000] RX buf alloc failed\n", .{});
         return false;
     };
     _ = iommu.dmaMap(d.bus, d.dev, d.func, rx_desc_phys, 4096, .{});
     _ = iommu.dmaMap(d.bus, d.dev, d.func, rx_buffers, BUF_PAGES * 4096, .{});
-    @memset(@as([*]u8, @ptrFromInt(paging.physToVirt(rx_desc_phys)))[0 .. NUM_RX_DESC * @sizeOf(RxDesc)], 0);
     var di: u32 = 0;
     while (di < NUM_RX_DESC) : (di += 1) {
         rx_descs[di] = .{
@@ -365,12 +394,10 @@ pub fn init() bool {
     mmioWrite(REG_RCTL, RCTL_EN | RCTL_BAM | RCTL_BSIZE_2048 | RCTL_SECRC);
 
     // === TX ring setup ===
-    const tx_desc_phys = pmm.allocContiguous(1) orelse return false;
-    tx_descs = @ptrFromInt(paging.physToVirt(tx_desc_phys));
-    tx_buffers = pmm.allocContiguous(BUF_PAGES) orelse return false;
+    const tx_desc_phys = allocTxRing() orelse return false;
+    const tx_buffers = allocPacketArena() orelse return false;
     _ = iommu.dmaMap(d.bus, d.dev, d.func, tx_desc_phys, 4096, .{});
     _ = iommu.dmaMap(d.bus, d.dev, d.func, tx_buffers, BUF_PAGES * 4096, .{});
-    @memset(@as([*]u8, @ptrFromInt(paging.physToVirt(tx_desc_phys)))[0 .. NUM_TX_DESC * @sizeOf(TxDesc)], 0);
     di = 0;
     while (di < NUM_TX_DESC) : (di += 1) {
         tx_descs[di] = .{
