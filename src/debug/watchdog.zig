@@ -200,6 +200,10 @@ pub fn peerCheck(self: *smp.CpuLocal) void {
     // spin_target of 0 here also discriminates a genuine host-pause (peer
     // descheduled, not spinning) from a cli-spin livelock.
     @import("../proc/spinlock.zig").dumpSpinTargets();
+    // ...and the last polled-hardware wait each CPU started — a frozen CPU
+    // inside a device poll (NVMe reset, PS/2 drain) shows up here, not in
+    // the spin-target dump.
+    @import("../util/deadline.zig").dumpWaitSites();
     // Claim-loop retry counts too — caught even on a freeze that later
     // self-recovers, so we get the Mode-A signature without needing a hard halt.
     @import("../proc/sched.zig").dumpSchedLoopStats();
@@ -329,6 +333,10 @@ fn fire(self: *smp.CpuLocal, peer: *smp.CpuLocal) void {
     // contended lock even when it's unregistered (setstate_locks[]/rq.lock) or
     // free again by now, which is exactly the schedstress-wedge case.
     @import("../proc/spinlock.zig").dumpSpinTargets();
+    // ...and the last polled-hardware wait each CPU started (deadline
+    // breadcrumbs) — names the device when the wedge is a hardware poll
+    // rather than a lock spin.
+    @import("../util/deadline.zig").dumpWaitSites();
     // ...and per-CPU schedule() claim-loop retry counts. A large in-flight
     // value here = the wedged CPU is livelocked re-picking a candidate with
     // IF=0 (Mode-A), the thing the spin-target dump can't show because the

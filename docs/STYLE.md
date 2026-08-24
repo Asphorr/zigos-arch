@@ -244,6 +244,36 @@ hdr.store(next);         // durable on return
 boot counter). New on-pmem structures go through `Persistent(T)`; the
 raw `readAt`/`writeAt` byte path remains for /dev/pmem0 file I/O.
 
+## `Deadline` — wall-clock budgets for polled hardware waits
+
+An iteration-count spin (`while (busy and spin < 5_000_000)`) measures
+"some amount of time that depends on the host": ~100 ns per port/MMIO
+read on bare metal, 5-10 µs per VM exit under nested QEMU. Two paid-for
+incidents: the 1.028 s PS/2 cli-hold (2026-05-24) and the NVMe late
+completion misread as a timeout (2026-08-22). Every new polled-hardware
+wait uses `util/deadline.zig`:
+
+```zig
+var d = Deadline.ms(5, "ps2 input-buffer clear");
+while (d.live()) {
+    if (io.inb(0x64) & 2 == 0) return true;
+}
+return false; // timeout — d.elapsedMs() for the log line
+```
+
+The constructor names the unit (`ms`/`us`, rule 4) and the wait (a
+grep-able literal); before APIC calibration the budget degrades to a
+bounded iteration ceiling automatically. Each construction stamps a
+per-CPU breadcrumb that `dumpWaitSites()` prints from the watchdog
+autopsy — a wedged CPU inside a device poll names its device.
+
+**Why:** the timeout constant should encode the *spec's* patience
+(PS/2: 17 ms; NVMe: CAP.TO), not a guess about host speed.
+**Reference exemplar:** `ps2Wait` in `driver/keyboard.zig`. **How to
+apply:** required for new polled waits; existing iteration-count loops
+were converted in the 2026-08-25 sweep — any stragglers convert when
+touched.
+
 ## `kwarn` — recoverable warnings
 
 Three-level severity in `debug/debug.zig`:
@@ -284,3 +314,4 @@ silent self-recovery into observable metric.
 | `UserPtr(T)`        | `src/cpu/syscall/proc.zig` `sysSigpending`      |
 | `Persistent(T)`     | `src/mm/pmem.zig` `persistenceSelfTest`         |
 | `kwarn(@src(),...)` | `src/debug/debug.zig` `kwarn`                   |
+| `Deadline`          | `src/driver/keyboard.zig` `ps2Wait`             |
