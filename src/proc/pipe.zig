@@ -21,6 +21,7 @@ const debug = @import("../debug/debug.zig");
 const config = @import("../config.zig");
 const fdpoll = @import("../cpu/ipc/fdpoll.zig");
 const spinlock = @import("spinlock.zig");
+const slot_table = @import("../util/slot_table.zig");
 const usercopy = @import("../cpu/arch/usercopy.zig");
 
 pub const PIPE_BUF_SIZE: u32 = config.PIPE_BUF_SIZE;
@@ -33,6 +34,10 @@ pub const MAX_PIPES: u8 = config.MAX_PIPES;
 pub const PIPE_ERR: usize = 0xFFFF_FFFF;
 
 pub const Pipe = struct {
+    /// Ring contents are contract-undefined while the slot is unclaimed
+    /// — slot_table.claim skips resetting them (see claim_skip_reset).
+    pub const claim_skip_reset = .{"buf"};
+
     buf: [PIPE_BUF_SIZE]u8 = undefined,
     head: u32 = 0, // next write offset
     tail: u32 = 0, // next read offset
@@ -88,39 +93,16 @@ pub var pipes: [MAX_PIPES]Pipe = [_]Pipe{.{}} ** MAX_PIPES;
 /// caller is expected to install one read fd and one write fd into the
 /// process's fd_table.
 pub fn alloc() ?u8 {
-    for (0..MAX_PIPES) |i| {
-        const p = &pipes[i];
-        // Unlocked fast filter only — the claim itself happens under the
-        // slot lock below. Without it, two sysPipe calls on two CPUs could
-        // both pass this check and initialise the same slot (double-claim:
-        // two unrelated pipe() calls sharing one ring with stomped 1/1
-        // refcounts).
-        if (p.in_use) continue;
-        const flags = p.lock.acquireIrqSave();
-        if (p.in_use) { // lost the claim race to another CPU's alloc
-            p.lock.releaseIrqRestore(flags);
-            continue;
-        }
-        // Reset ring + refcount state field-by-field, DELIBERATELY
-        // leaving `lock` untouched: a whole-struct `.{}` assign would
-        // reset the ticket counters we are currently HOLDING (and which
-        // a cross-CPU validator may be mid-acquire on). `in_use` is
-        // written LAST via release-store — read()/write()/tryRead() check
-        // it unlocked on entry, so on x86-TSO the field writes must be
-        // visible before any CPU can observe the slot as live.
-        p.head = 0;
-        p.tail = 0;
-        p.count = 0;
-        p.readers = 1;
-        p.writers = 1;
-        p.blocked_reader_pid = 0xFF;
-        p.blocked_writer_pid = 0xFF;
-        p.wake_desktop_on_write = false;
-        @atomicStore(bool, &p.in_use, true, .release);
-        p.lock.releaseIrqRestore(flags);
-        return @intCast(i);
-    }
-    return null;
+    // The four-invariant claim dance (unlocked filter, locked re-check,
+    // field reset that leaves `lock` alone, in_use published LAST with
+    // .release) lives in slot_table.claim now — this function only adds
+    // what is pipe-specific: both refcounts start at 1, the caller is
+    // expected to install one read fd and one write fd.
+    const c = slot_table.claim(Pipe, &pipes) orelse return null;
+    c.slot.readers = 1;
+    c.slot.writers = 1;
+    c.publish();
+    return @intCast(c.idx);
 }
 
 /// Mark a pipe as a desktop-drain pipe. Writes will trigger an explicit

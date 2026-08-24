@@ -382,6 +382,35 @@ constants died with the conversion. **How to apply:** new drivers
 describe their register file this way; existing drivers (ahci, e1000,
 i225, xhci, hda) convert when touched.
 
+## `slot_table.claim` — the fixed-pool claim protocol, once
+
+Every `in_use`-flagged fixed array (26 subsystems) needs the same
+four-invariant claim dance: unlocked fast filter → locked RE-CHECK
+(else two CPUs double-claim one slot) → field reset that must NOT
+touch `lock` (the claimant is holding its ticket counters) → publish
+`in_use=true` with a `.release` store LAST. `util/slot_table.zig` is
+that dance over a borrowed slice — the table keeps its array, indices,
+and free policy:
+
+```zig
+const c = slot_table.claim(Pipe, &pipes) orelse return null;
+c.slot.readers = 1;   // caller-specific init between reset and publish
+c.slot.writers = 1;
+c.publish();          // or c.abort()
+return @intCast(c.idx);
+```
+
+The reset is comptime reflection over the struct's own field defaults:
+a new field with a default resets correctly with zero extra code; a
+field without one fails the build. Payload buffers defaulted
+`= undefined` are named in a `pub const claim_skip_reset = .{"buf"};`
+decl on the struct. `recycle()` (assert-locked) is the release side.
+
+**Reference exemplar:** `pipe.alloc` — its 30-line hand dance became 6
+lines with the invariants documented once, in one place. **How to
+apply:** new fixed pools use claim(); the 25 existing tables convert
+when touched.
+
 ## `kwarn` — recoverable warnings
 
 Three-level severity in `debug/debug.zig`:
@@ -427,3 +456,4 @@ silent self-recovery into observable metric.
 | `fail()`/`errtrace` | `src/fs/gpt.zig` `readHeader` / `parse`         |
 | `Phys`/`Virt`/`Dma` | `src/driver/e1000.zig` `allocRxRing`            |
 | mmio window         | `src/driver/nvme.zig` `Regs` / `regs()`         |
+| `slot_table.claim`  | `src/proc/pipe.zig` `alloc`                     |
