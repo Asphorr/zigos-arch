@@ -30,6 +30,7 @@ const paging = @import("../mm/paging.zig");
 const msix = @import("../time/msix.zig");
 const debug = @import("../debug/debug.zig");
 const SpinLock = @import("../proc/spinlock.zig").SpinLock;
+const Deadline = @import("../util/deadline.zig").Deadline;
 
 // PCI class for "Mass Storage Controller / NVM Subsystem / NVMe I/O".
 const PCI_CLASS_STORAGE: u8 = 0x01;
@@ -57,6 +58,11 @@ const CC_IOSQES_64: u32 = 6 << 16; // log2(64) = 6 — submission entry size
 const CC_IOCQES_16: u32 = 4 << 20; // log2(16) = 4 — completion entry size
 
 const CSTS_RDY: u32 = 1 << 0;
+// Wall budget for CSTS.RDY transitions on enable/disable. The spec's own
+// figure is CAP.TO (units of 500 ms, up to 127.5 s); QEMU flips RDY
+// immediately and reports a small TO. 5 s covers every controller we run
+// on without letting a dead one wedge boot for minutes.
+const CSTS_RDY_BUDGET_MS: u64 = 5000;
 // Controller Fatal Status. Set when the device has hit an unrecoverable
 // internal error and is refusing all subsequent commands. Without checking
 // this we just time out on every I/O while the controller silently sits in
@@ -595,8 +601,8 @@ fn initController(c: *Controller, dev: pci.PciDevice, idx: usize) bool {
     const cc = r32(c, REG_CC);
     if (cc & CC_EN != 0) {
         w32(c, REG_CC, cc & ~CC_EN);
-        var spin: u32 = 0;
-        while ((r32(c, REG_CSTS) & CSTS_RDY) != 0 and spin < 5_000_000) : (spin += 1) {}
+        var d = Deadline.ms(CSTS_RDY_BUDGET_MS, "nvme csts.rdy clear (init)");
+        while ((r32(c, REG_CSTS) & CSTS_RDY) != 0 and d.live()) {}
     }
 
     // Allocate one page each for admin SQ (1 KiB used) + admin CQ (256 B).
@@ -631,10 +637,10 @@ fn initController(c: *Controller, dev: pci.PciDevice, idx: usize) bool {
     w32(c, REG_CC, CC_IOSQES_64 | CC_IOCQES_16);
     w32(c, REG_CC, CC_IOSQES_64 | CC_IOCQES_16 | CC_EN);
 
-    var spin: u32 = 0;
-    while ((r32(c, REG_CSTS) & CSTS_RDY) == 0 and spin < 10_000_000) : (spin += 1) {}
+    var d_rdy = Deadline.ms(CSTS_RDY_BUDGET_MS, "nvme csts.rdy set (init)");
+    while ((r32(c, REG_CSTS) & CSTS_RDY) == 0 and d_rdy.live()) {}
     if ((r32(c, REG_CSTS) & CSTS_RDY) == 0) {
-        debug.klog("[nvme] ctrl#{d} not RDY (csts=0x{x})\n", .{ idx, r32(c, REG_CSTS) });
+        debug.klog("[nvme] ctrl#{d} not RDY after {d} ms (csts=0x{x})\n", .{ idx, d_rdy.elapsedMs(), r32(c, REG_CSTS) });
         return false;
     }
 
@@ -1917,8 +1923,8 @@ fn resumeController(c: *Controller, idx: usize) bool {
     const cc = r32(c, REG_CC);
     if (cc & CC_EN != 0) {
         w32(c, REG_CC, cc & ~CC_EN);
-        var spin: u32 = 0;
-        while ((r32(c, REG_CSTS) & CSTS_RDY) != 0 and spin < 5_000_000) : (spin += 1) {}
+        var d = Deadline.ms(CSTS_RDY_BUDGET_MS, "nvme csts.rdy clear (s3)");
+        while ((r32(c, REG_CSTS) & CSTS_RDY) != 0 and d.live()) {}
     }
 
     // Re-zero the admin rings (stale phase bits from the boot session would
@@ -1938,10 +1944,10 @@ fn resumeController(c: *Controller, idx: usize) bool {
 
     w32(c, REG_CC, CC_IOSQES_64 | CC_IOCQES_16);
     w32(c, REG_CC, CC_IOSQES_64 | CC_IOCQES_16 | CC_EN);
-    var spin: u32 = 0;
-    while ((r32(c, REG_CSTS) & CSTS_RDY) == 0 and spin < 10_000_000) : (spin += 1) {}
+    var d_rdy = Deadline.ms(CSTS_RDY_BUDGET_MS, "nvme csts.rdy set (s3)");
+    while ((r32(c, REG_CSTS) & CSTS_RDY) == 0 and d_rdy.live()) {}
     if ((r32(c, REG_CSTS) & CSTS_RDY) == 0) {
-        debug.klog("[nvme] ctrl#{d} S3 resume: not RDY (csts=0x{x})\n", .{ idx, r32(c, REG_CSTS) });
+        debug.klog("[nvme] ctrl#{d} S3 resume: not RDY after {d} ms (csts=0x{x})\n", .{ idx, d_rdy.elapsedMs(), r32(c, REG_CSTS) });
         return false;
     }
 

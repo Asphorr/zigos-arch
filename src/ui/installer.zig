@@ -1053,8 +1053,8 @@ fn reboot() noreturn {
 
     // 8042 pulse of the CPU reset line. Wait for the input buffer to drain
     // first, or the controller drops the command.
-    var spin: u32 = 0;
-    while (spin < 100_000) : (spin += 1) {
+    var d = @import("../util/deadline.zig").Deadline.ms(10, "kbd-ctrl reboot drain");
+    while (d.live()) {
         if (io.inb(0x64) & 0x02 == 0) break;
     }
     io.outb(0x64, 0xFE);

@@ -10,6 +10,7 @@ const SpinLock = @import("../proc/spinlock.zig").SpinLock;
 const Mutex = @import("../proc/spinlock.zig").Mutex;
 const apic = @import("../time/apic.zig");
 const perf = @import("../debug/perf.zig");
+const Deadline = @import("../util/deadline.zig").Deadline;
 
 /// Slow-submit threshold for sendCmdViaPhys. When wait exceeds this, log
 /// the cmd_type (first u32 of cmd_phys, per virtio-gpu spec) + lengths
@@ -17,6 +18,10 @@ const perf = @import("../debug/perf.zig");
 /// well above normal (real cmds <1ms, blob page-flips ~16ms vsync) so
 /// it only fires for genuinely pathological waits.
 const SLOW_GPU_SUBMIT_THRESHOLD_MS: u64 = 50;
+// Wall budget for the POLLED ctrl-vq fallback paths (no blockOn available:
+// early boot, emergency mode, no task context). Virgl host renders can take
+// frames, not µs — but a second of dead polling means the device is gone.
+const CTRL_POLL_BUDGET_MS: u64 = 1000;
 
 // Serialises all access to the control virtqueue. Without this, BSP rendering
 // (flushRect/transferToHost called from the desktop) races with AP syscalls
@@ -901,11 +906,13 @@ fn sendCmdViaPhys(cmd_len: u32, resp_len: u32) bool {
                 hlt_iters += 1;
             }
         } else {
-            var timeout: u32 = 10000000;
-            while (ctrl_vq.last_used_idx == usedIdxCoherent(&ctrl_vq) and timeout > 0) : (timeout -= 1) {
+            var d = Deadline.ms(CTRL_POLL_BUDGET_MS, "virtio-gpu ctrl vq (polled)");
+            while (ctrl_vq.last_used_idx == usedIdxCoherent(&ctrl_vq) and d.live()) {
                 asm volatile ("pause");
             }
-            break :blk timeout > 0;
+            // Re-check rather than trust the deadline: a completion landing
+            // on the final iteration is a success, not a timeout.
+            break :blk ctrl_vq.last_used_idx != usedIdxCoherent(&ctrl_vq);
         }
     };
 
@@ -1150,11 +1157,11 @@ fn sendSimpleCmdPair(
                 hlt_iters += 1;
             }
         } else {
-            var timeout: u32 = 10000000;
-            while (@as(i16, @bitCast(usedIdxCoherent(&ctrl_vq) -% target_idx)) < 0 and timeout > 0) : (timeout -= 1) {
+            var d = Deadline.ms(CTRL_POLL_BUDGET_MS, "virtio-gpu ctrl vq target (polled)");
+            while (@as(i16, @bitCast(usedIdxCoherent(&ctrl_vq) -% target_idx)) < 0 and d.live()) {
                 asm volatile ("pause");
             }
-            break :blk timeout > 0;
+            break :blk @as(i16, @bitCast(usedIdxCoherent(&ctrl_vq) -% target_idx)) >= 0;
         }
     };
 
@@ -1494,9 +1501,9 @@ fn waitAsyncFlushIdleLocked() void {
         const process = @import("../proc/process.zig");
         const cur = @import("../cpu/smp.zig").myCpu().current_pid orelse {
             // No task context — asyncFlushEligible() should make this
-            // unreachable; bounded spin as a belt.
-            var timeout: u32 = 1_000_000;
-            while (timeout > 0 and !reapAsyncFlushLocked()) : (timeout -= 1) {
+            // unreachable; bounded wait as a belt.
+            var d = Deadline.ms(CTRL_POLL_BUDGET_MS, "virtio-gpu flush reap (no task)");
+            while (d.live() and !reapAsyncFlushLocked()) {
                 asm volatile ("pause");
             }
             return;
@@ -2394,8 +2401,8 @@ pub fn resumeFromS3() bool {
     // read-back of 0 before re-initialising, or the device rejects FEATURES_OK
     // while it's still tearing down its old state. Mirrors virtio_net/virtio_sound.
     ccWrite8(CC_DEVICE_STATUS, 0); // reset
-    var reset_spin: u32 = 0;
-    while (ccRead8(CC_DEVICE_STATUS) != 0 and reset_spin < 1000) : (reset_spin += 1) {}
+    var d_reset = Deadline.ms(100, "virtio-gpu reset drain");
+    while (ccRead8(CC_DEVICE_STATUS) != 0 and d_reset.live()) {}
     ccWrite8(CC_DEVICE_STATUS, STATUS_ACKNOWLEDGE);
     ccWrite8(CC_DEVICE_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER);
 

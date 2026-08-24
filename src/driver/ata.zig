@@ -3,6 +3,7 @@ const pci = @import("pci.zig");
 const pmm = @import("../mm/pmm.zig");
 const debug = @import("../debug/debug.zig");
 const SpinLock = @import("../proc/spinlock.zig").SpinLock;
+const Deadline = @import("../util/deadline.zig").Deadline;
 
 var ata_lock: SpinLock = .{};
 
@@ -170,14 +171,15 @@ fn testDmaRead(port: u16, drive_head: u8, bm_base: u16) bool {
     // Start DMA
     io.outb(bm_base, 0x09);
 
-    // Poll with short timeout
-    var timeout: u32 = 100_000;
-    while (timeout > 0) : (timeout -= 1) {
+    // Poll with a short wall-clock budget (single-sector DMA is sub-ms).
+    var d = Deadline.ms(100, "ata bm-dma probe");
+    var polls: u32 = 0;
+    while (d.live()) : (polls += 1) {
         const status = io.inb(bm_base + 2);
         if (status & 0x02 != 0) {
             // Error
             debug.klog("[ata] DMA test: error status=0x{X:0>2} after {d} polls\n", .{
-                status, 100_000 - timeout,
+                status, polls,
             });
             io.outb(bm_base, 0x00);
             io.outb(bm_base + 2, 0x06);
@@ -186,7 +188,7 @@ fn testDmaRead(port: u16, drive_head: u8, bm_base: u16) bool {
         if (status & 0x04 != 0) {
             // Success — DMA completed
             debug.klog("[ata] DMA test: success after {d} polls (status=0x{X:0>2})\n", .{
-                100_000 - timeout, status,
+                polls, status,
             });
             io.outb(bm_base, 0x00);
             io.outb(bm_base + 2, io.inb(bm_base + 2) | 0x06);
@@ -350,10 +352,13 @@ fn readSectorsDMA(port: u16, drive_head: u8, lba: u32, count: u8, dest: [*]u8, b
     // 5. Start DMA (set bit 0, keep bit 3 for read direction)
     io.outb(bm_base, 0x09); // start + read
 
-    // 6. Poll for completion
-    var timeout: u32 = 1_000_000;
+    // 6. Poll for completion. 500 ms wall budget: a multi-sector DMA is
+    // single-digit ms; anything past this is a lost interrupt-status bit
+    // and the PIO fallback below recovers.
+    var deadline = Deadline.ms(500, "ata bm-dma read");
+    var dma_done = false;
     var polls: u32 = 0;
-    while (timeout > 0) : (timeout -= 1) {
+    while (deadline.live()) {
         const status = io.inb(bm_base + 2);
         polls += 1;
         if (status & 0x02 != 0) {
@@ -370,6 +375,7 @@ fn readSectorsDMA(port: u16, drive_head: u8, lba: u32, count: u8, dest: [*]u8, b
         }
         if (status & 0x04 != 0) {
             // Interrupt — DMA complete
+            dma_done = true;
             break;
         }
     }
@@ -388,7 +394,7 @@ fn readSectorsDMA(port: u16, drive_head: u8, lba: u32, count: u8, dest: [*]u8, b
     if (polls > dma_max_polls_per_call) dma_max_polls_per_call = polls;
 
     // If timeout, fall back to PIO
-    if (timeout == 0) {
+    if (!dma_done) {
         dma_timeouts += 1;
         readSectorsPort(port, drive_head, lba, count, dest);
     }

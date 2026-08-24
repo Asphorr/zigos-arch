@@ -3,6 +3,7 @@ const serial = @import("serial.zig");
 const process = @import("../proc/process.zig");
 const elf_loader = @import("../proc/elf_loader.zig");
 const debug = @import("debug.zig");
+const Deadline = @import("../util/deadline.zig").Deadline;
 
 // --- COM2 serial port (0x2F8) for GDB communication ---
 
@@ -275,20 +276,20 @@ fn sendPacket(data: []const u8) void {
 
     if (no_ack_mode) return;
 
-    // Wait for ACK with generous timeout for TCP latency
-    var attempts: u32 = 0;
-    while (attempts < 1_000_000) : (attempts += 1) {
+    // Wait for ACK with a generous wall budget for TCP latency.
+    var d = Deadline.ms(2000, "gdb packet ack");
+    while (d.live()) {
         if (io.inb(COM2 + 5) & 1 != 0) {
             const c = io.inb(COM2);
             if (c == '+') return;
             if (c == '-') {
-                // Retransmit
+                // Retransmit, with a fresh budget for the retry.
                 com2Write('$');
                 com2WriteSlice(data);
                 com2Write('#');
                 com2Write(hexChar(checksum >> 4));
                 com2Write(hexChar(checksum & 0x0F));
-                attempts = 0;
+                d = Deadline.ms(2000, "gdb packet ack");
             }
             // Skip any other bytes (GDB might send a command before ACK)
         }

@@ -23,6 +23,7 @@ const debug = @import("../debug/debug.zig");
 const process = @import("../proc/process.zig");
 const spinlock = @import("../proc/spinlock.zig");
 const iommu = @import("../cpu/mmu/iommu.zig");
+const Deadline = @import("../util/deadline.zig").Deadline;
 
 // --- Constants ---
 
@@ -287,11 +288,11 @@ fn ctrlSend(cmd_buf: []const u8, resp_buf: []u8) bool {
     ctrl_vq.availIdx().* = ai +% 1;
     notifyQueue(VQ_CONTROL, &ctrl_vq);
 
-    var timeout: u32 = 5_000_000;
-    while (ctrl_vq.last_used_idx == ctrl_vq.usedIdx().* and timeout > 0) : (timeout -= 1) {
+    var d = Deadline.ms(1000, "virtio-snd ctrl vq");
+    while (ctrl_vq.last_used_idx == ctrl_vq.usedIdx().* and d.live()) {
         asm volatile ("pause");
     }
-    const got = timeout > 0;
+    const got = ctrl_vq.last_used_idx != ctrl_vq.usedIdx().*;
     if (got) ctrl_vq.last_used_idx +%= 1;
     d1.next = ctrl_vq.free_head;
     d0.next = d1_idx;
@@ -529,8 +530,8 @@ pub fn init() bool {
 
     // Reset → ACK → DRIVER (per virtio §3.1.1)
     ccWrite8(CC_DEVICE_STATUS, 0);
-    var spin: u32 = 0;
-    while (ccRead8(CC_DEVICE_STATUS) != 0 and spin < 1000) : (spin += 1) {
+    var d = Deadline.ms(100, "virtio-snd reset drain");
+    while (ccRead8(CC_DEVICE_STATUS) != 0 and d.live()) {
         asm volatile ("pause");
     }
     ccWrite8(CC_DEVICE_STATUS, STATUS_ACKNOWLEDGE);

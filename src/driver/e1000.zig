@@ -29,6 +29,7 @@ const msix = @import("../time/msix.zig");
 const debug = @import("../debug/debug.zig");
 const net = @import("../net/net.zig");
 const iommu = @import("../cpu/mmu/iommu.zig");
+const Deadline = @import("../util/deadline.zig").Deadline;
 
 const E1000_VENDOR: u16 = 0x8086;
 
@@ -269,9 +270,10 @@ pub fn init() bool {
 
     // Reset: pulse CTRL.RST. The device clears it once self-test finishes.
     mmioWrite(REG_CTRL, mmioRead(REG_CTRL) | CTRL_RST);
-    var spin: u32 = 0;
-    while ((mmioRead(REG_CTRL) & CTRL_RST) != 0 and spin < 100000) : (spin += 1) {}
-    if (spin >= 100000) {
+    // SDM: RST self-clears within ~1 ms once self-test finishes.
+    var d_rst = Deadline.ms(10, "e1000 ctrl reset");
+    while ((mmioRead(REG_CTRL) & CTRL_RST) != 0 and d_rst.live()) {}
+    if ((mmioRead(REG_CTRL) & CTRL_RST) != 0) {
         debug.klog("[e1000] reset timeout\n", .{});
         return false;
     }
@@ -422,8 +424,10 @@ pub fn send(data: []const u8) bool {
     const flags = tx_lock.acquireIrqSave();
     defer tx_lock.releaseIrqRestore(flags);
     const idx = tx_next;
-    var spin: u32 = 0;
-    while ((tx_descs[idx].sta & TXD_STAT_DD) == 0 and spin < 1_000_000) : (spin += 1) {}
+    // Wall budget, not iterations: this wait runs with IRQs off (tx_lock
+    // IrqSave above), so a bounded ms figure is also the cli-hold bound.
+    var d = Deadline.ms(100, "e1000 tx slot dd");
+    while ((tx_descs[idx].sta & TXD_STAT_DD) == 0 and d.live()) {}
     if ((tx_descs[idx].sta & TXD_STAT_DD) == 0) {
         debug.klog("[e1000] tx ring stuck at idx={d}\n", .{idx});
         return false;

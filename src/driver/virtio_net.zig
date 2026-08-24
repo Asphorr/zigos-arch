@@ -26,6 +26,7 @@ const debug = @import("../debug/debug.zig");
 const net = @import("../net/net.zig");
 const virtio = @import("virtio.zig");
 const iommu = @import("../cpu/mmu/iommu.zig");
+const Deadline = @import("../util/deadline.zig").Deadline;
 const SpinLock = @import("../proc/spinlock.zig").SpinLock;
 
 const VirtqDesc = virtio.VirtqDesc;
@@ -237,8 +238,8 @@ pub fn init() bool {
 
     // Reset → ACK → DRIVER (per virtio §3.1.1).
     ccWrite8(virtio.CC_DEVICE_STATUS, 0);
-    var spin: u32 = 0;
-    while (ccRead8(virtio.CC_DEVICE_STATUS) != 0 and spin < 1000) : (spin += 1) {
+    var d_reset = Deadline.ms(100, "virtio-net reset drain");
+    while (ccRead8(virtio.CC_DEVICE_STATUS) != 0 and d_reset.live()) {
         asm volatile ("pause");
     }
     ccWrite8(virtio.CC_DEVICE_STATUS, virtio.STATUS_ACKNOWLEDGE);

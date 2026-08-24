@@ -252,12 +252,11 @@ fn enableAcpiMode(f: *align(1) const acpi.Fadt, cnt_a: u16) bool {
     // Kick the firmware: write ACPI_ENABLE to the SMI command port.
     io.outb(@truncate(f.smi_cmd), f.acpi_enable);
     // Poll SCI_EN. ACPI doesn't bound the latency; in practice it's near-
-    // immediate on QEMU. Cap the spin so non-conforming firmware can't wedge boot.
-    var spin: u32 = 0;
-    const SPIN_MAX: u32 = 5_000_000;
-    while (spin < SPIN_MAX) : (spin += 1) {
+    // immediate on QEMU. Cap the wait so non-conforming firmware can't wedge boot.
+    var d = @import("../util/deadline.zig").Deadline.ms(1000, "acpi sci_en handshake");
+    while (d.live()) {
         if (sciEnabled(cnt_a)) {
-            debug.klog("[sci] ACPI mode enabled via SMI_CMD (spin={d})\n", .{spin});
+            debug.klog("[sci] ACPI mode enabled via SMI_CMD ({d} ms)\n", .{d.elapsedMs()});
             return true;
         }
     }

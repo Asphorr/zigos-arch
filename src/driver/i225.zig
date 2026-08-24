@@ -35,6 +35,7 @@ const paging = @import("../mm/paging.zig");
 const msix = @import("../time/msix.zig");
 const debug = @import("../debug/debug.zig");
 const net = @import("../net/net.zig");
+const Deadline = @import("../util/deadline.zig").Deadline;
 
 const I225_VENDOR: u16 = 0x8086;
 // Most-common SKUs across I225 + I226 families. The driver doesn't care
@@ -317,13 +318,12 @@ pub fn init() bool {
     defer bind.deinit();
 
     // --- Reset ---
-    // CTRL.RST is self-clearing. Spec calls for a 1us delay after the write
-    // before the first read; the busy-loop iterations cover this on any
-    // CPU faster than ~1 GHz.
+    // CTRL.RST is self-clearing; spec wants ~1 us before the first read —
+    // the poll loop's own MMIO read latency covers that.
     mmioWrite(REG_CTRL, mmioRead(REG_CTRL) | CTRL_RST);
-    var spin: u32 = 0;
-    while ((mmioRead(REG_CTRL) & CTRL_RST) != 0 and spin < 100000) : (spin += 1) {}
-    if (spin >= 100000) {
+    var d_rst = Deadline.ms(10, "i225 ctrl reset");
+    while ((mmioRead(REG_CTRL) & CTRL_RST) != 0 and d_rst.live()) {}
+    if ((mmioRead(REG_CTRL) & CTRL_RST) != 0) {
         debug.klog("[i225] reset timeout\n", .{});
         return false;
     }
@@ -489,8 +489,10 @@ pub fn send(data: []const u8) bool {
     const flags = tx_lock.acquireIrqSave();
     defer tx_lock.releaseIrqRestore(flags);
     const idx = tx_next;
-    var spin: u32 = 0;
-    while ((tx_descs[idx].olinfo_status & TXD_STAT_DD) == 0 and spin < 1_000_000) : (spin += 1) {}
+    // Wall budget, not iterations — runs under tx_lock IrqSave, so this
+    // is also the cli-hold bound (see e1000.send for the twin).
+    var d = Deadline.ms(100, "i225 tx slot dd");
+    while ((tx_descs[idx].olinfo_status & TXD_STAT_DD) == 0 and d.live()) {}
     if ((tx_descs[idx].olinfo_status & TXD_STAT_DD) == 0) {
         debug.klog("[i225] tx ring stuck at idx={d}\n", .{idx});
         return false;

@@ -1,6 +1,7 @@
 const io = @import("../io.zig");
 const pic = @import("../time/pic.zig");
 const debug = @import("../debug/debug.zig");
+const Deadline = @import("../util/deadline.zig").Deadline;
 
 const DATA_PORT: u16 = 0x60;
 const STATUS_PORT: u16 = 0x64;
@@ -71,8 +72,10 @@ var syn_synth_latched: bool = false;
 /// elapsed without the condition becoming true — caller treats as a missing
 /// or wedged device, NOT as success-with-bad-data.
 fn mouseWait(is_signal: bool) bool {
-    var timeout: u32 = 100000;
-    while (timeout > 0) : (timeout -= 1) {
+    // Same 5 ms wall budget as keyboard.zig's ps2Wait — the two share the
+    // i8042 and the same VM-exit-cost trap (see PS2_WAIT_MS there).
+    var d = Deadline.ms(5, "ps2 aux i8042 ready");
+    while (d.live()) {
         if (is_signal) {
             if (io.inb(STATUS_PORT) & 1 != 0) return true;
         } else {

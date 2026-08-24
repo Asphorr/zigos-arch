@@ -21,6 +21,7 @@ const pmm = @import("../mm/pmm.zig");
 const paging = @import("../mm/paging.zig");
 const msix = @import("../time/msix.zig");
 const debug = @import("../debug/debug.zig");
+const Deadline = @import("../util/deadline.zig").Deadline;
 
 // PCI class for "AHCI 1.0 compliant" SATA controller.
 const PCI_CLASS_STORAGE: u8 = 0x01;
@@ -200,8 +201,8 @@ fn portStart(p: u8) void {
     cmd |= CMD_FRE;
     portWrite(p, PORT_CMD, cmd);
 
-    var spin: u32 = 0;
-    while ((portRead(p, PORT_TFD) & (TFD_BSY | TFD_DRQ)) != 0 and spin < 5_000_000) : (spin += 1) {}
+    var d = Deadline.ms(500, "ahci port idle (tfd bsy/drq)");
+    while ((portRead(p, PORT_TFD) & (TFD_BSY | TFD_DRQ)) != 0 and d.live()) {}
 
     cmd |= CMD_ST;
     portWrite(p, PORT_CMD, cmd);
@@ -234,17 +235,18 @@ pub fn init() bool {
     const bohc = hbaRead(HBA_BOHC);
     if (bohc & BOHC_BOS != 0) {
         hbaWrite(HBA_BOHC, bohc | BOHC_OOS);
-        var spin: u32 = 0;
-        while ((hbaRead(HBA_BOHC) & BOHC_BOS) != 0 and spin < 1_000_000) : (spin += 1) {}
+        var d = Deadline.ms(2000, "ahci bios/os handoff");
+        while ((hbaRead(HBA_BOHC) & BOHC_BOS) != 0 and d.live()) {}
     }
 
     // Enable AHCI mode + reset HBA.
     hbaWrite(HBA_GHC, GHC_AE);
     hbaWrite(HBA_GHC, GHC_AE | GHC_HR);
-    var spin: u32 = 0;
-    while ((hbaRead(HBA_GHC) & GHC_HR) != 0 and spin < 1_000_000) : (spin += 1) {}
-    if (spin >= 1_000_000) {
-        debug.klog("[ahci] HBA reset timeout\n", .{});
+    // Spec (AHCI 1.3.1 §10.4.3): HR must self-clear within 1 s.
+    var d = Deadline.ms(1000, "ahci hba reset");
+    while ((hbaRead(HBA_GHC) & GHC_HR) != 0 and d.live()) {}
+    if ((hbaRead(HBA_GHC) & GHC_HR) != 0) {
+        debug.klog("[ahci] HBA reset timeout ({d} ms)\n", .{d.elapsedMs()});
         return false;
     }
     hbaWrite(HBA_GHC, GHC_AE); // re-enable after reset

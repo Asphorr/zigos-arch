@@ -209,8 +209,8 @@ pub fn sysShutdown(mode: u32) u32 {
         _ = hyperv.tryReset();
         acpi.tryReset();
         io.outb(0xCF9, 0x06);
-        var spin: u32 = 0;
-        while ((io.inb(0x64) & 0x02) != 0 and spin < 100000) : (spin += 1) {}
+        var d = @import("../../util/deadline.zig").Deadline.ms(10, "kbd-ctrl reboot drain");
+        while ((io.inb(0x64) & 0x02) != 0 and d.live()) {}
         io.outb(0x64, 0xFE);
     } else if (mode == 2) {
         // Enter S3 (suspend-to-RAM). All staging — resume trampoline, the

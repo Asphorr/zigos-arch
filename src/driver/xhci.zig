@@ -6,6 +6,7 @@ const process = @import("../proc/process.zig");
 const keyboard = @import("keyboard.zig");
 const mouse = @import("mouse.zig");
 const msix = @import("../time/msix.zig");
+const Deadline = @import("../util/deadline.zig").Deadline;
 const iommu = @import("../cpu/mmu/iommu.zig");
 
 // PCI BDF captured at init for per-device-attach iommu.dmaMap calls.
@@ -520,11 +521,11 @@ pub fn init() bool {
                 if (cap & (1 << 16) != 0) {
                     debug.klog("[xhci] BIOS owns controller — requesting handoff\n", .{});
                     writeReg(cap_addr, cap | (1 << 24));
-                    var ho_tries: u32 = 0;
-                    while (ho_tries < 1_000_000) : (ho_tries += 1) {
+                    var d_ho = Deadline.ms(1000, "xhci bios handoff");
+                    while (d_ho.live()) {
                         if (readReg(cap_addr) & (1 << 16) == 0) break;
                     }
-                    if (ho_tries >= 1_000_000) {
+                    if (readReg(cap_addr) & (1 << 16) != 0) {
                         // BIOS refused to release. Force-clear per xHCI
                         // spec section 4.22.1: write OS-Owned, leave
                         // BIOS-Owned 0. Some buggy BIOSes wedge here.
@@ -551,12 +552,12 @@ pub fn init() bool {
     cmd &= ~@as(u32, CMD_RS);
     writeReg(op_base + USBCMD, cmd);
 
-    // Wait for halted
-    var timeout: u32 = 100000;
-    while (timeout > 0) : (timeout -= 1) {
+    // Wait for halted (spec: HCH within 16 ms of RS clearing)
+    var d_halt = Deadline.ms(50, "xhci halt");
+    while (d_halt.live()) {
         if (readReg(op_base + USBSTS) & STS_HCH != 0) break;
     }
-    if (timeout == 0) {
+    if (readReg(op_base + USBSTS) & STS_HCH == 0) {
         debug.klog("[xhci] Timeout waiting for halt\n", .{});
         return false;
     }
@@ -568,11 +569,11 @@ pub fn init() bool {
     var reset_attempts: u32 = 0;
     while (reset_attempts < 2) : (reset_attempts += 1) {
         writeReg(op_base + USBCMD, CMD_HCRST);
-        timeout = 100000;
-        while (timeout > 0) : (timeout -= 1) {
+        var d_rst = Deadline.ms(200, "xhci hcrst clear");
+        while (d_rst.live()) {
             if (readReg(op_base + USBCMD) & CMD_HCRST == 0) break;
         }
-        if (timeout > 0) break;
+        if (readReg(op_base + USBCMD) & CMD_HCRST == 0) break;
         debug.klog("[xhci] HCRST attempt {d} didn't clear, retrying\n", .{reset_attempts + 1});
     }
     if (reset_attempts >= 2) {
@@ -581,11 +582,11 @@ pub fn init() bool {
     }
 
     // Wait for CNR to clear
-    timeout = 100000;
-    while (timeout > 0) : (timeout -= 1) {
+    var d_cnr = Deadline.ms(500, "xhci cnr clear");
+    while (d_cnr.live()) {
         if (readReg(op_base + USBSTS) & STS_CNR == 0) break;
     }
-    if (timeout == 0) {
+    if (readReg(op_base + USBSTS) & STS_CNR != 0) {
         debug.klog("[xhci] Timeout waiting for CNR clear\n", .{});
         return false;
     }
@@ -671,11 +672,11 @@ pub fn init() bool {
     writeReg(op_base + USBCMD, cmd);
 
     // Verify running
-    timeout = 100000;
-    while (timeout > 0) : (timeout -= 1) {
+    var d_run = Deadline.ms(50, "xhci start");
+    while (d_run.live()) {
         if (readReg(op_base + USBSTS) & STS_HCH == 0) break;
     }
-    if (timeout == 0) {
+    if (readReg(op_base + USBSTS) & STS_HCH != 0) {
         debug.klog("[xhci] Controller failed to start\n", .{});
         return false;
     }
@@ -780,24 +781,24 @@ pub fn resumeFromS3() bool {
     var cmd = readReg(op_base + USBCMD);
     cmd &= ~@as(u32, CMD_RS);
     writeReg(op_base + USBCMD, cmd);
-    var timeout: u32 = 100000;
-    while (timeout > 0) : (timeout -= 1) {
+    var d_halt = Deadline.ms(50, "xhci s3 halt");
+    while (d_halt.live()) {
         if (readReg(op_base + USBSTS) & STS_HCH != 0) break;
     }
-    if (timeout == 0) {
+    if (readReg(op_base + USBSTS) & STS_HCH == 0) {
         debug.klog("[xhci] S3 resume: halt timeout\n", .{});
         return false;
     }
     writeReg(op_base + USBCMD, CMD_HCRST);
-    timeout = 100000;
-    while (timeout > 0) : (timeout -= 1) {
+    var d_rst = Deadline.ms(200, "xhci s3 hcrst clear");
+    while (d_rst.live()) {
         if (readReg(op_base + USBCMD) & CMD_HCRST == 0) break;
     }
-    timeout = 100000;
-    while (timeout > 0) : (timeout -= 1) {
+    var d_cnr = Deadline.ms(500, "xhci s3 cnr clear");
+    while (d_cnr.live()) {
         if (readReg(op_base + USBSTS) & STS_CNR == 0) break;
     }
-    if (timeout == 0) {
+    if (readReg(op_base + USBSTS) & STS_CNR != 0) {
         debug.klog("[xhci] S3 resume: CNR timeout\n", .{});
         return false;
     }
@@ -841,11 +842,11 @@ pub fn resumeFromS3() bool {
     cmd = readReg(op_base + USBCMD);
     cmd |= CMD_RS | CMD_INTE;
     writeReg(op_base + USBCMD, cmd);
-    timeout = 100000;
-    while (timeout > 0) : (timeout -= 1) {
+    var d_run = Deadline.ms(50, "xhci s3 start");
+    while (d_run.live()) {
         if (readReg(op_base + USBSTS) & STS_HCH == 0) break;
     }
-    if (timeout == 0) {
+    if (readReg(op_base + USBSTS) & STS_HCH != 0) {
         debug.klog("[xhci] S3 resume: controller failed to start\n", .{});
         return false;
     }
@@ -915,17 +916,20 @@ fn resetPort(port: u8) bool {
     portsc |= PORTSC_CSC | PORTSC_PRC;
     writeReg(addr, portsc);
 
-    // Wait for reset complete (PRC bit set)
-    var timeout: u32 = 200000;
-    while (timeout > 0) : (timeout -= 1) {
+    // Wait for reset complete (PRC bit set). USB2 port reset holds 50 ms
+    // by spec; 200 ms covers slow hubs.
+    var d_prc = Deadline.ms(200, "xhci port reset (prc)");
+    var prc_seen = false;
+    while (d_prc.live()) {
         const sc = readReg(addr);
         if (sc & PORTSC_PRC != 0) {
             // Clear PRC
             writeReg(addr, (sc & 0x0E01C3E0) | PORTSC_PRC);
+            prc_seen = true;
             break;
         }
     }
-    if (timeout == 0) {
+    if (!prc_seen) {
         debug.klog("[xhci] Port {d} reset timeout\n", .{port + 1});
         return false;
     }

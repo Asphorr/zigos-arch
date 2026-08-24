@@ -502,16 +502,18 @@ pub fn blitRectToScreen(x: u32, y: u32, w: u32, h: u32) void {
     }
 }
 
-/// Wait for vertical retrace (eliminates tearing). Timeout-safe.
+/// Wait for vertical retrace (eliminates tearing). Timeout-safe: a frame
+/// is ~16 ms, so 20 ms per phase bounds the wait even when the status
+/// port is dead (GOP framebuffer — no VGA retrace to see).
 pub fn waitVSync() void {
-    var timeout: u32 = 4096;
+    var d_clear = @import("../util/deadline.zig").Deadline.ms(20, "vga vsync clear");
     // Wait until not in retrace
-    while (timeout > 0) : (timeout -= 1) {
+    while (d_clear.live()) {
         if (io.inb(0x3DA) & 0x08 == 0) break;
     }
-    timeout = 4096;
+    var d_start = @import("../util/deadline.zig").Deadline.ms(20, "vga vsync start");
     // Wait until retrace starts
-    while (timeout > 0) : (timeout -= 1) {
+    while (d_start.live()) {
         if (io.inb(0x3DA) & 0x08 != 0) break;
     }
 }
