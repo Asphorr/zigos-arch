@@ -36,6 +36,7 @@ const block = @import("../driver/block.zig");
 const crc32 = @import("../util/crc32.zig");
 const endian = @import("../util/endian.zig");
 const random = @import("../crypto/random.zig");
+const fail = @import("../util/fail.zig").fail;
 
 const debug = @import("../debug/debug.zig");
 
@@ -538,58 +539,81 @@ fn makeGuid(out: *[16]u8) void {
 /// signature and header CRC.
 ///
 /// Caller context: process context only — issues blocking reads.
-pub fn parse(dev: Device) ?Table {
+/// Everything `parse` can reject a disk for. `NotGpt` is the common,
+/// EXPECTED case (probe loops hit it all day); the rest mean "GPT here
+/// but damaged" — a different situation for the caller, and the reason
+/// this is an error set rather than a bool: the class travels with the
+/// return, the detail (which LBA, which CRC pair) sits in the fail ring.
+pub const ParseError = error{
+    DiskTooSmall,
+    DiskTooBig,
+    ReadFailed,
+    NotGpt,
+    BadRevision,
+    BadHeaderSize,
+    BadEntrySize,
+    TooManyEntries,
+    BadHeaderCrc,
+    ArrayPastDisk,
+    BadArrayCrc,
+};
+
+pub fn parse(dev: Device) ParseError!Table {
     if (dev.sectors < RESERVED_SECTORS + 1) {
-        debug.klog("[gpt] parse: disk too small ({d} sectors)\n", .{dev.sectors});
-        return null;
+        return fail(error.DiskTooSmall, "parse: {d} sectors", .{dev.sectors});
     }
     if (dev.sectors > MAX_DISK_SECTORS) {
-        debug.klog("[gpt] parse: disk {d} sectors exceeds the u32 LBA limit\n", .{dev.sectors});
-        return null;
+        return fail(error.DiskTooBig, "parse: {d} sectors > u32 LBA limit", .{dev.sectors});
     }
 
-    if (readHeader(dev, 1)) |h| {
+    const primary_err: ParseError = blk: {
+        const h = readHeader(dev, 1) catch |e| break :blk e;
         return buildTable(dev, h, false);
+    };
+    // A wiped/corrupt primary with a healthy backup is still a GPT disk —
+    // always try LBA N-1. Narrate on serial only when the primary looked
+    // DAMAGED; a plain non-GPT disk (NotGpt) stays quiet here, its detail
+    // already in the fail ring.
+    if (primary_err != error.NotGpt) {
+        debug.klog("[gpt] parse: primary header {s}, trying backup at LBA {d}\n", .{ @errorName(primary_err), dev.sectors - 1 });
     }
-    debug.klog("[gpt] parse: primary header bad, trying backup at LBA {d}\n", .{dev.sectors - 1});
-    if (readHeader(dev, dev.sectors - 1)) |h| {
-        return buildTable(dev, h, true);
-    }
-    debug.klog("[gpt] parse: no valid GPT header on either copy\n", .{});
-    return null;
+    const h = readHeader(dev, dev.sectors - 1) catch |backup_err| {
+        if (primary_err != error.NotGpt or backup_err != error.NotGpt) {
+            debug.klog("[gpt] parse: no valid GPT header on either copy ({s}/{s})\n", .{ @errorName(primary_err), @errorName(backup_err) });
+        }
+        return backup_err;
+    };
+    return buildTable(dev, h, true);
 }
 
-/// Reads and validates one header copy. Returns null on any of: read error,
-/// wrong signature, unsupported revision, header_size outside the range we
-/// understand, or CRC mismatch. Each is logged distinctly — "no GPT here" and
-/// "GPT here but corrupt" need different responses from a caller.
-fn readHeader(dev: Device, lba: u64) ?Header {
+/// Reads and validates one header copy. Each rejection is a distinct
+/// error with its detail (LBA, offending value) recorded via fail() —
+/// "no GPT here" and "GPT here but corrupt" need different responses
+/// from a caller.
+fn readHeader(dev: Device, lba: u64) ParseError!Header {
     var buf: [SECTOR_SIZE]u8 = undefined;
     if (!dev.readSectors(@intCast(lba), 1, &buf)) {
-        debug.klog("[gpt] header read failed at LBA {d}\n", .{lba});
-        return null;
+        return fail(error.ReadFailed, "header read at lba={d}", .{lba});
     }
 
     var h: Header = undefined;
     @memcpy(std.mem.asBytes(&h), buf[0..@sizeOf(Header)]);
 
-    if (h.signature.get() != SIGNATURE) return null; // not a GPT disk — quiet
+    if (h.signature.get() != SIGNATURE) {
+        return fail(error.NotGpt, "lba={d} sig=0x{X}", .{ lba, h.signature.get() });
+    }
     if (h.revision.get() != REVISION_1_0) {
-        debug.klog("[gpt] LBA {d}: unsupported revision 0x{X}\n", .{ lba, h.revision.get() });
-        return null;
+        return fail(error.BadRevision, "lba={d} rev=0x{X}", .{ lba, h.revision.get() });
     }
     const hsize = h.header_size.get();
     if (hsize < HEADER_BYTES or hsize > SECTOR_SIZE) {
-        debug.klog("[gpt] LBA {d}: header_size {d} out of range\n", .{ lba, hsize });
-        return null;
+        return fail(error.BadHeaderSize, "lba={d} header_size={d}", .{ lba, hsize });
     }
     if (h.sizeof_partition_entry.get() != ENTRY_BYTES) {
-        debug.klog("[gpt] LBA {d}: entry size {d} != {d}\n", .{ lba, h.sizeof_partition_entry.get(), ENTRY_BYTES });
-        return null;
+        return fail(error.BadEntrySize, "lba={d} entry size {d} != {d}", .{ lba, h.sizeof_partition_entry.get(), ENTRY_BYTES });
     }
     if (h.num_partition_entries.get() > ENTRY_COUNT) {
-        debug.klog("[gpt] LBA {d}: {d} entries exceeds the {d} we read\n", .{ lba, h.num_partition_entries.get(), ENTRY_COUNT });
-        return null;
+        return fail(error.TooManyEntries, "lba={d}: {d} entries > the {d} we read", .{ lba, h.num_partition_entries.get(), ENTRY_COUNT });
     }
 
     // CRC over header_size bytes with the CRC field zeroed. Zero it in the
@@ -599,13 +623,12 @@ fn readHeader(dev: Device, lba: u64) ?Header {
     @memset(buf[@offsetOf(Header, "header_crc32")..][0..4], 0);
     const computed = crc32.oneShot(buf[0..hsize]);
     if (computed != stored) {
-        debug.klog("[gpt] LBA {d}: header CRC 0x{X} != stored 0x{X}\n", .{ lba, computed, stored });
-        return null;
+        return fail(error.BadHeaderCrc, "lba={d} crc 0x{X} != stored 0x{X}", .{ lba, computed, stored });
     }
     return h;
 }
 
-fn buildTable(dev: Device, h: Header, from_backup: bool) ?Table {
+fn buildTable(dev: Device, h: Header, from_backup: bool) ParseError!Table {
     const entry_lba = h.partition_entry_lba.get();
     const declared = h.num_partition_entries.get();
     const array_bytes: u64 = @as(u64, declared) * @as(u64, ENTRY_BYTES);
@@ -613,8 +636,7 @@ fn buildTable(dev: Device, h: Header, from_backup: bool) ?Table {
     const array_sectors: u64 = (array_bytes + sector_bytes - 1) / sector_bytes;
 
     if (entry_lba + array_sectors > dev.sectors) {
-        debug.klog("[gpt] entry array at LBA {d} (+{d}) runs past the disk\n", .{ entry_lba, array_sectors });
-        return null;
+        return fail(error.ArrayPastDisk, "entry array lba={d} +{d} sectors, disk={d}", .{ entry_lba, array_sectors, dev.sectors });
     }
 
     var t: Table = .{
@@ -638,8 +660,7 @@ fn buildTable(dev: Device, h: Header, from_backup: bool) ?Table {
     while (sector < array_sectors) : (sector += 1) {
         var buf: [SECTOR_SIZE]u8 = undefined;
         if (!dev.readSectors(@intCast(entry_lba + sector), 1, &buf)) {
-            debug.klog("[gpt] entry array read failed at sector {d}\n", .{sector});
-            return null;
+            return fail(error.ReadFailed, "entry array sector {d} (lba={d})", .{ sector, entry_lba + sector });
         }
         // The final sector may be partially covered when `declared` is not a
         // multiple of 4; the CRC is defined over exactly declared*128 bytes.
@@ -666,8 +687,7 @@ fn buildTable(dev: Device, h: Header, from_backup: bool) ?Table {
     const computed = crc32.end(array_crc);
     const stored = h.partition_entry_array_crc32.get();
     if (computed != stored) {
-        debug.klog("[gpt] entry array CRC 0x{X} != stored 0x{X}\n", .{ computed, stored });
-        return null;
+        return fail(error.BadArrayCrc, "entry array crc 0x{X} != stored 0x{X}", .{ computed, stored });
     }
     if (t.truncated) {
         debug.kwarn(@src(), "[gpt] more than {d} partitions on disk; only the first {d} surfaced\n", .{ MAX_PARSED, MAX_PARSED });

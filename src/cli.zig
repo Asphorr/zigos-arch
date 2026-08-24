@@ -200,6 +200,13 @@ pub fn execute(cmd: []const u8) void {
         cmdKill(cmd[5..]);
     } else if (std.mem.eql(u8, cmd, "crashlog")) {
         cmdCat("CRASHLOG");
+    } else if (std.mem.eql(u8, cmd, "errlog")) {
+        // Drain the fail ring to serial — the recorded detail of every
+        // fail()-returned error, printed on demand instead of at birth.
+        @import("util/fail.zig").dumpRecent(32);
+        vga.print("fail ring dumped to serial\n", .{});
+    } else if (std.mem.eql(u8, cmd, "errprobe")) {
+        cmdErrProbe();
     } else if (std.mem.eql(u8, cmd, "lsusb")) {
         cmdLsusb();
     } else if (std.mem.startsWith(u8, cmd, "ping ")) {
@@ -398,6 +405,33 @@ fn cmdMeminfo() void {
     vga.fg = .LightGreen;
     vga.print("{d} KB\n", .{free * 4});
     vga.fg = .LightGray;
+}
+
+/// Living demo of the fail()+errtrace pattern: a three-deep call chain
+/// births an error via fail(), propagates it through two `try`s, and the
+/// surface point symbolizes the @errorReturnTrace(). If serial shows the
+/// full probeLevel2→probeLevel1 path, error tracing works in this build;
+/// if it prints "(no error-return trace)", the build knob regressed.
+fn cmdErrProbe() void {
+    const errtrace = @import("util/errtrace.zig");
+    const F = struct {
+        const failfn = @import("util/fail.zig").fail;
+        fn probeLevel2() !void {
+            return failfn(error.Timeout, "errprobe: synthetic failure, detail={d}", .{42});
+        }
+        fn probeLevel1() !void {
+            try probeLevel2();
+        }
+        fn probeRoot() !void {
+            try probeLevel1();
+        }
+    };
+    F.probeRoot() catch |e| {
+        errtrace.dump(e, @errorReturnTrace());
+        vga.print("errprobe: error.{s} surfaced — trace + fail ring on serial\n", .{@errorName(e)});
+        return;
+    };
+    vga.print("errprobe: BUG — the synthetic error vanished\n", .{});
 }
 
 fn cmdUptime() void {
@@ -1070,9 +1104,9 @@ fn cmdLsblk() void {
     const mib = dev.sectors / 2048;
     vga.print("  disk: {d} sectors ({d} MiB)\n", .{ dev.sectors, mib });
 
-    const table = gpt.parse(dev) orelse {
+    const table = gpt.parse(dev) catch |e| {
         vga.fg = .DarkGray;
-        vga.print("  no valid GPT (run 'mkdisk go' to create one)\n", .{});
+        vga.print("  no valid GPT: {s} (run 'mkdisk go' to create one)\n", .{@errorName(e)});
         vga.fg = .LightGray;
         return;
     };
@@ -1158,8 +1192,9 @@ fn cmdMkdisk(arg: []const u8) void {
 
     // Read the table back through the parse path rather than trusting the
     // write: a table only we can read is not a table.
-    const table = gpt.parse(dev) orelse {
-        printErr("Wrote a GPT our own parser rejects\n", .{});
+    const table = gpt.parse(dev) catch |e| {
+        printErr("Wrote a GPT our own parser rejects ({s})\n", .{@errorName(e)});
+        @import("util/errtrace.zig").dump(e, @errorReturnTrace());
         return;
     };
     if (table.count != specs.len) {

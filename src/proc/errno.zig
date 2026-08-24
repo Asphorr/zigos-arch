@@ -53,3 +53,25 @@ pub inline fn err(e: Errno) u32 {
 pub inline fn isErr(r: u32) bool {
     return r >= ERR_SENTINEL_BASE;
 }
+
+/// The one translator from Zig error values to syscall errno returns —
+/// the ABI boundary calls this in its `catch`, nothing else re-maps.
+/// Matches by NAME so both the generic `util/fail.zig` KError vocabulary
+/// and subsystem-local sets (gpt.ParseError, tls errors) translate
+/// without registering anywhere. Unknown names fall to EIO: by the time
+/// an unrecognized kernel-internal error reaches the ABI it IS an I/O-
+/// shaped failure from userspace's point of view, and EINVAL would
+/// mislead callers into blaming their own arguments.
+pub fn fromError(e: anyerror) u32 {
+    return err(switch (e) {
+        error.NoMem, error.OutOfMemory => .ENOMEM,
+        error.NoSlot, error.Busy => .EBUSY,
+        error.NoEnt, error.NotFound => .ENOENT,
+        error.Timeout => .ETIMEDOUT,
+        error.BadArg => .EINVAL,
+        error.BadState => .EBUSY,
+        error.Fault => .EFAULT,
+        error.Unsupported => .ENOSYS,
+        else => .EIO,
+    });
+}

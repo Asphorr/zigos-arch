@@ -90,8 +90,9 @@ fn run() void {
     //        than the specs, so a table that round-trips wrong misplaces the
     //        formats instead of quietly passing.
     serial.print("[disktest] 2: re-reading GPT\n", .{});
-    const table = gpt.parse(dev) orelse {
-        serial.print("[disktest] FAIL: gpt.parse rejected our own table\n", .{});
+    const table = gpt.parse(dev) catch |e| {
+        serial.print("[disktest] FAIL: gpt.parse rejected our own table ({s})\n", .{@errorName(e)});
+        @import("../util/errtrace.zig").dump(e, @errorReturnTrace());
         fail_count += 1;
         return;
     };

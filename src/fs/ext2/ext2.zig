@@ -106,7 +106,9 @@ pub fn initAuto() bool {
     var idx: usize = 0;
     while (idx < blkdev.controllerCount()) : (idx += 1) {
         const dev = blkdev.ctrlDevice(idx) orelse continue;
-        const table = gpt.parse(dev) orelse continue;
+        // Expected-failure path: most probed disks simply aren't GPT.
+        // The rejection class+detail is in the fail ring if ever needed.
+        const table = gpt.parse(dev) catch continue;
         for (table.parts[0..table.count]) |p| {
             if (!std.mem.eql(u8, &p.type_guid, &gpt.TYPE_LINUX_DATA)) continue;
             blkdev.setRootDisk(idx);

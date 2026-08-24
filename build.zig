@@ -112,6 +112,13 @@ pub fn build(b: *std.Build) void {
             // .rodata reference panics ld.lld with "relocation out of
             // range: 18446744071… is not in [0, 4294967295]".
             .code_model = .kernel,
+            // Error-return traces regardless of optimize mode: ReleaseSafe
+            // leaves them off by default, but util/errtrace.zig turns them
+            // into symbolized birth-to-boundary error paths — the cost is
+            // a per-frame trace buffer on functions that can error, paid
+            // only on error returns (cold by definition). See STYLE.md
+            // "fail() + errtrace".
+            .error_tracing = true,
             .imports = &.{
                 .{ .name = "shapes", .module = kernel_shapes_mod },
                 .{ .name = "font_blobs", .module = font_blobs_mod },

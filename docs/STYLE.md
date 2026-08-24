@@ -259,6 +259,45 @@ hdr.store(next);         // durable on return
 boot counter). New on-pmem structures go through `Persistent(T)`; the
 raw `readAt`/`writeAt` byte path remains for /dev/pmem0 file I/O.
 
+## `fail()` + `errtrace` — errors carry their birthplace
+
+Rule 12 bans silent failure paths, but a `return false`/`return null`
+can't say WHY even when the author wants it to. New fallible code
+returns error unions, and the failure site goes through
+`util/fail.zig`:
+
+```zig
+if (computed != stored)
+    return fail(error.BadHeaderCrc, "lba={d} crc 0x{X} != 0x{X}", .{ lba, computed, stored });
+```
+
+`fail()` records the formatted detail into a fixed 32-entry ring
+(RECORD-only — rule 6: a probe loop failing a hundred times stays
+quiet) and returns the error unchanged. Where an error finally
+SURFACES — an ABI boundary, a top-level loop, a mount that gives up —
+`util/errtrace.zig` makes the whole path visible:
+
+```zig
+op() catch |e| {
+    errtrace.dump(e, @errorReturnTrace()); // birth → boundary, symbolized
+    return errno.fromError(e);             // the ONE errno translator
+};
+```
+
+Error-return tracing is forced on in build.zig (ReleaseSafe leaves it
+off by default), so every `try` between birth and catch is in the
+trace. `errno.fromError` matches by NAME — subsystem-local error sets
+(gpt.ParseError, tls errors) translate without registering anywhere.
+CLI: `errprobe` demos the machinery end to end; `errlog` drains the
+ring on demand.
+
+**Why:** the 2026-08-25 audit counted 1568 silent failure returns
+against 400 logged ones; the TLS hunt (rule 12's origin) burned a day
+on exactly one of them. Bools don't compose; errors do.
+**Reference exemplar:** `gpt.parse` / `gpt.readHeader`. **How to
+apply:** new fallible functions return error unions and fail() their
+rejections; existing bool/optional functions convert when touched.
+
 ## `Deadline` — wall-clock budgets for polled hardware waits
 
 An iteration-count spin (`while (busy and spin < 5_000_000)`) measures
@@ -330,3 +369,5 @@ silent self-recovery into observable metric.
 | `Persistent(T)`     | `src/mm/pmem.zig` `persistenceSelfTest`         |
 | `kwarn(@src(),...)` | `src/debug/debug.zig` `kwarn`                   |
 | `Deadline`          | `src/driver/keyboard.zig` `ps2Wait`             |
+| `mightSleep`        | `src/proc/sched.zig` `blockOn`                  |
+| `fail()`/`errtrace` | `src/fs/gpt.zig` `readHeader` / `parse`         |

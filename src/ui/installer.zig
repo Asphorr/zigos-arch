@@ -1097,7 +1097,7 @@ fn stepInstall() void {
         },
 
         .reread_gpt => {
-            table = gpt.parse(dev) orelse {
+            table = gpt.parse(dev) catch {
                 fail("We wrote a partition table our own parser rejects.");
                 return;
             };
