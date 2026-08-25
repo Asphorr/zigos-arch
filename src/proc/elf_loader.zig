@@ -307,7 +307,7 @@ fn setupLinuxInitialStack(
         debug.klog("[linux] setupLinuxInitialStack: map of top stack page failed\n", .{});
         return false;
     };
-    const kbuf: [*]u8 = @ptrFromInt(paging.physToVirt(frame)); // physmap alias, zeroed
+    const kbuf = frame.toVirt().ptr([*]u8); // physmap alias, zeroed
 
     // Strings/data at the top of the page (descending); the argc/argv/envp/auxv
     // arrays go below them.
@@ -453,7 +453,7 @@ pub fn loadAndStart(elf_buf: [*]align(4) u8, file_size: usize, elf_buf_pages: u3
         return null;
     }
 
-    var pd_phys: usize = 0;
+    var pd_phys: Phys = Phys.of(0);
     const pd = vmm.createAddressSpace(&pd_phys) orelse {
         freePmmRange(@intFromPtr(elf_buf), elf_buf_pages);
         return null;
@@ -505,7 +505,7 @@ pub fn loadAndStart(elf_buf: [*]align(4) u8, file_size: usize, elf_buf_pages: u3
 
     const pcb = process.getPCB(pid);
     pcb.page_directory = pd;
-    pcb.page_dir_phys = pd_phys;
+    pcb.page_dir_phys = pd_phys.raw();
     pcb.pcid = @import("../cpu/mmu/pcid.zig").alloc();
     pcb.elf_buf = elf_buf;
     pcb.elf_buf_pages = elf_buf_pages;
@@ -604,7 +604,7 @@ pub fn loadAndExecute(elf_buf: [*]align(4) u8, file_size: usize, elf_buf_pages: 
     }
 
     // Create per-process address space
-    var pd_phys: usize = 0;
+    var pd_phys: Phys = Phys.of(0);
     const pd = vmm.createAddressSpace(&pd_phys) orelse {
         vga.fg = .LightRed;
         vga.print("Error: cannot create address space!\n", .{});
@@ -634,7 +634,7 @@ pub fn loadAndExecute(elf_buf: [*]align(4) u8, file_size: usize, elf_buf_pages: 
     // Store address space + ELF buffer in PCB
     const pcb = process.getPCB(pid);
     pcb.page_directory = pd;
-    pcb.page_dir_phys = pd_phys;
+    pcb.page_dir_phys = pd_phys.raw();
     pcb.pcid = @import("../cpu/mmu/pcid.zig").alloc();
     pcb.elf_buf = elf_buf;
     pcb.elf_buf_pages = elf_buf_pages;
@@ -697,7 +697,7 @@ pub fn loadAndExecute(elf_buf: [*]align(4) u8, file_size: usize, elf_buf_pages: 
 
     // Switch to the new address space (PCID-tagged so subsequent reloads
     // can preserve this process's TLB across context switches).
-    @import("../cpu/mmu/pcid.zig").loadCr3(pd_phys, pcb.pcid, @import("../cpu/smp.zig").myCpu().cpu_id);
+    @import("../cpu/mmu/pcid.zig").loadCr3(pd_phys.raw(), pcb.pcid, @import("../cpu/smp.zig").myCpu().cpu_id);
 
     debug.klog("[elf] Entering Ring 3\n", .{});
     // Synchronously wait for the loaded process to exit. schedule() may pick

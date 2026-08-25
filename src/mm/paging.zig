@@ -627,29 +627,29 @@ var gui_fb_back_phys: [MAX_PROCS][3]usize = [_][3]usize{[_]usize{0} ** 3} ** MAX
 /// Record the base physical address of a process's GUI front buffer.
 /// Called once per sysCreateWindow; front buffer is dual-owner (user
 /// PML4 + kernel desktop ref).
-pub fn registerGuiFB(pid: u8, phys_base: usize) void {
-    if (pid < MAX_PROCS) gui_fb_phys_base[pid] = phys_base;
+pub fn registerGuiFB(pid: u8, phys_base: Phys) void {
+    if (pid < MAX_PROCS) gui_fb_phys_base[pid] = phys_base.raw();
 }
 
 /// Record the base physical address of a lazily-allocated back buffer
 /// slot (0..2). Single-owner (kernel only). Called from
 /// desktop.snapshotGuiFb's first-touch path.
-pub fn registerGuiFBBack(pid: u8, slot: u8, phys_base: usize) void {
+pub fn registerGuiFBBack(pid: u8, slot: u8, phys_base: Phys) void {
     if (pid >= MAX_PROCS or slot >= 3) return;
-    gui_fb_back_phys[pid][slot] = phys_base;
+    gui_fb_back_phys[pid][slot] = phys_base.raw();
 }
 
 /// Atomically take the phys for a back-buffer slot, clearing the entry.
-/// Returns 0 if the slot wasn't allocated. Used by the reclaim path
+/// Returns null if the slot wasn't allocated. Used by the reclaim path
 /// (desktop.reclaimBackBuffers) so freeContiguous and the registry
 /// stay in sync — if reclaim called freeContiguous directly without
 /// clearing the registry, unmapGuiFB on window destroy would
 /// double-free.
-pub fn takeGuiFbBackPhys(pid: u8, slot: u8) usize {
-    if (pid >= MAX_PROCS or slot >= 3) return 0;
+pub fn takeGuiFbBackPhys(pid: u8, slot: u8) ?Phys {
+    if (pid >= MAX_PROCS or slot >= 3) return null;
     const phys = gui_fb_back_phys[pid][slot];
     gui_fb_back_phys[pid][slot] = 0;
-    return phys;
+    return if (phys == 0) null else Phys.of(phys);
 }
 
 /// Free a process's GUI FB back to the PMM. Front buffer pages are

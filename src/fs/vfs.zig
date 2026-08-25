@@ -458,13 +458,13 @@ pub fn readThroughCache(inum: u32, offset: u64, buf: [*]u8, count: u32) u32 {
             const fdst = pf.toVirt().ptr([*]u8);
             const got: u64 = @min(@as(u64, fillCachePage(inum, page_off, fdst)), 0x1000);
             if (got < 0x1000) @memset(fdst[@as(usize, @intCast(got))..0x1000], 0); // zero tail past EOF
-            break :blk page_cache.insertFilled(file_id, page_off, pf.raw());
+            break :blk page_cache.insertFilled(file_id, page_off, pf);
         };
 
         // frame -> kstack scratch, under the reference (cannot fault-kill).
-        const src: [*]const u8 = @ptrFromInt(paging.physToVirt(frame));
+        const src = frame.toVirt().ptr([*]const u8);
         @memcpy(scratch[0..ck], src[ip .. ip + ck]);
-        pmm.releaseFrame(Phys.of(frame)); // drop the pin / insertFilled ref BEFORE the user copy
+        pmm.releaseFrame(frame); // drop the pin / insertFilled ref BEFORE the user copy
 
         // scratch -> user (no cache ref held; a faulting user page is safe now).
         // Like the existing readInodeBytes path this user write isn't SMAP-
@@ -497,9 +497,9 @@ pub fn syncCacheFile(inum: u32, clear: bool) u32 {
     var written: u32 = 0;
     while (page_cache.takeNextDirty(file_id, off)) |dp| {
         off = dp.page_off + page_cache.PAGE_SIZE; // advance cursor → guarantees termination
-        const src: [*]const u8 = @ptrFromInt(paging.physToVirt(dp.frame));
+        const src = dp.frame.toVirt().ptr([*]const u8);
         _ = ext2.writebackPage(inum, dp.page_off, src);
-        pmm.releaseFrame(Phys.of(dp.frame)); // drop the writeback pin BEFORE the refcount-gated clear
+        pmm.releaseFrame(dp.frame); // drop the writeback pin BEFORE the refcount-gated clear
         if (clear) _ = page_cache.clearDirtyIfCacheOnly(file_id, dp.page_off);
         written += 1;
     }
@@ -540,10 +540,10 @@ pub fn flushAllDirty() u32 {
         // its own writeback path.
         if (dp.file_id & page_cache.FILE_ID_EXT2 != 0) {
             const inum: u32 = @intCast(dp.file_id & ~page_cache.FILE_ID_EXT2);
-            const src: [*]const u8 = @ptrFromInt(paging.physToVirt(dp.frame));
+            const src = dp.frame.toVirt().ptr([*]const u8);
             _ = ext2.writebackPage(inum, dp.page_off, src);
         }
-        pmm.releaseFrame(Phys.of(dp.frame)); // drop the writeback pin BEFORE the refcount-gated clear
+        pmm.releaseFrame(dp.frame); // drop the writeback pin BEFORE the refcount-gated clear
         _ = page_cache.clearDirtyIfCacheOnly(dp.file_id, dp.page_off);
         written += 1;
     }

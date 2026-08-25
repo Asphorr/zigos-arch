@@ -17,9 +17,16 @@
 //! Adoption is chokepoint-first (UserPtr precedent): `util/dma.zig`
 //! births typed driver memory, and since 2026-08-25 the pmm public API
 //! (allocFrame/allocContiguous/freeFrame/acquireFrame/… and variants)
-//! speaks `Phys` — every frame's lifecycle starts and ends typed. pmm's
-//! INTERNALS (bitmap math, magazines, region freelists) stay raw usize
-//! behind that boundary, as do PTE integers and driver ring structs;
+//! speaks `Phys` — every frame's lifecycle starts and ends typed. The
+//! same day's second sweep took the next ring outward: vmm's user-map
+//! API (mapUserPage/unmapUserPage/resolveUserPhys/allocAndMapUserPage,
+//! createAddressSpace/cloneAddressSpace phys_out, destroyAddressSpace),
+//! page_cache (Entry.frame/pin/insertFilled/dirty iterators), swap page
+//! I/O (writePage/readPage, setInflightFrame), and the GUI-FB
+//! registries (registerGuiFB[Back]/takeGuiFbBackPhys). pmm's INTERNALS
+//! (bitmap math, magazines, region freelists) stay raw usize behind
+//! that boundary, as do PTE integers, PCB registry fields
+//! (page_dir_phys, swap_inflight_frame), and driver ring structs;
 //! `Phys.of` at those crossings is the audit marker, not a smell.
 
 const paging = @import("../mm/paging.zig");

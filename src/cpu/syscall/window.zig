@@ -18,6 +18,7 @@ const perf = @import("../../debug/perf.zig");
 const pipe = @import("../../proc/pipe.zig");
 const memmap = @import("../../mm/memmap.zig");
 const config = @import("../../config.zig");
+const Phys = @import("../../util/addr.zig").Phys;
 const smp = @import("../smp.zig");
 const signals = @import("../../proc/signals.zig");
 const errno = @import("../../proc/errno.zig");
@@ -304,7 +305,7 @@ pub fn sysCreateWindow(alloc_width_in: u32, alloc_height: u32, display_wh: u32) 
     if (gpu_slot) |idx| {
         const gpu_comp = @import("../../ui/gpu_compositor.zig");
         const sl = &gpu_comp.window_slots[idx];
-        const slot_phys = sl.phys;
+        const slot_phys = Phys.of(sl.phys);
         const slot_pages: u32 = @intCast((sl.mem_bytes + 4095) / 4096);
         // Map the dmabuf into user-space at GUI_FB_BASE. The phys is
         // in the SHM BAR range — vmm.mapUserPage just sets PTE flags,
@@ -315,7 +316,7 @@ pub fn sysCreateWindow(alloc_width_in: u32, alloc_height: u32, display_wh: u32) 
         // whole point of gap #1's MapError migration.
         var mapped_pages: usize = 0;
         for (0..slot_pages) |i| {
-            vmm.mapUserPage(pd, GUI_FB_BASE + i * 4096, slot_phys + i * 4096, paging.READ_WRITE | paging.USER) catch |e| {
+            vmm.mapUserPage(pd, GUI_FB_BASE + i * 4096, slot_phys.add(i * 4096), paging.READ_WRITE | paging.USER) catch |e| {
                 debug.klog("[sysCW] BLOB mapUserPage failed at page={d} virt=0x{X}: {s}\n", .{ i, GUI_FB_BASE + i * 4096, @errorName(e) });
                 var j: usize = 0;
                 while (j < mapped_pages) : (j += 1) {
@@ -357,7 +358,7 @@ pub fn sysCreateWindow(alloc_width_in: u32, alloc_height: u32, display_wh: u32) 
         var mapped_pages: usize = 0;
         for (0..num_pages) |i| {
             const phys = phys_base.add(i * 4096);
-            vmm.mapUserPage(pd, GUI_FB_BASE + i * 4096, phys.raw(), paging.READ_WRITE | paging.USER) catch |e| {
+            vmm.mapUserPage(pd, GUI_FB_BASE + i * 4096, phys, paging.READ_WRITE | paging.USER) catch |e| {
                 // Rollback: undo dual-owner refs on what we mapped, then
                 // free the whole contiguous block. releaseFrame here pairs
                 // with the (skipped) acquireFrame we never reached on this
@@ -383,7 +384,7 @@ pub fn sysCreateWindow(alloc_width_in: u32, alloc_height: u32, display_wh: u32) 
             @memset(ptr[0..4096], 0);
             mapped_pages += 1;
         }
-        paging.registerGuiFB(pid, phys_base.raw());
+        paging.registerGuiFB(pid, phys_base);
         asm volatile ("movq %%cr3, %%rax\n movq %%rax, %%cr3" ::: .{ .rax = true });
         kern_fb = @ptrFromInt(phys_base.toVirt().raw());
         // kern_fb_backs stays { null, null, null } — snapshotGuiFb will

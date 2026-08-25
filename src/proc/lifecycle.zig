@@ -339,18 +339,17 @@ pub fn forkCurrent(frame: *signals.SyscallFrame) ?usize {
     // Clone parent's address space. On OOM partway through, the child PML4 is
     // partially built; tear it down via destroyAddressSpace, which drops every
     // refcount we bumped and frees every page-table page we allocated.
-    var child_pml4_phys: usize = 0;
+    var child_pml4_phys: Phys = Phys.of(0);
     const child_pml4 = vmm.cloneAddressSpace(parent_pml4, parent_lead_src.pcid, &child_pml4_phys) orelse {
-        if (child_pml4_phys != 0) {
-            const paging = @import("../mm/paging.zig");
-            const pml4_ptr: [*]align(4096) u64 = @ptrFromInt(paging.physToVirt(child_pml4_phys));
+        if (child_pml4_phys.raw() != 0) {
+            const pml4_ptr: [*]align(4096) u64 = @ptrFromInt(child_pml4_phys.toVirt().raw());
             vmm.destroyAddressSpace(@alignCast(pml4_ptr), child_pml4_phys);
         }
         process.setState(i, .unused);
         return null;
     };
     process.procs[i].page_directory = child_pml4;
-    process.procs[i].page_dir_phys = child_pml4_phys;
+    process.procs[i].page_dir_phys = child_pml4_phys.raw();
     process.procs[i].pcid = pcid_mod.alloc();
 
     // Per-AS state — fork has its own AS so lazy regions and brk/mmap state
@@ -793,9 +792,9 @@ pub fn reclaimInflightSlot(pid: usize) void {
 /// readPage. Counterpart of setInflightSlot for the swap-IN direction; see the
 /// `swap_inflight_frame` comment in process.zig for why the leak it prevents
 /// is self-amplifying.
-pub fn setInflightFrame(frame: usize) void {
+pub fn setInflightFrame(frame: Phys) void {
     const cur = smp.myCpu().current_pid orelse return;
-    @atomicStore(usize, &process.procs[cur].swap_inflight_frame, frame, .release);
+    @atomicStore(usize, &process.procs[cur].swap_inflight_frame, frame.raw(), .release);
 }
 
 pub fn clearInflightFrame() void {
@@ -1034,7 +1033,7 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp, persist_shared_dirty: 
     if (last_in_group) {
         const lead = &process.procs[my_tgid];
         if (lead.page_directory) |pd| {
-            vmm.destroyAddressSpace(pd, lead.page_dir_phys);
+            vmm.destroyAddressSpace(pd, Phys.of(lead.page_dir_phys));
             lead.page_directory = null;
             lead.page_dir_phys = 0;
             if (lead.pcid != 0) {

@@ -373,12 +373,21 @@ site:
 - keep the value TYPED through its local flow — `phys.toVirt().ptr(T)`
   replaces the `@ptrFromInt(paging.physToVirt(x))` idiom, `phys.add(n)`
   does ring/stride math, and the free side then needs no conversion;
-- `.raw()` only at a genuine sink (PTE assembly, wire descriptor, a
-  not-yet-typed API like `vmm.mapUserPage`), `Phys.of(...)` only where
-  a raw integer re-enters (a PTE's phys bits, a registry field, a
-  `virtToPhys` result);
+- `.raw()` only at a genuine sink (PTE assembly, wire descriptor, CR3
+  load), `Phys.of(...)` only where a raw integer re-enters (a PTE's
+  phys bits, a registry field, a `virtToPhys` result);
 - pmm INTERNALS and stored driver ring fields stay raw usize — the
   boundary is the API, not the bitmap math behind it.
+
+The second ring followed the same day: `vmm.mapUserPage`/`unmapUserPage`/
+`resolveUserPhys`/`allocAndMapUserPage` (plus the `createAddressSpace`/
+`cloneAddressSpace` phys_out and `destroyAddressSpace`), the page
+cache's `Entry.frame`/`pin`/`insertFilled`/dirty iterators, swap's
+`writePage`/`readPage`/`setInflightFrame`, and the GUI-FB registries
+all speak `Phys` now — a frame flows typed from `allocFrame` through
+map, cache-publish, evict, and free with zero conversions on the happy
+path. PCB registry fields (`page_dir_phys`, `swap_inflight_frame`,
+0-sentinel atomics) stay raw usize behind those APIs.
 
 The sweep's first scalp: `slab.releaseSlabToPmm` had been passing the
 slab's physmap VA to `freeFrame` — the MAX_FRAMES gate rejected it and

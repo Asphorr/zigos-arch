@@ -401,12 +401,12 @@ pub fn sysMmapPmem(len: u32, fd: u32, offset: u32) u32 {
 
     // Eagerly install the direct mappings. base_phys + offset is the first
     // frame; map consecutive frames to consecutive user pages.
-    const first_phys: usize = @intCast(pmem.basePhys() + offset);
+    const first_phys = Phys.of(pmem.basePhys() + offset);
     const num_pages = len_pg / 0x1000;
     var i: usize = 0;
     while (i < num_pages) : (i += 1) {
         const virt = new_top + i * 0x1000;
-        const phys = first_phys + i * 0x1000;
+        const phys = first_phys.add(i * 0x1000);
         vmm.mapUserPage(pd, virt, phys, paging.PRESENT | paging.READ_WRITE | paging.USER) catch {
             // Roll back the pages mapped so far. These are device frames, so
             // unmapUserPage's returned phys is discarded (nothing to free).

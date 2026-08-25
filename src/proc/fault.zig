@@ -213,7 +213,7 @@ fn faultInCachePage(pd: [*]align(4096) u64, r: process.LazyRegion, va_aligned: u
     const file_id = page_cache.ext2FileId(r.cache_inode);
     const page_off = r.cache_off + (va_aligned - r.start);
 
-    var phys: usize = undefined;
+    var phys: Phys = undefined;
     if (page_cache.pin(file_id, page_off)) |p| {
         phys = p; // cache hit: a mapper ref was taken atomically under the cache lock
     } else {
@@ -224,7 +224,7 @@ fn faultInCachePage(pd: [*]align(4096) u64, r: process.LazyRegion, va_aligned: u
         const dst = pf.toVirt().ptr([*]u8);
         const n = @min(vfs.fillCachePage(r.cache_inode, page_off, dst), 0x1000);
         if (n < 0x1000) @memset(dst[n..0x1000], 0); // zero the tail past EOF
-        phys = page_cache.insertFilled(file_id, page_off, pf.raw());
+        phys = page_cache.insertFilled(file_id, page_off, pf);
     }
 
     // MAP_SHARED (cache_shared): map the shared cache frame WRITABLE so writes
@@ -234,7 +234,7 @@ fn faultInCachePage(pd: [*]align(4096) u64, r: process.LazyRegion, va_aligned: u
     // handleCowFault always copies and never steals the shared page).
     const map_flags = if (r.cache_shared) vmm.protToMapFlags(r.prot) else vmm.cacheMapFlags(r.prot);
     vmm.mapUserPage(pd, va_aligned, phys, map_flags) catch |e| {
-        pmm.freeFrame(Phys.of(phys)); // release the mapper ref we took above
+        pmm.freeFrame(phys); // release the mapper ref we took above
         // AlreadyMapped: another CPU faulted this exact page first — it's mapped
         // now, so the fault is resolved (that CPU's fault flagged it dirty if
         // shared). Any other error is a real failure.
@@ -270,7 +270,7 @@ fn tryMapCachedPage(pd: [*]align(4096) u64, r: process.LazyRegion, va_aligned: u
     // for its write into a private page). See faultInCachePage for the rationale.
     const map_flags = if (r.cache_shared) vmm.protToMapFlags(r.prot) else vmm.cacheMapFlags(r.prot);
     vmm.mapUserPage(pd, va_aligned, phys, map_flags) catch |e| {
-        pmm.freeFrame(Phys.of(phys));
+        pmm.freeFrame(phys);
         return e == error.AlreadyMapped;
     };
     if (r.cache_shared) page_cache.markDirty(file_id, page_off);
@@ -618,10 +618,10 @@ pub fn handleUserPageFault(cr2: usize, error_code: u64) bool {
         const shm = @import("../mm/shm.zig");
         if (r.shm_id != shm.SHM_INVALID) {
             const page_idx: u32 = @intCast((va_aligned - r.start) / 0x1000);
-            const phys = shm.frameAt(r.shm_id, page_idx) orelse {
+            const phys = Phys.of(shm.frameAt(r.shm_id, page_idx) orelse {
                 debug.klog("[shm] frameAt miss id={d} pi={d} on fault — region torn down?\n", .{ r.shm_id, page_idx });
                 return false;
-            };
+            });
             vmm.mapUserPage(pd, va_aligned, phys, vmm.protToMapFlags(r.prot)) catch |e| {
                 // Benign MT race: another thread of this process faulted the
                 // same shm page first — it's mapped now, and that winner took
@@ -633,7 +633,7 @@ pub fn handleUserPageFault(cr2: usize, error_code: u64) bool {
                     @import("../debug/kdbg.zig").pfEvent(@intCast(cur), cr2, @truncate(error_code), 0, true);
                     return true;
                 }
-                debug.klog("[shm] mapUserPage failed va=0x{X} phys=0x{X} err={s}\n", .{ va_aligned, phys, @errorName(e) });
+                debug.klog("[shm] mapUserPage failed va=0x{X} phys=0x{X} err={s}\n", .{ va_aligned, phys.raw(), @errorName(e) });
                 return false;
             };
             // Bump the PMM refcount so the frame survives even if one
@@ -642,7 +642,7 @@ pub fn handleUserPageFault(cr2: usize, error_code: u64) bool {
             // calls freeFrame at release(refcount==0). Frame thus has
             // (N attachers + 1 shm-owned) refcount; munmap path drops the
             // attacher count, shm.release drops the +1.
-            pmm.acquireFrame(Phys.of(phys));
+            pmm.acquireFrame(phys);
             @import("../debug/kdbg.zig").pfEvent(@intCast(cur), cr2, @truncate(error_code), 0, true);
             return true;
         }
@@ -701,7 +701,7 @@ pub fn handleUserPageFault(cr2: usize, error_code: u64) bool {
         // lazy region's start..end is malformed — no amount of reclaim
         // helps, fall straight through to OOM-kill (with a distinct log
         // line so the autopsy knows it wasn't memory pressure).
-        var frame_opt: ?usize = null;
+        var frame_opt: ?Phys = null;
         if (!swap_failed) {
             if (vmm.allocAndMapUserPage(pd, va_aligned, vmm.protToMapFlags(r.prot))) |f| {
                 frame_opt = f;
@@ -833,7 +833,7 @@ pub fn handleUserPageFault(cr2: usize, error_code: u64) bool {
                 const dest_offset = copy_start - va_aligned;
                 const src_byte_offset = r.src_offset + (copy_start - r.src_va_base);
                 const len = copy_end - copy_start;
-                const dest: [*]u8 = @ptrFromInt(@import("../mm/paging.zig").physToVirt(frame + dest_offset));
+                const dest = frame.add(dest_offset).toVirt().ptr([*]u8);
                 @memcpy(dest[0..len], src[src_byte_offset .. src_byte_offset + len]);
             }
         }
@@ -981,7 +981,7 @@ pub fn prefaultUserRange(addr: usize, len: usize) void {
                     const dest_offset = copy_start - page;
                     const src_byte_offset = r.src_offset + (copy_start - r.src_va_base);
                     const clen = copy_end - copy_start;
-                    const dest: [*]u8 = @ptrFromInt(@import("../mm/paging.zig").physToVirt(frame + dest_offset));
+                    const dest = frame.add(dest_offset).toVirt().ptr([*]u8);
                     @memcpy(dest[0..clen], src[src_byte_offset .. src_byte_offset + clen]);
                 }
             }

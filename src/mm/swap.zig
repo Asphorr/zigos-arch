@@ -129,17 +129,17 @@ pub fn freeSlot(slot: u32) void {
 /// PMM frame's physical address. Returns false if swap is unavailable or the
 /// NVMe write reports failure. Locking: holds no kernel lock; may block on
 /// async NVMe completion.
-pub fn writePage(slot: u32, frame_phys: usize) bool {
+pub fn writePage(slot: u32, frame_phys: Phys) bool {
     if (!available or slot >= NUM_SLOTS) return false;
-    const va = paging.physToVirt(frame_phys);
+    const va = frame_phys.toVirt().raw();
     return nvme.writeSectorsOn(SWAP_CTRL_IDX, slot * SECTORS_PER_PAGE, SECTORS_PER_PAGE, @ptrFromInt(va));
 }
 
 /// Read swap slot `slot` back into a 4 KiB physical frame. Locking: same as
 /// `writePage`.
-pub fn readPage(slot: u32, frame_phys: usize) bool {
+pub fn readPage(slot: u32, frame_phys: Phys) bool {
     if (!available or slot >= NUM_SLOTS) return false;
-    const va = paging.physToVirt(frame_phys);
+    const va = frame_phys.toVirt().raw();
     return nvme.readSectorsOn(SWAP_CTRL_IDX, slot * SECTORS_PER_PAGE, SECTORS_PER_PAGE, @ptrFromInt(va));
 }
 
@@ -216,7 +216,7 @@ fn selfTest() void {
     const dst_bytes = dst.toVirt().ptr([*]u8);
     @memset(dst_bytes[0..PAGE_SIZE], 0xA5);
 
-    if (!writePage(slot, src.raw()) or !readPage(slot, dst.raw())) {
+    if (!writePage(slot, src) or !readPage(slot, dst)) {
         debug.klog("[swap] self-test FAILED — NVMe I/O error on slot {d}\n", .{slot});
         return;
     }
@@ -388,7 +388,7 @@ pub fn evictFrame(pte_ptr: *u64, va: usize, pcid: u16) bool {
     // @atomicLoad sites in teardownNonPresent / swapInFrame's CAS-loss path.
     const original = @atomicLoad(u64, pte_ptr, .acquire);
     if ((original & paging.PRESENT) == 0) return false; // nothing present to evict
-    const frame = original & paging.PAGE_MASK;
+    const frame = Phys.of(original & paging.PAGE_MASK);
     // [mtswap-trace] gated to stress-test pids (current_pid >= 4). evictFrame
     // is on the hot reclaim path; ungated logging would drown the log under
     // normal swap activity.
@@ -402,14 +402,14 @@ pub fn evictFrame(pte_ptr: *u64, va: usize, pcid: u16) bool {
     // the compositor keeps using the physical frame; swap-in would then hand
     // the app a fresh frame with stale contents -> silent FB corruption. Same
     // refcount==1 predicate the COW handler trusts. (zig-osdev-reviewer catch.)
-    if (pmm.frameRefCount(Phys.of(frame)) != 1) return false;
+    if (pmm.frameRefCount(frame) != 1) return false;
     const slot = allocSlot() orelse {
         if (etrace) debug.klog("[mtswap-trace] pid={d} cpu{d} evict_no_slot va=0x{X}\n", .{ evict_pid, ecpu, va });
         return false;
     };
 
     // --- Phase 1: claim the page via CAS to the in-flight encoding ---
-    const inflight = makeInflightPte(frame);
+    const inflight = makeInflightPte(frame.raw());
     // Pin across [CAS, setInflightSlot]. In that gap the slot is named ONLY by
     // this stack frame while the PTE already reads in-flight, so a kill landing
     // there leaks it: teardownNonPresent takes the in-flight branch and frees
@@ -440,7 +440,7 @@ pub fn evictFrame(pte_ptr: *u64, va: usize, pcid: u16) bool {
     if (etrace) debug.klog("[mtswap-trace] pid={d} cpu{d} evict_p2_shootdown_end va=0x{X}\n", .{ evict_pid, ecpu, va });
 
     // --- Phase 2: write the frame contents to swap (may block under async) ---
-    if (etrace) debug.klog("[mtswap-trace] pid={d} cpu{d} evict_p2_writePage_begin slot={d} frame=0x{X}\n", .{ evict_pid, ecpu, slot, frame });
+    if (etrace) debug.klog("[mtswap-trace] pid={d} cpu{d} evict_p2_writePage_begin slot={d} frame=0x{X}\n", .{ evict_pid, ecpu, slot, frame.raw() });
     const wok = writePage(slot, frame);
     if (etrace) debug.klog("[mtswap-trace] pid={d} cpu{d} evict_p2_writePage_end ok={any}\n", .{ evict_pid, ecpu, wok });
     if (!wok) {
@@ -504,7 +504,7 @@ pub fn evictFrame(pte_ptr: *u64, va: usize, pcid: u16) bool {
     // Frame is no longer referenced by any PTE; release it. No shootdown
     // needed here — phase 1's shootdown already cleared the present mapping,
     // and the in-flight→SWAPPED transition keeps PRESENT=0.
-    pmm.freeFrame(Phys.of(frame));
+    pmm.freeFrame(frame);
     wakeSwapEvictWaiters(evictWaitTarget(pte_ptr));
     if (etrace) debug.klog("[mtswap-trace] pid={d} cpu{d} evict_done slot={d}\n", .{ evict_pid, ecpu, slot });
     const out = @atomicRmw(u64, &pages_out, .Add, 1, .monotonic) + 1;
@@ -554,8 +554,8 @@ pub fn discardFrame(pte_ptr: *u64, va: usize, pcid: u16) bool {
     // because from this load onward any write must set DIRTY, which changes
     // the PTE and makes the CAS below fail.
     if ((original & paging.DIRTY) != 0) return false;
-    const frame = original & paging.PAGE_MASK;
-    if (pmm.frameRefCount(Phys.of(frame)) != 1) return false;
+    const frame = Phys.of(original & paging.PAGE_MASK);
+    if (pmm.frameRefCount(frame) != 1) return false;
     // CAS to 0 so a concurrent evictor / teardown of the same VA can't both
     // try to free the frame. Loser of the race returns false without touching
     // anything. PTE = 0 returns the slot to the "never-faulted" state;
@@ -564,7 +564,7 @@ pub fn discardFrame(pte_ptr: *u64, va: usize, pcid: u16) bool {
         return false;
     }
     tlb.shootdownPage(pcid, va);
-    pmm.freeFrame(Phys.of(frame));
+    pmm.freeFrame(frame);
     const dc = @atomicRmw(u64, &pages_discarded, .Add, 1, .monotonic) + 1;
     if (dc == 1 or dc % 4096 == 0)
         debug.klog("[swap] out={d} in={d} sc={d} dc={d} slots={d}/{d}\n", .{
@@ -621,11 +621,11 @@ pub fn swapInFrame(pte_ptr: *u64, va: usize, flags: u64, pcid: u16) bool {
     // PTE still reads SWAPPED, so a teardown frees the slot and would walk
     // straight past the frame. Same channel discipline as the evict path's
     // swap_inflight_slot — see evictFrame's ownership note.
-    process.setInflightFrame(frame.raw());
+    process.setInflightFrame(frame);
     if (cur_pid >= 4) debug.klog("[mtswap-trace] pid={d} cpu{d} swapIn readPage frame=0x{X}...\n", .{
         cur_pid, smp.myCpu().cpu_id, frame.raw(),
     });
-    if (!readPage(slot, frame.raw())) {
+    if (!readPage(slot, frame)) {
         const pin_rf = spinlock.pinPreemption();
         process.clearInflightFrame();
         pmm.freeFrame(frame);

@@ -810,7 +810,7 @@ fn growGuiFb(idx: u8, need_w: u32, need_h: u32) bool {
     const new_pages: u32 = @intCast((new_bytes + 4095) / 4096);
     const old_bytes: u64 = @as(u64, w.gui_alloc_w) * w.gui_alloc_h * 4;
     const old_pages: u32 = @intCast((old_bytes + 4095) / 4096);
-    const old_phys = paging.virtToPhys(@intFromPtr(fb_kv)) orelse return false;
+    const old_phys = Phys.of(paging.virtToPhys(@intFromPtr(fb_kv)) orelse return false);
 
     const new_phys = pmm.allocContiguous(new_pages) orelse {
         debug.klog("[maximize] growGuiFb pid={d}: allocContiguous({d} pages) failed; staying {d}x{d}\n", .{ pid, new_pages, w.gui_alloc_w, w.gui_alloc_h });
@@ -827,7 +827,7 @@ fn growGuiFb(idx: u8, need_w: u32, need_h: u32) bool {
     // page-table page. On failure the live [0,old_pages) mapping is untouched.
     var i: u32 = old_pages;
     while (i < new_pages) : (i += 1) {
-        vmm.mapUserPage(pd, base + i * 4096, new_phys.raw() + i * 4096, map_flags) catch {
+        vmm.mapUserPage(pd, base + i * 4096, new_phys.add(i * 4096), map_flags) catch {
             var j: u32 = old_pages;
             while (j < i) : (j += 1) {
                 _ = vmm.unmapUserPage(pd, base + j * 4096);
@@ -853,7 +853,7 @@ fn growGuiFb(idx: u8, need_w: u32, need_h: u32) bool {
     i = 0;
     while (i < old_pages) : (i += 1) {
         _ = vmm.unmapUserPage(pd, base + i * 4096);
-        vmm.mapUserPage(pd, base + i * 4096, new_phys.raw() + i * 4096, map_flags) catch |e| {
+        vmm.mapUserPage(pd, base + i * 4096, new_phys.add(i * 4096), map_flags) catch |e| {
             debug.klog("[maximize] growGuiFb pid={d}: in-place remap page {d} failed: {s}\n", .{ pid, i, @errorName(e) });
             @panic("growGuiFb in-place remap (PT page should already exist)");
         };
@@ -884,7 +884,7 @@ fn growGuiFb(idx: u8, need_w: u32, need_h: u32) bool {
     // re-published: otherwise the next snapshotGuiFb sees them non-null,
     // skips realloc, and memcpys the new (larger) pixel count into a
     // small freed back buffer → overflow + panic in sysPresent.
-    var old_back_phys: [3]usize = .{ 0, 0, 0 };
+    var old_back_phys: [3]?Phys = .{ null, null, null };
     {
         const wflags = lockWindows();
         defer unlockWindows(wflags);
@@ -901,7 +901,7 @@ fn growGuiFb(idx: u8, need_w: u32, need_h: u32) bool {
         w.gui_w = need_w;
         w.gui_h = need_h;
         w.gui_fb_pub.store(0, .release);
-        paging.registerGuiFB(pid, new_phys.raw());
+        paging.registerGuiFB(pid, new_phys);
         w.gui_fb = new_kv;
     }
 
@@ -914,13 +914,13 @@ fn growGuiFb(idx: u8, need_w: u32, need_h: u32) bool {
     // OLD-state values via gui_fb_phys_base/gui_alloc still being OLD).
     i = 0;
     while (i < old_pages) : (i += 1) {
-        pmm.releaseFrame(Phys.of(old_phys + i * 4096));
-        pmm.releaseFrame(Phys.of(old_phys + i * 4096));
+        pmm.releaseFrame(old_phys.add(i * 4096));
+        pmm.releaseFrame(old_phys.add(i * 4096));
     }
     {
         var s: u8 = 0;
         while (s < 3) : (s += 1) {
-            if (old_back_phys[s] != 0) pmm.freeContiguous(Phys.of(old_back_phys[s]), old_pages);
+            if (old_back_phys[s]) |bp| pmm.freeContiguous(bp, old_pages);
         }
     }
     debug.klog("[maximize] grew pid={d} FB -> {d}x{d} ({d} pages, was {d} pages)\n", .{ pid, new_alloc_w, new_alloc_h, new_pages, old_pages });
@@ -3975,7 +3975,7 @@ pub fn snapshotGuiFb(pid: u8) void {
                     const back_u8: [*]volatile u8 = @ptrCast(back_kv);
                     @memset(back_u8[0 .. num_pages * 4096], 0);
                     w.gui_fb_backs[next] = back_kv;
-                    paging.registerGuiFBBack(pid, @intCast(next), back_phys.raw());
+                    paging.registerGuiFBBack(pid, @intCast(next), back_phys);
                 } else {
                     // PMM exhausted — leave has_presented=false and let
                     // the compositor read gui_fb directly. App keeps
@@ -4019,7 +4019,7 @@ pub fn reclaimBackBuffers(needed_frames: u32) u32 {
     // their phys. Doing all the NULL writes first means by the time we
     // start the spin-wait, no new snapshotGuiFb call can latch a
     // pointer that we then free.
-    var pending_phys: [MAX_WINDOWS * 3]usize = [_]usize{0} ** (MAX_WINDOWS * 3);
+    var pending_phys: [MAX_WINDOWS * 3]Phys = undefined;
     var pending_pages: u32 = 0;
     var pending_count: usize = 0;
     for (0..MAX_WINDOWS) |k| {
@@ -4038,8 +4038,7 @@ pub fn reclaimBackBuffers(needed_frames: u32) u32 {
             // already loaded the pointer, the spin-wait below handles
             // it.
             w.gui_fb_backs[slot] = null;
-            const phys = paging.takeGuiFbBackPhys(w.owner_pid, slot);
-            if (phys != 0) {
+            if (paging.takeGuiFbBackPhys(w.owner_pid, slot)) |phys| {
                 pending_phys[pending_count] = phys;
                 pending_count += 1;
                 pending_pages = npages_this;
@@ -4075,7 +4074,7 @@ pub fn reclaimBackBuffers(needed_frames: u32) u32 {
     // Phase 3: now safe — actually return the frames to PMM.
     var i: usize = 0;
     while (i < pending_count) : (i += 1) {
-        pmm.freeContiguous(Phys.of(pending_phys[i]), pending_pages);
+        pmm.freeContiguous(pending_phys[i], pending_pages);
     }
     return freed_frames;
 }

@@ -18,6 +18,7 @@ const perf = @import("../../debug/perf.zig");
 const pipe = @import("../../proc/pipe.zig");
 const memmap = @import("../../mm/memmap.zig");
 const config = @import("../../config.zig");
+const Phys = @import("../../util/addr.zig").Phys;
 const smp = @import("../smp.zig");
 const signals = @import("../../proc/signals.zig");
 const errno = @import("../../proc/errno.zig");
@@ -235,7 +236,7 @@ pub fn sysGpuMapBlob(resource_id: u32, size: u32) u32 {
     var mapped_pages: usize = 0;
     for (0..pages) |i| {
         const virt = base_virt + i * 0x1000;
-        const p = phys + i * 0x1000;
+        const p = Phys.of(phys + i * 0x1000);
         vmm.mapUserPage(pd, virt, p, paging.PRESENT | paging.READ_WRITE | paging.USER) catch |e| {
             debug.klog("[gpu] map_blob mapUserPage failed at page={d} virt=0x{X}: {s}\n", .{ i, virt, @errorName(e) });
             // phys is host-owned SHM BAR memory — no PMM frame to free,
@@ -320,7 +321,7 @@ pub fn sysGpuCreateGuestBlob(size: u32, out_resource_id_ptr: u32) u32 {
     var mapped_pages: usize = 0;
     for (0..num_pages) |i| {
         const virt = base_virt + i * 0x1000;
-        const phys = phys_base.raw() + i * 0x1000;
+        const phys = phys_base.add(i * 0x1000);
         // PRESENT for clarity only — mapUserPage ORs it in regardless
         // (vmm.zig new_pte). Keeps this call site consistent with
         // sysGpuMapBlob's.
