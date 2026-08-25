@@ -133,40 +133,41 @@ touching an existing one, wrap fields opportunistically — `@sizeOf` /
 `@offsetOf` asserts under the struct verify the wrap didn't disturb
 the layout.
 
-## Lock-Guard pattern (compile-time-enforced lock-held)
+## Lock-Guard pattern: `Guarded(T)` (data behind its lock)
 
-For structs with a clearly delimited lock + a handful of lock-requiring
-methods, expose the lock via an `acquire() Guard` method whose return
-value is the receiver of every protected method:
+The canonical carrier is `util/guarded.zig`. Declare everything a lock
+protects as ONE struct and wrap it:
 
 ```zig
-const Region = struct {
-    lock: SpinLock = .{},
-    // ... fields ...
+const SlotMap = struct {
+    used: [N / 8]u8 = ...,
+    next_scan: usize = 0,
 
-    pub fn acquire(self: *Region) Guard { ... }
-
-    pub const Guard = struct {
-        region: *Region,
-        pub fn release(self: Guard) void { ... }
-        pub fn pushRun(self: Guard, ...) bool { ... }  // requires lock
-    };
+    fn bitSet(self: *SlotMap, slot: usize) void { ... } // requires lock
 };
+var slots: Guarded(SlotMap) = .init(.{});
 ```
 
-Callers `const g = region.acquire(); defer g.release();` then call
-`g.pushRun(...)`. Calling `pushRun` without going through `acquire()`
-is a compile error — the Guard is a *witness of lock-held state*.
-Strictly stronger than the `_locked` naming convention because the
-compiler enforces it.
+Callers `const h = slots.acquire(); defer h.release();` (or
+`acquireIrqSave()` — the saved RFLAGS ride inside the token, so the
+release flavor can't be mismatched) and reach state as `h.ptr.field` /
+`h.ptr.method(...)`. The only route to a `*T` is a token, so "touched
+the state, forgot the lock" is code of a visibly different shape, and
+lock-requiring helpers become methods on `T` — the receiver replaces
+both the `_Locked` naming convention and the entry assertHeld.
+Escapes, both deliberate: `refHeld()` for lock-ALL choreographies
+(assertHeld-checked; see `pmm.allocContiguousCrossRegion`), `racyPeek()`
+for autopsy dumps that must not acquire (see `nvme.dumpWaiterForTarget`).
 
-**When NOT to use:** for fields where dozens of unrelated sites touch
-the lock-protected state (e.g. `PCB.pending_signals`), the Guard would
-be more friction than the `(p:lockname)` tag is worth. Use Guards
-where lock + protected methods cluster on one struct. **Reference
-exemplar:** `pmm.Region.Guard.pushRun`. Existing `_Locked`-suffixed
-module functions can coexist during the migration; new lock-protected
-methods should be added as `Guard` methods directly.
+**When NOT to use:** state whose lock lives on ANOTHER object (PCB
+fields under their runqueue's lock — see `sched.RqHeld`/`acquireOwnRq`
+for that shape), or per-field split protection (`nvme.waiters`: alloc
+side CAS-owned, completion side doorbell-fenced). Those keep
+`(p:lockname)` tags. **Reference exemplars:** `swap.SlotMap` (simplest),
+`page_cache.CacheState` (methods), `nvme.SqState/CqState` (two-lock
+split), `pmm.RegionState` (methods + refHeld choreography). The
+hand-rolled `Region.Guard` prototype this section used to describe was
+absorbed into `Guarded(T)` (2026-08-25).
 
 ## `lock.assertHeld()` runtime checks
 
@@ -483,8 +484,8 @@ silent self-recovery into observable metric.
 | `(u)` user-mmap     | `src/cpu/iouring.zig` `RingHeader`              |
 | Wire layout asserts | `src/driver/nvme.zig` `SqEntry`                 |
 | `LE(T)` / `BE(T)`   | `src/driver/nvme.zig` `DsmRange`                |
-| Lock-Guard          | `src/mm/pmm.zig` `Region.Guard.pushRun`         |
-| `assertHeld()`      | `src/mm/pmm.zig` `pushRunLocked` line 1         |
+| `Guarded(T)`        | `src/util/guarded.zig`; adopters: swap/page_cache/nvme/pmm |
+| `assertHeld()`      | `src/util/guarded.zig` `refHeld`                |
 | `UserPtr(T)`        | `src/cpu/syscall/proc.zig` `sysSigpending`      |
 | `Persistent(T)`     | `src/mm/pmem.zig` `persistenceSelfTest`         |
 | `kwarn(@src(),...)` | `src/debug/debug.zig` `kwarn`                   |
