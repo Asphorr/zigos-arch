@@ -432,7 +432,13 @@ fn releaseSlabToPmm(cache: *Cache, s: *Slab) void {
     // Wipe magic so any stale pointer that finds its way back to free()
     // panics distinctly ("non-slab ptr") instead of silently freeing.
     s.magic = 0xDEADDEAD;
-    pmm.freeFrame(@intFromPtr(s));
+    // The slab sits behind the physmap — translate back to phys before
+    // handing it to the PMM. (The old code passed the VA straight through;
+    // freeFrame's MAX_FRAMES gate rejected it with a "bad addr" warning and
+    // every slab released past empty_keep — and every shrink() — leaked its
+    // frame. Found by the Phys typing sweep, 2026-08-25; same VA-vs-phys
+    // class elf_loader.freePmmRange already paid for once.)
+    pmm.freeFrame(paging.virtToPhys(@intFromPtr(s)).?);
     if (cache.slab_count > 0) cache.slab_count -= 1;
 }
 
