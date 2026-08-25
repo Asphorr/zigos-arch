@@ -26,6 +26,7 @@ const process = @import("../proc/process.zig");
 const spinlock = @import("../proc/spinlock.zig");
 const SpinLock = spinlock.SpinLock;
 const Phys = @import("../util/addr.zig").Phys;
+const pte_mod = @import("pte.zig");
 
 // The swap device is the 3rd NVMe controller (0 = tarfs, 1 = ext2, 2 = swap).
 const SWAP_CTRL_IDX: usize = 2;
@@ -248,13 +249,17 @@ fn selfTest() void {
 //
 // COW is bit 9 — never collides with SWAPPED (10) or SWAP_INFLIGHT (11). The
 // CPU ignores all bits when PRESENT=0, so the markers are software-only.
+// The marker bits and the state DISCRIMINATION live in mm/pte.zig (typed
+// decode, partition-proved at comptime); the slot+gen PAYLOAD codec below
+// stays private to this file — its geometry derives from NUM_SLOTS and the
+// gen tag is only ever consumed by CAS bit-equality.
 //
 // CAS-on-every-PTE-rewrite (added 2026-05-23 for MT hardening): every state
 // transition in evict/swap-in/discard uses @cmpxchgStrong on the PTE so two
 // CPUs racing on the same VA can't both "win" — exactly one transition
 // succeeds, the loser unwinds (free slot, free local frame) and bails.
-const SWAPPED: u64 = 1 << 10;
-const SWAP_INFLIGHT: u64 = 1 << 11;
+const SWAPPED: u64 = pte_mod.SWAPPED_MARK;
+const SWAP_INFLIGHT: u64 = pte_mod.INFLIGHT_MARK;
 const SLOT_SHIFT: u6 = 12;
 
 // Bits needed to encode every slot index, derived from NUM_SLOTS so the mask
@@ -289,16 +294,20 @@ inline fn inflightFrame(pte: u64) usize {
     return @intCast(pte & paging.PAGE_MASK);
 }
 
-/// True if `pte` encodes a page that is currently out on swap.
+/// True if `pte` encodes a page that is currently out on swap. Routed
+/// through pte.decode so a corrupt word (both markers, or unmarked garbage)
+/// reads as NEITHER state instead of whichever mask happened to match —
+/// teardownNonPresent then leaves it alone rather than freeing a garbage
+/// slot index.
 pub inline fn pteIsSwapped(pte: u64) bool {
-    return (pte & paging.PRESENT) == 0 and (pte & SWAPPED) != 0;
+    return pte_mod.decode(pte) == .swapped;
 }
 
 /// True if `pte` encodes a page that is mid-eviction (writePage in flight).
 /// Faulters that hit this state must wait on `.swap_evict` until the
 /// evicting thread CASes the PTE to SWAPPED (or back, on I/O failure).
 pub inline fn pteIsInflight(pte: u64) bool {
-    return (pte & paging.PRESENT) == 0 and (pte & SWAP_INFLIGHT) != 0;
+    return pte_mod.decode(pte) == .inflight;
 }
 
 /// Wait-target encoding for `.swap_evict`. Each leaf PTE lives at a unique

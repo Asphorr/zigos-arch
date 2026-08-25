@@ -15,6 +15,7 @@ const vmm = @import("../mm/vmm.zig");
 const pmm = @import("../mm/pmm.zig");
 const swap = @import("../mm/swap.zig");
 const Phys = @import("../util/addr.zig").Phys;
+const pte_mod = @import("../mm/pte.zig");
 const smp = @import("../cpu/smp.zig");
 
 const process = @import("process.zig");
@@ -125,7 +126,7 @@ fn handleCowFault(pml4: [*]align(4096) u64, cr2: usize) bool {
             // between our PTE read and this write. Loser returns resolved:
             // the winner's transition stands (and did the markDirty below);
             // if anything is still wrong the retried instruction re-faults.
-            if (@cmpxchgStrong(u64, pte_p, pte, (pte & ~paging.COW) | paging.READ_WRITE, .seq_cst, .seq_cst) != null) {
+            if (@cmpxchgStrong(u64, pte_p, pte, pte_mod.cowPromote(pte), .seq_cst, .seq_cst) != null) {
                 return true;
             }
             asm volatile ("invlpg (%[addr])"
@@ -151,7 +152,7 @@ fn handleCowFault(pml4: [*]align(4096) u64, cr2: usize) bool {
         // CAS for the same reason as the copy path below — a peer thread of
         // this AS can resolve this PTE between our read and the store. The
         // loser's intended value is identical, so just take the winner's.
-        _ = @cmpxchgStrong(u64, pte_p, pte, (pte & ~paging.COW) | paging.READ_WRITE, .seq_cst, .seq_cst);
+        _ = @cmpxchgStrong(u64, pte_p, pte, pte_mod.cowPromote(pte), .seq_cst, .seq_cst);
         asm volatile ("invlpg (%[addr])"
             :
             : [addr] "r" (va_aligned),
@@ -181,7 +182,7 @@ fn handleCowFault(pml4: [*]align(4096) u64, cr2: usize) bool {
     // returns resolved — the winner's mapping satisfies the retried write.
     // (Same CAS discipline reclaimViaSwap's A-bit aging already adopted
     // after its own pre-CAS 2x-eviction race.)
-    if (@cmpxchgStrong(u64, pte_p, pte, (pte & ~paging.PAGE_MASK & ~paging.COW) | new_phys.raw() | paging.READ_WRITE, .seq_cst, .seq_cst) != null) {
+    if (@cmpxchgStrong(u64, pte_p, pte, pte_mod.cowBreakTo(pte, new_phys), .seq_cst, .seq_cst) != null) {
         pmm.freeFrame(new_phys);
         return true;
     }
