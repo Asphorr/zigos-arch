@@ -613,6 +613,55 @@ inline fn rqQueueFor(rq: *runqueue.Rq, prio: Priority) *runqueue.PriQueue {
 /// `max(vruntime, min_vruntime[band] - SLEEPER_CREDIT)`. Newly-created
 /// tasks (first rqEnter, vruntime == 0) are seeded to min_vruntime[band]
 /// + 1 so they don't immediately monopolize their band.
+/// Witness that THIS CPU holds the runqueue lock of the rq a pid was
+/// pinned to at acquire time — the return value of `acquireOwnRq`, which is
+/// the packaged form of the H4 snapshot → lock → re-check → retry loop
+/// rqEnter/rqLeave used to hand-write, twice. `Guarded(T)`
+/// (util/guarded.zig) cannot express this relation: the lock lives on the
+/// runqueue while the state lives on the PCB, and WHICH runqueue is the
+/// right one (assigned_cpu) is itself a racing property that only
+/// stabilizes under the lock. So the witness carries the resolved rq + cpu.
+///
+/// Roadmap, queued behind a quiet observation period (the StateGraph
+/// recipe): (2) a typed view of the `(p:rq.lock)` PCB field group through
+/// this witness — deliberately NOT moving the fields today (switchTo's
+/// asm-facing kernel_esp/user_rsp_save keep PCB layout sacred, and dozens
+/// of picker/accounting sites read them under structurally-implied
+/// ownership); (3) a union witness for `(p:rq.lock | owning-cpu-cli)`.
+const RqHeld = struct {
+    rq: *runqueue.Rq,
+    cpu: u8,
+    flags: u64,
+
+    inline fn release(self: RqHeld) void {
+        self.rq.lock.releaseIrqRestore(self.flags);
+    }
+};
+
+/// Acquire the runqueue lock of the rq `pid` is CURRENTLY assigned to.
+/// The one home of the H4 loop: snapshot assigned_cpu, lock that rq,
+/// re-check under the lock, retry when a concurrent migrate (which updates
+/// assigned_cpu while holding BOTH rq locks) moved the pid inside the
+/// window — locking the stale rq would enrol/remove the pid in the wrong
+/// queue: permanent nr_runnable drift, the class H4 was written against.
+/// Iteration count is bounded by the practical migrate rate (the argument
+/// the old tail-recursive form made). Returns null for unassigned pids
+/// (assigned_cpu == 0xFF or out of range); idle pids stay the caller's
+/// early-out — they are never enqueued.
+fn acquireOwnRq(pid: usize) ?RqHeld {
+    const pcb = &process.procs[pid];
+    while (true) {
+        const snap = @atomicLoad(u8, &pcb.assigned_cpu, .acquire);
+        if (snap == 0xFF or snap >= smp.MAX_CPUS) return null;
+        const rq = &smp.cpus[snap].runqueue;
+        const f = rq.lock.acquireIrqSave();
+        if (@atomicLoad(u8, &pcb.assigned_cpu, .acquire) == snap) {
+            return .{ .rq = rq, .cpu = snap, .flags = f };
+        }
+        rq.lock.releaseIrqRestore(f); // migrate raced us; retry on the fresh cpu
+    }
+}
+
 fn rqEnter(pid: usize, from_sleep: bool) void {
     const pcb = &process.procs[pid];
     // Targeted scheduler-invariant trace: dump on every rq mutation for
@@ -627,25 +676,9 @@ fn rqEnter(pid: usize, from_sleep: bool) void {
         });
     }
     if (pcb.is_idle) return;
-    // H4: snapshot assigned_cpu BEFORE lock acquire, then re-check under the
-    // lock. A concurrent migrate updates pcb.assigned_cpu while holding both
-    // rq locks; if it ran between our load and our lock acquire, we'd
-    // otherwise enrol the pid in the OLD rq with assigned_cpu pointing at
-    // the NEW cpu — permanent nr_runnable drift + lost migration.
-    const cpu_idx_snap = @atomicLoad(u8, &pcb.assigned_cpu, .acquire);
-    if (cpu_idx_snap == 0xFF) return;
-    if (cpu_idx_snap >= smp.MAX_CPUS) return;
-    const rq = &smp.cpus[cpu_idx_snap].runqueue;
-    const f = rq.lock.acquireIrqSave();
-    if (@atomicLoad(u8, &pcb.assigned_cpu, .acquire) != cpu_idx_snap) {
-        // Migrate moved us between snapshot and lock acquire. Release and
-        // retry against the fresh assigned_cpu. Tail-recursion bounded by
-        // the practical migrate rate (a single rqEnter call should never
-        // see more than 1-2 concurrent migrates).
-        rq.lock.releaseIrqRestore(f);
-        return rqEnter(pid, from_sleep);
-    }
-    defer rq.lock.releaseIrqRestore(f);
+    const h = acquireOwnRq(pid) orelse return;
+    defer h.release();
+    const rq = h.rq;
     const pid_u8: u8 = @intCast(pid);
     if (rq.interactive.contains(pid_u8)) {
         if (TRACE_PID != 0 and pid == TRACE_PID) debug.klog("[trace pid={d} cpu={d}] rqEnter SKIP — already in interactive\n", .{ pid, smp.myCpu().cpu_id });
@@ -722,18 +755,10 @@ fn rqLeave(pid: usize) void {
         });
     }
     if (pcb.is_idle) return;
-    // H4: snapshot+recheck same as rqEnter — migrate can move us during
-    // the lock-acquire window.
-    const cpu_idx_snap = @atomicLoad(u8, &pcb.assigned_cpu, .acquire);
-    if (cpu_idx_snap == 0xFF) return;
-    if (cpu_idx_snap >= smp.MAX_CPUS) return;
-    const rq = &smp.cpus[cpu_idx_snap].runqueue;
-    const f = rq.lock.acquireIrqSave();
-    if (@atomicLoad(u8, &pcb.assigned_cpu, .acquire) != cpu_idx_snap) {
-        rq.lock.releaseIrqRestore(f);
-        return rqLeave(pid);
-    }
-    defer rq.lock.releaseIrqRestore(f);
+    // H4 lives in acquireOwnRq now — same snapshot + re-check as rqEnter.
+    const h = acquireOwnRq(pid) orelse return;
+    defer h.release();
+    const rq = h.rq;
     const pid_u8: u8 = @intCast(pid);
     const ra = @returnAddress();
     const pid_act = @import("../debug/pid_act.zig");
