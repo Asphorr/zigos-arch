@@ -67,6 +67,37 @@ const process = @import("process.zig");
 const hrtimer = @import("hrtimer.zig");
 const PCB = process.PCB;
 const State = process.State;
+
+// The PCB lifecycle's legal transitions, as data (util/state_graph.zig).
+// This is the prose that used to live scattered in comments — "loader
+// transitions loading→ready", "only the reaper leaves .zombie" — made
+// reviewable in one place and checked on every claimed transition below.
+// DETECTION ONLY for now: an off-graph transition logs and proceeds, so a
+// missing edge here can't wedge the scheduler — it can only make noise that
+// either fixes this list or names a real kill-vs-wake-class bug.
+const proc_graph = @import("../util/state_graph.zig").StateGraph(State, &.{
+    .{ .unused, .loading }, // allocSlot claims a free PCB
+    .{ .loading, .ready }, // loader finished initializing
+    .{ .loading, .unused }, // create/fork abort path
+    .{ .loading, .zombie }, // killed before the loader finished
+    .{ .ready, .running }, // dispatch
+    .{ .running, .ready }, // preempt / yield
+    .{ .running, .sleeping }, // blockOn
+    .{ .sleeping, .ready }, // wake
+    .{ .sleeping, .running }, // blockOn's wake-race rollback (same CPU)
+    .{ .ready, .zombie }, // kill
+    .{ .running, .zombie }, // kill / exit
+    .{ .sleeping, .zombie }, // kill
+    .{ .zombie, .unused }, // reap
+    // Orphan fast-free: tearDownTask's no-live-parent branch skips .zombie
+    // entirely and frees the slot in place — a self-destroy comes off
+    // .running. (Edge earned by evidence: the detector logged it 99× in a
+    // mode-6 kill storm, ra resolved to that exact branch.)
+    .{ .running, .unused },
+});
+comptime {
+    proc_graph.assertSane(.unused);
+}
 const Priority = process.Priority;
 const WaitKind = process.WaitKind;
 const MAX_PROCS = process.MAX_PROCS;
@@ -899,6 +930,16 @@ pub fn setState(pid: usize, new_state: State) void {
     if (TRACE_PID != 0 and pid == TRACE_PID) {
         debug.klog("[trace pid={d} cpu={d}] setState CAS-OK {d}->{d} ra=0x{X}\n", .{
             pid, smp.myCpu().cpu_id, old_byte, new_byte, @returnAddress(),
+        });
+    }
+    // We own this transition — check it against the lifecycle graph. An
+    // off-graph edge is either a hole in proc_graph's list (fix the data)
+    // or a real racing caller the terminal guards above don't cover — the
+    // kill-vs-wake class, caught at the exact transition with its return
+    // address, while it is still only a log line.
+    if (!proc_graph.legal(old_state, new_state)) {
+        debug.klog("[stategraph] OFF-GRAPH {s}->{s} pid={d} ra=0x{X}\n", .{
+            @tagName(old_state), @tagName(new_state), pid, @returnAddress(),
         });
     }
     // Per-PID activity ring stamp. Logged AFTER the CAS succeeded so the
