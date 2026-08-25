@@ -414,13 +414,16 @@ fn cmdMeminfo() void {
 /// build; if it prints "(no error-return trace)", the build knob
 /// regressed. (File-scope fns, not a local struct — function-local
 /// anonymous types feed the LLVM Invalid-type bug.)
-fn errProbeLevel2() !void {
+// noinline: ReleaseSafe inlines these three into cmdErrProbe otherwise,
+// and the demo trace shows one symbol at four offsets instead of the
+// three-deep chain it exists to demonstrate (seen live 2026-08-25).
+noinline fn errProbeLevel2() !void {
     return @import("util/fail.zig").fail(error.Timeout, "errprobe: synthetic failure, detail={d}", .{42});
 }
-fn errProbeLevel1() !void {
+noinline fn errProbeLevel1() !void {
     try errProbeLevel2();
 }
-fn errProbeRoot() !void {
+noinline fn errProbeRoot() !void {
     try errProbeLevel1();
 }
 
