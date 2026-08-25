@@ -901,8 +901,13 @@ fn resetIoQueueState(c: *Controller) void {
 /// Draw one CID for an admin/sync command through the sq token. Admin
 /// contexts are BSP-only (boot init, S3 resume) so the acquire is
 /// uncontended — taken anyway so next_cid has exactly one access story.
+/// IrqSave flavor even though both callers run at IF=0 today (the flags
+/// save/restore is then a no-op): every other sq window is IrqSave, and
+/// a future IF=1 caller with async on must not let the IRQ0-context
+/// reap chain (inline tickSweep → reapCq → .cb → submitAsyncCallback →
+/// sq) interrupt a plain-held sq on this CPU — that is a self-deadlock.
 fn drawCid(c: *Controller) u16 {
-    const sqh = c.sq.acquire();
+    const sqh = c.sq.acquireIrqSave();
     defer sqh.release();
     const v = sqh.ptr.next_cid;
     sqh.ptr.next_cid +%= 1;

@@ -17,8 +17,11 @@
 //!     the release flavor can never be mismatched (the stale-acquire_tsc /
 //!     phantom-[smi-cause] class dies at the type level);
 //!   - `@returnAddress()`-based autopsy attribution is preserved: the
-//!     acquire wrappers are `inline`, so SpinLock still records the REAL
-//!     call site, not this file.
+//!     acquire wrappers are `inline`, so a plain `acquire()` records the
+//!     REAL call site, not this file. (`acquireIrqSave` has ALWAYS
+//!     attributed to SpinLock's own internals — it takes @returnAddress
+//!     inside the `self.acquire()` it re-enters — kernel-wide, wrapper
+//!     or no wrapper. Nothing lost here, but nothing gained either.)
 //!
 //! What it deliberately does NOT give (Zig has no private fields and no
 //! borrow checker):
@@ -87,8 +90,10 @@ pub fn Guarded(comptime T: type) type {
             return .{ .ptr = &self.data__, .lock = &self.lock };
         }
 
-        /// IRQ-safe acquire (SpinLock.acquireIrqSave semantics). inline for
-        /// the same holder_ra reason.
+        /// IRQ-safe acquire (SpinLock.acquireIrqSave semantics). inline
+        /// for symmetry and zero cost; holder_ra for THIS flavor has
+        /// always named SpinLock.acquireIrqSave internals (it re-enters
+        /// via self.acquire()), so attribution is unchanged either way.
         pub inline fn acquireIrqSave(self: *Self) IrqHeld {
             const flags = self.lock.acquireIrqSave();
             return .{ .ptr = &self.data__, .lock = &self.lock, .flags = flags };

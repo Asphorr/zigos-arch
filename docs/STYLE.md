@@ -180,7 +180,9 @@ dependent race. Linux's `lockdep_assert_held` analogue.
 
 **Where to use:** every function whose docstring says "caller must
 hold X" or whose name ends in `_Locked`. **Reference exemplar:**
-`pmm.pushRunLocked` line 1 calls `r.lock.assertHeld()`.
+`slot_table.recycle` calls `slot.lock.assertHeld()` before flipping
+`in_use`. Inside `Guarded(T)` blobs the receiver already IS the proof;
+`guarded.refHeld()` is the checked escape for choreography sites.
 
 ## `mightSleep(@src())` — assert-not-atomic at parking sites
 
