@@ -323,6 +323,14 @@ autopsy — a wedged CPU inside a device poll names its device.
 
 **Why:** the timeout constant should encode the *spec's* patience
 (PS/2: 17 ms; NVMe: CAP.TO), not a guess about host speed.
+
+**Budgeting rule (2026-08-25 review):** classify the poll target first.
+Port I/O and MMIO-BAR reads are VM exits under nested virt — spec
+patience is the right budget. A WB-cached DMA descriptor or a per-frame
+path is NOT exit-bound — there the wall budget must come from the old
+*measured* wall time, and inside a cli window it must stay under the
+5 ms cli-hold threshold (the e1000 tx-DD and waitVSync lessons: a
+"generous" budget in those spots is a 20-60× cli/frame regression).
 **Reference exemplar:** `ps2Wait` in `driver/keyboard.zig`. **How to
 apply:** required for new polled waits; existing iteration-count loops
 were converted in the 2026-08-25 sweep — any stragglers convert when

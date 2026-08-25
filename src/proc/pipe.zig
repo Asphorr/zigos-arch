@@ -432,7 +432,7 @@ pub fn closeReader(id: u8) void {
         p.blocked_writer_pid = 0xFF;
     }
     if (p.readers == 0 and p.writers == 0) {
-        p.in_use = false;
+        slot_table.recycle(Pipe, p);
     }
     p.lock.releaseIrqRestore(flags);
     if (w != 0xFF) process.wake(w);
@@ -465,7 +465,7 @@ pub fn closeWriter(id: u8) void {
         p.blocked_reader_pid = 0xFF;
     }
     if (p.readers == 0 and p.writers == 0) {
-        p.in_use = false;
+        slot_table.recycle(Pipe, p);
     }
     p.lock.releaseIrqRestore(flags);
     if (r != 0xFF) process.wake(r);

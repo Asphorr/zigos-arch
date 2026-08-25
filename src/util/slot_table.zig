@@ -97,6 +97,11 @@ pub fn recycle(comptime T: type, slot: *T) void {
 fn resetPayload(comptime T: type, slot: *T) void {
     inline for (@typeInfo(T).@"struct".fields) |f| {
         if (comptime !shouldReset(T, f.name)) continue;
+        comptime {
+            if (containsLock(f.type)) {
+                @compileError("slot_table: field '" ++ f.name ++ "' of " ++ @typeName(T) ++ " contains a lock — resetting it would zero ticket counters a cross-CPU spinner may hold; add it to claim_skip_reset and re-init it deliberately");
+            }
+        }
         if (comptime f.defaultValue()) |dv| {
             @field(slot, f.name) = dv;
         } else {
@@ -113,6 +118,30 @@ fn shouldReset(comptime T: type, comptime name: []const u8) bool {
         }
     }
     return true;
+}
+
+/// The "don't reset a live lock" invariant, enforced by TYPE, not just
+/// by the `lock` field name: a table whose payload transitively contains
+/// a second SpinLock/Mutex (a per-entry sub-lock) would have its ticket
+/// counters zeroed under a cross-CPU spinner — permanent spin, autopsy
+/// pointing at an unregistered lock. Such fields must be claim_skip_reset
+/// (and re-initialized by the caller under discipline of their own).
+fn containsLock(comptime T: type) bool {
+    // Statement-form recursion only — the `inline for … break … else`
+    // EXPRESSION form of this function re-rolled the LLVM Invalid-type
+    // bug (2026-08-25, bisected to this exact fn).
+    if (T == spinlock.SpinLock or T == spinlock.Mutex) return true;
+    switch (@typeInfo(T)) {
+        .@"struct" => |s| {
+            inline for (s.fields) |f| {
+                if (containsLock(f.type)) return true;
+            }
+            return false;
+        },
+        .array => |a| return containsLock(a.child),
+        .optional => |o| return containsLock(o.child),
+        else => return false,
+    }
 }
 
 fn verifyTable(comptime T: type) void {

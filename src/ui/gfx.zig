@@ -502,16 +502,20 @@ pub fn blitRectToScreen(x: u32, y: u32, w: u32, h: u32) void {
     }
 }
 
-/// Wait for vertical retrace (eliminates tearing). Timeout-safe: a frame
-/// is ~16 ms, so 20 ms per phase bounds the wait even when the status
-/// port is dead (GOP framebuffer — no VGA retrace to see).
+/// Wait for vertical retrace (eliminates tearing). Timeout-safe, and the
+/// budget is deliberately TIGHT (2 ms per phase): this sits on the
+/// per-frame present path, and on a GOP framebuffer port 0x3DA reads a
+/// constant — no retrace ever appears, so one of the two phases burns
+/// its FULL budget every frame. A generous "frame-length" budget here
+/// capped the present rate itself (review 2026-08-25); ~4 ms worst case
+/// matches what the old 4096-iteration loops cost on bare metal.
 pub fn waitVSync() void {
-    var d_clear = @import("../util/deadline.zig").Deadline.ms(20, "vga vsync clear");
+    var d_clear = @import("../util/deadline.zig").Deadline.us(2000, "vga vsync clear");
     // Wait until not in retrace
     while (d_clear.live()) {
         if (io.inb(0x3DA) & 0x08 == 0) break;
     }
-    var d_start = @import("../util/deadline.zig").Deadline.ms(20, "vga vsync start");
+    var d_start = @import("../util/deadline.zig").Deadline.us(2000, "vga vsync start");
     // Wait until retrace starts
     while (d_start.live()) {
         if (io.inb(0x3DA) & 0x08 != 0) break;

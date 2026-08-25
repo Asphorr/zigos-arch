@@ -489,9 +489,10 @@ pub fn send(data: []const u8) bool {
     const flags = tx_lock.acquireIrqSave();
     defer tx_lock.releaseIrqRestore(flags);
     const idx = tx_next;
-    // Wall budget, not iterations — runs under tx_lock IrqSave, so this
-    // is also the cli-hold bound (see e1000.send for the twin).
-    var d = Deadline.ms(100, "i225 tx slot dd");
+    // 2 ms wall budget = the old 1M-iteration wall time on a WB-cached
+    // descriptor, and under the 5 ms cli-hold threshold — this runs with
+    // IRQs off under tx_lock (see e1000.send for the full rationale).
+    var d = Deadline.us(2000, "i225 tx slot dd");
     while ((tx_descs[idx].olinfo_status & TXD_STAT_DD) == 0 and d.live()) {}
     if ((tx_descs[idx].olinfo_status & TXD_STAT_DD) == 0) {
         debug.klog("[i225] tx ring stuck at idx={d}\n", .{idx});

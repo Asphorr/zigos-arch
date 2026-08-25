@@ -451,9 +451,15 @@ pub fn send(data: []const u8) bool {
     const flags = tx_lock.acquireIrqSave();
     defer tx_lock.releaseIrqRestore(flags);
     const idx = tx_next;
-    // Wall budget, not iterations: this wait runs with IRQs off (tx_lock
-    // IrqSave above), so a bounded ms figure is also the cli-hold bound.
-    var d = Deadline.ms(100, "e1000 tx slot dd");
+    // Wall budget, not iterations — and a SMALL one: this wait runs with
+    // IRQs off (tx_lock IrqSave above), so the budget IS the cli-hold
+    // bound, and the poll target is a WB-cached DMA descriptor (~4-6
+    // cycles/read, no VM exit anywhere) — the old 1M iterations were
+    // ~2 ms of wall time on every host. 2 ms keeps that and stays under
+    // the 5 ms cli-hold warning threshold; 100 ms here would stall the
+    // LAPIC timer and scheduler on this CPU for 20x the classifier
+    // limit whenever the NIC wedges (review 2026-08-25).
+    var d = Deadline.us(2000, "e1000 tx slot dd");
     while ((tx_descs[idx].sta & TXD_STAT_DD) == 0 and d.live()) {}
     if ((tx_descs[idx].sta & TXD_STAT_DD) == 0) {
         debug.klog("[e1000] tx ring stuck at idx={d}\n", .{idx});

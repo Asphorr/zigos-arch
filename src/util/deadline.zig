@@ -35,9 +35,25 @@ const FALLBACK_ITERS_PER_MS: u64 = 40_000;
 
 /// Hard cap on the fallback budget so a multi-second budget requested
 /// pre-calibration (NVMe CSTS.RDY asks for seconds) cannot turn into a
-/// hundreds-of-millions-iteration spin. 10M matches the largest
-/// iteration constant the old loops used.
-const FALLBACK_ITERS_MAX: u64 = 10_000_000;
+/// tens-of-seconds spin: at ~1-5 µs per port read, 5M iterations is
+/// already 5-25 s worst case — the ceiling is anti-wedge, not a clock.
+const FALLBACK_ITERS_MAX: u64 = 5_000_000;
+
+/// Calibration sanity window, same figure apic.zig uses to gate
+/// TSC-deadline mode: tsc_per_quantum outside [1e6, 1e11] means the
+/// 10 ms calibration window was corrupted (a host vCPU pause landing
+/// inside it inflates the value proportionally — a 2 s stall inflates
+/// ~200×, silently turning every ms budget into hundreds of ms of
+/// IF=0). Out-of-window ⇒ treat as uncalibrated and use the iteration
+/// fallback.
+const PER_QUANTUM_MIN: u64 = 1_000_000;
+const PER_QUANTUM_MAX: u64 = 100_000_000_000;
+
+fn sanePerQuantum() u64 {
+    const q = apic.tscPerQuantum();
+    if (q < PER_QUANTUM_MIN or q > PER_QUANTUM_MAX) return 0;
+    return q;
+}
 
 /// A wall-clock wait budget for a polled-hardware loop. Construct with
 /// `Deadline.ms(n, "what")` / `.us(n, "what")`, then drive the poll with
@@ -70,8 +86,9 @@ pub const Deadline = struct {
     }
 
     fn init(budget_us: u64, comptime what: [:0]const u8) Deadline {
-        // tscPerQuantum() = TSC cycles per 10 ms scheduler quantum.
-        const per_quantum = apic.tscPerQuantum();
+        // tscPerQuantum() = TSC cycles per 10 ms scheduler quantum,
+        // sanity-clamped (stall-corrupted calibration ⇒ fallback mode).
+        const per_quantum = sanePerQuantum();
         const d: Deadline = if (per_quantum == 0) .{
             .deadline_tsc = 0,
             .start_tsc = 0,
@@ -107,12 +124,18 @@ pub const Deadline = struct {
     }
 
     /// Milliseconds since construction — for timeout log lines. Returns 0
-    /// in fallback mode (no clock to measure with).
+    /// in fallback mode (no clock to measure with), and 0 when now reads
+    /// BELOW start (cross-CPU TSC skew after a migration; without the
+    /// guard the wrapped subtraction would overflow-panic in the `* 10`
+    /// — an integer-overflow panic inside the diagnostic that exists to
+    /// explain the timeout).
     pub fn elapsedMs(self: *const Deadline) u64 {
         if (self.start_tsc == 0) return 0;
-        const per_quantum = apic.tscPerQuantum();
+        const per_quantum = sanePerQuantum();
         if (per_quantum == 0) return 0;
-        return (perf.rdtsc() -% self.start_tsc) * 10 / per_quantum;
+        const now = perf.rdtsc();
+        if (now <= self.start_tsc) return 0;
+        return (now - self.start_tsc) * 10 / per_quantum;
     }
 };
 
@@ -169,8 +192,10 @@ fn currentCpuId() u8 {
 /// hardware wait each CPU started, and whether its budget has already
 /// passed. A CPU wedged inside a polled wait shows a live entry naming
 /// the device; "(past)" entries are history, not evidence. Called from
-/// the watchdog dump paths; safe from NMI/IRQ context (serial prints
-/// only, relaxed loads).
+/// the watchdog dump paths (task/IRQ context). NOT NMI-safe as-is:
+/// serial.print takes write_lock unless emergency_mode is set — an NMI
+/// caller must be on the watchdog.fire() emergency path, same caveat
+/// as the neighbouring dumpSpinTargets.
 pub fn dumpWaitSites() void {
     serial.print("[wait-sites] last polled-hardware wait started per CPU (stale entries marked past):\n", .{});
     const now = perf.rdtsc();
@@ -186,7 +211,7 @@ pub fn dumpWaitSites() void {
         if (dl == 0) {
             serial.print(" (pre-calibration fallback wait)\n", .{});
         } else if (now >= dl) {
-            const per_quantum = apic.tscPerQuantum();
+            const per_quantum = sanePerQuantum();
             if (per_quantum != 0) {
                 serial.print(" (past, ended {d} ms ago)\n", .{(now -% dl) * 10 / per_quantum});
             } else {

@@ -463,21 +463,40 @@ pub fn spinTargetOf(cpu: usize) usize {
 /// racing first hit can warn twice, which is harmless.
 pub fn mightSleep(comptime src: std.builtin.SourceLocation) void {
     const key: u64 = comptime std.hash.Wyhash.hash(src.line, src.file);
-    if (smp.myCpu().current_pid == null) return; // no task — nothing can park
-    const cpu = currentCpuId();
+    // One myCpu() for both checks — getLapicId is an uncached MMIO load
+    // (a VM exit under nested virt), and this sits on the uncontended
+    // Mutex.acquire fast path; cpus[] is LAPIC-indexed so cpu_id is the
+    // same number currentCpuId() would return, for free.
+    const cl = smp.myCpu();
+    if (cl.current_pid == null) return; // no task — nothing can park
+    const cpu = cl.cpu_id;
     if (cpu >= MAX_HOLD_CPUS) return;
-    if (preempt_pin[cpu] == 0) return;
+    // cli microwindow: an unpinned caller CAN be preempted between the
+    // CPU-id read and the pin read and land on another CPU — reading a
+    // stranger's non-zero pin would burn this site's one-shot latch on a
+    // false positive. (A true positive can't migrate: the pin it is
+    // about to see is what pins it.) Same bracket pinPreemption uses.
+    const irq_flags = saveAndDisableIrq();
+    const pin = preempt_pin[cpu];
+    restoreIrq(irq_flags);
+    if (pin == 0) return;
     for (&might_sleep_warned) |w| {
         if (w == key) return; // this site already warned once
     }
     for (&might_sleep_warned) |*w| {
         if (w.* == 0) {
             w.* = key;
-            break;
+            // Print the SAME pin value the gate saw — a fresh read could
+            // disagree (an interleaving IRQ's acquire/release).
+            debug.kwarn(src, "mightSleep with preempt pin {d} (SpinLock held or pinned) — parking here can deadlock the CPU", .{pin});
+            return;
         }
-        // Table full: fall through and warn unlatched — noisy beats silent.
     }
-    debug.kwarn(src, "mightSleep with preempt pin {d} (SpinLock held or pinned) — parking here can deadlock the CPU", .{preempt_pin[cpu]});
+    // Table full: stay SILENT rather than warn unlatched — the latch is
+    // also the recursion guard (mightSleep → kwarn → … → Mutex.acquire
+    // → mightSleep), and an unbounded re-entry here would be a stackless
+    // triple fault with no message. Sized 16 for ~6 call sites; if it
+    // ever fills, grow it.
 }
 
 /// Warned-site latch table for mightSleep — slots hold the site hash,

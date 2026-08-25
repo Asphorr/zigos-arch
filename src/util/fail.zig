@@ -74,6 +74,12 @@ pub fn fail(e: anytype, comptime fmt: []const u8, args: anytype) @TypeOf(e) {
     return e;
 }
 
+/// Contract: task/IRQ context only — NEVER from an NMI handler
+/// (ring_lock is a plain ticket lock; acquireIrqSave does not mask NMI,
+/// so an NMI-context fail() self-deadlocks against an interrupted
+/// holder on the same CPU). Format only kernel-owned data: a `{s}` on a
+/// user-space slice would take a kernel #PF with IRQs off and the ring
+/// lock held.
 fn record(e: anyerror, comptime fmt: []const u8, args: anytype) void {
     const flags = ring_lock.acquireIrqSave();
     defer ring_lock.releaseIrqRestore(flags);
@@ -82,10 +88,15 @@ fn record(e: anyerror, comptime fmt: []const u8, args: anytype) void {
     slot.seq = ring_seq;
     slot.tsc = perf.rdtsc();
     slot.name = @errorName(e);
+    // Zero first: on NoSpaceLeft, bufPrint leaves only the prefix it
+    // managed — without the wipe, dumpRecent would splice that prefix
+    // onto stale bytes from the record 32 entries ago and print a
+    // confident, WRONG reading.
+    @memset(&slot.msg, 0);
     if (std.fmt.bufPrint(&slot.msg, fmt, args)) |written| {
         slot.msg_len = @intCast(written.len);
     } else |_| {
-        slot.msg_len = MSG_BYTES; // truncated: buffer holds the prefix
+        slot.msg_len = @intCast(std.mem.indexOfScalar(u8, &slot.msg, 0) orelse MSG_BYTES);
     }
 }
 
@@ -113,8 +124,13 @@ pub fn dumpRecent(max: usize) void {
             serial.print("  #{d}: (recycled mid-dump)\n", .{i + 1});
             continue;
         }
+        // Guard the subtraction: cross-CPU TSC skew could read `now`
+        // below the record's stamp, and the wrapped value would
+        // overflow-panic in the `* 10` (same class as
+        // Deadline.elapsedMs).
         const per_quantum = apic.tscPerQuantum();
-        const age_ms: u64 = if (per_quantum == 0) 0 else (perf.rdtsc() -% slot.tsc) * 10 / per_quantum;
+        const now = perf.rdtsc();
+        const age_ms: u64 = if (per_quantum == 0 or now <= slot.tsc) 0 else (now - slot.tsc) * 10 / per_quantum;
         serial.print("  #{d}: {s} \"{s}\" ({d} ms ago)\n", .{
             slot.seq, slot.name, slot.msg[0..slot.msg_len], age_ms,
         });

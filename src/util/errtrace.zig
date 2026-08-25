@@ -33,9 +33,19 @@ const MAX_FRAMES: usize = 16;
 pub fn dump(err: anyerror, trace: ?*std.builtin.StackTrace) void {
     serial.print("[errtrace] error.{s}\n", .{@errorName(err)});
     if (trace) |t| {
-        const stored = @min(t.index, t.instruction_addresses.len);
+        // The trace buffer is a RING: on a chain deeper than the buffer,
+        // index keeps counting while the oldest frames are overwritten,
+        // and the oldest RETAINED frame sits at (index - stored) % len —
+        // linear [0..shown] indexing would print the wrong frames in the
+        // wrong order (std.debug.writeStackTrace does this same modulo
+        // walk).
+        const cap = t.instruction_addresses.len;
+        const stored = @min(t.index, cap);
         const shown = @min(stored, MAX_FRAMES);
-        for (t.instruction_addresses[0..shown]) |addr| {
+        const first = (t.index - stored) % @max(cap, 1);
+        var i: usize = 0;
+        while (i < shown) : (i += 1) {
+            const addr = t.instruction_addresses[(first + i) % cap];
             if (symbols.resolveKernel(addr)) |r| {
                 serial.print("  via {s}+0x{X}\n", .{ r.name, r.offset });
             } else {
