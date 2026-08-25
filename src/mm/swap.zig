@@ -24,7 +24,7 @@ const tlb = @import("../cpu/mmu/tlb.zig");
 const smp = @import("../cpu/smp.zig");
 const process = @import("../proc/process.zig");
 const spinlock = @import("../proc/spinlock.zig");
-const SpinLock = spinlock.SpinLock;
+const Guarded = @import("../util/guarded.zig").Guarded;
 const Phys = @import("../util/addr.zig").Phys;
 const pte_mod = @import("pte.zig");
 
@@ -40,10 +40,8 @@ const SECTORS_PER_PAGE: u32 = 8; // 4096 / 512
 const SWAP_BYTES: usize = 128 * 1024 * 1024;
 const NUM_SLOTS: usize = SWAP_BYTES / PAGE_SIZE; // 32768
 
-pub var available: bool = false;                                // (c) set in init() on swap-NVMe present; RO afterwards
-var slot_used: [NUM_SLOTS / 8]u8 = [_]u8{0} ** (NUM_SLOTS / 8); // (p:slot_lock) free-slot bitmap
-var used_count: usize = 0;                                       // (a) bumped by alloc/freeSlot; consumers may read outside slot_lock
-var next_scan: usize = 0;                                        // (p:slot_lock) round-robin hint for allocSlot
+pub var available: bool = false; // (c) set in init() on swap-NVMe present; RO afterwards
+var used_count: usize = 0; // (a) bumped by alloc/freeSlot; consumers may read outside slots.lock
 // Per-slot generation tag, embedded in every SWAPPED PTE (see makeSwapPte) and
 // bumped on every freeSlot. Kills the slot-reuse ABA in swapInFrame: it loads
 // the PTE (slot S), does a BLOCKING readPage(S), then commit-CASes — if in that
@@ -54,14 +52,34 @@ var next_scan: usize = 0;                                        // (p:slot_lock
 // the old PTE, so the stale commit loses and the loser re-faults. A u8 wraps
 // only after 256 free+reuse cycles of the SAME slot within one load-to-CAS
 // window (each cycle a full evict+swap-in round trip) — not physical.
-// Writes are atomic RMW under slot_lock; makeSwapPte reads with @atomicLoad
+// Writes are atomic RMW under slots.lock; makeSwapPte reads with @atomicLoad
 // monotonic (the slot's owner allocSlot'd it through the lock, which publishes
-// every prior bump; nobody can bump an owned slot's gen).
+// every prior bump; nobody can bump an owned slot's gen). Stays OUTSIDE the
+// Guarded blob: its readers are deliberately lock-free.
 var slot_gen: [NUM_SLOTS]u8 = [_]u8{0} ** NUM_SLOTS;
-// Guards slot_used + next_scan. Evict / swap-in run in the page-fault handler
-// on any CPU, so allocSlot/freeSlot must be serialized. NVMe I/O is done
-// OUTSIDE this lock (no I/O is held under it).
-var slot_lock: SpinLock = .{};
+
+/// Everything the slot lock protects, behind the lock (util/guarded.zig):
+/// the free-slot bitmap + the round-robin scan hint. Evict / swap-in run in
+/// the page-fault handler on any CPU, so allocSlot/freeSlot must be
+/// serialized. NVMe I/O is done OUTSIDE this lock (no I/O is held under it).
+/// The bit helpers are methods here: reaching them needs the token's
+/// `*SlotMap`, which is the compile-time form of the old assertHeld calls.
+const SlotMap = struct {
+    used: [NUM_SLOTS / 8]u8 = [_]u8{0} ** (NUM_SLOTS / 8), // free-slot bitmap
+    next_scan: usize = 0, // round-robin hint for allocSlot
+
+    inline fn bitGet(self: *const SlotMap, slot: usize) bool {
+        return (self.used[slot >> 3] & (@as(u8, 1) << @as(u3, @intCast(slot & 7)))) != 0;
+    }
+    inline fn bitSet(self: *SlotMap, slot: usize) void {
+        self.used[slot >> 3] |= (@as(u8, 1) << @as(u3, @intCast(slot & 7)));
+    }
+    inline fn bitClear(self: *SlotMap, slot: usize) void {
+        self.used[slot >> 3] &= ~(@as(u8, 1) << @as(u3, @intCast(slot & 7)));
+    }
+};
+
+var slots: Guarded(SlotMap) = .init(.{});
 
 // Stats. All bumped from multi-CPU evict/swap-in/discard/reclaim — atomic RMW
 // only, never plain `+=`. Milestone klog lines use the fetchAdd return value so
@@ -71,33 +89,20 @@ pub var pages_in: u64 = 0;             // (a) swap-in counter; multi-CPU
 pub var pages_second_chance: u64 = 0;  // (a) clock skips; bumped from fault.zig reclaimViaSwap
 pub var pages_discarded: u64 = 0;      // (a) discardFrame counter; multi-CPU
 
-inline fn bitGet(slot: usize) bool {
-    slot_lock.assertHeld();
-    return (slot_used[slot >> 3] & (@as(u8, 1) << @as(u3, @intCast(slot & 7)))) != 0;
-}
-inline fn bitSet(slot: usize) void {
-    slot_lock.assertHeld();
-    slot_used[slot >> 3] |= (@as(u8, 1) << @as(u3, @intCast(slot & 7)));
-}
-inline fn bitClear(slot: usize) void {
-    slot_lock.assertHeld();
-    slot_used[slot >> 3] &= ~(@as(u8, 1) << @as(u3, @intCast(slot & 7)));
-}
-
 /// Reserve a free swap slot. Returns its index, or null if swap is full or
-/// unavailable. Locking: acquires `slot_lock` internally.
+/// unavailable. Locking: acquires the slot lock internally.
 pub fn allocSlot() ?u32 {
     if (!available) return null;
-    slot_lock.acquire();
-    defer slot_lock.release();
+    const h = slots.acquire();
+    defer h.release();
     if (@atomicLoad(usize, &used_count, .monotonic) >= NUM_SLOTS) return null;
     var scanned: usize = 0;
-    var s = next_scan;
+    var s = h.ptr.next_scan;
     while (scanned < NUM_SLOTS) : (scanned += 1) {
-        if (!bitGet(s)) {
-            bitSet(s);
+        if (!h.ptr.bitGet(s)) {
+            h.ptr.bitSet(s);
             _ = @atomicRmw(usize, &used_count, .Add, 1, .monotonic);
-            next_scan = (s + 1) % NUM_SLOTS;
+            h.ptr.next_scan = (s + 1) % NUM_SLOTS;
             return @intCast(s);
         }
         s = (s + 1) % NUM_SLOTS;
@@ -106,7 +111,7 @@ pub fn allocSlot() ?u32 {
 }
 
 /// Release a swap slot (after its page was read back in, or its owner died).
-/// Locking: acquires `slot_lock` internally. Out-of-range and double-free
+/// Locking: acquires the slot lock internally. Out-of-range and double-free
 /// paths warn via `kwarn` so a caller's bookkeeping bug is observable rather
 /// than silently absorbed (mtswap-style stress would otherwise hide drift).
 pub fn freeSlot(slot: u32) void {
@@ -114,13 +119,13 @@ pub fn freeSlot(slot: u32) void {
         debug.kwarn(@src(), "freeSlot out-of-range slot={d} NUM_SLOTS={d}", .{ slot, NUM_SLOTS });
         return;
     }
-    slot_lock.acquire();
-    defer slot_lock.release();
-    if (!bitGet(slot)) {
+    const h = slots.acquire();
+    defer h.release();
+    if (!h.ptr.bitGet(slot)) {
         debug.kwarn(@src(), "freeSlot double-free slot={d}", .{slot});
         return;
     }
-    bitClear(slot);
+    h.ptr.bitClear(slot);
     // Retire this slot's SWAPPED-PTE encoding (ABA guard — see slot_gen).
     _ = @atomicRmw(u8, &slot_gen[slot], .Add, 1, .monotonic);
     _ = @atomicRmw(usize, &used_count, .Sub, 1, .monotonic);
@@ -162,7 +167,7 @@ pub fn init() void {
     // WITNESS: track the slot-allocator lock (taken in the page-fault evict /
     // swap-in path) vs other subsystem locks. Registered only when swap is
     // actually live — past the no-device early return above.
-    spinlock.registerLock("swap.slots", &slot_lock);
+    spinlock.registerLock("swap.slots", &slots.lock);
     // Self-test runs SYNCHRONOUSLY because nvme.enableAsync() hasn't fired yet
     // at this point in init — async_mode is false on every controller. Once
     // enableAsync() flips this controller too (we no longer markSyncOnly), all
@@ -176,7 +181,7 @@ pub fn init() void {
     //      at syscall entry BEFORE the handler takes any lock, so blocking
     //      there is equivalent to a normal blocking syscall.
     //   3. evictFrame/swapInFrame hold no lock across writePage/readPage (the
-    //      slot_lock is taken inside allocSlot/freeSlot only, never spanning
+    //      slots.lock is taken inside allocSlot/freeSlot only, never spanning
     //      the I/O). So eviction during reclaim can yield freely.
     // The single narrow concern — a mid-syscall kernel access to a user page
     // that was re-evicted between prefault and access — is bounded by the
