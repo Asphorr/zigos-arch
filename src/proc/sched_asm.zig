@@ -21,6 +21,8 @@
 //! marking removed crash-diagnostic state that depended on them.
 
 const std = @import("std");
+const frames = @import("frames.zig");
+const fd = frames.dispatch;
 
 // Pull save_trace into the import graph so the `save_trace_record` export
 // is present at link time — the inline asm in switchTo references it by
@@ -66,13 +68,12 @@ comptime {
 ///   - updated TSS.RSP0 to next task's kstack top (gdt.setTssRsp0)
 ///   - claimed the next task's state (.ready → .running CAS)
 pub fn switchTo() callconv(.naked) void {
-    asm volatile (
-        \\ pushq %%rbp
-        \\ pushq %%rbx
-        \\ pushq %%r12
-        \\ pushq %%r13
-        \\ pushq %%r14
-        \\ pushq %%r15
+    // The callee-save geometry — WHICH registers, in WHAT order, and the
+    // matching pops — is derived from frames.dispatch.switch_frame, the
+    // same value lifecycle.zig's forges size their zero slots from. The
+    // hand-written middle below is the SEMANTIC part (save skip, trace
+    // hook, on_cpu publish); the spec owns only the frame arithmetic.
+    asm volatile (fd.switch_frame.push_asm ++
         // Carry the on_cpu-clear pointer (RDX, may be 0) in RBX for the
         // whole switch body: prev's live RBX was just saved by the push
         // above, RBX is callee-saved across save_trace_record, and
@@ -83,8 +84,9 @@ pub fn switchTo() callconv(.naked) void {
         \\ jz 1f
         \\ movq %%rsp, (%%rdi)
         // ---- save_trace: record the kesp we just wrote -----------------
-        // After 6 pushes, RSP is at (caller's RSP - 56), mod 16 = 8.
-        // pushq %%rsi → mod 16 = 0 → callq's push aligns callee to 8 ✓.
+        // Alignment at this callq is a comptime proof now (frames.zig,
+        // dispatch's comptime block): entry ≡ 8 (mod 16) per SysV, the
+        // saves keep it ≡ 8, the pushq %%rsi below lands the callq on 0.
         // RSI carries next_kesp which the post-save path still needs, so
         // preserve it across the call. RDI is the kesp_ptr (= first SysV
         // arg), which save_trace_record consumes; we don't need it after.
@@ -108,12 +110,7 @@ pub fn switchTo() callconv(.naked) void {
         \\ jz 2f
         \\ movb $0, (%%rbx)
         \\ 2:
-        \\ popq %%r15
-        \\ popq %%r14
-        \\ popq %%r13
-        \\ popq %%r12
-        \\ popq %%rbx
-        \\ popq %%rbp
+        ++ "\n" ++ fd.switch_frame.pop_asm ++
         \\ retq
     );
 }
@@ -221,8 +218,10 @@ pub const SAFE_IRETQ = "\n" ++
 /// NOT called via `call` — reached via `ret` from `switchTo` popping this
 /// function's address from the new task's kstack.
 ///
-/// Stack layout at entry (RSP = pcb.kernel_esp + 56 after switchTo's ret):
-///   [RSP+0    .. RSP+120] : 15 GPR slots (zeroed for new task)
+/// Stack layout at entry (RSP = pcb.kernel_esp + 56 after switchTo's ret;
+/// every number here is derived from frames.dispatch and pinned by its
+/// comptime asserts):
+///   [RSP+0    .. RSP+120] : 15 GPR slots (gprs order; zeroed for new task)
 ///   [RSP+120  .. RSP+160] : iretq frame  (RIP, CS, RFLAGS, user RSP, user SS)
 ///
 /// FP state is loaded from the global `init_template` (.data) via RIP-relative
@@ -234,23 +233,13 @@ pub const SAFE_IRETQ = "\n" ++
 /// Restores FP, pops GPRs, iretqs to user. No path back here on this
 /// task — subsequent dispatches resume at the schedule() call site.
 pub fn retToUserStub() callconv(.naked) void {
+    // The 15-GPR pop order IS frames.dispatch.gprs — the same value the
+    // three lifecycle forges index their slots by (fork's hand-transposed
+    // f[0]=r15…f[14]=rax table is a derived loop now). Change the order
+    // there and every forge follows; there is no second copy to update.
     asm volatile (
         \\ fxrstorq init_template(%%rip)
-        \\ popq %%r15
-        \\ popq %%r14
-        \\ popq %%r13
-        \\ popq %%r12
-        \\ popq %%r11
-        \\ popq %%r10
-        \\ popq %%r9
-        \\ popq %%r8
-        \\ popq %%rdi
-        \\ popq %%rsi
-        \\ popq %%rbp
-        \\ popq %%rbx
-        \\ popq %%rdx
-        \\ popq %%rcx
-        \\ popq %%rax
+        ++ "\n" ++ fd.gprs.pop_asm
         // Pre-iretq sanity check — corrupt frame here means the planted
         // iretq frame from process.create is wrong from the start or got
         // scribbled before first dispatch.

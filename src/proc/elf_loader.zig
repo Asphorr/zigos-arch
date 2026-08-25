@@ -404,11 +404,12 @@ fn setupLinuxInitialStack(
     }
 
     // Point the task's first-dispatch RSP at argc (overriding create()'s native
-    // (16-aligned − 8) value). retToUserStub iretqs through frame[15..20];
-    // frame[18] is RSP. The frame sits at kstack_top − 20 qwords.
-    const PT_REGS_QWORDS: usize = 20;
-    const iretf: [*]u64 = @ptrFromInt(process.procs[pid].kernel_stack_top - PT_REGS_QWORDS * 8);
-    iretf[18] = argc_va;
+    // (16-aligned − 8) value). The slot index comes from the dispatch
+    // contract (frames.dispatch) — this used to be a hand-counted
+    // "frame[18] is RSP, 20 qwords below the top".
+    const fspec = @import("frames.zig").dispatch;
+    const iretf: [*]u64 = @ptrFromInt(process.procs[pid].kernel_stack_top - fspec.pt_regs_bytes);
+    iretf[fspec.iretq.rsp.at()] = argc_va;
 
     const argv0_log: []const u8 = if (real_argc > 0)
         pcb.argv[0][0..@min(@as(usize, pcb.arg_lens[0]), @as(usize, config.MAX_ARG_LEN))]

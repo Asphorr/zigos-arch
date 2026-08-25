@@ -45,6 +45,8 @@ const smp = @import("../cpu/smp.zig");
 const memmap = @import("../mm/memmap.zig");
 const config = @import("../config.zig");
 const signals = @import("signals.zig");
+const frames = @import("frames.zig");
+const dspec = frames.dispatch; // NOT `fd` — this file is full of file-descriptor captures
 
 const process = @import("process.zig");
 const elf_rc = @import("elf_rc.zig");
@@ -139,44 +141,35 @@ pub fn create(entry: usize, user_stack: usize) ?usize {
     const slot_base = @intFromPtr(&process.kstack_pool[i]);
     const stack_top = slot_base + KSTACK_SLOT_SIZE;
 
-    // Kernel stack image at first dispatch (low → high address):
-    //   [stack_top - 216 .. stack_top - 168) = 6 zero callee-saves   (48 B)
-    //   [stack_top - 168 .. stack_top - 160) = retToUserStub address  (8 B)
-    //   [stack_top - 160 .. stack_top -  40) = R15..RAX              (120 B)
-    //   [stack_top -  40 .. stack_top)       = RIP CS RFLAGS RSP SS  (40 B)
+    // Kernel stack image at first dispatch: the dispatch contract —
+    // switch-frame zeros + planted retToUserStub + GPR slots + iretq
+    // words. The geometry (counts, offsets, pop orders, 16-alignment)
+    // lives ONCE in frames.dispatch, the same value sched_asm.zig
+    // derives its push/pop text from; this function only fills values.
     //
     // After the first iretq the task is in user mode. On its next
     // preempt/yield, isr_irq0/syscall stub saves new state on this
     // SAME kstack at the top, then schedule() pushes its own
     // switchTo frame (callee-saves) deeper on the kstack.
-    const PT_REGS_QWORDS: usize = 20; // 15 GPRs + 5 iretq qwords
-    const PT_REGS_BYTES = PT_REGS_QWORDS * 8; // 160
-    const SWITCH_FRAME_BYTES: usize = 56; // 6 callee-saves + ret addr
-    const TOTAL_BYTES = PT_REGS_BYTES + SWITCH_FRAME_BYTES; // 216
-
-    comptime {
-        if ((TOTAL_BYTES - SWITCH_FRAME_BYTES) % 16 != 0) @compileError("retToUserStub entry RSP must be 16-aligned");
-    }
-
-    const frame: [*]u64 = @ptrFromInt(stack_top - PT_REGS_QWORDS * 8);
-    frame[19] = 0x1B;
+    const frame: [*]u64 = @ptrFromInt(stack_top - dspec.pt_regs_bytes);
+    frame[dspec.iretq.ss.at()] = 0x1B;
     // SysV ABI invariant: function entry RSP must be (16-aligned minus 8) —
     // see the matching block in cloneCurrent. _start almost always survives
     // because it's a small leaf that calls main via `call` (which itself
     // realigns), so the bug stays latent for sysExec but bites sysClone
     // where the entry is an arbitrary user function. Fix both for symmetry.
-    frame[18] = (user_stack & ~@as(usize, 0xF)) - 8;
-    frame[17] = 0x202;
-    frame[16] = 0x23;
-    frame[15] = entry;
-    for (0..15) |k| frame[k] = 0;
+    frame[dspec.iretq.rsp.at()] = (user_stack & ~@as(usize, 0xF)) - 8;
+    frame[dspec.iretq.rflags.at()] = 0x202;
+    frame[dspec.iretq.cs.at()] = 0x23;
+    frame[dspec.iretq.rip.at()] = entry;
+    for (0..dspec.gprs.count) |k| frame[k] = 0;
 
     const sched_asm = @import("sched_asm.zig");
-    const sw_base: [*]u64 = @ptrFromInt(stack_top - TOTAL_BYTES);
-    for (0..6) |k| sw_base[k] = 0;
-    sw_base[6] = @intFromPtr(&sched_asm.retToUserStub);
+    const sw_base: [*]u64 = @ptrFromInt(stack_top - dspec.total_bytes);
+    for (0..dspec.switch_frame.count) |k| sw_base[k] = 0;
+    sw_base[dspec.ret_slot] = @intFromPtr(&sched_asm.retToUserStub);
 
-    process.procs[i].kernel_esp = stack_top - TOTAL_BYTES;
+    process.procs[i].kernel_esp = stack_top - dspec.total_bytes;
     process.procs[i].kernel_stack_top = stack_top;
     process.plantStackCanary(i); // P4: plant base canary BEFORE publishing the slot runnable
     @atomicStore(usize, &process.expected_kstack_tops[i], stack_top, .release);
@@ -262,17 +255,13 @@ pub fn cloneCurrent(entry: usize, stack_top: usize, arg: usize, fs_base: u64) ?u
     process.procs[i].parent_pid = @intCast(parent_lead.tgid);
     process.procs[i].fs_base = fs_base;
 
-    // Kernel stack image: same layout as create() but with caller-
-    // chosen RIP/RSP/RDI. See create()'s comment for the full layout.
+    // Kernel stack image: same dispatch contract as create() but with
+    // caller-chosen RIP/RSP/RDI. Geometry from frames.dispatch.
     const slot_base = @intFromPtr(&process.kstack_pool[i]);
     const kstack_top = slot_base + KSTACK_SLOT_SIZE;
-    const PT_REGS_QWORDS: usize = 20;
-    const PT_REGS_BYTES = PT_REGS_QWORDS * 8; // 160
-    const SWITCH_FRAME_BYTES: usize = 56;
-    const TOTAL_BYTES = PT_REGS_BYTES + SWITCH_FRAME_BYTES; // 216
 
-    const frame: [*]u64 = @ptrFromInt(kstack_top - PT_REGS_QWORDS * 8);
-    frame[19] = 0x1B;
+    const frame: [*]u64 = @ptrFromInt(kstack_top - dspec.pt_regs_bytes);
+    frame[dspec.iretq.ss.at()] = 0x1B;
     // SysV ABI invariant: at function entry RSP must be (16-aligned minus 8).
     // A normal `call` pushes 8-byte RA before transferring control, so the
     // callee sees RSP at (16k - 8). iretq performs no such push, so we
@@ -282,19 +271,21 @@ pub fn cloneCurrent(entry: usize, stack_top: usize, arg: usize, fs_base: u64) ?u
     // notably anything calling std.fmt.bufPrint) GPFs immediately on
     // misaligned access. threadtest/threadbrot survive only because their
     // worker bodies don't trigger XMM pressure; richer thread bodies crash.
-    frame[18] = (stack_top & ~@as(usize, 0xF)) - 8;
-    frame[17] = 0x202;
-    frame[16] = 0x23;
-    frame[15] = entry;
-    for (0..15) |k| frame[k] = 0;
-    frame[8] = arg;
+    frame[dspec.iretq.rsp.at()] = (stack_top & ~@as(usize, 0xF)) - 8;
+    frame[dspec.iretq.rflags.at()] = 0x202;
+    frame[dspec.iretq.cs.at()] = 0x23;
+    frame[dspec.iretq.rip.at()] = entry;
+    for (0..dspec.gprs.count) |k| frame[k] = 0;
+    // First arg rides in RDI. The slot index is DERIVED from the pop
+    // order (this was the hand-counted "frame[8] = arg").
+    frame[dspec.gprs.index(.rdi)] = arg;
 
     const sched_asm = @import("sched_asm.zig");
-    const sw_base: [*]u64 = @ptrFromInt(kstack_top - TOTAL_BYTES);
-    for (0..6) |k| sw_base[k] = 0;
-    sw_base[6] = @intFromPtr(&sched_asm.retToUserStub);
+    const sw_base: [*]u64 = @ptrFromInt(kstack_top - dspec.total_bytes);
+    for (0..dspec.switch_frame.count) |k| sw_base[k] = 0;
+    sw_base[dspec.ret_slot] = @intFromPtr(&sched_asm.retToUserStub);
 
-    process.procs[i].kernel_esp = kstack_top - TOTAL_BYTES;
+    process.procs[i].kernel_esp = kstack_top - dspec.total_bytes;
     process.procs[i].kernel_stack_top = kstack_top;
     process.plantStackCanary(i); // P4: plant base canary BEFORE publishing the slot runnable
     @atomicStore(usize, &process.expected_kstack_tops[i], kstack_top, .release);
@@ -443,47 +434,39 @@ pub fn forkCurrent(frame: *signals.SyscallFrame) ?usize {
     process.procs[i].pgid = parent.pgid;
     process.procs[i].sid = parent.sid;
 
-    // Build child's kstack image — same shape as create()/cloneCurrent(), but
-    // values seeded from parent's saved syscall frame so child resumes at the
-    // parent's syscall-return point with RAX=0. retToUserStub pops 15 GPRs in
-    // order R15..RAX (frame[0..15]) then iretqs through frame[15..20].
+    // Build child's kstack image — the same dispatch contract as
+    // create()/cloneCurrent(), values seeded from parent's saved syscall
+    // frame so the child resumes at the parent's syscall-return point
+    // with RAX=0.
     const slot_base = @intFromPtr(&process.kstack_pool[i]);
     const kstack_top = slot_base + KSTACK_SLOT_SIZE;
-    const PT_REGS_QWORDS: usize = 20;
-    const PT_REGS_BYTES = PT_REGS_QWORDS * 8;
-    const SWITCH_FRAME_BYTES: usize = 56;
-    const TOTAL_BYTES = PT_REGS_BYTES + SWITCH_FRAME_BYTES;
 
-    const f: [*]u64 = @ptrFromInt(kstack_top - PT_REGS_BYTES);
-    // Iretq frame (top of pt_regs): SS, RSP, RFLAGS, CS, RIP.
-    f[19] = 0x1B;            // user SS
-    f[18] = frame.user_rsp;  // user RSP
-    f[17] = frame.r11;       // RFLAGS — saved by syscall in R11
-    f[16] = 0x23;             // user CS
-    f[15] = frame.rcx;        // user RIP — saved by syscall in RCX
-    // GPRs (retToUserStub pops in this order): R15..RAX.
-    f[0]  = frame.r15;
-    f[1]  = frame.r14;
-    f[2]  = frame.r13;
-    f[3]  = frame.r12;
-    f[4]  = frame.r11;        // R11 GPR slot — overwritten anyway by iretq's RFLAGS load
-    f[5]  = frame.r10;
-    f[6]  = frame.r9;
-    f[7]  = frame.r8;
-    f[8]  = frame.rdi;
-    f[9]  = frame.rsi;
-    f[10] = frame.rbp;
-    f[11] = frame.rbx;
-    f[12] = frame.rdx;
-    f[13] = frame.rcx;        // RCX GPR slot
-    f[14] = 0;                // RAX = fork() return value for child
+    const f: [*]u64 = @ptrFromInt(kstack_top - dspec.pt_regs_bytes);
+    // Iretq frame (top of pt_regs).
+    f[dspec.iretq.ss.at()] = 0x1B; // user SS
+    f[dspec.iretq.rsp.at()] = frame.user_rsp;
+    f[dspec.iretq.rflags.at()] = frame.r11; // syscall stashes RFLAGS in R11
+    f[dspec.iretq.cs.at()] = 0x23; // user CS
+    f[dspec.iretq.rip.at()] = frame.rcx; // syscall stashes user RIP in RCX
+    // GPR slots: copy BY NAME along the pop order — this loop replaces
+    // the hand-transposed f[0]=r15 … f[14]=rax table, so the slot of
+    // each register is derived, not counted by eye. Special cases: RAX
+    // is fork()'s return value for the child (0); R11/RCX slots carry
+    // the parent's raw values exactly as before (R11's GPR slot is
+    // overwritten by iretq's RFLAGS load anyway).
+    inline for (dspec.gprs.regs, 0..) |r, k| {
+        f[k] = switch (r) {
+            .rax => 0, // fork() → 0 in the child
+            else => @field(frame, @tagName(r)),
+        };
+    }
 
     const sched_asm = @import("sched_asm.zig");
-    const sw_base: [*]u64 = @ptrFromInt(kstack_top - TOTAL_BYTES);
-    for (0..6) |k| sw_base[k] = 0;
-    sw_base[6] = @intFromPtr(&sched_asm.retToUserStub);
+    const sw_base: [*]u64 = @ptrFromInt(kstack_top - dspec.total_bytes);
+    for (0..dspec.switch_frame.count) |k| sw_base[k] = 0;
+    sw_base[dspec.ret_slot] = @intFromPtr(&sched_asm.retToUserStub);
 
-    process.procs[i].kernel_esp = kstack_top - TOTAL_BYTES;
+    process.procs[i].kernel_esp = kstack_top - dspec.total_bytes;
     process.procs[i].kernel_stack_top = kstack_top;
     process.plantStackCanary(i); // P4: plant base canary BEFORE publishing the slot runnable
     @atomicStore(usize, &process.expected_kstack_tops[i], kstack_top, .release);

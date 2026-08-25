@@ -169,6 +169,45 @@ split), `pmm.RegionState` (methods + refHeld choreography). The
 hand-rolled `Region.Guard` prototype this section used to describe was
 absorbed into `Guarded(T)` (2026-08-25).
 
+## Frame contracts: `frames.Frame` (asm ↔ forge agreements)
+
+A stack-frame layout shared between an `asm volatile` template and Zig
+code that forges or indexes that frame is an agreement between two
+languages that nothing checks: switchTo's "6 pushes" had to equal three
+forge loops' `for (0..6)`, `frame[8] = arg` was RDI's position in
+retToUserStub's pop order counted by eye, and the SysV mod-16
+arithmetic lived in comments with a hand-drawn ✓. The historical
+casualty of this class: the init_template FXSAVE alias (MXCSR landing
+on a ret-addr slot). `proc/frames.zig` makes the frame a comptime
+value — an ordered register list — and DERIVES both sides from it:
+
+```zig
+const gprs = frames.Frame(&.{ .r15, .r14, ... , .rax });
+asm volatile ("..." ++ gprs.pop_asm ++ SAFE_IRETQ);   // the asm text
+f[gprs.index(.rdi)] = arg;                            // the forge slot
+```
+
+`push_asm` is the reversal of `pop_asm` BY CONSTRUCTION; sizes,
+slot indices and `rspModAfter` alignment feed `comptime` asserts that
+replace the ✓-comments. Zig allows this where C cannot: an asm
+template is a comptime string (`++` splice — precedent: `SAFE_IRETQ`,
+dynirq's `comptimePrint` stubs). The asm's SEMANTIC middle (save-trace
+hooks, publish points) stays hand-written — the spec owns only the
+geometry, which is the part humans get wrong.
+
+**Rule:** a new asm stub that pushes/pops/indexes a register frame
+declares the frame as a `Frame` spec and splices the derived text;
+order changes happen in the spec, nowhere else. **Verification rule:**
+converting existing hand asm must reproduce the old bytes — disassemble
+before and after (`objdump -d --disassemble=<sym>`, normalize
+addresses) and diff; the dispatch-contract conversion landed
+`ASM_IDENTICAL`. **Exemplar:** `frames.dispatch` — one value feeding
+sched_asm's switchTo/retToUserStub text, lifecycle's three forges
+(create/clone/fork), and elf_loader's Linux-ABI RSP override. **Future
+customers:** SyscallFrame/IrqFrame/ExcFrame push sides and the FXSAVE
+offset arithmetic (misc_irq.zig still carries a hand-checked "624B ≡ 0
+mod 16 ✓").
+
 ## `lock.assertHeld()` runtime checks
 
 Both `SpinLock` and `Mutex` carry holder identity already (`holder_cpu`
@@ -488,6 +527,7 @@ silent self-recovery into observable metric.
 | `LE(T)` / `BE(T)`   | `src/driver/nvme.zig` `DsmRange`                |
 | `Guarded(T)`        | `src/util/guarded.zig`; adopters: swap/page_cache/nvme/pmm |
 | `assertHeld()`      | `src/util/guarded.zig` `refHeld`                |
+| `frames.Frame`      | `src/proc/frames.zig` `dispatch`; sched_asm + lifecycle forges |
 | `UserPtr(T)`        | `src/cpu/syscall/proc.zig` `sysSigpending`      |
 | `Persistent(T)`     | `src/mm/pmem.zig` `persistenceSelfTest`         |
 | `kwarn(@src(),...)` | `src/debug/debug.zig` `kwarn`                   |
