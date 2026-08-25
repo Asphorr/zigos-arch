@@ -9,6 +9,7 @@ const heap = @import("heap.zig");
 const memmap = @import("memmap.zig");
 const swap = @import("swap.zig");
 const tlb = @import("../cpu/mmu/tlb.zig");
+const Phys = @import("../util/addr.zig").Phys;
 
 const PRESENT: u64 = paging.PRESENT;
 const READ_WRITE: u64 = paging.READ_WRITE;
@@ -93,18 +94,18 @@ inline fn tableFromEntry(entry: u64) [*]u64 {
 
 /// Allocate a zeroed page frame and return it as a table pointer (via the
 /// physmap so the kernel can write zeros without depending on PML4[0]).
-const TableAlloc = struct { ptr: [*]u64, phys: usize };
+const TableAlloc = struct { ptr: [*]u64, phys: Phys };
 
 fn allocZeroedTable() ?TableAlloc {
     const phys = pmm.allocFrame() orelse return null;
-    const ptr: [*]u64 = @ptrFromInt(paging.physToVirt(phys));
+    const ptr = phys.toVirt().ptr([*]u64);
     @memset(ptr[0..512], 0);
     return .{ .ptr = ptr, .phys = phys };
 }
 
 /// Build a page table entry from physical address and flags.
-inline fn makeEntry(phys: usize, flags: u64) u64 {
-    return @as(u64, @intCast(phys)) | flags;
+inline fn makeEntry(phys: Phys, flags: u64) u64 {
+    return phys.raw() | flags;
 }
 
 /// Create a new per-process address space (PML4).
@@ -142,7 +143,7 @@ pub fn createAddressSpace(phys_out: *usize) ?[*]align(4096) u64 {
     pml4[258] = kernel_pml4[258];
     pml4[511] = kernel_pml4[511];
 
-    phys_out.* = alloc.phys;
+    phys_out.* = alloc.phys.raw();
     return pml4;
 }
 
@@ -421,7 +422,7 @@ pub fn allocAndMapUserPage(pml4: [*]align(4096) u64, virt: usize, flags: u64) Ma
     // User-data frame: respects the PMM reserve so a user-driven lazy
     // fault can't eat into the kernel emergency pool.
     const frame = pmm.allocFrameUser() orelse return error.Oom;
-    mapUserPage(pml4, virt, frame, flags) catch |e| switch (e) {
+    mapUserPage(pml4, virt, frame.raw(), flags) catch |e| switch (e) {
         // Race resolved — another CPU faulted in this page while we were
         // allocating. Give our frame back; tell the caller to use the
         // existing one. resolveUserPhys can fail here when the winner's
@@ -444,9 +445,9 @@ pub fn allocAndMapUserPage(pml4: [*]align(4096) u64, virt: usize, flags: u64) Ma
             return e;
         },
     };
-    const ptr: [*]u8 = @ptrFromInt(paging.physToVirt(frame));
+    const ptr = frame.toVirt().ptr([*]u8);
     @memset(ptr[0..4096], 0);
-    return frame;
+    return frame.raw();
 }
 
 /// Update the access-control bits on an already-mapped 4KB user page. The
@@ -580,7 +581,7 @@ pub fn unmapUserRange(pml4: [*]align(4096) u64, start: usize, end: usize) usize 
             const pte = pt[i];
             if (pte & PRESENT != 0 and pte & USER != 0) {
                 pt[i] = 0;
-                pmm.freeFrame(@intCast(pte & PAGE_MASK));
+                pmm.freeFrame(Phys.of(pte & PAGE_MASK));
                 freed += 1;
             } else {
                 // Non-PRESENT: may be SWAPPED, SWAP_INFLIGHT (mid-eviction on
@@ -603,7 +604,7 @@ pub fn unmapUserRange(pml4: [*]align(4096) u64, start: usize, end: usize) usize 
             if (pt[j] & PRESENT != 0) { pt_used = true; break; }
         }
         if (!pt_used) {
-            pmm.freeFrame(entryPhys(pd[pd_idx]));
+            pmm.freeFrame(Phys.of(entryPhys(pd[pd_idx])));
             pd[pd_idx] = 0;
 
             var pd_used = false;
@@ -611,7 +612,7 @@ pub fn unmapUserRange(pml4: [*]align(4096) u64, start: usize, end: usize) usize 
                 if (pd[j] & PRESENT != 0) { pd_used = true; break; }
             }
             if (!pd_used) {
-                pmm.freeFrame(entryPhys(pdpt[pdpt_idx]));
+                pmm.freeFrame(Phys.of(entryPhys(pdpt[pdpt_idx])));
                 pdpt[pdpt_idx] = 0;
             }
         }
@@ -690,7 +691,7 @@ pub fn countUserPages(pml4: [*]align(4096) u64) usize {
 /// reference and never freed here — the kernel master owns them.
 pub fn destroyAddressSpace(pml4: [*]align(4096) u64, pml4_phys: usize) void {
     if (pml4[0] & PRESENT == 0) {
-        pmm.freeFrame(pml4_phys);
+        pmm.freeFrame(Phys.of(pml4_phys));
         return;
     }
 
@@ -726,7 +727,7 @@ pub fn destroyAddressSpace(pml4: [*]align(4096) u64, pml4_phys: usize) void {
             for (0..512) |pt_i| {
                 const pte = pt[pt_i];
                 if (pte & PRESENT != 0 and pte & USER != 0) {
-                    pmm.releaseFrame(entryPhys(pte));
+                    pmm.releaseFrame(Phys.of(entryPhys(pte)));
                 } else {
                     // Evicted page (SWAPPED) or in-flight eviction
                     // (SWAP_INFLIGHT) held by this dying address space: release
@@ -739,15 +740,15 @@ pub fn destroyAddressSpace(pml4: [*]align(4096) u64, pml4_phys: usize) void {
             }
 
             // Free the page table itself
-            pmm.freeFrame(entryPhys(pd[pd_i]));
+            pmm.freeFrame(Phys.of(entryPhys(pd[pd_i])));
         }
 
         // Free the private PD
-        pmm.freeFrame(entryPhys(pdpt[pdpt_i]));
+        pmm.freeFrame(Phys.of(entryPhys(pdpt[pdpt_i])));
     }
 
     // Free the private PDPT
-    pmm.freeFrame(entryPhys(pml4[0]));
+    pmm.freeFrame(Phys.of(entryPhys(pml4[0])));
 
     // Gap #4 (2026-05-20): TLB hygiene at teardown. We just freed every
     // user-mapped frame and every private page-table page. If anything
@@ -772,7 +773,7 @@ pub fn destroyAddressSpace(pml4: [*]align(4096) u64, pml4_phys: usize) void {
         : .{ .rax = true, .memory = true });
 
     // Free the PML4 itself
-    pmm.freeFrame(pml4_phys);
+    pmm.freeFrame(Phys.of(pml4_phys));
 }
 
 /// Clone an address space for fork(). Walks parent's PML4[0] tree, allocates
@@ -825,7 +826,7 @@ pub fn destroyAddressSpace(pml4: [*]align(4096) u64, pml4_phys: usize) void {
 pub fn cloneAddressSpace(parent_pml4: [*]align(4096) u64, parent_pcid: u16, phys_out: *usize) ?[*]align(4096) u64 {
     const pml4_alloc = allocZeroedTable() orelse return null;
     const child_pml4: [*]align(4096) u64 = @alignCast(pml4_alloc.ptr);
-    phys_out.* = pml4_alloc.phys;
+    phys_out.* = pml4_alloc.phys.raw();
 
     // Kernel-half by-reference inheritance (same as createAddressSpace).
     // [256] = physmap, [258] = vmalloc arena, [511] = kernel image.
@@ -890,7 +891,7 @@ pub fn cloneAddressSpace(parent_pml4: [*]align(4096) u64, parent_pcid: u16, phys
                     if (parent_pte & PRESENT == 0) break;
                     if (parent_pte & USER == 0) break; // non-user under PML4[0]: shouldn't appear
 
-                    const phys = entryPhys(parent_pte);
+                    const phys = Phys.of(entryPhys(parent_pte));
                     // Refuse a frame whose refcount already hit 0 — our PTE
                     // sample is stale (eviction completed and freed it). The
                     // re-read is guaranteed to see a different PTE: every

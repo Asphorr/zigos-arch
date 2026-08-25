@@ -33,6 +33,7 @@ const SpinLock = @import("../proc/spinlock.zig").SpinLock;
 const Deadline = @import("../util/deadline.zig").Deadline;
 const mmio = @import("../util/mmio.zig");
 const addrmod = @import("../util/addr.zig");
+const Phys = addrmod.Phys;
 
 // PCI class for "Mass Storage Controller / NVM Subsystem / NVMe I/O".
 const PCI_CLASS_STORAGE: u8 = 0x01;
@@ -569,7 +570,7 @@ const InitState = struct {
     /// block. deinit frees the whole block via freeContiguous on the
     /// abort path. Returns the physical base address of page 0.
     fn trackAllocN(self: *@This(), count: u32) ?usize {
-        const p = pmm.allocContiguous(count) orelse return null;
+        const p = (pmm.allocContiguous(count) orelse return null).raw();
         if (self.n < self.pages.len) {
             self.pages[self.n] = p;
             self.counts[self.n] = count;
@@ -588,9 +589,9 @@ const InitState = struct {
         while (i < self.n) : (i += 1) {
             if (self.pages[i] == 0) continue;
             if (self.counts[i] <= 1) {
-                pmm.freeFrame(self.pages[i]);
+                pmm.freeFrame(Phys.of(self.pages[i]));
             } else {
-                pmm.freeContiguous(self.pages[i], self.counts[i]);
+                pmm.freeContiguous(Phys.of(self.pages[i]), self.counts[i]);
             }
         }
     }

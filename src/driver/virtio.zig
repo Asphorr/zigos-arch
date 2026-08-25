@@ -167,15 +167,15 @@ pub const Queue = struct {
         // 4 bytes (flags+idx) + qs * 2 (ring entries) + 2 (used_event) =
         // 6 + qs*2 bytes. With qs ≤ 256, total < 4 KB.
         const p_desc_avail = pmm.allocFrame() orelse return false;
-        const p_used = pmm.allocFrame() orelse {
+        const p_used = (pmm.allocFrame() orelse {
             pmm.freeFrame(p_desc_avail);
             return false;
-        };
-        @memset(@as([*]u8, @ptrFromInt(paging.physToVirt(p_desc_avail)))[0..4096], 0);
+        }).raw();
+        @memset(p_desc_avail.toVirt().ptr([*]u8)[0..4096], 0);
         @memset(@as([*]u8, @ptrFromInt(paging.physToVirt(p_used)))[0..4096], 0);
 
-        self.desc_phys = p_desc_avail;
-        self.avail_phys = p_desc_avail + @as(usize, qs) * @sizeOf(VirtqDesc);
+        self.desc_phys = p_desc_avail.raw();
+        self.avail_phys = p_desc_avail.raw() + @as(usize, qs) * @sizeOf(VirtqDesc);
         self.used_phys = p_used;
         self.free_head = 0;
         self.num_free = qs;

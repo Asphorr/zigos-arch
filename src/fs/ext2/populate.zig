@@ -48,14 +48,13 @@ const COPY_BUF_BYTES: usize = 64 * 1024;
 pub fn ensureWorkingSet() ?*block.Mount {
     if (target_mount_ptr) |m| return m;
     const pmm = @import("../../mm/pmm.zig");
-    const paging = @import("../../mm/paging.zig");
     const bytes = @sizeOf(block.Mount) + COPY_BUF_BYTES;
     const pages: u32 = @intCast((bytes + 4095) / 4096);
     const phys = pmm.allocContiguous(pages) orelse {
         debug.klog("[populate] allocContiguous({d} pages) failed\n", .{pages});
         return null;
     };
-    const base: [*]u8 = @ptrFromInt(paging.physToVirt(phys));
+    const base = phys.toVirt().ptr([*]u8);
     const m: *block.Mount = @ptrCast(@alignCast(base));
     copy_buf = (base + @sizeOf(block.Mount))[0..COPY_BUF_BYTES];
     target_mount_ptr = m;

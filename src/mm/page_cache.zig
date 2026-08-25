@@ -51,6 +51,7 @@
 // (non-IrqSave) acquire is correct.
 
 const pmm = @import("pmm.zig");
+const Phys = @import("../util/addr.zig").Phys;
 const spinlock = @import("../proc/spinlock.zig");
 
 pub const PAGE_SIZE: usize = 4096;
@@ -135,7 +136,7 @@ pub fn init() void {
             // this on refcount == 1 (the original code) ORPHANED the cache's
             // ref for still-mapped frames: the mapper's later release parked
             // the count at 1 forever — a permanent frame leak.
-            if (e.valid) pmm.releaseFrame(e.frame);
+            if (e.valid) pmm.releaseFrame(Phys.of(e.frame));
             e.* = .{};
         }
         set.hand = 0;
@@ -194,11 +195,11 @@ pub fn pin(file_id: u64, page_off: u64) ?usize {
     lock.acquire();
     defer lock.release();
     if (findWay(file_id, page_off)) |e| {
-        if (pmm.frameRefCount(e.frame) >= PIN_SATURATION) {
+        if (pmm.frameRefCount(Phys.of(e.frame)) >= PIN_SATURATION) {
             stat_misses += 1; // refuse to saturate; caller maps an uncached copy
             return null;
         }
-        pmm.acquireFrame(e.frame); // 1 -> 2 (or N -> N+1); now un-evictable
+        pmm.acquireFrame(Phys.of(e.frame)); // 1 -> 2 (or N -> N+1); now un-evictable
         stat_hits += 1;
         return e.frame;
     }
@@ -239,10 +240,10 @@ pub fn getOrAlloc(file_id: u64, page_off: u64) ?GetResult {
         stat_full_skips += 1;
         return null;
     };
-    const phys = pmm.allocFrame() orelse {
+    const phys = (pmm.allocFrame() orelse {
         stat_full_skips += 1;
         return null;
-    };
+    }).raw();
     slot.* = .{ .file_id = file_id, .page_off = page_off, .frame = phys, .valid = true };
     stat_inserts += 1;
     return .{ .frame = phys, .fresh = true };
@@ -272,9 +273,9 @@ pub fn insertFilled(file_id: u64, page_off: u64, frame: usize) usize {
         // Another CPU published this page first. Prefer the shared resident copy
         // unless it's near the pmm refcount ceiling (acquireFrame panics at 255);
         // in that pathological case keep our own frame private.
-        if (pmm.frameRefCount(e.frame) < PIN_SATURATION) {
-            pmm.releaseFrame(frame); // discard our wasted fill (1 -> 0, freed)
-            pmm.acquireFrame(e.frame); // take a mapper ref on the resident copy
+        if (pmm.frameRefCount(Phys.of(e.frame)) < PIN_SATURATION) {
+            pmm.releaseFrame(Phys.of(frame)); // discard our wasted fill (1 -> 0, freed)
+            pmm.acquireFrame(Phys.of(e.frame)); // take a mapper ref on the resident copy
             stat_hits += 1;
             return e.frame;
         }
@@ -288,7 +289,7 @@ pub fn insertFilled(file_id: u64, page_off: u64, frame: usize) usize {
         return frame; // refcount 1, uncached
     };
     slot.* = .{ .file_id = file_id, .page_off = page_off, .frame = frame, .valid = true };
-    pmm.acquireFrame(frame); // 1 (cache's ref) -> 2 (+ this mapper's ref)
+    pmm.acquireFrame(Phys.of(frame)); // 1 (cache's ref) -> 2 (+ this mapper's ref)
     stat_inserts += 1;
     return frame;
 }
@@ -302,7 +303,7 @@ pub fn invalidate(file_id: u64, page_off: u64) bool {
     lock.acquire();
     defer lock.release();
     if (findWay(file_id, page_off)) |e| {
-        pmm.releaseFrame(e.frame); // drop the cache's reference
+        pmm.releaseFrame(Phys.of(e.frame)); // drop the cache's reference
         e.* = .{};
         return true;
     }
@@ -336,7 +337,7 @@ pub fn invalidateRange(file_id: u64, start_off: u64, len: u64) u32 {
             for (&set.ways) |*e| {
                 // !e.dirty: keep a MAP_SHARED-written page (see the probe branch).
                 if (e.valid and !e.dirty and e.file_id == file_id and e.page_off >= first and e.page_off < end) {
-                    pmm.releaseFrame(e.frame);
+                    pmm.releaseFrame(Phys.of(e.frame));
                     e.* = .{};
                     dropped += 1;
                 }
@@ -358,7 +359,7 @@ pub fn invalidateRange(file_id: u64, start_off: u64, len: u64) u32 {
             // the mapping's eventual writeback. (write()-vs-active-MAP_SHARED
             // ordering is POSIX-unspecified; write-through coherence is future work.)
             if (e.dirty) continue;
-            pmm.releaseFrame(e.frame);
+            pmm.releaseFrame(Phys.of(e.frame));
             e.* = .{};
             dropped += 1;
         }
@@ -378,7 +379,7 @@ pub fn invalidateFile(file_id: u64) u32 {
     for (&sets) |*set| {
         for (&set.ways) |*e| {
             if (e.valid and e.file_id == file_id) {
-                pmm.releaseFrame(e.frame);
+                pmm.releaseFrame(Phys.of(e.frame));
                 e.* = .{};
                 dropped += 1;
             }
@@ -432,13 +433,13 @@ pub fn takeNextDirty(file_id: u64, from_off: u64) ?DirtyPage {
     for (&sets) |*set| {
         for (&set.ways) |*e| {
             if (e.valid and e.dirty and e.file_id == file_id and e.page_off >= from_off) {
-                if (pmm.frameRefCount(e.frame) >= PIN_SATURATION) continue; // skip; flush later
+                if (pmm.frameRefCount(Phys.of(e.frame)) >= PIN_SATURATION) continue; // skip; flush later
                 if (best == null or e.page_off < best.?.page_off) best = e;
             }
         }
     }
     const e = best orelse return null;
-    pmm.acquireFrame(e.frame); // pin across the (lockless) writeback I/O
+    pmm.acquireFrame(Phys.of(e.frame)); // pin across the (lockless) writeback I/O
     return .{ .page_off = e.page_off, .frame = e.frame };
 }
 
@@ -466,8 +467,8 @@ pub fn takeNextDirtyGlobal(from_idx: u32) ?GlobalDirtyPage {
     while (idx < CAPACITY) : (idx += 1) {
         const e = &sets[idx / WAYS].ways[idx % WAYS];
         if (e.valid and e.dirty) {
-            if (pmm.frameRefCount(e.frame) >= PIN_SATURATION) continue; // skip; flush a later pass
-            pmm.acquireFrame(e.frame); // pin across the lockless writeback I/O
+            if (pmm.frameRefCount(Phys.of(e.frame)) >= PIN_SATURATION) continue; // skip; flush a later pass
+            pmm.acquireFrame(Phys.of(e.frame)); // pin across the lockless writeback I/O
             return .{ .file_id = e.file_id, .page_off = e.page_off, .frame = e.frame, .next_idx = idx + 1 };
         }
     }
@@ -484,7 +485,7 @@ pub fn clearDirtyIfCacheOnly(file_id: u64, page_off: u64) bool {
     lock.acquire();
     defer lock.release();
     if (findWay(file_id, page_off)) |e| {
-        if (e.dirty and pmm.frameRefCount(e.frame) == 1) {
+        if (e.dirty and pmm.frameRefCount(Phys.of(e.frame)) == 1) {
             e.dirty = false;
             return true;
         }
@@ -518,7 +519,7 @@ pub fn clearDirtyRangeCacheOnly(file_id: u64, start_off: u64, len: u64) u32 {
             for (&set.ways) |*e| {
                 if (e.valid and e.dirty and e.file_id == file_id and
                     e.page_off >= first and e.page_off < end and
-                    pmm.frameRefCount(e.frame) == 1)
+                    pmm.frameRefCount(Phys.of(e.frame)) == 1)
                 {
                     e.dirty = false;
                     cleared += 1;
@@ -530,7 +531,7 @@ pub fn clearDirtyRangeCacheOnly(file_id: u64, start_off: u64, len: u64) u32 {
     var off = first;
     while (off < end) : (off += PG) {
         if (findWay(file_id, off)) |e| {
-            if (e.dirty and pmm.frameRefCount(e.frame) == 1) {
+            if (e.dirty and pmm.frameRefCount(Phys.of(e.frame)) == 1) {
                 e.dirty = false;
                 cleared += 1;
             }
@@ -579,8 +580,8 @@ pub fn reclaim(needed: u32) u32 {
         for (&set.ways) |*e| {
             if (freed >= needed) return freed;
             if (!e.valid or e.dirty) continue;
-            if (pmm.frameRefCount(e.frame) != 1) continue;
-            pmm.releaseFrame(e.frame); // 1 -> 0: frame returns to the pool
+            if (pmm.frameRefCount(Phys.of(e.frame)) != 1) continue;
+            pmm.releaseFrame(Phys.of(e.frame)); // 1 -> 0: frame returns to the pool
             e.* = .{};
             freed += 1;
             stat_reclaimed += 1;
@@ -623,8 +624,8 @@ fn chooseSlot(set_idx: u32) ?*Entry {
         // discarded. Dirty pages are released by syncCacheFile, not eviction; a
         // set full of dirty pages just falls back to an uncached insert (rare;
         // dirty pages are flushed at msync/munmap and the bit cleared).
-        if (pmm.frameRefCount(e.frame) == 1 and !e.dirty) {
-            pmm.releaseFrame(e.frame); // 1 -> 0: frame returns to the pool
+        if (pmm.frameRefCount(Phys.of(e.frame)) == 1 and !e.dirty) {
+            pmm.releaseFrame(Phys.of(e.frame)); // 1 -> 0: frame returns to the pool
             e.* = .{};
             set.hand = (idx + 1) % WAYS;
             stat_evictions += 1;

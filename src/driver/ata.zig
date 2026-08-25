@@ -83,10 +83,10 @@ pub fn initDMA() void {
     }
 
     // Allocate a page for PRDT (must be below 4GB, physically contiguous)
-    const prdt_page = pmm.allocContiguousBelow4G(1) orelse {
+    const prdt_page = (pmm.allocContiguousBelow4G(1) orelse {
         debug.klog("[ata/{s}] Failed to allocate PRDT page\n", .{tag});
         return;
-    };
+    }).raw();
     prdt_phys = @intCast(prdt_page);
     // Kernel access through the physmap; the device sees prdt_phys itself.
     prdt_ptr = @ptrFromInt(@import("../mm/paging.zig").physToVirt(prdt_page));

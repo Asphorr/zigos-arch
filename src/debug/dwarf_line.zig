@@ -27,6 +27,7 @@ const debug = @import("debug.zig");
 const heap = @import("../mm/heap.zig");
 const vfs = @import("../fs/vfs.zig");
 const paging = @import("../mm/paging.zig");
+const Phys = @import("../util/addr.zig").Phys;
 
 const LINE_MAGIC: u32 = 0x4C494E45; // "LINE"
 
@@ -70,7 +71,7 @@ pub fn init() void {
         // frame freeFrame loops stamp spurious canaries that read as fake
         // UAF later.
         const phys_base = paging.virtToPhys(@intFromPtr(fresh.buf)).?;
-        @import("../mm/pmm.zig").freeRange(phys_base, fresh.pages);
+        @import("../mm/pmm.zig").freeRange(Phys.of(phys_base), fresh.pages);
     }
 
     if (file_size < 12) {

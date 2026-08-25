@@ -51,6 +51,7 @@ const std = @import("std");
 const memmap = @import("memmap.zig");
 const pmm = @import("pmm.zig");
 const paging = @import("paging.zig");
+const Phys = @import("../util/addr.zig").Phys;
 const spinlock = @import("../proc/spinlock.zig");
 const SpinLock = spinlock.SpinLock;
 // Diagnostics:
@@ -1103,7 +1104,7 @@ pub fn kvmalloc(size: usize, alignment: usize) ?[*]u8 {
     const total = header_pad + size;
     const pages: u32 = @intCast((total + 4095) / 4096);
     const phys = pmm.allocContiguous(pages) orelse return null;
-    const virt_base = paging.physToVirt(phys);
+    const virt_base = phys.toVirt().raw();
     const hdr: *KvHeader = @ptrFromInt(virt_base);
     hdr.* = .{
         .magic = KV_MAGIC,
@@ -1139,5 +1140,5 @@ pub fn kvfree(ptr: [*]u8) void {
     const pages = hdr.pages;
     const hdr_mut: *KvHeader = @ptrFromInt(page_base);
     hdr_mut.magic = 0xDEADDEADDEADDEAD;
-    pmm.freeContiguous(paging.virtToPhys(page_base).?, pages);
+    pmm.freeContiguous(Phys.of(paging.virtToPhys(page_base).?), pages);
 }

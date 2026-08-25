@@ -14,8 +14,13 @@
 //! enums, so they are exactly u64-sized, carry no methods a stray
 //! arithmetic op could invoke implicitly, and cost nothing at runtime.
 //!
-//! Adoption is incremental (UserPtr precedent): `util/dma.zig` births
-//! typed driver memory; mm internals keep raw usize until touched.
+//! Adoption is chokepoint-first (UserPtr precedent): `util/dma.zig`
+//! births typed driver memory, and since 2026-08-25 the pmm public API
+//! (allocFrame/allocContiguous/freeFrame/acquireFrame/… and variants)
+//! speaks `Phys` — every frame's lifecycle starts and ends typed. pmm's
+//! INTERNALS (bitmap math, magazines, region freelists) stay raw usize
+//! behind that boundary, as do PTE integers and driver ring structs;
+//! `Phys.of` at those crossings is the audit marker, not a smell.
 
 const paging = @import("../mm/paging.zig");
 

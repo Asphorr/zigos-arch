@@ -285,7 +285,7 @@ pub fn sysGpuCreateGuestBlob(size: u32, out_resource_id_ptr: u32) u32 {
     // Zero the pages so callers don't observe stale heap garbage. The
     // pages are guest physical, mapped into kernel via physToVirt
     // (PHYSMAP_BASE + phys, kernel can reach any phys frame).
-    const kvirt: [*]u8 = @ptrFromInt(paging.physToVirt(phys_base));
+    const kvirt = phys_base.toVirt().ptr([*]u8);
     @memset(kvirt[0 .. num_pages * 4096], 0);
 
     const resource_id = virtio_gpu.alloc3DResourceId();
@@ -294,7 +294,7 @@ pub fn sysGpuCreateGuestBlob(size: u32, out_resource_id_ptr: u32) u32 {
         pcb.gpu_ctx_id,
         resource_id,
         0x03,
-        phys_base,
+        phys_base.raw(),
         @as(u64, size),
     )) {
         debug.klog("[gpu] createGuestBlob: resourceCreateGuestBlob FAILED\n", .{});
@@ -320,7 +320,7 @@ pub fn sysGpuCreateGuestBlob(size: u32, out_resource_id_ptr: u32) u32 {
     var mapped_pages: usize = 0;
     for (0..num_pages) |i| {
         const virt = base_virt + i * 0x1000;
-        const phys = phys_base + i * 0x1000;
+        const phys = phys_base.raw() + i * 0x1000;
         // PRESENT for clarity only — mapUserPage ORs it in regardless
         // (vmm.zig new_pte). Keeps this call site consistent with
         // sysGpuMapBlob's.

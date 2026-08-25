@@ -100,6 +100,45 @@ fn note(comptime phase: []const u8, comptime fmt: []const u8, args: anytype) voi
     serial.print("[pmmstress] " ++ phase ++ ": " ++ fmt ++ "\n", args);
 }
 
+// The stress harness lives on raw addresses — it compares, aligns, XORs and
+// prints them. These shims are its one audited crossing to the typed pmm
+// API (pmm speaks util/addr.Phys since the 2026-08 typing sweep).
+const Phys = @import("../util/addr.zig").Phys;
+
+inline fn allocFrameRaw() ?usize {
+    return (pmm.allocFrame() orelse return null).raw();
+}
+inline fn allocFrameBelow4GRaw() ?usize {
+    return (pmm.allocFrameBelow4G() orelse return null).raw();
+}
+inline fn allocFrameUserRaw() ?usize {
+    return (pmm.allocFrameUser() orelse return null).raw();
+}
+inline fn allocContigRaw(count: u32) ?usize {
+    return (pmm.allocContiguous(count) orelse return null).raw();
+}
+inline fn allocContigBelow4GRaw(count: u32) ?usize {
+    return (pmm.allocContiguousBelow4G(count) orelse return null).raw();
+}
+inline fn allocContigUserRaw(count: u32) ?usize {
+    return (pmm.allocContiguousUser(count) orelse return null).raw();
+}
+inline fn freeFrameRaw(p: usize) void {
+    pmm.freeFrame(Phys.of(p));
+}
+inline fn freeContigRaw(p: usize, count: u32) void {
+    pmm.freeContiguous(Phys.of(p), count);
+}
+inline fn acquireFrameRaw(p: usize) void {
+    pmm.acquireFrame(Phys.of(p));
+}
+inline fn releaseFrameRaw(p: usize) void {
+    pmm.releaseFrame(Phys.of(p));
+}
+inline fn frameRefCountRaw(p: usize) u8 {
+    return pmm.frameRefCount(Phys.of(p));
+}
+
 inline fn frameOf(phys: usize) u32 {
     return @intCast(phys / pmm.PUB_FRAME_SIZE);
 }
@@ -140,7 +179,7 @@ fn assertAllUnique(comptime phase: []const u8) void {
 fn freeAllTracked(comptime phase: []const u8) void {
     var i: u32 = 0;
     while (i < tracking_count) : (i += 1) {
-        pmm.freeFrame(tracking[i]);
+        freeFrameRaw(tracking[i]);
     }
     note(phase, "freed {d} tracked frames", .{tracking_count});
     tracking_count = 0;
@@ -164,7 +203,7 @@ fn phase1_singleChurn() void {
     tracking_count = 0;
     var i: u32 = 0;
     while (i < N) : (i += 1) {
-        const phys = pmm.allocFrame() orelse {
+        const phys = allocFrameRaw() orelse {
             alloc_failures += 1;
             continue;
         };
@@ -196,8 +235,13 @@ fn phase1_singleChurn() void {
     note("p1", "allocs={d} fails={d} cycles={d} free_before={d} after={d}", .{
         allocated, alloc_failures, t1 - t0, free_before, free_after,
     });
-    if (free_after < free_before - 16 or free_after > free_before + 16) {
-        // Magazine state may shift by CACHE_SIZE; bigger swing = leak.
+    // Slack = every CPU's magazine can park CACHE_SIZE frames, and slab
+    // caches grow/shrink under us (releaseSlabToPmm actually returns
+    // frames since the 2026-08-25 typing sweep fixed its VA-vs-phys free;
+    // the old ±16 was tuned against a kernel where those pages leaked and
+    // the count sat artificially flat). 2 × CACHE_SIZE covers both.
+    const p1_slack: u32 = 2 * pmm.CACHE_SIZE;
+    if (free_after < free_before - p1_slack or free_after > free_before + p1_slack) {
         fail("p1", "free-count drift {d} → {d} exceeds magazine slack", .{ free_before, free_after });
     } else {
         pass("p1", "single-frame churn clean ({d} allocs, {d} fails)", .{ allocated, alloc_failures });
@@ -220,7 +264,7 @@ fn phase2_sizedContiguous() void {
         var got: u32 = 0;
         var j: u32 = 0;
         while (j < blocks_per_size) : (j += 1) {
-            const base = pmm.allocContiguous(sz) orelse continue;
+            const base = allocContigRaw(sz) orelse continue;
             bases[got] = base;
             got += 1;
             // Stamp the FIRST and LAST frame with a magic pattern based on base+sz.
@@ -240,7 +284,7 @@ fn phase2_sizedContiguous() void {
         }
         // Free everything we got.
         j = 0;
-        while (j < got) : (j += 1) pmm.freeContiguous(bases[j], sz);
+        while (j < got) : (j += 1) freeContigRaw(bases[j], sz);
         if (got < blocks_per_size and sz <= 256) {
             note("p2", "size {d}: only got {d}/{d} blocks (low memory or fragmentation?)", .{ sz, got, blocks_per_size });
         }
@@ -265,7 +309,7 @@ fn phase3_crossRegion() void {
     const free_before = pmm.freeFrameCount();
 
     // 2048 frames = 8 MiB = 2 regions
-    if (pmm.allocContiguous(2048)) |base| {
+    if (allocContigRaw(2048)) |base| {
         if (regionOf(base) == regionOf(base + 2047 * pmm.PUB_FRAME_SIZE)) {
             note("p3", "8 MiB landed entirely in one region (unexpected w/ REGION_FRAMES=1024)", .{});
         } else {
@@ -277,15 +321,15 @@ fn phase3_crossRegion() void {
         if (readMagic(base) != 0xDEADC0DE or readMagic(base + 2047 * pmm.PUB_FRAME_SIZE) != 0xBEEFCAFE) {
             fail("p3", "8 MiB magic mismatch", .{});
         }
-        pmm.freeContiguous(base, 2048);
+        freeContigRaw(base, 2048);
     } else {
         note("p3", "8 MiB alloc returned null (low free, may be OK on 256 MB VM)", .{});
     }
 
     // 4096 frames = 16 MiB = 4 regions — likely to fail on tight VMs
-    if (pmm.allocContiguous(4096)) |base| {
+    if (allocContigRaw(4096)) |base| {
         note("p3", "16 MiB spans regions {d}..{d}", .{ regionOf(base), regionOf(base + 4095 * pmm.PUB_FRAME_SIZE) });
-        pmm.freeContiguous(base, 4096);
+        freeContigRaw(base, 4096);
     } else {
         note("p3", "16 MiB alloc returned null (expected if free contiguous is tight)", .{});
     }
@@ -311,7 +355,7 @@ fn phase4_fragmentationCoalesce() void {
     tracking_count = 0;
     var i: u32 = 0;
     while (i < N) : (i += 1) {
-        const phys = pmm.allocFrame() orelse break;
+        const phys = allocFrameRaw() orelse break;
         tracking[tracking_count] = phys;
         tracking_count += 1;
     }
@@ -321,15 +365,15 @@ fn phase4_fragmentationCoalesce() void {
     var freed_even: u32 = 0;
     i = 0;
     while (i < tracking_count) : (i += 2) {
-        pmm.freeFrame(tracking[i]);
+        freeFrameRaw(tracking[i]);
         freed_even += 1;
     }
 
     // Try to alloc 16 contiguous — odds are it succeeds somewhere outside the
     // fragmented region, OR fails if local regions are checkerboarded.
-    if (pmm.allocContiguous(16)) |base| {
+    if (allocContigRaw(16)) |base| {
         note("p4", "post-fragment 16-frame alloc OK at 0x{X}", .{base});
-        pmm.freeContiguous(base, 16);
+        freeContigRaw(base, 16);
     } else {
         note("p4", "post-fragment 16-frame alloc returned null (heavy fragmentation)", .{});
     }
@@ -337,13 +381,13 @@ fn phase4_fragmentationCoalesce() void {
     // Free ODD indices — should fully heal the fragmentation, coalescing
     // adjacent freed frames into big runs.
     i = 1;
-    while (i < tracking_count) : (i += 2) pmm.freeFrame(tracking[i]);
+    while (i < tracking_count) : (i += 2) freeFrameRaw(tracking[i]);
     tracking_count = 0;
 
     // After full heal, 1024-frame alloc should succeed (we just freed enough).
-    if (pmm.allocContiguous(1024)) |base| {
+    if (allocContigRaw(1024)) |base| {
         note("p4", "post-heal 1024-frame alloc OK at 0x{X} (coalesce worked)", .{base});
-        pmm.freeContiguous(base, 1024);
+        freeContigRaw(base, 1024);
         pass("p4", "fragmentation + heal cycle clean", .{});
     } else {
         // May be impossible if existing system load uses the same regions —
@@ -379,16 +423,16 @@ fn phase5_runPoolExhaustion() void {
         tracking_count = 0;
         var i: u32 = 0;
         while (i < TRACK_MAX) : (i += 1) {
-            const phys = pmm.allocFrame() orelse break;
+            const phys = allocFrameRaw() orelse break;
             tracking[tracking_count] = phys;
             tracking_count += 1;
         }
         // Free every other; the rest get freed at end-of-round.
         i = 0;
-        while (i < tracking_count) : (i += 2) pmm.freeFrame(tracking[i]);
+        while (i < tracking_count) : (i += 2) freeFrameRaw(tracking[i]);
         // Now free the odd indices too — should heal everything.
         i = 1;
-        while (i < tracking_count) : (i += 2) pmm.freeFrame(tracking[i]);
+        while (i < tracking_count) : (i += 2) freeFrameRaw(tracking[i]);
         tracking_count = 0;
         rounds_done += 1;
     }
@@ -403,8 +447,8 @@ fn phase5_runPoolExhaustion() void {
     // exhaustion >0, we've proven graceful degradation. Both outcomes pass.
     if (exhaust_after > exhaust_before) {
         // Subsequent allocs must still succeed even with pool exhausted.
-        if (pmm.allocFrame()) |p| {
-            pmm.freeFrame(p);
+        if (allocFrameRaw()) |p| {
+            freeFrameRaw(p);
             pass("p5", "exhaustion drove +{d}, post-exhaust alloc OK", .{exhaust_after - exhaust_before});
         } else {
             fail("p5", "post-exhaustion allocFrame returned null", .{});
@@ -424,19 +468,19 @@ fn phase6_coalesceVerification() void {
 
     // Use a large pre-alloc to "settle" memory, then do the experiment in
     // its hole. This makes the freelist for the test region predictable.
-    const settle = pmm.allocContiguous(2048) orelse {
+    const settle = allocContigRaw(2048) orelse {
         note("p6", "skip — couldn't get 2048-frame settle buffer", .{});
         return;
     };
 
-    const a = pmm.allocContiguous(32) orelse {
-        pmm.freeContiguous(settle, 2048);
+    const a = allocContigRaw(32) orelse {
+        freeContigRaw(settle, 2048);
         note("p6", "skip — couldn't get block A", .{});
         return;
     };
-    const b = pmm.allocContiguous(32) orelse {
-        pmm.freeContiguous(a, 32);
-        pmm.freeContiguous(settle, 2048);
+    const b = allocContigRaw(32) orelse {
+        freeContigRaw(a, 32);
+        freeContigRaw(settle, 2048);
         note("p6", "skip — couldn't get block B", .{});
         return;
     };
@@ -444,13 +488,13 @@ fn phase6_coalesceVerification() void {
     note("p6", "A=0x{X} (region {d}), B=0x{X} (region {d})", .{ a, regionOf(a), b, regionOf(b) });
 
     // Free both blocks.
-    pmm.freeContiguous(a, 32);
-    pmm.freeContiguous(b, 32);
+    freeContigRaw(a, 32);
+    freeContigRaw(b, 32);
 
     // Try alloc 64 — if coalescing worked AND A and B were adjacent in the
     // SAME region, we'd get one combined run back. With per-CPU affinity +
     // first-fit, A and B were almost certainly adjacent.
-    if (pmm.allocContiguous(64)) |c| {
+    if (allocContigRaw(64)) |c| {
         const adjacent = (b == a + 32 * pmm.PUB_FRAME_SIZE) or (a == b + 32 * pmm.PUB_FRAME_SIZE);
         const lower = if (a < b) a else b;
         if (adjacent and c == lower) {
@@ -462,12 +506,12 @@ fn phase6_coalesceVerification() void {
             note("p6", "A and B not adjacent — coalesce test moot", .{});
             pass("p6", "blocks not adjacent (system noise); realloc succeeded", .{});
         }
-        pmm.freeContiguous(c, 64);
+        freeContigRaw(c, 64);
     } else {
         fail("p6", "post-free 64-frame alloc returned null", .{});
     }
 
-    pmm.freeContiguous(settle, 2048);
+    freeContigRaw(settle, 2048);
 }
 
 // ===========================================================================
@@ -486,16 +530,16 @@ fn phase7_uafCanary() void {
     var detected: u32 = 0;
     var trials: u32 = 0;
     while (trials < 4) : (trials += 1) {
-        const x = pmm.allocFrame() orelse {
+        const x = allocFrameRaw() orelse {
             note("p7", "allocFrame returned null, abort trial", .{});
             break;
         };
-        pmm.freeFrame(x); // canary written
+        freeFrameRaw(x); // canary written
         // Corrupt the canary by writing garbage to first 16 bytes.
         const dst: *[2]u64 = @ptrFromInt(paging.physToVirt(x));
         dst[0] = 0xDEADDEADDEADDEAD;
         dst[1] = 0xFEEDFEEDFEEDFEED;
-        const y = pmm.allocFrame() orelse {
+        const y = allocFrameRaw() orelse {
             note("p7", "post-corrupt allocFrame returned null", .{});
             continue;
         };
@@ -505,7 +549,7 @@ fn phase7_uafCanary() void {
                 detected += 1;
             }
         }
-        pmm.freeFrame(y);
+        freeFrameRaw(y);
     }
 
     const after = pmm.pmmCanaryMismatches();
@@ -530,19 +574,19 @@ fn phase8_below4G() void {
     var bad: u32 = 0;
     var addrs: [16]usize = undefined;
     while (i < 16) : (i += 1) {
-        const p = pmm.allocFrameBelow4G() orelse break;
+        const p = allocFrameBelow4GRaw() orelse break;
         addrs[got] = p;
         if (p >= max4g) bad += 1;
         got += 1;
     }
     i = 0;
-    while (i < got) : (i += 1) pmm.freeFrame(addrs[i]);
+    while (i < got) : (i += 1) freeFrameRaw(addrs[i]);
 
-    if (pmm.allocContiguousBelow4G(16)) |base| {
+    if (allocContigBelow4GRaw(16)) |base| {
         if (base + 15 * pmm.PUB_FRAME_SIZE >= max4g) {
             bad += 1;
         }
-        pmm.freeContiguous(base, 16);
+        freeContigRaw(base, 16);
     } else {
         note("p8", "16-contig-below-4G alloc returned null", .{});
     }
@@ -568,8 +612,8 @@ fn phase9_userReserve() void {
         fail("p9", "free ({d}) too close to reserve ({d}) to test cleanly", .{ free, reserve });
         return;
     }
-    if (pmm.allocFrameUser()) |p| {
-        pmm.freeFrame(p);
+    if (allocFrameUserRaw()) |p| {
+        freeFrameRaw(p);
         pass("p9", "allocFrameUser served when free > reserve", .{});
     } else {
         fail("p9", "allocFrameUser unexpectedly null", .{});
@@ -579,11 +623,11 @@ fn phase9_userReserve() void {
     // below the reserve. Should refuse.
     const huge: u32 = if (free > reserve) free - reserve else 0;
     if (huge > 0 and huge < 8192) {
-        const p = pmm.allocContiguousUser(huge);
+        const p = allocContigUserRaw(huge);
         if (p) |base| {
             // Some headroom may still exist; not a hard failure, just note.
             note("p9", "huge user-contig alloc of {d} unexpectedly succeeded (returned 0x{X}, freeing)", .{ huge, base });
-            pmm.freeContiguous(base, huge);
+            freeContigRaw(base, huge);
         } else {
             note("p9", "huge user-contig refused (good)", .{});
         }
@@ -605,7 +649,7 @@ fn phase10_magazineDrain() void {
         tracking_count = 0;
         var i: u32 = 0;
         while (i < 64) : (i += 1) {
-            const p = pmm.allocFrame() orelse break;
+            const p = allocFrameRaw() orelse break;
             tracking[tracking_count] = p;
             tracking_count += 1;
         }
@@ -613,7 +657,7 @@ fn phase10_magazineDrain() void {
         var j: u32 = tracking_count;
         while (j > 0) {
             j -= 1;
-            pmm.freeFrame(tracking[j]);
+            freeFrameRaw(tracking[j]);
         }
         tracking_count = 0;
     }
@@ -633,23 +677,23 @@ fn phase10_magazineDrain() void {
 
 fn phase11_refcountChurn() void {
     note("p11", "acquireFrame 100× then releaseFrame 100×, validate final free", .{});
-    const x = pmm.allocFrame() orelse {
+    const x = allocFrameRaw() orelse {
         fail("p11", "initial alloc failed", .{});
         return;
     };
     var i: u32 = 0;
-    while (i < 100) : (i += 1) pmm.acquireFrame(x);
-    if (pmm.frameRefCount(x) != 101) {
-        fail("p11", "expected refcount 101 after acquires, got {d}", .{pmm.frameRefCount(x)});
+    while (i < 100) : (i += 1) acquireFrameRaw(x);
+    if (frameRefCountRaw(x) != 101) {
+        fail("p11", "expected refcount 101 after acquires, got {d}", .{frameRefCountRaw(x)});
     }
     i = 0;
-    while (i < 100) : (i += 1) pmm.releaseFrame(x);
-    if (pmm.frameRefCount(x) != 1) {
-        fail("p11", "expected refcount 1 after releases, got {d}", .{pmm.frameRefCount(x)});
+    while (i < 100) : (i += 1) releaseFrameRaw(x);
+    if (frameRefCountRaw(x) != 1) {
+        fail("p11", "expected refcount 1 after releases, got {d}", .{frameRefCountRaw(x)});
     }
-    pmm.freeFrame(x); // refcount → 0, actually freed
-    if (pmm.frameRefCount(x) != 0) {
-        fail("p11", "expected refcount 0 after final free, got {d}", .{pmm.frameRefCount(x)});
+    freeFrameRaw(x); // refcount → 0, actually freed
+    if (frameRefCountRaw(x) != 0) {
+        fail("p11", "expected refcount 0 after final free, got {d}", .{frameRefCountRaw(x)});
         return;
     }
     pass("p11", "refcount cycle clean (1 → 101 → 1 → 0)", .{});
@@ -663,18 +707,18 @@ fn phase12_edgeCases() void {
     note("p12", "0-count alloc, bad-addr free, allocFrame after huge drain", .{});
 
     // (a) allocContiguous(0) → null
-    if (pmm.allocContiguous(0) != null) {
+    if (allocContigRaw(0) != null) {
         fail("p12", "allocContiguous(0) should return null", .{});
     }
 
     // (b) freeFrame on garbage addr should NOT panic — just log + return.
-    pmm.freeFrame(0xFFFFFFFFFFFFF000); // way past MAX_FRAMES * FRAME_SIZE
+    freeFrameRaw(0xFFFFFFFFFFFFF000); // way past MAX_FRAMES * FRAME_SIZE
     note("p12", "freeFrame on garbage addr survived (warning expected in log)", .{});
 
     // (c) allocContiguous(REGION_FRAMES+1) — definitely cross-region
-    if (pmm.allocContiguous(pmm.PUB_REGION_FRAMES + 1)) |base| {
+    if (allocContigRaw(pmm.PUB_REGION_FRAMES + 1)) |base| {
         note("p12", "alloc REGION_FRAMES+1 succeeded at 0x{X}", .{base});
-        pmm.freeContiguous(base, pmm.PUB_REGION_FRAMES + 1);
+        freeContigRaw(base, pmm.PUB_REGION_FRAMES + 1);
     } else {
         note("p12", "alloc REGION_FRAMES+1 null (heavy fragmentation)", .{});
     }
@@ -703,22 +747,22 @@ fn smpWorkerEntry() callconv(.c) noreturn {
                 // Pattern A: single-frame churn
                 var n: u32 = 0;
                 while (n < 256) : (n += 1) {
-                    const p = pmm.allocFrame() orelse break;
+                    const p = allocFrameRaw() orelse break;
                     local_addrs[n] = p;
                 }
                 var j: u32 = n;
                 while (j > 0) {
                     j -= 1;
-                    pmm.freeFrame(local_addrs[j]);
+                    freeFrameRaw(local_addrs[j]);
                 }
             },
             1 => {
                 // Pattern B: contig of random small size
                 const sz = 1 + rngU32Range(64);
-                if (pmm.allocContiguous(sz)) |base| {
+                if (allocContigRaw(sz)) |base| {
                     writeMagic(base, base ^ @as(u64, sz));
                     if (readMagic(base) != base ^ @as(u64, sz)) local_anomalies += 1;
-                    pmm.freeContiguous(base, sz);
+                    freeContigRaw(base, sz);
                 }
             },
             2 => {
@@ -726,19 +770,19 @@ fn smpWorkerEntry() callconv(.c) noreturn {
                 var n: u32 = 0;
                 const target: u32 = 32 + rngU32Range(96);
                 while (n < target and n < 256) : (n += 1) {
-                    const p = pmm.allocFrame() orelse break;
+                    const p = allocFrameRaw() orelse break;
                     local_addrs[n] = p;
                 }
                 var j: u32 = 0;
-                while (j < n) : (j += 1) pmm.freeFrame(local_addrs[j]);
+                while (j < n) : (j += 1) freeFrameRaw(local_addrs[j]);
             },
             3 => {
                 // Pattern D: acquire/release churn
-                if (pmm.allocFrame()) |p| {
+                if (allocFrameRaw()) |p| {
                     var k: u32 = 0;
-                    while (k < 8) : (k += 1) pmm.acquireFrame(p);
-                    while (k > 0) : (k -= 1) pmm.releaseFrame(p);
-                    pmm.freeFrame(p);
+                    while (k < 8) : (k += 1) acquireFrameRaw(p);
+                    while (k > 0) : (k -= 1) releaseFrameRaw(p);
+                    freeFrameRaw(p);
                 }
             },
             else => unreachable,
@@ -792,37 +836,37 @@ fn phase13_smpConcurrent() void {
             0 => {
                 var n: u32 = 0;
                 while (n < 256) : (n += 1) {
-                    const p = pmm.allocFrame() orelse break;
+                    const p = allocFrameRaw() orelse break;
                     local_addrs[n] = p;
                 }
                 var j: u32 = n;
                 while (j > 0) {
                     j -= 1;
-                    pmm.freeFrame(local_addrs[j]);
+                    freeFrameRaw(local_addrs[j]);
                 }
             },
             1 => {
                 const sz = 1 + rngU32Range(64);
-                if (pmm.allocContiguous(sz)) |base| {
-                    pmm.freeContiguous(base, sz);
+                if (allocContigRaw(sz)) |base| {
+                    freeContigRaw(base, sz);
                 }
             },
             2 => {
                 var n: u32 = 0;
                 const target: u32 = 32 + rngU32Range(96);
                 while (n < target and n < 256) : (n += 1) {
-                    const p = pmm.allocFrame() orelse break;
+                    const p = allocFrameRaw() orelse break;
                     local_addrs[n] = p;
                 }
                 var j: u32 = 0;
-                while (j < n) : (j += 1) pmm.freeFrame(local_addrs[j]);
+                while (j < n) : (j += 1) freeFrameRaw(local_addrs[j]);
             },
             3 => {
-                if (pmm.allocFrame()) |p| {
+                if (allocFrameRaw()) |p| {
                     var k: u32 = 0;
-                    while (k < 8) : (k += 1) pmm.acquireFrame(p);
-                    while (k > 0) : (k -= 1) pmm.releaseFrame(p);
-                    pmm.freeFrame(p);
+                    while (k < 8) : (k += 1) acquireFrameRaw(p);
+                    while (k > 0) : (k -= 1) releaseFrameRaw(p);
+                    freeFrameRaw(p);
                 }
             },
             else => unreachable,
@@ -876,38 +920,44 @@ fn phase14_mixedLongRun() void {
     const t0 = perf.rdtsc();
     const budget: u64 = 10_000_000_000; // ~5s on 2 GHz
     var iters: u64 = 0;
+    var leaked: u64 = 0;
     var local_addrs: [128]usize = undefined;
 
     while (perf.rdtsc() - t0 < budget) {
         switch (rngU32Range(6)) {
-            0 => { _ = pmm.allocFrame() orelse {}; }, // 0..N leaks then later phases free
+            // Deliberate leak — COUNTED, so the drift check below can
+            // subtract it. (The old fixed ±100 slop failed as soon as the
+            // host ran the loop past ~600 iters/5s: ~iters/6 leaks always
+            // outgrow a constant. Pre-existing calibration bug, surfaced
+            // 2026-08-25 on both baseline and typed-pmm kernels.)
+            0 => { if (allocFrameRaw()) |_| leaked += 1; },
             1 => {
-                if (pmm.allocFrame()) |p| pmm.freeFrame(p);
+                if (allocFrameRaw()) |p| freeFrameRaw(p);
             },
             2 => {
                 const sz = 1 + rngU32Range(32);
-                if (pmm.allocContiguous(sz)) |base| pmm.freeContiguous(base, sz);
+                if (allocContigRaw(sz)) |base| freeContigRaw(base, sz);
             },
             3 => {
                 // Heavy contiguous
                 const sz = 100 + rngU32Range(900);
-                if (pmm.allocContiguous(sz)) |base| pmm.freeContiguous(base, sz);
+                if (allocContigRaw(sz)) |base| freeContigRaw(base, sz);
             },
             4 => {
                 // Below-4G
-                if (pmm.allocFrameBelow4G()) |p| pmm.freeFrame(p);
+                if (allocFrameBelow4GRaw()) |p| freeFrameRaw(p);
             },
             5 => {
                 // Batch alloc + reverse free
                 var n: u32 = 0;
                 while (n < 64) : (n += 1) {
-                    const p = pmm.allocFrame() orelse break;
+                    const p = allocFrameRaw() orelse break;
                     local_addrs[n] = p;
                 }
                 var j: u32 = n;
                 while (j > 0) {
                     j -= 1;
-                    pmm.freeFrame(local_addrs[j]);
+                    freeFrameRaw(local_addrs[j]);
                 }
             },
             else => unreachable,
@@ -917,14 +967,17 @@ fn phase14_mixedLongRun() void {
 
     const free_after = pmm.freeFrameCount();
     const exhaust_after = pmm.pmmRunPoolExhaustions();
-    note("p14", "iters={d}, exhaust Δ={d}, free {d} → {d}", .{
-        iters, exhaust_after - exhaust_before, free_before, free_after,
+    note("p14", "iters={d}, leaked={d} (deliberate), exhaust Δ={d}, free {d} → {d}", .{
+        iters, leaked, exhaust_after - exhaust_before, free_before, free_after,
     });
-    // 100-frame slop tolerated: random pattern 0 deliberately leaks.
-    if (free_after < free_before - 100 or free_after > free_before + 100) {
-        fail("p14", "leak drift: free {d} → {d}", .{ free_before, free_after });
+    // Drift must equal the counted deliberate leaks, give or take the
+    // magazine/slab slack (same rationale as p1's p1_slack).
+    const drift: i64 = @as(i64, @intCast(free_before)) - @as(i64, @intCast(free_after));
+    const slack: i64 = 2 * pmm.CACHE_SIZE;
+    if (drift > @as(i64, @intCast(leaked)) + slack or drift < @as(i64, @intCast(leaked)) - slack) {
+        fail("p14", "leak drift {d} != deliberate {d} (±{d}): free {d} → {d}", .{ drift, leaked, slack, free_before, free_after });
     } else {
-        pass("p14", "mixed long run survived {d} iterations", .{iters});
+        pass("p14", "mixed long run survived {d} iterations (drift {d} ≈ deliberate {d})", .{ iters, drift, leaked });
     }
 }
 

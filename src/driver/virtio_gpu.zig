@@ -1,6 +1,7 @@
 const io = @import("../io.zig");
 const pci = @import("pci.zig");
 const pmm = @import("../mm/pmm.zig");
+const Phys = @import("../util/addr.zig").Phys;
 const paging = @import("../mm/paging.zig");
 const debug = @import("../debug/debug.zig");
 const idt = @import("../cpu/idt.zig");
@@ -1972,14 +1973,14 @@ fn ensureStaging() void {
     if (staging_phys != 0) {
         staging_active = false;
         iommu.dmaUnmap(pci_bus, pci_dev, pci_func, staging_phys, @as(usize, staging_pages) * 4096);
-        pmm.freeContiguous(staging_phys, staging_pages);
+        pmm.freeContiguous(Phys.of(staging_phys), staging_pages);
         staging_phys = 0;
         staging_pages = 0;
     }
-    const phys = pmm.allocContiguous(fb_num_pages) orelse {
+    const phys = (pmm.allocContiguous(fb_num_pages) orelse {
         debug.klog("[virtio-gpu] staging alloc failed ({d} pages) — live-FB backing, 2D async flush disabled\n", .{fb_num_pages});
         return;
-    };
+    }).raw();
     staging_phys = phys;
     staging_pages = fb_num_pages;
     staging_virt = @ptrFromInt(paging.physToVirt(phys));
@@ -2213,8 +2214,8 @@ pub fn init(xres: u32, yres: u32) bool {
     _ = iommu.dmaMap(pci_bus, pci_dev, pci_func, ctrl_vq.used_phys, 4096, .{});
 
     // Allocate command buffer (4 contiguous pages for large scatter-gather lists)
-    cmd_phys = pmm.allocContiguous(CMD_PAGES) orelse return false;
-    resp_phys = pmm.allocFrame() orelse return false;
+    cmd_phys = (pmm.allocContiguous(CMD_PAGES) orelse return false).raw();
+    resp_phys = (pmm.allocFrame() orelse return false).raw();
     _ = iommu.dmaMap(pci_bus, pci_dev, pci_func, cmd_phys, CMD_PAGES * 4096, .{});
     _ = iommu.dmaMap(pci_bus, pci_dev, pci_func, resp_phys, 4096, .{});
 
@@ -3073,12 +3074,12 @@ pub fn initCursor() bool {
     _ = iommu.dmaMap(pci_bus, pci_dev, pci_func, cursor_vq.used_phys, 4096, .{});
 
     // Allocate cursor command page
-    cursor_cmd_phys = pmm.allocFrame() orelse return false;
+    cursor_cmd_phys = (pmm.allocFrame() orelse return false).raw();
     @memset(@as([*]u8, @ptrFromInt(paging.physToVirt(cursor_cmd_phys)))[0..4096], 0);
     _ = iommu.dmaMap(pci_bus, pci_dev, pci_func, cursor_cmd_phys, 4096, .{});
 
     // Allocate cursor image: 64x64 RGBA = 16384 bytes = 4 contiguous pages
-    const cursor_img_phys = pmm.allocContiguous(4) orelse return false;
+    const cursor_img_phys = (pmm.allocContiguous(4) orelse return false).raw();
     _ = iommu.dmaMap(pci_bus, pci_dev, pci_func, cursor_img_phys, 4 * 4096, .{});
 
     // Zero and draw cursor into the 64x64 RGBA buffer

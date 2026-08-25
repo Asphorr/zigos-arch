@@ -25,6 +25,7 @@ const smp = @import("../cpu/smp.zig");
 const process = @import("../proc/process.zig");
 const spinlock = @import("../proc/spinlock.zig");
 const SpinLock = spinlock.SpinLock;
+const Phys = @import("../util/addr.zig").Phys;
 
 // The swap device is the 3rd NVMe controller (0 = tarfs, 1 = ext2, 2 = swap).
 const SWAP_CTRL_IDX: usize = 2;
@@ -201,7 +202,7 @@ fn selfTest() void {
     defer pmm.freeFrame(dst);
 
     // Fill src with a recognizable, position-dependent pattern.
-    const src_bytes: [*]u8 = @ptrFromInt(paging.physToVirt(src));
+    const src_bytes = src.toVirt().ptr([*]u8);
     var i: usize = 0;
     while (i < PAGE_SIZE) : (i += 1) src_bytes[i] = @truncate(i *% 31 +% 7);
 
@@ -212,10 +213,10 @@ fn selfTest() void {
     defer freeSlot(slot);
 
     // Poison dst so a no-op read can't accidentally "pass".
-    const dst_bytes: [*]u8 = @ptrFromInt(paging.physToVirt(dst));
+    const dst_bytes = dst.toVirt().ptr([*]u8);
     @memset(dst_bytes[0..PAGE_SIZE], 0xA5);
 
-    if (!writePage(slot, src) or !readPage(slot, dst)) {
+    if (!writePage(slot, src.raw()) or !readPage(slot, dst.raw())) {
         debug.klog("[swap] self-test FAILED — NVMe I/O error on slot {d}\n", .{slot});
         return;
     }
@@ -337,7 +338,7 @@ pub fn teardownNonPresent(pte_ptr: *u64) bool {
         if (pteIsSwapped(cur)) {
             freeSlot(pteSlot(cur));
         } else { // pteIsInflight
-            pmm.freeFrame(inflightFrame(cur));
+            pmm.freeFrame(Phys.of(inflightFrame(cur)));
         }
         return true;
     }
@@ -401,7 +402,7 @@ pub fn evictFrame(pte_ptr: *u64, va: usize, pcid: u16) bool {
     // the compositor keeps using the physical frame; swap-in would then hand
     // the app a fresh frame with stale contents -> silent FB corruption. Same
     // refcount==1 predicate the COW handler trusts. (zig-osdev-reviewer catch.)
-    if (pmm.frameRefCount(frame) != 1) return false;
+    if (pmm.frameRefCount(Phys.of(frame)) != 1) return false;
     const slot = allocSlot() orelse {
         if (etrace) debug.klog("[mtswap-trace] pid={d} cpu{d} evict_no_slot va=0x{X}\n", .{ evict_pid, ecpu, va });
         return false;
@@ -503,7 +504,7 @@ pub fn evictFrame(pte_ptr: *u64, va: usize, pcid: u16) bool {
     // Frame is no longer referenced by any PTE; release it. No shootdown
     // needed here — phase 1's shootdown already cleared the present mapping,
     // and the in-flight→SWAPPED transition keeps PRESENT=0.
-    pmm.freeFrame(frame);
+    pmm.freeFrame(Phys.of(frame));
     wakeSwapEvictWaiters(evictWaitTarget(pte_ptr));
     if (etrace) debug.klog("[mtswap-trace] pid={d} cpu{d} evict_done slot={d}\n", .{ evict_pid, ecpu, slot });
     const out = @atomicRmw(u64, &pages_out, .Add, 1, .monotonic) + 1;
@@ -554,7 +555,7 @@ pub fn discardFrame(pte_ptr: *u64, va: usize, pcid: u16) bool {
     // the PTE and makes the CAS below fail.
     if ((original & paging.DIRTY) != 0) return false;
     const frame = original & paging.PAGE_MASK;
-    if (pmm.frameRefCount(frame) != 1) return false;
+    if (pmm.frameRefCount(Phys.of(frame)) != 1) return false;
     // CAS to 0 so a concurrent evictor / teardown of the same VA can't both
     // try to free the frame. Loser of the race returns false without touching
     // anything. PTE = 0 returns the slot to the "never-faulted" state;
@@ -563,7 +564,7 @@ pub fn discardFrame(pte_ptr: *u64, va: usize, pcid: u16) bool {
         return false;
     }
     tlb.shootdownPage(pcid, va);
-    pmm.freeFrame(frame);
+    pmm.freeFrame(Phys.of(frame));
     const dc = @atomicRmw(u64, &pages_discarded, .Add, 1, .monotonic) + 1;
     if (dc == 1 or dc % 4096 == 0)
         debug.klog("[swap] out={d} in={d} sc={d} dc={d} slots={d}/{d}\n", .{
@@ -620,11 +621,11 @@ pub fn swapInFrame(pte_ptr: *u64, va: usize, flags: u64, pcid: u16) bool {
     // PTE still reads SWAPPED, so a teardown frees the slot and would walk
     // straight past the frame. Same channel discipline as the evict path's
     // swap_inflight_slot — see evictFrame's ownership note.
-    process.setInflightFrame(frame);
+    process.setInflightFrame(frame.raw());
     if (cur_pid >= 4) debug.klog("[mtswap-trace] pid={d} cpu{d} swapIn readPage frame=0x{X}...\n", .{
-        cur_pid, smp.myCpu().cpu_id, frame,
+        cur_pid, smp.myCpu().cpu_id, frame.raw(),
     });
-    if (!readPage(slot, frame)) {
+    if (!readPage(slot, frame.raw())) {
         const pin_rf = spinlock.pinPreemption();
         process.clearInflightFrame();
         pmm.freeFrame(frame);
@@ -640,7 +641,7 @@ pub fn swapInFrame(pte_ptr: *u64, va: usize, flags: u64, pcid: u16) bool {
     // CAS so two threads racing to swap-in the same VA don't both install
     // PTEs / free the slot. The loser frees its freshly-read frame; the
     // slot was already freed by whoever moved the PTE on.
-    const new_pte = (frame & paging.PAGE_MASK) | flags | paging.PRESENT;
+    const new_pte = (frame.raw() & paging.PAGE_MASK) | flags | paging.PRESENT;
     // Hand the frame from the PCB channel to the PTE, clearing first and
     // pinning across the handoff — exactly the phase-3 ordering rule, and for
     // the same reason: while both name the frame, a kill frees it twice

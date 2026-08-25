@@ -1,4 +1,5 @@
 const std = @import("std");
+const Phys = @import("../util/addr.zig").Phys;
 const gfx = @import("gfx.zig");
 const bga = @import("bga.zig");
 const display = @import("display.zig");
@@ -815,7 +816,7 @@ fn growGuiFb(idx: u8, need_w: u32, need_h: u32) bool {
         debug.klog("[maximize] growGuiFb pid={d}: allocContiguous({d} pages) failed; staying {d}x{d}\n", .{ pid, new_pages, w.gui_alloc_w, w.gui_alloc_h });
         return false;
     };
-    const new_kv: [*]volatile u32 = @ptrFromInt(paging.physToVirt(new_phys));
+    const new_kv = new_phys.toVirt().ptr([*]volatile u32);
     @memset(@as([*]volatile u8, @ptrCast(new_kv))[0 .. new_pages * 4096], 0);
 
     const pd: [*]align(4096) u64 = @ptrFromInt(paging.physToVirt(process.procs[pid].page_dir_phys));
@@ -826,17 +827,17 @@ fn growGuiFb(idx: u8, need_w: u32, need_h: u32) bool {
     // page-table page. On failure the live [0,old_pages) mapping is untouched.
     var i: u32 = old_pages;
     while (i < new_pages) : (i += 1) {
-        vmm.mapUserPage(pd, base + i * 4096, new_phys + i * 4096, map_flags) catch {
+        vmm.mapUserPage(pd, base + i * 4096, new_phys.raw() + i * 4096, map_flags) catch {
             var j: u32 = old_pages;
             while (j < i) : (j += 1) {
                 _ = vmm.unmapUserPage(pd, base + j * 4096);
-                pmm.releaseFrame(new_phys + j * 4096);
+                pmm.releaseFrame(new_phys.add(j * 4096));
             }
             pmm.freeContiguous(new_phys, new_pages);
             debug.klog("[maximize] growGuiFb pid={d}: PT OOM at growth page {d}; aborted\n", .{ pid, i });
             return false;
         };
-        pmm.acquireFrame(new_phys + i * 4096);
+        pmm.acquireFrame(new_phys.add(i * 4096));
     }
     // Repoint the existing [0,old_pages) mapping. mapUserPage refuses to
     // overwrite a PTE that points at a different phys (vmm gap #2 →
@@ -852,11 +853,11 @@ fn growGuiFb(idx: u8, need_w: u32, need_h: u32) bool {
     i = 0;
     while (i < old_pages) : (i += 1) {
         _ = vmm.unmapUserPage(pd, base + i * 4096);
-        vmm.mapUserPage(pd, base + i * 4096, new_phys + i * 4096, map_flags) catch |e| {
+        vmm.mapUserPage(pd, base + i * 4096, new_phys.raw() + i * 4096, map_flags) catch |e| {
             debug.klog("[maximize] growGuiFb pid={d}: in-place remap page {d} failed: {s}\n", .{ pid, i, @errorName(e) });
             @panic("growGuiFb in-place remap (PT page should already exist)");
         };
-        pmm.acquireFrame(new_phys + i * 4096);
+        pmm.acquireFrame(new_phys.add(i * 4096));
     }
     // Old frames are now unreachable from the app once its TLB is flushed.
     @import("../cpu/mmu/tlb.zig").shootdownAll(process.procs[pid].pcid);
@@ -900,7 +901,7 @@ fn growGuiFb(idx: u8, need_w: u32, need_h: u32) bool {
         w.gui_w = need_w;
         w.gui_h = need_h;
         w.gui_fb_pub.store(0, .release);
-        paging.registerGuiFB(pid, new_phys);
+        paging.registerGuiFB(pid, new_phys.raw());
         w.gui_fb = new_kv;
     }
 
@@ -913,13 +914,13 @@ fn growGuiFb(idx: u8, need_w: u32, need_h: u32) bool {
     // OLD-state values via gui_fb_phys_base/gui_alloc still being OLD).
     i = 0;
     while (i < old_pages) : (i += 1) {
-        pmm.releaseFrame(old_phys + i * 4096);
-        pmm.releaseFrame(old_phys + i * 4096);
+        pmm.releaseFrame(Phys.of(old_phys + i * 4096));
+        pmm.releaseFrame(Phys.of(old_phys + i * 4096));
     }
     {
         var s: u8 = 0;
         while (s < 3) : (s += 1) {
-            if (old_back_phys[s] != 0) pmm.freeContiguous(old_back_phys[s], old_pages);
+            if (old_back_phys[s] != 0) pmm.freeContiguous(Phys.of(old_back_phys[s]), old_pages);
         }
     }
     debug.klog("[maximize] grew pid={d} FB -> {d}x{d} ({d} pages, was {d} pages)\n", .{ pid, new_alloc_w, new_alloc_h, new_pages, old_pages });
@@ -3970,11 +3971,11 @@ pub fn snapshotGuiFb(pid: u8) void {
             if (w.gui_fb_backs[next] == null) {
                 const num_pages: u32 = @intCast((@as(usize, n) * 4 + 4095) / 4096);
                 if (pmm.allocContiguous(num_pages)) |back_phys| {
-                    const back_kv: [*]volatile u32 = @ptrFromInt(paging.physToVirt(back_phys));
+                    const back_kv = back_phys.toVirt().ptr([*]volatile u32);
                     const back_u8: [*]volatile u8 = @ptrCast(back_kv);
                     @memset(back_u8[0 .. num_pages * 4096], 0);
                     w.gui_fb_backs[next] = back_kv;
-                    paging.registerGuiFBBack(pid, @intCast(next), back_phys);
+                    paging.registerGuiFBBack(pid, @intCast(next), back_phys.raw());
                 } else {
                     // PMM exhausted — leave has_presented=false and let
                     // the compositor read gui_fb directly. App keeps
@@ -4074,7 +4075,7 @@ pub fn reclaimBackBuffers(needed_frames: u32) u32 {
     // Phase 3: now safe — actually return the frames to PMM.
     var i: usize = 0;
     while (i < pending_count) : (i += 1) {
-        pmm.freeContiguous(pending_phys[i], pending_pages);
+        pmm.freeContiguous(Phys.of(pending_phys[i]), pending_pages);
     }
     return freed_frames;
 }

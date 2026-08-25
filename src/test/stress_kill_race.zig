@@ -28,6 +28,7 @@ const vfs = @import("../fs/vfs.zig");
 const elf_loader = @import("../proc/elf_loader.zig");
 const pmm = @import("../mm/pmm.zig");
 const paging = @import("../mm/paging.zig");
+const Phys = @import("../util/addr.zig").Phys;
 const vmm = @import("../mm/vmm.zig");
 
 const ITERATIONS: u32 = 1_000;
@@ -85,7 +86,7 @@ pub fn taskEntry() callconv(.c) noreturn {
                 pids[b] = 0xFF;
                 spawn_failures += 1;
                 const phys_base = paging.virtToPhys(@intFromPtr(fresh.buf)).?;
-                pmm.freeRange(phys_base, fresh.pages);
+                pmm.freeRange(Phys.of(phys_base), fresh.pages);
             }
         }
 

@@ -23,6 +23,7 @@
 
 const pci = @import("pci.zig");
 const pmm = @import("../mm/pmm.zig");
+const Phys = @import("../util/addr.zig").Phys;
 const paging = @import("../mm/paging.zig");
 const debug = @import("../debug/debug.zig");
 const hpet = @import("../time/hpet.zig");
@@ -203,9 +204,9 @@ fn busyWaitMs(ms: u32) void {
 
 fn allocPage() ?usize {
     const p = pmm.allocFrame() orelse return null;
-    const v: [*]u8 = @ptrFromInt(paging.physToVirt(p));
+    const v = p.toVirt().ptr([*]u8);
     @memset(v[0..4096], 0);
-    return p;
+    return p.raw();
 }
 
 // --- Verb dispatch via CORB/RIRB ---
@@ -374,14 +375,14 @@ pub fn init() bool {
 // 48 kHz × 2 ch × 16-bit. From here, writeSamples() just refills the
 // buffer and toggles RUN; no need to re-program format or pin every call.
 fn streamSetup() bool {
-    stream_buf_phys = pmm.allocContiguous(STREAM_PAGES) orelse return false;
+    stream_buf_phys = (pmm.allocContiguous(STREAM_PAGES) orelse return false).raw();
     stream_buf_virt = @ptrFromInt(paging.physToVirt(stream_buf_phys));
     _ = iommu.dmaMap(pci_bus, pci_dev, pci_func, stream_buf_phys, STREAM_PAGES * 4096, .{});
     stream_buf_size = STREAM_PAGES * 4096;
     @memset(stream_buf_virt[0..stream_buf_size], 0);
 
     stream_bdl_phys = allocPage() orelse {
-        pmm.freeContiguous(stream_buf_phys, STREAM_PAGES);
+        pmm.freeContiguous(Phys.of(stream_buf_phys), STREAM_PAGES);
         return false;
     };
     _ = iommu.dmaMap(pci_bus, pci_dev, pci_func, stream_bdl_phys, 4096, .{});

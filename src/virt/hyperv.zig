@@ -248,7 +248,6 @@ pub fn enableHypercalls() void {
     if (!available or !has_hypercall_msrs or hypercall_page != 0) return;
 
     const pmm = @import("../mm/pmm.zig");
-    const paging = @import("../mm/paging.zig");
 
     // GUEST_OS_ID — required write before HYPERCALL MSR (TLFS § 3.6).
     // Format: Vendor[63:48] | OSType[47:40] | OSVer[39:0]. We claim vendor=1
@@ -264,12 +263,12 @@ pub fn enableHypercalls() void {
         debug.klog("[hyperv] enableHypercalls: PMM exhausted, hypercalls disabled\n", .{});
         return;
     };
-    const call_va = paging.physToVirt(phys_call);
+    const call_va = phys_call.toVirt().raw();
     @memset(@as([*]u8, @ptrFromInt(call_va))[0..4096], 0);
 
     // Enable: write phys | bit 0. Host overlays the VMCALL/VMMCALL thunk
     // into the page; subsequent calls into call_va issue the hypercall.
-    wrmsr(HV_MSR_HYPERCALL, phys_call | 1);
+    wrmsr(HV_MSR_HYPERCALL, phys_call.raw() | 1);
     hypercall_page = call_va;
 
     // Pre-allocate the flush input struct page (24-byte struct lives in
@@ -280,11 +279,11 @@ pub fn enableHypercalls() void {
         debug.klog("[hyperv] enableHypercalls: PMM exhausted for input page\n", .{});
         return;
     };
-    flush_input_va = paging.physToVirt(phys_in);
-    flush_input_pa = phys_in;
+    flush_input_va = phys_in.toVirt().raw();
+    flush_input_pa = phys_in.raw();
     @memset(@as([*]u8, @ptrFromInt(flush_input_va))[0..4096], 0);
 
-    debug.klog("[hyperv] hypercall page @ gpa=0x{X} input @ gpa=0x{X}\n", .{ phys_call, phys_in });
+    debug.klog("[hyperv] hypercall page @ gpa=0x{X} input @ gpa=0x{X}\n", .{ phys_call.raw(), phys_in.raw() });
 }
 
 pub fn hasHypercalls() bool {

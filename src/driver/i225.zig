@@ -363,15 +363,15 @@ pub fn init() bool {
     mmioWrite(REG_CTRL, CTRL_SLU | CTRL_ASDE | CTRL_FD);
 
     // --- RX ring setup ---
-    const rx_desc_phys = pmm.allocContiguous(1) orelse {
+    const rx_desc_phys = (pmm.allocContiguous(1) orelse {
         debug.klog("[i225] RX desc alloc failed\n", .{});
         return false;
-    };
+    }).raw();
     rx_descs = @ptrFromInt(paging.physToVirt(rx_desc_phys));
-    rx_buffers = pmm.allocContiguous(BUF_PAGES) orelse {
+    rx_buffers = (pmm.allocContiguous(BUF_PAGES) orelse {
         debug.klog("[i225] RX buf alloc failed\n", .{});
         return false;
-    };
+    }).raw();
     @memset(@as([*]u8, @ptrFromInt(paging.physToVirt(rx_desc_phys)))[0 .. NUM_RX_DESC * @sizeOf(RxDesc)], 0);
     var di: u32 = 0;
     while (di < NUM_RX_DESC) : (di += 1) {
@@ -397,9 +397,9 @@ pub fn init() bool {
     mmioWrite(REG_RCTL, RCTL_EN | RCTL_BAM | RCTL_BSIZE_2048 | RCTL_SECRC);
 
     // --- TX ring setup ---
-    const tx_desc_phys = pmm.allocContiguous(1) orelse return false;
+    const tx_desc_phys = (pmm.allocContiguous(1) orelse return false).raw();
     tx_descs = @ptrFromInt(paging.physToVirt(tx_desc_phys));
-    tx_buffers = pmm.allocContiguous(BUF_PAGES) orelse return false;
+    tx_buffers = (pmm.allocContiguous(BUF_PAGES) orelse return false).raw();
     @memset(@as([*]u8, @ptrFromInt(paging.physToVirt(tx_desc_phys)))[0 .. NUM_TX_DESC * @sizeOf(TxDesc)], 0);
     di = 0;
     while (di < NUM_TX_DESC) : (di += 1) {

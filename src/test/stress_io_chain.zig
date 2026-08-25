@@ -27,6 +27,7 @@ const process = @import("../proc/process.zig");
 const vfs = @import("../fs/vfs.zig");
 const pmm = @import("../mm/pmm.zig");
 const paging = @import("../mm/paging.zig");
+const Phys = @import("../util/addr.zig").Phys;
 const smp = @import("../cpu/smp.zig");
 const serial = @import("../debug/serial.zig");
 const debug = @import("../debug/debug.zig");
@@ -61,7 +62,7 @@ fn workerEntry() callconv(.c) noreturn {
         if (vfs.loadFileFresh(fname)) |fresh| {
             const buf_virt: usize = @intFromPtr(fresh.buf);
             const buf_phys = paging.virtToPhys(buf_virt);
-            if (buf_phys) |phys| pmm.freeContiguous(phys, fresh.pages);
+            if (buf_phys) |phys| pmm.freeContiguous(Phys.of(phys), fresh.pages);
             _ = @atomicRmw(u64, &worker_iter[slot], .Add, 1, .acq_rel);
         } else {
             _ = @atomicRmw(u64, &worker_failed[slot], .Add, 1, .acq_rel);

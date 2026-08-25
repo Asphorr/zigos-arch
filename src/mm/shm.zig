@@ -25,6 +25,7 @@ const std = @import("std");
 const pmm = @import("pmm.zig");
 const paging = @import("paging.zig");
 const debug = @import("../debug/debug.zig");
+const Phys = @import("../util/addr.zig").Phys;
 
 pub const MAX_SHM_REGIONS: u32 = 32;
 pub const MAX_PAGES_PER_REGION: u32 = 256;
@@ -74,15 +75,15 @@ pub fn create(size_pages: u32) ?u32 {
     var allocated: u32 = 0;
     while (allocated < size_pages) : (allocated += 1) {
         const phys = pmm.allocFrameUser() orelse break;
-        const vptr: [*]u8 = @ptrFromInt(paging.physToVirt(phys));
+        const vptr = phys.toVirt().ptr([*]u8);
         @memset(vptr[0..4096], 0);
-        regions[id].frames[allocated] = phys;
+        regions[id].frames[allocated] = phys.raw();
     }
     if (allocated < size_pages) {
         // OOM unwind: free what we got, un-reserve the slot.
         while (allocated > 0) {
             allocated -= 1;
-            pmm.freeFrame(regions[id].frames[allocated]);
+            pmm.freeFrame(Phys.of(regions[id].frames[allocated]));
             regions[id].frames[allocated] = 0;
         }
         const flags = lock.acquireIrqSave();
@@ -135,7 +136,7 @@ pub fn release(id: u32) void {
 
     var i: u16 = 0;
     while (i < regions[id].size_pages) : (i += 1) {
-        pmm.freeFrame(regions[id].frames[i]);
+        pmm.freeFrame(Phys.of(regions[id].frames[i]));
         regions[id].frames[i] = 0;
     }
     regions[id].in_use = false;

@@ -3,6 +3,7 @@ const vga = @import("../ui/vga.zig");
 const boot_info = @import("../boot/boot_info.zig");
 const SpinLock = @import("../proc/spinlock.zig").SpinLock;
 const memmap = @import("memmap.zig");
+const Phys = @import("../util/addr.zig").Phys;
 
 const FRAME_SIZE: u32 = 4096;
 // 1 GB cap: bitmap = 32 KB, frame_refs = 256 KB. ZigOS QEMU configs use
@@ -959,7 +960,7 @@ fn allocAndRefillFromRegion(region_idx: u32, cpu: anytype) ?usize {
     return caller;
 }
 
-pub fn allocFrame() ?usize {
+pub fn allocFrame() ?Phys {
     const ra = @returnAddress();
     // IF off across cache access — guarantees no preemption / IRQ runs an
     // allocFrame on the same CPU's cache mid-pop. With per-CPU storage and
@@ -979,7 +980,7 @@ pub fn allocFrame() ?usize {
         @import("../debug/kdbg.zig").pmmAlloc(phys, 1, ra);
         @import("../debug/kasan.zig").unpoison(phys, FRAME_SIZE);
         frame_refs[phys / FRAME_SIZE] = 1;
-        return phys;
+        return Phys.of(phys);
     }
 
     // Cache miss: try preferred region first (per-CPU affinity = cache
@@ -1005,12 +1006,12 @@ pub fn allocFrame() ?usize {
     @import("../debug/kdbg.zig").pmmAlloc(first, 1, ra);
     @import("../debug/kasan.zig").unpoison(first, FRAME_SIZE);
     frame_refs[first / FRAME_SIZE] = 1;
-    return first;
+    return Phys.of(first);
 }
 
 /// Allocate a frame below 4GB (for DMA buffers that require 32-bit addresses).
 /// Walks only regions whose end frame is below the 4GB boundary.
-pub fn allocFrameBelow4G() ?usize {
+pub fn allocFrameBelow4G() ?Phys {
     const max_frame_32: u32 = 0x100000; // 4GB / 4KB
     // Clamp to REGIONS_COUNT: every PMM region is already below 4 GB
     // (MAX_FRAMES caps at 1 GB), so 4GB/REGION_FRAMES (=1024) overshoots the
@@ -1042,13 +1043,13 @@ pub fn allocFrameBelow4G() ?usize {
             checkPhysSafety(phys, "allocFrameBelow4G");
             @import("../debug/kasan.zig").unpoison(phys, FRAME_SIZE);
             frame_refs[start_frame] = 1;
-            return phys;
+            return Phys.of(phys);
         }
         if (scanInRegionLocked(ri)) |phys| {
             checkPhysSafety(phys, "allocFrameBelow4G");
             @import("../debug/kasan.zig").unpoison(phys, FRAME_SIZE);
             frame_refs[phys / FRAME_SIZE] = 1;
-            return phys;
+            return Phys.of(phys);
         }
     }
     return null;
@@ -1291,7 +1292,7 @@ fn allocContiguousCrossRegion(count: u32, max_frame: u32) ?usize {
     return @as(usize, start_frame) * FRAME_SIZE;
 }
 
-pub fn allocContiguous(count: u32) ?usize {
+pub fn allocContiguous(count: u32) ?Phys {
     if (count == 0) return null;
     if (count == 1) return allocFrame();
     const ra = @returnAddress();
@@ -1324,11 +1325,11 @@ pub fn allocContiguous(count: u32) ?usize {
     canaryBitClearRange(@intCast(base / FRAME_SIZE), count);
     @import("../debug/kdbg.zig").pmmAlloc(base, count, ra);
     @import("../debug/kasan.zig").unpoison(base, @as(usize, count) * FRAME_SIZE);
-    return base;
+    return Phys.of(base);
 }
 
 /// Allocate `count` contiguous frames below 4GB (for DMA).
-pub fn allocContiguousBelow4G(count: u32) ?usize {
+pub fn allocContiguousBelow4G(count: u32) ?Phys {
     if (count == 0) return null;
     if (count == 1) return allocFrameBelow4G();
     const ra = @returnAddress();
@@ -1361,7 +1362,7 @@ pub fn allocContiguousBelow4G(count: u32) ?usize {
     canaryBitClearRange(@intCast(base / FRAME_SIZE), count);
     @import("../debug/kdbg.zig").pmmAlloc(base, count, ra);
     @import("../debug/kasan.zig").unpoison(base, @as(usize, count) * FRAME_SIZE);
-    return base;
+    return Phys.of(base);
 }
 
 // Device-memory window (e.g. an NVDIMM's DAX frames) that is NOT PMM-managed
@@ -1380,8 +1381,9 @@ pub fn registerDeviceRange(base: usize, len: usize) void {
     device_hi = base +| len;
 }
 
-pub fn freeFrame(phys_addr: usize) void {
+pub fn freeFrame(phys: Phys) void {
     const ra = @returnAddress();
+    const phys_addr: usize = phys.raw();
     const frame_num = phys_addr / FRAME_SIZE;
     // Registered device memory (NVDIMM DAX frames, etc.) is never PMM-managed —
     // ignore frees of it regardless of where the window sits relative to the RAM
@@ -1503,13 +1505,14 @@ pub fn freeFrame(phys_addr: usize) void {
 /// word-at-a-time clearing for the middle of the range. Replaces the
 /// `for (0..n) freeFrame(...)` idiom that was scattered across many callsites
 /// and took the spinlock + ran the kdbg/kasan hooks N times.
-pub fn freeContiguous(phys_addr: usize, count: u32) void {
+pub fn freeContiguous(phys: Phys, count: u32) void {
     if (count == 0) return;
     if (count == 1) {
-        freeFrame(phys_addr);
+        freeFrame(phys);
         return;
     }
     const ra = @returnAddress();
+    const phys_addr: usize = phys.raw();
     const start_frame = phys_addr / FRAME_SIZE;
     if (start_frame + count > MAX_FRAMES) {
         @import("../debug/serial.zig").print("[pmm] WARNING: freeContiguous bad range start=0x{X} count={d}\n", .{ phys_addr, count });
@@ -1596,7 +1599,7 @@ pub fn freeContiguous(phys_addr: usize, count: u32) void {
 /// of the bulk-allocated range and shows up later as fake UAF reports.
 /// THIS IS THE CANONICAL "free a `pages: u32` block" API; reach for it
 /// instead of writing a per-page free loop.
-pub inline fn freeRange(phys_base: usize, count: u32) void {
+pub inline fn freeRange(phys_base: Phys, count: u32) void {
     freeContiguous(phys_base, count);
 }
 
@@ -1620,7 +1623,7 @@ pub fn userReserveFrames() u32 {
 /// spinning under PMM contention. Returns null when the would-be
 /// post-alloc free count is at or below the reserve — caller must
 /// surface that as ENOMEM to userspace and let the process die.
-pub fn allocFrameUser() ?usize {
+pub fn allocFrameUser() ?Phys {
     if (total_frames.load(.monotonic) <= pmm_user_reserve) return null;
     return allocFrame();
 }
@@ -1628,7 +1631,7 @@ pub fn allocFrameUser() ?usize {
 /// User-faulting variant of allocContiguous. Same reserve check —
 /// big mmap-with-fd requests fail cleanly when PMM is tight rather
 /// than starving the kernel.
-pub fn allocContiguousUser(count: u32) ?usize {
+pub fn allocContiguousUser(count: u32) ?Phys {
     if (total_frames.load(.monotonic) <= pmm_user_reserve + count) return null;
     return allocContiguous(count);
 }
@@ -1644,7 +1647,8 @@ pub fn managedFrameCount() u32 {
 /// shares parent's data frames with child by bumping refcount instead of copying.
 /// CMPXCHG loop catches saturation explicitly (255 references = fork bomb depth
 /// 256, well past anything realistic; panic instead of wrapping silently).
-pub fn acquireFrame(phys_addr: usize) void {
+pub fn acquireFrame(phys: Phys) void {
+    const phys_addr: usize = phys.raw();
     const frame_num_us = phys_addr / FRAME_SIZE;
     if (frame_num_us >= MAX_FRAMES) {
         @import("../debug/serial.zig").print("[pmm] WARNING: acquireFrame bad addr=0x{X}\n", .{phys_addr});
@@ -1675,7 +1679,8 @@ pub fn acquireFrame(phys_addr: usize) void {
 /// its PTE sample and releases on mismatch; a `true` + unchanged-PTE pair
 /// proves continuous ownership (every unmap/evict path rewrites the PTE
 /// before dropping its reference). Saturation panics, same as acquireFrame.
-pub fn acquireFrameIfLive(phys_addr: usize) bool {
+pub fn acquireFrameIfLive(phys: Phys) bool {
+    const phys_addr: usize = phys.raw();
     const frame_num_us = phys_addr / FRAME_SIZE;
     if (frame_num_us >= MAX_FRAMES) return false;
     const frame_num: u32 = @intCast(frame_num_us);
@@ -1694,13 +1699,14 @@ pub fn acquireFrameIfLive(phys_addr: usize) bool {
 /// free pool. Functionally identical to freeFrame — both decrement and free-
 /// when-zero. Use this name when releasing a COW-shared frame to make intent
 /// explicit (the caller knows the frame may have other references).
-pub inline fn releaseFrame(phys_addr: usize) void {
-    return freeFrame(phys_addr);
+pub inline fn releaseFrame(phys: Phys) void {
+    return freeFrame(phys);
 }
 
 /// Read current refcount for a frame. Diagnostic only — racy under SMP. Useful
 /// for /proc/meminfo, kdbg autopsy, and unit tests.
-pub fn frameRefCount(phys_addr: usize) u8 {
+pub fn frameRefCount(phys: Phys) u8 {
+    const phys_addr: usize = phys.raw();
     const frame_num = phys_addr / FRAME_SIZE;
     if (frame_num >= MAX_FRAMES) return 0;
     return @atomicLoad(u8, &frame_refs[frame_num], .acquire);

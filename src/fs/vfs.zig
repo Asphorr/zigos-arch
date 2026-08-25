@@ -14,6 +14,7 @@
 // see the ext2 ETXTBSY arm); path helpers return null.
 
 const std = @import("std");
+const Phys = @import("../util/addr.zig").Phys;
 const fat32 = @import("fat32.zig");
 const tarfs = @import("tarfs.zig");
 const devfs = @import("devfs.zig");
@@ -454,16 +455,16 @@ pub fn readThroughCache(inum: u32, offset: u64, buf: [*]u8, count: u32) u32 {
                 const nread: u64 = @intCast(ext2.readFile(.{ .inum = inum, .file_size = 0, .current_offset = cur }, buf + dst_off, @intCast(want - done)));
                 return @intCast(done + nread);
             };
-            const fdst: [*]u8 = @ptrFromInt(paging.physToVirt(pf));
+            const fdst = pf.toVirt().ptr([*]u8);
             const got: u64 = @min(@as(u64, fillCachePage(inum, page_off, fdst)), 0x1000);
             if (got < 0x1000) @memset(fdst[@as(usize, @intCast(got))..0x1000], 0); // zero tail past EOF
-            break :blk page_cache.insertFilled(file_id, page_off, pf);
+            break :blk page_cache.insertFilled(file_id, page_off, pf.raw());
         };
 
         // frame -> kstack scratch, under the reference (cannot fault-kill).
         const src: [*]const u8 = @ptrFromInt(paging.physToVirt(frame));
         @memcpy(scratch[0..ck], src[ip .. ip + ck]);
-        pmm.releaseFrame(frame); // drop the pin / insertFilled ref BEFORE the user copy
+        pmm.releaseFrame(Phys.of(frame)); // drop the pin / insertFilled ref BEFORE the user copy
 
         // scratch -> user (no cache ref held; a faulting user page is safe now).
         // Like the existing readInodeBytes path this user write isn't SMAP-
@@ -498,7 +499,7 @@ pub fn syncCacheFile(inum: u32, clear: bool) u32 {
         off = dp.page_off + page_cache.PAGE_SIZE; // advance cursor → guarantees termination
         const src: [*]const u8 = @ptrFromInt(paging.physToVirt(dp.frame));
         _ = ext2.writebackPage(inum, dp.page_off, src);
-        pmm.releaseFrame(dp.frame); // drop the writeback pin BEFORE the refcount-gated clear
+        pmm.releaseFrame(Phys.of(dp.frame)); // drop the writeback pin BEFORE the refcount-gated clear
         if (clear) _ = page_cache.clearDirtyIfCacheOnly(file_id, dp.page_off);
         written += 1;
     }
@@ -542,7 +543,7 @@ pub fn flushAllDirty() u32 {
             const src: [*]const u8 = @ptrFromInt(paging.physToVirt(dp.frame));
             _ = ext2.writebackPage(inum, dp.page_off, src);
         }
-        pmm.releaseFrame(dp.frame); // drop the writeback pin BEFORE the refcount-gated clear
+        pmm.releaseFrame(Phys.of(dp.frame)); // drop the writeback pin BEFORE the refcount-gated clear
         _ = page_cache.clearDirtyIfCacheOnly(dp.file_id, dp.page_off);
         written += 1;
     }
@@ -834,7 +835,7 @@ pub fn loadFileFresh(name: []const u8) ?FreshFile {
     };
     const t2 = perf.rdtsc();
     // Reach the PMM-allocated buffer through the kernel physmap.
-    const buf: [*]align(4) u8 = @ptrFromInt(paging.physToVirt(phys));
+    const buf: [*]align(4) u8 = @ptrFromInt(phys.toVirt().raw());
 
     // NVMe-stats snapshot — diff'd after loadFile to attribute calls/cycles
     // to this specific load rather than the global counters.

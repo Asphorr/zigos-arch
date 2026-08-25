@@ -1,5 +1,6 @@
 const serial = @import("serial.zig");
 const debug = @import("debug.zig");
+const Phys = @import("../util/addr.zig").Phys;
 const heap = @import("../mm/heap.zig");
 const slab = @import("../mm/slab.zig");
 const vfs = @import("../fs/vfs.zig");
@@ -111,7 +112,7 @@ pub fn loadKernelSymbols() void {
         // and looks like a UAF burst at next allocation.
         const paging = @import("../mm/paging.zig");
         const phys_base = paging.virtToPhys(@intFromPtr(fresh.buf)).?;
-        @import("../mm/pmm.zig").freeRange(phys_base, fresh.pages);
+        @import("../mm/pmm.zig").freeRange(Phys.of(phys_base), fresh.pages);
     }
 
     if (file_size < 12) {

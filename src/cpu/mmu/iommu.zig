@@ -416,12 +416,12 @@ fn dmarCb(ctx: *WalkCtx, h: *align(1) const acpi.DmarRemappingHeader) void {
 
 fn allocZeroFrame() ?u64 {
     const phys = pmm.allocFrame() orelse return null;
-    const va = paging.physToVirt(phys);
+    const va = phys.toVirt().raw();
     const ptr: [*]u8 = @ptrFromInt(va);
     @memset(ptr[0..4096], 0);
     // Non-coherent walker must not read stale (pre-zero) lines.
     flushTableRange(va, 4096);
-    return phys;
+    return phys.raw();
 }
 
 /// Ensure `parent[idx]` points at a next-level table; allocate if needed.
@@ -505,17 +505,17 @@ fn ensureContextTable(drhd: *Drhd, bus: u8) u64 {
         debug.klog("[iommu] OOM allocating context table for bus {d}\n", .{bus});
         return 0;
     };
-    const ptr: [*]u8 = @ptrFromInt(paging.physToVirt(phys));
+    const ptr = phys.toVirt().ptr([*]u8);
     @memset(ptr[0..4096], 0);
-    drhd.ctx_phys[bus] = phys;
+    drhd.ctx_phys[bus] = phys.raw();
 
     // Wire the root entry for this bus to point at the new context table.
     const root_va = paging.physToVirt(drhd.root_phys);
     const root_entry: *volatile u64 = @ptrFromInt(root_va + @as(usize, bus) * 16);
-    root_entry.* = phys | 1; // Present + ctx-table pointer
+    root_entry.* = phys.raw() | 1; // Present + ctx-table pointer
     flushTableWrite(root_entry);
 
-    return phys;
+    return phys.raw();
 }
 
 /// Program one device's context entry to legacy second-level translation

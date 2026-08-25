@@ -356,8 +356,8 @@ pub fn sysCreateWindow(alloc_width_in: u32, alloc_height: u32, display_wh: u32) 
         };
         var mapped_pages: usize = 0;
         for (0..num_pages) |i| {
-            const phys = phys_base + i * 4096;
-            vmm.mapUserPage(pd, GUI_FB_BASE + i * 4096, phys, paging.READ_WRITE | paging.USER) catch |e| {
+            const phys = phys_base.add(i * 4096);
+            vmm.mapUserPage(pd, GUI_FB_BASE + i * 4096, phys.raw(), paging.READ_WRITE | paging.USER) catch |e| {
                 // Rollback: undo dual-owner refs on what we mapped, then
                 // free the whole contiguous block. releaseFrame here pairs
                 // with the (skipped) acquireFrame we never reached on this
@@ -367,7 +367,7 @@ pub fn sysCreateWindow(alloc_width_in: u32, alloc_height: u32, display_wh: u32) 
                 var j: usize = 0;
                 while (j < mapped_pages) : (j += 1) {
                     _ = vmm.unmapUserPage(pd, GUI_FB_BASE + j * 4096);
-                    pmm.releaseFrame(phys_base + j * 4096);
+                    pmm.releaseFrame(phys_base.add(j * 4096));
                 }
                 pmm.freeContiguous(phys_base, num_pages);
                 return E_INVAL;
@@ -379,13 +379,13 @@ pub fn sysCreateWindow(alloc_width_in: u32, alloc_height: u32, display_wh: u32) 
             // second owner's release underflows. Back-buffer pages stay
             // single-owner (kernel-only, never mapped to user).
             pmm.acquireFrame(phys);
-            const ptr: [*]u8 = @ptrFromInt(paging.physToVirt(phys));
+            const ptr = phys.toVirt().ptr([*]u8);
             @memset(ptr[0..4096], 0);
             mapped_pages += 1;
         }
-        paging.registerGuiFB(pid, phys_base);
+        paging.registerGuiFB(pid, phys_base.raw());
         asm volatile ("movq %%cr3, %%rax\n movq %%rax, %%cr3" ::: .{ .rax = true });
-        kern_fb = @ptrFromInt(paging.physToVirt(phys_base));
+        kern_fb = @ptrFromInt(phys_base.toVirt().raw());
         // kern_fb_backs stays { null, null, null } — snapshotGuiFb will
         // populate on first present (or skip cleanly on alloc failure,
         // leaving the compositor on the gui_fb fallback path).

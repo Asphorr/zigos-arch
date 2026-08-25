@@ -204,14 +204,13 @@ pub fn initPerCpuPv() void {
     if (base == 0 or pv_page_pa != 0) return;
     if (!hasStealTime() and !hasPvEoi()) return;
     const pmm = @import("../mm/pmm.zig");
-    const paging = @import("../mm/paging.zig");
     const phys = pmm.allocFrame() orelse {
         debug.klog("[kvm] initPerCpuPv: PMM exhausted, PV areas disabled\n", .{});
         return;
     };
-    pv_page_va = paging.physToVirt(phys);
+    pv_page_va = phys.toVirt().raw();
     @memset(@as([*]u8, @ptrFromInt(pv_page_va))[0..4096], 0);
-    pv_page_pa = phys;
+    pv_page_pa = phys.raw();
     enablePerCpuPv(@import("../cpu/smp.zig").myCpu().cpu_id);
 }
 

@@ -315,7 +315,7 @@ pub fn init() bool {
     // avail ring as device-writable buffers, leaving the remainder free.
     var rx_count: u16 = 0;
     while (rx_count < NUM_RX_BUFS and rx_count < rx_vq.queue_size) : (rx_count += 1) {
-        const buf_phys = pmm.allocFrame() orelse break;
+        const buf_phys = (pmm.allocFrame() orelse break).raw();
         rx_bufs[rx_count] = buf_phys;
         // Map the RX buf into the device's IOVA space so it can DMA the
         // received packet into it. Device-writable only would suffice
@@ -378,12 +378,12 @@ pub fn send(data: []const u8) bool {
     tx_vq.num_free -= 1;
 
     if (tx_bufs[di] == 0) {
-        tx_bufs[di] = pmm.allocFrame() orelse {
+        tx_bufs[di] = (pmm.allocFrame() orelse {
             d.next = tx_vq.free_head;
             tx_vq.free_head = di;
             tx_vq.num_free += 1;
             return false;
-        };
+        }).raw();
         // Map the freshly-allocated TX buf into the device's IOVA space
         // before the device sees its address. tx_bufs[di] persists for
         // the lifetime of the descriptor slot, so we map once and reuse.

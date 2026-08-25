@@ -40,6 +40,7 @@ const std = @import("std");
 const tlb = @import("../cpu/mmu/tlb.zig");
 const boot_phase = @import("../boot/boot_phase.zig");
 const kasan = @import("../debug/kasan.zig");
+const Phys = @import("../util/addr.zig").Phys;
 
 /// Kernel VA arena. Sits in an otherwise-unused PML4 slot above the
 /// physmap (which owns slot 256 entirely). Slot 258 = 0xFFFF810000000000.
@@ -126,7 +127,7 @@ fn findContigFree(n: usize) ?usize {
 
 /// Walk the kernel page tables to set a single PTE in the arena.
 /// PML4 + PDPT + PD are pre-installed by init(); only PT is lazy.
-fn mapPage(va: usize, phys: usize) bool {
+fn mapPage(va: usize, phys: Phys) bool {
     const pml4_phys = paging.getKernelPML4Phys();
     const pml4: [*]volatile u64 = @ptrFromInt(paging.physToVirt(pml4_phys));
     const pml4_idx = (va >> 39) & 0x1FF;
@@ -142,15 +143,15 @@ fn mapPage(va: usize, phys: usize) bool {
     const pd_idx = (va >> 21) & 0x1FF;
     if (pd[pd_idx] & PRESENT == 0) {
         const pt_phys = pmm.allocFrame() orelse return false;
-        const pt_kv: [*]u8 = @ptrFromInt(paging.physToVirt(pt_phys));
+        const pt_kv = pt_phys.toVirt().ptr([*]u8);
         @memset(pt_kv[0..4096], 0);
-        pd[pd_idx] = pt_phys | PRESENT | RW;
+        pd[pd_idx] = pt_phys.raw() | PRESENT | RW;
     }
 
     const pt_phys = pd[pd_idx] & PAGE_MASK;
     const pt: [*]volatile u64 = @ptrFromInt(paging.physToVirt(pt_phys));
     const pt_idx = (va >> 12) & 0x1FF;
-    pt[pt_idx] = phys | VMALLOC_PTE_FLAGS;
+    pt[pt_idx] = phys.raw() | VMALLOC_PTE_FLAGS;
     // Fresh PTE on a previously-not-present slot — local invlpg flushes any
     // negative cache entry. No TLB shootdown needed: peers also have no
     // cached entry (because there was nothing to cache) and their next walk
@@ -166,7 +167,7 @@ fn mapPage(va: usize, phys: usize) bool {
 /// null if nothing was there. Caller must perform a TLB shootdown for the
 /// VA AFTER the PMM frame has been freed (or batch the shootdown across
 /// many unmaps via `tlb.shootdownAll(0)`).
-fn unmapPage(va: usize) ?usize {
+fn unmapPage(va: usize) ?Phys {
     const pml4_phys = paging.getKernelPML4Phys();
     const pml4: [*]volatile u64 = @ptrFromInt(paging.physToVirt(pml4_phys));
     const pml4_idx = (va >> 39) & 0x1FF;
@@ -195,7 +196,7 @@ fn unmapPage(va: usize) ?usize {
         :
         : [addr] "r" (va),
         : .{ .memory = true });
-    return old & PAGE_MASK;
+    return Phys.of(old & PAGE_MASK);
 }
 
 /// One-time setup: install the PML4 entry, PDPT, and PD covering our
@@ -211,9 +212,9 @@ pub fn init() void {
             debug.klog("[vmalloc] init: pmm.allocFrame for PDPT failed\n", .{});
             return;
         };
-        const pdpt_kv: [*]u8 = @ptrFromInt(paging.physToVirt(pdpt_phys));
+        const pdpt_kv = pdpt_phys.toVirt().ptr([*]u8);
         @memset(pdpt_kv[0..4096], 0);
-        pml4[pml4_idx] = pdpt_phys | PRESENT | RW;
+        pml4[pml4_idx] = pdpt_phys.raw() | PRESENT | RW;
     }
 
     const pdpt_phys = pml4[pml4_idx] & PAGE_MASK;
@@ -224,9 +225,9 @@ pub fn init() void {
             debug.klog("[vmalloc] init: pmm.allocFrame for PD failed\n", .{});
             return;
         };
-        const pd_kv: [*]u8 = @ptrFromInt(paging.physToVirt(pd_phys));
+        const pd_kv = pd_phys.toVirt().ptr([*]u8);
         @memset(pd_kv[0..4096], 0);
-        pdpt[pdpt_idx] = pd_phys | PRESENT | RW;
+        pdpt[pdpt_idx] = pd_phys.raw() | PRESENT | RW;
     }
 
     initialized = true;

@@ -103,13 +103,12 @@ pub fn init() void {
         debug.klog("[kasan] init: pmm.allocContiguous({d}) failed — disabling\n", .{num_pages});
         return;
     };
-    debug.klog("[kasan] init: got phys=0x{X} — zeroing\n", .{phys});
+    debug.klog("[kasan] init: got phys=0x{X} — zeroing\n", .{phys.raw()});
     // Phase 3: store the physmap-translated VA so the shadow stays
     // dereferenceable after PML4[0] is dropped. The compiler-emitted
     // inline check below uses (addr >> 3) + dyn_addr; dyn_addr is
     // computed from `shadow_base`, so it inherits the same translation.
-    const paging = @import("../mm/paging.zig");
-    shadow_base = paging.physToVirt(phys);
+    shadow_base = phys.toVirt().raw();
 
     // Mark everything valid by default. Callers later poison specific
     // regions (red zones, freed allocations) via poison().

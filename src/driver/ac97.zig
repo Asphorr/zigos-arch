@@ -105,12 +105,12 @@ pub fn init() bool {
     io.outb16(nam_base + NAM_SAMPLE_RATE, @intCast(SAMPLE_RATE));
 
     // Allocate BDL page (physically contiguous)
-    bdl_phys = pmm.allocFrame() orelse return false;
+    bdl_phys = (pmm.allocFrame() orelse return false).raw();
     @memset(@as([*]u8, @ptrFromInt(paging.physToVirt(bdl_phys)))[0..4096], 0);
     _ = iommu.dmaMap(dev.bus, dev.dev, dev.func, bdl_phys, 4096, .{});
 
     // Allocate audio buffer (4 contiguous pages = 16KB)
-    buf_phys = pmm.allocContiguous(BUF_PAGES) orelse return false;
+    buf_phys = (pmm.allocContiguous(BUF_PAGES) orelse return false).raw();
     @memset(@as([*]u8, @ptrFromInt(paging.physToVirt(buf_phys)))[0 .. BUF_PAGES * 4096], 0);
     _ = iommu.dmaMap(dev.bus, dev.dev, dev.func, buf_phys, BUF_PAGES * 4096, .{});
 

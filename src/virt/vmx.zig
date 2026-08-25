@@ -30,6 +30,7 @@
 const debug = @import("../debug/debug.zig");
 const pmm = @import("../mm/pmm.zig");
 const paging = @import("../mm/paging.zig");
+const Phys = @import("../util/addr.zig").Phys;
 
 // --- CPUID / MSR encodings -------------------------------------------
 
@@ -305,11 +306,11 @@ inline fn vmread(field: u64) VmreadResult {
 /// field-access path works end-to-end. Clears and frees the probe VMCS on the
 /// way out. MUST be called while in VMX operation (between VMXON and VMXOFF).
 fn vmcsRoundtrip() bool {
-    const phys = pmm.allocFrame() orelse {
+    const phys = (pmm.allocFrame() orelse {
         debug.klog("[vmx] phase2a: PMM exhausted — no VMCS region\n", .{});
         return false;
-    };
-    defer pmm.freeFrame(phys);
+    }).raw();
+    defer pmm.freeFrame(Phys.of(phys));
     const va = paging.physToVirt(phys);
     @memset(@as([*]u8, @ptrFromInt(va))[0..4096], 0);
     // First dword = VMCS revision id (bit 31 clear = ordinary VMCS, not a
@@ -757,18 +758,18 @@ fn launchGuest() bool {
     const hs = captureHostState();
 
     // --- 4. Allocate VMCS + EPT tables + guest code page ----------------
-    const vmcs_frame = pmm.allocFrame() orelse return allocFail("VMCS");
-    defer pmm.freeFrame(vmcs_frame);
-    const ept_pml4 = pmm.allocFrame() orelse return allocFail("EPT PML4");
-    defer pmm.freeFrame(ept_pml4);
-    const ept_pdpt = pmm.allocFrame() orelse return allocFail("EPT PDPT");
-    defer pmm.freeFrame(ept_pdpt);
-    const ept_pd = pmm.allocFrame() orelse return allocFail("EPT PD");
-    defer pmm.freeFrame(ept_pd);
-    const ept_pt = pmm.allocFrame() orelse return allocFail("EPT PT");
-    defer pmm.freeFrame(ept_pt);
-    const code_frame = pmm.allocFrame() orelse return allocFail("guest code");
-    defer pmm.freeFrame(code_frame);
+    const vmcs_frame = (pmm.allocFrame() orelse return allocFail("VMCS")).raw();
+    defer pmm.freeFrame(Phys.of(vmcs_frame));
+    const ept_pml4 = (pmm.allocFrame() orelse return allocFail("EPT PML4")).raw();
+    defer pmm.freeFrame(Phys.of(ept_pml4));
+    const ept_pdpt = (pmm.allocFrame() orelse return allocFail("EPT PDPT")).raw();
+    defer pmm.freeFrame(Phys.of(ept_pdpt));
+    const ept_pd = (pmm.allocFrame() orelse return allocFail("EPT PD")).raw();
+    defer pmm.freeFrame(Phys.of(ept_pd));
+    const ept_pt = (pmm.allocFrame() orelse return allocFail("EPT PT")).raw();
+    defer pmm.freeFrame(Phys.of(ept_pt));
+    const code_frame = (pmm.allocFrame() orelse return allocFail("guest code")).raw();
+    defer pmm.freeFrame(Phys.of(code_frame));
 
     // Guest code at guest-physical 0: cpuid (0F A2), then hlt (F4) as a fence.
     const code = @as([*]u8, @ptrFromInt(paging.physToVirt(code_frame)));
@@ -1103,18 +1104,18 @@ fn runEchoGuest() bool {
     };
     const hs = captureHostState();
 
-    const vmcs_frame = pmm.allocFrame() orelse return allocFail("2c VMCS");
-    defer pmm.freeFrame(vmcs_frame);
-    const ept_pml4 = pmm.allocFrame() orelse return allocFail("2c EPT PML4");
-    defer pmm.freeFrame(ept_pml4);
-    const ept_pdpt = pmm.allocFrame() orelse return allocFail("2c EPT PDPT");
-    defer pmm.freeFrame(ept_pdpt);
-    const ept_pd = pmm.allocFrame() orelse return allocFail("2c EPT PD");
-    defer pmm.freeFrame(ept_pd);
-    const ept_pt = pmm.allocFrame() orelse return allocFail("2c EPT PT");
-    defer pmm.freeFrame(ept_pt);
-    const code_frame = pmm.allocFrame() orelse return allocFail("2c guest code");
-    defer pmm.freeFrame(code_frame);
+    const vmcs_frame = (pmm.allocFrame() orelse return allocFail("2c VMCS")).raw();
+    defer pmm.freeFrame(Phys.of(vmcs_frame));
+    const ept_pml4 = (pmm.allocFrame() orelse return allocFail("2c EPT PML4")).raw();
+    defer pmm.freeFrame(Phys.of(ept_pml4));
+    const ept_pdpt = (pmm.allocFrame() orelse return allocFail("2c EPT PDPT")).raw();
+    defer pmm.freeFrame(Phys.of(ept_pdpt));
+    const ept_pd = (pmm.allocFrame() orelse return allocFail("2c EPT PD")).raw();
+    defer pmm.freeFrame(Phys.of(ept_pd));
+    const ept_pt = (pmm.allocFrame() orelse return allocFail("2c EPT PT")).raw();
+    defer pmm.freeFrame(Phys.of(ept_pt));
+    const code_frame = (pmm.allocFrame() orelse return allocFail("2c guest code")).raw();
+    defer pmm.freeFrame(Phys.of(code_frame));
 
     // Guest page: program at 0, msg1 at 0x80, msg2 at 0xA0, vendor scratch
     // at 0xC0, guest stack top at 0xF00 (unused — no pushes — but legal).
@@ -1300,12 +1301,12 @@ pub fn enableBsp() void {
     //    first dword = VMCS revision id (bit 31 = 0; already masked in detect).
     //    A frame always fits: vmcs_region_size is architecturally <= 4KB
     //    (Phase 0 logged 4096). Phase 2 must apply the same bound to the VMCS.
-    const phys = pmm.allocFrame() orelse {
+    const phys = (pmm.allocFrame() orelse {
         debug.klog("[vmx] enableBsp: PMM exhausted — cannot allocate VMXON region\n", .{});
         writeCr4(orig_cr4);
         if (new_cr0 != orig_cr0) writeCr0(orig_cr0);
         return;
-    };
+    }).raw();
     const va = paging.physToVirt(phys);
     @memset(@as([*]u8, @ptrFromInt(va))[0..4096], 0);
     @as(*volatile u32, @ptrFromInt(va)).* = vmcs_revision;
@@ -1361,7 +1362,7 @@ pub fn enableBsp() void {
         debug.klog("[vmx] VMXON FAILED ({s}). region_pa=0x{X} cr4=0x{X} cf={d} zf={d}\n", .{
             if (cf != 0) "VMfailInvalid" else "VMfailValid", phys, new_cr4, cf, zf,
         });
-        pmm.freeFrame(phys);
+        pmm.freeFrame(Phys.of(phys));
         writeCr4(orig_cr4);
         if (new_cr0 != orig_cr0) writeCr0(orig_cr0);
         return;

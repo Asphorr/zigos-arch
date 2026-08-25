@@ -575,8 +575,8 @@ pub fn init() bool {
     _ = iommu.dmaMap(dev_found.bus, dev_found.dev, dev_found.func, tx_vq.used_phys, 4096, .{});
 
     // Allocate scratch buffers used by the control round-trip.
-    ctrl_cmd_phys = pmm.allocFrame() orelse return false;
-    ctrl_resp_phys = pmm.allocFrame() orelse return false;
+    ctrl_cmd_phys = (pmm.allocFrame() orelse return false).raw();
+    ctrl_resp_phys = (pmm.allocFrame() orelse return false).raw();
     _ = iommu.dmaMap(dev_found.bus, dev_found.dev, dev_found.func, ctrl_cmd_phys, 4096, .{});
     _ = iommu.dmaMap(dev_found.bus, dev_found.dev, dev_found.func, ctrl_resp_phys, 4096, .{});
     @memset(@as([*]u8, @ptrFromInt(paging.physToVirt(ctrl_cmd_phys)))[0..4096], 0);
@@ -584,7 +584,7 @@ pub fn init() bool {
 
     // Allocate TX pool — one PMM frame per slot, sliced into hdr/payload/status.
     for (0..NUM_TX_BUFS) |i| {
-        const frame = pmm.allocFrame() orelse return false;
+        const frame = (pmm.allocFrame() orelse return false).raw();
         _ = iommu.dmaMap(dev_found.bus, dev_found.dev, dev_found.func, frame, 4096, .{});
         @memset(@as([*]u8, @ptrFromInt(paging.physToVirt(frame)))[0..4096], 0);
         // Layout in the frame:

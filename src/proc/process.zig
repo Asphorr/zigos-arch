@@ -737,13 +737,13 @@ pub fn initKstackGuards() void {
         debug.klog("[proc] FATAL: kstack pool alloc failed ({d} frames / {d} KB)\n", .{ frames, KSTACK_POOL_BYTES / 1024 });
         @panic("kstack pool allocation failed");
     };
-    kstack_pool_phys_base = block_phys;
-    const region_va = paging.physToVirt(block_phys);
+    kstack_pool_phys_base = block_phys.raw();
+    const region_va = block_phys.toVirt().raw();
     kstack_pool = @ptrFromInt(region_va);
     // BSS was zero-initialized; preserve that — the kstack scanners and the
     // base canary both read these bytes.
     @memset(@as([*]u8, @ptrFromInt(region_va))[0..KSTACK_POOL_BYTES], 0);
-    debug.klog("[proc] kstack pool: {d} slots PMM-backed @ phys 0x{X} va 0x{X} ({d} KB)\n", .{ MAX_PROCS, block_phys, region_va, KSTACK_POOL_BYTES / 1024 });
+    debug.klog("[proc] kstack pool: {d} slots PMM-backed @ phys 0x{X} va 0x{X} ({d} KB)\n", .{ MAX_PROCS, block_phys.raw(), region_va, KSTACK_POOL_BYTES / 1024 });
 
     // Punch the unmapped guard page at the bottom of every slot so a stack
     // overflow #PFs (a kernel-mode not-present fault → fatal autopsy, since the

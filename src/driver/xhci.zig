@@ -1,6 +1,7 @@
 const pci = @import("pci.zig");
 const paging = @import("../mm/paging.zig");
 const pmm = @import("../mm/pmm.zig");
+const Phys = @import("../util/addr.zig").Phys;
 const debug = @import("../debug/debug.zig");
 const process = @import("../proc/process.zig");
 const keyboard = @import("keyboard.zig");
@@ -352,7 +353,7 @@ fn portscAddr(port: u8) usize {
 
 fn initRing() ?Ring {
     // Allocate one page for command/event rings
-    const phys = pmm.allocFrame() orelse return null;
+    const phys = (pmm.allocFrame() orelse return null).raw();
     const ptr: [*]u8 = @ptrFromInt(paging.physToVirt(phys));
     @memset(ptr[0..4096], 0);
 
@@ -366,7 +367,7 @@ fn initRing() ?Ring {
 
 fn initTransferRing() ?Ring {
     // 1 page = 256 TRBs (255 usable + Link TRB) — guaranteed contiguous physical memory
-    const phys = pmm.allocFrame() orelse return null;
+    const phys = (pmm.allocFrame() orelse return null).raw();
     const trbs: [*]volatile TRB = @ptrFromInt(paging.physToVirt(phys));
     @memset(@as([*]u8, @ptrFromInt(paging.physToVirt(phys)))[0..4096], 0);
 
@@ -597,10 +598,10 @@ pub fn init() bool {
 
     // --- Allocate DCBAA ---
     // (max_slots + 1) * 8 bytes, must be 64-byte aligned. One page is fine.
-    const dcbaa_page = pmm.allocFrame() orelse {
+    const dcbaa_page = (pmm.allocFrame() orelse {
         debug.klog("[xhci] Failed to allocate DCBAA\n", .{});
         return false;
-    };
+    }).raw();
     dcbaa_phys = dcbaa_page;
     const dcbaa_ptr: [*]u8 = @ptrFromInt(paging.physToVirt(dcbaa_page));
     @memset(dcbaa_ptr[0..4096], 0);
@@ -619,7 +620,7 @@ pub fn init() bool {
     debug.klog("[xhci] Command ring at 0x{x}\n", .{cmd_ring.phys});
 
     // --- Allocate Event Ring (4 contiguous pages = 1024 TRBs) ---
-    const evt_phys = pmm.allocContiguous(4) orelse return false;
+    const evt_phys = (pmm.allocContiguous(4) orelse return false).raw();
     @memset(@as([*]u8, @ptrFromInt(paging.physToVirt(evt_phys)))[0..4096 * 4], 0);
     _ = iommu.dmaMap(pci_bus, pci_dev, pci_func, evt_phys, 4096 * 4, .{});
     evt_ring = .{
@@ -632,10 +633,10 @@ pub fn init() bool {
 
     // --- Set up Event Ring Segment Table ---
     // ERST: one entry = {base_addr_lo, base_addr_hi, ring_size, reserved}
-    const erst_page = pmm.allocFrame() orelse {
+    const erst_page = (pmm.allocFrame() orelse {
         debug.klog("[xhci] Failed to allocate ERST\n", .{});
         return false;
-    };
+    }).raw();
     erst_phys = erst_page;
     _ = iommu.dmaMap(pci_bus, pci_dev, pci_func, erst_phys, 4096, .{});
     const erst: [*]volatile u32 = @ptrFromInt(paging.physToVirt(erst_page));
@@ -863,7 +864,7 @@ pub fn resumeFromS3() bool {
     device_count = 0;
     enumeration_done = false;
     if (scratch_phys != 0) {
-        pmm.freeFrame(scratch_phys);
+        pmm.freeFrame(Phys.of(scratch_phys));
         scratch_phys = 0;
     }
 
@@ -879,10 +880,10 @@ pub fn resumeFromS3() bool {
 
 fn scanAndEnumerate() void {
     // Allocate scratch buffer for control transfers
-    scratch_phys = pmm.allocFrame() orelse {
+    scratch_phys = (pmm.allocFrame() orelse {
         debug.klog("[xhci] Failed to allocate scratch buffer\n", .{});
         return;
-    };
+    }).raw();
     @memset(@as([*]u8, @ptrFromInt(paging.physToVirt(scratch_phys)))[0..4096], 0);
     _ = iommu.dmaMap(pci_bus, pci_dev, pci_func, scratch_phys, 4096, .{});
 
@@ -1056,9 +1057,9 @@ fn enumerateDevice(port: u8, speed: u8) void {
     debug.klog("[xhci] Slot {d} enabled for port {d}\n", .{ slot_id, port + 1 });
 
     // Step 2: Allocate Input Context + Device Context
-    const input_ctx_phys = pmm.allocFrame() orelse return;
-    const dev_ctx_phys = pmm.allocFrame() orelse return;
-    const tr_phys = pmm.allocFrame() orelse return;
+    const input_ctx_phys = (pmm.allocFrame() orelse return).raw();
+    const dev_ctx_phys = (pmm.allocFrame() orelse return).raw();
+    const tr_phys = (pmm.allocFrame() orelse return).raw();
     // Map per-device DMA targets before the controller touches them.
     // input_ctx is read by ADDRESS_DEVICE / CONFIGURE_ENDPOINT; dev_ctx
     // and tr (transfer ring) are read/written on every URB.
@@ -1415,7 +1416,7 @@ fn enumerateDevice(port: u8, speed: u8) void {
         debug.klog("[xhci] Endpoint configured, DCI={d}\n", .{dci});
 
         // Allocate per-device data buffer page
-        const dev_data_phys = pmm.allocFrame() orelse return;
+        const dev_data_phys = (pmm.allocFrame() orelse return).raw();
         @memset(@as([*]u8, @ptrFromInt(paging.physToVirt(dev_data_phys)))[0..4096], 0);
         _ = iommu.dmaMap(pci_bus, pci_dev, pci_func, dev_data_phys, 4096, .{});
 
@@ -1507,7 +1508,7 @@ fn enumerateDevice(port: u8, speed: u8) void {
         debug.klog("[xhci] MSC endpoints configured: IN DCI={d} OUT DCI={d}\n", .{ in_dci, out_dci });
 
         // Allocate data buffer page for MSC
-        const msc_data_phys = pmm.allocFrame() orelse return;
+        const msc_data_phys = (pmm.allocFrame() orelse return).raw();
         @memset(@as([*]u8, @ptrFromInt(paging.physToVirt(msc_data_phys)))[0..4096], 0);
         _ = iommu.dmaMap(pci_bus, pci_dev, pci_func, msc_data_phys, 4096, .{});
 
@@ -1763,7 +1764,7 @@ fn setupUasStreams(slot_id: u8, input_ctx_phys: usize, speed_val: u32) bool {
     // One page holds the three Primary Stream Context Arrays (the command
     // pipe has no streams). Each array is 4 entries x 16 B = 64 B; spaced
     // 256 B apart for clarity (all are 16-byte aligned within the page).
-    const sca_page = pmm.allocFrame() orelse return false;
+    const sca_page = (pmm.allocFrame() orelse return false).raw();
     @memset(@as([*]u8, @ptrFromInt(paging.physToVirt(sca_page)))[0..4096], 0);
     _ = iommu.dmaMap(pci_bus, pci_dev, pci_func, sca_page, 4096, .{});
     const status_sca = sca_page + 0;
@@ -1811,7 +1812,7 @@ fn setupUasStreams(slot_id: u8, input_ctx_phys: usize, speed_val: u32) bool {
     }
 
     // IU + data DMA staging buffer (enlarged in U3 for multi-sector reads).
-    const data_phys = pmm.allocFrame() orelse return false;
+    const data_phys = (pmm.allocFrame() orelse return false).raw();
     @memset(@as([*]u8, @ptrFromInt(paging.physToVirt(data_phys)))[0..4096], 0);
     _ = iommu.dmaMap(pci_bus, pci_dev, pci_func, data_phys, 4096, .{});
 

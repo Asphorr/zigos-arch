@@ -9,6 +9,7 @@
 const pmm = @import("pmm.zig");
 const memmap = @import("memmap.zig");
 const layout = @import("layout.zig");
+const Phys = @import("../util/addr.zig").Phys;
 
 // Page table entry flags (same bit positions in x86_64)
 pub const PRESENT: u64 = 1 << 0;
@@ -499,11 +500,11 @@ pub fn setRangeWriteCombining(phys: u64, size: u64) void {
                 debug.klog("[paging] FATAL setRangeWriteCombining: PMM OOM splitting 1GB at phys=0x{X} — WC upgrade abandoned mid-range\n", .{p});
                 return;
             };
-            const new_pd: [*]u64 = @ptrFromInt(physToVirt(new_pd_phys));
+            const new_pd = new_pd_phys.toVirt().ptr([*]u64);
             for (0..512) |i| {
                 new_pd[i] = (gb_phys + @as(u64, @intCast(i)) * 0x200000) | leaf_template;
             }
-            pdpt[pdpt_idx] = @as(u64, new_pd_phys) | (pdpte & PTR_FLAGS_MASK);
+            pdpt[pdpt_idx] = new_pd_phys.raw() | (pdpte & PTR_FLAGS_MASK);
             pdpte = pdpt[pdpt_idx];
         }
         const pd: [*]volatile u64 = @ptrFromInt(physToVirt(pdpte & PAGE_MASK));
@@ -567,9 +568,9 @@ fn ensureMapped(phys: usize, size: usize, cache_flag: u64) void {
                 debug.klog("[paging] FATAL ensureMapped: PMM OOM allocating PDPT for VA=0x{X}\n", .{addr});
                 return;
             };
-            const p: [*]u8 = @ptrFromInt(physToVirt(page));
+            const p = page.toVirt().ptr([*]u8);
             @memset(p[0..4096], 0);
-            pml4[pml4_idx] = @as(u64, page) | TBL_FLAGS;
+            pml4[pml4_idx] = page.raw() | TBL_FLAGS;
         }
 
         const pdpt_phys = pml4[pml4_idx] & PAGE_MASK;
@@ -581,9 +582,9 @@ fn ensureMapped(phys: usize, size: usize, cache_flag: u64) void {
                 debug.klog("[paging] FATAL ensureMapped: PMM OOM allocating PD for VA=0x{X}\n", .{addr});
                 return;
             };
-            const p: [*]u8 = @ptrFromInt(physToVirt(page));
+            const p = page.toVirt().ptr([*]u8);
             @memset(p[0..4096], 0);
-            pdpt[pdpt_idx] = @as(u64, page) | TBL_FLAGS;
+            pdpt[pdpt_idx] = page.raw() | TBL_FLAGS;
         }
 
         // Check if PDPT entry is a 1GB page (shouldn't be for our setup)
@@ -663,7 +664,7 @@ pub fn unmapGuiFB(pid: u8, num_pages_per_buf: u32) void {
     if (front != 0) {
         var i: u32 = 0;
         while (i < num_pages_per_buf) : (i += 1) {
-            pmm.releaseFrame(front + i * 4096);
+            pmm.releaseFrame(Phys.of(front + i * 4096));
         }
         gui_fb_phys_base[pid] = 0;
     }
@@ -671,7 +672,7 @@ pub fn unmapGuiFB(pid: u8, num_pages_per_buf: u32) void {
     while (s < 3) : (s += 1) {
         const back = gui_fb_back_phys[pid][s];
         if (back != 0) {
-            pmm.freeContiguous(back, num_pages_per_buf);
+            pmm.freeContiguous(Phys.of(back), num_pages_per_buf);
             gui_fb_back_phys[pid][s] = 0;
         }
     }
@@ -976,11 +977,11 @@ fn splitToPte(virt: usize) ?*u64 {
             debug.klog("[paging] FATAL splitToPte: PMM OOM splitting 1GB at VA=0x{X} — guard/watch install will fail\n", .{virt});
             return null;
         };
-        const new_pd: [*]u64 = @ptrFromInt(physToVirt(new_pd_phys));
+        const new_pd = new_pd_phys.toVirt().ptr([*]u64);
         for (0..512) |i| {
             new_pd[i] = (gb_phys + @as(u64, @intCast(i)) * 0x200000) | leaf_template;
         }
-        pdpt[pdpt_idx] = @as(u64, new_pd_phys) | (orig & PTR_FLAGS_MASK);
+        pdpt[pdpt_idx] = new_pd_phys.raw() | (orig & PTR_FLAGS_MASK);
     }
 
     const pd: [*]u64 = @ptrFromInt(physToVirt(pdpt[pdpt_idx] & PAGE_MASK));
@@ -1000,11 +1001,11 @@ fn splitToPte(virt: usize) ?*u64 {
             debug.klog("[paging] FATAL splitToPte: PMM OOM splitting 2MB at VA=0x{X} — guard/watch install will fail\n", .{virt});
             return null;
         };
-        const new_pt: [*]u64 = @ptrFromInt(physToVirt(new_pt_phys));
+        const new_pt = new_pt_phys.toVirt().ptr([*]u64);
         for (0..512) |i| {
             new_pt[i] = (huge_phys + @as(u64, @intCast(i)) * 4096) | leaf_template;
         }
-        pd[pd_idx] = @as(u64, new_pt_phys) | (orig & PTR_FLAGS_MASK);
+        pd[pd_idx] = new_pt_phys.raw() | (orig & PTR_FLAGS_MASK);
     }
 
     const pt: [*]u64 = @ptrFromInt(physToVirt(pd[pd_idx] & PAGE_MASK));

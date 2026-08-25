@@ -39,6 +39,7 @@ const pcid_mod = @import("../cpu/mmu/pcid.zig");
 const heap = @import("../mm/heap.zig");
 const pmm = @import("../mm/pmm.zig");
 const swap = @import("../mm/swap.zig");
+const Phys = @import("../util/addr.zig").Phys;
 const symbols = @import("../debug/symbols.zig");
 const smp = @import("../cpu/smp.zig");
 const memmap = @import("../mm/memmap.zig");
@@ -816,7 +817,7 @@ pub fn reclaimInflightFrame(pid: usize) void {
     if (pid >= MAX_PROCS) return;
     const cur = @atomicRmw(usize, &process.procs[pid].swap_inflight_frame, .Xchg, 0, .acq_rel);
     if (cur == 0) return;
-    pmm.freeFrame(cur);
+    pmm.freeFrame(Phys.of(cur));
 }
 
 /// Walk a dying process's fd_table and close any pipe fds so the pipe pool's
@@ -1083,7 +1084,7 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp, persist_shared_dirty: 
             // the kernel physmap. Translate VA → phys before handing to
             // PMM (which lives in phys space).
             const base: usize = paging.virtToPhys(@intFromPtr(src)).?;
-            pmm.freeContiguous(base, r.buf_pages);
+            pmm.freeContiguous(Phys.of(base), r.buf_pages);
         }
         lead.lazy_count = 0;
         lead.heap_lazy_idx = -1;
@@ -1620,7 +1621,7 @@ fn freeElfBuf(pcb: *PCB) void {
             // physToVirt result). PMM speaks phys, translate.
             const paging = @import("../mm/paging.zig");
             const base: usize = paging.virtToPhys(@intFromPtr(buf)).?;
-            pmm.freeContiguous(base, pcb.elf_buf_pages);
+            pmm.freeContiguous(Phys.of(base), pcb.elf_buf_pages);
         }
         pcb.elf_buf = null;
         pcb.elf_buf_pages = 0;

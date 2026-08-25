@@ -63,7 +63,7 @@ pub fn Dma(comptime T: type) type {
         /// DMA-ing into a freed ring is a use-after-free with a bus master
         /// on the other end.
         pub fn free(self: Self) void {
-            pmm.freeContiguous(@intCast(self.base_raw), @intCast(pagesFor(self.bytes())));
+            pmm.freeContiguous(self.device(), @intCast(pagesFor(self.bytes())));
         }
 
         /// Allocate `count` items of `T`: physically contiguous whole
@@ -75,7 +75,7 @@ pub fn Dma(comptime T: type) type {
         pub fn alloc(count: usize) ?Self {
             const pages = pagesFor(count * @sizeOf(T));
             const phys = pmm.allocContiguous(@intCast(pages)) orelse return null;
-            const d = Self{ .base_raw = phys, .count = count };
+            const d = Self{ .base_raw = phys.raw(), .count = count };
             @memset(d.device().toVirt().ptr([*]u8)[0 .. pages * PAGE_BYTES], 0);
             return d;
         }

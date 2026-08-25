@@ -27,6 +27,7 @@
 const serial = @import("../debug/serial.zig");
 const page_cache = @import("../mm/page_cache.zig");
 const pmm = @import("../mm/pmm.zig");
+const Phys = @import("../util/addr.zig").Phys;
 
 const WAYS = page_cache.WAYS; // 8
 const PG = page_cache.PAGE_SIZE;
@@ -86,7 +87,7 @@ fn test1HitMiss() void {
             return;
         };
         check(r.fresh, "test1 first insert of a key should be fresh");
-        check(pmm.frameRefCount(r.frame) == 1, "test1 a fresh cache frame should be refcount 1");
+        check(pmm.frameRefCount(Phys.of(r.frame)) == 1, "test1 a fresh cache frame should be refcount 1");
         frames[i] = r.frame;
     }
     check(frames[0] != frames[1] and frames[1] != frames[2] and frames[2] != frames[3], "test1 distinct keys must get distinct frames");
@@ -156,7 +157,7 @@ fn test3PinSurvives() void {
         check(false, "test3 pin(k0) missed a resident key");
         return;
     };
-    check(pmm.frameRefCount(pinned) == 2, "test3 a pinned cache frame should be refcount 2");
+    check(pmm.frameRefCount(Phys.of(pinned)) == 2, "test3 a pinned cache frame should be refcount 2");
 
     _ = page_cache.getOrAlloc(fid, keys[WAYS]); // forces an eviction; k0 pinned -> k1 goes
 
@@ -164,7 +165,7 @@ fn test3PinSurvives() void {
     check(page_cache.lookup(fid, keys[1]) == null, "test3 an unpinned peer (k1) should be evicted instead");
     check(page_cache.lookup(fid, keys[WAYS]) != null, "test3 the newly inserted page should be resident");
 
-    pmm.releaseFrame(pinned); // drop our pin so init() can reclaim it
+    pmm.releaseFrame(Phys.of(pinned)); // drop our pin so init() can reclaim it
     page_cache.init();
 }
 
@@ -196,7 +197,7 @@ fn test4FullyPinned() void {
     check(page_cache.stat_full_skips == skip_before + 1, "test4 a fully-pinned set should record one full_skip");
 
     i = 0;
-    while (i < WAYS) : (i += 1) pmm.releaseFrame(pins[i]); // unpin all
+    while (i < WAYS) : (i += 1) pmm.releaseFrame(Phys.of(pins[i])); // unpin all
     page_cache.init();
 }
 
@@ -221,7 +222,7 @@ fn test5NoLeak() void {
     i = 0;
     while (i < 4) : (i += 1) check(page_cache.invalidate(fid, i * PG), "test5 invalidate of a present key should return true");
     i = 0;
-    while (i < 4) : (i += 1) check(pmm.frameRefCount(frames[i]) == 0, "test5 an invalidated frame must be freed (refcount 0) — leak otherwise");
+    while (i < 4) : (i += 1) check(pmm.frameRefCount(Phys.of(frames[i])) == 0, "test5 an invalidated frame must be freed (refcount 0) — leak otherwise");
 
     check(page_cache.residentCount() == 0, "test5 residentCount should be 0 after invalidating everything");
 }

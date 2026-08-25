@@ -6,6 +6,7 @@ const debug = @import("../debug/debug.zig");
 const vmm = @import("../mm/vmm.zig");
 const pmm = @import("../mm/pmm.zig");
 const paging = @import("../mm/paging.zig");
+const Phys = @import("../util/addr.zig").Phys;
 const symbols = @import("../debug/symbols.zig");
 const memmap = @import("../mm/memmap.zig");
 const config = @import("../config.zig");
@@ -90,7 +91,7 @@ fn allocAndCopyElfBuf(staging: [*]const u8, file_size: usize) ?ElfBuf {
         return null;
     };
     // Reach the PMM frame through the kernel physmap.
-    const buf: [*]u8 = @ptrFromInt(paging.physToVirt(phys));
+    const buf = phys.toVirt().ptr([*]u8);
     @memcpy(buf[0..file_size], staging[0..file_size]);
     return .{ .buf = buf, .pages = pages };
 }
@@ -107,7 +108,7 @@ fn freePmmRange(base_va: usize, pages: u32) void {
         debug.klog("[elf] freePmmRange: virtToPhys(0x{X:0>16}) failed — leaking {d} pages\n", .{ base_va, pages });
         return;
     };
-    pmm.freeContiguous(phys, pages);
+    pmm.freeContiguous(Phys.of(phys), pages);
 }
 
 /// Register a lazy region for a single PT_LOAD segment, sourced from elf_buf.

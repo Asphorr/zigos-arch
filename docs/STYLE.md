@@ -363,9 +363,29 @@ that passes, and rule 11 wanted named phases anyway).
 
 **Reference exemplar:** `e1000.allocRxRing`/`allocPacketArena`.
 **How to apply:** new DMA rings/buffers go through `Dma(T)`; existing
-loose phys/virt pairs convert when touched. Full typing of the pmm API
-(allocFrame → Phys, 192 sites) is the next incremental campaign, same
-route UserPtr took.
+loose phys/virt pairs convert when touched.
+
+The pmm public API speaks `Phys` since 2026-08-25 (the UserPtr-style
+chokepoint seizure): every allocator returns `?Phys`, every
+free/acquire/release/refcount takes `Phys`. What that means at a call
+site:
+
+- keep the value TYPED through its local flow — `phys.toVirt().ptr(T)`
+  replaces the `@ptrFromInt(paging.physToVirt(x))` idiom, `phys.add(n)`
+  does ring/stride math, and the free side then needs no conversion;
+- `.raw()` only at a genuine sink (PTE assembly, wire descriptor, a
+  not-yet-typed API like `vmm.mapUserPage`), `Phys.of(...)` only where
+  a raw integer re-enters (a PTE's phys bits, a registry field, a
+  `virtToPhys` result);
+- pmm INTERNALS and stored driver ring fields stay raw usize — the
+  boundary is the API, not the bitmap math behind it.
+
+The sweep's first scalp: `slab.releaseSlabToPmm` had been passing the
+slab's physmap VA to `freeFrame` — the MAX_FRAMES gate rejected it and
+every slab released past `empty_keep` (and every `shrink()`) silently
+leaked its frame. The same VA-vs-phys confusion elf_loader's
+`freePmmRange` had already paid for once. A typed `freeFrame(Phys)`
+makes that entire bug class unrepresentable.
 
 ## `mmio` windows — register blocks as types
 

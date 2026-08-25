@@ -29,6 +29,7 @@ const std = @import("std");
 const pmm = @import("pmm.zig");
 const paging = @import("paging.zig");
 const SpinLock = @import("../proc/spinlock.zig").SpinLock;
+const Phys = @import("../util/addr.zig").Phys;
 const debug = @import("../debug/debug.zig");
 const heap = @import("heap.zig");
 const kasan = @import("../debug/kasan.zig");
@@ -390,7 +391,7 @@ fn newSlab(cache: *Cache) ?*Slab {
     // `@ptrFromInt(phys)` only worked while PML4[0] held the legacy low
     // identity. With it dropped, the kernel's view of any PMM frame is
     // PHYSMAP_BASE + phys.
-    const virt = paging.physToVirt(phys);
+    const virt = phys.toVirt().raw();
     const s: *Slab = @ptrFromInt(virt);
     s.* = .{
         .magic = SLAB_MAGIC,
@@ -436,9 +437,8 @@ fn releaseSlabToPmm(cache: *Cache, s: *Slab) void {
     // handing it to the PMM. (The old code passed the VA straight through;
     // freeFrame's MAX_FRAMES gate rejected it with a "bad addr" warning and
     // every slab released past empty_keep — and every shrink() — leaked its
-    // frame. Found by the Phys typing sweep, 2026-08-25; same VA-vs-phys
-    // class elf_loader.freePmmRange already paid for once.)
-    pmm.freeFrame(paging.virtToPhys(@intFromPtr(s)).?);
+    // frame. Found by the Phys typing sweep, 2026-08-25.)
+    pmm.freeFrame(Phys.of(paging.virtToPhys(@intFromPtr(s)).?));
     if (cache.slab_count > 0) cache.slab_count -= 1;
 }
 

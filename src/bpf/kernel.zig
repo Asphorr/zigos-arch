@@ -234,8 +234,8 @@ var hook_code: ?[]u8 = null;
 /// and every program runs on the interpreter.
 fn jitInit() void {
     if (pmm.allocContiguous(JIT_CODE_FRAMES)) |phys| {
-        jit_code = @as([*]u8, @ptrFromInt(paging.physToVirt(phys)))[0..JIT_CODE_SIZE];
-        serial.print("[zbpf] jit: {d} KB code buffer @ phys 0x{X} (physmap-exec)\n", .{ JIT_CODE_SIZE / 1024, phys });
+        jit_code = phys.toVirt().ptr([*]u8)[0..JIT_CODE_SIZE];
+        serial.print("[zbpf] jit: {d} KB code buffer @ phys 0x{X} (physmap-exec)\n", .{ JIT_CODE_SIZE / 1024, phys.raw() });
     } else {
         serial.print("[zbpf] jit: no code buffer — interpreter only\n", .{});
     }
@@ -252,7 +252,7 @@ fn hookJitInit() void {
         serial.print("[zbpf] jit: no hook buffer — syscall hook stays interpreted\n", .{});
         return;
     };
-    const buf = @as([*]u8, @ptrFromInt(paging.physToVirt(phys)))[0 .. HOOK_CODE_FRAMES * 4096];
+    const buf = phys.toVirt().ptr([*]u8)[0 .. HOOK_CODE_FRAMES * 4096];
     const n = jit.compile(&BUILTIN_PROG, buf, &HELPERS) catch {
         serial.print("[zbpf] jit: hook compile failed — syscall hook stays interpreted\n", .{});
         return;

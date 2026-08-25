@@ -14,6 +14,7 @@ const debug = @import("../debug/debug.zig");
 const vmm = @import("../mm/vmm.zig");
 const pmm = @import("../mm/pmm.zig");
 const swap = @import("../mm/swap.zig");
+const Phys = @import("../util/addr.zig").Phys;
 const smp = @import("../cpu/smp.zig");
 
 const process = @import("process.zig");
@@ -141,7 +142,7 @@ fn handleCowFault(pml4: [*]align(4096) u64, cr2: usize) bool {
         }
     }
 
-    const old_phys = pte & paging.PAGE_MASK;
+    const old_phys = Phys.of(pte & paging.PAGE_MASK);
 
     // Sole-owner promote-in-place. Refcount may race against another CPU's
     // releaseFrame on the same shared frame, but the only outcome of being
@@ -163,8 +164,8 @@ fn handleCowFault(pml4: [*]align(4096) u64, cr2: usize) bool {
     // aware allocator: a runaway COW fault storm during memory pressure
     // shouldn't be allowed to deplete the kernel's emergency pool.
     const new_phys = pmm.allocFrameUser() orelse return false;
-    const src: [*]const u8 = @ptrFromInt(paging.physToVirt(old_phys));
-    const dst: [*]u8 = @ptrFromInt(paging.physToVirt(new_phys));
+    const src = old_phys.toVirt().ptr([*]const u8);
+    const dst = new_phys.toVirt().ptr([*]u8);
     @memcpy(dst[0..0x1000], src[0..0x1000]);
 
     // Replace phys field, clear COW, restore R/W. Other flag bits (USER, NX,
@@ -180,7 +181,7 @@ fn handleCowFault(pml4: [*]align(4096) u64, cr2: usize) bool {
     // returns resolved — the winner's mapping satisfies the retried write.
     // (Same CAS discipline reclaimViaSwap's A-bit aging already adopted
     // after its own pre-CAS 2x-eviction race.)
-    if (@cmpxchgStrong(u64, pte_p, pte, (pte & ~paging.PAGE_MASK & ~paging.COW) | new_phys | paging.READ_WRITE, .seq_cst, .seq_cst) != null) {
+    if (@cmpxchgStrong(u64, pte_p, pte, (pte & ~paging.PAGE_MASK & ~paging.COW) | new_phys.raw() | paging.READ_WRITE, .seq_cst, .seq_cst) != null) {
         pmm.freeFrame(new_phys);
         return true;
     }
@@ -208,7 +209,6 @@ fn handleCowFault(pml4: [*]align(4096) u64, cr2: usize) bool {
 fn faultInCachePage(pd: [*]align(4096) u64, r: process.LazyRegion, va_aligned: usize) bool {
     const page_cache = @import("../mm/page_cache.zig");
     const vfs = @import("../fs/vfs.zig");
-    const paging = @import("../mm/paging.zig");
 
     const file_id = page_cache.ext2FileId(r.cache_inode);
     const page_off = r.cache_off + (va_aligned - r.start);
@@ -221,10 +221,10 @@ fn faultInCachePage(pd: [*]align(4096) u64, r: process.LazyRegion, va_aligned: u
         // NO cache lock held, THEN publish it. Filling before publishing means
         // no other CPU can ever observe a half-filled cache page.
         const pf = pmm.allocFrameUser() orelse return false;
-        const dst: [*]u8 = @ptrFromInt(paging.physToVirt(pf));
+        const dst = pf.toVirt().ptr([*]u8);
         const n = @min(vfs.fillCachePage(r.cache_inode, page_off, dst), 0x1000);
         if (n < 0x1000) @memset(dst[n..0x1000], 0); // zero the tail past EOF
-        phys = page_cache.insertFilled(file_id, page_off, pf);
+        phys = page_cache.insertFilled(file_id, page_off, pf.raw());
     }
 
     // MAP_SHARED (cache_shared): map the shared cache frame WRITABLE so writes
@@ -234,7 +234,7 @@ fn faultInCachePage(pd: [*]align(4096) u64, r: process.LazyRegion, va_aligned: u
     // handleCowFault always copies and never steals the shared page).
     const map_flags = if (r.cache_shared) vmm.protToMapFlags(r.prot) else vmm.cacheMapFlags(r.prot);
     vmm.mapUserPage(pd, va_aligned, phys, map_flags) catch |e| {
-        pmm.freeFrame(phys); // release the mapper ref we took above
+        pmm.freeFrame(Phys.of(phys)); // release the mapper ref we took above
         // AlreadyMapped: another CPU faulted this exact page first — it's mapped
         // now, so the fault is resolved (that CPU's fault flagged it dirty if
         // shared). Any other error is a real failure.
@@ -270,7 +270,7 @@ fn tryMapCachedPage(pd: [*]align(4096) u64, r: process.LazyRegion, va_aligned: u
     // for its write into a private page). See faultInCachePage for the rationale.
     const map_flags = if (r.cache_shared) vmm.protToMapFlags(r.prot) else vmm.cacheMapFlags(r.prot);
     vmm.mapUserPage(pd, va_aligned, phys, map_flags) catch |e| {
-        pmm.freeFrame(phys);
+        pmm.freeFrame(Phys.of(phys));
         return e == error.AlreadyMapped;
     };
     if (r.cache_shared) page_cache.markDirty(file_id, page_off);
@@ -642,7 +642,7 @@ pub fn handleUserPageFault(cr2: usize, error_code: u64) bool {
             // calls freeFrame at release(refcount==0). Frame thus has
             // (N attachers + 1 shm-owned) refcount; munmap path drops the
             // attacher count, shm.release drops the +1.
-            pmm.acquireFrame(phys);
+            pmm.acquireFrame(Phys.of(phys));
             @import("../debug/kdbg.zig").pfEvent(@intCast(cur), cr2, @truncate(error_code), 0, true);
             return true;
         }

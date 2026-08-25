@@ -9,6 +9,7 @@ const process = @import("../../proc/process.zig");
 const vmm = @import("../../mm/vmm.zig");
 const pmm = @import("../../mm/pmm.zig");
 const paging = @import("../../mm/paging.zig");
+const Phys = @import("../../util/addr.zig").Phys;
 const bga = @import("../../ui/bga.zig");
 const vfs = @import("../../fs/vfs.zig");
 const desktop = @import("../../ui/desktop.zig");
@@ -194,7 +195,7 @@ pub fn sysMmap(len: u32, fd: u32, offset: u32) u32 {
         // User-driven fd-backed mmap — respect the PMM reserve so a
         // big mmap can't deplete the kernel emergency pool.
         const buf_phys = pmm.allocContiguousUser(num_pages) orelse return E_NOMEM;
-        const buf_ptr: [*]u8 = @ptrFromInt(paging.physToVirt(buf_phys));
+        const buf_ptr = buf_phys.toVirt().ptr([*]u8);
 
         const saved_off = pcb.fd_table[fd].offset;
         pcb.fd_table[fd].offset = offset;
@@ -210,7 +211,7 @@ pub fn sysMmap(len: u32, fd: u32, offset: u32) u32 {
             return E_INVAL;
         }
         if (n < len_pg) {
-            const tail: [*]u8 = @ptrFromInt(paging.physToVirt(buf_phys + n));
+            const tail = buf_phys.add(n).toVirt().ptr([*]u8);
             @memset(tail[0 .. len_pg - n], 0);
         }
 
@@ -526,7 +527,7 @@ pub fn sysMunmap(va: u32, len: u32) u32 {
     if (removed.buf_owned) {
         if (removed.source) |src| {
             const phys = paging.virtToPhys(@intFromPtr(src)).?;
-            pmm.freeContiguous(phys, removed.buf_pages);
+            pmm.freeContiguous(Phys.of(phys), removed.buf_pages);
         }
     }
 

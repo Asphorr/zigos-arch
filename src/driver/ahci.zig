@@ -324,7 +324,7 @@ fn setupPort(p: u8) bool {
     //   0x400-0x4FF: FIS receive area
     //   0x500-0x5FF: command table 0 (we only use slot 0)
     //   0x600-0xFFF: scratch / unused
-    const phys = pmm.allocContiguous(1) orelse return false;
+    const phys = (pmm.allocContiguous(1) orelse return false).raw();
     @memset(@as([*]u8, @ptrFromInt(paging.physToVirt(phys)))[0..4096], 0);
     ports[p].cmd_list_phys = phys;
     ports[p].fis_phys = phys + 0x400;
