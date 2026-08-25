@@ -202,11 +202,16 @@ converting existing hand asm must reproduce the old bytes — disassemble
 before and after (`objdump -d --disassemble=<sym>`, normalize
 addresses) and diff; the dispatch-contract conversion landed
 `ASM_IDENTICAL`. **Exemplar:** `frames.dispatch` — one value feeding
-sched_asm's switchTo/retToUserStub text, lifecycle's three forges
-(create/clone/fork), and elf_loader's Linux-ABI RSP override. **Future
-customers:** SyscallFrame/IrqFrame/ExcFrame push sides and the FXSAVE
-offset arithmetic (misc_irq.zig still carries a hand-checked "624B ≡ 0
-mod 16 ✓").
+sched_asm's switchTo/retToUserStub text, lifecycle's SIX forges (the
+user trio create/clone/fork and the kthread trio idle/S3-replant/
+kernel-task via `kthread_bytes`/`kthread_ret_pad`), elf_loader's
+Linux-ABI RSP override, and the six saved-RIP diagnostics via
+`saved_rip_off` (save_trace, watch, pcb_invariants, sched's
+pre-dispatch guard). **Future customers:** SyscallFrame/IrqFrame/
+ExcFrame push sides and the FXSAVE offset arithmetic (misc_irq.zig
+still carries a hand-checked "624B ≡ 0 mod 16 ✓"). ⚠ IrqFrame/ExcFrame
+match `dispatch.gprs` by convention, not derivation — convert before
+any reorder of `gprs`.
 
 ## `lock.assertHeld()` runtime checks
 

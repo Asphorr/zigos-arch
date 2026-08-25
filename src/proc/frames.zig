@@ -28,10 +28,17 @@
 //! geometry, which is exactly the part humans get wrong.
 //!
 //! Customers today: the first-dispatch contract below (sched_asm.zig's
-//! switchTo/retToUserStub + lifecycle.zig's three forges). The syscall
-//! and IRQ entry frames (their own push orders, their own hand-checked
-//! alignment comments — misc_irq.zig line 60) are future customers;
-//! convert them one at a time, each against its live disassembly.
+//! switchTo/retToUserStub + lifecycle.zig's SIX forges — the user trio
+//! create/clone/fork and the kthread trio idle/S3-replant/kernel-task)
+//! plus the six saved-RIP diagnostics addressing [kesp+saved_rip_off].
+//! The syscall and IRQ entry frames (their own push orders, their own
+//! hand-checked alignment comments — misc_irq.zig line 60) are future
+//! customers; convert them one at a time, each against its live
+//! disassembly. ⚠ Until then: signals.IrqFrame/ExcFrame and the
+//! IRQ-side push stubs are byte-identical to `dispatch.gprs` TODAY by
+//! shared convention, NOT by derivation — reordering dispatch.gprs
+//! "because it's derived now" would silently diverge four IRQ-side
+//! consumers. Convert them first, reorder after.
 
 const std = @import("std");
 
@@ -63,7 +70,11 @@ pub fn Frame(comptime order: []const Reg) type {
         }
 
         /// "popq %rbp\n..." in declared order. `%%` because the text is
-        /// spliced into `asm volatile` templates, where % escapes.
+        /// spliced into `asm volatile` templates, where % escapes (so
+        /// these strings are for operand-substituting asm only). Ends
+        /// with a trailing newline — a splice CALLER never adds one
+        /// after it; a multiline literal BEFORE a splice still needs
+        /// its own explicit "\n" terminator (literals carry none).
         pub const pop_asm: []const u8 = blk: {
             var s: []const u8 = "";
             for (order) |r| s = s ++ "popq %%" ++ @tagName(r) ++ "\n";
@@ -134,6 +145,26 @@ pub const dispatch = struct {
     /// Qword index of the ret slot within the switch frame region.
     pub const ret_slot = switch_frame.count;
 
+    /// switchTo's saved-RIP slot: the qword at [kesp + switch_frame.bytes]
+    /// — after the callee-save pops, `ret` consumes it. The diagnostics
+    /// (save_trace's HWBP mirror, watch's stale-kesp filter,
+    /// pcb_invariants' .text check, sched's pre-dispatch guard) address
+    /// the slot through THIS name; a hand-written "+ 48" is drift bait —
+    /// if the frame ever grows, those checks would re-aim at a
+    /// callee-save slot and pcb_invariants would start panicking on
+    /// legitimate frames.
+    pub const saved_rip_off = switch_frame.bytes;
+
+    /// Kernel-thread variant (idle tasks, S3 idle re-plant, kernel
+    /// tasks): no pt_regs — switchTo's ret lands DIRECTLY in the entry
+    /// fn. The frame is the switch frame + planted entry address + one
+    /// poison return slot, which also lands the entry fn at
+    /// RSP ≡ 8 (mod 16), exactly what a SysV `call` would have produced.
+    pub const kthread_bytes = switch_frame_bytes + 8;
+    /// Qword index of the poison slot (the entry fn's would-be return
+    /// address; kernel entries are noreturn, so 0 = trap-on-return).
+    pub const kthread_ret_pad = ret_slot + 1;
+
     comptime {
         // The documented constants this contract replaces — the new
         // formulation must reproduce the old numbers (house rule; same
@@ -144,15 +175,23 @@ pub const dispatch = struct {
         std.debug.assert(gprs.index(.rdi) == 8); // cloneCurrent's arg slot
         std.debug.assert(gprs.index(.rax) == 14); // fork's child-return slot
         std.debug.assert(iretq.rip.at() == 15 and iretq.ss.at() == 19);
-        // retToUserStub entry alignment: switchTo's ret consumed the
-        // planted slot, so the stub starts exactly pt_regs below the
-        // top — which must be 16-aligned for the iretq frame the CPU
-        // will some day push on this same kstack to line up.
+        std.debug.assert(saved_rip_off == 48); // the diagnostics' "+48"
+        std.debug.assert(kthread_bytes == 64); // kthread forges' old FRAME_BYTES
+        // Forged-vs-natural residue: total−switch ≡ 0 (mod 16) makes a
+        // forged kernel_esp ≡ 8 (mod 16) — the SAME residue a naturally
+        // switchTo-saved kesp has (entered via callq at ≡ 8, the saves
+        // keep ≡ 8). Forged and natural frames are therefore
+        // indistinguishable to switchTo. (The CPU's own iretq frames
+        // land at TSS.RSP0 = kstack_top, whose 16-alignment is pinned
+        // by config.zig's KSTACK_* 4096-multiple asserts and the pool's
+        // align(4096) — a different property, proven elsewhere.)
         std.debug.assert((total_bytes - switch_frame_bytes) % 16 == 0);
-        // switchTo's internal save_trace callsite: entry RSP ≡ 8 (mod
-        // 16) per SysV (reached via callq), the 6 saves keep it ≡ 8,
-        // and the one extra `pushq %rsi` before `callq` must land on 0.
+        // switchTo's internal save_trace callsite. PREMISE (not provable
+        // here — see the matching comment in sched_asm.zig): exactly ONE
+        // extra push sits between the saves and the callq. Under it:
+        // entry ≡ 8 (mod 16) per SysV callq, the saves keep it ≡ 8, and
+        // that one pushq %rsi lands the callq on ≡ 0.
         std.debug.assert(switch_frame.rspModAfter(8) == 8);
-        std.debug.assert((switch_frame.rspModAfter(8) + 16 - 8) % 16 == 0);
+        std.debug.assert(Frame(&.{.rsi}).rspModAfter(switch_frame.rspModAfter(8)) == 0);
     }
 };

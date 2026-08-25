@@ -84,9 +84,13 @@ pub fn switchTo() callconv(.naked) void {
         \\ jz 1f
         \\ movq %%rsp, (%%rdi)
         // ---- save_trace: record the kesp we just wrote -----------------
-        // Alignment at this callq is a comptime proof now (frames.zig,
-        // dispatch's comptime block): entry ≡ 8 (mod 16) per SysV, the
-        // saves keep it ≡ 8, the pushq %%rsi below lands the callq on 0.
+        // Byte facts: after the saves RSP = caller − 56, ≡ 8 (mod 16);
+        // the pushq %%rsi below → ≡ 0; callq's own push enters the
+        // callee at ≡ 8 ✓. frames.dispatch's comptime block re-checks
+        // this arithmetic — but ONLY under the premise that exactly ONE
+        // push sits between the saves and this callq. Nothing parses
+        // this hand-written middle: if you add ANY push here, recount
+        // and update the assert in frames.zig.
         // RSI carries next_kesp which the post-save path still needs, so
         // preserve it across the call. RDI is the kesp_ptr (= first SysV
         // arg), which save_trace_record consumes; we don't need it after.

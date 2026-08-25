@@ -49,6 +49,9 @@
 //! `process.kick_handler_runs[...]` / `process.wake_handler_runs[...]`.
 
 const std = @import("std");
+// File-scope hoist — schedule() is exactly the giant-fn shape where an
+// inline decl-heavy @import rolls the LLVM Invalid-type dice.
+const SAVED_RIP_OFF: usize = @import("frames.zig").dispatch.saved_rip_off;
 
 const vga = @import("../ui/vga.zig");
 const gdt = @import("../cpu/arch/gdt.zig");
@@ -1952,7 +1955,7 @@ pub fn schedule() void {
         // memory here could itself fault.
         {
             const kstop = process.procs[next].kernel_stack_top;
-            const rip_slot = next_kesp +% 48;
+            const rip_slot = next_kesp +% SAVED_RIP_OFF;
             if (rip_slot + 8 <= kstop and rip_slot >= kstop -% (4 * @import("../config.zig").KSTACK_SIZE)) {
                 const saved_rip = @as(*const u64, @ptrFromInt(rip_slot)).*;
                 // Plausibility: saved RIP from switchTo's ret must be in

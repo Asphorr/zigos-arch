@@ -18,6 +18,10 @@
 
 const std = @import("std");
 const process = @import("../proc/process.zig");
+// File-scope hoist, NOT inline in the fn bodies below: an @import of a
+// decl-heavy container inside a giant function is LLVM Invalid-type
+// roulette bait (see reference-llvm-anon-struct-bitcode-bug).
+const SAVED_RIP_OFF: usize = @import("../proc/frames.zig").dispatch.saved_rip_off;
 const config = @import("../config.zig");
 const smp = @import("../cpu/smp.zig");
 const memmap = @import("../mm/memmap.zig");
@@ -217,7 +221,7 @@ pub export fn save_trace_record(kesp_ptr: usize) callconv(.c) void {
     if (pid < config.MAX_PROCS) {
         const top = @atomicLoad(usize, &process.expected_kstack_tops[pid], .acquire);
         if (top != 0) {
-            const rip_slot = new_kesp +% 48;
+            const rip_slot = new_kesp +% SAVED_RIP_OFF;
             const body_lo = top -| config.KSTACK_SIZE;
             if (rip_slot >= body_lo and rip_slot + 8 <= top) {
                 saved_rip = @as(*const u64, @ptrFromInt(rip_slot)).*;
@@ -265,7 +269,7 @@ pub export fn save_trace_record(kesp_ptr: usize) callconv(.c) void {
         // task's lifetime — corrupters slipped through whenever they fired
         // before the next save_trace_record re-armed.
         if (hwbp_save_arm_enabled and rip_in_body == 1) {
-            const rip_slot = new_kesp +% 48;
+            const rip_slot = new_kesp +% SAVED_RIP_OFF;
             if (pid == 2 or pid == 3) {
                 const hw_slot: u2 = if (pid == 2) HWBP_SLOT_PID2 else HWBP_SLOT_PID3;
                 const label = if (pid == 2) "kesp48_pid2" else "kesp48_pid3";
@@ -374,7 +378,7 @@ pub fn mirrorIntact(pid: u8) bool {
     if (kesp != last_save_kesp[pid]) return true; // mirror stale, not bug
     const top = pcb.kernel_stack_top;
     if (top == 0 or kesp < (top - config.KSTACK_SIZE) or kesp >= top) return true;
-    const slot: *volatile u64 = @ptrFromInt(kesp + 48);
+    const slot: *volatile u64 = @ptrFromInt(kesp + SAVED_RIP_OFF);
     return slot.* == last_save_plus48[pid];
 }
 

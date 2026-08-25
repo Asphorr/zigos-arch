@@ -583,13 +583,14 @@ pub fn createKernelIdle(cpu_id: u8) ?usize {
     const slot_base = @intFromPtr(&process.kstack_pool[i]);
     const stack_top = slot_base + KSTACK_SLOT_SIZE;
 
-    const FRAME_BYTES: usize = 64;
-    const sw_base: [*]u64 = @ptrFromInt(stack_top - FRAME_BYTES);
-    for (0..6) |k| sw_base[k] = 0;
-    sw_base[6] = @intFromPtr(&kernelIdle);
-    sw_base[7] = 0;
+    // Kthread frame: switch-frame zeros + entry address + poison ret
+    // slot — geometry from the dispatch contract (dspec.kthread_*).
+    const sw_base: [*]u64 = @ptrFromInt(stack_top - dspec.kthread_bytes);
+    for (0..dspec.switch_frame.count) |k| sw_base[k] = 0;
+    sw_base[dspec.ret_slot] = @intFromPtr(&kernelIdle);
+    sw_base[dspec.kthread_ret_pad] = 0;
 
-    process.procs[i].kernel_esp = stack_top - FRAME_BYTES;
+    process.procs[i].kernel_esp = stack_top - dspec.kthread_bytes;
     process.procs[i].kernel_stack_top = stack_top;
     process.plantStackCanary(i); // P4: plant base canary BEFORE publishing the slot runnable
     @atomicStore(usize, &process.expected_kstack_tops[i], stack_top, .release);
@@ -635,13 +636,12 @@ pub fn resetKernelIdleForResume(idle_pid: usize) void {
     const slot_base = @intFromPtr(&process.kstack_pool[i]);
     const stack_top = slot_base + KSTACK_SLOT_SIZE;
 
-    const FRAME_BYTES: usize = 64;
-    const sw_base: [*]u64 = @ptrFromInt(stack_top - FRAME_BYTES);
-    for (0..6) |k| sw_base[k] = 0;
-    sw_base[6] = @intFromPtr(&kernelIdle);
-    sw_base[7] = 0;
+    const sw_base: [*]u64 = @ptrFromInt(stack_top - dspec.kthread_bytes);
+    for (0..dspec.switch_frame.count) |k| sw_base[k] = 0;
+    sw_base[dspec.ret_slot] = @intFromPtr(&kernelIdle);
+    sw_base[dspec.kthread_ret_pad] = 0;
 
-    process.procs[i].kernel_esp = stack_top - FRAME_BYTES;
+    process.procs[i].kernel_esp = stack_top - dspec.kthread_bytes;
     process.procs[i].kernel_stack_top = stack_top;
     // Stale dispatch-claim from before the suspend (this idle was current
     // on the AP at power-off; the clear in switchTo's asm never ran).
@@ -707,13 +707,12 @@ pub fn createKernelTask(
         break :blk top;
     };
 
-    const FRAME_BYTES: usize = 64;
-    const sw_base: [*]u64 = @ptrFromInt(stack_top - FRAME_BYTES);
-    for (0..6) |k| sw_base[k] = 0;
-    sw_base[6] = entry_fn_addr;
-    sw_base[7] = 0;
+    const sw_base: [*]u64 = @ptrFromInt(stack_top - dspec.kthread_bytes);
+    for (0..dspec.switch_frame.count) |k| sw_base[k] = 0;
+    sw_base[dspec.ret_slot] = entry_fn_addr;
+    sw_base[dspec.kthread_ret_pad] = 0;
 
-    process.procs[i].kernel_esp = stack_top - FRAME_BYTES;
+    process.procs[i].kernel_esp = stack_top - dspec.kthread_bytes;
     process.procs[i].kernel_stack_top = stack_top;
     process.plantStackCanary(i); // P4: plant base canary BEFORE publishing the slot runnable
     @atomicStore(usize, &process.expected_kstack_tops[i], stack_top, .release);

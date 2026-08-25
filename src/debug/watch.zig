@@ -30,6 +30,9 @@
 //! Address must be naturally aligned to LEN.
 
 const std = @import("std");
+// File-scope hoist (LLVM Invalid-type roulette: no decl-heavy @import
+// inside the giant handler bodies below).
+const SAVED_RIP_OFF: usize = @import("../proc/frames.zig").dispatch.saved_rip_off;
 const apic = @import("../time/apic.zig");
 const smp = @import("../cpu/smp.zig");
 const serial = @import("serial.zig");
@@ -604,7 +607,7 @@ pub fn onDebugException(rsp: u64, saved_rip: u64) bool {
             const process = @import("../proc/process.zig");
             if (save_trace.isPidRunningOrSchedulingOut(pid)) continue;
             const kesp_now = @atomicLoad(usize, &process.procs[pid].kernel_esp, .acquire);
-            if (kesp_now +% 48 != e.addr) continue;
+            if (kesp_now +% SAVED_RIP_OFF != e.addr) continue;
             const p: *const u64 = @ptrFromInt(@as(usize, @intCast(e.addr)));
             const v = p.*;
             const mirror = save_trace.last_save_plus48[pid];

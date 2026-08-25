@@ -21,6 +21,8 @@
 const std = @import("std");
 const process = @import("../proc/process.zig");
 const smp = @import("../cpu/smp.zig");
+// File-scope hoist (LLVM Invalid-type roulette bait inside big fns).
+const SAVED_RIP_OFF: usize = @import("../proc/frames.zig").dispatch.saved_rip_off;
 const config = @import("../config.zig");
 const debug = @import("debug.zig");
 const serial = @import("serial.zig");
@@ -148,7 +150,7 @@ fn checkPcb(pid: usize) ?[]const u8 {
         if (save_trace.isPidRunningOrSchedulingOut(@intCast(pid))) {
             // skip the saved-RIP body check — see comment above
         } else if (@atomicLoad(bool, &save_trace.pcb_has_been_saved[pid], .acquire)) {
-            const rip_slot = p.kernel_esp +% 48;
+            const rip_slot = p.kernel_esp +% SAVED_RIP_OFF;
             // Allow rip_slot in body OR in any IST1 — matches the kesp range
             // accepted above. Resume-via-IST1 still has the saved RA on IST1.
             const slot_in_body = rip_slot >= body_lo and rip_slot + 8 <= body_hi;
