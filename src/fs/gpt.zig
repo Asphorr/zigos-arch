@@ -37,6 +37,9 @@ const crc32 = @import("../util/crc32.zig");
 const endian = @import("../util/endian.zig");
 const random = @import("../crypto/random.zig");
 const fail = @import("../util/fail.zig").fail;
+const geom = @import("../util/geom.zig");
+const Lba = geom.Lba;
+const Span = geom.Span;
 
 const debug = @import("../debug/debug.zig");
 
@@ -45,6 +48,10 @@ const debug = @import("../debug/debug.zig");
 // =============================================================================
 
 pub const SECTOR_SIZE: u32 = 512;
+comptime {
+    // One authority for the sector size — the typed-quantity module.
+    std.debug.assert(SECTOR_SIZE == geom.SECTOR_SIZE);
+}
 
 /// "EFI PART" as a little-endian u64 — the header signature.
 const SIGNATURE: u64 = 0x5452415020494645;
@@ -64,7 +71,7 @@ pub const ENTRY_BYTES: u32 = 128;
 pub const ENTRY_ARRAY_SECTORS: u32 = ENTRY_COUNT * ENTRY_BYTES / SECTOR_SIZE;
 
 /// First LBA a partition may claim: MBR + header + array.
-pub const FIRST_USABLE_LBA: u64 = 2 + ENTRY_ARRAY_SECTORS;
+pub const FIRST_USABLE_LBA: Lba = Lba.of(2 + ENTRY_ARRAY_SECTORS);
 
 /// Partition alignment, in sectors: 1 MiB, the universal convention since
 /// Vista/parted 2.1. It exists because flash erase blocks and RAID stripes are
@@ -76,20 +83,20 @@ pub const FIRST_USABLE_LBA: u64 = 2 + ENTRY_ARRAY_SECTORS;
 pub const ALIGN_SECTORS: u64 = 2048;
 
 /// Rounds `lba` up to the next `ALIGN_SECTORS` boundary.
-pub fn alignUp(lba: u64) u64 {
-    return (lba + ALIGN_SECTORS - 1) / ALIGN_SECTORS * ALIGN_SECTORS;
+pub fn alignUp(lba: Lba) Lba {
+    return lba.alignUpTo(ALIGN_SECTORS);
 }
 
 /// Rounds `lba` down so that `lba + 1` lands on an alignment boundary — the
 /// right transform for an INCLUSIVE end LBA, so the next partition after it
 /// would start aligned.
-pub fn alignEndDown(lba: u64) u64 {
-    return (lba + 1) / ALIGN_SECTORS * ALIGN_SECTORS - 1;
+pub fn alignEndDown(lba: Lba) Lba {
+    return lba.alignEndDownTo(ALIGN_SECTORS);
 }
 
 /// Sectors reserved at each end of the disk. A disk smaller than twice this
 /// has no usable space at all and is refused up front.
-const RESERVED_SECTORS: u64 = FIRST_USABLE_LBA + ENTRY_ARRAY_SECTORS + 1;
+const RESERVED_SECTORS: u64 = FIRST_USABLE_LBA.raw() + ENTRY_ARRAY_SECTORS + 1;
 
 /// Entries surfaced by `parse`. The on-disk array holds 128, but a partition
 /// count that large is not a shape this kernel has any use for; overflow is
@@ -251,16 +258,17 @@ pub const Partition = struct {
     index: u32,
     type_guid: [16]u8,
     unique_guid: [16]u8,
-    start_lba: u64,
-    /// Inclusive.
-    end_lba: u64,
+    /// First..last INCLUSIVE, straight from the on-disk fields. Built as a
+    /// literal (no ordering assert): a hostile disk may carry an inverted
+    /// entry, and rejecting it is a caller policy, not a parser panic.
+    span: Span,
     /// Name transliterated to ASCII, NUL-padded. Non-ASCII code units become
     /// '?' — this is a display convenience, not a round-trip encoding.
     name: [NAME_UTF16_LEN]u8,
     name_len: usize,
 
-    pub fn sectorCount(self: Partition) u64 {
-        return self.end_lba - self.start_lba + 1;
+    pub fn sectorCount(self: Partition) geom.Sectors {
+        return self.span.count();
     }
 
     pub fn isEsp(self: Partition) bool {
@@ -270,8 +278,8 @@ pub const Partition = struct {
 
 pub const Table = struct {
     disk_guid: [16]u8,
-    first_usable_lba: u64,
-    last_usable_lba: u64,
+    first_usable_lba: Lba,
+    last_usable_lba: Lba,
     /// True when the header CRC matched on the primary; false means the table
     /// was recovered from the backup copy at the end of the disk. Surfaced so
     /// a caller can report the repair rather than silently paper over it.
@@ -296,13 +304,13 @@ pub const Table = struct {
 // Creation
 // =============================================================================
 
-/// What the caller wants laid down. `end_lba` is inclusive, matching the
-/// on-disk field, because converting between inclusive and exclusive at an
-/// API boundary is where off-by-one partition overlaps come from.
+/// What the caller wants laid down. The span is inclusive, matching the
+/// on-disk fields, because converting between inclusive and exclusive at an
+/// API boundary is where off-by-one partition overlaps come from — which is
+/// the whole reason geom.Span stores it that way.
 pub const PartSpec = struct {
     type_guid: [16]u8,
-    start_lba: u64,
-    end_lba: u64,
+    span: Span,
     /// ASCII; transliterated to UTF-16LE on write. Truncated at 36 code
     /// units with a warning rather than silently.
     name: []const u8,
@@ -342,19 +350,21 @@ pub fn create(dev: Device, specs: []const PartSpec) bool {
     const backup_array_lba = backup_header_lba - ENTRY_ARRAY_SECTORS;
     const last_usable = backup_array_lba - 1;
 
-    // Validate every spec before touching the disk.
+    // Validate every spec before touching the disk. Inverted spans are
+    // checked on the raw fields — a Span built as a literal can carry one,
+    // and rejecting it politely here beats asserting in count().
     for (specs, 0..) |s, i| {
-        if (s.end_lba < s.start_lba) {
-            debug.klog("[gpt] create: part {d} inverted ({d}..{d})\n", .{ i, s.start_lba, s.end_lba });
+        if (s.span.last.raw() < s.span.first.raw()) {
+            debug.klog("[gpt] create: part {d} inverted ({d}..{d})\n", .{ i, s.span.first.raw(), s.span.last.raw() });
             return false;
         }
-        if (s.start_lba < FIRST_USABLE_LBA or s.end_lba > last_usable) {
-            debug.klog("[gpt] create: part {d} range {d}..{d} outside usable {d}..{d}\n", .{ i, s.start_lba, s.end_lba, FIRST_USABLE_LBA, last_usable });
+        if (s.span.first.raw() < FIRST_USABLE_LBA.raw() or s.span.last.raw() > last_usable) {
+            debug.klog("[gpt] create: part {d} range {d}..{d} outside usable {d}..{d}\n", .{ i, s.span.first.raw(), s.span.last.raw(), FIRST_USABLE_LBA.raw(), last_usable });
             return false;
         }
         for (specs[0..i], 0..) |prev, j| {
-            if (s.start_lba <= prev.end_lba and prev.start_lba <= s.end_lba) {
-                debug.klog("[gpt] create: part {d} ({d}..{d}) overlaps part {d} ({d}..{d})\n", .{ i, s.start_lba, s.end_lba, j, prev.start_lba, prev.end_lba });
+            if (s.span.overlaps(prev.span)) {
+                debug.klog("[gpt] create: part {d} ({d}..{d}) overlaps part {d} ({d}..{d})\n", .{ i, s.span.first.raw(), s.span.last.raw(), j, prev.span.first.raw(), prev.span.last.raw() });
                 return false;
             }
         }
@@ -405,7 +415,7 @@ pub fn create(dev: Device, specs: []const PartSpec) bool {
         .my_lba = 1,
         .alternate_lba = backup_header_lba,
         .entry_lba = 2,
-        .first_usable = FIRST_USABLE_LBA,
+        .first_usable = FIRST_USABLE_LBA.raw(),
         .last_usable = last_usable,
         .disk_guid = disk_guid,
         .entries_crc = entries_crc,
@@ -415,13 +425,13 @@ pub fn create(dev: Device, specs: []const PartSpec) bool {
         .my_lba = backup_header_lba,
         .alternate_lba = 1,
         .entry_lba = backup_array_lba,
-        .first_usable = FIRST_USABLE_LBA,
+        .first_usable = FIRST_USABLE_LBA.raw(),
         .last_usable = last_usable,
         .disk_guid = disk_guid,
         .entries_crc = entries_crc,
     })) return false;
 
-    debug.klog("[gpt] wrote table: {d} partitions, usable {d}..{d}, backup header at {d}\n", .{ specs.len, FIRST_USABLE_LBA, last_usable, backup_header_lba });
+    debug.klog("[gpt] wrote table: {d} partitions, usable {d}..{d}, backup header at {d}\n", .{ specs.len, FIRST_USABLE_LBA.raw(), last_usable, backup_header_lba });
     return true;
 }
 
@@ -468,8 +478,8 @@ fn buildEntry(spec: PartSpec) Entry {
     var e: Entry = .{
         .type_guid = spec.type_guid,
         .unique_guid = undefined,
-        .starting_lba = endian.LE(u64).init(spec.start_lba),
-        .ending_lba = endian.LE(u64).init(spec.end_lba),
+        .starting_lba = endian.LE(u64).init(spec.span.first.raw()),
+        .ending_lba = endian.LE(u64).init(spec.span.last.raw()),
         .attributes = endian.LE(u64).init(0),
         .name = .{0} ** 72,
     };
@@ -641,8 +651,8 @@ fn buildTable(dev: Device, h: Header, from_backup: bool) ParseError!Table {
 
     var t: Table = .{
         .disk_guid = h.disk_guid,
-        .first_usable_lba = h.first_usable_lba.get(),
-        .last_usable_lba = h.last_usable_lba.get(),
+        .first_usable_lba = Lba.of(h.first_usable_lba.get()),
+        .last_usable_lba = Lba.of(h.last_usable_lba.get()),
         .from_backup = from_backup,
         .truncated = false,
         .count = 0,
@@ -700,8 +710,9 @@ fn decodeEntry(e: Entry, index: u32) Partition {
         .index = index,
         .type_guid = e.type_guid,
         .unique_guid = e.unique_guid,
-        .start_lba = e.starting_lba.get(),
-        .end_lba = e.ending_lba.get(),
+        // Literal, not fromFirstLast: on-disk bytes may be inverted garbage
+        // and the parser reports, it does not assert.
+        .span = .{ .first = Lba.of(e.starting_lba.get()), .last = Lba.of(e.ending_lba.get()) },
         .name = .{0} ** NAME_UTF16_LEN,
         .name_len = 0,
     };

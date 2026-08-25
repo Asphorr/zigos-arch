@@ -37,6 +37,7 @@ const block = @import("../driver/block.zig");
 const nvme = @import("../driver/nvme.zig");
 
 const gpt = @import("../fs/gpt.zig");
+const geom = @import("../util/geom.zig");
 const ext2_mkfs = @import("../fs/ext2/mkfs.zig");
 const fat_mkfs = @import("../fs/fat32_mkfs.zig");
 const ext2_layout = @import("../fs/ext2/layout.zig");
@@ -1021,12 +1022,12 @@ fn computeLayout() bool {
     const d = disks[selected];
     // 64 MiB ESP: the conventional size, and comfortably above the FAT32
     // cluster-count floor — see the trap documented in fs/fat32_mkfs.zig.
-    esp_start = gpt.alignUp(gpt.FIRST_USABLE_LBA);
+    esp_start = gpt.alignUp(gpt.FIRST_USABLE_LBA).raw();
     esp_end = esp_start + 64 * 2048 - 1;
     root_start = esp_end + 1;
     // Leave the backup entry array plus its header at the tail, then pull the
     // end back to an alignment boundary.
-    root_end = gpt.alignEndDown(d.sectors - 1 - gpt.ENTRY_ARRAY_SECTORS - 1);
+    root_end = gpt.alignEndDown(geom.Lba.of(d.sectors - 1 - gpt.ENTRY_ARRAY_SECTORS - 1)).raw();
 
     if (esp_end >= d.sectors or root_start >= root_end) {
         fail_reason = "Disk is too small for a 64 MiB ESP plus a root.";
@@ -1083,8 +1084,8 @@ fn stepInstall() void {
     switch (phase) {
         .write_gpt => {
             const specs = [_]gpt.PartSpec{
-                .{ .type_guid = gpt.TYPE_ESP, .start_lba = esp_start, .end_lba = esp_end, .name = "EFI System" },
-                .{ .type_guid = gpt.TYPE_LINUX_DATA, .start_lba = root_start, .end_lba = root_end, .name = "ZIGOS" },
+                .{ .type_guid = gpt.TYPE_ESP, .span = geom.Span.fromFirstLast(geom.Lba.of(esp_start), geom.Lba.of(esp_end)), .name = "EFI System" },
+                .{ .type_guid = gpt.TYPE_LINUX_DATA, .span = geom.Span.fromFirstLast(geom.Lba.of(root_start), geom.Lba.of(root_end)), .name = "ZIGOS" },
             };
             logLine("[gpt] ESP  {d}..{d}", .{ esp_start, esp_end });
             logLine("[gpt] root {d}..{d}", .{ root_start, root_end });
@@ -1110,7 +1111,7 @@ fn stepInstall() void {
                 return;
             }
             for (table.parts[0..table.count]) |p| {
-                logLine("[gpt] part {d} {d}..{d} \"{s}\"", .{ p.index + 1, p.start_lba, p.end_lba, p.name[0..p.name_len] });
+                logLine("[gpt] part {d} {d}..{d} \"{s}\"", .{ p.index + 1, p.span.first.raw(), p.span.last.raw(), p.name[0..p.name_len] });
             }
             logLine("ok   table re-read and matches", .{});
             finished(.mkfs_esp);
@@ -1124,13 +1125,13 @@ fn stepInstall() void {
             }
             if (!fat_mkfs.format(.{
                 .dev = dev,
-                .part_lba = @intCast(p.start_lba),
-                .part_sectors = @intCast(p.sectorCount()),
+                .part_lba = @intCast(p.span.first.raw()),
+                .part_sectors = @intCast(p.sectorCount().raw()),
             }, "ZIGOS ESP")) {
                 fail("mkfs.fat32 failed. See the serial log.");
                 return;
             }
-            logLine("ok   FAT32 on partition 1 ({d} MiB)", .{p.sectorCount() / 2048});
+            logLine("ok   FAT32 on partition 1 ({d} MiB)", .{p.sectorCount().raw() / 2048});
             finished(.mkfs_root);
         },
 
@@ -1138,13 +1139,13 @@ fn stepInstall() void {
             const p = table.parts[1];
             if (!ext2_mkfs.format(.{
                 .dev = dev,
-                .part_lba = @intCast(p.start_lba),
-                .part_sectors = @intCast(p.sectorCount()),
+                .part_lba = @intCast(p.span.first.raw()),
+                .part_sectors = @intCast(p.sectorCount().raw()),
             }, "ZIGOS")) {
                 fail("mkfs.ext2 failed. See the serial log.");
                 return;
             }
-            logLine("ok   ext2 on partition 2 ({d} MiB)", .{p.sectorCount() / 2048});
+            logLine("ok   ext2 on partition 2 ({d} MiB)", .{p.sectorCount().raw() / 2048});
             finished(.copy_root);
         },
 
@@ -1155,7 +1156,7 @@ fn stepInstall() void {
                     fail("Out of memory for the copy working set.");
                     return;
                 };
-                if (!ext2_blk.mountAt(target_mount, block.readSectorsTargetU16, block.writeSectorsTargetU16, @intCast(p.start_lba))) {
+                if (!ext2_blk.mountAt(target_mount, block.readSectorsTargetU16, block.writeSectorsTargetU16, @intCast(p.span.first.raw()))) {
                     fail("Mounting the freshly-formatted root failed.");
                     return;
                 }
@@ -1190,7 +1191,7 @@ fn stepInstall() void {
 
         .install_boot => {
             const p = table.parts[0];
-            var esp = fat_pop.open(dev, @intCast(p.start_lba)) orelse {
+            var esp = fat_pop.open(dev, @intCast(p.span.first.raw())) orelse {
                 fail("Re-opening the fresh ESP failed.");
                 return;
             };
@@ -1224,8 +1225,8 @@ fn stepInstall() void {
             const p = table.parts[0];
             if (uefi_nvram.addBootEntry("ZigOS", .{
                 .partition_number = p.index + 1,
-                .partition_start = p.start_lba,
-                .partition_sectors = p.sectorCount(),
+                .partition_start = p.span.first.raw(),
+                .partition_sectors = p.sectorCount().raw(),
                 .partition_guid = p.unique_guid,
             })) |slot| {
                 boot_entry_slot = slot;
@@ -1298,7 +1299,7 @@ fn verifySignatures(dev: block.Device) bool {
     var buf: [512]u8 = undefined;
 
     const esp = table.parts[0];
-    if (!dev.readSectors(@intCast(esp.start_lba), 1, &buf)) {
+    if (!dev.readSectors(@intCast(esp.span.first.raw()), 1, &buf)) {
         fail("Reading the ESP boot sector back failed.");
         return false;
     }
@@ -1310,7 +1311,7 @@ fn verifySignatures(dev: block.Device) bool {
 
     // The ext2 superblock lives at byte 1024 of the partition — two sectors in.
     const root = table.parts[1];
-    if (!dev.readSectors(@as(u32, @intCast(root.start_lba)) + 2, 1, &buf)) {
+    if (!dev.readSectors(@as(u32, @intCast(root.span.first.raw())) + 2, 1, &buf)) {
         fail("Reading the ext2 superblock back failed.");
         return false;
     }

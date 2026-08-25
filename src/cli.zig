@@ -1118,7 +1118,7 @@ fn cmdLsblk() void {
         vga.print("  primary header was bad — read from the backup copy\n", .{});
         vga.fg = .LightGray;
     }
-    vga.print("  usable: {d}..{d}\n", .{ table.first_usable_lba, table.last_usable_lba });
+    vga.print("  usable: {d}..{d}\n", .{ table.first_usable_lba.raw(), table.last_usable_lba.raw() });
 
     var i: usize = 0;
     while (i < table.count) : (i += 1) {
@@ -1128,9 +1128,9 @@ fn cmdLsblk() void {
         vga.fg = .LightGray;
         vga.print("{s: <12} {d: >8}..{d: <8} {d: >6} MiB {s}\n", .{
             p.name[0..p.name_len],
-            p.start_lba,
-            p.end_lba,
-            p.sectorCount() / 2048,
+            p.span.first.raw(),
+            p.span.last.raw(),
+            p.sectorCount().raw() / 2048,
             if (p.isEsp()) "[ESP]" else "",
         });
     }
@@ -1163,25 +1163,26 @@ fn cmdMkdisk(arg: []const u8) void {
     // 64 MiB ESP — the size the firmware conventions expect, and enough for
     // BOOTX64.EFI plus kernel.elf many times over. The root takes everything
     // left between it and the backup table at the tail of the disk.
-    const esp_sectors: u64 = 64 * 2048;
+    const geom = @import("util/geom.zig");
+    const esp_sectors = geom.Sectors.of(64 * 2048);
     // Both ends on 1 MiB boundaries — see gpt.ALIGN_SECTORS for why.
-    const esp_start = gpt.alignUp(gpt.FIRST_USABLE_LBA);
-    const esp_end = esp_start + esp_sectors - 1;
-    const root_start = esp_end + 1;
-    const root_end = gpt.alignEndDown(dev.sectors - 1 - gpt.ENTRY_ARRAY_SECTORS - 1);
+    const esp_span = geom.Span.fromFirstCount(gpt.alignUp(gpt.FIRST_USABLE_LBA), esp_sectors);
+    const root_start = esp_span.last.add(geom.Sectors.of(1));
+    const root_end = gpt.alignEndDown(geom.Lba.of(dev.sectors - 1 - gpt.ENTRY_ARRAY_SECTORS - 1));
 
-    if (root_start >= root_end) {
+    if (root_start.raw() >= root_end.raw()) {
         printErr("Target disk too small for a 64 MiB ESP plus a root\n", .{});
         return;
     }
+    const root_span = geom.Span.fromFirstLast(root_start, root_end);
 
     printSection("Partitioning");
-    vga.print("  ESP   {d}..{d}\n", .{ esp_start, esp_end });
-    vga.print("  root  {d}..{d}\n", .{ root_start, root_end });
+    vga.print("  ESP   {d}..{d}\n", .{ esp_span.first.raw(), esp_span.last.raw() });
+    vga.print("  root  {d}..{d}\n", .{ root_span.first.raw(), root_span.last.raw() });
 
     const specs = [_]gpt.PartSpec{
-        .{ .type_guid = gpt.TYPE_ESP, .start_lba = esp_start, .end_lba = esp_end, .name = "EFI System" },
-        .{ .type_guid = gpt.TYPE_LINUX_DATA, .start_lba = root_start, .end_lba = root_end, .name = "ZIGOS" },
+        .{ .type_guid = gpt.TYPE_ESP, .span = esp_span, .name = "EFI System" },
+        .{ .type_guid = gpt.TYPE_LINUX_DATA, .span = root_span, .name = "ZIGOS" },
     };
 
     if (!gpt.create(dev, &specs)) {
@@ -1216,8 +1217,8 @@ fn cmdMkdisk(arg: []const u8) void {
     const ext2_mkfs = @import("fs/ext2/mkfs.zig");
 
     for (table.parts[0..table.count]) |part| {
-        const sectors: u32 = @intCast(part.sectorCount());
-        const part_start: u32 = @intCast(part.start_lba);
+        const sectors: u32 = @intCast(part.sectorCount().raw());
+        const part_start: u32 = @intCast(part.span.first.raw());
 
         if (part.isEsp()) {
             vga.print("  {d}  FAT32 ({d} MiB)... ", .{ part.index + 1, sectors / 2048 });
@@ -1255,7 +1256,7 @@ fn verifyFormats(dev: @import("driver/block.zig").Device, table: @import("fs/gpt
 
     printSection("Verify");
     for (table.parts[0..table.count]) |part| {
-        const part_start: u32 = @intCast(part.start_lba);
+        const part_start: u32 = @intCast(part.span.first.raw());
         var buf: [512]u8 = undefined;
 
         if (part.isEsp()) {

@@ -112,8 +112,8 @@ pub fn initAuto() bool {
         for (table.parts[0..table.count]) |p| {
             if (!std.mem.eql(u8, &p.type_guid, &gpt.TYPE_LINUX_DATA)) continue;
             blkdev.setRootDisk(idx);
-            if (block.mount(@intCast(p.start_lba))) {
-                debug.klog("[ext2] root from GPT: nvme{d} part {d} @ lba {d}\n", .{ idx, p.index + 1, p.start_lba });
+            if (block.mount(@intCast(p.span.first.raw()))) {
+                debug.klog("[ext2] root from GPT: nvme{d} part {d} @ lba {d}\n", .{ idx, p.index + 1, p.span.first.raw() });
                 return true;
             }
         }
