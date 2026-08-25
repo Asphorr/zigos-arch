@@ -120,11 +120,11 @@ fn test2Eviction() void {
         return;
     }
 
-    const ev_before = page_cache.stat_evictions;
+    const ev_before = page_cache.statsSnapshot().evictions;
     var i: u32 = 0;
     while (i < WAYS + 1) : (i += 1) _ = page_cache.getOrAlloc(fid, keys[i]);
 
-    check(page_cache.stat_evictions == ev_before + 1, "test2 filling WAYS+1 should evict exactly once");
+    check(page_cache.statsSnapshot().evictions == ev_before + 1, "test2 filling WAYS+1 should evict exactly once");
     check(page_cache.lookup(fid, keys[0]) == null, "test2 the oldest key (k0) should have been the victim");
 
     var hits: u32 = 0;
@@ -191,10 +191,10 @@ fn test4FullyPinned() void {
         };
     }
 
-    const skip_before = page_cache.stat_full_skips;
+    const skip_before = page_cache.statsSnapshot().full_skips;
     const r = page_cache.getOrAlloc(fid, keys[WAYS]);
     check(r == null, "test4 getOrAlloc into a fully-pinned set should return null (uncached)");
-    check(page_cache.stat_full_skips == skip_before + 1, "test4 a fully-pinned set should record one full_skip");
+    check(page_cache.statsSnapshot().full_skips == skip_before + 1, "test4 a fully-pinned set should record one full_skip");
 
     i = 0;
     while (i < WAYS) : (i += 1) pmm.releaseFrame(pins[i]); // unpin all
