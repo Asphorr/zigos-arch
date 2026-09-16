@@ -8,10 +8,21 @@
 # do not run, and the in-flight command's completion arrives only when the
 # world resumes.
 #
-# Expected result since the 2026-08-22 soft/hard deadline split:
+# Expected result since 2026-09-16 (steal-aware time, time/pause.zig): the
+# wait that spans the freeze measures it as host pause, not as guest time —
+#   [nvme] host pause absorbed: ~5400 Mcyc paused, <200 Mcyc guest-run on qid=1 (IF=0)
+#   [disktest] PASS
+# and NO "slow completion ... host stall?" line for the frozen wait. (Any
+# "slow completion: N Mcyc guest-run ... (0 Mcyc host-paused)" line is a
+# genuinely slow emulated write — the big FAT/zeroing pours do take
+# ~0.5 s of real QEMU time — not a misread pause.) The freeze lands at a
+# random point of the pour, so a run may miss every wait; the script
+# says so ("freeze fell between waits") rather than claiming a pass.
+#
+# History. Since the 2026-08-22 soft/hard deadline split the expectation
+# was two WALL-clock diagnostics + PASS:
 #   [nvme] slow completion on qid=1: >2000 Mcyc and still waiting (host stall?)
 #   [nvme] slow completion: ~5000 Mcyc on qid=1 (host stall?)
-#   [disktest] PASS
 # Before the split this scenario reproduced the 2026-07-26 failure bit for
 # bit: waitCompletion timeout (csts=0x1), mkfs FAIL — a LATE completion
 # misread as a lost one.
@@ -56,7 +67,16 @@ echo "--- unfroze: guest at: $(tail -c 200 serial-disktest.log | tail -1 | tr -d
 
 sleep 8
 echo "=== verdict lines ==="
-grep -a -E "timeout|LATE|lost|slow completion|expected phase|\[disktest\] (PASS|FAIL)|kernel-side" serial-disktest.log | head -40
+grep -a -E "timeout|LATE|lost|slow completion|host pause absorbed|expected phase|\[smi\] stall|\[disktest\] (PASS|FAIL)|kernel-side" serial-disktest.log | head -40
+echo "=== verdict ==="
+if grep -aq "host pause absorbed" serial-disktest.log; then
+    echo "PAUSE-ABSORBED: a wait spanned the freeze and subtracted it"
+elif grep -aqE "slow completion: [0-9]{4,} Mcyc guest-run" serial-disktest.log; then
+    echo "PAUSE-MISREAD: a wait counted the freeze as guest time (regression)"
+else
+    echo "INCONCLUSIVE: freeze fell between waits — rerun"
+fi
+grep -aq "\[disktest\] PASS" serial-disktest.log && echo "DISKTEST: PASS" || echo "DISKTEST: FAIL"
 pkill -f "[r]un-disk-selftest" 2>/dev/null
 pkill -f "[q]emu-system-x86_64" 2>/dev/null
 exit 0

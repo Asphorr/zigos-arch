@@ -131,6 +131,23 @@ pub fn tscPerQuantum() u64 {
     return tsc_per_quantum;
 }
 
+/// Calibration sanity window: tsc_per_quantum outside [1e6, 1e11] means
+/// the 10 ms calibration window was corrupted (a host vCPU pause landing
+/// inside it inflates the value proportionally — a 2 s stall inflates
+/// ~200×, silently turning every ms budget into hundreds of ms of IF=0).
+/// One figure for every consumer: the TSC-deadline gate below, Deadline,
+/// the host-pause clock.
+pub const PER_QUANTUM_MIN: u64 = 1_000_000;
+pub const PER_QUANTUM_MAX: u64 = 100_000_000_000;
+
+/// tscPerQuantum() with the sanity window applied: 0 when uncalibrated OR
+/// when the calibration reads stall-corrupted, so consumers fall back to
+/// their pre-calibration behavior instead of trusting a wild rate.
+pub fn tscPerQuantumSane() u64 {
+    if (tsc_per_quantum < PER_QUANTUM_MIN or tsc_per_quantum > PER_QUANTUM_MAX) return 0;
+    return tsc_per_quantum;
+}
+
 inline fn rdtsc() u64 {
     var lo: u32 = undefined;
     var hi: u32 = undefined;
@@ -774,7 +791,7 @@ pub fn init() bool {
         pic.init();
         return false;
     }
-    if (tsc_deadline_active and (tsc_per_quantum < 1_000_000 or tsc_per_quantum > 100_000_000_000)) {
+    if (tsc_deadline_active and (tsc_per_quantum < PER_QUANTUM_MIN or tsc_per_quantum > PER_QUANTUM_MAX)) {
         // TSC ran far too slowly / quickly for 10ms — KVM TSC scaling
         // is probably off. Disable TSC-deadline rather than risk a
         // 100µs scheduler tick that pegs the CPU.

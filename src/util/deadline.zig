@@ -11,16 +11,31 @@
 //! constructor names the unit (rule 4), expiry is measured on the TSC,
 //! and every wait leaves a per-CPU breadcrumb the wedge autopsy prints.
 //!
+//! The ruler (2026-09-16, steal-aware time): expiry is measured on
+//! GUEST-RUN time — the TSC minus the host-pause account kept by
+//! `time/pause.zig` (each vCPU's KVM steal + whole-VM gaps credited by
+//! `smi.tick`). The TSC counts through a host pause; the budget must not.
+//! A `Deadline.ms(500, ...)` therefore says "the guest waits 500 ms", and
+//! a 1 s Hyper-V pause stretches the wall wait without expiring it — the
+//! false-wedge class of this rig. `elapsedMs()` reports guest-run time;
+//! `pausedMs()` what was subtracted, so a timeout line can show both. A
+//! cli'd poll (IF=0) is credited by the Epoch's own jump observer, one
+//! observation per `live()` — which is why `live()` belongs in the loop
+//! condition, called every iteration, never hoisted.
+//!
 //! The TSC is treated as a system-wide wall clock — invariant and synced
 //! across CPUs. That is the same assumption the NVMe soft/hard deadlines
 //! and the watchdog already make; a wait that migrates mid-loop keeps a
-//! valid deadline.
+//! valid deadline (steal stays credited to the capturing vCPU — see
+//! `pause.Epoch.cpu`).
 
 const std = @import("std");
 
 // Core deps.
 const perf = @import("../debug/perf.zig");
 const apic = @import("../time/apic.zig");
+const pause = @import("../time/pause.zig");
+const smi = @import("../time/smi.zig");
 
 // Diagnostics-only deps (the wait-site breadcrumbs + their dump).
 const smp = @import("../cpu/smp.zig");
@@ -39,20 +54,11 @@ const FALLBACK_ITERS_PER_MS: u64 = 40_000;
 /// already 5-25 s worst case — the ceiling is anti-wedge, not a clock.
 const FALLBACK_ITERS_MAX: u64 = 5_000_000;
 
-/// Calibration sanity window, same figure apic.zig uses to gate
-/// TSC-deadline mode: tsc_per_quantum outside [1e6, 1e11] means the
-/// 10 ms calibration window was corrupted (a host vCPU pause landing
-/// inside it inflates the value proportionally — a 2 s stall inflates
-/// ~200×, silently turning every ms budget into hundreds of ms of
-/// IF=0). Out-of-window ⇒ treat as uncalibrated and use the iteration
-/// fallback.
-const PER_QUANTUM_MIN: u64 = 1_000_000;
-const PER_QUANTUM_MAX: u64 = 100_000_000_000;
-
+/// Calibration sanity: apic.tscPerQuantumSane() reads 0 when the 10 ms
+/// calibration window was stall-corrupted (see the window constants
+/// there) ⇒ treat as uncalibrated and use the iteration fallback.
 fn sanePerQuantum() u64 {
-    const q = apic.tscPerQuantum();
-    if (q < PER_QUANTUM_MIN or q > PER_QUANTUM_MAX) return 0;
-    return q;
+    return apic.tscPerQuantumSane();
 }
 
 /// A wall-clock wait budget for a polled-hardware loop. Construct with
@@ -65,12 +71,20 @@ fn sanePerQuantum() u64 {
 /// allocation. Before APIC calibration the TSC budget is unknown and the
 /// wait degrades to a bounded iteration count (see FALLBACK_*).
 pub const Deadline = struct {
-    /// TSC value after which the wait is over; 0 ⇒ fallback mode.
-    deadline_tsc: u64,
-    /// TSC at construction (0 in fallback mode) — for elapsedMs().
-    start_tsc: u64,
+    /// Guest-run TSC budget; 0 ⇒ fallback mode.
+    budget_tsc: u64,
+    /// Both clocks at construction — wall TSC and the host-pause account
+    /// (time/pause.zig). All-zero in fallback mode.
+    epoch: pause.Epoch,
     /// Remaining iteration budget, consumed only in fallback mode.
     iters_left: u64,
+    /// Second-look grants (see live()): expiry checks overruled because the
+    /// BSP's tick was overdue — an uncredited host pause in flight. Zero
+    /// means "no grant yet", which is when the grant window opens.
+    overdue_grants: u32,
+    /// Wall cycles since capture at the first grant — the grant window is
+    /// measured from here (see live()).
+    grant_start_wall: u64,
 
     /// Budget in milliseconds. `what` names the wait for the per-CPU
     /// breadcrumb ("nvme csts-rdy", "ps2 input-buffer clear") — keep it
@@ -90,21 +104,25 @@ pub const Deadline = struct {
         // sanity-clamped (stall-corrupted calibration ⇒ fallback mode).
         const per_quantum = sanePerQuantum();
         const d: Deadline = if (per_quantum == 0) .{
-            .deadline_tsc = 0,
-            .start_tsc = 0,
+            .budget_tsc = 0,
+            .epoch = pause.Epoch.zero,
             .iters_left = @min(
                 @max(budget_us * FALLBACK_ITERS_PER_MS / 1000, 1000),
                 FALLBACK_ITERS_MAX,
             ),
-        } else blk: {
-            const now = perf.rdtsc();
-            break :blk .{
-                .deadline_tsc = now + per_quantum * budget_us / 10_000,
-                .start_tsc = now,
-                .iters_left = 0,
-            };
+            .overdue_grants = 0,
+            .grant_start_wall = 0,
+        } else .{
+            .budget_tsc = per_quantum * budget_us / 10_000,
+            .epoch = pause.Epoch.now(),
+            .iters_left = 0,
+            .overdue_grants = 0,
+            .grant_start_wall = 0,
         };
-        noteWaitStart(what, d.deadline_tsc);
+        // Breadcrumb deadline is the WALL estimate (start + budget): a host
+        // pause pushes the real expiry later, which dumpWaitSites labels
+        // as "past" a little early — a diagnostic hint, not accounting.
+        noteWaitStart(what, if (d.budget_tsc == 0) 0 else d.epoch.tsc + d.budget_tsc);
         // The breadcrumb write is the only side effect; the struct itself
         // is inert until live() is polled.
         return d;
@@ -115,27 +133,57 @@ pub const Deadline = struct {
     /// the deadline) to distinguish success from timeout — the loop may
     /// exit with the condition satisfied on the final iteration.
     pub fn live(self: *Deadline) bool {
-        if (self.deadline_tsc == 0) {
+        if (self.budget_tsc == 0) {
             if (self.iters_left == 0) return false;
             self.iters_left -= 1;
             return true;
         }
-        return perf.rdtsc() < self.deadline_tsc;
+        if (self.epoch.runElapsed() < self.budget_tsc) return true;
+        // Expired on the guest-run ruler. Second look: is the BSP's own tick
+        // overdue — a host pause in flight (or just ended) that smi.tick has
+        // not yet measured and credited? Then the expiry is unproven: keep
+        // waiting and re-decide once the credit lands (the next check sees
+        // runElapsed drop back under budget) or the tick returns to schedule
+        // (a genuine timeout stands). smi refuses this on a BSP with IF=0 —
+        // a caller holding off its own tick can't cite that tick as
+        // evidence — so a cli'd BSP poll still expires on wall time, as
+        // before, with the watchdog's peer view as its backstop.
+        //
+        // The grants are bounded in WALL time from the first one: a credit
+        // that is coming comes within microseconds of the resume (the BSP's
+        // TSC-deadline passed during the pause and fires at once). A tick
+        // that stays overdue longer is a BSP sitting in its own long IF=0
+        // window (the mkfs pour holds the NVMe CQ lock for seconds) — not
+        // a pause, and no reason for an AP to hold ITS budget open: e1000's
+        // 2 ms per-packet budget IS its cli-hold bound. Window = min(budget,
+        // two quanta): never more than doubles a short wait, ≤ 20 ms on a
+        // long one.
+        if (smi.tickOverdue()) {
+            const wall = self.epoch.wallElapsed();
+            if (self.overdue_grants == 0) self.grant_start_wall = wall;
+            const window = @min(self.budget_tsc, 2 * sanePerQuantum());
+            if (wall -| self.grant_start_wall <= window) {
+                self.overdue_grants +|= 1;
+                return true;
+            }
+        }
+        return false;
     }
 
-    /// Milliseconds since construction — for timeout log lines. Returns 0
-    /// in fallback mode (no clock to measure with), and 0 when now reads
-    /// BELOW start (cross-CPU TSC skew after a migration; without the
-    /// guard the wrapped subtraction would overflow-panic in the `* 10`
-    /// — an integer-overflow panic inside the diagnostic that exists to
-    /// explain the timeout).
-    pub fn elapsedMs(self: *const Deadline) u64 {
-        if (self.start_tsc == 0) return 0;
-        const per_quantum = sanePerQuantum();
-        if (per_quantum == 0) return 0;
-        const now = perf.rdtsc();
-        if (now <= self.start_tsc) return 0;
-        return (now - self.start_tsc) * 10 / per_quantum;
+    /// Guest-run milliseconds since construction — for timeout log lines
+    /// (pair with pausedMs() to show what was subtracted). Returns 0 in
+    /// fallback mode (no clock to measure with). Cross-CPU TSC skew after
+    /// a migration reads as 0 elapsed, not as a wrapped overflow.
+    pub fn elapsedMs(self: *Deadline) u64 {
+        if (self.budget_tsc == 0) return 0;
+        return pause.tscToMs(self.epoch.runElapsed());
+    }
+
+    /// Host-paused milliseconds since construction — the part of the wall
+    /// wait the budget did NOT count. 0 in fallback mode.
+    pub fn pausedMs(self: *Deadline) u64 {
+        if (self.budget_tsc == 0) return 0;
+        return pause.tscToMs(self.epoch.pausedSince());
     }
 };
 
@@ -171,7 +219,7 @@ comptime {
 /// @intFromPtr of the wait's `what` literal, 0 = no wait recorded yet.
 /// Stored as usize so the cross-CPU load is a single atomic word.
 var wait_what: [MAX_WAIT_CPUS]usize = [_]usize{0} ** MAX_WAIT_CPUS;
-/// The wait's deadline_tsc (0 for a fallback-mode wait).
+/// The wait's wall-estimate deadline TSC (0 for a fallback-mode wait).
 var wait_deadline: [MAX_WAIT_CPUS]u64 = [_]u64{0} ** MAX_WAIT_CPUS;
 
 fn noteWaitStart(comptime what: [:0]const u8, deadline_tsc: u64) void {
@@ -197,7 +245,7 @@ fn currentCpuId() u8 {
 /// caller must be on the watchdog.fire() emergency path, same caveat
 /// as the neighbouring dumpSpinTargets.
 pub fn dumpWaitSites() void {
-    serial.print("[wait-sites] last polled-hardware wait started per CPU (stale entries marked past):\n", .{});
+    serial.print("[wait-sites] last polled-hardware wait started per CPU (stale entries marked past; wall estimate, host pause not subtracted):\n", .{});
     const now = perf.rdtsc();
     var any = false;
     var c: usize = 0;

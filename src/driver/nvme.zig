@@ -31,6 +31,7 @@ const msix = @import("../time/msix.zig");
 const debug = @import("../debug/debug.zig");
 const Guarded = @import("../util/guarded.zig").Guarded;
 const Deadline = @import("../util/deadline.zig").Deadline;
+const pause = @import("../time/pause.zig");
 const mmio = @import("../util/mmio.zig");
 const addrmod = @import("../util/addr.zig");
 const Phys = addrmod.Phys;
@@ -1068,7 +1069,11 @@ fn waitCompletion(c: *const Controller, cq_phys: usize, head_ptr: *u16, phase_pt
     // long is essentially free (~hundreds of µs of CPU). The MSI-X retarget
     // logic above is now a no-op for waking us but still ensures the IRQ
     // handler runs on the right CPU when the device completes.
-    const t_start = @import("../debug/perf.zig").rdtsc();
+    // Both clocks at the start of the wait — the deadlines below run on the
+    // GUEST-RUN ruler (2026-09-16, steal-aware time): ep.runElapsed() is
+    // the TSC minus the host pause accrued since, so a kill -STOP / Hyper-V
+    // pause stretches the wall wait without spending the budget.
+    var ep = pause.Epoch.now();
     // Two deadlines (2026-08-22, the "waitCompletion timeout" root cause).
     // The old single 2e9-cycle deadline is ~0.55 s of WALL-clock TSC on this
     // host — guest TSC keeps counting while the vCPU isn't running — and
@@ -1081,18 +1086,22 @@ fn waitCompletion(c: *const Controller, cq_phys: usize, head_ptr: *u16, phase_pt
     // Admin commands (qid 0) keep the fast deadline: they run at init on
     // an otherwise-idle machine, where 0.5 s of silence really does mean
     // a broken controller, and boot must not hang 30 s to say so.
+    // With the guest-run ruler the soft checkpoint fires only when the
+    // GUEST has waited 0.5 s — a pure host pause no longer trips it (the
+    // pre-2026-09-16 expectation in tools/nvme_freeze_test.sh); the hard
+    // figure keeps Linux parity, now in guest seconds.
     const SOFT_CYC: u64 = 2_000_000_000;
     const HARD_CYC: u64 = if (qid == 0) 2_000_000_000 else 120_000_000_000;
     var soft_warned = false;
     while (true) {
-        const elapsed = @import("../debug/perf.zig").rdtsc() -% t_start;
+        const elapsed = ep.runElapsed();
         if (qid != 0 and !soft_warned and elapsed > SOFT_CYC) {
             soft_warned = true;
-            debug.klog("[nvme] slow completion on qid={d}: >{d} Mcyc and still waiting (host stall?)\n", .{ qid, SOFT_CYC / 1_000_000 });
+            debug.klog("[nvme] slow completion on qid={d}: >{d} Mcyc guest-run and still waiting ({d} Mcyc host-paused not counted)\n", .{ qid, SOFT_CYC / 1_000_000, ep.pausedSince() / 1_000_000 });
         }
         if (elapsed > HARD_CYC) {
             const csts: u32 = @bitCast(regs(c).csts.read());
-            debug.klog("[nvme] waitCompletion timeout (qid={d} head={d} csts=0x{x})\n", .{ qid, head_ptr.*, csts });
+            debug.klog("[nvme] waitCompletion timeout (qid={d} head={d} csts=0x{x}; {d} Mcyc host-paused subtracted)\n", .{ qid, head_ptr.*, csts, ep.pausedSince() / 1_000_000 });
             // Post-mortem for the dropped-completion hunt (2026-08-22): dump
             // the raw CQ ring so the failure mode is readable from serial —
             // a CQE at head with the WRONG phase bit = our phase/head
@@ -1138,7 +1147,7 @@ fn waitCompletion(c: *const Controller, cq_phys: usize, head_ptr: *u16, phase_pt
             // hard split existed: timeout, then the CQE consumed 3490 Mcyc
             // late, textbook-consistent ring in the dump.
             const LATE_SCAN_CYC: u64 = 12_000_000_000; // ~3 s past the hard fail
-            while (@import("../debug/perf.zig").rdtsc() -% t_start <= HARD_CYC + LATE_SCAN_CYC) {
+            while (ep.runElapsed() <= HARD_CYC + LATE_SCAN_CYC) {
                 asm volatile ("clflush (%[ptr])"
                     :
                     : [ptr] "r" (@intFromPtr(&cq[head_ptr.*])),
@@ -1146,8 +1155,8 @@ fn waitCompletion(c: *const Controller, cq_phys: usize, head_ptr: *u16, phase_pt
                 asm volatile ("mfence" ::: .{ .memory = true });
                 const late_status = cq[head_ptr.*].status;
                 if (((late_status & 1) != 0) == phase_ptr.*) {
-                    debug.klog("[nvme] LATE completion after {d} extra Mcyc (status=0x{x:0>4}) — consumed, queue resynced\n", .{
-                        (@import("../debug/perf.zig").rdtsc() -% t_start -% HARD_CYC) / 1_000_000, late_status,
+                    debug.klog("[nvme] LATE completion after {d} extra Mcyc guest-run (status=0x{x:0>4}) — consumed, queue resynced\n", .{
+                        (ep.runElapsed() -| HARD_CYC) / 1_000_000, late_status,
                     });
                     head_ptr.* = (head_ptr.* + 1) % Q_DEPTH;
                     if (head_ptr.* == 0) phase_ptr.* = !phase_ptr.*;
@@ -1183,9 +1192,16 @@ fn waitCompletion(c: *const Controller, cq_phys: usize, head_ptr: *u16, phase_pt
             // >200 Mcyc (~55 ms) yet completed is the host-stall signature
             // in its sub-deadline form — log it so stalls are visible even
             // when they don't blow the timeout.
-            const waited = @import("../debug/perf.zig").rdtsc() -% t_start;
+            const waited = ep.runElapsed();
+            const paused = ep.pausedSince();
             if (waited > 200_000_000) {
-                debug.klog("[nvme] slow completion: {d} Mcyc on qid={d} (host stall?)\n", .{ waited / 1_000_000, qid });
+                debug.klog("[nvme] slow completion: {d} Mcyc guest-run on qid={d} ({d} Mcyc host-paused not counted)\n", .{ waited / 1_000_000, qid, paused / 1_000_000 });
+            } else if (paused > 200_000_000) {
+                // The positive evidence for steal-aware time: a wait whose
+                // WALL time would have read as a host stall (≥55 ms) but
+                // whose guest-run time stayed under the diagnostic floor.
+                // tools/nvme_freeze_test.sh greps for this line.
+                debug.klog("[nvme] host pause absorbed: {d} Mcyc paused, {d} Mcyc guest-run on qid={d} (IF={s})\n", .{ paused / 1_000_000, waited / 1_000_000, qid, if (ep.irqs_off) "0" else "1" });
             }
             const sc = status_word >> 1;
             head_ptr.* = (head_ptr.* + 1) % Q_DEPTH;
@@ -1700,7 +1716,8 @@ fn ioCommandAsync(c: *Controller, ctrl_idx: u32, opcode: u8, lba: u32, user_buf:
     submitSqeLocked(c, slot_idx, cid, opcode, prp.prp1, prp.prp2, lba, 0, sectors - 1, new_msix_addr);
 
     // ---- Wait phase: yield until IRQ reaper wakes us ----
-    const t_wait_start = @import("../debug/perf.zig").rdtsc();
+    const t_wait_start = @import("../debug/perf.zig").rdtsc(); // wall, for the io_wait stats
+    var wait_ep = pause.Epoch.now(); // guest-run, for the timeout
     const wait_target: u32 = (ctrl_idx << 16) | @as(u32, cid);
     // Gap #2 (2026-05-20): wall-clock timeout. The pre-2026-05-20 loop
     // spun until `completed` flipped — under a full IRQ-loss event
@@ -1712,6 +1729,8 @@ fn ioCommandAsync(c: *Controller, ctrl_idx: u32, opcode: u8, lba: u32, user_buf:
     // the gen counter (allocCid bumps on next reuse), so even if the
     // CQE arrives much later it lands in the orphan-log branch of
     // reapCq rather than spuriously waking the slot's next occupant.
+    // Measured on the guest-run ruler (pause.Epoch): a host pause of the
+    // whole VM or of this vCPU does not spend the 30 s.
     const TIMEOUT_CYC_ASYNC: u64 = 30_000_000_000; // ~30 s at 1 GHz
     // Block until completion. The IRQ reaper sets w.completed and calls
     // proc.wake(w.pid). blockOn handles the wake-pending handshake.
@@ -1732,7 +1751,7 @@ fn ioCommandAsync(c: *Controller, ctrl_idx: u32, opcode: u8, lba: u32, user_buf:
     const mwait_mod = @import("../cpu/arch/mwait.zig");
     var timed_out = false;
     while (!@atomicLoad(bool, &c.waiters[slot_idx].completed, .acquire)) {
-        if (@import("../debug/perf.zig").rdtsc() -% t_wait_start > TIMEOUT_CYC_ASYNC) {
+        if (wait_ep.runElapsed() > TIMEOUT_CYC_ASYNC) {
             timed_out = true;
             break;
         }
@@ -1893,8 +1912,8 @@ fn submitDatalessAsync(
     // Narrow critical section: submitSqeLocked — see ioCommandAsync.
     submitSqeLocked(c, slot_idx, cid, opcode, prp1, 0, cdw10, cdw11, cdw12, new_msix_addr);
 
-    // Wait phase — same shape as ioCommandAsync.
-    const t_wait_start = @import("../debug/perf.zig").rdtsc();
+    // Wait phase — same shape as ioCommandAsync (guest-run ruler).
+    var wait_ep = pause.Epoch.now();
     const wait_target: u32 = (ctrl_idx << 16) | @as(u32, cid);
     const TIMEOUT_CYC_ASYNC: u64 = 30_000_000_000;
 
@@ -1905,7 +1924,7 @@ fn submitDatalessAsync(
     const mwait_mod = @import("../cpu/arch/mwait.zig");
     var timed_out = false;
     while (!@atomicLoad(bool, &c.waiters[slot_idx].completed, .acquire)) {
-        if (@import("../debug/perf.zig").rdtsc() -% t_wait_start > TIMEOUT_CYC_ASYNC) {
+        if (wait_ep.runElapsed() > TIMEOUT_CYC_ASYNC) {
             timed_out = true;
             break;
         }
@@ -2396,7 +2415,7 @@ fn readSectorsPipelined(c: *Controller, ctrl_idx: u32, lba: u32, count: u32, des
     const proc = @import("../proc/process.zig");
     const smp = @import("../cpu/smp.zig");
     const perf = @import("../debug/perf.zig");
-    const TIMEOUT_CYC: u64 = 30_000_000_000; // ~30 s at 1 GHz — matches ioCommandAsync
+    const TIMEOUT_CYC: u64 = 30_000_000_000; // ~30 s at 1 GHz guest-run — matches ioCommandAsync
     const t_call = perf.rdtsc();
 
     var cids: [PIPELINE_DEPTH]u16 = undefined;
@@ -2427,7 +2446,8 @@ fn readSectorsPipelined(c: *Controller, ctrl_idx: u32, lba: u32, count: u32, des
         }
 
         // ---- wait for the whole wave (one park, woken per-completion) ----
-        const t_wait = perf.rdtsc();
+        const t_wait = perf.rdtsc(); // wall, for wait_total
+        var wait_ep = pause.Epoch.now(); // guest-run, for the timeout
         const rep_target: u32 = (ctrl_idx << 16) | cids[0]; // diagnostic label for blockOn/dump
         while (true) {
             var all_done = true;
@@ -2439,7 +2459,7 @@ fn readSectorsPipelined(c: *Controller, ctrl_idx: u32, lba: u32, count: u32, des
                 }
             }
             if (all_done) break;
-            if (perf.rdtsc() -% t_wait > TIMEOUT_CYC) {
+            if (wait_ep.runElapsed() > TIMEOUT_CYC) {
                 debug.klog("[nvme] pipelined read TIMEOUT ctrl#{d} lba={d} wave={d}\n", .{ ctrl_idx, lba, wave });
                 var j: u32 = 0;
                 while (j < wave) : (j += 1) @atomicStore(bool, &c.waiters[cidSlot(cids[j])].active, false, .release);

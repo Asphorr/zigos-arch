@@ -383,6 +383,28 @@ apply:** required for new polled waits; existing iteration-count loops
 were converted in the 2026-08-25 sweep — any stragglers convert when
 touched.
 
+**Ruler (2026-09-16, steal-aware time):** a budget expires on
+GUEST-RUN time, not wall time. `time/pause.zig` keeps the host-pause
+account — each vCPU's KVM steal (L1, exact) plus whole-VM gaps the
+`[smi]` detector credits at the first BSP tick after a pause (L0, or a
+real SMI on bare metal) — and `Deadline.live()` measures against the
+TSC minus that account. So `Deadline.ms(500, ...)` means "the guest
+waits 500 ms"; a 1 s Hyper-V pause stretches the wall wait without
+spending the budget — the false-wedge class of this rig. A hand-rolled
+timeout (`rdtsc() - t_start > N`) converts to `pause.Epoch.now()` /
+`ep.runElapsed()` when touched; diagnostics that WANT wall time (perf
+phases, cli-hold durations, wait statistics) keep the raw TSC on
+purpose and say so. The watchdog uses the same ground truth directly:
+a suspect peer whose steal covered ≥ 90 % of the measured check window
+is host-preempted, not wedged. **Reference exemplar:**
+`nvme.waitCompletion` (both deadlines on one `Epoch`, the timeout line
+prints what was subtracted). Accounting is deliberately conservative —
+every rounding UNDER-credits pause, because an over-credit would mask a
+genuine wedge: the BSP credits whole-VM gaps on the sane calibration
+only, a jump counts only with IRQs off at both ends, a wait that ran
+cli'd at any point never subtracts the BSP-side account, and
+`Deadline`'s tick-overdue grace is capped at two quanta.
+
 ## `Phys` / `Virt` + `Dma(T)` — typed addresses and device memory
 
 A `u64` can't say which address space it lives in. `util/addr.zig`
@@ -537,6 +559,7 @@ silent self-recovery into observable metric.
 | `Persistent(T)`     | `src/mm/pmem.zig` `persistenceSelfTest`         |
 | `kwarn(@src(),...)` | `src/debug/debug.zig` `kwarn`                   |
 | `Deadline`          | `src/driver/keyboard.zig` `ps2Wait`             |
+| `pause.Epoch`       | `src/driver/nvme.zig` `waitCompletion`          |
 | `mightSleep`        | `src/proc/sched.zig` `blockOn`                  |
 | `fail()`/`errtrace` | `src/fs/gpt.zig` `readHeader` / `parse`         |
 | `Phys`/`Virt`/`Dma` | `src/driver/e1000.zig` `allocRxRing`            |

@@ -33,6 +33,8 @@ const exectrail = @import("../debug/exectrail.zig");
 const symbols = @import("../debug/symbols.zig");
 const spinlock = @import("../proc/spinlock.zig");
 const kvm = @import("../virt/kvm.zig");
+const pause = @import("pause.zig");
+const smp = @import("../cpu/smp.zig");
 
 const PM_TMR_HZ: u64 = 3_579_545;
 const QUANTUM_MS: u64 = 10;
@@ -47,11 +49,12 @@ const STALL_THRESHOLD_PM: u64 = 15 * PM_TMR_HZ / 1000;
 /// ~100ms HOST-L0 stall — steal=0, exactly the L0 signature, a fake.
 /// rearmTimerForCurrent + the idle-wake shorten hook report every arm;
 /// tick() raises its stall threshold by the noted stretch and resets to
-/// 1 (the next arm re-notes). BSP-only, like everything in this file.
+/// 1 (the next arm re-notes). BSP-written like everything in this file;
+/// (a) because tickOverdue() reads it cross-CPU.
 var armed_quanta_max: u32 = 1;
 
 pub fn noteArmed(quanta: u32) void {
-    if (quanta > armed_quanta_max) armed_quanta_max = quanta;
+    if (quanta > @atomicLoad(u32, &armed_quanta_max, .monotonic)) @atomicStore(u32, &armed_quanta_max, quanta, .monotonic);
 }
 
 var pm_tmr_port: u16 = 0;
@@ -69,6 +72,8 @@ var initialized: bool = false;
 pub var stall_win_start_tsc: u64 = 0;
 pub var stall_win_end_tsc: u64 = 0;
 
+/// PM_TMR at the EXIT of the previous BSP tick (see tick()). (a) —
+/// BSP-written, read cross-CPU by tickOverdue().
 var last_pm: u32 = 0;
 var sample_count: u64 = 0;
 /// KVM steal-time reading at the previous tick (ns); 0 = not sampled yet.
@@ -117,14 +122,24 @@ pub fn isActive() bool {
 /// timer is calibrated and running, or last_pm is meaningless.
 pub fn tick() void {
     if (!initialized) return;
+    tickBody();
+    // Re-baseline at EXIT, not entry: the next gap is measured from the end
+    // of this handler's work, so the handler's own IF=0 body — the cli-hold
+    // drain, a [lock-dump] over the serial line at 115200 baud (a 1 KB dump
+    // is ~90 ms), classifyAndLog — is guest-run time in neither the stall
+    // figure nor the host-pause credit. It carries no cli-hold record of
+    // its own, so without this the tick after a chatty one would have read
+    // it as a whole-VM pause. One extra port read per tick. Same vCPU
+    // expression as the entry sample so the two steal baselines agree.
+    @atomicStore(u32, &last_pm, io.inl(pm_tmr_port) & pm_tmr_mask, .monotonic);
+    last_steal_ns = kvm.stealNs(smp.myCpu().cpu_id);
+}
+
+fn tickBody() void {
     const now: u32 = io.inl(pm_tmr_port) & pm_tmr_mask;
     sample_count +%= 1;
-    if (last_pm == 0) {
-        last_pm = now;
-        return;
-    }
+    if (last_pm == 0) return; // first sample: tick() stores the baseline on exit
     const delta = pmDelta(last_pm, now);
-    last_pm = now;
 
     // KVM steal across this tick window. Sampled EVERY tick so a stall
     // tick's delta spans exactly its gap — the ground truth that splits
@@ -132,10 +147,11 @@ pub fn tick() void {
     // scheduler descheduled our vCPU thread); steal ≈ 0 with a big gap =
     // L0 (Hyper-V paused all of zigvm — invisible to KVM's accounting,
     // no L1 runqueue wait ever happens). Cheap: seqlock read of a
-    // guest-RAM struct, no exit. 0 on bare metal / pre-arm.
-    const cur_steal_ns = kvm.stealNs(@import("../cpu/smp.zig").myCpu().cpu_id);
-    const steal_delta_ns = if (last_steal_ns == 0) 0 else cur_steal_ns -% last_steal_ns;
-    last_steal_ns = cur_steal_ns;
+    // guest-RAM struct, no exit. 0 on bare metal / pre-arm. Saturating:
+    // a bailed-out seqlock read (kvm.stealNs) returns 0 and must read as
+    // "no steal", not as a wrapped 2^64.
+    const cur_steal_ns = kvm.stealNs(smp.myCpu().cpu_id);
+    const steal_delta_ns = if (last_steal_ns == 0) 0 else cur_steal_ns -| last_steal_ns;
 
     const tsc_per_quantum = apic.tscPerQuantum();
     var now_tsc: u64 = 0;
@@ -152,7 +168,7 @@ pub fn tick() void {
     // time beyond (armed - one quantum) + slop is an anomaly.
     const pm_per_quantum: u64 = PM_TMR_HZ / 100;
     const stall_threshold = STALL_THRESHOLD_PM + @as(u64, armed_quanta_max - 1) * pm_per_quantum;
-    armed_quanta_max = 1;
+    @atomicStore(u32, &armed_quanta_max, 1, .monotonic);
     if (delta < stall_threshold) return;
     // Atomic store: keyboard.pollRepeat reads this cross-CPU (desktop loop
     // may run on an AP) to quarantine typematic repeat across host pauses.
@@ -164,33 +180,20 @@ pub fn tick() void {
         @atomicStore(u64, &big_stall_events, big_stall_events +% 1, .monotonic);
     }
     if (us > max_stall_us) max_stall_us = us;
-    if (tsc_per_quantum > 0) {
-        // PM ticks per 10ms quantum = PM_TMR_HZ/100; gap in TSC ≈
-        // delta * tsc_per_quantum / that. Publish for perf's quarantine.
-        const delta_tsc = delta * tsc_per_quantum / (PM_TMR_HZ / 100);
-        @atomicStore(u64, &stall_win_start_tsc, now_tsc -% delta_tsc, .monotonic);
-        @atomicStore(u64, &stall_win_end_tsc, now_tsc, .release);
-    }
-    // Rate limit: log at most once per second (every 100 BSP IRQ0s).
-    if (sample_count - last_log_tick < 100) return;
-    last_log_tick = sample_count;
 
+    // Corroboration for cpu0's gap: did THIS cpu record a cli-hold ending
+    // just before this IRQ0? A real cli-hold is recorded µs before the
+    // pending IRQ0 re-fires; an unrelated stale record fails the
+    // end-within-a-quantum check. Same-cpu so a peer's hold can't
+    // masquerade as ours. The record also carries the freeze-vs-hold
+    // verdict: a vm_frozen window must NOT be blamed OURS — its TSC delta
+    // counted host freeze time, not kernel work. Computed for EVERY stall
+    // tick (not only the logged ones): the host-pause credit below hangs
+    // on it.
     var cli_us: u64 = 0;
     var cli_ra: u64 = 0;
     var cli_vm_frozen = false;
     if (tsc_per_quantum > 0) {
-        // Lock-attribution: any lock CURRENTLY held >5ms (half the 10ms
-        // LAPIC quantum) — catches a PEER cpu still sitting on one
-        // (orthogonal to cpu0's own gap, corroborated below). One
-        // [smi-cause] line per lock, ABOVE the classifier verdict.
-        spinlock.dumpHeldLocksOlderThan(now_tsc, tsc_per_quantum / 2);
-        // Corroboration for cpu0's gap: did THIS cpu record a cli-hold
-        // ending just before this IRQ0? A real cli-hold is recorded µs
-        // before the pending IRQ0 re-fires; an unrelated stale record
-        // fails the end-within-a-quantum check. Same-cpu so a peer's hold
-        // can't masquerade as ours. The record also carries the
-        // freeze-vs-hold verdict: a vm_frozen window must NOT be blamed
-        // OURS — its TSC delta counted host freeze time, not kernel work.
         const my_cpu: u8 = @truncate(apic.getLapicId());
         var rec: spinlock.CliHoldRecord = undefined;
         if (spinlock.sampleHold(my_cpu, &rec)) |seq| {
@@ -201,6 +204,54 @@ pub fn tick() void {
             }
         }
     }
+    // Same rule classifyAndLog applies: a recorded hold covering ≥ half the
+    // gap, with the VM alive through it, means THIS CPU was running with
+    // IRQs off — the gap is our cli window, not a pause.
+    const ours = cli_us != 0 and cli_us * 2 >= us and !cli_vm_frozen;
+
+    if (tsc_per_quantum > 0) {
+        // PM ticks per 10ms quantum = PM_TMR_HZ/100; gap in TSC ≈
+        // delta * tsc_per_quantum / that. Publish for perf's quarantine.
+        const delta_tsc = delta * tsc_per_quantum / (PM_TMR_HZ / 100);
+        @atomicStore(u64, &stall_win_start_tsc, now_tsc -% delta_tsc, .monotonic);
+        @atomicStore(u64, &stall_win_end_tsc, now_tsc, .release);
+        // Credit the host-pause clock with the UNACCOUNTED part of a HOST
+        // gap: beyond the armed interval + slop (the threshold), beyond
+        // what KVM's steal already explains (L1 — credited per-vCPU by
+        // pause.stealTsc). What remains is whole-VM pause: L0, or a real
+        // SMI on bare metal. An OURS gap is not credited at all: the CPU
+        // was executing inside a cli window, and any pause that landed
+        // INSIDE that window is the window's own waiter's to observe
+        // (pause.Epoch, IF=0 jumps) — crediting it here too would count
+        // the whole cli window as pause. Under-credits by the slop on
+        // purpose (pause.zig, "conservative in one direction").
+        //
+        // On the SANE calibration only, end to end: the raw figure above
+        // is fine for perf's quarantine window, but a stall-corrupted
+        // calibration (up to ~200× the real rate) would inflate the gap
+        // here while pause.nsToTsc — sane-gated — subtracted no steal at
+        // all, and every stall tick would pour ~200× its excess into the
+        // account the NVMe waits subtract with no fallback of their own.
+        // No sane rate ⇒ no credit (the waits run on wall time, as before).
+        const per_q_sane = apic.tscPerQuantumSane();
+        if (!ours and per_q_sane != 0) {
+            const gap_tsc = delta * per_q_sane / pm_per_quantum;
+            const threshold_tsc = stall_threshold * per_q_sane / pm_per_quantum;
+            const l0_tsc = gap_tsc -| threshold_tsc -| pause.nsToTsc(steal_delta_ns);
+            if (l0_tsc != 0) pause.creditL0(l0_tsc);
+        }
+    }
+    // Rate limit: log at most once per second (every 100 BSP IRQ0s).
+    if (sample_count - last_log_tick < 100) return;
+    last_log_tick = sample_count;
+
+    if (tsc_per_quantum > 0) {
+        // Lock-attribution: any lock CURRENTLY held >5ms (half the 10ms
+        // LAPIC quantum) — catches a PEER cpu still sitting on one
+        // (orthogonal to cpu0's own gap, corroborated above). One
+        // [smi-cause] line per lock, ABOVE the classifier verdict.
+        spinlock.dumpHeldLocksOlderThan(now_tsc, tsc_per_quantum / 2);
+    }
 
     // prev_rip (in classifyAndLog) = what cpu0 was doing at the PREVIOUS
     // IRQ0 boundary (exectrail head-1; handleIRQ0 calls smi.tick() BEFORE
@@ -208,6 +259,36 @@ pub fn tick() void {
     // recorded cli-hold — not guessed from prev_rip; prev_rip is only
     // context for where a host pause happened to sample us.
     classifyAndLog(us, cli_us, cli_ra, cli_vm_frozen, steal_delta_ns / 1000);
+}
+
+/// Is the BSP's tick itself overdue — an IRQ0 gap in progress (or just
+/// ended) that tick() has not yet measured and credited to the host-pause
+/// clock? The second look for a budget that expired on an AP in the
+/// microseconds between the VM resuming and the BSP's pending IRQ0
+/// landing (pause.zig, "granularity"). Same threshold as tick(),
+/// including the tickless stretch, so a BSP legitimately asleep for 10
+/// quanta doesn't read as overdue. One PM_TMR port read per call — only
+/// on the expiry path, and Deadline bounds how long it keeps asking (a
+/// grant window of at most two quanta: a credit that is coming comes
+/// within microseconds of the resume).
+///
+/// True also while the BSP merely sits in a long IF=0 window of its own
+/// (the mkfs pour holds the NVMe CQ lock for seconds) — the caller cannot
+/// tell the two apart, which is why its grants are bounded. Refuses
+/// (false) on the BSP with IF=0: that caller is the reason its own tick is
+/// late and must not cite it as evidence — a cli'd BSP poll keeps expiring
+/// on wall time, the watchdog's peer view stays its backstop. A BSP wedged
+/// with IF=0 forever would make every AP wait "overdue" for its grant
+/// window; that BSP is exactly what the AP's watchdog halts on.
+pub fn tickOverdue() bool {
+    if (!initialized) return false;
+    const prev = @atomicLoad(u32, &last_pm, .monotonic);
+    if (prev == 0) return false;
+    if (smp.myCpu().cpu_id == 0 and !pause.irqsEnabled()) return false;
+    const now: u32 = io.inl(pm_tmr_port) & pm_tmr_mask;
+    const armed = @atomicLoad(u32, &armed_quanta_max, .monotonic);
+    const threshold = STALL_THRESHOLD_PM + @as(u64, armed - 1) * (PM_TMR_HZ / 100);
+    return pmDelta(prev, now) >= threshold;
 }
 
 inline fn rdtsc() u64 {

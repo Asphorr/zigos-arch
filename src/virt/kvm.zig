@@ -253,13 +253,35 @@ pub inline fn pvEoiClaimSelf() bool {
 pub fn stealNs(cpu_id: u32) u64 {
     if (pv_page_va == 0 or !hasStealTime() or cpu_id >= PV_MAX_CPUS) return 0;
     const st: *volatile StealTime = @ptrFromInt(pv_page_va + cpu_id * PV_STRIDE);
-    while (true) {
+    // Bounded seqlock: the host writes version/steal/version around each
+    // update, and if it is preempted between the two version writes the
+    // reader would spin for that whole preemption — with IF=0 in IRQ0
+    // (watchdog.peerCheck, smi.tick) and per poll iteration in every
+    // pause.Epoch observation. After the bound, the last value this vCPU's
+    // slot was read consistently at: steal is cumulative and monotonic, so
+    // a stale reading is a LOWER bound — every consumer under-credits by
+    // the torn window and none sees a wrapped delta or a bogus 0 baseline
+    // (a 0 at an Epoch capture would charge the whole boot's steal to that
+    // wait).
+    var tries: u32 = 0;
+    while (tries < STEAL_SEQLOCK_TRIES) : (tries += 1) {
         const v1 = st.version;
         asm volatile ("" ::: .{ .memory = true });
         const s = st.steal;
         asm volatile ("" ::: .{ .memory = true });
         const v2 = st.version;
-        if (v1 == v2 and (v1 & 1) == 0) return s;
+        if (v1 == v2 and (v1 & 1) == 0) {
+            @atomicStore(u64, &steal_last_good[cpu_id], s, .monotonic);
+            return s;
+        }
         asm volatile ("pause");
     }
+    return @atomicLoad(u64, &steal_last_good[cpu_id], .monotonic);
 }
+
+/// ~100 µs of `pause` spins before stealNs settles for the last good value.
+const STEAL_SEQLOCK_TRIES: u32 = 1024;
+/// (a) Last consistently-read steal per vCPU slot — stealNs's answer on a
+/// torn read. Any CPU may read any slot (the watchdog reads peers'), hence
+/// atomic accesses; the values only ever grow.
+var steal_last_good: [PV_MAX_CPUS]u64 = [_]u64{0} ** PV_MAX_CPUS;

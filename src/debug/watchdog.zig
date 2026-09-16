@@ -29,6 +29,7 @@ const smp = @import("../cpu/smp.zig");
 const serial = @import("serial.zig");
 const kdbg = @import("kdbg.zig");
 const apic = @import("../time/apic.zig");
+const kvm = @import("../virt/kvm.zig");
 
 /// Ticks between peer checks. 100 Hz IRQ0 × 100 ticks = 1 second.
 const WATCHDOG_CHECK_INTERVAL: u64 = 100;
@@ -56,6 +57,26 @@ const WATCHDOG_GRACE_LOCKED: u8 = 2; // ~5s total when a cli-lock is held
 const WATCHDOG_EXTEND_CAP: u8 = 6; // ~6 extra grace windows (~40s) of ride-out
 const WATCHDOG_PROBE_SAMPLES: u32 = 16; // NMI RIP samples for the spin test
 const CLAIM_LIVELOCK_THRESH: u64 = 64; // sched claim-loop in-flight above this = Mode-A
+/// Steal-aware ride-out (2026-09-16). KVM's steal time for the PEER's vCPU is
+/// the host's own statement that it descheduled that vCPU (L1). A peer whose
+/// steal covered (nearly) the whole check window while its tick stood still
+/// was not running — and a wedge needs the CPU to RUN. Such a window does not
+/// age the suspicion at all. The bar is 90 % of the window as MEASURED on the
+/// watcher's TSC, not a fixed figure: a peer starved 50 % still ran for the
+/// other half and should have ticked ~50 times in it (a merely oversubscribed
+/// host must not launder a real spin), and the watcher's own window is ~1 s
+/// only nominally — an idle AP's one-shot is stretched to 10 quanta, so its
+/// "100 ticks" can be 10 s. Its own cap keeps the fail-safe: a vCPU the host
+/// starves for a whole minute still reaches the spin probe and the halt —
+/// much sooner when the peer sits on a cli-lock, where a freeze can
+/// propagate to the watcher before it can autopsy (the GRACE_LOCKED
+/// rationale). Whole-VM (L0) pauses freeze the watcher too and need nothing
+/// here; a single-vCPU L0 pause shows no steal and is left to the NMI spin
+/// probe, as before. Ground truth first, heuristics after: this check runs
+/// before the grace/extension logic below.
+const STEAL_WINDOW_PERMILLE: u64 = 900; // steal must cover ≥ 90 % of the measured window
+const WATCHDOG_STEAL_RIDEOUT_CAP: u8 = 60; // ~1 min of host-preempted windows, lockless peer
+const WATCHDOG_STEAL_RIDEOUT_CAP_LOCKED: u8 = 10; // ~10 s when the peer holds a cli-lock
 
 var armed: bool = false;
 var fired: bool = false;
@@ -75,6 +96,16 @@ var wd_suspect_age: [smp.MAX_CPUS]u8 = [_]u8{0} ** smp.MAX_CPUS;
 /// ride-out so a spin-signature-less but genuine wedge still halts. See
 /// WATCHDOG_EXTEND_CAP.
 var wd_extended: [smp.MAX_CPUS]u8 = [_]u8{0} ** smp.MAX_CPUS;
+/// Peer steal (ns, kvm.stealNs) at the previous suspect-mode check, per
+/// watcher — the delta per window is the steal-aware verdict's input — and
+/// the watcher's TSC at that check, so the window the delta is judged
+/// against is the one that actually elapsed (wall, deliberately: a whole-VM
+/// pause inside it lowers the steal ratio, which errs toward aging).
+var wd_suspect_steal_ns: [smp.MAX_CPUS]u64 = [_]u64{0} ** smp.MAX_CPUS;
+var wd_suspect_steal_tsc: [smp.MAX_CPUS]u64 = [_]u64{0} ** smp.MAX_CPUS;
+/// Steal-corroborated windows granted this suspicion, per watcher (see
+/// WATCHDOG_STEAL_RIDEOUT_CAP).
+var wd_steal_rideouts: [smp.MAX_CPUS]u8 = [_]u8{0} ** smp.MAX_CPUS;
 /// Serializes the NMI spin-probe across watchers (kdbg's prof_* state is global).
 var wd_probe_busy: bool = false;
 
@@ -125,6 +156,7 @@ pub fn peerCheck(self: *smp.CpuLocal) void {
         wd_suspecting[self.cpu_id] = false;
         wd_suspect_age[self.cpu_id] = 0;
         wd_extended[self.cpu_id] = 0;
+        wd_steal_rideouts[self.cpu_id] = 0;
         return;
     }
 
@@ -143,14 +175,41 @@ pub fn peerCheck(self: *smp.CpuLocal) void {
             wd_suspecting[self.cpu_id] = false;
             wd_suspect_age[self.cpu_id] = 0;
             wd_extended[self.cpu_id] = 0;
+            wd_steal_rideouts[self.cpu_id] = 0;
             self.watchdog_peer_last_tick = peer_tick;
             self.watchdog_peer_strikes = 0;
             return;
         }
-        // Still frozen. Wait up to the grace window — shorter if the peer is
-        // sitting on a cli-lock (a real wedge there can propagate to us).
-        wd_suspect_age[self.cpu_id] +|= 1;
+        // Still frozen. Ground truth first: did the host preempt the peer's
+        // vCPU for (nearly) all of this window? Then the tick COULDN'T have
+        // advanced and the peer is provably not spinning — no aging, wait
+        // for the host to hand the vCPU back (bounded by its own cap).
         const locked = @import("../proc/spinlock.zig").cpuHoldsAnyLock(peer.cpu_id);
+        {
+            const now_tsc = rdtsc();
+            const peer_steal_ns = kvm.stealNs(peer.cpu_id);
+            const steal_delta_ns = peer_steal_ns -| wd_suspect_steal_ns[self.cpu_id];
+            const window_tsc = now_tsc -| wd_suspect_steal_tsc[self.cpu_id];
+            wd_suspect_steal_ns[self.cpu_id] = peer_steal_ns;
+            wd_suspect_steal_tsc[self.cpu_id] = now_tsc;
+            // Window in ms on the sane calibration; 0 (uncalibrated or
+            // corrupted) disables the ride-out rather than guessing.
+            const per_ms = apic.tscPerQuantumSane() / 10;
+            const window_ms = if (per_ms == 0) 0 else window_tsc / per_ms;
+            const cap: u8 = if (locked) WATCHDOG_STEAL_RIDEOUT_CAP_LOCKED else WATCHDOG_STEAL_RIDEOUT_CAP;
+            if (window_ms != 0 and steal_delta_ns / 1_000_000 >= window_ms * STEAL_WINDOW_PERMILLE / 1000 and wd_steal_rideouts[self.cpu_id] < cap) {
+                wd_steal_rideouts[self.cpu_id] +|= 1;
+                // Log the first window and every tenth — a minute-long
+                // starvation is 60 windows, not 60 lines.
+                if (wd_steal_rideouts[self.cpu_id] == 1 or wd_steal_rideouts[self.cpu_id] % 10 == 0) {
+                    serial.print("[watchdog] cpu{d} still frozen, but KVM reports {d} ms of steal in a {d} ms window — host-preempted vCPU (L1 ground truth), not a wedge; riding out {d}/{d}, not aging\n", .{ peer.cpu_id, steal_delta_ns / 1_000_000, window_ms, wd_steal_rideouts[self.cpu_id], cap });
+                }
+                return;
+            }
+        }
+        // Wait up to the grace window — shorter if the peer is sitting on a
+        // cli-lock (a real wedge there can propagate to us).
+        wd_suspect_age[self.cpu_id] +|= 1;
         const grace: u8 = if (locked) WATCHDOG_GRACE_LOCKED else WATCHDOG_GRACE_FREE;
         if (wd_suspect_age[self.cpu_id] < grace) return;
 
@@ -191,8 +250,15 @@ pub fn peerCheck(self: *smp.CpuLocal) void {
     wd_suspect_tick[self.cpu_id] = peer_tick;
     wd_suspect_age[self.cpu_id] = 0;
     wd_extended[self.cpu_id] = 0;
+    wd_steal_rideouts[self.cpu_id] = 0;
+    // Baseline for the per-window steal delta. The peer's steal over the
+    // ~3 s of strikes that got us here is printed for the record — a large
+    // figure already says "host", before any probe runs.
+    const steal_at_suspect_ns = kvm.stealNs(peer.cpu_id);
+    wd_suspect_steal_ns[self.cpu_id] = steal_at_suspect_ns;
+    wd_suspect_steal_tsc[self.cpu_id] = rdtsc();
     const locked = @import("../proc/spinlock.zig").cpuHoldsAnyLock(peer.cpu_id);
-    serial.print("\n[watchdog] cpu{d} tick frozen ~{d}s (holds_lock={any}) — probing host-pause vs wedge before halting\n", .{ peer.cpu_id, WATCHDOG_STRIKES, locked });
+    serial.print("\n[watchdog] cpu{d} tick frozen ~{d}s (holds_lock={any}; peer steal total {d} ms) — probing host-pause vs wedge before halting\n", .{ peer.cpu_id, WATCHDOG_STRIKES, locked, steal_at_suspect_ns / 1_000_000 });
     // Name what the frozen peer is spinning on RIGHT NOW. Catches the
     // unregistered setstate_locks[]/rq.lock contention even on a freeze that
     // later RESUMES — so we get the lock without needing a hard watchdog halt
@@ -207,6 +273,15 @@ pub fn peerCheck(self: *smp.CpuLocal) void {
     // Claim-loop retry counts too — caught even on a freeze that later
     // self-recovers, so we get the Mode-A signature without needing a hard halt.
     @import("../proc/sched.zig").dumpSchedLoopStats();
+}
+
+inline fn rdtsc() u64 {
+    return asm volatile (
+        \\ rdtsc
+        \\ shlq $32, %%rdx
+        \\ orq %%rdx, %%rax
+        : [r] "={rax}" (-> u64),
+        :: .{ .rdx = true });
 }
 
 fn nextAlivePeer(self: *smp.CpuLocal) ?*smp.CpuLocal {
