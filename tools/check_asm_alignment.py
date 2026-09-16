@@ -14,6 +14,16 @@ Acknowledged limitations:
   to add explicit alignment documentation.
 - The runtime guards in cpu/syscall/entry.zig and idt.zig are still the
   authoritative check. This linter is a fast-fail convenience, not a proof.
+
+History: from its birth until 2026-09-16 the block-capture regex required
+every continuation line to START with `\\`, but Zig multiline-string lines
+are indented — so only the first line of each block was ever captured, no
+`call` was ever seen, and every build printed a vacuous PASS (found during
+the FXSAVE work, when adding 512-byte saves to the trampolines should have
+moved the verdict and didn't). The regex now allows leading whitespace per
+line, and the self-check at the bottom of main() refuses to PASS unless the
+capture actually saw multi-line blocks and at least one `call` — a linter
+that inspects nothing must say so, not say PASS.
 """
 
 import re
@@ -82,14 +92,14 @@ def check_alignment(tokens: List[Tuple[str, str]], file_path: str, line_no: int)
             delta += 8
         elif opcode.startswith('pop'):
             delta -= 8
-        elif opcode == 'sub' and '%rsp' in operands or '%esp' in operands:
+        elif opcode == 'sub' and ('%rsp' in operands or '%esp' in operands):
             # sub $N, %rsp
             match = re.search(r'\$(\d+|0x[0-9a-fA-F]+)', operands)
             if match:
                 val_str = match.group(1)
                 val = int(val_str, 16 if val_str.startswith('0x') else 10)
                 delta += val
-        elif opcode == 'add' and '%rsp' in operands or '%esp' in operands:
+        elif opcode == 'add' and ('%rsp' in operands or '%esp' in operands):
             # add $N, %rsp
             match = re.search(r'\$(\d+|0x[0-9a-fA-F]+)', operands)
             if match:
@@ -111,6 +121,10 @@ def check_alignment(tokens: List[Tuple[str, str]], file_path: str, line_no: int)
         return False
     return True
 
+# Coverage counters for the self-check in main(): a run that captured no
+# multi-line block or no `call` is a run that inspected nothing.
+STATS = {"blocks": 0, "multiline_blocks": 0, "calls": 0}
+
 def lint_file(path: Path) -> bool:
     """
     Scan a single .zig file for inline asm blocks and check alignment.
@@ -118,20 +132,14 @@ def lint_file(path: Path) -> bool:
     """
     text = path.read_text(encoding='utf-8', errors='ignore')
 
-    # Find all `asm volatile (` blocks. The asm text is between the opening
-    # `(` and the closing `)` or `;`. This regex is tolerant but not perfect.
-    # Pattern: asm volatile ( ... multi-line string literal ... )
-    # We look for the opening `asm volatile (` or `asm (`, then capture until
-    # we see a `)` that's not inside a string literal. Simplified: just grab
-    # everything between the first `(` and the next `);` at the same indent.
-
-    # Regex approach: find `asm volatile (` or `asm (`, then capture the
-    # multi-line string literal (starts with `\\` or `"`, ends with `"`).
-    # The string literal may span many lines.
-
+    # Find all `asm volatile (` / `asm (` blocks and capture the multi-line
+    # string literal that follows: one or more lines of optional indentation,
+    # `\\`, the asm text, newline. The `[ \t]*` per line is the 2026-09-16
+    # fix — Zig indents continuation lines, so without it the capture ended
+    # after the first line of every block (see the module docstring).
     pattern = re.compile(
-        r'asm\s+(?:volatile\s+)?\(\s*'  # asm volatile ( or asm (
-        r'((?:\\\\[^\n]*\n)+)',          # multi-line asm string (backslash-escaped lines)
+        r'asm\s+(?:volatile\s+)?\(\s*'      # asm volatile ( or asm (
+        r'((?:[ \t]*\\\\[^\n]*\n)+)',        # multi-line asm string (indented backslash-escaped lines)
         re.MULTILINE
     )
 
@@ -141,14 +149,18 @@ def lint_file(path: Path) -> bool:
         # Find line number of the match
         line_no = text[:match.start()].count('\n') + 1
 
+        STATS["blocks"] += 1
+        if asm_text.count('\n') > 1:
+            STATS["multiline_blocks"] += 1
         tokens = parse_asm_block(asm_text, str(path), line_no)
+        STATS["calls"] += sum(1 for op, _ in tokens if op == 'call')
         if not check_alignment(tokens, str(path), line_no):
             all_pass = False
 
     return all_pass
 
 def main():
-    # Walk D:\zigos-sse2\src\*.zig (or src/*.zig relative to script location)
+    # Walk src/*.zig relative to the script location (tools/ sits beside src/).
     script_dir = Path(__file__).parent
     src_dir = script_dir.parent / 'src'
 
@@ -168,8 +180,23 @@ def main():
         if not lint_file(path):
             all_pass = False
 
+    # Self-check: refuse a vacuous PASS. The kernel has dozens of multi-line
+    # trampolines and several `call`s inside them; seeing none means the
+    # capture regressed again and the verdict below would be meaningless.
+    if STATS["multiline_blocks"] == 0 or STATS["calls"] == 0:
+        print(
+            f"[asm-lint] FAIL — vacuous run: blocks={STATS['blocks']} "
+            f"multiline={STATS['multiline_blocks']} calls={STATS['calls']} "
+            f"(the capture saw no trampolines; the regex has regressed)",
+            file=sys.stderr,
+        )
+        return 1
+
     if all_pass:
-        print("[asm-lint] PASS — all trampolines aligned")
+        print(
+            f"[asm-lint] PASS — all trampolines aligned "
+            f"(blocks={STATS['blocks']} multiline={STATS['multiline_blocks']} calls={STATS['calls']})"
+        )
         return 0
     else:
         print("[asm-lint] FAIL — see errors above", file=sys.stderr)
