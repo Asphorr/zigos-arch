@@ -992,6 +992,7 @@ pub var nmi_halt_after_snapshot: bool = false;
 const MAX_CPUS_NMI = @import("../cpu/smp.zig").MAX_CPUS;
 var nmi_ack: [MAX_CPUS_NMI]bool = [_]bool{false} ** MAX_CPUS_NMI;
 
+// ctx: irq — NMI: nothing here may park or take a sleeping lock (tools/ctx_lint.zig root).
 pub fn nmiSnapshot(rsp: u64, saved_rip: u64, saved_cs: u64) void {
     // Profiling fast-path — if the watchdog is RIP-sampling this CPU (see
     // profileWedgedCpu), record the interrupted RIP and IRET immediately,

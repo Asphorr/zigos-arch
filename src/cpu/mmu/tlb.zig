@@ -201,6 +201,7 @@ inline fn flushLocalForMode() void {
 /// IPI handler — invoked on the target CPU via vector 0x50. Performs a
 /// mode-appropriate local flush, decrements this CPU's ack-pending
 /// counter, then issues EOI. Idempotent.
+/// ctx: irq — reached from isr_tlb_shootdown's asm, IF=0 (tools/ctx_lint.zig root).
 pub export fn handleTlbShootdown() callconv(.c) void {
     flushLocalForMode();
     const me_full = apic.getLapicId();

@@ -243,6 +243,38 @@ swap-evict waits). Linux `might_sleep()` analogue.
 **Where to use:** any new function that can reach `schedule()` from
 task context. **Reference exemplar:** `sched.blockOn` line 3.
 
+## `// ctx:` annotations — the build-time context lint
+
+`tools/ctx_lint.zig` (run by `zig build` before the kernel links; std.zig.Ast
+over `src/`, only files reachable from `main.zig`) makes three of the
+disciplines above build failures and one a warning:
+
+- `.data__` outside `util/guarded.zig` — a Guarded payload reached without
+  a token. ERROR.
+- A function marked `// ctx: irq` in the comment block above it — plus
+  every handler passed to `idt.registerIrq` / `msix.allocVector` /
+  `msix.armOne` — reaching a `mightSleep`-bearing sleeper (the
+  `blockOn*` family, `Mutex.acquire`, also `.acquire()` on a receiver
+  whose field type is a Mutex anywhere in the tree) through the
+  resolvable call graph. ERROR, path printed. `// ctx: irq-ok <reason>`
+  on a function cuts the walk there: the documented "branches on
+  context" exemption, reason mandatory.
+- A `(p:lock)` field tag naming a lock that is neither a field of the
+  enclosing struct, nor a file-scope var, nor a documented cross-object
+  lock (`rq.lock`, `owning-cpu-cli`). ERROR — the tag outlived its lock.
+- A spinlock/Guarded window (`.acquire()` / `.acquireIrqSave()`) still
+  open at a call that may sleep, by textual receiver match; a `defer`red
+  release holds to the end of the body. WARNING; `// ctx: lock-ok
+  <reason>` silences it for a function (the witness self-test does this
+  on purpose).
+
+Calls through function pointers and methods on unresolvable receivers
+are counted, not guessed (`zig run tools/ctx_lint.zig -- src --verbose`
+lists roots, sleepers and skipped files). The annotation is the
+contract: when you write a new hardware handler, mark it `// ctx: irq`
+in the same commit. **Reference exemplar:** `cpu/idt/irq0.zig`
+`handleIRQ0` (root), `test/witness_selftest.zig` `taskEntry` (lock-ok).
+
 ## `UserPtr(T)` — type-safe user-space pointers
 
 Raw `usize` / `u32` user VAs flowing through kernel code can't be
@@ -561,6 +593,7 @@ silent self-recovery into observable metric.
 | `Deadline`          | `src/driver/keyboard.zig` `ps2Wait`             |
 | `pause.Epoch`       | `src/driver/nvme.zig` `waitCompletion`          |
 | `mightSleep`        | `src/proc/sched.zig` `blockOn`                  |
+| `// ctx: irq`       | `src/cpu/idt/irq0.zig` `handleIRQ0`; lint in `tools/ctx_lint.zig` |
 | `fail()`/`errtrace` | `src/fs/gpt.zig` `readHeader` / `parse`         |
 | `Phys`/`Virt`/`Dma` | `src/driver/e1000.zig` `allocRxRing`            |
 | mmio window         | `src/driver/nvme.zig` `Regs` / `regs()`         |

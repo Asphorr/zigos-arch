@@ -15,6 +15,7 @@ const apic = @import("../../time/apic.zig");
 const keyboard = @import("../../driver/keyboard.zig");
 const mouse = @import("../../driver/mouse.zig");
 
+// ctx: irq — PS/2 keyboard, IF=0 (tools/ctx_lint.zig root).
 export fn handleIRQ1() callconv(.c) void {
     @import("../arch/protect.zig").disallowUserAccess();
     const t = @import("../../debug/perf.zig").enter();
@@ -33,6 +34,7 @@ export fn handleIRQ1() callconv(.c) void {
     sendEOI();
 }
 
+// ctx: irq — PS/2 mouse, IF=0 (tools/ctx_lint.zig root).
 export fn handleIRQ12() callconv(.c) void {
     @import("../arch/protect.zig").disallowUserAccess();
     const t = @import("../../debug/perf.zig").enter();
@@ -245,6 +247,7 @@ pub export fn isr_pmi_align_panic() callconv(.c) noreturn {
     @panic("isr_pmi: RSP misaligned at call handlePmi");
 }
 
+// ctx: irq — LVT.PMI overflow, IF=0 (tools/ctx_lint.zig root).
 export fn handlePmi(rip: u64) callconv(.c) void {
     @import("../arch/pmu.zig").onSample(rip);
 }

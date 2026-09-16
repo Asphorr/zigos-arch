@@ -40,6 +40,9 @@ var lock_b: spinlock.SpinLock = .{};
 var sleep_guard: spinlock.SpinLock = .{};
 var sleepy: spinlock.Mutex = .{};
 
+// ctx: lock-ok — part 3 takes `sleepy` (a Mutex) under `sleep_guard` ON
+// PURPOSE to prove the runtime detector fires; the static lint would
+// flag the same line for the same reason.
 pub fn taskEntry() callconv(.c) noreturn {
     serial.print("\n[wtest] === WITNESS self-test start ===\n", .{});
 

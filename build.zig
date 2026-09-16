@@ -142,6 +142,27 @@ pub fn build(b: *std.Build) void {
     const asm_lint = b.addSystemCommand(&.{ "python3", "tools/check_asm_alignment.py" });
     kernel.step.dependOn(&asm_lint.step);
 
+    // --- CONTEXT / LOCK-DISCIPLINE LINTER ---
+    // tools/ctx_lint.zig walks src/ with std.zig.Ast: `.data__` outside
+    // util/guarded.zig, a `// ctx: irq` root (or any handler passed to
+    // registerIrq/allocVector/armOne) reaching a mightSleep-bearing
+    // sleeper, stale `(p:lock)` field tags — errors that abort the kernel
+    // build; sleep-under-spinlock is a warning. Host tool; the src/
+    // directory is its hashed input, so it re-runs only when a source
+    // file changes. `zig run tools/ctx_lint.zig -- src --verbose` lists
+    // roots and sleepers.
+    const ctx_lint_exe = b.addExecutable(.{
+        .name = "ctx_lint",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/ctx_lint.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+        }),
+    });
+    const ctx_lint = b.addRunArtifact(ctx_lint_exe);
+    ctx_lint.addDirectoryArg(b.path("src"));
+    kernel.step.dependOn(&ctx_lint.step);
+
     // Use addFileArg / addPrefixedFileArg so Zig tracks the .asm content for
     // its build-cache hash. Passing the path as a bare string literal in the
     // argv tuple looks fine but means Zig never sees the file as an input —

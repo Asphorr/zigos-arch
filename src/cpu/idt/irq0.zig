@@ -91,6 +91,7 @@ fn sendEOI() void {
     }
 }
 
+// ctx: irq — timer / soft-yield entry, IF=0 throughout (tools/ctx_lint.zig root).
 export fn handleIRQ0(rsp: u64) callconv(.c) void {
     // SMAP: timer IRQ during a syscall body inherits AC=1; clear it so the
     // scheduler / schedulable kernel work runs with SMAP enforcement. IRET
