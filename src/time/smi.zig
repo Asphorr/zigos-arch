@@ -194,7 +194,7 @@ fn tickBody() void {
     var cli_ra: u64 = 0;
     var cli_vm_frozen = false;
     if (tsc_per_quantum > 0) {
-        const my_cpu: u8 = @truncate(apic.getLapicId());
+        const my_cpu: u8 = smp.myCpuId();
         var rec: spinlock.CliHoldRecord = undefined;
         if (spinlock.sampleHold(my_cpu, &rec)) |seq| {
             if (seq != 0 and now_tsc >= rec.end_tsc and (now_tsc - rec.end_tsc) < tsc_per_quantum) {

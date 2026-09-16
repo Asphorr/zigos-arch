@@ -204,7 +204,9 @@ inline fn flushLocalForMode() void {
 /// ctx: irq — reached from isr_tlb_shootdown's asm, IF=0 (tools/ctx_lint.zig root).
 pub export fn handleTlbShootdown() callconv(.c) void {
     flushLocalForMode();
-    const me_full = apic.getLapicId();
+    // One rdtscp, not a LAPIC register read (a VM exit) — this runs once per
+    // shootdown IPI on every target CPU, i.e. on every munmap/COW.
+    const me_full = smp.myCpuId();
     if (me_full < smp.MAX_CPUS) {
         // Decrement only a nonzero slot. Only THIS cpu ever decrements its
         // own slot, so the load→sub pair can't race another decrementer; a

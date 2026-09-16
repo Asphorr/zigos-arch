@@ -344,10 +344,37 @@ comptime {
 pub var cpu_count: u8 = 1;
 var smp_initialized: bool = false;
 
-/// Get current CPU's local data via LAPIC ID
+/// IA32_TSC_AUX — `rdtscp` returns it in ECX with no VM exit. Each CPU
+/// stores its LAPIC id there (armTscAux, from initPerCpuAsm) and myCpuId()
+/// reads it back with rdtscp instead of the LAPIC ID register. Measured on
+/// zigvm (nested Hyper-V → KVM, x2APIC; benchCpuIdRead prints it every
+/// boot): 14–31k cycles per LAPIC ID read — `rdmsr 0x802` is an exit —
+/// against a few dozen per rdtscp, and a plain SpinLock.acquire, the Mutex
+/// fast path, every IRQ0 tick and every Deadline each pay one read.
+const IA32_TSC_AUX: u32 = 0xC000_0103;
+
+/// True while every online CPU identifies itself through TSC_AUX. The BSP
+/// sets it once its own round trip (wrmsr, rdtscp, compare) passed; a CPU
+/// whose round trip fails clears it and everyone falls back to the LAPIC
+/// ID register. Atomic: an AP can clear it while the BSP is running.
+var cpu_id_via_aux: bool = false;
+/// Sticky companion: some CPU's round trip failed — never re-enable (the
+/// BSP re-arms on S3 resume and would otherwise flip the flag back on).
+var tsc_aux_refused: bool = false;
+
+/// This CPU's id — its LAPIC id, which is also its cpus[] index. One
+/// rdtscp while TSC_AUX carries it, the LAPIC ID register otherwise; 0
+/// before SMP init (single-threaded boot on the BSP, whose id is 0).
+pub fn myCpuId() u8 {
+    if (!smp_initialized) return 0;
+    if (@atomicLoad(bool, &cpu_id_via_aux, .monotonic)) return @truncate(rdtscpAux());
+    return @truncate(apic.getLapicId());
+}
+
+/// Get current CPU's local data
 pub fn myCpu() *CpuLocal {
     if (!smp_initialized) return &cpus[0];
-    const id: u8 = @truncate(apic.getLapicId());
+    const id = myCpuId();
     if (id >= MAX_CPUS) return &cpus[0];
     return &cpus[id];
 }
@@ -355,6 +382,85 @@ pub fn myCpu() *CpuLocal {
 /// Get BSP CPU data (always CPU 0)
 pub fn bspCpu() *CpuLocal {
     return &cpus[0];
+}
+
+inline fn rdtsc() u64 {
+    var lo: u32 = undefined;
+    var hi: u32 = undefined;
+    asm volatile ("rdtsc"
+        : [lo] "={eax}" (lo),
+          [hi] "={edx}" (hi),
+    );
+    return (@as(u64, hi) << 32) | lo;
+}
+
+/// `rdtscp` — the TSC plus IA32_TSC_AUX in ECX, never a VM exit. Only the
+/// AUX half is wanted: it carries this CPU's LAPIC id (armTscAux), the way
+/// Linux keeps the CPU number there for getcpu. ONE asm output on purpose,
+/// the TSC halves are clobbers: every multi-output inline asm returns an
+/// LLVM literal struct type, and a `{i32, i32, i32}` the kernel had never
+/// emitted before re-rolled the LLVM 20 "Invalid type" bitcode bug (round
+/// 9, cold build) — see reference-llvm-anon-struct-bitcode-bug.
+inline fn rdtscpAux() u32 {
+    var aux: u32 = undefined;
+    asm volatile ("rdtscp"
+        : [aux] "={ecx}" (aux),
+        :
+        : .{ .rax = true, .rdx = true }
+    );
+    return aux;
+}
+
+/// CPUID.80000001H:EDX[27] — RDTSCP present.
+fn hasRdtscp() bool {
+    var a: u32 = undefined;
+    var b: u32 = undefined;
+    var c: u32 = undefined;
+    var d: u32 = undefined;
+    asm volatile ("cpuid"
+        : [a] "={eax}" (a),
+          [b] "={ebx}" (b),
+          [c] "={ecx}" (c),
+          [d] "={edx}" (d),
+        : [leaf] "{eax}" (@as(u32, 0x8000_0001)),
+          [sub] "{ecx}" (@as(u32, 0)),
+    );
+    return (d & (1 << 27)) != 0;
+}
+
+/// Boot-time diagnostic: what one CPU-id read costs on this host, both
+/// ways. A LAPIC ID read (x2APIC: `rdmsr 0x802`; xAPIC: an MMIO load) is a
+/// VM exit under nested virtualization — 14–31k cycles on zigvm against a
+/// few dozen for rdtscp, the measurement that moved myCpuId() onto
+/// TSC_AUX. Printed every boot so a host where the ratio changes, or a boot
+/// where the round trip failed and myCpu fell back, shows in the log. Wall
+/// time with IRQs on: a tick or a host pause inside a loop lands in the
+/// figure, which is why it is a ratio, not a datasheet number. Short on
+/// purpose: 1024 reads stay under ~70 ms even at 200k cycles per exit.
+fn benchCpuIdRead() void {
+    const reads: u32 = 1024;
+    var sink: u64 = 0;
+    var i: u32 = 0;
+    const rdtscp_ok = hasRdtscp(); // CPUID is an exit too — keep it out of both windows
+    const t0 = rdtsc();
+    while (i < reads) : (i += 1) sink +%= apic.getLapicId();
+    const t1 = rdtsc();
+    if (rdtscp_ok) {
+        i = 0;
+        while (i < reads) : (i += 1) sink +%= rdtscpAux();
+    }
+    const t2 = rdtsc();
+    asm volatile (""
+        :
+        : [s] "r" (sink),
+    );
+    debug.klog("[smp] cpu-id read cost: lapic-id {d} cyc, rdtscp {d} cyc ({s}, {d} reads each, wall); myCpu via {s}\n", .{
+        (t1 -| t0) / reads,
+        if (rdtscp_ok) (t2 -| t1) / reads else 0,
+        if (apic.x2apic_active) "x2apic" else "xapic",
+        reads,
+        if (@atomicLoad(bool, &cpu_id_via_aux, .monotonic)) "tsc_aux" else "lapic-id",
+    });
 }
 
 /// Count of CPUs marked alive (BSP + APs that came up). For boot summary.
@@ -371,18 +477,17 @@ pub fn aliveCpuCount() usize {
 /// True if we're currently executing on the BSP (CPU 0).
 pub fn isBSP() bool {
     if (!smp_initialized) return true;
-    const id: u8 = @truncate(apic.getLapicId());
-    return id == 0;
+    return myCpuId() == 0;
 }
 
 /// SMP-correctness guard: panic if a BSP-only function is invoked from an AP.
-/// Cheap (one MSR read) and only fires when an audit invariant is violated, so
+/// Cheap (one rdtscp) and only fires when an audit invariant is violated, so
 /// we can sprinkle it on every "BSP-only by design" entry point. Catches the
 /// class of bugs where code that mutates desktop/USB/keyboard/mouse state
 /// silently runs on an AP and corrupts BSP-private structures.
 pub fn assertBSP(comptime site: []const u8) void {
     if (!smp_initialized) return;
-    const id: u8 = @truncate(apic.getLapicId());
+    const id = myCpuId();
     if (id != 0) {
         @import("../debug/serial.zig").print("\n[SMP-AUDIT] {s}: called from CPU {d}, must be BSP\n", .{ site, id });
         @panic("BSP-only function ran on AP — see [SMP-AUDIT] line above");
@@ -478,6 +583,7 @@ pub fn init() void {
     if (@import("../boot/boot_info.zig").boot_mode == 2) {
         debug.klog("[smp] BOOT MODE: SAFE — skipping AP startup, BSP-only\n", .{});
         const bsp_id: u8 = @truncate(apic.getLapicId());
+        if (bsp_id != 0) @panic("smp: BSP LAPIC id != 0 — cpus[0] is the BSP by invariant (bspCpu/isBSP/S3/TSC_AUX)");
         cpus[bsp_id].cpu_id = 0;
         cpus[bsp_id].lapic_id = bsp_id;
         @atomicStore(bool, &cpus[bsp_id].alive, true, .release);
@@ -490,6 +596,12 @@ pub fn init() void {
 
     // Set up BSP (CPU 0) per-CPU data
     const bsp_id: u8 = @truncate(apic.getLapicId());
+    // cpus[0] IS the BSP everywhere — bspCpu(), isBSP(), reinitForS3Resume's
+    // armTscAuxQuiet(0)/initPerCpuAsm(0), the TSC_AUX flag raised only by
+    // "cpu 0". A board whose BSP carries another LAPIC id would split the
+    // BSP across two slots; assertBSP would panic on the first BSP-only call
+    // anyway, so say it here, once, with the reason.
+    if (bsp_id != 0) @panic("smp: BSP LAPIC id != 0 — cpus[0] is the BSP by invariant (bspCpu/isBSP/S3/TSC_AUX)");
     cpus[bsp_id].cpu_id = 0;
     cpus[bsp_id].lapic_id = bsp_id;
     @atomicStore(bool, &cpus[bsp_id].alive, true, .release);
@@ -512,6 +624,7 @@ pub fn init() void {
     initPerCpuGdt(&cpus[bsp_id]);
 
     smp_initialized = true;
+    benchCpuIdRead();
 
     // Copy trampoline to phys 0x8000. The AP boots in 16-bit real mode
     // and starts execution at this physical address; the kernel writes
@@ -813,6 +926,14 @@ export fn apEntryS3Resume() callconv(.c) noreturn {
 pub fn reinitForS3Resume() void {
     const bsp = &cpus[0];
 
+    // BEFORE ANYTHING: S3 reset IA32_TSC_AUX (firmware may even have parked
+    // its own value there) while myCpuId() still trusts it — re-arm before
+    // any code that could ask who it is. Needs no APIC. The QUIET variant:
+    // a report here would klog → serial.print → getLapicId() down the stale
+    // x2APIC path with no IDT loaded = triple fault. initPerCpuAsm(0) below
+    // repeats the (idempotent) arm once the LAPIC is back and reports then.
+    _ = armTscAuxQuiet(0);
+
     // FIRST: re-enable the LAPIC and re-derive `x2apic_active` from the reset
     // IA32_APIC_BASE. Must precede any getLapicId()/myCpu() below — the stale
     // RAM flag would otherwise route LAPIC access down the wrong MMIO/MSR path
@@ -1097,13 +1218,94 @@ pub fn endQuiesceAps() void {
     @atomicStore(bool, &quiesce_requested, false, .release);
 }
 
-/// Initialize this CPU's per-CPU syscall scratch slot. The kstack pointer
-/// itself lives in cpus[cpu_id].tss.rsp0 and is stamped by setTssRsp0 on
-/// the first per-process dispatch; until then no syscall can fire on this
-/// CPU (BSP enters user via desktop.yieldToScheduler which calls
-/// setTssRsp0 first; APs never enter user mode in this kernel).
+/// Initialize this CPU's per-CPU register state and syscall scratch slot:
+/// IA32_TSC_AUX takes the LAPIC id for myCpuId(), user_rsp_save is zeroed.
+/// The kstack pointer itself lives in cpus[cpu_id].tss.rsp0 and is stamped
+/// by setTssRsp0 on the first per-process dispatch; until then no syscall
+/// can fire on this CPU (BSP enters user via desktop.yieldToScheduler which
+/// calls setTssRsp0 first; APs never enter user mode in this kernel).
+/// Runs on the BSP at boot and S3 resume and on every AP in apInitPerCpu.
 fn initPerCpuAsm(cpu_id: u8) void {
     per_cpu_user_rsp[cpu_id] = 0;
+    armTscAux(cpu_id);
+}
+
+inline fn wrmsr(msr: u32, val: u64) void {
+    asm volatile ("wrmsr"
+        :
+        : [msr] "{ecx}" (msr),
+          [lo] "{eax}" (@as(u32, @truncate(val))),
+          [hi] "{edx}" (@as(u32, @truncate(val >> 32))),
+    );
+}
+
+/// Store this CPU's id in IA32_TSC_AUX and prove the round trip. Runs
+/// before the IDT is loaded on this CPU (AP bring-up, S3 resume), so the
+/// write is the plain wrmsr gated on CPUID — RDTSCP present implies the
+/// MSR — not the #GP-fixup helper. A failed round trip (a hypervisor that
+/// swallows the write, an aux that reads back wrong) demotes EVERY CPU to
+/// the LAPIC ID register for the rest of the boot: global because
+/// myCpuId() must answer the same way on all of them, sticky because the
+/// BSP re-arms on S3 resume and would otherwise flip it back. Nothing on
+/// the AP path calls myCpu() before this runs (apInitPerCpu: x2APIC
+/// enable, getLapicId, sipi_acked, the two id fields, then here inside
+/// initPerCpuAsm); until then a fresh AP's aux holds whatever reset left
+/// there, which would alias it to another slot. Prints nothing (see
+/// armTscAux); false = this CPU, or an earlier one, was refused.
+fn armTscAuxQuiet(cpu_id: u8) bool {
+    if (@atomicLoad(bool, &tsc_aux_refused, .monotonic)) return false;
+    if (hasRdtscp()) {
+        wrmsr(IA32_TSC_AUX, cpu_id);
+        if (rdtscpAux() == cpu_id) {
+            if (cpu_id == 0) @atomicStore(bool, &cpu_id_via_aux, true, .release);
+            return true;
+        }
+        // Don't leave a lying aux behind for a future direct rdtscp reader.
+        wrmsr(IA32_TSC_AUX, 0);
+    }
+    @atomicStore(bool, &tsc_aux_refused, true, .monotonic);
+    @atomicStore(bool, &cpu_id_via_aux, false, .monotonic);
+    return false;
+}
+
+/// armTscAuxQuiet plus the report. Only where this CPU can already print:
+/// klog goes through serial.print's own getLapicId(), which needs the
+/// x2APIC flag to be right and an IDT to catch a #GP — true on the boot
+/// paths and on APs (x2APIC is enabled first thing), NOT at the top of the
+/// S3 BSP path. A CPU arriving after an earlier refusal reports that too,
+/// which is how the quiet S3 arm gets its line from initPerCpuAsm(0).
+fn armTscAux(cpu_id: u8) void {
+    const refused_before = @atomicLoad(bool, &tsc_aux_refused, .monotonic);
+    if (armTscAuxQuiet(cpu_id)) return;
+    debug.klog("[smp] cpu{d}: TSC_AUX {s} — myCpu() on the LAPIC ID register\n", .{
+        cpu_id, if (refused_before) "refused earlier" else if (hasRdtscp()) "round trip failed" else "absent (no RDTSCP)",
+    });
+}
+
+/// Once a second per CPU, from the IRQ0 tick: does TSC_AUX still agree
+/// with the LAPIC ID register? The round trip proves the aux at arm time
+/// only; if SMM, firmware or a hypervisor ever rewrote it, myCpuId() would
+/// hand two CPUs one per-CPU slot (preempt_pin, spin targets, rq locks,
+/// PMM magazines) with no symptom — a class the register could not
+/// produce. On disagreement demote everyone (sticky) and kwarn. One LAPIC
+/// read per CPU per second is noise next to what the aux saves. The tick
+/// counter is indexed by the aux itself: a wrong aux only shares a
+/// counter; the comparison does not depend on it.
+var cpu_id_audit_ticks: [MAX_CPUS]u8 = [_]u8{0} ** MAX_CPUS;
+const CPU_ID_AUDIT_EVERY_TICKS: u8 = 100; // 100 Hz tick → once a second
+
+pub fn auditCpuIdTick() void {
+    if (!@atomicLoad(bool, &cpu_id_via_aux, .monotonic)) return;
+    const aux: u8 = @truncate(rdtscpAux());
+    const slot: usize = if (aux < MAX_CPUS) aux else 0;
+    cpu_id_audit_ticks[slot] +%= 1;
+    if (cpu_id_audit_ticks[slot] < CPU_ID_AUDIT_EVERY_TICKS) return;
+    cpu_id_audit_ticks[slot] = 0;
+    const lapic: u8 = @truncate(apic.getLapicId());
+    if (lapic == aux) return;
+    @atomicStore(bool, &tsc_aux_refused, true, .monotonic);
+    @atomicStore(bool, &cpu_id_via_aux, false, .monotonic);
+    debug.kwarn(@src(), "[smp] TSC_AUX says cpu{d}, LAPIC ID says cpu{d} — myCpu() demoted to the LAPIC ID register\n", .{ aux, lapic });
 }
 
 /// Dedicated per-CPU NMI stack (TSS IST2, wired to vector 2 in idt.init). NMI

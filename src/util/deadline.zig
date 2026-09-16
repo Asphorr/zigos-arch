@@ -230,10 +230,11 @@ fn noteWaitStart(comptime what: [:0]const u8, deadline_tsc: u64) void {
 }
 
 /// LAPIC id as CPU index — the same aliasing spinlock's per-CPU slots
-/// assume (lapic_id == cpu_id on this board).
+/// assume (lapic_id == cpu_id on this board). One rdtscp via smp.myCpuId():
+/// every Deadline construction passes through here, and e1000/i225 build
+/// one per packet.
 fn currentCpuId() u8 {
-    if (!apic.apic_active) return 0;
-    return @as(u8, @truncate(apic.getLapicId()));
+    return smp.myCpuId();
 }
 
 /// Wedge-autopsy companion to spinlock.dumpSpinTargets(): the last

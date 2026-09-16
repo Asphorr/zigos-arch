@@ -80,7 +80,7 @@ const std = @import("std");
 
 // Core — what the primitives themselves need to function.
 const smp = @import("../cpu/smp.zig");
-const apic = @import("../time/apic.zig"); // LAPIC id = this file's CPU identity
+const apic = @import("../time/apic.zig"); // tscPerQuantum; CPU identity is smp.myCpuId()
 const process = @import("process.zig"); // Mutex block/wake integration
 
 // Diagnostics-only — autopsy, tracing, liveness. Nothing in this group
@@ -463,8 +463,7 @@ pub fn spinTargetOf(cpu: usize) usize {
 /// racing first hit can warn twice, which is harmless.
 pub fn mightSleep(comptime src: std.builtin.SourceLocation) void {
     const key: u64 = comptime std.hash.Wyhash.hash(src.line, src.file);
-    // One myCpu() for both checks — getLapicId is an uncached MMIO load
-    // (a VM exit under nested virt), and this sits on the uncontended
+    // One myCpu() for both checks — this sits on the uncontended
     // Mutex.acquire fast path; cpus[] is LAPIC-indexed so cpu_id is the
     // same number currentCpuId() would return, for free.
     const cl = smp.myCpu();
@@ -684,11 +683,11 @@ fn cliHoldCheck(self: *SpinLock, start_tsc: u64, start_pulse: u64, ra: u64, cpu_
 }
 
 /// This CPU's LAPIC id — the identity every per-CPU slot in this file is
-/// indexed by. 0 before the APIC comes up (early boot is single-threaded,
-/// so the aliasing is harmless).
+/// indexed by. 0 before SMP init (early boot is single-threaded, so the
+/// aliasing is harmless). One rdtscp (smp.myCpuId), not a LAPIC register
+/// read: this sits inside every plain acquire's cli microwindow.
 fn currentCpuId() u8 {
-    if (!apic.apic_active) return 0;
-    return @as(u8, @truncate(apic.getLapicId()));
+    return smp.myCpuId();
 }
 
 /// Print the [lock-spin] diagnostic with symbol-resolved caller and

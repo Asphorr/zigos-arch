@@ -154,6 +154,9 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
     defer @import("../../debug/perf.zig").leave(.irq0_timer, t);
     const smp = @import("../smp.zig");
     const cpu = smp.myCpu();
+    // Once a second: TSC_AUX (what myCpu() just trusted) still equals the
+    // LAPIC ID register, or demote everyone. See smp.auditCpuIdTick.
+    smp.auditCpuIdTick();
 
     bisectPoint("entry", frame_for_validate, irq_snap);
 

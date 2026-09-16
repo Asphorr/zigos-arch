@@ -549,6 +549,47 @@ lines with the invariants documented once, in one place. **How to
 apply:** new fixed pools use claim(); the 25 existing tables convert
 when touched.
 
+## CPU identity — `smp.myCpuId()` / `smp.myCpu()`, never the LAPIC ID register on a hot path
+
+"Which CPU am I" is `smp.myCpuId()` (the LAPIC id, which is also the
+`cpus[]` index) or `smp.myCpu()` for the per-CPU struct. Both are one
+`rdtscp`: every CPU parks its id in `IA32_TSC_AUX` during per-CPU init
+(`initPerCpuAsm` → `armTscAux`) and proves the round trip; a CPU whose
+round trip fails demotes the whole kernel to the LAPIC ID register,
+loudly, so the answer is the same on every CPU either way.
+
+**Why:** `apic.getLapicId()` is a LAPIC register read — `rdmsr 0x802` in
+x2APIC mode, an MMIO load in xAPIC — and under nested virtualization
+that is a VM exit. Measured on zigvm and printed at every boot as
+`[smp] cpu-id read cost`: 14–31k cycles per LAPIC read against a few
+dozen per rdtscp (wall time with IRQs on — a ratio, not a datasheet
+figure). A plain `SpinLock.acquire`, the `Mutex` fast path (`mightSleep`),
+every IRQ0 tick, every TLB-shootdown IPI and every `Deadline` construction
+each read the id once, so the register read was a 4–9 µs tax on the
+hottest paths in the kernel.
+
+**Where `apic.getLapicId()` still belongs:** hardware identity, not
+"who am I" — MSI-X destination ids (nvme), IPI targets and the bring-up
+itself (`smp.init`, `apInitPerCpu`, before TSC_AUX is armed), and
+`serial.print`, which cannot import smp (cycle) and is bounded by the
+UART anyway. Everything else goes through smp.
+
+**Traps:** nothing may call `myCpu()` on an AP before `armTscAux` ran
+there (a fresh AP's aux holds whatever reset left, aliasing it to another
+slot) — `apInitPerCpu` arms inside `initPerCpuAsm`, after `getLapicId`,
+the `sipi_acked` store and the two id-field stores, and nothing in that
+gap asks who it is; do not "tidy" a store into it. S3 resume re-arms the
+BSP first thing in `reinitForS3Resume`, with the QUIET variant: a klog
+there would reach `serial.print`'s `getLapicId()` down the stale x2APIC
+path with no IDT loaded. The flag is global and sticky by design: a
+per-CPU answer would let two CPUs index the same table two different
+ways. The round trip proves the aux at arm time only, so the IRQ0 tick
+re-checks it against the LAPIC register once a second per CPU
+(`smp.auditCpuIdTick`) and demotes on disagreement with a `kwarn`. The
+BSP is LAPIC 0 by invariant (`cpus[0]` is hardcoded as the BSP in
+`bspCpu`, `isBSP`, the S3 path and the flag) — `smp.init` panics
+otherwise instead of splitting the BSP across two slots.
+
 ## `kwarn` — recoverable warnings
 
 Three-level severity in `debug/debug.zig`:
@@ -598,3 +639,4 @@ silent self-recovery into observable metric.
 | `Phys`/`Virt`/`Dma` | `src/driver/e1000.zig` `allocRxRing`            |
 | mmio window         | `src/driver/nvme.zig` `Regs` / `regs()`         |
 | `slot_table.claim`  | `src/proc/pipe.zig` `alloc`                     |
+| `smp.myCpuId()`     | `src/proc/spinlock.zig` `currentCpuId`; arming in `src/cpu/smp.zig` `armTscAux` |
