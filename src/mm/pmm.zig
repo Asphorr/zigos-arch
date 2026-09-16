@@ -4,7 +4,10 @@ const boot_info = @import("../boot/boot_info.zig");
 const SpinLock = @import("../proc/spinlock.zig").SpinLock;
 const Guarded = @import("../util/guarded.zig").Guarded;
 const memmap = @import("memmap.zig");
-const Phys = @import("../util/addr.zig").Phys;
+/// pub: boot-plumbing callers (pmem.registerDeviceRange) reach the type as
+/// `pmm.Phys` instead of adding an @import edge of their own — a new edge
+/// re-rolls the LLVM Invalid-type dice (round 7, 2026-09-16).
+pub const Phys = @import("../util/addr.zig").Phys;
 
 const FRAME_SIZE: u32 = 4096;
 // 1 GB cap: bitmap = 32 KB, frame_refs = 256 KB. ZigOS QEMU configs use
@@ -713,7 +716,14 @@ fn testBit(frame: u32) bool {
 /// Used at init (single-threaded, no contention) AND at runtime by
 /// paging.freeBackBuffer / paging.freeGuestFB (rare). Splits the range
 /// per region; locks each region briefly.
-pub fn markRegionFree(base: usize, length: usize) void {
+pub fn markRegionFree(base: Phys, length: usize) void {
+    markRegionFreeRaw(base.raw(), length);
+}
+
+/// Raw-address body of markRegionFree. init() calls this directly for the
+/// boot memory map (raw firmware addresses; keeping the giant init body
+/// free of Phys.of injections — LLVM Invalid-type round 7).
+fn markRegionFreeRaw(base: usize, length: usize) void {
     var frame: u32 = @intCast(base / FRAME_SIZE);
     const end_frame: u32 = @intCast(@min((base + length) / FRAME_SIZE, MAX_FRAMES));
     while (frame < end_frame) {
@@ -749,7 +759,12 @@ pub fn markRegionFree(base: usize, length: usize) void {
 /// Mark [base, base+length) as used in the bitmap. Updates per-region free
 /// counts and removes any freelist entries that overlap. Used at init AND
 /// at runtime by paging.allocBackBuffer / paging.allocGuestFB.
-pub fn markRegionUsed(base: usize, length: usize) void {
+pub fn markRegionUsed(base: Phys, length: usize) void {
+    markRegionUsedRaw(base.raw(), length);
+}
+
+/// Raw-address body of markRegionUsed — see markRegionFreeRaw.
+fn markRegionUsedRaw(base: usize, length: usize) void {
     var frame: u32 = @intCast(base / FRAME_SIZE);
     const end_frame: u32 = @intCast(@min((base + length + FRAME_SIZE - 1) / FRAME_SIZE, MAX_FRAMES));
     while (frame < end_frame) {
@@ -841,7 +856,7 @@ pub fn init(info: *const boot_info.BootInfo) void {
         }
         const base: usize = @intCast(region.base);
         const length: usize = @intCast(@min(region.length, 0x100000000 - region.base));
-        markRegionFree(base, length);
+        markRegionFreeRaw(base, length);
         if (base + length > highest_usable_phys) highest_usable_phys = base + length;
         consumed += 1;
         if (region.base + region.length > 0x100000000) {
@@ -858,21 +873,21 @@ pub fn init(info: *const boot_info.BootInfo) void {
     // Mark reserved regions as used (see memmap.zig for the layout).
     // Clean-rule pass: only SINGLETON kernel infrastructure here; per-process
     // GUI FBs go through PMM allocation.
-    markRegionUsed(0x0, memmap.KERNEL_PHYS_START); // Low memory, BIOS, VGA
+    markRegionUsedRaw(0x0, memmap.KERNEL_PHYS_START); // Low memory, BIOS, VGA
     // Kernel image: linker-defined low PA → kernelEndPhys. Runtime-derived
     // so kernel growth (more code, bigger BSS) is automatic; no manual memmap
     // bumps. PMM only protects the bytes the kernel actually uses.
     const kernel_end = memmap.kernelEndPhys();
-    markRegionUsed(memmap.KERNEL_PHYS_START, kernel_end - memmap.KERNEL_PHYS_START);
+    markRegionUsedRaw(memmap.KERNEL_PHYS_START, kernel_end - memmap.KERNEL_PHYS_START);
     kernel_phys_end = kernel_end; // arm tripwire — see checkPhysSafety
-    markRegionUsed(memmap.KERNEL_HEAP_BASE, memmap.KERNEL_HEAP_SIZE); // Kernel heap (4 MB)
-    markRegionUsed(memmap.GUEST_FB_BASE, memmap.GUEST_FB_SIZE); // Guest FB (8 MB)
-    markRegionUsed(memmap.BACK_BUFFER_BASE, memmap.BACK_BUFFER_SIZE); // Back buffer (8 MB)
+    markRegionUsedRaw(memmap.KERNEL_HEAP_BASE, memmap.KERNEL_HEAP_SIZE); // Kernel heap (4 MB)
+    markRegionUsedRaw(memmap.GUEST_FB_BASE, memmap.GUEST_FB_SIZE); // Guest FB (8 MB)
+    markRegionUsedRaw(memmap.BACK_BUFFER_BASE, memmap.BACK_BUFFER_SIZE); // Back buffer (8 MB)
     if (@import("../boot/boot_info.zig").is_uefi) {
         // UEFI page tables live at 0x1C00000..0x1C40000. See memmap.zig
         // (UEFI_PT_BASE) for the rationale — kasan.init's 32 MB shadow
         // alloc otherwise overwrites them and kernel halts on wild CR3.
-        markRegionUsed(memmap.UEFI_PT_BASE, memmap.UEFI_PT_SIZE);
+        markRegionUsedRaw(memmap.UEFI_PT_BASE, memmap.UEFI_PT_SIZE);
     }
 
     // Lock in the post-markings free-frame count as the static "total" we
@@ -1362,9 +1377,9 @@ var device_hi: usize = 0;
 
 /// Register a physical range as device memory that freeFrame must silently
 /// ignore (not warn about). Used for NVDIMM DAX frames mapped into user space.
-pub fn registerDeviceRange(base: usize, len: usize) void {
-    device_lo = base;
-    device_hi = base +| len;
+pub fn registerDeviceRange(base: Phys, len: usize) void {
+    device_lo = base.raw();
+    device_hi = base.raw() +| len;
 }
 
 pub fn freeFrame(phys: Phys) void {

@@ -230,7 +230,7 @@ inline fn kvirtAt(inst: *const Instance, off: usize) usize {
     const page = off / 0x1000;
     const in_page = off % 0x1000;
     const phys = shm.frameAt(inst.shm_id, @intCast(page)) orelse @panic("iouring kvirtAt: shm frame gone");
-    return paging.physToVirt(phys) + in_page;
+    return phys.toVirt().raw() + in_page;
 }
 
 fn readSqe(inst: *Instance, idx_masked: u32) Sqe {
@@ -1008,7 +1008,7 @@ pub fn setup(entries_req: u32) u32 {
         instances[slot].in_use = false;
         return 0;
     };
-    const header_kvirt = paging.physToVirt(phys0);
+    const header_kvirt = phys0.toVirt().raw();
     const hdr: *RingHeader = @ptrFromInt(header_kvirt);
     hdr.* = .{
         .sq_head = 0,

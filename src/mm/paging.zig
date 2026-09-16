@@ -681,17 +681,17 @@ pub fn unmapGuiFB(pid: u8, num_pages_per_buf: u32) void {
 // --- Back buffer ---
 // Fixed contiguous region after the guest framebuffer. The kernel pointer
 // goes through the physmap; the BB_BASE constant itself is the *physical*
-// address (used by allocBackBuffer to mark the region used in PMM).
+// address (typed Phys — allocBackBuffer marks the region used in PMM).
 //   kernel_heap → guest_fb → back_buffer → gui_fb_reserve.
-const BB_BASE: usize = memmap.BACK_BUFFER_BASE;
+const BB_BASE: Phys = Phys.of(memmap.BACK_BUFFER_BASE);
 
 pub fn allocBackBuffer(num_pages: u32) ?[*]u32 {
     pmm.markRegionUsed(BB_BASE, @as(usize, num_pages) * 4096);
-    return @ptrFromInt(physToVirt(BB_BASE));
+    return @ptrFromInt(BB_BASE.toVirt().raw());
 }
 
 pub fn getBackBufferAddr() usize {
-    return BB_BASE;
+    return BB_BASE.raw();
 }
 
 pub fn freeBackBuffer(num_pages: u32) void {
@@ -714,18 +714,18 @@ pub fn freeBackBuffer(num_pages: u32) void {
 // Fixed contiguous region. Needs contiguous physical memory for DMA. Kernel
 // writes go through the physmap; the device sees the entries in `phys_out`
 // (still the raw phys addresses, what virtio-gpu's resource_create expects).
-const GFB_BASE: usize = memmap.GUEST_FB_BASE;
+const GFB_BASE: Phys = Phys.of(memmap.GUEST_FB_BASE);
 
 pub fn allocGuestFB(num_pages: u32, phys_out: [*]usize) ?[*]volatile u32 {
     pmm.markRegionUsed(GFB_BASE, @as(usize, num_pages) * 4096);
     for (0..num_pages) |i| {
-        phys_out[i] = GFB_BASE + i * 4096;
+        phys_out[i] = GFB_BASE.add(i * 4096).raw();
     }
-    return @ptrFromInt(physToVirt(GFB_BASE));
+    return @ptrFromInt(GFB_BASE.toVirt().raw());
 }
 
 pub fn getGuestFBAddr() usize {
-    return GFB_BASE;
+    return GFB_BASE.raw();
 }
 
 pub fn freeGuestFB(num_pages: u32) void {

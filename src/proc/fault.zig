@@ -619,10 +619,10 @@ pub fn handleUserPageFault(cr2: usize, error_code: u64) bool {
         const shm = @import("../mm/shm.zig");
         if (r.shm_id != shm.SHM_INVALID) {
             const page_idx: u32 = @intCast((va_aligned - r.start) / 0x1000);
-            const phys = Phys.of(shm.frameAt(r.shm_id, page_idx) orelse {
+            const phys = shm.frameAt(r.shm_id, page_idx) orelse {
                 debug.klog("[shm] frameAt miss id={d} pi={d} on fault — region torn down?\n", .{ r.shm_id, page_idx });
                 return false;
-            });
+            };
             vmm.mapUserPage(pd, va_aligned, phys, vmm.protToMapFlags(r.prot)) catch |e| {
                 // Benign MT race: another thread of this process faulted the
                 // same shm page first — it's mapped now, and that winner took

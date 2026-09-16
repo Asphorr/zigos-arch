@@ -35,7 +35,7 @@ const ShmRegion = struct {
     in_use: bool = false,
     size_pages: u16 = 0,
     refcount: u16 = 0,
-    frames: [MAX_PAGES_PER_REGION]u64 = [_]u64{0} ** MAX_PAGES_PER_REGION,
+    frames: [MAX_PAGES_PER_REGION]Phys = [_]Phys{Phys.of(0)} ** MAX_PAGES_PER_REGION,
 };
 
 var regions: [MAX_SHM_REGIONS]ShmRegion = [_]ShmRegion{.{}} ** MAX_SHM_REGIONS;
@@ -77,14 +77,14 @@ pub fn create(size_pages: u32) ?u32 {
         const phys = pmm.allocFrameUser() orelse break;
         const vptr = phys.toVirt().ptr([*]u8);
         @memset(vptr[0..4096], 0);
-        regions[id].frames[allocated] = phys.raw();
+        regions[id].frames[allocated] = phys;
     }
     if (allocated < size_pages) {
         // OOM unwind: free what we got, un-reserve the slot.
         while (allocated > 0) {
             allocated -= 1;
-            pmm.freeFrame(Phys.of(regions[id].frames[allocated]));
-            regions[id].frames[allocated] = 0;
+            pmm.freeFrame(regions[id].frames[allocated]);
+            regions[id].frames[allocated] = Phys.of(0);
         }
         const flags = lock.acquireIrqSave();
         regions[id].in_use = false;
@@ -136,8 +136,8 @@ pub fn release(id: u32) void {
 
     var i: u16 = 0;
     while (i < regions[id].size_pages) : (i += 1) {
-        pmm.freeFrame(Phys.of(regions[id].frames[i]));
-        regions[id].frames[i] = 0;
+        pmm.freeFrame(regions[id].frames[i]);
+        regions[id].frames[i] = Phys.of(0);
     }
     regions[id].in_use = false;
     regions[id].size_pages = 0;
@@ -154,12 +154,12 @@ pub fn release(id: u32) void {
 /// suspenders: a 0 frame reads as null rather than as "map phys page 0
 /// into userspace" — the failure mode if the refcount invariant is ever
 /// broken and we race a teardown's frames[i]=0.
-pub fn frameAt(id: u32, page_idx: u32) ?u64 {
+pub fn frameAt(id: u32, page_idx: u32) ?Phys {
     if (id >= MAX_SHM_REGIONS) return null;
     if (!regions[id].in_use) return null;
     if (page_idx >= regions[id].size_pages) return null;
     const f = regions[id].frames[page_idx];
-    return if (f == 0) null else f;
+    return if (f.raw() == 0) null else f;
 }
 
 pub fn sizePages(id: u32) u32 {

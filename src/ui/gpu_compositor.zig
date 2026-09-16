@@ -30,6 +30,7 @@ const gfx = @import("gfx.zig");
 const paging = @import("../mm/paging.zig");
 const process = @import("../proc/process.zig");
 const virtio_gpu = @import("../driver/virtio_gpu.zig");
+const Phys = @import("../util/addr.zig").Phys;
 const venus = @import("venus_kernel.zig");
 const shaders = @import("gpu_compositor_shaders.zig");
 
@@ -227,7 +228,7 @@ pub const WindowSlot = struct {
     res_id: u32 = 0,                 // virtio-gpu resource id (HOST3D blob)
     desc_set_id: u64 = 0,            // Venus descriptor set handle
     kernel_ptr: ?[*]volatile u8 = null,
-    phys: usize = 0,                 // BAR-phys for user-space mapping
+    phys: Phys = Phys.of(0),         // SHM-BAR phys for user-space mapping
     mem_bytes: u64 = 0,              // total allocation size (page-rounded)
 };
 pub var window_slots: [MAX_WINDOW_SLOTS]WindowSlot = blk: {
@@ -387,10 +388,10 @@ fn setupVulkanContext() bool {
         debug.klog("[gpu-comp] reply ring resourceMapBlob FAILED\n", .{});
         return false;
     };
-    const reply_buf: [*]volatile u8 = @ptrFromInt(paging.physToVirt(reply_phys));
+    const reply_buf: [*]volatile u8 = @ptrFromInt(reply_phys.toVirt().raw());
     for (0..REPLY_RING_SIZE) |i| reply_buf[i] = 0;
     reply_ring = reply_buf;
-    debug.klog("[gpu-comp] reply ring res_id={d} phys=0x{X} size={d}\n", .{ reply_ring_res_id, reply_phys, REPLY_RING_SIZE });
+    debug.klog("[gpu-comp] reply ring res_id={d} phys=0x{X} size={d}\n", .{ reply_ring_res_id, reply_phys.raw(), REPLY_RING_SIZE });
 
     // 4. Build SetReplyCommandStreamMESA Venus command and submit. After
     //    this, the host knows where to write replies for any subsequent
@@ -867,7 +868,7 @@ fn setupCommandRing() bool {
         debug.klog("[gpu-comp] ring: resourceMapBlob FAILED\n", .{});
         return false;
     };
-    const kvirt: [*]volatile u8 = @ptrFromInt(paging.physToVirt(phys));
+    const kvirt: [*]volatile u8 = @ptrFromInt(phys.toVirt().raw());
     // Zero the entire ring region (vkr_ring expects head=0, status=0 at create).
     for (0..RING_TOTAL_SIZE) |i| kvirt[i] = 0;
 
@@ -896,7 +897,7 @@ fn setupCommandRing() bool {
     ring_kvirt = kvirt;
     ring_res_id = res_id;
     ring_created = true;
-    debug.klog("[gpu-comp] ring: created (res={d} phys=0x{X} total={d} buf={d}) — Phase 1 ok\n", .{ res_id, phys, RING_TOTAL_SIZE, RING_BUFFER_SIZE });
+    debug.klog("[gpu-comp] ring: created (res={d} phys=0x{X} total={d} buf={d}) — Phase 1 ok\n", .{ res_id, phys.raw(), RING_TOTAL_SIZE, RING_BUFFER_SIZE });
 
     // Sanity: read back head/tail/status (should all be 0).
     const head_ptr: *align(1) const volatile u32 = @ptrCast(kvirt + RING_HEAD_OFFSET);
@@ -1005,8 +1006,8 @@ fn setupVulkanRender() bool {
             return false;
         };
         readback_res_ids[bi] = res_id;
-        readback_pixel_bufs[bi] = @ptrFromInt(paging.physToVirt(phys));
-        debug.klog("[gpu-comp] readback[{d}] res={d} phys=0x{X} (HOST3D blob+udmabuf)\n", .{ bi, res_id, phys });
+        readback_pixel_bufs[bi] = @ptrFromInt(phys.toVirt().raw());
+        debug.klog("[gpu-comp] readback[{d}] res={d} phys=0x{X} (HOST3D blob+udmabuf)\n", .{ bi, res_id, phys.raw() });
 
         // C: probe memory properties. memoryTypeBits tells us which host
         // Vulkan memory types can import this resource as VkDeviceMemory.
@@ -1084,9 +1085,9 @@ fn setupVulkanRender() bool {
         debug.klog("[gpu-comp] source resourceMapBlob FAILED\n", .{});
         return false;
     };
-    const source_buf: [*]volatile u8 = @ptrFromInt(paging.physToVirt(source_phys));
+    const source_buf: [*]volatile u8 = @ptrFromInt(source_phys.toVirt().raw());
     source_pixel_buf = source_buf;
-    debug.klog("[gpu-comp] source image res={d} phys=0x{X} {d}x{d}\n", .{ source_res_id, source_phys, SOURCE_W, SOURCE_H });
+    debug.klog("[gpu-comp] source image res={d} phys=0x{X} {d}x{d}\n", .{ source_res_id, source_phys.raw(), SOURCE_W, SOURCE_H });
 
     // Image view (color aspect, 2D). Created BEFORE the layout transition
     // so the descriptor-set update later has something to reference.
@@ -1228,8 +1229,8 @@ fn setupVulkanRender() bool {
     )) return false;
     if (!virtio_gpu.ctxAttachResource(COMPOSITOR_CTX_ID, focused_res_id)) return false;
     const focused_phys = virtio_gpu.resourceMapBlob(focused_res_id, FOCUSED_PX_BYTES) orelse return false;
-    focused_pixel_buf = @as([*]volatile u8, @ptrFromInt(paging.physToVirt(focused_phys)));
-    debug.klog("[gpu-comp] focused image res={d} phys=0x{X} {d}x{d}\n", .{ focused_res_id, focused_phys, FOCUSED_W, FOCUSED_H });
+    focused_pixel_buf = @as([*]volatile u8, @ptrFromInt(focused_phys.toVirt().raw()));
+    debug.klog("[gpu-comp] focused image res={d} phys=0x{X} {d}x{d}\n", .{ focused_res_id, focused_phys.raw(), FOCUSED_W, FOCUSED_H });
     {
         scratch_cs.reset();
         venus.encodeCreateImageView(
@@ -1428,7 +1429,7 @@ pub fn allocateWindowImage(image_w: u32, image_h: u32, mem_w: u32, mem_h: u32) ?
         debug.klog("[gpu-comp] slot[{d}] resourceMapBlob FAILED\n", .{slot_idx});
         return null;
     };
-    const kvirt: [*]volatile u8 = @ptrFromInt(paging.physToVirt(phys));
+    const kvirt: [*]volatile u8 = @ptrFromInt(phys.toVirt().raw());
 
     // 5. Image view (color aspect, B8G8R8A8).
     {
@@ -1494,7 +1495,7 @@ pub fn allocateWindowImage(image_w: u32, image_h: u32, mem_w: u32, mem_h: u32) ?
     sl.kernel_ptr = kvirt;
     sl.phys = phys;
     sl.mem_bytes = px_bytes_aligned;
-    debug.klog("[gpu-comp] slot[{d}] allocated: image={d}x{d} mem={d}x{d} bytes={d} res={d} kvirt=0x{X} phys=0x{X}\n", .{ slot_idx, image_w, image_h, mem_w, mem_h, px_bytes_aligned, res_id, @intFromPtr(kvirt), phys });
+    debug.klog("[gpu-comp] slot[{d}] allocated: image={d}x{d} mem={d}x{d} bytes={d} res={d} kvirt=0x{X} phys=0x{X}\n", .{ slot_idx, image_w, image_h, mem_w, mem_h, px_bytes_aligned, res_id, @intFromPtr(kvirt), phys.raw() });
     return slot_idx;
 }
 
@@ -1562,7 +1563,7 @@ fn setupBlobScanout(n_blobs: u32) bool {
             debug.klog("[gpu-comp] scanout[{d}] resourceMapBlob FAILED\n", .{i});
             return false;
         };
-        const kvirt: [*]volatile u32 = @ptrFromInt(paging.physToVirt(phys));
+        const kvirt: [*]volatile u32 = @ptrFromInt(phys.toVirt().raw());
 
         // Pre-fill blob 0 with the existing FB contents so the user
         // doesn't see a black flash during the transition. Blob 1 stays
@@ -1586,7 +1587,7 @@ fn setupBlobScanout(n_blobs: u32) bool {
 
         res_ids[i] = res_id;
         virts[i] = kvirt;
-        debug.klog("[gpu-comp] scanout blob[{d}] res={d} kvirt=0x{X} phys=0x{X}\n", .{ i, res_id, @intFromPtr(kvirt), phys });
+        debug.klog("[gpu-comp] scanout blob[{d}] res={d} kvirt=0x{X} phys=0x{X}\n", .{ i, res_id, @intFromPtr(kvirt), phys.raw() });
     }
 
     // 7. Tell virtio-gpu to flip the scanout to blob 0.
@@ -1638,7 +1639,7 @@ fn renderImageAsScanout() bool {
         debug.klog("[gpu-comp] renderImageAsScanout: resourceMapBlob FAILED\n", .{});
         return false;
     };
-    const kvirt: [*]volatile u32 = @ptrFromInt(paging.physToVirt(phys));
+    const kvirt: [*]volatile u32 = @ptrFromInt(phys.toVirt().raw());
 
     var res_ids = [_]u32{ res_id, 0 };
     var virts = [_][*]volatile u32{ kvirt, undefined };
@@ -1648,7 +1649,7 @@ fn renderImageAsScanout() bool {
     }
     virtio_gpu.dropOriginal2DScanout();
     render_scanout_res_id = res_id;
-    debug.klog("[gpu-comp] renderImageAsScanout: ok res={d} phys=0x{X}\n", .{ res_id, phys });
+    debug.klog("[gpu-comp] renderImageAsScanout: ok res={d} phys=0x{X}\n", .{ res_id, phys.raw() });
     return true;
 }
 

@@ -3390,10 +3390,11 @@ pub fn resourceCreateBlob(ctx_id: u32, resource_id: u32, blob_mem: u32, blob_fla
 // SHM BAR bump allocator — each blob gets a unique page-aligned offset
 var shm_next_offset: u64 = 0;
 
-/// Map a blob resource into the SHM BAR. Returns the physical address or null.
+/// Map a blob resource into the SHM BAR. Returns the blob's SHM-BAR physical
+/// address (device memory, never a PMM frame) or null.
 /// The offset is a guest-specified INPUT telling QEMU where in the SHM BAR to place this blob.
 /// The response only contains caching flags (map_info), NOT an offset.
-pub fn resourceMapBlob(resource_id: u32, size: u32) ?usize {
+pub fn resourceMapBlob(resource_id: u32, size: u32) ?Phys {
     if (shm_bar_phys == 0) {
         debug.klog("[virtio-gpu] mapBlob: no SHM BAR\n", .{});
         return null;
@@ -3432,7 +3433,7 @@ pub fn resourceMapBlob(resource_id: u32, size: u32) ?usize {
 
     const phys = shm_bar_phys + @as(usize, @truncate(offset));
     debug.klog("[virtio-gpu] mapBlob: res={d} offset=0x{X} phys=0x{X}\n", .{ resource_id, offset, phys });
-    return phys;
+    return Phys.of(phys);
 }
 
 /// Create a 3D resource (texture/buffer) for VirGL rendering.

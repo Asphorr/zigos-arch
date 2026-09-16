@@ -18,7 +18,6 @@ const perf = @import("../../debug/perf.zig");
 const pipe = @import("../../proc/pipe.zig");
 const memmap = @import("../../mm/memmap.zig");
 const config = @import("../../config.zig");
-const Phys = @import("../../util/addr.zig").Phys;
 const smp = @import("../smp.zig");
 const signals = @import("../../proc/signals.zig");
 const errno = @import("../../proc/errno.zig");
@@ -305,7 +304,7 @@ pub fn sysCreateWindow(alloc_width_in: u32, alloc_height: u32, display_wh: u32) 
     if (gpu_slot) |idx| {
         const gpu_comp = @import("../../ui/gpu_compositor.zig");
         const sl = &gpu_comp.window_slots[idx];
-        const slot_phys = Phys.of(sl.phys);
+        const slot_phys = sl.phys;
         const slot_pages: u32 = @intCast((sl.mem_bytes + 4095) / 4096);
         // Map the dmabuf into user-space at GUI_FB_BASE. The phys is
         // in the SHM BAR range — vmm.mapUserPage just sets PTE flags,

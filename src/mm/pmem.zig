@@ -447,7 +447,7 @@ pub fn init() void {
     // These frames sit above PMM-managed RAM. Once DAX mmap maps them into a
     // user AS, teardown will freeFrame each present leaf — register the window
     // so the PMM treats those frees as expected no-ops instead of warnings.
-    pmm.registerDeviceRange(@intCast(base_phys), @intCast(len_bytes));
+    pmm.registerDeviceRange(pmm.Phys.of(base_phys), @intCast(len_bytes));
 
     debug.klog("[pmem] NFIT: persistent-memory SPA range base=0x{x} len=0x{x} ({d} MiB)\n", .{
         base_phys, len_bytes, len_bytes / (1024 * 1024),

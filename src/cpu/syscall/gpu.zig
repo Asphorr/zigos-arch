@@ -18,7 +18,6 @@ const perf = @import("../../debug/perf.zig");
 const pipe = @import("../../proc/pipe.zig");
 const memmap = @import("../../mm/memmap.zig");
 const config = @import("../../config.zig");
-const Phys = @import("../../util/addr.zig").Phys;
 const smp = @import("../smp.zig");
 const signals = @import("../../proc/signals.zig");
 const errno = @import("../../proc/errno.zig");
@@ -226,7 +225,7 @@ pub fn sysGpuMapBlob(resource_id: u32, size: u32) u32 {
     // backing dma-buf is WB. Mapping UC on the guest side breaks MESI
     // coherency across the KVM boundary (guest reads stale DRAM until
     // the host CPU flushes its caches), and pegs reads to ~1.5 GB/s.
-    paging.mapWBRange(phys, size);
+    paging.mapWBRange(phys.raw(), size);
 
     // Map into user space at the process brk region. Same WB-everywhere
     // rationale — both kernel and user mappings of the same physical
@@ -236,7 +235,7 @@ pub fn sysGpuMapBlob(resource_id: u32, size: u32) u32 {
     var mapped_pages: usize = 0;
     for (0..pages) |i| {
         const virt = base_virt + i * 0x1000;
-        const p = Phys.of(phys + i * 0x1000);
+        const p = phys.add(i * 0x1000);
         vmm.mapUserPage(pd, virt, p, paging.PRESENT | paging.READ_WRITE | paging.USER) catch |e| {
             debug.klog("[gpu] map_blob mapUserPage failed at page={d} virt=0x{X}: {s}\n", .{ i, virt, @errorName(e) });
             // phys is host-owned SHM BAR memory — no PMM frame to free,
@@ -252,7 +251,7 @@ pub fn sysGpuMapBlob(resource_id: u32, size: u32) u32 {
     }
     pcb.user_brk = base_virt + pages * 0x1000;
 
-    debug.klog("[gpu] map_blob: res={d} phys=0x{X} virt=0x{X} size={d}\n", .{ resource_id, phys, base_virt, size });
+    debug.klog("[gpu] map_blob: res={d} phys=0x{X} virt=0x{X} size={d}\n", .{ resource_id, phys.raw(), base_virt, size });
     return @intCast(base_virt);
 }
 
