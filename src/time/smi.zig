@@ -22,8 +22,22 @@
 // of misattributed [cli-hold] lines per boot (see spinlock.zig's
 // vm_alive_pulse block comment for the full story).
 //
-// Cost: one I/O port read (~1 µs on real HW, near zero on QEMU+KVM) per
-// BSP IRQ0 = ~100 µs/sec = 0.01% CPU. Negligible.
+// The wall ruler (2026-09-16): PM_TMR was the only ruler until the tick
+// was measured — the PIIX4 timer port is emulated in QEMU USERSPACE, so
+// one `inl` is a KVM_EXIT_IO round trip through QEMU, and nested under
+// Hyper-V that is ~100k+ cycles; the tick paid two (entry sample + exit
+// re-baseline) = ~80 % of the BSP tick's 396k mean cycles. Under KVM the
+// tick now reads kvmclock instead (kvm.clockNs: the BSP's pvclock record
+// in guest RAM, ~100 cycles, no exit) and keeps PM_TMR for bare metal
+// and non-KVM hypervisors. Both are absolute-frequency wall clocks that
+// count through host pauses, which is exactly what a gap detector needs;
+// the TSC alone is not, because tsc_per_quantum is a CALIBRATED figure a
+// stall can corrupt (apic.tscPerQuantumSane). The ruler is latched once,
+// at the first BSP tick (kvm.initPerCpuPv runs before apic.init starts
+// IRQ0), and never switches: tickOverdue() reads the baseline cross-CPU,
+// and a ruler that changes under it would pair a baseline from one clock
+// with a reading from the other. benchRulers() prints both read costs at
+// boot — "[smi] ruler read cost".
 
 const acpi = @import("../acpi/acpi.zig");
 const apic = @import("apic.zig");
@@ -61,6 +75,30 @@ var pm_tmr_port: u16 = 0;
 var pm_tmr_mask: u32 = 0;
 var initialized: bool = false;
 
+/// Which wall clock the detector measures IRQ0 gaps on. `pm_tmr` = the
+/// ACPI timer port (3.579545 MHz, 24/32-bit, wraps); `kvmclock` = the
+/// BSP's pvclock record via kvm.clockNs (ns, u64, no exit). Latched by
+/// latchRuler() at the first BSP tick, published before `have_baseline`;
+/// never changes afterwards (see the header).
+const Ruler = enum(u8) { pm_tmr, kvmclock };
+/// (a) BSP-written once at latch, read cross-CPU by tickOverdue() only
+/// after it has seen have_baseline (acquire) — hence always the latched
+/// value there.
+var ruler: Ruler = .pm_tmr;
+/// Ruler ticks per second — PM_TMR_HZ or 1e9. (a) as `ruler`.
+var ruler_hz: u64 = PM_TMR_HZ;
+/// Ruler ticks per 10 ms quantum (= ruler_hz / 100). (a) as `ruler`.
+var ruler_per_quantum: u64 = PM_TMR_HZ / 100;
+/// 15 ms in ruler ticks — the base stall threshold. (a) as `ruler`.
+var stall_threshold_base: u64 = STALL_THRESHOLD_PM;
+/// kvmclock reads that came back null (record torn for the whole seqlock
+/// bound). That tick keeps its baseline and measures nothing; the next
+/// gap then spans two quanta and may log as a 20 ms HOST stall, which is
+/// about what a host mid-update preempting us for ~100 µs+ amounts to.
+/// BSP-only, dumped nowhere yet — a counter so the shape is visible in a
+/// debugger if it ever matters.
+var ruler_null_reads: u64 = 0;
+
 /// Most-recent stall window in BSP TSC, published for perf.zig's sample
 /// quarantine (a perf sample whose [start,end] overlaps this window was
 /// host-pause-contaminated, regardless of its magnitude). start is derived
@@ -72,9 +110,16 @@ var initialized: bool = false;
 pub var stall_win_start_tsc: u64 = 0;
 pub var stall_win_end_tsc: u64 = 0;
 
-/// PM_TMR at the EXIT of the previous BSP tick (see tick()). (a) —
-/// BSP-written, read cross-CPU by tickOverdue().
-var last_pm: u32 = 0;
+/// Ruler reading at the EXIT of the previous BSP tick (see tick()) — a
+/// masked PM_TMR value or kvmclock ns, per `ruler`. (a) — BSP-written,
+/// read cross-CPU by tickOverdue() after `have_baseline`.
+var last_wall: u64 = 0;
+/// (a) False until the first tick has stored a baseline; published with
+/// .release AFTER last_wall and the latched ruler, so a cross-CPU reader
+/// that sees it true sees a consistent (ruler, baseline) pair. Replaces
+/// the old "last_pm == 0" sentinel: a kvmclock reading is boottime ns and
+/// is never 0 in practice, but "in practice" is not a sentinel.
+var have_baseline: bool = false;
 var sample_count: u64 = 0;
 /// KVM steal-time reading at the previous tick (ns); 0 = not sampled yet.
 /// BSP-only like everything here (tick() is BSP IRQ0).
@@ -113,15 +158,17 @@ pub fn isActive() bool {
     return initialized;
 }
 
-/// Called from BSP IRQ0 (timer). Reads PM_TMR, computes elapsed-since-last
-/// in PM ticks, flags windows that exceeded the stall threshold. Also
-/// drains spinlock's cli-hold slots every tick (see flushCliHolds).
+/// Called from BSP IRQ0 (timer). Reads the wall ruler, computes
+/// elapsed-since-last in ruler ticks, flags windows that exceeded the
+/// stall threshold. Also drains spinlock's cli-hold slots every tick (see
+/// flushCliHolds).
 ///
 /// Don't call from APs — their IRQ0 is irregular (idle hlt suppresses it)
 /// and would trigger constant false positives. Don't call before APIC
-/// timer is calibrated and running, or last_pm is meaningless.
+/// timer is calibrated and running, or the baseline is meaningless.
 pub fn tick() void {
     if (!initialized) return;
+    if (!@atomicLoad(bool, &have_baseline, .monotonic)) latchRuler();
     tickBody();
     // Re-baseline at EXIT, not entry: the next gap is measured from the end
     // of this handler's work, so the handler's own IF=0 body — the cli-hold
@@ -129,17 +176,120 @@ pub fn tick() void {
     // is ~90 ms), classifyAndLog — is guest-run time in neither the stall
     // figure nor the host-pause credit. It carries no cli-hold record of
     // its own, so without this the tick after a chatty one would have read
-    // it as a whole-VM pause. One extra port read per tick. Same vCPU
+    // it as a whole-VM pause. One extra ruler read per tick (free on
+    // kvmclock; the second QEMU round trip on PM_TMR). Same vCPU
     // expression as the entry sample so the two steal baselines agree.
-    @atomicStore(u32, &last_pm, io.inl(pm_tmr_port) & pm_tmr_mask, .monotonic);
+    // A null kvmclock read keeps the previous baseline (see
+    // ruler_null_reads) rather than storing a lie.
+    if (rulerNow()) |w| {
+        @atomicStore(u64, &last_wall, w, .monotonic);
+        @atomicStore(bool, &have_baseline, true, .release);
+    } else {
+        ruler_null_reads +%= 1;
+    }
     last_steal_ns = kvm.stealNs(smp.myCpu().cpu_id);
 }
 
+/// First BSP tick only: pick the ruler for the life of the boot. kvmclock
+/// when KVM has armed and proven the BSP's record (kvm.initPerCpuPv runs
+/// before apic.init starts IRQ0, so by the first tick the answer is
+/// final); PM_TMR otherwise. Logged once — the line pairs with
+/// "[smi] ruler read cost" from benchRulers().
+fn latchRuler() void {
+    if (kvm.clockReady()) {
+        ruler = .kvmclock;
+        ruler_hz = 1_000_000_000;
+    } else {
+        ruler = .pm_tmr;
+        ruler_hz = PM_TMR_HZ;
+    }
+    ruler_per_quantum = ruler_hz / 100;
+    stall_threshold_base = 15 * ruler_hz / 1000;
+    debug.klog("[smi] tick ruler: {s} ({s})\n", .{
+        @tagName(ruler),
+        if (ruler == .kvmclock) "BSP pvclock record in guest RAM, no exit" else "ACPI timer port, one QEMU round trip per read under KVM",
+    });
+}
+
+/// One ruler reading. null only on the kvmclock ruler when the record
+/// stayed torn for the whole seqlock bound (kvm.clockNs).
+inline fn rulerNow() ?u64 {
+    return switch (ruler) {
+        .pm_tmr => @as(u64, io.inl(pm_tmr_port) & pm_tmr_mask),
+        .kvmclock => kvm.clockNs(0),
+    };
+}
+
+/// Ruler ticks from `prev` to `now`: wrap-safe on the masked PM_TMR,
+/// saturating on kvmclock ns (a cross-CPU read of slot 0 with a TSC a
+/// few cycles behind the BSP's must not wrap into 2^64).
+fn rulerDelta(prev: u64, now: u64) u64 {
+    return switch (ruler) {
+        .pm_tmr => pmDelta(@truncate(prev), @truncate(now)),
+        .kvmclock => now -| prev,
+    };
+}
+
+/// Ruler ticks → microseconds. Split whole-seconds/remainder math so a
+/// multi-hour gap on the ns ruler cannot overflow (delta × 1e6 would at
+/// 5 h; the PM ruler never came close).
+fn rulerToUs(delta: u64) u64 {
+    const whole_s = delta / ruler_hz;
+    const rem = delta % ruler_hz;
+    return (whole_s *| 1_000_000) +| (rem * 1_000_000 / ruler_hz);
+}
+
+/// Ruler ticks → TSC cycles at `per_q` TSC per 10 ms quantum. Split
+/// whole-quanta/remainder math: rem < ruler_per_quantum (≤ 1e7) times
+/// per_q (≤ PER_QUANTUM_MAX 1e11) stays under 2^64; the whole-quanta
+/// product saturates instead of overflowing on an absurd gap.
+fn rulerToTsc(delta: u64, per_q: u64) u64 {
+    const whole_q = delta / ruler_per_quantum;
+    const rem = delta % ruler_per_quantum;
+    return (whole_q *| per_q) +| (rem * per_q / ruler_per_quantum);
+}
+
+/// Boot diagnostic, BSP, IF=1, after kvm.initPerCpuPv: the read cost of
+/// both rulers in wall TSC cycles, and which one the tick will latch.
+/// Under nested Hyper-V the PM_TMR figure IS the price the tick used to
+/// pay twice per 10 ms; on bare metal it is a ~1 µs chipset read and
+/// kvmclock reads "absent". 128 port reads ≈ 10 ms once at boot.
+pub fn benchRulers() void {
+    if (!initialized) return;
+    const pm_reads: u32 = 128;
+    const kc_reads: u32 = 1024;
+    var sink: u64 = 0;
+    var i: u32 = 0;
+    const kvmclock_ready = kvm.clockReady();
+    const t0 = rdtsc();
+    while (i < pm_reads) : (i += 1) sink +%= io.inl(pm_tmr_port);
+    const t1 = rdtsc();
+    if (kvmclock_ready) {
+        i = 0;
+        while (i < kc_reads) : (i += 1) sink +%= kvm.clockNs(0) orelse 0;
+    }
+    const t2 = rdtsc();
+    asm volatile (""
+        :
+        : [s] "r" (sink),
+    );
+    debug.klog("[smi] ruler read cost: pm_tmr {d} cyc, kvmclock {d} cyc ({d}/{d} reads, wall); tick ruler will be {s}\n", .{
+        (t1 -| t0) / pm_reads,
+        if (kvmclock_ready) (t2 -| t1) / kc_reads else 0,
+        pm_reads,
+        kc_reads,
+        if (kvmclock_ready) "kvmclock" else "pm_tmr",
+    });
+}
+
 fn tickBody() void {
-    const now: u32 = io.inl(pm_tmr_port) & pm_tmr_mask;
     sample_count +%= 1;
-    if (last_pm == 0) return; // first sample: tick() stores the baseline on exit
-    const delta = pmDelta(last_pm, now);
+    if (!@atomicLoad(bool, &have_baseline, .monotonic)) return; // first sample: tick() stores the baseline on exit
+    const now: u64 = rulerNow() orelse {
+        ruler_null_reads +%= 1;
+        return; // measure nothing on a torn kvmclock read; the baseline stands
+    };
+    const delta = rulerDelta(@atomicLoad(u64, &last_wall, .monotonic), now);
 
     // KVM steal across this tick window. Sampled EVERY tick so a stall
     // tick's delta spans exactly its gap — the ground truth that splits
@@ -164,10 +314,9 @@ fn tickBody() void {
     }
 
     // Threshold scales with the deliberately-armed interval: a tickless
-    // BSP sleeping 10 quanta produces a 100ms PM gap BY DESIGN — only
-    // time beyond (armed - one quantum) + slop is an anomaly.
-    const pm_per_quantum: u64 = PM_TMR_HZ / 100;
-    const stall_threshold = STALL_THRESHOLD_PM + @as(u64, armed_quanta_max - 1) * pm_per_quantum;
+    // BSP sleeping 10 quanta produces a 100ms gap BY DESIGN — only time
+    // beyond (armed - one quantum) + slop is an anomaly. Ruler units.
+    const stall_threshold = stall_threshold_base + @as(u64, armed_quanta_max - 1) * ruler_per_quantum;
     @atomicStore(u32, &armed_quanta_max, 1, .monotonic);
     if (delta < stall_threshold) return;
     // Atomic store: keyboard.pollRepeat reads this cross-CPU (desktop loop
@@ -175,7 +324,7 @@ fn tickBody() void {
     // The plain read in the +% is fine — BSP IRQ0 is the ONLY writer, so
     // this is not a racy RMW; don't "fix" it into @atomicRmw or a lock.
     @atomicStore(u64, &stall_events, stall_events +% 1, .monotonic);
-    const us = delta * 1_000_000 / PM_TMR_HZ;
+    const us = rulerToUs(delta);
     if (us >= BIG_STALL_US) {
         @atomicStore(u64, &big_stall_events, big_stall_events +% 1, .monotonic);
     }
@@ -210,9 +359,9 @@ fn tickBody() void {
     const ours = cli_us != 0 and cli_us * 2 >= us and !cli_vm_frozen;
 
     if (tsc_per_quantum > 0) {
-        // PM ticks per 10ms quantum = PM_TMR_HZ/100; gap in TSC ≈
-        // delta * tsc_per_quantum / that. Publish for perf's quarantine.
-        const delta_tsc = delta * tsc_per_quantum / (PM_TMR_HZ / 100);
+        // Gap in TSC ≈ delta × tsc_per_quantum / ruler ticks per quantum.
+        // Publish for perf's quarantine.
+        const delta_tsc = rulerToTsc(delta, tsc_per_quantum);
         @atomicStore(u64, &stall_win_start_tsc, now_tsc -% delta_tsc, .monotonic);
         @atomicStore(u64, &stall_win_end_tsc, now_tsc, .release);
         // Credit the host-pause clock with the UNACCOUNTED part of a HOST
@@ -235,8 +384,8 @@ fn tickBody() void {
         // No sane rate ⇒ no credit (the waits run on wall time, as before).
         const per_q_sane = apic.tscPerQuantumSane();
         if (!ours and per_q_sane != 0) {
-            const gap_tsc = delta * per_q_sane / pm_per_quantum;
-            const threshold_tsc = stall_threshold * per_q_sane / pm_per_quantum;
+            const gap_tsc = rulerToTsc(delta, per_q_sane);
+            const threshold_tsc = rulerToTsc(stall_threshold, per_q_sane);
             const l0_tsc = gap_tsc -| threshold_tsc -| pause.nsToTsc(steal_delta_ns);
             if (l0_tsc != 0) pause.creditL0(l0_tsc);
         }
@@ -267,10 +416,11 @@ fn tickBody() void {
 /// microseconds between the VM resuming and the BSP's pending IRQ0
 /// landing (pause.zig, "granularity"). Same threshold as tick(),
 /// including the tickless stretch, so a BSP legitimately asleep for 10
-/// quanta doesn't read as overdue. One PM_TMR port read per call — only
-/// on the expiry path, and Deadline bounds how long it keeps asking (a
-/// grant window of at most two quanta: a credit that is coming comes
-/// within microseconds of the resume).
+/// quanta doesn't read as overdue. One ruler read per call (kvmclock: the
+/// BSP's record in guest RAM with this CPU's TSC; PM_TMR: the port round
+/// trip) — only on the expiry path, and Deadline bounds how long it keeps
+/// asking (a grant window of at most two quanta: a credit that is coming
+/// comes within microseconds of the resume).
 ///
 /// True also while the BSP merely sits in a long IF=0 window of its own
 /// (the mkfs pour holds the NVMe CQ lock for seconds) — the caller cannot
@@ -282,13 +432,15 @@ fn tickBody() void {
 /// window; that BSP is exactly what the AP's watchdog halts on.
 pub fn tickOverdue() bool {
     if (!initialized) return false;
-    const prev = @atomicLoad(u32, &last_pm, .monotonic);
-    if (prev == 0) return false;
-    if (smp.myCpu().cpu_id == 0 and !pause.irqsEnabled()) return false;
-    const now: u32 = io.inl(pm_tmr_port) & pm_tmr_mask;
+    // acquire pairs with tick()'s release: a true here means `ruler`, the
+    // per-ruler constants and last_wall are the latched, published set.
+    if (!@atomicLoad(bool, &have_baseline, .acquire)) return false;
+    if (smp.myCpuId() == 0 and !pause.irqsEnabled()) return false;
+    const prev = @atomicLoad(u64, &last_wall, .monotonic);
+    const now = rulerNow() orelse return false; // torn kvmclock read: no evidence, no grant
     const armed = @atomicLoad(u32, &armed_quanta_max, .monotonic);
-    const threshold = STALL_THRESHOLD_PM + @as(u64, armed - 1) * (PM_TMR_HZ / 100);
-    return pmDelta(prev, now) >= threshold;
+    const threshold = stall_threshold_base + @as(u64, armed - 1) * ruler_per_quantum;
+    return rulerDelta(prev, now) >= threshold;
 }
 
 inline fn rdtsc() u64 {
@@ -300,9 +452,9 @@ inline fn rdtsc() u64 {
         :: .{ .rdx = true });
 }
 
-/// Wraparound-safe delta on the masked counter. Returns the number of PM
-/// ticks elapsed from `prev` to `now`. Caller already masked both with
-/// `pm_tmr_mask`.
+/// Wraparound-safe delta on the masked PM_TMR counter. Returns the number
+/// of PM ticks elapsed from `prev` to `now`. Caller already masked both
+/// with `pm_tmr_mask`. PM_TMR ruler only — rulerDelta dispatches here.
 fn pmDelta(prev: u32, now: u32) u64 {
     if (now >= prev) return now - prev;
     // Wrapped: distance is (mask - prev) + now + 1.

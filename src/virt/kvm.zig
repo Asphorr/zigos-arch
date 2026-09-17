@@ -139,11 +139,26 @@ pub fn hasClocksource2() bool {
     return features_eax & KVM_FEATURE_CLOCKSOURCE2 != 0;
 }
 
-// --- Per-CPU PV areas: steal time + PV EOI ----------------------------
+// --- Per-CPU PV areas: steal time + PV EOI + kvmclock -------------------
 //
 // One PMM frame, carved into 128-byte per-CPU strides: the 64-byte
-// steal-time struct at +0 (KVM requires 64-byte alignment) and the PV
-// EOI flag byte at +64 (own cacheline — KVM and this CPU both write it).
+// steal-time struct at +0 (KVM requires 64-byte alignment), the PV EOI
+// flag byte at +64 (second cacheline — KVM and this CPU both write it)
+// and the 32-byte pvclock at +96 (same second cacheline: every writer of
+// this stride is this vCPU's own KVM thread, so there is nothing to
+// false-share with).
+//
+//   kvmclock (MSR 0x4B564D01 = pa|1, pvclock_vcpu_time_info): KVM keeps
+//   (tsc_timestamp, system_time, mul, shift) current for this vCPU;
+//   clockNs() extrapolates ns = system_time + (rdtsc - tsc_timestamp)
+//   scaled — the same clock Linux runs on under KVM, host-authoritative
+//   wall time with NO exit. It counts through host pauses exactly like
+//   the TSC and PM_TMR do (system_time is the L1 host's boottime ns; the
+//   extrapolation term is the TSC). The BSP tick's stall detector
+//   (time/smi.zig) reads slot 0 in place of PM_TMR: the PIIX4 timer port
+//   is emulated in QEMU userspace, so a single `inl` is a KVM_EXIT_IO
+//   round trip through QEMU — under nested Hyper-V ~100k+ cycles, and
+//   the tick paid two per 10 ms.
 //
 //   Steal time (MSR 0x4B564D03 = pa|1): KVM continuously publishes
 //   nanoseconds this vCPU spent preempted (host descheduled it). This
@@ -164,12 +179,32 @@ pub fn hasClocksource2() bool {
 // BSP). Until a CPU re-arms, its flag byte stays 0 and eoi() falls
 // through to the real write — degraded, never wrong.
 
+const MSR_KVM_SYSTEM_TIME_NEW: u32 = 0x4B564D01;
 const MSR_KVM_STEAL_TIME: u32 = 0x4B564D03;
 const MSR_KVM_PV_EOI_EN: u32 = 0x4B564D04;
 
 const PV_STRIDE: u32 = 128;
 const PV_EOI_OFF: u32 = 64;
+const PV_CLOCK_OFF: u32 = 96;
 const PV_MAX_CPUS: u32 = 4096 / PV_STRIDE;
+
+/// pvclock_vcpu_time_info — KVM's per-vCPU clock record (kvmclock).
+/// `version` is a seqlock (odd = host mid-update; 0 = never written).
+const PvClock = extern struct {
+    version: u32,
+    pad0: u32,
+    tsc_timestamp: u64,
+    system_time: u64, // ns on the L1 host's boottime basis, at tsc_timestamp
+    tsc_to_system_mul: u32, // ns per TSC tick × 2^32, after the shift
+    tsc_shift: i8,
+    flags: u8, // bit 0 PVCLOCK_TSC_STABLE_BIT, bit 1 PVCLOCK_GUEST_STOPPED
+    pad1: [2]u8,
+};
+comptime {
+    if (@sizeOf(PvClock) != 32) @compileError("KVM pvclock_vcpu_time_info must be exactly 32 bytes");
+    if (PV_EOI_OFF + 1 > PV_CLOCK_OFF or PV_CLOCK_OFF % 32 != 0 or PV_CLOCK_OFF + @sizeOf(PvClock) > PV_STRIDE)
+        @compileError("PV stride layout: eoi byte, then a 32-byte-aligned pvclock, inside one stride");
+}
 
 const StealTime = extern struct {
     steal: u64, // ns preempted, monotonic; torn-read-guarded by `version`
@@ -225,11 +260,88 @@ pub fn enablePerCpuPv(cpu_id: u32) void {
         wrmsr(MSR_KVM_PV_EOI_EN, (stride_pa + PV_EOI_OFF) | 1);
         @atomicStore(bool, &pv_eoi_armed, true, .release);
     }
-    debug.klog("[kvm] cpu{d} PV armed: steal_time={s} pv_eoi={s}\n", .{
+    // kvmclock: KVM fills the record before it re-enters the guest after
+    // the MSR write (KVM_REQ_CLOCK_UPDATE is serviced on the entry path),
+    // so a read right here is the proof — version even and nonzero, a
+    // nonzero multiplier. A hypervisor that swallowed the write leaves
+    // the zeroed record, and the BSP slot's readiness flag stays down:
+    // smi.tick then stays on PM_TMR instead of reading a dead clock.
+    var clock_ok = false;
+    if (hasClocksource2()) {
+        wrmsr(MSR_KVM_SYSTEM_TIME_NEW, (stride_pa + PV_CLOCK_OFF) | 1);
+        clock_ok = clockNs(cpu_id) != null;
+        if (cpu_id == 0) @atomicStore(bool, &pvclock_bsp_ready, clock_ok, .release);
+    }
+    debug.klog("[kvm] cpu{d} PV armed: steal_time={s} pv_eoi={s} kvmclock={s}\n", .{
         cpu_id,
         if (hasStealTime()) "y" else "n",
         if (hasPvEoi()) "y" else "n",
+        if (!hasClocksource2()) "n" else if (clock_ok) "y" else "REFUSED (record unwritten after the MSR write)",
     });
+}
+
+/// (a) The BSP's pvclock record is armed and read back sane — the gate
+/// smi.tick latches its ruler on. Written by the BSP's enablePerCpuPv
+/// (boot and S3 re-arm), read by any CPU.
+var pvclock_bsp_ready: bool = false;
+
+/// True once the BSP's kvmclock record has been armed and proven.
+pub fn clockReady() bool {
+    return @atomicLoad(bool, &pvclock_bsp_ready, .acquire);
+}
+
+/// `lfence; rdtsc` — the TSC read must not be hoisted above the pvclock
+/// field loads it is paired with (Linux's rdtsc_ordered). Same two-output
+/// asm signature as apic.readTsc.
+inline fn rdtscOrdered() u64 {
+    var lo: u32 = undefined;
+    var hi: u32 = undefined;
+    asm volatile ("lfence; rdtsc"
+        : [lo] "={eax}" (lo),
+          [hi] "={edx}" (hi),
+    );
+    return (@as(u64, hi) << 32) | lo;
+}
+
+/// kvmclock nanoseconds as published in `slot`'s record, extrapolated
+/// with THIS CPU's TSC: system_time + ((rdtsc - tsc_timestamp) << shift)
+/// * mul >> 32, all in u64 (split multiply — no u128 libcall on the BSP
+/// tick). Any CPU may read any slot: the vCPUs share one TSC offset, so
+/// slot 0 read from an AP is the BSP's clock to within the extrapolation
+/// slope. Bounded seqlock like stealNs; null when the record is torn for
+/// the whole bound, never written (version 0 / mul 0 — the MSR write was
+/// refused or this slot never armed), or kvmclock is absent. A caller
+/// that gets null skips its measurement — a stale clock value is no
+/// lower bound of anything, unlike stale steal.
+pub fn clockNs(slot: u32) ?u64 {
+    if (pv_page_va == 0 or !hasClocksource2() or slot >= PV_MAX_CPUS) return null;
+    const pc: *volatile PvClock = @ptrFromInt(pv_page_va + slot * PV_STRIDE + PV_CLOCK_OFF);
+    var tries: u32 = 0;
+    while (tries < STEAL_SEQLOCK_TRIES) : (tries += 1) {
+        const v1 = pc.version;
+        asm volatile ("" ::: .{ .memory = true });
+        const tsc_ts = pc.tsc_timestamp;
+        const sys = pc.system_time;
+        const mul: u64 = pc.tsc_to_system_mul;
+        const shift = pc.tsc_shift;
+        const tsc = rdtscOrdered();
+        asm volatile ("" ::: .{ .memory = true });
+        const v2 = pc.version;
+        if (v1 == v2 and (v1 & 1) == 0) {
+            if (v1 == 0 or mul == 0) return null;
+            var delta = tsc -| tsc_ts;
+            if (shift > 0) {
+                delta <<= @intCast(@min(@as(i16, shift), 63));
+            } else if (shift < 0) {
+                delta >>= @intCast(@min(-@as(i16, shift), 63));
+            }
+            const hi = (delta >> 32) *| mul;
+            const lo = ((delta & 0xFFFF_FFFF) * mul) >> 32;
+            return sys +| hi +| lo;
+        }
+        asm volatile ("pause");
+    }
+    return null;
 }
 
 /// EOI fast path: returns true when KVM marked the in-service interrupt

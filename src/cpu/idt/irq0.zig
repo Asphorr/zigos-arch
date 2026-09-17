@@ -245,8 +245,9 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
             serial.print("[hb] cpu0 irq#{d} tick={d}\n", .{ hb_state_count_page.count, process.tick_count });
         }
         // SMI / stall detector: BSP-only because APs IRQ0 is irregular
-        // (hlt suppression). Samples PM_TMR once per real (non-soft-yield)
-        // BSP timer tick; logs windows >15 ms.
+        // (hlt suppression). Samples its wall ruler (kvmclock under KVM,
+        // else PM_TMR) once per real (non-soft-yield) BSP timer tick;
+        // logs windows >15 ms.
         @import("../../time/smi.zig").tick();
         // S10 heartbeat — proves the trap checkers are actually running.
         // Self-rate-limits to one log per ~60s.

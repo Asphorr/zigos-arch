@@ -416,6 +416,11 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     // EOI vmexit on every edge interrupt). APs arm in apInitPerCpu.
     @import("virt/kvm.zig").detect();
     @import("virt/kvm.zig").initPerCpuPv();
+    // Stall detector's wall ruler, measured: PM_TMR port read vs kvmclock
+    // record read, and which one the first BSP tick will latch (kvmclock
+    // when initPerCpuPv just armed and proved it — that is why this sits
+    // between initPerCpuPv and apic.init, which starts IRQ0).
+    @import("time/smi.zig").benchRulers();
     if (@import("time/apic.zig").init()) {
         blog.ok("Local APIC + IOAPIC");
     } else {

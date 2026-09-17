@@ -435,7 +435,14 @@ every rounding UNDER-credits pause, because an over-credit would mask a
 genuine wedge: the BSP credits whole-VM gaps on the sane calibration
 only, a jump counts only with IRQs off at both ends, a wait that ran
 cli'd at any point never subtracts the BSP-side account, and
-`Deadline`'s tick-overdue grace is capped at two quanta.
+`Deadline`'s tick-overdue grace is capped at two quanta. The
+detector's own ruler is kvmclock when KVM offers it (`kvm.clockNs`, the
+BSP's pvclock record in guest RAM — the clock Linux runs on under KVM)
+and PM_TMR only otherwise: the ACPI timer port is emulated in QEMU
+userspace, one `inl` is a full QEMU round trip (~100k+ cycles nested),
+and the tick paid two per 10 ms — most of the BSP tick's cost until
+2026-09-16. Not the raw TSC, because `tsc_per_quantum` is a calibrated
+figure a stall can corrupt; both rulers are absolute-frequency clocks.
 
 ## `Phys` / `Virt` + `Dma(T)` — typed addresses and device memory
 

@@ -17,7 +17,8 @@
 //!   L0 — Hyper-V paused the whole zigvm. Invisible to KVM's accounting (no
 //!        runqueue wait ever happens), detectable only as guest NON-PROGRESS.
 //!        Two observers, for two situations:
-//!        · the BSP's IRQ0 gap (smi.tick): PM_TMR-measured, minus the armed
+//!        · the BSP's IRQ0 gap (smi.tick): measured on the detector's wall
+//!          ruler (kvmclock under KVM, PM_TMR otherwise), minus the armed
 //!          interval, minus the L1 steal covering it, and only when no
 //!          cli-hold of ours accounts for the gap — credited to ONE global
 //!          accumulator at the first BSP tick after the pause. Bare-metal
