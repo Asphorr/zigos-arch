@@ -26,7 +26,11 @@ pub var attach_on_kernel_exception_flag: bool = true;
 var initialized: bool = false;
 var no_ack_mode: bool = false;
 var gdb_connected: bool = false; // true after first successful packet exchange
-var resume_action: enum { none, cont, step } = .none;
+/// Named, not an anonymous stored-var type: the LLVM bitcode reader trips
+/// on anonymous types in this kernel's graph (round 11 of the "Invalid
+/// type" bug landed on this module).
+const ResumeAction = enum { none, cont, step };
+var resume_action: ResumeAction = .none;
 var saved_frame: ?[*]u64 = null;
 var stop_reason: u8 = 0;
 var current_thread: u32 = 0;
@@ -56,11 +60,16 @@ var hw_breakpoints: [4]HwBreakpoint = [_]HwBreakpoint{.{}} ** 4;
 //        [8]=RDI [9]=RSI [10]=RBP [11]=RBX [12]=RDX [13]=RCX [14]=RAX
 //        [15]=int_no [16]=error_code
 //        [17]=RIP [18]=CS [19]=RFLAGS [20]=RSP [21]=SS
-const gdb_to_frame = [24]?u8{
+// NO_FRAME = "fixed value, not in the frame". A plain u8 table with a
+// sentinel, not [24]?u8: an array of optionals is an array of anonymous
+// {i8, i1} literal structs — the array-element pool of the LLVM "Invalid
+// type" bitcode bug (round 2 drained it treewide; this one was missed).
+const NO_FRAME: u8 = 0xFF;
+const gdb_to_frame = [24]u8{
     14, 11, 13, 12, 9, 8, 10, 20, // rax rbx rcx rdx rsi rdi rbp rsp
     7, 6, 5, 4, 3, 2, 1, 0, // r8-r15
     17, 19, 18, 21, // rip eflags cs ss
-    null, null, null, null, // ds es fs gs (fixed values)
+    NO_FRAME, NO_FRAME, NO_FRAME, NO_FRAME, // ds es fs gs (fixed values)
 };
 
 // --- Public API ---
@@ -86,9 +95,12 @@ pub fn isConnected() bool {
 }
 
 /// True if the kernel should drop into the stub on Ring 0 exceptions when no
-/// GDB is currently attached. Reads the runtime flag.
+/// GDB is currently attached. Reads the runtime flag — and refuses once the
+/// tick poll has found no UART behind COM2: enterStub's recvPacket would
+/// otherwise spin forever on an unbacked port that reads 0xFF as "data
+/// ready" (a crash that never prints its autopsy).
 pub fn attachOnKernelException() bool {
-    return attach_on_kernel_exception_flag;
+    return attach_on_kernel_exception_flag and !com2_absent;
 }
 
 /// Insert a software breakpoint from kernel code
@@ -96,11 +108,33 @@ pub fn breakpoint() void {
     asm volatile ("int $3");
 }
 
-/// Check for Ctrl-C break from GDB (call from timer IRQ)
+/// Sticky "no UART behind 0x2F8". An unbacked port reads 0xFF, and a
+/// real 16550 LSR is never 0xFF (the 8250 existence test). Latched on the
+/// first poll: every headless run script backs COM1 only, and a per-tick
+/// poll of a missing COM2 read "data ready" (0xFF & 1) and then the data
+/// byte — two QEMU round trips (~38k cycles each nested) per BSP tick for
+/// a debugger nothing could attach to.
+var com2_absent: bool = false;
+/// Polls are one real BSP tick in ten: 100 ms of Ctrl-C latency is plenty
+/// for a debugger, and every poll is a port read = VM exit.
+var poll_countdown: u8 = 0;
+
+/// Check for Ctrl-C break from GDB (call from the BSP timer IRQ).
 pub fn checkForBreak() void {
-    if (!initialized) return;
+    if (!initialized or com2_absent) return;
+    if (poll_countdown != 0) {
+        poll_countdown -= 1;
+        return;
+    }
+    poll_countdown = 9;
+    const lsr = io.inb(COM2 + 5);
+    if (lsr == 0xFF) {
+        com2_absent = true;
+        debug.klog("[gdb] COM2 LSR reads 0xFF — no UART behind 0x2F8; Ctrl-C poll off\n", .{});
+        return;
+    }
     // Check if COM2 has data ready
-    if (io.inb(COM2 + 5) & 1 != 0) {
+    if (lsr & 1 != 0) {
         const c = io.inb(COM2);
         if (c == 0x03) {
             // Ctrl-C — break into debugger
@@ -386,7 +420,8 @@ fn handleReadRegs() void {
 
     // Write 24 GPRs
     for (0..24) |i| {
-        const val: u64 = if (gdb_to_frame[i]) |idx|
+        const idx = gdb_to_frame[i];
+        const val: u64 = if (idx != NO_FRAME)
             frame[idx]
         else switch (i) {
             20, 21 => 0x10, // ds, es
@@ -419,7 +454,8 @@ fn handleWriteRegs(data: []const u8) void {
         reg_idx += 1;
         data_pos += 16;
     }) {
-        if (gdb_to_frame[reg_idx]) |frame_idx| {
+        const frame_idx = gdb_to_frame[reg_idx];
+        if (frame_idx != NO_FRAME) {
             var val: u64 = 0;
             for (0..8) |byte_idx| {
                 const hi = hexVal(data[data_pos + byte_idx * 2]) orelse continue;
