@@ -974,11 +974,13 @@ pub fn sysAlarm(seconds: u32) u32 {
         @truncate((pcb.alarm_tick - now) / 100)
     else
         0;
+    // Atomic: deliverDueAlarms claims alarm_tick with a cmpxchg on the BSP
+    // and reads every slot's value on its scan (the registrar contract).
     if (seconds == 0) {
-        pcb.alarm_tick = 0;
+        @atomicStore(u64, &pcb.alarm_tick, 0, .release);
     } else {
         const deadline = now + @as(u64, seconds) * 100;
-        pcb.alarm_tick = deadline;
+        @atomicStore(u64, &pcb.alarm_tick, deadline, .release);
         @import("../../proc/sched.zig").registerAlarmDeadline(deadline);
     }
     return prev_remaining;

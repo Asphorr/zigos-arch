@@ -940,6 +940,11 @@ pub fn reinitForS3Resume() void {
     // and #GP. Enabling the LAPIC this early is safe: IF is still 0 (the wake
     // trampoline cli'd and never sti'd) and the timer isn't armed until the end.
     apic.reinitLapicForS3Resume();
+    // The timer is re-armed one quantum out of band below, so the pre-suspend
+    // tickless bookkeeping (stretch flags, the BSP's published fire) is stale
+    // until the first fire — reset it so registrars don't compare against a
+    // fire tick that is now in the past.
+    @import("idt/irq0.zig").clearTicklessState();
 
     // Re-arm the BSP's KVM PV MSRs (steal time + PV EOI) — S3 reset them
     // along with the rest of CPU state. Until this runs, the PV EOI flag

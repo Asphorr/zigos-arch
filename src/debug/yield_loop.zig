@@ -77,6 +77,12 @@ pub fn observe(pid: usize, kind: process.WaitKind, target: u32, caller_ra: u64) 
     // it (the slot is never recorded, so checkStuck also skips it) so a healthy
     // bottom-half worker isn't mistaken for a stuck wake/resleep spin.
     if (kind == .softirq) return;
+    // Same shape for the compositor: it parks on .compositor between frames
+    // (gpu_compositor.parkUntilRender) with one fingerprint, 60×/s while
+    // the desktop repaints — a legitimate event wait, not a resleep spin.
+    if (kind == .compositor) return;
+    // And acpid, parked on .acpid between SCI events (main.parkAcpid).
+    if (kind == .acpid) return;
     // Earlier we disabled .nvme_io / .gpu_io thinking allocCid recycling
     // produced FPs — the "FPs" turned out to be REAL state/rq race trips
     // (pid stuck .sleeping in rq → picker repeatedly transitions
@@ -176,6 +182,8 @@ fn waitKindName(k: process.WaitKind) []const u8 {
         .iouring_cq => "iouring_cq",
         .softirq => "softirq",
         .desktop => "desktop",
+        .compositor => "compositor",
+        .acpid => "acpid",
     };
 }
 
@@ -215,6 +223,8 @@ fn dumpResourceState(pid: usize, kind: process.WaitKind, target: u32) void {
         .iouring_cq => serial.print("  iouring_cq instance={d} (enter() parked, wake from worker after CQE)\n", .{target}),
         .softirq => serial.print("  softirq cpu={d} — ksoftirqd idle (no bottom-half pending)\n", .{target}),
         .desktop => serial.print("  desktop parked (no wake source due; wakers: idle-loop, IRQ0 due-check, wakeExpired backstop)\n", .{}),
+        .compositor => serial.print("  compositor parked (no frame requested; wakers: requestRender wake, wakeExpired backstop)\n", .{}),
+        .acpid => serial.print("  acpid parked (no SCI event; wakers: sci.wakeAcpid stamp, wakeExpired backstop)\n", .{}),
     }
 }
 

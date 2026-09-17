@@ -79,6 +79,34 @@ pub fn takePowerOffRequest() bool {
     return @atomicRmw(u8, &power_off_requested, .Xchg, 0, .acq_rel) != 0;
 }
 
+/// PCB index of the acpid thread (main.acpidEntry), 0xFF until it exists.
+/// Set once from main after createKernelTask; read by the SCI handler.
+var acpid_pid: u8 = 0xFF;
+
+pub fn setAcpidPid(pid: u8) void {
+    @atomicStore(u8, &acpid_pid, pid, .release);
+}
+
+/// IRQ-side wake of the acpid thread, the virtio-gpu IRQ pattern: no
+/// process.wake() here (it takes the cross-CPU sched_lock), so stamp the
+/// thread's wake_tick = now and register it — the BSP's wakeExpired readies
+/// it on the next fire, and registerWakeDeadline kicks a tickless-stretched
+/// BSP so that fire is ≤10 ms away — and set wake_pending so a park racing
+/// this stamp (main.parkAcpid between its flag check and blockOn) returns at
+/// once instead of sleeping through the event. Also called from acpid's own
+/// context by the aml Notify hook (main.acpiNotifyDispatch) — a self-wake
+/// that costs one extra loop pass and keeps a boot-time Notify from waiting
+/// out the backstop.
+pub fn wakeAcpid() void {
+    const pid = @atomicLoad(u8, &acpid_pid, .acquire);
+    if (pid == 0xFF) return;
+    const process = @import("../proc/process.zig");
+    const pcb = &process.procs[pid];
+    @atomicStore(u64, &pcb.wake_tick, process.tick_count, .release);
+    @import("../proc/sched.zig").registerWakeDeadline(process.tick_count);
+    @atomicStore(bool, &pcb.wake_pending, true, .release);
+}
+
 // --- GPE0 dispatch state (Slice C) ------------------------------------------
 //
 // Slice A masked every GPE for storm safety. Slice C selectively re-enables the
@@ -297,6 +325,7 @@ fn sciHandler() callconv(.c) void {
     if (pressed) {
         @atomicStore(u8, &power_off_requested, 1, .release);
         serial.print("[sci] power button -> graceful power-off requested\n", .{});
+        wakeAcpid();
     }
 
     // GPE0 events (Slice C). For each enabled+set bit: record it for acpid and
@@ -320,6 +349,7 @@ fn sciHandler() callconv(.c) void {
         if (fired != 0) {
             _ = @atomicRmw(u64, &gpe_pending, .Or, fired, .acq_rel);
             serial.print("[sci] GPE event(s) -> acpid (bits=0x{X})\n", .{fired});
+            wakeAcpid();
         }
     }
 }

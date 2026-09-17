@@ -517,8 +517,22 @@ fn kernelIdle() callconv(.c) noreturn {
         // guarded). On a steal, schedule() runs it; the loop re-checks for more
         // before ever sleeping. No steal → fall through to the normal sleep.
         if (STEAL_ON_IDLE and process.tryStealWork()) {
+            @import("../cpu/idt/irq0.zig").shortenAfterIdleWake();
             process.schedule();
             continue;
+        }
+        // A task became runnable HERE with no IPI to break the sleep below
+        // (apProcessLoadQueue readying a pid assigned to this CPU, a same-
+        // CPU wake): run it now, off the tickless stretch, instead of
+        // hlt-ing over it for up to 10 quanta. Spin-proof: if schedule()
+        // dispatched nothing (a queued pid the picker skips for a reason
+        // rqHasDispatchable doesn't model), fall through and sleep on the
+        // one-quantum arm the shorten left — never re-check in a loop.
+        if (@import("../cpu/idt/irq0.zig").localRqHasWork()) {
+            const seq = @import("../cpu/idt/irq0.zig").dispatchSeq();
+            @import("../cpu/idt/irq0.zig").shortenAfterIdleWake();
+            process.schedule();
+            if (@import("../cpu/idt/irq0.zig").dispatchSeq() != seq) continue;
         }
         if (mwait.mwait_supported) {
             // sti + monitor + mwait. MWAIT(EAX=C1 hint, ECX[0]=1) wakes on
@@ -539,6 +553,7 @@ fn kernelIdle() callconv(.c) noreturn {
             const cpu = smp.myCpu();
             mwait.monitorArm(&cpu.idle_monitor_word);
             if (@import("../ui/desktop.zig").wakeIfDueFromIdle()) {
+                @import("../cpu/idt/irq0.zig").shortenAfterIdleWake();
                 process.schedule();
                 continue;
             }
@@ -550,25 +565,27 @@ fn kernelIdle() callconv(.c) noreturn {
             // races past it is caught by the next timer fire (the BSP
             // stretch is capped by earliest_wake_tick, ≤100 ms).
             if (@import("../ui/desktop.zig").wakeIfDueFromIdle()) {
+                @import("../cpu/idt/irq0.zig").shortenAfterIdleWake();
                 process.schedule();
                 continue;
             }
             asm volatile ("sti; hlt");
         }
-        // Tickless idle: if the one-shot was stretched while we slept and
-        // the wake came from a device IRQ / kick (not the timer), restore
-        // the 10ms cadence BEFORE scheduling whatever just became
-        // runnable — otherwise it runs up to the full stretch with no
-        // preemption and (on BSP) no wallclock advance. No-op when the
-        // timer itself woke us (its handler already re-armed).
-        @import("../cpu/idt/irq0.zig").shortenAfterIdleWake();
         // Parked-desktop instant wake: input IRQs land on the BSP and
         // break its hlt — hand the event to the desktop NOW, in this
         // lock-clean context (sched.wake is not IRQ-safe; the idle loop
         // is the earliest safe point after the IRQ). µs-class input
         // latency instead of waiting for the next tick. No-op off-BSP
-        // or when the desktop isn't parked/due.
+        // or when the desktop isn't parked/due. Runs BEFORE the tickless
+        // hook below so a woken desktop counts as work on this CPU.
         _ = @import("../ui/desktop.zig").wakeIfDueFromIdle();
+        // Tickless idle: if the one-shot is stretched and this wake put
+        // work on our queue (or the BSP was kicked for a sooner deadline),
+        // restore the 10 ms cadence BEFORE scheduling it — otherwise it
+        // runs up to the full stretch with no preemption and (on BSP) no
+        // wallclock advance. Queue empty → the stretch stands, whether the
+        // timer or an inline-handled device IRQ woke us.
+        @import("../cpu/idt/irq0.zig").shortenAfterIdleWake();
         process.schedule();
     }
 }

@@ -4410,6 +4410,11 @@ fn parkOrYield() void {
     // worst case the floor starts/stops one ~100 ms cycle late when a GUI
     // window is first created/destroyed, then self-corrects.
     if (gui_windows_active) wake.requestSelfWake(process.tick_count + GUI_PARK_REFRESH_TICKS);
+    // Held key: the next auto-repeat is a tick deadline this loop must
+    // wake for itself. Nothing else fires while a key stays down (USB HID
+    // reports a press once), and with the BSP's tick stretched during
+    // idle the IRQ0 due-check alone would pace repeats at 10 Hz.
+    if (keyboard.nextRepeatTick(process.tick_count)) |t| wake.requestSelfWake(t);
     const self_due = wake.selfWakeAt();
     const deadline: u64 = if (self_due != 0) self_due else process.tick_count + PARK_BACKSTOP_TICKS;
     @atomicStore(u64, &pcb.wake_tick, deadline, .release);

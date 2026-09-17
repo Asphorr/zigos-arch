@@ -259,6 +259,27 @@ var screen_h_cache: u32 = 0;
 pub var compositor_pid: u8 = 0xFF;
 var pending_wakes: u32 = 0;
 
+/// Liveness backstop for the compositor's park: a frame request that
+/// somehow bypasses requestRender's wake is honored within this many
+/// ticks. Longer than the BSP's 10-quanta idle stretch, so an idle
+/// desktop never has the compositor as its tickless clamp.
+pub const PARK_BACKSTOP_TICKS: u64 = 100;
+
+/// Block the compositor task until requestRender wakes it or the backstop
+/// expires. Same shape as desktop.parkOrYield: wake_tick stored, deadline
+/// registered, then blockOn (whose wake_pending handshake catches a wake
+/// that raced the caller's pending_wakes check); wake_tick cleared after
+/// so a stale one-shot can't trip the orphan-sleep diagnostics later.
+fn parkUntilRender() void {
+    const me: usize = process.getCurrentPid();
+    const pcb = &process.procs[me];
+    const deadline = process.tick_count + PARK_BACKSTOP_TICKS;
+    @atomicStore(u64, &pcb.wake_tick, deadline, .release);
+    @import("../proc/sched.zig").registerWakeDeadline(deadline);
+    process.blockOn(.compositor, 0);
+    @atomicStore(u64, &pcb.wake_tick, 0, .release);
+}
+
 // Per-frame damage snapshot. The desktop calls into requestRenderRects
 // to hand us a list of changed rects in screen coords; we copy only
 // those regions from the desktop backbuf to the source image, instead
@@ -2001,23 +2022,34 @@ fn run() noreturn {
     //   bucket 2: 8..16ms     (60-125Hz range)
     //   bucket 3: 16..24ms    (~60Hz target band)
     //   bucket 4: 24..33ms    (30-45Hz, mild stutter)
-    //   bucket 5: 33..50ms    (idle wake from kernelSleepMs(33))
+    //   bucket 5: 33..50ms    (a slow frame; the old 33 ms idle poll lived here)
     //   bucket 6: 50..100ms   (visible stutter)
     //   bucket 7: 100ms+      (frame drop)
     var interval_hist: [8]u32 = .{0} ** 8;
     var prev_frame_tsc: u64 = 0;
     while (true) : (frame_no += 1) {
-        // Sleep until something asks for a frame. Idle desktop = ~30 Hz
-        // wake-and-recheck, no work; active desktop = woken sub-ms by
-        // requestRender(). The kernelSleepMs timer covers the rare
-        // wake-vs-sleep race (kernelSleepMs sets state=.sleeping AFTER
-        // we've checked the counter — if a wake fired in between, the
-        // explicit process.wake() flipped state to .ready and we exit
-        // immediately; if not, the 33 ms timer fires).
-        while (@atomicLoad(u32, &pending_wakes, .seq_cst) == 0) {
-            process.kernelSleepMs(33);
+        // Park until something asks for a frame: requestRender() bumps
+        // pending_wakes and process.wake()s us from any CPU, and blockOn's
+        // wake_pending handshake makes the check-then-park race-free (a
+        // wake landing between the load below and the park returns at
+        // once). The wake_tick is a liveness backstop only. Until
+        // 2026-09-17 this was a 33 ms kernelSleepMs poll — the desktop
+        // never truly idled, and the BSP's tickless stretch was clamped to
+        // 3 quanta by this task's next deadline for the life of the boot.
+        // Xchg, not load-then-store-0: a requestRender landing between the
+        // two would lose its increment (harmless today only because every
+        // caller publishes its damage before bumping — made structural).
+        while (@atomicRmw(u32, &pending_wakes, .Xchg, 0, .seq_cst) == 0) {
+            if (vulkan_render_ready) {
+                // The Venus/Lavapipe path animates on frame_no (its
+                // renderVulkanFrame gets t = frame_no / 30): it needs the
+                // free-running ~30 Hz cadence the old poll gave it. Only
+                // this path keeps polling.
+                process.kernelSleepMs(33);
+            } else {
+                parkUntilRender();
+            }
         }
-        @atomicStore(u32, &pending_wakes, 0, .seq_cst);
 
         const perf = @import("../debug/perf.zig");
         // Frame-start timestamp + interval bucketing. Done AFTER the

@@ -136,6 +136,12 @@ pub export fn check_and_preempt_dynirq() callconv(.c) void {
         // consumed by the next DEVICE-IRQ epilogue on this CPU, not by a
         // tick. Bounded in practice by ambient device IRQ rates; same
         // class of delay the timer policy already imposes on kernel tasks.
+        // Tickless: drop a stretch this CPU no longer deserves (work queued
+        // here, a kick, or the idle PCB no longer current) BEFORE the pin
+        // gate — the drop takes no lock and schedules nothing, so it is
+        // safe under a pin, and it must not wait for the next device-IRQ
+        // epilogue the way the deferred preempt itself does.
+        @import("irq0.zig").shortenAfterIdleWake();
         if (@import("../../proc/spinlock.zig").preemptionPinned()) return;
         cpu.dynirq_preempt_pending = false;
         @import("../../proc/process.zig").schedule();

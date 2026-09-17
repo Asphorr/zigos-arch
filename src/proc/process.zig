@@ -160,6 +160,8 @@ pub const WaitKind = enum(u8) {
     iouring_cq, // wait_target = io_uring instance index. io_uring_enter parks here when caller asked for min_complete > 0; worker wakes it after writing each CQE.
     softirq, // wait_target = cpu_id. This CPU's ksoftirqd parks here when its softirq_pending mask is empty; softirq.raise wakes it by pid (target is informational only).
     desktop, // wait_target = 0. The desktop task parks here when wake.isDue() + all input checks are idle; woken by the BSP idle loop (instant, input path), the IRQ0 due-check (≤10ms backstop), or wakeExpired at its self-wake deadline.
+    compositor, // wait_target = 0. The GPU compositor task parks here between frames; woken by requestRender's process.wake (any CPU) or by wakeExpired at its liveness backstop (gpu_compositor.PARK_BACKSTOP_TICKS).
+    acpid, // wait_target = 0. The acpid thread parks here between SCI events; the SCI handler stamps wake_tick = now (+ wake_pending, the virtio-gpu IRQ pattern) and wakeExpired readies it; ACPID_BACKSTOP_TICKS bounds a missed stamp.
 };
 
 // Per-fd table entry. All fields are owner-pid only — fd_table lives on

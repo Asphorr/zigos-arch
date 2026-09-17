@@ -514,7 +514,11 @@ pub fn loadBalance() void {
     // idlest. pickMigrationCandidate takes the source rq.lock for the scan;
     // migrate() re-validates the pick under both rq locks.
     if (pickMigrationCandidate(busiest_cpu)) |p| {
-        _ = migrate(p, idlest_cpu);
+        // migrate() moves the pid between queues without a setState, so
+        // no maybePreemptOnWake and no IPI — and the destination is by
+        // construction the idlest CPU, i.e. one hlt-asleep on a tickless
+        // stretch (up to 10 quanta). Kick it so the push lands now.
+        if (migrate(p, idlest_cpu)) kickReschedule(p);
     }
 }
 
@@ -2124,6 +2128,11 @@ pub fn schedule() void {
         // tripwires still catch wild writes from anywhere else.
         const from_pid_a: u8 = if (cpu.current_pid) |c| @intCast(c) else 0xFE; // 0xFE = dying task
         @import("../debug/pid_trace.zig").setCurrentPid(cpu, next);
+        // Tickless: a non-idle `next` never starts on a stretched one-shot —
+        // the structural guarantee behind "stretched ⇒ idle current"
+        // (irq0.zig's contract block). IF=0 here, own-CPU state + one LAPIC
+        // write; also bumps the dispatch sequence the idle loop reads.
+        @import("../cpu/idt/irq0.zig").noteDispatch(cpu.cpu_id, process.procs[next].is_idle);
 
         // Race fix (B.3 caught this): release the lock WITHOUT restoring IRQ
         // state. We must keep IRQs masked across switchToCall — otherwise an
@@ -2254,21 +2263,54 @@ pub var earliest_alarm_tick: std.atomic.Value(u64) = std.atomic.Value(u64).init(
 // gates its scan and recomputes it. hrtimer.NONE (maxInt) = nothing pending.
 pub var earliest_hires_tsc: std.atomic.Value(u64) = std.atomic.Value(u64).init(hrtimer.NONE);
 
+/// Lower the earliest-wake cache to `deadline`. CONTRACT for every
+/// registrar: store the deadline into the PCB (`wake_tick`, .release)
+/// BEFORE calling this. wakeExpired re-derives the cache from the PCB
+/// table with the cache parked at maxInt for the scan's duration, so a
+/// registration that compared against the expired pre-scan value (and
+/// was dropped here) is still seen by the scan through the PCB field —
+/// whatever state the pid is in at that instant (the scan reads every
+/// slot's wake_tick, sleeping or not).
+///
+/// Then the tickless kick: a deadline sooner than the fire the idle BSP
+/// has armed must not wait for that fire (up to 10 quanta) — see
+/// irq0.noteTickDeadline. Called unconditionally (cheap, two loads): a
+/// registration that did NOT lower the cache is covered by the earlier
+/// one that did, or by a pending scan of an expired value.
 pub fn registerWakeDeadline(deadline: u64) void {
+    registrarFence();
     var cur = earliest_wake_tick.load(.monotonic);
     while (deadline < cur) {
-        cur = earliest_wake_tick.cmpxchgWeak(cur, deadline, .release, .monotonic) orelse return;
+        cur = earliest_wake_tick.cmpxchgWeak(cur, deadline, .release, .monotonic) orelse break;
     }
+    @import("../cpu/idt/irq0.zig").noteTickDeadline(deadline);
+}
+
+/// The registrar side of the scan protocol needs a full fence between the
+/// caller's PCB store and the cache load that follows. x86 TSO lets a store
+/// sit in the store buffer past the CPU's own later loads: without the
+/// fence an AP's `wake_tick = D` can still be invisible when the BSP — which
+/// has just swapped the cache to maxInt (a locked op, so ITS side is
+/// ordered) — reads that slot; and since D < (the expired cache value) is
+/// false, no locked cmpxchg happens on this side either. The walk misses D,
+/// the min-merge leaves maxInt, the sleeper has no waker. A seq_cst LOAD
+/// would not do (plain mov on x86); mfence does. One per registration.
+inline fn registrarFence() void {
+    asm volatile ("mfence" ::: .{ .memory = true });
 }
 
 /// Register a hi-res usleep deadline (absolute TSC). CAS-min into the cache so
 /// the timer ISR's re-arm sees the soonest due-time. Mirrors
 /// registerWakeDeadline; the caller has already stored it in pcb.hires_wake_tsc.
 pub fn registerHiresWake(deadline: u64) void {
+    registrarFence(); // see registerWakeDeadline — same store-buffer window
     var cur = earliest_hires_tsc.load(.monotonic);
     while (deadline < cur) {
-        cur = earliest_hires_tsc.cmpxchgWeak(cur, deadline, .release, .monotonic) orelse return;
+        cur = earliest_hires_tsc.cmpxchgWeak(cur, deadline, .release, .monotonic) orelse break;
     }
+    // Tickless kick, TSC flavour — an idle-stretched BSP re-arms for a
+    // usleep due before its armed fire (irq0.noteHiresDeadline).
+    @import("../cpu/idt/irq0.zig").noteHiresDeadline(deadline);
 }
 
 /// Earliest pending hi-res deadline (absolute TSC), or hrtimer.NONE if none.
@@ -2279,15 +2321,62 @@ pub inline fn nextHiresTsc() u64 {
 }
 
 pub fn registerAlarmDeadline(deadline: u64) void {
+    registrarFence(); // see registerWakeDeadline — same store-buffer window
     var cur = earliest_alarm_tick.load(.monotonic);
     while (deadline < cur) {
-        cur = earliest_alarm_tick.cmpxchgWeak(cur, deadline, .release, .monotonic) orelse return;
+        cur = earliest_alarm_tick.cmpxchgWeak(cur, deadline, .release, .monotonic) orelse break;
     }
+    // Same registrar contract as registerWakeDeadline (alarm_tick is
+    // stored first; deliverDueAlarms reads every slot's alarm_tick).
+    @import("../cpu/idt/irq0.zig").noteTickDeadline(deadline);
+}
+
+/// Does `cpu_id`'s run queue hold a task the picker would actually
+/// dispatch? The tickless predicate (irq0.rqHasWork). nr_runnable alone
+/// also counts job-control-stopped pids, which sit .ready in the queue
+/// until SIGCONT — an idle loop keyed on it spins at 100 % after one
+/// Ctrl-Z, and that CPU never stretches again (review B3). Walks the
+/// three bands under rq.lock: PriQueue.remove shrinks `count` before it
+/// compacts, so an unlocked reader can miss a live pid behind a
+/// stopped one and answer "nothing" over a runnable task — which on the
+/// arm path becomes a 10-quantum stretch over it (review SF5). Every
+/// rq.lock holder in the tree takes it IrqSave, so an IRQ0 / dynirq
+/// caller can never be the interrupted holder. Mirrors pickMinVruntime's
+/// PERMANENT skips (job_stopped, exit_requested) only; its transient gates
+/// (on_cpu, wait_kind) clear within µs — and the idle loop's dispatch-
+/// sequence guard bounds a false positive to one extra schedule().
+pub fn rqHasDispatchable(cpu_id: u8) bool {
+    if (cpu_id >= smp.MAX_CPUS) return false;
+    const rq = &smp.cpus[cpu_id].runqueue;
+    if (@atomicLoad(u16, &rq.nr_runnable, .monotonic) == 0) return false;
+    const flags = rq.lock.acquireIrqSave();
+    defer rq.lock.releaseIrqRestore(flags);
+    const bands = [_]*const runqueue.PriQueue{ &rq.interactive, &rq.normal, &rq.background };
+    for (bands) |q| {
+        var i: u8 = 0;
+        while (i < q.count and i < q.pids.len) : (i += 1) {
+            const pid = q.pids[i];
+            if (pid >= MAX_PROCS) continue;
+            if (@atomicLoad(bool, &process.procs[pid].job_stopped, .acquire)) continue;
+            if (@atomicLoad(bool, &process.procs[pid].exit_requested, .acquire)) continue;
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Wait kinds whose sleeper wakeExpired readies by wake_tick: the explicit
+/// waker stamps wake_tick = now from IRQ context (virtio-gpu IRQ → .gpu_io,
+/// SCI → .acpid, the IRQ0 due-check → .desktop) or the deadline is the
+/// park's liveness backstop (.desktop, .compositor, .acpid). Every other
+/// non-.none kind is woken by its explicit path alone.
+inline fn deadlineParked(kind: WaitKind) bool {
+    return kind == .gpu_io or kind == .desktop or kind == .compositor or kind == .acpid;
 }
 
 /// Wake sleeping processes whose `sleep()` deadline has expired. Only
 /// considers processes with wait_kind == .none (those blocked via
-/// `sysSleep`) and .gpu_io (virtio-gpu safety-net) — futex/pipe/waitpid
+/// `sysSleep`) and the deadlineParked kinds — futex/pipe/waitpid
 /// sleepers leave wait_kind set and must be woken by their respective
 /// explicit wake paths. Without the guard, every `.sleeping` PCB with the
 /// default wake_tick=0 would race to .ready on the very next tick, breaking
@@ -2297,6 +2386,20 @@ pub fn wakeExpired() void {
     // per slot every tick. With the earliest cache + tick gating, idle ticks
     // skip the scan entirely. ~6,400 PCB atomic loads/sec eliminated at idle.
     if (process.tick_count < earliest_wake_tick.load(.acquire)) return;
+    // Re-derive from the PCB table. Park the cache at maxInt for the scan's
+    // duration: a registrar racing us then lowers from maxInt (kept by the
+    // min-merge at the end) instead of comparing against the expired value
+    // we are replacing. A registration that hit that expired value before
+    // the swap was dropped by registerWakeDeadline — but its wake_tick was
+    // stored first (the registrar contract), so the walk below sees it.
+    //
+    // Until 2026-09-17 the store-back was "only lower", which can never
+    // raise the cache above the deadline that just expired: the first
+    // fired sleep left the cache in the past for the rest of the boot — a
+    // full scan every tick, and the BSP's tickless clamp (quantaUntil)
+    // permanently reading "due now", so the BSP never stretched a single
+    // quantum. (wakeHiresExpired had the healing store-back already.)
+    _ = earliest_wake_tick.swap(std.math.maxInt(u64), .acq_rel);
     var new_earliest: u64 = std.math.maxInt(u64);
     for (0..MAX_PROCS) |i| {
         const pcb = &process.procs[i];
@@ -2304,6 +2407,15 @@ pub fn wakeExpired() void {
             // Forward progress on this slot — clear any latched stuck
             // state so the NEXT incident logs fresh.
             stuck_last_seen_wait_kind[i] = null;
+            // A future wake_tick on a non-sleeping pid is a sleeper in
+            // flight (deadline stored, setState(.sleeping) not landed
+            // yet) or a one-shot left behind by an explicit wake().
+            // Tracking it costs one scan at that tick and closes the
+            // registered-but-not-yet-sleeping window for good — that is
+            // the race the old "only lower" store-back was written
+            // against (H5), solved here without pinning the cache.
+            const wt_nf = @atomicLoad(u64, &pcb.wake_tick, .acquire);
+            if (wt_nf > process.tick_count and wt_nf < new_earliest) new_earliest = wt_nf;
             continue;
         }
         // Hi-res usleep sleepers carry hires_wake_tsc (not wake_tick) and are
@@ -2335,7 +2447,12 @@ pub fn wakeExpired() void {
         // mouse, and the park backstop/self-wake deadlines were dead
         // letters (animations/toasts survived only because the idle loop
         // re-checked shouldResumeDesktop after every IRQ).
-        if ((pcb.wait_kind == .gpu_io or pcb.wait_kind == .desktop) and wt != 0 and process.tick_count >= wt) {
+        //
+        // .compositor parks the same way (gpu_compositor.parkUntilRender):
+        // requestRender's wake() is the real waker, wake_tick the backstop.
+        // .acpid too (main.parkAcpid): the SCI handler stamps wake_tick =
+        // now from the IRQ, exactly like the virtio-gpu IRQ does for .gpu_io.
+        if (deadlineParked(pcb.wait_kind) and wt != 0 and process.tick_count >= wt) {
             @atomicStore(u64, &pcb.wake_tick, 0, .release);
             clearWait(pcb);
             setState(i, .ready);
@@ -2363,13 +2480,11 @@ pub fn wakeExpired() void {
             continue;
         }
         // Sleeper remains parked. If it has a future deadline this function
-        // would honor (.gpu_io/.desktop or .none with wt > now), track it
-        // for the post-scan earliest_wake_tick store. Other wait kinds are
-        // woken by explicit paths and their wake_tick (if any) is
+        // would honor (a deadlineParked kind or .none, with wt > now), track
+        // it for the post-scan earliest_wake_tick store. Other wait kinds
+        // are woken by explicit paths and their wake_tick (if any) is
         // informational only.
-        if ((pcb.wait_kind == .gpu_io or pcb.wait_kind == .desktop or pcb.wait_kind == .none)
-            and wt > process.tick_count and wt < new_earliest)
-        {
+        if ((deadlineParked(pcb.wait_kind) or pcb.wait_kind == .none) and wt > process.tick_count and wt < new_earliest) {
             new_earliest = wt;
         }
         // Diagnostic — pid is sleeping but neither wake path fires. Three cases:
@@ -2396,10 +2511,10 @@ pub fn wakeExpired() void {
             } else {
                 continue; // race: wt became eligible, we'll wake on next pass
             }
-        } else if (kind == .desktop and wt != 0 and process.tick_count < wt) {
-            // Parked desktop with a live deadline — the branch above wakes
-            // it at wt. Same shape as the .none "sleep still pending" case,
-            // not a stuck waiter.
+        } else if (deadlineParked(kind) and wt != 0 and process.tick_count < wt) {
+            // A deadline-parked sleeper with a live deadline — the branch
+            // above wakes it at wt. Same shape as the .none "sleep still
+            // pending" case, not a stuck waiter.
             continue;
         } else {
             debug.klog("[wake-skip] pid={d} state=sleeping wait_kind={d} wait_target=0x{x} (explicit waker not firing)\n", .{
@@ -2415,14 +2530,14 @@ pub fn wakeExpired() void {
         stuck_last_seen_wait_target[i] = target;
         wake_dbg_last_log = process.tick_count;
     }
-    // H5: Store-back the recomputed earliest, but only if no concurrent
-    // registrar already lowered the cache below our value. An unconditional
-    // store(new_earliest) would stomp a kernelSleepMs that registered a
-    // deadline DURING our scan: pid 5 was .running at scan time so
-    // contributed nothing to new_earliest, then registered D1 before our
-    // store, then our store(maxInt) wipes D1 → fast-path returns early
-    // forever, pid 5 sleeps with no waker. cmpxchg-only-if-larger preserves
-    // any racing lower registration.
+    // Min-merge with whatever registrars lowered the maxInt-parked cache
+    // during the scan: theirs wins when sooner. The swap at the top is
+    // what makes "only lower" correct here — the expired pre-scan value
+    // is gone, so this can no longer pin the cache in the past. (H5's
+    // concern, a kernelSleepMs registering DURING the scan for a pid that
+    // was still .running when walked, is covered twice over: its
+    // registration lands on the parked cache and survives this merge, and
+    // its stored wake_tick is read on the walk regardless of state.)
     var cur_earliest = earliest_wake_tick.load(.acquire);
     while (cur_earliest > new_earliest) {
         const r = earliest_wake_tick.cmpxchgWeak(cur_earliest, new_earliest, .release, .acquire);
@@ -2447,13 +2562,26 @@ pub fn wakeHiresExpired(now_tsc: u64) void {
     // due(now, NONE) is true (maxInt is "1 ahead" under wrapping).
     const earliest = earliest_hires_tsc.load(.acquire);
     if (earliest == hrtimer.NONE or !hrtimer.due(now_tsc, earliest)) return;
+    // Park the cache at NONE for the walk — the tick path's protocol
+    // (wakeExpired): a registrar racing us lands on NONE and survives the
+    // min-merge below, and this locked op is what the registrar-side mfence
+    // proof needs (registrarFence) — the plain load above is not (review B4).
+    _ = earliest_hires_tsc.swap(hrtimer.NONE, .acq_rel);
 
     var new_earliest: u64 = hrtimer.NONE;
     for (0..MAX_PROCS) |i| {
         const pcb = &process.procs[i];
-        if (pcb.state != .sleeping) continue;
         const dl = @atomicLoad(u64, &pcb.hires_wake_tsc, .acquire);
         if (dl == 0) continue; // not a hi-res sleeper
+        if (pcb.state != .sleeping) {
+            // In flight: deadline stored (sysUsleep), setState(.sleeping) not
+            // landed yet. Track it so the heal below can't raise the cache
+            // past it — the tick path's registered-but-not-yet-sleeping
+            // hole (H5), same closure: the registrar stores the PCB field
+            // first and fences (registerHiresWake), the walk reads every slot.
+            if (!hrtimer.due(now_tsc, dl) and dl < new_earliest) new_earliest = dl;
+            continue;
+        }
         if (pcb.wait_kind == .none and hrtimer.due(now_tsc, dl)) {
             // ORDER: clear the deadline BEFORE setState — same orphan-sleep rule
             // as wakeExpired. setState routes into the run queue; the woken task
@@ -2465,23 +2593,18 @@ pub fn wakeHiresExpired(now_tsc: u64) void {
         }
         if (pcb.wait_kind == .none and dl < new_earliest) new_earliest = dl;
     }
-    // Heal the cache to the recomputed earliest. CRITICAL difference from
-    // wakeExpired's "only lower" store-back: THIS cache drives timer arming, so a
-    // value stuck in the PAST makes armDelta re-fire the timer every tick — the
-    // livelock that wedged the box (BSP fired ~67×/quantum, tick_count crawled).
-    // A past cached value is therefore always stale (real deadlines are future)
-    // and must be overwritten; a FUTURE value below new_earliest is a concurrent
-    // registerHiresWake to preserve. So keep `cur` only when it's a sooner
-    // *future* deadline — otherwise overwrite (this raises a stale-past value
-    // back to NONE/next, which "only lower" never could).
+    // Min-merge with registrations that landed on the NONE-parked cache
+    // during the walk — all genuine future deadlines. The swap at the top
+    // removed the stale-past value the old "heal" loop existed for: THIS
+    // cache drives timer arming, and a past value made armDelta re-fire
+    // every tick (the livelock that wedged the box — BSP firing ~67×/quantum,
+    // tick_count crawling). Nothing past survives a scan now, so "only
+    // lower" is safe here too.
     var cur = earliest_hires_tsc.load(.acquire);
-    while (true) {
-        const cur_future = cur != hrtimer.NONE and !hrtimer.due(now_tsc, cur);
-        const want = if (cur_future and cur < new_earliest) cur else new_earliest;
-        if (want == cur) break;
-        if (earliest_hires_tsc.cmpxchgWeak(cur, want, .release, .acquire)) |actual| {
-            cur = actual;
-        } else break;
+    while (cur > new_earliest) {
+        const r = earliest_hires_tsc.cmpxchgWeak(cur, new_earliest, .release, .acquire);
+        if (r == null) break;
+        cur = r.?;
     }
 }
 
@@ -2501,6 +2624,11 @@ pub fn deliverDueAlarms() void {
     // is due. Alarms are rare (sys_alarm only) so this is nearly always
     // the case at runtime.
     if (process.tick_count < earliest_alarm_tick.load(.acquire)) return;
+    // Park the cache at maxInt for the scan — same reasoning as
+    // wakeExpired: the expired value must not survive the store-back, and
+    // a sys_alarm racing the scan either lands on the parked cache or has
+    // already stored alarm_tick (read below for every slot).
+    _ = earliest_alarm_tick.swap(std.math.maxInt(u64), .acq_rel);
     var new_earliest: u64 = std.math.maxInt(u64);
     for (0..MAX_PROCS) |i| {
         const at = @atomicLoad(u64, &process.procs[i].alarm_tick, .acquire);
@@ -2523,8 +2651,8 @@ pub fn deliverDueAlarms() void {
             new_earliest = at;
         }
     }
-    // H5: same cmpxchg-only-if-larger as wakeExpired — don't stomp a
-    // racing registerAlarmDeadline that lowered the cache during our scan.
+    // Min-merge, as in wakeExpired — a registerAlarmDeadline that lowered
+    // the parked cache during our scan wins when sooner.
     var cur_earliest = earliest_alarm_tick.load(.acquire);
     while (cur_earliest > new_earliest) {
         const r = earliest_alarm_tick.cmpxchgWeak(cur_earliest, new_earliest, .release, .acquire);

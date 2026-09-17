@@ -317,6 +317,14 @@ pub fn scan() void {
 pub fn maybeScan() void {
     if (@atomicLoad(bool, &reported, .acquire)) return;
     const t = @atomicLoad(u64, &process.tick_count, .monotonic);
-    if (t == 0 or (t % SCAN_PERIOD_TICKS) != 0) return;
+    // Due-tick, not modulo: the tickless BSP advances tick_count in jumps
+    // (up to 10 at a fire), which step over `% SCAN_PERIOD_TICKS == 0`.
+    const due = @atomicLoad(u64, &next_scan_tick, .acquire);
+    if (t < due) return;
+    // One CPU claims the boundary (maybeScan runs on every CPU's IRQ0).
+    if (@cmpxchgStrong(u64, &next_scan_tick, due, t + SCAN_PERIOD_TICKS, .acq_rel, .acquire) != null) return;
     scan();
 }
+
+/// Next tick the scan is due at; claimed by cmpxchg above.
+var next_scan_tick: u64 = SCAN_PERIOD_TICKS;

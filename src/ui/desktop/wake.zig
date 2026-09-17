@@ -44,12 +44,17 @@ pub var event_driven: bool = true;
 ///      sleep wake checks run. This is what makes an AP-side producer
 ///      (async app load, a task's pipe write) wake the compositor in µs
 ///      instead of "whenever the next input IRQ happens to arrive".
-///      Harmless when the BSP is busy or hlt-idling (the timer catches
-///      those within its ≤100 ms stretch cap).
+///      Harmless when the BSP is busy.
+///   3. a tickless kick when the BSP is hlt-idling on a stretched
+///      one-shot (no MONITOR/MWAIT under this KVM): the wake-only IPI
+///      breaks its hlt, the idle loop's post-wake check finds us due.
+///      Without it an AP-side producer waited for the BSP's next fire —
+///      up to 100 ms once the stretch actually engaged (2026-09-17).
 pub fn requestWake() void {
     @atomicStore(bool, &wake_pending, true, .release);
     const smp = @import("../../cpu/smp.zig");
     _ = @atomicRmw(u32, &smp.cpus[0].idle_monitor_word, .Add, 1, .release);
+    @import("../../cpu/idt/irq0.zig").kickBspIfStretched();
 }
 
 /// Schedule a self-wake at `at_tick` (absolute tick count). Coalesces

@@ -399,6 +399,22 @@ pub fn repeatDue(now: u64) bool {
     return (now -% repeat_last_tick) >= REPEAT_INTERVAL_TICKS;
 }
 
+/// Tick at which the held key's next repeat comes due, or null when no
+/// key is tracked. The desktop's park arms a self-wake on it
+/// (desktop.parkOrYield) so repeats keep their cadence while the BSP tick
+/// is stretched.
+pub fn nextRepeatTick(now: u64) ?u64 {
+    if (repeat_scancode == 0 or !key_state[repeat_scancode]) return null;
+    // HID drain lagging: repeatDue() is gated off, so a "due now" answer
+    // would park/wake the desktop at 100 Hz until the gate reopens — and
+    // the reopen (pollHID) does not wake the desktop. Re-check at 10 Hz.
+    if (@atomicLoad(bool, &ext_events_pending, .acquire)) return now +% 10;
+    const after_delay = repeat_press_tick +% REPEAT_DELAY_TICKS;
+    const after_interval = repeat_last_tick +% REPEAT_INTERVAL_TICKS;
+    const due = @max(after_delay, after_interval);
+    return if (due > now) due else now +% 1;
+}
+
 // Ring buffer for app-readable keystrokes (printable ASCII + control codes
 // + arrow keys). Apps drain this via syscall 4 / libc.readChar.
 var buffer: [256]u8 = [_]u8{0} ** 256;

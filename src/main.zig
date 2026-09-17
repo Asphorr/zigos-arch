@@ -507,8 +507,11 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     // and runs the graceful shutdown in thread context (FS flush + S5 enter),
     // which must NOT happen inside the SCI IRQ. Spawned unconditionally so the
     // power button works regardless of which filesystem mounted.
-    if (@import("proc/lifecycle.zig").createKernelTask(@intFromPtr(&acpidEntry), "acpid", 0, .normal, 16 * 1024) == null)
+    if (@import("proc/lifecycle.zig").createKernelTask(@intFromPtr(&acpidEntry), "acpid", 0, .normal, 16 * 1024)) |acpid_pid| {
+        @import("acpi/sci.zig").setAcpidPid(@intCast(acpid_pid));
+    } else {
         blog.warn("acpid", "spawn failed — ACPI power button won't trigger shutdown", .{});
+    }
     verifyBuildId();
     blog.ok("Build-ID stamp");
     @import("debug/symbols.zig").loadKernelSymbols();
@@ -940,10 +943,29 @@ fn dhcpdEntry() callconv(.c) noreturn {
 /// the SCI handler sets (sci.takePowerOffRequest) and, on a press, runs the same
 /// graceful power-off as the shutdown(0) syscall — FS cache flush + NVMe sync +
 /// S5 enter. This must run here, in thread context, not in the SCI IRQ:
-/// sysShutdown takes FS locks and polls device I/O. A 250 ms poll is
-/// imperceptible for a power button and the thread is otherwise asleep.
-/// (Future: wake-driven via proc.wake instead of polled.)
-const ACPID_POLL_MS: u32 = 250;
+/// sysShutdown takes FS locks and polls device I/O. Event-driven since
+/// 2026-09-17: the SCI handler stamps this thread's wake_tick (sci.wakeAcpid)
+/// and it parks on .acpid in between; the backstop below only bounds a
+/// stamp that somehow went missing. It used to poll every 250 ms, which
+/// made acpid the idle desktop's busiest sleeper — 4 wakes/s that each cost
+/// the BSP three or four timer fires under the tickless stretch.
+const ACPID_BACKSTOP_TICKS: u64 = 100;
+
+/// Park acpid until the SCI handler stamps it or the backstop expires — the
+/// same shape as desktop.parkOrYield / gpu_compositor.parkUntilRender:
+/// wake_tick stored, deadline registered, blockOn (whose wake_pending
+/// handshake catches a stamp that raced the caller's flag checks), wake_tick
+/// cleared afterwards so a stale one-shot can't trip the orphan diagnostics.
+fn parkAcpid() void {
+    const process = @import("proc/process.zig");
+    const me: usize = process.getCurrentPid();
+    const pcb = &process.procs[me];
+    const deadline = process.tick_count + ACPID_BACKSTOP_TICKS;
+    @atomicStore(u64, &pcb.wake_tick, deadline, .release);
+    @import("proc/sched.zig").registerWakeDeadline(deadline);
+    process.blockOn(.acpid, 0);
+    @atomicStore(u64, &pcb.wake_tick, 0, .release);
+}
 // PCI hotplug: set by acpiNotifyDispatch (the aml Notify hook) when a GPE
 // handler signals a topology change; drained once per acpid poll so a handler
 // that Notifies several slots triggers a single rescan, and the heavy bus walk
@@ -958,20 +980,28 @@ var pci_rescan_requested: bool = false;
 /// _BST/_TMP method (the hook runs mid-GPE-handler under the interpreter lock, so
 /// the re-eval can't happen here; acpid drains the queue). Runs in acpid context.
 fn acpiNotifyDispatch(obj_path: []const u8, value: u64) void {
+    // acpid drains both flags; it parks between SCI events (parkAcpid), so a
+    // Notify raised outside its own loop pass (boot-time init, a self-test)
+    // needs the same stamp the SCI handler gives it.
     switch (value) {
-        0x00, 0x01, 0x03 => pci_rescan_requested = true,
-        0x80, 0x81 => @import("acpi/aml.zig").queueNotifyReeval(obj_path, value),
+        0x00, 0x01, 0x03 => {
+            pci_rescan_requested = true;
+            @import("acpi/sci.zig").wakeAcpid();
+        },
+        0x80, 0x81 => {
+            @import("acpi/aml.zig").queueNotifyReeval(obj_path, value);
+            @import("acpi/sci.zig").wakeAcpid();
+        },
         else => {},
     }
 }
 
 fn acpidEntry() callconv(.c) noreturn {
-    const sched = @import("proc/sched.zig");
     const sci = @import("acpi/sci.zig");
     const aml = @import("acpi/aml.zig");
     var did_selftest = false;
     while (true) {
-        sched.kernelSleepMs(ACPID_POLL_MS);
+        parkAcpid();
         if (sci.takePowerOffRequest()) {
             debug.klog("[acpid] power-off requested — flushing caches + entering S5\n", .{});
             _ = @import("cpu/syscall/sys.zig").sysShutdown(0); // never returns
