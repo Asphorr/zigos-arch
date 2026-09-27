@@ -30,8 +30,17 @@
 # Run on the VM: bash tools/nvme_freeze_test.sh   (from the repo root)
 cd "$(dirname "$(readlink -f "$0")")/.."
 
+# Only QEMUs started from THIS tree: a bare pkill also took down the
+# user's live instance running from another checkout.
+kill_own_qemu() {
+    local p
+    for p in $(pgrep -f "qemu-system-x86_64" 2>/dev/null); do
+        [ "$(readlink "/proc/$p/cwd" 2>/dev/null)" = "$PWD" ] && kill "$p" 2>/dev/null
+    done
+}
+
 pkill -f "[r]un-disk-selftest" 2>/dev/null
-pkill -f "[q]emu-system-x86_64" 2>/dev/null
+kill_own_qemu
 sleep 1
 rm -f serial-disktest.log
 
@@ -60,23 +69,27 @@ done
 if [ "$HIT" = "0" ]; then echo "NO-PHASE3-LINE (boot failed?)"; kill "$QPID"; exit 1; fi
 
 echo "--- freeze: guest at: $(tail -c 200 serial-disktest.log | tail -1 | tr -d '\r')"
+# The verdict reads only what the guest printed from here on: a boot-time
+# slow read (cold disk.tar) is not the freeze.
+FROM=$(( $(wc -l < serial-disktest.log) + 1 ))
 kill -STOP "$QPID"
 sleep 1.5
 kill -CONT "$QPID"
 echo "--- unfroze: guest at: $(tail -c 200 serial-disktest.log | tail -1 | tr -d '\r')"
 
 sleep 8
-echo "=== verdict lines ==="
-grep -a -E "timeout|LATE|lost|slow completion|host pause absorbed|expected phase|\[smi\] stall|\[disktest\] (PASS|FAIL)|kernel-side" serial-disktest.log | head -40
+AFTER=$(tail -n +"$FROM" serial-disktest.log)
+echo "=== verdict lines (from serial line $FROM) ==="
+echo "$AFTER" | grep -a -E "timeout|LATE|lost|slow completion|host pause absorbed|expected phase|\[smi\] stall|\[disktest\] (PASS|FAIL)|kernel-side" | head -40
 echo "=== verdict ==="
-if grep -aq "host pause absorbed" serial-disktest.log; then
+if echo "$AFTER" | grep -aq "host pause absorbed"; then
     echo "PAUSE-ABSORBED: a wait spanned the freeze and subtracted it"
-elif grep -aqE "slow completion: [0-9]{4,} Mcyc guest-run" serial-disktest.log; then
+elif echo "$AFTER" | grep -aqE "slow completion: [0-9]{4,} Mcyc guest-run"; then
     echo "PAUSE-MISREAD: a wait counted the freeze as guest time (regression)"
 else
     echo "INCONCLUSIVE: freeze fell between waits — rerun"
 fi
 grep -aq "\[disktest\] PASS" serial-disktest.log && echo "DISKTEST: PASS" || echo "DISKTEST: FAIL"
 pkill -f "[r]un-disk-selftest" 2>/dev/null
-pkill -f "[q]emu-system-x86_64" 2>/dev/null
+kill_own_qemu
 exit 0

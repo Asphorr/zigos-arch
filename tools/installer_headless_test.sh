@@ -12,7 +12,16 @@
 # Run on the VM: bash tools/installer_headless_test.sh
 cd "$(dirname "$(readlink -f "$0")")/.."
 
-pkill -f "[q]emu-system-x86_64" 2>/dev/null
+# Only QEMUs started from THIS tree: a bare pkill also took down the
+# user's live instance running from another checkout.
+kill_own_qemu() {
+    local p
+    for p in $(pgrep -f "qemu-system-x86_64" 2>/dev/null); do
+        [ "$(readlink "/proc/$p/cwd" 2>/dev/null)" = "$PWD" ] && kill "$p" 2>/dev/null
+    done
+}
+
+kill_own_qemu
 sleep 1
 rm -f serial-installer.log installer-done.ppm
 
@@ -48,6 +57,13 @@ for i in $(seq 1 1200); do
     grep -aq "graphical installer" serial-installer.log 2>/dev/null && break
     sleep 0.1
 done
+# A menu key lost to a host pause boots the default entry instead; say so
+# now rather than after the full install timeout.
+if ! grep -aq "graphical installer" serial-installer.log 2>/dev/null; then
+    echo "INSTALLER-NOT-SELECTED: no 'graphical installer' line (boot menu keys lost?)"
+    kill_own_qemu
+    exit 2
+fi
 sleep 3 # let the first frame paint before typing at it
 
 mon "sendkey ret"; sleep 1.5
@@ -69,5 +85,5 @@ sleep 1
 echo "=== verdict lines ==="
 grep -aE "\[installer\]|\[nvram\]|\[esp-populate\]|\[populate\]" serial-installer.log | tail -30
 echo "=== teardown ==="
-pkill -f "[q]emu-system-x86_64" 2>/dev/null
+kill_own_qemu
 exit 0
