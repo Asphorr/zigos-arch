@@ -69,6 +69,46 @@ pub fn addLazyRegionWithSource(
     return true;
 }
 
+/// What a fresh page of `r` at `page` starts with: the intersection of the
+/// page with the region's file-backed range, copied from its kernel buffer
+/// (vmm.allocFillAndMapUserPage does it before the PTE is published).
+/// Anonymous regions, and pages past the file-backed range (BSS), start
+/// all-zero. Every fresh-page path of a lazy region must go through this —
+/// ensureUserRangeFor once mapped bare zero pages over ELF .data.
+fn sourceFill(r: process.LazyRegion, page: usize) vmm.PageFill {
+    const src = r.source orelse return .{};
+    const copy_start = @max(page, r.src_va_base);
+    const copy_end = @min(page + 0x1000, r.src_va_base + r.src_size);
+    if (copy_end <= copy_start) return .{};
+    return .{
+        .src = src + (r.src_offset + (copy_start - r.src_va_base)),
+        .dst_off = copy_start - page,
+        .len = copy_end - copy_start,
+    };
+}
+
+/// Map a shared-anon region's page to the shm registry's frame — every
+/// attached AS maps the same phys, never a private copy. Non-blocking. True
+/// when the page is mapped, by us or by a racing thread of this process
+/// (that winner took the frame ref).
+fn mapShmPage(pd: [*]align(4096) u64, r: process.LazyRegion, va_aligned: usize) bool {
+    const shm = @import("../mm/shm.zig");
+    const page_idx: u32 = @intCast((va_aligned - r.start) / 0x1000);
+    const phys = shm.frameAt(r.shm_id, page_idx) orelse {
+        debug.klog("[shm] frameAt miss id={d} pi={d} on fault — region torn down?\n", .{ r.shm_id, page_idx });
+        return false;
+    };
+    vmm.mapUserPage(pd, va_aligned, phys, vmm.protToMapFlags(r.prot)) catch |e| {
+        if (e == error.AlreadyMapped) return true;
+        debug.klog("[shm] mapUserPage failed va=0x{X} phys=0x{X} err={s}\n", .{ va_aligned, phys.raw(), @errorName(e) });
+        return false;
+    };
+    // Frame refcount = N attachers + 1 shm-owned: destroyAddressSpace frees
+    // present leaves, munmap drops the attacher ref, shm.release the +1.
+    pmm.acquireFrame(phys);
+    return true;
+}
+
 /// Walk PML4→PT for `va` and return a writable pointer to its 4 KB PTE,
 /// or null if the path is missing or the address is covered by a huge page.
 /// Used by the COW handler to mutate the PTE in place after copying.
@@ -611,39 +651,11 @@ pub fn handleUserPageFault(cr2: usize, error_code: u64) bool {
         if (cr2 < r.start or cr2 >= r.end) continue;
         const va_aligned = cr2 & ~@as(usize, 0xFFF);
 
-        // Shared-anon shortcut: map the precomputed phys from the shm region.
-        // No swap, no fresh-alloc — the frame is owned by the shm registry and
-        // shared across every attached AS. Same phys mapped into N AS's = N
-        // PRESENT PTEs of the same frame; refcount management is in
-        // forkCurrent/munmap/tearDown via shm.acquire/release.
+        // Shared-anon: no swap, no fresh alloc — the shm registry owns the
+        // frame; refcounts move in forkCurrent/munmap/tearDown.
         const shm = @import("../mm/shm.zig");
         if (r.shm_id != shm.SHM_INVALID) {
-            const page_idx: u32 = @intCast((va_aligned - r.start) / 0x1000);
-            const phys = shm.frameAt(r.shm_id, page_idx) orelse {
-                debug.klog("[shm] frameAt miss id={d} pi={d} on fault — region torn down?\n", .{ r.shm_id, page_idx });
-                return false;
-            };
-            vmm.mapUserPage(pd, va_aligned, phys, vmm.protToMapFlags(r.prot)) catch |e| {
-                // Benign MT race: another thread of this process faulted the
-                // same shm page first — it's mapped now, and that winner took
-                // the acquireFrame ref below. Returning false here SIGSEGV'd
-                // the losing thread of a concurrent same-page fault (the
-                // sibling cache path already treated AlreadyMapped as
-                // resolved; this path was missed).
-                if (e == error.AlreadyMapped) {
-                    @import("../debug/kdbg.zig").pfEvent(@intCast(cur), cr2, @truncate(error_code), 0, true);
-                    return true;
-                }
-                debug.klog("[shm] mapUserPage failed va=0x{X} phys=0x{X} err={s}\n", .{ va_aligned, phys.raw(), @errorName(e) });
-                return false;
-            };
-            // Bump the PMM refcount so the frame survives even if one
-            // attacher's destroyAddressSpace walks the PT and tries to free
-            // present pages — the shm registry owns the original alloc and
-            // calls freeFrame at release(refcount==0). Frame thus has
-            // (N attachers + 1 shm-owned) refcount; munmap path drops the
-            // attacher count, shm.release drops the +1.
-            pmm.acquireFrame(phys);
+            if (!mapShmPage(pd, r, va_aligned)) return false;
             @import("../debug/kdbg.zig").pfEvent(@intCast(cur), cr2, @truncate(error_code), 0, true);
             return true;
         }
@@ -703,8 +715,9 @@ pub fn handleUserPageFault(cr2: usize, error_code: u64) bool {
         // helps, fall straight through to OOM-kill (with a distinct log
         // line so the autopsy knows it wasn't memory pressure).
         var frame_opt: ?Phys = null;
+        const fill = sourceFill(r, va_aligned);
         if (!swap_failed) {
-            if (vmm.allocAndMapUserPage(pd, va_aligned, vmm.protToMapFlags(r.prot))) |f| {
+            if (vmm.allocFillAndMapUserPage(pd, va_aligned, vmm.protToMapFlags(r.prot), fill)) |f| {
                 frame_opt = f;
             } else |e1| {
                 if (e1 == error.Oom) {
@@ -712,7 +725,7 @@ pub fn handleUserPageFault(cr2: usize, error_code: u64) bool {
                     // shed reclaimable caches (GUI back-buffers etc.), then
                     // retry the alloc ONCE.
                     if (pmm.tryReclaim(1) > 0) {
-                        if (vmm.allocAndMapUserPage(pd, va_aligned, vmm.protToMapFlags(r.prot))) |f2| {
+                        if (vmm.allocFillAndMapUserPage(pd, va_aligned, vmm.protToMapFlags(r.prot), fill)) |f2| {
                             frame_opt = f2;
                         } else |_| {}
                     }
@@ -735,7 +748,7 @@ pub fn handleUserPageFault(cr2: usize, error_code: u64) bool {
                         const free_now = pmm.freeFrameCount();
                         const want: usize = if (free_now <= reserve) (reserve - free_now) + 16 else 16;
                         if (reclaimViaSwap(pd, lead, va_aligned, lead.pcid, want) == 0) break;
-                        if (vmm.allocAndMapUserPage(pd, va_aligned, vmm.protToMapFlags(r.prot))) |f3| {
+                        if (vmm.allocFillAndMapUserPage(pd, va_aligned, vmm.protToMapFlags(r.prot), fill)) |f3| {
                             frame_opt = f3;
                         } else |_| {}
                     }
@@ -822,22 +835,9 @@ pub fn handleUserPageFault(cr2: usize, error_code: u64) bool {
             unreachable;
         };
         @import("../debug/kdbg.zig").pfEvent(@intCast(cur), cr2, @truncate(error_code), 0, true);
-        // For ELF demand paging: copy the intersection of this page with the
-        // segment's file-backed range from the kernel buffer. Untouched bytes
-        // (alignment padding, BSS) stay zero from allocAndMapUserPage.
-        if (r.source) |src| {
-            const page_end = va_aligned + 0x1000;
-            const src_va_end = r.src_va_base + r.src_size;
-            const copy_start = @max(va_aligned, r.src_va_base);
-            const copy_end = @min(page_end, src_va_end);
-            if (copy_end > copy_start) {
-                const dest_offset = copy_start - va_aligned;
-                const src_byte_offset = r.src_offset + (copy_start - r.src_va_base);
-                const len = copy_end - copy_start;
-                const dest = frame.add(dest_offset).toVirt().ptr([*]u8);
-                @memcpy(dest[0..len], src[src_byte_offset .. src_byte_offset + len]);
-            }
-        }
+        // ELF demand paging's file bytes were copied in by
+        // allocFillAndMapUserPage before the PTE went live (sourceFill).
+        _ = frame;
         // Invalidate TLB on this CPU. Other CPUs don't share user PDs.
         asm volatile ("invlpg (%[addr])"
             :
@@ -938,6 +938,13 @@ pub fn prefaultUserRange(addr: usize, len: usize) void {
             // to do. Otherwise allocate + map + (optionally) copy from src.
             if (pageHasRealMapping(pd, page)) break;
 
+            // Shared-anon: the registry frame. A private zero page here
+            // would silently unshare the page for this process.
+            if (r.shm_id != @import("../mm/shm.zig").SHM_INVALID) {
+                _ = mapShmPage(pd, r, page);
+                break;
+            }
+
             // Cache-backed (ext2 mmap): fault the shared page in through the page
             // cache so a kernel READ of an mmap'd buffer sees real file data, not
             // a zero page (that would be silent corruption). faultInCachePage may
@@ -963,7 +970,7 @@ pub fn prefaultUserRange(addr: usize, len: usize) void {
                 .not_swapped => {}, // never-faulted page: fall through to fresh alloc + src copy
             }
 
-            const frame = vmm.allocAndMapUserPage(pd, page, vmm.protToMapFlags(r.prot)) catch |e| {
+            _ = vmm.allocFillAndMapUserPage(pd, page, vmm.protToMapFlags(r.prot), sourceFill(r, page)) catch |e| {
                 // Benign MT race: a peer thread faulted this exact page in
                 // between our pageHasRealMapping check and the alloc (the
                 // winner did the source copy). Move on to the NEXT page —
@@ -973,19 +980,6 @@ pub fn prefaultUserRange(addr: usize, len: usize) void {
                 if (e == error.AlreadyMapped) break;
                 return; // OOM/BadVA: leave unmapped -> clean E_FAULT upstream
             };
-            if (r.source) |src| {
-                const page_end = page + 0x1000;
-                const src_va_end = r.src_va_base + r.src_size;
-                const copy_start = @max(page, r.src_va_base);
-                const copy_end = @min(page_end, src_va_end);
-                if (copy_end > copy_start) {
-                    const dest_offset = copy_start - page;
-                    const src_byte_offset = r.src_offset + (copy_start - r.src_va_base);
-                    const clen = copy_end - copy_start;
-                    const dest = frame.add(dest_offset).toVirt().ptr([*]u8);
-                    @memcpy(dest[0..clen], src[src_byte_offset .. src_byte_offset + clen]);
-                }
-            }
             asm volatile ("invlpg (%[addr])"
                 :
                 : [addr] "r" (page),
@@ -1086,7 +1080,9 @@ fn ensureUserRangeFor(owner_pcb: *process.PCB, va: usize, len: usize, need_write
             while (i < lead.lazy_count) : (i += 1) {
                 const r = lead.lazy_regions[i];
                 if (p < r.start or p >= r.end) continue;
-                if (r.cache_inode != 0) {
+                if (r.shm_id != @import("../mm/shm.zig").SHM_INVALID) {
+                    if (!mapShmPage(pd, r, p)) return false;
+                } else if (r.cache_inode != 0) {
                     // Cache-backed page: map it shared RO+COW if resident, then
                     // (write paths only) break COW so this proactive (SMAP/
                     // signal-frame or io_uring) write lands on a private
@@ -1094,25 +1090,17 @@ fn ensureUserRangeFor(owner_pcb: *process.PCB, va: usize, len: usize, need_write
                     // caller may hold a spinlock; the app must touch the page
                     // itself so the #PF path can fill it).
                     if (!tryMapCachedPage(pd, r, p)) return false;
-                    if (need_write) {
-                        _ = handleCowFault(pd, p);
-                        // RO cache region (Slice 3e ELF text/rodata: no PROT_WRITE →
-                        // no COW bit → handleCowFault no-op) stays read-only. Fail
-                        // delivery rather than let the caller kernel-mode #PF into it.
-                        const pte_ptr = findUserPte(pd, p) orelse return false;
-                        if (pte_ptr.* & paging.READ_WRITE == 0) return false;
-                    }
+                    if (need_write) _ = handleCowFault(pd, p);
                 } else {
-                    _ = vmm.allocAndMapUserPage(pd, p, vmm.protToMapFlags(r.prot)) catch |e| {
-                        // Benign MT race: a peer thread faulted this page in
-                        // between our resolveUserPhys null-check and the alloc.
-                        // Any mapper of an anon lazy page uses these same
-                        // protToMapFlags, so the winner's mapping is the one we
-                        // wanted — failing here turned the race into a spurious
-                        // EFAULT / failed signal delivery. (tryMapCachedPage
-                        // above already tolerates AlreadyMapped the same way.)
-                        if (e != error.AlreadyMapped) return false;
-                    };
+                    // sourceFill: an ELF .data / private-file-mmap page starts
+                    // with its file bytes (this path used to map a bare zero
+                    // page over them). The copy is from a kernel buffer, so it
+                    // stays non-blocking under the caller's as_lock. A racing
+                    // thread's present mapping comes back as success;
+                    // AlreadyMapped means a binding that is not a present
+                    // frame (swapped out), and swap-in may block — fail, the
+                    // app's own touch pages it in.
+                    _ = vmm.allocFillAndMapUserPage(pd, p, vmm.protToMapFlags(r.prot), sourceFill(r, p)) catch return false;
                     asm volatile ("invlpg (%[addr])"
                         :
                         : [addr] "r" (p),
@@ -1122,6 +1110,13 @@ fn ensureUserRangeFor(owner_pcb: *process.PCB, va: usize, len: usize, need_write
                 break;
             }
             if (!mapped) return false;
+            // Mapped with the region's own protection: an RO region (ELF
+            // text/rodata, PROT_READ mmap) stays read-only, and the caller's
+            // write would kernel-mode #PF into it.
+            if (need_write) {
+                const pte_ptr = findUserPte(pd, p) orelse return false;
+                if (pte_ptr.* & paging.READ_WRITE == 0) return false;
+            }
         }
     }
     return true;

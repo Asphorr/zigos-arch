@@ -14,7 +14,7 @@
 // but the [pcb-invariant] line names which pid / which field failed —
 // usually enough to narrow the writer to a recent code change.
 //
-// Cost budget: walking MAX_PROCS=32 alive slots is ~64 atomic loads + ~10
+// Cost budget: walking MAX_PROCS=64 alive slots is ~128 atomic loads + ~10
 // comparisons per slot, well under 10 µs. Running every 1s makes overhead
 // trivial (<0.001% CPU).
 
@@ -249,7 +249,7 @@ pub fn scan() void {
     _ = @import("cpu_struct_hash.zig").verify();
 
     // Structural data-structure walks: kernel heap counters + freelists,
-    // PMM per-region run pool, pipe ring invariants. All are bounded
+    // PMM per-region index, pipe ring invariants. All are bounded
     // O(in-use entries) and lock-aware. Wired into the tick path 2026-05-28
     // so that the 4-day silent-overlap class (?usize freelist corruption)
     // surfaces seconds after the regression instead of waiting for the
@@ -260,7 +260,7 @@ pub fn scan() void {
     const heap = @import("../mm/heap.zig");
     if (!heap.validateInvariants()) structuralFail("heap.validateInvariants");
     if (!heap.validateFreelists()) structuralFail("heap.validateFreelists");
-    if (!@import("../mm/pmm.zig").validateRunPool()) structuralFail("pmm.validateRunPool");
+    if (!@import("../mm/pmm.zig").validateIndex()) structuralFail("pmm.validateIndex");
     if (!@import("../proc/pipe.zig").validate()) structuralFail("pipe.validate");
 
     for (0..config.MAX_PROCS) |pid| {

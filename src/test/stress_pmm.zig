@@ -1,12 +1,12 @@
 // Heavy PMM stress test — exercises every code path of the region-bucketed
-// rewrite (project_pmm_region_rewrite_2026_05_24.md) with conditions
-// chosen to surface bugs:
+// PMM and its per-region frame index (src/mm/frame_index.zig) with
+// conditions chosen to surface bugs:
 //
 //   1. Single-frame churn       — uniqueness + magazine path
-//   2. Contiguous sized matrix  — freelist popRunGE across all orders
-//   3. Cross-region big allocs  — locks-all-256 path + edge re-push
-//   4. Fragmentation + coalesce — checkerboard then heal, validate runs return
-//   5. Run pool exhaustion      — drive run_pool_freelist→NULL_RUN, must not panic
+//   2. Contiguous sized matrix  — in-region runs across all sizes
+//   3. Cross-region big allocs  — edge-chained candidates + span claim
+//   4. Fragmentation + heal     — checkerboard then heal, a full region returns
+//   5. Index under fragmentation — maximal checkerboard, validateIndex exact
 //   6. Coalesce verification    — alloc A+B, free, re-alloc combined, address check
 //   7. UAF via canary           — corrupt freed frame, next alloc must detect
 //   8. Below-4G                 — DMA path, all phys < 4 GiB
@@ -305,7 +305,7 @@ fn phase2_sizedContiguous() void {
 // ===========================================================================
 
 fn phase3_crossRegion() void {
-    note("p3", "cross-region: 2048, 4096 frames (forces all-region lock)", .{});
+    note("p3", "cross-region: 2048, 4096 frames (claims only the spanned regions)", .{});
     const free_before = pmm.freeFrameCount();
 
     // 2048 frames = 8 MiB = 2 regions
@@ -403,22 +403,20 @@ fn phase4_fragmentationCoalesce() void {
 }
 
 // ===========================================================================
-// PHASE 5 — Run pool exhaustion (drive run_pool_freelist→NULL_RUN)
+// PHASE 5 — Index exactness under maximal fragmentation
 // ===========================================================================
+//
+// The old run-list layer degraded here (pool exhaustion orphaned runs);
+// the index has no pool, so what's left to prove is that it stays EXACT:
+// validateIndex recomputes every region's masks and count from the bitmap
+// words, at the most fragmented point and again after the heal.
 
-fn phase5_runPoolExhaustion() void {
-    note("p5", "drive run pool exhaustion via maximal fragmentation", .{});
+fn phase5_indexUnderFragmentation() void {
+    note("p5", "checkerboard up to {d} frames, validateIndex at peak and after heal", .{TRACK_MAX});
 
-    const exhaust_before = pmm.pmmRunPoolExhaustions();
-    const pool_free_before = pmm.pmmRunPoolFreeCount();
-    note("p5", "pool free before: {d}, exhaustions so far: {d}", .{ pool_free_before, exhaust_before });
-
-    // To maximize freelist node usage: alloc N single frames, free every
-    // other one — each freed frame becomes a separate freelist entry
-    // (no neighbors to coalesce with). N=4000+ in one round, repeated.
     const ROUNDS: u32 = 3;
     var round: u32 = 0;
-    var rounds_done: u32 = 0;
+    var bad: u32 = 0;
     while (round < ROUNDS) : (round += 1) {
         tracking_count = 0;
         var i: u32 = 0;
@@ -427,34 +425,24 @@ fn phase5_runPoolExhaustion() void {
             tracking[tracking_count] = phys;
             tracking_count += 1;
         }
-        // Free every other; the rest get freed at end-of-round.
+        // Free every other: the most fragmented shape the index can see.
         i = 0;
         while (i < tracking_count) : (i += 2) freeFrameRaw(tracking[i]);
+        if (!pmm.validateIndex()) bad += 1;
         // Now free the odd indices too — should heal everything.
         i = 1;
         while (i < tracking_count) : (i += 2) freeFrameRaw(tracking[i]);
         tracking_count = 0;
-        rounds_done += 1;
+        if (!pmm.validateIndex()) bad += 1;
     }
 
-    const exhaust_after = pmm.pmmRunPoolExhaustions();
-    const pool_free_after = pmm.pmmRunPoolFreeCount();
-    note("p5", "{d} rounds done, pool free after: {d}, exhaustions: {d} (Δ={d})", .{
-        rounds_done, pool_free_after, exhaust_after, exhaust_after - exhaust_before,
-    });
-
-    // Even WITHOUT exhaustion, the test surfaces stale-entry handling. With
-    // exhaustion >0, we've proven graceful degradation. Both outcomes pass.
-    if (exhaust_after > exhaust_before) {
-        // Subsequent allocs must still succeed even with pool exhausted.
-        if (allocFrameRaw()) |p| {
-            freeFrameRaw(p);
-            pass("p5", "exhaustion drove +{d}, post-exhaust alloc OK", .{exhaust_after - exhaust_before});
-        } else {
-            fail("p5", "post-exhaustion allocFrame returned null", .{});
-        }
+    if (bad != 0) {
+        fail("p5", "validateIndex failed {d}× (see [pmm] index-inv lines)", .{bad});
+    } else if (allocContigRaw(pmm.PUB_REGION_FRAMES)) |base| {
+        freeContigRaw(base, pmm.PUB_REGION_FRAMES);
+        pass("p5", "{d} rounds: index exact at peak fragmentation and after heal; full-region run OK", .{ROUNDS});
     } else {
-        pass("p5", "ran {d} fragmentation rounds without exhausting pool (good)", .{rounds_done});
+        pass("p5", "{d} rounds: index exact (no full region free — system load)", .{ROUNDS});
     }
 }
 
@@ -641,7 +629,6 @@ fn phase9_userReserve() void {
 fn phase10_magazineDrain() void {
     note("p10", "fill cache via batch alloc then batch free, repeat 100×", .{});
     const free_before = pmm.freeFrameCount();
-    const exhaust_before = pmm.pmmRunPoolExhaustions();
 
     var round: u32 = 0;
     while (round < 100) : (round += 1) {
@@ -662,12 +649,13 @@ fn phase10_magazineDrain() void {
         tracking_count = 0;
     }
     const free_after = pmm.freeFrameCount();
-    const exhaust_after = pmm.pmmRunPoolExhaustions();
-    note("p10", "exhaust Δ={d}, free {d} → {d}", .{ exhaust_after - exhaust_before, free_before, free_after });
+    note("p10", "free {d} → {d}", .{ free_before, free_after });
     if (free_after < free_before - 32 or free_after > free_before + 32) {
         fail("p10", "leak after 100 rounds: free {d} → {d}", .{ free_before, free_after });
+    } else if (!pmm.validateIndex()) {
+        fail("p10", "validateIndex failed after magazine drains", .{});
     } else {
-        pass("p10", "100 alloc/free rounds clean", .{});
+        pass("p10", "100 alloc/free rounds clean, index exact", .{});
     }
 }
 
@@ -901,10 +889,12 @@ fn phase13_smpConcurrent() void {
     }
     note("p13", "cpu0 iters={d}, others total={d}, anomalies={d}", .{ main_iters, total - main_iters, anom });
 
-    if (anom == 0) {
-        pass("p13", "SMP concurrent stress clean ({d} total iterations)", .{total});
-    } else {
+    if (anom != 0) {
         fail("p13", "{d} anomalies across CPUs", .{anom});
+    } else if (!pmm.validateIndex()) {
+        fail("p13", "validateIndex failed after concurrent churn", .{});
+    } else {
+        pass("p13", "SMP concurrent stress clean ({d} total iterations), index exact", .{total});
     }
 }
 
@@ -915,7 +905,6 @@ fn phase13_smpConcurrent() void {
 fn phase14_mixedLongRun() void {
     note("p14", "mixed random workload, 5s wall budget", .{});
     rngSeed(perf.rdtsc());
-    const exhaust_before = pmm.pmmRunPoolExhaustions();
     const free_before = pmm.freeFrameCount();
     const t0 = perf.rdtsc();
     const budget: u64 = 10_000_000_000; // ~5s on 2 GHz
@@ -966,9 +955,8 @@ fn phase14_mixedLongRun() void {
     }
 
     const free_after = pmm.freeFrameCount();
-    const exhaust_after = pmm.pmmRunPoolExhaustions();
-    note("p14", "iters={d}, leaked={d} (deliberate), exhaust Δ={d}, free {d} → {d}", .{
-        iters, leaked, exhaust_after - exhaust_before, free_before, free_after,
+    note("p14", "iters={d}, leaked={d} (deliberate), free {d} → {d}", .{
+        iters, leaked, free_before, free_after,
     });
     // Drift must equal the counted deliberate leaks, give or take the
     // magazine/slab slack (same rationale as p1's p1_slack).
@@ -976,6 +964,8 @@ fn phase14_mixedLongRun() void {
     const slack: i64 = 2 * pmm.CACHE_SIZE;
     if (drift > @as(i64, @intCast(leaked)) + slack or drift < @as(i64, @intCast(leaked)) - slack) {
         fail("p14", "leak drift {d} != deliberate {d} (±{d}): free {d} → {d}", .{ drift, leaked, slack, free_before, free_after });
+    } else if (!pmm.validateIndex()) {
+        fail("p14", "validateIndex failed after the mixed run", .{});
     } else {
         pass("p14", "mixed long run survived {d} iterations (drift {d} ≈ deliberate {d})", .{ iters, drift, leaked });
     }
@@ -990,8 +980,8 @@ pub fn taskEntry() callconv(.c) noreturn {
     serial.print("[pmmstress] === HEAVY PMM STRESS — {d} phases, {d} regions × {d} frames ===\n", .{
         14, pmm.PUB_REGIONS_COUNT, pmm.PUB_REGION_FRAMES,
     });
-    serial.print("[pmmstress] managed={d} free={d} reserve={d} pool_exhaust={d}\n", .{
-        pmm.managedFrameCount(), pmm.freeFrameCount(), pmm.userReserveFrames(), pmm.pmmRunPoolExhaustions(),
+    serial.print("[pmmstress] managed={d} free={d} reserve={d} regions_live={d}\n", .{
+        pmm.managedFrameCount(), pmm.freeFrameCount(), pmm.userReserveFrames(), pmm.pmmRegionsLive(),
     });
 
     const t_start = perf.rdtsc();
@@ -1000,7 +990,7 @@ pub fn taskEntry() callconv(.c) noreturn {
     phase2_sizedContiguous();
     phase3_crossRegion();
     phase4_fragmentationCoalesce();
-    phase5_runPoolExhaustion();
+    phase5_indexUnderFragmentation();
     phase6_coalesceVerification();
     phase7_uafCanary();
     phase8_below4G();
@@ -1018,13 +1008,26 @@ pub fn taskEntry() callconv(.c) noreturn {
     serial.print("[pmmstress] SUMMARY: passed={d}/{d}  failed={d}  anomalies={d}\n", .{
         phases_passed, phases_passed + phases_failed, phases_failed, anomalies,
     });
-    serial.print("[pmmstress] final free={d}/{d} ({d}%), pool exhaustions={d}, canary mismatches={d}\n", .{
+    serial.print("[pmmstress] final free={d}/{d} ({d}%), index {s}, canary mismatches={d}\n", .{
         pmm.freeFrameCount(),
         pmm.managedFrameCount(),
         if (pmm.managedFrameCount() > 0) pmm.freeFrameCount() * 100 / pmm.managedFrameCount() else 0,
-        pmm.pmmRunPoolExhaustions(),
+        if (pmm.validateIndex()) "exact" else "MISMATCH",
         pmm.pmmCanaryMismatches(),
     });
+    // Background tasks may have an alloc in flight; a real drift persists.
+    var counted = pmm.freeFrameCount();
+    var indexed = pmm.indexFreeFrames();
+    var reads: u32 = 1;
+    while (counted != indexed and reads < 5) : (reads += 1) {
+        process.kernelSleepMs(1);
+        counted = pmm.freeFrameCount();
+        indexed = pmm.indexFreeFrames();
+    }
+    serial.print("[pmmstress] free count {d} vs index {d} ({s}), cross-region held scans={d}\n", .{
+        counted, indexed, if (counted == indexed) "equal" else "DRIFT", pmm.pmmCrossHeldScans(),
+    });
+    if (counted != indexed) phases_failed += 1;
     serial.print("[pmmstress] elapsed cycles: {d}\n", .{total_cyc});
     serial.print("[pmmstress] ============================================================\n", .{});
 

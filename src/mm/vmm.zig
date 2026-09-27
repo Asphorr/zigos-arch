@@ -324,9 +324,8 @@ fn resolveOrAlloc(table: [*]u64, idx: u64) MapError![*]u64 {
 /// Read-only walk: return the physical frame currently mapped at `virt`,
 /// or null if not present / outside the user range / under a huge page.
 /// Does NOT allocate intermediate tables — purely diagnostic / race-resolution
-/// (`allocAndMapUserPage` calls this on the `AlreadyMapped` branch to
-/// recover the winner's phys so the caller can still memcpy file-backed
-/// content into it).
+/// (`allocFillAndMapUserPage` calls this on the `AlreadyMapped` branch to
+/// return the winner's phys).
 pub fn resolveUserPhys(pml4: [*]align(4096) u64, virt: usize) ?Phys {
     if (virt < USER_SPACE_START or virt >= USER_SPACE_END) return null;
     const vaddr: u64 = @intCast(virt);
@@ -399,29 +398,47 @@ pub fn cacheMapFlags(prot: u8) u64 {
     return base;
 }
 
-/// Allocate a physical frame, map it at the given virtual address with the
-/// supplied flags, and zero it. `flags` is the OR of the bits the page-fault
+/// Initial contents of a page about to be published: `src[0..len]` at
+/// `dst_off`, zeros everywhere else. The default is an all-zero page.
+pub const PageFill = struct {
+    src: [*]const u8 = undefined,
+    dst_off: usize = 0,
+    len: usize = 0,
+};
+
+/// Allocate a physical frame, zero it, and map it at the given virtual
+/// address with the supplied flags. `flags` is the OR of the bits the page-fault
 /// resolution path wants — typically `protToMapFlags(region.prot)`. PRESENT
 /// is set inside `mapUserPage`; callers don't need to include it.
+pub fn allocAndMapUserPage(pml4: [*]align(4096) u64, virt: usize, flags: u64) MapError!Phys {
+    return allocFillAndMapUserPage(pml4, virt, flags, .{});
+}
+
+/// allocAndMapUserPage with initial contents. The frame is zeroed and
+/// filled BEFORE mapUserPage publishes the PTE: once its CAS lands, a
+/// sibling thread can read the page, so a later fill would show it the
+/// previous owner's bytes or a half-copied file page.
 ///
-/// Returns the physical frame the caller should write into. Under the
-/// multi-CPU lazy-fault race (two CPUs page-fault on the same virt at the
-/// same time), the loser sees `AlreadyMapped` from mapUserPage, frees its
-/// own freshly-allocated frame, walks for the winner's phys, and returns
-/// THAT — so the caller's subsequent memcpy lands on the same physical
-/// page the winner installed. Idempotent for read-only ELF file-backed
-/// content; harmless for BSS / anonymous (both sides zero the same page).
+/// Returns the mapped frame. Under the multi-CPU lazy-fault race (two CPUs
+/// page-fault on the same virt at the same time), the loser sees
+/// `AlreadyMapped` from mapUserPage, frees its own frame and returns the
+/// winner's phys — filled with the same contents before it was published.
 ///
 /// Errors:
 ///   Oom           — pmm has no free user frame, OR a page-table alloc failed
 ///                   while walking down. Caller should run reclaim + retry.
 ///   BadVA/KernelHeap — virt is not a valid user-mappable address. Caller
 ///                      should SIGSEGV.
-///   (AlreadyMapped is NOT propagated — it's resolved internally.)
-pub fn allocAndMapUserPage(pml4: [*]align(4096) u64, virt: usize, flags: u64) MapError!Phys {
+///   AlreadyMapped — the PTE is bound but not to a present frame (swap-
+///                   marked, or the winner's mapping is being torn down);
+///                   the caller's retried access resolves it.
+pub fn allocFillAndMapUserPage(pml4: [*]align(4096) u64, virt: usize, flags: u64, fill: PageFill) MapError!Phys {
     // User-data frame: respects the PMM reserve so a user-driven lazy
     // fault can't eat into the kernel emergency pool.
     const frame = pmm.allocFrameUser() orelse return error.Oom;
+    const page = frame.toVirt().ptr([*]u8);
+    @memset(page[0..4096], 0);
+    if (fill.len != 0) @memcpy(page[fill.dst_off..][0..fill.len], fill.src[0..fill.len]);
     mapUserPage(pml4, virt, frame, flags) catch |e| switch (e) {
         // Race resolved — another CPU faulted in this page while we were
         // allocating. Give our frame back; tell the caller to use the
@@ -445,8 +462,6 @@ pub fn allocAndMapUserPage(pml4: [*]align(4096) u64, virt: usize, flags: u64) Ma
             return e;
         },
     };
-    const ptr = frame.toVirt().ptr([*]u8);
-    @memset(ptr[0..4096], 0);
     return frame;
 }
 
