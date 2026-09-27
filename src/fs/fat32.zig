@@ -785,7 +785,7 @@ pub fn resolveDirCluster(path: []const u8) ?u32 {
 ///
 /// Path-cached: a hit lets us skip the entire `walkPath` (root → leaf
 /// directory traversal, multiple disk reads). Cache is invalidated on
-/// every mutating op (createFile/writeFile/deleteFile/renameFile/
+/// exit from every mutating op (createFile/writeFile/deleteFile/renameFile/
 /// createDirectory/removeDirectory) since fat32 caches file_size +
 /// first_cluster + dir_index, all of which can change under those.
 pub fn openFile(path: []const u8) ?Handle {
@@ -798,6 +798,7 @@ pub fn openFile(path: []const u8) ?Handle {
             .current_offset = 0,
         };
     }
+    const epoch = path_cache.snapshot();
     const loc = walkPath(path) orelse return null;
     if (loc.entry.attr & ATTR_DIRECTORY != 0) return null;
     const first_cluster = getEntryCluster(loc.entry);
@@ -806,7 +807,7 @@ pub fn openFile(path: []const u8) ?Handle {
         .dir_index = loc.short_index,
         .first_cluster = first_cluster,
         .file_size = loc.entry.file_size,
-    });
+    }, epoch);
     return Handle{
         .dir_cluster = loc.dir_cluster,
         .dir_index = loc.short_index,
@@ -913,7 +914,7 @@ pub fn readFile(handle: Handle, buf: [*]u8, count: u32) usize {
 /// Create a new file. Returns handle or null.
 pub fn createFile(path: []const u8) ?Handle {
     if (!initialized) return null;
-    path_cache.invalidateAll();
+    defer path_cache.invalidateAll();
     _ = deleteFile(path);
 
     const par = walkParent(path) orelse return null;
@@ -951,7 +952,7 @@ pub fn createFile(path: []const u8) ?Handle {
 pub fn writeFile(handle: *Handle, buf: [*]const u8, count: u32) usize {
     if (!initialized) return 0;
     if (count == 0) return 0;
-    path_cache.invalidateAll();
+    defer path_cache.invalidateAll();
 
     var bytes_written: u32 = 0;
     var cluster = handle.first_cluster;
@@ -1157,7 +1158,7 @@ fn freeClusterChain(start_cluster: u32) void {
 /// that precede it) deleted, then freeing the data cluster chain.
 pub fn deleteFile(path: []const u8) bool {
     if (!initialized) return false;
-    path_cache.invalidateAll();
+    defer path_cache.invalidateAll();
     const par = walkParent(path) orelse return false;
     const loc = findInDir(par.parent_cluster, par.name) orelse return false;
     if (loc.entry.attr & ATTR_DIRECTORY != 0) return false;
@@ -1260,7 +1261,7 @@ pub fn getFileStat(path: []const u8, stat_buf: *anyopaque) bool {
 /// affects the canonical short name).
 pub fn renameFile(old_path: []const u8, new_path: []const u8) bool {
     if (!initialized) return false;
-    path_cache.invalidateAll();
+    defer path_cache.invalidateAll();
 
     const old_par = walkParent(old_path) orelse return false;
     const new_par = walkParent(new_path) orelse return false;
@@ -1277,7 +1278,7 @@ pub fn renameFile(old_path: []const u8, new_path: []const u8) bool {
 /// behavior). Refuses if anything already lives at that path.
 pub fn createDirectory(path: []const u8) bool {
     if (!initialized) return false;
-    path_cache.invalidateAll();
+    defer path_cache.invalidateAll();
     const par = walkParent(path) orelse return false;
     if (findInDir(par.parent_cluster, par.name) != null) return false;
 
@@ -1330,7 +1331,7 @@ pub fn createDirectory(path: []const u8) bool {
 /// or contains anything beyond `.` / `..`.
 pub fn removeDirectory(path: []const u8) bool {
     if (!initialized) return false;
-    path_cache.invalidateAll();
+    defer path_cache.invalidateAll();
     const par = walkParent(path) orelse return false;
     const loc = findInDir(par.parent_cluster, par.name) orelse return false;
     if (loc.entry.attr & ATTR_DIRECTORY == 0) return false;

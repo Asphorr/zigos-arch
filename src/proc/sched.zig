@@ -117,18 +117,18 @@ const MAX_PROCS = process.MAX_PROCS;
 const TRACE_PID: u8 = 0;
 
 // =============================================================================
-// Phase 1: per-CPU runqueue parallel-tracking
+// Per-CPU runqueue membership
 // =============================================================================
 //
 // Centralized state-transition path. Every PCB state change SHOULD route
-// through `setState` — it maintains the per-CPU runqueue's view of "which
-// pids are .ready and assigned here" alongside the legacy state byte.
+// through `setState` — it keeps the per-CPU runqueue (the dispatch source,
+// see pickNext) in step with the state byte: "which pids are .ready and
+// assigned here".
 //
 // The two CAS sites that can't go through setState (allocSlot's
 // .unused→.loading CAS and schedule()'s pickNext-claim .ready→.running CAS)
 // instead call the explicit one-side helpers (`rqOnLeaveReady` after they
-// flip a pid out of .ready). Phase 1 is shadow-only — `pickNext` still
-// scans procs[] — so the rq is purely audit material until Phase 2.
+// flip a pid out of .ready). `rqAudit` cross-checks the two views.
 
 /// Phase 4 load-balancer thresholds. BALANCE_INTERVAL_TICKS gates how
 /// often loadBalance() runs (BSP timer IRQ); BALANCE_THRESHOLD is the
@@ -752,7 +752,7 @@ fn rqEnter(pid: usize, from_sleep: bool) void {
 /// in the OLD priority's queue and leave a phantom entry — the audit
 /// drift class first reproduced as `pid=3 state=4 assigned_cpu=1
 /// in_rq=true` (process slept after a priority bump). Three queues of
-/// MAX_PROCS=32 entries each is trivial to scan.
+/// MAX_PROCS entries each is trivial to scan.
 fn rqLeave(pid: usize) void {
     const pcb = &process.procs[pid];
     if (TRACE_PID != 0 and pid == TRACE_PID) {
@@ -1293,7 +1293,7 @@ pub fn consumeGatedPickSkip(cpu_id: u8) bool {
 /// if the queue has no eligible pid.
 ///
 /// Ties broken by FIFO position (smaller index = earlier-enqueued).
-/// O(N) where N <= MAX_PROCS = 32 per queue — fine without an rb-tree.
+/// O(N) where N <= MAX_PROCS (64) per queue — fine without an rb-tree.
 fn pickMinVruntime(q: *const runqueue.PriQueue, exclude_pid: ?u8) ?u8 {
     var best: ?u8 = null;
     var best_vr: u64 = std.math.maxInt(u64);

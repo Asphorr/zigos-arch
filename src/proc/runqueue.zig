@@ -1,21 +1,17 @@
-//! Per-CPU runqueue (Phase 1 — parallel-track / shadow-only).
+//! Per-CPU runqueue — the dispatch source.
 //!
 //! Each CpuLocal owns one Rq. An Rq holds three priority queues
 //! (interactive / normal / background). A PCB is on AT MOST ONE rq's
 //! priority queue at a time, exactly when its state == .ready.
 //!
-//! Phase 1 is shadow-only: rq membership is maintained alongside the
-//! existing pickNext/schedule path but NOT consulted for dispatch.
-//! The audit assertion (process.rqAudit) catches drift between the
-//! two views; once it stays clean for a while, Phase 2 cuts dispatch
-//! over to read from rq directly and Phases 3-4 retire the legacy
-//! cross-CPU tripwires (save_in_flight_prev, dead_letter, etc.).
+//! `sched.pickNext` dispatches from this CPU's rq (min vruntime within
+//! the highest non-empty band); `sched.rqAudit` still cross-checks rq
+//! membership against the PCB state bytes.
 //!
 //! Locking: rq.lock is per-Rq (per-CPU). Cross-CPU state writes (wake
 //! or kill targeting a pid whose assigned_cpu != my cpu) acquire the
 //! target's lock; same-CPU writes also acquire it for uniformity.
-//! Phase 1 has no migration primitive that takes two rq locks; Phase 4's
-//! load balancer will introduce strict pid-order acquisition.
+//! Migration takes both rq locks in cpu-index order (sched.migrate).
 
 const config = @import("../config.zig");
 const SpinLock = @import("spinlock.zig").SpinLock;
@@ -23,7 +19,7 @@ const SpinLock = @import("spinlock.zig").SpinLock;
 /// Fixed-cap FIFO of pids. count <= MAX_PROCS by construction (each
 /// pid appears in at most one PriQueue at a time). Append at tail,
 /// pop from head, linear-scan remove. O(MAX_PROCS) for remove is fine
-/// at MAX_PROCS = 32.
+/// at MAX_PROCS = 64.
 ///
 /// Sentinel 0xFF in unused slots so a stale read past `count` is
 /// obvious in debugger dumps (a real pid would be 0..MAX_PROCS-1).

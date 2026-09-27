@@ -17,13 +17,14 @@ const page_cache = @import("../../mm/page_cache.zig");
 
 /// Path-cached `walkPath`. Saves the full root → leaf directory walk on
 /// repeat opens of the same path (httpd serving static files, shell
-/// re-exec'ing the same /bin/* per command). Path → inum mapping is stable
-/// across `writeFile` and `truncate` (the only ext2 mutations today), so
-/// no invalidation is needed from this side.
+/// re-exec'ing the same /bin/* per command). The walk runs without the
+/// mount lock; the epoch snapshot keeps a walk that raced an
+/// unlink/rmdir out of the cache.
 fn cachedWalk(path: []const u8) ?u32 {
     if (path_cache.lookupExt2(path)) |inum| return inum;
+    const epoch = path_cache.snapshot();
     const inum = walkPath(path) orelse return null;
-    path_cache.insertExt2(path, inum);
+    path_cache.insertExt2(path, inum, epoch);
     return inum;
 }
 
@@ -430,15 +431,14 @@ pub fn createFile(parent_inum: u32, name: []const u8) ?u32 {
         _ = inode.freeInode(new_inum, false);
         return null;
     }
+    // The dirent exists from here on, whatever the exit path. Only
+    // positive lookups are cached, so this is the conservative hammer;
+    // ext2 mutations are rare.
+    defer path_cache.invalidateAll();
     // Bump parent mtime/ctime — directory contents changed.
     parent.mtime = sec;
     parent.ctime = sec;
     if (!inode.writeInode(parent_inum, &parent)) return null;
-
-    // Parent's path → inum mapping is unchanged, but a fresh path with
-    // this `name` suffix needs to resolve. invalidateAll is the conservative
-    // hammer; ext2 mutations are rare so the cache rebuild cost is fine.
-    path_cache.invalidateAll();
     return new_inum;
 }
 
@@ -589,12 +589,11 @@ pub fn mkdirPath(path: []const u8) bool {
         _ = inode.freeInode(new_inum, true);
         return false;
     }
+    defer path_cache.invalidateAll();
     parent.links_count += 1; // the new dir's ".." points back to parent
     parent.mtime = sec;
     parent.ctime = sec;
     if (!inode.writeInode(parent_inum, &parent)) return false;
-
-    path_cache.invalidateAll();
     return true;
 }
 
@@ -693,6 +692,8 @@ pub fn unlinkInDir(parent_inum: u32, name: []const u8, policy: UnlinkPolicy) boo
     // empty — we don't re-check here.
 
     if (!dirRemove(m, &parent, name)) return false;
+    // The dirent is gone even if a write below fails.
+    defer path_cache.invalidateAll();
 
     const t = time.now();
     const sec: u32 = @truncate(t.sec);
@@ -723,8 +724,6 @@ pub fn unlinkInDir(parent_inum: u32, name: []const u8, policy: UnlinkPolicy) boo
     parent.mtime = sec;
     parent.ctime = sec;
     if (!inode.writeInode(parent_inum, &parent)) return false;
-
-    path_cache.invalidateAll();
     return true;
 }
 

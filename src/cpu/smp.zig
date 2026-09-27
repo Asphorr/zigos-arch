@@ -137,13 +137,10 @@ pub const CpuLocal = struct {
     path_l1: [PATH_L1_SIZE]PathCacheEntry align(64) = [_]PathCacheEntry{.{}} ** PATH_L1_SIZE,
     path_l1_next: u8 = 0,
 
-    /// Per-CPU runqueue (Phase 1 — shadow-only). Three priority queues
-    /// holding pids whose state == .ready and assigned_cpu == this cpu.
-    /// Phase 1 maintains membership alongside the legacy procs[]-scan
-    /// pickNext but does NOT yet read from this for dispatch; the
-    /// `process.rqAudit` call from schedule() catches drift between
-    /// the two views. Phase 2 swaps pickNext to read from here and
-    /// retires the cross-CPU CAS scan. See src/proc/runqueue.zig.
+    /// Per-CPU runqueue — pickNext dispatches from here. Three priority
+    /// queues holding pids whose state == .ready and assigned_cpu == this
+    /// cpu; `sched.rqAudit` cross-checks them against the PCB states. See
+    /// src/proc/runqueue.zig.
     runqueue: @import("../proc/runqueue.zig").Rq align(64) = .{},
 
     /// Migration counters — bumped by `process.migrate` when this cpu is

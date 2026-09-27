@@ -118,12 +118,6 @@ pub fn readCounter() u64 {
 
 /// Nanoseconds since hpet.init(). u64 holds ~584 years at ns precision.
 ///
-/// Math is u128 to defeat overflow in the counter*period_fs intermediate.
-/// At the worst legal period (≈100 ns/tick) the u64 product would wrap
-/// after ~5 hours of uptime; at QEMU's typical 14.318 MHz it's ~213 days.
-/// u128 capacity is 2^91 bits at the period bound — fine for any uptime
-/// short of cosmological.
-///
 /// On 32-bit-counter HPETs the hardware counter wraps every ~5 min worst
 /// case. We extend it to 64 bits in software via a TAS-locked
 /// (wraps, last_seen32) pair updated on every read. Adds ~50 ns to
@@ -160,11 +154,14 @@ pub fn readNanos() u64 {
     // manual `ld` step). Split: whole-ns per tick + sub-ns remainder.
     // For HPET 100MHz period_fs = 10_000_000 → period_ns_whole = 10,
     // remainder = 0 — the second term is a no-op.
-    // Safe from overflow: ctr * 10_000 fits u64 for ~5800 years uptime at
-    // 100MHz; ctr * (period_fs % 1_000_000) is bounded by ctr * 999_999.
     const period_ns_whole = period_fs / 1_000_000;
     const period_ns_rem = period_fs % 1_000_000;
-    return ctr *% period_ns_whole +% (ctr *% period_ns_rem) / 1_000_000;
+    if (period_ns_rem == 0) return ctr *% period_ns_whole;
+    // ctr * rem would wrap past 2^64 / rem ticks (~17.7 days at
+    // 14.318 MHz); splitting ctr by 10^6 keeps it exact and in range.
+    const hi = ctr / 1_000_000;
+    const lo = ctr % 1_000_000;
+    return ctr *% period_ns_whole +% hi *% period_ns_rem +% (lo * period_ns_rem) / 1_000_000;
 }
 
 /// Microseconds since init. Convenient for short-duration timing.

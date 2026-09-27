@@ -125,11 +125,11 @@ pub fn openFile(rel: []const u8) ?u32 {
 
 pub fn closeFile(_: u32) void {}
 
-/// Stack-cost budget for procfs rendering: 2 KB on the BSS, never on the
+/// Stack-cost budget for procfs rendering: 4 KB on the BSS, never on the
 /// kstack (the kstack-lean rule — see feedback_kstack_lean_syscall_paths).
-/// /proc/sessions is the largest renderer; 32 procs worst case → ~1500
-/// bytes for a fully populated run.
-var render_buf: [2048]u8 = undefined;
+/// /proc/sessions is the largest renderer; at MAX_PROCS = 64 a full table
+/// is ~2-3 KB (overflow truncates, see fmt).
+var render_buf: [4096]u8 = undefined;
 
 /// Render the file's content fresh, then return up to `count` bytes
 /// starting at `offset`. Returns 0 at EOF.

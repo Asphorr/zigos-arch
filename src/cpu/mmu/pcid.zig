@@ -21,7 +21,7 @@
 // preserve the TLB. Cross-CPU TLB shootdowns also bump the generation
 // (see `bumpAfterShootdown`) so peers lazily flush before next load.
 //
-// Sizing: MAX_PCID = 128 covers MAX_PROCS=32 with plenty of headroom
+// Sizing: MAX_PCID = 128 covers MAX_PROCS=64 with headroom
 // even under heavy fork/exec churn. Memory cost: 128 × 4 = 0.5 KB
 // global generation + 32 × 128 × 4 = 16 KB per-CPU generation. Cheap.
 

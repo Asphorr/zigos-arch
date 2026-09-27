@@ -691,6 +691,13 @@ inline fn quantaUntil(deadline: u64, tc: u64) u64 {
 /// armDelta's clamp. Everyone busy gets one quantum (≈10ms). The
 /// 10-quanta cap keeps the watchdog peer-check, backstop sweeps and load
 /// balancer within ~10x of their normal cadence — degrade, never starve.
+const IDLE_STRETCH_QUANTA: u32 = 10;
+
+comptime {
+    // A stretched fire must be caught up in full, or tick_count loses time.
+    if (IDLE_STRETCH_QUANTA >= hrtimer.MAX_CATCHUP) @compileError("idle stretch must stay below hrtimer.MAX_CATCHUP");
+}
+
 fn rearmTimerForCurrent(cpu: *smp.CpuLocal) void {
     const quantum = apic.timerQuantum();
     const cur_is_idle = blk: {
@@ -721,12 +728,12 @@ fn rearmTimerForCurrent(cpu: *smp.CpuLocal) void {
             // from the on_cpu-gate review, 2026-07-16.)
             bump(&st.clamp_gated);
         } else if (cpu.cpu_id != 0) {
-            quanta = 10;
+            quanta = IDLE_STRETCH_QUANTA;
         } else if (@import("../../driver/sound.zig").needsTick()) {
             bump(&st.clamp_sound);
         } else {
             const tc = process.tick_count;
-            var stretch: u64 = 10;
+            var stretch: u64 = IDLE_STRETCH_QUANTA;
             const until_wake = quantaUntil(sched_mod.earliest_wake_tick.load(.seq_cst), tc);
             if (until_wake < stretch) {
                 stretch = until_wake;
@@ -737,9 +744,9 @@ fn rearmTimerForCurrent(cpu: *smp.CpuLocal) void {
                 stretch = until_alarm;
                 bump(&st.clamp_alarm);
             }
-            quanta = @intCast(stretch); // ≤10 by construction
+            quanta = @intCast(stretch); // ≤ IDLE_STRETCH_QUANTA by construction
         }
-        if (quanta <= 1) bump(&st.arm_1q) else if (quanta >= 10) bump(&st.arm_full) else bump(&st.arm_mid);
+        if (quanta <= 1) bump(&st.arm_1q) else if (quanta >= IDLE_STRETCH_QUANTA) bump(&st.arm_full) else bump(&st.arm_mid);
     }
     const stretched = quanta > 1;
 

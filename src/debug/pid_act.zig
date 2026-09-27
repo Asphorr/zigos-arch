@@ -27,7 +27,7 @@
 // CAS-serialized through setState; PICK_CAS at line 2318 has a brief race
 // window only on simultaneous candidate-pickers, accepted-as-best-effort).
 //
-// Size: 16 entries × MAX_PROCS=32 pids × 24 bytes = 12 KB BSS. Static.
+// Size: 16 entries × MAX_PROCS=64 pids × 24 bytes = 24 KB BSS. Static.
 
 const std = @import("std");
 const config = @import("../config.zig");

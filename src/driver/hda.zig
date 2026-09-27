@@ -26,7 +26,7 @@ const pmm = @import("../mm/pmm.zig");
 const Phys = @import("../util/addr.zig").Phys;
 const paging = @import("../mm/paging.zig");
 const debug = @import("../debug/debug.zig");
-const hpet = @import("../time/hpet.zig");
+const Deadline = @import("../util/deadline.zig").Deadline;
 const SpinLock = @import("../proc/spinlock.zig").SpinLock;
 const iommu = @import("../cpu/mmu/iommu.zig");
 
@@ -635,28 +635,27 @@ pub fn selfTest() bool {
     }
 
     const lpib_before = r32(sdOff(stream_sd_idx, SD_LPIB));
-    const t_start = hpet.readMicros();
+    // TSC-based: an HPET-less machine read 0 - 0 < 100_000 here forever.
+    var d = Deadline.ms(100, "hda selftest dma");
 
     writeSamples(@as([*]const i16, &tone), tone_frames);
 
     // Watch DMA progress for 100 ms.
-    var milestone: u32 = 25_000;
-    while (hpet.readMicros() - t_start < 100_000) {
-        const dt = hpet.readMicros() - t_start;
-        if (dt >= milestone) {
+    var milestone_ms: u64 = 25;
+    while (d.live()) {
+        const dt = d.elapsedMs();
+        if (dt >= milestone_ms) {
             const lpib_now = r32(sdOff(stream_sd_idx, SD_LPIB));
-            debug.klog("[hda] selfTest: t={d}us LPIB={d}\n", .{ dt, lpib_now });
-            milestone += 25_000;
+            debug.klog("[hda] selfTest: t={d}ms LPIB={d}\n", .{ dt, lpib_now });
+            milestone_ms += 25;
         }
         asm volatile ("pause");
     }
 
     const lpib_after = r32(sdOff(stream_sd_idx, SD_LPIB));
-    const t_end = hpet.readMicros();
-    const elapsed_us = t_end - t_start;
     const advance = lpib_after -% lpib_before;
 
-    debug.klog("[hda] selfTest: elapsed={d} us, LPIB advance={d} bytes\n", .{ elapsed_us, advance });
+    debug.klog("[hda] selfTest: elapsed={d} ms (+{d} ms host pause), LPIB advance={d} bytes\n", .{ d.elapsedMs(), d.pausedMs(), advance });
 
     const ok = advance >= 1024 and advance < stream_buf_size;
     if (ok) {

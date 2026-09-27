@@ -10,12 +10,17 @@
 //!   • L2 — global, 32 slots, one ticket-lock. Round-robin victim. Hit
 //!     here promotes into the calling CPU's L1.
 //!
-//! Invalidation is coarse: any FS mutation calls `invalidateAll`, which
-//!   1. bumps `global_epoch` (atomic) — every existing L1 entry's stored
-//!      epoch becomes stale, so they invisibly miss without per-slot writes
-//!   2. clears L2 under its lock.
+//! Invalidation is coarse: any FS mutation calls `invalidateAll`, which,
+//! under the L2 lock,
+//!   1. bumps `global_epoch` — every existing L1 entry's stored epoch
+//!      becomes stale, so they invisibly miss without per-slot writes
+//!   2. clears L2.
 //! L1 doesn't need a per-CPU sweep because the epoch check at lookup time
 //! filters stale entries.
+//!
+//! Contract: mutators call `invalidateAll` AFTER the directory change;
+//! walkers take `snapshot()` BEFORE the walk and pass it to `insert`, which
+//! drops the result if any mutation finished in between.
 //!
 //! Per-FS payload conventions (caller-defined, opaque to this module):
 //!   ext2 — bytes [0..4]  : u32 inum (little-endian)
@@ -65,11 +70,18 @@ inline fn writeEntry(e: *Entry, tag: FsTag, path: []const u8, payload: [PAYLOAD_
 /// Drop every cached entry. Call from any FS mutation that could change a
 /// path → handle mapping (rename, unlink, fat32 file size change).
 pub fn invalidateAll() void {
-    _ = @atomicRmw(u64, &global_epoch, .Add, 1, .seq_cst);
     const flags = l2_lock.acquireIrqSave();
     defer l2_lock.releaseIrqRestore(flags);
+    // Bump and clear under one lock hold: a lookup that already read the
+    // new epoch must not find an old L2 entry and promote it as current.
+    _ = @atomicRmw(u64, &global_epoch, .Add, 1, .seq_cst);
     for (&l2) |*e| e.tag = 0;
     l2_next = 0;
+}
+
+/// Epoch for `insert`. Take it before the walk whose result gets cached.
+pub fn snapshot() u64 {
+    return @atomicLoad(u64, &global_epoch, .acquire);
 }
 
 /// Look up a (tag, path) pair. Returns the 16-byte payload the caller
@@ -126,25 +138,31 @@ pub fn lookup(tag: FsTag, path: []const u8) ?[PAYLOAD_BYTES]u8 {
 }
 
 /// Insert (or update if already present) a (tag, path) → payload mapping.
-/// Writes to both L1 (this CPU) and L2 (global).
-pub fn insert(tag: FsTag, path: []const u8, payload: [PAYLOAD_BYTES]u8) void {
+/// Writes to both L1 (this CPU) and L2 (global). `epoch` is the
+/// `snapshot()` taken before the walk that produced `payload`.
+pub fn insert(tag: FsTag, path: []const u8, payload: [PAYLOAD_BYTES]u8, epoch: u64) void {
     if (path.len == 0 or path.len > smp.PATH_CACHE_PATH_MAX) return;
-    const cur_epoch = @atomicLoad(u64, &global_epoch, .acquire);
+    {
+        const flags = l2_lock.acquireIrqSave();
+        defer l2_lock.releaseIrqRestore(flags);
+        // A mutation that finished during the walk bumped the epoch; one
+        // still running will clear this entry when it finishes.
+        if (@atomicLoad(u64, &global_epoch, .seq_cst) != epoch) return;
+        writeEntry(l2Slot(tag, path), tag, path, payload, epoch);
+    }
+    promoteL1(tag, path, payload, epoch);
+}
 
-    promoteL1(tag, path, payload, cur_epoch);
-
-    const flags = l2_lock.acquireIrqSave();
-    defer l2_lock.releaseIrqRestore(flags);
-    // Replace existing entry to avoid duplicates.
+/// The L2 slot for (tag, path): its existing entry (no duplicates), else
+/// the round-robin victim. Caller holds l2_lock. Statement form on purpose:
+/// an expression-form for-else is on the LLVM Invalid-type list.
+fn l2Slot(tag: FsTag, path: []const u8) *Entry {
     for (&l2) |*e| {
-        if (matches(e, tag, path)) {
-            e.payload = payload;
-            return;
-        }
+        if (matches(e, tag, path)) return e;
     }
     const victim = &l2[l2_next];
     l2_next = (l2_next + 1) % @as(u8, L2_SIZE);
-    writeEntry(victim, tag, path, payload, cur_epoch);
+    return victim;
 }
 
 fn promoteL1(tag: FsTag, path: []const u8, payload: [PAYLOAD_BYTES]u8, epoch: u64) void {
@@ -172,10 +190,10 @@ pub fn lookupExt2(path: []const u8) ?u32 {
     return std.mem.readInt(u32, p[0..4], .little);
 }
 
-pub fn insertExt2(path: []const u8, inum: u32) void {
+pub fn insertExt2(path: []const u8, inum: u32, epoch: u64) void {
     var p: [PAYLOAD_BYTES]u8 = [_]u8{0} ** PAYLOAD_BYTES;
     std.mem.writeInt(u32, p[0..4], inum, .little);
-    insert(.ext2, path, p);
+    insert(.ext2, path, p, epoch);
 }
 
 pub const Fat32Hit = struct {
@@ -195,11 +213,11 @@ pub fn lookupFat32(path: []const u8) ?Fat32Hit {
     };
 }
 
-pub fn insertFat32(path: []const u8, hit: Fat32Hit) void {
+pub fn insertFat32(path: []const u8, hit: Fat32Hit, epoch: u64) void {
     var p: [PAYLOAD_BYTES]u8 = undefined;
     std.mem.writeInt(u32, p[0..4], hit.dir_cluster, .little);
     std.mem.writeInt(u32, p[4..8], hit.dir_index, .little);
     std.mem.writeInt(u32, p[8..12], hit.first_cluster, .little);
     std.mem.writeInt(u32, p[12..16], hit.file_size, .little);
-    insert(.fat32, path, p);
+    insert(.fat32, path, p, epoch);
 }

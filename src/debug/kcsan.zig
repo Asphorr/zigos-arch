@@ -34,6 +34,7 @@
 const std = @import("std");
 const debug = @import("debug.zig");
 const serial = @import("serial.zig");
+const smp = @import("../cpu/smp.zig");
 
 pub const ENABLE: bool = true;
 
@@ -50,9 +51,12 @@ const PANIC_ON_HIT: bool = false;
 /// pause window often enough to make the system unusably slow. Cross-CPU
 /// detection still runs on EVERY access — the rare path is just the resample.
 const SAMPLE_DENOM: u32 = 50_000;
-/// Match smp.MAX_CPUS so we have a slot for every possible LAPIC id we might
-/// see. Empty slots are cheap (single atomic load == 0), so oversizing is OK.
+/// == smp.MAX_CPUS; one watchpoint slot per cpu id.
 const MAX_CPUS: usize = 32;
+
+comptime {
+    if (MAX_CPUS != smp.MAX_CPUS) @compileError("kcsan MAX_CPUS must equal smp.MAX_CPUS");
+}
 
 inline fn pauseSpin(n: u32) void {
     var i: u32 = 0;
@@ -61,10 +65,10 @@ inline fn pauseSpin(n: u32) void {
     }
 }
 
+/// rdtscp, not the LAPIC ID register (a VM exit). smp.zig is on the
+/// kcsan_inject denylist, so this cannot re-enter the hooks.
 inline fn currentCpuId() u8 {
-    const apic = @import("../time/apic.zig");
-    if (!apic.apic_active) return 0;
-    return @truncate(apic.getLapicId());
+    return smp.myCpuId();
 }
 
 // =============================================================================
