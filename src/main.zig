@@ -290,6 +290,8 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     blog.ok("Kernel heap");
     kasan.init();
     blog.ok("KASAN shadow");
+    heap.selfTest();
+    blog.ok("Heap free-path self-test");
     @import("mm/vmalloc.zig").init();
     blog.ok("vmalloc arena");
     // Unified page cache (file-backed mmap + future read() path). init() clears

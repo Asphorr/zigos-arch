@@ -44,9 +44,9 @@ var violations: u32 = 0;
 /// initial useful autopsy.
 var reported: bool = false;
 
-/// Convert a kstack_top to its owning pool-slot index, or null for heap-
-/// allocated kstacks. Used to validate kesp lands inside the SAME slot as
-/// kernel_stack_top (cross-stack aliasing detector).
+/// Convert a kstack_top to its owning pool-slot index, or null if it is not
+/// a slot's high edge. Every task's kstack is its pool slot, so null is
+/// corruption.
 fn poolSlotForTop(top: usize) ?usize {
     const base = @intFromPtr(&process.kstack_pool[0]);
     const total = config.MAX_PROCS * config.KSTACK_SLOT_SIZE;
@@ -99,15 +99,9 @@ fn checkPcb(pid: usize) ?[]const u8 {
         return "kernel_esp outside kstack body and not in any IST1";
     }
 
-    // ---- For pool kstacks, kesp must be in the SAME slot ----
-    // (heap kstacks live wherever kmalloc returned; can't validate by slot)
-    if (poolSlotForTop(expected_top)) |slot| {
-        if (slot != pid) {
-            // Witness top doesn't even match this pid's slot — earlier
-            // check should have caught this if the witness was right.
-            return "kstack_top's pool slot != pid";
-        }
-    }
+    // ---- kstack_top must be this pid's own pool slot ----
+    const slot = poolSlotForTop(expected_top) orelse return "kstack_top is not a kstack_pool slot top";
+    if (slot != pid) return "kstack_top's pool slot != pid";
 
     // ---- Saved RIP plausibility (only for non-running PCBs THAT HAVE
     //      BEEN THROUGH switchTo's save path at least once) ----

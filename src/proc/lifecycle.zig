@@ -690,11 +690,10 @@ pub fn createIdleProcess() void {
 /// switchTo asm `ret`s to it directly; there's no iretq frame and no user
 /// mode. Function runs in CS=0x08, RSP=this PCB's kstack.
 ///
-/// `kstack_bytes` lets the caller request a larger kstack than the pool
-/// default (16 KB). Desktop needs at least 32 KB because its init+render
-/// path (virtio_gpu init, font rasterization) was sized for the 32 KB
-/// boot stack. Heap-allocated; no guard page at the bottom (the heap
-/// allocator surrounds it with redzones if KASAN is on).
+/// `kstack_bytes` is the stack the task needs; every task runs on its pool
+/// slot (KSTACK_SIZE with a guard page below). A request past KSTACK_SIZE
+/// fails: a heap-allocated stack had no guard page (an overflow silently
+/// shredded neighbouring heap blocks) and was never freed.
 pub fn createKernelTask(
     entry_fn_addr: usize,
     name: []const u8,
@@ -702,27 +701,14 @@ pub fn createKernelTask(
     prio: Priority,
     kstack_bytes: usize,
 ) ?usize {
+    if (kstack_bytes > KSTACK_SIZE) {
+        debug.klog("[proc] createKernelTask '{s}': kstack {d} bytes > KSTACK_SIZE {d} — refused\n", .{ name, kstack_bytes, KSTACK_SIZE });
+        return null;
+    }
     const i = allocSlot() orelse return null;
     resetPcbExceptState(&process.procs[i]); // state stays .loading from allocSlot's CAS
 
-    const stack_top: usize = blk: {
-        if (kstack_bytes <= KSTACK_SIZE) {
-            const slot_base = @intFromPtr(&process.kstack_pool[i]);
-            break :blk slot_base + KSTACK_SLOT_SIZE;
-        }
-        const buf = heap.kmallocAligned(kstack_bytes, 4096) orelse {
-            debug.klog("[proc] createKernelTask: heap alloc {d} bytes failed\n", .{kstack_bytes});
-            // Release the slot back to .unused. State was .loading from
-            // allocSlot's CAS, never reached .ready, so no rq enter happened.
-            process.setState(i, .unused);
-            return null;
-        };
-        const top = @intFromPtr(buf) + kstack_bytes;
-        // Heap kstack tops are recorded via expected_kstack_tops below at
-        // the same time as the per-pid witness — `isValidKstackTopShape`
-        // scans that array for tops outside the kstack pool.
-        break :blk top;
-    };
+    const stack_top: usize = @intFromPtr(&process.kstack_pool[i]) + KSTACK_SLOT_SIZE;
 
     const sw_base: [*]u64 = @ptrFromInt(stack_top - dspec.kthread_bytes);
     for (0..dspec.switch_frame.count) |k| sw_base[k] = 0;

@@ -86,11 +86,9 @@ pub fn setTssRsp0(pid: usize, rsp0: u64) void {
     const smp = @import("../smp.zig");
     const process = @import("../../proc/process.zig");
     // Per-PID exact match against the immutable witness set at create()
-    // time. The shape-check (isValidKstackTopShape) accepted ANY value
-    // that happened to be a valid pool top OR a registered heap kstack,
-    // which silently passed when desktop's heap-kstack value (0x312000)
-    // leaked into procs[3].kernel_stack_top — that's the wild-RIP smoking
-    // gun we caught via sched ring autopsy. The expected-tops witness
+    // time. The shape-check (isValidKstackTopShape) accepts ANY valid pool
+    // top, so another task's top leaking into this PCB would pass it. The
+    // expected-tops witness
     // lives in a separate static array (not inside procs[]) so a wild
     // writer scribbling inside one PCB can't simultaneously corrupt the
     // witness.

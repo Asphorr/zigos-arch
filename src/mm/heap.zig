@@ -1,56 +1,22 @@
-// TLSF (Two-Level Segregated Fit) kernel heap allocator.
+// Kernel heap: the TLSF core (tlsf.zig — block layout, free lists,
+// corruption detectors, validators) over the fixed physmap window at
+// KERNEL_HEAP_BASE, under one IRQ-safe spinlock. This file is the kernel
+// side: the lock, the kmalloc/kfree API, stats, kasan/kdbg hooks, the
+// panics on corruption, the boot self-test, and kvmalloc (PMM-backed).
 //
-// Replaces the prior first-fit free-list allocator 2026-05-24. The old
-// allocator's O(n) walk + unbounded fragmentation tail was hitting alloc
-// failures at 64 KB asks with plenty of bytes free; with the system
-// growing (drivers, GUI, network), that wasn't going to age well.
+// TLSF replaced a first-fit free-list allocator 2026-05-24: its O(n) walk
+// and fragmentation tail failed 64 KB asks with plenty of bytes free.
 //
-// TLSF properties:
-//   - Bounded O(1) alloc and free (bitmap-indexed free lists; @ctz/@clz for
-//     bucket search).
-//   - Bounded internal fragmentation (worst case ~1/SL_INDEX_COUNT per class).
-//   - Boundary-tag coalescing in both directions on free, also O(1).
-//   - Same public API as before — kmalloc / kmallocAligned / kfree /
-//     kalloc / kfreeAuto / kvmalloc / kvfree / validateHeap /
-//     printDetailedStats / printStats / snapshot / Stats.
-//
-// Block layout (all blocks 16-byte aligned, sizes multiples of 16):
-//
-//   Allocated block:
-//     [0..8]:    header   (size << 4 | flags)   <- THIS_FREE clear
-//     [8..12]:   user_size (u32, requested bytes)
-//     [12..16]:  canary_head (u32 = 0xDEADBEEF)
-//     [16..16+user_size]:  user data            <- user_ptr returned here
-//     [+0..+4]:  canary_tail (u32 = 0xCAFEBABE)
-//     [pad to total_size]
-//
-//   Free block:
-//     [0..8]:    header   (size << 4 | flags)   <- THIS_FREE set
-//     [8..16]:   next_free (ptr to next block in same (FL,SL) free list)
-//     [16..24]:  prev_free (ptr to prev block in same (FL,SL) free list)
-//     [24..size-8]: unused
-//     [size-8..size]: footer (size duplicate, lets prev-coalesce find us)
-//
-// Header low 4 bits (size is always 16-multiple → low 4 bits free for flags):
-//   bit 0: THIS_FREE
-//   bit 1: PREV_FREE  (mirror of the physically previous block's THIS_FREE;
-//                      flipped by alloc/free on the NEXT block's header)
-//   bits 2-3: reserved
-//
-// User pointer is at block_addr + USER_OFFSET (=16) for naturally-aligned
-// allocs. For alignment > 16, the user pointer is shifted further into the
-// block (padding stays as dead bytes inside the allocation). kfree finds the
-// header via scan-back from (ptr - USER_OFFSET) downward — same approach as
-// the prior allocator.
-//
-// kvmalloc / kvfree (PMM-backed, page-multiples) are unchanged at the bottom
-// of this file. They're the right answer for >= KVMALLOC_THRESHOLD allocs.
+// Public API: kmalloc / kmallocAligned / kfree / kalloc / kfreeAuto /
+// kvmalloc / kvfree / validateHeap / validateInvariants / validateFreelists /
+// printDetailedStats / printStats / snapshot / Stats / selfTest.
 
 // Core:
 const std = @import("std");
 const memmap = @import("memmap.zig");
 const pmm = @import("pmm.zig");
 const paging = @import("paging.zig");
+const tlsf = @import("tlsf.zig");
 const Phys = @import("../util/addr.zig").Phys;
 const spinlock = @import("../proc/spinlock.zig");
 const SpinLock = spinlock.SpinLock;
@@ -64,289 +30,70 @@ const layout = @import("../debug/layout.zig");
 
 pub const HEAP_START: usize = memmap.PHYSMAP_BASE + memmap.KERNEL_HEAP_BASE;
 pub const HEAP_SIZE: usize = memmap.KERNEL_HEAP_SIZE;
-
-// === Block layout constants ===
-
-const BLOCK_ALIGN: usize = 16;
-const BLOCK_ALIGN_MASK: usize = BLOCK_ALIGN - 1;
-const HEADER_SIZE: usize = 8;
-const FOOTER_SIZE: usize = 8;
-// Per-alloc prefix (header + user_size + canary_head):
-const USER_OFFSET: usize = 16;
-const CANARY_TAIL_SIZE: usize = 4;
-// Min total block size: header + next + prev + footer = 32. Shrinking this
-// would silently overlap the prev pointer (offset 16) with the footer
-// (offset size-8) — see prevFreePtr. Comptime-locked.
-const MIN_BLOCK_SIZE: usize = 32;
-comptime {
-    if (MIN_BLOCK_SIZE < 32) @compileError("MIN_BLOCK_SIZE < 32 overlaps prev pointer with footer");
-}
-
-// The last MIN_BLOCK_SIZE bytes of the heap are a permanently-allocated
-// sentinel "wall" (written once in init): the last real block always has a
-// non-free, in-bounds neighbor, so coalesce-forward stops cleanly without
-// bounds-checking the heap end on every free. Never on a freelist, never
-// user-visible, carries no canaries.
-const WALL_ADDR: usize = HEAP_START + HEAP_SIZE - MIN_BLOCK_SIZE;
-
-const FLAG_THIS_FREE: usize = 1 << 0;
-const FLAG_PREV_FREE: usize = 1 << 1;
-const SIZE_MASK: usize = ~@as(usize, 0xF);
-
-const CANARY_HEAD: u32 = 0xDEADBEEF;
-const CANARY_TAIL: u32 = 0xCAFEBABE;
+// Sentinel wall: the last MIN_BLOCK_SIZE bytes, never user-visible.
+const WALL_ADDR: usize = HEAP_START + HEAP_SIZE - tlsf.MIN_BLOCK_SIZE;
 
 comptime {
-    // Allocated-block prefix layout: header[0..8] u64, user_size[8..12] u32,
-    // canary_head[12..16] u32. The first user byte is at USER_OFFSET=16 for
-    // naturally-aligned allocs. If any field widens, the user pointer math
-    // breaks silently. See debug/layout.zig for why hand-overlaid storage
-    // needs this gate (2026-05-28 heap freelist bug post-mortem).
+    if (HEAP_SIZE > tlsf.MAX_REGION) @compileError("KERNEL_HEAP_SIZE exceeds tlsf.MAX_REGION");
+    // Hand-overlaid block storage: if any field widens, the user pointer /
+    // free-list math breaks silently (the 2026-05-28 `?usize` link overlap
+    // — see debug/layout.zig).
     layout.assertFieldsExactFill(&.{
-        .{ .name = "header",      .offset = 0,  .size = HEADER_SIZE },
+        .{ .name = "header",      .offset = 0,  .size = tlsf.HEADER_SIZE },
         .{ .name = "user_size",   .offset = 8,  .size = @sizeOf(u32) },
         .{ .name = "canary_head", .offset = 12, .size = @sizeOf(u32) },
-    }, USER_OFFSET);
+    }, tlsf.USER_OFFSET);
+    layout.assertFieldsNonOverlap(&.{
+        .{ .name = "header",    .offset = 0,                         .size = tlsf.HEADER_SIZE },
+        .{ .name = "next_free", .offset = 8,                         .size = @sizeOf(@TypeOf(tlsf.nextFreePtr(0).*)) },
+        .{ .name = "prev_free", .offset = 16,                        .size = @sizeOf(@TypeOf(tlsf.prevFreePtr(0).*)) },
+        .{ .name = "footer",    .offset = tlsf.MIN_BLOCK_SIZE - 8,   .size = tlsf.FOOTER_SIZE },
+    }, tlsf.MIN_BLOCK_SIZE);
 }
-
-// === TLSF parameters ===
-
-// SMALL_BLOCK_SIZE is the boundary below which we use the "small" (FL=0)
-// bucket — all sizes [MIN_BLOCK_SIZE .. SMALL_BLOCK_SIZE) live in FL=0,
-// subdivided by SL_INDEX_COUNT.
-// SMALL_BLOCK_SIZE = 1 << FL_INDEX_SHIFT.
-//
-// FL_INDEX_SHIFT must be >= SL_INDEX_LOG2 + log2(BLOCK_ALIGN) so the
-// second-level subdivision step is at least one allocation grain. For
-// SL_INDEX_LOG2=4 and BLOCK_ALIGN=16 (log2=4) → FL_INDEX_SHIFT >= 8.
-const FL_INDEX_SHIFT: u6 = 8;
-const SL_INDEX_LOG2: u6 = 4;
-const SL_INDEX_COUNT: usize = 1 << SL_INDEX_LOG2;
-const SL_INDEX_MASK: usize = SL_INDEX_COUNT - 1;
-// FL_INDEX_MAX_LOG2 = log2 of largest block we ever map. 25 covers 32 MB —
-// well past current HEAP_SIZE (16 MB) with headroom for growth.
-// FL_INDEX_MAX_LOG2 = 26 (64 MB) gives one full FL of headroom above the
-// largest block we ever expect (32 MB), so mappingAllocRoundUp can never
-// carry past the last valid bucket. Standard TLSF practice.
-const FL_INDEX_MAX_LOG2: u6 = 26;
-const FL_INDEX_COUNT: usize = FL_INDEX_MAX_LOG2 - FL_INDEX_SHIFT + 1; // 19
 
 // === State ===
 
 var initialized: bool = false;
 var lock: SpinLock = .{};
+var core: tlsf.Tlsf = undefined;
 
-// Bitmaps: bit i in fl_bitmap set iff sl_bitmaps[i] != 0.
-//          bit j in sl_bitmaps[i] set iff free_lists[i][j] != 0.
-var fl_bitmap: u32 = 0; // up to FL_INDEX_COUNT bits used (max 18)
-var sl_bitmaps: [FL_INDEX_COUNT]u16 = [_]u16{0} ** FL_INDEX_COUNT;
-// NOTE: `usize` not `?usize` — sentinel is 0 (heap addresses are never 0).
-// `?usize` is 16 bytes wide (payload + has_value, non-pointer optional),
-// which would overlap next_free@+8 with prev_free@+16 inside a free block
-// and silently corrupt the freelist. Caught 2026-05-28 as #PF cr2=0x10 in
-// removeFreeBlock after the discriminant overlap yielded `some(0)`.
-var free_lists: [FL_INDEX_COUNT][SL_INDEX_COUNT]usize =
-    [_][SL_INDEX_COUNT]usize{[_]usize{0} ** SL_INDEX_COUNT} ** FL_INDEX_COUNT;
-
-// Stats (preserved from prior impl for compat with sysmon/cli output).
+// Stats (sysmon/cli output).
 var alloc_count: u32 = 0;
 var free_count: u32 = 0;
 var current_alloc: u32 = 0;
 var peak_alloc: u32 = 0;
 var current_bytes: u64 = 0;
 var peak_bytes: u64 = 0;
-var free_bytes_remaining: u64 = 0;
-var free_block_count: u32 = 0;
-// Upper bound between recomputes: insertFreeBlock grows it, nothing shrinks
-// it on alloc. Every consumer that needs the true value (printDetailedStats,
-// snapshot, the alloc-fail log) calls recomputeLargestFreeBlock first.
-var largest_free_block: usize = 0;
-
-// === Header helpers ===
-
-inline fn headerPtr(addr: usize) *usize {
-    return @ptrFromInt(addr);
-}
-inline fn blockSize(addr: usize) usize {
-    return headerPtr(addr).* & SIZE_MASK;
-}
-inline fn blockIsFree(addr: usize) bool {
-    return (headerPtr(addr).* & FLAG_THIS_FREE) != 0;
-}
-inline fn blockPrevFree(addr: usize) bool {
-    return (headerPtr(addr).* & FLAG_PREV_FREE) != 0;
-}
-inline fn writeHeader(addr: usize, size: usize, this_free: bool, prev_free: bool) void {
-    var v = size & SIZE_MASK;
-    if (this_free) v |= FLAG_THIS_FREE;
-    if (prev_free) v |= FLAG_PREV_FREE;
-    headerPtr(addr).* = v;
-}
-inline fn setPrevFreeFlag(addr: usize, prev_free: bool) void {
-    var v = headerPtr(addr).*;
-    if (prev_free) v |= FLAG_PREV_FREE else v &= ~FLAG_PREV_FREE;
-    headerPtr(addr).* = v;
-}
-inline fn writeFooter(addr: usize) void {
-    const sz = blockSize(addr);
-    const f: *usize = @ptrFromInt(addr + sz - FOOTER_SIZE);
-    f.* = sz;
-}
-inline fn readFooterAt(footer_addr: usize) usize {
-    const f: *const usize = @ptrFromInt(footer_addr);
-    return f.*;
-}
-
-// Free-block links live in the user-data region; safe to overlay because
-// the block is free. Use plain `usize` with 0 as the null sentinel — see
-// free_lists declaration for why `?usize` is unsafe here.
-inline fn nextFreePtr(addr: usize) *usize {
-    return @ptrFromInt(addr + 8);
-}
-inline fn prevFreePtr(addr: usize) *usize {
-    return @ptrFromInt(addr + 16);
-}
-comptime {
-    // Free-block layout — header[0..8], next_free[8..16], prev_free[16..24],
-    // footer[MIN_BLOCK_SIZE-8..MIN_BLOCK_SIZE]. The .size for each link is
-    // computed from @sizeOf(@TypeOf(deref)) so any future widening (e.g., a
-    // refactor back to ?usize @ 16B) trips the assertion at compile time.
-    layout.assertFieldsNonOverlap(&.{
-        .{ .name = "header",    .offset = 0,                    .size = HEADER_SIZE },
-        .{ .name = "next_free", .offset = 8,                    .size = @sizeOf(@TypeOf(nextFreePtr(0).*)) },
-        .{ .name = "prev_free", .offset = 16,                   .size = @sizeOf(@TypeOf(prevFreePtr(0).*)) },
-        .{ .name = "footer",    .offset = MIN_BLOCK_SIZE - 8,   .size = FOOTER_SIZE },
-    }, MIN_BLOCK_SIZE);
-}
-
-// === Size → (FL, SL) mapping ===
-
-// Round a request up so the bucket we land on is guaranteed large enough.
-// Standard TLSF "round up to next class" trick: add (1 << (log2(size) -
-// SL_INDEX_LOG2)) - 1 so the size moves into the next SL slot if not on a
-// boundary.
-fn mappingAllocRoundUp(size: usize) usize {
-    if (size < (1 << FL_INDEX_SHIFT)) return size;
-    const log2: u6 = @intCast(63 - @clz(size));
-    const round: usize = (@as(usize, 1) << (log2 - SL_INDEX_LOG2)) - 1;
-    return size + round;
-}
-
-const FlSl = struct { fl: usize, sl: usize };
-
-// Map a size to (fl, sl). For sizes < SMALL_BLOCK_SIZE, fl=0 and sl is
-// linear in size.
-fn mapping(size: usize) FlSl {
-    if (size < (1 << FL_INDEX_SHIFT)) {
-        const small_shift: u6 = FL_INDEX_SHIFT - SL_INDEX_LOG2;
-        return .{ .fl = 0, .sl = size >> small_shift };
-    }
-    const log2: u6 = @intCast(63 - @clz(size));
-    const fl: usize = log2 - FL_INDEX_SHIFT + 1;
-    const sl: usize = (size >> (log2 - SL_INDEX_LOG2)) & SL_INDEX_MASK;
-    return .{ .fl = fl, .sl = sl };
-}
-
-// Find the smallest non-empty (fl, sl) >= the input. Returns null if no
-// satisfying block exists.
-fn searchSuitableBlock(fl_in: usize, sl_in: usize) ?FlSl {
-    if (fl_in >= FL_INDEX_COUNT) return null;
-    // First try same FL, SL >= sl_in.
-    const sl_map: u16 = sl_bitmaps[fl_in] & (@as(u16, 0xFFFF) << @intCast(sl_in));
-    if (sl_map != 0) {
-        const sl: usize = @ctz(sl_map);
-        return .{ .fl = fl_in, .sl = sl };
-    }
-    // Walk to next FL with any free blocks.
-    const shift_amt: u5 = @intCast(fl_in + 1);
-    if (shift_amt >= 32) return null;
-    const fl_map: u32 = fl_bitmap & (@as(u32, 0xFFFFFFFF) << shift_amt);
-    if (fl_map == 0) return null;
-    const fl: usize = @ctz(fl_map);
-    if (fl >= FL_INDEX_COUNT) return null;
-    const sl: usize = @ctz(sl_bitmaps[fl]);
-    return .{ .fl = fl, .sl = sl };
-}
-
-// === Free-list insert/remove ===
-
-fn insertFreeBlock(addr: usize) void {
-    const sz = blockSize(addr);
-    const m = mapping(sz);
-    const head = free_lists[m.fl][m.sl];
-    nextFreePtr(addr).* = head;
-    prevFreePtr(addr).* = 0;
-    if (head != 0) prevFreePtr(head).* = addr;
-    free_lists[m.fl][m.sl] = addr;
-    sl_bitmaps[m.fl] |= (@as(u16, 1) << @intCast(m.sl));
-    fl_bitmap |= (@as(u32, 1) << @intCast(m.fl));
-    free_block_count += 1;
-    if (sz > largest_free_block) largest_free_block = sz;
-}
-
-fn removeFreeBlock(addr: usize) void {
-    const sz = blockSize(addr);
-    const m = mapping(sz);
-    const next = nextFreePtr(addr).*;
-    const prev = prevFreePtr(addr).*;
-    if (next != 0) prevFreePtr(next).* = prev;
-    if (prev != 0) {
-        nextFreePtr(prev).* = next;
-    } else {
-        // We were the head.
-        free_lists[m.fl][m.sl] = next;
-        if (next == 0) {
-            sl_bitmaps[m.fl] &= ~(@as(u16, 1) << @intCast(m.sl));
-            if (sl_bitmaps[m.fl] == 0) {
-                fl_bitmap &= ~(@as(u32, 1) << @intCast(m.fl));
-            }
-        }
-    }
-    if (free_block_count > 0) free_block_count -= 1;
-}
-
-// === Coalesce ===
-
-// Physically-prev block addr (only valid if PREV_FREE set in our header).
-inline fn prevPhysAddr(addr: usize) usize {
-    const prev_size = readFooterAt(addr - FOOTER_SIZE);
-    return addr - (prev_size & SIZE_MASK);
-}
-
-// === Init ===
 
 pub fn init() void {
     spinlock.registerLock("heap.lock", &lock);
-    // One big free block covering the whole heap, minus the sentinel wall
-    // at the very end (see WALL_ADDR).
-    const big_size = WALL_ADDR - HEAP_START;
-
-    writeHeader(HEAP_START, big_size, true, false);
-    writeFooter(HEAP_START);
-    nextFreePtr(HEAP_START).* = 0;
-    prevFreePtr(HEAP_START).* = 0;
-
-    // Sentinel "wall" — allocated, never freed, PREV_FREE set (the big
-    // block in front of it IS free initially).
-    writeHeader(WALL_ADDR, MIN_BLOCK_SIZE, false, true);
-
-    fl_bitmap = 0;
-    @memset(sl_bitmaps[0..], 0);
-    for (&free_lists) |*row| {
-        @memset(row[0..], 0);
-    }
-    free_bytes_remaining = big_size;
-    free_block_count = 0;
-    largest_free_block = 0;
-    insertFreeBlock(HEAP_START);
-
+    core.init(HEAP_START, HEAP_SIZE);
     initialized = true;
-    debug.klog("[tlsf] Initialized: 0x{X:0>16} - 0x{X:0>16} ({d} KB heap, big_block={d} KB, FL={d} SL={d})\n", .{ HEAP_START, HEAP_START + HEAP_SIZE, HEAP_SIZE / 1024, big_size / 1024, FL_INDEX_COUNT, SL_INDEX_COUNT });
+    debug.klog("[tlsf] Initialized: 0x{X:0>16} - 0x{X:0>16} ({d} KB heap, big_block={d} KB, FL={d} SL={d})\n", .{ HEAP_START, HEAP_START + HEAP_SIZE, HEAP_SIZE / 1024, core.free_bytes / 1024, tlsf.FL_INDEX_COUNT, tlsf.SL_INDEX_COUNT });
 }
 
 inline fn alignUp(addr: usize, alignment: usize) usize {
-    if (alignment == 0) return addr;
     return (addr + alignment - 1) & ~(alignment - 1);
+}
+
+/// Report structural corruption the core stopped at (core.fault), drop the
+/// lock and panic. Releasing first keeps the lock-dump autopsy clean: Zig's
+/// @panic does not unwind, so a deferred release would never run.
+fn corruptPanic(irq_flags: u64) noreturn {
+    switch (core.fault) {
+        .links => |f| {
+            serial.print("\n!!! HEAP CORRUPTION: free block 0x{X:0>16} links next=0x{X} prev=0x{X} don't point back (use-after-free write?)\n", .{ f.block, f.next, f.prev });
+            kdbg.attributeHeapCorruptor(f.block + 8);
+            lock.releaseIrqRestore(irq_flags);
+            @panic("tlsf: free-list links corrupted");
+        },
+        .footer => |f| {
+            serial.print("\n!!! HEAP CORRUPTION: footer before 0x{X:0>16} decodes to prev=0x{X:0>16}\n", .{ f.block, f.prev });
+            kdbg.attributeHeapCorruptor(f.block - tlsf.FOOTER_SIZE);
+            lock.releaseIrqRestore(irq_flags);
+            @panic("tlsf: prev-block footer corrupted — heap underflow");
+        },
+    }
 }
 
 // === Public allocator API ===
@@ -356,8 +103,8 @@ pub fn kmalloc(size: usize) ?[*]u8 {
 }
 
 /// Allocate `size` bytes with the given alignment. Alignments up to and
-/// including BLOCK_ALIGN (16) are natural; higher alignments carve a
-/// front-pad off a larger block (so kfree's scan-back finds the header).
+/// including 16 are natural; higher alignments carve a front pad off a
+/// larger block (so kfree's scan-back finds the header).
 pub fn kmallocAligned(size: usize, alignment: usize) ?[*]u8 {
     if (!initialized or size == 0) {
         debug.klog("[tlsf] alloc fail: init={} size={d}\n", .{ initialized, size });
@@ -369,605 +116,214 @@ pub fn kmallocAligned(size: usize, alignment: usize) ?[*]u8 {
         return null;
     }
     // Reject absurd requests up front: nothing past this point can succeed,
-    // and the size arithmetic below (prefix sums, the u32 user_size store)
-    // would otherwise trip ReleaseSafe overflow panics mid-computation
-    // instead of failing the documented way (log + null).
+    // and the size arithmetic (prefix sums, the u32 user_size store) would
+    // otherwise trip ReleaseSafe overflow panics instead of log + null.
     if (size > HEAP_SIZE or alignment > HEAP_SIZE) {
         debug.klog("[tlsf] alloc fail: size={d} align={d} exceeds heap ({d})\n", .{ size, alignment, HEAP_SIZE });
         return null;
     }
     const irq_flags = lock.acquireIrqSave();
-    defer lock.releaseIrqRestore(irq_flags);
-
-    // Round the user request to a block size including our 16-byte prefix
-    // (header + user_size + canary_head) and 4-byte tail canary, then
-    // 16-byte align. Minimum a block can be is MIN_BLOCK_SIZE so future
-    // recycling works.
-    const min_user_block = alignUp(USER_OFFSET + size + CANARY_TAIL_SIZE, BLOCK_ALIGN);
-    const need_block = if (min_user_block < MIN_BLOCK_SIZE) MIN_BLOCK_SIZE else min_user_block;
-
-    // For alignment > 16, we need extra room to carve a front-pad so the
-    // user pointer lands aligned. Worst-case extra = alignment +
-    // MIN_BLOCK_SIZE (split-front needs MIN_BLOCK_SIZE to be its own free
-    // block, or we waste it inside the alloc).
-    const search_size = if (alignment > BLOCK_ALIGN)
-        need_block + alignment + MIN_BLOCK_SIZE
-    else
-        need_block;
-
-    const rounded = mappingAllocRoundUp(search_size);
-    const m = mapping(rounded);
-    const found = searchSuitableBlock(m.fl, m.sl) orelse {
-        debug.klog("[tlsf] alloc fail: no block for size={d} align={d} need_block={d} search={d}\n", .{ size, alignment, need_block, search_size });
-        // largest_free_block is a stale upper bound between recomputes —
-        // refresh it so the OOM post-mortem shows the real ceiling.
-        recomputeLargestFreeBlock();
-        debug.klog("[tlsf]   fl_bitmap=0x{X} free_blocks={d} free_bytes={d} largest={d}\n", .{ fl_bitmap, free_block_count, free_bytes_remaining, largest_free_block });
-        return null;
-    };
-
-    const block_addr = free_lists[found.fl][found.sl];
-    removeFreeBlock(block_addr);
-    const block_sz = blockSize(block_addr);
-
-    // Determine user pointer position. Naturally at block_addr + USER_OFFSET.
-    // For higher alignment, shift up; the bytes between USER_OFFSET and the
-    // aligned user pointer are dead inside the allocation.
-    var user_ptr: usize = block_addr + USER_OFFSET;
-    var alloc_block_addr: usize = block_addr;
-    if (alignment > BLOCK_ALIGN) {
-        const aligned = alignUp(user_ptr, alignment);
-        // If we can carve a real front block (>= MIN_BLOCK_SIZE) before our
-        // aligned position, do so — that buys back the front padding.
-        const front_size: usize = (aligned - USER_OFFSET) - block_addr;
-        if (front_size >= MIN_BLOCK_SIZE) {
-            // Split: front becomes a free block, back is our alloc.
-            const new_block = aligned - USER_OFFSET;
-            const back_size = block_sz - front_size;
-            // PREV_FREE flag on front: inherit from this block (which had
-            // none, since we just removed it from the free list and it now
-            // becomes the new front).
-            const prev_free_into_front = blockPrevFree(block_addr);
-            writeHeader(block_addr, front_size, true, prev_free_into_front);
-            writeFooter(block_addr);
-            // Back block: PREV_FREE = true (the front we just made is free).
-            writeHeader(new_block, back_size, false, true);
-            insertFreeBlock(block_addr);
-            alloc_block_addr = new_block;
-            user_ptr = aligned;
-        } else {
-            // Front-pad too small to split; bury it inside the allocation.
-            // user_ptr advances to aligned; alloc_block_addr stays at
-            // block_addr; the alloc just wastes (aligned - (block_addr +
-            // USER_OFFSET)) bytes between USER_OFFSET and user_ptr.
-            user_ptr = aligned;
-        }
+    const r = core.alloc(size, alignment) catch corruptPanic(irq_flags);
+    if (r == .ok) {
+        alloc_count += 1;
+        current_alloc += 1;
+        current_bytes += size;
+        if (current_alloc > peak_alloc) peak_alloc = current_alloc;
+        if (current_bytes > peak_bytes) peak_bytes = current_bytes;
+        kasan.allocHook(r.ok, size);
     }
-
-    const cur_block_sz = blockSize(alloc_block_addr);
-
-    // Try to split off the tail if the remainder is its own block.
-    const consumed = (user_ptr - alloc_block_addr) + size + CANARY_TAIL_SIZE;
-    const consumed_aligned = alignUp(consumed, BLOCK_ALIGN);
-    const consumed_clamped = if (consumed_aligned < MIN_BLOCK_SIZE) MIN_BLOCK_SIZE else consumed_aligned;
-    const final_block_size: usize = blk: {
-        if (cur_block_sz >= consumed_clamped + MIN_BLOCK_SIZE) {
-            const remainder = cur_block_sz - consumed_clamped;
-            const tail_addr = alloc_block_addr + consumed_clamped;
-            // alloc_block_addr: not free, prev_free preserved from cur header.
-            const alloc_prev_free = blockPrevFree(alloc_block_addr);
-            writeHeader(alloc_block_addr, consumed_clamped, false, alloc_prev_free);
-            // Tail becomes a new free block; PREV_FREE = false (we are
-            // allocated now).
-            writeHeader(tail_addr, remainder, true, false);
-            writeFooter(tail_addr);
-            insertFreeBlock(tail_addr);
-            // Update the block AFTER the tail to reflect prev=free.
-            if (tail_addr + remainder < HEAP_START + HEAP_SIZE) {
-                setPrevFreeFlag(tail_addr + remainder, true);
-            }
-            break :blk consumed_clamped;
-        } else {
-            const alloc_prev_free = blockPrevFree(alloc_block_addr);
-            writeHeader(alloc_block_addr, cur_block_sz, false, alloc_prev_free);
-            // Block AFTER our alloc must now see PREV_FREE = false.
-            if (alloc_block_addr + cur_block_sz < HEAP_START + HEAP_SIZE) {
-                setPrevFreeFlag(alloc_block_addr + cur_block_sz, false);
-            }
-            break :blk cur_block_sz;
-        }
-    };
-
-    // Write per-alloc metadata (user_size + canary_head) right after the
-    // header. For natural alignment these sit at block+8..block+16.
-    // For over-aligned, they sit at user_ptr - 8..user_ptr (we always
-    // place them immediately before user_ptr so kfree can find them via
-    // a fixed offset).
-    const us_ptr: *u32 = @ptrFromInt(user_ptr - 8);
-    const ch_ptr: *u32 = @ptrFromInt(user_ptr - 4);
-    us_ptr.* = @intCast(size);
-    ch_ptr.* = CANARY_HEAD;
-
-    // Tail canary right after user data (may be unaligned).
-    const tail_ptr: *align(1) u32 = @ptrFromInt(user_ptr + size);
-    tail_ptr.* = CANARY_TAIL;
-
-    // Stats.
-    alloc_count += 1;
-    current_alloc += 1;
-    current_bytes += size;
-    if (current_alloc > peak_alloc) peak_alloc = current_alloc;
-    if (current_bytes > peak_bytes) peak_bytes = current_bytes;
-    free_bytes_remaining -= final_block_size;
-
-    kasan.allocHook(user_ptr, size);
-    return @ptrFromInt(user_ptr);
+    lock.releaseIrqRestore(irq_flags);
+    switch (r) {
+        .ok => |user_ptr| return @ptrFromInt(user_ptr),
+        .oom => |o| {
+            // Logged after the unlock: serial output with IRQs off stalls
+            // every CPU that wants the heap.
+            debug.klog("[tlsf] alloc fail: no block for size={d} align={d} need_block={d} search={d}\n", .{ size, alignment, o.need_block, o.search });
+            debug.klog("[tlsf]   fl_bitmap=0x{X} free_blocks={d} free_bytes={d} largest={d}\n", .{ o.fl_bitmap, o.free_blocks, o.free_bytes, o.largest });
+            return null;
+        },
+    }
 }
 
 /// Free a block previously allocated via kmalloc/kmallocAligned.
 pub fn kfree(ptr: [*]u8) void {
     if (!initialized) return;
     const addr = @intFromPtr(ptr);
-    // The sentinel wall occupies the last MIN_BLOCK_SIZE bytes of the heap
-    // and is intentionally never user-visible. Reject pointers into it so a
-    // stale ptr can't trick scan-back into reading the wall's header and
-    // then freeing the real block in front of it (H5).
-    if (addr < HEAP_START or addr >= WALL_ADDR) return;
+    // Pointers into the wall are rejected too, so a stale ptr can't trick
+    // scan-back into reading the wall's header and freeing the real block
+    // in front of it (H5).
+    if (addr < HEAP_START or addr >= WALL_ADDR) {
+        const ra = @returnAddress();
+        if (@import("../debug/symbols.zig").resolveKernelNearest(@as(u64, ra))) |sym| {
+            serial.print("[tlsf] kfree: ptr 0x{X} outside the heap — ignored (caller {s}+0x{X})\n", .{ addr, sym.name, sym.offset });
+        } else {
+            serial.print("[tlsf] kfree: ptr 0x{X} outside the heap — ignored (caller RA 0x{X})\n", .{ addr, ra });
+        }
+        return;
+    }
     const irq_flags = lock.acquireIrqSave();
-    defer lock.releaseIrqRestore(irq_flags);
 
-    // Find block_addr by scanning back from (addr - USER_OFFSET) at 16-byte
-    // grains. TWO grains suffice, provably: kmallocAligned yields exactly
-    // two layouts. Natural (alignment <= 16, or an over-aligned request
-    // whose front pad reached MIN_BLOCK_SIZE and was split off as its own
-    // free block): user_ptr = block + USER_OFFSET — header on the first
-    // probe. Buried pad (over-aligned, pad too small to split): the pad is
-    // a nonzero 16-multiple < MIN_BLOCK_SIZE=32, i.e. exactly 16 — header
-    // one grain lower. A miss within two grains is a wild pointer; keeping
-    // the limit tight fails wild frees fast and gives stale user bytes no
-    // room to masquerade as a header.
-    const SCAN_LIMIT: usize = 2 * BLOCK_ALIGN;
-    var block_addr: usize = (addr - USER_OFFSET) & ~BLOCK_ALIGN_MASK;
-    var found = false;
-    var scanned: usize = 0;
-    while (scanned < SCAN_LIMIT) : (scanned += BLOCK_ALIGN) {
-        if (block_addr < HEAP_START) break; // ran off the heap start → wild
-        const hdr_raw = headerPtr(block_addr).*;
-        const sz = hdr_raw & SIZE_MASK;
-        const this_free = (hdr_raw & FLAG_THIS_FREE) != 0;
-        // Containment check (H1): the user pointer must actually live inside
-        // this candidate block — addr >= block_addr + USER_OFFSET (post-
-        // header) and addr < block_addr + sz (before block end). Without
-        // this, a stale ptr whose addr-4 happens to be 0xDEADBEEF could
-        // free the wrong block.
-        if (!this_free and sz >= MIN_BLOCK_SIZE and sz <= HEAP_SIZE and
-            block_addr + sz <= HEAP_START + HEAP_SIZE and
-            addr >= block_addr + USER_OFFSET and addr < block_addr + sz)
-        {
-            const ch: *const u32 = @ptrFromInt(addr - 4);
-            if (ch.* == CANARY_HEAD) {
-                found = true;
-                break;
-            }
-        }
-        if (block_addr <= HEAP_START) break; // next step would leave the heap
-        block_addr -= BLOCK_ALIGN;
-    }
-    if (!found) {
-        // Wild free: pointer doesn't sit inside any live block we can
-        // scan back to. Causes: kfree(p + offset) on a non-allocation
-        // boundary; kfree on a stack/static/userspace pointer; double-
-        // free racing a different freer. Either way it's a real kernel
-        // bug — surface loud instead of silently leaking. Matches the
-        // tail-canary panic policy a few lines below (consistent: every
-        // heap-corruption class fails the same way).
-        serial.print("[tlsf] free: no header for ptr 0x{X:0>16} (scan {d} bytes)\n", .{ addr, scanned });
-        // Auto-bisect — what alloc/free events touched this frame recently?
-        // For the no-header case it most often points at "the kernel heap
-        // tore through whoever owns this page" so the surfacing is doubly
-        // useful.
-        kdbg.attributeHeapCorruptor(addr);
-        // Release before @panic: Zig's @panic does not unwind, so the
-        // outer `defer lock.releaseIrqRestore` would never run and the
-        // lock-dump autopsy reports heap.lock as held. Cosmetic (kernel
-        // halts either way), but a clean lock-dump is worth two lines.
-        lock.releaseIrqRestore(irq_flags);
-        @panic("tlsf: kfree on non-heap or non-block-aligned pointer");
-    }
-
-    // Validate canaries.
-    const us_ptr: *const u32 = @ptrFromInt(addr - 8);
-    const user_size: usize = us_ptr.*;
-    const tail_addr = addr + user_size;
-    if (tail_addr + 4 <= HEAP_START + HEAP_SIZE) {
-        const tail_ptr: *align(1) const u32 = @ptrFromInt(tail_addr);
-        if (tail_ptr.* != CANARY_TAIL) {
-            serial.print("\n!!! HEAP CORRUPTION: tail canary at 0x{X:0>16}: got 0x{X:0>8} want 0x{X:0>8} (user_size={d} block=0x{X:0>16})\n", .{ tail_addr, tail_ptr.*, CANARY_TAIL, user_size, block_addr });
-            // Auto-bisect: surface the most-recent alloc/free for this frame
-            // and a window-event count, so the human sees the strongest
-            // culprit immediately rather than greping the rings by hand.
-            kdbg.attributeHeapCorruptor(tail_addr);
-            // Release before @panic — same reason as the no-header path.
+    // Each @panic below releases the lock first — see corruptPanic.
+    const block_addr = switch (core.locate(addr)) {
+        .block => |b| b,
+        .double_free => {
+            serial.print("\n!!! HEAP: double free of ptr 0x{X:0>16}\n", .{addr});
+            kdbg.attributeHeapCorruptor(addr);
             lock.releaseIrqRestore(irq_flags);
-            @panic("tlsf: buffer overflow — tail canary corrupted");
+            @panic("tlsf: double free");
+        },
+        .wild => {
+            // No live block starts here: kfree(p + offset), a stack/static
+            // pointer, or a block already reused after its free. A real
+            // kernel bug either way — loud, like every heap-corruption class.
+            serial.print("[tlsf] free: no header for ptr 0x{X:0>16}\n", .{addr});
+            // Auto-bisect — what alloc/free events touched this frame
+            // recently? Often "the kernel heap tore through whoever owns
+            // this page".
+            kdbg.attributeHeapCorruptor(addr);
+            lock.releaseIrqRestore(irq_flags);
+            @panic("tlsf: kfree on non-heap or non-block-aligned pointer");
+        },
+    };
+
+    const user_size = tlsf.Tlsf.userSize(addr);
+    if (core.tailFault(block_addr, addr)) |f| {
+        switch (f) {
+            .size_overflows_block => serial.print("\n!!! HEAP CORRUPTION: user_size={d} overflows block 0x{X:0>16} (size {d}, ptr 0x{X:0>16})\n", .{ user_size, block_addr, tlsf.blockSize(block_addr), addr }),
+            .canary => serial.print("\n!!! HEAP CORRUPTION: tail canary at 0x{X:0>16}: got 0x{X:0>8} want 0x{X:0>8} (user_size={d} block=0x{X:0>16})\n", .{ addr + user_size, @as(*align(1) const u32, @ptrFromInt(addr + user_size)).*, tlsf.CANARY_TAIL, user_size, block_addr }),
         }
+        // Auto-bisect: the most-recent alloc/free for this frame and a
+        // window-event count, so the strongest culprit shows immediately.
+        kdbg.attributeHeapCorruptor(if (f == .canary) addr + user_size else addr - 8);
+        lock.releaseIrqRestore(irq_flags);
+        @panic(if (f == .canary) "tlsf: buffer overflow — tail canary corrupted" else "tlsf: user_size corrupted");
     }
 
-    // Stats.
     free_count += 1;
     if (current_alloc > 0) current_alloc -= 1;
     if (current_bytes >= user_size) current_bytes -= user_size;
-
     kasan.freeHook(addr, user_size);
 
-    // Coalesce-backward via PREV_FREE flag + footer.
-    // We add only `freed_size` (the block being released) to
-    // free_bytes_remaining at the end — the prev/next neighbors we
-    // merge with were ALREADY counted in free_bytes_remaining (they
-    // were free), and removeFreeBlock doesn't decrement that field,
-    // so adding `merge_size` would double-count them. Caught when
-    // `Free: 233546 KB` showed up on a 16 MB heap.
-    const freed_size: usize = blockSize(block_addr);
-    var merge_addr = block_addr;
-    var merge_size = freed_size;
-    if (blockPrevFree(block_addr)) {
-        const prev_addr = prevPhysAddr(block_addr);
-        // The footer is allocator-owned, but it borders the previous
-        // block's user region — a heap underflow shreds it, and then
-        // prev_addr is garbage. Structurally-insane values get the same
-        // loud treatment as the canary paths above: a silent merge-skip
-        // would leave adjacent free blocks and let the corruption
-        // metastasize until validateInvariants trips much later.
-        if (prev_addr < HEAP_START or prev_addr >= block_addr or
-            (prev_addr & BLOCK_ALIGN_MASK) != 0)
-        {
-            serial.print("\n!!! HEAP CORRUPTION: footer before 0x{X:0>16} decodes to prev=0x{X:0>16}\n", .{ block_addr, prev_addr });
-            kdbg.attributeHeapCorruptor(block_addr - FOOTER_SIZE);
-            // Release before @panic — same reason as the paths above.
-            lock.releaseIrqRestore(irq_flags);
-            @panic("tlsf: prev-block footer corrupted — heap underflow");
-        }
-        if (blockIsFree(prev_addr)) {
-            removeFreeBlock(prev_addr);
-            merge_addr = prev_addr;
-            merge_size = blockSize(prev_addr) + merge_size;
-        }
-    }
-    // Coalesce-forward.
-    const next_addr = merge_addr + merge_size;
-    if (next_addr < HEAP_START + HEAP_SIZE) {
-        if (blockIsFree(next_addr)) {
-            removeFreeBlock(next_addr);
-            merge_size += blockSize(next_addr);
-        }
-    }
-
-    // Write the new (possibly merged) free block.
-    const prev_free_for_merged = blockPrevFree(merge_addr);
-    writeHeader(merge_addr, merge_size, true, prev_free_for_merged);
-    writeFooter(merge_addr);
-    insertFreeBlock(merge_addr);
-    free_bytes_remaining += freed_size;
-    // Update the block AFTER the merged region: its PREV_FREE must be true.
-    const after = merge_addr + merge_size;
-    if (after < HEAP_START + HEAP_SIZE) {
-        setPrevFreeFlag(after, true);
-    }
+    core.release(block_addr, addr) catch corruptPanic(irq_flags);
+    lock.releaseIrqRestore(irq_flags);
 }
 
-// === Heap walk / validation ===
-
-fn recomputeLargestFreeBlock() void {
-    var best: usize = 0;
-    var i: usize = FL_INDEX_COUNT;
-    while (i > 0) {
-        i -= 1;
-        if ((fl_bitmap & (@as(u32, 1) << @intCast(i))) == 0) continue;
-        var j: usize = SL_INDEX_COUNT;
-        while (j > 0) {
-            j -= 1;
-            if ((sl_bitmaps[i] & (@as(u16, 1) << @intCast(j))) == 0) continue;
-            var p = free_lists[i][j];
-            while (p != 0) {
-                const addr = p;
-                const sz = blockSize(addr);
-                if (sz > best) best = sz;
-                p = nextFreePtr(addr).*;
-            }
-        }
-    }
-    largest_free_block = best;
-}
+// === Validation ===
 
 /// Walk the entire heap, validate every block's header consistency, every
-/// allocated block's canaries (head AND tail, both layouts — the sentinel
-/// wall is the one exemption), and prev-free flag agreement.
+/// allocated block's canaries, and prev-free flag agreement.
 pub fn validateHeap() bool {
     if (!initialized) return true;
     const irq_flags = lock.acquireIrqSave();
     defer lock.releaseIrqRestore(irq_flags);
-    return validateHeapLocked();
+    return core.validateBlocks(serial);
 }
 
-fn validateHeapLocked() bool {
-    var errors: u32 = 0;
-    var addr: usize = HEAP_START;
-    var prev_was_free: bool = false;
-    while (addr < HEAP_START + HEAP_SIZE) {
-        const sz = blockSize(addr);
-        if (sz < MIN_BLOCK_SIZE or (sz & BLOCK_ALIGN_MASK) != 0 or
-            addr + sz > HEAP_START + HEAP_SIZE)
-        {
-            serial.print("[tlsf] validate: bad size {d} at 0x{X:0>16}\n", .{ sz, addr });
-            errors += 1;
-            break;
-        }
-        const pf = blockPrevFree(addr);
-        if (pf != prev_was_free) {
-            serial.print("[tlsf] validate: prev-free flag mismatch at 0x{X:0>16} (have {} want {})\n", .{ addr, pf, prev_was_free });
-            errors += 1;
-        }
-        if (blockIsFree(addr)) {
-            // Footer must match.
-            const f = readFooterAt(addr + sz - FOOTER_SIZE) & SIZE_MASK;
-            if (f != sz) {
-                serial.print("[tlsf] validate: footer mismatch at 0x{X:0>16}: {d} vs {d}\n", .{ addr, f, sz });
-                errors += 1;
-            }
-            prev_was_free = true;
-        } else if (addr != WALL_ADDR) {
-            // Allocated block: full canary validation. Only two layouts
-            // exist (proof at kfree's scan-back): natural — user_ptr at
-            // addr+USER_OFFSET, canary_head at +12 — or buried-pad (over-
-            // aligned alloc, exactly one dead grain) — user_ptr at
-            // addr+USER_OFFSET+16, canary_head at +28. Natural is checked
-            // first: for buried blocks +12 holds the upper half of a stale
-            // freelist link (a kernel VA or 0), never CANARY_HEAD, so the
-            // order can't misattribute. Both probe offsets sit inside the
-            // block (sz >= MIN_BLOCK_SIZE = 32).
-            const BURIED_USER_OFFSET: usize = USER_OFFSET + BLOCK_ALIGN;
-            const ch_nat: *const u32 = @ptrFromInt(addr + USER_OFFSET - 4);
-            const ch_pad: *const u32 = @ptrFromInt(addr + BURIED_USER_OFFSET - 4);
-            const user_off: usize = if (ch_nat.* == CANARY_HEAD)
-                USER_OFFSET
-            else if (ch_pad.* == CANARY_HEAD)
-                BURIED_USER_OFFSET
-            else blk: {
-                serial.print("[tlsf] validate: head canary missing at 0x{X:0>16} (sz={d})\n", .{ addr, sz });
-                errors += 1;
-                break :blk 0;
-            };
-            if (user_off != 0) {
-                const us: *const u32 = @ptrFromInt(addr + user_off - 8);
-                const user_size: usize = us.*;
-                if (user_off + user_size + CANARY_TAIL_SIZE > sz) {
-                    serial.print("[tlsf] validate: user_size {d} overflows block at 0x{X:0>16} (sz={d})\n", .{ user_size, addr, sz });
-                    errors += 1;
-                } else {
-                    const tail: *align(1) const u32 = @ptrFromInt(addr + user_off + user_size);
-                    if (tail.* != CANARY_TAIL) {
-                        serial.print("[tlsf] validate: tail canary at 0x{X:0>16}: got 0x{X:0>8} want 0x{X:0>8}\n", .{ addr + user_off + user_size, tail.*, CANARY_TAIL });
-                        errors += 1;
-                    }
-                }
-            }
-            prev_was_free = false;
-        } else {
-            // The sentinel wall: allocated forever, carries no canaries.
-            prev_was_free = false;
-        }
-        addr += sz;
-    }
-    return errors == 0;
-}
-
-/// Re-derive the heap's free-pool counters (free_bytes_remaining,
-/// free_block_count, largest_free_block) from a full block walk and
-/// verify they match the incrementally-maintained globals. Catches the
-/// class of bug where alloc/free arithmetic on the counters drifts from
-/// reality — silent until someone notices a weird number (e.g. the 2026-
-/// 05-24 TLSF double-count-on-coalesce that reported Free: 233546 KB on
-/// a 16 MB heap). Returns true if all invariants hold; logs detailed
-/// diff to serial otherwise.
-///
-/// Takes the heap lock — safe to call from anywhere outside the heap's
-/// own internal critical sections. Bounded O(blocks).
+/// Re-derive the free-pool counters from a full block walk and compare with
+/// the incrementally-maintained ones. Catches counter drift that is silent
+/// until someone notices a weird number (the 2026-05-24 double count
+/// reported Free: 233546 KB on a 16 MB heap).
 pub fn validateInvariants() bool {
     if (!initialized) return true;
     const irq_flags = lock.acquireIrqSave();
     defer lock.releaseIrqRestore(irq_flags);
-    return validateInvariantsLocked();
+    return core.validateCounters(serial);
 }
 
-fn validateInvariantsLocked() bool {
-    var walked_free_bytes: u64 = 0;
-    var walked_free_blocks: u32 = 0;
-    var walked_largest: usize = 0;
-    var walked_alloc_bytes: u64 = 0;
-    var addr: usize = HEAP_START;
-    while (addr < HEAP_START + HEAP_SIZE) {
-        const sz = blockSize(addr);
-        if (sz < MIN_BLOCK_SIZE or addr + sz > HEAP_START + HEAP_SIZE) {
-            serial.print("[tlsf] inv: walk derailed at 0x{X:0>16} (sz={d}) — structural corruption, can't audit\n", .{ addr, sz });
-            return false;
-        }
-        if (blockIsFree(addr)) {
-            walked_free_bytes += sz;
-            walked_free_blocks += 1;
-            if (sz > walked_largest) walked_largest = sz;
-        } else {
-            walked_alloc_bytes += sz;
-        }
-        addr += sz;
-    }
-
-    var ok = true;
-    if (walked_free_bytes != free_bytes_remaining) {
-        serial.print("[tlsf] inv: free_bytes_remaining={d} but walk says {d} (delta={d})\n", .{ free_bytes_remaining, walked_free_bytes, @as(i64, @intCast(free_bytes_remaining)) - @as(i64, @intCast(walked_free_bytes)) });
-        ok = false;
-    }
-    if (walked_free_blocks != free_block_count) {
-        serial.print("[tlsf] inv: free_block_count={d} but walk says {d}\n", .{ free_block_count, walked_free_blocks });
-        ok = false;
-    }
-    if (walked_largest != largest_free_block) {
-        // largest_free_block is an upper bound between recomputes; only
-        // flag if the global is SMALLER than the actual max (i.e. lying
-        // about available space).
-        if (largest_free_block < walked_largest) {
-            serial.print("[tlsf] inv: largest_free_block={d} but walk found {d}\n", .{ largest_free_block, walked_largest });
-            ok = false;
-        }
-    }
-    // Cross-check: walked free + walked alloc must equal the whole heap
-    // (the sentinel wall block is counted in walked_alloc).
-    const total = walked_free_bytes + walked_alloc_bytes;
-    if (total != HEAP_SIZE) {
-        serial.print("[tlsf] inv: walked free+alloc={d} but heap size is {d}\n", .{ total, HEAP_SIZE });
-        ok = false;
-    }
-    return ok;
-}
-
-/// Walk every populated `free_lists[fl][sl]` doubly-linked list and verify:
-///   1. each link points inside the heap
-///   2. each block has THIS_FREE set (i.e. the block IS actually free)
-///   3. `mapping(blockSize(p)) == (fl, sl)` (block is in the correct bucket)
-///   4. `prevFreePtr(head) == 0` (head's prev link is null sentinel)
-///   5. `prevFreePtr(next) == current` (back-link symmetry through the chain)
-///   6. fl_bitmap/sl_bitmaps[fl] bits are consistent with free_lists[fl][sl]
-///      (`bit set ⇔ head != 0`)
-///   7. total visited free blocks equals `free_block_count` (no orphans, no
-///      cycles — guarded by a max-iteration ceiling).
-///
-/// Catches the class of bug where freelist link metadata is corrupted by an
-/// out-of-bounds write, type-width regression (the 2026-05-28 `?usize` overlap
-/// bug would have failed step 1 — `nextFreePtr` would have loaded a non-heap
-/// pointer immediately after the first conflicting insert), or coalesce path
-/// that forgets to detach a neighbour before merging.
-///
-/// Returns true if all invariants hold. Bounded O(free_blocks) — same cost as
-/// `recomputeLargestFreeBlock`. Holds the heap lock — safe from anywhere
-/// outside the heap's own internal critical sections.
+/// Walk every free list: links, THIS_FREE, bucket membership, back-links,
+/// bitmaps, visit count vs the counter.
 pub fn validateFreelists() bool {
     if (!initialized) return true;
     const irq_flags = lock.acquireIrqSave();
     defer lock.releaseIrqRestore(irq_flags);
-    return validateFreelistsLocked();
+    return core.validateFreelists(serial);
 }
 
-fn validateFreelistsLocked() bool {
-    var ok = true;
-    var visited: u32 = 0;
-    // Outer iteration cap: free_block_count is the authoritative-by-design
-    // count, but the bug we're trying to catch is "counter lies". Cap at
-    // free_block_count + a slack of 16 so a small overshoot still completes
-    // and reports the issue rather than spinning.
-    const max_visit: u32 = free_block_count + 16;
+/// Boot self-test of kfree's corruption detectors. Probes locate, tailFault
+/// and linksIntact directly, so nothing panics; every probe that writes
+/// restores the byte before the lock drops.
+pub fn selfTest() void {
+    const a = kmalloc(48) orelse return selfTestFail("kmalloc a");
+    const b = kmalloc(48) orelse return selfTestFail("kmalloc b");
+    const c = kmalloc(48) orelse return selfTestFail("kmalloc c");
+    @memset(c[0..48], 0); // no stale header/canary bytes in c's user area
+    kfree(a);
+    kfree(b); // after a: merges backward when the two are neighbours
+    const pa = @intFromPtr(a);
+    const pb = @intFromPtr(b);
+    const pc = @intFromPtr(c);
 
-    var fl: usize = 0;
-    while (fl < FL_INDEX_COUNT) : (fl += 1) {
-        const fl_set = (fl_bitmap & (@as(u32, 1) << @intCast(fl))) != 0;
-        const sl_word = sl_bitmaps[fl];
-        // Invariant: fl_bitmap bit is set iff sl_bitmaps[fl] != 0.
-        if (fl_set != (sl_word != 0)) {
-            serial.print("[tlsf] fl-inv: fl_bitmap[{d}]={any} but sl_bitmaps[{d}]=0x{X}\n", .{ fl, fl_set, fl, sl_word });
-            ok = false;
-        }
-        var sl: usize = 0;
-        while (sl < SL_INDEX_COUNT) : (sl += 1) {
-            const sl_set = (sl_word & (@as(u16, 1) << @intCast(sl))) != 0;
-            const head = free_lists[fl][sl];
-            // Invariant: sl_bitmaps[fl] bit j set iff free_lists[fl][j] != 0.
-            if (sl_set != (head != 0)) {
-                serial.print("[tlsf] fl-inv: sl_bitmaps[{d}][{d}]={any} but head=0x{X}\n", .{ fl, sl, sl_set, head });
-                ok = false;
-                continue;
-            }
-            if (head == 0) continue;
+    const bad: ?[]const u8 = blk: {
+        const flags = lock.acquireIrqSave();
+        defer lock.releaseIrqRestore(flags);
+        if (core.locate(pb) != .double_free) break :blk "second free of b not caught";
+        if (core.locate(pa) != .double_free) break :blk "second free of a not caught";
+        const lc = core.locate(pc);
+        if (lc != .block) break :blk "live c not located";
+        if (core.locate(pc + 16) != .wild) break :blk "interior pointer not wild";
 
-            // Walk this bucket's freelist.
-            var prev: usize = 0;
-            var cur: usize = head;
-            while (cur != 0) {
-                visited += 1;
-                if (visited > max_visit) {
-                    serial.print("[tlsf] fl-inv: bucket [{d}][{d}] over visit cap (cycle? count={d})\n", .{ fl, sl, free_block_count });
-                    return false;
-                }
-                // Bounds.
-                if (cur < HEAP_START or cur >= HEAP_START + HEAP_SIZE) {
-                    serial.print("[tlsf] fl-inv: bucket [{d}][{d}] block 0x{X} out of heap\n", .{ fl, sl, cur });
-                    return false;
-                }
-                // Alignment.
-                if ((cur & BLOCK_ALIGN_MASK) != 0) {
-                    serial.print("[tlsf] fl-inv: bucket [{d}][{d}] block 0x{X} misaligned\n", .{ fl, sl, cur });
-                    ok = false;
-                }
-                // THIS_FREE must be set.
-                if (!blockIsFree(cur)) {
-                    serial.print("[tlsf] fl-inv: bucket [{d}][{d}] block 0x{X} on freelist but THIS_FREE clear\n", .{ fl, sl, cur });
-                    ok = false;
-                }
-                // Bucket-membership.
-                const sz = blockSize(cur);
-                if (sz < MIN_BLOCK_SIZE or sz > HEAP_SIZE) {
-                    serial.print("[tlsf] fl-inv: bucket [{d}][{d}] block 0x{X} bad size {d}\n", .{ fl, sl, cur, sz });
-                    return false;
-                }
-                const want = mapping(sz);
-                if (want.fl != fl or want.sl != sl) {
-                    serial.print("[tlsf] fl-inv: block 0x{X} sz={d} mapped to [{d}][{d}] but is in [{d}][{d}]\n", .{ cur, sz, want.fl, want.sl, fl, sl });
-                    ok = false;
-                }
-                // Back-link symmetry.
-                const cur_prev = prevFreePtr(cur).*;
-                if (cur_prev != prev) {
-                    serial.print("[tlsf] fl-inv: block 0x{X} prev_free=0x{X} but list-prev=0x{X}\n", .{ cur, cur_prev, prev });
-                    ok = false;
-                }
-                prev = cur;
-                cur = nextFreePtr(cur).*;
-            }
-        }
-    }
+        const cb = lc.block;
+        const us: *u32 = @ptrFromInt(pc - 8);
+        const saved_us = us.*;
+        us.* = 0x10000;
+        const f_size = core.tailFault(cb, pc);
+        us.* = saved_us;
+        if (f_size == null or f_size.? != .size_overflows_block) break :blk "oversized user_size passed";
+        const tail: *align(1) u32 = @ptrFromInt(pc + 48);
+        const saved_tail = tail.*;
+        tail.* = saved_tail ^ 1;
+        const f_tail = core.tailFault(cb, pc);
+        tail.* = saved_tail;
+        if (f_tail == null or f_tail.? != .canary) break :blk "tail canary flip passed";
+        if (core.tailFault(cb, pc) != null) break :blk "intact c reported corrupt";
 
-    if (visited != free_block_count) {
-        serial.print("[tlsf] fl-inv: walked {d} blocks across all freelists but counter says {d}\n", .{ visited, free_block_count });
-        ok = false;
-    }
-    return ok;
+        // Any listed free block (a's run at least is one).
+        if (core.fl_bitmap == 0) break :blk "no free block listed";
+        const fl: usize = @ctz(core.fl_bitmap);
+        const fb = core.free_lists[fl][@ctz(core.sl_bitmaps[fl])];
+        if (!core.linksIntact(fb)) break :blk "intact links reported corrupt";
+        const saved_prev = tlsf.prevFreePtr(fb).*;
+        tlsf.prevFreePtr(fb).* = fb; // a UAF write of the block's own address
+        const links_caught = !core.linksIntact(fb);
+        tlsf.prevFreePtr(fb).* = saved_prev;
+        if (!links_caught) break :blk "corrupt prev link passed";
+        break :blk null;
+    };
+    kfree(c);
+    if (bad) |what| return selfTestFail(what);
+    if (!validateHeap() or !validateInvariants() or !validateFreelists()) return selfTestFail("heap validators after the test");
+    debug.klog("[tlsf] self-test: double free (merged + heading its run), wild interior pointer, user_size bound, tail canary, free-list links — VERIFIED\n", .{});
+}
+
+fn selfTestFail(what: []const u8) void {
+    debug.klog("[tlsf] self-test: FAIL — {s}\n", .{what});
 }
 
 // === Stats output ===
 
+/// Fragmentation % = share of free bytes outside the largest free block.
+/// Guarded so an inflated `largest` can never underflow the subtraction.
+fn fragPct(largest: usize, free_bytes: u64) u32 {
+    if (free_bytes == 0) return 0;
+    const ratio = (@as(u64, largest) * 100) / free_bytes;
+    if (ratio >= 100) return 0;
+    return @intCast(100 - ratio);
+}
+
 pub fn printDetailedStats(use_vga: bool) void {
-    // Lock the entire body (H2): the snapshot of free_bytes / largest /
-    // counters and the validateHeap walk both read mutable state.
+    // Lock the entire body (H2): the counter snapshot and the validator
+    // walks both read mutable state.
     const irq_flags = lock.acquireIrqSave();
     defer lock.releaseIrqRestore(irq_flags);
-    // Always force a fresh recompute when displaying — incrementally-
-    // maintained largest_free_block is an UPPER BOUND between recomputes
-    // (it grows on insert, never shrinks on alloc). After we fixed the
-    // free_bytes_remaining double-count bug, an inflated largest could
-    // exceed the (now-accurate) free_bytes and overflow the frag_pct
-    // subtraction below. Recomputing here is O(free_blocks), trivial for
-    // an observability path.
-    recomputeLargestFreeBlock();
-    const free_bytes = free_bytes_remaining;
-    const free_blocks = free_block_count;
-    const largest = largest_free_block;
+    // largest_free is an upper bound between recomputes; displays want the
+    // real value. O(free_blocks), trivial for an observability path.
+    core.recomputeLargestFreeBlock();
+    const free_bytes = core.free_bytes;
+    const free_blocks = core.free_blocks;
+    const largest = core.largest_free;
     const used_bytes = if (HEAP_SIZE > free_bytes) HEAP_SIZE - free_bytes else 0;
     const pct = if (HEAP_SIZE > 0) (used_bytes * 100) / HEAP_SIZE else 0;
-    // Defense-in-depth guard against the same overflow class: even if
-    // someone broke recompute, never let frag_pct's subtraction underflow.
-    const frag_pct: u64 = blk: {
-        if (free_bytes == 0) break :blk 0;
-        const ratio = (largest * 100) / free_bytes;
-        if (ratio >= 100) break :blk 0;
-        break :blk 100 - ratio;
-    };
+    const frag_pct = fragPct(largest, free_bytes);
     if (use_vga) {
         vga.fg = .Yellow;
         vga.print("Heap Statistics (TLSF)\n", .{});
@@ -980,13 +336,13 @@ pub fn printDetailedStats(use_vga: bool) void {
         vga.print("  Peak live:    {d} allocs, {d} bytes\n", .{ peak_alloc, peak_bytes });
         vga.print("  Current:      {d} bytes tracked\n", .{current_bytes});
         vga.fg = .LightGreen;
-        if (validateHeapLocked()) {
+        if (core.validateBlocks(serial)) {
             vga.print("  Integrity:    OK\n", .{});
         } else {
             vga.fg = .LightRed;
             vga.print("  Integrity:    CORRUPTED (see serial)\n", .{});
         }
-        if (validateInvariantsLocked()) {
+        if (core.validateCounters(serial)) {
             vga.fg = .LightGreen;
             vga.print("  Invariants:   OK\n", .{});
         } else {
@@ -1012,31 +368,19 @@ pub const Stats = struct {
 };
 
 pub fn snapshot() Stats {
-    // Full-body lock (M4): the counters are read together; without the
-    // lock, concurrent alloc/free can produce internally-inconsistent
-    // numbers (e.g. free_bytes_remaining and free_block_count from
-    // different instants).
+    // Full-body lock (M4): the counters are read together; unlocked,
+    // concurrent alloc/free could mix values from different instants.
     const irq_flags = lock.acquireIrqSave();
     defer lock.releaseIrqRestore(irq_flags);
-    // Same recompute-always-then-guard pattern as printDetailedStats —
-    // snapshot is an observability path; an accurate `largest` matters
-    // more than a few µs of walk cost.
-    recomputeLargestFreeBlock();
-    const free_bytes = free_bytes_remaining;
-    const used = if (HEAP_SIZE > free_bytes) HEAP_SIZE - free_bytes else 0;
-    const frag: u32 = blk: {
-        if (free_bytes == 0) break :blk 0;
-        const ratio = (@as(u64, largest_free_block) * 100) / free_bytes;
-        if (ratio >= 100) break :blk 0;
-        break :blk @intCast(100 - ratio);
-    };
+    core.recomputeLargestFreeBlock();
+    const free_bytes = core.free_bytes;
     return .{
         .total_bytes = HEAP_SIZE,
-        .used_bytes = used,
+        .used_bytes = if (HEAP_SIZE > free_bytes) HEAP_SIZE - free_bytes else 0,
         .free_bytes = free_bytes,
-        .free_blocks = free_block_count,
-        .largest_free = largest_free_block,
-        .fragmentation_pct = frag,
+        .free_blocks = core.free_blocks,
+        .largest_free = core.largest_free,
+        .fragmentation_pct = fragPct(core.largest_free, free_bytes),
         .live_allocs = current_alloc,
         .peak_allocs = peak_alloc,
     };
@@ -1046,7 +390,7 @@ pub fn printStats() void {
     printDetailedStats(false);
 }
 
-// === kvmalloc / kvfree (PMM-backed, unchanged from prior impl) ===
+// === kvmalloc / kvfree (PMM-backed) ===
 //
 // Routes large allocations through PMM directly: page-rounded contiguous
 // frames, identity-mapped through the physmap, no heap traffic. Right

@@ -94,7 +94,7 @@ pub var kstack_pool_phys_base: usize = 0;
 /// own slot. Limited to ONE outstanding borrow per task; deep nesting
 /// inside ext2/fat32 path-walks needs caller-passed buffers.
 ///
-/// Cost: 4KB × MAX_PROCS = 128KB BSS at MAX_PROCS=32. Trivial.
+/// Cost: 4KB × MAX_PROCS = 256KB BSS at MAX_PROCS=64.
 pub var io_scratch_pool: [MAX_PROCS][4096]u8 align(4096) =
     [_][4096]u8{[_]u8{0} ** 4096} ** MAX_PROCS;
 
@@ -842,26 +842,15 @@ pub fn stackCanaryMismatches() u64 {
     return @atomicLoad(u64, &stack_canary_miss, .monotonic);
 }
 
-/// True if `top` is a plausible kernel_stack_top value — it points at the
-/// HIGH edge of one of kstack_pool's slots, or matches the recorded top of
-/// some heap-allocated kstack (kernel tasks like desktop with non-default
-/// sizes — see createKernelTask). Used by gdt.setTssRsp0 to catch a
-/// corrupted PCB.kernel_stack_top BEFORE it leaks into TSS.RSP0 (which
-/// both the IDT-gate AND the syscall-entry path read).
+/// True if `top` is a plausible kernel_stack_top value — the HIGH edge of
+/// one of kstack_pool's slots, the only place any task's kstack lives (see
+/// createKernelTask). Used by gdt.setTssRsp0 to catch a corrupted
+/// PCB.kernel_stack_top BEFORE it leaks into TSS.RSP0 (which both the
+/// IDT-gate AND the syscall-entry path read).
 pub fn isValidKstackTopShape(top: usize) bool {
     const base = @intFromPtr(&kstack_pool[0]);
     const end = base + MAX_PROCS * KSTACK_SLOT_SIZE;
-    if (top > base and top <= end) {
-        return ((top - base) % KSTACK_SLOT_SIZE) == 0;
-    }
-    // Heap-backed kstacks: scan the per-PID witnesses set at create() time.
-    // Same array `isValidKstackTop` consults for the per-PID exact match —
-    // a heap kstack is just any expected_kstack_tops entry that doesn't sit
-    // in the pool's address range (already handled by the early return).
-    for (expected_kstack_tops) |t| {
-        if (t != 0 and t == top) return true;
-    }
-    return false;
+    return top > base and top <= end and ((top - base) % KSTACK_SLOT_SIZE) == 0;
 }
 
 /// Per-PID expected kernel_stack_top — set ONCE at create() and immutable
