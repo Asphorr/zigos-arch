@@ -93,9 +93,9 @@ pub fn fixupRip(rip: u64) ?u64 {
 ///
 /// Register discipline mirrors msr.zig's working recipe for this toolchain
 /// (Zig 0.15.2 + LLVM 20): generic `r` inputs moved into rsi/rdi/rcx inside
-/// the asm, generic `=r` output, `=m` address publishes, explicit clobbers.
-/// Register-specific outputs alongside `=m` publishes + internal labels are
-/// the known miscompile shape (msr.zig doc has the details). `cld` per the
+/// the asm, ONE generic `=r` output, `=m` address publishes, explicit
+/// clobbers. A second register output next to `=m` ones hits a Zig 0.15.2
+/// bug (msr.zig rdmsrSafe has the details). `cld` per the
 /// boot.asm lesson: never trust inherited DF around rep string ops.
 noinline fn copyRawInner(dst: usize, src: usize, len: usize) usize {
     var rem: usize = undefined;
@@ -134,6 +134,8 @@ noinline fn copyRawInner(dst: usize, src: usize, len: usize) usize {
 /// fault would read as found=true with rem==max and underflow the length
 /// math). So found=false is guaranteed on every fault path. Caller must
 /// reject max==0 (a zero-count rep never runs and never touches flags).
+/// `found` is `=m`, not `=r`: one register output only — see msr.zig
+/// rdmsrSafe for the Zig 0.15.2 bug a second one next to `=m` triggers.
 const StrnlenResult = struct { rem: usize, found: bool };
 
 noinline fn strnlenInner(ptr: usize, max: usize) StrnlenResult {
@@ -155,7 +157,7 @@ noinline fn strnlenInner(ptr: usize, max: usize) StrnlenResult {
         \\ movq %rax, %[found]
         \\ movq %rcx, %[rem]
         : [rem] "=r" (rem),
-          [found] "=r" (found),
+          [found] "=m" (found),
           [frip] "=m" (scan_fault_rip),
           [fxup] "=m" (scan_fixup_rip),
         : [ptr] "r" (ptr),

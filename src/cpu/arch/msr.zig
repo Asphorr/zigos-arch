@@ -52,17 +52,18 @@ pub fn fixupRip(rip: u64) ?u64 {
 /// Read `msr`, returning null if the access raised #GP (MSR not present /
 /// not emulated). Never panics.
 ///
-/// The value is folded from edx:eax into one `=r` output *inside* the asm,
-/// rather than the usual pmu.zig-style split `={eax}`/`={edx}` outputs
-/// combined in Zig. That split form is cleaner, but binding the two
-/// register-specific outputs alongside the `=m` fixup-address publishes and
-/// the internal labels miscompiles on this toolchain (Zig 0.15.2 + LLVM 20:
-/// "Invalid TYPE table: Only named structs can be forward referenced"). The
-/// single-register combine sidesteps it; the perf difference is nil (MSR
-/// access isn't hot). The two `=m` publishes mirror fp.zig's fxsave. On a
-/// #GP at label 1 the handler redirects to label 2 (ok=0); the success path
-/// sets ok=1. %r8 is the address scratch so the MSR-input register (ecx) is
-/// untouched. Modelled on vmx.zig's vmlaunch fixup asm.
+/// Exactly ONE register output (`val`); `ok` and the fixup publishes are
+/// `=m`. Zig 0.15.2 builds an asm's LLVM return struct over ALL its
+/// outputs but fills only the register ones, so ≥2 register outputs next
+/// to any `=m` output leave struct fields typed from uninitialized
+/// compiler memory — "Invalid type" when the garbage points forward in the
+/// type table, a silently wrong type when it doesn't (tools/asm_lint
+/// rejects the shape). With one register output the return type is that
+/// output's own, no struct. The value is folded from edx:eax inside the
+/// asm for the same reason. On a #GP at label 1 the handler redirects to
+/// label 2 (ok=0); the success path sets ok=1. %r8 is the address scratch
+/// so the MSR-input register (ecx) is untouched. Modelled on vmx.zig's
+/// vmlaunch fixup asm.
 ///
 /// noinline is load-bearing: the "fixed instruction site" premise dies if
 /// the compiler inlines this into multiple callers — each instance would
@@ -87,7 +88,7 @@ pub noinline fn rdmsrSafe(msr: u32) ?u64 {
         \\2: movq $0, %[ok]
         \\3:
         : [val] "=r" (value),
-          [ok] "=r" (ok),
+          [ok] "=m" (ok),
           [frip] "=m" (rd_fault_rip),
           [fxup] "=m" (rd_fixup_rip),
         : [msr] "{ecx}" (msr),

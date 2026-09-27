@@ -123,7 +123,78 @@ def check_alignment(tokens: List[Tuple[str, str]], file_path: str, line_no: int)
 
 # Coverage counters for the self-check in main(): a run that captured no
 # multi-line block or no `call` is a run that inspected nothing.
-STATS = {"blocks": 0, "multiline_blocks": 0, "calls": 0}
+STATS = {"blocks": 0, "multiline_blocks": 0, "calls": 0, "asm_outputs": 0}
+
+# ── Output-shape rule ───────────────────────────────────────────────────
+# Zig 0.15.2 builds an asm's LLVM return struct over ALL its outputs but
+# fills only the register (direct) ones. With >=2 register outputs plus any
+# memory (`=m`, passed indirectly) output, the leftover fields are typed
+# from uninitialized compiler memory: LLVM's reader rejects the module
+# ("Invalid type") when the garbage points forward in the type table and
+# silently accepts a wrong type otherwise — the run-to-run "dice" of the
+# 2026 Invalid-type rounds. One register output (no struct) or no memory
+# outputs are both fine. tools/asm_ret_check.py verifies the bitcode.
+
+ASM_START = re.compile(r'\basm\s+(?:volatile\s+)?\(')
+
+
+def asm_outputs_section(text: str, start: int) -> str:
+    """Text of the outputs section of the asm whose `(` ends at `start`:
+    from the first top-level ':' to the next top-level ':' or the closing
+    paren. Skips "..." strings, `\\\\` multiline-string lines and // comments."""
+    i, depth, n = start, 1, len(text)
+    begin = None
+    while i < n:
+        c = text[i]
+        if c == '"':
+            i += 1
+            while i < n and text[i] != '"':
+                i += 2 if text[i] == '\\' else 1
+        elif c == '\\' and text.startswith('\\\\', i):
+            i = text.find('\n', i)
+            if i < 0:
+                break
+        elif c == '/' and text.startswith('//', i):
+            i = text.find('\n', i)
+            if i < 0:
+                break
+        elif c in '([{':
+            depth += 1
+        elif c in ')]}':
+            depth -= 1
+            if depth == 0:
+                return text[begin:i] if begin is not None else ""
+        elif c == ':' and depth == 1:
+            if begin is None:
+                begin = i + 1
+            else:
+                return text[begin:i]
+        i += 1
+    return ""
+
+
+def lint_outputs(text: str, path: Path) -> bool:
+    ok = True
+    for m in ASM_START.finditer(text):
+        outs = asm_outputs_section(text, m.end())
+        direct = memory = 0
+        for cons in re.findall(r'"(=[^"]*)"', outs):
+            STATS["asm_outputs"] += 1
+            bare = re.sub(r'\{[^}]*\}', '', cons)
+            if 'm' in bare:
+                memory += 1
+            else:
+                direct += 1
+        if direct >= 2 and memory >= 1:
+            line_no = text[:m.start()].count('\n') + 1
+            print(
+                f"{path}:{line_no}: asm with {direct} register outputs and {memory} "
+                f"memory output(s) — Zig 0.15.2 emits a garbage return type for this "
+                f"shape (Invalid type). Keep ONE register output; move the rest to =m.",
+                file=sys.stderr,
+            )
+            ok = False
+    return ok
 
 def lint_file(path: Path) -> bool:
     """
@@ -157,6 +228,8 @@ def lint_file(path: Path) -> bool:
         if not check_alignment(tokens, str(path), line_no):
             all_pass = False
 
+    if not lint_outputs(text, path):
+        all_pass = False
     return all_pass
 
 def main():
@@ -183,19 +256,21 @@ def main():
     # Self-check: refuse a vacuous PASS. The kernel has dozens of multi-line
     # trampolines and several `call`s inside them; seeing none means the
     # capture regressed again and the verdict below would be meaningless.
-    if STATS["multiline_blocks"] == 0 or STATS["calls"] == 0:
+    if STATS["multiline_blocks"] == 0 or STATS["calls"] == 0 or STATS["asm_outputs"] == 0:
         print(
             f"[asm-lint] FAIL — vacuous run: blocks={STATS['blocks']} "
             f"multiline={STATS['multiline_blocks']} calls={STATS['calls']} "
-            f"(the capture saw no trampolines; the regex has regressed)",
+            f"outputs={STATS['asm_outputs']} "
+            f"(the capture saw no trampolines or no asm outputs; a regex has regressed)",
             file=sys.stderr,
         )
         return 1
 
     if all_pass:
         print(
-            f"[asm-lint] PASS — all trampolines aligned "
-            f"(blocks={STATS['blocks']} multiline={STATS['multiline_blocks']} calls={STATS['calls']})"
+            f"[asm-lint] PASS — all trampolines aligned, output shapes ok "
+            f"(blocks={STATS['blocks']} multiline={STATS['multiline_blocks']} calls={STATS['calls']} "
+            f"outputs={STATS['asm_outputs']})"
         )
         return 0
     else:
