@@ -520,14 +520,14 @@ pub fn sysMunmap(va: u32, len: u32) u32 {
         lead.mmap_top = new_top;
     }
 
-    // File-backed mmap allocates a per-region kernel buffer; release it after
-    // the user-side teardown so a fault hitting the just-removed region (e.g.
-    // a stale TLB entry) can't read freed memory. `source` is a physmap virt
-    // pointer (see sysMmap line 942) — translate back to phys for PMM.
+    // File-backed mmap allocates a per-region kernel buffer; drop this
+    // process's ownership after the user-side teardown so a fault hitting the
+    // just-removed region (e.g. a stale TLB entry) can't read freed memory.
+    // A fork peer may still own it. `source` is a physmap virt pointer.
     if (removed.buf_owned) {
         if (removed.source) |src| {
             const phys = paging.virtToPhys(@intFromPtr(src)).?;
-            pmm.freeContiguous(Phys.of(phys), removed.buf_pages);
+            pmm.releaseContiguous(Phys.of(phys), removed.buf_pages);
         }
     }
 

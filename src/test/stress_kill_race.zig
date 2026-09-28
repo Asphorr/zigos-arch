@@ -26,9 +26,7 @@ const debug = @import("../debug/debug.zig");
 const serial = @import("../debug/serial.zig");
 const vfs = @import("../fs/vfs.zig");
 const elf_loader = @import("../proc/elf_loader.zig");
-const pmm = @import("../mm/pmm.zig");
 const paging = @import("../mm/paging.zig");
-const Phys = @import("../util/addr.zig").Phys;
 const vmm = @import("../mm/vmm.zig");
 
 const ITERATIONS: u32 = 1_000;
@@ -79,14 +77,9 @@ pub fn taskEntry() callconv(.c) noreturn {
                 // ordinary path. interactive priority would short-circuit
                 // some scheduler corners.
             } else {
-                // ELF load failed — release the buffer back to PMM. Same
-                // dance as sysExec's failure branch. Use freeRange (the
-                // allocContiguous pair) — per-frame freeFrame loops stamp
-                // spurious canaries on every page.
+                // loadAndStart already freed the buffer on failure.
                 pids[b] = 0xFF;
                 spawn_failures += 1;
-                const phys_base = paging.virtToPhys(@intFromPtr(fresh.buf)).?;
-                pmm.freeRange(Phys.of(phys_base), fresh.pages);
             }
         }
 

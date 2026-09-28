@@ -684,7 +684,28 @@ fn phase11_refcountChurn() void {
         fail("p11", "expected refcount 0 after final free, got {d}", .{frameRefCountRaw(x)});
         return;
     }
-    pass("p11", "refcount cycle clean (1 → 101 → 1 → 0)", .{});
+
+    // Shared run (fork-inherited kernel buffer): owners count on the head
+    // frame, only the last release frees the run.
+    const run = allocContigRaw(4) orelse {
+        fail("p11", "allocContiguous(4) for the shared run failed", .{});
+        return;
+    };
+    const tail = run + 3 * pmm.PUB_FRAME_SIZE;
+    pmm.shareContiguous(Phys.of(run));
+    pmm.shareContiguous(Phys.of(run));
+    pmm.releaseContiguous(Phys.of(run), 4);
+    pmm.releaseContiguous(Phys.of(run), 4);
+    if (frameRefCountRaw(run) != 1 or frameRefCountRaw(tail) != 1) {
+        fail("p11", "shared run: expected refs 1/1 with one owner left, got {d}/{d}", .{ frameRefCountRaw(run), frameRefCountRaw(tail) });
+        return;
+    }
+    pmm.releaseContiguous(Phys.of(run), 4);
+    if (frameRefCountRaw(run) != 0 or frameRefCountRaw(tail) != 0) {
+        fail("p11", "shared run: expected refs 0/0 after the last release, got {d}/{d}", .{ frameRefCountRaw(run), frameRefCountRaw(tail) });
+        return;
+    }
+    pass("p11", "refcount cycle clean (1 → 101 → 1 → 0), shared run freed by its last owner", .{});
 }
 
 // ===========================================================================

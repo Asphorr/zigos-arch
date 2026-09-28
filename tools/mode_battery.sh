@@ -9,6 +9,7 @@
 #   12  [pmmstress] ✓ ALL CLEAN          (src/test/stress_pmm.zig)
 #   14  [pgcache] PASS                    (src/test/page_cache_selftest.zig)
 #   16  [disktest] PASS                   (src/test/disk_selftest.zig)
+#   18  [usertest] PASS                   (src/test/user_selftest.zig)
 #
 # Any other mode runs with a generic "PASS"/"FAIL" grep — extend the table
 # below when a new self-test grows a verdict line. Exit status = number of
@@ -27,6 +28,7 @@ pass_marker() {
         12) echo '\[pmmstress\] ✓ ALL CLEAN' ;;
         14) echo '\[pgcache\] PASS' ;;
         16) echo '\[disktest\] PASS' ;;
+        18) echo '\[usertest\] PASS' ;;
         *)  echo 'PASS' ;;
     esac
 }
@@ -35,6 +37,7 @@ fail_marker() {
         12) echo '\[pmmstress\] ✗|\[pmmstress\] FAIL' ;;
         14) echo '\[pgcache\] FAIL' ;;
         16) echo '\[disktest\] FAIL' ;;
+        18) echo '\[usertest\] FAIL \(' ;;
         *)  echo 'FAIL' ;;
     esac
 }

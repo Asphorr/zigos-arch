@@ -1093,6 +1093,28 @@ pub inline fn freeRange(phys_base: Phys, count: u32) void {
     freeContiguous(phys_base, count);
 }
 
+/// Add an owner to a contiguous run (a kernel buffer that fork hands to the
+/// child). The owner count lives on the head frame; the rest stay at 1, so
+/// freeContiguous still trips on a run released more times than it was owned.
+pub fn shareContiguous(phys: Phys) void {
+    acquireFrame(phys);
+}
+
+/// Drop one owner of a run from allocContiguous*; the last owner frees it
+/// exactly as freeContiguous does. Inline so the free is attributed to the
+/// real caller.
+pub inline fn releaseContiguous(phys: Phys, count: u32) void {
+    const head = phys.raw() / FRAME_SIZE;
+    if (count > 1 and head < MAX_FRAMES) {
+        while (true) {
+            const cur = @atomicLoad(u8, &frame_refs[head], .acquire);
+            if (cur <= 1) break;
+            if (@cmpxchgWeak(u8, &frame_refs[head], cur, cur - 1, .acq_rel, .acquire) == null) return;
+        }
+    }
+    freeContiguous(phys, count);
+}
+
 pub fn freeFrameCount() u32 {
     return total_frames.load(.monotonic);
 }

@@ -49,7 +49,6 @@ const frames = @import("frames.zig");
 const dspec = frames.dispatch; // NOT `fd` — this file is full of file-descriptor captures
 
 const process = @import("process.zig");
-const elf_rc = @import("elf_rc.zig");
 // Pull-on-idle work stealing: an idle CPU steals one queued task from the
 // busiest peer (via migrate()) instead of waiting up to a full load-balance
 // interval for the BSP's periodic push. The migrate() PCID gen-bump
@@ -360,40 +359,22 @@ pub fn forkCurrent(frame: *signals.SyscallFrame) ?usize {
     // the same frames (cloneAddressSpace strips writable for COW, but the
     // fault handler re-checks shm_id BEFORE handleCowFault, so writes on a
     // shared-anon page take the shm-map path, not the COW path).
+    //
+    // Kernel buffers behind `source` (a private file mmap's copy, the ELF
+    // image) are not remapped by COW: the child's copied regions read the
+    // parent's buffers, so each gains an owner and the last one frees it.
     {
         const shm = @import("../mm/shm.zig");
-        var ri: u8 = 0;
-        while (ri < process.procs[i].lazy_count) : (ri += 1) {
-            const sid = process.procs[i].lazy_regions[ri].shm_id;
-            if (sid != shm.SHM_INVALID) _ = shm.acquire(sid);
+        for (process.procs[i].lazy_regions[0..process.procs[i].lazy_count]) |r| {
+            if (r.shm_id != shm.SHM_INVALID) _ = shm.acquire(r.shm_id);
+            if (r.buf_owned) {
+                if (r.source) |src| pmm.shareContiguous(kbufPhys(src));
+            }
         }
     }
-    // ELF buf is the parent's source-of-truth for demand paging; the child's
-    // copied lazy_regions[].source point straight into it (COW doesn't remap a
-    // kernel buffer). Share it under a refcount so it survives whichever of
-    // {parent, child} faults in its last PT_LOAD page — freeElfBuf drops a ref
-    // and frees the PMM pages only at zero. (This closes the prior UAF: the
-    // child used to null its own elf_buf and dangle if the parent exited first.)
-    if (parent_lead_src.elf_buf != null) {
-        if (parent_lead_src.elf_buf_rc) |rc| {
-            elf_rc.acquire(rc);
-            process.procs[i].elf_buf = parent_lead_src.elf_buf;
-            process.procs[i].elf_buf_pages = parent_lead_src.elf_buf_pages;
-            process.procs[i].elf_buf_rc = rc;
-        } else {
-            // Parent's buffer is un-refcounted (rc pool was exhausted at load):
-            // can't share it safely, so the child goes without — same as before.
-            // Its still-lazy ELF pages will fault as zero-fill; acceptable in the
-            // can't-happen-in-practice exhaustion corner (see elf_rc.zig).
-            process.procs[i].elf_buf = null;
-            process.procs[i].elf_buf_pages = 0;
-            process.procs[i].elf_buf_rc = null;
-        }
-    } else {
-        process.procs[i].elf_buf = null;
-        process.procs[i].elf_buf_pages = 0;
-        process.procs[i].elf_buf_rc = null;
-    }
+    if (parent_lead_src.elf_buf) |buf| pmm.shareContiguous(kbufPhys(buf));
+    process.procs[i].elf_buf = parent_lead_src.elf_buf;
+    process.procs[i].elf_buf_pages = parent_lead_src.elf_buf_pages;
 
     // FD table — copy entries verbatim, then bump pipe-side refcounts so the
     // parent closing its end doesn't drop the last reference while child
@@ -1028,7 +1009,6 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp, persist_shared_dirty: 
         }
         closePipeFds(my_tgid);
         freeElfBuf(lead);
-        const paging = @import("../mm/paging.zig");
         const shm = @import("../mm/shm.zig");
         const page_cache = @import("../mm/page_cache.zig");
         for (lead.lazy_regions[0..lead.lazy_count]) |r| {
@@ -1064,11 +1044,7 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp, persist_shared_dirty: 
             }
             if (!r.buf_owned) continue;
             const src = r.source orelse continue;
-            // r.source points at a PMM-allocated buffer reached through
-            // the kernel physmap. Translate VA → phys before handing to
-            // PMM (which lives in phys space).
-            const base: usize = paging.virtToPhys(@intFromPtr(src)).?;
-            pmm.freeContiguous(Phys.of(base), r.buf_pages);
+            pmm.releaseContiguous(kbufPhys(src), r.buf_pages);
         }
         lead.lazy_count = 0;
         lead.heap_lazy_idx = -1;
@@ -1591,24 +1567,20 @@ pub fn findZombieChild(parent: u8, target_pid: u32) ?u8 {
     return null;
 }
 
-/// Drop this PCB's reference to the per-process ELF buffer (PMM-allocated
-/// contiguous frames). The pages are freed only when the last referrer lets go
-/// — a fork child shares the parent's buffer under a refcount (see elf_rc.zig /
-/// forkCurrent), so freeing on the first exit would dangle the survivor's
-/// lazy_regions[].source. An un-refcounted buffer (rc == null) is a single
-/// owner and frees immediately, as before.
+/// Drop this PCB's ownership of the ELF buffer. A fork child shares the
+/// parent's buffer (forkCurrent), so the pages go back to the PMM only when
+/// the last owner lets go.
 fn freeElfBuf(pcb: *PCB) void {
     if (pcb.elf_buf) |buf| {
-        const should_free = if (pcb.elf_buf_rc) |rc| elf_rc.release(rc) else true;
-        if (should_free) {
-            // pcb.elf_buf is a kernel-side physmap VA (set from vfs.loadFileFresh's
-            // physToVirt result). PMM speaks phys, translate.
-            const paging = @import("../mm/paging.zig");
-            const base: usize = paging.virtToPhys(@intFromPtr(buf)).?;
-            pmm.freeContiguous(Phys.of(base), pcb.elf_buf_pages);
-        }
+        pmm.releaseContiguous(kbufPhys(buf), pcb.elf_buf_pages);
         pcb.elf_buf = null;
         pcb.elf_buf_pages = 0;
-        pcb.elf_buf_rc = null;
     }
+}
+
+/// Phys head of a PMM buffer the kernel reaches through the physmap
+/// (elf_buf, a file mmap's `source`).
+fn kbufPhys(buf: [*]const u8) Phys {
+    const paging = @import("../mm/paging.zig");
+    return Phys.of(paging.virtToPhys(@intFromPtr(buf)).?);
 }

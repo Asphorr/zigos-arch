@@ -338,7 +338,7 @@ pub fn getCwd(out: []u8) ?[]const u8 {
 pub fn mmap(len: usize) ?[]u8 {
     if (len == 0) return null;
     const va = syscall3(57, @intCast(len), 0xFFFFFFFF, 0);
-    if (va == 0xFFFFFFFF) return null;
+    if (isErr(va)) return null;
     const aligned: usize = (len + 0xFFF) & ~@as(usize, 0xFFF);
     const ptr: [*]u8 = @ptrFromInt(@as(usize, va));
     return ptr[0..aligned];
@@ -356,7 +356,7 @@ pub fn mmap(len: usize) ?[]u8 {
 pub fn mmapFile(fd: u32, offset: u32, len: usize) ?[]u8 {
     if (len == 0) return null;
     const va = syscall3(57, @intCast(len), fd, offset);
-    if (va == 0xFFFFFFFF) return null;
+    if (isErr(va)) return null;
     const aligned: usize = (len + 0xFFF) & ~@as(usize, 0xFFF);
     const ptr: [*]u8 = @ptrFromInt(@as(usize, va));
     return ptr[0..aligned];
@@ -373,7 +373,7 @@ pub fn mmapFile(fd: u32, offset: u32, len: usize) ?[]u8 {
 pub fn mmapFileShared(fd: u32, offset: u32, len: usize) ?[]u8 {
     if (len == 0) return null;
     const va = syscall3(118, @intCast(len), fd, offset);
-    if (va == 0xFFFFFFFF) return null;
+    if (isErr(va)) return null;
     const aligned: usize = (len + 0xFFF) & ~@as(usize, 0xFFF);
     const ptr: [*]u8 = @ptrFromInt(@as(usize, va));
     return ptr[0..aligned];
@@ -388,7 +388,7 @@ pub fn mmapFileShared(fd: u32, offset: u32, len: usize) ?[]u8 {
 pub fn mmapPmem(fd: u32, offset: u32, len: usize) ?[]u8 {
     if (len == 0) return null;
     const va = syscall3(121, @intCast(len), fd, offset);
-    if (va == 0xFFFFFFFF) return null;
+    if (isErr(va)) return null;
     const aligned: usize = (len + 0xFFF) & ~@as(usize, 0xFFF);
     const ptr: [*]u8 = @ptrFromInt(@as(usize, va));
     return ptr[0..aligned];

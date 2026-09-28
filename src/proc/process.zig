@@ -328,15 +328,10 @@ pub const PCB = struct {
     // every fault (turns an O(n^2) linear-scan workload into O(n)).
     swap_clock_va: usize = 0,
     // Per-process kernel-side ELF buffer (PMM-allocated contiguous frames).
-    // Lazy regions for PT_LOAD segments reference this; freed on process destroy.
+    // Lazy regions for PT_LOAD segments reference this. fork() shares it with
+    // the child (pmm.shareContiguous); the last owner frees it.
     elf_buf: ?[*]u8 = null, // (c) set at exec
     elf_buf_pages: u32 = 0, // (c)
-    // Shared refcount for elf_buf (see elf_rc.zig). fork() hands the parent's
-    // buffer to the child — the child's lazy_regions[].source point into it —
-    // so the PMM pages must live until the LAST referrer frees them, not the
-    // original owner. null = un-refcounted single owner (buffer dropped at
-    // load, or rc pool exhausted): never shared, so it can't dangle.
-    elf_buf_rc: ?*u32 = null, // (c)
     // Bottom of the user stack (lazy region start). Set by elf_loader. The
     // page-fault handler treats faults in [stack_base - GUARD_SIZE, stack_base)
     // as stack overflow rather than a generic segfault.
@@ -640,10 +635,10 @@ pub const LazyRegion = struct {
     src_size: usize = 0,
     src_offset: usize = 0,
     // True iff `source` was PMM-allocated by sysMmap (file-backed mmap) and
-    // belongs to this region. munmap and destroyCurrent free `buf_pages`
-    // contiguous frames starting at `source` when this is set. ELF segments
-    // share `pcb.elf_buf` and DON'T set this — that buffer is freed once via
-    // freeElfBuf instead.
+    // belongs to this region: `buf_pages` contiguous frames starting at
+    // `source`. fork() adds the child as an owner (pmm.shareContiguous);
+    // munmap and teardown drop one owner (pmm.releaseContiguous). ELF segments
+    // source `pcb.elf_buf` and DON'T set this — freeElfBuf releases that one.
     buf_owned: bool = false,
     buf_pages: u16 = 0,
     // Page-protection bits (PROT_READ | PROT_WRITE | PROT_EXEC). Default RWX
