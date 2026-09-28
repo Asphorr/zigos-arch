@@ -350,9 +350,9 @@ pub fn read(pcb: *process.PCB, fd: u32, buf: [*]u8, count: u32) u32 {
             return @intCast(bytes_read);
         },
         .tarfs => {
-            const bytes_read = tarfs.readFile(@intCast(fd_entry.inode), buf, count);
-            fd_entry.offset += @intCast(bytes_read);
-            return @intCast(bytes_read);
+            const bytes_read = tarfs.readAt(fd_entry.inode, fd_entry.offset, buf, count);
+            fd_entry.offset += bytes_read;
+            return bytes_read;
         },
         .pipe => {
             // Pipes only valid as read-side here. Write-side fds use sysFwrite path.
@@ -622,9 +622,7 @@ pub fn close(pcb: *process.PCB, fd: u32) u32 {
         .fat32 => {
             fat32.closeFile(fatHandle(fd_entry));
         },
-        .tarfs => {
-            tarfs.closeFile(@intCast(fd_entry.inode));
-        },
+        .tarfs => {},
         .pipe => {
             if (fd_entry.flags == 0) {
                 pipe.closeReader(fd_entry.pipe_id);

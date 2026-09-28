@@ -257,6 +257,13 @@ pub fn targetDevice() ?Device {
     };
 }
 
+/// Capacity of the primary (tarfs) disk in 512-byte sectors; 0 = unknown
+/// (the ata/ahci backends don't report it).
+pub fn primarySectors() u64 {
+    if (backend != .nvme) return 0;
+    return nvme.namespaceSectors(0);
+}
+
 /// Capacity of the install target in 512-byte sectors, or 0 when no target
 /// disk is attached. Callers must check this before issuing target I/O; it is
 /// the presence test, and 0 is the only "not here" signal (the read/write

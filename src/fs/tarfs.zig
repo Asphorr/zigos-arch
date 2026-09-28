@@ -26,19 +26,33 @@ var index: [MAX_INDEX_ENTRIES]IndexEntry = [_]IndexEntry{.{}} ** MAX_INDEX_ENTRI
 var index_count: u32 = 0;
 var indexed: bool = false;
 
+/// Scan bound when the disk doesn't report its size. The archive's zero
+/// block ends the scan first; this only stops a runaway on a corrupt tar.
+const UNKNOWN_DISK_SCAN_SECTORS: u64 = 1 << 22; // 2 GB
+
 /// Build the TAR index at boot. Scans disk once, caches all file metadata.
 pub fn buildIndex() void {
     var lba: u32 = 0;
     var buf: [512]u8 = undefined;
     index_count = 0;
+    const disk = ata.primarySectors();
+    const limit: u64 = @min(if (disk != 0) disk else UNKNOWN_DISK_SCAN_SECTORS, std.math.maxInt(u32));
 
-    while (lba < 65536 and index_count < MAX_INDEX_ENTRIES) {
+    while (lba < limit) {
         ata.readSector(lba, &buf);
         if (buf[0] == 0) break;
+        if (index_count == MAX_INDEX_ENTRIES) {
+            debug.klog("[tarfs] index full ({d} entries) — later files are not reachable\n", .{MAX_INDEX_ENTRIES});
+            break;
+        }
 
         const name_len = std.mem.indexOfScalar(u8, buf[0..100], 0) orelse 100;
         const size = parseOctal(buf[124..136]);
-        const sectors: u32 = @intCast((size + 511) / 512);
+        const next: u64 = @as(u64, lba) + 1 + (size + 511) / 512;
+        if (size > std.math.maxInt(u32) or next > limit) {
+            debug.klog("[tarfs] entry at lba {d} runs past the disk (size {d}) — stopping the scan\n", .{ lba, size });
+            break;
+        }
 
         var entry = &index[index_count];
         @memcpy(entry.name[0..name_len], buf[0..name_len]);
@@ -47,11 +61,11 @@ pub fn buildIndex() void {
         entry.file_size = @intCast(size);
         index_count += 1;
 
-        lba += 1 + sectors;
+        lba = @intCast(next);
     }
 
     indexed = true;
-    debug.klog("[tarfs] Indexed {d} files\n", .{index_count});
+    debug.klog("[tarfs] Indexed {d} files ({d} sectors)\n", .{ index_count, lba });
 
     // Sort index by filename for binary search
     sortIndex();
@@ -136,15 +150,10 @@ pub fn ls() void {
     }
 }
 
-// Handle-based API for VFS
-
-pub const Handle = struct {
-    data_lba: u32,
-    file_size: u32,
-    current_offset: u32,
-};
-
-var tar_handles: [8]?Handle = [_]?Handle{null} ** 8;
+// fd API for VFS. A tarfs fd's inode is the file's position in the index
+// (fixed once buildIndex has sorted it) and its read position is the fd's
+// own offset: no per-open state here, so seek, mmap at an offset, fork and
+// an exit without close() all just work.
 
 /// O(1) file-size lookup via the prebuilt index. Used by vfs.loadFileFresh
 /// to size a PMM allocation before opening the file.
@@ -156,82 +165,33 @@ pub fn fileSize(name: []const u8) ?usize {
     return null;
 }
 
+/// Index position of `name`, stored as the fd's inode. Null before the
+/// index is built.
 pub fn openFile(name: []const u8) ?u16 {
-    // Use index for O(1) lookup (no disk I/O)
-    if (indexed) {
-        const entry = findInIndex(name) orelse return null;
-        for (0..8) |i| {
-            if (tar_handles[i] == null) {
-                tar_handles[i] = .{
-                    .data_lba = entry.data_lba,
-                    .file_size = entry.file_size,
-                    .current_offset = 0,
-                };
-                return @intCast(i);
-            }
-        }
-        return null; // no free handle
-    }
-
-    // Fallback: disk scan (before index is built)
-    var lba: u32 = 0;
-    var buf: [512]u8 = undefined;
-    while (lba < 8000) {
-        ata.readSector(lba, &buf);
-        if (buf[0] == 0) break;
-        const name_len = std.mem.indexOfScalar(u8, buf[0..100], 0) orelse 100;
-        const size = parseOctal(buf[124..136]);
-        const sectors: u32 = @intCast((size + 511) / 512);
-        if (std.mem.eql(u8, buf[0..name_len], name)) {
-            for (0..8) |i| {
-                if (tar_handles[i] == null) {
-                    tar_handles[i] = .{
-                        .data_lba = lba + 1,
-                        .file_size = @intCast(size),
-                        .current_offset = 0,
-                    };
-                    return @intCast(i);
-                }
-            }
-            return null;
-        }
-        lba += 1 + sectors;
-    }
-    return null;
+    if (!indexed) return null;
+    const entry = findInIndex(name) orelse return null;
+    return @intCast((@intFromPtr(entry) - @intFromPtr(&index[0])) / @sizeOf(IndexEntry));
 }
 
-pub fn readFile(handle_idx: u16, buf: [*]u8, count: u32) usize {
-    if (handle_idx >= 8) return 0;
-    var handle = tar_handles[handle_idx] orelse return 0;
-    if (handle.current_offset >= handle.file_size) return 0;
-
-    const bytes_left = handle.file_size - handle.current_offset;
-    const to_read: u32 = if (count > bytes_left) bytes_left else count;
-    if (to_read == 0) return 0;
+/// Read up to `count` bytes at `offset` of the file at index position
+/// `pos`; returns the bytes read (0 at or past EOF).
+pub fn readAt(pos: u32, offset: u32, buf: [*]u8, count: u32) u32 {
+    if (pos >= index_count) return 0;
+    const entry = &index[pos];
+    if (offset >= entry.file_size) return 0;
+    const to_read: u32 = @min(count, entry.file_size - offset);
 
     var bytes_read: u32 = 0;
     var sector_buf: [512]u8 = undefined;
     while (bytes_read < to_read) {
-        const sector_offset = handle.current_offset / 512;
-        const byte_in_sector = handle.current_offset % 512;
-        ata.readSector(handle.data_lba + sector_offset, &sector_buf);
-
-        const available = 512 - byte_in_sector;
-        const remaining = to_read - bytes_read;
-        const chunk = if (available < remaining) available else remaining;
+        const at = offset + bytes_read;
+        ata.readSector(entry.data_lba + at / 512, &sector_buf);
+        const byte_in_sector = at % 512;
+        const chunk = @min(512 - byte_in_sector, to_read - bytes_read);
         @memcpy(buf[bytes_read..][0..chunk], sector_buf[byte_in_sector..][0..chunk]);
         bytes_read += chunk;
-        handle.current_offset += chunk;
     }
-
-    tar_handles[handle_idx] = handle;
     return bytes_read;
-}
-
-pub fn closeFile(handle_idx: u16) void {
-    if (handle_idx < 8) {
-        tar_handles[handle_idx] = null;
-    }
 }
 
 /// Collect tarfs filenames matching a prefix. Returns number of matches (max 8).

@@ -1302,8 +1302,8 @@ pub fn build(b: *std.Build) void {
         \\  fi
         \\fi
         \\cd zig-out/bin
-        \\# Order matters — tarfs scans only the first 8000 sectors (4 MB) for
-        \\# its index. KERNEL.SYM goes early so symbols.loadKernelSymbols
+        \\# Order matters — before its index is built, tarfs scans only the
+        \\# first 8000 sectors (4 MB). KERNEL.SYM goes early so symbols.loadKernelSymbols
         \\# always finds it regardless of what's on IDE2 (FAT32 or ext2 in
         \\# Phase 1-2 dev). app.elf next so the shell is always loadable.
         \\# Then tiny + CLI staples + GUI apps.
