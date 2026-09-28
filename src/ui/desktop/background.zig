@@ -79,9 +79,9 @@ pub fn allocateWallpaper(w: u32, h: u32) bool {
     wp_lock.acquire();
     defer wp_lock.release();
     clearWallpaperLocked();
-    // vmalloc rather than heap.kvmalloc: a 6+ MB wallpaper needs 1500+
-    // contiguous frames from PMM, which can't be served on a fragmented
-    // heap. vmalloc returns a virtually-contiguous region backed by
+    // vmalloc: a 6+ MB wallpaper as one PMM run needs 1500+ contiguous
+    // frames, which fragmented memory can't serve. vmalloc returns a
+    // virtually-contiguous region backed by
     // individually-allocated frames, so the only requirement is that
     // PMM has enough total free pages — order doesn't matter. Wallpaper
     // bytes are CPU-read-only (no DMA), making vmalloc the right fit.

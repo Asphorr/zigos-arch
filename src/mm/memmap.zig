@@ -11,15 +11,12 @@
 //   0x100000..kernel_end kernel image (.text, .rodata, .data, .bss).
 //                        kernel_end is runtime-derived from `_kernel_end` —
 //                        the linker sets it; nothing in the static map cares
-//                        where exactly it lands as long as it's < KERNEL_HEAP_BASE.
-//   kernel_end..0x7FFFFF free RAM (PMM hands these frames out on demand).
-//                        Historically reserved as USER_LOAD; the reservation
-//                        was fossilized protection for a Phase-2 lazy-fault
-//                        bug class that's gone since PML4[0] was dropped.
-//   0xA00000..0xDFFFFF   kernel dynamic heap (KERNEL_HEAP, 4 MB)
-//   0xE00000..0x15FFFFF  guest GPU framebuffer (GUEST_FB, 8 MB)
-//   0x1600000..0x1DFFFFF CPU back buffer for compositing (BACK_BUFFER, 8 MB)
-//   0x1E00000..0x1E3FFFF UEFI page tables (reserved on UEFI builds only)
+//                        where exactly it lands as long as it's < GUEST_FB_BASE.
+//   kernel_end..0x1BFFFFF free RAM (PMM hands these frames out on demand; the
+//                        kernel heap's pools come from PMM too).
+//   0x1C00000..0x23FFFFF guest GPU framebuffer (GUEST_FB, 8 MB)
+//   0x2400000..0x2BFFFFF CPU back buffer for compositing (BACK_BUFFER, 8 MB)
+//   0x2C00000..0x2C3FFFF UEFI page tables (reserved on UEFI builds only)
 //
 // User space (per-process page tables): each process gets its own PML4[0]
 // from createAddressSpace; user-app .text loads at USER_VA_FLOOR (matches
@@ -84,27 +81,18 @@ pub fn kernelEndPhys() usize {
 //
 // Independent of kernel image size — the kernel image lives at high-half
 // VAs; the only thing that has to fit at low PAs is "kernel image must
-// end before KERNEL_HEAP_BASE" (assertKernelImageFits). Bumping this
+// end before GUEST_FB_BASE" (assertKernelImageFits). Bumping this
 // constant requires re-linking all user apps and is rarely the right move.
 pub const USER_VA_FLOOR: usize = layout.USER_VA_FLOOR;
 
 // --- Static kernel-side regions (low PA, post-kernel-image) ---
 //
-// Bumped 2026-05-20 from 0x800000 → 0xA00000 (ext2 cache_buf growth), and
-// 2026-08-22 from 0xA00000 → 0xC00000 (installer campaign BSS) — each time
-// the kernel-image-fits check tripped and each time the fix was the same
-// pair: move the biggest offender out of BSS (kstack_pool then, the
-// installer working set now) AND restore ~2 MB of headroom between
-// _kernel_end and KERNEL_HEAP_BASE. Downstream regions are *derived* so a
-// future bump only touches KERNEL_HEAP_BASE in lib/uefi_layout.zig.
-// Cross-unit layout constants live in lib/uefi_layout.zig — both kernel
-// and UEFI bootloader import from there. The comptime block at the
+// The kernel image may grow up to GUEST_FB_BASE; the RAM in between is
+// PMM's. Cross-unit layout constants live in lib/uefi_layout.zig — both
+// kernel and UEFI bootloader import from there. The comptime block at the
 // bottom of this file enforces agreement; if the values diverge, build
 // fails loudly (see lib/uefi_layout.zig header for the bug-class history).
 const uefi_layout = @import("uefi_layout");
-
-pub const KERNEL_HEAP_BASE: usize = uefi_layout.KERNEL_HEAP_BASE;
-pub const KERNEL_HEAP_SIZE: usize = uefi_layout.KERNEL_HEAP_SIZE;
 
 pub const GUEST_FB_BASE: usize = uefi_layout.GUEST_FB_BASE;
 pub const GUEST_FB_SIZE: usize = uefi_layout.GUEST_FB_SIZE;
@@ -191,13 +179,12 @@ pub const UVa = layout.UVa;
 // --- Comptime overlap asserts ---
 //
 // Pairwise check that the kernel-side static regions don't overlap. If a
-// future change makes two regions collide (e.g. doubling KERNEL_HEAP_SIZE
-// without bumping GUEST_FB_BASE), this fails at build time. The kernel
+// future change makes two regions collide (e.g. doubling GUEST_FB_SIZE
+// without bumping BACK_BUFFER_BASE), this fails at build time. The kernel
 // image's runtime extent is checked separately in `assertKernelImageFits`.
 comptime {
     const Region = struct { name: []const u8, base: usize, size: usize };
     const regions = [_]Region{
-        .{ .name = "kernel_heap", .base = KERNEL_HEAP_BASE, .size = KERNEL_HEAP_SIZE },
         .{ .name = "guest_fb", .base = GUEST_FB_BASE, .size = GUEST_FB_SIZE },
         .{ .name = "back_buffer", .base = BACK_BUFFER_BASE, .size = BACK_BUFFER_SIZE },
     };
@@ -230,21 +217,22 @@ comptime {
     }
 }
 
-/// Runtime check that the kernel image fits below KERNEL_HEAP_BASE. Call once
-/// during boot. If this fires, the kernel grew into the heap region — heap
-/// allocations would corrupt kernel BSS / .data. Either trim the kernel or
-/// bump KERNEL_HEAP_BASE (and the dependent regions stacked above it).
+/// Runtime check that the kernel image fits below GUEST_FB_BASE. Call once
+/// during boot. If this fires, the kernel grew into the guest framebuffer —
+/// FB writes would corrupt kernel BSS / .data. Either trim the kernel or
+/// move GUEST_FB_BASE (and the regions stacked above it) in
+/// lib/uefi_layout.zig.
 ///
 /// Note: this is the ONLY runtime constraint on kernel image size — user-app
 /// load VA is a separate concept (USER_VA_FLOOR, fixed by app/linker.ld) and
 /// has no relationship to kernel growth.
 pub fn assertKernelImageFits() void {
     const end = kernelEndPhys();
-    if (end > KERNEL_HEAP_BASE) {
+    if (end > GUEST_FB_BASE) {
         @import("../debug/debug.zig").klog(
-            "[memmap] FATAL: kernel image extends to 0x{X}, past KERNEL_HEAP_BASE 0x{X}\n",
-            .{ end, KERNEL_HEAP_BASE },
+            "[memmap] FATAL: kernel image extends to 0x{X}, past GUEST_FB_BASE 0x{X}\n",
+            .{ end, GUEST_FB_BASE },
         );
-        @panic("kernel image grew into kernel heap region");
+        @panic("kernel image grew into the guest framebuffer");
     }
 }

@@ -3,6 +3,8 @@
 //! so allocator metadata straying into user data (or the reverse) shows
 //! up; the three validators must pass after every step, and every freed
 //! pointer must read as a double free until something reuses its bytes.
+//! The pool tests grow and shrink the allocator over an arena of slots the
+//! way heap.zig does over PMM chunks.
 
 const std = @import("std");
 const tlsf = @import("tlsf.zig");
@@ -25,7 +27,8 @@ var region: [REGION]u8 align(4096) = undefined;
 /// A fresh allocator over stale bytes: nothing may trust uninitialized memory.
 fn fresh(t: *tlsf.Tlsf) void {
     @memset(&region, 0xA5);
-    t.init(@intFromPtr(&region), REGION);
+    t.init();
+    std.debug.assert(t.addPool(@intFromPtr(&region), REGION));
 }
 
 fn valid(t: *const tlsf.Tlsf) bool {
@@ -43,7 +46,7 @@ fn free(t: *tlsf.Tlsf, p: usize) !void {
     const loc = t.locate(p);
     try expect(loc == .block);
     try expect(t.tailFault(loc.block, p) == null);
-    try t.release(loc.block, p);
+    _ = try t.release(loc.block, p);
 }
 
 fn pristine(t: *const tlsf.Tlsf) !void {
@@ -124,7 +127,7 @@ test "random operations keep the oracle" {
                 switch (try t.alloc(size, alignment)) {
                     .ok => |p| {
                         try expect(p % alignment == 0);
-                        try expect(p >= t.start and p + size <= t.wall);
+                        try expect(p >= t.pools[0].start and p + size <= t.pools[0].wall());
                         for (live[0..n]) |l| try expect(p + size <= l.p or l.p + l.size <= p);
                         const tag: u8 = @truncate(step *% 131 +% 7);
                         @memset(@as([*]u8, @ptrFromInt(p))[0..size], tag);
@@ -136,6 +139,7 @@ test "random operations keep the oracle" {
                         // would have been found.
                         ooms += 1;
                         try expect(o.largest < tlsf.mappingAllocRoundUp(o.search));
+                        try expect(!t.canServe(o.search));
                     },
                 }
             } else {
@@ -203,7 +207,9 @@ test "wild pointers" {
     @memset(@as([*]u8, @ptrFromInt(p))[0..64], 0);
     try expect(t.locate(p + 16) == .wild);
     try expect(t.locate(p + 1) == .wild);
-    try expect(t.locate(t.start) == .wild);
+    try expect(t.locate(t.pools[0].start) == .wild);
+    try expect(t.locate(t.pools[0].wall()) == .wild);
+    try expect(t.locate(t.pools[0].start + REGION) == .wild);
 }
 
 test "use-after-free write over the links is caught at unlink" {
@@ -248,4 +254,287 @@ test "a shredded footer is caught before the merge" {
     @as(*usize, @ptrFromInt(b_block - tlsf.FOOTER_SIZE)).* = 0xFFFF_FFFF_0000;
     try std.testing.expectError(error.Corrupt, t.release(b_block, b));
     try expect(t.fault == .footer);
+}
+
+test "a free block whose size runs past its wall is caught before use" {
+    var t: tlsf.Tlsf = undefined;
+    fresh(&t);
+    const big = t.pools[0].start; // the one free block
+    const hdr: *usize = @ptrFromInt(big);
+    hdr.* += 2 * tlsf.MIN_BLOCK_SIZE; // keeps the flag bits
+    try std.testing.expectError(error.Corrupt, t.alloc(48, 16));
+    try expect(t.fault == .size);
+    try expectEqual(big, t.fault.size.block);
+}
+
+test "a merge never trusts a free neighbour's size" {
+    var t: tlsf.Tlsf = undefined;
+    // The pool is the first half; the second half is a guard that a merge
+    // writing its footer past the wall would hit.
+    const half = REGION / 2;
+    @memset(&region, 0xA5);
+    t.init();
+    std.debug.assert(t.addPool(@intFromPtr(&region), half));
+    const a = (try alloc(&t, 48, 16)).?;
+    const b = (try alloc(&t, 48, 16)).?;
+    const c = (try alloc(&t, 48, 16)).?;
+    _ = (try alloc(&t, 48, 16)).?;
+    const a_block = t.locate(a).block;
+    const b_block = t.locate(b).block;
+    const c_block = t.locate(c).block;
+    try free(&t, b); // a | free b | c
+    const b_hdr: *usize = @ptrFromInt(b_block);
+    const b_saved = b_hdr.*;
+
+    // Forward merge from a: b claims to reach past the wall, then under the minimum.
+    b_hdr.* = b_saved + half;
+    try std.testing.expectError(error.Corrupt, t.release(a_block, a));
+    try expect(t.fault == .size);
+    try expectEqual(b_block, t.fault.size.block);
+    b_hdr.* = b_saved & 0xF; // flags kept, size 0
+    try std.testing.expectError(error.Corrupt, t.release(a_block, a));
+    try expect(t.fault == .size);
+
+    // Backward merge from c: c's footer finds b, whose size doesn't end at c.
+    b_hdr.* = b_saved + half;
+    try std.testing.expectError(error.Corrupt, t.release(c_block, c));
+    try expect(t.fault == .footer);
+    try expectEqual(c_block, t.fault.footer.block);
+
+    for (region[half..]) |byte| try expectEqual(@as(u8, 0xA5), byte);
+    // Nothing was unlinked: with b's size back, the free list is whole.
+    b_hdr.* = b_saved;
+    try expect(t.validateFreelists(Loud) and t.validateCounters(Loud));
+}
+
+// === Pools ===
+
+const SLOT: usize = 64 * 1024;
+const SLOTS: usize = 64;
+var arena: [SLOT * SLOTS]u8 align(4096) = undefined;
+
+fn slotAddr(i: usize) usize {
+    return @intFromPtr(&arena) + i * SLOT;
+}
+
+fn freshArena(t: *tlsf.Tlsf) void {
+    @memset(&arena, 0x5A);
+    t.init();
+}
+
+test "adjacent pools stay apart, each reports empty on its own" {
+    var t: tlsf.Tlsf = undefined;
+    freshArena(&t);
+    try expect(t.addPool(slotAddr(1), SLOT)); // out of order on purpose
+    try expect(t.addPool(slotAddr(0), SLOT));
+    try expectEqual(slotAddr(0), t.pools[0].start);
+    try expectEqual(@as(u32, 2), t.free_blocks);
+    try expect(valid(&t));
+
+    // Half a pool each: the second can't fit beside the first.
+    const p = (try alloc(&t, SLOT / 2, 16)).?;
+    const q = (try alloc(&t, SLOT / 2, 16)).?;
+    const pp = t.poolOf(p).?;
+    const qp = t.poolOf(q).?;
+    try expect(pp != qp);
+    try expect(valid(&t));
+
+    const lp = t.locate(p);
+    try expectEqual(@as(?u32, pp), try t.release(lp.block, p));
+    try expect(t.poolIsEmpty(pp) and !t.poolIsEmpty(qp));
+    try expect(valid(&t));
+    const lq = t.locate(q);
+    try expectEqual(@as(?u32, qp), try t.release(lq.block, q));
+    try expect(valid(&t));
+
+    _ = try t.removePool(1);
+    _ = try t.removePool(0);
+    try expectEqual(@as(u32, 0), t.pool_count);
+    try expectEqual(@as(u64, 0), t.total_bytes);
+    try expectEqual(@as(u64, 0), t.free_bytes);
+    try expectEqual(@as(u32, 0), t.free_blocks);
+    try expect(valid(&t));
+    try expect((try t.alloc(16, 16)) == .oom);
+}
+
+test "the pool table fills up" {
+    var t: tlsf.Tlsf = undefined;
+    freshArena(&t);
+    for (0..tlsf.MAX_POOLS) |i| try expect(t.addPool(slotAddr(i % SLOTS) + (i / SLOTS) * 4096, 2 * tlsf.MIN_BLOCK_SIZE));
+    try expect(!t.addPool(slotAddr(SLOTS - 1) + SLOT / 2, 2 * tlsf.MIN_BLOCK_SIZE));
+    try expect(valid(&t));
+}
+
+test "canServe agrees with alloc on the OOM search" {
+    var t: tlsf.Tlsf = undefined;
+    freshArena(&t);
+    try expect(t.addPool(slotAddr(0), SLOT));
+    try expect(t.canServe(1000));
+    const search = while (true) {
+        switch (try t.alloc(1000, 16)) {
+            .ok => {},
+            .oom => |o| break o.search,
+        }
+    };
+    try expect(!t.canServe(search));
+    try expect(t.addPool(slotAddr(2), SLOT));
+    try expect(t.canServe(search));
+    try expect((try t.alloc(1000, 16)) == .ok);
+}
+
+test "gaps between pools are wild, links into them are caught" {
+    var t: tlsf.Tlsf = undefined;
+    freshArena(&t);
+    try expect(t.addPool(slotAddr(0), SLOT));
+    try expect(t.addPool(slotAddr(2), SLOT));
+    const gap = slotAddr(1) + 4 * tlsf.BLOCK_ALIGN;
+    try expect(t.locate(gap) == .wild);
+    try expect(!t.inBlockSpace(gap));
+    try expect(t.poolOf(gap) == null);
+    try expect(t.poolOf(slotAddr(1)) == null); // one past pool 0's end
+    try expectEqual(@as(?u32, 0), t.poolOf(slotAddr(1) - 1));
+
+    _ = (try alloc(&t, 48, 16)).?;
+    const b = (try alloc(&t, 48, 16)).?;
+    _ = (try alloc(&t, 48, 16)).?;
+    try free(&t, b);
+    @as(*usize, @ptrFromInt(b)).* = gap; // prev link into the gap
+    try std.testing.expectError(error.Corrupt, t.alloc(48, 16));
+    try expect(t.fault == .links);
+}
+
+/// Slot bookkeeping for the random test: pools are runs of free slots, placed
+/// at random so some end up adjacent and some leave gaps.
+const Slots = struct {
+    used: [SLOTS]bool = [_]bool{false} ** SLOTS,
+
+    fn grow(self: *Slots, t: *tlsf.Tlsf, rnd: std.Random, need: usize) !bool {
+        const k = @max(1, (need + tlsf.MIN_BLOCK_SIZE + SLOT - 1) / SLOT);
+        if (k > SLOTS) return false;
+        const first = rnd.uintLessThan(usize, SLOTS);
+        for (0..SLOTS) |d| {
+            const s = (first + d) % SLOTS;
+            if (s + k > SLOTS) continue;
+            const run_free = for (self.used[s .. s + k]) |u| {
+                if (u) break false;
+            } else true;
+            if (!run_free) continue;
+            if (!t.addPool(slotAddr(s), k * SLOT)) return false;
+            @memset(self.used[s .. s + k], true);
+            return true;
+        }
+        return false;
+    }
+
+    fn shrink(self: *Slots, t: *tlsf.Tlsf, i: u32) !void {
+        const p = try t.removePool(i);
+        const s = (p.start - @intFromPtr(&arena)) / SLOT;
+        @memset(self.used[s .. s + p.size / SLOT], false);
+    }
+
+    fn freeSlotAddr(self: *const Slots, rnd: std.Random) ?usize {
+        const first = rnd.uintLessThan(usize, SLOTS);
+        for (0..SLOTS) |d| {
+            const s = (first + d) % SLOTS;
+            if (!self.used[s]) return slotAddr(s) + 4 * tlsf.BLOCK_ALIGN;
+        }
+        return null;
+    }
+};
+
+test "random operations while pools grow and shrink" {
+    var t: tlsf.Tlsf = undefined;
+    const seeds = [_]u64{ 7, 11, 0xFEED, 0xBADC0DE };
+    var grown: u32 = 0;
+    var shrunk: u32 = 0;
+    var no_room: u32 = 0;
+    for (seeds) |seed| {
+        freshArena(&t);
+        var slots: Slots = .{};
+        var prng = std.Random.DefaultPrng.init(seed);
+        const rnd = prng.random();
+        var live: [768]Live = undefined;
+        var n: usize = 0;
+        for (0..6000) |step| {
+            const do_alloc = n == 0 or (n < live.len and rnd.uintLessThan(u8, 10) < 6);
+            if (do_alloc) {
+                const size: usize = switch (rnd.uintLessThan(u8, 40)) {
+                    0 => rnd.intRangeAtMost(usize, 65536, 200_000), // needs a multi-slot pool
+                    1 => rnd.intRangeAtMost(usize, 4097, 65536),
+                    2...8 => rnd.intRangeAtMost(usize, 257, 4096),
+                    else => rnd.intRangeAtMost(usize, 1, 256),
+                };
+                const alignment: usize = if (rnd.uintLessThan(u8, 5) == 0)
+                    @as(usize, 1) << rnd.intRangeAtMost(u6, 5, 12)
+                else
+                    16;
+                var res = try t.alloc(size, alignment);
+                if (res == .oom) {
+                    // heap.grow's race check: never "served" on a real OOM.
+                    try expect(!t.canServe(res.oom.search));
+                    if (try slots.grow(&t, rnd, tlsf.mappingAllocRoundUp(res.oom.search))) {
+                        grown += 1;
+                        try expect(t.canServe(res.oom.search));
+                        res = try t.alloc(size, alignment);
+                        // A pool that holds the searched class always serves it.
+                        try expect(res == .ok);
+                    } else no_room += 1;
+                }
+                if (res == .ok) {
+                    const p = res.ok;
+                    try expect(p % alignment == 0);
+                    const pi = t.poolOf(p).?;
+                    try expect(p + size <= t.pools[pi].wall());
+                    for (live[0..n]) |l| try expect(p + size <= l.p or l.p + l.size <= p);
+                    const tag: u8 = @truncate(step *% 131 +% 7);
+                    @memset(@as([*]u8, @ptrFromInt(p))[0..size], tag);
+                    live[n] = .{ .p = p, .size = size, .tag = tag };
+                    n += 1;
+                }
+            } else {
+                const k = rnd.uintLessThan(usize, n);
+                const l = live[k];
+                try checkPattern(l);
+                const loc = t.locate(l.p);
+                try expect(loc == .block);
+                try expect(t.tailFault(loc.block, l.p) == null);
+                if (try t.release(loc.block, l.p)) |pi| {
+                    try expect(t.poolIsEmpty(pi));
+                    // Keep some empty pools around, like heap.zig's spare.
+                    if (rnd.uintLessThan(u8, 4) != 0) {
+                        try slots.shrink(&t, pi);
+                        shrunk += 1;
+                    }
+                } else {
+                    try expect(t.locate(l.p) == .double_free);
+                }
+                live[k] = live[n - 1];
+                n -= 1;
+            }
+            if (rnd.uintLessThan(u8, 50) == 0) {
+                if (slots.freeSlotAddr(rnd)) |gap| {
+                    try expect(t.locate(gap) == .wild);
+                    try expect(!t.inBlockSpace(gap));
+                }
+            }
+            if (!valid(&t)) {
+                std.debug.print("seed {d} step {d}: validators failed\n", .{ seed, step });
+                return error.TestUnexpectedResult;
+            }
+        }
+        for (live[0..n]) |l| {
+            try checkPattern(l);
+            try free(&t, l.p);
+        }
+        var i: u32 = t.pool_count;
+        while (i > 0) {
+            i -= 1;
+            try expect(t.poolIsEmpty(i));
+            try slots.shrink(&t, i);
+        }
+        try expectEqual(@as(u64, 0), t.total_bytes);
+        try expectEqual(@as(u32, 0), t.free_blocks);
+        try expect(valid(&t));
+    }
+    try expect(grown > 0 and shrunk > 0 and no_room > 0);
 }

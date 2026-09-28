@@ -723,13 +723,16 @@ fn termPrompt(w: *Window) void {
 }
 
 fn createWindow(title: []const u8, x: i32, y: i32, w: u32, h: u32) ?u8 {
-    const flags = lockWindows();
-    defer unlockWindows(flags);
+    // Terminal data is vmalloc'd: allocate and free it outside windows_lock
+    // (IRQs off), since vmalloc.free waits for every CPU's TLB flush.
     const td = allocTerminalData() orelse return null;
+    const flags = lockWindows();
     const slot = allocSlot() orelse {
+        unlockWindows(flags);
         freeTerminalData(td);
         return null;
     };
+    defer unlockWindows(flags);
     windows[slot].x = x;
     windows[slot].y = y;
     windows[slot].width = w;
@@ -3820,13 +3823,12 @@ pub fn presentWindow(pid: u8) void {
 /// splices it out of z_stack. With stable slot IDs, no other slot's data
 /// is touched — outside references to other slots stay valid. Refs that
 /// were pointing AT this slot (focused, drag_win, resize_win) get cleaned
-/// up here.
-fn removeWindow(slot: u8) void {
-    if (slot >= MAX_WINDOWS or !slot_used[slot]) return;
-    if (windows[slot].term) |td| {
-        freeTerminalData(td);
-        windows[slot].term = null;
-    }
+/// up here. Returns the window's terminal data for the caller to free once
+/// windows_lock is dropped.
+fn removeWindow(slot: u8) ?*TerminalData {
+    if (slot >= MAX_WINDOWS or !slot_used[slot]) return null;
+    const term = windows[slot].term;
+    windows[slot].term = null;
     // Tear down shell pipes if this window had a user-space shell. Closing
     // the desktop's end drops the refcount; once the shell also closes
     // its end the pipe slot is freed by pipe.closeReader/Writer.
@@ -3854,10 +3856,14 @@ fn removeWindow(slot: u8) void {
     // Active drag/resize on the dying slot is cancelled.
     if (dragging and drag_win == slot) dragging = false;
     if (resizing and resize_win == slot) resizing = false;
+    return term;
 }
 
 /// Destroy GUI windows owned by the given process.
 pub fn destroyGuiWindow(pid: u8) void {
+    // Declared first so it runs after both locks are released.
+    var dead_terms: [MAX_WINDOWS]?*TerminalData = @splat(null);
+    defer for (dead_terms) |dt| if (dt) |t| freeTerminalData(t);
     // Mutex held across the whole teardown so growGuiFb cannot race
     // its publish + OLD-release sequence against our unmapGuiFB. See
     // the lock's declaration for the deadlock analysis. Lock order is
@@ -3894,7 +3900,7 @@ pub fn destroyGuiWindow(pid: u8) void {
                 pid, num_pages, free_before, free_after, free_after -% free_before,
             });
         }
-        removeWindow(i);
+        dead_terms[i] = removeWindow(i);
         dirty_rects_mod.force_full_kind = true;
         markDirtyFull();
     }

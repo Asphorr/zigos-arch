@@ -16,26 +16,37 @@
 // Why this exists: kernel symbols only know `function+offset`. Mapping back
 // to source line requires either a DWARF parser in-kernel (1000s of LoC,
 // dynamic state machine) or pre-resolution at build time. We do the latter
-// — pre-resolved entries are stable, compact (~16 bytes each), and lookup
-// is a binary search.
+// — pre-resolved entries are stable, compact (8 bytes each, format in
+// tools/gen_kernel_lines.py), and lookup is a binary search.
 //
-// Memory cost: typical kernel = ~50k entries × 16B = 800 KB + ~50 KB file
-// pool. Significant but bounded; freed if KERNEL.LINE is missing.
+// Memory: the file stays where vfs.loadFileFresh read it (a PMM buffer kept
+// for the whole uptime), not in the heap — ~250k entries = 2 MB.
 
-const serial = @import("serial.zig");
 const debug = @import("debug.zig");
-const heap = @import("../mm/heap.zig");
 const vfs = @import("../fs/vfs.zig");
 const paging = @import("../mm/paging.zig");
+const pmm = @import("../mm/pmm.zig");
 const Phys = @import("../util/addr.zig").Phys;
 
-const LINE_MAGIC: u32 = 0x4C494E45; // "LINE"
+const LINE_MAGIC: u32 = 0x324E494C; // "LIN2"
+
+const Header = extern struct {
+    magic: u32,
+    count: u32,
+    file_pool_len: u32,
+    reserved: u32,
+    addr_base: u64,
+};
 
 pub const LineEntry = extern struct {
-    addr: u64,
-    file_off: u32,
-    line: u32,
+    addr_off: u32,
+    file_off: u16,
+    line: u16,
 };
+
+comptime {
+    if (@sizeOf(Header) != 24 or @sizeOf(LineEntry) != 8) @compileError("KERNEL.LINE layout drifted from tools/gen_kernel_lines.py");
+}
 
 pub const LookupResult = struct {
     file: []const u8,
@@ -45,16 +56,16 @@ pub const LookupResult = struct {
 const Table = struct {
     entries: [*]const LineEntry,
     count: u32,
+    addr_base: u64,
     file_pool: [*]const u8,
     file_pool_len: u32,
 };
 
 var table: ?Table = null;
 
-/// Load KERNEL.LINE from disk into kernel heap. Idempotent — silently
-/// no-ops if already loaded or if the file is missing/malformed (any
-/// failure path leaves table = null and the autopsy falls through to its
-/// existing function+offset format).
+/// Load KERNEL.LINE. Idempotent — silently no-ops if already loaded or if
+/// the file is missing/malformed (any failure path leaves table = null and
+/// the autopsy falls through to its existing function+offset format).
 pub fn init() void {
     if (table != null) return;
 
@@ -62,63 +73,39 @@ pub fn init() void {
         debug.klog("[dwarf-line] KERNEL.LINE not found on disk\n", .{});
         return;
     };
-    const staging: [*]const u8 = fresh.buf;
-    const file_size = fresh.size;
-    defer {
-        // pmm.freeRange is the canonical "free a FreshFile / allocContiguous
-        // block" API — internally routes to freeContiguous, but the name
-        // signals "this isn't a per-frame free choice; just call it." Per-
-        // frame freeFrame loops stamp spurious canaries that read as fake
-        // UAF later.
-        const phys_base = paging.virtToPhys(@intFromPtr(fresh.buf)).?;
-        @import("../mm/pmm.zig").freeRange(Phys.of(phys_base), fresh.pages);
-    }
-
-    if (file_size < 12) {
-        debug.klog("[dwarf-line] KERNEL.LINE too small ({d} bytes)\n", .{file_size});
+    if (!adopt(fresh.buf, fresh.size)) {
+        pmm.freeRange(Phys.of(paging.virtToPhys(@intFromPtr(fresh.buf)).?), fresh.pages);
         return;
     }
+    const t = table.?;
+    debug.klog("[dwarf-line] Loaded {d} line entries ({d} bytes file pool, {d} KB in place)\n", .{ t.count, t.file_pool_len, @as(usize, fresh.pages) * 4 });
+}
 
-    const header_ptr: [*]const u32 = @ptrCast(@alignCast(staging));
-    const magic = header_ptr[0];
-    const entry_count = header_ptr[1];
-    const file_pool_size = header_ptr[2];
-
-    if (magic != LINE_MAGIC) {
-        debug.klog("[dwarf-line] Bad magic: 0x{X:0>8}\n", .{magic});
-        return;
+/// Validate the file image and point `table` into it.
+fn adopt(buf: [*]align(4) const u8, size: usize) bool {
+    if (size < @sizeOf(Header)) {
+        debug.klog("[dwarf-line] KERNEL.LINE too small ({d} bytes)\n", .{size});
+        return false;
     }
-
-    const entries_size = entry_count * @sizeOf(LineEntry);
-    const expected_size = 12 + entries_size + file_pool_size;
-    if (file_size < expected_size) {
-        debug.klog("[dwarf-line] File too small: {d} < {d}\n", .{ file_size, expected_size });
-        return;
+    const h: *const Header = @ptrCast(@alignCast(buf));
+    if (h.magic != LINE_MAGIC) {
+        debug.klog("[dwarf-line] Bad magic: 0x{X:0>8} (want LIN2 — stale KERNEL.LINE?)\n", .{h.magic});
+        return false;
     }
-
-    const entries_buf = heap.kmallocAligned(entries_size, 8) orelse {
-        debug.klog("[dwarf-line] Failed to allocate {d} bytes for entries\n", .{entries_size});
-        return;
-    };
-    const src_entries = staging + 12;
-    @memcpy(entries_buf[0..entries_size], src_entries[0..entries_size]);
-
-    const pool_buf = heap.kmalloc(file_pool_size) orelse {
-        heap.kfree(entries_buf);
-        debug.klog("[dwarf-line] Failed to allocate {d} bytes for file pool\n", .{file_pool_size});
-        return;
-    };
-    const src_pool = staging + 12 + entries_size;
-    @memcpy(pool_buf[0..file_pool_size], src_pool[0..file_pool_size]);
-
+    const entries_size = @as(usize, h.count) * @sizeOf(LineEntry);
+    const expected_size = @sizeOf(Header) + entries_size + h.file_pool_len;
+    if (size < expected_size) {
+        debug.klog("[dwarf-line] File too small: {d} < {d}\n", .{ size, expected_size });
+        return false;
+    }
     table = .{
-        .entries = @ptrCast(@alignCast(entries_buf)),
-        .count = entry_count,
-        .file_pool = pool_buf,
-        .file_pool_len = file_pool_size,
+        .entries = @ptrCast(@alignCast(buf + @sizeOf(Header))),
+        .count = h.count,
+        .addr_base = h.addr_base,
+        .file_pool = buf + @sizeOf(Header) + entries_size,
+        .file_pool_len = h.file_pool_len,
     };
-
-    debug.klog("[dwarf-line] Loaded {d} line entries ({d} bytes file pool)\n", .{ entry_count, file_pool_size });
+    return true;
 }
 
 /// Resolve a kernel address to (file, line). Returns null if no DWARF
@@ -128,13 +115,14 @@ pub fn init() void {
 /// this is the canonical interpretation.
 pub fn lookup(addr: u64) ?LookupResult {
     const t = table orelse return null;
-    if (t.count == 0) return null;
+    if (t.count == 0 or addr < t.addr_base) return null;
+    const off = addr - t.addr_base;
 
     var lo: u32 = 0;
     var hi: u32 = t.count;
     while (lo < hi) {
         const mid = lo + (hi - lo) / 2;
-        if (t.entries[mid].addr <= addr) {
+        if (t.entries[mid].addr_off <= off) {
             lo = mid + 1;
         } else {
             hi = mid;
@@ -146,8 +134,8 @@ pub fn lookup(addr: u64) ?LookupResult {
     // Sanity bound: if the next entry is more than 64 KB away (or this is
     // the last entry), the line entry probably doesn't actually cover
     // addr — better to return null than a misleading file:line.
-    const range_end: u64 = if (lo < t.count) t.entries[lo].addr else e.addr + 0x10000;
-    if (addr >= range_end) return null;
+    const range_end: u64 = if (lo < t.count) t.entries[lo].addr_off else @as(u64, e.addr_off) + 0x10000;
+    if (off >= range_end) return null;
 
     if (e.file_off >= t.file_pool_len) return null;
     const name_start = t.file_pool + e.file_off;

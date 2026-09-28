@@ -1,10 +1,10 @@
 // vmalloc — kernel allocator for non-DMA, non-contig-required buffers.
 //
-// kvmalloc (heap.zig) backs every allocation with one physically-contiguous
-// run from PMM. That's fine for small allocations but breaks once the heap
-// fragments: requesting 6 MB needs 1537 contiguous frames, which can't be
-// served after a few apps have churned the bitmap. The wallpaper bitmap
-// was the first thing big enough to feel the pinch.
+// A physically-contiguous run from PMM is fine for small allocations but
+// breaks once memory fragments: requesting 6 MB needs 1537 contiguous
+// frames, which can't be served after a few apps have churned the bitmap.
+// The wallpaper bitmap was the first thing big enough to feel the pinch;
+// heap.kvmalloc (kalloc's large path) now lands here too.
 //
 // This module returns a virtually-contiguous range backed by N individually
 // allocated PMM frames. Each frame can come from anywhere in physical
@@ -17,7 +17,7 @@
 // no-DMA, multi-MB.
 //
 // NOT for DMA. Drivers that hand a pointer to hardware (NVMe PRPs,
-// virtio queues, etc.) still need pmm.allocContiguous via kvmalloc.
+// virtio queues, etc.) still need pmm.allocContiguous.
 //
 // Modernization (2026-05-24): plugged into the rest of the kernel —
 //   - free() does a kernel-PCID TLB shootdown so other CPUs drop stale
@@ -28,7 +28,7 @@
 //   - PTEs carry NX by default; vmalloc is data-only, anyone executing
 //     from a vmalloc buffer is an attacker
 //   - alloc/free wrap kasan unpoison/poison so UAF on vmalloc'd memory
-//     surfaces the same way it does on kvmalloc
+//     surfaces the same way it does on the heap
 //   - atomic stats (pages_in_use, live_regions, peak_pages) exposed for
 //     /proc/meminfo + sysmon
 
@@ -41,6 +41,7 @@ const tlb = @import("../cpu/mmu/tlb.zig");
 const boot_phase = @import("../boot/boot_phase.zig");
 const kasan = @import("../debug/kasan.zig");
 const Phys = @import("../util/addr.zig").Phys;
+const irqsEnabled = @import("../time/pause.zig").irqsEnabled;
 
 /// Kernel VA arena. Sits in an otherwise-unused PML4 slot above the
 /// physmap (which owns slot 256 entirely). Slot 258 = 0xFFFF810000000000.
@@ -96,6 +97,11 @@ pub fn peakPagesInUse() u32 {
 }
 pub fn totalPages() u32 {
     return @intCast(NUM_PAGES);
+}
+
+/// `addr` is inside the arena (live or not).
+pub fn contains(addr: usize) bool {
+    return addr >= VMALLOC_BASE and addr < VMALLOC_BASE + VMALLOC_SIZE;
 }
 
 inline fn isFree(idx: usize) bool {
@@ -163,11 +169,8 @@ fn mapPage(va: usize, phys: Phys) bool {
     return true;
 }
 
-/// Inverse of mapPage. Returns the physical frame that was mapped, or
-/// null if nothing was there. Caller must perform a TLB shootdown for the
-/// VA AFTER the PMM frame has been freed (or batch the shootdown across
-/// many unmaps via `tlb.shootdownAll(0)`).
-fn unmapPage(va: usize) ?Phys {
+/// The arena PTE for `va`, or null if a table above it isn't there.
+fn ptePtr(va: usize) ?*volatile u64 {
     const pml4_phys = paging.getKernelPML4Phys();
     const pml4: [*]volatile u64 = @ptrFromInt(paging.physToVirt(pml4_phys));
     const pml4_idx = (va >> 39) & 0x1FF;
@@ -185,17 +188,25 @@ fn unmapPage(va: usize) ?Phys {
 
     const pt_phys = pd[pd_idx] & PAGE_MASK;
     const pt: [*]volatile u64 = @ptrFromInt(paging.physToVirt(pt_phys));
-    const pt_idx = (va >> 12) & 0x1FF;
-    const old = pt[pt_idx];
-    if (old & PRESENT == 0) return null;
-    pt[pt_idx] = 0;
-    // Local invlpg only. Caller is responsible for the cross-CPU shootdown
-    // (typically batched as one `tlb.shootdownAll(0)` covering all unmapped
-    // pages, instead of one IPI per page). See `free()` for the batching.
+    return &pt[(va >> 12) & 0x1FF];
+}
+
+inline fn invlpg(va: usize) void {
     asm volatile ("invlpg (%[addr])"
         :
         : [addr] "r" (va),
         : .{ .memory = true });
+}
+
+/// Inverse of mapPage with a local flush only. Returns the physical frame
+/// that was mapped, or null if nothing was there. Used on alloc's rollback,
+/// where no other CPU has had the address.
+fn unmapPage(va: usize) ?Phys {
+    const pte = ptePtr(va) orelse return null;
+    const old = pte.*;
+    if (old & PRESENT == 0) return null;
+    pte.* = 0;
+    invlpg(va);
     return Phys.of(old & PAGE_MASK);
 }
 
@@ -311,6 +322,10 @@ pub fn alloc(size: usize) ?[*]u8 {
 
 /// Free a region previously returned by `alloc`. Validates the header
 /// magic so a stray pointer doesn't silently corrupt the bitmap.
+///
+/// Waits for every CPU to flush its TLB, so never call it with interrupts
+/// off or under a spinlock another CPU may spin on with interrupts off: a
+/// CPU spinning there can't take the flush IPI.
 pub fn free(ptr: [*]u8) void {
     const addr = @intFromPtr(ptr);
     if (addr < VMALLOC_BASE + HEADER_PAD or addr >= VMALLOC_BASE + VMALLOC_SIZE) {
@@ -319,12 +334,12 @@ pub fn free(ptr: [*]u8) void {
     }
     const base_va = addr - HEADER_PAD;
     const hdr: *Header = @ptrFromInt(base_va);
-    if (hdr.magic != MAGIC) {
-        debug.klog("[vmalloc] free: bad magic 0x{X:0>16} at 0x{X}\n", .{ hdr.magic, base_va });
+    // One winner per region: the unmap below runs without the arena lock.
+    if (@cmpxchgStrong(u64, &hdr.magic, MAGIC, 0xDEADDEADDEADDEAD, .acq_rel, .monotonic)) |seen| {
+        debug.klog("[vmalloc] free: bad magic 0x{X:0>16} at 0x{X}\n", .{ seen, base_va });
         return;
     }
     const pages: usize = @intCast(hdr.pages);
-    hdr.magic = 0xDEADDEADDEADDEAD;
     const start = (base_va - VMALLOC_BASE) / 4096;
 
     // Poison the user-visible bytes BEFORE we drop the lock so any racing
@@ -332,29 +347,43 @@ pub fn free(ptr: [*]u8) void {
     // Size derived from header.pages × frame - header pad.
     kasan.poison(base_va + HEADER_PAD, pages * 4096 - HEADER_PAD, kasan.SHADOW_FREED);
 
-    lock.acquire();
-    defer lock.release();
+    const smp_up = boot_phase.isComplete();
+    if (smp_up and !irqsEnabled()) {
+        debug.kwarn(@src(), "vmalloc.free(0x{X}) with interrupts off: a CPU spinning with IF=0 on a lock we hold can't ack the TLB flush", .{addr});
+    }
 
+    // No arena lock from here to the bitmap update: the range stays marked
+    // used, so nothing else touches its PTEs, and the flush wait below
+    // must not hold a lock alloc spins on. PRESENT goes first; the frame
+    // address stays in the PTE until every CPU has flushed.
     var i: usize = 0;
     while (i < pages) : (i += 1) {
         const va = VMALLOC_BASE + (start + i) * 4096;
-        if (unmapPage(va)) |phys| pmm.freeFrame(phys);
-        setFree(start + i);
+        const pte = ptePtr(va) orelse continue;
+        pte.* &= ~PRESENT;
+        invlpg(va);
     }
 
-    // Cross-CPU TLB shootdown. Kernel-PCID (pcid 0) shootdown broadcasts
-    // to every alive CPU + toggles CR4.PGE on each (kernel mappings carry
-    // PGE so a CR3 reload alone won't evict them). One IPI batch covers
-    // the whole range — cheaper than per-page shootdownPage(0, va) when
-    // pages > 1. Gated on boot_phase: pre-scheduler boot only has cpu0 alive
-    // and the local invlpg inside unmapPage already sufficed; the shootdown
-    // IPI fan-out machinery may not even be armed yet.
-    //
-    // Without this, freed PMM frames could be observed live on another CPU
-    // via a stale kernel TLB entry — catastrophic if PMM has handed the
-    // frame back out for, say, a page table. Latent SMP UAF bug pre-2026-05-24.
-    if (boot_phase.isComplete()) {
-        tlb.shootdownAll(0);
+    // Kernel-PCID shootdown: every alive CPU drops the range (CR4.PGE
+    // toggle, since these PTEs are global) before PMM can hand a frame
+    // out again, say as a page table. One batch for the whole range.
+    // Before the scheduler only cpu0 runs and the local invlpg suffices.
+    if (smp_up) tlb.shootdownAll(0);
+
+    i = 0;
+    while (i < pages) : (i += 1) {
+        const va = VMALLOC_BASE + (start + i) * 4096;
+        const pte = ptePtr(va) orelse continue;
+        const old = pte.*;
+        pte.* = 0;
+        if (old & PAGE_MASK != 0) pmm.freeFrame(Phys.of(old & PAGE_MASK));
+    }
+
+    {
+        lock.acquire();
+        defer lock.release();
+        i = 0;
+        while (i < pages) : (i += 1) setFree(start + i);
     }
 
     if (pages_in_use.load(.monotonic) >= pages) {

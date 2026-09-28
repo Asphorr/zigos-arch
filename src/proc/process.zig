@@ -63,7 +63,7 @@ const INIT_CWD: [256]u8 = blk: {
 // initKstackGuards and accessed through the physmap, so slot i sits at
 // `base + i*KSTACK_SLOT_SIZE` exactly as the old array did — every consumer's
 // `&kstack_pool[i]` math is byte-identical. Moved out of BSS so MAX_PROCS no
-// longer bloats the kernel image past KERNEL_HEAP_BASE (68KB/proc was the
+// longer bloats the kernel image past its limit (68KB/proc was the
 // dominant term). Shared across address spaces via the physmap's PML4[256]
 // entry — which createAddressSpace copies — so the guards we punch before the
 // first user process are inherited. Pool slot i ↔ procs[i]. `undefined` until

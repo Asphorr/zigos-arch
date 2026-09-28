@@ -52,9 +52,9 @@ fn render(addr: usize) ![]const u8 {
     // 2. Physmap window — kernel's view of any phys frame.
     if (addr >= memmap.PHYSMAP_BASE and addr < memmap.PHYSMAP_BASE + memmap.PHYSMAP_SIZE) {
         const phys = addr - memmap.PHYSMAP_BASE;
-        if (addr >= heap.HEAP_START and addr < heap.HEAP_START + heap.HEAP_SIZE) {
-            return std.fmt.bufPrint(&buf, "heap[+0x{x}/0x{x}] phys=0x{x}", .{
-                addr - heap.HEAP_START, heap.HEAP_SIZE, phys,
+        if (heap.poolForDiag(addr)) |p| {
+            return std.fmt.bufPrint(&buf, "heap pool 0x{x}[+0x{x}/0x{x}] phys=0x{x}", .{
+                p.start, addr - p.start, p.size, phys,
             });
         }
         if (slab.querySlabAddr(addr)) |info| {

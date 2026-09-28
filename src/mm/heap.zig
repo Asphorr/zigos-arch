@@ -1,20 +1,26 @@
 // Kernel heap: the TLSF core (tlsf.zig — block layout, free lists,
-// corruption detectors, validators) over the fixed physmap window at
-// KERNEL_HEAP_BASE, under one IRQ-safe spinlock. This file is the kernel
-// side: the lock, the kmalloc/kfree API, stats, kasan/kdbg hooks, the
-// panics on corruption, the boot self-test, and kvmalloc (PMM-backed).
+// corruption detectors, validators) over pools of PMM frames reached
+// through the physmap, under one IRQ-safe spinlock. This file is the kernel
+// side: where pools come from, the lock, the kmalloc/kfree API, stats,
+// kasan/kdbg hooks, the panics on corruption, the boot self-test, and
+// kvmalloc (vmalloc-backed).
+//
+// Pools: BASE_POOL_BYTES at init, kept for good; on OOM a GROW_BYTES pool
+// (bigger for one large request) is taken from PMM outside the lock. A
+// grown pool that empties goes back to PMM unless it is the only empty one.
 //
 // TLSF replaced a first-fit free-list allocator 2026-05-24: its O(n) walk
 // and fragmentation tail failed 64 KB asks with plenty of bytes free.
 //
 // Public API: kmalloc / kmallocAligned / kfree / kalloc / kfreeAuto /
-// kvmalloc / kvfree / validateHeap / validateInvariants / validateFreelists /
-// printDetailedStats / printStats / snapshot / Stats / selfTest.
+// kvmalloc / kvfree / contains / validateHeap / validateInvariants /
+// validateFreelists / printDetailedStats / printStats / snapshot / Stats /
+// selfTest.
 
 // Core:
 const std = @import("std");
-const memmap = @import("memmap.zig");
 const pmm = @import("pmm.zig");
+const vmalloc = @import("vmalloc.zig");
 const paging = @import("paging.zig");
 const tlsf = @import("tlsf.zig");
 const Phys = @import("../util/addr.zig").Phys;
@@ -28,13 +34,16 @@ const kasan = @import("../debug/kasan.zig");
 const kdbg = @import("../debug/kdbg.zig");
 const layout = @import("../debug/layout.zig");
 
-pub const HEAP_START: usize = memmap.PHYSMAP_BASE + memmap.KERNEL_HEAP_BASE;
-pub const HEAP_SIZE: usize = memmap.KERNEL_HEAP_SIZE;
-// Sentinel wall: the last MIN_BLOCK_SIZE bytes, never user-visible.
-const WALL_ADDR: usize = HEAP_START + HEAP_SIZE - tlsf.MIN_BLOCK_SIZE;
+const BASE_POOL_BYTES: usize = 2 * 1024 * 1024;
+const GROW_BYTES: usize = 2 * 1024 * 1024;
+/// Largest single kmalloc; bigger buffers belong in vmalloc.
+pub const MAX_ALLOC: usize = 8 * 1024 * 1024;
 
 comptime {
-    if (HEAP_SIZE > tlsf.MAX_REGION) @compileError("KERNEL_HEAP_SIZE exceeds tlsf.MAX_REGION");
+    // A pool sized for MAX_ALLOC at the largest alignment must fit one pool.
+    if (poolBytesFor(tlsf.mappingAllocRoundUp(MAX_ALLOC + MAX_ALLOC + 2 * tlsf.MIN_BLOCK_SIZE + 64)) > tlsf.MAX_REGION)
+        @compileError("MAX_ALLOC too large for tlsf.MAX_REGION");
+    if (BASE_POOL_BYTES % 4096 != 0 or GROW_BYTES % 4096 != 0) @compileError("pools are whole frames");
     // Hand-overlaid block storage: if any field widens, the user pointer /
     // free-list math breaks silently (the 2026-05-28 `?usize` link overlap
     // — see debug/layout.zig).
@@ -56,6 +65,8 @@ comptime {
 var initialized: bool = false;
 var lock: SpinLock = .{};
 var core: tlsf.Tlsf = undefined;
+/// The pool init() took; never handed back.
+var base_pool_start: usize = 0;
 
 // Stats (sysmon/cli output).
 var alloc_count: u32 = 0;
@@ -64,16 +75,106 @@ var current_alloc: u32 = 0;
 var peak_alloc: u32 = 0;
 var current_bytes: u64 = 0;
 var peak_bytes: u64 = 0;
+var pools_grown: u32 = 0;
+var pools_returned: u32 = 0;
 
+/// After pmm.init: the base pool comes from PMM.
 pub fn init() void {
     spinlock.registerLock("heap.lock", &lock);
-    core.init(HEAP_START, HEAP_SIZE);
+    core.init();
+    const phys = pmm.allocContiguous(BASE_POOL_BYTES / 4096) orelse @panic("heap: no frames for the base pool");
+    base_pool_start = phys.toVirt().raw();
+    if (!core.addPool(base_pool_start, BASE_POOL_BYTES)) unreachable;
     initialized = true;
-    debug.klog("[tlsf] Initialized: 0x{X:0>16} - 0x{X:0>16} ({d} KB heap, big_block={d} KB, FL={d} SL={d})\n", .{ HEAP_START, HEAP_START + HEAP_SIZE, HEAP_SIZE / 1024, core.free_bytes / 1024, tlsf.FL_INDEX_COUNT, tlsf.SL_INDEX_COUNT });
+    debug.klog("[tlsf] Initialized: base pool 0x{X:0>16} ({d} KB), grows by {d} KB pools from PMM (FL={d} SL={d})\n", .{ base_pool_start, BASE_POOL_BYTES / 1024, GROW_BYTES / 1024, tlsf.FL_INDEX_COUNT, tlsf.SL_INDEX_COUNT });
 }
 
 inline fn alignUp(addr: usize, alignment: usize) usize {
     return (addr + alignment - 1) & ~(alignment - 1);
+}
+
+/// A pool whose one free block serves a search of `search` bytes (already
+/// rounded to its class by tlsf.mappingAllocRoundUp).
+fn poolBytesFor(search: usize) usize {
+    return @max(GROW_BYTES, alignUp(search + tlsf.MIN_BLOCK_SIZE, GROW_BYTES));
+}
+
+/// Take a pool from PMM for an allocation that searched `search` bytes and
+/// add it to the core. Called without the heap lock: PMM has its own. When
+/// PMM is too fragmented for a GROW_BYTES run, a pool of just the pages this
+/// request needs still lets it through. True when the caller should retry.
+fn grow(search: usize) bool {
+    const rounded = tlsf.mappingAllocRoundUp(search);
+    var bytes = poolBytesFor(rounded);
+    const phys = pmm.allocContiguous(@intCast(bytes / 4096)) orelse blk: {
+        const least = alignUp(rounded + tlsf.MIN_BLOCK_SIZE, 4096);
+        debug.klog("[tlsf] grow: PMM has no {d} KB run, trying {d} KB\n", .{ bytes / 1024, least / 1024 });
+        bytes = least;
+        break :blk pmm.allocContiguous(@intCast(bytes / 4096)) orelse {
+            debug.klog("[tlsf] grow: PMM has no {d} KB run either\n", .{bytes / 1024});
+            return false;
+        };
+    };
+    const pages: u32 = @intCast(bytes / 4096);
+    const start = phys.toVirt().raw();
+    const irq_flags = lock.acquireIrqSave();
+    // A CPU that hit the same OOM may have grown the heap meanwhile; a
+    // second pool would sit empty, never emptied by a free to hand back.
+    const raced = core.canServe(search);
+    const added = !raced and core.addPool(start, bytes);
+    if (added) pools_grown += 1;
+    const pools = core.pool_count;
+    const total = core.total_bytes;
+    lock.releaseIrqRestore(irq_flags);
+    if (raced) {
+        pmm.freeContiguous(phys, pages);
+        return true;
+    }
+    if (!added) {
+        pmm.freeContiguous(phys, pages);
+        debug.klog("[tlsf] grow: pool table full ({d} pools)\n", .{tlsf.MAX_POOLS});
+        return false;
+    }
+    debug.klog("[tlsf] grew: +{d} KB pool at 0x{X:0>16} for a {d}-byte search ({d} pools, {d} KB)\n", .{ bytes / 1024, start, search, pools, total / 1024 });
+    return true;
+}
+
+/// Pool `pi` just emptied. The base pool and one empty grown pool stay (so
+/// an alloc/free pair at a pool's edge doesn't bounce frames through PMM);
+/// any other comes out of the core for the caller to hand back.
+fn takeSurplusPool(pi: u32) tlsf.Corrupt!?tlsf.Pool {
+    if (core.pools[pi].start == base_pool_start) return null;
+    var empty_grown: u32 = 0;
+    for (core.pools[0..core.pool_count], 0..) |p, i| {
+        if (p.start != base_pool_start and core.poolIsEmpty(@intCast(i))) empty_grown += 1;
+    }
+    if (empty_grown <= 1) return null;
+    pools_returned += 1;
+    return try core.removePool(pi);
+}
+
+/// Return a pool taken out by takeSurplusPool. Without the heap lock.
+fn givePoolBack(p: tlsf.Pool) void {
+    const pages: u32 = @intCast(p.size / 4096);
+    pmm.freeContiguous(Phys.of(paging.virtToPhys(p.start).?), pages);
+    debug.klog("[tlsf] returned: {d} KB pool at 0x{X:0>16} to PMM\n", .{ p.size / 1024, p.start });
+}
+
+/// The heap pool holding `addr`, read WITHOUT the lock — for diagnostics
+/// that may run while the lock is held (panic autopsy). A racing pool
+/// change can make the answer stale, never unsafe: only the table is read.
+pub fn poolForDiag(addr: usize) ?tlsf.Pool {
+    if (!initialized) return null;
+    const i = core.poolOf(addr) orelse return null;
+    return core.pools[i];
+}
+
+/// `addr` is inside a heap pool, before its wall.
+pub fn contains(addr: usize) bool {
+    if (!initialized) return false;
+    const irq_flags = lock.acquireIrqSave();
+    defer lock.releaseIrqRestore(irq_flags);
+    return core.inBlockSpace(addr);
 }
 
 /// Report structural corruption the core stopped at (core.fault), drop the
@@ -92,6 +193,12 @@ fn corruptPanic(irq_flags: u64) noreturn {
             kdbg.attributeHeapCorruptor(f.block - tlsf.FOOTER_SIZE);
             lock.releaseIrqRestore(irq_flags);
             @panic("tlsf: prev-block footer corrupted — heap underflow");
+        },
+        .size => |f| {
+            serial.print("\n!!! HEAP CORRUPTION: free block 0x{X:0>16} claims size {d}, which its pool can't hold (overflow from below?)\n", .{ f.block, f.size });
+            kdbg.attributeHeapCorruptor(f.block);
+            lock.releaseIrqRestore(irq_flags);
+            @panic("tlsf: free block size corrupted");
         },
     }
 }
@@ -118,30 +225,39 @@ pub fn kmallocAligned(size: usize, alignment: usize) ?[*]u8 {
     // Reject absurd requests up front: nothing past this point can succeed,
     // and the size arithmetic (prefix sums, the u32 user_size store) would
     // otherwise trip ReleaseSafe overflow panics instead of log + null.
-    if (size > HEAP_SIZE or alignment > HEAP_SIZE) {
-        debug.klog("[tlsf] alloc fail: size={d} align={d} exceeds heap ({d})\n", .{ size, alignment, HEAP_SIZE });
+    if (size > MAX_ALLOC or alignment > MAX_ALLOC) {
+        debug.klog("[tlsf] alloc fail: size={d} align={d} exceeds MAX_ALLOC ({d})\n", .{ size, alignment, MAX_ALLOC });
         return null;
     }
-    const irq_flags = lock.acquireIrqSave();
-    const r = core.alloc(size, alignment) catch corruptPanic(irq_flags);
-    if (r == .ok) {
-        alloc_count += 1;
-        current_alloc += 1;
-        current_bytes += size;
-        if (current_alloc > peak_alloc) peak_alloc = current_alloc;
-        if (current_bytes > peak_bytes) peak_bytes = current_bytes;
-        kasan.allocHook(r.ok, size);
-    }
-    lock.releaseIrqRestore(irq_flags);
-    switch (r) {
-        .ok => |user_ptr| return @ptrFromInt(user_ptr),
-        .oom => |o| {
-            // Logged after the unlock: serial output with IRQs off stalls
-            // every CPU that wants the heap.
-            debug.klog("[tlsf] alloc fail: no block for size={d} align={d} need_block={d} search={d}\n", .{ size, alignment, o.need_block, o.search });
-            debug.klog("[tlsf]   fl_bitmap=0x{X} free_blocks={d} free_bytes={d} largest={d}\n", .{ o.fl_bitmap, o.free_blocks, o.free_bytes, o.largest });
-            return null;
-        },
+    var grown: u32 = 0;
+    while (true) {
+        const irq_flags = lock.acquireIrqSave();
+        const r = core.alloc(size, alignment) catch corruptPanic(irq_flags);
+        if (r == .ok) {
+            alloc_count += 1;
+            current_alloc += 1;
+            current_bytes += size;
+            if (current_alloc > peak_alloc) peak_alloc = current_alloc;
+            if (current_bytes > peak_bytes) peak_bytes = current_bytes;
+            kasan.allocHook(r.ok, size);
+        }
+        lock.releaseIrqRestore(irq_flags);
+        switch (r) {
+            .ok => |user_ptr| return @ptrFromInt(user_ptr),
+            .oom => |o| {
+                // Another CPU can use up a new pool before the retry: two
+                // tries, then give up.
+                if (grown < 2 and grow(o.search)) {
+                    grown += 1;
+                    continue;
+                }
+                // Logged after the unlock: serial output with IRQs off stalls
+                // every CPU that wants the heap.
+                debug.klog("[tlsf] alloc fail: no block for size={d} align={d} need_block={d} search={d}\n", .{ size, alignment, o.need_block, o.search });
+                debug.klog("[tlsf]   fl_bitmap=0x{X} free_blocks={d} free_bytes={d} largest={d}\n", .{ o.fl_bitmap, o.free_blocks, o.free_bytes, o.largest });
+                return null;
+            },
+        }
     }
 }
 
@@ -149,10 +265,12 @@ pub fn kmallocAligned(size: usize, alignment: usize) ?[*]u8 {
 pub fn kfree(ptr: [*]u8) void {
     if (!initialized) return;
     const addr = @intFromPtr(ptr);
-    // Pointers into the wall are rejected too, so a stale ptr can't trick
+    const irq_flags = lock.acquireIrqSave();
+    // Pointers into a wall are rejected too, so a stale ptr can't trick
     // scan-back into reading the wall's header and freeing the real block
-    // in front of it (H5).
-    if (addr < HEAP_START or addr >= WALL_ADDR) {
+    // in front of it (H5). Checked under the lock: pools come and go.
+    if (!core.inBlockSpace(addr)) {
+        lock.releaseIrqRestore(irq_flags);
         const ra = @returnAddress();
         if (@import("../debug/symbols.zig").resolveKernelNearest(@as(u64, ra))) |sym| {
             serial.print("[tlsf] kfree: ptr 0x{X} outside the heap — ignored (caller {s}+0x{X})\n", .{ addr, sym.name, sym.offset });
@@ -161,7 +279,6 @@ pub fn kfree(ptr: [*]u8) void {
         }
         return;
     }
-    const irq_flags = lock.acquireIrqSave();
 
     // Each @panic below releases the lock first — see corruptPanic.
     const block_addr = switch (core.locate(addr)) {
@@ -204,8 +321,10 @@ pub fn kfree(ptr: [*]u8) void {
     if (current_bytes >= user_size) current_bytes -= user_size;
     kasan.freeHook(addr, user_size);
 
-    core.release(block_addr, addr) catch corruptPanic(irq_flags);
+    const emptied = core.release(block_addr, addr) catch corruptPanic(irq_flags);
+    const surplus = if (emptied) |pi| takeSurplusPool(pi) catch corruptPanic(irq_flags) else null;
     lock.releaseIrqRestore(irq_flags);
+    if (surplus) |p| givePoolBack(p);
 }
 
 // === Validation ===
@@ -318,17 +437,18 @@ pub fn printDetailedStats(use_vga: bool) void {
     // largest_free is an upper bound between recomputes; displays want the
     // real value. O(free_blocks), trivial for an observability path.
     core.recomputeLargestFreeBlock();
+    const total = core.total_bytes;
     const free_bytes = core.free_bytes;
     const free_blocks = core.free_blocks;
     const largest = core.largest_free;
-    const used_bytes = if (HEAP_SIZE > free_bytes) HEAP_SIZE - free_bytes else 0;
-    const pct = if (HEAP_SIZE > 0) (used_bytes * 100) / HEAP_SIZE else 0;
+    const used_bytes = if (total > free_bytes) total - free_bytes else 0;
+    const pct = if (total > 0) (used_bytes * 100) / total else 0;
     const frag_pct = fragPct(largest, free_bytes);
     if (use_vga) {
         vga.fg = .Yellow;
         vga.print("Heap Statistics (TLSF)\n", .{});
         vga.fg = .LightGray;
-        vga.print("  Total:        {d} KB\n", .{HEAP_SIZE / 1024});
+        vga.print("  Total:        {d} KB in {d} pools ({d} grown, {d} returned)\n", .{ total / 1024, core.pool_count, pools_grown, pools_returned });
         vga.print("  Used:         {d} KB ({d}%)\n", .{ used_bytes / 1024, pct });
         vga.print("  Free:         {d} KB in {d} blocks\n", .{ free_bytes / 1024, free_blocks });
         vga.print("  Largest free: {d} KB ({d}% fragmented)\n", .{ largest / 1024, frag_pct });
@@ -351,7 +471,7 @@ pub fn printDetailedStats(use_vga: bool) void {
         }
         vga.fg = .LightGray;
     } else {
-        serial.print("[tlsf] Total: {d} KB, Used: {d} KB ({d}%), Free: {d} KB in {d} blocks (largest {d} KB, frag {d}%)\n", .{ HEAP_SIZE / 1024, used_bytes / 1024, pct, free_bytes / 1024, free_blocks, largest / 1024, frag_pct });
+        serial.print("[tlsf] Total: {d} KB in {d} pools ({d} grown, {d} returned), Used: {d} KB ({d}%), Free: {d} KB in {d} blocks (largest {d} KB, frag {d}%)\n", .{ total / 1024, core.pool_count, pools_grown, pools_returned, used_bytes / 1024, pct, free_bytes / 1024, free_blocks, largest / 1024, frag_pct });
         serial.print("[tlsf] Allocs: {d} total, {d} freed, {d} live, peak: {d}\n", .{ alloc_count, free_count, current_alloc, peak_alloc });
     }
 }
@@ -365,6 +485,9 @@ pub const Stats = struct {
     fragmentation_pct: u32,
     live_allocs: u32,
     peak_allocs: u32,
+    pools: u32,
+    pools_grown: u32,
+    pools_returned: u32,
 };
 
 pub fn snapshot() Stats {
@@ -373,16 +496,20 @@ pub fn snapshot() Stats {
     const irq_flags = lock.acquireIrqSave();
     defer lock.releaseIrqRestore(irq_flags);
     core.recomputeLargestFreeBlock();
+    const total = core.total_bytes;
     const free_bytes = core.free_bytes;
     return .{
-        .total_bytes = HEAP_SIZE,
-        .used_bytes = if (HEAP_SIZE > free_bytes) HEAP_SIZE - free_bytes else 0,
+        .total_bytes = total,
+        .used_bytes = if (total > free_bytes) total - free_bytes else 0,
         .free_bytes = free_bytes,
         .free_blocks = core.free_blocks,
         .largest_free = core.largest_free,
         .fragmentation_pct = fragPct(core.largest_free, free_bytes),
         .live_allocs = current_alloc,
         .peak_allocs = peak_alloc,
+        .pools = core.pool_count,
+        .pools_grown = pools_grown,
+        .pools_returned = pools_returned,
     };
 }
 
@@ -390,99 +517,35 @@ pub fn printStats() void {
     printDetailedStats(false);
 }
 
-// === kvmalloc / kvfree (PMM-backed) ===
+// === kvmalloc / kvfree (vmalloc-backed) ===
 //
-// Routes large allocations through PMM directly: page-rounded contiguous
-// frames, identity-mapped through the physmap, no heap traffic. Right
-// choice for anything page-aligned or above a few KB.
+// Large buffers go to vmalloc: whole pages mapped virtually contiguous over
+// scattered frames, so they need neither a contiguous PMM run nor room in a
+// heap pool. CPU-only memory — nothing here may be handed to a device.
+// Freeing one waits for a TLB flush on every CPU: kvfree, and kfreeAuto on
+// a kalloc of KVMALLOC_THRESHOLD or more, need interrupts on and no
+// spinlock held (see vmalloc.free).
 
 const KVMALLOC_THRESHOLD: usize = 16 * 1024;
-const KV_MAGIC: u64 = 0x4B564D414C4C4F43; // "KVMALLOC"
-
-const KvHeader = extern struct {
-    magic: u64,
-    pages: u32,
-    user_offset: u32,
-};
 
 pub fn kalloc(size: usize) ?[*]u8 {
-    if (size >= KVMALLOC_THRESHOLD) return kvmalloc(size, 16);
+    if (size >= KVMALLOC_THRESHOLD) return kvmalloc(size);
     return kmalloc(size);
 }
 
 pub fn kfreeAuto(ptr: [*]u8) void {
     const addr = @intFromPtr(ptr);
-    if (addr >= HEAP_START and addr < HEAP_START + HEAP_SIZE) {
-        kfree(ptr);
-        return;
-    }
-    // The KvHeader lives at the start of the page containing (addr - 1) —
-    // NOT the page containing addr: a 4096-aligned kvmalloc places the user
-    // pointer exactly one page past the header, and `addr & ~0xFFF` would
-    // land on the user's own first page and read their data as a header
-    // (legit free → "orphan pointer" panic).
-    if (addr != 0) {
-        const page_base = (addr - 1) & ~@as(usize, 0xFFF);
-        if (page_base != 0) {
-            const hdr: *const KvHeader = @ptrFromInt(page_base);
-            if (hdr.magic == KV_MAGIC and addr - page_base == hdr.user_offset) {
-                kvfree(ptr);
-                return;
-            }
-        }
-    }
-    serial.print("[tlsf] kfreeAuto: ptr 0x{X} matches no allocator (heap or kv)\n", .{addr});
+    if (vmalloc.contains(addr)) return kvfree(ptr);
+    if (contains(addr)) return kfree(ptr);
+    serial.print("[tlsf] kfreeAuto: ptr 0x{X} matches no allocator (heap or vmalloc)\n", .{addr});
     @panic("kfreeAuto: orphan pointer");
 }
 
-pub fn kvmalloc(size: usize, alignment: usize) ?[*]u8 {
-    if (size == 0) return null;
-    // Same power-of-two requirement as kmallocAligned (M3).
-    if (alignment != 0 and (alignment & (alignment - 1)) != 0) return null;
-    const align_real = if (alignment < 16) 16 else alignment;
-    // 4096 is the hard ceiling: kvfree finds the header at the start of the
-    // page containing (user_ptr - 1), which only works while the header pad
-    // is at most one page.
-    if (align_real > 4096) return null;
-    const header_pad = alignUp(@sizeOf(KvHeader), align_real);
-    const total = header_pad + size;
-    const pages: u32 = @intCast((total + 4095) / 4096);
-    const phys = pmm.allocContiguous(pages) orelse return null;
-    const virt_base = phys.toVirt().raw();
-    const hdr: *KvHeader = @ptrFromInt(virt_base);
-    hdr.* = .{
-        .magic = KV_MAGIC,
-        .pages = pages,
-        .user_offset = @intCast(header_pad),
-    };
-    return @ptrFromInt(virt_base + header_pad);
+/// `size` bytes, 16-aligned, from vmalloc.
+pub fn kvmalloc(size: usize) ?[*]u8 {
+    return vmalloc.alloc(size);
 }
 
 pub fn kvfree(ptr: [*]u8) void {
-    const addr = @intFromPtr(ptr);
-    // Header page = the page containing (addr - 1). See kfreeAuto for why
-    // this is NOT `addr & ~0xFFF`: a 4096-aligned kvmalloc puts the user
-    // pointer exactly one page past the header.
-    if (addr == 0) {
-        serial.print("[tlsf] kvfree: bad ptr 0x{X}\n", .{addr});
-        return;
-    }
-    const page_base = (addr - 1) & ~@as(usize, 0xFFF);
-    if (page_base == 0) {
-        serial.print("[tlsf] kvfree: bad ptr 0x{X}\n", .{addr});
-        return;
-    }
-    const hdr: *const KvHeader = @ptrFromInt(page_base);
-    if (hdr.magic != KV_MAGIC) {
-        serial.print("[tlsf] kvfree: bad magic at 0x{X}: 0x{X}\n", .{ page_base, hdr.magic });
-        @panic("kvfree: bad magic — double-free, type confusion, or non-kvmalloc ptr");
-    }
-    if (addr - page_base != hdr.user_offset) {
-        serial.print("[tlsf] kvfree: bad offset {d} (expected {d}) for ptr 0x{X}\n", .{ addr - page_base, hdr.user_offset, addr });
-        @panic("kvfree: corrupted header");
-    }
-    const pages = hdr.pages;
-    const hdr_mut: *KvHeader = @ptrFromInt(page_base);
-    hdr_mut.magic = 0xDEADDEADDEADDEAD;
-    pmm.freeContiguous(Phys.of(paging.virtToPhys(page_base).?), pages);
+    vmalloc.free(ptr);
 }

@@ -303,8 +303,8 @@ pub fn topSlot() ?u8 {
 }
 
 pub fn allocTerminalData() ?*TerminalData {
-    // ~36 KB — well above kvmalloc threshold; bypasses the small kernel heap
-    // (4 MB) so opening a few terminals doesn't fragment it.
+    // ~36 KB — above the kvmalloc threshold, so it comes from vmalloc and
+    // opening a few terminals doesn't fragment the heap.
     const ptr = heap.kalloc(@sizeOf(TerminalData)) orelse return null;
     const td: *TerminalData = @ptrCast(@alignCast(ptr));
     td.* = .{

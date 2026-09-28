@@ -840,7 +840,7 @@ const BLUR_SCRATCH_BYTES: usize = BLUR_MAX_W * BLUR_MAX_H * @sizeOf(u32);
 
 // Heap-allocated lazily on the first blur call. Lives in .bss as a
 // pointer (8 bytes) instead of a 900 KB static array, which keeps the
-// kernel image well clear of KERNEL_HEAP_BASE — see assertKernelImageFits.
+// kernel image well clear of its limit — see assertKernelImageFits.
 var blur_scratch_ptr: ?[*]u32 = null;
 
 fn blurScratch() ?[*]u32 {

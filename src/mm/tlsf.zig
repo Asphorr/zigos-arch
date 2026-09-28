@@ -1,8 +1,9 @@
-//! TLSF (Two-Level Segregated Fit) allocator core over one contiguous
-//! region: block layout, free lists, kfree's corruption detectors and the
-//! validators. Imports only std, so tools/heap-test drives it under
-//! `zig test`; heap.zig owns the kernel instance, its lock, the stats, the
-//! kasan/kdbg hooks and every panic.
+//! TLSF (Two-Level Segregated Fit) allocator core over a set of pools
+//! (disjoint contiguous regions): block layout, free lists, kfree's
+//! corruption detectors and the validators. Imports only std, so
+//! tools/heap-test drives it under `zig test`; heap.zig owns the kernel
+//! instance, its lock, where pools come from, the stats, the kasan/kdbg
+//! hooks and every panic.
 //!
 //! Properties:
 //!   - Bounded O(1) alloc and free (bitmap-indexed free lists; @ctz/@clz for
@@ -37,9 +38,10 @@
 //! allocs. For alignment > 16, the user pointer is shifted further into the
 //! block (padding stays as dead bytes inside the allocation); user_size and
 //! canary_head always sit in the 8 bytes right below it. The last
-//! MIN_BLOCK_SIZE bytes of the region are a permanently-allocated sentinel
+//! MIN_BLOCK_SIZE bytes of each pool are a permanently-allocated sentinel
 //! "wall", so coalesce-forward always stops on an in-bounds, non-free
-//! neighbour.
+//! neighbour and blocks never merge across pools. A pool's first block
+//! has PREV_FREE clear, so coalesce-backward stops at the pool start.
 
 const std = @import("std");
 
@@ -81,11 +83,12 @@ const SL_INDEX_LOG2: u6 = 4;
 pub const SL_INDEX_COUNT: usize = 1 << SL_INDEX_LOG2;
 const SL_INDEX_MASK: usize = SL_INDEX_COUNT - 1;
 // Largest mapped block class is 2^26 (64 MB): one full FL above the largest
-// region (MAX_REGION), so mappingAllocRoundUp never carries past the last
+// pool (MAX_REGION), so mappingAllocRoundUp never carries past the last
 // bucket.
 const FL_INDEX_MAX_LOG2: u6 = 26;
 pub const FL_INDEX_COUNT: usize = FL_INDEX_MAX_LOG2 - FL_INDEX_SHIFT + 1; // 19
 pub const MAX_REGION: usize = @as(usize, 1) << (FL_INDEX_MAX_LOG2 - 1);
+pub const MAX_POOLS: usize = 64;
 
 // === Raw block accessors (addresses, not instance state) ===
 
@@ -199,26 +202,43 @@ pub const Located = union(enum) {
 pub const TailFault = enum { size_overflows_block, canary };
 
 /// Structural corruption found while unlinking or coalescing. The operation
-/// stops at the fault, leaving the region as it found it past that point;
+/// stops at the fault, leaving the pools as it found them past that point;
 /// the kernel panics on it.
 pub const Fault = union(enum) {
     /// A free block's neighbours don't point back at it (use-after-free
     /// write over its links).
     links: struct { block: usize, next: usize, prev: usize },
-    /// The footer below `block` decodes to an impossible predecessor (heap
-    /// underflow over the previous block's tail).
+    /// The footer below `block` decodes to an impossible predecessor, or to
+    /// a free block that doesn't end at `block` (heap underflow over the
+    /// previous block's tail).
     footer: struct { block: usize, prev: usize },
+    /// A free block's header claims a size its pool can't hold: past the
+    /// wall, or under the minimum (an overflow of the block below rewrote
+    /// it).
+    size: struct { block: usize, size: usize },
 };
 
 pub const Corrupt = error{Corrupt};
 
+/// One contiguous region: blocks over [start, wall), the sentinel wall
+/// over [wall, start + size).
+pub const Pool = struct {
+    start: usize,
+    size: usize,
+
+    pub inline fn wall(p: Pool) usize {
+        return p.start + p.size - MIN_BLOCK_SIZE;
+    }
+};
+
 // === The allocator ===
 
 pub const Tlsf = struct {
-    start: usize,
-    size: usize,
-    /// Sentinel wall: the last MIN_BLOCK_SIZE bytes of the region.
-    wall: usize,
+    /// Sorted by start, disjoint.
+    pools: [MAX_POOLS]Pool,
+    pool_count: u32,
+    /// Sum of pool sizes, walls included.
+    total_bytes: u64,
 
     // Bitmaps: bit i in fl_bitmap set iff sl_bitmaps[i] != 0.
     //          bit j in sl_bitmaps[i] set iff free_lists[i][j] != 0.
@@ -236,15 +256,12 @@ pub const Tlsf = struct {
     /// Set whenever an operation returns error.Corrupt.
     fault: Fault,
 
-    /// One free block over [start, start+size) minus the wall. `start` 16-
-    /// aligned, `size` a 16-multiple in [2 * MIN_BLOCK_SIZE, MAX_REGION].
-    pub fn init(self: *Tlsf, start: usize, size: usize) void {
-        std.debug.assert(start & BLOCK_ALIGN_MASK == 0 and size & BLOCK_ALIGN_MASK == 0);
-        std.debug.assert(size >= 2 * MIN_BLOCK_SIZE and size <= MAX_REGION);
+    /// No pools: every alloc reports oom until addPool.
+    pub fn init(self: *Tlsf) void {
         self.* = .{
-            .start = start,
-            .size = size,
-            .wall = start + size - MIN_BLOCK_SIZE,
+            .pools = undefined,
+            .pool_count = 0,
+            .total_bytes = 0,
             .fl_bitmap = 0,
             .sl_bitmaps = [_]u16{0} ** FL_INDEX_COUNT,
             .free_lists = [_][SL_INDEX_COUNT]usize{[_]usize{0} ** SL_INDEX_COUNT} ** FL_INDEX_COUNT,
@@ -253,18 +270,80 @@ pub const Tlsf = struct {
             .largest_free = 0,
             .fault = undefined,
         };
-        const big_size = self.wall - start;
+    }
+
+    /// Add [start, start+size) as one free block before its wall. `start`
+    /// 16-aligned, `size` a 16-multiple in [2 * MIN_BLOCK_SIZE, MAX_REGION],
+    /// disjoint from every pool. False (nothing written) if the table is full.
+    pub fn addPool(self: *Tlsf, start: usize, size: usize) bool {
+        std.debug.assert(start & BLOCK_ALIGN_MASK == 0 and size & BLOCK_ALIGN_MASK == 0);
+        std.debug.assert(size >= 2 * MIN_BLOCK_SIZE and size <= MAX_REGION);
+        if (self.pool_count == MAX_POOLS) return false;
+        const at = self.firstPoolAfter(start);
+        if (at > 0) std.debug.assert(self.pools[at - 1].start + self.pools[at - 1].size <= start);
+        if (at < self.pool_count) std.debug.assert(start + size <= self.pools[at].start);
+        var i: u32 = self.pool_count;
+        while (i > at) : (i -= 1) self.pools[i] = self.pools[i - 1];
+        const pool: Pool = .{ .start = start, .size = size };
+        self.pools[at] = pool;
+        self.pool_count += 1;
+        self.total_bytes += size;
+
+        const big_size = pool.wall() - start;
         writeHeader(start, big_size, true, false);
         writeFooter(start);
         // Wall: allocated, never freed, PREV_FREE set (the big block in
         // front of it is free).
-        writeHeader(self.wall, MIN_BLOCK_SIZE, false, true);
-        self.free_bytes = big_size;
+        writeHeader(pool.wall(), MIN_BLOCK_SIZE, false, true);
+        self.free_bytes += big_size;
         self.insertFreeBlock(start);
+        return true;
     }
 
-    inline fn end(self: *const Tlsf) usize {
-        return self.start + self.size;
+    /// Index of the first pool starting above `addr` (pool_count if none).
+    fn firstPoolAfter(self: *const Tlsf, addr: usize) u32 {
+        var lo: u32 = 0;
+        var hi: u32 = self.pool_count;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (self.pools[mid].start <= addr) lo = mid + 1 else hi = mid;
+        }
+        return lo;
+    }
+
+    /// Index of the pool whose [start, start + size) holds `addr`. The
+    /// `addr >= start` test is redundant under the owner's lock; it keeps an
+    /// unlocked diagnostic read of a table mid-shift from underflowing.
+    pub fn poolOf(self: *const Tlsf, addr: usize) ?u32 {
+        const after = self.firstPoolAfter(addr);
+        if (after == 0) return null;
+        const p = self.pools[after - 1];
+        return if (addr >= p.start and addr - p.start < p.size) after - 1 else null;
+    }
+
+    /// `addr` lies before some pool's wall: where blocks and user bytes live.
+    pub fn inBlockSpace(self: *const Tlsf, addr: usize) bool {
+        const i = self.poolOf(addr) orelse return false;
+        return addr < self.pools[i].wall();
+    }
+
+    /// Pool `i` holds nothing: one free block from its start to its wall.
+    pub fn poolIsEmpty(self: *const Tlsf, i: u32) bool {
+        const p = self.pools[i];
+        return blockIsFree(p.start) and blockSize(p.start) == p.wall() - p.start;
+    }
+
+    /// Take empty pool `i` out; its memory is the caller's again.
+    pub fn removePool(self: *Tlsf, i: u32) Corrupt!Pool {
+        std.debug.assert(i < self.pool_count and self.poolIsEmpty(i));
+        const p = self.pools[i];
+        try self.removeFreeBlock(p.start);
+        self.free_bytes -= p.wall() - p.start;
+        self.total_bytes -= p.size;
+        var j: u32 = i;
+        while (j + 1 < self.pool_count) : (j += 1) self.pools[j] = self.pools[j + 1];
+        self.pool_count -= 1;
+        return p;
     }
 
     // Find the smallest non-empty (fl, sl) >= the input, or null.
@@ -296,7 +375,7 @@ pub const Tlsf = struct {
     }
 
     inline fn linkInRegion(self: *const Tlsf, p: usize) bool {
-        return p >= self.start and p < self.wall and (p & BLOCK_ALIGN_MASK) == 0;
+        return (p & BLOCK_ALIGN_MASK) == 0 and self.inBlockSpace(p);
     }
 
     /// Both neighbours of free block `addr` point back at it. The links are
@@ -337,9 +416,16 @@ pub const Tlsf = struct {
         if (self.free_blocks > 0) self.free_blocks -= 1;
     }
 
+    /// A free block exists that an alloc searching `search` bytes (as in
+    /// AllocResult.oom) would take.
+    pub fn canServe(self: *const Tlsf, search: usize) bool {
+        const m = mapping(mappingAllocRoundUp(search));
+        return self.searchSuitableBlock(m.fl, m.sl) != null;
+    }
+
     /// Allocate `size` bytes aligned to `alignment`; returns the user
-    /// pointer. Caller validated 0 < size <= self.size and a power-of-two
-    /// alignment <= self.size. Alignments up to BLOCK_ALIGN are natural;
+    /// pointer. Caller validated 0 < size <= MAX_REGION and a power-of-two
+    /// alignment <= MAX_REGION. Alignments up to BLOCK_ALIGN are natural;
     /// higher ones carve a front pad off a larger block.
     pub fn alloc(self: *Tlsf, size: usize, alignment: usize) Corrupt!AllocResult {
         // Block size including the 16-byte prefix and the 4-byte tail
@@ -371,8 +457,16 @@ pub const Tlsf = struct {
         };
 
         const block_addr = self.free_lists[found.fl][found.sl];
-        try self.removeFreeBlock(block_addr);
         const block_sz = blockSize(block_addr);
+        // Every write below stays inside [block_addr, block_addr + block_sz]
+        // (the header after it included), so that range must end at or
+        // before its pool's wall.
+        const room: usize = if (self.poolOf(block_addr)) |pi| self.pools[pi].wall() -| block_addr else 0;
+        if (block_sz < MIN_BLOCK_SIZE or block_sz > room) {
+            self.fault = .{ .size = .{ .block = block_addr, .size = block_sz } };
+            return error.Corrupt;
+        }
+        try self.removeFreeBlock(block_addr);
 
         // User pointer: naturally block_addr + USER_OFFSET. For higher
         // alignment, shift up; the bytes between USER_OFFSET and the aligned
@@ -416,11 +510,12 @@ pub const Tlsf = struct {
                 writeHeader(tail_addr, remainder, true, false);
                 writeFooter(tail_addr);
                 self.insertFreeBlock(tail_addr);
-                if (tail_addr + remainder < self.end()) setPrevFreeFlag(tail_addr + remainder, true);
+                // The next block (at worst the wall) exists: checked above.
+                setPrevFreeFlag(tail_addr + remainder, true);
                 break :blk consumed_clamped;
             } else {
                 writeHeader(alloc_block_addr, cur_block_sz, false, alloc_prev_free);
-                if (alloc_block_addr + cur_block_sz < self.end()) setPrevFreeFlag(alloc_block_addr + cur_block_sz, false);
+                setPrevFreeFlag(alloc_block_addr + cur_block_sz, false);
                 break :blk cur_block_sz;
             }
         };
@@ -439,8 +534,8 @@ pub const Tlsf = struct {
         return .{ .ok = user_ptr };
     }
 
-    /// The allocated block whose user pointer is `addr`, for any `addr` in
-    /// [start, wall).
+    /// The allocated block whose user pointer is `addr`, for any `addr`
+    /// (outside every pool's block space it is wild).
     ///
     /// Scans back from (addr - USER_OFFSET) at 16-byte grains. TWO grains
     /// suffice, provably: alloc yields exactly two layouts. Natural
@@ -456,31 +551,34 @@ pub const Tlsf = struct {
         // Every user pointer is 16-aligned (natural, or aligned further);
         // this also keeps the u32 reads at addr-8 / addr-4 aligned.
         if (addr & BLOCK_ALIGN_MASK != 0) return .wild;
+        const pi = self.poolOf(addr) orelse return .wild;
+        const pool = self.pools[pi];
+        const wall = pool.wall();
+        if (addr >= wall) return .wild;
         const SCAN_LIMIT: usize = 2 * BLOCK_ALIGN;
         var block_addr: usize = (addr -% USER_OFFSET) & ~BLOCK_ALIGN_MASK;
         var scanned: usize = 0;
         while (scanned < SCAN_LIMIT) : (scanned += BLOCK_ALIGN) {
-            if (block_addr < self.start or block_addr >= self.wall) break;
+            if (block_addr < pool.start or block_addr >= wall) break;
             const hdr_raw = headerPtr(block_addr).*;
             const sz = hdr_raw & SIZE_MASK;
             const this_free = (hdr_raw & FLAG_THIS_FREE) != 0;
             // Containment: the user pointer must actually live inside this
             // candidate block — else a stale ptr whose addr-4 happens to be
             // CANARY_HEAD could free the wrong block.
-            if (!this_free and sz >= MIN_BLOCK_SIZE and sz <= self.size and
-                block_addr + sz <= self.end() and
+            if (!this_free and sz >= MIN_BLOCK_SIZE and sz <= wall - block_addr and
                 addr >= block_addr + USER_OFFSET and addr < block_addr + sz)
             {
                 const ch: *const u32 = @ptrFromInt(addr - 4);
                 if (ch.* == CANARY_HEAD) return .{ .block = block_addr };
             }
-            if (block_addr <= self.start) break; // next step would leave the region
+            if (block_addr <= pool.start) break; // next step would leave the pool
             block_addr -= BLOCK_ALIGN;
         }
         // Not live. Only now tell a repeated free from a wild pointer: the
         // probes above may read a buried pad's garbage grain, which must
         // never decide.
-        if (addr < self.start + USER_OFFSET) return .wild;
+        if (addr < pool.start + USER_OFFSET) return .wild;
         // Merged into a free predecessor (or a buried block heading its
         // run): canary_head still holds release()'s poison.
         if (@as(*const u32, @ptrFromInt(addr - 4)).* == CANARY_FREED) return .double_free;
@@ -488,7 +586,7 @@ pub const Tlsf = struct {
         // poison, but its own header now says free.
         const b = addr - USER_OFFSET;
         const sz = blockSize(b);
-        if (blockIsFree(b) and sz >= MIN_BLOCK_SIZE and b + sz <= self.end()) return .double_free;
+        if (blockIsFree(b) and sz >= MIN_BLOCK_SIZE and sz <= wall - b) return .double_free;
         return .wild;
     }
 
@@ -512,36 +610,57 @@ pub const Tlsf = struct {
 
     /// Free live block `block_addr` (user pointer `addr`), both already
     /// checked by locate + tailFault: poison canary_head, coalesce with free
-    /// neighbours, relist.
-    pub fn release(self: *Tlsf, block_addr: usize, addr: usize) Corrupt!void {
+    /// neighbours, relist. Returns the block's pool index when that pool is
+    /// now empty (poolIsEmpty), else null.
+    pub fn release(self: *Tlsf, block_addr: usize, addr: usize) Corrupt!?u32 {
+        const pi = self.poolOf(block_addr).?;
+        const pool = self.pools[pi];
+        const wall = pool.wall();
         @as(*u32, @ptrFromInt(addr - 4)).* = CANARY_FREED;
 
         // Only `freed_size` joins free_bytes: merged neighbours were already
         // counted while free (the 2026-05-24 double count showed 233546 KB
         // free on a 16 MB heap).
         const freed_size: usize = blockSize(block_addr);
-        var merge_addr = block_addr;
-        var merge_size = freed_size;
+        // Both neighbours' sizes are checked before anything is unlinked:
+        // a merge trusting a rewritten size writes its footer outside the
+        // pool, into whatever PMM gave out next to it.
+        var prev_free: ?usize = null;
         if (blockPrevFree(block_addr)) {
             const prev_addr = prevPhysAddr(block_addr);
             // The footer borders the previous block's user region — a heap
             // underflow shreds it and prev_addr becomes garbage.
-            if (prev_addr < self.start or prev_addr >= block_addr or
-                (prev_addr & BLOCK_ALIGN_MASK) != 0)
+            if (prev_addr < pool.start or prev_addr >= block_addr or
+                (prev_addr & BLOCK_ALIGN_MASK) != 0 or
+                (blockIsFree(prev_addr) and blockSize(prev_addr) != block_addr - prev_addr))
             {
                 self.fault = .{ .footer = .{ .block = block_addr, .prev = prev_addr } };
                 return error.Corrupt;
             }
-            if (blockIsFree(prev_addr)) {
-                try self.removeFreeBlock(prev_addr);
-                merge_addr = prev_addr;
-                merge_size = blockSize(prev_addr) + merge_size;
-            }
+            if (blockIsFree(prev_addr)) prev_free = prev_addr;
         }
-        const next_addr = merge_addr + merge_size;
-        if (next_addr < self.end() and blockIsFree(next_addr)) {
-            try self.removeFreeBlock(next_addr);
-            merge_size += blockSize(next_addr);
+        // The wall is never free, so the forward merge stops at it.
+        const next_addr = block_addr + freed_size;
+        var next_free: ?usize = null;
+        if (next_addr < wall and blockIsFree(next_addr)) {
+            const next_size = blockSize(next_addr);
+            if (next_size < MIN_BLOCK_SIZE or next_size > wall - next_addr) {
+                self.fault = .{ .size = .{ .block = next_addr, .size = next_size } };
+                return error.Corrupt;
+            }
+            next_free = next_addr;
+        }
+
+        var merge_addr = block_addr;
+        var merge_size = freed_size;
+        if (prev_free) |p| {
+            try self.removeFreeBlock(p);
+            merge_addr = p;
+            merge_size += block_addr - p;
+        }
+        if (next_free) |n| {
+            try self.removeFreeBlock(n);
+            merge_size += blockSize(n);
         }
 
         writeHeader(merge_addr, merge_size, true, blockPrevFree(merge_addr));
@@ -549,7 +668,8 @@ pub const Tlsf = struct {
         self.insertFreeBlock(merge_addr);
         self.free_bytes += freed_size;
         const after = merge_addr + merge_size;
-        if (after < self.end()) setPrevFreeFlag(after, true);
+        if (after <= wall) setPrevFreeFlag(after, true);
+        return if (merge_addr == pool.start and after == wall) pi else null;
     }
 
     pub fn recomputeLargestFreeBlock(self: *Tlsf) void {
@@ -568,17 +688,33 @@ pub const Tlsf = struct {
 
     // === Validators — `Log` is any type with `pub fn print(comptime fmt, args)` ===
 
-    /// Walk every block: header consistency, the canaries of every allocated
-    /// block (both layouts; the wall is the one exemption), PREV_FREE
-    /// agreement.
+    /// Walk every block of every pool: header consistency, the canaries of
+    /// every allocated block (both layouts; walls are the one exemption),
+    /// PREV_FREE agreement, each walk ending exactly on its wall.
     pub fn validateBlocks(self: *const Tlsf, comptime Log: type) bool {
         var errors: u32 = 0;
-        var addr: usize = self.start;
+        for (self.pools[0..self.pool_count]) |pool| {
+            if (!validatePoolBlocks(pool, Log)) errors += 1;
+        }
+        return errors == 0;
+    }
+
+    fn validatePoolBlocks(pool: Pool, comptime Log: type) bool {
+        var errors: u32 = 0;
+        const end = pool.start + pool.size;
+        var addr: usize = pool.start;
         var prev_was_free: bool = false;
-        while (addr < self.end()) {
+        while (addr < end) {
             const sz = blockSize(addr);
-            if (sz < MIN_BLOCK_SIZE or (sz & BLOCK_ALIGN_MASK) != 0 or addr + sz > self.end()) {
+            if (sz < MIN_BLOCK_SIZE or (sz & BLOCK_ALIGN_MASK) != 0 or addr + sz > end or
+                (addr < pool.wall() and addr + sz > pool.wall()))
+            {
                 Log.print("[tlsf] validate: bad size {d} at 0x{X:0>16}\n", .{ sz, addr });
+                errors += 1;
+                break;
+            }
+            if (addr == pool.wall() and blockIsFree(addr)) {
+                Log.print("[tlsf] validate: wall at 0x{X:0>16} is marked free\n", .{addr});
                 errors += 1;
                 break;
             }
@@ -594,7 +730,7 @@ pub const Tlsf = struct {
                     errors += 1;
                 }
                 prev_was_free = true;
-            } else if (addr != self.wall) {
+            } else if (addr != pool.wall()) {
                 // Natural layout first: for buried blocks +12 holds the upper
                 // half of a stale link, stale user bytes or CANARY_FREED —
                 // never CANARY_HEAD — so the order can't misattribute. Both
@@ -634,30 +770,47 @@ pub const Tlsf = struct {
     }
 
     /// Re-derive free_bytes / free_blocks / largest_free from a block walk
-    /// and compare with the incrementally-maintained counters.
+    /// and compare with the incrementally-maintained counters; the pool
+    /// table must be sorted, disjoint and sum to total_bytes.
     pub fn validateCounters(self: *const Tlsf, comptime Log: type) bool {
         var walked_free_bytes: u64 = 0;
         var walked_free_blocks: u32 = 0;
         var walked_largest: usize = 0;
         var walked_alloc_bytes: u64 = 0;
-        var addr: usize = self.start;
-        while (addr < self.end()) {
-            const sz = blockSize(addr);
-            if (sz < MIN_BLOCK_SIZE or addr + sz > self.end()) {
-                Log.print("[tlsf] inv: walk derailed at 0x{X:0>16} (sz={d}) — structural corruption, can't audit\n", .{ addr, sz });
-                return false;
+        var pool_bytes: u64 = 0;
+        for (self.pools[0..self.pool_count], 0..) |pool, i| {
+            if (i > 0) {
+                const below = self.pools[i - 1];
+                if (below.start + below.size > pool.start) {
+                    Log.print("[tlsf] inv: pool {d} at 0x{X:0>16} overlaps or precedes pool {d}\n", .{ i, pool.start, i - 1 });
+                    return false;
+                }
             }
-            if (blockIsFree(addr)) {
-                walked_free_bytes += sz;
-                walked_free_blocks += 1;
-                walked_largest = @max(walked_largest, sz);
-            } else {
-                walked_alloc_bytes += sz;
+            pool_bytes += pool.size;
+            const end = pool.start + pool.size;
+            var addr: usize = pool.start;
+            while (addr < end) {
+                const sz = blockSize(addr);
+                if (sz < MIN_BLOCK_SIZE or addr + sz > end) {
+                    Log.print("[tlsf] inv: walk derailed at 0x{X:0>16} (sz={d}) — structural corruption, can't audit\n", .{ addr, sz });
+                    return false;
+                }
+                if (blockIsFree(addr)) {
+                    walked_free_bytes += sz;
+                    walked_free_blocks += 1;
+                    walked_largest = @max(walked_largest, sz);
+                } else {
+                    walked_alloc_bytes += sz;
+                }
+                addr += sz;
             }
-            addr += sz;
         }
 
         var ok = true;
+        if (pool_bytes != self.total_bytes) {
+            Log.print("[tlsf] inv: total_bytes={d} but pools sum to {d}\n", .{ self.total_bytes, pool_bytes });
+            ok = false;
+        }
         if (walked_free_bytes != self.free_bytes) {
             Log.print("[tlsf] inv: free_bytes={d} but walk says {d}\n", .{ self.free_bytes, walked_free_bytes });
             ok = false;
@@ -672,15 +825,15 @@ pub const Tlsf = struct {
             Log.print("[tlsf] inv: largest_free={d} but walk found {d}\n", .{ self.largest_free, walked_largest });
             ok = false;
         }
-        // The wall is counted in walked_alloc_bytes.
-        if (walked_free_bytes + walked_alloc_bytes != self.size) {
-            Log.print("[tlsf] inv: walked free+alloc={d} but region size is {d}\n", .{ walked_free_bytes + walked_alloc_bytes, self.size });
+        // Walls are counted in walked_alloc_bytes.
+        if (walked_free_bytes + walked_alloc_bytes != pool_bytes) {
+            Log.print("[tlsf] inv: walked free+alloc={d} but the pools hold {d}\n", .{ walked_free_bytes + walked_alloc_bytes, pool_bytes });
             ok = false;
         }
         return ok;
     }
 
-    /// Walk every free list: links in the region and aligned, THIS_FREE set,
+    /// Walk every free list: blocks in a pool and aligned, THIS_FREE set,
     /// block in its mapped bucket, back-link symmetry, bitmap bits ⇔
     /// non-empty lists, visited count == free_blocks (cycle-capped).
     pub fn validateFreelists(self: *const Tlsf, comptime Log: type) bool {
@@ -713,8 +866,8 @@ pub const Tlsf = struct {
                         Log.print("[tlsf] fl-inv: bucket [{d}][{d}] over visit cap (cycle? count={d})\n", .{ fl, sl, self.free_blocks });
                         return false;
                     }
-                    if (cur < self.start or cur >= self.end()) {
-                        Log.print("[tlsf] fl-inv: bucket [{d}][{d}] block 0x{X} out of region\n", .{ fl, sl, cur });
+                    if (!self.inBlockSpace(cur)) {
+                        Log.print("[tlsf] fl-inv: bucket [{d}][{d}] block 0x{X} outside every pool\n", .{ fl, sl, cur });
                         return false;
                     }
                     if ((cur & BLOCK_ALIGN_MASK) != 0) {
@@ -726,7 +879,7 @@ pub const Tlsf = struct {
                         ok = false;
                     }
                     const sz = blockSize(cur);
-                    if (sz < MIN_BLOCK_SIZE or sz > self.size) {
+                    if (sz < MIN_BLOCK_SIZE or sz > self.pools[self.poolOf(cur).?].wall() - cur) {
                         Log.print("[tlsf] fl-inv: bucket [{d}][{d}] block 0x{X} bad size {d}\n", .{ fl, sl, cur, sz });
                         return false;
                     }

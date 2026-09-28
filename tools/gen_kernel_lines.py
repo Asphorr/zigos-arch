@@ -10,16 +10,21 @@ into a sorted (addr, file, line) array, dedupe consecutive entries that map
 to the same (file, line) — only transition points matter for lookup — and
 emit a compact binary the kernel loads at boot.
 
-Binary format:
-  u32 magic = 0x4C494E45 ("LINE")
+Binary format (little-endian, 8 bytes per entry):
+  u32 magic = 0x324E494C ("LIN2")
   u32 entry_count
   u32 file_pool_size
+  u32 reserved = 0
+  u64 addr_base      # address of the first entry
   [entry_count] x {
-    u64 addr,
-    u32 file_off,    # offset into file pool (null-terminated string)
-    u32 line,
+    u32 addr_off,    # entry address - addr_base
+    u16 file_off,    # offset into file pool (null-terminated string)
+    u16 line,
   }
   [file_pool_size] bytes of null-terminated filenames
+
+The kernel uses the file in place (src/debug/dwarf_line.zig), so every
+field must fit its width; the script fails the build rather than truncate.
 
 Lookup: binary search for the largest entry where entry.addr <= target.
 That entry's (file, line) is the source location.
@@ -29,7 +34,7 @@ import re
 import struct
 import sys
 
-MAGIC = 0x4C494E45  # "LINE"
+MAGIC = 0x324E494C  # "LIN2"
 
 # Match a data line:  "filename       LINENUM    0xADDR    [trailing flags]"
 # The locale of objdump may localize column headers, but the data rows are
@@ -99,11 +104,19 @@ def main():
         file_pool.extend(fname.encode("ascii", errors="replace"))
         file_pool.append(0)
 
+    base = deduped[0][0] if deduped else 0
+    span = deduped[-1][0] - base if deduped else 0
+    max_line = max((line for _, _, line in deduped), default=0)
+    if span > 0xFFFFFFFF or len(file_pool) > 0xFFFF or max_line > 0xFFFF:
+        print(f"[gen_kernel_lines] ERROR: does not fit LIN2 (addr span 0x{span:X}, "
+              f"name pool {len(file_pool)} bytes, max line {max_line})", file=sys.stderr)
+        sys.exit(1)
+
     # Emit the binary.
     with open(output, "wb") as f:
-        f.write(struct.pack("<III", MAGIC, len(deduped), len(file_pool)))
+        f.write(struct.pack("<IIIIQ", MAGIC, len(deduped), len(file_pool), 0, base))
         for addr, fname, line in deduped:
-            f.write(struct.pack("<QII", addr, file_offs[fname], line))
+            f.write(struct.pack("<IHH", addr - base, file_offs[fname], line))
         f.write(bytes(file_pool))
 
     print(f"[gen_kernel_lines] {len(deduped)} entries, {len(file_offs)} files, {len(file_pool)} bytes name pool, output {os.path.getsize(output)} bytes", file=sys.stderr)

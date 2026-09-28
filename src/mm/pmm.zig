@@ -12,7 +12,7 @@ pub const Phys = @import("../util/addr.zig").Phys;
 const FRAME_SIZE: u32 = 4096;
 // 1 GB cap: bitmap = 32 KB, frame_refs = 256 KB. ZigOS QEMU configs use
 // 64-256 MB so 1 GB is far more than needed; the cap exists to keep static
-// BSS small enough that _kernel_end stays below KERNEL_HEAP_BASE (0x800000).
+// BSS small enough that _kernel_end stays below GUEST_FB_BASE.
 // Frames above 1 GB in the memory map are skipped at init time with a
 // warning — bump this if a config ever genuinely wants more RAM exposed.
 const MAX_FRAMES: u32 = 256 * 1024;
@@ -544,13 +544,12 @@ pub fn init(info: *const boot_info.BootInfo) void {
     const kernel_end = memmap.kernelEndPhys();
     markRegionUsedRaw(memmap.KERNEL_PHYS_START, kernel_end - memmap.KERNEL_PHYS_START);
     kernel_phys_end = kernel_end; // arm tripwire — see checkPhysSafety
-    markRegionUsedRaw(memmap.KERNEL_HEAP_BASE, memmap.KERNEL_HEAP_SIZE); // Kernel heap (16 MB)
     markRegionUsedRaw(memmap.GUEST_FB_BASE, memmap.GUEST_FB_SIZE); // Guest FB (8 MB)
     markRegionUsedRaw(memmap.BACK_BUFFER_BASE, memmap.BACK_BUFFER_SIZE); // Back buffer (8 MB)
     if (@import("../boot/boot_info.zig").is_uefi) {
-        // UEFI page tables live at 0x1C00000..0x1C40000. See memmap.zig
-        // (UEFI_PT_BASE) for the rationale — kasan.init's 32 MB shadow
-        // alloc otherwise overwrites them and kernel halts on wild CR3.
+        // UEFI page tables at UEFI_PT_BASE (256 KB). See memmap.zig for the
+        // rationale — kasan.init's 32 MB shadow alloc otherwise overwrites
+        // them and kernel halts on wild CR3.
         markRegionUsedRaw(memmap.UEFI_PT_BASE, memmap.UEFI_PT_SIZE);
     }
 

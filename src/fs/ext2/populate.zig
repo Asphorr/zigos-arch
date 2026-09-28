@@ -34,8 +34,8 @@ const debug = @import("../../debug/debug.zig");
 /// writeBlockRun folds each into one or two NVMe commands on a fresh fs).
 ///
 /// PMM-BACKED, allocated on first use and reached through the physmap —
-/// NOT static BSS. As statics these pushed _kernel_end past
-/// KERNEL_HEAP_BASE and the boot died in assertKernelImageFits; same
+/// NOT static BSS. As statics these pushed _kernel_end past the image
+/// limit and the boot died in assertKernelImageFits; same
 /// lesson proc.process.kstack_pool learned. Never freed: one install per
 /// boot, and the installer's only exit is a reboot.
 var target_mount_ptr: ?*block.Mount = null;

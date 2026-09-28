@@ -14,21 +14,16 @@
 // updating this file, which causes the `comptime` agreement assertion
 // in src/mm/memmap.zig to either pass or fail loudly at build time.
 //
-// Order of dependence: kernel-side memmap regions (HEAP, GFB, BB) are
-// arithmetic on KERNEL_HEAP_BASE + sizes; UEFI_PT_BASE is the address
-// at the end of that chain; PAGE_TABLES_ADDR + siblings must equal
-// UEFI_PT_BASE.
+// Order of dependence: kernel-side memmap regions (GFB, BB) are arithmetic
+// on GUEST_FB_BASE + sizes; UEFI_PT_BASE is the address at the end of that
+// chain; PAGE_TABLES_ADDR + siblings must equal UEFI_PT_BASE.
 
 // === Kernel-side region addresses (mirror of memmap.zig) ===
-// Bumped 2026-08-22 from 0xA00000 → 0xC00000: the installer campaign's BSS
-// (a second ext2 Mount is 265 KB alone) ate the 2 MB headroom the 2026-05-20
-// bump bought. The installer's big buffers moved to PMM at the same time;
-// this bump restores the ~2 MB margin between _kernel_end and the heap so
-// ordinary BSS growth doesn't trip assertKernelImageFits again.
-pub const KERNEL_HEAP_BASE: usize = 0xC00000;
-pub const KERNEL_HEAP_SIZE: usize = 0x1000000; // 16 MB
-
-pub const GUEST_FB_BASE: usize = KERNEL_HEAP_BASE + KERNEL_HEAP_SIZE;
+// The kernel image (loaded at its low LMA) must end below GUEST_FB_BASE
+// (memmap.assertKernelImageFits). Everything between the image and it is
+// ordinary PMM RAM — the fixed 16 MB kernel heap that used to sit there
+// (0xC00000) is gone; the heap grows from PMM.
+pub const GUEST_FB_BASE: usize = 0x1C00000;
 pub const GUEST_FB_SIZE: usize = 0x800000; // 8 MB
 
 pub const BACK_BUFFER_BASE: usize = GUEST_FB_BASE + GUEST_FB_SIZE;
