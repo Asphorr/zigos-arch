@@ -1144,7 +1144,6 @@ pub fn releaseAllForPid(pid: u32) void {
             spins += 1;
             // Yield to give the worker a chance to run. softYield() here
             // mirrors nvme.ioCommandAsync's queue-full-retry pattern.
-            smp.myCpu().pending_soft_yield = true;
             @import("../../proc/sched_asm.zig").softYield();
             // Diagnostic: if we spin >100k times the worker is wedged.
             // 100k * softYield latency = many seconds at minimum.

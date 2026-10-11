@@ -1,9 +1,9 @@
 // Yield-Loop Detector.
 //
 // Catches the structural pattern of "pid yields with identical
-// (wait_kind, wait_target, blockOn_caller_ra) in a tight cycle" — the
-// fingerprint of a wake-then-resleep loop where the I/O resource never
-// makes progress.
+// (wait_kind, wait_target, blockOn_caller_ra) in a tight cycle without
+// leaving the syscall" — the fingerprint of a wake-then-resleep loop where
+// the I/O resource never makes progress.
 //
 // Each `blockOn` call observes the trio (kind, target, caller_ra) for
 // the current pid. If consecutive observations match within a short
@@ -43,6 +43,10 @@ const Slot = struct {
     wait_kind: u8 = 0xFF,
     wait_target: u32 = 0,
     caller_ra: u64 = 0,
+    /// acct_syscall_count at the observation. A new syscall in between means
+    /// the pid went back to user space — a fresh wait (sequential waitpids,
+    /// a read loop on one pipe), not a kernel wake/resleep spin.
+    syscalls: u64 = 0,
     count: u16 = 0,
     first_tick: u64 = 0,
     last_tick: u64 = 0,
@@ -95,9 +99,11 @@ pub fn observe(pid: usize, kind: process.WaitKind, target: u32, caller_ra: u64) 
 
     const tick = process.tick_count;
     const new_kind = @intFromEnum(kind);
+    const syscalls = process.procs[pid].acct_syscall_count;
     const same = s.wait_kind == new_kind and
         s.wait_target == target and
-        s.caller_ra == caller_ra;
+        s.caller_ra == caller_ra and
+        s.syscalls == syscalls;
     if (same) {
         s.count +%= 1;
         s.last_tick = tick;
@@ -110,6 +116,7 @@ pub fn observe(pid: usize, kind: process.WaitKind, target: u32, caller_ra: u64) 
     s.wait_kind = new_kind;
     s.wait_target = target;
     s.caller_ra = caller_ra;
+    s.syscalls = syscalls;
     s.count = 1;
     s.first_tick = tick;
     s.last_tick = tick;

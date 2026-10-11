@@ -449,12 +449,11 @@ const PRINT_BUF_LEN: usize = 1024;
 var print_bufs: [PRINT_NUM_BUFS][PRINT_BUF_LEN]u8 align(16) = undefined;
 
 pub fn print(comptime format: []const u8, args: anytype) void {
-    // Avoid importing smp.zig (it imports us — circular). Read LAPIC ID
-    // directly. The LAPIC base (0xFEE00000) is identity-mapped at boot,
-    // so this is safe even before the APIC software-init runs — BSP just
-    // reads its hardware LAPIC ID from MMIO.
-    const lapic_id = @import("../time/apic.zig").getLapicId();
-    const cpu_idx: usize = if (lapic_id < PRINT_NUM_BUFS) @intCast(lapic_id) else 0;
+    // myCpuId is one rdtscp; the LAPIC ID register it falls back to is a VM
+    // exit (14–31k cycles nested), once per log line. 0 before SMP init,
+    // which is the BSP.
+    const cpu_id = @import("../cpu/smp.zig").myCpuId();
+    const cpu_idx: usize = if (cpu_id < PRINT_NUM_BUFS) cpu_id else 0;
     const buf = &print_bufs[cpu_idx];
     const out = std.fmt.bufPrint(buf, format, args) catch "[print: buf overflow]\n";
     write(out);

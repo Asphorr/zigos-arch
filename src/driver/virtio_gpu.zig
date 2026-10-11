@@ -2494,6 +2494,16 @@ pub fn resumeFromS3() bool {
 /// kicks them on the same tick. Mirrors `nvme.tickSweep`.
 ///
 /// Cost when idle: one clflush + one memory read per tick. Sub-microsecond.
+/// Whether irq0's backstop has anything for tickSweep: async-flush
+/// bookkeeping, or a used index the driver hasn't consumed (a lost
+/// completion IRQ). RAM reads only.
+pub fn sweepWanted() bool {
+    if (!active or !use_msix) return false;
+    if (@atomicLoad(bool, &aflush_in_flight, .acquire) or
+        @atomicLoad(bool, &aflush_pending, .acquire)) return true;
+    return usedIdxCoherent(&ctrl_vq) != ctrl_vq.last_used_idx;
+}
+
 pub fn tickSweep() void {
     if (!active) return;
     if (!use_msix) return;

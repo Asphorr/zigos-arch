@@ -462,7 +462,7 @@ pub fn forkCurrent(frame: *signals.SyscallFrame) ?usize {
 }
 
 /// Per-CPU kernel-mode idle task (task #235). Runs CS=0x08, no user space,
-/// no syscall_entry. Loop: `sti; hlt; schedule()`.
+/// no syscall_entry. Loop: `sti; hlt; schedule()` when the wake queued work.
 ///
 /// The post-hlt `schedule()` call is critical: handleIRQ0 SKIPS calling
 /// schedule when the IRQ fires from kernel mode (see idt.zig's `if
@@ -570,7 +570,9 @@ fn kernelIdle() callconv(.c) noreturn {
         // wallclock advance. Queue empty → the stretch stands, whether the
         // timer or an inline-handled device IRQ woke us.
         @import("../cpu/idt/irq0.zig").shortenAfterIdleWake();
-        process.schedule();
+        // Queue empty: schedule() would only pick idle again (~12k cycles a
+        // wake). The loop top re-checks before the next sleep.
+        if (@import("../cpu/idt/irq0.zig").localRqHasWork()) process.schedule();
     }
 }
 

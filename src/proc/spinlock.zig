@@ -162,7 +162,7 @@ pub const SpinLock = struct {
     /// (cpu + ra) — enough for symbols.zig to resolve both ends.
     ///
     /// Involuntary-preemption pin: the whole acquire+hold window bumps
-    /// this CPU's `preempt_pin`, dropped by release() — see the
+    /// this CPU's pin (`lock_cpu[cpu].pin`), dropped by release() — see the
     /// preempt_pin block comment for why every plain acquire needs it
     /// (the SpinLock-held-across-schedule deadlock class).
     pub fn acquire(self: *SpinLock) void {
@@ -176,14 +176,14 @@ pub const SpinLock = struct {
         // pay nothing extra.
         const pin_flags = saveAndDisableIrq();
         const cpu = currentCpuId();
-        if (cpu < MAX_HOLD_CPUS) preempt_pin[cpu] += 1;
+        if (cpu < MAX_HOLD_CPUS) lock_cpu[cpu].pin += 1;
         restoreIrq(pin_flags);
         const ticket = @atomicRmw(u32, &self.next_ticket, .Add, 1, .seq_cst);
         var spins: u64 = 0;
         var warned = false;
         // Publish what we're about to wait on so a wedge autopsy can name this
         // lock even when it's unregistered / free again by the time we dump.
-        if (cpu < MAX_HOLD_CPUS) @atomicStore(usize, &spin_target[cpu], @intFromPtr(self), .monotonic);
+        if (cpu < MAX_HOLD_CPUS) @atomicStore(usize, &lock_cpu[cpu].spin_target, @intFromPtr(self), .monotonic);
         while (true) {
             const serving = @atomicLoad(u32, &self.now_serving, .acquire);
             if (serving == ticket) {
@@ -197,7 +197,7 @@ pub const SpinLock = struct {
                         witness.spinAcquire(self.witness_class, cpu, smp.myCpu().current_pid, ra);
                     }
                 }
-                if (cpu < MAX_HOLD_CPUS) @atomicStore(usize, &spin_target[cpu], 0, .monotonic);
+                if (cpu < MAX_HOLD_CPUS) @atomicStore(usize, &lock_cpu[cpu].spin_target, 0, .monotonic);
                 return;
             }
             // u32 wrapping subtract: handles next_ticket overflow correctly
@@ -277,7 +277,7 @@ pub const SpinLock = struct {
         // A double-release reads cpu == NO_HOLDER_CPU (≥ MAX_HOLD_CPUS), so
         // the bounds guard skips the decrement instead of underflowing the
         // pin into a permanently-unpreemptible CPU.
-        if (cpu < MAX_HOLD_CPUS and preempt_pin[cpu] != 0) preempt_pin[cpu] -= 1;
+        if (cpu < MAX_HOLD_CPUS and lock_cpu[cpu].pin != 0) lock_cpu[cpu].pin -= 1;
     }
 
     /// Acquire with interrupts disabled. Returns previous RFLAGS for restore.
@@ -408,17 +408,24 @@ comptime {
 //     yields holding a spinlock are the WITNESS bug above), so no
 //     save/restore across switches is needed.
 // =============================================================================
-var preempt_pin: [MAX_HOLD_CPUS]u32 = [_]u32{0} ** MAX_HOLD_CPUS;
+const CpuLockState = struct {
+    /// The preempt pin above.
+    pin: u32 align(64) = 0,
+    /// "Currently spinning to acquire" target (lock address, 0 = none).
+    /// Set while a CPU waits in acquire()'s spin loop, cleared the instant it
+    /// wins. Read cross-CPU by the wedge autopsy (dumpSpinTargets) to name the
+    /// exact lock a stuck CPU is on — the one thing the post-hoc [lock-dump]
+    /// can't show: the hot lock is usually free again by dump time, and
+    /// per-PID setstate_locks[] / per-rq rq.lock aren't individually
+    /// registered. Only this CPU writes its own; the autopsy reads cross-CPU
+    /// with a relaxed load — a momentarily-stale value is fine for a diagnostic.
+    spin_target: usize = 0,
+};
 
-/// Per-CPU "currently spinning to acquire" target (lock address, 0 = none).
-/// Set while a CPU waits in acquire()'s spin loop, cleared the instant it wins.
-/// Read cross-CPU by the wedge autopsy (dumpSpinTargets) to name the exact lock
-/// a stuck CPU is on — the one thing the post-hoc [lock-dump] can't show: the
-/// hot lock is usually free again by dump time, and per-PID setstate_locks[] /
-/// per-rq rq.lock aren't individually registered. Plain per-CPU slot (only this
-/// CPU writes its own; the autopsy reads cross-CPU with a relaxed load — a
-/// momentarily-stale value is fine for a diagnostic).
-var spin_target: [MAX_HOLD_CPUS]usize = [_]usize{0} ** MAX_HOLD_CPUS;
+/// One cache line per CPU: every acquire and release writes these, and
+/// packed per-CPU arrays put several CPUs' words in one line that then
+/// bounces between them on each lock operation.
+var lock_cpu: [MAX_HOLD_CPUS]CpuLockState = [_]CpuLockState{.{}} ** MAX_HOLD_CPUS;
 
 /// Read `cpu`'s current spin target — the address of the lock its
 /// SpinLock.acquire is waiting on, or 0 when it isn't spinning. `cpu` is a
@@ -438,7 +445,7 @@ var spin_target: [MAX_HOLD_CPUS]usize = [_]usize{0} ** MAX_HOLD_CPUS;
 /// returns a plain usize without dereferencing it.
 pub fn spinTargetOf(cpu: usize) usize {
     if (cpu >= MAX_HOLD_CPUS) return 0;
-    return @atomicLoad(usize, &spin_target[cpu], .monotonic);
+    return @atomicLoad(usize, &lock_cpu[cpu].spin_target, .monotonic);
 }
 
 /// Linux might_sleep() analogue, scoped to what this kernel needs: call at
@@ -476,7 +483,7 @@ pub fn mightSleep(comptime src: std.builtin.SourceLocation) void {
     // false positive. (A true positive can't migrate: the pin it is
     // about to see is what pins it.) Same bracket pinPreemption uses.
     const irq_flags = saveAndDisableIrq();
-    const pin = preempt_pin[cpu];
+    const pin = lock_cpu[cpu].pin;
     restoreIrq(irq_flags);
     if (pin == 0) return;
     for (&might_sleep_warned) |w| {
@@ -509,7 +516,7 @@ var might_sleep_warned: [16]u64 = [_]u64{0} ** 16;
 pub fn preemptionPinned() bool {
     const cpu = currentCpuId();
     if (cpu >= MAX_HOLD_CPUS) return false;
-    return preempt_pin[cpu] != 0;
+    return lock_cpu[cpu].pin != 0;
 }
 
 /// Pin this CPU against involuntary dynirq preemption WITHOUT holding a
@@ -525,7 +532,7 @@ pub fn preemptionPinned() bool {
 pub fn pinPreemption() u8 {
     const flags = saveAndDisableIrq();
     const cpu = currentCpuId();
-    if (cpu < MAX_HOLD_CPUS) preempt_pin[cpu] += 1;
+    if (cpu < MAX_HOLD_CPUS) lock_cpu[cpu].pin += 1;
     restoreIrq(flags);
     return cpu;
 }
@@ -536,7 +543,7 @@ pub fn pinPreemption() u8 {
 /// raised. Bounds/zero guards mirror release() — a bogus id or double-unpin
 /// must not underflow a counter into a permanently-unpreemptible CPU.
 pub fn unpinPreemption(cpu: u8) void {
-    if (cpu < MAX_HOLD_CPUS and preempt_pin[cpu] != 0) preempt_pin[cpu] -= 1;
+    if (cpu < MAX_HOLD_CPUS and lock_cpu[cpu].pin != 0) lock_cpu[cpu].pin -= 1;
 }
 
 pub const HoldVerdict = enum(u8) { unverified, vm_alive, vm_frozen };
@@ -1124,7 +1131,7 @@ pub fn dumpSpinTargets() void {
     var any = false;
     var c: usize = 0;
     while (c < MAX_HOLD_CPUS) : (c += 1) {
-        const addr = @atomicLoad(usize, &spin_target[c], .monotonic);
+        const addr = @atomicLoad(usize, &lock_cpu[c].spin_target, .monotonic);
         if (addr == 0) continue;
         any = true;
         const lock: *SpinLock = @ptrFromInt(addr);

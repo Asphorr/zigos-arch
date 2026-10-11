@@ -151,8 +151,12 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
     const ret_addr_snap = @import("../../debug/kdbg.zig").snapshotHandleIRQ0RetAddr(rsp);
     defer @import("../../debug/kdbg.zig").validateHandleIRQ0RetAddr(rsp, ret_addr_snap);
 
-    const t = @import("../../debug/perf.zig").enter();
-    defer @import("../../debug/perf.zig").leave(.irq0_timer, t);
+    const t = perf.enter();
+    // Closed before each schedule(): past it this frame waits out the task's
+    // whole time off the CPU, which is not IRQ0 cost (schedule() stops its
+    // own .schedule span at the switch the same way).
+    var irq0_measured = false;
+    defer if (!irq0_measured) perf.leave(.irq0_timer, t);
     const cpu = smp.myCpu();
     // Once a second: TSC_AUX (what myCpu() just trusted) still equals the
     // LAPIC ID register, or demote everyone. See smp.auditCpuIdTick.
@@ -382,13 +386,20 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
             // raise()==false only before ksoftirqd exists (early boot) → inline-
             // sweep fallback so no backstop is ever dropped.
             //
-            // ⚠ GATE LIVENESS: this .hid raise must stay UNCONDITIONAL (in
-            // particular: never skipped while xhci.event_drain_locked is
-            // held). pollHID early-returns under that lock WITHOUT reopening
+            // Each raise is gated on its sweepWanted RAM peek (a command in
+            // flight, an unconsumed ring entry, ...). Raising unconditionally
+            // woke ksoftirqd every 100 ms on an idle machine, and its
+            // dispatch armed a one-quantum timer that fired again: ~45% of
+            // the BSP's timer fires were that echo.
+            //
+            // ⚠ GATE LIVENESS: the .hid raise must keep firing while the
+            // typematic gate is closed (in particular: never skipped while
+            // xhci.event_drain_locked is held) — hidSweepWanted's first
+            // check. pollHID early-returns under that lock WITHOUT reopening
             // keyboard.ext_events_pending — by design, since reopening mid-op
             // would re-admit a stale-key spam window — so this 10 Hz raise is
             // what guarantees the typematic gate reopens ≤100 ms after the op
-            // ends. Gating it would wedge auto-repeat closed silently.
+            // ends. Dropping it would wedge auto-repeat closed silently.
             // Due-tick (>=) rather than modulo: tickless idle advances
             // tick_count in JUMPS (ticksToAdvance catch-up), and a jump
             // from 9 to 21 skips both %10 boundaries — modulo would
@@ -396,9 +407,11 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
             if (process.tick_count >= next_backstop_tick) {
                 next_backstop_tick = process.tick_count + 10;
                 const softirq = @import("../../proc/softirq.zig");
-                if (!softirq.raise(.hid)) xhci.pollHID();
-                if (!softirq.raise(.nvme)) @import("../../driver/nvme.zig").tickSweep();
-                if (!softirq.raise(.virtio_gpu)) @import("../../driver/virtio_gpu.zig").tickSweep();
+                const nvme = @import("../../driver/nvme.zig");
+                const virtio_gpu = @import("../../driver/virtio_gpu.zig");
+                if (xhci.hidSweepWanted() and !softirq.raise(.hid)) xhci.pollHID();
+                if (nvme.sweepWanted() and !softirq.raise(.nvme)) nvme.tickSweep();
+                if (virtio_gpu.sweepWanted() and !softirq.raise(.virtio_gpu)) virtio_gpu.tickSweep();
             }
 
             @import("../../debug/gdb_stub.zig").checkForBreak();
@@ -406,10 +419,11 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
             // Auto-dump perf counters every ~5 seconds (500 ticks at 100Hz). The
             // counters survive the dump (no implicit reset) so the next dump shows
             // accumulated cost since boot. Use `perf reset` from the CLI to zero.
+            // Formatted in ksoftirqd (IF=1): ~2.4 KB of text is milliseconds
+            // with interrupts off here.
             if (process.tick_count >= next_perfdump_tick) {
                 next_perfdump_tick = process.tick_count + 500;
-                @import("../../debug/perf.zig").dumpAll();
-                dumpTickless();
+                if (!@import("../../proc/softirq.zig").raise(.perf_dump)) perfDump();
             }
 
             // Tier C.1: rotate DR0-DR3 across procs[].kernel_esp slots so any
@@ -486,6 +500,8 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
                 if (cpu.current_pid) |pid| process.getPCB(pid).ticks_used = 0;
                 deliverPendingToReturnFrame(cpu, rsp);
                 bisectPoint("after force_yield deliverSignals", frame_for_validate, irq_snap);
+                perf.leave(.irq0_timer, t);
+                irq0_measured = true;
                 process.schedule();
                 bisectPoint("after force_yield schedule RESUME", frame_for_validate, irq_snap);
                 // When this task is later re-dispatched, schedule returns.
@@ -508,6 +524,8 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
         // THIS task is re-scheduled. After it returns, we fall through to
         // isr_irq0's pop-and-iretq, which exits to wherever this task was
         // running before the IRQ.
+        perf.leave(.irq0_timer, t);
+        irq0_measured = true;
         process.schedule();
         bisectPoint("after schedule RESUME", frame_for_validate, irq_snap);
         return;
@@ -898,8 +916,15 @@ fn nameSlice(name: *const [16]u8) []const u8 {
     return name[0..len];
 }
 
+/// The periodic [perf] + [tickless] dump — the BSP ksoftirqd's .perf_dump
+/// handler, or inline from the tick before ksoftirqd exists.
+pub fn perfDump() void {
+    perf.dumpAll();
+    dumpTickless();
+}
+
 /// `[tickless]` — one line per CPU plus what the BSP's wake clamp is
-/// pinned on right now. With every perf dump (BSP IRQ0, IF=0, serial).
+/// pinned on right now. With every perf dump.
 fn dumpTickless() void {
     var cpu_id: usize = 0;
     while (cpu_id < smp.MAX_CPUS) : (cpu_id += 1) {

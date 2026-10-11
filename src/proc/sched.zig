@@ -2680,7 +2680,6 @@ pub fn kernelSleepMs(ms: u32) void {
     @atomicStore(u64, &pcb.wake_tick, deadline, .release);
     registerWakeDeadline(deadline);
     setState(cur, .sleeping);
-    smp.myCpu().pending_soft_yield = true;
     @import("sched_asm.zig").softYield();
 }
 
@@ -2776,7 +2775,6 @@ pub fn blockOn(kind: WaitKind, target: u32) void {
     // count; the fast-path returns from a satisfied caller condition
     // would otherwise produce false-positive trips.
     @import("../debug/yield_loop.zig").observe(cur, kind, target, caller_ra);
-    smp.myCpu().pending_soft_yield = true;
     @import("sched_asm.zig").softYield();
     clearWait(pcb);
 }
@@ -2829,7 +2827,6 @@ pub fn blockOnFutex(target: u32, word: *const volatile u32, val: u32) FutexResul
         return .woke;
     }
 
-    smp.myCpu().pending_soft_yield = true;
     @import("sched_asm.zig").softYield(); // self-accounts the descheduled span
     clearWait(pcb);
     if (hasPendingDeliverable(pcb)) return .signalled;
@@ -2893,7 +2890,6 @@ pub fn blockOnMutex(target_id: u32, owner_pid_ptr: *const u16) void {
         setState(cur, .running);
         return;
     }
-    smp.myCpu().pending_soft_yield = true;
     @import("sched_asm.zig").softYield();
     clearWait(pcb);
 }
@@ -2986,7 +2982,6 @@ pub fn blockOnSwapEvict(pte_ptr: *const u64) void {
             setState(cur, .running);
             continue;
         }
-        smp.myCpu().pending_soft_yield = true;
         @import("sched_asm.zig").softYield();
         clearWait(pcb);
         // Loop and re-check; the PTE may still be in-flight (spurious wake)

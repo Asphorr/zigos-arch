@@ -157,8 +157,6 @@ pub inline fn switchToCall(prev_save: ?*u64, next_kesp: u64, prev_on_cpu: ?*bool
 ///     schedule() will pick someone else. setState routes through the
 ///     per-CPU runqueue book-keeping (Phase 1 parallel-track). Without
 ///     the state flip the IRQ0 path resumes the same PCB after a tick.
-///   - Set `cpu.pending_soft_yield = true` so handleIRQ0 distinguishes
-///     this from a real hardware timer firing.
 ///   - Set any wait_kind / wait_target / wake_tick the caller depends on
 ///     for the wake-back-up signal.
 /// NOTE: `softYield` is the CENTRAL descheduled-time accounting point. The
@@ -181,13 +179,23 @@ pub fn softYield() void {
     if (process.currentPCB()) |p| p.perf_gap_cyc +%= t1 -% t0;
 }
 
+/// Sets `pending_soft_yield` and issues the `int` with interrupts off: a
+/// hardware tick landing between the two would take the flag for itself,
+/// skip its EOI and timer re-arm, and — if this task then sleeps or moves
+/// to another CPU before the `int` runs — leave this CPU's timer blocked.
 fn softYieldRaw() void {
+    var flags: u64 = undefined;
+    asm volatile ("pushfq; pop %[f]; cli"
+        : [f] "=r" (flags),
+    );
+    @import("../cpu/smp.zig").myCpu().pending_soft_yield = true;
     asm volatile (
         \\ movq %%rsp, %%rax
         \\ andq $-16, %%rsp
         \\ int $0x20
         \\ movq %%rax, %%rsp
         ::: .{ .rax = true, .memory = true });
+    if (flags & 0x200 != 0) asm volatile ("sti");
 }
 
 /// Common pre-iretq sanity check shared by `retToUserStub` (sched_asm.zig),

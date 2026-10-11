@@ -101,14 +101,23 @@ pub var phases: [MAX_CPUS][PHASE_COUNT]Counter = blk: {
 
 pub var syscalls: [SYSCALL_TABLE_SIZE]Counter = [_]Counter{.{}} ** SYSCALL_TABLE_SIZE;
 
-/// Per-CPU wall bounds. Each CPU records its own [first leave, last leave]
-/// span using its own TSC, so dumpAll's % wall is computed against the
-/// elapsed cycles ON THAT CPU. Earlier version used a single global
-/// wall_start_tsc captured by whichever CPU happened to leave() first
-/// and read by dumpAll's CPU at the end — across KVM-drifting TSCs this
-/// produced %wall values >100% (cpu1 schedule % seen at 497).
-var wall_start_tsc: [MAX_CPUS]u64 = [_]u64{0} ** MAX_CPUS;
-var wall_last_tsc: [MAX_CPUS]u64 = [_]u64{0} ** MAX_CPUS;
+/// This CPU's leave() state, one cache line per CPU: leave() writes it on
+/// every IRQ, syscall and schedule, and packed per-CPU arrays would bounce
+/// a shared line between CPUs.
+const CpuState = struct {
+    /// Wall bounds. Each CPU records its own [first leave, last leave] span
+    /// using its own TSC, so dumpAll's % wall is computed against the
+    /// elapsed cycles ON THAT CPU. Earlier version used a single global
+    /// wall_start_tsc captured by whichever CPU happened to leave() first
+    /// and read by dumpAll's CPU at the end — across KVM-drifting TSCs this
+    /// produced %wall values >100% (cpu1 schedule % seen at 497).
+    wall_start_tsc: u64 align(64) = 0,
+    wall_last_tsc: u64 = 0,
+    /// See Pending.
+    pending: Pending = .{},
+    pending_busy: bool = false,
+};
+var cpu_state: [MAX_CPUS]CpuState = [_]CpuState{.{}} ** MAX_CPUS;
 
 pub inline fn rdtsc() u64 {
     var lo: u32 = undefined;
@@ -205,8 +214,6 @@ const Pending = struct {
     end: u64 = 0,
     valid: bool = false,
 };
-var pending: [MAX_CPUS]Pending = [_]Pending{.{}} ** MAX_CPUS;
-var pending_busy: [MAX_CPUS]bool = [_]bool{false} ** MAX_CPUS;
 
 /// ~1.7ms at 3GHz. Genuine schedule/IRQ bodies are µs-scale; a sample this
 /// long in a cli'd phase is steal-slice-shaped and worth holding one tick.
@@ -222,33 +229,34 @@ pub fn leave(phase: Phase, start_tsc: u64) void {
 
     const cpu_id = smp.myCpu().cpu_id;
     if (cpu_id >= MAX_CPUS) return;
-    if (wall_start_tsc[cpu_id] == 0) wall_start_tsc[cpu_id] = start_tsc;
-    wall_last_tsc[cpu_id] = end;
+    const st = &cpu_state[cpu_id];
+    if (st.wall_start_tsc == 0) st.wall_start_tsc = start_tsc;
+    st.wall_last_tsc = end;
 
-    if (pending_busy[cpu_id]) {
+    if (st.pending_busy) {
         // Nested inside this CPU's own pending-slot manipulation — classify
         // with whatever stall info exists now rather than touching the slot.
         commitSample(cpu_id, phase, start_tsc, end);
         return;
     }
-    pending_busy[cpu_id] = true;
-    defer pending_busy[cpu_id] = false;
+    st.pending_busy = true;
+    defer st.pending_busy = false;
 
     // Resolve an aged pending sample: 3 quanta past its end, smi has had
     // its post-stall tick (or there was no stall) — verdict is in.
-    if (pending[cpu_id].valid) {
+    if (st.pending.valid) {
         const tpq = @import("../time/apic.zig").tscPerQuantum();
-        if (tpq == 0 or end -% pending[cpu_id].end > 3 *% tpq) {
-            const pd = pending[cpu_id];
-            pending[cpu_id].valid = false;
+        if (tpq == 0 or end -% st.pending.end > 3 *% tpq) {
+            const pd = st.pending;
+            st.pending.valid = false;
             commitSample(cpu_id, pd.phase, pd.start, pd.end);
         }
     }
 
     // Park a suspicious cli'd-phase sample for the deferred verdict.
     // Over-ceiling samples skip the wait — commitSample diverts them anyway.
-    if (deferEligible(phase) and dt >= SUSPECT_FLOOR and dt <= pauseCeiling(phase) and !pending[cpu_id].valid) {
-        pending[cpu_id] = .{ .phase = phase, .start = start_tsc, .end = end, .valid = true };
+    if (deferEligible(phase) and dt >= SUSPECT_FLOOR and dt <= pauseCeiling(phase) and !st.pending.valid) {
+        st.pending = .{ .phase = phase, .start = start_tsc, .end = end, .valid = true };
         return;
     }
     commitSample(cpu_id, phase, start_tsc, end);
@@ -281,9 +289,11 @@ pub fn resetAll() void {
         for (row) |*c| c.reset();
     }
     for (&syscalls) |*c| c.reset();
-    @memset(&wall_start_tsc, 0);
-    @memset(&wall_last_tsc, 0);
-    for (&pending) |*p| p.valid = false;
+    for (&cpu_state) |*st| {
+        st.wall_start_tsc = 0;
+        st.wall_last_tsc = 0;
+        st.pending.valid = false;
+    }
 }
 
 /// Print a formatted summary to serial. Caller is responsible for any preamble
@@ -303,7 +313,7 @@ pub fn dumpAll() void {
         // Per-CPU wall: span between this CPU's first and last leave().
         // Bounds %wall ≤100% by construction and avoids the cross-CPU TSC
         // drift that previously produced bogus 484% rows.
-        const wall_cpu = wall_last_tsc[cpu_id] -% wall_start_tsc[cpu_id];
+        const wall_cpu = cpu_state[cpu_id].wall_last_tsc -% cpu_state[cpu_id].wall_start_tsc;
         for (row, 0..) |*c, p| {
             if (c.count == 0) continue;
             const mean = c.total / c.count;

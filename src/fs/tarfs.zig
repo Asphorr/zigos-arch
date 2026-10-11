@@ -2,6 +2,7 @@ const std = @import("std");
 const ata = @import("../driver/block.zig");
 const vga = @import("../ui/vga.zig");
 const debug = @import("../debug/debug.zig");
+const spinlock = @import("../proc/spinlock.zig");
 
 pub fn parseOctal(bytes: []const u8) usize {
     var res: usize = 0;
@@ -173,22 +174,31 @@ pub fn openFile(name: []const u8) ?u16 {
     return @intCast((@intFromPtr(entry) - @intFromPtr(&index[0])) / @sizeOf(IndexEntry));
 }
 
+/// readAt's bounce buffer: one NVMe command's worth. The disk drivers want
+/// kernel memory (AHCI DMAs to the translated address), not the caller's
+/// user buffer.
+const STAGE_SECTORS: u32 = 64;
+var stage: [STAGE_SECTORS * 512]u8 align(4096) = undefined;
+var stage_lock: spinlock.Mutex = .{};
+
 /// Read up to `count` bytes at `offset` of the file at index position
-/// `pos`; returns the bytes read (0 at or past EOF).
+/// `pos`; returns the bytes read (0 at or past EOF, short on a disk error).
 pub fn readAt(pos: u32, offset: u32, buf: [*]u8, count: u32) u32 {
     if (pos >= index_count) return 0;
     const entry = &index[pos];
     if (offset >= entry.file_size) return 0;
     const to_read: u32 = @min(count, entry.file_size - offset);
 
+    stage_lock.acquire();
+    defer stage_lock.release();
     var bytes_read: u32 = 0;
-    var sector_buf: [512]u8 = undefined;
     while (bytes_read < to_read) {
         const at = offset + bytes_read;
-        ata.readSector(entry.data_lba + at / 512, &sector_buf);
-        const byte_in_sector = at % 512;
-        const chunk = @min(512 - byte_in_sector, to_read - bytes_read);
-        @memcpy(buf[bytes_read..][0..chunk], sector_buf[byte_in_sector..][0..chunk]);
+        const skip = at % 512;
+        const sectors: u32 = @min(STAGE_SECTORS, (skip + to_read - bytes_read + 511) / 512);
+        if (!ata.readSectors(entry.data_lba + at / 512, @intCast(sectors), &stage)) break;
+        const chunk = @min(sectors * 512 - skip, to_read - bytes_read);
+        @memcpy(buf[bytes_read..][0..chunk], stage[skip..][0..chunk]);
         bytes_read += chunk;
     }
     return bytes_read;
@@ -236,6 +246,10 @@ pub fn matchPrefix(prefix: []const u8, names: *[8][32]u8, name_lens: *[8]u8) u8 
     return count;
 }
 
+/// loadFile's sectors per block read: on NVMe a full pipeline wave (8
+/// commands of 64 sectors in flight); 256 KiB stays within one AHCI PRD.
+const LOAD_BATCH_SECTORS: u32 = 512;
+
 pub fn loadFile(filename: []const u8, load_addr: []align(4) u8) ?usize {
     // Use index for instant lookup
     if (indexed) {
@@ -246,7 +260,7 @@ pub fn loadFile(filename: []const u8, load_addr: []align(4) u8) ?usize {
         if (@as(u64, sectors) * 512 > load_addr.len) return null;
         var s: u32 = 0;
         while (s < sectors) {
-            const batch: u8 = @intCast(@min(sectors - s, 128));
+            const batch: u16 = @intCast(@min(sectors - s, LOAD_BATCH_SECTORS));
             const dest_ptr: [*]u8 = @ptrFromInt(@intFromPtr(load_addr.ptr) + s * 512);
             // Propagate read failure (BUG 2 class): serving the unwritten
             // load_addr bytes as file content is silent corruption.
@@ -269,7 +283,7 @@ pub fn loadFile(filename: []const u8, load_addr: []align(4) u8) ?usize {
             if (@as(u64, sectors) * 512 > load_addr.len) return null;
             var s: u32 = 0;
             while (s < sectors) {
-                const batch: u8 = @intCast(@min(sectors - s, 128));
+                const batch: u16 = @intCast(@min(sectors - s, LOAD_BATCH_SECTORS));
                 const dest_ptr: [*]u8 = @ptrFromInt(@intFromPtr(load_addr.ptr) + s * 512);
                 if (!ata.readSectors(lba + 1 + s, batch, dest_ptr)) return null;
                 s += batch;

@@ -64,7 +64,6 @@ pub fn sysYield() u32 {
     // process. See process.zig State enum / switchTo asm for why we don't
     // pre-set state=.ready here.
     // softYield self-accounts the descheduled span into perf_gap_cyc.
-    smp.myCpu().pending_soft_yield = true;
     sched_asm.softYield();
     return 0;
 }
@@ -341,7 +340,6 @@ pub fn sysSleep(ms: u32) u32 {
     // sys#07 — see comments there. wakeExpired() flips us back to .ready once
     // tick_count >= wake_tick.
     // softYield self-accounts the descheduled span into perf_gap_cyc.
-    smp.myCpu().pending_soft_yield = true;
     sched_asm.softYield();
     return 0;
 }
@@ -843,7 +841,6 @@ pub fn sysSigsuspend(mask_ptr: u32) u32 {
             break;
         }
         // softYield self-accounts the descheduled span into perf_gap_cyc.
-        smp.myCpu().pending_soft_yield = true;
         sched_asm.softYield();
     }
     // Don't leave the "forever" deadline behind on the now-running PCB.
@@ -867,7 +864,6 @@ pub fn sysPause() u32 {
             break;
         }
         // softYield self-accounts the descheduled span into perf_gap_cyc.
-        smp.myCpu().pending_soft_yield = true;
         sched_asm.softYield();
     }
     @atomicStore(u64, &pcb.wake_tick, 0, .release);
@@ -1137,7 +1133,6 @@ pub fn sysUsleep(usec: u32) u32 {
         sched.registerHiresWake(deadline);
         process.setState(cur_pid, .sleeping);
         // softYield self-accounts the descheduled span into perf_gap_cyc.
-        smp.myCpu().pending_soft_yield = true;
         sched_asm.softYield();
     }
     // Leave no stale deadline behind (broke out on signal, or woken early).

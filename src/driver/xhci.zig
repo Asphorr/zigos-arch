@@ -2477,6 +2477,17 @@ fn routeHidEventDuringWait(evt_trb: TRB) bool {
     return false;
 }
 
+/// Whether irq0's 10 Hz backstop has anything for pollHID: the typematic
+/// gate still closed (it only reopens from a drain), an event the MSI-X path
+/// missed at the dequeue slot, or the mouse watchdog due. RAM reads only;
+/// called on the BSP with IF=0, so no drain is mid-way through the cursors.
+pub fn hidSweepWanted() bool {
+    if (!enumeration_done or device_count == 0) return false;
+    if (@atomicLoad(bool, &keyboard.ext_events_pending, .acquire)) return true;
+    if (((evt_ring.trbs[evt_dequeue].control & 1) != 0) == evt_cycle) return true;
+    return mouse_ever_worked and !hasTabletDevice() and process.tick_count > mouse_event_tick + MOUSE_WATCHDOG_TICKS;
+}
+
 pub fn pollHID() void {
     @import("../cpu/smp.zig").assertBSP("xhci.pollHID");
     // Self-serialize via IRQ-disable (Inc 2c). The drain mutates non-atomic
@@ -2510,7 +2521,8 @@ pub fn pollHID() void {
     // reopened here: between lock-set and the wait loop's next ring walk
     // a release can sit queued, and reopening would re-admit the stale-
     // key spam window. Gate liveness instead rides irq0.zig's 10 Hz .hid
-    // backstop, which must stay unconditional — see the ⚠ there.)
+    // backstop, which must keep firing while the gate is closed — see the
+    // ⚠ there and hidSweepWanted.)
     if (event_drain_locked) return;
     poll_count +%= 1;
 

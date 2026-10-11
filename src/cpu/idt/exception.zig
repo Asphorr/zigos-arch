@@ -189,8 +189,15 @@ pub fn armWriteWatch(addr: u64, whitelist_sym: []const u8, max_offset: u32) void
 }
 //   [17] rip  [18] cs  [19] rflags  [20] rsp  [21] ss  (pushed by CPU)
 export fn handleException(rsp: u64) callconv(.c) void {
-    const t = @import("../../debug/perf.zig").enter();
-    defer @import("../../debug/perf.zig").leave(.exception, t);
+    const perf = @import("../../debug/perf.zig");
+    const t = perf.enter();
+    // A #PF that blocks (swap-in I/O) is descheduled for a while; softYield
+    // books that to perf_gap_cyc, and it is not exception cost.
+    const gap0 = if (process.currentPCB()) |p| p.perf_gap_cyc else 0;
+    defer {
+        const gap = (if (process.currentPCB()) |p| p.perf_gap_cyc else gap0) -% gap0;
+        perf.leave(.exception, t +% gap);
+    }
     asm volatile ("cli");
     // SMAP: an exception during a syscall body inherits AC=1 from the
     // syscall; clear it so kernel-mode handler code runs with SMAP

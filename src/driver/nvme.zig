@@ -915,6 +915,14 @@ fn drawCid(c: *Controller) u16 {
     return v;
 }
 
+/// MSI-X message address steering a completion to this CPU. myCpuId is the
+/// LAPIC id from one rdtscp; the LAPIC ID register would cost a VM exit per
+/// command.
+fn msixAddrThisCpu() u64 {
+    const dest_id: u64 = @import("../cpu/smp.zig").myCpuId();
+    return 0xFEE00000 | (dest_id << 12);
+}
+
 /// The submit critical section every async path shares (and the fourth
 /// copy the old code asked to "keep in sync" by hand): MSI-X retarget +
 /// SQE write at the tail slot + tail bump + doorbell, under the sq token.
@@ -1664,11 +1672,7 @@ fn ioCommandAsync(c: *Controller, ctrl_idx: u32, opcode: u8, lba: u32, user_buf:
             }
             _ = @atomicRmw(u64, &c.queue_full_retries, .Add, 1, .monotonic);
             // Yield so the IRQ reaper (or tickSweep) gets a chance to
-            // drain in-flight completions. Must set pending_soft_yield
-            // first — without it handleIRQ0 mis-attributes the int $0x20
-            // as a kernel-mode hardware timer (sendEOI+rearm+return) and
-            // never calls schedule(), making the "yield" a no-op spin.
-            smp.myCpu().pending_soft_yield = true;
+            // drain in-flight completions.
             @import("../proc/sched_asm.zig").softYield();
         }
     };
@@ -1700,11 +1704,7 @@ fn ioCommandAsync(c: *Controller, ctrl_idx: u32, opcode: u8, lba: u32, user_buf:
     // distinct dest_ids would just oscillate; pick one with a brief
     // io_lock window OR move this OUT entirely. For now keep inside the
     // narrow lock below — costs one MMIO write on the rare retarget.
-    const new_msix_addr: u64 = if (c.use_msix) blk: {
-        const apic = @import("../time/apic.zig");
-        const dest_id: u64 = apic.getLapicId() & 0xFF;
-        break :blk 0xFEE00000 | (dest_id << 12);
-    } else 0;
+    const new_msix_addr: u64 = if (c.use_msix) msixAddrThisCpu() else 0;
 
     // ---- Narrow critical section: submitSqeLocked (SQE at tail + tail bump
     // + doorbell; the MSI-X retarget piggy-backs there, idempotent). What it
@@ -1903,11 +1903,7 @@ fn submitDatalessAsync(
     const cur_pid: u8 = if (smp.myCpu().current_pid) |p| @intCast(p) else 0xFF;
     c.waiters[slot_idx].wake = .{ .pid = cur_pid };
 
-    const new_msix_addr: u64 = if (c.use_msix) blk: {
-        const apic_mod = @import("../time/apic.zig");
-        const dest_id: u64 = apic_mod.getLapicId() & 0xFF;
-        break :blk 0xFEE00000 | (dest_id << 12);
-    } else 0;
+    const new_msix_addr: u64 = if (c.use_msix) msixAddrThisCpu() else 0;
 
     // Narrow critical section: submitSqeLocked — see ioCommandAsync.
     submitSqeLocked(c, slot_idx, cid, opcode, prp1, 0, cdw10, cdw11, cdw12, new_msix_addr);
@@ -2149,6 +2145,19 @@ pub fn resumeFromS3() bool {
 /// Cost: one clflush + ~one MMIO read per controller per tick when the
 /// CQ is empty; one full drain per tick if completions are pending.
 /// Negligible for ZigOS's I/O rates.
+/// Whether irq0's backstop has anything for tickSweep: a lost completion
+/// needs a command in flight on an async-mode controller. RAM reads only.
+pub fn sweepWanted() bool {
+    if (!ASYNC_BUILD_ENABLED) return false;
+    for (controllers[0..num_controllers]) |*c| {
+        if (!@atomicLoad(bool, &c.async_mode, .acquire)) continue;
+        for (&c.waiters) |*w| {
+            if (@atomicLoad(bool, &w.active, .acquire)) return true;
+        }
+    }
+    return false;
+}
+
 pub fn tickSweep() void {
     if (!ASYNC_BUILD_ENABLED) return;
     var i: usize = 0;
@@ -2312,11 +2321,7 @@ pub fn submitAsyncCallback(
     // Wake mode = callback (per-slot, owned by us via the CAS in allocCid).
     c.waiters[slot_idx].wake = .{ .cb = .{ .callback = callback, .ctx = ctx } };
 
-    const new_msix_addr: u64 = if (c.use_msix) blk: {
-        const apic_mod = @import("../time/apic.zig");
-        const dest_id: u64 = apic_mod.getLapicId() & 0xFF;
-        break :blk 0xFEE00000 | (dest_id << 12);
-    } else 0;
+    const new_msix_addr: u64 = if (c.use_msix) msixAddrThisCpu() else 0;
 
     // Narrow critical section: submitSqeLocked — see ioCommandAsync.
     const prp = buildPrp(c, slot_idx, xfer_bytes);
@@ -2392,11 +2397,7 @@ fn submitReadNoWait(ctrl_idx: u32, lba: u32, sectors: u32, out_cid: *u16) bool {
     const cur_pid: u8 = if (smp.myCpu().current_pid) |p| @intCast(p) else 0xFF;
     c.waiters[slot_idx].wake = .{ .pid = cur_pid };
 
-    const new_msix_addr: u64 = if (c.use_msix) blk: {
-        const apic_mod = @import("../time/apic.zig");
-        const dest_id: u64 = apic_mod.getLapicId() & 0xFF;
-        break :blk 0xFEE00000 | (dest_id << 12);
-    } else 0;
+    const new_msix_addr: u64 = if (c.use_msix) msixAddrThisCpu() else 0;
 
     // Narrow critical section: submitSqeLocked — see ioCommandAsync.
     const prp = buildPrp(c, slot_idx, xfer_bytes);
@@ -2413,7 +2414,6 @@ fn submitReadNoWait(ctrl_idx: u32, lba: u32, sectors: u32, out_cid: *u16) bool {
 /// handleCompletion). Returns false on any chunk error or wave timeout.
 fn readSectorsPipelined(c: *Controller, ctrl_idx: u32, lba: u32, count: u32, dest: usize) bool {
     const proc = @import("../proc/process.zig");
-    const smp = @import("../cpu/smp.zig");
     const perf = @import("../debug/perf.zig");
     const TIMEOUT_CYC: u64 = 30_000_000_000; // ~30 s at 1 GHz guest-run — matches ioCommandAsync
     const t_call = perf.rdtsc();
@@ -2440,7 +2440,6 @@ fn readSectorsPipelined(c: *Controller, ctrl_idx: u32, lba: u32, count: u32, des
         if (wave == 0) {
             // Every slot busy with other tasks' I/O — yield so the reaper can
             // drain, then retry (same shape as ioCommandAsync's queue-full loop).
-            smp.myCpu().pending_soft_yield = true;
             @import("../proc/sched_asm.zig").softYield();
             continue;
         }

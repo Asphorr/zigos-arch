@@ -94,8 +94,8 @@ pub const CpuLocal = struct {
     /// dependency on a stateful global.
     sched_lock: @import("../proc/spinlock.zig").SpinLock align(64) = .{},
     /// Distinguishes a software-triggered `int $0x20` (sysYield, sysSleep,
-    /// pipe block, sysWaitpid) from a real hardware LAPIC timer IRQ. The
-    /// yield-issuing code sets this true *immediately before* `int $0x20`;
+    /// pipe block, sysWaitpid) from a real hardware LAPIC timer IRQ.
+    /// sched_asm.softYield sets it and issues `int $0x20` under one cli;
     /// `handleIRQ0` reads it and clears it on entry. Without this we used
     /// `from_user` as a proxy (kernel-mode = software), which made
     /// `tick_count` stop advancing whenever BSP was busy in any kernel-mode
@@ -926,8 +926,9 @@ pub fn reinitForS3Resume() void {
     // BEFORE ANYTHING: S3 reset IA32_TSC_AUX (firmware may even have parked
     // its own value there) while myCpuId() still trusts it — re-arm before
     // any code that could ask who it is. Needs no APIC. The QUIET variant:
-    // a report here would klog → serial.print → getLapicId() down the stale
-    // x2APIC path with no IDT loaded = triple fault. initPerCpuAsm(0) below
+    // a report here would klog → serial.print, and a refused aux sends
+    // myCpuId() to getLapicId() down the stale x2APIC path with no IDT
+    // loaded = triple fault. initPerCpuAsm(0) below
     // repeats the (idempotent) arm once the LAPIC is back and reports then.
     _ = armTscAuxQuiet(0);
 
@@ -1271,8 +1272,8 @@ fn armTscAuxQuiet(cpu_id: u8) bool {
 }
 
 /// armTscAuxQuiet plus the report. Only where this CPU can already print:
-/// klog goes through serial.print's own getLapicId(), which needs the
-/// x2APIC flag to be right and an IDT to catch a #GP — true on the boot
+/// after a refusal klog's myCpuId() reads the LAPIC ID register, which needs
+/// the x2APIC flag to be right and an IDT to catch a #GP — true on the boot
 /// paths and on APs (x2APIC is enabled first thing), NOT at the top of the
 /// S3 BSP path. A CPU arriving after an earlier refusal reports that too,
 /// which is how the quiet S3 arm gets its line from initPerCpuAsm(0).

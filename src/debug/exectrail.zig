@@ -48,16 +48,19 @@ const ZERO: TrailEntry = .{ .tsc = 0, .rip = 0 };
 
 var trails: [smp.MAX_CPUS][TRAIL_ENTRIES]TrailEntry =
     [_][TRAIL_ENTRIES]TrailEntry{[_]TrailEntry{ZERO} ** TRAIL_ENTRIES} ** smp.MAX_CPUS;
-var trail_head: [smp.MAX_CPUS]u8 = [_]u8{0} ** smp.MAX_CPUS;
+/// One cache line per CPU: written on every IRQ0 and syscall, and packed
+/// heads would share a line that bounces between CPUs.
+const Head = struct { i: u8 align(64) = 0 };
+var trail_head: [smp.MAX_CPUS]Head = [_]Head{.{}} ** smp.MAX_CPUS;
 
 /// Record the saved RIP at IRQ0 entry. Called from handleIRQ0 — runs
 /// with cli held, so the per-CPU ring write needs no synchronization.
 pub fn recordIrq(saved_rip: u64) void {
     const cpu_id = smp.myCpu().cpu_id;
     if (cpu_id >= smp.MAX_CPUS) return;
-    const head = trail_head[cpu_id];
+    const head = trail_head[cpu_id].i;
     trails[cpu_id][head] = .{ .tsc = perf.rdtsc(), .rip = saved_rip };
-    trail_head[cpu_id] = (head + 1) % TRAIL_ENTRIES;
+    trail_head[cpu_id].i = (head + 1) % TRAIL_ENTRIES;
 }
 
 /// Record syscall entry. Encodes sys_num into a sentinel RIP so the
@@ -66,10 +69,10 @@ pub fn recordIrq(saved_rip: u64) void {
 pub fn recordSyscall(sys_num: u32) void {
     const cpu_id = smp.myCpu().cpu_id;
     if (cpu_id >= smp.MAX_CPUS) return;
-    const head = trail_head[cpu_id];
+    const head = trail_head[cpu_id].i;
     const marker = MARKER_BASE | MARKER_SYSCALL_BIT | @as(u64, sys_num);
     trails[cpu_id][head] = .{ .tsc = perf.rdtsc(), .rip = marker };
-    trail_head[cpu_id] = (head + 1) % TRAIL_ENTRIES;
+    trail_head[cpu_id].i = (head + 1) % TRAIL_ENTRIES;
 }
 
 /// Peek at the most-recent recorded entry for `cpu_id`. Returns the
@@ -83,7 +86,7 @@ pub fn recordSyscall(sys_num: u32) void {
 /// CPU was in user code, idle, or kernel work during the stall gap.
 pub fn peekHeadMinusOne(cpu_id: u8) ?u64 {
     if (cpu_id >= smp.MAX_CPUS) return null;
-    const head = trail_head[cpu_id];
+    const head = trail_head[cpu_id].i;
     const idx = (head + TRAIL_ENTRIES - 1) % TRAIL_ENTRIES;
     const e = trails[cpu_id][idx];
     if (e.tsc == 0) return null;
@@ -97,7 +100,7 @@ pub fn dump(cpu_id: u8, n: u8) void {
     const want: u8 = if (n > TRAIL_ENTRIES) TRAIL_ENTRIES else n;
     serial.print("[trail cpu{d}] last {d} samples (newest first):\n", .{ cpu_id, want });
 
-    const head = trail_head[cpu_id];
+    const head = trail_head[cpu_id].i;
     var i: u8 = 0;
     while (i < want) : (i += 1) {
         // Walk backward from (head - 1).

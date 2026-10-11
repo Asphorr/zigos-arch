@@ -52,6 +52,9 @@ pub const Softirq = enum(u5) {
     /// BSP tick when bytes are pending, so the BSP's ksoftirqd is the sole
     /// drainer — serial.drain_pos needs exactly one consumer.
     klog = 3,
+    /// The 5-second [perf]/[tickless] dump. Raised from the BSP tick; its
+    /// formatting used to run there, in IRQ0 with interrupts off.
+    perf_dump = 4,
     // room for: net (NAPI), block, tasklet, ...
 };
 
@@ -184,6 +187,7 @@ pub fn startAll() void {
     register(.virtio_gpu, @import("../driver/virtio_gpu.zig").tickSweep);
     register(.hid, @import("../driver/xhci.zig").pollHID);
     register(.klog, serial.drainToPort);
+    register(.perf_dump, @import("../cpu/idt/irq0.zig").perfDump);
 
     var id: u8 = 0;
     while (id < smp.MAX_CPUS) : (id += 1) {
