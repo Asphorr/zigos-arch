@@ -1,8 +1,8 @@
 // Cross-CPU hang detector.
 //
 // Each CPU bumps `cpu.irq_tick_count` on every IRQ0. From its own IRQ0
-// handler, every WATCHDOG_CHECK_INTERVAL ticks (~1s), each CPU samples its
-// "next" peer's tick. If the peer hasn't advanced in WATCHDOG_STRIKES
+// handler, once per second of its TSC, each CPU samples its "next" peer's
+// tick. If the peer hasn't advanced in WATCHDOG_STRIKES
 // consecutive checks (~3s), the peer is wedged — kernel running with cli
 // held in a tight loop, no log output, no heartbeats. Trigger a
 // panic-style autopsy: set kdbg.nmi_halt_after_snapshot, broadcast NMI to
@@ -31,7 +31,7 @@ const kdbg = @import("kdbg.zig");
 const apic = @import("../time/apic.zig");
 const kvm = @import("../virt/kvm.zig");
 
-/// Ticks between peer checks. 100 Hz IRQ0 × 100 ticks = 1 second.
+/// Quanta between peer checks: 100 × 10 ms = 1 second of the watcher's TSC.
 const WATCHDOG_CHECK_INTERVAL: u64 = 100;
 /// Consecutive missed checks before we SUSPECT a wedge (~3s frozen).
 const WATCHDOG_STRIKES: u8 = 3;
@@ -64,10 +64,11 @@ const CLAIM_LIVELOCK_THRESH: u64 = 64; // sched claim-loop in-flight above this 
 /// age the suspicion at all. The bar is 90 % of the window as MEASURED on the
 /// watcher's TSC, not a fixed figure: a peer starved 50 % still ran for the
 /// other half and should have ticked ~50 times in it (a merely oversubscribed
-/// host must not launder a real spin), and the watcher's own window is ~1 s
-/// only nominally — an idle AP's one-shot is stretched to 10 quanta, so its
-/// "100 ticks" can be 10 s. Its own cap keeps the fail-safe: a vCPU the host
-/// starves for a whole minute still reaches the spin probe and the halt —
+/// host must not launder a real spin), and the watcher's own window runs
+/// past 1 s by however late its next IRQ0 lands (up to a 10-quantum stretch
+/// on an idle AP, longer across a host pause). Its own cap keeps the
+/// fail-safe: a vCPU the host starves for a whole minute still reaches the
+/// spin probe and the halt —
 /// much sooner when the peer sits on a cli-lock, where a freeze can
 /// propagate to the watcher before it can autopsy (the GRACE_LOCKED
 /// rationale). Whole-VM (L0) pauses freeze the watcher too and need nothing
@@ -108,13 +109,19 @@ var wd_suspect_steal_tsc: [smp.MAX_CPUS]u64 = [_]u64{0} ** smp.MAX_CPUS;
 var wd_steal_rideouts: [smp.MAX_CPUS]u8 = [_]u8{0} ** smp.MAX_CPUS;
 /// Serializes the NMI spin-probe across watchers (kdbg's prof_* state is global).
 var wd_probe_busy: bool = false;
+/// Watcher's TSC at which its next peer check is due. The cadence is wall
+/// time, not the watcher's IRQ0 count: soft yields enter IRQ0 too (an idle
+/// task polling NVMe yields ~1000 times a millisecond) and so do the hires
+/// one-shot's early fires, either of which ages a healthy peer to the halt
+/// in milliseconds.
+var wd_next_check_tsc: [smp.MAX_CPUS]u64 = [_]u64{0} ** smp.MAX_CPUS;
 
 /// Enable the watchdog. Call after smp.init() so peer CPUs exist. No-op
 /// before that; the per-CPU tick fields default to 0, and a freshly-zeroed
 /// peer would falsely register as "not advancing" on the first check.
 pub fn arm() void {
     armed = true;
-    serial.print("[watchdog] armed (interval={d} ticks, strikes={d})\n", .{ WATCHDOG_CHECK_INTERVAL, WATCHDOG_STRIKES });
+    serial.print("[watchdog] armed (interval={d} quanta of TSC, strikes={d})\n", .{ WATCHDOG_CHECK_INTERVAL, WATCHDOG_STRIKES });
 }
 
 /// Public read accessor — used by src/debug/diag.zig for the boot
@@ -128,7 +135,12 @@ pub fn isArmed() bool {
 /// peer read fires once per second per CPU.
 pub fn peerCheck(self: *smp.CpuLocal) void {
     if (!armed or fired) return;
-    if (self.irq_tick_count % WATCHDOG_CHECK_INTERVAL != 0) return;
+    const per_check = apic.tscPerQuantumSane() * WATCHDOG_CHECK_INTERVAL;
+    if (per_check != 0) {
+        const now = rdtsc();
+        if (now < wd_next_check_tsc[self.cpu_id]) return;
+        wd_next_check_tsc[self.cpu_id] = now + per_check;
+    } else if (self.irq_tick_count % WATCHDOG_CHECK_INTERVAL != 0) return;
 
     // Pick the peer to watch — round-robin to the next alive CPU. On a
     // 2-CPU system this just toggles cpu0↔cpu1.
