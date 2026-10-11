@@ -716,7 +716,25 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
         else => @intFromPtr(&desktop_mod.taskEntry),
     };
     debug.klog("[boot] boot_mode={d} (param={d}) entry=0x{X:0>16}\n", .{ live_mode, boot_info.boot_mode, entry });
-    @import("proc/process.zig").enterFirstTask(entry);
+    // enterFirstTask switches stacks with interrupts off; the desktop and the
+    // installer turn them back on themselves, the selftest/stress entries go
+    // through bootTaskWithIrqs.
+    if (live_mode == 17 or entry == @intFromPtr(&desktop_mod.taskEntry)) {
+        @import("proc/process.zig").enterFirstTask(entry);
+    } else {
+        boot_task_body = entry;
+        @import("proc/process.zig").enterFirstTask(@intFromPtr(&bootTaskWithIrqs));
+    }
+}
+
+var boot_task_body: usize = 0;
+
+/// First task of a selftest/stress boot mode: interrupts on, then the mode's
+/// entry. Without it the whole run kept the BSP's timer masked.
+fn bootTaskWithIrqs() callconv(.c) noreturn {
+    asm volatile ("sti");
+    const body: *const fn () callconv(.c) noreturn = @ptrFromInt(boot_task_body);
+    body();
 }
 
 pub fn panic(msg: []const u8, _: ?*std.builtin.StackTrace, ret_addr: ?usize) noreturn {

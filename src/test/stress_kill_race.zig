@@ -109,5 +109,6 @@ pub fn taskEntry() callconv(.c) noreturn {
     serial.print("[killrace] interaction (mouse, focus, draw) which this harness\n", .{});
     serial.print("[killrace] doesn't simulate. Try running heavy GUI workload manually.\n", .{});
 
-    while (true) asm volatile ("cli; hlt");
+    // Park with the timer live: a cli'd park reads to the watchdog as a wedge.
+    while (true) asm volatile ("sti; hlt");
 }
