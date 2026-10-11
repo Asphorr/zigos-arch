@@ -329,7 +329,8 @@ fn readSeg(r: *Reader, ns: *NameString) bool {
 
 // --- scope path tracking ----------------------------------------------------
 // A fixed buffer holding the current absolute ACPI path (e.g. "\_SB_.PCI0").
-// Recursion pushes a child segment and restores on the way out — no allocator.
+// A nested scope gets its own copy (child) — no allocator, and nothing a
+// declaration inside it does can touch the enclosing path.
 
 const PathBuf = struct {
     buf: [256]u8 = undefined,
@@ -352,28 +353,25 @@ const PathBuf = struct {
         }
     }
 
-    /// Resolve a NameString against the current path, mutating in place to the
-    /// object's absolute path. Returns a mark to restore the previous path with.
-    /// Handles rooted '\' (reset to root), parent '^' (drop trailing segments),
-    /// and relative (append). Multi-seg names append each seg dot-separated.
-    fn enter(self: *PathBuf, ns: NameString) usize {
-        const mark = self.len;
+    /// The absolute path `ns` names when resolved from this scope: rooted '\'
+    /// restarts at the root, each '^' drops a trailing segment, the segments are
+    /// appended dot-separated. Returns a copy because a rooted or '^' name
+    /// rewrites bytes the scope itself still needs — AMI firmware declares
+    /// `Method (^BN00)` inside PCI0 and `Scope (\) { Name (...) }` inside devices.
+    fn child(self: *const PathBuf, ns: NameString) PathBuf {
+        var out = self.*;
         if (ns.rooted) {
-            self.len = 1; // back to "\"
+            out.len = 1; // back to "\"
         } else {
             var p: u8 = 0;
-            while (p < ns.parents) : (p += 1) self.dropSegment();
+            while (p < ns.parents) : (p += 1) out.dropSegment();
         }
         var i: u8 = 0;
         while (i < ns.nsegs) : (i += 1) {
-            if (self.len > 1) self.append(".");
-            self.append(&ns.segs[i]);
+            if (out.len > 1) out.append(".");
+            out.append(&ns.segs[i]);
         }
-        return mark;
-    }
-
-    fn restore(self: *PathBuf, mark: usize) void {
-        self.len = mark;
+        return out;
     }
 
     /// Drop the last '.'-separated component (for '^'). Never goes below root.
@@ -405,20 +403,32 @@ fn readOpcode(r: *Reader) ?u16 {
     return b;
 }
 
+/// Scope nesting the walker follows; deeper bodies are skipped, so a hostile
+/// table can't recurse the kernel stack away. Real firmware nests ~10 deep.
+const MAX_WALK_DEPTH = 64;
+
+/// Module-level statements the walker stepped over without executing.
+var mlc_skipped: u32 = 0;
+
 /// Walk a TermList in [r.pos, end), recording named objects under `path`.
-/// Recurses into scope-creating objects. depth is for the dump indent only.
-fn walkTerms(r: *Reader, end: usize, path: *PathBuf, depth: u8) void {
+/// Recurses into scope-creating objects; depth bounds that recursion.
+fn walkTerms(r: *Reader, end: usize, path: *const PathBuf, depth: u8) void {
     while (r.pos < end) {
         const term_start = r.pos;
         const op = readOpcode(r) orelse return;
 
         const info = lookup(op) orelse {
-            // Not a namespace/scoping opcode. At the top level of a DSDT this is
-            // rare (most terms are object definitions); when it happens it's an
-            // executable statement whose length we don't model yet. Skipping
-            // blindly would desync the stream, so stop this list and record the
-            // opcode for diagnostics — the caller still has every object found
-            // before this point.
+            // Not a declaration: module-level code (a CreateWordField inside a
+            // Device, a Store, a method call) or an External. It is not executed;
+            // stepping over it by its operand spec keeps the declarations after
+            // it visible.
+            r.pos = term_start;
+            if (skipTerm(r, path.snapshot(), 0)) {
+                mlc_skipped += 1;
+                continue;
+            }
+            // Unparseable: walking on would read desynced bytes. Stop this list;
+            // the caller still has every object found before this point.
             if (unknown_op_seen == 0) unknown_op_seen = op;
             return;
         };
@@ -430,9 +440,10 @@ fn walkTerms(r: *Reader, end: usize, path: *PathBuf, depth: u8) void {
                 if (info.extra > 0) r.skip(info.extra);
                 record(info.kind, path, ns, depth);
                 storeNode(info.kind, path, ns, .{});
-                const mark = path.enter(ns);
-                walkTerms(r, pkg_end, path, depth + 1);
-                path.restore(mark);
+                if (depth < MAX_WALK_DEPTH) {
+                    const inner = path.child(ns);
+                    walkTerms(r, pkg_end, &inner, depth + 1);
+                }
                 r.pos = pkg_end;
             },
             .method => {
@@ -481,10 +492,23 @@ fn walkTerms(r: *Reader, end: usize, path: *PathBuf, depth: u8) void {
             .op_region => {
                 const ns = readNameString(r) orelse return;
                 const space = r.next() orelse return; // RegionSpace
-                const off = evalRegionBase(r, path.snapshot()); // RegionOffset: const, or a Name (QEMU NVDIMM NRAM ← MEMA)
-                const len = evalConstInt(r) orelse 0; // RegionLen
+                // Literal offset/length are taken now. Anything else — a Name
+                // (QEMU's NVDIMM bases NRAM at MEMA), Add(...), a method call — is
+                // evaluated on first access (regionReady), once every name it
+                // mentions exists.
+                const args_off = r.pos;
+                const off = literalInt(r);
+                if (off == null and !skipTerm(r, path.snapshot(), 0)) return;
+                const len = literalInt(r);
+                if (len == null and !skipTerm(r, path.snapshot(), 0)) return;
+                const deferred = off == null or len == null;
                 record(info.kind, path, ns, depth);
-                storeNode(.op_region, path, ns, .{ .region_space = space, .region_off = off, .region_len = len });
+                storeNode(.op_region, path, ns, .{
+                    .region_space = space,
+                    .region_off = off orelse 0,
+                    .region_len = len orelse 0,
+                    .region_args = if (deferred) args_off else 0,
+                });
             },
             .name_byte => {
                 const ns = readNameString(r) orelse return;
@@ -575,25 +599,217 @@ fn skipDataObject(r: *Reader) bool {
     }
 }
 
-/// Skip one TermArg (used for OperationRegion offset/length). These are almost
-/// always integer literals in practice; fall back to DataObject skipping, which
-/// covers the literal forms and a NameString reference.
-fn skipTermArg(r: *Reader) bool {
-    return skipDataObject(r);
+/// An integer literal (Zero/One/Ones/Byte/Word/DWord/QWord) at the cursor:
+/// consumed and returned. Anything else is left unconsumed and yields null.
+fn literalInt(r: *Reader) ?u64 {
+    switch (r.peek(0) orelse return null) {
+        0x00, 0x01, 0xFF, 0x0A, 0x0B, 0x0C, 0x0E => {
+            const save = r.pos;
+            if (evalData(r)) |v| if (v == .integer) return v.integer;
+            r.pos = save;
+            return null;
+        },
+        else => return null,
+    }
+}
+
+// --- parse-only skipping (ACPI 6.4 §20.2.5-§20.2.6) -------------------------
+// The walker steps over terms it does not model — module-level code, External,
+// the non-literal operands of an OperationRegion — without evaluating them, so
+// skipping has no side effects and works before the namespace is complete.
+// Each opcode's operands are a spec string:
+//   t TermArg   s SuperName/Target   n NameString   b/w/d Byte/Word/DWordData
+//   p PkgLength — the rest of the package is skipped whole
+
+const SkipInfo = struct { code: u16, args: []const u8 };
+
+const skip_table = [_]SkipInfo{
+    .{ .code = 0x06, .args = "nn" }, // Alias
+    .{ .code = 0x08, .args = "nt" }, // Name
+    .{ .code = 0x10, .args = "p" }, // Scope
+    .{ .code = 0x11, .args = "p" }, // Buffer
+    .{ .code = 0x12, .args = "p" }, // Package
+    .{ .code = 0x13, .args = "p" }, // VarPackage
+    .{ .code = 0x14, .args = "p" }, // Method
+    .{ .code = 0x15, .args = "nbb" }, // External
+    .{ .code = 0x70, .args = "ts" }, // Store
+    .{ .code = 0x71, .args = "s" }, // RefOf
+    .{ .code = 0x72, .args = "tts" }, // Add
+    .{ .code = 0x73, .args = "tts" }, // Concatenate
+    .{ .code = 0x74, .args = "tts" }, // Subtract
+    .{ .code = 0x75, .args = "s" }, // Increment
+    .{ .code = 0x76, .args = "s" }, // Decrement
+    .{ .code = 0x77, .args = "tts" }, // Multiply
+    .{ .code = 0x78, .args = "ttss" }, // Divide
+    .{ .code = 0x79, .args = "tts" }, // ShiftLeft
+    .{ .code = 0x7A, .args = "tts" }, // ShiftRight
+    .{ .code = 0x7B, .args = "tts" }, // And
+    .{ .code = 0x7C, .args = "tts" }, // NAnd
+    .{ .code = 0x7D, .args = "tts" }, // Or
+    .{ .code = 0x7E, .args = "tts" }, // NOr
+    .{ .code = 0x7F, .args = "tts" }, // Xor
+    .{ .code = 0x80, .args = "ts" }, // Not
+    .{ .code = 0x81, .args = "ts" }, // FindSetLeftBit
+    .{ .code = 0x82, .args = "ts" }, // FindSetRightBit
+    .{ .code = 0x83, .args = "t" }, // DerefOf
+    .{ .code = 0x84, .args = "tts" }, // ConcatenateResTemplate
+    .{ .code = 0x85, .args = "tts" }, // Mod
+    .{ .code = 0x86, .args = "st" }, // Notify
+    .{ .code = 0x87, .args = "s" }, // SizeOf
+    .{ .code = 0x88, .args = "tts" }, // Index
+    .{ .code = 0x89, .args = "tbtbtt" }, // Match
+    .{ .code = 0x8A, .args = "ttn" }, // CreateDWordField
+    .{ .code = 0x8B, .args = "ttn" }, // CreateWordField
+    .{ .code = 0x8C, .args = "ttn" }, // CreateByteField
+    .{ .code = 0x8D, .args = "ttn" }, // CreateBitField
+    .{ .code = 0x8E, .args = "s" }, // ObjectType
+    .{ .code = 0x8F, .args = "ttn" }, // CreateQWordField
+    .{ .code = 0x90, .args = "tt" }, // LAnd
+    .{ .code = 0x91, .args = "tt" }, // LOr
+    .{ .code = 0x92, .args = "t" }, // LNot
+    .{ .code = 0x93, .args = "tt" }, // LEqual
+    .{ .code = 0x94, .args = "tt" }, // LGreater
+    .{ .code = 0x95, .args = "tt" }, // LLess
+    .{ .code = 0x96, .args = "ts" }, // ToBuffer
+    .{ .code = 0x97, .args = "ts" }, // ToDecimalString
+    .{ .code = 0x98, .args = "ts" }, // ToHexString
+    .{ .code = 0x99, .args = "ts" }, // ToInteger
+    .{ .code = 0x9C, .args = "tts" }, // ToString
+    .{ .code = 0x9D, .args = "ts" }, // CopyObject
+    .{ .code = 0x9E, .args = "ttts" }, // Mid
+    .{ .code = 0x9F, .args = "" }, // Continue
+    .{ .code = 0xA0, .args = "p" }, // If
+    .{ .code = 0xA1, .args = "p" }, // Else
+    .{ .code = 0xA2, .args = "p" }, // While
+    .{ .code = 0xA3, .args = "" }, // Noop
+    .{ .code = 0xA4, .args = "t" }, // Return
+    .{ .code = 0xA5, .args = "" }, // Break
+    .{ .code = 0xCC, .args = "" }, // BreakPoint
+    .{ .code = 0x5B01, .args = "nb" }, // Mutex
+    .{ .code = 0x5B02, .args = "n" }, // Event
+    .{ .code = 0x5B12, .args = "ss" }, // CondRefOf
+    .{ .code = 0x5B13, .args = "tttn" }, // CreateField
+    .{ .code = 0x5B1F, .args = "tttttt" }, // LoadTable
+    .{ .code = 0x5B20, .args = "ns" }, // Load
+    .{ .code = 0x5B21, .args = "t" }, // Stall
+    .{ .code = 0x5B22, .args = "t" }, // Sleep
+    .{ .code = 0x5B23, .args = "sw" }, // Acquire
+    .{ .code = 0x5B24, .args = "s" }, // Signal
+    .{ .code = 0x5B25, .args = "st" }, // Wait
+    .{ .code = 0x5B26, .args = "s" }, // Reset
+    .{ .code = 0x5B27, .args = "s" }, // Release
+    .{ .code = 0x5B28, .args = "ts" }, // FromBCD
+    .{ .code = 0x5B29, .args = "ts" }, // ToBCD
+    .{ .code = 0x5B2A, .args = "s" }, // Unload
+    .{ .code = 0x5B30, .args = "" }, // Revision
+    .{ .code = 0x5B31, .args = "" }, // Debug
+    .{ .code = 0x5B32, .args = "bdt" }, // Fatal
+    .{ .code = 0x5B33, .args = "" }, // Timer
+    .{ .code = 0x5B80, .args = "nbtt" }, // OperationRegion
+    .{ .code = 0x5B81, .args = "p" }, // Field
+    .{ .code = 0x5B82, .args = "p" }, // Device
+    .{ .code = 0x5B83, .args = "p" }, // Processor
+    .{ .code = 0x5B84, .args = "p" }, // PowerResource
+    .{ .code = 0x5B85, .args = "p" }, // ThermalZone
+    .{ .code = 0x5B86, .args = "p" }, // IndexField
+    .{ .code = 0x5B87, .args = "p" }, // BankField
+    .{ .code = 0x5B88, .args = "nttt" }, // DataRegion
+};
+
+fn skipSpec(code: u16) ?[]const u8 {
+    inline for (skip_table) |s| {
+        if (s.code == code) return s.args;
+    }
+    return null;
+}
+
+/// Bounds operand nesting so a hostile table can't recurse the stack away.
+const MAX_SKIP_DEPTH = 64;
+
+fn skipBytes(r: *Reader, n: usize) bool {
+    if (r.rem() < n) return false;
+    r.skip(n);
+    return true;
+}
+
+/// Step over one term — a data object, Local/Arg, a NameString (with the
+/// arguments of the Method it names, resolved from `scope`), or any opcode in
+/// skip_table. False on truncation, an unknown opcode or runaway nesting. A
+/// Method declared later in the table can't be resolved yet, so a call to it is
+/// taken as a plain name — the rule ACPICA's parser follows too.
+fn skipTerm(r: *Reader, scope: []const u8, depth: u8) bool {
+    if (depth >= MAX_SKIP_DEPTH) return false;
+    const lead = r.peek(0) orelse return false;
+    switch (lead) {
+        0x00, 0x01, 0xFF, 0x60...0x6E => return skipBytes(r, 1),
+        0x0A => return skipBytes(r, 2),
+        0x0B => return skipBytes(r, 3),
+        0x0C => return skipBytes(r, 5),
+        0x0E => return skipBytes(r, 9),
+        0x0D => {
+            _ = r.next();
+            while (r.next()) |c| {
+                if (c == 0) return true;
+            }
+            return false;
+        },
+        else => {},
+    }
+    if (isNameLead(lead)) {
+        const ns = readNameString(r) orelse return false;
+        const n = resolve(scope, ns) orelse return true;
+        if (n.kind != .method) return true;
+        var i: u8 = 0;
+        while (i < n.arg_count) : (i += 1) {
+            if (!skipTerm(r, scope, depth + 1)) return false;
+        }
+        return true;
+    }
+    const op_start = r.pos;
+    const op = readOpcode(r) orelse return false;
+    const spec = skipSpec(op) orelse return false;
+    for (spec) |a| {
+        const ok = switch (a) {
+            't' => skipTerm(r, scope, depth + 1),
+            's' => skipTarget(r, scope, depth + 1),
+            'n' => readNameString(r) != null,
+            'b' => skipBytes(r, 1),
+            'w' => skipBytes(r, 2),
+            'd' => skipBytes(r, 4),
+            'p' => blk: {
+                r.pos = packageEnd(r, op_start) orelse break :blk false;
+                break :blk true;
+            },
+            else => false,
+        };
+        if (!ok) return false;
+    }
+    return true;
+}
+
+/// Step over a SuperName/Target: NullName, Local/Arg, Debug, a NameString (a
+/// reference here, never an invocation) or a RefOf/DerefOf/Index term.
+fn skipTarget(r: *Reader, scope: []const u8, depth: u8) bool {
+    if (depth >= MAX_SKIP_DEPTH) return false;
+    const lead = r.peek(0) orelse return false;
+    switch (lead) {
+        0x00, 0x60...0x6E => return skipBytes(r, 1),
+        0x5B => if ((r.peek(1) orelse 0) == 0x31) return skipBytes(r, 2),
+        else => {},
+    }
+    if (isNameLead(lead)) return readNameString(r) != null;
+    return skipTerm(r, scope, depth);
 }
 
 /// Record (dump) one discovered named object.
-fn record(kind: NodeKind, path: *PathBuf, ns: NameString, depth: u8) void {
+fn record(kind: NodeKind, path: *const PathBuf, ns: NameString, depth: u8) void {
     node_count += 1;
     if (!DUMP) return;
-    // Build the object's absolute path by entering+restoring (non-destructive).
-    const mark = path.enter(ns);
-    const full = path.snapshot();
+    const full = path.child(ns);
     var indent: [32]u8 = undefined;
     const ind_n = @min(@as(usize, depth) * 2, indent.len);
     @memset(indent[0..ind_n], ' ');
-    debug.klog("[aml] {s}{s} {s}\n", .{ indent[0..ind_n], kind.label(), full });
-    path.restore(mark);
+    debug.klog("[aml] {s}{s} {s}\n", .{ indent[0..ind_n], kind.label(), full.snapshot() });
 }
 
 // === B2: namespace store + value evaluator ==================================
@@ -603,11 +819,14 @@ fn record(kind: NodeKind, path: *PathBuf, ns: NameString, depth: u8) void {
 // is B2b; OperationRegion/Field I/O is B2c.
 
 const PATH_MAX = 64;
-// Real laptops declare thousands of namespace nodes (deep EC/battery/thermal/GPE
-// device trees + per-processor objects); 512 overflowed silently on them. Each
-// StoredNode is ~160 B, so 2048 ≈ 320 KB of BSS (in line with the kernel's other
-// static ACPI/verifier tables). store_overflow still guards the cap.
-const MAX_NODES = 2048;
+// Real firmware declares thousands of namespace nodes: an AMI B250 desktop DSDT
+// alone holds ~4200, a laptop's EC/battery/thermal trees add more. Each
+// StoredNode is ~170 B, so 8192 ≈ 1.4 MB of BSS — well inside the image's room
+// below GUEST_FB_BASE. store_overflow still guards the cap.
+const MAX_NODES = 8192;
+
+/// A region whose offset/length were not literals is resolved on first access.
+const RegionState = enum { ready, pending, failed };
 
 /// One resolved namespace entry. Which payload fields matter depends on `kind`:
 ///   .name      -> val_off/val_len: the DataRefObject's byte range in the body
@@ -627,6 +846,10 @@ const StoredNode = struct {
     region_space: u8 = 0,
     region_off: u64 = 0,
     region_len: u64 = 0,
+    /// .pending: region_args is the body offset of the RegionOffset TermArg, to
+    /// be evaluated by regionReady(). .failed: unusable — every access fails.
+    region_state: RegionState = .ready,
+    region_args: usize = 0,
     // Field element (B2c, kind == .field): the parent OperationRegion's node
     // index (-1 if unresolved) plus this element's bit position/width/access.
     field_region: i32 = -1,
@@ -656,6 +879,7 @@ const Payload = struct {
     region_space: u8 = 0,
     region_off: u64 = 0,
     region_len: u64 = 0,
+    region_args: usize = 0, // nonzero: offset/length deferred to regionReady()
     field_region: i32 = -1,
     field_bit_off: u32 = 0,
     field_bit_width: u32 = 0,
@@ -708,13 +932,13 @@ fn bodyOf(n: *const StoredNode) []const u8 {
     return if (n.table_id < nbodies) bodies[n.table_id] else &[_]u8{};
 }
 
-fn storeNode(kind: NodeKind, path: *PathBuf, ns: NameString, p: Payload) void {
+fn storeNode(kind: NodeKind, path: *const PathBuf, ns: NameString, p: Payload) void {
     if (nnodes >= nodes.len) {
         store_overflow = true;
         return;
     }
-    const mark = path.enter(ns);
-    const full = path.snapshot();
+    const abs = path.child(ns);
+    const full = abs.snapshot();
     const n = &nodes[nnodes];
     n.* = .{
         .kind = kind,
@@ -725,6 +949,8 @@ fn storeNode(kind: NodeKind, path: *PathBuf, ns: NameString, p: Payload) void {
         .region_space = p.region_space,
         .region_off = p.region_off,
         .region_len = p.region_len,
+        .region_state = if (p.region_args != 0) .pending else .ready,
+        .region_args = p.region_args,
         .field_region = p.field_region,
         .field_bit_off = p.field_bit_off,
         .field_bit_width = p.field_bit_width,
@@ -733,7 +959,6 @@ fn storeNode(kind: NodeKind, path: *PathBuf, ns: NameString, p: Payload) void {
     const cl = @min(full.len, @as(usize, PATH_MAX));
     @memcpy(n.path[0..cl], full[0..cl]);
     n.path_len = @intCast(cl);
-    path.restore(mark);
     nnodes += 1;
 }
 
@@ -1003,45 +1228,6 @@ fn isNameLead(c: u8) bool {
     return c == 0x5C or c == 0x5E or c == 0x2E or c == 0x2F or c == '_' or (c >= 'A' and c <= 'Z');
 }
 
-/// Evaluate a TermArg expected to be a constant integer (OpRegion offset/len).
-/// On a non-constant expression, skip the TermArg and return null.
-fn evalConstInt(r: *Reader) ?u64 {
-    const save = r.pos;
-    if (evalData(r)) |v| {
-        if (v == .integer) return v.integer;
-    }
-    r.pos = save;
-    _ = skipTermArg(r);
-    return null;
-}
-
-/// Resolve an OperationRegion's base offset. Almost always a constant integer (a
-/// fixed I/O port or MMIO address) — handled by evalConstInt. QEMU's NVDIMM is
-/// the exception that makes A5 possible: it bases the SystemMemory DSM-mailbox
-/// region (NRAM) at `MEMA`, a Name the firmware's ACPI table-loader patched to
-/// the mailbox buffer's physical address before our kernel ran. So if the base
-/// operand is a NameString, resolve it against the enclosing scope and read the
-/// (firmware-patched) integer literal it names — the name is declared before the
-/// region in the same scope, so it's already in the store at parse time. Anything
-/// that doesn't cleanly resolve to an integer yields 0, which readRegionUnit/
-/// writeRegionUnit treat as an unmapped no-op (never a fault) — byte-for-byte the
-/// prior behavior, since evalConstInt also folded an unresolved name to 0.
-fn evalRegionBase(r: *Reader, scope: []const u8) u64 {
-    const lead = r.peek(0) orelse return 0;
-    if (isNameLead(lead)) {
-        const ns = readNameString(r) orelse return 0;
-        if (resolve(scope, ns)) |n| {
-            if (n.kind == .name) {
-                var br = Reader{ .buf = bodyOf(n), .pos = n.val_off };
-                if (evalData(&br)) |bv| {
-                    if (bv == .integer) return bv.integer;
-                }
-            }
-        }
-        return 0;
-    }
-    return evalConstInt(r) orelse 0;
-}
 
 /// SLP_TYPa from \_S5_ as evaluated from AML (cross-checks Slice A's static
 /// scan; usable by the shutdown path later). Null if \_S5_ is absent or not a
@@ -1218,22 +1404,15 @@ fn seedPath(pb: *PathBuf, scope: []const u8) void {
 fn resolve(scope: []const u8, ns: NameString) ?*StoredNode {
     if (ns.nsegs == 0) return null;
     var pb = PathBuf{};
+    seedPath(&pb, scope);
     const single_relative = !ns.rooted and ns.parents == 0 and ns.nsegs == 1;
     if (!single_relative) {
-        seedPath(&pb, scope);
-        const mark = pb.enter(ns);
-        const hit = findExact(pb.snapshot());
-        pb.restore(mark);
-        return hit;
+        const abs = pb.child(ns);
+        return findExact(abs.snapshot());
     }
-    seedPath(&pb, scope);
     while (true) {
-        const mark = pb.enter(ns);
-        if (findExact(pb.snapshot())) |n| {
-            pb.restore(mark);
-            return n;
-        }
-        pb.restore(mark);
+        const abs = pb.child(ns);
+        if (findExact(abs.snapshot())) |n| return n;
         if (pb.len <= 1) return null; // tested root too
         pb.dropSegment();
     }
@@ -1864,10 +2043,13 @@ fn evalRefOf(r: *Reader, st: *ExecState) ?Value {
 /// existing node (CreateField re-target) or a freshly appended one; null if the
 /// store is full.
 fn createDynNode(scope: []const u8, ns: NameString) ?*StoredNode {
+    // A NullName would resolve to the scope itself — the running Method — and
+    // the caller would then retype that node.
+    if (ns.nsegs == 0) return null;
     var pb = PathBuf{};
     seedPath(&pb, scope);
-    _ = pb.enter(ns);
-    const abs = pb.snapshot();
+    const full = pb.child(ns);
+    const abs = full.snapshot();
     if (findExact(abs)) |n| return n;
     if (nnodes >= nodes.len) {
         store_overflow = true;
@@ -2605,17 +2787,19 @@ fn execOpRegion(r: *Reader, st: *ExecState) void {
     _ = r.next(); // 0x80 OpRegionOp
     const ns = readNameString(r) orelse return;
     const space = r.next() orelse return;
-    const off = toInt(evalTermArg(r, st) orelse .uninit);
-    const len = toInt(evalTermArg(r, st) orelse .uninit);
+    const off = regionArgInt(evalTermArg(r, st) orelse .uninit);
+    const len = regionArgInt(evalTermArg(r, st) orelse .uninit);
     const node = createDynNode(st.scope, ns) orelse return;
     node.kind = .op_region;
     node.region_space = space;
-    node.region_off = off;
-    node.region_len = len;
+    node.region_off = off orelse 0;
+    node.region_len = len orelse 0;
+    node.region_args = 0;
+    node.region_state = if (off != null and len != null) .ready else .failed;
     node.has_runtime = false;
     if (DUMP) {
         const seg = ns.segs[ns.nsegs - 1];
-        debug.klog("[aml] exec OperationRegion {s} space={d} base=0x{X} len=0x{X}\n", .{ seg[0..], space, off, len });
+        debug.klog("[aml] exec OperationRegion {s} space={d} base=0x{X} len=0x{X}{s}\n", .{ seg[0..], space, node.region_off, node.region_len, if (node.region_state == .failed) " (unresolved — disabled)" else "" });
     }
 }
 
@@ -3142,6 +3326,7 @@ pub fn runGpeHandler(n: u8) bool {
 fn tNsReset() void {
     node_count = 0;
     unknown_op_seen = 0;
+    mlc_skipped = 0;
     nnodes = 0;
     static_nnodes = 0;
     store_overflow = false;
@@ -3541,8 +3726,8 @@ fn stPciTest(fails: *u32) void {
 /// A5: named-base OperationRegion — the one new primitive the live NVDIMM mailbox
 /// depends on. Hand-assemble Name(MEMA, <st_region_buf phys>), an OperationRegion
 /// based at MEMA (a Name, not a constant), a DWord field over it, and a method
-/// that writes then reads the field. Proves evalRegionBase resolves the Name to
-/// the address so region I/O lands in the real buffer — exactly how QEMU bases
+/// that writes then reads the field. Proves the deferred region base (regionReady)
+/// resolves the Name to the address so region I/O lands in the real buffer — exactly how QEMU bases
 /// NRAM at the firmware-patched MEMA. Verified twice: the field read-back, and the
 /// raw little-endian bytes deposited in st_region_buf.
 fn stNamedRegionTest(fails: *u32) void {
@@ -3966,7 +4151,80 @@ pub fn selfTestExtended() u32 {
     // Unload: Tier C state-pruning — DDB handle → remove a loaded table's nodes.
     stUnloadTest(&fails);
 
+    // Real-firmware walk shapes: scope paths, module-level code, deferred regions.
+    stWalkScopeTest(&fails);
+    stDeferredRegionTest(&fails);
+
     return fails;
+}
+
+/// Declarations real AMI firmware makes that QEMU's DSDT never does: a '^' name
+/// and a `Scope (\)` inside a Device (each used to overwrite the walker's shared
+/// path, so every later sibling got a wrong one), an External, and a
+/// CreateWordField at Device scope (each used to stop the walk).
+///   Scope(\_SB_) { Device(PCI0) { Method(^BN00) { Return(Zero) }
+///                                 Scope(\) { Name(MSFG, One) }
+///                                 Name(_ADR, Zero) } }
+///   External(\_SB_.XXXX, MethodObj, 0)
+///   Device(SIO1) { Name(CRS1, Buffer(4){}) CreateWordField(CRS1, 2, IRQM)
+///                  Name(AFTR, One) }
+fn stWalkScopeTest(fails: *u32) void {
+    tNsReset();
+    _ = walkBody(&[_]u8{
+        0x10, 0x27, 0x5C, '_',  'S',  'B',  '_', // Scope(\_SB_)
+        0x5B, 0x82, 0x1F, 'P',  'C',  'I',  '0', //   Device(PCI0)
+        0x14, 0x09, 0x5E, 'B',  'N',  '0',  '0', 0x00, 0xA4, 0x00, // Method(^BN00){Return(Zero)}
+        0x10, 0x09, 0x5C, 0x00, 0x08, 'M',  'S', 'F', 'G', 0x01, // Scope(\){Name(MSFG,One)}
+        0x08, '_',  'A',  'D',  'R',  0x00, // Name(_ADR, Zero)
+        0x15, 0x5C, 0x2E, '_',  'S',  'B',  '_', 'X', 'X', 'X', 'X', 0x08, 0x00, // External
+        0x5B, 0x82, 0x1F, 'S',  'I',  'O',  '1', // Device(SIO1)
+        0x08, 'C',  'R',  'S',  '1',  0x11, 0x03, 0x0A, 0x04, // Name(CRS1, Buffer(4){})
+        0x8B, 'C',  'R',  'S',  '1',  0x0A, 0x02, 'I', 'R', 'Q', 'M', // CreateWordField
+        0x08, 'A',  'F',  'T',  'R',  0x01, // Name(AFTR, One)
+    });
+    stCheck("walk: sibling path after ^BN00 / Scope(\\)", b2i(findExact("\\_SB_.PCI0._ADR") != null), 1, fails);
+    stCheck("walk: ^BN00 lands in \\_SB_", b2i(findExact("\\_SB_.BN00") != null), 1, fails);
+    stCheck("walk: Scope(\\) declares at root", b2i(findExact("\\MSFG") != null), 1, fails);
+    stCheck("walk: past External + CreateWordField", b2i(findExact("\\SIO1.AFTR") != null), 1, fails);
+    stCheck("walk: module-level statements stepped", mlc_skipped, 2, fails);
+    stCheck("walk: no unparsed opcode", unknown_op_seen, 0, fails);
+}
+
+/// OperationRegion operands that are not literals are evaluated on first access:
+/// a base of Add(MEMB, 4) over st_region_buf must land 4 bytes in, and a base
+/// naming nothing must disable the region instead of becoming address 0.
+///   Name(MEMB, <phys>)
+///   OperationRegion(DREG, SystemMemory, Add(MEMB, 4), 8)  Field{ DDAT, 32 }
+///   OperationRegion(BADR, SystemMemory, UNDF, 8)          Field{ BDAT, 32 }
+///   Method(TST_) { Store(0xCAFEF00D, DDAT); Store(One, BDAT); Return(DDAT) }
+fn stDeferredRegionTest(fails: *u32) void {
+    const phys = paging.virtToPhys(@intFromPtr(&st_region_buf)) orelse {
+        debug.klog("[aml] selftest deferred region base: SKIP (test buffer not mapped)\n", .{});
+        return;
+    };
+    @memset(&st_region_buf, 0);
+    var body = [_]u8{
+        0x08, 'M',  'E',  'M',  'B',  0x0E, 0,    0,    0,    0, 0, 0, 0, 0, // Name(MEMB, QWord)
+        0x5B, 0x80, 'D',  'R',  'E',  'G',  0x00, 0x72, 'M',  'E', 'M', 'B', 0x0A, 0x04, 0x00, 0x0A, 0x08,
+        0x5B, 0x81, 0x0B, 'D',  'R',  'E',  'G',  0x03, 'D',  'D', 'A', 'T', 0x20,
+        0x5B, 0x80, 'B',  'A',  'D',  'R',  0x00, 'U',  'N',  'D', 'F', 0x0A, 0x08,
+        0x5B, 0x81, 0x0B, 'B',  'A',  'D',  'R',  0x03, 'B',  'D', 'A', 'T', 0x20,
+        0x14, 0x1B, 'T',  'S',  'T',  '_',  0x00,
+        0x70, 0x0C, 0x0D, 0xF0, 0xFE, 0xCA, 'D',  'D',  'A',  'T', // Store(0xCAFEF00D, DDAT)
+        0x70, 0x01, 'B',  'D',  'A',  'T', // Store(One, BDAT)
+        0xA4, 'D',  'D',  'A',  'T', // Return(DDAT)
+    };
+    var i: usize = 0;
+    while (i < 8) : (i += 1) body[6 + i] = @truncate(phys >> @intCast(8 * i));
+    tNsReset();
+    _ = walkBody(&body);
+    static_nnodes = nnodes;
+    const dreg = findExact("\\DREG");
+    stCheck("deferred region: pending after walk", b2i(dreg != null and dreg.?.region_state == .pending), 1, fails);
+    stCheck("deferred region: Add() base r/w", toInt(evalMethod("\\TST_") orelse .uninit), 0xCAFEF00D, fails);
+    stCheck("deferred region: landed at base+4", st_region_buf[4], 0x0D, fails);
+    const badr = findExact("\\BADR");
+    stCheck("deferred region: unresolvable base disabled", b2i(badr != null and badr.?.region_state == .failed), 1, fails);
 }
 
 // === B2c: OperationRegion / Field hardware I/O ==============================
@@ -3989,7 +4247,7 @@ fn nodeIndexOf(n: *StoredNode) usize {
 
 /// Parse a FieldList in [r.pos, end), creating a .field node per NamedField in
 /// `path`, tracking the running bit offset and the current AccessType.
-fn parseFieldList(r: *Reader, end: usize, path: *PathBuf, region_idx: i32, access0: u8, depth: u8) void {
+fn parseFieldList(r: *Reader, end: usize, path: *const PathBuf, region_idx: i32, access0: u8, depth: u8) void {
     var bit_off: u32 = 0;
     var access = access0;
     while (r.pos < end) {
@@ -4283,6 +4541,48 @@ fn regionHandlerFor(space: u8) ?*const RegionHandler {
     return null;
 }
 
+/// An OperationRegion operand as an address: an integer (through a reference),
+/// else null — an uninit left by a failed read must not become address 0, which
+/// in SystemIO is a live port.
+fn regionArgInt(v: Value) ?u64 {
+    return switch (derefValue(v)) {
+        .integer => |i| i,
+        else => null,
+    };
+}
+
+/// Make a region usable: evaluate its deferred offset/length (walkTerms
+/// .op_region) in the scope that declared it, once. False when the region is
+/// unusable. Runs inside whatever evaluation first touched the region, so it
+/// allocates in the current arenas and must never reset them.
+fn regionReady(region: *StoredNode) bool {
+    switch (region.region_state) {
+        .ready => return true,
+        .failed => return false,
+        .pending => {},
+    }
+    region.region_state = .failed; // until it resolves; also stops self-reference
+    const scope = parentScope(region.path[0..region.path_len]);
+    var frame = Frame{};
+    var st = ExecState{ .frame = &frame, .scope = if (scope.len == 0) "\\" else scope, .depth = 0 };
+    var r = Reader{ .buf = bodyOf(region), .pos = region.region_args };
+    const off = regionArgInt(evalTermArg(&r, &st) orelse return false) orelse return false;
+    const len = regionArgInt(evalTermArg(&r, &st) orelse return false) orelse return false;
+    region.region_off = off;
+    region.region_len = len;
+    region.region_state = .ready;
+    return true;
+}
+
+/// The usable OperationRegion behind a field element, or null.
+fn fieldRegion(field: *const StoredNode) ?*StoredNode {
+    if (field.field_region < 0) return null;
+    const ridx: usize = @intCast(field.field_region);
+    if (ridx >= nnodes) return null;
+    const region = &nodes[ridx];
+    return if (regionReady(region)) region else null;
+}
+
 /// Read one access-width unit (1/2/4/8 bytes) from a region at a byte offset.
 fn readRegionUnit(region: *const StoredNode, byte_off: u64, width: u32) ?u64 {
     switch (region.region_space) {
@@ -4363,10 +4663,7 @@ fn writeRegionUnit(region: *const StoredNode, byte_off: u64, width: u32, val: u6
 /// spans and extracting its bit-slice. Null for unsupported widths, unresolved
 /// regions, or an access window too wide to fit a u64.
 fn readField(field: *const StoredNode) ?u64 {
-    if (field.field_region < 0) return null;
-    const ridx: usize = @intCast(field.field_region);
-    if (ridx >= nnodes) return null;
-    const region = &nodes[ridx];
+    const region = fieldRegion(field) orelse return null;
     const width = field.field_bit_width;
     if (width == 0 or width > 64) return null;
     const ab = accessWidthBytes(field.field_access);
@@ -4391,10 +4688,7 @@ fn readField(field: *const StoredNode) ?u64 {
 /// Write a scalar field (≤ 64 bits), preserving surrounding bits (Preserve
 /// UpdateRule) via read-modify-write across the spanned access units.
 fn writeField(field: *const StoredNode, value: u64) bool {
-    if (field.field_region < 0) return false;
-    const ridx: usize = @intCast(field.field_region);
-    if (ridx >= nnodes) return false;
-    const region = &nodes[ridx];
+    const region = fieldRegion(field) orelse return false;
     const width = field.field_bit_width;
     if (width == 0 or width > 64) return false;
     const ab = accessWidthBytes(field.field_access);
@@ -4433,10 +4727,7 @@ fn writeField(field: *const StoredNode, value: u64) bool {
 
 /// Read a field of any width into a fresh arena Buffer ((width+7)/8 bytes).
 fn readFieldBuffer(field: *const StoredNode) ?Value {
-    if (field.field_region < 0) return null;
-    const ridx: usize = @intCast(field.field_region);
-    if (ridx >= nnodes) return null;
-    const region = &nodes[ridx];
+    const region = fieldRegion(field) orelse return null;
     const width = field.field_bit_width;
     if (width == 0) return null;
     const out = newBuf((width + 7) / 8) orelse return null;
@@ -4460,10 +4751,7 @@ fn readFieldBuffer(field: *const StoredNode) ?Value {
 
 /// Write a Buffer's bytes into a field of any width (RMW per access unit).
 fn writeFieldBuffer(field: *const StoredNode, bytes: []const u8) bool {
-    if (field.field_region < 0) return false;
-    const ridx: usize = @intCast(field.field_region);
-    if (ridx >= nnodes) return false;
-    const region = &nodes[ridx];
+    const region = fieldRegion(field) orelse return false;
     const width = field.field_bit_width;
     if (width == 0) return false;
     const ab = accessWidthBytes(field.field_access);
@@ -4547,9 +4835,10 @@ fn loadDefinitionBlock(body: []const u8) ?u8 {
 /// (stable storage), and load its body. Returns the DDB handle (the new table_id)
 /// or null on any failure (non-memory space, unmapped, bad length, pool/registry
 /// full). Best-effort — never faults (physMapped gates every access).
-fn loadFromRegion(region: *const StoredNode) ?u8 {
+fn loadFromRegion(region: *StoredNode) ?u8 {
     const hdr_len = @sizeOf(acpi.SdtHeader);
     if (region.kind != .op_region or region.region_space != SPACE_MEM) return null;
+    if (!regionReady(region)) return null;
     // Reject a full table registry up front, before consuming any pool space —
     // loadDefinitionBlock would otherwise reject after the copy already advanced
     // loaded_pool_used (a wasted-pool leak).
@@ -4651,6 +4940,21 @@ fn loadTableBySignature(sig: []const u8, oemid: []const u8, oemtid: []const u8) 
 /// Compile in a deterministic thermal zone so Slice D's readout has a target on
 /// firmware (QEMU) that ships none. Set false to test against only real tables.
 const SYNTH_TEST = true;
+
+/// Whether load() put the synthetic tables into the live namespace. Only on
+/// QEMU (DSDT OEM ID "BOCHS "): on real firmware they would surface as a phantom
+/// battery, thermal zone and EC, and their made-up _CST would become the idle
+/// loop's MWAIT hint.
+var synth_injected: bool = false;
+
+pub fn synthInjected() bool {
+    return synth_injected;
+}
+
+fn qemuFirmware() bool {
+    const d = acpi.getDsdt() orelse return false;
+    return std.mem.eql(u8, &d.oem_id, "BOCHS ");
+}
 
 /// Hand-assembled AML body (no SDT header — QEMU synthesizes that for a real
 /// `-acpitable` table; here we feed the body straight to walkBody). Decodes to
@@ -5903,10 +6207,12 @@ pub fn load() u32 {
 
     node_count = 0;
     unknown_op_seen = 0;
+    mlc_skipped = 0;
     nnodes = 0;
     store_overflow = false;
     nbodies = 0;
     loaded_pool_used = 0;
+    synth_injected = false;
     arenaReset();
 
     // Table 0: the DSDT — the namespace root. SSDTs (next) re-open \_SB etc. by
@@ -5926,10 +6232,12 @@ pub fn load() u32 {
         if (acpi.getSsdt(si)) |s| ssdt_objs += walkTable(s);
     }
 
-    // A built-in synthetic SSDT (\_SB.TZ0._TMP) so thermal evaluation has a
-    // deterministic target even on firmware that ships no thermal zone. Loaded
-    // through the exact same multi-table path — proves SSDT loading every boot.
-    if (SYNTH_TEST) {
+    // Built-in synthetic SSDTs (\_SB.TZ0._TMP and friends) so thermal, battery,
+    // C-state and EC evaluation have a deterministic target on QEMU, which ships
+    // none of them. Loaded through the exact same multi-table path — proves SSDT
+    // loading every boot.
+    if (SYNTH_TEST and qemuFirmware()) {
+        synth_injected = true;
         _ = walkBody(&synth_ssdt); // thermal zone \_SB.TZ0
         _ = walkBody(&synth_battery); // battery \_SB.BAT0
         _ = walkBody(&synth_cst); // processor C-states \_SB.CPUT._CST
@@ -5948,14 +6256,15 @@ pub fn load() u32 {
     resolvePciRegions();
 
     if (unknown_op_seen != 0) {
-        debug.klog("[aml] walk stopped early at unmodeled opcode 0x{X} ({d} objects so far)\n", .{ unknown_op_seen, node_count });
+        debug.klog("[aml] walk could not parse opcode 0x{X}; the rest of that scope is missing ({d} objects found)\n", .{ unknown_op_seen, node_count });
     } else {
         debug.klog("[aml] namespace walk complete: {d} named objects\n", .{node_count});
     }
+    if (mlc_skipped != 0) debug.klog("[aml] {d} module-level statement(s) stepped over, not executed\n", .{mlc_skipped});
     debug.klog("[aml] namespace: DSDT {d} obj + {d} SSDT(s) {d} obj{s} = {d} total{s}\n", .{
         dsdt_objs, acpi.ssdtCount(), ssdt_objs,
-        if (SYNTH_TEST) " + synthetic test SSDT" else "",
-        nnodes, if (store_overflow) " (TRUNCATED)" else "",
+        if (synth_injected) " + synthetic test SSDT" else "",
+        nnodes, if (store_overflow) " (TRUNCATED — raise MAX_NODES)" else "",
     });
 
     // B2a proof: evaluate \_S5_ through the interpreter and report SLP_TYP — the

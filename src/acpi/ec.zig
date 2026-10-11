@@ -339,11 +339,12 @@ pub fn selfTest() u32 {
     // byte order in RAM must be LE: 0xAA at the lowest address, 0xDD highest.
     if (ec_ram[0x10] != 0xAA or ec_ram[0x11] != 0xBB or ec_ram[0x12] != 0xCC or ec_ram[0x13] != 0xDD) fails += 1;
 
-    // (3) _Qxx query dispatch (only if an EC device was discovered): raise a
+    // (3) _Qxx query dispatch (only against the synthetic EC — on real firmware
+    //     this would run the board's own _Q01 on simulated data): raise a
     //     simulated SCI query 0x01 and confirm the EC's _Q01 handler actually ran
     //     — it stores 0x99 into \ECQF, which \QCHK reads back — and that the event
     //     was consumed (SCI_EVT cleared). Exercises queryByte→runQuery→evalMethod.
-    if (ec_path_len > 0) {
+    if (ec_path_len > 0 and aml.synthInjected()) {
         simRaiseQuery(0x01);
         processQueries();
         var got: u64 = 0xDEAD;
@@ -359,7 +360,7 @@ pub fn selfTest() u32 {
     //     exact path acpid takes for a real EC SCI. Reset the sentinel to 0
     //     (\QRST), raise a sim query, dispatch by the discovered GPE bit, and
     //     confirm the GPE-routed _Q01 ran (0 → 0x99) and the event was consumed.
-    if (ec_path_len > 0 and ec_gpe_valid) {
+    if (ec_path_len > 0 and ec_gpe_valid and aml.synthInjected()) {
         _ = aml.evalMethod("\\QRST"); // \ECQF = 0
         var pre: u64 = 0xDEAD;
         if (aml.evalMethod("\\QCHK")) |v| {
