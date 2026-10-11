@@ -581,6 +581,70 @@ pub fn configWriteExt(bus: u8, dev: u8, func: u8, offset: u16, value: u32) void 
     configWriteExtUnlocked(bus, dev, func, offset, value);
 }
 
+// --- Sized access (one 1/2/4-byte bus cycle) ---
+//
+// For the AML field engine (registered by acpi.init): firmware reads and writes
+// single config bytes and words, and a dword read-modify-write would write a
+// neighbouring W1C status back as ones — clearing it. ECAM takes the narrow
+// access as is; CF8/CFC selects the bytes through the data port's low address
+// bits. Null/false for a misaligned or unreachable offset (above 0xFF without
+// ECAM).
+
+fn sizedOk(offset: u16, width: u8) bool {
+    return (width == 1 or width == 2 or width == 4) and offset % width == 0 and offset <= 0xFFF;
+}
+
+fn cf8Addr(bus: u8, dev: u8, func: u8, offset: u16) u32 {
+    return @as(u32, 1) << 31 | @as(u32, bus) << 16 | @as(u32, dev & 0x1F) << 11 |
+        @as(u32, func & 0x07) << 8 | (@as(u32, offset) & 0xFC);
+}
+
+pub fn configReadSized(bus: u8, dev: u8, func: u8, offset: u16, width: u8) ?u32 {
+    if (!sizedOk(offset, width)) return null;
+    const flags = pci_lock.acquireIrqSave();
+    defer pci_lock.releaseIrqRestore(flags);
+    if (ecamPtr(bus, dev, func, offset)) |p| {
+        const a = @intFromPtr(p) + (offset & 3);
+        return switch (width) {
+            1 => @as(*volatile u8, @ptrFromInt(a)).*,
+            2 => @as(*volatile u16, @ptrFromInt(a)).*,
+            else => p.*,
+        };
+    }
+    if (offset > 0xFF) return null;
+    io.outl(CONFIG_ADDR, cf8Addr(bus, dev, func, offset));
+    const port = CONFIG_DATA + (offset & 3);
+    return switch (width) {
+        1 => io.inb(port),
+        2 => io.inw(port),
+        else => io.inl(port),
+    };
+}
+
+pub fn configWriteSized(bus: u8, dev: u8, func: u8, offset: u16, width: u8, value: u32) bool {
+    if (!sizedOk(offset, width)) return false;
+    const flags = pci_lock.acquireIrqSave();
+    defer pci_lock.releaseIrqRestore(flags);
+    if (ecamPtr(bus, dev, func, offset)) |p| {
+        const a = @intFromPtr(p) + (offset & 3);
+        switch (width) {
+            1 => @as(*volatile u8, @ptrFromInt(a)).* = @truncate(value),
+            2 => @as(*volatile u16, @ptrFromInt(a)).* = @truncate(value),
+            else => p.* = value,
+        }
+        return true;
+    }
+    if (offset > 0xFF) return false;
+    io.outl(CONFIG_ADDR, cf8Addr(bus, dev, func, offset));
+    const port = CONFIG_DATA + (offset & 3);
+    switch (width) {
+        1 => io.outb(port, @truncate(value)),
+        2 => io.outw(port, @truncate(value)),
+        else => io.outl(port, value),
+    }
+    return true;
+}
+
 // --- Device scanning ---
 
 // PCI config register layouts per PCI Local Bus Spec 3.0 §6.1.

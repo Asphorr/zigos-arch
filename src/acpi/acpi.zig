@@ -826,6 +826,10 @@ pub fn init(boot_rsdp: u64) void {
     amlmod.stall_us_fn = &amlStallUs;
     amlmod.timer_100ns_fn = &amlTimer100ns;
     amlmod.task_id_fn = &amlTaskId;
+    // PCI_Config regions go through the PCI driver: its lock, and ECAM once
+    // pci.applyAcpi has mapped it (CF8/CFC until then).
+    const pci = @import("../driver/pci.zig");
+    amlmod.pci_cfg_ops = .{ .read = &pci.configReadSized, .write = &pci.configWriteSized };
     if (globalLockWord()) |p| {
         amlmod.global_lock = p;
         amlmod.global_lock_release_fn = &amlGlobalLockRelease;

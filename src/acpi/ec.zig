@@ -32,13 +32,15 @@
 //! with the storm protection a source-held LEVEL GPE needs (mask-in-IRQ /
 //! re-enable-after-drain, behind an IRQ-safe GPE-enable lock — unverifiable on
 //! QEMU). Also deferred: ECDT/_CRS port & GPE-bit override (we default 0x66/0x62
-//! and the integer `_GPE`), the package form of `_GPE`, burst mode (BE_EC/BD_EC),
-//! and a query-aware stale-OBF drain at readByte start.
+//! and the integer `_GPE`), the package form of `_GPE`, and a query-aware
+//! stale-OBF drain at readByte start. Multi-byte accesses use burst mode
+//! (BE_EC/BD_EC); `_GLK` = 1 puts each access under the firmware Global Lock.
 
 const std = @import("std");
 const io = @import("../io.zig");
 const debug = @import("../debug/debug.zig");
 const aml = @import("aml.zig");
+const Deadline = @import("../util/deadline.zig").Deadline;
 
 // --- EC hardware interface (ACPI 6.x §12.2.1) --------------------------------
 // Default ports: the legacy values essentially every x86 EC uses. A later
@@ -49,21 +51,22 @@ var data_port: u16 = 0x62; // EC_DATA: byte in / out
 // Status register (read from cmd_port) bits.
 const ST_OBF: u8 = 0x01; // Output Buffer Full — a byte is ready for us to read
 const ST_IBF: u8 = 0x02; // Input Buffer Full — the EC hasn't consumed our last write
-const ST_BURST: u8 = 0x10; // (unused in increment 1 — burst mode deferred)
+const ST_BURST: u8 = 0x10; // the EC is in burst mode
 const ST_SCI: u8 = 0x20; // SCI event pending — a _Qxx query is queued (deferred)
 
 // Commands (written to cmd_port).
 const RD_EC: u8 = 0x80;
 const WR_EC: u8 = 0x81;
-const BE_EC: u8 = 0x82; // burst enable (deferred)
-const BD_EC: u8 = 0x83; // burst disable (deferred)
+const BE_EC: u8 = 0x82; // burst enable
+const BD_EC: u8 = 0x83; // burst disable
 const QR_EC: u8 = 0x84; // query (deferred — needs the GPE path)
+const BURST_ACK: u8 = 0x90; // BE_EC's reply
 
-// A transaction polls a handshake bit up to this many times, then gives up (→ the
-// field access degrades to uninit, NEVER a hang). Generous for a real EC, which
-// can take milliseconds; the software model answers on the first poll. Real
-// time-based timeouts arrive with the ECDT increment.
-const POLL_MAX: u32 = 1_000_000;
+// How long one handshake step may take before the transaction gives up (→ the
+// field access degrades to uninit, NEVER a hang): Linux's ACPI_EC_DELAY. Wall
+// time, not a poll count, which on bare metal and under a VM differ a
+// hundredfold.
+const EC_WAIT_MS: u64 = 500;
 
 /// A handler is registered for the EmbeddedControl space.
 pub var present: bool = false;
@@ -87,10 +90,10 @@ fn dataWrite(v: u8) void {
     if (sim_active) simData(v) else io.outb(data_port, v);
 }
 
-/// Spin until `(status & mask) != 0` equals `want_set`, or POLL_MAX expires.
+/// Spin until `(status & mask) != 0` equals `want_set`, or EC_WAIT_MS expires.
 fn waitStatus(mask: u8, want_set: bool) bool {
-    var i: u32 = 0;
-    while (i < POLL_MAX) : (i += 1) {
+    var d = Deadline.ms(EC_WAIT_MS, "ec handshake");
+    while (d.live()) {
         if (((scRead() & mask) != 0) == want_set) return true;
         std.atomic.spinLoopHint();
     }
@@ -112,10 +115,7 @@ fn glkRelease() void {
     aml.releaseGlobalLock();
 }
 
-/// Read one byte from EC address `addr`. Null on a handshake timeout.
-pub fn readByte(addr: u8) ?u8 {
-    if (!glkAcquire()) return null;
-    defer glkRelease();
+fn rawRead(addr: u8) ?u8 {
     if (!waitStatus(ST_IBF, false)) return null; // EC ready to accept a command
     cmdWrite(RD_EC);
     if (!waitStatus(ST_IBF, false)) return null; // command consumed
@@ -124,10 +124,7 @@ pub fn readByte(addr: u8) ?u8 {
     return dataRead();
 }
 
-/// Write `val` to EC address `addr`. False on a handshake timeout.
-pub fn writeByte(addr: u8, val: u8) bool {
-    if (!glkAcquire()) return false;
-    defer glkRelease();
+fn rawWrite(addr: u8, val: u8) bool {
     if (!waitStatus(ST_IBF, false)) return false;
     cmdWrite(WR_EC);
     if (!waitStatus(ST_IBF, false)) return false;
@@ -137,19 +134,55 @@ pub fn writeByte(addr: u8, val: u8) bool {
     return waitStatus(ST_IBF, false); // the value byte drained into the EC
 }
 
+/// Read one byte from EC address `addr`. Null on a handshake timeout.
+pub fn readByte(addr: u8) ?u8 {
+    if (!glkAcquire()) return null;
+    defer glkRelease();
+    return rawRead(addr);
+}
+
+/// Write `val` to EC address `addr`. False on a handshake timeout.
+pub fn writeByte(addr: u8, val: u8) bool {
+    if (!glkAcquire()) return false;
+    defer glkRelease();
+    return rawWrite(addr, val);
+}
+
+/// BE_EC: until BD_EC the EC serves the host alone and answers each byte at
+/// once. Linux enters it for every access wider than a byte. False when the EC
+/// doesn't acknowledge; the access then goes byte by byte without it.
+fn burstEnable() bool {
+    if (!waitStatus(ST_IBF, false)) return false;
+    cmdWrite(BE_EC);
+    if (!waitStatus(ST_OBF, true)) return false;
+    return dataRead() == BURST_ACK;
+}
+
+fn burstDisable() void {
+    if (scRead() & ST_BURST == 0) return; // the EC already left it
+    if (!waitStatus(ST_IBF, false)) return;
+    cmdWrite(BD_EC);
+    _ = waitStatus(ST_IBF, false);
+}
+
 // --- aml.zig region handler (EmbeddedControl, space 0x03) --------------------
 // `off` is the ABSOLUTE EC address (region base + field byte offset). The EC is
 // byte-addressed, so an N-byte access-width unit is N consecutive single-byte
-// transactions assembled little-endian — the order the AML field engine expects.
+// transactions assembled little-endian — the order the AML field engine expects
+// — in burst mode, and under one Global Lock hold when _GLK asks for it.
 
 fn ecRead(space: u8, off: u64, width: u32) ?u64 {
     _ = space;
     const w: u64 = width;
     if (off >= 0x100 or w == 0 or w > 8 or off + w > 0x100) return null;
+    if (!glkAcquire()) return null;
+    defer glkRelease();
+    const burst = w > 1 and burstEnable();
+    defer if (burst) burstDisable();
     var result: u64 = 0;
     var i: u64 = 0;
     while (i < w) : (i += 1) {
-        const b = readByte(@intCast(off + i)) orelse return null;
+        const b = rawRead(@intCast(off + i)) orelse return null;
         result |= @as(u64, b) << @as(u6, @intCast(i * 8));
     }
     return result;
@@ -159,10 +192,14 @@ fn ecWrite(space: u8, off: u64, width: u32, val: u64) bool {
     _ = space;
     const w: u64 = width;
     if (off >= 0x100 or w == 0 or w > 8 or off + w > 0x100) return false;
+    if (!glkAcquire()) return false;
+    defer glkRelease();
+    const burst = w > 1 and burstEnable();
+    defer if (burst) burstDisable();
     var i: u64 = 0;
     while (i < w) : (i += 1) {
         const b: u8 = @truncate(val >> @as(u6, @intCast(i * 8)));
-        if (!writeByte(@intCast(off + i), b)) return false;
+        if (!rawWrite(@intCast(off + i), b)) return false;
     }
     return true;
 }
@@ -288,6 +325,7 @@ var sim_status: u8 = 0;
 var sim_data_out: u8 = 0;
 var sim_addr: u8 = 0;
 var sim_query: u8 = 0; // a pending SCI query code (0 = none), returned by QR_EC
+var sim_bursts: u32 = 0; // BE_EC commands seen
 const SimState = enum { idle, rd_addr, wr_addr, wr_data };
 var sim_state: SimState = .idle;
 
@@ -305,7 +343,14 @@ fn simCmd(v: u8) void {
             sim_query = 0; // one-shot
             sim_state = .idle;
         },
-        else => {}, // burst enable/disable: not modeled
+        BE_EC => {
+            sim_bursts += 1;
+            sim_data_out = BURST_ACK;
+            sim_status |= ST_OBF | ST_BURST;
+            sim_state = .idle;
+        },
+        BD_EC => sim_status &= ~ST_BURST,
+        else => {},
     }
 }
 fn simData(v: u8) void {
@@ -350,6 +395,7 @@ pub fn selfTest() u32 {
     sim_state = .idle;
     sim_status = 0;
     sim_query = 0;
+    sim_bursts = 0;
     @memset(&ec_ram, 0);
 
     // (1) single-byte write/read round-trip via readByte/writeByte.
@@ -364,6 +410,8 @@ pub fn selfTest() u32 {
     if (rd == null or rd.? != 0xDDCC_BBAA) fails += 1;
     // byte order in RAM must be LE: 0xAA at the lowest address, 0xDD highest.
     if (ec_ram[0x10] != 0xAA or ec_ram[0x11] != 0xBB or ec_ram[0x12] != 0xCC or ec_ram[0x13] != 0xDD) fails += 1;
+    // ...each in burst mode (one BE_EC per multi-byte access), left again after.
+    if (sim_bursts != 2 or (sim_status & ST_BURST) != 0) fails += 1;
 
     // (3) _Qxx query dispatch (only against the synthetic EC — on real firmware
     //     this would run the board's own _Q01 on simulated data): raise a

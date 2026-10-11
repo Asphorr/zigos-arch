@@ -715,12 +715,11 @@ fn moduleCreateField(r: *Reader, path: *const PathBuf, depth: u8) bool {
     storeNode(.name, path, ns, .{});
     const n = &nodes[nnodes - 1];
     n.is_buffer_field = true;
-    n.has_runtime = true;
-    n.runtime_val = .{ .ref = .{ .name_field = .{
+    setRuntime(n, .{ .ref = .{ .name_field = .{
         .node = @intCast(nodeIndexOf(src)),
         .bit_off = @intCast(bit_off),
         .bit_width = @intCast(bits),
-    } } };
+    } } });
     mlc_run += 1;
     return true;
 }
@@ -1050,6 +1049,7 @@ const StoredNode = struct {
     // over the static DSDT value. Reset every load() (nnodes = 0 re-walks).
     runtime_val: Value = .uninit,
     has_runtime: bool = false,
+    rt_listed: bool = false, // in rt_list (setRuntime)
     // A1/A2: this Name is a CreateField buffer-field window (runtime_val holds a
     // .ref => .buf_field). Reads/writes auto-deref through it instead of
     // replacing it. Created dynamically at exec time (beyond static_nnodes).
@@ -1154,11 +1154,57 @@ fn storeNode(kind: NodeKind, path: *const PathBuf, ns: NameString, p: Payload) v
     @memcpy(n.path[0..cl], full[0..cl]);
     n.path_len = @intCast(cl);
     nnodes += 1;
+    // Walked objects are permanent from the start, so module-level code later
+    // in the same walk finds them through the index (and a Load mid-method
+    // keeps everything before them, as loadDefinitionBlock always did).
+    static_nnodes = nnodes;
 }
 
-/// Exact absolute-path lookup (e.g. "\\_S5_"). B2b adds scope-relative search.
+// --- name index ---------------------------------------------------------------
+// Every name a method mentions is a lookup — several for a relative name,
+// searched up its scopes — and a scan of the whole store costs ~3800 path
+// compares on a real desktop DSDT. The permanent nodes [0, static_nnodes) are
+// indexed by path in an open-addressing table that follows static_nnodes as it
+// grows (indexSync); the few nodes an evaluation adds past it are scanned. A
+// namespace reset or an Unload clears the index, and it is rebuilt on demand.
+
+const INDEX_SLOTS = 2 * MAX_NODES; // a power of two, at most half full
+var name_index: [INDEX_SLOTS]u16 = [_]u16{0} ** INDEX_SLOTS; // node index + 1; 0 = empty
+var indexed_n: usize = 0;
+
+fn pathSlot(p: []const u8) usize {
+    return @as(usize, @truncate(std.hash.Wyhash.hash(0, p))) & (INDEX_SLOTS - 1);
+}
+
+fn indexReset() void {
+    // As bytes: a u16 @memset trips Zig 0.15.2's self-hosted x86 backend (Debug).
+    @memset(std.mem.asBytes(&name_index), 0);
+    indexed_n = 0;
+}
+
+fn indexSync() void {
+    if (indexed_n > static_nnodes) indexReset();
+    while (indexed_n < static_nnodes) : (indexed_n += 1) {
+        const n = &nodes[indexed_n];
+        if (n.path_len == 0) continue; // unloaded
+        const p = n.path[0..n.path_len];
+        var slot = pathSlot(p);
+        while (name_index[slot] != 0) : (slot = (slot + 1) & (INDEX_SLOTS - 1)) {
+            const o = &nodes[name_index[slot] - 1];
+            if (std.mem.eql(u8, o.path[0..o.path_len], p)) break; // the first declaration wins
+        } else name_index[slot] = @intCast(indexed_n + 1);
+    }
+}
+
+/// Exact absolute-path lookup (e.g. "\\_S5_"): the first node with that path.
 fn findExact(abs: []const u8) ?*StoredNode {
-    var i: usize = 0;
+    indexSync();
+    var slot = pathSlot(abs);
+    while (name_index[slot] != 0) : (slot = (slot + 1) & (INDEX_SLOTS - 1)) {
+        const n = &nodes[name_index[slot] - 1];
+        if (std.mem.eql(u8, n.path[0..n.path_len], abs)) return n;
+    }
+    var i = indexed_n;
     while (i < nnodes) : (i += 1) {
         const n = &nodes[i];
         if (std.mem.eql(u8, n.path[0..n.path_len], abs)) return n;
@@ -1471,12 +1517,12 @@ fn sameValue(a: Value, b: Value, depth: u8) bool {
     };
 }
 
-/// Move the live pooled values to the front of the pool. Runs between
-/// evaluations, with the arenas empty: they stage the copies.
+/// Move the live pooled values to the front of the pool. Runs at the end of
+/// arenaReset, with the arenas empty (they stage the copies) and rt_list just
+/// pruned to the nodes that hold a value.
 fn compactNames() void {
-    var i: usize = 0;
-    while (i < nnodes) : (i += 1) {
-        const n = &nodes[i];
+    for (rt_list[0..rt_count]) |idx| {
+        const n = &nodes[idx];
         if (!n.has_runtime or !poolBacked(n.runtime_val)) continue;
         if (n.kind == .name and n.val_len != 0) {
             const mark_v = arena_top;
@@ -1500,9 +1546,8 @@ fn compactNames() void {
     }
     name_vals_top = 0;
     name_bytes_top = 0;
-    i = 0;
-    while (i < nnodes) : (i += 1) {
-        const n = &nodes[i];
+    for (rt_list[0..rt_count]) |idx| {
+        const n = &nodes[idx];
         if (!n.has_runtime or !arenaBacked(n.runtime_val)) continue;
         if (copyValue(n.runtime_val, .names, 0)) |kept| {
             n.runtime_val = kept;
@@ -1535,23 +1580,71 @@ fn namePoolReset() void {
 const SLEEP_BUDGET_MS: u64 = 2_000;
 var sleep_budget_ms: u64 = SLEEP_BUDGET_MS;
 
+/// The nodes that may hold a runtime value, so the reset visits those rather
+/// than the whole store. setRuntime adds a node the first time; the reset
+/// drops dead and duplicate entries. On overflow the next reset scans every
+/// node once and rebuilds the list.
+var rt_list: [MAX_NODES]u16 = undefined;
+var rt_count: usize = 0;
+var rt_overflow: bool = false;
+
+/// Give a node a runtime value. Every runtime value is set through here, or
+/// the reset would never see it.
+fn setRuntime(n: *StoredNode, v: Value) void {
+    n.runtime_val = v;
+    n.has_runtime = true;
+    if (n.rt_listed) return;
+    n.rt_listed = true;
+    if (rt_count < rt_list.len) {
+        rt_list[rt_count] = @intCast(nodeIndexOf(n));
+        rt_count += 1;
+    } else {
+        rt_overflow = true;
+    }
+}
+
+/// Reset-time check of one node's value; false once it holds none.
+fn keepRuntime(n: *StoredNode) bool {
+    if (!n.has_runtime) return false;
+    if (arenaBacked(n.runtime_val)) {
+        n.has_runtime = false;
+        n.runtime_val = .uninit;
+        n.is_buffer_field = false;
+        return false;
+    }
+    if (n.runtime_val == .package) scrubPackage(n.runtime_val.package, 0);
+    return true;
+}
+
 fn arenaReset() void {
     arena_top = 0;
     byte_top = 0;
     sleep_budget_ms = SLEEP_BUDGET_MS;
     if (nnodes > static_nnodes) nnodes = static_nnodes; // drop dynamic CreateField nodes
-    var i: usize = 0;
-    while (i < nnodes) : (i += 1) {
-        const n = &nodes[i];
-        if (!n.has_runtime) continue;
-        if (arenaBacked(n.runtime_val)) {
-            n.has_runtime = false;
-            n.runtime_val = .uninit;
-            n.is_buffer_field = false;
-        } else if (n.runtime_val == .package) {
-            scrubPackage(n.runtime_val.package, 0);
+    var kept: usize = 0;
+    if (rt_overflow) {
+        rt_overflow = false;
+        var i: usize = 0;
+        while (i < nnodes) : (i += 1) {
+            nodes[i].rt_listed = keepRuntime(&nodes[i]);
+            if (nodes[i].rt_listed) {
+                rt_list[kept] = @intCast(i);
+                kept += 1;
+            }
+        }
+    } else {
+        for (rt_list[0..rt_count]) |idx| {
+            if (idx < nnodes) nodes[idx].rt_listed = false;
+        }
+        for (rt_list[0..rt_count]) |idx| {
+            if (idx >= nnodes or nodes[idx].rt_listed) continue; // dropped node, or a duplicate
+            if (!keepRuntime(&nodes[idx])) continue;
+            nodes[idx].rt_listed = true;
+            rt_list[kept] = idx;
+            kept += 1;
         }
     }
+    rt_count = kept;
     if (name_vals_top > NAME_POOL_VALUES / 2 or name_bytes_top > NAME_POOL_BYTES / 2) compactNames();
 }
 
@@ -2158,19 +2251,16 @@ fn evalEventOp(r: *Reader, st: *ExecState, ext: u8) ?Value {
     const count: u64 = if (n.has_runtime and n.runtime_val == .integer) n.runtime_val.integer else 0;
     switch (ext) {
         0x24 => { // Signal: one more pending wakeup
-            n.runtime_val = .{ .integer = count +| 1 };
-            n.has_runtime = true;
+            setRuntime(n, .{ .integer = count +| 1 });
             return .uninit;
         },
         0x26 => { // Reset: clear all pending signals
-            n.runtime_val = .{ .integer = 0 };
-            n.has_runtime = true;
+            setRuntime(n, .{ .integer = 0 });
             return .uninit;
         },
         else => { // Wait: consume one pending signal, or time out immediately
             if (count > 0) {
-                n.runtime_val = .{ .integer = count - 1 };
-                n.has_runtime = true;
+                setRuntime(n, .{ .integer = count - 1 });
                 return .{ .integer = 0 }; // Zero ⇒ acquired
             }
             return timed_out;
@@ -2349,8 +2439,7 @@ fn nameValue(node: *StoredNode) Value {
     switch (v) {
         .buffer, .package => {
             const pooled = if (nodeIndexOf(node) < static_nnodes) poolCopy(v) else null;
-            node.runtime_val = pooled orelse materializeValue(v);
-            node.has_runtime = true;
+            setRuntime(node, pooled orelse materializeValue(v));
             return node.runtime_val;
         },
         else => return v,
@@ -2410,8 +2499,7 @@ fn readThroughRef(rf: Ref) Value {
 /// new value.
 fn storeName(n: *StoredNode, v: Value) bool {
     if (n.is_buffer_field and n.has_runtime and n.runtime_val == .ref) return writeThroughRef(n.runtime_val.ref, v);
-    n.runtime_val = keepValue(n, v);
-    n.has_runtime = true;
+    setRuntime(n, keepValue(n, v));
     return true;
 }
 
@@ -2652,8 +2740,7 @@ fn bindBufferField(st: *ExecState, ns: NameString, src: Value, bit_off: u64, bit
     if (nodeIndexOf(node) < static_nnodes) return .uninit;
     node.kind = .name;
     node.is_buffer_field = true;
-    node.has_runtime = true;
-    node.runtime_val = .{ .ref = .{ .buf_field = .{ .buf = buf, .bit_off = @intCast(bit_off), .bit_width = @intCast(bit_width) } } };
+    setRuntime(node, .{ .ref = .{ .buf_field = .{ .buf = buf, .bit_off = @intCast(bit_off), .bit_width = @intCast(bit_width) } } });
     return .uninit;
 }
 
@@ -3495,8 +3582,7 @@ fn execName(r: *Reader, st: *ExecState) void {
     const node = createDynNode(st.scope, ns) orelse return;
     node.kind = .name;
     node.is_buffer_field = false;
-    node.has_runtime = true;
-    node.runtime_val = v;
+    setRuntime(node, v);
 }
 
 /// Hook invoked for every executed Notify(object, value). The integrator
@@ -3936,6 +4022,7 @@ fn tNsReset() void {
     nbodies = 0;
     loaded_pool_used = 0;
     namePoolReset();
+    indexReset();
     arenaReset();
 }
 
@@ -4242,8 +4329,7 @@ fn stUnloadTest(fails: *u32) void {
     const id2 = loadDefinitionBlock(&[_]u8{ 0x08, 0x5C, 'U', 'N', 'L', '2', 0x0A, 0x33 }) orelse return; // id 1
     const hnd = stMakeNode("\\HND_") orelse return;
     hnd.kind = .name;
-    hnd.runtime_val = .{ .integer = @as(u64, id2) + 1 };
-    hnd.has_runtime = true;
+    setRuntime(hnd, .{ .integer = @as(u64, id2) + 1 });
     static_nnodes = nnodes;
     _ = runProgKeepNs(&[_]u8{ 0x5B, 0x2A, 0x5C, 'H', 'N', 'D', '_' }); // Unload(\HND_)
     stCheck("Unload via Name handle", b2i(findExact("\\UNL2") == null), 1, fails);
@@ -4778,6 +4864,7 @@ pub fn selfTestExtended() u32 {
     stInitObjectsTest(&fails);
     stGlobalLockTest(&fails);
     stNotifyQueueTest(&fails);
+    stNameIndexTest(&fails);
 
     return fails;
 }
@@ -5245,6 +5332,20 @@ fn stGlobalLockTest(fails: *u32) void {
     stCheck("Global Lock: leaked Acquire released", (@as(u64, held) << 8) | (@as(u64, gl_depth) << 4) | st_gl, 0x100, fails);
 }
 
+/// The name index: the first of two declarations wins, a method-local Name
+/// past the index is found and gone after the reset, and a fresh namespace of
+/// the same size is not answered from the old one.
+fn stNameIndexTest(fails: *u32) void {
+    tNsReset();
+    _ = walkBody(&[_]u8{ 0x08, 'D', 'U', 'P', 'L', 0x01, 0x08, 'D', 'U', 'P', 'L', 0x0A, 0x02 });
+    stCheck("name index: first declaration wins", toInt(runProgKeepNs(&[_]u8{ 0xA4, 'D', 'U', 'P', 'L' })), 1, fails);
+    stCheck("name index: method-local Name", toInt(runProgKeepNs(&[_]u8{ 0x08, 'D', 'Y', 'N', 'X', 0x0A, 0x07, 0xA4, 'D', 'Y', 'N', 'X' })), 7, fails);
+    stCheck("name index: method-local Name gone after the reset", toInt(runProgKeepNs(&[_]u8{ 0xA4, 0x5B, 0x12, 'D', 'Y', 'N', 'X', 0x00 })), 0, fails);
+    tNsReset();
+    _ = walkBody(&[_]u8{ 0x08, 'N', 'E', 'W', 'A', 0x01, 0x08, 'N', 'E', 'W', 'B', 0x0A, 0x02 });
+    stCheck("name index: rebuilt for a new namespace", b2i(findExact("\\NEWB") != null and findExact("\\DUPL") == null), 1, fails);
+}
+
 fn stNotifyHook(obj_path: []const u8, value: u64) void {
     queueNotifyReeval(obj_path, value);
 }
@@ -5372,11 +5473,21 @@ fn physMapped(phys: u64, len: u64) bool {
 // the enclosing namespace scope: the byte offset is region_off + the field's bit
 // offset, the device/function come from that device's _ADR (high16 = device,
 // low16 = function) and the bus from walking PCI-to-PCI bridges down from the
-// host bridge's _BBN (regionBdf). Backed by the legacy mechanism-#1 CF8/CFC
-// config ports — port I/O is the `io` surface the native harness already stubs,
-// so aml.zig stays a leaf module. Standard 256-byte config space only (no
-// ECAM/extended). Config reads are side-effect-free per spec, so the boot
-// liveness probe is safe to run unconditionally.
+// host bridge's _BBN (regionBdf). The kernel's PCI driver does the access
+// (pci_cfg_ops): one 1/2/4-byte bus cycle under its lock — the CF8/CFC pair is
+// shared with every other config access on every CPU — through ECAM when MCFG
+// maps the bus, which also reaches the extended space up to 0xFFF. Without it
+// (the native harness) the legacy CF8/CFC ports are driven directly, standard
+// space only. Config reads are side-effect-free per spec, so the boot liveness
+// probe is safe to run unconditionally.
+
+/// PCI configuration access, registered by acpi.init (driver/pci.zig sized
+/// accessors). Null: aml drives CF8/CFC itself.
+pub const PciCfgOps = struct {
+    read: *const fn (bus: u8, dev: u8, func: u8, offset: u16, width: u8) ?u32,
+    write: *const fn (bus: u8, dev: u8, func: u8, offset: u16, width: u8, value: u32) bool,
+};
+pub var pci_cfg_ops: ?PciCfgOps = null;
 
 const PCI_CFG_ADDR: u16 = 0xCF8;
 const PCI_CFG_DATA: u16 = 0xCFC;
@@ -5404,69 +5515,77 @@ fn pciCfgAddr(b: Bdf, off: u16) u32 {
 var pci_cfg_sim: ?*const fn (b: Bdf, off: u16) u32 = null;
 
 fn pciCfgReadDword(b: Bdf, off: u16) u32 {
-    if (pci_cfg_sim) |f| return f(b, off & 0xFC);
+    return @truncate(pciCfgRead(b, off & 0xFFC, 4) orelse 0xFFFF_FFFF);
+}
+
+/// One aligned 1/2/4-byte config cycle.
+fn pciCfgCycleRead(b: Bdf, off: u16, width: u8) ?u32 {
+    if (pci_cfg_sim) |f| {
+        const shift: u5 = @intCast((off & 3) * 8);
+        return @truncate((f(b, off & 0xFC) >> shift) & lowBits(@as(u64, width) * 8));
+    }
+    if (pci_cfg_ops) |ops| return ops.read(b.bus, b.dev, b.func, off, width);
+    if (off > 0xFF) return null;
     io.outl(PCI_CFG_ADDR, pciCfgAddr(b, off));
-    return io.inl(PCI_CFG_DATA);
+    const port = PCI_CFG_DATA + (off & 3);
+    return switch (width) {
+        1 => io.inb(port),
+        2 => io.inw(port),
+        else => io.inl(port),
+    };
 }
 
-/// Read `width` (1/2/4/8) bytes from config offset `co` (standard space only). The
-/// field engine hands us an access-width-aligned `co`, so a sub-dword read just
-/// shifts the containing dword — no reliance on sub-dword CFC port decode.
-fn pciCfgRead(b: Bdf, co: u64, width: u32) ?u64 {
-    if (co > 0xFF) return null;
-    switch (width) {
-        1, 2, 4 => {
-            const dw = pciCfgReadDword(b, @intCast(co & 0xFC));
-            const shift: u5 = @intCast((co & 3) * 8);
-            const v = dw >> shift;
-            return switch (width) {
-                1 => v & 0xFF,
-                2 => v & 0xFFFF,
-                else => v, // width 4: co is dword-aligned, shift 0
-            };
-        },
-        8 => {
-            if (co + 8 > 0x100) return null;
-            const lo = pciCfgReadDword(b, @intCast(co & 0xFC));
-            const hi = pciCfgReadDword(b, @intCast((co + 4) & 0xFC));
-            return @as(u64, lo) | (@as(u64, hi) << 32);
-        },
-        else => return null,
-    }
-}
-
-/// Write `width` bytes to config offset `co`. Sub-dword writes read-modify-write
-/// the containing dword (Preserve the neighbour bytes), mirroring the field
-/// engine's own RMW so a byte field never clobbers its dword's other three bytes.
-fn pciCfgWrite(b: Bdf, co: u64, width: u32, val: u64) bool {
-    if (co > 0xFF) return false;
+fn pciCfgCycleWrite(b: Bdf, off: u16, width: u8, val: u32) bool {
     if (pci_cfg_sim != null) return true;
+    if (pci_cfg_ops) |ops| return ops.write(b.bus, b.dev, b.func, off, width, val);
+    if (off > 0xFF) return false;
+    io.outl(PCI_CFG_ADDR, pciCfgAddr(b, off));
+    const port = PCI_CFG_DATA + (off & 3);
     switch (width) {
-        4 => {
-            io.outl(PCI_CFG_ADDR, pciCfgAddr(b, @intCast(co & 0xFC)));
-            io.outl(PCI_CFG_DATA, @truncate(val));
-            return true;
-        },
-        1, 2 => {
-            const aligned: u16 = @intCast(co & 0xFC);
-            const shift: u5 = @intCast((co & 3) * 8);
-            const mask: u32 = (if (width == 1) @as(u32, 0xFF) else @as(u32, 0xFFFF)) << shift;
-            var dw = pciCfgReadDword(b, aligned);
-            dw = (dw & ~mask) | ((@as(u32, @truncate(val)) << shift) & mask);
-            io.outl(PCI_CFG_ADDR, pciCfgAddr(b, aligned));
-            io.outl(PCI_CFG_DATA, dw);
-            return true;
-        },
-        8 => {
-            if (co + 8 > 0x100) return false;
-            io.outl(PCI_CFG_ADDR, pciCfgAddr(b, @intCast(co & 0xFC)));
-            io.outl(PCI_CFG_DATA, @truncate(val));
-            io.outl(PCI_CFG_ADDR, pciCfgAddr(b, @intCast((co + 4) & 0xFC)));
-            io.outl(PCI_CFG_DATA, @truncate(val >> 32));
-            return true;
-        },
-        else => return false,
+        1 => io.outb(port, @truncate(val)),
+        2 => io.outw(port, @truncate(val)),
+        else => io.outl(port, val),
     }
+    return true;
+}
+
+/// Read `width` (1/2/4/8) bytes at config offset `co`: one cycle when aligned,
+/// a byte at a time when not (a region based at an odd offset), two dwords for 8.
+fn pciCfgRead(b: Bdf, co: u64, width: u32) ?u64 {
+    if (width != 1 and width != 2 and width != 4 and width != 8) return null;
+    if (co > 0x1000 - width) return null;
+    const off: u16 = @intCast(co);
+    if (width == 8) {
+        const lo = pciCfgRead(b, co, 4) orelse return null;
+        const hi = pciCfgRead(b, co + 4, 4) orelse return null;
+        return lo | hi << 32;
+    }
+    if (off % width == 0) {
+        const one = pciCfgCycleRead(b, off, @intCast(width)) orelse return null;
+        return one;
+    }
+    var v: u64 = 0;
+    var i: u16 = 0;
+    while (i < width) : (i += 1) {
+        const byte = pciCfgCycleRead(b, off + i, 1) orelse return null;
+        v |= @as(u64, byte) << @as(u6, @intCast(i * 8));
+    }
+    return v;
+}
+
+/// Write `width` bytes at config offset `co`, split like pciCfgRead. Only the
+/// bytes written are touched: no read-modify-write of the containing dword.
+fn pciCfgWrite(b: Bdf, co: u64, width: u32, val: u64) bool {
+    if (width != 1 and width != 2 and width != 4 and width != 8) return false;
+    if (co > 0x1000 - width) return false;
+    const off: u16 = @intCast(co);
+    if (width == 8) return pciCfgWrite(b, co, 4, val & 0xFFFF_FFFF) and pciCfgWrite(b, co + 4, 4, val >> 32);
+    if (off % width == 0) return pciCfgCycleWrite(b, off, @intCast(width), @truncate(val));
+    var i: u16 = 0;
+    while (i < width) : (i += 1) {
+        if (!pciCfgCycleWrite(b, off + i, 1, @truncate(val >> @as(u6, @intCast(i * 8))))) return false;
+    }
+    return true;
 }
 
 /// Strip the trailing ".SEG" from an absolute path → the enclosing scope. Returns
@@ -6062,6 +6181,7 @@ fn unloadTable(tid: u8) u32 {
     bodies[tid] = &[_]u8{};
     table_src[tid] = 0;
     if (@as(usize, tid) + 1 == nbodies) nbodies -= 1; // retire a trailing id
+    indexReset(); // another table's declaration of a pruned path is now the first
     return pruned;
 }
 
@@ -7145,6 +7265,13 @@ fn idMatches(v: Value, id: []const u8) bool {
     }
 }
 
+/// _STA bit 0; a device without _STA is present. Checked after the id, which
+/// is usually a Name, while _STA is often a method reading PCI or EC state.
+fn devicePresent(path: []const u8) bool {
+    const v = evalDeviceChild(path, "_STA") orelse return true;
+    return v != .integer or v.integer & 0x01 != 0;
+}
+
 fn deviceMatchesId(path: []const u8, id: []const u8) bool {
     if (evalDeviceChild(path, "_HID")) |v| {
         if (idMatches(v, id)) return true;
@@ -7167,12 +7294,7 @@ pub fn findByHid(id: []const u8) ?DevResources {
         const n = &nodes[i];
         if (n.kind != .device) continue;
         const path = n.path[0..n.path_len];
-        var sta: u64 = 0x0F;
-        if (evalDeviceChild(path, "_STA")) |v| {
-            if (v == .integer) sta = v.integer;
-        }
-        if (sta & 0x01 == 0) continue;
-        if (!deviceMatchesId(path, id)) continue;
+        if (!deviceMatchesId(path, id) or !devicePresent(path)) continue;
         if (evalDeviceChild(path, "_CRS")) |v| {
             if (v == .buffer) return extractCrs(v.buffer);
         }
@@ -7196,12 +7318,7 @@ pub fn findDevicePathByHid(id: []const u8) ?[]const u8 {
         const n = &nodes[i];
         if (n.kind != .device) continue;
         const path = n.path[0..n.path_len];
-        var sta: u64 = 0x0F;
-        if (evalDeviceChild(path, "_STA")) |v| {
-            if (v == .integer) sta = v.integer;
-        }
-        if (sta & 0x01 == 0) continue; // not present
-        if (!deviceMatchesId(path, id)) continue;
+        if (!deviceMatchesId(path, id) or !devicePresent(path)) continue;
         return path;
     }
     return null;
@@ -7542,10 +7659,11 @@ fn addOsObjects() void {
 fn osObject(abs: []const u8, v: Value) void {
     if (nnodes >= nodes.len) return;
     const n = &nodes[nnodes];
-    n.* = .{ .kind = .name, .runtime_val = v, .has_runtime = true };
+    n.* = .{ .kind = .name };
     @memcpy(n.path[0..abs.len], abs);
     n.path_len = @intCast(abs.len);
     nnodes += 1;
+    setRuntime(n, v);
 }
 
 /// Decode the cached DSDT plus every SSDT into one namespace. Call after
@@ -7572,6 +7690,7 @@ pub fn load() u32 {
     loaded_pool_used = 0;
     synth_injected = false;
     namePoolReset();
+    indexReset();
     arenaReset();
     addOsObjects();
 
