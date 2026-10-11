@@ -292,6 +292,15 @@ fn enableAcpiMode(f: *align(1) const acpi.Fadt, cnt_a: u16) bool {
     return false;
 }
 
+/// The handshake on its own, for acpi.init: the firmware's _REG and _INI run
+/// right after the namespace is loaded and expect ACPI mode, as under ACPICA.
+/// init() checks again later (and finds SCI_EN set).
+pub fn enterAcpiMode() void {
+    const f = acpi.getFadt() orelse return;
+    if (f.flags & FADT_HW_REDUCED != 0) return;
+    _ = enableAcpiMode(f, pm1Ports(f).cnt_a);
+}
+
 // --- SCI handler ------------------------------------------------------------
 
 /// SCI interrupt handler. Runs via the dynirq stub: IF=0, on the per-CPU

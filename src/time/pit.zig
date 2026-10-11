@@ -11,11 +11,43 @@
 
 const io = @import("../io.zig");
 
+const PIT_HZ: u64 = 1_193_182;
+const DIVISOR: u16 = 11932; // 1193182 / 100 ≈ 11932 → ~100 Hz
+
 pub fn init() void {
-    const divisor: u16 = 11932; // 1193182 / 100 ≈ 11932 → ~100 Hz
     io.outb(0x43, 0x34); // Channel 0, lobyte/hibyte, mode 2 (rate generator)
-    io.outb(0x40, @truncate(divisor));
-    io.outb(0x40, @truncate(divisor >> 8));
+    io.outb(0x40, @truncate(DIVISOR));
+    io.outb(0x40, @truncate(DIVISOR >> 8));
+}
+
+/// Busy-wait `us` µs on channel 0's countdown — the only clock before
+/// apic.init calibrates the TSC (acpi.init runs firmware methods, whose
+/// Stall/Sleep must really wait). Gives up if the count stops moving, as it
+/// does once stop() has run.
+pub fn delayUs(us: u64) void {
+    var left = us * PIT_HZ / 1_000_000;
+    var prev = count();
+    var still: u32 = 0;
+    while (left > 0) {
+        const cur = count();
+        // Mode 2 counts DIVISOR..1 and reloads: a larger count means a wrap.
+        const step = if (cur <= prev) prev - cur else prev + DIVISOR - cur;
+        if (step == 0) {
+            still += 1;
+            if (still > 10_000) return;
+            continue;
+        }
+        still = 0;
+        left -|= step;
+        prev = cur;
+    }
+}
+
+fn count() u64 {
+    io.outb(0x43, 0x00); // latch channel 0
+    const lo: u64 = io.inb(0x40);
+    const hi: u64 = io.inb(0x40);
+    return hi << 8 | lo;
 }
 
 /// Halt channel 0. Writing a control word with no count following stops

@@ -97,8 +97,25 @@ fn waitStatus(mask: u8, want_set: bool) bool {
     return false;
 }
 
+// An EC whose _GLK returns 1 is shared with SMM firmware: each transaction runs
+// under the firmware Global Lock, as Linux's EC driver does.
+var use_glk: bool = false;
+const GLK_WAIT_MS: u64 = 1_000;
+
+fn glkAcquire() bool {
+    if (!use_glk or sim_active) return true;
+    return aml.acquireGlobalLock(GLK_WAIT_MS);
+}
+
+fn glkRelease() void {
+    if (!use_glk or sim_active) return;
+    aml.releaseGlobalLock();
+}
+
 /// Read one byte from EC address `addr`. Null on a handshake timeout.
 pub fn readByte(addr: u8) ?u8 {
+    if (!glkAcquire()) return null;
+    defer glkRelease();
     if (!waitStatus(ST_IBF, false)) return null; // EC ready to accept a command
     cmdWrite(RD_EC);
     if (!waitStatus(ST_IBF, false)) return null; // command consumed
@@ -109,6 +126,8 @@ pub fn readByte(addr: u8) ?u8 {
 
 /// Write `val` to EC address `addr`. False on a handshake timeout.
 pub fn writeByte(addr: u8, val: u8) bool {
+    if (!glkAcquire()) return false;
+    defer glkRelease();
     if (!waitStatus(ST_IBF, false)) return false;
     cmdWrite(WR_EC);
     if (!waitStatus(ST_IBF, false)) return false;
@@ -182,6 +201,7 @@ var ec_gpe_valid: bool = false; // _GPE found (integer form) + native handler re
 pub fn discover() void {
     ec_path_len = 0;
     ec_gpe_valid = false;
+    use_glk = false;
     const p = aml.findDevicePathByHid("PNP0C09") orelse {
         debug.klog("[ec] no PNP0C09 device in namespace — query dispatch idle\n", .{});
         return;
@@ -189,6 +209,10 @@ pub fn discover() void {
     if (p.len > ec_path_buf.len) return;
     @memcpy(ec_path_buf[0..p.len], p);
     ec_path_len = p.len;
+    if ((aml.deviceChildInteger(ec_path_buf[0..ec_path_len], "_GLK") orelse 0) == 1) {
+        use_glk = true;
+        debug.klog("[ec] _GLK = 1: transactions take the firmware Global Lock\n", .{});
+    }
 
     // _GPE names the EC's SCI GPE bit. The integer form (`Name(_GPE, n)`) is what
     // QEMU/most firmware use; the alternate package form (a referenced GPE-block
@@ -209,6 +233,8 @@ pub fn discover() void {
 
 /// Issue QR_EC and return the pending query byte (0 = no event), null on timeout.
 pub fn queryByte() ?u8 {
+    if (!glkAcquire()) return null;
+    defer glkRelease();
     if (!waitStatus(ST_IBF, false)) return null;
     cmdWrite(QR_EC);
     if (!waitStatus(ST_OBF, true)) return null;

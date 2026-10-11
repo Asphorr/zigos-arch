@@ -89,8 +89,110 @@ fn ilockAcquire() void {
 }
 
 fn ilockRelease() void {
+    if (ilock_depth == 1) glEndEvaluation();
     ilock_depth -= 1;
     if (ilock_depth == 0) @atomicStore(u64, &ilock_owner, NO_OWNER, .release);
+}
+
+// --- firmware Global Lock (ACPI 6.4 §5.2.10.1) ---------------------------------
+// The FACS dword the OS and SMM firmware share to serialize hardware both touch:
+// fields declared with LockRule = Lock, AML's Acquire (\_GL), and an EC whose
+// _GLK is 1. The interpreter holds it recursively (gl_depth), only while it
+// holds the interpreter lock, so gl_depth needs no atomics.
+
+/// The FACS GlobalLock dword, registered by acpi.init. Null (no FACS, or a
+/// hardware-reduced platform) makes the lock a no-op.
+pub var global_lock: ?*u32 = null;
+/// Set PM1_CNT.GBL_RLS: the firmware asked for the lock while we held it.
+pub var global_lock_release_fn: ?*const fn () void = null;
+
+const GL_PENDING: u32 = 1 << 0;
+const GL_OWNED: u32 = 1 << 1;
+/// How long a field access or an Acquire (\_GL, 0xFFFF) waits for the firmware
+/// to let go; ACPICA waits forever, Linux's EC gives up after a second too.
+const GL_WAIT_MS: u64 = 1_000;
+/// Retry period while the firmware holds it: one scheduler tick.
+const GL_POLL_MS: u64 = 10;
+
+var gl_depth: u32 = 0;
+
+/// One attempt: take the lock, or mark it pending so the firmware signals its
+/// release. True if taken.
+fn glTryAcquire(p: *u32) bool {
+    var old = @atomicLoad(u32, p, .monotonic);
+    while (true) {
+        const owned = old & GL_OWNED != 0;
+        const new = (old & ~(GL_PENDING | GL_OWNED)) | GL_OWNED | (if (owned) GL_PENDING else 0);
+        if (@cmpxchgWeak(u32, p, old, new, .acquire, .monotonic)) |seen| {
+            old = seen;
+            continue;
+        }
+        return !owned;
+    }
+}
+
+/// Clear owned and pending; true if the firmware was waiting (pending set).
+fn glReleaseHw(p: *u32) bool {
+    var old = @atomicLoad(u32, p, .monotonic);
+    while (true) {
+        if (@cmpxchgWeak(u32, p, old, old & ~(GL_PENDING | GL_OWNED), .release, .monotonic)) |seen| {
+            old = seen;
+            continue;
+        }
+        return old & GL_PENDING != 0;
+    }
+}
+
+/// Take the Global Lock (recursively), waiting up to `timeout_ms`. The caller
+/// holds the interpreter lock.
+fn glAcquire(timeout_ms: u64) bool {
+    const p = global_lock orelse return true;
+    if (gl_depth > 0) {
+        gl_depth += 1;
+        return true;
+    }
+    var waited: u64 = 0;
+    while (!glTryAcquire(p)) {
+        if (waited >= timeout_ms) return false;
+        if (sleep_ms_fn) |f| f(GL_POLL_MS);
+        waited += GL_POLL_MS;
+    }
+    gl_depth = 1;
+    return true;
+}
+
+fn glRelease() void {
+    if (gl_depth == 0) return;
+    gl_depth -= 1;
+    if (gl_depth != 0) return;
+    const p = global_lock orelse return;
+    if (glReleaseHw(p)) {
+        if (global_lock_release_fn) |f| f();
+    }
+}
+
+/// No evaluation is running any more: a Global Lock still held was acquired by
+/// an Acquire (\_GL) whose method stopped before its Release. Holding it on
+/// would leave SMM waiting for good.
+fn glEndEvaluation() void {
+    if (gl_depth == 0) return;
+    debug.klog("[aml] Global Lock still held after the evaluation — released\n", .{});
+    gl_depth = 1;
+    glRelease();
+}
+
+/// The Global Lock for a driver's own hardware access (ec.zig, when the EC's
+/// _GLK is 1). Holds the interpreter lock until releaseGlobalLock.
+pub fn acquireGlobalLock(timeout_ms: u64) bool {
+    ilockAcquire();
+    if (glAcquire(timeout_ms)) return true;
+    ilockRelease();
+    return false;
+}
+
+pub fn releaseGlobalLock() void {
+    glRelease();
+    ilockRelease();
 }
 
 // --- AML object value (tagged union) ----------------------------------------
@@ -116,6 +218,9 @@ pub const Ref = union(enum) {
     pkg_elem: struct { pkg: []Value, idx: usize }, // Index(Package, i) → one element slot
     buf_field: struct { buf: []u8, bit_off: u32, bit_width: u32 }, // CreateField window (A2)
     node: usize, // RefOf(Name/Field) → a nodes[] index
+    // A module-level CreateField window: names its Name by node, since the
+    // Name's buffer moves when the Name pool is compacted.
+    name_field: struct { node: u32, bit_off: u32, bit_width: u32 },
 };
 
 // --- Namespace object kinds -------------------------------------------------
@@ -409,6 +514,8 @@ const MAX_WALK_DEPTH = 64;
 
 /// Module-level statements the walker stepped over without executing.
 var mlc_skipped: u32 = 0;
+/// Module-level If conditions and CreateXxxFields executed during the walk.
+var mlc_run: u32 = 0;
 
 /// Walk a TermList in [r.pos, end), recording named objects under `path`.
 /// Recurses into scope-creating objects; depth bounds that recursion.
@@ -419,9 +526,11 @@ fn walkTerms(r: *Reader, end: usize, path: *const PathBuf, depth: u8) void {
 
         const info = lookup(op) orelse {
             // Not a declaration: module-level code (a CreateWordField inside a
-            // Device, a Store, a method call) or an External. It is not executed;
-            // stepping over it by its operand spec keeps the declarations after
-            // it visible.
+            // Device, a Store, a method call) or an External. A CreateXxxField
+            // over a Name's buffer is executed; anything else is stepped over by
+            // its operand spec, which keeps the declarations after it visible.
+            r.pos = term_start;
+            if (moduleCreateField(r, path, depth)) continue;
             r.pos = term_start;
             if (skipTerm(r, path.snapshot(), 0)) {
                 mlc_skipped += 1;
@@ -528,13 +637,92 @@ fn walkTerms(r: *Reader, end: usize, path: *const PathBuf, depth: u8) void {
                 storeNode(info.kind, path, ns, .{});
             },
             .ctrl_pkg => {
-                // Control flow (If/Else/While). Skip the whole package. (A later
-                // slice may recurse to catch objects defined inside `If (cond)`.)
                 const pkg_end = packageEnd(r, term_start) orelse return;
-                r.pos = pkg_end;
+                if (op == 0xA0 and depth < MAX_WALK_DEPTH) {
+                    moduleIf(r, pkg_end, path, depth);
+                } else {
+                    mlc_skipped += 1; // a module-level While, or an Else without its If
+                    r.pos = pkg_end;
+                }
             },
         }
     }
+}
+
+/// Module-level `If (cond) {…} Else {…}` — how firmware declares objects only on
+/// some boards (`If (PCHV () == SPTH)`, `If (CondRefOf (\_SB.PCI0.RP01.PXSX))`).
+/// As in ACPICA, the condition is evaluated during the load, against the
+/// namespace walked so far, and the declarations in the branch taken become
+/// part of the enclosing scope. An unevaluable condition takes neither branch.
+fn moduleIf(r: *Reader, pkg_end: usize, path: *const PathBuf, depth: u8) void {
+    const taken: ?bool = if (loadTimeArg(r, path)) |c| toBool(c) else null;
+    if (taken == null) mlc_skipped += 1 else mlc_run += 1;
+    if (taken orelse false) walkTerms(r, pkg_end, path, depth + 1);
+    r.pos = pkg_end;
+    if ((r.peek(0) orelse 0) != 0xA1) return; // Else
+    const else_start = r.pos;
+    _ = r.next();
+    const else_end = packageEnd(r, else_start) orelse return;
+    if (taken != null and !taken.?) walkTerms(r, else_end, path, depth + 1);
+    r.pos = else_end;
+}
+
+/// Evaluate a TermArg during the walk, in the scope being walked. Nodes the
+/// evaluation creates (a called method's Names, CreateField windows) are its
+/// own and are dropped, so they don't become part of the namespace — unless it
+/// ran a Load, which made everything up to its table permanent.
+fn loadTimeArg(r: *Reader, path: *const PathBuf) ?Value {
+    const mark = nnodes;
+    defer if (static_nnodes <= mark) {
+        nnodes = mark;
+    };
+    var frame = Frame{};
+    var st = ExecState{ .frame = &frame, .scope = path.snapshot(), .depth = 0 };
+    return evalTermArg(r, &st);
+}
+
+/// Module-level `CreateWordField (CRS1, 0x02, IRQM)` and kin over a Name's
+/// buffer: a permanent buffer field naming its Name by node, so a method that
+/// stores into IRQM patches CRS1 for every later evaluation. False (nothing
+/// created; the caller steps over the term) for any other shape.
+fn moduleCreateField(r: *Reader, path: *const PathBuf, depth: u8) bool {
+    const op = r.peek(0) orelse return false;
+    var bits: u64 = switch (op) {
+        0x8A => 32,
+        0x8B => 16,
+        0x8C => 8,
+        0x8D => 1,
+        0x8F => 64,
+        0x5B => if ((r.peek(1) orelse 0) == 0x13) 0 else return false,
+        else => return false,
+    };
+    r.skip(if (op == 0x5B) 2 else 1);
+    if (!isNameLead(r.peek(0) orelse return false)) return false;
+    const src_ns = readNameString(r) orelse return false;
+    const index = toInt(loadTimeArg(r, path) orelse return false);
+    if (op == 0x5B) bits = toInt(loadTimeArg(r, path) orelse return false);
+    const ns = readNameString(r) orelse return false;
+    if (ns.nsegs == 0) return false;
+    const src = resolve(path.snapshot(), src_ns) orelse return false;
+    if (src.kind != .name or src.is_buffer_field) return false;
+    const buf = nameValue(src);
+    if (buf != .buffer) return false;
+    const bit_off: u64 = if (op == 0x8D or op == 0x5B) index else index *| 8;
+    const buf_bits = @as(u64, buf.buffer.len) * 8;
+    if (bits == 0 or bit_off > buf_bits or bits > buf_bits - bit_off) return false;
+    if (nnodes >= nodes.len) return false;
+    record(.name, path, ns, depth);
+    storeNode(.name, path, ns, .{});
+    const n = &nodes[nnodes - 1];
+    n.is_buffer_field = true;
+    n.has_runtime = true;
+    n.runtime_val = .{ .ref = .{ .name_field = .{
+        .node = @intCast(nodeIndexOf(src)),
+        .bit_off = @intCast(bit_off),
+        .bit_width = @intCast(bits),
+    } } };
+    mlc_run += 1;
+    return true;
 }
 
 /// For a PkgLength-prefixed opcode whose opcode byte(s) started at `op_start`,
@@ -857,6 +1045,7 @@ const StoredNode = struct {
     field_bit_width: u32 = 0,
     field_access: u8 = 0,
     field_update: u8 = UPDATE_PRESERVE,
+    field_lock: bool = false, // LockRule: access under the firmware Global Lock
     // Runtime mutable value (B2b): Store-to-Name updates this; reads prefer it
     // over the static DSDT value. Reset every load() (nnodes = 0 re-walks).
     runtime_val: Value = .uninit,
@@ -886,6 +1075,7 @@ const Payload = struct {
     field_bit_width: u32 = 0,
     field_access: u8 = 0,
     field_update: u8 = UPDATE_PRESERVE,
+    field_lock: bool = false,
 };
 
 var nodes: [MAX_NODES]StoredNode = undefined;
@@ -958,6 +1148,7 @@ fn storeNode(kind: NodeKind, path: *const PathBuf, ns: NameString, p: Payload) v
         .field_bit_width = p.field_bit_width,
         .field_access = p.field_access,
         .field_update = p.field_update,
+        .field_lock = p.field_lock,
     };
     const cl = @min(full.len, @as(usize, PATH_MAX));
     @memcpy(n.path[0..cl], full[0..cl]);
@@ -1044,7 +1235,8 @@ fn arenaAlloc(n: usize) ?[]Value {
 // per top-level evaluation alongside the value arena. A buffer Value pointing
 // into this arena is mutable; one pointing into a table body is read-only. The
 // rule that makes Index()/CreateField aliasing correct: every object created or
-// mutated during a single method-call tree lives here and shares its lifetime.
+// mutated during a single method-call tree lives here and shares its lifetime —
+// except a static Name's own Buffer/Package, which lives in the Name pool.
 
 // Sized for the NVDIMM DSM-mailbox path: a single wide field (FARG/ODAT) is up to
 // ~4 KiB, and _FIT reads a fresh response buffer per loop iteration plus a growing
@@ -1069,12 +1261,18 @@ fn inByteArena(b: []const u8) bool {
     return p >= base and p < base + byte_arena.len;
 }
 
-/// The mutable view of an arena-backed buffer, or null if it's a table literal.
+/// The mutable view of an arena- or Name-pool-backed buffer, or null if it's a
+/// table literal.
 fn mutBuf(b: []const u8) ?[]u8 {
-    if (!inByteArena(b)) return null;
-    const base = @intFromPtr(&byte_arena[0]);
-    const off = @intFromPtr(b.ptr) - base;
-    return byte_arena[off .. off + b.len];
+    if (inByteArena(b)) {
+        const off = @intFromPtr(b.ptr) - @intFromPtr(&byte_arena[0]);
+        return byte_arena[off .. off + b.len];
+    }
+    if (inNameBytes(b)) {
+        const off = @intFromPtr(b.ptr) - @intFromPtr(&name_bytes[0]);
+        return name_bytes[off .. off + b.len];
+    }
+    return null;
 }
 
 /// Ensure `b` is arena-backed + writable, copying a table literal in first.
@@ -1093,14 +1291,243 @@ fn newBuf(n: usize) ?[]u8 {
     return m;
 }
 
+fn inValueArena(p: []const Value) bool {
+    if (p.len == 0) return false;
+    const base = @intFromPtr(&value_arena[0]);
+    const a = @intFromPtr(p.ptr);
+    return a >= base and a < base + value_arena.len * @sizeOf(Value);
+}
+
+// --- Name pool (objects that outlive an evaluation) ---------------------------
+// A Name's Buffer or Package keeps what methods write into it: an EC _Qxx fills
+// PBST and the next _BST returns it; a _CRS method patches CRS1 through its
+// CreateWordFields. Those objects live here, not in the per-evaluation arenas.
+// Everything stored under a static Name is deep-copied in (copyValue), so the
+// pool never points into the arenas. It is a bump allocator: a replaced value
+// stays behind until compactNames() runs between evaluations, which moves the
+// live values and drops those still equal to their table literal (they are
+// re-read on next use).
+
+const NAME_POOL_VALUES = 2048;
+const NAME_POOL_BYTES = 16 * 1024;
+var name_vals: [NAME_POOL_VALUES]Value = undefined;
+var name_vals_top: usize = 0;
+var name_bytes: [NAME_POOL_BYTES]u8 = undefined;
+var name_bytes_top: usize = 0;
+var name_pool_full_seen: bool = false; // logged once per load()
+
+/// Packages nest; copies and comparisons stop here.
+const MAX_VALUE_DEPTH = 16;
+
+const Pool = enum { arena, names };
+
+fn inNameBytes(b: []const u8) bool {
+    if (b.len == 0) return false;
+    const base = @intFromPtr(&name_bytes[0]);
+    const p = @intFromPtr(b.ptr);
+    return p >= base and p < base + name_bytes.len;
+}
+
+fn inNameVals(p: []const Value) bool {
+    if (p.len == 0) return false;
+    const base = @intFromPtr(&name_vals[0]);
+    const a = @intFromPtr(p.ptr);
+    return a >= base and a < base + name_vals.len * @sizeOf(Value);
+}
+
+fn poolBytes(n: usize, to: Pool) ?[]u8 {
+    if (to == .arena) return bufAlloc(n);
+    if (name_bytes_top + n > name_bytes.len) return null;
+    const s = name_bytes[name_bytes_top .. name_bytes_top + n];
+    name_bytes_top += n;
+    return s;
+}
+
+fn poolValues(n: usize, to: Pool) ?[]Value {
+    if (to == .arena) return arenaAlloc(n);
+    if (name_vals_top + n > name_vals.len) return null;
+    const s = name_vals[name_vals_top .. name_vals_top + n];
+    name_vals_top += n;
+    return s;
+}
+
+/// Set by copyValue when it replaced a reference with uninit.
+var copy_lost_ref: bool = false;
+
+/// A deep copy of `v` in `to`. Table-literal strings are immutable and shared;
+/// buffers are always copied, so the copy is writable. References other than
+/// to a static node or a Name's buffer field point at storage that moves and
+/// become uninit (copy_lost_ref). Null when `to` is full.
+fn copyValue(v: Value, to: Pool, depth: u8) ?Value {
+    switch (v) {
+        .string => |s| {
+            if (!inByteArena(s) and !inNameBytes(s)) return v;
+            const m = poolBytes(s.len, to) orelse return null;
+            @memcpy(m, s);
+            return .{ .string = m };
+        },
+        .buffer => |b| {
+            const m = poolBytes(b.len, to) orelse return null;
+            @memcpy(m, b);
+            return .{ .buffer = m };
+        },
+        .package => |p| {
+            if (depth >= MAX_VALUE_DEPTH) return .uninit;
+            const out = poolValues(p.len, to) orelse return null;
+            for (p, out) |e, *o| o.* = copyValue(e, to, depth + 1) orelse return null;
+            return .{ .package = out };
+        },
+        .ref => |rf| {
+            switch (rf) {
+                .node => |ni| if (ni < static_nnodes) return v,
+                .name_field => return v,
+                else => {},
+            }
+            copy_lost_ref = true;
+            return .uninit;
+        },
+        else => return v,
+    }
+}
+
+fn notePoolFull() void {
+    if (name_pool_full_seen) return;
+    name_pool_full_seen = true;
+    debug.klog("[aml] Name pool full: a Name's new value lasts one evaluation\n", .{});
+}
+
+/// `v` copied into the Name pool, or null when it doesn't fit or holds a
+/// reference the pool can't keep; the caller then keeps `v` itself, for this
+/// evaluation only (the reset drops or scrubs it).
+fn poolCopy(v: Value) ?Value {
+    copy_lost_ref = false;
+    const c = copyValue(v, .names, 0) orelse {
+        notePoolFull();
+        return null;
+    };
+    return if (copy_lost_ref) null else c;
+}
+
+/// What a Name keeps when `v` is stored into it. A static Name gets a Name-pool
+/// copy; a dynamic one (method-local, dropped at the reset) keeps `v` itself.
+fn keepValue(node: *StoredNode, v: Value) Value {
+    if (nodeIndexOf(node) >= static_nnodes) return v;
+    switch (v) {
+        .string, .buffer, .package => return poolCopy(v) orelse v,
+        else => return v, // integers; a reference to a static node survives the reset as is
+    }
+}
+
+/// True if `v` points into storage the next reset recycles.
+fn arenaBacked(v: Value) bool {
+    return switch (v) {
+        .string, .buffer => |b| inByteArena(b),
+        .package => |p| inValueArena(p),
+        .ref => |rf| switch (rf) {
+            .node => |ni| ni >= static_nnodes,
+            .name_field => false,
+            else => true,
+        },
+        else => false,
+    };
+}
+
+fn poolBacked(v: Value) bool {
+    return switch (v) {
+        .string, .buffer => |b| inNameBytes(b),
+        .package => |p| inNameVals(p),
+        else => false,
+    };
+}
+
+/// Clear the elements of a pooled package that point into the arenas — written
+/// through a reference while the pool was full.
+fn scrubPackage(p: []Value, depth: u8) void {
+    for (p) |*e| {
+        if (arenaBacked(e.*)) {
+            e.* = .uninit;
+        } else if (e.* == .package and depth < MAX_VALUE_DEPTH) {
+            scrubPackage(e.package, depth + 1);
+        }
+    }
+}
+
+fn sameValue(a: Value, b: Value, depth: u8) bool {
+    if (depth >= MAX_VALUE_DEPTH) return false;
+    return switch (a) {
+        .uninit => b == .uninit,
+        .integer => |x| b == .integer and b.integer == x,
+        .string => |x| b == .string and std.mem.eql(u8, x, b.string),
+        .buffer => |x| b == .buffer and std.mem.eql(u8, x, b.buffer),
+        .name_ref => |x| b == .name_ref and std.mem.eql(u8, &x, &b.name_ref),
+        .package => |x| blk: {
+            if (b != .package or b.package.len != x.len) break :blk false;
+            for (x, b.package) |e, f| {
+                if (!sameValue(e, f, depth + 1)) break :blk false;
+            }
+            break :blk true;
+        },
+        .ref => false,
+    };
+}
+
+/// Move the live pooled values to the front of the pool. Runs between
+/// evaluations, with the arenas empty: they stage the copies.
+fn compactNames() void {
+    var i: usize = 0;
+    while (i < nnodes) : (i += 1) {
+        const n = &nodes[i];
+        if (!n.has_runtime or !poolBacked(n.runtime_val)) continue;
+        if (n.kind == .name and n.val_len != 0) {
+            const mark_v = arena_top;
+            const mark_b = byte_top;
+            var rr = Reader{ .buf = bodyOf(n), .pos = n.val_off };
+            const clean = if (evalData(&rr)) |lit| sameValue(lit, n.runtime_val, 0) else false;
+            arena_top = mark_v;
+            byte_top = mark_b;
+            if (clean) {
+                n.has_runtime = false;
+                n.runtime_val = .uninit;
+                continue;
+            }
+        }
+        if (copyValue(n.runtime_val, .arena, 0)) |staged| {
+            n.runtime_val = staged;
+        } else {
+            n.has_runtime = false;
+            n.runtime_val = .uninit;
+        }
+    }
+    name_vals_top = 0;
+    name_bytes_top = 0;
+    i = 0;
+    while (i < nnodes) : (i += 1) {
+        const n = &nodes[i];
+        if (!n.has_runtime or !arenaBacked(n.runtime_val)) continue;
+        if (copyValue(n.runtime_val, .names, 0)) |kept| {
+            n.runtime_val = kept;
+        } else {
+            n.has_runtime = false;
+            n.runtime_val = .uninit;
+        }
+    }
+    arena_top = 0;
+    byte_top = 0;
+}
+
+fn namePoolReset() void {
+    name_vals_top = 0;
+    name_bytes_top = 0;
+    name_pool_full_seen = false;
+}
+
 // --- arena reset (per top-level evaluation) ---------------------------------
 // Called at every public entry (evalMethod, reportThermal, buildPrt, the load()
-// proofs, the self-tests). Resets both arenas, then invalidates any cached
-// runtime Name value that points into the (now-recycled) arenas — a stale
-// buffer/package/ref would dangle, and so would a string built at run time
-// (ToHexString, Concatenate…). Integers and table-literal strings survive, so a
-// Name written by one method (e.g. \PICF set by _PIC, read later by _PRT) keeps
-// its value across calls; only arena-backed objects are dropped.
+// proofs, the self-tests). Resets both arenas and drops the dynamic nodes, then
+// any Name value still pointing into the arenas: a dynamic node's, or a static
+// one's the Name pool had no room for. Pooled values stay, so what a method
+// stores into a Name — an integer, a string, a patched buffer or package — is
+// what the next evaluation reads.
 /// Per-top-level-evaluation Sleep() budget. A firmware wait loop with a
 /// generous poll interval (`While (BUSY) { Sleep(10) }`) must not be able to
 /// park acpid unboundedly: once one method-call tree has slept this much,
@@ -1115,18 +1542,17 @@ fn arenaReset() void {
     if (nnodes > static_nnodes) nnodes = static_nnodes; // drop dynamic CreateField nodes
     var i: usize = 0;
     while (i < nnodes) : (i += 1) {
-        if (!nodes[i].has_runtime) continue;
-        const stale = switch (nodes[i].runtime_val) {
-            .buffer, .package, .ref => true,
-            .string => |s| inByteArena(s),
-            else => false,
-        };
-        if (stale) {
-            nodes[i].has_runtime = false;
-            nodes[i].runtime_val = .uninit;
-            nodes[i].is_buffer_field = false;
+        const n = &nodes[i];
+        if (!n.has_runtime) continue;
+        if (arenaBacked(n.runtime_val)) {
+            n.has_runtime = false;
+            n.runtime_val = .uninit;
+            n.is_buffer_field = false;
+        } else if (n.runtime_val == .package) {
+            scrubPackage(n.runtime_val.package, 0);
         }
     }
+    if (name_vals_top > NAME_POOL_VALUES / 2 or name_bytes_top > NAME_POOL_BYTES / 2) compactNames();
 }
 
 // --- data evaluator ---------------------------------------------------------
@@ -1466,10 +1892,20 @@ fn skipSuperName(r: *Reader) bool {
     return readNameString(r) != null;
 }
 
-/// Extended (0x5B-prefixed) opcodes in expression/statement position. Mutexes
-/// stay modeled as no-ops — the interpreter lock already serializes every AML
+/// Whether the SuperName at the cursor is \_GL (the Global Lock mutex). Does
+/// not move the cursor.
+fn isGlobalLockName(r: *const Reader) bool {
+    var rr = r.*;
+    if (!isNameLead(rr.peek(0) orelse return false)) return false;
+    const ns = readNameString(&rr) orelse return false;
+    return ns.nsegs == 1 and std.mem.eql(u8, &ns.segs[0], "_GL_");
+}
+
+/// Extended (0x5B-prefixed) opcodes in expression/statement position. AML
+/// Mutexes are no-ops — the interpreter lock already serializes every AML
 /// evaluation, so an AML Mutex is by construction uncontended: Acquire
-/// "succeeds" (returns 0 = no timeout) and Release does nothing. This lets real
+/// "succeeds" (returns 0 = no timeout) and Release does nothing. \_GL is the
+/// exception: it is the firmware Global Lock (glAcquire). This lets real
 /// firmware methods run *past* their lock: e.g. the PCI-hotplug \_GPE._E01
 /// serializes on \_SB.PCI0.BLCK before touching the controller, then walks the
 /// slots (PCIU/PCID field I/O) and Notifies. Sleep/Stall are REAL delays when
@@ -1509,15 +1945,22 @@ fn evalExtTerm(r: *Reader, st: *ExecState) ?Value {
         0x23 => { // AcquireOp SuperName WordData(timeout)
             _ = r.next(); // 0x5B (ExtOpPrefix)
             _ = r.next(); // 0x23 (AcquireOp)
+            // AML Mutexes need nothing beyond the interpreter lock, which
+            // already serializes every method; \_GL is the firmware's lock.
+            const gl = isGlobalLockName(r);
             if (!skipSuperName(r)) return null;
-            _ = r.next(); // timeout lo
-            _ = r.next(); // timeout hi (WordData, a raw literal — not a TermArg)
-            return .{ .integer = 0 }; // 0 ⇒ acquired, no timeout
+            const lo = r.next() orelse return null;
+            const hi = r.next() orelse return null; // WordData, a raw literal — not a TermArg
+            if (!gl) return .{ .integer = 0 }; // Zero ⇒ acquired
+            const timeout: u64 = @as(u64, hi) << 8 | lo;
+            return .{ .integer = boolVal(!glAcquire(@min(timeout, GL_WAIT_MS))) };
         },
         0x27 => { // ReleaseOp SuperName
             _ = r.next(); // 0x5B (ExtOpPrefix)
             _ = r.next(); // 0x27 (ReleaseOp)
+            const gl = isGlobalLockName(r);
             if (!skipSuperName(r)) return null;
+            if (gl) glRelease();
             return .uninit;
         },
         0x13 => { // CreateFieldOp Source BitIndex NumBits Name (arbitrary width)
@@ -1893,22 +2336,38 @@ fn bufFieldWriteWide(buf: []u8, bit_off: u32, bit_width: u32, src: []const u8) v
 }
 
 /// A Name's current value. A Buffer or Package (with any buffers nested in it)
-/// is copied into the arenas on first access and cached as the runtime value,
-/// so a write through Index()/CreateField is what every later read in the same
-/// evaluation sees — `Store(x, Index(PBIF, 1)); Return(PBIF)` is how firmware
-/// fills _BIF/_BST. (Dropped again by the next arenaReset.)
+/// is copied out of the table on first access — into the Name pool for a static
+/// Name — and cached as the runtime value, so a write through Index() or a
+/// CreateField window is what every later read sees, in this evaluation and the
+/// next: `Store(x, Index(PBIF, 1)); Return(PBIF)` is how firmware fills _BIF/_BST.
+/// A buffer field reads the bits it covers.
 fn nameValue(node: *StoredNode) Value {
+    if (node.is_buffer_field and node.has_runtime and node.runtime_val == .ref) return readThroughRef(node.runtime_val.ref);
     if (node.has_runtime) return node.runtime_val;
     var rr = Reader{ .buf = bodyOf(node), .pos = node.val_off };
     const v = evalData(&rr) orelse return .uninit;
     switch (v) {
         .buffer, .package => {
-            node.runtime_val = materializeValue(v);
+            const pooled = if (nodeIndexOf(node) < static_nnodes) poolCopy(v) else null;
+            node.runtime_val = pooled orelse materializeValue(v);
             node.has_runtime = true;
             return node.runtime_val;
         },
         else => return v,
     }
+}
+
+/// The writable bytes behind a module-level buffer field, or null when its Name
+/// no longer holds a buffer the window fits in.
+fn nameFieldBuf(node: u32, bit_off: u32, bit_width: u32) ?[]u8 {
+    if (node >= nnodes) return null;
+    const src = &nodes[node];
+    if (src.is_buffer_field) return null;
+    const v = nameValue(src);
+    if (v != .buffer) return null;
+    const buf = mutBuf(v.buffer) orelse return null;
+    if (@as(u64, bit_off) + bit_width > @as(u64, buf.len) * 8) return null;
+    return buf;
 }
 
 /// Copy a value's table-literal buffers into the byte arena, through nested
@@ -1931,6 +2390,10 @@ fn readThroughRef(rf: Ref) Value {
         .buf_byte => |bb| return .{ .integer = if (bb.idx < bb.buf.len) bb.buf[bb.idx] else 0 },
         .pkg_elem => |pe| return if (pe.idx < pe.pkg.len) pe.pkg[pe.idx] else .uninit,
         .buf_field => |bf| return bufFieldReadValue(bf.buf, bf.bit_off, bf.bit_width),
+        .name_field => |nf| {
+            const buf = nameFieldBuf(nf.node, nf.bit_off, nf.bit_width) orelse return .uninit;
+            return bufFieldReadValue(buf, nf.bit_off, nf.bit_width);
+        },
         .node => |ni| {
             if (ni >= nnodes) return .uninit;
             const n = &nodes[ni];
@@ -1943,6 +2406,15 @@ fn readThroughRef(rf: Ref) Value {
     }
 }
 
+/// Store into a Name: through its window if it is a buffer field, else as its
+/// new value.
+fn storeName(n: *StoredNode, v: Value) bool {
+    if (n.is_buffer_field and n.has_runtime and n.runtime_val == .ref) return writeThroughRef(n.runtime_val.ref, v);
+    n.runtime_val = keepValue(n, v);
+    n.has_runtime = true;
+    return true;
+}
+
 /// Write a value through a reference (Store-to-lvalue). True on success.
 fn writeThroughRef(rf: Ref, v: Value) bool {
     switch (rf) {
@@ -1953,30 +2425,37 @@ fn writeThroughRef(rf: Ref, v: Value) bool {
         },
         .pkg_elem => |pe| {
             if (pe.idx >= pe.pkg.len) return false;
-            pe.pkg[pe.idx] = v;
+            // A pooled package takes a pooled copy; if the pool is full the
+            // element lasts this evaluation (arenaReset scrubs it).
+            pe.pkg[pe.idx] = if (inNameVals(pe.pkg)) poolCopy(v) orelse v else v;
             return true;
         },
         .buf_field => |bf| {
-            if (bf.bit_width <= 64) {
-                bufFieldWrite(bf.buf, bf.bit_off, bf.bit_width, toInt(v));
-            } else {
-                bufFieldWriteWide(bf.buf, bf.bit_off, bf.bit_width, toBufferBytes(v));
-            }
+            writeBits(bf.buf, bf.bit_off, bf.bit_width, v);
+            return true;
+        },
+        .name_field => |nf| {
+            const buf = nameFieldBuf(nf.node, nf.bit_off, nf.bit_width) orelse return false;
+            writeBits(buf, nf.bit_off, nf.bit_width, v);
             return true;
         },
         .node => |ni| {
             if (ni >= nnodes) return false;
             const n = &nodes[ni];
             switch (n.kind) {
-                .name => {
-                    n.runtime_val = v;
-                    n.has_runtime = true;
-                    return true;
-                },
+                .name => return storeName(n, v),
                 .field => return writeField(n, toInt(v)),
                 else => return false,
             }
         },
+    }
+}
+
+fn writeBits(buf: []u8, bit_off: u32, bit_width: u32, v: Value) void {
+    if (bit_width <= 64) {
+        bufFieldWrite(buf, bit_off, bit_width, toInt(v));
+    } else {
+        bufFieldWriteWide(buf, bit_off, bit_width, toBufferBytes(v));
     }
 }
 
@@ -2127,7 +2606,8 @@ fn evalRefOf(r: *Reader, st: *ExecState) ?Value {
 // CreateByteField/Word/DWord/QWord/BitField and the general CreateField create
 // a NAMED window over a Buffer's bits. They run at EXECUTION time, so the node
 // is created dynamically (beyond static_nnodes) and reclaimed at the next
-// top-level arenaReset. Reads/writes of the name auto-deref through the window.
+// top-level arenaReset (one at module level is permanent: moduleCreateField).
+// Reads/writes of the name auto-deref through the window.
 
 /// Find-or-create a namespace node for `ns` resolved against `scope`. Returns an
 /// existing node (CreateField re-target) or a freshly appended one; null if the
@@ -2167,6 +2647,9 @@ fn bindBufferField(st: *ExecState, ns: NameString, src: Value, bit_off: u64, bit
     const buf_bits = @as(u64, buf.len) * 8;
     if (bit_width == 0 or bit_off > buf_bits or bit_width > buf_bits - bit_off) return null;
     const node = createDynNode(st.scope, ns) orelse return .uninit;
+    // A permanent object of that name already exists (AE_ALREADY_EXISTS);
+    // only this evaluation's own nodes are re-targeted.
+    if (nodeIndexOf(node) < static_nnodes) return .uninit;
     node.kind = .name;
     node.is_buffer_field = true;
     node.has_runtime = true;
@@ -2638,12 +3121,7 @@ fn evalNameRef(r: *Reader, st: *ExecState) ?Value {
             }
             return callMethod(node, args[0 .. @min(@as(usize, node.arg_count), 7)], st.depth + 1);
         },
-        .name => {
-            // A CreateField window auto-derefs: reading the name yields the
-            // value of the bits it covers, not the reference object itself.
-            if (node.is_buffer_field and node.has_runtime) return readThroughRef(node.runtime_val.ref);
-            return nameValue(node);
-        },
+        .name => return nameValue(node), // a CreateField window yields its bits
         .field => { // B2c/A4: read the backing hardware
             if (node.field_bit_width > 64) return readFieldBuffer(node) orelse .uninit;
             if (readField(node)) |fv| return .{ .integer = fv };
@@ -2695,16 +3173,7 @@ fn storeTarget(r: *Reader, st: *ExecState, v: Value) bool {
                 const ns = readNameString(r) orelse return false;
                 if (resolve(st.scope, ns)) |n| {
                     switch (n.kind) {
-                        .name => {
-                            // A CreateField window: deposit v into its bits
-                            // instead of replacing the reference object.
-                            if (n.is_buffer_field and n.has_runtime) {
-                                _ = writeThroughRef(n.runtime_val.ref, v);
-                            } else {
-                                n.runtime_val = v;
-                                n.has_runtime = true;
-                            }
-                        },
+                        .name => _ = storeName(n, v),
                         .field => { // B2c/A4: write hardware (scalar, or wide ← Buffer)
                             if (n.field_bit_width > 64) {
                                 _ = writeFieldBuffer(n, toBufferBytes(v));
@@ -2961,6 +3430,7 @@ fn execParseFieldList(r: *Reader, end: usize, scope: []const u8, region_idx: i32
     var bit_off: u32 = 0;
     var access = flags & 0x0F;
     const update = (flags >> 5) & 0x03;
+    const lock = flags & 0x10 != 0;
     while (r.pos < end) {
         const lead = r.peek(0) orelse return;
         switch (lead) {
@@ -3002,6 +3472,7 @@ fn execParseFieldList(r: *Reader, end: usize, scope: []const u8, region_idx: i32
                     node.field_bit_width = width;
                     node.field_access = access;
                     node.field_update = update;
+                    node.field_lock = lock;
                     node.is_buffer_field = false;
                     node.has_runtime = false;
                 }
@@ -3099,8 +3570,9 @@ pub fn evalMethodArg1(abs: []const u8, arg: Value) ?Value {
 /// returns (the live NFIT structure stream). Null if the Value isn't a buffer
 /// (an unmodeled opcode would leave the method returning `.uninit`). Lets a
 /// consumer inspect a method result without reaching into the Value union.
-/// The returned slice points into the byte arena and is valid only until the
-/// next public AML entry (which resets the arena) — copy/parse it immediately.
+/// The returned slice points into the byte arena or the Name pool and is valid
+/// only until the next public AML entry (which resets the arena and may compact
+/// the pool) — copy/parse it immediately.
 pub fn asBuffer(v: Value) ?[]const u8 {
     return switch (v) {
         .buffer => |b| b,
@@ -3457,11 +3929,13 @@ fn tNsReset() void {
     node_count = 0;
     unknown_op_seen = 0;
     mlc_skipped = 0;
+    mlc_run = 0;
     nnodes = 0;
     static_nnodes = 0;
     store_overflow = false;
     nbodies = 0;
     loaded_pool_used = 0;
+    namePoolReset();
     arenaReset();
 }
 
@@ -3556,6 +4030,7 @@ fn stWideFieldTest(fails: *u32) void {
 /// and write — the exact plug-in point a real EmbeddedControl driver will use.
 var st_fake_space: [8]u8 = [_]u8{0} ** 8;
 var st_fake_reads: u32 = 0; // lets stUpdateRuleTest see whether a write read first
+var st_fake_write_gl: u32 = 0; // the Global Lock dword at the last write
 
 fn stFakeSpaceRead(space: u8, off: u64, width: u32) ?u64 {
     _ = space;
@@ -3568,6 +4043,7 @@ fn stFakeSpaceWrite(space: u8, off: u64, width: u32, val: u64) bool {
     _ = space;
     if (width != 1 or off >= st_fake_space.len) return false;
     st_fake_space[@intCast(off)] = @truncate(val);
+    st_fake_write_gl = if (global_lock) |p| p.* else 0;
     return true;
 }
 
@@ -4295,6 +4771,14 @@ pub fn selfTestExtended() u32 {
     stUpdateRuleTest(&fails);
     stOpcodeGapTest(&fails);
 
+    // Firmware state and initialization: Name persistence, module-level code,
+    // _INI/_REG, the Global Lock, the Notify queue.
+    stNamePersistTest(&fails);
+    stModuleIfTest(&fails);
+    stInitObjectsTest(&fails);
+    stGlobalLockTest(&fails);
+    stNotifyQueueTest(&fails);
+
     return fails;
 }
 
@@ -4378,7 +4862,8 @@ fn stNameValueTest(fails: *u32) void {
     _ = evalMethod("\\SETL");
     arenaReset();
     const str = findExact("\\STR_");
-    stCheck("arena string dropped at reset", b2i(str != null and !str.?.has_runtime), 1, fails);
+    stCheck("run-time string copied out of the arena", b2i(str != null and str.?.has_runtime and str.?.runtime_val == .string and
+        !inByteArena(str.?.runtime_val.string) and str.?.runtime_val.string.len != 0), 1, fails);
     const stl = findExact("\\STL_");
     stCheck("table string kept at reset", b2i(stl != null and stl.?.has_runtime and stl.?.runtime_val == .string), 1, fails);
 }
@@ -4515,7 +5000,9 @@ fn stWalkScopeTest(fails: *u32) void {
     stCheck("walk: ^BN00 lands in \\_SB_", b2i(findExact("\\_SB_.BN00") != null), 1, fails);
     stCheck("walk: Scope(\\) declares at root", b2i(findExact("\\MSFG") != null), 1, fails);
     stCheck("walk: past External + CreateWordField", b2i(findExact("\\SIO1.AFTR") != null), 1, fails);
-    stCheck("walk: module-level statements stepped", mlc_skipped, 2, fails);
+    const irqm = findExact("\\SIO1.IRQM");
+    stCheck("walk: CreateWordField made a buffer field", b2i(irqm != null and irqm.?.is_buffer_field), 1, fails);
+    stCheck("walk: External stepped over", mlc_skipped, 1, fails);
     stCheck("walk: no unparsed opcode", unknown_op_seen, 0, fails);
 }
 
@@ -4556,6 +5043,239 @@ fn stDeferredRegionTest(fails: *u32) void {
     stCheck("deferred region: unresolvable base disabled", b2i(badr != null and badr.?.region_state == .failed), 1, fails);
 }
 
+/// What a method writes into a Name is what the next evaluation reads, and the
+/// pool compaction keeps it while dropping what still matches the table:
+///   Name(PBST, Package(4){0,0,0,0})  Method(_Q01) { Store(0x1234, Index(PBST, 2)) }
+///                                    Method(_BST) { Return(PBST) }
+///   Name(CRS1, Buffer(4){})  CreateWordField(CRS1, 2, IRQM)
+///   Method(SETI) { Store(0x0800, IRQM) }  Method(GETC) { Return(DerefOf(Index(CRS1, 3))) }
+///   Name(PKS_, Package(1){0})
+///   Method(SETP) { Store(Package(2){7, Buffer(2){1,2}}, PKS_) }
+///   Method(GETP) { Return(DerefOf(Index(DerefOf(Index(PKS_, 1)), 1))) }
+///   Method(CHRN) { Store(0, Local0)
+///                  While (LLess(Local0, 600)) { Store(Package(3){1,2,3}, PKS_) Increment(Local0) }
+///                  Store(Local0, Index(PKS_, 0)) }
+///   Method(GETX) { Return(DerefOf(Index(PKS_, 0))) }
+///   Name(CLN_, Package(2){5,6})  Method(RDC_) { Return(DerefOf(Index(CLN_, 1))) }
+///   Name(RFV_, 0)  Method(TRF_) { Store(Buffer(2){1,2}, Local0)
+///                                 Store(Index(Local0, 1), RFV_) Return(DerefOf(RFV_)) }
+fn stNamePersistTest(fails: *u32) void {
+    tNsReset();
+    _ = walkBody(&[_]u8{
+        0x08, 'P', 'B', 'S', 'T', 0x12, 0x06, 0x04, 0x00, 0x00, 0x00, 0x00,
+        0x14, 0x12, '_', 'Q', '0', '1', 0x00, 0x70, 0x0B, 0x34, 0x12, 0x88, 'P', 'B', 'S', 'T', 0x0A, 0x02, 0x00,
+        0x14, 0x0B, '_', 'B', 'S', 'T', 0x00, 0xA4, 'P', 'B', 'S', 'T',
+        0x08, 'C', 'R', 'S', '1', 0x11, 0x03, 0x0A, 0x04,
+        0x8B, 'C', 'R', 'S', '1', 0x0A, 0x02, 'I', 'R', 'Q', 'M',
+        0x14, 0x0E, 'S', 'E', 'T', 'I', 0x00, 0x70, 0x0B, 0x00, 0x08, 'I', 'R', 'Q', 'M',
+        0x14, 0x10, 'G', 'E', 'T', 'C', 0x00, 0xA4, 0x83, 0x88, 'C', 'R', 'S', '1', 0x0A, 0x03, 0x00,
+        0x08, 'P', 'K', 'S', '_', 0x12, 0x03, 0x01, 0x00,
+        0x14, 0x16, 'S', 'E', 'T', 'P', 0x00, 0x70, 0x12, 0x0A, 0x02, 0x0A, 0x07, 0x11, 0x05, 0x0A, 0x02, 0x01, 0x02, 'P', 'K', 'S', '_',
+        0x14, 0x13, 'G', 'E', 'T', 'P', 0x00, 0xA4, 0x83, 0x88, 0x83, 0x88, 'P', 'K', 'S', '_', 0x01, 0x00, 0x01, 0x00,
+        0x14, 0x28, 'C', 'H', 'R', 'N', 0x00,
+        0x70, 0x00, 0x60, // Store(Zero, Local0)
+        0xA2, 0x15, 0x95, 0x60, 0x0B, 0x58, 0x02, // While (LLess(Local0, 600))
+        0x70, 0x12, 0x07, 0x03, 0x01, 0x0A, 0x02, 0x0A, 0x03, 'P', 'K', 'S', '_', //   Store(Package(3){1,2,3}, PKS_)
+        0x75, 0x60, //   Increment(Local0)
+        0x70, 0x60, 0x88, 'P', 'K', 'S', '_', 0x00, 0x00, // Store(Local0, Index(PKS_, 0))
+        0x14, 0x0F, 'G', 'E', 'T', 'X', 0x00, 0xA4, 0x83, 0x88, 'P', 'K', 'S', '_', 0x00, 0x00,
+        0x08, 'C', 'L', 'N', '_', 0x12, 0x06, 0x02, 0x0A, 0x05, 0x0A, 0x06,
+        0x14, 0x0F, 'R', 'D', 'C', '_', 0x00, 0xA4, 0x83, 0x88, 'C', 'L', 'N', '_', 0x01, 0x00,
+        0x08, 'R', 'F', 'V', '_', 0x00,
+        0x14, 0x1D, 'T', 'R', 'F', '_', 0x00,
+        0x70, 0x11, 0x05, 0x0A, 0x02, 0x01, 0x02, 0x60, // Store(Buffer(2){1,2}, Local0)
+        0x70, 0x88, 0x60, 0x01, 0x00, 'R', 'F', 'V', '_', // Store(Index(Local0, 1), RFV_)
+        0xA4, 0x83, 'R', 'F', 'V', '_', // Return(DerefOf(RFV_))
+    });
+    static_nnodes = nnodes;
+    stCheck("Name state: a reference stored in a Name, same evaluation", toInt(evalMethod("\\TRF_") orelse .uninit), 2, fails);
+    _ = evalMethod("\\_Q01");
+    const bst = evalMethod("\\_BST") orelse Value.uninit;
+    stCheck("Name state: _Qxx write seen by the next _BST", if (bst == .package and bst.package.len == 4) toInt(bst.package[2]) else 0, 0x1234, fails);
+    _ = evalMethod("\\SETI");
+    stCheck("Name state: module-level CreateWordField patches the buffer", toInt(evalMethod("\\GETC") orelse .uninit), 0x08, fails);
+    _ = evalMethod("\\SETP");
+    stCheck("Name state: stored Package with a nested Buffer", toInt(evalMethod("\\GETP") orelse .uninit), 2, fails);
+    stCheck("Name state: clean Name read", toInt(evalMethod("\\RDC_") orelse .uninit), 6, fails);
+    _ = evalMethod("\\CHRN");
+    const used = name_vals_top;
+    arenaReset();
+    stCheck("Name pool: replaced values reclaimed", b2i(used > NAME_POOL_VALUES / 2 and name_vals_top <= 16), 1, fails);
+    const cln = findExact("\\CLN_");
+    stCheck("Name pool: unmodified Name dropped", b2i(cln != null and !cln.?.has_runtime), 1, fails);
+    stCheck("Name pool: live value moved", toInt(evalMethod("\\GETX") orelse .uninit), 600, fails);
+    const bst2 = evalMethod("\\_BST") orelse Value.uninit;
+    stCheck("Name pool: _BST state kept", if (bst2 == .package and bst2.package.len == 4) toInt(bst2.package[2]) else 0, 0x1234, fails);
+    stCheck("Name pool: buffer field after the move", toInt(evalMethod("\\GETC") orelse .uninit), 0x08, fails);
+    stCheck("Name pool: clean Name re-read", toInt(evalMethod("\\RDC_") orelse .uninit), 6, fails);
+}
+
+/// Module-level If/Else is decided during the load, like ACPICA does:
+///   Name(FLAG, One)
+///   If (LEqual(FLAG, One)) { Name(INIF, 5) } Else { Name(INEL, 6) }
+///   If (LEqual(FLAG, 2))   { Name(NOIF, 7) } Else { Name(ELSE, 8) }
+///   If (CondRefOf(\INIF))  { Device(DEVC) { Name(_ADR, Zero) } }
+///   Device(DEVX) { If (FLAG) { Method(MTHD) { Return(0x42) } } }
+///   If (<unevaluable>) { Name(UNEV, 1) } Else { Name(UNEL, 1) }
+///   Name(AFTR, One)
+fn stModuleIfTest(fails: *u32) void {
+    tNsReset();
+    _ = walkBody(&[_]u8{
+        0x08, 'F',  'L',  'A',  'G',  0x01,
+        0xA0, 0x0E, 0x93, 'F',  'L',  'A',  'G',  0x01, 0x08, 'I', 'N', 'I', 'F', 0x0A, 0x05,
+        0xA1, 0x08, 0x08, 'I',  'N',  'E',  'L',  0x0A, 0x06,
+        0xA0, 0x0F, 0x93, 'F',  'L',  'A',  'G',  0x0A, 0x02, 0x08, 'N', 'O', 'I', 'F', 0x0A, 0x07,
+        0xA1, 0x08, 0x08, 'E',  'L',  'S',  'E',  0x0A, 0x08,
+        0xA0, 0x16, 0x5B, 0x12, 0x5C, 'I',  'N',  'I',  'F', 0x00,
+        0x5B, 0x82, 0x0B, 'D',  'E',  'V',  'C',  0x08, '_', 'A', 'D', 'R', 0x00,
+        0x5B, 0x82, 0x15, 'D',  'E',  'V',  'X',
+        0xA0, 0x0F, 'F',  'L',  'A',  'G',  0x14, 0x09, 'M', 'T', 'H', 'D', 0x00, 0xA4, 0x0A, 0x42,
+        0xA0, 0x09, 0x5B, 0xFE, 0x08, 'U',  'N',  'E',  'V', 0x01,
+        0xA1, 0x07, 0x08, 'U',  'N',  'E',  'L',  0x01,
+        0x08, 'A',  'F',  'T',  'R',  0x01,
+    });
+    static_nnodes = nnodes;
+    stCheck("module If: taken branch declared", b2i(findExact("\\INIF") != null and findExact("\\INEL") == null), 1, fails);
+    stCheck("module If: Else declared", b2i(findExact("\\NOIF") == null and findExact("\\ELSE") != null), 1, fails);
+    stCheck("module If: CondRefOf sees earlier objects", b2i(findExact("\\DEVC._ADR") != null), 1, fails);
+    stCheck("module If: inside a Device", toInt(evalMethod("\\DEVX.MTHD") orelse .uninit), 0x42, fails);
+    stCheck("module If: unevaluable takes neither", b2i(findExact("\\UNEV") == null and findExact("\\UNEL") == null), 1, fails);
+    stCheck("module If: walk continues", b2i(findExact("\\AFTR") != null), 1, fails);
+    stCheck("module If: conditions run / skipped", (@as(u64, mlc_run) << 8) | mlc_skipped, 0x401, fails);
+}
+
+/// initObjects order and gating: \_SB._INI first, _REG for each handled space,
+/// _INI only on present devices, a not-present-not-functioning device hiding
+/// its subtree, a functioning-not-present one not hiding it:
+///   Scope(\_SB_) { Method(_INI) { Store(LOG_, SBV_) Or(LOG_, 1, LOG_) } }
+///   Device(DEV1) { Name(_STA, 0x0F) Method(_INI){LOG_|=2} OperationRegion(R1__, SystemIO, 0x80, 1)
+///                  Method(_REG, 2) { If (LEqual(Arg0, 1)) { Store(Arg1, REGI) } } }
+///   Device(DEV2) { Name(_STA, 0) Method(_INI){LOG_|=4} Device(CHLD) { Method(_INI){LOG_|=8} } }
+///   Device(DEV3) { Name(_STA, 0x08) Device(CHLD) { Method(_INI){LOG_|=0x10} } }
+///   Device(DEV4) { Method(_INI){LOG_|=0x20} OperationRegion(R4__, 0x7E, 0, 1)
+///                  Method(_REG, 2) { If (LEqual(Arg0, 0x7E)) { Store(Arg1, REGE) } } }
+fn stInitObjectsTest(fails: *u32) void {
+    tNsReset();
+    if (!registerRegionHandler(0x7E, .{ .read = &stFakeSpaceRead, .write = &stFakeSpaceWrite })) return;
+    _ = walkBody(&[_]u8{
+        0x08, 'L',  'O',  'G',  '_',  0x00,
+        0x08, 'S',  'B',  'V',  '_',  0xFF,
+        0x08, 'R',  'E',  'G',  'I',  0x00,
+        0x08, 'R',  'E',  'G',  'E',  0x00,
+        0x10, 0x20, 0x5C, '_',  'S',  'B',  '_',
+        0x14, 0x19, '_',  'I',  'N',  'I',  0x00, 0x70, 'L', 'O', 'G', '_', 'S', 'B', 'V', '_',
+        0x7D, 'L',  'O',  'G',  '_',  0x01, 'L',  'O',  'G', '_',
+        0x5B, 0x82, 0x3A, 'D',  'E',  'V',  '1',
+        0x08, '_',  'S',  'T',  'A',  0x0A, 0x0F,
+        0x14, 0x11, '_',  'I',  'N',  'I',  0x00, 0x7D, 'L', 'O', 'G', '_', 0x0A, 0x02, 'L', 'O', 'G', '_',
+        0x5B, 0x80, 'R',  '1',  '_',  '_',  0x01, 0x0A, 0x80, 0x01,
+        0x14, 0x11, '_',  'R',  'E',  'G',  0x02, 0xA0, 0x0A, 0x93, 0x68, 0x01, 0x70, 0x69, 'R', 'E', 'G', 'I',
+        0x5B, 0x82, 0x36, 'D',  'E',  'V',  '2',
+        0x08, '_',  'S',  'T',  'A',  0x00,
+        0x14, 0x11, '_',  'I',  'N',  'I',  0x00, 0x7D, 'L', 'O', 'G', '_', 0x0A, 0x04, 'L', 'O', 'G', '_',
+        0x5B, 0x82, 0x17, 'C',  'H',  'L',  'D',
+        0x14, 0x11, '_',  'I',  'N',  'I',  0x00, 0x7D, 'L', 'O', 'G', '_', 0x0A, 0x08, 'L', 'O', 'G', '_',
+        0x5B, 0x82, 0x25, 'D',  'E',  'V',  '3',
+        0x08, '_',  'S',  'T',  'A',  0x0A, 0x08,
+        0x5B, 0x82, 0x17, 'C',  'H',  'L',  'D',
+        0x14, 0x11, '_',  'I',  'N',  'I',  0x00, 0x7D, 'L', 'O', 'G', '_', 0x0A, 0x10, 'L', 'O', 'G', '_',
+        0x5B, 0x82, 0x33, 'D',  'E',  'V',  '4',
+        0x14, 0x11, '_',  'I',  'N',  'I',  0x00, 0x7D, 'L', 'O', 'G', '_', 0x0A, 0x20, 'L', 'O', 'G', '_',
+        0x5B, 0x80, 'R',  '4',  '_',  '_',  0x7E, 0x00, 0x01,
+        0x14, 0x12, '_',  'R',  'E',  'G',  0x02, 0xA0, 0x0B, 0x93, 0x68, 0x0A, 0x7E, 0x70, 0x69, 'R', 'E', 'G', 'E',
+    });
+    static_nnodes = nnodes;
+    initObjects();
+    const log = if (findExact("\\LOG_")) |n| toInt(nameValue(n)) else 0;
+    stCheck("_INI: present devices, hidden subtree skipped", log, 0x33, fails);
+    stCheck("_INI: \\_SB._INI first", if (findExact("\\SBV_")) |n| toInt(nameValue(n)) else 0xFF, 0, fails);
+    stCheck("_REG: SystemIO region's device", if (findExact("\\REGI")) |n| toInt(nameValue(n)) else 0, 1, fails);
+    stCheck("_REG: registered space", if (findExact("\\REGE")) |n| toInt(nameValue(n)) else 0, 1, fails);
+}
+
+var st_gl: u32 = 0;
+var st_gl_rls: u32 = 0;
+
+fn stGlRelease() void {
+    st_gl_rls += 1;
+}
+
+/// The Global Lock over a fake FACS dword: a LockRule field holds it across the
+/// access, Acquire (\_GL) times out against the firmware and sets pending, a
+/// release with pending set signals GBL_RLS, a leaked Acquire is released:
+///   OperationRegion(GLRG, 0x7E, 0, 2)  Field(GLRG, ByteAcc, Lock, Preserve) { GLF0, 8 }
+///   Method(TACQ) { Return(Acquire(\_GL_, 0)) }  Method(TREL) { Release(\_GL_) }
+///   Method(TFLD) { Store(0x5A, GLF0) Return(GLF0) }  Method(TLEK) { Acquire(\_GL_, 0xFFFF) }
+fn stGlobalLockTest(fails: *u32) void {
+    tNsReset();
+    if (!registerRegionHandler(0x7E, .{ .read = &stFakeSpaceRead, .write = &stFakeSpaceWrite })) return;
+    _ = walkBody(&[_]u8{
+        0x5B, 0x80, 'G',  'L',  'R',  'G', 0x7E, 0x00, 0x0A, 0x02,
+        0x5B, 0x81, 0x0B, 'G',  'L',  'R', 'G',  0x11, 'G',  'L', 'F', '0', 0x08,
+        0x14, 0x10, 'T',  'A',  'C',  'Q', 0x00, 0xA4, 0x5B, 0x23, 0x5C, '_', 'G', 'L', '_', 0x00, 0x00,
+        0x14, 0x0D, 'T',  'R',  'E',  'L', 0x00, 0x5B, 0x27, 0x5C, '_',  'G', 'L', '_',
+        0x14, 0x12, 'T',  'F',  'L',  'D', 0x00, 0x70, 0x0A, 0x5A, 'G',  'L', 'F', '0', 0xA4, 'G', 'L', 'F', '0',
+        0x14, 0x0F, 'T',  'L',  'E',  'K', 0x00, 0x5B, 0x23, 0x5C, '_',  'G', 'L', '_', 0xFF, 0xFF,
+    });
+    static_nnodes = nnodes;
+    const saved = global_lock;
+    const saved_fn = global_lock_release_fn;
+    global_lock = &st_gl;
+    global_lock_release_fn = &stGlRelease;
+    defer {
+        global_lock = saved;
+        global_lock_release_fn = saved_fn;
+    }
+    st_gl = 0;
+    st_gl_rls = 0;
+    st_fake_write_gl = 0;
+    stCheck("Global Lock: locked field r/w", toInt(evalMethod("\\TFLD") orelse .uninit), 0x5A, fails);
+    stCheck("Global Lock: held during the access, released after", (@as(u64, st_fake_write_gl) << 8) | st_gl, 0x200, fails);
+    st_gl = GL_OWNED;
+    stCheck("Global Lock: Acquire times out while firmware owns it", toInt(evalMethod("\\TACQ") orelse .uninit), ~@as(u64, 0), fails);
+    stCheck("Global Lock: pending set for the firmware", st_gl, GL_OWNED | GL_PENDING, fails);
+    st_gl = 0;
+    stCheck("Global Lock: Acquire after the firmware let go", toInt(evalMethod("\\TACQ") orelse .uninit), 0, fails);
+    st_gl |= GL_PENDING;
+    _ = evalMethod("\\TREL");
+    stCheck("Global Lock: release signals a waiting firmware", (@as(u64, st_gl_rls) << 8) | st_gl, 0x100, fails);
+    _ = evalMethod("\\TLEK");
+    const held = gl_depth;
+    glEndEvaluation();
+    stCheck("Global Lock: leaked Acquire released", (@as(u64, held) << 8) | (@as(u64, gl_depth) << 4) | st_gl, 0x100, fails);
+}
+
+fn stNotifyHook(obj_path: []const u8, value: u64) void {
+    queueNotifyReeval(obj_path, value);
+}
+
+/// The deferred Notify queue: a repeated request is queued once, and a _BST
+/// that Notifies its own battery does not queue itself again:
+///   Device(BATX) { Method(_BST) { Notify(BATX, 0x80) Notify(BATX, 0x81)
+///                                 Return(Package(4){1,2,3,4}) } }
+fn stNotifyQueueTest(fails: *u32) void {
+    tNsReset();
+    _ = walkBody(&[_]u8{
+        0x5B, 0x82, 0x25, 'B', 'A', 'T', 'X',
+        0x14, 0x1F, '_', 'B', 'S', 'T', 0x00,
+        0x86, 'B', 'A', 'T', 'X', 0x0A, 0x80,
+        0x86, 'B', 'A', 'T', 'X', 0x0A, 0x81,
+        0xA4, 0x12, 0x09, 0x04, 0x01, 0x0A, 0x02, 0x0A, 0x03, 0x0A, 0x04,
+    });
+    static_nnodes = nnodes;
+    const saved_hook = notify_hook;
+    notify_hook = &stNotifyHook;
+    defer notify_hook = saved_hook;
+    notify_q_head = 0;
+    notify_q_count = 0;
+    queueNotifyReeval("\\BATX", 0x80);
+    queueNotifyReeval("\\BATX", 0x80);
+    stCheck("Notify queue: repeat queued once", notify_q_count, 1, fails);
+    const done = drainNotifyReevals();
+    stCheck("Notify queue: self-Notify not requeued", (@as(u64, done) << 4) | notify_q_count, 0x10, fails);
+    notify_q_count = 0;
+}
+
 // === B2c: OperationRegion / Field hardware I/O ==============================
 // A Field declares named bit-slices over an OperationRegion. B2c parses the
 // FieldList into .field nodes (parent region + bit offset/width/access) and
@@ -4581,6 +5301,7 @@ fn parseFieldList(r: *Reader, end: usize, path: *const PathBuf, region_idx: i32,
     var bit_off: u32 = 0;
     var access = flags & 0x0F;
     const update = (flags >> 5) & 0x03;
+    const lock = flags & 0x10 != 0;
     while (r.pos < end) {
         const lead = r.peek(0) orelse return;
         switch (lead) {
@@ -4622,6 +5343,7 @@ fn parseFieldList(r: *Reader, end: usize, path: *const PathBuf, region_idx: i32,
                     .field_bit_width = width,
                     .field_access = access,
                     .field_update = update,
+                    .field_lock = lock,
                 });
                 bit_off +%= width;
             },
@@ -5083,12 +5805,26 @@ fn lowBits(n: u64) u64 {
     return if (n >= 64) ~@as(u64, 0) else (@as(u64, 1) << @as(u6, @intCast(n))) - 1;
 }
 
+/// LockRule = Lock: the access runs under the Global Lock. False when the
+/// firmware kept it past GL_WAIT_MS — the access fails rather than race SMM.
+fn fieldLock(field: *const StoredNode) bool {
+    if (!field.field_lock or glAcquire(GL_WAIT_MS)) return true;
+    debug.klog("[aml] {s}: firmware kept the Global Lock — access failed\n", .{field.path[0..field.path_len]});
+    return false;
+}
+
+fn fieldUnlock(field: *const StoredNode) void {
+    if (field.field_lock) glRelease();
+}
+
 /// Read a scalar field (≤ 64 bits) by assembling the access-width units it
 /// spans and extracting its bit-slice. Null for unsupported widths, unresolved
 /// regions, or an access window too wide to fit a u64. Bit positions are u64:
 /// a FieldList's running offset can wrap a u32.
 fn readField(field: *const StoredNode) ?u64 {
     const region = fieldRegion(field) orelse return null;
+    if (!fieldLock(field)) return null;
+    defer fieldUnlock(field);
     const width: u64 = field.field_bit_width;
     if (width == 0 or width > 64) return null;
     const ab = accessWidthBytes(field.field_access);
@@ -5115,6 +5851,8 @@ fn readField(field: *const StoredNode) ?u64 {
 /// never read just to be overwritten.
 fn writeField(field: *const StoredNode, value: u64) bool {
     const region = fieldRegion(field) orelse return false;
+    if (!fieldLock(field)) return false;
+    defer fieldUnlock(field);
     const width: u64 = field.field_bit_width;
     if (width == 0 or width > 64) return false;
     const ab = accessWidthBytes(field.field_access);
@@ -5159,6 +5897,8 @@ fn writeField(field: *const StoredNode, value: u64) bool {
 /// Read a field of any width into a fresh arena Buffer ((width+7)/8 bytes).
 fn readFieldBuffer(field: *const StoredNode) ?Value {
     const region = fieldRegion(field) orelse return null;
+    if (!fieldLock(field)) return null;
+    defer fieldUnlock(field);
     const width: u64 = field.field_bit_width;
     if (width == 0) return null;
     const out = newBuf(@intCast((width + 7) / 8)) orelse return null;
@@ -5184,6 +5924,8 @@ fn readFieldBuffer(field: *const StoredNode) ?Value {
 /// Write a Buffer's bytes into a field of any width, one access unit at a time.
 fn writeFieldBuffer(field: *const StoredNode, bytes: []const u8) bool {
     const region = fieldRegion(field) orelse return false;
+    if (!fieldLock(field)) return false;
+    defer fieldUnlock(field);
     const width: u64 = field.field_bit_width;
     if (width == 0) return false;
     const ab = accessWidthBytes(field.field_access);
@@ -5660,8 +6402,8 @@ pub fn reportBattery() u32 {
 // it must NOT re-eval there — that would nest a method call inside the firmware's
 // running handler. Instead queueNotifyReeval() records (path, value) and acpid
 // drains it via drainNotifyReevals() OUTSIDE the interpreter call stack, mirroring
-// the PCI-rescan deferral. Single-reader/-writer (acpid), like pci_rescan: the
-// queue ops need no atomics.
+// the PCI-rescan deferral. Any task's evaluation can Notify, so both ends take the
+// interpreter lock.
 
 /// Resolve "<dev>.<seg>" (a 4-char NameSeg child of an absolute device path) to a
 /// method node, or null. Used to tell a battery (has _BST) from a thermal zone
@@ -5705,17 +6447,35 @@ const NotifyReq = struct { path: [PATH_MAX]u8 = undefined, len: u8 = 0, value: u
 var notify_q: [NOTIFY_Q_LEN]NotifyReq = [_]NotifyReq{.{}} ** NOTIFY_Q_LEN;
 var notify_q_head: usize = 0; // index of the next entry to drain
 var notify_q_count: usize = 0;
+/// The request drainNotifyReevals is re-evaluating, if any.
+var notify_running: ?NotifyReq = null;
+
+fn notifyReqIs(e: *const NotifyReq, obj_path: []const u8, value: u64) bool {
+    return e.value == value and std.mem.eql(u8, e.path[0..e.len], obj_path);
+}
 
 /// Queue a device-specific Notify (value 0x80/0x81) for deferred re-evaluation by
-/// acpid. Called from the Notify hook (mid-GPE-handler, under the interpreter
-/// lock) — so it records rather than re-evaluating here. The device path is COPIED
-/// (the caller's slice points into node storage). On a full queue the oldest entry
-/// is dropped — a missed re-read is idempotent and the next notify refreshes it.
-/// Values other than 0x80/0x81 are ignored (PCI hotplug 0x00/0x01/0x03 is handled
-/// by the integrator's own hook path, not here).
+/// acpid. Called from the Notify hook in the middle of whatever evaluation ran
+/// the Notify — so it records rather than re-evaluating here. The device path is
+/// COPIED (the caller's slice points into node storage). A request already queued
+/// is not queued twice, and none is queued for the device being re-evaluated
+/// (its re-read covers both values): a _BST that Notifies its own battery would
+/// otherwise keep acpid re-reading it forever. On
+/// a full queue the oldest entry is dropped — a missed re-read is idempotent and
+/// the next notify refreshes it. Values other than 0x80/0x81 are ignored (PCI
+/// hotplug 0x00/0x01/0x03 is handled by the integrator's own hook path, not here).
 pub fn queueNotifyReeval(obj_path: []const u8, value: u64) void {
     if (obj_path.len == 0 or obj_path.len > PATH_MAX) return;
     if (value != 0x80 and value != 0x81) return;
+    ilockAcquire();
+    defer ilockRelease();
+    if (notify_running) |*cur| {
+        if (std.mem.eql(u8, cur.path[0..cur.len], obj_path)) return;
+    }
+    var k: usize = 0;
+    while (k < notify_q_count) : (k += 1) {
+        if (notifyReqIs(&notify_q[(notify_q_head + k) % NOTIFY_Q_LEN], obj_path, value)) return;
+    }
     const slot = (notify_q_head + notify_q_count) % NOTIFY_Q_LEN;
     const e = &notify_q[slot];
     @memcpy(e.path[0..obj_path.len], obj_path);
@@ -5729,20 +6489,22 @@ pub fn queueNotifyReeval(obj_path: []const u8, value: u64) void {
 }
 
 /// Drain the deferred Notify re-eval queue (acpid thread context): re-evaluate
-/// each queued device's status method and log the fresh reading. Returns the
-/// number actually re-evaluated. A no-op when the queue is empty.
+/// each queued device's status method and log the fresh reading. Only the
+/// requests queued before the call are drained; one a re-evaluation queues
+/// waits for the next pass. Returns the number actually re-evaluated.
 pub fn drainNotifyReevals() u32 {
+    ilockAcquire();
+    defer ilockRelease();
     var done: u32 = 0;
-    while (notify_q_count > 0) {
-        // Pop (copy the entry + advance head/count) BEFORE the re-eval, so the ring
-        // stays consistent even if the _BST/_TMP method body were itself to Notify
-        // and re-enter queueNotifyReeval mid-drain: the freed slot is valid and the
-        // outer loop just drains the new entry. Real status methods don't Notify.
-        const e = notify_q[notify_q_head];
+    var n = notify_q_count;
+    while (n > 0 and notify_q_count > 0) : (n -= 1) {
+        notify_running = notify_q[notify_q_head];
         notify_q_head = (notify_q_head + 1) % NOTIFY_Q_LEN;
         notify_q_count -= 1;
+        const e = &notify_running.?;
         if (reevalNotify(e.path[0..e.len], e.value)) done += 1;
     }
+    notify_running = null;
     return done;
 }
 
@@ -6009,9 +6771,8 @@ fn evalNamedNode(n: *StoredNode) ?Value {
     arenaReset();
     switch (n.kind) {
         .name => {
-            if (n.has_runtime) return n.runtime_val;
-            var rr = Reader{ .buf = bodyOf(n), .pos = n.val_off };
-            return evalData(&rr);
+            const v = nameValue(n);
+            return if (v == .uninit) null else v;
         },
         .method => return callMethod(n, &.{}, 0),
         else => return null,
@@ -6629,6 +7390,145 @@ pub fn reportPrtPciJoin() void {
     debug.klog("[acpi] _PRT join: {d}/{d} INTx PCI device(s) matched an ACPI route\n", .{ matched, pinned });
 }
 
+// --- device initialization (_REG, _INI) --------------------------------------
+// What ACPICA's AcpiInitializeObjects does once the namespace is loaded and ACPI
+// mode is on, in its order: \_INI and \_SB._INI; then _REG (space, 1) to tell
+// the firmware that each address space the OS handles is now available — the
+// laptop EC's _REG is where firmware sets the flag (ECON/ECOK) its battery and
+// thermal methods check before touching the EC; then _STA/_INI for every
+// device, processor and thermal zone. A device that is neither present nor
+// functioning hides its whole subtree.
+
+const STA_PRESENT: u64 = 1 << 0;
+const STA_FUNCTIONING: u64 = 1 << 3;
+const REG_CONNECT: u64 = 1;
+
+/// Which _REG methods ran for which space: one call per pair, however many
+/// regions of that space the device declares.
+const RegRun = struct { method: usize, space: u8 };
+const MAX_REG_RUNS = 128;
+
+/// Subtrees _INI skips (devices neither present nor functioning).
+const MAX_HIDDEN = 256;
+
+fn spaceHandled(space: u8) bool {
+    return space == SPACE_MEM or space == SPACE_IO or space == SPACE_PCI or regionHandlerFor(space) != null;
+}
+
+fn runInit(n: *StoredNode, args: []const Value) void {
+    arenaReset();
+    _ = callMethod(n, args, 0);
+}
+
+fn regRun(runs: []RegRun, nruns: *usize, method: *StoredNode, space: u8) bool {
+    const mi = nodeIndexOf(method);
+    for (runs[0..nruns.*]) |r| {
+        if (r.method == mi and r.space == space) return false;
+    }
+    if (nruns.* < runs.len) {
+        runs[nruns.*] = .{ .method = mi, .space = space };
+        nruns.* += 1;
+    }
+    runInit(method, &.{ .{ .integer = space }, .{ .integer = REG_CONNECT } });
+    return true;
+}
+
+/// _REG (space, 1) for every space the OS handles, by each region's parent, in
+/// space then namespace order. Also an EC's own _REG when no EmbeddedControl
+/// region sits under it (ACPICA's orphan _REG). Returns the number run.
+fn runRegMethods() u32 {
+    var runs: [MAX_REG_RUNS]RegRun = undefined;
+    var nruns: usize = 0;
+    var ran: u32 = 0;
+    var spaces: [3 + MAX_REGION_HANDLERS]u8 = undefined;
+    spaces[0] = SPACE_MEM;
+    spaces[1] = SPACE_IO;
+    spaces[2] = SPACE_PCI;
+    var nspaces: usize = 3;
+    for (region_handlers[0..n_region_handlers]) |h| {
+        spaces[nspaces] = h.space;
+        nspaces += 1;
+    }
+    for (spaces[0..nspaces]) |space| {
+        var i: usize = 0;
+        while (i < static_nnodes) : (i += 1) {
+            const n = &nodes[i];
+            if (n.kind != .op_region or n.region_space != space or n.path_len == 0) continue;
+            const reg = childMethod(parentScope(n.path[0..n.path_len]), "_REG") orelse continue;
+            if (regRun(&runs, &nruns, reg, space)) ran += 1;
+        }
+    }
+    if (regionHandlerFor(SPACE_EC) != null) {
+        if (findDevicePathByHid("PNP0C09")) |ec| {
+            if (childMethod(ec, "_REG")) |reg| {
+                if (regRun(&runs, &nruns, reg, SPACE_EC)) ran += 1;
+            }
+        }
+    }
+    return ran;
+}
+
+fn underHidden(path: []const u8, hidden: []const []const u8) bool {
+    for (hidden) |h| {
+        if (path.len > h.len and path[h.len] == '.' and std.mem.eql(u8, path[0..h.len], h)) return true;
+    }
+    return false;
+}
+
+/// Run the firmware's initialization methods. Call once after load(), with
+/// ACPI mode on and the region handlers registered.
+pub fn initObjects() void {
+    ilockAcquire();
+    defer ilockRelease();
+    var ini_ran: u32 = 0;
+    const root_ini = if (findExact("\\_INI")) |n| (if (n.kind == .method) n else null) else null;
+    const sb_ini = childMethod("\\_SB_", "_INI");
+    if (root_ini) |n| {
+        runInit(n, &.{});
+        ini_ran += 1;
+    }
+    if (sb_ini) |n| {
+        runInit(n, &.{});
+        ini_ran += 1;
+    }
+    const reg_ran = runRegMethods();
+
+    var hidden: [MAX_HIDDEN][]const u8 = undefined;
+    var nhidden: usize = 0;
+    var absent: u32 = 0;
+    const end = static_nnodes; // objects a Load in an _INI adds are not initialized (ACPICA)
+    var i: usize = 0;
+    while (i < end) : (i += 1) {
+        const n = &nodes[i];
+        if (n.kind != .device and n.kind != .processor and n.kind != .thermal_zone) continue;
+        const path = n.path[0..n.path_len];
+        if (path.len == 0 or underHidden(path, hidden[0..nhidden])) continue;
+        var sta: u64 = STA_PRESENT | 0x0E; // no _STA: present, enabled, shown, functioning
+        if (childExists(path, "_STA")) {
+            // Unevaluable: skip its _INI, keep walking its children.
+            const v = evalDeviceChild(path, "_STA") orelse continue;
+            if (v != .integer) continue;
+            sta = v.integer;
+        }
+        if (sta & STA_PRESENT == 0) {
+            absent += 1;
+            if (sta & STA_FUNCTIONING == 0) {
+                if (nhidden < hidden.len) {
+                    hidden[nhidden] = path;
+                    nhidden += 1;
+                }
+            }
+            continue;
+        }
+        const ini = childMethod(path, "_INI") orelse continue;
+        if (sb_ini != null and ini == sb_ini.?) continue;
+        runInit(ini, &.{});
+        ini_ran += 1;
+    }
+    arenaReset();
+    debug.klog("[aml] init: {d} _REG, {d} _INI run; {d} device(s) not present\n", .{ reg_ran, ini_ran, absent });
+}
+
 // --- entry point ------------------------------------------------------------
 
 /// Objects the OS itself provides at the root (ACPI 6.4 §5.7.4, §5.7.6):
@@ -6648,10 +7548,10 @@ fn osObject(abs: []const u8, v: Value) void {
     nnodes += 1;
 }
 
-/// Decode the cached DSDT plus every SSDT into one namespace, then run the
-/// boot-time proofs. Call after acpi.init has cached the tables. Best-effort:
-/// logs a summary; a malformed table yields a partial walk, never a fault.
-/// Returns the total named-object count.
+/// Decode the cached DSDT plus every SSDT into one namespace. Call after
+/// acpi.init has cached the tables, then initObjects() and bootReport().
+/// Best-effort: logs a summary; a malformed table yields a partial walk, never
+/// a fault. Returns the total named-object count.
 pub fn load() u32 {
     ilockAcquire();
     defer ilockRelease();
@@ -6664,11 +7564,14 @@ pub fn load() u32 {
     node_count = 0;
     unknown_op_seen = 0;
     mlc_skipped = 0;
+    mlc_run = 0;
     nnodes = 0;
+    static_nnodes = 0;
     store_overflow = false;
     nbodies = 0;
     loaded_pool_used = 0;
     synth_injected = false;
+    namePoolReset();
     arenaReset();
     addOsObjects();
 
@@ -6717,12 +7620,22 @@ pub fn load() u32 {
     } else {
         debug.klog("[aml] namespace walk complete: {d} named objects\n", .{node_count});
     }
+    if (mlc_run != 0) debug.klog("[aml] {d} module-level If/CreateField executed during the load\n", .{mlc_run});
     if (mlc_skipped != 0) debug.klog("[aml] {d} module-level statement(s) stepped over, not executed\n", .{mlc_skipped});
     debug.klog("[aml] namespace: DSDT {d} obj + {d} SSDT(s) {d} obj{s} = {d} total{s}\n", .{
         dsdt_objs, acpi.ssdtCount(), ssdt_objs,
         if (synth_injected) " + synthetic test SSDT" else "",
         nnodes, if (store_overflow) " (TRUNCATED — raise MAX_NODES)" else "",
     });
+    return node_count;
+}
+
+/// The boot-time proofs: evaluate the objects the kernel and the boot log rely
+/// on (_S5_, _PRT, _OSC, thermal, battery, C-states, devices). After
+/// initObjects(), so they see the state the firmware's _INI methods set up.
+pub fn bootReport() void {
+    ilockAcquire();
+    defer ilockRelease();
 
     // B2a proof: evaluate \_S5_ through the interpreter and report SLP_TYP — the
     // same datum Slice A's static scan extracts, now produced by the general
@@ -6819,5 +7732,4 @@ pub fn load() u32 {
     // Slice H proof: build the PCI INTx → GSI routing table from \_SB.PCI0._PRT
     // (selecting APIC mode via _PIC), resolving each link device to its GSI.
     _ = buildPrt();
-    return node_count;
 }

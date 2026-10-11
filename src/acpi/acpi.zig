@@ -818,13 +818,23 @@ pub fn init(boot_rsdp: u64) void {
     // Hand the (leaf) AML interpreter its kernel service hooks before any
     // firmware method runs: real Sleep/Stall delays, the monotonic Timer
     // clock, and the current-task id for its recursive interpreter lock. All
-    // are safe from boot context — kernelSleepMs returns immediately when no
-    // current task exists, and a zero Timer falls back to aml's own counter.
+    // are safe from boot context — with no task to sleep or no calibrated TSC,
+    // Sleep and Stall spin on the PIT, and a zero Timer falls back to aml's own
+    // counter.
     const amlmod = @import("aml.zig");
     amlmod.sleep_ms_fn = &amlSleepMs;
     amlmod.stall_us_fn = &amlStallUs;
     amlmod.timer_100ns_fn = &amlTimer100ns;
     amlmod.task_id_fn = &amlTaskId;
+    if (globalLockWord()) |p| {
+        amlmod.global_lock = p;
+        amlmod.global_lock_release_fn = &amlGlobalLockRelease;
+    }
+
+    // ACPI mode before the first firmware method runs, as under ACPICA: _REG
+    // and _INI below expect the OS to own ACPI events. Interrupts are still off,
+    // and sci.init masks every GPE before it routes the SCI.
+    @import("sci.zig").enterAcpiMode();
 
     // Tier B: register the Embedded Controller handler (EmbeddedControl space
     // 0x03) BEFORE the DSDT walk, so a real laptop's EC OperationRegion fields
@@ -837,11 +847,17 @@ pub fn init(boot_rsdp: u64) void {
     // Dynamic ACPI (Slice B): decode the DSDT's AML into a namespace. Best-
     // effort + fully bounds-checked; a malformed DSDT yields a partial walk,
     // never a fault. For bring-up this dumps the discovered objects to serial.
-    _ = @import("aml.zig").load();
+    _ = amlmod.load();
 
-    // EC namespace discovery (needs the built namespace) + the boot proof: the
-    // software-EC loopback AND a simulated _Qxx query running its handler.
+    // EC namespace discovery (_GPE, _GLK) before any firmware method touches
+    // the EC; then the firmware's own initialization (_REG, _INI); then the
+    // boot proofs, which see the state _INI set up.
     ec.discover();
+    amlmod.initObjects();
+    amlmod.bootReport();
+
+    // The EC boot proof: the software-EC loopback AND a simulated _Qxx query
+    // running its handler.
     _ = ec.selfTest();
 
     // Slice E: adopt the deepest CPU-supported processor C-state from _CST as the
@@ -866,16 +882,51 @@ pub fn init(boot_rsdp: u64) void {
 
 fn amlSleepMs(ms: u64) void {
     // Per-call clamp; aml.zig additionally enforces a per-method Sleep budget.
-    @import("../proc/sched.zig").kernelSleepMs(@intCast(@min(ms, 1_000)));
+    const capped = @min(ms, 1_000);
+    // No task to put to sleep yet — _INI runs from acpi.init — so wait in place.
+    if (@import("../cpu/smp.zig").myCpu().current_pid == null) return busyWaitUs(capped * 1_000);
+    @import("../proc/sched.zig").kernelSleepMs(@intCast(capped));
 }
 
 fn amlStallUs(us: u64) void {
+    busyWaitUs(@min(us, 1_000));
+}
+
+/// Spin for `us` µs: on the TSC once apic.init has calibrated it, before that
+/// on the PIT count pit.init left running.
+fn busyWaitUs(us: u64) void {
     const apic = @import("../time/apic.zig");
     const tpq = apic.tscPerQuantum(); // TSC ticks per 10ms quantum
-    if (tpq == 0) return; // pre-calibration: nothing to time against
-    const ticks = @min(us, 1_000) * tpq / 10_000; // 10_000 µs per quantum
+    if (tpq == 0) return @import("../time/pit.zig").delayUs(us);
+    const ticks = us * tpq / 10_000; // 10_000 µs per quantum
     const start = apic.readTsc();
     while (apic.readTsc() -% start < ticks) std.atomic.spinLoopHint();
+}
+
+/// The FACS GlobalLock dword, aligned for atomics; null when there is no lock
+/// (no FACS, or FADT HW_REDUCED_ACPI, flags bit 20).
+fn globalLockWord() ?*u32 {
+    const f = fadt orelse return null;
+    if (f.flags & (1 << 20) != 0) return null;
+    const fc = facs orelse return null;
+    const addr = @intFromPtr(&fc.global_lock);
+    if (addr % 4 != 0) return null;
+    return @ptrFromInt(addr);
+}
+
+/// PM1_CNT.GBL_RLS (bit 2): the firmware waited for the Global Lock we just
+/// released.
+fn amlGlobalLockRelease() void {
+    const f = fadt orelse return;
+    const GBL_RLS: u16 = 1 << 2;
+    if (f.pm1a_cnt_blk != 0) {
+        const port: u16 = @truncate(f.pm1a_cnt_blk);
+        io.outw(port, io.inw(port) | GBL_RLS);
+    }
+    if (f.pm1b_cnt_blk != 0) {
+        const port: u16 = @truncate(f.pm1b_cnt_blk);
+        io.outw(port, io.inw(port) | GBL_RLS);
+    }
 }
 
 fn amlTimer100ns() u64 {
