@@ -479,7 +479,7 @@ fn walkTerms(r: *Reader, end: usize, path: *const PathBuf, depth: u8) void {
                     if (rn.kind == .op_region) region_idx = @intCast(nodeIndexOf(rn));
                 }
                 const flags = r.next() orelse return; // FieldFlags
-                parseFieldList(r, pkg_end, path, region_idx, flags & 0x0F, depth);
+                parseFieldList(r, pkg_end, path, region_idx, flags, depth);
                 r.pos = pkg_end;
             },
             .name => {
@@ -856,6 +856,7 @@ const StoredNode = struct {
     field_bit_off: u32 = 0,
     field_bit_width: u32 = 0,
     field_access: u8 = 0,
+    field_update: u8 = UPDATE_PRESERVE,
     // Runtime mutable value (B2b): Store-to-Name updates this; reads prefer it
     // over the static DSDT value. Reset every load() (nnodes = 0 re-walks).
     runtime_val: Value = .uninit,
@@ -884,6 +885,7 @@ const Payload = struct {
     field_bit_off: u32 = 0,
     field_bit_width: u32 = 0,
     field_access: u8 = 0,
+    field_update: u8 = UPDATE_PRESERVE,
 };
 
 var nodes: [MAX_NODES]StoredNode = undefined;
@@ -955,6 +957,7 @@ fn storeNode(kind: NodeKind, path: *const PathBuf, ns: NameString, p: Payload) v
         .field_bit_off = p.field_bit_off,
         .field_bit_width = p.field_bit_width,
         .field_access = p.field_access,
+        .field_update = p.field_update,
     };
     const cl = @min(full.len, @as(usize, PATH_MAX));
     @memcpy(n.path[0..cl], full[0..cl]);
@@ -1094,7 +1097,8 @@ fn newBuf(n: usize) ?[]u8 {
 // Called at every public entry (evalMethod, reportThermal, buildPrt, the load()
 // proofs, the self-tests). Resets both arenas, then invalidates any cached
 // runtime Name value that points into the (now-recycled) arenas — a stale
-// buffer/package/ref would dangle. Integer/string runtime values survive, so a
+// buffer/package/ref would dangle, and so would a string built at run time
+// (ToHexString, Concatenate…). Integers and table-literal strings survive, so a
 // Name written by one method (e.g. \PICF set by _PIC, read later by _PRT) keeps
 // its value across calls; only arena-backed objects are dropped.
 /// Per-top-level-evaluation Sleep() budget. A firmware wait loop with a
@@ -1112,13 +1116,15 @@ fn arenaReset() void {
     var i: usize = 0;
     while (i < nnodes) : (i += 1) {
         if (!nodes[i].has_runtime) continue;
-        switch (nodes[i].runtime_val) {
-            .buffer, .package, .ref => {
-                nodes[i].has_runtime = false;
-                nodes[i].runtime_val = .uninit;
-                nodes[i].is_buffer_field = false;
-            },
-            else => {},
+        const stale = switch (nodes[i].runtime_val) {
+            .buffer, .package, .ref => true,
+            .string => |s| inByteArena(s),
+            else => false,
+        };
+        if (stale) {
+            nodes[i].has_runtime = false;
+            nodes[i].runtime_val = .uninit;
+            nodes[i].is_buffer_field = false;
         }
     }
 }
@@ -1174,9 +1180,17 @@ fn evalData(r: *Reader) ?Value {
             const pl = readPkgLength(r) orelse return null;
             const end = pkg_start + pl.value;
             if (end > r.buf.len or end < r.pos) return null;
-            _ = evalData(r); // BufferSize TermArg (real length is the byte count)
+            const size = evalData(r); // BufferSize TermArg
             const bytes = if (r.pos <= end) r.buf[r.pos..end] else r.buf[0..0];
             r.pos = end;
+            // A BufferSize larger than the initializer zero-fills the rest:
+            // `Name (BUFF, Buffer (0x10) {})` is 16 bytes, not empty.
+            if (size != null and size.? == .integer and size.?.integer > bytes.len and size.?.integer <= BYTE_ARENA) {
+                if (newBuf(@intCast(size.?.integer))) |mb| {
+                    @memcpy(mb[0..bytes.len], bytes);
+                    return .{ .buffer = mb };
+                }
+            }
             return .{ .buffer = bytes };
         },
         0x12, 0x13 => { // PackageOp / VarPackageOp
@@ -1279,6 +1293,7 @@ fn toInt(v: Value) u64 {
     return switch (v) {
         .integer => |i| i,
         .ref => |rf| toInt(readThroughRef(rf)), // an Index/RefOf result used as an integer auto-derefs
+        .buffer => |b| readLeBytes(b), // implicit Buffer→Integer: first 8 bytes, LE (ACPI 6.4 §19.3.5.5)
         else => 0,
     };
 }
@@ -1315,6 +1330,12 @@ fn aOr(a: u64, b: u64) u64 {
 fn aXor(a: u64, b: u64) u64 {
     return a ^ b;
 }
+fn aNAnd(a: u64, b: u64) u64 {
+    return ~(a & b);
+}
+fn aNOr(a: u64, b: u64) u64 {
+    return ~(a | b);
+}
 fn aShl(a: u64, b: u64) u64 {
     return if (b >= 64) 0 else a << @as(u6, @intCast(b));
 }
@@ -1347,7 +1368,9 @@ const bin_table = [_]BinOp{
     .{ .code = 0x79, .has_target = true, .apply = aShl }, // ShiftLeft
     .{ .code = 0x7A, .has_target = true, .apply = aShr }, // ShiftRight
     .{ .code = 0x7B, .has_target = true, .apply = aAnd }, // And
+    .{ .code = 0x7C, .has_target = true, .apply = aNAnd }, // NAnd
     .{ .code = 0x7D, .has_target = true, .apply = aOr }, // Or
+    .{ .code = 0x7E, .has_target = true, .apply = aNOr }, // NOr
     .{ .code = 0x7F, .has_target = true, .apply = aXor }, // Xor
     .{ .code = 0x85, .has_target = true, .apply = aMod }, // Mod
     .{ .code = 0x90, .has_target = false, .apply = aLAnd }, // LAnd
@@ -1372,9 +1395,19 @@ fn aNot(a: u64) u64 {
 fn aLNot(a: u64) u64 {
     return boolVal(a == 0);
 }
+/// 1-based index of the most significant set bit, 0 for none.
+fn aFindLeft(a: u64) u64 {
+    return if (a == 0) 0 else 64 - @as(u64, @clz(a));
+}
+/// 1-based index of the least significant set bit, 0 for none.
+fn aFindRight(a: u64) u64 {
+    return if (a == 0) 0 else @as(u64, @ctz(a)) + 1;
+}
 
 const un_table = [_]UnOp{
     .{ .code = 0x80, .has_target = true, .apply = aNot }, // Not
+    .{ .code = 0x81, .has_target = true, .apply = aFindLeft }, // FindSetLeftBit
+    .{ .code = 0x82, .has_target = true, .apply = aFindRight }, // FindSetRightBit
     .{ .code = 0x92, .has_target = false, .apply = aLNot }, // LNot (also prefixes LGE/LLE/LNE)
 };
 
@@ -1447,6 +1480,32 @@ fn skipSuperName(r: *Reader) bool {
 fn evalExtTerm(r: *Reader, st: *ExecState) ?Value {
     const ext = r.peek(1) orelse return null;
     switch (ext) {
+        0x12 => { // CondRefOfOp SuperName Target
+            _ = r.next(); // 0x5B
+            _ = r.next(); // 0x12
+            // Ones, with a reference stored to Target, when the object exists;
+            // Zero with Target untouched otherwise. Firmware guards optional
+            // objects with it, and `CondRefOf (\_OSI, Local0)` is how it asks
+            // whether the OS has _OSI at all — answered by name, as evalNameRef
+            // intercepts _OSI.
+            const lead = r.peek(0) orelse return null;
+            var ref: ?Value = null;
+            if (isNameLead(lead)) {
+                const ns = readNameString(r) orelse return null;
+                if (ns.nsegs > 0 and std.mem.eql(u8, &ns.segs[ns.nsegs - 1], "_OSI")) {
+                    ref = Value.uninit;
+                } else if (resolve(st.scope, ns)) |n| {
+                    ref = Value{ .ref = .{ .node = nodeIndexOf(n) } };
+                }
+            } else {
+                const v = evalTermArg(r, st) orelse return null; // Local/Arg
+                if (v != .uninit) ref = v;
+            }
+            if (ref) |rv| {
+                if (!storeTarget(r, st, rv)) return null;
+            } else if (!skipTarget(r, st.scope, 0)) return null;
+            return .{ .integer = boolVal(ref != null) };
+        },
         0x23 => { // AcquireOp SuperName WordData(timeout)
             _ = r.next(); // 0x5B (ExtOpPrefix)
             _ = r.next(); // 0x23 (AcquireOp)
@@ -1468,7 +1527,7 @@ fn evalExtTerm(r: *Reader, st: *ExecState) ?Value {
             const bit_index = toInt(evalTermArg(r, st) orelse return null);
             const num_bits = toInt(evalTermArg(r, st) orelse return null);
             const ns = readNameString(r) orelse return null;
-            return bindBufferField(st, ns, src, @intCast(bit_index & 0xFFFF_FFFF), @intCast(num_bits & 0xFFFF_FFFF));
+            return bindBufferField(st, ns, src, bit_index, num_bits);
         },
         0x21, 0x22 => { // Stall(usec) / Sleep(msec): real, bounded delays.
             _ = r.next(); // 0x5B
@@ -1740,6 +1799,7 @@ fn evalTermArg(r: *Reader, st: *ExecState) ?Value {
         0x71 => return evalRefOf(r, st), // RefOf → reference
         0x8A, 0x8B, 0x8C, 0x8D, 0x8F => return evalCreateField(r, st, op), // CreateDWord/Word/Byte/Bit/QWordField
         0x73 => return evalConcat(r, st), // Concatenate
+        0x84 => return evalConcatRes(r, st), // ConcatenateResTemplate
         0x89 => return evalMatch(r, st), // Match
         0x96 => return evalToBuffer(r, st), // ToBuffer
         0x99 => return evalToInteger(r, st), // ToInteger
@@ -1832,6 +1892,39 @@ fn bufFieldWriteWide(buf: []u8, bit_off: u32, bit_width: u32, src: []const u8) v
     }
 }
 
+/// A Name's current value. A Buffer or Package (with any buffers nested in it)
+/// is copied into the arenas on first access and cached as the runtime value,
+/// so a write through Index()/CreateField is what every later read in the same
+/// evaluation sees — `Store(x, Index(PBIF, 1)); Return(PBIF)` is how firmware
+/// fills _BIF/_BST. (Dropped again by the next arenaReset.)
+fn nameValue(node: *StoredNode) Value {
+    if (node.has_runtime) return node.runtime_val;
+    var rr = Reader{ .buf = bodyOf(node), .pos = node.val_off };
+    const v = evalData(&rr) orelse return .uninit;
+    switch (v) {
+        .buffer, .package => {
+            node.runtime_val = materializeValue(v);
+            node.has_runtime = true;
+            return node.runtime_val;
+        },
+        else => return v,
+    }
+}
+
+/// Copy a value's table-literal buffers into the byte arena, through nested
+/// packages (whose element slices are already arena-backed), so all of it is
+/// writable. A buffer the arena can't hold stays read-only.
+fn materializeValue(v: Value) Value {
+    switch (v) {
+        .buffer => |b| return .{ .buffer = materializeBuf(b) orelse return v },
+        .package => |p| {
+            for (p) |*e| e.* = materializeValue(e.*);
+            return v;
+        },
+        else => return v,
+    }
+}
+
 /// Read the value a reference points at (DerefOf / auto-deref).
 fn readThroughRef(rf: Ref) Value {
     switch (rf) {
@@ -1842,10 +1935,7 @@ fn readThroughRef(rf: Ref) Value {
             if (ni >= nnodes) return .uninit;
             const n = &nodes[ni];
             return switch (n.kind) {
-                .name => if (n.has_runtime) n.runtime_val else blk: {
-                    var rr = Reader{ .buf = bodyOf(n), .pos = n.val_off };
-                    break :blk (evalData(&rr) orelse .uninit);
-                },
+                .name => nameValue(n),
                 .field => .{ .integer = readField(n) orelse 0 },
                 else => .uninit,
             };
@@ -2066,16 +2156,21 @@ fn createDynNode(scope: []const u8, ns: NameString) ?*StoredNode {
 
 /// Bind `ns` as a buffer-field window [bit_off, bit_off+bit_width) over `src`'s
 /// bytes (materialized into the byte arena so writes alias the source object).
-fn bindBufferField(st: *ExecState, ns: NameString, src: Value, bit_off: u32, bit_width: u32) ?Value {
+/// A window that doesn't fit the buffer is an error — null stops the method, as
+/// ACPICA's AE_AML_BUFFER_LIMIT does. The index is firmware data (an EC or GNVS
+/// read can be all-ones), so it is checked in u64 before anything narrows it.
+fn bindBufferField(st: *ExecState, ns: NameString, src: Value, bit_off: u64, bit_width: u64) ?Value {
     const buf: []u8 = switch (derefValue(src)) {
         .buffer => |b| materializeBuf(b) orelse return .uninit,
         else => return .uninit, // CreateField over a non-buffer: ignore (lenient)
     };
+    const buf_bits = @as(u64, buf.len) * 8;
+    if (bit_width == 0 or bit_off > buf_bits or bit_width > buf_bits - bit_off) return null;
     const node = createDynNode(st.scope, ns) orelse return .uninit;
     node.kind = .name;
     node.is_buffer_field = true;
     node.has_runtime = true;
-    node.runtime_val = .{ .ref = .{ .buf_field = .{ .buf = buf, .bit_off = bit_off, .bit_width = bit_width } } };
+    node.runtime_val = .{ .ref = .{ .buf_field = .{ .buf = buf, .bit_off = @intCast(bit_off), .bit_width = @intCast(bit_width) } } };
     return .uninit;
 }
 
@@ -2095,7 +2190,7 @@ fn evalCreateField(r: *Reader, st: *ExecState, op: u8) ?Value {
         0x8F => 64, // CreateQWordField
         else => 8,
     };
-    const bit_off: u32 = if (op == 0x8D) @intCast(index) else @intCast(index *% 8);
+    const bit_off: u64 = if (op == 0x8D) index else index *| 8;
     return bindBufferField(st, ns, src, bit_off, bits);
 }
 
@@ -2188,6 +2283,42 @@ fn evalConcat(r: *Reader, st: *ExecState) ?Value {
     const a = derefValue(evalTermArg(r, st) orelse return null);
     const b = derefValue(evalTermArg(r, st) orelse return null);
     const res = concatValues(a, b) orelse Value.uninit;
+    if (!storeTarget(r, st, res)) return null;
+    return res;
+}
+
+/// Offset of a resource template's End Tag (small item type 0xF), or its length
+/// if it has none. Walks the descriptors: 0x79 can occur as data.
+fn resEndTagOffset(b: []const u8) usize {
+    var i: usize = 0;
+    while (i < b.len) {
+        const tag = b[i];
+        if (tag & 0x80 == 0) {
+            if ((tag >> 3) & 0x0F == 0x0F) return i;
+            i += 1 + (tag & 0x07);
+        } else {
+            if (i + 3 > b.len) return b.len;
+            i += 3 + (@as(usize, b[i + 1]) | (@as(usize, b[i + 2]) << 8));
+        }
+    }
+    return b.len;
+}
+
+/// ConcatenateResTemplate(a, b, Target): a's descriptors, then b's, closed by a
+/// single End Tag with checksum 0 ("not computed", ACPI 6.4 §6.4.2.9). Real
+/// _CRS methods build their result this way (an AMI board has nine).
+fn evalConcatRes(r: *Reader, st: *ExecState) ?Value {
+    _ = r.next(); // 0x84 ConcatResOp
+    const a = toBufferBytes(evalTermArg(r, st) orelse return null);
+    const b = toBufferBytes(evalTermArg(r, st) orelse return null);
+    const al = resEndTagOffset(a);
+    const bl = resEndTagOffset(b);
+    const out = bufAlloc(al + bl + 2) orelse return null;
+    @memcpy(out[0..al], a[0..al]);
+    @memcpy(out[al..][0..bl], b[0..bl]);
+    out[al + bl] = 0x79;
+    out[al + bl + 1] = 0;
+    const res = Value{ .buffer = out };
     if (!storeTarget(r, st, res)) return null;
     return res;
 }
@@ -2511,21 +2642,7 @@ fn evalNameRef(r: *Reader, st: *ExecState) ?Value {
             // A CreateField window auto-derefs: reading the name yields the
             // value of the bits it covers, not the reference object itself.
             if (node.is_buffer_field and node.has_runtime) return readThroughRef(node.runtime_val.ref);
-            if (node.has_runtime) return node.runtime_val;
-            var rr = Reader{ .buf = bodyOf(node), .pos = node.val_off };
-            var v = evalData(&rr) orelse .uninit;
-            // A buffer-valued Name materializes into the byte arena on first
-            // access and caches the arena copy as its runtime value — so a later
-            // Index()/CreateField over this Name aliases the SAME storage and
-            // writes persist. (Invalidated at the next arenaReset.)
-            if (v == .buffer) {
-                if (materializeBuf(v.buffer)) |mb| {
-                    v = .{ .buffer = mb };
-                    node.runtime_val = v;
-                    node.has_runtime = true;
-                }
-            }
-            return v;
+            return nameValue(node);
         },
         .field => { // B2c/A4: read the backing hardware
             if (node.field_bit_width > 64) return readFieldBuffer(node) orelse .uninit;
@@ -2704,6 +2821,14 @@ fn execTermList(r: *Reader, end: usize, st: *ExecState) void {
     }
 }
 
+/// A condition the interpreter can't evaluate leaves no faithful way on: either
+/// branch would be one the firmware didn't choose (an If skipped this way used
+/// to run its Else). Stop the method, as for any other unmodeled term.
+fn abortOnCondition(st: *ExecState, what: []const u8) void {
+    debug.klog("[aml] {s}: {s} condition not evaluable — method stopped\n", .{ st.scope, what });
+    st.returned = true;
+}
+
 fn execIf(r: *Reader, st: *ExecState) void {
     const start = r.pos;
     _ = r.next(); // IfOp
@@ -2712,8 +2837,8 @@ fn execIf(r: *Reader, st: *ExecState) void {
         return;
     };
     const pred = evalTermArg(r, st) orelse {
+        abortOnCondition(st, "If");
         r.pos = pkg_end;
-        st.last_if_taken = false;
         return;
     };
     if (toBool(pred)) {
@@ -2748,7 +2873,10 @@ fn execWhile(r: *Reader, st: *ExecState) void {
     var iters: u32 = 0;
     while (iters < MAX_LOOP_ITERS) : (iters += 1) {
         r.pos = cond_start;
-        const pred = evalTermArg(r, st) orelse break;
+        const pred = evalTermArg(r, st) orelse {
+            abortOnCondition(st, "While");
+            break;
+        };
         if (!toBool(pred)) break;
         execTermList(r, pkg_end, st);
         if (st.returned) return;
@@ -2822,16 +2950,17 @@ fn execField(r: *Reader, st: *ExecState) void {
         r.pos = pkg_end;
         return;
     };
-    execParseFieldList(r, pkg_end, st.scope, region_idx, flags & 0x0F);
+    execParseFieldList(r, pkg_end, st.scope, region_idx, flags);
     r.pos = pkg_end;
 }
 
 /// FieldList parse for exec-time Field — mirrors parseFieldList but registers each
 /// NamedField via createDynNode in `scope` (the method's path) instead of the
 /// load-time store. Tracks the running bit offset + current AccessType.
-fn execParseFieldList(r: *Reader, end: usize, scope: []const u8, region_idx: i32, access0: u8) void {
+fn execParseFieldList(r: *Reader, end: usize, scope: []const u8, region_idx: i32, flags: u8) void {
     var bit_off: u32 = 0;
-    var access = access0;
+    var access = flags & 0x0F;
+    const update = (flags >> 5) & 0x03;
     while (r.pos < end) {
         const lead = r.peek(0) orelse return;
         switch (lead) {
@@ -2872,6 +3001,7 @@ fn execParseFieldList(r: *Reader, end: usize, scope: []const u8, region_idx: i32
                     node.field_bit_off = bit_off;
                     node.field_bit_width = width;
                     node.field_access = access;
+                    node.field_update = update;
                     node.is_buffer_field = false;
                     node.has_runtime = false;
                 }
@@ -3425,10 +3555,12 @@ fn stWideFieldTest(fails: *u32) void {
 /// Proves an unmodeled space routes through a registered handler for both read
 /// and write — the exact plug-in point a real EmbeddedControl driver will use.
 var st_fake_space: [8]u8 = [_]u8{0} ** 8;
+var st_fake_reads: u32 = 0; // lets stUpdateRuleTest see whether a write read first
 
 fn stFakeSpaceRead(space: u8, off: u64, width: u32) ?u64 {
     _ = space;
     if (width != 1 or off >= st_fake_space.len) return null;
+    st_fake_reads += 1;
     return st_fake_space[@intCast(off)];
 }
 
@@ -4155,7 +4287,204 @@ pub fn selfTestExtended() u32 {
     stWalkScopeTest(&fails);
     stDeferredRegionTest(&fails);
 
+    // Real-firmware evaluation: bridges, Name state, CondRefOf, bounds, UpdateRule.
+    stPciBridgeTest(&fails);
+    stNameValueTest(&fails);
+    stCondRefOfTest(&fails);
+    stCreateFieldBoundsTest(&fails);
+    stUpdateRuleTest(&fails);
+    stOpcodeGapTest(&fails);
+
     return fails;
+}
+
+/// stPciBridgeTest's config space: a PCI-to-PCI bridge at 0:1C.0 with secondary
+/// bus 2; nothing else is present.
+fn stPciCfgSim(b: Bdf, off: u16) u32 {
+    if (b.bus != 0 or b.dev != 0x1C or b.func != 0) return 0xFFFF_FFFF;
+    return switch (off) {
+        0x00 => 0xA110_8086, // vendor/device
+        0x0C => 0x0001_0000, // header type 1: PCI-to-PCI bridge
+        0x18 => 0x0002_0200, // primary 0, secondary 2, subordinate 2
+        else => 0,
+    };
+}
+
+/// A PCI_Config region in a device behind a root port must address the port's
+/// secondary bus, and one behind an absent port must be refused — both used to
+/// land on bus 0, i.e. on the host bridge for a device with _ADR 0.
+///   Device(PCI0) { Name(_BBN, 0)
+///     Device(RP01) { Name(_ADR, 0x001C0000)
+///       Device(PXSX) { Name(_ADR, 0) OperationRegion(FLDR, PCI_Config, 0x44, 4) } }
+///     Device(RP02) { Name(_ADR, 0x001C0001)
+///       Device(PXSX) { Name(_ADR, 0) OperationRegion(FLD2, PCI_Config, 0x44, 4) } } }
+fn stPciBridgeTest(fails: *u32) void {
+    tNsReset();
+    _ = walkBody(&[_]u8{
+        0x5B, 0x82, 0x4E, 0x05, 'P', 'C', 'I', '0', // Device(PCI0), PkgLength 94
+        0x08, '_', 'B', 'B', 'N', 0x00,
+        0x5B, 0x82, 0x27, 'R', 'P', '0', '1',
+        0x08, '_', 'A', 'D', 'R', 0x0C, 0x00, 0x00, 0x1C, 0x00,
+        0x5B, 0x82, 0x16, 'P', 'X', 'S', 'X',
+        0x08, '_', 'A', 'D', 'R', 0x00,
+        0x5B, 0x80, 'F', 'L', 'D', 'R', 0x02, 0x0A, 0x44, 0x0A, 0x04,
+        0x5B, 0x82, 0x27, 'R', 'P', '0', '2',
+        0x08, '_', 'A', 'D', 'R', 0x0C, 0x01, 0x00, 0x1C, 0x00,
+        0x5B, 0x82, 0x16, 'P', 'X', 'S', 'X',
+        0x08, '_', 'A', 'D', 'R', 0x00,
+        0x5B, 0x80, 'F', 'L', 'D', '2', 0x02, 0x0A, 0x44, 0x0A, 0x04,
+    });
+    static_nnodes = nnodes;
+    pci_cfg_sim = &stPciCfgSim;
+    defer pci_cfg_sim = null;
+    const b = if (findExact("\\PCI0.RP01.PXSX.FLDR")) |n| pciBdf(n) else null;
+    stCheck("PCI bridge: secondary bus", if (b) |x| x.bus else 0xFF, 2, fails);
+    stCheck("PCI bridge: dev/func", if (b) |x| (@as(u64, x.dev) << 8) | x.func else 0xFFFF, 0, fails);
+    const fld2 = findExact("\\PCI0.RP02.PXSX.FLD2");
+    stCheck("PCI bridge: absent bridge refused", b2i(fld2 != null and pciBdf(fld2.?) == null), 1, fails);
+}
+
+/// Name state within one evaluation, and what survives the arena reset:
+///   Name(PKG_, Package(2){1, 2})          Index write, read back by name
+///   Name(PKB_, Package(1){Buffer(2){1,2}}) write into a buffer nested in it
+///   Name(BUF_, Buffer(0x10){0xAA})        declared size beyond the initializer
+///   Name(STR_, Zero)  Method(SETS) { Store(ToHexString(0xABCD), STR_) }
+///   Name(STL_, "AB")  Method(SETL) { Store("CD", STL_) }
+fn stNameValueTest(fails: *u32) void {
+    tNsReset();
+    _ = walkBody(&[_]u8{
+        0x08, 'P', 'K', 'G', '_', 0x12, 0x05, 0x02, 0x01, 0x0A, 0x02,
+        0x14, 0x19, 'T', 'P', 'K', '_', 0x00, // Method(TPK_)
+        0x70, 0x0A, 0x55, 0x88, 'P', 'K', 'G', '_', 0x01, 0x00, // Store(0x55, Index(PKG_, 1))
+        0xA4, 0x83, 0x88, 'P', 'K', 'G', '_', 0x01, 0x00, // Return(DerefOf(Index(PKG_, 1)))
+        0x08, 'P', 'K', 'B', '_', 0x12, 0x08, 0x01, 0x11, 0x05, 0x0A, 0x02, 0x01, 0x02,
+        0x14, 0x21, 'T', 'P', 'B', '_', 0x00, // Method(TPB_)
+        0x70, 0x0A, 0x09, 0x88, 0x83, 0x88, 'P', 'K', 'B', '_', 0x00, 0x00, 0x01, 0x00, // Store(9, Index(DerefOf(Index(PKB_,0)),1))
+        0xA4, 0x83, 0x88, 0x83, 0x88, 'P', 'K', 'B', '_', 0x00, 0x00, 0x01, 0x00, // Return(that byte)
+        0x08, 'B', 'U', 'F', '_', 0x11, 0x04, 0x0A, 0x10, 0xAA,
+        0x14, 0x0C, 'T', 'S', 'B', '_', 0x00, 0xA4, 0x87, 'B', 'U', 'F', '_', // Return(SizeOf(BUF_))
+        0x14, 0x0F, 'T', 'S', 'I', '_', 0x00, 0xA4, 0x83, 0x88, 'B', 'U', 'F', '_', 0x00, 0x00, // Return(BUF_[0])
+        0x08, 'S', 'T', 'R', '_', 0x00,
+        0x14, 0x10, 'S', 'E', 'T', 'S', 0x00, 0x70, 0x98, 0x0B, 0xCD, 0xAB, 0x00, 'S', 'T', 'R', '_',
+        0x08, 'S', 'T', 'L', '_', 0x0D, 'A', 'B', 0x00,
+        0x14, 0x0F, 'S', 'E', 'T', 'L', 0x00, 0x70, 0x0D, 'C', 'D', 0x00, 'S', 'T', 'L', '_',
+    });
+    static_nnodes = nnodes;
+    stCheck("Name Package: Index write persists", toInt(evalMethod("\\TPK_") orelse .uninit), 0x55, fails);
+    stCheck("Name Package: nested Buffer write", toInt(evalMethod("\\TPB_") orelse .uninit), 0x09, fails);
+    stCheck("Name Buffer(0x10){0xAA}: size", toInt(evalMethod("\\TSB_") orelse .uninit), 16, fails);
+    stCheck("Name Buffer(0x10){0xAA}: init byte", toInt(evalMethod("\\TSI_") orelse .uninit), 0xAA, fails);
+    _ = evalMethod("\\SETS");
+    _ = evalMethod("\\SETL");
+    arenaReset();
+    const str = findExact("\\STR_");
+    stCheck("arena string dropped at reset", b2i(str != null and !str.?.has_runtime), 1, fails);
+    const stl = findExact("\\STL_");
+    stCheck("table string kept at reset", b2i(stl != null and stl.?.has_runtime and stl.?.runtime_val == .string), 1, fails);
+}
+
+/// CondRefOf on a present object, a missing one and \_OSI; the OS-provided
+/// \_REV/\_OS_; and an If whose condition can't be evaluated (0x5B 0xFE is no
+/// opcode) stopping the method instead of running its Else.
+fn stCondRefOfTest(fails: *u32) void {
+    tNsReset();
+    addOsObjects();
+    _ = walkBody(&[_]u8{
+        0x08, 'X',  'X',  'X',  'X',  0x0A, 0x05, // Name(XXXX, 5)
+        0x14, 0x16, 'T',  'C',  'R',  '_',  0x00,
+        0xA0, 0x0A, 0x5B, 0x12, 'X',  'X',  'X',  'X', 0x00, 0xA4, 0x01, // If (CondRefOf(XXXX)) { Return(1) }
+        0xA1, 0x04, 0xA4, 0x0A, 0x02, // Else { Return(2) }
+        0x14, 0x16, 'T',  'C',  'M',  '_',  0x00,
+        0xA0, 0x0A, 0x5B, 0x12, 'N',  'O',  'N',  'E', 0x00, 0xA4, 0x01, // If (CondRefOf(NONE)) { Return(1) }
+        0xA1, 0x04, 0xA4, 0x0A, 0x02, // Else { Return(2) }
+        0x14, 0x15, 'T',  'C',  'O',  '_',  0x00,
+        0xA0, 0x0B, 0x5B, 0x12, 0x5C, '_',  'O',  'S', 'I', 0x60, 0xA4, 0x01, // If (CondRefOf(\_OSI, Local0)) { Return(1) }
+        0xA4, 0x0A, 0x02, // Return(2)
+        0x14, 0x14, 'T',  'I',  'A',  '_',  0x00,
+        0xA0, 0x05, 0x5B, 0xFE, 0xA4, 0x01, // If (<unknown>) { Return(1) }
+        0xA1, 0x04, 0xA4, 0x0A, 0x02, // Else { Return(2) }
+        0xA4, 0x0A, 0x03, // Return(3)
+    });
+    static_nnodes = nnodes;
+    stCheck("CondRefOf present", toInt(evalMethod("\\TCR_") orelse .uninit), 1, fails);
+    stCheck("CondRefOf missing", toInt(evalMethod("\\TCM_") orelse .uninit), 2, fails);
+    stCheck("CondRefOf \\_OSI", toInt(evalMethod("\\TCO_") orelse .uninit), 1, fails);
+    stCheck("If on an unevaluable condition stops", toInt(evalMethod("\\TIA_") orelse .uninit), 0, fails);
+    stCheck("\\_REV", toInt(runProgKeepNs(&[_]u8{ 0xA4, 0x5C, '_', 'R', 'E', 'V' })), 2, fails);
+    stCheck("SizeOf(\\_OS_)", toInt(runProgKeepNs(&[_]u8{ 0xA4, 0x87, 0x5C, '_', 'O', 'S', '_' })), 20, fails);
+}
+
+/// CreateField windows are checked against their buffer in u64: an index of
+/// Ones used to trap an integer cast (a kernel panic from firmware data).
+fn stCreateFieldBoundsTest(fails: *u32) void {
+    stCheck("CreateByteField(Ones) stops the method", toInt(runProg(&[_]u8{
+        0x70, 0x11, 0x03, 0x0A, 0x04, 0x60, // Store(Buffer(4){}, Local0)
+        0x8C, 0x60, 0xFF, 'B', 'F', '_', '_', // CreateByteField(Local0, Ones, BF__)
+        0xA4, 0x0A, 0x77, // Return(0x77) — not reached
+    })), 0, fails);
+    stCheck("CreateField at the buffer's end", toInt(runProg(&[_]u8{
+        0x70, 0x11, 0x03, 0x0A, 0x04, 0x60, // Store(Buffer(4){}, Local0)
+        0x5B, 0x13, 0x60, 0x0A, 0x1E, 0x0A, 0x02, 'C', 'F', '_', '_', // CreateField(Local0, 30, 2, CF__)
+        0x70, 0x0A, 0x03, 'C', 'F', '_', '_', // Store(3, CF__)
+        0xA4, 0x83, 0x88, 0x60, 0x0A, 0x03, 0x00, // Return(DerefOf(Index(Local0, 3)))
+    })), 0xC0, fails);
+    stCheck("CreateField one bit past the end", toInt(runProg(&[_]u8{
+        0x70, 0x11, 0x03, 0x0A, 0x04, 0x60,
+        0x5B, 0x13, 0x60, 0x0A, 0x1F, 0x0A, 0x02, 'C', 'G', '_', '_', // CreateField(Local0, 31, 2, CG__)
+        0xA4, 0x0A, 0x77,
+    })), 0, fails);
+}
+
+/// Field UpdateRule over the fake 0x7E space, which counts reads:
+///   OperationRegion(FKRG, 0x7E, 0, 8)
+///   Field(FKRG, ByteAcc, NoLock, WriteAsZeros) { B0__,1, B1__,7, FULL,8 }
+///   Field(FKRG, ByteAcc, NoLock, WriteAsOnes)  { Offset(2), W1__,1, W7__,7 }
+fn stUpdateRuleTest(fails: *u32) void {
+    tNsReset();
+    if (!registerRegionHandler(0x7E, .{ .read = &stFakeSpaceRead, .write = &stFakeSpaceWrite })) {
+        stCheck("UpdateRule handler register", 0, 1, fails);
+        return;
+    }
+    _ = walkBody(&[_]u8{
+        0x5B, 0x80, 'F',  'K',  'R',  'G', 0x7E, 0x00, 0x0A, 0x08,
+        0x5B, 0x81, 0x15, 'F',  'K',  'R', 'G',  0x41, 'B',  '0', '_', '_', 0x01, 'B', '1', '_', '_', 0x07, 'F', 'U', 'L', 'L', 0x08,
+        0x5B, 0x81, 0x12, 'F',  'K',  'R', 'G',  0x21, 0x00, 0x10, 'W', '1', '_', '_', 0x01, 'W', '7', '_', '_', 0x07,
+        0x14, 0x0C, 'T',  'W',  'Z',  '_', 0x00, 0x70, 0x01, 'B', '0', '_', '_', // Store(One, B0__)
+        0x14, 0x0D, 'T',  'F',  'U',  '_', 0x00, 0x70, 0x0A, 0x5A, 'F', 'U', 'L', 'L', // Store(0x5A, FULL)
+        0x14, 0x0C, 'T',  'W',  'O',  '_', 0x00, 0x70, 0x00, 'W', '1', '_', '_', // Store(Zero, W1__)
+    });
+    static_nnodes = nnodes;
+    @memset(&st_fake_space, 0);
+    st_fake_space[0] = 0xFE;
+    st_fake_reads = 0;
+    _ = evalMethod("\\TWZ_");
+    stCheck("WriteAsZeros: neighbours written 0", st_fake_space[0], 0x01, fails);
+    stCheck("WriteAsZeros: no read", st_fake_reads, 0, fails);
+    st_fake_reads = 0;
+    _ = evalMethod("\\TFU_");
+    stCheck("whole-unit write: value", st_fake_space[1], 0x5A, fails);
+    stCheck("whole-unit write: no read", st_fake_reads, 0, fails);
+    _ = evalMethod("\\TWO_");
+    stCheck("WriteAsOnes: neighbours written 1", st_fake_space[2], 0xFE, fails);
+}
+
+/// Opcodes real firmware uses that the interpreter used to stop on.
+fn stOpcodeGapTest(fails: *u32) void {
+    // ConcatenateResTemplate(IRQ{0}, IRQ{1}, Local0): two IRQ descriptors, one End Tag.
+    const concat = [_]u8{
+        0x84,
+        0x11, 0x08, 0x0A, 0x05, 0x22, 0x01, 0x00, 0x79, 0x00,
+        0x11, 0x08, 0x0A, 0x05, 0x22, 0x02, 0x00, 0x79, 0x00,
+        0x60,
+    };
+    stCheck("ConcatenateResTemplate size", toInt(runProg(&(concat ++ [_]u8{ 0xA4, 0x87, 0x60 }))), 8, fails);
+    stCheck("ConcatenateResTemplate 2nd descriptor", toInt(runProg(&(concat ++ [_]u8{ 0xA4, 0x83, 0x88, 0x60, 0x0A, 0x03, 0x00 }))), 0x22, fails);
+    stCheck("ConcatenateResTemplate End Tag", toInt(runProg(&(concat ++ [_]u8{ 0xA4, 0x83, 0x88, 0x60, 0x0A, 0x06, 0x00 }))), 0x79, fails);
+    stCheck("FindSetLeftBit(0x10)", toInt(runProg(&[_]u8{ 0xA4, 0x81, 0x0A, 0x10, 0x00 })), 5, fails);
+    stCheck("FindSetRightBit(0x18)", toInt(runProg(&[_]u8{ 0xA4, 0x82, 0x0A, 0x18, 0x00 })), 4, fails);
+    stCheck("NAnd(0xF0, 0x3C) & 0xFF", toInt(runProg(&[_]u8{ 0xA4, 0x7B, 0x7C, 0x0A, 0xF0, 0x0A, 0x3C, 0x00, 0x0A, 0xFF, 0x00 })), 0xCF, fails);
+    stCheck("NOr(0xF0, 0x0C) & 0xFF", toInt(runProg(&[_]u8{ 0xA4, 0x7B, 0x7E, 0x0A, 0xF0, 0x0A, 0x0C, 0x00, 0x0A, 0xFF, 0x00 })), 0x03, fails);
+    stCheck("Buffer as Integer", toInt(runProg(&[_]u8{ 0xA4, 0x72, 0x11, 0x05, 0x0A, 0x02, 0x34, 0x12, 0x00, 0x00 })), 0x1234, fails);
 }
 
 /// Declarations real AMI firmware makes that QEMU's DSDT never does: a '^' name
@@ -4246,10 +4575,12 @@ fn nodeIndexOf(n: *StoredNode) usize {
 }
 
 /// Parse a FieldList in [r.pos, end), creating a .field node per NamedField in
-/// `path`, tracking the running bit offset and the current AccessType.
-fn parseFieldList(r: *Reader, end: usize, path: *const PathBuf, region_idx: i32, access0: u8, depth: u8) void {
+/// `path`, tracking the running bit offset and the current AccessType. `flags`
+/// is the Field's FieldFlags byte (AccessType 3:0, UpdateRule 6:5).
+fn parseFieldList(r: *Reader, end: usize, path: *const PathBuf, region_idx: i32, flags: u8, depth: u8) void {
     var bit_off: u32 = 0;
-    var access = access0;
+    var access = flags & 0x0F;
+    const update = (flags >> 5) & 0x03;
     while (r.pos < end) {
         const lead = r.peek(0) orelse return;
         switch (lead) {
@@ -4290,6 +4621,7 @@ fn parseFieldList(r: *Reader, end: usize, path: *const PathBuf, region_idx: i32,
                     .field_bit_off = bit_off,
                     .field_bit_width = width,
                     .field_access = access,
+                    .field_update = update,
                 });
                 bit_off +%= width;
             },
@@ -4316,15 +4648,13 @@ fn physMapped(phys: u64, len: u64) bool {
 // === Slice J: PCI_Config OperationRegion access ============================
 // A PCI_Config region addresses the configuration space of the device named by
 // the enclosing namespace scope: the byte offset is region_off + the field's bit
-// offset, and the device's bus/dev/func come from the nearest ancestor _ADR
-// (high16 = device, low16 = function) and _BBN (base bus number, default 0).
-// Backed by the legacy mechanism-#1 CF8/CFC config ports — port I/O is the `io`
-// surface the native harness already stubs, so aml.zig stays a leaf module.
-// Honest scope limits: standard 256-byte config space only (no ECAM/extended),
-// and a device sitting under its host bridge — nested PCI-PCI bridge secondary-bus
-// chasing is not done (QEMU's DSDT PCI_Config fields all live under the root
-// bridge). config reads are side-effect-free per spec, so the boot liveness probe
-// is safe to run unconditionally.
+// offset, the device/function come from that device's _ADR (high16 = device,
+// low16 = function) and the bus from walking PCI-to-PCI bridges down from the
+// host bridge's _BBN (regionBdf). Backed by the legacy mechanism-#1 CF8/CFC
+// config ports — port I/O is the `io` surface the native harness already stubs,
+// so aml.zig stays a leaf module. Standard 256-byte config space only (no
+// ECAM/extended). Config reads are side-effect-free per spec, so the boot
+// liveness probe is safe to run unconditionally.
 
 const PCI_CFG_ADDR: u16 = 0xCF8;
 const PCI_CFG_DATA: u16 = 0xCFC;
@@ -4347,7 +4677,12 @@ fn pciCfgAddr(b: Bdf, off: u16) u32 {
         (@as(u32, off) & 0xFC);
 }
 
+/// Stand-in config space for stPciBridgeTest, which needs a bridge QEMU's q35
+/// doesn't have. Set only for the duration of that test; writes are dropped.
+var pci_cfg_sim: ?*const fn (b: Bdf, off: u16) u32 = null;
+
 fn pciCfgReadDword(b: Bdf, off: u16) u32 {
+    if (pci_cfg_sim) |f| return f(b, off & 0xFC);
     io.outl(PCI_CFG_ADDR, pciCfgAddr(b, off));
     return io.inl(PCI_CFG_DATA);
 }
@@ -4383,6 +4718,7 @@ fn pciCfgRead(b: Bdf, co: u64, width: u32) ?u64 {
 /// engine's own RMW so a byte field never clobbers its dword's other three bytes.
 fn pciCfgWrite(b: Bdf, co: u64, width: u32, val: u64) bool {
     if (co > 0xFF) return false;
+    if (pci_cfg_sim != null) return true;
     switch (width) {
         4 => {
             io.outl(PCI_CFG_ADDR, pciCfgAddr(b, @intCast(co & 0xFC)));
@@ -4418,46 +4754,118 @@ fn parentScope(path: []const u8) []const u8 {
     return path[0..0];
 }
 
-/// Resolve a PCI_Config region's bus/dev/func by walking ancestor scopes: the
-/// nearest _ADR gives device/function, the nearest _BBN gives the bus (default 0).
-/// Side-effect-free in practice (_ADR/_BBN are constant Names), and run once at
-/// load time so the hot field path only reads the cached value.
-fn regionBdf(region: *const StoredNode) Bdf {
-    var b = Bdf{};
-    var have_adr = false;
-    var have_bbn = false;
-    var cur = parentScope(region.path[0..region.path_len]);
-    var guard: u32 = 0;
-    while (cur.len > 0 and guard < 24) : (guard += 1) {
-        if (!have_adr) {
-            if (evalDeviceChild(cur, "_ADR")) |v| if (v == .integer) {
-                b.dev = @intCast((v.integer >> 16) & 0x1F);
-                b.func = @intCast(v.integer & 0x07);
-                have_adr = true;
-            };
-        }
-        if (!have_bbn) {
-            if (evalDeviceChild(cur, "_BBN")) |v| if (v == .integer) {
-                b.bus = @truncate(v.integer);
-                have_bbn = true;
-            };
-        }
-        if (have_adr and have_bbn) break;
-        cur = parentScope(cur);
-    }
-    return b;
+/// pci_bdf values that are not a packed BDF (which never exceeds 0xFF1F07).
+const PCI_BDF_UNRESOLVED: u32 = 0xFFFF_FFFF; // not looked up yet
+const PCI_BDF_NONE: u32 = 0xFFFF_FFFE; // no device behind this region
+
+/// PCI-to-PCI bridge levels regionBdf follows below the host bridge.
+const MAX_PCI_DEPTH = 8;
+
+/// `<dev>.<seg>` evaluated without resetting the arenas: BDF resolution can run
+/// in the middle of an evaluation (the first access of a method-local region).
+fn childValue(dev: []const u8, seg: []const u8) ?Value {
+    if (dev.len + 1 + seg.len > PATH_MAX) return null;
+    var buf: [PATH_MAX]u8 = undefined;
+    @memcpy(buf[0..dev.len], dev);
+    buf[dev.len] = '.';
+    @memcpy(buf[dev.len + 1 ..][0..seg.len], seg);
+    const n = findExact(buf[0 .. dev.len + 1 + seg.len]) orelse return null;
+    return switch (n.kind) {
+        .name => nameValue(n),
+        .method => callMethod(n, &.{}, 0),
+        else => null,
+    };
 }
 
-/// Resolve + cache the BDF of every PCI_Config OperationRegion. Call once after the
-/// namespace is fully walked (in load(), and after each synth walk in the harness)
-/// so field reads/writes never re-enter the evaluator mid-access.
+fn isPciRootId(v: Value) bool {
+    if (v == .package) {
+        for (v.package) |e| {
+            if (isPciRootId(e)) return true;
+        }
+        return false;
+    }
+    return idMatches(v, "PNP0A08") or idMatches(v, "PNP0A03");
+}
+
+fn isHostBridge(path: []const u8) bool {
+    if (childExists(path, "_BBN")) return true;
+    if (childValue(path, "_HID")) |v| if (isPciRootId(v)) return true;
+    if (childValue(path, "_CID")) |v| if (isPciRootId(v)) return true;
+    return false;
+}
+
+fn adrBdf(dev: []const u8, bus: u8) ?Bdf {
+    const v = childValue(dev, "_ADR") orelse return null;
+    if (v != .integer) return null;
+    return .{ .bus = bus, .dev = @intCast((v.integer >> 16) & 0x1F), .func = @intCast(v.integer & 0x07) };
+}
+
+/// The bus behind a PCI-to-PCI or CardBus bridge (config 0x19), or null if `b`
+/// is absent, not a bridge, or has no secondary bus assigned.
+fn secondaryBus(b: Bdf) ?u8 {
+    if (pciCfgReadDword(b, 0x00) & 0xFFFF == 0xFFFF) return null;
+    const hdr = (pciCfgReadDword(b, 0x0C) >> 16) & 0x7F;
+    if (hdr != 1 and hdr != 2) return null;
+    const sec: u8 = @truncate(pciCfgReadDword(b, 0x18) >> 8);
+    return if (sec == 0) null else sec;
+}
+
+/// A PCI_Config region's bus/dev/func (ACPI 6.4 §6.5.6; ACPICA's
+/// AcpiHwDerivePciId). The device is the nearest ancestor with _ADR. Every _ADR
+/// ancestor between it and the host bridge is a PCI-to-PCI bridge whose
+/// secondary bus is the bus of the level below, starting from the host's _BBN.
+/// Null when that chain doesn't hold — a level absent or not a bridge — so the
+/// region is refused rather than aimed at bus 0, where a root port's child
+/// would land on the host bridge itself.
+fn regionBdf(region: *const StoredNode) ?Bdf {
+    var chain: [MAX_PCI_DEPTH][]const u8 = undefined; // _ADR scopes, nearest first
+    var n: usize = 0;
+    var bus: u8 = 0;
+    var cur = parentScope(region.path[0..region.path_len]);
+    while (cur.len > 0) : (cur = parentScope(cur)) {
+        if (isHostBridge(cur)) {
+            if (childValue(cur, "_BBN")) |v| {
+                if (v == .integer) bus = @truncate(v.integer);
+            }
+            // A region on the host bridge itself addresses the bridge's own _ADR.
+            if (n == 0 and childExists(cur, "_ADR")) {
+                chain[0] = cur;
+                n = 1;
+            }
+            break;
+        }
+        if (childExists(cur, "_ADR")) {
+            if (n == chain.len) return null;
+            chain[n] = cur;
+            n += 1;
+        }
+    }
+    if (n == 0) return null;
+    var i = n;
+    while (i > 1) {
+        i -= 1;
+        bus = secondaryBus(adrBdf(chain[i], bus) orelse return null) orelse return null;
+    }
+    return adrBdf(chain[0], bus);
+}
+
+/// The region's BDF, resolved on first use and cached; null when there is no
+/// device behind it (every access then fails).
+fn pciBdf(region: *StoredNode) ?Bdf {
+    if (region.pci_bdf == PCI_BDF_UNRESOLVED) {
+        region.pci_bdf = PCI_BDF_NONE; // until resolved; also stops an _ADR that reads this region
+        if (regionBdf(region)) |b| region.pci_bdf = packBdf(b);
+    }
+    return if (region.pci_bdf == PCI_BDF_NONE) null else unpackBdf(region.pci_bdf);
+}
+
+/// Resolve every PCI_Config region now, so the boot log shows where each one
+/// points. Field access resolves lazily anyway (method-local regions included).
 fn resolvePciRegions() void {
     var i: usize = 0;
     while (i < nnodes) : (i += 1) {
         const n = &nodes[i];
-        if (n.kind == .op_region and n.region_space == SPACE_PCI) {
-            n.pci_bdf = packBdf(regionBdf(n));
-        }
+        if (n.kind == .op_region and n.region_space == SPACE_PCI) _ = pciBdf(n);
     }
 }
 
@@ -4477,7 +4885,10 @@ pub fn reportPciConfig() void {
         const n = &nodes[i];
         if (n.kind != .op_region or n.region_space != SPACE_PCI) continue;
         n_regions += 1;
-        const b = unpackBdf(n.pci_bdf);
+        const b = pciBdf(n) orelse {
+            debug.klog("[aml] PCI_Config region {s}: no device behind its bridge chain — disabled\n", .{n.path[0..n.path_len]});
+            continue;
+        };
         debug.klog("[aml] PCI_Config region {s} -> {d}:{d}.{d} off 0x{X} len 0x{X}\n", .{ n.path[0..n.path_len], b.bus, b.dev, b.func, n.region_off, n.region_len });
         // First field over this region — enough for an end-to-end liveness proof.
         var fj: usize = 0;
@@ -4584,10 +4995,12 @@ fn fieldRegion(field: *const StoredNode) ?*StoredNode {
 }
 
 /// Read one access-width unit (1/2/4/8 bytes) from a region at a byte offset.
-fn readRegionUnit(region: *const StoredNode, byte_off: u64, width: u32) ?u64 {
+/// Offsets add saturating: a region base comes from firmware data, and a sum
+/// past the end of any space must fail the bounds checks, not trap.
+fn readRegionUnit(region: *StoredNode, byte_off: u64, width: u32) ?u64 {
     switch (region.region_space) {
         SPACE_IO => {
-            const base = region.region_off + byte_off;
+            const base = region.region_off +| byte_off;
             if (base > 0xFFFF) return null;
             const port: u16 = @intCast(base);
             return switch (width) {
@@ -4599,7 +5012,7 @@ fn readRegionUnit(region: *const StoredNode, byte_off: u64, width: u32) ?u64 {
             };
         },
         SPACE_MEM => {
-            const phys = region.region_off + byte_off;
+            const phys = region.region_off +| byte_off;
             if (!physMapped(phys, width)) return null;
             const va = paging.physToVirt(phys);
             return switch (width) {
@@ -4610,19 +5023,19 @@ fn readRegionUnit(region: *const StoredNode, byte_off: u64, width: u32) ?u64 {
                 else => null,
             };
         },
-        SPACE_PCI => return pciCfgRead(unpackBdf(region.pci_bdf), region.region_off + byte_off, width),
+        SPACE_PCI => return pciCfgRead(pciBdf(region) orelse return null, region.region_off +| byte_off, width),
         else => {
             if (regionHandlerFor(region.region_space)) |h|
-                return h.read(region.region_space, region.region_off + byte_off, width);
+                return h.read(region.region_space, region.region_off +| byte_off, width);
             return null; // unhandled address space: degrade to uninit
         },
     }
 }
 
-fn writeRegionUnit(region: *const StoredNode, byte_off: u64, width: u32, val: u64) bool {
+fn writeRegionUnit(region: *StoredNode, byte_off: u64, width: u32, val: u64) bool {
     switch (region.region_space) {
         SPACE_IO => {
-            const base = region.region_off + byte_off;
+            const base = region.region_off +| byte_off;
             if (base > 0xFFFF) return false;
             const port: u16 = @intCast(base);
             switch (width) {
@@ -4638,7 +5051,7 @@ fn writeRegionUnit(region: *const StoredNode, byte_off: u64, width: u32, val: u6
             return true;
         },
         SPACE_MEM => {
-            const phys = region.region_off + byte_off;
+            const phys = region.region_off +| byte_off;
             if (!physMapped(phys, width)) return false;
             const va = paging.physToVirt(phys);
             switch (width) {
@@ -4650,70 +5063,88 @@ fn writeRegionUnit(region: *const StoredNode, byte_off: u64, width: u32, val: u6
             }
             return true;
         },
-        SPACE_PCI => return pciCfgWrite(unpackBdf(region.pci_bdf), region.region_off + byte_off, width, val),
+        SPACE_PCI => return pciCfgWrite(pciBdf(region) orelse return false, region.region_off +| byte_off, width, val),
         else => {
             if (regionHandlerFor(region.region_space)) |h|
-                return h.write(region.region_space, region.region_off + byte_off, width, val);
+                return h.write(region.region_space, region.region_off +| byte_off, width, val);
             return false;
         },
     }
 }
 
-/// Read a scalar field (≤ 64 bits) by assembling the access-width units it
-/// spans and extracting its bit-slice. Null for unsupported widths, unresolved
-/// regions, or an access window too wide to fit a u64.
-fn readField(field: *const StoredNode) ?u64 {
-    const region = fieldRegion(field) orelse return null;
-    const width = field.field_bit_width;
-    if (width == 0 or width > 64) return null;
-    const ab = accessWidthBytes(field.field_access);
-    const abits = ab * 8;
-    const first_unit = field.field_bit_off / abits;
-    const last_unit = (field.field_bit_off + width - 1) / abits;
-    const n_units = last_unit - first_unit + 1;
-    if (n_units * abits > 64) return null;
-    var raw: u64 = 0;
-    var u: u32 = 0;
-    while (u < n_units) : (u += 1) {
-        const unit_byte = @as(u64, first_unit + u) * @as(u64, ab);
-        const v = readRegionUnit(region, unit_byte, ab) orelse return null;
-        raw |= v << @as(u6, @intCast(u * abits));
-    }
-    const shift: u32 = field.field_bit_off - first_unit * abits;
-    const shifted = raw >> @as(u6, @intCast(shift));
-    if (width >= 64) return shifted;
-    return shifted & ((@as(u64, 1) << @as(u6, @intCast(width))) - 1);
+// FieldFlags UpdateRule (bits 6:5): what a write puts in the bits of the access
+// units it touches that lie outside the field.
+const UPDATE_PRESERVE: u8 = 0;
+const UPDATE_WRITE_AS_ONES: u8 = 1;
+const UPDATE_WRITE_AS_ZEROS: u8 = 2;
+
+/// A mask of the low `n` bits, n in 1..64.
+fn lowBits(n: u64) u64 {
+    return if (n >= 64) ~@as(u64, 0) else (@as(u64, 1) << @as(u6, @intCast(n))) - 1;
 }
 
-/// Write a scalar field (≤ 64 bits), preserving surrounding bits (Preserve
-/// UpdateRule) via read-modify-write across the spanned access units.
+/// Read a scalar field (≤ 64 bits) by assembling the access-width units it
+/// spans and extracting its bit-slice. Null for unsupported widths, unresolved
+/// regions, or an access window too wide to fit a u64. Bit positions are u64:
+/// a FieldList's running offset can wrap a u32.
+fn readField(field: *const StoredNode) ?u64 {
+    const region = fieldRegion(field) orelse return null;
+    const width: u64 = field.field_bit_width;
+    if (width == 0 or width > 64) return null;
+    const ab = accessWidthBytes(field.field_access);
+    const abits: u64 = ab * 8;
+    const bit_off: u64 = field.field_bit_off;
+    const first_unit = bit_off / abits;
+    const n_units = (bit_off + width - 1) / abits - first_unit + 1;
+    if (n_units * abits > 64) return null;
+    var raw: u64 = 0;
+    var u: u64 = 0;
+    while (u < n_units) : (u += 1) {
+        const v = readRegionUnit(region, (first_unit + u) * ab, ab) orelse return null;
+        raw |= v << @as(u6, @intCast(u * abits));
+    }
+    const shifted = raw >> @as(u6, @intCast(bit_off - first_unit * abits));
+    return shifted & lowBits(width);
+}
+
+/// Write a scalar field (≤ 64 bits). The bits of the spanned access units that
+/// lie outside the field follow its UpdateRule: read back first (Preserve) or
+/// forced to ones/zeros — WriteAsZeros is how firmware keeps a write to one
+/// write-1-to-clear status bit from clearing its neighbours. A write that
+/// covers its units exactly reads nothing, so a data or doorbell register is
+/// never read just to be overwritten.
 fn writeField(field: *const StoredNode, value: u64) bool {
     const region = fieldRegion(field) orelse return false;
-    const width = field.field_bit_width;
+    const width: u64 = field.field_bit_width;
     if (width == 0 or width > 64) return false;
     const ab = accessWidthBytes(field.field_access);
-    const abits = ab * 8;
-    const first_unit = field.field_bit_off / abits;
-    const last_unit = (field.field_bit_off + width - 1) / abits;
-    const n_units = last_unit - first_unit + 1;
+    const abits: u64 = ab * 8;
+    const bit_off: u64 = field.field_bit_off;
+    const first_unit = bit_off / abits;
+    const n_units = (bit_off + width - 1) / abits - first_unit + 1;
     if (n_units * abits > 64) return false;
-    const shift: u32 = field.field_bit_off - first_unit * abits;
-    const field_mask: u64 = if (width >= 64) ~@as(u64, 0) else (@as(u64, 1) << @as(u6, @intCast(width))) - 1;
-    const window_mask = field_mask << @as(u6, @intCast(shift));
+    const shift: u6 = @intCast(bit_off - first_unit * abits);
+    const window_mask = lowBits(width) << shift;
+    const span_mask = lowBits(n_units * abits);
     var cur: u64 = 0;
-    var u: u32 = 0;
-    while (u < n_units) : (u += 1) {
-        const unit_byte = @as(u64, first_unit + u) * @as(u64, ab);
-        const v = readRegionUnit(region, unit_byte, ab) orelse return false;
-        cur |= v << @as(u6, @intCast(u * abits));
+    if (window_mask != span_mask) {
+        switch (field.field_update) {
+            UPDATE_WRITE_AS_ONES => cur = span_mask,
+            UPDATE_WRITE_AS_ZEROS => {},
+            else => {
+                var ru: u64 = 0;
+                while (ru < n_units) : (ru += 1) {
+                    const v = readRegionUnit(region, (first_unit + ru) * ab, ab) orelse return false;
+                    cur |= v << @as(u6, @intCast(ru * abits));
+                }
+            },
+        }
     }
-    cur = (cur & ~window_mask) | ((value & field_mask) << @as(u6, @intCast(shift)));
-    const unit_mask: u64 = if (abits >= 64) ~@as(u64, 0) else (@as(u64, 1) << @as(u6, @intCast(abits))) - 1;
-    u = 0;
+    cur = (cur & ~window_mask) | ((value & lowBits(width)) << shift);
+    var u: u64 = 0;
     while (u < n_units) : (u += 1) {
-        const unit_byte = @as(u64, first_unit + u) * @as(u64, ab);
-        const piece = (cur >> @as(u6, @intCast(u * abits))) & unit_mask;
-        if (!writeRegionUnit(region, unit_byte, ab, piece)) return false;
+        const piece = (cur >> @as(u6, @intCast(u * abits))) & lowBits(abits);
+        if (!writeRegionUnit(region, (first_unit + u) * ab, ab, piece)) return false;
     }
     return true;
 }
@@ -4722,53 +5153,61 @@ fn writeField(field: *const StoredNode, value: u64) bool {
 // The DSM mailbox carries request/response payloads far wider than a u64. A
 // Field element wider than 64 bits reads into a Buffer (LSB-first: field bit 0
 // → buffer byte 0 bit 0) and is written from a Buffer the same way. Each access
-// unit is read/written once; partial leading/trailing units are RMW-preserved
-// by walking only the field's own bits.
+// unit is read/written once; the bits of a partly covered unit follow the
+// UpdateRule, exactly as in writeField.
 
 /// Read a field of any width into a fresh arena Buffer ((width+7)/8 bytes).
 fn readFieldBuffer(field: *const StoredNode) ?Value {
     const region = fieldRegion(field) orelse return null;
-    const width = field.field_bit_width;
+    const width: u64 = field.field_bit_width;
     if (width == 0) return null;
-    const out = newBuf((width + 7) / 8) orelse return null;
+    const out = newBuf(@intCast((width + 7) / 8)) orelse return null;
     const ab = accessWidthBytes(field.field_access);
-    const abits = ab * 8;
-    var fpos: u32 = 0;
+    const abits: u64 = ab * 8;
+    const bit_off: u64 = field.field_bit_off;
+    var fpos: u64 = 0;
     while (fpos < width) {
-        const abs_bit = field.field_bit_off + fpos;
+        const abs_bit = bit_off + fpos;
         const unit = abs_bit / abits;
-        const v = readRegionUnit(region, @as(u64, unit) * ab, ab) orelse return null;
-        var k: u32 = abs_bit - unit * abits;
+        const v = readRegionUnit(region, unit * ab, ab) orelse return null;
+        var k: u64 = abs_bit - unit * abits;
         while (k < abits and fpos < width) : ({
             k += 1;
             fpos += 1;
         }) {
-            if ((v >> @as(u6, @intCast(k))) & 1 != 0) out[fpos >> 3] |= @as(u8, 1) << @as(u3, @intCast(fpos & 7));
+            if ((v >> @as(u6, @intCast(k))) & 1 != 0) out[@intCast(fpos >> 3)] |= @as(u8, 1) << @as(u3, @intCast(fpos & 7));
         }
     }
     return .{ .buffer = out };
 }
 
-/// Write a Buffer's bytes into a field of any width (RMW per access unit).
+/// Write a Buffer's bytes into a field of any width, one access unit at a time.
 fn writeFieldBuffer(field: *const StoredNode, bytes: []const u8) bool {
     const region = fieldRegion(field) orelse return false;
-    const width = field.field_bit_width;
+    const width: u64 = field.field_bit_width;
     if (width == 0) return false;
     const ab = accessWidthBytes(field.field_access);
-    const abits = ab * 8;
-    var fpos: u32 = 0;
+    const abits: u64 = ab * 8;
+    const bit_off: u64 = field.field_bit_off;
+    var fpos: u64 = 0;
     while (fpos < width) {
-        const abs_bit = field.field_bit_off + fpos;
+        const abs_bit = bit_off + fpos;
         const unit = abs_bit / abits;
-        const unit_byte = @as(u64, unit) * ab;
-        var v = readRegionUnit(region, unit_byte, ab) orelse 0;
-        var k: u32 = abs_bit - unit * abits;
+        const unit_byte = unit * ab;
+        var k: u64 = abs_bit - unit * abits;
+        const whole = k == 0 and width - fpos >= abits;
+        var v: u64 = if (whole) 0 else switch (field.field_update) {
+            UPDATE_WRITE_AS_ONES => lowBits(abits),
+            UPDATE_WRITE_AS_ZEROS => 0,
+            else => readRegionUnit(region, unit_byte, ab) orelse 0,
+        };
         while (k < abits and fpos < width) : ({
             k += 1;
             fpos += 1;
         }) {
             const mask = @as(u64, 1) << @as(u6, @intCast(k));
-            const src_set = if ((fpos >> 3) < bytes.len) (bytes[fpos >> 3] >> @as(u3, @intCast(fpos & 7))) & 1 else 0;
+            const byte_i = fpos >> 3;
+            const src_set = if (byte_i < bytes.len) (bytes[@intCast(byte_i)] >> @as(u3, @intCast(fpos & 7))) & 1 else 0;
             if (src_set != 0) v |= mask else v &= ~mask;
         }
         if (!writeRegionUnit(region, unit_byte, ab, v)) return false;
@@ -6192,6 +6631,23 @@ pub fn reportPrtPciJoin() void {
 
 // --- entry point ------------------------------------------------------------
 
+/// Objects the OS itself provides at the root (ACPI 6.4 §5.7.4, §5.7.6):
+/// firmware reads \_OS_ and \_REV directly or probes them with CondRefOf. _OSI is
+/// answered by name in evalNameRef. The values are what Windows reports.
+fn addOsObjects() void {
+    osObject("\\_OS_", .{ .string = "Microsoft Windows NT" });
+    osObject("\\_REV", .{ .integer = 2 });
+}
+
+fn osObject(abs: []const u8, v: Value) void {
+    if (nnodes >= nodes.len) return;
+    const n = &nodes[nnodes];
+    n.* = .{ .kind = .name, .runtime_val = v, .has_runtime = true };
+    @memcpy(n.path[0..abs.len], abs);
+    n.path_len = @intCast(abs.len);
+    nnodes += 1;
+}
+
 /// Decode the cached DSDT plus every SSDT into one namespace, then run the
 /// boot-time proofs. Call after acpi.init has cached the tables. Best-effort:
 /// logs a summary; a malformed table yields a partial walk, never a fault.
@@ -6214,6 +6670,7 @@ pub fn load() u32 {
     loaded_pool_used = 0;
     synth_injected = false;
     arenaReset();
+    addOsObjects();
 
     // Table 0: the DSDT — the namespace root. SSDTs (next) re-open \_SB etc. by
     // path, so we still load them even if the DSDT is somehow absent.
