@@ -2766,6 +2766,10 @@ pub fn blockOn(kind: WaitKind, target: u32) void {
     if (@atomicRmw(bool, &pcb.wake_pending, .Xchg, false, .acq_rel)) {
         return;
     }
+    if (pcb.is_idle) {
+        idleWait(pcb);
+        return;
+    }
     setWait(pcb, kind, target);
     setState(cur, .sleeping);
     // Race check: did a wake() land between our test-and-clear above
@@ -2785,6 +2789,65 @@ pub fn blockOn(kind: WaitKind, target: u32) void {
     @import("../debug/yield_loop.zig").observe(cur, kind, target, caller_ra);
     @import("sched_asm.zig").softYield();
     clearWait(pcb);
+}
+
+/// Per CPU: its idle task is halted in idleWait. Dekker pair with
+/// wake_pending: the waiter publishes this, then re-reads wake_pending;
+/// wake() publishes wake_pending, then reads this (kickIdleWaiter).
+var idle_waiting: [smp.MAX_CPUS]std.atomic.Value(bool) = [_]std.atomic.Value(bool){std.atomic.Value(bool).init(false)} ** smp.MAX_CPUS;
+
+/// blockOn for the idle task, which cannot park: schedule() re-dispatches it
+/// at once when nothing else is queued, so softYield would spin `int $0x20`
+/// about a thousand times a millisecond (the AP app load waiting on NVMe).
+/// Runs queued work if there is any, else halts until an interrupt: the
+/// completion IRQ steered to this CPU, kickIdleWaiter's IPI from another
+/// CPU, or the tick. The caller loops on its condition, as with blockOn.
+fn idleWait(pcb: *process.PCB) void {
+    const irq0 = @import("../cpu/idt/irq0.zig");
+    // As kernelIdle before its hlt: hand an input event to the parked
+    // desktop (BSP only), then yield to whatever is queued here.
+    _ = @import("../ui/desktop.zig").wakeIfDueFromIdle();
+    if (irq0.localRqHasWork()) {
+        @import("sched_asm.zig").softYield();
+        return;
+    }
+    var flags: u64 = undefined;
+    asm volatile ("pushfq; pop %[f]; cli"
+        : [f] "=r" (flags),
+    );
+    if (flags & 0x200 == 0) {
+        // A hlt with IF=0 waits for an NMI.
+        @import("sched_asm.zig").softYield();
+        return;
+    }
+    const cpu = smp.myCpu().cpu_id;
+    idle_waiting[cpu].store(true, .seq_cst);
+    irq0.holdQuantumForIoWait();
+    if (!@atomicLoad(bool, &pcb.wake_pending, .seq_cst) and !irq0.localRqHasWork()) {
+        asm volatile ("sti; hlt" ::: .{ .memory = true });
+    } else {
+        asm volatile ("sti" ::: .{ .memory = true });
+    }
+    idle_waiting[cpu].store(false, .monotonic);
+}
+
+/// `cpu`'s idle task is halted in idleWait: rearmTimerForCurrent keeps the
+/// one-quantum cadence under it.
+pub fn idleInIoWait(cpu: u8) bool {
+    if (cpu >= smp.MAX_CPUS) return false;
+    return idle_waiting[cpu].load(.monotonic);
+}
+
+/// wake() of an idle task: if it is halted in idleWait on another CPU, a
+/// wake-only IPI ends the hlt (wake() sends none otherwise, and a
+/// completion reaped on another CPU raises no interrupt here).
+fn kickIdleWaiter(cpu: u8) void {
+    if (cpu >= smp.MAX_CPUS or cpu == smp.myCpu().cpu_id) return;
+    // StoreLoad against wake()'s release store of wake_pending.
+    asm volatile ("mfence" ::: .{ .memory = true });
+    if (!idle_waiting[cpu].load(.seq_cst)) return;
+    const v = wakeVector() orelse return;
+    @import("../time/apic.zig").sendIPI(smp.cpus[cpu].lapic_id, v);
 }
 
 
@@ -2851,6 +2914,7 @@ pub fn wake(pid: u8) void {
     // store and its setState) can detect us via the re-check after setState.
     // Without this, the wake is silently lost and the task sleeps forever.
     @atomicStore(bool, &process.procs[pid].wake_pending, true, .release);
+    if (process.procs[pid].is_idle) kickIdleWaiter(process.procs[pid].idle_cpu);
     clearWait(&process.procs[pid]);
     // pipe.read / pipe.write park themselves with state=.sleeping so the
     // int $0x20 yield actually reschedules (idt's yielded_from_kernel check

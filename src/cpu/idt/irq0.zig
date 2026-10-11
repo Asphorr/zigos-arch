@@ -674,6 +674,7 @@ const TicklessStats = struct {
     arm_full: u64 = 0, // ...the full 10-quanta stretch
     clamp_rq: u64 = 0, // idle current but the local run queue holds work
     clamp_gated: u64 = 0, // on_cpu-gated pick skip → retry within a quantum
+    clamp_iowait: u64 = 0, // idle task halted waiting for I/O (sched.idleWait)
     clamp_sound: u64 = 0, // BSP: tick-pumped sound effect live
     clamp_wake: u64 = 0, // BSP: earliest_wake_tick inside the window
     clamp_alarm: u64 = 0, // BSP: earliest_alarm_tick inside the window
@@ -788,6 +789,10 @@ fn rearmTimerForCurrent(cpu: *smp.CpuLocal) void {
             // tickless-stretching up to 100ms over runnable work. (L1
             // from the on_cpu-gate review, 2026-07-16.)
             bump(&st.clamp_gated);
+        } else if (sched_mod.idleInIoWait(cpu.cpu_id)) {
+            // The idle task is halted waiting for I/O (sched.idleWait), and
+            // a wake that raises no interrupt here is seen at the next fire.
+            bump(&st.clamp_iowait);
         } else if (cpu.cpu_id != 0) {
             quanta = IDLE_STRETCH_QUANTA;
         } else if (@import("../../driver/sound.zig").needsTick()) {
@@ -908,6 +913,16 @@ pub fn shortenAfterIdleWake() void {
     dropStretch(cpu.cpu_id);
 }
 
+/// The idle task is about to halt waiting for I/O (sched.idleWait): drop a
+/// stretch armed while it was idle for real, so a wake that raises no
+/// interrupt here waits at most a quantum. IF=0, own CPU.
+pub fn holdQuantumForIoWait() void {
+    const id = smp.myCpu().cpu_id;
+    if (!@atomicLoad(bool, &timer_long_armed[id], .seq_cst)) return;
+    bump(&tl_stats[id].clamp_iowait);
+    dropStretch(id);
+}
+
 /// This CPU's run queue holds a ready task — the idle loop's pre-sleep
 /// check for a local wake that sends no IPI (apProcessLoadQueue readying
 /// a pid assigned here, a same-CPU wake).
@@ -974,7 +989,7 @@ fn dumpTickless() void {
         const st = &tl_stats[cpu_id];
         const fires = @atomicLoad(u64, &st.fires, .monotonic);
         if (fires == 0) continue;
-        serial.print("[tickless] cpu{d} fires={d} idle_arms={d} (1q={d} 2-9q={d} 10q={d}) wake: kept={d} shortened={d} kicks={d} | clamps: rq={d} gated={d} sound={d} wake={d} alarm={d} hires={d} late={d}\n", .{
+        serial.print("[tickless] cpu{d} fires={d} idle_arms={d} (1q={d} 2-9q={d} 10q={d}) wake: kept={d} shortened={d} kicks={d} | clamps: rq={d} gated={d} iowait={d} sound={d} wake={d} alarm={d} hires={d} late={d}\n", .{
             cpu_id,
             fires,
             @atomicLoad(u64, &st.idle_arms, .monotonic),
@@ -986,6 +1001,7 @@ fn dumpTickless() void {
             @atomicLoad(u64, &st.kicks, .monotonic),
             @atomicLoad(u64, &st.clamp_rq, .monotonic),
             @atomicLoad(u64, &st.clamp_gated, .monotonic),
+            @atomicLoad(u64, &st.clamp_iowait, .monotonic),
             @atomicLoad(u64, &st.clamp_sound, .monotonic),
             @atomicLoad(u64, &st.clamp_wake, .monotonic),
             @atomicLoad(u64, &st.clamp_alarm, .monotonic),
