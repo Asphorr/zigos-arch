@@ -215,7 +215,9 @@ pub fn countThreadsInGroup(tgid: u8) u8 {
 /// storage (0 = inherit / no TLS). Returns the child pid (which doubles
 /// as its tid) or null if the process table is full.
 ///
-/// What's shared: page_directory (same CR3 pointer + phys). lazy_regions,
+/// What's shared: page_directory (same CR3 pointer + phys) and the PCID —
+/// every shootdown of the AS names the lead's PCID, so a thread tagged with
+/// another one would keep stale entries past munmap/fork/swap. lazy_regions,
 /// fd_table, sigactions, cwd, etc. all live on the lead thread; cloned
 /// threads access them through `leader(pcb)`.
 ///
@@ -240,6 +242,7 @@ pub fn cloneCurrent(entry: usize, stack_top: usize, arg: usize, fs_base: u64) ?u
     process.procs[i].sid = parent_lead.sid;
     process.procs[i].page_directory = parent_lead.page_directory;
     process.procs[i].page_dir_phys = parent_lead.page_dir_phys;
+    process.procs[i].pcid = parent_lead.pcid;
 
     // Copy per-thread defaults that need to mirror the parent for
     // sane scheduling. fd_table is COPIED for now (Linux would
@@ -889,6 +892,15 @@ var teardown_diag_suppressed: u32 = 0; // (a) teardowns hidden since then
 ///     dying CPU is still on the dying kstack until it reschedules).
 fn tearDownTask(pid: usize, status: u32, op: TerminateOp, persist_shared_dirty: bool) void {
     const my_tgid: u8 = process.procs[pid].tgid;
+    // Self-destroy: leave the AS for kernel tables BEFORE the claim. Once
+    // marked, this thread no longer keeps the AS alive — a sibling dying on
+    // another CPU can be the last claimant and free the page tables (PML4
+    // included) while this CPU would still be walking them. Nothing below
+    // touches user memory. External kill runs on the killer's own CR3 (the
+    // victim's is not active anywhere), so no switch there.
+    if (op == .destroy) {
+        pcid_mod.loadCr3(@import("../mm/paging.zig").getKernelPageDirPhys(), 0, smp.myCpu().cpu_id);
+    }
     const last_in_group = claimTeardown(pid, my_tgid);
     // Throttle the teardown diagnostics (see TEARDOWN_DIAG_GAP_TICKS). One
     // decision gates the [proc] line + both [pmm-diag] lines below, so the
@@ -988,14 +1000,6 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp, persist_shared_dirty: 
         }
     }
 
-    // Self-destroy: switch to kernel CR3 BEFORE freeing the victim's PT
-    // pages — otherwise destroyAddressSpace would free the very CR3 the
-    // CPU is walking. External kill is on the killer's own CR3 (the
-    // victim's was never active here), so no switch needed.
-    if (op == .destroy) {
-        pcid_mod.loadCr3(@import("../mm/paging.zig").getKernelPageDirPhys(), 0, smp.myCpu().cpu_id);
-    }
-
     if (last_in_group) {
         const lead = &process.procs[my_tgid];
         if (lead.page_directory) |pd| {
@@ -1059,6 +1063,7 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp, persist_shared_dirty: 
     if (pid != my_tgid or last_in_group) {
         process.procs[pid].page_directory = null;
         process.procs[pid].page_dir_phys = 0;
+        process.procs[pid].pcid = 0;
     }
     process.procs[pid].exit_status = status;
 

@@ -134,8 +134,9 @@ fn findUserPte(pml4: [*]align(4096) u64, va: usize) ?*u64 {
 /// child PTEs this way). Allocates a private frame for the faulting AS,
 /// copies the shared frame's contents in, swaps the PTE to point at the new
 /// frame R/W, and drops one refcount on the shared frame. If we were the only
-/// owner (refcount==1), skip the copy and just promote in place.
-fn handleCowFault(pml4: [*]align(4096) u64, cr2: usize) bool {
+/// owner (refcount==1), skip the copy and just promote in place. `lead` owns
+/// `pml4` — not necessarily the current task (io_uring writes for an owner).
+fn handleCowFault(pml4: [*]align(4096) u64, lead: *PCB, cr2: usize) bool {
     const paging = @import("../mm/paging.zig");
     const va_aligned = cr2 & ~@as(usize, 0xFFF);
     const pte_p = findUserPte(pml4, va_aligned) orelse return false;
@@ -150,9 +151,6 @@ fn handleCowFault(pml4: [*]align(4096) u64, cr2: usize) bool {
     // semantics. (cloneAddressSpace's acquireFrame already balanced the child's
     // inherited reference, so teardown stays leak-free.)
     {
-        const cur = smp.myCpu().current_pid orelse return false;
-        const pcb = &process.procs[cur];
-        const lead = leader(pcb);
         const shm = @import("../mm/shm.zig");
         const page_cache = @import("../mm/page_cache.zig");
         var i: u8 = 0;
@@ -188,7 +186,16 @@ fn handleCowFault(pml4: [*]align(4096) u64, cr2: usize) bool {
     // Sole-owner promote-in-place. Refcount may race against another CPU's
     // releaseFrame on the same shared frame, but the only outcome of being
     // wrong here is taking the slow path unnecessarily — never incorrect.
-    if (pmm.frameRefCount(old_phys) == 1) {
+    // A fork RAISES it, though, after reading this PTE: a promote racing a
+    // sibling's fork could CAS the unchanged COW word to writable on a frame
+    // the child now maps. So promote only while no fork can run beside us
+    // (the faulting task is the process's only live thread); otherwise copy,
+    // which moves the parent off the old frame whatever a fork did.
+    const sole_thread = if (process.currentPCB()) |cur_pcb|
+        cur_pcb.tgid == lead.tgid and process.countThreadsInGroup(lead.tgid) == 1
+    else
+        false;
+    if (sole_thread and pmm.frameRefCount(old_phys) == 1) {
         // CAS for the same reason as the copy path below — a peer thread of
         // this AS can resolve this PTE between our read and the store. The
         // loser's intended value is identical, so just take the winner's.
@@ -227,14 +234,41 @@ fn handleCowFault(pml4: [*]align(4096) u64, cr2: usize) bool {
         return true;
     }
 
+    // Flush before dropping the reference: once it goes, the other owner may
+    // write the old frame in place or free it.
+    flushCowBreak(lead, va_aligned);
     pmm.releaseFrame(old_phys);
-
-    asm volatile ("invlpg (%[addr])"
-        :
-        : [addr] "r" (va_aligned),
-        : .{ .memory = true }
-    );
     return true;
+}
+
+/// Drop stale translations of `va` after a COW break pointed it at a new
+/// frame. Threads share the lead's PCID, so a peer CPU running one of them
+/// may still read the old frame; single-threaded, only this CPU can.
+/// (Permission upgrades need no peer flush: a stale entry makes a user
+/// access fault spuriously, see handleUserPageFault, and kernel writes go
+/// through ensureUserRangeFor, which drops it first.)
+fn flushCowBreak(lead: *PCB, va: usize) void {
+    const tlb = @import("../cpu/mmu/tlb.zig");
+    const spinlock = @import("spinlock.zig");
+    const me = spinlock.pinPreemption();
+    defer spinlock.unpinPreemption(me);
+    if (lead.pcid != 0) {
+        tlb.flushUserPage(lead.pcid, va, me);
+        return;
+    }
+    // PCID 0 (no PCIDs, or the allocator ran dry): no cpumask to consult.
+    // Shared when other threads exist or the caller isn't one of them (an
+    // io_uring worker breaking COW for its owner) — a full broadcast then.
+    const cur_tgid: u8 = if (process.currentPCB()) |p| p.tgid else 0xFF;
+    if (cur_tgid != lead.tgid or process.countThreadsInGroup(lead.tgid) > 1) {
+        tlb.shootdownPage(0, va);
+    } else {
+        asm volatile ("invlpg (%[addr])"
+            :
+            : [addr] "r" (va),
+            : .{ .memory = true }
+        );
+    }
 }
 
 /// Fault-in one page of a cache-backed (ext2 file mmap) region `r` at
@@ -295,10 +329,10 @@ fn faultInCachePage(pd: [*]align(4096) u64, r: process.LazyRegion, va_aligned: u
 
 /// NON-BLOCKING variant of faultInCachePage for the proactive prefault helpers
 /// that must not do disk I/O — specifically ensureUserRangeWritableFor, which
-/// runs with the owner's `as_lock` (a spinlock) held: maps the page ONLY if it's
+/// runs with the owner's `as_lock` held: maps the page ONLY if it's
 /// already resident in the cache (pin HIT, no ext2 read). Returns false on a
-/// miss, so the caller fails the operation cleanly instead of blocking under a
-/// spinlock. Maps read-only + COW; the caller breaks COW if it needs the page
+/// miss, so the caller fails the operation cleanly instead of doing disk I/O
+/// under that lock. Maps read-only + COW; the caller breaks COW if it needs the page
 /// writable. (A miss here just means the app must touch the page itself — the
 /// real #PF path then fills it.)
 fn tryMapCachedPage(pd: [*]align(4096) u64, r: process.LazyRegion, va_aligned: usize) bool {
@@ -615,12 +649,16 @@ pub fn handleUserPageFault(cr2: usize, error_code: u64) bool {
     // an unmapped address" wouldn't show up.
     pcb.acct_pf_count +%= 1;
     const pd = pcb.page_directory orelse return false;
+    // Lazy regions live on the lead thread (per-process resource). For
+    // single-threaded processes this aliases pcb itself; for cloned
+    // threads we read the parent's regions so mmap'd VAs are visible.
+    const lead = leader(pcb);
 
     // COW path: write fault on a present user page (P=1, W=1, U=1). Walk the
     // PT and dispatch handleCowFault if the PTE has the COW software bit set.
     // Lazy-region faults are P=0 (non-present); COW faults are P=1 and W=1.
     if ((error_code & 0x3) == 0x3) {
-        if (handleCowFault(pd, cr2)) {
+        if (handleCowFault(pd, lead, cr2)) {
             @import("../debug/kdbg.zig").pfEvent(@intCast(cur), cr2, @truncate(error_code), 0, true);
             return true;
         }
@@ -638,12 +676,25 @@ pub fn handleUserPageFault(cr2: usize, error_code: u64) bool {
         if (findUserPte(pd, cr2 & ~@as(usize, 0xFFF))) |pte_ptr| {
             const pte = pte_ptr.*;
             if ((pte & paging.PRESENT) != 0 and (pte & paging.READ_WRITE) == 0) return false;
+            // Already writable: a stale read-only entry, left on this CPU when
+            // a peer thread promoted the page (promotes flush locally only).
+            // The fault itself drops the entry; the invlpg backs that up under
+            // nested virt. Falling through would re-pin a cache or shm frame
+            // and leak a reference per such fault. Only a plain protection
+            // fault qualifies: a reserved-bit (corrupt PTE), PK or SS fault
+            // on such a PTE would retry forever.
+            const user_rw = paging.PRESENT | paging.READ_WRITE | paging.USER;
+            if (pte & user_rw == user_rw and (error_code & 0xFFFF) == 0x7) {
+                asm volatile ("invlpg (%[addr])"
+                    :
+                    : [addr] "r" (cr2),
+                    : .{ .memory = true }
+                );
+                @import("../debug/kdbg.zig").pfEvent(@intCast(cur), cr2, @truncate(error_code), 0, true);
+                return true;
+            }
         }
     }
-    // Lazy regions live on the lead thread (per-process resource). For
-    // single-threaded processes this aliases pcb itself; for cloned
-    // threads we read the parent's regions so mmap'd VAs are visible.
-    const lead = leader(pcb);
 
     var i: u8 = 0;
     while (i < lead.lazy_count) : (i += 1) {
@@ -838,7 +889,8 @@ pub fn handleUserPageFault(cr2: usize, error_code: u64) bool {
         // ELF demand paging's file bytes were copied in by
         // allocFillAndMapUserPage before the PTE went live (sourceFill).
         _ = frame;
-        // Invalidate TLB on this CPU. Other CPUs don't share user PDs.
+        // The PTE was not present, so no CPU's TLB can hold it; the local
+        // invlpg is a backstop.
         asm volatile ("invlpg (%[addr])"
             :
             : [addr] "r" (va_aligned),
@@ -1059,6 +1111,21 @@ pub fn ensureUserRangeReadableFor(owner_pcb: *process.PCB, va: usize, len: usize
     return ensureUserRangeFor(owner_pcb, va, len, false);
 }
 
+/// handleCowFault until `p` is no longer COW. A lost CAS (a peer thread
+/// resolved it, or the CPU set A between the read and the CAS) reports
+/// success with the word still COW; the #PF path retries the instruction,
+/// a proactive caller has to retry itself. Bounded: each loss means
+/// someone else moved the word.
+fn breakCow(pd: [*]align(4096) u64, lead: *PCB, p: usize) void {
+    const paging = @import("../mm/paging.zig");
+    var tries: u8 = 0;
+    while (tries < 4) : (tries += 1) {
+        _ = handleCowFault(pd, lead, p);
+        const pte_ptr = findUserPte(pd, p) orelse return;
+        if (pte_ptr.* & paging.COW == 0) return;
+    }
+}
+
 fn ensureUserRangeFor(owner_pcb: *process.PCB, va: usize, len: usize, need_write: bool) bool {
     if (len == 0) return true;
     const pd = owner_pcb.page_directory orelse return false;
@@ -1070,9 +1137,16 @@ fn ensureUserRangeFor(owner_pcb: *process.PCB, va: usize, len: usize, need_write
     while (p < end_excl) : (p += 0x1000) {
         if (vmm.resolveUserPhys(pd, p) != null) {
             if (need_write) {
-                _ = handleCowFault(pd, p);
+                breakCow(pd, lead, p);
                 const pte_ptr = findUserPte(pd, p) orelse return false;
                 if (pte_ptr.* & paging.READ_WRITE == 0) return false;
+                // A peer thread's promote flushed only its own CPU; this one
+                // may still hold the read-only entry, and the caller's kernel
+                // write through it would fault with no fixup.
+                asm volatile ("invlpg (%[addr])"
+                    :
+                    : [addr] "r" (p),
+                    : .{ .memory = true });
             }
         } else {
             var mapped = false;
@@ -1090,7 +1164,7 @@ fn ensureUserRangeFor(owner_pcb: *process.PCB, va: usize, len: usize, need_write
                     // caller may hold a spinlock; the app must touch the page
                     // itself so the #PF path can fill it).
                     if (!tryMapCachedPage(pd, r, p)) return false;
-                    if (need_write) _ = handleCowFault(pd, p);
+                    if (need_write) breakCow(pd, lead, p);
                 } else {
                     // sourceFill: an ELF .data / private-file-mmap page starts
                     // with its file bytes (this path used to map a bare zero

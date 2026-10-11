@@ -927,9 +927,11 @@ pub fn cloneAddressSpace(parent_pml4: [*]align(4096) u64, parent_pcid: u16, phys
                         }
                         child_pt[pt_i] = cow_pte;
                     } else {
-                        // Already read-only (text/rodata or PROT_READ mmap):
-                        // no COW marking needed — but the parent PTE isn't
-                        // rewritten either, so validate the sample explicitly
+                        // Already read-only (text/rodata, PROT_READ mmap, or
+                        // COW from an earlier fork, whose promote-in-place
+                        // handleCowFault keeps off while a fork can run
+                        // beside it): no COW marking needed — but the parent
+                        // PTE isn't rewritten either, so validate the sample explicitly
                         // in place of the CAS. Unchanged PTE + successful
                         // IfLive-acquire proves the frame stayed continuously
                         // owned by this mapping.

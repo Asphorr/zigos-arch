@@ -447,7 +447,8 @@ pub const PCB = struct {
     // from `pcid.alloc` when their page_dir_phys is assigned and free it
     // on destroyAddressSpace. The schedule path uses pcid + the per-CPU
     // generation tracker to set CR3 bit 63 (preserve-TLB) on reloads.
-    pcid: u16 = 0, // (c) pcid.alloc in createAddressSpace; RO after
+    // Threads carry their lead's PCID: shootdowns name the lead's.
+    pcid: u16 = 0, // (c) pcid.alloc in createAddressSpace, copied by cloneCurrent; RO after
 
     // iretq-frame snapshot tripwire (task #230). Captured by
     // debug.iretq_canary.capture() at IRQ/exception entry; checked at

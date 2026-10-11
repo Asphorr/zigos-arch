@@ -90,7 +90,9 @@ pub fn sysSbrk(increment: u32) u32 {
 
         const pml4: [*]align(4096) u64 = @ptrCast(@alignCast(lead.page_directory.?));
         _ = vmm.unmapUserRange(pml4, new_brk_shrink, old_brk);
-        @import("../mmu/tlb.zig").shootdownAll(lead.pcid);
+        const first_page = new_brk_shrink & ~@as(usize, 0xFFF);
+        const end_page = (old_brk + 0xFFF) & ~@as(usize, 0xFFF);
+        @import("../mmu/tlb.zig").shootdownRange(lead.pcid, first_page, (end_page - first_page) / 0x1000);
 
         hr.end = new_brk_shrink;
         lead.user_brk = new_brk_shrink;
@@ -482,21 +484,11 @@ pub fn sysMunmap(va: u32, len: u32) u32 {
     // does no per-page invlpg; without this call, other CPUs would still
     // cache the freed pages' translations and could read / write into
     // now-recycled PMM frames. Doing it once at batch end rather than
-    // inside the unmap loop cuts the IPI count by len/4096×.
-    // For range==1 page, use INVPCID type-0 (single-page) so peer CPUs
-    // only lose that one TLB entry; for larger ranges, use type-1
-    // (whole-PCID flush) which is cheaper than emitting N type-0 calls.
-    const tlb = @import("../mmu/tlb.zig");
-    if ((end - start) == 0x1000) {
-        // Single page: surgical INVPCID type-0 on peers. shootdownPage's local
-        // flush (flushLocalForMode) carries an INVLPG backstop that reliably
-        // clears THIS CPU's entry under nested virt — where type-0 under-
-        // invalidates and could leave a stale entry into the just-freed frame —
-        // so no separate local flush is needed here.
-        tlb.shootdownPage(lead.pcid, start);
-    } else {
-        tlb.shootdownAll(lead.pcid);
-    }
+    // inside the unmap loop cuts the IPI count by len/4096×. Small ranges
+    // go page by page (INVPCID type-0 plus the INVLPG backstop that
+    // reliably clears this CPU's entry under nested virt), so peers keep
+    // the rest of the AS's entries; large ones flush the whole PCID.
+    @import("../mmu/tlb.zig").shootdownRange(lead.pcid, start, (end - start) / 0x1000);
 
     // Compact the lazy_regions array. heap_lazy_idx is sbrk's pointer; if it
     // happens to be above the removed slot, shift it down by one to keep
@@ -618,19 +610,9 @@ pub fn sysMprotect(va: u32, len: u32, prot: u32) u32 {
     // Cross-CPU TLB shootdown. changePageProt only does a local invlpg per
     // page; without this, another CPU's TLB still caches the OLD prot bits
     // and an mprotect(RW→RO) wouldn't actually block writes from that CPU
-    // until its TLB happens to evict the entry.
-    // Single-page case uses type-0 INVPCID (surgical, leaves the rest of
-    // the PCID's TLB intact); ranges fall through to the whole-PCID type-1
-    // flush.
-    const tlb = @import("../mmu/tlb.zig");
-    if (len_pg == 0x1000) {
-        // Single page: see sysMunmap — shootdownPage's flushLocalForMode INVLPG
-        // backstop reliably clears THIS CPU's stale entry under nested virt (the
-        // W^X-narrowing hazard); peers are covered by the .single_page gen-bump.
-        tlb.shootdownPage(pcb.pcid, start);
-    } else {
-        tlb.shootdownAll(pcb.pcid);
-    }
+    // until its TLB happens to evict the entry. Page by page for small
+    // ranges (see sysMunmap), the whole PCID for large ones.
+    @import("../mmu/tlb.zig").shootdownRange(lead.pcid, start, len_pg / 0x1000);
     return 0;
 }
 

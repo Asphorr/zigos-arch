@@ -329,7 +329,9 @@ inline fn hypercall(call_code: u64, input_gpa: u64, output_gpa: u64) u64 {
 pub fn flushAllProcessors(address_space_cr3: u64) bool {
     if (hypercall_page == 0 or flush_input_va == 0) return false;
     const inp: *FlushInput = @ptrFromInt(flush_input_va);
-    inp.address_space = address_space_cr3;
+    // The address space is the CR3 base with the PCID bits stripped (TLFS;
+    // Linux masks the same way).
+    inp.address_space = address_space_cr3 & ~@as(u64, 0xFFF);
     inp.flags = HV_FLUSH_ALL_PROCESSORS;
     inp.processor_mask = 0;
     const status = hypercall(HV_CALL_FLUSH_VIRTUAL_ADDRESS_SPACE, flush_input_pa, 0);

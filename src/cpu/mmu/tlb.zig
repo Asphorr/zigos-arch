@@ -29,9 +29,12 @@
 //   this PCID's CR3 at least once (tracked in `pcid_cpumask` — set in
 //   `pcid.loadCr3`, cleared in `pcid.free`). CPUs that have never run the
 //   AS are guaranteed to have no entries for this PCID, so their TLB needs
-//   no shootdown. For affected_pcid == 0 (kernel-global mappings) all
-//   CPUs may have stale GLOBAL entries — fall back to broadcasting to
-//   every alive CPU.
+//   no shootdown. Of those, only CPUs with the PCID in CR3 right now
+//   (pcid.loadedOn) are interrupted: one holding it lazily can't use its
+//   entries until it reloads the PCID, and the generation bumped first
+//   makes that reload a flush. For affected_pcid == 0 (kernel-global
+//   mappings) all CPUs may have stale GLOBAL entries — fall back to
+//   broadcasting to every alive CPU.
 //
 // Still-open future work:
 //   - Per-mm sequence numbers so concurrent shootdowns don't have to
@@ -93,16 +96,26 @@ const Mode = enum(u32) {
     full = 0,
     single_context = 1,
     single_page = 2,
+    /// `current_pages` consecutive pages from `current_va`, each flushed
+    /// like .single_page — one IPI round for a small munmap/mprotect
+    /// instead of dropping the whole PCID's working set.
+    range = 3,
 };
 var current_mode: Mode = .full;  // (p:shootdown_lock) publisher-fenced before IPI broadcast
 var current_pcid: u16 = 0;       // (p:shootdown_lock) publisher-fenced before IPI broadcast
 var current_va: u64 = 0;         // (p:shootdown_lock) publisher-fenced before IPI broadcast
+var current_pages: u32 = 0;      // (p:shootdown_lock) publisher-fenced before IPI broadcast
+
+/// Largest range flushed page by page; past it the whole PCID goes (Linux's
+/// ceiling is 33 pages).
+pub const RANGE_MAX_PAGES: usize = 32;
 
 // Telemetry — surfaces in `[slow-tlb]` lines + readable by sysmon. All bumped
 // from multi-CPU senders, so atomic-RMW only (never plain `+=` / `+%=`).
 pub var n_shootdowns_full: u64 = 0;            // (a)
 pub var n_shootdowns_context: u64 = 0;         // (a)
 pub var n_shootdowns_page: u64 = 0;            // (a)
+pub var n_shootdowns_range: u64 = 0;           // (a)
 pub var n_shootdowns_via_hypercall: u64 = 0;   // (a)
 /// (a) Count of skipped peer-CPU slots (NOT shootdown events) due to the
 /// per-mm cpumask narrowing. A 32-CPU host where every shootdown narrows
@@ -111,6 +124,9 @@ pub var n_shootdowns_via_hypercall: u64 = 0;   // (a)
 /// CPU and the mask isn't helping. Accumulated only on IPI-path shootdowns
 /// (skipped on hypercall path).
 pub var n_shootdowns_cpumask_skipped: u64 = 0; // (a)
+/// (a) Peer-CPU slots skipped because the CPU held the PCID only lazily
+/// (not in CR3 at the time); the generation bump covers them.
+pub var n_shootdowns_lazy_skipped: u64 = 0; // (a)
 
 inline fn flushLocalTlb() void {
     asm volatile (
@@ -195,6 +211,19 @@ inline fn flushLocalForMode() void {
                 : [v] "r" (current_va),
                 : .{ .memory = true });
         },
+        // Only issued with a PCID and INVPCID (shootdownRange); the same
+        // type-0 + INVLPG pair as .single_page, per page.
+        .range => {
+            var k: u32 = 0;
+            while (k < current_pages) : (k += 1) {
+                const v = current_va + @as(u64, k) * 0x1000;
+                pcid.invpcid(.address, current_pcid, v);
+                asm volatile ("invlpg (%[v])"
+                    :
+                    : [v] "r" (v),
+                    : .{ .memory = true });
+            }
+        },
     }
 }
 
@@ -231,7 +260,7 @@ pub export fn handleTlbShootdown() callconv(.c) void {
 /// broadcast IPI, wait for acks, do local flush, release lock. Hot path
 /// for both `shootdownAll` (single_context / full) and `shootdownPage`
 /// (single_page).
-fn doShootdown(mode: Mode, affected_pcid: u16, va: u64) void {
+fn doShootdown(mode: Mode, affected_pcid: u16, va: u64, pages: u32) void {
     // Pin against involuntary preemption for the WHOLE shootdown. dynirq's
     // check_and_preempt runs at every device-IRQ epilogue with no from_user
     // gate, and shootdown_lock is a raw atomic (not a SpinLock), so nothing
@@ -239,7 +268,7 @@ fn doShootdown(mode: Mode, affected_pcid: u16, va: u64) void {
     // function (most callers arrive IF=1; the cli'd ones sti during the lock
     // spin below) can schedule() and MIGRATE us mid-shootdown — then `me`
     // names the WRONG cpu: the old cpu is skipped as "self" (missed flush,
-    // and bumpAfterShootdown wrongly exempts it from the lazy gen-flush —
+    // and markFlushed wrongly exempts it from the reload gen-flush —
     // i.e. a USABLE stale TLB entry), while the new cpu receives a self-IPI
     // whose ack a cli'd caller can never service (permanent wedge). The pin
     // defers only the reschedule — IRQs and inbound IPIs stay serviced — and
@@ -291,7 +320,13 @@ fn doShootdown(mode: Mode, affected_pcid: u16, va: u64) void {
     current_mode = mode;
     current_pcid = affected_pcid;
     current_va = va;
+    current_pages = pages;
     asm volatile ("mfence" ::: .{ .memory = true });
+
+    // Generation first, then the targets' `loaded` (pcid.loadCr3 orders the
+    // other way round): a CPU skipped below because it isn't running the
+    // PCID right now flushes it when it next loads it.
+    const new_gen = pcid.bumpGen(affected_pcid);
 
     // Hyper-V fast path: HvCallFlushVirtualAddressSpace flushes all VPs
     // (including self) for the given address space in one hypercall —
@@ -301,8 +336,8 @@ fn doShootdown(mode: Mode, affected_pcid: u16, va: u64) void {
     // to express a single VA, which isn't wired yet.
     //
     // On success: skip the IPI block and the local flush (the hypercall
-    // covered self too). Still bump the PCID gen counter so peers lazy-
-    // flush again on their next CR3 load (belt-and-suspenders).
+    // covered self too). The PCID gen bump above still makes peers flush
+    // again on their next CR3 load (belt-and-suspenders).
     var via_hypercall = false;
     // Exclude kernel-global flushes (affected_pcid == 0): the per-address-
     // space hypercall isn't guaranteed to evict GLOBAL translations on every
@@ -346,15 +381,17 @@ fn doShootdown(mode: Mode, affected_pcid: u16, va: u64) void {
         // Record the exact set of CPUs we bumped ack_pending for. The
         // broadcast + wait loops iterate THIS local snapshot rather than
         // re-reading (alive, target_mask) — independent of any concurrent
-        // mutation in pcid_cpumask. `pcid.loadCr3` eager-clears its bit on
-        // switch-out (after INVPCID-flushing the old PCID), so bits can
-        // clear mid-shootdown. Re-reading the mask in the wait loop would
+        // mutation in pcid_cpumask or `loaded`. `pcid.loadCr3` eager-clears
+        // a CPU's bit when it loads a different user PCID (after INVPCID-
+        // flushing the old one), so bits can clear mid-shootdown, and
+        // `loaded` changes on every switch. Re-reading in the wait loop would
         // skip a CPU we incremented for, leaking the ack_pending bump so
         // the next sender either spins forever on its slot or observes
         // ack_pending==0 prematurely. Tracking inflight_mask locally closes
         // that hole structurally. Skip self — sender does its own flush at
         // the end without bouncing through an IPI.
         var inflight_mask: u32 = 0;
+        var n_lazy: u32 = 0;
         var i: u8 = 0;
         while (i < smp.MAX_CPUS) : (i += 1) {
             if (i == me) continue;
@@ -363,11 +400,19 @@ fn doShootdown(mode: Mode, affected_pcid: u16, va: u64) void {
                 n_skipped += 1;
                 continue;
             }
+            // Holds the PCID lazily (kernel tables loaded, or another user
+            // PCID on a CPU without INVPCID): the generation bump above
+            // flushes it on reload — no need to wake it.
+            if (affected_pcid != 0 and pcid.loadedOn(i) != affected_pcid) {
+                n_lazy += 1;
+                continue;
+            }
             inflight_mask |= (@as(u32, 1) << @as(u5, @intCast(i)));
             _ = ack_pending[i].fetchAdd(1, .acq_rel);
             n_targets += 1;
         }
         _ = @atomicRmw(u64, &n_shootdowns_cpumask_skipped, .Add, n_skipped, .monotonic);
+        _ = @atomicRmw(u64, &n_shootdowns_lazy_skipped, .Add, n_lazy, .monotonic);
 
         if (n_targets > 0) {
             // Broadcast — iterate the local inflight_mask snapshot. Tiny cost
@@ -394,9 +439,9 @@ fn doShootdown(mode: Mode, affected_pcid: u16, va: u64) void {
 
     const t_acked = perf.rdtsc();
 
-    // Local flush in the same mode the peers used. Then bump the PCID
-    // generation counter so peers lazy-flush this PCID on their next CR3
-    // load.
+    // Local flush in the same mode the peers used. The PCID generation was
+    // bumped before the targets were picked, so every peer also flushes this
+    // PCID on its next CR3 load.
     //
     // Why .single_page is bumped too (it used to be excluded): the peer IPI
     // handler flushes a single_page shootdown via INVPCID type-0
@@ -409,7 +454,7 @@ fn doShootdown(mode: Mode, affected_pcid: u16, va: u64) void {
     // the peer to full-flush this PCID on the CR3 load that brings the process
     // back, so the stale entry can never be USED. The sender's own CPU is
     // covered by flushLocalForMode's INVLPG backstop (.single_page branch), and
-    // the bump catches local_gen up so the sender doesn't redundantly full-
+    // markFlushed catches its local_gen up so it doesn't redundantly full-
     // flush on its next reload. Cost is one PCID flush per migration (bumps
     // between migrations collapse to one), not per shootdown.
     //
@@ -421,16 +466,19 @@ fn doShootdown(mode: Mode, affected_pcid: u16, va: u64) void {
     // now closed.
     //
     // Hypercall path already flushed self via FLUSH_ALL_PROCESSORS, so skip
-    // the local flush there — but still bump PCID gen for the same reason.
+    // the local flush there (the gen bump stands for the same reason).
     if (!via_hypercall) flushLocalForMode();
-    if (affected_pcid != 0) {
-        pcid.bumpAfterShootdown(affected_pcid, me);
+    // Only a sender running the PCID flushed it reliably (INVLPG acts on the
+    // loaded tag); otherwise its own lazy entries wait for the reload flush.
+    if (affected_pcid != 0 and pcid.loadedOn(me) == affected_pcid) {
+        pcid.markFlushed(affected_pcid, me, new_gen);
     }
 
     switch (mode) {
         .full => _ = @atomicRmw(u64, &n_shootdowns_full, .Add, 1, .monotonic),
         .single_context => _ = @atomicRmw(u64, &n_shootdowns_context, .Add, 1, .monotonic),
         .single_page => _ = @atomicRmw(u64, &n_shootdowns_page, .Add, 1, .monotonic),
+        .range => _ = @atomicRmw(u64, &n_shootdowns_range, .Add, 1, .monotonic),
     }
 
     shootdown_lock.store(0, .release);
@@ -462,7 +510,34 @@ pub fn shootdownAll(affected_pcid: u16) void {
         .single_context
     else
         .full;
-    doShootdown(mode, affected_pcid, 0);
+    doShootdown(mode, affected_pcid, 0, 0);
+}
+
+/// Flush one user page of `affected_pcid` (non-zero) after its PTE changed,
+/// from a caller pinned on `me`. Same protocol as doShootdown, minus the
+/// lock when nobody else is running the PCID right now — the common case
+/// (single-threaded, or siblings parked): bump the generation (CPUs holding
+/// it lazily flush on reload), drop the local entry, done. The bump's
+/// locked RMW also orders the caller's PTE store before the reads below.
+pub fn flushUserPage(affected_pcid: u16, va: u64, me: u8) void {
+    const gen = pcid.bumpGen(affected_pcid);
+    const mine: u32 = if (me < smp.MAX_CPUS) @as(u32, 1) << @as(u5, @intCast(me)) else 0;
+    var others = pcid.cpumaskOf(affected_pcid) & ~mine;
+    while (others != 0) {
+        const i: u8 = @intCast(@ctz(others));
+        others &= others - 1;
+        if (pcid.loadedOn(i) == affected_pcid) {
+            shootdownPage(affected_pcid, va);
+            return;
+        }
+    }
+    asm volatile ("invlpg (%[v])"
+        :
+        : [v] "r" (va),
+        : .{ .memory = true });
+    // INVLPG acts on the loaded tag; a CPU running something else keeps its
+    // lazy entries for the reload flush.
+    if (pcid.loadedOn(me) == affected_pcid) pcid.markFlushed(affected_pcid, me, gen);
 }
 
 /// Broadcast a single-page TLB shootdown for `(affected_pcid, va)`.
@@ -484,5 +559,21 @@ pub fn shootdownPage(affected_pcid: u16, va: u64) void {
         // at a different VA — masking the wrong bug. Surface it.
         debug.kwarn(@src(), "shootdownPage va=0x{X} not page-aligned", .{va});
     }
-    doShootdown(.single_page, affected_pcid, va & ~@as(u64, 0xFFF));
+    doShootdown(.single_page, affected_pcid, va & ~@as(u64, 0xFFF), 1);
+}
+
+/// Shootdown for `pages` consecutive pages from page-aligned `start` after
+/// their PTEs changed (munmap, mprotect, sbrk shrink). Up to RANGE_MAX_PAGES
+/// they go page by page in one IPI round, so the rest of the address space
+/// keeps its TLB entries (and under Hyper-V enlightenments avoids the
+/// whole-AS hypercall, which KVM serves as a full flush of every vCPU);
+/// past that, or without PCID+INVPCID, the whole PCID.
+pub fn shootdownRange(affected_pcid: u16, start: u64, pages: usize) void {
+    if (pages == 0) return;
+    if (pages == 1) return shootdownPage(affected_pcid, start);
+    if (affected_pcid == 0 or !protect.invpcid_supported or pages > RANGE_MAX_PAGES) {
+        shootdownAll(affected_pcid);
+        return;
+    }
+    doShootdown(.range, affected_pcid, start & ~@as(u64, 0xFFF), @intCast(pages));
 }
