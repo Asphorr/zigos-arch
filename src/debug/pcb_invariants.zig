@@ -182,41 +182,44 @@ fn checkPcb(pid: usize) ?[]const u8 {
     // (Skip for is_idle — idle PCBs may have state==.running while their
     // cpu's current_pid points at them, but the bookkeeping uses idle_pid
     // separately; checked elsewhere.)
-    if (!p.is_idle and p.state == .running) {
-        // Transient inbound-dispatch window: pickNext's PICK_CAS set the
-        // state byte to .running but the dispatching CPU hasn't yet
-        // executed setCurrentPid. Skip — `dispatching_in_pid` is the
-        // load-bearing bracket. Caught 2026-05-19 by cross-CPU scan of
-        // pid 4 mid-sysSleep/wake cycle.
-        if (@import("save_trace.zig").isPidDispatchingInAnywhere(@intCast(pid))) {
-            return null;
-        }
-        // Transient outbound-destroy window: destroyCurrent cleared
-        // cpu.current_pid before setState(.zombie/.unused); state stays
-        // .running in between. Symmetric partner of the inbound case;
-        // `dispatching_out_pid` is the load-bearing bracket. Added
-        // 2026-05-20 as the long-planned symmetric fix exposed during
-        // Q1 port stress.
-        if (@import("save_trace.zig").isPidDispatchingOutAnywhere(@intCast(pid))) {
-            return null;
-        }
-        var found = false;
-        for (0..smp.MAX_CPUS) |i| {
-            const cpu = &smp.cpus[i];
-            if (i > 0 and !cpu.alive) continue;
-            if (cpu.current_pid) |cp| {
-                if (cp == pid) {
-                    found = true;
-                    break;
-                }
-            }
-        }
-        if (!found) {
+    if (!p.is_idle and p.state == .running and !runningAccountedFor(pid)) {
+        // The state byte and the CPUs' current_pid are read at different
+        // moments, so the task can leave its CPU in between (a host vCPU
+        // pause mid-scan stretches that gap). Real corruption survives a
+        // re-read; a task that went to sleep meanwhile does not.
+        if (@atomicLoad(process.State, &p.state, .acquire) == .running and !runningAccountedFor(pid)) {
             return "state==.running but no cpu.current_pid points here";
         }
     }
 
     return null;
+}
+
+/// True if a .running pid is some CPU's current_pid or sits in a bracketed
+/// dispatch window.
+fn runningAccountedFor(pid: usize) bool {
+    const save_trace = @import("save_trace.zig");
+    // Transient inbound-dispatch window: pickNext's PICK_CAS set the
+    // state byte to .running but the dispatching CPU hasn't yet
+    // executed setCurrentPid. Skip — `dispatching_in_pid` is the
+    // load-bearing bracket. Caught 2026-05-19 by cross-CPU scan of
+    // pid 4 mid-sysSleep/wake cycle.
+    if (save_trace.isPidDispatchingInAnywhere(@intCast(pid))) return true;
+    // Transient outbound-destroy window: destroyCurrent cleared
+    // cpu.current_pid before setState(.zombie/.unused); state stays
+    // .running in between. Symmetric partner of the inbound case;
+    // `dispatching_out_pid` is the load-bearing bracket. Added
+    // 2026-05-20 as the long-planned symmetric fix exposed during
+    // Q1 port stress.
+    if (save_trace.isPidDispatchingOutAnywhere(@intCast(pid))) return true;
+    for (0..smp.MAX_CPUS) |i| {
+        const cpu = &smp.cpus[i];
+        if (i > 0 and !cpu.alive) continue;
+        if (cpu.current_pid) |cp| {
+            if (cp == pid) return true;
+        }
+    }
+    return false;
 }
 
 /// Trip the one-shot reported latch and halt with a structural-data
