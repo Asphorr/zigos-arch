@@ -87,7 +87,8 @@ pub fn init() void {
     wrmsr(MSR_LSTAR, stub_addr);
     debug.klog("[syscall] LSTAR(cpu{d}): 0x{X:0>16}\n", .{ my_id, stub_addr });
 
-    // SFMASK: RFLAGS bits to clear on syscall (clear IF to disable interrupts)
+    // SFMASK clears IF: the stub runs on the user RSP until it has switched
+    // stacks. doSyscall enables interrupts for the handler body only.
     wrmsr(MSR_SFMASK, 0x200); // Clear IF (bit 9)
     debug.klog("[syscall] syscall/sysret initialized\n", .{});
 }
@@ -167,7 +168,7 @@ fn wrmsr(msr: u32, value: u64) void {
 // The smp.zig assert guarantees the 8-byte read doesn't straddle a cache
 // line, so a same-CPU setTssRsp0 update is observed atomically here.
 
-extern fn doSyscall(num: u32, arg1: u32, arg2: u32, arg3: u32, frame: *anyopaque) callconv(.c) u64;
+extern fn doSyscall(num: u32, arg1: u32, arg2: u32, arg3: u32, frame: ?*anyopaque) callconv(.c) u64;
 
 fn CpuEntry(comptime cpu_id: u8) type {
     const off_user_rsp_str = std.fmt.comptimePrint("{d}", .{@as(usize, cpu_id) * 8});
@@ -236,6 +237,10 @@ fn CpuEntry(comptime cpu_id: u8) type {
                     "test $0xF, %%rsp\n" ++
                     "jnz syscall_align_panic\n" ++
                     "call doSyscall\n" ++
+                    // doSyscall returns with IF=0 already; this makes it
+                    // structural. From `pop %rsp` to sysretq RSP is the user
+                    // stack in ring 0, where an interrupt must not land.
+                    "cli\n" ++
                     "fxrstorq (%%rsp)\n" ++
                     "add $520, %%rsp\n" ++
                     "pop %%r10\n" ++

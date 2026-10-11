@@ -1555,6 +1555,10 @@ pub fn schedule() void {
     // the audit / exit_requested branches so callers that bail early
     // still count toward "this cpu reached schedule()".
     smp.myCpu().schedule_count +%= 1;
+    // No interrupt-handler bracket spans a switch (handleIRQ0 closes its
+    // own first); a depth left here is a handler frame some exit path
+    // abandoned, and the task switched in must not inherit it.
+    spinlock.hardirqReset();
 
     // Breadcrumb: schedule_enter, ctx = caller's current_pid (whichever
     // task is about to be replaced). Picked here rather than later so we
@@ -2680,6 +2684,10 @@ pub fn kernelSleepMs(ms: u32) void {
     @atomicStore(u64, &pcb.wake_tick, deadline, .release);
     registerWakeDeadline(deadline);
     setState(cur, .sleeping);
+    // wakeExpired drops a due deadline whose task is not .sleeping yet (a
+    // tick between the registration and the flip, callers run IF=1).
+    // Already due: stay runnable, and the softYield is a plain yield.
+    if (process.tick_count >= deadline) setState(cur, .running);
     @import("sched_asm.zig").softYield();
 }
 

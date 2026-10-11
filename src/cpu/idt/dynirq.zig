@@ -68,8 +68,11 @@ pub fn registerIrq(vec: u8, handler: DynHandler) void {
 
 export fn handleDynIrq(vec: u32) callconv(.c) void {
     @import("../arch/protect.zig").disallowUserAccess();
+    @import("../../proc/spinlock.zig").hardirqEnter();
+    defer @import("../../proc/spinlock.zig").hardirqExit();
     const t = @import("../../debug/perf.zig").enter();
     defer @import("../../debug/perf.zig").leave(.dynirq, t);
+    defer @import("../syscall.zig").chargeInterrupt(t);
     // Breadcrumb: (vec << 16) | pid. cpu.current_pid read once.
     {
         const pid_now: u64 = if (@import("../smp.zig").myCpu().current_pid) |p| @intCast(p) else 0xFF;
@@ -115,7 +118,11 @@ export fn handleDynIrq(vec: u32) callconv(.c) void {
 /// underlying invariant, but the schedule-from-stub path has historically
 /// been audit-checked and lock-clean, so this is the safer place to call
 /// it while Shape D (per-CPU IRQ trampoline stack) is still pending.
-pub export fn check_and_preempt_dynirq() callconv(.c) void {
+///
+/// A syscall body (IF=1, `in_syscall`) is not a preemption point either:
+/// the flag stays set and doSyscall's endBody runs the schedule() once the
+/// body is done. `interrupted_cs` is the CS the interrupt pushed.
+pub export fn check_and_preempt_dynirq(interrupted_cs: u64) callconv(.c) void {
     const smp_mod = @import("../smp.zig");
     const cpu = smp_mod.myCpu();
     if (cpu.dynirq_preempt_pending) {
@@ -130,10 +137,11 @@ pub export fn check_and_preempt_dynirq() callconv(.c) void {
         // User-mode interrupts are never pinned, so wake dispatch latency
         // for the input path is unchanged.
         //
-        // Asymmetry worth knowing: this is the ONLY clear site. A kernel-
-        // mode timer tick never schedules (irq0 !from_user policy) and
-        // schedule() itself never reads the flag — a deferred preempt is
-        // consumed by the next DEVICE-IRQ epilogue on this CPU, not by a
+        // Asymmetry worth knowing: the flag is cleared here and at a
+        // syscall's end (endBody) only. A kernel-mode timer tick never
+        // schedules (irq0 !from_user policy) and schedule() itself never
+        // reads the flag — a deferred preempt is consumed by the next
+        // DEVICE-IRQ epilogue on this CPU or the syscall exit, not by a
         // tick. Bounded in practice by ambient device IRQ rates; same
         // class of delay the timer policy already imposes on kernel tasks.
         // Tickless: drop a stretch this CPU no longer deserves (work queued
@@ -143,6 +151,11 @@ pub export fn check_and_preempt_dynirq() callconv(.c) void {
         // epilogue the way the deferred preempt itself does.
         @import("irq0.zig").shortenAfterIdleWake();
         if (@import("../../proc/spinlock.zig").preemptionPinned()) return;
+        if (interrupted_cs & 3 == 0) {
+            if (cpu.current_pid) |pid| {
+                if (@import("../../proc/process.zig").procs[pid].in_syscall) return;
+            }
+        }
         cpu.dynirq_preempt_pending = false;
         @import("../../proc/process.zig").schedule();
     }
@@ -167,6 +180,10 @@ pub export fn dynirqIrqStackTop() callconv(.c) usize {
 //
 // Alignment math at `call handleDynIrq`:
 //   CPU frame = 40 bytes, 9 GPRs = 72 bytes, FXSAVE = 512 bytes → 624B ≡ 0 mod 16 ✓
+/// Interrupted CS on the task kstack once DynIrqStub is back from isr_stack:
+/// FXSAVE area + 9 GPRs + the pushed RIP.
+const STUB_CS_OFF_STR = std.fmt.comptimePrint("{d}", .{512 + 9 * 8 + 8});
+
 pub fn DynIrqStub(comptime vec: u8) type {
     const vec_str = std.fmt.comptimePrint("{d}", .{vec});
     return struct {
@@ -217,6 +234,7 @@ pub fn DynIrqStub(comptime vec: u8) type {
                     // 16-aligned at top of FXSAVE area, so the call is ABI-
                     // clean. After return, fall through to fxrstor + GPR
                     // pops + iretq as if no preempt happened.
+                    "movq " ++ STUB_CS_OFF_STR ++ "(%%rsp), %%rdi\n" ++
                     "call check_and_preempt_dynirq\n" ++
                     "fxrstorq (%%rsp)\n" ++
                     "addq $512, %%rsp\n" ++

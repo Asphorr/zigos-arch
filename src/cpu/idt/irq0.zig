@@ -20,6 +20,7 @@ const xhci = @import("../../driver/xhci.zig");
 const signals = @import("../../proc/signals.zig");
 const perf = @import("../../debug/perf.zig");
 const hrtimer = @import("../../proc/hrtimer.zig");
+const spinlock = @import("../../proc/spinlock.zig");
 
 // TSC watermark for the elapsed-time wallclock advance (#1006). BSP-only,
 // mutated solely inside handleIRQ0's `!was_soft_yield` block with IRQs off — no
@@ -152,11 +153,17 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
     defer @import("../../debug/kdbg.zig").validateHandleIRQ0RetAddr(rsp, ret_addr_snap);
 
     const t = perf.enter();
+    spinlock.hardirqEnter();
     // Closed before each schedule(): past it this frame waits out the task's
     // whole time off the CPU, which is not IRQ0 cost (schedule() stops its
-    // own .schedule span at the switch the same way).
+    // own .schedule span at the switch the same way). The hardirq bracket
+    // closes there too — the task switched in must not inherit it.
     var irq0_measured = false;
-    defer if (!irq0_measured) perf.leave(.irq0_timer, t);
+    defer if (!irq0_measured) {
+        spinlock.hardirqExit();
+        perf.leave(.irq0_timer, t);
+        @import("../syscall.zig").chargeInterrupt(t);
+    };
     const cpu = smp.myCpu();
     // Once a second: TSC_AUX (what myCpu() just trusted) still equals the
     // LAPIC ID register, or demote everyone. See smp.auditCpuIdTick.
@@ -468,6 +475,22 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
     //   3. Software int $0x20 from sysYield/sysSleep/pipe block → reschedule.
     //      `was_soft_yield` is set explicitly by the caller; we no longer
     //      infer it from process state.
+    //   4. Real tick inside a syscall body (case 2 with `in_syscall`): the
+    //      task's time like case 1, but the body is no preemption point, so
+    //      the reschedule waits for the syscall's exit (endBody). With the
+    //      body masked, this tick used to fire right after sysret as case 1.
+    if (!from_user and !was_soft_yield) {
+        if (cpu.current_pid) |pid| {
+            const pcb = process.getPCB(pid);
+            if (pcb.in_syscall) {
+                pcb.ticks_used += 1;
+                pcb.acct_cpu_ticks += 1;
+                cpu.dynirq_preempt_pending = true;
+                pcb.body_ticks +%= 1;
+                if (pcb.body_ticks % SOFT_LOCKUP_TICKS == 0) reportSoftLockup(pid, pcb, frame_for_validate[15]);
+            }
+        }
+    }
     if (from_user or was_soft_yield) {
         // Track per-process time usage (real-timer case only — yields are
         // voluntary and shouldn't penalize the slice budget).
@@ -500,6 +523,7 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
                 if (cpu.current_pid) |pid| process.getPCB(pid).ticks_used = 0;
                 deliverPendingToReturnFrame(cpu, rsp);
                 bisectPoint("after force_yield deliverSignals", frame_for_validate, irq_snap);
+                spinlock.hardirqExit();
                 perf.leave(.irq0_timer, t);
                 irq0_measured = true;
                 process.schedule();
@@ -524,6 +548,7 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
         // THIS task is re-scheduled. After it returns, we fall through to
         // isr_irq0's pop-and-iretq, which exits to wherever this task was
         // running before the IRQ.
+        spinlock.hardirqExit();
         perf.leave(.irq0_timer, t);
         irq0_measured = true;
         process.schedule();
@@ -537,6 +562,24 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
     bisectPoint("kernel-mode after rearmTimer", frame_for_validate, irq_snap);
     deliverPendingToReturnFrame(cpu, rsp);
     bisectPoint("kernel-mode after deliverPending", frame_for_validate, irq_snap);
+}
+
+/// Ticks inside one syscall body before [soft-lockup] (5 s of its CPU time
+/// at 100 Hz), then again every multiple. The watchdog can't see such a
+/// loop: the body runs IF=1, so the CPU keeps ticking.
+const SOFT_LOCKUP_TICKS: u32 = 500;
+
+fn reportSoftLockup(pid: usize, pcb: *const process.PCB, rip: u64) void {
+    const ring_len = pcb.syscall_ring.len;
+    const sys = pcb.syscall_ring[(pcb.syscall_ring_head + ring_len - 1) % ring_len];
+    serial.print("[soft-lockup] pid={d} sys#{d}: {d}s of CPU in one syscall body without returning, at ", .{
+        pid, sys, pcb.body_ticks / 100,
+    });
+    if (@import("../../debug/symbols.zig").resolveKernel(rip)) |r| {
+        serial.print("{s}+0x{X}\n", .{ r.name, r.offset });
+    } else {
+        serial.print("0x{X}\n", .{rip});
+    }
 }
 
 /// If the process about to be resumed via iretq is heading back to user mode

@@ -1503,6 +1503,11 @@ pub fn destroyCurrentGraceful(status: u32) void {
 }
 
 fn destroyCurrentImpl(status: u32, persist_shared_dirty: bool) void {
+    // Interrupts stay off to the final schedule(): a handler landing here
+    // would run on a PCB, kstack and address space mid-teardown. Syscall
+    // bodies run IF=1, so the exit paths can arrive with it on.
+    asm volatile ("cli" ::: .{ .memory = true });
+    @import("spinlock.zig").hardirqReset();
     const cur = smp.myCpu().current_pid orelse return;
 
     tearDownTask(cur, status, .destroy, persist_shared_dirty);

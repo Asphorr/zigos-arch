@@ -232,6 +232,12 @@ inline fn flushLocalForMode() void {
 /// counter, then issues EOI. Idempotent.
 /// ctx: irq — reached from isr_tlb_shootdown's asm, IF=0 (tools/ctx_lint.zig root).
 pub export fn handleTlbShootdown() callconv(.c) void {
+    // Can land in a syscall body with AC=1 (user access unlocked).
+    @import("../arch/protect.zig").disallowUserAccess();
+    spinlock.hardirqEnter();
+    defer spinlock.hardirqExit();
+    const t = perf.rdtsc();
+    defer @import("../syscall.zig").chargeInterrupt(t);
     flushLocalForMode();
     // One rdtscp, not a LAPIC register read (a VM exit) — this runs once per
     // shootdown IPI on every target CPU, i.e. on every munmap/COW.

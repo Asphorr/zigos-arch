@@ -340,6 +340,14 @@ pub const PCB = struct {
     // primitives (yield/sleep) and subtracted by doSyscall so the syscall
     // counter reflects CPU time, not wall time.
     perf_gap_cyc: u64 = 0,
+    // True while doSyscall runs the handler body with interrupts on. An
+    // interrupt landing in kernel mode must not switch this task out there:
+    // check_and_preempt_dynirq leaves the preempt pending and doSyscall runs
+    // it on the way out, with interrupts off again.
+    in_syscall: bool = false,
+    // Timer ticks that landed in the current syscall body (handleIRQ0's
+    // soft-lockup report; reset by doSyscall's beginBody).
+    body_ticks: u32 = 0,
     // --- Process tree + exit/wait (Task #73) ---
     // 0 means "no parent" (kernel-spawned, e.g. desktop). When this process
     // exits, killProcess/destroyCurrent looks for procs[parent_pid] with a

@@ -196,7 +196,9 @@ export fn handleException(rsp: u64) callconv(.c) void {
     const gap0 = if (process.currentPCB()) |p| p.perf_gap_cyc else 0;
     defer {
         const gap = (if (process.currentPCB()) |p| p.perf_gap_cyc else gap0) -% gap0;
-        perf.leave(.exception, t +% gap);
+        // Capped at the span: an interrupt at a yield's IF=1 edge is booked
+        // both by the yield and by syscall.chargeInterrupt.
+        perf.leave(.exception, t +% @min(gap, perf.rdtsc() -% t));
     }
     asm volatile ("cli");
     // SMAP: an exception during a syscall body inherits AC=1 from the

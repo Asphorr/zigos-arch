@@ -146,6 +146,9 @@ pub const SpinLock = struct {
     /// signal that discriminates a host pause INSIDE a cli window from a
     /// genuine long hold, since the TSC keeps counting through both.
     acquire_pulse: u64 = 0,
+    /// IRQ_USE_* evidence for the interrupt-safety check (noteIrqUse).
+    /// Atomic OR from any CPU; bits are only ever set.
+    irq_use: u8 = 0,
 
     /// Acquire the lock. Spins until this ticket is served.
     ///
@@ -178,6 +181,7 @@ pub const SpinLock = struct {
         const cpu = currentCpuId();
         if (cpu < MAX_HOLD_CPUS) lock_cpu[cpu].pin += 1;
         restoreIrq(pin_flags);
+        if (comptime witness.enabled) noteIrqUse(self, cpu, pin_flags, ra);
         const ticket = @atomicRmw(u32, &self.next_ticket, .Add, 1, .seq_cst);
         var spins: u64 = 0;
         var warned = false;
@@ -420,6 +424,9 @@ const CpuLockState = struct {
     /// registered. Only this CPU writes its own; the autopsy reads cross-CPU
     /// with a relaxed load — a momentarily-stale value is fine for a diagnostic.
     spin_target: usize = 0,
+    /// Interrupt-handler nesting depth (hardirqEnter/hardirqExit). Written
+    /// by this CPU with IF=0; read by noteIrqUse on this CPU.
+    hardirq: u32 = 0,
 };
 
 /// One cache line per CPU: every acquire and release writes these, and
@@ -544,6 +551,85 @@ pub fn pinPreemption() u8 {
 /// must not underflow a counter into a permanently-unpreemptible CPU.
 pub fn unpinPreemption(cpu: u8) void {
     if (cpu < MAX_HOLD_CPUS and lock_cpu[cpu].pin != 0) lock_cpu[cpu].pin -= 1;
+}
+
+// =============================================================================
+// Interrupt-safety check — lockdep's hardirq-safe vs hardirq-unsafe, lite.
+//
+// A SpinLock taken inside an interrupt handler AND with interrupts enabled
+// outside one deadlocks the CPU whose handler lands while that CPU holds it:
+// the handler spins on its own interrupted holder. acquire() records which of
+// the two uses each lock has seen and reports a lock the first time it has
+// both, naming both sites. acquireIrqSave and acquires with IF=0 are neither
+// use. Only exercised paths are seen — a silent run proves nothing about
+// paths it never took.
+// =============================================================================
+
+const IRQ_USE_HARDIRQ: u8 = 1 << 0;
+const IRQ_USE_IRQS_ON: u8 = 1 << 1;
+const IRQ_USE_REPORTED: u8 = 1 << 2;
+
+const IrqUseSite = struct { lock: usize = 0, ra: usize = 0, use: u8 = 0 };
+/// First site of each use per lock, append-only. Full ⇒ a report lacks the
+/// earlier site; detection itself is unaffected.
+var irq_use_sites: [IRQ_USE_SITES]IrqUseSite = [_]IrqUseSite{.{}} ** IRQ_USE_SITES;
+const IRQ_USE_SITES = 512;
+var irq_use_count: u32 = 0;
+
+/// Bracket an interrupt handler's body. Never across a schedule(): the
+/// depth is per CPU, and the task switched in would inherit it.
+pub fn hardirqEnter() void {
+    const cpu = currentCpuId();
+    if (cpu < MAX_HOLD_CPUS) lock_cpu[cpu].hardirq += 1;
+}
+
+pub fn hardirqExit() void {
+    const cpu = currentCpuId();
+    if (cpu < MAX_HOLD_CPUS and lock_cpu[cpu].hardirq != 0) lock_cpu[cpu].hardirq -= 1;
+}
+
+/// Drop handler frames an exit path abandoned: a task destroying itself
+/// (a signal default action taken from IRQ0 never unwinds the handler),
+/// and schedule(), which no handler bracket legitimately spans.
+pub fn hardirqReset() void {
+    const cpu = currentCpuId();
+    if (cpu < MAX_HOLD_CPUS) lock_cpu[cpu].hardirq = 0;
+}
+
+fn noteIrqUse(self: *SpinLock, cpu: u8, flags: u64, ra: usize) void {
+    if (cpu >= MAX_HOLD_CPUS) return;
+    const use: u8 = if (lock_cpu[cpu].hardirq != 0)
+        IRQ_USE_HARDIRQ
+    else if (flags & 0x200 != 0)
+        IRQ_USE_IRQS_ON
+    else
+        return;
+    if (@atomicLoad(u8, &self.irq_use, .monotonic) & use != 0) return;
+    const prev = @atomicRmw(u8, &self.irq_use, .Or, use, .monotonic);
+    if (prev & use != 0) return;
+    const slot = @atomicRmw(u32, &irq_use_count, .Add, 1, .monotonic);
+    if (slot < IRQ_USE_SITES) irq_use_sites[slot] = .{ .lock = @intFromPtr(self), .ra = ra, .use = use };
+    const other = (IRQ_USE_HARDIRQ | IRQ_USE_IRQS_ON) & ~use;
+    if (prev & other == 0) return;
+    if (@atomicRmw(u8, &self.irq_use, .Or, IRQ_USE_REPORTED, .monotonic) & IRQ_USE_REPORTED != 0) return;
+    serial.print("[irq-unsafe] lock@0x{X}", .{@intFromPtr(self)});
+    if (lockName(@intFromPtr(self))) |n| serial.print(" ({s})", .{n});
+    serial.print(" is taken inside an interrupt handler and with interrupts on: a handler landing on the holder's CPU spins forever\n", .{});
+    printIrqUseSite(use, ra);
+    const n = @min(@atomicLoad(u32, &irq_use_count, .monotonic), IRQ_USE_SITES);
+    for (irq_use_sites[0..n]) |s| {
+        if (s.lock == @intFromPtr(self) and s.use == other) printIrqUseSite(s.use, s.ra);
+    }
+}
+
+fn printIrqUseSite(use: u8, ra: usize) void {
+    const what = if (use == IRQ_USE_HARDIRQ) "in interrupt" else "with IF=1  ";
+    serial.print("  {s} at ", .{what});
+    if (symbols.resolveKernel(ra)) |r| {
+        serial.print("{s}+0x{X}\n", .{ r.name, r.offset });
+    } else {
+        serial.print("0x{X}\n", .{ra});
+    }
 }
 
 pub const HoldVerdict = enum(u8) { unverified, vm_alive, vm_frozen };

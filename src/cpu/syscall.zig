@@ -40,7 +40,58 @@ const SLOW_SC_MIN_GAP_TICKS: u64 = 2;
 var slow_sc_last_tick: u64 = 0; // (a) tick of the last emitted [slow-sc]
 var slow_sc_suppressed: u32 = 0; // (a) crossings hidden since that emission
 
-export fn doSyscall(sys_num: u32, arg1: u32, arg2: u32, arg3: u32, frame_raw: *anyopaque) callconv(.c) u64 {
+/// Native syscalls whose handler body keeps interrupts off. exec/exec_as
+/// replace the address space through kernel-CR3 excursions; shutdown can
+/// enter S3, which manages IF itself. The Linux layer has neither.
+fn bodyKeepsIrqOff(sys_num: u32) bool {
+    return switch (sys_num) {
+        22, 52, 82 => true,
+        else => false,
+    };
+}
+
+/// Enable interrupts for the handler body. The body is not a preemption
+/// point: an interrupt that wants a reschedule leaves it pending
+/// (check_and_preempt_dynirq) and endBody runs it. Locks shared with
+/// interrupt handlers must be IrqSave from here on, as in kernel tasks.
+inline fn beginBody(pcb: ?*process.PCB, keep_irq_off: bool) void {
+    if (keep_irq_off) return;
+    const p = pcb orelse return;
+    p.in_syscall = true;
+    p.body_ticks = 0;
+    asm volatile ("sti" ::: .{ .memory = true });
+}
+
+/// Interrupts off for the rest of the syscall (signal delivery, the frame
+/// restore and sysret need IF=0), then the reschedule an interrupt deferred
+/// during the body. Its descheduled time goes to perf_gap_cyc like a yield.
+inline fn endBody(pcb: ?*process.PCB) void {
+    asm volatile ("cli" ::: .{ .memory = true });
+    const p = pcb orelse return;
+    if (!p.in_syscall) return;
+    p.in_syscall = false;
+    const cpu = @import("smp.zig").myCpu();
+    if (!cpu.dynirq_preempt_pending or @import("../proc/spinlock.zig").preemptionPinned()) return;
+    cpu.dynirq_preempt_pending = false;
+    perf.noteDeferredPreempt();
+    const t0 = perf.rdtsc();
+    process.schedule();
+    p.perf_gap_cyc +%= perf.rdtsc() -% t0;
+}
+
+/// Called by interrupt handlers when they finish: time spent handling an
+/// interrupt that landed in a syscall body is not that syscall's CPU time.
+pub fn chargeInterrupt(t_start: u64) void {
+    const p = process.currentPCB() orelse return;
+    if (!p.in_syscall) return;
+    p.perf_gap_cyc +%= perf.rdtsc() -% t_start;
+    perf.noteIrqInSyscall();
+}
+
+/// `frame_raw` is null on the int 0x80 path, which has no SyscallFrame:
+/// fork, sigreturn, Linux-personality calls and return-path signal delivery
+/// need one and are refused or skipped there.
+export fn doSyscall(sys_num: u32, arg1: u32, arg2: u32, arg3: u32, frame_raw: ?*anyopaque) callconv(.c) u64 {
     // Per-CPU breadcrumb — stamp BEFORE everything else so even if we panic
     // mid-syscall, the autopsy reflects what this CPU was doing.
     @import("../debug/breadcrumb.zig").stamp(.syscall_entry, sys_num);
@@ -117,9 +168,11 @@ export fn doSyscall(sys_num: u32, arg1: u32, arg2: u32, arg3: u32, frame_raw: *a
         // Subtract any descheduled-time gap recorded by blocking primitives
         // (yield/sleep) so the syscall counter reflects CPU time, not wall.
         const gap = if (process.currentPCB()) |pcb| pcb.perf_gap_cyc else 0;
-        const adjusted_t_enter = t_enter +% gap;
         const t_end = perf.rdtsc();
-        const dt = t_end -% adjusted_t_enter;
+        // Saturating: an interrupt at a yield's IF=1 edge is booked both by
+        // the yield and by chargeInterrupt, so the gap can exceed the span.
+        const dt = (t_end -% t_enter) -| gap;
+        const adjusted_t_enter = t_end -% dt;
         perf.leave(.syscall, adjusted_t_enter);
         perf.syscallSample(sys_num, dt);
 
@@ -158,7 +211,8 @@ export fn doSyscall(sys_num: u32, arg1: u32, arg2: u32, arg3: u32, frame_raw: *a
 
     // Cast the asm-supplied frame pointer to its strongly-typed form. Field
     // layout matches the push order in syscall_entry.zig — see signals.zig.
-    const frame: *signals.SyscallFrame = @ptrCast(@alignCast(frame_raw));
+    const frame: ?*signals.SyscallFrame = if (frame_raw) |f| @ptrCast(@alignCast(f)) else null;
+    const cur_pcb = process.currentPCB();
 
     // Linux-personality processes use a completely separate ABI — 6×u64 args
     // read from the frame, Linux syscall numbers, u64 return. Route them to the
@@ -166,9 +220,13 @@ export fn doSyscall(sys_num: u32, arg1: u32, arg2: u32, arg3: u32, frame_raw: *a
     // handling (native sigreturn/signals don't apply to a Linux binary; Linux
     // signal delivery, when it lands, hooks in here). This still returns through
     // the perf `defer` above, so accounting is unaffected.
-    if (process.currentPCB()) |pcb| {
+    if (cur_pcb) |pcb| {
         if (pcb.personality == .linux) {
-            return @import("syscall/linux.zig").dispatch(sys_num, frame);
+            const f = frame orelse return @as(u64, E_NOSYS);
+            beginBody(pcb, false);
+            const r = @import("syscall/linux.zig").dispatch(sys_num, f);
+            endBody(pcb);
+            return r;
         }
     }
 
@@ -178,19 +236,22 @@ export fn doSyscall(sys_num: u32, arg1: u32, arg2: u32, arg3: u32, frame_raw: *a
     // state). Routing it through the regular path would re-deliver any still-
     // pending signal before user code runs the post-handler instruction.
     if (sys_num == 62) {
-        if (process.currentPCB()) |pcb| return @as(u64, signals.sigreturn(pcb, frame));
+        const f = frame orelse return @as(u64, E_NOSYS);
+        if (cur_pcb) |pcb| return @as(u64, signals.sigreturn(pcb, f));
         return 0;
     }
 
+    beginBody(cur_pcb, bodyKeepsIrqOff(sys_num));
     const ret = doSyscallInner(sys_num, arg1, arg2, arg3, frame);
+    endBody(cur_pcb);
 
     // Check pending signals on the way out. Skips if the dispatcher already
     // killed the process (currentPCB returns null after destroyCurrent), and
     // is a no-op when the process is mid-handler (in_signal_handler == true).
     if (process.currentPCB()) |pcb| {
-        if ((@atomicLoad(u32, &pcb.pending_signals, .acquire) & ~pcb.signal_mask) != 0) {
-            return @as(u64, signals.deliverFromSyscallFrame(pcb, frame, ret));
-        }
+        if (frame) |f| if ((@atomicLoad(u32, &pcb.pending_signals, .acquire) & ~pcb.signal_mask) != 0) {
+            return @as(u64, signals.deliverFromSyscallFrame(pcb, f, ret));
+        };
     }
     return @as(u64, ret);
 }
@@ -388,7 +449,7 @@ pub fn syscallName(num: u32) ?[]const u8 {
     return null;
 }
 
-fn doSyscallInner(sys_num: u32, arg1: u32, arg2: u32, arg3: u32, frame: *signals.SyscallFrame) u32 {
+fn doSyscallInner(sys_num: u32, arg1: u32, arg2: u32, arg3: u32, frame: ?*signals.SyscallFrame) u32 {
     // sigreturn (#62) is intercepted in doSyscall outer; fork (#92) needs the
     // frame to seed child's kstack; everything else uses arg1..arg3 only.
     // Explicit switch dispatch — A/B-tested against the comptime
@@ -501,7 +562,7 @@ fn doSyscallInner(sys_num: u32, arg1: u32, arg2: u32, arg3: u32, frame: *signals
         89 => gpu.sysGpuResourceFlush(arg1, arg2),
         90 => window.sysPollEvent(arg1),
         91 => gpu.sysGpuCreateGuestBlob(arg1, arg2),
-        92 => proc.sysFork(frame),
+        92 => if (frame) |f| proc.sysFork(f) else E_NOSYS,
         93 => proc.sysSetsid(),
         94 => proc.sysSetpgid(arg1, arg2),
         95 => proc.sysGetpgrp(),
@@ -556,6 +617,8 @@ pub fn isr_syscall() callconv(.naked) void {
         \\ movl %%ecx, %%r8d
         \\ movl %%edx, %%ecx
         \\ movl %%r8d, %%edx
+        // No SyscallFrame on this path: frame = null.
+        \\ xorl %%r8d, %%r8d
         \\ call doSyscall
         \\ movq %%rax, (%%rsp)
         // Restore all GPRs

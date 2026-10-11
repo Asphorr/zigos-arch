@@ -336,6 +336,12 @@ pub fn sysSleep(ms: u32) u32 {
     @atomicStore(u64, &pcb.wake_tick, deadline, .release);
     @import("../../proc/sched.zig").registerWakeDeadline(deadline);
     process.setState(cur_pid, .sleeping);
+    // A tick between the registration and the state flip (this body runs
+    // IF=1, and the BSP ticks for any CPU) saw us .running with the
+    // deadline due and dropped it from the wake cache. setState's locked
+    // cmpxchg orders the flip before this re-read. Already due: stay
+    // runnable, and the softYield below is a plain yield.
+    if (process.tick_count >= deadline) process.setState(cur_pid, .running);
     // Force the scheduler to actually deschedule us. Same alignment dance as
     // sys#07 — see comments there. wakeExpired() flips us back to .ready once
     // tick_count >= wake_tick.
@@ -1132,6 +1138,12 @@ pub fn sysUsleep(usec: u32) u32 {
         @atomicStore(u64, &pcb.hires_wake_tsc, deadline, .release);
         sched.registerHiresWake(deadline);
         process.setState(cur_pid, .sleeping);
+        // Same register-then-recheck as sysSleep: wakeHiresExpired drops a
+        // due deadline whose task is not .sleeping yet.
+        if (hrtimer.due(perf.rdtsc(), deadline)) {
+            process.setState(cur_pid, .running);
+            continue;
+        }
         // softYield self-accounts the descheduled span into perf_gap_cyc.
         sched_asm.softYield();
     }

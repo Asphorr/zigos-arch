@@ -272,7 +272,7 @@ pub fn syscallSample(num: u32, dt: u64) void {
     // per-number mean) — the paired leave(.syscall) already bucketed it into
     // host_pause, so recording here too would double-count.
     if (dt > CEIL_SYSCALL) return;
-    // Stall-overlap guard: syscalls run IF=1, so a host pause inside one has
+    // Stall-overlap guard: syscall bodies run IF=1, so a host pause inside one has
     // already latched-and-fired IRQ0 on resume → smi published the window
     // BEFORE the syscall returned. end≈now (called right after measurement;
     // µs of skew vs a ≥15ms window is noise), start = end - dt.
@@ -357,4 +357,21 @@ pub fn dumpAll() void {
             .{ n, "-", c.count, c.total, mean, c.max },
         );
     }
+    serial.print("[perf] syscall bodies: {d} interrupts handled inside, {d} deferred reschedules run at exit (since boot)\n", .{
+        @atomicLoad(u64, &irqs_in_syscall, .monotonic),
+        @atomicLoad(u64, &deferred_preempts, .monotonic),
+    });
+}
+
+/// Interrupts taken inside a syscall body (which runs IF=1) and the
+/// reschedules they left for the syscall's exit. Cumulative since boot.
+var irqs_in_syscall: u64 = 0;
+var deferred_preempts: u64 = 0;
+
+pub fn noteIrqInSyscall() void {
+    _ = @atomicRmw(u64, &irqs_in_syscall, .Add, 1, .monotonic);
+}
+
+pub fn noteDeferredPreempt() void {
+    _ = @atomicRmw(u64, &deferred_preempts, .Add, 1, .monotonic);
 }

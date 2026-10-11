@@ -196,8 +196,10 @@ pub const CpuLocal = struct {
     /// stub's frame instead. Net effect: ~50µs wake-latency preserved
     /// without the cross-stack hazard.
     /// (u: this CPU only) Set by dyn-IRQ handler bodies running on this
-    /// CPU's isr_stack with IF=0; consumed by check_and_preempt_dynirq in
-    /// the DynIrqStub epilogue, also on this CPU. NEVER set from a peer.
+    /// CPU's isr_stack with IF=0, and by handleIRQ0 for a tick inside a
+    /// syscall body; consumed by check_and_preempt_dynirq in the DynIrqStub
+    /// epilogue or by doSyscall's endBody, also on this CPU. NEVER set from
+    /// a peer.
     dynirq_preempt_pending: bool = false,
 
     /// Bracket-marker for the schedule() transient demote window. Set to the
