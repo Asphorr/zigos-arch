@@ -151,11 +151,10 @@ pub export fn check_and_preempt_dynirq(interrupted_cs: u64) callconv(.c) void {
         // epilogue the way the deferred preempt itself does.
         @import("irq0.zig").shortenAfterIdleWake();
         if (@import("../../proc/spinlock.zig").preemptionPinned()) return;
-        if (interrupted_cs & 3 == 0) {
-            if (cpu.current_pid) |pid| {
-                if (@import("../../proc/process.zig").procs[pid].in_syscall) return;
-            }
-        }
+        // Boot code before this CPU's first task has no PCB to park:
+        // schedule() would abandon it for good.
+        const pid = cpu.current_pid orelse return;
+        if (interrupted_cs & 3 == 0 and @import("../../proc/process.zig").procs[pid].in_syscall) return;
         cpu.dynirq_preempt_pending = false;
         @import("../../proc/process.zig").schedule();
     }

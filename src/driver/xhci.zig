@@ -654,6 +654,21 @@ pub fn init() bool {
     writeReg64(ir0_base + 0x18, evt_ring.phys);
     // Set ERSTBA (Event Ring Segment Table Base Address)
     writeReg64(ir0_base + 0x10, erst_phys);
+
+    // Arm MSI-X (table entry 0 → interrupter 0) BEFORE IMAN.IE and
+    // USBCMD.INTE, the order Linux uses. QEMU's xHCI marks a vector in use
+    // only when those registers are written with MSI-X already enabled;
+    // armed afterwards, every interrupt is silently dropped. A failed arm
+    // leaves us on the busy-poll path. init() runs after the global sti, so
+    // the sti+hlt waits are safe from here on.
+    if (msix.armOne(dev, 0, xhciIrqHandler)) |armed| {
+        use_msix = true;
+        msix_safe_to_use = true;
+        debug.klog("[xhci] MSI-X armed: IDT vec=0x{x}\n", .{armed.vector.irq_vector});
+    } else {
+        debug.klog("[xhci] MSI-X unavailable — busy-poll fallback\n", .{});
+    }
+
     // Enable interrupter
     var iman = readReg(ir0_base + 0x00);
     iman |= 0x02; // IE (Interrupt Enable)
@@ -684,24 +699,6 @@ pub fn init() bool {
 
     initialized = true;
     debug.klog("[xhci] Controller running!\n", .{});
-
-    // Arm MSI-X: table entry 0 → interrupter 0 by xHCI spec when MSI-X is
-    // enabled. We already set IMAN.IE on interrupter 0 above and CMD_INTE
-    // in USBCMD, so the device is ready to fire — `msix.armOne` just wires
-    // up the IDT vector + LAPIC mailbox + flips the cap's MSI-X-Enable bit.
-    // Failing arm leaves us on the busy-poll path; both work, MSI-X just
-    // saves milliseconds of `pause` per USB transfer.
-    //
-    // xhci.init() runs in Phase 6, AFTER the global `sti` and AFTER
-    // `virtio_gpu.msix_safe_to_use = true` were both flipped, so we can
-    // safely use the sti+hlt path immediately — no two-phase setup needed.
-    if (msix.armOne(dev, 0, xhciIrqHandler)) |armed| {
-        use_msix = true;
-        msix_safe_to_use = true;
-        debug.klog("[xhci] MSI-X armed: IDT vec=0x{x}\n", .{armed.vector.irq_vector});
-    } else {
-        debug.klog("[xhci] MSI-X unavailable — busy-poll fallback\n", .{});
-    }
 
     // Scan ports and enumerate connected devices
     scanAndEnumerate();
