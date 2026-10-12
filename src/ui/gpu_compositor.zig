@@ -28,6 +28,10 @@
 // buffers (see `direct_sources`). A host that cannot export host-visible
 // memory as dma-buf still maps it, and the scanout becomes a single
 // mapped buffer flushed by damage rect (see `scanout_flip`).
+//
+// Frames are damage-limited: the desktop reports the rects it repainted,
+// and a frame uploads, renders (a LOAD pass, one scissor per rect) and
+// reads back only those. A full frame clears and redraws everything.
 
 const std = @import("std");
 const debug = @import("../debug/debug.zig");
@@ -206,6 +210,9 @@ const COMPOSITOR_SAMPLER: u64 = 315;
 const COMPOSITOR_DESC_SET_LAYOUT: u64 = 316;
 const COMPOSITOR_DESC_POOL: u64 = 317;
 const COMPOSITOR_DESC_SET: u64 = 318;
+// Same attachment as COMPOSITOR_RENDER_PASS (so the framebuffer and the
+// pipeline serve both) but it loads the previous frame instead of clearing.
+const COMPOSITOR_RENDER_PASS_LOAD: u64 = 319;
 // Step 8c-5: per-window source image (focused window only for now,
 // scaled to N when this proves out). Same descriptor layout as the
 // background, allocated from the same pool.
@@ -461,6 +468,8 @@ var pending_full: bool = true; // initial frame copies everything
 /// their pixels without reporting damage.
 const Damage = struct {
     full: bool = true,
+    /// Visible GPU-slot windows (counted only for partial damage).
+    slot_windows: u8 = 0,
     bg_count: u8 = 0,
     bg: [MAX_PENDING_RECTS][4]u32 = undefined,
     out_count: u8 = 0,
@@ -483,10 +492,14 @@ const Damage = struct {
 };
 var frame_damage: Damage = .{};
 const FULL_SCREEN = [_][4]u32{.{ 0, 0, RENDER_W, RENDER_H }};
+/// Draw calls (damage rects × layers) a frame may scissor one by one; ~200
+/// bytes of command stream each.
+const MAX_SCISSORED_DRAWS: usize = 24;
 
 fn takeDamage() void {
     frame_damage.bg_count = 0;
     frame_damage.out_count = 0;
+    frame_damage.slot_windows = 0;
     frame_damage.full = pending_full or pending_rect_count == 0;
     if (!frame_damage.full) {
         const n = @min(pending_rect_count, MAX_PENDING_RECTS);
@@ -506,6 +519,25 @@ fn takeDamage() void {
     }
     pending_full = false;
     pending_rect_count = 0;
+    if (frame_damage.full) return;
+
+    // GPU-slot windows: their content area is drawn from the slot image.
+    // A window that moves before the draw is clipped to this frame's
+    // render area; the desktop's repaint of the move brings the next frame.
+    const wm = @import("desktop/window.zig");
+    const TITLEBAR_H: u32 = @import("desktop/layout.zig").TITLEBAR_H;
+    const flags = wm.lockWindows();
+    defer wm.unlockWindows(flags);
+    var wi: u8 = 0;
+    while (wi < wm.windows.len) : (wi += 1) {
+        if (!wm.slot_used[wi]) continue;
+        const w_ref = &wm.windows[wi];
+        if (!w_ref.visible or w_ref.minimized) continue;
+        const slot_idx = w_ref.gpu_slot orelse continue;
+        if (slot_idx >= MAX_WINDOW_SLOTS or !window_slots[slot_idx].in_use) continue;
+        frame_damage.slot_windows += 1;
+        frame_damage.addOut(w_ref.x, w_ref.y + @as(i32, @intCast(TITLEBAR_H)), w_ref.width, w_ref.height -| TITLEBAR_H);
+    }
 }
 
 /// Backbuf rects to upload this frame.
@@ -577,6 +609,12 @@ pub fn requestRenderRect(x: u32, y: u32, w: u32, h: u32) void {
 /// back to full upload on overflow or empty list.
 pub fn requestRenderFromDirty() void {
     const dirty = @import("desktop/dirty.zig");
+    // Nothing changed on screen. Waking anyway would cost a full frame:
+    // a wake with no rects pending reads as "everything".
+    if (!dirty.isFull()) {
+        const n = dirty.rectCount(); // can flip to full on cap overflow
+        if (n == 0 and !dirty.isFull()) return;
+    }
     if (dirty.isFull()) {
         pending_full = true;
     } else if (!pending_full) {
@@ -1424,7 +1462,9 @@ fn setupVulkanRender() bool {
             venus.VK_IMAGE_ASPECT_COLOR_BIT,
             COMPOSITOR_RENDER_VIEW,
         );
-        venus.encodeCreateRenderPass(&scratch_cs, COMPOSITOR_DEVICE, venus.VK_FORMAT_B8G8R8A8_UNORM, COMPOSITOR_RENDER_PASS);
+        venus.encodeCreateRenderPass(&scratch_cs, COMPOSITOR_DEVICE, venus.VK_FORMAT_B8G8R8A8_UNORM, COMPOSITOR_RENDER_PASS, false);
+        // Partial frames: each frame ends with the image in TRANSFER_SRC.
+        venus.encodeCreateRenderPass(&scratch_cs, COMPOSITOR_DEVICE, venus.VK_FORMAT_B8G8R8A8_UNORM, COMPOSITOR_RENDER_PASS_LOAD, true);
         venus.encodeCreateFramebuffer(
             &scratch_cs,
             COMPOSITOR_DEVICE,
@@ -1799,6 +1839,7 @@ fn perFrameCmdArgsLen(cmd_type: u32, args_buf: []const u8) ?usize {
         90 => 40, // vkBeginCommandBuffer
         91 => 8, // vkEndCommandBuffer
         93 => 20, // vkCmdBindPipeline
+        95 => 40, // vkCmdSetScissor (one rect)
         103 => 56, // vkCmdBindDescriptorSets (one set, no dynamic offsets)
         106 => 24, // vkCmdDraw
         // vkCmdCopyBufferToImage / vkCmdCopyImageToBuffer: three handles +
@@ -1957,13 +1998,23 @@ fn renderVulkanFrame(_: f32) FrameResult {
             0x20, // dstAccess = SHADER_READ
         );
     }
+    // Render only the damage: the render image keeps the previous frame
+    // (LOAD pass), so outside the damage it is already current. A full
+    // frame clears instead — the image may not hold a frame yet. Each
+    // damage rect gets the draws under its own scissor; where rects
+    // overlap the same pixels are drawn twice (no blending). Too many
+    // rects × windows would outgrow the command stream: then one scissor
+    // over the bounds.
+    const bounds = if (frame_damage.full) FULL_SCREEN[0] else damageBounds();
+    const bounds_only = [_][4]u32{bounds};
+    const draws = outDamage().len * (1 + @as(usize, frame_damage.slot_windows));
+    const scissors: []const [4]u32 = if (frame_damage.full or draws > MAX_SCISSORED_DRAWS) &bounds_only else outDamage();
     venus.encodeCmdBeginRenderPassClear(
         &scratch_cs,
         COMPOSITOR_CMD_BUF,
-        COMPOSITOR_RENDER_PASS,
+        if (frame_damage.full) COMPOSITOR_RENDER_PASS else COMPOSITOR_RENDER_PASS_LOAD,
         COMPOSITOR_FRAMEBUFFER,
-        RENDER_W,
-        RENDER_H,
+        bounds,
         0.05,
         0.05,
         0.07,
@@ -1971,24 +2022,25 @@ fn renderVulkanFrame(_: f32) FrameResult {
     );
     venus.encodeCmdBindPipeline(&scratch_cs, COMPOSITOR_CMD_BUF, COMPOSITOR_PIPELINE);
 
-    // Draw 1: background — desktop chrome layer (backbuf as one big
-    // texture).  Window content rects in the backbuf are stale (Phase
-    // 4 will skip the gui_fb→backbuf blit entirely); the per-window
-    // draws below overlay the live pixels on top.
-    venus.encodeCmdBindDescriptorSets(&scratch_cs, COMPOSITOR_CMD_BUF, COMPOSITOR_PIPELINE_LAYOUT, COMPOSITOR_DESC_SET);
-    venus.encodeCmdPushConstants(&scratch_cs, COMPOSITOR_CMD_BUF, COMPOSITOR_PIPELINE_LAYOUT, 0x10, &bg_push);
-    venus.encodeCmdDraw(&scratch_cs, COMPOSITOR_CMD_BUF, 3, 1);
+    const wm = @import("desktop/window.zig");
+    const TITLEBAR_H: u32 = @import("desktop/layout.zig").TITLEBAR_H;
+    const flags = wm.lockWindows();
+    for (scissors) |sc| {
+        venus.encodeCmdSetScissor(&scratch_cs, COMPOSITOR_CMD_BUF, sc);
 
-    // Step 9.4 Phase 3: per-window draws. Each visible window with a
-    // gpu_slot binds its own descriptor set + pushes its on-screen
-    // rect (below the title bar — the chrome stays in the backbuf
-    // layer). Fragment shader's bounds-test discards pixels outside
-    // the rect.
-    {
-        const wm = @import("desktop/window.zig");
-        const TITLEBAR_H: u32 = @import("desktop/layout.zig").TITLEBAR_H;
-        const flags = wm.lockWindows();
-        defer wm.unlockWindows(flags);
+        // Draw 1: background — desktop chrome layer (backbuf as one big
+        // texture).  Window content rects in the backbuf are stale (Phase
+        // 4 will skip the gui_fb→backbuf blit entirely); the per-window
+        // draws below overlay the live pixels on top.
+        venus.encodeCmdBindDescriptorSets(&scratch_cs, COMPOSITOR_CMD_BUF, COMPOSITOR_PIPELINE_LAYOUT, COMPOSITOR_DESC_SET);
+        venus.encodeCmdPushConstants(&scratch_cs, COMPOSITOR_CMD_BUF, COMPOSITOR_PIPELINE_LAYOUT, 0x10, &bg_push);
+        venus.encodeCmdDraw(&scratch_cs, COMPOSITOR_CMD_BUF, 3, 1);
+
+        // Step 9.4 Phase 3: per-window draws. Each visible window with a
+        // gpu_slot binds its own descriptor set + pushes its on-screen
+        // rect (below the title bar — the chrome stays in the backbuf
+        // layer). Fragment shader's bounds-test discards pixels outside
+        // the rect.
         var wi: u8 = 0;
         while (wi < wm.windows.len) : (wi += 1) {
             if (!wm.slot_used[wi]) continue;
@@ -2000,12 +2052,12 @@ fn renderVulkanFrame(_: f32) FrameResult {
             if (!sl.in_use) continue;
 
             // Window rect on screen, content area only (skip title bar).
-            const wx: f32 = @floatFromInt(w_ref.x);
-            const wy: f32 = @floatFromInt(w_ref.y + @as(i32, @intCast(TITLEBAR_H)));
-            const ww: f32 = @floatFromInt(w_ref.width);
-            const wh: f32 = @floatFromInt(w_ref.height -| TITLEBAR_H);
-            if (ww <= 0 or wh <= 0) continue;
-            frame_damage.addOut(w_ref.x, w_ref.y + @as(i32, @intCast(TITLEBAR_H)), w_ref.width, w_ref.height -| TITLEBAR_H);
+            const x0: i64 = w_ref.x;
+            const y0: i64 = @as(i64, w_ref.y) + TITLEBAR_H;
+            const content_h: u32 = w_ref.height -| TITLEBAR_H;
+            if (w_ref.width == 0 or content_h == 0) continue;
+            if (x0 >= @as(i64, sc[0]) + sc[2] or x0 + w_ref.width <= sc[0] or
+                y0 >= @as(i64, sc[1]) + sc[3] or y0 + content_h <= sc[1]) continue;
             // uv_scale = (sl.width / sl.mem_w, sl.height / sl.mem_h). The
             // image is allocated at slot mem dims (full alloc area); only
             // the (sl.width × sl.height) drawn portion needs to be visible
@@ -2013,13 +2065,14 @@ fn renderVulkanFrame(_: f32) FrameResult {
             const ux: f32 = @as(f32, @floatFromInt(sl.width)) / @as(f32, @floatFromInt(sl.mem_w));
             const uy: f32 = @as(f32, @floatFromInt(sl.height)) / @as(f32, @floatFromInt(sl.mem_h));
             var per_win_push: [32]u8 = undefined;
-            packPush.p(&per_win_push, wx, wy, ww, wh, ux, uy);
+            packPush.p(&per_win_push, @floatFromInt(x0), @floatFromInt(y0), @floatFromInt(w_ref.width), @floatFromInt(content_h), ux, uy);
 
             venus.encodeCmdBindDescriptorSets(&scratch_cs, COMPOSITOR_CMD_BUF, COMPOSITOR_PIPELINE_LAYOUT, sl.desc_set_id);
             venus.encodeCmdPushConstants(&scratch_cs, COMPOSITOR_CMD_BUF, COMPOSITOR_PIPELINE_LAYOUT, 0x10, &per_win_push);
             venus.encodeCmdDraw(&scratch_cs, COMPOSITOR_CMD_BUF, 3, 1);
         }
     }
+    wm.unlockWindows(flags);
 
     venus.encodeCmdEndRenderPass(&scratch_cs, COMPOSITOR_CMD_BUF);
     // Step 9.1: render image -> readback buffer.
@@ -2231,6 +2284,8 @@ fn run() noreturn {
     //   bucket 7: 100ms+      (frame drop)
     var interval_hist: [8]u32 = .{0} ** 8;
     var full_damage_frames: u32 = 0;
+    // Damaged screen area (sum of the damage rects), per stats window.
+    var damage_px: u64 = 0;
     var prev_frame_tsc: u64 = 0;
     while (true) : (frame_no += 1) {
         // Park until something asks for a frame: requestRender() bumps
@@ -2283,6 +2338,7 @@ fn run() noreturn {
         if (vulkan_render_ready) {
             takeDamage();
             if (frame_damage.full) full_damage_frames += 1;
+            for (outDamage()) |r| damage_px += @as(u64, r[2]) * r[3];
             // 1. Sample-source fill — the fragment shader reads from
             //    `source_pixel_buf` (320×180 backbuf downsample). Step
             //    9.2 will replace this with a full-resolution source.
@@ -2366,14 +2422,16 @@ fn run() noreturn {
         if (now -% fps_last_tick >= 500) {
             const elapsed_ms: u64 = (now -% fps_last_tick) * 10;
             const fps = if (elapsed_ms > 0) (@as(u64, fps_frames) * 1000) / elapsed_ms else 0;
-            debug.klog("[gpu-comp] frame {d}, ~{d} fps over {d} ms (vulkan={d}, full-damage={d}) | intervals <4ms={d} <8={d} <16={d} <24={d} <33={d} <50={d} <100={d} 100+={d}\n", .{
+            debug.klog("[gpu-comp] frame {d}, ~{d} fps over {d} ms (vulkan={d}, full-damage={d}, avg-area={d}px) | intervals <4ms={d} <8={d} <16={d} <24={d} <33={d} <50={d} <100={d} 100+={d}\n", .{
                 frame_no, fps, elapsed_ms, @intFromBool(vulkan_render_ready), full_damage_frames,
+                if (fps_frames > 0) damage_px / fps_frames else 0,
                 interval_hist[0], interval_hist[1], interval_hist[2], interval_hist[3],
                 interval_hist[4], interval_hist[5], interval_hist[6], interval_hist[7],
             });
             fps_last_tick = now;
             fps_frames = 0;
             full_damage_frames = 0;
+            damage_px = 0;
             interval_hist = .{0} ** 8;
         }
 

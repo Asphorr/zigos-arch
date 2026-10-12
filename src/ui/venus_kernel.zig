@@ -46,6 +46,7 @@ pub const CMD_vkAllocateCommandBuffers: u32 = 88;
 pub const CMD_vkBeginCommandBuffer: u32 = 90;
 pub const CMD_vkEndCommandBuffer: u32 = 91;
 pub const CMD_vkCmdBindPipeline: u32 = 93;
+pub const CMD_vkCmdSetScissor: u32 = 95;
 pub const CMD_vkCmdBindDescriptorSets: u32 = 103;
 pub const CMD_vkCmdDraw: u32 = 106;
 pub const CMD_vkCmdPipelineBarrier: u32 = 126;
@@ -101,6 +102,7 @@ pub const VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO: u32 = 23;
 pub const VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO: u32 = 24;
 pub const VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO: u32 = 25;
 pub const VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO: u32 = 26;
+pub const VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO: u32 = 27;
 pub const VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO: u32 = 28;
 pub const VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO: u32 = 30;
 pub const VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO: u32 = 37;
@@ -916,12 +918,15 @@ pub fn encodeCreateImageView(
     cs.writeU64(view_id);
 }
 
-/// Single color attachment; clear → store; final layout = COLOR_ATTACHMENT_OPTIMAL
+/// Single color attachment, stored; final layout = COLOR_ATTACHMENT_OPTIMAL.
+/// `keep_contents` loads the previous contents, which must be in
+/// TRANSFER_SRC_OPTIMAL; otherwise the attachment is cleared.
 pub fn encodeCreateRenderPass(
     cs: *CmdStream,
     device_id: u64,
     format: u32,
     render_pass_id: u64,
+    keep_contents: bool,
 ) void {
     cs.cmdHeader(CMD_vkCreateRenderPass, 0);
     cs.writeU64(device_id);
@@ -934,11 +939,11 @@ pub fn encodeCreateRenderPass(
     cs.writeU32(0); // attachment flags
     cs.writeU32(format);
     cs.writeU32(1); // samples
-    cs.writeU32(1); // loadOp = CLEAR
+    cs.writeU32(if (keep_contents) 0 else 1); // loadOp = LOAD / CLEAR
     cs.writeU32(0); // storeOp = STORE
     cs.writeU32(2); // stencilLoadOp = DONT_CARE
     cs.writeU32(1); // stencilStoreOp = DONT_CARE
-    cs.writeU32(0); // initialLayout = UNDEFINED
+    cs.writeU32(if (keep_contents) VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL else 0); // initialLayout (0 = UNDEFINED)
     cs.writeU32(2); // finalLayout = COLOR_ATTACHMENT_OPTIMAL
     cs.writeU32(1); // subpassCount
     cs.writeU64(1);
@@ -1056,13 +1061,14 @@ pub fn encodeEndCommandBuffer(cs: *CmdStream, cmd_buf_id: u64) void {
 }
 
 /// Begin a render pass with a single color clear value (RGBA float).
+/// Begin a render pass over the render area `area` = {x, y, w, h}. The
+/// clear color is used only by a pass that clears.
 pub fn encodeCmdBeginRenderPassClear(
     cs: *CmdStream,
     cmd_buf_id: u64,
     render_pass_id: u64,
     framebuffer_id: u64,
-    w: u32,
-    h: u32,
+    area: [4]u32,
     r: f32,
     g: f32,
     b: f32,
@@ -1075,10 +1081,10 @@ pub fn encodeCmdBeginRenderPassClear(
     cs.writeNull();
     cs.writeU64(render_pass_id);
     cs.writeU64(framebuffer_id);
-    cs.writeU32(0);
-    cs.writeU32(0);
-    cs.writeU32(w);
-    cs.writeU32(h);
+    cs.writeU32(area[0]);
+    cs.writeU32(area[1]);
+    cs.writeU32(area[2]);
+    cs.writeU32(area[3]);
     cs.writeU32(1); // clearValueCount
     cs.writeU64(1);
     cs.writeU32(0); // VkClearValue tag = color
@@ -1089,6 +1095,19 @@ pub fn encodeCmdBeginRenderPassClear(
     cs.writeF32(b);
     cs.writeF32(a);
     cs.writeU32(0); // VK_SUBPASS_CONTENTS_INLINE
+}
+
+/// One scissor rect {x, y, w, h}, for a pipeline with dynamic scissor.
+pub fn encodeCmdSetScissor(cs: *CmdStream, cmd_buf_id: u64, rect: [4]u32) void {
+    cs.cmdHeader(CMD_vkCmdSetScissor, 0);
+    cs.writeU64(cmd_buf_id);
+    cs.writeU32(0); // firstScissor
+    cs.writeU32(1); // scissorCount
+    cs.writeU64(1);
+    cs.writeU32(rect[0]); // offset.x (i32)
+    cs.writeU32(rect[1]); // offset.y
+    cs.writeU32(rect[2]);
+    cs.writeU32(rect[3]);
 }
 
 pub fn encodeCmdEndRenderPass(cs: *CmdStream, cmd_buf_id: u64) void {
@@ -1370,7 +1389,8 @@ pub fn encodeCreatePipelineLayoutPush(
 }
 
 /// Graphics pipeline for a fullscreen-triangle pass: no vertex input,
-/// no depth/stencil, no blending, no culling, viewport = full image.
+/// no depth/stencil, no blending, no culling, viewport = full image,
+/// dynamic scissor (set it with encodeCmdSetScissor before drawing).
 /// Caller draws 3 vertices via vkCmdDraw (positions come from the
 /// vertex shader's gl_VertexIndex math, no buffer needed).
 pub fn encodeCreateGraphicsPipelinesFullscreen(
@@ -1512,8 +1532,14 @@ pub fn encodeCreateGraphicsPipelinesFullscreen(
     cs.writeF32(0.0);
     cs.writeF32(0.0);
 
-    // pDynamicState = null
+    // pDynamicState: scissor
+    cs.writePresent();
+    cs.writeU32(VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO);
     cs.writeNull();
+    cs.writeU32(0); // flags
+    cs.writeU32(1); // dynamicStateCount
+    cs.writeU64(1);
+    cs.writeU32(1); // VK_DYNAMIC_STATE_SCISSOR
 
     cs.writeU64(layout_id);
     cs.writeU64(render_pass_id);
