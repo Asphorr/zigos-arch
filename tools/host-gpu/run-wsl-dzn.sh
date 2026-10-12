@@ -3,6 +3,7 @@
 # (render server in-process) -> Mesa dzn -> D3D12. See README.md here.
 # Run from the repo after `zig build -Doptimize=ReleaseSafe`; pick
 # "GPU Compositor (experimental)" in the boot menu for mode 9.
+# ACCEL=kvm runs it under KVM instead, in a Hyper-V VM with GPU-PV.
 # Usage: run-wsl-dzn.sh [sdl|none] [extra qemu args...]
 set -e
 GPUPV=${GPUPV:-$HOME/gpupv}
@@ -36,9 +37,13 @@ export VIRGL_LOG_LEVEL=${VIRGL_LOG_LEVEL:-info}
 #   phys-bits=39            keeps PCI BARs inside the kernel's 512 GB physmap
 #   monitor=off             TCG advertises MWAIT IBE but #GPs on ECX != 0
 #   x2apic=off              icount aborts on the x2APIC timer MSR read
+if [ "${ACCEL:-tcg}" = kvm ]; then
+    ACCEL_ARGS="-accel kvm -cpu host"
+else
+    ACCEL_ARGS="-accel tcg,thread=single -icount shift=auto,sleep=on -cpu max,phys-bits=39,monitor=off,x2apic=off"
+fi
 exec $QEMU_WRAP "$QEMU" \
-    -m 256 -accel tcg,thread=single -icount shift=auto,sleep=on \
-    -cpu max,phys-bits=39,monitor=off,x2apic=off -smp 2 -no-reboot \
+    -m 256 $ACCEL_ARGS -smp 2 -no-reboot \
     -machine q35 -vga none \
     -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd \
     -drive if=pflash,format=raw,file=$VARS \

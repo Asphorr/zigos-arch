@@ -107,10 +107,80 @@ Each of these works around a TCG problem ZigOS hits:
 - `SDL_VIDEODRIVER=wayland GALLIUM_DRIVER=d3d12`: WSLg's X11 has no DRI3, so
   GL would fall back to software rendering.
 
+## Inside a Hyper-V VM (KVM)
+
+Windows 10's WSL2 has no nested virtualization, but a Hyper-V VM can: a
+Linux guest with nested virtualization runs QEMU under KVM, and Hyper-V's
+GPU paravirtualization (GPU-PV) gives it the same `/dev/dxg` as WSL2.
+Tested with an Ubuntu 24.04 guest on kernel 7.0 and an RTX 3050 host.
+
+1. On the host, in an elevated PowerShell: `hyperv-gpupv.ps1 -VMName NAME
+   [-DataDisk D:\path\data.vhdx]`. It shuts the VM down, adds the GPU
+   partition and the MMIO space it needs, and starts the VM again. A VM
+   with a GPU partition can be neither saved nor checkpointed, so the
+   script turns automatic checkpoints off and makes the VM shut down with
+   the host. The driver store and the builds below take about 6 GB; the
+   optional data disk is for that.
+
+2. In the guest, build `dxgkrnl` (the `/dev/dxg` driver; it is not in
+   mainline) from the WSL kernel, ported to 7.0 by `dxgkrnl-linux-7.0.patch`:
+
+   ```sh
+   # linux-msft-wsl-6.18.y at rolling-lts/wsl/6.18.54.1
+   mkdir wsl-kernel && cd wsl-kernel && git init -q
+   git remote add origin https://github.com/microsoft/WSL2-Linux-Kernel.git
+   git sparse-checkout set drivers/hv/dxgkrnl include/uapi/misc
+   git fetch --depth 1 --filter=blob:none origin d504d40ab83839cb61942a812a99d183c42227b9
+   git checkout FETCH_HEAD && cd ..
+   S=/usr/src/dxgkrnl-6.18.54.1
+   sudo mkdir -p $S/include/uapi/misc
+   sudo cp wsl-kernel/drivers/hv/dxgkrnl/* $S/
+   sudo cp wsl-kernel/include/uapi/misc/d3dkmthk.h $S/include/uapi/misc/
+   (cd $S && sudo patch -p1 < /path/to/zigos-arch/tools/host-gpu/dxgkrnl-linux-7.0.patch)
+   ```
+
+   and install it with DKMS so kernel updates rebuild it. In `$S/dkms.conf`:
+
+   ```
+   PACKAGE_NAME="dxgkrnl"
+   PACKAGE_VERSION="6.18.54.1"
+   BUILT_MODULE_NAME[0]="dxgkrnl"
+   DEST_MODULE_LOCATION[0]="/updates/dkms"
+   MAKE[0]="make -C ${kernel_source_dir} M=${dkms_tree}/${PACKAGE_NAME}/${PACKAGE_VERSION}/build modules"
+   CLEAN="make -C ${kernel_source_dir} M=${dkms_tree}/${PACKAGE_NAME}/${PACKAGE_VERSION}/build clean"
+   AUTOINSTALL="yes"
+   ```
+
+   then `sudo dkms install dxgkrnl/6.18.54.1` and
+   `echo dxgkrnl | sudo tee /etc/modules-load.d/dxgkrnl.conf`. Once loaded
+   it binds the vGPU's two VMBus channels and its PCI device (`1414:008e`).
+
+3. Copy the user-mode side from the host into `/usr/lib/wsl`, as WSL2
+   mounts it:
+   - `/usr/lib/wsl/lib`: `C:\Windows\System32\lxss\lib`, then overwrite
+     `libd3d12.so`, `libd3d12core.so` and `libdxcore.so` with the ones in
+     `C:\Program Files\WSL\lib`. WSL itself layers those over the System32
+     ones; with the System32 versions the NVIDIA driver crashes on a
+     misaligned SSE store while the D3D12 device is created.
+   - `ln -s libd3d12core.so /usr/lib/wsl/lib/libD3D12Core.so`: libd3d12
+     asks for that name, which WSL's case-insensitive mount resolves.
+   - `/usr/lib/wsl/drivers`: the GPU driver's folders from
+     `C:\Windows\System32\DriverStore\FileRepository`. For NVIDIA that is
+     `nv_dispi.inf_amd64_*` and `nvmdi.inf_amd64_*`; the user-mode driver
+     the host reports lives in the latter.
+   - `echo /usr/lib/wsl/lib | sudo tee /etc/ld.so.conf.d/ld.wsl.conf; sudo ldconfig`
+
+   `vulkaninfo --summary` with the dzn ICD then lists the host GPU as
+   `Microsoft Direct3D12 (...)`.
+
+4. Build Mesa, virglrenderer and QEMU as above, and run
+   `ACCEL=kvm run-wsl-dzn.sh`. Only the TCG flags change; the rest of the
+   command line is the same.
+
 ## Limitations
 
-- TCG only: a handful of frames per second, bound by guest CPU emulation,
-  not the GPU.
+- TCG only under WSL2: a handful of frames per second, bound by guest CPU
+  emulation, not the GPU. A Hyper-V VM runs it under KVM (see above).
 - WSLg presents the QEMU window by copying it (`[WARN:COPY MODE]` in the
   title).
 - Lavapipe under WSL crashes QEMU in vkr's gbm fallback (`gbm_bo_create`; no

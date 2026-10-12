@@ -1,0 +1,76 @@
+dxgkrnl out-of-tree port to Linux 7.0 (Ubuntu 7.0.0-34 and -38-generic)
+
+Base: github.com/microsoft/WSL2-Linux-Kernel, branch linux-msft-wsl-6.18.y,
+      commit d504d40ab83839cb61942a812a99d183c42227b9
+      ("Merge tag 'rolling-lts/wsl/6.18.54.1'"), files
+      drivers/hv/dxgkrnl/* and include/uapi/misc/d3dkmthk.h.
+
+Layout: paths are relative to a flat module directory that holds the
+contents of drivers/hv/dxgkrnl/ plus include/uapi/misc/d3dkmthk.h.
+Apply with `patch -p1` (or `git apply`) inside that directory; inside the
+WSL kernel tree use `git apply --directory=drivers/hv/dxgkrnl`.
+
+Build: make -C /lib/modules/$(uname -r)/build M=$PWD modules
+
+diff --git a/Makefile b/Makefile
+index 89824cd..eb92e6b 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,5 +1,27 @@
+ # SPDX-License-Identifier: GPL-2.0
+ # Makefile for the hyper-v compute device driver (dxgkrnl).
+ 
++ifneq ($(KERNELRELEASE),)
++
++# Out-of-tree builds have no Kconfig symbol; build as a module.
++CONFIG_DXGKRNL ?= m
++
+ obj-$(CONFIG_DXGKRNL)	+= dxgkrnl.o
+ dxgkrnl-y := dxgmodule.o hmgr.o misc.o dxgadapter.o ioctl.o dxgvmbus.o dxgprocess.o  dxgsyncfile.o
++
++# <uapi/misc/d3dkmthk.h> is not part of the distro headers package.
++ccflags-y += -I$(src)/include
++
++else
++
++KDIR ?= /lib/modules/$(shell uname -r)/build
++
++modules:
++	$(MAKE) -C $(KDIR) M=$(CURDIR) modules
++
++clean:
++	$(MAKE) -C $(KDIR) M=$(CURDIR) clean
++
++.PHONY: modules clean
++
++endif
+diff --git a/dxgkrnl.h b/dxgkrnl.h
+index 09d54bb..6c4ff3d 100644
+--- a/dxgkrnl.h
++++ b/dxgkrnl.h
+@@ -28,6 +28,25 @@
+ #include <linux/hyperv.h>
+ #include <uapi/misc/d3dkmthk.h>
+ #include <linux/version.h>
++
++/*
++ * The channel GUIDs live in the WSL kernel's <linux/hyperv.h> only;
++ * mainline headers lack them when building out of tree.
++ */
++#ifndef HV_GPUP_DXGK_GLOBAL_GUID
++/* GPU paravirtualization global DXGK channel {DDE9CBC0-5060-4436-9448-EA1254A5D177} */
++#define HV_GPUP_DXGK_GLOBAL_GUID \
++	.guid = GUID_INIT(0xdde9cbc0, 0x5060, 0x4436, 0x94, 0x48, \
++			  0xea, 0x12, 0x54, 0xa5, 0xd1, 0x77)
++#endif
++
++#ifndef HV_GPUP_DXGK_VGPU_GUID
++/* GPU paravirtualization per virtual GPU DXGK channel {6E382D18-3336-4F4B-ACC4-2B7703D4DF4A} */
++#define HV_GPUP_DXGK_VGPU_GUID \
++	.guid = GUID_INIT(0x6e382d18, 0x3336, 0x4f4b, 0xac, 0xc4, \
++			  0x2b, 0x77, 0x3, 0xd4, 0xdf, 0x4a)
++#endif
++
+ #include "misc.h"
+ #include "hmgr.h"
+ #include <uapi/misc/d3dkmthk.h>
