@@ -1,5 +1,8 @@
-// Vulkan Triangle — Venus wire protocol over virtio-gpu
-// Renders a red triangle via Vulkan/Venus, displays CPU visualization
+// Vulkan Triangle — Venus wire protocol over virtio-gpu.
+// Renders into a device-local image, copies it into a host-visible buffer and
+// reads that buffer through a mapped HOST3D blob. Memory types come from the
+// host driver's reported properties, so this runs on real GPUs as well as on
+// lavapipe's single all-purpose type.
 
 const libc = @import("libc");
 const venus = @import("venus");
@@ -42,7 +45,17 @@ const frag_spirv = [_]u32{
 
 const RT_W: u32 = 320;
 const RT_H: u32 = 240;
+const PX_BYTES: u32 = RT_W * RT_H * 4;
 const VK_FORMAT_R8G8B8A8_UNORM: u32 = 37;
+
+const VK_IMAGE_USAGE_TRANSFER_SRC_BIT: u32 = 0x1;
+const VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT: u32 = 0x10;
+const VK_BUFFER_USAGE_TRANSFER_DST_BIT: u32 = 0x2;
+const VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL: u32 = 6;
+const VK_PIPELINE_STAGE_TRANSFER_BIT: u32 = 0x1000;
+const VK_PIPELINE_STAGE_HOST_BIT: u32 = 0x4000;
+const VK_ACCESS_TRANSFER_WRITE_BIT: u32 = 0x1000;
+const VK_ACCESS_HOST_READ_BIT: u32 = 0x2000;
 
 const INSTANCE: u64 = 100;
 const PHYS_DEV: u64 = 101;
@@ -51,6 +64,8 @@ const QUEUE: u64 = 103;
 const IMAGE: u64 = 200;
 const IMAGE_VIEW: u64 = 201;
 const RENDER_MEM: u64 = 202;
+const READBACK_BUF: u64 = 203;
+const READBACK_MEM: u64 = 204;
 const RENDER_PASS: u64 = 300;
 const PIPELINE_LAYOUT: u64 = 301;
 const VERT_MODULE: u64 = 302;
@@ -59,6 +74,7 @@ const PIPELINE: u64 = 304;
 const FRAMEBUFFER: u64 = 305;
 const CMD_POOL: u64 = 400;
 const CMD_BUF: u64 = 401;
+const FENCE: u64 = 402;
 
 var cs: venus.CmdStream = .{};
 var reply_buf: [*]volatile u8 = undefined;
@@ -111,27 +127,58 @@ export fn _start() callconv(.c) noreturn {
         }
     }.f, "vkEnumPhysDev")) { cleanup(); halt(); }
 
-    if (!vkEnc(venus.encodeCreateDeviceExportable, .{ PHYS_DEV, 0, DEVICE }, "vkCreateDevice")) { cleanup(); halt(); }
+    // Memory types as the host driver reports them.
+    beginChecked();
+    venus.encodeGetPhysicalDeviceMemoryProperties(&cs, PHYS_DEV);
+    if (!submitAndWait() or replyCmd() != venus.CMD_vkGetPhysicalDeviceMemoryProperties) {
+        libc.print("  memory properties: no reply\n");
+        cleanup(); halt();
+    }
+    const props = venus.decodeMemoryPropertiesReply(reply_buf);
+    if (props.memory_type_count > venus.VK_MAX_MEMORY_TYPES) { cleanup(); halt(); }
+    libc.print("  memory types:");
+    for (0..props.memory_type_count) |i| {
+        libc.print(" ");
+        libc.printNum(@intCast(i));
+        libc.print("=");
+        libc.printHex(props.memory_types[i].property_flags);
+    }
+    libc.print("\n");
+    if (props.memory_type_count == 0) { cleanup(); halt(); }
+
+    if (!vkEnc(venus.encodeCreateDevice, .{ PHYS_DEV, 0, DEVICE }, "vkCreateDevice")) { cleanup(); halt(); }
     fire(venus.encodeGetDeviceQueue, .{ DEVICE, 0, 0, QUEUE });
 
-    if (!vkEnc(venus.encodeCreateImage, .{ DEVICE, RT_W, RT_H, VK_FORMAT_R8G8B8A8_UNORM, 0x10, IMAGE }, "vkCreateImage")) { cleanup(); halt(); }
-    const mem_size: u32 = RT_W * RT_H * 4;
-    if (!vkEnc(venus.encodeAllocateMemory, .{ DEVICE, @as(u64, mem_size), 0, RENDER_MEM }, "vkAllocMemory")) { cleanup(); halt(); }
+    // Render target: device-local where the host has such a type.
+    if (!vkEnc(venus.encodeCreateImage, .{ DEVICE, RT_W, RT_H, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, IMAGE }, "vkCreateImage")) { cleanup(); halt(); }
+    const img_req = requirements(venus.encodeGetImageMemoryRequirements, IMAGE, "image") orelse { cleanup(); halt(); };
+    const img_type = venus.pickMemoryTypeBits(&props, img_req.type_bits, venus.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0) orelse
+        venus.pickMemoryTypeBits(&props, img_req.type_bits, 0, 0) orelse { libc.print("  no memory type for image\n"); cleanup(); halt(); };
+    if (!vkEnc(venus.encodeAllocateMemory, .{ DEVICE, img_req.size, img_type, RENDER_MEM }, "vkAllocMemory(image)")) { cleanup(); halt(); }
     if (!vkEnc(venus.encodeBindImageMemory, .{ DEVICE, IMAGE, RENDER_MEM, 0 }, "vkBindImgMem")) { cleanup(); halt(); }
 
-    // Try blob-backed readback
+    // Readback buffer: host-visible, mapped straight into this process.
+    if (!vkEnc(venus.encodeCreateBuffer, .{ DEVICE, @as(u64, PX_BYTES), VK_BUFFER_USAGE_TRANSFER_DST_BIT, READBACK_BUF }, "vkCreateBuffer")) { cleanup(); halt(); }
+    const buf_req = requirements(venus.encodeGetBufferMemoryRequirements, READBACK_BUF, "buffer") orelse { cleanup(); halt(); };
+    const buf_type = venus.pickMemoryTypeBits(&props, buf_req.type_bits, venus.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | venus.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0) orelse {
+        libc.print("  no host-visible memory type for buffer\n");
+        cleanup(); halt();
+    };
+    // the blob maps whole pages
+    const buf_size: u32 = @intCast((@max(buf_req.size, PX_BYTES) + 4095) & ~@as(u64, 4095));
+    if (!vkEnc(venus.encodeAllocateMemory, .{ DEVICE, @as(u64, buf_size), buf_type, READBACK_MEM }, "vkAllocMemory(buffer)")) { cleanup(); halt(); }
+    if (!vkEnc(venus.encodeBindBufferMemory, .{ DEVICE, READBACK_BUF, READBACK_MEM, 0 }, "vkBindBufMem")) { cleanup(); halt(); }
+
     var pixel_ptr: ?[*]volatile u8 = null;
-    const blob_res = libc.gpuCreateBlobWithId(venus.BLOB_MEM_HOST3D, mem_size, @intCast(RENDER_MEM));
-    if (blob_res) |br| {
-        pixel_ptr = libc.gpuMapBlob(br, mem_size);
-        if (pixel_ptr != null) libc.print("Blob mapped!\n") else libc.print("mapBlob fail\n");
+    if (libc.gpuCreateBlobWithId(venus.BLOB_MEM_HOST3D, buf_size, @intCast(READBACK_MEM))) |br| {
+        pixel_ptr = libc.gpuMapBlob(br, buf_size);
+        libc.print(if (pixel_ptr != null) "  readback buffer mapped\n" else "  mapBlob fail\n");
     } else {
-        libc.print("createBlob fail (CPU fallback)\n");
+        libc.print("  createBlob fail (CPU fallback)\n");
     }
 
     if (!vkEnc(venus.encodeCreateImageView, .{ DEVICE, IMAGE, VK_FORMAT_R8G8B8A8_UNORM, IMAGE_VIEW }, "vkCreateImgView")) { cleanup(); halt(); }
-
-    if (!vkEnc(venus.encodeCreateRenderPass, .{ DEVICE, VK_FORMAT_R8G8B8A8_UNORM, RENDER_PASS }, "vkRenderPass")) { cleanup(); halt(); }
+    if (!vkEnc(venus.encodeCreateRenderPassEx, .{ DEVICE, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, RENDER_PASS }, "vkRenderPass")) { cleanup(); halt(); }
     if (!vkEnc(venus.encodeCreateFramebuffer, .{ DEVICE, RENDER_PASS, IMAGE_VIEW, RT_W, RT_H, FRAMEBUFFER }, "vkFB")) { cleanup(); halt(); }
     if (!vkEnc(venus.encodeCreateShaderModule, .{ DEVICE, &vert_spirv, VERT_MODULE }, "vkShader(v)")) { cleanup(); halt(); }
     if (!vkEnc(venus.encodeCreateShaderModule, .{ DEVICE, &frag_spirv, FRAG_MODULE }, "vkShader(f)")) { cleanup(); halt(); }
@@ -139,26 +186,30 @@ export fn _start() callconv(.c) noreturn {
     if (!vkEnc(venus.encodeCreateGraphicsPipelines, .{ DEVICE, PIPELINE_LAYOUT, RENDER_PASS, VERT_MODULE, FRAG_MODULE, PIPELINE }, "vkPipeline")) { cleanup(); halt(); }
     if (!vkEnc(venus.encodeCreateCommandPool, .{ DEVICE, 0, CMD_POOL }, "vkCmdPool")) { cleanup(); halt(); }
     if (!vkEnc(venus.encodeAllocateCommandBuffers, .{ DEVICE, CMD_POOL, CMD_BUF }, "vkCmdBuf")) { cleanup(); halt(); }
+    if (!vkEnc(venus.encodeCreateFence, .{ DEVICE, 0, FENCE }, "vkCreateFence")) { cleanup(); halt(); }
 
     fire(venus.encodeBeginCommandBuffer, .{CMD_BUF});
     fire(venus.encodeCmdBeginRenderPass, .{ CMD_BUF, RENDER_PASS, FRAMEBUFFER, RT_W, RT_H });
     fire(venus.encodeCmdBindPipeline, .{ CMD_BUF, PIPELINE });
     fire(venus.encodeCmdDraw, .{ CMD_BUF, 3, 1 });
     fire(venus.encodeCmdEndRenderPass, .{CMD_BUF});
+    fire(venus.encodeCmdCopyImageToBuffer, .{ CMD_BUF, IMAGE, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, READBACK_BUF, RT_W, RT_H });
+    fire(venus.encodeCmdMemoryBarrier, .{ CMD_BUF, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT });
     fire(venus.encodeEndCommandBuffer, .{CMD_BUF});
 
-    // Submit + WaitIdle: reply stream overlaps render image in SHM, so ignore reply value
-    _ = vkEnc(venus.encodeQueueSubmit, .{ QUEUE, CMD_BUF }, "vkSubmit");
-    _ = vkEnc(venus.encodeDeviceWaitIdle, .{DEVICE}, "vkWaitIdle");
+    // vkr does not implement the *WaitIdle calls (they kill the context): wait on a fence.
+    if (!vkEnc(venus.encodeQueueSubmitFence, .{ QUEUE, CMD_BUF, FENCE }, "vkSubmit")) { cleanup(); halt(); }
+    if (!vkEnc(venus.encodeWaitForFences, .{ DEVICE, FENCE, @as(u64, 5_000_000_000) }, "vkWaitForFences")) { cleanup(); halt(); }
 
     libc.print("\nAll Vulkan calls OK!\n");
 
     // Display
-    const _win = libc.createWindow(RT_W, RT_H) orelse { cleanup(); halt(); };
-    const fb = _win.fb;
+    const win = libc.createWindow(RT_W, RT_H) orelse { cleanup(); halt(); };
+    const fb = win.fb;
+    const stride = win.alloc_w;
 
     if (pixel_ptr) |pixels| {
-        libc.print("Copying GPU pixels...\n");
+        var lit: u32 = 0;
         for (0..RT_H) |py| {
             for (0..RT_W) |px| {
                 const off = (py * RT_W + px) * 4;
@@ -166,12 +217,20 @@ export fn _start() callconv(.c) noreturn {
                 const g: u32 = pixels[off + 1];
                 const b: u32 = pixels[off + 2];
                 const a: u32 = pixels[off + 3];
-                fb[py * RT_W + px] = (a << 24) | (r << 16) | (g << 8) | b;
+                if (r != 0) lit += 1;
+                fb[py * stride + px] = (a << 24) | (r << 16) | (g << 8) | b;
             }
         }
+        libc.print("GPU pixels: ");
+        libc.printNum(lit);
+        libc.print(" red of ");
+        libc.printNum(RT_W * RT_H);
+        libc.print("\n");
     } else {
         // CPU fallback
-        for (0..RT_W * RT_H) |i| fb[i] = 0xFF000000;
+        for (0..RT_H) |py| {
+            for (0..RT_W) |px| fb[py * stride + px] = 0xFF000000;
+        }
         const x0: i32 = 160; const y0: i32 = 60;
         const x1i: i32 = 240; const y1i: i32 = 180;
         const x2i: i32 = 80;
@@ -183,7 +242,7 @@ export fn _start() callconv(.c) noreturn {
             var x: i32 = lx;
             while (x <= rx) : (x += 1) {
                 if (x >= 0 and x < @as(i32, RT_W))
-                    fb[@intCast(@as(i32, RT_W) * y + x)] = 0xFFFF0000;
+                    fb[@as(usize, @intCast(y)) * stride + @as(usize, @intCast(x))] = 0xFFFF0000;
             }
         }
     }
@@ -197,20 +256,41 @@ export fn _start() callconv(.c) noreturn {
     while (true) libc.sleep(100);
 }
 
-fn clearReply() void { for (0..64) |i| reply_buf[i] = 0; }
-fn patchReplyFlag() void {
-    const p: *align(1) u32 = @ptrCast(cs.buf[4..8]);
+// The host appends replies to the reply stream; seek back to 0 first so each
+// checked command's reply lands where readReplyResult looks. The 0xFF fill
+// tells "no reply" apart from any real command type (vkCreateInstance is 0).
+fn beginChecked() void {
+    for (0..1024) |i| reply_buf[i] = 0xFF;
+    cs.reset();
+    venus.encodeSeekReplyCommandStream(&cs, 0);
+}
+fn replyCmd() u32 {
+    const p: *align(1) const volatile u32 = @ptrCast(reply_buf);
+    return p.*;
+}
+// The host decodes commands after the submit returns and writes the reply
+// later; poll for it. Generous timeout: emulated guests are slow.
+fn submitAndWait() bool {
+    if (!cs.submit()) return false;
+    var waited_ms: u32 = 0;
+    while (replyCmd() == 0xFFFF_FFFF and waited_ms < 30_000) : (waited_ms += 1) libc.sleep(1);
+    return replyCmd() != 0xFFFF_FFFF;
+}
+fn setReplyFlag(at: usize) void {
+    const p: *align(1) u32 = @ptrCast(cs.buf[at + 4 .. at + 8]);
     p.* = venus.CMD_FLAG_GENERATE_REPLY;
 }
 
 fn vkCmd(encodeFn: *const fn (*venus.CmdStream) void, name: []const u8) bool {
-    clearReply(); cs.reset(); encodeFn(&cs);
+    beginChecked();
+    encodeFn(&cs);
     return checkResult(name);
 }
 fn vkEnc(comptime encodeFn: anytype, args: anytype, name: []const u8) bool {
-    clearReply(); cs.reset();
+    beginChecked();
+    const at = cs.pos;
     @call(.auto, encodeFn, .{&cs} ++ args);
-    patchReplyFlag();
+    setReplyFlag(at);
     return checkResult(name);
 }
 fn fire(comptime encodeFn: anytype, args: anytype) void {
@@ -218,11 +298,29 @@ fn fire(comptime encodeFn: anytype, args: anytype) void {
     @call(.auto, encodeFn, .{&cs} ++ args);
     _ = cs.submit();
 }
+fn requirements(comptime encodeFn: anytype, object: u64, name: []const u8) ?venus.MemoryRequirements {
+    beginChecked();
+    const at = cs.pos;
+    encodeFn(&cs, DEVICE, object);
+    const cmd: *align(1) const u32 = @ptrCast(cs.buf[at .. at + 4]);
+    if (!submitAndWait() or replyCmd() != cmd.*) {
+        libc.print("  "); libc.print(name); libc.print(" requirements: no reply\n");
+        return null;
+    }
+    const req = venus.decodeMemoryRequirementsReply(reply_buf) orelse {
+        libc.print("  "); libc.print(name); libc.print(" requirements: no reply\n");
+        return null;
+    };
+    libc.print("  "); libc.print(name); libc.print(" requirements: size=");
+    libc.printNum(@intCast(req.size)); libc.print(" types="); libc.printHex(req.type_bits); libc.print("\n");
+    return req;
+}
 fn checkResult(name: []const u8) bool {
-    if (!cs.submit()) { libc.print("  "); libc.print(name); libc.print(" FAIL\n"); return false; }
+    const answered = submitAndWait();
     const result = venus.readReplyResult(reply_buf);
     libc.print("  "); libc.print(name);
-    if (result == 0) { libc.print(" OK\n"); return true; }
+    if (result == 0 and answered) { libc.print(" OK\n"); return true; }
+    if (!answered) { libc.print(" NO REPLY\n"); return false; }
     libc.print(" ERR="); libc.printNum(@bitCast(result)); libc.print("\n");
     return false;
 }

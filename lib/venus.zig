@@ -33,6 +33,8 @@ pub const CMD_vkDeviceWaitIdle: u32 = 20;
 pub const CMD_vkAllocateMemory: u32 = 21;
 pub const CMD_vkBindBufferMemory: u32 = 28;
 pub const CMD_vkBindImageMemory: u32 = 29;
+pub const CMD_vkGetBufferMemoryRequirements: u32 = 30;
+pub const CMD_vkGetImageMemoryRequirements: u32 = 31;
 pub const CMD_vkCreateFence: u32 = 35;
 pub const CMD_vkDestroyFence: u32 = 36;
 pub const CMD_vkResetFences: u32 = 37;
@@ -1098,12 +1100,50 @@ pub fn decodeMemoryPropertiesReply(reply_buf: [*]volatile const u8) MemoryProper
 /// Find the first memory type whose property_flags satisfies `required`
 /// bits and excludes `forbidden` bits. Returns null if none match.
 pub fn pickMemoryType(props: *const MemoryProperties, required: u32, forbidden: u32) ?u32 {
+    return pickMemoryTypeBits(props, 0xFFFF_FFFF, required, forbidden);
+}
+
+/// pickMemoryType restricted to `type_bits` (VkMemoryRequirements.memoryTypeBits).
+pub fn pickMemoryTypeBits(props: *const MemoryProperties, type_bits: u32, required: u32, forbidden: u32) ?u32 {
     var i: u32 = 0;
     while (i < props.memory_type_count and i < VK_MAX_MEMORY_TYPES) : (i += 1) {
+        if (type_bits & (@as(u32, 1) << @intCast(i)) == 0) continue;
         const flags = props.memory_types[i].property_flags;
         if ((flags & required) == required and (flags & forbidden) == 0) return i;
     }
     return null;
+}
+
+pub const MemoryRequirements = struct {
+    size: u64,
+    alignment: u64,
+    type_bits: u32,
+};
+
+/// vkGetImageMemoryRequirements; decode the reply with decodeMemoryRequirementsReply.
+pub fn encodeGetImageMemoryRequirements(cs: *CmdStream, device_id: u64, image_id: u64) void {
+    cs.cmdHeader(CMD_vkGetImageMemoryRequirements, CMD_FLAG_GENERATE_REPLY);
+    cs.writeU64(device_id);
+    cs.writeU64(image_id);
+    cs.writePresent(); // pMemoryRequirements (output only: no fields sent)
+}
+
+/// vkGetBufferMemoryRequirements; decode the reply with decodeMemoryRequirementsReply.
+pub fn encodeGetBufferMemoryRequirements(cs: *CmdStream, device_id: u64, buffer_id: u64) void {
+    cs.cmdHeader(CMD_vkGetBufferMemoryRequirements, CMD_FLAG_GENERATE_REPLY);
+    cs.writeU64(device_id);
+    cs.writeU64(buffer_id);
+    cs.writePresent();
+}
+
+/// Reply: u32 cmd_type, u64 pointer present, u64 size, u64 alignment, u32 memoryTypeBits.
+pub fn decodeMemoryRequirementsReply(reply_buf: [*]volatile const u8) ?MemoryRequirements {
+    if (r64(reply_buf, 4) == 0) return null;
+    return .{
+        .size = r64(reply_buf, 12),
+        .alignment = r64(reply_buf, 20),
+        .type_bits = r32(reply_buf, 28),
+    };
 }
 
 pub fn encodeAllocateMemoryExportable(
