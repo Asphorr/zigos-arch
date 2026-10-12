@@ -1,0 +1,3 @@
+# Applied and run from WSL: keep LF on any checkout.
+*.patch -text
+*.sh text eol=lf

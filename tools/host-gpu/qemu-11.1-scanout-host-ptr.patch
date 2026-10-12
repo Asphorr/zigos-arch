@@ -1,0 +1,108 @@
+--- a/hw/display/virtio-gpu-virgl.c
++++ b/hw/display/virtio-gpu-virgl.c
+@@ -261,6 +261,13 @@
+         return 0;
+     }
+ 
++    /* scanout surfaces read straight from this mapping */
++    for (int i = 0; i < b->conf.max_outputs; i++) {
++        if (b->scanout[i].ds && b->scanout[i].resource_id == res->base.resource_id) {
++            virtio_gpu_disable_scanout(g, i);
++        }
++    }
++
+     vmr = to_hostmem_region(res->mr);
+ 
+     trace_virtio_gpu_cmd_res_unmap_blob(res->base.resource_id, mr,
+@@ -517,11 +524,19 @@
+ static void virtio_gpu_rect_update(VirtIOGPU *g, int idx, int x, int y,
+                                 int width, int height)
+ {
+-    if (!g->parent_obj.scanout[idx].con) {
++    struct virtio_gpu_scanout *scanout = &g->parent_obj.scanout[idx];
++
++    if (!scanout->con) {
++        return;
++    }
++
++    /* a surface over mapped blob memory: the display uploads the rect */
++    if (scanout->ds) {
++        qemu_console_update(scanout->con, x, y, width, height);
+         return;
+     }
+ 
+-    qemu_console_gl_update(g->parent_obj.scanout[idx].con, x, y, width, height);
++    qemu_console_gl_update(scanout->con, x, y, width, height);
+ }
+ 
+ static void virgl_cmd_resource_flush(VirtIOGPU *g,
+@@ -586,6 +601,7 @@
+                                              &cmd->error)) {
+             return;
+         }
++        g->parent_obj.scanout[ss.scanout_id].ds = NULL;
+         qemu_console_resize(g->parent_obj.scanout[ss.scanout_id].con,
+                             ss.r.width, ss.r.height);
+         virgl_renderer_force_ctx_0();
+@@ -597,6 +613,7 @@
+             d3d_tex2d);
+     } else {
+         qemu_console_set_surface(g->parent_obj.scanout[ss.scanout_id].con, NULL);
++        g->parent_obj.scanout[ss.scanout_id].ds = NULL;
+         qemu_console_gl_scanout_disable(g->parent_obj.scanout[ss.scanout_id].con);
+     }
+     g->parent_obj.scanout[ss.scanout_id].resource_id = ss.resource_id;
+@@ -1005,18 +1022,47 @@
+         cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
+         return;
+     }
+-    if (res->base.dmabuf_fd < 0) {
+-        qemu_log_mask(LOG_GUEST_ERROR, "%s: resource not backed by dmabuf %d\n",
+-                      __func__, ss.resource_id);
+-        cmd->error = VIRTIO_GPU_RESP_ERR_UNSPEC;
++    if (!virtio_gpu_scanout_blob_to_fb(&fb, &ss, res->base.blob_size)) {
++        cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
+         return;
+     }
+ 
+-    if (!virtio_gpu_scanout_blob_to_fb(&fb, &ss, res->base.blob_size)) {
+-        cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
++    if (res->base.dmabuf_fd < 0) {
++        /*
++         * No dma-buf (e.g. a driver that cannot export host-visible memory),
++         * but the guest has the blob mapped: wrap that memory in a surface.
++         * No copy here; the display uploads flushed rects from it.
++         */
++        struct virtio_gpu_scanout *scanout = &g->parent_obj.scanout[ss.scanout_id];
++        pixman_image_t *rect;
++
++        if (!res->mr) {
++            qemu_log_mask(LOG_GUEST_ERROR,
++                          "%s: resource %d has neither a dmabuf nor a mapping\n",
++                          __func__, ss.resource_id);
++            cmd->error = VIRTIO_GPU_RESP_ERR_UNSPEC;
++            return;
++        }
++
++        rect = pixman_image_create_bits(fb.format, ss.r.width, ss.r.height,
++                                        (uint32_t *)((uint8_t *)memory_region_get_ram_ptr(res->mr) +
++                                                     fb.offset),
++                                        fb.stride);
++        if (!rect) {
++            cmd->error = VIRTIO_GPU_RESP_ERR_UNSPEC;
++            return;
++        }
++
++        g->parent_obj.enable = 1;
++        qemu_console_gl_scanout_disable(scanout->con);
++        scanout->ds = qemu_create_displaysurface_pixman(rect);
++        pixman_image_unref(rect);
++        qemu_console_set_surface(scanout->con, scanout->ds);
++        virtio_gpu_update_scanout(g, ss.scanout_id, &res->base, &fb, &ss.r);
+         return;
+     }
+ 
++    g->parent_obj.scanout[ss.scanout_id].ds = NULL;
+     g->parent_obj.enable = 1;
+     if (virtio_gpu_update_dmabuf(g, ss.scanout_id, &res->base, &fb, &ss.r)) {
+         qemu_log_mask(LOG_GUEST_ERROR, "%s: failed to update dmabuf\n",

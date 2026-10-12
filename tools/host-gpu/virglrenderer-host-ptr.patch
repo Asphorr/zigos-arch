@@ -1,0 +1,802 @@
+diff --git a/server/render_context.c b/server/render_context.c
+index b44b5b5..7512e9f 100644
+--- a/server/render_context.c
++++ b/server/render_context.c
+@@ -108,13 +108,20 @@ render_context_dispatch_create_resource(struct render_context *ctx,
+    struct render_context_op_create_resource_reply reply = {
+       .fd_type = VIRGL_RESOURCE_FD_INVALID,
+    };
+-   int res_fd;
++   int res_fd = -1;
++   void *host_ptr = NULL;
+    bool ok = render_state_create_resource(ctx->ctx_id, req->res_id, req->blob_id,
+                                           req->blob_size, req->blob_flags, &reply.fd_type,
+-                                          &res_fd, &reply.map_info, &reply.vulkan_info);
++                                          &res_fd, &host_ptr, &reply.map_info,
++                                          &reply.vulkan_info);
+    if (!ok)
+       return render_socket_send_reply(&ctx->socket, &reply, sizeof(reply));
+ 
++   if (reply.fd_type == VIRGL_RESOURCE_HOST_PTR) {
++      reply.host_ptr = (uint64_t)(uintptr_t)host_ptr;
++      return render_socket_send_reply(&ctx->socket, &reply, sizeof(reply));
++   }
++
+    ok =
+       render_socket_send_reply_with_fds(&ctx->socket, &reply, sizeof(reply), &res_fd, 1);
+    close(res_fd);
+diff --git a/server/render_protocol.h b/server/render_protocol.h
+index cae94a0..5d82089 100644
+--- a/server/render_protocol.h
++++ b/server/render_protocol.h
+@@ -150,7 +150,9 @@ struct render_context_op_create_resource_reply {
+    uint32_t map_info; /* VIRGL_RENDERER_MAP_* */
+    /* vulkan_info is set if the fd_type is VIRGL_RESOURCE_FD_OPAQUE */
+    struct virgl_resource_vulkan_info vulkan_info;
+-   /* followed by 1 fd if not VIRGL_RESOURCE_FD_INVALID */
++   /* set if the fd_type is VIRGL_RESOURCE_HOST_PTR (same-process server only) */
++   uint64_t host_ptr;
++   /* followed by 1 fd unless VIRGL_RESOURCE_FD_INVALID or VIRGL_RESOURCE_HOST_PTR */
+ };
+ 
+ /* Import a blob resource to the context
+diff --git a/server/render_state.c b/server/render_state.c
+index bc7f8e1..3b8dbad 100644
+--- a/server/render_state.c
++++ b/server/render_state.c
+@@ -225,12 +225,13 @@ render_state_create_resource(uint32_t ctx_id,
+                              uint32_t blob_flags,
+                              enum virgl_resource_fd_type *out_fd_type,
+                              int *out_res_fd,
++                             void **out_host_ptr,
+                              uint32_t *out_map_info,
+                              struct virgl_resource_vulkan_info *out_vulkan_info)
+ {
+    SCOPE_LOCK_RENDERER();
+    return vkr_renderer_create_resource(ctx_id, res_id, blob_id, blob_size, blob_flags,
+-                                       out_fd_type, out_res_fd, out_map_info,
++                                       out_fd_type, out_res_fd, out_host_ptr, out_map_info,
+                                        out_vulkan_info);
+ }
+ 
+diff --git a/server/render_state.h b/server/render_state.h
+index 98de272..1d304e1 100644
+--- a/server/render_state.h
++++ b/server/render_state.h
+@@ -40,6 +40,7 @@ render_state_create_resource(uint32_t ctx_id,
+                              uint32_t blob_flags,
+                              enum virgl_resource_fd_type *out_fd_type,
+                              int *out_res_fd,
++                             void **out_host_ptr,
+                              uint32_t *out_map_info,
+                              struct virgl_resource_vulkan_info *out_vulkan_info);
+ 
+diff --git a/src/proxy/proxy_context.c b/src/proxy/proxy_context.c
+index 2780a54..45eaf81 100644
+--- a/src/proxy/proxy_context.c
++++ b/src/proxy/proxy_context.c
+@@ -372,6 +372,26 @@ proxy_context_get_blob(struct virgl_context *base,
+       return -1;
+    }
+ 
++   if (reply.fd_type == VIRGL_RESOURCE_HOST_PTR) {
++#ifdef ENABLE_SAME_PROCESS_RENDER_SERVER
++      if (reply_fd_count || !reply.host_ptr) {
++         proxy_log("invalid host ptr reply for blob %" PRIu64, blob_id);
++         if (reply_fd_count)
++            close(reply_fd);
++         return -1;
++      }
++      blob->type = VIRGL_RESOURCE_HOST_PTR;
++      blob->u.host_ptr = (void *)(uintptr_t)reply.host_ptr;
++      blob->map_info = reply.map_info;
++      proxy_context_resource_add(ctx, res_id);
++      return 0;
++#else
++      /* a pointer from another address space is meaningless */
++      proxy_log("host ptr blob %" PRIu64 " from an out-of-process server", blob_id);
++      return -1;
++#endif
++   }
++
+    if (!reply_fd_count) {
+       proxy_log("invalid reply for blob %" PRIu64, blob_id);
+       return -1;
+diff --git a/src/venus/vkr_context.c b/src/venus/vkr_context.c
+index b97e5ea..b687481 100644
+--- a/src/venus/vkr_context.c
++++ b/src/venus/vkr_context.c
+@@ -237,6 +237,7 @@ vkr_context_import_resource_internal(struct vkr_context *ctx,
+    res->res_id = res_id;
+    res->fd_type = fd_type;
+    res->size = blob_size;
++   res->host_ptr_mem = NULL;
+ 
+    /* fd and mmap_ptr cannot be valid at the same time, but allowed to be -1 and NULL */
+    assert(fd < 0 || !mmap_ptr);
+@@ -332,6 +333,22 @@ vkr_context_create_resource_from_device_memory(struct vkr_context *ctx,
+    if (!vkr_device_memory_export_blob(mem, blob_size, blob_flags, &blob))
+       return false;
+ 
++   if (blob.type == VIRGL_RESOURCE_HOST_PTR) {
++      if (!vkr_context_import_resource_internal(ctx, res_id, blob_size, blob.type, -1,
++                                                NULL))
++         return false;
++
++      /* tie the resource to the memory so a guest free waits for the unmap */
++      mtx_lock(&ctx->host_ptr_mutex);
++      struct vkr_resource *res = vkr_context_get_resource(ctx, res_id);
++      res->host_ptr_mem = mem;
++      mem->host_ptr_res_id = res_id;
++      mtx_unlock(&ctx->host_ptr_mutex);
++
++      *out_blob = blob;
++      return true;
++   }
++
+    /* If memory might get exported, store a dup'ed fd in vkr_resource for:
+     * - vkAllocateMemory for dma_buf import
+     * - vkGetMemoryFdPropertiesKHR for dma_buf fd properties query
+@@ -415,6 +432,7 @@ vkr_context_destroy_resource(struct vkr_context *ctx, uint32_t res_id)
+    }
+    mtx_unlock(&ctx->ring_mutex);
+ 
++   vkr_device_memory_on_resource_destroy(ctx, res);
+    vkr_context_remove_resource(ctx, res_id);
+ }
+ 
+@@ -629,6 +647,9 @@ vkr_context_destroy(struct vkr_context *ctx)
+    if (ctx->ring_monitor.started)
+       vkr_context_ring_monitor_fini(ctx);
+ 
++   /* while the devices still exist */
++   vkr_device_memory_release_zombies(ctx, NULL);
++
+    if (ctx->instance) {
+       vkr_log("destroying context %d (%s) with a valid instance", ctx->ctx_id,
+               vkr_context_get_name(ctx));
+@@ -642,6 +663,8 @@ vkr_context_destroy(struct vkr_context *ctx)
+    _mesa_hash_table_destroy(ctx->object_table, vkr_context_free_object);
+    mtx_destroy(&ctx->object_mutex);
+ 
++   mtx_destroy(&ctx->host_ptr_mutex);
++
+    vkr_cs_encoder_fini(&ctx->encoder);
+    vkr_cs_decoder_fini(&ctx->decoder);
+ 
+@@ -738,8 +761,15 @@ vkr_context_create(uint32_t ctx_id,
+ 
+    list_inithead(&ctx->rings);
+ 
++   if (mtx_init(&ctx->host_ptr_mutex, mtx_plain) != thrd_success)
++      goto err_ctx_host_ptr_mutex;
++
++   list_inithead(&ctx->host_ptr_zombies);
++
+    return ctx;
+ 
++err_ctx_host_ptr_mutex:
++   mtx_destroy(&ctx->ring_mutex);
+ err_ctx_ring_mutex:
+    vkr_cs_encoder_fini(&ctx->encoder);
+ err_cs_encoder_init:
+diff --git a/src/venus/vkr_context.h b/src/venus/vkr_context.h
+index 3867f13..6c89b6e 100644
+--- a/src/venus/vkr_context.h
++++ b/src/venus/vkr_context.h
+@@ -32,6 +32,9 @@ struct vkr_resource {
+    } u;
+ 
+    size_t size;
++
++   /* fd_type is host ptr: the memory behind it while the guest still owns it */
++   struct vkr_device_memory *host_ptr_mem;
+ };
+ 
+ enum vkr_context_validate_level {
+@@ -88,6 +91,12 @@ struct vkr_context {
+    mtx_t resource_mutex;
+    struct hash_table *resource_table;
+ 
++   /* VIRGL_RESOURCE_HOST_PTR memories the guest freed while a resource still
++    * maps them; released when the resource or the device goes away
++    */
++   mtx_t host_ptr_mutex;
++   struct list_head host_ptr_zombies;
++
+    bool cs_fatal_error;
+    struct vkr_cs_encoder encoder;
+    struct vkr_cs_decoder decoder;
+diff --git a/src/venus/vkr_device.c b/src/venus/vkr_device.c
+index 603f45b..eac3161 100644
+--- a/src/venus/vkr_device.c
++++ b/src/venus/vkr_device.c
+@@ -305,9 +305,16 @@ vkr_device_object_destroy(struct vkr_context *ctx,
+ 
+    /* always cleanup vkr allocs */
+    switch (obj->type) {
+-   case VK_OBJECT_TYPE_DEVICE_MEMORY:
++   case VK_OBJECT_TYPE_DEVICE_MEMORY: {
++      /* the driver memory is already gone (freed above) */
++      size_t mapped_size = 0;
++      void *still_mapped = vkr_device_memory_detach_resource(
++         ctx, (struct vkr_device_memory *)obj, &mapped_size);
++      if (still_mapped && ctx->on_worker_thread)
++         vkr_device_memory_backfill_mapping(still_mapped, mapped_size);
+       vkr_device_memory_release((struct vkr_device_memory *)obj);
+       break;
++   }
+    case VK_OBJECT_TYPE_DESCRIPTOR_POOL:
+       /* Destroying VkDescriptorPool frees all VkDescriptorSet allocated inside. */
+       vkr_descriptor_pool_release(ctx, (struct vkr_descriptor_pool *)obj);
+@@ -339,6 +346,8 @@ vkr_device_destroy(struct vkr_context *ctx, struct vkr_device *dev, bool destroy
+          vkr_log("vkDeviceWaitIdle(%p) failed(%d)", dev, (int32_t)result);
+    }
+ 
++   vkr_device_memory_release_zombies(ctx, dev);
++
+    mtx_destroy(&dev->object_mutex);
+ 
+    if (!list_is_empty(&dev->objects)) {
+diff --git a/src/venus/vkr_device.h b/src/venus/vkr_device.h
+index c71f085..eca0a18 100644
+--- a/src/venus/vkr_device.h
++++ b/src/venus/vkr_device.h
+@@ -28,6 +28,10 @@ struct vkr_device {
+    struct list_head objects;
+ 
+    void *mtl_device;
++
++   /* per memory type: whether host-visible memory can be allocated exportable */
++   uint32_t host_visible_export_probed;
++   uint32_t host_visible_export_ok;
+ };
+ VKR_DEFINE_OBJECT_CAST(device, VK_OBJECT_TYPE_DEVICE, VkDevice)
+ 
+diff --git a/src/venus/vkr_device_memory.c b/src/venus/vkr_device_memory.c
+index 1abc23a..a9aed14 100644
+--- a/src/venus/vkr_device_memory.c
++++ b/src/venus/vkr_device_memory.c
+@@ -6,6 +6,7 @@
+ #include "vkr_device_memory.h"
+ 
+ #include <math.h>
++#include <sys/mman.h>
+ 
+ #include "vn_protocol_renderer_transport.h"
+ 
+@@ -244,6 +245,49 @@ vkr_gbm_get_fd_info_from_allocation_info(UNUSED struct vkr_physical_device *phys
+ 
+ #endif /* ENABLE_GBM_ALLOCATION */
+ 
++#ifdef ENABLE_SAME_PROCESS_RENDER_SERVER
++/* Some drivers can export device-local memory but not host-visible memory
++ * (D3D12 forbids CPU-visible shared heaps, so dzn fails such allocations).
++ * Probe once per memory type with a small exportable allocation.
++ */
++static bool
++vkr_device_can_export_host_visible(struct vkr_device *dev, uint32_t mem_type_index)
++{
++   const uint32_t bit = 1u << mem_type_index;
++
++   mtx_lock(&dev->object_mutex);
++   if (!(dev->host_visible_export_probed & bit)) {
++      bool ok = false;
++      if (dev->physical_device->is_opaque_fd_export_supported) {
++         const VkExportMemoryAllocateInfo export_info = {
++            .sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
++            .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT,
++         };
++         const VkMemoryAllocateInfo probe_info = {
++            .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++            .pNext = &export_info,
++            .allocationSize = 64 * 1024,
++            .memoryTypeIndex = mem_type_index,
++         };
++         VkDeviceMemory probe;
++         if (dev->proc_table.AllocateMemory(dev->base.handle.device, &probe_info, NULL,
++                                            &probe) == VK_SUCCESS) {
++            dev->proc_table.FreeMemory(dev->base.handle.device, probe, NULL);
++            ok = true;
++         }
++      }
++      dev->host_visible_export_probed |= bit;
++      if (ok)
++         dev->host_visible_export_ok |= bit;
++      vkr_log("memory type %u: host-visible export %s", mem_type_index,
++              ok ? "ok" : "unavailable, mapping via host pointers");
++   }
++   const bool ok = dev->host_visible_export_ok & bit;
++   mtx_unlock(&dev->object_mutex);
++   return ok;
++}
++#endif
++
+ static void
+ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
+                               struct vn_command_vkAllocateMemory *args)
+@@ -300,6 +344,7 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
+    struct vkr_mtl_shm *mtl_shm = NULL;
+    VkExportMemoryAllocateInfo local_export_info;
+    VkImportMemoryMetalHandleInfoEXT local_metal_import;
++   bool host_ptr_only = false;
+ 
+    if ((property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && !res_info) {
+       /* An implementation can support dma_buf import along with opaque fd export/import.
+@@ -312,7 +357,26 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
+          !(export_info->handleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT);
+       const bool force_gbm_import = !!physical_dev->gbm_device;
+       const bool force_udmabuf_import = physical_dev->udmabuf_dev_fd >= 0;
+-      if (!(force_gbm_import || force_udmabuf_import) &&
++#ifdef ENABLE_SAME_PROCESS_RENDER_SERVER
++      host_ptr_only = !(force_gbm_import || force_udmabuf_import) &&
++                      !physical_dev->is_dma_buf_fd_export_supported &&
++                      !physical_dev->EXT_external_memory_metal &&
++                      !vkr_device_can_export_host_visible(dev, mem_type_index);
++#endif
++      if (host_ptr_only) {
++         /* The blob will be the driver's own mapping, not an export.  Drop any
++          * export the guest chained: the driver would reject it, and nothing
++          * outside this process can use it anyway.
++          */
++         if (export_info) {
++            void *prev_of_export_info = vkr_find_prev_struct(
++               alloc_info, VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO);
++            vkr_pnext_set_next(prev_of_export_info, export_info->pNext);
++            export_info = NULL;
++         }
++         /* the VMM maps whole pages */
++         alloc_info->allocationSize = align(alloc_info->allocationSize, getpagesize());
++      } else if (!(force_gbm_import || force_udmabuf_import) &&
+           (physical_dev->is_dma_buf_fd_export_supported ||
+            (physical_dev->is_opaque_fd_export_supported && no_dma_buf_export))) {
+          const VkExternalMemoryHandleTypeFlagBits handle_type =
+@@ -414,7 +478,8 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
+    }
+ 
+    mem->device = dev;
+-   mem->might_export = might_export;
++   /* a host ptr blob has no fd to hand out for later imports */
++   mem->might_export = might_export && !host_ptr_only;
+    mem->property_flags = property_flags;
+    mem->valid_fd_types = valid_fd_types;
+    mem->udmabuf_fd = udmabuf_fd;
+@@ -422,6 +487,131 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
+    mem->mtl_shm = mtl_shm;
+    mem->allocation_size = alloc_info->allocationSize;
+    mem->memory_type_index = mem_type_index;
++   mem->host_ptr_only = host_ptr_only;
++}
++
++/* Driver memory whose CPU mapping a VMM-side resource still maps into the
++ * guest, after the guest freed the VkDeviceMemory.
++ */
++struct vkr_host_ptr_zombie {
++   struct list_head head;
++   uint32_t res_id;
++   struct vkr_device *device;
++   VkDeviceMemory memory;
++   void *ptr;
++   size_t size;
++};
++
++/* Returns true if the driver memory must outlive the guest's vkFreeMemory. */
++static bool
++vkr_device_memory_defer_free(struct vkr_context *ctx, struct vkr_device_memory *mem)
++{
++   bool deferred = false;
++
++   mtx_lock(&ctx->host_ptr_mutex);
++   struct vkr_resource *res =
++      mem->host_ptr_res_id ? vkr_context_get_resource(ctx, mem->host_ptr_res_id) : NULL;
++   if (res && res->host_ptr_mem == mem) {
++      struct vkr_host_ptr_zombie *zombie = calloc(1, sizeof(*zombie));
++      if (zombie) {
++         zombie->res_id = res->res_id;
++         zombie->device = mem->device;
++         zombie->memory = mem->base.handle.device_memory;
++         zombie->ptr = mem->host_ptr;
++         zombie->size = mem->allocation_size;
++         list_addtail(&zombie->head, &ctx->host_ptr_zombies);
++         res->host_ptr_mem = NULL;
++         deferred = true;
++      } else {
++         vkr_log("cannot defer freeing host ptr mem of res %u", res->res_id);
++      }
++   }
++   mtx_unlock(&ctx->host_ptr_mutex);
++
++   return deferred;
++}
++
++void *
++vkr_device_memory_detach_resource(struct vkr_context *ctx,
++                                  struct vkr_device_memory *mem,
++                                  size_t *out_size)
++{
++   void *still_mapped = NULL;
++
++   if (!mem->host_ptr_only)
++      return NULL;
++
++   mtx_lock(&ctx->host_ptr_mutex);
++   if (mem->host_ptr_res_id) {
++      struct vkr_resource *res = vkr_context_get_resource(ctx, mem->host_ptr_res_id);
++      if (res && res->host_ptr_mem == mem) {
++         vkr_log("freeing memory that res %u still maps", res->res_id);
++         res->host_ptr_mem = NULL;
++         still_mapped = mem->host_ptr;
++         *out_size = mem->allocation_size;
++      }
++      mem->host_ptr_res_id = 0;
++   }
++   mtx_unlock(&ctx->host_ptr_mutex);
++
++   return still_mapped;
++}
++
++void
++vkr_device_memory_backfill_mapping(void *ptr, size_t size)
++{
++   /* The VMM keeps pointing here until the resource goes away: back the hole
++    * with zero pages so a guest access cannot fault the host.
++    */
++   /* EEXIST: the driver kept the range mapped (dzn caches heaps), still valid */
++   if (mmap(ptr, size, PROT_READ | PROT_WRITE,
++            MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0) == MAP_FAILED &&
++       errno != EEXIST)
++      vkr_log("cannot backfill freed host ptr mapping %p (%s)", ptr, strerror(errno));
++}
++
++void
++vkr_device_memory_on_resource_destroy(struct vkr_context *ctx, struct vkr_resource *res)
++{
++   if (res->fd_type != VIRGL_RESOURCE_HOST_PTR)
++      return;
++
++   mtx_lock(&ctx->host_ptr_mutex);
++   if (res->host_ptr_mem) {
++      /* the guest still owns the memory; vkFreeMemory releases it as usual */
++      res->host_ptr_mem->host_ptr_res_id = 0;
++      res->host_ptr_mem = NULL;
++   } else {
++      list_for_each_entry_safe (struct vkr_host_ptr_zombie, zombie, &ctx->host_ptr_zombies,
++                                head) {
++         if (zombie->res_id != res->res_id)
++            continue;
++         zombie->device->proc_table.FreeMemory(zombie->device->base.handle.device,
++                                               zombie->memory, NULL);
++         list_del(&zombie->head);
++         free(zombie);
++         break;
++      }
++   }
++   mtx_unlock(&ctx->host_ptr_mutex);
++}
++
++void
++vkr_device_memory_release_zombies(struct vkr_context *ctx, struct vkr_device *dev)
++{
++   mtx_lock(&ctx->host_ptr_mutex);
++   list_for_each_entry_safe (struct vkr_host_ptr_zombie, zombie, &ctx->host_ptr_zombies,
++                             head) {
++      if (dev && zombie->device != dev)
++         continue;
++      vkr_log("device going away while res %u still maps its memory", zombie->res_id);
++      zombie->device->proc_table.FreeMemory(zombie->device->base.handle.device,
++                                            zombie->memory, NULL);
++      vkr_device_memory_backfill_mapping(zombie->ptr, zombie->size);
++      list_del(&zombie->head);
++      free(zombie);
++   }
++   mtx_unlock(&ctx->host_ptr_mutex);
+ }
+ 
+ static void
+@@ -429,12 +619,24 @@ vkr_dispatch_vkFreeMemory(struct vn_dispatch_context *dispatch,
+                           struct vn_command_vkFreeMemory *args)
+ {
+    TRACE_FUNC();
++   struct vkr_context *ctx = dispatch->data;
+    struct vkr_device_memory *mem = vkr_device_memory_from_handle(args->memory);
+    if (!mem)
+       return;
+ 
+    vkr_device_memory_release(mem);
+-   vkr_device_memory_destroy_and_remove(dispatch->data, args);
++
++   if (mem->host_ptr_only && vkr_device_memory_defer_free(ctx, mem)) {
++      /* drop the guest handle, keep the driver memory for the resource */
++      vkr_device_remove_object(ctx, mem->device, &mem->base);
++      return;
++   }
++
++   size_t mapped_size = 0;
++   void *still_mapped = vkr_device_memory_detach_resource(ctx, mem, &mapped_size);
++   vkr_device_memory_destroy_and_remove(ctx, args);
++   if (still_mapped)
++      vkr_device_memory_backfill_mapping(still_mapped, mapped_size);
+ }
+ 
+ static void
+@@ -566,6 +768,41 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
+                                       : VIRGL_RENDERER_MAP_CACHE_WC;
+    }
+ 
++   if (mem->host_ptr_only) {
++#ifdef ENABLE_SAME_PROCESS_RENDER_SERVER
++      if (!(blob_flags & VIRGL_RENDERER_BLOB_FLAG_USE_MAPPABLE) ||
++          (blob_flags & VIRGL_RENDERER_BLOB_FLAG_USE_CROSS_DEVICE)) {
++         vkr_log("host ptr mem supports only mappable, non-cross-device blobs");
++         return false;
++      }
++      if (blob_size > mem->allocation_size) {
++         vkr_log("blob_size %" PRIu64 " > host ptr mem size %" PRIu64, blob_size,
++                 mem->allocation_size);
++         return false;
++      }
++
++      struct vn_device_proc_table *vk = &mem->device->proc_table;
++      void *ptr = NULL;
++      VkResult ret = vk->MapMemory(mem->device->base.handle.device,
++                                   mem->base.handle.device_memory, 0, VK_WHOLE_SIZE, 0, &ptr);
++      if (ret != VK_SUCCESS || !ptr) {
++         vkr_log("host ptr mem map failed (vk ret %d)", ret);
++         return false;
++      }
++
++      mem->exported = true;
++      mem->host_ptr = ptr;
++      *out_blob = (struct virgl_context_blob){
++         .type = VIRGL_RESOURCE_HOST_PTR,
++         .u.host_ptr = ptr,
++         .map_info = map_info,
++      };
++      return true;
++#else
++      return false;
++#endif
++   }
++
+    if (mem->mtl_shm && mem->mtl_shm->shm_fd >= 0) {
+       mem->exported = true;
+       *out_blob = (struct virgl_context_blob){
+diff --git a/src/venus/vkr_device_memory.h b/src/venus/vkr_device_memory.h
+index 3259966..58933a8 100644
+--- a/src/venus/vkr_device_memory.h
++++ b/src/venus/vkr_device_memory.h
+@@ -34,6 +34,14 @@ struct vkr_device_memory {
+    uint32_t memory_type_index;
+ 
+    bool exported;
++
++   /* Host-visible memory the driver cannot export: handed to the VMM as the
++    * driver's own CPU mapping (VIRGL_RESOURCE_HOST_PTR).  host_ptr_res_id is
++    * the resource that maps it, 0 once that resource is gone.
++    */
++   bool host_ptr_only;
++   void *host_ptr;
++   uint32_t host_ptr_res_id;
+ };
+ VKR_DEFINE_OBJECT_CAST(device_memory, VK_OBJECT_TYPE_DEVICE_MEMORY, VkDeviceMemory)
+ 
+@@ -49,4 +57,24 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
+                               uint32_t blob_flags,
+                               struct virgl_context_blob *out_blob);
+ 
++struct vkr_resource;
++
++/* Returns the mapping a resource still exposes (size in *out_size); back it
++ * with vkr_device_memory_backfill_mapping once the driver memory is freed.
++ */
++void *
++vkr_device_memory_detach_resource(struct vkr_context *ctx,
++                                  struct vkr_device_memory *mem,
++                                  size_t *out_size);
++
++void
++vkr_device_memory_backfill_mapping(void *ptr, size_t size);
++
++void
++vkr_device_memory_on_resource_destroy(struct vkr_context *ctx, struct vkr_resource *res);
++
++/* dev == NULL releases every zombie of the context */
++void
++vkr_device_memory_release_zombies(struct vkr_context *ctx, struct vkr_device *dev);
++
+ #endif /* VKR_DEVICE_MEMORY_H */
+diff --git a/src/venus/vkr_renderer.c b/src/venus/vkr_renderer.c
+index 8aae924..24b18d9 100644
+--- a/src/venus/vkr_renderer.c
++++ b/src/venus/vkr_renderer.c
+@@ -179,6 +179,7 @@ vkr_renderer_create_resource(uint32_t ctx_id,
+                              uint32_t blob_flags,
+                              enum virgl_resource_fd_type *out_fd_type,
+                              int *out_res_fd,
++                             void **out_host_ptr,
+                              uint32_t *out_map_info,
+                              struct virgl_resource_vulkan_info *out_vulkan_info)
+ {
+@@ -196,10 +197,15 @@ vkr_renderer_create_resource(uint32_t ctx_id,
+       return false;
+ 
+    assert(blob.type == VIRGL_RESOURCE_FD_SHM || blob.type == VIRGL_RESOURCE_FD_DMABUF ||
+-          blob.type == VIRGL_RESOURCE_FD_OPAQUE);
++          blob.type == VIRGL_RESOURCE_FD_OPAQUE || blob.type == VIRGL_RESOURCE_HOST_PTR);
+ 
+    *out_fd_type = blob.type;
+-   *out_res_fd = blob.u.fd;
++   if (blob.type == VIRGL_RESOURCE_HOST_PTR) {
++      *out_res_fd = -1;
++      *out_host_ptr = blob.u.host_ptr;
++   } else {
++      *out_res_fd = blob.u.fd;
++   }
+    *out_map_info = blob.map_info;
+ 
+    if (blob.type == VIRGL_RESOURCE_FD_OPAQUE) {
+diff --git a/src/venus/vkr_renderer.h b/src/venus/vkr_renderer.h
+index be3ae04..fc4d741 100644
+--- a/src/venus/vkr_renderer.h
++++ b/src/venus/vkr_renderer.h
+@@ -61,6 +61,7 @@ vkr_renderer_create_resource(uint32_t ctx_id,
+                              uint32_t blob_flags,
+                              enum virgl_resource_fd_type *out_fd_type,
+                              int *out_res_fd,
++                             void **out_host_ptr,
+                              uint32_t *out_map_info,
+                              struct virgl_resource_vulkan_info *out_vulkan_info);
+ 
+diff --git a/src/virgl_context.h b/src/virgl_context.h
+index 25bc106..ccd3ed8 100644
+--- a/src/virgl_context.h
++++ b/src/virgl_context.h
+@@ -44,6 +44,7 @@ struct virgl_context_blob {
+       int fd;
+       uint32_t opaque_handle;
+       struct pipe_resource *pipe_resource;
++      void *host_ptr;
+    } u;
+ 
+    uint32_t map_info;
+diff --git a/src/virgl_resource.c b/src/virgl_resource.c
+index 0ee5468..64e502d 100644
+--- a/src/virgl_resource.c
++++ b/src/virgl_resource.c
+@@ -47,7 +47,8 @@ virgl_resource_destroy_func(void *val)
+    if (res->pipe_resource)
+       pipe_callbacks.unref(res->pipe_resource, pipe_callbacks.data);
+    if ((res->fd_type != VIRGL_RESOURCE_FD_INVALID) &&
+-       (res->fd_type != VIRGL_RESOURCE_OPAQUE_HANDLE))
++       (res->fd_type != VIRGL_RESOURCE_OPAQUE_HANDLE) &&
++       (res->fd_type != VIRGL_RESOURCE_HOST_PTR))
+       close(res->fd);
+ 
+    free(res);
+@@ -186,6 +187,24 @@ virgl_resource_create_from_opaque_handle(struct virgl_context *ctx,
+    return res;
+ }
+ 
++struct virgl_resource *
++virgl_resource_create_from_host_ptr(uint32_t res_id, void *host_ptr)
++{
++   struct virgl_resource *res;
++
++   assert(host_ptr);
++
++   res = virgl_resource_create(res_id);
++   if (!res)
++      return NULL;
++
++   /* the context that produced the pointer owns the storage */
++   res->fd_type = VIRGL_RESOURCE_HOST_PTR;
++   res->host_ptr = host_ptr;
++
++   return res;
++}
++
+ struct virgl_resource *
+ virgl_resource_create_from_iov(uint32_t res_id,
+                                const struct iovec *iov,
+@@ -263,6 +282,9 @@ virgl_resource_export_fd(struct virgl_resource *res, int *fd)
+          return VIRGL_RESOURCE_FD_INVALID;
+ 
+       return ctx->export_opaque_handle(ctx, res, fd);
++   } else if (res->fd_type == VIRGL_RESOURCE_HOST_PTR) {
++      /* nothing to share outside this process */
++      return VIRGL_RESOURCE_FD_INVALID;
+    } else if (res->fd_type != VIRGL_RESOURCE_FD_INVALID) {
+       *fd = os_dupfd_cloexec(res->fd);
+       return *fd >= 0 ? res->fd_type : VIRGL_RESOURCE_FD_INVALID;
+diff --git a/src/virgl_resource.h b/src/virgl_resource.h
+index 8eb770e..a079688 100644
+--- a/src/virgl_resource.h
++++ b/src/virgl_resource.h
+@@ -50,6 +50,13 @@ enum virgl_resource_fd_type {
+     */
+    VIRGL_RESOURCE_OPAQUE_HANDLE,
+ 
++   /**
++    * The driver's own CPU mapping of memory it cannot export as an fd (e.g.
++    * D3D12-backed host-visible memory).  Only valid when the render server
++    * shares the address space of the VMM (ENABLE_SAME_PROCESS_RENDER_SERVER).
++    */
++   VIRGL_RESOURCE_HOST_PTR,
++
+    VIRGL_RESOURCE_FD_INVALID = -1,
+ };
+ 
+@@ -94,6 +101,9 @@ struct virgl_resource {
+    uint32_t opaque_handle_context_id;
+    uint32_t opaque_handle;
+ 
++   /* valid when fd_type is VIRGL_RESOURCE_HOST_PTR */
++   void *host_ptr;
++
+    const struct iovec *iov;
+    int iov_count;
+ 
+@@ -152,6 +162,9 @@ virgl_resource_create_from_opaque_handle(struct virgl_context *ctx,
+                                          uint32_t res_id,
+                                          uint32_t opaque_handle);
+ 
++struct virgl_resource *
++virgl_resource_create_from_host_ptr(uint32_t res_id, void *host_ptr);
++
+ struct virgl_resource *
+ virgl_resource_create_from_iov(uint32_t res_id,
+                                const struct iovec *iov,
+diff --git a/src/virglrenderer.c b/src/virglrenderer.c
+index ce2b03d..519b287 100644
+--- a/src/virglrenderer.c
++++ b/src/virglrenderer.c
+@@ -1308,6 +1308,12 @@ int virgl_renderer_resource_create_blob(const struct virgl_renderer_resource_cre
+       res = virgl_resource_create_from_opaque_handle(ctx, args->res_handle, blob.u.opaque_handle);
+       if (!res)
+          return -ENOMEM;
++   } else if (blob.type == VIRGL_RESOURCE_HOST_PTR) {
++      if (has_guest_storage)
++         return -EINVAL;
++      res = virgl_resource_create_from_host_ptr(args->res_handle, blob.u.host_ptr);
++      if (!res)
++         return -ENOMEM;
+    } else if (blob.type != VIRGL_RESOURCE_FD_INVALID) {
+       res = virgl_resource_create_from_fd(args->res_handle,
+                                           blob.type,
+@@ -1382,6 +1388,10 @@ int virgl_renderer_resource_map(uint32_t res_handle, void **out_map, uint64_t *o
+          map = ctx->resource_map(ctx, res, NULL, PROT_WRITE | PROT_READ, MAP_SHARED);
+          map_size = res->map_size;
+          break;
++      case VIRGL_RESOURCE_HOST_PTR:
++         map = res->host_ptr;
++         map_size = res->map_size;
++         break;
+       case VIRGL_RESOURCE_FD_INVALID:
+          /* Avoid a default case so that -Wswitch will tell us at compile time
+           * if a new virgl resource type is added without being handled here.
+@@ -1437,6 +1447,7 @@ int virgl_renderer_resource_map_fixed(uint32_t res_handle, void *addr)
+                                  MAP_FIXED | MAP_SHARED);
+          break;
+       case VIRGL_RESOURCE_FD_OPAQUE:
++      case VIRGL_RESOURCE_HOST_PTR:
+       case VIRGL_RESOURCE_FD_INVALID:
+          /* Avoid a default case so that -Wswitch will tell us at compile time
+           * if a new virgl resource type is added without being handled here.
+@@ -1481,6 +1492,9 @@ int virgl_renderer_resource_unmap(uint32_t res_handle)
+       case VIRGL_RESOURCE_FD_OPAQUE:
+          ret = vkr_allocator_resource_unmap(res);
+          break;
++      case VIRGL_RESOURCE_HOST_PTR:
++         /* the owning context unmaps when the memory is freed */
++         break;
+       case VIRGL_RESOURCE_FD_INVALID:
+          /* Avoid a default case so that -Wswitch will tell us at compile time
+           * if a new virgl resource type is added without being handled here.
+@@ -1529,6 +1543,7 @@ virgl_renderer_resource_export_blob(uint32_t res_id, uint32_t *fd_type, int *fd)
+       *fd_type = VIRGL_RENDERER_BLOB_FD_TYPE_SHM;
+       break;
+    case VIRGL_RESOURCE_OPAQUE_HANDLE:
++   case VIRGL_RESOURCE_HOST_PTR:
+    case VIRGL_RESOURCE_FD_INVALID:
+       /* Avoid a default case so that -Wswitch will tell us at compile time if a
+        * new virgl resource type is added without being handled here.
