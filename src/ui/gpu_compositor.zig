@@ -32,6 +32,10 @@
 // Frames are damage-limited: the desktop reports the rects it repainted,
 // and a frame uploads, renders (a LOAD pass, one scissor per rect) and
 // reads back only those. A full frame clears and redraws everything.
+//
+// Once the render path is up, the desktop draws straight into the
+// background source (`bg_in_place`): the CPU never copies the backbuf.
+// source_lock keeps its drawing and a frame's GPU reads apart.
 
 const std = @import("std");
 const debug = @import("../debug/debug.zig");
@@ -418,6 +422,44 @@ var screen_h_cache: u32 = 0;
 // kernel task.
 pub var compositor_pid: u8 = 0xFF;
 var pending_wakes: u32 = 0;
+
+// The desktop's backbuf, the background source and the pending damage
+// belong to whoever holds source_lock: the desktop for one loop iteration
+// (beginDraw/endDraw), a frame until the GPU has read them. Taken before
+// venus_lock.
+var source_lock: Mutex = .{};
+// The desktop draws straight into the background source's CPU side, so a
+// frame uploads (or samples) the backbuf in place instead of copying it.
+var bg_in_place: bool = false;
+// The background source, offered to the desktop as its backbuf once the
+// render path is up (see takeOfferedBackBuffer).
+var offered_backbuf: ?[*]volatile u32 = null;
+
+/// Mode 9: called by the desktop before it touches the backbuf in a loop
+/// iteration. True if it now holds source_lock (release with endDraw).
+pub fn beginDraw() bool {
+    if (@atomicLoad(u8, &compositor_pid, .acquire) == 0xFF) return false;
+    source_lock.acquire();
+    return true;
+}
+
+pub fn endDraw() void {
+    source_lock.release();
+}
+
+/// The memory the desktop should draw into from now on, once; null if it
+/// keeps its own backbuf. Caller holds source_lock and calls
+/// backBufferAdopted after switching.
+pub fn takeOfferedBackBuffer() ?[*]volatile u32 {
+    const p = offered_backbuf orelse return null;
+    offered_backbuf = null;
+    return p;
+}
+
+pub fn backBufferAdopted() void {
+    bg_in_place = true;
+    requestRender();
+}
 
 /// Liveness backstop for the compositor's park: a frame request that
 /// somehow bypasses requestRender's wake is honored within this many
@@ -854,6 +896,7 @@ fn fillWindowSlots() void {
 }
 
 fn fillBackgroundSource() void {
+    if (bg_in_place) return;
     const buf = source_pixel_buf orelse return;
     const dst: [*]volatile u32 = @ptrCast(@alignCast(buf));
 
@@ -1214,7 +1257,8 @@ fn transitionSourceImage(image: u64, name: []const u8) bool {
 
 /// Create a w×h B8G8R8A8 source texture with its view, CPU-visible side
 /// mapped in the SHM BAR, and layout GENERAL. See `direct_sources`.
-fn createTexture(ids: TextureIds, w: u32, h: u32, name: []const u8) ?Texture {
+/// `cpu_reads`: the CPU also reads that side back (the desktop's backbuf).
+fn createTexture(ids: TextureIds, w: u32, h: u32, cpu_reads: bool, name: []const u8) ?Texture {
     const cpu_bytes = pageAlign(@as(u64, w) * h * 4);
     const fmt = venus.VK_FORMAT_B8G8R8A8_UNORM;
 
@@ -1240,9 +1284,11 @@ fn createTexture(ids: TextureIds, w: u32, h: u32, name: []const u8) ?Texture {
         venus.encodeCreateBufferExportable(&scratch_cs, COMPOSITOR_DEVICE, cpu_bytes, venus.VK_BUFFER_USAGE_TRANSFER_SRC_BIT, ids.staging_buf);
         if (!submitFireAndForget(&scratch_cs)) return null;
         const staging_req = bufferRequirements(ids.staging_buf, name) orelse return null;
-        // CPU writes, GPU reads once: uncached (write-combined) when offered.
+        // CPU writes, GPU reads once: uncached (write-combined) when
+        // offered, unless the CPU reads it too.
         mapped_bytes = @max(pageAlign(staging_req.size), cpu_bytes);
-        if (!allocateMemory(ids.staging_mem, mapped_bytes, staging_req, HOST_MAPPED, 0, venus.VK_MEMORY_PROPERTY_HOST_CACHED_BIT, name)) return null;
+        const cached = venus.VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+        if (!allocateMemory(ids.staging_mem, mapped_bytes, staging_req, HOST_MAPPED, if (cpu_reads) cached else 0, if (cpu_reads) 0 else cached, name)) return null;
         mapped_mem = ids.staging_mem;
     }
 
@@ -1504,19 +1550,17 @@ fn setupVulkanRender() bool {
             return false;
         }
     }
-    // Background source: the desktop backbuf, 1:1. The kernel writes the
-    // initial frame right away (row-major B,G,R,A).
+    // Background source: the desktop backbuf, 1:1 (row-major B,G,R,A). The
+    // first frame is a full one and fills it.
     source_tex = createTexture(.{
         .image = COMPOSITOR_SOURCE_IMAGE,
         .view = COMPOSITOR_SOURCE_VIEW,
         .mem = COMPOSITOR_SOURCE_MEM,
         .staging_buf = COMPOSITOR_SOURCE_STAGING,
         .staging_mem = COMPOSITOR_SOURCE_STAGING_MEM,
-    }, SOURCE_W, SOURCE_H, "source") orelse return false;
+    }, SOURCE_W, SOURCE_H, true, "source") orelse return false;
     source_pixel_buf = source_tex.kptr;
     debug.klog("[gpu-comp] source image res={d} phys=0x{X} {d}x{d}\n", .{ source_tex.res_id, source_tex.phys.raw(), SOURCE_W, SOURCE_H });
-    fillSourceFrame(0);
-    debug.klog("[gpu-comp] source image filled (initial frame)\n", .{});
     if (!createDescriptorSet(COMPOSITOR_DESC_SET, COMPOSITOR_SOURCE_VIEW, "source descriptor set")) return false;
 
     focused_tex = createTexture(.{
@@ -1525,7 +1569,7 @@ fn setupVulkanRender() bool {
         .mem = COMPOSITOR_FOCUSED_MEM,
         .staging_buf = COMPOSITOR_FOCUSED_STAGING,
         .staging_mem = COMPOSITOR_FOCUSED_STAGING_MEM,
-    }, FOCUSED_W, FOCUSED_H, "focused") orelse return false;
+    }, FOCUSED_W, FOCUSED_H, false, "focused") orelse return false;
     focused_pixel_buf = focused_tex.kptr;
     debug.klog("[gpu-comp] focused image res={d} phys=0x{X} {d}x{d}\n", .{ focused_tex.res_id, focused_tex.phys.raw(), FOCUSED_W, FOCUSED_H });
     if (!createDescriptorSet(COMPOSITOR_FOCUSED_DESC_SET, COMPOSITOR_FOCUSED_VIEW, "focused descriptor set")) return false;
@@ -1632,7 +1676,7 @@ pub fn allocateWindowImage(image_w: u32, image_h: u32, mem_w: u32, mem_h: u32) ?
     const desc_set_id = base + 5;
 
     // Texture at MEM dims so the CPU row stride is mem_w (see above).
-    const tex = createTexture(ids, mem_w, mem_h, "window slot") orelse {
+    const tex = createTexture(ids, mem_w, mem_h, false, "window slot") orelse {
         debug.klog("[gpu-comp] slot[{d}] texture FAILED\n", .{slot_idx});
         return null;
     };
@@ -2166,11 +2210,14 @@ fn run() noreturn {
     @import("../cpu/smp.zig").assertBSP("gpu_compositor.run");
     debug.klog("[gpu-comp] entered as side task.\n", .{});
 
-    // Publish our PID so requestRender() can wake us.
-    compositor_pid = @intCast(process.getCurrentPid());
     // Registered: a process dying inside allocateWindowImage gets the lock
-    // force-released instead of stalling the compositor for good.
+    // force-released instead of stalling the compositor for good. Both
+    // before the pid is published: from then on the desktop takes
+    // source_lock (beginDraw).
     @import("../proc/spinlock.zig").registerMutex("gpu_compositor.venus_lock", &venus_lock);
+    @import("../proc/spinlock.zig").registerMutex("gpu_compositor.source_lock", &source_lock);
+    // Publish our PID so requestRender() can wake us.
+    @atomicStore(u8, &compositor_pid, @intCast(process.getCurrentPid()), .release);
 
     // Co-op mode: the desktop is already running and owns the display.
     // We sample one of its windows' published gui_fb back-buffers as our
@@ -2240,6 +2287,13 @@ fn run() noreturn {
                     debug.klog("[gpu-comp] scanout=readback HOST3D blob x{d}\n", .{n});
                 } else {
                     debug.klog("[gpu-comp] armBlobScanout(readback x{d}) FAILED — keeping 2D fallback\n", .{n});
+                }
+
+                // Same size and row pitch as the backbuf: the desktop can
+                // draw into the background source itself.
+                if (disp_w == SOURCE_W and disp_h == SOURCE_H and source_tex.row_pixels == disp_w) {
+                    offered_backbuf = @ptrCast(@alignCast(source_pixel_buf.?));
+                    @import("desktop/wake.zig").requestWake();
                 }
 
                 // Step 9.4 Phase 2: real per-window slots get allocated
@@ -2322,6 +2376,7 @@ fn run() noreturn {
         // the flushed rect). Null = flush the whole screen.
         var flush_rect: ?[4]u32 = null;
         var present = true;
+        source_lock.acquire();
         if (vulkan_render_ready) {
             takeDamage();
             if (frame_damage.full) full_damage_frames += 1;
@@ -2388,6 +2443,7 @@ fn run() noreturn {
             defer perf.leave(.comp_sync, t);
             _ = syncBackBufferToScreen();
         }
+        source_lock.release();
 
         // 4. ONE flush per frame. Wrapped in comp_flush so we can tell
         // whether host vblank actually back-pressures here (~16ms) or

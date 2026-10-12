@@ -330,6 +330,25 @@ pub fn getBackBuffer() ?[*]volatile u32 {
     return backbuf;
 }
 
+/// Mode 9: draw into `nb`, the GPU compositor's background source, from
+/// now on. Caller holds the compositor's source lock. The old buffer is
+/// the boot-reserved region; freeBackBuffer would be a no-op anyway.
+fn adoptBackBuffer(nb: [*]volatile u32) void {
+    const old = backbuf orelse return;
+    const qwords: usize = @as(usize, gfx.target_w) * gfx.target_h / 2;
+    asm volatile ("cld; rep movsq"
+        :
+        : [dst] "{rdi}" (@intFromPtr(nb)),
+          [src] "{rsi}" (@intFromPtr(old)),
+          [cnt] "{rcx}" (qwords),
+        : .{ .rdi = true, .rsi = true, .rcx = true, .memory = true });
+    backbuf = nb;
+    bb_pages = 0;
+    gfx.setTarget(nb, gfx.target_w, gfx.target_h);
+    @import("gpu_compositor.zig").backBufferAdopted();
+    debug.klog("[desktop] Back buffer: drawing into the GPU compositor's source\n", .{});
+}
+
 /// Incremented at the start of every renderScene call. The mode-9 GPU
 /// compositor caches the last value it saw; if unchanged since the last
 /// frame, the desktop hasn't redrawn, so the compositor can skip its
@@ -3327,6 +3346,14 @@ pub fn run() void {
         // Frame clock starts AFTER parkOrYield returns — parked/yielded
         // time belongs to the scheduler, not to this frame.
         frameperf.frameBegin();
+        // Mode 9: the GPU compositor reads the backbuf (or draws from it in
+        // place) between our iterations, never during one.
+        const gpu_comp = @import("gpu_compositor.zig");
+        const source_held = gpu_comp.beginDraw();
+        defer if (source_held) gpu_comp.endDraw();
+        if (source_held) {
+            if (gpu_comp.takeOfferedBackBuffer()) |nb| adoptBackBuffer(nb);
+        }
 
         // Apply config changes from settings app
         if (config_changed) {
