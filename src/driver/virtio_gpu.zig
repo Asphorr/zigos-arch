@@ -1865,11 +1865,18 @@ fn resourceCreate2D(resource_id: u32, w: u32, h: u32) bool {
 // = 16000 bytes. Previously a stack local — Zig ReleaseSafe `undefined`-fills
 // it with 0xAA on entry, and the resulting 16KB memset on desktop's kstack
 // (a) consumed huge frame depth and (b) tripped the kstack_deep watchpoint
-// at 2026-05-17. attachBacking is only called from setupDisplay during
-// virtio_gpu.init (boot-time, single-threaded) so no locking is needed.
+// at 2026-05-17. Guarded by ctrl_lock, which attachBacking holds throughout
+// (setupDisplay reaches it at init and from changeMode at runtime).
 var attach_backing_merged: [1000]MemEntry = undefined;
 
 fn attachBacking(resource_id: u32, pages: []const usize, page_count: u32) bool {
+    // cmd_phys/resp_phys belong to whoever holds ctrl_lock, so build the
+    // command under it.
+    defer kickPendingFromTask(); // see sendCmd — runs after the release
+    ctrl_lock.acquire();
+    defer ctrl_lock.release();
+    waitAsyncFlushIdleLocked();
+
     // Merge contiguous physical pages into fewer scatter-gather entries
     // This keeps the command small enough to fit in one page
     const merged = &attach_backing_merged;
@@ -1907,8 +1914,6 @@ fn attachBacking(resource_id: u32, pages: []const usize, page_count: u32) bool {
     // shared descriptor-chain helper.
     const resp_dst: [*]volatile u8 = @ptrFromInt(paging.physToVirt(resp_phys));
     @memset(resp_dst[0..@sizeOf(CtrlHdr)], 0);
-    ctrl_lock.acquire();
-    defer ctrl_lock.release();
     if (!sendCmdViaPhys(total_len, @sizeOf(CtrlHdr))) return false;
 
     clflushRange(paging.physToVirt(resp_phys), @sizeOf(CtrlHdr)); // gap #2
@@ -3341,8 +3346,12 @@ pub fn submit3D(ctx_id: u32, cmd_data: []const u8) bool {
 
     // Serialize against sendCmd — both touch ctrl_vq + cmd_phys/resp_phys.
     // Without this, BSP rendering racing with AP syscalls corrupts the ring.
+    defer kickPendingFromTask(); // see sendCmd — runs after the release
     ctrl_lock.acquire();
     defer ctrl_lock.release();
+    // As in sendCmd: an outstanding async flush pair owns cmd/resp slots,
+    // and its completion would pass for ours in sendCmdViaPhys.
+    waitAsyncFlushIdleLocked();
 
     // Write header + command data directly to cmd_phys.
     const dst: [*]volatile u8 = @ptrFromInt(paging.physToVirt(cmd_phys));
@@ -3515,6 +3524,12 @@ pub fn resourceCreateGuestBlob(ctx_id: u32, resource_id: u32, blob_flags: u32, p
     // range so one dmaMap call covers it.
     _ = iommu.dmaMap(pci_bus, pci_dev, pci_func, phys_base, size, .{});
 
+    // cmd_phys/resp_phys belong to whoever holds ctrl_lock: build under it.
+    defer kickPendingFromTask(); // see sendCmd — runs after the release
+    ctrl_lock.acquire();
+    defer ctrl_lock.release();
+    waitAsyncFlushIdleLocked();
+
     const cmd_dst: [*]volatile u8 = @ptrFromInt(paging.physToVirt(cmd_phys));
     @memset(cmd_dst[0..4096], 0);
 
@@ -3535,8 +3550,6 @@ pub fn resourceCreateGuestBlob(ctx_id: u32, resource_id: u32, blob_flags: u32, p
     const resp_dst: [*]volatile u8 = @ptrFromInt(paging.physToVirt(resp_phys));
     @memset(resp_dst[0..48], 0);
 
-    ctrl_lock.acquire();
-    defer ctrl_lock.release();
     if (!sendCmdViaPhys(total_len, 48)) {
         debug.klog("[virtio-gpu] createGuestBlob timeout\n", .{});
         return false;
