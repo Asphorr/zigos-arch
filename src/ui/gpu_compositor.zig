@@ -107,6 +107,9 @@ const REPLY_TIMEOUT_MS: u64 = 30_000;
 const FRAME_TIMEOUT_MS: u64 = 30_000;
 // Host-side vkWaitForFences bound, same reasoning.
 const FENCE_TIMEOUT_NS: u64 = 10_000_000_000;
+/// How long waitReplyMarker yields before it sleeps: a frame on a host GPU
+/// takes 1–4 ms (dzn under KVM).
+const SPIN_WAIT_US: u64 = 4000;
 
 fn beginChecked() void {
     scratch_cs.reset();
@@ -120,10 +123,14 @@ fn markReply(at: usize) void {
 }
 
 fn appendReplyMarker() void {
+    appendReplyMarkerTo(&scratch_cs);
+}
+
+fn appendReplyMarkerTo(cs: *venus.CmdStream) void {
     reply_marker_seq +%= 1;
     reply_marker_off = REPLY_MARKER_BASE + (reply_marker_seq % REPLY_MARKER_SLOTS) * REPLY_MARKER_STRIDE;
-    venus.encodeSeekReplyCommandStream(&scratch_cs, reply_marker_off);
-    venus.encodeEnumerateInstanceVersion(&scratch_cs);
+    venus.encodeSeekReplyCommandStream(cs, reply_marker_off);
+    venus.encodeEnumerateInstanceVersion(cs);
 }
 
 const SubmitResult = enum {
@@ -134,28 +141,88 @@ const SubmitResult = enum {
     no_reply,
 };
 
-/// Submit scratch_cs (marker already appended) and wait for the marker.
+/// Pre-fill the reply slots a checked submit waits on.
+fn armReplyMarker(ring: [*]volatile u8) void {
+    for (0..64) |i| ring[i] = 0xFF;
+    for (0..4) |i| ring[reply_marker_off + i] = 0xFF;
+}
+
+/// Wait for the marker of the stream just submitted.
+fn waitReplyMarker(ring: [*]volatile u8, timeout_ms: u64) SubmitResult {
+    const apic = @import("../time/apic.zig");
+    const hrtimer = @import("../proc/hrtimer.zig");
+    const tpq = apic.tscPerQuantum();
+    const per_us = hrtimer.tscPerUs(if (tpq == 0) 30_000_000 else tpq);
+    const start = apic.readTsc();
+    while (venus.readReplyCmdType(ring + reply_marker_off) == REPLY_SENTINEL) {
+        const waited_us = (apic.readTsc() -% start) / per_us;
+        if (waited_us >= timeout_ms * 1000) return .no_reply;
+        // Yield through the few milliseconds a host GPU takes for a frame;
+        // only past that sleep. A sleep here ends on a timer tick (10 ms)
+        // in practice, which made every frame cost about a tick.
+        if (waited_us < SPIN_WAIT_US) {
+            @import("../proc/sched_asm.zig").softYield();
+        } else {
+            _ = @import("../cpu/syscall/proc.zig").sysUsleep(1000);
+        }
+    }
+    const waited = apic.tscToMs(apic.readTsc() -% start);
+    if (waited >= 500) debug.klog("[gpu-comp] slow host reply: {d} ms\n", .{waited});
+    return .replied;
+}
+
+/// Submit scratch_cs (marker already appended) on the virtqueue and wait
+/// for the marker.
 fn submitChecked(timeout_ms: u64) SubmitResult {
     const ring = reply_ring orelse return .not_sent;
     if (scratch_cs.overflowed) {
         debug.klog("[gpu-comp] command stream overflowed ({d} B)\n", .{scratch_cs.pos});
         return .not_sent;
     }
-    for (0..64) |i| ring[i] = 0xFF;
-    for (0..4) |i| ring[reply_marker_off + i] = 0xFF;
+    armReplyMarker(ring);
     if (!virtio_gpu.submit3D(COMPOSITOR_CTX_ID, scratch_cs.bytes())) return .not_sent;
-    const apic = @import("../time/apic.zig");
-    const start = apic.readTsc();
-    while (venus.readReplyCmdType(ring + reply_marker_off) == REPLY_SENTINEL) {
-        const waited = apic.tscToMs(apic.readTsc() -% start);
-        if (waited >= timeout_ms) return .no_reply;
-        // Most waits end within a few yields; longer ones sleep so the
-        // CPU can idle.
-        if (waited < 2) @import("../proc/sched_asm.zig").softYield() else process.kernelSleepMs(1);
+    const r = waitReplyMarker(ring, timeout_ms);
+    // The virtqueue executes in order: everything sent on it has run.
+    if (r == .replied) virtqueue_pending = false;
+    return r;
+}
+
+/// submitChecked for a frame: through the command ring when it is up.
+fn submitFrame(timeout_ms: u64) SubmitResult {
+    if (!ring_frames) return submitChecked(timeout_ms);
+    const ring = reply_ring orelse return .not_sent;
+    if (scratch_cs.overflowed) {
+        debug.klog("[gpu-comp] command stream overflowed ({d} B)\n", .{scratch_cs.pos});
+        return .not_sent;
     }
-    const waited = apic.tscToMs(apic.readTsc() -% start);
-    if (waited >= 500) debug.klog("[gpu-comp] slow host reply: {d} ms\n", .{waited});
-    return .replied;
+    // The ring and the virtqueue run on different host threads: what the
+    // virtqueue still holds (a new window's descriptor update, say) must
+    // land before a frame uses it.
+    if (virtqueue_pending and !drainVirtqueue()) return .not_sent;
+    armReplyMarker(ring);
+    if (!ringWrite(scratch_cs.bytes())) {
+        // The host's ring thread failed or stopped draining; the context
+        // goes down with it.
+        ring_frames = false;
+        debug.klog("[gpu-comp] ring: fatal or stuck\n", .{});
+        return .no_reply;
+    }
+    return waitReplyMarker(ring, timeout_ms);
+}
+
+/// A marker alone on the virtqueue: returns once all it holds has run.
+/// The frame in scratch_cs keeps its own marker slot.
+fn drainVirtqueue() bool {
+    const ring = reply_ring orelse return false;
+    const frame_marker_off = reply_marker_off;
+    defer reply_marker_off = frame_marker_off;
+    side_cs.reset();
+    appendReplyMarkerTo(&side_cs);
+    armReplyMarker(ring);
+    if (!virtio_gpu.submit3D(COMPOSITOR_CTX_ID, side_cs.bytes())) return false;
+    if (waitReplyMarker(ring, REPLY_TIMEOUT_MS) != .replied) return false;
+    virtqueue_pending = false;
+    return true;
 }
 
 /// Finish a beginChecked stream whose last reply-generating command is
@@ -256,15 +323,14 @@ const COMPOSITOR_READBACK_MEM: u64 = 341;
 const COMPOSITOR_READBACK_BUFFER_2: u64 = 342;
 const COMPOSITOR_READBACK_MEM_2: u64 = 343;
 
-// Task A — Phase 1: secondary command ring. A 64 KB HOST3D blob laid
-// out as:
+// Command ring (vkCreateRingMESA). A 64 KB HOST3D blob laid out as:
 //   [head:u32 @ 0][tail:u32 @ 4][status:u32 @ 8][pad @ 12]
 //   [buffer @ 16, 32 KB] [extra @ 32784, ~32 KB]
 // Buffer size MUST be a power of 2 (vkr_ring asserts util_is_power_of_two_nonzero).
-// After vkCreateRingMESA the host spins up a dedicated thread that drains
-// commands from this ring instead of going through ctrl_vq SUBMIT_3D.
-// Phase 1 creates the ring and verifies the host accepts it; Phase 2
-// would actually emit per-frame commands through it.
+// The host runs a thread per ring that executes the commands between head
+// and tail, polling the tail until idleTimeout passes without any, then
+// sleeping until vkNotifyRingMESA. Frames go through it (`ring_frames`): a
+// frame costs no virtqueue round trip unless the thread went idle.
 const COMPOSITOR_RING: u64 = 500;
 const RING_TOTAL_SIZE: u64 = 64 * 1024;
 const RING_HEAD_OFFSET: u64 = 0;
@@ -274,9 +340,20 @@ const RING_BUFFER_OFFSET: u64 = 16;
 const RING_BUFFER_SIZE: u64 = 32 * 1024; // power of 2
 const RING_EXTRA_OFFSET: u64 = RING_BUFFER_OFFSET + RING_BUFFER_SIZE;
 const RING_EXTRA_SIZE: u64 = RING_TOTAL_SIZE - RING_EXTRA_OFFSET;
+// VkRingStatusFlagBitsMESA
+const RING_STATUS_IDLE: u32 = 0x1;
+const RING_STATUS_FATAL: u32 = 0x2;
 var ring_kvirt: ?[*]volatile u8 = null;
 var ring_res_id: u32 = 0;
 var ring_created: bool = false;
+var ring_frames: bool = false;
+/// The tail this side last published (free-running, like the host's head).
+var ring_tail: u32 = 0;
+/// Something went out on the virtqueue that no checked submit has waited
+/// for since; the next ring frame drains it first (see submitFrame).
+var virtqueue_pending: bool = true;
+/// For the few virtqueue commands sent while scratch_cs holds a frame.
+var side_cs: venus.CmdStream = .{};
 
 // Step 9.4: per-window Venus image slots. Each visible app window
 // gets its own source texture (see Texture) whose CPU side is a HOST3D
@@ -727,11 +804,7 @@ fn setupVulkanContext() bool {
     //    this, the host knows where to write replies for any subsequent
     //    reply-generating command (vkCreateInstance, etc.).
     scratch_cs.reset();
-    scratch_cs.cmdHeader(venus.CMD_vkSetReplyCommandStreamMESA, 0);
-    scratch_cs.writePresent(); // pStream
-    scratch_cs.writeU32(reply_ring_res_id);
-    scratch_cs.writeU64(0); // offset
-    scratch_cs.writeU64(REPLY_RING_SIZE);
+    encodeSetReplyStream(&scratch_cs);
     if (!virtio_gpu.submit3D(COMPOSITOR_CTX_ID, scratch_cs.bytes())) {
         debug.klog("[gpu-comp] SetReplyCommandStreamMESA submit FAILED\n", .{});
         return false;
@@ -1163,6 +1236,7 @@ fn syncBackBufferToScreen() bool {
 /// Submit a Venus command that doesn't generate a reply.
 fn submitFireAndForget(cs: *venus.CmdStream) bool {
     if (cs.overflowed) return false;
+    virtqueue_pending = true;
     return virtio_gpu.submit3D(COMPOSITOR_CTX_ID, cs.bytes());
 }
 
@@ -1324,12 +1398,9 @@ fn recordUpload(ids: TextureIds, row_pixels: u32, rects: []const [4]u32) void {
     venus.encodeCmdCopyBufferToImageRects(&scratch_cs, COMPOSITOR_CMD_BUF, ids.staging_buf, ids.image, 1, row_pixels, rects);
 }
 
-/// Task A Phase 1: allocate a 64 KB HOST3D blob, lay out the ring
-/// regions, zero them, and call vkCreateRingMESA. After this returns
-/// true the host has a dedicated thread polling our ring tail.
-///
-/// Phase 1 stops here — we don't actually write commands to the ring
-/// yet. Phase 2 would replace per-frame submit3D() with ring writes.
+/// Allocate a 64 KB HOST3D blob, lay out the ring regions, zero them, call
+/// vkCreateRingMESA and send frames through the ring once a marker comes
+/// back through it. Caller holds venus_lock.
 fn setupCommandRing() bool {
     if (reply_ring == null) return false; // need Venus reply ring up first
 
@@ -1360,7 +1431,10 @@ fn setupCommandRing() bool {
         res_id,
         0, // region offset within the resource
         RING_TOTAL_SIZE,
-        50_000, // idleTimeout: 50 ms — host thread sleeps after this much idle
+        // idleTimeout (µs): frames of an interaction come faster than this,
+        // so they find the thread polling and need no notify. Its poll
+        // backs off to ~0.3 ms sleeps by then.
+        200_000,
         RING_HEAD_OFFSET,
         RING_TAIL_OFFSET,
         RING_STATUS_OFFSET,
@@ -1377,15 +1451,73 @@ fn setupCommandRing() bool {
     ring_kvirt = kvirt;
     ring_res_id = res_id;
     ring_created = true;
-    debug.klog("[gpu-comp] ring: created (res={d} phys=0x{X} total={d} buf={d}) — Phase 1 ok\n", .{ res_id, phys.raw(), RING_TOTAL_SIZE, RING_BUFFER_SIZE });
+    ring_tail = 0;
+    debug.klog("[gpu-comp] ring: created (res={d} phys=0x{X} total={d} buf={d})\n", .{ res_id, phys.raw(), RING_TOTAL_SIZE, RING_BUFFER_SIZE });
 
-    // Sanity: read back head/tail/status (should all be 0).
-    const head_ptr: *align(1) const volatile u32 = @ptrCast(kvirt + RING_HEAD_OFFSET);
-    const tail_ptr: *align(1) const volatile u32 = @ptrCast(kvirt + RING_TAIL_OFFSET);
-    const status_ptr: *align(1) const volatile u32 = @ptrCast(kvirt + RING_STATUS_OFFSET);
-    debug.klog("[gpu-comp] ring: post-create head={d} tail={d} status=0x{X}\n", .{ head_ptr.*, tail_ptr.*, status_ptr.* });
-
+    // The ring decodes with its own reply stream: point it at the reply
+    // ring, then let a marker prove the ring runs.
+    const reply = reply_ring.?;
+    scratch_cs.reset();
+    encodeSetReplyStream(&scratch_cs);
+    venus.encodeSeekReplyCommandStream(&scratch_cs, 0);
+    appendReplyMarker();
+    armReplyMarker(reply);
+    if (!ringWrite(scratch_cs.bytes()) or waitReplyMarker(reply, REPLY_TIMEOUT_MS) != .replied) {
+        debug.klog("[gpu-comp] ring: no reply through the ring, frames stay on the virtqueue\n", .{});
+        return false;
+    }
+    ring_frames = true;
+    debug.klog("[gpu-comp] ring: frames go through the ring\n", .{});
     return true;
+}
+
+fn ringU32(off: u64) *volatile u32 {
+    return @ptrCast(@alignCast(ring_kvirt.? + off));
+}
+
+/// Copy `bytes` into the ring buffer and publish them; notify the host's
+/// ring thread if it went idle. False if the ring is fatal or the host
+/// stopped draining it.
+fn ringWrite(bytes: []const u8) bool {
+    const r = ring_kvirt orelse return false;
+    const size: u32 = @intCast(RING_BUFFER_SIZE);
+    const len: u32 = @intCast(bytes.len);
+    if (len > size) return false;
+    // Each frame waited for its marker, so the ring is all but empty: the
+    // host stores the head after every command.
+    const apic = @import("../time/apic.zig");
+    const start = apic.readTsc();
+    while (ring_tail -% @atomicLoad(u32, ringU32(RING_HEAD_OFFSET), .acquire) > size - len) {
+        if (@atomicLoad(u32, ringU32(RING_STATUS_OFFSET), .acquire) & RING_STATUS_FATAL != 0) return false;
+        if (apic.tscToMs(apic.readTsc() -% start) >= REPLY_TIMEOUT_MS) return false;
+        @import("../proc/sched_asm.zig").softYield();
+    }
+    const buf = r + RING_BUFFER_OFFSET;
+    for (bytes, 0..) |b, i| buf[(ring_tail +% @as(u32, @intCast(i))) & (size - 1)] = b;
+    ring_tail +%= len;
+    @atomicStore(u32, ringU32(RING_TAIL_OFFSET), ring_tail, .release);
+    // Dekker with the host, which sets IDLE and then re-reads the tail:
+    // the tail store must be visible before the status load.
+    asm volatile ("mfence" ::: .{ .memory = true });
+    const status = @atomicLoad(u32, ringU32(RING_STATUS_OFFSET), .acquire);
+    if (status & RING_STATUS_FATAL != 0) return false;
+    if (status & RING_STATUS_IDLE != 0) {
+        // Not submitFireAndForget: a notify orders nothing a frame needs.
+        side_cs.reset();
+        venus.encodeNotifyRing(&side_cs, COMPOSITOR_RING, ring_tail, 0);
+        if (!virtio_gpu.submit3D(COMPOSITOR_CTX_ID, side_cs.bytes())) return false;
+    }
+    return true;
+}
+
+/// vkSetReplyCommandStreamMESA: replies of the stream's dispatcher go to
+/// the reply ring.
+fn encodeSetReplyStream(cs: *venus.CmdStream) void {
+    cs.cmdHeader(venus.CMD_vkSetReplyCommandStreamMESA, 0);
+    cs.writePresent(); // pStream
+    cs.writeU32(reply_ring_res_id);
+    cs.writeU64(0); // offset
+    cs.writeU64(REPLY_RING_SIZE);
 }
 
 /// Read-back buffer `i`: a TRANSFER_DST VkBuffer the render image is
@@ -2226,7 +2358,7 @@ fn renderVulkanFrame(_: f32) FrameResult {
         unreachable;
     }
     // The flush that follows presents these pixels, so wait for the GPU.
-    switch (submitChecked(FRAME_TIMEOUT_MS)) {
+    switch (submitFrame(FRAME_TIMEOUT_MS)) {
         .replied => {},
         .not_sent => {
             // Nothing of it runs on the host, or (acceptance lost) it runs
@@ -2305,10 +2437,8 @@ fn run() noreturn {
                 vulkan_render_ready = true;
                 debug.klog("[gpu-comp] Vulkan render path ready\n", .{});
 
-                // Task A Phase 1: experimentally create a Venus command ring.
-                // Doesn't replace any per-frame work yet — just verifies the
-                // protocol round-trip works and gives us SHM-mapped head/tail/
-                // status/buffer/extra regions to play with.
+                // Frames go through a command ring when the host runs one;
+                // otherwise they stay on the virtqueue.
                 _ = setupCommandRing();
                 // Promote the readback HOST3D blob to scanout. After
                 // this, vkCmdCopyImageToBuffer's destination IS the
