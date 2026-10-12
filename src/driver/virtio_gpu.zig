@@ -3406,6 +3406,22 @@ pub fn resourceCreateBlob(ctx_id: u32, resource_id: u32, blob_mem: u32, blob_fla
     return true;
 }
 
+/// How the host backs a VkDeviceMemory blob: as a dma-buf it can scan out
+/// directly, or only as a mapping it reads through a pointer.
+pub const MemoryBlob = enum { dma_buf, mapped };
+
+/// Wrap Venus VkDeviceMemory `blob_id` as a mappable blob. With
+/// `try_dma_buf`, asks for a dma-buf first (CROSS_DEVICE); a host driver
+/// that cannot export host-visible memory refuses that but can still map
+/// it, so retry mappable-only.
+pub fn resourceCreateMemoryBlob(ctx_id: u32, resource_id: u32, blob_mem: u32, blob_id: u64, size: u64, try_dma_buf: bool) ?MemoryBlob {
+    if (try_dma_buf and resourceCreateBlob(ctx_id, resource_id, blob_mem, BLOB_FLAG_USE_MAPPABLE | BLOB_FLAG_USE_CROSS_DEVICE, blob_id, size))
+        return .dma_buf;
+    if (resourceCreateBlob(ctx_id, resource_id, blob_mem, BLOB_FLAG_USE_MAPPABLE, blob_id, size))
+        return .mapped;
+    return null;
+}
+
 // SHM BAR bump allocator — each blob gets a unique page-aligned offset
 var shm_next_offset: u64 = 0;
 

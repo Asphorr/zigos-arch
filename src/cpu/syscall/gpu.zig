@@ -82,7 +82,11 @@ pub fn sysGpuCtxCreate(capset_id: u32) u32 {
     // Atomic fetch-and-add: two CPUs concurrently entering this syscall must
     // not both grab the same ID. Without this the GPU sees duplicate context
     // IDs and the second ctxCreate silently corrupts the first's state.
-    const ctx_id = @atomicRmw(u32, &next_gpu_ctx_id, .Add, 1, .acq_rel);
+    var ctx_id = @atomicRmw(u32, &next_gpu_ctx_id, .Add, 1, .acq_rel);
+    // The counter never reuses ids, so it reaches the compositor's reserved
+    // one after that many contexts over the boot; skip it.
+    if (ctx_id == @import("../../ui/gpu_compositor.zig").COMPOSITOR_CTX_ID)
+        ctx_id = @atomicRmw(u32, &next_gpu_ctx_id, .Add, 1, .acq_rel);
 
     if (!virtio_gpu.ctxCreate(ctx_id, capset_id, "app")) {
         debug.klog("[gpu] ctx_create FAILED ctx_id={d} capset={d}\n", .{ ctx_id, capset_id });
@@ -179,14 +183,14 @@ pub fn sysGpuCreateBlob(blob_mem: u32, size: u32, blob_id_arg: u32) u32 {
 
     const resource_id = virtio_gpu.alloc3DResourceId();
     const blob_id: u64 = blob_id_arg;
-    if (!virtio_gpu.resourceCreateBlob(
-        pcb.gpu_ctx_id,
-        resource_id,
-        blob_mem,
-        if (blob_id_arg != 0) 5 else 1, // MAPPABLE + CROSS_DEVICE for VkDeviceMemory blobs
-        blob_id,
-        size,
-    )) return E_INVAL;
+    if (blob_id_arg != 0) {
+        // VkDeviceMemory: dma-buf when the host can export it, else mapped.
+        _ = virtio_gpu.resourceCreateMemoryBlob(pcb.gpu_ctx_id, resource_id, blob_mem, blob_id, size, true) orelse return E_INVAL;
+        return resource_id;
+    }
+    const MAPPABLE: u32 = 1;
+    if (!virtio_gpu.resourceCreateBlob(pcb.gpu_ctx_id, resource_id, blob_mem, MAPPABLE, blob_id, size))
+        return E_INVAL;
 
     return resource_id;
 }

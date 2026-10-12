@@ -5,12 +5,10 @@
 // `virtio_gpu.submit3D`. Future cleanup: refactor lib/venus.zig to
 // abstract its transport so both sides can share encoders.
 //
-// Per-submit reply convention: each `virtio_gpu.submit3D(ctx, cs.bytes())`
-// call is one Venus submit. The host's reply-write head appears to reset
-// per submit, so single-command submits read the reply at offset 4 of
-// the reply ring. For multi-command batched submits we'd need an explicit
-// `Seek(0)` before the reply-generating command (cube does this for its
-// per-frame WaitForFences).
+// Replies: the host appends each reply at the reply stream's write
+// position and writes it after submit3D has returned, so a caller seeks
+// before the reply-generating command and polls for the reply (see the
+// compositor's checked submits).
 
 const std = @import("std");
 const virtio_gpu = @import("../driver/virtio_gpu.zig");
@@ -18,7 +16,13 @@ const virtio_gpu = @import("../driver/virtio_gpu.zig");
 // --- VkCommandTypeEXT constants ---
 pub const CMD_vkCreateInstance: u32 = 0;
 pub const CMD_vkEnumeratePhysicalDevices: u32 = 2;
+pub const CMD_vkGetPhysicalDeviceFormatProperties: u32 = 4;
+pub const CMD_vkGetPhysicalDeviceMemoryProperties: u32 = 8;
 pub const CMD_vkCreateDevice: u32 = 11;
+pub const CMD_vkGetBufferMemoryRequirements: u32 = 30;
+pub const CMD_vkGetImageMemoryRequirements: u32 = 31;
+pub const CMD_vkCmdCopyBufferToImage: u32 = 115;
+pub const CMD_vkEnumerateInstanceVersion: u32 = 137;
 pub const CMD_vkQueueSubmit: u32 = 18;
 pub const CMD_vkAllocateMemory: u32 = 21;
 pub const CMD_vkBindImageMemory: u32 = 29;
@@ -111,23 +115,46 @@ pub const VK_STRUCTURE_TYPE_DEVICE_QUEUE_TIMELINE_INFO_MESA: u32 = 1000384005;
 // --- Vulkan format / usage constants used by the compositor ---
 pub const VK_FORMAT_B8G8R8A8_UNORM: u32 = 44;
 pub const VK_IMAGE_USAGE_TRANSFER_SRC_BIT: u32 = 0x1;
+pub const VK_IMAGE_USAGE_TRANSFER_DST_BIT: u32 = 0x2;
 pub const VK_IMAGE_USAGE_SAMPLED_BIT: u32 = 0x4;
 pub const VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT: u32 = 0x10;
 pub const VK_IMAGE_ASPECT_COLOR_BIT: u32 = 1;
+pub const VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT: u32 = 0x1;
+
+pub const VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT: u32 = 0x1;
+pub const VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT: u32 = 0x2;
+pub const VK_MEMORY_PROPERTY_HOST_COHERENT_BIT: u32 = 0x4;
+pub const VK_MEMORY_PROPERTY_HOST_CACHED_BIT: u32 = 0x8;
+
+pub const VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT: u32 = 0x200;
+
+/// Handle types the "Exportable" encoders declare on images, buffers and
+/// allocations. The compositor clears it when the device came up without
+/// VK_EXT_external_memory_dma_buf; the host still maps such memory.
+pub var export_handle_types: u32 = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT;
 
 pub const CmdStream = struct {
-    buf: [4096]u8 align(8) = undefined,
+    // Under virtio_gpu's 16 KB SUBMIT_3D limit with room for the header.
+    buf: [12 * 1024]u8 align(8) = undefined,
     pos: usize = 0,
+    /// A write did not fit; the stream is truncated and must not be submitted.
+    overflowed: bool = false,
 
     pub fn writeU32(self: *CmdStream, val: u32) void {
-        if (self.pos + 4 > self.buf.len) return;
+        if (self.pos + 4 > self.buf.len) {
+            self.overflowed = true;
+            return;
+        }
         const ptr: *align(1) u32 = @ptrCast(self.buf[self.pos..][0..4]);
         ptr.* = val;
         self.pos += 4;
     }
 
     pub fn writeU64(self: *CmdStream, val: u64) void {
-        if (self.pos + 8 > self.buf.len) return;
+        if (self.pos + 8 > self.buf.len) {
+            self.overflowed = true;
+            return;
+        }
         const ptr: *align(1) u64 = @ptrCast(self.buf[self.pos..][0..8]);
         ptr.* = val;
         self.pos += 8;
@@ -153,7 +180,10 @@ pub const CmdStream = struct {
     pub fn writeString(self: *CmdStream, s: []const u8) void {
         const len = s.len + 1;
         self.writeU64(len);
-        if (self.pos + len > self.buf.len) return;
+        if (self.pos + len > self.buf.len) {
+            self.overflowed = true;
+            return;
+        }
         @memcpy(self.buf[self.pos..][0..s.len], s);
         self.buf[self.pos + s.len] = 0;
         self.pos += len;
@@ -166,7 +196,10 @@ pub const CmdStream = struct {
 
     /// Write raw bytes (4-byte aligned). Used by encodeCmdPushConstants.
     pub fn writeBytes(self: *CmdStream, data: []const u8) void {
-        if (self.pos + data.len > self.buf.len) return;
+        if (self.pos + data.len > self.buf.len) {
+            self.overflowed = true;
+            return;
+        }
         @memcpy(self.buf[self.pos..][0..data.len], data);
         self.pos += data.len;
         const aligned = (self.pos + 3) & ~@as(usize, 3);
@@ -182,6 +215,7 @@ pub const CmdStream = struct {
 
     pub fn reset(self: *CmdStream) void {
         self.pos = 0;
+        self.overflowed = false;
     }
 };
 
@@ -452,7 +486,7 @@ pub fn encodeEnumeratePhysicalDevices(cs: *CmdStream, instance_id: u64, phys_dev
     cs.writeU64(phys_dev_id);
 }
 
-/// Exportable variant of vkCreateDevice — enables VK_KHR_external_memory_fd
+/// vkCreateDevice with one queue. `dma_buf` enables VK_KHR_external_memory_fd
 /// + VK_EXT_external_memory_dma_buf so we can allocate DMA_BUF-exportable
 /// VkDeviceMemory and back it with a virtio-gpu HOST3D blob (the same
 /// pattern the cube uses).
@@ -461,6 +495,7 @@ pub fn encodeCreateDevice(
     phys_dev_id: u64,
     queue_family: u32,
     device_id: u64,
+    dma_buf: bool,
 ) void {
     cs.cmdHeader(CMD_vkCreateDevice, CMD_FLAG_GENERATE_REPLY);
     cs.writeU64(phys_dev_id);
@@ -480,11 +515,15 @@ pub fn encodeCreateDevice(
     // layers
     cs.writeU32(0);
     cs.writeU64(0);
-    // extensions (DMA_BUF export pair)
-    cs.writeU32(2);
-    cs.writeU64(2);
-    cs.writeString("VK_KHR_external_memory_fd");
-    cs.writeString("VK_EXT_external_memory_dma_buf");
+    if (dma_buf) {
+        cs.writeU32(2);
+        cs.writeU64(2);
+        cs.writeString("VK_KHR_external_memory_fd");
+        cs.writeString("VK_EXT_external_memory_dma_buf");
+    } else {
+        cs.writeU32(0);
+        cs.writeU64(0);
+    }
     cs.writeNull(); // pEnabledFeatures
     cs.writeNull(); // pAllocator
     cs.writePresent();
@@ -513,8 +552,8 @@ pub fn encodeGetDeviceQueue(
     cs.writeU64(queue_id);
 }
 
-/// 2D color image, OPTIMAL tiling, single-mip/single-layer, with DMA_BUF
-/// external-memory pNext chain so it can bind to memory allocated via
+/// 2D color image, OPTIMAL tiling, single-mip/single-layer, declaring
+/// `export_handle_types` so it can bind to memory allocated via
 /// `encodeAllocateMemoryExportable`.
 pub fn encodeCreateImageExportable(
     cs: *CmdStream,
@@ -578,10 +617,14 @@ fn encodeCreateImageImpl(
     cs.writeU64(device_id);
     cs.writePresent();
     cs.writeU32(VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO);
-    cs.writePresent(); // pNext -> VkExternalMemoryImageCreateInfo
-    cs.writeU32(1000072001);
-    cs.writeNull();
-    cs.writeU32(0x200); // DMA_BUF
+    if (export_handle_types != 0) {
+        cs.writePresent(); // pNext -> VkExternalMemoryImageCreateInfo
+        cs.writeU32(1000072001);
+        cs.writeNull();
+        cs.writeU32(export_handle_types);
+    } else {
+        cs.writeNull();
+    }
     cs.writeU32(0); // flags
     cs.writeU32(1); // imageType = 2D
     cs.writeU32(format);
@@ -613,10 +656,14 @@ pub fn encodeAllocateMemoryExportable(
     cs.writeU64(device_id);
     cs.writePresent();
     cs.writeU32(VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO);
-    cs.writePresent();
-    cs.writeU32(1000072002); // VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO
-    cs.writeNull();
-    cs.writeU32(0x200); // handleTypes = DMA_BUF
+    if (export_handle_types != 0) {
+        cs.writePresent();
+        cs.writeU32(1000072002); // VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO
+        cs.writeNull();
+        cs.writeU32(export_handle_types);
+    } else {
+        cs.writeNull();
+    }
     cs.writeU64(alloc_size);
     cs.writeU32(memory_type_index);
     cs.writeNull(); // pAllocator
@@ -708,10 +755,14 @@ pub fn encodeCreateBufferExportable(
 
     cs.writePresent(); // pCreateInfo
     cs.writeU32(VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO);
-    cs.writePresent(); // pNext -> VkExternalMemoryBufferCreateInfo
-    cs.writeU32(1000072000); // VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO
-    cs.writeNull(); // external info pNext
-    cs.writeU32(0x200); // handleTypes = DMA_BUF
+    if (export_handle_types != 0) {
+        cs.writePresent(); // pNext -> VkExternalMemoryBufferCreateInfo
+        cs.writeU32(1000072000); // VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO
+        cs.writeNull(); // external info pNext
+        cs.writeU32(export_handle_types);
+    } else {
+        cs.writeNull();
+    }
     cs.writeU32(0); // flags
     cs.writeU64(size);
     cs.writeU32(usage);
@@ -750,33 +801,73 @@ pub fn encodeCmdCopyImageToBuffer(
     width: u32,
     height: u32,
 ) void {
+    const full = [_][4]u32{.{ 0, 0, width, height }};
+    encodeCmdCopyImageToBufferRects(cs, cmd_buf_id, src_image, image_layout, dst_buffer, width, &full);
+}
+
+/// vkCmdCopyImageToBuffer with one region per {x, y, w, h} rect. The
+/// buffer holds the whole image row-major with `row_pixels` texels per
+/// row, so each rect lands at its own offset.
+pub fn encodeCmdCopyImageToBufferRects(
+    cs: *CmdStream,
+    cmd_buf_id: u64,
+    src_image: u64,
+    image_layout: u32,
+    dst_buffer: u64,
+    row_pixels: u32,
+    rects: []const [4]u32,
+) void {
     cs.cmdHeader(CMD_vkCmdCopyImageToBuffer, 0);
     cs.writeU64(cmd_buf_id);
     cs.writeU64(src_image);
     cs.writeU32(image_layout);
     cs.writeU64(dst_buffer);
-    cs.writeU32(1); // regionCount
-    cs.writeU64(1); // pRegions array size
-    // VkBufferImageCopy
-    cs.writeU64(0); // bufferOffset
-    cs.writeU32(0); // bufferRowLength (0 = tightly packed)
-    cs.writeU32(0); // bufferImageHeight (0 = tightly packed)
-    // imageSubresource
-    cs.writeU32(VK_IMAGE_ASPECT_COLOR_BIT);
-    cs.writeU32(0); // mipLevel
-    cs.writeU32(0); // baseArrayLayer
-    cs.writeU32(1); // layerCount
-    // imageOffset
-    cs.writeU32(0);
-    cs.writeU32(0);
-    cs.writeU32(0);
-    // imageExtent
-    cs.writeU32(width);
-    cs.writeU32(height);
-    cs.writeU32(1);
+    writeBufferImageCopies(cs, row_pixels, rects);
+}
+
+/// vkCmdCopyBufferToImage, the upload twin of encodeCmdCopyImageToBufferRects.
+pub fn encodeCmdCopyBufferToImageRects(
+    cs: *CmdStream,
+    cmd_buf_id: u64,
+    src_buffer: u64,
+    dst_image: u64,
+    image_layout: u32,
+    row_pixels: u32,
+    rects: []const [4]u32,
+) void {
+    cs.cmdHeader(CMD_vkCmdCopyBufferToImage, 0);
+    cs.writeU64(cmd_buf_id);
+    cs.writeU64(src_buffer);
+    cs.writeU64(dst_image);
+    cs.writeU32(image_layout);
+    writeBufferImageCopies(cs, row_pixels, rects);
+}
+
+/// Bytes per encoded VkBufferImageCopy.
+pub const BUFFER_IMAGE_COPY_SIZE: usize = 56;
+
+fn writeBufferImageCopies(cs: *CmdStream, row_pixels: u32, rects: []const [4]u32) void {
+    cs.writeU32(@intCast(rects.len)); // regionCount
+    cs.writeU64(rects.len); // pRegions array size
+    for (rects) |r| {
+        cs.writeU64((@as(u64, r[1]) * row_pixels + r[0]) * 4); // bufferOffset
+        cs.writeU32(row_pixels); // bufferRowLength
+        cs.writeU32(0); // bufferImageHeight (= extent height)
+        cs.writeU32(VK_IMAGE_ASPECT_COLOR_BIT);
+        cs.writeU32(0); // mipLevel
+        cs.writeU32(0); // baseArrayLayer
+        cs.writeU32(1); // layerCount
+        cs.writeU32(r[0]); // imageOffset
+        cs.writeU32(r[1]);
+        cs.writeU32(0);
+        cs.writeU32(r[2]); // imageExtent
+        cs.writeU32(r[3]);
+        cs.writeU32(1);
+    }
 }
 
 pub const VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO: u32 = 12;
+pub const VK_BUFFER_USAGE_TRANSFER_SRC_BIT: u32 = 0x1;
 pub const VK_BUFFER_USAGE_TRANSFER_DST_BIT: u32 = 0x2;
 pub const VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL: u32 = 6;
 
@@ -1046,6 +1137,32 @@ pub fn encodeCmdPipelineBarrier(
     cs.writeU32(1);
 }
 
+/// vkCmdPipelineBarrier with a single global VkMemoryBarrier.
+pub fn encodeCmdMemoryBarrier(
+    cs: *CmdStream,
+    cmd_buf_id: u64,
+    src_stage: u32,
+    dst_stage: u32,
+    src_access: u32,
+    dst_access: u32,
+) void {
+    cs.cmdHeader(CMD_vkCmdPipelineBarrier, 0);
+    cs.writeU64(cmd_buf_id);
+    cs.writeU32(src_stage);
+    cs.writeU32(dst_stage);
+    cs.writeU32(0); // dependencyFlags
+    cs.writeU32(1); // memoryBarrierCount
+    cs.writeU64(1);
+    cs.writeU32(46); // VK_STRUCTURE_TYPE_MEMORY_BARRIER
+    cs.writeNull();
+    cs.writeU32(src_access);
+    cs.writeU32(dst_access);
+    cs.writeU32(0); // bufferMemoryBarrierCount
+    cs.writeU64(0);
+    cs.writeU32(0); // imageMemoryBarrierCount
+    cs.writeU64(0);
+}
+
 pub fn encodeResetFences(cs: *CmdStream, device_id: u64, fence_id: u64) void {
     cs.cmdHeader(CMD_vkResetFences, 0);
     cs.writeU64(device_id);
@@ -1091,6 +1208,115 @@ pub fn encodeSeekReplyCommandStream(cs: *CmdStream, position: u64) void {
 pub fn readReplyResult(reply_buf: [*]volatile u8) i32 {
     const ptr: *align(1) const volatile i32 = @ptrCast(reply_buf + 4);
     return ptr.*;
+}
+
+/// A reply's leading cmd_type. The host writes it before the rest of that
+/// reply, so it only proves an EARLIER reply complete (see the compositor's
+/// reply marker).
+pub fn readReplyCmdType(reply_buf: [*]volatile u8) u32 {
+    return r32(reply_buf, 0);
+}
+
+/// Instance-less command with a reply; cheap enough to serve as a marker
+/// that every command before it in the stream has been executed.
+pub fn encodeEnumerateInstanceVersion(cs: *CmdStream) void {
+    cs.cmdHeader(CMD_vkEnumerateInstanceVersion, CMD_FLAG_GENERATE_REPLY);
+    cs.writePresent(); // pApiVersion (output only)
+}
+
+inline fn r32(buf: [*]volatile const u8, off: usize) u32 {
+    const ptr: *align(1) const volatile u32 = @ptrCast(buf + off);
+    return ptr.*;
+}
+
+inline fn r64(buf: [*]volatile const u8, off: usize) u64 {
+    const ptr: *align(1) const volatile u64 = @ptrCast(buf + off);
+    return ptr.*;
+}
+
+// ============================================================================
+// Physical-device and memory queries (replies carry payloads, no VkResult)
+// ============================================================================
+
+pub const VK_MAX_MEMORY_TYPES: u32 = 32;
+pub const VK_MAX_MEMORY_HEAPS: u32 = 16;
+
+pub const MemoryProperties = struct {
+    type_count: u32 = 0,
+    type_flags: [VK_MAX_MEMORY_TYPES]u32 = @splat(0),
+
+    /// First type in `type_bits` with all `required` flags, preferring one
+    /// that also has all `wanted` and none of `unwanted`.
+    pub fn pick(self: *const MemoryProperties, type_bits: u32, required: u32, wanted: u32, unwanted: u32) ?u32 {
+        var fallback: ?u32 = null;
+        var i: u32 = 0;
+        while (i < self.type_count) : (i += 1) {
+            if (type_bits & (@as(u32, 1) << @intCast(i)) == 0) continue;
+            const f = self.type_flags[i];
+            if (f & required != required) continue;
+            if (f & wanted == wanted and f & unwanted == 0) return i;
+            if (fallback == null) fallback = i;
+        }
+        return fallback;
+    }
+};
+
+pub fn encodeGetPhysicalDeviceMemoryProperties(cs: *CmdStream, phys_dev_id: u64) void {
+    cs.cmdHeader(CMD_vkGetPhysicalDeviceMemoryProperties, CMD_FLAG_GENERATE_REPLY);
+    cs.writeU64(phys_dev_id);
+    cs.writePresent(); // pMemoryProperties (output only)
+    cs.writeU64(VK_MAX_MEMORY_TYPES); // memoryTypes array size
+    cs.writeU64(VK_MAX_MEMORY_HEAPS); // memoryHeaps array size
+}
+
+/// Reply: u32 cmd_type, u64 present, u32 memoryTypeCount, u64 array size,
+/// 32 × {u32 propertyFlags, u32 heapIndex}, then the heaps (unused).
+pub fn decodeMemoryPropertiesReply(reply_buf: [*]volatile const u8) ?MemoryProperties {
+    if (r64(reply_buf, 4) == 0) return null;
+    const count = r32(reply_buf, 12);
+    if (count > VK_MAX_MEMORY_TYPES) return null;
+    var props: MemoryProperties = .{ .type_count = count };
+    var i: u32 = 0;
+    while (i < count) : (i += 1) props.type_flags[i] = r32(reply_buf, 24 + @as(usize, i) * 8);
+    return props;
+}
+
+/// VkFormatProperties output (no sType: the request sends only the pointer).
+pub fn encodeGetPhysicalDeviceFormatProperties(cs: *CmdStream, phys_dev_id: u64, format: u32) void {
+    cs.cmdHeader(CMD_vkGetPhysicalDeviceFormatProperties, CMD_FLAG_GENERATE_REPLY);
+    cs.writeU64(phys_dev_id);
+    cs.writeU32(format);
+    cs.writePresent();
+}
+
+pub const FormatProperties = struct { linear: u32, optimal: u32, buffer: u32 };
+
+/// Reply: u32 cmd_type, u64 present, u32 linear, u32 optimal, u32 buffer features.
+pub fn decodeFormatPropertiesReply(reply_buf: [*]volatile const u8) ?FormatProperties {
+    if (r64(reply_buf, 4) == 0) return null;
+    return .{ .linear = r32(reply_buf, 12), .optimal = r32(reply_buf, 16), .buffer = r32(reply_buf, 20) };
+}
+
+pub const MemoryRequirements = struct { size: u64, alignment: u64, type_bits: u32 };
+
+pub fn encodeGetImageMemoryRequirements(cs: *CmdStream, device_id: u64, image_id: u64) void {
+    cs.cmdHeader(CMD_vkGetImageMemoryRequirements, CMD_FLAG_GENERATE_REPLY);
+    cs.writeU64(device_id);
+    cs.writeU64(image_id);
+    cs.writePresent(); // pMemoryRequirements (output only)
+}
+
+pub fn encodeGetBufferMemoryRequirements(cs: *CmdStream, device_id: u64, buffer_id: u64) void {
+    cs.cmdHeader(CMD_vkGetBufferMemoryRequirements, CMD_FLAG_GENERATE_REPLY);
+    cs.writeU64(device_id);
+    cs.writeU64(buffer_id);
+    cs.writePresent();
+}
+
+/// Reply: u32 cmd_type, u64 present, u64 size, u64 alignment, u32 memoryTypeBits.
+pub fn decodeMemoryRequirementsReply(reply_buf: [*]volatile const u8) ?MemoryRequirements {
+    if (r64(reply_buf, 4) == 0) return null;
+    return .{ .size = r64(reply_buf, 12), .alignment = r64(reply_buf, 20), .type_bits = r32(reply_buf, 28) };
 }
 
 // ============================================================================
