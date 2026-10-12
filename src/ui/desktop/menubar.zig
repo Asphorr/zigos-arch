@@ -61,6 +61,37 @@ fn loadColor(pct: u8) u32 {
     return 0xFF55C95E; // green
 }
 
+const STAT_BAR_W: u32 = 36;
+
+fn statFill(pct: u8) u32 {
+    return (@as(u32, pct) * STAT_BAR_W) / 100;
+}
+
+// What the last render() showed, and when, for stale().
+var shown_minute: u8 = 0xFF;
+var shown_cpu_fill: u32 = 0;
+var shown_mem_fill: u32 = 0;
+var shown_tick: u64 = 0;
+var last_stale_check: u64 = 0;
+
+/// Ticks a stat bar may lag its value. A repaint costs the whole bar's
+/// blur (hundreds of ms under TCG), so the bars don't chase the CPU load.
+const STAT_REFRESH_TICKS: u64 = 500;
+
+/// True when the clock's minute has moved since the last render(), or a
+/// stat bar's fill has and the bar is STAT_REFRESH_TICKS old; the desktop
+/// then repaints the bar. Checks at most once a second (the clock read is
+/// port I/O).
+pub fn stale() bool {
+    const now = process.tick_count;
+    if (now -% last_stale_check < 100) return false;
+    last_stale_check = now;
+    if (rtc.readTime().minute != shown_minute) return true;
+    if (now -% shown_tick < STAT_REFRESH_TICKS) return false;
+    sampleCpu();
+    return statFill(cpu_pct) != shown_cpu_fill or statFill(memPct()) != shown_mem_fill;
+}
+
 /// Draw one labelled mini-bar at (x, y_top). Returns the right-edge x so
 /// the caller can stack the next widget to its left.
 fn drawStatBar(x: i32, y_top: i32, label: []const u8, pct: u8, atlas: *const aa_font.Atlas) i32 {
@@ -69,7 +100,7 @@ fn drawStatBar(x: i32, y_top: i32, label: []const u8, pct: u8, atlas: *const aa_
     aa_font.drawText(x, text_y, label, 0x8C8C92, atlas);
 
     const bar_x: i32 = x + @as(i32, @intCast(label_w)) + 6;
-    const bar_w: u32 = 36;
+    const bar_w: u32 = STAT_BAR_W;
     const bar_h: u32 = 6;
     const bar_y: i32 = y_top + @divTrunc(@as(i32, MENUBAR_H) - @as(i32, bar_h), 2);
 
@@ -77,7 +108,7 @@ fn drawStatBar(x: i32, y_top: i32, label: []const u8, pct: u8, atlas: *const aa_
     gfx.fillRectAlpha(bar_x, bar_y, bar_w, bar_h, 0x44000000);
     gfx.fillRectAlpha(bar_x, bar_y, bar_w, 1, 0x22000000);
 
-    const fill_w: u32 = (@as(u32, pct) * bar_w) / 100;
+    const fill_w: u32 = statFill(pct);
     if (fill_w > 0) {
         const col = loadColor(pct);
         gfx.fillRectAlpha(bar_x, bar_y, fill_w, bar_h, col);
@@ -132,6 +163,10 @@ pub fn render(focused_title: ?[]const u8) void {
     // pair (10-12 px label + 6 px gap + 36 px bar + 4 px gap to next).
     sampleCpu();
     const mp = memPct();
+    shown_minute = time.minute;
+    shown_cpu_fill = statFill(cpu_pct);
+    shown_mem_fill = statFill(mp);
+    shown_tick = process.tick_count;
     const sep_x: i32 = clock_x - 10;
     gfx.drawVLine(sep_x, 6, MENUBAR_H - 12, 0x444448);
 

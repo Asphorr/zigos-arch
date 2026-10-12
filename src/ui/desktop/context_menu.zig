@@ -73,10 +73,7 @@ pub fn close() void {
     active = false;
     ctx = .none;
     hover = -1;
-    // The menu's painted region won't be re-rendered next frame (active=false
-    // makes render() a no-op), so partial blit would leave its pixels stale.
-    // Request a full repaint instead.
-    dirty_rects.force_full_kind = true;
+    // The caller repaints this frame; `painted` tells it where the menu was.
 }
 
 pub fn itemAt(mx: i32, my: i32) i8 {
@@ -109,7 +106,24 @@ pub fn updateHover(mx: i32, my: i32) bool {
     return false;
 }
 
+/// Screen rect [x0, y0, x1, y1) the last render() painted, null if none.
+pub var painted: ?[4]i32 = null;
+
+/// Screen rect [x0, y0, x1, y1) render() would paint now (menu plus its
+/// shadows and border ring), null when the menu is closed.
+pub fn rect() ?[4]i32 {
+    if (!active) return null;
+    const items = currentItems();
+    const count: u32 = @intCast(items.len);
+    if (count == 0) return null;
+    const mw = menuWidth(items);
+    const mh = count * ITEM_H + PAD_Y * 2;
+    const pos = clampPos(mw, mh);
+    return .{ pos[0] - 3, pos[1] - 2, pos[0] + @as(i32, @intCast(mw)) + 6, pos[1] + @as(i32, @intCast(mh)) + 8 };
+}
+
 pub fn render() void {
+    painted = rect();
     if (!active) return;
     const items = currentItems();
     const count: u32 = @intCast(items.len);

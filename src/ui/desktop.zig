@@ -152,7 +152,7 @@ const frameperf = @import("desktop/frameperf.zig");
 
 pub fn showNotification(text: []const u8) void {
     toast.show(text);
-    dirty_rects_mod.force_full_kind = true;
+    // The next tick() starts the slide-in, which repaints the pill.
     wake.requestWake();
     sound.notify();
 }
@@ -268,7 +268,7 @@ var drag_oy: i32 = 0;
 var drag_old_x: i32 = 0;
 var drag_old_y: i32 = 0;
 
-// Vacated-region accumulator for the tight drag repaint (renderDragTight).
+// Vacated-region accumulator for the tight drag repaint (renderRegions).
 // Each move event unions the dragged window's OLD padded rect in here.
 // Today handleMouseEvents runs once per frame so this sees one rect per
 // frame; the union is defensive so every vacated strip is restored even if
@@ -1114,14 +1114,20 @@ fn renderScene() void {
     @import("gpu_compositor.zig").requestRender();
 }
 
-// ─── Tight drag repaint ─────────────────────────────────────────────────────
-// The frameperf "drag p90 16 ms" lever: window drags used to markDirtyFull →
-// full renderScene → full-screen flush on every mouse delta. renderDragTight
-// repaints only the closure of the drag-affected union instead.
+// ─── Region repaint ─────────────────────────────────────────────────────────
+// Frames that change a few known spots — terminal output, a window drag, an
+// overlay appearing or moving — repaint only those spots instead of the whole
+// scene, and hand only those rects to the flush and the GPU compositor. Each
+// seed rect grows to the closure of every alpha layer it touches (window
+// shadows, icon cells, glass bands and overlays all blend over or read the
+// pixels beneath them, so each must lie wholly on freshly restored wallpaper
+// or its blend accumulates: the shadow-darkening bug class). Intersecting
+// closures merge; each disjoint region is then painted in renderScene's
+// order, pixel-identical to renderScene inside it, untouched outside.
 
-/// Expandable bbox for the drag-union closure. growOver unions a rect in
-/// only when it intersects and isn't already contained, and records growth
-/// so the fixpoint loop knows when to stop.
+/// Expandable bbox for a region closure. growOver unions a rect in only
+/// when it intersects and isn't already contained, and records growth so
+/// the fixpoint loop knows when to stop.
 const Bbox = struct {
     x0: i32,
     y0: i32,
@@ -1129,9 +1135,12 @@ const Bbox = struct {
     y1: i32,
     grew: bool = false,
 
+    fn intersects(self: Bbox, o: Bbox) bool {
+        return self.x0 < o.x1 and o.x0 < self.x1 and self.y0 < o.y1 and o.y0 < self.y1;
+    }
+
     fn growOver(self: *Bbox, bx0: i32, by0: i32, bx1: i32, by1: i32) void {
-        const intersects = bx0 < self.x1 and self.x0 < bx1 and by0 < self.y1 and self.y0 < by1;
-        if (!intersects) return;
+        if (!self.intersects(.{ .x0 = bx0, .y0 = by0, .x1 = bx1, .y1 = by1 })) return;
         const contained = bx0 >= self.x0 and by0 >= self.y0 and bx1 <= self.x1 and by1 <= self.y1;
         if (contained) return;
         self.x0 = @min(self.x0, bx0);
@@ -1154,48 +1163,146 @@ fn paddedWinRect(i: u8) [4]i32 {
     };
 }
 
-/// Repaint only the drag-affected region: the vacated rects accumulated by
-/// the move events (drag_accum) ∪ the dragged window's current padded rect,
-/// closure-expanded until every alpha layer that intersects the union lies
-/// FULLY inside it — window shadows, icon cells, and the menubar/dock glass
-/// bands (glass READS the pixels beneath, and any alpha re-blend onto
-/// non-restored pixels accumulates: the shadow-darkening bug class). Inside
-/// the union the paint order mirrors renderScene exactly, so the result is
-/// pixel-identical there; outside, nothing is touched — correct because a
-/// pure-.drag frame changes nothing else (anything else escalates to .full,
-/// and prep-phase GUI stamps carry their own dirty rects).
-///
-/// Returns false — the caller falls back to the full-scene path — for icon
-/// (ghost) drags, under the software cursor (its previous position isn't
-/// modeled here), when an unmodeled overlay is live (toast, context menu,
-/// dock tooltip), or when this frame was already forced full.
-fn renderDragTight(use_hw_cursor: bool) bool {
-    if (!use_hw_cursor) return false;
-    if (!dragging or shortcuts.isDragging()) return false;
-    if (!drag_accum_valid) return false;
-    if (toast.isActive() or context_menu.active or dock.isTooltipVisible()) return false;
-    if (dirty_rects_mod.isFull()) return false;
+// Glass reach: the menubar's blurRegion radius 6 (+saturate), the dock's
+// fillGlass radius 8 + pill soft shadow +2, and the overlays' fillGlass
+// radius ≤ 6. Each joins a closure padded by its reach so the blur never
+// samples stale pixels.
+const MENUBAR_REACH: i32 = @as(i32, MENUBAR_H) + 8;
+const DOCK_REACH: i32 = 12;
+const OVERLAY_REACH: i32 = 8;
 
-    // Seed: vacated bbox ∪ the dragged window's current (post-move) rect.
-    var u = Bbox{ .x0 = drag_accum_x0, .y0 = drag_accum_y0, .x1 = drag_accum_x1, .y1 = drag_accum_y1 };
-    {
-        const r = paddedWinRect(drag_win);
-        u.x0 = @min(u.x0, r[0]);
-        u.y0 = @min(u.y0, r[1]);
-        u.x1 = @max(u.x1, r[2]);
-        u.y1 = @max(u.y1, r[3]);
+const MAX_REGION_SEEDS = 16;
+var region_seeds: [MAX_REGION_SEEDS]Bbox = undefined;
+var region_seed_count: u8 = 0;
+/// The focused terminal's text row changed during a .region/.drag frame.
+/// Painted on its own, like .text_only, unless its window is repainted
+/// in a region anyway.
+var text_row_pending: bool = false;
+
+/// Queue [x0, y0, x1, y1) for this frame's region repaint. Past the cap,
+/// seeds merge into the last one.
+fn seedRegion(x0: i32, y0: i32, x1: i32, y1: i32) void {
+    if (x1 <= x0 or y1 <= y0) return;
+    if (region_seed_count == MAX_REGION_SEEDS) {
+        const b = &region_seeds[MAX_REGION_SEEDS - 1];
+        b.x0 = @min(b.x0, x0);
+        b.y0 = @min(b.y0, y0);
+        b.x1 = @max(b.x1, x1);
+        b.y1 = @max(b.y1, y1);
+        return;
     }
+    region_seeds[region_seed_count] = .{ .x0 = x0, .y0 = y0, .x1 = x1, .y1 = y1 };
+    region_seed_count += 1;
+}
 
-    // Glass reach: menubar blurRegion radius 6 (+saturate), dock fillGlass
-    // radius 8 + pill soft shadow +2 — both bands join the closure padded by
-    // their kernel reach so the glass never samples stale pixels.
-    const mb_reach: i32 = @as(i32, MENUBAR_H) + 8;
-    const dock_y0: i32 = dock.dockY() - 12;
-    const dock_y1: i32 = dock.dockY() + @as(i32, TASKBAR_H) + 12;
+fn seedRect(r: [4]i32) void {
+    seedRegion(r[0], r[1], r[2], r[3]);
+}
+
+fn seedWindow(i: u8) void {
+    if (i >= MAX_WINDOWS or !slot_used[i]) return;
+    if (!windows[i].visible or windows[i].minimized) return;
+    seedRect(paddedWinRect(i));
+}
+
+fn sameRect(a: ?[4]i32, b: ?[4]i32) bool {
+    const ra = a orelse return b == null;
+    const rb = b orelse return false;
+    return ra[0] == rb[0] and ra[1] == rb[1] and ra[2] == rb[2] and ra[3] == rb[3];
+}
+
+/// An overlay that appeared, vanished or moved since it was last painted
+/// needs both its old and its new rect repainted.
+fn seedOverlayMove(painted: ?[4]i32, now: ?[4]i32) void {
+    if (sameRect(painted, now)) return;
+    if (painted) |r| seedRect(r);
+    if (now) |r| seedRect(r);
+}
+
+/// True if an overlay on screen, or about to be, overlaps `r`.
+fn overlayOver(r: [4]i32) bool {
+    const area = Bbox{ .x0 = r[0], .y0 = r[1], .x1 = r[2], .y1 = r[3] };
+    const overlays = [_]?[4]i32{
+        dock.tooltip_painted, toast.painted, context_menu.painted,
+        dock.tooltipRect(),   toast.rect(),  context_menu.rect(),
+    };
+    for (overlays) |o| {
+        const q = o orelse continue;
+        if (area.intersects(.{ .x0 = q[0], .y0 = q[1], .x1 = q[2], .y1 = q[3] })) return true;
+    }
+    return false;
+}
+
+/// True if this frame's partial window repaint — .gui_only's tracker rects,
+/// .text_only's focused terminal — overlaps an overlay, which it would
+/// paint over.
+fn partialHitsOverlay(dirty: DirtyKind) bool {
+    if (dock.tooltip_painted == null and toast.painted == null and context_menu.painted == null and
+        !dock.isTooltipVisible() and !toast.isActive() and !context_menu.active) return false;
+    if (dirty == .text_only) return slot_used[wm.focused] and overlayOver(paddedWinRect(wm.focused));
+    if (dirty_rects_mod.isFull()) return true;
+    const n = dirty_rects_mod.rectCount(); // can flip to full on cap overflow
+    if (dirty_rects_mod.isFull()) return true;
+    var i: u8 = 0;
+    while (i < n) : (i += 1) {
+        const r = dirty_rects_mod.getRect(i);
+        if (overlayOver(.{ @intCast(r[0]), @intCast(r[1]), @intCast(r[0] + r[2]), @intCast(r[1] + r[3]) })) return true;
+    }
+    return false;
+}
+
+/// Make this frame a region repaint of what has been seeded.
+fn wantRegion(dirty: *DirtyKind) void {
+    switch (dirty.*) {
+        .full, .drag, .region => {},
+        .text_only => {
+            text_row_pending = true;
+            dirty.* = .region;
+        },
+        .none, .cursor_only, .gui_only => dirty.* = .region,
+    }
+}
+
+/// The focused terminal's text row changed (keystroke echo, cursor blink).
+fn wantTextRow(dirty: *DirtyKind) void {
+    switch (dirty.*) {
+        .none, .cursor_only => dirty.* = .text_only,
+        .text_only, .full => {},
+        .region, .drag => text_row_pending = true,
+        .gui_only => {
+            text_row_pending = true;
+            dirty.* = .region;
+        },
+    }
+}
+
+/// The focused terminal's text row {x, y, w, h} as .text_only paints and
+/// flushes it, null when there is none on screen.
+fn textRowRect() ?[4]u32 {
+    if (!slot_used[wm.focused]) return null;
+    const cw = &windows[wm.focused];
+    const ct = cw.term orelse return null;
+    if (!cw.visible or cw.minimized) return null;
+    const ry = cw.y + @as(i32, TITLEBAR_H) + @as(i32, @intCast(@as(u32, ct.text_row) * FONT_H));
+    if (ry < 0) return null;
+    return .{ if (cw.x < 0) 0 else @intCast(cw.x), @intCast(ry), cw.width, FONT_H };
+}
+
+fn focusedTitle() ?[]const u8 {
+    return if (slot_used[wm.focused] and windows[wm.focused].visible)
+        windows[wm.focused].title[0..windows[wm.focused].title_len]
+    else
+        null;
+}
+
+const OverlayRects = struct { tip: ?[4]i32, toast: ?[4]i32, menu: ?[4]i32 };
+
+/// Grow `u` until every layer it touches lies wholly inside it. Each pass
+/// only grows over a fixed item set, so the fixpoint takes ≤ items passes
+/// (1–2 in practice).
+fn closeRegion(u: *Bbox, ov: OverlayRects) void {
+    const dock_y: i32 = dock.dockY();
     const sw_i: i32 = @intCast(gfx.screen_w);
-
-    // Fixpoint: each pass only grows the union over a fixed item set, so it
-    // terminates in ≤ items passes (1–2 in practice).
     u.grew = true;
     while (u.grew) {
         u.grew = false;
@@ -1211,23 +1318,35 @@ fn renderDragTight(use_hw_cursor: bool) bool {
             const c = shortcuts.cellRect(si);
             u.growOver(c[0], c[1], c[0] + c[2], c[1] + c[3]);
         }
-        u.growOver(0, 0, sw_i, mb_reach);
-        u.growOver(0, dock_y0, sw_i, dock_y1);
+        u.growOver(0, 0, sw_i, MENUBAR_REACH);
+        u.growOver(0, dock_y - DOCK_REACH, sw_i, dock_y + @as(i32, TASKBAR_H) + DOCK_REACH);
+        for ([_]?[4]i32{ ov.tip, ov.toast, ov.menu }) |o| {
+            const r = o orelse continue;
+            u.growOver(r[0] - OVERLAY_REACH, r[1] - OVERLAY_REACH, r[2] + OVERLAY_REACH, r[3] + OVERLAY_REACH);
+        }
     }
+}
 
-    // Clamp to the screen.
+/// Whether a closed region holds an overlay's paint. With nothing to draw
+/// the overlay's render() only records that, so let it run.
+fn overlayIn(u: Bbox, r: ?[4]i32) bool {
+    const o = r orelse return true;
+    return u.intersects(.{ .x0 = o[0], .y0 = o[1], .x1 = o[2], .y1 = o[3] });
+}
+
+/// Paint one closed region in renderScene's order.
+fn paintRegion(u: Bbox, ov: OverlayRects) void {
     const ux: u32 = if (u.x0 < 0) 0 else @intCast(u.x0);
     const uy: u32 = if (u.y0 < 0) 0 else @intCast(u.y0);
     const ux1: u32 = if (u.x1 < 0) 0 else @min(@as(u32, @intCast(u.x1)), gfx.screen_w);
     const uy1: u32 = if (u.y1 < 0) 0 else @min(@as(u32, @intCast(u.y1)), gfx.screen_h);
-    if (ux1 <= ux or uy1 <= uy) return false;
+    if (ux1 <= ux or uy1 <= uy) return;
 
-    // Paint — renderScene's order, restricted to the union.
     background.renderRect(ux, uy, ux1 - ux, uy1 - uy);
     shortcuts.renderRect(u.x0, u.y0, u.x1, u.y1);
-    var k2: u8 = 0;
-    while (k2 < wm.z_count) : (k2 += 1) {
-        const i = z_stack[k2];
+    var k: u8 = 0;
+    while (k < wm.z_count) : (k += 1) {
+        const i = z_stack[k];
         if (!windows[i].visible or windows[i].minimized) continue;
         const r = paddedWinRect(i);
         const inter = r[0] < u.x1 and u.x0 < r[2] and r[1] < u.y1 and u.y0 < r[3];
@@ -1235,7 +1354,7 @@ fn renderDragTight(use_hw_cursor: bool) bool {
         // Mirror renderScene's containment skip — a fully-covered window's
         // shadow is never painted there, and painting it here would show a
         // shadow sliver poking past the coverer that pops away on release.
-        if (isCoveredByUpper(k2, i)) continue;
+        if (isCoveredByUpper(k, i)) continue;
         // The closure put this window's whole padded rect on freshly restored
         // wallpaper, so the shadow re-blend can't accumulate frame-over-frame.
         // (Two overlapping non-containing shadows double-blend exactly like
@@ -1243,16 +1362,89 @@ fn renderDragTight(use_hw_cursor: bool) bool {
         windows[i].shadow_dirty = true;
         renderWindow(i);
     }
-    if (u.y0 < mb_reach) {
-        const focused_title: ?[]const u8 = if (slot_used[wm.focused] and windows[wm.focused].visible)
-            windows[wm.focused].title[0..windows[wm.focused].title_len]
-        else
-            null;
-        menubar.render(focused_title);
-    }
-    if (u.y1 > dock_y0) dock.render();
+    // A band the region reaches lies wholly inside it (closure).
+    if (u.y0 < MENUBAR_REACH) menubar.render(focusedTitle());
+    if (u.y1 > dock.dockY() - DOCK_REACH) dock.render();
+    if (overlayIn(u, ov.tip)) dock.renderTooltip();
+    if (overlayIn(u, ov.toast)) toast.render();
+    if (overlayIn(u, ov.menu)) context_menu.render();
     addDirtyRect(ux, uy, ux1 - ux, uy1 - uy);
-    return true;
+}
+
+/// Repaint this frame's seeds — plus the window-drag union, the windows the
+/// GUI recomposite already stamped, and any overlay that moved — as closed
+/// regions. Returns false, and the caller repaints the full scene, under the
+/// software cursor (its previous position isn't modeled), during an icon drag
+/// (nor is the ghost), or when the frame is already forced full.
+fn renderRegions(use_hw_cursor: bool) bool {
+    if (!use_hw_cursor or shortcuts.isDragging()) return false;
+    if (dirty_rects_mod.isFull()) return false;
+    const n = dirty_rects_mod.rectCount(); // can flip to full on cap overflow
+    if (dirty_rects_mod.isFull()) return false;
+
+    var ri: u8 = 0;
+    while (ri < n) : (ri += 1) {
+        const r = dirty_rects_mod.getRect(ri);
+        seedRegion(@intCast(r[0]), @intCast(r[1]), @intCast(r[0] + r[2]), @intCast(r[1] + r[3]));
+    }
+    if (dragging and drag_accum_valid) {
+        seedRegion(drag_accum_x0, drag_accum_y0, drag_accum_x1, drag_accum_y1);
+        seedWindow(drag_win);
+    }
+    const ov = OverlayRects{ .tip = dock.tooltipRect(), .toast = toast.rect(), .menu = context_menu.rect() };
+    seedOverlayMove(dock.tooltip_painted, ov.tip);
+    seedOverlayMove(toast.painted, ov.toast);
+    seedOverlayMove(context_menu.painted, ov.menu);
+    // A pending text row is painted alone unless an overlay lies over its
+    // window (the row paint would cover it) or the window lands in a region.
+    var row = if (text_row_pending) textRowRect() else null;
+    if (row != null and overlayOver(paddedWinRect(wm.focused))) {
+        seedWindow(wm.focused);
+        row = null;
+    }
+
+    var regions = region_seeds;
+    var count = region_seed_count;
+    region_seed_count = 0;
+    for (regions[0..count]) |*u| closeRegion(u, ov);
+    // Merge until disjoint: then every layer lies in exactly one region and
+    // the regions paint independently.
+    var merged = true;
+    while (merged) {
+        merged = false;
+        var i: u8 = 0;
+        scan: while (i < count) : (i += 1) {
+            var j: u8 = i + 1;
+            while (j < count) : (j += 1) {
+                const a = regions[i];
+                const b = regions[j];
+                if (!a.intersects(b)) continue;
+                regions[i] = .{ .x0 = @min(a.x0, b.x0), .y0 = @min(a.y0, b.y0), .x1 = @max(a.x1, b.x1), .y1 = @max(a.y1, b.y1) };
+                closeRegion(&regions[i], ov);
+                count -= 1;
+                regions[j] = regions[count];
+                merged = true;
+                break :scan;
+            }
+        }
+    }
+    for (regions[0..count]) |u| paintRegion(u, ov);
+    if (row) |r| {
+        // A window touching a region lies wholly inside it (closure), so
+        // the row is either repainted already or clear of every region.
+        const fw = paddedWinRect(wm.focused);
+        const win = Bbox{ .x0 = fw[0], .y0 = fw[1], .x1 = fw[2], .y1 = fw[3] };
+        var in_region = false;
+        for (regions[0..count]) |u| in_region = in_region or u.intersects(win);
+        if (!in_region) {
+            renderTerminalRow(wm.focused);
+            addDirtyRect(r[0], r[1], r[2], r[3]);
+        }
+    }
+    // An overlay that moved while painting (the dock re-laid out its
+    // buttons) may have landed outside every region.
+    return sameRect(dock.tooltip_painted, ov.tip) and sameRect(toast.painted, ov.toast) and
+        sameRect(context_menu.painted, ov.menu);
 }
 
 fn launchShortcut(idx: usize) void {
@@ -2346,7 +2538,9 @@ fn clearCurrentLine(w: *Window) void {
     t.cmd_len = 0;
 }
 
-const DirtyKind = enum { none, cursor_only, text_only, drag, full, gui_only };
+/// What this frame repaints. .region repaints the queued seeds (see
+/// renderRegions); .drag is the same path driven by a window drag.
+const DirtyKind = enum { none, cursor_only, text_only, drag, full, gui_only, region };
 
 // --- Context menu ---
 
@@ -2507,14 +2701,20 @@ fn handleMouseEvents() DirtyKind {
                     const ustep: u16 = @intCast(@min(-step, 0xFFFF));
                     tt.scroll_view -|= ustep;
                 }
-                result = .full;
+                seedWindow(ti);
+                result = .region;
             }
         }
     }
 
-    // Context menu: dismiss on left-click, track hover
+    // Context menu: dismiss on left-click, track hover. A menu that opens,
+    // closes or moves is repainted by renderRegions; a hover change keeps
+    // the rect, so it is seeded here.
     if (context_menu.active) {
-        if (context_menu.updateHover(mx, my)) result = .full;
+        if (context_menu.updateHover(mx, my)) {
+            if (context_menu.rect()) |r| seedRect(r);
+            result = .region;
+        }
         if (left_down and !was_down) {
             executeMenuItem(context_menu.itemAt(mx, my));
             context_menu.close();
@@ -2524,7 +2724,7 @@ fn handleMouseEvents() DirtyKind {
         }
         if (right_down and !right_was) {
             context_menu.close();
-            result = .full;
+            result = .region;
             // Fall through to open new menu below
         } else {
             prev_buttons = btn;
@@ -2539,11 +2739,11 @@ fn handleMouseEvents() DirtyKind {
         } else if (windowAt(mx, my)) |idx| {
             if (isInTitlebar(idx, mx, my)) {
                 context_menu.open(.titlebar, mx, my, idx);
-                result = .full;
+                result = .region;
             }
         } else {
             context_menu.open(.desktop_bg, mx, my, 0);
-            result = .full;
+            result = .region;
         }
     }
 
@@ -2697,7 +2897,7 @@ fn handleMouseEvents() DirtyKind {
             drag_old_x = windows[drag_win].x;
             drag_old_y = windows[drag_win].y;
             // Record the vacated region for the tight drag repaint instead of
-            // the old markDirtyFull() — renderDragTight restores exactly this
+            // the old markDirtyFull() — renderRegions restores exactly this
             // (plus the closure) rather than re-rendering the whole scene.
             accumVacated(drag_old_x, drag_old_y, windows[drag_win].width, windows[drag_win].height);
             windows[drag_win].x = new_x;
@@ -3140,8 +3340,9 @@ pub fn run() void {
             showNotification("Settings applied!");
         }
 
-        // Toast: advance the slide-in / countdown one tick.
-        if (toast.tick()) dirty_rects_mod.force_full_kind = true;
+        // Toast: advance the slide-in / countdown one tick. A step moves the
+        // pill; renderRegions repaints its old and new rects.
+        const toast_stepped = toast.tick();
         // Toast keeps animating until its timer drains — request a
         // self-wake so the next tick brings us back to advance the
         // slide-in / slide-out. ~2 ticks (~50 Hz) is plenty for a 200-
@@ -3156,15 +3357,18 @@ pub fn run() void {
         var dirty: DirtyKind = if (dirty_rects_mod.force_full_kind) .full else .none;
         // `force_full_kind` semantically means "the previous frame painted
         // something that won't be tracked by this frame's renderScene"
-        // (animation completion, toast expiry, resolution change, etc.).
+        // (animation completion, menu close, resolution change, etc.).
         // Mark the rect tracker full so the .full path falls back to full
         // blit instead of partial — partial would miss pixels where the
         // disappearing element used to live (closing-window halo, etc.).
         if (dirty_rects_mod.force_full_kind) markDirtyFull();
         dirty_rects_mod.force_full_kind = false;
-        // Context menu and tooltips must use full render (gui_only blits would overwrite parts)
-        if (context_menu.active) dirty = .full;
-        if (dock.isTooltipVisible()) dirty = .full;
+        if (toast_stepped) wantRegion(&dirty);
+        // The clock or a CPU/MEM bar moved: repaint the menubar.
+        if (menubar.stale()) {
+            seedRegion(0, 0, @intCast(gfx.screen_w), @as(i32, MENUBAR_H));
+            wantRegion(&dirty);
+        }
 
         // Cursor blink edge: when tick_count crosses a blink half-period
         // boundary and the focused window is a terminal, mark dirty so the
@@ -3175,7 +3379,7 @@ pub fn run() void {
             const curr_phase = process.tick_count / CURSOR_BLINK_HALF_TICKS;
             if (curr_phase != last_blink_phase) {
                 last_blink_phase = curr_phase;
-                if (dirty == .none) dirty = .text_only;
+                wantTextRow(&dirty);
             }
             // Self-wake at the start of the next half-period so the blink
             // toggle fires on time even with no other compositor activity.
@@ -3184,13 +3388,15 @@ pub fn run() void {
         }
 
         // Bell flash: each terminal with a non-zero bell_phase counts down
-        // one frame; while active, mark dirty=.full so the red border re-renders.
+        // one frame; while active, repaint the window so the red border
+        // re-renders.
         var any_bell_active = false;
         for (z_stack[0..wm.z_count]) |wi| {
             if (windows[wi].term) |tt| {
                 if (tt.bell_phase > 0) {
                     tt.bell_phase -= 1;
-                    dirty = .full;
+                    seedWindow(wi);
+                    wantRegion(&dirty);
                     if (tt.bell_phase > 0) any_bell_active = true;
                 }
             }
@@ -3359,7 +3565,7 @@ pub fn run() void {
                         }
                     } else {
                         const needs_full = handleKeyboard(w, ch);
-                        if (needs_full) dirty = .full else if (dirty != .full) dirty = .text_only;
+                        if (needs_full) dirty = .full else wantTextRow(&dirty);
                     }
                 }
             }
@@ -3377,24 +3583,25 @@ pub fn run() void {
             const mr = handleMouseEvents();
             switch (mr) {
                 .full => dirty = .full,
-                .drag => {
-                    // A pending .text_only (keypress / cursor blink) renders its
-                    // row only in the .text_only arm — the tight drag path would
-                    // drop it if the terminal sits outside the drag union, so
-                    // the coincidence escalates to .full (the historical cost).
-                    if (dirty == .text_only) {
-                        dirty = .full;
-                    } else if (dirty != .full) {
+                .drag => switch (dirty) {
+                    .full => {},
+                    // A pending row (keypress / cursor blink) rides along with
+                    // the drag's regions.
+                    .text_only => {
+                        text_row_pending = true;
                         dirty = .drag;
-                    }
+                    },
+                    else => dirty = .drag,
                 },
+                .region => wantRegion(&dirty),
                 else => {},
             }
             if (cursor_moved and dirty == .none) dirty = .cursor_only;
         }
 
-        // Dock hover tracking for tooltips
-        if (cursor_moved and dock.updateHover(mouse.x, mouse.y)) dirty = .full;
+        // Dock hover tracking for tooltips. A tooltip that appears, moves or
+        // vanishes is repainted by renderRegions.
+        if (cursor_moved and dock.updateHover(mouse.x, mouse.y)) wantRegion(&dirty);
 
         // Drain stdout pipes for every shell-attached terminal window. The
         // shell process writes via libc.print → fwrite(1) → pipe.write into
@@ -3403,10 +3610,11 @@ pub fn run() void {
         // "TTY-as-two-pipes" architecture: no kernel TTY primitive, just a
         // pair of generic byte streams plus this drain step.
         //
-        // dirty=.full (not .text_only) because drained bytes can span
-        // multiple rows — `ls`'s newline-separated output, wc's "N bytes
-        // M lines\n", etc. — and .text_only only redraws the row at
+        // The whole window is repainted (not .text_only) because drained bytes
+        // can span multiple rows — `ls`'s newline-separated output, wc's "N
+        // bytes M lines\n", etc. — and .text_only only redraws the row at
         // text_row, leaving earlier rows blank until the next full repaint.
+        // Output only touches the terminal's own cells, so a region suffices.
         {
             const pipe = @import("../proc/pipe.zig");
             var drain_buf: [256]u8 = undefined;
@@ -3417,7 +3625,8 @@ pub fn run() void {
                     const got = pipe.tryRead(w.out_pipe, &drain_buf);
                     if (got == 0) break;
                     for (drain_buf[0..got]) |c| putCharOnWindow(w, c);
-                    dirty = .full;
+                    seedWindow(wi);
+                    wantRegion(&dirty);
                     if (got < drain_buf.len) break;
                 }
             }
@@ -3526,6 +3735,8 @@ pub fn run() void {
             }
         }
 
+        if ((dirty == .gui_only or dirty == .text_only) and partialHitsOverlay(dirty)) wantRegion(&dirty);
+
         // Render based on what changed
         frameperf.prepDone();
         if (backbuf != null) {
@@ -3542,14 +3753,13 @@ pub fn run() void {
                     display.flush();
                     resetDirtyRects();
                 },
-                .drag => {
-                    // Tight path (hw cursor only): repaint just the drag-union
-                    // closure and flush its rects. Falls back to the historical
-                    // full-scene path when renderDragTight's preconditions
-                    // don't hold.
-                    if (renderDragTight(use_hw_cursor)) {
+                .drag, .region => {
+                    // Tight path (hw cursor only): repaint just the closed
+                    // regions and flush their rects. Falls back to the full-
+                    // scene path when renderRegions' preconditions don't hold.
+                    if (renderRegions(use_hw_cursor)) {
                         const dr_count = dirty_rects_mod.rectCount(); // can flip to full on cap overflow
-                        if (dirty_rects_mod.isFull() or dr_count == 0) {
+                        if (dirty_rects_mod.isFull()) {
                             gfx.blitToScreen();
                             display.flush();
                         } else {
@@ -3568,8 +3778,7 @@ pub fn run() void {
                         @import("gpu_compositor.zig").requestRenderFromDirty();
                         resetDirtyRects();
                     } else {
-                        // Window drag — full re-render repaints the background
-                        // behind the old position.
+                        frameperf.regionFallback();
                         renderScene();
                         if (!use_hw_cursor) bakeCursorToBackBuffer();
                         gfx.blitToScreen();
@@ -3656,16 +3865,19 @@ pub fn run() void {
             if (swCursorActive(use_hw_cursor)) drawCursorOnScreen();
             display.flush();
         }
-        // Any rendered frame consumed (tight path) or superseded (full paths)
-        // the vacated-region accumulator; a valid accum implies dirty ≥ .drag,
-        // so no repaint is ever lost by clearing here.
+        // Any rendered frame consumed (region path) or superseded (full paths)
+        // the vacated-region accumulator and the region seeds; both come with
+        // dirty ∈ {.drag, .region, .full}, so no repaint is lost by clearing.
         drag_accum_valid = false;
+        region_seed_count = 0;
+        text_row_pending = false;
         frameperf.frameEnd(switch (dirty) {
             .none => .none,
             .cursor_only => .cursor,
             .text_only => .text,
             .gui_only => .gui,
             .drag => .drag,
+            .region => .region,
             .full => .full,
         }, process.tick_count);
 

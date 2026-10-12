@@ -91,7 +91,7 @@ pub fn render() void {
 }
 
 /// render() restricted to icons whose padded cell intersects the given
-/// rect ([x0, y0, x1, y1) in screen coords) — the tight drag path's icon
+/// rect ([x0, y0, x1, y1) in screen coords) — the region repaint's icon
 /// pass. The caller guarantees (by closure expansion over cellRect) that
 /// an intersecting cell lies FULLY inside the restored region, so the
 /// alpha icon/label blend never lands on stale pixels.
@@ -99,7 +99,7 @@ pub fn renderRect(cx0: i32, cy0: i32, cx1: i32, cy1: i32) void {
     renderImpl(.{ .x0 = cx0, .y0 = cy0, .x1 = cx1, .y1 = cy1 });
 }
 
-/// Number of icon cells (for the tight drag path's closure walk).
+/// Number of icon cells (for the region repaint's closure walk).
 pub fn cellCount() usize {
     return pinned.list.len;
 }

@@ -151,7 +151,7 @@ pub fn render() void {
 }
 
 /// Restore wallpaper/gradient ONLY inside the given screen-space rect —
-/// the tight drag path's background pass. Pixel-identical to a full
+/// the region repaint's background pass. Pixel-identical to a full
 /// render() restricted to the rect (gradient rows keyed by absolute row;
 /// the wallpaper sub-blit uses the same centering math). Holds wp_lock
 /// for the whole paint — without it, sysSetWallpaper can vmalloc.free the

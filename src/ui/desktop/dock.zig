@@ -34,9 +34,7 @@ var pill_h: u32 = 0;
 
 /// Hover tracking. -1 means cursor not over any dock button. The timer
 /// counts frames since hover started; once it reaches TOOLTIP_FRAMES we
-/// draw the tooltip. Read by the desktop loop to decide whether the
-/// scene needs a full re-render (tooltip pixels live outside the
-/// rect-tracker, so a partial flush would leave the tooltip stale).
+/// draw the tooltip.
 pub var hover_idx: i8 = -1;
 pub var hover_timer: u8 = 0;
 pub const TOOLTIP_FRAMES: u8 = 10;
@@ -59,9 +57,8 @@ pub fn inDockZone(my: i32) bool {
     return my >= top and my < top + @as(i32, TASKBAR_H);
 }
 
-/// True iff a tooltip is currently visible. Caller uses this to decide
-/// whether the next frame needs a .full repaint (tooltip overlays the
-/// dock + bg below it, outside the dirty-rect tracker).
+/// True iff a tooltip is currently visible. While it is, the desktop
+/// keeps partial window repaints from painting over it.
 pub fn isTooltipVisible() bool {
     return hover_idx >= 0 and hover_timer >= TOOLTIP_FRAMES;
 }
@@ -158,10 +155,14 @@ pub fn render() void {
     }
 }
 
-pub fn renderTooltip() void {
-    if (!isTooltipVisible()) return;
+const Tooltip = struct { name: []const u8, x: i32, y: i32, w: u32, h: u32 };
+
+/// The tooltip for the current hover state, placed against the button
+/// positions of the last render().
+fn tooltip() ?Tooltip {
+    if (!isTooltipVisible()) return null;
     const idx: u8 = @intCast(hover_idx);
-    if (idx >= btn_count) return;
+    if (idx >= btn_count) return null;
 
     const btn = btn_positions[idx];
     var name: []const u8 = "";
@@ -172,14 +173,39 @@ pub fn renderTooltip() void {
             name = wm.windows[btn.idx].title[0..wm.windows[btn.idx].title_len];
         }
     }
-    if (name.len == 0) return;
+    if (name.len == 0) return null;
 
     const atlas = aa_font.getDefault16();
-    const text_w = atlas.measure(name);
-    const tip_w: u32 = text_w + 16;
+    const tip_w: u32 = atlas.measure(name) + 16;
     const tip_h: u32 = atlas.line_height + 10;
-    const tip_x: i32 = btn.x + @as(i32, DOCK_ICON_SIZE / 2) - @as(i32, @intCast(tip_w / 2));
-    const tip_y: i32 = pill_y - @as(i32, @intCast(tip_h)) - 6;
+    return .{
+        .name = name,
+        .x = btn.x + @as(i32, DOCK_ICON_SIZE / 2) - @as(i32, @intCast(tip_w / 2)),
+        .y = pill_y - @as(i32, @intCast(tip_h)) - 6,
+        .w = tip_w,
+        .h = tip_h,
+    };
+}
+
+/// Screen rect [x0, y0, x1, y1) the last renderTooltip() painted, null if none.
+pub var tooltip_painted: ?[4]i32 = null;
+
+/// Screen rect [x0, y0, x1, y1) renderTooltip() would paint now (glass
+/// plus its 1 px shadow), null when no tooltip is shown.
+pub fn tooltipRect() ?[4]i32 {
+    const t = tooltip() orelse return null;
+    return .{ t.x, t.y, t.x + @as(i32, @intCast(t.w)) + 2, t.y + @as(i32, @intCast(t.h)) + 2 };
+}
+
+pub fn renderTooltip() void {
+    tooltip_painted = tooltipRect();
+    const t = tooltip() orelse return;
+    const name = t.name;
+    const atlas = aa_font.getDefault16();
+    const tip_w = t.w;
+    const tip_h = t.h;
+    const tip_x = t.x;
+    const tip_y = t.y;
 
     // Track painted region so partial-blit paths flush the tooltip.
     const ux: u32 = if (tip_x < 0) 0 else @intCast(tip_x);
@@ -214,8 +240,8 @@ pub fn clickAt(mx: i32) ?Action {
 }
 
 /// Update hover state given the current cursor position. Returns true if
-/// the dock visibly changed (hover started/stopped or tooltip just
-/// appeared) — caller should mark the next frame .full when this is true.
+/// the tooltip may have changed (hover started/stopped or tooltip just
+/// appeared) — the caller repaints its old and new rects.
 pub fn updateHover(mx: i32, my: i32) bool {
     if (inDockZone(my)) {
         const new_hover: i8 = if (itemAt(mx)) |idx| @intCast(idx) else -1;

@@ -44,8 +44,8 @@ pub fn isActive() bool {
 }
 
 /// Per-frame timer/anim advance. Returns true iff the desktop must
-/// schedule a full repaint (a slide-in step, a slide-out step, or the
-/// final clear when the pill leaves the screen).
+/// repaint the pill's old and new rects (a slide-in step, a slide-out
+/// step, or the final clear when the pill leaves the screen).
 pub fn tick() bool {
     if (timer == 0) return false;
     var dirty = false;
@@ -55,16 +55,23 @@ pub fn tick() bool {
     }
     timer -= 1;
     // The final ANIM_FRAMES of life are the slide-out (plus the timer==0
-    // frame, where render() draws nothing and the desktop's force-full
-    // repaint clears the pixels). Repaint every one of those frames so the
-    // pill animates off-screen instead of hard-cutting.
+    // frame, where render() draws nothing and the repaint of the old rect
+    // clears the pixels). Repaint every one of those frames so the pill
+    // animates off-screen instead of hard-cutting.
     if (timer <= ANIM_FRAMES) dirty = true;
     return dirty;
 }
 
-pub fn render() void {
-    if (timer == 0) return;
-    const toast_w: u32 = @as(u32, text_len) * FONT_ADVANCE + 32;
+/// Screen rect [x0, y0, x1, y1) the last render() painted, null if none.
+pub var painted: ?[4]i32 = null;
+
+fn pillWidth() u32 {
+    return @as(u32, text_len) * FONT_ADVANCE + 32;
+}
+
+/// Pill origin for the current timer/anim state.
+fn pillPos() [2]i32 {
+    const toast_w = pillWidth();
     const toast_y: i32 = @as(i32, layout.MENUBAR_H) + MARGIN;
 
     // `full_x` = resting position; `off_x` = distance from rest to fully
@@ -86,6 +93,24 @@ pub fn render() void {
         const progress = @divTrunc(t * t, total);
         toast_x = full_x + @divTrunc(off_x * progress, total);
     }
+    return .{ toast_x, toast_y };
+}
+
+/// Screen rect [x0, y0, x1, y1) render() would paint now (pill plus
+/// shadow and specular border), null when no toast is up.
+pub fn rect() ?[4]i32 {
+    if (timer == 0) return null;
+    const p = pillPos();
+    return .{ p[0] - 1, p[1] - 1, p[0] + @as(i32, @intCast(pillWidth())) + 3, p[1] + @as(i32, PILL_H) + 3 };
+}
+
+pub fn render() void {
+    painted = rect();
+    if (timer == 0) return;
+    const toast_w = pillWidth();
+    const p = pillPos();
+    const toast_x = p[0];
+    const toast_y = p[1];
 
     // Track the painted region so partial-blit paths flush this strip.
     // Add 2 px on each side for the shadow + specular border.

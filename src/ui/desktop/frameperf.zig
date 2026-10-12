@@ -37,8 +37,8 @@ const N_PHASES = 4; // prep, render, flush, total
 const PHASE_NAMES = [N_PHASES][]const u8{ "prep  ", "render", "flush ", "total " };
 const DUMP_INTERVAL_TICKS: u64 = 3000; // ~30 s at 100 Hz
 
-pub const Kind = enum(u3) { none, cursor, text, gui, drag, full };
-const KIND_COUNT = 6;
+pub const Kind = enum(u3) { none, cursor, text, gui, drag, full, region };
+const KIND_COUNT = 7;
 
 var in_frame: bool = false;
 var t_frame_start: u64 = 0;
@@ -49,6 +49,7 @@ var hist: [N_PHASES][N_BUCKETS]u64 = .{.{0} ** N_BUCKETS} ** N_PHASES;
 var max_us: [N_PHASES]u64 = .{0} ** N_PHASES;
 var frames: u64 = 0;
 var idle_wakes: u64 = 0;
+var region_fallbacks: u64 = 0;
 var kind_counts: [KIND_COUNT]u64 = .{0} ** KIND_COUNT;
 var last_dump_tick: u64 = 0;
 
@@ -74,6 +75,11 @@ pub fn flushBegin() u64 {
 pub fn flushEnd(t0: u64) void {
     if (t0 == 0) return;
     flush_tsc_accum +%= perf.rdtsc() -% t0;
+}
+
+/// A .drag/.region frame fell back to a full scene repaint.
+pub fn regionFallback() void {
+    region_fallbacks += 1;
 }
 
 /// Frame complete. Records histograms (or idle_wakes for a no-op wake) and
@@ -142,12 +148,13 @@ fn dump(window_ticks: u64) void {
         return;
     }
     debug.klog(
-        "[frameperf] {d}t window: frames={d} (full={d} drag={d} gui={d} text={d} cur={d}) idle_wakes={d}\n",
+        "[frameperf] {d}t window: frames={d} (full={d} region={d} drag={d} gui={d} text={d} cur={d}) region_fallbacks={d} idle_wakes={d}\n",
         .{
-            window_ticks,                        frames,
-            kind_counts[@intFromEnum(Kind.full)], kind_counts[@intFromEnum(Kind.drag)],
-            kind_counts[@intFromEnum(Kind.gui)],  kind_counts[@intFromEnum(Kind.text)],
-            kind_counts[@intFromEnum(Kind.cursor)], idle_wakes,
+            window_ticks,                         frames,
+            kind_counts[@intFromEnum(Kind.full)], kind_counts[@intFromEnum(Kind.region)],
+            kind_counts[@intFromEnum(Kind.drag)], kind_counts[@intFromEnum(Kind.gui)],
+            kind_counts[@intFromEnum(Kind.text)], kind_counts[@intFromEnum(Kind.cursor)],
+            region_fallbacks,                     idle_wakes,
         },
     );
     for (0..N_PHASES) |p| {
@@ -163,6 +170,7 @@ fn reset(now_tick: u64) void {
     max_us = .{0} ** N_PHASES;
     frames = 0;
     idle_wakes = 0;
+    region_fallbacks = 0;
     kind_counts = .{0} ** KIND_COUNT;
     last_dump_tick = now_tick;
 }
