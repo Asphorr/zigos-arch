@@ -856,15 +856,13 @@ fn sendCmdViaPhys(cmd_len: u32, resp_len: u32) bool {
         if (use_msix and msix_safe_to_use and !force_polled) {
             // Sleep-yield wait. blockOn parks the calling PCB in .sleeping
             // with wait_kind=.gpu_io; schedule() then picks idle (or
-            // another runnable task), which means the timer IRQs that
-            // fire during the wait charge against the idle PCB's
-            // is_idle=true → idle_tick_count++ instead of the GPU
-            // submitter. Without this yield, the submitter holds
-            // current_pid through the entire wait and the menubar /
-            // sysmon CPU bars peg at 100 % even though the CPU is in
-            // C-state. virtioGpuIrqHandler walks PCBs and wakes any
-            // .gpu_io waiter when usedIdx advances; ctrl_lock keeps the
-            // waiter count at ≤ 1.
+            // another runnable task), so the wait counts as idle time.
+            // Without this yield, the submitter holds current_pid
+            // through the entire wait and the menubar / sysmon CPU bars
+            // peg at 100 % even though the CPU is in C-state.
+            // virtioGpuIrqHandler walks PCBs and wakes any .gpu_io
+            // waiter when usedIdx advances; ctrl_lock keeps the waiter
+            // count at ≤ 1.
             //
             // Timeout: re-check after each yield; bail after 100
             // schedule round-trips (~1 s if waking only via the 10 ms

@@ -52,7 +52,7 @@ fn drawBar(canvas: *C, x: u32, y: u32, w: u32, h: u32, pct: u32) void {
 
 const MAX_CPUS: u32 = 4;
 const POLL_FRAMES: u32 = 50; // ~500ms between refreshes
-var prev_stats: [MAX_CPUS]libc.CpuStat = [_]libc.CpuStat{.{ .irq_ticks = 0, .idle_ticks = 0 }} ** MAX_CPUS;
+var prev_stats: [MAX_CPUS]libc.CpuStat = [_]libc.CpuStat{.{ .total_cyc = 0, .idle_cyc = 0 }} ** MAX_CPUS;
 var prev_valid: bool = false;
 
 // Layout constants — y-coords of each row in the dynamic content area.
@@ -188,16 +188,16 @@ export fn _start() linksection(".text.entry") callconv(.c) void {
         var c: u32 = 0;
         while (c < cpu_count) : (c += 1) {
             const y: u32 = Y_CPU_START + c * CPU_PITCH;
-            // Delta-based utilization: (irq_d - idle_d) / irq_d.
+            // Delta-based utilization: (total_d - idle_d) / total_d.
             // First sample has prev=0 so we skip and show 0% to avoid a
             // bogus spike on the first frame.
             var pct: u32 = 0;
             if (prev_valid) {
-                const d_irq = stat_buf[c].irq_ticks -% prev_stats[c].irq_ticks;
-                const d_idle = stat_buf[c].idle_ticks -% prev_stats[c].idle_ticks;
-                if (d_irq > 0) {
-                    const busy = if (d_irq > d_idle) d_irq - d_idle else 0;
-                    pct = @intCast((busy * 100) / d_irq);
+                const d_total = stat_buf[c].total_cyc -% prev_stats[c].total_cyc;
+                const d_idle = stat_buf[c].idle_cyc -% prev_stats[c].idle_cyc;
+                if (d_total > 0) {
+                    const busy = if (d_total > d_idle) d_total - d_idle else 0;
+                    pct = @intCast((busy * 100) / d_total);
                     if (pct > 100) pct = 100;
                 }
             }

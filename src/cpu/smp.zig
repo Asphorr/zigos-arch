@@ -163,15 +163,16 @@ pub const CpuLocal = struct {
     /// (a) Self-write is under cli but uses @atomicStore so peer
     /// @atomicLoads compose with the StoreLoad fence the load implies
     /// — without atomics a future LICM hoist across IRQ-entry would
-    /// freeze the displayed value forever. Readers: watchdog.peerCheck,
-    /// menubar sample loop, sys.cpustat.
+    /// freeze the displayed value forever. Reader: watchdog.peerCheck.
     irq_tick_count: u64 = 0,
-    /// Counts only the IRQ0 firings that interrupted an idle PCB on this CPU.
-    /// `(irq_tick_count - idle_tick_count) / irq_tick_count` over a window
-    /// gives instantaneous CPU usage — what htop/top draw. Updated under the
-    /// same cli as `irq_tick_count` so the pair stays monotonic to readers.
-    /// (a) Same access rules as irq_tick_count above.
-    idle_tick_count: u64 = 0,
+    /// Idle time: the CPU is idle exactly while its idle PCB is current.
+    /// idle_cyc sums the closed idle stretches in TSC cycles, idle_since is
+    /// the TSC at which the open one began (0 while a task runs). Written
+    /// by noteIdleSwitch only, on this CPU with IRQs off, inside the
+    /// idle_seq seqcount; read through idleCycles.
+    idle_cyc: u64 = 0,
+    idle_since: u64 = 0,
+    idle_seq: u32 = 0,
     /// Watchdog scratch — last `peer.irq_tick_count` snapshot taken by this
     /// CPU's watchdog check, and how many consecutive 1s windows the peer
     /// hasn't advanced. Threshold-cross fires the watchdog autopsy.
@@ -391,6 +392,49 @@ inline fn rdtsc() u64 {
           [hi] "={edx}" (hi),
     );
     return (@as(u64, hi) << 32) | lo;
+}
+
+/// The current_pid setter's hook: `cpu`'s idle PCB stops or starts being
+/// current. Sampling which PCB a timer tick interrupts can't stand in for
+/// this: soft yields are ticks too, all charged to the task that yields,
+/// and a tickless idle CPU takes few real ones.
+pub fn noteIdleSwitch(cpu: *CpuLocal, was_idle: bool, now_idle: bool) void {
+    if (was_idle == now_idle) return;
+    var flags: u64 = undefined;
+    asm volatile ("pushfq; pop %[f]; cli"
+        : [f] "=r" (flags),
+    );
+    const now = rdtsc();
+    @atomicStore(u32, &cpu.idle_seq, cpu.idle_seq +% 1, .release);
+    if (was_idle) {
+        if (cpu.idle_since != 0 and now > cpu.idle_since) {
+            @atomicStore(u64, &cpu.idle_cyc, cpu.idle_cyc +% (now - cpu.idle_since), .release);
+        }
+        @atomicStore(u64, &cpu.idle_since, 0, .release);
+    } else {
+        @atomicStore(u64, &cpu.idle_since, now, .release);
+    }
+    @atomicStore(u32, &cpu.idle_seq, cpu.idle_seq +% 1, .release);
+    if (flags & 0x200 != 0) asm volatile ("sti");
+}
+
+/// TSC cycles `c` has spent idle up to `now`, a TSC value the caller read
+/// (one value for all CPUs keeps their spans comparable). Retries are
+/// bounded: a CPU halted by an NMI inside noteIdleSwitch leaves idle_seq
+/// odd for good, and then the closed stretches alone have to do.
+pub fn idleCycles(c: *const CpuLocal, now: u64) u64 {
+    for (0..64) |_| {
+        const seq = @atomicLoad(u32, &c.idle_seq, .acquire);
+        if (seq & 1 == 0) {
+            const closed = @atomicLoad(u64, &c.idle_cyc, .acquire);
+            const since = @atomicLoad(u64, &c.idle_since, .acquire);
+            if (@atomicLoad(u32, &c.idle_seq, .acquire) == seq) {
+                return if (since != 0 and now > since) closed +% (now - since) else closed;
+            }
+        }
+        std.atomic.spinLoopHint();
+    }
+    return @atomicLoad(u64, &c.idle_cyc, .acquire);
 }
 
 /// `rdtscp` — the TSC plus IA32_TSC_AUX in ECX, never a VM exit. Only the

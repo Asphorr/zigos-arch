@@ -112,16 +112,17 @@ pub fn sysMeminfo(buf_ptr: u32) u32 {
     return 0;
 }
 
-/// Per-CPU tick stats — `(irq_ticks, idle_ticks)` u64 pair per alive CPU,
-/// packed sequentially. Caller passes a buffer sized for `max_cpus` entries
-/// (16 bytes each); we fill up to the alive count and return the actual
-/// count written. Returns E_FAULT on bad user pointer or buf too small.
+/// Per-CPU time stats — `(total_cyc, idle_cyc)` u64 pair per alive CPU,
+/// packed sequentially: the TSC now and the TSC cycles the CPU has spent
+/// idle. Caller passes a buffer sized for `max_cpus` entries (16 bytes
+/// each); we fill up to the alive count and return the actual count
+/// written. Returns E_FAULT on bad user pointer or buf too small.
 ///
-/// Used by sysmon / top-style tools: compute `(d_irq - d_idle) / d_irq * 100`
-/// across two snapshots to get instantaneous utilization per CPU.
+/// Used by sysmon / top-style tools: compute `(d_total - d_idle) / d_total * 100`
+/// across two snapshots to get utilization per CPU.
 const CpuStat = extern struct {
-    irq_ticks: u64,
-    idle_ticks: u64,
+    total_cyc: u64,
+    idle_cyc: u64,
 };
 
 pub fn sysCpuStats(buf_ptr: u32, max_cpus: u32) u32 {
@@ -135,13 +136,11 @@ pub fn sysCpuStats(buf_ptr: u32, max_cpus: u32) u32 {
     if (!validateUserPtrWriteAligned(buf_ptr, byte_len, @alignOf(CpuStat))) return E_FAULT;
     const buf: [*]CpuStat = @ptrFromInt(@as(usize, buf_ptr));
     var written: u32 = 0;
+    const now = apic.readTsc();
     for (&smp.cpus) |*c| {
         if (!c.alive) continue;
         if (written >= clamped) break;
-        buf[written] = .{
-            .irq_ticks = @atomicLoad(u64, &c.irq_tick_count, .acquire),
-            .idle_ticks = @atomicLoad(u64, &c.idle_tick_count, .acquire),
-        };
+        buf[written] = .{ .total_cyc = now, .idle_cyc = smp.idleCycles(c, now) };
         written += 1;
     }
     return written;

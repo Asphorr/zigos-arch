@@ -101,11 +101,17 @@ pub inline fn setCurrentPid(cpu: *smp.CpuLocal, new: ?usize) void {
         const prev_pid: u8 = if (old) |op| @intCast(op) else 0xFF;
         pid_act.record(np, .setcurpid_in, prev_pid, 0xFF, ra);
     }
+    smp.noteIdleSwitch(cpu, isIdle(old), isIdle(new));
     cpu.current_pid = new;
     // Release the inbound-dispatch bracket: from here on, cpu.current_pid
     // matches the running-state pid (or null for outbound-only paths),
     // so pcb_invariants' "state==.running but no owner" check is safe.
     cpu.dispatching_in_pid = 0xFFFF;
+}
+
+inline fn isIdle(p: ?usize) bool {
+    const pid = p orelse return false;
+    return pid < config.MAX_PROCS and process.procs[pid].is_idle;
 }
 
 fn fmtPid(buf: []u8, p: u8) []const u8 {

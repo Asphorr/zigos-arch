@@ -281,18 +281,9 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
     // BEFORE the peer check so a CPU that's only running soft yields still
     // shows up alive. cli is held throughout handleIRQ0 so the read+store is
     // race-free against this CPU's other code; @atomicStore is used so peer
-    // @atomicLoad readers (watchdog, menubar, sys.cpustat) see ordered
-    // values that the compiler can't hoist across IRQ entry.
+    // @atomicLoad readers (the watchdog) see ordered values that the
+    // compiler can't hoist across IRQ entry.
     @atomicStore(u64, &cpu.irq_tick_count, cpu.irq_tick_count +% 1, .release);
-    // Charge this tick as "idle" if the CPU was running its kernel idle PCB
-    // at the moment of the IRQ. The /proc/cpustat consumer subtracts idle
-    // from total to get utilization. Done under the same cli as irq_tick,
-    // so a reader on another CPU never sees idle > irq.
-    if (cpu.current_pid) |pid| {
-        if (pid < process.procs.len and process.procs[pid].is_idle) {
-            @atomicStore(u64, &cpu.idle_tick_count, cpu.idle_tick_count +% 1, .release);
-        }
-    }
     @import("../../debug/watchdog.zig").peerCheck(cpu);
 
     // Per-CPU execution trail — record where this CPU was interrupted.

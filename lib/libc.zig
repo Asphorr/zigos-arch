@@ -686,12 +686,13 @@ pub fn meminfo() MemInfo {
     return .{ .free_frames = buf[0], .total_frames = buf[1] };
 }
 
-/// Per-CPU tick counters used to compute utilization. Caller takes two
-/// snapshots `dt` apart and computes `((irq_d - idle_d) * 100) / irq_d`
-/// for each CPU to get instantaneous CPU usage in percent.
+/// Per-CPU TSC counters used to compute utilization: the TSC at the call
+/// and the cycles the CPU has spent idle. Caller takes two snapshots apart
+/// and computes `((total_d - idle_d) * 100) / total_d` for each CPU to get
+/// CPU usage in percent.
 pub const CpuStat = extern struct {
-    irq_ticks: u64,
-    idle_ticks: u64,
+    total_cyc: u64,
+    idle_cyc: u64,
 };
 
 /// Fill `out` with stats for up to `out.len` alive CPUs. Returns how many

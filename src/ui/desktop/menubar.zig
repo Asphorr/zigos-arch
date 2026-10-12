@@ -9,6 +9,7 @@ const rtc = @import("../../time/rtc.zig");
 const layout = @import("layout.zig");
 const dirty_rects = @import("dirty.zig");
 const smp = @import("../../cpu/smp.zig");
+const apic = @import("../../time/apic.zig");
 const pmm = @import("../../mm/pmm.zig");
 const process = @import("../../proc/process.zig");
 
@@ -17,8 +18,9 @@ const MENUBAR_H = layout.MENUBAR_H;
 // CPU sampling state. We average activity over a small sliding window so
 // the bar doesn't twitch every frame. The sample window is ~50 timer ticks
 // (≈0.5s @ 100Hz) — long enough to be readable, short enough to feel live.
-var prev_irq_total: u64 = 0;
-var prev_idle_total: u64 = 0;
+var prev_tsc: u64 = 0;
+var prev_idle_cyc: u64 = 0;
+var prev_cpus: u64 = 0;
 var cpu_pct: u8 = 0;
 var last_sample_tick: u64 = 0;
 
@@ -29,20 +31,24 @@ fn sampleCpu() void {
     if (now -% last_sample_tick < 50) return;
     last_sample_tick = now;
 
-    var irq_sum: u64 = 0;
-    var idle_sum: u64 = 0;
+    const tsc = apic.readTsc();
+    var idle: u64 = 0;
+    var cpus: u64 = 0;
     for (&smp.cpus) |*c| {
         if (!c.alive) continue;
-        irq_sum +%= @atomicLoad(u64, &c.irq_tick_count, .acquire);
-        idle_sum +%= @atomicLoad(u64, &c.idle_tick_count, .acquire);
+        idle +%= smp.idleCycles(c, tsc);
+        cpus += 1;
     }
-    const d_irq = irq_sum -% prev_irq_total;
-    const d_idle = idle_sum -% prev_idle_total;
-    prev_irq_total = irq_sum;
-    prev_idle_total = idle_sum;
-    if (d_irq == 0) return;
-    const busy: u64 = if (d_idle >= d_irq) 0 else d_irq - d_idle;
-    cpu_pct = @intCast((busy * 100) / d_irq);
+    // A CPU coming online, or the TSC restarting across S3, voids the window.
+    const valid = prev_tsc != 0 and tsc > prev_tsc and cpus == prev_cpus;
+    const span = if (valid) (tsc - prev_tsc) * cpus else 0;
+    const d_idle = idle -% prev_idle_cyc;
+    prev_tsc = tsc;
+    prev_idle_cyc = idle;
+    prev_cpus = cpus;
+    if (span < 100) return;
+    const busy: u64 = if (d_idle >= span) 0 else span - d_idle;
+    cpu_pct = @intCast(@min(100, busy / (span / 100)));
 }
 
 fn memPct() u8 {
