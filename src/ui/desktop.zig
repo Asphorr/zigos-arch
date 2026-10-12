@@ -1182,6 +1182,46 @@ fn paddedWinRect(i: u8) [4]i32 {
     };
 }
 
+/// Mode 9: what the backbuf shows on top of window `i`, as rects
+/// [x0, y0, x1, y1) — the windows above it (bordered, without their
+/// shadow: the backbuf holds no content under a GPU-slot window's
+/// shadow), the menubar, the dock and the overlays — up to out.len of
+/// them. The GPU compositor draws a GPU-slot window's content and then
+/// the backbuf again over these. Caller holds the windows lock and the
+/// compositor's source lock, so this matches the last finished desktop
+/// iteration.
+pub fn occludersAbove(i: u8, out: [][4]i32) usize {
+    var n: usize = 0;
+    var above = false;
+    for (z_stack[0..wm.z_count]) |j| {
+        const w = &windows[j];
+        if (above and n < out.len and w.visible and !w.minimized) {
+            out[n] = .{
+                w.x - @as(i32, BORDER),
+                w.y - @as(i32, BORDER),
+                w.x + @as(i32, @intCast(w.width + BORDER)),
+                w.y + @as(i32, @intCast(w.height + BORDER)),
+            };
+            n += 1;
+        }
+        if (j == i) above = true;
+    }
+    const bands = [_]?[4]i32{
+        .{ 0, 0, @intCast(gfx.screen_w), @as(i32, MENUBAR_H) },
+        dock.pillRect(),
+        dock.tooltip_painted,
+        toast.painted,
+        context_menu.painted,
+    };
+    for (bands) |b| {
+        const r = b orelse continue;
+        if (n == out.len) break;
+        out[n] = r;
+        n += 1;
+    }
+    return n;
+}
+
 // Glass reach: the menubar's blurRegion radius 6 (+saturate), the dock's
 // fillGlass radius 8 + pill soft shadow +2, and the overlays' fillGlass
 // radius ≤ 6. Each joins a closure padded by its reach so the blur never

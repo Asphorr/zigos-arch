@@ -155,6 +155,13 @@ pub fn render() void {
     }
 }
 
+/// Screen rect [x0, y0, x1, y1) the last render() painted: the pill, its
+/// 2 px shadow and the running dots under it. Null before the first one.
+pub fn pillRect() ?[4]i32 {
+    if (pill_w == 0) return null;
+    return .{ pill_x, pill_y, pill_x + @as(i32, @intCast(pill_w)) + 2, pill_y + @as(i32, @intCast(pill_h)) + 6 };
+}
+
 const Tooltip = struct { name: []const u8, x: i32, y: i32, w: u32, h: u32 };
 
 /// The tooltip for the current hover state, placed against the button

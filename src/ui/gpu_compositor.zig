@@ -505,8 +505,6 @@ var pending_full: bool = true; // initial frame copies everything
 /// their pixels without reporting damage.
 const Damage = struct {
     full: bool = true,
-    /// Visible GPU-slot windows (counted only for partial damage).
-    slot_windows: u8 = 0,
     bg_count: u8 = 0,
     bg: [MAX_PENDING_RECTS][4]u32 = undefined,
     out_count: u8 = 0,
@@ -536,7 +534,6 @@ const MAX_SCISSORED_DRAWS: usize = 24;
 fn takeDamage() void {
     frame_damage.bg_count = 0;
     frame_damage.out_count = 0;
-    frame_damage.slot_windows = 0;
     frame_damage.full = pending_full or pending_rect_count == 0;
     if (!frame_damage.full) {
         const n = @min(pending_rect_count, MAX_PENDING_RECTS);
@@ -572,7 +569,6 @@ fn takeDamage() void {
         if (!w_ref.visible or w_ref.minimized) continue;
         const slot_idx = w_ref.gpu_slot orelse continue;
         if (slot_idx >= MAX_WINDOW_SLOTS or !window_slots[slot_idx].in_use) continue;
-        frame_damage.slot_windows += 1;
         frame_damage.addOut(w_ref.x, w_ref.y + @as(i32, @intCast(TITLEBAR_H)), w_ref.width, w_ref.height -| TITLEBAR_H);
     }
 }
@@ -1984,26 +1980,102 @@ const FrameResult = enum {
     failed,
 };
 
-fn renderVulkanFrame(_: f32) FrameResult {
-    // Pack 32-byte push constants: vec4 rect + vec4 uv_scale (only .xy used).
-    const packPush = struct {
-        fn p(out: *[32]u8, x: f32, y: f32, w: f32, h: f32, ux: f32, uy: f32) void {
-            const vals = [_]f32{ x, y, w, h, ux, uy, 0.0, 0.0 };
-            inline for (vals, 0..) |v, i| {
-                const bits: u32 = @bitCast(v);
-                @memcpy(out[i * 4 ..][0..4], @as(*const [4]u8, @ptrCast(&bits)));
-            }
-        }
-    };
+/// Pack 32-byte push constants: vec4 rect + vec4 uv_scale (only .xy used).
+fn packPush(out: *[32]u8, x: f32, y: f32, w: f32, h: f32, ux: f32, uy: f32) void {
+    const vals = [_]f32{ x, y, w, h, ux, uy, 0.0, 0.0 };
+    inline for (vals, 0..) |v, i| {
+        const bits: u32 = @bitCast(v);
+        @memcpy(out[i * 4 ..][0..4], @as(*const [4]u8, @ptrCast(&bits)));
+    }
+}
 
+/// A GPU-slot window as this frame draws it: content rect [x0, y0, x1, y1),
+/// its sampling state, and the backbuf rects on top of it, already clipped
+/// to the content rect.
+const SlotLayer = struct {
+    rect: [4]i32,
+    push: [32]u8,
+    desc_set: u64,
+    occ_count: u8,
+    occ: [MAX_OCCLUDERS][4]i32,
+};
+const MAX_OCCLUDERS = 12;
+var slot_layers: [MAX_WINDOW_SLOTS]SlotLayer = undefined;
+var slot_layer_count: u8 = 0;
+/// Draws a frame records per scissor at most. ~220 bytes of command stream
+/// for a draw with its bindings, ~80 for a backbuf redraw that reuses them.
+const MAX_LAYER_DRAWS: usize = 32;
+
+fn intersect(a: [4]i32, b: [4]i32) ?[4]i32 {
+    const r = [4]i32{ @max(a[0], b[0]), @max(a[1], b[1]), @min(a[2], b[2]), @min(a[3], b[3]) };
+    return if (r[0] < r[2] and r[1] < r[3]) r else null;
+}
+
+/// `r` [x0, y0, x1, y1) clipped to scissor `sc` {x, y, w, h}, as a scissor.
+fn clipToScissor(r: [4]i32, sc: [4]u32) ?[4]u32 {
+    const s = [4]i32{ @intCast(sc[0]), @intCast(sc[1]), @intCast(sc[0] + sc[2]), @intCast(sc[1] + sc[3]) };
+    const c = intersect(r, s) orelse return null;
+    return .{ @intCast(c[0]), @intCast(c[1]), @intCast(c[2] - c[0]), @intCast(c[3] - c[1]) };
+}
+
+/// Snapshot the visible GPU-slot windows, bottom to top, into slot_layers.
+/// Returns the draws one scissor takes (the backbuf, then each window and
+/// its occluders), trimming occluders past MAX_LAYER_DRAWS. Caller holds
+/// the windows lock and source_lock.
+fn collectSlotLayers() usize {
+    const wm = @import("desktop/window.zig");
+    const desktop = @import("desktop.zig");
+    const TITLEBAR_H: u32 = @import("desktop/layout.zig").TITLEBAR_H;
+    slot_layer_count = 0;
+    var draws: usize = 1;
+    for (wm.z_stack[0..wm.z_count]) |wi| {
+        const w_ref = &wm.windows[wi];
+        if (!w_ref.visible or w_ref.minimized) continue;
+        const slot_idx = w_ref.gpu_slot orelse continue;
+        if (slot_idx >= MAX_WINDOW_SLOTS) continue;
+        const sl = &window_slots[slot_idx];
+        if (!sl.in_use) continue;
+        const content_h: u32 = w_ref.height -| TITLEBAR_H;
+        if (w_ref.width == 0 or content_h == 0) continue;
+        if (draws == MAX_LAYER_DRAWS) break;
+
+        const l = &slot_layers[slot_layer_count];
+        const y0 = w_ref.y + @as(i32, @intCast(TITLEBAR_H));
+        l.rect = .{ w_ref.x, y0, w_ref.x + @as(i32, @intCast(w_ref.width)), y0 + @as(i32, @intCast(content_h)) };
+        l.desc_set = sl.desc_set_id;
+        // The image spans the slot's memory dims; sample only the
+        // sl.width × sl.height the app draws.
+        const ux: f32 = @as(f32, @floatFromInt(sl.width)) / @as(f32, @floatFromInt(sl.mem_w));
+        const uy: f32 = @as(f32, @floatFromInt(sl.height)) / @as(f32, @floatFromInt(sl.mem_h));
+        packPush(&l.push, @floatFromInt(w_ref.x), @floatFromInt(y0), @floatFromInt(w_ref.width), @floatFromInt(content_h), ux, uy);
+        draws += 1;
+
+        var above: [MAX_OCCLUDERS][4]i32 = undefined;
+        const n = desktop.occludersAbove(wi, &above);
+        l.occ_count = 0;
+        for (above[0..n]) |o| {
+            if (draws == MAX_LAYER_DRAWS) break;
+            l.occ[l.occ_count] = intersect(o, l.rect) orelse continue;
+            l.occ_count += 1;
+            draws += 1;
+        }
+        slot_layer_count += 1;
+    }
+    return draws;
+}
+
+/// The backbuf draw under the current scissor.
+fn recordBackgroundDraw(bg_push: *const [32]u8) void {
+    venus.encodeCmdBindDescriptorSets(&scratch_cs, COMPOSITOR_CMD_BUF, COMPOSITOR_PIPELINE_LAYOUT, COMPOSITOR_DESC_SET);
+    venus.encodeCmdPushConstants(&scratch_cs, COMPOSITOR_CMD_BUF, COMPOSITOR_PIPELINE_LAYOUT, 0x10, bg_push);
+    venus.encodeCmdDraw(&scratch_cs, COMPOSITOR_CMD_BUF, 3, 1);
+}
+
+fn renderVulkanFrame(_: f32) FrameResult {
     var bg_push: [32]u8 = undefined;
     // Background image (backbuf) is allocated at exact screen size, so
     // uv_scale = (1, 1) — sample full image extent.
-    packPush.p(&bg_push, 0.0, 0.0, @floatFromInt(RENDER_W), @floatFromInt(RENDER_H), 1.0, 1.0);
-    // Phase 3: replaced the single-focused-overlay draw with a loop
-    // over all visible windows that have a gpu_slot. The old
-    // focused_rect_* and win_push are still computed in fillFocusedSource
-    // but the latter early-returns since Phase 9.2.
+    packPush(&bg_push, 0.0, 0.0, @floatFromInt(RENDER_W), @floatFromInt(RENDER_H), 1.0, 1.0);
 
     scratch_cs.reset();
     venus.encodeBeginCommandBuffer(&scratch_cs, COMPOSITOR_CMD_BUF);
@@ -2037,16 +2109,23 @@ fn renderVulkanFrame(_: f32) FrameResult {
             0x20, // dstAccess = SHADER_READ
         );
     }
+    const per_scissor = blk: {
+        const wm = @import("desktop/window.zig");
+        const flags = wm.lockWindows();
+        defer wm.unlockWindows(flags);
+        break :blk collectSlotLayers();
+    };
+
     // Render only the damage: the render image keeps the previous frame
     // (LOAD pass), so outside the damage it is already current. A full
     // frame clears instead — the image may not hold a frame yet. Each
     // damage rect gets the draws under its own scissor; where rects
     // overlap the same pixels are drawn twice (no blending). Too many
-    // rects × windows would outgrow the command stream: then one scissor
+    // rects × draws would outgrow the command stream: then one scissor
     // over the bounds.
     const bounds = if (frame_damage.full) FULL_SCREEN[0] else damageBounds();
     const bounds_only = [_][4]u32{bounds};
-    const draws = outDamage().len * (1 + @as(usize, frame_damage.slot_windows));
+    const draws = outDamage().len * per_scissor;
     const scissors: []const [4]u32 = if (frame_damage.full or draws > MAX_SCISSORED_DRAWS) &bounds_only else outDamage();
     venus.encodeCmdBeginRenderPassClear(
         &scratch_cs,
@@ -2061,57 +2140,33 @@ fn renderVulkanFrame(_: f32) FrameResult {
     );
     venus.encodeCmdBindPipeline(&scratch_cs, COMPOSITOR_CMD_BUF, COMPOSITOR_PIPELINE);
 
-    const wm = @import("desktop/window.zig");
-    const TITLEBAR_H: u32 = @import("desktop/layout.zig").TITLEBAR_H;
-    const flags = wm.lockWindows();
     for (scissors) |sc| {
+        // The backbuf: chrome, CPU-drawn windows, menubar, dock, overlays.
         venus.encodeCmdSetScissor(&scratch_cs, COMPOSITOR_CMD_BUF, sc);
+        recordBackgroundDraw(&bg_push);
 
-        // Draw 1: background — desktop chrome layer (backbuf as one big
-        // texture).  Window content rects in the backbuf are stale (Phase
-        // 4 will skip the gui_fb→backbuf blit entirely); the per-window
-        // draws below overlay the live pixels on top.
-        venus.encodeCmdBindDescriptorSets(&scratch_cs, COMPOSITOR_CMD_BUF, COMPOSITOR_PIPELINE_LAYOUT, COMPOSITOR_DESC_SET);
-        venus.encodeCmdPushConstants(&scratch_cs, COMPOSITOR_CMD_BUF, COMPOSITOR_PIPELINE_LAYOUT, 0x10, &bg_push);
-        venus.encodeCmdDraw(&scratch_cs, COMPOSITOR_CMD_BUF, 3, 1);
-
-        // Step 9.4 Phase 3: per-window draws. Each visible window with a
-        // gpu_slot binds its own descriptor set + pushes its on-screen
-        // rect (below the title bar — the chrome stays in the backbuf
-        // layer). Fragment shader's bounds-test discards pixels outside
-        // the rect.
-        var wi: u8 = 0;
-        while (wi < wm.windows.len) : (wi += 1) {
-            if (!wm.slot_used[wi]) continue;
-            const w_ref = &wm.windows[wi];
-            if (!w_ref.visible or w_ref.minimized) continue;
-            const slot_idx = w_ref.gpu_slot orelse continue;
-            if (slot_idx >= MAX_WINDOW_SLOTS) continue;
-            const sl = &window_slots[slot_idx];
-            if (!sl.in_use) continue;
-
-            // Window rect on screen, content area only (skip title bar).
-            const x0: i64 = w_ref.x;
-            const y0: i64 = @as(i64, w_ref.y) + TITLEBAR_H;
-            const content_h: u32 = w_ref.height -| TITLEBAR_H;
-            if (w_ref.width == 0 or content_h == 0) continue;
-            if (x0 >= @as(i64, sc[0]) + sc[2] or x0 + w_ref.width <= sc[0] or
-                y0 >= @as(i64, sc[1]) + sc[3] or y0 + content_h <= sc[1]) continue;
-            // uv_scale = (sl.width / sl.mem_w, sl.height / sl.mem_h). The
-            // image is allocated at slot mem dims (full alloc area); only
-            // the (sl.width × sl.height) drawn portion needs to be visible
-            // in the on-screen rect, so we shrink the sampling uv accordingly.
-            const ux: f32 = @as(f32, @floatFromInt(sl.width)) / @as(f32, @floatFromInt(sl.mem_w));
-            const uy: f32 = @as(f32, @floatFromInt(sl.height)) / @as(f32, @floatFromInt(sl.mem_h));
-            var per_win_push: [32]u8 = undefined;
-            packPush.p(&per_win_push, @floatFromInt(x0), @floatFromInt(y0), @floatFromInt(w_ref.width), @floatFromInt(content_h), ux, uy);
-
-            venus.encodeCmdBindDescriptorSets(&scratch_cs, COMPOSITOR_CMD_BUF, COMPOSITOR_PIPELINE_LAYOUT, sl.desc_set_id);
-            venus.encodeCmdPushConstants(&scratch_cs, COMPOSITOR_CMD_BUF, COMPOSITOR_PIPELINE_LAYOUT, 0x10, &per_win_push);
+        // GPU-slot windows bottom to top: the content area from the slot
+        // image (the chrome stays in the backbuf layer), then the backbuf
+        // again wherever something is on top of the window.
+        for (slot_layers[0..slot_layer_count]) |*l| {
+            const vis = clipToScissor(l.rect, sc) orelse continue;
+            venus.encodeCmdSetScissor(&scratch_cs, COMPOSITOR_CMD_BUF, vis);
+            venus.encodeCmdBindDescriptorSets(&scratch_cs, COMPOSITOR_CMD_BUF, COMPOSITOR_PIPELINE_LAYOUT, l.desc_set);
+            venus.encodeCmdPushConstants(&scratch_cs, COMPOSITOR_CMD_BUF, COMPOSITOR_PIPELINE_LAYOUT, 0x10, &l.push);
             venus.encodeCmdDraw(&scratch_cs, COMPOSITOR_CMD_BUF, 3, 1);
+            var bound = false;
+            for (l.occ[0..l.occ_count]) |o| {
+                const r = clipToScissor(o, vis) orelse continue;
+                venus.encodeCmdSetScissor(&scratch_cs, COMPOSITOR_CMD_BUF, r);
+                if (bound) {
+                    venus.encodeCmdDraw(&scratch_cs, COMPOSITOR_CMD_BUF, 3, 1);
+                } else {
+                    recordBackgroundDraw(&bg_push);
+                    bound = true;
+                }
+            }
         }
     }
-    wm.unlockWindows(flags);
 
     venus.encodeCmdEndRenderPass(&scratch_cs, COMPOSITOR_CMD_BUF);
     // Step 9.1: render image -> readback buffer.
