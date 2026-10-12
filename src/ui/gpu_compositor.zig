@@ -413,14 +413,9 @@ var focused_rect_h: u32 = 0;
 var screen_w_cache: u32 = 0;
 var screen_h_cache: u32 = 0;
 
-// Event-driven wake plumbing. The compositor parks via kernelSleepMs(33)
-// — a 30 Hz timer fallback that bounds wake latency if the wake-flip
-// race kicks in — and external damage sources call `requestRender()` to
-// flip the counter and explicit-wake the kernel task. process.wake on a
-// PCB whose state == .sleeping flips it to .ready, which exits
-// kernelSleepMs early; if the wake interleaves between our atomic check
-// and the kernelSleepMs state-flip, the 33 ms timer covers it. So
-// worst-case idle latency = 33 ms, typical = sub-ms.
+// Event-driven wake plumbing. The compositor parks in parkUntilRender, and
+// damage sources call `requestRender()` to bump pending_wakes and wake the
+// kernel task.
 pub var compositor_pid: u8 = 0xFF;
 var pending_wakes: u32 = 0;
 
@@ -2300,15 +2295,7 @@ fn run() noreturn {
         // two would lose its increment (harmless today only because every
         // caller publishes its damage before bumping — made structural).
         while (@atomicRmw(u32, &pending_wakes, .Xchg, 0, .seq_cst) == 0) {
-            if (vulkan_render_ready) {
-                // The Venus/Lavapipe path animates on frame_no (its
-                // renderVulkanFrame gets t = frame_no / 30): it needs the
-                // free-running ~30 Hz cadence the old poll gave it. Only
-                // this path keeps polling.
-                process.kernelSleepMs(33);
-            } else {
-                parkUntilRender();
-            }
+            parkUntilRender();
         }
 
         const perf = @import("../debug/perf.zig");
