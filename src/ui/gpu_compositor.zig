@@ -107,9 +107,11 @@ const REPLY_TIMEOUT_MS: u64 = 30_000;
 const FRAME_TIMEOUT_MS: u64 = 30_000;
 // Host-side vkWaitForFences bound, same reasoning.
 const FENCE_TIMEOUT_NS: u64 = 10_000_000_000;
-/// How long waitReplyMarker yields before it sleeps: a frame on a host GPU
-/// takes 1–4 ms (dzn under KVM).
-const SPIN_WAIT_US: u64 = 4000;
+/// waitReplyMarker yields this long, for replies that come straight back,
+/// then polls in POLL_SLEEP_US sleeps: a frame on a host GPU takes 1–4 ms
+/// (dzn under KVM), and the ring has no completion interrupt.
+const SPIN_WAIT_US: u64 = 100;
+const POLL_SLEEP_US: u32 = 250;
 
 fn beginChecked() void {
     scratch_cs.reset();
@@ -157,13 +159,10 @@ fn waitReplyMarker(ring: [*]volatile u8, timeout_ms: u64) SubmitResult {
     while (venus.readReplyCmdType(ring + reply_marker_off) == REPLY_SENTINEL) {
         const waited_us = (apic.readTsc() -% start) / per_us;
         if (waited_us >= timeout_ms * 1000) return .no_reply;
-        // Yield through the few milliseconds a host GPU takes for a frame;
-        // only past that sleep. A sleep here ends on a timer tick (10 ms)
-        // in practice, which made every frame cost about a tick.
         if (waited_us < SPIN_WAIT_US) {
             @import("../proc/sched_asm.zig").softYield();
         } else {
-            _ = @import("../cpu/syscall/proc.zig").sysUsleep(1000);
+            _ = @import("../cpu/syscall/proc.zig").sysUsleep(POLL_SLEEP_US);
         }
     }
     const waited = apic.tscToMs(apic.readTsc() -% start);
