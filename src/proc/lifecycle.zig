@@ -84,6 +84,12 @@ const MAX_FDS = config.MAX_FDS;
 /// would set state back to .unused briefly, re-opening the race.
 fn allocSlot() ?usize {
     for (0..MAX_PROCS) |i| {
+        // A task that tore itself down frees its slot before its final
+        // schedule() leaves the kstack; until that switch clears on_cpu, a
+        // new occupant would build its first frame on a stack still in use.
+        // Nothing sets on_cpu on an .unused slot, so the check cannot go
+        // stale before the CAS.
+        if (@atomicLoad(bool, &process.procs[i].on_cpu, .acquire)) continue;
         const state_ptr: *u8 = @as(*u8, @ptrCast(&process.procs[i].state));
         if (@cmpxchgStrong(
             u8,
@@ -1091,6 +1097,9 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp, persist_shared_dirty: 
         // of dispatching_in_pid for the outbound direction; cleared after
         // the setState lands further down.
         cpu.dispatching_out_pid = @intCast(pid);
+        // The final schedule() clears this slot's on_cpu once off the
+        // kstack; allocSlot waits for that.
+        @import("sched.zig").noteDying(pid);
         @import("../debug/pid_trace.zig").setCurrentPid(cpu, null);
     }
 

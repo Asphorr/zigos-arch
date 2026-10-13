@@ -1116,6 +1116,24 @@ fn maybePreemptOnWake(pid: usize) void {
     }
 }
 
+/// Per CPU: a task that tore itself down (lifecycle.tearDownTask) and is
+/// still on its kstack until its final schedule() switches away. That
+/// switch clears its on_cpu, and allocSlot does not reuse the slot before.
+var dying_pid: [smp.MAX_CPUS]u8 = .{0xFF} ** smp.MAX_CPUS;
+
+pub fn noteDying(pid: usize) void {
+    if (pid >= MAX_PROCS) return;
+    dying_pid[smp.myCpu().cpu_id] = @intCast(pid);
+}
+
+fn takeDying(cpu_id: u8) ?u8 {
+    if (cpu_id >= smp.MAX_CPUS) return null;
+    const d = dying_pid[cpu_id];
+    if (d == 0xFF) return null;
+    dying_pid[cpu_id] = 0xFF;
+    return d;
+}
+
 /// Force `pid`'s owning CPU to take a reschedule decision NOW. Used by
 /// job-control resume (signals.send clearing job_stopped on SIGCONT/SIGKILL):
 /// the resumed task sits .ready-but-skipped in its runqueue, and if its CPU is
@@ -1148,8 +1166,8 @@ fn rqOnLeaveReady(pid: usize) void {
 
 /// Per-tick audit. Two checks:
 ///   (1) Per-CPU rq internal consistency: `totalCount == nr_runnable`.
-///       Both fields update under the rq.lock so no FP class applies; any
-///       mismatch is a real bookkeeping bug.
+///       Both fields update under the rq.lock, and the audit reads them
+///       under it; any mismatch is a real bookkeeping bug.
 ///   (2) Per-pid cross-check: state==.ready ⟺ pid is in its assigned_cpu's
 ///       rq. This one is FP-prone — setState's state CAS happens BEFORE
 ///       rqEnter (deliberate ordering documented at setState — chosen to
@@ -1165,8 +1183,13 @@ pub fn rqAudit() void {
     var i: usize = 0;
     while (i < smp.MAX_CPUS) : (i += 1) {
         if (!smp.cpus[i].alive) continue;
-        const rq_count = smp.cpus[i].runqueue.totalCount();
-        const rq_nr = smp.cpus[i].runqueue.nr_runnable;
+        // Under the lock: rqLeave shrinks the queue before nr_runnable, so
+        // an unlocked read can land between the two.
+        const rq = &smp.cpus[i].runqueue;
+        const f = rq.lock.acquireIrqSave();
+        const rq_count = rq.totalCount();
+        const rq_nr = rq.nr_runnable;
+        rq.lock.releaseIrqRestore(f);
         if (rq_count != rq_nr) {
             debug.klog("[rq-audit] cpu{d} totalCount={d} != nr_runnable={d}\n", .{ i, rq_count, rq_nr });
             rqAuditFull();
@@ -1660,11 +1683,15 @@ pub fn schedule() void {
 
     // The on_cpu-clear slot for switchTo's asm tail — tracked for EVERY
     // real prev, including the doomed (.zombie/.unused) shapes whose kesp
-    // save is skipped: their slot may be reallocated, and a stale
-    // on_cpu=true would gate the fresh occupant's first remote dispatch
-    // (resetPcbExceptState also clears it on reuse; this is the belt for
-    // the running→zombie switch itself).
-    const prev_on_cpu: ?*bool = if (cpu.current_pid) |cur| &process.procs[cur].on_cpu else null;
+    // save is skipped: allocSlot reuses a slot only once its on_cpu is
+    // clear, i.e. once its last task is off the kstack. A self-destroy has
+    // cleared current_pid already; its pid comes from noteDying.
+    const prev_on_cpu: ?*bool = if (cpu.current_pid) |cur|
+        &process.procs[cur].on_cpu
+    else if (takeDying(cpu.cpu_id)) |d|
+        &process.procs[d].on_cpu
+    else
+        null;
 
     // Demote prev .running → .ready directly. Per-CPU rq dispatch (Phase 2)
     // means no other CPU can pick prev — only this cpu reads its own rq.
@@ -1762,6 +1789,10 @@ pub fn schedule() void {
         // locked CAS, so the reader will see the bracket if it sees
         // the post-CAS state.
         cpu.dispatching_in_pid = @intCast(cand);
+        // rqAuditFull's bracket, as setState sets it: between this CAS and
+        // the rqLeave below cand is .running yet still queued.
+        _ = @atomicRmw(u8, &setstate_in_flight[cand], .Add, 1, .acquire);
+        defer _ = @atomicRmw(u8, &setstate_in_flight[cand], .Sub, 1, .release);
         const prev = @cmpxchgStrong(u8, state_ptr, ready_val, running_val, .seq_cst, .seq_cst);
         if (TRACE_PID != 0 and cand == TRACE_PID) {
             debug.klog("[trace pid={d} cpu={d}] pickNext CAS .ready->.running result={any}\n", .{
