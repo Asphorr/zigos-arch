@@ -305,6 +305,11 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
     // towards wallclock too. Previously we missed them, so tick stalled
     // whenever BSP was in long kernel work (FAT32 read, gpu flush) and the
     // UI/sleep timing went haywire.
+    //
+    // A BSP fire brought in for a usleep deadline (pullInHires) ends no
+    // quantum (n_ticks == 0): it charges no tick and preempts only for a
+    // task its wakeHiresExpired just readied here.
+    var quantum_fire = !was_soft_yield;
     if (cpu.cpu_id == 0 and !was_soft_yield) {
         // Advance the 100 Hz wallclock by ELAPSED TSC, not one tick per fire:
         // the hires one-shot (#1006) fires the timer EARLY for sub-quantum
@@ -322,6 +327,7 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
             const adv = hrtimer.ticksToAdvance(now_tsc, last_tick_tsc, tpq);
             last_tick_tsc = adv.last;
             n_ticks = adv.n;
+            quantum_fire = n_ticks > 0;
             // Wake precise-usleep sleepers on EVERY fire, including the early
             // sub-quantum ones — arming the one-shot early is the whole point.
             process.wakeHiresExpired(now_tsc);
@@ -333,9 +339,8 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
             // lands THIS fire (not 10ms later): input/self-wake sources
             // that don't call sched.wake() (keyboard ring, mouse.moved,
             // wake.requestWake from other tasks) become visible here.
-            // Same store pattern as the virtio-gpu IRQ waker — wake_tick
-            // to "now" + wake_pending + deadline registration; the
-            // battle-tested wakeExpired transition does the setState.
+            // wake_tick to "now" + wake_pending + deadline registration;
+            // the wakeExpired transition does the setState.
             {
                 const desktop_mod = @import("../../ui/desktop.zig");
                 if (desktop_mod.desktopParkedAndDue()) {
@@ -457,6 +462,8 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
     // works but is less timely.
     if (!was_soft_yield) process.checkPreempt();
     bisectPoint("after checkPreempt", frame_for_validate, irq_snap);
+    const wake_preempt = cpu.cpu_id == 0 and !was_soft_yield and
+        @import("../../proc/sched.zig").takeLocalWakePreempt();
 
     // Decide whether to run the scheduler. Three cases:
     //   1. Real LAPIC timer fired while user code was running (from_user) →
@@ -470,22 +477,26 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
     //      task's time like case 1, but the body is no preemption point, so
     //      the reschedule waits for the syscall's exit (endBody). With the
     //      body masked, this tick used to fire right after sysret as case 1.
+    // A fire that is not a quantum boundary (see quantum_fire) takes cases
+    // 1 and 4 only for a wake_preempt, and charges no tick.
     if (!from_user and !was_soft_yield) {
         if (cpu.current_pid) |pid| {
             const pcb = process.getPCB(pid);
-            if (pcb.in_syscall) {
+            if (pcb.in_syscall and quantum_fire) {
                 pcb.ticks_used += 1;
                 pcb.acct_cpu_ticks += 1;
                 cpu.dynirq_preempt_pending = true;
                 pcb.body_ticks +%= 1;
                 if (pcb.body_ticks % SOFT_LOCKUP_TICKS == 0) reportSoftLockup(pid, pcb, frame_for_validate[15]);
+            } else if (pcb.in_syscall and wake_preempt) {
+                cpu.dynirq_preempt_pending = true;
             }
         }
     }
-    if (from_user or was_soft_yield) {
+    if ((from_user and (quantum_fire or wake_preempt)) or was_soft_yield) {
         // Track per-process time usage (real-timer case only — yields are
         // voluntary and shouldn't penalize the slice budget).
-        if (from_user) {
+        if (from_user and quantum_fire) {
             if (cpu.current_pid) |pid| {
                 process.getPCB(pid).ticks_used += 1;
                 // Accounting tick — separate from `ticks_used` (which is
@@ -508,7 +519,7 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
         // so schedule() will pick it ahead of normal/background user tasks
         // when it's ready — exactly the "give CPU back to desktop NOW"
         // semantic the legacy switchToScheduler had.
-        if (cpu.cpu_id == 0 and from_user) {
+        if (cpu.cpu_id == 0 and from_user and quantum_fire) {
             const force_yield = if (cpu.current_pid) |pid| process.getPCB(pid).ticks_used >= 4 else false;
             if (desktop.active and (desktop.shouldResumeDesktop() or force_yield)) {
                 if (cpu.current_pid) |pid| process.getPCB(pid).ticks_used = 0;
@@ -542,7 +553,11 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
         spinlock.hardirqExit();
         perf.leave(.irq0_timer, t);
         irq0_measured = true;
-        process.schedule();
+        if (from_user and !quantum_fire) {
+            @import("../../proc/sched.zig").schedulePreempt();
+        } else {
+            process.schedule();
+        }
         bisectPoint("after schedule RESUME", frame_for_validate, irq_snap);
         return;
     }
@@ -616,15 +631,18 @@ fn deliverPendingToReturnFrame(cpu: *@import("../smp.zig").CpuLocal, new_rsp: u6
 //     the queue empty — the timer's own fire, a device IRQ handled inline
 //     — keeps the stretch. Invariant: stretched ⇒ the idle PCB is current.
 //   * A deadline due BEFORE the BSP's armed fire (a sleeper registering
-//     from an AP, a virtio-gpu waiter stamped from a BSP IRQ, an AP
-//     producer posting a desktop wake) kicks the BSP: the registrar
-//     compares against the published fire tick / TSC, sets rearm_kick[0]
-//     and sends the wake-only IPI; the BSP idle loop consumes the flag and
-//     drops to one quantum, whose fire recomputes everything with a fresh
-//     tick_count. The BSP re-reads the caches right after publishing its
-//     arm — Dekker: it stores the fire then loads the cache, the registrar
-//     stores the cache (locked cmpxchg) then loads the fire, all seq_cst —
-//     so a lowering that raced the arm is caught by one side or the other.
+//     from an AP, an AP producer posting a desktop wake) kicks the BSP:
+//     the registrar compares against the published fire tick / TSC, sets
+//     rearm_kick[0] and sends the wake-only IPI; its handler on the BSP
+//     (serviceBspKick) consumes the flag and drops to one quantum, whose
+//     fire recomputes everything with a fresh tick_count. A usleep
+//     deadline does this on ANY arm, stretched or not (bsp_fire_tsc), and
+//     the fire is brought in to the deadline itself (pullInHires); on the
+//     BSP the registrar does that directly. The BSP re-reads the caches
+//     right after publishing its arm — Dekker: it stores the fire then
+//     loads the cache, the registrar stores the cache (locked cmpxchg)
+//     then loads the fire, all seq_cst — so a lowering that raced the arm
+//     is caught by one side or the other.
 //   * The wallclock is TSC-measured at every fire (ticksToAdvance): a
 //     stretched BSP catches tick_count up in one jump, and every periodic
 //     BSP job is keyed on due-ticks (>=), never modulo.
@@ -650,6 +668,13 @@ var rearm_kick: [smp.MAX_CPUS]bool = .{false} ** smp.MAX_CPUS;
 var bsp_armed_fire_tick: u64 = std.math.maxInt(u64);
 var bsp_armed_fire_tsc: u64 = std.math.maxInt(u64);
 
+/// The TSC instant the BSP's one-shot is programmed for, whatever the arm
+/// (maxInt = unknown: before the first arm, after S3). Dekker pair with
+/// noteHiresDeadline: an arm that can move the fire later stores this,
+/// then re-reads the usleep cache (pullInHires); a registrar lowers the
+/// cache (locked cmpxchg), then reads this.
+var bsp_fire_tsc: u64 = std.math.maxInt(u64);
+
 /// Tickless accounting, per CPU, cumulative since boot — `[tickless]` with
 /// every perf dump. Atomic increments: the idle loop (IF=1) and this CPU's
 /// own IRQ0 both write. Reading the dump: a CPU whose `clamp_rq` climbs
@@ -671,6 +696,7 @@ const TicklessStats = struct {
     clamp_alarm: u64 = 0, // BSP: earliest_alarm_tick inside the window
     clamp_hires: u64 = 0, // BSP: armDelta cut the one-shot to a usleep deadline
     clamp_late: u64 = 0, // BSP: the post-publish re-check found a sooner deadline
+    pull_hires: u64 = 0, // BSP: one-shot brought in to a usleep deadline after the arm
     wake_kept: u64 = 0, // idle loop woke, run queue empty → stretch kept
     wake_shortened: u64 = 0, // idle loop woke into work / a kick → one quantum restored
     kicks: u64 = 0, // BSP: rearm_kick requests received
@@ -726,6 +752,7 @@ pub fn clearTicklessState() void {
     }
     @atomicStore(u64, &bsp_armed_fire_tick, std.math.maxInt(u64), .seq_cst);
     @atomicStore(u64, &bsp_armed_fire_tsc, std.math.maxInt(u64), .seq_cst);
+    @atomicStore(u64, &bsp_fire_tsc, std.math.maxInt(u64), .seq_cst);
 }
 
 /// Quanta until an absolute tick-deadline (1 = due now/overdue —
@@ -830,6 +857,7 @@ fn rearmTimerForCurrent(cpu: *smp.CpuLocal) void {
         @atomicStore(u64, &bsp_armed_fire_tick, fire_tick, .seq_cst);
         @atomicStore(u64, &bsp_armed_fire_tsc, fire_tsc, .seq_cst);
         @atomicStore(bool, &rearm_kick[0], false, .seq_cst);
+        if (apic.tsc_deadline_active) @atomicStore(u64, &bsp_fire_tsc, now_tsc +| armed, .seq_cst);
     }
     @atomicStore(bool, &timer_long_armed[cpu.cpu_id], stretched, .seq_cst);
     apic.armOneShot(armed);
@@ -849,6 +877,7 @@ fn rearmTimerForCurrent(cpu: *smp.CpuLocal) void {
             dropStretch(cpu.cpu_id);
         }
     }
+    if (cpu.cpu_id == 0) pullInHires();
 }
 
 /// Back to one quantum, flag and published arm cleared. Own CPU only. The
@@ -862,11 +891,66 @@ fn dropStretch(cpu_id: u8) void {
         @atomicStore(u64, &bsp_armed_fire_tick, std.math.maxInt(u64), .seq_cst);
         @atomicStore(u64, &bsp_armed_fire_tsc, std.math.maxInt(u64), .seq_cst);
         if (apic.tsc_deadline_active) {
-            apic.armOneShot(hrtimer.armDelta(base, perf.rdtsc(), process.nextHiresTsc()));
+            // The idle loop gets here with IF=1: a kick serviced between
+            // this arm and its publish would be overwritten by it.
+            const flags = saveIrq();
+            defer restoreIrq(flags);
+            const now = perf.rdtsc();
+            const armed = hrtimer.armDelta(base, now, process.nextHiresTsc());
+            @atomicStore(u64, &bsp_fire_tsc, now +| armed, .seq_cst);
+            apic.armOneShot(armed);
+            pullInHires();
             return;
         }
     }
     apic.armOneShot(base);
+}
+
+/// BSP, IF=0, after its one-shot was programmed and `bsp_fire_tsc`
+/// published: a usleep deadline before that fire — registered while the
+/// arm was being computed, or by a registrar that read the previous fire —
+/// brings the fire in to it. Only ever moves the fire earlier, so a
+/// registrar that read the published fire and did not kick stays covered.
+fn pullInHires() void {
+    if (!apic.tsc_deadline_active) return;
+    const hires = process.nextHiresTsc();
+    if (hires == hrtimer.NONE) return;
+    const fire = @atomicLoad(u64, &bsp_fire_tsc, .monotonic);
+    if (fire == std.math.maxInt(u64) or hrtimer.due(hires, fire)) return;
+    const now = perf.rdtsc();
+    // Already due: fire at once. That fire's wakeHiresExpired walk drops
+    // every due entry from the cache, so this cannot re-fire forever.
+    const delta: u64 = if (hrtimer.due(now, hires)) 1 else hires -% now;
+    if (delta > std.math.maxInt(u32)) return;
+    @atomicStore(u64, &bsp_fire_tsc, now +% delta, .seq_cst);
+    apic.armOneShot(@intCast(delta));
+    bump(&tl_stats[0].pull_hires);
+}
+
+/// BSP, wake-only IPI (IF=0): a registrar on another CPU asked for a
+/// sooner fire (requestBspRearm). Served in the IPI rather than at the
+/// idle loop's next pass, which a busy BSP may not reach for a quantum.
+pub fn serviceBspKick() void {
+    if (!@atomicRmw(bool, &rearm_kick[0], .Xchg, false, .seq_cst)) return;
+    if (@atomicLoad(bool, &timer_long_armed[0], .seq_cst)) {
+        bump(&tl_stats[0].wake_shortened);
+        dropStretch(0);
+    } else {
+        pullInHires();
+    }
+}
+
+inline fn saveIrq() u64 {
+    var flags: u64 = undefined;
+    asm volatile ("pushfq; pop %[f]; cli"
+        : [f] "=r" (flags),
+        :
+        : .{ .memory = true });
+    return flags;
+}
+
+inline fn restoreIrq(flags: u64) void {
+    if (flags & 0x200 != 0) asm volatile ("sti" ::: .{ .memory = true });
 }
 
 /// Every dispatch point out of idle calls this BEFORE schedule(): the idle
@@ -931,11 +1015,20 @@ pub fn noteTickDeadline(deadline: u64) void {
     requestBspRearm();
 }
 
-/// TSC twin for usleep deadlines (sched.registerHiresWake).
+/// TSC twin for usleep deadlines (sched.registerHiresWake). Any arm, not
+/// only a stretch: a usleep due before the BSP's programmed fire would
+/// otherwise wait for it, up to a quantum late.
 pub fn noteHiresDeadline(deadline_tsc: u64) void {
-    if (!@atomicLoad(bool, &timer_long_armed[0], .seq_cst)) return;
-    const fire = @atomicLoad(u64, &bsp_armed_fire_tsc, .seq_cst);
-    if (fire == std.math.maxInt(u64) or !hrtimer.due(fire, deadline_tsc)) return;
+    if (!apic.tsc_deadline_active) return;
+    const fire = @atomicLoad(u64, &bsp_fire_tsc, .seq_cst);
+    if (fire != std.math.maxInt(u64) and !hrtimer.due(fire, deadline_tsc)) return;
+    // CPU id read with IRQs off: a preemptible caller could migrate after it.
+    const flags = saveIrq();
+    defer restoreIrq(flags);
+    if (smp.myCpu().cpu_id == 0) {
+        pullInHires();
+        return;
+    }
     requestBspRearm();
 }
 
@@ -970,6 +1063,7 @@ fn nameSlice(name: *const [16]u8) []const u8 {
 pub fn perfDump() void {
     perf.dumpAll();
     dumpTickless();
+    @import("../../debug/wakelat.zig").dump();
 }
 
 /// `[tickless]` — one line per CPU plus what the BSP's wake clamp is
@@ -980,7 +1074,7 @@ fn dumpTickless() void {
         const st = &tl_stats[cpu_id];
         const fires = @atomicLoad(u64, &st.fires, .monotonic);
         if (fires == 0) continue;
-        serial.print("[tickless] cpu{d} fires={d} idle_arms={d} (1q={d} 2-9q={d} 10q={d}) wake: kept={d} shortened={d} kicks={d} | clamps: rq={d} gated={d} iowait={d} sound={d} wake={d} alarm={d} hires={d} late={d}\n", .{
+        serial.print("[tickless] cpu{d} fires={d} idle_arms={d} (1q={d} 2-9q={d} 10q={d}) wake: kept={d} shortened={d} kicks={d} | clamps: rq={d} gated={d} iowait={d} sound={d} wake={d} alarm={d} hires={d} late={d} pull={d}\n", .{
             cpu_id,
             fires,
             @atomicLoad(u64, &st.idle_arms, .monotonic),
@@ -998,6 +1092,7 @@ fn dumpTickless() void {
             @atomicLoad(u64, &st.clamp_alarm, .monotonic),
             @atomicLoad(u64, &st.clamp_hires, .monotonic),
             @atomicLoad(u64, &st.clamp_late, .monotonic),
+            @atomicLoad(u64, &st.pull_hires, .monotonic),
         });
     }
     // The sleeper owning the earliest tick deadline — any state, the way

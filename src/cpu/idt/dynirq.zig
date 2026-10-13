@@ -154,9 +154,15 @@ pub export fn check_and_preempt_dynirq(interrupted_cs: u64) callconv(.c) void {
         // Boot code before this CPU's first task has no PCB to park:
         // schedule() would abandon it for good.
         const pid = cpu.current_pid orelse return;
-        if (interrupted_cs & 3 == 0 and @import("../../proc/process.zig").procs[pid].in_syscall) return;
+        const process = @import("../../proc/process.zig");
+        const pcb = &process.procs[pid];
+        if (interrupted_cs & 3 == 0 and pcb.in_syscall) return;
+        // Mid-enrollment in a blockOn (wait fields set, not yet .sleeping):
+        // demoted now it would sit .ready with wait_kind set, which the
+        // picker skips and no waker clears. It yields within instructions.
+        if (@atomicLoad(process.WaitKind, &pcb.wait_kind, .acquire) != .none) return;
         cpu.dynirq_preempt_pending = false;
-        @import("../../proc/process.zig").schedule();
+        @import("../../proc/sched.zig").schedulePreempt();
     }
 }
 

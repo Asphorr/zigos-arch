@@ -562,9 +562,8 @@ fn kernelIdle() callconv(.c) noreturn {
             asm volatile ("sti; hlt");
         }
         // Parked-desktop instant wake: input IRQs land on the BSP and
-        // break its hlt — hand the event to the desktop NOW, in this
-        // lock-clean context (sched.wake is not IRQ-safe; the idle loop
-        // is the earliest safe point after the IRQ). µs-class input
+        // break its hlt — hand the event to the desktop NOW, at the idle
+        // loop's first pass after the IRQ. µs-class input
         // latency instead of waiting for the next tick. No-op off-BSP
         // or when the desktop isn't parked/due. Runs BEFORE the tickless
         // hook below so a woken desktop counts as work on this CPU.

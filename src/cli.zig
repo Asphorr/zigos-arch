@@ -1052,7 +1052,7 @@ fn cmdIpi() void {
         if (c == 0) continue;
         vga.print("  cpu{d}: {d}\n", .{ i, c });
     }
-    vga.print("wake-IPIs sent from MSI-X handler: {d}\n", .{vgpu.virtio_gpu_wake_ipis_sent});
+    vga.print("waiter wakes from MSI-X handler: {d}\n", .{vgpu.virtio_gpu_waiter_wakes});
     vga.print("wake-only handler runs per CPU (no schedule, just irq):\n", .{});
     for (proc.wake_handler_runs, 0..) |c, i| {
         vga.print("  cpu{d}: {d}\n", .{ i, c });

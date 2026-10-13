@@ -99,20 +99,13 @@ var msix_entry_addr: usize = 0;
 /// CPUs ≥ 4 (was hardcoded [4]u64 — gap #15).
 pub var virtio_gpu_irq_per_cpu: [@import("../cpu/smp.zig").MAX_CPUS]u64 =
     .{0} ** @import("../cpu/smp.zig").MAX_CPUS;
-/// IPIs we sent from the MSI-X handler to wake other CPUs from sti+hlt.
-/// Compared against process.kill_kick handler invocations to determine
-/// whether IPI delivery is the broken link. (See process.kickHandlerCount.)
-pub var virtio_gpu_wake_ipis_sent: u64 = 0;
+/// Waiter wakes issued by the MSI-X handler.
+pub var virtio_gpu_waiter_wakes: u64 = 0;
 
 /// The single pid currently parked in blockOn(.gpu_io) via sendCmdViaPhys
 /// / sendSimpleCmdPair. ctrl_lock serializes submitters so there's at
 /// most one. 0xFF = nobody waiting; otherwise = pid. Updated atomically
-/// because the IRQ handler reads it concurrently from cpu0.
-///
-/// Pre-existing code scanned ALL MAX_PROCS PCBs on every IRQ — fine
-/// when MAX_PROCS was small but wasteful at 256. Direct lookup also
-/// lets us IPI ONLY the CPU the waiter parked on, instead of fanning
-/// out the wake-IPI to every alive CPU. (Gaps #8 + #9, 2026-05-20.)
+/// because the IRQ handler reads it concurrently from any CPU.
 var current_gpu_waiter: u8 = 0xFF;
 fn virtioGpuIrqHandler() callconv(.c) void {
     virtio_gpu_irq_count +%= 1;
@@ -129,46 +122,26 @@ fn virtioGpuIrqHandler() callconv(.c) void {
         smp_mod.myCpu().dynirq_preempt_pending = true;
     }
 
-    // Direct waiter lookup (gap #8). ctrl_lock serializes submitters so
-    // current_gpu_waiter is at most one pid; previous code walked all
-    // MAX_PROCS PCBs every IRQ. We MUST NOT call process.wake() — it
-    // takes cross-CPU sched_lock and a wedge during paint.elf load
-    // traced to exactly that path. Bump wake_tick to "now" and let
-    // BSP's wakeExpired (runs from IRQ0 in a lock-clean context) do
-    // the setState + rqEnter. The targeted IPI below kicks the waiter's
-    // CPU out of hlt so its next IRQ0 fires immediately.
+    // Direct waiter lookup (gap #8): ctrl_lock serializes submitters, so
+    // current_gpu_waiter is at most one pid. Parked on its command, or
+    // about to park (wait_kind still .none): wake() readies it now, or
+    // sets wake_pending for blockOn's handshake. A waiter that already
+    // moved on to another wait is left to that wait's waker. The waiter's
+    // own wake_tick stays the backstop for a dropped IRQ (CVE-2024-3446).
+    // wake() is IF=0-safe — softirq.raise calls it from IRQs too.
     const pid = @atomicLoad(u8, &current_gpu_waiter, .acquire);
     if (pid == 0xFF) return;
-    const pcb = &process.procs[pid];
-    @atomicStore(u64, &pcb.wake_tick, process.tick_count, .release);
-    @import("../proc/sched.zig").registerWakeDeadline(process.tick_count);
-    // Participate in blockOn's lost-wake handshake (sched.zig:1817).
-    // Without this, an IRQ landing between the submitter's last
-    // usedIdxCoherent re-read and blockOn's setState(.sleeping) is
-    // silently dropped — recovery falls onto wakeExpired's 10 ms
-    // safety net, which compounds with schedule overhead into the
-    // 150 ms-per-cycle yield-loop the autopsy 2026-05-25 surfaced.
-    // Same shape as the 2026-05-22 futex lost-wake fix
-    // ([[futex-lostwake-fix-2026-05-22]]); every waker outside the
-    // process.wake() path has to set wake_pending or it's blind to
-    // the handshake. wake_tick stays as the missed-notify safety net.
-    @atomicStore(bool, &pcb.wake_pending, true, .release);
-
-    // Targeted IPI (gap #9). Re-read wait_kind to defend against the
-    // waiter having raced through wake → re-park on something else;
-    // if it's no longer .gpu_io, no IPI is needed (the new waker
-    // owns delivery). last_cpu is the CPU the waiter most recently
-    // ran on — same one it parked from, since blockOn doesn't migrate.
-    if (@atomicLoad(process.WaitKind, &pcb.wait_kind, .acquire) != .gpu_io) return;
-    const wcpu = pcb.last_cpu;
-    if (wcpu == cpu_id) return; // own LAPIC tick will re-check usedIdx
-    if (wcpu >= smp_mod.MAX_CPUS) return;
-    const cl = &smp_mod.cpus[wcpu];
-    if (!cl.alive) return;
-    if (process.wakeVector()) |v| {
-        apic.sendIPI(cl.lapic_id, v);
-        virtio_gpu_wake_ipis_sent +%= 1;
-    }
+    const kind = @atomicLoad(process.WaitKind, &process.procs[pid].wait_kind, .acquire);
+    if (kind != .gpu_io and kind != .none) return;
+    const wakelat = @import("../debug/wakelat.zig");
+    const sched = @import("../proc/sched.zig");
+    wakelat.noteGpuIrq(pid);
+    wakelat.hintWake(pid, .gpu_io);
+    sched.wake(pid);
+    virtio_gpu_waiter_wakes +%= 1;
+    // Queued on this CPU: the dynirq epilogue runs it if it outranks the
+    // current task. On another CPU, wake() sent the reschedule IPI.
+    if (sched.wakeupPreemptsLocal(pid)) smp_mod.myCpu().dynirq_preempt_pending = true;
 }
 
 // --- Virtio PCI modern (MMIO-based) ---
@@ -860,9 +833,8 @@ fn sendCmdViaPhys(cmd_len: u32, resp_len: u32) bool {
             // Without this yield, the submitter holds current_pid
             // through the entire wait and the menubar / sysmon CPU bars
             // peg at 100 % even though the CPU is in C-state.
-            // virtioGpuIrqHandler walks PCBs and wakes any .gpu_io
-            // waiter when usedIdx advances; ctrl_lock keeps the waiter
-            // count at ≤ 1.
+            // virtioGpuIrqHandler wakes the .gpu_io waiter when usedIdx
+            // advances; ctrl_lock keeps the waiter count at ≤ 1.
             //
             // Timeout: re-check after each yield; bail after 100
             // schedule round-trips (~1 s if waking only via the 10 ms
@@ -870,10 +842,8 @@ fn sendCmdViaPhys(cmd_len: u32, resp_len: u32) bool {
             const process = @import("../proc/process.zig");
             const cur_pid_outer = @import("../cpu/smp.zig").myCpu().current_pid orelse break :blk false;
             // Stamp ourselves as THE gpu_io waiter so virtioGpuIrqHandler
-            // can wake us directly instead of scanning MAX_PROCS PCBs and
-            // can IPI only our last_cpu instead of fanning out to all
-            // alive CPUs. Cleared by defer on every exit path (true, false,
-            // or panic-unwind). Gaps #8 + #9.
+            // can wake us directly. Cleared by defer on every exit path
+            // (true, false, or panic-unwind).
             @atomicStore(u8, &current_gpu_waiter, @intCast(cur_pid_outer), .release);
             defer @atomicStore(u8, &current_gpu_waiter, 0xFF, .release);
             while (true) {
@@ -2566,7 +2536,7 @@ pub fn dumpWaiterForTarget(target: u32) void {
     debug.klog("    avail_idx     = {d}\n", .{ctrl_vq.availIdx().*});
     debug.klog("    num_free      = {d}\n", .{ctrl_vq.num_free});
     debug.klog("    irq_count     = {d}\n", .{virtio_gpu_irq_count});
-    debug.klog("    ipis_sent     = {d}\n", .{virtio_gpu_wake_ipis_sent});
+    debug.klog("    waiter_wakes  = {d}\n", .{virtio_gpu_waiter_wakes});
     debug.klog("    aflush: in_flight={any} ncmds={d} pend_rects={d} target={d} staging={any}\n", .{
         @atomicLoad(bool, &aflush_in_flight, .acquire),
         aflush_ncmds,

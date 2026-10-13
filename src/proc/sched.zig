@@ -68,6 +68,7 @@ const SpinLock = spinlock.SpinLock;
 
 const process = @import("process.zig");
 const hrtimer = @import("hrtimer.zig");
+const wakelat = @import("../debug/wakelat.zig");
 const PCB = process.PCB;
 const State = process.State;
 
@@ -996,10 +997,22 @@ pub fn setState(pid: usize, new_state: State) void {
     }
 
     if (was_ready and !is_ready) rqLeave(pid);
+    if (new_state == .zombie or new_state == .unused) wakelat.drop(pid);
     if (!was_ready and is_ready) {
+        if (from_sleep and !pcb.is_idle) {
+            const target = pcb.assigned_cpu;
+            wakelat.noteReady(pid, target, cpuBusy(target));
+        }
         rqEnter(pid, from_sleep);
         maybePreemptOnWake(pid);
     }
+}
+
+/// `cpu_id` is running something other than its idle task. Unlocked peek.
+fn cpuBusy(cpu_id: u8) bool {
+    if (cpu_id >= smp.MAX_CPUS) return false;
+    const cur = smp.cpus[cpu_id].current_pid orelse return false;
+    return cur < MAX_PROCS and !process.procs[cur].is_idle;
 }
 
 /// CFS: bump current.vruntime by ticks consumed since slice start, and
@@ -1082,8 +1095,7 @@ pub fn checkPreempt() void {
 /// Phase 6: fire a resched IPI to the woken pid's assigned CPU when:
 ///   - target is a different CPU than caller (same-cpu wakes get handled
 ///     by the local schedule loop on the next preempt, no IPI needed),
-///   - AND target is currently running its idle PCB OR a strictly lower-
-///     priority task.
+///   - AND the woken task outranks what runs there (wakeupPreempts).
 ///
 /// Reuses kill_kick_vector — the handler is just `schedule()`, which on
 /// the receiver checks exit_requested + demotes prev + pickNext, doing
@@ -1104,16 +1116,66 @@ fn maybePreemptOnWake(pid: usize) void {
 
     const should_preempt = blk: {
         const target_cur = target_cpu.current_pid orelse break :blk true;
-        if (target_cur >= MAX_PROCS) break :blk false;
-        if (process.procs[target_cur].is_idle) break :blk true;
-        break :blk @intFromEnum(pcb.priority) > @intFromEnum(process.procs[target_cur].priority);
+        break :blk wakeupPreempts(pid, target_cur);
     };
-    if (!should_preempt) return;
+    if (!should_preempt) {
+        wakelat.noteNoIpi(pid);
+        return;
+    }
 
     if (kill_kick_vector) |v| {
         const apic = @import("../time/apic.zig");
+        wakelat.noteIpiSent(target_cpu_id);
         apic.sendIPI(target_cpu.lapic_id, v);
     }
+}
+
+/// A woken task this far behind the running one in vruntime — one tick of
+/// nice-0 runtime — takes the CPU now instead of at the running task's
+/// next yield or tick: CFS wakeup preemption, at tick granularity.
+const WAKEUP_GRANULARITY: u64 = VRUNTIME_SCALE;
+
+/// Should `pid`, just queued, preempt `cur` on the same CPU? An idle CPU
+/// always yields, a higher band preempts, and within a band a vruntime
+/// lead of WAKEUP_GRANULARITY does. Both vruntimes live on the same rq.
+/// Unlocked reads: a stale value costs a needless IPI or one tick of
+/// latency, never correctness.
+fn wakeupPreempts(pid: usize, cur: usize) bool {
+    if (cur >= MAX_PROCS) return false;
+    // Still current there: it blocked and that CPU is mid-switch, past its
+    // pick. Kick it, or the wakee waits out whatever it picked instead.
+    if (cur == pid) return true;
+    const c = &process.procs[cur];
+    if (c.is_idle) return true;
+    const w = &process.procs[pid];
+    const wp = @intFromEnum(w.priority);
+    const cp = @intFromEnum(c.priority);
+    if (wp != cp) return wp > cp;
+    return w.vruntime +| WAKEUP_GRANULARITY < c.vruntime;
+}
+
+/// Per CPU: the next schedule() preempts for a wake rather than ending a
+/// quantum, so the demoted task is not passed over (see `exclude`).
+var wake_preempt_pick: [smp.MAX_CPUS]bool = .{false} ** smp.MAX_CPUS;
+
+/// schedule() from an IRQ return that preempts for a wake (dynirq
+/// epilogue, an early hires timer fire): the demoted task competes on
+/// vruntime with the wakee, so a stale kick that lands on the wakee itself
+/// cannot hand the CPU to someone else for a quantum.
+pub fn schedulePreempt() void {
+    wake_preempt_pick[smp.myCpu().cpu_id] = true;
+    schedule();
+}
+
+/// Per CPU, own CPU only: wakeHiresExpired readied a task here that
+/// outranks the current one. Consumed by the same timer IRQ.
+var local_wake_preempt: [smp.MAX_CPUS]bool = .{false} ** smp.MAX_CPUS;
+
+pub fn takeLocalWakePreempt() bool {
+    const id = smp.myCpu().cpu_id;
+    const v = local_wake_preempt[id];
+    local_wake_preempt[id] = false;
+    return v;
 }
 
 /// Per CPU: a task that tore itself down (lifecycle.tearDownTask) and is
@@ -1134,6 +1196,17 @@ fn takeDying(cpu_id: u8) ?u8 {
     return d;
 }
 
+/// wakeupPreempts against this CPU's current task, for a device IRQ that
+/// just woke `pid`: true = let its dynirq epilogue schedule.
+pub fn wakeupPreemptsLocal(pid: usize) bool {
+    if (pid >= MAX_PROCS) return false;
+    const cpu = smp.myCpu();
+    if (process.procs[pid].assigned_cpu != cpu.cpu_id) return false;
+    const cur = cpu.current_pid orelse return false;
+    if (cur == pid) return false;
+    return wakeupPreempts(pid, cur);
+}
+
 /// Force `pid`'s owning CPU to take a reschedule decision NOW. Used by
 /// job-control resume (signals.send clearing job_stopped on SIGCONT/SIGKILL):
 /// the resumed task sits .ready-but-skipped in its runqueue, and if its CPU is
@@ -1151,6 +1224,7 @@ pub fn kickReschedule(pid: usize) void {
     const target_cpu = &smp.cpus[target_cpu_id];
     if (!target_cpu.alive) return;
     if (kill_kick_vector) |v| {
+        wakelat.noteIpiSent(target_cpu_id);
         @import("../time/apic.zig").sendIPI(target_cpu.lapic_id, v);
     }
 }
@@ -1476,6 +1550,7 @@ var kill_kick_vector: ?u8 = null;
 fn killKickHandler() callconv(.c) void {
     const cpu = smp.myCpu();
     if (cpu.cpu_id < smp.MAX_CPUS) process.kick_handler_runs[cpu.cpu_id] +%= 1;
+    wakelat.noteIpiRecv(cpu.cpu_id);
     // Receiving CPU: force a reschedule. The currently-running task may be
     // the kill target — schedule()'s exit_requested escalation tears it
     // down on its own kstack, and the killer's spin loop in
@@ -1526,8 +1601,10 @@ var wake_ipi_vector: ?u8 = null;
 fn wakeOnlyHandler() callconv(.c) void {
     const cpu_id = smp.myCpu().cpu_id;
     if (cpu_id < smp.MAX_CPUS) process.wake_handler_runs[cpu_id] +%= 1;
-    // Intentionally empty — the IRQ delivery itself is the work. By NOT
-    // calling schedule(), we don't demote the receiver's current task.
+    // A registrar on another CPU asked the BSP to re-arm (tickless kick).
+    if (cpu_id == 0) @import("../cpu/idt/irq0.zig").serviceBspKick();
+    // Otherwise the IRQ delivery itself is the work. By NOT calling
+    // schedule(), we don't demote the receiver's current task.
     // iretq pops the original kernel frame; if the receiver was in hlt,
     // execution resumes at hlt+1 and any wait loop above re-checks its
     // condition.
@@ -1742,7 +1819,13 @@ pub fn schedule() void {
     // a cpu running an interactive task (e.g. desktop on cpu0) gives
     // its .normal-priority queueing a turn instead of immediately re-
     // dispatching itself. Falls back to cur if no alternative exists.
-    const exclude: ?u8 = if (cpu.current_pid) |c| @intCast(c) else null;
+    // Only a cur demoted here at a quantum end or yield: one that blocked
+    // and was woken again before this pick, or one preempted for a wake
+    // (schedulePreempt), competes like any other task — else the wakee can
+    // go to the back of the line for a whole quantum.
+    const for_wake = wake_preempt_pick[cpu.cpu_id];
+    wake_preempt_pick[cpu.cpu_id] = false;
+    const exclude: ?u8 = if (demoted_running_to_ready and !for_wake) @intCast(cpu.current_pid.?) else null;
     // Mode-A diagnostic: count re-picks so the wedge autopsy can SEE a
     // claim-loop livelock. Published to a per-CPU slot only once we re-pick
     // (loop_iters > 1) so the common single-pass dispatch pays nothing extra.
@@ -1838,6 +1921,7 @@ pub fn schedule() void {
     }
 
     if (next_opt) |next| {
+        wakelat.noteRun(next);
         // Self-switch guard (task #235). When pickNext falls back to own
         // idle and idle is already current, `next == current_pid`. Skip
         // the actual switchTo (no point), but undo the demote.
@@ -2343,8 +2427,8 @@ pub fn registerHiresWake(deadline: u64) void {
     while (deadline < cur) {
         cur = earliest_hires_tsc.cmpxchgWeak(cur, deadline, .release, .monotonic) orelse break;
     }
-    // Tickless kick, TSC flavour — an idle-stretched BSP re-arms for a
-    // usleep due before its armed fire (irq0.noteHiresDeadline).
+    // The BSP brings its one-shot in for a usleep due before its programmed
+    // fire, stretched or not (irq0.noteHiresDeadline).
     @import("../cpu/idt/irq0.zig").noteHiresDeadline(deadline);
 }
 
@@ -2401,10 +2485,10 @@ pub fn rqHasDispatchable(cpu_id: u8) bool {
 }
 
 /// Wait kinds whose sleeper wakeExpired readies by wake_tick: the explicit
-/// waker stamps wake_tick = now from IRQ context (virtio-gpu IRQ → .gpu_io,
-/// SCI → .acpid, the IRQ0 due-check → .desktop) or the deadline is the
-/// park's liveness backstop (.desktop, .compositor, .acpid). Every other
-/// non-.none kind is woken by its explicit path alone.
+/// waker stamps wake_tick = now from IRQ context (SCI → .acpid, the IRQ0
+/// due-check → .desktop) or the deadline is the park's liveness backstop
+/// (.gpu_io, .desktop, .compositor, .acpid). Every other non-.none kind is
+/// woken by its explicit path alone.
 inline fn deadlineParked(kind: WaitKind) bool {
     return kind == .gpu_io or kind == .desktop or kind == .compositor or kind == .acpid;
 }
@@ -2463,8 +2547,8 @@ pub fn wakeExpired() void {
         }
         const wt = @atomicLoad(u64, &pcb.wake_tick, .acquire);
         // .gpu_io waiters set both wait_kind AND wake_tick as a safety
-        // net: the primary waker is virtio_gpu's MSI-X IRQ walking the
-        // PCB table, but QEMU CVE-2024-3446 occasionally drops the
+        // net: the primary waker is virtio_gpu's MSI-X handler (wake()),
+        // but QEMU CVE-2024-3446 occasionally drops the
         // notify. wake_tick guarantees the waiter re-runs and re-polls
         // usedIdx after a bounded delay even if no IRQ arrives. We
         // handle .gpu_io here (not in the .none branch) so the wake
@@ -2486,9 +2570,10 @@ pub fn wakeExpired() void {
         // .compositor parks the same way (gpu_compositor.parkUntilRender):
         // requestRender's wake() is the real waker, wake_tick the backstop.
         // .acpid too (main.parkAcpid): the SCI handler stamps wake_tick =
-        // now from the IRQ, exactly like the virtio-gpu IRQ does for .gpu_io.
+        // now from the IRQ.
         if (deadlineParked(pcb.wait_kind) and wt != 0 and process.tick_count >= wt) {
             @atomicStore(u64, &pcb.wake_tick, 0, .release);
+            wakelat.hintWake(i, if (pcb.wait_kind == .gpu_io) .gpu_io else .parked);
             clearWait(pcb);
             setState(i, .ready);
             stuck_last_seen_wait_kind[i] = null;
@@ -2510,6 +2595,7 @@ pub fn wakeExpired() void {
             // skipped by wakeExpired guard, but the fresh sysSleep would
             // overwrite it before any harm).
             @atomicStore(u64, &pcb.wake_tick, 0, .release);
+            wakelat.hintWake(i, .tick);
             setState(i, .ready);
             stuck_last_seen_wait_kind[i] = null;
             continue;
@@ -2623,7 +2709,10 @@ pub fn wakeHiresExpired(now_tsc: u64) void {
             // can run and usleep again before our store lands, and a late store
             // would clobber its fresh deadline, parking it with no waker.
             @atomicStore(u64, &pcb.hires_wake_tsc, 0, .release);
+            wakelat.hintWake(i, .hires);
+            wakelat.noteLate(.hires, now_tsc -% dl);
             setState(i, .ready);
+            if (wakeupPreemptsLocal(i)) local_wake_preempt[smp.myCpu().cpu_id] = true;
             continue;
         }
         if (pcb.wait_kind == .none and dl < new_earliest) new_earliest = dl;
@@ -2946,6 +3035,7 @@ pub fn wake(pid: u8) void {
     // Without this, the wake is silently lost and the task sleeps forever.
     @atomicStore(bool, &process.procs[pid].wake_pending, true, .release);
     if (process.procs[pid].is_idle) kickIdleWaiter(process.procs[pid].idle_cpu);
+    wakelat.hintWakeDefault(pid, .explicit);
     clearWait(&process.procs[pid]);
     // pipe.read / pipe.write park themselves with state=.sleeping so the
     // int $0x20 yield actually reschedules (idt's yielded_from_kernel check

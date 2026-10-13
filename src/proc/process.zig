@@ -695,11 +695,9 @@ pub var procs: [MAX_PROCS]PCB = [_]PCB{.{}} ** MAX_PROCS;
 // Tick counter incremented by IRQ0
 pub var tick_count: u64 = 0;
 
-/// Per-CPU kill-kick (and any wake-IPI reusing this vector) receive count.
-/// Read by debug CLI to compare against virtio_gpu_wake_ipis_sent — if
-/// sent grows but receive doesn't grow on cpu1, IPI delivery is broken
-/// under the current hypervisor. If both grow but cube still hangs, the
-/// broken link is later in the schedule()/iretq path.
+/// Per-CPU kill-kick (and any wake-IPI reusing this vector) receive count,
+/// read by the debug CLI: a CPU whose count stays flat while wakes target
+/// it means IPI delivery is broken under the current hypervisor.
 ///
 /// STAYS in process.zig (instead of sched.zig where killKickHandler /
 /// wakeOnlyHandler live) because external readers (cli.zig,
