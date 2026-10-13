@@ -341,6 +341,11 @@ pub fn migrate(pid: u8, new_cpu: u8) bool {
     const old_rq = &smp.cpus[old_cpu].runqueue;
     const new_rq = &smp.cpus[new_cpu].runqueue;
 
+    // rqAuditFull's bracket: from the remove below to the assigned_cpu
+    // store, a .ready pid is missing from the rq its assigned_cpu names.
+    auditBracketEnter(pid);
+    defer auditBracketExit(pid);
+
     var removed = false;
     if (old_rq.interactive.remove(pid)) {
         old_rq.nr_runnable -%= 1;
@@ -811,6 +816,23 @@ fn rqLeave(pid: usize) void {
 /// bracket must independently increment/decrement.
 pub var setstate_in_flight: [MAX_PROCS]u8 = [_]u8{0} ** MAX_PROCS;
 
+/// Bumped on entry to and exit from every bracket: the audit's reads are
+/// separate loads, and a transition that runs start to finish between two
+/// of them leaves the in-flight count at zero on both checks.
+var setstate_gen: [MAX_PROCS]u32 = [_]u32{0} ** MAX_PROCS;
+
+/// rqAuditFull's bracket around a change to `pid`'s state or rq membership
+/// (setState, schedule()'s claim, migrate).
+inline fn auditBracketEnter(pid: usize) void {
+    _ = @atomicRmw(u32, &setstate_gen[pid], .Add, 1, .acq_rel);
+    _ = @atomicRmw(u8, &setstate_in_flight[pid], .Add, 1, .acquire);
+}
+
+inline fn auditBracketExit(pid: usize) void {
+    _ = @atomicRmw(u8, &setstate_in_flight[pid], .Sub, 1, .release);
+    _ = @atomicRmw(u32, &setstate_gen[pid], .Add, 1, .release);
+}
+
 /// Per-pid setState serializing lock. Held across the CAS + rq op so a
 /// concurrent setState on the SAME pid (e.g., cpu1's nvme IRQ wake doing
 /// .sleeping→.ready while cpu0's preempt does .running→.ready) cannot
@@ -920,8 +942,8 @@ fn transition(pid: usize, from: ?State, new_state: State, ra: usize) bool {
     if (pid >= MAX_PROCS) return false;
     const lock_flags = setstate_locks[pid].acquireIrqSave();
     defer setstate_locks[pid].releaseIrqRestore(lock_flags);
-    _ = @atomicRmw(u8, &setstate_in_flight[pid], .Add, 1, .acquire);
-    defer _ = @atomicRmw(u8, &setstate_in_flight[pid], .Sub, 1, .release);
+    auditBracketEnter(pid);
+    defer auditBracketExit(pid);
     const pcb = &process.procs[pid];
     const state_ptr: *u8 = @as(*u8, @ptrCast(&pcb.state));
 
@@ -1305,21 +1327,34 @@ pub fn rqAudit() void {
 /// on another CPU and the state-byte ↔ rq-membership cross-check would
 /// fire spuriously inside the CAS-to-rqEnter window. The bracket is set
 /// at the top of setState and cleared at the bottom; on no-CPU-in-flight
-/// the cross-check is structurally consistent.
+/// the cross-check is structurally consistent. `setstate_gen` covers a
+/// bracket that opens and closes between the reads.
 fn rqAuditFull() void {
     var p: usize = 0;
     while (p < MAX_PROCS) : (p += 1) {
         if (process.procs[p].is_idle) continue;
+        const gen = @atomicLoad(u32, &setstate_gen[p], .acquire);
         if (@atomicLoad(u8, &setstate_in_flight[p], .acquire) > 0) continue;
         const s = @atomicLoad(u8, @as(*const u8, @ptrCast(&process.procs[p].state)), .acquire);
         const want_in_rq = (s == @intFromEnum(State.ready));
         const cpu_idx = process.procs[p].assigned_cpu;
-        const in_rq = if (cpu_idx == 0xFF or cpu_idx >= smp.MAX_CPUS) false else
-            smp.cpus[cpu_idx].runqueue.contains(@intCast(p));
+        const cpu_ok = cpu_idx < smp.MAX_CPUS;
+        var in_rq = cpu_ok and smp.cpus[cpu_idx].runqueue.contains(@intCast(p));
+        if (want_in_rq == in_rq) continue;
+        // The unlocked scan races a remove of another pid from that queue,
+        // which drops the count before it shifts the tail down: settle it
+        // under the lock.
+        if (cpu_ok) {
+            const rq = &smp.cpus[cpu_idx].runqueue;
+            const f = rq.lock.acquireIrqSave();
+            in_rq = rq.contains(@intCast(p));
+            rq.lock.releaseIrqRestore(f);
+        }
         if (want_in_rq == in_rq) continue;
         // Re-check bracket after the in_rq load: a setState may have started
-        // between our skip-check and the in_rq read. If now in-flight, skip.
+        // between our skip-check and the in_rq read, or run whole.
         if (@atomicLoad(u8, &setstate_in_flight[p], .acquire) > 0) continue;
+        if (@atomicLoad(u32, &setstate_gen[p], .acquire) != gen) continue;
         debug.klog(
             "[rq-audit] pid={d} state={d} assigned_cpu={d} in_rq={any} want={any}\n",
             .{ p, s, cpu_idx, in_rq, want_in_rq },
@@ -1901,8 +1936,8 @@ pub fn schedule() void {
         cpu.dispatching_in_pid = @intCast(cand);
         // rqAuditFull's bracket, as setState sets it: between this CAS and
         // the rqLeave below cand is .running yet still queued.
-        _ = @atomicRmw(u8, &setstate_in_flight[cand], .Add, 1, .acquire);
-        defer _ = @atomicRmw(u8, &setstate_in_flight[cand], .Sub, 1, .release);
+        auditBracketEnter(cand);
+        defer auditBracketExit(cand);
         const prev = @cmpxchgStrong(u8, state_ptr, ready_val, running_val, .seq_cst, .seq_cst);
         if (TRACE_PID != 0 and cand == TRACE_PID) {
             debug.klog("[trace pid={d} cpu={d}] pickNext CAS .ready->.running result={any}\n", .{
