@@ -900,8 +900,24 @@ pub fn classifySchedLock(addr: usize, idx_out: *usize) ?[]const u8 {
     return null;
 }
 
-pub fn setState(pid: usize, new_state: State) void {
-    if (pid >= MAX_PROCS) return;
+// noinline here and below: inlined, @returnAddress() would name the
+// caller's caller in the traces and [stategraph] lines.
+pub noinline fn setState(pid: usize, new_state: State) void {
+    _ = transition(pid, null, new_state, @returnAddress());
+}
+
+/// setState only while `pid` is still in `from` at the CAS; true if it
+/// moved. A waker's .sleeping → .ready needs this: setState retries onto
+/// whatever state it finds, so a sleeper that rolled itself back to
+/// .running (blockOn's re-check, a deadline already due) would end up
+/// .ready and queued while it runs.
+pub noinline fn setStateFrom(pid: usize, from: State, new_state: State) bool {
+    return transition(pid, from, new_state, @returnAddress());
+}
+
+/// `ra`: the setState / setStateFrom caller, for the traces.
+fn transition(pid: usize, from: ?State, new_state: State, ra: usize) bool {
+    if (pid >= MAX_PROCS) return false;
     const lock_flags = setstate_locks[pid].acquireIrqSave();
     defer setstate_locks[pid].releaseIrqRestore(lock_flags);
     _ = @atomicRmw(u8, &setstate_in_flight[pid], .Add, 1, .acquire);
@@ -927,19 +943,29 @@ pub fn setState(pid: usize, new_state: State) void {
     var old_byte: u8 = @atomicLoad(u8, state_ptr, .acquire);
     const new_byte: u8 = @intFromEnum(new_state);
     while (true) {
+        if (from) |f| {
+            if (old_byte != @intFromEnum(f)) {
+                wakelat.noteStaleWake(pid, switch (old_byte) {
+                    @intFromEnum(State.running) => .running,
+                    @intFromEnum(State.ready) => .ready,
+                    else => .other,
+                });
+                return false;
+            }
+        }
         if (old_byte == new_byte) {
             if (TRACE_PID != 0 and pid == TRACE_PID) {
                 debug.klog("[trace pid={d} cpu={d}] setState NOOP old=={d} new=={d} ra=0x{X}\n", .{
-                    pid, smp.myCpu().cpu_id, old_byte, new_byte, @returnAddress(),
+                    pid, smp.myCpu().cpu_id, old_byte, new_byte, ra,
                 });
             }
-            return; // already in this state
+            return false; // already in this state
         }
         // H1: Terminal-state guard. Once a pid is .zombie or .unused, the
         // ONLY legitimate transition out is .zombie→.unused (reaper) or
         // .unused→.loading (allocator). All other transitions out of a
-        // terminal state are races — wake() reads state=.sleeping plain,
-        // a concurrent killer flips state to .zombie, then wake's
+        // terminal state are races — a caller reads state=.sleeping plain,
+        // a concurrent killer flips state to .zombie, then its
         // setState(.ready) here CAS-retries against the new .zombie value
         // and resurrects the zombie as .ready. Filter the retry path so
         // a peer's terminal-state flip absorbs cleanly.
@@ -947,13 +973,13 @@ pub fn setState(pid: usize, new_state: State) void {
             if (TRACE_PID != 0 and pid == TRACE_PID) {
                 debug.klog("[trace pid={d}] setState ABSORB zombie→{d} (terminal guard)\n", .{ pid, new_byte });
             }
-            return;
+            return false;
         }
         if (old_byte == @intFromEnum(State.unused) and new_state != .loading) {
             if (TRACE_PID != 0 and pid == TRACE_PID) {
                 debug.klog("[trace pid={d}] setState ABSORB unused→{d} (terminal guard)\n", .{ pid, new_byte });
             }
-            return;
+            return false;
         }
         const cas = @cmpxchgStrong(u8, state_ptr, old_byte, new_byte, .acq_rel, .acquire);
         if (cas == null) break; // we own this transition
@@ -962,7 +988,7 @@ pub fn setState(pid: usize, new_state: State) void {
     const old_state: State = @enumFromInt(old_byte);
     if (TRACE_PID != 0 and pid == TRACE_PID) {
         debug.klog("[trace pid={d} cpu={d}] setState CAS-OK {d}->{d} ra=0x{X}\n", .{
-            pid, smp.myCpu().cpu_id, old_byte, new_byte, @returnAddress(),
+            pid, smp.myCpu().cpu_id, old_byte, new_byte, ra,
         });
     }
     // We own this transition — check it against the lifecycle graph. An
@@ -972,14 +998,14 @@ pub fn setState(pid: usize, new_state: State) void {
     // address, while it is still only a log line.
     if (!proc_graph.legal(old_state, new_state)) {
         debug.klog("[stategraph] OFF-GRAPH {s}->{s} pid={d} ra=0x{X}\n", .{
-            @tagName(old_state), @tagName(new_state), pid, @returnAddress(),
+            @tagName(old_state), @tagName(new_state), pid, ra,
         });
     }
     // Per-PID activity ring stamp. Logged AFTER the CAS succeeded so the
     // ring entry corresponds to a real transition (no-op early-returns
     // above leave no trace, by design).
     @import("../debug/pid_act.zig").record(
-        pid, .setstate, old_byte, new_byte, @returnAddress(),
+        pid, .setstate, old_byte, new_byte, ra,
     );
     const was_ready = (old_state == .ready);
     const is_ready = (new_state == .ready);
@@ -1006,6 +1032,7 @@ pub fn setState(pid: usize, new_state: State) void {
         rqEnter(pid, from_sleep);
         maybePreemptOnWake(pid);
     }
+    return true;
 }
 
 /// `cpu_id` is running something other than its idle task. Unlocked peek.
@@ -2575,7 +2602,7 @@ pub fn wakeExpired() void {
             @atomicStore(u64, &pcb.wake_tick, 0, .release);
             wakelat.hintWake(i, if (pcb.wait_kind == .gpu_io) .gpu_io else .parked);
             clearWait(pcb);
-            setState(i, .ready);
+            _ = setStateFrom(i, .sleeping, .ready);
             stuck_last_seen_wait_kind[i] = null;
             continue;
         }
@@ -2593,10 +2620,14 @@ pub fn wakeExpired() void {
             // wake_tick first means the worst-case race re-wakes us on
             // the next tick (we'd be sleeping with wake_tick=0 briefly,
             // skipped by wakeExpired guard, but the fresh sysSleep would
-            // overwrite it before any harm).
-            @atomicStore(u64, &pcb.wake_tick, 0, .release);
+            // overwrite it before any harm). A cmpxchg, not a store: a
+            // sleeper that rolled back and re-armed since the read above
+            // keeps its new deadline (a plain 0 would park it for good).
+            if (@cmpxchgStrong(u64, &pcb.wake_tick, wt, 0, .acq_rel, .monotonic) != null) continue;
             wakelat.hintWake(i, .tick);
-            setState(i, .ready);
+            // From .sleeping only: an already-due sleep rolls itself back
+            // to .running (kernelSleepMs, sysSleep).
+            _ = setStateFrom(i, .sleeping, .ready);
             stuck_last_seen_wait_kind[i] = null;
             continue;
         }
@@ -2707,12 +2738,16 @@ pub fn wakeHiresExpired(now_tsc: u64) void {
             // ORDER: clear the deadline BEFORE setState — same orphan-sleep rule
             // as wakeExpired. setState routes into the run queue; the woken task
             // can run and usleep again before our store lands, and a late store
-            // would clobber its fresh deadline, parking it with no waker.
-            @atomicStore(u64, &pcb.hires_wake_tsc, 0, .release);
+            // would clobber its fresh deadline, parking it with no waker. A
+            // cmpxchg for the same reason: a sleeper that rolled back and
+            // re-armed since the read above keeps its new deadline.
+            if (@cmpxchgStrong(u64, &pcb.hires_wake_tsc, dl, 0, .acq_rel, .monotonic) != null) continue;
             wakelat.hintWake(i, .hires);
             wakelat.noteLate(.hires, now_tsc -% dl);
-            setState(i, .ready);
-            if (wakeupPreemptsLocal(i)) local_wake_preempt[smp.myCpu().cpu_id] = true;
+            // From .sleeping only: sysUsleep rolls itself back to .running
+            // when its deadline is already due.
+            if (setStateFrom(i, .sleeping, .ready) and wakeupPreemptsLocal(i))
+                local_wake_preempt[smp.myCpu().cpu_id] = true;
             continue;
         }
         if (pcb.wait_kind == .none and dl < new_earliest) new_earliest = dl;
@@ -3040,15 +3075,13 @@ pub fn wake(pid: u8) void {
     // pipe.read / pipe.write park themselves with state=.sleeping so the
     // int $0x20 yield actually reschedules (idt's yielded_from_kernel check
     // requires state != .running). Flip back to .ready here so the next
-    // scheduler tick can pick us up. Don't touch .running or .zombie — wake
-    // is meant to be a no-op for processes that aren't parked. setState
-    // also rqEnter's pid on its assigned_cpu's runqueue.
-    // M3: atomic-load state — `state` is `(a)` and a peer CPU may flip
-    // it to .zombie between this read and setState's CAS. setState's H1
-    // guard absorbs the race if it happens; the atomic load keeps the
-    // compiler from hoisting the check across IRQ boundaries.
+    // scheduler tick can pick us up; setState also rqEnter's pid on its
+    // assigned_cpu's runqueue. Only from .sleeping, at the CAS: wake is a
+    // no-op for a task that isn't parked, and the task can leave .sleeping
+    // after the load below — rolled back to .running by its own re-check,
+    // or killed. The load just skips the lock when it isn't parked.
     const s = @atomicLoad(u8, @as(*const u8, @ptrCast(&process.procs[pid].state)), .acquire);
-    if (s == @intFromEnum(State.sleeping)) setState(pid, .ready);
+    if (s == @intFromEnum(State.sleeping)) _ = setStateFrom(pid, .sleeping, .ready);
 }
 
 /// Compare-and-sleep primitive for Mutex.acquire. Enrolls the current

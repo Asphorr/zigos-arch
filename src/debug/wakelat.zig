@@ -112,6 +112,19 @@ pub fn noteNoIpi(pid: usize) void {
     if (tag % N_WHERE < 4) @atomicStore(u8, &ready_tag[pid], tag + 2, .monotonic);
 }
 
+/// What a waker's .sleeping → .ready flip found instead (sched.setStateFrom):
+/// running = the sleeper rolled itself back first, ready = another waker
+/// got there first. No wake happened, so the waker's tag goes too.
+pub const Stale = enum(u8) { running, ready, other };
+var stale_wakes: [@typeInfo(Stale).@"enum".fields.len]u64 = .{0} ** @typeInfo(Stale).@"enum".fields.len;
+
+pub fn noteStaleWake(pid: usize, seen: Stale) void {
+    if (pid >= MAX_PROCS) return;
+    @atomicStore(u8, &hint[pid], 0, .monotonic);
+    @atomicStore(u64, &irq_tsc[pid], 0, .monotonic);
+    _ = @atomicRmw(u64, &stale_wakes[@intFromEnum(seen)], .Add, 1, .monotonic);
+}
+
 /// A pid leaving .ready without running (kill): its stamp must not be
 /// charged to the slot's next occupant.
 pub fn drop(pid: usize) void {
@@ -166,4 +179,9 @@ pub fn dump() void {
         for (per_src, 0..) |*h, w| dumpHist("run", name, wheres[w], h);
     }
     for (&late_h, 0..) |*h, l| dumpHist("late", @tagName(@as(Late, @enumFromInt(l))), "", h);
+    var stale: [stale_wakes.len]u64 = undefined;
+    for (&stale, &stale_wakes) |*s, *c| s.* = @atomicRmw(u64, c, .Xchg, 0, .monotonic);
+    if (stale[0] + stale[1] + stale[2] != 0) {
+        serial.print("[wakelat] stale wakes: running={d} ready={d} other={d}\n", .{ stale[0], stale[1], stale[2] });
+    }
 }
