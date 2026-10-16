@@ -621,14 +621,11 @@ fn sysMmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, off: u64) u64 {
     const lead = process.leader(pcb);
     lead.as_lock.acquire();
     defer lead.as_lock.release();
-    if (lead.lazy_count >= process.MAX_LAZY_REGIONS) return err(ENOMEM);
     const len_pg: usize = (@as(usize, @intCast(@min(len, 0xFFFF_F000))) + 0xFFF) & ~@as(usize, 0xFFF);
     if (len_pg == 0 or len_pg > lead.mmap_top) return err(ENOMEM);
     const new_top = lead.mmap_top - len_pg;
     if (new_top < lead.user_brk) return err(ENOMEM);
-    const lead_pid: u32 = lead.tgid;
-    if (!process.addLazyRegion(lead_pid, new_top, lead.mmap_top, 0)) return err(ENOMEM);
-    lead.lazy_regions[lead.lazy_count - 1].prot = process.PROT_RW;
+    if (!process.addRegion(lead.tgid, .{ .start = new_top, .end = lead.mmap_top, .prot = process.PROT_RW })) return err(ENOMEM);
     lead.mmap_top = new_top;
     return new_top;
 }

@@ -12,7 +12,7 @@
 //     master PML4[0] is zero; the lookup deref'd `physToVirt(0)` =
 //     BIOS data, and a stray bit-51 in there produced a u64 overflow
 //     in the next physToVirt → ReleaseSafe panic.
-//   * `freeElfBuf` and the lazy_regions cleanup passed the kernel
+//   * `freeElfBuf` and the regions cleanup passed the kernel
 //     pointer (now a physmap VA) straight to `pmm.freeContiguous`,
 //     which expects a phys address. PMM rejected with [pmm] WARNING
 //     up front, but the leak was real.
@@ -111,7 +111,7 @@ pub fn taskEntry() callconv(.c) noreturn {
         process.kernelSleepMs(0);
 
         // --- Kill: drives killProcessWithStatus → destroyAddressSpace
-        // → freeElfBuf → lazy_regions cleanup. This is the path that
+        // → freeElfBuf → regions cleanup. This is the path that
         // panicked before the Phase 3 follow-up fixes landed.
         process.killProcess(pid);
         killed += 1;

@@ -31,7 +31,7 @@ const serial = @import("serial.zig");
 const apic = @import("../time/apic.zig");
 
 pub const Phase = enum(u8) {
-    /// validateUserPtr / allCurrentUserPagesMapped — PT walk for every page.
+    /// validateUserPtr / prefaultUserRange — PT walk for every page.
     /// Hot since today's user-pointer hardening sweep.
     user_ptr_walk,
     /// Bare @memcpy / explicit copy_to_user style operations.

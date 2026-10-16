@@ -44,7 +44,9 @@ const protect = @import("../arch/protect.zig");
 const lifecycle = @import("../../proc/lifecycle.zig");
 const config = @import("../../config.zig");
 const memmap = @import("../../mm/memmap.zig");
+const heap = @import("../../mm/heap.zig");
 const nvme = @import("../../driver/nvme.zig");
+const spinlock = @import("../../proc/spinlock.zig");
 
 const common = @import("../syscall/common.zig");
 const E_INVAL = common.E_INVAL;
@@ -350,17 +352,61 @@ fn ensurePollCallbackRegistered() void {
     );
 }
 
-/// Execute one non-NVMe Sqe synchronously. For OP_READ/WRITE the worker
-/// swaps to the owner's CR3 so user-buffer dereferences resolve. vfs.read/
-/// write take the owner's PCB so fd_table lookups use the right table.
+/// Largest OP_READ / OP_WRITE moved per Sqe; a longer request completes
+/// short, as a read(2) may.
+const SYNC_IO_MAX: u32 = 64 * 1024;
+
+const CopyDir = enum { to_owner, from_owner };
+
+/// Copy between a kernel buffer and the owner's user memory at `addr`, from
+/// the worker. Holds the read side of the owner's as_lock (so an munmap on
+/// one of its threads can't take the pages away mid-copy) and runs the copy
+/// with the owner's CR3 and preemption pinned: a kernel task resumes on the
+/// kernel PML4, where the user address means nothing. The first step
+/// resolves the owner's lazy pages, which the worker's own #PF can't:
+/// to_owner needs them writable (COW broken), from_owner only present —
+/// writable would refuse every source in a read-only region, string
+/// literals included. Blockable context only; false = EFAULT.
+fn copyWithOwner(owner_pcb: *process.PCB, addr: usize, buf: []u8, dir: CopyDir) bool {
+    if (owner_pcb.page_dir_phys == 0) return false;
+    const owner_leader = process.leader(owner_pcb);
+    const me = process.currentPCB() orelse return false;
+    me.foreign_as_lock = owner_leader.tgid;
+    owner_leader.as_lock.acquireRead();
+    defer {
+        owner_leader.as_lock.releaseRead();
+        me.foreign_as_lock = process.NO_FOREIGN_LOCK;
+    }
+
+    const pin = spinlock.pinPreemption();
+    defer spinlock.unpinPreemption(pin);
+    const my_cpu_id = smp.myCpu().cpu_id;
+    pcid_mod.loadCr3(owner_pcb.page_dir_phys, owner_pcb.pcid, my_cpu_id);
+    defer pcid_mod.loadCr3(paging.getKernelPageDirPhys(), 0, my_cpu_id);
+
+    const ok = switch (dir) {
+        .to_owner => fault.ensureUserRangeWritableFor(owner_pcb, addr, buf.len),
+        .from_owner => fault.ensureUserRangeReadableFor(owner_pcb, addr, buf.len),
+    };
+    if (!ok) return false;
+    protect.allowUserAccess();
+    defer protect.disallowUserAccess();
+    const user: [*]u8 = @ptrFromInt(addr);
+    switch (dir) {
+        .to_owner => @memcpy(user[0..buf.len], buf),
+        .from_owner => @memcpy(buf, user[0..buf.len]),
+    }
+    return true;
+}
+
+/// Execute one non-NVMe Sqe synchronously. vfs.read/write take the owner's
+/// PCB so fd_table lookups use the right table.
 ///
-/// Acquires owner_leader.as_lock around the validation + CR3 swap + vfs
-/// call to serialize against concurrent sysMunmap/sysMprotect on the
-/// owner's own thread (would otherwise unmap pages mid-vfs, causing a
-/// kernel-mode #PF that the ring-3-only handler can't service → panic).
-/// Plus ensureUserRangeWritableFor breaks COW so the kernel WRITE on the
-/// user VA doesn't trap on a fork-shared page. Closes HIGH classes 3+3b
-/// reviewer flagged 2026-05-24.
+/// The file I/O runs on a kernel bounce buffer with no lock held: a read can
+/// park indefinitely (an empty pipe whose writer is a thread of the owner),
+/// and the owner's as_lock held meanwhile would let a waiting writer — any
+/// mmap — stall every fault in the owner, that pipe writer's included. Only
+/// the copy to or from the user buffer takes the lock (copyWithOwner).
 fn executeSyncAsWorker(inst: *Instance, sqe: Sqe) i32 {
     if (inst.owner_pid >= process.MAX_PROCS) return ERES_FAULT;
     const owner_pcb = &process.procs[inst.owner_pid];
@@ -380,48 +426,18 @@ fn executeSyncAsWorker(inst: *Instance, sqe: Sqe) i32 {
             {
                 return ERES_FAULT;
             }
-            const owner_pd_phys: u64 = owner_pcb.page_dir_phys;
-            const owner_pcid: u16 = owner_pcb.pcid;
-            if (owner_pd_phys == 0) return ERES_FAULT;
-
-            // AS-stability lock. Acquired BEFORE CR3 swap (the swap itself
-            // must not span a yield, but Mutex.acquire may yield via
-            // blockOnMutex on contention — fine here since CR3 hasn't been
-            // touched yet). Released on return via defer.
-            const owner_leader = process.leader(owner_pcb);
-            owner_leader.as_lock.acquire();
-            defer owner_leader.as_lock.release();
-
-            const my_cpu_id = smp.myCpu().cpu_id;
-            const kernel_pd_phys = paging.getKernelPageDirPhys();
-            pcid_mod.loadCr3(owner_pd_phys, owner_pcid, my_cpu_id);
-            defer pcid_mod.loadCr3(kernel_pd_phys, 0, my_cpu_id);
-
-            // Lazy-fault any missing pages in the range BEFORE vfs touches
-            // user memory — the worker's #PF context can't service the
-            // owner's lazy regions. OP_READ (vfs WRITES the user buf):
-            // present + writable, breaking COW. OP_WRITE (vfs only READS
-            // the buf): present suffices — demanding writable would
-            // ERES_FAULT any source in an RO cache region (Slice 3e ELF
-            // .rodata), i.e. every string literal passed to a write.
-            const range_ok = if (sqe.opcode == OP_READ)
-                fault.ensureUserRangeWritableFor(owner_pcb, addr, sqe.len)
-            else
-                fault.ensureUserRangeReadableFor(owner_pcb, addr, sqe.len);
-            if (!range_ok) {
-                return ERES_FAULT;
-            }
-
-            protect.allowUserAccess();
-            defer protect.disallowUserAccess();
+            const len = @min(sqe.len, SYNC_IO_MAX);
+            const bounce = heap.kmalloc(len) orelse return ERES_NOMEM;
+            defer heap.kfree(bounce);
 
             if (sqe.opcode == OP_READ) {
-                const buf: [*]u8 = @ptrFromInt(addr);
-                const n = vfs.read(owner_pcb, sqe.fd, buf, sqe.len);
-                return if (n == 0xFFFFFFFF) ERES_INVAL else @intCast(n);
+                const n = vfs.read(owner_pcb, sqe.fd, bounce, len);
+                if (n == 0xFFFFFFFF) return ERES_INVAL;
+                if (!copyWithOwner(owner_pcb, addr, bounce[0..n], .to_owner)) return ERES_FAULT;
+                return @intCast(n);
             } else {
-                const buf: [*]const u8 = @ptrFromInt(addr);
-                const n = vfs.write(owner_pcb, sqe.fd, buf, sqe.len);
+                if (!copyWithOwner(owner_pcb, addr, bounce[0..len], .from_owner)) return ERES_FAULT;
+                const n = vfs.write(owner_pcb, sqe.fd, bounce, len);
                 return if (n == 0xFFFFFFFF) ERES_INVAL else @intCast(n);
             }
         },
@@ -628,11 +644,8 @@ fn submitNvmeOp(inst: *Instance, inst_id: u8, slot_idx: u8, sqe: Sqe) SubmitResu
 /// Drain one completed pending slot. Copies bounce → user (for reads),
 /// posts the CQE, releases the NVMe CID, frees the slot.
 ///
-/// Acquires owner_leader.as_lock around the CR3 swap + ensureUserRangeWritableFor
-/// + memcpy. Lock-then-swap order is correct (Mutex may yield on
-/// contention; CR3 must not span a yield). ensureUserRangeWritableFor
-/// breaks any COW page in the range so the kernel WRITE doesn't trap as
-/// kernel-mode #PF. Closes HIGH classes 3+3b reviewer flagged 2026-05-24.
+/// The copy into the owner's buffer goes through copyWithOwner (lock, CR3,
+/// COW break — see there).
 fn handleCompletion(inst: *Instance, p: *PendingOp) void {
     // OP_POLL completes via fdpoll.wakePollers (not NVMe IRQ), no CID
     // to release, no bounce copy. Just post the ready mask and free
@@ -660,38 +673,13 @@ fn handleCompletion(inst: *Instance, p: *PendingOp) void {
     if (success and p.op == OP_NVME_READ) {
         if (inst.owner_pid >= process.MAX_PROCS) {
             res = ERES_FAULT;
-        } else copy: {
+        } else {
             const owner_pcb = &process.procs[inst.owner_pid];
-            if (owner_pcb.page_dir_phys == 0) {
-                res = ERES_FAULT;
-                break :copy;
-            }
-
-            const owner_leader = process.leader(owner_pcb);
-            owner_leader.as_lock.acquire();
-            defer owner_leader.as_lock.release();
-
-            const my_cpu_id = smp.myCpu().cpu_id;
-            const kernel_pd_phys = paging.getKernelPageDirPhys();
-            pcid_mod.loadCr3(owner_pcb.page_dir_phys, owner_pcb.pcid, my_cpu_id);
-            defer pcid_mod.loadCr3(kernel_pd_phys, 0, my_cpu_id);
-
-            if (!fault.ensureUserRangeWritableFor(owner_pcb, p.user_addr, p.bytes)) {
-                res = ERES_FAULT;
-                break :copy;
-            }
-
-            const bounce_phys = nvme.bounceBufPhys(p.ctrl_idx, p.packed_cid) orelse {
-                res = ERES_FAULT;
-                break :copy;
-            };
-
-            protect.allowUserAccess();
-            defer protect.disallowUserAccess();
-
-            const dst: [*]u8 = @ptrFromInt(p.user_addr);
-            const src: [*]const u8 = @ptrFromInt(paging.physToVirt(bounce_phys));
-            @memcpy(dst[0..p.bytes], src[0..p.bytes]);
+            const ok = if (nvme.bounceBufPhys(p.ctrl_idx, p.packed_cid)) |bounce_phys| blk: {
+                const src: [*]u8 = @ptrFromInt(paging.physToVirt(bounce_phys));
+                break :blk copyWithOwner(owner_pcb, p.user_addr, src[0..p.bytes], .to_owner);
+            } else false;
+            if (!ok) res = ERES_FAULT;
         }
     }
 
@@ -929,6 +917,11 @@ fn workerLoop() callconv(.c) noreturn {
     unreachable;
 }
 
+/// Region-set `remove` context for a ring region nothing has mapped yet.
+const NoPages = struct {
+    pub fn removed(_: NoPages, _: process.LazyRegion) void {}
+};
+
 /// Create a new io_uring instance. Allocates the shared ring region,
 /// installs the user-side LazyRegion mapping, spawns a worker task,
 /// and returns the user VA.
@@ -948,8 +941,6 @@ pub fn setup(entries_req: u32) u32 {
     // worker (other instance, same pid) could be mutating concurrently.
     lead.as_lock.acquire();
     defer lead.as_lock.release();
-
-    if (lead.lazy_count >= process.MAX_LAZY_REGIONS) return 0;
 
     const region_bytes = regionSize(entries);
     const region_pages: u32 = @intCast(region_bytes / 0x1000);
@@ -993,17 +984,18 @@ pub fn setup(entries_req: u32) u32 {
         instances[slot].in_use = false;
         return 0;
     }
-    if (!process.addLazyRegion(lead.tgid, new_top, lead.mmap_top, 0)) {
+    if (!process.addRegion(lead.tgid, .{ .start = new_top, .end = lead.mmap_top, .prot = process.PROT_RW, .shm_id = shm_id })) {
         shm.release(shm_id);
         instances[slot].in_use = false;
         return 0;
     }
-    const ridx = lead.lazy_count - 1;
-    lead.lazy_regions[ridx].prot = process.PROT_RW;
-    lead.lazy_regions[ridx].shm_id = shm_id;
     lead.mmap_top = new_top;
 
     const phys0 = shm.frameAt(shm_id, 0) orelse {
+        // The region holds the shm reference: take it out with the release,
+        // or teardown would release the id a second time.
+        lead.regions.remove(new_top, new_top + region_bytes, NoPages{}) catch unreachable; // whole region: no split
+        lead.mmap_top = new_top + region_bytes;
         shm.release(shm_id);
         instances[slot].in_use = false;
         return 0;
@@ -1039,12 +1031,10 @@ pub fn setup(entries_req: u32) u32 {
         16 * 1024,
     );
     const worker_pid = worker_pid_opt orelse {
-        if (lead.lazy_count > 0) {
-            const removed = lead.lazy_regions[lead.lazy_count - 1];
-            lead.lazy_regions[lead.lazy_count - 1] = .{};
-            lead.lazy_count -= 1;
-            if (removed.start == lead.mmap_top) lead.mmap_top = removed.end;
-        }
+        // Nothing faulted the ring in yet (setup hasn't returned its VA), so
+        // there are no pages to release.
+        lead.regions.remove(new_top, new_top + region_bytes, NoPages{}) catch unreachable; // whole region: no split
+        lead.mmap_top = new_top + region_bytes;
         shm.release(shm_id);
         instances[slot].in_use = false;
         return 0;

@@ -45,6 +45,12 @@ const E_PERM = common.E_PERM;
 const E_CHILD = common.E_CHILD;
 const E_INTR = common.E_INTR;
 
+/// Region-set `remove` context for ranges whose pages the caller already
+/// released.
+const Discard = struct {
+    pub fn removed(_: Discard, _: process.LazyRegion) void {}
+};
+
 pub fn sysSbrk(increment: u32) u32 {
     const pcb = process.currentPCB() orelse return E_FAULT;
     _ = pcb.page_directory orelse return E_FAULT;
@@ -78,9 +84,9 @@ pub fn sysSbrk(increment: u32) u32 {
         const decrement: usize = @intCast(-@as(i64, inc_signed));
         if (decrement > old_brk - memmap.USER_BRK_INITIAL) return E_INVAL;
         const new_brk_shrink = old_brk - decrement;
-        if (lead.heap_lazy_idx < 0) return E_INVAL;
-        const hr = &lead.lazy_regions[@intCast(lead.heap_lazy_idx)];
-        if (hr.end != old_brk) return E_INVAL;
+        if (lead.heap_start == 0) return E_INVAL;
+        const hr = lead.regions.find(lead.heap_start) orelse return E_INVAL;
+        if (hr.start != lead.heap_start or hr.end != old_brk) return E_INVAL;
         if (new_brk_shrink < hr.start) return E_INVAL;
 
         debug.klog("[sbrk-shrink] pid={d} name='{s}' dec={d}KB old=0x{X} new=0x{X}\n", .{
@@ -94,7 +100,14 @@ pub fn sysSbrk(increment: u32) u32 {
         const end_page = (old_brk + 0xFFF) & ~@as(usize, 0xFFF);
         @import("../mmu/tlb.zig").shootdownRange(lead.pcid, first_page, (end_page - first_page) / 0x1000);
 
-        hr.end = new_brk_shrink;
+        // A heap shrunk to nothing leaves the set; the next grow starts a
+        // new heap region at the break.
+        if (new_brk_shrink == hr.start) {
+            lead.regions.remove(hr.start, old_brk, Discard{}) catch unreachable; // whole region: no split
+            lead.heap_start = 0;
+        } else {
+            _ = lead.regions.resizeEnd(lead.heap_start, new_brk_shrink);
+        }
         lead.user_brk = new_brk_shrink;
         return @intCast(old_brk);
     }
@@ -113,16 +126,18 @@ pub fn sysSbrk(increment: u32) u32 {
 
     // Lazy heap: register (or extend) a lazy region instead of eagerly mapping
     // every page. The page-fault handler allocates+zeros pages on first touch.
-    // Reuse the existing heap region if it still ends at old_brk; otherwise
-    // (first sbrk, or gpu_map_blob bumped user_brk past it) register a new one.
-    const reuse = lead.heap_lazy_idx >= 0 and
-        lead.lazy_regions[@intCast(lead.heap_lazy_idx)].end == old_brk;
+    // Grow the heap region if it still ends at old_brk; otherwise (first
+    // sbrk, or gpu_map_blob bumped user_brk past it) register a new one.
+    const reuse = if (lead.heap_start != 0) blk: {
+        const hr = lead.regions.find(lead.heap_start) orelse break :blk false;
+        break :blk hr.start == lead.heap_start and hr.end == old_brk;
+    } else false;
 
     if (reuse) {
-        lead.lazy_regions[@intCast(lead.heap_lazy_idx)].end = new_brk;
+        if (!lead.regions.resizeEnd(lead.heap_start, new_brk)) return E_INVAL;
     } else {
         if (!process.addLazyRegion(@intCast(lead.tgid), old_brk, new_brk, 0)) return E_INVAL;
-        lead.heap_lazy_idx = @intCast(lead.lazy_count - 1);
+        lead.heap_start = old_brk;
     }
 
     lead.user_brk = new_brk;
@@ -157,42 +172,24 @@ pub fn sysMmap(len: u32, fd: u32, offset: u32) u32 {
     _ = pcb.page_directory orelse return E_FAULT;
     const lead = process.leader(pcb);
 
-    // AS-stability lock (see PCB.as_lock). Acquired before any AS-state
-    // read to avoid races with the io_uring worker.
-    lead.as_lock.acquire();
-    defer lead.as_lock.release();
-
-    if (lead.lazy_count >= process.MAX_LAZY_REGIONS) return E_INVAL;
-
     const len_pg: usize = (@as(usize, len) + 0xFFF) & ~@as(usize, 0xFFF);
-    if (len_pg > lead.mmap_top) return E_INVAL;
-    const new_top = lead.mmap_top - len_pg;
-    if (new_top < lead.user_brk) return E_INVAL;
-
-    const lead_pid: u32 = lead.tgid;
-
-    if (fd == 0xFFFFFFFF) {
-        if (!process.addLazyRegion(lead_pid, new_top, lead.mmap_top, 0)) return E_INVAL;
-        lead.lazy_regions[lead.lazy_count - 1].prot = process.PROT_RW;
-    } else {
+    const anon = fd == 0xFFFFFFFF;
+    if (!anon) {
         if (fd >= config.MAX_FDS) return E_INVAL;
         if (!pcb.fd_table[fd].in_use) return E_INVAL;
+    }
+    // Cache-backed fast path (ext2 only): a demand-paged region keyed on the
+    // file's inode — NO eager read, NO private buffer. Pages fault in through
+    // the unified page cache, shared across mappers and filled lazily
+    // (fault.zig faultInCachePage).
+    const cached = !anon and pcb.fd_table[fd].fs_type == .ext2;
 
-        // Cache-backed fast path (ext2 only): register a demand-paged region
-        // keyed on the file's inode and return immediately — NO eager read, NO
-        // private buffer. Pages fault in through the unified page cache, shared
-        // across mappers and filled lazily (fault.zig faultInCachePage). Other
-        // filesystems fall through to the eager copy-into-buffer path below.
-        if (pcb.fd_table[fd].fs_type == .ext2) {
-            if (!process.addLazyRegion(lead_pid, new_top, lead.mmap_top, 0)) return E_INVAL;
-            const ridx = lead.lazy_count - 1;
-            lead.lazy_regions[ridx].prot = process.PROT_RW;
-            lead.lazy_regions[ridx].cache_inode = @intCast(pcb.fd_table[fd].inode);
-            lead.lazy_regions[ridx].cache_off = offset;
-            lead.mmap_top = new_top;
-            return @intCast(new_top);
-        }
-
+    // Any other file is copied into a private buffer, BEFORE the lock: the
+    // read may block (a pipe, a long disk read), and with the write side held
+    // every fault of every thread would wait on it.
+    const Copy = struct { phys: Phys, ptr: [*]u8, pages: u32 };
+    var copy: ?Copy = null;
+    if (!anon and !cached) {
         const num_pages: u32 = @intCast(len_pg / 0x1000);
         // User-driven fd-backed mmap — respect the PMM reserve so a
         // big mmap can't deplete the kernel emergency pool.
@@ -216,28 +213,36 @@ pub fn sysMmap(len: u32, fd: u32, offset: u32) u32 {
             const tail = buf_phys.add(n).toVirt().ptr([*]u8);
             @memset(tail[0 .. len_pg - n], 0);
         }
-
-        if (!process.addLazyRegionWithSource(
-            lead_pid,
-            new_top,
-            lead.mmap_top,
-            0,
-            buf_ptr,
-            new_top,
-            len_pg,
-            0,
-        )) {
-            pmm.freeContiguous(buf_phys, @intCast(num_pages));
-            return E_INVAL;
-        }
-        const ridx = lead.lazy_count - 1;
-        lead.lazy_regions[ridx].buf_owned = true;
-        lead.lazy_regions[ridx].buf_pages = @intCast(num_pages);
-        lead.lazy_regions[ridx].prot = process.PROT_RW;
+        copy = .{ .phys = buf_phys, .ptr = buf_ptr, .pages = num_pages };
     }
 
-    lead.mmap_top = new_top;
-    return @intCast(new_top);
+    // AS-stability lock (see PCB.as_lock), write side: placement reads
+    // mmap_top/user_brk and the new region goes into the set.
+    lead.as_lock.acquire();
+    defer lead.as_lock.release();
+
+    const placed: ?usize = if (len_pg <= lead.mmap_top and lead.mmap_top - len_pg >= lead.user_brk) lead.mmap_top - len_pg else null;
+    var region: process.LazyRegion = .{ .end = lead.mmap_top, .prot = process.PROT_RW };
+    if (placed) |new_top| {
+        region.start = new_top;
+        if (cached) {
+            region.cache_inode = @intCast(pcb.fd_table[fd].inode);
+            region.cache_off = offset;
+        }
+        if (copy) |c| {
+            region.source = c.ptr;
+            region.src_va_base = new_top;
+            region.src_size = len_pg;
+            region.buf_owned = true;
+            region.buf_pages = @intCast(c.pages);
+        }
+    }
+    if (placed == null or !process.addRegion(lead.tgid, region)) {
+        if (copy) |c| pmm.freeContiguous(c.phys, @intCast(c.pages));
+        return E_INVAL;
+    }
+    lead.mmap_top = region.start;
+    return @intCast(region.start);
 }
 
 /// MAP_SHARED file mapping (Slice 3c). Like the ext2 fast path of sysMmap, but
@@ -259,7 +264,6 @@ pub fn sysMmapFileShared(len: u32, fd: u32, offset: u32) u32 {
     lead.as_lock.acquire();
     defer lead.as_lock.release();
 
-    if (lead.lazy_count >= process.MAX_LAZY_REGIONS) return E_INVAL;
     if (fd >= config.MAX_FDS) return E_INVAL;
     if (!pcb.fd_table[fd].in_use) return E_INVAL;
     // Shared writeback only exists for the ext2 page cache. Other fs types have
@@ -272,12 +276,14 @@ pub fn sysMmapFileShared(len: u32, fd: u32, offset: u32) u32 {
     const new_top = lead.mmap_top - len_pg;
     if (new_top < lead.user_brk) return E_INVAL;
 
-    if (!process.addLazyRegion(lead.tgid, new_top, lead.mmap_top, 0)) return E_INVAL;
-    const ridx = lead.lazy_count - 1;
-    lead.lazy_regions[ridx].prot = process.PROT_RW;
-    lead.lazy_regions[ridx].cache_inode = @intCast(pcb.fd_table[fd].inode);
-    lead.lazy_regions[ridx].cache_off = offset;
-    lead.lazy_regions[ridx].cache_shared = true;
+    if (!process.addRegion(lead.tgid, .{
+        .start = new_top,
+        .end = lead.mmap_top,
+        .prot = process.PROT_RW,
+        .cache_inode = @intCast(pcb.fd_table[fd].inode),
+        .cache_off = offset,
+        .cache_shared = true,
+    })) return E_INVAL;
     lead.mmap_top = new_top;
     return @intCast(new_top);
 }
@@ -297,14 +303,11 @@ pub fn sysMsync(va: u32, len: u32) u32 {
 
     // Resolve the region under the lock (the table can be mutated by a concurrent
     // mmap/munmap on another thread), capture the inode, then release before I/O.
-    lead.as_lock.acquire();
+    lead.as_lock.acquireRead();
     const inum: ?u32 = blk: {
-        defer lead.as_lock.release();
-        for (lead.lazy_regions[0..lead.lazy_count]) |r| {
-            if (r.cache_inode != 0 and r.cache_shared and start >= r.start and start < r.end) {
-                break :blk r.cache_inode;
-            }
-        }
+        defer lead.as_lock.releaseRead();
+        const r = lead.regions.find(start) orelse break :blk null;
+        if (r.cache_inode != 0 and r.cache_shared) break :blk r.cache_inode;
         break :blk null;
     };
     const i = inum orelse return E_INVAL;
@@ -330,8 +333,6 @@ pub fn sysMmapSharedAnon(len: u32) u32 {
     lead.as_lock.acquire();
     defer lead.as_lock.release();
 
-    if (lead.lazy_count >= process.MAX_LAZY_REGIONS) return 0;
-
     const len_pg: usize = (@as(usize, len) + 0xFFF) & ~@as(usize, 0xFFF);
     if (len_pg > lead.mmap_top) return 0;
     const new_top = lead.mmap_top - len_pg;
@@ -341,13 +342,10 @@ pub fn sysMmapSharedAnon(len: u32) u32 {
     const num_pages: u32 = @intCast(len_pg / 0x1000);
     const shm_id = shm.create(num_pages) orelse return 0;
 
-    if (!process.addLazyRegion(lead.tgid, new_top, lead.mmap_top, 0)) {
+    if (!process.addRegion(lead.tgid, .{ .start = new_top, .end = lead.mmap_top, .prot = process.PROT_RW, .shm_id = shm_id })) {
         shm.release(shm_id);
         return 0;
     }
-    const ridx = lead.lazy_count - 1;
-    lead.lazy_regions[ridx].prot = process.PROT_RW;
-    lead.lazy_regions[ridx].shm_id = shm_id;
     lead.mmap_top = new_top;
     return @intCast(new_top);
 }
@@ -396,7 +394,6 @@ pub fn sysMmapPmem(len: u32, fd: u32, offset: u32) u32 {
     lead.as_lock.acquire();
     defer lead.as_lock.release();
 
-    if (lead.lazy_count >= process.MAX_LAZY_REGIONS) return E_INVAL;
     if (len_pg > lead.mmap_top) return E_INVAL;
     const new_top = lead.mmap_top - len_pg;
     if (new_top < lead.user_brk) return E_INVAL;
@@ -420,12 +417,11 @@ pub fn sysMmapPmem(len: u32, fd: u32, offset: u32) u32 {
 
     // Track the VA range so munmap/teardown account for it. No buf_owned /
     // cache_inode / shm_id: the frames are device memory, freed as no-ops.
-    if (!process.addLazyRegion(lead.tgid, new_top, lead.mmap_top, 0)) {
+    if (!process.addRegion(lead.tgid, .{ .start = new_top, .end = lead.mmap_top, .prot = process.PROT_RW })) {
         var j: usize = 0;
         while (j < num_pages) : (j += 1) _ = vmm.unmapUserPage(pd, new_top + j * 0x1000);
         return E_INVAL;
     }
-    lead.lazy_regions[lead.lazy_count - 1].prot = process.PROT_RW;
     lead.mmap_top = new_top;
     return @intCast(new_top);
 }
@@ -433,14 +429,13 @@ pub fn sysMmapPmem(len: u32, fd: u32, offset: u32) u32 {
 /// Free a previously-mmapped region. `va` must match the start of a registered
 /// region exactly and `len` must match its length (rounded up to page) — partial
 /// unmaps are rejected. Walks the page table releasing each present 4KB frame
-/// back to the PMM, then removes the lazy-region entry.
+/// back to the PMM, then removes the region.
 ///
-/// VA recovery: when the freed region is the topmost (its start equals the
-/// current mmap_top), mmap_top is advanced upward to the next existing mmap
-/// region's start — this also reclaims any contiguous holes below that were
-/// freed earlier in non-stack order. Middle holes between still-allocated
-/// regions are NOT reclaimed; that needs a real free-range list and is
-/// deferred until the lazy_count cap (16) actually starts hurting.
+/// VA recovery: when the freed region is the lowest mmap (its start equals
+/// the current mmap_top), mmap_top is advanced upward to the next mmap's
+/// start — this also reclaims any contiguous holes below that were freed
+/// earlier in non-stack order. Middle holes between still-allocated regions
+/// are not reused by this bump allocator (the Linux mmap searches gaps).
 pub fn sysMunmap(va: u32, len: u32) u32 {
     if (len == 0) return E_INVAL;
     const pcb = process.currentPCB() orelse return E_FAULT;
@@ -461,18 +456,19 @@ pub fn sysMunmap(va: u32, len: u32) u32 {
         return E_INVAL;
     }
 
-    var found_idx: ?usize = null;
-    for (lead.lazy_regions[0..lead.lazy_count], 0..) |r, i| {
-        if (r.start == start and r.end == end) {
-            found_idx = i;
-            break;
-        }
-    }
-    const idx = found_idx orelse {
+    const found = lead.regions.find(start) orelse {
         lead.as_lock.release();
         return E_INVAL;
     };
-    const removed = lead.lazy_regions[idx];
+    if (found.start != start or found.end != end) {
+        lead.as_lock.release();
+        return E_INVAL;
+    }
+    // A copy: regions.remove below shifts the array under `found`. Keep this
+    // a plain `const = ptr.*` — Zig 0.15.2 ReleaseSafe turns a const struct
+    // initialized by a block, if or switch that yields `ptr.*` into an alias
+    // of *ptr, and this one would then read the region shifted into its slot.
+    const removed = found.*;
 
     // Gap #7+#8 (2026-05-20): batched walk that shares the PT pointer
     // across each 2 MB span AND reclaims empty intermediate tables. The
@@ -490,26 +486,14 @@ pub fn sysMunmap(va: u32, len: u32) u32 {
     // the rest of the AS's entries; large ones flush the whole PCID.
     @import("../mmu/tlb.zig").shootdownRange(lead.pcid, start, (end - start) / 0x1000);
 
-    // Compact the lazy_regions array. heap_lazy_idx is sbrk's pointer; if it
-    // happens to be above the removed slot, shift it down by one to keep
-    // pointing at the same region.
-    for (idx + 1..lead.lazy_count) |j| lead.lazy_regions[j - 1] = lead.lazy_regions[j];
-    lead.lazy_count -= 1;
-    lead.lazy_regions[lead.lazy_count] = .{};
-    if (lead.heap_lazy_idx >= 0 and @as(usize, @intCast(lead.heap_lazy_idx)) > idx) {
-        lead.heap_lazy_idx -= 1;
-    }
+    lead.regions.remove(start, end, Discard{}) catch unreachable; // whole region: no split
+    if (removed.start == lead.heap_start) lead.heap_start = 0;
 
-    // VA reclaim: if we just freed the topmost mmap region, slide mmap_top up
-    // to the next still-allocated mmap region's start (or USER_SPACE_END).
-    // Filter `r.start > lead.mmap_top` excludes the heap region (which sits
-    // far below in user space) and naturally picks only mmap-managed regions.
+    // VA reclaim: if we just freed the lowest mmap region, slide mmap_top up
+    // to the next one's start (or USER_SPACE_END). Regions above mmap_top are
+    // all mmaps — the heap sits far below.
     if (removed.start == lead.mmap_top) {
-        var new_top: usize = memmap.USER_SPACE_END;
-        for (lead.lazy_regions[0..lead.lazy_count]) |r| {
-            if (r.start > lead.mmap_top and r.start < new_top) new_top = r.start;
-        }
-        lead.mmap_top = new_top;
+        lead.mmap_top = if (lead.regions.atOrAbove(lead.mmap_top)) |next| next.start else memmap.USER_SPACE_END;
     }
 
     // File-backed mmap allocates a per-region kernel buffer; drop this
@@ -571,21 +555,15 @@ pub fn sysMprotect(va: u32, len: u32, prot: u32) u32 {
     const end = start + len_pg;
     if (end <= start) return E_INVAL;
 
-    // Lazy regions live on the lead thread (per-process), like every other
+    // Regions live on the lead thread (per-process), like every other
     // mmap-family syscall — a cloned (non-lead) thread's mprotect must see the
     // shared table, not its own empty one.
-    var found_idx: ?usize = null;
-    for (lead.lazy_regions[0..lead.lazy_count], 0..) |r, i| {
-        if (r.start == start and r.end == end) {
-            found_idx = i;
-            break;
-        }
-    }
-    const idx = found_idx orelse return E_INVAL;
+    const lr = lead.regions.find(start) orelse return E_INVAL;
+    if (lr.start != start or lr.end != end) return E_INVAL;
 
     // Mask off non-prot bits the user might have passed; we own the encoding.
     const new_prot: u8 = @as(u8, @truncate(prot)) & process.PROT_RWX;
-    lead.lazy_regions[idx].prot = new_prot;
+    lr.prot = new_prot;
 
     // A PRIVATE cache-backed region's present pages are mapped read-only + COW
     // over a SHARED frame; protToMapFlags(PROT_RW) would strip COW and set W,
@@ -594,7 +572,6 @@ pub fn sysMprotect(va: u32, len: u32, prot: u32) u32 {
     // so the COW divergence — and PROT_READ enforcement — stay intact.
     // A SHARED cache region (cache_shared, Slice 3c) is the opposite: writes are
     // SUPPOSED to hit the shared frame, so it takes the plain prot bits like anon.
-    const lr = &lead.lazy_regions[idx];
     const new_flags = if (lr.cache_inode != 0 and !lr.cache_shared)
         vmm.cacheMapFlags(new_prot)
     else

@@ -27,10 +27,14 @@
 //!     (drivers, syscall handlers, etc.) keep reaching through the
 //!     `process.X` surface for source-stability.
 
+const std = @import("std");
 const vga = @import("../ui/vga.zig");
 const debug = @import("../debug/debug.zig");
 const smp = @import("../cpu/smp.zig");
 const memmap = @import("../mm/memmap.zig");
+const heap = @import("../mm/heap.zig");
+const shm = @import("../mm/shm.zig");
+const vma = @import("../mm/vma.zig");
 const config = @import("../config.zig");
 const signals = @import("signals.zig");
 const symbols = @import("../debug/symbols.zig");
@@ -114,7 +118,7 @@ pub fn currentIoScratch() *[4096]u8 {
 pub const State = enum(u8) {
     unused, // slot is free and may be claimed by process.create
     loading, // process.create has claimed the slot but the loader hasn't
-    // finished initializing it (page_directory, lazy_regions,
+    // finished initializing it (page_directory, regions,
     // pcb fields). pickNext MUST NOT pick a loading PCB — without
     // this gap, an AP racing process.create's `state=.ready` set
     // dispatches a half-initialized PCB with page_dir_phys=0, runs
@@ -303,26 +307,29 @@ pub const PCB = struct {
     // spell that path rather than relying on a zero default.
     cwd: [256]u8 = INIT_CWD,
     cwd_len: u8 = INIT_CWD_PATH.len,
-    // Lazy regions: VA ranges whose pages get allocated on first access via the
-    // page-fault handler. Used for: 64KB user stack (avoids upfront cost),
-    // sbrk heap (grows on demand), and demand-paged ELF segments.
-    lazy_regions: [MAX_LAZY_REGIONS]LazyRegion = [_]LazyRegion{.{}} ** MAX_LAZY_REGIONS, // (p:as_lock)
-    lazy_count: u8 = 0, // (p:as_lock)
-    /// Address-space stability lock (leader-owned, non-leader threads access via
-    /// `leader(pcb).as_lock`). Acquired by:
-    ///   - AS-mutating syscalls: sysSbrk, sysMmap, sysMmapSharedAnon, sysMunmap,
-    ///     sysMprotect (mutate lazy_regions / page directory).
-    ///   - Kernel paths that read/write user memory from a NON-current pid:
-    ///     io_uring worker's handleCompletion + executeSyncAsWorker.
-    /// Serializes the (walk → memcpy) sequence against concurrent munmap/mprotect
-    /// on another CPU, which would otherwise let the kernel write to a page after
-    /// the owner's TLB shootdown freed its backing frame. Closes the HIGH classes
-    /// reviewer flagged 2026-05-24 (concurrent munmap + COW write-fault).
-    /// Mutex semantics + sleep-aware → safe to hold across vfs.read/write.
-    as_lock: @import("spinlock.zig").Mutex = .{},
-    // Index of the lazy region tracking the heap (sbrk). -1 = no heap region
-    // has been registered yet. Allows sysSbrk to extend in place across calls.
-    heap_lazy_idx: i8 = -1, // (p:as_lock)
+    // The user address space's regions: VA ranges whose pages are allocated
+    // (or read from a file, or shared) on first touch by the page-fault
+    // handler — stack, sbrk heap, ELF segments, mmaps. Per process: threads
+    // use their lead's (`leader(pcb).regions`).
+    regions: RegionSet = .{}, // (p:as_lock)
+    /// Address-space lock (the lead's; threads go through `leader(pcb)`).
+    ///   - read side: everything that resolves a user page against `regions`
+    ///     — the page-fault handler, the kernel-side prefault and
+    ///     ensureUserRange* helpers, and the io_uring worker around its CR3
+    ///     swap + copy into the owner's memory;
+    ///   - write side: everything that edits `regions` or unmaps pages —
+    ///     sbrk, the mmap family, munmap, mprotect, fork's address-space copy.
+    /// Faults hold the read side across their I/O (swap-in, page-cache fill),
+    /// so an munmap waits for faults in flight instead of racing them into
+    /// mapping pages of a region it is removing.
+    as_lock: @import("spinlock.zig").RwMutex = .{},
+    // Start of the sbrk heap's region (0 = none yet); sysSbrk grows it in
+    // place while it still ends at user_brk.
+    heap_start: usize = 0, // (p:as_lock)
+    /// The lead pid whose as_lock this task holds or awaits from outside its
+    /// own group (the io_uring worker, copying for its owner), else
+    /// NO_FOREIGN_LOCK: tearDownTask releases that one too. Owner-pid only.
+    foreign_as_lock: u8 = NO_FOREIGN_LOCK,
     // Swap clock cursor (a user VA): reclaimViaSwap resumes its cold-page
     // eviction scan from here so it doesn't rescan already-evicted pages on
     // every fault (turns an O(n^2) linear-scan workload into O(n)).
@@ -404,10 +411,9 @@ pub const PCB = struct {
     // --- Threads (sysClone) ---------------------------------------------
     // Thread group ID = pid of the lead thread that started the process.
     // Threads spawned via sysClone copy the parent's tgid; lead-thread
-    // PCBs have tgid == self_pid. Per-process state — lazy_regions for
-    // shared mmap, fd_table, etc. — is owned by `procs[tgid]`. The page
-    // fault handler reads `procs[pcb.tgid].lazy_regions` so all threads
-    // see the same mmap'd address space.
+    // PCBs have tgid == self_pid. Per-process state — regions, fd_table,
+    // etc. — is owned by `procs[tgid]`. The page fault handler reads
+    // `procs[pcb.tgid].regions` so all threads see the same address space.
     //
     // 0xFF means "not assigned yet"; create() and clone() fill it in.
     tgid: u8 = 0xFF, // (c) set at create/clone
@@ -612,8 +618,6 @@ pub inline fn leader(pcb: *PCB) *PCB {
     return &procs[pcb.tgid];
 }
 
-pub const MAX_LAZY_REGIONS: u8 = config.MAX_LAZY_REGIONS;
-
 /// Initial value for `PCB.mmap_top`. memmap.USER_SPACE_END is u64; we narrow
 /// to usize once at the comptime boundary so the field default stays clean.
 pub const MMAP_TOP_INIT: usize = @intCast(memmap.USER_SPACE_END);
@@ -628,13 +632,19 @@ pub const PROT_EXEC: u8 = 4;
 pub const PROT_RW: u8 = PROT_READ | PROT_WRITE;
 pub const PROT_RWX: u8 = PROT_READ | PROT_WRITE | PROT_EXEC;
 
-// Per-region demand-paging descriptor. Stored inside `PCB.lazy_regions`;
-// all field reads/writes go through that array, so the access discipline
-// is `(p:as_lock)` inherited from the array's annotation.
+/// LazyRegion.flags: plain anonymous memory that may join an adjacent region
+/// with the same prot (Linux anonymous mmap). Unset, a region stays its own.
+pub const REGION_MERGEABLE: u8 = 1;
+
+/// PCB.foreign_as_lock: no lock outside the task's own group.
+pub const NO_FOREIGN_LOCK: u8 = 0xFF;
+
+// One region of a user address space — an element of `PCB.regions`, so the
+// access discipline is `(p:as_lock)` inherited from there.
 pub const LazyRegion = struct {
     start: usize = 0,
     end: usize = 0, // exclusive
-    flags: u8 = 0, // reserved for future use (RO/exec/etc.)
+    flags: u8 = 0, // REGION_*
     // Optional source for demand-paged ELF segments. If non-null, on first
     // touch the kernel copies the intersection of the new page's VA range with
     // [src_va_base, src_va_base + src_size) from `source`. Bytes outside that
@@ -679,7 +689,46 @@ pub const LazyRegion = struct {
     // (fault.zig handleCowFault) keeps a forked shared page shared rather than
     // copying it. Ignored when cache_inode == 0.
     cache_shared: bool = false,
+
+    /// A region whose pieces can't be split apart: one buffer or shm
+    /// reference backs the whole range, and the pieces would have to share
+    /// it. munmap and mprotect take such a region whole or not at all.
+    pub fn unsplittable(r: LazyRegion) bool {
+        return r.buf_owned or r.shm_id != shm.SHM_INVALID;
+    }
+
+    /// `r` from `at` on (vma.Set's split). `src_va_base` is an absolute VA,
+    /// so only the start-relative file offset moves.
+    pub fn tailFrom(r: LazyRegion, at: usize) LazyRegion {
+        std.debug.assert(!r.unsplittable() and at > r.start and at < r.end);
+        var t = r;
+        t.cache_off += at - r.start;
+        t.start = at;
+        return t;
+    }
+
+    pub fn canMerge(lo: LazyRegion, hi: LazyRegion) bool {
+        return lo.flags & REGION_MERGEABLE != 0 and hi.flags & REGION_MERGEABLE != 0 and
+            lo.prot == hi.prot and
+            lo.source == null and hi.source == null and
+            lo.cache_inode == 0 and hi.cache_inode == 0 and
+            !lo.unsplittable() and !hi.unsplittable();
+    }
 };
+
+/// Region storage on the kernel heap.
+const RegionAlloc = struct {
+    pub fn alloc(n: usize) ?[*]LazyRegion {
+        const p = heap.kmallocAligned(n * @sizeOf(LazyRegion), @alignOf(LazyRegion)) orelse return null;
+        return @ptrCast(@alignCast(p));
+    }
+    pub fn free(p: [*]LazyRegion, n: usize) void {
+        _ = n;
+        heap.kfree(@ptrCast(p));
+    }
+};
+
+pub const RegionSet = vma.Set(LazyRegion, RegionAlloc);
 
 fn initFdTable() [MAX_FDS]FileDesc {
     var table: [MAX_FDS]FileDesc = [_]FileDesc{.{}} ** MAX_FDS;
@@ -1011,7 +1060,7 @@ pub fn getCurrentPid() u32 {
 // loadBalance, setAffinity, getAffinity, assignInitialCpu, rqAudit,
 // killKickHandler, wakeOnlyHandler, initKillKickIpi, initWakeIpi,
 // kickVector, wakeVector, enterFirstTask, enterFirstTaskAp,
-// blockOn, blockOnInterruptible, blockOnFutex, blockOnMutex,
+// blockOn, blockOnInterruptible, blockOnFutex, blockOnMutex, blockOnLockSeq,
 // blockOnSwapEvict, wake, wakeMutexWaiters, wakeSwapEvictWaiters,
 // wakeExpired, deliverDueAlarms, kernelSleepMs.
 // Types: BlockResult, FutexResult.
@@ -1041,6 +1090,7 @@ pub const blockOn = @import("sched.zig").blockOn;
 pub const blockOnInterruptible = @import("sched.zig").blockOnInterruptible;
 pub const blockOnFutex = @import("sched.zig").blockOnFutex;
 pub const blockOnMutex = @import("sched.zig").blockOnMutex;
+pub const blockOnLockSeq = @import("sched.zig").blockOnLockSeq;
 pub const blockOnSwapEvict = @import("sched.zig").blockOnSwapEvict;
 pub const wake = @import("sched.zig").wake;
 pub const wakeMutexWaiters = @import("sched.zig").wakeMutexWaiters;
@@ -1086,13 +1136,14 @@ pub const findZombieChild = @import("lifecycle.zig").findZombieChild;
 // tearDownTask, freeElfBuf) live only in lifecycle.zig — no re-export.
 
 // --- Page fault + lazy regions + swap-in — moved to fault.zig (#810) ---
+pub const addRegion = @import("fault.zig").addRegion;
 pub const addLazyRegion = @import("fault.zig").addLazyRegion;
 pub const addLazyRegionWithSource = @import("fault.zig").addLazyRegionWithSource;
 pub const ensureUserRangeWritable = @import("fault.zig").ensureUserRangeWritable;
+pub const ensureSignalFrameWritable = @import("fault.zig").ensureSignalFrameWritable;
 pub const ensureUserRangeWritableFor = @import("fault.zig").ensureUserRangeWritableFor;
 pub const handleUserPageFault = @import("fault.zig").handleUserPageFault;
 pub const prefaultUserRange = @import("fault.zig").prefaultUserRange;
-pub const allCurrentUserPagesMapped = @import("fault.zig").allCurrentUserPagesMapped;
 
 
 pub fn setName(pid: u8, name: []const u8) void {

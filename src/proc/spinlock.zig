@@ -1043,6 +1043,217 @@ pub const Mutex = struct {
     }
 };
 
+// =============================================================================
+// RwMutex — sleep-aware readers-writer lock: any number of readers, or one
+// writer. Holders are pids, as with Mutex, and contention sleeps
+// (blockOnLockSeq) instead of spinning.
+//
+// When to use RwMutex (not Mutex): state that many tasks read at once on a
+// hot path and that is edited rarely — a process's address-space map
+// (PCB.as_lock), which every page fault of every thread reads and mmap,
+// munmap and mprotect edit.
+//
+// Writer preference: a waiting writer holds new readers off, so a stream of
+// faults can't starve an munmap. A holder therefore must not take the lock
+// again in either mode (a writer queued between a reader's two acquires
+// would deadlock both); every acquire panics on that.
+//
+// Holders and waiters are pid bits, so tearDownTask gives back whatever a
+// dying task held or waited for (dropPid).
+//
+// Wake policy: every release bumps `seq`; if anyone sleeps it wakes all
+// sleepers (thundering herd, as Mutex) and each re-checks under `guard`.
+// =============================================================================
+
+comptime {
+    if (process.MAX_PROCS > 64) @compileError("RwMutex keeps one bit per pid in a u64");
+}
+
+pub const RwMutex = struct {
+    /// Guards every field below but `seq` and `holder_ra`. Held for a few
+    /// instructions with IRQs off, so tryAcquireRead works from an interrupt.
+    guard: SpinLock = .{},
+    /// (p:guard) Bit per pid holding the read side.
+    readers: u64 = 0,
+    /// (p:guard) Pid holding the write side, or NO_OWNER.
+    writer: u16 = NO_OWNER,
+    /// (p:guard) Bit per pid waiting for the write side. Any bit holds new
+    /// readers off.
+    writers_waiting: u64 = 0,
+    /// (p:guard) Bit per pid asleep in an acquire. A release with none set
+    /// skips the wake walk.
+    sleepers: u64 = 0,
+    /// Bumped by every release, under guard, with an atomic RMW: its full
+    /// barrier orders the bump before the release's scan of waiter states,
+    /// against the waiter's setState-then-reload in blockOnLockSeq.
+    seq: u32 = 0,
+    /// Where the current or last writer acquired the lock, for autopsies.
+    holder_ra: u64 = 0,
+
+    const Mode = enum { read, write };
+
+    fn waitId(self: *const RwMutex) u32 {
+        return @truncate(@intFromPtr(&self.seq));
+    }
+
+    fn pidBit(pid: usize) u64 {
+        return @as(u64, 1) << @intCast(pid);
+    }
+
+    fn currentPid(comptime what: []const u8) usize {
+        return smp.myCpu().current_pid orelse @panic("RwMutex." ++ what ++ " outside a task");
+    }
+
+    /// Under guard: panic if `pid` already holds the lock.
+    fn checkNotHeld(self: *RwMutex, pid: usize, flags: u64) void {
+        const reading = self.readers & pidBit(pid) != 0;
+        if (!reading and self.writer != pid) return;
+        self.guard.releaseIrqRestore(flags);
+        serial.print("\n!!! RwMutex@0x{X} re-acquired by pid={d}, which holds the {s} side\n", .{
+            @intFromPtr(self), pid, if (reading) "read" else "write",
+        });
+        @panic("RwMutex re-acquired by a holder — deadlocks behind a waiting writer");
+    }
+
+    /// Under guard: advance seq; true when a sleeper must be woken.
+    fn bumpLocked(self: *RwMutex) bool {
+        _ = @atomicRmw(u32, &self.seq, .Add, 1, .seq_cst);
+        return self.sleepers != 0;
+    }
+
+    /// Take the read side, sleeping while a writer holds or waits for the
+    /// lock. Task context, IRQs on, no spinlock held. Panics if this task
+    /// already holds the lock.
+    pub fn acquireRead(self: *RwMutex) void {
+        const pid = currentPid("acquireRead");
+        const bit = pidBit(pid);
+        mightSleep(@src());
+        while (true) {
+            const f = self.guard.acquireIrqSave();
+            self.sleepers &= ~bit;
+            self.checkNotHeld(pid, f);
+            if (self.writer == NO_OWNER and self.writers_waiting == 0) {
+                self.readers |= bit;
+                self.guard.releaseIrqRestore(f);
+                return;
+            }
+            self.sleepers |= bit;
+            const seen = self.seq;
+            self.guard.releaseIrqRestore(f);
+            process.blockOnLockSeq(self.waitId(), &self.seq, seen);
+        }
+    }
+
+    /// Take the read side if that needs no wait. Any context, interrupts
+    /// included (signal delivery on IRQ return). False if a writer holds or
+    /// waits, or this task already holds the lock.
+    pub fn tryAcquireRead(self: *RwMutex) bool {
+        const pid = currentPid("tryAcquireRead");
+        const bit = pidBit(pid);
+        const f = self.guard.acquireIrqSave();
+        defer self.guard.releaseIrqRestore(f);
+        if (self.readers & bit != 0 or self.writer == pid) return false;
+        if (self.writer != NO_OWNER or self.writers_waiting != 0) return false;
+        self.readers |= bit;
+        return true;
+    }
+
+    /// Give back the read side this task holds; same context as the acquire.
+    pub fn releaseRead(self: *RwMutex) void {
+        self.drop(currentPid("releaseRead"), .read);
+    }
+
+    /// Take the write side, sleeping until nobody holds the lock. Task
+    /// context, IRQs on, no spinlock held. Panics if this task already holds
+    /// the lock.
+    pub fn acquire(self: *RwMutex) void {
+        const ra = @returnAddress();
+        const pid = currentPid("acquire");
+        const bit = pidBit(pid);
+        mightSleep(@src());
+        while (true) {
+            const f = self.guard.acquireIrqSave();
+            self.sleepers &= ~bit;
+            self.checkNotHeld(pid, f);
+            if (self.writer == NO_OWNER and self.readers == 0) {
+                self.writer = @intCast(pid);
+                self.writers_waiting &= ~bit;
+                self.holder_ra = ra;
+                self.guard.releaseIrqRestore(f);
+                return;
+            }
+            self.writers_waiting |= bit;
+            self.sleepers |= bit;
+            const seen = self.seq;
+            self.guard.releaseIrqRestore(f);
+            process.blockOnLockSeq(self.waitId(), &self.seq, seen);
+        }
+    }
+
+    /// Give back the write side this task holds.
+    pub fn release(self: *RwMutex) void {
+        self.drop(currentPid("release"), .write);
+    }
+
+    fn drop(self: *RwMutex, pid: usize, comptime mode: Mode) void {
+        const bit = pidBit(pid);
+        const f = self.guard.acquireIrqSave();
+        const held = switch (mode) {
+            .read => self.readers & bit != 0,
+            .write => self.writer == pid,
+        };
+        if (!held) {
+            self.guard.releaseIrqRestore(f);
+            serial.print("\n!!! RwMutex@0x{X} {s} side released by pid={d}, which doesn't hold it\n", .{
+                @intFromPtr(self), @tagName(mode), pid,
+            });
+            @panic("RwMutex released by a non-holder");
+        }
+        switch (mode) {
+            .read => self.readers &= ~bit,
+            .write => self.writer = NO_OWNER,
+        }
+        const wake = self.bumpLocked();
+        self.guard.releaseIrqRestore(f);
+        if (wake) process.wakeMutexWaiters(self.waitId());
+    }
+
+    /// True if the calling task holds the lock in `mode` (either mode if
+    /// null). For code that requires the lock to assert it.
+    pub fn heldByCurrent(self: *RwMutex, mode: ?Mode) bool {
+        const pid = smp.myCpu().current_pid orelse return false;
+        const f = self.guard.acquireIrqSave();
+        defer self.guard.releaseIrqRestore(f);
+        const reading = self.readers & pidBit(pid) != 0;
+        const writing = self.writer == pid;
+        return if (mode) |m| switch (m) {
+            .read => reading,
+            .write => writing,
+        } else reading or writing;
+    }
+
+    /// Give back whatever `pid` holds and forget that it waits. tearDownTask
+    /// calls this on the group's lock for every dying task, so a task killed
+    /// while it held or waited can't wedge the rest of its group. True if
+    /// `pid` held or waited.
+    pub fn dropPid(self: *RwMutex, pid: usize) bool {
+        if (pid >= process.MAX_PROCS) return false;
+        const bit = pidBit(pid);
+        const f = self.guard.acquireIrqSave();
+        const had = (self.readers | self.writers_waiting | self.sleepers) & bit != 0 or self.writer == pid;
+        self.readers &= ~bit;
+        self.writers_waiting &= ~bit;
+        self.sleepers &= ~bit;
+        if (self.writer == pid) self.writer = NO_OWNER;
+        // Wake sleepers even when `pid` held nothing: it may have died
+        // between a release's guard drop and that release's wake.
+        const wake = (had or self.sleepers != 0) and self.bumpLocked();
+        self.guard.releaseIrqRestore(f);
+        if (wake) process.wakeMutexWaiters(self.waitId());
+        return had;
+    }
+};
+
 /// Walk every registered Mutex and force-release any owned by `pid`.
 /// Called from `tearDownTask` so a dying pid never strands a named lock.
 /// O(named_lock_count) — small fixed bound, runs once per teardown.

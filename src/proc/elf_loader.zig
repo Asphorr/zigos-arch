@@ -164,7 +164,6 @@ fn segProt(p_flags: u32) u8 {
 /// to retain it or free it after symbol parsing), or null if a region couldn't
 /// be registered or a segment's VA is out of user range (caller kills the proc).
 fn registerSegments(pid: usize, elf_buf: [*]const u8, phoff: usize, phnum: u16, inode: u32) ?bool {
-    const pcb = process.getPCB(pid);
     const phdrs: [*]align(1) const ProgramHeader = @ptrCast(elf_buf + phoff);
     var needs_elf_buf = false;
     var n_cache: u32 = 0;
@@ -197,11 +196,13 @@ fn registerSegments(pid: usize, elf_buf: [*]const u8, phoff: usize, phnum: u16, 
             // with vaddr & ~0xFFF). Maps RO, executable iff PF_X; a write
             // COW-diverges (the cache's own ref keeps refcount>=2, so the shared
             // frame is copied, never stolen).
-            if (!process.addLazyRegion(pid, seg_start, seg_end, 0)) return null;
-            const ridx = pcb.lazy_count - 1;
-            pcb.lazy_regions[ridx].cache_inode = inode;
-            pcb.lazy_regions[ridx].cache_off = p_offset & ~@as(usize, PAGE_SIZE - 1);
-            pcb.lazy_regions[ridx].prot = segProt(p_flags);
+            if (!process.addRegion(pid, .{
+                .start = seg_start,
+                .end = seg_end,
+                .cache_inode = inode,
+                .cache_off = p_offset & ~@as(usize, PAGE_SIZE - 1),
+                .prot = segProt(p_flags),
+            })) return null;
             n_cache += 1;
         } else {
             // RW initialized data (+maybe a BSS tail), or a non-qualifying RO

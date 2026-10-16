@@ -395,6 +395,13 @@ fn clearPending(pcb: *process.PCB, signo: u32) void {
     _ = @atomicRmw(u32, &pcb.pending_signals, .And, ~(@as(u32, 1) << @intCast(signo)), .seq_cst);
 }
 
+/// Put a picked signal back: its handler frame couldn't be written yet (the
+/// address-space lock was busy and this path can't sleep for it), so the
+/// next return to user delivers it.
+fn repend(pcb: *process.PCB, signo: u32) void {
+    _ = @atomicRmw(u32, &pcb.pending_signals, .Or, @as(u32, 1) << @intCast(signo), .seq_cst);
+}
+
 // =============================================================================
 // Job control (POSIX stop/cont)
 // =============================================================================
@@ -630,9 +637,16 @@ pub fn deliverFromSyscallFrame(pcb: *process.PCB, frame: *SyscallFrame, retval: 
         //     spanning into a lower stack page not yet lazily mapped.)
         //  2. Bracket the writes — mctx, writeSiginfo, RA, and the mctx.rflags
         //     read-back below — with stac/clac so SMAP permits kernel access.
-        if (!process.ensureUserRangeWritable(layout.ra_va, old_user_rsp - layout.ra_va)) {
-            process.destroyCurrentWithStatus(0xDEAD0000 | sig);
-            return retval;
+        switch (process.ensureSignalFrameWritable(layout.ra_va, old_user_rsp - layout.ra_va)) {
+            .ok => {},
+            .busy => {
+                repend(pcb, sig);
+                return retval;
+            },
+            .fault => {
+                process.destroyCurrentWithStatus(0xDEAD0000 | sig);
+                return retval;
+            },
         }
         protect.allowUserAccess();
         const mctx_ptr: *MContext = @ptrFromInt(layout.mctx_va);
@@ -714,9 +728,16 @@ pub fn deliverFromIrqFrame(pcb: *process.PCB, frame: *IrqFrame) void {
 
         // SMAP: pre-resolve frame pages (no-fault lazy/COW) + bracket the
         // direct user-stack frame writes. See deliverFromSyscallFrame.
-        if (!process.ensureUserRangeWritable(layout.ra_va, old_user_rsp - layout.ra_va)) {
-            process.destroyCurrentWithStatus(0xDEAD0000 | sig);
-            return;
+        switch (process.ensureSignalFrameWritable(layout.ra_va, old_user_rsp - layout.ra_va)) {
+            .ok => {},
+            .busy => {
+                repend(pcb, sig);
+                return;
+            },
+            .fault => {
+                process.destroyCurrentWithStatus(0xDEAD0000 | sig);
+                return;
+            },
         }
         protect.allowUserAccess();
         const mctx_ptr: *MContext = @ptrFromInt(layout.mctx_va);
@@ -802,9 +823,20 @@ pub fn deliverFromExcFrame(pcb: *process.PCB, frame: *ExcFrame, signo: u32, faul
 
     // SMAP: pre-resolve frame pages (no-fault lazy/COW) + bracket the direct
     // user-stack frame writes. See deliverFromSyscallFrame.
-    if (!process.ensureUserRangeWritable(layout.ra_va, old_user_rsp - layout.ra_va)) {
-        process.destroyCurrentWithStatus(0xDEAD0000 | signo);
-        return false;
+    switch (process.ensureSignalFrameWritable(layout.ra_va, old_user_rsp - layout.ra_va)) {
+        .ok => {},
+        // Lock busy: return to the faulting instruction unchanged. It faults
+        // again and this delivery retries; a fault's signal must not be left
+        // pending to land after the instruction instead. SIGTRAP comes from
+        // traps, which resume past the instruction: that one does wait.
+        .busy => {
+            if (signo == SIGTRAP) repend(pcb, signo);
+            return true;
+        },
+        .fault => {
+            process.destroyCurrentWithStatus(0xDEAD0000 | signo);
+            return false;
+        },
     }
     protect.allowUserAccess();
     const mctx_ptr: *MContext = @ptrFromInt(layout.mctx_va);

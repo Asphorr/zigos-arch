@@ -3155,6 +3155,28 @@ pub fn blockOnMutex(target_id: u32, owner_pid_ptr: *const u16) void {
     clearWait(pcb);
 }
 
+/// Compare-and-sleep for RwMutex: sleep as a .mutex waiter on `target_id`
+/// until `*seq` moves off `seen` (every release bumps it, then wakes the
+/// target's waiters). Same enroll-then-recheck as blockOnMutex: setState's
+/// locked CAS orders the enrollment before the reload, the releaser's
+/// locked bump orders its store before its waiter scan, so either we see
+/// the new seq or the releaser sees us asleep.
+pub fn blockOnLockSeq(target_id: u32, seq: *const u32, seen: u32) void {
+    const cur = smp.myCpu().current_pid orelse return;
+    const pcb = &process.procs[cur];
+    spinlock.mightSleep(@src());
+    if (@atomicRmw(bool, &pcb.wake_pending, .Xchg, false, .acq_rel)) return;
+    setWait(pcb, .mutex, target_id);
+    setState(cur, .sleeping);
+    if (@atomicLoad(u32, seq, .acquire) != seen or @atomicLoad(bool, &pcb.wake_pending, .acquire)) {
+        clearWait(pcb);
+        setState(cur, .running);
+        return;
+    }
+    @import("sched_asm.zig").softYield();
+    clearWait(pcb);
+}
+
 /// Wake every .sleeping PCB enrolled on exactly (kind, target). Shared
 /// body of the four wake-fan-out entry points below — the state filter +
 /// waitsOn + wake() triple was copy-pasted four times and had begun to

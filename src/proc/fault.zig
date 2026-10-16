@@ -21,20 +21,24 @@ const smp = @import("../cpu/smp.zig");
 const process = @import("process.zig");
 const PCB = process.PCB;
 const MAX_PROCS = process.MAX_PROCS;
-const MAX_LAZY_REGIONS = process.MAX_LAZY_REGIONS;
 const leader = process.leader;
 
-/// Register a lazy region — pages in [start, end) get allocated on first
-/// touch via the page-fault handler. Returns false if the table is full or
-/// the bounds are invalid. Pages still allocate-and-zero on miss; this just
-/// avoids paying for them upfront.
-pub fn addLazyRegion(pid: usize, start: usize, end: usize, flags: u8) bool {
-    if (end <= start) return false;
-    const pcb = &process.procs[pid];
-    if (pcb.lazy_count >= MAX_LAZY_REGIONS) return false;
-    pcb.lazy_regions[pcb.lazy_count] = .{ .start = start, .end = end, .flags = flags };
-    pcb.lazy_count += 1;
+/// Add `r` to `pid`'s regions. The caller holds that process's as_lock
+/// write side, or the process isn't running yet (the loader). False if `r`
+/// is empty, overlaps a region, or there's no memory for the set — logged.
+pub fn addRegion(pid: usize, r: process.LazyRegion) bool {
+    if (r.end <= r.start) return false;
+    process.procs[pid].regions.insert(r) catch |e| {
+        debug.klog("[vma] pid={d} can't add region 0x{X}..0x{X}: {s}\n", .{ pid, r.start, r.end, @errorName(e) });
+        return false;
+    };
     return true;
+}
+
+/// Register a lazy region — pages in [start, end) get allocated on first
+/// touch via the page-fault handler. Same contract as addRegion.
+pub fn addLazyRegion(pid: usize, start: usize, end: usize, flags: u8) bool {
+    return addRegion(pid, .{ .start = start, .end = end, .flags = flags });
 }
 
 /// Register a lazy region backed by a kernel buffer (used for demand-paged
@@ -53,10 +57,7 @@ pub fn addLazyRegionWithSource(
     src_size: usize,
     src_offset: usize,
 ) bool {
-    if (end <= start) return false;
-    const pcb = &process.procs[pid];
-    if (pcb.lazy_count >= MAX_LAZY_REGIONS) return false;
-    pcb.lazy_regions[pcb.lazy_count] = .{
+    return addRegion(pid, .{
         .start = start,
         .end = end,
         .flags = flags,
@@ -64,9 +65,7 @@ pub fn addLazyRegionWithSource(
         .src_va_base = src_va_base,
         .src_size = src_size,
         .src_offset = src_offset,
-    };
-    pcb.lazy_count += 1;
-    return true;
+    });
 }
 
 /// What a fresh page of `r` at `page` starts with: the intersection of the
@@ -150,35 +149,31 @@ fn handleCowFault(pml4: [*]align(4096) u64, lead: *PCB, cr2: usize) bool {
     // frame stays mapped at the same phys in every AS, preserving MAP_SHARED
     // semantics. (cloneAddressSpace's acquireFrame already balanced the child's
     // inherited reference, so teardown stays leak-free.)
-    {
+    if (lead.regions.find(va_aligned)) |rp| shared: {
         const shm = @import("../mm/shm.zig");
         const page_cache = @import("../mm/page_cache.zig");
-        var i: u8 = 0;
-        while (i < lead.lazy_count) : (i += 1) {
-            const r = lead.lazy_regions[i];
-            const is_shared_anon = r.shm_id != shm.SHM_INVALID;
-            const is_shared_file = r.cache_inode != 0 and r.cache_shared;
-            if (!is_shared_anon and !is_shared_file) continue;
-            if (va_aligned < r.start or va_aligned >= r.end) continue;
-            // CAS — a peer thread of this AS can resolve the same fault
-            // between our PTE read and this write. Loser returns resolved:
-            // the winner's transition stands (and did the markDirty below);
-            // if anything is still wrong the retried instruction re-faults.
-            if (@cmpxchgStrong(u64, pte_p, pte, pte_mod.cowPromote(pte), .seq_cst, .seq_cst) != null) {
-                return true;
-            }
-            asm volatile ("invlpg (%[addr])"
-                :
-                : [addr] "r" (va_aligned),
-                : .{ .memory = true }
-            );
-            // A shared FILE page just made writable is now (potentially) modified —
-            // flag it dirty so the next msync/munmap writes it back to disk.
-            if (is_shared_file) {
-                page_cache.markDirty(page_cache.ext2FileId(r.cache_inode), r.cache_off + (va_aligned - r.start));
-            }
+        const r = rp.*;
+        const is_shared_anon = r.shm_id != shm.SHM_INVALID;
+        const is_shared_file = r.cache_inode != 0 and r.cache_shared;
+        if (!is_shared_anon and !is_shared_file) break :shared;
+        // CAS — a peer thread of this AS can resolve the same fault
+        // between our PTE read and this write. Loser returns resolved:
+        // the winner's transition stands (and did the markDirty below);
+        // if anything is still wrong the retried instruction re-faults.
+        if (@cmpxchgStrong(u64, pte_p, pte, pte_mod.cowPromote(pte), .seq_cst, .seq_cst) != null) {
             return true;
         }
+        asm volatile ("invlpg (%[addr])"
+            :
+            : [addr] "r" (va_aligned),
+            : .{ .memory = true }
+        );
+        // A shared FILE page just made writable is now (potentially) modified —
+        // flag it dirty so the next msync/munmap writes it back to disk.
+        if (is_shared_file) {
+            page_cache.markDirty(page_cache.ext2FileId(r.cache_inode), r.cache_off + (va_aligned - r.start));
+        }
+        return true;
     }
 
     const old_phys = Phys.of(pte & paging.PAGE_MASK);
@@ -377,12 +372,47 @@ fn tryMapCachedPage(pd: [*]align(4096) u64, r: process.LazyRegion, va_aligned: u
 /// Adds an explicit invlpg after a fresh map: mapUserPage only flushes on the
 /// remap path (the fault path relies on the faulting instruction's re-walk,
 /// which a proactive caller doesn't have).
+///
+/// Task context with interrupts on: takes the read side of the address-space
+/// lock, so the caller must not hold it. Signal delivery, which may run with
+/// interrupts off, uses ensureSignalFrameWritable.
 pub fn ensureUserRangeWritable(va: usize, len: usize) bool {
     if (len == 0) return true;
     const cur = smp.myCpu().current_pid orelse return false;
-    // Body lives in ensureUserRangeFor — this was a ~55-line verbatim copy
-    // of its need_write=true path that had already begun to age separately.
+    const lead = leader(&process.procs[cur]);
+    lead.as_lock.acquireRead();
+    defer lead.as_lock.releaseRead();
     return ensureUserRangeFor(&process.procs[cur], va, len, true);
+}
+
+pub const FrameWrite = enum { ok, fault, busy };
+
+/// ensureUserRangeWritable for a signal frame. Delivery runs on IRQ return,
+/// at syscall exit and from ring-3 exceptions, some with interrupts off, so
+/// it can't sleep for the lock: with interrupts off it only takes a free
+/// read side and answers `.busy` otherwise — the caller leaves the signal
+/// pending for the next return to user. `.fault`: the pages can't be made
+/// writable (no region, read-only, out of memory).
+/// ctx: irq-ok — sleeps for the lock only with interrupts on; masked, it try-takes it.
+pub fn ensureSignalFrameWritable(va: usize, len: usize) FrameWrite {
+    if (len == 0) return .ok;
+    const cur = smp.myCpu().current_pid orelse return .fault;
+    const lead = leader(&process.procs[cur]);
+    if (interruptsEnabled()) {
+        lead.as_lock.acquireRead();
+    } else if (!lead.as_lock.tryAcquireRead()) {
+        return .busy;
+    }
+    defer lead.as_lock.releaseRead();
+    return if (ensureUserRangeFor(&process.procs[cur], va, len, true)) .ok else .fault;
+}
+
+fn interruptsEnabled() bool {
+    var flags: u64 = undefined;
+    asm volatile ("pushfq; pop %[f]"
+        : [f] "=r" (flags),
+    );
+    return flags & 0x200 != 0;
 }
 
 /// Free up to `want` physical frames by evicting cold, present, non-COW pages
@@ -392,7 +422,7 @@ pub fn ensureUserRangeWritable(va: usize, len: usize) bool {
 /// Skips `skip_va` (the page currently being faulted in). Returns frames freed;
 /// no-op if swap is unavailable.
 fn reclaimViaSwap(pml4: [*]align(4096) u64, lead: *PCB, skip_va: usize, pcid: u16, want: usize) usize {
-    if (!swap.available or lead.lazy_count == 0) return 0;
+    if (!swap.available or lead.regions.len == 0) return 0;
     const paging = @import("../mm/paging.zig");
     var freed: usize = 0;
     var iters: usize = 0;
@@ -402,8 +432,8 @@ fn reclaimViaSwap(pml4: [*]align(4096) u64, lead: *PCB, skip_va: usize, pcid: u1
     const trace_pid: u32 = if (smp.myCpu().current_pid) |p| @intCast(p) else 0xFF;
     const rtrace = trace_pid >= 4;
     const trace_cpu = smp.myCpu().cpu_id;
-    if (rtrace) debug.klog("[mtswap-trace] pid={d} cpu{d} reclaim_loop_enter va=0x{X} lazy_count={d}\n", .{
-        trace_pid, trace_cpu, lead.swap_clock_va, lead.lazy_count,
+    if (rtrace) debug.klog("[mtswap-trace] pid={d} cpu{d} reclaim_loop_enter va=0x{X} regions={d}\n", .{
+        trace_pid, trace_cpu, lead.swap_clock_va, lead.regions.len,
     });
     // Second-chance (clock) aging: a recently-accessed page gets its A bit
     // cleared and is skipped this sweep rather than evicted. skip_budget bounds
@@ -424,42 +454,17 @@ fn reclaimViaSwap(pml4: [*]align(4096) u64, lead: *PCB, skip_va: usize, pcid: u1
         // eviction is transparent to syscalls and the restriction is lifted.
         // (Later optimization: DISCARD clean file-backed pages rather than
         // writing them to swap; they re-read from `source` for free.)
-        var in_region = false;
-        var region_has_source = false;
-        var region_is_cache = false;
-        var k: u8 = 0;
-        while (k < lead.lazy_count) : (k += 1) {
-            const r = lead.lazy_regions[k];
-            if (r.end > r.start and va >= r.start and va < r.end) {
-                in_region = true;
-                region_has_source = r.source != null;
-                region_is_cache = r.cache_inode != 0;
-                break;
-            }
-        }
-        if (!in_region) {
-            // Jump to the next region start above va, else wrap to the lowest.
-            var next_start: usize = 0;
-            var found = false;
-            var lo: usize = 0;
-            var any = false;
-            var j: u8 = 0;
-            while (j < lead.lazy_count) : (j += 1) {
-                const r = lead.lazy_regions[j];
-                if (r.end <= r.start) continue;
-                if (!any or r.start < lo) {
-                    lo = r.start;
-                    any = true;
-                }
-                if (r.start > va and (!found or r.start < next_start)) {
-                    next_start = r.start;
-                    found = true;
-                }
-            }
-            if (!any) break; // no non-empty regions
-            va = if (found) next_start else lo;
+        // Outside every region: jump to the next one up, else wrap to the lowest.
+        const r = lead.regions.atOrAbove(va) orelse {
+            va = lead.regions.slice()[0].start;
+            continue;
+        };
+        if (va < r.start) {
+            va = r.start;
             continue;
         }
+        const region_has_source = r.source != null;
+        const region_is_cache = r.cache_inode != 0;
         // Cache-backed pages (ext2 file mmap, Slice 2/3) are NEVER swapped. A
         // private (RO+COW) page is clean + re-faultable from the page cache; a
         // SHARED (RW, Slice 3c) page MUST keep pointing at the shared cache frame
@@ -649,18 +654,41 @@ pub fn handleUserPageFault(cr2: usize, error_code: u64) bool {
     // an unmapped address" wouldn't show up.
     pcb.acct_pf_count +%= 1;
     const pd = pcb.page_directory orelse return false;
-    // Lazy regions live on the lead thread (per-process resource). For
+    // Regions live on the lead thread (per-process resource). For
     // single-threaded processes this aliases pcb itself; for cloned
     // threads we read the parent's regions so mmap'd VAs are visible.
     const lead = leader(pcb);
 
+    // The read side covers the whole resolution, I/O included: an munmap
+    // (write side) waits for this fault instead of removing the region under
+    // it and leaving the page this fault maps behind.
+    lead.as_lock.acquireRead();
+    const result = resolveFault(cur, pcb, pd, lead, cr2, error_code);
+    lead.as_lock.releaseRead();
+    switch (result) {
+        .handled => return true,
+        .unhandled => return false,
+        .oom_kill => {
+            // Logged by resolveFault. The lock is back first: the group's
+            // other threads must be able to take it while this one dies.
+            process.destroyCurrent();
+            process.schedule();
+            unreachable;
+        },
+    }
+}
+
+const FaultResult = enum { handled, unhandled, oom_kill };
+
+/// handleUserPageFault's body, under the read side of `lead.as_lock`.
+fn resolveFault(cur: usize, pcb: *PCB, pd: [*]align(4096) u64, lead: *PCB, cr2: usize, error_code: u64) FaultResult {
     // COW path: write fault on a present user page (P=1, W=1, U=1). Walk the
     // PT and dispatch handleCowFault if the PTE has the COW software bit set.
     // Lazy-region faults are P=0 (non-present); COW faults are P=1 and W=1.
     if ((error_code & 0x3) == 0x3) {
         if (handleCowFault(pd, lead, cr2)) {
             @import("../debug/kdbg.zig").pfEvent(@intCast(cur), cr2, @truncate(error_code), 0, true);
-            return true;
+            return .handled;
         }
         // handleCowFault declined (no COW bit; the shm hatch didn't apply). If
         // the page is PRESENT and read-only, this is a genuine write-to-RO
@@ -675,7 +703,7 @@ pub fn handleUserPageFault(cr2: usize, error_code: u64) bool {
         const paging = @import("../mm/paging.zig");
         if (findUserPte(pd, cr2 & ~@as(usize, 0xFFF))) |pte_ptr| {
             const pte = pte_ptr.*;
-            if ((pte & paging.PRESENT) != 0 and (pte & paging.READ_WRITE) == 0) return false;
+            if ((pte & paging.PRESENT) != 0 and (pte & paging.READ_WRITE) == 0) return .unhandled;
             // Already writable: a stale read-only entry, left on this CPU when
             // a peer thread promoted the page (promotes flush locally only).
             // The fault itself drops the entry; the invlpg backs that up under
@@ -691,391 +719,352 @@ pub fn handleUserPageFault(cr2: usize, error_code: u64) bool {
                     : .{ .memory = true }
                 );
                 @import("../debug/kdbg.zig").pfEvent(@intCast(cur), cr2, @truncate(error_code), 0, true);
-                return true;
+                return .handled;
             }
         }
     }
 
-    var i: u8 = 0;
-    while (i < lead.lazy_count) : (i += 1) {
-        const r = lead.lazy_regions[i];
-        if (cr2 < r.start or cr2 >= r.end) continue;
-        const va_aligned = cr2 & ~@as(usize, 0xFFF);
+    const r = (lead.regions.find(cr2) orelse {
+        logFaultMiss(cur, lead, cr2, error_code);
+        return .unhandled;
+    }).*;
+    const va_aligned = cr2 & ~@as(usize, 0xFFF);
 
-        // Shared-anon: no swap, no fresh alloc — the shm registry owns the
-        // frame; refcounts move in forkCurrent/munmap/tearDown.
-        const shm = @import("../mm/shm.zig");
-        if (r.shm_id != shm.SHM_INVALID) {
-            if (!mapShmPage(pd, r, va_aligned)) return false;
+    // Shared-anon: no swap, no fresh alloc — the shm registry owns the
+    // frame; refcounts move in forkCurrent/munmap/tearDown.
+    const shm = @import("../mm/shm.zig");
+    if (r.shm_id != shm.SHM_INVALID) {
+        if (!mapShmPage(pd, r, va_aligned)) return .unhandled;
+        @import("../debug/kdbg.zig").pfEvent(@intCast(cur), cr2, @truncate(error_code), 0, true);
+        return .handled;
+    }
+
+    // File-backed-via-cache shortcut (ext2 mmap): serve this page from the
+    // unified page cache — shared across mappers, demand-filled; private
+    // mappings are COW-on-write, shared (Slice 3c) are writable. Placed BEFORE
+    // swap-in because reclaimViaSwap explicitly skips cache-backed regions
+    // (region_is_cache) — private RO+COW pages would also be filtered by its
+    // COW gate, but shared pages are RW with no COW bit, so the region skip is
+    // what guarantees a cache page is never a swap entry.
+    if (r.cache_inode != 0) {
+        if (faultInCachePage(pd, r, va_aligned)) {
             @import("../debug/kdbg.zig").pfEvent(@intCast(cur), cr2, @truncate(error_code), 0, true);
-            return true;
+            lead.acct_current_rss +%= 1;
+            if (lead.acct_current_rss > lead.acct_peak_rss) lead.acct_peak_rss = lead.acct_current_rss;
+            return .handled;
         }
+        // Fill/map failed (OOM or ext2 I/O). Neither swap-in nor zero-alloc
+        // applies to a file page, so go straight to the lightweight OOM-kill
+        // (mirrors the frame_opt==null path below — no heavy autopsy under
+        // memory pressure: a fat32 crash-log write would re-enter the
+        // allocator and the long dump would stall the compositor).
+        @import("../debug/kdbg.zig").pfEvent(@intCast(cur), cr2, @truncate(error_code), 0, false);
+        debug.klog("[oom] cache-mmap fill failed pid={d} '{s}' va=0x{X} inode={d} — killing\n", .{
+            cur, pcb.name[0..@min(pcb.name_len, pcb.name.len)], va_aligned, r.cache_inode,
+        });
+        const desktop = @import("../ui/desktop.zig");
+        if (desktop.active) desktop.showNotification("App killed: out of memory");
+        return .oom_kill;
+    }
 
-        // File-backed-via-cache shortcut (ext2 mmap): serve this page from the
-        // unified page cache — shared across mappers, demand-filled; private
-        // mappings are COW-on-write, shared (Slice 3c) are writable. Placed BEFORE
-        // swap-in because reclaimViaSwap explicitly skips cache-backed regions
-        // (region_is_cache) — private RO+COW pages would also be filtered by its
-        // COW gate, but shared pages are RW with no COW bit, so the region skip is
-        // what guarantees a cache page is never a swap entry.
-        if (r.cache_inode != 0) {
-            if (faultInCachePage(pd, r, va_aligned)) {
-                @import("../debug/kdbg.zig").pfEvent(@intCast(cur), cr2, @truncate(error_code), 0, true);
-                lead.acct_current_rss +%= 1;
-                if (lead.acct_current_rss > lead.acct_peak_rss) lead.acct_peak_rss = lead.acct_current_rss;
-                return true;
-            }
-            // Fill/map failed (OOM or ext2 I/O). Neither swap-in nor zero-alloc
-            // applies to a file page, so go straight to the lightweight OOM-kill
-            // (mirrors the frame_opt==null path below — no heavy autopsy under
-            // memory pressure: a fat32 crash-log write would re-enter the
-            // allocator and the long dump would stall the compositor).
-            @import("../debug/kdbg.zig").pfEvent(@intCast(cur), cr2, @truncate(error_code), 0, false);
-            debug.klog("[oom] cache-mmap fill failed pid={d} '{s}' va=0x{X} inode={d} — killing\n", .{
-                cur, pcb.name[0..@min(pcb.name_len, pcb.name.len)], va_aligned, r.cache_inode,
-            });
-            const desktop = @import("../ui/desktop.zig");
-            if (desktop.active) desktop.showNotification("App killed: out of memory");
-            process.destroyCurrent();
-            process.schedule();
-            unreachable;
-        }
+    // Swap-in: if this VA was evicted to swap, page it back in instead of
+    // fresh-allocating a zero page (which would discard its contents and
+    // leak the swap slot). The region still exists; only the physical
+    // frame was reclaimed. swap_failed => genuine OOM swapping in; skip the
+    // fresh-alloc and fall through to the OOM-kill.
+    var swap_failed = false;
+    switch (trySwapInPage(pd, lead, va_aligned, r.prot, lead.pcid)) {
+        .paged_in => {
+            @import("../debug/kdbg.zig").pfEvent(@intCast(cur), cr2, @truncate(error_code), 0, true);
+            return .handled;
+        },
+        .oom => {
+            debug.klog("[swap] swap-in FAILED pid={d} va=0x{X} — out of memory, killing\n", .{ cur, va_aligned });
+            swap_failed = true;
+        },
+        .not_swapped => {},
+    }
 
-        // Swap-in: if this VA was evicted to swap, page it back in instead of
-        // fresh-allocating a zero page (which would discard its contents and
-        // leak the swap slot). The lazy region still exists; only the physical
-        // frame was reclaimed. swap_failed => genuine OOM swapping in; skip the
-        // fresh-alloc and fall through to the OOM-kill.
-        var swap_failed = false;
-        switch (trySwapInPage(pd, lead, va_aligned, r.prot, lead.pcid)) {
-            .paged_in => {
-                @import("../debug/kdbg.zig").pfEvent(@intCast(cur), cr2, @truncate(error_code), 0, true);
-                return true;
-            },
-            .oom => {
-                debug.klog("[swap] swap-in FAILED pid={d} va=0x{X} — out of memory, killing\n", .{ cur, va_aligned });
-                swap_failed = true;
-            },
-            .not_swapped => {},
-        }
-
-        // Gap #1+#5 (2026-05-20): allocAndMapUserPage now returns a named
-        // MapError instead of null. Oom is the only retry-worthy variant
-        // (caches might free under pressure); BadVA / KernelHeap mean the
-        // lazy region's start..end is malformed — no amount of reclaim
-        // helps, fall straight through to OOM-kill (with a distinct log
-        // line so the autopsy knows it wasn't memory pressure).
-        var frame_opt: ?Phys = null;
-        const fill = sourceFill(r, va_aligned);
-        if (!swap_failed) {
-            if (vmm.allocFillAndMapUserPage(pd, va_aligned, vmm.protToMapFlags(r.prot), fill)) |f| {
-                frame_opt = f;
-            } else |e1| {
-                if (e1 == error.Oom) {
-                    // Memory pressure response: ask registered modules to
-                    // shed reclaimable caches (GUI back-buffers etc.), then
-                    // retry the alloc ONCE.
-                    if (pmm.tryReclaim(1) > 0) {
-                        if (vmm.allocFillAndMapUserPage(pd, va_aligned, vmm.protToMapFlags(r.prot), fill)) |f2| {
-                            frame_opt = f2;
-                        } else |_| {}
-                    }
-                    // Still nothing? Evict cold pages of this process out to
-                    // swap and retry — THIS is what lets a process run past
-                    // physical RAM instead of being OOM-killed. The batch must
-                    // be big enough to climb back ACROSS the reserve-aware
-                    // user-alloc floor: swap-ins use the reserve-EXEMPT
-                    // allocFrame and can leave free FAR below the reserve, so a
-                    // fixed small batch (the old 64) can't lift this
-                    // allocFrameUser back over it -> spurious OOM-kill. Reclaim
-                    // the actual deficit (reserve - free, + margin for the data
-                    // page and its PT/PD/PDPT levels). Loop a few times in case
-                    // one scan only partially fills the gap or a peer races us;
-                    // reclaimViaSwap returning 0 means nothing left to evict =
-                    // genuine OOM, so stop.
-                    var rtries: u8 = 0;
-                    while (frame_opt == null and rtries < 8) : (rtries += 1) {
-                        const reserve = pmm.userReserveFrames();
-                        const free_now = pmm.freeFrameCount();
-                        const want: usize = if (free_now <= reserve) (reserve - free_now) + 16 else 16;
-                        if (reclaimViaSwap(pd, lead, va_aligned, lead.pcid, want) == 0) break;
-                        if (vmm.allocFillAndMapUserPage(pd, va_aligned, vmm.protToMapFlags(r.prot), fill)) |f3| {
-                            frame_opt = f3;
-                        } else |_| {}
-                    }
-                } else if (e1 == error.AlreadyMapped) {
-                    // The PTE acquired a binding we must not blind-install
-                    // over, and it didn't resolve to a present frame: the
-                    // racing winner's mapping is mid-teardown, or a full
-                    // map+evict cycle inside our fault window left the PTE
-                    // swap-marked. Not OOM, not a bad region — report the
-                    // fault handled; the retried access takes the correct
-                    // path (swap-in or a fresh fault). This shape used to
-                    // fall through to the OOM-kill below.
-                    @import("../debug/kdbg.zig").pfEvent(@intCast(cur), cr2, @truncate(error_code), 0, true);
-                    return true;
-                } else {
-                    debug.klog("[vmm] lazy fault REJECTED virt=0x{X} {s} — region[{d}] (0x{X}..0x{X}) prot=0x{X}\n", .{
-                        va_aligned, @errorName(e1), i, r.start, r.end, r.prot,
-                    });
+    // Gap #1+#5 (2026-05-20): allocAndMapUserPage now returns a named
+    // MapError instead of null. Oom is the only retry-worthy variant
+    // (caches might free under pressure); BadVA / KernelHeap mean the
+    // region's start..end is malformed — no amount of reclaim
+    // helps, fall straight through to OOM-kill (with a distinct log
+    // line so the autopsy knows it wasn't memory pressure).
+    var frame_opt: ?Phys = null;
+    const fill = sourceFill(r, va_aligned);
+    if (!swap_failed) {
+        if (vmm.allocFillAndMapUserPage(pd, va_aligned, vmm.protToMapFlags(r.prot), fill)) |f| {
+            frame_opt = f;
+        } else |e1| {
+            if (e1 == error.Oom) {
+                // Memory pressure response: ask registered modules to
+                // shed reclaimable caches (GUI back-buffers etc.), then
+                // retry the alloc ONCE.
+                if (pmm.tryReclaim(1) > 0) {
+                    if (vmm.allocFillAndMapUserPage(pd, va_aligned, vmm.protToMapFlags(r.prot), fill)) |f2| {
+                        frame_opt = f2;
+                    } else |_| {}
                 }
-            }
-        }
-        const frame = frame_opt orelse {
-            @import("../debug/kdbg.zig").pfEvent(@intCast(cur), cr2, @truncate(error_code), 0, false);
-            // OOM kill path. The region IS valid (cr2 fell in r.start..r.end);
-            // we just don't have a physical frame left. That's not a bug in
-            // the user app — it's resource exhaustion — and the right
-            // response is to SIGKILL THIS process and let the rest of the
-            // system keep running, NOT to run the full crashSummary
-            // (register dump, backtrace, dumpAll, fat32 writeCrashLog). The
-            // heavy dump is fine for a programmer-error fault but here it's
-            // both useless (we know why: OOM) and risky — fat32 writes
-            // re-enter the allocator under the same pressure, and the long
-            // print stream stalls the compositor on the BSP for hundreds of
-            // ms. Take the lightweight route instead and the system stays
-            // responsive even with photo / paint / etc. running into their
-            // memory caps.
-            debug.klog("[oom] killing PID={d} '{s}' — region[{d}] (0x{X}..0x{X}) needed page at cr2=0x{X}, pmm free={d}/{d}\n", .{
-                cur,
-                pcb.name[0..@min(pcb.name_len, pcb.name.len)],
-                i,
-                r.start,
-                r.end,
-                cr2,
-                pmm.freeFrameCount(),
-                pmm.managedFrameCount(),
-            });
-            // Memory autopsy: enumerate every lazy region so we can see
-            // WHICH range consumed the frames before OOM hit. Without
-            // this the OOM line names only the fault site, not the leak
-            // site. Added 2026-05-20 during Q1 memory-budget audit.
-            debug.klog("[oom]   lazy_count={d} user_brk=0x{X} heap_lazy_idx={d}\n", .{
-                lead.lazy_count, lead.user_brk, lead.heap_lazy_idx,
-            });
-            var ri: u8 = 0;
-            while (ri < lead.lazy_count) : (ri += 1) {
-                const rr = lead.lazy_regions[ri];
-                const size_kb: usize = (rr.end - rr.start) / 1024;
-                const tag: []const u8 = if (rr.source != null)
-                    "FILE-BACKED"
-                else if (lead.heap_lazy_idx >= 0 and ri == @as(u8, @intCast(lead.heap_lazy_idx)))
-                    "SBRK-HEAP"
-                else
-                    "ANON";
-                debug.klog("[oom]   region[{d}] 0x{X:0>9}..0x{X:0>9} size={d}KB prot=0x{X} {s}\n", .{
-                    ri, rr.start, rr.end, size_kb, rr.prot, tag,
+                // Still nothing? Evict cold pages of this process out to
+                // swap and retry — THIS is what lets a process run past
+                // physical RAM instead of being OOM-killed. The batch must
+                // be big enough to climb back ACROSS the reserve-aware
+                // user-alloc floor: swap-ins use the reserve-EXEMPT
+                // allocFrame and can leave free FAR below the reserve, so a
+                // fixed small batch (the old 64) can't lift this
+                // allocFrameUser back over it -> spurious OOM-kill. Reclaim
+                // the actual deficit (reserve - free, + margin for the data
+                // page and its PT/PD/PDPT levels). Loop a few times in case
+                // one scan only partially fills the gap or a peer races us;
+                // reclaimViaSwap returning 0 means nothing left to evict =
+                // genuine OOM, so stop.
+                var rtries: u8 = 0;
+                while (frame_opt == null and rtries < 8) : (rtries += 1) {
+                    const reserve = pmm.userReserveFrames();
+                    const free_now = pmm.freeFrameCount();
+                    const want: usize = if (free_now <= reserve) (reserve - free_now) + 16 else 16;
+                    if (reclaimViaSwap(pd, lead, va_aligned, lead.pcid, want) == 0) break;
+                    if (vmm.allocFillAndMapUserPage(pd, va_aligned, vmm.protToMapFlags(r.prot), fill)) |f3| {
+                        frame_opt = f3;
+                    } else |_| {}
+                }
+            } else if (e1 == error.AlreadyMapped) {
+                // The PTE acquired a binding we must not blind-install
+                // over, and it didn't resolve to a present frame: the
+                // racing winner's mapping is mid-teardown, or a full
+                // map+evict cycle inside our fault window left the PTE
+                // swap-marked. Not OOM, not a bad region — report the
+                // fault handled; the retried access takes the correct
+                // path (swap-in or a fresh fault). This shape used to
+                // fall through to the OOM-kill below.
+                @import("../debug/kdbg.zig").pfEvent(@intCast(cur), cr2, @truncate(error_code), 0, true);
+                return .handled;
+            } else {
+                debug.klog("[vmm] lazy fault REJECTED virt=0x{X} {s} — region 0x{X}..0x{X} prot=0x{X}\n", .{
+                    va_aligned, @errorName(e1), r.start, r.end, r.prot,
                 });
             }
-            // Dump the kdbg pmm_alloc + pmm_free rings — they name which
-            // call sites have been (de)allocating frames most recently.
-            // For the Q1 audit (2026-05-20): lazy regions sum to 17 MB
-            // but PMM dropped ~200 MB; the ring tells us who took the
-            // other 183 MB.
-            @import("../debug/kdbg.zig").dumpPmmAllocRing();
-            process.dumpSyscallRing(@intCast(cur));
-            // Desktop notification so the user sees WHY the app vanished
-            // without having to scroll serial.log.
-            const desktop = @import("../ui/desktop.zig");
-            if (desktop.active) desktop.showNotification("App killed: out of memory");
-            // tearDown + schedule. schedule() never returns when we just
-            // marked current_pid null (dead-letter eats the outgoing rsp);
-            // the `unreachable` below is for the type system.
-            process.destroyCurrent();
-            process.schedule();
-            unreachable;
-        };
-        @import("../debug/kdbg.zig").pfEvent(@intCast(cur), cr2, @truncate(error_code), 0, true);
-        // ELF demand paging's file bytes were copied in by
-        // allocFillAndMapUserPage before the PTE went live (sourceFill).
-        _ = frame;
-        // The PTE was not present, so no CPU's TLB can hold it; the local
-        // invlpg is a backstop.
-        asm volatile ("invlpg (%[addr])"
-            :
-            : [addr] "r" (va_aligned),
-            : .{ .memory = true }
-        );
-        // Diagnostic: log first fault-in per (PID, 4KB page) so we see every
-        // unique page a process touches, not just the first per region. Lets
-        // us spot "process keeps faulting same page" loops vs "process moved
-        // on to different pages and got stuck mid-execution." The seen-array
-        // is bounded; once full we silently stop logging to avoid flooding.
-        const dbg = struct {
-            const MAX_LOG_PAGES = 64;
-            var pages: [MAX_PROCS][MAX_LOG_PAGES]usize =
-                [_][MAX_LOG_PAGES]usize{[_]usize{0} ** MAX_LOG_PAGES} ** MAX_PROCS;
-            var counts: [MAX_PROCS]u8 = [_]u8{0} ** MAX_PROCS;
-        };
-        if (cur < MAX_PROCS) {
-            // Defensive clamp: cnt is loaded from BSS and SHOULD always be
-            // <= MAX_LOG_PAGES (the increment below is gated). If it's
-            // larger, something corrupted the array — log and reset rather
-            // than tripping a slice OOB panic that masks the real bug.
-            const raw_cnt = dbg.counts[cur];
-            if (raw_cnt > dbg.MAX_LOG_PAGES) {
-                @import("../debug/serial.zig").print("[corrupt] dbg.counts[{d}]={d} > {d} — reset (BSS scribbled?)\n", .{ cur, raw_cnt, dbg.MAX_LOG_PAGES });
-                dbg.counts[cur] = 0;
-            }
-            const cnt = @min(raw_cnt, dbg.MAX_LOG_PAGES);
-            var already_seen = false;
-            for (dbg.pages[cur][0..cnt]) |seen_va| {
-                if (seen_va == va_aligned) {
-                    already_seen = true;
-                    break;
-                }
-            }
-            if (!already_seen and cnt < dbg.MAX_LOG_PAGES) {
-                dbg.pages[cur][cnt] = va_aligned;
-                dbg.counts[cur] = cnt + 1;
-                debug.klog("[pf] PID={d} lazy fault-in 0x{X} region={d}\n", .{ cur, va_aligned, i });
-            }
         }
-        // Accounting: this fault successfully populated a fresh user page,
-        // so the process's resident set grew by one. Track peak too —
-        // useful for OOM heuristics + sysmon's "max ever used" column.
-        // Charge against the LEAD thread because lazy regions are shared.
-        lead.acct_current_rss +%= 1;
-        if (lead.acct_current_rss > lead.acct_peak_rss) {
-            lead.acct_peak_rss = lead.acct_current_rss;
-        }
-        return true;
     }
-    // No region matched. Diagnostic: dump lazy region table so we can see
-    // whether the fault address is past the heap end, in an unexpected
-    // gap between regions, or in territory we never mapped. Throttled
-    // per-pid (one dump per crashing PCB) so a wild pointer in a loop
-    // doesn't drown serial.
+    const frame = frame_opt orelse {
+        @import("../debug/kdbg.zig").pfEvent(@intCast(cur), cr2, @truncate(error_code), 0, false);
+        // OOM kill path. The region IS valid (cr2 fell in r.start..r.end);
+        // we just don't have a physical frame left. That's not a bug in
+        // the user app — it's resource exhaustion — and the right
+        // response is to SIGKILL THIS process and let the rest of the
+        // system keep running, NOT to run the full crashSummary
+        // (register dump, backtrace, dumpAll, fat32 writeCrashLog). The
+        // heavy dump is fine for a programmer-error fault but here it's
+        // both useless (we know why: OOM) and risky — fat32 writes
+        // re-enter the allocator under the same pressure, and the long
+        // print stream stalls the compositor on the BSP for hundreds of
+        // ms. Take the lightweight route instead and the system stays
+        // responsive even with photo / paint / etc. running into their
+        // memory caps.
+        debug.klog("[oom] killing PID={d} '{s}' — region 0x{X}..0x{X} needed page at cr2=0x{X}, pmm free={d}/{d}\n", .{
+            cur,
+            pcb.name[0..@min(pcb.name_len, pcb.name.len)],
+            r.start,
+            r.end,
+            cr2,
+            pmm.freeFrameCount(),
+            pmm.managedFrameCount(),
+        });
+        // Memory autopsy: enumerate every region so we can see WHICH range
+        // consumed the frames before OOM hit. Without this the OOM line
+        // names only the fault site, not the leak site.
+        debug.klog("[oom]   regions={d} user_brk=0x{X} heap_start=0x{X}\n", .{
+            lead.regions.len, lead.user_brk, lead.heap_start,
+        });
+        for (lead.regions.slice(), 0..) |rr, ri| {
+            const size_kb: usize = (rr.end - rr.start) / 1024;
+            const tag: []const u8 = if (rr.source != null)
+                "FILE-BACKED"
+            else if (lead.heap_start != 0 and rr.start == lead.heap_start)
+                "SBRK-HEAP"
+            else
+                "ANON";
+            debug.klog("[oom]   region[{d}] 0x{X:0>9}..0x{X:0>9} size={d}KB prot=0x{X} {s}\n", .{
+                ri, rr.start, rr.end, size_kb, rr.prot, tag,
+            });
+        }
+        // Dump the kdbg pmm_alloc + pmm_free rings — they name which
+        // call sites have been (de)allocating frames most recently.
+        @import("../debug/kdbg.zig").dumpPmmAllocRing();
+        process.dumpSyscallRing(@intCast(cur));
+        // Desktop notification so the user sees WHY the app vanished
+        // without having to scroll serial.log.
+        const desktop = @import("../ui/desktop.zig");
+        if (desktop.active) desktop.showNotification("App killed: out of memory");
+        return .oom_kill;
+    };
+    @import("../debug/kdbg.zig").pfEvent(@intCast(cur), cr2, @truncate(error_code), 0, true);
+    // ELF demand paging's file bytes were copied in by
+    // allocFillAndMapUserPage before the PTE went live (sourceFill).
+    _ = frame;
+    // The PTE was not present, so no CPU's TLB can hold it; the local
+    // invlpg is a backstop.
+    asm volatile ("invlpg (%[addr])"
+        :
+        : [addr] "r" (va_aligned),
+        : .{ .memory = true }
+    );
+    // Diagnostic: log first fault-in per (PID, 4KB page) so we see every
+    // unique page a process touches, not just the first per region. Lets
+    // us spot "process keeps faulting same page" loops vs "process moved
+    // on to different pages and got stuck mid-execution." The seen-array
+    // is bounded; once full we silently stop logging to avoid flooding.
+    const dbg = struct {
+        const MAX_LOG_PAGES = 64;
+        var pages: [MAX_PROCS][MAX_LOG_PAGES]usize =
+            [_][MAX_LOG_PAGES]usize{[_]usize{0} ** MAX_LOG_PAGES} ** MAX_PROCS;
+        var counts: [MAX_PROCS]u8 = [_]u8{0} ** MAX_PROCS;
+    };
+    if (cur < MAX_PROCS) {
+        // Defensive clamp: cnt is loaded from BSS and SHOULD always be
+        // <= MAX_LOG_PAGES (the increment below is gated). If it's
+        // larger, something corrupted the array — log and reset rather
+        // than tripping a slice OOB panic that masks the real bug.
+        const raw_cnt = dbg.counts[cur];
+        if (raw_cnt > dbg.MAX_LOG_PAGES) {
+            @import("../debug/serial.zig").print("[corrupt] dbg.counts[{d}]={d} > {d} — reset (BSS scribbled?)\n", .{ cur, raw_cnt, dbg.MAX_LOG_PAGES });
+            dbg.counts[cur] = 0;
+        }
+        const cnt = @min(raw_cnt, dbg.MAX_LOG_PAGES);
+        var already_seen = false;
+        for (dbg.pages[cur][0..cnt]) |seen_va| {
+            if (seen_va == va_aligned) {
+                already_seen = true;
+                break;
+            }
+        }
+        if (!already_seen and cnt < dbg.MAX_LOG_PAGES) {
+            dbg.pages[cur][cnt] = va_aligned;
+            dbg.counts[cur] = cnt + 1;
+            debug.klog("[pf] PID={d} lazy fault-in 0x{X} region=0x{X}\n", .{ cur, va_aligned, r.start });
+        }
+    }
+    // Accounting: this fault successfully populated a fresh user page,
+    // so the process's resident set grew by one. Track peak too —
+    // useful for OOM heuristics + sysmon's "max ever used" column.
+    // Charge against the LEAD thread because regions are shared.
+    lead.acct_current_rss +%= 1;
+    if (lead.acct_current_rss > lead.acct_peak_rss) {
+        lead.acct_peak_rss = lead.acct_current_rss;
+    }
+    return .handled;
+}
+
+/// No region holds `cr2`: dump the table so the log shows whether the address
+/// is past the heap end, in a gap between regions, or somewhere never mapped.
+/// One dump per pid, so a wild pointer in a loop doesn't drown serial.
+fn logFaultMiss(cur: usize, lead: *PCB, cr2: usize, error_code: u64) void {
     const dbg2 = struct {
         var dumped: [MAX_PROCS]bool = [_]bool{false} ** MAX_PROCS;
     };
-    if (cur < MAX_PROCS and !dbg2.dumped[cur]) {
-        dbg2.dumped[cur] = true;
-        debug.klog("[pf-miss] PID={d} cr2=0x{X} err=0x{X} — no lazy region matches; user_brk=0x{X}, heap_idx={d}, count={d}\n", .{
-            cur, cr2, error_code, lead.user_brk, lead.heap_lazy_idx, lead.lazy_count,
+    if (cur >= MAX_PROCS or dbg2.dumped[cur]) return;
+    dbg2.dumped[cur] = true;
+    debug.klog("[pf-miss] PID={d} cr2=0x{X} err=0x{X} — no region matches; user_brk=0x{X}, heap_start=0x{X}, regions={d}\n", .{
+        cur, cr2, error_code, lead.user_brk, lead.heap_start, lead.regions.len,
+    });
+    for (lead.regions.slice(), 0..) |r, j| {
+        debug.klog("[pf-miss]   region[{d}] start=0x{X} end=0x{X} prot=0x{X}\n", .{
+            j, r.start, r.end, r.prot,
         });
-        var j: u8 = 0;
-        while (j < lead.lazy_count) : (j += 1) {
-            const r = lead.lazy_regions[j];
-            debug.klog("[pf-miss]   region[{d}] start=0x{X} end=0x{X} prot=0x{X}\n", .{
-                j, r.start, r.end, r.prot,
-            });
-        }
-    }
-    return false;
-}
-
-/// Force-fault-in any lazy region pages in [addr, addr+len). Used by syscalls
-/// before reading user memory — without this, kernel-mode reads bypass the
-/// USER bit check and return whatever's in the inherited 2MB identity map
-/// (i.e. random kernel data) instead of the app's lazy-loaded data.
-pub fn prefaultUserRange(addr: usize, len: usize) void {
-    if (len == 0) return;
-    const cur = smp.myCpu().current_pid orelse return;
-    const pcb = &process.procs[cur];
-    const pd = pcb.page_directory orelse return;
-    const lead = leader(pcb);
-
-    var page = addr & ~@as(usize, 0xFFF);
-    const end = addr + len;
-    while (page < end) : (page += 0x1000) {
-        // Walk the regions for this page; if it's lazy, ensure its real PTE
-        // is installed (which overrides the inherited 2MB mapping).
-        var i: u8 = 0;
-        while (i < lead.lazy_count) : (i += 1) {
-            const r = lead.lazy_regions[i];
-            if (page < r.start or page >= r.end) continue;
-
-            // If a real 4K PTE is already installed (has USER bit), nothing
-            // to do. Otherwise allocate + map + (optionally) copy from src.
-            if (pageHasRealMapping(pd, page)) break;
-
-            // Shared-anon: the registry frame. A private zero page here
-            // would silently unshare the page for this process.
-            if (r.shm_id != @import("../mm/shm.zig").SHM_INVALID) {
-                _ = mapShmPage(pd, r, page);
-                break;
-            }
-
-            // Cache-backed (ext2 mmap): fault the shared page in through the page
-            // cache so a kernel READ of an mmap'd buffer sees real file data, not
-            // a zero page (that would be silent corruption). faultInCachePage may
-            // block on ext2 I/O, which is fine here — prefault already blocks via
-            // trySwapInPage below, so callers hold no spinlock. On failure the
-            // page stays unmapped and allCurrentUserPagesMapped → clean E_FAULT.
-            if (r.cache_inode != 0) {
-                _ = faultInCachePage(pd, r, page);
-                break;
-            }
-
-            // If the page was evicted to swap, page it back in rather than
-            // mapping a fresh zero page over the swapped PTE (which would lose
-            // its contents AND leak the slot). This is the kernel-side swap-in
-            // that lets validateUserPtr accept a pointer into a swapped buffer.
-            // NOTE: prefault covers the WHOLE syscall (ptr,len) range, so a
-            // syscall handed a large fully-swapped buffer swaps every page in
-            // here (evict<->swap-in thrash if it exceeds RAM). Fine for normal
-            // syscall buffers; a per-call swap-in cap is the fix if it bites.
-            switch (trySwapInPage(pd, lead, page, r.prot, lead.pcid)) {
-                .paged_in => break, // resident now (swapInFrame flushed this CPU)
-                .oom => break, // leave unmapped — allCurrentUserPagesMapped() then fails -> clean E_FAULT
-                .not_swapped => {}, // never-faulted page: fall through to fresh alloc + src copy
-            }
-
-            _ = vmm.allocFillAndMapUserPage(pd, page, vmm.protToMapFlags(r.prot), sourceFill(r, page)) catch |e| {
-                // Benign MT race: a peer thread faulted this exact page in
-                // between our pageHasRealMapping check and the alloc (the
-                // winner did the source copy). Move on to the NEXT page —
-                // the old blanket `catch return` abandoned the rest of the
-                // range, turning the benign race into a spurious E_FAULT
-                // from allCurrentUserPagesMapped.
-                if (e == error.AlreadyMapped) break;
-                return; // OOM/BadVA: leave unmapped -> clean E_FAULT upstream
-            };
-            asm volatile ("invlpg (%[addr])"
-                :
-                : [addr] "r" (page),
-                : .{ .memory = true }
-            );
-            break;
-        }
     }
 }
 
-/// True if every 4 KB page in [addr, addr+len) of the current process's
-/// address space has a present USER PTE (or sits under an inherited 1GB/2MB
-/// page). Use after `prefaultUserRange` to confirm a user pointer is safe
-/// to dereference from kernel context — prefault only maps pages registered
-/// in lazy_regions, leaving pointers to scratch user VAs unmapped, and the
-/// kernel's bare `@memcpy` then page-faults. validateUserPtr in syscall.zig
-/// chains prefault → this helper to refuse the call cleanly.
-pub fn allCurrentUserPagesMapped(addr: usize, len: usize) bool {
+/// Force-fault-in any region pages in [addr, addr+len) of the current
+/// process, then report whether every page in the range is present as a 4 KB
+/// USER mapping. Used by syscalls before touching user memory — without the
+/// fault-in, kernel-mode reads bypass the USER bit check and return whatever's
+/// in the inherited 2MB identity map (i.e. random kernel data) instead of the
+/// app's lazy-loaded data; without the check, a pointer to user VA no region
+/// covers stays unmapped and the kernel's bare @memcpy faults in supervisor
+/// mode. Both run under the read side of the address-space lock, so an munmap
+/// can't free the page tables the check walks. Task context; the caller must
+/// not hold that lock.
+pub fn prefaultUserRange(addr: usize, len: usize) bool {
     if (len == 0) return true;
     const cur = smp.myCpu().current_pid orelse return false;
     const pcb = &process.procs[cur];
     const pd = pcb.page_directory orelse return false;
+    const lead = leader(pcb);
 
-    var page = addr & ~@as(usize, 0xFFF);
+    lead.as_lock.acquireRead();
+    defer lead.as_lock.releaseRead();
+    const first = addr & ~@as(usize, 0xFFF);
     const end = addr + len;
+    var page = first;
+    while (page < end) : (page += 0x1000) {
+        if (!prefaultPage(pd, lead, page)) return false;
+    }
+    page = first;
     while (page < end) : (page += 0x1000) {
         if (!pageHasRealMapping(pd, page)) return false;
     }
     return true;
 }
 
-/// Variant that walks an explicitly-provided PML4 rather than the current
-/// task's. Used by io_uring's worker, which runs as a kernel task but needs
-/// to validate user pointers in the OWNER's address space (after swapping
-/// CR3). The fault handler can't service a missed page on the worker — its
-/// currentPCB is the worker, with no lazy regions — so the worker must
-/// pre-validate every page is honestly mapped.
-pub fn allUserPagesMappedFor(pml4: [*]align(4096) u64, addr: usize, len: usize) bool {
-    if (len == 0) return true;
-    var page = addr & ~@as(usize, 0xFFF);
-    const end = addr + len;
-    while (page < end) : (page += 0x1000) {
-        if (!pageHasRealMapping(pml4, page)) return false;
+/// prefaultUserRange for one page, under the read side. False when memory
+/// ran out: the rest of the range stays unmapped and the range check fails
+/// it with E_FAULT. A page left unmapped for any other reason fails the same
+/// check.
+fn prefaultPage(pd: [*]align(4096) u64, lead: *PCB, page: usize) bool {
+    const r = (lead.regions.find(page) orelse return true).*;
+
+    // If a real 4K PTE is already installed (has USER bit), nothing
+    // to do. Otherwise allocate + map + (optionally) copy from src.
+    if (pageHasRealMapping(pd, page)) return true;
+
+    // Shared-anon: the registry frame. A private zero page here
+    // would silently unshare the page for this process.
+    if (r.shm_id != @import("../mm/shm.zig").SHM_INVALID) {
+        _ = mapShmPage(pd, r, page);
+        return true;
     }
+
+    // Cache-backed (ext2 mmap): fault the shared page in through the page
+    // cache so a kernel READ of an mmap'd buffer sees real file data, not
+    // a zero page (that would be silent corruption). faultInCachePage may
+    // block on ext2 I/O, which is fine here — prefault already blocks via
+    // trySwapInPage below, so callers hold no spinlock. On failure the
+    // page stays unmapped and the range check → clean E_FAULT.
+    if (r.cache_inode != 0) {
+        _ = faultInCachePage(pd, r, page);
+        return true;
+    }
+
+    // If the page was evicted to swap, page it back in rather than
+    // mapping a fresh zero page over the swapped PTE (which would lose
+    // its contents AND leak the slot). This is the kernel-side swap-in
+    // that lets validateUserPtr accept a pointer into a swapped buffer.
+    // NOTE: prefault covers the WHOLE syscall (ptr,len) range, so a
+    // syscall handed a large fully-swapped buffer swaps every page in
+    // here (evict<->swap-in thrash if it exceeds RAM). Fine for normal
+    // syscall buffers; a per-call swap-in cap is the fix if it bites.
+    switch (trySwapInPage(pd, lead, page, r.prot, lead.pcid)) {
+        .paged_in => return true, // resident now (swapInFrame flushed this CPU)
+        .oom => return true, // leave unmapped — the range check then fails -> clean E_FAULT
+        .not_swapped => {}, // never-faulted page: fall through to fresh alloc + src copy
+    }
+
+    _ = vmm.allocFillAndMapUserPage(pd, page, vmm.protToMapFlags(r.prot), sourceFill(r, page)) catch |e| {
+        // Benign MT race: a peer thread faulted this exact page in
+        // between our pageHasRealMapping check and the alloc (the
+        // winner did the source copy). Move on to the NEXT page —
+        // the old blanket `catch return` abandoned the rest of the
+        // range, turning the benign race into a spurious E_FAULT
+        // from the range check.
+        if (e == error.AlreadyMapped) return true;
+        return false; // OOM/BadVA: leave unmapped -> clean E_FAULT upstream
+    };
+    asm volatile ("invlpg (%[addr])"
+        :
+        : [addr] "r" (page),
+        : .{ .memory = true }
+    );
     return true;
 }
 
@@ -1093,11 +1082,12 @@ pub fn allUserPagesMappedFor(pml4: [*]align(4096) u64, addr: usize, len: usize) 
 /// match the PML4 we're modifying. handleCompletion satisfies this by
 /// switching to owner CR3 before calling us.
 ///
-/// Acquiring the owner's `as_lock` BEFORE calling this (and holding it
-/// across the subsequent memcpy) is the caller's responsibility — that's
-/// what serializes us vs concurrent sysMunmap/sysMprotect on the owner's
-/// own thread.
+/// Holding the read side of the owner's `as_lock` across this call AND the
+/// subsequent memcpy is the caller's responsibility — that's what
+/// serializes us vs concurrent sysMunmap/sysMprotect on the owner's own
+/// thread.
 pub fn ensureUserRangeWritableFor(owner_pcb: *process.PCB, va: usize, len: usize) bool {
+    std.debug.assert(leader(owner_pcb).as_lock.heldByCurrent(.read));
     return ensureUserRangeFor(owner_pcb, va, len, true);
 }
 
@@ -1106,8 +1096,9 @@ pub fn ensureUserRangeWritableFor(owner_pcb: *process.PCB, va: usize, len: usize
 /// only READS the user buffer (io_uring OP_WRITE: vfs reads the source buf)
 /// — demanding READ_WRITE there would reject any buffer in an RO cache
 /// region (Slice 3e ELF .rodata), i.e. every string literal. COW pages are
-/// readable without breaking; resident is resident.
+/// readable without breaking; resident is resident. Same lock contract.
 pub fn ensureUserRangeReadableFor(owner_pcb: *process.PCB, va: usize, len: usize) bool {
+    std.debug.assert(leader(owner_pcb).as_lock.heldByCurrent(.read));
     return ensureUserRangeFor(owner_pcb, va, len, false);
 }
 
@@ -1149,41 +1140,32 @@ fn ensureUserRangeFor(owner_pcb: *process.PCB, va: usize, len: usize, need_write
                     : .{ .memory = true });
             }
         } else {
-            var mapped = false;
-            var i: u8 = 0;
-            while (i < lead.lazy_count) : (i += 1) {
-                const r = lead.lazy_regions[i];
-                if (p < r.start or p >= r.end) continue;
-                if (r.shm_id != @import("../mm/shm.zig").SHM_INVALID) {
-                    if (!mapShmPage(pd, r, p)) return false;
-                } else if (r.cache_inode != 0) {
-                    // Cache-backed page: map it shared RO+COW if resident, then
-                    // (write paths only) break COW so this proactive (SMAP/
-                    // signal-frame or io_uring) write lands on a private
-                    // WRITABLE page. Non-blocking — a miss returns false (the
-                    // caller may hold a spinlock; the app must touch the page
-                    // itself so the #PF path can fill it).
-                    if (!tryMapCachedPage(pd, r, p)) return false;
-                    if (need_write) breakCow(pd, lead, p);
-                } else {
-                    // sourceFill: an ELF .data / private-file-mmap page starts
-                    // with its file bytes (this path used to map a bare zero
-                    // page over them). The copy is from a kernel buffer, so it
-                    // stays non-blocking under the caller's as_lock. A racing
-                    // thread's present mapping comes back as success;
-                    // AlreadyMapped means a binding that is not a present
-                    // frame (swapped out), and swap-in may block — fail, the
-                    // app's own touch pages it in.
-                    _ = vmm.allocFillAndMapUserPage(pd, p, vmm.protToMapFlags(r.prot), sourceFill(r, p)) catch return false;
-                    asm volatile ("invlpg (%[addr])"
-                        :
-                        : [addr] "r" (p),
-                        : .{ .memory = true });
-                }
-                mapped = true;
-                break;
+            const r = (lead.regions.find(p) orelse return false).*;
+            if (r.shm_id != @import("../mm/shm.zig").SHM_INVALID) {
+                if (!mapShmPage(pd, r, p)) return false;
+            } else if (r.cache_inode != 0) {
+                // Cache-backed page: map it shared RO+COW if resident, then
+                // (write paths only) break COW so this proactive (SMAP/
+                // signal-frame or io_uring) write lands on a private
+                // WRITABLE page. Non-blocking — a miss returns false (the
+                // caller may run with interrupts off; the app must touch the
+                // page itself so the #PF path can fill it).
+                if (!tryMapCachedPage(pd, r, p)) return false;
+                if (need_write) breakCow(pd, lead, p);
+            } else {
+                // sourceFill: an ELF .data / private-file-mmap page starts
+                // with its file bytes (this path used to map a bare zero
+                // page over them). The copy is from a kernel buffer, so it
+                // stays non-blocking. A racing thread's present mapping
+                // comes back as success; AlreadyMapped means a binding that
+                // is not a present frame (swapped out), and swap-in may
+                // block — fail, the app's own touch pages it in.
+                _ = vmm.allocFillAndMapUserPage(pd, p, vmm.protToMapFlags(r.prot), sourceFill(r, p)) catch return false;
+                asm volatile ("invlpg (%[addr])"
+                    :
+                    : [addr] "r" (p),
+                    : .{ .memory = true });
             }
-            if (!mapped) return false;
             // Mapped with the region's own protection: an RO region (ELF
             // text/rodata, PROT_READ mmap) stays read-only, and the caller's
             // write would kernel-mode #PF into it.

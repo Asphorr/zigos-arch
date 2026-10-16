@@ -243,8 +243,8 @@ pub fn mapUserPage(pml4: [*]align(4096) u64, virt: usize, phys: Phys, flags: u64
     //   - Different phys: error.AlreadyMapped. Caller (typically
     //     allocAndMapUserPage) frees its newly-allocated frame and
     //     uses the winner's mapping.
-    // The whole policy runs as a CAS loop: the fault path holds no as_lock,
-    // so two CPUs installing the SAME page used to both pass the not-present
+    // The whole policy runs as a CAS loop: faults hold only the read side of
+    // as_lock, so two CPUs installing the SAME page used to both pass the not-present
     // check and plain-store — last writer won and the loser's frame leaked
     // WITHOUT the AlreadyMapped protocol ever firing (it only caught losers
     // that arrived after the winner's store became visible). A CAS makes
@@ -303,7 +303,7 @@ fn resolveOrAlloc(table: [*]u64, idx: u64) MapError![*]u64 {
     }
     const alloc = allocZeroedTable() orelse return error.Oom;
     const new = makeEntry(alloc.phys, PRESENT | READ_WRITE | USER);
-    // CAS the install: the fault path holds no as_lock, so concurrent lazy
+    // CAS the install: faults hold only the read side of as_lock, so concurrent lazy
     // faults on two DIFFERENT pages of the same span both used to pass the
     // not-present check and plain-store their fresh table — last writer won,
     // and the loser's table page plus every PTE subsequently installed into

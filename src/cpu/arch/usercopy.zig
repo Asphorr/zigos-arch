@@ -226,8 +226,7 @@ pub const MAX_FAULT_RETRIES: u8 = 4;
 pub fn faultInReadable(user_va: usize, len: usize) bool {
     if (len == 0) return true;
     if (!memmap.userDataRangeOk(user_va, len)) return false;
-    process.prefaultUserRange(user_va, len);
-    return process.allCurrentUserPagesMapped(user_va, len);
+    return process.prefaultUserRange(user_va, len);
 }
 
 /// faultInReadable's WRITE-side twin: additionally breaks COW and rejects

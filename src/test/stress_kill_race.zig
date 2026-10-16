@@ -86,7 +86,7 @@ pub fn taskEntry() callconv(.c) noreturn {
         // Kill the batch back-to-back, no yields. cpu1 may still be
         // mid-dispatch, mid-page-fault, or mid-syscall on these pids.
         // Each killProcess walks the user kill path: vmm.destroyAddressSpace,
-        // freeElfBuf, lazy_regions cleanup. expected_kstack_tops[pid] = 0
+        // freeElfBuf, regions cleanup. expected_kstack_tops[pid] = 0
         // store fires somewhere in there.
         b = 0;
         while (b < BATCH) : (b += 1) {

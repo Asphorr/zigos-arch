@@ -43,13 +43,12 @@ pub fn validateUserPtr(ptr: usize, len: usize) bool {
     // checks above don't need bracketing; the meaningful cost starts here.
     const sp = @import("../../debug/syscall_perf.zig").scope(.user_ptr_walk);
     defer sp.end();
-    if (len > 0) process.prefaultUserRange(ptr, len);
-    // prefaultUserRange only maps pages inside registered lazy_regions; a
-    // pointer to scratch user-VA stays unmapped and the kernel's @memcpy
-    // would #PF in supervisor mode. Verify every page is actually present
-    // before letting the syscall body dereference it. Found by redteam
-    // fuzzer hitting sysGetcwd with a random user-range pointer.
-    if (len > 0 and !process.allCurrentUserPagesMapped(ptr, len)) return false;
+    // prefaultUserRange maps only pages inside registered regions and then
+    // checks every page is present: a pointer to scratch user VA would
+    // otherwise reach the syscall body's @memcpy unmapped and #PF in
+    // supervisor mode. Found by redteam fuzzer hitting sysGetcwd with a
+    // random user-range pointer.
+    if (len > 0 and !process.prefaultUserRange(ptr, len)) return false;
     // Validation succeeded — caller is about to deref. STAC unlocks user
     // memory access for the remainder of this syscall; doSyscall's defer
     // CLACs on exit. Cheap: with SMAP off this is a noop branch.

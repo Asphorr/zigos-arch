@@ -498,10 +498,17 @@ export fn handleException(rsp: u64) callconv(.c) void {
                     fault_addr = saved_rip;
                     si_code = signals.TRAP_BRKPT;
                 }
-                if (signals.deliverFromExcFrame(pcb, exc_frame, sig, fault_addr, si_code)) {
-                    asm volatile ("sti");
-                    return;
-                }
+                // Interrupts on for the delivery, as on the #PF path: the trap
+                // came from ring 3, so no kernel context is interrupted, and
+                // writing the handler frame may sleep for the address-space
+                // lock. The kill path below keeps the state it had.
+                var flags: u64 = undefined;
+                asm volatile ("pushfq; pop %[f]"
+                    : [f] "=r" (flags),
+                );
+                asm volatile ("sti");
+                if (signals.deliverFromExcFrame(pcb, exc_frame, sig, fault_addr, si_code)) return;
+                if (flags & 0x200 == 0) asm volatile ("cli");
             }
         }
 

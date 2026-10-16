@@ -223,7 +223,7 @@ pub fn countThreadsInGroup(tgid: u8) u8 {
 ///
 /// What's shared: page_directory (same CR3 pointer + phys) and the PCID —
 /// every shootdown of the AS names the lead's PCID, so a thread tagged with
-/// another one would keep stale entries past munmap/fork/swap. lazy_regions,
+/// another one would keep stale entries past munmap/fork/swap. regions,
 /// fd_table, sigactions, cwd, etc. all live on the lead thread; cloned
 /// threads access them through `leader(pcb)`.
 ///
@@ -308,7 +308,7 @@ pub fn cloneCurrent(entry: usize, stack_top: usize, arg: usize, fs_base: u64) ?u
 }
 
 /// Spawn a child via fork(). Clones the parent's address space (COW shared),
-/// copies fd_table / sigactions / cwd / lazy_regions / argv, and synthesizes
+/// copies fd_table / sigactions / cwd / regions / argv, and synthesizes
 /// a kstack iretq frame so the child resumes at the parent's syscall-return
 /// RIP/RSP with RAX=0. Parent's caller (sysFork) returns the child PID.
 ///
@@ -317,9 +317,9 @@ pub fn cloneCurrent(entry: usize, stack_top: usize, arg: usize, fs_base: u64) ?u
 pub fn forkCurrent(frame: *signals.SyscallFrame) ?usize {
     const parent = process.currentPCB() orelse return null;
     const parent_pid_u8: u8 = @intCast(smp.myCpu().current_pid orelse return null);
-    // Process-level state (address space, lazy regions, fd table, argv…)
+    // Process-level state (address space, regions, fd table, argv…)
     // lives on the LEAD thread. fork() from a cloned worker used to copy the
-    // WORKER's own fields — empty lazy_regions, default brk/mmap_top — so
+    // WORKER's own fields — empty regions, default brk/mmap_top — so
     // the child faulted on its first instruction. Read through the lead.
     const parent_lead_src = process.leader(parent);
     const parent_pml4 = parent_lead_src.page_directory orelse return null;
@@ -335,6 +335,14 @@ pub fn forkCurrent(frame: *signals.SyscallFrame) ?usize {
     const i = allocSlot() orelse return null;
     resetPcbExceptState(&process.procs[i]); // state stays .loading from allocSlot's CAS
 
+    // Per-AS state — fork has its own AS, so the regions are a copy (not
+    // aliased through tgid like clone's).
+    process.procs[i].regions = parent_lead_src.regions.clone() catch {
+        debug.klog("[fork] no memory for the child's {d} regions\n", .{parent_lead_src.regions.len});
+        process.setState(i, .unused);
+        return null;
+    };
+
     // Clone parent's address space. On OOM partway through, the child PML4 is
     // partially built; tear it down via destroyAddressSpace, which drops every
     // refcount we bumped and frees every page-table page we allocated.
@@ -344,6 +352,7 @@ pub fn forkCurrent(frame: *signals.SyscallFrame) ?usize {
             const pml4_ptr: [*]align(4096) u64 = @ptrFromInt(child_pml4_phys.toVirt().raw());
             vmm.destroyAddressSpace(@alignCast(pml4_ptr), child_pml4_phys);
         }
+        process.procs[i].regions.deinit();
         process.setState(i, .unused);
         return null;
     };
@@ -351,12 +360,9 @@ pub fn forkCurrent(frame: *signals.SyscallFrame) ?usize {
     process.procs[i].page_dir_phys = child_pml4_phys.raw();
     process.procs[i].pcid = pcid_mod.alloc();
 
-    // Per-AS state — fork has its own AS so lazy regions and brk/mmap state
-    // are inherited as values (not aliased through tgid like clone does).
-    // All of it lives on the lead (see parent_lead_src above).
-    process.procs[i].lazy_regions = parent_lead_src.lazy_regions;
-    process.procs[i].lazy_count = parent_lead_src.lazy_count;
-    process.procs[i].heap_lazy_idx = parent_lead_src.heap_lazy_idx;
+    // brk/mmap state is inherited as values too. All of it lives on the
+    // lead (see parent_lead_src above).
+    process.procs[i].heap_start = parent_lead_src.heap_start;
     process.procs[i].user_brk = parent_lead_src.user_brk;
     process.procs[i].mmap_top = parent_lead_src.mmap_top;
     process.procs[i].stack_base = parent_lead_src.stack_base;
@@ -374,7 +380,7 @@ pub fn forkCurrent(frame: *signals.SyscallFrame) ?usize {
     // parent's buffers, so each gains an owner and the last one frees it.
     {
         const shm = @import("../mm/shm.zig");
-        for (process.procs[i].lazy_regions[0..process.procs[i].lazy_count]) |r| {
+        for (process.procs[i].regions.slice()) |r| {
             if (r.shm_id != shm.SHM_INVALID) _ = shm.acquire(r.shm_id);
             if (r.buf_owned) {
                 if (r.source) |src| pmm.shareContiguous(kbufPhys(src));
@@ -970,6 +976,18 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp, persist_shared_dirty: 
     // (2026-06-04 SMP ext2 on-disk-corruption fix.)
     @import("../fs/ext2/block.zig").releaseLockIfHeld(@intCast(pid));
 
+    // The group's address-space lock, likewise: a thread killed while it held
+    // the read side (a fault parked on swap-in or a page-cache fill) or waited
+    // for the lock would wedge every other thread of the group at its next
+    // fault or mmap.
+    if (process.procs[my_tgid].as_lock.dropPid(pid)) {
+        debug.klog("[proc] pid={d} died holding or awaiting the as_lock of pid {d}; released\n", .{ pid, my_tgid });
+    }
+    const foreign = process.procs[pid].foreign_as_lock;
+    if (foreign != process.NO_FOREIGN_LOCK and foreign < MAX_PROCS and process.procs[foreign].as_lock.dropPid(pid)) {
+        debug.klog("[proc] pid={d} died holding or awaiting the as_lock of pid {d}; released\n", .{ pid, foreign });
+    }
+
     // io_uring instances owned by this pid: free the slot-table entries.
     // The underlying ring memory is freed by the LazyRegion shm.release in
     // the per-AS cleanup below; this just recycles the kernel bookkeeping.
@@ -1022,7 +1040,7 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp, persist_shared_dirty: 
         freeElfBuf(lead);
         const shm = @import("../mm/shm.zig");
         const page_cache = @import("../mm/page_cache.zig");
-        for (lead.lazy_regions[0..lead.lazy_count]) |r| {
+        for (lead.regions.slice()) |r| {
             // Shared-anon: drop this AS's refcount. The shm registry frees
             // its frames at refcount==0, so peers keep working until they
             // also exit / munmap.
@@ -1057,8 +1075,8 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp, persist_shared_dirty: 
             const src = r.source orelse continue;
             pmm.releaseContiguous(kbufPhys(src), r.buf_pages);
         }
-        lead.lazy_count = 0;
-        lead.heap_lazy_idx = -1;
+        lead.regions.deinit();
+        lead.heap_start = 0;
     }
 
     // Per-thread: drop the borrowed page directory pointer so a future
@@ -1357,7 +1375,7 @@ pub fn killThreadGroup(tgid: u8, status: u32) void {
     const my_pid_opt = smp.myCpu().current_pid;
 
     // Phase 1: kill every peer OTHER than the current thread. Defer self so
-    // tearDownTask on peers (which reads procs[tgid].lazy_regions etc) can
+    // tearDownTask on peers (which reads procs[tgid].regions etc) can
     // finish before we tear our own kstack out from under this call.
     var i: u8 = 0;
     while (i < MAX_PROCS) : (i += 1) {
@@ -1486,7 +1504,7 @@ pub fn reapStaleZombies(max_age_ticks: u64) u32 {
 /// Threading: if this thread is one of several in its group (sysClone
 /// members), only the thread-local cleanup runs — the shared page
 /// directory, fd_table, sym_table, GPU ctx, GUI window, ELF buf, and
-/// lazy_regions stay alive on the lead PCB until the LAST thread exits.
+/// regions stay alive on the lead PCB until the LAST thread exits.
 /// Self-exit. Calls the shared teardown (which switches CR3 to kernel,
 /// frees the address space, steers TSS rsp0 to idle, clears
 /// cpu.current_pid), then reschedules + halts. We MUST reschedule
