@@ -3033,8 +3033,7 @@ pub fn idleInIoWait(cpu: u8) bool {
 /// completion reaped on another CPU raises no interrupt here).
 fn kickIdleWaiter(cpu: u8) void {
     if (cpu >= smp.MAX_CPUS or cpu == smp.myCpu().cpu_id) return;
-    // StoreLoad against wake()'s release store of wake_pending.
-    asm volatile ("mfence" ::: .{ .memory = true });
+    // wake()'s locked exchange of wake_pending orders it before this load.
     if (!idle_waiting[cpu].load(.seq_cst)) return;
     const v = wakeVector() orelse return;
     @import("../time/apic.zig").sendIPI(smp.cpus[cpu].lapic_id, v);
@@ -3103,7 +3102,11 @@ pub fn wake(pid: u8) void {
     // racing blockOn (running on the target's own CPU between its wait_kind
     // store and its setState) can detect us via the re-check after setState.
     // Without this, the wake is silently lost and the task sleeps forever.
-    @atomicStore(bool, &process.procs[pid].wake_pending, true, .release);
+    // An exchange, not a store: the sleeper sets .sleeping with a locked CAS
+    // and then reads wake_pending; we set wake_pending and then read its
+    // state. A plain store can sit in the store buffer past that state load
+    // (x86 StoreLoad), so each side would read the other's old value.
+    _ = @atomicRmw(bool, &process.procs[pid].wake_pending, .Xchg, true, .seq_cst);
     if (process.procs[pid].is_idle) kickIdleWaiter(process.procs[pid].idle_cpu);
     wakelat.hintWakeDefault(pid, .explicit);
     clearWait(&process.procs[pid]);

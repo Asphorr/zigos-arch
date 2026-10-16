@@ -1017,8 +1017,11 @@ pub const Mutex = struct {
             if (self.witness_class != UNREGISTERED_CLASS) witness.mutexRelease(self.witness_class, smp.myCpu().current_pid.?);
         }
         // Clear ownership BEFORE waking waiters: they retry CAS on wake
-        // and need to observe the free state.
-        @atomicStore(u16, &self.owner_pid, NO_OWNER, .release);
+        // and need to observe the free state. An exchange, not a store: a
+        // waiter in blockOnMutex sets .sleeping (locked CAS) and then reads
+        // owner_pid, and the waiter scan reads its state — a plain store can
+        // be overtaken by that load (x86 StoreLoad) and both sides miss.
+        _ = @atomicRmw(u16, &self.owner_pid, .Xchg, NO_OWNER, .seq_cst);
         process.wakeMutexWaiters(@truncate(@intFromPtr(self)));
     }
 
