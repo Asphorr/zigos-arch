@@ -161,6 +161,12 @@ pub export fn check_and_preempt_dynirq(interrupted_cs: u64) callconv(.c) void {
         // demoted now it would sit .ready with wait_kind set, which the
         // picker skips and no waker clears. It yields within instructions.
         if (@atomicLoad(process.WaitKind, &pcb.wait_kind, .acquire) != .none) return;
+        // Already .sleeping but still running: between a blocking
+        // primitive's setState(.sleeping) and its yield, or in its rollback
+        // after clearWait and before setState(.running). Parked from the
+        // rollback it would stay .sleeping with no wait fields, so no waker
+        // ever finds it. It yields or rolls back within instructions.
+        if (@atomicLoad(process.State, &pcb.state, .acquire) == .sleeping) return;
         cpu.dynirq_preempt_pending = false;
         @import("../../proc/sched.zig").schedulePreempt();
     }
