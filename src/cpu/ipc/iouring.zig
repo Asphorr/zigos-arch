@@ -205,13 +205,40 @@ const Instance = struct {
     pending: [MAX_PENDING_PER_INSTANCE]PendingOp = [_]PendingOp{.{}} ** MAX_PENDING_PER_INSTANCE,
     /// Suppress spurious wakes to .iouring_cq parkers. Set by enter() to its
     /// min_complete before parking; cleared on exit. Worker checks before
-    /// calling wakeIoUringCqWaiters — only wakes when ready ≥ cq_min_complete.
+    /// calling wakeCqWaiters — only wakes when ready ≥ cq_min_complete.
     /// Without this, a 16-deep concurrent submit triggered 16 separate IRQs →
     /// 16 wake-and-re-park cycles for the app (each adds a ~4 ms schedule
     /// round-trip), turning a single wait into N × round-trip latency.
     /// 0 means "no one is parked / no waiter cares" — worker skips the wake.
     cq_min_complete: u32 = 0, // (a) enter() writes before park, worker reads
+    /// Bit per pid waiting in enter() for completions (wakeCqWaiters).
+    cq_waiters: u64 = 0, // (a)
 };
+
+comptime {
+    if (process.MAX_PROCS > 64) @compileError("Instance.cq_waiters keeps one bit per pid in a u64");
+}
+
+/// Wake `inst_id`'s worker by pid. wake() sets its wake_pending whatever its
+/// state, so a completion that lands after the worker found nothing to do and
+/// before it parks still ends that blockOn. A scan for .sleeping waiters
+/// misses the worker in that window and the completion is lost. Any
+/// context, interrupts included.
+fn wakeWorker(inst_id: usize) void {
+    if (inst_id >= MAX_INSTANCES_TOTAL) return;
+    const pid = @atomicLoad(u32, &instances[inst_id].worker_pid, .acquire);
+    if (pid < process.MAX_PROCS) process.wake(@intCast(pid));
+}
+
+/// Wake, by pid and for the same reason, every task waiting in enter() on
+/// `inst_id`. The OR of zero is a locked RMW: it orders the caller's
+/// preceding cq_tail store before the read of the waiter set, against
+/// enter()'s publish-bit-then-read-cq_tail.
+fn wakeCqWaiters(inst_id: usize) void {
+    if (inst_id >= MAX_INSTANCES_TOTAL) return;
+    var m = @atomicRmw(u64, &instances[inst_id].cq_waiters, .Or, 0, .seq_cst);
+    while (m != 0) : (m &= m - 1) process.wake(@intCast(@ctz(m)));
+}
 
 var instances: [MAX_INSTANCES_TOTAL]Instance = [_]Instance{.{}} ** MAX_INSTANCES_TOTAL;
 var lock: @import("../../proc/spinlock.zig").SpinLock = .{};
@@ -308,7 +335,7 @@ fn nvmeCompletionCallback(ctx: usize, success: bool, sc: u16) callconv(.c) void 
     p.success = success;
     @atomicStore(bool, &p.done, true, .release);
     if (p.instance_id < MAX_INSTANCES_TOTAL) {
-        process.wakeIoUringWorker(@intCast(p.instance_id));
+        wakeWorker(p.instance_id);
     }
 }
 
@@ -336,7 +363,7 @@ fn pollCompletionCallback(inst_id: u8, slot_idx: u8, expected_gen: u16, ready_ma
     if (p.op != OP_POLL) return;
     p.poll_mask = ready_mask;
     @atomicStore(bool, &p.done, true, .release);
-    process.wakeIoUringWorker(inst_id);
+    wakeWorker(inst_id);
 }
 
 /// Called from `setup` the first time it runs. Registers the OP_POLL
@@ -550,7 +577,7 @@ fn postInlineCqe(inst: *Instance, user_data: u64, res: i32) SubmitResult {
     });
     @atomicStore(u32, &hdr.cq_tail, cq_tail +% 1, .release);
     const inst_id: u32 = @intCast((@intFromPtr(inst) - @intFromPtr(&instances[0])) / @sizeOf(Instance));
-    process.wakeIoUringCqWaiters(inst_id);
+    wakeCqWaiters(inst_id);
     return .invalid;
 }
 
@@ -564,7 +591,10 @@ fn submitNvmeOp(inst: *Instance, inst_id: u8, slot_idx: u8, sqe: Sqe) SubmitResu
     const lba: u32 = @truncate(sqe.off);
     const sectors: u32 = sqe.len;
 
-    if (ctrl_idx >= nvme.controllerCount()) {
+    // Before enableAsync (boot modes without the desktop) the controller
+    // refuses every async submission: an error now, not a "queue full" the
+    // worker would wait out forever.
+    if (ctrl_idx >= nvme.controllerCount() or !nvme.asyncEnabled(ctrl_idx)) {
         @atomicStore(bool, &p.in_use, false, .release);
         return .invalid;
     }
@@ -756,7 +786,7 @@ fn workerLoop() callconv(.c) noreturn {
             const ready = cq_tail -% cq_head;
             const min_c = @atomicLoad(u32, &inst.cq_min_complete, .acquire);
             if (min_c == 0 or ready >= min_c) {
-                process.wakeIoUringCqWaiters(inst_id);
+                wakeCqWaiters(inst_id);
             }
         }
 
@@ -870,7 +900,7 @@ fn workerLoop() callconv(.c) noreturn {
                             });
                             @atomicStore(u32, &hdr.sq_head, sq_head +% 1, .release);
                             @atomicStore(u32, &hdr.cq_tail, cq_tail +% 1, .release);
-                            process.wakeIoUringCqWaiters(inst_id);
+                            wakeCqWaiters(inst_id);
                         },
                     }
                 },
@@ -884,7 +914,7 @@ fn workerLoop() callconv(.c) noreturn {
                     });
                     @atomicStore(u32, &hdr.sq_head, sq_head +% 1, .release);
                     @atomicStore(u32, &hdr.cq_tail, cq_tail +% 1, .release);
-                    process.wakeIoUringCqWaiters(inst_id);
+                    wakeCqWaiters(inst_id);
                 },
             }
         }
@@ -901,9 +931,14 @@ fn workerLoop() callconv(.c) noreturn {
             // Truly idle — only enter() can wake us.
             process.blockOn(.iouring_work, inst_id);
         } else if (blocked_by_full) {
-            // Waiting on NVMe-side queue or pending-table room — only an
-            // IRQ-callback wake can free that, and that wakes .iouring_work.
-            process.blockOn(.iouring_work, inst_id);
+            // Waiting on NVMe-side queue or pending-table room. Our own
+            // completions wake us; with none in flight the CIDs are held by
+            // other submitters, whose completions don't, so retry shortly.
+            if (in_flight == 0) {
+                process.kernelSleepMs(1);
+            } else {
+                process.blockOn(.iouring_work, inst_id);
+            }
         } else if (sq_empty) {
             // Pending in-flight; SQ drained. Wait for IRQ callbacks.
             process.blockOn(.iouring_work, inst_id);
@@ -1065,7 +1100,7 @@ pub fn enter(user_va: u32, to_submit: u32, min_complete: u32) u32 {
     const sq_head_pre = @atomicLoad(u32, &hdr.sq_head, .acquire);
     const sq_tail_pre = @atomicLoad(u32, &hdr.sq_tail, .acquire);
     if (sq_tail_pre != sq_head_pre) {
-        process.wakeIoUringWorker(inst_id);
+        wakeWorker(inst_id);
     }
 
     if (min_complete > 0) {
@@ -1073,6 +1108,11 @@ pub fn enter(user_va: u32, to_submit: u32, min_complete: u32) u32 {
         // suppress per-CQE wakes and only wake us when the count is hit.
         @atomicStore(u32, &inst.cq_min_complete, min_complete, .release);
         defer @atomicStore(u32, &inst.cq_min_complete, 0, .release);
+        // Completions wake waiters by pid (wakeCqWaiters): publish ours
+        // before the first look at cq_tail.
+        const bit = @as(u64, 1) << @intCast(process.getCurrentPid());
+        _ = @atomicRmw(u64, &inst.cq_waiters, .Or, bit, .seq_cst);
+        defer _ = @atomicRmw(u64, &inst.cq_waiters, .And, ~bit, .seq_cst);
 
         while (true) {
             const cq_tail = @atomicLoad(u32, &hdr.cq_tail, .acquire);
@@ -1117,7 +1157,7 @@ pub fn releaseAllForPid(pid: u32) void {
                 process.wake(@intCast(it.worker_pid));
             }
             // Wake CQ waiters so they bail (their loop checks exit_requested).
-            process.wakeIoUringCqWaiters(@intCast(idx));
+            wakeCqWaiters(idx);
         }
     }
 

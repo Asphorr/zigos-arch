@@ -14,6 +14,8 @@ const vfs = @import("../fs/vfs.zig");
 const pmm = @import("../mm/pmm.zig");
 const heap = @import("../mm/heap.zig");
 const vmalloc = @import("../mm/vmalloc.zig");
+const nvme = @import("../driver/nvme.zig");
+const boot_phase = @import("../boot/boot_phase.zig");
 const serial = @import("../debug/serial.zig");
 
 const Case = struct {
@@ -26,6 +28,7 @@ const Case = struct {
 // buffer too, not only forktest's own file mapping.
 const CASES = [_]Case{
     .{ .path = "/tar/forktest.elf", .name = "forktest", .ok_status = 0xCAFE0042 },
+    .{ .path = "/tar/iouringtest.elf", .name = "iouringtest", .ok_status = 0xCAFE0115 },
 };
 
 const WARMUP_RUNS: u32 = 2;
@@ -170,6 +173,10 @@ fn vmallocRounds() void {
 }
 
 pub fn taskEntry() callconv(.c) noreturn {
+    // Steady state, as the desktop's first task enters it: programs load
+    // and io_uring submits through async NVMe I/O.
+    boot_phase.markComplete();
+    nvme.enableAsync();
     serial.print("[usertest] {d} program(s), {d} warm-up + {d} counted runs each\n", .{ CASES.len, WARMUP_RUNS, COUNTED_RUNS });
 
     for (CASES) |c| {

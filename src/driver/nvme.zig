@@ -2604,6 +2604,14 @@ pub fn enableAsync() void {
     debug.klog("[nvme] async I/O enabled on {d} controller(s)\n", .{num_controllers});
 }
 
+/// Controller `ctrl_idx` takes async submissions (submitAsyncCallback):
+/// initialized and past enableAsync.
+pub fn asyncEnabled(ctrl_idx: u32) bool {
+    if (ctrl_idx >= num_controllers) return false;
+    const c = &controllers[ctrl_idx];
+    return c.initialized and @atomicLoad(bool, &c.async_mode, .acquire);
+}
+
 pub fn writeSectorSecondary(lba: u32, src: [*]const u8) void {
     if (num_controllers < 2) return;
     _ = ioCommand(&controllers[1], IO_WRITE, lba, @intFromPtr(src), 1);

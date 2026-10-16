@@ -202,8 +202,8 @@ inline fn clearWait(pcb: *process.PCB) void {
 }
 
 /// Test whether this PCB is enrolled as a (kind, target) waiter, atomically.
-/// All wake-helper fan-out loops (wakeMutexWaiters, wakeSwapEvictWaiters,
-/// wakeIoUring*) use this so the read pairs with setWait's .release store.
+/// All wake-helper fan-out loops (wakeMutexWaiters, wakeSwapEvictWaiters)
+/// use this so the read pairs with setWait's .release store.
 inline fn waitsOn(t: *const process.PCB, kind: process.WaitKind, target: u32) bool {
     return @atomicLoad(u8, @as(*const u8, @ptrCast(&t.wait_kind)), .acquire) == @intFromEnum(kind)
         and @atomicLoad(u32, &t.wait_target, .acquire) == target;
@@ -3212,20 +3212,6 @@ pub fn wakeMutexWaiters(target_id: u32) void {
 /// one or two threads of a MT process).
 pub fn wakeSwapEvictWaiters(target: u32) void {
     wakeAllWaitingOn(.swap_evict, target);
-}
-
-/// Wake the single worker task blocked on .iouring_work with this instance id.
-/// Called by io_uring_enter when userspace bumped sq_tail; the worker drains
-/// pending Sqes on its next loop iteration.
-pub fn wakeIoUringWorker(instance_id: u32) void {
-    wakeAllWaitingOn(.iouring_work, instance_id);
-}
-
-/// Wake every task parked on io_uring_enter(min_complete > 0) for this
-/// instance. Called by the worker after writing a CQE; the enter caller's
-/// while-cq_count<min_complete loop re-checks on wake.
-pub fn wakeIoUringCqWaiters(instance_id: u32) void {
-    wakeAllWaitingOn(.iouring_cq, instance_id);
 }
 
 
