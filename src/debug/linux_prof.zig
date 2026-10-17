@@ -9,6 +9,7 @@ const nvme = @import("../driver/nvme.zig");
 const smp = @import("../cpu/smp.zig");
 const process = @import("../proc/process.zig");
 const symbols = @import("symbols.zig");
+const tlb = @import("../cpu/mmu/tlb.zig");
 const ext2_block = @import("../fs/ext2/block.zig");
 
 const SLOTS: usize = 512;
@@ -170,6 +171,8 @@ var last_io_calls: u64 = 0;
 var last_io_wait: u64 = 0;
 var last_bc: ext2_block.Stats = .{};
 var last_klog_bytes: u64 = 0;
+var last_shoot: u64 = 0;
+var last_lazy: u64 = 0;
 
 /// Zero everything without printing. One caller at a time.
 pub fn reset() void {
@@ -237,6 +240,11 @@ pub noinline fn dumpAndReset(label: []const u8) void {
     var fe: [futex_ends.len]u64 = undefined;
     for (&fe, &futex_ends) |*d, *s| d.* = @atomicRmw(u64, s, .Xchg, 0, .monotonic);
     out("[lprof]   futex: wait woke {d}, changed {d}, timed out {d}; wake some {d}, none {d}\n", .{ fe[0], fe[1], fe[2], fe[3], fe[4] });
+    const shoot = tlb.n_shootdowns_full +% tlb.n_shootdowns_context +% tlb.n_shootdowns_page +% tlb.n_shootdowns_range;
+    const lazy = tlb.n_shootdowns_lazy_skipped;
+    out("[lprof]   tlb shootdowns: {d} (peers left to their reload: {d})\n", .{ shoot -% last_shoot, lazy -% last_lazy });
+    last_shoot = shoot;
+    last_lazy = lazy;
     const bc = ext2_block.stats();
     out("[lprof]   ext2 cache: {d} buffers ({d} dirty), {d} hits, {d} misses, {d} blocks read, {d} blocks flushed in {d} commands\n", .{ bc.live, bc.dirty, bc.hits -% last_bc.hits, bc.misses -% last_bc.misses, bc.read_blocks -% last_bc.read_blocks, bc.flushed_blocks -% last_bc.flushed_blocks, bc.flush_cmds -% last_bc.flush_cmds });
     last_bc = bc;
