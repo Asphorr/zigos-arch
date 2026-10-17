@@ -12,6 +12,7 @@
 const std = @import("std");
 const process = @import("../proc/process.zig");
 const elf_loader = @import("../proc/elf_loader.zig");
+const vfs = @import("../fs/vfs.zig");
 const pmm = @import("../mm/pmm.zig");
 const nvme = @import("../driver/nvme.zig");
 const boot_phase = @import("../boot/boot_phase.zig");
@@ -22,11 +23,16 @@ const Case = struct {
     /// argv[1..], space separated.
     args: []const u8 = "",
     timeout_ms: u32 = 60_000,
+    /// Not built with the kernel: skipped when the image doesn't have it.
+    optional: bool = false,
 };
 
 const CASES = [_]Case{
     .{ .path = "/bin/lt_basic.elf", .args = "one two three" },
     .{ .path = "/bin/lt_mm.elf" },
+    // The official Zig compiler (static musl, 172 MB), stamped OSABI 3 and
+    // written into ext2.img by hand.
+    .{ .path = "/bin/zig", .args = "version", .timeout_ms = 120_000, .optional = true },
 };
 
 const WARMUP_RUNS: u32 = 1;
@@ -109,6 +115,10 @@ pub fn taskEntry() callconv(.c) noreturn {
     serial.print("[linuxtest] {d} program(s), {d} warm-up + {d} counted runs each\n", .{ CASES.len, WARMUP_RUNS, COUNTED_RUNS });
 
     for (CASES) |c| {
+        if (c.optional and vfs.lookupCached(c.path) == null) {
+            serial.print("[linuxtest] SKIP {s}: not in the image\n", .{c.path});
+            continue;
+        }
         var run: u32 = 0;
         while (run < WARMUP_RUNS) : (run += 1) check(c, run);
         process.kernelSleepMs(50);

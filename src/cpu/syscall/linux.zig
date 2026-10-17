@@ -107,6 +107,7 @@ const SYS_getegid: u32 = 108;
 // newfstatat(AT_FDCWD, ...). statPath ignores the dirfd for a non-empty path.
 const AT_FDCWD: u64 = 0xFFFF_FFFF_FFFF_FF9C;
 const SYS_getpid: u32 = 39;
+const SYS_gettid: u32 = 186;
 const SYS_exit: u32 = 60;
 const SYS_getdents64: u32 = 217;
 const SYS_set_tid_address: u32 = 218;
@@ -232,6 +233,8 @@ pub fn dispatch(num: u32, frame: *signals.SyscallFrame) u64 {
         // is for futex-on-exit join, which we don't implement yet — ignore it.
         SYS_set_tid_address => return process.getCurrentPid(),
         SYS_getpid => return process.getCurrentPid(),
+        // Every task has its own pid, so a thread's id is its pid.
+        SYS_gettid => return process.getCurrentPid(),
         // No Linux-signal delivery for these processes yet, so these are moot.
         SYS_rt_sigprocmask => return 0,
         SYS_rt_sigaction => return 0,
