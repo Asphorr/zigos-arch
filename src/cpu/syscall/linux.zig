@@ -18,6 +18,8 @@
 //!   * M3 — memory management (linux_mm.zig): mmap/munmap/mprotect/madvise/
 //!     brk on the region set, anywhere in the 512 GB window; pread/pwrite;
 //!     resource limits; clocks and sleeps (linux_time.zig).
+//!   * M4 — threads (linux_thread.zig): clone of the pthread shape, futex,
+//!     exit vs exit_group; the group shares the lead's fd table and cwd.
 //!
 //! The native ABI (3×u32 args, native numbers, return u32) is entirely
 //! separate and untouched — the only shared edge is doSyscall's one-line
@@ -37,6 +39,7 @@ const errno = @import("../../proc/errno.zig");
 const smp = @import("../smp.zig");
 const linux_mm = @import("linux_mm.zig");
 const linux_time = @import("linux_time.zig");
+const linux_thread = @import("linux_thread.zig");
 const native_proc = @import("proc.zig");
 
 // --- Linux x86-64 errno (DISTINCT from zigos common.E_* — different values).
@@ -63,6 +66,12 @@ const ENOSYS: i64 = 38;
 /// Encode a positive errno as the Linux-ABI return value (sign-extended -errno).
 inline fn err(e: i64) u64 {
     return @bitCast(-e);
+}
+
+/// The process the calling thread belongs to: its group lead holds the fd
+/// table and the cwd the group's threads share.
+fn proc() ?*process.PCB {
+    return process.leader(process.currentPCB() orelse return null);
 }
 
 // --- Linux x86-64 syscall numbers (subset; grows per milestone). ---
@@ -97,6 +106,10 @@ const SYS_sched_getaffinity: u32 = 204;
 const SYS_clock_gettime: u32 = 228;
 const SYS_clock_getres: u32 = 229;
 const SYS_clock_nanosleep: u32 = 230;
+const SYS_clone: u32 = 56;
+const SYS_getppid: u32 = 110;
+const SYS_futex: u32 = 202;
+const SYS_membarrier: u32 = 324;
 
 // fcntl commands (the few musl's open/opendir paths issue).
 const F_DUPFD: u64 = 0;
@@ -248,12 +261,15 @@ pub fn dispatch(num: u32, frame: *signals.SyscallFrame) u64 {
         SYS_ioctl => return err(ENOTTY),
         // TLS bring-up: musl's __init_tp does arch_prctl(ARCH_SET_FS, tcb).
         SYS_arch_prctl => return sysArchPrctl(a1, a2),
-        // musl stores the return as its tid; the clear-child-tid pointer (a1)
-        // is for futex-on-exit join, which we don't implement yet — ignore it.
-        SYS_set_tid_address => return process.getCurrentPid(),
-        SYS_getpid => return process.getCurrentPid(),
-        // Every task has its own pid, so a thread's id is its pid.
+        SYS_clone => return linux_thread.clone(frame, a1, a2, a3, a4, a5),
+        SYS_futex => return linux_thread.futex(a1, a2, a3, a4, a5, a6),
+        SYS_set_tid_address => return linux_thread.setTidAddress(a1),
+        // A thread's tid is its pid; the process id is the group lead's.
+        SYS_getpid => return (process.currentPCB() orelse return err(EFAULT)).tgid,
         SYS_gettid => return process.getCurrentPid(),
+        SYS_getppid => return (proc() orelse return err(EFAULT)).parent_pid,
+        // musl registers at its first pthread_create and does without.
+        SYS_membarrier => return err(ENOSYS),
         // No Linux-signal delivery for these processes yet, so these are moot.
         SYS_rt_sigprocmask => return 0,
         SYS_rt_sigaction => return 0,
@@ -267,11 +283,8 @@ pub fn dispatch(num: u32, frame: *signals.SyscallFrame) u64 {
         // to any id "succeeds" as a no-op (we are already privileged).
         SYS_getuid, SYS_geteuid, SYS_getgid, SYS_getegid => return 0,
         SYS_setuid, SYS_setgid => return 0,
-        SYS_exit, SYS_exit_group => {
-            // Low byte is the wait-status exit code (per _exit(2)).
-            process.destroyCurrentGraceful(@truncate(a1 & 0xFF));
-            return 0; // never reached: destroyCurrentGraceful switches away.
-        },
+        SYS_exit => return linux_thread.exitThread(a1),
+        SYS_exit_group => return linux_thread.exitGroup(a1),
         else => {
             // Bring-up aid: surface exactly which syscall a binary needs next,
             // with its args, so growing M2→M3 is "read the log, add the arm".
@@ -337,7 +350,7 @@ fn sysWrite(fd: u32, buf_va: u64, count: u64) u64 {
     if (count == 0) return 0;
     const len = rwLen(count);
     if (!common.validateUserPtr(buf_va, len)) return err(EFAULT);
-    const pcb = process.currentPCB() orelse return err(EFAULT);
+    const pcb = proc() orelse return err(EFAULT);
     const buf: [*]const u8 = @ptrFromInt(buf_va);
     if (fd <= 2 and len <= 1024) debug.klog("[linux] write(fd={d}): {s}", .{ fd, buf[0..len] });
     return vfsResult(vfs.write(pcb, fd, buf, len));
@@ -345,7 +358,7 @@ fn sysWrite(fd: u32, buf_va: u64, count: u64) u64 {
 
 /// read(fd, buf, count). Delegates to vfs.read, which returns 0 at EOF.
 fn sysRead(fd: u32, buf_va: u64, count: u64) u64 {
-    const pcb = process.currentPCB() orelse return err(EFAULT);
+    const pcb = proc() orelse return err(EFAULT);
     if (isDirFd(pcb, fd)) return err(EISDIR);
     const len = readLen(pcb, fd, count);
     if (len == 0) return 0;
@@ -363,7 +376,7 @@ fn sysWritev(fd: u32, iov_va: u64, iovcnt: u64) u64 {
     const n: usize = @intCast(iovcnt);
     const array_bytes = n * @sizeOf(Iovec);
     if (!common.validateUserPtr(iov_va, array_bytes)) return err(EFAULT);
-    const pcb = process.currentPCB() orelse return err(EFAULT);
+    const pcb = proc() orelse return err(EFAULT);
     const iov: [*]align(1) const Iovec = @ptrFromInt(iov_va);
 
     var total: u64 = 0;
@@ -400,7 +413,7 @@ fn sysReadv(fd: u32, iov_va: u64, iovcnt: u64) u64 {
     const n: usize = @intCast(iovcnt);
     const array_bytes = n * @sizeOf(Iovec);
     if (!common.validateUserPtr(iov_va, array_bytes)) return err(EFAULT);
-    const pcb = process.currentPCB() orelse return err(EFAULT);
+    const pcb = proc() orelse return err(EFAULT);
     if (isDirFd(pcb, fd)) return err(EISDIR);
     const iov: [*]align(1) const Iovec = @ptrFromInt(iov_va);
     // readLen over the whole call; the segments draw on it in turn.
@@ -435,7 +448,7 @@ fn sysReadv(fd: u32, iov_va: u64, iovcnt: u64) u64 {
 /// directly so fcntl spam doesn't look like a missing syscall).
 fn sysFcntl(fd: u32, cmd: u64, arg: u64) u64 {
     _ = arg;
-    const pcb = process.currentPCB() orelse return err(EFAULT);
+    const pcb = proc() orelse return err(EFAULT);
     if (fd >= pcb.fd_table.len or !pcb.fd_table[fd].in_use) return err(EBADF);
     return switch (cmd) {
         F_GETFD => 0, // FD_CLOEXEC not tracked
@@ -467,7 +480,7 @@ fn readUserPath(va: u64, out: *[256]u8, allow_empty: bool) ?[]const u8 {
 /// open(path, flags) / openat(AT_FDCWD, path, flags). Tries the regular-file
 /// path first (ext2.openFile rejects directories), then a directory open.
 fn sysOpenImpl(path_va: u64, lflags: u64) u64 {
-    const pcb = process.currentPCB() orelse return err(EFAULT);
+    const pcb = proc() orelse return err(EFAULT);
     var pbuf: [256]u8 = undefined;
     const path = readUserPath(path_va, &pbuf, false) orelse return err(EFAULT);
     var zflags: u32 = 0;
@@ -480,7 +493,7 @@ fn sysOpenImpl(path_va: u64, lflags: u64) u64 {
 }
 
 fn sysClose(fd: u32) u64 {
-    const pcb = process.currentPCB() orelse return err(EFAULT);
+    const pcb = proc() orelse return err(EFAULT);
     const r = vfs.close(pcb, fd);
     if (r != 0) return err(EBADF);
     return 0;
@@ -495,7 +508,7 @@ fn fdFileSize(fe: *const process.FileDesc) u64 {
 
 /// lseek(fd, off, whence). offset is u32 in the fd table; SEEK_SET/CUR/END.
 fn sysLseek(fd: u32, off: u64, whence: u32) u64 {
-    const pcb = process.currentPCB() orelse return err(EFAULT);
+    const pcb = proc() orelse return err(EFAULT);
     if (fd >= pcb.fd_table.len or !pcb.fd_table[fd].in_use) return err(EBADF);
     if (fd < 3) return err(ESPIPE); // console isn't seekable
     const fe = &pcb.fd_table[fd];
@@ -560,7 +573,7 @@ fn statByFd(pcb: *process.PCB, fd: u32, st: *LinuxStat) u64 {
 
 /// fstat(fd, statbuf).
 fn sysFstat(fd: u32, statbuf_va: u64) u64 {
-    const pcb = process.currentPCB() orelse return err(EFAULT);
+    const pcb = proc() orelse return err(EFAULT);
     if (!common.validateUserPtrWriteAligned(statbuf_va, @sizeOf(LinuxStat), @alignOf(LinuxStat))) return err(EFAULT);
     const st: *LinuxStat = @ptrFromInt(statbuf_va);
     st.* = .{};
@@ -571,7 +584,7 @@ fn sysFstat(fd: u32, statbuf_va: u64) u64 {
 /// against cwd) and the AT_EMPTY_PATH / empty-path form (== fstat(dirfd)).
 /// dirfd-relative resolution against an arbitrary directory fd is deferred.
 fn sysNewfstatat(dirfd: u64, path_va: u64, statbuf_va: u64, flags: u64) u64 {
-    const pcb = process.currentPCB() orelse return err(EFAULT);
+    const pcb = proc() orelse return err(EFAULT);
     if (!common.validateUserPtrWriteAligned(statbuf_va, @sizeOf(LinuxStat), @alignOf(LinuxStat))) return err(EFAULT);
     const st: *LinuxStat = @ptrFromInt(statbuf_va);
     st.* = .{};
@@ -618,7 +631,7 @@ fn sysUname(buf_va: u64) u64 {
 /// returns the byte length including the NUL (musl turns that into the buf
 /// pointer); -ERANGE if the buffer is too small to hold path + NUL.
 fn sysGetcwd(buf_va: u64, size: u64) u64 {
-    const pcb = process.currentPCB() orelse return err(EFAULT);
+    const pcb = proc() orelse return err(EFAULT);
     const cwd = pcb.cwd[0..pcb.cwd_len];
     const needed: u64 = @as(u64, @intCast(cwd.len)) + 1; // path + NUL
     if (size < needed) return err(ERANGE);
@@ -634,7 +647,7 @@ fn sysGetcwd(buf_va: u64, size: u64) u64 {
 /// returned); listDir always restarts at entry 0, so we skip `offset` of them.
 /// `.`/`..`/`lost+found` are filtered by listDir (so this looks like `ls`).
 fn sysGetdents64(fd: u32, buf_va: u64, count: u64) u64 {
-    const pcb = process.currentPCB() orelse return err(EFAULT);
+    const pcb = proc() orelse return err(EFAULT);
     if (fd >= pcb.fd_table.len or !pcb.fd_table[fd].in_use) return err(EBADF);
     const fe = &pcb.fd_table[fd];
     if (fe.fs_type != .ext2) return err(ENOTDIR);
@@ -689,7 +702,7 @@ fn positionedFile(pcb: *process.PCB, fd: u32, off: u64) union(enum) { file: *pro
 
 /// pread64(fd, buf, count, off): read at `off`; the fd offset stays put.
 fn sysPread(fd: u32, buf_va: u64, count: u64, off: u64) u64 {
-    const pcb = process.currentPCB() orelse return err(EFAULT);
+    const pcb = proc() orelse return err(EFAULT);
     const fe = switch (positionedFile(pcb, fd, off)) {
         .file => |f| f,
         .fail => |e| return e,
@@ -705,7 +718,7 @@ fn sysPread(fd: u32, buf_va: u64, count: u64, off: u64) u64 {
 
 /// pwrite64(fd, buf, count, off): write at `off`; the fd offset stays put.
 fn sysPwrite(fd: u32, buf_va: u64, count: u64, off: u64) u64 {
-    const pcb = process.currentPCB() orelse return err(EFAULT);
+    const pcb = proc() orelse return err(EFAULT);
     const fe = switch (positionedFile(pcb, fd, off)) {
         .file => |f| f,
         .fail => |e| return e,
@@ -742,7 +755,8 @@ fn rlimitOf(resource: u64) Rlimit {
 /// table, the rest unlimited. A well-formed new limit is accepted and has no
 /// effect.
 fn sysPrlimit(pid: u64, resource: u64, new_va: u64, old_va: u64) u64 {
-    if (pid != 0 and pid != process.getCurrentPid()) return err(ESRCH);
+    const me = proc() orelse return err(EFAULT);
+    if (pid != 0 and pid != me.tgid and pid != process.getCurrentPid()) return err(ESRCH);
     if (resource >= RLIMIT_NLIMITS) return err(EINVAL);
     if (new_va != 0) {
         if (!common.validateUserPtr(new_va, @sizeOf(Rlimit))) return err(EFAULT);

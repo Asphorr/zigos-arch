@@ -30,6 +30,7 @@ const Case = struct {
 const CASES = [_]Case{
     .{ .path = "/bin/lt_basic.elf", .args = "one two three" },
     .{ .path = "/bin/lt_mm.elf" },
+    .{ .path = "/bin/lt_thread.elf" },
     // The official Zig compiler (static musl, 172 MB), stamped OSABI 3 and
     // written into ext2.img by hand.
     .{ .path = "/bin/zig", .args = "version", .timeout_ms = 120_000, .optional = true },

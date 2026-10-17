@@ -209,8 +209,11 @@ pub const PCB = struct {
     // rejected explicitly in sysMmap. munmap hands VA back only when it frees
     // the lowest mapping (see sysMunmap).
     mmap_top: usize = MMAP_TOP_INIT, // (p:as_lock)
-    // File descriptor table — owner-pid only
+    // File descriptor table. A native process's own; a Linux process's
+    // threads all use the lead's, so slots are claimed and freed under
+    // fd_lock (vfs.allocFd / installFd / close).
     fd_table: [MAX_FDS]FileDesc = initFdTable(),
+    fd_lock: @import("spinlock.zig").SpinLock = .{},
     // ext2 inode this process's executable image was loaded from (0 = none /
     // not loaded from a regular file). Set by elf_loader.loadAndStart. Read by
     // isTextBusy to implement ETXTBSY: a write/truncate of a file whose inum
@@ -418,6 +421,10 @@ pub const PCB = struct {
     //
     // 0xFF means "not assigned yet"; create() and clone() fill it in.
     tgid: u8 = 0xFF, // (c) set at create/clone
+    // Set on the lead when the whole group is being killed (exit_group,
+    // killThreadGroup), before the pass over its threads: a clone that
+    // sees it gives up, so no thread can slip in behind the pass.
+    group_exiting: bool = false, // (a)
 
     // --- Sessions / process groups (POSIX setsid / setpgid) -------------
     // Process group ID = pid of the group leader. Default fill-in (by
@@ -446,9 +453,13 @@ pub const PCB = struct {
     /// doSyscall reroutes these to syscall/linux.zig. Set by the Linux ELF
     /// load path and inherited across fork. (`Personality` is module-level.)
     personality: Personality = .native,
-    // Userspace tid pointer — when this thread exits, futex-wake any
-    // thread joining on this address. 0 = no join address.
-    clear_child_tid: u32 = 0,
+    // Linux CLONE_CHILD_CLEARTID / set_tid_address: when this thread exits,
+    // the u32 here is zeroed and one futex waiter on it woken (a joiner).
+    // 0 = none. Owner-pid only.
+    clear_child_tid: usize = 0,
+    // The full user VA a .futex waiter sleeps on (wait_target holds its low
+    // 32 bits). Stored before setWait publishes the wait.
+    futex_addr: usize = 0, // (a)
     // Per-thread snapshot of `per_cpu_user_rsp[cpu]`. The syscall entry
     // stub stashes the user RSP into the per-CPU slot; if this thread is
     // preempted mid-syscall and another thread on the same CPU enters its
@@ -1089,6 +1100,7 @@ pub const enterFirstTaskAp = @import("sched.zig").enterFirstTaskAp;
 pub const blockOn = @import("sched.zig").blockOn;
 pub const blockOnInterruptible = @import("sched.zig").blockOnInterruptible;
 pub const blockOnFutex = @import("sched.zig").blockOnFutex;
+pub const wakeFutex = @import("sched.zig").wakeFutex;
 pub const blockOnMutex = @import("sched.zig").blockOnMutex;
 pub const blockOnLockSeq = @import("sched.zig").blockOnLockSeq;
 pub const blockOnSwapEvict = @import("sched.zig").blockOnSwapEvict;
@@ -1107,6 +1119,9 @@ pub const FutexResult = @import("sched.zig").FutexResult;
 pub const create = @import("lifecycle.zig").create;
 pub const countThreadsInGroup = @import("lifecycle.zig").countThreadsInGroup;
 pub const cloneCurrent = @import("lifecycle.zig").cloneCurrent;
+pub const cloneLinuxThread = @import("lifecycle.zig").cloneLinuxThread;
+pub const LinuxThreadSpec = @import("lifecycle.zig").LinuxThreadSpec;
+pub const exitThreadGroup = @import("lifecycle.zig").exitThreadGroup;
 pub const forkCurrent = @import("lifecycle.zig").forkCurrent;
 pub const createKernelIdle = @import("lifecycle.zig").createKernelIdle;
 pub const resetKernelIdleForResume = @import("lifecycle.zig").resetKernelIdleForResume;

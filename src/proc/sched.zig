@@ -2548,16 +2548,17 @@ pub fn rqHasDispatchable(cpu_id: u8) bool {
 
 /// Wait kinds whose sleeper wakeExpired readies by wake_tick: the explicit
 /// waker stamps wake_tick = now from IRQ context (SCI → .acpid, the IRQ0
-/// due-check → .desktop) or the deadline is the park's liveness backstop
-/// (.gpu_io, .desktop, .compositor, .acpid). Every other non-.none kind is
-/// woken by its explicit path alone.
+/// due-check → .desktop), the deadline is the park's liveness backstop
+/// (.gpu_io, .desktop, .compositor, .acpid), or it is the wait's timeout
+/// (.futex; blockOnFutex stores 0 for an untimed wait). Every other non-.none
+/// kind is woken by its explicit path alone.
 inline fn deadlineParked(kind: WaitKind) bool {
-    return kind == .gpu_io or kind == .desktop or kind == .compositor or kind == .acpid;
+    return kind == .gpu_io or kind == .desktop or kind == .compositor or kind == .acpid or kind == .futex;
 }
 
 /// Wake sleeping processes whose `sleep()` deadline has expired. Only
 /// considers processes with wait_kind == .none (those blocked via
-/// `sysSleep`) and the deadlineParked kinds — futex/pipe/waitpid
+/// `sysSleep`) and the deadlineParked kinds — pipe/waitpid/etc.
 /// sleepers leave wait_kind set and must be woken by their respective
 /// explicit wake paths. Without the guard, every `.sleeping` PCB with the
 /// default wake_tick=0 would race to .ready on the very next tick, breaking
@@ -2633,6 +2634,18 @@ pub fn wakeExpired() void {
         // requestRender's wake() is the real waker, wake_tick the backstop.
         // .acpid too (main.parkAcpid): the SCI handler stamps wake_tick =
         // now from the IRQ.
+        // A futex wait's timeout. Both steps are claims: since the reads
+        // above the waiter may have been woken and begun another wait, with
+        // its own deadline and word, and a futex waker counts only a wait it
+        // ended itself.
+        if (pcb.wait_kind == .futex and wt != 0 and process.tick_count >= wt) {
+            if (@cmpxchgStrong(u64, &pcb.wake_tick, wt, 0, .acq_rel, .monotonic) == null and claimFutexWait(pcb)) {
+                wakelat.hintWake(i, .parked);
+                _ = setStateFrom(i, .sleeping, .ready);
+            }
+            stuck_last_seen_wait_kind[i] = null;
+            continue;
+        }
         if (deadlineParked(pcb.wait_kind) and wt != 0 and process.tick_count >= wt) {
             @atomicStore(u64, &pcb.wake_tick, 0, .release);
             wakelat.hintWake(i, if (pcb.wait_kind == .gpu_io) .gpu_io else .parked);
@@ -3040,9 +3053,10 @@ fn kickIdleWaiter(cpu: u8) void {
 }
 
 
-/// Result of blockOnFutex: woke normally, interrupted by a deliverable signal,
-/// or the futex word changed during enrollment (caller returns EAGAIN).
-pub const FutexResult = enum { woke, signalled, again };
+/// Result of blockOnFutex: woke (by a FUTEX_WAKE, or spuriously), interrupted
+/// by a deliverable signal, the futex word changed during enrollment (caller
+/// returns EAGAIN), or the deadline passed first.
+pub const FutexResult = enum { woke, signalled, again, timed_out };
 
 /// Futex compare-and-sleep — mirrors blockOnMutex's register-then-recheck so a
 /// racing FUTEX_WAKE can't be lost. `word` is the validated user *uaddr. We
@@ -3053,7 +3067,10 @@ pub const FutexResult = enum { woke, signalled, again };
 /// internal atomic fences our enroll ahead of the *word re-read on x86 (same
 /// assumption blockOnMutex relies on). Interruptible: .signalled on a pending
 /// deliverable signal so a SIGINT/SIGTERM handler isn't stuck in the wait.
-pub fn blockOnFutex(target: u32, word: *const volatile u32, val: u32) FutexResult {
+///
+/// `addr` is the futex word's user VA (the wake key, with the tgid);
+/// `deadline` a tick_count at which wakeExpired ends the wait, 0 for none.
+pub fn blockOnFutex(addr: usize, word: *const volatile u32, val: u32, deadline: u64) FutexResult {
     const cur = smp.myCpu().current_pid orelse return .woke;
     const pcb = &process.procs[cur];
     spinlock.mightSleep(@src());
@@ -3069,28 +3086,97 @@ pub fn blockOnFutex(target: u32, word: *const volatile u32, val: u32) FutexResul
         if (hasPendingDeliverable(pcb)) return .signalled;
         return .woke;
     }
-    setWait(pcb, .futex, target);
+    @atomicStore(usize, &pcb.futex_addr, addr, .release);
+    // Stored even when 0, so a deadline left from an earlier wait can't end
+    // this one.
+    @atomicStore(u64, &pcb.wake_tick, deadline, .release);
+    if (deadline != 0) registerWakeDeadline(deadline);
+    setWait(pcb, .futex, @truncate(addr));
     setState(cur, .sleeping);
 
     // Race A: the waker stored a new *uaddr before we enrolled. (Futex contract:
     // the waker changes *uaddr, THEN calls FUTEX_WAKE.) Seeing the new value
     // means the wake is already in flight / done — don't park.
-    if (word.* != val) {
-        clearWait(pcb);
-        setState(cur, .running);
-        return .again;
-    }
+    if (word.* != val) return futexBackOut(pcb, cur, deadline, .again);
     // Race B: a FUTEX_WAKE landed during enrollment — wake() set wake_pending.
-    if (@atomicLoad(bool, &pcb.wake_pending, .acquire)) {
-        clearWait(pcb);
-        setState(cur, .running);
-        return .woke;
-    }
+    if (@atomicLoad(bool, &pcb.wake_pending, .acquire)) return futexBackOut(pcb, cur, deadline, .woke);
+    // Already due: wakeExpired drops a due deadline whose task was not
+    // .sleeping yet.
+    if (deadline != 0 and process.tick_count >= deadline) return futexBackOut(pcb, cur, deadline, .timed_out);
 
     @import("sched_asm.zig").softYield(); // self-accounts the descheduled span
-    clearWait(pcb);
+    // Whoever readied us ended the wait; the claim only catches a wake()
+    // that got here first through clearWait.
+    _ = claimFutexWait(pcb);
+    disarmFutexDeadline(pcb, deadline);
     if (hasPendingDeliverable(pcb)) return .signalled;
+    // A waker sets wake_pending before it claims the wait; wakeExpired
+    // claims it without.
+    if (deadline != 0 and !@atomicLoad(bool, &pcb.wake_pending, .acquire) and process.tick_count >= deadline) return .timed_out;
     return .woke;
+}
+
+/// End a .futex wait: the one that moves wait_kind off .futex — a waker
+/// (wakeFutex), wakeExpired at the deadline, or the waiter backing out —
+/// owns the outcome. A FUTEX_WAKE counts a waiter only when it won, so a
+/// waiter that timed out can't swallow a wake meant for another.
+inline fn claimFutexWait(pcb: *PCB) bool {
+    const kind: *u8 = @ptrCast(&pcb.wait_kind);
+    if (@cmpxchgStrong(u8, kind, @intFromEnum(WaitKind.futex), @intFromEnum(WaitKind.none), .acq_rel, .acquire) != null) return false;
+    @atomicStore(u32, &pcb.wait_target, 0, .release);
+    return true;
+}
+
+/// Leave a wait that was never slept in, reporting `why` if the waiter
+/// claims it — else what the one that did meant: a waker (it set
+/// wake_pending first) woke us, wakeExpired timed us out.
+fn futexBackOut(pcb: *PCB, cur: usize, deadline: u64, why: FutexResult) FutexResult {
+    const mine = claimFutexWait(pcb);
+    setState(cur, .running);
+    disarmFutexDeadline(pcb, deadline);
+    if (mine) return why;
+    if (@atomicLoad(bool, &pcb.wake_pending, .acquire)) return .woke;
+    return .timed_out;
+}
+
+/// Drop a futex deadline wakeExpired hasn't consumed.
+inline fn disarmFutexDeadline(pcb: *PCB, deadline: u64) void {
+    if (deadline != 0) _ = @cmpxchgStrong(u64, &pcb.wake_tick, deadline, 0, .acq_rel, .monotonic);
+}
+
+/// Wake up to `max` tasks of group `tgid` parked in blockOnFutex on `addr`;
+/// returns how many. Futexes are keyed by user VA, which means something
+/// only inside one address space — so by (tgid, VA).
+pub fn wakeFutex(tgid: u8, addr: usize, max: u32) u32 {
+    // The caller's store to the futex word must be visible before the scan
+    // reads wait_kind: the waiter enrolls, then re-reads the word (Dekker;
+    // x86 lets a store pass a later load).
+    asm volatile ("mfence" ::: .{ .memory = true });
+    var woken: u32 = 0;
+    for (0..MAX_PROCS) |i| {
+        if (woken >= max) break;
+        const t = &process.procs[i];
+        if (!waitsOn(t, .futex, @truncate(addr))) continue;
+        if (@atomicLoad(usize, &t.futex_addr, .acquire) != addr) continue;
+        // Without this, process A waking VA X could spend its count on
+        // process B's waiter at B's own VA X and leave A's real waiter
+        // parked: a lost wakeup.
+        if (t.tgid != tgid) continue;
+        // Not a slot being torn down or reused with stale wait fields.
+        const s = t.state;
+        if (s != .sleeping and s != .running and s != .ready) continue;
+        // wake_pending before the claim: a waiter still enrolling sees it
+        // in its Race B re-check, and one backing out learns it was woken.
+        _ = @atomicRmw(bool, &t.wake_pending, .Xchg, true, .seq_cst);
+        if (!claimFutexWait(t)) continue; // timed out, backed out, or another waker's
+        wakelat.hintWakeDefault(@intCast(i), .explicit);
+        if (@atomicLoad(u8, @as(*const u8, @ptrCast(&t.state)), .acquire) == @intFromEnum(State.sleeping))
+            _ = setStateFrom(@intCast(i), .sleeping, .ready);
+        // A waiter that left and began a wait on another word since the
+        // checks above was just woken spuriously; it isn't one of ours.
+        if (@atomicLoad(usize, &t.futex_addr, .acquire) == addr) woken += 1;
+    }
+    return woken;
 }
 
 /// Called by pipe.write when waking a blocked reader, by pipe.read when waking

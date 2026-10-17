@@ -177,12 +177,11 @@ pub fn openFlags(pcb: *process.PCB, name: []const u8, flags: u32) ?u32 {
     var path_buf: [256]u8 = undefined;
     const resolved = resolvePath(pcb, name, &path_buf) orelse return null;
 
-    // Claim the fd index up front. allocFd only names a free slot — nothing
-    // is reserved until the single install below — so an early return leaks
-    // nothing, and no fs-side open (or truncate) can run for a process whose
-    // table is already full. This ordering is load-bearing for O_TRUNC: the
-    // truncate used to run before the fd allocation, so open() on a full
-    // table destroyed the file's contents and then failed.
+    // Claim the fd index up front, so no fs-side open (or truncate) can run
+    // for a process whose table is already full. This ordering is
+    // load-bearing for O_TRUNC: the truncate used to run before the fd
+    // allocation, so open() on a full table destroyed the file's contents
+    // and then failed. A failed open hands the slot back below.
     const fd_idx = allocFd(pcb) orelse return null;
 
     // Each arm resolves the fs-specific open to the FileDesc to install, or
@@ -260,8 +259,11 @@ pub fn openFlags(pcb: *process.PCB, name: []const u8, flags: u32) ?u32 {
             break :blk null;
         },
     };
-    const desc = maybe_desc orelse return null;
-    pcb.fd_table[fd_idx] = desc;
+    const desc = maybe_desc orelse {
+        releaseFd(pcb, fd_idx);
+        return null;
+    };
+    installFd(pcb, fd_idx, desc);
     return @intCast(fd_idx);
 }
 
@@ -277,13 +279,13 @@ pub fn openDir(pcb: *process.PCB, name: []const u8) ?u32 {
     if (resolved.fs != .ext2) return null;
     const dir_inum = ext2.resolveDirInum(resolved.path) orelse return null;
     const fd_idx = allocFd(pcb) orelse return null;
-    pcb.fd_table[fd_idx] = .{
+    installFd(pcb, fd_idx, .{
         .in_use = true,
         .inode = dir_inum,
         .offset = 0,
         .flags = 0,
         .fs_type = .ext2,
-    };
+    });
     return @intCast(fd_idx);
 }
 
@@ -615,7 +617,18 @@ pub fn write(pcb: *process.PCB, fd: u32, buf: [*]const u8, count: u32) u32 {
 pub fn close(pcb: *process.PCB, fd: u32) u32 {
     if (fd >= pcb.fd_table.len or !pcb.fd_table[fd].in_use) return VFS_ERR;
     if (fd < 3) return VFS_ERR; // can't close stdin/stdout/stderr
-    const fd_entry = &pcb.fd_table[fd];
+    // Free the slot and take its entry in one step under fd_lock, then close
+    // the copy: of two threads closing one fd of a shared table (Linux
+    // threads), only one gets the file to release.
+    var entry: process.FileDesc = undefined;
+    {
+        pcb.fd_lock.acquire();
+        defer pcb.fd_lock.release();
+        if (!pcb.fd_table[fd].in_use) return VFS_ERR;
+        entry = pcb.fd_table[fd];
+        pcb.fd_table[fd].in_use = false;
+    }
+    const fd_entry = &entry;
 
     switch (fd_entry.fs_type) {
         .console => {},
@@ -648,7 +661,6 @@ pub fn close(pcb: *process.PCB, fd: u32) u32 {
             net.tcpUnlisten(@intCast(fd_entry.inode));
         },
     }
-    fd_entry.in_use = false;
     return 0;
 }
 
@@ -900,14 +912,32 @@ pub fn loadFileFresh(name: []const u8) ?FreshFile {
     return null;
 }
 
-/// Find a free fd index. NAMES a slot only — nothing is reserved until the
-/// caller installs into fd_table[fd_idx]. Safe because every fd_table has
-/// exactly one accessor today (tables are COPIED on clone, never shared —
-/// lifecycle.cloneCurrent). If CLONE_FILES sharing ever lands, this needs a
-/// reservation (in_use placeholder) or an fd-table lock.
+/// Reserve a free fd index. A Linux process's threads share their lead's
+/// table, so slots change hands under its fd_lock; a reserved slot reads
+/// as a console fd until the caller installs the real entry with installFd,
+/// or hands it back with releaseFd.
 pub fn allocFd(pcb: *process.PCB) ?usize {
+    pcb.fd_lock.acquire();
+    defer pcb.fd_lock.release();
     for (3..pcb.fd_table.len) |fd_idx| {
-        if (!pcb.fd_table[fd_idx].in_use) return fd_idx;
+        const e = &pcb.fd_table[fd_idx];
+        if (e.in_use) continue;
+        e.* = .{ .in_use = true, .fs_type = .console, .flags = 1 };
+        return fd_idx;
     }
     return null;
+}
+
+/// Fill a slot allocFd reserved.
+pub fn installFd(pcb: *process.PCB, fd_idx: usize, desc: process.FileDesc) void {
+    pcb.fd_lock.acquire();
+    defer pcb.fd_lock.release();
+    pcb.fd_table[fd_idx] = desc;
+}
+
+/// Hand back an fd allocFd reserved and nothing was installed into.
+pub fn releaseFd(pcb: *process.PCB, fd_idx: usize) void {
+    pcb.fd_lock.acquire();
+    defer pcb.fd_lock.release();
+    pcb.fd_table[fd_idx].in_use = false;
 }

@@ -283,42 +283,18 @@ pub fn sysFutex(uaddr: u32, op: u32, val: u32) u32 {
             const word: *const volatile u32 = @ptrFromInt(@as(usize, uaddr));
             if (word.* != val) return E_INVAL; // EAGAIN
             _ = process.currentPCB() orelse return E_FAULT;
-            return switch (process.blockOnFutex(uaddr, word, val)) {
+            return switch (process.blockOnFutex(uaddr, word, val, 0)) {
                 .again => E_INVAL, // *uaddr changed during enroll
                 .signalled => E_INTR,
-                .woke => 0,
+                .woke, .timed_out => 0,
             };
         },
         FUTEX_WAKE => {
             const me = process.currentPCB() orelse return E_FAULT;
-            var woken: u32 = 0;
-            for (0..process.MAX_PROCS) |i| {
-                if (woken >= val) break;
-                const t = &process.procs[i];
-                if (t.wait_kind != .futex or t.wait_target != uaddr) continue;
-                // Futexes are keyed by raw user VA, which is only meaningful
-                // within ONE address space — and threads (the only sharers of
-                // an address space) share tgid. Without this filter, process
-                // A waking VA X could spend its wake count on process B's
-                // unrelated waiter parked on B's own VA X: B's waiter just
-                // re-checks and re-parks (spurious wakes are in-contract),
-                // but A's REAL waiter never gets woken (val exhausted) —
-                // a lost wakeup, i.e. a stuck pthread_mutex/cond.
-                if (t.tgid != me.tgid) continue;
-                if (t.state == .unused or t.state == .zombie) continue;
-                // Route through wake(): it sets wake_pending (so a waiter still
-                // mid-enroll in blockOnFutex catches us via its Race B re-check)
-                // and flips .sleeping->.ready. Matching futex waiters that
-                // haven't reached .sleeping yet closes the enroll window the old
-                // .sleeping-only scan dropped.
-                process.wake(@intCast(i));
-                woken += 1;
-            }
-            // woken == 0 is normal (an uncontended wake with no current waiter);
-            // the old [futex.wake.miss] PCB dump was a lost-wake tripwire that
-            // the enroll-window fix makes obsolete. The wakeExpired [wake-skip]
-            // detector still catches any genuinely stuck waiter.
-            return woken;
+            // woken == 0 is normal (an uncontended wake with no current
+            // waiter); the wakeExpired [wake-skip] detector catches a waiter
+            // that really is stuck.
+            return process.wakeFutex(me.tgid, uaddr, val);
         },
         else => return 0xFFFFFFFF,
     }

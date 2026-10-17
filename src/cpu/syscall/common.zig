@@ -97,11 +97,11 @@ pub fn validateUserPtrWriteAligned(ptr: usize, len: usize, comptime align_to: us
 pub fn allocSocketFd(pcb: *process.PCB, kind: process.FsType, slot: u8) ?u32 {
     const vfs = @import("../../fs/vfs.zig");
     const fd_idx = vfs.allocFd(pcb) orelse return null;
-    pcb.fd_table[fd_idx] = .{
+    vfs.installFd(pcb, fd_idx, .{
         .in_use = true,
         .fs_type = kind,
         .inode = @as(u32, slot),
-    };
+    });
     return @intCast(fd_idx);
 }
 

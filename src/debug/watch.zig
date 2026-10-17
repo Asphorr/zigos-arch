@@ -998,11 +998,13 @@ fn isLegitKernelEspWriter(rip: u64, addr: u64) bool {
         // "proc.lifecycle.X" for these bodies; accept both prefixes.
         break :blk std.mem.eql(u8, r.name, "proc.lifecycle.create") or
             std.mem.eql(u8, r.name, "proc.lifecycle.cloneCurrent") or
+            std.mem.eql(u8, r.name, "proc.lifecycle.cloneLinuxThread") or
             std.mem.eql(u8, r.name, "proc.lifecycle.createKernelIdle") or
             std.mem.eql(u8, r.name, "proc.lifecycle.createKernelTask") or
             std.mem.eql(u8, r.name, "proc.lifecycle.forkCurrent") or
             std.mem.eql(u8, r.name, "proc.process.create") or
             std.mem.eql(u8, r.name, "proc.process.cloneCurrent") or
+            std.mem.eql(u8, r.name, "proc.process.cloneLinuxThread") or
             std.mem.eql(u8, r.name, "proc.process.createKernelIdle") or
             std.mem.eql(u8, r.name, "proc.process.createKernelTask") or
             std.mem.eql(u8, r.name, "proc.process.forkCurrent");

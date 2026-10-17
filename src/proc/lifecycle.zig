@@ -6,9 +6,9 @@
 //!   * allocSlot + resetPcbExceptState — the .unused→.loading CAS plus the
 //!     verbatim field reset that the four constructors (create,
 //!     createKernelIdle, createKernelTask, cloneCurrent) share.
-//!   * create / cloneCurrent / forkCurrent — user-process / thread / fork
-//!     PCB constructors. Each builds a synthetic kstack frame so the next
-//!     dispatch lands in the right ring-3 RIP/RSP.
+//!   * create / cloneCurrent / cloneLinuxThread / forkCurrent — user-process /
+//!     thread / Linux thread / fork PCB constructors. Each builds a synthetic
+//!     kstack frame so the next dispatch lands in the right ring-3 RIP/RSP.
 //!   * kernelIdle + createKernelIdle / createIdleProcess / createKernelTask
 //!     — kernel-mode PCBs (one idle per CPU, plus desktop and friends).
 //!   * setInflightSlot / clearInflightSlot / reclaimInflightSlot and the
@@ -239,28 +239,11 @@ pub fn cloneCurrent(entry: usize, stack_top: usize, arg: usize, fs_base: u64) ?u
     const i = allocSlot() orelse return null;
     resetPcbExceptState(&process.procs[i]); // state stays .loading from allocSlot's CAS
 
-    // Inherit thread-group + address space from the lead thread.
-    process.procs[i].tgid = parent_lead.tgid;
-    // Threads share the leader's process group + session — they're not
-    // separate processes. setpgid/setsid on a thread mutates the whole
-    // group's leader (matches Linux pthread semantics).
-    process.procs[i].pgid = parent_lead.pgid;
-    process.procs[i].sid = parent_lead.sid;
-    process.procs[i].page_directory = parent_lead.page_directory;
-    process.procs[i].page_dir_phys = parent_lead.page_dir_phys;
-    process.procs[i].pcid = parent_lead.pcid;
-
-    // Copy per-thread defaults that need to mirror the parent for
-    // sane scheduling. fd_table is COPIED for now (Linux would
-    // share via CLONE_FILES; we punt). sigactions copied likewise.
-    process.procs[i].fd_table = parent_lead.fd_table;
-    process.procs[i].sigactions = parent_lead.sigactions;
-    process.procs[i].cwd = parent_lead.cwd;
-    process.procs[i].cwd_len = parent_lead.cwd_len;
-    process.procs[i].name = parent_lead.name;
-    process.procs[i].name_len = parent_lead.name_len;
-    process.procs[i].priority = parent.priority;
-    process.procs[i].parent_pid = @intCast(parent_lead.tgid);
+    joinGroup(&process.procs[i], parent, parent_lead);
+    if (groupExiting(&process.procs[i])) {
+        process.setState(i, .unused);
+        return null;
+    }
     process.procs[i].fs_base = fs_base;
 
     // Kernel stack image: same dispatch contract as create() but with
@@ -303,6 +286,117 @@ pub fn cloneCurrent(entry: usize, stack_top: usize, arg: usize, fs_base: u64) ?u
     // so setState's rqEnter lands on the right per-CPU runqueue.
     process.assignInitialCpu(i);
     process.setState(i, .ready);
+    @import("../debug/kasan.zig").markPcbAlive(slot_base + KSTACK_GUARD_SIZE, KSTACK_SIZE);
+    return i;
+}
+
+/// What a new thread takes from its group: the tgid, process group and
+/// session (a thread is not a process of its own: setpgid/setsid on it act
+/// on the lead), the address space with its PCID, and copies of the
+/// process-level state native thread code reads off its own PCB. The fd
+/// table copy is what a native thread uses; the Linux layer goes to the
+/// lead's table instead, which is how Linux threads share one.
+fn joinGroup(child: *PCB, parent: *const PCB, parent_lead: *const PCB) void {
+    child.tgid = parent_lead.tgid;
+    child.pgid = parent_lead.pgid;
+    child.sid = parent_lead.sid;
+    child.page_directory = parent_lead.page_directory;
+    child.page_dir_phys = parent_lead.page_dir_phys;
+    child.pcid = parent_lead.pcid;
+    child.fd_table = parent_lead.fd_table;
+    child.sigactions = parent_lead.sigactions;
+    child.cwd = parent_lead.cwd;
+    child.cwd_len = parent_lead.cwd_len;
+    child.name = parent_lead.name;
+    child.name_len = parent_lead.name_len;
+    child.priority = parent.priority;
+    child.parent_pid = parent_lead.tgid;
+}
+
+/// True when the new thread `child`'s group is being killed: the caller
+/// drops the slot. The killer stores group_exiting, then makes one pass
+/// over the slots; the tgid joinGroup stored is fenced ahead of the flag
+/// read, so either that pass sees this thread or this sees the flag.
+fn groupExiting(child: *const PCB) bool {
+    asm volatile ("mfence" ::: .{ .memory = true });
+    return @atomicLoad(bool, &process.procs[child.tgid].group_exiting, .seq_cst);
+}
+
+/// What a Linux clone(CLONE_THREAD) sets up beyond the caller's registers.
+pub const LinuxThreadSpec = struct {
+    /// The thread's user stack pointer; 0 keeps the caller's.
+    stack: usize,
+    fs_base: u64,
+    /// CLONE_CHILD_CLEARTID word, 0 for none.
+    clear_tid: usize,
+    /// CLONE_PARENT_SETTID / CLONE_CHILD_SETTID words, 0 for none. The
+    /// caller validates them (u32, writable); the tid is stored in them
+    /// before the thread can run.
+    parent_tid: usize,
+    child_tid: usize,
+};
+
+/// clone() for a Linux thread: a task in the caller's group, as with
+/// cloneCurrent, that returns from the caller's syscall with every register
+/// the caller had (musl's __clone keeps the start routine in r9) except
+/// RAX = 0 and RSP = spec.stack. Returns the tid, which is the pid.
+pub fn cloneLinuxThread(frame: *const signals.SyscallFrame, spec: LinuxThreadSpec) ?usize {
+    const parent = process.currentPCB() orelse return null;
+    const parent_lead = process.leader(parent);
+
+    const i = allocSlot() orelse return null;
+    resetPcbExceptState(&process.procs[i]); // state stays .loading from allocSlot's CAS
+
+    joinGroup(&process.procs[i], parent, parent_lead);
+    if (groupExiting(&process.procs[i])) {
+        process.setState(i, .unused);
+        return null;
+    }
+    // The Linux layer uses the lead's fd table and cwd. Without copies of
+    // its own, a path that reached for this thread's would fail rather than
+    // act on fds and a cwd as they were at clone time.
+    process.procs[i].fd_table = [_]process.FileDesc{.{}} ** MAX_FDS;
+    process.procs[i].cwd_len = 0;
+    process.procs[i].personality = .linux;
+    process.procs[i].fs_base = spec.fs_base;
+    process.procs[i].clear_child_tid = spec.clear_tid;
+    process.procs[i].signal_mask = parent.signal_mask;
+
+    // Kernel stack image: forkCurrent's, on the new stack.
+    const slot_base = @intFromPtr(&process.kstack_pool[i]);
+    const kstack_top = slot_base + KSTACK_SLOT_SIZE;
+    const f: [*]u64 = @ptrFromInt(kstack_top - dspec.pt_regs_bytes);
+    f[dspec.iretq.ss.at()] = 0x1B;
+    f[dspec.iretq.rsp.at()] = if (spec.stack != 0) spec.stack else frame.user_rsp;
+    f[dspec.iretq.rflags.at()] = frame.r11;
+    f[dspec.iretq.cs.at()] = 0x23;
+    f[dspec.iretq.rip.at()] = frame.rcx;
+    inline for (dspec.gprs.regs, 0..) |r, k| {
+        f[k] = switch (r) {
+            .rax => 0,
+            else => @field(frame, @tagName(r)),
+        };
+    }
+
+    const sched_asm = @import("sched_asm.zig");
+    const sw_base: [*]u64 = @ptrFromInt(kstack_top - dspec.total_bytes);
+    for (0..dspec.switch_frame.count) |k| sw_base[k] = 0;
+    sw_base[dspec.ret_slot] = @intFromPtr(&sched_asm.retToUserStub);
+
+    process.procs[i].kernel_esp = kstack_top - dspec.total_bytes;
+    process.procs[i].kernel_stack_top = kstack_top;
+    process.plantStackCanary(i); // P4: plant base canary BEFORE publishing the slot runnable
+    @atomicStore(usize, &process.expected_kstack_tops[i], kstack_top, .release);
+
+    // musl's thread start reads its tid from here (mutex owner ids), so it
+    // is in place before the thread is.
+    const tid: u32 = @intCast(i);
+    if (spec.parent_tid != 0) @atomicStore(u32, @as(*u32, @ptrFromInt(spec.parent_tid)), tid, .release);
+    if (spec.child_tid != 0) @atomicStore(u32, @as(*u32, @ptrFromInt(spec.child_tid)), tid, .release);
+
+    process.assignInitialCpu(i);
+    process.setState(i, .ready);
+    @import("../debug/kdbg.zig").procEvent(.create, @intCast(i), parent_lead.tgid, 0);
     @import("../debug/kasan.zig").markPcbAlive(slot_base + KSTACK_GUARD_SIZE, KSTACK_SIZE);
     return i;
 }
@@ -1305,7 +1399,7 @@ pub fn killProcessWithStatus(pid: u8, status: u32) void {
             continue;
         }
 
-        if (snap == @intFromEnum(State.running)) {
+        if (stillOnCpu(pid, snap)) {
             // Case 2: another CPU is running pid. IPI to wake it into
             // schedule(); schedule's exit_requested check at top runs
             // destroyCurrentWithStatus on the target CPU.
@@ -1331,7 +1425,7 @@ pub fn killProcessWithStatus(pid: u8, status: u32) void {
             var spin: u32 = 0;
             while (spin < 1_000_000) : (spin += 1) {
                 const s = @atomicLoad(u8, @as(*const u8, @ptrCast(&process.procs[pid].state)), .acquire);
-                if (s != @intFromEnum(State.running)) break;
+                if (!stillOnCpu(pid, s)) break;
                 asm volatile ("pause" ::: .{ .memory = true });
             }
             continue;
@@ -1351,6 +1445,17 @@ pub fn killProcessWithStatus(pid: u8, status: u32) void {
         tearDownTask(pid, status, .kill, false);
         return;
     }
+}
+
+/// pid (in state `state`) still executes on its CPU: .running, or .sleeping /
+/// .ready while that CPU hasn't switched away yet — between a blocker's
+/// setState(.sleeping) and its yield, or a preempted task before its context
+/// is saved. Torn down from here, it could roll back to .running past the
+/// teardown and return to user mode on a freed address space.
+fn stillOnCpu(pid: u8, state: u8) bool {
+    if (state == @intFromEnum(State.running)) return true;
+    if (state != @intFromEnum(State.sleeping) and state != @intFromEnum(State.ready)) return false;
+    return @atomicLoad(bool, &process.procs[pid].on_cpu, .acquire);
 }
 
 /// Tear down a process its constructor still holds in .loading, after a
@@ -1388,15 +1493,8 @@ pub fn killThreadGroup(tgid: u8, status: u32) void {
     // Phase 1: kill every peer OTHER than the current thread. Defer self so
     // tearDownTask on peers (which reads procs[tgid].regions etc) can
     // finish before we tear our own kstack out from under this call.
-    var i: u8 = 0;
-    while (i < MAX_PROCS) : (i += 1) {
-        const p = &process.procs[i];
-        const s = p.state;
-        if (s == .unused or s == .zombie) continue;
-        if (p.tgid != tgid) continue;
-        if (my_pid_opt) |cur| if (cur == i) continue;
-        killProcessWithStatus(i, status);
-    }
+    if (tgid < MAX_PROCS) @atomicStore(bool, &process.procs[tgid].group_exiting, true, .seq_cst);
+    killPeers(tgid, my_pid_opt, status);
 
     // Phase 2: if current is in the group, self-destroy. Mirrors the case-1
     // self-escalation inside killProcessWithStatus — destroyCurrentWithStatus
@@ -1411,6 +1509,33 @@ pub fn killThreadGroup(tgid: u8, status: u32) void {
             }
         }
     }
+}
+
+/// Kill every live member of `tgid` but `except`.
+fn killPeers(tgid: u8, except: ?usize, status: u32) void {
+    var i: u8 = 0;
+    while (i < MAX_PROCS) : (i += 1) {
+        const p = &process.procs[i];
+        const s = p.state;
+        if (s == .unused or s == .zombie) continue;
+        if (p.tgid != tgid) continue;
+        if (except) |cur| if (cur == i) continue;
+        killProcessWithStatus(i, status);
+    }
+}
+
+/// Linux exit_group(): the caller's whole group exits with `status`, the
+/// other threads killed first as in killThreadGroup, the caller last through
+/// the graceful self-exit (a voluntary exit persists shared dirty pages).
+pub fn exitThreadGroup(status: u32) void {
+    const cur = smp.myCpu().current_pid orelse return;
+    const tgid = process.procs[cur].tgid;
+    // A lead that exited first stays pinned until the group empties; the
+    // status its parent reads is the group's.
+    if (cur != tgid and process.procs[tgid].state == .zombie) process.procs[tgid].exit_status = status;
+    @atomicStore(bool, &process.procs[tgid].group_exiting, true, .seq_cst);
+    killPeers(tgid, cur, status);
+    destroyCurrentGraceful(status);
 }
 
 // =============================================================================
