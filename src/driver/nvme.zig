@@ -321,7 +321,31 @@ const NvmeWaiter = struct {
     /// vs "the SQ has someone else's cmd in our slot." Set in
     /// `ioCommandAsync` between alloc and doorbell; 0xFFFF = never set.
     sq_slot: u16 = 0xFFFF, // doorbell-fenced
+    /// TSC at the doorbell and when reapCq saw the completion (latency stats).
+    submit_tsc: u64 = 0, // doorbell-fenced
+    reap_tsc: u64 = 0, // written before `completed` (release)
 };
+
+/// Command latency split, for the I/O probes: doorbell -> reapCq sees the
+/// CQE (the device and the interrupt), and reapCq -> the waiter running
+/// again (the wakeup). Racy sums; diagnostics only.
+pub var lat_device_cycles: u64 = 0;
+pub var lat_wake_cycles: u64 = 0;
+pub var lat_count: u64 = 0;
+/// Of lat_device_cycles: doorbell -> the MSI-X handler, the rest being the
+/// handler -> reapCq hop.
+pub var lat_irq_cycles: u64 = 0;
+/// When the MSI-X handler last ran (any controller).
+var last_irq_tsc: u64 = 0;
+
+fn noteLatency(w: *const NvmeWaiter, woke_tsc: u64) void {
+    if (w.submit_tsc == 0 or w.reap_tsc < w.submit_tsc or woke_tsc < w.reap_tsc) return;
+    lat_device_cycles +%= w.reap_tsc - w.submit_tsc;
+    lat_wake_cycles +%= woke_tsc - w.reap_tsc;
+    const irq = @atomicLoad(u64, &last_irq_tsc, .monotonic);
+    lat_irq_cycles +%= if (irq > w.submit_tsc and irq <= w.reap_tsc) irq - w.submit_tsc else w.reap_tsc - w.submit_tsc;
+    lat_count +%= 1;
+}
 
 /// Pack a slot index + generation counter into the 16-bit CID we write
 /// into the SQE. The device echoes this back unchanged in the CQE.
@@ -372,10 +396,6 @@ const SqState = struct {
     /// CID counter for the admin/sync paths (allocCid's packed CIDs are a
     /// separate, lockless per-slot scheme).
     next_cid: u16 = 1,
-    /// MSI-X retarget cache — the addr most recently written to the I/O
-    /// vector's table entry, so the submit path can skip the
-    /// mask/write/unmask cycle when the calling CPU hasn't changed.
-    msix_current_addr: u64 = 0,
 };
 
 /// Reap-side I/O-CQ state, behind "cq_lock". Held by reapCq (IRQ context)
@@ -454,13 +474,6 @@ const Controller = struct {
     // stays polled because it's only used during init.
     use_msix: bool = false, // (c) probed at init
     msix_cap: msix.Cap = undefined, // (c)
-    // Absolute virtual address of the I/O CQ's MSI-X table entry — saved
-    // at init so the per-call retarget in the submit paths doesn't have
-    // to re-walk the cap structure. data is the vector word writeEntry
-    // needs; addr is recomputed each call from the current CPU's APIC ID
-    // (the retarget cache lives in SqState.msix_current_addr).
-    msix_io_entry: usize = 0, // (c) cached MSI-X table-entry VA
-    msix_data: u32 = 0, // (c) data word for the I/O vector
 
     // When true, IRQs scan the I/O CQ + wake waiters. When false, IRQs
     // only bump irq_count and ioCommand polls the CQ inline. Phase C
@@ -508,6 +521,7 @@ pub var irq_count: u64 = 0;
 /// inline-reap measured ~18 ms/call before deferral fixed the slice penalty).
 fn nvmeIrqHandler() callconv(.c) void {
     irq_count +%= 1;
+    @atomicStore(u64, &last_irq_tsc, @import("../debug/perf.zig").rdtsc(), .monotonic);
     if (!ASYNC_BUILD_ENABLED) return;
     // Only kick the bottom-half when there's async work to reap. In sync mode
     // the submit path polls the CQ itself (waitCompletion), and ksoftirqd's
@@ -637,9 +651,6 @@ fn initController(c: *Controller, dev: pci.PciDevice, idx: usize) bool {
     if (msix.armOne(dev, 1, nvmeIrqHandler)) |armed| {
         c.msix_cap = armed.cap;
         c.use_msix = true;
-        c.msix_io_entry = armed.entry_addr;
-        c.msix_data = armed.vector.data;
-        seedMsixRetargetCache(c, armed.vector.addr);
         debug.klog("[nvme] ctrl#{d} MSI-X armed: tbl_sz={d} IDT vec=0x{x} dest=0x{x}\n", .{
             idx, armed.cap.table_size, armed.vector.irq_vector, armed.vector.addr,
         });
@@ -703,10 +714,10 @@ fn initController(c: *Controller, dev: pci.PciDevice, idx: usize) bool {
     // and the field on Controller is gone. No allocation needed here.
 
     // Per-CID bounce buffers + PRP list pages for the async path.
-    // BOUNCE_PAGES_PER_SLOT contiguous pages per slot (32 KiB at the
-    // default 8) so a single command can transfer up to 64 sectors;
-    // one extra page per slot for the PRP list when the transfer
-    // spans > 2 pages. IOMMU-map both ranges so the device can DMA.
+    // BOUNCE_PAGES_PER_SLOT contiguous pages per slot so a single command
+    // can transfer up to MAX_SECTORS_PER_CMD sectors; one extra page per
+    // slot for the PRP list when the transfer spans > 2 pages. IOMMU-map
+    // both ranges so the device can DMA.
     var ci: usize = 0;
     while (ci < Q_DEPTH) : (ci += 1) {
         const bb = init_state.trackAllocN(BOUNCE_PAGES_PER_SLOT) orelse return false;
@@ -869,13 +880,6 @@ const AdminArgs = struct {
 // reference-llvm-anon-struct-bitcode-bug, round 3). Byte-identical logic in
 // a small named helper passes.
 
-/// Seed the MSI-X retarget cache (initController, BSP-only: uncontended).
-fn seedMsixRetargetCache(c: *Controller, addr: u64) void {
-    const sqh = c.sq.acquire();
-    defer sqh.release();
-    sqh.ptr.msix_current_addr = addr;
-}
-
 /// Reset the sync/admin CID counter (init + S3 resume, BSP-only).
 fn resetNextCid(c: *Controller) void {
     const sqh = c.sq.acquire();
@@ -915,28 +919,21 @@ fn drawCid(c: *Controller) u16 {
     return v;
 }
 
-/// MSI-X message address steering a completion to this CPU. myCpuId is the
-/// LAPIC id from one rdtscp; the LAPIC ID register would cost a VM exit per
-/// command.
-fn msixAddrThisCpu() u64 {
-    const dest_id: u64 = @import("../cpu/smp.zig").myCpuId();
-    return 0xFEE00000 | (dest_id << 12);
-}
-
 /// The submit critical section every async path shares (and the fourth
-/// copy the old code asked to "keep in sync" by hand): MSI-X retarget +
-/// SQE write at the tail slot + tail bump + doorbell, under the sq token.
-/// Callers run buildPrp and all waiter setup OUTSIDE the window — that is
-/// per-slot state owned via the allocCid CAS, so the hold stays exactly
-/// "order the shared tail + doorbell".
-fn submitSqeLocked(c: *Controller, slot_idx: u16, cid: u16, opcode: u8, prp1: u64, prp2: u64, cdw10: u32, cdw11: u32, cdw12: u32, new_msix_addr: u64) void {
+/// copy the old code asked to "keep in sync" by hand): SQE write at the
+/// tail slot + tail bump + doorbell, under the sq token. Callers run
+/// buildPrp and all waiter setup OUTSIDE the window — that is per-slot
+/// state owned via the allocCid CAS, so the hold stays exactly "order the
+/// shared tail + doorbell".
+///
+/// The I/O vector stays on the CPU it was armed for; a waiter elsewhere is
+/// woken by the reaper. Steering it to each submitter instead cost a table
+/// rewrite (mask, read-back, addr, data, unmask: an exit each, plus the
+/// host rebuilding its interrupt routes) whenever the submitting CPU
+/// changed, with IRQs off.
+fn submitSqeLocked(c: *Controller, slot_idx: u16, cid: u16, opcode: u8, prp1: u64, prp2: u64, cdw10: u32, cdw11: u32, cdw12: u32) void {
     const sqh = c.sq.acquireIrqSave();
     defer sqh.release();
-    if (c.use_msix and sqh.ptr.msix_current_addr != new_msix_addr) {
-        msix.writeEntry(c.msix_io_entry, new_msix_addr, c.msix_data, false);
-        sqh.ptr.msix_current_addr = new_msix_addr;
-        io_msix_retargets += 1;
-    }
     const sq_tail_at_submit = sqh.ptr.tail;
     c.waiters[slot_idx].sq_slot = sq_tail_at_submit;
     const slot_addr = c.io_sq + @as(usize, sq_tail_at_submit) * 64;
@@ -1074,9 +1071,7 @@ fn waitCompletion(c: *const Controller, cq_phys: usize, head_ptr: *u16, phase_pt
     // rdtsc deadline is bounded regardless of interrupt state.
     //
     // NVMe normal completion latency is <100µs; pause-spinning for that
-    // long is essentially free (~hundreds of µs of CPU). The MSI-X retarget
-    // logic above is now a no-op for waking us but still ensures the IRQ
-    // handler runs on the right CPU when the device completes.
+    // long is essentially free (~hundreds of µs of CPU).
     // Both clocks at the start of the wait — the deadlines below run on the
     // GUEST-RUN ruler (2026-09-16, steal-aware time): ep.runElapsed() is
     // the TSC minus the host pause accrued since, so a kill -STOP / Hyper-V
@@ -1231,7 +1226,6 @@ fn waitCompletion(c: *const Controller, cq_phys: usize, head_ptr: *u16, phase_pt
 pub var io_call_count: u64 = 0;
 pub var io_total_cycles: u64 = 0;
 pub var io_wait_cycles: u64 = 0;
-pub var io_msix_retargets: u64 = 0;
 pub var io_max_wait_cycles: u64 = 0;
 
 /// Invalidate the guest CPU's cached copy of a device-DMA'd buffer before the
@@ -1261,19 +1255,17 @@ fn invalidateDmaRange(virt: usize, len: usize) void {
 
 /// Bounce buffer size per CID slot, in 4 KiB pages. Contiguous in
 /// physical memory so the SQE can describe it with one PRP page list.
-/// 8 pages × 4 KiB = 32 KiB per slot → MAX_SECTORS_PER_CMD = 64.
-/// 16 slots × 32 KiB = 512 KiB per controller (was 64 KiB at 1 page/slot).
-const BOUNCE_PAGES_PER_SLOT: u32 = 8;
+/// 32 pages × 4 KiB = 128 KiB per slot → MAX_SECTORS_PER_CMD = 256.
+/// 16 slots × 128 KiB = 2 MiB per controller. A command costs ~0.3-1 ms
+/// under nested virtualization whatever its size, so fewer, bigger ones win;
+/// QEMU's NVMe takes up to 512 KiB (MDTS 7).
+const BOUNCE_PAGES_PER_SLOT: u32 = 32;
 const BOUNCE_BYTES_PER_SLOT: u32 = BOUNCE_PAGES_PER_SLOT * 4096;
 
-/// Max sectors per NVMe command. Bounded by the bounce buffer (each cmd
-/// must fit in BOUNCE_PAGES_PER_SLOT pages = 32 KiB = 64 sectors at the
-/// hardware-mandated 512 B sector size). Larger transfers split at the
-/// caller via readSectorsSecondary's loop. Pre-2026-05-20 this was 8
-/// (single-PRP, no list) and an 963 KB app load took ~241 commands; with
-/// 64 it's ~30 commands — 8× fewer iothread round-trips, which is the
-/// actual bottleneck on QEMU NVMe.
-const MAX_SECTORS_PER_CMD: u32 = 64;
+/// Max sectors per NVMe command: what fits the bounce buffer at the
+/// hardware-mandated 512 B sector size. Larger transfers split at the
+/// caller via readSectorsSecondary's loop.
+const MAX_SECTORS_PER_CMD: u32 = BOUNCE_BYTES_PER_SLOT / 512;
 
 /// Issue an N-sector I/O (1..MAX_SECTORS_PER_CMD). Bounce-buffers the
 /// data through the per-controller scratch page so the user buffer can
@@ -1335,13 +1327,6 @@ fn ioCommand(c: *Controller, opcode: u8, lba: u32, user_buf: usize, sectors: u32
 
     storeBarrier();
 
-    // Gap #15 (2026-05-20): the original MSI-X retarget here aimed to
-    // steer the IRQ to the CPU doing `sti; hlt`. waitCompletion has
-    // since moved to pause-spin (the `use_irq` param is discarded;
-    // line ~530), so retargeting MSI-X does nothing useful in this
-    // sync path — pause-spin doesn't sleep on IRQ. Async retarget in
-    // ioCommandAsync below still matters because that path genuinely
-    // waits via MWAIT / blockOn. Deleted the dead retarget block here.
 
     sqh.ptr.tail = (sqh.ptr.tail + 1) % Q_DEPTH;
     sqDoorbell(c, 1).* = @as(u32, sqh.ptr.tail);
@@ -1506,6 +1491,7 @@ fn reapCq(c: *Controller) bool {
             if (w.active and w.gen == expected_gen) {
                 w.status_code = sc;
                 w.success = (sc == 0);
+                w.reap_tsc = @import("../debug/perf.zig").rdtsc();
                 @atomicStore(bool, &w.completed, true, .release);
                 // Stage — dispatch below, outside cq_lock.
                 pending[pending_count] = .{
@@ -1698,22 +1684,14 @@ fn ioCommandAsync(c: *Controller, ctrl_idx: u32, opcode: u8, lba: u32, user_buf:
         @memcpy(dst[0..xfer_bytes], src[0..xfer_bytes]);
     }
 
-    // MSI-X retarget: msix_current_addr is shared per-controller, but
-    // updates are idempotent (any LAPIC that the IRQ delivers to can
-    // handle the wake — pid lookup is global). Two CPUs racing to write
-    // distinct dest_ids would just oscillate; pick one with a brief
-    // io_lock window OR move this OUT entirely. For now keep inside the
-    // narrow lock below — costs one MMIO write on the rare retarget.
-    const new_msix_addr: u64 = if (c.use_msix) msixAddrThisCpu() else 0;
-
     // ---- Narrow critical section: submitSqeLocked (SQE at tail + tail bump
-    // + doorbell; the MSI-X retarget piggy-backs there, idempotent). What it
-    // does NOT protect stays lockless: allocCid / waiter setup / bounce copy
-    // above, and buildPrp here — prp_list_phys[slot_idx] is per-slot state
-    // owned via the allocCid CAS, so the hold covers only the genuinely
-    // shared tail + doorbell.
+    // + doorbell). What it does NOT protect stays lockless: allocCid /
+    // waiter setup / bounce copy above, and buildPrp here —
+    // prp_list_phys[slot_idx] is per-slot state owned via the allocCid CAS,
+    // so the hold covers only the genuinely shared tail + doorbell.
     const prp = buildPrp(c, slot_idx, xfer_bytes);
-    submitSqeLocked(c, slot_idx, cid, opcode, prp.prp1, prp.prp2, lba, 0, sectors - 1, new_msix_addr);
+    c.waiters[slot_idx].submit_tsc = @import("../debug/perf.zig").rdtsc();
+    submitSqeLocked(c, slot_idx, cid, opcode, prp.prp1, prp.prp2, lba, 0, sectors - 1);
 
     // ---- Wait phase: yield until IRQ reaper wakes us ----
     const t_wait_start = @import("../debug/perf.zig").rdtsc(); // wall, for the io_wait stats
@@ -1816,6 +1794,7 @@ fn ioCommandAsync(c: *Controller, ctrl_idx: u32, opcode: u8, lba: u32, user_buf:
     }
 
     const success = c.waiters[slot_idx].success;
+    noteLatency(&c.waiters[slot_idx], t_wait_end);
 
     // Copy bounce → user for reads BEFORE freeing the CID, otherwise a
     // racing submitter could reuse the bounce buffer.
@@ -1903,10 +1882,8 @@ fn submitDatalessAsync(
     const cur_pid: u8 = if (smp.currentPid()) |p| @intCast(p) else 0xFF;
     c.waiters[slot_idx].wake = .{ .pid = cur_pid };
 
-    const new_msix_addr: u64 = if (c.use_msix) msixAddrThisCpu() else 0;
-
     // Narrow critical section: submitSqeLocked — see ioCommandAsync.
-    submitSqeLocked(c, slot_idx, cid, opcode, prp1, 0, cdw10, cdw11, cdw12, new_msix_addr);
+    submitSqeLocked(c, slot_idx, cid, opcode, prp1, 0, cdw10, cdw11, cdw12);
 
     // Wait phase — same shape as ioCommandAsync (guest-run ruler).
     var wait_ep = pause.Epoch.now();
@@ -2321,11 +2298,9 @@ pub fn submitAsyncCallback(
     // Wake mode = callback (per-slot, owned by us via the CAS in allocCid).
     c.waiters[slot_idx].wake = .{ .cb = .{ .callback = callback, .ctx = ctx } };
 
-    const new_msix_addr: u64 = if (c.use_msix) msixAddrThisCpu() else 0;
-
     // Narrow critical section: submitSqeLocked — see ioCommandAsync.
     const prp = buildPrp(c, slot_idx, xfer_bytes);
-    submitSqeLocked(c, slot_idx, cid, opcode, prp.prp1, prp.prp2, lba, 0, sectors - 1, new_msix_addr);
+    submitSqeLocked(c, slot_idx, cid, opcode, prp.prp1, prp.prp2, lba, 0, sectors - 1);
 
     out_packed_cid.* = cid;
     return true;
@@ -2397,11 +2372,10 @@ fn submitReadNoWait(ctrl_idx: u32, lba: u32, sectors: u32, out_cid: *u16) bool {
     const cur_pid: u8 = if (smp.currentPid()) |p| @intCast(p) else 0xFF;
     c.waiters[slot_idx].wake = .{ .pid = cur_pid };
 
-    const new_msix_addr: u64 = if (c.use_msix) msixAddrThisCpu() else 0;
-
     // Narrow critical section: submitSqeLocked — see ioCommandAsync.
     const prp = buildPrp(c, slot_idx, xfer_bytes);
-    submitSqeLocked(c, slot_idx, cid, IO_READ, prp.prp1, prp.prp2, lba, 0, sectors - 1, new_msix_addr);
+    c.waiters[slot_idx].submit_tsc = @import("../debug/perf.zig").rdtsc();
+    submitSqeLocked(c, slot_idx, cid, IO_READ, prp.prp1, prp.prp2, lba, 0, sectors - 1);
 
     out_cid.* = cid;
     return true;
@@ -2467,13 +2441,15 @@ fn readSectorsPipelined(c: *Controller, ctrl_idx: u32, lba: u32, count: u32, des
             proc.blockOn(.nvme_io, rep_target);
             _ = reapCq(c); // safety net for a lost MSI-X (mirrors ioCommandAsync)
         }
-        wait_total +%= perf.rdtsc() -% t_wait;
+        const t_woke = perf.rdtsc();
+        wait_total +%= t_woke -% t_wait;
 
         // ---- copy each chunk bounce -> dest, free the cid ----
         var i: u32 = 0;
         var wave_ok = true;
         while (i < wave) : (i += 1) {
             const slot = cidSlot(cids[i]);
+            noteLatency(&c.waiters[slot], t_woke);
             if (c.waiters[slot].success) {
                 const bphys = c.bounce_bufs[slot];
                 const src_va = paging.physToVirt(bphys);

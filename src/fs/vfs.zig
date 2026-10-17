@@ -878,7 +878,6 @@ pub fn loadFileFresh(name: []const u8) ?FreshFile {
     const io_calls0 = nvme.io_call_count;
     const io_cyc0 = nvme.io_total_cycles;
     const io_wait0 = nvme.io_wait_cycles;
-    const io_retgt0 = nvme.io_msix_retargets;
     const io_irq0 = nvme.irq_count;
     nvme.io_max_wait_cycles = 0; // local-max for this load only
 
@@ -888,13 +887,12 @@ pub fn loadFileFresh(name: []const u8) ?FreshFile {
         const io_calls = nvme.io_call_count - io_calls0;
         const io_cyc = nvme.io_total_cycles - io_cyc0;
         const io_wait = nvme.io_wait_cycles - io_wait0;
-        const io_retgt = nvme.io_msix_retargets - io_retgt0;
         const io_irqs = nvme.irq_count - io_irq0;
         const max_wait = nvme.io_max_wait_cycles;
         const per_call_avg = if (io_calls > 0) (io_cyc / io_calls) else 0;
         const per_wait_avg = if (io_calls > 0) (io_wait / io_calls) else 0;
         serial.print(
-            "[vfs.timing] {s}: size={d} pages={d} fileSize={d}M alloc={d}M loadFile={d}M | nvme calls={d} cyc={d}M wait={d}M retgt={d} irqs={d} avg_call={d}c avg_wait={d}c max_wait={d}c\n",
+            "[vfs.timing] {s}: size={d} pages={d} fileSize={d}M alloc={d}M loadFile={d}M | nvme calls={d} cyc={d}M wait={d}M irqs={d} avg_call={d}c avg_wait={d}c max_wait={d}c\n",
             .{
                 name,
                 size,
@@ -905,7 +903,6 @@ pub fn loadFileFresh(name: []const u8) ?FreshFile {
                 io_calls,
                 io_cyc >> 20,
                 io_wait >> 20,
-                io_retgt,
                 io_irqs,
                 per_call_avg,
                 per_wait_avg,
