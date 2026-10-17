@@ -877,12 +877,9 @@ pub fn destroyAddressSpace(pml4: [*]align(4096) u64, pml4_phys: Phys) void {
     // of thousands of times for a healthy process. PCID-preserve bit 63 is
     // deliberately NOT set: we WANT every user-VA TLB entry gone.
     //
-    // Order matters: the reload re-walks the pml4 (still mapped at
-    // pml4_phys) to refresh the kernel-half entries it inherits. If we
-    // freed pml4_phys first, the reload would walk a possibly-recycled
-    // frame. Reloading BEFORE the freeFrame keeps the walk safe; by the
-    // time the caller (destroyCurrent) switches CR3 to the next process,
-    // the kernel-half walks are TLB-cached and no longer need pml4_phys.
+    // `pml4` itself must be in no CPU's CR3, this one's included: the
+    // free-frame canary lands on its kernel-half entries, and a TLB miss
+    // in the kernel then walks them (pmm.freeFrame reports such a free).
     asm volatile (
         \\movq %%cr3, %%rax
         \\movq %%rax, %%cr3

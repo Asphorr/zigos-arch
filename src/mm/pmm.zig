@@ -982,6 +982,7 @@ pub fn freeFrame(phys: Phys) void {
     checkPhysSafety(phys_addr, "freeFrame");
     @import("../debug/kdbg.zig").pmmFree(phys_addr, ra);
     @import("../debug/kasan.zig").poison(phys_addr, FRAME_SIZE, @import("../debug/kasan.zig").SHADOW_FREED);
+    @import("../cpu/mmu/pcid.zig").reportIfLoaded(phys_addr, ra);
     // S5 canary: stamp self-referencing magic at offset 0. If anyone
     // writes to this frame while it's free, the next alloc detects it.
     pmmCanaryWrite(phys_addr);

@@ -99,6 +99,34 @@ const CpuTlb = struct {
 };
 var cpu_tlb: [smp.MAX_CPUS]CpuTlb = [_]CpuTlb{.{}} ** smp.MAX_CPUS;
 
+/// Per CPU: the PML4 in CR3 and the caller of the loadCr3 that put it there.
+var cr3_pml4: [smp.MAX_CPUS]std.atomic.Value(u64) = [_]std.atomic.Value(u64){std.atomic.Value(u64).init(0)} ** smp.MAX_CPUS;
+var cr3_loader: [smp.MAX_CPUS]usize = [_]usize{0} ** smp.MAX_CPUS;
+
+/// pmm tripwire: `frame` is being freed by the caller at `freer_ra`. If it is
+/// some CPU's PML4, the free-frame canary is about to land on that CPU's
+/// kernel-half entries, and its next TLB miss in the kernel triple-faults.
+/// Say who holds it and who loaded it, straight to the port: that CPU and
+/// often the klog drain die next.
+pub fn reportIfLoaded(frame: u64, freer_ra: usize) void {
+    var i: u8 = 0;
+    while (i < smp.MAX_CPUS) : (i += 1) {
+        if (cr3_pml4[i].load(.monotonic) != frame) continue;
+        const symbols = @import("../../debug/symbols.zig");
+        const loader = symbols.resolveKernelNearest(cr3_loader[i]);
+        const freer = symbols.resolveKernelNearest(freer_ra);
+        const cur = smp.cpus[i].current_pid;
+        const name: []const u8 = if (cur) |p| std.mem.sliceTo(&@import("../../proc/process.zig").procs[p].name, 0) else "-";
+        @import("../../debug/serial.zig").emergencyPrint("[pml4-busy] freeing 0x{X}, cpu{d}'s CR3 (pid {d} '{s}', loaded by {s}+0x{X}); freer pid {d} at {s}+0x{X}\n", .{
+            frame,                                         i,
+            cur orelse 0xFFFF,                             name,
+            if (loader) |r| r.name else "?",               if (loader) |r| r.offset else cr3_loader[i],
+            smp.currentPid() orelse 0xFFFF,                if (freer) |r| r.name else "?",
+            if (freer) |r| r.offset else freer_ra,
+        });
+    }
+}
+
 /// The PCID `cpu` has in CR3 right now (0 = kernel tables or untracked).
 pub inline fn loadedOn(cpu: u8) u16 {
     if (cpu >= smp.MAX_CPUS) return 0;
@@ -187,6 +215,11 @@ pub fn loadCr3(pml4_phys: u64, pcid: u16, _: u8) void {
     const cpu_id = smp.myCpuId();
     const aligned = pml4_phys & ~@as(u64, 0xFFF);
     const tracked = cpu_id < smp.MAX_CPUS;
+    // After the CR3 write (deferred): until then the old PML4 is still in use.
+    defer if (tracked) {
+        cr3_pml4[cpu_id].store(aligned, .seq_cst);
+        cr3_loader[cpu_id] = @returnAddress();
+    };
 
     if (!protect.pcid_supported or pcid == 0 or pcid >= MAX_PCID) {
         // Kernel tables (or no PCIDs). The last user PCID stays lazily

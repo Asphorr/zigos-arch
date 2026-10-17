@@ -2095,7 +2095,10 @@ pub fn schedule() void {
         // asm tail when next is later switched OUT and its save landed.
         @atomicStore(bool, &process.procs[next].on_cpu, true, .release);
         gdt.setTssRsp0(next, process.procs[next].kernel_stack_top);
-        if (process.procs[next].page_dir_phys != 0) {
+        // A task in its teardown no longer holds its address space up (the
+        // last member to claim frees it), and it may sleep on the way: it
+        // resumes on the kernel tables, never back on its own.
+        if (process.procs[next].page_dir_phys != 0 and !@atomicLoad(bool, &process.procs[next].teardown_marked, .acquire)) {
             pcid_mod.loadCr3(process.procs[next].page_dir_phys, process.procs[next].pcid, cpu.cpu_id);
         } else {
             pcid_mod.loadCr3(paging.getKernelPageDirPhys(), 0, cpu.cpu_id);
