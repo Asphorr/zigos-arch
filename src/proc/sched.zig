@@ -1854,6 +1854,11 @@ pub fn schedule() void {
     // section. We MUST release before calling switchTo (the lock can't be
     // held across the kernel-to-kernel switch).
     const flags = cpu.sched_lock.acquireIrqSave();
+    // An IRQ preempted the idle task mid-poll: the flag must drop before the
+    // pick, or a wake queued after it would skip the IPI while another task
+    // runs here (Dekker, as in pollIdle).
+    if (cpu.cpu_id < smp.MAX_CPUS and idle_polling[cpu.cpu_id].load(.monotonic))
+        _ = idle_polling[cpu.cpu_id].swap(false, .seq_cst);
 
     // Compute prev_save: the slot switchTo will write the prev RSP into,
     // or null to skip the save entirely. null when prev is .zombie/.unused
