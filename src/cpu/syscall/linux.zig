@@ -17,7 +17,7 @@
 //!     getdents64) plus anonymous mmap + brk for malloc.
 //!   * M3 — memory management (linux_mm.zig): mmap/munmap/mprotect/madvise/
 //!     brk on the region set, anywhere in the 512 GB window; pread/pwrite;
-//!     resource limits.
+//!     resource limits; clocks and sleeps (linux_time.zig).
 //!
 //! The native ABI (3×u32 args, native numbers, return u32) is entirely
 //! separate and untouched — the only shared edge is doSyscall's one-line
@@ -34,7 +34,10 @@ const heap = @import("../../mm/heap.zig");
 const memmap = @import("../../mm/memmap.zig");
 const config = @import("../../config.zig");
 const errno = @import("../../proc/errno.zig");
+const smp = @import("../smp.zig");
 const linux_mm = @import("linux_mm.zig");
+const linux_time = @import("linux_time.zig");
+const native_proc = @import("proc.zig");
 
 // --- Linux x86-64 errno (DISTINCT from zigos common.E_* — different values).
 // Returned to userspace as the sign-extended negative, per the kernel ABI.
@@ -86,6 +89,14 @@ const SYS_fcntl: u32 = 72;
 const SYS_getrlimit: u32 = 97;
 const SYS_setrlimit: u32 = 160;
 const SYS_prlimit64: u32 = 302;
+const SYS_sched_yield: u32 = 24;
+const SYS_nanosleep: u32 = 35;
+const SYS_gettimeofday: u32 = 96;
+const SYS_time: u32 = 201;
+const SYS_sched_getaffinity: u32 = 204;
+const SYS_clock_gettime: u32 = 228;
+const SYS_clock_getres: u32 = 229;
+const SYS_clock_nanosleep: u32 = 230;
 
 // fcntl commands (the few musl's open/opendir paths issue).
 const F_DUPFD: u64 = 0;
@@ -223,6 +234,14 @@ pub fn dispatch(num: u32, frame: *signals.SyscallFrame) u64 {
         SYS_getrlimit => return sysPrlimit(0, a1, 0, a2),
         SYS_setrlimit => return sysPrlimit(0, a1, a2, 0),
         SYS_prlimit64 => return sysPrlimit(a1, a2, a3, a4),
+        SYS_clock_gettime => return linux_time.clockGettime(a1, a2),
+        SYS_clock_getres => return linux_time.clockGetres(a1, a2),
+        SYS_gettimeofday => return linux_time.gettimeofday(a1, a2),
+        SYS_time => return linux_time.timeNow(a1),
+        SYS_nanosleep => return linux_time.nanosleep(a1, a2),
+        SYS_clock_nanosleep => return linux_time.clockNanosleep(a1, a2, a3, a4),
+        SYS_sched_yield => return native_proc.sysYield(),
+        SYS_sched_getaffinity => return sysSchedGetaffinity(a1, a2, a3),
         // isatty / line-buffering probe: musl's first stdio write does
         // ioctl(fd, TIOCGWINSZ). Reporting "not a tty" (-ENOTTY) makes it pick
         // full buffering and flush via writev at exit — exactly what we want.
@@ -735,6 +754,24 @@ fn sysPrlimit(pid: u64, resource: u64, new_va: u64, old_va: u64) u64 {
         @as(*align(1) Rlimit, @ptrFromInt(old_va)).* = rlimitOf(resource);
     }
     return 0;
+}
+
+/// sched_getaffinity(pid, len, mask): every online CPU, as one long (the
+/// bytes written, which is what the syscall returns), for any live task.
+fn sysSchedGetaffinity(pid: u64, len: u64, mask_va: u64) u64 {
+    if (pid != 0) {
+        if (pid >= process.MAX_PROCS) return err(ESRCH);
+        const s = process.procs[pid].state;
+        if (s == .unused or s == .zombie) return err(ESRCH);
+    }
+    if (len < 8 or len & 7 != 0) return err(EINVAL);
+    if (!common.validateUserPtrWrite(mask_va, 8)) return err(EFAULT);
+    var mask: u64 = 0;
+    for (&smp.cpus, 0..) |*c, i| {
+        if (@atomicLoad(bool, &c.alive, .acquire)) mask |= @as(u64, 1) << @intCast(i);
+    }
+    @as(*align(1) u64, @ptrFromInt(mask_va)).* = mask;
+    return 8;
 }
 
 /// arch_prctl(code, addr). Only ARCH_SET_FS / ARCH_GET_FS are meaningful for

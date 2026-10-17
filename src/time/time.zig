@@ -99,3 +99,8 @@ pub fn monotonicNanos() u64 {
     const now_ns = hpet.readNanos();
     return if (now_ns > boot_hpet_ns) now_ns - boot_hpet_ns else 0;
 }
+
+/// Wall-clock nanoseconds since the Unix epoch (now() at full precision).
+pub fn realtimeNanos() u64 {
+    return boot_unix_sec * 1_000_000_000 + monotonicNanos();
+}
