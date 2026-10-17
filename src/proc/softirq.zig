@@ -35,6 +35,7 @@ const std = @import("std");
 const smp = @import("../cpu/smp.zig");
 const process = @import("process.zig");
 const serial = @import("../debug/serial.zig");
+const lprof = @import("../debug/linux_prof.zig");
 
 /// Bottom-half identifiers. Each maps to one bit of `CpuLocal.softirq_pending`
 /// via its integer value, so keep the count <= 32 (the mask is a u32). Append
@@ -121,7 +122,9 @@ fn drain(cpu: *smp.CpuLocal) u32 {
                 const h = handlers[f.value];
                 if (h != 0) {
                     const fp: HandlerFn = @ptrFromInt(h);
+                    const t0 = lprof.now();
                     fp();
+                    lprof.softirq(f.value, t0);
                     ran += 1;
                 }
             }

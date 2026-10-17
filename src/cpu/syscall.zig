@@ -224,7 +224,10 @@ export fn doSyscall(sys_num: u32, arg1: u32, arg2: u32, arg3: u32, frame_raw: ?*
         if (pcb.personality == .linux) {
             const f = frame orelse return @as(u64, E_NOSYS);
             beginBody(pcb, false);
+            const lprof = @import("../debug/linux_prof.zig");
+            const t0 = lprof.now();
             const r = @import("syscall/linux.zig").dispatch(sys_num, f);
+            lprof.syscall(sys_num, t0);
             endBody(pcb);
             return r;
         }

@@ -17,6 +17,8 @@ const pmm = @import("../mm/pmm.zig");
 const nvme = @import("../driver/nvme.zig");
 const boot_phase = @import("../boot/boot_phase.zig");
 const serial = @import("../debug/serial.zig");
+const lprof = @import("../debug/linux_prof.zig");
+const time = @import("../time/time.zig");
 
 const Case = struct {
     path: []const u8,
@@ -99,7 +101,15 @@ fn runOnce(c: Case) Outcome {
 }
 
 fn check(c: Case, run: u32) void {
-    switch (runOnce(c)) {
+    // Let the last report drain out first, outside this run's time and
+    // counters (~0.1 s of UART for a report; the virtio console is instant).
+    process.kernelSleepMs(300);
+    lprof.reset();
+    const t0 = time.monotonicNanos();
+    const outcome = runOnce(c);
+    serial.print("[linuxtest] {s} run {d}: {d} ms\n", .{ c.path, run, (time.monotonicNanos() - t0) / 1_000_000 });
+    lprof.dumpAndReset(progName(c.path));
+    switch (outcome) {
         .exited => |st| if (st != 0) {
             serial.print("[linuxtest] FAIL {s} run {d}: exit status {d}\n", .{ c.path, run, st });
             failures += 1;
@@ -115,10 +125,69 @@ fn check(c: Case, run: u32) void {
     }
 }
 
+/// What a clock read and a VM exit cost on this machine.
+fn probeClock() void {
+    const perf = @import("../debug/perf.zig");
+    const per_q = @import("../time/apic.zig").tscPerQuantumSane();
+    if (per_q == 0) return;
+    const reads: u64 = 1000;
+    const t0 = perf.rdtsc();
+    var i: u64 = 0;
+    while (i < reads) : (i += 1) _ = time.monotonicNanos();
+    const cycles = perf.rdtsc() - t0;
+    serial.print("[linuxtest] clock read: {d} ns\n", .{cycles * 10_000_000 / per_q / reads});
+
+    // A port write, to the POST port (0x80) nothing listens on: a VM exit.
+    const outs: u64 = 200;
+    const t1 = perf.rdtsc();
+    i = 0;
+    while (i < outs) : (i += 1) @import("../io.zig").outb(0x80, 0);
+    serial.print("[linuxtest] port write: {d} ns\n", .{(perf.rdtsc() - t1) * 10_000_000 / per_q / outs});
+}
+
+/// What one root-disk read costs on an idle system, by size.
+fn probeDisk() void {
+    const perf = @import("../debug/perf.zig");
+    const per_q = @import("../time/apic.zig").tscPerQuantumSane();
+    if (per_q == 0) return;
+    const S = struct {
+        var buf: [128 * 1024]u8 align(4096) = undefined;
+    };
+    for ([_]u16{ 8, 64, 256 }) |sectors| {
+        const reads: u64 = 32;
+        nvme.lat_device_cycles = 0;
+        nvme.lat_wake_cycles = 0;
+        nvme.lat_irq_cycles = 0;
+        nvme.lat_count = 0;
+        const t0 = perf.rdtsc();
+        var i: u32 = 0;
+        while (i < reads) : (i += 1) {
+            // Spread over the first 256 MiB, away from each other.
+            const lba: u32 = (i * 7919 * 256) % (512 * 1024);
+            if (!nvme.readSectorsSecondary(lba, sectors, &S.buf)) {
+                serial.print("[linuxtest] disk probe: read failed\n", .{});
+                return;
+            }
+        }
+        const cycles = perf.rdtsc() - t0;
+        const n = @max(nvme.lat_count, 1);
+        serial.print("[linuxtest] disk read {d} KiB: {d} us ({d} commands: to irq {d} us, irq to reap {d} us, reap to waiter {d} us each)\n", .{
+            sectors / 2,
+            cycles * 10_000 / per_q / reads,
+            nvme.lat_count,
+            nvme.lat_irq_cycles * 10_000 / per_q / n,
+            (nvme.lat_device_cycles -| nvme.lat_irq_cycles) * 10_000 / per_q / n,
+            nvme.lat_wake_cycles * 10_000 / per_q / n,
+        });
+    }
+}
+
 pub fn taskEntry() callconv(.c) noreturn {
     // Steady state, as the desktop's first task enters it (async NVMe I/O).
     boot_phase.markComplete();
     nvme.enableAsync();
+    probeClock();
+    probeDisk();
     serial.print("[linuxtest] {d} program(s), {d} warm-up + {d} counted runs each\n", .{ CASES.len, WARMUP_RUNS, COUNTED_RUNS });
 
     for (CASES) |c| {

@@ -696,9 +696,12 @@ pub fn handleUserPageFault(cr2: usize, error_code: u64) bool {
     // The read side covers the whole resolution, I/O included: an munmap
     // (write side) waits for this fault instead of removing the region under
     // it and leaving the page this fault maps behind.
+    const lprof = @import("../debug/linux_prof.zig");
+    const t0 = lprof.now();
     lead.as_lock.acquireRead();
     const result = resolveFault(cur, pcb, pd, lead, cr2, error_code);
     lead.as_lock.releaseRead();
+    if (pcb.personality == .linux) lprof.fault(t0);
     switch (result) {
         .handled => return true,
         .unhandled => return false,

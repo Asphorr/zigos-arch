@@ -14,8 +14,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <linux/futex.h>
+#include <sys/mman.h>
 #include <sys/random.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
@@ -105,6 +108,32 @@ static void check_identity(void) {
     CHECK(sigaltstack(NULL, &old) == 0 && (old.ss_flags & SS_DISABLE), "sigaltstack reports none");
 }
 
+static long long now_ns(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec * 1000000000LL + t.tv_nsec;
+}
+
+// What the basic kernel paths cost; printed, not checked.
+static void measure_costs(void) {
+    enum { CALLS = 20000, PAGES = 2000 };
+    long long t0 = now_ns();
+    for (int i = 0; i < CALLS; i++) syscall(SYS_getppid);
+    long long t1 = now_ns();
+    static int word;
+    for (int i = 0; i < CALLS; i++) syscall(SYS_futex, &word, FUTEX_WAKE_PRIVATE, 1, NULL, NULL, 0);
+    long long t2 = now_ns();
+    char *p = mmap(NULL, PAGES * 4096L, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    long long t3 = now_ns();
+    if (p != MAP_FAILED) {
+        for (int i = 0; i < PAGES; i++) p[i * 4096L] = 1;
+        munmap(p, PAGES * 4096L);
+    }
+    long long t4 = now_ns();
+    printf("lt_basic: getppid %lld ns, futex wake %lld ns, page fault %lld ns\n",
+           (t1 - t0) / CALLS, (t2 - t1) / CALLS, (t4 - t3) / PAGES);
+}
+
 int main(int argc, char **argv) {
     CHECK(argc == 4, "argc");
     CHECK(strcmp(argv[1], "one") == 0 && strcmp(argv[2], "two") == 0 && strcmp(argv[3], "three") == 0, "argv");
@@ -139,6 +168,7 @@ int main(int argc, char **argv) {
 
     check_clocks();
     check_identity();
+    measure_costs();
 
     printf("lt_basic: PASS (%d checks)\n", check_no);
     return 0;

@@ -165,6 +165,7 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
         @import("../syscall.zig").chargeInterrupt(t);
     };
     const cpu = smp.myCpu();
+    @import("../../debug/linux_prof.zig").tick(cpu.current_pid, frame_for_validate[15], frame_for_validate[16]);
     // Once a second: TSC_AUX (what myCpu() just trusted) still equals the
     // LAPIC ID register, or demote everyone. See smp.auditCpuIdTick.
     smp.auditCpuIdTick();

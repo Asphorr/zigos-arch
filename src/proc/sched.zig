@@ -2371,6 +2371,7 @@ pub fn schedule() void {
         // (irq0.zig's contract block). IF=0 here, own-CPU state + one LAPIC
         // write; also bumps the dispatch sequence the idle loop reads.
         @import("../cpu/idt/irq0.zig").noteDispatch(cpu.cpu_id, process.procs[next].is_idle);
+        @import("../debug/linux_prof.zig").noteSwitch(cpu.cpu_id, from_pid_a);
 
         // Race fix (B.3 caught this): release the lock WITHOUT restoring IRQ
         // state. We must keep IRQs masked across switchToCall — otherwise an

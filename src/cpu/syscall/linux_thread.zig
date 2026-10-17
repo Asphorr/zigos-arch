@@ -20,6 +20,7 @@ const debug = @import("../../debug/debug.zig");
 const time = @import("../../time/time.zig");
 const common = @import("common.zig");
 const linux_time = @import("linux_time.zig");
+const lprof = @import("../../debug/linux_prof.zig");
 
 // Linux errno.
 const EPERM: i64 = 1;
@@ -162,17 +163,27 @@ pub fn futex(uaddr: u64, op: u64, val: u64, timeout: u64, uaddr2: u64, val3: u64
             if (!common.validateUserPtr(uaddr, 4)) return err(EFAULT);
             const word: *const volatile u32 = @ptrFromInt(uaddr);
             const want: u32 = @truncate(val);
-            if (word.* != want) return err(EAGAIN);
+            if (word.* != want) {
+                lprof.futex(.wait_changed);
+                return err(EAGAIN);
+            }
             if (rel) |ns| if (ns == 0) return err(ETIMEDOUT);
-            const start = time.monotonicNanos();
+            // The clock only for a timed wait: reading it costs a VM exit.
+            const start = if (rel != null) time.monotonicNanos() else 0;
             const end = start +| (rel orelse 0);
             var left = rel;
             while (true) {
                 switch (process.blockOnFutex(uaddr, word, want, if (left) |ns| deadlineAfter(ns) else 0)) {
-                    .woke => return 0,
-                    .again => return err(EAGAIN),
+                    .woke => {
+                        lprof.futex(.wait_woke);
+                        return 0;
+                    },
+                    .again => {
+                        lprof.futex(.wait_changed);
+                        return err(EAGAIN);
+                    },
                     .signalled => return err(EINTR),
-                    .timed_out => {},
+                    .timed_out => lprof.futex(.wait_timed_out),
                 }
                 // tick_count can trail the clock (a tickless CPU catches up
                 // in steps), so a tick deadline may come early: wait out the
@@ -186,7 +197,9 @@ pub fn futex(uaddr: u64, op: u64, val: u64, timeout: u64, uaddr2: u64, val3: u64
         FUTEX_WAKE, FUTEX_WAKE_BITSET => {
             if (cmd == FUTEX_WAKE_BITSET and @as(u32, @truncate(val3)) == 0) return err(EINVAL);
             const n = futexCount(val) orelse return err(EINVAL);
-            return process.wakeFutex(me.tgid, uaddr, n);
+            const woken = process.wakeFutex(me.tgid, uaddr, n);
+            lprof.futex(if (woken == 0) .wake_none else .wake_some);
+            return woken;
         },
         FUTEX_REQUEUE, FUTEX_CMP_REQUEUE => {
             const wake_n = futexCount(val) orelse return err(EINVAL);
