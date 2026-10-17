@@ -21,6 +21,7 @@ const hpet = @import("hpet.zig");
 const apic = @import("apic.zig");
 
 var boot_unix_sec: u64 = 0;
+/// HPET reading at clock 0 (moved by restartClock).
 var boot_hpet_ns: u64 = 0;
 var initialized: bool = false;
 
@@ -101,10 +102,10 @@ pub fn monotonicNanos() u64 {
 }
 
 fn hpetNanos() u64 {
-    const now_ns = hpet.readNanos();
-    // HPET counter is monotonic; saturating subtract guards against the
-    // unlikely case where init's reading raced and ended up slightly ahead.
-    return if (now_ns > boot_hpet_ns) now_ns - boot_hpet_ns else 0;
+    // Wrapping: restartClock may put the base above the counter. A reading a
+    // hair before the base (init's own race) is 0, not a wrap.
+    const d = hpet.readNanos() -% boot_hpet_ns;
+    return if (d >> 63 != 0) 0 else d;
 }
 
 // The clock runs on the TSC. An HPET read is an MMIO exit (~20 µs under
@@ -114,6 +115,8 @@ fn hpetNanos() u64 {
 // clock a little either way; clk_last keeps what callers see from going back
 // (and covers TSCs that differ slightly between CPUs).
 const ANCHOR_NS: u64 = 100_000_000;
+/// TSC skew between CPUs this clock rides out.
+const TSC_BEHIND_MAX_NS: u64 = 1_000_000;
 
 /// Anchor, written under the seqlock clk_seq (odd while being written) by
 /// whoever holds clk_busy; read lock-free.
@@ -153,7 +156,9 @@ fn tscNanos() ?u64 {
         anchor((@as(u64, 10_000_000) << 32) / per_q);
         return null;
     }
-    // A TSC a little behind the anchoring CPU's reads as the anchor itself.
+    // A TSC a little behind the anchoring CPU's reads as the anchor itself;
+    // one far behind (an AP whose TSC S3 reset) can't run this clock.
+    if (t < a_tsc and ticksToNs(a_tsc - t, mult) > TSC_BEHIND_MAX_NS) return hpetNanos();
     const dt = if (t > a_tsc) t - a_tsc else 0;
     const ns = a_ns + ticksToNs(dt, mult);
     if (ns - a_ns >= ANCHOR_NS) anchor(0);
@@ -172,8 +177,16 @@ fn anchor(first_mult: u64) void {
     defer @atomicStore(bool, &clk_busy, false, .release);
     const running = @atomicLoad(u64, &clk_mult, .acquire) != 0;
     if (!running and first_mult == 0) return;
-    const ns = hpetNanos();
-    const t = perf.rdtsc();
+    var t: u64 = undefined;
+    var ns: u64 = undefined;
+    // The better of two samples: an IRQ or a host stall inside one widens it.
+    const gap = sampleHpet(&t, &ns);
+    var t2: u64 = undefined;
+    var ns2: u64 = undefined;
+    if (sampleHpet(&t2, &ns2) < gap) {
+        t = t2;
+        ns = ns2;
+    }
     var mult = first_mult;
     if (running) {
         mult = clk_mult;
@@ -195,16 +208,41 @@ fn anchor(first_mult: u64) void {
     _ = @atomicRmw(u32, &clk_seq, .Add, 1, .acq_rel);
 }
 
+/// HPET time and the TSC at its read (the midpoint of a TSC pair around it,
+/// IRQs off); returns the pair's width in ticks.
+fn sampleHpet(tsc: *u64, ns: *u64) u64 {
+    const flags = saveAndDisableIrq();
+    defer restoreIrq(flags);
+    const t0 = perf.rdtsc();
+    ns.* = hpetNanos();
+    const t1 = perf.rdtsc();
+    const width = t1 -% t0;
+    tsc.* = t0 +% width / 2;
+    return width;
+}
+
+/// The clock starts over from HPET, going on from the last value handed out:
+/// S3 reset the TSCs (the BSP's is restored, the APs' are not) and may have
+/// reset the HPET counter. Resume path: the BSP alone, IRQs off.
+pub fn restartClock() void {
+    if (!initialized) return;
+    boot_hpet_ns = hpet.readNanos() -% @atomicLoad(u64, &clk_last, .monotonic);
+    @atomicStore(u32, &clk_seq, 0, .release);
+    @atomicStore(u64, &clk_mult, 0, .release);
+    @atomicStore(bool, &clk_busy, false, .release);
+}
+
 inline fn saveAndDisableIrq() u64 {
     var flags: u64 = undefined;
     asm volatile ("pushfq; pop %[f]; cli"
         : [f] "=r" (flags),
-    );
+        :
+        : .{ .memory = true });
     return flags;
 }
 
 inline fn restoreIrq(flags: u64) void {
-    if (flags & 0x200 != 0) asm volatile ("sti");
+    if (flags & 0x200 != 0) asm volatile ("sti" ::: .{ .memory = true });
 }
 
 /// Wall-clock nanoseconds since the Unix epoch (now() at full precision).

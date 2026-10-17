@@ -324,6 +324,8 @@ pub fn suspendToRam() u32 {
 
     // ---- RESUME path (s3_longjmp landed here from s3ResumeEntry; IF=0) ----
     serial.print("[s3] resumed: back in suspendToRam via longjmp\n", .{});
+    // While the BSP still runs alone (restartClock writes without a lock).
+    @import("../time/time.zig").restartClock();
     // S3 powered the APs down — only the BSP woke. Mark them offline first (a
     // clean single-CPU baseline that clears the stale `alive` flags), then
     // re-online them (CP2b-2b) so the machine comes back full-SMP. The re-online
