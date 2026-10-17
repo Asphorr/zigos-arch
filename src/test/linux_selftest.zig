@@ -80,16 +80,21 @@ fn runOnce(c: Case) Outcome {
     process.assignInitialCpu(pid);
     process.setState(pid, .ready);
 
+    // Done when the lead is a zombie and no thread of the group is left.
     var waited: u32 = 0;
-    while (process.procs[pid].state != .zombie) : (waited += 10) {
-        if (waited >= c.timeout_ms) {
-            process.killProcess(@intCast(pid));
-            return .timed_out;
+    var timed_out = false;
+    while (process.procs[pid].state != .zombie or process.countThreadsInGroup(@intCast(pid)) != 0) : (waited += 10) {
+        if (!timed_out and waited >= c.timeout_ms) {
+            // Every thread: a lead killed alone leaves its workers running.
+            process.killThreadGroup(@intCast(pid), 0xDEAD0000 | 9);
+            timed_out = true;
         }
+        if (timed_out and waited >= c.timeout_ms + 10_000) return .timed_out; // the kill didn't take
         process.kernelSleepMs(10);
     }
     const status = process.procs[pid].exit_status;
     process.reapZombie(@intCast(pid));
+    if (timed_out) return .timed_out;
     return .{ .exited = status };
 }
 

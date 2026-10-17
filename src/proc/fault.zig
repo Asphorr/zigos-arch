@@ -282,7 +282,26 @@ fn flushCowBreak(lead: *PCB, va: usize) void {
 /// balanced by the ordinary per-PTE freeFrame at unmap/teardown — the cache's
 /// own +1 keeps the page warm until eviction. Returns false on OOM or I/O
 /// failure (caller OOM-kills); true on success OR a benign same-page race.
-fn faultInCachePage(pd: [*]align(4096) u64, r: process.LazyRegion, va_aligned: usize) bool {
+const CacheFill = enum { mapped, no_frame, failed };
+
+/// faultInCachePage, with the anonymous path's answer to running out of
+/// frames: shed cache-only pages, then evict this process's cold anonymous
+/// pages to swap, and fill again.
+fn faultInCachePageReclaiming(pd: [*]align(4096) u64, lead: *PCB, r: process.LazyRegion, va_aligned: usize) bool {
+    var res = faultInCachePage(pd, r, va_aligned);
+    if (res == .no_frame and pmm.tryReclaim(1) > 0) res = faultInCachePage(pd, r, va_aligned);
+    var tries: u8 = 0;
+    while (res == .no_frame and tries < 8) : (tries += 1) {
+        const reserve = pmm.userReserveFrames();
+        const free_now = pmm.freeFrameCount();
+        const want: usize = if (free_now <= reserve) (reserve - free_now) + 16 else 16;
+        if (reclaimViaSwap(pd, lead, va_aligned, lead.pcid, want) == 0) break;
+        res = faultInCachePage(pd, r, va_aligned);
+    }
+    return res == .mapped;
+}
+
+fn faultInCachePage(pd: [*]align(4096) u64, r: process.LazyRegion, va_aligned: usize) CacheFill {
     const page_cache = @import("../mm/page_cache.zig");
     const vfs = @import("../fs/vfs.zig");
 
@@ -296,7 +315,7 @@ fn faultInCachePage(pd: [*]align(4096) u64, r: process.LazyRegion, va_aligned: u
         // Miss (or refcount-saturated): read the page into a PRIVATE frame with
         // NO cache lock held, THEN publish it. Filling before publishing means
         // no other CPU can ever observe a half-filled cache page.
-        const pf = pmm.allocFrameUser() orelse return false;
+        const pf = pmm.allocFrameUser() orelse return .no_frame;
         const dst = pf.toVirt().ptr([*]u8);
         const n = @min(vfs.fillCachePage(r.cache_inode, page_off, dst), 0x1000);
         if (n < 0x1000) @memset(dst[n..0x1000], 0); // zero the tail past EOF
@@ -314,7 +333,7 @@ fn faultInCachePage(pd: [*]align(4096) u64, r: process.LazyRegion, va_aligned: u
         // AlreadyMapped: another CPU faulted this exact page first — it's mapped
         // now, so the fault is resolved (that CPU's fault flagged it dirty if
         // shared). Any other error is a real failure.
-        return e == error.AlreadyMapped;
+        return if (e == error.AlreadyMapped) .mapped else .failed;
     };
     // Shared writable page: flag it dirty for writeback. Coarse by design — even a
     // read-faulted page is marked, because with a direct RW mapping a later write
@@ -325,7 +344,7 @@ fn faultInCachePage(pd: [*]align(4096) u64, r: process.LazyRegion, va_aligned: u
         : [addr] "r" (va_aligned),
         : .{ .memory = true }
     );
-    return true;
+    return .mapped;
 }
 
 /// NON-BLOCKING variant of faultInCachePage for the proactive prefault helpers
@@ -685,8 +704,10 @@ pub fn handleUserPageFault(cr2: usize, error_code: u64) bool {
         .unhandled => return false,
         .oom_kill => {
             // Logged by resolveFault. The lock is back first: the group's
-            // other threads must be able to take it while this one dies.
-            process.destroyCurrent();
+            // other threads must be able to take it while they die. The whole
+            // process goes, as for SIGKILL: its other threads would only
+            // wait forever on this one.
+            process.killThreadGroup(pcb.tgid, 0xDEAD0000 | 9);
             process.schedule();
             unreachable;
         },
@@ -764,15 +785,15 @@ fn resolveFault(cur: usize, pcb: *PCB, pd: [*]align(4096) u64, lead: *PCB, cr2: 
     // COW gate, but shared pages are RW with no COW bit, so the region skip is
     // what guarantees a cache page is never a swap entry.
     if (r.cache_inode != 0) {
-        if (faultInCachePage(pd, r, va_aligned)) {
+        if (faultInCachePageReclaiming(pd, lead, r, va_aligned)) {
             @import("../debug/kdbg.zig").pfEvent(@intCast(cur), cr2, @truncate(error_code), 0, true);
             lead.acct_current_rss +%= 1;
             if (lead.acct_current_rss > lead.acct_peak_rss) lead.acct_peak_rss = lead.acct_current_rss;
             return .handled;
         }
-        // Fill/map failed (OOM or ext2 I/O). Neither swap-in nor zero-alloc
-        // applies to a file page, so go straight to the lightweight OOM-kill
-        // (mirrors the frame_opt==null path below — no heavy autopsy under
+        // Fill/map failed (out of frames after reclaim, or ext2 I/O). Neither
+        // swap-in nor zero-alloc applies to a file page, so go to the
+        // lightweight OOM-kill (mirrors the frame_opt==null path below — no heavy autopsy under
         // memory pressure: a fat32 crash-log write would re-enter the
         // allocator and the long dump would stall the compositor).
         @import("../debug/kdbg.zig").pfEvent(@intCast(cur), cr2, @truncate(error_code), 0, false);
