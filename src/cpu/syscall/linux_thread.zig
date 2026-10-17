@@ -57,12 +57,19 @@ fn tidWordOk(va: u64) bool {
     return common.validateUserPtrWriteAligned(va, 4, 4);
 }
 
-/// clone(flags, stack, ptid, ctid, tls) — the thread shape only, as
-/// pthread_create issues it. Returns the new tid; the thread itself returns
-/// 0 on `stack`.
+/// The fork shape of clone: a new process, nothing shared; the low byte is
+/// the exit signal (SIGCHLD, or none).
+const SIGCHLD: u64 = 17;
+
+/// clone(flags, stack, ptid, ctid, tls): the thread shape, as
+/// pthread_create issues it, or the plain fork shape. Returns the new tid;
+/// the thread itself returns 0 on `stack`.
 pub fn clone(frame: *signals.SyscallFrame, flags: u64, stack: u64, ptid: u64, ctid: u64, tls: u64) u64 {
     if (flags & CLONE_THREAD == 0) {
-        debug.klog("[linux] pid={d} clone flags 0x{X}: only threads so far\n", .{ process.getCurrentPid(), flags });
+        const sig = flags & 0xFF;
+        if (flags & ~@as(u64, 0xFF) == 0 and stack == 0 and (sig == SIGCHLD or sig == 0))
+            return @import("linux_proc.zig").fork(frame);
+        debug.klog("[linux] pid={d} clone flags 0x{X}: only threads and plain forks\n", .{ process.getCurrentPid(), flags });
         return err(ENOSYS);
     }
     if (flags & THREAD_SHARES != THREAD_SHARES or flags & ~(THREAD_SHARES | THREAD_EXTRAS) != 0) return err(EINVAL);

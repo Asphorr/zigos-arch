@@ -158,6 +158,39 @@ fn pollMaskConsole(pid: u8, _: u16) u16 {
     return 0;
 }
 
+// --- poll(2) sleepers --------------------------------------------------
+//
+// A task in a Linux poll is a bit here (pid < 64) from before it first
+// checks its fds until it returns, and any fd event wakes every such task
+// by pid; each re-checks its own fds. By pid, a wake that lands before the
+// task parks is kept for it (wake_pending), so none is lost. A herd, but
+// there are few pollers.
+
+var sleepers = std.atomic.Value(u64).init(0);
+
+comptime {
+    if (process.MAX_PROCS > 64) @compileError("fdpoll.sleepers holds one bit per pid");
+}
+
+pub fn sleeperEnter(pid: usize) void {
+    _ = sleepers.fetchOr(@as(u64, 1) << @intCast(pid), .seq_cst);
+}
+
+pub fn sleeperLeave(pid: usize) void {
+    _ = sleepers.fetchAnd(~(@as(u64, 1) << @intCast(pid)), .seq_cst);
+}
+
+/// The pids in poll(2) now, as bits (diagnostics).
+pub fn sleeperMask() u64 {
+    return sleepers.load(.monotonic);
+}
+
+fn wakeSleepers() void {
+    // A locked RMW: orders the caller's state change before the read.
+    var m = sleepers.fetchOr(0, .seq_cst);
+    while (m != 0) : (m &= m - 1) process.wake(@intCast(@ctz(m)));
+}
+
 // --- Registry --------------------------------------------------------
 
 /// Reserve a waiter slot. Returns the waiter index (opaque to caller —
@@ -216,6 +249,7 @@ pub fn releaseAllForPid(pid: u8) void {
 /// fine — re-checking pollMaskHandle keeps the result coherent with
 /// the post-wake state.
 pub fn wakePollers(kind: process.FsType, id: u16) void {
+    wakeSleepers();
     const cb = completion_callback orelse return;
     // Snapshot which slots to complete under the lock, then call out
     // without holding it — completion may take long enough that we

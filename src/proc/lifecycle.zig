@@ -424,7 +424,9 @@ pub fn cloneLinuxThread(frame: *const signals.SyscallFrame, spec: LinuxThreadSpe
 /// we read RIP/RFLAGS/RSP/all GPRs from there to seed child's iretq frame.
 pub fn forkCurrent(frame: *signals.SyscallFrame) ?usize {
     const parent = process.currentPCB() orelse return null;
-    const parent_pid_u8: u8 = @intCast(smp.currentPid() orelse return null);
+    // A Linux process's children are the process's, whichever thread forked
+    // (any of them may wait4 for them).
+    const parent_pid_u8: u8 = if (parent.personality == .linux) parent.tgid else @intCast(smp.currentPid() orelse return null);
     // Process-level state (address space, regions, fd table, argv…)
     // lives on the LEAD thread. fork() from a cloned worker used to copy the
     // WORKER's own fields — empty regions, default brk/mmap_top — so
@@ -936,6 +938,41 @@ fn closePipeFds(pid: u8) void {
     }
 }
 
+/// Tasks in a Linux wait4: a bit per pid, set before the task first looks
+/// for a zombie child. A child of their process becoming reapable wakes them
+/// by pid (any thread of a process may wait for its children), so a wake
+/// between the look and the park is kept (wake_pending).
+var child_waiters = std.atomic.Value(u64).init(0);
+
+comptime {
+    if (MAX_PROCS > 64) @compileError("child_waiters holds one bit per pid");
+}
+
+pub fn childWaitEnter(pid: usize) void {
+    _ = child_waiters.fetchOr(@as(u64, 1) << @intCast(pid), .seq_cst);
+}
+
+pub fn childWaitLeave(pid: usize) void {
+    _ = child_waiters.fetchAnd(~(@as(u64, 1) << @intCast(pid)), .seq_cst);
+}
+
+/// The pids in wait4 now, as bits (diagnostics).
+pub fn childWaiterMask() u64 {
+    return child_waiters.load(.monotonic);
+}
+
+/// A child of process `parent` became reapable: wake its wait4 sleepers.
+fn wakeChildWaiters(parent: u8) void {
+    if (parent >= MAX_PROCS) return;
+    const group = process.procs[parent].tgid;
+    // A locked RMW: orders the zombie state store before the read.
+    var m = child_waiters.fetchOr(0, .seq_cst);
+    while (m != 0) : (m &= m - 1) {
+        const w: u8 = @intCast(@ctz(m));
+        if (process.procs[w].tgid == group) process.wake(w);
+    }
+}
+
 /// True if any other process is currently blocked in waitpid waiting for this
 /// dying process. waitpid wakes when its child becomes a zombie, so a parent
 /// in waitpid(child_pid) or waitpid(any) needs the kid kept around as a zombie
@@ -1115,6 +1152,9 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp, persist_shared_dirty: 
     // completes, since the OP_POLL pending slots reference them by index
     // and the worker may already have recycled the Instance slot above.
     @import("../cpu/ipc/fdpoll.zig").releaseAllForPid(@intCast(pid));
+    // Killed inside poll or wait4: its bits would wake the slot's next task.
+    @import("../cpu/ipc/fdpoll.zig").sleeperLeave(pid);
+    childWaitLeave(pid);
 
     // Resources reachable in any address space (GUI window state, GPU
     // contexts, debug symbols all live in heap / driver structures, not
@@ -1273,6 +1313,7 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp, persist_shared_dirty: 
         process.setState(pid, .zombie);
         if (parent_alive) {
             if (parentIsWaiting(@intCast(pid))) process.wake(parent);
+            wakeChildWaiters(parent);
             // SIGCHLD is default-ignored, so this is a no-op for shells
             // that don't care; shells with a SIGCHLD handler can do
             // non-blocking reaping. Sent regardless of waitpid state per POSIX.
@@ -1293,6 +1334,7 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp, persist_shared_dirty: 
         const lp_alive = lp != 0 and lp < MAX_PROCS and process.procs[lp].state != .unused;
         if (lp_alive) {
             if (parentIsWaiting(my_tgid)) process.wake(lp);
+            wakeChildWaiters(lp);
             _ = signals.send(lp, signals.SIGCHLD);
         } else {
             reapZombie(my_tgid);
@@ -1551,6 +1593,68 @@ fn killPeers(tgid: u8, except: ?usize, status: u32) void {
         if (except) |cur| if (cur == i) continue;
         killProcessWithStatus(i, status);
     }
+}
+
+/// Kill every other thread of the caller's group and wait until they are
+/// gone (a killed thread inside a no-kill section finishes it first). For
+/// execve, which then drops the address space they ran on.
+pub fn killOtherThreads() void {
+    const me = smp.currentPid() orelse return;
+    const tgid = process.procs[me].tgid;
+    // Holds off clones from the threads while they die.
+    @atomicStore(bool, &process.procs[tgid].group_exiting, true, .seq_cst);
+    killPeers(tgid, me, 0);
+    var d = @import("../util/deadline.zig").Deadline.ms(5000, "execve: other threads");
+    while (groupHasOtherLive(@intCast(me)) and d.live()) @import("sched_asm.zig").softYield();
+    if (groupHasOtherLive(@intCast(me))) debug.klog("[exec] pid={d}: threads of the group still alive after 5 s\n", .{me});
+    @atomicStore(bool, &process.procs[tgid].group_exiting, false, .seq_cst);
+}
+
+/// The per-process image fields execve trades between the caller and the
+/// slot its new image was built in.
+const IMAGE_FIELDS = .{
+    "page_directory", "page_dir_phys", "pcid",      "regions",       "heap_start",
+    "user_brk",       "brk_base",      "mmap_top",  "stack_base",    "elf_buf",
+    "elf_buf_pages",  "text_inum",     "sym_table", "swap_clock_va",
+};
+
+fn swapImages(p: *PCB, t: *PCB) void {
+    p.as_lock.acquire();
+    defer p.as_lock.release();
+    // Nobody else reaches `t`: held in .loading, never dispatched.
+    t.as_lock.acquire();
+    defer t.as_lock.release();
+    inline for (IMAGE_FIELDS) |f| std.mem.swap(@TypeOf(@field(p, f)), &@field(p, f), &@field(t, f));
+}
+
+/// execve's commit, past which there is no going back: the calling lead,
+/// alone in its group (killOtherThreads), takes the address space and image
+/// built in `img` (elf_loader.loadForExec, held in .loading); `img` takes
+/// the caller's old ones and is torn down with them, as an exiting process
+/// would be (MAP_SHARED dirty pages stay for pgflushd). Identity, fds,
+/// parent and children stay the caller's.
+pub fn takeExecImage(img: usize) void {
+    const me = smp.currentPid() orelse return;
+    const p = &process.procs[me];
+    const t = &process.procs[img];
+    swapImages(p, t);
+    // Onto the new tables before the old ones go.
+    pcid_mod.loadCr3(p.page_dir_phys, p.pcid, smp.myCpu().cpu_id);
+
+    p.name = t.name;
+    p.name_len = t.name_len;
+    p.argv = t.argv;
+    p.arg_lens = t.arg_lens;
+    p.argc = t.argc;
+    p.exe_path = t.exe_path;
+    p.exe_path_len = t.exe_path_len;
+    p.personality = t.personality;
+    p.clear_child_tid = 0;
+    p.sigactions = [_]signals.SigAction{.{}} ** config.NSIG;
+    p.in_signal_handler = false;
+
+    process.setState(img, .zombie);
+    tearDownTask(img, 0, .kill, true);
 }
 
 /// Linux exit_group(): the caller's whole group exits with `status`, the

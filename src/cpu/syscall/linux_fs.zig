@@ -23,6 +23,7 @@ const common = @import("common.zig");
 // Linux errno.
 const ENOENT: i64 = 2;
 const EIO: i64 = 5;
+const EACCES: i64 = 13;
 const EBADF: i64 = 9;
 const EFAULT: i64 = 14;
 const EEXIST: i64 = 17;
@@ -74,6 +75,7 @@ const O_TRUNC: u64 = 0x200;
 const O_APPEND: u64 = 0x400;
 const O_DIRECTORY: u64 = 0x10000;
 const O_TMPFILE: u64 = 0x410000; // includes O_DIRECTORY
+const O_CLOEXEC: u64 = 0x80000;
 
 const RENAME_NOREPLACE: u64 = 1;
 
@@ -273,7 +275,7 @@ pub fn openat(dirfd: u64, path_va: u64, lflags: u64) u64 {
             if (creat and lflags & O_EXCL != 0) return err(EEXIST);
             if (isDirInode(inum)) {
                 if (lflags & O_ACCMODE != O_RDONLY) return err(EISDIR);
-                if (vfs.openDir(pcb, path)) |fd| return fd;
+                if (vfs.openDir(pcb, path)) |fd| return opened(pcb, fd, lflags);
                 return err(if (freeFds(pcb)) ENOENT else EMFILE);
             }
             if (lflags & O_DIRECTORY != 0) return err(ENOTDIR);
@@ -283,16 +285,48 @@ pub fn openat(dirfd: u64, path_va: u64, lflags: u64) u64 {
     if (creat) zflags |= vfs.O_CREATE;
     if (lflags & O_TRUNC != 0) zflags |= vfs.O_TRUNC;
     if (lflags & O_APPEND != 0) zflags |= vfs.O_APPEND;
-    if (vfs.openFlags(pcb, path, zflags)) |fd| return fd;
+    if (vfs.openFlags(pcb, path, zflags)) |fd| return opened(pcb, fd, lflags);
     // A missing file whose directory is missing too, or a full table.
     return err(if (freeFds(pcb)) ENOENT else EMFILE);
+}
+
+/// A new fd, its O_CLOEXEC recorded.
+fn opened(pcb: *process.PCB, fd: u32, lflags: u64) u64 {
+    pcb.fd_table[fd].cloexec = lflags & O_CLOEXEC != 0;
+    return fd;
 }
 
 pub fn close(fd: u64) u64 {
     const pcb = proc() orelse return err(EFAULT);
     if (fd >= pcb.fd_table.len) return err(EBADF);
-    if (vfs.close(pcb, @intCast(fd)) != 0) return err(EBADF);
+    if (vfs.closeSlot(pcb, @intCast(fd)) != 0) return err(EBADF);
     return 0;
+}
+
+/// What execve runs: an ext2 file, and its absolute name.
+pub const ExecTarget = struct { inum: u32, size: u64, path: []const u8 };
+pub const ExecLookup = union(enum) { file: ExecTarget, fail: u64 };
+
+/// The file execve's `path_va` names (relative to the cwd), its absolute
+/// name in `out`.
+pub fn execTarget(path_va: u64, out: *[256]u8) ExecLookup {
+    const pcb = proc() orelse return .{ .fail = err(EFAULT) };
+    var bufs: Bufs = .{};
+    const path = switch (userAtPath(pcb, AT_FDCWD, path_va, &bufs, false)) {
+        .path => |p| p,
+        .fail => |e| return .{ .fail = e },
+    };
+    var rbuf: [256]u8 = undefined;
+    const r = vfs.resolvePath(pcb, path, &rbuf) orelse return .{ .fail = err(ENOENT) };
+    if (r.fs != .ext2) return .{ .fail = err(EACCES) };
+    const inum = ext2.lookupPath(r.path) orelse return .{ .fail = err(ENOENT) };
+    const ino = ext2_inode.readInode(inum) orelse return .{ .fail = err(EIO) };
+    if (ext2_inode.isDir(&ino)) return .{ .fail = err(EACCES) };
+    const rel = std.mem.trimLeft(u8, r.path, "/");
+    if (rel.len + 1 > out.len) return .{ .fail = err(ENAMETOOLONG) };
+    out[0] = '/';
+    @memcpy(out[1..][0..rel.len], rel);
+    return .{ .file = .{ .inum = inum, .size = ext2_inode.fileSize(&ino), .path = out[0 .. rel.len + 1] } };
 }
 
 // --- stat ------------------------------------------------------------------

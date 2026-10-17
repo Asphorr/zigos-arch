@@ -624,8 +624,14 @@ pub fn writeAt(inum: u32, offset: u64, buf: [*]const u8, count: u32) u32 {
 }
 
 pub fn close(pcb: *process.PCB, fd: u32) u32 {
-    if (fd >= pcb.fd_table.len or !pcb.fd_table[fd].in_use) return VFS_ERR;
     if (fd < 3) return VFS_ERR; // can't close stdin/stdout/stderr
+    return closeSlot(pcb, fd);
+}
+
+/// close() without the guard on 0..2: a Linux process may close and reuse
+/// its standard fds.
+pub fn closeSlot(pcb: *process.PCB, fd: u32) u32 {
+    if (fd >= pcb.fd_table.len or !pcb.fd_table[fd].in_use) return VFS_ERR;
     // Free the slot and take its entry in one step under fd_lock, then close
     // the copy: of two threads closing one fd of a shared table (Linux
     // threads), only one gets the file to release.
@@ -637,8 +643,12 @@ pub fn close(pcb: *process.PCB, fd: u32) u32 {
         entry = pcb.fd_table[fd];
         pcb.fd_table[fd].in_use = false;
     }
-    const fd_entry = &entry;
+    releaseEntry(&entry);
+    return 0;
+}
 
+/// Drop what an fd entry, already out of its table, held.
+pub fn releaseEntry(fd_entry: *const process.FileDesc) void {
     switch (fd_entry.fs_type) {
         .console => {},
         .fat32 => {
@@ -670,7 +680,17 @@ pub fn close(pcb: *process.PCB, fd: u32) u32 {
             net.tcpUnlisten(@intCast(fd_entry.inode));
         },
     }
-    return 0;
+}
+
+/// A second reference to what `e` holds, for an fd copy (dup, fork): false
+/// for kinds whose close can't be shared.
+pub fn refEntry(e: *const process.FileDesc) bool {
+    switch (e.fs_type) {
+        .pipe => if (e.flags == 0) pipe.addReader(e.pipe_id) else pipe.addWriter(e.pipe_id),
+        .console, .ext2, .tarfs => {},
+        else => return false,
+    }
+    return true;
 }
 
 pub fn ls() void {

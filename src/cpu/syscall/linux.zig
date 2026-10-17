@@ -45,6 +45,7 @@ const linux_mm = @import("linux_mm.zig");
 const linux_time = @import("linux_time.zig");
 const linux_thread = @import("linux_thread.zig");
 const linux_fs = @import("linux_fs.zig");
+const linux_proc = @import("linux_proc.zig");
 const native_proc = @import("proc.zig");
 
 // --- Linux x86-64 errno (DISTINCT from zigos common.E_* — different values).
@@ -139,6 +140,21 @@ const SYS_preadv2: u32 = 327;
 const SYS_pwritev2: u32 = 328;
 const SYS_statx: u32 = 332;
 const SYS_faccessat2: u32 = 439;
+const SYS_poll: u32 = 7;
+const SYS_pipe: u32 = 22;
+const SYS_dup: u32 = 32;
+const SYS_dup2: u32 = 33;
+const SYS_fork: u32 = 57;
+const SYS_vfork: u32 = 58;
+const SYS_execve: u32 = 59;
+const SYS_wait4: u32 = 61;
+const SYS_kill: u32 = 62;
+const SYS_sysinfo: u32 = 99;
+const SYS_ppoll: u32 = 271;
+const SYS_utimensat: u32 = 280;
+const SYS_dup3: u32 = 292;
+const SYS_pipe2: u32 = 293;
+const SYS_process_vm_readv: u32 = 310;
 
 // fcntl commands (the few musl's open/opendir paths issue).
 const F_DUPFD: u64 = 0;
@@ -146,6 +162,12 @@ const F_GETFD: u64 = 1;
 const F_SETFD: u64 = 2;
 const F_GETFL: u64 = 3;
 const F_SETFL: u64 = 4;
+const F_DUPFD_CLOEXEC: u64 = 1030;
+const FD_CLOEXEC: u64 = 1;
+const O_RDONLY: u64 = 0;
+const O_WRONLY: u64 = 1;
+const O_RDWR: u64 = 2;
+const O_NONBLOCK: u64 = 0x800;
 const SYS_stat: u32 = 4;
 const SYS_lstat: u32 = 6;
 const SYS_uname: u32 = 63;
@@ -264,6 +286,22 @@ pub fn dispatch(num: u32, frame: *signals.SyscallFrame) u64 {
         // TLS bring-up: musl's __init_tp does arch_prctl(ARCH_SET_FS, tcb).
         SYS_arch_prctl => return sysArchPrctl(a1, a2),
         SYS_clone => return linux_thread.clone(frame, a1, a2, a3, a4, a5),
+        // Processes and pipes (linux_proc.zig). vfork is a fork: the parent
+        // runs on, which a correct vfork child can't tell.
+        SYS_fork, SYS_vfork => return linux_proc.fork(frame),
+        SYS_execve => return linux_proc.execve(frame, a1, a2, a3),
+        SYS_wait4 => return linux_proc.wait4(a1, a2, a3, a4),
+        SYS_kill => return linux_proc.kill(a1, a2),
+        SYS_pipe => return linux_proc.pipe2(a1, 0),
+        SYS_pipe2 => return linux_proc.pipe2(a1, a2),
+        SYS_dup => return linux_proc.dup(a1),
+        SYS_dup2 => return linux_proc.dup2(a1, a2),
+        SYS_dup3 => return linux_proc.dup3(a1, a2, a3),
+        SYS_poll => return linux_proc.poll(a1, a2, a3),
+        SYS_ppoll => return linux_proc.ppoll(a1, a2, a3),
+        SYS_process_vm_readv => return linux_proc.processVmReadv(a1, a2, a3, a4, a5, a6),
+        SYS_sysinfo => return linux_proc.sysinfo(a1),
+        SYS_utimensat => return linux_proc.utimensat(),
         SYS_futex => return linux_thread.futex(a1, a2, a3, a4, a5, a6),
         SYS_set_tid_address => return linux_thread.setTidAddress(a1),
         // A thread's tid is its pid; the process id is the group lead's.
@@ -446,14 +484,24 @@ fn sysReadv(fd: u32, iov_va: u64, iovcnt: u64) u64 {
 /// unimplemented (logged via the default ENOSYS path is avoided — return it
 /// directly so fcntl spam doesn't look like a missing syscall).
 fn sysFcntl(fd: u32, cmd: u64, arg: u64) u64 {
-    _ = arg;
     const pcb = proc() orelse return err(EFAULT);
     if (fd >= pcb.fd_table.len or !pcb.fd_table[fd].in_use) return err(EBADF);
+    const fe = &pcb.fd_table[fd];
     return switch (cmd) {
-        F_GETFD => 0, // FD_CLOEXEC not tracked
-        F_SETFD => 0, // accept (cloexec no-op)
-        F_GETFL => 0, // report O_RDONLY-ish; musl rarely depends on exact flags
-        F_SETFL => 0,
+        F_DUPFD => linux_proc.dupFrom(fd, arg, false),
+        F_DUPFD_CLOEXEC => linux_proc.dupFrom(fd, arg, true),
+        F_GETFD => @intFromBool(fe.cloexec),
+        F_SETFD => blk: {
+            fe.cloexec = arg & FD_CLOEXEC != 0;
+            break :blk 0;
+        },
+        // The access mode: a pipe's end, else read/write.
+        F_GETFL => @as(u64, if (fe.fs_type != .pipe) O_RDWR else if (fe.flags == 0) O_RDONLY else O_WRONLY) |
+            @as(u64, if (fe.nonblock) O_NONBLOCK else 0),
+        F_SETFL => blk: {
+            fe.nonblock = arg & O_NONBLOCK != 0;
+            break :blk 0;
+        },
         else => err(ENOSYS),
     };
 }
@@ -469,8 +517,8 @@ fn fdFileSize(fe: *const process.FileDesc) u64 {
 fn sysLseek(fd: u32, off: u64, whence: u32) u64 {
     const pcb = proc() orelse return err(EFAULT);
     if (fd >= pcb.fd_table.len or !pcb.fd_table[fd].in_use) return err(EBADF);
-    if (fd < 3) return err(ESPIPE); // console isn't seekable
     const fe = &pcb.fd_table[fd];
+    if (fe.fs_type == .console or fe.fs_type == .pipe) return err(ESPIPE);
     const new: u64 = switch (whence) {
         0 => off, // SEEK_SET
         1 => @as(u64, fe.offset) +% off, // SEEK_CUR

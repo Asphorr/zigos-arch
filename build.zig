@@ -564,7 +564,7 @@ pub fn build(b: *std.Build) void {
     // Linux syscall layer (syscall/linux.zig), and toolchains emit 0, the same
     // as native apps. Installed into zig-out/bin, so they land in /bin.
     const linux_target = b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .musl });
-    const linux_tests = .{ "lt_basic", "lt_mm", "lt_thread", "lt_fs" };
+    const linux_tests = .{ "lt_basic", "lt_mm", "lt_thread", "lt_fs", "lt_proc" };
     inline for (linux_tests) |name| {
         const exe = b.addExecutable(.{
             .name = name,
@@ -585,6 +585,11 @@ pub fn build(b: *std.Build) void {
         stamp.addFileArg(exe.getEmittedBin());
         const stamped = stamp.addOutputFileArg(name ++ ".elf");
         b.getInstallStep().dependOn(&b.addInstallBinFile(stamped, name ++ ".elf").step);
+        // Also unstamped, as a binary built inside ZigOS comes out: a Linux
+        // process's execve must run it as Linux all the same.
+        if (comptime std.mem.eql(u8, name, "lt_proc")) {
+            b.getInstallStep().dependOn(&b.addInstallBinFile(exe.getEmittedBin(), name ++ "_plain.elf").step);
+        }
     }
 
     // --- DOOM (real engine via doomgeneric) ---

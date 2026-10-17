@@ -191,6 +191,7 @@ fn waitKindName(k: process.WaitKind) []const u8 {
         .desktop => "desktop",
         .compositor => "compositor",
         .acpid => "acpid",
+        .poll => "poll",
     };
 }
 
@@ -232,6 +233,7 @@ fn dumpResourceState(pid: usize, kind: process.WaitKind, target: u32) void {
         .desktop => serial.print("  desktop parked (no wake source due; wakers: idle-loop, IRQ0 due-check, wakeExpired backstop)\n", .{}),
         .compositor => serial.print("  compositor parked (no frame requested; wakers: requestRender wake, wakeExpired backstop)\n", .{}),
         .acpid => serial.print("  acpid parked (no SCI event; wakers: sci.wakeAcpid stamp, wakeExpired backstop)\n", .{}),
+        .poll => serial.print("  poll parked (wakers: fdpoll.wakePollers on any fd event, wakeExpired at the timeout)\n", .{}),
     }
 }
 

@@ -2620,7 +2620,7 @@ pub fn rqHasDispatchable(cpu_id: u8) bool {
 /// (.futex; blockOnFutex stores 0 for an untimed wait). Every other non-.none
 /// kind is woken by its explicit path alone.
 inline fn deadlineParked(kind: WaitKind) bool {
-    return kind == .gpu_io or kind == .desktop or kind == .compositor or kind == .acpid or kind == .futex;
+    return kind == .gpu_io or kind == .desktop or kind == .compositor or kind == .acpid or kind == .futex or kind == .poll;
 }
 
 /// Wake sleeping processes whose `sleep()` deadline has expired. Only

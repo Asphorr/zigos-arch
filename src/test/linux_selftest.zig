@@ -34,6 +34,7 @@ const CASES = [_]Case{
     .{ .path = "/bin/lt_mm.elf" },
     .{ .path = "/bin/lt_thread.elf" },
     .{ .path = "/bin/lt_fs.elf" },
+    .{ .path = "/bin/lt_proc.elf" },
     // The official Zig compiler (static musl, 172 MB), stamped OSABI 3 and
     // written into ext2.img by hand.
     .{ .path = "/bin/zig", .args = "version", .timeout_ms = 120_000, .optional = true },
@@ -86,6 +87,7 @@ fn runOnce(c: Case) Outcome {
     var waited: u32 = 0;
     var timed_out = false;
     while (process.procs[pid].state != .zombie or process.countThreadsInGroup(@intCast(pid)) != 0) : (waited += 10) {
+        if (waited >= STALL_DUMP_MS and waited % STALL_DUMP_MS == 0) dumpTasks(waited);
         if (!timed_out and waited >= c.timeout_ms) {
             // Every thread: a lead killed alone leaves its workers running.
             process.killThreadGroup(@intCast(pid), 0xDEAD0000 | 9);
@@ -100,6 +102,40 @@ fn runOnce(c: Case) Outcome {
     return .{ .exited = status };
 }
 
+/// How often a run still going shows its tasks.
+const STALL_DUMP_MS: u32 = 60_000;
+
+/// Every Linux task — what it is and what it waits on — with the leads'
+/// fds and the pipes: for a run that stops making progress.
+fn dumpTasks(waited: u32) void {
+    serial.print("[linuxtest] {d} s in; poll sleepers 0x{X}, wait4 sleepers 0x{X}:\n", .{
+        waited / 1000, @import("../cpu/ipc/fdpoll.zig").sleeperMask(), @import("../proc/lifecycle.zig").childWaiterMask(),
+    });
+    for (0..process.MAX_PROCS) |i| {
+        const p = &process.procs[i];
+        if (p.state == .unused or p.personality != .linux) continue;
+        serial.print("[linuxtest]   pid {d} tgid {d} parent {d} '{s}' {s} wait {s}/0x{X} nokill {d} wake_pending {}\n", .{
+            i, p.tgid, p.parent_pid, std.mem.sliceTo(&p.name, 0), @tagName(p.state), @tagName(p.wait_kind), p.wait_target, p.nokill, p.wake_pending,
+        });
+        if (i != p.tgid) continue;
+        for (p.fd_table, 0..) |fe, fd| {
+            if (!fe.in_use) continue;
+            if (fe.fs_type == .pipe) {
+                serial.print("[linuxtest]     fd {d}: pipe {d} {s}{s}\n", .{ fd, fe.pipe_id, if (fe.flags == 0) "read" else "write", if (fe.cloexec) " cloexec" else "" });
+            } else {
+                serial.print("[linuxtest]     fd {d}: {s} inode {d}\n", .{ fd, @tagName(fe.fs_type), fe.inode });
+            }
+        }
+    }
+    const pipe = @import("../proc/pipe.zig");
+    for (&pipe.pipes, 0..) |*pp, id| {
+        if (!pp.in_use) continue;
+        serial.print("[linuxtest]   pipe {d}: {d} bytes, readers {d} writers {d}, blocked reader {d} writer {d}\n", .{
+            id, pp.count, pp.readers, pp.writers, pp.blocked_reader_pid, pp.blocked_writer_pid,
+        });
+    }
+}
+
 fn check(c: Case, run: u32) void {
     // Let the last report drain out first, outside this run's time and
     // counters (~0.1 s of UART for a report; the virtio console is instant).
@@ -107,7 +143,7 @@ fn check(c: Case, run: u32) void {
     lprof.reset();
     const t0 = time.monotonicNanos();
     const outcome = runOnce(c);
-    serial.print("[linuxtest] {s} run {d}: {d} ms\n", .{ c.path, run, (time.monotonicNanos() - t0) / 1_000_000 });
+    serial.print("[linuxtest] {s} run {d}: {d} ms, {d} frames free\n", .{ c.path, run, (time.monotonicNanos() - t0) / 1_000_000, pmm.freeFrameCount() });
     lprof.dumpAndReset(progName(c.path));
     switch (outcome) {
         .exited => |st| if (st != 0) {

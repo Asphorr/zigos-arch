@@ -36,6 +36,17 @@ pub const LaunchInfo = struct {
     /// Absolute path of the executable → pcb.exe_path (/proc/self/exe).
     /// spawnPath fills it in.
     exe_path: []const u8 = "",
+    /// A Linux execve: the image is Linux whatever its EI_OSABI says, and
+    /// its stack gets these argv and envp.
+    exec_args: ?*const ExecArgs = null,
+};
+
+/// argv and envp strings of a Linux execve: each NUL-terminated, argv's
+/// first, back to back.
+pub const ExecArgs = struct {
+    strings: []const u8,
+    argc: u32,
+    envc: u32,
 };
 
 const Header = extern struct {
@@ -90,8 +101,9 @@ const Layout = struct {
 /// around the image. The break starts at the page after the highest segment
 /// (native: not below USER_BRK_INITIAL). A native stack is the reserve under
 /// the load base; a Linux stack is the top LINUX_STACK_RESERVE of the window.
-/// Null if a segment is out of range.
-fn layoutFor(header: Header, phdrs: [*]align(1) const ProgramHeader) ?Layout {
+/// The image is Linux if its EI_OSABI says so or `linux` is set. Null if a
+/// segment is out of range.
+fn layoutFor(header: Header, phdrs: [*]align(1) const ProgramHeader, linux: bool) ?Layout {
     var end: usize = 0;
     for (0..header.phnum) |i| {
         if (phdrs[i].p_type != PT_LOAD_T) continue;
@@ -104,7 +116,7 @@ fn layoutFor(header: Header, phdrs: [*]align(1) const ProgramHeader) ?Layout {
         end = @max(end, p_vaddr + p_memsz);
     }
     const image_end = (end + PAGE_SIZE - 1) & ~@as(usize, PAGE_SIZE - 1);
-    if (header.ident[7] == ELFOSABI_LINUX) {
+    if (linux or header.ident[7] == ELFOSABI_LINUX) {
         const stack_base: usize = memmap.USER_SPACE_END - memmap.LINUX_STACK_RESERVE;
         if (image_end > stack_base) {
             debug.klog("[elf] Rejected: image ends at 0x{X}, in the stack region\n", .{image_end});
@@ -410,16 +422,52 @@ inline fn rdtsc() u64 {
     return (@as(u64, hi) << 32) | lo;
 }
 
+/// Most bytes the SysV block (strings, pointers, auxv) may take.
+const MAX_INITIAL_STACK: usize = 128 * 1024;
+
+/// A launch's argv (pcb.argv, else "prog") and the default environment, as
+/// ExecArgs packed into `buf`.
+fn launchArgs(pid: usize, buf: []u8) ExecArgs {
+    const pcb = process.getPCB(pid);
+    var n: usize = 0;
+    const argc: usize = @min(@as(usize, pcb.argc), @as(usize, config.MAX_ARGS));
+    for (0..argc) |ai| {
+        const alen: usize = @min(@as(usize, pcb.arg_lens[ai]), @as(usize, config.MAX_ARG_LEN));
+        @memcpy(buf[n..][0..alen], pcb.argv[ai][0..alen]);
+        buf[n + alen] = 0;
+        n += alen + 1;
+    }
+    if (argc == 0) {
+        @memcpy(buf[0..5], "prog\x00");
+        n = 5;
+    }
+    for (LINUX_ENV) |s| {
+        @memcpy(buf[n..][0..s.len], s);
+        buf[n + s.len] = 0;
+        n += s.len + 1;
+    }
+    return .{ .strings = buf[0..n], .argc = @intCast(@max(argc, 1)), .envc = LINUX_ENV.len };
+}
+
+const LAUNCH_ARGS_BYTES = blk: {
+    var n: usize = @as(usize, config.MAX_ARGS) * (@as(usize, config.MAX_ARG_LEN) + 1) + 5;
+    for (LINUX_ENV) |s| n += s.len + 1;
+    break :blk n;
+};
+
 /// Build the SysV initial stack for a .linux process and point its first-
 /// dispatch RSP at argc. `pd` is the new address space, `stack_top` the
 /// page-aligned top of the user stack region, `elf_buf` the kernel-side
 /// whole-file image (still valid — the caller invokes this before any elf_buf
-/// drop). Returns false if the top page couldn't be mapped (caller kills it).
+/// drop), `exec_args` an execve's argv and envp (null: the launch's). The
+/// block takes as many pages below the top as it needs. Returns false if
+/// they couldn't be mapped (caller kills it).
 fn setupLinuxInitialStack(
     pid: usize,
     pd: [*]align(4096) u64,
     stack_top: usize,
     elf_buf: [*]align(4) const u8,
+    exec_args: ?*const ExecArgs,
 ) bool {
     const header = @as([*]align(1) const Header, @ptrCast(elf_buf))[0];
     const phoff: usize = @intCast(header.phoff);
@@ -452,19 +500,28 @@ fn setupLinuxInitialStack(
         }
     }
 
-    // Eagerly back the top stack page with a zeroed anon frame, mapped RW/NX
-    // exactly as the lazy stack-fault path would (protToMapFlags(R|W)).
-    const page_base: usize = stack_top - PAGE_SIZE;
-    const flags = vmm.protToMapFlags(process.PROT_READ | process.PROT_WRITE);
-    const frame = vmm.allocAndMapUserPage(pd, page_base, flags) catch {
-        debug.klog("[linux] setupLinuxInitialStack: map of top stack page failed\n", .{});
-        return false;
-    };
-    const kbuf = frame.toVirt().ptr([*]u8); // physmap alias, zeroed
+    var own: [LAUNCH_ARGS_BYTES]u8 = undefined;
+    const args: ExecArgs = if (exec_args) |a| a.* else launchArgs(pid, &own);
 
-    // Strings/data at the top of the page (descending); the argc/argv/envp/auxv
-    // arrays go below them.
-    var off: usize = PAGE_SIZE;
+    // The block, top down: 16 random bytes, the strings, then
+    // argc | argv[0..argc] | NULL | envp | NULL | auxv with &argc 16-aligned.
+    // Built in a kernel buffer standing for the pages below stack_top, then
+    // copied into fresh frames mapped there RW/NX, as the lazy stack-fault
+    // path would map them (protToMapFlags(R|W)).
+    const AUXV_PAIRS = 14;
+    const words: usize = 1 + (args.argc + 1) + (args.envc + 1) + AUXV_PAIRS * 2;
+    const total = 16 + args.strings.len + words * 8 + 16;
+    if (total > MAX_INITIAL_STACK) {
+        debug.klog("[linux] pid={d}: argv and envp take {d} bytes, past {d}\n", .{ pid, total, MAX_INITIAL_STACK });
+        return false;
+    }
+    const span = std.mem.alignForward(usize, total, PAGE_SIZE);
+    const page_base: usize = stack_top - span;
+    const kbuf = heap.kmallocAligned(span, 16) orelse return false;
+    defer heap.kfree(kbuf);
+    @memset(kbuf[0..span], 0);
+
+    var off: usize = span;
 
     // 16 random bytes for AT_RANDOM (musl seeds its stack canary from these).
     // rdtsc-derived — not cryptographic, but canary strength isn't an M1 goal;
@@ -482,43 +539,12 @@ fn setupLinuxInitialStack(
     }
     const rand_va: u64 = page_base + rand_off;
 
-    // argv strings — the real argv parsed at exec time (pcb.argv[0..argc],
-    // populated by loadAndStart from the exec string before we run). Laid out
-    // high→low; each string's VA is recorded for the pointer array below. If no
-    // argv was set (a non-shell launch path), fall back to a single
-    // argv[0]="prog" so _start still finds a valid, NUL-terminated argv[0].
-    const pcb = process.getPCB(pid);
-    var argv_va: [config.MAX_ARGS]u64 = undefined;
-    const real_argc: usize = @min(@as(usize, pcb.argc), @as(usize, config.MAX_ARGS));
-    const argc: usize = if (real_argc > 0) real_argc else 1;
-    if (real_argc > 0) {
-        var ai: usize = 0;
-        while (ai < real_argc) : (ai += 1) {
-            const alen: usize = @min(@as(usize, pcb.arg_lens[ai]), @as(usize, config.MAX_ARG_LEN));
-            off -= alen + 1;
-            const aoff = off;
-            for (0..alen) |k| kbuf[aoff + k] = pcb.argv[ai][k];
-            kbuf[aoff + alen] = 0;
-            argv_va[ai] = page_base + aoff;
-        }
-    } else {
-        const s = "prog";
-        off -= s.len + 1;
-        for (s, 0..) |c, k| kbuf[off + k] = c;
-        kbuf[off + s.len] = 0;
-        argv_va[0] = page_base + off;
-    }
-
-    var env_va: [LINUX_ENV.len]u64 = undefined;
-    for (LINUX_ENV, 0..) |s, ei| {
-        off -= s.len + 1;
-        @memcpy(kbuf[off..][0..s.len], s);
-        kbuf[off + s.len] = 0;
-        env_va[ei] = page_base + off;
-    }
+    off -= args.strings.len;
+    @memcpy(kbuf[off..][0..args.strings.len], args.strings);
+    const strings_off = off;
 
     // Auxiliary vector — (type,value) pairs, AT_NULL-terminated.
-    const auxv = [_][2]u64{
+    const auxv = [AUXV_PAIRS][2]u64{
         .{ AT_PHDR, phdr_va },
         .{ AT_PHENT, phentsize },
         .{ AT_PHNUM, @intCast(phnum) },
@@ -535,39 +561,39 @@ fn setupLinuxInitialStack(
         .{ AT_NULL, 0 },
     };
 
-    // word layout (low→high): argc | argv[0..argc] | NULL | envp | NULL | auxv.
-    // Provably fits one page: rand(16) + argv and env strings + these arrays
-    // total well under 4 KiB with the MAX_ARGS/MAX_ARG_LEN caps, so the
-    // descending `off` can never underflow into the array region below.
-    comptime {
-        var env_bytes: usize = 0;
-        for (LINUX_ENV) |s| env_bytes += s.len + 1;
-        const max_strings = @as(usize, config.MAX_ARGS) * (@as(usize, config.MAX_ARG_LEN) + 1) + env_bytes + 16;
-        const max_arrays = (1 + @as(usize, config.MAX_ARGS) + 1 + LINUX_ENV.len + 1 + auxv.len * 2) * 8;
-        if (max_strings + max_arrays + 16 > PAGE_SIZE)
-            @compileError("SysV initial stack may overflow one page — shrink MAX_ARGS/MAX_ARG_LEN");
-    }
-    const words: usize = 1 + (argc + 1) + (LINUX_ENV.len + 1) + auxv.len * 2;
     var block_off: usize = off - words * 8;
     block_off &= ~@as(usize, 0xF); // &argc must be 16-byte aligned at _start
     const argc_va: u64 = page_base + block_off;
 
     const wp: [*]align(1) u64 = @ptrFromInt(@intFromPtr(kbuf) + block_off);
     var w: usize = 0;
-    wp[w] = argc; w += 1;
-    for (0..argc) |ai| {
-        wp[w] = argv_va[ai];
-        w += 1;
+    wp[w] = args.argc; w += 1;
+    // The pointers walk the strings: argc of them, a NULL, envc, a NULL.
+    var s: usize = 0;
+    for (0..args.argc + args.envc) |k| {
+        if (k == args.argc) {
+            wp[w] = 0; w += 1; // argv terminator
+        }
+        wp[w] = page_base + strings_off + s; w += 1;
+        s += (std.mem.indexOfScalarPos(u8, args.strings, s, 0) orelse args.strings.len) - s + 1;
     }
-    wp[w] = 0; w += 1; // argv terminator
-    for (env_va) |va| {
-        wp[w] = va;
-        w += 1;
+    if (args.envc == 0) {
+        wp[w] = 0; w += 1; // argv terminator
     }
     wp[w] = 0; w += 1; // envp terminator
     for (auxv) |pair| {
         wp[w] = pair[0]; w += 1;
         wp[w] = pair[1]; w += 1;
+    }
+
+    const flags = vmm.protToMapFlags(process.PROT_READ | process.PROT_WRITE);
+    var p: usize = 0;
+    while (p < span / PAGE_SIZE) : (p += 1) {
+        const frame = vmm.allocAndMapUserPage(pd, page_base + p * PAGE_SIZE, flags) catch {
+            debug.klog("[linux] setupLinuxInitialStack: map of stack page {d} failed\n", .{p});
+            return false;
+        };
+        @memcpy(frame.toVirt().ptr([*]u8)[0..PAGE_SIZE], kbuf[p * PAGE_SIZE ..][0..PAGE_SIZE]);
     }
 
     // Point the task's first-dispatch RSP at argc (overriding create()'s native
@@ -578,12 +604,9 @@ fn setupLinuxInitialStack(
     const iretf: [*]u64 = @ptrFromInt(process.procs[pid].kernel_stack_top - fspec.pt_regs_bytes);
     iretf[fspec.iretq.rsp.at()] = argc_va;
 
-    const argv0_log: []const u8 = if (real_argc > 0)
-        pcb.argv[0][0..@min(@as(usize, pcb.arg_lens[0]), @as(usize, config.MAX_ARG_LEN))]
-    else
-        "prog";
-    debug.klog("[linux] pid={d} SysV stack: rsp=0x{X} argc={d} argv0='{s}' phdr=0x{X} phnum={d} entry=0x{X}\n", .{
-        pid, argc_va, argc, argv0_log, phdr_va, phnum, entry,
+    const argv0_log = std.mem.sliceTo(args.strings, 0);
+    debug.klog("[linux] pid={d} SysV stack: rsp=0x{X} argc={d} envc={d} argv0='{s}' phdr=0x{X} phnum={d} entry=0x{X}\n", .{
+        pid, argc_va, args.argc, args.envc, argv0_log, phdr_va, phnum, entry,
     });
     return true;
 }
@@ -598,6 +621,16 @@ pub fn spawnPath(path: []const u8, launch: ?LaunchInfo) ?usize {
     if (vfs.lookupCached(path)) |f| return loadCached(f.inum, f.size, li);
     const fresh = vfs.loadFileFresh(path) orelse return null;
     return loadAndStart(fresh.buf, fresh.size, fresh.pages, fresh.inode, li);
+}
+
+/// A Linux execve's new image from ext2 inode `inum`: a process built and
+/// held in .loading, never dispatched, whose address space the caller takes
+/// over (lifecycle.takeExecImage). `launch.exec_args` must be set. Null if
+/// the file isn't an image we can run, or memory ran out.
+pub fn loadForExec(inum: u32, size: u64, launch: LaunchInfo) ?usize {
+    var li = launch;
+    li.start_held = true;
+    return loadCached(inum, size, li);
 }
 
 /// The absolute path `name` names, as vfs.lookupCached resolves it: as
@@ -749,7 +782,8 @@ fn startImage(img: Image, header: Header, launch: ?LaunchInfo) ?usize {
 
     // Validate every PT_LOAD's VA range fits in user space before doing
     // any per-segment work — bail early without partial state.
-    const lay = layoutFor(header, phdrs) orelse {
+    const exec_args = if (launch) |li| li.exec_args else null;
+    const lay = layoutFor(header, phdrs, exec_args != null) orelse {
         img.drop();
         return null;
     };
@@ -795,6 +829,8 @@ fn startImage(img: Image, header: Header, launch: ?LaunchInfo) ?usize {
     // unmodified Linux x86-64 binary, so its `syscall`s route to the Linux
     // translation layer (syscall/linux.zig). Native zigos ELFs have OSABI 0.
     // One detection point here covers every launch path (shell/desktop/smp).
+    // What a Linux process execs is Linux too (layoutFor): a binary built
+    // here carries no OSABI stamp.
     pcb.personality = if (lay.linux) .linux else .native;
 
     // Set the process name + real argv from the launch descriptor (if any)
@@ -832,7 +868,7 @@ fn startImage(img: Image, header: Header, launch: ?LaunchInfo) ?usize {
     // the program headers out of it. Native processes get argv via syscalls and
     // skip this entirely.
     if (pcb.personality == .linux) {
-        if (!setupLinuxInitialStack(pid, pd, lay.stack_top, img.bytes())) {
+        if (!setupLinuxInitialStack(pid, pd, lay.stack_top, img.bytes(), exec_args)) {
             debug.klog("[linux] initial-stack setup failed for PID {d}\n", .{pid});
             process.abortLoading(@intCast(pid));
             return null;
@@ -888,7 +924,7 @@ pub fn loadAndExecute(elf_buf: [*]align(4) u8, file_size: usize, elf_buf_pages: 
         return;
     }
 
-    const lay = layoutFor(header, @ptrCast(elf_buf + phoff)) orelse {
+    const lay = layoutFor(header, @ptrCast(elf_buf + phoff), false) orelse {
         vga.fg = .LightRed;
         vga.print("Error: segment outside user space!\n", .{});
         freePmmRange(@intFromPtr(elf_buf), elf_buf_pages);
@@ -948,7 +984,7 @@ pub fn loadAndExecute(elf_buf: [*]align(4) u8, file_size: usize, elf_buf_pages: 
     // Linux personality: build the SysV initial stack before any elf_buf drop
     // (see loadAndStart for the full rationale).
     if (pcb.personality == .linux) {
-        if (!setupLinuxInitialStack(pid, pd, lay.stack_top, elf_buf)) {
+        if (!setupLinuxInitialStack(pid, pd, lay.stack_top, elf_buf, null)) {
             debug.klog("[linux] initial-stack setup failed for PID {d}\n", .{pid});
             process.abortLoading(@intCast(pid));
             return;
