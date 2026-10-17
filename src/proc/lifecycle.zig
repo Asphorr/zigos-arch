@@ -109,6 +109,19 @@ fn allocSlot() ?usize {
 /// already set to .loading via allocSlot's CAS). Equivalent to
 /// `procs[i] = .{}` minus the state-byte write — necessary because that write
 /// would briefly restore state to .unused and re-open the slot to other CPUs.
+/// FP state a forked or cloned task starts with: its parent's at the
+/// syscall. User code may keep values in XMM registers across a syscall,
+/// and the child returns from the same one.
+var inherited_fpu: [MAX_PROCS][512]u8 align(16) = undefined;
+
+/// Give task `child`, whose first-dispatch frame starts at `sw_base`, the
+/// FP state the caller's syscall saved: retToUserStub loads the image its
+/// switch frame's rbx names (0 there: fp.init_template).
+fn inheritFpu(child: usize, frame: *const signals.SyscallFrame, sw_base: [*]u64) void {
+    @memcpy(&inherited_fpu[child], frame.userFpu());
+    sw_base[dspec.switch_frame.index(.rbx)] = @intFromPtr(&inherited_fpu[child]);
+}
+
 fn resetPcbExceptState(pcb: *PCB) void {
     const fresh: PCB = .{};
     const state_off = comptime @offsetOf(PCB, "state");
@@ -382,6 +395,7 @@ pub fn cloneLinuxThread(frame: *const signals.SyscallFrame, spec: LinuxThreadSpe
     const sw_base: [*]u64 = @ptrFromInt(kstack_top - dspec.total_bytes);
     for (0..dspec.switch_frame.count) |k| sw_base[k] = 0;
     sw_base[dspec.ret_slot] = @intFromPtr(&sched_asm.retToUserStub);
+    inheritFpu(i, frame, sw_base);
 
     process.procs[i].kernel_esp = kstack_top - dspec.total_bytes;
     process.procs[i].kernel_stack_top = kstack_top;
@@ -558,6 +572,7 @@ pub fn forkCurrent(frame: *signals.SyscallFrame) ?usize {
     const sw_base: [*]u64 = @ptrFromInt(kstack_top - dspec.total_bytes);
     for (0..dspec.switch_frame.count) |k| sw_base[k] = 0;
     sw_base[dspec.ret_slot] = @intFromPtr(&sched_asm.retToUserStub);
+    inheritFpu(i, frame, sw_base);
 
     process.procs[i].kernel_esp = kstack_top - dspec.total_bytes;
     process.procs[i].kernel_stack_top = kstack_top;

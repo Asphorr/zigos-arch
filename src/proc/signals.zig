@@ -215,6 +215,12 @@ pub const SyscallFrame = extern struct {
     // Putting user_rsp on the kernel stack ties its lifetime to the kernel
     // stack itself, which IS per-thread (kstack_pool[pid]).
     user_rsp: u64,
+
+    /// The caller's FP/SSE state, fxsave'd by the entry stub 520 bytes below
+    /// the frame (512 bytes + 8 of padding).
+    pub fn userFpu(self: *const SyscallFrame) *align(16) const [512]u8 {
+        return @ptrFromInt(@intFromPtr(self) - 520);
+    }
 };
 
 /// Mirror of isr_irq0's saved frame at `call handleIRQ0`. The leading 15 GPRs

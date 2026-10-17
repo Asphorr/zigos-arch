@@ -236,11 +236,12 @@ pub const SAFE_IRETQ = "\n" ++
 ///   [RSP+0    .. RSP+120] : 15 GPR slots (gprs order; zeroed for new task)
 ///   [RSP+120  .. RSP+160] : iretq frame  (RIP, CS, RFLAGS, user RSP, user SS)
 ///
-/// FP state is loaded from the global `init_template` (.data) via RIP-relative
-/// fxrstor. Earlier versions copied init_template onto the kstack at
-/// stack_top - 672 and fxrstor'd from (%rsp); that put MXCSR exactly at
-/// stack_top - 648, aliasing the saved ret-addr slot of every subsequent
-/// syscall/IRQ on the same kstack. Loading from .data eliminates the alias.
+/// FP state: the FXSAVE image the switch frame's rbx names (a forked or
+/// cloned task's, its parent's — lifecycle.inheritFpu), else the global
+/// `init_template` (.data). Never a copy on this kstack: earlier versions
+/// copied init_template onto the kstack at stack_top - 672 and fxrstor'd
+/// from (%rsp); that put MXCSR exactly at stack_top - 648, aliasing the
+/// saved ret-addr slot of every subsequent syscall/IRQ on the same kstack.
 ///
 /// Restores FP, pops GPRs, iretqs to user. No path back here on this
 /// task — subsequent dispatches resume at the schedule() call site.
@@ -250,7 +251,13 @@ pub fn retToUserStub() callconv(.naked) void {
     // f[0]=r15…f[14]=rax table is a derived loop now). Change the order
     // there and every forge follows; there is no second copy to update.
     asm volatile (
+        \\ testq %%rbx, %%rbx
+        \\ jz 8f
+        \\ fxrstorq (%%rbx)
+        \\ jmp 9f
+        \\ 8:
         \\ fxrstorq init_template(%%rip)
+        \\ 9:
         ++ "\n" ++ fd.gprs.pop_asm
         // Pre-iretq sanity check — corrupt frame here means the planted
         // iretq frame from process.create is wrong from the start or got
