@@ -517,17 +517,17 @@ pub fn freeAllBlocks(m: *block.Mount, ino: *layout.Inode) void {
     }
     // Single indirect: free leaves + indirect block itself.
     if (ino.block[layout.IND_BLOCK] != 0) {
-        freeIndirectLevel(m, ino.block[layout.IND_BLOCK], 1);
+        _ = freeIndirectLevel(m, ino.block[layout.IND_BLOCK], 1);
         _ = block.freeBlock(m, ino.block[layout.IND_BLOCK]);
         ino.block[layout.IND_BLOCK] = 0;
     }
     if (ino.block[layout.DIND_BLOCK] != 0) {
-        freeIndirectLevel(m, ino.block[layout.DIND_BLOCK], 2);
+        _ = freeIndirectLevel(m, ino.block[layout.DIND_BLOCK], 2);
         _ = block.freeBlock(m, ino.block[layout.DIND_BLOCK]);
         ino.block[layout.DIND_BLOCK] = 0;
     }
     if (ino.block[layout.TIND_BLOCK] != 0) {
-        freeIndirectLevel(m, ino.block[layout.TIND_BLOCK], 3);
+        _ = freeIndirectLevel(m, ino.block[layout.TIND_BLOCK], 3);
         _ = block.freeBlock(m, ino.block[layout.TIND_BLOCK]);
         ino.block[layout.TIND_BLOCK] = 0;
     }
@@ -539,19 +539,91 @@ pub fn freeAllBlocks(m: *block.Mount, ino: *layout.Inode) void {
 /// by `depth - 1` (depth 1 = single, 2 = double, 3 = triple). 12 KB total.
 var indir_scratch: [3][4096]u8 align(8) = undefined;
 
-fn freeIndirectLevel(m: *block.Mount, indir_block: u32, depth: u32) void {
-    if (depth == 0 or depth > 3) return;
+/// Free everything under `indir_block` (not the block itself); returns how
+/// many blocks that was.
+fn freeIndirectLevel(m: *block.Mount, indir_block: u32, depth: u32) u32 {
+    if (depth == 0 or depth > 3) return 0;
     const bs = m.block_size;
     const buf = indir_scratch[depth - 1][0..bs];
-    if (!block.readBlock(m, indir_block, buf)) return;
+    if (!block.readBlock(m, indir_block, buf)) return 0;
     const ptrs_per_block: u32 = bs / 4;
+    var n: u32 = 0;
     var i: u32 = 0;
     while (i < ptrs_per_block) : (i += 1) {
         const ptr = std.mem.readInt(u32, buf[i * 4 ..][0..4], .little);
         if (ptr == 0) continue;
-        if (depth > 1) freeIndirectLevel(m, ptr, depth - 1);
+        if (depth > 1) n += freeIndirectLevel(m, ptr, depth - 1);
         _ = block.freeBlock(m, ptr);
+        n += 1;
     }
+    return n;
+}
+
+/// Free every data block at logical index >= `first`, and each indirect
+/// block left pointing at nothing; i_blocks follows. `first == 0` is
+/// freeAllBlocks. PRECONDITION: the mount lock, as freeAllBlocks.
+pub fn freeBlocksFrom(m: *block.Mount, ino: *layout.Inode, first: u32) void {
+    if (first == 0) return freeAllBlocks(m, ino);
+    const ppb: u64 = m.block_size / 4;
+    var freed: u32 = 0;
+    var i: u32 = first;
+    while (i < layout.N_DIRECT) : (i += 1) {
+        if (ino.block[i] == 0) continue;
+        _ = block.freeBlock(m, ino.block[i]);
+        ino.block[i] = 0;
+        freed += 1;
+    }
+    var base: u64 = layout.N_DIRECT;
+    var span: u64 = ppb;
+    for ([_]u32{ layout.IND_BLOCK, layout.DIND_BLOCK, layout.TIND_BLOCK }, 1..) |slot, depth| {
+        if (ino.block[slot] != 0 and first < base + span) {
+            if (pruneIndirect(m, ino.block[slot], @intCast(depth), base, first, &freed)) {
+                _ = block.freeBlock(m, ino.block[slot]);
+                ino.block[slot] = 0;
+                freed += 1;
+            }
+        }
+        base += span;
+        span *= ppb;
+    }
+    const per_block: u32 = m.block_size / 512;
+    ino.blocks -|= freed * per_block;
+}
+
+/// freeBlocksFrom below indirect block `blk`, whose tree of `depth` levels
+/// maps logical blocks from `base`. True when `blk` points at nothing
+/// afterwards (the caller frees it).
+fn pruneIndirect(m: *block.Mount, blk: u32, depth: u32, base: u64, first: u32, freed: *u32) bool {
+    const bs = m.block_size;
+    const buf = indir_scratch[depth - 1][0..bs];
+    if (!block.readBlock(m, blk, buf)) return false;
+    const ppb: u32 = bs / 4;
+    var child_span: u64 = 1;
+    for (1..depth) |_| child_span *= ppb;
+    var left = false;
+    var changed = false;
+    var i: u32 = 0;
+    while (i < ppb) : (i += 1) {
+        const ptr = std.mem.readInt(u32, buf[i * 4 ..][0..4], .little);
+        if (ptr == 0) continue;
+        const child_base = base + @as(u64, i) * child_span;
+        const whole = child_base >= first;
+        if (child_base + child_span <= first) {
+            left = true;
+        } else if (depth == 1 or whole or pruneIndirect(m, ptr, depth - 1, child_base, first, freed)) {
+            // A whole subtree past the cut goes with freeIndirectLevel; a
+            // partial one was pruned to nothing just above.
+            if (depth > 1 and whole) freed.* += freeIndirectLevel(m, ptr, depth - 1);
+            _ = block.freeBlock(m, ptr);
+            std.mem.writeInt(u32, buf[i * 4 ..][0..4], 0, .little);
+            freed.* += 1;
+            changed = true;
+        } else {
+            left = true;
+        }
+    }
+    if (changed and left) _ = block.writeBlock(m, blk, buf);
+    return !left;
 }
 
 // =============================================================================

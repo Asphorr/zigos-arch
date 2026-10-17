@@ -614,6 +614,15 @@ pub fn write(pcb: *process.PCB, fd: u32, buf: [*]const u8, count: u32) u32 {
     }
 }
 
+/// Write `count` bytes into ext2 inode `inum` at `offset`, leaving every fd
+/// offset alone (pwrite and its kin). Refuses a running program's text
+/// as write() does.
+pub fn writeAt(inum: u32, offset: u64, buf: [*]const u8, count: u32) u32 {
+    if (process.isTextBusy(inum)) return @import("../proc/errno.zig").err(.ETXTBSY);
+    var handle = ext2.Handle{ .inum = inum, .file_size = 0, .current_offset = offset };
+    return ext2.writeFile(&handle, buf, count);
+}
+
 pub fn close(pcb: *process.PCB, fd: u32) u32 {
     if (fd >= pcb.fd_table.len or !pcb.fd_table[fd].in_use) return VFS_ERR;
     if (fd < 3) return VFS_ERR; // can't close stdin/stdout/stderr

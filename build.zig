@@ -564,7 +564,7 @@ pub fn build(b: *std.Build) void {
     // Linux syscall layer (syscall/linux.zig), and toolchains emit 0, the same
     // as native apps. Installed into zig-out/bin, so they land in /bin.
     const linux_target = b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .musl });
-    const linux_tests = .{ "lt_basic", "lt_mm", "lt_thread" };
+    const linux_tests = .{ "lt_basic", "lt_mm", "lt_thread", "lt_fs" };
     inline for (linux_tests) |name| {
         const exe = b.addExecutable(.{
             .name = name,

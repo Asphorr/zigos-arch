@@ -20,6 +20,10 @@
 //!     resource limits; clocks and sleeps (linux_time.zig).
 //!   * M4 — threads (linux_thread.zig): clone of the pthread shape, futex,
 //!     exit vs exit_group; the group shares the lead's fd table and cwd.
+//!   * M5 — the file system a compiler's cache needs (linux_fs.zig): names
+//!     relative to directory fds, mkdirat/unlinkat/renameat2/faccessat,
+//!     statx, ftruncate, flock; here, preadv/pwritev and copy_file_range;
+//!     /proc/self/exe, getrandom.
 //!
 //! The native ABI (3×u32 args, native numbers, return u32) is entirely
 //! separate and untouched — the only shared edge is doSyscall's one-line
@@ -31,15 +35,16 @@ const vfs = @import("../../fs/vfs.zig");
 const common = @import("common.zig");
 const debug = @import("../../debug/debug.zig");
 const ext2_inode = @import("../../fs/ext2/inode.zig");
-const ext2_fs = @import("../../fs/ext2/ext2.zig");
 const heap = @import("../../mm/heap.zig");
 const memmap = @import("../../mm/memmap.zig");
 const config = @import("../../config.zig");
 const errno = @import("../../proc/errno.zig");
+const random = @import("../../crypto/random.zig");
 const smp = @import("../smp.zig");
 const linux_mm = @import("linux_mm.zig");
 const linux_time = @import("linux_time.zig");
 const linux_thread = @import("linux_thread.zig");
+const linux_fs = @import("linux_fs.zig");
 const native_proc = @import("proc.zig");
 
 // --- Linux x86-64 errno (DISTINCT from zigos common.E_* — different values).
@@ -62,17 +67,15 @@ const EPIPE: i64 = 32;
 const ERANGE: i64 = 34;
 const ESPIPE: i64 = 29;
 const ENOSYS: i64 = 38;
+const EOVERFLOW: i64 = 75;
+const EOPNOTSUPP: i64 = 95;
 
 /// Encode a positive errno as the Linux-ABI return value (sign-extended -errno).
 inline fn err(e: i64) u64 {
     return @bitCast(-e);
 }
 
-/// The process the calling thread belongs to: its group lead holds the fd
-/// table and the cwd the group's threads share.
-fn proc() ?*process.PCB {
-    return process.leader(process.currentPCB() orelse return null);
-}
+const proc = linux_fs.proc;
 
 // --- Linux x86-64 syscall numbers (subset; grows per milestone). ---
 const SYS_read: u32 = 0;
@@ -110,6 +113,32 @@ const SYS_clone: u32 = 56;
 const SYS_getppid: u32 = 110;
 const SYS_futex: u32 = 202;
 const SYS_membarrier: u32 = 324;
+const SYS_access: u32 = 21;
+const SYS_flock: u32 = 73;
+const SYS_fsync: u32 = 74;
+const SYS_fdatasync: u32 = 75;
+const SYS_truncate: u32 = 76;
+const SYS_ftruncate: u32 = 77;
+const SYS_rename: u32 = 82;
+const SYS_mkdir: u32 = 83;
+const SYS_rmdir: u32 = 84;
+const SYS_unlink: u32 = 87;
+const SYS_readlink: u32 = 89;
+const SYS_sigaltstack: u32 = 131;
+const SYS_mkdirat: u32 = 258;
+const SYS_unlinkat: u32 = 263;
+const SYS_renameat: u32 = 264;
+const SYS_readlinkat: u32 = 267;
+const SYS_faccessat: u32 = 269;
+const SYS_preadv: u32 = 295;
+const SYS_pwritev: u32 = 296;
+const SYS_renameat2: u32 = 316;
+const SYS_getrandom: u32 = 318;
+const SYS_copy_file_range: u32 = 326;
+const SYS_preadv2: u32 = 327;
+const SYS_pwritev2: u32 = 328;
+const SYS_statx: u32 = 332;
+const SYS_faccessat2: u32 = 439;
 
 // fcntl commands (the few musl's open/opendir paths issue).
 const F_DUPFD: u64 = 0;
@@ -127,9 +156,7 @@ const SYS_setuid: u32 = 105;
 const SYS_setgid: u32 = 106;
 const SYS_geteuid: u32 = 107;
 const SYS_getegid: u32 = 108;
-// AT_FDCWD (-100): stat/lstat resolve their path against the cwd, exactly like
-// newfstatat(AT_FDCWD, ...). statPath ignores the dirfd for a non-empty path.
-const AT_FDCWD: u64 = 0xFFFF_FFFF_FFFF_FF9C;
+const AT_FDCWD = linux_fs.AT_FDCWD;
 const SYS_getpid: u32 = 39;
 const SYS_gettid: u32 = 186;
 const SYS_exit: u32 = 60;
@@ -149,68 +176,8 @@ const ARCH_GET_GS: u64 = 0x1004;
 
 const IA32_FS_BASE: u32 = 0xC0000100;
 
-// open(2) flag bits (the few that map onto zigos vfs flags). Linux's other
-// bits (O_DIRECTORY/O_CLOEXEC/O_NONBLOCK/access mode) are handled implicitly:
-// we try a regular-file open then a directory open, so O_DIRECTORY needs no
-// explicit decode for the cases that matter.
-const LINUX_O_CREAT: u64 = 0x40;
-const LINUX_O_TRUNC: u64 = 0x200;
-const LINUX_O_APPEND: u64 = 0x400;
-
-const AT_EMPTY_PATH: u64 = 0x1000;
-
-// d_type values for getdents64.
-const DT_DIR: u8 = 4;
-const DT_REG: u8 = 8;
-
-// struct stat st_mode format bits (same values as ext2 on-disk i_mode).
-const S_IFCHR: u32 = 0o0020000;
-const S_IFDIR: u32 = 0o0040000;
-const S_IFREG: u32 = 0o0100000;
-
 /// Linux iovec: { void *iov_base; size_t iov_len; } — 16 bytes, native order.
 const Iovec = extern struct { base: u64, len: u64 };
-
-/// Linux x86-64 `struct stat` — 144 bytes, exact field layout per
-/// arch/x86/include/uapi/asm/stat.h. Defaults zero so unfilled fields read 0.
-const LinuxStat = extern struct {
-    st_dev: u64 = 0,
-    st_ino: u64 = 0,
-    st_nlink: u64 = 0,
-    st_mode: u32 = 0,
-    st_uid: u32 = 0,
-    st_gid: u32 = 0,
-    __pad0: u32 = 0,
-    st_rdev: u64 = 0,
-    st_size: i64 = 0,
-    st_blksize: i64 = 0,
-    st_blocks: i64 = 0,
-    st_atime: u64 = 0,
-    st_atime_nsec: u64 = 0,
-    st_mtime: u64 = 0,
-    st_mtime_nsec: u64 = 0,
-    st_ctime: u64 = 0,
-    st_ctime_nsec: u64 = 0,
-    __unused: [3]i64 = .{ 0, 0, 0 },
-};
-
-/// Mirrors syscall.FileEntry / ext2.FileEntry (48 bytes) — ext2.listDir fills
-/// an array of these. We read name / name_len / flags to serialize dirents.
-const FileEntry = extern struct {
-    name: [32]u8,
-    name_len: u8,
-    file_size: u32 align(1),
-    flags: u8,
-    _pad: [10]u8,
-};
-const FE_FLAG_IS_DIR: u8 = 0x02;
-
-inline fn putU64(p: [*]u8, v: u64) void {
-    @as(*align(1) u64, @ptrCast(p)).* = v;
-}
-inline fn putU16(p: [*]u8, v: u16) void {
-    @as(*align(1) u16, @ptrCast(p)).* = v;
-}
 
 /// Linux-personality syscall dispatch. `num` is RAX (the Linux syscall number);
 /// the six args are read from the frame in Linux register order
@@ -229,15 +196,50 @@ pub fn dispatch(num: u32, frame: *signals.SyscallFrame) u64 {
         SYS_write => return sysWrite(@truncate(a1), a2, a3),
         SYS_writev => return sysWritev(@truncate(a1), a2, a3),
         SYS_fcntl => return sysFcntl(@truncate(a1), a2, a3),
-        SYS_open => return sysOpenImpl(a1, a2),
-        SYS_openat => return sysOpenImpl(a2, a3), // dirfd ignored: AT_FDCWD only (M2)
-        SYS_close => return sysClose(@truncate(a1)),
         SYS_lseek => return sysLseek(@truncate(a1), a2, @truncate(a3)),
-        SYS_fstat => return sysFstat(@truncate(a1), a2),
-        SYS_newfstatat => return sysNewfstatat(a1, a2, a3, a4),
-        SYS_getdents64 => return sysGetdents64(@truncate(a1), a2, a3),
         SYS_pread64 => return sysPread(@truncate(a1), a2, a3, a4),
         SYS_pwrite64 => return sysPwrite(@truncate(a1), a2, a3, a4),
+        SYS_preadv => return sysPreadv(@truncate(a1), a2, a3, a4),
+        SYS_pwritev => return sysPwritev(@truncate(a1), a2, a3, a4),
+        // preadv2/pwritev2(fd, iov, iovcnt, pos, pos_high, flags): the whole
+        // offset is in pos on 64-bit; -1 is the fd's own. No RWF_* flags.
+        SYS_preadv2, SYS_pwritev2 => {
+            if (a6 != 0) return err(EOPNOTSUPP);
+            const at_fd_offset = a4 == ~@as(u64, 0);
+            if (num == SYS_preadv2) {
+                return if (at_fd_offset) sysReadv(@truncate(a1), a2, a3) else sysPreadv(@truncate(a1), a2, a3, a4);
+            }
+            return if (at_fd_offset) sysWritev(@truncate(a1), a2, a3) else sysPwritev(@truncate(a1), a2, a3, a4);
+        },
+        SYS_copy_file_range => return sysCopyFileRange(a1, a2, a3, a4, a5, a6),
+        // Names, metadata and the tree (linux_fs.zig). The pre-*at calls are
+        // their *at forms at the cwd.
+        SYS_open => return linux_fs.openat(AT_FDCWD, a1, a2),
+        SYS_openat => return linux_fs.openat(a1, a2, a3),
+        SYS_close => return linux_fs.close(a1),
+        SYS_fstat => return linux_fs.fstat(a1, a2),
+        SYS_stat, SYS_lstat => return linux_fs.newfstatat(AT_FDCWD, a1, a2, 0),
+        SYS_newfstatat => return linux_fs.newfstatat(a1, a2, a3, a4),
+        SYS_statx => return linux_fs.statx(a1, a2, a3, a4, a5),
+        SYS_getdents64 => return linux_fs.getdents64(a1, a2, a3),
+        SYS_mkdir => return linux_fs.mkdirat(AT_FDCWD, a1),
+        SYS_mkdirat => return linux_fs.mkdirat(a1, a2),
+        SYS_unlink => return linux_fs.unlinkat(AT_FDCWD, a1, 0),
+        SYS_rmdir => return linux_fs.unlinkat(AT_FDCWD, a1, linux_fs.AT_REMOVEDIR),
+        SYS_unlinkat => return linux_fs.unlinkat(a1, a2, a3),
+        SYS_rename => return linux_fs.renameat2(AT_FDCWD, a1, AT_FDCWD, a2, 0),
+        SYS_renameat => return linux_fs.renameat2(a1, a2, a3, a4, 0),
+        SYS_renameat2 => return linux_fs.renameat2(a1, a2, a3, a4, a5),
+        SYS_access => return linux_fs.faccessat(AT_FDCWD, a1),
+        SYS_faccessat, SYS_faccessat2 => return linux_fs.faccessat(a1, a2),
+        SYS_readlink => return linux_fs.readlinkat(AT_FDCWD, a1, a2, a3),
+        SYS_readlinkat => return linux_fs.readlinkat(a1, a2, a3, a4),
+        SYS_truncate => return linux_fs.truncate(a1, a2),
+        SYS_ftruncate => return linux_fs.ftruncate(a1, a2),
+        SYS_flock => return linux_fs.flock(a1, a2),
+        SYS_fsync, SYS_fdatasync => return linux_fs.fsync(a1),
+        SYS_getrandom => return sysGetrandom(a1, a2, a3),
+        SYS_sigaltstack => return sysSigaltstack(a1, a2),
         SYS_mmap => return linux_mm.mmap(a1, a2, a3, a4, a5, a6),
         SYS_munmap => return linux_mm.munmap(a1, a2),
         SYS_mprotect => return linux_mm.mprotect(a1, a2, a3),
@@ -274,9 +276,6 @@ pub fn dispatch(num: u32, frame: *signals.SyscallFrame) u64 {
         SYS_rt_sigprocmask => return 0,
         SYS_rt_sigaction => return 0,
         SYS_set_robust_list => return 0,
-        // Path-based stat/lstat == newfstatat against the cwd. We have no
-        // symlinks, so lstat and stat are identical.
-        SYS_stat, SYS_lstat => return sysNewfstatat(AT_FDCWD, a1, a2, 0),
         SYS_uname => return sysUname(a1),
         SYS_getcwd => return sysGetcwd(a1, a2),
         // Single-user system: everything runs as root (uid/gid 0). setuid/setgid
@@ -459,46 +458,6 @@ fn sysFcntl(fd: u32, cmd: u64, arg: u64) u64 {
     };
 }
 
-/// Read a NUL-terminated user path (≤255 bytes) into `out`. Returns the slice,
-/// or null on a faulting/empty pointer. `allow_empty` keeps a zero-length path
-/// (newfstatat's AT_EMPTY_PATH form); otherwise empty → null.
-fn readUserPath(va: u64, out: *[256]u8, allow_empty: bool) ?[]const u8 {
-    if (va == 0) return null;
-    var nlen: usize = 0;
-    while (nlen < 255) : (nlen += 1) {
-        // Once per page; the first check bounds va below the user ceiling.
-        const at = va + nlen;
-        if ((nlen == 0 or at & 0xFFF == 0) and !common.validateUserPtr(at, 1)) return null;
-        const ch = @as([*]const u8, @ptrFromInt(at))[0];
-        if (ch == 0) break;
-        out[nlen] = ch;
-    }
-    if (nlen == 0 and !allow_empty) return null;
-    return out[0..nlen];
-}
-
-/// open(path, flags) / openat(AT_FDCWD, path, flags). Tries the regular-file
-/// path first (ext2.openFile rejects directories), then a directory open.
-fn sysOpenImpl(path_va: u64, lflags: u64) u64 {
-    const pcb = proc() orelse return err(EFAULT);
-    var pbuf: [256]u8 = undefined;
-    const path = readUserPath(path_va, &pbuf, false) orelse return err(EFAULT);
-    var zflags: u32 = 0;
-    if (lflags & LINUX_O_CREAT != 0) zflags |= vfs.O_CREATE;
-    if (lflags & LINUX_O_TRUNC != 0) zflags |= vfs.O_TRUNC;
-    if (lflags & LINUX_O_APPEND != 0) zflags |= vfs.O_APPEND;
-    if (vfs.openFlags(pcb, path, zflags)) |fd| return fd;
-    if (vfs.openDir(pcb, path)) |fd| return fd;
-    return err(ENOENT);
-}
-
-fn sysClose(fd: u32) u64 {
-    const pcb = proc() orelse return err(EFAULT);
-    const r = vfs.close(pcb, fd);
-    if (r != 0) return err(EBADF);
-    return 0;
-}
-
 /// File size behind an fd (ext2 only; 0 otherwise) — for lseek SEEK_END.
 fn fdFileSize(fe: *const process.FileDesc) u64 {
     if (fe.fs_type != .ext2) return 0;
@@ -521,91 +480,6 @@ fn sysLseek(fd: u32, off: u64, whence: u32) u64 {
     if (new > 0xFFFF_FFFF) return err(EINVAL);
     fe.offset = @truncate(new);
     return new;
-}
-
-/// Fill a Linux struct stat for a console fd (stdin/out/err) — a char device.
-fn fillStatConsole(st: *LinuxStat) void {
-    st.st_mode = S_IFCHR | 0o620;
-    st.st_nlink = 1;
-    st.st_blksize = 1024;
-    st.st_rdev = 0x0500;
-}
-
-/// Fill a Linux struct stat from an ext2 inode (the faithful path — real mode,
-/// size, link count, times). Returns false if the inode can't be read.
-fn fillStatExt2Inum(inum: u32, st: *LinuxStat) bool {
-    const ino = ext2_inode.readInode(inum) orelse return false;
-    st.st_ino = inum;
-    st.st_mode = ino.mode;
-    st.st_nlink = ino.links_count;
-    st.st_uid = ino.uid;
-    st.st_gid = ino.gid;
-    st.st_size = @intCast(ext2_inode.fileSize(&ino));
-    st.st_blksize = 4096;
-    st.st_blocks = @intCast(ino.blocks); // ext2 i_blocks already in 512-B units
-    st.st_atime = ino.atime;
-    st.st_mtime = ino.mtime;
-    st.st_ctime = ino.ctime;
-    return true;
-}
-
-/// Synthesize a Linux struct stat from coarse {is_dir, size} (the path-stat
-/// fallback via vfs.statPath, which only yields those facts).
-fn fillStatSynth(st: *LinuxStat, is_dir: bool, size: u64) void {
-    st.st_mode = if (is_dir) (S_IFDIR | 0o755) else (S_IFREG | 0o644);
-    st.st_nlink = 1;
-    st.st_size = @intCast(size);
-    st.st_blksize = 4096;
-    st.st_blocks = @intCast((size + 511) / 512);
-}
-
-/// fstat the file behind `fd` into the user stat buffer.
-fn statByFd(pcb: *process.PCB, fd: u32, st: *LinuxStat) u64 {
-    if (fd >= pcb.fd_table.len or !pcb.fd_table[fd].in_use) return err(EBADF);
-    const fe = &pcb.fd_table[fd];
-    switch (fe.fs_type) {
-        .console => fillStatConsole(st),
-        .ext2 => if (!fillStatExt2Inum(fe.inode, st)) return err(EBADF),
-        else => fillStatSynth(st, false, 0),
-    }
-    return 0;
-}
-
-/// fstat(fd, statbuf).
-fn sysFstat(fd: u32, statbuf_va: u64) u64 {
-    const pcb = proc() orelse return err(EFAULT);
-    if (!common.validateUserPtrWriteAligned(statbuf_va, @sizeOf(LinuxStat), @alignOf(LinuxStat))) return err(EFAULT);
-    const st: *LinuxStat = @ptrFromInt(statbuf_va);
-    st.* = .{};
-    return statByFd(pcb, fd, st);
-}
-
-/// newfstatat(dirfd, path, statbuf, flags). M2 supports AT_FDCWD (path resolved
-/// against cwd) and the AT_EMPTY_PATH / empty-path form (== fstat(dirfd)).
-/// dirfd-relative resolution against an arbitrary directory fd is deferred.
-fn sysNewfstatat(dirfd: u64, path_va: u64, statbuf_va: u64, flags: u64) u64 {
-    const pcb = proc() orelse return err(EFAULT);
-    if (!common.validateUserPtrWriteAligned(statbuf_va, @sizeOf(LinuxStat), @alignOf(LinuxStat))) return err(EFAULT);
-    const st: *LinuxStat = @ptrFromInt(statbuf_va);
-    st.* = .{};
-
-    var pbuf: [256]u8 = undefined;
-    const path = readUserPath(path_va, &pbuf, true) orelse return err(EFAULT);
-    // Empty path: with AT_EMPTY_PATH this is fstat(dirfd) (how musl's fstat is
-    // built); without the flag POSIX says -ENOENT.
-    if (path.len == 0) {
-        if (flags & AT_EMPTY_PATH == 0) return err(ENOENT);
-        return statByFd(pcb, @truncate(dirfd), st);
-    }
-    var info: vfs.StatInfo = undefined;
-    if (!vfs.statPath(pcb, path, &info)) return err(ENOENT);
-    fillStatSynth(st, info.is_directory != 0, info.file_size);
-    if (info.modify_time != 0) {
-        st.st_mtime = info.modify_time;
-        st.st_atime = info.modify_time;
-        st.st_ctime = info.modify_time;
-    }
-    return 0;
 }
 
 /// uname(2): fill `struct utsname` — six 65-byte char fields (sysname,
@@ -640,54 +514,6 @@ fn sysGetcwd(buf_va: u64, size: u64) u64 {
     @memcpy(out[0..cwd.len], cwd);
     out[cwd.len] = 0;
     return needed;
-}
-
-/// getdents64(fd, buf, count). Enumerates an ext2 directory fd into Linux
-/// linux_dirent64 records. fd.offset is the cross-call cursor (entries already
-/// returned); listDir always restarts at entry 0, so we skip `offset` of them.
-/// `.`/`..`/`lost+found` are filtered by listDir (so this looks like `ls`).
-fn sysGetdents64(fd: u32, buf_va: u64, count: u64) u64 {
-    const pcb = proc() orelse return err(EFAULT);
-    if (fd >= pcb.fd_table.len or !pcb.fd_table[fd].in_use) return err(EBADF);
-    const fe = &pcb.fd_table[fd];
-    if (fe.fs_type != .ext2) return err(ENOTDIR);
-    const dino = ext2_inode.readInode(fe.inode) orelse return err(EBADF);
-    if (!ext2_inode.isDir(&dino)) return err(ENOTDIR);
-    // MAX_DIR_ENTS records take at most 14 KB; don't map more buffer.
-    const cap = @min(rwLen(count), 64 * 1024);
-    if (cap < 32) return err(EINVAL);
-    if (!common.validateUserPtrWrite(buf_va, cap)) return err(EFAULT);
-
-    // Heap temp (not stack): ext2.listDir already burns 4 KiB of stack for its
-    // block buffer, so keep our own footprint off the kstack.
-    const MAX_DIR_ENTS: u32 = 256;
-    const tmp = heap.kmallocAligned(@as(usize, MAX_DIR_ENTS) * @sizeOf(FileEntry), @alignOf(FileEntry)) orelse return err(ENOMEM);
-    defer heap.kfree(tmp);
-    const fents: [*]FileEntry = @ptrCast(@alignCast(tmp));
-    const total = ext2_fs.listDir(fe.inode, @ptrCast(fents), MAX_DIR_ENTS);
-
-    if (fe.offset >= total) return 0; // all entries already returned (EOF)
-    const ubuf: [*]u8 = @ptrFromInt(buf_va);
-    var used: u32 = 0;
-    var i: u32 = fe.offset;
-    while (i < total) : (i += 1) {
-        const e = &fents[i];
-        const nlen: usize = @min(@as(usize, e.name_len), 32);
-        const reclen: u32 = @intCast((19 + nlen + 1 + 7) & ~@as(usize, 7)); // 8-align
-        if (used + reclen > cap) break;
-        const rec = ubuf + used;
-        putU64(rec, @as(u64, i) + 1); // d_ino (synthetic nonzero; FileEntry lacks inum)
-        putU64(rec + 8, @as(u64, i) + 1); // d_off (opaque next-cursor cookie)
-        putU16(rec + 16, @truncate(reclen)); // d_reclen
-        rec[18] = if (e.flags & FE_FLAG_IS_DIR != 0) DT_DIR else DT_REG; // d_type
-        var k: usize = 0;
-        while (k < nlen) : (k += 1) rec[19 + k] = e.name[k];
-        var p: usize = 19 + nlen;
-        while (p < reclen) : (p += 1) rec[p] = 0; // NUL terminator + alignment pad
-        used += reclen;
-    }
-    fe.offset = i; // advance cursor past what we emitted
-    return used;
 }
 
 /// The ext2 file behind `fd` for a positioned read or write: -EBADF for a
@@ -726,13 +552,147 @@ fn sysPwrite(fd: u32, buf_va: u64, count: u64, off: u64) u64 {
     if (count == 0) return 0;
     const len = rwLen(count);
     if (!common.validateUserPtr(buf_va, len)) return err(EFAULT);
-    // fd offsets are u32.
-    if (off + len > 0xFFFF_FFFF) return err(EFBIG);
-    const saved = fe.offset;
-    fe.offset = @intCast(off);
-    const n = vfs.write(pcb, fd, @ptrFromInt(buf_va), len);
-    fe.offset = saved;
-    return vfsResult(n);
+    if (off +| len > MAX_FILE) return err(EFBIG);
+    return vfsResult(vfs.writeAt(fe.inode, off, @ptrFromInt(buf_va), len));
+}
+
+/// Largest file the positioned writes grow: ext2 LARGE_FILE's 2^48 bytes.
+const MAX_FILE: u64 = 1 << 48;
+
+/// The `iovcnt` iovecs at `iov_va`, or the errno for a bad vector.
+fn iovecs(iov_va: u64, iovcnt: u64) union(enum) { iov: []align(1) const Iovec, fail: u64 } {
+    if (iovcnt > 1024) return .{ .fail = err(EINVAL) }; // UIO_MAXIOV
+    const n: usize = @intCast(iovcnt);
+    if (n == 0) return .{ .iov = &.{} };
+    if (!common.validateUserPtr(iov_va, n * @sizeOf(Iovec))) return .{ .fail = err(EFAULT) };
+    return .{ .iov = @as([*]align(1) const Iovec, @ptrFromInt(iov_va))[0..n] };
+}
+
+/// preadv(fd, iov, iovcnt, off): the iovecs in turn from `off`, stopping at
+/// a short read; the fd offset stays put.
+fn sysPreadv(fd: u32, iov_va: u64, iovcnt: u64, off: u64) u64 {
+    const iov = switch (iovecs(iov_va, iovcnt)) {
+        .iov => |v| v,
+        .fail => |e| return e,
+    };
+    var total: u64 = 0;
+    for (iov) |v| {
+        if (v.len == 0) continue;
+        const r = sysPread(fd, v.base, v.len, off +% total);
+        if (@as(i64, @bitCast(r)) < 0) return if (total > 0) total else r;
+        total += r;
+        if (r < v.len) break;
+    }
+    return total;
+}
+
+/// pwritev(fd, iov, iovcnt, off): the iovecs in turn from `off`; the fd
+/// offset stays put.
+fn sysPwritev(fd: u32, iov_va: u64, iovcnt: u64, off: u64) u64 {
+    const iov = switch (iovecs(iov_va, iovcnt)) {
+        .iov => |v| v,
+        .fail => |e| return e,
+    };
+    var total: u64 = 0;
+    for (iov) |v| {
+        if (v.len == 0) continue;
+        const r = sysPwrite(fd, v.base, v.len, off +% total);
+        if (@as(i64, @bitCast(r)) < 0) return if (total > 0) total else r;
+        total += r;
+        if (r < v.len) break;
+    }
+    return total;
+}
+
+/// Most bytes one copy_file_range moves; callers loop on a short count.
+const MAX_COPY: u64 = 1 << 20;
+
+/// The offset a copy_file_range side starts at: `*off_va` when given (it
+/// gets the end offset back), else the fd's own.
+fn copyOffset(fe: *const process.FileDesc, off_va: u64) ?u64 {
+    if (off_va == 0) return fe.offset;
+    if (!common.validateUserPtrWriteAligned(off_va, 8, 8)) return null;
+    const off = @as(*const i64, @ptrFromInt(off_va)).*;
+    if (off < 0) return null;
+    return @intCast(off);
+}
+
+/// copy_file_range(fd_in, off_in, fd_out, off_out, len, flags) between ext2
+/// files, through a kernel page. A null offset pointer means the fd's own
+/// offset, which advances; a given one is updated instead.
+fn sysCopyFileRange(fd_in: u64, off_in_va: u64, fd_out: u64, off_out_va: u64, len: u64, flags: u64) u64 {
+    if (flags != 0) return err(EINVAL);
+    const pcb = proc() orelse return err(EFAULT);
+    const in_fe = linux_fs.fdEntry(pcb, fd_in) orelse return err(EBADF);
+    const out_fe = linux_fs.fdEntry(pcb, fd_out) orelse return err(EBADF);
+    if (in_fe.fs_type != .ext2 or out_fe.fs_type != .ext2) return err(EINVAL);
+    if (isDirFd(pcb, @intCast(fd_in)) or isDirFd(pcb, @intCast(fd_out))) return err(EISDIR);
+    var in_off = copyOffset(in_fe, off_in_va) orelse return err(EFAULT);
+    var out_off = copyOffset(out_fe, off_out_va) orelse return err(EFAULT);
+    const size = fdFileSize(in_fe);
+    const want = @min(len, MAX_COPY, size -| in_off);
+    if (want == 0) return 0;
+    if (in_fe.inode == out_fe.inode and in_off < out_off + want and out_off < in_off + want) return err(EINVAL);
+    if (out_off +| want > MAX_FILE) return err(EFBIG);
+    if (off_out_va == 0 and out_off + want > 0xFFFF_FFFF) return err(EFBIG); // fd offsets are u32
+
+    if (off_in_va == 0 and in_off + want > 0xFFFF_FFFF) return err(EOVERFLOW); // fd offsets are u32
+    const buf = heap.kmallocAligned(4096, 4096) orelse return err(ENOMEM);
+    defer heap.kfree(buf);
+    var done: u64 = 0;
+    while (done < want) {
+        const chunk: u32 = @intCast(@min(want - done, 4096));
+        const got = vfs.readThroughCache(in_fe.inode, in_off, buf, chunk);
+        if (got == 0) break;
+        const put = vfs.writeAt(out_fe.inode, out_off, buf, got);
+        if (put >= errno.ERR_SENTINEL_BASE) {
+            if (done > 0) break;
+            return vfsResult(put);
+        }
+        done += put;
+        in_off += put;
+        out_off += put;
+        if (put < got) break;
+    }
+    if (off_in_va != 0) @as(*u64, @ptrFromInt(off_in_va)).* = in_off else in_fe.offset = @intCast(in_off);
+    if (off_out_va != 0) @as(*u64, @ptrFromInt(off_out_va)).* = out_off else out_fe.offset = @intCast(out_off);
+    return done;
+}
+
+/// Most bytes one getrandom returns; Linux may return short past 256.
+const MAX_RANDOM: u64 = 1 << 20;
+
+/// getrandom(buf, len, flags): the kernel CSPRNG (RDSEED/RDRAND), never
+/// blocking, whichever pool the flags name.
+fn sysGetrandom(buf_va: u64, len: u64, flags: u64) u64 {
+    if (flags & ~@as(u64, 7) != 0) return err(EINVAL); // GRND_NONBLOCK | GRND_RANDOM | GRND_INSECURE
+    const n = @min(len, MAX_RANDOM);
+    if (n == 0) return 0;
+    if (!common.validateUserPtrWrite(buf_va, n)) return err(EFAULT);
+    _ = random.fillRandom(@as([*]u8, @ptrFromInt(buf_va))[0..n]);
+    return n;
+}
+
+/// Linux stack_t.
+const StackT = extern struct { sp: u64, flags: i32, _pad: u32 = 0, size: u64 };
+const SS_DISABLE: i32 = 2;
+const SS_AUTODISARM: i32 = @bitCast(@as(u32, 1 << 31));
+const MINSIGSTKSZ: u64 = 2048;
+
+/// sigaltstack(ss, old): checked and accepted, and reported as none. No
+/// Linux signal handler runs yet, so no alternate stack is ever used.
+fn sysSigaltstack(ss_va: u64, old_va: u64) u64 {
+    if (ss_va != 0) {
+        if (!common.validateUserPtrAligned(ss_va, @sizeOf(StackT), 8)) return err(EFAULT);
+        const ss = @as(*const StackT, @ptrFromInt(ss_va)).*;
+        if (ss.flags & ~(SS_DISABLE | SS_AUTODISARM) != 0) return err(EINVAL);
+        if (ss.flags & SS_DISABLE == 0 and ss.size < MINSIGSTKSZ) return err(ENOMEM);
+    }
+    if (old_va != 0) {
+        if (!common.validateUserPtrWriteAligned(old_va, @sizeOf(StackT), 8)) return err(EFAULT);
+        @as(*StackT, @ptrFromInt(old_va)).* = .{ .sp = 0, .flags = SS_DISABLE, .size = 0 };
+    }
+    return 0;
 }
 
 const RLIMIT_STACK: u64 = 3;

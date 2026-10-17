@@ -1,6 +1,7 @@
 // lt_basic — what every static musl program needs before main does any
 // work: the SysV initial stack (argc/argv/envp/auxv), TLS, stdio through
-// writev, the ext2 root through open/read/getdents64/stat, and the clocks.
+// writev, the ext2 root through open/read/getdents64/stat, the clocks, and
+// what it learns about itself: its path, the environment, randomness.
 // Boot mode 19 runs it as `lt_basic one two three`; exit 0 = every check
 // passed, else the number of the first failed check.
 
@@ -9,9 +10,11 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <sched.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/random.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <time.h>
@@ -68,6 +71,40 @@ static void check_clocks(void) {
     CHECK(sched_yield() == 0, "sched_yield");
 }
 
+static int all_zero(const unsigned char *p, size_t n) {
+    for (size_t i = 0; i < n; i++)
+        if (p[i]) return 0;
+    return 1;
+}
+
+// What a program learns about itself and its surroundings: its path, the
+// environment, randomness.
+static void check_identity(void) {
+    char exe[256] = {0};
+    ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
+    CHECK(n > 0 && strcmp(exe, "/bin/lt_basic.elf") == 0, "readlink /proc/self/exe");
+    char tiny[4];
+    CHECK(readlink("/proc/self/exe", tiny, sizeof tiny) == sizeof tiny && memcmp(tiny, "/bin", 4) == 0, "readlink truncates");
+    errno = 0;
+    CHECK(readlink("/etc/motd", exe, sizeof exe) == -1 && errno == EINVAL, "readlink of a regular file is EINVAL");
+    errno = 0;
+    CHECK(readlink("/no/such/file", exe, sizeof exe) == -1 && errno == ENOENT, "readlink of nothing is ENOENT");
+
+    const char *home = getenv("HOME");
+    CHECK(home != NULL && strcmp(home, "/") == 0, "HOME is set");
+    CHECK(getenv("PATH") != NULL, "PATH is set");
+
+    unsigned char a[32] = {0}, b[32] = {0};
+    CHECK(getrandom(a, sizeof a, 0) == sizeof a && !all_zero(a, sizeof a), "getrandom");
+    int fd = open("/dev/urandom", O_RDONLY);
+    CHECK(fd >= 0, "open /dev/urandom");
+    CHECK(read(fd, b, sizeof b) == sizeof b && !all_zero(b, sizeof b) && memcmp(a, b, sizeof a) != 0, "read /dev/urandom");
+    close(fd);
+
+    stack_t old;
+    CHECK(sigaltstack(NULL, &old) == 0 && (old.ss_flags & SS_DISABLE), "sigaltstack reports none");
+}
+
 int main(int argc, char **argv) {
     CHECK(argc == 4, "argc");
     CHECK(strcmp(argv[1], "one") == 0 && strcmp(argv[2], "two") == 0 && strcmp(argv[3], "three") == 0, "argv");
@@ -101,6 +138,7 @@ int main(int argc, char **argv) {
     CHECK(saw_motd, "readdir /etc lists motd");
 
     check_clocks();
+    check_identity();
 
     printf("lt_basic: PASS (%d checks)\n", check_no);
     return 0;

@@ -510,6 +510,8 @@ pub fn forkCurrent(frame: *signals.SyscallFrame) ?usize {
     process.procs[i].argv = parent_lead_src.argv;
     process.procs[i].arg_lens = parent_lead_src.arg_lens;
     process.procs[i].argc = parent_lead_src.argc;
+    process.procs[i].exe_path = parent_lead_src.exe_path;
+    process.procs[i].exe_path_len = parent_lead_src.exe_path_len;
     process.procs[i].priority = parent.priority;
     process.procs[i].fs_base = parent.fs_base;
     // A Linux process's forked children are Linux too — inherit the ABI

@@ -8,7 +8,8 @@
 // Currently supported:
 //   /dev/null    write-discard, read returns 0 (EOF)
 //   /dev/zero    read returns zeros forever
-//   /dev/random  read returns xorshift32-derived bytes
+//   /dev/random, /dev/urandom  read returns the kernel CSPRNG's bytes
+//                 (crypto/random.zig: RDSEED/RDRAND)
 //   /dev/usb0    raw block access to the first USB block device (UAS or BOT).
 //                 sector-aligned (offset and count multiples of block_size,
 //                 typically 512). Returns 0xFFFFFFFF on misalignment.
@@ -33,6 +34,7 @@ const std = @import("std");
 const xhci = @import("../driver/xhci.zig");
 const pmem = @import("../mm/pmem.zig");
 const serial = @import("../debug/serial.zig");
+const random = @import("../crypto/random.zig");
 
 pub const Kind = enum(u8) {
     null_dev,
@@ -55,22 +57,8 @@ const DEVICES = [_]Device{
     .{ .name = "usb0", .kind = .usb0 },
     .{ .name = "kmsg", .kind = .kmsg },
     .{ .name = "pmem0", .kind = .pmem0 },
+    .{ .name = "urandom", .kind = .random_dev },
 };
-
-// Single global xorshift32 — `random` is for entropy-as-a-toy, not cryptography.
-// Seed is non-zero (xorshift cannot recover from 0); reseeding from rdtsc would
-// be marginally better, but the current init point is reached very early when
-// rdtsc is small and predictable, so it doesn't really help.
-var rng_state: u32 = 0x9E3779B9;
-
-fn xorshift32() u32 {
-    var x = rng_state;
-    x ^= x << 13;
-    x ^= x >> 17;
-    x ^= x << 5;
-    rng_state = x;
-    return x;
-}
 
 /// Match a relative path (the part after "/dev/") to a device index.
 /// Returns null if the name is unknown.
@@ -122,23 +110,7 @@ pub fn read(idx: u32, offset: *u32, buf: [*]u8, count: u32) u32 {
             break :blk count;
         },
         .random_dev => blk: {
-            // xorshift produces 32 bits per call; copy them out 4 bytes at a
-            // time and handle the tail with a final partial extraction.
-            var i: u32 = 0;
-            while (i + 4 <= count) : (i += 4) {
-                const r = xorshift32();
-                buf[i] = @truncate(r);
-                buf[i + 1] = @truncate(r >> 8);
-                buf[i + 2] = @truncate(r >> 16);
-                buf[i + 3] = @truncate(r >> 24);
-            }
-            if (i < count) {
-                var r = xorshift32();
-                while (i < count) : (i += 1) {
-                    buf[i] = @truncate(r);
-                    r >>= 8;
-                }
-            }
+            _ = random.fillRandom(buf[0..count]);
             break :blk count;
         },
         .usb0 => readUsb(offset.*, buf, count),

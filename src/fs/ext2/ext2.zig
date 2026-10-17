@@ -79,6 +79,26 @@ fn splitParentLeaf(path: []const u8) ParentLeaf {
     return .{ .parent = "", .leaf = path };
 }
 
+/// Why a namespace operation failed, for callers that report it (the Linux
+/// layer's errno).
+pub const Error = error{ NotFound, Exists, NotDir, IsDir, NotEmpty, NoSpace, Busy, Invalid, Io };
+
+const ParentAt = struct { inum: u32, leaf: []const u8 };
+
+/// The directory holding `path`'s last component, and the component.
+/// Trailing slashes don't count ("a/b/" names b).
+fn parentDir(path: []const u8) Error!ParentAt {
+    var p = path;
+    while (p.len > 1 and p[p.len - 1] == '/') p = p[0 .. p.len - 1];
+    if (p.len == 0 or p.len > 255) return error.Invalid;
+    const split = splitParentLeaf(p);
+    if (split.leaf.len == 0) return error.Invalid;
+    const inum = if (split.parent.len == 0) layout.ROOT_INO else (cachedWalk(split.parent) orelse return error.NotFound);
+    const ino = inode.readInode(inum) orelse return error.Io;
+    if (!inode.isDir(&ino)) return error.NotDir;
+    return .{ .inum = inum, .leaf = split.leaf };
+}
+
 // =============================================================================
 // Init
 // =============================================================================
@@ -513,23 +533,26 @@ inline fn containsSlash(name: []const u8) bool {
 /// bumps the parent's links_count by 1 to account for the new ".." back-
 /// pointer. Returns true on success.
 pub fn mkdirPath(path: []const u8) bool {
-    if (path.len == 0 or path.len > 255) return false;
-    const split = splitParentLeaf(path);
-    const parent_path = split.parent;
-    const leaf = split.leaf;
-    if (leaf.len == 0 or leaf.len > 255) return false;
-    if (containsSlash(leaf)) return false;
+    mkdirAt(path) catch return false;
+    return true;
+}
 
-    const m = block.getMount() orelse return false;
-    const parent_inum = if (parent_path.len == 0) layout.ROOT_INO else (cachedWalk(parent_path) orelse return false);
+/// mkdirPath with the reason it failed.
+pub fn mkdirAt(path: []const u8) Error!void {
+    const at = try parentDir(path);
+    if (isDotEntry(at.leaf)) return error.Exists;
+    const parent_inum = at.inum;
+    const leaf = at.leaf;
+
+    const m = block.getMount() orelse return error.Io;
     // Whole-op hold — same compound-atomicity reasoning as createFile.
     block.lockMount(m);
     defer block.unlockMount(m);
-    var parent = inode.readInode(parent_inum) orelse return false;
-    if (!inode.isDir(&parent)) return false;
-    if (lookupInDir(&parent, leaf) != null) return false;
+    var parent = inode.readInode(parent_inum) orelse return error.Io;
+    if (!inode.isDir(&parent)) return error.NotDir;
+    if (lookupInDir(&parent, leaf) != null) return error.Exists;
 
-    const new_inum = inode.allocInode(true) orelse return false;
+    const new_inum = inode.allocInode(true) orelse return error.NoSpace;
 
     // Initialize the new directory inode.
     var new_ino: layout.Inode = std.mem.zeroes(layout.Inode);
@@ -547,7 +570,7 @@ pub fn mkdirPath(path: []const u8) bool {
     // bumps new_ino.blocks for us.
     const data_block = inode.ensurePhysicalBlock(m, &new_ino, 0) orelse {
         _ = inode.freeInode(new_inum, true);
-        return false;
+        return error.NoSpace;
     };
 
     const bs = m.block_size;
@@ -574,27 +597,26 @@ pub fn mkdirPath(path: []const u8) bool {
         // the data block since ensurePhysicalBlock already wired it in.
         inode.freeAllBlocks(m, &new_ino);
         _ = inode.freeInode(new_inum, true);
-        return false;
+        return error.Io;
     }
     new_ino.size = @intCast(bs);
 
     if (!inode.writeInode(new_inum, &new_ino)) {
         inode.freeAllBlocks(m, &new_ino);
         _ = inode.freeInode(new_inum, true);
-        return false;
+        return error.Io;
     }
 
     if (!dirInsert(m, &parent, leaf, new_inum, layout.FT_DIR)) {
         inode.freeAllBlocks(m, &new_ino);
         _ = inode.freeInode(new_inum, true);
-        return false;
+        return error.NoSpace;
     }
     defer path_cache.invalidateAll();
     parent.links_count += 1; // the new dir's ".." points back to parent
     parent.mtime = sec;
     parent.ctime = sec;
-    if (!inode.writeInode(parent_inum, &parent)) return false;
-    return true;
+    if (!inode.writeInode(parent_inum, &parent)) return error.Io;
 }
 
 /// Remove an empty directory at `path`. Refuses non-empty dirs (anything
@@ -602,28 +624,28 @@ pub fn mkdirPath(path: []const u8) bool {
 /// directory's data block + inode and decrements the parent's links_count
 /// by 1.
 pub fn rmdirPath(path: []const u8) bool {
-    if (path.len == 0 or path.len > 255) return false;
-    const split = splitParentLeaf(path);
-    const parent_path = split.parent;
-    const leaf = split.leaf;
-    if (leaf.len == 0) return false;
+    rmdirAt(path) catch return false;
+    return true;
+}
 
-    const parent_inum = if (parent_path.len == 0) layout.ROOT_INO else (cachedWalk(parent_path) orelse return false);
+/// rmdirPath with the reason it failed.
+pub fn rmdirAt(path: []const u8) Error!void {
+    const at = try parentDir(path);
+    if (isDotEntry(at.leaf)) return error.Invalid;
     // Whole-op hold so the emptiness check and the removal are atomic: a
     // concurrent create into this directory between dirIsEmpty and
     // unlinkInDir would otherwise orphan the new file in a freed dir.
     // unlinkInDir re-locks — reentrant, just bumps depth.
-    const m = block.getMount() orelse return false;
+    const m = block.getMount() orelse return error.Io;
     block.lockMount(m);
     defer block.unlockMount(m);
-    var parent = inode.readInode(parent_inum) orelse return false;
-    if (!inode.isDir(&parent)) return false;
-    const child_inum = lookupInDir(&parent, leaf) orelse return false;
-    const child = inode.readInode(child_inum) orelse return false;
-    if (!inode.isDir(&child)) return false;
-    if (!dirIsEmpty(&child)) return false;
-
-    return unlinkInDir(parent_inum, leaf, .dir_only);
+    var parent = inode.readInode(at.inum) orelse return error.Io;
+    if (!inode.isDir(&parent)) return error.NotDir;
+    const child_inum = lookupInDir(&parent, at.leaf) orelse return error.NotFound;
+    const child = inode.readInode(child_inum) orelse return error.Io;
+    if (!inode.isDir(&child)) return error.NotDir;
+    if (!dirIsEmpty(&child)) return error.NotEmpty;
+    if (!unlinkInDir(at.inum, at.leaf, .dir_only)) return error.Io;
 }
 
 /// Returns true if `dir_ino` contains nothing besides "." and ".." (the
@@ -649,14 +671,24 @@ fn dirIsEmpty(dir_ino: *const layout.Inode) bool {
 /// inode bitmap bit. Returns true on success. Refuses to operate on
 /// directories — use rmdir for those.
 pub fn unlinkPath(path: []const u8) bool {
-    if (path.len == 0 or path.len > 255) return false;
-    const split = splitParentLeaf(path);
-    const parent_path = split.parent;
-    const leaf = split.leaf;
-    if (leaf.len == 0) return false;
+    unlinkAt(path) catch return false;
+    return true;
+}
 
-    const parent_inum = if (parent_path.len == 0) layout.ROOT_INO else (cachedWalk(parent_path) orelse return false);
-    return unlinkInDir(parent_inum, leaf, .file_only);
+/// unlinkPath with the reason it failed.
+pub fn unlinkAt(path: []const u8) Error!void {
+    const at = try parentDir(path);
+    if (isDotEntry(at.leaf)) return error.IsDir;
+    const m = block.getMount() orelse return error.Io;
+    block.lockMount(m);
+    defer block.unlockMount(m);
+    var parent = inode.readInode(at.inum) orelse return error.Io;
+    if (!inode.isDir(&parent)) return error.NotDir;
+    const child_inum = lookupInDir(&parent, at.leaf) orelse return error.NotFound;
+    const child = inode.readInode(child_inum) orelse return error.Io;
+    if (inode.isDir(&child)) return error.IsDir;
+    if (@import("../../proc/process.zig").isTextBusy(child_inum)) return error.Busy;
+    if (!unlinkInDir(at.inum, at.leaf, .file_only)) return error.Io;
 }
 
 const UnlinkPolicy = enum { file_only, dir_only };
@@ -789,6 +821,233 @@ pub fn truncate(inum: u32) bool {
     // fault/read doesn't serve pre-truncate bytes.
     _ = page_cache.invalidateFile(page_cache.ext2FileId(inum));
     return inode.writeInode(inum, &ino);
+}
+
+/// Set regular file `inum` to `size` bytes, as ftruncate: growing leaves a
+/// hole (reads as zeros), shrinking frees the blocks past the end and zeroes
+/// the rest of the last one, so growing again reads zeros there too.
+pub fn truncateTo(inum: u32, size: u64) Error!void {
+    if (size == 0) return if (truncate(inum)) {} else error.Busy;
+    if (@import("../../proc/process.zig").isTextBusy(inum)) return error.Busy;
+    const m = block.getMount() orelse return error.Io;
+    block.lockMount(m);
+    defer block.unlockMount(m);
+    block.beginMetaDefer(m);
+    defer block.endMetaDefer(m);
+    var ino = inode.readInode(inum) orelse return error.Io;
+    if (inode.isDir(&ino)) return error.IsDir;
+    if (!inode.isReg(&ino)) return error.Invalid;
+    const old = inode.fileSize(&ino);
+    if (size < old) {
+        const bs: u64 = m.block_size;
+        inode.freeBlocksFrom(m, &ino, @intCast(std.math.divCeil(u64, size, bs) catch unreachable));
+        if (size % bs != 0) {
+            if (inode.blockMapLookup(&ino, @intCast(size / bs))) |phys| {
+                const buf = @import("../../proc/process.zig").currentIoScratch();
+                if (!block.readBlock(m, phys, buf[0..m.block_size])) return error.Io;
+                @memset(buf[@intCast(size % bs)..m.block_size], 0);
+                if (!block.writeBlock(m, phys, buf[0..m.block_size])) return error.Io;
+            }
+        }
+        const page_from = size & ~@as(u64, 0xFFF);
+        _ = page_cache.invalidateRange(page_cache.ext2FileId(inum), page_from, old - page_from);
+    }
+    ino.size = @truncate(size);
+    ino.dir_acl = @truncate(size >> 32); // size-high bits
+    const sec: u32 = @truncate(time.now().sec);
+    ino.mtime = sec;
+    ino.ctime = sec;
+    if (!inode.writeInode(inum, &ino)) return error.Io;
+}
+
+/// The inode `path` names, or null. "" and "/" are the root.
+pub fn lookupPath(path: []const u8) ?u32 {
+    var p = path;
+    while (p.len > 0 and p[p.len - 1] == '/') p = p[0 .. p.len - 1];
+    if (p.len == 0) return layout.ROOT_INO;
+    return cachedWalk(p);
+}
+
+/// The name directory `dir_ino` gives inode `child` (not "." or ".."),
+/// copied into `out`.
+fn nameIn(dir_ino: *const layout.Inode, child: u32, out: *[255]u8) ?[]const u8 {
+    const m = block.getMount() orelse return null;
+    const block_buf: *[4096]u8 = @import("../../proc/process.zig").currentIoScratch();
+    const total = inode.fileSize(dir_ino);
+    var lblock: u32 = 0;
+    while (@as(u64, lblock) * m.block_size < total) : (lblock += 1) {
+        if (!inode.readInodeBlock(dir_ino, lblock, block_buf[0..m.block_size])) return null;
+        var w = DirWalk{ .buf = block_buf[0..m.block_size] };
+        while (w.next()) |d| {
+            if (d.e.inode != child or d.name.len == 0 or isDotEntry(d.name)) continue;
+            @memcpy(out[0..d.name.len], d.name);
+            return out[0..d.name.len];
+        }
+    }
+    return null;
+}
+
+/// The absolute path of directory `inum`, by walking ".." up to the root
+/// and naming each step in its parent; null when the chain breaks or
+/// doesn't fit `buf`. A directory moved by rename gets its new path.
+pub fn pathOf(inum: u32, buf: []u8) ?[]const u8 {
+    if (buf.len == 0) return null;
+    var end = buf.len;
+    var cur = inum;
+    var depth: u32 = 0;
+    while (cur != layout.ROOT_INO) : (depth += 1) {
+        if (depth >= 128) return null;
+        const ino = inode.readInode(cur) orelse return null;
+        if (!inode.isDir(&ino)) return null;
+        const parent = lookupInDir(&ino, "..") orelse return null;
+        const pino = inode.readInode(parent) orelse return null;
+        var name_buf: [255]u8 = undefined;
+        const name = nameIn(&pino, cur, &name_buf) orelse return null;
+        if (name.len + 1 > end) return null;
+        end -= name.len;
+        @memcpy(buf[end..][0..name.len], name);
+        end -= 1;
+        buf[end] = '/';
+        cur = parent;
+    }
+    if (end == buf.len) {
+        end -= 1;
+        buf[end] = '/';
+    }
+    const len = buf.len - end;
+    std.mem.copyForwards(u8, buf[0..len], buf[end..]);
+    return buf[0..len];
+}
+
+/// True if directory `dir` is `ancestor` or lies anywhere below it.
+fn isUnder(dir: u32, ancestor: u32) bool {
+    var cur = dir;
+    var depth: u32 = 0;
+    while (depth < 128) : (depth += 1) {
+        if (cur == ancestor) return true;
+        if (cur == layout.ROOT_INO) return false;
+        const ino = inode.readInode(cur) orelse return false;
+        cur = lookupInDir(&ino, "..") orelse return false;
+    }
+    return false;
+}
+
+/// Point directory `dir_ino`'s ".." entry at `parent`.
+fn setDotDot(m: *block.Mount, dir_ino: *const layout.Inode, parent: u32) bool {
+    const bs = m.block_size;
+    var dir_buf: [4096]u8 align(8) = undefined;
+    if (!inode.readInodeBlock(dir_ino, 0, dir_buf[0..bs])) return false;
+    var w = DirWalk{ .buf = dir_buf[0..bs] };
+    while (w.next()) |d| {
+        if (d.e.inode == 0 or !std.mem.eql(u8, d.name, "..")) continue;
+        d.e.inode = parent;
+        const phys = inode.blockMapLookup(dir_ino, 0) orelse return false;
+        return block.writeBlock(m, phys, dir_buf[0..bs]);
+    }
+    return false;
+}
+
+/// Move `old_path` to `new_path`, as rename(2): what `new_path` names is
+/// replaced — a file by a file, an empty directory by a directory — and a
+/// directory's ".." follows it to its new parent.
+pub fn rename(old_path: []const u8, new_path: []const u8) Error!void {
+    const from = try parentDir(old_path);
+    const to = try parentDir(new_path);
+    if (isDotEntry(from.leaf) or isDotEntry(to.leaf)) return error.Invalid;
+    const m = block.getMount() orelse return error.Io;
+    block.lockMount(m);
+    defer block.unlockMount(m);
+    block.beginMetaDefer(m);
+    defer block.endMetaDefer(m);
+
+    const from_dir = inode.readInode(from.inum) orelse return error.Io;
+    if (!inode.isDir(&from_dir)) return error.NotDir;
+    const src = lookupInDir(&from_dir, from.leaf) orelse return error.NotFound;
+    var src_ino = inode.readInode(src) orelse return error.Io;
+    const src_is_dir = inode.isDir(&src_ino);
+    // Into itself or below it: the subtree would hang off nothing.
+    if (src_is_dir and isUnder(to.inum, src)) return error.Invalid;
+
+    {
+        const to_dir = inode.readInode(to.inum) orelse return error.Io;
+        if (!inode.isDir(&to_dir)) return error.NotDir;
+        if (lookupInDir(&to_dir, to.leaf)) |dst| {
+            if (dst == src) return;
+            const dst_ino = inode.readInode(dst) orelse return error.Io;
+            if (src_is_dir) {
+                if (!inode.isDir(&dst_ino)) return error.NotDir;
+                if (!dirIsEmpty(&dst_ino)) return error.NotEmpty;
+            } else {
+                if (inode.isDir(&dst_ino)) return error.IsDir;
+                if (@import("../../proc/process.zig").isTextBusy(dst)) return error.Busy;
+            }
+            if (!unlinkInDir(to.inum, to.leaf, if (src_is_dir) .dir_only else .file_only)) return error.Io;
+        }
+    }
+
+    // unlinkInDir may have rewritten either directory: work on fresh copies,
+    // one copy when both names are in the same directory.
+    var to_dir = inode.readInode(to.inum) orelse return error.Io;
+    const ftype: u8 = if (src_is_dir) layout.FT_DIR else layout.FT_REG_FILE;
+    if (!dirInsert(m, &to_dir, to.leaf, src, ftype)) return error.NoSpace;
+    defer path_cache.invalidateAll();
+    const sec: u32 = @truncate(time.now().sec);
+    to_dir.mtime = sec;
+    to_dir.ctime = sec;
+    if (from.inum == to.inum) {
+        if (!dirRemove(m, &to_dir, from.leaf)) return error.Io;
+        if (!inode.writeInode(to.inum, &to_dir)) return error.Io;
+    } else {
+        var old_dir = inode.readInode(from.inum) orelse return error.Io;
+        if (!dirRemove(m, &old_dir, from.leaf)) return error.Io;
+        if (src_is_dir) {
+            if (!setDotDot(m, &src_ino, to.inum)) return error.Io;
+            old_dir.links_count -|= 1;
+            to_dir.links_count += 1;
+        }
+        old_dir.mtime = sec;
+        old_dir.ctime = sec;
+        if (!inode.writeInode(to.inum, &to_dir)) return error.Io;
+        if (!inode.writeInode(from.inum, &old_dir)) return error.Io;
+    }
+    src_ino.ctime = sec;
+    if (!inode.writeInode(src, &src_ino)) return error.Io;
+}
+
+/// One live entry of a directory, as iterDir hands it out. `name` points
+/// into the caller's scratch block: copy it before the next entry.
+pub const DirItem = struct {
+    inum: u32,
+    file_type: u8,
+    name: []const u8,
+    /// Where the entry after this one starts (iterDir's `pos`).
+    next: u64,
+};
+
+/// Walk directory `dir_inum`'s live entries from byte position `pos` (0, or
+/// a previous item's `next`), handing each to `sink.take(item)` until it
+/// returns false. Returns where to resume: the position of the entry the
+/// sink refused, or the directory's end; null if the directory can't be read.
+pub fn iterDir(dir_inum: u32, pos: u64, sink: anytype) ?u64 {
+    const m = block.getMount() orelse return null;
+    const ino = inode.readInode(dir_inum) orelse return null;
+    if (!inode.isDir(&ino)) return null;
+    const bs: u64 = m.block_size;
+    const total = inode.fileSize(&ino);
+    const buf: *[4096]u8 = @import("../../proc/process.zig").currentIoScratch();
+    var lblock: u64 = pos / bs;
+    while (lblock * bs < total) : (lblock += 1) {
+        if (!inode.readInodeBlock(&ino, @intCast(lblock), buf[0..m.block_size])) return null;
+        const start: u64 = if (lblock == pos / bs) pos % bs else 0;
+        var w = DirWalk{ .buf = buf[0..m.block_size] };
+        while (w.next()) |d| {
+            if (d.off < start or d.e.inode == 0 or d.name.len == 0) continue;
+            const here = lblock * bs + d.off;
+            const item = DirItem{ .inum = d.e.inode, .file_type = d.e.file_type, .name = d.name, .next = here + d.e.rec_len };
+            if (!sink.take(item)) return here;
+        }
+    }
+    return total;
 }
 
 pub fn fileSize(path: []const u8) ?u64 {

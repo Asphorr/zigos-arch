@@ -220,6 +220,10 @@ pub const PCB = struct {
     // matches a live process's text_inum is refused, so a process can't pull
     // the rug from under its own (or another's) loader. (2026-06-04)
     text_inum: u32 = 0, // (c) set once at load
+    // Absolute path of the executable, for /proc/self/exe; empty when the
+    // launch path didn't name one.
+    exe_path: [255]u8 = [_]u8{0} ** 255, // (c) set at exec
+    exe_path_len: u8 = 0, // (c)
     // Sleep support
     wake_tick: u64 = 0, // (a) sysSleep + sched wakeExpired + virtio_gpu IRQ; cross-CPU readable
     // Hi-res sleep deadline, ABSOLUTE TSC ticks (0 = none). Set by sysUsleep,

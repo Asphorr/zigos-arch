@@ -11,6 +11,7 @@ const symbols = @import("../debug/symbols.zig");
 const memmap = @import("../mm/memmap.zig");
 const heap = @import("../mm/heap.zig");
 const vfs = @import("../fs/vfs.zig");
+const ext2 = @import("../fs/ext2/ext2.zig");
 const config = @import("../config.zig");
 
 /// Optional launch descriptor handed to loadAndStart so it can set the new
@@ -32,6 +33,9 @@ pub const LaunchInfo = struct {
     /// The caller releases via process.assignInitialCpu + setState(.ready),
     /// in that order (rqEnter must land on the right per-CPU runqueue).
     start_held: bool = false,
+    /// Absolute path of the executable → pcb.exe_path (/proc/self/exe).
+    /// spawnPath fills it in.
+    exe_path: []const u8 = "",
 };
 
 const Header = extern struct {
@@ -392,6 +396,10 @@ const AT_RANDOM: u64 = 25;
 const PT_LOAD_T: u32 = 1;
 const PT_PHDR_T: u32 = 6;
 
+/// The environment every Linux process starts with (nothing passes one in
+/// yet). HOME is where programs keep caches and dotfiles.
+const LINUX_ENV = [_][]const u8{ "HOME=/", "PATH=/bin" };
+
 inline fn rdtsc() u64 {
     var lo: u32 = undefined;
     var hi: u32 = undefined;
@@ -501,6 +509,14 @@ fn setupLinuxInitialStack(
         argv_va[0] = page_base + off;
     }
 
+    var env_va: [LINUX_ENV.len]u64 = undefined;
+    for (LINUX_ENV, 0..) |s, ei| {
+        off -= s.len + 1;
+        @memcpy(kbuf[off..][0..s.len], s);
+        kbuf[off + s.len] = 0;
+        env_va[ei] = page_base + off;
+    }
+
     // Auxiliary vector — (type,value) pairs, AT_NULL-terminated.
     const auxv = [_][2]u64{
         .{ AT_PHDR, phdr_va },
@@ -519,17 +535,19 @@ fn setupLinuxInitialStack(
         .{ AT_NULL, 0 },
     };
 
-    // word layout (low→high): argc | argv[0..argc] | NULL | envp NULL | auxv.
-    // Provably fits one page: rand(16) + argv strings + these arrays total a
-    // few hundred bytes with the MAX_ARGS/MAX_ARG_LEN caps, far under 4 KiB, so
-    // the descending `off` can never underflow into the array region below.
+    // word layout (low→high): argc | argv[0..argc] | NULL | envp | NULL | auxv.
+    // Provably fits one page: rand(16) + argv and env strings + these arrays
+    // total well under 4 KiB with the MAX_ARGS/MAX_ARG_LEN caps, so the
+    // descending `off` can never underflow into the array region below.
     comptime {
-        const max_strings = @as(usize, config.MAX_ARGS) * (@as(usize, config.MAX_ARG_LEN) + 1) + 16;
-        const max_arrays = (1 + @as(usize, config.MAX_ARGS) + 1 + 1 + auxv.len * 2) * 8;
+        var env_bytes: usize = 0;
+        for (LINUX_ENV) |s| env_bytes += s.len + 1;
+        const max_strings = @as(usize, config.MAX_ARGS) * (@as(usize, config.MAX_ARG_LEN) + 1) + env_bytes + 16;
+        const max_arrays = (1 + @as(usize, config.MAX_ARGS) + 1 + LINUX_ENV.len + 1 + auxv.len * 2) * 8;
         if (max_strings + max_arrays + 16 > PAGE_SIZE)
             @compileError("SysV initial stack may overflow one page — shrink MAX_ARGS/MAX_ARG_LEN");
     }
-    const words: usize = 1 + (argc + 1) + 1 + auxv.len * 2;
+    const words: usize = 1 + (argc + 1) + (LINUX_ENV.len + 1) + auxv.len * 2;
     var block_off: usize = off - words * 8;
     block_off &= ~@as(usize, 0xF); // &argc must be 16-byte aligned at _start
     const argc_va: u64 = page_base + block_off;
@@ -542,7 +560,11 @@ fn setupLinuxInitialStack(
         w += 1;
     }
     wp[w] = 0; w += 1; // argv terminator
-    wp[w] = 0; w += 1; // envp terminator (no env yet)
+    for (env_va) |va| {
+        wp[w] = va;
+        w += 1;
+    }
+    wp[w] = 0; w += 1; // envp terminator
     for (auxv) |pair| {
         wp[w] = pair[0]; w += 1;
         wp[w] = pair[1]; w += 1;
@@ -570,9 +592,24 @@ fn setupLinuxInitialStack(
 /// cache, only its headers read up front; anything else (tarfs, fat32) is
 /// read whole first. Same contract as loadAndStart.
 pub fn spawnPath(path: []const u8, launch: ?LaunchInfo) ?usize {
-    if (vfs.lookupCached(path)) |f| return loadCached(f.inum, f.size, launch);
+    var exe_buf: [255]u8 = undefined;
+    var li = launch;
+    if (li) |*l| l.exe_path = exePath(path, &exe_buf);
+    if (vfs.lookupCached(path)) |f| return loadCached(f.inum, f.size, li);
     const fresh = vfs.loadFileFresh(path) orelse return null;
-    return loadAndStart(fresh.buf, fresh.size, fresh.pages, fresh.inode, launch);
+    return loadAndStart(fresh.buf, fresh.size, fresh.pages, fresh.inode, li);
+}
+
+/// The absolute path `name` names, as vfs.lookupCached resolves it: as
+/// given when absolute, else under the root, else under /bin. Empty when it
+/// doesn't fit `buf`.
+fn exePath(name: []const u8, buf: *[255]u8) []const u8 {
+    if (name.len > 0 and name[0] == '/') return name;
+    const dir: []const u8 = if (ext2.lookupFile(name) != null) "/" else "/bin/";
+    if (dir.len + name.len > buf.len) return "";
+    @memcpy(buf[0..dir.len], dir);
+    @memcpy(buf[dir.len..][0..name.len], name);
+    return buf[0 .. dir.len + name.len];
 }
 
 /// Load an ELF and create the process, but don't enter user mode.
@@ -768,6 +805,9 @@ fn startImage(img: Image, header: Header, launch: ?LaunchInfo) ?usize {
     if (launch) |li| {
         process.setName(@intCast(pid), li.name);
         process.populateArgv(pcb, li.name, li.raw, li.fname_len);
+        const n = @min(li.exe_path.len, pcb.exe_path.len);
+        @memcpy(pcb.exe_path[0..n], li.exe_path[0..n]);
+        pcb.exe_path_len = @intCast(n);
     }
 
     // Register lazy regions: the stack, then each PT_LOAD segment. The heap
