@@ -218,14 +218,14 @@ pub fn pendingToPort() u32 {
 /// canonical record) and the lap itself is counted + reported.
 pub fn drainToPort() void {
     if (!@atomicLoad(bool, &deferred, .monotonic)) return;
-    const console = virtio_console.isReady();
+    var console = virtio_console.isReady();
     // Per-invocation cap: ksoftirqd also drains .hid (input) — a full-ring
     // drain at ~µs-per-char of port VM exits would block input for tens of
     // ms under storm logging. 4 KB ≈ a few ms worst case; the leftover
     // keeps pendingToPort() nonzero so the next tick re-raises us. The
     // console costs an exit per chunk, not per byte: it takes the lot.
-    var budget: u32 = if (console) RING_LEN else 4096;
-    const chunk_len: u32 = if (console) drain_chunk.len else 256;
+    const uart_budget: u32 = 4096;
+    var budget: u32 = if (console) RING_LEN else uart_budget;
     while (budget > 0) {
         const behind = @atomicLoad(u32, &total_written, .monotonic) -% drain_pos;
         if (behind == 0) break;
@@ -233,9 +233,15 @@ pub fn drainToPort() void {
             // Writers lapped us; ringRead will jump the cursor forward.
             port_lost_bytes +%= behind - RING_LEN;
         }
+        const chunk_len: u32 = if (console) drain_chunk.len else 256;
         const n = ringRead(&drain_pos, &drain_chunk, chunk_len);
         if (n == 0) break;
-        if (!console or !virtio_console.write(drain_chunk[0..n])) putChars(drain_chunk[0..n]);
+        if (!console or !virtio_console.write(drain_chunk[0..n])) {
+            // A backed-up console: the rest of this pass goes at UART pace.
+            if (console) budget = @min(budget, uart_budget);
+            console = false;
+            putChars(drain_chunk[0..n]);
+        }
         drained_bytes +%= n;
         budget -|= n;
     }

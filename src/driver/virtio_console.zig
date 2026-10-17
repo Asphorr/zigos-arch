@@ -4,9 +4,9 @@
 //! same lock as the disk's doorbells.
 //!
 //! Port 0 only (MULTIPORT is not negotiated), transmit queue only, polled:
-//! the device hands a buffer back by advancing the used index, and nothing
-//! here waits for an interrupt. QEMU's virtio-serial writes a buffer out
-//! during the doorbell's exit, so buffers come back in order and at once.
+//! the device hands buffers back through the used ring, and nothing here
+//! waits for an interrupt. QEMU's virtio-serial writes a buffer out during
+//! the doorbell's exit, so they come back at once.
 //!
 //! QEMU: `-device virtio-serial-pci -device virtconsole,chardev=X`; sharing
 //! the UART's log file takes a mux chardev (`-chardev file,...,mux=on` with
@@ -41,9 +41,9 @@ var common_base: usize = 0;
 var notify_base: usize = 0;
 var notify_mult: u32 = 0;
 var slot_phys: [SLOTS]usize = undefined;
-/// Next slot (and descriptor: slot i is descriptor i) to fill.
-var next_slot: u16 = 0;
-var in_flight: u16 = 0;
+/// Slots the device has given back (slot i is descriptor i), a stack.
+var free_slots: [SLOTS]u16 = undefined;
+var n_free: u16 = 0;
 var avail_idx: u16 = 0;
 
 /// True once the console takes writes.
@@ -101,7 +101,9 @@ pub fn init() bool {
         desc.len = 0;
         desc.flags = 0; // device-readable, no chain
         desc.next = 0;
+        free_slots[i] = i;
     }
+    n_free = SLOTS;
 
     virtio.ccWrite8(common_base, virtio.CC_DEVICE_STATUS, features_ok | virtio.STATUS_DRIVER_OK);
     bind.commit();
@@ -115,11 +117,17 @@ fn fail(why: []const u8) bool {
     return false;
 }
 
-/// Take back the buffers the device is done with.
+/// Take back the buffers the device is done with, in whatever order it
+/// returned them.
 fn reclaim() void {
     const used = @atomicLoad(u16, @as(*const u16, @volatileCast(vq.usedIdx())), .acquire);
-    in_flight -%= used -% vq.last_used_idx;
-    vq.last_used_idx = used;
+    while (vq.last_used_idx != used) : (vq.last_used_idx +%= 1) {
+        const id = vq.usedRingId(vq.last_used_idx % SLOTS).*;
+        if (id < SLOTS and n_free < SLOTS) {
+            free_slots[n_free] = @intCast(id);
+            n_free += 1;
+        }
+    }
 }
 
 /// Send `bytes` (at most SLOT_BYTES). One caller at a time: the klog
@@ -128,15 +136,16 @@ fn reclaim() void {
 pub fn write(bytes: []const u8) bool {
     if (!isReady() or bytes.len == 0 or bytes.len > SLOT_BYTES) return false;
     reclaim();
-    if (in_flight == SLOTS) {
+    if (n_free == 0) {
         var d = Deadline.ms(FULL_WAIT_MS, "virtio-console full");
-        while (in_flight == SLOTS and d.live()) {
+        while (n_free == 0 and d.live()) {
             std.atomic.spinLoopHint();
             reclaim();
         }
-        if (in_flight == SLOTS) return false;
+        if (n_free == 0) return false;
     }
-    const s = next_slot;
+    n_free -= 1;
+    const s = free_slots[n_free];
     const dst: [*]u8 = @ptrFromInt(paging.physToVirt(slot_phys[s]));
     @memcpy(dst[0..bytes.len], bytes);
     vq.descPtr(s).len = @intCast(bytes.len);
@@ -144,8 +153,6 @@ pub fn write(bytes: []const u8) bool {
     avail_idx +%= 1;
     // The ring entry and the buffer before the index the device reads.
     @atomicStore(u16, @as(*u16, @volatileCast(vq.availIdx())), avail_idx, .release);
-    in_flight += 1;
-    next_slot = (s + 1) % SLOTS;
     virtio.notifyQueue(notify_base, vq.notify_off, notify_mult, TX_QUEUE);
     return true;
 }
