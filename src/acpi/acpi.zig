@@ -943,8 +943,7 @@ fn amlTimer100ns() u64 {
 }
 
 fn amlTaskId() u64 {
-    const cpu = @import("../cpu/smp.zig").myCpu();
-    return if (cpu.current_pid) |p| @as(u64, @intCast(p)) else 0xFFFF_FFFF;
+    return if (@import("../cpu/smp.zig").currentPid()) |p| @as(u64, @intCast(p)) else 0xFFFF_FFFF;
 }
 
 // --- MADT iterator ----------------------------------------------------------

@@ -281,11 +281,7 @@ pub fn mapUserPage(pml4: [*]align(4096) u64, virt: usize, phys: Phys, flags: u64
     // kdbg: record the install so post-mortem can answer "who mapped CR2?".
     // Only the success path lands here — the error returns above don't
     // pollute the ring with would-be-installs that bounced.
-    const cur_pid: u8 = blk: {
-        const cpu = @import("../cpu/smp.zig").myCpu();
-        if (cpu.current_pid) |p| break :blk @intCast(p);
-        break :blk 0xFF;
-    };
+    const cur_pid: u8 = if (@import("../cpu/smp.zig").currentPid()) |p| @intCast(p) else 0xFF;
     @import("../debug/kdbg.zig").mmapEvent(cur_pid, virt, paddr & PAGE_MASK, flags);
 }
 
