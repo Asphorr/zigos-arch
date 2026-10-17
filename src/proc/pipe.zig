@@ -348,6 +348,12 @@ pub fn write(id: u8, data: []const u8) usize {
         if (displaced != 0xFF and displaced != my_pid) {
             debug.klog("[pipe] WARN: writer wait-slot collision pipe={d} displaced pid={d} by pid={d}\n", .{ id, displaced, my_pid });
         }
+        // What this write filled the ring with must reach a reader that
+        // polls rather than reads, or neither side ever moves.
+        if (pushed_data) {
+            fdpoll.wakePollers(.pipe, id);
+            pushed_data = false;
+        }
         const br = process.blockOnInterruptible(.pipe_write, id);
         if (br == .signalled) {
             const f2 = p.lock.acquireIrqSave();
