@@ -141,6 +141,8 @@ pub fn taskEntry() callconv(.c) noreturn {
         }
     }
 
+    // What the programs wrote is read back from the image on the host.
+    @import("../fs/ext2/ext2.zig").sync();
     if (failures == 0) {
         serial.print("[linuxtest] PASS\n", .{});
     } else {

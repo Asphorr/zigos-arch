@@ -146,6 +146,11 @@ pub fn isInitialized() bool {
     return block.isMounted();
 }
 
+/// Write everything the root's block cache holds dirty to the disk.
+pub fn sync() void {
+    if (block.getMount()) |m| _ = block.flush(m);
+}
+
 // =============================================================================
 // Handle / file ops
 // =============================================================================
@@ -210,23 +215,15 @@ pub fn writeFile(handle: *Handle, src: [*]const u8, count: u32) u32 {
     const start_off = handle.current_offset;
     const bs = m.block_size;
 
-    // `done` = bytes COMMITTED to disk. Full-block writes whose phys blocks
+    // `done` = bytes in the block cache. Full-block writes whose phys blocks
     // are adjacent accumulate into a pending run covering
-    // [done, done + pend_blocks*bs) and flush as ONE writeBlockRun —
-    // sequential allocBlock results are adjacent on anything but a
-    // fragmented fs, so a bulk save is a handful of multi-block commands
-    // instead of one per 4 KiB. Partial blocks flush the run, then take
-    // the read-modify-write path as before.
+    // [done, done + pend_blocks*bs) and go in as ONE writeBlockRun. Partial
+    // blocks put the run in first, then take the read-modify-write path.
     //
-    // KNOWN CRASH-WINDOW (reviewed 2026-06-12, deliberately accepted):
-    // for indirect-tree leaves, ensurePhysicalBlock persists the leaf
-    // POINTER immediately while the data sits in the pending run, so a
-    // crash inside this op can leave a pointer to stale previous-occupant
-    // disk content. The per-block baseline had the same window at
-    // microsecond width; batching stretches it to run width. Closing it
-    // (alloc-time leaf zeroing, or run-flush before every writePointer)
-    // would re-double the command count — wrong trade for a journal-less
-    // fs where a mid-save crash already loses the save.
+    // Crash window: the cache reaches the disk in block order, not in the
+    // order of the updates, so a crash between flushes can leave pointers
+    // to blocks whose new contents never landed. A journal-less fs loses an
+    // interrupted save either way.
     var done: u32 = 0;
     var pend_phys: u32 = 0;
     var pend_blocks: u32 = 0;

@@ -679,11 +679,14 @@ pub fn flock(fd: u64, op: u64) u64 {
     return 0;
 }
 
-/// fsync / fdatasync: write() data is on disk already (the ext2 block layer
-/// writes through); what a MAP_SHARED mapping dirtied goes now.
+/// fsync / fdatasync: what a MAP_SHARED mapping dirtied goes to the block
+/// cache, then the whole cache to the disk (not just this file's blocks).
 pub fn fsync(fd: u64) u64 {
     const pcb = proc() orelse return err(EFAULT);
     const fe = fdEntry(pcb, fd) orelse return err(EBADF);
-    if (fe.fs_type == .ext2) _ = vfs.syncCacheFile(fe.inode, false);
+    if (fe.fs_type == .ext2) {
+        _ = vfs.syncCacheFile(fe.inode, false);
+        ext2.sync();
+    }
     return 0;
 }

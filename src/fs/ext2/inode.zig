@@ -4,7 +4,7 @@
 // are returned BY VALUE (Inode is 128 B), so a caller's reference can't
 // be invalidated by a later cache eviction. The cache lives in this file
 // rather than block.zig because it's a per-inode concept; the disk block
-// holding the inode flows through block.zig's 8-sector cache underneath.
+// holding the inode flows through block.zig's buffer cache underneath.
 //
 // Inodes are 1-indexed; inode 0 means "none", inode 1 is bad-blocks,
 // inode 2 is the root directory.

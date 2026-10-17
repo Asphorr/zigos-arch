@@ -922,8 +922,8 @@ pub fn panic(msg: []const u8, _: ?*std.builtin.StackTrace, ret_addr: ?usize) nor
 
 /// pgflushd kernel-thread entry (Slice 3d-2). Periodically writes back dirty
 /// page-cache pages so MAP_SHARED file writes persist to disk without an explicit
-/// msync (and so any orphaned dirty page gets cleaned + made reclaimable). Spawned
-/// once ext2 mounts — the only filesystem that populates the cache. Never returns.
+/// msync (and so any orphaned dirty page gets cleaned + made reclaimable), then
+/// the root's dirty ext2 buffers. Spawned once ext2 mounts. Never returns.
 /// Sleeps PGFLUSH_INTERVAL_MS between passes; the flush itself parks on NVMe I/O
 /// (no spinlock held) so it never hogs its CPU.
 const PGFLUSH_INTERVAL_MS: u32 = 2000;
@@ -933,6 +933,7 @@ fn pgflushdEntry() callconv(.c) noreturn {
     while (true) {
         sched.kernelSleepMs(PGFLUSH_INTERVAL_MS);
         _ = vfs.flushAllDirty();
+        @import("fs/ext2/ext2.zig").sync();
     }
 }
 

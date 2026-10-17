@@ -181,6 +181,8 @@ pub fn sysShutdown(mode: u32) u32 {
 
     // Best-effort: flush dirty FS caches before yanking the power.
     if (fat32.isInitialized()) fat32.flushAll();
+    _ = vfs.flushAllDirty();
+    @import("../../fs/ext2/ext2.zig").sync();
     // Then commit any in-flight NVMe writes to non-volatile storage —
     // without this, the device write cache can lose recent writes on
     // power-off even after fat32.flushAll has drained the OS-side caches.

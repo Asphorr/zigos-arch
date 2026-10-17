@@ -126,7 +126,11 @@ pub fn copyBegin(m_dst: *block.Mount) bool {
 /// means the target is scrap (the reason is in the serial log). `lost+found`
 /// is skipped (mkfs gave the target its own); "." / ".." are structural.
 pub fn copyStep() StepResult {
-    if (sp == 0) return .done;
+    if (sp == 0) {
+        // The copy lives in the block cache until written out.
+        _ = block.flush(dst_mount);
+        return .done;
+    }
     const m_src = src_mount;
     const m_dst = dst_mount;
 
