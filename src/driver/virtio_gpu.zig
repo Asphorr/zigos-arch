@@ -840,7 +840,7 @@ fn sendCmdViaPhys(cmd_len: u32, resp_len: u32) bool {
             // schedule round-trips (~1 s if waking only via the 10 ms
             // LAPIC tick; far sooner under any real GPU IRQ delivery).
             const process = @import("../proc/process.zig");
-            const cur_pid_outer = @import("../cpu/smp.zig").myCpu().current_pid orelse break :blk false;
+            const cur_pid_outer = @import("../cpu/smp.zig").currentPid() orelse break :blk false;
             // Stamp ourselves as THE gpu_io waiter so virtioGpuIrqHandler
             // can wake us directly. Cleared by defer on every exit path
             // (true, false, or panic-unwind).
@@ -1104,7 +1104,7 @@ fn sendSimpleCmdPair(
         if (phase_a_done_via_poll) break :blk true;
         if (use_msix and msix_safe_to_use and !force_polled) {
             const process = @import("../proc/process.zig");
-            const cur_pid_outer = @import("../cpu/smp.zig").myCpu().current_pid orelse break :blk false;
+            const cur_pid_outer = @import("../cpu/smp.zig").currentPid() orelse break :blk false;
             // Single-waiter / targeted-IPI stamp; see sendCmdViaPhys above.
             @atomicStore(u8, &current_gpu_waiter, @intCast(cur_pid_outer), .release);
             defer @atomicStore(u8, &current_gpu_waiter, 0xFF, .release);
@@ -1468,7 +1468,7 @@ fn waitAsyncFlushIdleLocked() void {
             continue;
         }
         const process = @import("../proc/process.zig");
-        const cur = @import("../cpu/smp.zig").myCpu().current_pid orelse {
+        const cur = @import("../cpu/smp.zig").currentPid() orelse {
             // No task context — asyncFlushEligible() should make this
             // unreachable; bounded wait as a belt.
             var d = Deadline.ms(CTRL_POLL_BUDGET_MS, "virtio-gpu flush reap (no task)");

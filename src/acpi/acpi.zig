@@ -888,7 +888,7 @@ fn amlSleepMs(ms: u64) void {
     // Per-call clamp; aml.zig additionally enforces a per-method Sleep budget.
     const capped = @min(ms, 1_000);
     // No task to put to sleep yet — _INI runs from acpi.init — so wait in place.
-    if (@import("../cpu/smp.zig").myCpu().current_pid == null) return busyWaitUs(capped * 1_000);
+    if (@import("../cpu/smp.zig").currentPid() == null) return busyWaitUs(capped * 1_000);
     @import("../proc/sched.zig").kernelSleepMs(@intCast(capped));
 }
 

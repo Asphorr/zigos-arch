@@ -406,7 +406,7 @@ pub fn evictFrame(pte_ptr: *u64, va: usize, pcid: u16) bool {
     // [mtswap-trace] gated to stress-test pids (current_pid >= 4). evictFrame
     // is on the hot reclaim path; ungated logging would drown the log under
     // normal swap activity.
-    const evict_pid: u32 = if (smp.myCpu().current_pid) |p| @intCast(p) else 0xFF;
+    const evict_pid: u32 = if (smp.currentPid()) |p| @intCast(p) else 0xFF;
     const etrace = evict_pid >= 4;
     const ecpu = smp.myCpu().cpu_id;
     // Refcount guard: only evict a frame this address space SOLELY owns. A
@@ -617,7 +617,7 @@ pub fn swapInFrame(pte_ptr: *u64, va: usize, flags: u64, pcid: u16) bool {
     }
     const slot = pteSlot(original);
     // [mtswap-trace] for the parked MT-stress wedge — see fault.zig.
-    const cur_pid: u32 = if (smp.myCpu().current_pid) |p| @intCast(p) else 0xFF;
+    const cur_pid: u32 = if (smp.currentPid()) |p| @intCast(p) else 0xFF;
     if (cur_pid >= 4) debug.klog("[mtswap-trace] pid={d} cpu{d} swapIn slot={d} alloc...\n", .{
         cur_pid, smp.myCpu().cpu_id, slot,
     });

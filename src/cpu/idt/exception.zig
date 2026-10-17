@@ -261,7 +261,7 @@ export fn handleException(rsp: u64) callconv(.c) void {
     // Breadcrumb: vec in high 32, pid in low 32. Stamped before the NMI
     // fast-path return so even NMI-snapshotted CPUs leave a trace.
     {
-        const pid_now: u64 = if (@import("../smp.zig").myCpu().current_pid) |p| @intCast(p) else 0xFF;
+        const pid_now: u64 = if (@import("../smp.zig").currentPid()) |p| @intCast(p) else 0xFF;
         @import("../../debug/breadcrumb.zig").stamp(.exception_entry, (int_no << 32) | pid_now);
     }
 

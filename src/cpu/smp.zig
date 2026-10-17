@@ -379,6 +379,23 @@ pub fn myCpu() *CpuLocal {
     return &cpus[id];
 }
 
+/// The pid running on this CPU, null before its first dispatch. Read with
+/// interrupts off: finding "this CPU" and reading its current_pid are two
+/// steps, and a preemptible caller moved to another CPU in between would
+/// read the pid of whatever now runs on the CPU it left. Use this, not
+/// `myCpu().current_pid`, for "who am I".
+pub fn currentPid() ?usize {
+    var flags: u64 = undefined;
+    // Memory clobbers keep the load between the two.
+    asm volatile ("pushfq; pop %[f]; cli"
+        : [f] "=r" (flags),
+        :
+        : .{ .memory = true });
+    const pid = myCpu().current_pid;
+    if (flags & 0x200 != 0) asm volatile ("sti" ::: .{ .memory = true });
+    return pid;
+}
+
 /// Get BSP CPU data (always CPU 0)
 pub fn bspCpu() *CpuLocal {
     return &cpus[0];

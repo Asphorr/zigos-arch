@@ -156,7 +156,7 @@ pub fn sysNetTcpConnect(ip_ptr: u32, port: u32) u32 {
 
     const net = @import("../../net/net.zig");
     const slot = net.tcpConnect(ip, @intCast(port)) orelse return E_INVAL;
-    const cur = smp.myCpu().current_pid orelse {
+    const cur = smp.currentPid() orelse {
         net.tcpClose(slot);
         return E_INVAL;
     };
@@ -176,7 +176,7 @@ pub fn sysNetTcpSend(fd: u32, buf_ptr: u32, buf_len: u32) u32 {
     if (buf_len > 64 * 1024) return E_INVAL;
     if (!validateUserPtr(buf_ptr, buf_len)) return E_FAULT;
 
-    const cur = smp.myCpu().current_pid orelse return E_INVAL;
+    const cur = smp.currentPid() orelse return E_INVAL;
     const pcb = &process.procs[cur];
     const slot = common.resolveSocketFd(pcb, fd, .tcp_sock) orelse return E_BADF;
 
@@ -195,7 +195,7 @@ pub fn sysNetTcpRecv(fd: u32, buf_ptr: u32, buf_len: u32) u32 {
     if (buf_len > 64 * 1024) return 0;
     if (!validateUserPtrWrite(buf_ptr, buf_len)) return 0;
 
-    const cur = smp.myCpu().current_pid orelse return 0;
+    const cur = smp.currentPid() orelse return 0;
     const pcb = &process.procs[cur];
     const slot = common.resolveSocketFd(pcb, fd, .tcp_sock) orelse return 0;
 
@@ -211,7 +211,7 @@ pub fn sysNetTcpRecv(fd: u32, buf_ptr: u32, buf_len: u32) u32 {
 ///
 /// poll() runs first so the FIN bit reflects the freshest state.
 pub fn sysNetTcpStatus(fd: u32) u32 {
-    const cur = smp.myCpu().current_pid orelse return 0;
+    const cur = smp.currentPid() orelse return 0;
     const pcb = &process.procs[cur];
     const slot = common.resolveSocketFd(pcb, fd, .tcp_sock) orelse return 0;
     const net = @import("../../net/net.zig");
@@ -230,7 +230,7 @@ pub fn sysNetTcpListen(port: u32) u32 {
     if (port == 0 or port > 65535) return E_INVAL;
     const net = @import("../../net/net.zig");
     const slot = net.tcpListen(@intCast(port)) orelse return E_INVAL;
-    const cur = smp.myCpu().current_pid orelse {
+    const cur = smp.currentPid() orelse {
         net.tcpUnlisten(slot);
         return E_INVAL;
     };
@@ -246,7 +246,7 @@ pub fn sysNetTcpListen(port: u32) u32 {
 /// accepted conn, or 0xFFFFFFFF if nothing is queued yet. poll() runs
 /// first to land any pending handshakes.
 pub fn sysNetTcpAccept(listener_fd: u32) u32 {
-    const cur = smp.myCpu().current_pid orelse return E_INVAL;
+    const cur = smp.currentPid() orelse return E_INVAL;
     const pcb = &process.procs[cur];
     const lst_slot = common.resolveSocketFd(pcb, listener_fd, .tcp_listener) orelse return E_BADF;
     const net = @import("../../net/net.zig");

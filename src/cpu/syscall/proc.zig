@@ -301,7 +301,7 @@ pub fn sysFutex(uaddr: u32, op: u32, val: u32) u32 {
 }
 
 pub fn sysSleep(ms: u32) u32 {
-    const cur_pid = smp.myCpu().current_pid orelse return E_FAULT;
+    const cur_pid = smp.currentPid() orelse return E_FAULT;
     const pcb = &process.procs[cur_pid];
     // Convert ms to ticks (100 Hz timer -> 10ms per tick). Widen to u64
     // BEFORE the +9 add — `(ms + 9) / 10` in u32 overflows for any
@@ -805,7 +805,7 @@ pub fn sysSigsuspend(mask_ptr: u32) u32 {
 
     // Park until a deliverable signal lands. Same idiom as sysSleep: state =
     // .sleeping + soft yield; signals.send → process.wake → re-check.
-    const cur_pid = smp.myCpu().current_pid orelse return E_FAULT;
+    const cur_pid = smp.currentPid() orelse return E_FAULT;
     while (!signals.hasDeliverable(pcb)) {
         // wake_tick BEFORE setState (sysSleep's order) — never visible as
         // .sleeping with a stale previous-sleep deadline.
@@ -834,7 +834,7 @@ pub fn sysSigsuspend(mask_ptr: u32) u32 {
 /// with the current mask. Returns 0xFFFFFFFF (interrupted) when the handler
 /// has run.
 pub fn sysPause() u32 {
-    const cur_pid = smp.myCpu().current_pid orelse return E_FAULT;
+    const cur_pid = smp.currentPid() orelse return E_FAULT;
     const pcb = &process.procs[cur_pid];
     while (!signals.hasDeliverable(pcb)) {
         @atomicStore(u64, &pcb.wake_tick, std.math.maxInt(u64), .release);
@@ -1093,7 +1093,7 @@ pub fn sysUsleep(usec: u32) u32 {
         return 0;
     }
 
-    const cur_pid = smp.myCpu().current_pid orelse return E_FAULT;
+    const cur_pid = smp.currentPid() orelse return E_FAULT;
     const pcb = &process.procs[cur_pid];
     const deadline = hrtimer.deadline(perf.rdtsc(), usec, tpq);
     const floor_tsc: u64 = @as(u64, SPIN_FLOOR_US) *% per_us;

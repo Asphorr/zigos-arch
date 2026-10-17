@@ -123,7 +123,7 @@ pub const Mount = struct {
 pub fn lockMount(self: *Mount) void {
     const smp = @import("../../cpu/smp.zig");
     const sched = @import("../../proc/sched.zig");
-    const me: u16 = if (smp.myCpu().current_pid) |p| @intCast(p) else return;
+    const me: u16 = if (smp.currentPid()) |p| @intCast(p) else return;
     if (@atomicLoad(u16, &self.lock_owner, .acquire) == me) {
         self.lock_depth += 1; // reentrant — we already hold it
         return;
@@ -142,7 +142,7 @@ pub fn lockMount(self: *Mount) void {
 pub fn unlockMount(self: *Mount) void {
     const smp = @import("../../cpu/smp.zig");
     const sched = @import("../../proc/sched.zig");
-    const me: u16 = if (smp.myCpu().current_pid) |p| @intCast(p) else return;
+    const me: u16 = if (smp.currentPid()) |p| @intCast(p) else return;
     if (@atomicLoad(u16, &self.lock_owner, .acquire) != me) return; // not held by us (boot path)
     self.lock_depth -= 1;
     if (self.lock_depth == 0) {

@@ -52,7 +52,7 @@ fn workerEntry() callconv(.c) noreturn {
     // Each worker gets a unique slot via current_pid — we use that as
     // the worker index modulo WORKERS for stat bookkeeping. The actual
     // pid is fine, we just need a stable bucket per task.
-    const cur = smp.myCpu().current_pid orelse {
+    const cur = smp.currentPid() orelse {
         while (true) asm volatile ("cli; hlt");
     };
     const slot: usize = cur % WORKERS;

@@ -1726,7 +1726,7 @@ pub fn schedule() void {
     // task is about to be replaced). Picked here rather than later so we
     // capture even early-bail paths.
     {
-        const cur_now: u64 = if (smp.myCpu().current_pid) |p| @intCast(p) else 0xFF;
+        const cur_now: u64 = if (smp.currentPid()) |p| @intCast(p) else 0xFF;
         @import("../debug/breadcrumb.zig").stamp(.schedule_enter, cur_now);
     }
 
@@ -2880,7 +2880,7 @@ pub fn deliverDueAlarms() void {
 /// manipulation (wake_tick + state + the rescheduling dance), and net.zig
 /// can't import syscall.zig without a cycle.
 pub fn kernelSleepMs(ms: u32) void {
-    const cur = smp.myCpu().current_pid orelse return;
+    const cur = smp.currentPid() orelse return;
     const pcb = &process.procs[cur];
     const ticks = (ms + 9) / 10; // 100 Hz timer, round up
     const deadline = process.tick_count + ticks;
@@ -2935,7 +2935,7 @@ inline fn hasPendingDeliverable(pcb: *const PCB) bool {
 /// waits (NVMe completion, GPU command IRQ) should keep using `blockOn` —
 /// interrupting them mid-DMA would leak hardware state.
 pub fn blockOnInterruptible(kind: WaitKind, target: u32) BlockResult {
-    const cur = smp.myCpu().current_pid orelse return .woke;
+    const cur = smp.currentPid() orelse return .woke;
     const pcb = &process.procs[cur];
     // Signal already pending — don't even park. The deliver path on this
     // syscall's return will pick it up.
@@ -2946,7 +2946,7 @@ pub fn blockOnInterruptible(kind: WaitKind, target: u32) BlockResult {
 }
 
 pub fn blockOn(kind: WaitKind, target: u32) void {
-    const cur = smp.myCpu().current_pid orelse return;
+    const cur = smp.currentPid() orelse return;
     const pcb = &process.procs[cur];
     spinlock.mightSleep(@src());
     // Captured for the yield-loop detector call below — taken here so the
@@ -3071,7 +3071,7 @@ pub const FutexResult = enum { woke, signalled, again, timed_out };
 /// `addr` is the futex word's user VA (the wake key, with the tgid);
 /// `deadline` a tick_count at which wakeExpired ends the wait, 0 for none.
 pub fn blockOnFutex(addr: usize, word: *const volatile u32, val: u32, deadline: u64) FutexResult {
-    const cur = smp.myCpu().current_pid orelse return .woke;
+    const cur = smp.currentPid() orelse return .woke;
     const pcb = &process.procs[cur];
     spinlock.mightSleep(@src());
     if (hasPendingDeliverable(pcb)) return .signalled;
@@ -3217,7 +3217,7 @@ pub fn wake(pid: u8) void {
 /// owner + wake_pending) closes the wake-during-enrollment window that
 /// would otherwise lose a wakeup.
 pub fn blockOnMutex(target_id: u32, owner_pid_ptr: *const u16) void {
-    const cur = smp.myCpu().current_pid orelse return;
+    const cur = smp.currentPid() orelse return;
     const pcb = &process.procs[cur];
     spinlock.mightSleep(@src());
     // H3: test-and-clear. A wake() that arrived between caller's failed
@@ -3251,7 +3251,7 @@ pub fn blockOnMutex(target_id: u32, owner_pid_ptr: *const u16) void {
 /// locked bump orders its store before its waiter scan, so either we see
 /// the new seq or the releaser sees us asleep.
 pub fn blockOnLockSeq(target_id: u32, seq: *const u32, seen: u32) void {
-    const cur = smp.myCpu().current_pid orelse return;
+    const cur = smp.currentPid() orelse return;
     const pcb = &process.procs[cur];
     spinlock.mightSleep(@src());
     if (@atomicRmw(bool, &pcb.wake_pending, .Xchg, false, .acq_rel)) return;
@@ -3316,7 +3316,7 @@ pub fn wakeSwapEvictWaiters(target: u32) void {
 /// Returns once the PTE is in a settled state (SWAPPED commit / PRESENT abort
 /// / 0 teardown). The caller re-dispatches based on the new state.
 pub fn blockOnSwapEvict(pte_ptr: *const u64) void {
-    const cur = smp.myCpu().current_pid orelse return;
+    const cur = smp.currentPid() orelse return;
     const pcb = &process.procs[cur];
     spinlock.mightSleep(@src());
     const target = swap.evictWaitTarget(pte_ptr);

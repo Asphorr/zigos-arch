@@ -75,7 +75,7 @@ export fn handleDynIrq(vec: u32) callconv(.c) void {
     defer @import("../syscall.zig").chargeInterrupt(t);
     // Breadcrumb: (vec << 16) | pid. cpu.current_pid read once.
     {
-        const pid_now: u64 = if (@import("../smp.zig").myCpu().current_pid) |p| @intCast(p) else 0xFF;
+        const pid_now: u64 = if (@import("../smp.zig").currentPid()) |p| @intCast(p) else 0xFF;
         @import("../../debug/breadcrumb.zig").stamp(.irq_dynamic, (@as(u64, vec) << 16) | pid_now);
     }
 

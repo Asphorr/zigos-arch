@@ -515,7 +515,7 @@ fn applyDefault(pcb: *process.PCB, signo: u32) void {
             // pre-tgid path.
             const status: u32 = 0xDEAD0000 | signo;
             process.killThreadGroup(pcb.tgid, status);
-            if (smp.myCpu().current_pid) |cur| {
+            if (smp.currentPid()) |cur| {
                 if (cur == pidIndexOfPcb(pcb)) {
                     // If pcb wasn't in its own group (shouldn't happen — clone
                     // sets tgid before .ready) the killThreadGroup self-phase

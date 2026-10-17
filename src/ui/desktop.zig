@@ -3170,7 +3170,7 @@ pub fn taskEntry() callconv(.c) noreturn {
 
 pub fn run() void {
     @import("../cpu/smp.zig").assertBSP("desktop.run");
-    if (@import("../cpu/smp.zig").myCpu().current_pid) |p| desktop_pid = @intCast(p);
+    if (@import("../cpu/smp.zig").currentPid()) |p| desktop_pid = @intCast(p);
     debug.klog("[desktop] Starting graphical desktop...\n", .{});
 
     // Register the back-buffer reclaim callback with PMM. When an

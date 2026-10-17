@@ -403,7 +403,7 @@ fn tryMapCachedPage(pd: [*]align(4096) u64, r: process.LazyRegion, va_aligned: u
 /// interrupts off, uses ensureSignalFrameWritable.
 pub fn ensureUserRangeWritable(va: usize, len: usize) bool {
     if (len == 0) return true;
-    const cur = smp.myCpu().current_pid orelse return false;
+    const cur = smp.currentPid() orelse return false;
     const lead = leader(&process.procs[cur]);
     lead.as_lock.acquireRead();
     defer lead.as_lock.releaseRead();
@@ -421,7 +421,7 @@ pub const FrameWrite = enum { ok, fault, busy };
 /// ctx: irq-ok — sleeps for the lock only with interrupts on; masked, it try-takes it.
 pub fn ensureSignalFrameWritable(va: usize, len: usize) FrameWrite {
     if (len == 0) return .ok;
-    const cur = smp.myCpu().current_pid orelse return .fault;
+    const cur = smp.currentPid() orelse return .fault;
     const lead = leader(&process.procs[cur]);
     if (interruptsEnabled()) {
         lead.as_lock.acquireRead();
@@ -454,7 +454,7 @@ fn reclaimViaSwap(pml4: [*]align(4096) u64, lead: *PCB, skip_va: usize, pcid: u1
     const ITER_CAP: usize = 16384; // bounds total work (pages examined + gap hops)
     // [mtswap-trace] probes inside the loop are gated to stress-test pids
     // (the user-spawned mtswap workers) so regular reclaim stays quiet.
-    const trace_pid: u32 = if (smp.myCpu().current_pid) |p| @intCast(p) else 0xFF;
+    const trace_pid: u32 = if (smp.currentPid()) |p| @intCast(p) else 0xFF;
     const rtrace = trace_pid >= 4;
     const trace_cpu = smp.myCpu().cpu_id;
     if (rtrace) debug.klog("[mtswap-trace] pid={d} cpu{d} reclaim_loop_enter va=0x{X} regions={d}\n", .{
@@ -606,7 +606,7 @@ fn trySwapInPage(pd: [*]align(4096) u64, lead: *PCB, va: usize, prot: u8, pcid: 
     const initial_pte = sp.*;
     const is_swap_candidate = initial_pte != 0 and
         (swap.pteIsInflight(initial_pte) or swap.pteIsSwapped(initial_pte));
-    const cur_pid: u32 = if (smp.myCpu().current_pid) |p| @intCast(p) else 0xFF;
+    const cur_pid: u32 = if (smp.currentPid()) |p| @intCast(p) else 0xFF;
     const trace = is_swap_candidate and cur_pid >= 4;
     if (trace) debug.klog("[mtswap-trace] pid={d} cpu{d} swap_try va=0x{X} pte=0x{X}\n", .{
         cur_pid, smp.myCpu().cpu_id, va, initial_pte,
@@ -680,7 +680,7 @@ pub fn handleUserPageFault(cr2: usize, error_code: u64) bool {
     // and nested #PF (kernel-stack growth) is fine because every #PF gets
     // a fresh stack frame.
     asm volatile ("sti");
-    const cur = smp.myCpu().current_pid orelse return false;
+    const cur = smp.currentPid() orelse return false;
     const pcb = &process.procs[cur];
     // Accounting: count every user-mode page fault (handled or not) so the
     // counter reflects the load this PCB puts on the fault path. If we
@@ -1025,7 +1025,7 @@ fn logFaultMiss(cur: usize, lead: *PCB, cr2: usize, error_code: u64) void {
 /// not hold that lock.
 pub fn prefaultUserRange(addr: usize, len: usize) bool {
     if (len == 0) return true;
-    const cur = smp.myCpu().current_pid orelse return false;
+    const cur = smp.currentPid() orelse return false;
     const pcb = &process.procs[cur];
     const pd = pcb.page_directory orelse return false;
     const lead = leader(pcb);

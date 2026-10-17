@@ -1666,7 +1666,7 @@ fn ioCommandAsync(c: *Controller, ctrl_idx: u32, opcode: u8, lba: u32, user_buf:
             if (allocCid(c)) |c_packed| break :blk_alloc c_packed;
             if (attempts >= MAX_QUEUE_FULL_RETRIES) {
                 debug.klog("[nvme] queue full after {d} retries on ctrl#{d} (pid={d}, opcode=0x{X}, lba={d})\n", .{
-                    attempts, ctrl_idx, smp.myCpu().current_pid orelse 0xFF, opcode, lba,
+                    attempts, ctrl_idx, smp.currentPid() orelse 0xFF, opcode, lba,
                 });
                 return false;
             }
@@ -1686,7 +1686,7 @@ fn ioCommandAsync(c: *Controller, ctrl_idx: u32, opcode: u8, lba: u32, user_buf:
     // Mark the waiter as belonging to the current process so the IRQ
     // handler knows whom to wake. allocCid already CAS-claimed the slot
     // exclusively to us — no lock needed for these per-slot writes.
-    const cur_pid: u8 = if (smp.myCpu().current_pid) |p| @intCast(p) else 0xFF;
+    const cur_pid: u8 = if (smp.currentPid()) |p| @intCast(p) else 0xFF;
     c.waiters[slot_idx].wake = .{ .pid = cur_pid };
 
     // For IO_WRITE, copy user → bounce. Slot is ours via CAS until we
@@ -1745,7 +1745,7 @@ fn ioCommandAsync(c: *Controller, ctrl_idx: u32, opcode: u8, lba: u32, user_buf:
     // calc.elf load on AP avg_wait was 42 ms/call from the spin; with
     // MWAIT, drops to the IRQ-latency floor.
     const cur_is_idle = blk: {
-        if (smp.myCpu().current_pid) |p| break :blk proc.procs[p].is_idle;
+        if (smp.currentPid()) |p| break :blk proc.procs[p].is_idle;
         break :blk false;
     };
     const mwait_mod = @import("../cpu/arch/mwait.zig");
@@ -1900,7 +1900,7 @@ fn submitDatalessAsync(
         @memcpy(bounce[0..payload.len], payload);
     }
 
-    const cur_pid: u8 = if (smp.myCpu().current_pid) |p| @intCast(p) else 0xFF;
+    const cur_pid: u8 = if (smp.currentPid()) |p| @intCast(p) else 0xFF;
     c.waiters[slot_idx].wake = .{ .pid = cur_pid };
 
     const new_msix_addr: u64 = if (c.use_msix) msixAddrThisCpu() else 0;
@@ -1914,7 +1914,7 @@ fn submitDatalessAsync(
     const TIMEOUT_CYC_ASYNC: u64 = 30_000_000_000;
 
     const cur_is_idle = blk: {
-        if (smp.myCpu().current_pid) |p| break :blk proc.procs[p].is_idle;
+        if (smp.currentPid()) |p| break :blk proc.procs[p].is_idle;
         break :blk false;
     };
     const mwait_mod = @import("../cpu/arch/mwait.zig");
@@ -2394,7 +2394,7 @@ fn submitReadNoWait(ctrl_idx: u32, lba: u32, sectors: u32, out_cid: *u16) bool {
     const slot_idx: u16 = cidSlot(cid);
     const xfer_bytes: u32 = sectors * c.block_size;
 
-    const cur_pid: u8 = if (smp.myCpu().current_pid) |p| @intCast(p) else 0xFF;
+    const cur_pid: u8 = if (smp.currentPid()) |p| @intCast(p) else 0xFF;
     c.waiters[slot_idx].wake = .{ .pid = cur_pid };
 
     const new_msix_addr: u64 = if (c.use_msix) msixAddrThisCpu() else 0;

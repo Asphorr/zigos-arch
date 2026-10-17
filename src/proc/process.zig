@@ -111,7 +111,7 @@ var boot_io_scratch: [4096]u8 align(4096) = [_]u8{0} ** 4096;
 /// when no current_pid is set (early kmain fs init). Callers MUST NOT
 /// nest borrows on the same task — see io_scratch_pool docs.
 pub fn currentIoScratch() *[4096]u8 {
-    if (smp.myCpu().current_pid) |pid| return &io_scratch_pool[pid];
+    if (smp.currentPid()) |pid| return &io_scratch_pool[pid];
     return &boot_io_scratch;
 }
 
@@ -990,7 +990,7 @@ pub fn getProcessInfo(pid: usize) ProcessInfo {
 /// Get mutable pointer to PCB for current process (per-CPU). Returns null
 /// when no task is dispatched on this CPU (only true pre-`enterFirstTask`).
 pub fn currentPCB() ?*PCB {
-    if (smp.myCpu().current_pid) |cur| return &procs[cur];
+    if (smp.currentPid()) |cur| return &procs[cur];
     return null;
 }
 
@@ -1065,7 +1065,7 @@ pub fn printProcesses() void {
 /// Get current process PID (per-CPU). Returns 0xFFFFFFFF when no task is
 /// dispatched on this CPU (only true pre-`enterFirstTask`).
 pub fn getCurrentPid() u32 {
-    if (smp.myCpu().current_pid) |cur| return @intCast(cur);
+    if (smp.currentPid()) |cur| return @intCast(cur);
     return 0xFFFFFFFF;
 }
 

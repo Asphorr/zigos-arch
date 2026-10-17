@@ -198,7 +198,7 @@ pub const SpinLock = struct {
                 self.holder_ra = ra;
                 if (comptime witness.enabled) {
                     if (self.witness_class != UNREGISTERED_CLASS) {
-                        witness.spinAcquire(self.witness_class, cpu, smp.myCpu().current_pid, ra);
+                        witness.spinAcquire(self.witness_class, cpu, smp.currentPid(), ra);
                     }
                 }
                 if (cpu < MAX_HOLD_CPUS) @atomicStore(usize, &lock_cpu[cpu].spin_target, 0, .monotonic);
@@ -845,7 +845,7 @@ fn restoreIrq(flags: u64) void {
 //   - tiny critical sections where one cache miss > context-switch cost.
 //   - boot-time / pre-scheduler paths (no current_pid yet).
 //
-// Pre-scheduler safety: if smp.myCpu().current_pid is null (early init
+// Pre-scheduler safety: if smp.currentPid() is null (early init
 // before the first task is dispatched), acquire/release degrade to a
 // no-op stamp. The system is single-threaded at that point so no actual
 // serialization is needed.
@@ -889,7 +889,7 @@ pub const Mutex = struct {
     /// for the rationale.
     pub inline fn assertHeld(self: *const Mutex) void {
         if (std.debug.runtime_safety) {
-            const cur = smp.myCpu().current_pid orelse return;
+            const cur = smp.currentPid() orelse return;
             std.debug.assert(@atomicLoad(u16, &self.owner_pid, .acquire) == @as(u16, @intCast(cur)));
         }
     }
@@ -902,7 +902,7 @@ pub const Mutex = struct {
     /// ctrl_lock; root-caused via [lock-dump] + [wake-skip] cross-reference).
     pub fn acquire(self: *Mutex) void {
         const ra = @returnAddress();
-        const cur_opt = smp.myCpu().current_pid;
+        const cur_opt = smp.currentPid();
         if (cur_opt == null) {
             // No-task context — pre-scheduler boot. The old stamp-only
             // no-op assumed strict single-threadedness, but IRQ-context
@@ -971,7 +971,7 @@ pub const Mutex = struct {
     /// about. No-task context mirrors acquire(): stamp and succeed.
     pub fn tryAcquire(self: *Mutex) bool {
         const ra = @returnAddress();
-        const cur_opt = smp.myCpu().current_pid;
+        const cur_opt = smp.currentPid();
         if (cur_opt == null) {
             // Honest even with no task: claim the sentinel or report
             // failure. (The old unconditional `return true` let an
@@ -1002,7 +1002,7 @@ pub const Mutex = struct {
     /// Ownership clears BEFORE the wake so woken waiters observe the free
     /// state and can win their retry CAS.
     pub fn release(self: *Mutex) void {
-        if (smp.myCpu().current_pid == null) {
+        if (smp.currentPid() == null) {
             // No-task context: clear the sentinel claim (no-op if a boot
             // self-nest's inner release already freed it). Wake on success
             // is cheap pre-scheduler (procs[] all .unused → no-op) and
@@ -1014,7 +1014,7 @@ pub const Mutex = struct {
             return;
         }
         if (comptime witness.enabled) {
-            if (self.witness_class != UNREGISTERED_CLASS) witness.mutexRelease(self.witness_class, smp.myCpu().current_pid.?);
+            if (self.witness_class != UNREGISTERED_CLASS) witness.mutexRelease(self.witness_class, smp.currentPid().?);
         }
         // Clear ownership BEFORE waking waiters: they retry CAS on wake
         // and need to observe the free state. An exchange, not a store: a
@@ -1104,7 +1104,7 @@ pub const RwMutex = struct {
     }
 
     fn currentPid(comptime what: []const u8) usize {
-        return smp.myCpu().current_pid orelse @panic("RwMutex." ++ what ++ " outside a task");
+        return smp.currentPid() orelse @panic("RwMutex." ++ what ++ " outside a task");
     }
 
     /// Under guard: panic if `pid` already holds the lock.
@@ -1224,7 +1224,7 @@ pub const RwMutex = struct {
     /// True if the calling task holds the lock in `mode` (either mode if
     /// null). For code that requires the lock to assert it.
     pub fn heldByCurrent(self: *RwMutex, mode: ?Mode) bool {
-        const pid = smp.myCpu().current_pid orelse return false;
+        const pid = smp.currentPid() orelse return false;
         const f = self.guard.acquireIrqSave();
         defer self.guard.releaseIrqRestore(f);
         const reading = self.readers & pidBit(pid) != 0;

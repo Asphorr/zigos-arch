@@ -410,7 +410,7 @@ pub fn cloneLinuxThread(frame: *const signals.SyscallFrame, spec: LinuxThreadSpe
 /// we read RIP/RFLAGS/RSP/all GPRs from there to seed child's iretq frame.
 pub fn forkCurrent(frame: *signals.SyscallFrame) ?usize {
     const parent = process.currentPCB() orelse return null;
-    const parent_pid_u8: u8 = @intCast(smp.myCpu().current_pid orelse return null);
+    const parent_pid_u8: u8 = @intCast(smp.currentPid() orelse return null);
     // Process-level state (address space, regions, fd table, argv…)
     // lives on the LEAD thread. fork() from a cloned worker used to copy the
     // WORKER's own fields — empty regions, default brk/mmap_top — so
@@ -844,12 +844,12 @@ pub fn createKernelTask(
 /// by swap.evictFrame; counterpart `clearInflightSlot` runs at phase-3 /
 /// rollback. Atomic so killProcess can observe it from another CPU.
 pub fn setInflightSlot(slot: u32) void {
-    const cur = smp.myCpu().current_pid orelse return;
+    const cur = smp.currentPid() orelse return;
     @atomicStore(u32, &process.procs[cur].swap_inflight_slot, slot, .release);
 }
 
 pub fn clearInflightSlot() void {
-    const cur = smp.myCpu().current_pid orelse return;
+    const cur = smp.currentPid() orelse return;
     @atomicStore(u32, &process.procs[cur].swap_inflight_slot, 0xFFFFFFFF, .release);
 }
 
@@ -872,12 +872,12 @@ pub fn reclaimInflightSlot(pid: usize) void {
 /// `swap_inflight_frame` comment in process.zig for why the leak it prevents
 /// is self-amplifying.
 pub fn setInflightFrame(frame: Phys) void {
-    const cur = smp.myCpu().current_pid orelse return;
+    const cur = smp.currentPid() orelse return;
     @atomicStore(usize, &process.procs[cur].swap_inflight_frame, frame.raw(), .release);
 }
 
 pub fn clearInflightFrame() void {
-    const cur = smp.myCpu().current_pid orelse return;
+    const cur = smp.currentPid() orelse return;
     @atomicStore(usize, &process.procs[cur].swap_inflight_frame, 0, .release);
 }
 
@@ -1490,7 +1490,7 @@ pub fn killProcess(pid: u8) void {
 /// returns. Idempotent re: peers racing into this from concurrent fatal
 /// signals: killProcessWithStatus's exit_requested xchg collapses duplicates.
 pub fn killThreadGroup(tgid: u8, status: u32) void {
-    const my_pid_opt = smp.myCpu().current_pid;
+    const my_pid_opt = smp.currentPid();
 
     // Phase 1: kill every peer OTHER than the current thread. Defer self so
     // tearDownTask on peers (which reads procs[tgid].regions etc) can
@@ -1530,7 +1530,7 @@ fn killPeers(tgid: u8, except: ?usize, status: u32) void {
 /// other threads killed first as in killThreadGroup, the caller last through
 /// the graceful self-exit (a voluntary exit persists shared dirty pages).
 pub fn exitThreadGroup(status: u32) void {
-    const cur = smp.myCpu().current_pid orelse return;
+    const cur = smp.currentPid() orelse return;
     const tgid = process.procs[cur].tgid;
     // A lead that exited first stays pinned until the group empties; the
     // status its parent reads is the group's.
@@ -1672,7 +1672,7 @@ fn destroyCurrentImpl(status: u32, persist_shared_dirty: bool) void {
     // bodies run IF=1, so the exit paths can arrive with it on.
     asm volatile ("cli" ::: .{ .memory = true });
     @import("spinlock.zig").hardirqReset();
-    const cur = smp.myCpu().current_pid orelse return;
+    const cur = smp.currentPid() orelse return;
 
     tearDownTask(cur, status, .destroy, persist_shared_dirty);
 
