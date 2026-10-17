@@ -189,6 +189,8 @@ pub const FileDesc = struct {
     cloexec: bool = false,
     /// O_NONBLOCK, as F_GETFL reports it.
     nonblock: bool = false,
+    /// Claimed by vfs.allocFd, its file not installed yet.
+    reserved: bool = false,
 };
 
 /// ABI personality of a process — selects which translation the `syscall`
@@ -541,6 +543,7 @@ pub const PCB = struct {
     // the first schedule() after the count drops (see doomed()). Only the
     // task itself changes it, and never while off-CPU.
     nokill: u16 = 0, // (a) own-task writes; killers and pickNext read
+    nokill_seq: u32 = 0, // (a) own-task writes; bumped by each noKillEnter
 
     // --- CFS-style vruntime (scheduler rewrite, post-Phase 7) -------------
     // Accumulated CPU "fair-share" time in ticks. Bumped by accountRunningTick
@@ -646,16 +649,21 @@ pub inline fn leader(pcb: *PCB) *PCB {
 
 /// `pid` is being killed and may be torn down now: not dispatched again,
 /// and dies at its next schedule(). A killed task inside a no-kill section
-/// (PCB.nokill) runs on until it leaves it.
+/// (PCB.nokill) runs on until it leaves it; one already in its teardown
+/// (teardown_marked) runs on to finish it, sleeps there included.
 pub inline fn doomed(pid: usize) bool {
     return @atomicLoad(bool, &procs[pid].exit_requested, .acquire) and
-        @atomicLoad(u16, &procs[pid].nokill, .acquire) == 0;
+        @atomicLoad(u16, &procs[pid].nokill, .acquire) == 0 and
+        !@atomicLoad(bool, &procs[pid].teardown_marked, .acquire);
 }
 
-/// Enter / leave a section a kill must not cut short (PCB.nokill).
+/// Enter / leave a section a kill must not cut short (PCB.nokill). Entering
+/// bumps nokill_seq too, so a killer can tell a task that went in and back
+/// to sleep since it last looked.
 pub fn noKillEnter() void {
     const pcb = currentPCB() orelse return;
     @atomicStore(u16, &pcb.nokill, pcb.nokill + 1, .release);
+    @atomicStore(u32, &pcb.nokill_seq, pcb.nokill_seq +% 1, .release);
 }
 
 pub fn noKillLeave() void {

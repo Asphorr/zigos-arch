@@ -1141,6 +1141,23 @@ pub fn enter(user_va: u32, to_submit: u32, min_complete: u32) u32 {
 /// memcpy) referencing it. Closes the HIGH "PD freed under live CR3"
 /// race reviewer flagged 2026-05-24.
 pub fn releaseAllForPid(pid: u32) void {
+    releaseOwnedBy(pid, false);
+}
+
+/// releaseAllForPid for every instance a thread of group `tgid` owns: the
+/// group's last teardown calls it before freeing the address space, as a
+/// member that claimed its teardown earlier may not have reached its own
+/// release yet, and its worker may still be copying on those tables.
+pub fn releaseAllForGroup(tgid: u32) void {
+    releaseOwnedBy(tgid, true);
+}
+
+fn ownedBy(it: *const Instance, id: u32, group: bool) bool {
+    if (!group) return it.owner_pid == id;
+    return it.owner_pid < process.MAX_PROCS and process.procs[it.owner_pid].tgid == id;
+}
+
+fn releaseOwnedBy(id: u32, group: bool) void {
     // Phase 1: signal exit + wake everyone, without holding `lock` (the
     // worker may need to take it during cleanup, and we'll spin-wait
     // below — must not hold it while blocked).
@@ -1150,7 +1167,7 @@ pub fn releaseAllForPid(pid: u32) void {
         defer lock.releaseIrqRestore(flags);
         for (&instances, 0..) |*it, idx| {
             if (!@atomicLoad(bool, &it.in_use, .acquire)) continue;
-            if (it.owner_pid != pid) continue;
+            if (!ownedBy(it, id, group)) continue;
             owned_slots[idx] = true;
             @atomicStore(bool, &it.exit_requested, true, .release);
             if (it.worker_pid < process.MAX_PROCS) {

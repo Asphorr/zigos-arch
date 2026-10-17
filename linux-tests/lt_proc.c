@@ -75,6 +75,12 @@ static void *fork_from_thread(void *arg) {
     return NULL;
 }
 
+static void *sleep_forever(void *arg) {
+    (void)arg;
+    for (;;) nap_ms(1000);
+    return NULL;
+}
+
 static int run_exec(const char *image, int gone, int kept) {
     char a2[16], a3[16];
     snprintf(a2, sizeof a2, "%d", gone);
@@ -216,6 +222,22 @@ int main(int argc, char **argv) {
     CHECK(run_exec("/bin/lt_proc.elf", gone[1], kept[1]) == 7, "execve of a stamped image");
     CHECK(run_exec("/bin/lt_proc_plain.elf", gone[1], kept[1]) == 7, "execve of an unstamped image");
     CHECK(read(kept[0], buf, 2) == 2 && memcmp(buf, "EE", 2) == 0, "both wrote through the kept fd");
+    // execve from a process with another thread: that one goes first
+    p = fork();
+    if (p == 0) {
+        pthread_t sleeper;
+        if (pthread_create(&sleeper, NULL, sleep_forever, NULL) != 0) _exit(90);
+        nap_ms(20);
+        char a2[16], a3[16];
+        snprintf(a2, sizeof a2, "%d", gone[1]);
+        snprintf(a3, sizeof a3, "%d", kept[1]);
+        char *argv2[] = {"lt_proc", "exec-child", a2, a3, NULL};
+        char *envp2[] = {"FOO=bar", NULL};
+        execve("/bin/lt_proc.elf", argv2, envp2);
+        _exit(91);
+    }
+    CHECK(wait_exit(p) == 7, "execve from a two-thread process");
+    CHECK(read(kept[0], buf, 1) == 1 && buf[0] == 'E', "and it ran");
     char *nav[] = {"nope", NULL};
     CHECK(execve("/bin/no-such-file", nav, nav) == -1 && errno == ENOENT, "execve of a missing file returns");
 
@@ -226,6 +248,9 @@ int main(int argc, char **argv) {
     CHECK(process_vm_readv(getpid(), &l, 1, &r, 1, 0) == (ssize_t)sizeof secret && memcmp(got, secret, sizeof secret) == 0, "process_vm_readv");
     struct iovec rbad = {(void *)16, 8};
     CHECK(process_vm_readv(getpid(), &l, 1, &rbad, 1, 0) == -1 && errno == EFAULT, "process_vm_readv of unmapped memory");
+    static char span[24] = "0123456789abcdefghijklm";
+    struct iovec lo = {span, 16}, ro = {span + 8, 16};
+    CHECK(process_vm_readv(getpid(), &lo, 1, &ro, 1, 0) == 16 && memcmp(span, "89abcdefghijklm", 16) == 0, "process_vm_readv between overlapping ranges");
 
     // sysinfo
     struct sysinfo si;

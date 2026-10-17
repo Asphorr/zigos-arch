@@ -948,7 +948,7 @@ pub fn allocFd(pcb: *process.PCB) ?usize {
     for (3..pcb.fd_table.len) |fd_idx| {
         const e = &pcb.fd_table[fd_idx];
         if (e.in_use) continue;
-        e.* = .{ .in_use = true, .fs_type = .console, .flags = 1 };
+        e.* = .{ .in_use = true, .fs_type = .console, .flags = 1, .reserved = true };
         return fd_idx;
     }
     return null;

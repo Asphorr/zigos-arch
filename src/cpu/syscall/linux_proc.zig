@@ -43,6 +43,7 @@ const EFAULT: i64 = 14;
 const EINVAL: i64 = 22;
 const ENFILE: i64 = 23;
 const EMFILE: i64 = 24;
+const EBUSY: i64 = 16;
 
 inline fn err(e: i64) u64 {
     return @bitCast(-e);
@@ -212,17 +213,30 @@ pub fn wait4(pid_arg: u64, status_va: u64, options: u64, rusage_va: u64) u64 {
     lifecycle.childWaitEnter(me);
     defer lifecycle.childWaitLeave(me);
     while (true) {
-        if (process.findZombieChild(group, target)) |z| {
-            const st = waitStatus(process.procs[z].exit_status);
+        var st: u32 = 0;
+        if (reapChild(group, target, &st)) |z| {
             if (status_va != 0) @as(*u32, @ptrFromInt(status_va)).* = st;
             if (rusage_va != 0) @memset(@as([*]u8, @ptrFromInt(rusage_va))[0..RUSAGE_BYTES], 0);
-            process.reapZombie(z);
             return z;
         }
         if (!hasChild(group, target)) return err(ECHILD);
         if (options & WNOHANG != 0) return 0;
         process.blockOn(.waitpid, target);
     }
+}
+
+/// Two threads of a process may wait4 for the same child: one reaps it.
+var reap_lock: @import("../../proc/spinlock.zig").SpinLock = .{};
+
+/// Reap a zombie child of `group` matching `target`, its wait status in
+/// `status`; null if none is reapable now.
+fn reapChild(group: u8, target: u32, status: *u32) ?u8 {
+    reap_lock.acquire();
+    defer reap_lock.release();
+    const z = process.findZombieChild(group, target) orelse return null;
+    status.* = waitStatus(process.procs[z].exit_status);
+    process.reapZombie(z);
+    return z;
 }
 
 fn hasChild(group: u8, target: u32) bool {
@@ -311,7 +325,9 @@ fn dupAt(pcb: *process.PCB, old: u64, new: u64, cloexec: bool) u64 {
     {
         pcb.fd_lock.acquire();
         defer pcb.fd_lock.release();
-        if (old >= pcb.fd_table.len or !pcb.fd_table[old].in_use) return err(EBADF);
+        if (old >= pcb.fd_table.len or !pcb.fd_table[old].in_use or pcb.fd_table[old].reserved) return err(EBADF);
+        // Being opened by another thread: its install would overwrite us.
+        if (pcb.fd_table[new].in_use and pcb.fd_table[new].reserved) return err(EBUSY);
         var copy = pcb.fd_table[old];
         if (!vfs.refEntry(&copy)) return err(EINVAL);
         copy.cloexec = cloexec;
@@ -327,7 +343,7 @@ pub fn dupFrom(old: u64, min: u64, cloexec: bool) u64 {
     const pcb = linux_fs.proc() orelse return err(EFAULT);
     pcb.fd_lock.acquire();
     defer pcb.fd_lock.release();
-    if (old >= pcb.fd_table.len or !pcb.fd_table[old].in_use) return err(EBADF);
+    if (old >= pcb.fd_table.len or !pcb.fd_table[old].in_use or pcb.fd_table[old].reserved) return err(EBADF);
     var slot: usize = @intCast(@min(min, pcb.fd_table.len));
     while (slot < pcb.fd_table.len and pcb.fd_table[slot].in_use) slot += 1;
     if (slot == pcb.fd_table.len) return err(EMFILE);
@@ -393,9 +409,7 @@ fn pollFor(fds_va: u64, nfds: u64, timeout_ns: ?u64) u64 {
         }
         if (ready > 0) return ready;
         if (timeout_ns) |ns| if (ns == 0 or process.tick_count >= deadline) return 0;
-        @atomicStore(u64, &pcb.wake_tick, deadline, .release);
-        if (deadline != 0) sched.registerWakeDeadline(deadline);
-        process.blockOn(.poll, 0);
+        sched.blockOnDeadline(.poll, 0, deadline);
     }
 }
 
@@ -419,22 +433,33 @@ pub fn processVmReadv(pid: u64, local_va: u64, liovcnt: u64, remote_va: u64, rio
     if (pid != process.procs[me].tgid and pid != me) return err(EPERM);
     if (!common.validateUserPtr(local_va, liovcnt * @sizeOf(Iovec))) return err(EFAULT);
     if (!common.validateUserPtr(remote_va, riovcnt * @sizeOf(Iovec))) return err(EFAULT);
-    const local: [*]align(1) const Iovec = @ptrFromInt(local_va);
-    const remote: [*]align(1) const Iovec = @ptrFromInt(remote_va);
+    // Each iovec read once into a local: the caller's other threads may
+    // rewrite the arrays meanwhile.
+    const local: [*]align(1) const volatile Iovec = @ptrFromInt(local_va);
+    const remote: [*]align(1) const volatile Iovec = @ptrFromInt(remote_va);
     var li: usize = 0;
+    var lv: Iovec = .{ .base = 0, .len = 0 };
     var loff: u64 = 0;
     var total: u64 = 0;
     for (0..riovcnt) |ri| {
+        const rv = remote[ri];
         var roff: u64 = 0;
-        while (roff < remote[ri].len) {
-            while (li < liovcnt and loff == local[li].len) : (li += 1) loff = 0;
-            if (li == liovcnt) return total;
-            const n = @min(remote[ri].len - roff, local[li].len - loff, 4096 - ((remote[ri].base + roff) & 0xFFF));
-            const src = remote[ri].base + roff;
-            const dst = local[li].base + loff;
+        while (roff < rv.len) {
+            while (loff == lv.len) {
+                if (li == liovcnt) return total;
+                lv = local[li];
+                li += 1;
+                loff = 0;
+            }
+            const n = @min(rv.len - roff, lv.len - loff, 4096 - ((rv.base +% roff) & 0xFFF));
+            const src = rv.base +% roff;
+            const dst = lv.base +% loff;
             if (!common.validateUserPtr(src, n) or !common.validateUserPtrWrite(dst, n))
                 return if (total > 0) total else err(EFAULT);
-            @memcpy(@as([*]u8, @ptrFromInt(dst))[0..n], @as([*]const u8, @ptrFromInt(src))[0..n]);
+            // Both sides are the caller's memory, so they may overlap.
+            const d: [*]u8 = @ptrFromInt(dst);
+            const s: [*]const u8 = @ptrFromInt(src);
+            if (dst <= src) std.mem.copyForwards(u8, d[0..n], s[0..n]) else std.mem.copyBackwards(u8, d[0..n], s[0..n]);
             roff += n;
             loff += n;
             total += n;

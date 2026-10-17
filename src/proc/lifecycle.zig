@@ -415,6 +415,20 @@ pub fn cloneLinuxThread(frame: *const signals.SyscallFrame, spec: LinuxThreadSpe
     return i;
 }
 
+/// The fork child's fd table: the parent's, each entry with its own
+/// reference. Under the parent's fd_lock: another of its threads may close
+/// or dup meanwhile (a Linux table is the group's), and a pipe whose last
+/// reference that close dropped could be recycled before the bump. A slot
+/// being opened (reserved) stays the parent's.
+fn copyFdTable(child: *PCB, parent: *PCB) void {
+    parent.fd_lock.acquire();
+    defer parent.fd_lock.release();
+    for (&child.fd_table, &parent.fd_table) |*c, *p| {
+        c.* = if (p.in_use and !p.reserved) p.* else .{};
+        if (c.in_use) _ = @import("../fs/vfs.zig").refEntry(c);
+    }
+}
+
 /// Spawn a child via fork(). Clones the parent's address space (COW shared),
 /// copies fd_table / sigactions / cwd / regions / argv, and synthesizes
 /// a kstack iretq frame so the child resumes at the parent's syscall-return
@@ -505,16 +519,7 @@ pub fn forkCurrent(frame: *signals.SyscallFrame) ?usize {
     // FD table — copy entries verbatim, then bump pipe-side refcounts so the
     // parent closing its end doesn't drop the last reference while child
     // still holds the inherited fd. fd_table is process-level → lead's.
-    process.procs[i].fd_table = parent_lead_src.fd_table;
-    {
-        const pipe = @import("pipe.zig");
-        for (process.procs[i].fd_table) |fd| {
-            if (!fd.in_use) continue;
-            if (fd.fs_type == .pipe) {
-                if (fd.flags == 0) pipe.addReader(fd.pipe_id) else pipe.addWriter(fd.pipe_id);
-            }
-        }
-    }
+    copyFdTable(&process.procs[i], parent_lead_src);
 
     // Inherit cwd, name, sigactions, argv (process-level → lead) and
     // priority, fs_base (per-thread → the calling thread).
@@ -1186,6 +1191,9 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp, persist_shared_dirty: 
     if (last_in_group) {
         const lead = &process.procs[my_tgid];
         if (lead.page_directory) |pd| {
+            // A member that claimed earlier may not have released its
+            // io_uring instances yet; their workers copy on these tables.
+            @import("../cpu/ipc/iouring.zig").releaseAllForGroup(my_tgid);
             vmm.destroyAddressSpace(pd, Phys.of(lead.page_dir_phys));
             lead.page_directory = null;
             lead.page_dir_phys = 0;
@@ -1300,8 +1308,10 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp, persist_shared_dirty: 
     // Reparent children before changing state — otherwise a child's
     // parent_pid could point at a slot that gets reused by a future
     // create() and the child would think a stranger is its parent.
-    // Worker threads share a tgid; only the lead process owns children.
-    if (!is_worker_thread) {
+    // Children are the process's (parent_pid = the lead): they move when
+    // the group empties, here for a lead dying last, below for a worker
+    // that outlived its pinned lead. Until then a worker may wait4 them.
+    if (!is_worker_thread and last_in_group) {
         reparentChildren(@intCast(pid));
     }
 
@@ -1330,6 +1340,7 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp, persist_shared_dirty: 
     // waitpid has been blocking on findZombieChild's group-alive guard)
     // or, with no parent to reap it, free the slot right here.
     if (last_in_group and is_worker_thread and process.procs[my_tgid].state == .zombie) {
+        reparentChildren(my_tgid);
         const lp = process.procs[my_tgid].parent_pid;
         const lp_alive = lp != 0 and lp < MAX_PROCS and process.procs[lp].state != .unused;
         if (lp_alive) {
@@ -1411,6 +1422,9 @@ pub fn killProcessWithStatus(pid: u8, status: u32) void {
         while (spin < 10_000_000) : (spin += 1) {
             const s = @atomicLoad(u8, @as(*const u8, @ptrCast(&process.procs[pid].state)), .acquire);
             if (s == @intFromEnum(State.zombie) or s == @intFromEnum(State.unused)) return;
+            // Finishing a no-kill section or its own teardown: it dies on
+            // its own, and may need this CPU to.
+            if (!process.doomed(pid)) return;
             asm volatile ("pause" ::: .{ .memory = true });
         }
         debug.klog("[kill] WARN: pid={d} concurrent-killer wait timed out\n", .{pid});
@@ -1419,8 +1433,7 @@ pub fn killProcessWithStatus(pid: u8, status: u32) void {
 
     // Case 1: self-kill (current CPU is running pid). Escalate to the
     // self-destroy path, which steers TSS rsp0 to idle and never returns.
-    const my_cpu = smp.myCpu();
-    if (my_cpu.current_pid) |cur| {
+    if (smp.currentPid()) |cur| {
         if (cur == pid) {
             destroyCurrentWithStatus(status);
             unreachable;
@@ -1437,7 +1450,9 @@ pub fn killProcessWithStatus(pid: u8, status: u32) void {
         // dispatched, finishes the operation and dies at its next
         // schedule(). Read before the state: once it reads doomed, a task
         // off-CPU is never dispatched again, and one on-CPU dies at its next
-        // schedule() — the state read below can't be outrun.
+        // schedule(). The one gap — running when read, then into a section
+        // and asleep before the state read — case 3 closes with nokill_seq.
+        const seq = @atomicLoad(u32, &process.procs[pid].nokill_seq, .acquire);
         if (!process.doomed(pid)) return;
         const snap = @atomicLoad(u8, @as(*const u8, @ptrCast(&process.procs[pid].state)), .acquire);
         if (snap == @intFromEnum(State.zombie) or snap == @intFromEnum(State.unused)) return;
@@ -1508,7 +1523,13 @@ pub fn killProcessWithStatus(pid: u8, status: u32) void {
         // Safe to setState + tearDown directly. (parent reaping AFTER
         // tearDown is naturally serialized via the wake() inside tearDown
         // — parent was blocked in waitpid until tearDown wakes it.)
-        process.setState(pid, .zombie);
+        //
+        // Off-CPU now. If it went into a no-kill section since the first
+        // look, it isn't ours. The claim is a CAS from the state seen: it
+        // fails if a CPU that read exit_requested before we set it picked
+        // the task meanwhile.
+        if (!process.doomed(pid) or @atomicLoad(u32, &process.procs[pid].nokill_seq, .acquire) != seq) continue;
+        if (!@import("sched.zig").setStateFrom(pid, @enumFromInt(snap), .zombie)) continue;
         // External kill (user kill / Ctrl-C / fatal signal): clear unflushed
         // shared dirty pages, same as today. A killed process makes no msync
         // guarantee; persisting its final window is deferred (the graceful
@@ -1597,16 +1618,23 @@ fn killPeers(tgid: u8, except: ?usize, status: u32) void {
 
 /// Kill every other thread of the caller's group and wait until they are
 /// gone (a killed thread inside a no-kill section finishes it first). For
-/// execve, which then drops the address space they ran on.
+/// execve, which then drops the address space they ran on: it waits for
+/// as long as that takes, as Linux's de_thread does.
 pub fn killOtherThreads() void {
     const me = smp.currentPid() orelse return;
     const tgid = process.procs[me].tgid;
     // Holds off clones from the threads while they die.
     @atomicStore(bool, &process.procs[tgid].group_exiting, true, .seq_cst);
     killPeers(tgid, me, 0);
-    var d = @import("../util/deadline.zig").Deadline.ms(5000, "execve: other threads");
-    while (groupHasOtherLive(@intCast(me)) and d.live()) @import("sched_asm.zig").softYield();
-    if (groupHasOtherLive(@intCast(me))) debug.klog("[exec] pid={d}: threads of the group still alive after 5 s\n", .{me});
+    var waited_s: u32 = 0;
+    while (groupHasOtherLive(@intCast(me))) {
+        var d = @import("../util/deadline.zig").Deadline.ms(5000, "execve: other threads");
+        while (groupHasOtherLive(@intCast(me)) and d.live()) @import("sched_asm.zig").softYield();
+        if (groupHasOtherLive(@intCast(me))) {
+            waited_s += 5;
+            debug.klog("[exec] pid={d}: threads of the group still alive after {d} s\n", .{ me, waited_s });
+        }
+    }
     @atomicStore(bool, &process.procs[tgid].group_exiting, false, .seq_cst);
 }
 
@@ -1745,6 +1773,11 @@ pub fn reapStaleZombies(max_age_ticks: u64) u32 {
         if (parentIsWaiting(i)) continue;
         // Pinned lead — live workers still deref this PCB via leader().
         if (groupHasOtherLive(i)) continue;
+        // A Linux parent may wait4 whenever it likes, and reads ECHILD for
+        // a child taken from it as a bug (Zig's std: unreachable).
+        const parent = process.procs[i].parent_pid;
+        if (parent != 0 and parent < MAX_PROCS and process.procs[parent].state != .unused and
+            process.procs[parent].personality == .linux) continue;
         // Age from the DEATH stamp, not acct_start_tick: aging from creation
         // gave any process older than the threshold a zero-second grace
         // window between exit and force-reap, racing the parent's waitpid

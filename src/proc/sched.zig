@@ -3061,6 +3061,31 @@ pub fn blockOn(kind: WaitKind, target: u32) void {
     clearWait(pcb);
 }
 
+/// blockOn for a deadline-parked `kind`, also ending at tick `deadline`
+/// (0: none). The deadline is re-checked once the task is .sleeping:
+/// wakeExpired drops a due deadline of a task not yet asleep, so one that
+/// passed during enrollment would otherwise go unnoticed.
+pub fn blockOnDeadline(kind: WaitKind, target: u32, deadline: u64) void {
+    const cur = smp.currentPid() orelse return;
+    const pcb = &process.procs[cur];
+    spinlock.mightSleep(@src());
+    std.debug.assert(deadlineParked(kind));
+    if (@atomicRmw(bool, &pcb.wake_pending, .Xchg, false, .acq_rel)) return;
+    // Stored even when 0, so a deadline left from an earlier wait can't end
+    // this one.
+    @atomicStore(u64, &pcb.wake_tick, deadline, .release);
+    if (deadline != 0) registerWakeDeadline(deadline);
+    setWait(pcb, kind, target);
+    setState(cur, .sleeping);
+    if (@atomicLoad(bool, &pcb.wake_pending, .acquire) or (deadline != 0 and process.tick_count >= deadline)) {
+        clearWait(pcb);
+        setState(cur, .running);
+        return;
+    }
+    @import("sched_asm.zig").softYield();
+    clearWait(pcb);
+}
+
 /// Per CPU: its idle task is halted in idleWait. Dekker pair with
 /// wake_pending: the waiter publishes this, then re-reads wake_pending;
 /// wake() publishes wake_pending, then reads this (kickIdleWaiter).
