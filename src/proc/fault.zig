@@ -141,6 +141,12 @@ fn handleCowFault(pml4: [*]align(4096) u64, lead: *PCB, cr2: usize) bool {
     const pte_p = findUserPte(pml4, va_aligned) orelse return false;
     const pte = pte_p.*;
     if (pte & paging.COW == 0) return false;
+    // mprotect keeps COW on a page it makes read-only (so a later PROT_WRITE
+    // still copies rather than writing a shared frame); the region's prot
+    // says whether a write may break it now.
+    if (lead.regions.find(va_aligned)) |rp| {
+        if (rp.prot & process.PROT_WRITE == 0) return false;
+    }
 
     // Shared escape hatch: cloneAddressSpace marks every writable PTE COW without
     // knowing about lazy regions, so a fork'd page of a SHARED mapping — anon
@@ -472,12 +478,21 @@ fn reclaimViaSwap(pml4: [*]align(4096) u64, lead: *PCB, skip_va: usize, pcid: u1
         // silently lose writeback tracking. (Private pages were already skipped
         // below via the COW-bit gate; shared pages are RW with no COW bit, so they
         // need this explicit skip.) Page-cache reclaim — not swap — handles these.
-        if (region_is_cache) {
-            va += 0x1000;
+        // A PROT_NONE reserve has no pages at all. Either way, skip the region
+        // whole: a page-by-page walk of a big one would use up ITER_CAP and
+        // report nothing reclaimable.
+        if (region_is_cache or r.prot == 0) {
+            va = r.end;
             continue;
         }
         if (va != skip_va) {
-            if (vmm.userPtePtr(pml4, va)) |pte_ptr| {
+            const pte_opt = vmm.userPtePtr(pml4, va);
+            if (pte_opt == null) {
+                // No page table: nothing is mapped up to the next 2 MB boundary.
+                va = (va | 0x1FFFFF) + 1;
+                continue;
+            }
+            if (pte_opt) |pte_ptr| {
                 const pte = pte_ptr.*;
                 if ((pte & paging.PRESENT) != 0 and (pte & paging.COW) == 0) {
                     if ((pte & paging.ACCESSED) != 0 and skipped < skip_budget) {
