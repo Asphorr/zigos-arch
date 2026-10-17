@@ -626,6 +626,12 @@ fn kernelIdle() callconv(.c) noreturn {
             @import("../cpu/idt/irq0.zig").shortenAfterIdleWake();
             process.schedule();
             if (@import("../cpu/idt/irq0.zig").dispatchSeq() != seq) continue;
+        } else if (@import("sched.zig").pollIdle()) {
+            // Work arrived while we spun instead of halting.
+            const seq = @import("../cpu/idt/irq0.zig").dispatchSeq();
+            @import("../cpu/idt/irq0.zig").shortenAfterIdleWake();
+            process.schedule();
+            if (@import("../cpu/idt/irq0.zig").dispatchSeq() != seq) continue;
         }
         if (mwait.mwait_supported) {
             // sti + monitor + mwait. MWAIT(EAX=C1 hint, ECX[0]=1) wakes on

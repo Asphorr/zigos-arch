@@ -1171,12 +1171,69 @@ fn maybePreemptOnWake(pid: usize) void {
         wakelat.noteNoIpi(pid);
         return;
     }
+    if (idlePollingSees(target_cpu_id)) {
+        wakelat.noteNoIpi(pid);
+        return;
+    }
 
     if (kill_kick_vector) |v| {
         const apic = @import("../time/apic.zig");
         wakelat.noteIpiSent(target_cpu_id);
         apic.sendIPI(target_cpu.lapic_id, v);
     }
+}
+
+/// Per CPU: its idle task is spinning in pollIdle, watching its runqueue.
+/// Dekker pair with the runqueue: the poller clears this, then re-reads
+/// nr_runnable; a waker bumps nr_runnable (rqEnter), then reads this
+/// (idlePollingSees). One of the two sees the other's store.
+var idle_polling: [smp.MAX_CPUS]std.atomic.Value(bool) = [_]std.atomic.Value(bool){std.atomic.Value(bool).init(false)} ** smp.MAX_CPUS;
+
+/// How long an idle CPU watches its runqueue before halting.
+const IDLE_POLL_US: u64 = 200;
+
+/// A task just queued on `cpu_id` will be seen by that CPU's idle poll:
+/// no IPI needed. Only while the idle task is current there; once anything
+/// else runs, the flag says nothing about who will look at the queue.
+fn idlePollingSees(cpu_id: u8) bool {
+    // Orders rqEnter's nr_runnable bump before the flag read (Dekker).
+    asm volatile ("mfence" ::: .{ .memory = true });
+    if (!idle_polling[cpu_id].load(.seq_cst)) return false;
+    const cur = smp.cpus[cpu_id].current_pid orelse return false;
+    return cur < MAX_PROCS and process.procs[cur].is_idle;
+}
+
+/// The idle task, before it halts: spin up to IDLE_POLL_US on this CPU's
+/// runqueue. A wake in that window reaches a running vCPU and needs no IPI;
+/// a halted vCPU costs one plus the host rescheduling it, hundreds of µs
+/// under nested virtualization. True when work arrived. Runs with IRQs on
+/// so device completions keep flowing.
+pub fn pollIdle() bool {
+    const id = smp.myCpu().cpu_id;
+    const per_q = @import("../time/apic.zig").tscPerQuantumSane();
+    if (per_q == 0 or id >= smp.MAX_CPUS) return false;
+    const budget = per_q * IDLE_POLL_US / 10_000;
+    const perf = @import("../debug/perf.zig");
+    idle_polling[id].store(true, .seq_cst);
+    asm volatile ("sti");
+    const start = perf.rdtsc();
+    var found = false;
+    var round: u32 = 0;
+    while (perf.rdtsc() -% start < budget) : (round += 1) {
+        if (rqHasDispatchable(id)) {
+            found = true;
+            break;
+        }
+        // A wakee queued behind a busy peer: take it here instead.
+        if (round % 16 == 15 and tryStealWork()) {
+            found = true;
+            break;
+        }
+        std.atomic.spinLoopHint();
+    }
+    // Locked exchange: the clear lands before the re-read (Dekker).
+    _ = idle_polling[id].swap(false, .seq_cst);
+    return found or rqHasDispatchable(id);
 }
 
 /// A woken task this far behind the running one in vruntime — one tick of
