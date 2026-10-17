@@ -19,6 +19,7 @@ const paging = @import("../../mm/paging.zig");
 const memmap = @import("../../mm/memmap.zig");
 const shm = @import("../../mm/shm.zig");
 const vfs = @import("../../fs/vfs.zig");
+const ext2_inode = @import("../../fs/ext2/inode.zig");
 const tlb = @import("../mmu/tlb.zig");
 const config = @import("../../config.zig");
 const Phys = @import("../../util/addr.zig").Phys;
@@ -33,6 +34,7 @@ const ENOMEM: i64 = 12;
 const EEXIST: i64 = 17;
 const ENODEV: i64 = 19;
 const EINVAL: i64 = 22;
+const EOVERFLOW: i64 = 75;
 
 inline fn err(e: i64) u64 {
     return @bitCast(-e);
@@ -149,7 +151,6 @@ pub fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, off: u64) u64 {
         else => return err(EINVAL),
     };
     const anon = flags & MAP_ANONYMOUS != 0;
-    const fixed = flags & (MAP_FIXED | MAP_FIXED_NOREPLACE) != 0;
     const p: u8 = @truncate(prot & PROT_MASK);
 
     const pcb = process.currentPCB() orelse return err(EINVAL);
@@ -160,42 +161,60 @@ pub fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, off: u64) u64 {
         if (!shared) region.flags = process.REGION_MERGEABLE;
     } else {
         if (fd >= config.MAX_FDS or !pcb.fd_table[fd].in_use) return err(EBADF);
-        // File mappings go through the page cache, which only ext2 has.
-        if (pcb.fd_table[fd].fs_type != .ext2) return err(ENODEV);
-        region.cache_inode = pcb.fd_table[fd].inode;
+        // File mappings go through the page cache, which only ext2 has,
+        // and only for regular files.
+        const fe = &pcb.fd_table[fd];
+        if (fe.fs_type != .ext2) return err(ENODEV);
+        const ino = ext2_inode.readInode(fe.inode) orelse return err(EBADF);
+        if (!ext2_inode.isReg(&ino)) return err(ENODEV);
+        // The cache keys pages by file offset; every page's must be one.
+        if (@as(i64, @bitCast(off)) < 0 or @addWithOverflow(off, len_pg)[1] != 0) return err(EOVERFLOW);
+        region.cache_inode = fe.inode;
         region.cache_off = off;
         region.cache_shared = shared;
+    }
+    // Before anything is unmapped: MAP_FIXED must not fail after it took
+    // the old mapping away for want of an shm object.
+    if (anon and shared) {
+        region.shm_id = shm.create(@intCast(len_pg / PAGE)) orelse return err(ENOMEM);
     }
 
     owner.as_lock.acquire();
     var rel = Release.init(owner, addr);
-    const start: u64 = blk: {
-        defer owner.as_lock.release();
-
-        const at: u64 = if (fixed) at: {
-            if (addr & (PAGE - 1) != 0) return err(EINVAL);
-            if (!rangeOk(addr, len_pg)) return err(ENOMEM);
-            if (flags & MAP_FIXED_NOREPLACE != 0) {
-                if (!owner.regions.isFree(addr, addr + len_pg)) return err(EEXIST);
-            } else {
-                unmapLocked(owner, &rel, addr, addr + len_pg) catch |e| return err(if (e == error.OutOfMemory) ENOMEM else EINVAL);
-            }
-            break :at addr;
-        } else place(owner, addr, len_pg) orelse return err(ENOMEM);
-
-        region.start = at;
-        region.end = at + len_pg;
-        if (anon and shared) {
-            region.shm_id = shm.create(@intCast(len_pg / PAGE)) orelse return err(ENOMEM);
-        }
-        if (!process.addRegion(owner.tgid, region)) {
-            if (region.shm_id != shm.SHM_INVALID) shm.release(region.shm_id);
-            return err(ENOMEM);
-        }
-        break :blk at;
-    };
+    const res = mapLocked(owner, &rel, &region, addr, len_pg, flags);
+    owner.as_lock.release();
     rel.writeBack();
-    return start;
+    return res catch |e| {
+        if (region.shm_id != shm.SHM_INVALID) shm.release(region.shm_id);
+        return err(switch (e) {
+            error.NoMemory => ENOMEM,
+            error.Exists => EEXIST,
+            error.Invalid => EINVAL,
+        });
+    };
+}
+
+/// mmap's placement and insert, under the write side. `region` comes back
+/// with its range set.
+fn mapLocked(owner: *process.PCB, rel: *Release, region: *LazyRegion, addr: u64, len_pg: u64, flags: u64) error{ NoMemory, Exists, Invalid }!u64 {
+    const at: u64 = if (flags & (MAP_FIXED | MAP_FIXED_NOREPLACE) != 0) at: {
+        if (addr & (PAGE - 1) != 0) return error.Invalid;
+        if (!rangeOk(addr, len_pg)) return error.NoMemory;
+        if (flags & MAP_FIXED_NOREPLACE != 0) {
+            if (!owner.regions.isFree(addr, addr + len_pg)) return error.Exists;
+        } else {
+            unmapLocked(owner, rel, addr, addr + len_pg) catch |e| return switch (e) {
+                error.OutOfMemory => error.NoMemory,
+                error.Unsplittable => error.Invalid,
+            };
+        }
+        break :at addr;
+    } else place(owner, addr, len_pg) orelse return error.NoMemory;
+
+    region.start = at;
+    region.end = at + len_pg;
+    if (!process.addRegion(owner.tgid, region.*)) return error.NoMemory;
+    return at;
 }
 
 /// Where a non-fixed mapping of `len` bytes goes: the hint if it is free,

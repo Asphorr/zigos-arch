@@ -33,6 +33,7 @@ const ext2_fs = @import("../../fs/ext2/ext2.zig");
 const heap = @import("../../mm/heap.zig");
 const memmap = @import("../../mm/memmap.zig");
 const config = @import("../../config.zig");
+const errno = @import("../../proc/errno.zig");
 const linux_mm = @import("linux_mm.zig");
 
 // --- Linux x86-64 errno (DISTINCT from zigos common.E_* — different values).
@@ -41,13 +42,17 @@ const EPERM: i64 = 1;
 const ENOENT: i64 = 2;
 const ESRCH: i64 = 3;
 const EBADF: i64 = 9;
+const EAGAIN: i64 = 11;
 const ENOMEM: i64 = 12;
 const EFAULT: i64 = 14;
 const ENOTDIR: i64 = 20;
 const EISDIR: i64 = 21;
 const EINVAL: i64 = 22;
 const ENOTTY: i64 = 25;
+const ETXTBSY: i64 = 26;
 const EFBIG: i64 = 27;
+const ENOSPC: i64 = 28;
+const EPIPE: i64 = 32;
 const ERANGE: i64 = 34;
 const ESPIPE: i64 = 29;
 const ENOSYS: i64 = 38;
@@ -264,6 +269,46 @@ inline fn rwLen(count: u64) u32 {
     return @intCast(@min(count, MAX_RW));
 }
 
+/// Most bytes one read from anything but an ext2 file asks for. Validating
+/// the buffer maps every page of it, so a read sized to a huge lazy reserve
+/// would commit all of it; pipes, consoles and sockets return short anyway.
+const MAX_STREAM_READ: u32 = 1 << 20;
+
+/// What a read of `count` bytes from `fd` can return at most: what is left
+/// of an ext2 file, MAX_STREAM_READ from anything else.
+fn readLen(pcb: *process.PCB, fd: u32, count: u64) u32 {
+    const len = rwLen(count);
+    if (fd >= pcb.fd_table.len or !pcb.fd_table[fd].in_use) return len;
+    const fe = &pcb.fd_table[fd];
+    if (fe.fs_type != .ext2) return @min(len, MAX_STREAM_READ);
+    const size = fdFileSize(fe);
+    if (fe.offset >= size) return 0;
+    return @intCast(@min(len, size - fe.offset));
+}
+
+/// A vfs read or write result as a Linux return: the count, or -errno for
+/// the codes vfs packs into the top of u32 (all ones, VFS_ERR, is a bad fd
+/// or an fd that can't do this).
+fn vfsResult(n: u32) u64 {
+    if (n < errno.ERR_SENTINEL_BASE) return n;
+    return err(switch (n) {
+        @intFromEnum(errno.Errno.ETXTBSY) => ETXTBSY,
+        @intFromEnum(errno.Errno.ENOSPC) => ENOSPC,
+        @intFromEnum(errno.Errno.EAGAIN) => EAGAIN,
+        @intFromEnum(errno.Errno.EPIPE) => EPIPE,
+        @intFromEnum(errno.Errno.EFAULT) => EFAULT,
+        @intFromEnum(errno.Errno.ENOMEM) => ENOMEM,
+        else => EBADF,
+    });
+}
+
+/// Linux read of an ext2 directory fd is -EISDIR.
+fn isDirFd(pcb: *process.PCB, fd: u32) bool {
+    if (fd >= pcb.fd_table.len or !pcb.fd_table[fd].in_use or pcb.fd_table[fd].fs_type != .ext2) return false;
+    const ino = ext2_inode.readInode(pcb.fd_table[fd].inode) orelse return false;
+    return ext2_inode.isDir(&ino);
+}
+
 /// write(fd, buf, count). Delegates to the same vfs.write the native path
 /// uses. Returns the byte count on success; a faulting buffer is -EFAULT.
 fn sysWrite(fd: u32, buf_va: u64, count: u64) u64 {
@@ -273,27 +318,17 @@ fn sysWrite(fd: u32, buf_va: u64, count: u64) u64 {
     const pcb = process.currentPCB() orelse return err(EFAULT);
     const buf: [*]const u8 = @ptrFromInt(buf_va);
     if (fd <= 2 and len <= 1024) debug.klog("[linux] write(fd={d}): {s}", .{ fd, buf[0..len] });
-    const n = vfs.write(pcb, fd, buf, len);
-    if (n == 0xFFFF_FFFF) return err(EBADF);
-    return n;
+    return vfsResult(vfs.write(pcb, fd, buf, len));
 }
 
-/// read(fd, buf, count). Delegates to vfs.read (returns 0 at EOF, 0xFFFFFFFF on
-/// bad fd). Linux read of a directory fd is -EISDIR.
+/// read(fd, buf, count). Delegates to vfs.read, which returns 0 at EOF.
 fn sysRead(fd: u32, buf_va: u64, count: u64) u64 {
-    if (count == 0) return 0;
-    const len = rwLen(count);
-    if (!common.validateUserPtrWrite(buf_va, len)) return err(EFAULT);
     const pcb = process.currentPCB() orelse return err(EFAULT);
-    if (fd < pcb.fd_table.len and pcb.fd_table[fd].in_use and pcb.fd_table[fd].fs_type == .ext2) {
-        if (ext2_inode.readInode(pcb.fd_table[fd].inode)) |ino| {
-            if (ext2_inode.isDir(&ino)) return err(EISDIR);
-        }
-    }
-    const buf: [*]u8 = @ptrFromInt(buf_va);
-    const n = vfs.read(pcb, fd, buf, len);
-    if (n == 0xFFFF_FFFF) return err(EBADF);
-    return n;
+    if (isDirFd(pcb, fd)) return err(EISDIR);
+    const len = readLen(pcb, fd, count);
+    if (len == 0) return 0;
+    if (!common.validateUserPtrWrite(buf_va, len)) return err(EFAULT);
+    return vfsResult(vfs.read(pcb, fd, @ptrFromInt(buf_va), len));
 }
 
 /// writev(fd, iov, iovcnt). musl's stdio writes everything through writev (the
@@ -323,9 +358,9 @@ fn sysWritev(fd: u32, iov_va: u64, iovcnt: u64) u64 {
         const buf: [*]const u8 = @ptrFromInt(base);
         if (fd <= 2 and l <= 1024) debug.klog("[linux] writev(fd={d}): {s}", .{ fd, buf[0..l] });
         const w = vfs.write(pcb, fd, buf, l);
-        if (w == 0xFFFF_FFFF) {
+        if (w >= errno.ERR_SENTINEL_BASE) {
             if (total > 0) return total;
-            return err(EBADF);
+            return vfsResult(w);
         }
         total += w;
         if (w < l) break; // short write — stop, report what landed
@@ -344,31 +379,28 @@ fn sysReadv(fd: u32, iov_va: u64, iovcnt: u64) u64 {
     const array_bytes = n * @sizeOf(Iovec);
     if (!common.validateUserPtr(iov_va, array_bytes)) return err(EFAULT);
     const pcb = process.currentPCB() orelse return err(EFAULT);
-    // Linux read of a directory fd is -EISDIR (same guard as sysRead).
-    if (fd < pcb.fd_table.len and pcb.fd_table[fd].in_use and pcb.fd_table[fd].fs_type == .ext2) {
-        if (ext2_inode.readInode(pcb.fd_table[fd].inode)) |ino| {
-            if (ext2_inode.isDir(&ino)) return err(EISDIR);
-        }
-    }
+    if (isDirFd(pcb, fd)) return err(EISDIR);
     const iov: [*]align(1) const Iovec = @ptrFromInt(iov_va);
+    // readLen over the whole call; the segments draw on it in turn.
+    var budget = readLen(pcb, fd, MAX_RW);
     var total: u64 = 0;
     var i: usize = 0;
-    while (i < n) : (i += 1) {
+    while (i < n and budget > 0) : (i += 1) {
         const base = iov[i].base;
         const seg = iov[i].len;
         if (seg == 0) continue;
-        const l = rwLen(seg);
+        const l = @min(rwLen(seg), budget);
         if (!common.validateUserPtrWrite(base, l)) {
             if (total > 0) return total;
             return err(EFAULT);
         }
-        const buf: [*]u8 = @ptrFromInt(base);
-        const r = vfs.read(pcb, fd, buf, l);
-        if (r == 0xFFFF_FFFF) {
+        const r = vfs.read(pcb, fd, @ptrFromInt(base), l);
+        if (r >= errno.ERR_SENTINEL_BASE) {
             if (total > 0) return total;
-            return err(EBADF);
+            return vfsResult(r);
         }
         total += r;
+        budget -= r;
         if (r < l) break; // short read / EOF — stop
     }
     return total;
@@ -586,7 +618,8 @@ fn sysGetdents64(fd: u32, buf_va: u64, count: u64) u64 {
     if (fe.fs_type != .ext2) return err(ENOTDIR);
     const dino = ext2_inode.readInode(fe.inode) orelse return err(EBADF);
     if (!ext2_inode.isDir(&dino)) return err(ENOTDIR);
-    const cap = rwLen(count);
+    // MAX_DIR_ENTS records take at most 14 KB; don't map more buffer.
+    const cap = @min(rwLen(count), 64 * 1024);
     if (cap < 32) return err(EINVAL);
     if (!common.validateUserPtrWrite(buf_va, cap)) return err(EFAULT);
 
@@ -639,12 +672,12 @@ fn sysPread(fd: u32, buf_va: u64, count: u64, off: u64) u64 {
         .file => |f| f,
         .fail => |e| return e,
     };
-    if (count == 0) return 0;
-    const len = rwLen(count);
+    if (isDirFd(pcb, fd)) return err(EISDIR);
+    const size = fdFileSize(fe);
+    if (off >= size) return 0;
+    const len: u32 = @intCast(@min(rwLen(count), size - off));
+    if (len == 0) return 0;
     if (!common.validateUserPtrWrite(buf_va, len)) return err(EFAULT);
-    if (ext2_inode.readInode(fe.inode)) |ino| {
-        if (ext2_inode.isDir(&ino)) return err(EISDIR);
-    }
     return vfs.readThroughCache(fe.inode, off, @ptrFromInt(buf_va), len);
 }
 
@@ -664,8 +697,7 @@ fn sysPwrite(fd: u32, buf_va: u64, count: u64, off: u64) u64 {
     fe.offset = @intCast(off);
     const n = vfs.write(pcb, fd, @ptrFromInt(buf_va), len);
     fe.offset = saved;
-    if (n == 0xFFFF_FFFF) return err(EBADF);
-    return n;
+    return vfsResult(n);
 }
 
 const RLIMIT_STACK: u64 = 3;
