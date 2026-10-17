@@ -60,6 +60,16 @@ pub fn init() void {
     debug.klog("[block] using IDE/ATA\n", .{});
 }
 
+/// Wait, a second at most, for the commands of killed tasks to leave the
+/// devices, so a rewrite of the same sectors can't be overtaken by one.
+/// Task context. Only NVMe tracks such commands.
+pub fn waitAbandoned() void {
+    if (backend != .nvme) return;
+    var d = @import("../util/deadline.zig").Deadline.ms(1000, "abandoned disk commands");
+    while (nvme.abandonedInFlight() != 0 and d.live()) @import("../proc/sched_asm.zig").softYield();
+    if (nvme.abandonedInFlight() != 0) debug.klog("[block] commands of killed tasks still in the device after 1 s\n", .{});
+}
+
 pub fn readSector(lba: u32, dest: [*]u8) void {
     switch (backend) {
         .none => {},

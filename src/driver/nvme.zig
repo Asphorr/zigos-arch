@@ -324,6 +324,9 @@ const NvmeWaiter = struct {
     /// TSC at the doorbell and when reapCq saw the completion (latency stats).
     submit_tsc: u64 = 0, // doorbell-fenced
     reap_tsc: u64 = 0, // written before `completed` (release)
+    /// The owner died with the command in the device: reapCq frees the slot
+    /// on its completion, so the bounce buffer stays the device's till then.
+    abandoned: bool = false, // cq_lock
 };
 
 /// Command latency split, for the I/O probes: doorbell -> reapCq sees the
@@ -1425,6 +1428,7 @@ fn allocCid(c: *Controller) ?u16 {
         c.waiters[i].status_code = 0;
         c.waiters[i].wake = .{ .pid = 0xFF };
         c.waiters[i].sq_slot = 0xFFFF;
+        c.waiters[i].abandoned = false;
         return packCid(i, new_gen);
     }
     return null;
@@ -1488,7 +1492,11 @@ fn reapCq(c: *Controller) bool {
             const slot_idx = cidSlot(cid);
             const expected_gen = cidGen(cid);
             const w = &c.waiters[slot_idx];
-            if (w.active and w.gen == expected_gen) {
+            if (w.active and w.gen == expected_gen and w.abandoned) {
+                // Its task died; nobody waits. The slot comes free.
+                w.abandoned = false;
+                @atomicStore(bool, &w.active, false, .release);
+            } else if (w.active and w.gen == expected_gen) {
                 w.status_code = sc;
                 w.success = (sc == 0);
                 w.reap_tsc = @import("../debug/perf.zig").rdtsc();
@@ -2489,24 +2497,45 @@ fn readSectorsPipelined(c: *Controller, ctrl_idx: u32, lba: u32, count: u32, des
 /// from process teardown (lifecycle.tearDownTask): a task killed while parked
 /// in `readSectorsPipelined`'s wave-wait holds up to PIPELINE_DEPTH CIDs
 /// (`.wake = .pid(pid)`); without this they'd stay active=true forever and
-/// slowly starve the queue. Safe even if the device completes one of these
-/// after teardown — a late CQE for a freed slot hits reapCq's orphan branch
-/// (gen mismatch on the slot's next reuse), and `wake` against the now-dead
-/// pid is a no-op. The `.cb` (io_uring) slots are reclaimed by releaseAllForPid.
+/// slowly starve the queue. A slot whose command is still in the device is
+/// only marked abandoned: its bounce buffer is the device's until the
+/// completion, and reapCq frees it then. The `.cb` (io_uring) slots are
+/// reclaimed by releaseAllForPid.
 pub fn reclaimWaitersForPid(pid: u8) void {
     var ci: usize = 0;
-    while (ci < num_controllers) : (ci += 1) {
-        const c = &controllers[ci];
-        var s: usize = 0;
-        while (s < Q_DEPTH) : (s += 1) {
-            const w = &c.waiters[s];
-            if (!@atomicLoad(bool, &w.active, .acquire)) continue;
-            switch (w.wake) {
-                .pid => |p| if (p == pid) @atomicStore(bool, &w.active, false, .release),
-                .cb => {},
-            }
+    while (ci < num_controllers) : (ci += 1) abandonWaitersOf(&controllers[ci], pid);
+}
+
+fn abandonWaitersOf(c: *Controller, pid: u8) void {
+    // Against reapCq: a slot either completed before this or is freed by it.
+    const cqh = c.cq.acquireIrqSave();
+    defer cqh.release();
+    var s: usize = 0;
+    while (s < Q_DEPTH) : (s += 1) {
+        const w = &c.waiters[s];
+        if (!@atomicLoad(bool, &w.active, .acquire)) continue;
+        switch (w.wake) {
+            .pid => |p| if (p == pid) {
+                // sq_slot is set under the SQ lock with the doorbell: unset,
+                // the command never reached the device.
+                const in_device = w.sq_slot != 0xFFFF and !@atomicLoad(bool, &w.completed, .acquire);
+                if (in_device) w.abandoned = true else @atomicStore(bool, &w.active, false, .release);
+            },
+            .cb => {},
         }
     }
+}
+
+/// Commands of killed tasks still in a device (see abandonWaitersOf).
+pub fn abandonedInFlight() u32 {
+    var n: u32 = 0;
+    var ci: usize = 0;
+    while (ci < num_controllers) : (ci += 1) {
+        for (&controllers[ci].waiters) |*w| {
+            if (@atomicLoad(bool, &w.active, .acquire) and @atomicLoad(bool, &w.abandoned, .acquire)) n += 1;
+        }
+    }
+    return n;
 }
 
 /// Block size for `ctrl_idx`. Used by io_uring to compute the byte-len
