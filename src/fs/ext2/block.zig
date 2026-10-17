@@ -17,9 +17,13 @@
 //     -> pmm.
 //   * A buffer that is pinned, dirty or under writeback is never evicted or
 //     reclaimed. Block ops pin across their copy; flush marks writeback
-//     across its I/O.
+//     across its I/O. Pins are taken and dropped under the mount lock, so a
+//     dead lock holder's pins are all of them (dropPins).
+//   * A new buffer is findable only once its contents are: a copy from user
+//     memory can fault, and the fault can read the same block back.
 //   * Buffers reach the device only through flush, one flush at a time
-//     (flush_lock), so two writes of one block never race in the device.
+//     (flush_lock), so two writes of one block never race in the device; a
+//     flush whose task died is waited out (recoverDeadFlush).
 
 const std = @import("std");
 const layout = @import("layout.zig");
@@ -161,6 +165,7 @@ pub fn releaseLockIfHeld(pid: u16) void {
     // writeBgdTable/writeSuperblock (any alloc/free outside a defer
     // scope) records current state, which subsumes the lost one.
     self.meta_defer_depth = 0;
+    dropPins(self);
     const tid: u32 = @truncate(@intFromPtr(&self.lock_owner));
     @atomicStore(u16, &self.lock_owner, 0xFFFF, .release);
     @import("../../proc/sched.zig").wakeMutexWaiters(tid);
@@ -276,7 +281,7 @@ pub fn readBlock(self: *Mount, block_num: u32, dst: []u8) bool {
     defer unlockMount(self);
     if (block_num == 0 or block_num >= self.sb.blocks_count) return false;
     if (dst.len != self.block_size) return false;
-    const i = getBuf(self, block_num, .read) orelse return false;
+    const i = getBuf(self, block_num) orelse return false;
     @memcpy(dst, dataOf(i)[0..self.block_size]);
     unpin(i);
     return true;
@@ -290,7 +295,7 @@ pub fn readBlockBytes(self: *Mount, block_num: u32, byte_off: u32, dst: []u8) bo
     defer unlockMount(self);
     if (block_num == 0 or block_num >= self.sb.blocks_count) return false;
     if (byte_off + dst.len > self.block_size) return false;
-    const i = getBuf(self, block_num, .read) orelse return false;
+    const i = getBuf(self, block_num) orelse return false;
     @memcpy(dst, dataOf(i)[byte_off .. byte_off + dst.len]);
     unpin(i);
     return true;
@@ -307,10 +312,8 @@ pub fn writeBlock(self: *Mount, block_num: u32, src: []const u8) bool {
     defer unlockMount(self);
     if (block_num == 0 or block_num >= self.sb.blocks_count) return false;
     if (src.len != self.block_size) return false;
-    const i = getBuf(self, block_num, .overwrite) orelse return false;
-    @memcpy(dataOf(i)[0..self.block_size], src);
-    markDirtyUnpin(i);
-    throttle(self);
+    if (!overwrite(self, block_num, src)) return false;
+    throttle();
     return true;
 }
 
@@ -323,7 +326,7 @@ pub fn writeBlockBytes(self: *Mount, block_num: u32, byte_off: u32, src: []const
     if (block_num == 0 or block_num >= self.sb.blocks_count) return false;
     if (byte_off + src.len > self.block_size) return false;
     if (!patchBlock(self, block_num, byte_off, src)) return false;
-    throttle(self);
+    throttle();
     return true;
 }
 
@@ -407,11 +410,9 @@ pub fn writeBlockRun(self: *Mount, first_block: u32, n_blocks: u32, src: [*]cons
     const bs = self.block_size;
     var k: u32 = 0;
     while (k < n_blocks) : (k += 1) {
-        const i = getBuf(self, first_block + k, .overwrite) orelse return false;
-        @memcpy(dataOf(i)[0..bs], src[k * bs ..][0..bs]);
-        markDirtyUnpin(i);
+        if (!overwrite(self, first_block + k, src[k * bs ..][0..bs])) return false;
     }
-    throttle(self);
+    throttle();
     return true;
 }
 
@@ -454,7 +455,7 @@ pub fn freeBlock(self: *Mount, block_num: u32) bool {
     const mask: u8 = @as(u8, 1) << bit;
 
     const bgd = &self.bgd[group];
-    const bi = getBuf(self, bgd.block_bitmap, .read) orelse return false;
+    const bi = getBuf(self, bgd.block_bitmap) orelse return false;
     const bitmap = dataOf(bi);
     if (bitmap[byte_idx] & mask == 0) {
         unpin(bi);
@@ -473,7 +474,7 @@ pub fn freeBlock(self: *Mount, block_num: u32) bool {
 
 fn allocBlockInGroup(self: *Mount, group: u32) ?u32 {
     const bgd = &self.bgd[group];
-    const bi = getBuf(self, bgd.block_bitmap, .read) orelse return null;
+    const bi = getBuf(self, bgd.block_bitmap) orelse return null;
     const bitmap = dataOf(bi)[0..self.block_size];
 
     var byte_idx: u32 = 0;
@@ -531,6 +532,9 @@ const Buf = struct {
     /// descriptors chain through lru_next.
     lru_prev: u32,
     lru_next: u32,
+    /// Dirty-list neighbours, oldest dirtied first.
+    dirty_prev: u32,
+    dirty_next: u32,
 };
 
 // All under cache_lock.
@@ -539,6 +543,8 @@ var buckets: [HASH_BUCKETS]u32 = undefined;
 var free_desc: u32 = NO_BUF;
 var lru_head: u32 = NO_BUF;
 var lru_tail: u32 = NO_BUF;
+var dirty_head: u32 = NO_BUF;
+var dirty_tail: u32 = NO_BUF;
 /// Descriptors holding a frame.
 var live: u32 = 0;
 var dirty_count: u32 = 0;
@@ -548,6 +554,9 @@ var cache_lock: spinlock.SpinLock = .{};
 /// Serializes flushes; see flush. Registered, so a task killed mid-flush
 /// doesn't keep it.
 var flush_lock: spinlock.Mutex = .{};
+/// A flush is in progress (flush_lock). Found set by the next flush: the
+/// last one's task died in it.
+var flush_running: bool = false;
 /// Gathered dirty buffers of the running flush, with the generation each
 /// had before its copy. Owned by the flush_lock holder.
 var flush_batch: [FLUSH_BATCH]u32 = undefined;
@@ -582,7 +591,7 @@ fn initCache() void {
     for (&buckets) |*b| b.* = NO_BUF;
     var i: u32 = 0;
     while (i < MAX_BUFS) : (i += 1) {
-        bufs[i] = .{ .mount = null, .blk = 0, .frame = Phys.of(0), .gen = 0, .pins = 0, .dirty = false, .writeback = false, .hash_next = NO_BUF, .lru_prev = NO_BUF, .lru_next = if (i + 1 < MAX_BUFS) i + 1 else NO_BUF };
+        bufs[i] = .{ .mount = null, .blk = 0, .frame = Phys.of(0), .gen = 0, .pins = 0, .dirty = false, .writeback = false, .hash_next = NO_BUF, .lru_prev = NO_BUF, .lru_next = if (i + 1 < MAX_BUFS) i + 1 else NO_BUF, .dirty_prev = NO_BUF, .dirty_next = NO_BUF };
     }
     free_desc = 0;
     spinlock.registerLock("ext2.cache", &cache_lock);
@@ -665,18 +674,42 @@ fn lruPushTail(i: u32) void {
     lru_tail = i;
 }
 
+/// Buffer `i` now differs from the disk.
+fn setDirty(i: u32) void {
+    const b = &bufs[i];
+    if (b.dirty) return;
+    b.dirty = true;
+    dirty_count += 1;
+    b.dirty_next = NO_BUF;
+    b.dirty_prev = dirty_tail;
+    if (dirty_tail != NO_BUF) bufs[dirty_tail].dirty_next = i else dirty_head = i;
+    dirty_tail = i;
+}
+
+fn clearDirty(i: u32) void {
+    const b = &bufs[i];
+    if (!b.dirty) return;
+    b.dirty = false;
+    dirty_count -= 1;
+    const p = b.dirty_prev;
+    const n = b.dirty_next;
+    if (p != NO_BUF) bufs[p].dirty_next = n else dirty_head = n;
+    if (n != NO_BUF) bufs[n].dirty_prev = p else dirty_tail = p;
+}
+
 inline fn evictable(i: u32) bool {
     const b = &bufs[i];
     return b.pins == 0 and !b.dirty and !b.writeback;
 }
 
 /// Take a clean, idle buffer off the cold end of the LRU for reuse, frame
-/// and all. Null when none is near the cold end.
-fn evictOne() ?u32 {
+/// and all, passing over the `spare` coldest entries. Null when none is
+/// near the cold end.
+fn evictOne(spare: u32) ?u32 {
     var i = lru_tail;
     var looked: u32 = 0;
-    while (i != NO_BUF and looked < EVICT_SCAN_BUFS) : (looked += 1) {
-        if (evictable(i)) {
+    while (i != NO_BUF and looked < spare + EVICT_SCAN_BUFS) : (looked += 1) {
+        if (looked >= spare and evictable(i)) {
             hashRemove(i);
             lruUnlink(i);
             return i;
@@ -686,18 +719,27 @@ fn evictOne() ?u32 {
     return null;
 }
 
-const Fill = enum { read, overwrite };
-
-/// Buffer holding `blk` of `m`, pinned; on a miss read from disk when `fill`
-/// is .read, left with stale bytes for the caller to overwrite when
-/// .overwrite. Caller holds the mount lock and unpins. Null on a read error
-/// or when no buffer can be had.
-fn getBuf(m: *Mount, blk: u32, fill: Fill) ?u32 {
+/// Buffer holding `blk` of `m`, pinned, read from disk on a miss. Caller
+/// holds the mount lock and unpins. Null on a read error or when no buffer
+/// can be had.
+fn getBuf(m: *Mount, blk: u32) ?u32 {
+    // Bitmap block numbers come off the disk unchecked.
+    if (blk >= m.sb.blocks_count) return null;
     if (pinCached(m, blk)) |i| return i;
-    return switch (fill) {
-        .read => readIn(m, blk),
-        .overwrite => newBuf(m, blk),
-    };
+    return readIn(m, blk);
+}
+
+/// Replace block `blk` of `m` with `src`. Mount lock held.
+fn overwrite(m: *Mount, blk: u32, src: []const u8) bool {
+    if (pinCached(m, blk)) |i| {
+        @memcpy(dataOf(i)[0..src.len], src);
+        markDirtyUnpin(i);
+        return true;
+    }
+    const i = newBuf(m, blk) orelse return false;
+    @memcpy(dataOf(i)[0..src.len], src);
+    publishDirty(i, src.len);
+    return true;
 }
 
 /// `blk` of `m` pinned and made most recent, if cached.
@@ -736,12 +778,14 @@ fn readIn(m: *Mount, blk: u32) ?u32 {
     const bs = m.block_size;
     const first = newBuf(m, blk) orelse return null;
     @memcpy(dataOf(first)[0..bs], m.read_stage[0..bs]);
+    publish(first);
     var k: u32 = 1;
     while (k < n) : (k += 1) {
-        // Read-ahead is a guess: never flush or overcommit for it.
-        const i = claimBuf(m, blk + k, false) orelse break;
+        // Read-ahead is a guess: never flush or overcommit for it, nor
+        // evict the read-ahead just done (the k-1 coldest buffers).
+        const i = claimBuf(m, blk + k, false, k - 1) orelse break;
         @memcpy(dataOf(i)[0..bs], m.read_stage[k * bs ..][0..bs]);
-        unpinCold(i);
+        publishCold(i);
     }
     cache_lock.acquire();
     counters.read_blocks += n;
@@ -749,26 +793,57 @@ fn readIn(m: *Mount, blk: u32) ?u32 {
     return first;
 }
 
-/// Unpin a read-ahead buffer and send it to the cold end of the LRU.
-fn unpinCold(i: u32) void {
+/// Make a filled buffer findable; it stays pinned.
+fn publish(i: u32) void {
     cache_lock.acquire();
     defer cache_lock.release();
+    hashInsert(i);
+}
+
+/// Make a filled read-ahead buffer findable, unpinned, at the cold end of
+/// the LRU.
+fn publishCold(i: u32) void {
+    cache_lock.acquire();
+    defer cache_lock.release();
+    hashInsert(i);
     bufs[i].pins -= 1;
     lruUnlink(i);
     lruPushTail(i);
 }
 
-/// A pinned buffer for `blk` of `m` (not cached before), its bytes stale.
-/// Grows the cache while under cap() and memory is plentiful, else reuses
-/// the coldest clean buffer; with nothing clean, flushes `m` and tries again,
-/// and as a last resort takes a frame past the cap.
-fn newBuf(m: *Mount, blk: u32) ?u32 {
-    if (claimBuf(m, blk, false)) |i| return i;
-    _ = flush(m);
-    return claimBuf(m, blk, true);
+/// Make a buffer the caller filled with `len` new bytes findable, dirty and
+/// unpinned. If the fill faulted and the fault read the block in meanwhile,
+/// that buffer takes the bytes and this one goes back unused.
+fn publishDirty(i: u32, len: usize) void {
+    cache_lock.acquire();
+    defer cache_lock.release();
+    if (find(bufs[i].mount.?, bufs[i].blk)) |j| {
+        @memcpy(dataOf(j)[0..len], dataOf(i)[0..len]);
+        bufs[j].gen +%= 1;
+        setDirty(j);
+        bufs[i].pins -= 1;
+        lruUnlink(i);
+        lruPushTail(i);
+        return;
+    }
+    hashInsert(i);
+    bufs[i].gen +%= 1;
+    setDirty(i);
+    bufs[i].pins -= 1;
 }
 
-fn claimBuf(m: *Mount, blk: u32, any_frame: bool) ?u32 {
+/// A pinned buffer for `blk` of `m` (not cached before), its bytes stale and
+/// not yet findable: the caller fills it, then publishes it. Grows the cache
+/// while under cap() and memory is plentiful, else reuses the coldest clean
+/// buffer; with nothing clean, flushes and tries again, and as a last
+/// resort takes a frame past the cap.
+fn newBuf(m: *Mount, blk: u32) ?u32 {
+    if (claimBuf(m, blk, false, 0)) |i| return i;
+    _ = flush(null);
+    return claimBuf(m, blk, true, 0);
+}
+
+fn claimBuf(m: *Mount, blk: u32, any_frame: bool, spare: u32) ?u32 {
     const free_floor = pmm.managedFrameCount() / 8;
     const grow = any_frame or (@atomicLoad(u32, &live, .monotonic) < cap() and pmm.freeFrameCount() > free_floor);
     var frame: ?Phys = if (grow) pmm.allocFrame() else null;
@@ -781,7 +856,7 @@ fn claimBuf(m: *Mount, blk: u32, any_frame: bool) ?u32 {
         bufs[i].frame = frame.?;
         frame = null;
         live += 1;
-    } else if (evictOne()) |e| {
+    } else if (evictOne(spare)) |e| {
         i = e;
     }
     if (frame) |f| pmm.releaseFrame(f); // no descriptor left for it
@@ -793,7 +868,6 @@ fn claimBuf(m: *Mount, blk: u32, any_frame: bool) ?u32 {
     b.pins = 1;
     b.dirty = false;
     b.writeback = false;
-    hashInsert(i);
     lruPushHead(i);
     return i;
 }
@@ -808,18 +882,14 @@ fn unpin(i: u32) void {
 fn markDirtyUnpin(i: u32) void {
     cache_lock.acquire();
     defer cache_lock.release();
-    const b = &bufs[i];
-    b.gen +%= 1;
-    if (!b.dirty) {
-        b.dirty = true;
-        dirty_count += 1;
-    }
-    b.pins -= 1;
+    bufs[i].gen +%= 1;
+    setDirty(i);
+    bufs[i].pins -= 1;
 }
 
 /// Overwrite part of a block, reading the rest in on a miss. Mount lock held.
 fn patchBlock(m: *Mount, blk: u32, off: u32, src: []const u8) bool {
-    const i = getBuf(m, blk, .read) orelse return false;
+    const i = getBuf(m, blk) orelse return false;
     @memcpy(dataOf(i)[off .. off + src.len], src);
     markDirtyUnpin(i);
     return true;
@@ -830,17 +900,35 @@ fn discard(m: *Mount, blk: u32) void {
     cache_lock.acquire();
     defer cache_lock.release();
     const i = find(m, blk) orelse return;
-    const b = &bufs[i];
-    if (b.dirty and b.pins == 0) {
-        b.dirty = false;
-        b.gen +%= 1; // a flush already copying it must not count it written
-        dirty_count -= 1;
+    if (bufs[i].dirty and bufs[i].pins == 0) {
+        bufs[i].gen +%= 1; // a flush already copying it must not count it written
+        clearDirty(i);
     }
 }
 
-/// Too much dirty data: write `m` out before taking more. Mount lock held.
-fn throttle(m: *Mount) void {
-    if (@atomicLoad(u32, &dirty_count, .monotonic) > dirtyLimit()) _ = flush(m);
+/// Too much dirty data: write it out before taking more. Mount lock may be
+/// held (flush takes none).
+fn throttle() void {
+    if (@atomicLoad(u32, &dirty_count, .monotonic) > dirtyLimit()) _ = flush(null);
+}
+
+/// The holder of `m`'s lock died. Every pin on `m`'s buffers was its own,
+/// and a pinned buffer may have been half changed, so it goes out again;
+/// one not yet findable was only being filled and is just let go.
+fn dropPins(m: *Mount) void {
+    if (!cache_ready) return;
+    cache_lock.acquire();
+    defer cache_lock.release();
+    var i: u32 = 0;
+    while (i < MAX_BUFS) : (i += 1) {
+        const b = &bufs[i];
+        if (b.pins == 0 or !owns(i, m)) continue;
+        b.pins = 0;
+        if (find(m, b.blk) == i) {
+            b.gen +%= 1;
+            setDirty(i);
+        }
+    }
 }
 
 /// Write every dirty buffer of `only` (all mounts when null) to the disk;
@@ -856,7 +944,9 @@ pub fn flush(only: ?*Mount) u32 {
     if (!cache_ready) return 0;
     flush_lock.acquire();
     defer flush_lock.release();
-    clearStaleWriteback();
+    if (flush_running) recoverDeadFlush();
+    flush_running = true;
+    defer flush_running = false;
     var written: u32 = 0;
     // Rounds enough for what is dirty now; a writer re-dirtying buffers as
     // fast as they go out must not keep the flush going forever.
@@ -890,8 +980,15 @@ pub fn flush(only: ?*Mount) u32 {
     return written;
 }
 
-/// Writeback marks are set and cleared only by the flush_lock holder; one
-/// seen at the start of a flush was left by a flush whose task died.
+/// The last flush's task died in it: its writeback marks are stale, and its
+/// last write may still be in the device, where a rewrite of the same
+/// blocks could land before it. Clear the marks and let that write finish.
+fn recoverDeadFlush() void {
+    clearStaleWriteback();
+    blkdev.waitAbandoned();
+}
+
+/// Writeback marks are set and cleared only by the flush_lock holder.
 fn clearStaleWriteback() void {
     cache_lock.acquire();
     defer cache_lock.release();
@@ -904,11 +1001,10 @@ fn gatherDirty(only: ?*Mount) u32 {
     cache_lock.acquire();
     defer cache_lock.release();
     var n: u32 = 0;
-    if (dirty_count == 0) return 0;
-    var i: u32 = 0;
-    while (i < MAX_BUFS and n < FLUSH_BATCH) : (i += 1) {
+    var i = dirty_head;
+    while (i != NO_BUF and n < FLUSH_BATCH) : (i = bufs[i].dirty_next) {
         const b = &bufs[i];
-        if (!b.dirty or b.writeback or b.mount == null) continue;
+        if (b.writeback) continue;
         if (only) |m| if (!owns(i, m)) continue;
         b.writeback = true;
         flush_batch[n] = i;
@@ -943,20 +1039,18 @@ fn finishRun(k: u32, run: u32, ok: bool) void {
     defer cache_lock.release();
     var r: u32 = 0;
     while (r < run) : (r += 1) {
-        const b = &bufs[flush_batch[k + r]];
-        b.writeback = false;
-        if (ok and b.dirty and b.gen == flush_gen[k + r]) {
-            b.dirty = false;
-            dirty_count -= 1;
-        }
+        const i = flush_batch[k + r];
+        bufs[i].writeback = false;
+        if (ok and bufs[i].gen == flush_gen[k + r]) clearDirty(i);
     }
     counters.flushed_blocks += if (ok) run else 0;
     counters.flush_cmds += 1;
 }
 
 /// Drop every buffer of `m` without writing it: the disk under `m` was
-/// rewritten behind the cache (mkfs before a remount). Buffers of `m`
-/// still pinned or under writeback stay; nothing uses an unmounted slot.
+/// rewritten behind the cache (mkfs before a remount). A buffer of `m`
+/// still pinned or under writeback (a dead flush's) can't be freed yet; it
+/// is made clean and unfindable, and goes once idle.
 pub fn forget(m: *Mount) void {
     if (!cache_ready) return;
     cache_lock.acquire();
@@ -964,13 +1058,16 @@ pub fn forget(m: *Mount) void {
     var i: u32 = 0;
     while (i < MAX_BUFS) : (i += 1) {
         const b = &bufs[i];
-        if (b.mount != m or b.pins != 0 or b.writeback) continue;
-        if (b.dirty) dirty_count -= 1;
+        if (!owns(i, m)) continue;
+        clearDirty(i);
         hashRemove(i);
+        if (b.pins != 0 or b.writeback) {
+            b.gen +%= 1;
+            continue;
+        }
         lruUnlink(i);
         pmm.releaseFrame(b.frame);
         b.mount = null;
-        b.dirty = false;
         b.lru_next = free_desc;
         free_desc = i;
         live -= 1;
