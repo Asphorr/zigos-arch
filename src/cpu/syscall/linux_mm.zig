@@ -76,19 +76,34 @@ fn lead() ?*process.PCB {
 }
 
 /// What munmap and MAP_FIXED do to every piece they take out of the set:
-/// unmap its pages and release what backs it. Writeback of MAP_SHARED file
-/// pieces is left to the caller, outside the lock.
+/// unmap its pages and release what backs it. The pages' frames wait in
+/// `rc` for the caller's shootdown; writeback of MAP_SHARED file pieces is
+/// left to the caller, outside the lock.
 const Release = struct {
     pd: [*]align(4096) u64,
     owner: *process.PCB,
+    rc: vmm.Reclaim,
+    /// Start of the range being taken out. Pieces come in ascending order,
+    /// so everything in `rc` lies in [lo, the current piece's end).
+    lo: u64,
     flush: [MAX_FLUSH_INODES]u32 = undefined,
     n_flush: usize = 0,
 
+    fn init(owner: *process.PCB, lo: u64) Release {
+        return .{ .pd = owner.page_directory.?, .owner = owner, .rc = .{ .pcid = owner.pcid }, .lo = lo };
+    }
+
     pub fn removed(self: *Release, r: LazyRegion) void {
-        _ = vmm.unmapUserRange(self.pd, r.start, r.end);
-        if (r.shm_id != shm.SHM_INVALID) shm.release(r.shm_id);
-        if (r.buf_owned) {
-            if (r.source) |src| pmm.releaseContiguous(Phys.of(paging.virtToPhys(@intFromPtr(src)).?), r.buf_pages);
+        _ = vmm.unmapUserRange(self.pd, r.start, r.end, &self.rc);
+        if (r.unsplittable()) {
+            // Its buffer or shm pages may go with this reference: no CPU
+            // may still reach them, nor anything collected before them.
+            tlb.shootdownRange(self.owner.pcid, self.lo, (r.end - self.lo) / PAGE);
+            self.rc.release();
+            if (r.shm_id != shm.SHM_INVALID) shm.release(r.shm_id);
+            if (r.buf_owned) {
+                if (r.source) |src| pmm.releaseContiguous(Phys.of(paging.virtToPhys(@intFromPtr(src)).?), r.buf_pages);
+            }
         }
         if (r.cache_inode != 0 and r.cache_shared and self.n_flush < MAX_FLUSH_INODES) {
             self.flush[self.n_flush] = r.cache_inode;
@@ -116,8 +131,12 @@ fn splitsUnsplittable(owner: *process.PCB, start: u64, end: u64) bool {
 /// Take [start, end) out of the address space. Under the write side.
 fn unmapLocked(owner: *process.PCB, rel: *Release, start: u64, end: u64) error{ OutOfMemory, Unsplittable }!void {
     if (splitsUnsplittable(owner, start, end)) return error.Unsplittable;
+    // Also when remove fails part way: what it unmapped is in rel.rc.
+    defer {
+        tlb.shootdownRange(owner.pcid, start, (end - start) / PAGE);
+        rel.rc.release();
+    }
     try owner.regions.remove(start, end, rel);
-    tlb.shootdownRange(owner.pcid, start, (end - start) / PAGE);
 }
 
 pub fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, off: u64) u64 {
@@ -135,7 +154,6 @@ pub fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, off: u64) u64 {
 
     const pcb = process.currentPCB() orelse return err(EINVAL);
     const owner = lead() orelse return err(EINVAL);
-    const pd = owner.page_directory.?;
 
     var region: LazyRegion = .{ .prot = p };
     if (anon) {
@@ -150,7 +168,7 @@ pub fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, off: u64) u64 {
     }
 
     owner.as_lock.acquire();
-    var rel: Release = .{ .pd = pd, .owner = owner };
+    var rel = Release.init(owner, addr);
     const start: u64 = blk: {
         defer owner.as_lock.release();
 
@@ -198,7 +216,7 @@ pub fn munmap(addr: u64, len: u64) u64 {
     const owner = lead() orelse return err(EINVAL);
 
     owner.as_lock.acquire();
-    var rel: Release = .{ .pd = owner.page_directory.?, .owner = owner };
+    var rel = Release.init(owner, addr);
     const res = unmapLocked(owner, &rel, addr, addr + len_pg);
     owner.as_lock.release();
     rel.writeBack();
@@ -254,8 +272,10 @@ pub fn madvise(addr: u64, len: u64, advice: u64) u64 {
     // copy goes) or the same shared frame again (shm, MAP_SHARED file).
     owner.as_lock.acquire();
     defer owner.as_lock.release();
-    _ = vmm.unmapUserRange(owner.page_directory.?, addr, addr + len_pg);
+    var rc: vmm.Reclaim = .{ .pcid = owner.pcid };
+    _ = vmm.unmapUserRange(owner.page_directory.?, addr, addr + len_pg, &rc);
     tlb.shootdownRange(owner.pcid, addr, len_pg / PAGE);
+    rc.release();
     return 0;
 }
 
@@ -290,8 +310,10 @@ pub fn brk(addr: u64) u64 {
         const lo = @max(new_pg, r.start);
         const hi = r.end;
         if (lo < hi) {
-            _ = vmm.unmapUserRange(owner.page_directory.?, lo, hi);
+            var rc: vmm.Reclaim = .{ .pcid = owner.pcid };
+            _ = vmm.unmapUserRange(owner.page_directory.?, lo, hi, &rc);
             tlb.shootdownRange(owner.pcid, lo, (hi - lo) / PAGE);
+            rc.release();
             if (lo == r.start) {
                 const Drop = struct {
                     pub fn removed(_: @This(), _: LazyRegion) void {}

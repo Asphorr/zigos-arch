@@ -95,10 +95,12 @@ pub fn sysSbrk(increment: u32) u32 {
         });
 
         const pml4: [*]align(4096) u64 = @ptrCast(@alignCast(lead.page_directory.?));
-        _ = vmm.unmapUserRange(pml4, new_brk_shrink, old_brk);
+        var rc: vmm.Reclaim = .{ .pcid = lead.pcid };
+        _ = vmm.unmapUserRange(pml4, new_brk_shrink, old_brk, &rc);
         const first_page = new_brk_shrink & ~@as(usize, 0xFFF);
         const end_page = (old_brk + 0xFFF) & ~@as(usize, 0xFFF);
         @import("../mmu/tlb.zig").shootdownRange(lead.pcid, first_page, (end_page - first_page) / 0x1000);
+        rc.release();
 
         // A heap shrunk to nothing leaves the set; the next grow starts a
         // new heap region at the break.
@@ -474,17 +476,19 @@ pub fn sysMunmap(va: u32, len: u32) u32 {
     // across each 2 MB span AND reclaims empty intermediate tables. The
     // previous loop did a full PML4→PT walk per page (~100× more
     // indirections on a 64 MB munmap) and never freed empty PTs.
-    _ = vmm.unmapUserRange(pd, start, end);
+    var rc: vmm.Reclaim = .{ .pcid = lead.pcid };
+    _ = vmm.unmapUserRange(pd, start, end, &rc);
 
     // Single cross-CPU TLB shootdown for the whole range. unmapUserRange
-    // does no per-page invlpg; without this call, other CPUs would still
-    // cache the freed pages' translations and could read / write into
-    // now-recycled PMM frames. Doing it once at batch end rather than
-    // inside the unmap loop cuts the IPI count by len/4096×. Small ranges
-    // go page by page (INVPCID type-0 plus the INVLPG backstop that
-    // reliably clears this CPU's entry under nested virt), so peers keep
-    // the rest of the AS's entries; large ones flush the whole PCID.
+    // does no per-page invlpg; until this call, other CPUs may still cache
+    // the unmapped pages' translations, which is why their frames are freed
+    // only after it. Doing it once at batch end rather than inside the
+    // unmap loop cuts the IPI count by len/4096×. Small ranges go page by
+    // page (INVPCID type-0 plus the INVLPG backstop that reliably clears
+    // this CPU's entry under nested virt), so peers keep the rest of the
+    // AS's entries; large ones flush the whole PCID.
     @import("../mmu/tlb.zig").shootdownRange(lead.pcid, start, (end - start) / 0x1000);
+    rc.release();
 
     lead.regions.remove(start, end, Discard{}) catch unreachable; // whole region: no split
     if (removed.start == lead.heap_start) lead.heap_start = 0;

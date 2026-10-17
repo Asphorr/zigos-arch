@@ -536,8 +536,8 @@ pub fn unmapUserPage(pml4: [*]align(4096) u64, virt: usize) ?Phys {
     return Phys.of(frame);
 }
 
-/// Unmap every present 4 KB user PTE in `[start, end)`. Calls
-/// `pmm.freeFrame` on each released phys; returns the count freed.
+/// Unmap every present 4 KB user PTE in `[start, end)`. Hands each released
+/// frame to `rc`; returns how many.
 ///
 /// Gap #7 (2026-05-20): replacement for the sysMunmap pattern
 ///     `while (...) if (unmapUserPage(...)) |f| pmm.freeFrame(f);`
@@ -555,9 +555,9 @@ pub fn unmapUserPage(pml4: [*]align(4096) u64, virt: usize) ?Phys {
 /// it ever touched, fragmenting the user-half page-table tree forever.
 ///
 /// Does NOT do per-page invlpg or any TLB invalidation — the caller
-/// (typically `sysMunmap`) is expected to issue one `tlb.shootdownAll`
-/// after the whole batch.
-pub fn unmapUserRange(pml4: [*]align(4096) u64, start: usize, end: usize) usize {
+/// (typically `sysMunmap`) is expected to issue one shootdown after the
+/// whole batch, and only then `rc.release()` the frames and tables it took.
+pub fn unmapUserRange(pml4: [*]align(4096) u64, start: usize, end: usize, rc: *Reclaim) usize {
     if (start >= end) return 0;
     const range_start = start & ~@as(usize, 0xFFF);
     const range_end = (end + 0xFFF) & ~@as(usize, 0xFFF);
@@ -596,7 +596,7 @@ pub fn unmapUserRange(pml4: [*]align(4096) u64, start: usize, end: usize) usize 
             const pte = pt[i];
             if (pte & PRESENT != 0 and pte & USER != 0) {
                 pt[i] = 0;
-                pmm.freeFrame(Phys.of(pte & PAGE_MASK));
+                rc.add(pte & PAGE_MASK);
                 freed += 1;
             } else {
                 // Non-PRESENT: may be SWAPPED, SWAP_INFLIGHT (mid-eviction on
@@ -614,26 +614,87 @@ pub fn unmapUserRange(pml4: [*]align(4096) u64, start: usize, end: usize) usize 
         // Then cascade: if the PD itself is now empty, free it and
         // clear the parent PDPT entry. Don't touch the PDPT — it's
         // the per-process root that destroyAddressSpace owns.
+        // Any nonzero entry keeps the table: a swapped-out page outside our
+        // range is not PRESENT but still lives there.
         var pt_used = false;
         for (0..512) |j| {
-            if (pt[j] & PRESENT != 0) { pt_used = true; break; }
+            if (pt[j] != 0) { pt_used = true; break; }
         }
         if (!pt_used) {
-            pmm.freeFrame(Phys.of(entryPhys(pd[pd_idx])));
+            // The table goes after the shootdown too: a peer's paging-
+            // structure cache may still walk through it. Unlink it first, so
+            // rc.add's out-of-frames flush can't leave it reachable.
+            const pt_phys = entryPhys(pd[pd_idx]);
             pd[pd_idx] = 0;
+            rc.add(pt_phys);
 
             var pd_used = false;
             for (0..512) |j| {
                 if (pd[j] & PRESENT != 0) { pd_used = true; break; }
             }
             if (!pd_used) {
-                pmm.freeFrame(Phys.of(entryPhys(pdpt[pdpt_idx])));
+                const pd_phys = entryPhys(pdpt[pdpt_idx]);
                 pdpt[pdpt_idx] = 0;
+                rc.add(pd_phys);
             }
         }
     }
     return freed;
 }
+
+/// Frames and page tables that unmapUserRange took out of an address space,
+/// held until the caller's TLB shootdown: until then a thread on another CPU
+/// can still reach them through a stale entry and write into a frame that
+/// already belongs to someone else. Kept in kernel pages chained through
+/// their last slot, never in the frames themselves, which such a write
+/// would hit too.
+pub const Reclaim = struct {
+    pcid: u16,
+    /// Newest chunk's phys, 0 = none. Its last slot holds the previous one's.
+    chunk: u64 = 0,
+    /// Slots used in `chunk`.
+    n: usize = 0,
+
+    const SLOTS = 511;
+
+    fn slots(phys: u64) [*]u64 {
+        return Phys.of(phys).toVirt().ptr([*]u64);
+    }
+
+    pub fn add(self: *Reclaim, phys: u64) void {
+        if (self.chunk == 0 or self.n == SLOTS) {
+            const page = pmm.allocFrame() orelse {
+                // No frame for bookkeeping: flush the whole PCID now and
+                // free directly.
+                tlb.shootdownAll(self.pcid);
+                self.release();
+                pmm.freeFrame(Phys.of(phys));
+                return;
+            };
+            slots(page.raw())[SLOTS] = self.chunk;
+            self.chunk = page.raw();
+            self.n = 0;
+        }
+        slots(self.chunk)[self.n] = phys;
+        self.n += 1;
+    }
+
+    /// Free what was collected. Only after the shootdown.
+    pub fn release(self: *Reclaim) void {
+        var c = self.chunk;
+        var n = self.n;
+        while (c != 0) {
+            const s = slots(c);
+            for (s[0..n]) |p| pmm.freeFrame(Phys.of(p));
+            const prev = s[SLOTS];
+            pmm.freeFrame(Phys.of(c));
+            c = prev;
+            n = SLOTS;
+        }
+        self.chunk = 0;
+        self.n = 0;
+    }
+};
 
 /// Give every present 4 KB user page in [start, end) the protection `flags`
 /// (protToMapFlags / cacheMapFlags output), keeping its frame, its accessed
