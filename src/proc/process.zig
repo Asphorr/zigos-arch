@@ -1120,6 +1120,7 @@ pub const clearInflightFrame = @import("lifecycle.zig").clearInflightFrame;
 pub const reclaimInflightFrame = @import("lifecycle.zig").reclaimInflightFrame;
 pub const killProcessWithStatus = @import("lifecycle.zig").killProcessWithStatus;
 pub const killProcess = @import("lifecycle.zig").killProcess;
+pub const abortLoading = @import("lifecycle.zig").abortLoading;
 pub const killThreadGroup = @import("lifecycle.zig").killThreadGroup;
 pub const reparentChildren = @import("lifecycle.zig").reparentChildren;
 pub const maybeReapZombies = @import("lifecycle.zig").maybeReapZombies;

@@ -412,8 +412,8 @@ fn execCommon(name_ptr: u32, name_len: u32, hold_for_caller: bool) u32 {
     @import("../mmu/pcid.zig").loadCr3(paging.getKernelPageDirPhys(), 0, @import("../smp.zig").myCpu().cpu_id);
 
     var pid: u32 = 0xFFFFFFFF;
-    if (vfs.loadFileFresh(name_buf[0..fname_len])) |fresh| {
-        // Hand loadAndStart the parsed name + full exec string so it sets the
+    {
+        // Hand the loader the parsed name + full exec string so it sets the
         // child's name and real argv before any Linux initial-stack build.
         const launch = elf_loader.LaunchInfo{
             .name = clean_name[0..nl],
@@ -421,7 +421,7 @@ fn execCommon(name_ptr: u32, name_len: u32, hold_for_caller: bool) u32 {
             .fname_len = fname_len,
             .start_held = true, // released below, after inheritance
         };
-        if (elf_loader.loadAndStart(fresh.buf, fresh.size, fresh.pages, fresh.inode, launch)) |p| {
+        if (elf_loader.spawnPath(name_buf[0..fname_len], launch)) |p| {
             pid = @intCast(p);
             // Promote to interactive immediately so the new process isn't
             // starved by an already-running interactive app — same fix as

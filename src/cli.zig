@@ -531,21 +531,18 @@ fn cmdRun(name: []const u8) void {
         }
     }
     // Sync fallback (single core or AP busy)
-    if (vfs.loadFileFresh(name)) |fresh| {
-        if (desktop.active) {
-            if (elf_loader.loadAndStart(fresh.buf, fresh.size, fresh.pages, fresh.inode, null)) |pid| {
-                const fname = name;
-                var nlen: usize = fname.len;
-                if (nlen >= 4 and fname[nlen - 4] == '.') nlen -= 4;
-                process.setName(@intCast(pid), fname[0..nlen]);
-                printOk("Started PID={d}\n", .{pid});
-            } else {
-                printErr("Failed to start process\n", .{});
-            }
+    if (desktop.active) {
+        if (elf_loader.spawnPath(name, null)) |pid| {
+            var nlen: usize = name.len;
+            if (nlen >= 4 and name[nlen - 4] == '.') nlen -= 4;
+            process.setName(@intCast(pid), name[0..nlen]);
+            printOk("Started PID={d}\n", .{pid});
         } else {
-            elf_loader.loadAndExecute(fresh.buf, fresh.size, fresh.pages, fresh.inode);
-            printOk("\n[Process exited]\n", .{});
+            printErr("Failed to start {s}\n", .{name});
         }
+    } else if (vfs.loadFileFresh(name)) |fresh| {
+        elf_loader.loadAndExecute(fresh.buf, fresh.size, fresh.pages, fresh.inode);
+        printOk("\n[Process exited]\n", .{});
     } else {
         printErr("File not found: {s}\n", .{name});
     }

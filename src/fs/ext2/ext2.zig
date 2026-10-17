@@ -816,6 +816,14 @@ pub fn loadFile(path: []const u8, dest: []align(4) u8) ?usize {
 /// second `cachedWalk` diverging to a different file.
 pub const LoadedFile = struct { size: usize, inum: u32 };
 
+/// The regular file at `path`: inode number and size, no data read.
+pub fn lookupFile(path: []const u8) ?LoadedFile {
+    const inum = cachedWalk(path) orelse return null;
+    const ino = inode.readInode(inum) orelse return null;
+    if (!inode.isReg(&ino)) return null;
+    return .{ .size = @intCast(inode.fileSize(&ino)), .inum = inum };
+}
+
 pub fn loadFileInum(path: []const u8, dest: []align(4) u8) ?LoadedFile {
     const inum = cachedWalk(path) orelse return null;
     const ino = inode.readInode(inum) orelse {

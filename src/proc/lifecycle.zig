@@ -1353,9 +1353,19 @@ pub fn killProcessWithStatus(pid: u8, status: u32) void {
     }
 }
 
+/// Tear down a process its constructor still holds in .loading, after a
+/// loader step failed. Only the constructor may: killers wait for .loading
+/// to end (killProcess would wait on itself) and pickNext never dispatches
+/// it. With no parent yet, the slot goes straight back to .unused.
+pub fn abortLoading(pid: u8) void {
+    std.debug.assert(process.procs[pid].state == .loading);
+    process.setState(pid, .zombie);
+    tearDownTask(pid, 0, .kill, false);
+}
+
 /// Kill a process by PID (status defaults to 0 — for callers that don't care
-/// or aren't routing through sysKill). Most internal callers (elf_loader,
-/// desktop close-button, cli `kill` command) use this.
+/// or aren't routing through sysKill). Most internal callers (desktop
+/// close-button, cli `kill` command) use this.
 pub fn killProcess(pid: u8) void {
     killProcessWithStatus(pid, 0);
 }

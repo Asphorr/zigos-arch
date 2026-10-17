@@ -9,6 +9,8 @@ const paging = @import("../mm/paging.zig");
 const Phys = @import("../util/addr.zig").Phys;
 const symbols = @import("../debug/symbols.zig");
 const memmap = @import("../mm/memmap.zig");
+const heap = @import("../mm/heap.zig");
+const vfs = @import("../fs/vfs.zig");
 const config = @import("../config.zig");
 
 /// Optional launch descriptor handed to loadAndStart so it can set the new
@@ -265,6 +267,103 @@ fn registerSegments(pid: usize, elf_buf: [*]const u8, phoff: usize, phnum: u16, 
     return needs_elf_buf;
 }
 
+inline fn pageDown(v: usize) usize {
+    return v & ~@as(usize, PAGE_SIZE - 1);
+}
+
+inline fn pageUp(v: usize) usize {
+    return (v + PAGE_SIZE - 1) & ~@as(usize, PAGE_SIZE - 1);
+}
+
+/// File bytes in frames of their own, for a region that owns them.
+const Owned = struct { buf: [*]u8, pages: u16 };
+
+/// `len` bytes of the file at `off`, zero-padded to whole pages. Null if
+/// out of frames, too big for a region's buffer, or the read came up short.
+fn readOwned(inum: u32, off: u64, len: usize) ?Owned {
+    const n = (len + PAGE_SIZE - 1) / PAGE_SIZE;
+    if (n == 0 or n > std.math.maxInt(u16)) return null;
+    const phys = pmm.allocContiguousUser(@intCast(n)) orelse return null;
+    const buf = phys.toVirt().ptr([*]u8);
+    @memset(buf[0 .. n * PAGE_SIZE], 0);
+    if (vfs.readThroughCache(inum, off, buf, @intCast(len)) != len) {
+        pmm.releaseContiguous(phys, @intCast(n));
+        return null;
+    }
+    return .{ .buf = buf, .pages = @intCast(n) };
+}
+
+/// Add `r`, sourced from `b`, which it then owns; `b` goes back if it
+/// can't be added.
+fn addOwned(pid: usize, r: process.LazyRegion, b: Owned) bool {
+    var reg = r;
+    reg.source = b.buf;
+    reg.src_offset = 0;
+    reg.buf_owned = true;
+    reg.buf_pages = b.pages;
+    if (process.addRegion(pid, reg)) return true;
+    pmm.releaseContiguous(Phys.of(paging.virtToPhys(@intFromPtr(b.buf)).?), b.pages);
+    return false;
+}
+
+/// Register one PT_LOAD of an ext2 image read through the page cache, as up
+/// to three regions: the pages holding only file bytes map the cache
+/// (shared until written), the page where the file bytes end and the bss
+/// begins gets a private copy with a zero tail, and the bss pages after it
+/// are anonymous. A segment whose file offset and address differ within a
+/// page lines up with no cache page; its file bytes go to a buffer of its
+/// own. Its ranges were checked by layoutFor and segmentsInFile.
+fn registerCachedSegment(pid: usize, inum: u32, ph: ProgramHeader) bool {
+    const vaddr: usize = @intCast(ph.p_vaddr);
+    const memsz: usize = @intCast(ph.p_memsz);
+    const filesz: usize = @intCast(ph.p_filesz);
+    const off: u64 = ph.p_offset;
+    const prot = segProt(ph.p_flags);
+    const seg_start = pageDown(vaddr);
+    const mem_end = pageUp(vaddr + memsz);
+
+    if (filesz == 0) return process.addRegion(pid, .{ .start = seg_start, .end = mem_end, .prot = prot });
+    if (off % PAGE_SIZE != vaddr % PAGE_SIZE) {
+        const b = readOwned(inum, off, filesz) orelse return false;
+        return addOwned(pid, .{ .start = seg_start, .end = mem_end, .src_va_base = vaddr, .src_size = filesz, .prot = prot }, b);
+    }
+
+    const file_end = vaddr + filesz;
+    const start_off = off - (vaddr - seg_start); // file offset of seg_start
+    // Without bss the last page maps whole, file bytes past the segment
+    // included, as on Linux; with bss that page's tail must read zero.
+    const cache_end = if (memsz > filesz) pageDown(file_end) else pageUp(file_end);
+    if (cache_end > seg_start and !process.addRegion(pid, .{
+        .start = seg_start,
+        .end = cache_end,
+        .cache_inode = inum,
+        .cache_off = start_off,
+        .prot = prot,
+    })) return false;
+
+    var next = cache_end;
+    if (memsz > filesz and file_end % PAGE_SIZE != 0) {
+        const page = pageDown(file_end);
+        const b = readOwned(inum, start_off + (page - seg_start), file_end - page) orelse return false;
+        if (!addOwned(pid, .{ .start = page, .end = page + PAGE_SIZE, .src_va_base = page, .src_size = file_end - page, .prot = prot }, b)) return false;
+        next = page + PAGE_SIZE;
+    }
+    if (mem_end > next and !process.addRegion(pid, .{ .start = next, .end = mem_end, .prot = prot })) return false;
+    return true;
+}
+
+fn registerCachedSegments(pid: usize, inum: u32, phdrs: [*]align(1) const ProgramHeader, phnum: u16) bool {
+    var n: u32 = 0;
+    for (0..phnum) |i| {
+        const ph = phdrs[i];
+        if (ph.p_type != PT_LOAD_T) continue;
+        if (!registerCachedSegment(pid, inum, ph)) return false;
+        n += 1;
+    }
+    debug.klog("[elf] pid={d} inode={d}: {d} segments through the page cache\n", .{ pid, inum, n });
+    return true;
+}
+
 // --- Linux personality: SysV initial process stack ---------------------------
 // A Linux x86-64 `_start` reads argc/argv/envp/auxv off the stack (RSP → argc)
 // and sets up TLS from the auxiliary vector — none of which the native zigos
@@ -467,6 +566,15 @@ fn setupLinuxInitialStack(
     return true;
 }
 
+/// Start the program at `path`. An ext2 file is mapped through the page
+/// cache, only its headers read up front; anything else (tarfs, fat32) is
+/// read whole first. Same contract as loadAndStart.
+pub fn spawnPath(path: []const u8, launch: ?LaunchInfo) ?usize {
+    if (vfs.lookupCached(path)) |f| return loadCached(f.inum, f.size, launch);
+    const fresh = vfs.loadFileFresh(path) orelse return null;
+    return loadAndStart(fresh.buf, fresh.size, fresh.pages, fresh.inode, launch);
+}
+
 /// Load an ELF and create the process, but don't enter user mode.
 /// Returns PID or null. Used by the desktop for multitasking.
 ///
@@ -476,8 +584,9 @@ fn setupLinuxInitialStack(
 /// must NOT touch it after the call.
 pub fn loadAndStart(elf_buf: [*]align(4) u8, file_size: usize, elf_buf_pages: u32, inode: u32, launch: ?LaunchInfo) ?usize {
     debug.klog("[elf] Loading ELF64 binary...\n", .{});
+    const img: Image = .{ .buffer = .{ .buf = elf_buf, .size = file_size, .pages = elf_buf_pages, .inode = inode } };
     const header = @as([*]align(1) const Header, @ptrCast(elf_buf))[0];
-    if (!std.mem.eql(u8, header.ident[0..4], "\x7fELF") or header.ident[4] != 2 or header.machine != 0x3E) {
+    if (file_size < @sizeOf(Header) or !headerOk(header, file_size)) {
         // Diagnostic: dump first 32 bytes + parsed fields. The "Invalid"
         // condition is hit when DMA returned garbage (race on PRDT) — the
         // bytes show whether the buffer is zeros (DMA never wrote), stale
@@ -485,33 +594,132 @@ pub fn loadAndStart(elf_buf: [*]align(4) u8, file_size: usize, elf_buf_pages: u3
         // transfer).
         debug.klog("[elf] Invalid ELF64 header — file_size={d} elf_buf=0x{X:0>16}\n", .{ file_size, @intFromPtr(elf_buf) });
         debug.klog("[elf]   ident[0..4]: {X:0>2} {X:0>2} {X:0>2} {X:0>2}  (want: 7F 45 4C 46)\n", .{ header.ident[0], header.ident[1], header.ident[2], header.ident[3] });
-        debug.klog("[elf]   ident[4]={d} (want 2 = ELF64), machine=0x{X} (want 0x3E = AMD64)\n", .{ header.ident[4], header.machine });
+        debug.klog("[elf]   ident[4]={d} (want 2 = ELF64), machine=0x{X} (want 0x3E = AMD64), phentsize={d} phoff=0x{X} phnum={d}\n", .{ header.ident[4], header.machine, header.phentsize, header.phoff, header.phnum });
         debug.klog("[elf]   First 32 bytes:", .{});
         for (0..@min(32, file_size)) |i| debug.klog(" {X:0>2}", .{elf_buf[i]});
         debug.klog("\n", .{});
-        freePmmRange(@intFromPtr(elf_buf), elf_buf_pages);
+        img.drop();
         return null;
     }
+    return startImage(img, header, launch);
+}
+
+/// Most header bytes loadCached reads; the program headers must end within.
+const MAX_HEADER_BYTES: usize = 64 * 1024;
+
+/// loadAndStart for an ext2 file, mapped through the page cache: only the
+/// ELF header and program headers are read here, segment pages on first
+/// touch.
+fn loadCached(inum: u32, size: u64, launch: ?LaunchInfo) ?usize {
+    debug.klog("[elf] Loading ELF64 binary from inode {d} ({d} bytes) through the page cache\n", .{ inum, size });
+    var header: Header = undefined;
+    const hb = std.mem.asBytes(&header);
+    if (size < hb.len or vfs.readThroughCache(inum, 0, hb, hb.len) != hb.len or !headerOk(header, size)) {
+        debug.klog("[elf] inode {d}: not an x86-64 ELF64 executable\n", .{inum});
+        return null;
+    }
+    const hdr_len: usize = @intCast(@max(hb.len, header.phoff + @as(u64, header.phnum) * @sizeOf(ProgramHeader)));
+    if (hdr_len > MAX_HEADER_BYTES) {
+        debug.klog("[elf] inode {d}: program headers end at {d}, past {d}\n", .{ inum, hdr_len, MAX_HEADER_BYTES });
+        return null;
+    }
+    const raw = heap.kmallocAligned(hdr_len, 8) orelse return null;
+    defer heap.kfree(raw);
+    const hdr: [*]align(8) u8 = @alignCast(raw);
+    if (vfs.readThroughCache(inum, 0, hdr, @intCast(hdr_len)) != hdr_len) return null;
+    // The header validated above, whatever the file holds now.
+    @memcpy(hdr[0..hb.len], hb);
+    return startImage(.{ .cached = .{ .inum = inum, .size = size, .hdr = hdr } }, header, launch);
+}
+
+/// Where a new process's segments come from.
+const Image = union(enum) {
+    /// The whole file in a PMM buffer (tarfs, fat32, the desktop's async
+    /// load). The process keeps it while a segment sources from it.
+    buffer: struct { buf: [*]align(4) u8, size: usize, pages: u32, inode: u32 },
+    /// An ext2 file read through the page cache. `hdr` holds its first
+    /// bytes through the program headers; the caller frees it.
+    cached: struct { inum: u32, size: u64, hdr: [*]align(8) const u8 },
+
+    /// The file's first bytes: the ELF header and the program headers.
+    fn bytes(self: Image) [*]align(4) const u8 {
+        return switch (self) {
+            .buffer => |b| b.buf,
+            .cached => |c| c.hdr,
+        };
+    }
+
+    fn fileSize(self: Image) u64 {
+        return switch (self) {
+            .buffer => |b| b.size,
+            .cached => |c| c.size,
+        };
+    }
+
+    fn inode(self: Image) u32 {
+        return switch (self) {
+            .buffer => |b| b.inode,
+            .cached => |c| c.inum,
+        };
+    }
+
+    /// Give back a buffer no process took.
+    fn drop(self: Image) void {
+        switch (self) {
+            .buffer => |b| freePmmRange(@intFromPtr(b.buf), b.pages),
+            .cached => {},
+        }
+    }
+};
+
+/// An x86-64 ELF64 whose program headers, of the size we index them at,
+/// lie in the first `avail` bytes.
+fn headerOk(header: Header, avail: u64) bool {
+    if (!std.mem.eql(u8, header.ident[0..4], "\x7fELF") or header.ident[4] != 2 or header.machine != 0x3E) return false;
+    if (header.phentsize != @sizeOf(ProgramHeader)) return false;
+    const ph_len = @as(u64, header.phnum) * @sizeOf(ProgramHeader);
+    return header.phoff <= avail and ph_len <= avail - header.phoff;
+}
+
+/// Every PT_LOAD's file bytes lie in the file and fit its memory size.
+fn segmentsInFile(phdrs: [*]align(1) const ProgramHeader, phnum: u16, size: u64) bool {
+    for (0..phnum) |i| {
+        const ph = phdrs[i];
+        if (ph.p_type != PT_LOAD_T) continue;
+        if (ph.p_filesz > ph.p_memsz) return false;
+        if (ph.p_offset > size or ph.p_filesz > size - ph.p_offset) return false;
+    }
+    return true;
+}
+
+/// The process for a validated header: address space, PCB, regions, the
+/// Linux initial stack, symbols. Takes over `img`'s buffer either way.
+fn startImage(img: Image, header: Header, launch: ?LaunchInfo) ?usize {
+    const phoff: usize = @intCast(header.phoff);
+    const phdrs: [*]align(1) const ProgramHeader = @ptrCast(img.bytes() + phoff);
 
     const entry_addr: usize = @intCast(header.entry);
     if (!isUserVA(entry_addr, 1)) {
         debug.klog("[elf] Rejected: entry 0x{X} outside user VA range\n", .{entry_addr});
-        freePmmRange(@intFromPtr(elf_buf), elf_buf_pages);
+        img.drop();
+        return null;
+    }
+    if (!segmentsInFile(phdrs, header.phnum, img.fileSize())) {
+        debug.klog("[elf] Rejected: a segment's file bytes lie outside the file\n", .{});
+        img.drop();
         return null;
     }
 
     // Validate every PT_LOAD's VA range fits in user space before doing
     // any per-segment work — bail early without partial state.
-    const phoff: usize = @intCast(header.phoff);
-    const phdrs: [*]align(1) const ProgramHeader = @ptrCast(elf_buf + phoff);
     const lay = layoutFor(header, phdrs) orelse {
-        freePmmRange(@intFromPtr(elf_buf), elf_buf_pages);
+        img.drop();
         return null;
     };
 
     var pd_phys: Phys = Phys.of(0);
     const pd = vmm.createAddressSpace(&pd_phys) orelse {
-        freePmmRange(@intFromPtr(elf_buf), elf_buf_pages);
+        img.drop();
         return null;
     };
 
@@ -521,24 +729,31 @@ pub fn loadAndStart(elf_buf: [*]align(4) u8, file_size: usize, elf_buf_pages: u3
     const entry: usize = @intCast(header.entry);
     const pid = process.create(entry, lay.stack_top - 8) orelse {
         vmm.destroyAddressSpace(pd, pd_phys);
-        freePmmRange(@intFromPtr(elf_buf), elf_buf_pages);
+        img.drop();
         return null;
     };
     debug.klog("[elf] Process created PID={d} entry=0x{X:0>16}\n", .{ pid, header.entry });
 
+    // From here the PCB owns the address space and the buffer; a failure
+    // tears the process down (abortLoading), which frees both.
     const pcb = process.getPCB(pid);
     pcb.page_directory = pd;
     pcb.page_dir_phys = pd_phys.raw();
     pcb.pcid = @import("../cpu/mmu/pcid.zig").alloc();
-    pcb.elf_buf = elf_buf;
-    pcb.elf_buf_pages = elf_buf_pages;
+    switch (img) {
+        .buffer => |b| {
+            pcb.elf_buf = b.buf;
+            pcb.elf_buf_pages = b.pages;
+        },
+        .cached => {},
+    }
     pcb.stack_base = lay.stack_base;
     pcb.brk_base = lay.brk;
     pcb.user_brk = lay.brk;
     // Record the source inode for ETXTBSY: while this process is live, writes
     // and truncates of this same file are refused (process.isTextBusy). 0 for
     // tarfs/non-regular loads (inum is an ext2 identity); harmless there.
-    pcb.text_inum = inode;
+    pcb.text_inum = img.inode();
     // ABI personality: EI_OSABI (e_ident[7]) == ELFOSABI_LINUX (3) marks an
     // unmodified Linux x86-64 binary, so its `syscall`s route to the Linux
     // translation layer (syscall/linux.zig). Native zigos ELFs have OSABI 0.
@@ -559,36 +774,43 @@ pub fn loadAndStart(elf_buf: [*]align(4) u8, file_size: usize, elf_buf_pages: u3
     // is registered later by sbrk/brk.
     if (!process.addLazyRegion(pid, lay.stack_base, lay.stack_top, 0)) {
         debug.klog("[elf] Failed to register lazy stack region for PID {d}\n", .{pid});
-        process.killProcess(@intCast(pid));
+        process.abortLoading(@intCast(pid));
         return null;
     }
-    const needs_elf_buf = registerSegments(pid, elf_buf, phoff, header.phnum, inode) orelse {
-        debug.klog("[elf] segment registration failed for PID {d}\n", .{pid});
-        process.killProcess(@intCast(pid));
-        return null;
+    const needs_elf_buf: ?bool = switch (img) {
+        .buffer => |b| registerSegments(pid, b.buf, phoff, header.phnum, b.inode),
+        .cached => |c| if (registerCachedSegments(pid, c.inum, phdrs, header.phnum)) false else null,
     };
+    if (needs_elf_buf == null) {
+        debug.klog("[elf] segment registration failed for PID {d}\n", .{pid});
+        process.abortLoading(@intCast(pid));
+        return null;
+    }
 
     // Linux personality: build the SysV initial stack (argc/argv/envp/auxv +
     // RSP) BEFORE elf_buf can be dropped below — setupLinuxInitialStack reads
     // the program headers out of it. Native processes get argv via syscalls and
     // skip this entirely.
     if (pcb.personality == .linux) {
-        if (!setupLinuxInitialStack(pid, pd, lay.stack_top, elf_buf)) {
+        if (!setupLinuxInitialStack(pid, pd, lay.stack_top, img.bytes())) {
             debug.klog("[linux] initial-stack setup failed for PID {d}\n", .{pid});
-            process.killProcess(@intCast(pid));
+            process.abortLoading(@intCast(pid));
             return null;
         }
     }
 
-    // Parse debug symbols from ELF section headers (use kernel-side ELF buffer).
-    pcb.sym_table = symbols.parseElfSymbols(elf_buf, file_size);
+    // Debug symbols from the ELF section headers.
+    pcb.sym_table = switch (img) {
+        .buffer => |b| symbols.parseElfSymbols(b.buf, b.size),
+        .cached => |c| symbols.parseElfSymbolsFile(c.inum, c.size, c.hdr[0..@sizeOf(Header)]),
+    };
 
     // Slice 3e: if no segment is demand-paged from elf_buf (all are cache-shared
     // or pure-BSS anon), the per-process whole-file copy is dead weight — free it
     // now instead of holding it until exit. freeElfBuf is null-safe, so teardown
     // simply no-ops. Symbol parsing above already copied what it needs.
-    if (!needs_elf_buf) {
-        freePmmRange(@intFromPtr(elf_buf), elf_buf_pages);
+    if (!needs_elf_buf.?) {
+        if (pcb.elf_buf) |buf| freePmmRange(@intFromPtr(buf), pcb.elf_buf_pages);
         pcb.elf_buf = null;
         pcb.elf_buf_pages = 0;
     }
@@ -615,7 +837,10 @@ pub fn loadAndStart(elf_buf: [*]align(4) u8, file_size: usize, elf_buf_pages: u3
 pub fn loadAndExecute(elf_buf: [*]align(4) u8, file_size: usize, elf_buf_pages: u32, inode: u32) void {
     debug.klog("[elf] Loading ELF64 binary...\n", .{});
     const header = @as([*]align(1) const Header, @ptrCast(elf_buf))[0];
-    if (!std.mem.eql(u8, header.ident[0..4], "\x7fELF") or header.ident[4] != 2 or header.machine != 0x3E) {
+    const phoff: usize = @intCast(header.phoff);
+    if (file_size < @sizeOf(Header) or !headerOk(header, file_size) or
+        !segmentsInFile(@ptrCast(elf_buf + phoff), header.phnum, file_size))
+    {
         vga.fg = .LightRed;
         vga.print("ELF Error!\n", .{});
         debug.klog("[elf] Invalid ELF64 header\n", .{});
@@ -623,7 +848,6 @@ pub fn loadAndExecute(elf_buf: [*]align(4) u8, file_size: usize, elf_buf_pages: 
         return;
     }
 
-    const phoff: usize = @intCast(header.phoff);
     const lay = layoutFor(header, @ptrCast(elf_buf + phoff)) orelse {
         vga.fg = .LightRed;
         vga.print("Error: segment outside user space!\n", .{});
@@ -670,14 +894,14 @@ pub fn loadAndExecute(elf_buf: [*]align(4) u8, file_size: usize, elf_buf_pages: 
     if (!process.addLazyRegion(pid, lay.stack_base, lay.stack_top, 0)) {
         vga.fg = .LightRed;
         vga.print("Error: lazy stack region full!\n", .{});
-        process.killProcess(@intCast(pid));
+        process.abortLoading(@intCast(pid));
         return;
     }
 
     const needs_elf_buf = registerSegments(pid, elf_buf, phoff, header.phnum, inode) orelse {
         vga.fg = .LightRed;
         vga.print("Error: segment registration failed!\n", .{});
-        process.killProcess(@intCast(pid));
+        process.abortLoading(@intCast(pid));
         return;
     };
 
@@ -686,7 +910,7 @@ pub fn loadAndExecute(elf_buf: [*]align(4) u8, file_size: usize, elf_buf_pages: 
     if (pcb.personality == .linux) {
         if (!setupLinuxInitialStack(pid, pd, lay.stack_top, elf_buf)) {
             debug.klog("[linux] initial-stack setup failed for PID {d}\n", .{pid});
-            process.killProcess(@intCast(pid));
+            process.abortLoading(@intCast(pid));
             return;
         }
     }

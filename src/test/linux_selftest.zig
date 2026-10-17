@@ -12,7 +12,6 @@
 const std = @import("std");
 const process = @import("../proc/process.zig");
 const elf_loader = @import("../proc/elf_loader.zig");
-const vfs = @import("../fs/vfs.zig");
 const pmm = @import("../mm/pmm.zig");
 const nvme = @import("../driver/nvme.zig");
 const boot_phase = @import("../boot/boot_phase.zig");
@@ -61,15 +60,13 @@ fn runOnce(c: Case) Outcome {
         c.path
     else
         std.fmt.bufPrint(&raw_buf, "{s} {s}", .{ c.path, c.args }) catch return .spawn_failed;
-    const fresh = vfs.loadFileFresh(c.path) orelse return .spawn_failed;
     const launch = elf_loader.LaunchInfo{
         .name = progName(c.path),
         .raw = raw,
         .fname_len = c.path.len,
         .start_held = true,
     };
-    // loadAndStart owns the buffer from here, including on failure.
-    const pid = elf_loader.loadAndStart(fresh.buf, fresh.size, fresh.pages, fresh.inode, launch) orelse return .spawn_failed;
+    const pid = elf_loader.spawnPath(c.path, launch) orelse return .spawn_failed;
     // Parent it here so the exit leaves a zombie holding the status.
     process.getPCB(pid).parent_pid = @intCast(process.getCurrentPid());
     process.assignInitialCpu(pid);

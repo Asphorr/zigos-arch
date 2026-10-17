@@ -779,6 +779,23 @@ pub fn fileSize(name: []const u8) ?u32 {
     return resolveFirst(u32, name, SizeOp{});
 }
 
+/// An ext2 regular file, for reading through the page cache.
+pub const CachedFile = struct { inum: u32, size: u64 };
+
+const CachedOp = struct {
+    fn run(_: @This(), fs: FsType, rel: []const u8) ?CachedFile {
+        if (fs != .ext2) return null;
+        const f = ext2.lookupFile(rel) orelse return null;
+        return .{ .inum = f.inum, .size = f.size };
+    }
+};
+
+/// The ext2 file `name` resolves to, by the sequence loadFile reads through;
+/// null when it resolves to another filesystem or to nothing.
+pub fn lookupCached(name: []const u8) ?CachedFile {
+    return resolveFirst(CachedFile, name, CachedOp{});
+}
+
 /// A PMM-allocated file buffer ready to hand to elf_loader.loadAndStart
 /// (which takes ownership) or freed by the caller via `pmm.freeRange(phys,
 /// fresh.pages)` on cleanup. Use `freeRange` (NOT a per-frame `freeFrame`

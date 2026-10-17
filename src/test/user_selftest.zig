@@ -10,7 +10,6 @@
 
 const process = @import("../proc/process.zig");
 const elf_loader = @import("../proc/elf_loader.zig");
-const vfs = @import("../fs/vfs.zig");
 const pmm = @import("../mm/pmm.zig");
 const heap = @import("../mm/heap.zig");
 const vmalloc = @import("../mm/vmalloc.zig");
@@ -24,8 +23,9 @@ const Case = struct {
     ok_status: u32,
 };
 
-// /tar/ keeps the loader on the private elf_buf path, so fork shares that
-// buffer too, not only forktest's own file mapping.
+// /tar/ keeps the loader on the private elf_buf path (spawnPath maps only
+// ext2 files through the page cache), so fork shares that buffer too, not
+// only forktest's own file mapping.
 const CASES = [_]Case{
     .{ .path = "/tar/forktest.elf", .name = "forktest", .ok_status = 0xCAFE0042 },
     .{ .path = "/tar/iouringtest.elf", .name = "iouringtest", .ok_status = 0xCAFE0115 },
@@ -47,15 +47,13 @@ const Outcome = union(enum) {
 };
 
 fn runOnce(c: Case) Outcome {
-    const fresh = vfs.loadFileFresh(c.path) orelse return .spawn_failed;
     const launch = elf_loader.LaunchInfo{
         .name = c.name,
         .raw = c.path,
         .fname_len = c.path.len,
         .start_held = true,
     };
-    // loadAndStart owns the buffer from here, including on failure.
-    const pid = elf_loader.loadAndStart(fresh.buf, fresh.size, fresh.pages, fresh.inode, launch) orelse return .spawn_failed;
+    const pid = elf_loader.spawnPath(c.path, launch) orelse return .spawn_failed;
     // Parent it here so the exit leaves a zombie holding the status.
     process.getPCB(pid).parent_pid = @intCast(process.getCurrentPid());
     process.assignInitialCpu(pid);

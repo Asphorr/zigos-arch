@@ -268,60 +268,106 @@ fn getName(table: *const SymTable, off: u32) []const u8 {
 
 // --- ELF64 section header parsing for app symbols ---
 
+/// [off, off + len) lies inside a file of `size` bytes.
+fn inFile(off: u64, len: u64, size: u64) bool {
+    return off <= size and len <= size - off;
+}
+
+/// Where the section header table sits in the file.
+const ShdrTable = struct { off: u64, len: usize, entsize: usize };
+
+fn shdrTable(hdr: *align(1) const ElfHeader, file_size: u64) ?ShdrTable {
+    if (hdr.ident[0] != 0x7F or hdr.ident[1] != 'E' or hdr.ident[2] != 'L' or hdr.ident[3] != 'F') return null;
+    if (hdr.ident[4] != 2) return null; // Must be ELF64
+    if (hdr.shnum == 0 or hdr.shoff == 0) return null;
+    if (hdr.shentsize < @sizeOf(SectionHeader)) return null;
+    const len = @as(usize, hdr.shnum) * hdr.shentsize;
+    if (!inFile(hdr.shoff, len, file_size)) return null;
+    return .{ .off = hdr.shoff, .len = len, .entsize = hdr.shentsize };
+}
+
+/// .symtab and its string table, as file ranges.
+const SymRanges = struct { sym_off: u64, sym_size: usize, entsize: usize, str_off: u64, str_size: usize };
+
+fn symRanges(shdrs: []const u8, entsize: usize, file_size: u64) ?SymRanges {
+    const n = shdrs.len / entsize;
+    for (0..n) |i| {
+        const sh: *align(1) const SectionHeader = @ptrCast(shdrs.ptr + i * entsize);
+        if (sh.sh_type != SHT_SYMTAB) continue;
+        if (sh.sh_link >= n or sh.sh_entsize < @sizeOf(Elf64Sym)) return null;
+        const str: *align(1) const SectionHeader = @ptrCast(shdrs.ptr + @as(usize, sh.sh_link) * entsize);
+        if (!inFile(sh.sh_offset, sh.sh_size, file_size) or !inFile(str.sh_offset, str.sh_size, file_size)) return null;
+        return .{
+            .sym_off = sh.sh_offset,
+            .sym_size = @intCast(sh.sh_size),
+            .entsize = @intCast(sh.sh_entsize),
+            .str_off = str.sh_offset,
+            .str_size = @intCast(str.sh_size),
+        };
+    }
+    return null;
+}
+
 /// Parse symbol table from an ELF64 file in memory (staging buffer)
 pub fn parseElfSymbols(file_buf: [*]const u8, file_size: usize) ?*SymTable {
     if (file_size < @sizeOf(ElfHeader)) return null;
+    const t = shdrTable(@ptrCast(file_buf), file_size) orelse return null;
+    const r = symRanges(file_buf[@intCast(t.off)..][0..t.len], t.entsize, file_size) orelse return null;
+    return buildTable(
+        file_buf[@intCast(r.sym_off)..][0..r.sym_size],
+        r.entsize,
+        file_buf[@intCast(r.str_off)..][0..r.str_size],
+    );
+}
 
-    const hdr: *align(1) const ElfHeader = @ptrCast(file_buf);
+/// Most bytes parseElfSymbolsFile reads for the section headers, and for
+/// each of the symbol and string tables; a bigger image goes without.
+const MAX_SHDR_READ: usize = 256 * 1024;
+const MAX_TABLE_READ: usize = 8 * 1024 * 1024;
 
-    // Validate ELF64
-    if (hdr.ident[0] != 0x7F or hdr.ident[1] != 'E' or hdr.ident[2] != 'L' or hdr.ident[3] != 'F') return null;
-    if (hdr.ident[4] != 2) return null; // Must be ELF64
-
-    if (hdr.shnum == 0 or hdr.shoff == 0) return null;
-
-    const shoff: usize = @intCast(hdr.shoff);
-    const shentsize: usize = @intCast(hdr.shentsize);
-    const shnum: usize = @intCast(hdr.shnum);
-
-    if (shoff + shnum * shentsize > file_size) return null;
-
-    // Find .symtab section
-    var symtab_shdr: ?*align(1) const SectionHeader = null;
-    for (0..shnum) |i| {
-        const sh: *align(1) const SectionHeader = @ptrCast(file_buf + shoff + i * shentsize);
-        if (sh.sh_type == SHT_SYMTAB) {
-            symtab_shdr = sh;
-            break;
-        }
+/// parseElfSymbols for an ext2 image read through the page cache: only the
+/// section headers and the two tables are read. `hdr` is the image's first
+/// bytes (at least the ELF header).
+pub fn parseElfSymbolsFile(inum: u32, file_size: u64, hdr: []const u8) ?*SymTable {
+    if (hdr.len < @sizeOf(ElfHeader)) return null;
+    const t = shdrTable(@ptrCast(hdr.ptr), file_size) orelse return null;
+    if (t.len > MAX_SHDR_READ) return null;
+    const shdrs = readRange(inum, t.off, t.len) orelse return null;
+    defer heap.kfree(shdrs.ptr);
+    const r = symRanges(shdrs, t.entsize, file_size) orelse return null;
+    if (r.sym_size > MAX_TABLE_READ or r.str_size > MAX_TABLE_READ) {
+        debug.klog("[sym] inode {d}: symbol tables too big ({d} + {d} bytes), skipped\n", .{ inum, r.sym_size, r.str_size });
+        return null;
     }
+    const syms = readRange(inum, r.sym_off, r.sym_size) orelse return null;
+    defer heap.kfree(syms.ptr);
+    const strs = readRange(inum, r.str_off, r.str_size) orelse return null;
+    defer heap.kfree(strs.ptr);
+    return buildTable(syms, r.entsize, strs);
+}
 
-    const symtab = symtab_shdr orelse return null;
+/// `len` bytes of the file at `off` in a kmalloc'd buffer; null if short.
+fn readRange(inum: u32, off: u64, len: usize) ?[]u8 {
+    const buf = heap.kmalloc(@max(len, 1)) orelse return null;
+    if (vfs.readThroughCache(inum, off, buf, @intCast(len)) != len) {
+        heap.kfree(buf);
+        return null;
+    }
+    return buf[0..len];
+}
 
-    // Get linked .strtab
-    const strtab_idx: usize = @intCast(symtab.sh_link);
-    if (strtab_idx >= shnum) return null;
-    const strtab_sh: *align(1) const SectionHeader = @ptrCast(file_buf + shoff + strtab_idx * shentsize);
-
-    const sym_offset: usize = @intCast(symtab.sh_offset);
-    const sym_size: usize = @intCast(symtab.sh_size);
-    const sym_entsize: usize = @intCast(symtab.sh_entsize);
-    if (sym_entsize == 0) return null;
-    const sym_count = sym_size / sym_entsize;
-
-    const str_offset: usize = @intCast(strtab_sh.sh_offset);
-    const str_size: usize = @intCast(strtab_sh.sh_size);
-
-    if (sym_offset + sym_size > file_size) return null;
-    if (str_offset + str_size > file_size) return null;
-
-    const strtab_ptr = file_buf + str_offset;
+/// The table of function symbols in `syms` (`entsize`-byte Elf64Sym
+/// records) with names from `strtab`.
+fn buildTable(syms: []const u8, sym_entsize: usize, strtab: []const u8) ?*SymTable {
+    const sym_count = syms.len / sym_entsize;
+    const str_size = strtab.len;
+    const strtab_ptr = strtab.ptr;
 
     // First pass: count function symbols
     var func_count: u32 = 0;
     var total_name_bytes: u32 = 0;
     for (0..sym_count) |i| {
-        const sym: *align(1) const Elf64Sym = @ptrCast(file_buf + sym_offset + i * sym_entsize);
+        const sym: *align(1) const Elf64Sym = @ptrCast(syms.ptr + i * sym_entsize);
         if ((sym.st_info & 0xF) == STT_FUNC and sym.st_value != 0) {
             func_count += 1;
             // Calculate name length
@@ -364,7 +410,7 @@ pub fn parseElfSymbols(file_buf: [*]const u8, file_size: usize) ?*SymTable {
     var idx: u32 = 0;
     var name_off: u32 = 0;
     for (0..sym_count) |i| {
-        const sym: *align(1) const Elf64Sym = @ptrCast(file_buf + sym_offset + i * sym_entsize);
+        const sym: *align(1) const Elf64Sym = @ptrCast(syms.ptr + i * sym_entsize);
         if ((sym.st_info & 0xF) == STT_FUNC and sym.st_value != 0) {
             if (idx >= func_count) break;
 
