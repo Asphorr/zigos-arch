@@ -1,11 +1,12 @@
 const std = @import("std");
 const io = @import("../io.zig");
+const virtio_console = @import("../driver/virtio_console.zig");
 
 const PORT: u16 = 0x3F8; // COM1
 
 // Line Status Register (PORT+5) bits used ONLY by the bounded-poll
-// emergency writer below (the normal putChar path is fire-and-forget on
-// purpose — see putChar's comment for why).
+// emergency writer below (the normal putChars path is fire-and-forget on
+// purpose — see putChars's comment for why).
 const LSR: u16 = PORT + 5;
 const LSR_THR_EMPTY: u8 = 0x20; // bit 5 — holding reg empty, OK to queue a byte
 const LSR_TEMT: u8 = 0x40; // bit 6 — transmitter fully drained (FIFO + shift reg)
@@ -103,6 +104,10 @@ pub var deferred: bool = false;
 /// send to the UART. Single consumer: only the BSP ksoftirqd drainer (or
 /// the one-shot emergency flush) advances it.
 var drain_pos: u32 = 0;
+/// Bytes drainToPort has sent, for profiling (single writer: the drainer).
+pub var drained_bytes: u64 = 0;
+/// drainToPort's staging; the drainer is the only user.
+var drain_chunk: [virtio_console.SLOT_BYTES]u8 = undefined;
 
 /// Bytes that fell out of the ring before the drainer reached them (port
 /// output lost them; the in-ring /dev/kmsg view saw them until lapped).
@@ -135,17 +140,16 @@ pub fn init() void {
     io.outb(PORT + 4, 0x0B); // IRQs enabled, RTS/DSR set
 }
 
-fn putChar(c: u8) void {
-    // No busy-wait on LSR.THR_EMPTY. QEMU's emulated UART rate-limits the
-    // FIFO drain, and the spin loop here was costing ~us per byte under
-    // contention — a single 80-char klog took 30-400 ms to drain because
-    // each putChar busy-waited on a kvm-exit-emulated `inb`. Stacked
-    // across the dozen klogs in a `desktop.createGuiWindow` call path,
-    // it added 200-400 ms per window — the actual cause of "files take
-    // 6-8 s to load". Fire-and-forget: if QEMU's 16-byte FIFO is full
-    // we drop a byte, which is fine for a debug log. The in-kernel ring
-    // (`ringPush`, /dev/kmsg) keeps the full text either way.
-    io.outb(PORT, c);
+/// Send `bytes` to the UART, an `outb` each. Every one is a VM exit (~30 µs
+/// under nested virtualization); `rep outsb` is no cheaper there, its
+/// iterations exit one by one and through the emulator (~50 µs a byte).
+///
+/// No busy-wait on LSR.THR_EMPTY: each poll is an exit too, and a spin here
+/// once made an 80-char klog take 30-400 ms. Fire-and-forget: a UART whose
+/// FIFO is full drops bytes, which is fine for a debug log; the in-kernel
+/// ring (`ringPush`, /dev/kmsg) keeps the full text either way.
+fn putChars(bytes: []const u8) void {
+    for (bytes) |c| io.outb(PORT, c);
 }
 
 fn ringPush(c: u8) void {
@@ -182,11 +186,8 @@ pub fn write(msg: []const u8) void {
     }
     const flags = lockWrite();
     defer unlockWrite(flags);
-    const to_port = !@atomicLoad(bool, &deferred, .monotonic);
-    for (msg) |c| {
-        if (to_port) putChar(c);
-        ringPush(c);
-    }
+    if (!@atomicLoad(bool, &deferred, .monotonic)) putChars(msg);
+    for (msg) |c| ringPush(c);
 }
 
 /// Sync the drain cursor to the current write head. Called once when flipping
@@ -209,19 +210,22 @@ pub fn pendingToPort() u32 {
 }
 
 /// .klog softirq handler — runs in ksoftirqd (IF=1, schedulable). Copies
-/// pending ring bytes to the UART in small chunks. Lock-free against
+/// pending ring bytes out, through the virtio console in page-sized chunks
+/// when there is one, else to the UART in small ones. Lock-free against
 /// writers: ringRead only touches stream positions < total_written, which
 /// are stable unless the ring laps the cursor mid-drain — under that kind
 /// of burst a torn byte in the port output is acceptable (the ring is the
 /// canonical record) and the lap itself is counted + reported.
 pub fn drainToPort() void {
     if (!@atomicLoad(bool, &deferred, .monotonic)) return;
-    var chunk: [256]u8 = undefined;
+    const console = virtio_console.isReady();
     // Per-invocation cap: ksoftirqd also drains .hid (input) — a full-ring
     // drain at ~µs-per-char of port VM exits would block input for tens of
     // ms under storm logging. 4 KB ≈ a few ms worst case; the leftover
-    // keeps pendingToPort() nonzero so the next tick re-raises us.
-    var budget: u32 = 4096;
+    // keeps pendingToPort() nonzero so the next tick re-raises us. The
+    // console costs an exit per chunk, not per byte: it takes the lot.
+    var budget: u32 = if (console) RING_LEN else 4096;
+    const chunk_len: u32 = if (console) drain_chunk.len else 256;
     while (budget > 0) {
         const behind = @atomicLoad(u32, &total_written, .monotonic) -% drain_pos;
         if (behind == 0) break;
@@ -229,9 +233,10 @@ pub fn drainToPort() void {
             // Writers lapped us; ringRead will jump the cursor forward.
             port_lost_bytes +%= behind - RING_LEN;
         }
-        const n = ringRead(&drain_pos, &chunk, chunk.len);
+        const n = ringRead(&drain_pos, &drain_chunk, chunk_len);
         if (n == 0) break;
-        for (chunk[0..n]) |c| putChar(c);
+        if (!console or !virtio_console.write(drain_chunk[0..n])) putChars(drain_chunk[0..n]);
+        drained_bytes +%= n;
         budget -|= n;
     }
     if (port_lost_bytes != 0) {
@@ -423,11 +428,8 @@ fn writeFn(_: void, bytes: []const u8) error{}!usize {
     }
     const flags = lockWrite();
     defer unlockWrite(flags);
-    const to_port = !@atomicLoad(bool, &deferred, .monotonic);
-    for (bytes) |b| {
-        if (to_port) putChar(b);
-        ringPush(b);
-    }
+    if (!@atomicLoad(bool, &deferred, .monotonic)) putChars(bytes);
+    for (bytes) |b| ringPush(b);
     return bytes.len;
 }
 pub const writer = WriterType{ .context = {} };

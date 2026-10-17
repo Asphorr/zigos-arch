@@ -482,6 +482,8 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
 
     // ---- Phase 4: Storage & filesystems ----------------------------------
     blog.phase(.storage, "\u{25A4}", "Storage & filesystems"); // ▤
+    // The klog drain's cheap way out, when QEMU offers a virtconsole.
+    if (@import("driver/virtio_console.zig").init()) blog.ok("virtio console (klog)");
     @import("driver/block.zig").init();
     blog.ok("Block layer (NVMe/AHCI/IDE)");
     fat32.init();

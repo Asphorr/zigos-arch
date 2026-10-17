@@ -62,6 +62,10 @@ fi
 #                                 usable PMEM SPA 256→254 MiB (stays 2M-aligned);
 #                                 pmem.img is NOT recreated (the label area is
 #                                 just the last 2 MiB of the existing image).
+#   virtconsole on the mux chardev — the kernel log leaves through it once
+#                                 ksoftirqd drains it, a doorbell per 4 KiB;
+#                                 the UART (same file) keeps early boot and
+#                                 panics. Each UART byte is a VM exit.
 VKR_DEBUG=udmabuf \
 LD_LIBRARY_PATH=/usr/local/lib/x86_64-linux-gnu \
 VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json \
@@ -89,6 +93,7 @@ VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json \
     -device nvme,drive=nvm_ext2,serial=zigos-ext2 \
     -drive file=swap.img,format=raw,if=none,id=nvm_swap \
     -device nvme,drive=nvm_swap,serial=zigos-swap \
-    -serial file:serial.log "$@"
+    -chardev file,id=klog,path=serial.log,mux=on -serial chardev:klog \
+    -device virtio-serial-pci,id=vser0 -device virtconsole,chardev=klog "$@"
 
 [ -x tools/crash_db.sh ] && tools/crash_db.sh serial.log
