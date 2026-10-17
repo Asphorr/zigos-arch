@@ -635,6 +635,52 @@ pub fn unmapUserRange(pml4: [*]align(4096) u64, start: usize, end: usize) usize 
     return freed;
 }
 
+/// Give every present 4 KB user page in [start, end) the protection `flags`
+/// (protToMapFlags / cacheMapFlags output), keeping its frame, its accessed
+/// and dirty bits, its caching type, and copy-on-write: a COW page stays
+/// read-only, so its first write still copies. Not-present entries (never
+/// faulted, swapped out) are left alone; they come back with their region's
+/// prot. One walk per 2 MB span, like unmapUserRange, and no TLB invalidation
+/// — the caller shoots the range down once. Caller holds the write side of
+/// the owner's as_lock.
+pub fn reprotectUserRange(pml4: [*]align(4096) u64, start: usize, end: usize, flags: u64) void {
+    // Bit 7 of a 4 KB PTE is PAT.
+    const KEEP: u64 = PAGE_MASK | paging.COW | paging.ACCESSED | paging.DIRTY |
+        paging.WRITE_THROUGH | paging.CACHE_DISABLE | (1 << 7);
+    if (start >= end) return;
+    const range_start = start & ~@as(usize, 0xFFF);
+    const range_end = (end + 0xFFF) & ~@as(usize, 0xFFF);
+    if (range_start < USER_SPACE_START or range_end > USER_SPACE_END) return;
+
+    var span = range_start & ~@as(usize, 0x1FFFFF);
+    while (span < range_end) : (span += 0x200000) {
+        const pml4_idx = (span >> 39) & 0x1FF;
+        const pdpt_idx = (span >> 30) & 0x1FF;
+        const pd_idx = (span >> 21) & 0x1FF;
+        if (pml4[pml4_idx] & PRESENT == 0) continue;
+        const pdpt = tableFromEntry(pml4[pml4_idx]);
+        if (pdpt[pdpt_idx] & PRESENT == 0 or pdpt[pdpt_idx] & PAGE_SIZE_FLAG != 0) continue;
+        const pd = tableFromEntry(pdpt[pdpt_idx]);
+        if (pd[pd_idx] & PRESENT == 0 or pd[pd_idx] & PAGE_SIZE_FLAG != 0) continue;
+        const pt = tableFromEntry(pd[pd_idx]);
+
+        const lo = @max(span, range_start);
+        const hi = @min(span + 0x200000, range_end);
+        var i: usize = (lo >> 12) & 0x1FF;
+        const i_end: usize = i + ((hi - lo) >> 12);
+        while (i < i_end) : (i += 1) {
+            // CAS: the hardware sets A/D under us.
+            while (true) {
+                const pte = @atomicLoad(u64, &pt[i], .acquire);
+                if (pte & PRESENT == 0 or pte & USER == 0) break;
+                var new = (pte & KEEP) | flags | PRESENT | USER;
+                if (pte & paging.COW != 0) new &= ~READ_WRITE;
+                if (@cmpxchgStrong(u64, &pt[i], pte, new, .seq_cst, .seq_cst) == null) break;
+            }
+        }
+    }
+}
+
 /// Gap #12 (2026-05-20): public iterator over every present 4 KB user PTE
 /// under `pml4`. Calls `callback(ctx, virt, phys, flags)` per page. Skips
 /// huge pages (none should exist in user space under Phase 3 — see gap

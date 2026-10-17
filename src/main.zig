@@ -710,6 +710,7 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
         // does, not a script — so it is compiled in unconditionally.
         17 => @intFromPtr(&@import("ui/installer.zig").taskEntry),
         18 => @intFromPtr(&@import("test/user_selftest.zig").taskEntry),
+        19 => @intFromPtr(&@import("test/linux_selftest.zig").taskEntry),
         // Mode 9 (GPU compositor) boots the regular desktop; the desktop
         // detects boot_mode==9 and spawns ui/gpu_compositor.zig as a
         // side-by-side kernel task so they share one screen.

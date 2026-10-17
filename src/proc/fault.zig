@@ -728,6 +728,8 @@ fn resolveFault(cur: usize, pcb: *PCB, pd: [*]align(4096) u64, lead: *PCB, cr2: 
         logFaultMiss(cur, lead, cr2, error_code);
         return .unhandled;
     }).*;
+    // PROT_NONE reserves the range; no page may appear in it.
+    if (r.prot == 0) return .unhandled;
     const va_aligned = cr2 & ~@as(usize, 0xFFF);
 
     // Shared-anon: no swap, no fresh alloc — the shm registry owns the
@@ -1017,6 +1019,8 @@ fn prefaultPage(pd: [*]align(4096) u64, lead: *PCB, page: usize) bool {
     // If a real 4K PTE is already installed (has USER bit), nothing
     // to do. Otherwise allocate + map + (optionally) copy from src.
     if (pageHasRealMapping(pd, page)) return true;
+    // PROT_NONE: stays unmapped, so the range check fails it.
+    if (r.prot == 0) return true;
 
     // Shared-anon: the registry frame. A private zero page here
     // would silently unshare the page for this process.
@@ -1141,6 +1145,7 @@ fn ensureUserRangeFor(owner_pcb: *process.PCB, va: usize, len: usize, need_write
             }
         } else {
             const r = (lead.regions.find(p) orelse return false).*;
+            if (r.prot == 0) return false;
             if (r.shm_id != @import("../mm/shm.zig").SHM_INVALID) {
                 if (!mapShmPage(pd, r, p)) return false;
             } else if (r.cache_inode != 0) {

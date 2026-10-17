@@ -15,6 +15,9 @@
 //!   * M2 — file I/O on the ext2 root: a libc program that opendir/readdir's or
 //!     fopen/fread's a real file (openat/read/close/lseek/fstat/newfstatat/
 //!     getdents64) plus anonymous mmap + brk for malloc.
+//!   * M3 — memory management (linux_mm.zig): mmap/munmap/mprotect/madvise/
+//!     brk on the region set, anywhere in the 512 GB window; pread/pwrite;
+//!     resource limits.
 //!
 //! The native ABI (3×u32 args, native numbers, return u32) is entirely
 //! separate and untouched — the only shared edge is doSyscall's one-line
@@ -29,11 +32,14 @@ const ext2_inode = @import("../../fs/ext2/inode.zig");
 const ext2_fs = @import("../../fs/ext2/ext2.zig");
 const heap = @import("../../mm/heap.zig");
 const memmap = @import("../../mm/memmap.zig");
+const config = @import("../../config.zig");
+const linux_mm = @import("linux_mm.zig");
 
 // --- Linux x86-64 errno (DISTINCT from zigos common.E_* — different values).
 // Returned to userspace as the sign-extended negative, per the kernel ABI.
 const EPERM: i64 = 1;
 const ENOENT: i64 = 2;
+const ESRCH: i64 = 3;
 const EBADF: i64 = 9;
 const ENOMEM: i64 = 12;
 const EFAULT: i64 = 14;
@@ -41,6 +47,7 @@ const ENOTDIR: i64 = 20;
 const EISDIR: i64 = 21;
 const EINVAL: i64 = 22;
 const ENOTTY: i64 = 25;
+const EFBIG: i64 = 27;
 const ERANGE: i64 = 34;
 const ESPIPE: i64 = 29;
 const ENOSYS: i64 = 38;
@@ -64,9 +71,16 @@ const SYS_brk: u32 = 12;
 const SYS_rt_sigaction: u32 = 13;
 const SYS_rt_sigprocmask: u32 = 14;
 const SYS_ioctl: u32 = 16;
+const SYS_pread64: u32 = 17;
+const SYS_pwrite64: u32 = 18;
 const SYS_readv: u32 = 19;
 const SYS_writev: u32 = 20;
+const SYS_mremap: u32 = 25;
+const SYS_madvise: u32 = 28;
 const SYS_fcntl: u32 = 72;
+const SYS_getrlimit: u32 = 97;
+const SYS_setrlimit: u32 = 160;
+const SYS_prlimit64: u32 = 302;
 
 // fcntl commands (the few musl's open/opendir paths issue).
 const F_DUPFD: u64 = 0;
@@ -113,7 +127,6 @@ const LINUX_O_CREAT: u64 = 0x40;
 const LINUX_O_TRUNC: u64 = 0x200;
 const LINUX_O_APPEND: u64 = 0x400;
 
-const MAP_ANONYMOUS: u64 = 0x20;
 const AT_EMPTY_PATH: u64 = 0x1000;
 
 // d_type values for getdents64.
@@ -193,10 +206,17 @@ pub fn dispatch(num: u32, frame: *signals.SyscallFrame) u64 {
         SYS_fstat => return sysFstat(@truncate(a1), a2),
         SYS_newfstatat => return sysNewfstatat(a1, a2, a3, a4),
         SYS_getdents64 => return sysGetdents64(@truncate(a1), a2, a3),
-        SYS_mmap => return sysMmap(a1, a2, a3, a4, a5, a6),
-        SYS_munmap => return 0, // no per-region reclaim yet; freed at exit
-        SYS_mprotect => return 0, // anon pages are already RW; no-op
-        SYS_brk => return sysBrk(a1),
+        SYS_pread64 => return sysPread(@truncate(a1), a2, a3, a4),
+        SYS_pwrite64 => return sysPwrite(@truncate(a1), a2, a3, a4),
+        SYS_mmap => return linux_mm.mmap(a1, a2, a3, a4, a5, a6),
+        SYS_munmap => return linux_mm.munmap(a1, a2),
+        SYS_mprotect => return linux_mm.mprotect(a1, a2, a3),
+        SYS_madvise => return linux_mm.madvise(a1, a2, a3),
+        SYS_brk => return linux_mm.brk(a1),
+        SYS_mremap => return linux_mm.mremap(),
+        SYS_getrlimit => return sysPrlimit(0, a1, 0, a2),
+        SYS_setrlimit => return sysPrlimit(0, a1, a2, 0),
+        SYS_prlimit64 => return sysPrlimit(a1, a2, a3, a4),
         // isatty / line-buffering probe: musl's first stdio write does
         // ioctl(fd, TIOCGWINSZ). Reporting "not a tty" (-ENOTTY) makes it pick
         // full buffering and flush via writev at exit — exactly what we want.
@@ -602,41 +622,84 @@ fn sysGetdents64(fd: u32, buf_va: u64, count: u64) u64 {
     return used;
 }
 
-/// mmap(addr, len, prot, flags, fd, off). M2 implements MAP_ANONYMOUS only
-/// (musl's mallocng allocates anonymous), reusing the native grow-down lazy
-/// region machinery. File-backed mmap is reported unimplemented for now.
-fn sysMmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, off: u64) u64 {
-    _ = addr;
-    _ = prot;
-    _ = off;
-    if (len == 0) return err(EINVAL);
-    if (flags & MAP_ANONYMOUS == 0) {
-        debug.klog("[linux] mmap non-anon unsupported (flags=0x{X} fd=0x{X})\n", .{ flags, fd });
-        return err(ENOSYS);
-    }
-    const pcb = process.currentPCB() orelse return err(EFAULT);
-    _ = pcb.page_directory orelse return err(EFAULT);
-    const lead = process.leader(pcb);
-    lead.as_lock.acquire();
-    defer lead.as_lock.release();
-    const len_pg: usize = (@as(usize, @intCast(@min(len, 0xFFFF_F000))) + 0xFFF) & ~@as(usize, 0xFFF);
-    if (len_pg == 0 or len_pg > lead.mmap_top) return err(ENOMEM);
-    const new_top = lead.mmap_top - len_pg;
-    if (new_top < lead.user_brk) return err(ENOMEM);
-    if (!process.addRegion(lead.tgid, .{ .start = new_top, .end = lead.mmap_top, .prot = process.PROT_RW })) return err(ENOMEM);
-    lead.mmap_top = new_top;
-    return new_top;
+/// The ext2 file behind `fd` for a positioned read or write: -EBADF for a
+/// closed fd, -ESPIPE for anything without a byte offset of its own.
+fn positionedFile(pcb: *process.PCB, fd: u32, off: u64) union(enum) { file: *process.FileDesc, fail: u64 } {
+    if (fd >= pcb.fd_table.len or !pcb.fd_table[fd].in_use) return .{ .fail = err(EBADF) };
+    if (@as(i64, @bitCast(off)) < 0) return .{ .fail = err(EINVAL) };
+    const fe = &pcb.fd_table[fd];
+    if (fe.fs_type != .ext2) return .{ .fail = err(ESPIPE) };
+    return .{ .file = fe };
 }
 
-/// brk(addr). Minimal: report the current break, never move it. musl (mallocng)
-/// allocates via mmap and only probes brk(0); returning the current break for
-/// any request makes it fall back to mmap rather than trusting a half-grown
-/// heap. (Wire to the sbrk heap region if a brk-based allocator ever appears in
-/// the log.)
-fn sysBrk(addr: u64) u64 {
-    _ = addr;
+/// pread64(fd, buf, count, off): read at `off`; the fd offset stays put.
+fn sysPread(fd: u32, buf_va: u64, count: u64, off: u64) u64 {
     const pcb = process.currentPCB() orelse return err(EFAULT);
-    return @intCast(process.leader(pcb).user_brk);
+    const fe = switch (positionedFile(pcb, fd, off)) {
+        .file => |f| f,
+        .fail => |e| return e,
+    };
+    if (count == 0) return 0;
+    const len = rwLen(count);
+    if (!common.validateUserPtrWrite(buf_va, len)) return err(EFAULT);
+    if (ext2_inode.readInode(fe.inode)) |ino| {
+        if (ext2_inode.isDir(&ino)) return err(EISDIR);
+    }
+    return vfs.readThroughCache(fe.inode, off, @ptrFromInt(buf_va), len);
+}
+
+/// pwrite64(fd, buf, count, off): write at `off`; the fd offset stays put.
+fn sysPwrite(fd: u32, buf_va: u64, count: u64, off: u64) u64 {
+    const pcb = process.currentPCB() orelse return err(EFAULT);
+    const fe = switch (positionedFile(pcb, fd, off)) {
+        .file => |f| f,
+        .fail => |e| return e,
+    };
+    if (count == 0) return 0;
+    const len = rwLen(count);
+    if (!common.validateUserPtr(buf_va, len)) return err(EFAULT);
+    // fd offsets are u32.
+    if (off + len > 0xFFFF_FFFF) return err(EFBIG);
+    const saved = fe.offset;
+    fe.offset = @intCast(off);
+    const n = vfs.write(pcb, fd, @ptrFromInt(buf_va), len);
+    fe.offset = saved;
+    if (n == 0xFFFF_FFFF) return err(EBADF);
+    return n;
+}
+
+const RLIMIT_STACK: u64 = 3;
+const RLIMIT_NOFILE: u64 = 7;
+const RLIMIT_NLIMITS: u64 = 16;
+const RLIM_INFINITY: u64 = ~@as(u64, 0);
+
+const Rlimit = extern struct { cur: u64, max: u64 };
+
+fn rlimitOf(resource: u64) Rlimit {
+    return switch (resource) {
+        RLIMIT_STACK => .{ .cur = memmap.LINUX_STACK_RESERVE, .max = memmap.LINUX_STACK_RESERVE },
+        RLIMIT_NOFILE => .{ .cur = config.MAX_FDS, .max = config.MAX_FDS },
+        else => .{ .cur = RLIM_INFINITY, .max = RLIM_INFINITY },
+    };
+}
+
+/// prlimit64(pid, resource, new, old), and getrlimit/setrlimit through it.
+/// The limits are fixed: the stack is the stack region, open files the fd
+/// table, the rest unlimited. A well-formed new limit is accepted and has no
+/// effect.
+fn sysPrlimit(pid: u64, resource: u64, new_va: u64, old_va: u64) u64 {
+    if (pid != 0 and pid != process.getCurrentPid()) return err(ESRCH);
+    if (resource >= RLIMIT_NLIMITS) return err(EINVAL);
+    if (new_va != 0) {
+        if (!common.validateUserPtr(new_va, @sizeOf(Rlimit))) return err(EFAULT);
+        const want = @as(*align(1) const Rlimit, @ptrFromInt(new_va)).*;
+        if (want.cur > want.max) return err(EINVAL);
+    }
+    if (old_va != 0) {
+        if (!common.validateUserPtrWrite(old_va, @sizeOf(Rlimit))) return err(EFAULT);
+        @as(*align(1) Rlimit, @ptrFromInt(old_va)).* = rlimitOf(resource);
+    }
+    return 0;
 }
 
 /// arch_prctl(code, addr). Only ARCH_SET_FS / ARCH_GET_FS are meaningful for
