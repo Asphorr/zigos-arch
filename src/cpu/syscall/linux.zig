@@ -28,6 +28,7 @@ const debug = @import("../../debug/debug.zig");
 const ext2_inode = @import("../../fs/ext2/inode.zig");
 const ext2_fs = @import("../../fs/ext2/ext2.zig");
 const heap = @import("../../mm/heap.zig");
+const memmap = @import("../../mm/memmap.zig");
 
 // --- Linux x86-64 errno (DISTINCT from zigos common.E_* — different values).
 // Returned to userspace as the sign-extended negative, per the kernel ABI.
@@ -235,20 +236,24 @@ pub fn dispatch(num: u32, frame: *signals.SyscallFrame) u64 {
     }
 }
 
-/// write(fd, buf, count). Delegates to the same vfs.write the native path uses
-/// (zigos user VAs are sub-4GB, so the 64-bit pointer round-trips through the
-/// u32 helpers). Returns the byte count on success; a faulting buffer is
-/// -EFAULT.
+/// Most bytes one read or write moves, as Linux's MAX_RW_COUNT; vfs counts
+/// in u32.
+const MAX_RW: u64 = 0x7FFF_F000;
+
+inline fn rwLen(count: u64) u32 {
+    return @intCast(@min(count, MAX_RW));
+}
+
+/// write(fd, buf, count). Delegates to the same vfs.write the native path
+/// uses. Returns the byte count on success; a faulting buffer is -EFAULT.
 fn sysWrite(fd: u32, buf_va: u64, count: u64) u64 {
     if (count == 0) return 0;
-    const len: usize = @intCast(count);
-    if (buf_va > 0xFFFF_FFFF or !common.validateUserPtr(@truncate(buf_va), @truncate(len))) {
-        return err(EFAULT);
-    }
+    const len = rwLen(count);
+    if (!common.validateUserPtr(buf_va, len)) return err(EFAULT);
     const pcb = process.currentPCB() orelse return err(EFAULT);
-    const buf: [*]const u8 = @ptrFromInt(@as(usize, @intCast(buf_va)));
+    const buf: [*]const u8 = @ptrFromInt(buf_va);
     if (fd <= 2 and len <= 1024) debug.klog("[linux] write(fd={d}): {s}", .{ fd, buf[0..len] });
-    const n = vfs.write(pcb, fd, buf, @truncate(len));
+    const n = vfs.write(pcb, fd, buf, len);
     if (n == 0xFFFF_FFFF) return err(EBADF);
     return n;
 }
@@ -257,16 +262,15 @@ fn sysWrite(fd: u32, buf_va: u64, count: u64) u64 {
 /// bad fd). Linux read of a directory fd is -EISDIR.
 fn sysRead(fd: u32, buf_va: u64, count: u64) u64 {
     if (count == 0) return 0;
-    if (buf_va > 0xFFFF_FFFF) return err(EFAULT);
-    const len: u32 = if (count > 0xFFFF_F000) 0xFFFF_F000 else @truncate(count);
-    if (!common.validateUserPtrWrite(@truncate(buf_va), len)) return err(EFAULT);
+    const len = rwLen(count);
+    if (!common.validateUserPtrWrite(buf_va, len)) return err(EFAULT);
     const pcb = process.currentPCB() orelse return err(EFAULT);
     if (fd < pcb.fd_table.len and pcb.fd_table[fd].in_use and pcb.fd_table[fd].fs_type == .ext2) {
         if (ext2_inode.readInode(pcb.fd_table[fd].inode)) |ino| {
             if (ext2_inode.isDir(&ino)) return err(EISDIR);
         }
     }
-    const buf: [*]u8 = @ptrFromInt(@as(usize, @intCast(buf_va)));
+    const buf: [*]u8 = @ptrFromInt(buf_va);
     const n = vfs.read(pcb, fd, buf, len);
     if (n == 0xFFFF_FFFF) return err(EBADF);
     return n;
@@ -279,12 +283,11 @@ fn sysRead(fd: u32, buf_va: u64, count: u64) u64 {
 fn sysWritev(fd: u32, iov_va: u64, iovcnt: u64) u64 {
     if (iovcnt == 0) return 0;
     if (iovcnt > 1024) return err(EINVAL); // sane cap; UIO_MAXIOV is 1024
-    if (iov_va > 0xFFFF_FFFF) return err(EFAULT);
     const n: usize = @intCast(iovcnt);
     const array_bytes = n * @sizeOf(Iovec);
-    if (!common.validateUserPtr(@truncate(iov_va), @truncate(array_bytes))) return err(EFAULT);
+    if (!common.validateUserPtr(iov_va, array_bytes)) return err(EFAULT);
     const pcb = process.currentPCB() orelse return err(EFAULT);
-    const iov: [*]align(1) const Iovec = @ptrFromInt(@as(usize, @intCast(iov_va)));
+    const iov: [*]align(1) const Iovec = @ptrFromInt(iov_va);
 
     var total: u64 = 0;
     var i: usize = 0;
@@ -292,15 +295,13 @@ fn sysWritev(fd: u32, iov_va: u64, iovcnt: u64) u64 {
         const base = iov[i].base;
         const seg = iov[i].len;
         if (seg == 0) continue;
-        if (seg > 0xFFFF_FFFF or base > 0xFFFF_FFFF or
-            !common.validateUserPtr(@truncate(base), @truncate(seg)))
-        {
+        const l = rwLen(seg);
+        if (!common.validateUserPtr(base, l)) {
             if (total > 0) return total;
             return err(EFAULT);
         }
-        const buf: [*]const u8 = @ptrFromInt(@as(usize, @intCast(base)));
-        const l: u32 = @truncate(seg);
-        if (fd <= 2 and seg <= 1024) debug.klog("[linux] writev(fd={d}): {s}", .{ fd, buf[0..@intCast(seg)] });
+        const buf: [*]const u8 = @ptrFromInt(base);
+        if (fd <= 2 and l <= 1024) debug.klog("[linux] writev(fd={d}): {s}", .{ fd, buf[0..l] });
         const w = vfs.write(pcb, fd, buf, l);
         if (w == 0xFFFF_FFFF) {
             if (total > 0) return total;
@@ -319,10 +320,9 @@ fn sysWritev(fd: u32, iov_va: u64, iovcnt: u64) u64 {
 fn sysReadv(fd: u32, iov_va: u64, iovcnt: u64) u64 {
     if (iovcnt == 0) return 0;
     if (iovcnt > 1024) return err(EINVAL);
-    if (iov_va > 0xFFFF_FFFF) return err(EFAULT);
     const n: usize = @intCast(iovcnt);
     const array_bytes = n * @sizeOf(Iovec);
-    if (!common.validateUserPtr(@truncate(iov_va), @truncate(array_bytes))) return err(EFAULT);
+    if (!common.validateUserPtr(iov_va, array_bytes)) return err(EFAULT);
     const pcb = process.currentPCB() orelse return err(EFAULT);
     // Linux read of a directory fd is -EISDIR (same guard as sysRead).
     if (fd < pcb.fd_table.len and pcb.fd_table[fd].in_use and pcb.fd_table[fd].fs_type == .ext2) {
@@ -330,21 +330,19 @@ fn sysReadv(fd: u32, iov_va: u64, iovcnt: u64) u64 {
             if (ext2_inode.isDir(&ino)) return err(EISDIR);
         }
     }
-    const iov: [*]align(1) const Iovec = @ptrFromInt(@as(usize, @intCast(iov_va)));
+    const iov: [*]align(1) const Iovec = @ptrFromInt(iov_va);
     var total: u64 = 0;
     var i: usize = 0;
     while (i < n) : (i += 1) {
         const base = iov[i].base;
         const seg = iov[i].len;
         if (seg == 0) continue;
-        if (seg > 0xFFFF_FFFF or base > 0xFFFF_FFFF or
-            !common.validateUserPtrWrite(@truncate(base), @truncate(seg)))
-        {
+        const l = rwLen(seg);
+        if (!common.validateUserPtrWrite(base, l)) {
             if (total > 0) return total;
             return err(EFAULT);
         }
-        const buf: [*]u8 = @ptrFromInt(@as(usize, @intCast(base)));
-        const l: u32 = @truncate(seg);
+        const buf: [*]u8 = @ptrFromInt(base);
         const r = vfs.read(pcb, fd, buf, l);
         if (r == 0xFFFF_FFFF) {
             if (total > 0) return total;
@@ -378,12 +376,13 @@ fn sysFcntl(fd: u32, cmd: u64, arg: u64) u64 {
 /// or null on a faulting/empty pointer. `allow_empty` keeps a zero-length path
 /// (newfstatat's AT_EMPTY_PATH form); otherwise empty → null.
 fn readUserPath(va: u64, out: *[256]u8, allow_empty: bool) ?[]const u8 {
-    if (va == 0 or va > 0xFFFF_FFFF) return null;
-    const base: usize = @intCast(va);
+    if (va == 0) return null;
     var nlen: usize = 0;
     while (nlen < 255) : (nlen += 1) {
-        if (!common.validateUserPtr(@truncate(base + nlen), 1)) return null;
-        const ch = @as([*]const u8, @ptrFromInt(base + nlen))[0];
+        // Once per page; the first check bounds va below the user ceiling.
+        const at = va + nlen;
+        if ((nlen == 0 or at & 0xFFF == 0) and !common.validateUserPtr(at, 1)) return null;
+        const ch = @as([*]const u8, @ptrFromInt(at))[0];
         if (ch == 0) break;
         out[nlen] = ch;
     }
@@ -488,8 +487,8 @@ fn statByFd(pcb: *process.PCB, fd: u32, st: *LinuxStat) u64 {
 /// fstat(fd, statbuf).
 fn sysFstat(fd: u32, statbuf_va: u64) u64 {
     const pcb = process.currentPCB() orelse return err(EFAULT);
-    if (statbuf_va > 0xFFFF_FFFF or !common.validateUserPtrWrite(@truncate(statbuf_va), @sizeOf(LinuxStat))) return err(EFAULT);
-    const st: *LinuxStat = @ptrFromInt(@as(usize, @intCast(statbuf_va)));
+    if (!common.validateUserPtrWriteAligned(statbuf_va, @sizeOf(LinuxStat), @alignOf(LinuxStat))) return err(EFAULT);
+    const st: *LinuxStat = @ptrFromInt(statbuf_va);
     st.* = .{};
     return statByFd(pcb, fd, st);
 }
@@ -499,8 +498,8 @@ fn sysFstat(fd: u32, statbuf_va: u64) u64 {
 /// dirfd-relative resolution against an arbitrary directory fd is deferred.
 fn sysNewfstatat(dirfd: u64, path_va: u64, statbuf_va: u64, flags: u64) u64 {
     const pcb = process.currentPCB() orelse return err(EFAULT);
-    if (statbuf_va > 0xFFFF_FFFF or !common.validateUserPtrWrite(@truncate(statbuf_va), @sizeOf(LinuxStat))) return err(EFAULT);
-    const st: *LinuxStat = @ptrFromInt(@as(usize, @intCast(statbuf_va)));
+    if (!common.validateUserPtrWriteAligned(statbuf_va, @sizeOf(LinuxStat), @alignOf(LinuxStat))) return err(EFAULT);
+    const st: *LinuxStat = @ptrFromInt(statbuf_va);
     st.* = .{};
 
     var pbuf: [256]u8 = undefined;
@@ -530,8 +529,8 @@ const UTS_LEN: usize = 65;
 const UTSNAME_SIZE: usize = 6 * UTS_LEN; // 390 bytes
 
 fn sysUname(buf_va: u64) u64 {
-    if (buf_va == 0 or buf_va > 0xFFFF_FFFF or !common.validateUserPtrWrite(@truncate(buf_va), UTSNAME_SIZE)) return err(EFAULT);
-    const buf: []u8 = @as([*]u8, @ptrFromInt(@as(usize, @intCast(buf_va))))[0..UTSNAME_SIZE];
+    if (buf_va == 0 or !common.validateUserPtrWrite(buf_va, UTSNAME_SIZE)) return err(EFAULT);
+    const buf: []u8 = @as([*]u8, @ptrFromInt(buf_va))[0..UTSNAME_SIZE];
     @memset(buf, 0); // zero first so every field is NUL-terminated
     const fields = [_][]const u8{ "Linux", "zigos", "6.6.0-zigos", "#1 zigos", "x86_64", "(none)" };
     inline for (fields, 0..) |f, i| {
@@ -549,8 +548,8 @@ fn sysGetcwd(buf_va: u64, size: u64) u64 {
     const cwd = pcb.cwd[0..pcb.cwd_len];
     const needed: u64 = @as(u64, @intCast(cwd.len)) + 1; // path + NUL
     if (size < needed) return err(ERANGE);
-    if (buf_va == 0 or buf_va > 0xFFFF_FFFF or !common.validateUserPtrWrite(@truncate(buf_va), @as(usize, @intCast(needed)))) return err(EFAULT);
-    const out: [*]u8 = @ptrFromInt(@as(usize, @intCast(buf_va)));
+    if (buf_va == 0 or !common.validateUserPtrWrite(buf_va, needed)) return err(EFAULT);
+    const out: [*]u8 = @ptrFromInt(buf_va);
     @memcpy(out[0..cwd.len], cwd);
     out[cwd.len] = 0;
     return needed;
@@ -567,10 +566,9 @@ fn sysGetdents64(fd: u32, buf_va: u64, count: u64) u64 {
     if (fe.fs_type != .ext2) return err(ENOTDIR);
     const dino = ext2_inode.readInode(fe.inode) orelse return err(EBADF);
     if (!ext2_inode.isDir(&dino)) return err(ENOTDIR);
-    if (buf_va > 0xFFFF_FFFF) return err(EFAULT);
-    const cap: u32 = if (count > 0xFFFF_F000) 0xFFFF_F000 else @truncate(count);
+    const cap = rwLen(count);
     if (cap < 32) return err(EINVAL);
-    if (!common.validateUserPtrWrite(@truncate(buf_va), cap)) return err(EFAULT);
+    if (!common.validateUserPtrWrite(buf_va, cap)) return err(EFAULT);
 
     // Heap temp (not stack): ext2.listDir already burns 4 KiB of stack for its
     // block buffer, so keep our own footprint off the kstack.
@@ -581,7 +579,7 @@ fn sysGetdents64(fd: u32, buf_va: u64, count: u64) u64 {
     const total = ext2_fs.listDir(fe.inode, @ptrCast(fents), MAX_DIR_ENTS);
 
     if (fe.offset >= total) return 0; // all entries already returned (EOF)
-    const ubuf: [*]u8 = @ptrFromInt(@as(usize, @intCast(buf_va)));
+    const ubuf: [*]u8 = @ptrFromInt(buf_va);
     var used: u32 = 0;
     var i: u32 = fe.offset;
     while (i < total) : (i += 1) {
@@ -650,6 +648,9 @@ fn sysArchPrctl(code: u64, addr: u64) u64 {
     const pcb = process.currentPCB() orelse return err(EFAULT);
     switch (code) {
         ARCH_SET_FS => {
+            // wrmsr #GPs on a non-canonical base; Linux refuses anything
+            // past the user window the same way.
+            if (addr >= memmap.USER_SPACE_END) return err(EPERM);
             pcb.fs_base = addr;
             const lo: u32 = @truncate(addr);
             const hi: u32 = @truncate(addr >> 32);
@@ -662,8 +663,8 @@ fn sysArchPrctl(code: u64, addr: u64) u64 {
             return 0;
         },
         ARCH_GET_FS => {
-            if (addr > 0xFFFF_FFFF or !common.validateUserPtrWrite(@truncate(addr), 8)) return err(EFAULT);
-            const p: *align(1) u64 = @ptrFromInt(@as(usize, @intCast(addr)));
+            if (!common.validateUserPtrWrite(addr, 8)) return err(EFAULT);
+            const p: *align(1) u64 = @ptrFromInt(addr);
             p.* = pcb.fs_base;
             return 0;
         },

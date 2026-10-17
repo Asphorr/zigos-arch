@@ -12,7 +12,7 @@
 //! User space carries TWO distinct floors, and conflating them is the class of
 //! bug that broke Ctrl+C (signals.zig) and EFAULT'd stack-buffer syscalls
 //! (common.zig). They are now structural, not conventional:
-//!   • CODE/RIP/segment validity  →  [USER_VA_FLOOR, USER_VA_MAX)
+//!   • CODE/RIP/segment validity  →  [USER_VA_FLOOR, USER_SPACE_END)
 //!       code never lives below the ELF load base. Used by kdbg.ripIsValidUser
 //!       and elf_loader.isUserVA. → `isValidUserCode` / `userCodeRangeOk`.
 //!   • DATA/STACK/mappable validity → [USER_SPACE_START, USER_SPACE_END)
@@ -24,6 +24,12 @@
 //! through a `switch` over it, so ADDING a region is a compile error until each
 //! validator decides where the new region belongs — the ad-hoc `if (va < FLOOR)`
 //! ladders that produced the conflated-floor footgun are gone.
+//!
+//! ── Two personalities, one window ──────────────────────────────────────────
+//! Every process may map anywhere in [USER_SPACE_START, USER_SPACE_END), 512 GB.
+//! Native processes keep their brk and mmap under NATIVE_SPACE_END: their
+//! syscall ABI carries 32-bit addresses. Linux processes put the stack at the
+//! top of the window and place mmaps from LINUX_MMAP_TOP down.
 
 const std = @import("std");
 
@@ -68,20 +74,30 @@ pub const USER_STACK_RESERVE: u64 = 0x100000; // 256 pages = 1 MB
 /// saved RIP below this on return-to-user is wild.
 pub const USER_VA_FLOOR: u64 = 0x500000; // 5 MB
 
-/// Initial sbrk position; heap grows up from here toward USER_SPACE_END.
+/// Initial native sbrk position; the heap grows up from here.
 pub const USER_BRK_INITIAL: u64 = 0x2000000; // 32 MB
 
-/// Data/stack/mappable ceiling (exclusive). mmap_top starts here and grows
-/// down; mapUserPage rejects >= this. The true addressable user ceiling.
-pub const USER_SPACE_END: u64 = 0x10000000; // 256 MB
+/// Native processes' brk and mmap ceiling (exclusive): their mmap_top starts
+/// here and grows down. Their syscall ABI passes addresses as u32.
+pub const NATIVE_SPACE_END: u64 = 0x10000000; // 256 MB
 
-/// ELF-segment / RIP validity ceiling (exclusive). Looser than USER_SPACE_END:
-/// a sanity bound on code addresses, NOT a guarantee of mappability. The span
-/// [USER_SPACE_END, USER_VA_MAX) is `user_high_unmappable` — code validators
-/// accept it but it cannot be mapped. (Tightening this to USER_SPACE_END is a
-/// candidate cleanup; kept wide here to stay behavior-identical to the
-/// pre-refactor kernel.)
-pub const USER_VA_MAX: u64 = 0x40000000; // 1 GB
+/// Linux processes: highest mmap placement (exclusive); the gap search runs
+/// down from here, leaving the window's top gigabyte to the stack.
+pub const LINUX_MMAP_TOP: u64 = USER_SPACE_END - 0x40000000;
+
+/// Linux processes: lowest address the gap search places an mmap at (hints
+/// and MAP_FIXED may go lower), so the brk heap above the image has room.
+pub const LINUX_MMAP_FLOOR: u64 = 0x100000000; // 4 GB
+
+/// Linux processes: the stack region, [USER_SPACE_END - this, USER_SPACE_END),
+/// demand-paged. Also the RLIMIT_STACK maximum reported to the program.
+pub const LINUX_STACK_RESERVE: u64 = 0x10000000; // 256 MB
+
+/// Data/stack/code ceiling (exclusive) for every process: mapUserPage rejects
+/// >= this. Exactly PML4[0]'s 512 GB — the user page-table walkers
+/// (vmm.destroyAddressSpace, cloneAddressSpace, forEachUserPage, the
+/// empty-table cascade in unmapUserRange) only walk that slot.
+pub const USER_SPACE_END: u64 = 0x80_0000_0000; // 512 GB
 
 // ── Comptime verification ──────────────────────────────────────────────────
 // The single proof that the layout is well-formed. Any future edit that
@@ -95,8 +111,11 @@ const user_boundaries = [_]Boundary{
     .{ .name = "USER_SPACE_START", .va = USER_SPACE_START },
     .{ .name = "USER_VA_FLOOR", .va = USER_VA_FLOOR },
     .{ .name = "USER_BRK_INITIAL", .va = USER_BRK_INITIAL },
+    .{ .name = "NATIVE_SPACE_END", .va = NATIVE_SPACE_END },
+    .{ .name = "LINUX_MMAP_FLOOR", .va = LINUX_MMAP_FLOOR },
+    .{ .name = "LINUX_MMAP_TOP", .va = LINUX_MMAP_TOP },
+    .{ .name = "LINUX_STACK_BOTTOM", .va = USER_SPACE_END - LINUX_STACK_RESERVE },
     .{ .name = "USER_SPACE_END", .va = USER_SPACE_END },
-    .{ .name = "USER_VA_MAX", .va = USER_VA_MAX },
 };
 
 fn verify() void {
@@ -124,11 +143,12 @@ fn verify() void {
     // stack region below the load base — the original silent-EFAULT bug).
     if (USER_SPACE_START >= USER_VA_FLOOR) @compileError("layout: USER_SPACE_START must be below USER_VA_FLOOR (no stack reserve)");
     if (USER_VA_FLOOR - USER_SPACE_START != USER_STACK_RESERVE) @compileError("layout: USER_STACK_RESERVE inconsistent with USER_VA_FLOOR-USER_SPACE_START");
-    // Data ceiling must not exceed the code/segment ceiling (else mapUserPage
-    // could accept a page the segment validator rejects — the inverse footgun).
-    if (USER_SPACE_END > USER_VA_MAX) @compileError("layout: USER_SPACE_END above USER_VA_MAX — data ceiling exceeds code ceiling");
     // A non-null guard: page 0 stays unmapped so a null deref faults.
     if (USER_SPACE_START < PAGE_SIZE) @compileError("layout: USER_SPACE_START must leave page 0 unmapped (null-deref guard)");
+    // The user page-table walkers cover PML4[0] only.
+    if (USER_SPACE_END > (1 << 39)) @compileError("layout: USER_SPACE_END beyond PML4[0] — the user page-table walkers would miss it");
+    // Native addresses travel as u32.
+    if (NATIVE_SPACE_END > (1 << 32)) @compileError("layout: NATIVE_SPACE_END must fit the 32-bit native syscall ABI");
 }
 
 comptime {
@@ -145,15 +165,11 @@ pub const AddrClass = enum {
     below_user,
     /// [USER_SPACE_START, USER_VA_FLOOR) — the 1 MB stack reserve. DATA ok, CODE no.
     user_stack,
-    /// [USER_VA_FLOOR, USER_BRK_INITIAL) — ELF text/rodata/data load area.
+    /// [USER_VA_FLOOR, USER_BRK_INITIAL) — the native ELF load area.
     user_code,
-    /// [USER_BRK_INITIAL, USER_SPACE_END) — heap (grows up) ∪ mmap (grows down).
+    /// [USER_BRK_INITIAL, USER_SPACE_END) — heaps, mmaps, Linux images and stacks.
     user_heap_mmap,
-    /// [USER_SPACE_END, USER_VA_MAX) — CODE validators accept, but UNMAPPABLE
-    /// (mapUserPage/validateUserPtr reject). The named home of the old latent
-    /// "segment passes load but faults at map time" inconsistency.
-    user_high_unmappable,
-    /// [USER_VA_MAX, ...) — above the user window; kernel half lives up here.
+    /// [USER_SPACE_END, ...) — above the user window; kernel half lives up here.
     above_user,
 };
 
@@ -162,15 +178,14 @@ pub fn classify(va: u64) AddrClass {
     if (va < USER_VA_FLOOR) return .user_stack;
     if (va < USER_BRK_INITIAL) return .user_code;
     if (va < USER_SPACE_END) return .user_heap_mmap;
-    if (va < USER_VA_MAX) return .user_high_unmappable;
     return .above_user;
 }
 
-/// CODE/RIP/segment membership: [USER_VA_FLOOR, USER_VA_MAX). Exhaustive switch
-/// — a new AddrClass variant won't compile until it's classified here.
+/// CODE/RIP/segment membership: [USER_VA_FLOOR, USER_SPACE_END). Exhaustive
+/// switch — a new AddrClass variant won't compile until it's classified here.
 fn classIsUserCode(c: AddrClass) bool {
     return switch (c) {
-        .user_code, .user_heap_mmap, .user_high_unmappable => true,
+        .user_code, .user_heap_mmap => true,
         .below_user, .user_stack, .above_user => false,
     };
 }
@@ -179,14 +194,14 @@ fn classIsUserCode(c: AddrClass) bool {
 fn classIsUserData(c: AddrClass) bool {
     return switch (c) {
         .user_stack, .user_code, .user_heap_mmap => true,
-        .below_user, .user_high_unmappable, .above_user => false,
+        .below_user, .above_user => false,
     };
 }
 
 // ── Validator predicates (the only thing the 5 validators should call) ─────
 
 /// A single code/RIP address is valid. Replaces `rip >= USER_VA_FLOOR and
-/// rip < USER_VA_MAX` (kdbg.ripIsValidUser).
+/// rip < USER_SPACE_END` (kdbg.ripIsValidUser).
 pub fn isValidUserCode(va: u64) bool {
     return classIsUserCode(classify(va));
 }
@@ -202,7 +217,7 @@ pub fn isUserDataAddr(va: u64) bool {
 pub fn userCodeRangeOk(addr: u64, size: u64) bool {
     if (!isValidUserCode(addr)) return false;
     const end = addr +| size; // saturating — matches the original `+|`
-    return end <= USER_VA_MAX;
+    return end <= USER_SPACE_END;
 }
 
 /// A [addr, len) range is valid for DATA/stack access. Unifies the two prior
@@ -308,13 +323,14 @@ pub inline fn ptIndex(va: anytype) usize {
 
 // ── Native tests (zig test src/mm/layout.zig) ──────────────────────────────
 
-test "constants match the pre-refactor literals (no-op guard)" {
+test "constants" {
     try std.testing.expectEqual(@as(u64, 0x400000), USER_SPACE_START);
     try std.testing.expectEqual(@as(u64, 0x100000), USER_STACK_RESERVE);
     try std.testing.expectEqual(@as(u64, 0x500000), USER_VA_FLOOR);
     try std.testing.expectEqual(@as(u64, 0x2000000), USER_BRK_INITIAL);
-    try std.testing.expectEqual(@as(u64, 0x10000000), USER_SPACE_END);
-    try std.testing.expectEqual(@as(u64, 0x40000000), USER_VA_MAX);
+    try std.testing.expectEqual(@as(u64, 0x10000000), NATIVE_SPACE_END);
+    try std.testing.expectEqual(@as(u64, 0x80_0000_0000), USER_SPACE_END);
+    try std.testing.expectEqual(@as(usize, 0), pml4Index(USER_SPACE_END - 1));
     try std.testing.expectEqual(@as(u64, 0xFFFFFFFF80000000), KERNEL_VIRT_BASE);
     try std.testing.expectEqual(@as(u64, 0xFFFF800000000000), PHYSMAP_BASE);
 }
@@ -328,22 +344,20 @@ test "classify partitions the boundaries correctly" {
     try std.testing.expectEqual(AddrClass.user_code, classify(USER_BRK_INITIAL - 1));
     try std.testing.expectEqual(AddrClass.user_heap_mmap, classify(USER_BRK_INITIAL));
     try std.testing.expectEqual(AddrClass.user_heap_mmap, classify(USER_SPACE_END - 1));
-    try std.testing.expectEqual(AddrClass.user_high_unmappable, classify(USER_SPACE_END));
-    try std.testing.expectEqual(AddrClass.user_high_unmappable, classify(USER_VA_MAX - 1));
-    try std.testing.expectEqual(AddrClass.above_user, classify(USER_VA_MAX));
+    try std.testing.expectEqual(AddrClass.above_user, classify(USER_SPACE_END));
     try std.testing.expectEqual(AddrClass.above_user, classify(KERNEL_VIRT_BASE));
 }
 
-test "isValidUserCode reproduces rip>=FLOOR and rip<MAX" {
-    const samples = [_]u64{ 0, 0x3FFFFF, USER_SPACE_START, USER_VA_FLOOR - 1, USER_VA_FLOOR, 0x800000, USER_SPACE_END, USER_VA_MAX - 1, USER_VA_MAX, KERNEL_VIRT_BASE };
+test "isValidUserCode reproduces rip>=FLOOR and rip<END" {
+    const samples = [_]u64{ 0, 0x3FFFFF, USER_SPACE_START, USER_VA_FLOOR - 1, USER_VA_FLOOR, 0x800000, NATIVE_SPACE_END, USER_SPACE_END - 1, USER_SPACE_END, KERNEL_VIRT_BASE };
     for (samples) |x| {
-        const want = (x >= USER_VA_FLOOR and x < USER_VA_MAX);
+        const want = (x >= USER_VA_FLOOR and x < USER_SPACE_END);
         try std.testing.expectEqual(want, isValidUserCode(x));
     }
 }
 
 test "isUserDataAddr reproduces va>=START and va<END" {
-    const samples = [_]u64{ 0, USER_SPACE_START - 1, USER_SPACE_START, USER_VA_FLOOR, USER_BRK_INITIAL, USER_SPACE_END - 1, USER_SPACE_END, USER_VA_MAX, KERNEL_VIRT_BASE };
+    const samples = [_]u64{ 0, USER_SPACE_START - 1, USER_SPACE_START, USER_VA_FLOOR, USER_BRK_INITIAL, NATIVE_SPACE_END, USER_SPACE_END - 1, USER_SPACE_END, KERNEL_VIRT_BASE };
     for (samples) |x| {
         const want = (x >= USER_SPACE_START and x < USER_SPACE_END);
         try std.testing.expectEqual(want, isUserDataAddr(x));
@@ -356,7 +370,7 @@ test "userCodeRangeOk mirrors elf isUserVA" {
     // below floor
     try std.testing.expect(!userCodeRangeOk(USER_SPACE_START, 0x1000));
     // straddles the ceiling
-    try std.testing.expect(!userCodeRangeOk(USER_VA_MAX - 0x800, 0x1000));
+    try std.testing.expect(!userCodeRangeOk(USER_SPACE_END - 0x800, 0x1000));
     // saturating add can't wrap to accept
     try std.testing.expect(!userCodeRangeOk(USER_VA_FLOOR, std.math.maxInt(u64)));
 }

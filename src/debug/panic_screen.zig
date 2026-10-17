@@ -218,7 +218,7 @@ fn formatCr2(buf: []u8, cr2: u64) []const u8 {
         "non-canonical - wild pointer"
     else if (cr2 < memmap.KERNEL_PHYS_START)
         "below kernel image"
-    else if (cr2 >= memmap.USER_VA_FLOOR and cr2 < memmap.USER_VA_MAX)
+    else if (cr2 >= memmap.USER_VA_FLOOR and cr2 < memmap.USER_SPACE_END)
         "user range"
     else
         "kernel range";

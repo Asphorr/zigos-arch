@@ -203,13 +203,11 @@ pub const PCB = struct {
     // VMM fields
     page_directory: ?[*]align(4096) u64 = null, // (c) createAddressSpace, RO after
     page_dir_phys: usize = 0, // (c) createAddressSpace, RO after
-    user_brk: usize = memmap.USER_BRK_INITIAL, // sbrk start; sits above kernel heap (see memmap.zig)
-    // mmap allocator (sysMmap). VAs grow downward from USER_SPACE_END so they
-    // don't collide with the upward-growing user_brk; collision is rejected
-    // explicitly in sysMmap. munmap currently leaks VA range — we don't reclaim
-    // unmapped VA into a free list (pages are freed, just the address space
-    // isn't compacted). v2 problem; bump-allocator works fine for short-lived
-    // apps and the few hundred MB of user space is plenty for now.
+    user_brk: usize = memmap.USER_BRK_INITIAL, // the break; the loader sets it past the image
+    // Native mmap allocator (sysMmap). VAs grow downward from NATIVE_SPACE_END
+    // so they don't collide with the upward-growing user_brk; collision is
+    // rejected explicitly in sysMmap. munmap hands VA back only when it frees
+    // the lowest mapping (see sysMunmap).
     mmap_top: usize = MMAP_TOP_INIT, // (p:as_lock)
     // File descriptor table — owner-pid only
     fd_table: [MAX_FDS]FileDesc = initFdTable(),
@@ -326,6 +324,9 @@ pub const PCB = struct {
     // Start of the sbrk heap's region (0 = none yet); sysSbrk grows it in
     // place while it still ends at user_brk.
     heap_start: usize = 0, // (p:as_lock)
+    // Lowest break: the page after the image (the loader sets it). Linux brk
+    // never moves the break below it.
+    brk_base: usize = memmap.USER_BRK_INITIAL, // (c) set at exec
     /// The lead pid whose as_lock this task holds or awaits from outside its
     /// own group (the io_uring worker, copying for its owner), else
     /// NO_FOREIGN_LOCK: tearDownTask releases that one too. Owner-pid only.
@@ -618,9 +619,8 @@ pub inline fn leader(pcb: *PCB) *PCB {
     return &procs[pcb.tgid];
 }
 
-/// Initial value for `PCB.mmap_top`. memmap.USER_SPACE_END is u64; we narrow
-/// to usize once at the comptime boundary so the field default stays clean.
-pub const MMAP_TOP_INIT: usize = @intCast(memmap.USER_SPACE_END);
+/// Initial value for `PCB.mmap_top`.
+pub const MMAP_TOP_INIT: usize = @intCast(memmap.NATIVE_SPACE_END);
 
 // Linux-style prot bits — stored on each LazyRegion and consulted by
 // `handleUserPageFault` to derive the PTE flags. PROT_READ has no PTE

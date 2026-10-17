@@ -29,7 +29,7 @@ const common = @import("common.zig");
 const validateUserPtr = common.validateUserPtr;
 const validateUserPtrAligned = common.validateUserPtrAligned;
 const USER_SPACE_START = common.USER_SPACE_START;
-const USER_SPACE_END = common.USER_SPACE_END;
+const NATIVE_SPACE_END: usize = memmap.NATIVE_SPACE_END;
 const E_INVAL = common.E_INVAL;
 const E_NOENT = common.E_NOENT;
 const E_FAULT = common.E_FAULT;
@@ -82,7 +82,7 @@ pub fn sysSbrk(increment: u32) u32 {
         // redteam: sbrk(0x80000000)). i64 holds the 2^31 magnitude; the bounds
         // check just below then rejects the absurd shrink as E_INVAL.
         const decrement: usize = @intCast(-@as(i64, inc_signed));
-        if (decrement > old_brk - memmap.USER_BRK_INITIAL) return E_INVAL;
+        if (decrement > old_brk - lead.brk_base) return E_INVAL;
         const new_brk_shrink = old_brk - decrement;
         if (lead.heap_start == 0) return E_INVAL;
         const hr = lead.regions.find(lead.heap_start) orelse return E_INVAL;
@@ -113,7 +113,7 @@ pub fn sysSbrk(increment: u32) u32 {
     }
 
     const new_brk = old_brk + increment;
-    if (new_brk > USER_SPACE_END or new_brk < old_brk) return E_INVAL;
+    if (new_brk > NATIVE_SPACE_END or new_brk < old_brk) return E_INVAL;
 
     // Diagnostic: log every grow > 1 MB so we can attribute big user-heap
     // jumps to a specific app call. Filter small grows to avoid spam.
@@ -164,7 +164,7 @@ pub fn sysSbrk(increment: u32) u32 {
 ///   sequential file-position state isn't disturbed. FAT cluster cache is
 ///   reset because changing offset invalidates it.
 ///
-/// VAs grow downward from `pcb.mmap_top` (initially USER_SPACE_END) so they
+/// VAs grow downward from `pcb.mmap_top` (initially NATIVE_SPACE_END) so they
 /// stay clear of upward-growing sbrk and the ELF load area.
 pub fn sysMmap(len: u32, fd: u32, offset: u32) u32 {
     if (len == 0) return E_INVAL;
@@ -490,10 +490,10 @@ pub fn sysMunmap(va: u32, len: u32) u32 {
     if (removed.start == lead.heap_start) lead.heap_start = 0;
 
     // VA reclaim: if we just freed the lowest mmap region, slide mmap_top up
-    // to the next one's start (or USER_SPACE_END). Regions above mmap_top are
+    // to the next one's start (or NATIVE_SPACE_END). Regions above mmap_top are
     // all mmaps — the heap sits far below.
     if (removed.start == lead.mmap_top) {
-        lead.mmap_top = if (lead.regions.atOrAbove(lead.mmap_top)) |next| next.start else memmap.USER_SPACE_END;
+        lead.mmap_top = if (lead.regions.atOrAbove(lead.mmap_top)) |next| next.start else NATIVE_SPACE_END;
     }
 
     // File-backed mmap allocates a per-region kernel buffer; drop this

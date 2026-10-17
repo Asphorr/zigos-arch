@@ -63,14 +63,60 @@ const ProgramHeader = extern struct {
 
 const PAGE_SIZE: usize = 4096;
 
-// User-space VA range. Apps link at USER_VA_FLOOR (app/linker.ld); any ELF
-// segment below that is suspicious — almost always means someone tried to
-// launch kernel.elf or a UEFI binary from the file browser.
-const USER_VA_MIN: usize = memmap.USER_VA_FLOOR;
-const USER_VA_MAX: usize = memmap.USER_VA_MAX;
-
+// Apps link at USER_VA_FLOOR (app/linker.ld); any ELF segment below that is
+// suspicious — almost always means someone tried to launch kernel.elf or a
+// UEFI binary from the file browser.
 fn isUserVA(addr: usize, size: usize) bool {
     return memmap.userCodeRangeOk(addr, size);
+}
+
+const ELFOSABI_LINUX: u8 = 3;
+
+/// Where a new process's break and stack go.
+const Layout = struct {
+    linux: bool,
+    brk: usize,
+    stack_base: usize,
+    stack_top: usize,
+};
+
+/// Check every PT_LOAD against the user window and lay the process out
+/// around the image. The break starts at the page after the highest segment
+/// (native: not below USER_BRK_INITIAL). A native stack is the reserve under
+/// the load base; a Linux stack is the top LINUX_STACK_RESERVE of the window.
+/// Null if a segment is out of range.
+fn layoutFor(header: Header, phdrs: [*]align(1) const ProgramHeader) ?Layout {
+    var end: usize = 0;
+    for (0..header.phnum) |i| {
+        if (phdrs[i].p_type != PT_LOAD_T) continue;
+        const p_vaddr: usize = @intCast(phdrs[i].p_vaddr);
+        const p_memsz: usize = @intCast(phdrs[i].p_memsz);
+        if (!isUserVA(p_vaddr, p_memsz)) {
+            debug.klog("[elf] Rejected: segment 0x{X}+{d} outside user VA\n", .{ p_vaddr, p_memsz });
+            return null;
+        }
+        end = @max(end, p_vaddr + p_memsz);
+    }
+    const image_end = (end + PAGE_SIZE - 1) & ~@as(usize, PAGE_SIZE - 1);
+    if (header.ident[7] == ELFOSABI_LINUX) {
+        const stack_base: usize = memmap.USER_SPACE_END - memmap.LINUX_STACK_RESERVE;
+        if (image_end > stack_base) {
+            debug.klog("[elf] Rejected: image ends at 0x{X}, in the stack region\n", .{image_end});
+            return null;
+        }
+        return .{ .linux = true, .brk = image_end, .stack_base = stack_base, .stack_top = memmap.USER_SPACE_END };
+    }
+    // Native syscalls carry addresses as u32.
+    if (image_end > memmap.NATIVE_SPACE_END) {
+        debug.klog("[elf] Rejected: native image ends at 0x{X}, above 0x{X}\n", .{ image_end, memmap.NATIVE_SPACE_END });
+        return null;
+    }
+    return .{
+        .linux = false,
+        .brk = @max(memmap.USER_BRK_INITIAL, image_end),
+        .stack_base = memmap.USER_SPACE_START,
+        .stack_top = memmap.USER_VA_FLOOR,
+    };
 }
 
 // (PerCpuRspSlot + per_cpu_rsp_save removed. The Linux-style switchTo
@@ -454,50 +500,26 @@ pub fn loadAndStart(elf_buf: [*]align(4) u8, file_size: usize, elf_buf_pages: u3
         return null;
     }
 
+    // Validate every PT_LOAD's VA range fits in user space before doing
+    // any per-segment work — bail early without partial state.
+    const phoff: usize = @intCast(header.phoff);
+    const phdrs: [*]align(1) const ProgramHeader = @ptrCast(elf_buf + phoff);
+    const lay = layoutFor(header, phdrs) orelse {
+        freePmmRange(@intFromPtr(elf_buf), elf_buf_pages);
+        return null;
+    };
+
     var pd_phys: Phys = Phys.of(0);
     const pd = vmm.createAddressSpace(&pd_phys) orelse {
         freePmmRange(@intFromPtr(elf_buf), elf_buf_pages);
         return null;
     };
 
-    // Validate every PT_LOAD's VA range fits in user space before doing
-    // any per-segment work — bail early without partial state.
-    const phoff: usize = @intCast(header.phoff);
-    const phdrs: [*]align(1) const ProgramHeader = @ptrCast(elf_buf + phoff);
-    for (0..header.phnum) |i| {
-        if (phdrs[i].p_type != 1) continue;
-        const p_vaddr: usize = @intCast(phdrs[i].p_vaddr);
-        const p_memsz: usize = @intCast(phdrs[i].p_memsz);
-        if (!isUserVA(p_vaddr, p_memsz)) {
-            debug.klog("[elf] Rejected: segment 0x{X}+{d} outside user VA\n", .{ p_vaddr, p_memsz });
-            vmm.destroyAddressSpace(pd, pd_phys);
-            freePmmRange(@intFromPtr(elf_buf), elf_buf_pages);
-            return null;
-        }
-    }
-
-    // User stack: lazily allocated via the page-fault handler. Pages back
-    // on first touch so unused stack costs 0 RSS. Top stays at
-    // USER_VA_FLOOR so process.create's initial RSP is just below it; the
-    // first push triggers fault-in for the top page.
-    //
-    // SIZE is derived from memmap.USER_STACK_RESERVE — must match exactly,
-    // otherwise mapUserPage silently rejects stack faults below
-    // USER_SPACE_START (=USER_VA_FLOOR - USER_STACK_RESERVE) and the app
-    // burns frames forever in a re-fault loop (caught 2026-05-20 on Q1
-    // after the stack was bumped to 64 pages but USER_STACK_RESERVE
-    // stayed at 16 pages = 64 KB → 200 MB leak before OOM).
-    const stack_top: usize = memmap.USER_VA_FLOOR;
-    const stack_pages: usize = memmap.USER_STACK_RESERVE / PAGE_SIZE;
-    const stack_base: usize = stack_top - stack_pages * PAGE_SIZE;
-    comptime {
-        if (stack_pages * PAGE_SIZE > memmap.USER_STACK_RESERVE) {
-            @compileError("stack_pages exceeds USER_STACK_RESERVE — mapUserPage will reject low stack faults");
-        }
-    }
-
+    // The user stack is a lazy region: pages back on first touch. A native
+    // task starts just below its top; a Linux task's RSP is moved to the
+    // SysV block by setupLinuxInitialStack.
     const entry: usize = @intCast(header.entry);
-    const pid = process.create(entry, stack_top - 8) orelse {
+    const pid = process.create(entry, lay.stack_top - 8) orelse {
         vmm.destroyAddressSpace(pd, pd_phys);
         freePmmRange(@intFromPtr(elf_buf), elf_buf_pages);
         return null;
@@ -510,7 +532,9 @@ pub fn loadAndStart(elf_buf: [*]align(4) u8, file_size: usize, elf_buf_pages: u3
     pcb.pcid = @import("../cpu/mmu/pcid.zig").alloc();
     pcb.elf_buf = elf_buf;
     pcb.elf_buf_pages = elf_buf_pages;
-    pcb.stack_base = stack_base;
+    pcb.stack_base = lay.stack_base;
+    pcb.brk_base = lay.brk;
+    pcb.user_brk = lay.brk;
     // Record the source inode for ETXTBSY: while this process is live, writes
     // and truncates of this same file are refused (process.isTextBusy). 0 for
     // tarfs/non-regular loads (inum is an ext2 identity); harmless there.
@@ -519,7 +543,7 @@ pub fn loadAndStart(elf_buf: [*]align(4) u8, file_size: usize, elf_buf_pages: u3
     // unmodified Linux x86-64 binary, so its `syscall`s route to the Linux
     // translation layer (syscall/linux.zig). Native zigos ELFs have OSABI 0.
     // One detection point here covers every launch path (shell/desktop/smp).
-    pcb.personality = if (header.ident[7] == 3) .linux else .native;
+    pcb.personality = if (lay.linux) .linux else .native;
 
     // Set the process name + real argv from the launch descriptor (if any)
     // BEFORE setupLinuxInitialStack below reads them. The caller used to do
@@ -531,9 +555,9 @@ pub fn loadAndStart(elf_buf: [*]align(4) u8, file_size: usize, elf_buf_pages: u3
         process.populateArgv(pcb, li.name, li.raw, li.fname_len);
     }
 
-    // Register lazy regions: stack first (region 0), then each PT_LOAD segment
-    // (regions 1..N). Heap is registered later by sysSbrk.
-    if (!process.addLazyRegion(pid, stack_base, stack_top, 0)) {
+    // Register lazy regions: the stack, then each PT_LOAD segment. The heap
+    // is registered later by sbrk/brk.
+    if (!process.addLazyRegion(pid, lay.stack_base, lay.stack_top, 0)) {
         debug.klog("[elf] Failed to register lazy stack region for PID {d}\n", .{pid});
         process.killProcess(@intCast(pid));
         return null;
@@ -549,7 +573,7 @@ pub fn loadAndStart(elf_buf: [*]align(4) u8, file_size: usize, elf_buf_pages: u3
     // the program headers out of it. Native processes get argv via syscalls and
     // skip this entirely.
     if (pcb.personality == .linux) {
-        if (!setupLinuxInitialStack(pid, pd, stack_top, elf_buf)) {
+        if (!setupLinuxInitialStack(pid, pd, lay.stack_top, elf_buf)) {
             debug.klog("[linux] initial-stack setup failed for PID {d}\n", .{pid});
             process.killProcess(@intCast(pid));
             return null;
@@ -599,6 +623,14 @@ pub fn loadAndExecute(elf_buf: [*]align(4) u8, file_size: usize, elf_buf_pages: 
         return;
     }
 
+    const phoff: usize = @intCast(header.phoff);
+    const lay = layoutFor(header, @ptrCast(elf_buf + phoff)) orelse {
+        vga.fg = .LightRed;
+        vga.print("Error: segment outside user space!\n", .{});
+        freePmmRange(@intFromPtr(elf_buf), elf_buf_pages);
+        return;
+    };
+
     // Create per-process address space
     var pd_phys: Phys = Phys.of(0);
     const pd = vmm.createAddressSpace(&pd_phys) orelse {
@@ -609,15 +641,9 @@ pub fn loadAndExecute(elf_buf: [*]align(4) u8, file_size: usize, elf_buf_pages: 
         return;
     };
 
-    // User stack: derived from memmap.USER_STACK_RESERVE — see loadAndStart
-    // for the silent-rejection bug class this matching prevents.
-    const stack_top: usize = memmap.USER_VA_FLOOR;
-    const stack_pages: usize = memmap.USER_STACK_RESERVE / PAGE_SIZE;
-    const stack_base: usize = stack_top - stack_pages * PAGE_SIZE;
-
     // Create process with fake interrupt frame
     const entry: usize = @intCast(header.entry);
-    const pid = process.create(entry, stack_top - 8) orelse {
+    const pid = process.create(entry, lay.stack_top - 8) orelse {
         vga.fg = .LightRed;
         vga.print("Error: process table full!\n", .{});
         debug.klog("[elf] Process table full\n", .{});
@@ -634,19 +660,20 @@ pub fn loadAndExecute(elf_buf: [*]align(4) u8, file_size: usize, elf_buf_pages: 
     pcb.pcid = @import("../cpu/mmu/pcid.zig").alloc();
     pcb.elf_buf = elf_buf;
     pcb.elf_buf_pages = elf_buf_pages;
-    pcb.stack_base = stack_base;
+    pcb.stack_base = lay.stack_base;
+    pcb.brk_base = lay.brk;
+    pcb.user_brk = lay.brk;
     pcb.text_inum = inode; // ETXTBSY — see loadAndStart
     // ABI personality (see loadAndStart): Linux OSABI(3) → Linux syscall layer.
-    pcb.personality = if (header.ident[7] == 3) .linux else .native;
+    pcb.personality = if (lay.linux) .linux else .native;
 
-    if (!process.addLazyRegion(pid, stack_base, stack_top, 0)) {
+    if (!process.addLazyRegion(pid, lay.stack_base, lay.stack_top, 0)) {
         vga.fg = .LightRed;
         vga.print("Error: lazy stack region full!\n", .{});
         process.killProcess(@intCast(pid));
         return;
     }
 
-    const phoff: usize = @intCast(header.phoff);
     const needs_elf_buf = registerSegments(pid, elf_buf, phoff, header.phnum, inode) orelse {
         vga.fg = .LightRed;
         vga.print("Error: segment registration failed!\n", .{});
@@ -657,7 +684,7 @@ pub fn loadAndExecute(elf_buf: [*]align(4) u8, file_size: usize, elf_buf_pages: 
     // Linux personality: build the SysV initial stack before any elf_buf drop
     // (see loadAndStart for the full rationale).
     if (pcb.personality == .linux) {
-        if (!setupLinuxInitialStack(pid, pd, stack_top, elf_buf)) {
+        if (!setupLinuxInitialStack(pid, pd, lay.stack_top, elf_buf)) {
             debug.klog("[linux] initial-stack setup failed for PID {d}\n", .{pid});
             process.killProcess(@intCast(pid));
             return;

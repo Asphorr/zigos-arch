@@ -20,8 +20,8 @@
 //
 // User space (per-process page tables): each process gets its own PML4[0]
 // from createAddressSpace; user-app .text loads at USER_VA_FLOOR (matches
-// app/linker.ld). user_brk starts at USER_BRK_INITIAL and grows to
-// USER_SPACE_END. Two distinct floors apply: CODE/RIP validators (kdbg
+// app/linker.ld). A native user_brk starts at USER_BRK_INITIAL and grows to
+// NATIVE_SPACE_END. Two distinct floors apply: CODE/RIP validators (kdbg
 // ripIsValidUser, elf_loader segments, sysClone entry) floor at USER_VA_FLOOR
 // because code never lives below the load base; STACK/DATA validators
 // (validateUserPtr, vmm.mapUserPage, signals frame validation) MUST floor at
@@ -150,15 +150,18 @@ pub const GUI_FB_PER_PID_SIZE: usize = 0xA00000;
 // the low-VA layout.
 pub const USER_STACK_RESERVE: u64 = layout.USER_STACK_RESERVE; // 256 pages = 1 MB
 pub const USER_SPACE_START: u64 = layout.USER_SPACE_START;
-pub const USER_SPACE_END: u64 = layout.USER_SPACE_END; // 256 MB
-// Initial sbrk position (per-process VA). Lives in user low-half VA
+pub const USER_SPACE_END: u64 = layout.USER_SPACE_END; // 512 GB
+pub const NATIVE_SPACE_END: u64 = layout.NATIVE_SPACE_END; // 256 MB
+pub const LINUX_MMAP_TOP: u64 = layout.LINUX_MMAP_TOP;
+pub const LINUX_MMAP_FLOOR: u64 = layout.LINUX_MMAP_FLOOR;
+pub const LINUX_STACK_RESERVE: u64 = layout.LINUX_STACK_RESERVE;
+// Initial native sbrk position (per-process VA). Lives in user low-half VA
 // space, fully independent of kernel low-PA layout — kernel reaches its
 // own heap through the high-half physmap (Phase 3 dropped PML4[0]), so
 // a numeric collision between user-VA and kernel-PHYS is harmless.
 // 0x2000000 (32 MB) gives apps a fresh upward range from a round
-// boundary; well below USER_SPACE_END (0x10000000 = 256 MB).
+// boundary; well below NATIVE_SPACE_END (0x10000000 = 256 MB).
 pub const USER_BRK_INITIAL: usize = layout.USER_BRK_INITIAL;
-pub const USER_VA_MAX: usize = layout.USER_VA_MAX; // ELF segment validity ceiling
 
 // VA classification + validator predicates + typed addresses, all defined and
 // comptime-proven in layout.zig. Re-exported here so the 5 user-VA validators
@@ -209,8 +212,8 @@ comptime {
     }
 
     // User-space sanity.
-    if (USER_BRK_INITIAL >= USER_SPACE_END) {
-        @compileError("USER_BRK_INITIAL beyond USER_SPACE_END");
+    if (USER_BRK_INITIAL >= NATIVE_SPACE_END) {
+        @compileError("USER_BRK_INITIAL beyond NATIVE_SPACE_END");
     }
     if (USER_BRK_INITIAL < USER_VA_FLOOR) {
         @compileError("USER_BRK_INITIAL must be at or above USER_VA_FLOOR");

@@ -363,6 +363,7 @@ pub fn forkCurrent(frame: *signals.SyscallFrame) ?usize {
     // brk/mmap state is inherited as values too. All of it lives on the
     // lead (see parent_lead_src above).
     process.procs[i].heap_start = parent_lead_src.heap_start;
+    process.procs[i].brk_base = parent_lead_src.brk_base;
     process.procs[i].user_brk = parent_lead_src.user_brk;
     process.procs[i].mmap_top = parent_lead_src.mmap_top;
     process.procs[i].stack_base = parent_lead_src.stack_base;

@@ -423,7 +423,7 @@ pub fn iretqValidate(frame_base: [*]const u64, snap: IretqSnap) void {
 const memmap = @import("../mm/memmap.zig");
 
 inline fn ripIsValidUser(rip: u64) bool {
-    // USER_VA_FLOOR..USER_VA_MAX matches what the kernel actually maps for
+    // USER_VA_FLOOR..USER_SPACE_END matches what the kernel actually maps for
     // user processes (see memmap.zig). The lower bound catches every "RIP <
     // load base" stale-pointer case; the upper bound catches kernel-half
     // pointers leaked into user RIP (e.g. 0x80000C, 0x800010, fmt strings).
@@ -451,7 +451,7 @@ pub fn validateUserReturnIretq(frame_base: [*]const u64, comptime rip_index: usi
     serial.print("  frame_addr   = 0x{X:0>16}\n", .{@intFromPtr(&frame_base[rip_index])});
     serial.print("  saved RIP    = 0x{X:0>16} ", .{rip});
     safeSymbolPrint(rip);
-    serial.print("  <-- not in user range [0x{X}, 0x{X})\n", .{ memmap.USER_VA_FLOOR, memmap.USER_VA_MAX });
+    serial.print("  <-- not in user range [0x{X}, 0x{X})\n", .{ memmap.USER_VA_FLOOR, memmap.USER_SPACE_END });
     serial.print("  saved CS     = 0x{X:0>16}\n", .{cs});
     serial.print("  saved RFLAGS = 0x{X:0>16}\n", .{frame_base[rip_index + 2]});
     serial.print("  saved RSP    = 0x{X:0>16}\n", .{frame_base[rip_index + 3]});
@@ -485,7 +485,7 @@ pub fn validateUserReturnSysret(saved_rcx: u64, saved_r11: u64) void {
     serial.print("\n!!! WILD RIP about to sysretq to user-mode (cpu={d}) !!!\n", .{id});
     serial.print("  saved user RIP (RCX) = 0x{X:0>16} ", .{saved_rcx});
     safeSymbolPrint(saved_rcx);
-    serial.print("  <-- not in user range [0x{X}, 0x{X})\n", .{ memmap.USER_VA_FLOOR, memmap.USER_VA_MAX });
+    serial.print("  <-- not in user range [0x{X}, 0x{X})\n", .{ memmap.USER_VA_FLOOR, memmap.USER_SPACE_END });
     serial.print("  saved RFLAGS (R11)   = 0x{X:0>16}\n", .{saved_r11});
 
     dumpAll();
@@ -1545,7 +1545,7 @@ pub fn crashSummary(opts: AutopsyOpts) void {
             "non-canonical — wild pointer!"
         else if (cr2 < memmap.KERNEL_PHYS_START)
             "below kernel image"
-        else if (cr2 >= memmap.USER_VA_FLOOR and cr2 < memmap.USER_VA_MAX)
+        else if (cr2 >= memmap.USER_VA_FLOOR and cr2 < memmap.USER_SPACE_END)
             "user range"
         else
             "kernel range";
