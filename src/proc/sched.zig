@@ -1519,7 +1519,7 @@ fn pickMinVruntime(q: *const runqueue.PriQueue, exclude_pid: ?u8) ?u8 {
         const pid: u8 = q.pids[i];
         if (pid >= MAX_PROCS) continue;
         if (exclude_pid) |xp| if (pid == xp) continue;
-        if (@atomicLoad(bool, &process.procs[pid].exit_requested, .acquire)) continue;
+        if (process.doomed(pid)) continue;
         // Cross-CPU dispatch gate: on_cpu ⇒ the pid's context save hasn't
         // completed on the CPU it last ran on — its kernel_esp is stale
         // and its kstack is still live there. Dispatching it HERE would
@@ -1817,8 +1817,7 @@ pub fn schedule() void {
     // exit_requested (no one kills them); kernel tasks shouldn't either.
     // Defensive: only honor for non-idle PCBs.
     {
-        const cpu_now = smp.myCpu();
-        if (cpu_now.current_pid) |cur_pid| {
+        if (smp.currentPid()) |cur_pid| {
             // teardown_marked gate: once this pid's OWN teardown has started
             // (lifecycle.claimTeardown marks it first thing), exit_requested
             // is stale — teardown legitimately reaches schedule() (GPU
@@ -1826,8 +1825,10 @@ pub fn schedule() void {
             // escalating again would restart teardown from the top, re-free
             // group resources the outer pass is still walking, and strand
             // the outer frame (the task dies inside the inner schedule()).
+            // doomed(): a task inside a no-kill section sleeps and runs on
+            // until it leaves it.
             if (!process.procs[cur_pid].is_idle and
-                @atomicLoad(bool, &process.procs[cur_pid].exit_requested, .acquire) and
+                process.doomed(cur_pid) and
                 !@atomicLoad(bool, &process.procs[cur_pid].teardown_marked, .acquire))
             {
                 process.destroyCurrentWithStatus(process.procs[cur_pid].exit_status);
@@ -2605,7 +2606,7 @@ pub fn rqHasDispatchable(cpu_id: u8) bool {
             const pid = q.pids[i];
             if (pid >= MAX_PROCS) continue;
             if (@atomicLoad(bool, &process.procs[pid].job_stopped, .acquire)) continue;
-            if (@atomicLoad(bool, &process.procs[pid].exit_requested, .acquire)) continue;
+            if (process.doomed(pid)) continue;
             return true;
         }
     }

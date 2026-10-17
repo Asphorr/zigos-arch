@@ -132,6 +132,9 @@ pub fn lockMount(self: *Mount) void {
         // CAS free(0xFFFF) -> me. cmpxchgStrong returns null on success.
         if (@cmpxchgStrong(u16, &self.lock_owner, 0xFFFF, me, .acq_rel, .acquire) == null) {
             self.lock_depth = 1;
+            // A kill waits for the operation to finish: torn down halfway,
+            // it would leave the metadata half updated.
+            @import("../../proc/process.zig").noKillEnter();
             return;
         }
         sched.blockOnMutex(tid, &self.lock_owner); // sleep until released, then retry CAS
@@ -148,6 +151,7 @@ pub fn unlockMount(self: *Mount) void {
         const tid: u32 = @truncate(@intFromPtr(&self.lock_owner));
         @atomicStore(u16, &self.lock_owner, 0xFFFF, .release);
         sched.wakeMutexWaiters(tid);
+        @import("../../proc/process.zig").noKillLeave();
     }
 }
 

@@ -229,6 +229,7 @@ export fn doSyscall(sys_num: u32, arg1: u32, arg2: u32, arg3: u32, frame_raw: ?*
             const r = @import("syscall/linux.zig").dispatch(sys_num, f);
             lprof.syscall(sys_num, t0);
             endBody(pcb);
+            dieIfKilled();
             return r;
         }
     }
@@ -247,6 +248,7 @@ export fn doSyscall(sys_num: u32, arg1: u32, arg2: u32, arg3: u32, frame_raw: ?*
     beginBody(cur_pcb, bodyKeepsIrqOff(sys_num));
     const ret = doSyscallInner(sys_num, arg1, arg2, arg3, frame);
     endBody(cur_pcb);
+    dieIfKilled();
 
     // Check pending signals on the way out. Skips if the dispatcher already
     // killed the process (currentPCB returns null after destroyCurrent), and
@@ -257,6 +259,15 @@ export fn doSyscall(sys_num: u32, arg1: u32, arg2: u32, arg3: u32, frame_raw: ?*
         };
     }
     return @as(u64, ret);
+}
+
+/// A kill that waited out a no-kill section (PCB.nokill) lands here, before
+/// the caller's thread returns to user code it no longer owns.
+fn dieIfKilled() void {
+    const pid = @import("smp.zig").currentPid() orelse return;
+    const pcb = &process.procs[pid];
+    if (pcb.is_idle or !process.doomed(pid) or @atomicLoad(bool, &pcb.teardown_marked, .acquire)) return;
+    process.destroyCurrentWithStatus(pcb.exit_status);
 }
 
 // ===========================================================================

@@ -1376,6 +1376,12 @@ pub fn killProcessWithStatus(pid: u8, status: u32) void {
     var loading_waits: u32 = 0;
 
     while (true) {
+        // Inside a no-kill section (an ext2 operation) it is still
+        // dispatched, finishes the operation and dies at its next
+        // schedule(). Read before the state: once it reads doomed, a task
+        // off-CPU is never dispatched again, and one on-CPU dies at its next
+        // schedule() — the state read below can't be outrun.
+        if (!process.doomed(pid)) return;
         const snap = @atomicLoad(u8, @as(*const u8, @ptrCast(&process.procs[pid].state)), .acquire);
         if (snap == @intFromEnum(State.zombie) or snap == @intFromEnum(State.unused)) return;
 

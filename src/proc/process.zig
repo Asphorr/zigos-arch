@@ -531,6 +531,11 @@ pub const PCB = struct {
     //      re-enter destroyCurrentWithStatus mid-teardown.
     // Cleared on slot reuse by resetPcbExceptState.
     teardown_marked: bool = false, // (a) set under lifecycle.teardown_count_lock; read in schedule()
+    // Sections a kill must not cut short (an ext2 operation under its mount
+    // lock): while nonzero, a killed task keeps being scheduled and dies at
+    // the first schedule() after the count drops (see doomed()). Only the
+    // task itself changes it, and never while off-CPU.
+    nokill: u16 = 0, // (a) own-task writes; killers and pickNext read
 
     // --- CFS-style vruntime (scheduler rewrite, post-Phase 7) -------------
     // Accumulated CPU "fair-share" time in ticks. Bumped by accountRunningTick
@@ -632,6 +637,26 @@ pub fn dumpSyscallRing(pid: u8) void {
 /// `pcb.tgid == self_pid` so `leader(pcb) == pcb` and no behavior change.
 pub inline fn leader(pcb: *PCB) *PCB {
     return &procs[pcb.tgid];
+}
+
+/// `pid` is being killed and may be torn down now: not dispatched again,
+/// and dies at its next schedule(). A killed task inside a no-kill section
+/// (PCB.nokill) runs on until it leaves it.
+pub inline fn doomed(pid: usize) bool {
+    return @atomicLoad(bool, &procs[pid].exit_requested, .acquire) and
+        @atomicLoad(u16, &procs[pid].nokill, .acquire) == 0;
+}
+
+/// Enter / leave a section a kill must not cut short (PCB.nokill).
+pub fn noKillEnter() void {
+    const pcb = currentPCB() orelse return;
+    @atomicStore(u16, &pcb.nokill, pcb.nokill + 1, .release);
+}
+
+pub fn noKillLeave() void {
+    const pcb = currentPCB() orelse return;
+    if (pcb.nokill == 0) return;
+    @atomicStore(u16, &pcb.nokill, pcb.nokill - 1, .release);
 }
 
 /// Initial value for `PCB.mmap_top`.
