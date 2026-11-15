@@ -40,6 +40,15 @@ pub const Palette = struct {
     btn_destructive_top: u32,
     btn_destructive_bot: u32,
     btn_destructive_border: u32,
+
+    /// Toolbar and status bar strips, and the line that parts them from
+    /// the content.
+    bar_bg: u32,
+    hairline: u32,
+    /// Selected row or item, the text on it, and a row under the cursor.
+    selection: u32,
+    selection_text: u32,
+    row_hover: u32,
 };
 
 pub const light_palette = Palette{
@@ -59,6 +68,11 @@ pub const light_palette = Palette{
     .btn_destructive_top = 0xE05C50,
     .btn_destructive_bot = 0xB52E22,
     .btn_destructive_border = 0x8B1F16,
+    .bar_bg = 0xE9E9EB,
+    .hairline = 0xC6C6C8,
+    .selection = 0x0A6BE0,
+    .selection_text = 0xFFFFFF,
+    .row_hover = 0xE6E6E9,
 };
 
 // Neutral grays a step apart: window body < card < control, so each
@@ -81,6 +95,11 @@ pub const dark_palette = Palette{
     .btn_destructive_top = 0xE2554B,
     .btn_destructive_bot = 0xC43A31,
     .btn_destructive_border = 0x9E2A22,
+    .bar_bg = 0x2A2A2D,
+    .hairline = 0x141416,
+    .selection = 0x0A60D0,
+    .selection_text = 0xFFFFFF,
+    .row_hover = 0x2A2A2E,
 };
 
 /// Dark by default: every app paints a dark window body, and widgets from
@@ -205,6 +224,126 @@ pub fn drawShadow(canvas: *Canvas, x: u32, y: u32, w: u32, h: u32, surrounding_b
 pub fn drawFocusRing(canvas: *Canvas, x: u32, y: u32, w: u32, h: u32, color: u32) void {
     if (x < 2 or y < 2) return;
     drawRect1px(canvas, x - 2, y - 2, w + 4, h + 4, color);
+}
+
+// --- Icons ---
+
+/// Line glyphs for toolbar buttons, drawn in a 16 px box.
+pub const Icon = enum {
+    back,
+    forward,
+    up,
+    home,
+    folder,
+    search,
+    plus,
+    minus,
+    // Drawing tools.
+    pencil,
+    brush,
+    eraser,
+    line,
+    rect,
+    ellipse,
+    circle,
+    triangle,
+    drop,
+    filled,
+    dot_small,
+    dot_medium,
+    dot_large,
+};
+
+pub const ICON_SIZE: u32 = 16;
+
+const IconPt = struct { x: i32, y: i32 };
+
+fn iconStroke(canvas: *Canvas, ox: i32, oy: i32, pts: []const IconPt, color: u32) void {
+    for (pts[0 .. pts.len - 1], pts[1..]) |a, b| {
+        canvas.drawThickLineAA(ox + a.x, oy + a.y, ox + b.x, oy + b.y, 2, color);
+    }
+    // Round the joints: two thick segments leave a notch where they meet.
+    for (pts[1 .. pts.len - 1]) |p| canvas.fillCircle(ox + p.x, oy + p.y, 1, color);
+}
+
+pub fn drawIcon(canvas: *Canvas, icon: Icon, x: u32, y: u32, color: u32) void {
+    const ox: i32 = @intCast(x);
+    const oy: i32 = @intCast(y);
+    switch (icon) {
+        .back => iconStroke(canvas, ox, oy, &.{ .{ .x = 10, .y = 3 }, .{ .x = 5, .y = 8 }, .{ .x = 10, .y = 13 } }, color),
+        .forward => iconStroke(canvas, ox, oy, &.{ .{ .x = 6, .y = 3 }, .{ .x = 11, .y = 8 }, .{ .x = 6, .y = 13 } }, color),
+        .up => iconStroke(canvas, ox, oy, &.{ .{ .x = 3, .y = 10 }, .{ .x = 8, .y = 5 }, .{ .x = 13, .y = 10 } }, color),
+        .home => {
+            iconStroke(canvas, ox, oy, &.{ .{ .x = 2, .y = 8 }, .{ .x = 8, .y = 2 }, .{ .x = 14, .y = 8 } }, color);
+            iconStroke(canvas, ox, oy, &.{ .{ .x = 4, .y = 8 }, .{ .x = 4, .y = 13 }, .{ .x = 12, .y = 13 }, .{ .x = 12, .y = 8 } }, color);
+        },
+        .folder => {
+            canvas.fillRoundedRect(x + 1, y + 3, 7, 4, 1, color);
+            canvas.fillRoundedRect(x + 1, y + 5, 14, 9, 2, color);
+        },
+        .search => {
+            canvas.drawCircleAA(ox + 7, oy + 7, 4, 2, color);
+            canvas.drawThickLineAA(ox + 10, oy + 10, ox + 14, oy + 14, 2, color);
+        },
+        .plus => {
+            canvas.fillRect(x + 7, y + 3, 2, 10, color);
+            canvas.fillRect(x + 3, y + 7, 10, 2, color);
+        },
+        .minus => canvas.fillRect(x + 3, y + 7, 10, 2, color),
+        .pencil => {
+            // Shaft, then the point it narrows to.
+            canvas.drawThickLineAA(ox + 6, oy + 10, ox + 12, oy + 4, 3, color);
+            canvas.fillTriangle(ox + 2, oy + 14, ox + 4, oy + 10, ox + 6, oy + 12, color);
+        },
+        .brush => {
+            canvas.drawThickLineAA(ox + 8, oy + 8, ox + 13, oy + 3, 2, color);
+            canvas.drawCircleAA(ox + 5, oy + 11, 3, 3, color);
+        },
+        .eraser => {
+            canvas.drawThickLineAA(ox + 5, oy + 10, ox + 10, oy + 5, 6, color);
+            canvas.fillRect(x + 2, y + 14, 12, 1, color);
+        },
+        .line => canvas.drawThickLineAA(ox + 3, oy + 13, ox + 13, oy + 3, 2, color),
+        .rect => {
+            canvas.fillRect(x + 2, y + 3, 12, 2, color);
+            canvas.fillRect(x + 2, y + 11, 12, 2, color);
+            canvas.fillRect(x + 2, y + 3, 2, 10, color);
+            canvas.fillRect(x + 12, y + 3, 2, 10, color);
+        },
+        .ellipse => canvas.drawEllipseAA(ox + 8, oy + 8, 6, 4, 2, color),
+        .circle => canvas.drawCircleAA(ox + 8, oy + 8, 5, 2, color),
+        .triangle => iconStroke(canvas, ox, oy, &.{ .{ .x = 8, .y = 3 }, .{ .x = 13, .y = 12 }, .{ .x = 3, .y = 12 }, .{ .x = 8, .y = 3 } }, color),
+        .drop => {
+            canvas.drawCircleAA(ox + 8, oy + 10, 4, 4, color);
+            canvas.fillTriangle(ox + 8, oy + 2, ox + 4, oy + 9, ox + 12, oy + 9, color);
+        },
+        .filled => canvas.fillRoundedRect(x + 3, y + 3, 10, 10, 2, color),
+        // A ring as wide as its radius is a smooth-edged disc.
+        .dot_small => canvas.drawCircleAA(ox + 8, oy + 8, 1, 1, color),
+        .dot_medium => canvas.drawCircleAA(ox + 8, oy + 8, 3, 3, color),
+        .dot_large => canvas.drawCircleAA(ox + 8, oy + 8, 5, 5, color),
+    }
+}
+
+/// `text` cut to fit `max_w` pixels: how many bytes to draw, and whether an
+/// ellipsis follows them.
+pub const Fit = struct { len: usize, cut: bool };
+
+pub fn fitText(atlas: *const fa.FontAtlas, text: []const u8, max_w: u32) Fit {
+    if (atlas.measure(text) <= max_w) return .{ .len = text.len, .cut = false };
+    const room = max_w -| atlas.measure("...");
+    var n: usize = text.len;
+    while (n > 0 and atlas.measure(text[0..n]) > room) n -= 1;
+    return .{ .len = n, .cut = true };
+}
+
+/// Draw `text` at (x, y), ending it in "..." if it is wider than `max_w`.
+pub fn drawTextFit(canvas: *Canvas, x: u32, y: u32, max_w: u32, text: []const u8, color: u32, atlas: *const fa.FontAtlas) void {
+    const fit = fitText(atlas, text, max_w);
+    fa.drawText(canvas, @intCast(x), @intCast(y), text[0..fit.len], color, atlas);
+    if (fit.cut and max_w >= atlas.measure("...")) {
+        fa.drawText(canvas, @intCast(x + atlas.measure(text[0..fit.len])), @intCast(y), "...", color, atlas);
+    }
 }
 
 // --- Button ---
@@ -567,6 +706,8 @@ pub const Scrollbar = struct {
     /// step. Apps can override after construction (e.g. text editor with
     /// taller line-height may want 1).
     lines_per_notch: u32 = 3,
+    /// Only the thumb is drawn, over whatever the content painted there.
+    trackless: bool = false,
 
     fn thumbBounds(self: Scrollbar, content_total: u32, content_visible: u32, scroll_offset: u32) struct { y: u32, h: u32 } {
         if (content_total <= content_visible or content_total == 0) {
@@ -708,8 +849,9 @@ pub const Scrollbar = struct {
         scroll_offset: u32,
     ) void {
         // Track: a shade under the card color, so it sits back.
-        const track_color = lerpColor(palette.card_bg, 0x000000, 1, 5);
-        canvas.fillRect(self.x, self.y, self.w, self.h, track_color);
+        if (!self.trackless) {
+            canvas.fillRect(self.x, self.y, self.w, self.h, lerpColor(palette.card_bg, 0x000000, 1, 5));
+        }
 
         // No thumb if everything fits.
         if (content_total <= content_visible) return;
@@ -724,8 +866,7 @@ pub const Scrollbar = struct {
         const tw = self.w -| 4;
         const th = tb.h -| 4;
         if (tw == 0 or th == 0) return;
-        canvas.fillRect(self.x + 2, tb.y + 2, tw, th, thumb_color);
-        canvas.roundCornersRadius(self.x + 2, tb.y + 2, tw, th, tw / 2, track_color);
+        canvas.fillRoundedRect(self.x + 2, tb.y + 2, tw, th, tw / 2, thumb_color);
     }
 };
 
@@ -952,6 +1093,18 @@ pub const Dialog = struct {
 
 // --- Folder picker --------------------------------------------------------
 
+/// Whether name `a` sorts before `b`, letter case aside: the order file
+/// lists are shown in.
+pub fn nameBefore(a: []const u8, b: []const u8) bool {
+    const n = @min(a.len, b.len);
+    for (a[0..n], b[0..n]) |ca, cb| {
+        const la = if (ca >= 'A' and ca <= 'Z') ca + 32 else ca;
+        const lb = if (cb >= 'A' and cb <= 'Z') cb + 32 else cb;
+        if (la != lb) return la < lb;
+    }
+    return a.len < b.len;
+}
+
 pub const FolderPickerAction = enum {
     /// Nothing happened this frame. Default each frame.
     none,
@@ -1088,7 +1241,12 @@ pub const FolderPicker = struct {
             const name = tmp[i].name[0..tmp[i].name_len];
             if (name.len == 1 and name[0] == '.') continue;
             if (name.len == 2 and name[0] == '.' and name[1] == '.') continue;
-            self.entries[kept] = tmp[i];
+            // Kept in name order, whatever order the disk lists them in.
+            var at = kept;
+            while (at > 0 and nameBefore(name, self.entries[at - 1].name[0..self.entries[at - 1].name_len])) : (at -= 1) {
+                self.entries[at] = self.entries[at - 1];
+            }
+            self.entries[at] = tmp[i];
             kept += 1;
         }
         self.entry_count = kept;
@@ -1193,17 +1351,16 @@ pub const FolderPicker = struct {
                 }
                 return .ok;
             },
-            // Arrow keys arrive as the bare scancode in some paths;
-            // accept them but don't require them. 0x91 = down, 0x92 = up
-            // in the kernel's keymap (see input dispatch).
-            0x91 => {
+            // Arrows are key_special events: the caller passes their code
+            // here like a character.
+            libc.Key.down => {
                 if (self.entry_count == 0) return .none;
                 const next: i32 = if (self.selected < 0) 0 else @min(self.selected + 1, @as(i32, @intCast(self.entry_count - 1)));
                 self.selected = next;
                 self.scrollIntoView();
                 return .none;
             },
-            0x92 => {
+            libc.Key.up => {
                 if (self.entry_count == 0) return .none;
                 const next: i32 = if (self.selected <= 0) 0 else self.selected - 1;
                 self.selected = next;
@@ -1247,8 +1404,8 @@ pub const FolderPicker = struct {
         const list_y = self.up_btn.y + self.up_btn.h + 6;
         const list_w = self.w -| (padding * 2);
         const list_h = self.listHeight();
-        canvas.fillRect(list_x, list_y, list_w, list_h, palette.card_bg);
-        drawRect1px(canvas, list_x, list_y, list_w, list_h, palette.card_border);
+        canvas.fillRoundedRect(list_x, list_y, list_w, list_h, 7, palette.card_border);
+        canvas.fillRoundedRect(list_x + 1, list_y + 1, list_w -| 2, list_h -| 2, 6, palette.window_bg);
 
         // Rows
         const visible = self.visibleRows();
@@ -1258,12 +1415,12 @@ pub const FolderPicker = struct {
             const row_y = list_y + ri * row_h;
             const sel = (self.selected >= 0 and @as(u32, @intCast(self.selected)) == entry_idx);
             if (sel) {
-                canvas.fillRect(list_x + 1, row_y, list_w -| 2, row_h, palette.btn_primary_top);
+                canvas.fillRoundedRect(list_x + 3, row_y + 1, list_w -| 6, row_h -| 2, 5, palette.selection);
             }
             const name = self.entries[entry_idx].name[0..self.entries[entry_idx].name_len];
-            const text_color: u32 = if (sel) palette.card_bg else palette.text_normal;
+            const text_color: u32 = if (sel) palette.selection_text else palette.text_normal;
             // Folder glyph (a tab over a body) + name
-            const glyph_color: u32 = if (sel) palette.card_bg else palette.text_muted;
+            const glyph_color: u32 = if (sel) palette.selection_text else palette.text_muted;
             const glyph_y = row_y + (row_h -| 11) / 2;
             canvas.fillRect(list_x + 10, glyph_y, 6, 2, glyph_color);
             canvas.fillRect(list_x + 10, glyph_y + 2, 14, 9, glyph_color);
@@ -1553,6 +1710,20 @@ pub const ImagePicker = struct {
         }
         if (ch == 0x1B) return .cancel;
         if (ch == '\n' or ch == '\r') return if (self.selected >= 0) .ok else .none;
+        // Arrows (key_special codes, passed like a character) walk the
+        // grid; the first one picks the first image.
+        const shown: i32 = @intCast(@min(self.thumbs.len, cols * rows));
+        const step: i32 = switch (ch) {
+            libc.Key.left => -1,
+            libc.Key.right => 1,
+            libc.Key.up => -@as(i32, cols),
+            libc.Key.down => @as(i32, cols),
+            else => 0,
+        };
+        if (step != 0 and shown > 0) {
+            const next = if (self.selected < 0) 0 else self.selected + step;
+            if (next >= 0 and next < shown) self.selected = next;
+        }
         return .none;
     }
 
@@ -1587,9 +1758,9 @@ pub const ImagePicker = struct {
             const cy = gy + row * (cell_h + cell_gap);
 
             const is_sel = (self.selected >= 0 and @as(u32, @intCast(self.selected)) == i);
-            // Cell frame — slight tint, selected gets the primary color.
+            // Cell frame: a hairline, or the selection colour when picked.
             if (is_sel) {
-                canvas.fillRect(cx, cy, cell_w, cell_h, palette.btn_primary_top);
+                canvas.fillRoundedRect(cx, cy, cell_w, cell_h, 8, palette.selection);
             } else {
                 drawRect1px(canvas, cx, cy, cell_w, cell_h, palette.card_border);
             }
@@ -1611,7 +1782,7 @@ pub const ImagePicker = struct {
                     fa.drawTextCentered(canvas, @intCast(tcell_x), @intCast(tcell_y + thumb_h / 2 - atlas.line_height / 2), thumb_w, "?", palette.text_muted, atlas);
                 }
                 // Filename label below, cut to the cell.
-                const label_color: u32 = if (is_sel) palette.card_bg else palette.text_normal;
+                const label_color: u32 = if (is_sel) palette.selection_text else palette.text_normal;
                 const label_y = tcell_y + thumb_h + 4;
                 var shown = t.name;
                 while (shown.len > 1 and atlas.measure(shown) > cell_w - 8) shown = shown[0 .. shown.len - 1];

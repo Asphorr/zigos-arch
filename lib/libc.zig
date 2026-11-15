@@ -222,6 +222,22 @@ pub const Event = extern struct {
     }
 };
 
+/// `Event.a` of a key_special event.
+pub const Key = struct {
+    pub const up: u8 = 0x80;
+    pub const down: u8 = 0x81;
+    pub const left: u8 = 0x82;
+    pub const right: u8 = 0x83;
+    pub const home: u8 = 0x84;
+    pub const end: u8 = 0x85;
+    pub const page_up: u8 = 0x86;
+    pub const page_down: u8 = 0x87;
+    pub const delete: u8 = 0x88;
+    pub const insert: u8 = 0x89;
+    /// F1; F2..F12 follow.
+    pub const f1: u8 = 0x90;
+};
+
 /// Modifier bits packed into `Event.b` for key events.
 pub const MOD_SHIFT: u32 = 1 << 0;
 pub const MOD_CTRL: u32 = 1 << 1;

@@ -22,6 +22,10 @@ pub const Event = libc.Event;
 pub const Point = app_ui.Point;
 pub const Rect = app_ui.Rect;
 pub const Ui = app_ui.Ui;
+pub const ListState = app_ui.ListState;
+pub const ListView = app_ui.ListView;
+pub const BAR_H = app_ui.BAR_H;
+pub const STATUS_H = app_ui.STATUS_H;
 
 pub const Options = struct {
     /// Initial content size in pixels, clamped to the screen. With `frame`,

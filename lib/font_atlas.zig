@@ -104,25 +104,34 @@ pub const FontAtlas = struct {
     }
 };
 
-// Compile-time embedded atlases. Three slots:
+// Compile-time embedded atlases:
+//   default_13, default_13sb — small UI text, regular and semibold (SF Pro
+//     Text 13px): status bars, column headers, secondary columns. The size
+//     of the desktop's own chrome.
 //   default_16 — proportional body text (SF Pro Text 16px)
 //   default_24 — proportional display titles (SF Pro Display 24px)
 //   default_mono — monospace for terminal/console (SF Mono 14px)
+const blob_13: []const u8 align(2) = @embedFile("assets/font_13.bin");
+const blob_13sb: []const u8 align(2) = @embedFile("assets/font_13sb.bin");
 const blob_16: []const u8 align(2) = @embedFile("assets/font_16.bin");
 const blob_24: []const u8 align(2) = @embedFile("assets/font_24.bin");
 const blob_mono: []const u8 align(2) = @embedFile("assets/font_mono.bin");
 
+pub var default_13: FontAtlas = undefined;
+pub var default_13sb: FontAtlas = undefined;
 pub var default_16: FontAtlas = undefined;
 pub var default_24: FontAtlas = undefined;
 pub var default_mono: FontAtlas = undefined;
 
 var initialized: bool = false;
 
-/// Lazily-parse the embedded blobs. First call sets up the three default
+/// Lazily-parse the embedded blobs. First call sets up the default
 /// atlases; subsequent calls are no-ops. Cheap to call from every
 /// drawText() entry — single bool check.
 pub fn ensureLoaded() void {
     if (initialized) return;
+    default_13 = FontAtlas.parse(blob_13);
+    default_13sb = FontAtlas.parse(blob_13sb);
     default_16 = FontAtlas.parse(blob_16);
     default_24 = FontAtlas.parse(blob_24);
     default_mono = FontAtlas.parse(blob_mono);
