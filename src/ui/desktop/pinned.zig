@@ -7,6 +7,7 @@
 // launchShortcut). For everything else `cmd` is the absolute ELF path
 // passed to smp.requestAppLoad.
 
+const std = @import("std");
 const icons = @import("../icons.zig");
 
 pub const Shortcut = struct {
@@ -45,3 +46,23 @@ pub const dock_indices = [_]u8{
     4, // Settings
     5, // Monitor
 };
+
+/// File name of `path` without its directory and .elf suffix.
+fn stem(path: []const u8) []const u8 {
+    var s = path;
+    if (std.mem.lastIndexOfScalar(u8, s, '/')) |i| s = s[i + 1 ..];
+    if (std.ascii.endsWithIgnoreCase(s, ".elf")) s = s[0 .. s.len - 4];
+    return s;
+}
+
+/// Name of the pinned app a process called `pname` is an instance of: the
+/// one whose executable has the same file name. Its windows take this name
+/// as their title, which is how the dock tells whose they are.
+pub fn nameForProcess(pname: []const u8) ?[]const u8 {
+    const s = stem(pname);
+    if (s.len == 0) return null;
+    for (list) |sc| {
+        if (std.ascii.eqlIgnoreCase(stem(sc.cmd), s)) return sc.name;
+    }
+    return null;
+}

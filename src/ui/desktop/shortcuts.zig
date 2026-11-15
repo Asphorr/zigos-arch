@@ -115,7 +115,7 @@ pub fn cellRect(si: usize) [4]i32 {
 const ClipRect = struct { x0: i32, y0: i32, x1: i32, y1: i32 };
 
 fn renderImpl(clip: ?ClipRect) void {
-    const label_atlas = aa_font.getDefault16();
+    const label_atlas = aa_font.getDefault13();
     for (pinned.list, 0..) |sc, si| {
         const cell = iconCell(si);
         if (clip) |c| {
@@ -133,16 +133,24 @@ fn renderImpl(clip: ?ClipRect) void {
         // until the drop commits a new position.
         if (drag_idx >= 0 and @as(usize, @intCast(drag_idx)) == si) continue;
 
+        // Selection: a translucent rounded tile centered on the cell, inside
+        // cellRect() like everything else painted here.
         const is_sel = (selected >= 0 and @as(usize, @intCast(selected)) == si);
         if (is_sel) {
-            gfx.fillRect(cell.x - 4, cell.y - 2, ICON_CELL_W, ICON_CELL_H, 0x3A4A6A);
+            gfx.fillRoundedRectAlpha(cell.x + 3, cell.y - 1, ICON_CELL_W - 6, ICON_CELL_H - 6, 9, 0x2AFFFFFF);
+            gfx.strokeRoundedRectAlpha(cell.x + 3, cell.y - 1, ICON_CELL_W - 6, ICON_CELL_H - 6, 9, 0x30FFFFFF);
         }
 
         const icon_x: i32 = cell.x + @as(i32, @intCast((ICON_CELL_W - ICON_PIXEL_W) / 2));
         const icon_y: i32 = cell.y + 4;
         gfx.drawIcon32(icon_x, icon_y, sc.icon);
 
-        aa_font.drawTextCentered(cell.x, cell.y + 40, ICON_CELL_W, sc.name, 0xEEEEEE, label_atlas);
+        // Label over a 1 px drop shadow, so it reads on a bright wallpaper.
+        const label_w = label_atlas.measure(sc.name);
+        const label_x: i32 = cell.x + @as(i32, @intCast((ICON_CELL_W -| label_w) / 2));
+        const label_y: i32 = cell.y + 43;
+        aa_font.drawTextAlpha(label_x, label_y + 1, sc.name, 0x000000, 150, label_atlas);
+        aa_font.drawText(label_x, label_y, sc.name, 0xFFFFFF, label_atlas);
     }
 }
 
@@ -165,7 +173,7 @@ pub fn renderDragGhost() void {
 fn iconAt(mx: i32, my: i32) ?i8 {
     for (pinned.list, 0..) |_, si| {
         const cell = iconCell(si);
-        const x = cell.x - 4;
+        const x = cell.x;
         const y = cell.y - 2;
         if (mx >= x and mx < x + @as(i32, ICON_CELL_W) and my >= y and my < y + @as(i32, ICON_CELL_H)) {
             return @intCast(si);

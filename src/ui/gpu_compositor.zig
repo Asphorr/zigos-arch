@@ -1101,9 +1101,10 @@ fn fillFocusedSource() void {
         src_h = win.gui_h;
         src_stride = win.gui_alloc_w;
         win_x = win.x;
-        win_y = win.y + 28; // skip title bar (TITLEBAR_H)
+        const titlebar_h: u32 = @import("desktop/layout.zig").TITLEBAR_H;
+        win_y = win.y + @as(i32, @intCast(titlebar_h));
         win_pixel_w = win.width;
-        win_pixel_h = win.height -| 28;
+        win_pixel_h = win.height -| titlebar_h;
         found = true;
     }
     if (!found or win_pixel_w == 0 or win_pixel_h == 0) return;

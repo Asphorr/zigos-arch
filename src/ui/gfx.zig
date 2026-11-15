@@ -1101,9 +1101,78 @@ pub fn fillGlass(x: i32, y: i32, w: u32, h: u32, radius: u32, tint: u32, blur_r:
 
     // Tint overlay
     fillRoundedRectAlpha(x, y, w, h, radius, tint);
-    // Specular top-edge highlight (1px)
-    if (h > 2 and w > radius * 2) {
-        fillRoundedRectAlpha(x, y, w, 1, radius, 0x18FFFFFF);
+    // Rim light: 1 px along the top edge that follows the corner arcs and
+    // fades out down them. A straight full-width row would stick out past
+    // the rounded corners.
+    if (h > 2) {
+        const hr = @min(radius, w / 2, h / 2);
+        var prev_inset: u32 = w / 2;
+        var row: u32 = 0;
+        while (row <= hr) : (row += 1) {
+            const inset = if (row < hr) roundedRowEdge(hr, hr - 1 - row).inset else 0;
+            const a: u32 = 0x1C * (hr + 1 - row) / (hr + 1);
+            if (a == 0) break;
+            const col = (a << 24) | 0x00FFFFFF;
+            const py = y + @as(i32, @intCast(row));
+            if (row == 0) {
+                if (inset * 2 < w) fillRectAlpha(x + @as(i32, @intCast(inset)), py, w - inset * 2, 1, col);
+            } else if (prev_inset > inset) {
+                const seg = prev_inset - inset;
+                fillRectAlpha(x + @as(i32, @intCast(inset)), py, seg, 1, col);
+                fillRectAlpha(x + @as(i32, @intCast(w - prev_inset)), py, seg, 1, col);
+            }
+            prev_inset = inset;
+        }
+    }
+}
+
+/// 1 px outline of a rounded rect, alpha in the color's top byte. The
+/// stroke follows the same arc fillRoundedRectAlpha fills, so a ring drawn
+/// with the same x/y/w/h/radius sits exactly on the fill's edge.
+pub fn strokeRoundedRectAlpha(x: i32, y: i32, w: u32, h: u32, radius: u32, color: u32) void {
+    if (w < 2 or h < 2) return;
+    const r = @min(radius, w / 2, h / 2);
+    const base_a = (color >> 24) & 0xFF;
+    const rgb = color & 0x00FFFFFF;
+    const right: i32 = x + @as(i32, @intCast(w)) - 1;
+    var row: u32 = 0;
+    while (row < h) : (row += 1) {
+        const ry = y + @as(i32, @intCast(row));
+        const in_top = row < r;
+        const in_bot = row >= h - r;
+        if (!in_top and !in_bot) {
+            if (row == 0 or row == h - 1) {
+                fillRectAlpha(x, ry, w, 1, color);
+            } else {
+                blendPixelAt(x, ry, color);
+                blendPixelAt(right, ry, color);
+            }
+            continue;
+        }
+        // dy counts rows from the arc's center row out to the flat edge.
+        const dy: u32 = if (in_top) r - 1 - row else row - (h - r);
+        const e = roundedRowEdge(r, dy);
+        if (e.inset * 2 >= w) continue;
+        // The outermost row is all stroke; the others cover the step to the
+        // next row out, at least one pixel.
+        const span: u32 = if (dy + 1 >= r)
+            w - e.inset * 2
+        else
+            @max(1, roundedRowEdge(r, dy + 1).inset -| e.inset);
+        const left: i32 = x + @as(i32, @intCast(e.inset));
+        if (span * 2 >= w - e.inset * 2) {
+            fillRectAlpha(left, ry, w - e.inset * 2, 1, color);
+        } else {
+            fillRectAlpha(left, ry, span, 1, color);
+            fillRectAlpha(x + @as(i32, @intCast(w - e.inset - span)), ry, span, 1, color);
+        }
+        if (e.inset > 0 and e.edge_a > 0) {
+            const pa = (base_a * e.edge_a) / 255;
+            if (pa > 0) {
+                blendPixelAt(left - 1, ry, (pa << 24) | rgb);
+                blendPixelAt(x + @as(i32, @intCast(w - e.inset)), ry, (pa << 24) | rgb);
+            }
+        }
     }
 }
 

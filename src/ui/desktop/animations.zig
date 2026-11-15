@@ -201,11 +201,12 @@ pub fn advance() void {
                 // Maximize / un-maximize finished — let the owning app
                 // react to its new size. Without this, GUI apps stay
                 // laid-out for their pre-maximize dimensions and waste
-                // the extra screen estate (or render off-canvas).
+                // the extra screen estate (or render off-canvas). The
+                // event carries the content size, like every resize.
                 w.events.push(.{
                     .kind = @intFromEnum(events.EventKind.resize),
                     .a = w.width,
-                    .b = w.height,
+                    .b = w.height -| TITLEBAR_H,
                 });
             }
         }

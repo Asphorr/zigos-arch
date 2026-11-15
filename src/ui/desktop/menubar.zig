@@ -6,6 +6,7 @@
 const gfx = @import("../gfx.zig");
 const aa_font = @import("../aa_font.zig");
 const rtc = @import("../../time/rtc.zig");
+const time = @import("../../time/time.zig");
 const layout = @import("layout.zig");
 const dirty_rects = @import("dirty.zig");
 const smp = @import("../../cpu/smp.zig");
@@ -98,31 +99,65 @@ pub fn stale() bool {
     return statFill(cpu_pct) != shown_cpu_fill or statFill(memPct()) != shown_mem_fill;
 }
 
-/// Draw one labelled mini-bar at (x, y_top). Returns the right-edge x so
-/// the caller can stack the next widget to its left.
-fn drawStatBar(x: i32, y_top: i32, label: []const u8, pct: u8, atlas: *const aa_font.Atlas) i32 {
+const STAT_BAR_H: u32 = 5;
+const STAT_LABEL_GAP: u32 = 6;
+
+fn statPairWidth(label: []const u8, atlas: *const aa_font.Atlas) u32 {
+    return atlas.measure(label) + STAT_LABEL_GAP + STAT_BAR_W;
+}
+
+/// Draw one labelled mini-bar with its left edge at `x`.
+fn drawStatBar(x: i32, label: []const u8, pct: u8, atlas: *const aa_font.Atlas) void {
     const text_y: i32 = @divTrunc(@as(i32, MENUBAR_H) - @as(i32, atlas.line_height), 2);
-    const label_w: u32 = atlas.measure(label);
-    aa_font.drawText(x, text_y, label, 0x8C8C92, atlas);
+    aa_font.drawText(x, text_y, label, 0xA0A0A8, atlas);
 
-    const bar_x: i32 = x + @as(i32, @intCast(label_w)) + 6;
-    const bar_w: u32 = STAT_BAR_W;
-    const bar_h: u32 = 6;
-    const bar_y: i32 = y_top + @divTrunc(@as(i32, MENUBAR_H) - @as(i32, bar_h), 2);
+    const bar_x: i32 = x + @as(i32, @intCast(atlas.measure(label) + STAT_LABEL_GAP));
+    const bar_y: i32 = @divTrunc(@as(i32, MENUBAR_H) - @as(i32, STAT_BAR_H), 2) + 1;
 
-    // Trough — soft inset behind the fill.
-    gfx.fillRectAlpha(bar_x, bar_y, bar_w, bar_h, 0x44000000);
-    gfx.fillRectAlpha(bar_x, bar_y, bar_w, 1, 0x22000000);
-
+    gfx.fillRoundedRectAlpha(bar_x, bar_y, STAT_BAR_W, STAT_BAR_H, 2, 0x50000000);
     const fill_w: u32 = statFill(pct);
-    if (fill_w > 0) {
-        const col = loadColor(pct);
-        gfx.fillRectAlpha(bar_x, bar_y, fill_w, bar_h, col);
-        // 1-px top highlight gives the fill a slight bevel
-        gfx.fillRectAlpha(bar_x, bar_y, fill_w, 1, 0x40FFFFFF);
-    }
+    if (fill_w > 0) gfx.fillRoundedRectAlpha(bar_x, bar_y, @max(fill_w, 3), STAT_BAR_H, 2, loadColor(pct));
+}
 
-    return bar_x + @as(i32, @intCast(bar_w));
+const weekdays = [7][]const u8{ "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
+const months = [12][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+
+/// Day of the week, 0 = Sunday (Sakamoto's method; Gregorian dates).
+fn weekday(year: u32, month: u32, day: u32) u32 {
+    const t = [12]u32{ 0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4 };
+    const y = if (month < 3) year - 1 else year;
+    return (y + y / 4 - y / 100 + y / 400 + t[month - 1] + day) % 7;
+}
+
+/// "Sun 15 Nov  11:33" into `buf`; returns the length written.
+fn formatClock(buf: *[20]u8, dt: rtc.DateTime) usize {
+    var n: usize = 0;
+    // A clock that was never set can read month 0 or day 0: show the time alone.
+    if (dt.month >= 1 and dt.month <= 12 and dt.day >= 1 and dt.day <= 31 and dt.year >= 1) {
+        @memcpy(buf[n..][0..3], weekdays[weekday(dt.year, dt.month, dt.day)]);
+        n += 3;
+        buf[n] = ' ';
+        n += 1;
+        if (dt.day >= 10) {
+            buf[n] = '0' + dt.day / 10;
+            n += 1;
+        }
+        buf[n] = '0' + dt.day % 10;
+        n += 1;
+        buf[n] = ' ';
+        n += 1;
+        @memcpy(buf[n..][0..3], months[dt.month - 1]);
+        n += 3;
+        buf[n] = ' ';
+        buf[n + 1] = ' ';
+        n += 2;
+    }
+    buf[n] = '0' + dt.hour / 10;
+    buf[n + 1] = '0' + dt.hour % 10;
+    buf[n + 2] = ':';
+    buf[n + 3] = '0' + dt.minute / 10;
+    buf[n + 4] = '0' + dt.minute % 10;
+    return n + 5;
 }
 
 /// Render the menubar. `focused_title` is the visible window's title (or
@@ -130,56 +165,41 @@ fn drawStatBar(x: i32, y_top: i32, label: []const u8, pct: u8, atlas: *const aa_
 /// what counts as focused so this stays free of window-state coupling.
 pub fn render(focused_title: ?[]const u8) void {
     dirty_rects.add(0, 0, gfx.screen_w, MENUBAR_H);
-    // Glass backdrop (blur + tint)
+    // Glass backdrop (blur + tint) over a dark hairline at the bottom edge.
     gfx.blurRegion(0, 0, gfx.screen_w, MENUBAR_H, 6);
     gfx.saturateRegion(0, 0, gfx.screen_w, MENUBAR_H, 40);
-    gfx.fillRectAlpha(0, 0, gfx.screen_w, MENUBAR_H, 0x381A1A1E);
-    // Bottom border + top highlight
-    gfx.drawHLine(0, @as(i32, MENUBAR_H) - 1, gfx.screen_w, 0x333338);
-    gfx.drawHLine(0, 0, gfx.screen_w, 0x18FFFFFF);
+    gfx.fillRectAlpha(0, 0, gfx.screen_w, MENUBAR_H, 0x4A18181C);
+    gfx.fillRectAlpha(0, @as(i32, MENUBAR_H) - 1, gfx.screen_w, 1, 0x38000000);
 
-    // SF Pro Text 16 for everything in the bar. line_height ~19, MENUBAR_H=28
-    // → leave 4-5px above and below.
-    const atlas = aa_font.getDefault16();
+    // SF Pro Text 13 throughout: the wordmark semibold, the rest regular.
+    const atlas = aa_font.getDefault13();
+    const bold = aa_font.getDefault13Semibold();
     const text_y: i32 = @divTrunc(@as(i32, MENUBAR_H) - @as(i32, atlas.line_height), 2);
 
-    aa_font.drawText(12, text_y, "ZigOS", 0xC0C0CC, atlas);
-
-    const zigos_w: i32 = @intCast(atlas.measure("ZigOS"));
-    gfx.drawVLine(12 + zigos_w + 8, 6, MENUBAR_H - 12, 0x444448);
-
+    aa_font.drawText(14, text_y, "ZigOS", 0xFFFFFF, bold);
     if (focused_title) |title| {
-        aa_font.drawText(12 + zigos_w + 18, text_y, title, 0xEEEEEE, atlas);
+        const title_x: i32 = 14 + @as(i32, @intCast(bold.measure("ZigOS"))) + 16;
+        aa_font.drawText(title_x, text_y, title, 0xE4E4E8, atlas);
     }
 
-    // Right-side widgets, laid out right-to-left: [stat bars] [sep] [clock].
-    const time = rtc.readTime();
-    var clock_buf: [5]u8 = undefined;
-    clock_buf[0] = '0' + time.hour / 10;
-    clock_buf[1] = '0' + time.hour % 10;
-    clock_buf[2] = ':';
-    clock_buf[3] = '0' + time.minute / 10;
-    clock_buf[4] = '0' + time.minute % 10;
-    const clock_w: i32 = @intCast(atlas.measure(&clock_buf));
-    const clock_x: i32 = @as(i32, @intCast(gfx.screen_w)) - clock_w - 12;
-    aa_font.drawText(clock_x, text_y, &clock_buf, 0xEEEEEE, atlas);
+    // Right-side widgets, laid out right-to-left: [MEM] [CPU] [date + clock].
+    const utc = rtc.readDateTime();
+    const dt = time.toLocal(utc);
+    var clock_buf: [20]u8 = undefined;
+    const clock = clock_buf[0..formatClock(&clock_buf, dt)];
+    const clock_x: i32 = @as(i32, @intCast(gfx.screen_w)) - @as(i32, @intCast(atlas.measure(clock))) - 14;
+    aa_font.drawText(clock_x, text_y, clock, 0xF2F2F4, atlas);
 
-    // Stat bars: CPU on the right, MEM on the left. Refresh CPU sample, then
-    // place each pair (label + bar) to the left of the clock. ~58 px wide per
-    // pair (10-12 px label + 6 px gap + 36 px bar + 4 px gap to next).
     sampleCpu();
     const mp = memPct();
-    shown_minute = time.minute;
+    // The RTC's minute, which is what stale() compares against.
+    shown_minute = utc.minute;
     shown_cpu_fill = statFill(cpu_pct);
     shown_mem_fill = statFill(mp);
     shown_tick = process.tick_count;
-    const sep_x: i32 = clock_x - 10;
-    gfx.drawVLine(sep_x, 6, MENUBAR_H - 12, 0x444448);
 
-    // Per-widget budget: ~26 px label + 6 px gap + 36 px bar = ~68 px.
-    const pair_w: i32 = 70;
-    const cpu_x: i32 = sep_x - 8 - pair_w;
-    _ = drawStatBar(cpu_x, 0, "CPU", cpu_pct, atlas);
-    const mem_x: i32 = cpu_x - 8 - pair_w;
-    _ = drawStatBar(mem_x, 0, "MEM", mp, atlas);
+    const cpu_x: i32 = clock_x - 18 - @as(i32, @intCast(statPairWidth("CPU", atlas)));
+    drawStatBar(cpu_x, "CPU", cpu_pct, atlas);
+    const mem_x: i32 = cpu_x - 14 - @as(i32, @intCast(statPairWidth("MEM", atlas)));
+    drawStatBar(mem_x, "MEM", mp, atlas);
 }

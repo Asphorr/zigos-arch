@@ -105,11 +105,17 @@ pub const Atlas = struct {
 // had the block-element-extended one. The shared module eliminates the
 // drift class structurally.
 const font_blobs = @import("font_blobs");
+const blob_13 = font_blobs.blob_13;
+const blob_13sb = font_blobs.blob_13sb;
 const blob_16 = font_blobs.blob_16;
 const blob_24 = font_blobs.blob_24;
 const blob_mono = font_blobs.blob_mono;
 
 comptime {
+    for ([_][]const u8{ blob_13, blob_13sb }) |b| {
+        if (b.len < 32 or b[0] != 0x41 or b[1] != 0x54 or b[2] != 0x4C or b[3] != 0x46)
+            @compileError("aa_font: font_13*.bin missing, truncated or bad magic");
+    }
     if (blob_16.len < 32) @compileError("aa_font: font_16.bin missing or truncated");
     if (blob_24.len < 32) @compileError("aa_font: font_24.bin missing or truncated");
     if (blob_mono.len < 32) @compileError("aa_font: font_mono.bin missing or truncated");
@@ -122,6 +128,8 @@ comptime {
         @compileError("aa_font: font_mono.bin bad magic");
 }
 
+var default_13: Atlas = undefined;
+var default_13sb: Atlas = undefined;
 var default_16: Atlas = undefined;
 var default_24: Atlas = undefined;
 var default_mono: Atlas = undefined;
@@ -129,10 +137,24 @@ var initialized: bool = false;
 
 pub fn ensureLoaded() void {
     if (initialized) return;
+    default_13 = Atlas.parse(blob_13);
+    default_13sb = Atlas.parse(blob_13sb);
     default_16 = Atlas.parse(blob_16);
     default_24 = Atlas.parse(blob_24);
     default_mono = Atlas.parse(blob_mono);
     initialized = true;
+}
+
+/// UI text of the desktop chrome: menubar, menus, tooltips, icon labels.
+pub fn getDefault13() *const Atlas {
+    ensureLoaded();
+    return &default_13;
+}
+
+/// Semibold cut of the UI size: window titles, the menubar wordmark.
+pub fn getDefault13Semibold() *const Atlas {
+    ensureLoaded();
+    return &default_13sb;
 }
 
 pub fn getDefault16() *const Atlas {
@@ -154,6 +176,12 @@ pub fn getDefaultMono() *const Atlas {
 /// coverage. `(x, y)` is the top-left of the glyph cell — `y + line_height`
 /// is the next baseline. No clipping; rejects out-of-bounds pixels.
 pub fn drawText(x: i32, y: i32, text: []const u8, color: u32, atlas: *const Atlas) void {
+    drawTextAlpha(x, y, text, color, 255, atlas);
+}
+
+/// drawText with the glyph coverage scaled by `alpha` (0..255): soft text
+/// shadows, dimmed labels.
+pub fn drawTextAlpha(x: i32, y: i32, text: []const u8, color: u32, alpha: u8, atlas: *const Atlas) void {
     var pen_x: i32 = x;
     for (text) |c| {
         if (c < atlas.codept_start) {
@@ -181,8 +209,9 @@ pub fn drawText(x: i32, y: i32, text: []const u8, color: u32, atlas: *const Atla
             var gx: u32 = 0;
             while (gx < g.w) : (gx += 1) {
                 const px = glyph_left + @as(i32, @intCast(gx));
-                const a = atlas.pixels[row_off + g.atlas_x + gx];
-                if (a == 0) continue;
+                const cov = atlas.pixels[row_off + g.atlas_x + gx];
+                if (cov == 0) continue;
+                const a: u8 = if (alpha == 255) cov else @intCast((@as(u32, cov) * alpha) / 255);
                 blendPx(px, py, color, a);
             }
         }

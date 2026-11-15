@@ -421,31 +421,32 @@ pub fn isInTitlebar(idx: u8, mx: i32, my: i32) bool {
         mx >= w.x and mx < w.x + @as(i32, @intCast(w.width)));
 }
 
+/// Center of traffic light `n` (0 = close, 1 = minimize, 2 = maximize) of
+/// a window whose top-left is (wx, wy).
+pub fn trafficLightCenter(wx: i32, wy: i32, n: i32) [2]i32 {
+    return .{ wx + layout.BTN_FIRST_X + n * layout.BTN_PITCH, wy + @as(i32, TITLEBAR_H / 2) };
+}
+
+/// The hit disc is 2 px wider than the painted one: a 12 px target is easy
+/// to miss, and the lights are BTN_PITCH apart, so the discs never overlap.
+fn onTrafficLight(idx: u8, n: i32, mx: i32, my: i32) bool {
+    const c = trafficLightCenter(windows[idx].x, windows[idx].y, n);
+    const dx = mx - c[0];
+    const dy = my - c[1];
+    const hit_r: i32 = @as(i32, BTN_RADIUS) + 2;
+    return dx * dx + dy * dy <= hit_r * hit_r;
+}
+
 pub fn isOnCloseBtn(idx: u8, mx: i32, my: i32) bool {
-    const w = &windows[idx];
-    const cx = w.x + 16;
-    const cy = w.y + @as(i32, TITLEBAR_H / 2);
-    const dx = mx - cx;
-    const dy = my - cy;
-    return (dx * dx + dy * dy <= @as(i32, BTN_RADIUS * BTN_RADIUS));
+    return onTrafficLight(idx, 0, mx, my);
 }
 
 pub fn isOnMinimizeBtn(idx: u8, mx: i32, my: i32) bool {
-    const w = &windows[idx];
-    const cx = w.x + 38;
-    const cy = w.y + @as(i32, TITLEBAR_H / 2);
-    const dx = mx - cx;
-    const dy = my - cy;
-    return (dx * dx + dy * dy <= @as(i32, BTN_RADIUS * BTN_RADIUS));
+    return onTrafficLight(idx, 1, mx, my);
 }
 
 pub fn isOnMaximizeBtn(idx: u8, mx: i32, my: i32) bool {
-    const w = &windows[idx];
-    const cx = w.x + 60;
-    const cy = w.y + @as(i32, TITLEBAR_H / 2);
-    const dx = mx - cx;
-    const dy = my - cy;
-    return (dx * dx + dy * dy <= @as(i32, BTN_RADIUS * BTN_RADIUS));
+    return onTrafficLight(idx, 2, mx, my);
 }
 
 pub fn isOnResizeEdge(idx: u8, mx: i32, my: i32) ?ResizeEdge {

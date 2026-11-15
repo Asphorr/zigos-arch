@@ -2,74 +2,89 @@
 // then slides back out. Brief glass pill with a single line of text.
 // One toast at a time; a new `show()` call replaces whatever was there.
 //
-// Lifecycle: `show()` queues text + resets timer/anim. The desktop
-// main loop calls `tick()` once per frame, which advances the slide-in,
-// counts the hold timer down, then drives the slide-out over the final
-// ANIM_FRAMES. `render()` draws the current frame's glass pill at the
-// eased position — ease-out on the way in, ease-in on the way out.
-//
-// Width estimate uses 9 px / char (matches the legacy bitmap font's
-// advance) plus 32 px horizontal padding — close enough for SF Pro
-// at body size given the surrounding 12 px screen margin.
+// Lifecycle: `show()` queues the text. The desktop main loop calls
+// `tick(now)` each frame; the pill's place follows from its age in timer
+// ticks, so it stays up LIFE_TICKS whatever the frame rate. `render()`
+// draws it at the eased position — ease-out on the way in, ease-in on
+// the way out.
 
 const gfx = @import("../gfx.zig");
+const aa_font = @import("../aa_font.zig");
 const layout = @import("layout.zig");
 const dirty_rects = @import("dirty.zig");
 
 var text_buf: [64]u8 = [_]u8{0} ** 64;
 var text_len: u8 = 0;
-var timer: u32 = 0;
-var anim: u8 = 0;
 
-pub const ANIM_FRAMES: u8 = 8;
-const FONT_ADVANCE: u32 = 9; // Approximate glyph width for sizing only
-const PILL_H: u32 = 36;
-const MARGIN: i32 = 12;
+/// Timer ticks (10 ms) on screen, both slides included, and per slide.
+const LIFE_TICKS: u32 = 300;
+const SLIDE_TICKS: u32 = 15;
 
-/// Show `text` for ~200 frames (~3 s at 60 Hz, scales with desktop tick
-/// rate). A new call interrupts the previous toast immediately.
+var active: bool = false;
+/// show() ran and tick() has not yet stamped the start.
+var fresh: bool = false;
+var start_tick: u64 = 0;
+/// Ticks since start_tick as of the last tick().
+var age: u32 = 0;
+
+const PILL_H: u32 = 34;
+const PAD_X: u32 = 16;
+const RADIUS: u32 = 11;
+const MARGIN: i32 = 10;
+
+/// Show `text` for LIFE_TICKS. A new call replaces the toast on screen.
 pub fn show(text: []const u8) void {
     if (text.len == 0) return;
     const copy_len = @min(text.len, text_buf.len);
     for (0..copy_len) |i| text_buf[i] = text[i];
     text_len = @intCast(copy_len);
-    timer = 200;
-    anim = 0;
+    active = true;
+    fresh = true;
+    age = 0;
 }
 
-/// True iff a toast is currently on screen. Desktop's idle-yield logic
-/// uses this to keep ticking while the slide-in / slide-out plays.
 pub fn isActive() bool {
-    return timer > 0;
+    return active;
 }
 
-/// Per-frame timer/anim advance. Returns true iff the desktop must
-/// repaint the pill's old and new rects (a slide-in step, a slide-out
-/// step, or the final clear when the pill leaves the screen).
-pub fn tick() bool {
-    if (timer == 0) return false;
-    var dirty = false;
-    if (anim < ANIM_FRAMES) {
-        anim += 1;
-        dirty = true;
+fn sliding(a: u32) bool {
+    return a < SLIDE_TICKS or a > LIFE_TICKS - SLIDE_TICKS;
+}
+
+/// Advance to tick `now`. Returns true iff the desktop must repaint the
+/// pill's old and new rects: it appeared, moved or left.
+pub fn tick(now: u64) bool {
+    if (!active) return false;
+    if (fresh) {
+        fresh = false;
+        start_tick = now;
+        return true;
     }
-    timer -= 1;
-    // The final ANIM_FRAMES of life are the slide-out (plus the timer==0
-    // frame, where render() draws nothing and the repaint of the old rect
-    // clears the pixels). Repaint every one of those frames so the pill
-    // animates off-screen instead of hard-cutting.
-    if (timer <= ANIM_FRAMES) dirty = true;
-    return dirty;
+    const new_age: u32 = @intCast(@min(now -% start_tick, LIFE_TICKS));
+    const moved = new_age != age and (sliding(age) or sliding(new_age));
+    age = new_age;
+    if (age >= LIFE_TICKS) {
+        active = false;
+        return true;
+    }
+    return moved;
+}
+
+/// The tick at which tick() next has something to do: every other tick
+/// during a slide, the start of the slide-out during the hold.
+pub fn nextWake(now: u64) u64 {
+    if (fresh or sliding(age)) return now + 2;
+    return start_tick + (LIFE_TICKS - SLIDE_TICKS) + 1;
 }
 
 /// Screen rect [x0, y0, x1, y1) the last render() painted, null if none.
 pub var painted: ?[4]i32 = null;
 
 fn pillWidth() u32 {
-    return @as(u32, text_len) * FONT_ADVANCE + 32;
+    return aa_font.getDefault13().measure(text_buf[0..text_len]) + PAD_X * 2;
 }
 
-/// Pill origin for the current timer/anim state.
+/// Pill origin at the current age.
 fn pillPos() [2]i32 {
     const toast_w = pillWidth();
     const toast_y: i32 = @as(i32, layout.MENUBAR_H) + MARGIN;
@@ -78,50 +93,49 @@ fn pillPos() [2]i32 {
     // off-screen past the right edge. The pill eases between the two.
     const full_x: i32 = @as(i32, @intCast(gfx.screen_w)) - @as(i32, @intCast(toast_w)) - MARGIN;
     const off_x: i32 = @as(i32, @intCast(toast_w)) + MARGIN;
-    const total: i32 = ANIM_FRAMES;
+    const total: i32 = SLIDE_TICKS;
     var toast_x: i32 = full_x;
-    if (anim < ANIM_FRAMES) {
+    if (age < SLIDE_TICKS) {
         // Slide-in from the right edge with quadratic ease-out.
-        const t: i32 = @intCast(anim);
+        const t: i32 = @intCast(age);
         const progress = total - @divTrunc((total - t) * (total - t), total);
         toast_x = full_x + off_x - @divTrunc(off_x * progress, total);
-    } else if (timer <= ANIM_FRAMES) {
-        // Slide-out back off the right edge with quadratic ease-in — the
-        // mirror of the slide-in. `timer` counts ANIM_FRAMES..1 across the
-        // exit, so t = ANIM_FRAMES - timer ramps 0..ANIM_FRAMES-1.
-        const t: i32 = total - @as(i32, @intCast(timer));
+    } else if (age > LIFE_TICKS - SLIDE_TICKS) {
+        // Slide-out with quadratic ease-in, the mirror of the slide-in.
+        const t: i32 = @intCast(age - (LIFE_TICKS - SLIDE_TICKS));
         const progress = @divTrunc(t * t, total);
         toast_x = full_x + @divTrunc(off_x * progress, total);
     }
     return .{ toast_x, toast_y };
 }
 
-/// Screen rect [x0, y0, x1, y1) render() would paint now (pill plus
-/// shadow and specular border), null when no toast is up.
+/// Screen rect [x0, y0, x1, y1) render() would paint now (pill plus its
+/// shadow), null when no toast is up.
 pub fn rect() ?[4]i32 {
-    if (timer == 0) return null;
+    if (!active) return null;
     const p = pillPos();
-    return .{ p[0] - 1, p[1] - 1, p[0] + @as(i32, @intCast(pillWidth())) + 3, p[1] + @as(i32, PILL_H) + 3 };
+    return .{ p[0] - 1, p[1], p[0] + @as(i32, @intCast(pillWidth())) + 1, p[1] + @as(i32, PILL_H) + 4 };
 }
 
 pub fn render() void {
     painted = rect();
-    if (timer == 0) return;
+    const r = painted orelse return;
     const toast_w = pillWidth();
-    const p = pillPos();
-    const toast_x = p[0];
-    const toast_y = p[1];
+    const toast_x = r[0] + 1;
+    const toast_y = r[1];
 
     // Track the painted region so partial-blit paths flush this strip.
-    // Add 2 px on each side for the shadow + specular border.
-    const ux: u32 = if (toast_x < 1) 0 else @intCast(toast_x - 1);
-    const uy: u32 = if (toast_y < 1) 0 else @intCast(toast_y - 1);
-    dirty_rects.add(ux, uy, toast_w + 4, PILL_H + 4);
+    const ux: u32 = if (r[0] < 0) 0 else @intCast(r[0]);
+    const uy: u32 = if (r[1] < 0) 0 else @intCast(r[1]);
+    dirty_rects.add(ux, uy, toast_w + 2, PILL_H + 4);
 
-    // Shadow + glass backdrop + 1 px specular border.
-    gfx.fillRoundedRectAlpha(toast_x + 2, toast_y + 2, toast_w, PILL_H, 10, 0x40000000);
-    gfx.fillGlass(toast_x, toast_y, toast_w, PILL_H, 10, 0x382A2A3A, 6);
-    gfx.fillRoundedRectAlpha(toast_x - 1, toast_y - 1, toast_w + 2, PILL_H + 2, 11, 0x18FFFFFF);
-    // Body text — opaque bitmap font is fine; glass already painted under it.
-    gfx.drawString(toast_x + 16, toast_y + 10, text_buf[0..text_len], 0xFFFFFF, 0);
+    // Shadow, glass, hairline ring: all inside rect().
+    gfx.fillRoundedRectAlpha(toast_x - 1, toast_y + 1, toast_w + 2, PILL_H + 3, RADIUS + 1, 0x18000000);
+    gfx.fillRoundedRectAlpha(toast_x, toast_y + 3, toast_w, PILL_H, RADIUS, 0x28000000);
+    gfx.fillGlass(toast_x, toast_y, toast_w, PILL_H, RADIUS, 0xA026262A, 6);
+    gfx.strokeRoundedRectAlpha(toast_x, toast_y, toast_w, PILL_H, RADIUS, 0x30FFFFFF);
+
+    const atlas = aa_font.getDefault13();
+    const text_y: i32 = toast_y + @as(i32, @intCast((PILL_H -| atlas.line_height) / 2));
+    aa_font.drawText(toast_x + @as(i32, PAD_X), text_y, text_buf[0..text_len], 0xF2F2F4, atlas);
 }

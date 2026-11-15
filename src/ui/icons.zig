@@ -557,6 +557,7 @@ const title_map = [_]Entry{
     .{ .prefix = "sett", .icon = &settings },
     .{ .prefix = "file", .icon = &folder },
     .{ .prefix = "sys", .icon = &monitor },
+    .{ .prefix = "moni", .icon = &monitor },
     .{ .prefix = "edit", .icon = &editor },
     .{ .prefix = "doom", .icon = &doom },
     .{ .prefix = "quake", .icon = &quake },

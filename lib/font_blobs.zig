@@ -16,6 +16,10 @@
 // statically linked separately and still @embedFile's directly from
 // lib/assets/ — same files, different package, no divergence risk.
 
+// SF Pro Text 13 px, regular and semibold: the desktop chrome's UI size
+// (menubar, window titles, menus, labels). ASCII only.
+pub const blob_13: []const u8 align(2) = @embedFile("assets/font_13.bin");
+pub const blob_13sb: []const u8 align(2) = @embedFile("assets/font_13sb.bin");
 pub const blob_16: []const u8 align(2) = @embedFile("assets/font_16.bin");
 pub const blob_24: []const u8 align(2) = @embedFile("assets/font_24.bin");
 pub const blob_mono: []const u8 align(2) = @embedFile("assets/font_mono.bin");
