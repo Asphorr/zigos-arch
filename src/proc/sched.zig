@@ -2617,10 +2617,10 @@ pub fn rqHasDispatchable(cpu_id: u8) bool {
 /// waker stamps wake_tick = now from IRQ context (SCI → .acpid, the IRQ0
 /// due-check → .desktop), the deadline is the park's liveness backstop
 /// (.gpu_io, .desktop, .compositor, .acpid), or it is the wait's timeout
-/// (.futex; blockOnFutex stores 0 for an untimed wait). Every other non-.none
-/// kind is woken by its explicit path alone.
+/// (.futex, .poll, .win_event; 0 is stored for an untimed wait). Every other
+/// non-.none kind is woken by its explicit path alone.
 inline fn deadlineParked(kind: WaitKind) bool {
-    return kind == .gpu_io or kind == .desktop or kind == .compositor or kind == .acpid or kind == .futex or kind == .poll;
+    return kind == .gpu_io or kind == .desktop or kind == .compositor or kind == .acpid or kind == .futex or kind == .poll or kind == .win_event;
 }
 
 /// Wake sleeping processes whose `sleep()` deadline has expired. Only

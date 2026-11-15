@@ -1157,8 +1157,10 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp, persist_shared_dirty: 
     // completes, since the OP_POLL pending slots reference them by index
     // and the worker may already have recycled the Instance slot above.
     @import("../cpu/ipc/fdpoll.zig").releaseAllForPid(@intCast(pid));
-    // Killed inside poll or wait4: its bits would wake the slot's next task.
+    // Killed inside poll, waitEvent or wait4: its bits would wake the slot's
+    // next task.
     @import("../cpu/ipc/fdpoll.zig").sleeperLeave(pid);
+    @import("../ui/desktop/event_wait.zig").leave(pid);
     childWaitLeave(pid);
 
     // Resources reachable in any address space (GUI window state, GPU

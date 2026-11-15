@@ -167,6 +167,7 @@ pub const WaitKind = enum(u8) {
     compositor, // wait_target = 0. The GPU compositor task parks here between frames; woken by requestRender's process.wake (any CPU) or by wakeExpired at its liveness backstop (gpu_compositor.PARK_BACKSTOP_TICKS).
     acpid, // wait_target = 0. The acpid thread parks here between SCI events; the SCI handler stamps wake_tick = now (+ wake_pending, the virtio-gpu IRQ pattern) and wakeExpired readies it; ACPID_BACKSTOP_TICKS bounds a missed stamp.
     poll, // wait_target = 0. A Linux poll/ppoll; fdpoll.wakePollers wakes it by pid, wakeExpired at its timeout (wake_tick, 0 for none).
+    win_event, // wait_target = 0. sysWaitEvent; the desktop wakes it by pid once its focused window has events (event_wait.notify), wakeExpired at its timeout (wake_tick, 0 for none).
 };
 
 // Per-fd table entry. All fields are owner-pid only — fd_table lives on

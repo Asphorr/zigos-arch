@@ -140,6 +140,47 @@ pub fn sysPollEvent(buf_ptr: u32) u32 {
     return ev.kind;
 }
 
+/// wait_event(buf_ptr, timeout_ms): poll_event that parks the caller until
+/// it has an event to read or `timeout_ms` passes (0xFFFFFFFF: no timeout).
+/// Returns the event kind; 0 on timeout or when a signal is pending.
+pub fn sysWaitEvent(buf_ptr: u32, timeout_ms: u32) u32 {
+    if (buf_ptr == 0) return 0;
+    const UserPtr = @import("../../util/user_ptr.zig").UserPtr;
+    const out = UserPtr(desktop.Event).fromRaw(buf_ptr).validateWrite() orelse return 0;
+    const ev = waitForEvent(timeout_ms) orelse return 0;
+    // A faultable copy: the page was proven at entry, a park ago. Done
+    // outside the wait, since bringing the page back can itself block.
+    if (!out.copyOut(ev)) return 0;
+    return ev.kind;
+}
+
+/// The wait of sysWaitEvent: null on timeout or when a signal is pending.
+fn waitForEvent(timeout_ms: u32) ?desktop.Event {
+    const event_wait = @import("../../ui/desktop/event_wait.zig");
+    const cur: u8 = @intCast(process.getCurrentPid());
+    const pcb = &process.procs[cur];
+    const untimed = timeout_ms == 0xFFFFFFFF;
+    // Rounded up and one tick more: never shorter than asked.
+    const deadline: u64 = if (untimed) 0 else if (timeout_ms == 0) process.tick_count else process.tick_count +| (@as(u64, timeout_ms) + 9) / 10 +| 1;
+    // Entered before the first look at the queue: the desktop's notify for
+    // an event queued after any look of ours finds the bit.
+    event_wait.enter(cur);
+    defer {
+        event_wait.leave(cur);
+        @atomicStore(u64, &pcb.wake_tick, 0, .release);
+    }
+    var ev: desktop.Event = .{ .kind = 0 };
+    while (true) {
+        if (desktop.popEvent(cur, &ev)) return ev;
+        if (!untimed and process.tick_count >= deadline) return null;
+        // signals.send wakes us; return so the signal is delivered. Not
+        // inside a handler: none is delivered there, and returning would
+        // only spin the caller's loop.
+        if (!pcb.in_signal_handler and signals.hasDeliverable(pcb)) return null;
+        @import("../../proc/sched.zig").blockOnDeadline(.win_event, 0, deadline);
+    }
+}
+
 pub fn sysSetCursorVisible(arg1: u32) u32 {
     const pid: u8 = @intCast(process.getCurrentPid());
     desktop.setCursorHidden(pid, arg1 == 0);
