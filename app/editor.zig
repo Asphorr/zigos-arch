@@ -3,12 +3,12 @@ const gfx = @import("graphics");
 const fa = @import("font_atlas");
 const ui = @import("ui");
 
-const BG: u32 = 0x1E1E2E;
+const BG: u32 = 0x1E1E20;
 const TEXT_FG: u32 = 0xCCCCCC;
 const SEL_BG: u32 = 0x3A3A55;
-const TOOLBAR_BG: u32 = 0x2A2A3A;
-const TOOLBAR_FG: u32 = 0x88AACC;
-const STATUS_BG: u32 = 0x2A2A3A;
+const TOOLBAR_BG: u32 = 0x29292C;
+const TOOLBAR_FG: u32 = 0xB4B4BA;
+const STATUS_BG: u32 = 0x29292C;
 const STATUS_FG: u32 = 0xAAAAAA;
 const CURSOR_COLOR: u32 = 0xFFFFFF;
 const LINE_NUM_FG: u32 = 0x555566;

@@ -17,20 +17,20 @@ const ui = @import("ui");
 const fa = @import("font_atlas");
 
 // --- Palette (mirrors UEFI menu / About) ---
-const COLOR_BG: u32 = 0x141826;
-const COLOR_PANEL: u32 = 0x1C2032;
-const COLOR_PANEL_ALT: u32 = 0x222640;
-const COLOR_BORDER_OUT: u32 = 0x2E3450;
-const COLOR_BORDER_IN: u32 = 0x171A28;
-const COLOR_TITLE: u32 = 0x9FB6E0;
-const COLOR_TEXT: u32 = 0xE0E4F0;
-const COLOR_TEXT_DIM: u32 = 0x7A8298;
-const COLOR_TEXT_MUTED: u32 = 0x586078;
-const COLOR_ACCENT: u32 = 0x60A8FF;
-const COLOR_SEL_BG: u32 = 0x2A4080;
-const COLOR_SEL_BORDER: u32 = 0x4D7AE6;
-const COLOR_PATH_BG: u32 = 0x161A2A;
-const COLOR_DIVIDER: u32 = 0x2A2E48;
+const COLOR_BG: u32 = 0x1E1E20;
+const COLOR_PANEL: u32 = 0x29292C;
+const COLOR_PANEL_ALT: u32 = 0x242427;
+const COLOR_BORDER_OUT: u32 = 0x3A3A3E;
+const COLOR_BORDER_IN: u32 = 0x18181A;
+const COLOR_TITLE: u32 = 0xF2F2F4;
+const COLOR_TEXT: u32 = 0xE4E4E8;
+const COLOR_TEXT_DIM: u32 = 0x8C8C92;
+const COLOR_TEXT_MUTED: u32 = 0x66666C;
+const COLOR_ACCENT: u32 = 0x58A6FF;
+const COLOR_SEL_BG: u32 = 0x0B55B8;
+const COLOR_SEL_BORDER: u32 = 0x3D9BFF;
+const COLOR_PATH_BG: u32 = 0x19191B;
+const COLOR_DIVIDER: u32 = 0x343438;
 
 // --- Per-icon colors ---
 const ICON_FOLDER: u32 = 0xE8B83A; // amber folder
@@ -614,7 +614,7 @@ fn render(canvas: *gfx.Canvas) void {
         const n = formatNum(&buf, file_count);
         const cx = fa.drawNumOpaque(canvas, 12, sb_text_y, file_count, COLOR_TEXT_DIM, COLOR_PANEL, &fa.default_16);
         _ = n;
-        fa.drawTextOpaque(canvas, cx, sb_text_y, " items  •  double-click to open", COLOR_TEXT_DIM, COLOR_PANEL, &fa.default_16);
+        fa.drawTextOpaque(canvas, cx, sb_text_y, " items, double-click to open", COLOR_TEXT_DIM, COLOR_PANEL, &fa.default_16);
     }
 }
 

@@ -325,7 +325,7 @@ fn render(canvas: *gfx.Canvas) void {
         blitScaled(canvas, px, e.w, e.h, draw_x, draw_y, draw_w, draw_h);
     } else {
         // No image loaded — show a hint.
-        const msg = "No image loaded — use Open Folder to browse";
+        const msg = "No image loaded. Use Open Folder to browse";
         const atlas = fa.getDefault16();
         const ty = img_area_y + (img_area_h -| atlas.line_height) / 2;
         fa.drawTextCentered(canvas, 0, @intCast(ty), vis_w, msg, COLOR_TEXT_DIM, atlas);

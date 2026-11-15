@@ -1,12 +1,8 @@
 const libc = @import("libc");
-const gfx = @import("graphics");
+const app = @import("app");
 const ui = @import("ui");
-const fa = @import("font_atlas");
 const image = @import("image");
 
-const BG: u32 = 0x1E1E2E;
-const SECTION_COLOR: u32 = 0x8888CC;
-const LABEL_COLOR: u32 = 0xCCCCCC;
 const STATUS_OK: u32 = 0x66DD88;
 const STATUS_WARN: u32 = 0xFFCC55;
 const STATUS_BAD: u32 = 0xFF6666;
@@ -16,9 +12,16 @@ const WP_DIR = "/share/";
 
 var sel_resolution: u8 = 1; // default to 1080p
 var sel_background: u8 = 0;
-var sel_theme: u8 = 0;
+var sel_theme: u8 = 1; // the desktop's default when the file has no key
 var sel_mouse_speed: u8 = 1;
+// The dock has one position; the key is carried through so a saved value
+// survives a rewrite of the file.
 var sel_dock_pos: u8 = 0;
+// Minutes east of UTC; zones sit on the hour or :30 / :45 past it.
+var sel_utc_offset: i32 = 0;
+const UTC_OFFSET_MIN: i32 = -12 * 60;
+const UTC_OFFSET_MAX: i32 = 14 * 60;
+const zone_minutes = [_]u32{ 0, 30, 45 };
 
 // Wallpaper state. `sel_wp_path` is the full path of the picked image
 // ("" = no wallpaper / gradient background). Cached image dimensions
@@ -28,34 +31,6 @@ var sel_wp_path_len: u32 = 0;
 var sel_wp_w: u32 = 0;
 var sel_wp_h: u32 = 0;
 var sel_wp_kind: enum { none, exact, letterbox, mismatch, broken } = .none;
-
-var alloc_w: u32 = 0;
-var alloc_h: u32 = 0;
-var vis_w: u32 = 0;
-var vis_h: u32 = 0;
-var section_h: u32 = 0;
-
-// Label y-coordinates produced by computeLayout's VStack walk. Indexed
-// in section order: 0=Resolution, 1=Background, 2=Theme, 3=Mouse Speed,
-// 4=Dock Position, 5=Wallpaper. Render block reads from this to keep
-// the label rows aligned with the button rows below them without
-// re-doing the y math at every drawText call site.
-var label_ys: [6]u32 = [_]u32{0} ** 6;
-var wp_status_y: u32 = 0;
-// macOS-style cards — one per section. Each wraps its row of buttons
-// with rounded card_bg + AA corners. computeLayout sizes them after
-// reserving space for the row(s) inside.
-var cards: [6]ui.Card = [_]ui.Card{.{ .x = 0, .y = 0, .w = 0, .h = 0 }} ** 6;
-
-var res_btns: [2]ui.Button = undefined;
-var bg_btns: [4]ui.Button = undefined;
-const bg_colors = [4]u32{ 0x2D5F8A, 0x5F2D8A, 0x2D8A5F, 0x8A2D2D };
-var theme_btns: [2]ui.Button = undefined;
-var speed_btns: [3]ui.Button = undefined;
-var dock_btns: [2]ui.Button = undefined;
-var wp_choose_btn: ui.Button = undefined;
-var wp_clear_btn: ui.Button = undefined;
-var apply_btn: ui.Button = undefined;
 
 // --- Wallpaper picker state ------------------------------------------------
 //
@@ -124,6 +99,21 @@ fn parseU8(s: []const u8) ?u8 {
     return @intCast(v);
 }
 
+/// Signed decimal minutes within the range zones use.
+fn parseOffset(s: []const u8) ?i32 {
+    if (s.len == 0) return null;
+    const neg = s[0] == '-';
+    const digits = if (neg or s[0] == '+') s[1..] else s;
+    if (digits.len == 0 or digits.len > 4) return null;
+    var v: i32 = 0;
+    for (digits) |c| {
+        if (c < '0' or c > '9') return null;
+        v = v * 10 + (c - '0');
+    }
+    if (neg) v = -v;
+    return if (v < UTC_OFFSET_MIN or v > UTC_OFFSET_MAX) null else v;
+}
+
 fn applyKv(key: []const u8, val_str: []const u8) void {
     if (eql(key, "wallpaper")) {
         sel_wp_path_len = 0;
@@ -131,6 +121,10 @@ fn applyKv(key: []const u8, val_str: []const u8) void {
         @memcpy(sel_wp_path_buf[0..val_str.len], val_str);
         sel_wp_path_len = @intCast(val_str.len);
         refreshWallpaperStatus();
+        return;
+    }
+    if (eql(key, "utc_offset")) {
+        if (parseOffset(val_str)) |minutes| sel_utc_offset = minutes;
         return;
     }
     const val = parseU8(val_str) orelse return;
@@ -182,10 +176,21 @@ fn writeKvStr(buf: []u8, pos: usize, key: []const u8, val: []const u8) usize {
     return p;
 }
 
+fn writeKvInt(buf: []u8, pos: usize, key: []const u8, val: i32) usize {
+    var num: [12]u8 = undefined;
+    var n: usize = 0;
+    if (val < 0) {
+        num[0] = '-';
+        n = 1;
+    }
+    n += writeNum(num[n..], @abs(val));
+    return writeKvStr(buf, pos, key, num[0..n]);
+}
+
 fn saveConf() void {
     var buf: [512]u8 = undefined;
     var pos: usize = 0;
-    const header = "# ZigOS UI configuration — written by Settings\n";
+    const header = "# ZigOS UI configuration, written by Settings\n";
     @memcpy(buf[pos..][0..header.len], header);
     pos += header.len;
     pos = writeKv(&buf, pos, "resolution", sel_resolution);
@@ -193,6 +198,7 @@ fn saveConf() void {
     pos = writeKv(&buf, pos, "theme", sel_theme);
     pos = writeKv(&buf, pos, "mouse_speed", sel_mouse_speed);
     pos = writeKv(&buf, pos, "dock_pos", sel_dock_pos);
+    pos = writeKvInt(&buf, pos, "utc_offset", sel_utc_offset);
     pos = writeKvStr(&buf, pos, "wallpaper", sel_wp_path_buf[0..sel_wp_path_len]);
     const fd = libc.openFlags(CONF_PATH, libc.O_TRUNC) orelse return;
     defer libc.close(fd);
@@ -443,148 +449,60 @@ fn applyWallpaperAndNotify(ok_msg: []const u8, fail_msg: []const u8) void {
     libc.notify(ok_msg);
 }
 
-// --- Layout -----------------------------------------------------------------
-
-fn computeLayout(w: u32, h: u32) void {
-    vis_w = w;
-    vis_h = h;
-    section_h = 60; // legacy field, no longer used by the layout itself
-
-    const bh: u32 = 26;
-    const m: u32 = 12;
-    const LABEL_TO_CARD: u32 = 6; // small gap between section label and the card
-    const SECTION_GAP: u32 = 16;
-    const lh: u32 = fa.default_16.line_height;
-    const card_w: u32 = w -| (m * 2);
-    const ix: u32 = m + ui.Card.HPAD; // button x inside a card
-
-    var v = ui.VStack.init(undefined, m, 8, card_w);
-    v.gap(fa.default_24.line_height + 12); // title row + gap
-
-    // Each section: label, small gap, then a card with one row of
-    // buttons (or two stacked rows for wallpaper). Card top/bottom are
-    // determined by `card_y_start` and `v.cursor() - card_y_start`
-    // after the row is reserved.
-
-    // Resolution
-    label_ys[0] = v.cursor();
-    v.gap(lh + LABEL_TO_CARD);
-    var card_y = v.cursor();
-    v.gap(ui.Card.VPAD);
-    var y = v.reserve(bh);
-    res_btns[0] = .{ .x = ix, .y = y, .w = 110, .h = bh, .label = "1280x720" };
-    res_btns[1] = .{ .x = ix + 116, .y = y, .w = 120, .h = bh, .label = "1920x1080" };
-    v.gap(ui.Card.VPAD);
-    cards[0] = .{ .x = m, .y = card_y, .w = card_w, .h = v.cursor() - card_y };
-    v.gap(SECTION_GAP);
-
-    // Background
-    label_ys[1] = v.cursor();
-    v.gap(lh + LABEL_TO_CARD);
-    card_y = v.cursor();
-    v.gap(ui.Card.VPAD);
-    y = v.reserve(bh);
-    bg_btns[0] = .{ .x = ix, .y = y, .w = 70, .h = bh, .label = "Blue" };
-    bg_btns[1] = .{ .x = ix + 76, .y = y, .w = 80, .h = bh, .label = "Purple" };
-    bg_btns[2] = .{ .x = ix + 162, .y = y, .w = 75, .h = bh, .label = "Green" };
-    bg_btns[3] = .{ .x = ix + 243, .y = y, .w = 60, .h = bh, .label = "Red" };
-    v.gap(ui.Card.VPAD);
-    cards[1] = .{ .x = m, .y = card_y, .w = card_w, .h = v.cursor() - card_y };
-    v.gap(SECTION_GAP);
-
-    // Theme
-    label_ys[2] = v.cursor();
-    v.gap(lh + LABEL_TO_CARD);
-    card_y = v.cursor();
-    v.gap(ui.Card.VPAD);
-    y = v.reserve(bh);
-    theme_btns[0] = .{ .x = ix, .y = y, .w = 80, .h = bh, .label = "Light" };
-    theme_btns[1] = .{ .x = ix + 86, .y = y, .w = 80, .h = bh, .label = "Dark" };
-    v.gap(ui.Card.VPAD);
-    cards[2] = .{ .x = m, .y = card_y, .w = card_w, .h = v.cursor() - card_y };
-    v.gap(SECTION_GAP);
-
-    // Mouse Speed
-    label_ys[3] = v.cursor();
-    v.gap(lh + LABEL_TO_CARD);
-    card_y = v.cursor();
-    v.gap(ui.Card.VPAD);
-    y = v.reserve(bh);
-    speed_btns[0] = .{ .x = ix, .y = y, .w = 70, .h = bh, .label = "Slow" };
-    speed_btns[1] = .{ .x = ix + 76, .y = y, .w = 85, .h = bh, .label = "Normal" };
-    speed_btns[2] = .{ .x = ix + 167, .y = y, .w = 70, .h = bh, .label = "Fast" };
-    v.gap(ui.Card.VPAD);
-    cards[3] = .{ .x = m, .y = card_y, .w = card_w, .h = v.cursor() - card_y };
-    v.gap(SECTION_GAP);
-
-    // Dock Position
-    label_ys[4] = v.cursor();
-    v.gap(lh + LABEL_TO_CARD);
-    card_y = v.cursor();
-    v.gap(ui.Card.VPAD);
-    y = v.reserve(bh);
-    dock_btns[0] = .{ .x = ix, .y = y, .w = 90, .h = bh, .label = "Bottom" };
-    dock_btns[1] = .{ .x = ix + 96, .y = y, .w = 80, .h = bh, .label = "Top" };
-    v.gap(ui.Card.VPAD);
-    cards[4] = .{ .x = m, .y = card_y, .w = card_w, .h = v.cursor() - card_y };
-    v.gap(SECTION_GAP);
-
-    // Wallpaper — button row + status line below, both inside the card
-    label_ys[5] = v.cursor();
-    v.gap(lh + LABEL_TO_CARD);
-    card_y = v.cursor();
-    v.gap(ui.Card.VPAD);
-    y = v.reserve(bh);
-    wp_choose_btn = .{ .x = ix, .y = y, .w = 180, .h = bh, .label = "Choose Wallpaper..." };
-    wp_clear_btn = .{ .x = ix + 186, .y = y, .w = 70, .h = bh, .label = "Clear" };
-    v.gap(8);
-    wp_status_y = v.reserve(lh);
-    v.gap(ui.Card.VPAD);
-    cards[5] = .{ .x = m, .y = card_y, .w = card_w, .h = v.cursor() - card_y };
-
-    // Apply — centered below all cards, 32 px tall as a primary action
-    v.gap(SECTION_GAP + 4);
-    const apply_y = v.reserve(32);
-    apply_btn = .{ .x = vis_w / 2 -| 65, .y = apply_y, .w = 130, .h = 32, .label = "Apply" };
+fn openPicker(u: *const app.Ui) void {
+    // Start in the folder of the current wallpaper.
+    const path = sel_wp_path_buf[0..sel_wp_path_len];
+    var start_dir: []const u8 = WP_DIR;
+    if (lastIndexOf(path, '/')) |slash| {
+        if (slash > 0) start_dir = path[0 .. slash + 1];
+    }
+    wp_picker = ui.ImagePicker.init(u.w, u.h, start_dir);
+    rescanPicker();
+    wp_picker_active = true;
 }
 
-// --- Status line drawer -----------------------------------------------------
+fn rescanPicker() void {
+    scanWallpaperThumbs(wp_picker.currentDir());
+    wp_picker.setThumbnails(wp_thumbs[0..wp_thumb_count]);
+}
 
-fn drawWallpaperStatus(canvas: *gfx.Canvas, x: u32, y: u32) void {
-    var line_buf: [96]u8 = undefined;
-    var line_len: usize = 0;
-    var color: u32 = LABEL_COLOR;
+fn closePicker() void {
+    wp_picker_active = false;
+    freeWallpaperThumbs();
+}
 
-    switch (sel_wp_kind) {
-        .none => {
-            const t = "None — gradient background";
-            @memcpy(line_buf[0..t.len], t);
-            line_len = t.len;
+/// The picker's share of an input pass.
+fn pickerInput(u: *app.Ui) void {
+    var action = wp_picker.handleClick(u.mouse.x, u.mouse.y, u.down, u.was_down);
+    if (action == .none and u.key != 0) action = wp_picker.handleKey(u.key);
+    switch (action) {
+        .cancel => closePicker(),
+        .ok => {
+            commitPickerSelection();
+            closePicker();
         },
-        .exact => {
-            line_len = formatStatus(&line_buf, "✓ exact match");
-            color = STATUS_OK;
+        .folder_changed => {
+            rescanPicker();
+            wp_picker.acknowledgeFolderChange();
         },
-        .letterbox => {
-            line_len = formatStatus(&line_buf, "centered (letterbox)");
-            color = STATUS_WARN;
-        },
-        .mismatch => {
-            line_len = formatStatus(&line_buf, "larger than screen — will be cropped");
-            color = STATUS_WARN;
-        },
-        .broken => {
-            const t = "couldn't read image (not a PNG?)";
-            @memcpy(line_buf[0..t.len], t);
-            line_len = t.len;
-            color = STATUS_BAD;
-        },
+        .none => {},
     }
+    // It keeps its own hover and selection.
+    u.repaint();
+}
 
-    // Status sits INSIDE the wallpaper card now — bg-fill must use the
-    // card color, not the window bg, or the opaque rect punches a hole
-    // in the card.
-    fa.drawTextOpaque(canvas, x, y, line_buf[0..line_len], color, ui.palette.card_bg, &fa.default_16);
+// --- Status line -------------------------------------------------------------
+
+const Status = struct { text: []const u8, color: u32 };
+
+fn wallpaperStatus(buf: []u8) Status {
+    return switch (sel_wp_kind) {
+        .none => .{ .text = "No image: gradient background", .color = ui.palette.text_muted },
+        .exact => .{ .text = buf[0..formatStatus(buf, "exact match")], .color = STATUS_OK },
+        .letterbox => .{ .text = buf[0..formatStatus(buf, "centered (letterbox)")], .color = STATUS_WARN },
+        .mismatch => .{ .text = buf[0..formatStatus(buf, "larger than the screen, will be cropped")], .color = STATUS_WARN },
+        .broken => .{ .text = "couldn't read image (not a PNG?)", .color = STATUS_BAD },
+    };
 }
 
 fn formatStatus(buf: []u8, suffix: []const u8) usize {
@@ -637,289 +555,114 @@ fn writeNum(buf: []u8, n: u32) usize {
     return p;
 }
 
-// --- Main -------------------------------------------------------------------
+// --- Time zone ---------------------------------------------------------------
+
+/// "UTC+05:30" for the selected offset.
+fn zoneLabel(buf: *[9]u8) []const u8 {
+    const mag: u32 = @abs(sel_utc_offset);
+    const h: u8 = @intCast(mag / 60);
+    const m: u8 = @intCast(mag % 60);
+    const sign: u8 = if (sel_utc_offset < 0) '-' else '+';
+    buf.* = .{ 'U', 'T', 'C', sign, '0' + h / 10, '0' + h % 10, ':', '0' + m / 10, '0' + m % 10 };
+    return buf;
+}
+
+fn setZone(minutes: i32) void {
+    sel_utc_offset = @max(UTC_OFFSET_MIN, @min(minutes, UTC_OFFSET_MAX));
+}
+
+/// Keep the hour, swap the minutes past it.
+fn setZoneMinutes(past: u32) void {
+    const mag: u32 = @abs(sel_utc_offset);
+    const whole: i32 = @intCast(mag / 60 * 60 + past);
+    setZone(if (sel_utc_offset < 0) -whole else whole);
+}
+
+/// Which of zone_minutes the offset has; past the end when none.
+fn zoneMinuteIndex() usize {
+    const past = @abs(sel_utc_offset) % 60;
+    for (zone_minutes, 0..) |m, i| if (m == past) return i;
+    return zone_minutes.len;
+}
+
+// --- Actions ----------------------------------------------------------------
+
+fn apply() void {
+    libc.setConfig(libc.Config.resolution, sel_resolution);
+    libc.setConfig(libc.Config.background, sel_background);
+    libc.setConfig(libc.Config.theme, sel_theme);
+    libc.setConfig(libc.Config.mouse_speed, sel_mouse_speed);
+    libc.setConfig(libc.Config.dock_pos, sel_dock_pos);
+    libc.setConfig(libc.Config.utc_offset, @bitCast(sel_utc_offset));
+    libc.applyConfig();
+    saveConf();
+    libc.notify("Settings saved");
+}
+
+fn clearWallpaper() void {
+    sel_wp_path_len = 0;
+    refreshWallpaperStatus();
+    saveConf();
+    // Straight to the kernel: wallpaper.elf, given an empty `wallpaper=`
+    // line, exits without telling it to drop the image it has.
+    libc.notify(if (libc.setWallpaperClear()) "Wallpaper cleared" else "Wallpaper clear failed");
+}
+
+// --- Window -----------------------------------------------------------------
 
 export fn _start() linksection(".text.entry") callconv(.c) void {
-    // Atlases first — every later height calc (init_h below, computeLayout
-    // when called) reads line_height; lazy load would leave it as 0.
-    fa.ensureLoaded();
-
+    // Before run(): its first layout already shows the saved choices.
+    loadConf();
     const scr = libc.getScreenSize();
-    var init_w = scr.w / 4;
-    if (init_w < 460) init_w = 460;
-    if (init_w > 540) init_w = 540;
-    // Card layout: title + 5 standard sections + wallpaper (taller, has
-    // status row) + apply. Numbers come from computeLayout's actual gaps:
-    //   title block:    title_lh + 12
-    //   per section:    label_lh + 6 (gap) + 12 (vpad) + 26 (button) + 12 (vpad) + 16 (section gap)
-    //   wallpaper extra: 8 (gap) + label_lh (status)
-    //   apply block:    (section_gap+4) + 32
-    //   bottom margin:  16
-    const bh: u32 = 26;
-    const lh16: u32 = fa.default_16.line_height;
-    const lh24: u32 = fa.default_24.line_height;
-    const per_section: u32 = lh16 + 6 + 12 + bh + 12 + 16;
-    const init_h: u32 = 8 + lh24 + 12 + per_section * 5 + (per_section + 8 + lh16) + (16 + 4 + 32) + 16;
-    alloc_w = @min(init_w * 2, scr.w);
-    alloc_h = @min(init_h * 2, scr.h);
-    while (alloc_w * alloc_h > 524288) {
-        if (alloc_w > alloc_h) alloc_w -= 16 else alloc_h -= 16;
+    const w: u32 = @min(@max(scr.w / 4, 460), 540);
+    app.run(@This(), .{ .width = w });
+}
+
+pub fn frame(u: *app.Ui) void {
+    // The picker is modal: the settings under it are drawn but inert.
+    if (wp_picker_active) {
+        u.blocked = true;
+        if (!u.painting) pickerInput(u);
+    } else if (u.key == 0x1B) {
+        u.close();
     }
 
-    loadConf();
-    refreshWallpaperStatus(); // applyKv may have set sel_wp_path
-    ui.setDarkMode(sel_theme == 1);
+    // No title of its own (the titlebar has it) and wallpaper under
+    // Background: as laid out here the window still fits a 720p work area.
+    u.beginGroup("Resolution");
+    if (u.choice(&.{ "1280x720", "1920x1080" }, sel_resolution)) |i| sel_resolution = @intCast(i);
+    u.endGroup();
 
-    // Force font atlases parsed BEFORE computeLayout — the new VStack-based
-    // layout reads default_16/default_24's line_height to size the row
-    // gaps, and the atlases are otherwise lazy-loaded on first drawText.
-    // Without this, line_height reads as 0 (undefined) and all rows
-    // collapse onto the buttons below them.
-    fa.ensureLoaded();
+    u.beginGroup("Background");
+    if (u.choice(&.{ "Blue", "Purple", "Green", "Red" }, sel_background)) |i| sel_background = @intCast(i);
+    if (u.button("Choose Wallpaper...")) openPicker(u);
+    u.sameLine();
+    if (u.button("Clear")) clearWallpaper();
+    var status_buf: [96]u8 = undefined;
+    const status = wallpaperStatus(&status_buf);
+    u.text(status.text, status.color);
+    u.endGroup();
 
-    computeLayout(init_w, init_h);
+    u.beginGroup("Theme");
+    if (u.choice(&.{ "Light", "Dark" }, sel_theme)) |i| sel_theme = @intCast(i);
+    u.endGroup();
 
-    const win = libc.createWindowEx(alloc_w, alloc_h, init_w, init_h) orelse {
-        libc.exit();
-    };
-    alloc_w = win.alloc_w;
-    alloc_h = win.alloc_h;
-    var canvas = gfx.Canvas.init(win.fb, alloc_w, alloc_h);
-    _ = libc.getWindowAlloc(); // opt this window into F10 grow-on-maximize (re-fetched in .resize)
-    fa.ensureLoaded();
-    var needs_redraw: bool = true;
-    var prev_left: bool = false;
-    var cur_mx: i32 = 0;
-    var cur_my: i32 = 0;
-    var cur_btns: u32 = 0;
+    u.beginGroup("Mouse Speed");
+    if (u.choice(&.{ "Slow", "Normal", "Fast" }, sel_mouse_speed)) |i| sel_mouse_speed = @intCast(i);
+    u.endGroup();
 
-    while (true) {
-        while (libc.pollEvent()) |ev| {
-            switch (ev.kindOf()) {
-                .close_request => {
-                    libc.destroyWindow();
-                    libc.exit();
-                },
-                .key_char => {
-                    const ch: u8 = @truncate(ev.a);
-                    if (wp_picker_active) {
-                        switch (wp_picker.handleKey(ch)) {
-                            .cancel => {
-                                wp_picker_active = false;
-                                freeWallpaperThumbs();
-                                needs_redraw = true;
-                            },
-                            .ok => {
-                                commitPickerSelection();
-                                wp_picker_active = false;
-                                freeWallpaperThumbs();
-                                needs_redraw = true;
-                            },
-                            .folder_changed => {
-                                scanWallpaperThumbs(wp_picker.currentDir());
-                                wp_picker.setThumbnails(wp_thumbs[0..wp_thumb_count]);
-                                wp_picker.acknowledgeFolderChange();
-                                needs_redraw = true;
-                            },
-                            .none => {},
-                        }
-                    } else if (ch == 0x1B) {
-                        libc.destroyWindow();
-                        libc.exit();
-                    }
-                },
-                .mouse_move => {
-                    cur_mx = @bitCast(ev.a);
-                    cur_my = @bitCast(ev.b);
-                    cur_btns = ev.c;
-                    needs_redraw = true;
-                },
-                .mouse_button => {
-                    cur_btns = ev.buttonsState();
-                    cur_mx = @bitCast(ev.b);
-                    cur_my = @bitCast(ev.c);
-                    needs_redraw = true;
-                },
-                .resize => {
-                    // F10 maximize may have GROWN our framebuffer past the
-                    // alloc we requested. Re-fetch and rebuild the canvas at
-                    // the new stride before clamping/laying out (FB ptr is
-                    // unchanged) so we render crisply instead of upscaled.
-                    const wa = libc.getWindowAlloc();
-                    if (wa.w != 0 and (wa.w != alloc_w or wa.h != alloc_h)) {
-                        alloc_w = wa.w;
-                        alloc_h = wa.h;
-                        canvas = gfx.Canvas.init(win.fb, alloc_w, alloc_h);
-                    }
-                    const new_w = @min(ev.a, alloc_w);
-                    const new_h = @min(ev.b, alloc_h);
-                    if (new_w != vis_w or new_h != vis_h) {
-                        computeLayout(new_w, new_h);
-                        needs_redraw = true;
-                    }
-                },
-                else => {},
-            }
-        }
+    u.beginGroup("Time Zone");
+    var zone_buf: [9]u8 = undefined;
+    if (u.stepper(zoneLabel(&zone_buf), "UTC+00:00")) |step| setZone(sel_utc_offset + step * 60);
+    u.sameLine();
+    if (u.choice(&.{ ":00", ":30", ":45" }, zoneMinuteIndex())) |i| setZoneMinutes(zone_minutes[i]);
+    u.endGroup();
 
-        const left_now = (cur_btns & 1) != 0;
+    u.alignNext(.right);
+    if (u.styledButton("Apply", .primary)) apply();
 
-        // Picker is modal — when active, it consumes the click and the
-        // base-settings widgets stop receiving updates.
-        if (wp_picker_active) {
-            switch (wp_picker.handleClick(cur_mx, cur_my, left_now, prev_left)) {
-                .cancel => {
-                    wp_picker_active = false;
-                    freeWallpaperThumbs();
-                    needs_redraw = true;
-                },
-                .ok => {
-                    commitPickerSelection();
-                    wp_picker_active = false;
-                    freeWallpaperThumbs();
-                    needs_redraw = true;
-                },
-                .folder_changed => {
-                    scanWallpaperThumbs(wp_picker.currentDir());
-                    wp_picker.setThumbnails(wp_thumbs[0..wp_thumb_count]);
-                    wp_picker.acknowledgeFolderChange();
-                    needs_redraw = true;
-                },
-                .none => {
-                    if (left_now != prev_left) needs_redraw = true;
-                },
-            }
-            prev_left = left_now;
-            if (!needs_redraw) {
-                libc.sleep(10);
-                continue;
-            }
-        } else {
-            for (&res_btns, 0..) |*btn, i| {
-                if (btn.update(cur_mx, cur_my, left_now, prev_left)) {
-                    sel_resolution = @intCast(i);
-                    needs_redraw = true;
-                }
-            }
-            for (&bg_btns, 0..) |*btn, i| {
-                if (btn.update(cur_mx, cur_my, left_now, prev_left)) {
-                    sel_background = @intCast(i);
-                    needs_redraw = true;
-                }
-            }
-            for (&theme_btns, 0..) |*btn, i| {
-                if (btn.update(cur_mx, cur_my, left_now, prev_left)) {
-                    sel_theme = @intCast(i);
-                    ui.setDarkMode(i == 1);
-                    needs_redraw = true;
-                }
-            }
-            for (&speed_btns, 0..) |*btn, i| {
-                if (btn.update(cur_mx, cur_my, left_now, prev_left)) {
-                    sel_mouse_speed = @intCast(i);
-                    needs_redraw = true;
-                }
-            }
-            for (&dock_btns, 0..) |*btn, i| {
-                if (btn.update(cur_mx, cur_my, left_now, prev_left)) {
-                    sel_dock_pos = @intCast(i);
-                    needs_redraw = true;
-                }
-            }
-            if (wp_choose_btn.update(cur_mx, cur_my, left_now, prev_left)) {
-                const start_dir: []const u8 = if (sel_wp_path_len > 0) blk: {
-                    var i: i32 = @as(i32, @intCast(sel_wp_path_len)) - 1;
-                    while (i > 0 and sel_wp_path_buf[@intCast(i)] != '/') : (i -= 1) {}
-                    if (i > 0) break :blk sel_wp_path_buf[0 .. @as(usize, @intCast(i)) + 1];
-                    break :blk WP_DIR;
-                } else WP_DIR;
-                wp_picker = ui.ImagePicker.init(vis_w, vis_h, start_dir);
-                scanWallpaperThumbs(wp_picker.currentDir());
-                wp_picker.setThumbnails(wp_thumbs[0..wp_thumb_count]);
-                wp_picker_active = true;
-                needs_redraw = true;
-            }
-            if (wp_clear_btn.update(cur_mx, cur_my, left_now, prev_left)) {
-                sel_wp_path_len = 0;
-                refreshWallpaperStatus();
-                saveConf();
-                // Clear talks to the kernel directly. Going via
-                // wallpaper.elf would only see an empty `wallpaper=` line
-                // in conf and exit cleanly without telling the kernel to
-                // drop its current wallpaper.
-                if (libc.setWallpaperClear()) {
-                    libc.notify("Wallpaper cleared");
-                } else {
-                    libc.notify("Wallpaper clear failed");
-                }
-                needs_redraw = true;
-            }
-        }
-        if (!wp_picker_active and apply_btn.update(cur_mx, cur_my, left_now, prev_left)) {
-            libc.setConfig(libc.Config.resolution, sel_resolution);
-            libc.setConfig(libc.Config.background, sel_background);
-            libc.setConfig(libc.Config.theme, sel_theme);
-            libc.setConfig(libc.Config.mouse_speed, sel_mouse_speed);
-            libc.setConfig(libc.Config.dock_pos, sel_dock_pos);
-            libc.applyConfig();
-            saveConf();
-            libc.notify("Settings saved");
-            needs_redraw = true;
-        }
-        prev_left = left_now;
-
-        if (!needs_redraw) {
-            libc.sleep(10);
-            continue;
-        }
-        needs_redraw = false;
-
-        canvas.clear(BG);
-        fa.drawTextOpaque(&canvas, 12, 8, "Settings", SECTION_COLOR, BG, &fa.default_24);
-
-        // Each section: label outside the card, then card surface, then
-        // buttons inside. Buttons pass `palette.card_bg` as their corner
-        // clip color so the AA corners blend against the card and not the
-        // window bg behind it.
-        const cbg = ui.palette.card_bg;
-
-        fa.drawTextOpaque(&canvas, 12, label_ys[0], "Resolution", LABEL_COLOR, BG, &fa.default_16);
-        cards[0].drawBg(&canvas, BG);
-        for (res_btns, 0..) |btn, i|
-            btn.drawStyled(&canvas, if (sel_resolution == i) .primary else .default, cbg);
-
-        fa.drawTextOpaque(&canvas, 12, label_ys[1], "Background", LABEL_COLOR, BG, &fa.default_16);
-        cards[1].drawBg(&canvas, BG);
-        for (bg_btns, 0..) |btn, i|
-            btn.drawStyled(&canvas, if (sel_background == i) .primary else .default, cbg);
-
-        fa.drawTextOpaque(&canvas, 12, label_ys[2], "Theme", LABEL_COLOR, BG, &fa.default_16);
-        cards[2].drawBg(&canvas, BG);
-        for (theme_btns, 0..) |btn, i|
-            btn.drawStyled(&canvas, if (sel_theme == i) .primary else .default, cbg);
-
-        fa.drawTextOpaque(&canvas, 12, label_ys[3], "Mouse Speed", LABEL_COLOR, BG, &fa.default_16);
-        cards[3].drawBg(&canvas, BG);
-        for (speed_btns, 0..) |btn, i|
-            btn.drawStyled(&canvas, if (sel_mouse_speed == i) .primary else .default, cbg);
-
-        fa.drawTextOpaque(&canvas, 12, label_ys[4], "Dock Position", LABEL_COLOR, BG, &fa.default_16);
-        cards[4].drawBg(&canvas, BG);
-        for (dock_btns, 0..) |btn, i|
-            btn.drawStyled(&canvas, if (sel_dock_pos == i) .primary else .default, cbg);
-
-        fa.drawTextOpaque(&canvas, 12, label_ys[5], "Wallpaper", LABEL_COLOR, BG, &fa.default_16);
-        cards[5].drawBg(&canvas, BG);
-        wp_choose_btn.drawStyled(&canvas, .default, cbg);
-        wp_clear_btn.drawStyled(&canvas, .default, cbg);
-        drawWallpaperStatus(&canvas, cards[5].innerX(), wp_status_y);
-
-        apply_btn.drawStyled(&canvas, .primary, BG);
-
-        // Picker overlay paints LAST so it sits above every base widget.
-        if (wp_picker_active) wp_picker.draw(&canvas, BG);
-
-        libc.present();
-        libc.sleep(10);
+    if (wp_picker_active and u.painting) {
+        ui.drawScrim(u.canvas, u.w, u.h);
+        wp_picker.draw(u.canvas, ui.palette.window_bg);
     }
 }

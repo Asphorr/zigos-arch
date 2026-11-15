@@ -2,11 +2,19 @@ const libc = @import("libc");
 const gfx = @import("graphics");
 const ui = @import("ui");
 const fa = @import("font_atlas");
+const app = @import("app");
 const C = gfx.Canvas;
 
-const BG: u32 = 0x1A1A2E;
-const BAR_EMPTY: u32 = 0x2A2A40;
-const BAR_BORDER: u32 = 0x404060;
+const BG: u32 = 0x1E1E20;
+const BAR_EMPTY: u32 = 0x2A2A2D;
+const BAR_BORDER: u32 = 0x45454A;
+const RULE: u32 = 0x38383C;
+const TITLE: u32 = 0xF2F2F4;
+const LABEL: u32 = 0xA8A8AE;
+const VALUE: u32 = 0xF2F2F4;
+const RUNNING: u32 = 0x6FD58A;
+const READY: u32 = 0x6CB6FF;
+const SLEEPING: u32 = 0xE8B25A;
 
 // Band colors — same palette as fastfetch's terminal memory bar so the
 // look is consistent across tools.
@@ -51,172 +59,171 @@ fn drawBar(canvas: *C, x: u32, y: u32, w: u32, h: u32, pct: u32) void {
 }
 
 const MAX_CPUS: u32 = 4;
-const POLL_FRAMES: u32 = 50; // ~500ms between refreshes
+const SAMPLE_MS: u32 = 500;
+
+// Layout: y of each row, x of the margins and of the value column.
+const PAD: u32 = 12;
+const VALUE_X: u32 = 96;
+const Y_TITLE: u32 = 8;
+const Y_SEP: u32 = 40;
+const Y_UPTIME: u32 = 50;
+const Y_PROCS: u32 = 72;
+const Y_MEM: u32 = 98;
+const Y_MEM_BAR: u32 = 120;
+const Y_CPU_START: u32 = 146; // first CPU row; each subsequent +CPU_PITCH
+const CPU_PITCH: u32 = 36;
+const BOTTOM: u32 = Y_CPU_START + CPU_PITCH * MAX_CPUS + 8;
+
+/// What the window shows, as of the last sample().
+const Sample = struct {
+    uptime_s: u32 = 0,
+    procs: u32 = 0,
+    running: u32 = 0,
+    ready: u32 = 0,
+    sleeping: u32 = 0,
+    mem_used_mb: u32 = 0,
+    mem_total_mb: u32 = 0,
+    mem_pct: u32 = 0,
+    cpus: u32 = 0,
+    cpu_pct: [MAX_CPUS]u32 = .{0} ** MAX_CPUS,
+};
+var shown: Sample = .{};
 var prev_stats: [MAX_CPUS]libc.CpuStat = [_]libc.CpuStat{.{ .total_cyc = 0, .idle_cyc = 0 }} ** MAX_CPUS;
 var prev_valid: bool = false;
 
-// Layout constants — y-coords of each row in the dynamic content area.
-const Y_TITLE: u32 = 8;
-const Y_SEP: u32 = 38;
-const Y_UPTIME: u32 = 46;
-const Y_PROCS: u32 = 68;
-const Y_MEM_LABEL: u32 = 92;
-const Y_MEM_BAR: u32 = 110;
-const Y_CPU_START: u32 = 134; // first CPU bar; each subsequent +24
-const CPU_PITCH: u32 = 24;
-const FOOTER_BASE: u32 = 134 + CPU_PITCH * MAX_CPUS + 8;
-
-var alloc_w: u32 = 0;
-var alloc_h: u32 = 0;
-var vis_w: u32 = 0;
-var vis_h: u32 = 0;
-
 export fn _start() linksection(".text.entry") callconv(.c) void {
     const scr = libc.getScreenSize();
-    var init_w = scr.w / 4;
-    if (init_w < 320) init_w = 320;
-    if (init_w > 540) init_w = 540;
-    // Tall enough for title + memory bar + up to MAX_CPUS bars + footer rows.
-    var init_h: u32 = FOOTER_BASE + 60;
-    if (init_h > scr.h) init_h = scr.h;
-    alloc_w = @min(init_w * 2, scr.w);
-    alloc_h = @min(init_h * 2, scr.h);
-    while (alloc_w * alloc_h > 524288) {
-        if (alloc_w > alloc_h) alloc_w -= 16 else alloc_h -= 16;
+    const w = @min(@max(scr.w / 4, 320), 540);
+    app.run(@This(), .{ .width = w, .height = BOTTOM, .escape_closes = true, .tick_ms = SAMPLE_MS });
+}
+
+pub fn init(_: *app.Window) void {
+    sample();
+}
+
+pub fn tick(win: *app.Window) void {
+    sample();
+    win.invalidate();
+}
+
+fn sample() void {
+    shown.uptime_s = libc.uptime() / 100;
+
+    var procs: [32]libc.ProcInfo = undefined;
+    const n = libc.processList(&procs);
+    shown.procs = n;
+    shown.running = 0;
+    shown.ready = 0;
+    shown.sleeping = 0;
+    for (procs[0..n]) |p| {
+        switch (p.state) {
+            libc.PROC_STATE_RUNNING => shown.running += 1,
+            libc.PROC_STATE_READY => shown.ready += 1,
+            libc.PROC_STATE_SLEEPING => shown.sleeping += 1,
+            else => {},
+        }
     }
-    vis_w = init_w;
-    vis_h = init_h;
 
-    const win = libc.createWindowEx(alloc_w, alloc_h, init_w, init_h) orelse {
-        libc.exit();
-    };
-    alloc_w = win.alloc_w;
-    alloc_h = win.alloc_h;
-    var canvas = gfx.Canvas.init(win.fb, alloc_w, alloc_h);
-    fa.ensureLoaded();
+    const mem = libc.meminfo();
+    const used_frames = mem.total_frames -| mem.free_frames;
+    shown.mem_used_mb = used_frames / 256;
+    shown.mem_total_mb = mem.total_frames / 256;
+    shown.mem_pct = if (mem.total_frames > 0) (used_frames * 100) / mem.total_frames else 0;
 
-    // Static chrome — labels that never change.
-    canvas.clear(BG);
-    fa.drawTextOpaque(&canvas, 10, Y_TITLE, "System Monitor", 0x4488CC, BG, &fa.default_24);
-    canvas.drawHLine(10, Y_SEP, vis_w -| 20, 0x333355);
-    fa.drawTextOpaque(&canvas, 10, Y_UPTIME, "Uptime:", 0xCCCCCC, BG, &fa.default_16);
-    fa.drawTextOpaque(&canvas, 10, Y_PROCS, "Procs:", 0xCCCCCC, BG, &fa.default_16);
-    fa.drawTextOpaque(&canvas, 10, Y_MEM_LABEL, "Memory:", 0xCCCCCC, BG, &fa.default_16);
+    // Utilization over the interval since the previous sample:
+    // (total_d - idle_d) / total_d. The first sample has nothing to
+    // subtract from and shows 0%.
+    var stats: [MAX_CPUS]libc.CpuStat = undefined;
+    const n_cpus = libc.cpuStats(stats[0..]);
+    shown.cpus = if (n_cpus > MAX_CPUS) 0 else n_cpus;
+    for (0..shown.cpus) |c| {
+        var pct: u32 = 0;
+        if (prev_valid) {
+            const d_total = stats[c].total_cyc -% prev_stats[c].total_cyc;
+            const d_idle = stats[c].idle_cyc -% prev_stats[c].idle_cyc;
+            if (d_total > 0) pct = @intCast(@min((d_total -| d_idle) * 100 / d_total, 100));
+        }
+        shown.cpu_pct[c] = pct;
+        prev_stats[c] = stats[c];
+    }
+    if (shown.cpus > 0) prev_valid = true;
+}
 
-    var frame: u32 = 0;
+/// Draw `n` in decimal at the row's cursor.
+fn num(row: *ui.HStack, n: u32, color: u32) void {
+    var buf: [10]u8 = undefined;
+    var i: usize = buf.len;
+    var v = n;
     while (true) {
-        if (libc.readChar() == 0x1B) break;
-
-        const ws = libc.getWindowSize();
-        if (ws.w > 0 and ws.h > 0) {
-            const new_w = @min(ws.w, alloc_w);
-            const new_h = @min(ws.h, alloc_h);
-            if (new_w != vis_w or new_h != vis_h) {
-                vis_w = new_w;
-                vis_h = new_h;
-                frame = 0;
-            }
-        }
-
-        frame += 1;
-        if (frame % POLL_FRAMES != 1) {
-            libc.sleep(10);
-            continue;
-        }
-
-        // ─── Uptime row ────────────────────────────────────────────
-        const ticks = libc.uptime();
-        const secs = ticks / 100;
-        const mins = secs / 60;
-        const hrs = mins / 60;
-        canvas.fillRect(110, Y_UPTIME, vis_w -| 120, fa.default_16.line_height, BG);
-        var cx: u32 = fa.drawNumOpaque(&canvas, 110, Y_UPTIME, hrs, 0x88FF88, BG, &fa.default_16);
-        fa.drawCharOpaque(&canvas, cx, Y_UPTIME, 'h', 0x88FF88, BG, &fa.default_16);
-        cx = fa.drawNumOpaque(&canvas, cx + fa.default_16.size_px + 4, Y_UPTIME, mins % 60, 0x88FF88, BG, &fa.default_16);
-        fa.drawCharOpaque(&canvas, cx, Y_UPTIME, 'm', 0x88FF88, BG, &fa.default_16);
-        cx = fa.drawNumOpaque(&canvas, cx + fa.default_16.size_px + 4, Y_UPTIME, secs % 60, 0x88FF88, BG, &fa.default_16);
-        fa.drawCharOpaque(&canvas, cx, Y_UPTIME, 's', 0x88FF88, BG, &fa.default_16);
-
-        // ─── Process count row ─────────────────────────────────────
-        var pl_buf: [32]libc.ProcInfo = undefined;
-        const pl_n = libc.processList(&pl_buf);
-        var n_run: u32 = 0;
-        var n_rdy: u32 = 0;
-        var n_slp: u32 = 0;
-        var k: u32 = 0;
-        while (k < pl_n) : (k += 1) {
-            switch (pl_buf[k].state) {
-                libc.PROC_STATE_RUNNING => n_run += 1,
-                libc.PROC_STATE_READY => n_rdy += 1,
-                libc.PROC_STATE_SLEEPING => n_slp += 1,
-                else => {},
-            }
-        }
-        canvas.fillRect(110, Y_PROCS, vis_w -| 120, fa.default_16.line_height, BG);
-        cx = fa.drawNumOpaque(&canvas, 110, Y_PROCS, pl_n, 0x88FF88, BG, &fa.default_16);
-        fa.drawTextOpaque(&canvas, cx, Y_PROCS, " (", 0xCCCCCC, BG, &fa.default_16);
-        cx += fa.default_16.size_px * 2;
-        cx = fa.drawNumOpaque(&canvas, cx, Y_PROCS, n_run, 0x88FF88, BG, &fa.default_16);
-        fa.drawTextOpaque(&canvas, cx, Y_PROCS, "R ", 0x88FF88, BG, &fa.default_16);
-        cx += fa.default_16.size_px * 2;
-        cx = fa.drawNumOpaque(&canvas, cx, Y_PROCS, n_rdy, 0x88CCFF, BG, &fa.default_16);
-        fa.drawTextOpaque(&canvas, cx, Y_PROCS, "Q ", 0x88CCFF, BG, &fa.default_16);
-        cx += fa.default_16.size_px * 2;
-        cx = fa.drawNumOpaque(&canvas, cx, Y_PROCS, n_slp, 0xFFCC88, BG, &fa.default_16);
-        fa.drawTextOpaque(&canvas, cx, Y_PROCS, "S)", 0xFFCC88, BG, &fa.default_16);
-
-        // ─── Memory bar ────────────────────────────────────────────
-        const mem = libc.meminfo();
-        const used_frames = if (mem.total_frames > mem.free_frames) mem.total_frames - mem.free_frames else 0;
-        const used_mb = used_frames / 256;
-        const total_mb = mem.total_frames / 256;
-        const mem_pct: u32 = if (mem.total_frames > 0) (used_frames * 100) / mem.total_frames else 0;
-        canvas.fillRect(80, Y_MEM_LABEL, vis_w -| 90, fa.default_16.line_height, BG);
-        cx = fa.drawNumOpaque(&canvas, 80, Y_MEM_LABEL, used_mb, 0xCCCCCC, BG, &fa.default_16);
-        fa.drawCharOpaque(&canvas, cx, Y_MEM_LABEL, '/', 0xCCCCCC, BG, &fa.default_16);
-        cx = fa.drawNumOpaque(&canvas, cx + fa.default_16.size_px, Y_MEM_LABEL, total_mb, 0xCCCCCC, BG, &fa.default_16);
-        fa.drawTextOpaque(&canvas, cx, Y_MEM_LABEL, " MiB  ", 0xCCCCCC, BG, &fa.default_16);
-        cx += fa.default_16.size_px * 6;
-        cx = fa.drawNumOpaque(&canvas, cx, Y_MEM_LABEL, mem_pct, 0xFFFFFF, BG, &fa.default_16);
-        fa.drawCharOpaque(&canvas, cx, Y_MEM_LABEL, '%', 0xFFFFFF, BG, &fa.default_16);
-        drawBar(&canvas, 10, Y_MEM_BAR, vis_w -| 20, 16, mem_pct);
-
-        // ─── CPU bars (per CPU) ────────────────────────────────────
-        var stat_buf: [MAX_CPUS]libc.CpuStat = undefined;
-        const n_cpus = libc.cpuStats(stat_buf[0..]);
-        const cpu_count: u32 = if (n_cpus > MAX_CPUS) 0 else n_cpus;
-        var c: u32 = 0;
-        while (c < cpu_count) : (c += 1) {
-            const y: u32 = Y_CPU_START + c * CPU_PITCH;
-            // Delta-based utilization: (total_d - idle_d) / total_d.
-            // First sample has prev=0 so we skip and show 0% to avoid a
-            // bogus spike on the first frame.
-            var pct: u32 = 0;
-            if (prev_valid) {
-                const d_total = stat_buf[c].total_cyc -% prev_stats[c].total_cyc;
-                const d_idle = stat_buf[c].idle_cyc -% prev_stats[c].idle_cyc;
-                if (d_total > 0) {
-                    const busy = if (d_total > d_idle) d_total - d_idle else 0;
-                    pct = @intCast((busy * 100) / d_total);
-                    if (pct > 100) pct = 100;
-                }
-            }
-            canvas.fillRect(10, y, vis_w -| 20, fa.default_16.line_height + 18, BG);
-            // Label "CPU N" + %.
-            fa.drawTextOpaque(&canvas, 10, y, "CPU", 0xCCCCCC, BG, &fa.default_16);
-            cx = 10 + fa.default_16.size_px * 4;
-            cx = fa.drawNumOpaque(&canvas, cx, y, c, 0xCCCCCC, BG, &fa.default_16);
-            fa.drawCharOpaque(&canvas, cx + 4, y, ':', 0xCCCCCC, BG, &fa.default_16);
-            cx = fa.drawNumOpaque(&canvas, cx + fa.default_16.size_px + 6, y, pct, 0xFFFFFF, BG, &fa.default_16);
-            fa.drawCharOpaque(&canvas, cx, y, '%', 0xFFFFFF, BG, &fa.default_16);
-            drawBar(&canvas, 10, y + 18, vis_w -| 20, 12, pct);
-            prev_stats[c] = stat_buf[c];
-        }
-        if (cpu_count > 0) prev_valid = true;
-
-        libc.sleep(10);
+        i -= 1;
+        buf[i] = @intCast('0' + v % 10);
+        v /= 10;
+        if (v == 0) break;
     }
+    row.label(buf[i..], color, fa.getDefault16());
+}
 
-    libc.destroyWindow();
-    libc.exit();
+/// "NN%" with its right edge at `right`.
+fn percentRight(canvas: *C, right: u32, y: u32, pct: u32) void {
+    const a16 = fa.getDefault16();
+    const digits: u32 = if (pct >= 100) 3 else if (pct >= 10) 2 else 1;
+    const width = a16.measure("0") * digits + a16.measure("%");
+    var row = ui.HStack.init(canvas, right -| width, y, a16.line_height);
+    num(&row, pct, VALUE);
+    row.label("%", VALUE, a16);
+}
+
+pub fn draw(win: *app.Window) void {
+    const canvas = &win.canvas;
+    const a16 = fa.getDefault16();
+    const right = win.w -| PAD;
+    const bar_w = win.w -| PAD * 2;
+    const s = shown;
+
+    canvas.clear(BG);
+    fa.drawText(canvas, PAD, Y_TITLE, "System Monitor", TITLE, fa.getDefault24());
+    canvas.drawHLine(PAD, Y_SEP, bar_w, RULE);
+
+    var row = ui.HStack.init(canvas, PAD, Y_UPTIME, a16.line_height);
+    row.label("Uptime", LABEL, a16);
+    row.skipTo(VALUE_X);
+    num(&row, s.uptime_s / 3600, VALUE);
+    row.label("h ", VALUE, a16);
+    num(&row, s.uptime_s / 60 % 60, VALUE);
+    row.label("m ", VALUE, a16);
+    num(&row, s.uptime_s % 60, VALUE);
+    row.label("s", VALUE, a16);
+
+    row = ui.HStack.init(canvas, PAD, Y_PROCS, a16.line_height);
+    row.label("Procs", LABEL, a16);
+    row.skipTo(VALUE_X);
+    num(&row, s.procs, VALUE);
+    row.gap(14);
+    num(&row, s.running, RUNNING);
+    row.label(" running", RUNNING, a16);
+    row.gap(10);
+    num(&row, s.ready, READY);
+    row.label(" ready", READY, a16);
+    row.gap(10);
+    num(&row, s.sleeping, SLEEPING);
+    row.label(" asleep", SLEEPING, a16);
+
+    row = ui.HStack.init(canvas, PAD, Y_MEM, a16.line_height);
+    row.label("Memory", LABEL, a16);
+    row.skipTo(VALUE_X);
+    num(&row, s.mem_used_mb, VALUE);
+    row.label(" / ", LABEL, a16);
+    num(&row, s.mem_total_mb, VALUE);
+    row.label(" MiB", LABEL, a16);
+    percentRight(canvas, right, Y_MEM, s.mem_pct);
+    drawBar(canvas, PAD, Y_MEM_BAR, bar_w, 14, s.mem_pct);
+
+    for (0..s.cpus) |c| {
+        const y: u32 = Y_CPU_START + @as(u32, @intCast(c)) * CPU_PITCH;
+        row = ui.HStack.init(canvas, PAD, y, a16.line_height);
+        row.label("CPU ", LABEL, a16);
+        num(&row, @intCast(c), LABEL);
+        percentRight(canvas, right, y, s.cpu_pct[c]);
+        drawBar(canvas, PAD, y + 20, bar_w, 12, s.cpu_pct[c]);
+    }
 }

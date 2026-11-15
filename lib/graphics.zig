@@ -704,6 +704,42 @@ pub const Canvas = struct {
         }
     }
 
+    /// Fill a rounded rectangle, blending the curve's edge pixels over what
+    /// is already there. Unlike fillRect + roundCornersRadius it needs no
+    /// background colour, so it can sit on any content.
+    pub fn fillRoundedRect(self: *Canvas, bx: u32, by: u32, bw: u32, bh: u32, radius: u32, color: u32) void {
+        if (bw == 0 or bh == 0) return;
+        const r: u32 = @min(radius, @min(bw / 2, bh / 2));
+        // The rows between the corners, then the strips between each pair.
+        self.fillRect(bx, by + r, bw, bh - 2 * r, color);
+        if (r == 0) return;
+        self.fillRect(bx + r, by, bw - 2 * r, r, color);
+        self.fillRect(bx + r, by + bh - r, bw - 2 * r, r, color);
+        // Same band as roundCornersRadius, so the two curves agree.
+        const r_i: i32 = @intCast(r);
+        const r_sq: i32 = r_i * r_i;
+        const half_band: i32 = @divTrunc(3 * r_i, 2);
+        const inner: i32 = r_sq - half_band;
+        const outer: i32 = r_sq + half_band;
+        const rgb: u32 = color & 0x00FFFFFF;
+        var dy: u32 = 0;
+        while (dy < r) : (dy += 1) {
+            const py_i: i32 = r_i - @as(i32, @intCast(dy));
+            var dx: u32 = 0;
+            while (dx < r) : (dx += 1) {
+                const px_i: i32 = r_i - @as(i32, @intCast(dx));
+                const d_sq: i32 = px_i * px_i + py_i * py_i;
+                if (d_sq >= outer) continue;
+                const a: u32 = if (d_sq <= inner) 255 else @intCast(@divTrunc((outer - d_sq) * 255, outer - inner));
+                const src: u32 = (a << 24) | rgb;
+                blendPxAt(self, bx + dx, by + dy, src);
+                blendPxAt(self, bx + bw - 1 - dx, by + dy, src);
+                blendPxAt(self, bx + dx, by + bh - 1 - dy, src);
+                blendPxAt(self, bx + bw - 1 - dx, by + bh - 1 - dy, src);
+            }
+        }
+    }
+
     inline fn setPx(self: *Canvas, x: u32, y: u32, color: u32) void {
         if (x < self.width and y < self.height) self.fb[y * self.width + x] = color;
     }

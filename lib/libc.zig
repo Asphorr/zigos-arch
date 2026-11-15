@@ -243,6 +243,18 @@ pub fn pollEvent() ?Event {
     return ev;
 }
 
+pub const WAIT_FOREVER: u32 = 0xFFFFFFFF;
+
+/// pollEvent that sleeps in the kernel until there is an event to read or
+/// `timeout_ms` passes (WAIT_FOREVER: no timeout). Null on timeout, and
+/// possibly earlier (a signal arrived), so callers loop.
+pub fn waitEvent(timeout_ms: u32) ?Event {
+    var ev: Event = .{ .kind = 0 };
+    const kind = syscall(123, @truncate(@intFromPtr(&ev)), timeout_ms);
+    if (kind == 0 or kind > @intFromEnum(EventKind.close_request)) return null;
+    return ev;
+}
+
 comptime {
     std.debug.assert(@sizeOf(Event) == 16);
 }
@@ -733,6 +745,8 @@ pub const Config = struct {
     pub const theme: u32 = 2;
     pub const mouse_speed: u32 = 3;
     pub const dock_pos: u32 = 4;
+    /// Signed minutes east of UTC, passed as an i32 bit pattern.
+    pub const utc_offset: u32 = 5;
 };
 
 pub fn setConfig(key: u32, value: u32) void {
@@ -770,8 +784,8 @@ pub fn listdir(buf: []FileEntry) u32 {
     const ptr: u32 = @truncate(@intFromPtr(buf.ptr));
     const size = @as(u32, @intCast(buf.len)) * @sizeOf(FileEntry);
     const result = syscall(21, ptr, size);
-    if (result == 0xFFFFFFFF) return 0;
-    return result;
+    if (result >= ERR_SENTINEL_BASE) return 0;
+    return @min(result, @as(u32, @intCast(buf.len)));
 }
 
 /// Path-aware variant of `listdir`. `path` must be NUL-terminatable (ends up
@@ -784,8 +798,9 @@ pub fn readdir(path: []const u8, buf: []FileEntry) u32 {
     pbuf[path.len] = 0;
     const bsize = @as(u32, @intCast(buf.len)) * @sizeOf(FileEntry);
     const result = syscall3(42, @truncate(@intFromPtr(&pbuf)), @truncate(@intFromPtr(buf.ptr)), bsize);
-    if (result == 0xFFFFFFFF) return 0;
-    return result;
+    // Any errno, not only EINVAL: callers index `buf` up to the count.
+    if (result >= ERR_SENTINEL_BASE) return 0;
+    return @min(result, @as(u32, @intCast(buf.len)));
 }
 
 pub fn exec(name: []const u8) u32 {
@@ -1440,13 +1455,19 @@ pub fn execAs(name: []const u8, remap: []const FdRemap) u32 {
 
 // --- Wall-clock time + microsecond sleep (Task #74) ---
 
-/// Result of gettimeofday: Unix epoch seconds + microseconds within the
-/// current second [0, 999999]. Same layout the kernel writes (16-byte buffer
-/// with u64 sec + u32 usec + u32 padding).
+/// Result of gettimeofday: Unix epoch seconds (UTC) + microseconds within
+/// the current second [0, 999999], and the minutes local time adds to UTC.
+/// Same 16-byte layout the kernel writes.
 pub const TimeOfDay = extern struct {
     sec: u64,
     usec: u32,
-    _pad: u32 = 0,
+    utc_offset_min: i32 = 0,
+
+    /// Seconds since the epoch on the local clock.
+    pub fn localSec(self: TimeOfDay) u64 {
+        const local = @as(i64, @intCast(self.sec)) + @as(i64, self.utc_offset_min) * 60;
+        return if (local < 0) 0 else @intCast(local);
+    }
 };
 
 /// Get current wall-clock time as { sec, usec } since the Unix epoch.

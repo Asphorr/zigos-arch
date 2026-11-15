@@ -333,6 +333,17 @@ pub fn build(b: *std.Build) void {
             .{ .name = "libc", .module = libc_mod },
         },
     });
+    const app_mod = b.createModule(.{
+        .root_source_file = b.path("lib/app.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "graphics", .module = graphics_mod },
+            .{ .name = "libc", .module = libc_mod },
+            .{ .name = "font_atlas", .module = font_atlas_mod },
+            .{ .name = "ui", .module = ui_mod },
+        },
+    });
     const virgl_mod = b.createModule(.{
         .root_source_file = b.path("lib/virgl.zig"),
         .target = target,
@@ -438,6 +449,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "graphics", .module = graphics_mod },
         .{ .name = "font", .module = font_mod },
         .{ .name = "ui", .module = ui_mod },
+        .{ .name = "app", .module = app_mod },
         .{ .name = "font_atlas", .module = font_atlas_mod },
         .{ .name = "http", .module = http_mod },
         .{ .name = "json", .module = json_mod },
@@ -974,6 +986,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "graphics", .module = graphics_mod },
                 .{ .name = "font", .module = font_mod },
                 .{ .name = "ui", .module = ui_mod },
+                .{ .name = "app", .module = app_mod },
                 .{ .name = "font_atlas", .module = font_atlas_mod },
                 .{ .name = "image", .module = image_mod },
             },
@@ -1301,7 +1314,7 @@ pub fn build(b: *std.Build) void {
         \\# dock_pos      0=bottom, 1=top
         \\resolution=1
         \\background=0
-        \\theme=0
+        \\theme=1
         \\mouse_speed=1
         \\dock_pos=0
         \\EOF

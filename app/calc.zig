@@ -1,23 +1,30 @@
 const libc = @import("libc");
 const gfx = @import("graphics");
 const ui = @import("ui");
+const fa = @import("font_atlas");
+const app = @import("app");
 
-const BG: u32 = 0x1A1A2E;
+const BG: u32 = 0x1E1E20;
+const DISPLAY_BG: u32 = 0x2A2A2D;
+const KEY_DIGIT: u32 = 0x3C3C40;
+const KEY_CLEAR: u32 = 0x5E5E63;
+const KEY_OP: u32 = 0xFF9F0A;
+const KEY_EQUALS: u32 = 0x0A84FF;
 
 const labels = [20]u8{
     'C', '/', '*', '-',
     '7', '8', '9', '+',
     '4', '5', '6', '=',
     '1', '2', '3', ' ',
-    '0', '.', ' ', ' ',
+    '0', '<', ' ', ' ',
 };
 
 const btn_colors = [20]u32{
-    0x666666, 0xFF8800, 0xFF8800, 0xFF8800,
-    0x505050, 0x505050, 0x505050, 0xFF8800,
-    0x505050, 0x505050, 0x505050, 0x4488CC,
-    0x505050, 0x505050, 0x505050, BG,
-    0x505050, 0x505050, BG,       BG,
+    KEY_CLEAR, KEY_OP,    KEY_OP,    KEY_OP,
+    KEY_DIGIT, KEY_DIGIT, KEY_DIGIT, KEY_OP,
+    KEY_DIGIT, KEY_DIGIT, KEY_DIGIT, KEY_EQUALS,
+    KEY_DIGIT, KEY_DIGIT, KEY_DIGIT, BG,
+    KEY_DIGIT, KEY_DIGIT, BG,        BG,
 };
 
 var display_val: i32 = 0;
@@ -25,13 +32,9 @@ var pending_op: u8 = 0;
 var pending_val: i32 = 0;
 var fresh: bool = true;
 
-// Allocated (max) dimensions — never changes, this is the canvas stride
-var alloc_w: u32 = 0;
-var alloc_h: u32 = 0;
-// Current visible dimensions — tracks window content area
+// Layout for the current content size.
 var vis_w: u32 = 0;
 var vis_h: u32 = 0;
-// Layout vars
 var btn_w: u32 = 0;
 var btn_h: u32 = 0;
 var btn_gap: u32 = 0;
@@ -44,135 +47,93 @@ fn computeLayout(w: u32, h: u32) void {
     btn_gap = vis_w / 40;
     if (btn_gap < 2) btn_gap = 2;
     btn_w = (vis_w -| btn_gap * 5) / 4;
-    btn_h = btn_w * 3 / 4;
     grid_x = btn_gap;
     grid_y = vis_h / 5;
+    // Five rows fill the window below the display.
+    btn_h = (vis_h -| grid_y -| btn_gap * 5) / 5;
 }
 
 export fn _start() linksection(".text.entry") callconv(.c) void {
     const scr = libc.getScreenSize();
-    var init_w = scr.w / 5;
-    if (init_w < 200) init_w = 200;
-    if (init_w > 400) init_w = 400;
-    const init_h = init_w * 14 / 10;
+    // Typed: a bare @min against 400 would be u9 and overflow below.
+    const w: u32 = @min(@max(scr.w / 5, 200), 400);
+    app.run(@This(), .{ .width = w, .height = w * 14 / 10, .escape_closes = true });
+}
 
-    // Over-allocate FB for resize headroom (cap at 2MB / 4 = 524288 pixels)
-    alloc_w = @min(init_w * 2, scr.w);
-    alloc_h = @min(init_h * 2, scr.h);
-    while (alloc_w * alloc_h > 524288) {
-        if (alloc_w > alloc_h) alloc_w -= 16 else alloc_h -= 16;
+pub fn event(win: *app.Window, ev: app.Event) void {
+    switch (ev.kindOf()) {
+        .key_char => if (keyLabel(@truncate(ev.a))) |label| {
+            handleButton(label);
+            win.invalidate();
+        },
+        .mouse_button => if (app.leftPress(ev)) |p| {
+            // Hit-test against the layout of the size being shown.
+            computeLayout(win.w, win.h);
+            for (0..20) |bi| {
+                if (labels[bi] == ' ') continue;
+                if (calcButton(@intCast(bi)).contains(p.x, p.y)) {
+                    handleButton(labels[bi]);
+                    win.invalidate();
+                }
+            }
+        },
+        else => {},
     }
-    computeLayout(init_w, init_h);
+}
 
-    const win = libc.createWindowEx(alloc_w, alloc_h, init_w, init_h) orelse {
-        libc.exit();
+/// The key a typed character stands for.
+fn keyLabel(ch: u8) ?u8 {
+    return switch (ch) {
+        '0'...'9', '+', '-', '*', '/', '=' => ch,
+        '\n' => '=',
+        'c', 'C' => 'C',
+        0x08, 0x7F => '<',
+        else => null,
     };
-    alloc_w = win.alloc_w; // libc may have rounded up to 16-px stride
-    alloc_h = win.alloc_h;
-    var canvas = gfx.Canvas.init(win.fb, alloc_w, alloc_h);
-    _ = libc.getWindowAlloc(); // opt this window into F10 grow-on-maximize (re-fetched in .resize)
+}
 
-    var needs_redraw: bool = true;
-
-    // Initial draw
+pub fn draw(win: *app.Window) void {
+    const canvas = &win.canvas;
+    computeLayout(win.w, win.h);
     canvas.clear(BG);
-    canvas.fillRect(btn_gap, btn_gap, vis_w -| btn_gap * 2, grid_y -| btn_gap * 2, 0x2A2A3E);
-    canvas.drawNumRightAligned(vis_w -| btn_gap * 2, btn_gap + 6, display_val, 0xFFFFFF, 2);
+
+    // Display: a rounded panel, the value right-aligned in the 24 px face.
+    const disp_w = vis_w -| btn_gap * 2;
+    const disp_h = grid_y -| btn_gap * 2;
+    canvas.fillRect(btn_gap, btn_gap, disp_w, disp_h, DISPLAY_BG);
+    canvas.roundCornersRadius(btn_gap, btn_gap, disp_w, disp_h, 10, BG);
+
+    var buf: [12]u8 = undefined;
+    const text = formatValue(&buf, display_val);
+    const atlas = fa.getDefault24();
+    const pad: u32 = 12;
+    const text_w = atlas.measure(text);
+    const tx: u32 = btn_gap + disp_w -| pad -| text_w;
+    const ty: u32 = btn_gap + (disp_h -| atlas.line_height) / 2;
+    fa.drawText(canvas, @intCast(tx), @intCast(ty), text, 0xFFFFFF, atlas);
+
     for (0..20) |bi| {
         if (labels[bi] == ' ') continue;
         const btn = calcButton(@intCast(bi));
-        btn.draw(&canvas, btn_colors[bi], 0xFFFFFF);
+        btn.drawRounded(canvas, btn_colors[bi], 0xFFFFFF, BG);
     }
-    libc.present();
+}
 
-    // Event-driven main loop: drain the window event queue, handle each
-    // event, redraw if any handler asked for it, sleep when idle. No
-    // more polling readChar + getWindowSize + getMouse + diffing button
-    // state; the queue gives us key/mouse/resize/close in one ordered
-    // stream.
+/// Decimal text of `val` in `buf`.
+fn formatValue(buf: *[12]u8, val: i32) []const u8 {
+    var v: u32 = @abs(val);
+    var i: usize = buf.len;
     while (true) {
-        // Drain all currently-pending events.
-        while (libc.pollEvent()) |ev| {
-            switch (ev.kindOf()) {
-                .close_request => {
-                    libc.destroyWindow();
-                    libc.exit();
-                },
-                .key_char => {
-                    const ch: u8 = @truncate(ev.a);
-                    if (ch == 0x1B) {
-                        libc.destroyWindow();
-                        libc.exit();
-                    }
-                    if ((ch >= '0' and ch <= '9') or
-                        ch == '+' or ch == '-' or ch == '*' or ch == '/')
-                    {
-                        handleButton(ch);
-                        needs_redraw = true;
-                    } else if (ch == '\n' or ch == '=') {
-                        handleButton('=');
-                        needs_redraw = true;
-                    } else if (ch == 'c' or ch == 'C') {
-                        handleButton('C');
-                        needs_redraw = true;
-                    }
-                },
-                .mouse_button => {
-                    // Left-button press inside any labelled button → activate it.
-                    if (ev.buttonIndex() == 0 and ev.buttonPressed()) {
-                        const mx: i32 = @bitCast(ev.b);
-                        const my: i32 = @bitCast(ev.c);
-                        for (0..20) |bi| {
-                            if (labels[bi] == ' ') continue;
-                            const btn = calcButton(@intCast(bi));
-                            if (btn.contains(mx, my)) {
-                                handleButton(labels[bi]);
-                                needs_redraw = true;
-                            }
-                        }
-                    }
-                },
-                .resize => {
-                    // F10 maximize may have GROWN our framebuffer past the
-                    // alloc we requested. Re-fetch and rebuild the canvas at
-                    // the new stride before clamping/laying out (FB ptr is
-                    // unchanged) so we render crisply instead of upscaled.
-                    const wa = libc.getWindowAlloc();
-                    if (wa.w != 0 and (wa.w != alloc_w or wa.h != alloc_h)) {
-                        alloc_w = wa.w;
-                        alloc_h = wa.h;
-                        canvas = gfx.Canvas.init(win.fb, alloc_w, alloc_h);
-                    }
-                    const new_w = @min(ev.a, alloc_w);
-                    const new_h = @min(ev.b, alloc_h);
-                    if (new_w != vis_w or new_h != vis_h) {
-                        computeLayout(new_w, new_h);
-                        needs_redraw = true;
-                    }
-                },
-                else => {},
-            }
-        }
-
-        if (!needs_redraw) {
-            libc.sleep(10);
-            continue;
-        }
-        needs_redraw = false;
-
-        canvas.clear(BG);
-        canvas.fillRect(btn_gap, btn_gap, vis_w -| btn_gap * 2, grid_y -| btn_gap * 2, 0x2A2A3E);
-        canvas.drawNumRightAligned(vis_w -| btn_gap * 2, btn_gap + 6, display_val, 0xFFFFFF, 2);
-
-        for (0..20) |bi| {
-            if (labels[bi] == ' ') continue;
-            const btn = calcButton(@intCast(bi));
-            btn.draw(&canvas, btn_colors[bi], 0xFFFFFF);
-        }
-
-        libc.present();
-        libc.sleep(10);
+        i -= 1;
+        buf[i] = @intCast('0' + v % 10);
+        v /= 10;
+        if (v == 0) break;
     }
+    if (val < 0) {
+        i -= 1;
+        buf[i] = '-';
+    }
+    return buf[i..];
 }
 
 fn calcButton(bi: u32) ui.Button {
@@ -200,6 +161,9 @@ fn handleButton(label: u8) void {
         pending_op = 0;
         pending_val = 0;
         fresh = true;
+    } else if (label == '<') {
+        // Drop the last digit typed; a result is not edited.
+        if (!fresh) display_val = @divTrunc(display_val, 10);
     } else if (label == '=') {
         doOp();
         pending_op = 0;
@@ -213,12 +177,17 @@ fn handleButton(label: u8) void {
 }
 
 fn doOp() void {
+    // Saturating: a result past i32 pins at the limit instead of trapping.
     switch (pending_op) {
-        '+' => display_val = pending_val + display_val,
-        '-' => display_val = pending_val - display_val,
-        '*' => display_val = pending_val * display_val,
+        '+' => display_val = pending_val +| display_val,
+        '-' => display_val = pending_val -| display_val,
+        '*' => display_val = pending_val *| display_val,
         '/' => {
-            if (display_val != 0) display_val = @divTrunc(pending_val, display_val);
+            if (display_val == -1) {
+                display_val = 0 -| pending_val;
+            } else if (display_val != 0) {
+                display_val = @divTrunc(pending_val, display_val);
+            }
         },
         else => {},
     }

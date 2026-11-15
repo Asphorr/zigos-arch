@@ -20,6 +20,7 @@ pub const Canvas = gfx.Canvas;
 pub const PANEL_RADIUS: u32 = 10;
 
 pub const Palette = struct {
+    window_bg: u32,
     card_bg: u32,
     card_border: u32,
     card_shadow: u32,
@@ -42,6 +43,7 @@ pub const Palette = struct {
 };
 
 pub const light_palette = Palette{
+    .window_bg = 0xF6F6F7,
     .card_bg = 0xECECEC,
     .card_border = 0xB0B0B0,
     .card_shadow = 0x00000040,
@@ -59,30 +61,33 @@ pub const light_palette = Palette{
     .btn_destructive_border = 0x8B1F16,
 };
 
+// Neutral grays a step apart: window body < card < control, so each
+// surface reads against the one under it without a heavy border. The
+// control gradients are shallow; the accent blue is the desktop's.
 pub const dark_palette = Palette{
-    .card_bg = 0x1F1F1F,
-    .card_border = 0x3A3A3A,
+    .window_bg = 0x1E1E20,
+    .card_bg = 0x2A2A2D,
+    .card_border = 0x3E3E42,
     .card_shadow = 0x00000080,
-    .text_strong = 0xF0F0F0,
-    .text_normal = 0xCCCCCC,
-    .text_muted = 0x808080,
-    .btn_default_top = 0x4A4A4A,
-    .btn_default_bot = 0x363636,
-    .btn_default_border = 0x202020,
-    // Primary blue stays vivid in dark mode but slightly desaturated.
-    .btn_primary_top = 0x3A8AE6,
-    .btn_primary_bot = 0x0852B8,
-    .btn_primary_border = 0x063F8C,
-    .btn_destructive_top = 0xCC4A40,
-    .btn_destructive_bot = 0x991F18,
-    .btn_destructive_border = 0x701008,
+    .text_strong = 0xF2F2F4,
+    .text_normal = 0xDCDCE0,
+    .text_muted = 0x8C8C92,
+    .btn_default_top = 0x57575C,
+    .btn_default_bot = 0x4B4B50,
+    .btn_default_border = 0x36363A,
+    .btn_primary_top = 0x2D8FFF,
+    .btn_primary_bot = 0x0A78F0,
+    .btn_primary_border = 0x0A64CC,
+    .btn_destructive_top = 0xE2554B,
+    .btn_destructive_bot = 0xC43A31,
+    .btn_destructive_border = 0x9E2A22,
 };
 
-pub var palette: Palette = light_palette;
+/// Dark by default: every app paints a dark window body, and widgets from
+/// the light palette on it read as holes.
+pub var palette: Palette = dark_palette;
 
-/// Switch the runtime palette. Call once at app startup if the user has
-/// dark mode enabled in settings (read via libc.getConfig — eventual TODO,
-/// for now apps either default to light or set explicitly).
+/// Switch the runtime palette, for an app that paints a light body.
 pub fn setDarkMode(dark: bool) void {
     palette = if (dark) dark_palette else light_palette;
 }
@@ -118,6 +123,20 @@ pub fn drawRect1px(canvas: *Canvas, x: u32, y: u32, w: u32, h: u32, color: u32) 
     canvas.drawHLine(x, y + h - 1, w, color);
     canvas.drawVLine(x, y, h, color);
     canvas.drawVLine(x + w - 1, y, h, color);
+}
+
+/// Surface of a panel that floats over other content (dialogs, pickers):
+/// shadow, hairline border and rounded card, none of which assume what
+/// lies underneath.
+pub fn drawPanel(canvas: *Canvas, x: u32, y: u32, w: u32, h: u32) void {
+    drawShadow(canvas, x, y, w, h, 0);
+    canvas.fillRoundedRect(x, y, w, h, PANEL_RADIUS, palette.card_border);
+    canvas.fillRoundedRect(x + 1, y + 1, w -| 2, h -| 2, PANEL_RADIUS - 1, palette.card_bg);
+}
+
+/// Dim everything a modal panel is about to cover.
+pub fn drawScrim(canvas: *Canvas, w: u32, h: u32) void {
+    canvas.fillRectAlpha(0, 0, w, h, 0x000000, 96);
 }
 
 /// Soft drop shadow — 16-step Gaussian alpha falloff for right + bottom
@@ -301,7 +320,7 @@ pub const Button = struct {
         // Subtle highlight on top edge (1px lighter line just below the border).
         // Skipped on `pressed` so the inversion reads cleanly.
         if (self.h > 4 and self.state != .pressed) {
-            canvas.drawHLine(self.x + 1, self.y + 1, self.w -| 2, lerpColor(top, 0xFFFFFF, 1, 3));
+            canvas.drawHLine(self.x + 1, self.y + 1, self.w -| 2, lerpColor(top, 0xFFFFFF, 1, 7));
         }
         const atlas = fa.getDefault16();
         const text_y = self.y + (self.h -| atlas.line_height) / 2;
@@ -688,20 +707,25 @@ pub const Scrollbar = struct {
         content_visible: u32,
         scroll_offset: u32,
     ) void {
-        // Track — slightly darker than card_bg.
-        const track_color = lerpColor(palette.card_bg, 0x000000, 1, 8);
+        // Track: a shade under the card color, so it sits back.
+        const track_color = lerpColor(palette.card_bg, 0x000000, 1, 5);
         canvas.fillRect(self.x, self.y, self.w, self.h, track_color);
 
         // No thumb if everything fits.
         if (content_total <= content_visible) return;
 
+        // Thumb: a pill inset 2 px from the track's sides and ends.
         const tb = self.thumbBounds(content_total, content_visible, scroll_offset);
         const thumb_color: u32 = switch (self.state) {
-            .normal => lerpColor(palette.card_border, 0x000000, 1, 8),
+            .normal => lerpColor(palette.card_bg, palette.text_muted, 1, 2),
             .hover => palette.text_muted,
-            .dragging => palette.btn_primary_top,
+            .dragging => palette.text_normal,
         };
-        canvas.fillRect(self.x + 1, tb.y, self.w -| 2, tb.h, thumb_color);
+        const tw = self.w -| 4;
+        const th = tb.h -| 4;
+        if (tw == 0 or th == 0) return;
+        canvas.fillRect(self.x + 2, tb.y + 2, tw, th, thumb_color);
+        canvas.roundCornersRadius(self.x + 2, tb.y + 2, tw, th, tw / 2, track_color);
     }
 };
 
@@ -901,15 +925,8 @@ pub const Dialog = struct {
     }
 
     pub fn draw(self: Dialog, canvas: *Canvas, surrounding_bg: u32) void {
-        // Drop shadow via the shared helper (3-layer). Replaces the
-        // hardcoded 0xC8/D8/E4 stack; now follows the chosen palette so
-        // dark mode dialogs get a darker shadow that reads correctly.
-        drawShadow(canvas, self.x, self.y, self.w, self.h, surrounding_bg);
-
-        // Card body
-        canvas.fillRect(self.x, self.y, self.w, self.h, palette.card_bg);
-        drawRect1px(canvas, self.x, self.y, self.w, self.h, palette.card_border);
-        canvas.roundCornersRadius(self.x, self.y, self.w, self.h, PANEL_RADIUS, surrounding_bg);
+        _ = surrounding_bg;
+        drawPanel(canvas, self.x, self.y, self.w, self.h);
 
         // Title
         const atlas = fa.getDefault16();
@@ -1108,7 +1125,9 @@ pub const FolderPicker = struct {
 
     /// Caller treats this as the chosen folder once `handleClick` /
     /// `handleKey` returns `.ok`.
-    pub fn currentPath(self: FolderPicker) []const u8 {
+    /// By pointer: the slice aliases the picker, and a by-value `self`
+    /// may be a copy that is gone when this returns.
+    pub fn currentPath(self: *const FolderPicker) []const u8 {
         return self.path_buf[0..self.path_len];
     }
 
@@ -1207,12 +1226,8 @@ pub const FolderPicker = struct {
     }
 
     pub fn draw(self: FolderPicker, canvas: *Canvas, surrounding_bg: u32) void {
-        // Drop shadow + card surface — same vocabulary as Dialog so the
-        // two read as part of the same OS look.
-        drawShadow(canvas, self.x, self.y, self.w, self.h, surrounding_bg);
-        canvas.fillRect(self.x, self.y, self.w, self.h, palette.card_bg);
-        drawRect1px(canvas, self.x, self.y, self.w, self.h, palette.card_border);
-        canvas.roundCornersRadius(self.x, self.y, self.w, self.h, PANEL_RADIUS, surrounding_bg);
+        _ = surrounding_bg;
+        drawPanel(canvas, self.x, self.y, self.w, self.h);
 
         // Title
         const atlas = fa.getDefault16();
@@ -1225,7 +1240,7 @@ pub const FolderPicker = struct {
         // Current path crumb to the right of Up button
         const crumb_x = self.up_btn.x + self.up_btn.w + 12;
         const crumb_y = self.up_btn.y + (btn_h -| atlas.line_height) / 2;
-        canvas.drawText16Fg(crumb_x, crumb_y, self.path_buf[0..self.path_len], palette.text_normal);
+        fa.drawText(canvas, @intCast(crumb_x), @intCast(crumb_y), self.path_buf[0..self.path_len], palette.text_normal, atlas);
 
         // Entry list region with a subtle inset frame
         const list_x = self.x + padding;
@@ -1247,9 +1262,12 @@ pub const FolderPicker = struct {
             }
             const name = self.entries[entry_idx].name[0..self.entries[entry_idx].name_len];
             const text_color: u32 = if (sel) palette.card_bg else palette.text_normal;
-            // Folder glyph (lo-fi) + name
-            canvas.drawText16Fg(list_x + 8, row_y + (row_h -| atlas.line_height) / 2, "[D]", if (sel) palette.card_bg else palette.text_muted);
-            canvas.drawText16Fg(list_x + 36, row_y + (row_h -| atlas.line_height) / 2, name, text_color);
+            // Folder glyph (a tab over a body) + name
+            const glyph_color: u32 = if (sel) palette.card_bg else palette.text_muted;
+            const glyph_y = row_y + (row_h -| 11) / 2;
+            canvas.fillRect(list_x + 10, glyph_y, 6, 2, glyph_color);
+            canvas.fillRect(list_x + 10, glyph_y + 2, 14, 9, glyph_color);
+            fa.drawText(canvas, @intCast(list_x + 34), @intCast(row_y + (row_h -| atlas.line_height) / 2), name, text_color, atlas);
         }
 
         // Empty-state hint when the directory has no subfolders
@@ -1355,7 +1373,7 @@ pub const ImagePicker = struct {
     pub const cell_h: u32 = 110;
     pub const cell_gap: u32 = 10;
     pub const thumb_w: u32 = cell_w - 16;
-    pub const thumb_h: u32 = cell_h - 28; // leave room for filename below
+    pub const thumb_h: u32 = cell_h - 34; // leave room for filename below
     pub const cols: u32 = 3;
     pub const rows: u32 = 3;
     pub const btn_h: u32 = 28;
@@ -1417,7 +1435,8 @@ pub const ImagePicker = struct {
         return ip;
     }
 
-    pub fn currentDir(self: ImagePicker) []const u8 {
+    /// By pointer, as FolderPicker.currentPath.
+    pub fn currentDir(self: *const ImagePicker) []const u8 {
         return self.dir_buf[0..self.dir_len];
     }
 
@@ -1545,11 +1564,7 @@ pub const ImagePicker = struct {
     }
 
     pub fn draw(self: ImagePicker, canvas: *Canvas, surrounding_bg: u32) void {
-        // Card surface — same vocabulary as Dialog/FolderPicker.
-        drawShadow(canvas, self.x, self.y, self.w, self.h, surrounding_bg);
-        canvas.fillRect(self.x, self.y, self.w, self.h, palette.card_bg);
-        drawRect1px(canvas, self.x, self.y, self.w, self.h, palette.card_border);
-        canvas.roundCornersRadius(self.x, self.y, self.w, self.h, PANEL_RADIUS, surrounding_bg);
+        drawPanel(canvas, self.x, self.y, self.w, self.h);
 
         const atlas = fa.getDefault16();
         const title_y = self.y + padding;
@@ -1558,7 +1573,7 @@ pub const ImagePicker = struct {
         // Browse + breadcrumb row
         self.browse_btn.drawStyled(canvas, .default, palette.card_bg);
         const crumb_y = self.browse_btn.y + (btn_h -| atlas.line_height) / 2;
-        canvas.drawText16Fg(self.x + padding, crumb_y, self.dir_buf[0..self.dir_len], palette.text_muted);
+        fa.drawText(canvas, @intCast(self.x + padding), @intCast(crumb_y), self.dir_buf[0..self.dir_len], palette.text_muted, atlas);
 
         // Thumbnail grid
         const gx = self.gridX();
@@ -1595,10 +1610,12 @@ pub const ImagePicker = struct {
                     canvas.fillRect(tcell_x, tcell_y, thumb_w, thumb_h, palette.card_border);
                     fa.drawTextCentered(canvas, @intCast(tcell_x), @intCast(tcell_y + thumb_h / 2 - atlas.line_height / 2), thumb_w, "?", palette.text_muted, atlas);
                 }
-                // Filename label below.
+                // Filename label below, cut to the cell.
                 const label_color: u32 = if (is_sel) palette.card_bg else palette.text_normal;
-                const label_y = cy + thumb_h + 10;
-                fa.drawTextCentered(canvas, @intCast(cx), @intCast(label_y), cell_w, t.name, label_color, atlas);
+                const label_y = tcell_y + thumb_h + 4;
+                var shown = t.name;
+                while (shown.len > 1 and atlas.measure(shown) > cell_w - 8) shown = shown[0 .. shown.len - 1];
+                fa.drawTextCentered(canvas, @intCast(cx), @intCast(label_y), cell_w, shown, label_color, atlas);
             }
         }
 
