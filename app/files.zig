@@ -1,36 +1,19 @@
-// Files — directory browser with folder navigation, AA fonts, and a path bar.
+// Files — directory browser.
 //
-// Renders the cwd with one row per entry. Folders are double-click-into,
-// regular files are double-click-to-launch (`.elf`) or open-in-editor.
-// `..` row at the top of every non-root listing for parent navigation; an
-// "Up" button in the toolbar does the same. Status bar tracks file count
-// and the selected entry.
-//
-// Visual idiom mirrors the UEFI menu / About panel: SF Pro Text 16 body,
-// SF Pro Display 24 title, dark "card" palette with subtle borders, colored
-// icon chips per file type. The whole window redraws on selection or path
-// change — directories are small, so no diff'ing.
+// The toolbar goes up and home and shows the path as crumbs, each a click
+// away. The list has one row per entry, folders first: a double click or
+// Enter opens a folder, runs a program, or hands a file to the app for its
+// kind. Typing a letter selects the next name that starts with it.
 
 const libc = @import("libc");
 const gfx = @import("graphics");
 const ui = @import("ui");
 const fa = @import("font_atlas");
+const app = @import("app");
 
-// --- Palette (mirrors UEFI menu / About) ---
-const COLOR_BG: u32 = 0x1E1E20;
-const COLOR_PANEL: u32 = 0x29292C;
-const COLOR_PANEL_ALT: u32 = 0x242427;
-const COLOR_BORDER_OUT: u32 = 0x3A3A3E;
-const COLOR_BORDER_IN: u32 = 0x18181A;
-const COLOR_TITLE: u32 = 0xF2F2F4;
-const COLOR_TEXT: u32 = 0xE4E4E8;
-const COLOR_TEXT_DIM: u32 = 0x8C8C92;
 const COLOR_TEXT_MUTED: u32 = 0x66666C;
-const COLOR_ACCENT: u32 = 0x58A6FF;
-const COLOR_SEL_BG: u32 = 0x0B55B8;
-const COLOR_SEL_BORDER: u32 = 0x3D9BFF;
-const COLOR_PATH_BG: u32 = 0x19191B;
-const COLOR_DIVIDER: u32 = 0x343438;
+/// Secondary columns of the selected row: white would shout.
+const COLOR_ON_SELECTION: u32 = 0xD6E6FF;
 
 // --- Per-icon colors ---
 const ICON_FOLDER: u32 = 0xE8B83A; // amber folder
@@ -43,16 +26,18 @@ const ICON_SYMBOL: u32 = 0xC04AE8; // .sym/.id purple
 const ICON_CONFIG: u32 = 0x4DDED0; // .conf teal — distinct from text grey
 
 // --- Layout constants ---
-const TITLEBAR_H: u32 = 38;
-const PATHBAR_H: u32 = 30;
+const HEADER_H: u32 = 24;
 const ROW_H: u32 = 26;
-const STATUSBAR_H: u32 = 24;
-const TEXT_X: u32 = 38;
-const ICON_X: u32 = 12;
+const TEXT_X: u32 = 42;
+const ICON_X: u32 = 16;
 const ICON_W: u32 = 18;
 const ICON_H: u32 = 18;
-const SCROLLBAR_W: u32 = 8;
-const MAX_FILES: u32 = 64;
+const KIND_W: u32 = 104;
+const SIZE_W: u32 = 76;
+const COL_PAD: u32 = 14;
+/// Below this list width the Kind column is dropped.
+const KIND_MIN_LIST_W: u32 = 400;
+const MAX_FILES: u32 = 256;
 
 const FileKind = enum { directory, executable, symbol_table, data, text, config, audio, image, unknown };
 
@@ -74,10 +59,10 @@ fn classify(entry: *const libc.FileEntry) FileKind {
     if (endsWith(name, ".elf") or endsWith(name, ".efi")) return .executable;
     if (endsWith(name, ".sym") or endsWith(name, ".id")) return .symbol_table;
     if (endsWith(name, ".conf") or endsWith(name, ".cfg") or endsWith(name, ".ini") or endsWith(name, ".toml")) return .config;
-    if (endsWith(name, ".txt") or endsWith(name, ".md") or endsWith(name, "motd")) return .text;
+    if (endsWith(name, ".txt") or endsWith(name, ".md") or endsWith(name, "motd") or endsWith(name, ".html") or endsWith(name, ".zig")) return .text;
     if (endsWith(name, ".wad") or endsWith(name, ".dat") or endsWith(name, ".bin")) return .data;
     if (endsWith(name, ".wav") or endsWith(name, ".mp3") or endsWith(name, ".ogg")) return .audio;
-    if (endsWith(name, ".png") or endsWith(name, ".jpg") or endsWith(name, ".bmp") or endsWith(name, ".html")) return .image;
+    if (endsWith(name, ".png") or endsWith(name, ".jpg") or endsWith(name, ".jpeg") or endsWith(name, ".bmp")) return .image;
     return .unknown;
 }
 
@@ -95,31 +80,40 @@ fn iconColor(kind: FileKind) u32 {
     };
 }
 
-// --- State ---
-var alloc_w: u32 = 0;
-var alloc_h: u32 = 0;
-var vis_w: u32 = 0;
-var vis_h: u32 = 0;
-var visible_rows: u32 = 0;
+fn kindName(kind: FileKind) []const u8 {
+    return switch (kind) {
+        .directory => "Folder",
+        .executable => "Program",
+        .symbol_table => "Symbols",
+        .text => "Text",
+        .config => "Settings",
+        .data => "Data",
+        .audio => "Audio",
+        .image => "Image",
+        .unknown => "Document",
+    };
+}
 
+fn lower(c: u8) u8 {
+    return if (c >= 'A' and c <= 'Z') c + 32 else c;
+}
+
+// --- State ---
 var files: [MAX_FILES]libc.FileEntry = undefined;
 var file_count: u32 = 0;
-var scroll_offset: u32 = 0;
-var selected: i32 = -1;
-var scrollbar: ui.Scrollbar = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
+var list: app.ListState = .{};
 
 var cwd_buf: [256]u8 = undefined;
 var cwd_len: usize = 0;
 
-var status_msg: [80]u8 = undefined;
-var status_len: u32 = 0;
-var status_color: u32 = COLOR_TEXT_DIM;
+/// A message that replaces the selection's details in the status bar until
+/// the selection or the folder changes.
+var note_buf: [80]u8 = undefined;
+var note_len: usize = 0;
 
-fn setStatus(msg: []const u8, color: u32) void {
-    const n = @min(msg.len, status_msg.len);
-    @memcpy(status_msg[0..n], msg[0..n]);
-    status_len = @intCast(n);
-    status_color = color;
+fn setNote(msg: []const u8) void {
+    note_len = @min(msg.len, note_buf.len);
+    @memcpy(note_buf[0..note_len], msg[0..note_len]);
 }
 
 fn refreshCwd() void {
@@ -131,106 +125,110 @@ fn refreshCwd() void {
     }
 }
 
+fn nameOf(entry: *const libc.FileEntry) []const u8 {
+    return entry.name[0..entry.name_len];
+}
+
+/// Folders first, then by name without regard to case.
+fn sortsBefore(a: *const libc.FileEntry, b: *const libc.FileEntry) bool {
+    const a_dir = a.flags & libc.FE_FLAG_IS_DIR != 0;
+    const b_dir = b.flags & libc.FE_FLAG_IS_DIR != 0;
+    if (a_dir != b_dir) return a_dir;
+    const an = nameOf(a);
+    const bn = nameOf(b);
+    for (0..@min(an.len, bn.len)) |i| {
+        const ac = lower(an[i]);
+        const bc = lower(bn[i]);
+        if (ac != bc) return ac < bc;
+    }
+    return an.len < bn.len;
+}
+
 fn refreshFileList() void {
-    file_count = libc.listdir(&files);
-    if (file_count > MAX_FILES) file_count = MAX_FILES;
-    if (selected >= @as(i32, @intCast(file_count))) selected = @as(i32, @intCast(file_count)) - 1;
-    if (selected < 0 and file_count > 0) selected = 0;
-    scroll_offset = 0;
+    const n = libc.listdir(&files);
+    // "." and ".." have the toolbar.
+    var kept: u32 = 0;
+    for (0..n) |i| {
+        const name = nameOf(&files[i]);
+        if (name.len == 0 or (name[0] == '.' and (name.len == 1 or (name.len == 2 and name[1] == '.')))) continue;
+        files[kept] = files[i];
+        kept += 1;
+    }
+    file_count = kept;
+    // Insertion sort: a few hundred entries at most.
+    var i: u32 = 1;
+    while (i < file_count) : (i += 1) {
+        const moving = files[i];
+        var j = i;
+        while (j > 0 and sortsBefore(&moving, &files[j - 1])) : (j -= 1) files[j] = files[j - 1];
+        files[j] = moving;
+    }
+    list = .{ .selected = if (file_count > 0) 0 else null };
+    note_len = 0;
 }
 
 fn isAtRoot() bool {
     return cwd_len == 1 and cwd_buf[0] == '/';
 }
 
-/// Strip the last `/foo` component from `cwd_buf[0..cwd_len]`. Stops at
-/// "/" (root). cwd is invariantly trailing-`/`-terminated by the kernel,
-/// so we drop the trailing slash, walk back to the previous slash, and
-/// keep that slash as the new ending.
-fn parentPath(out: []u8) []const u8 {
-    if (isAtRoot()) {
-        out[0] = '/';
-        return out[0..1];
+fn goTo(path: []const u8) void {
+    if (libc.chdir(path)) {
+        refreshCwd();
+        refreshFileList();
+    } else {
+        setNote("Can't open that folder");
     }
+}
+
+/// The path of the folder above: the kernel ends cwd in '/', so cut that
+/// and the name before it.
+fn navigateUp() void {
+    if (isAtRoot()) return;
     var end: usize = cwd_len;
     if (cwd_buf[end - 1] == '/') end -= 1;
     while (end > 0 and cwd_buf[end - 1] != '/') end -= 1;
-    if (end == 0) {
-        out[0] = '/';
-        return out[0..1];
-    }
-    @memcpy(out[0..end], cwd_buf[0..end]);
-    return out[0..end];
+    var parent: [256]u8 = undefined;
+    @memcpy(parent[0..end], cwd_buf[0..end]);
+    goTo(if (end == 0) "/" else parent[0..end]);
 }
 
-fn navigateUp() void {
-    var buf: [256]u8 = undefined;
-    const parent = parentPath(&buf);
-    if (libc.chdir(parent)) {
-        refreshCwd();
-        refreshFileList();
-        setStatus(parent, COLOR_TEXT_DIM);
-    } else {
-        setStatus("chdir failed", 0xE85F50);
-    }
+fn runWith(program: []const u8, name: []const u8) void {
+    var cmd: [128]u8 = undefined;
+    if (program.len + 1 + name.len > cmd.len) return;
+    @memcpy(cmd[0..program.len], program);
+    cmd[program.len] = ' ';
+    @memcpy(cmd[program.len + 1 ..][0..name.len], name);
+    _ = libc.exec(cmd[0 .. program.len + 1 + name.len]);
 }
 
-fn navigateInto(name: []const u8) void {
-    if (libc.chdir(name)) {
-        refreshCwd();
-        refreshFileList();
-        setStatus(cwd_buf[0..cwd_len], COLOR_TEXT_DIM);
-    } else {
-        setStatus("chdir failed (not a dir?)", 0xE85F50);
-    }
-}
-
-fn launchEntry(idx: u32) void {
+fn openEntry(idx: u32) void {
     const entry = &files[idx];
-    const kind = classify(entry);
-    const name = entry.name[0..entry.name_len];
-    switch (kind) {
-        .directory => navigateInto(name),
+    const name = nameOf(entry);
+    switch (classify(entry)) {
+        .directory => goTo(name),
         .executable => {
             _ = libc.exec(name);
-            setStatus("Launched", 0x88CC88);
+            setNote("Started");
         },
-        .text, .config => {
-            var cmd: [128]u8 = undefined;
-            const prefix = "editor.elf ";
-            @memcpy(cmd[0..prefix.len], prefix);
-            @memcpy(cmd[prefix.len..][0..name.len], name);
-            _ = libc.exec(cmd[0 .. prefix.len + name.len]);
-        },
-        else => setStatus("No default action for this file type", COLOR_TEXT_DIM),
+        .text, .config => runWith("editor.elf", name),
+        .image => runWith("photo.elf", name),
+        else => setNote("No app opens this kind of file"),
     }
 }
 
-// --- Layout ---
-
-fn computeLayout(w: u32, h: u32) void {
-    vis_w = w;
-    vis_h = h;
-    const list_h = h -| (TITLEBAR_H + PATHBAR_H + STATUSBAR_H);
-    visible_rows = list_h / ROW_H;
-    scrollbar.x = vis_w -| SCROLLBAR_W;
-    scrollbar.y = TITLEBAR_H + PATHBAR_H;
-    scrollbar.w = SCROLLBAR_W;
-    scrollbar.h = list_h;
-}
-
-fn rowYAt(row: u32) u32 {
-    return TITLEBAR_H + PATHBAR_H + row * ROW_H;
-}
-
-fn getClickedRow(my: i32) i32 {
-    const top: i32 = @intCast(TITLEBAR_H + PATHBAR_H);
-    const bot: i32 = @intCast(vis_h -| STATUSBAR_H);
-    if (my < top or my >= bot) return -1;
-    const rel: u32 = @intCast(my - top);
-    const r = rel / ROW_H;
-    if (r >= visible_rows) return -1;
-    return @intCast(r);
+/// Select the next entry whose name starts with `ch`, wrapping around.
+fn selectByLetter(ch: u8) bool {
+    if (file_count == 0) return false;
+    const start: u32 = if (list.selected) |s| s + 1 else 0;
+    for (0..file_count) |step| {
+        const i: u32 = (start + @as(u32, @intCast(step))) % file_count;
+        const name = nameOf(&files[i]);
+        if (name.len != 0 and lower(name[0]) == lower(ch)) {
+            list.select(i);
+            return true;
+        }
+    }
+    return false;
 }
 
 // --- Drawing ---
@@ -492,28 +490,27 @@ fn drawIcon(canvas: *gfx.Canvas, x: u32, y: u32, kind: FileKind) void {
     }
 }
 
-fn drawSize(canvas: *gfx.Canvas, x_right: u32, y: u32, size: u32, bg: u32) void {
-    var buf: [16]u8 = undefined;
+/// "812 bytes", "14 KB", "3.2 MB".
+fn sizeText(buf: *[16]u8, size: u32) []const u8 {
     var pos: usize = 0;
+    var unit: []const u8 = " bytes";
     if (size >= 1024 * 1024) {
-        const mb = size / (1024 * 1024);
-        pos = formatNum(&buf, mb);
-        buf[pos] = ' '; pos += 1;
-        buf[pos] = 'M'; pos += 1;
-        buf[pos] = 'B'; pos += 1;
+        pos = formatNum(buf, size / (1024 * 1024));
+        // One decimal below 10 MB, where it still says something.
+        if (size < 10 * 1024 * 1024) {
+            buf[pos] = '.';
+            buf[pos + 1] = '0' + @as(u8, @intCast((size % (1024 * 1024)) * 10 / (1024 * 1024)));
+            pos += 2;
+        }
+        unit = " MB";
     } else if (size >= 1024) {
-        const kb = size / 1024;
-        pos = formatNum(&buf, kb);
-        buf[pos] = ' '; pos += 1;
-        buf[pos] = 'K'; pos += 1;
-        buf[pos] = 'B'; pos += 1;
+        pos = formatNum(buf, size / 1024);
+        unit = " KB";
     } else {
-        pos = formatNum(&buf, size);
-        buf[pos] = ' '; pos += 1;
-        buf[pos] = 'B'; pos += 1;
+        pos = formatNum(buf, size);
     }
-    const w = fa.default_16.measure(buf[0..pos]);
-    fa.drawTextOpaque(canvas, x_right -| w, y, buf[0..pos], COLOR_TEXT_DIM, bg, &fa.default_16);
+    @memcpy(buf[pos..][0..unit.len], unit);
+    return buf[0 .. pos + unit.len];
 }
 
 fn formatNum(buf: []u8, n: u32) usize {
@@ -532,242 +529,195 @@ fn formatNum(buf: []u8, n: u32) usize {
     return len;
 }
 
-fn render(canvas: *gfx.Canvas) void {
-    canvas.clear(COLOR_BG);
+// --- The window ---
 
-    // --- Title bar ---
-    canvas.fillRect(0, 0, vis_w, TITLEBAR_H, COLOR_PANEL);
-    canvas.fillRect(0, TITLEBAR_H - 1, vis_w, 1, COLOR_DIVIDER);
-    fa.drawTextOpaque(canvas, 14, 6, "Files", COLOR_TITLE, COLOR_PANEL, &fa.default_24);
+/// The path as crumbs in `r`: "/" then each folder, the current one in
+/// bold. A click on an ancestor goes there. Leading crumbs give way when
+/// the path is wider than the bar.
+fn crumbs(u: *app.Ui, r: app.Rect) void {
+    const p = &ui.palette;
+    const regular = &fa.default_13;
+    const bold = &fa.default_13sb;
+    const SEP_W: u32 = 14;
+    const PAD: u32 = 6;
 
-    // --- Path bar ---
-    const path_y = TITLEBAR_H;
-    canvas.fillRect(0, path_y, vis_w, PATHBAR_H, COLOR_PATH_BG);
-    canvas.fillRect(0, path_y + PATHBAR_H - 1, vis_w, 1, COLOR_DIVIDER);
-
-    // "↑" up button on the left of the path bar (if not at root).
-    const up_w: u32 = 30;
-    if (!isAtRoot()) {
-        canvas.fillRect(8, path_y + 4, up_w, PATHBAR_H - 8, COLOR_PANEL_ALT);
-        fa.drawTextOpaque(canvas, 16, path_y + 6, "Up", COLOR_ACCENT, COLOR_PANEL_ALT, &fa.default_16);
-    }
-
-    // Current path display.
-    const path_text_x: u32 = if (isAtRoot()) 14 else 8 + up_w + 12;
-    fa.drawTextOpaque(canvas, path_text_x, path_y + 6, cwd_buf[0..cwd_len], COLOR_TEXT, COLOR_PATH_BG, &fa.default_16);
-
-    // --- File list ---
-    const list_w = vis_w -| SCROLLBAR_W;
-    const list_top = TITLEBAR_H + PATHBAR_H;
-    const list_bot = vis_h -| STATUSBAR_H;
-    canvas.fillRect(0, list_top, list_w, list_bot -| list_top, COLOR_BG);
-
-    if (file_count == 0) {
-        const msg = "(empty directory)";
-        const w = fa.default_16.measure(msg);
-        fa.drawTextOpaque(canvas, (vis_w -| w) / 2, list_top + 24, msg, COLOR_TEXT_MUTED, COLOR_BG, &fa.default_16);
-    }
-
-    var r: u32 = 0;
-    while (r < visible_rows) : (r += 1) {
-        const file_idx = scroll_offset + r;
-        if (file_idx >= file_count) break;
-        const entry = &files[file_idx];
-        const y = rowYAt(r);
-        const is_sel = (@as(i32, @intCast(file_idx)) == selected);
-        const row_bg: u32 = if (is_sel) COLOR_SEL_BG else if (r % 2 == 0) COLOR_BG else COLOR_PANEL_ALT;
-        canvas.fillRect(0, y, list_w, ROW_H, row_bg);
-        if (is_sel) {
-            canvas.fillRect(0, y, 3, ROW_H, COLOR_SEL_BORDER);
-        }
-
-        const kind = classify(entry);
-        drawIcon(canvas, ICON_X, y + (ROW_H - ICON_H) / 2, kind);
-
-        const name_y = y + (ROW_H -| fa.default_16.line_height) / 2;
-        const name_color: u32 = if (kind == .directory) COLOR_ACCENT else COLOR_TEXT;
-        fa.drawTextOpaque(canvas, TEXT_X, name_y, entry.name[0..entry.name_len], name_color, row_bg, &fa.default_16);
-
-        // Trailing slash on directories so they're obvious without
-        // depending on the icon.
-        if (kind == .directory) {
-            const name_w = fa.default_16.measure(entry.name[0..entry.name_len]);
-            fa.drawTextOpaque(canvas, TEXT_X + name_w, name_y, "/", COLOR_ACCENT, row_bg, &fa.default_16);
-        } else {
-            // File size on the right (skip for dirs since they're inode-only).
-            drawSize(canvas, list_w -| 12, name_y, entry.file_size, row_bg);
+    // Ends of the path's components: cwd[0..end] is the folder to go to.
+    var ends: [32]usize = undefined;
+    var count: usize = 1;
+    ends[0] = 1;
+    var i: usize = 1;
+    while (i < cwd_len and count < ends.len) : (i += 1) {
+        if (cwd_buf[i] == '/') {
+            ends[count] = i + 1;
+            count += 1;
         }
     }
+    // A cwd without its trailing '/' still has a last component.
+    if (cwd_len > 1 and cwd_buf[cwd_len - 1] != '/' and count < ends.len) {
+        ends[count] = cwd_len + 1;
+        count += 1;
+    }
 
-    scrollbar.draw(canvas, file_count, visible_rows, scroll_offset);
+    // Drop crumbs from the left until the rest fits.
+    var first: usize = 0;
+    while (first + 1 < count) : (first += 1) {
+        var w: u32 = 0;
+        for (first..count) |k| w += crumbWidth(ends, k, if (k + 1 == count) bold else regular) + 2 * PAD + SEP_W;
+        if (w <= r.w + SEP_W) break;
+    }
 
-    // --- Status bar ---
-    const sb_y = vis_h -| STATUSBAR_H;
-    canvas.fillRect(0, sb_y, vis_w, STATUSBAR_H, COLOR_PANEL);
-    canvas.fillRect(0, sb_y, vis_w, 1, COLOR_DIVIDER);
+    var x = r.x;
+    for (first..count) |k| {
+        const is_last = k + 1 == count;
+        const atlas = if (is_last) bold else regular;
+        const text = crumbText(ends, k);
+        const cell = app.Rect{ .x = x, .y = r.y, .w = @min(atlas.measure(text) + 2 * PAD, r.x + r.w -| x), .h = r.h };
+        if (!is_last and u.clicked(cell)) {
+            // `ends` describes the path just left.
+            goTo(cwd_buf[0..ends[k]]);
+            return;
+        }
+        if (u.painting) {
+            const hot = !is_last and u.hovering(cell);
+            if (hot) u.canvas.fillRoundedRect(cell.x, cell.y, cell.w, cell.h, 5, ui.lerpColor(p.bar_bg, p.text_strong, 1, 8));
+            const color = if (is_last or hot) p.text_strong else p.text_muted;
+            ui.drawTextFit(u.canvas, cell.x + PAD, cell.y + (cell.h -| atlas.line_height) / 2, cell.w -| 2 * PAD, text, color, atlas);
+            if (!is_last) {
+                const cx: i32 = @intCast(cell.x + cell.w + SEP_W / 2);
+                const cy: i32 = @intCast(cell.y + cell.h / 2);
+                u.canvas.drawLineAA(cx - 2, cy - 4, cx + 2, cy, p.text_muted);
+                u.canvas.drawLineAA(cx + 2, cy, cx - 2, cy + 4, p.text_muted);
+            }
+        }
+        x = cell.x + cell.w + SEP_W;
+    }
+}
 
-    const sb_text_y = sb_y + (STATUSBAR_H -| fa.default_16.line_height) / 2;
-    if (status_len > 0) {
-        fa.drawTextOpaque(canvas, 12, sb_text_y, status_msg[0..status_len], status_color, COLOR_PANEL, &fa.default_16);
-    } else {
-        var buf: [16]u8 = undefined;
-        const n = formatNum(&buf, file_count);
-        const cx = fa.drawNumOpaque(canvas, 12, sb_text_y, file_count, COLOR_TEXT_DIM, COLOR_PANEL, &fa.default_16);
-        _ = n;
-        fa.drawTextOpaque(canvas, cx, sb_text_y, " items, double-click to open", COLOR_TEXT_DIM, COLOR_PANEL, &fa.default_16);
+fn crumbText(ends: [32]usize, k: usize) []const u8 {
+    if (k == 0) return "/";
+    return cwd_buf[ends[k - 1] .. ends[k] - 1];
+}
+
+fn crumbWidth(ends: [32]usize, k: usize, atlas: *const fa.FontAtlas) u32 {
+    return atlas.measure(crumbText(ends, k));
+}
+
+fn statusText(buf: *[96]u8) []const u8 {
+    if (note_len != 0) return note_buf[0..note_len];
+    const sel = list.selected orelse return "";
+    const entry = &files[sel];
+    const kind = classify(entry);
+    const name = nameOf(entry);
+    var len: usize = 0;
+    @memcpy(buf[0..name.len], name);
+    len = name.len;
+    const parts = [_][]const u8{ "  -  ", kindName(kind) };
+    for (parts) |part| {
+        @memcpy(buf[len..][0..part.len], part);
+        len += part.len;
+    }
+    if (kind != .directory) {
+        var size_buf: [16]u8 = undefined;
+        const size = sizeText(&size_buf, entry.file_size);
+        @memcpy(buf[len..][0..2], ", ");
+        @memcpy(buf[len + 2 ..][0..size.len], size);
+        len += 2 + size.len;
+    }
+    return buf[0..len];
+}
+
+fn countText(buf: *[24]u8) []const u8 {
+    const n = formatNum(buf, file_count);
+    const word: []const u8 = if (file_count == 1) " item" else " items";
+    @memcpy(buf[n..][0..word.len], word);
+    return buf[0 .. n + word.len];
+}
+
+fn drawHeader(u: *app.Ui, r: app.Rect, show_kind: bool) void {
+    const p = &ui.palette;
+    const atlas = &fa.default_13sb;
+    const ty = r.y + (r.h - 1 -| atlas.line_height) / 2;
+    u.canvas.fillRect(r.x, r.y + r.h - 1, r.w, 1, ui.lerpColor(p.window_bg, p.text_muted, 1, 5));
+    fa.drawText(u.canvas, @intCast(r.x + TEXT_X), @intCast(ty), "Name", p.text_muted, atlas);
+    const size_right = r.x + r.w -| COL_PAD;
+    fa.drawText(u.canvas, @intCast(size_right -| atlas.measure("Size")), @intCast(ty), "Size", p.text_muted, atlas);
+    if (show_kind) fa.drawText(u.canvas, @intCast(size_right -| SIZE_W -| KIND_W), @intCast(ty), "Kind", p.text_muted, atlas);
+}
+
+fn drawRow(u: *app.Ui, r: app.Rect, entry: *const libc.FileEntry, is_selected: bool, show_kind: bool) void {
+    const p = &ui.palette;
+    const kind = classify(entry);
+    drawIcon(u.canvas, r.x + ICON_X, r.y + (ROW_H - ICON_H) / 2, kind);
+
+    const small = &fa.default_13;
+    const name_atlas = &fa.default_16;
+    const size_right = r.x + r.w -| COL_PAD;
+    const kind_x = size_right -| SIZE_W -| KIND_W;
+    const name_end = if (show_kind) kind_x else size_right -| SIZE_W;
+    const name_color = if (is_selected) p.selection_text else p.text_normal;
+    const dim = if (is_selected) COLOR_ON_SELECTION else p.text_muted;
+
+    ui.drawTextFit(u.canvas, r.x + TEXT_X, r.y + (ROW_H -| name_atlas.line_height) / 2, name_end -| (r.x + TEXT_X) -| COL_PAD, nameOf(entry), name_color, name_atlas);
+    const small_y = r.y + (ROW_H -| small.line_height) / 2;
+    if (show_kind) fa.drawText(u.canvas, @intCast(kind_x), @intCast(small_y), kindName(kind), dim, small);
+    var size_buf: [16]u8 = undefined;
+    const size: []const u8 = if (kind == .directory) "--" else sizeText(&size_buf, entry.file_size);
+    fa.drawText(u.canvas, @intCast(size_right -| small.measure(size)), @intCast(small_y), size, dim, small);
+}
+
+pub fn init(_: *app.Window) void {
+    refreshCwd();
+    refreshFileList();
+}
+
+pub fn frame(u: *app.Ui) void {
+    if (!u.painting) {
+        if (u.key == 0x08 or u.key == 0x7F) {
+            navigateUp();
+            u.repaint();
+        } else if (u.key > ' ' and u.key < 0x7F and u.mods & (libc.MOD_CTRL | libc.MOD_ALT) == 0) {
+            if (selectByLetter(u.key)) note_len = 0;
+            u.repaint();
+        }
+    }
+
+    u.beginBar();
+    if (u.iconButton(.up, !isAtRoot())) navigateUp();
+    if (u.iconButton(.home, !isAtRoot())) goTo("/");
+    crumbs(u, u.space(0, 22));
+    u.endBar();
+
+    var status_buf: [96]u8 = undefined;
+    var count_buf: [24]u8 = undefined;
+    u.statusBar(statusText(&status_buf), countText(&count_buf));
+
+    const area = u.fill();
+    const header = app.Rect{ .x = area.x, .y = area.y, .w = area.w, .h = @min(HEADER_H, area.h) };
+    const body = app.Rect{ .x = area.x, .y = area.y + header.h, .w = area.w, .h = area.h - header.h };
+    const selected_before = list.selected;
+    const view = u.list(body, &list, file_count, ROW_H);
+    if (view.selected != selected_before) note_len = 0;
+    if (view.opened) |row| openEntry(row);
+
+    if (u.painting) {
+        const show_kind = view.area.w >= KIND_MIN_LIST_W;
+        drawHeader(u, .{ .x = header.x, .y = header.y, .w = view.area.w, .h = header.h }, show_kind);
+        if (file_count == 0) {
+            const msg = "This folder is empty";
+            fa.drawTextCentered(u.canvas, @intCast(body.x), @intCast(body.y + 28), body.w, msg, ui.palette.text_muted, &fa.default_16);
+        }
+        var row = view.first;
+        while (row < view.first + view.count) : (row += 1) {
+            drawRow(u, view.rowRect(row), &files[row], view.selected == row, show_kind);
+        }
     }
 }
 
 export fn _start() linksection(".text.entry") callconv(.c) void {
     const scr = libc.getScreenSize();
-    var init_w = scr.w * 4 / 10;
-    if (init_w < 420) init_w = 420;
-    if (init_w > 720) init_w = 720;
-    var init_h = scr.h * 5 / 10;
-    if (init_h < 360) init_h = 360;
-    if (init_h > 700) init_h = 700;
-    alloc_w = @min(init_w + 200, scr.w);
-    alloc_h = @min(init_h + 200, scr.h);
-    while (alloc_w * alloc_h > 524288) {
-        if (alloc_w > alloc_h) alloc_w -= 16 else alloc_h -= 16;
-    }
-    computeLayout(init_w, init_h);
-
-    const win = libc.createWindowEx(alloc_w, alloc_h, init_w, init_h) orelse libc.exit();
-    alloc_w = win.alloc_w; // libc may have rounded up to 16-px stride
-    alloc_h = win.alloc_h;
-    var canvas = gfx.Canvas.init(win.fb, alloc_w, alloc_h);
-    _ = libc.getWindowAlloc(); // opt this window into F10 grow-on-maximize (re-fetched in .resize)
-    fa.ensureLoaded();
-
-    refreshCwd();
-    refreshFileList();
-    setStatus(cwd_buf[0..cwd_len], COLOR_TEXT_DIM);
-
-    var needs_redraw: bool = true;
-    var prev_left: bool = false;
-    var last_click_tick: u32 = 0;
-    var last_click_idx: i32 = -1;
-    // Tracked mouse state — fed from mouse_move/mouse_button events.
-    var cur_mx: i32 = 0;
-    var cur_my: i32 = 0;
-    var cur_btns: u32 = 0;
-
-    while (true) {
-        // Drain all queued events.
-        while (libc.pollEvent()) |ev| {
-            // Scrollbar consumes wheel + drag/track interactions globally;
-            // app code only handles its own widgets (Up button, row click).
-            if (scrollbar.handleEvent(ev, file_count, visible_rows, &scroll_offset)) {
-                needs_redraw = true;
-            }
-            switch (ev.kindOf()) {
-                .close_request => {
-                    libc.destroyWindow();
-                    libc.exit();
-                },
-                .key_char => {
-                    const ch: u8 = @truncate(ev.a);
-                    if (ch == 0x1B) {
-                        libc.destroyWindow();
-                        libc.exit();
-                    }
-                    if (ch == 0x08 or ch == 0x7F) {
-                        if (!isAtRoot()) {
-                            navigateUp();
-                            needs_redraw = true;
-                        }
-                    } else if (ch == 0x0D or ch == 0x0A) {
-                        if (selected >= 0 and selected < @as(i32, @intCast(file_count))) {
-                            launchEntry(@intCast(selected));
-                            needs_redraw = true;
-                        }
-                    } else if (ch == 'h' or ch == 'H') {
-                        if (libc.chdir("/")) {
-                            refreshCwd();
-                            refreshFileList();
-                            needs_redraw = true;
-                        }
-                    }
-                },
-                .mouse_move => {
-                    cur_mx = @bitCast(ev.a);
-                    cur_my = @bitCast(ev.b);
-                    cur_btns = ev.c;
-                },
-                .mouse_button => {
-                    cur_btns = ev.buttonsState();
-                    cur_mx = @bitCast(ev.b);
-                    cur_my = @bitCast(ev.c);
-                    needs_redraw = true; // press/release-edge may matter
-                },
-                .resize => {
-                    // The compositor may have GROWN our framebuffer (F10
-                    // maximize) past the alloc we requested at startup. Re-fetch
-                    // it and rebuild the canvas at the new stride before laying
-                    // out, so we render crisply into the bigger FB instead of
-                    // being upscaled. The FB pointer (win.fb) is unchanged.
-                    const wa = libc.getWindowAlloc();
-                    if (wa.w != 0 and (wa.w != alloc_w or wa.h != alloc_h)) {
-                        alloc_w = wa.w;
-                        alloc_h = wa.h;
-                        canvas = gfx.Canvas.init(win.fb, alloc_w, alloc_h);
-                    }
-                    const new_w = @min(ev.a, alloc_w);
-                    const new_h = @min(ev.b, alloc_h);
-                    if (new_w != vis_w or new_h != vis_h) {
-                        computeLayout(new_w, new_h);
-                        needs_redraw = true;
-                    }
-                },
-                else => {},
-            }
-        }
-
-        // Mouse state for app-owned widgets (Up button, row click).
-        const left = (cur_btns & 1) != 0;
-        const in_scrollbar = cur_mx >= @as(i32, @intCast(scrollbar.x)) and cur_mx < @as(i32, @intCast(scrollbar.x + scrollbar.w));
-
-        // Up button click
-        if (left and !prev_left and !isAtRoot()) {
-            const up_w_signed: i32 = 30;
-            if (cur_mx >= 8 and cur_mx < 8 + up_w_signed and
-                cur_my >= @as(i32, @intCast(TITLEBAR_H + 4)) and
-                cur_my < @as(i32, @intCast(TITLEBAR_H + PATHBAR_H - 4)))
-            {
-                navigateUp();
-                needs_redraw = true;
-            }
-        }
-
-        if (left and !prev_left and !in_scrollbar) {
-            const click_row = getClickedRow(cur_my);
-            if (click_row >= 0) {
-                const file_idx = @as(i32, @intCast(scroll_offset)) + click_row;
-                if (file_idx >= 0 and file_idx < @as(i32, @intCast(file_count))) {
-                    const now = libc.uptime();
-                    const is_double = (file_idx == last_click_idx and (now -% last_click_tick) < 80);
-                    if (is_double) {
-                        launchEntry(@intCast(file_idx));
-                        last_click_idx = -1;
-                    } else {
-                        selected = file_idx;
-                        last_click_idx = file_idx;
-                        last_click_tick = now;
-                    }
-                    needs_redraw = true;
-                }
-            }
-        }
-        prev_left = left;
-
-        if (!needs_redraw) {
-            libc.sleep(10);
-            continue;
-        }
-        needs_redraw = false;
-        render(&canvas);
-        libc.present();
-        libc.sleep(10);
-    }
+    app.run(@This(), .{
+        .width = @max(480, @min(scr.w * 4 / 10, 760)),
+        .height = @max(360, @min(scr.h / 2, 700)),
+        .escape_closes = true,
+    });
 }

@@ -1,46 +1,35 @@
-// photo — image viewer with directory navigation + folder picker.
+// photo — image viewer.
 //
-// Opens the image given on the command line (default
-// /share/zigos_test.png), then scans the parent directory for other
-// images (.png/.jpg/.jpeg/.bmp) and lets the user cycle through them
-// with Prev/Next buttons or Left/Right arrows. The Open Folder button
-// pops `ui.FolderPicker`, an overlay folder browser; picking a new
-// folder rescans and shows the first image found there.
+// Opens the image named on the command line (default
+// /share/zigos_test.png) and scans its folder for others (.png, .jpg,
+// .jpeg, .bmp): the toolbar arrows and the Left/Right keys step through
+// them, Open Folder picks another folder. An image larger than the window
+// is scaled down to fit, never up.
 
 const libc = @import("libc");
 const gfx = @import("graphics");
 const ui = @import("ui");
 const fa = @import("font_atlas");
 const image = @import("image");
+const app = @import("app");
 
-// --- Layout ---
-const TOOLBAR_H: u32 = 36;
-const FOOTER_H: u32 = 24;
-const BTN_W: u32 = 88;
-const BTN_H: u32 = 26;
-const BTN_GAP: u32 = 8;
+/// Behind the image: a shade under the window body, so the picture's edge
+/// shows even where the picture is dark.
+const COLOR_STAGE: u32 = 0x161618;
 
-const COLOR_BG: u32 = 0x1A1A24;
-const COLOR_TOOLBAR: u32 = 0x222230;
-const COLOR_DIVIDER: u32 = 0x2A2A38;
-const COLOR_TEXT: u32 = 0xE0E4F0;
-const COLOR_TEXT_DIM: u32 = 0x808898;
-
+const MIN_W: u32 = 640;
+const MIN_H: u32 = 480;
 const MAX_IMAGES: u32 = 256;
 const FILE_BUF_CAP: usize = 16 * 1024 * 1024;
 const CACHE_SIZE: u32 = 4;
 
 // --- State ---
-var alloc_w: u32 = 0;
-var alloc_h: u32 = 0;
-var vis_w: u32 = 0;
-var vis_h: u32 = 0;
 
 /// Directory we last scanned, trailing-slash terminated.
 var dir_buf: [256]u8 = undefined;
 var dir_len: u32 = 0;
 
-/// Image filenames in `dir_buf`, sorted by readdir's order.
+/// Image filenames in `dir_buf`, in readdir's order.
 var images: [MAX_IMAGES]libc.FileEntry = undefined;
 var image_count: u32 = 0;
 var current_idx: i32 = -1;
@@ -68,12 +57,18 @@ var cache: [CACHE_SIZE]CacheEntry = [_]CacheEntry{.{}} ** CACHE_SIZE;
 var cache_tick: u32 = 0;
 
 /// Index into `cache[]` for the currently-displayed image; -1 = none.
-/// The render path reads pixels/w/h directly from cache[current_cache].
 var current_cache: i32 = -1;
 
-var prev_btn: ui.Button = .{ .x = 8, .y = 5, .w = BTN_W, .h = BTN_H, .label = "< Prev" };
-var next_btn: ui.Button = .{ .x = 8 + BTN_W + BTN_GAP, .y = 5, .w = BTN_W, .h = BTN_H, .label = "Next >" };
-var open_btn: ui.Button = .{ .x = 8 + (BTN_W + BTN_GAP) * 2, .y = 5, .w = BTN_W + 28, .h = BTN_H, .label = "Open Folder" };
+/// The current image scaled to the size it was last shown at, as
+/// framebuffer pixels: scaling is the slow part of a repaint, and most
+/// repaints (hover, the picker) change neither the image nor its size.
+/// One screenful, allocated on first use.
+var scaled: ?[*]u32 = null;
+var scaled_cap: usize = 0;
+var scaled_w: u32 = 0;
+var scaled_h: u32 = 0;
+/// cache[].stamp of the image in `scaled`; 0 = nothing.
+var scaled_stamp: u32 = 0;
 
 var picker: ui.FolderPicker = undefined;
 var picker_active: bool = false;
@@ -99,25 +94,22 @@ fn endsWith(name: []const u8, suffix: []const u8) bool {
     return true;
 }
 
-/// Split `path` at the last '/' into (parent_dir_with_slash, filename).
-/// Returns null filename if the path has no slash. Parent comes back as
-/// "/" for top-level paths.
-fn splitPath(path: []const u8) struct { dir: []const u8, name: []const u8 } {
+/// Split `path` at the last '/' into its folder (with the slash) and the
+/// file name. A bare name is in the current directory: that is how Files
+/// hands an image over.
+fn splitPath(path: []const u8, cwd: []const u8) struct { dir: []const u8, name: []const u8 } {
     var last_slash: ?usize = null;
-    var i: usize = 0;
-    while (i < path.len) : (i += 1) {
-        if (path[i] == '/') last_slash = i;
+    for (path, 0..) |c, i| {
+        if (c == '/') last_slash = i;
     }
-    if (last_slash) |ls| {
-        return .{ .dir = path[0 .. ls + 1], .name = path[ls + 1 ..] };
-    }
-    return .{ .dir = "/", .name = path };
+    if (last_slash) |ls| return .{ .dir = path[0 .. ls + 1], .name = path[ls + 1 ..] };
+    return .{ .dir = cwd, .name = path };
 }
 
 // --- Directory scanning + image loading ----------------------------------
 
 fn setDir(p: []const u8) void {
-    if (p.len == 0 or p.len >= dir_buf.len) return;
+    if (p.len == 0 or p.len + 1 >= dir_buf.len) return;
     @memcpy(dir_buf[0..p.len], p);
     dir_len = @intCast(p.len);
     if (dir_buf[dir_len - 1] != '/') {
@@ -139,26 +131,14 @@ fn scanDir() void {
     }
     image_count = kept;
     current_idx = if (kept > 0) 0 else -1;
-}
-
-/// Try to point current_idx at `name`. Falls back to 0 if not found.
-fn selectByName(name: []const u8) void {
-    var i: u32 = 0;
-    while (i < image_count) : (i += 1) {
-        const en = images[i].name[0..images[i].name_len];
-        if (en.len == name.len) {
-            var same = true;
-            for (en, name) |a, b| if (a != b) {
-                same = false;
-                break;
-            };
-            if (same) {
-                current_idx = @intCast(i);
-                return;
-            }
-        }
+    // By name, so that Next and Previous go the way a file listing does.
+    var a: u32 = 1;
+    while (a < kept) : (a += 1) {
+        const moving = images[a];
+        var b = a;
+        while (b > 0 and ui.nameBefore(moving.name[0..moving.name_len], images[b - 1].name[0..images[b - 1].name_len])) : (b -= 1) images[b] = images[b - 1];
+        images[b] = moving;
     }
-    current_idx = if (image_count > 0) 0 else -1;
 }
 
 fn nameEql(a: []const u8, b: []const u8) bool {
@@ -167,13 +147,24 @@ fn nameEql(a: []const u8, b: []const u8) bool {
     return true;
 }
 
+/// Point current_idx at `name`, or at the first image if it is not there.
+fn selectByName(name: []const u8) void {
+    var i: u32 = 0;
+    while (i < image_count) : (i += 1) {
+        if (nameEql(images[i].name[0..images[i].name_len], name)) {
+            current_idx = @intCast(i);
+            return;
+        }
+    }
+    current_idx = if (image_count > 0) 0 else -1;
+}
+
 /// Find a cache slot whose name matches `name`; null on miss.
 fn cacheFind(name: []const u8) ?u32 {
     var i: u32 = 0;
     while (i < CACHE_SIZE) : (i += 1) {
         if (cache[i].stamp == 0) continue;
-        const cn = cache[i].name_buf[0..cache[i].name_len];
-        if (nameEql(cn, name)) return i;
+        if (nameEql(cache[i].name_buf[0..cache[i].name_len], name)) return i;
     }
     return null;
 }
@@ -191,7 +182,6 @@ fn cachePickSlot() u32 {
             best = i;
         }
     }
-    // Evict — free the pixels we're about to overwrite.
     if (cache[best].pixels) |p| {
         image.raw.stbi_image_free(p);
         cache[best].pixels = null;
@@ -204,6 +194,16 @@ fn cacheBump(idx: u32) void {
     cache[idx].stamp = cache_tick;
 }
 
+/// Names from another folder must not match this folder's cached pixels.
+fn cacheClear() void {
+    for (&cache) |*e| {
+        if (e.pixels) |p| image.raw.stbi_image_free(p);
+        e.* = .{};
+    }
+    current_cache = -1;
+    scaled_stamp = 0;
+}
+
 /// Ensure the FILE_BUF_CAP scratch buffer exists. Allocated once and
 /// never freed — perpetual ownership is the point (avoid heap churn).
 fn ensureFileBuf() bool {
@@ -214,14 +214,12 @@ fn ensureFileBuf() bool {
 
 fn readEntireFile(path: []const u8) ?[]u8 {
     if (!ensureFileBuf()) return null;
-    const buf_ptr = file_buf.?;
-    const buf = buf_ptr[0..FILE_BUF_CAP];
+    const buf = file_buf.?[0..FILE_BUF_CAP];
     const fd = libc.open(path) orelse return null;
     defer libc.close(fd);
     var total: usize = 0;
     while (total < FILE_BUF_CAP) {
-        const remaining = FILE_BUF_CAP - total;
-        const chunk = if (remaining > 65536) 65536 else remaining;
+        const chunk = @min(FILE_BUF_CAP - total, 65536);
         const n = libc.fread(fd, buf[total..][0..chunk]);
         if (n == 0) break;
         total += n;
@@ -230,26 +228,20 @@ fn readEntireFile(path: []const u8) ?[]u8 {
 }
 
 /// Load the image at `current_idx` into the cache (or look it up if
-/// already there). Updates `current_cache` so the render path knows
-/// which slot has the pixels. Returns false on read/decode failure;
-/// the displayed image stays whatever was previously there.
+/// already there) and point `current_cache` at it. False on a read or
+/// decode failure: then nothing is shown.
 fn loadCurrentImage() bool {
-    if (current_idx < 0 or @as(u32, @intCast(current_idx)) >= image_count) {
-        current_cache = -1;
-        return false;
-    }
+    current_cache = -1;
+    if (current_idx < 0 or @as(u32, @intCast(current_idx)) >= image_count) return false;
     const idx: u32 = @intCast(current_idx);
     const name = images[idx].name[0..images[idx].name_len];
 
-    // Cache hit: just bump the stamp and update current_cache.
     if (cacheFind(name)) |slot| {
         cacheBump(slot);
         current_cache = @intCast(slot);
         return true;
     }
 
-    // Cache miss: decode and insert. Pre-evict the chosen slot so we
-    // don't OOM by holding two N-MB allocations in flight.
     var path_buf: [320]u8 = undefined;
     if (dir_len + name.len >= path_buf.len) return false;
     @memcpy(path_buf[0..dir_len], dir_buf[0..dir_len]);
@@ -257,15 +249,15 @@ fn loadCurrentImage() bool {
     const full = path_buf[0 .. dir_len + name.len];
 
     const file_data = readEntireFile(full) orelse return false;
+    // file_data lives in the reusable file_buf; img.pixels is stb's, kept
+    // in the cache and freed with stbi_image_free on eviction.
     const img = image.decode(file_data, 4) catch return false;
-    // file_data lives in the reusable file_buf — no free here. img.pixels
-    // is the stb-allocated buffer; cache stores the raw pointer + dims and
-    // frees via image.raw.stbi_image_free on eviction.
     if (img.width == 0 or img.height == 0) {
         img.deinit();
         return false;
     }
 
+    // Slot picked after the decode succeeded: a failure evicts nothing.
     const slot = cachePickSlot();
     @memcpy(cache[slot].name_buf[0..name.len], name);
     cache[slot].name_len = @intCast(name.len);
@@ -277,351 +269,285 @@ fn loadCurrentImage() bool {
     return true;
 }
 
-/// Free every cache entry. Called on shutdown; not on close/reload
-/// (the whole point of the cache is to outlive individual loads).
-fn freeAllCaches() void {
-    var i: u32 = 0;
-    while (i < CACHE_SIZE) : (i += 1) {
-        if (cache[i].pixels) |p| {
-            image.raw.stbi_image_free(p);
-            cache[i].pixels = null;
+fn currentEntry() ?*const CacheEntry {
+    if (current_cache < 0) return null;
+    const e = &cache[@intCast(current_cache)];
+    return if (e.pixels != null) e else null;
+}
+
+fn step(delta: i32) void {
+    if (image_count < 2) return;
+    const n: i32 = @intCast(image_count);
+    current_idx = @mod(current_idx + delta, n);
+    _ = loadCurrentImage();
+}
+
+fn openFolder(path: []const u8) void {
+    cacheClear();
+    setDir(path);
+    scanDir();
+    _ = loadCurrentImage();
+}
+
+// --- Scaling --------------------------------------------------------------
+
+const Size = struct { w: u32, h: u32 };
+
+/// The size an sw x sh image is shown at inside max_w x max_h: whole,
+/// in proportion, and never larger than it is.
+fn fitSize(sw: u32, sh: u32, max_w: u32, max_h: u32) Size {
+    if (sw == 0 or sh == 0 or max_w == 0 or max_h == 0) return .{ .w = 0, .h = 0 };
+    if (sw <= max_w and sh <= max_h) return .{ .w = sw, .h = sh };
+    // The tighter side decides; the other follows, at least one pixel.
+    if (@as(u64, max_w) * sh <= @as(u64, max_h) * sw) {
+        return .{ .w = max_w, .h = @max(1, @as(u32, @intCast(@as(u64, sh) * max_w / sw))) };
+    }
+    return .{ .w = @max(1, @as(u32, @intCast(@as(u64, sw) * max_h / sh))), .h = max_h };
+}
+
+/// Scale RGBA `src` (sw x sh) down to dw x dh over `bg`, each output pixel
+/// the average of the source pixels it covers. Nearest-neighbour sampling
+/// drops most of them and turns fine detail into noise.
+fn scaleDown(dst: [*]u32, dw: u32, dh: u32, src: [*]const u8, sw: u32, sh: u32, bg: u32) void {
+    const bg_r: u64 = (bg >> 16) & 0xFF;
+    const bg_g: u64 = (bg >> 8) & 0xFF;
+    const bg_b: u64 = bg & 0xFF;
+    var dy: u32 = 0;
+    while (dy < dh) : (dy += 1) {
+        const y0: u32 = @intCast(@as(u64, dy) * sh / dh);
+        const y1: u32 = @max(y0 + 1, @as(u32, @intCast(@as(u64, dy + 1) * sh / dh)));
+        var dx: u32 = 0;
+        while (dx < dw) : (dx += 1) {
+            const x0: u32 = @intCast(@as(u64, dx) * sw / dw);
+            const x1: u32 = @max(x0 + 1, @as(u32, @intCast(@as(u64, dx + 1) * sw / dw)));
+            // Colour weighted by alpha, so a transparent pixel adds none.
+            var r: u64 = 0;
+            var g: u64 = 0;
+            var b: u64 = 0;
+            var a: u64 = 0;
+            var sy = y0;
+            while (sy < y1) : (sy += 1) {
+                var p = src + (@as(usize, sy) * sw + x0) * 4;
+                var sx = x0;
+                while (sx < x1) : (sx += 1) {
+                    const pa: u64 = p[3];
+                    r += p[0] * pa;
+                    g += p[1] * pa;
+                    b += p[2] * pa;
+                    a += pa;
+                    p += 4;
+                }
+            }
+            const full: u64 = @as(u64, (x1 - x0) * (y1 - y0)) * 255;
+            const rest = full - a;
+            const out_r: u32 = @intCast((r + bg_r * rest) / full);
+            const out_g: u32 = @intCast((g + bg_g * rest) / full);
+            const out_b: u32 = @intCast((b + bg_b * rest) / full);
+            dst[@as(usize, dy) * dw + dx] = (out_r << 16) | (out_g << 8) | out_b;
         }
-        cache[i].stamp = 0;
     }
 }
 
-// --- Rendering ----------------------------------------------------------
-
-fn render(canvas: *gfx.Canvas) void {
-    // Clear background.
-    canvas.fillRect(0, 0, vis_w, vis_h, COLOR_BG);
-
-    // Toolbar strip.
-    canvas.fillRect(0, 0, vis_w, TOOLBAR_H, COLOR_TOOLBAR);
-    canvas.fillRect(0, TOOLBAR_H - 1, vis_w, 1, COLOR_DIVIDER);
-
-    // Buttons enabled/disabled based on whether there are images to nav.
-    prev_btn.enabled = image_count > 1;
-    next_btn.enabled = image_count > 1;
-    prev_btn.drawStyled(canvas, .default, COLOR_TOOLBAR);
-    next_btn.drawStyled(canvas, .default, COLOR_TOOLBAR);
-    open_btn.drawStyled(canvas, .default, COLOR_TOOLBAR);
-
-    // Image area — between toolbar and footer.
-    const img_area_y = TOOLBAR_H;
-    const img_area_h = vis_h -| TOOLBAR_H -| FOOTER_H;
-
-    if (current_cache >= 0 and cache[@intCast(current_cache)].pixels != null) {
-        const slot: u32 = @intCast(current_cache);
-        const e = &cache[slot];
-        const px = e.pixels.?;
-        // Fit image into available area while preserving aspect ratio.
-        // Nearest-neighbor scale — fast and good enough for a viewer.
-        const scale_n = computeScale(e.w, e.h, vis_w, img_area_h);
-        const draw_w = (e.w * scale_n.num) / scale_n.den;
-        const draw_h = (e.h * scale_n.num) / scale_n.den;
-        const draw_x = (vis_w -| draw_w) / 2;
-        const draw_y = img_area_y + (img_area_h -| draw_h) / 2;
-        blitScaled(canvas, px, e.w, e.h, draw_x, draw_y, draw_w, draw_h);
-    } else {
-        // No image loaded — show a hint.
-        const msg = "No image loaded. Use Open Folder to browse";
-        const atlas = fa.getDefault16();
-        const ty = img_area_y + (img_area_h -| atlas.line_height) / 2;
-        fa.drawTextCentered(canvas, 0, @intCast(ty), vis_w, msg, COLOR_TEXT_DIM, atlas);
+/// `scaled` holding image `e` at w x h; false if there is no memory for it.
+fn ensureScaled(e: *const CacheEntry, w: u32, h: u32) bool {
+    const need: usize = @as(usize, w) * h;
+    if (scaled == null or scaled_cap < need) {
+        // A screenful covers every size the window can take.
+        const scr = libc.getScreenSize();
+        const cap = @max(need, @as(usize, scr.w) * scr.h);
+        const mem = libc.malloc(cap * 4) orelse return false;
+        scaled = @ptrCast(@alignCast(mem));
+        scaled_cap = cap;
+        scaled_stamp = 0;
     }
-
-    // Footer with filename + counter.
-    const footer_y = vis_h -| FOOTER_H;
-    canvas.fillRect(0, footer_y, vis_w, FOOTER_H, COLOR_TOOLBAR);
-    canvas.fillRect(0, footer_y, vis_w, 1, COLOR_DIVIDER);
-    if (current_idx >= 0) {
-        const idx: u32 = @intCast(current_idx);
-        const name = images[idx].name[0..images[idx].name_len];
-        canvas.drawText16Fg(8, footer_y + (FOOTER_H -| gfx.Canvas.CH16) / 2, name, COLOR_TEXT);
-        // "i of N" counter on the right.
-        var counter_buf: [32]u8 = undefined;
-        const counter = formatCounter(&counter_buf, idx + 1, image_count);
-        const cw: u32 = @intCast(counter.len * 9);
-        const cx = vis_w -| cw -| 8;
-        canvas.drawText16Fg(cx, footer_y + (FOOTER_H -| gfx.Canvas.CH16) / 2, counter, COLOR_TEXT_DIM);
-    }
-
-    // Folder picker overlay (on top of everything else).
-    if (picker_active) picker.draw(canvas, COLOR_BG);
+    if (scaled_stamp == e.stamp and scaled_w == w and scaled_h == h) return true;
+    scaleDown(scaled.?, w, h, e.pixels.?, e.w, e.h, COLOR_STAGE);
+    scaled_w = w;
+    scaled_h = h;
+    scaled_stamp = e.stamp;
+    return true;
 }
 
-const Ratio = struct { num: u32, den: u32 };
-
-fn computeScale(src_w: u32, src_h: u32, max_w: u32, max_h: u32) Ratio {
-    if (src_w == 0 or src_h == 0 or max_w == 0 or max_h == 0) return .{ .num = 1, .den = 1 };
-    // Fit-to-bounds factor expressed as a ratio so we don't pull in FP.
-    // We pick the smaller of (max_w/src_w) and (max_h/src_h) and represent
-    // it as fixed-point num/256.
-    const fx = (max_w * 256) / src_w;
-    const fy = (max_h * 256) / src_h;
-    const f = @min(fx, fy);
-    if (f >= 256) return .{ .num = 1, .den = 1 }; // never upscale past 1:1
-    return .{ .num = f, .den = 256 };
-}
-
-fn blitScaled(canvas: *gfx.Canvas, src: [*]u8, sw: u32, sh: u32, dx: u32, dy: u32, dw: u32, dh: u32) void {
-    if (dw == 0 or dh == 0) return;
-    const stride = canvas.width;
+fn drawStage(canvas: *gfx.Canvas, area: app.Rect) void {
+    canvas.fillRect(area.x, area.y, area.w, area.h, COLOR_STAGE);
+    const e = currentEntry() orelse {
+        const atlas = &fa.default_16;
+        const msg = if (image_count == 0) "No images in this folder" else "This image can't be shown";
+        const ty = area.y + (area.h -| atlas.line_height) / 2;
+        fa.drawTextCentered(canvas, @intCast(area.x), @intCast(ty), area.w, msg, ui.palette.text_muted, atlas);
+        return;
+    };
+    const size = fitSize(e.w, e.h, area.w, area.h);
+    if (size.w == 0 or size.h == 0 or !ensureScaled(e, size.w, size.h)) return;
+    const x0 = area.x + (area.w - size.w) / 2;
+    const y0 = area.y + (area.h - size.h) / 2;
+    const px = scaled.?;
     var y: u32 = 0;
-    while (y < dh) : (y += 1) {
-        const cy = dy + y;
-        if (cy >= canvas.height) break;
-        const sy: u32 = (y * sh) / dh;
-        const src_row_base: usize = @as(usize, sy) * sw * 4;
-        const dst_row_base: usize = @as(usize, cy) * stride;
-        var x: u32 = 0;
-        while (x < dw) : (x += 1) {
-            const cx = dx + x;
-            if (cx >= canvas.width) break;
-            const sx: u32 = (x * sw) / dw;
-            const sidx = src_row_base + @as(usize, sx) * 4;
-            const r: u32 = src[sidx + 0];
-            const g: u32 = src[sidx + 1];
-            const b: u32 = src[sidx + 2];
-            canvas.fb[dst_row_base + cx] = (r << 16) | (g << 8) | b;
-        }
+    while (y < size.h and y0 + y < canvas.height) : (y += 1) {
+        const row = px + @as(usize, y) * size.w;
+        const out = canvas.fb + @as(usize, y0 + y) * canvas.width + x0;
+        const n = @min(size.w, canvas.width -| x0);
+        for (0..n) |x| out[x] = row[x];
     }
 }
 
-fn formatCounter(buf: []u8, i: u32, n: u32) []const u8 {
+// --- Text -----------------------------------------------------------------
+
+fn writeUint(buf: []u8, n: u32) usize {
+    var tmp: [10]u8 = undefined;
     var len: usize = 0;
-    len += writeUint(buf[len..], i);
-    const sep = " of ";
-    if (len + sep.len < buf.len) {
-        @memcpy(buf[len..][0..sep.len], sep);
-        len += sep.len;
+    var v = n;
+    while (true) {
+        tmp[len] = '0' + @as(u8, @intCast(v % 10));
+        len += 1;
+        v /= 10;
+        if (v == 0) break;
     }
-    len += writeUint(buf[len..], n);
+    const out = @min(len, buf.len);
+    for (0..out) |i| buf[i] = tmp[len - 1 - i];
+    return out;
+}
+
+fn append(buf: []u8, len: *usize, text: []const u8) void {
+    const n = @min(text.len, buf.len - len.*);
+    @memcpy(buf[len.*..][0..n], text[0..n]);
+    len.* += n;
+}
+
+/// "1920 x 1080", and the scale it is shown at when that is not 100%.
+fn infoText(buf: []u8, shown: Size) []const u8 {
+    const e = currentEntry() orelse return "";
+    var len: usize = 0;
+    len += writeUint(buf[len..], e.w);
+    append(buf, &len, " x ");
+    len += writeUint(buf[len..], e.h);
+    if (shown.w != 0 and shown.w < e.w) {
+        append(buf, &len, "   ");
+        len += writeUint(buf[len..], @max(1, shown.w * 100 / e.w));
+        append(buf, &len, "%");
+    }
     return buf[0..len];
 }
 
-fn writeUint(buf: []u8, n: u32) usize {
-    if (n == 0) {
-        if (buf.len == 0) return 0;
-        buf[0] = '0';
-        return 1;
-    }
-    var tmp: [10]u8 = undefined;
-    var ti: usize = 0;
-    var v = n;
-    while (v > 0) {
-        tmp[ti] = '0' + @as(u8, @intCast(v % 10));
-        ti += 1;
-        v /= 10;
-    }
-    var i: usize = 0;
-    while (ti > 0 and i < buf.len) {
-        ti -= 1;
-        buf[i] = tmp[ti];
-        i += 1;
-    }
-    return i;
+/// "3 of 12".
+fn counterText(buf: []u8) []const u8 {
+    if (current_idx < 0) return "";
+    var len: usize = 0;
+    len += writeUint(buf[len..], @intCast(current_idx + 1));
+    append(buf, &len, " of ");
+    len += writeUint(buf[len..], image_count);
+    return buf[0..len];
 }
 
-// --- Layout ---
+fn currentName() []const u8 {
+    if (current_idx < 0) return "";
+    const e = &images[@intCast(current_idx)];
+    return e.name[0..e.name_len];
+}
 
-fn computeLayout(w: u32, h: u32) void {
-    vis_w = w;
-    vis_h = h;
+// --- The window -----------------------------------------------------------
+
+fn openPicker(u: *const app.Ui) void {
+    picker = ui.FolderPicker.init(u.w, u.h, dir_buf[0..dir_len]);
+    picker_active = true;
+}
+
+fn pickerInput(u: *app.Ui) void {
+    var action = picker.handleClick(u.mouse.x, u.mouse.y, u.down, u.was_down);
+    const key = if (u.key != 0) u.key else u.special;
+    if (action == .none and key != 0) action = picker.handleKey(key);
+    switch (action) {
+        .cancel => picker_active = false,
+        .ok => {
+            openFolder(picker.currentPath());
+            picker_active = false;
+        },
+        .navigated, .none => {},
+    }
+    // It keeps its own hover and selection.
+    u.repaint();
+}
+
+fn keys(u: *app.Ui) void {
+    switch (u.special) {
+        libc.Key.right, libc.Key.down, libc.Key.page_down => step(1),
+        libc.Key.left, libc.Key.up, libc.Key.page_up => step(-1),
+        else => switch (u.key) {
+            0x1B => u.close(),
+            'n', 'N', ' ' => step(1),
+            'p', 'P', 0x08 => step(-1),
+            'o', 'O' => openPicker(u),
+            else => return,
+        },
+    }
+    u.repaint();
+}
+
+pub fn frame(u: *app.Ui) void {
+    // The picker is modal: the viewer under it is drawn but inert.
+    if (picker_active) {
+        u.blocked = true;
+        if (!u.painting) pickerInput(u);
+    } else if (!u.painting) {
+        keys(u);
+    }
+
+    u.beginBar();
+    if (u.iconButton(.back, image_count > 1)) step(-1);
+    if (u.iconButton(.forward, image_count > 1)) step(1);
+    u.alignNext(.right);
+    if (u.button("Open Folder")) openPicker(u);
+    u.alignNext(.center);
+    u.heading(currentName());
+    u.endBar();
+
+    // The status bar comes before the area it describes: fit against what
+    // the area will be.
+    const stage_h = u.h -| (app.BAR_H + app.STATUS_H);
+    const shown: Size = if (currentEntry()) |e| fitSize(e.w, e.h, u.w, stage_h) else .{ .w = 0, .h = 0 };
+    var info_buf: [48]u8 = undefined;
+    var counter_buf: [32]u8 = undefined;
+    u.statusBar(infoText(&info_buf, shown), counterText(&counter_buf));
+
+    const area = u.fill();
+    if (u.painting) {
+        drawStage(u.canvas, area);
+        if (picker_active) {
+            ui.drawScrim(u.canvas, u.w, u.h);
+            picker.draw(u.canvas, ui.palette.window_bg);
+        }
+    }
 }
 
 // --- Entry --------------------------------------------------------------
 
 export fn _start() linksection(".text.entry") callconv(.c) void {
-    // Resolve initial path from argv[1] or default.
     var path_buf: [256]u8 = undefined;
     const default_path = "/share/zigos_test.png";
-    const path: []const u8 = blk: {
-        const argc = libc.getArgc();
-        if (argc >= 2) {
-            const len = libc.getArgv(1, &path_buf);
-            if (len != 0xFFFFFFFF and len > 0 and len < path_buf.len) {
-                break :blk path_buf[0..len];
-            }
-        }
-        @memcpy(path_buf[0..default_path.len], default_path);
-        break :blk path_buf[0..default_path.len];
-    };
+    var path: []const u8 = default_path;
+    if (libc.getArgc() >= 2) {
+        const len = libc.getArgv(1, &path_buf);
+        if (len != 0xFFFFFFFF and len > 0 and len < path_buf.len) path = path_buf[0..len];
+    }
 
-    const split = splitPath(path);
+    var cwd_buf: [256]u8 = undefined;
+    const cwd = libc.getCwd(&cwd_buf) orelse "/";
+    const split = splitPath(path, cwd);
     setDir(split.dir);
     scanDir();
     if (split.name.len > 0) selectByName(split.name);
+    _ = loadCurrentImage();
 
-    // Window sizing — start at the larger of the image's natural size
-    // and a comfortable minimum.
-    _ = loadCurrentImage(); // first try, may fail silently
+    // As large as the first image wants, within three quarters of the
+    // screen: the desktop's own bars need the rest.
     const scr = libc.getScreenSize();
-    const min_w: u32 = 640;
-    const min_h: u32 = 480;
-    var init_img_w: u32 = 0;
-    var init_img_h: u32 = 0;
-    if (current_cache >= 0) {
-        const c0 = &cache[@as(u32, @intCast(current_cache))];
-        init_img_w = c0.w;
-        init_img_h = c0.h;
+    const bars = app.BAR_H + app.STATUS_H;
+    var width: u32 = MIN_W;
+    var height: u32 = MIN_H;
+    if (currentEntry()) |e| {
+        const fit = fitSize(e.w, e.h, scr.w * 3 / 4, (scr.h * 3 / 4) -| bars);
+        width = @max(MIN_W, fit.w);
+        height = @max(MIN_H, fit.h + bars);
     }
-    var init_w: u32 = if (init_img_w > min_w) init_img_w else min_w;
-    var init_h: u32 = if (init_img_h + TOOLBAR_H + FOOTER_H > min_h) init_img_h + TOOLBAR_H + FOOTER_H else min_h;
-    if (init_w > scr.w) init_w = scr.w;
-    if (init_h > scr.h) init_h = scr.h;
-    alloc_w = @min(scr.w, init_w);
-    alloc_h = @min(scr.h, init_h);
-
-    const win = libc.createWindowEx(alloc_w, alloc_h, init_w, init_h) orelse libc.exit();
-    alloc_w = win.alloc_w;
-    alloc_h = win.alloc_h;
-    var canvas = gfx.Canvas.init(win.fb, alloc_w, alloc_h);
-    _ = libc.getWindowAlloc(); // opt this window into F10 grow-on-maximize (re-fetched in .resize)
-    fa.ensureLoaded();
-    computeLayout(init_w, init_h);
-
-    var needs_redraw: bool = true;
-    var prev_left: bool = false;
-    var cur_mx: i32 = 0;
-    var cur_my: i32 = 0;
-    var cur_btns: u32 = 0;
-
-    while (true) {
-        while (libc.pollEvent()) |ev| {
-            switch (ev.kindOf()) {
-                .close_request => {
-                    freeAllCaches();
-                    libc.destroyWindow();
-                    libc.exit();
-                },
-                .key_char => {
-                    const ch: u8 = @truncate(ev.a);
-                    if (picker_active) {
-                        switch (picker.handleKey(ch)) {
-                            .cancel => {
-                                picker_active = false;
-                                needs_redraw = true;
-                            },
-                            .ok => {
-                                setDir(picker.currentPath());
-                                scanDir();
-                                _ = loadCurrentImage();
-                                picker_active = false;
-                                needs_redraw = true;
-                            },
-                            .navigated => needs_redraw = true,
-                            .none => {},
-                        }
-                    } else switch (ch) {
-                        0x1B => {
-                            freeAllCaches();
-                            libc.destroyWindow();
-                            libc.exit();
-                        },
-                        0x91, 'n', 'N', ' ' => { // right arrow or Next
-                            if (image_count > 1) {
-                                current_idx = @mod(current_idx + 1, @as(i32, @intCast(image_count)));
-                                _ = loadCurrentImage();
-                                needs_redraw = true;
-                            }
-                        },
-                        0x92, 'p', 'P' => { // left arrow or Prev
-                            if (image_count > 1) {
-                                current_idx = @mod(current_idx - 1 + @as(i32, @intCast(image_count)), @as(i32, @intCast(image_count)));
-                                _ = loadCurrentImage();
-                                needs_redraw = true;
-                            }
-                        },
-                        'o', 'O' => {
-                            picker = ui.FolderPicker.init(vis_w, vis_h, dir_buf[0..dir_len]);
-                            picker_active = true;
-                            needs_redraw = true;
-                        },
-                        else => {},
-                    }
-                },
-                .mouse_move => {
-                    cur_mx = @bitCast(ev.a);
-                    cur_my = @bitCast(ev.b);
-                    cur_btns = ev.c;
-                },
-                .mouse_button => {
-                    cur_btns = ev.buttonsState();
-                    cur_mx = @bitCast(ev.b);
-                    cur_my = @bitCast(ev.c);
-                    needs_redraw = true;
-                },
-                .resize => {
-                    // F10 maximize may have GROWN our framebuffer past the
-                    // alloc we requested. Re-fetch and rebuild the canvas at
-                    // the new stride before clamping/laying out (FB ptr is
-                    // unchanged) so we render crisply instead of upscaled.
-                    const wa = libc.getWindowAlloc();
-                    if (wa.w != 0 and (wa.w != alloc_w or wa.h != alloc_h)) {
-                        alloc_w = wa.w;
-                        alloc_h = wa.h;
-                        canvas = gfx.Canvas.init(win.fb, alloc_w, alloc_h);
-                    }
-                    const new_w = @min(ev.a, alloc_w);
-                    const new_h = @min(ev.b, alloc_h);
-                    if (new_w != vis_w or new_h != vis_h) {
-                        computeLayout(new_w, new_h);
-                        needs_redraw = true;
-                    }
-                },
-                else => {},
-            }
-        }
-
-        const left = (cur_btns & 1) != 0;
-
-        if (picker_active) {
-            const action = picker.handleClick(cur_mx, cur_my, left, prev_left);
-            switch (action) {
-                .cancel => {
-                    picker_active = false;
-                    needs_redraw = true;
-                },
-                .ok => {
-                    setDir(picker.currentPath());
-                    scanDir();
-                    _ = loadCurrentImage();
-                    picker_active = false;
-                    needs_redraw = true;
-                },
-                .navigated => needs_redraw = true,
-                .none => {
-                    if (left != prev_left) needs_redraw = true;
-                },
-            }
-        } else {
-            if (prev_btn.update(cur_mx, cur_my, left, prev_left) and image_count > 1) {
-                current_idx = @mod(current_idx - 1 + @as(i32, @intCast(image_count)), @as(i32, @intCast(image_count)));
-                _ = loadCurrentImage();
-                needs_redraw = true;
-            }
-            if (next_btn.update(cur_mx, cur_my, left, prev_left) and image_count > 1) {
-                current_idx = @mod(current_idx + 1, @as(i32, @intCast(image_count)));
-                _ = loadCurrentImage();
-                needs_redraw = true;
-            }
-            if (open_btn.update(cur_mx, cur_my, left, prev_left)) {
-                picker = ui.FolderPicker.init(vis_w, vis_h, dir_buf[0..dir_len]);
-                picker_active = true;
-                needs_redraw = true;
-            }
-            if (left != prev_left) needs_redraw = true; // refresh hover states
-        }
-
-        prev_left = left;
-
-        if (needs_redraw) {
-            render(&canvas);
-            libc.present();
-            needs_redraw = false;
-        }
-        libc.sleep(16);
-    }
+    app.run(@This(), .{ .width = width, .height = height });
 }

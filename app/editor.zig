@@ -1,21 +1,23 @@
+// Editor — plain text, with Zig highlighting for .zig files.
+//
+// Ctrl+S saves (asking for a name when there is none), Ctrl+F finds and
+// F3 or Ctrl+G finds the next, Ctrl+C/X/V/A work on the selection, and
+// Ctrl+Q closes at once. Esc closes too, unless there are unsaved changes.
+
 const libc = @import("libc");
 const gfx = @import("graphics");
 const fa = @import("font_atlas");
 const ui = @import("ui");
+const app = @import("app");
 
-const BG: u32 = 0x1E1E20;
-const TEXT_FG: u32 = 0xCCCCCC;
-const SEL_BG: u32 = 0x3A3A55;
-const TOOLBAR_BG: u32 = 0x29292C;
-const TOOLBAR_FG: u32 = 0xB4B4BA;
-const STATUS_BG: u32 = 0x29292C;
-const STATUS_FG: u32 = 0xAAAAAA;
+const TEXT_FG: u32 = 0xD4D4D8;
+const SEL_BG: u32 = 0x264F78;
+const CURRENT_LINE_BG: u32 = 0x252528;
 const CURSOR_COLOR: u32 = 0xFFFFFF;
-const LINE_NUM_FG: u32 = 0x555566;
-const MODIFIED_FG: u32 = 0xFF8888;
-const PROMPT_BG: u32 = 0x36364A;
-const PROMPT_FG: u32 = 0xE0E0E0;
-const FIND_HIT_BG: u32 = 0x665520;
+const LINE_NUM_FG: u32 = 0x5C5C64;
+const LINE_NUM_CURRENT_FG: u32 = 0xB4B4BA;
+const EDITED_FG: u32 = 0xE0A458;
+const FIELD_BG: u32 = 0x18181A;
 
 // Zig syntax colors (only used when filename ends in .zig).
 const HL_KEYWORD: u32 = 0x66B3FF;
@@ -25,10 +27,10 @@ const HL_NUMBER: u32 = 0x90C080;
 const HL_COMMENT: u32 = 0x707080;
 const HL_BUILTIN: u32 = 0xC080C0;
 
-const TOOLBAR_H: u32 = 24;
-const STATUS_H: u32 = 20;
-const LINE_NUM_W: u32 = 36;
-const SCROLLBAR_W: u32 = 8;
+/// Line numbers, right-aligned, and the gap before the text.
+const GUTTER_W: u32 = 44;
+const GUTTER_PAD: u32 = 10;
+const PROMPT_H: u32 = 36;
 const TAB_WIDTH: u32 = 4;
 const C = gfx.Canvas;
 
@@ -52,18 +54,12 @@ var prompt_buf: [128]u8 = [_]u8{0} ** 128;
 var prompt_len: u8 = 0;
 var last_find_pos: u32 = 0;
 
-var win_w: u32 = 0;
-var win_h: u32 = 0;
-var ed_alloc_w: u32 = 0;
-var ed_alloc_h: u32 = 0;
-var scrollbar: ui.Scrollbar = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
+/// Text rows that fit the window, as of the last frame.
+var view_rows: u32 = 1;
 
-fn layoutScrollbar() void {
-    scrollbar.x = win_w -| SCROLLBAR_W;
-    scrollbar.y = TOOLBAR_H;
-    scrollbar.w = SCROLLBAR_W;
-    scrollbar.h = win_h -| (TOOLBAR_H + STATUS_H);
-}
+/// A line for the status bar that replaces the cursor position until the
+/// next key.
+var note: []const u8 = "";
 
 fn detectZig() void {
     if (filename_len < 4) { is_zig = false; return; }
@@ -75,28 +71,6 @@ fn detectZig() void {
 }
 
 export fn _start() linksection(".text.entry") callconv(.c) void {
-    const scr = libc.getScreenSize();
-    win_w = scr.w * 2 / 5;
-    if (win_w < 400) win_w = 400;
-    if (win_w > 700) win_w = 700;
-    win_h = scr.h * 2 / 3;
-    if (win_h < 300) win_h = 300;
-    if (win_h > 600) win_h = 600;
-
-    ed_alloc_w = @min(win_w * 2, scr.w);
-    ed_alloc_h = @min(win_h * 2, scr.h);
-    while (ed_alloc_w * ed_alloc_h > 524288) {
-        if (ed_alloc_w > ed_alloc_h) ed_alloc_w -= 16 else ed_alloc_h -= 16;
-    }
-
-    const win = libc.createWindowEx(ed_alloc_w, ed_alloc_h, win_w, win_h) orelse libc.exit();
-    ed_alloc_w = win.alloc_w;
-    ed_alloc_h = win.alloc_h;
-    var canvas = gfx.Canvas.init(win.fb, ed_alloc_w, ed_alloc_h);
-    _ = libc.getWindowAlloc(); // opt this window into F10 grow-on-maximize (re-fetched in .resize)
-    fa.ensureLoaded();
-    layoutScrollbar();
-
     var arg_buf: [64]u8 = undefined;
     const arg_len = libc.getExecArg(&arg_buf);
     if (arg_len > 0 and arg_len <= 64) {
@@ -106,122 +80,91 @@ export fn _start() linksection(".text.entry") callconv(.c) void {
         loadFile();
     }
 
-    var needs_redraw: bool = true;
-    var prev_left: bool = false;
-    var cur_mx: i32 = 0;
-    var cur_my: i32 = 0;
-    var cur_btns: u32 = 0;
+    const scr = libc.getScreenSize();
+    app.run(@This(), .{
+        .width = @max(480, @min(scr.w * 2 / 5, 760)),
+        .height = @max(320, @min(scr.h * 2 / 3, 640)),
+    });
+}
 
-    while (true) {
-        var should_quit = false;
+fn closePrompt() void {
+    find_mode = false;
+    save_as_mode = false;
+    prompt_len = 0;
+}
 
-        while (libc.pollEvent()) |ev| {
-            if (scrollbar.handleEvent(ev, totalLines(), visibleLines(), &scroll_line)) {
-                needs_redraw = true;
-            }
-            switch (ev.kindOf()) {
-                .close_request => should_quit = true,
-                .resize => {
-                    // F10 maximize may have GROWN our framebuffer past the
-                    // alloc we requested. Re-fetch and rebuild the canvas at
-                    // the new stride before clamping/laying out (FB ptr is
-                    // unchanged) so we render crisply instead of upscaled.
-                    const wa = libc.getWindowAlloc();
-                    if (wa.w != 0 and (wa.w != ed_alloc_w or wa.h != ed_alloc_h)) {
-                        ed_alloc_w = wa.w;
-                        ed_alloc_h = wa.h;
-                        canvas = gfx.Canvas.init(win.fb, ed_alloc_w, ed_alloc_h);
-                    }
-                    const new_w = @min(ev.a, ed_alloc_w);
-                    const new_h = @min(ev.b, ed_alloc_h);
-                    if (new_w != win_w or new_h != win_h) {
-                        win_w = new_w;
-                        win_h = new_h;
-                        layoutScrollbar();
-                        ensureCursorVisible();
-                        needs_redraw = true;
-                    }
-                },
-                .key_char => {
-                    const ch: u8 = @truncate(ev.a);
-                    const mods: u32 = ev.b;
-                    if (ch == 0x1B) {
-                        if (find_mode or save_as_mode) {
-                            find_mode = false;
-                            save_as_mode = false;
-                            prompt_len = 0;
-                            needs_redraw = true;
-                        } else {
-                            should_quit = true;
-                        }
-                    } else if (ch != 0) {
-                        if (handleKeyChar(ch, mods)) needs_redraw = true;
-                    }
-                },
-                .key_special => {
-                    const ch: u8 = @truncate(ev.a);
-                    const mods: u32 = ev.b;
-                    if (handleKeySpecial(ch, mods)) needs_redraw = true;
-                },
-                .mouse_move => {
-                    cur_mx = @bitCast(ev.a);
-                    cur_my = @bitCast(ev.b);
-                    cur_btns = ev.c;
-                    // Drag-select: left held + moving → update cursor + keep anchor
-                    if (prev_left and (cur_btns & 1) != 0 and !find_mode and !save_as_mode) {
-                        const in_scrollbar = cur_mx >= @as(i32, @intCast(scrollbar.x));
-                        if (!in_scrollbar and cur_my >= @as(i32, TOOLBAR_H) and
-                            cur_my < @as(i32, @intCast(win_h -| STATUS_H)))
-                        {
-                            const click_line = @as(u32, @intCast(cur_my - @as(i32, TOOLBAR_H))) / C.CH16 + scroll_line;
-                            var click_col: u32 = 0;
-                            if (cur_mx > @as(i32, LINE_NUM_W)) {
-                                click_col = @as(u32, @intCast(cur_mx - @as(i32, LINE_NUM_W))) / C.CW16;
-                            }
-                            moveCursorToLineCol(click_line, click_col);
-                            needs_redraw = true;
-                        }
-                    }
-                },
-                .mouse_button => {
-                    cur_btns = ev.buttonsState();
-                    cur_mx = @bitCast(ev.b);
-                    cur_my = @bitCast(ev.c);
-                },
-                else => {},
-            }
+fn save() void {
+    if (filename_len == 0) enterSaveAsMode() else saveFile();
+}
+
+fn keys(u: *app.Ui) void {
+    if (u.key == 0 and u.special == 0) return;
+    note = "";
+    u.repaint();
+    if (u.key == 0x1B) {
+        if (find_mode or save_as_mode) {
+            closePrompt();
+        } else if (modified) {
+            note = "Not saved. Ctrl+S saves, Ctrl+Q closes without saving";
+        } else {
+            u.close();
         }
-        if (should_quit) break;
+    } else if (u.key != 0) {
+        _ = handleKeyChar(u.key, u.mods);
+    } else {
+        _ = handleKeySpecial(u.special, u.mods);
+    }
+}
 
-        const left = (cur_btns & 1) != 0;
-        const in_scrollbar = cur_mx >= @as(i32, @intCast(scrollbar.x));
-        if (left and !prev_left and !in_scrollbar and !find_mode and !save_as_mode) {
-            if (cur_my >= @as(i32, TOOLBAR_H) and cur_my < @as(i32, @intCast(win_h -| STATUS_H))) {
-                const click_line = @as(u32, @intCast(cur_my - @as(i32, TOOLBAR_H))) / C.CH16 + scroll_line;
-                var click_col: u32 = 0;
-                if (cur_mx > @as(i32, LINE_NUM_W)) {
-                    click_col = @as(u32, @intCast(cur_mx - @as(i32, LINE_NUM_W))) / C.CW16;
-                }
-                clearSelection();
-                moveCursorToLineCol(click_line, click_col);
-                sel_anchor = cursor_pos; // anchor a fresh selection for drag
-                needs_redraw = true;
-            }
-        }
-        prev_left = left;
+/// Move the cursor to the character cell under `p`; `text` is the rect the
+/// text is drawn in. Halfway across a cell counts as the next one.
+fn cursorToPoint(p: app.Point, text: app.Rect) void {
+    const text_x: i32 = @intCast(text.x + GUTTER_W);
+    const top: i32 = @intCast(text.y);
+    const row: u32 = if (p.y > top) @as(u32, @intCast(p.y - top)) / C.CH16 else 0;
+    const col: u32 = if (p.x > text_x) (@as(u32, @intCast(p.x - text_x)) + C.CW16 / 2) / C.CW16 else 0;
+    moveCursorToLineCol(scroll_line + @min(row, view_rows -| 1), col);
+}
 
-        if (!needs_redraw) {
-            libc.sleep(10);
-            continue;
-        }
-        needs_redraw = false;
+pub fn frame(u: *app.Ui) void {
+    if (!u.painting) keys(u);
+    const prompting = find_mode or save_as_mode;
 
-        render(&canvas);
-        libc.sleep(10);
+    u.beginBar();
+    // The buttons first: the name takes what room they leave.
+    u.alignNext(.right);
+    if (u.button("Save")) save();
+    u.alignNext(.right);
+    if (u.button("Find")) enterFindMode();
+    u.heading(if (filename_len > 0) filename[0..filename_len] else "Untitled");
+    if (modified) u.caption("Edited", EDITED_FG);
+    u.endBar();
+
+    var status_buf: [48]u8 = undefined;
+    var size_buf: [32]u8 = undefined;
+    if (prompting) {
+        const strip = u.bottomBar(PROMPT_H);
+        if (u.painting) drawPrompt(u.canvas, strip, if (find_mode) "Find" else "Save as");
+    } else {
+        u.statusBar(if (note.len != 0) note else positionText(&status_buf), sizeText(&size_buf));
     }
 
-    libc.destroyWindow();
-    libc.exit();
+    const area = u.fill();
+    view_rows = @max(1, area.h / C.CH16);
+    const text = u.vscroll(area, totalLines(), view_rows, &scroll_line);
+    if (!prompting) {
+        if (u.pressed(text)) |p| {
+            clearSelection();
+            cursorToPoint(p, text);
+            // The anchor of a selection, should the press become a drag.
+            sel_anchor = cursor_pos;
+        } else if (u.dragging(text)) |p| {
+            const before = cursor_pos;
+            cursorToPoint(p, text);
+            if (cursor_pos != before) u.repaint();
+        }
+    }
+    if (u.painting) drawText(u.canvas, text);
 }
 
 inline fn modShift(mods: u32) bool { return (mods & 1) != 0; }
@@ -597,7 +540,7 @@ fn ensureCursorVisible() void {
 }
 
 fn visibleLines() u32 {
-    return (win_h -| (TOOLBAR_H + STATUS_H)) / C.CH16;
+    return view_rows;
 }
 
 fn loadFile() void {
@@ -659,6 +602,13 @@ fn isType(s: []const u8) bool {
     return false;
 }
 
+/// One character in its cell of the grid. No background: the selection
+/// and the current line's shade are already painted under the text.
+fn drawCell(canvas: *gfx.Canvas, x: u32, y: u32, ch: u8, color: u32) void {
+    if (ch <= ' ') return;
+    fa.drawText(canvas, @intCast(x), @intCast(y), &[1]u8{ch}, color, &fa.default_mono);
+}
+
 // Drive the row through a small state machine producing colored runs.
 fn drawZigLine(canvas: *gfx.Canvas, x0: u32, y: u32, line: []const u8, max_cols: u32) void {
     var col: u32 = 0;
@@ -669,23 +619,23 @@ fn drawZigLine(canvas: *gfx.Canvas, x0: u32, y: u32, line: []const u8, max_cols:
         // // line comment
         if (c == '/' and i + 1 < len and line[i + 1] == '/') {
             while (i < len and col < max_cols) : (i += 1) {
-                fa.drawCharOpaque(canvas, x0 + col * C.CW16, y, line[i], HL_COMMENT, BG, &fa.default_mono);
+                drawCell(canvas, x0 + col * C.CW16, y, line[i], HL_COMMENT);
                 col += 1;
             }
             return;
         }
         // "string"
         if (c == '"') {
-            fa.drawCharOpaque(canvas, x0 + col * C.CW16, y, c, HL_STRING, BG, &fa.default_mono);
+            drawCell(canvas, x0 + col * C.CW16, y, c, HL_STRING);
             col += 1;
             i += 1;
             while (i < len and col < max_cols) {
                 const sc = line[i];
-                fa.drawCharOpaque(canvas, x0 + col * C.CW16, y, sc, HL_STRING, BG, &fa.default_mono);
+                drawCell(canvas, x0 + col * C.CW16, y, sc, HL_STRING);
                 col += 1;
                 i += 1;
                 if (sc == '\\' and i < len and col < max_cols) {
-                    fa.drawCharOpaque(canvas, x0 + col * C.CW16, y, line[i], HL_STRING, BG, &fa.default_mono);
+                    drawCell(canvas, x0 + col * C.CW16, y, line[i], HL_STRING);
                     col += 1;
                     i += 1;
                     continue;
@@ -704,7 +654,7 @@ fn drawZigLine(canvas: *gfx.Canvas, x0: u32, y: u32, line: []const u8, max_cols:
             };
             var k = i;
             while (k < end_off and col < max_cols) : (k += 1) {
-                fa.drawCharOpaque(canvas, x0 + col * C.CW16, y, line[k], HL_STRING, BG, &fa.default_mono);
+                drawCell(canvas, x0 + col * C.CW16, y, line[k], HL_STRING);
                 col += 1;
             }
             i = end_off;
@@ -714,7 +664,7 @@ fn drawZigLine(canvas: *gfx.Canvas, x0: u32, y: u32, line: []const u8, max_cols:
         if (c == '@' and i + 1 < len and (line[i + 1] >= 'a' and line[i + 1] <= 'z')) {
             var k = i;
             while (k < len and (isWordChar(line[k]) or line[k] == '@') and col < max_cols) : (k += 1) {
-                fa.drawCharOpaque(canvas, x0 + col * C.CW16, y, line[k], HL_BUILTIN, BG, &fa.default_mono);
+                drawCell(canvas, x0 + col * C.CW16, y, line[k], HL_BUILTIN);
                 col += 1;
             }
             i = k;
@@ -727,7 +677,7 @@ fn drawZigLine(canvas: *gfx.Canvas, x0: u32, y: u32, line: []const u8, max_cols:
                  line[i] == 'X' or line[i] == '_' or
                  (line[i] >= 'a' and line[i] <= 'f') or (line[i] >= 'A' and line[i] <= 'F'))) : (i += 1)
             {
-                fa.drawCharOpaque(canvas, x0 + col * C.CW16, y, line[i], HL_NUMBER, BG, &fa.default_mono);
+                drawCell(canvas, x0 + col * C.CW16, y, line[i], HL_NUMBER);
                 col += 1;
             }
             continue;
@@ -742,44 +692,67 @@ fn drawZigLine(canvas: *gfx.Canvas, x0: u32, y: u32, line: []const u8, max_cols:
                 else TEXT_FG;
             var k: u32 = 0;
             while (k < ident.len and col < max_cols) : (k += 1) {
-                fa.drawCharOpaque(canvas, x0 + col * C.CW16, y, ident[k], color, BG, &fa.default_mono);
+                drawCell(canvas, x0 + col * C.CW16, y, ident[k], color);
                 col += 1;
             }
             continue;
         }
         // default
-        fa.drawCharOpaque(canvas, x0 + col * C.CW16, y, c, TEXT_FG, BG, &fa.default_mono);
+        drawCell(canvas, x0 + col * C.CW16, y, c, TEXT_FG);
         col += 1;
         i += 1;
     }
 }
 
-fn render(canvas: *gfx.Canvas) void {
-    canvas.clear(BG);
+// --- Drawing ----------------------------------------------------------------
 
-    // --- Toolbar ---
-    canvas.fillRect(0, 0, win_w, TOOLBAR_H, TOOLBAR_BG);
-    if (filename_len > 0) {
-        const fname = filename[0..filename_len];
-        fa.drawTextOpaque(canvas, 8, 4, fname, TOOLBAR_FG, TOOLBAR_BG, &fa.default_16);
-        if (modified) {
-            const fw = fa.default_16.measure(fname);
-            fa.drawTextOpaque(canvas, 8 + fw, 4, " *", MODIFIED_FG, TOOLBAR_BG, &fa.default_16);
-        }
-    } else {
-        fa.drawTextOpaque(canvas, 8, 4, "[untitled]", TOOLBAR_FG, TOOLBAR_BG, &fa.default_16);
+fn writeNum(buf: []u8, n: u32) usize {
+    var tmp: [10]u8 = undefined;
+    var len: usize = 0;
+    var v = n;
+    while (true) {
+        tmp[len] = '0' + @as(u8, @intCast(v % 10));
+        len += 1;
+        v /= 10;
+        if (v == 0) break;
     }
-    fa.drawTextOpaque(canvas, win_w -| 320, 4, "^S Save  ^F Find  ^C/V/X Clip  ^Q Quit",
-        0x666688, TOOLBAR_BG, &fa.default_16);
+    for (0..len) |i| buf[i] = tmp[len - 1 - i];
+    return len;
+}
 
-    // --- Text area + selection highlight ---
-    const text_y = TOOLBAR_H;
-    const text_h = win_h -| (TOOLBAR_H + STATUS_H);
-    const vis = text_h / C.CH16;
-    const text_area_w = win_w -| SCROLLBAR_W;
-    const max_cols = (text_area_w -| LINE_NUM_W) / C.CW16;
+fn appendText(buf: []u8, len: *usize, s: []const u8) void {
+    @memcpy(buf[len.*..][0..s.len], s);
+    len.* += s.len;
+}
 
+/// "Line 12, Column 5".
+fn positionText(buf: *[48]u8) []const u8 {
+    const cur = cursorLineCol();
+    var len: usize = 0;
+    appendText(buf, &len, "Line ");
+    len += writeNum(buf[len..], cur.line + 1);
+    appendText(buf, &len, ", Column ");
+    len += writeNum(buf[len..], cur.col + 1);
+    return buf[0..len];
+}
+
+/// "Zig   1234 bytes".
+fn sizeText(buf: *[32]u8) []const u8 {
+    var len: usize = 0;
+    if (is_zig) appendText(buf, &len, "Zig   ");
+    len += writeNum(buf[len..], text_len);
+    appendText(buf, &len, if (text_len == 1) " byte" else " bytes");
+    return buf[0..len];
+}
+
+/// The text in `r`: line numbers in the gutter, then the grid of cells.
+fn drawText(canvas: *gfx.Canvas, r: app.Rect) void {
+    const text_x = r.x + GUTTER_W;
+    const max_cols = (r.w -| GUTTER_W) / C.CW16;
+    const rows = r.h / C.CH16;
+    const mono = &fa.default_mono;
     const sel = selectionRange();
+    const cur = cursorLineCol();
 
     // Walk to start of scroll_line.
     var pos: u32 = 0;
@@ -788,121 +761,87 @@ fn render(canvas: *gfx.Canvas) void {
         if (text_buf[pos] == '\n') line += 1;
     }
 
-    const cur = cursorLineCol();
     var row: u32 = 0;
-    while (row < vis) : (row += 1) {
-        const y = text_y + row * C.CH16;
+    while (row < rows) : (row += 1) {
+        const y = r.y + row * C.CH16;
         const display_line = scroll_line + row;
+        const is_current = display_line == cur.line;
 
-        // Line number.
-        _ = fa.drawNumOpaque(canvas, 2, y, display_line +| 1, LINE_NUM_FG, BG, &fa.default_mono);
-        canvas.drawVLine(LINE_NUM_W - 2, y, C.CH16, 0x333344);
+        if (is_current and sel == null) canvas.fillRect(r.x, y, r.w, C.CH16, CURRENT_LINE_BG);
+
+        var num_buf: [10]u8 = undefined;
+        const num = num_buf[0..writeNum(&num_buf, display_line +| 1)];
+        const num_x = text_x -| GUTTER_PAD -| mono.measure(num);
+        fa.drawText(canvas, @intCast(num_x), @intCast(y), num, if (is_current) LINE_NUM_CURRENT_FG else LINE_NUM_FG, mono);
 
         // Slice this line out of the buffer.
         const line_start = pos;
-        var line_end_idx: u32 = pos;
-        while (line_end_idx < text_len and text_buf[line_end_idx] != '\n') : (line_end_idx += 1) {}
+        var line_end: u32 = pos;
+        while (line_end < text_len and text_buf[line_end] != '\n') : (line_end += 1) {}
 
-        // Selection background underlay.
+        // Selection, under the text.
         if (sel) |s| {
-            if (s.end > line_start and s.start <= line_end_idx) {
-                const a = if (s.start < line_start) line_start else s.start;
-                const b = if (s.end > line_end_idx) line_end_idx else s.end;
-                const sc_a = a - line_start;
-                const sc_b = b - line_start;
-                if (sc_b > sc_a and sc_a < max_cols) {
-                    const sx = LINE_NUM_W + sc_a * C.CW16;
-                    const sw = @min(sc_b - sc_a, max_cols - sc_a) * C.CW16;
-                    canvas.fillRect(sx, y, sw, C.CH16, SEL_BG);
+            if (s.end > line_start and s.start <= line_end) {
+                const a = @max(s.start, line_start) - line_start;
+                const b = @min(s.end, line_end) - line_start;
+                if (b > a and a < max_cols) {
+                    canvas.fillRect(text_x + a * C.CW16, y, @min(b - a, max_cols - a) * C.CW16, C.CH16, SEL_BG);
                 }
-                // Highlight trailing newline for multi-line selections.
-                if (s.end > line_end_idx) {
-                    const sx = LINE_NUM_W + (line_end_idx - line_start) * C.CW16;
-                    canvas.fillRect(sx, y, C.CW16 / 2, C.CH16, SEL_BG);
+                // The newline of a line the selection runs past.
+                if (s.end > line_end and line_end - line_start < max_cols) {
+                    canvas.fillRect(text_x + (line_end - line_start) * C.CW16, y, C.CW16 / 2, C.CH16, SEL_BG);
                 }
             }
         }
 
-        // Highlight find-match overlay (current selection IS the find hit;
-        // we already painted SEL_BG, so additional highlight only kicks in
-        // when find mode is active and the selection is exactly the
-        // current find result — keeps the cue clearly visible).
-        if (find_mode and sel != null) {
-            // Re-tint over SEL_BG for emphasis.
-            if (sel) |s| if (s.end > line_start and s.start < line_end_idx) {
-                const a = if (s.start < line_start) line_start else s.start;
-                const b = if (s.end > line_end_idx) line_end_idx else s.end;
-                const sc_a = a - line_start;
-                const sc_b = b - line_start;
-                if (sc_b > sc_a and sc_a < max_cols) {
-                    const hx = LINE_NUM_W + sc_a * C.CW16;
-                    const hw = @min(sc_b - sc_a, max_cols - sc_a) * C.CW16;
-                    canvas.fillRect(hx, y, hw, 1, FIND_HIT_BG);
-                    canvas.fillRect(hx, y + C.CH16 - 1, hw, 1, FIND_HIT_BG);
-                }
-            };
-        }
-
-        const line_slice = text_buf[line_start..line_end_idx];
+        const line_slice = text_buf[line_start..line_end];
         if (is_zig) {
-            drawZigLine(canvas, LINE_NUM_W, y, line_slice, max_cols);
+            drawZigLine(canvas, text_x, y, line_slice, max_cols);
         } else {
             var col: u32 = 0;
             while (col < line_slice.len and col < max_cols) : (col += 1) {
-                fa.drawCharOpaque(canvas, LINE_NUM_W + col * C.CW16, y, line_slice[col], TEXT_FG, BG, &fa.default_mono);
+                drawCell(canvas, text_x + col * C.CW16, y, line_slice[col], TEXT_FG);
             }
         }
 
-        pos = line_end_idx;
+        pos = line_end;
         if (pos < text_len and text_buf[pos] == '\n') pos += 1;
 
-        // Cursor.
-        if (display_line == cur.line) {
-            const cx_px = LINE_NUM_W + cur.col * C.CW16;
-            if (cx_px < text_area_w) {
-                canvas.fillRect(cx_px, y, 2, C.CH16, CURSOR_COLOR);
-            }
+        if (is_current and cur.col <= max_cols) {
+            canvas.fillRect(text_x + cur.col * C.CW16, y, 2, C.CH16, CURSOR_COLOR);
         }
 
         if (pos >= text_len and display_line >= cur.line) break;
     }
-
-    scrollbar.draw(canvas, totalLines(), visibleLines(), scroll_line);
-
-    // --- Status bar / prompt ---
-    const sy = win_h -| STATUS_H + 2;
-    canvas.fillRect(0, win_h -| STATUS_H, win_w, STATUS_H,
-        if (find_mode or save_as_mode) PROMPT_BG else STATUS_BG);
-
-    if (find_mode) {
-        renderPrompt(canvas, sy, "Find: ");
-    } else if (save_as_mode) {
-        renderPrompt(canvas, sy, "Save as: ");
-    } else {
-        fa.drawTextOpaque(canvas, 8, sy, "Ln ", STATUS_FG, STATUS_BG, &fa.default_16);
-        var sx: u32 = 8 + fa.default_16.measure("Ln ");
-        sx = fa.drawNumOpaque(canvas, sx, sy, cur.line + 1, STATUS_FG, STATUS_BG, &fa.default_mono);
-        fa.drawTextOpaque(canvas, sx + 4, sy, "Col ", STATUS_FG, STATUS_BG, &fa.default_16);
-        sx = sx + 4 + fa.default_16.measure("Col ");
-        sx = fa.drawNumOpaque(canvas, sx, sy, cur.col + 1, STATUS_FG, STATUS_BG, &fa.default_mono);
-        fa.drawTextOpaque(canvas, sx + 8, sy, "Size ", STATUS_FG, STATUS_BG, &fa.default_16);
-        sx = sx + 8 + fa.default_16.measure("Size ");
-        _ = fa.drawNumOpaque(canvas, sx, sy, text_len, STATUS_FG, STATUS_BG, &fa.default_mono);
-        if (is_zig) {
-            const tag = "  [zig]";
-            const tw = fa.default_16.measure(tag);
-            fa.drawTextOpaque(canvas, win_w -| (tw + 8), sy, tag, 0x66B3FF, STATUS_BG, &fa.default_16);
-        }
-    }
 }
 
-fn renderPrompt(canvas: *gfx.Canvas, sy: u32, label: []const u8) void {
-    fa.drawTextOpaque(canvas, 8, sy, label, PROMPT_FG, PROMPT_BG, &fa.default_16);
-    const lx = 8 + fa.default_16.measure(label);
-    if (prompt_len > 0) {
-        fa.drawTextOpaque(canvas, lx, sy, prompt_buf[0..prompt_len], PROMPT_FG, PROMPT_BG, &fa.default_mono);
-    }
-    // Caret at end of prompt.
-    const cx = lx + prompt_len * C.CW16;
-    canvas.fillRect(cx, sy, 2, C.CH16, CURSOR_COLOR);
+/// The find or save-as prompt in the bottom strip `r`: a caption, the
+/// field with what was typed, and what the keys do.
+fn drawPrompt(canvas: *gfx.Canvas, r: app.Rect, caption: []const u8) void {
+    const p = &ui.palette;
+    const small = &fa.default_13;
+    const pad: u32 = 10;
+    const hint = if (find_mode) "Enter: next    Esc: close" else "Enter: save    Esc: cancel";
+    const caption_w = fa.default_13sb.measure(caption);
+    const hint_w = small.measure(hint);
+    const small_y = r.y + (r.h -| small.line_height) / 2;
+    fa.drawText(canvas, @intCast(r.x + pad), @intCast(small_y), caption, p.text_strong, &fa.default_13sb);
+
+    const field_x = r.x + pad + caption_w + pad;
+    // The hint gives way first on a narrow window.
+    const show_hint = r.w > field_x + 160 + hint_w + 2 * pad;
+    const field_w = r.w -| field_x -| (if (show_hint) hint_w + 2 * pad else pad);
+    const field_h: u32 = 24;
+    const field_y = r.y + (r.h - field_h) / 2;
+    canvas.fillRoundedRect(field_x, field_y, field_w, field_h, 6, p.card_border);
+    canvas.fillRoundedRect(field_x + 1, field_y + 1, field_w -| 2, field_h -| 2, 5, FIELD_BG);
+
+    // The tail of a query longer than the field stays in view.
+    const cols = (field_w -| 16) / C.CW16;
+    const shown = prompt_buf[@as(u32, prompt_len) -| cols..prompt_len];
+    const text_y = field_y + (field_h -| C.CH16) / 2;
+    for (shown, 0..) |ch, i| drawCell(canvas, field_x + 8 + @as(u32, @intCast(i)) * C.CW16, text_y, ch, TEXT_FG);
+    canvas.fillRect(field_x + 8 + @as(u32, @intCast(shown.len)) * C.CW16, text_y, 2, C.CH16, CURSOR_COLOR);
+
+    if (show_hint) fa.drawText(canvas, @intCast(r.x + r.w - pad - hint_w), @intCast(small_y), hint, p.text_muted, small);
 }

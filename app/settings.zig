@@ -295,6 +295,14 @@ fn scanWallpaperThumbs(dir: []const u8) void {
     freeWallpaperThumbs();
     var entries: [128]libc.FileEntry = undefined;
     const n = libc.readdir(dir, &entries);
+    // By name, whatever order the disk lists them in.
+    var a: u32 = 1;
+    while (a < n) : (a += 1) {
+        const moving = entries[a];
+        var b = a;
+        while (b > 0 and ui.nameBefore(moving.name[0..moving.name_len], entries[b - 1].name[0..entries[b - 1].name_len])) : (b -= 1) entries[b] = entries[b - 1];
+        entries[b] = moving;
+    }
     var slot: u32 = 0;
     var i: u32 = 0;
     while (i < n and slot < MAX_THUMBS) : (i += 1) {
@@ -474,7 +482,8 @@ fn closePicker() void {
 /// The picker's share of an input pass.
 fn pickerInput(u: *app.Ui) void {
     var action = wp_picker.handleClick(u.mouse.x, u.mouse.y, u.down, u.was_down);
-    if (action == .none and u.key != 0) action = wp_picker.handleKey(u.key);
+    const key = if (u.key != 0) u.key else u.special;
+    if (action == .none and key != 0) action = wp_picker.handleKey(key);
     switch (action) {
         .cancel => closePicker(),
         .ok => {

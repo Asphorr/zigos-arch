@@ -1008,6 +1008,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "image", .module = image_mod },
                 .{ .name = "graphics", .module = graphics_mod },
                 .{ .name = "ui", .module = ui_mod },
+                .{ .name = "app", .module = app_mod },
                 .{ .name = "font_atlas", .module = font_atlas_mod },
             },
         }),
@@ -1304,7 +1305,7 @@ pub fn build(b: *std.Build) void {
         \\cat > $STAGE/etc/zigos.conf <<'EOF'
         \\# ZigOS UI configuration
         \\# Edit values 0..N to change appearance / input. Saved by the Settings
-        \\# app and read by the desktop at boot. The editor opens this file too —
+        \\# app and read by the desktop at boot. The editor opens this file too:
         \\# Ctrl+S to save your changes.
         \\#
         \\# resolution    0=1280x720, 1=1920x1080
