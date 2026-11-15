@@ -7,8 +7,8 @@
 //   * `wake_pending` — a level-triggered flag set by edge events
 //     (sysPresent landed, a pipe got new bytes, a toast was shown,
 //     an animation was started, an app crashed, config changed). The
-//     desktop's `consume()` call at the top of each loop iteration
-//     clears it; subsequent sets re-arm.
+//     desktop's `consume()` call, made as each loop iteration resumes
+//     from its park or yield, clears it; subsequent sets re-arm.
 //
 //   * `self_wake_due_at` — an absolute tick deadline written by the
 //     loop body itself when it has tick-driven artifacts still in

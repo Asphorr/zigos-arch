@@ -3588,13 +3588,6 @@ pub fn run() void {
 
     while (true) {
         frame_count +%= 1;
-        // Clear event-driven wake flags. We're running because either
-        // wake.isDue() told the timer to switch us in (atomic flag /
-        // self-wake due), or one of the input checks fired. Either way,
-        // we own this iteration — drain both channels before doing any
-        // work so producers during the iteration re-arm cleanly for the
-        // next wake.
-        wake.consume();
         // Inject typematic repeats (held keys past the initial delay) into
         // the keyboard ring before we read from it. Cheap: returns immediately
         // unless a key is actually due for repeat.
@@ -3611,6 +3604,12 @@ pub fn run() void {
         // stretch) — see the parking block comment near `parked`.
         last_desktop_tick = process.tick_count;
         parkOrYield();
+        // Drain both wake channels now that this iteration is running, not
+        // before the park: the park needs the self-wake the last iteration
+        // asked for (the next animation or toast frame) as its deadline, and
+        // a wake requested during that iteration must keep it from parking.
+        // Requests made from here on re-arm for the next iteration.
+        wake.consume();
         // Frame clock starts AFTER parkOrYield returns — parked/yielded
         // time belongs to the scheduler, not to this frame.
         frameperf.frameBegin();
