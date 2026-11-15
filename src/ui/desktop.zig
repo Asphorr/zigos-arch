@@ -1820,9 +1820,6 @@ fn renderWindow(idx: u8) void {
     const span: u32 = @intCast(2 * SHADOW_SPAD);
     addDirtyRect(ddx, ddy, w.width + span, w.height + span);
 
-    // Save corner pixels from back buffer BEFORE drawing (for transparent rounded corners)
-    saveCornerPixels(w.x - @as(i32, BORDER), w.y - @as(i32, BORDER), w.width + BORDER * 2, w.height + BORDER * 2, ALL_CORNERS);
-
     // Soft "elevation" drop shadow on ALL FOUR sides, biased downward so the
     // bottom reads heavier than the top (key light from above). The shadow is
     // cast by the window+border rect shifted down by SHADOW_OFFY; per-pixel
@@ -1854,8 +1851,15 @@ fn renderWindow(idx: u8) void {
             var px: i32 = ol - SHADOW_R;
             while (px < orr + SHADOW_R) : (px += 1) {
                 if (px < 0 or px >= tw) continue;
-                // Skip the window's own footprint — chrome paints over it below.
-                if (px >= ol and px < orr and py >= ot and py < ob) continue;
+                // Skip the window's own footprint — chrome paints over it
+                // below. Its corner squares are not skipped: what shows past
+                // the rounded corners lies in the shadow like its surroundings.
+                if (px >= ol and px < orr and py >= ot and py < ob) {
+                    const cr: i32 = CORNER_R;
+                    const in_x = px < ol + cr or px >= orr - cr;
+                    const in_y = py < ot + cr or py >= ob - cr;
+                    if (!(in_x and in_y)) continue;
+                }
                 const dx_i: i32 = if (px < ol) ol - px else if (px >= orr) px - orr + 1 else 0;
                 if (dx_i > SHADOW_R) continue;
                 var a: u32 = shadow_lut[@intCast(dy_i)][@intCast(dx_i)];
@@ -1867,6 +1871,10 @@ fn renderWindow(idx: u8) void {
         }
         w.shadow_dirty = false;
     }
+
+    // What lies behind the rounded corners, shadow included, before the
+    // chrome is drawn over it.
+    saveCornerPixels(w.x - @as(i32, BORDER), w.y - @as(i32, BORDER), w.width + BORDER * 2, w.height + BORDER * 2, ALL_CORNERS);
 
     const border_color = borderColor(w, is_focused);
     gfx.drawRect(w.x - @as(i32, BORDER), w.y - @as(i32, BORDER), w.width + BORDER * 2, w.height + BORDER * 2, border_color);
