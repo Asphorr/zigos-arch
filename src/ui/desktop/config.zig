@@ -68,6 +68,12 @@ fn parseU8Decimal(s: []const u8) ?u8 {
 }
 
 fn applyKv(key: []const u8, val_str: []const u8) void {
+    if (std.mem.eql(u8, key, "utc_offset")) {
+        // Signed minutes east of UTC; lives with the clock, not here.
+        const minutes = std.fmt.parseInt(i32, val_str, 10) catch return;
+        _ = @import("../../time/time.zig").setUtcOffsetMinutes(minutes);
+        return;
+    }
     const val = parseU8Decimal(val_str) orelse return;
     if (std.mem.eql(u8, key, "resolution") and val <= 1) {
         resolution = val;

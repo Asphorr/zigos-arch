@@ -93,6 +93,9 @@ pub fn sysSetConfig(key: u32, value: u32) u32 {
         4 => { // dock position: 0=bottom, 1=top
             if (value <= 1) desktop.conf.dock_pos = @truncate(value);
         },
+        5 => { // UTC offset: signed minutes east, as an i32 bit pattern
+            _ = @import("../../time/time.zig").setUtcOffsetMinutes(@bitCast(value));
+        },
         255 => { // apply
             desktop.config_changed = true;
             // Wake the event-driven compositor so the apply path runs

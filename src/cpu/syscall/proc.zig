@@ -1041,20 +1041,21 @@ pub fn sysExecAs(name_ptr: u32, name_len: u32, remap_ptr: u32) u32 {
 
 // --- Wall-clock time + microsecond sleep (Task #74) ---
 
-/// gettimeofday(buf_ptr) — write { u64 sec, u32 usec } to user buffer. sec is
-/// Unix epoch seconds; usec is microseconds within the current second.
+/// gettimeofday(buf_ptr) — write { u64 sec, u32 usec, i32 utc_offset_min }
+/// to user buffer. sec is Unix epoch seconds (UTC); usec is microseconds
+/// within the current second; utc_offset_min is what local time adds.
 /// Returns 0 on success.
 pub fn sysGettimeofday(buf_ptr: u32) u32 {
     if (!validateUserPtrWrite(buf_ptr, 16)) return E_FAULT;
     const time = @import("../../time/time.zig");
     const t = time.now();
     const out: [*]u8 = @ptrFromInt(@as(usize, buf_ptr));
-    // Write u64 sec at offset 0, u32 usec at offset 8. Pad u32 at 12 stays
-    // whatever was there — caller only reads the first 12 bytes meaningfully.
     const sec_ptr: *align(1) u64 = @ptrCast(out);
     const usec_ptr: *align(1) u32 = @ptrCast(out + 8);
+    const off_ptr: *align(1) i32 = @ptrCast(out + 12);
     sec_ptr.* = t.sec;
     usec_ptr.* = t.usec;
+    off_ptr.* = time.utcOffsetMinutes();
     return 0;
 }
 

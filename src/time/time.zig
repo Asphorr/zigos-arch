@@ -249,3 +249,65 @@ inline fn restoreIrq(flags: u64) void {
 pub fn realtimeNanos() u64 {
     return boot_unix_sec * 1_000_000_000 + monotonicNanos();
 }
+
+// --- Local time ---
+
+/// Local time is UTC plus this many minutes, east positive. Set from
+/// /etc/zigos.conf and the Settings app; there is no DST.
+var utc_offset_min: i32 = 0;
+
+pub const UTC_OFFSET_MIN: i32 = -12 * 60;
+pub const UTC_OFFSET_MAX: i32 = 14 * 60;
+
+pub fn utcOffsetMinutes() i32 {
+    return @atomicLoad(i32, &utc_offset_min, .monotonic);
+}
+
+/// False, with nothing changed, for an offset no zone has.
+pub fn setUtcOffsetMinutes(minutes: i32) bool {
+    if (minutes < UTC_OFFSET_MIN or minutes > UTC_OFFSET_MAX) return false;
+    @atomicStore(i32, &utc_offset_min, minutes, .monotonic);
+    return true;
+}
+
+/// `utc` moved to local time. A date the RTC never had set (month or day 0)
+/// keeps its date fields; only the time of day moves.
+pub fn toLocal(utc: rtc.DateTime) rtc.DateTime {
+    const off = utcOffsetMinutes();
+    if (off == 0) return utc;
+    const secs: i32 = @as(i32, utc.hour) * 3600 + @as(i32, utc.minute) * 60 + utc.second + off * 60;
+    const tod: u32 = @intCast(@mod(secs, 86400));
+    var out = utc;
+    out.hour = @intCast(tod / 3600);
+    out.minute = @intCast(tod % 3600 / 60);
+    out.second = @intCast(tod % 60);
+    const day_shift = @divFloor(secs, 86400);
+    if (day_shift != 0 and utc.month >= 1 and utc.month <= 12 and utc.day >= 1) {
+        const date = civilFromDays(daysFromCivil(utc.year, utc.month, utc.day) + day_shift);
+        out.year = date.year;
+        out.month = date.month;
+        out.day = date.day;
+    }
+    return out;
+}
+
+/// Inverse of daysFromCivil (same algorithm family); sets the date fields only.
+fn civilFromDays(days: i64) rtc.DateTime {
+    const z = days + 719468;
+    const era = @divFloor(z, 146097);
+    const doe: u64 = @intCast(z - era * 146097); // [0, 146096]
+    const yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
+    const doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    const mp = (5 * doy + 2) / 153; // [0, 11]
+    const day = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    const month = if (mp < 10) mp + 3 else mp - 9; // [1, 12]
+    const year = @as(i64, @intCast(yoe)) + era * 400 + @intFromBool(month <= 2);
+    return .{
+        .year = @intCast(year),
+        .month = @intCast(month),
+        .day = @intCast(day),
+        .hour = 0,
+        .minute = 0,
+        .second = 0,
+    };
+}

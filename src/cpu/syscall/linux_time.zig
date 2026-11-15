@@ -101,7 +101,7 @@ pub fn clockGetres(clock: u64, res_va: u64) u64 {
     return 0;
 }
 
-/// gettimeofday(tv, tz). The timezone is UTC, no DST.
+/// gettimeofday(tv, tz). tz is { minutes west of UTC, DST kind }; no DST.
 pub fn gettimeofday(tv_va: u64, tz_va: u64) u64 {
     if (tv_va != 0) {
         if (!common.validateUserPtrWriteAligned(tv_va, @sizeOf(Timeval), 8)) return err(EFAULT);
@@ -110,7 +110,7 @@ pub fn gettimeofday(tv_va: u64, tz_va: u64) u64 {
     }
     if (tz_va != 0) {
         if (!common.validateUserPtrWriteAligned(tz_va, 8, 4)) return err(EFAULT);
-        @as(*[2]i32, @ptrFromInt(tz_va)).* = .{ 0, 0 };
+        @as(*[2]i32, @ptrFromInt(tz_va)).* = .{ -time.utcOffsetMinutes(), 0 };
     }
     return 0;
 }
