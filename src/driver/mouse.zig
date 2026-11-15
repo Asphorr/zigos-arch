@@ -13,7 +13,27 @@ const RESEND: u8 = 0xFE;
 pub var x: i32 = 640;
 pub var y: i32 = 360;
 pub var buttons: u8 = 0;
+/// Press edges per button since the desktop last drained them. A press and
+/// its release can both land between two desktop frames (a tap click, a
+/// double click during a slow frame); `buttons` then never shows them.
+/// Producers count through setButtons from IRQ context; the desktop drains
+/// each counter with an atomic swap and replays the clicks.
+pub var press_count: [3]u8 = .{ 0, 0, 0 };
 pub var moved: bool = false;
+
+/// Publish a new button level, counting each press edge.
+pub fn setButtons(new: u8) void {
+    const rising = new & ~buttons;
+    inline for (0..3) |b| {
+        if (rising & (@as(u8, 1) << b) != 0) _ = @atomicRmw(u8, &press_count[b], .Add, 1, .monotonic);
+    }
+    buttons = new;
+}
+
+/// True while a counted press waits for the desktop.
+pub fn pressPending() bool {
+    return (press_count[0] | press_count[1] | press_count[2]) != 0;
+}
 // Accumulated deltas since last read (for FPS-style mouse input)
 pub var accum_dx: i32 = 0;
 pub var accum_dy: i32 = 0;
@@ -314,7 +334,7 @@ fn processPacket() void {
     // Standard / IntelliMouse path.
     if (mouse_bytes[0] & 0xC0 != 0) return; // overflow → likely desync, drop
 
-    buttons = mouse_bytes[0] & 0x07;
+    setButtons(mouse_bytes[0] & 0x07);
 
     var dx: i32 = @intCast(mouse_bytes[1]);
     var dy: i32 = @intCast(mouse_bytes[2]);
@@ -447,7 +467,7 @@ fn processSynapticsPacket() void {
 
     // Final button state visible to the desktop: real hardware buttons,
     // OR'd with any pending synthetic click for one packet.
-    buttons = real_btns | syn_synth_click;
+    setButtons(real_btns | syn_synth_click);
     if (syn_synth_click != 0) {
         // Arm the release: handleIRQ publishes it on the next aux byte.
         syn_synth_click = 0;

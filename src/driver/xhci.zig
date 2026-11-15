@@ -2752,7 +2752,7 @@ fn processMouseReport(data: [*]volatile const u8) void {
     const dy: i32 = @as(i32, @as(i8, @bitCast(data[2])));
 
     const prev_buttons = mouse.buttons;
-    mouse.buttons = buttons & 0x07;
+    mouse.setButtons(buttons & 0x07);
     const buttons_changed = mouse.buttons != prev_buttons;
 
     if (dx != 0 or dy != 0) {
@@ -2794,7 +2794,7 @@ fn processTabletReport(data: [*]volatile const u8) void {
     const prev_x = mouse.x;
     const prev_y = mouse.y;
 
-    mouse.buttons = buttons & 0x07;
+    mouse.setButtons(buttons & 0x07);
 
     const sw: u32 = @intCast(mouse.screen_w);
     const sh: u32 = @intCast(mouse.screen_h);
