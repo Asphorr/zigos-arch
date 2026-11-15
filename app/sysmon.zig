@@ -109,7 +109,7 @@ pub fn tick(win: *app.Window) void {
 fn sample() void {
     shown.uptime_s = libc.uptime() / 100;
 
-    var procs: [32]libc.ProcInfo = undefined;
+    var procs: [libc.MAX_PROCS]libc.ProcInfo = undefined;
     const n = libc.processList(&procs);
     shown.procs = n;
     shown.running = 0;

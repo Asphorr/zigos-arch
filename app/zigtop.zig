@@ -138,7 +138,7 @@ fn drawSparkline(canvas: *gfx.Canvas, x: u32, y: u32, w: u32, h: u32) void {
 
 // === Process list — sort top-N by CPU% ===
 
-const MAX_PROCS: u32 = 32;
+const MAX_PROCS: u32 = libc.MAX_PROCS;
 const TOP_N: u32 = 12;
 
 const Row = struct {
@@ -175,7 +175,7 @@ fn collectProcs() void {
         rows_count += 1;
     }
     // Insertion sort by cpu_pct descending, then rss_kb descending. With
-    // <= 32 entries the O(n²) is fine.
+    // at most MAX_PROCS entries the O(n²) is fine.
     var i: u32 = 1;
     while (i < rows_count) : (i += 1) {
         var j = i;

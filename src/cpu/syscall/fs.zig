@@ -308,28 +308,43 @@ pub fn sysChdir(path_ptr: u32) u32 {
     }
     if (path_len == 0 or path_len >= 256) return E_NAMETOOLONG;
 
+    changeDir(pcb, path_buf[0..path_len]) catch |e| return switch (e) {
+        error.NotFound => E_NOENT,
+        error.Invalid, error.NotDir => E_INVAL,
+    };
+    return 0;
+}
+
+pub const ChdirError = error{ Invalid, NotFound, NotDir };
+
+/// Make `path` (absolute, or relative to the cwd) the cwd of `pcb`. Shared
+/// by the native chdir and the Linux chdir/fchdir.
+pub fn changeDir(pcb: *process.PCB, path: []const u8) ChdirError!void {
+    if (path.len == 0) return error.Invalid;
+
     // Build the absolute candidate. Relative paths get the current cwd
     // prepended (cwd is stored with a trailing '/' so concatenation is
     // straightforward — see the trailing-slash invariant below).
     var abs: [256]u8 = undefined;
     var abs_len: usize = 0;
-    if (path_buf[0] == '/') {
-        @memcpy(abs[0..path_len], path_buf[0..path_len]);
-        abs_len = path_len;
+    if (path[0] == '/') {
+        if (path.len > abs.len) return error.Invalid;
+        @memcpy(abs[0..path.len], path);
+        abs_len = path.len;
     } else {
         const cwd = pcb.cwd[0..pcb.cwd_len];
-        if (cwd.len == 0) return E_INVAL;
+        if (cwd.len == 0) return error.Invalid;
         const need_sep = cwd[cwd.len - 1] != '/';
-        const need = cwd.len + path_len + (if (need_sep) @as(usize, 1) else 0);
-        if (need > 256) return E_INVAL;
+        const need = cwd.len + path.len + (if (need_sep) @as(usize, 1) else 0);
+        if (need > 256) return error.Invalid;
         @memcpy(abs[0..cwd.len], cwd);
         abs_len = cwd.len;
         if (need_sep) {
             abs[abs_len] = '/';
             abs_len += 1;
         }
-        @memcpy(abs[abs_len..][0..path_len], path_buf[0..path_len]);
-        abs_len += path_len;
+        @memcpy(abs[abs_len..][0..path.len], path);
+        abs_len += path.len;
     }
 
     // Normalize: strip duplicate slashes, drop "." components, and resolve
@@ -337,13 +352,13 @@ pub fn sysChdir(path_ptr: u32) u32 {
     // component is clamped (stays at the mount root) instead of escaping
     // up to "/", which has no mount and would always fail.
     abs_len = normalizePath(&abs, abs_len);
-    if (abs_len == 0) return E_INVAL;
+    if (abs_len == 0) return error.Invalid;
 
     // Trailing-slash invariant: cwd always ends with '/' so resolvePath's
     // relative-path concat ("cwd + child") doesn't produce missing or
     // doubled separators.
     if (abs[abs_len - 1] != '/') {
-        if (abs_len >= 256) return E_INVAL;
+        if (abs_len >= 256) return error.Invalid;
         abs[abs_len] = '/';
         abs_len += 1;
     }
@@ -355,7 +370,7 @@ pub fn sysChdir(path_ptr: u32) u32 {
     //      resolved fs confirms the path is an existing directory.
     if (!vfs.isMountRoot(abs[0..abs_len])) {
         var rb: [256]u8 = undefined;
-        const r = vfs.resolvePath(pcb, abs[0 .. abs_len - 1], &rb) orelse return E_NOENT;
+        const r = vfs.resolvePath(pcb, abs[0 .. abs_len - 1], &rb) orelse return error.NotFound;
         // Per-fs existence check. tarfs is flat (no real subdirs) so we
         // accept any junk and let later opens fail — matches historical
         // behavior. Other filesystems can verify, so they do.
@@ -363,27 +378,28 @@ pub fn sysChdir(path_ptr: u32) u32 {
             .tarfs => {},
             .fat32 => {
                 const fat32 = @import("../../fs/fat32.zig");
-                if (fat32.resolveDirCluster(r.path) == null) return E_INVAL;
+                if (fat32.resolveDirCluster(r.path) == null) return error.NotDir;
             },
             .devfs => {
                 // devfs has no subdirectories — any non-empty path is a file.
-                return E_INVAL;
+                return error.NotDir;
             },
             .procfs => {
                 const procfs = @import("../../fs/procfs.zig");
-                if (!procfs.isDirectory(r.path)) return E_INVAL;
+                if (!procfs.isDirectory(r.path)) return error.NotDir;
             },
             .ext2 => {
                 const ext2 = @import("../../fs/ext2/ext2.zig");
-                if (ext2.resolveDirInum(r.path) == null) return E_INVAL;
+                if (ext2.resolveDirInum(r.path) == null) {
+                    return if (ext2.lookupPath(r.path) == null) error.NotFound else error.NotDir;
+                }
             },
         }
     }
 
-    if (abs_len > pcb.cwd.len) return E_INVAL;
+    if (abs_len > pcb.cwd.len) return error.Invalid;
     @memcpy(pcb.cwd[0..abs_len], abs[0..abs_len]);
     pcb.cwd_len = @intCast(abs_len);
-    return 0;
 }
 
 /// Collapse `.` and `..` components and duplicate slashes in an absolute

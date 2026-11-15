@@ -258,6 +258,11 @@ export fn handleException(rsp: u64) callconv(.c) void {
         }
     }
 
+    // A syscall body's write to a user page that went copy-on-write after it
+    // was validated (a sibling thread forked): resolved as a ring-3 fault is.
+    if (int_no == 14 and (saved_cs & 3) == 0 and
+        process.handleKernelWriteFault(@intCast(readCr2()), error_code, stack[19])) return;
+
     // Breadcrumb: vec in high 32, pid in low 32. Stamped before the NMI
     // fast-path return so even NMI-snapshotted CPUs leave a trace.
     {

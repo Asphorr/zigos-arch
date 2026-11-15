@@ -10,12 +10,12 @@ const smp = @import("../cpu/smp.zig");
 pub const Phys = @import("../util/addr.zig").Phys;
 
 const FRAME_SIZE: u32 = 4096;
-// 1 GB cap: bitmap = 32 KB, frame_refs = 256 KB. ZigOS QEMU configs use
-// 64-256 MB so 1 GB is far more than needed; the cap exists to keep static
-// BSS small enough that _kernel_end stays below GUEST_FB_BASE.
-// Frames above 1 GB in the memory map are skipped at init time with a
-// warning — bump this if a config ever genuinely wants more RAM exposed.
-const MAX_FRAMES: u32 = 256 * 1024;
+// 4 GB cap: bitmap = 128 KB, frame_refs = 1 MB of BSS (_kernel_end must
+// stay below GUEST_FB_BASE). Frames above it in the memory map are skipped
+// at init time with a warning. 4 GB is as far as it goes without more
+// work: see the Below4G note in the comptime block below. A kernel build
+// inside ZigOS peaks at 1.5 GB in the compiler alone.
+const MAX_FRAMES: u32 = 1024 * 1024;
 const BITMAP_SIZE = MAX_FRAMES / 32;
 
 // === Region-bucketed bitmap with per-CPU affinity + a per-region index ===
@@ -38,7 +38,7 @@ const BITMAP_SIZE = MAX_FRAMES / 32;
 //      refill and contiguous alloc start at the preferred region and walk
 //      outward over the regions that hold RAM, skipping full ones by hint.
 const REGION_FRAMES: u32 = 1024; // 4 MB per region
-const REGIONS_COUNT: u32 = MAX_FRAMES / REGION_FRAMES; // 256
+const REGIONS_COUNT: u32 = MAX_FRAMES / REGION_FRAMES; // 1024
 const REGION_WORDS: u32 = REGION_FRAMES / 32; // bitmap words per region
 
 const fi = @import("frame_index.zig");
@@ -67,6 +67,7 @@ comptime {
 /// exactly like the summary, but it cannot move into the blob: one array,
 /// region-striped.
 var regions: [REGIONS_COUNT]Guarded(fi.Summary) = blk: {
+    @setEvalBranchQuota(REGIONS_COUNT * 8);
     var arr: [REGIONS_COUNT]Guarded(fi.Summary) = undefined;
     for (&arr) |*r| r.* = .init(.{});
     break :blk arr;

@@ -1509,7 +1509,7 @@ pub fn consumeGatedPickSkip(cpu_id: u8) bool {
 /// if the queue has no eligible pid.
 ///
 /// Ties broken by FIFO position (smaller index = earlier-enqueued).
-/// O(N) where N <= MAX_PROCS (64) per queue — fine without an rb-tree.
+/// O(N) where N <= MAX_PROCS per queue — fine without an rb-tree.
 fn pickMinVruntime(q: *const runqueue.PriQueue, exclude_pid: ?u8) ?u8 {
     var best: ?u8 = null;
     var best_vr: u64 = std.math.maxInt(u64);

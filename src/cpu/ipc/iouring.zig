@@ -47,6 +47,7 @@ const memmap = @import("../../mm/memmap.zig");
 const heap = @import("../../mm/heap.zig");
 const nvme = @import("../../driver/nvme.zig");
 const spinlock = @import("../../proc/spinlock.zig");
+const pid_set = @import("../../util/pid_set.zig");
 
 const common = @import("../syscall/common.zig");
 const E_INVAL = common.E_INVAL;
@@ -211,13 +212,9 @@ const Instance = struct {
     /// round-trip), turning a single wait into N × round-trip latency.
     /// 0 means "no one is parked / no waiter cares" — worker skips the wake.
     cq_min_complete: u32 = 0, // (a) enter() writes before park, worker reads
-    /// Bit per pid waiting in enter() for completions (wakeCqWaiters).
-    cq_waiters: u64 = 0, // (a)
+    /// Tasks waiting in enter() for completions (wakeCqWaiters).
+    cq_waiters: pid_set.AtomicPidSet = .{}, // (a)
 };
-
-comptime {
-    if (process.MAX_PROCS > 64) @compileError("Instance.cq_waiters keeps one bit per pid in a u64");
-}
 
 /// Wake `inst_id`'s worker by pid. wake() sets its wake_pending whatever its
 /// state, so a completion that lands after the worker found nothing to do and
@@ -231,13 +228,13 @@ fn wakeWorker(inst_id: usize) void {
 }
 
 /// Wake, by pid and for the same reason, every task waiting in enter() on
-/// `inst_id`. The OR of zero is a locked RMW: it orders the caller's
-/// preceding cq_tail store before the read of the waiter set, against
-/// enter()'s publish-bit-then-read-cq_tail.
+/// `inst_id`. The set's locked RMW orders the caller's preceding cq_tail
+/// store before the read of the waiter set, against enter()'s
+/// publish-bit-then-read-cq_tail.
 fn wakeCqWaiters(inst_id: usize) void {
     if (inst_id >= MAX_INSTANCES_TOTAL) return;
-    var m = @atomicRmw(u64, &instances[inst_id].cq_waiters, .Or, 0, .seq_cst);
-    while (m != 0) : (m &= m - 1) process.wake(@intCast(@ctz(m)));
+    var it = instances[inst_id].cq_waiters.members();
+    while (it.next()) |pid| process.wake(@intCast(pid));
 }
 
 var instances: [MAX_INSTANCES_TOTAL]Instance = [_]Instance{.{}} ** MAX_INSTANCES_TOTAL;
@@ -1110,9 +1107,9 @@ pub fn enter(user_va: u32, to_submit: u32, min_complete: u32) u32 {
         defer @atomicStore(u32, &inst.cq_min_complete, 0, .release);
         // Completions wake waiters by pid (wakeCqWaiters): publish ours
         // before the first look at cq_tail.
-        const bit = @as(u64, 1) << @intCast(process.getCurrentPid());
-        _ = @atomicRmw(u64, &inst.cq_waiters, .Or, bit, .seq_cst);
-        defer _ = @atomicRmw(u64, &inst.cq_waiters, .And, ~bit, .seq_cst);
+        const self_pid = process.getCurrentPid();
+        inst.cq_waiters.enter(self_pid);
+        defer inst.cq_waiters.leave(self_pid);
 
         while (true) {
             const cq_tail = @atomicLoad(u32, &hdr.cq_tail, .acquire);

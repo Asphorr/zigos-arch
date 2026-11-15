@@ -21,17 +21,22 @@
 // preserve the TLB. Cross-CPU TLB shootdowns also bump the generation
 // (see `bumpGen`) so peers flush before their next load.
 //
-// Sizing: MAX_PCID = 128 covers MAX_PROCS=64 with headroom
-// even under heavy fork/exec churn. Memory cost: 128 × 4 = 0.5 KB
-// global generation + 32 × 128 × 4 = 16 KB per-CPU generation. Cheap.
+// Sizing: MAX_PCID = 256 covers MAX_PROCS=128 with headroom
+// even under heavy fork/exec churn. Memory cost: 256 × 4 = 1 KB
+// global generation + 32 × 256 × 4 = 32 KB per-CPU generation. Cheap.
 
 const std = @import("std");
 const protect = @import("../arch/protect.zig");
 const smp = @import("../smp.zig");
 const debug = @import("../../debug/debug.zig");
 const spinlock = @import("../../proc/spinlock.zig");
+const config = @import("../../config.zig");
 
-pub const MAX_PCID: u16 = 128;
+pub const MAX_PCID: u16 = 256;
+
+comptime {
+    if (MAX_PCID < 2 * config.MAX_PROCS) @compileError("MAX_PCID wants twice MAX_PROCS: exec holds two address spaces for one slot while it swaps images");
+}
 
 var alloc_lock: spinlock.SpinLock = .{};
 var in_use: [MAX_PCID]bool = [_]bool{false} ** MAX_PCID;

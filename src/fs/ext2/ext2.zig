@@ -14,6 +14,7 @@ const path_cache = @import("../path_cache.zig");
 const time = @import("../../time/time.zig");
 const debug = @import("../../debug/debug.zig");
 const page_cache = @import("../../mm/page_cache.zig");
+const Phys = @import("../../util/addr.zig").Phys;
 
 /// Path-cached `walkPath`. Saves the full root → leaf directory walk on
 /// repeat opens of the same path (httpd serving static files, shell
@@ -323,8 +324,9 @@ pub fn writeFile(handle: *Handle, src: [*]const u8, count: u32) u32 {
 ///      are simply not persisted). So `ino.size` is left untouched.
 /// mtime/ctime are intentionally not bumped (that would cost an inode write per
 /// page) — writeback is a pure data persist of blocks the file already owns.
-/// `page_off` must be page-aligned. Returns bytes written.
-pub fn writebackPage(inum: u32, page_off: u64, src: [*]const u8) u32 {
+/// `page_off` must be page-aligned; `frame` is the cache frame the caller
+/// pinned, `src` its bytes. Returns bytes written.
+pub fn writebackPage(inum: u32, page_off: u64, frame: Phys, src: [*]const u8) u32 {
     const m = block.getMount() orelse return 0;
     // Whole-op hold — same reasoning as writeFile (sparse-hole fill mutates
     // the block map + bitmaps).
@@ -332,6 +334,10 @@ pub fn writebackPage(inum: u32, page_off: u64, src: [*]const u8) u32 {
     defer block.unlockMount(m);
     block.beginMetaDefer(m);
     defer block.endMetaDefer(m);
+    // Pinned with no lock held: since then the file may have been truncated,
+    // or unlinked and its inode given to a new file. Both drop the page from
+    // the cache under this lock, so a page still cached is still this file's.
+    if (!page_cache.holds(page_cache.ext2FileId(inum), page_off, frame)) return 0;
     var ino = inode.readInode(inum) orelse return 0;
     if (!inode.isReg(&ino)) return 0;
     const fsize = inode.fileSize(&ino);
@@ -820,11 +826,20 @@ pub fn truncate(inum: u32) bool {
     return inode.writeInode(inum, &ino);
 }
 
+/// The most bytes the block map of a file addresses: the 12 direct blocks
+/// and the three indirect trees. 0 with nothing mounted.
+pub fn maxFileSize() u64 {
+    const m = block.getMount() orelse return 0;
+    const p: u64 = m.block_size / 4;
+    return (layout.N_DIRECT + p + p * p + p * p * p) * m.block_size;
+}
+
 /// Set regular file `inum` to `size` bytes, as ftruncate: growing leaves a
 /// hole (reads as zeros), shrinking frees the blocks past the end and zeroes
 /// the rest of the last one, so growing again reads zeros there too.
 pub fn truncateTo(inum: u32, size: u64) Error!void {
     if (size == 0) return if (truncate(inum)) {} else error.Busy;
+    if (size > maxFileSize()) return error.Invalid;
     if (@import("../../proc/process.zig").isTextBusy(inum)) return error.Busy;
     const m = block.getMount() orelse return error.Io;
     block.lockMount(m);
@@ -848,6 +863,11 @@ pub fn truncateTo(inum: u32, size: u64) Error!void {
         }
         const page_from = size & ~@as(u64, 0xFFF);
         _ = page_cache.invalidateRange(page_cache.ext2FileId(inum), page_from, old - page_from);
+    } else if (size > old) {
+        // What was cached at or past the old end (a mapping reaches past
+        // EOF) must not become the new bytes: they read as zeros.
+        const page_from = old & ~@as(u64, 0xFFF);
+        _ = page_cache.invalidateRange(page_cache.ext2FileId(inum), page_from, size - page_from);
     }
     ino.size = @truncate(size);
     ino.dir_acl = @truncate(size >> 32); // size-high bits

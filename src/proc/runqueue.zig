@@ -19,7 +19,7 @@ const SpinLock = @import("spinlock.zig").SpinLock;
 /// Fixed-cap FIFO of pids. count <= MAX_PROCS by construction (each
 /// pid appears in at most one PriQueue at a time). Append at tail,
 /// pop from head, linear-scan remove. O(MAX_PROCS) for remove is fine
-/// at MAX_PROCS = 64.
+/// at MAX_PROCS = 128.
 ///
 /// Sentinel 0xFF in unused slots so a stale read past `count` is
 /// obvious in debugger dumps (a real pid would be 0..MAX_PROCS-1).

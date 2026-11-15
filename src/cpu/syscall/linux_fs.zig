@@ -19,6 +19,8 @@ const vfs = @import("../../fs/vfs.zig");
 const ext2 = @import("../../fs/ext2/ext2.zig");
 const ext2_inode = @import("../../fs/ext2/inode.zig");
 const common = @import("common.zig");
+const native_fs = @import("fs.zig");
+const usercopy = @import("../arch/usercopy.zig");
 
 // Linux errno.
 const ENOENT: i64 = 2;
@@ -33,6 +35,7 @@ const EISDIR: i64 = 21;
 const EINVAL: i64 = 22;
 const EMFILE: i64 = 24;
 const ETXTBSY: i64 = 26;
+const EFBIG: i64 = 27;
 const ENOSPC: i64 = 28;
 const EROFS: i64 = 30;
 const ENAMETOOLONG: i64 = 36;
@@ -507,6 +510,7 @@ const DentSink = struct {
         put64(rec + 8, it.next); // d_off: where the next entry starts
         @as(*align(1) u16, @ptrCast(rec + 16)).* = @intCast(reclen);
         rec[18] = dtypeOf(it.file_type);
+        if (rec[18] == DT_UNKNOWN) rec[18] = dtypeOfInode(it.inum);
         @memcpy(rec[19..][0..it.name.len], it.name);
         @memset(rec[19 + it.name.len .. reclen], 0); // NUL + padding
         self.used += reclen;
@@ -514,22 +518,35 @@ const DentSink = struct {
     }
 };
 
+/// Most bytes of records one getdents64 call returns: its kernel-stack
+/// buffer. A record is at most 280 bytes, so a call always makes progress.
+const DENTS_CHUNK: usize = 4096;
+
 /// getdents64(fd, buf, count) over an ext2 directory fd, with "." and "..".
 /// The fd offset is the byte position of the next entry in the directory.
+/// Records are built in a kernel buffer and copied out afterwards, so the
+/// user buffer is never written while the directory is being read.
 pub fn getdents64(fd: u64, buf_va: u64, count: u64) u64 {
     const pcb = proc() orelse return err(EFAULT);
     const fe = fdEntry(pcb, fd) orelse return err(EBADF);
     if (fe.fs_type != .ext2 or !isDirInode(fe.inode)) return err(ENOTDIR);
-    // A record is at most 280 bytes; don't validate (and map) more buffer
-    // than a few hundred of them need.
-    const cap: usize = @intCast(@min(count, 64 * 1024));
+    const cap: usize = @intCast(@min(count, DENTS_CHUNK));
     if (cap < 24) return err(EINVAL);
-    if (!common.validateUserPtrWrite(buf_va, cap)) return err(EFAULT);
-    var sink = DentSink{ .out = @ptrFromInt(buf_va), .cap = cap };
+    var kbuf: [DENTS_CHUNK]u8 = undefined;
+    var sink = DentSink{ .out = &kbuf, .cap = cap };
     const next = ext2.iterDir(fe.inode, fe.offset, &sink) orelse return err(EIO);
     if (sink.used == 0 and next < dirSize(fe.inode)) return err(EINVAL); // the next entry doesn't fit
+    if (!usercopy.copyToUser(buf_va, kbuf[0..sink.used])) return err(EFAULT);
     fe.offset = @intCast(next);
     return sink.used;
+}
+
+/// d_type from the inode, for a directory whose entries carry no type (a
+/// filesystem made without the filetype feature). Programs that walk trees
+/// by d_type alone would otherwise see nothing they recognise.
+fn dtypeOfInode(inum: u32) u8 {
+    const ino = ext2_inode.readInode(inum) orelse return DT_UNKNOWN;
+    return @truncate((ino.mode >> 12) & 0xF);
 }
 
 fn dirSize(inum: u32) u64 {
@@ -623,6 +640,38 @@ pub fn faccessat(dirfd: u64, path_va: u64) u64 {
     };
 }
 
+/// chdir(path): the cwd of the process, shared by its threads.
+pub fn chdir(path_va: u64) u64 {
+    const pcb = proc() orelse return err(EFAULT);
+    var buf: [256]u8 = undefined;
+    const path = switch (readPath(path_va, &buf, false)) {
+        .path => |p| p,
+        .fail => |e| return e,
+    };
+    return chdirTo(pcb, path);
+}
+
+/// fchdir(fd): chdir to the directory `fd` has open.
+pub fn fchdir(fd: u64) u64 {
+    const pcb = proc() orelse return err(EFAULT);
+    if (fd == AT_FDCWD) return err(EBADF);
+    var buf: [256]u8 = undefined;
+    const path = switch (atPath(pcb, fd, "", &buf)) {
+        .path => |p| p,
+        .fail => |e| return e,
+    };
+    return chdirTo(pcb, path);
+}
+
+fn chdirTo(pcb: *process.PCB, path: []const u8) u64 {
+    native_fs.changeDir(pcb, path) catch |e| return err(switch (e) {
+        error.NotFound => ENOENT,
+        error.NotDir => ENOTDIR,
+        error.Invalid => ENAMETOOLONG,
+    });
+    return 0;
+}
+
 /// The target of the /proc/<pid>/exe-style link `path` names, if it is one:
 /// /proc/self/exe, /proc/thread-self/exe and /proc/<pid>/exe.
 fn exeLink(pcb: *process.PCB, path: []const u8) ?[]const u8 {
@@ -675,6 +724,7 @@ pub fn ftruncate(fd: u64, length: u64) u64 {
     const fe = fdEntry(pcb, fd) orelse return err(EBADF);
     if (@as(i64, @bitCast(length)) < 0) return err(EINVAL);
     if (fe.fs_type != .ext2) return err(EINVAL);
+    if (length > ext2.maxFileSize()) return err(EFBIG);
     ext2.truncateTo(fe.inode, length) catch |e| return errOf(e);
     return 0;
 }
@@ -693,6 +743,7 @@ pub fn truncate(path_va: u64, length: u64) u64 {
         .missing => return err(ENOENT),
         .other => return err(EROFS),
     };
+    if (length > ext2.maxFileSize()) return err(EFBIG);
     ext2.truncateTo(inum, length) catch |e| return errOf(e);
     return 0;
 }

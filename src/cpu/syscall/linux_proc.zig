@@ -216,8 +216,13 @@ pub fn wait4(pid_arg: u64, status_va: u64, options: u64, rusage_va: u64) u64 {
     while (true) {
         var st: u32 = 0;
         if (reapChild(group, target, &st)) |z| {
-            if (status_va != 0) @as(*u32, @ptrFromInt(status_va)).* = st;
-            if (rusage_va != 0) @memset(@as([*]u8, @ptrFromInt(rusage_va))[0..RUSAGE_BYTES], 0);
+            // Faultable copies: the pages were checked before the wait, and
+            // a sibling thread's fork since makes them copy-on-write again.
+            if (status_va != 0 and !usercopy.copyToUser(status_va, std.mem.asBytes(&st))) return err(EFAULT);
+            if (rusage_va != 0) {
+                const zero = [_]u8{0} ** RUSAGE_BYTES;
+                if (!usercopy.copyToUser(rusage_va, &zero)) return err(EFAULT);
+            }
             return z;
         }
         if (!hasChild(group, target)) return err(ECHILD);
@@ -271,6 +276,19 @@ pub fn kill(pid_arg: u64, sig_arg: u64) u64 {
     if (sig == 0 or defaultIgnored(sig)) return 0;
     lifecycle.killThreadGroup(t.tgid, KILLED_BY | sig);
     return 0;
+}
+
+/// tkill(tid, sig): a signal for one thread. Without handlers every signal
+/// takes its default, and a fatal default ends the whole process, so this
+/// is kill() on the thread's process. abort() raises SIGABRT this way.
+pub fn tkill(tid: u64, sig: u64) u64 {
+    return kill(tid, sig);
+}
+
+/// tgkill(tgid, tid, sig): tkill that also names the thread's process.
+pub fn tgkill(tgid: u64, tid: u64, sig: u64) u64 {
+    if (tid < process.MAX_PROCS and process.procs[tid].tgid != tgid) return err(ESRCH);
+    return kill(tid, sig);
 }
 
 // --- pipes and fds -----------------------------------------------------------

@@ -149,7 +149,7 @@ fn padHex(n: u32, width: usize) void {
 }
 
 export fn _start() linksection(".text.entry") callconv(.c) void {
-    var procs: [32]libc.ProcInfo = undefined;
+    var procs: [libc.MAX_PROCS]libc.ProcInfo = undefined;
     const n = libc.processList(&procs);
     if (n == 0) {
         libc.print("ps: no processes (or syscall failed)\n");

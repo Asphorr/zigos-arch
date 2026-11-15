@@ -27,6 +27,12 @@ const Case = struct {
     timeout_ms: u32 = 60_000,
     /// Not built with the kernel: skipped when the image doesn't have it.
     optional: bool = false,
+    /// Another file an optional case needs in the image.
+    needs: []const u8 = "",
+    /// Run once and judge the exit status alone: a job of minutes whose
+    /// repeat would redo the work (the kernel build mints a new build id
+    /// every time).
+    once: bool = false,
 };
 
 const CASES = [_]Case{
@@ -38,7 +44,20 @@ const CASES = [_]Case{
     // The official Zig compiler (static musl, 172 MB), stamped OSABI 3 and
     // written into ext2.img by hand.
     .{ .path = "/bin/zig", .args = "version", .timeout_ms = 120_000, .optional = true },
+    // ZigOS building its own kernel: the tree from tools/add_tree_to_image.sh
+    // and /bin/nasm from tools/build_static_nasm.sh. The kernel lands in
+    // /work/zigos/zig-out/bin/kernel.elf.
+    .{
+        .path = "/bin/zig",
+        .args = "build kernel --build-file " ++ SELF_TREE ++ "/build.zig -Doptimize=ReleaseSafe",
+        .timeout_ms = 60 * 60_000,
+        .optional = true,
+        .needs = SELF_TREE ++ "/build.zig",
+        .once = true,
+    },
 };
+
+const SELF_TREE = "/work/zigos";
 
 const WARMUP_RUNS: u32 = 1;
 const COUNTED_RUNS: u32 = 2;
@@ -108,9 +127,11 @@ const STALL_DUMP_MS: u32 = 60_000;
 /// Every Linux task — what it is and what it waits on — with the leads'
 /// fds and the pipes: for a run that stops making progress.
 fn dumpTasks(waited: u32) void {
-    serial.print("[linuxtest] {d} s in; poll sleepers 0x{X}, wait4 sleepers 0x{X}:\n", .{
-        waited / 1000, @import("../cpu/ipc/fdpoll.zig").sleeperMask(), @import("../proc/lifecycle.zig").childWaiterMask(),
-    });
+    serial.print("[linuxtest] {d} s in; poll sleepers", .{waited / 1000});
+    for (@import("../cpu/ipc/fdpoll.zig").sleeperMask()) |w| serial.print(" 0x{X}", .{w});
+    serial.print(", wait4 sleepers", .{});
+    for (@import("../proc/lifecycle.zig").childWaiterMask()) |w| serial.print(" 0x{X}", .{w});
+    serial.print(":\n", .{});
     for (0..process.MAX_PROCS) |i| {
         const p = &process.procs[i];
         if (p.state == .unused or p.personality != .linux) continue;
@@ -227,8 +248,12 @@ pub fn taskEntry() callconv(.c) noreturn {
     serial.print("[linuxtest] {d} program(s), {d} warm-up + {d} counted runs each\n", .{ CASES.len, WARMUP_RUNS, COUNTED_RUNS });
 
     for (CASES) |c| {
-        if (c.optional and vfs.lookupCached(c.path) == null) {
-            serial.print("[linuxtest] SKIP {s}: not in the image\n", .{c.path});
+        if (c.optional and (vfs.lookupCached(c.path) == null or (c.needs.len != 0 and vfs.lookupCached(c.needs) == null))) {
+            serial.print("[linuxtest] SKIP {s} {s}: not in the image\n", .{ c.path, c.args });
+            continue;
+        }
+        if (c.once) {
+            check(c, 0);
             continue;
         }
         var run: u32 = 0;

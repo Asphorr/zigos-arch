@@ -11,7 +11,10 @@
 const std = @import("std");
 
 // --- Process / scheduler ---
-pub const MAX_PROCS: u32 = 64; // kstacks are PMM-backed (see process.kstack_pool) so this no longer bloats BSS; only procs[] (~2KB/proc) grows
+/// Task slots: every thread, kernel threads included, takes one. Sets of
+/// pids are util/pid_set.zig, sized from this. Costs per slot: a PMM-backed
+/// kernel stack (KSTACK_SLOT_SIZE), the PCB and a 4 KiB I/O scratch page.
+pub const MAX_PROCS: u32 = 128;
 pub const MAX_FDS: u32 = 64; // the Zig compiler holds ~25 open at once
 
 /// Per-process kernel stack body size. Plus KSTACK_GUARD_SIZE below it.
@@ -22,7 +25,7 @@ pub const KSTACK_GUARD_SIZE: usize = 4 * 1024;
 pub const KSTACK_SLOT_SIZE: usize = KSTACK_SIZE + KSTACK_GUARD_SIZE;
 
 // --- Pipes ---
-pub const MAX_PIPES: u8 = 32;
+pub const MAX_PIPES: u8 = 64;
 pub const PIPE_BUF_SIZE: u32 = 4096;
 
 // --- Desktop / windowing ---
@@ -66,6 +69,7 @@ pub const ENABLE_DEBUG_CRASH: bool = false;
 // --- Sanity ---
 comptime {
     if (MAX_PROCS < 2) @compileError("MAX_PROCS must be >= 2 (idle + at least one user process)");
+    if (MAX_PROCS > 255) @compileError("pids are stored in u8 fields with 0xFF meaning none");
     if (MAX_FDS < 3) @compileError("MAX_FDS must be >= 3 (stdin/stdout/stderr)");
     if (KSTACK_GUARD_SIZE % 4096 != 0) @compileError("KSTACK_GUARD_SIZE must be a multiple of 4096");
     if (KSTACK_SIZE % 4096 != 0) @compileError("KSTACK_SIZE must be a multiple of 4096");

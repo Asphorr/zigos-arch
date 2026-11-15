@@ -82,6 +82,7 @@ const std = @import("std");
 const smp = @import("../cpu/smp.zig");
 const apic = @import("../time/apic.zig"); // tscPerQuantum; CPU identity is smp.myCpuId()
 const process = @import("process.zig"); // Mutex block/wake integration
+const PidSet = @import("../util/pid_set.zig").PidSet;
 
 // Diagnostics-only — autopsy, tracing, liveness. Nothing in this group
 // affects lock SEMANTICS: a build that stubbed these out would still lock
@@ -861,7 +862,7 @@ fn restoreIrq(flags: u64) void {
 pub const NO_OWNER: u16 = 0xFFFF;
 
 /// Mutex.owner_pid sentinel for holds taken from a context with no
-/// current_pid. Outside the valid pid range (MAX_PROCS=64) and distinct
+/// current_pid. Outside the valid pid range (below MAX_PROCS) and distinct
 /// from NO_OWNER, so forceReleaseIfOwnedBy(real pid) can never match it.
 pub const NO_TASK_OWNER: u16 = 0xFFFE;
 
@@ -1059,7 +1060,8 @@ pub const Mutex = struct {
 // Writer preference: a waiting writer holds new readers off, so a stream of
 // faults can't starve an munmap. A holder therefore must not take the lock
 // again in either mode (a writer queued between a reader's two acquires
-// would deadlock both); every acquire panics on that.
+// would deadlock both); every acquire panics on that. The one reader that
+// passes waiting writers is acquireReadPassingWriters.
 //
 // Holders and waiters are pid bits, so tearDownTask gives back whatever a
 // dying task held or waited for (dropPid).
@@ -1068,24 +1070,20 @@ pub const Mutex = struct {
 // sleepers (thundering herd, as Mutex) and each re-checks under `guard`.
 // =============================================================================
 
-comptime {
-    if (process.MAX_PROCS > 64) @compileError("RwMutex keeps one bit per pid in a u64");
-}
-
 pub const RwMutex = struct {
     /// Guards every field below but `seq` and `holder_ra`. Held for a few
     /// instructions with IRQs off, so tryAcquireRead works from an interrupt.
     guard: SpinLock = .{},
-    /// (p:guard) Bit per pid holding the read side.
-    readers: u64 = 0,
+    /// (p:guard) Pids holding the read side.
+    readers: PidSet = .{},
     /// (p:guard) Pid holding the write side, or NO_OWNER.
     writer: u16 = NO_OWNER,
-    /// (p:guard) Bit per pid waiting for the write side. Any bit holds new
+    /// (p:guard) Pids waiting for the write side. Any of them holds new
     /// readers off.
-    writers_waiting: u64 = 0,
-    /// (p:guard) Bit per pid asleep in an acquire. A release with none set
-    /// skips the wake walk.
-    sleepers: u64 = 0,
+    writers_waiting: PidSet = .{},
+    /// (p:guard) Pids asleep in an acquire. A release with none skips the
+    /// wake walk.
+    sleepers: PidSet = .{},
     /// Bumped by every release, under guard, with an atomic RMW: its full
     /// barrier orders the bump before the release's scan of waiter states,
     /// against the waiter's setState-then-reload in blockOnLockSeq.
@@ -1099,17 +1097,13 @@ pub const RwMutex = struct {
         return @truncate(@intFromPtr(&self.seq));
     }
 
-    fn pidBit(pid: usize) u64 {
-        return @as(u64, 1) << @intCast(pid);
-    }
-
     fn currentPid(comptime what: []const u8) usize {
         return smp.currentPid() orelse @panic("RwMutex." ++ what ++ " outside a task");
     }
 
     /// Under guard: panic if `pid` already holds the lock.
     fn checkNotHeld(self: *RwMutex, pid: usize, flags: u64) void {
-        const reading = self.readers & pidBit(pid) != 0;
+        const reading = self.readers.has(pid);
         if (!reading and self.writer != pid) return;
         self.guard.releaseIrqRestore(flags);
         serial.print("\n!!! RwMutex@0x{X} re-acquired by pid={d}, which holds the {s} side\n", .{
@@ -1121,26 +1115,37 @@ pub const RwMutex = struct {
     /// Under guard: advance seq; true when a sleeper must be woken.
     fn bumpLocked(self: *RwMutex) bool {
         _ = @atomicRmw(u32, &self.seq, .Add, 1, .seq_cst);
-        return self.sleepers != 0;
+        return !self.sleepers.isEmpty();
     }
 
     /// Take the read side, sleeping while a writer holds or waits for the
     /// lock. Task context, IRQs on, no spinlock held. Panics if this task
     /// already holds the lock.
     pub fn acquireRead(self: *RwMutex) void {
+        self.acquireReadImpl(false);
+    }
+
+    /// acquireRead that does not queue behind waiting writers: it sleeps
+    /// only while a writer holds the lock. For a taker that may itself hold
+    /// a sleeping lock some reader is waiting for (a kernel-mode page fault):
+    /// behind a writer that waits for that reader it would never get in.
+    pub fn acquireReadPassingWriters(self: *RwMutex) void {
+        self.acquireReadImpl(true);
+    }
+
+    fn acquireReadImpl(self: *RwMutex, comptime pass_writers: bool) void {
         const pid = currentPid("acquireRead");
-        const bit = pidBit(pid);
         mightSleep(@src());
         while (true) {
             const f = self.guard.acquireIrqSave();
-            self.sleepers &= ~bit;
+            self.sleepers.clear(pid);
             self.checkNotHeld(pid, f);
-            if (self.writer == NO_OWNER and self.writers_waiting == 0) {
-                self.readers |= bit;
+            if (self.writer == NO_OWNER and (pass_writers or self.writers_waiting.isEmpty())) {
+                self.readers.set(pid);
                 self.guard.releaseIrqRestore(f);
                 return;
             }
-            self.sleepers |= bit;
+            self.sleepers.set(pid);
             const seen = self.seq;
             self.guard.releaseIrqRestore(f);
             process.blockOnLockSeq(self.waitId(), &self.seq, seen);
@@ -1152,12 +1157,11 @@ pub const RwMutex = struct {
     /// waits, or this task already holds the lock.
     pub fn tryAcquireRead(self: *RwMutex) bool {
         const pid = currentPid("tryAcquireRead");
-        const bit = pidBit(pid);
         const f = self.guard.acquireIrqSave();
         defer self.guard.releaseIrqRestore(f);
-        if (self.readers & bit != 0 or self.writer == pid) return false;
-        if (self.writer != NO_OWNER or self.writers_waiting != 0) return false;
-        self.readers |= bit;
+        if (self.readers.has(pid) or self.writer == pid) return false;
+        if (self.writer != NO_OWNER or !self.writers_waiting.isEmpty()) return false;
+        self.readers.set(pid);
         return true;
     }
 
@@ -1172,21 +1176,20 @@ pub const RwMutex = struct {
     pub fn acquire(self: *RwMutex) void {
         const ra = @returnAddress();
         const pid = currentPid("acquire");
-        const bit = pidBit(pid);
         mightSleep(@src());
         while (true) {
             const f = self.guard.acquireIrqSave();
-            self.sleepers &= ~bit;
+            self.sleepers.clear(pid);
             self.checkNotHeld(pid, f);
-            if (self.writer == NO_OWNER and self.readers == 0) {
+            if (self.writer == NO_OWNER and self.readers.isEmpty()) {
                 self.writer = @intCast(pid);
-                self.writers_waiting &= ~bit;
+                self.writers_waiting.clear(pid);
                 self.holder_ra = ra;
                 self.guard.releaseIrqRestore(f);
                 return;
             }
-            self.writers_waiting |= bit;
-            self.sleepers |= bit;
+            self.writers_waiting.set(pid);
+            self.sleepers.set(pid);
             const seen = self.seq;
             self.guard.releaseIrqRestore(f);
             process.blockOnLockSeq(self.waitId(), &self.seq, seen);
@@ -1199,10 +1202,9 @@ pub const RwMutex = struct {
     }
 
     fn drop(self: *RwMutex, pid: usize, comptime mode: Mode) void {
-        const bit = pidBit(pid);
         const f = self.guard.acquireIrqSave();
         const held = switch (mode) {
-            .read => self.readers & bit != 0,
+            .read => self.readers.has(pid),
             .write => self.writer == pid,
         };
         if (!held) {
@@ -1213,7 +1215,7 @@ pub const RwMutex = struct {
             @panic("RwMutex released by a non-holder");
         }
         switch (mode) {
-            .read => self.readers &= ~bit,
+            .read => self.readers.clear(pid),
             .write => self.writer = NO_OWNER,
         }
         const wake = self.bumpLocked();
@@ -1227,7 +1229,7 @@ pub const RwMutex = struct {
         const pid = smp.currentPid() orelse return false;
         const f = self.guard.acquireIrqSave();
         defer self.guard.releaseIrqRestore(f);
-        const reading = self.readers & pidBit(pid) != 0;
+        const reading = self.readers.has(pid);
         const writing = self.writer == pid;
         return if (mode) |m| switch (m) {
             .read => reading,
@@ -1241,16 +1243,15 @@ pub const RwMutex = struct {
     /// `pid` held or waited.
     pub fn dropPid(self: *RwMutex, pid: usize) bool {
         if (pid >= process.MAX_PROCS) return false;
-        const bit = pidBit(pid);
         const f = self.guard.acquireIrqSave();
-        const had = (self.readers | self.writers_waiting | self.sleepers) & bit != 0 or self.writer == pid;
-        self.readers &= ~bit;
-        self.writers_waiting &= ~bit;
-        self.sleepers &= ~bit;
+        const had = self.readers.has(pid) or self.writers_waiting.has(pid) or self.sleepers.has(pid) or self.writer == pid;
+        self.readers.clear(pid);
+        self.writers_waiting.clear(pid);
+        self.sleepers.clear(pid);
         if (self.writer == pid) self.writer = NO_OWNER;
         // Wake sleepers even when `pid` held nothing: it may have died
         // between a release's guard drop and that release's wake.
-        const wake = (had or self.sleepers != 0) and self.bumpLocked();
+        const wake = (had or !self.sleepers.isEmpty()) and self.bumpLocked();
         self.guard.releaseIrqRestore(f);
         if (wake) process.wakeMutexWaiters(self.waitId());
         return had;

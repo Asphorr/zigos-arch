@@ -1,19 +1,23 @@
 // lt_thread — Linux threads through musl's pthreads: clone, futex (wait,
 // wake, timeouts), the clear-tid word pthread_join waits on, TLS per thread,
-// one fd table for every thread, detached threads, thread churn, and
-// exit_group taking down threads that sleep, spin or nanosleep. Exit 0 =
-// every check passed, else the number of the first failed check.
+// one fd table for every thread, detached threads, thread churn, 90 threads
+// alive at once (pids past 64), and exit_group taking down threads that
+// sleep, spin or nanosleep. Exit 0 = every check passed, else the number of
+// the first failed check.
 
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <pthread.h>
 #include <sched.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -294,6 +298,108 @@ static void check_lifetimes(void) {
     CHECK(ok, "200 threads created and joined in turn");
 }
 
+// --- More live threads than one 64-bit set of pids holds ----------------------
+
+#define CROWD 90
+
+static atomic_int crowd_ready;
+static atomic_int crowd_bad;
+static int crowd_pipe[2];
+
+static void *crowd_worker(void *arg) {
+    long idx = (long)arg;
+    // The address-space lock, both sides: mmap edits the map, the touch
+    // faults on it.
+    unsigned char *p = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) {
+        atomic_fetch_add(&crowd_bad, 1);
+    } else {
+        p[idx] = (unsigned char)idx;
+    }
+    atomic_fetch_add(&crowd_ready, 1);
+    // Every poller is woken by pid when main writes.
+    struct pollfd pf = {crowd_pipe[0], POLLIN, 0};
+    if (poll(&pf, 1, 20000) != 1) atomic_fetch_add(&crowd_bad, 1);
+    // A few of them wait for a child of their own.
+    if (idx % 30 == 0) {
+        int st = 0;
+        pid_t c = fork();
+        if (c == 0) _exit(9);
+        if (c < 0 || waitpid(c, &st, 0) != c || !WIFEXITED(st) || WEXITSTATUS(st) != 9) atomic_fetch_add(&crowd_bad, 1);
+    }
+    if (p != MAP_FAILED) {
+        if (p[idx] != (unsigned char)idx) atomic_fetch_add(&crowd_bad, 1);
+        munmap(p, 4096);
+    }
+    return NULL;
+}
+
+static void check_crowd(void) {
+    static pthread_t th[CROWD];
+    CHECK(pipe(crowd_pipe) == 0, "pipe for the crowd");
+    pthread_attr_t a;
+    pthread_attr_init(&a);
+    pthread_attr_setstacksize(&a, 64 * 1024);
+    int made = 0;
+    while (made < CROWD && pthread_create(&th[made], &a, crowd_worker, (void *)(long)made) == 0) made++;
+    pthread_attr_destroy(&a);
+    CHECK(made == CROWD, "90 threads alive at once");
+    for (int i = 0; i < 10000 && atomic_load(&crowd_ready) < CROWD; i++) nap_ms(1);
+    nap_ms(20);
+    CHECK(write(crowd_pipe[1], "x", 1) == 1, "one write for every poller");
+    int joined = 0;
+    while (joined < CROWD && pthread_join(th[joined], NULL) == 0) joined++;
+    CHECK(joined == CROWD, "the crowd joins");
+    CHECK(atomic_load(&crowd_bad) == 0, "they map, fault, poll and wait for children");
+    close(crowd_pipe[0]);
+    close(crowd_pipe[1]);
+}
+
+// --- A fork beside threads the kernel is writing to ---------------------------
+
+#define WRITERS 3
+#define FORKS 200
+
+static atomic_int forking_done;
+static atomic_int writer_bad;
+
+static void *kernel_written(void *arg) {
+    (void)arg;
+    // Only the kernel writes these pages, so after each fork its write is
+    // the one that meets them copy-on-write.
+    char *buf = calloc(1, 8192);
+    int fd = open("/etc/motd", O_RDONLY);
+    if (buf == NULL || fd < 0) {
+        atomic_fetch_add(&writer_bad, 1);
+        return NULL;
+    }
+    while (!atomic_load(&forking_done)) {
+        struct timespec *ts = (struct timespec *)(buf + 6144);
+        if (clock_gettime(CLOCK_MONOTONIC, ts) != 0) atomic_fetch_add(&writer_bad, 1);
+        if (pread(fd, buf, 4000, 0) <= 0 || strstr(buf, "hello from /etc/motd") == NULL) atomic_fetch_add(&writer_bad, 1);
+        if (getcwd(buf + 4096, 2048) == NULL || buf[4096] != '/') atomic_fetch_add(&writer_bad, 1);
+    }
+    close(fd);
+    free(buf);
+    return NULL;
+}
+
+static void check_fork_beside_writers(void) {
+    pthread_t th[WRITERS];
+    for (int i = 0; i < WRITERS; i++) CHECK(pthread_create(&th[i], NULL, kernel_written, NULL) == 0, "pthread_create writer");
+    int ok = 1;
+    for (int i = 0; i < FORKS; i++) {
+        int st = 0;
+        pid_t c = fork();
+        if (c == 0) _exit(3);
+        if (c < 0 || waitpid(c, &st, 0) != c || !WIFEXITED(st) || WEXITSTATUS(st) != 3) ok = 0;
+    }
+    atomic_store(&forking_done, 1);
+    for (int i = 0; i < WRITERS; i++) CHECK(pthread_join(th[i], NULL) == 0, "pthread_join writer");
+    CHECK(ok, "200 forks beside threads in syscalls");
+    CHECK(atomic_load(&writer_bad) == 0, "the kernel's writes to their memory all land");
+}
+
 // --- exit_group with live peers ---------------------------------------------
 
 static void *sleeper(void *arg) {
@@ -322,6 +428,8 @@ int main(void) {
     check_futex();
     check_shared_fds();
     check_lifetimes();
+    check_crowd();
+    check_fork_beside_writers();
 
     // Returning from main is exit_group: these must go with the process.
     pthread_t t;

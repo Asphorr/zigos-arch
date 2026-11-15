@@ -6,16 +6,20 @@
 // self-test — there'd be no evidence the data structure is correct unless
 // something deliberately drives it. This is that something.
 //
-// Five tests, each on a freshly init()'d cache:
+// Seven tests, each on a freshly init()'d cache:
 //   1  hit/miss + fresh-allocation accounting
-//   2  set-associative eviction (a full set's oldest unpinned way is evicted)
+//   2  eviction at the resident limit (the oldest unpinned page goes)
 //   3  a refcount-PINNED page survives eviction; an unpinned peer goes instead
-//   4  a fully-pinned set refuses a new page (getOrAlloc -> null, uncached)
+//   4  a cache full of pinned pages refuses a new one (getOrAlloc -> null)
 //   5  no frame leak: invalidate drops the cache's ref and the frame is freed
+//   6  per-file walks: invalidateFile and a long invalidateRange take one
+//      file's pages and leave another's
+//   7  dirty batches: the lowest dirty pages come out in order and pinned,
+//      however far apart; a cache-only page can be dropped, a mapped one not
 //
-// Determinism trick: tests 2-4 need several keys that land in the SAME set.
-// We compute them up front via page_cache.setIndexFor (collectSameSet), so the
-// round-robin eviction order is predictable. Eviction is checked by KEY
+// Tests 2-4 lower the resident limit to LIMIT pages (page_cache.limitForTest)
+// so eviction starts after a handful of inserts; on a fresh cache the sweep
+// meets pages in the order they were cached. Eviction is checked by KEY
 // PRESENCE (lookup hit/miss), never by frame identity — pmm.allocFrame may hand
 // the just-freed victim frame straight back to the next insert, which would
 // make a naive "evicted frame is now free" assertion flap.
@@ -29,7 +33,8 @@ const page_cache = @import("../mm/page_cache.zig");
 const pmm = @import("../mm/pmm.zig");
 const Phys = @import("../util/addr.zig").Phys;
 
-const WAYS = page_cache.WAYS; // 8
+/// Resident limit for the eviction tests.
+const LIMIT: u32 = 8;
 const PG = page_cache.PAGE_SIZE;
 
 var fail_count: u32 = 0;
@@ -41,20 +46,6 @@ fn check(cond: bool, msg: []const u8) void {
     }
 }
 
-/// Fill `out` with byte-offsets (of `fid`) that all hash to `target` set.
-fn collectSameSet(fid: u64, target: u32, out: []u64) u32 {
-    var found: u32 = 0;
-    var i: u64 = 0;
-    while (found < out.len and i < 200_000) : (i += 1) {
-        const off = i * PG;
-        if (page_cache.setIndexFor(fid, off) == target) {
-            out[found] = off;
-            found += 1;
-        }
-    }
-    return found;
-}
-
 pub fn taskEntry() callconv(.c) noreturn {
     serial.print("\n[pgcache] === page cache self-test start ===\n", .{});
 
@@ -63,9 +54,11 @@ pub fn taskEntry() callconv(.c) noreturn {
     test3PinSurvives();
     test4FullyPinned();
     test5NoLeak();
+    test6PerFile();
+    test7DirtyBatches();
 
     if (fail_count == 0) {
-        serial.print("[pgcache] PASS — all checks green (hit/miss, eviction frees victim, pin survives eviction, full-set skip, no leak)\n", .{});
+        serial.print("[pgcache] PASS — all checks green (hit/miss, eviction frees victim, pin survives eviction, full-cache skip, no leak, per-file walks, dirty batches)\n", .{});
     } else {
         serial.print("[pgcache] FAIL — {d} check(s) failed (see [pgcache] FAIL lines above)\n", .{fail_count});
     }
@@ -108,31 +101,27 @@ fn test1HitMiss() void {
     page_cache.init(); // frees the 4 frames
 }
 
-// --- 2: set eviction --------------------------------------------------------
+// --- 2: eviction at the limit -----------------------------------------------
 fn test2Eviction() void {
-    serial.print("[pgcache] test 2: set-associative eviction\n", .{});
+    serial.print("[pgcache] test 2: eviction at the resident limit\n", .{});
     page_cache.init();
+    page_cache.limitForTest(LIMIT);
     const fid: u64 = 0x2000;
-    var keys: [16]u64 = undefined;
-    const n = collectSameSet(fid, page_cache.setIndexFor(fid, 0), keys[0 .. WAYS + 1]);
-    if (n < WAYS + 1) {
-        check(false, "test2 could not collect WAYS+1 same-set keys");
-        return;
-    }
 
     const ev_before = page_cache.statsSnapshot().evictions;
-    var i: u32 = 0;
-    while (i < WAYS + 1) : (i += 1) _ = page_cache.getOrAlloc(fid, keys[i]);
+    var i: u64 = 0;
+    while (i < LIMIT + 1) : (i += 1) _ = page_cache.getOrAlloc(fid, i * PG);
 
-    check(page_cache.statsSnapshot().evictions == ev_before + 1, "test2 filling WAYS+1 should evict exactly once");
-    check(page_cache.lookup(fid, keys[0]) == null, "test2 the oldest key (k0) should have been the victim");
+    check(page_cache.statsSnapshot().evictions == ev_before + 1, "test2 filling LIMIT+1 should evict exactly once");
+    check(page_cache.lookup(fid, 0) == null, "test2 the oldest key (k0) should have been the victim");
+    check(page_cache.residentCount() == LIMIT, "test2 the cache should hold exactly LIMIT pages");
 
     var hits: u32 = 0;
     i = 1;
-    while (i < WAYS + 1) : (i += 1) {
-        if (page_cache.lookup(fid, keys[i]) != null) hits += 1;
+    while (i < LIMIT + 1) : (i += 1) {
+        if (page_cache.lookup(fid, i * PG) != null) hits += 1;
     }
-    check(hits == WAYS, "test2 every key except k0 should still be resident");
+    check(hits == LIMIT, "test2 every key except k0 should still be resident");
 
     page_cache.init();
 }
@@ -141,63 +130,54 @@ fn test2Eviction() void {
 fn test3PinSurvives() void {
     serial.print("[pgcache] test 3: refcount-pinned page survives eviction\n", .{});
     page_cache.init();
+    page_cache.limitForTest(LIMIT);
     const fid: u64 = 0x3000;
-    var keys: [16]u64 = undefined;
-    const n = collectSameSet(fid, page_cache.setIndexFor(fid, 0), keys[0 .. WAYS + 1]);
-    if (n < WAYS + 1) {
-        check(false, "test3 could not collect same-set keys");
-        return;
-    }
 
-    var i: u32 = 0;
-    while (i < WAYS) : (i += 1) _ = page_cache.getOrAlloc(fid, keys[i]); // fill the set
+    var i: u64 = 0;
+    while (i < LIMIT) : (i += 1) _ = page_cache.getOrAlloc(fid, i * PG); // fill to the limit
 
-    // Pin k0 — the round-robin victim. It must now be skipped by eviction.
-    const pinned = page_cache.pin(fid, keys[0]) orelse {
+    // Pin k0 — the sweep's first candidate. Eviction must now skip it.
+    const pinned = page_cache.pin(fid, 0) orelse {
         check(false, "test3 pin(k0) missed a resident key");
         return;
     };
     check(pmm.frameRefCount(pinned) == 2, "test3 a pinned cache frame should be refcount 2");
 
-    _ = page_cache.getOrAlloc(fid, keys[WAYS]); // forces an eviction; k0 pinned -> k1 goes
+    _ = page_cache.getOrAlloc(fid, LIMIT * PG); // forces an eviction; k0 pinned -> k1 goes
 
-    check(page_cache.lookup(fid, keys[0]) != null, "test3 the pinned page (k0) must survive eviction");
-    check(page_cache.lookup(fid, keys[1]) == null, "test3 an unpinned peer (k1) should be evicted instead");
-    check(page_cache.lookup(fid, keys[WAYS]) != null, "test3 the newly inserted page should be resident");
+    check(page_cache.lookup(fid, 0) != null, "test3 the pinned page (k0) must survive eviction");
+    check(page_cache.lookup(fid, PG) == null, "test3 an unpinned peer (k1) should be evicted instead");
+    check(page_cache.lookup(fid, LIMIT * PG) != null, "test3 the newly inserted page should be resident");
 
     pmm.releaseFrame(pinned); // drop our pin so init() can reclaim it
     page_cache.init();
 }
 
-// --- 4: fully-pinned set refuses a new page ---------------------------------
+// --- 4: a cache full of pinned pages refuses a new one ----------------------
 fn test4FullyPinned() void {
-    serial.print("[pgcache] test 4: fully-pinned set -> uncached\n", .{});
+    serial.print("[pgcache] test 4: every page pinned -> not cached\n", .{});
     page_cache.init();
+    page_cache.limitForTest(LIMIT);
     const fid: u64 = 0x4000;
-    var keys: [16]u64 = undefined;
-    const n = collectSameSet(fid, page_cache.setIndexFor(fid, 0), keys[0 .. WAYS + 1]);
-    if (n < WAYS + 1) {
-        check(false, "test4 could not collect same-set keys");
-        return;
-    }
 
-    var pins: [16]Phys = undefined;
+    var pins: [LIMIT]Phys = undefined;
     var i: u32 = 0;
-    while (i < WAYS) : (i += 1) {
-        _ = page_cache.getOrAlloc(fid, keys[i]);
-        pins[i] = page_cache.pin(fid, keys[i]) orelse {
+    while (i < LIMIT) : (i += 1) {
+        _ = page_cache.getOrAlloc(fid, @as(u64, i) * PG);
+        pins[i] = page_cache.pin(fid, @as(u64, i) * PG) orelse {
             check(false, "test4 pin of a resident key missed");
             return;
         };
     }
 
     const skip_before = page_cache.statsSnapshot().full_skips;
-    const r = page_cache.getOrAlloc(fid, keys[WAYS]);
-    check(r == null, "test4 getOrAlloc into a fully-pinned set should return null (uncached)");
-    check(page_cache.statsSnapshot().full_skips == skip_before + 1, "test4 a fully-pinned set should record one full_skip");
+    const r = page_cache.getOrAlloc(fid, LIMIT * PG);
+    check(r == null, "test4 getOrAlloc with every page pinned should return null");
+    check(page_cache.statsSnapshot().full_skips == skip_before + 1, "test4 a full cache should record one full_skip");
+    check(page_cache.residentCount() == LIMIT, "test4 the pinned pages should all still be resident");
 
     i = 0;
-    while (i < WAYS) : (i += 1) pmm.releaseFrame(pins[i]); // unpin all
+    while (i < LIMIT) : (i += 1) pmm.releaseFrame(pins[i]); // unpin all
     page_cache.init();
 }
 
@@ -225,6 +205,95 @@ fn test5NoLeak() void {
     while (i < 4) : (i += 1) check(pmm.frameRefCount(frames[i]) == 0, "test5 an invalidated frame must be freed (refcount 0) — leak otherwise");
 
     check(page_cache.residentCount() == 0, "test5 residentCount should be 0 after invalidating everything");
+}
+
+// --- 6: per-file walks ------------------------------------------------------
+fn test6PerFile() void {
+    serial.print("[pgcache] test 6: per-file walks\n", .{});
+    page_cache.init();
+    const a: u64 = 0x6000;
+    const b: u64 = 0x6001;
+    const pages: u64 = 600; // more than one offset-probe range
+
+    var i: u64 = 0;
+    while (i < pages) : (i += 1) {
+        if (page_cache.getOrAlloc(a, i * PG) == null or page_cache.getOrAlloc(b, i * PG) == null) {
+            check(false, "test6 getOrAlloc returned null");
+            page_cache.init();
+            return;
+        }
+    }
+    check(page_cache.residentCount() == 2 * pages, "test6 both files' pages should be resident");
+
+    // A long range of `a` (walked by file), then a short one (probed).
+    check(page_cache.invalidateRange(a, 100 * PG, 400 * PG) == 400, "test6 a long invalidateRange should drop exactly its pages");
+    check(page_cache.invalidateRange(a, 0, 10 * PG) == 10, "test6 a short invalidateRange should drop exactly its pages");
+    check(page_cache.lookup(a, 99 * PG) != null and page_cache.lookup(a, 100 * PG) == null, "test6 the range's lower edge");
+    check(page_cache.lookup(a, 499 * PG) == null and page_cache.lookup(a, 500 * PG) != null, "test6 the range's upper edge");
+    check(page_cache.residentCount() == 2 * pages - 410, "test6 the other file must be untouched by a range drop");
+
+    check(page_cache.invalidateFile(b) == pages, "test6 invalidateFile should drop every page of the file");
+    check(page_cache.lookup(b, 0) == null and page_cache.lookup(a, 50 * PG) != null, "test6 only that file's pages go");
+    check(page_cache.residentCount() == pages - 410, "test6 what is left is the first file's remainder");
+
+    page_cache.init();
+    check(page_cache.residentCount() == 0, "test6 init should empty the cache");
+}
+
+// --- 7: dirty batches -------------------------------------------------------
+fn unpin(batch: []const page_cache.DirtyPage) void {
+    for (batch) |dp| pmm.releaseFrame(dp.frame);
+}
+
+fn test7DirtyBatches() void {
+    serial.print("[pgcache] test 7: dirty batches\n", .{});
+    page_cache.init();
+    const a: u64 = 0x7000;
+    const b: u64 = 0x7001;
+    // Dirty pages of `a`: a run with a gap near the start, then three far
+    // apart, cached highest first so the file's list is not in order.
+    const near = [_]u64{ 0, PG, 2 * PG, 40 * PG };
+    const far = [_]u64{ 1 << 40, 1 << 30, 5 << 20 };
+    for (far ++ near) |off| {
+        if (page_cache.getOrAlloc(a, off) == null) {
+            check(false, "test7 getOrAlloc returned null");
+            page_cache.init();
+            return;
+        }
+        page_cache.markDirty(a, off);
+    }
+    // Neither a clean page of `a` nor a dirty page of `b` belongs in a batch.
+    _ = page_cache.getOrAlloc(a, 3 * PG);
+    _ = page_cache.getOrAlloc(b, 0);
+    page_cache.markDirty(b, 0);
+
+    var out: [4]page_cache.DirtyPage = undefined;
+    var n = page_cache.takeDirtyBatch(a, 0, &out);
+    check(n == 4 and out[0].page_off == 0 and out[1].page_off == PG and out[2].page_off == 2 * PG and out[3].page_off == 40 * PG, "test7 the first batch is the run near the start, in order");
+    if (n > 0) check(pmm.frameRefCount(out[0].frame) == 2, "test7 a page of a batch is pinned");
+    unpin(out[0..n]);
+
+    n = page_cache.takeDirtyBatch(a, 41 * PG, &out);
+    check(n == 3 and out[0].page_off == 5 << 20 and out[1].page_off == 1 << 30 and out[2].page_off == 1 << 40, "test7 pages far apart come out lowest first");
+    unpin(out[0..n]);
+
+    var two: [2]page_cache.DirtyPage = undefined;
+    n = page_cache.takeDirtyBatch(a, 41 * PG, &two);
+    check(n == 2 and two[0].page_off == 5 << 20 and two[1].page_off == 1 << 30, "test7 a short batch keeps the lowest pages");
+    unpin(two[0..n]);
+
+    check(page_cache.takeDirtyBatch(a, (1 << 40) + PG, &out) == 0, "test7 nothing is left past the last dirty page");
+
+    const pinned = page_cache.pin(a, 0) orelse {
+        check(false, "test7 pin missed a resident key");
+        page_cache.init();
+        return;
+    };
+    check(!page_cache.dropIfCacheOnly(a, 0), "test7 a page something holds must not be dropped");
+    pmm.releaseFrame(pinned);
+    check(page_cache.dropIfCacheOnly(a, 0) and page_cache.lookup(a, 0) == null, "test7 a cache-only page is dropped, dirty or not");
+
+    page_cache.init();
 }
 
 fn idle() noreturn {

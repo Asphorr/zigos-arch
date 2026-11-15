@@ -1,7 +1,7 @@
 //! ctx_lint — context-coloring + lock-discipline lint over the kernel tree.
 //!
 //! Host tool, run by build.zig before the kernel links (like
-//! check_asm_alignment.py). Parses every `src/**/*.zig` with std.zig.Ast
+//! asm_lint.zig). Parses every `src/**/*.zig` with std.zig.Ast
 //! and checks four disciplines the kernel documents in STYLE.md but the
 //! compiler cannot enforce:
 //!

@@ -294,10 +294,11 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     blog.ok("Heap free-path self-test");
     @import("mm/vmalloc.zig").init();
     blog.ok("vmalloc arena");
-    // Unified page cache (file-backed mmap + future read() path). init() clears
-    // the (BSS-zeroed) table — a no-op at boot — and registers page_cache.lock
-    // with WITNESS so the first fault-path acquire participates in lock-order
-    // checking (order: as_lock -> page_cache.lock -> pmm).
+    // Unified page cache (file-backed mmap and read()). init() takes its
+    // index from PMM, sized from the RAM free now, and registers
+    // page_cache.lock with WITNESS so the first fault-path acquire
+    // participates in lock-order checking (order: as_lock -> page_cache.lock
+    // -> pmm).
     @import("mm/page_cache.zig").init();
     blog.ok("Page cache");
     @import("debug/symbols.zig").init();

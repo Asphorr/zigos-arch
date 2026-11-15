@@ -134,12 +134,23 @@ pub fn build(b: *std.Build) void {
     kernel.setLinkerScript(b.path("src/linker.ld"));
     kernel.root_module.addOptions("build_options", build_options);
 
-    // --- ASM ALIGNMENT LINTER ---
-    // Run before linking to catch push-count drift at build time. Exits nonzero
-    // on misalignment → aborts the build. The runtime guards in
-    // cpu/syscall/entry.zig and idt.zig are still the authoritative check;
-    // this is a fast-fail.
-    const asm_lint = b.addSystemCommand(&.{ "python3", "tools/check_asm_alignment.py" });
+    // --- ASM LINTER ---
+    // tools/asm_lint.zig reads src/ as text: stack alignment at every `call`
+    // inside an asm template (push-count drift), and the asm output shape
+    // Zig 0.15.2 miscompiles. A failure aborts the build. The runtime guards
+    // in cpu/syscall/entry.zig and idt.zig are still the authoritative
+    // check; this is a fast-fail. Host tool like ctx_lint below, so the
+    // kernel build needs no interpreter.
+    const asm_lint_exe = b.addExecutable(.{
+        .name = "asm_lint",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/asm_lint.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+        }),
+    });
+    const asm_lint = b.addRunArtifact(asm_lint_exe);
+    asm_lint.addDirectoryArg(b.path("src"));
     kernel.step.dependOn(&asm_lint.step);
 
     // --- CONTEXT / LOCK-DISCIPLINE LINTER ---
@@ -192,6 +203,12 @@ pub fn build(b: *std.Build) void {
     if (!kasan_enabled and !kcsan_enabled) {
         b.installArtifact(kernel);
     }
+
+    // `zig build kernel` — kernel.elf alone, no apps and no images. This is
+    // the step a build inside ZigOS runs: besides the compiler it needs only
+    // nasm (the two linters are built by the same compiler).
+    const kernel_step = b.step("kernel", "Build kernel.elf alone (no apps, no images)");
+    kernel_step.dependOn(&b.addInstallArtifact(kernel, .{}).step);
 
     // Convert ELF64 to ELF32 for QEMU Multiboot loading
     const objcopy = b.addSystemCommand(&.{
@@ -1258,9 +1275,11 @@ pub fn build(b: *std.Build) void {
         \\T0=$(date +%s%3N)
         \\IMG=ext2.img
         \\STAGE=zig-out/ext2-stage
+        \\MB=$1
         \\
-        \\# Skip rebuild if every input file is older than the image.
-        \\if [ -f $IMG ]; then
+        \\# Skip rebuild if every input file is older than the image and the
+        \\# image has the size asked for.
+        \\if [ -f $IMG ] && [ "$(stat -c %s $IMG)" = "$((MB * 1048576))" ]; then
         \\  newest=$( { ls -t zig-out/bin/*.elf zig-out/bin/KERNEL.SYM zig-out/bin/BUILD.ID zig-out/bin/BOOTX64.efi doom1.wad www/* linux-bin/* 2>/dev/null; find share -type f -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2; } | head -1 || true)
         \\  if [ -n "$newest" ] && [ "$newest" -ot $IMG ]; then
         \\    echo "[ext2] up-to-date $(($(date +%s%3N)-T0))ms"
@@ -1320,17 +1339,23 @@ pub fn build(b: *std.Build) void {
         \\dock_pos=0
         \\EOF
         \\
-        \\# -B 4096 block size, -b 131072 blocks → 512 MB raw image. The on-disk
-        \\# file ends up sparse so unused capacity costs ~nothing. -N 8192 inode
-        \\# table covers DDLC's ~1500 small assets (442 PNG + 64 OGG + ~1000 misc)
+        \\# -B 4096 block size; per MiB 256 blocks and 16 inodes, so the default
+        \\# 512 MiB image has 131072 blocks and 8192 inodes. The on-disk file
+        \\# ends up sparse so unused capacity costs ~nothing. The inode table
+        \\# covers DDLC's ~1500 small assets (442 PNG + 64 OGG + ~1000 misc)
         \\# with headroom for system files.
         \\# genext2fs won't cleanly overwrite an existing image — remove first
         \\# so a triggered rebuild (e.g. a new input under linux-bin/) succeeds.
         \\rm -f $IMG
-        \\genext2fs -B 4096 -b 131072 -N 8192 -d $STAGE -q $IMG
+        \\genext2fs -B 4096 -b $((MB * 256)) -N $((MB * 16)) -d $STAGE -q $IMG
         \\echo "[ext2] rebuilt ($(du -h $IMG | cut -f1)) $(($(date +%s%3N)-T0))ms"
         ,
+        "mkext2",
     });
+    // A build inside ZigOS wants room for the compiler, its lib/ and the
+    // caches of a kernel build: -Dext2-mb=2048.
+    const ext2_mb = b.option(u32, "ext2-mb", "Size of ext2.img in MiB (default 512)") orelse 512;
+    mkext2.addArg(b.fmt("{d}", .{ext2_mb}));
     mkext2.step.dependOn(b.getInstallStep());
     mkext2.step.dependOn(&mk_buildid.step);
     const ext2_step = b.step("ext2", "Create ext2.img via genext2fs (no sudo)");

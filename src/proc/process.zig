@@ -98,7 +98,7 @@ pub var kstack_pool_phys_base: usize = 0;
 /// own slot. Limited to ONE outstanding borrow per task; deep nesting
 /// inside ext2/fat32 path-walks needs caller-passed buffers.
 ///
-/// Cost: 4KB × MAX_PROCS = 256KB BSS at MAX_PROCS=64.
+/// Cost: 4KB × MAX_PROCS = 512KB BSS at MAX_PROCS=128.
 pub var io_scratch_pool: [MAX_PROCS][4096]u8 align(4096) =
     [_][4096]u8{[_]u8{0} ** 4096} ** MAX_PROCS;
 
@@ -1200,6 +1200,7 @@ pub const ensureUserRangeWritable = @import("fault.zig").ensureUserRangeWritable
 pub const ensureSignalFrameWritable = @import("fault.zig").ensureSignalFrameWritable;
 pub const ensureUserRangeWritableFor = @import("fault.zig").ensureUserRangeWritableFor;
 pub const handleUserPageFault = @import("fault.zig").handleUserPageFault;
+pub const handleKernelWriteFault = @import("fault.zig").handleKernelWriteFault;
 pub const prefaultUserRange = @import("fault.zig").prefaultUserRange;
 
 

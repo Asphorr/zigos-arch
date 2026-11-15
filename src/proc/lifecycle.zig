@@ -44,6 +44,7 @@ const symbols = @import("../debug/symbols.zig");
 const smp = @import("../cpu/smp.zig");
 const memmap = @import("../mm/memmap.zig");
 const config = @import("../config.zig");
+const pid_set = @import("../util/pid_set.zig");
 const signals = @import("signals.zig");
 const frames = @import("frames.zig");
 const dspec = frames.dispatch; // NOT `fd` — this file is full of file-descriptor captures
@@ -943,38 +944,33 @@ fn closePipeFds(pid: u8) void {
     }
 }
 
-/// Tasks in a Linux wait4: a bit per pid, set before the task first looks
-/// for a zombie child. A child of their process becoming reapable wakes them
-/// by pid (any thread of a process may wait for its children), so a wake
-/// between the look and the park is kept (wake_pending).
-var child_waiters = std.atomic.Value(u64).init(0);
-
-comptime {
-    if (MAX_PROCS > 64) @compileError("child_waiters holds one bit per pid");
-}
+/// Tasks in a Linux wait4, entered before the task first looks for a zombie
+/// child. A child of their process becoming reapable wakes them by pid (any
+/// thread of a process may wait for its children), so a wake between the
+/// look and the park is kept (wake_pending).
+var child_waiters: pid_set.AtomicPidSet = .{};
 
 pub fn childWaitEnter(pid: usize) void {
-    _ = child_waiters.fetchOr(@as(u64, 1) << @intCast(pid), .seq_cst);
+    child_waiters.enter(pid);
 }
 
 pub fn childWaitLeave(pid: usize) void {
-    _ = child_waiters.fetchAnd(~(@as(u64, 1) << @intCast(pid)), .seq_cst);
+    child_waiters.leave(pid);
 }
 
 /// The pids in wait4 now, as bits (diagnostics).
-pub fn childWaiterMask() u64 {
-    return child_waiters.load(.monotonic);
+pub fn childWaiterMask() [pid_set.WORDS]u64 {
+    return child_waiters.snapshot();
 }
 
 /// A child of process `parent` became reapable: wake its wait4 sleepers.
 fn wakeChildWaiters(parent: u8) void {
     if (parent >= MAX_PROCS) return;
     const group = process.procs[parent].tgid;
-    // A locked RMW: orders the zombie state store before the read.
-    var m = child_waiters.fetchOr(0, .seq_cst);
-    while (m != 0) : (m &= m - 1) {
-        const w: u8 = @intCast(@ctz(m));
-        if (process.procs[w].tgid == group) process.wake(w);
+    // The set's locked RMW orders the zombie state store before the read.
+    var it = child_waiters.members();
+    while (it.next()) |w| {
+        if (process.procs[w].tgid == group) process.wake(@intCast(w));
     }
 }
 

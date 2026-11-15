@@ -499,7 +499,7 @@ fn lineMemory(buf: []u8) []const u8 {
 }
 
 fn lineProcs(buf: []u8) []const u8 {
-    var procs: [32]libc.ProcInfo = undefined;
+    var procs: [libc.MAX_PROCS]libc.ProcInfo = undefined;
     const n = libc.processList(&procs);
     var running: u32 = 0;
     var sleeping: u32 = 0;
@@ -585,7 +585,7 @@ fn lineGpu(buf: []u8) []const u8 {
 /// found (init, or fastfetch invoked via a stale pid).
 fn lineShell(buf: []u8) []const u8 {
     var p: usize = 0;
-    var procs: [32]libc.ProcInfo = undefined;
+    var procs: [libc.MAX_PROCS]libc.ProcInfo = undefined;
     const n = libc.processList(&procs);
     const my_pid: u8 = @intCast(libc.getpid());
     var ppid: u8 = 0xFF;

@@ -14,8 +14,8 @@
 // but the [pcb-invariant] line names which pid / which field failed —
 // usually enough to narrow the writer to a recent code change.
 //
-// Cost budget: walking MAX_PROCS=64 alive slots is ~128 atomic loads + ~10
-// comparisons per slot, well under 10 µs. Running every 1s makes overhead
+// Cost budget: walking MAX_PROCS slots is two atomic loads + ~10 comparisons
+// per slot, a few tens of µs at most. Running every 1s makes overhead
 // trivial (<0.001% CPU).
 
 const std = @import("std");

@@ -1792,8 +1792,13 @@ pub const ProcInfo = extern struct {
     _pad3: [4]u8 = .{ 0, 0, 0, 0 },
 };
 
+/// The kernel's task slot count (config.MAX_PROCS): a buffer of this many
+/// entries holds every task.
+pub const MAX_PROCS = 128;
+
 /// Fill `buf` with one ProcInfo per active (non-unused) process slot.
-/// Returns the count. Caller's buffer should be at least MAX_PROCS=32 entries.
+/// Returns the count; a buffer shorter than MAX_PROCS gets the first slots
+/// only, a longer one is refused (0).
 pub fn processList(buf: []ProcInfo) u32 {
     if (buf.len == 0) return 0;
     return syscall(

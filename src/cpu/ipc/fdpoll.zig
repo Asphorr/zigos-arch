@@ -28,6 +28,7 @@ const std = @import("std");
 const process = @import("../../proc/process.zig");
 const pipe = @import("../../proc/pipe.zig");
 const SpinLock = @import("../../proc/spinlock.zig").SpinLock;
+const pid_set = @import("../../util/pid_set.zig");
 const debug = @import("../../debug/debug.zig");
 
 // POSIX poll bit values (match Linux). Apps observe these as CQE.res on
@@ -160,35 +161,30 @@ fn pollMaskConsole(pid: u8, _: u16) u16 {
 
 // --- poll(2) sleepers --------------------------------------------------
 //
-// A task in a Linux poll is a bit here (pid < 64) from before it first
-// checks its fds until it returns, and any fd event wakes every such task
-// by pid; each re-checks its own fds. By pid, a wake that lands before the
-// task parks is kept for it (wake_pending), so none is lost. A herd, but
-// there are few pollers.
+// A task in a Linux poll is in this set from before it first checks its
+// fds until it returns, and any fd event wakes every such task by pid; each
+// re-checks its own fds. By pid, a wake that lands before the task parks is
+// kept for it (wake_pending), so none is lost. A herd, but there are few
+// pollers.
 
-var sleepers = std.atomic.Value(u64).init(0);
-
-comptime {
-    if (process.MAX_PROCS > 64) @compileError("fdpoll.sleepers holds one bit per pid");
-}
+var sleepers: pid_set.AtomicPidSet = .{};
 
 pub fn sleeperEnter(pid: usize) void {
-    _ = sleepers.fetchOr(@as(u64, 1) << @intCast(pid), .seq_cst);
+    sleepers.enter(pid);
 }
 
 pub fn sleeperLeave(pid: usize) void {
-    _ = sleepers.fetchAnd(~(@as(u64, 1) << @intCast(pid)), .seq_cst);
+    sleepers.leave(pid);
 }
 
 /// The pids in poll(2) now, as bits (diagnostics).
-pub fn sleeperMask() u64 {
-    return sleepers.load(.monotonic);
+pub fn sleeperMask() [pid_set.WORDS]u64 {
+    return sleepers.snapshot();
 }
 
 fn wakeSleepers() void {
-    // A locked RMW: orders the caller's state change before the read.
-    var m = sleepers.fetchOr(0, .seq_cst);
-    while (m != 0) : (m &= m - 1) process.wake(@intCast(@ctz(m)));
+    var it = sleepers.members();
+    while (it.next()) |pid| process.wake(@intCast(pid));
 }
 
 // --- Registry --------------------------------------------------------

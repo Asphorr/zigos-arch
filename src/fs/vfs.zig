@@ -460,7 +460,7 @@ pub fn readThroughCache(inum: u32, offset: u64, buf: [*]u8, count: u32) u32 {
             const fdst = pf.toVirt().ptr([*]u8);
             const got: u64 = @min(@as(u64, fillCachePage(inum, page_off, fdst)), 0x1000);
             if (got < 0x1000) @memset(fdst[@as(usize, @intCast(got))..0x1000], 0); // zero tail past EOF
-            break :blk page_cache.insertFilled(file_id, page_off, pf);
+            break :blk page_cache.insertFilled(file_id, page_off, pf).frame;
         };
 
         // frame -> kstack scratch, under the reference (cannot fault-kill).
@@ -477,8 +477,26 @@ pub fn readThroughCache(inum: u32, offset: u64, buf: [*]u8, count: u32) u32 {
     return @intCast(done);
 }
 
+/// Write one pinned dirty page of ext2 inode `inum` back and drop the pin;
+/// `size` is the file's. With `clear`, a page no mapping holds any more
+/// rejoins the evictable pool — or leaves the cache when it lies wholly past
+/// EOF: nothing of it reaches the disk, and its bytes must not come back if
+/// the file later grows over them.
+fn flushDirtyPage(inum: u32, size: u64, page_off: u64, frame: Phys, clear: bool) void {
+    const file_id = page_cache.ext2FileId(inum);
+    const in_file = page_off < size;
+    if (in_file) _ = ext2.writebackPage(inum, page_off, frame, frame.toVirt().ptr([*]const u8));
+    pmm.releaseFrame(frame); // the writeback pin, before the refcount-gated calls below
+    if (!clear) return;
+    if (in_file) {
+        _ = page_cache.clearDirtyIfCacheOnly(file_id, page_off);
+    } else {
+        _ = page_cache.dropIfCacheOnly(file_id, page_off);
+    }
+}
+
 /// Write every dirty page of ext2 inode `inum` back to disk — the orchestration
-/// half of MAP_SHARED writeback (Slice 3c). Drives page_cache.takeNextDirty
+/// half of MAP_SHARED writeback (Slice 3c). Drives page_cache.takeDirtyBatch
 /// (which PINS each dirty page so the lockless writeback I/O can't race eviction
 /// or a concurrent unmap freeing the frame) → ext2.writebackPage → releaseFrame,
 /// looping on a strictly-increasing offset cursor so it always terminates.
@@ -495,15 +513,18 @@ pub fn readThroughCache(inum: u32, offset: u64, buf: [*]u8, count: u32) u32 {
 /// on NVMe I/O. Returns the number of pages written back.
 pub fn syncCacheFile(inum: u32, clear: bool) u32 {
     const file_id = page_cache.ext2FileId(inum);
+    var batch: [page_cache.DIRTY_BATCH]page_cache.DirtyPage = undefined;
     var off: u64 = 0;
     var written: u32 = 0;
-    while (page_cache.takeNextDirty(file_id, off)) |dp| {
-        off = dp.page_off + page_cache.PAGE_SIZE; // advance cursor → guarantees termination
-        const src = dp.frame.toVirt().ptr([*]const u8);
-        _ = ext2.writebackPage(inum, dp.page_off, src);
-        pmm.releaseFrame(dp.frame); // drop the writeback pin BEFORE the refcount-gated clear
-        if (clear) _ = page_cache.clearDirtyIfCacheOnly(file_id, dp.page_off);
-        written += 1;
+    while (true) {
+        const n = page_cache.takeDirtyBatch(file_id, off, &batch);
+        if (n == 0) break;
+        const size = ext2.cacheReadInfo(inum).size;
+        for (batch[0..n]) |dp| {
+            flushDirtyPage(inum, size, dp.page_off, dp.frame, clear);
+            written += 1;
+        }
+        off = batch[n - 1].page_off + page_cache.PAGE_SIZE; // advance cursor → guarantees termination
     }
     // Disk-truth trace for MAP_SHARED writeback (Slice 3c). Silent on the common
     // case (no dirty shared pages → written==0): only msync()/munmap() of a
@@ -535,6 +556,10 @@ pub fn syncCacheFile(inum: u32, clear: bool) u32 {
 pub fn flushAllDirty() u32 {
     var cursor: u32 = 0;
     var written: u32 = 0;
+    // Size of the file the last page belonged to: neighbours in the pool are
+    // mostly one file's.
+    var sized_inum: u32 = 0;
+    var size: u64 = 0;
     while (page_cache.takeNextDirtyGlobal(cursor)) |dp| {
         cursor = dp.next_idx; // strictly advances -> the pass terminates
         // The cache is ext2-only, so a dirty page is always an ext2 file page; the
@@ -542,11 +567,15 @@ pub fn flushAllDirty() u32 {
         // its own writeback path.
         if (dp.file_id & page_cache.FILE_ID_EXT2 != 0) {
             const inum: u32 = @intCast(dp.file_id & ~page_cache.FILE_ID_EXT2);
-            const src = dp.frame.toVirt().ptr([*]const u8);
-            _ = ext2.writebackPage(inum, dp.page_off, src);
+            if (inum != sized_inum) {
+                size = ext2.cacheReadInfo(inum).size;
+                sized_inum = inum;
+            }
+            flushDirtyPage(inum, size, dp.page_off, dp.frame, true);
+        } else {
+            pmm.releaseFrame(dp.frame);
+            _ = page_cache.clearDirtyIfCacheOnly(dp.file_id, dp.page_off);
         }
-        pmm.releaseFrame(dp.frame); // drop the writeback pin BEFORE the refcount-gated clear
-        _ = page_cache.clearDirtyIfCacheOnly(dp.file_id, dp.page_off);
         written += 1;
     }
     if (written > 0)
@@ -687,7 +716,9 @@ pub fn releaseEntry(fd_entry: *const process.FileDesc) void {
 pub fn refEntry(e: *const process.FileDesc) bool {
     switch (e.fs_type) {
         .pipe => if (e.flags == 0) pipe.addReader(e.pipe_id) else pipe.addWriter(e.pipe_id),
-        .console, .ext2, .tarfs => {},
+        // devfs: an fd is an index into the device table, close is a no-op.
+        // A child spawned with its stdin "ignored" gets /dev/null by dup2.
+        .console, .ext2, .tarfs, .devfs => {},
         else => return false,
     }
     return true;

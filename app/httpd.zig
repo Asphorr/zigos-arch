@@ -309,7 +309,7 @@ fn apiScreen() []const u8 {
 }
 
 fn apiProcs() []const u8 {
-    var procs: [32]libc.ProcInfo = undefined;
+    var procs: [libc.MAX_PROCS]libc.ProcInfo = undefined;
     const n = libc.processList(&procs);
 
     jsonReset();

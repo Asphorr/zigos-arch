@@ -97,6 +97,7 @@ const SYS_pwrite64: u32 = 18;
 const SYS_readv: u32 = 19;
 const SYS_writev: u32 = 20;
 const SYS_mremap: u32 = 25;
+const SYS_msync: u32 = 26;
 const SYS_madvise: u32 = 28;
 const SYS_fcntl: u32 = 72;
 const SYS_getrlimit: u32 = 97;
@@ -149,6 +150,8 @@ const SYS_vfork: u32 = 58;
 const SYS_execve: u32 = 59;
 const SYS_wait4: u32 = 61;
 const SYS_kill: u32 = 62;
+const SYS_tkill: u32 = 200;
+const SYS_tgkill: u32 = 234;
 const SYS_sysinfo: u32 = 99;
 const SYS_ppoll: u32 = 271;
 const SYS_utimensat: u32 = 280;
@@ -172,6 +175,8 @@ const SYS_stat: u32 = 4;
 const SYS_lstat: u32 = 6;
 const SYS_uname: u32 = 63;
 const SYS_getcwd: u32 = 79;
+const SYS_chdir: u32 = 80;
+const SYS_fchdir: u32 = 81;
 const SYS_getuid: u32 = 102;
 const SYS_getgid: u32 = 104;
 const SYS_setuid: u32 = 105;
@@ -266,6 +271,7 @@ pub fn dispatch(num: u32, frame: *signals.SyscallFrame) u64 {
         SYS_munmap => return linux_mm.munmap(a1, a2),
         SYS_mprotect => return linux_mm.mprotect(a1, a2, a3),
         SYS_madvise => return linux_mm.madvise(a1, a2, a3),
+        SYS_msync => return linux_mm.msync(a1, a2, a3),
         SYS_brk => return linux_mm.brk(a1),
         SYS_mremap => return linux_mm.mremap(),
         SYS_getrlimit => return sysPrlimit(0, a1, 0, a2),
@@ -292,6 +298,8 @@ pub fn dispatch(num: u32, frame: *signals.SyscallFrame) u64 {
         SYS_execve => return linux_proc.execve(frame, a1, a2, a3),
         SYS_wait4 => return linux_proc.wait4(a1, a2, a3, a4),
         SYS_kill => return linux_proc.kill(a1, a2),
+        SYS_tkill => return linux_proc.tkill(a1, a2),
+        SYS_tgkill => return linux_proc.tgkill(a1, a2, a3),
         SYS_pipe => return linux_proc.pipe2(a1, 0),
         SYS_pipe2 => return linux_proc.pipe2(a1, a2),
         SYS_dup => return linux_proc.dup(a1),
@@ -316,6 +324,8 @@ pub fn dispatch(num: u32, frame: *signals.SyscallFrame) u64 {
         SYS_set_robust_list => return 0,
         SYS_uname => return sysUname(a1),
         SYS_getcwd => return sysGetcwd(a1, a2),
+        SYS_chdir => return linux_fs.chdir(a1),
+        SYS_fchdir => return linux_fs.fchdir(a1),
         // Single-user system: everything runs as root (uid/gid 0). setuid/setgid
         // to any id "succeeds" as a no-op (we are already privileged).
         SYS_getuid, SYS_geteuid, SYS_getgid, SYS_getegid => return 0,

@@ -319,7 +319,17 @@ fn faultInCachePage(pd: [*]align(4096) u64, r: process.LazyRegion, va_aligned: u
         const dst = pf.toVirt().ptr([*]u8);
         const n = @min(vfs.fillCachePage(r.cache_inode, page_off, dst), 0x1000);
         if (n < 0x1000) @memset(dst[n..0x1000], 0); // zero the tail past EOF
-        phys = page_cache.insertFilled(file_id, page_off, pf);
+        const ins = page_cache.insertFilled(file_id, page_off, pf);
+        // A shared mapping's writes reach the file only through a frame the
+        // cache tracks: without one, fail the fill (the caller reclaims and
+        // retries) rather than map a frame whose writes would be lost.
+        if (r.cache_shared and !ins.cached) {
+            pmm.freeFrame(ins.frame);
+            // Reclaim frees entries, not references to a page mapped too
+            // many times over.
+            return if (ins.saturated) .failed else .no_frame;
+        }
+        phys = ins.frame;
     }
 
     // MAP_SHARED (cache_shared): map the shared cache frame WRITABLE so writes
@@ -439,6 +449,77 @@ fn interruptsEnabled() bool {
     );
     return flags & 0x200 != 0;
 }
+
+/// A kernel-mode write-protection fault on a user page: a syscall body
+/// writing to memory it validated earlier, after a sibling thread's fork made
+/// the page copy-on-write again, or a peer's promote left this CPU a stale
+/// read-only entry. Resolved as the ring-3 fault is; the caller then returns
+/// to the faulting instruction. Only where sleeping for the address-space
+/// lock is legal — interrupts were on, user access was open, no spinlock is
+/// held, the lock is not already ours — and only for the address space that
+/// is loaded. Anything else stays a kernel fault. Called with interrupts off.
+///
+/// The wait for the lock is a sleep like any other and consumes a pending
+/// wake: a waiter must not store to user memory between its last re-check
+/// and its park, or the wake meant for the park can be spent here.
+pub fn handleKernelWriteFault(cr2: usize, error_code: u64, saved_rflags: u64) bool {
+    const paging = @import("../mm/paging.zig");
+    const RFLAGS_IF: u64 = 1 << 9;
+    const RFLAGS_AC: u64 = 1 << 18;
+    // Present, write, supervisor and nothing else (reserved bit, PK, SS).
+    if (error_code & 0xFFFF != 0x3) return false;
+    if (saved_rflags & RFLAGS_IF == 0) return false;
+    if (@import("../cpu/arch/protect.zig").smap_enabled and saved_rflags & RFLAGS_AC == 0) return false;
+    if (!@import("../mm/memmap.zig").userDataRangeOk(cr2, 1)) return false;
+    if (@import("spinlock.zig").preemptionPinned()) return false;
+    const cur = smp.currentPid() orelse return false;
+    const pcb = &process.procs[cur];
+    const pd = pcb.page_directory orelse return false;
+    const pd_phys = paging.virtToPhys(@intFromPtr(pd)) orelse return false;
+    const cr3 = asm volatile ("mov %%cr3, %[r]"
+        : [r] "=r" (-> u64),
+    );
+    if (cr3 & paging.PAGE_MASK != pd_phys) return false;
+    const lead = leader(pcb);
+    if (lead.as_lock.heldByCurrent(null)) return false;
+
+    asm volatile ("sti");
+    const page = cr2 & ~@as(usize, 0xFFF);
+    // Past waiting writers: the interrupted code may hold a sleeping lock
+    // that a reader ahead of such a writer is waiting for.
+    lead.as_lock.acquireReadPassingWriters();
+    const user_rw = paging.PRESENT | paging.READ_WRITE | paging.USER;
+    var writable = false;
+    var attempt: u8 = 0;
+    while (attempt < 2) : (attempt += 1) {
+        breakCow(pd, lead, page);
+        const pte = if (findUserPte(pd, page)) |pte_ptr| pte_ptr.* else 0;
+        writable = pte & user_rw == user_rw;
+        // Still copy-on-write: no frame for the copy. Shed cache pages once.
+        if (writable or pte & paging.COW == 0 or pmm.tryReclaim(1) == 0) break;
+    }
+    lead.as_lock.releaseRead();
+    if (!writable) {
+        // Other faults may have run on this CPU, or the task moved: the
+        // caller's report reads the address from CR2.
+        asm volatile ("cli; mov %[a], %%cr2"
+            :
+            : [a] "r" (cr2),
+        );
+        return false;
+    }
+    asm volatile ("invlpg (%[addr])"
+        :
+        : [addr] "r" (page),
+        : .{ .memory = true }
+    );
+    const n = @atomicRmw(u64, &kernel_write_faults, .Add, 1, .monotonic) + 1;
+    if (n & (n - 1) == 0) debug.klog("[pf] pid={d} kernel write to 0x{X} resolved in the fault path ({d} so far)\n", .{ cur, cr2, n });
+    return true;
+}
+
+/// Kernel-mode write faults handleKernelWriteFault resolved, since boot.
+var kernel_write_faults: u64 = 0;
 
 /// Free up to `want` physical frames by evicting cold, present, non-COW pages
 /// of `lead`'s lazy regions out to swap (Phase 2: intra-process only). A

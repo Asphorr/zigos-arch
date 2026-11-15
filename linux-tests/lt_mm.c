@@ -177,6 +177,53 @@ int main(void) {
     CHECK(ok, "realloc kept the bytes");
     free(r);
 
+    // msync doubles as "is this mapped?" for a stack walker.
+    unsigned char *ms = mmap(NULL, 2 * PG, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(ms != MAP_FAILED, "mmap for msync");
+    CHECK(msync(ms, 2 * PG, MS_ASYNC) == 0, "msync of a mapped range");
+    CHECK(munmap(ms + PG, PG) == 0, "unmap its second page");
+    errno = 0;
+    CHECK(msync(ms, 2 * PG, MS_ASYNC) == -1 && errno == ENOMEM, "msync across a hole is ENOMEM");
+    CHECK(msync(ms, PG, MS_ASYNC) == 0 && munmap(ms, PG) == 0, "the first page alone is fine");
+
+    // A file written through a shared mapping, the way a linker writes its
+    // output: sized by ftruncate (all holes), filled through the mapping.
+    size_t out_sz = 300 * PG + 123;
+    int out = open("/ltmm.out", O_CREAT | O_RDWR | O_TRUNC, 0644);
+    CHECK(out >= 0 && ftruncate(out, (off_t)out_sz) == 0, "create and size a file");
+    unsigned char *om = mmap(NULL, out_sz, PROT_READ | PROT_WRITE, MAP_SHARED, out, 0);
+    CHECK(om != MAP_FAILED, "MAP_SHARED of the new file");
+    for (size_t i = 0; i < out_sz; i += 61) om[i] = (unsigned char)(i * 13 + 1);
+    CHECK(munmap(om, out_sz) == 0, "munmap of the shared mapping");
+    ok = 1;
+    for (size_t i = 0; i < out_sz && ok; i += 61 * 97) {
+        unsigned char got = 0;
+        ok = pread(out, &got, 1, (off_t)i) == 1 && got == (unsigned char)(i * 13 + 1);
+    }
+    CHECK(ok, "what the mapping wrote is in the file");
+    close(out);
+    CHECK(unlink("/ltmm.out") == 0, "remove the file");
+
+    // A sparse file far bigger than anything cached: syncing it costs what
+    // is dirty, not its size, and a page dirtied far in is still found.
+    {
+        int sp = open("/ltmm.sparse", O_CREAT | O_RDWR | O_TRUNC, 0644);
+        CHECK(sp >= 0 && ftruncate(sp, (off_t)1 << 42) == 0, "size a sparse file to 4 TiB");
+        CHECK(ftruncate(sp, (off_t)1 << 62) == -1 && errno == EFBIG, "a size no file can have is EFBIG");
+        off_t far = (off_t)3 << 30;
+        unsigned char *far_map = mmap(NULL, 2 * PG, PROT_READ | PROT_WRITE, MAP_SHARED, sp, far);
+        CHECK(far_map != MAP_FAILED, "MAP_SHARED far into the sparse file");
+        memcpy(far_map + 100, "far page", 8);
+        CHECK(msync(far_map, 2 * PG, MS_SYNC) == 0 && fsync(sp) == 0, "msync and fsync of it return");
+        CHECK(munmap(far_map, 2 * PG) == 0, "munmap of the far mapping");
+        char back[8] = {0};
+        CHECK(pread(sp, back, 8, far + 100) == 8 && memcmp(back, "far page", 8) == 0, "the far page reached the file");
+        unsigned char gap = 1;
+        CHECK(pread(sp, &gap, 1, far - 5) == 1 && gap == 0, "the hole beside it reads as zero");
+        close(sp);
+        CHECK(unlink("/ltmm.sparse") == 0, "remove the sparse file");
+    }
+
     printf("lt_mm: PASS (%d checks)\n", check_no);
     return 0;
 }

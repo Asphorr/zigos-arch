@@ -1,5 +1,5 @@
 //! Linux memory-management syscalls for `.linux` processes: mmap, munmap,
-//! mprotect, madvise, brk, mremap. They edit the process's region set
+//! mprotect, madvise, msync, brk, mremap. They edit the process's region set
 //! (PCB.regions, mm/vma.zig) under the write side of its as_lock; the page
 //! tables follow — pages appear on first touch through the fault handler, and
 //! an edit that takes pages away unmaps them and shoots the range down.
@@ -53,6 +53,8 @@ const MAP_FIXED_NOREPLACE: u64 = 0x100000;
 // madvise advice that drops pages.
 const MADV_DONTNEED: u64 = 4;
 const MADV_FREE: u64 = 8;
+
+const MS_SYNC: u64 = 4;
 
 /// Most MAP_SHARED file regions one munmap flushes after dropping the lock;
 /// the rest wait for pgflushd.
@@ -346,6 +348,39 @@ pub fn brk(addr: u64) u64 {
     }
     owner.user_brk = addr;
     return addr;
+}
+
+/// msync(addr, len, flags): -ENOMEM unless the whole range is mapped, which
+/// is also the probe Zig's stack walker makes before it reads a frame.
+/// MS_SYNC writes back the MAP_SHARED files in the range; without it their
+/// dirty pages wait for pgflushd.
+pub fn msync(addr: u64, len: u64, flags: u64) u64 {
+    if (addr & (PAGE - 1) != 0) return err(EINVAL);
+    const len_pg = pageUp(len) orelse return err(ENOMEM);
+    if (len_pg == 0) return 0;
+    if (!rangeOk(addr, len_pg)) return err(ENOMEM);
+    const owner = lead() orelse return err(EINVAL);
+    const end = addr + len_pg;
+
+    var flush: [MAX_FLUSH_INODES]u32 = undefined;
+    var n_flush: usize = 0;
+    {
+        owner.as_lock.acquireRead();
+        defer owner.as_lock.releaseRead();
+        if (!owner.regions.covers(addr, end)) return err(ENOMEM);
+        if (flags & MS_SYNC != 0) {
+            var it = owner.regions.atOrAbove(addr);
+            while (it) |r| : (it = owner.regions.atOrAbove(r.end)) {
+                if (r.start >= end) break;
+                if (r.cache_inode != 0 and r.cache_shared and n_flush < flush.len) {
+                    flush[n_flush] = r.cache_inode;
+                    n_flush += 1;
+                }
+            }
+        }
+    }
+    for (flush[0..n_flush]) |inum| _ = vfs.syncCacheFile(inum, true);
+    return 0;
 }
 
 /// mremap: not modeled. ENOMEM is the "can't do it in place or move it"

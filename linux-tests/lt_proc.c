@@ -3,7 +3,8 @@
 // kill, pipes, dup2 onto stdout, poll with and without timeouts, execve with
 // argv, envp and close-on-exec (of a stamped image and of one that carries
 // no OSABI stamp), the FP state across fork, process_vm_readv on itself,
-// sysinfo. Exit 0 = every check passed, else the number of the first failed
+// sysinfo, /dev/null as a child's stdin, tkill. Exit 0 = every check passed,
+// else the number of the first failed
 // check. Run as `lt_proc exec-child <fd-cloexec> <fd-kept>` it is the
 // execve target instead.
 
@@ -17,6 +18,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/syscall.h>
 #include <sys/sysinfo.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
@@ -255,6 +257,26 @@ int main(int argc, char **argv) {
     // sysinfo
     struct sysinfo si;
     CHECK(sysinfo(&si) == 0 && si.totalram > 0 && si.freeram <= si.totalram, "sysinfo");
+
+    // a child with /dev/null for stdin, as a build runner starts its tools
+    int nul = open("/dev/null", O_RDWR);
+    CHECK(nul >= 0, "open /dev/null");
+    p = fork();
+    if (p == 0) {
+        char c;
+        if (dup2(nul, 0) != 0) _exit(1);
+        _exit(read(0, &c, 1) == 0 ? 0 : 2);
+    }
+    CHECK(wait_exit(p) == 0, "dup2 of /dev/null onto stdin, EOF from it");
+    close(nul);
+
+    // abort() raises SIGABRT with tkill: it ends the process
+    p = fork();
+    if (p == 0) {
+        syscall(SYS_tkill, syscall(SYS_gettid), SIGABRT);
+        _exit(0);
+    }
+    CHECK(waitpid(p, &st, 0) == p && WIFSIGNALED(st) && WTERMSIG(st) == SIGABRT, "tkill(SIGABRT) status");
 
     // churn
     for (int i = 0; i < 20; i++) {

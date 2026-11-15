@@ -2,7 +2,8 @@
 // directory fds (openat, mkdirat, fstatat, statx, faccessat, unlinkat,
 // renameat2), getdents64 with long names, ftruncate both ways, rename of
 // files and of directories across parents, preadv/pwritev, copy_file_range,
-// flock and fsync. Works under /ltfs, which it removes first and last.
+// flock and fsync, chdir and fchdir. Works under /ltfs, which it removes
+// first and last.
 // Exit 0 = every check passed, else the number of the first failed check.
 
 #define _GNU_SOURCE
@@ -71,6 +72,25 @@ static int lists(int dirfd, const char *name) {
     while (d && (e = readdir(d)) != NULL) found |= strcmp(e->d_name, name) == 0;
     if (d) closedir(d);
     return found;
+}
+
+static int type_in(const char *dir, const char *name) {
+    DIR *d = opendir(dir);
+    int type = -1;
+    struct dirent *e;
+    while (d && (e = readdir(d)) != NULL)
+        if (strcmp(e->d_name, name) == 0) type = e->d_type;
+    if (d) closedir(d);
+    return type;
+}
+
+static int count_entries(int dirfd) {
+    int fd = openat(dirfd, ".", O_RDONLY | O_DIRECTORY);
+    DIR *d = fdopendir(fd);
+    int n = 0;
+    while (d && readdir(d) != NULL) n++;
+    if (d) closedir(d);
+    return n;
 }
 
 static unsigned char big[100000];
@@ -157,6 +177,25 @@ int main(void) {
     close(l);
     CHECK(lists(d, LONG_NAME) && lists(d, "sub") && lists(d, ".") && lists(d, ".."), "readdir lists every name in full");
 
+    // Entry types, for names the image came with (its entries carry none).
+    CHECK(type_in("/", "etc") == DT_DIR && type_in("/etc", "motd") == DT_REG, "readdir reports entry types");
+
+    // More entries than one getdents64 call returns.
+    CHECK(mkdirat(d, "many", 0755) == 0, "mkdirat many");
+    int many = openat(d, "many", O_RDONLY | O_DIRECTORY);
+    int made = 0;
+    for (int i = 0; i < 120; i++) {
+        char name[64];
+        snprintf(name, sizeof name, "entry_number_%03d_with_a_longer_name.txt", i);
+        int e = openat(many, name, O_CREAT | O_WRONLY, 0644);
+        if (e >= 0) {
+            made++;
+            close(e);
+        }
+    }
+    CHECK(made == 120 && count_entries(many) == 122, "a directory of 120 files lists each once");
+    close(many);
+
     // Renames: a file, a file over another, a directory across parents.
     CHECK(renameat(d, "sub/a.txt", d, "sub/b.txt") == 0, "renameat");
     errno = 0;
@@ -190,6 +229,23 @@ int main(void) {
     CHECK(unlinkat(d, "sub/b.txt", 0) == 0, "unlinkat a file");
     errno = 0;
     CHECK(unlinkat(d, "sub/b.txt", 0) == -1 && errno == ENOENT, "unlinkat it again is ENOENT");
+
+    // chdir and fchdir: relative names follow the cwd.
+    char cwd[256];
+    CHECK(chdir(ROOT) == 0 && getcwd(cwd, sizeof cwd) != NULL && strncmp(cwd, ROOT, strlen(ROOT)) == 0, "chdir");
+    int rel = open("rel.txt", O_CREAT | O_WRONLY, 0644);
+    CHECK(rel >= 0 && size_at(d, "rel.txt") == 0, "a relative name lands in the cwd");
+    close(rel);
+    CHECK(fchdir(sub) == 0, "fchdir");
+    rel = open("in_sub.txt", O_CREAT | O_WRONLY, 0644);
+    CHECK(rel >= 0 && size_at(sub, "in_sub.txt") == 0, "and names follow it");
+    close(rel);
+    errno = 0;
+    CHECK(chdir("no-such-dir") == -1 && errno == ENOENT, "chdir to a missing directory is ENOENT");
+    errno = 0;
+    CHECK(chdir("in_sub.txt") == -1 && errno == ENOTDIR, "chdir to a file is ENOTDIR");
+    CHECK(chdir("/") == 0, "back to the root");
+    CHECK(unlinkat(d, "rel.txt", 0) == 0 && unlinkat(sub, "in_sub.txt", 0) == 0, "remove the two files");
     close(sub);
     close(d);
     remove_tree(AT_FDCWD, ROOT);
