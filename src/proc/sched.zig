@@ -2713,11 +2713,17 @@ pub fn wakeExpired() void {
             stuck_last_seen_wait_kind[i] = null;
             continue;
         }
-        if (deadlineParked(pcb.wait_kind) and wt != 0 and process.tick_count >= wt) {
-            @atomicStore(u64, &pcb.wake_tick, 0, .release);
-            wakelat.hintWake(i, if (pcb.wait_kind == .gpu_io) .gpu_io else .parked);
-            clearWait(pcb);
-            _ = setStateFrom(i, .sleeping, .ready);
+        // The other deadline parks, claimed the same way. A plain store and
+        // clearWait here could land on the waiter's next wait instead: zero
+        // a fresh deadline (a timed wait with no timeout left), or wipe the
+        // kind its waker scans for (.gpu_io leaves a due wake_tick behind
+        // when wake() ends it, so a mutex wait right after would match).
+        const parked_kind: WaitKind = @enumFromInt(@atomicLoad(u8, @as(*const u8, @ptrCast(&pcb.wait_kind)), .acquire));
+        if (deadlineParked(parked_kind) and wt != 0 and process.tick_count >= wt) {
+            if (@cmpxchgStrong(u64, &pcb.wake_tick, wt, 0, .acq_rel, .monotonic) == null and claimWait(pcb, parked_kind)) {
+                wakelat.hintWake(i, if (parked_kind == .gpu_io) .gpu_io else .parked);
+                _ = setStateFrom(i, .sleeping, .ready);
+            }
             stuck_last_seen_wait_kind[i] = null;
             continue;
         }
@@ -3213,10 +3219,16 @@ pub fn blockOnFutex(addr: usize, word: *const volatile u32, val: u32, deadline: 
 /// owns the outcome. A FUTEX_WAKE counts a waiter only when it won, so a
 /// waiter that timed out can't swallow a wake meant for another.
 inline fn claimFutexWait(pcb: *PCB) bool {
-    const kind: *u8 = @ptrCast(&pcb.wait_kind);
-    if (@cmpxchgStrong(u8, kind, @intFromEnum(WaitKind.futex), @intFromEnum(WaitKind.none), .acq_rel, .acquire) != null) return false;
-    @atomicStore(u32, &pcb.wait_target, 0, .release);
-    return true;
+    return claimWait(pcb, .futex);
+}
+
+/// Move wait_kind from `kind` to .none; false when the wait is no longer
+/// of that kind (ended, or the waiter is already in another). wait_target
+/// is left alone: nothing matches it under .none, and a store after the
+/// claim could land on the waiter's next wait.
+inline fn claimWait(pcb: *PCB, kind: WaitKind) bool {
+    const k: *u8 = @ptrCast(&pcb.wait_kind);
+    return @cmpxchgStrong(u8, k, @intFromEnum(kind), @intFromEnum(WaitKind.none), .acq_rel, .acquire) == null;
 }
 
 /// Leave a wait that was never slept in, reporting `why` if the waiter

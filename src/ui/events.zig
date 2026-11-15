@@ -2,9 +2,10 @@
 //
 // Replaces the patchwork "global keyboard ring + per-terminal kb_pipe +
 // mouse-special-case + ad-hoc focus polling" with a per-window typed
-// event queue. The desktop is the sole producer (drains the keyboard
+// event queue. The desktop is the main producer (drains the keyboard
 // IRQ ring and publishes events into the focused window's queue); the
-// owning process is the sole consumer (drains via syscall).
+// owning process consumes (drains via syscall). Window creation pushes
+// too, from the creating app's context, so the queue is locked.
 //
 // Phase 1 scope: key_char + key_special events only. Mouse, focus
 // transitions, resize, and close events are reserved kinds for later
@@ -20,13 +21,12 @@
 //     adding one queue per window costs MAX_WINDOWS × QUEUE_BYTES of
 //     BSS and disappears with the window.
 //
-// SPSC safety: desktop is the only producer (single kernel task), and
-// only the focused window's owner can consume (kernel filters by pid in
-// `desktop.popEvent`). On x86 with TSO, head/tail u8 stores and reads
-// are sequenced enough that the producer's queue write becomes visible
-// before the head bump. No locks needed.
+// Every queue operation takes `queue_lock`: besides the desktop, a window
+// being created or removed pushes focus events from the app's CPU, and the
+// owner pops on its own.
 
 const std = @import("std");
+const spinlock = @import("../proc/spinlock.zig");
 
 /// Event categories. Numeric values are part of the user-space ABI —
 /// libc maps these to constants and apps switch on them. Don't reorder
@@ -101,31 +101,59 @@ comptime {
 pub const QUEUE_SIZE: u8 = 32;
 const QUEUE_MASK: u8 = QUEUE_SIZE - 1;
 
+/// One lock for every window's queue. The desktop task is not the only
+/// producer: a syscall that creates a window pushes focus events from the
+/// app's CPU, and the owner pops on its own. A leaf lock, held for a few
+/// instructions; nothing is acquired under it.
+var queue_lock: spinlock.SpinLock = .{};
+
+/// For a writer that replaces a whole queue at once, as a window slot
+/// reset does: the desktop may be pushing into that queue. Taken after
+/// windows_lock where both are held.
+pub fn lockQueues() u64 {
+    return queue_lock.acquireIrqSave();
+}
+
+pub fn unlockQueues(flags: u64) void {
+    queue_lock.releaseIrqRestore(flags);
+}
+
 pub const EventQueue = struct {
     buf: [QUEUE_SIZE]Event = [_]Event{.{ .kind = 0 }} ** QUEUE_SIZE,
     head: u8 = 0,
     tail: u8 = 0,
 
-    /// Push an event. If the queue is full, the new event is dropped
-    /// (overflow). Drop-newest matches the user's intent better than
-    /// drop-oldest — when the app is too slow to drain, the user is
-    /// usually about to retry rather than missing a stale stroke.
-    pub fn push(self: *EventQueue, ev: Event) void {
+    /// Push an event; false if the queue is full and the event was dropped.
+    /// Drop-newest matches the user's intent better than drop-oldest — when
+    /// the app is too slow to drain, the user is usually about to retry
+    /// rather than missing a stale stroke.
+    pub fn tryPush(self: *EventQueue, ev: Event) bool {
+        const f = queue_lock.acquireIrqSave();
+        defer queue_lock.releaseIrqRestore(f);
         const next = (self.head + 1) & QUEUE_MASK;
-        if (next == self.tail) return;
+        if (next == self.tail) return false;
         self.buf[self.head] = ev;
         self.head = next;
+        return true;
+    }
+
+    pub fn push(self: *EventQueue, ev: Event) void {
+        _ = self.tryPush(ev);
     }
 
     /// Pop the oldest event. Returns null when empty.
     pub fn pop(self: *EventQueue) ?Event {
+        const f = queue_lock.acquireIrqSave();
+        defer queue_lock.releaseIrqRestore(f);
         if (self.head == self.tail) return null;
         const ev = self.buf[self.tail];
         self.tail = (self.tail + 1) & QUEUE_MASK;
         return ev;
     }
 
-    pub fn isEmpty(self: *const EventQueue) bool {
+    pub fn isEmpty(self: *EventQueue) bool {
+        const f = queue_lock.acquireIrqSave();
+        defer queue_lock.releaseIrqRestore(f);
         return self.head == self.tail;
     }
 
@@ -133,6 +161,8 @@ pub const EventQueue = struct {
     /// so a window doesn't deliver stale events when it next becomes
     /// focused (or to a future tenant of the same slot).
     pub fn clear(self: *EventQueue) void {
+        const f = queue_lock.acquireIrqSave();
+        defer queue_lock.releaseIrqRestore(f);
         self.tail = self.head;
     }
 };

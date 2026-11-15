@@ -3811,20 +3811,17 @@ pub fn run() void {
                     (@as(u32, @intFromBool(keyboard.ctrl_held)) << 1) |
                     (@as(u32, @intFromBool(keyboard.alt_held)) << 2) |
                     (@as(u32, @intFromBool(keyboard.caps_lock)) << 3);
-                // DBG: pre-push queue depth (tail to head distance).
-                const pre_count: u8 = (w.events.head -% w.events.tail) & 31;
-                w.events.push(.{ .kind = kind, .a = ch, .b = mods });
-                const post_count: u8 = (w.events.head -% w.events.tail) & 31;
+                const queued = w.events.tryPush(.{ .kind = kind, .a = ch, .b = mods });
                 // Wake any io_uring OP_POLL waiters on a console fd. We
                 // can't filter by which pid owns the focused window here
                 // (fdpoll's wake walk does pollMaskConsole, which re-runs
                 // the focus/visibility/owner check), so the broadcast
                 // (.console, 0xFFFF) lets the matcher do its job.
-                if (post_count != pre_count) {
+                if (queued) {
                     @import("../cpu/ipc/fdpoll.zig").wakePollers(.console, 0xFFFF);
                 }
-                if (pre_count == post_count) {
-                    // push() did NOT advance head — queue full, event dropped
+                if (!queued) {
+                    // Queue full, event dropped.
                     dbg_event_queue_full +%= 1;
                     if (process.tick_count -% dbg_last_qfull_log >= 100) {
                         dbg_last_qfull_log = process.tick_count;
@@ -4710,11 +4707,10 @@ pub fn consoleReadable(pid: u8) bool {
     if (!w.visible or w.minimized) return false;
     if (w.term != null) return false;
     if (w.owner_pid != pid) return false;
-    // Queue uses ring buffer: head==tail = empty. We don't peek event
-    // kinds — non-char events are vanishingly rare (no current pusher),
-    // and a stale POLLIN that resolves to zero bytes is benign (caller
-    // re-polls).
-    return w.events.head != w.events.tail;
+    // We don't peek event kinds — non-char events are vanishingly rare
+    // (no current pusher), and a stale POLLIN that resolves to zero bytes
+    // is benign (caller re-polls).
+    return !w.events.isEmpty();
 }
 
 /// Drain one char event from the focused window's queue and return its

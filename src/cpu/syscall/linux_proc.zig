@@ -24,6 +24,7 @@ const heap = @import("../../mm/heap.zig");
 const pmm = @import("../../mm/pmm.zig");
 const fdpoll = @import("../ipc/fdpoll.zig");
 const smp = @import("../smp.zig");
+const usercopy = @import("../arch/usercopy.zig");
 const common = @import("common.zig");
 const linux_fs = @import("linux_fs.zig");
 const linux_time = @import("linux_time.zig");
@@ -375,14 +376,39 @@ pub fn ppoll(fds_va: u64, nfds: u64, tmo_va: u64) u64 {
     };
 }
 
+/// Poll sets up to this size are copied to the stack, larger ones to the heap.
+const POLL_STACK_FDS: usize = 32;
+
 fn pollFor(fds_va: u64, nfds: u64, timeout_ns: ?u64) u64 {
     if (nfds > 1024) return err(EINVAL);
     const n: usize = @intCast(nfds);
-    if (n > 0 and !common.validateUserPtrWrite(fds_va, n * @sizeOf(PollFd))) return err(EFAULT);
+    const bytes = n * @sizeOf(PollFd);
+    if (n > 0 and !common.validateUserPtrWrite(fds_va, bytes)) return err(EFAULT);
     const me = smp.currentPid() orelse return err(EFAULT);
+    // The set is read once and written back once, by faultable copies on
+    // either side of the wait. A park can outlive the pages proven above
+    // (swap, a sibling's munmap), and bringing one back blocks, which
+    // inside the wait would eat the wake of an fd event.
+    var on_stack: [POLL_STACK_FDS]PollFd = undefined;
+    const on_heap: ?[*]u8 = if (n > POLL_STACK_FDS) (heap.kmalloc(bytes) orelse return err(ENOMEM)) else null;
+    defer if (on_heap) |p| heap.kfree(p);
+    const fds: []PollFd = if (on_heap) |p| @as([*]PollFd, @ptrCast(@alignCast(p)))[0..n] else on_stack[0..n];
+    if (!usercopy.copyFromUser(std.mem.sliceAsBytes(fds), fds_va)) return err(EFAULT);
+    const ready = pollWait(me, fds, timeout_ns);
+    // Only revents goes back: a sibling's edit of fd or events during the
+    // wait is the caller's to keep.
+    for (fds, 0..) |*p, i| {
+        const va = fds_va + i * @sizeOf(PollFd) + @offsetOf(PollFd, "revents");
+        if (!usercopy.copyToUser(va, std.mem.asBytes(&p.revents))) return err(EFAULT);
+    }
+    return ready;
+}
+
+/// Fill revents in `fds`, waiting until an entry is ready or the timeout
+/// passes; returns how many are ready. Touches no user memory.
+fn pollWait(me: usize, fds: []PollFd, timeout_ns: ?u64) u64 {
     const pcb = &process.procs[me];
     const group: u8 = pcb.tgid;
-    const fds: [*]align(1) PollFd = @ptrFromInt(fds_va);
     const deadline: u64 = if (timeout_ns) |ns| deadlineAfter(ns) else 0;
     // Registered before the first look, so an fd event after it wakes us.
     fdpoll.sleeperEnter(me);
@@ -392,19 +418,19 @@ fn pollFor(fds_va: u64, nfds: u64, timeout_ns: ?u64) u64 {
     }
     while (true) {
         var ready: u64 = 0;
-        for (0..n) |i| {
-            const fd = fds[i].fd;
+        for (fds) |*p| {
+            const fd = p.fd;
             if (fd < 0) {
-                fds[i].revents = 0;
+                p.revents = 0;
                 continue;
             }
-            const want: u16 = @bitCast(fds[i].events);
+            const want: u16 = @bitCast(p.events);
             const lead = &process.procs[group];
             const mask: u16 = if (fd >= lead.fd_table.len or !lead.fd_table[@intCast(fd)].in_use)
                 POLLNVAL
             else
                 fdpoll.pollMask(group, @intCast(fd)) & (want | fdpoll.POLLERR | fdpoll.POLLHUP);
-            fds[i].revents = @bitCast(mask);
+            p.revents = @bitCast(mask);
             if (mask != 0) ready += 1;
         }
         if (ready > 0) return ready;

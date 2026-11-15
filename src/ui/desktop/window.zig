@@ -195,9 +195,10 @@ pub const Window = struct {
     anim_end_y: i32 = 0,
     anim_end_w: u32 = 0,
     anim_end_h: u32 = 0,
-    /// Per-window event queue. Desktop is the sole producer (drains the
+    /// Per-window event queue. The desktop is the main producer (drains the
     /// keyboard IRQ ring and publishes events here when this window is
-    /// focused); the owning process drains via `sysPollEvent` (or, for
+    /// focused), window creation and removal push focus events too; the
+    /// owning process drains via `sysPollEvent` (or, for
     /// legacy console-fd consumers, via `desktop.popCharEvent` from
     /// `sysRead`/`vfs.read`). See ui/events.zig for the event model.
     events: events_mod.EventQueue = .{},
@@ -257,7 +258,7 @@ pub fn allocSlot() ?u8 {
     for (0..MAX_WINDOWS) |i| {
         if (!slot_used[i]) {
             slot_used[i] = true;
-            windows[i] = defaultWindow();
+            resetSlot(i);
             return @intCast(i);
         }
     }
@@ -269,6 +270,14 @@ pub fn allocSlot() ?u8 {
 pub fn freeSlot(slot: u8) void {
     if (slot >= MAX_WINDOWS) return;
     slot_used[slot] = false;
+    resetSlot(slot);
+}
+
+/// The store rewrites the slot's event queue, which the desktop may be
+/// pushing into through a pointer it took without windows_lock.
+fn resetSlot(slot: usize) void {
+    const f = events_mod.lockQueues();
+    defer events_mod.unlockQueues(f);
     windows[slot] = defaultWindow();
 }
 
