@@ -4,14 +4,16 @@
 // read + writeback orchestration (readThroughCache/syncCacheFile/
 // flushAllDirty).
 //
-// Dispatch contract: the FsType/FdType switches below are exhaustive on
-// purpose — adding a filesystem is adding an enum variant, after which the
-// compiler names every dispatch point that still needs an arm. That IS the
-// backend interface; five static filesystems don't need vtable indirection.
+// Dispatch contract: path operations switch on the mount's FsType, and the
+// switches are exhaustive on purpose — adding a filesystem is adding an enum
+// variant, after which the compiler names every path dispatch point that
+// still needs an arm. An open file carries its operations with it (file.zig's
+// Ops; the tables of the kinds made here are below), so a new kind of file
+// — one no path names — needs no arm at all.
 //
 // Error convention: fd ops return VFS_ERR for "bad fd / not permitted" and
 // 0 for "nothing transferred" (write may also return an errno encoding —
-// see the ext2 ETXTBSY arm); path helpers return null.
+// see ext2FileWrite); path helpers return null.
 
 const std = @import("std");
 const Phys = @import("../util/addr.zig").Phys;
@@ -24,9 +26,16 @@ const process = @import("../proc/process.zig");
 const keyboard = @import("../driver/keyboard.zig");
 const vga = @import("../ui/vga.zig");
 const pipe = @import("../proc/pipe.zig");
+const tty = @import("../proc/tty.zig");
 const paging = @import("../mm/paging.zig");
 const pmm = @import("../mm/pmm.zig");
 const page_cache = @import("../mm/page_cache.zig");
+const heap = @import("../mm/heap.zig");
+const memmap = @import("../mm/memmap.zig");
+const usercopy = @import("../cpu/arch/usercopy.zig");
+const errno = @import("../proc/errno.zig");
+const file = @import("file.zig");
+const File = file.File;
 
 pub const O_CREATE: u32 = 0x100;
 pub const O_APPEND: u32 = 0x400; // start the fd's offset at file_size so writes append
@@ -38,7 +47,7 @@ const VFS_ERR: u32 = 0xFFFFFFFF;
 
 pub const FsType = enum { tarfs, fat32, devfs, procfs, ext2 };
 
-const ResolvedPath = struct {
+pub const ResolvedPath = struct {
     fs: FsType,
     path: []const u8, // path within the filesystem (without mount prefix)
 };
@@ -130,43 +139,91 @@ pub fn findMount(path: []const u8) ?Mount {
     return best;
 }
 
-/// Resolve a path to a filesystem and relative path.
-/// Absolute paths look up the longest matching mount prefix.
-/// Relative paths get cwd prepended and re-resolved as absolute.
+/// Resolve a path to a filesystem and the path inside it. A relative path
+/// starts at the cwd; the mount is the one with the longest matching prefix.
+/// Symbolic links on the way are replaced by their targets, the last
+/// component's too.
 pub fn resolvePath(pcb: *process.PCB, path: []const u8, path_buf: *[256]u8) ?ResolvedPath {
+    return resolvePathOpt(pcb, path, path_buf, true);
+}
+
+/// resolvePath that leaves a symbolic link in the last component alone: for
+/// what acts on the link itself (lstat, unlink, rename, readlink).
+pub fn resolvePathNoFollow(pcb: *process.PCB, path: []const u8, path_buf: *[256]u8) ?ResolvedPath {
+    return resolvePathOpt(pcb, path, path_buf, false);
+}
+
+fn resolvePathOpt(pcb: *process.PCB, path: []const u8, path_buf: *[256]u8, follow_last: bool) ?ResolvedPath {
     if (path.len == 0) return null;
 
-    // Absolute path → mount-table lookup.
+    // The absolute form, in path_buf.
+    var n: usize = 0;
     if (path[0] == '/') {
-        const m = findMount(path) orelse return null;
-        const rel = path[m.prefix.len..];
-        // `rel` may already live inside `path_buf` (after a recursive cwd
-        // prepend), so a plain @memcpy would alias. copyForwards is the
-        // safe choice for the dst-below-src pattern we always have here.
-        // Empty rel (the mount root itself, e.g. "/dev/") is allowed —
-        // caller distinguishes; `open` will refuse, but `readdir` lists.
-        if (rel.len > 0) std.mem.copyForwards(u8, path_buf[0..rel.len], rel);
-        return .{ .fs = m.fs, .path = path_buf[0..rel.len] };
+        if (path.len > path_buf.len) return null;
+        moveBytes(path_buf[0..path.len], path);
+        n = path.len;
+    } else {
+        var cwd_copy: [256]u8 = undefined;
+        const cwd = cwd_copy[0..pcb.cwd_len];
+        @memcpy(cwd, pcb.cwd[0..pcb.cwd_len]);
+        if (cwd.len == 0) return null;
+        const sep: usize = if (cwd[cwd.len - 1] == '/') 0 else 1;
+        if (cwd.len + sep + path.len > path_buf.len) return null;
+        moveBytes(path_buf[cwd.len + sep ..][0..path.len], path);
+        @memcpy(path_buf[0..cwd.len], cwd);
+        if (sep == 1) path_buf[cwd.len] = '/';
+        n = cwd.len + sep + path.len;
     }
 
-    // Relative path — prepend cwd, recurse as absolute.
-    const cwd = pcb.cwd[0..pcb.cwd_len];
-    if (cwd.len == 0) return null;
-    if (cwd.len + 1 + path.len > 256) return null;
+    n = expandLinks(path_buf, n, follow_last) orelse return null;
+    const m = findMount(path_buf[0..n]) orelse return null;
+    // Empty rel (the mount root itself, e.g. "/dev/") is allowed — caller
+    // distinguishes; `open` will refuse, but `readdir` lists.
+    const rel_len = n - m.prefix.len;
+    std.mem.copyForwards(u8, path_buf[0..rel_len], path_buf[m.prefix.len..n]);
+    return .{ .fs = m.fs, .path = path_buf[0..rel_len] };
+}
 
-    var buf_idx: usize = 0;
-    @memcpy(path_buf[buf_idx..][0..cwd.len], cwd);
-    buf_idx += cwd.len;
-
-    if (cwd[cwd.len - 1] != '/') {
-        path_buf[buf_idx] = '/';
-        buf_idx += 1;
+/// Copy `src` to `dst`, which may overlap it either way.
+fn moveBytes(dst: []u8, src: []const u8) void {
+    if (@intFromPtr(dst.ptr) <= @intFromPtr(src.ptr)) {
+        std.mem.copyForwards(u8, dst, src);
+    } else {
+        std.mem.copyBackwards(u8, dst, src);
     }
+}
 
-    @memcpy(path_buf[buf_idx..][0..path.len], path);
-    buf_idx += path.len;
+/// Most symbolic links one resolution follows (Linux's MAXSYMLINKS).
+const MAX_LINK_HOPS: u8 = 40;
 
-    return resolvePath(pcb, path_buf[0..buf_idx], path_buf);
+/// Replace the symbolic links in the absolute path `buf[0..len]` by their
+/// targets, in place — the last component's only with `follow_last`.
+/// Returns the new length, or null for a loop of links or a path that
+/// outgrows the buffer. A name that doesn't exist ends the expansion: what
+/// is there to that point is resolved, the rest is the caller's to miss or
+/// create. Links live on ext2; a target may lead to another mount.
+fn expandLinks(buf: *[256]u8, len: usize, follow_last: bool) ?usize {
+    var n = len;
+    var hops: u8 = 0;
+    while (true) {
+        const m = findMount(buf[0..n]) orelse return n;
+        if (m.fs != .ext2) return n;
+        const base = m.prefix.len;
+        var target_buf: [255]u8 = undefined;
+        const link = ext2.findLink(buf[base..n], follow_last, &target_buf) orelse return n;
+        hops += 1;
+        if (hops > MAX_LINK_HOPS) return null;
+        // An absolute target replaces everything up to the link; a relative
+        // one starts in the link's directory. What followed the link stays.
+        const head: usize = if (link.target[0] == '/') 0 else base + link.start;
+        const tail = base + link.end;
+        const rest = n - tail;
+        const new_tail = head + link.target.len;
+        if (new_tail + rest > buf.len) return null;
+        moveBytes(buf[new_tail..][0..rest], buf[tail..n]);
+        @memcpy(buf[head..][0..link.target.len], link.target);
+        n = new_tail + rest;
+    }
 }
 
 pub fn open(pcb: *process.PCB, name: []const u8) ?u32 {
@@ -177,20 +234,24 @@ pub fn openFlags(pcb: *process.PCB, name: []const u8, flags: u32) ?u32 {
     var path_buf: [256]u8 = undefined;
     const resolved = resolvePath(pcb, name, &path_buf) orelse return null;
 
-    // Claim the fd index up front, so no fs-side open (or truncate) can run
-    // for a process whose table is already full. This ordering is
-    // load-bearing for O_TRUNC: the truncate used to run before the fd
-    // allocation, so open() on a full table destroyed the file's contents
-    // and then failed. A failed open hands the slot back below.
+    // Claim the fd index and the file object up front, so no fs-side open
+    // (or truncate) can run for a process that can't take the file. This
+    // ordering is load-bearing for O_TRUNC: the truncate used to run before
+    // the fd allocation, so open() on a full table destroyed the file's
+    // contents and then failed. A failed open hands both back below.
     const fd_idx = allocFd(pcb) orelse return null;
+    const f = file.create(.{}) orelse {
+        releaseFd(pcb, fd_idx);
+        return null;
+    };
 
-    // Each arm resolves the fs-specific open to the FileDesc to install, or
-    // null. Exactly one install point below — per-arm fd bookkeeping is how
-    // the truncate-before-alloc bug stayed hidden.
-    const maybe_desc: ?process.FileDesc = switch (resolved.fs) {
+    // Each arm resolves the fs-specific open to the file's fields, or null.
+    // Exactly one install point below — per-arm fd bookkeeping is how the
+    // truncate-before-alloc bug stayed hidden.
+    const maybe_init: ?File = switch (resolved.fs) {
         .tarfs => blk: {
             const tar_idx = tarfs.openFile(resolved.path) orelse break :blk null;
-            break :blk .{ .in_use = true, .inode = tar_idx, .offset = 0, .flags = 2, .fs_type = .tarfs };
+            break :blk .{ .kind = .tarfs, .inode = tar_idx, .access = file.READ_WRITE };
         },
         .fat32 => blk: {
             if (fat32.openFile(resolved.path)) |handle| {
@@ -198,13 +259,11 @@ pub fn openFlags(pcb: *process.PCB, name: []const u8, flags: u32) ?u32 {
                 // write extends rather than overwrites. fat32.writeFile
                 // already handles offset > file_size by allocating new
                 // clusters as needed.
-                const start_offset: u32 = if (flags & O_APPEND != 0) handle.file_size else 0;
                 break :blk .{
-                    .in_use = true,
+                    .kind = .fat32,
                     .inode = handle.dir_index,
-                    .offset = start_offset,
-                    .flags = 2,
-                    .fs_type = .fat32,
+                    .offset = if (flags & O_APPEND != 0) handle.file_size else 0,
+                    .access = file.READ_WRITE,
                     .fat_dir_cluster = handle.dir_cluster,
                 };
             }
@@ -212,11 +271,9 @@ pub fn openFlags(pcb: *process.PCB, name: []const u8, flags: u32) ?u32 {
             if (flags & O_CREATE != 0) {
                 if (fat32.createFile(resolved.path)) |handle| {
                     break :blk .{
-                        .in_use = true,
+                        .kind = .fat32,
                         .inode = handle.dir_index,
-                        .offset = 0,
-                        .flags = 2,
-                        .fs_type = .fat32,
+                        .access = file.READ_WRITE,
                         .fat_dir_cluster = handle.dir_cluster,
                     };
                 }
@@ -225,51 +282,83 @@ pub fn openFlags(pcb: *process.PCB, name: []const u8, flags: u32) ?u32 {
         },
         .devfs => blk: {
             const dev_idx = devfs.openFile(resolved.path) orelse break :blk null;
-            break :blk .{ .in_use = true, .inode = dev_idx, .offset = 0, .flags = 2, .fs_type = .devfs };
+            break :blk .{ .kind = .devfs, .inode = dev_idx, .access = file.READ_WRITE };
         },
         .procfs => blk: {
             const inode = procfs.openFile(resolved.path) orelse break :blk null;
-            // flags = 0: procfs is read-only.
-            break :blk .{ .in_use = true, .inode = inode, .offset = 0, .flags = 0, .fs_type = .procfs };
+            break :blk .{ .kind = .procfs, .inode = inode, .access = file.READ };
         },
         .ext2 => blk: {
-            if (ext2.openFile(resolved.path)) |handle| {
+            const append = flags & O_APPEND != 0;
+            // The inode is held from here to the file's release
+            // (ext2Release), so an unlink leaves it for this file to use.
+            if (ext2.openHeld(resolved.path)) |handle| {
                 // O_TRUNC on an existing file: free all data + indirect-tree
                 // blocks and reset size to 0. The next writeFile re-allocates.
-                // Safe to do here — with the fd already claimed, nothing after
-                // this point can fail and turn the open into a destructive no-op.
+                // Safe to do here — with the fd and the file already claimed,
+                // nothing after this point can fail and turn the open into a
+                // destructive no-op.
                 if (flags & O_TRUNC != 0) _ = ext2.truncate(handle.inum);
-                // ext2 LARGE_FILE sizes exceed the fd's u32 offset — refuse
-                // O_APPEND there instead of panicking on the cast (corrupt-
-                // image class). handle.file_size is the pre-truncate snapshot,
-                // so O_TRUNC|O_APPEND on such a file also refuses — strictly
-                // better than the checked-@intCast panic it replaces.
-                const start_offset: u32 = if (flags & O_APPEND != 0)
-                    (std.math.cast(u32, handle.file_size) orelse break :blk null)
-                else
-                    0;
-                break :blk .{ .in_use = true, .inode = handle.inum, .offset = start_offset, .flags = 2, .fs_type = .ext2 };
+                // An appending file's offset starts at the end as well, for
+                // what reads it before the first write.
+                const size: u64 = if (flags & O_TRUNC != 0) 0 else handle.file_size;
+                break :blk .{
+                    .kind = .ext2,
+                    .inode = handle.inum,
+                    .offset = if (append) size else 0,
+                    .access = file.READ_WRITE,
+                    .append = append,
+                };
             }
             // Not found — create if O_CREATE flag set.
             if (flags & O_CREATE != 0) {
-                if (ext2.createFilePath(resolved.path)) |handle| {
-                    break :blk .{ .in_use = true, .inode = handle.inum, .offset = 0, .flags = 2, .fs_type = .ext2 };
+                if (ext2.createHeld(resolved.path)) |handle| {
+                    break :blk .{ .kind = .ext2, .inode = handle.inum, .access = file.READ_WRITE, .append = append };
                 }
             }
             break :blk null;
         },
     };
-    const desc = maybe_desc orelse {
+    const init = maybe_init orelse {
+        file.put(f); // nothing held yet: the default ops release nothing
         releaseFd(pcb, fd_idx);
         return null;
     };
-    installFd(pcb, fd_idx, desc);
+    setUp(f, init);
+    file.install(pcb, fd_idx, f, false);
     return @intCast(fd_idx);
 }
 
+/// Give a file file.create made its fields and its kind's operations.
+fn setUp(f: *File, init: File) void {
+    f.* = init;
+    f.refs = 1;
+    f.static = false;
+    f.ops = opsFor(init.kind);
+}
+
+/// A new file of `init`'s kind with its operations set, one reference held
+/// by the caller. Null when memory is out.
+pub fn newFile(init: File) ?*File {
+    const f = file.create(.{}) orelse return null;
+    setUp(f, init);
+    return f;
+}
+
+/// A new file in the reserved descriptor `fd_idx`. On failure the
+/// descriptor is handed back and nothing was created.
+pub fn installNew(pcb: *process.PCB, fd_idx: usize, init: File, cloexec: bool) bool {
+    const f = newFile(init) orelse {
+        releaseFd(pcb, fd_idx);
+        return false;
+    };
+    file.install(pcb, fd_idx, f, cloexec);
+    return true;
+}
+
 /// Open a directory for getdents-style enumeration (ext2 only — the writable
-/// root fs). Returns an fd whose `.inode` is the directory's inum and
-/// `.fs_type == .ext2`. ext2.openFile rejects non-regular files, so a Linux
+/// root fs). Returns an fd whose file's `.inode` is the directory's inum and
+/// `.kind == .ext2`. ext2.openFile rejects non-regular files, so a Linux
 /// binary's openat(O_DIRECTORY) falls back to this when the regular-file open
 /// path returns null. No "is-dir" bit is stored — getdents64 / fstat re-read
 /// the inode to learn the type.
@@ -277,15 +366,15 @@ pub fn openDir(pcb: *process.PCB, name: []const u8) ?u32 {
     var path_buf: [256]u8 = undefined;
     const resolved = resolvePath(pcb, name, &path_buf) orelse return null;
     if (resolved.fs != .ext2) return null;
-    const dir_inum = ext2.resolveDirInum(resolved.path) orelse return null;
     const fd_idx = allocFd(pcb) orelse return null;
-    installFd(pcb, fd_idx, .{
-        .in_use = true,
-        .inode = dir_inum,
-        .offset = 0,
-        .flags = 0,
-        .fs_type = .ext2,
-    });
+    const dir_inum = ext2.openDirHeld(resolved.path) orelse {
+        releaseFd(pcb, fd_idx);
+        return null;
+    };
+    if (!installNew(pcb, fd_idx, .{ .kind = .ext2, .inode = dir_inum, .access = file.READ }, false)) {
+        ext2.release(dir_inum);
+        return null;
+    }
     return @intCast(fd_idx);
 }
 
@@ -307,95 +396,231 @@ pub fn statPath(pcb: *process.PCB, name: []const u8, out: *StatInfo) bool {
     return ext2.getFileStat(resolved.path, out);
 }
 
-/// Rebuild the fat32 handle a FileDesc describes. read/write/close all need
-/// the same reconstruction; one definition keeps the dir-cluster default
-/// ("0 means root" — see FileDesc.fat_dir_cluster) in a single place.
-fn fatHandle(fd_entry: *const process.FileDesc) fat32.Handle {
-    const dc = if (fd_entry.fat_dir_cluster != 0) fd_entry.fat_dir_cluster else fat32.root_cluster;
+/// Rebuild the fat32 handle a file describes. read/write/close all need the
+/// same reconstruction; one definition keeps the dir-cluster default ("0
+/// means root" — see File.fat_dir_cluster) in a single place. Null when the
+/// offset is past what fat32 counts.
+fn fatHandle(f: *const File) ?fat32.Handle {
+    const dc = if (f.fat_dir_cluster != 0) f.fat_dir_cluster else fat32.root_cluster;
     return .{
         .dir_cluster = dc,
-        .dir_index = fd_entry.inode,
-        .first_cluster = fat32.getFirstClusterAt(dc, fd_entry.inode),
-        .file_size = fat32.getFileSizeAt(dc, fd_entry.inode),
-        .current_offset = fd_entry.offset,
+        .dir_index = f.inode,
+        .first_cluster = fat32.getFirstClusterAt(dc, f.inode),
+        .file_size = fat32.getFileSizeAt(dc, f.inode),
+        .current_offset = f.offset32() orelse return null,
     };
 }
 
+/// Read from descriptor `fd` of `pcb`'s table at the file's offset.
 pub fn read(pcb: *process.PCB, fd: u32, buf: [*]u8, count: u32) u32 {
-    if (fd >= pcb.fd_table.len or !pcb.fd_table[fd].in_use) return VFS_ERR;
-    const fd_entry = &pcb.fd_table[fd];
+    const f = file.get(pcb, fd) orelse return VFS_ERR;
+    defer file.put(f);
+    return f.ops.read(f, pcb, buf, count);
+}
 
-    switch (fd_entry.fs_type) {
-        .console => {
-            if (fd != 0) return 0;
-            // Reads from the focused window's per-window event queue
-            // (ui/events.zig). Lazy import to keep vfs ↔ desktop one-way.
-            const desktop = @import("../ui/desktop.zig");
-            const cur: u8 = @intCast(pcb.tgid);
-            var bytes_read: u32 = 0;
-            while (bytes_read < count) {
-                if (desktop.popCharEvent(cur)) |ch| {
-                    buf[bytes_read] = ch;
-                    bytes_read += 1;
-                } else break;
-            }
-            return bytes_read;
-        },
-        .fat32 => {
-            const handle = fatHandle(fd_entry);
-            var new_cluster: u32 = 0;
-            var new_off: u32 = 0;
-            const bytes_read = fat32.readFileAt(handle, buf, count, fd_entry.fat_cluster, fd_entry.fat_cluster_off, &new_cluster, &new_off);
-            fd_entry.offset += @intCast(bytes_read);
-            fd_entry.fat_cluster = new_cluster;
-            fd_entry.fat_cluster_off = new_off;
-            return @intCast(bytes_read);
-        },
-        .tarfs => {
-            const bytes_read = tarfs.readAt(fd_entry.inode, fd_entry.offset, buf, count);
-            fd_entry.offset += bytes_read;
-            return bytes_read;
-        },
-        .pipe => {
-            // Pipes only valid as read-side here. Write-side fds use sysFwrite path.
-            if (fd_entry.flags != 0) return VFS_ERR;
-            const n = pipe.read(fd_entry.pipe_id, buf[0..count]);
-            return @intCast(n);
-        },
-        .devfs => {
-            // devfs.read advances fd_entry.offset itself — kmsg's stream
-            // position has to move past bytes that aged out of the ring,
-            // which is more than just the count returned.
-            return devfs.read(fd_entry.inode, &fd_entry.offset, buf, count);
-        },
-        .procfs => {
-            const n = procfs.read(fd_entry.inode, fd_entry.offset, buf, count);
-            fd_entry.offset += n;
-            return n;
-        },
-        .ext2 => {
-            // Through the unified page cache (Slice 3b): a page read here is the
-            // SAME physical frame a later mmap of this file maps, and vice versa.
-            // Falls back to a private uncached read only under frame OOM.
-            const n = readThroughCache(fd_entry.inode, fd_entry.offset, buf, count);
-            fd_entry.offset += n;
-            return n;
-        },
-        .tcp_sock => {
-            // Non-blocking read on the conn ring. Pollers handle blocking
-            // via OP_POLL; raw read() returns 0 when there's nothing yet
-            // (mirrors sys#72 net_tcp_recv semantics).
-            const net = @import("../net/net.zig");
-            net.poll();
-            return @intCast(net.tcpRecv(@intCast(fd_entry.inode), buf[0..count]));
-        },
-        .tcp_listener => return VFS_ERR, // listeners aren't readable; use accept()
+// --- What each kind of file does ---------------------------------------------
+//
+// One Ops table per kind the file systems make; opsFor maps a kind to its
+// table. A new kind of file brings its own table and needs no arm here.
+
+pub fn opsFor(kind: process.FsType) *const file.Ops {
+    return switch (kind) {
+        .console => &console_ops,
+        .fat32 => &fat_ops,
+        .tarfs => &tar_ops,
+        .pipe => &pipe_ops,
+        .devfs => &dev_ops,
+        .procfs => &proc_ops,
+        .ext2 => &ext2_ops,
+        .tcp_sock => &tcp_ops,
+        .tcp_listener => &listener_ops,
+    };
+}
+
+pub const console_ops: file.Ops = .{ .read = consoleRead, .write = consoleWrite };
+const fat_ops: file.Ops = .{ .read = fatRead, .write = fatWrite, .release = fatRelease, .release_sleeps = true };
+const tar_ops: file.Ops = .{ .read = tarRead };
+const pipe_ops: file.Ops = .{ .read = pipeRead, .write = pipeWrite, .release = pipeRelease };
+const dev_ops: file.Ops = .{ .read = devRead, .write = devWrite };
+const proc_ops: file.Ops = .{ .read = procRead };
+const ext2_ops: file.Ops = .{ .read = ext2Read, .write = ext2FileWrite, .release = ext2Release, .release_sleeps = true };
+const tcp_ops: file.Ops = .{ .read = tcpRead, .write = tcpWrite, .release = tcpRelease, .release_sleeps = true };
+const listener_ops: file.Ops = .{ .release = listenerRelease };
+
+fn consoleRead(f: *File, pcb: *process.PCB, buf: [*]u8, count: u32) u32 {
+    if (f.access != file.READ) return 0;
+    // Reads from the focused window's per-window event queue
+    // (ui/events.zig). Lazy import to keep vfs ↔ desktop one-way.
+    const desktop = @import("../ui/desktop.zig");
+    const cur: u8 = @intCast(pcb.tgid);
+    var bytes_read: u32 = 0;
+    while (bytes_read < count) {
+        if (desktop.popCharEvent(cur)) |ch| {
+            buf[bytes_read] = ch;
+            bytes_read += 1;
+        } else break;
     }
+    return bytes_read;
+}
+
+fn consoleWrite(f: *File, _: *process.PCB, buf: [*]const u8, count: u32) u32 {
+    if (f.access == file.READ) return 0;
+    vga.print("{s}", .{buf[0..count]});
+    // Mirror to serial with an [app] prefix so kernel-side traces can
+    // correlate user output with kernel events.
+    @import("../debug/serial.zig").print("[app] {s}", .{buf[0..count]});
+    return count;
+}
+
+fn fatRead(f: *File, _: *process.PCB, buf: [*]u8, count: u32) u32 {
+    const handle = fatHandle(f) orelse return 0;
+    var new_cluster: u32 = 0;
+    var new_off: u32 = 0;
+    const bytes_read = fat32.readFileAt(handle, buf, count, f.fat_cluster, f.fat_cluster_off, &new_cluster, &new_off);
+    f.offset += bytes_read;
+    f.fat_cluster = new_cluster;
+    f.fat_cluster_off = new_off;
+    return @intCast(bytes_read);
+}
+
+fn fatWrite(f: *File, _: *process.PCB, buf: [*]const u8, count: u32) u32 {
+    var handle = fatHandle(f) orelse return 0;
+    const bytes_written = fat32.writeFile(&handle, buf, count);
+    f.offset += bytes_written;
+    return @intCast(bytes_written);
+}
+
+fn fatRelease(f: *File) void {
+    if (fatHandle(f)) |h| fat32.closeFile(h);
+}
+
+fn tarRead(f: *File, _: *process.PCB, buf: [*]u8, count: u32) u32 {
+    const off = f.offset32() orelse return 0;
+    const bytes_read = tarfs.readAt(f.inode, off, buf, count);
+    f.offset = @as(u64, off) + bytes_read;
+    return bytes_read;
+}
+
+// A call a signal cut short before a byte moved: a Linux caller gets EINTR
+// (its layer runs the call again or ends it so); a native one gets no bytes,
+// as it always has. A write with no reader left is EPIPE to a Linux caller.
+fn pipeRead(f: *File, pcb: *process.PCB, buf: [*]u8, count: u32) u32 {
+    if (f.access != file.READ) return VFS_ERR;
+    // A terminal's keys reach a Linux reader through its line discipline; a
+    // native one takes them as the window sends them.
+    if (f.tty != tty.NONE and pcb.personality == .linux) {
+        var line: [256]u8 = undefined;
+        switch (tty.read(f.tty, line[0..@min(count, line.len)], f.nonblock)) {
+            .bytes => |n| {
+                @memcpy(buf[0..n], line[0..n]);
+                return @intCast(n);
+            },
+            .interrupted => return errno.err(.EINTR),
+            .again => return errno.err(.EAGAIN),
+        }
+    }
+    const n = pipe.read(f.pipe_id, buf[0..count]);
+    if (n == pipe.PIPE_INTR) return if (pcb.personality == .linux) errno.err(.EINTR) else 0;
+    return @intCast(n);
+}
+
+fn pipeWrite(f: *File, pcb: *process.PCB, buf: [*]const u8, count: u32) u32 {
+    if (f.access != file.WRITE) return VFS_ERR;
+    const n = pipe.write(f.pipe_id, buf[0..count]);
+    if (n == pipe.PIPE_INTR) return if (pcb.personality == .linux) errno.err(.EINTR) else 0;
+    if (n == pipe.PIPE_CLOSED) return if (pcb.personality == .linux) errno.err(.EPIPE) else VFS_ERR;
+    return @intCast(n);
+}
+
+fn pipeRelease(f: *File) void {
+    if (f.access == file.READ) pipe.closeReader(f.pipe_id) else pipe.closeWriter(f.pipe_id);
+}
+
+fn devRead(f: *File, _: *process.PCB, buf: [*]u8, count: u32) u32 {
+    // devfs.read advances the offset itself — kmsg's stream position has
+    // to move past bytes that aged out of the ring, which is more than
+    // just the count returned.
+    var off = f.offset32() orelse return 0;
+    const n = devfs.read(f.inode, &off, buf, count);
+    f.offset = off;
+    return n;
+}
+
+fn devWrite(f: *File, _: *process.PCB, buf: [*]const u8, count: u32) u32 {
+    const off = f.offset32() orelse return VFS_ERR;
+    const n = devfs.write(f.inode, off, buf, count);
+    if (n != VFS_ERR) f.offset = @as(u64, off) + n;
+    return n;
+}
+
+fn procRead(f: *File, _: *process.PCB, buf: [*]u8, count: u32) u32 {
+    const off = f.offset32() orelse return 0;
+    const n = procfs.read(f.inode, off, buf, count);
+    f.offset = @as(u64, off) + n;
+    return n;
+}
+
+fn ext2Read(f: *File, _: *process.PCB, buf: [*]u8, count: u32) u32 {
+    // Through the unified page cache (Slice 3b): a page read here is the
+    // SAME physical frame a later mmap of this file maps, and vice versa.
+    // Falls back to a private uncached read only under frame OOM.
+    const off = f.offset;
+    const n = readThroughCache(f.inode, off, buf, count);
+    f.offset = off + n;
+    return n;
+}
+
+fn ext2FileWrite(f: *File, _: *process.PCB, buf: [*]const u8, count: u32) u32 {
+    // ETXTBSY: refuse to overwrite the text image of a live process.
+    // This is the choke-point the fuzzer hit — fwrite-ing into its own
+    // /bin/redteam.elf while running. Inode-keyed, so the //bin//…
+    // path alias is covered too. (2026-06-04)
+    if (process.isTextBusy(f.inode)) return errno.err(.ETXTBSY);
+    var handle = ext2.Handle{
+        .inum = f.inode,
+        .file_size = 0, // refreshed by writeFile
+        .current_offset = f.offset,
+        .append = f.append,
+    };
+    const bytes_written = ext2Write(&handle, buf, count);
+    // The handle's offset is where the write ended, wherever an appending
+    // one began.
+    if (bytes_written < errno.ERR_SENTINEL_BASE and bytes_written > 0) f.offset = handle.current_offset;
+    return bytes_written;
+}
+
+/// Every ext2 file holds its inode (ext2.openHeld and kin); the last holder
+/// of one that was unlinked meanwhile frees it.
+fn ext2Release(f: *File) void {
+    ext2.release(f.inode);
+}
+
+fn tcpRead(f: *File, _: *process.PCB, buf: [*]u8, count: u32) u32 {
+    // Non-blocking read on the conn ring. Pollers handle blocking
+    // via OP_POLL; raw read() returns 0 when there's nothing yet
+    // (mirrors sys#72 net_tcp_recv semantics).
+    const net = @import("../net/net.zig");
+    net.poll();
+    return @intCast(net.tcpRecv(@intCast(f.inode), buf[0..count]));
+}
+
+fn tcpWrite(f: *File, _: *process.PCB, buf: [*]const u8, count: u32) u32 {
+    const net = @import("../net/net.zig");
+    if (!net.tcpSend(@intCast(f.inode), buf[0..count])) return VFS_ERR;
+    return count;
+}
+
+fn tcpRelease(f: *File) void {
+    @import("../net/net.zig").tcpClose(@intCast(f.inode));
+}
+
+fn listenerRelease(f: *File) void {
+    @import("../net/net.zig").tcpUnlisten(@intCast(f.inode));
 }
 
 /// Demand-fill one page for the unified page cache: read up to one page (4 KiB)
 /// at absolute byte `offset` from ext2 inode `inode` into `buf`, WITHOUT an fd
-/// or FileDesc — a file mmap can outlive the fd that created it. Returns the
+/// or File — a file mmap can outlive the fd that created it. Returns the
 /// number of bytes read (clipped at EOF; the caller zero-fills the tail). ext2
 /// only: sysMmap routes only ext2 fds through the cache, so this is the only
 /// backing store the page-cache fault path needs today.
@@ -583,64 +808,11 @@ pub fn flushAllDirty() u32 {
     return written;
 }
 
+/// Write to descriptor `fd` of `pcb`'s table at the file's offset.
 pub fn write(pcb: *process.PCB, fd: u32, buf: [*]const u8, count: u32) u32 {
-    if (fd >= pcb.fd_table.len or !pcb.fd_table[fd].in_use) return VFS_ERR;
-    const fd_entry = &pcb.fd_table[fd];
-
-    switch (fd_entry.fs_type) {
-        .console => {
-            if (fd != 1 and fd != 2) return 0;
-            vga.print("{s}", .{buf[0..count]});
-            // Mirror to serial with an [app] prefix so kernel-side traces
-            // can correlate user output with kernel events. This used to
-            // live in sysPrint (syscall 1), but libc.print now routes via
-            // fwrite(1, ...) so the logging moved here to follow the data.
-            @import("../debug/serial.zig").print("[app] {s}", .{buf[0..count]});
-            return count;
-        },
-        .fat32 => {
-            var handle = fatHandle(fd_entry);
-            const bytes_written = fat32.writeFile(&handle, buf, count);
-            fd_entry.offset += @intCast(bytes_written);
-            return @intCast(bytes_written);
-        },
-        .tarfs => {
-            return VFS_ERR; // tarfs is read-only
-        },
-        .pipe => {
-            // Only valid as write-side here. Read-side fds use sysFread path.
-            if (fd_entry.flags != 1) return VFS_ERR;
-            const n = pipe.write(fd_entry.pipe_id, buf[0..count]);
-            return @intCast(n);
-        },
-        .devfs => {
-            const n = devfs.write(fd_entry.inode, fd_entry.offset, buf, count);
-            if (n != VFS_ERR) fd_entry.offset += n;
-            return n;
-        },
-        .procfs => return VFS_ERR, // read-only
-        .ext2 => {
-            // ETXTBSY: refuse to overwrite the text image of a live process.
-            // This is the choke-point the fuzzer hit — fwrite-ing into its own
-            // /bin/redteam.elf while running. Inode-keyed, so the //bin//…
-            // path alias is covered too. (2026-06-04)
-            if (process.isTextBusy(fd_entry.inode)) return @import("../proc/errno.zig").err(.ETXTBSY);
-            var handle = ext2.Handle{
-                .inum = fd_entry.inode,
-                .file_size = 0, // refreshed by writeFile
-                .current_offset = fd_entry.offset,
-            };
-            const bytes_written = ext2.writeFile(&handle, buf, count);
-            fd_entry.offset += bytes_written;
-            return bytes_written;
-        },
-        .tcp_sock => {
-            const net = @import("../net/net.zig");
-            if (!net.tcpSend(@intCast(fd_entry.inode), buf[0..count])) return VFS_ERR;
-            return count;
-        },
-        .tcp_listener => return VFS_ERR, // listeners aren't writable
-    }
+    const f = file.get(pcb, fd) orelse return VFS_ERR;
+    defer file.put(f);
+    return f.ops.write(f, pcb, buf, count);
 }
 
 /// Write `count` bytes into ext2 inode `inum` at `offset`, leaving every fd
@@ -649,7 +821,40 @@ pub fn write(pcb: *process.PCB, fd: u32, buf: [*]const u8, count: u32) u32 {
 pub fn writeAt(inum: u32, offset: u64, buf: [*]const u8, count: u32) u32 {
     if (process.isTextBusy(inum)) return @import("../proc/errno.zig").err(.ETXTBSY);
     var handle = ext2.Handle{ .inum = inum, .file_size = 0, .current_offset = offset };
-    return ext2.writeFile(&handle, buf, count);
+    return ext2Write(&handle, buf, count);
+}
+
+/// Most user bytes one ext2.writeFile call takes through the kernel buffer.
+const WRITE_BOUNCE: u32 = 64 * 1024;
+
+/// ext2.writeFile for a source that may be user memory. The file system
+/// reads its source under the mount lock, where a fault on a user page can't
+/// be served (the page may need that same file system), so user bytes go
+/// through a kernel buffer first. A write larger than the buffer is several
+/// file-system writes: against another writer of the same range it is
+/// atomic piece by piece only. Returns the bytes written, or EFAULT's
+/// encoding when the source went away before any were.
+fn ext2Write(handle: *ext2.Handle, src: [*]const u8, count: u32) u32 {
+    const src_va = @intFromPtr(src);
+    if (!memmap.userDataRangeOk(src_va, count)) return ext2.writeFile(handle, src, count);
+
+    var small: [0x1000]u8 align(8) = undefined;
+    var buf: []u8 = &small;
+    const big: ?[*]u8 = if (count > small.len) heap.kmalloc(@min(count, WRITE_BOUNCE)) else null;
+    defer if (big) |p| heap.kfree(p);
+    if (big) |p| buf = p[0..@min(count, WRITE_BOUNCE)];
+
+    var done: u32 = 0;
+    while (done < count) {
+        const chunk: u32 = @intCast(@min(count - done, buf.len));
+        if (!usercopy.copyFromUser(buf[0..chunk], src_va + done)) {
+            return if (done > 0) done else errno.err(.EFAULT);
+        }
+        const put = ext2.writeFile(handle, buf.ptr, chunk);
+        done += put;
+        if (put < chunk) break;
+    }
+    return done;
 }
 
 pub fn close(pcb: *process.PCB, fd: u32) u32 {
@@ -660,68 +865,12 @@ pub fn close(pcb: *process.PCB, fd: u32) u32 {
 /// close() without the guard on 0..2: a Linux process may close and reuse
 /// its standard fds.
 pub fn closeSlot(pcb: *process.PCB, fd: u32) u32 {
-    if (fd >= pcb.fd_table.len or !pcb.fd_table[fd].in_use) return VFS_ERR;
-    // Free the slot and take its entry in one step under fd_lock, then close
-    // the copy: of two threads closing one fd of a shared table (Linux
-    // threads), only one gets the file to release.
-    var entry: process.FileDesc = undefined;
-    {
-        pcb.fd_lock.acquire();
-        defer pcb.fd_lock.release();
-        if (!pcb.fd_table[fd].in_use) return VFS_ERR;
-        entry = pcb.fd_table[fd];
-        pcb.fd_table[fd].in_use = false;
-    }
-    releaseEntry(&entry);
+    // The table gives up its reference under fd_lock: of two threads
+    // closing one fd of a shared table, only one gets it to drop. The file
+    // itself goes when the last sharer (a dup, a fork, a call in flight) does.
+    const f = file.take(pcb, fd) orelse return VFS_ERR;
+    file.put(f);
     return 0;
-}
-
-/// Drop what an fd entry, already out of its table, held.
-pub fn releaseEntry(fd_entry: *const process.FileDesc) void {
-    switch (fd_entry.fs_type) {
-        .console => {},
-        .fat32 => {
-            fat32.closeFile(fatHandle(fd_entry));
-        },
-        .tarfs => {},
-        .pipe => {
-            if (fd_entry.flags == 0) {
-                pipe.closeReader(fd_entry.pipe_id);
-            } else {
-                pipe.closeWriter(fd_entry.pipe_id);
-            }
-        },
-        .devfs => {
-            devfs.closeFile(fd_entry.inode);
-        },
-        .procfs => {
-            procfs.closeFile(fd_entry.inode);
-        },
-        .ext2 => {
-            // ext2.closeFile is a no-op — Handle is pure value, nothing to release.
-        },
-        .tcp_sock => {
-            const net = @import("../net/net.zig");
-            net.tcpClose(@intCast(fd_entry.inode));
-        },
-        .tcp_listener => {
-            const net = @import("../net/net.zig");
-            net.tcpUnlisten(@intCast(fd_entry.inode));
-        },
-    }
-}
-
-/// A second reference to what `e` holds, for an fd copy (dup, fork): false
-/// for kinds whose close can't be shared.
-pub fn refEntry(e: *const process.FileDesc) bool {
-    switch (e.fs_type) {
-        .pipe => if (e.flags == 0) pipe.addReader(e.pipe_id) else pipe.addWriter(e.pipe_id),
-        // devfs: an fd is an index into the device table, close is a no-op.
-        // A child spawned with its stdin "ignored" gets /dev/null by dup2.
-        .console, .ext2, .tarfs, .devfs => {},
-        else => return false,
-    }
-    return true;
 }
 
 pub fn ls() void {
@@ -744,10 +893,15 @@ pub fn ls() void {
 /// `op.run(fs, rel)`. `op` is duck-typed: any struct with
 /// `fn run(self, fs: FsType, rel: []const u8) ?R`.
 fn resolveFirst(comptime R: type, name: []const u8, op: anytype) ?R {
-    // Absolute path → longest-prefix mount dispatch, one candidate.
+    // Absolute path → symbolic links replaced, then longest-prefix mount
+    // dispatch, one candidate.
     if (name.len > 0 and name[0] == '/') {
-        const m = findMount(name) orelse return null;
-        return op.run(m.fs, name[m.prefix.len..]);
+        var buf: [256]u8 = undefined;
+        if (name.len > buf.len) return null;
+        @memcpy(buf[0..name.len], name);
+        const n = expandLinks(&buf, name.len, true) orelse return null;
+        const m = findMount(buf[0..n]) orelse return null;
+        return op.run(m.fs, buf[m.prefix.len..n]);
     }
     // Bare-filename fallback for legacy callers (sysExec passing "cat.elf"
     // unqualified, KERNEL.SYM / BUILD.ID lookups). Resolution order:
@@ -759,6 +913,17 @@ fn resolveFirst(comptime R: type, name: []const u8, op: anytype) ?R {
     var bin_buf: [128]u8 = undefined;
     if (binPath(&bin_buf, name)) |bp| {
         if (op.run(.ext2, bp)) |r| return r;
+        // A link in /bin (a busybox applet's name): what it leads to.
+        var abs: [256]u8 = undefined;
+        abs[0] = '/';
+        @memcpy(abs[1..][0..bp.len], bp);
+        if (expandLinks(&abs, bp.len + 1, true)) |n| {
+            if (findMount(abs[0..n])) |m| {
+                if (m.fs == .ext2 and !std.mem.eql(u8, abs[m.prefix.len..n], bp)) {
+                    if (op.run(.ext2, abs[m.prefix.len..n])) |r| return r;
+                }
+            }
+        }
     }
     if (op.run(.tarfs, name)) |r| return r;
     return op.run(.fat32, name);
@@ -969,32 +1134,19 @@ pub fn loadFileFresh(name: []const u8) ?FreshFile {
     return null;
 }
 
-/// Reserve a free fd index. A Linux process's threads share their lead's
-/// table, so slots change hands under its fd_lock; a reserved slot reads
-/// as a console fd until the caller installs the real entry with installFd,
-/// or hands it back with releaseFd.
+/// Reserve a free fd index. A Linux process's
+/// threads share their lead's table, so slots change hands under its
+/// fd_lock; a reserved slot is closed to everyone until the caller installs
+/// a file (installNew, file.install) or hands it back with releaseFd.
+///
+/// A Linux process gets the lowest free number, 0 to 2 included: `close(0)`
+/// then `open` is how its programs redirect. A native one's standard three
+/// are never handed out again (it can't close them either).
 pub fn allocFd(pcb: *process.PCB) ?usize {
-    pcb.fd_lock.acquire();
-    defer pcb.fd_lock.release();
-    for (3..pcb.fd_table.len) |fd_idx| {
-        const e = &pcb.fd_table[fd_idx];
-        if (e.in_use) continue;
-        e.* = .{ .in_use = true, .fs_type = .console, .flags = 1, .reserved = true };
-        return fd_idx;
-    }
-    return null;
-}
-
-/// Fill a slot allocFd reserved.
-pub fn installFd(pcb: *process.PCB, fd_idx: usize, desc: process.FileDesc) void {
-    pcb.fd_lock.acquire();
-    defer pcb.fd_lock.release();
-    pcb.fd_table[fd_idx] = desc;
+    return file.reserveFrom(pcb, if (pcb.personality == .linux) 0 else 3);
 }
 
 /// Hand back an fd allocFd reserved and nothing was installed into.
 pub fn releaseFd(pcb: *process.PCB, fd_idx: usize) void {
-    pcb.fd_lock.acquire();
-    defer pcb.fd_lock.release();
-    pcb.fd_table[fd_idx].in_use = false;
+    file.unreserve(pcb, fd_idx);
 }

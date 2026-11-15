@@ -33,6 +33,23 @@ const Case = struct {
     /// repeat would redo the work (the kernel build mints a new build id
     /// every time).
     once: bool = false,
+    /// Run it at a terminal of its own (proc/tty.zig), with these steps
+    /// typed there; none: its stdio is the console.
+    terminal: []const Step = &.{},
+    /// What must show up in what it wrote to the terminal, in this order.
+    expect: []const []const u8 = &.{},
+    /// The exit status that passes.
+    ok_status: u32 = 0,
+};
+
+/// What the harness does at a case's terminal, as a person at the window
+/// would.
+const Step = union(enum) {
+    /// Keys, as the window sends them (its codes for the arrow keys).
+    keys: []const u8,
+    wait_ms: u32,
+    /// Ctrl+C.
+    interrupt,
 };
 
 const CASES = [_]Case{
@@ -41,6 +58,43 @@ const CASES = [_]Case{
     .{ .path = "/bin/lt_thread.elf" },
     .{ .path = "/bin/lt_fs.elf" },
     .{ .path = "/bin/lt_proc.elf" },
+    .{ .path = "/bin/lt_signal.elf" },
+    // At a terminal: lines typed and edited, then raw keys (the last is the
+    // window's code for the up arrow).
+    .{
+        .path = "/bin/lt_tty.elf",
+        .terminal = &.{.{ .keys = "abX\x08c\none\ntwo\njunk\x15ok\n\x04part\x04k\x80" }},
+        .expect = &.{ "abX\x08 \x08c\n", "one\n", "two\n", "junk\x08 \x08\x08 \x08\x08 \x08\x08 \x08ok\n", "lt_tty: all" },
+    },
+    // A static busybox, its shell running a script of applets, pipes, files
+    // and jobs (tools/add_busybox_to_image.sh).
+    .{
+        .path = "/bin/busybox",
+        .args = "sh /etc/bbtest.sh",
+        .timeout_ms = 120_000,
+        .optional = true,
+        .needs = "/etc/bbtest.sh",
+        .once = true,
+    },
+    // The same shell at a terminal, typed at: a command, one interrupted
+    // with Ctrl+C while it sleeps, and the shell's own exit.
+    .{
+        .path = "/bin/busybox",
+        .args = "sh",
+        .optional = true,
+        .needs = "/etc/bbtest.sh",
+        .once = true,
+        .terminal = &.{
+            .{ .keys = "echo tty-$((40+2))\n" },
+            .{ .keys = "sleep 100\n" },
+            .{ .wait_ms = 1500 },
+            .interrupt,
+            .{ .keys = "echo rc=$?\n" },
+            .{ .keys = "exit 7\n" },
+        },
+        .expect = &.{ "tty-42", "rc=130" },
+        .ok_status = 7,
+    },
     // The official Zig compiler (static musl, 172 MB), stamped OSABI 3 and
     // written into ext2.img by hand.
     .{ .path = "/bin/zig", .args = "version", .timeout_ms = 120_000, .optional = true },
@@ -70,6 +124,9 @@ const Outcome = union(enum) {
     exited: u32,
     spawn_failed,
     timed_out,
+    /// It ran at a terminal and didn't write what was expected (named in
+    /// the log).
+    wrong_output,
 };
 
 /// "/bin/lt_mm.elf" → "lt_mm".
@@ -99,6 +156,14 @@ fn runOnce(c: Case) Outcome {
     const pid = elf_loader.spawnPath(c.path, launch) orelse return .spawn_failed;
     // Parent it here so the exit leaves a zombie holding the status.
     process.getPCB(pid).parent_pid = @intCast(process.getCurrentPid());
+    var term: ?Terminal = null;
+    if (c.terminal.len != 0) {
+        term = Terminal.open(pid) orelse {
+            process.killProcess(@intCast(pid));
+            return .spawn_failed;
+        };
+    }
+    defer if (term) |*t| t.close();
     process.assignInitialCpu(pid);
     process.setState(pid, .ready);
 
@@ -106,6 +171,7 @@ fn runOnce(c: Case) Outcome {
     var waited: u32 = 0;
     var timed_out = false;
     while (process.procs[pid].state != .zombie or process.countThreadsInGroup(@intCast(pid)) != 0) : (waited += 10) {
+        if (term) |*t| t.turn(c.terminal, 10);
         if (waited >= STALL_DUMP_MS and waited % STALL_DUMP_MS == 0) dumpTasks(waited);
         if (!timed_out and waited >= c.timeout_ms) {
             // Every thread: a lead killed alone leaves its workers running.
@@ -118,8 +184,128 @@ fn runOnce(c: Case) Outcome {
     const status = process.procs[pid].exit_status;
     process.reapZombie(@intCast(pid));
     if (timed_out) return .timed_out;
+    if (term) |*t| {
+        t.drain();
+        if (!t.wrote(c.expect)) return .wrong_output;
+    }
     return .{ .exited = status };
 }
+
+/// A terminal for one run: the two pipes a window would have, the harness
+/// at the window's ends, the program's stdio at the others.
+const Terminal = struct {
+    id: u8,
+    keys_pipe: u8,
+    out_pipe: u8,
+    /// Where the script is: the step, how far into its keys, the time left
+    /// of its wait.
+    step: usize = 0,
+    typed: usize = 0,
+    wait_left: u32 = 0,
+
+    const pipe = @import("../proc/pipe.zig");
+    const tty = @import("../proc/tty.zig");
+    const file = @import("../fs/file.zig");
+
+    /// Everything the program wrote, from the start of the run.
+    var out: [16 * 1024]u8 = undefined;
+    var out_len: usize = 0;
+
+    fn open(pid: usize) ?Terminal {
+        const keys_pipe = pipe.alloc() orelse return null;
+        const out_pipe = pipe.alloc() orelse {
+            pipe.closeReader(keys_pipe);
+            pipe.closeWriter(keys_pipe);
+            return null;
+        };
+        const id = tty.open(keys_pipe, out_pipe, @intCast(pid), 25, 80);
+        const pcb = process.getPCB(pid);
+        if (vfs.newFile(.{ .kind = .pipe, .pipe_id = keys_pipe, .access = file.READ, .tty = id })) |f| file.assign(pcb, 0, f);
+        if (vfs.newFile(.{ .kind = .pipe, .pipe_id = out_pipe, .access = file.WRITE, .tty = id })) |f| {
+            file.ref(f);
+            file.assign(pcb, 1, f);
+            file.assign(pcb, 2, f);
+        }
+        out_len = 0;
+        return .{ .id = id, .keys_pipe = keys_pipe, .out_pipe = out_pipe };
+    }
+
+    fn close(self: *Terminal) void {
+        pipe.closeWriter(self.keys_pipe);
+        pipe.closeReader(self.out_pipe);
+        tty.close(self.id);
+    }
+
+    fn drain(self: *Terminal) void {
+        while (out_len < out.len) {
+            const got = pipe.tryRead(self.out_pipe, out[out_len..]);
+            if (got == 0) break;
+            out_len += got;
+        }
+    }
+
+    /// `ms` have passed: take what was written, go on with the script.
+    fn turn(self: *Terminal, script: []const Step, ms: u32) void {
+        self.drain();
+        if (self.wait_left > ms) {
+            self.wait_left -= ms;
+            return;
+        }
+        self.wait_left = 0;
+        while (self.step < script.len) {
+            switch (script[self.step]) {
+                .keys => |k| {
+                    self.typed += pipe.tryWrite(self.keys_pipe, k[self.typed..]);
+                    if (self.typed < k.len) return; // the pipe is full: the rest next turn
+                    self.typed = 0;
+                },
+                .wait_ms => |w| {
+                    self.step += 1;
+                    self.wait_left = w;
+                    return;
+                },
+                // With key signals off the key is a byte like the others.
+                .interrupt => if (!tty.interruptKey(self.id)) {
+                    _ = pipe.tryWrite(self.keys_pipe, "\x03");
+                },
+            }
+            self.step += 1;
+        }
+    }
+
+    /// True if each of `wanted` is in the output, one after another. The
+    /// first that is not is named, with the output.
+    fn wrote(self: *const Terminal, wanted: []const []const u8) bool {
+        _ = self;
+        var from: usize = 0;
+        for (wanted) |w| {
+            const at = std.mem.indexOfPos(u8, out[0..out_len], from, w) orelse {
+                serial.print("[linuxtest] the terminal never showed '", .{});
+                printEscaped(w);
+                serial.print("' (looking from byte {d} of {d}); it showed:\n", .{ from, out_len });
+                var i: usize = 0;
+                while (i < out_len) : (i += 96) {
+                    serial.print("[linuxtest]   '", .{});
+                    printEscaped(out[i..@min(i + 96, out_len)]);
+                    serial.print("'\n", .{});
+                }
+                return false;
+            };
+            from = at + w.len;
+        }
+        return true;
+    }
+
+    fn printEscaped(bytes: []const u8) void {
+        for (bytes) |b| {
+            if (b >= 0x20 and b < 0x7F and b != '\\') {
+                serial.print("{c}", .{b});
+            } else {
+                serial.print("\\x{X:0>2}", .{b});
+            }
+        }
+    }
+};
 
 /// How often a run still going shows its tasks.
 const STALL_DUMP_MS: u32 = 60_000;
@@ -139,12 +325,14 @@ fn dumpTasks(waited: u32) void {
             i, p.tgid, p.parent_pid, std.mem.sliceTo(&p.name, 0), @tagName(p.state), @tagName(p.wait_kind), p.wait_target, p.nokill, p.wake_pending,
         });
         if (i != p.tgid) continue;
-        for (p.fd_table, 0..) |fe, fd| {
-            if (!fe.in_use) continue;
-            if (fe.fs_type == .pipe) {
-                serial.print("[linuxtest]     fd {d}: pipe {d} {s}{s}\n", .{ fd, fe.pipe_id, if (fe.flags == 0) "read" else "write", if (fe.cloexec) " cloexec" else "" });
+        const file_mod = @import("../fs/file.zig");
+        for (0..p.fd_table.len) |fd| {
+            const fe = file_mod.get(p, fd) orelse continue;
+            defer file_mod.put(fe);
+            if (fe.kind == .pipe) {
+                serial.print("[linuxtest]     fd {d}: pipe {d} {s}{s}\n", .{ fd, fe.pipe_id, if (fe.access == file_mod.READ) "read" else "write", if (p.fd_table[fd].cloexec) " cloexec" else "" });
             } else {
-                serial.print("[linuxtest]     fd {d}: {s} inode {d}\n", .{ fd, @tagName(fe.fs_type), fe.inode });
+                serial.print("[linuxtest]     fd {d}: {s} inode {d}\n", .{ fd, @tagName(fe.kind), fe.inode });
             }
         }
     }
@@ -167,8 +355,12 @@ fn check(c: Case, run: u32) void {
     serial.print("[linuxtest] {s} run {d}: {d} ms, {d} frames free\n", .{ c.path, run, (time.monotonicNanos() - t0) / 1_000_000, pmm.freeFrameCount() });
     lprof.dumpAndReset(progName(c.path));
     switch (outcome) {
-        .exited => |st| if (st != 0) {
+        .exited => |st| if (st != c.ok_status) {
             serial.print("[linuxtest] FAIL {s} run {d}: exit status {d}\n", .{ c.path, run, st });
+            failures += 1;
+        },
+        .wrong_output => {
+            serial.print("[linuxtest] FAIL {s} run {d}: wrong output at its terminal\n", .{ c.path, run });
             failures += 1;
         },
         .spawn_failed => {

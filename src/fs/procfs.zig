@@ -13,7 +13,7 @@
 //      reads that span multiple syscalls may see slightly different snap-
 //      shots between calls, which matches Linux procfs behavior.
 //
-// Inode encoding (in FileDesc.inode, u32):
+// Inode encoding (in File.inode, u32):
 //     bits 31..8  = Kind (the file type, see enum)
 //     bits  7..0  = pid (only meaningful for pid_* kinds; 0 for root files)
 //
@@ -22,6 +22,8 @@
 
 const std = @import("std");
 const process = @import("../proc/process.zig");
+const pid_nr = @import("../proc/pid_nr.zig");
+const session = @import("../proc/session.zig");
 const pmm = @import("../mm/pmm.zig");
 const smp = @import("../cpu/smp.zig");
 const vfs = @import("vfs.zig");
@@ -316,8 +318,8 @@ fn renderPidStatus(pid: u8, buf: []u8) usize {
             pid,
             pcb.parent_pid,
             pcb.tgid,
-            pcb.pgid,
-            pcb.sid,
+            process.leader(pcb).pgid,
+            process.leader(pcb).sid,
             state_str,
             prio_str,
             pcb.last_cpu,
@@ -337,48 +339,49 @@ fn renderPidStatus(pid: u8, buf: []u8) usize {
 ///   session 8 (leader: httpd)        — daemon escaped
 ///     group 8 (leader: httpd)
 ///       8 httpd
+///
+/// Session and group ids are numbers (pid_nr.zig); the members are listed
+/// by slot, as everywhere in /proc.
 fn renderSessions(buf: []u8) usize {
     var n: usize = 0;
-    var seen_sid: [process.MAX_PROCS]bool = .{false} ** process.MAX_PROCS;
-    var i: u8 = 0;
-    while (i < process.MAX_PROCS) : (i += 1) {
-        if (process.procs[i].state == .unused) continue;
+    for (0..process.MAX_PROCS) |i| {
+        if (!session.isProcess(i)) continue;
         const sid = process.procs[i].sid;
-        if (seen_sid[sid]) continue;
-        seen_sid[sid] = true;
+        if (listedBefore(i, sid, null)) continue;
+        n += fmt(buf[n..], "session {d} (leader: {s})\n", .{ sid, leaderName(sid) });
 
-        const sl = &process.procs[sid];
-        const sl_alive = sl.state != .unused;
-        const sl_name = if (sl_alive) sl.name[0..sl.name_len] else "<gone>";
-        n += fmt(buf[n..], "session {d} (leader: {s})\n", .{ sid, sl_name });
-
-        // Now pass over members of this session, grouping by pgid.
-        var seen_pgid: [process.MAX_PROCS]bool = .{false} ** process.MAX_PROCS;
-        var j: u8 = 0;
-        while (j < process.MAX_PROCS) : (j += 1) {
-            if (process.procs[j].state == .unused) continue;
-            if (process.procs[j].sid != sid) continue;
+        for (i..process.MAX_PROCS) |j| {
+            if (!session.isProcess(j) or process.procs[j].sid != sid) continue;
             const pgid = process.procs[j].pgid;
-            if (seen_pgid[pgid]) continue;
-            seen_pgid[pgid] = true;
+            if (listedBefore(j, sid, pgid)) continue;
+            n += fmt(buf[n..], "  group {d} (leader: {s})\n", .{ pgid, leaderName(pgid) });
 
-            const gl = &process.procs[pgid];
-            const gl_alive = gl.state != .unused;
-            const gl_name = if (gl_alive) gl.name[0..gl.name_len] else "<gone>";
-            n += fmt(buf[n..], "  group {d} (leader: {s})\n", .{ pgid, gl_name });
-
-            var k: u8 = 0;
-            while (k < process.MAX_PROCS) : (k += 1) {
-                if (process.procs[k].state == .unused) continue;
-                if (process.procs[k].sid != sid) continue;
-                if (process.procs[k].pgid != pgid) continue;
-                const m_name = process.procs[k].name[0..process.procs[k].name_len];
-                n += fmt(buf[n..], "    {d} {s}\n", .{ k, m_name });
+            for (j..process.MAX_PROCS) |k| {
+                const m = &process.procs[k];
+                if (!session.isProcess(k) or m.sid != sid or m.pgid != pgid) continue;
+                n += fmt(buf[n..], "    {d} {s}\n", .{ k, m.name[0..m.name_len] });
                 if (n >= buf.len) return n;
             }
         }
     }
     return n;
+}
+
+/// True if a process in a slot below `slot` is in session `sid` (and group
+/// `pgid`, when given): that one's pass printed the block.
+fn listedBefore(slot: usize, sid: u32, pgid: ?u32) bool {
+    for (0..slot) |j| {
+        if (!session.isProcess(j) or process.procs[j].sid != sid) continue;
+        if (pgid == null or process.procs[j].pgid == pgid.?) return true;
+    }
+    return false;
+}
+
+/// The name of the process a group or session goes by, while it lives.
+fn leaderName(nr: u32) []const u8 {
+    const slot = pid_nr.slotOf(nr) orelse return "<gone>";
+    const p = &process.procs[slot];
+    return p.name[0..p.name_len];
 }
 
 /// /proc/sched — per-CPU runqueue snapshot. Lets you SEE what the CFS

@@ -12,6 +12,7 @@ const paging = @import("../../mm/paging.zig");
 const Phys = @import("../../util/addr.zig").Phys;
 const bga = @import("../../ui/bga.zig");
 const vfs = @import("../../fs/vfs.zig");
+const file = @import("../../fs/file.zig");
 const desktop = @import("../../ui/desktop.zig");
 const xhci = @import("../../driver/xhci.zig");
 const debug = @import("../../debug/debug.zig");
@@ -176,15 +177,15 @@ pub fn sysMmap(len: u32, fd: u32, offset: u32) u32 {
 
     const len_pg: usize = (@as(usize, len) + 0xFFF) & ~@as(usize, 0xFFF);
     const anon = fd == 0xFFFFFFFF;
-    if (!anon) {
-        if (fd >= config.MAX_FDS) return E_INVAL;
-        if (!pcb.fd_table[fd].in_use) return E_INVAL;
-    }
+    // Held for the call only: the mapping keeps the inode or a copy of the
+    // bytes, never the file.
+    const mapped: ?*file.File = if (anon) null else (file.get(pcb, fd) orelse return E_INVAL);
+    defer if (mapped) |f| file.put(f);
     // Cache-backed fast path (ext2 only): a demand-paged region keyed on the
     // file's inode — NO eager read, NO private buffer. Pages fault in through
     // the unified page cache, shared across mappers and filled lazily
     // (fault.zig faultInCachePage).
-    const cached = !anon and pcb.fd_table[fd].fs_type == .ext2;
+    const cached = if (mapped) |f| f.kind == .ext2 else false;
 
     // Any other file is copied into a private buffer, BEFORE the lock: the
     // read may block (a pipe, a long disk read), and with the write side held
@@ -198,14 +199,15 @@ pub fn sysMmap(len: u32, fd: u32, offset: u32) u32 {
         const buf_phys = pmm.allocContiguousUser(num_pages) orelse return E_NOMEM;
         const buf_ptr = buf_phys.toVirt().ptr([*]u8);
 
-        const saved_off = pcb.fd_table[fd].offset;
-        pcb.fd_table[fd].offset = offset;
-        pcb.fd_table[fd].fat_cluster = 0;
-        pcb.fd_table[fd].fat_cluster_off = 0;
-        const n = vfs.read(pcb, fd, buf_ptr, len);
-        pcb.fd_table[fd].offset = saved_off;
-        pcb.fd_table[fd].fat_cluster = 0;
-        pcb.fd_table[fd].fat_cluster_off = 0;
+        const f = mapped.?;
+        const saved_off = f.offset;
+        f.offset = offset;
+        f.fat_cluster = 0;
+        f.fat_cluster_off = 0;
+        const n = f.ops.read(f, pcb, buf_ptr, len);
+        f.offset = saved_off;
+        f.fat_cluster = 0;
+        f.fat_cluster_off = 0;
 
         if (n == 0xFFFFFFFF) {
             pmm.freeContiguous(buf_phys, @intCast(num_pages));
@@ -228,7 +230,7 @@ pub fn sysMmap(len: u32, fd: u32, offset: u32) u32 {
     if (placed) |new_top| {
         region.start = new_top;
         if (cached) {
-            region.cache_inode = @intCast(pcb.fd_table[fd].inode);
+            region.cache_inode = mapped.?.inode;
             region.cache_off = offset;
         }
         if (copy) |c| {
@@ -263,15 +265,18 @@ pub fn sysMmapFileShared(len: u32, fd: u32, offset: u32) u32 {
     _ = pcb.page_directory orelse return E_FAULT;
     const lead = process.leader(pcb);
 
-    lead.as_lock.acquire();
-    defer lead.as_lock.release();
-
-    if (fd >= config.MAX_FDS) return E_INVAL;
-    if (!pcb.fd_table[fd].in_use) return E_INVAL;
     // Shared writeback only exists for the ext2 page cache. Other fs types have
     // no cache frame to share, so reject rather than silently giving private
     // semantics under a MAP_SHARED name.
-    if (pcb.fd_table[fd].fs_type != .ext2) return E_INVAL;
+    const cache_inode: u32 = blk: {
+        const f = file.get(pcb, fd) orelse return E_INVAL;
+        defer file.put(f);
+        if (f.kind != .ext2) return E_INVAL;
+        break :blk f.inode;
+    };
+
+    lead.as_lock.acquire();
+    defer lead.as_lock.release();
 
     const len_pg: usize = (@as(usize, len) + 0xFFF) & ~@as(usize, 0xFFF);
     if (len_pg > lead.mmap_top) return E_INVAL;
@@ -282,7 +287,7 @@ pub fn sysMmapFileShared(len: u32, fd: u32, offset: u32) u32 {
         .start = new_top,
         .end = lead.mmap_top,
         .prot = process.PROT_RW,
-        .cache_inode = @intCast(pcb.fd_table[fd].inode),
+        .cache_inode = cache_inode,
         .cache_off = offset,
         .cache_shared = true,
     })) return E_INVAL;
@@ -378,11 +383,13 @@ pub fn sysMmapPmem(len: u32, fd: u32, offset: u32) u32 {
     const lead = process.leader(pcb);
 
     // The fd must really be /dev/pmem0 — DAX semantics only make sense there.
-    if (fd >= config.MAX_FDS) return E_INVAL;
-    if (!pcb.fd_table[fd].in_use) return E_INVAL;
-    if (pcb.fd_table[fd].fs_type != .devfs) return E_INVAL;
-    const devfs = @import("../../fs/devfs.zig");
-    if (devfs.kindOf(pcb.fd_table[fd].inode) != .pmem0) return E_INVAL;
+    {
+        const f = file.get(pcb, fd) orelse return E_INVAL;
+        defer file.put(f);
+        if (f.kind != .devfs) return E_INVAL;
+        const devfs = @import("../../fs/devfs.zig");
+        if (devfs.kindOf(f.inode) != .pmem0) return E_INVAL;
+    }
 
     const pmem = @import("../../mm/pmem.zig");
     if (!pmem.isPresent()) return E_INVAL;

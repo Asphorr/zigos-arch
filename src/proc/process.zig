@@ -2,7 +2,7 @@
 //! file holds:
 //!
 //!   * The exhaustive enums + structs (State, Priority, FsType, WaitKind,
-//!     FileDesc, PCB, LazyRegion, ProcessInfo) and the PROT_* / MAX_*
+//!     PCB, LazyRegion, ProcessInfo) and the PROT_* / MAX_*
 //!     constants — single source of truth that the per-domain files
 //!     (fault.zig, lifecycle.zig, sched.zig) import via `process.X`.
 //!
@@ -170,29 +170,10 @@ pub const WaitKind = enum(u8) {
     win_event, // wait_target = 0. sysWaitEvent; the desktop wakes it by pid once its focused window has events (event_wait.notify), wakeExpired at its timeout (wake_tick, 0 for none).
 };
 
-// Per-fd table entry. All fields are owner-pid only — fd_table lives on
-// the PCB and is only touched on syscall paths running as that PID.
-pub const FileDesc = struct {
-    in_use: bool = false,
-    inode: u32 = 0,
-    offset: u32 = 0,
-    flags: u8 = 0,
-    fs_type: FsType = .console,
-    fat_cluster: u32 = 0, // cached FAT32 cluster for O(1) sequential reads
-    fat_cluster_off: u32 = 0, // byte offset that fat_cluster corresponds to
-    // Cluster of the parent directory holding this file's dirent — set on
-    // open/create and used by reads/writes/closes to update the entry's
-    // file_size in the right directory. 0 means "use fat32.root_cluster"
-    // (back-compat default for older fds and the root-dir case).
-    fat_dir_cluster: u32 = 0,
-    pipe_id: u8 = 0xFF, // valid only when fs_type == .pipe
-    /// Closed by a Linux execve (FD_CLOEXEC / O_CLOEXEC).
-    cloexec: bool = false,
-    /// O_NONBLOCK, as F_GETFL reports it.
-    nonblock: bool = false,
-    /// Claimed by vfs.allocFd, its file not installed yet.
-    reserved: bool = false,
-};
+const file = @import("../fs/file.zig");
+/// An open file, and a descriptor-table entry that refers to one (fs/file.zig).
+pub const File = file.File;
+pub const FdSlot = file.Slot;
 
 /// ABI personality of a process — selects which translation the `syscall`
 /// instruction routes to. `.native` is zigos's own ABI (3×u32 args, native
@@ -217,10 +198,10 @@ pub const PCB = struct {
     // rejected explicitly in sysMmap. munmap hands VA back only when it frees
     // the lowest mapping (see sysMunmap).
     mmap_top: usize = MMAP_TOP_INIT, // (p:as_lock)
-    // File descriptor table. A native process's own; a Linux process's
-    // threads all use the lead's, so slots are claimed and freed under
-    // fd_lock (vfs.allocFd / installFd / close).
-    fd_table: [MAX_FDS]FileDesc = initFdTable(),
+    // File descriptor table. A native task's own; a Linux process's threads
+    // all use the lead's. Slots change only under fd_lock, through
+    // fs/file.zig, which is also how a file is looked up (file.get).
+    fd_table: file.Table = file.initialTable(), // (p:fd_lock)
     fd_lock: @import("spinlock.zig").SpinLock = .{},
     // ext2 inode this process's executable image was loaded from (0 = none /
     // not loaded from a regular file). Set by elf_loader.loadAndStart. Read by
@@ -320,6 +301,9 @@ pub const PCB = struct {
     // spell that path rather than relying on a zero default.
     cwd: [256]u8 = INIT_CWD,
     cwd_len: u8 = INIT_CWD_PATH.len,
+    // Linux umask(): kept and given back, nothing else — files have no
+    // permission bits to mask.
+    umask: u16 = 0o022,
     // The user address space's regions: VA ranges whose pages are allocated
     // (or read from a file, or shared) on first touch by the page-fault
     // handler — stack, sbrk heap, ELF segments, mmaps. Per process: threads
@@ -383,26 +367,44 @@ pub const PCB = struct {
     wait_kind: WaitKind = .none, // (a) blockOn writes; wake() reads cross-CPU
     wait_target: u32 = 0, // (a) read by wake() to match waiters
     // --- POSIX signals (src/signals.zig) ---
-    // Pending bitmap — bit N = signal N is pending. Cleared when delivered.
-    // u32 caps us at NSIG=32 which matches POSIX 1..31; widening to u64 +
-    // rt-signals is a future tunable in config.zig.
-    pending_signals: u32 = 0, // (a) atomic OR by signal sender (any CPU)
+    // Signals sent to this task and not yet delivered: bit signals.bit(N)
+    // for signal N.
+    pending_signals: u64 = 0, // (a) atomic OR by signal sender (any CPU)
+    // Signals sent to the process as a whole (kill, SIGCHLD, the terminal's)
+    // and not yet delivered: on the lead, taken by any thread that doesn't
+    // block them. Linux processes only; a native one's go to the task.
+    shared_pending: u64 = 0, // (a)
+    // What came with each pending signal: its sender, a child's status.
+    // Written and read under signals.info_lock, with the pending bit.
+    sig_info: [config.NSIG]signals.Info = [_]signals.Info{.{}} ** config.NSIG,
+    shared_info: [config.NSIG]signals.Info = [_]signals.Info{.{}} ** config.NSIG,
     // Currently blocked signals (sigprocmask). Signals marked pending while
     // blocked stay pending until unblocked, then deliver in numeric order.
-    signal_mask: u32 = 0,
+    signal_mask: u64 = 0,
     // Per-signal disposition. Default = all SIG_DFL with empty mask/flags;
     // signals.zig consults default_actions[] to decide what SIG_DFL means
-    // for each signal (term, core, ignore, stop, cont).
-    sigactions: [config.NSIG]signals.SigAction = [_]signals.SigAction{.{}} ** config.NSIG,
-    // Mask snapshot taken when entering a handler — restored by sigreturn.
-    saved_signal_mask: u32 = 0,
-    // True between handler entry and sigreturn. Suppresses re-entry from
-    // syscall/IRQ delivery paths (a handler that itself does syscalls would
-    // otherwise stack signal frames recursively).
+    // for each signal (term, core, ignore, stop, cont). A Linux process's
+    // threads share the lead's (signals.dispositions).
+    sigactions: [config.NSIG]signals.Disposition = [_]signals.Disposition{.{}} ** config.NSIG,
+    // Mask snapshot taken when entering a native handler — restored by
+    // sigreturn. (A Linux handler's is in its frame.) For a Linux call that
+    // waits under a mask of its own (rt_sigsuspend, ppoll), the mask to put
+    // back on its way out, while restore_mask is set.
+    saved_signal_mask: u64 = 0,
+    restore_mask: bool = false,
+    // True between a native handler's entry and its sigreturn. Suppresses
+    // re-entry from syscall/IRQ delivery paths (a handler that itself does
+    // syscalls would otherwise stack signal frames recursively). Linux
+    // handlers nest; the mask is what holds signals back there.
     in_signal_handler: bool = false,
+    // Linux sigaltstack: the stack SA_ONSTACK handlers run on.
+    alt_stack: signals.AltStack = .{},
     // Tick at which a pending SIGALRM should be delivered, or 0 for none.
     // Compared against tick_count in process.deliverDueAlarms each timer.
     alarm_tick: u64 = 0,
+    // Ticks between SIGALRMs once the first has fired (setitimer's
+    // it_interval), 0 for a one-shot alarm.
+    alarm_interval: u64 = 0, // (a)
 
     // --- Job control (POSIX stop/cont) ----------------------------------
     // True while job-control-stopped (default action of SIGSTOP/SIGTSTP/
@@ -438,23 +440,22 @@ pub const PCB = struct {
     // sees it gives up, so no thread can slip in behind the pass.
     group_exiting: bool = false, // (a)
 
+    // The number programs know this task by (pid_nr.zig): the slot for the
+    // slot's first occupant, another for every later one. Linux programs
+    // see it as the pid or tid; group and session ids are such numbers.
+    pid_nr: u32 = 0, // (c) set when the slot is claimed
+
     // --- Sessions / process groups (POSIX setsid / setpgid) -------------
-    // Process group ID = pid of the group leader. Default fill-in (by
-    // process.create) is self_pid (own group). fork() and sysExec()
-    // inherit parent's pgid; setpgid() moves into a different group;
-    // setsid() makes the caller a group AND session leader (pgid = sid =
-    // self_pid). Used for kill(-PID) → "signal whole group", for shell
-    // job control's foreground-group concept, and for daemons that detach
-    // from the parent shell's session via setsid.
-    pgid: u8 = 0, // (c) inherited or set by setpgid/setsid
-    // Session ID = pid of the session leader. Boot session is whatever sid
-    // the desktop kernel-task ends up with (it's never set explicitly, so
-    // its children inherit the create()-default of self_pid). User
-    // sessions are created by setsid(): caller's sid becomes its own pid,
-    // and it's no longer in any other process group. Daemons run their
-    // own session so closing the parent shell's session leader doesn't
-    // SIGHUP them.
-    sid: u8 = 0, // (c) inherited or set by setsid
+    // Process group ID = the number of the group's first leader; the group
+    // goes on by it after the leader is gone. A task made from nothing
+    // leads its own group; fork() and sysExec() inherit the parent's;
+    // setpgid() moves into another group; setsid() makes the caller a
+    // group and session leader. Used for kill(-pgid), wait4 by group, the
+    // shell's foreground group, and daemons that leave the shell's session.
+    pgid: u32 = 0, // (c) inherited or set by setpgid/setsid
+    // Session ID = the number of the session's first leader. Daemons run
+    // their own session so the end of the shell's doesn't reach them.
+    sid: u32 = 0, // (c) inherited or set by setsid
 
     // Per-thread TLS base (written to IA32_FS_BASE on dispatch). 0 = no
     // TLS / inherit. Set by sysSetTls.
@@ -545,6 +546,10 @@ pub const PCB = struct {
     // task itself changes it, and never while off-CPU.
     nokill: u16 = 0, // (a) own-task writes; killers and pickNext read
     nokill_seq: u32 = 0, // (a) own-task writes; bumped by each noKillEnter
+    // Sleeping locks this task holds: every Mutex, RwMutex side and the ext2
+    // mount lock. A kernel-mode fault on a user page that is not present is
+    // resolved only at zero (fault.handleKernelUserFault).
+    sleep_locks: u16 = 0, // (a) the holder adds; whoever clears its ownership subtracts
 
     // --- CFS-style vruntime (scheduler rewrite, post-Phase 7) -------------
     // Accumulated CPU "fair-share" time in ticks. Bumped by accountRunningTick
@@ -673,6 +678,22 @@ pub fn noKillLeave() void {
     @atomicStore(u16, &pcb.nokill, pcb.nokill - 1, .release);
 }
 
+/// `pid` took / no longer holds a sleeping lock (PCB.sleep_locks). The drop
+/// may come from another task; a dying holder's count goes with its slot.
+pub fn sleepLockTaken(pid: usize) void {
+    if (pid >= MAX_PROCS) return;
+    _ = @atomicRmw(u16, &procs[pid].sleep_locks, .Add, 1, .monotonic);
+}
+
+pub fn sleepLockDropped(pid: usize) void {
+    if (pid >= MAX_PROCS) return;
+    const p = &procs[pid].sleep_locks;
+    var seen = @atomicLoad(u16, p, .monotonic);
+    while (seen != 0) {
+        seen = @cmpxchgWeak(u16, p, seen, seen - 1, .monotonic, .monotonic) orelse return;
+    }
+}
+
 /// Initial value for `PCB.mmap_top`.
 pub const MMAP_TOP_INIT: usize = @intCast(memmap.NATIVE_SPACE_END);
 
@@ -783,15 +804,6 @@ const RegionAlloc = struct {
 };
 
 pub const RegionSet = vma.Set(LazyRegion, RegionAlloc);
-
-fn initFdTable() [MAX_FDS]FileDesc {
-    var table: [MAX_FDS]FileDesc = [_]FileDesc{.{}} ** MAX_FDS;
-    // Pre-open stdin(0), stdout(1), stderr(2)
-    table[0] = .{ .in_use = true, .inode = 0, .offset = 0, .flags = 0, .fs_type = .console }; // stdin
-    table[1] = .{ .in_use = true, .inode = 0, .offset = 0, .flags = 1, .fs_type = .console }; // stdout
-    table[2] = .{ .in_use = true, .inode = 0, .offset = 0, .flags = 1, .fs_type = .console }; // stderr
-    return table;
-}
 
 pub var procs: [MAX_PROCS]PCB = [_]PCB{.{}} ** MAX_PROCS;
 
@@ -1166,6 +1178,7 @@ pub const cloneLinuxThread = @import("lifecycle.zig").cloneLinuxThread;
 pub const LinuxThreadSpec = @import("lifecycle.zig").LinuxThreadSpec;
 pub const exitThreadGroup = @import("lifecycle.zig").exitThreadGroup;
 pub const forkCurrent = @import("lifecycle.zig").forkCurrent;
+pub const ForkSpec = @import("lifecycle.zig").ForkSpec;
 pub const createKernelIdle = @import("lifecycle.zig").createKernelIdle;
 pub const resetKernelIdleForResume = @import("lifecycle.zig").resetKernelIdleForResume;
 pub const createIdleProcess = @import("lifecycle.zig").createIdleProcess;
@@ -1200,7 +1213,7 @@ pub const ensureUserRangeWritable = @import("fault.zig").ensureUserRangeWritable
 pub const ensureSignalFrameWritable = @import("fault.zig").ensureSignalFrameWritable;
 pub const ensureUserRangeWritableFor = @import("fault.zig").ensureUserRangeWritableFor;
 pub const handleUserPageFault = @import("fault.zig").handleUserPageFault;
-pub const handleKernelWriteFault = @import("fault.zig").handleKernelWriteFault;
+pub const handleKernelUserFault = @import("fault.zig").handleKernelUserFault;
 pub const prefaultUserRange = @import("fault.zig").prefaultUserRange;
 
 

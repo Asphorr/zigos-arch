@@ -393,6 +393,30 @@ pub fn isSymlink(inode: *const layout.Inode) bool {
     return (inode.mode & layout.S_IFMT) == layout.S_IFLNK;
 }
 
+/// Longest target a symbolic link keeps in the inode itself.
+pub const FAST_LINK_MAX: usize = @sizeOf([layout.N_BLOCKS]u32);
+
+/// A symbolic link whose target text lies in the inode's block array (it
+/// owns no data block): those words are not block numbers.
+pub fn isFastSymlink(inode: *const layout.Inode) bool {
+    return isSymlink(inode) and inode.blocks == 0 and inode.size <= FAST_LINK_MAX;
+}
+
+/// The target of symbolic link `inum`, in `out`. Null if it is not a link,
+/// can't be read, or doesn't fit.
+pub fn readLink(inum: u32, out: []u8) ?[]const u8 {
+    const ino = readInode(inum) orelse return null;
+    if (!isSymlink(&ino)) return null;
+    const len: usize = ino.size;
+    if (len == 0 or len > out.len) return null;
+    if (isFastSymlink(&ino)) {
+        @memcpy(out[0..len], std.mem.asBytes(&ino.block)[0..len]);
+    } else if (readInodeBytes(inum, 0, out[0..len]) != len) {
+        return null;
+    }
+    return out[0..len];
+}
+
 // =============================================================================
 // Phase 2 — write-side block-tree helpers
 // =============================================================================
@@ -508,6 +532,11 @@ fn allocAndZeroIndirect(m: *block.Mount) ?u32 {
 /// rollback — all whole-op-locked). Also non-reentrant with itself via the
 /// shared `indir_scratch` BSS buffers below, which the lock now guarantees.
 pub fn freeAllBlocks(m: *block.Mount, ino: *layout.Inode) void {
+    // A fast link's block array is its target's text.
+    if (isFastSymlink(ino)) {
+        ino.block = [_]u32{0} ** layout.N_BLOCKS;
+        return;
+    }
     // Direct.
     for (0..layout.N_DIRECT) |i| {
         if (ino.block[i] != 0) {

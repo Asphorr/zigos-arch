@@ -122,6 +122,8 @@ pub const Window = struct {
     /// 0xFF on either field = no shell attached.
     kb_pipe: u8 = 0xFF,
     out_pipe: u8 = 0xFF,
+    /// The terminal over those two pipes (proc/tty.zig), 0xFF for none.
+    tty: u8 = 0xFF,
     /// PID of the shell process owning this terminal. Used so closing the
     /// window can SIGKILL the shell. 0xFF = no shell attached yet.
     shell_pid: u8 = 0xFF,

@@ -60,16 +60,39 @@ fn tidWordOk(va: u64) bool {
 /// The fork shape of clone: a new process, nothing shared; the low byte is
 /// the exit signal (SIGCHLD, or none).
 const SIGCHLD: u64 = 17;
+const CLONE_VFORK: u64 = 0x4000;
 
 /// clone(flags, stack, ptid, ctid, tls): the thread shape, as
-/// pthread_create issues it, or the plain fork shape. Returns the new tid;
-/// the thread itself returns 0 on `stack`.
+/// pthread_create issues it, or a fork shape. Returns the new tid; the
+/// thread itself returns 0 on `stack`.
+///
+/// CLONE_VM | CLONE_VFORK with a stack is posix_spawn's fork: a child that
+/// borrows the caller's memory until it execs. It gets a copy instead, and
+/// the caller is not held up for it — which neither can tell as long as
+/// the child reports to its parent through a file, as musl's does (a pipe
+/// that closes on exec).
 pub fn clone(frame: *signals.SyscallFrame, flags: u64, stack: u64, ptid: u64, ctid: u64, tls: u64) u64 {
     if (flags & CLONE_THREAD == 0) {
         const sig = flags & 0xFF;
-        if (flags & ~@as(u64, 0xFF) == 0 and stack == 0 and (sig == SIGCHLD or sig == 0))
-            return @import("linux_proc.zig").fork(frame);
-        debug.klog("[linux] pid={d} clone flags 0x{X}: only threads and plain forks\n", .{ process.getCurrentPid(), flags });
+        // The tid words go with either fork shape: glibc's fork asks for
+        // the child's.
+        const tid_words = CLONE_PARENT_SETTID | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID;
+        const shape = flags & ~@as(u64, 0xFF) & ~tid_words;
+        if ((shape == 0 or shape == CLONE_VM | CLONE_VFORK) and (sig == SIGCHLD or sig == 0)) {
+            if (stack >= memmap.USER_SPACE_END) return err(EINVAL);
+            if (flags & CLONE_PARENT_SETTID != 0 and !tidWordOk(ptid)) return err(EFAULT);
+            const child = @import("linux_proc.zig").forkWith(frame, .{
+                .stack = stack,
+                .set_tid = if (flags & CLONE_CHILD_SETTID != 0) ctid else 0,
+                .clear_tid = if (flags & CLONE_CHILD_CLEARTID != 0 and ctid & 3 == 0 and ctid < memmap.USER_SPACE_END) ctid else 0,
+            });
+            if (flags & CLONE_PARENT_SETTID != 0 and @as(i64, @bitCast(child)) > 0) {
+                const tid: u32 = @truncate(child);
+                _ = @import("../arch/usercopy.zig").copyToUser(ptid, std.mem.asBytes(&tid));
+            }
+            return child;
+        }
+        debug.klog("[linux] pid={d} clone flags 0x{X}: only threads and forks\n", .{ process.getCurrentPid(), flags });
         return err(ENOSYS);
     }
     if (flags & THREAD_SHARES != THREAD_SHARES or flags & ~(THREAD_SHARES | THREAD_EXTRAS) != 0) return err(EINVAL);
@@ -98,7 +121,7 @@ pub fn clone(frame: *signals.SyscallFrame, flags: u64, stack: u64, ptid: u64, ct
 pub fn setTidAddress(tidptr: u64) u64 {
     const me = process.currentPCB() orelse return err(EFAULT);
     me.clear_child_tid = if (tidptr & 3 == 0 and tidptr < memmap.USER_SPACE_END) tidptr else 0;
-    return process.getCurrentPid();
+    return me.pid_nr;
 }
 
 /// exit(code): this thread only. A joiner waits on its clear-tid word.

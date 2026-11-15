@@ -1653,16 +1653,27 @@ fn spawnShellOnWindow(wi: u8) void {
     const pcb = process.getPCB(pid);
     pcb.priority = .interactive;
 
-    // The shell owns: kb_pipe read-side (fd 0), out_pipe write-side (fd 1, fd 2).
-    // The desktop owns: kb_pipe write-side, out_pipe read-side. Refcounts are
-    // initialized to 1/1 by pipe.alloc(); no addReader/addWriter needed because
-    // each end has exactly one owner.
-    pcb.fd_table[0] = .{ .in_use = true, .fs_type = .pipe, .pipe_id = kb_pipe, .flags = 0 };
-    pcb.fd_table[1] = .{ .in_use = true, .fs_type = .pipe, .pipe_id = out_pipe, .flags = 1 };
-    pcb.fd_table[2] = .{ .in_use = true, .fs_type = .pipe, .pipe_id = out_pipe, .flags = 1 };
+    // The shell owns: kb_pipe read-side (fd 0), out_pipe write-side (one file
+    // behind fd 1 and fd 2). The desktop owns: kb_pipe write-side, out_pipe
+    // read-side. Refcounts are initialized to 1/1 by pipe.alloc(); each end
+    // has exactly one owner, and the shell's go back when its files do.
+    //
+    // The two ends are the window's terminal (proc/tty.zig): a Linux
+    // program the shell starts inherits them and finds a tty there.
+    const file = @import("../fs/file.zig");
+    const vfs_mod = @import("../fs/vfs.zig");
+    const tty = @import("../proc/tty.zig");
+    const term = tty.open(kb_pipe, out_pipe, @intCast(pid), @intCast(TERM_ROWS), @intCast(TERM_COLS));
+    if (vfs_mod.newFile(.{ .kind = .pipe, .pipe_id = kb_pipe, .access = file.READ, .tty = term })) |f| file.assign(pcb, 0, f);
+    if (vfs_mod.newFile(.{ .kind = .pipe, .pipe_id = out_pipe, .access = file.WRITE, .tty = term })) |f| {
+        file.ref(f);
+        file.assign(pcb, 1, f);
+        file.assign(pcb, 2, f);
+    }
 
     windows[wi].kb_pipe = kb_pipe;
     windows[wi].out_pipe = out_pipe;
+    windows[wi].tty = term;
     windows[wi].shell_pid = @intCast(pid);
     // Event-driven compositor: out_pipe is drained by the desktop loop's
     // tryRead poll, not by a blocking read. Tell pipe.write to wake the
@@ -2511,7 +2522,10 @@ fn handleKeyboard(w: *Window, ch: u8) bool {
             ch == keyboard.KEY_LEFT or ch == keyboard.KEY_RIGHT or
             ch == keyboard.KEY_HOME or ch == keyboard.KEY_END or
             ch == keyboard.KEY_DELETE;
-        if (!is_printable and !is_line_edit and !is_nav) return false;
+        // A Linux program in the terminal gets every control key (^D, ^Z,
+        // ^U...): its line discipline or the program itself knows them.
+        const is_control = ch < 0x20 and @import("../proc/tty.zig").hasLinuxProgram(w.tty);
+        if (!is_printable and !is_line_edit and !is_nav and !is_control) return false;
         const buf = [_]u8{ch};
         const written = @import("../proc/pipe.zig").tryWrite(w.kb_pipe, &buf);
         if (written == 0) {
@@ -4398,6 +4412,8 @@ fn removeWindow(slot: u8) ?*TerminalData {
         @import("../proc/pipe.zig").closeReader(windows[slot].out_pipe);
         windows[slot].out_pipe = 0xFF;
     }
+    @import("../proc/tty.zig").close(windows[slot].tty);
+    windows[slot].tty = 0xFF;
     if (windows[slot].shell_pid != 0xFF) {
         process.killProcess(windows[slot].shell_pid);
         windows[slot].shell_pid = 0xFF;
@@ -4664,6 +4680,15 @@ pub fn focusedSignalTarget() u8 {
     const w = &windows[wm.focused];
     if (!w.visible) return 0xFF;
     return if (w.term != null) w.shell_pid else w.owner_pid;
+}
+
+/// The terminal (proc/tty.zig) of the focused window, 0xFF if it has none.
+/// Read at interrupt time, like focusedSignalTarget.
+pub fn focusedTty() u8 {
+    if (!slot_used[wm.focused]) return 0xFF;
+    const w = &windows[wm.focused];
+    if (!w.visible) return 0xFF;
+    return w.tty;
 }
 
 /// True iff `pid` is the owner of a non-terminal, focused, visible, non-

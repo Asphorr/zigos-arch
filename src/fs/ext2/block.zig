@@ -134,7 +134,9 @@ pub fn lockMount(self: *Mount) void {
             self.lock_depth = 1;
             // A kill waits for the operation to finish: torn down halfway,
             // it would leave the metadata half updated.
-            @import("../../proc/process.zig").noKillEnter();
+            const process = @import("../../proc/process.zig");
+            process.noKillEnter();
+            process.sleepLockTaken(me);
             return;
         }
         sched.blockOnMutex(tid, &self.lock_owner); // sleep until released, then retry CAS
@@ -151,7 +153,9 @@ pub fn unlockMount(self: *Mount) void {
         const tid: u32 = @truncate(@intFromPtr(&self.lock_owner));
         @atomicStore(u16, &self.lock_owner, 0xFFFF, .release);
         sched.wakeMutexWaiters(tid);
-        @import("../../proc/process.zig").noKillLeave();
+        const process = @import("../../proc/process.zig");
+        process.sleepLockDropped(me);
+        process.noKillLeave();
     }
 }
 
@@ -225,6 +229,13 @@ pub fn mountAt(slot: *Mount, read_fn: ReadFn, write_fn: WriteFn, partition_lba: 
     }
     if (sb.log_block_size > 2) {
         debug.klog("[ext2] mount: unsupported log_block_size={d}\n", .{sb.log_block_size});
+        return false;
+    }
+    // An incompat feature changes how the disk is read (extents, 64-bit
+    // block numbers, a journal to replay first): with one this driver
+    // doesn't know, every read would be a guess.
+    if (sb.rev_level >= layout.REV_DYNAMIC and sb.feature_incompat & ~layout.FEATURE_INCOMPAT_FILETYPE != 0) {
+        debug.klog("[ext2] mount: unsupported incompat features 0x{X}\n", .{sb.feature_incompat});
         return false;
     }
 

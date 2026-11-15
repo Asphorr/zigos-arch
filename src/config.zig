@@ -50,11 +50,11 @@ pub const MAX_ARGS: u8 = 8;
 pub const MAX_ARG_LEN: u8 = 32;
 
 // --- Signals ---
-/// Total signal slots. Linux's _NSIG is 64 (for rt-signals 33..63); we cap at
-/// 32 because the per-PCB pending/mask are u32 bitmasks. Standard POSIX uses
-/// 1..31. Bumping to 64 means widening pending/mask to u64 and the asm-side
-/// signal-frame magic constant — defer until we genuinely need rt-signals.
-pub const NSIG: u32 = 32;
+/// Signal slots: signals 1..64 as on Linux (32..64 are the real-time ones;
+/// musl keeps a few for itself), slot 0 unused. Pending sets and masks are
+/// u64 with bit N-1 for signal N (signals.bit), Linux's layout; the native
+/// calls' u32 sets have bit N and are shifted at their boundary.
+pub const NSIG: u32 = 65;
 
 // --- Debug / test backdoors ---
 /// Gates sysDebugCrash (sys#117), the crash-test backdoor crashtest.elf uses

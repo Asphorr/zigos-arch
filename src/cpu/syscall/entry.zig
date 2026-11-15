@@ -225,15 +225,18 @@ fn CpuEntry(comptime cpu_id: u8) type {
                     "push %%r8\n" ++
                     "push %%r9\n" ++
                     "push %%r10\n" ++
-                    // 520 = 512 FXSAVE + 8 padding. 15 prior pushes (120B)
-                    // + 520 = 640, 640%16==0; CALL pushes 8 → callee at %16==8.
-                    "sub $520, %%rsp\n" ++
+                    // 536 = 512 FXSAVE + the three words under the frame
+                    // (signals.SyscallFrame: exit mode, then the rcx and r11
+                    // a full restore loads). 15 prior pushes (120B) + 536 =
+                    // 656, 656%16==0; CALL pushes 8 → callee at %16==8.
+                    "sub $536, %%rsp\n" ++
+                    "movq $0, 512(%%rsp)\n" ++ // exit mode: sysret
                     "fxsaveq (%%rsp)\n" ++
                     // 5th arg to doSyscall = pointer to the saved frame (start of
-                    // the GPR area, just above the 520-byte FXSAVE block). Layout
+                    // the GPR area, just above the 536 bytes). Layout
                     // matches signals.SyscallFrame — 14 u64 GPRs starting at r10,
                     // followed by user_rsp at offset 112.
-                    "leaq 520(%%rsp), %%r8\n" ++
+                    "leaq 536(%%rsp), %%r8\n" ++
                     "test $0xF, %%rsp\n" ++
                     "jnz syscall_align_panic\n" ++
                     "call doSyscall\n" ++
@@ -242,7 +245,9 @@ fn CpuEntry(comptime cpu_id: u8) type {
                     // stack in ring 0, where an interrupt must not land.
                     "cli\n" ++
                     "fxrstorq (%%rsp)\n" ++
-                    "add $520, %%rsp\n" ++
+                    "cmpq $0, 512(%%rsp)\n" ++
+                    "jne 7f\n" ++
+                    "add $536, %%rsp\n" ++
                     "pop %%r10\n" ++
                     "pop %%r9\n" ++
                     "pop %%r8\n" ++
@@ -262,7 +267,36 @@ fn CpuEntry(comptime cpu_id: u8) type {
                     // 8 bytes of "leak" on the kernel stack don't matter (next
                     // syscall resets RSP from cpus[N].tss.rsp0).
                     "pop %%rsp\n" ++
-                    "sysretq\n");
+                    "sysretq\n" ++
+                    // Full restore (rt_sigreturn): every register comes back,
+                    // rcx and r11 too, so the exit is iretq. Its frame is
+                    // built in the FXSAVE block, free now, from the slots
+                    // sysret would have used; rax is the call's result.
+                    "7:\n" ++
+                    "movq 632(%%rsp), %%rcx\n" ++ // frame.rcx: rip
+                    "movq %%rcx, 472(%%rsp)\n" ++
+                    "movq $0x23, 480(%%rsp)\n" ++ // user cs
+                    "movq 640(%%rsp), %%rcx\n" ++ // frame.r11: rflags
+                    "movq %%rcx, 488(%%rsp)\n" ++
+                    "movq 648(%%rsp), %%rcx\n" ++ // frame.user_rsp
+                    "movq %%rcx, 496(%%rsp)\n" ++
+                    "movq $0x1B, 504(%%rsp)\n" ++ // user ss
+                    "movq 520(%%rsp), %%rcx\n" ++
+                    "movq 528(%%rsp), %%r11\n" ++
+                    "movq 536(%%rsp), %%r10\n" ++
+                    "movq 544(%%rsp), %%r9\n" ++
+                    "movq 552(%%rsp), %%r8\n" ++
+                    "movq 560(%%rsp), %%rdx\n" ++
+                    "movq 568(%%rsp), %%rsi\n" ++
+                    "movq 576(%%rsp), %%rdi\n" ++
+                    "movq 584(%%rsp), %%r15\n" ++
+                    "movq 592(%%rsp), %%r14\n" ++
+                    "movq 600(%%rsp), %%r13\n" ++
+                    "movq 608(%%rsp), %%r12\n" ++
+                    "movq 616(%%rsp), %%rbp\n" ++
+                    "movq 624(%%rsp), %%rbx\n" ++
+                    "addq $472, %%rsp\n" ++
+                    "iretq\n");
         }
     };
 }

@@ -187,6 +187,8 @@ pub fn advance() void {
                         pipe.closeReader(w.out_pipe);
                         w.out_pipe = 0xFF;
                     }
+                    @import("../../proc/tty.zig").close(w.tty);
+                    w.tty = 0xFF;
                     w.visible = false;
                 }
                 dirty_rects.force_full_kind = true;

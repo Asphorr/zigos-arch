@@ -447,12 +447,23 @@ pub fn push(ch: u8) void {
     // event sits in the buffer until the loop runs again, which can be many
     // seconds. From IRQ context we can call signals.send straight through —
     // it's pure field writes + an optional process.wake, both lock-free.
+    //
+    // A terminal window has a foreground process group for it (proc/tty.zig)
+    // — the shell, a Linux program's job — unless its reader has turned key
+    // signals off, in which case the byte travels as any other key.
     if (ch == 0x03) {
         const desktop = @import("../ui/desktop.zig");
         const signals = @import("../proc/signals.zig");
-        const target = desktop.focusedSignalTarget();
-        if (target != 0xFF) _ = signals.send(target, signals.SIGINT);
-        return;
+        const tty = @import("../proc/tty.zig");
+        const term = desktop.focusedTty();
+        const as_key = term != tty.NONE and !tty.interruptKey(term);
+        if (!as_key) {
+            if (term == tty.NONE) {
+                const target = desktop.focusedSignalTarget();
+                if (target != 0xFF) _ = signals.sendProcess(target, signals.SIGINT, .{});
+            }
+            return;
+        }
     }
     // F1..F12 (0x90..0x9F) are global shortcuts — route to the desktop-only
     // ring so a focused fullscreen app's `while (readChar() != 0) {}` drain

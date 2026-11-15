@@ -133,7 +133,7 @@ fn sleepNanos(ns: u64, rem_va: u64) u64 {
     var now = time.monotonicNanos();
     const deadline = now +| ns;
     while (now < deadline) {
-        if ((@atomicLoad(u32, &pcb.pending_signals, .acquire) & ~pcb.signal_mask) != 0) {
+        if (@import("../../proc/signals.zig").deliverable(pcb) != 0) {
             if (rem_va != 0) {
                 const rem = toTimespec(deadline - now);
                 _ = usercopy.copyToUser(rem_va, std.mem.asBytes(&rem));

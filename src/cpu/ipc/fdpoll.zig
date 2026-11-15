@@ -118,15 +118,14 @@ pub fn pollMaskHandle(pid: u8, h: FdHandle) u16 {
 /// have been closed.
 pub fn resolveFd(pid: u8, fd: u8) ?FdHandle {
     if (pid >= process.MAX_PROCS) return null;
-    const pcb = &process.procs[pid];
-    if (fd >= pcb.fd_table.len) return null;
-    const e = &pcb.fd_table[fd];
-    if (!e.in_use) return null;
-    return switch (e.fs_type) {
-        .pipe => .{ .kind = .pipe, .id = e.pipe_id },
+    const file = @import("../../fs/file.zig");
+    const f = file.get(&process.procs[pid], fd) orelse return null;
+    defer file.put(f);
+    return switch (f.kind) {
+        .pipe => .{ .kind = .pipe, .id = f.pipe_id },
         .console => .{ .kind = .console, .id = 0xFFFF }, // focus may change; use 0xFFFF as a "current focus" sentinel
-        .tcp_sock, .tcp_listener => .{ .kind = e.fs_type, .id = @intCast(e.inode) },
-        else => .{ .kind = e.fs_type, .id = 0 },
+        .tcp_sock, .tcp_listener => .{ .kind = f.kind, .id = @intCast(f.inode) },
+        else => .{ .kind = f.kind, .id = 0 },
     };
 }
 

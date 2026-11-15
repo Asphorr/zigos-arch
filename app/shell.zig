@@ -1175,7 +1175,10 @@ fn runPipeline(cmds: []const Command) void {
                 rcount += 1;
             }
 
-            const pid = libc.execAs(resolved, remap[0..rcount]);
+            var pid = libc.execAs(resolved, remap[0..rcount]);
+            // A program that goes by its plain name, with no `.elf`: a Linux
+            // one, as a rule.
+            if (pid == BAD_PID and resolved.len != c.cmd.len) pid = libc.execAs(c.cmd, remap[0..rcount]);
             if (pid == BAD_PID) {
                 libc.print("\x1b[31mshell: not found: ");
                 libc.print(c.cmd);

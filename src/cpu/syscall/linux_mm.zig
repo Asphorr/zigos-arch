@@ -161,12 +161,14 @@ pub fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, off: u64) u64 {
     if (anon) {
         if (!shared) region.flags = process.REGION_MERGEABLE;
     } else {
-        // The fd table is the group's: the lead's.
-        if (fd >= config.MAX_FDS or !owner.fd_table[fd].in_use) return err(EBADF);
+        // The fd table is the group's: the lead's. The mapping keeps the
+        // inode, not the file, so the reference ends with this block.
+        const file = @import("../../fs/file.zig");
+        const fe = file.get(owner, fd) orelse return err(EBADF);
+        defer file.put(fe);
         // File mappings go through the page cache, which only ext2 has,
         // and only for regular files.
-        const fe = &owner.fd_table[fd];
-        if (fe.fs_type != .ext2) return err(ENODEV);
+        if (fe.kind != .ext2) return err(ENODEV);
         const ino = ext2_inode.readInode(fe.inode) orelse return err(EBADF);
         if (!ext2_inode.isReg(&ino)) return err(ENODEV);
         // The cache keys pages by file offset; every page's must be one.

@@ -9,17 +9,20 @@
 //! slot leaves with the old one, through the ordinary teardown. A failure
 //! before that trade leaves the caller as it was.
 //!
-//! No Linux signal delivery yet: kill ends a process for the signals whose
-//! default is to, and ignores the rest.
+//! kill, tkill and tgkill send through the signal core (proc/signals.zig);
+//! handlers and masks are linux_signal.zig's.
 
 const std = @import("std");
 const process = @import("../../proc/process.zig");
 const lifecycle = @import("../../proc/lifecycle.zig");
 const sched = @import("../../proc/sched.zig");
 const signals = @import("../../proc/signals.zig");
+const pid_nr = @import("../../proc/pid_nr.zig");
+const session = @import("../../proc/session.zig");
 const pipe = @import("../../proc/pipe.zig");
 const elf_loader = @import("../../proc/elf_loader.zig");
 const vfs = @import("../../fs/vfs.zig");
+const file = @import("../../fs/file.zig");
 const heap = @import("../../mm/heap.zig");
 const pmm = @import("../../mm/pmm.zig");
 const fdpoll = @import("../ipc/fdpoll.zig");
@@ -27,6 +30,7 @@ const smp = @import("../smp.zig");
 const usercopy = @import("../arch/usercopy.zig");
 const common = @import("common.zig");
 const linux_fs = @import("linux_fs.zig");
+const linux_signal = @import("linux_signal.zig");
 const linux_time = @import("linux_time.zig");
 const debug = @import("../../debug/debug.zig");
 
@@ -59,8 +63,18 @@ const O_CLOEXEC: u64 = 0x80000;
 /// fork(), vfork() and clone() of the fork shape: the child returns 0 from
 /// the same syscall with the caller's registers and FP state.
 pub fn fork(frame: *signals.SyscallFrame) u64 {
+    return forkWith(frame, .{});
+}
+
+/// fork as clone asks for it: on a stack of the child's own, with tid
+/// words. `spec.child_nr` is this function's to set.
+pub fn forkWith(frame: *signals.SyscallFrame, spec: process.ForkSpec) u64 {
+    var child: u32 = 0;
+    var full = spec;
+    full.child_nr = &child;
     // never_inline: watch.zig names forkCurrent as a kernel_esp writer.
-    return @call(.never_inline, process.forkCurrent, .{frame}) orelse err(EAGAIN);
+    _ = @call(.never_inline, process.forkCurrent, .{ frame, full }) orelse return err(EAGAIN);
+    return child;
 }
 
 // --- execve ----------------------------------------------------------------
@@ -153,7 +167,7 @@ fn enterImage(frame: *signals.SyscallFrame, e: EntryRsp) void {
 fn closeOnExec() void {
     const pcb = linux_fs.proc() orelse return;
     for (0..pcb.fd_table.len) |fd| {
-        if (pcb.fd_table[fd].in_use and pcb.fd_table[fd].cloexec) _ = vfs.closeSlot(pcb, @intCast(fd));
+        if (pcb.fd_table[fd].file != null and pcb.fd_table[fd].cloexec) _ = vfs.closeSlot(pcb, @intCast(fd));
     }
 }
 
@@ -189,25 +203,54 @@ const WNOHANG: u64 = 1;
 const RUSAGE_BYTES: usize = 144;
 const SIGKILL: u32 = 9;
 
-/// The exit status of a process kill() ended: the signal, flagged.
-const KILLED_BY: u32 = 0x4000_0000;
-
 /// A process's exit status as wait4 reports it: an exit code (0..255)
-/// shifted up, or the signal that ended it in the low bits — what kill()
-/// recorded, else SIGKILL (a fault, an out-of-memory kill).
+/// shifted up, or the signal that ended it in the low bits — the one a
+/// signal's default or a fault recorded (signals.fatalStatus), else SIGKILL
+/// (the kernel's own kills: out of memory, a fault under a lock).
 fn waitStatus(s: u32) u32 {
     if (s <= 0xFF) return s << 8;
-    if (s & KILLED_BY != 0) return s & 0x7F;
+    if (s & signals.KILLED_BY != 0) return s & 0x7F;
     return SIGKILL;
 }
 
-/// wait4(pid, status, options, rusage). pid > 0 names a child; any other
-/// value waits for any child (no process groups). rusage comes back zeroed.
+/// The children a wait4 is for: all, the one in a slot, or those of a
+/// process group.
+const Awaited = union(enum) {
+    any,
+    slot: u8,
+    group: u32,
+
+    fn has(self: Awaited, slot: usize) bool {
+        return switch (self) {
+            .any => true,
+            .slot => |s| s == slot,
+            .group => |g| process.procs[slot].pgid == g,
+        };
+    }
+};
+
+const ANY_CHILD: u32 = 0xFFFF_FFFF;
+
+/// wait4(pid, status, options, rusage). pid > 0 names a child, -1 is any
+/// child, 0 the children in the caller's process group and below -1 those
+/// in group -pid. Returns the child's pid; rusage comes back zeroed.
 pub fn wait4(pid_arg: u64, status_va: u64, options: u64, rusage_va: u64) u64 {
     const me = smp.currentPid() orelse return err(EFAULT);
     const group: u8 = process.procs[me].tgid;
     const pid: i32 = @bitCast(@as(u32, @truncate(pid_arg)));
-    const target: u32 = if (pid > 0) @intCast(pid) else 0xFFFF_FFFF;
+    const awaited: Awaited = if (pid > 0)
+        .{ .slot = pid_nr.slotOf(@intCast(pid)) orelse return err(ECHILD) }
+    else if (pid == -1)
+        .any
+    else if (pid == 0)
+        .{ .group = process.procs[group].pgid }
+    else
+        .{ .group = @intCast(-@as(i64, pid)) };
+    // What a dying child wakes: a waiter for its slot, or for any.
+    const wake_on: u32 = switch (awaited) {
+        .slot => |s| s,
+        else => ANY_CHILD,
+    };
     if (status_va != 0 and !common.validateUserPtrWriteAligned(status_va, 4, 4)) return err(EFAULT);
     if (rusage_va != 0 and !common.validateUserPtrWrite(rusage_va, RUSAGE_BYTES)) return err(EFAULT);
     // Registered before the first look, so a child dying after it wakes us.
@@ -215,7 +258,7 @@ pub fn wait4(pid_arg: u64, status_va: u64, options: u64, rusage_va: u64) u64 {
     defer lifecycle.childWaitLeave(me);
     while (true) {
         var st: u32 = 0;
-        if (reapChild(group, target, &st)) |z| {
+        if (reapChild(group, awaited, &st)) |child| {
             // Faultable copies: the pages were checked before the wait, and
             // a sibling thread's fork since makes them copy-on-write again.
             if (status_va != 0 and !usercopy.copyToUser(status_va, std.mem.asBytes(&st))) return err(EFAULT);
@@ -223,72 +266,160 @@ pub fn wait4(pid_arg: u64, status_va: u64, options: u64, rusage_va: u64) u64 {
                 const zero = [_]u8{0} ** RUSAGE_BYTES;
                 if (!usercopy.copyToUser(rusage_va, &zero)) return err(EFAULT);
             }
-            return z;
+            return child;
         }
-        if (!hasChild(group, target)) return err(ECHILD);
+        if (!hasChild(group, awaited)) return err(ECHILD);
         if (options & WNOHANG != 0) return 0;
-        process.blockOn(.waitpid, target);
+        // A signal for the caller ends the wait, after the look above: a
+        // child ready with it (SIGCHLD's own) is still reaped by this call.
+        if (signals.deliverable(&process.procs[me]) != 0) return err(linux_signal.ERESTARTSYS);
+        process.blockOn(.waitpid, wake_on);
     }
 }
 
 /// Two threads of a process may wait4 for the same child: one reaps it.
 var reap_lock: @import("../../proc/spinlock.zig").SpinLock = .{};
 
-/// Reap a zombie child of `group` matching `target`, its wait status in
-/// `status`; null if none is reapable now.
-fn reapChild(group: u8, target: u32, status: *u32) ?u8 {
+/// Reap a zombie child of `group` among the `awaited`, its wait status in
+/// `status`. Returns the child's number; null if none is reapable now.
+fn reapChild(group: u8, awaited: Awaited, status: *u32) ?u32 {
     reap_lock.acquire();
     defer reap_lock.release();
-    const z = process.findZombieChild(group, target) orelse return null;
+    const z: u8 = switch (awaited) {
+        .any => process.findZombieChild(group, ANY_CHILD),
+        .slot => |s| process.findZombieChild(group, s),
+        .group => blk: {
+            for (0..process.MAX_PROCS) |i| {
+                if (!awaited.has(i)) continue;
+                if (process.findZombieChild(group, @intCast(i))) |z| break :blk z;
+            }
+            break :blk null;
+        },
+    } orelse return null;
     status.* = waitStatus(process.procs[z].exit_status);
+    const nr = process.procs[z].pid_nr;
     process.reapZombie(z);
-    return z;
+    return nr;
 }
 
-fn hasChild(group: u8, target: u32) bool {
+fn hasChild(group: u8, awaited: Awaited) bool {
     for (0..process.MAX_PROCS) |i| {
         if (process.procs[i].state == .unused or process.procs[i].parent_pid != group) continue;
-        if (target == 0xFFFF_FFFF or i == target) return true;
+        if (awaited.has(i)) return true;
     }
     return false;
 }
 
-/// Signals whose default action is to do nothing (or to stop, which there
-/// is no job control for).
-fn defaultIgnored(sig: u32) bool {
-    return switch (sig) {
-        17, 18, 19, 20, 21, 22, 23, 28 => true, // CHLD CONT STOP TSTP TTIN TTOU URG WINCH
-        else => false,
-    };
+/// What a signal the caller sends carries: `code` and the caller's pid.
+fn fromCaller(code: i32) signals.Info {
+    const me = linux_fs.proc() orelse return .{ .code = code };
+    return .{ .code = code, .pid = me.pid_nr };
 }
 
-/// kill(pid, sig): ends process `pid` (any thread of it named) for a
-/// signal whose default does; 0 checks it exists. No process groups.
+/// Signal `sig` for the process the task in `slot` belongs to; 0 only
+/// checks that it is there.
+fn signalProcess(slot: u8, sig: u32) u64 {
+    const t = &process.procs[slot];
+    if (t.state == .unused or t.state == .zombie or t.state == .loading) return err(ESRCH);
+    if (t.is_idle or t.page_dir_phys == 0) return err(EPERM);
+    if (!signals.killProcess(slot, sig, fromCaller(signals.SI_USER_CODE))) return err(ESRCH);
+    return 0;
+}
+
+/// kill(pid, sig). pid > 0 is one process (any thread of it named), 0 the
+/// caller's process group, below -1 the group -pid, and -1 every Linux
+/// process but the caller's (native programs are not its to signal).
 pub fn kill(pid_arg: u64, sig_arg: u64) u64 {
     const pid: i32 = @bitCast(@as(u32, @truncate(pid_arg)));
     const sig: u32 = @truncate(sig_arg);
     if (sig >= 65) return err(EINVAL);
-    if (pid <= 0) return err(EINVAL);
-    if (pid >= process.MAX_PROCS) return err(ESRCH);
-    const t = &process.procs[@intCast(pid)];
-    if (t.state == .unused or t.state == .zombie or t.state == .loading) return err(ESRCH);
-    if (t.is_idle or t.page_dir_phys == 0) return err(EPERM);
-    if (sig == 0 or defaultIgnored(sig)) return 0;
-    lifecycle.killThreadGroup(t.tgid, KILLED_BY | sig);
-    return 0;
+    if (pid > 0) return signalProcess(pid_nr.slotOf(@intCast(pid)) orelse return err(ESRCH), sig);
+
+    const me = linux_fs.proc() orelse return err(EFAULT);
+    const everyone = pid == -1;
+    const group: u32 = if (pid == 0) me.pgid else @intCast(-@as(i64, pid));
+    var found = false;
+    var self = false;
+    for (0..process.MAX_PROCS) |i| {
+        const p = &process.procs[i];
+        if (!session.isProcess(i) or p.state == .zombie or p.is_idle or p.page_dir_phys == 0) continue;
+        if (everyone) {
+            if (p == me or p.personality != .linux) continue;
+        } else if (p.pgid != group) continue;
+        found = true;
+        // The caller's own process goes last: its end ends this loop.
+        if (p == me) self = true else _ = signalProcess(@intCast(i), sig);
+    }
+    if (self) return signalProcess(me.tgid, sig);
+    return if (found) 0 else err(ESRCH);
 }
 
-/// tkill(tid, sig): a signal for one thread. Without handlers every signal
-/// takes its default, and a fatal default ends the whole process, so this
-/// is kill() on the thread's process. abort() raises SIGABRT this way.
+/// tkill(tid, sig): a signal for one thread — only it takes it. abort()
+/// and raise() send theirs this way.
 pub fn tkill(tid: u64, sig: u64) u64 {
-    return kill(tid, sig);
+    const tid32: i32 = @bitCast(@as(u32, @truncate(tid)));
+    if (tid32 <= 0) return err(EINVAL);
+    if (sig >= 65) return err(EINVAL);
+    const slot = pid_nr.slotOf(@intCast(tid32)) orelse return err(ESRCH);
+    const t = &process.procs[slot];
+    if (t.state == .zombie) return err(ESRCH);
+    if (t.is_idle or t.page_dir_phys == 0) return err(EPERM);
+    if (!signals.killTask(slot, @truncate(sig), fromCaller(signals.SI_TKILL_CODE))) return err(ESRCH);
+    return 0;
 }
 
 /// tgkill(tgid, tid, sig): tkill that also names the thread's process.
 pub fn tgkill(tgid: u64, tid: u64, sig: u64) u64 {
-    if (tid < process.MAX_PROCS and process.procs[tid].tgid != tgid) return err(ESRCH);
-    return kill(tid, sig);
+    const tid32: i32 = @bitCast(@as(u32, @truncate(tid)));
+    const tgid32: i32 = @bitCast(@as(u32, @truncate(tgid)));
+    if (tid32 <= 0 or tgid32 <= 0) return err(EINVAL);
+    const slot = pid_nr.slotOf(@intCast(tid32)) orelse return err(ESRCH);
+    if (pid_nr.of(process.procs[slot].tgid) != @as(u32, @intCast(tgid32))) return err(ESRCH);
+    return tkill(tid, sig);
+}
+
+// --- process groups and sessions ---------------------------------------------
+
+/// The process Linux pid `pid` names (0: the caller's `me`), or null.
+fn processOf(pid: u64, me: *process.PCB) ?*process.PCB {
+    const nr: u32 = @truncate(pid);
+    if (nr == 0) return me;
+    return process.leader(&process.procs[pid_nr.slotOf(nr) orelse return null]);
+}
+
+/// getpgid(pid); getpgrp is getpgid(0).
+pub fn getpgid(pid: u64) u64 {
+    const me = linux_fs.proc() orelse return err(EFAULT);
+    return (processOf(pid, me) orelse return err(ESRCH)).pgid;
+}
+
+/// getsid(pid).
+pub fn getsid(pid: u64) u64 {
+    const me = linux_fs.proc() orelse return err(EFAULT);
+    return (processOf(pid, me) orelse return err(ESRCH)).sid;
+}
+
+/// setpgid(pid, pgid): the caller or one of its children moves to a group
+/// of the caller's session; pgid 0 (or the process's own pid) starts one.
+pub fn setpgid(pid: u64, pgid_arg: u64) u64 {
+    const me = linux_fs.proc() orelse return err(EFAULT);
+    const want: i32 = @bitCast(@as(u32, @truncate(pgid_arg)));
+    if (want < 0 or @as(i32, @bitCast(@as(u32, @truncate(pid)))) < 0) return err(EINVAL);
+    const target = processOf(pid, me) orelse return err(ESRCH);
+    if (target != me and target.parent_pid != me.tgid) return err(ESRCH);
+    // A session's leader stays in the group it started.
+    if (target.sid == target.pid_nr) return err(EPERM);
+    const pgid: u32 = if (want == 0) target.pid_nr else @intCast(want);
+    session.setGroup(me, target, pgid) catch return err(EPERM);
+    return 0;
+}
+
+/// setsid(): a new session and group, both of the caller's pid. Not for a
+/// process that leads a group: the group would lose it to the new session.
+pub fn setsid() u64 {
+    const me = linux_fs.proc() orelse return err(EFAULT);
+    if (me.pgid == me.pid_nr) return err(EPERM);
+    return session.startSession(me) catch err(EPERM);
 }
 
 // --- pipes and fds -----------------------------------------------------------
@@ -298,23 +429,34 @@ pub fn pipe2(fds_va: u64, flags: u64) u64 {
     if (flags & ~(O_NONBLOCK | O_CLOEXEC | O_DIRECT) != 0) return err(EINVAL);
     if (!common.validateUserPtrWriteAligned(fds_va, 8, 4)) return err(EFAULT);
     const pcb = linux_fs.proc() orelse return err(EFAULT);
-    const id = pipe.alloc() orelse return err(ENFILE);
-    const r = vfs.allocFd(pcb) orelse return pipeFail(id, null, pcb);
-    const w = vfs.allocFd(pcb) orelse return pipeFail(id, r, pcb);
     const cloexec = flags & O_CLOEXEC != 0;
     const nonblock = flags & O_NONBLOCK != 0;
-    vfs.installFd(pcb, r, .{ .in_use = true, .fs_type = .pipe, .pipe_id = id, .flags = 0, .cloexec = cloexec, .nonblock = nonblock });
-    vfs.installFd(pcb, w, .{ .in_use = true, .fs_type = .pipe, .pipe_id = id, .flags = 1, .cloexec = cloexec, .nonblock = nonblock });
+    const id = pipe.alloc() orelse return err(ENFILE);
+    // Each file owns its end of the pipe from here: putting it closes the end.
+    const rf = vfs.newFile(.{ .kind = .pipe, .pipe_id = id, .access = file.READ, .nonblock = nonblock }) orelse {
+        pipe.closeReader(id);
+        pipe.closeWriter(id);
+        return err(ENFILE);
+    };
+    const wf = vfs.newFile(.{ .kind = .pipe, .pipe_id = id, .access = file.WRITE, .nonblock = nonblock }) orelse {
+        file.put(rf);
+        pipe.closeWriter(id);
+        return err(ENFILE);
+    };
+    const r = vfs.allocFd(pcb) orelse return pipeFail(rf, wf, null, pcb);
+    const w = vfs.allocFd(pcb) orelse return pipeFail(rf, wf, r, pcb);
+    file.install(pcb, r, rf, cloexec);
+    file.install(pcb, w, wf, cloexec);
     const out: *[2]i32 = @ptrFromInt(fds_va);
     out[0] = @intCast(r);
     out[1] = @intCast(w);
     return 0;
 }
 
-fn pipeFail(id: u8, reserved: ?usize, pcb: *process.PCB) u64 {
+fn pipeFail(rf: *file.File, wf: *file.File, reserved: ?usize, pcb: *process.PCB) u64 {
     if (reserved) |fd| vfs.releaseFd(pcb, fd);
-    pipe.closeReader(id);
-    pipe.closeWriter(id);
+    file.put(rf);
+    file.put(wf);
     return err(EMFILE);
 }
 
@@ -326,7 +468,7 @@ pub fn dup(old: u64) u64 {
 /// dup2(old, new).
 pub fn dup2(old: u64, new: u64) u64 {
     const pcb = linux_fs.proc() orelse return err(EFAULT);
-    if (old == new) return if (linux_fs.fdEntry(pcb, old) != null) new else err(EBADF);
+    if (old == new) return if (linux_fs.fdOpen(pcb, old)) new else err(EBADF);
     return dupAt(pcb, old, new, false);
 }
 
@@ -337,39 +479,32 @@ pub fn dup3(old: u64, new: u64, flags: u64) u64 {
     return dupAt(pcb, old, new, flags & O_CLOEXEC != 0);
 }
 
-/// fd `old` into slot `new`, whatever `new` held closed after.
+/// fd `old`'s file into slot `new` as well, whatever `new` held closed
+/// after. The two share the file: one offset, one set of status flags.
 fn dupAt(pcb: *process.PCB, old: u64, new: u64, cloexec: bool) u64 {
     if (new >= pcb.fd_table.len) return err(EBADF);
-    var victim: process.FileDesc = .{};
-    {
-        pcb.fd_lock.acquire();
-        defer pcb.fd_lock.release();
-        if (old >= pcb.fd_table.len or !pcb.fd_table[old].in_use or pcb.fd_table[old].reserved) return err(EBADF);
+    const f = file.get(pcb, old) orelse return err(EBADF);
+    switch (file.replace(pcb, @intCast(new), f, cloexec)) {
         // Being opened by another thread: its install would overwrite us.
-        if (pcb.fd_table[new].in_use and pcb.fd_table[new].reserved) return err(EBUSY);
-        var copy = pcb.fd_table[old];
-        if (!vfs.refEntry(&copy)) return err(EINVAL);
-        copy.cloexec = cloexec;
-        victim = pcb.fd_table[new];
-        pcb.fd_table[new] = copy;
+        .busy => {
+            file.put(f);
+            return err(EBUSY);
+        },
+        .was => |victim| if (victim) |v| file.put(v),
     }
-    if (victim.in_use) vfs.releaseEntry(&victim);
     return new;
 }
 
-/// fd `old` into the lowest free slot at or above `min` (dup, F_DUPFD).
+/// fd `old`'s file into the lowest free slot at or above `min` as well
+/// (dup, F_DUPFD).
 pub fn dupFrom(old: u64, min: u64, cloexec: bool) u64 {
     const pcb = linux_fs.proc() orelse return err(EFAULT);
-    pcb.fd_lock.acquire();
-    defer pcb.fd_lock.release();
-    if (old >= pcb.fd_table.len or !pcb.fd_table[old].in_use or pcb.fd_table[old].reserved) return err(EBADF);
-    var slot: usize = @intCast(@min(min, pcb.fd_table.len));
-    while (slot < pcb.fd_table.len and pcb.fd_table[slot].in_use) slot += 1;
-    if (slot == pcb.fd_table.len) return err(EMFILE);
-    var copy = pcb.fd_table[old];
-    if (!vfs.refEntry(&copy)) return err(EINVAL);
-    copy.cloexec = cloexec;
-    pcb.fd_table[slot] = copy;
+    const f = file.get(pcb, old) orelse return err(EBADF);
+    const slot = file.reserveFrom(pcb, @intCast(@min(min, pcb.fd_table.len))) orelse {
+        file.put(f);
+        return err(EMFILE);
+    };
+    file.install(pcb, slot, f, cloexec);
     return slot;
 }
 
@@ -384,9 +519,15 @@ pub fn poll(fds_va: u64, nfds: u64, timeout_arg: u64) u64 {
     return pollFor(fds_va, nfds, if (ms < 0) null else @as(u64, @intCast(ms)) * 1_000_000);
 }
 
-/// ppoll(fds, nfds, timeout, sigmask, sigsetsize): the mask is moot without
-/// signal delivery.
-pub fn ppoll(fds_va: u64, nfds: u64, tmo_va: u64) u64 {
+/// ppoll(fds, nfds, timeout, sigmask, sigsetsize): poll under `sigmask`
+/// when one is given.
+pub fn ppoll(fds_va: u64, nfds: u64, tmo_va: u64, mask_va: u64, mask_size: u64) u64 {
+    if (mask_va != 0) {
+        if (mask_size != 8) return err(EINVAL);
+        var mask: u64 = 0;
+        if (!usercopy.copyFromUser(std.mem.asBytes(&mask), mask_va)) return err(EFAULT);
+        linux_signal.waitUnderMask(process.currentPCB() orelse return err(EFAULT), mask);
+    }
     if (tmo_va == 0) return pollFor(fds_va, nfds, null);
     return switch (linux_time.readTimespec(tmo_va)) {
         .ns => |ns| pollFor(fds_va, nfds, ns),
@@ -412,7 +553,9 @@ fn pollFor(fds_va: u64, nfds: u64, timeout_ns: ?u64) u64 {
     defer if (on_heap) |p| heap.kfree(p);
     const fds: []PollFd = if (on_heap) |p| @as([*]PollFd, @ptrCast(@alignCast(p)))[0..n] else on_stack[0..n];
     if (!usercopy.copyFromUser(std.mem.sliceAsBytes(fds), fds_va)) return err(EFAULT);
-    const ready = pollWait(me, fds, timeout_ns);
+    // Cut short by a signal: EINTR if its handler runs, else the poll runs
+    // again.
+    const ready = pollWait(me, fds, timeout_ns) orelse return err(linux_signal.ERESTARTNOHAND);
     // Only revents goes back: a sibling's edit of fd or events during the
     // wait is the caller's to keep.
     for (fds, 0..) |*p, i| {
@@ -423,8 +566,9 @@ fn pollFor(fds_va: u64, nfds: u64, timeout_ns: ?u64) u64 {
 }
 
 /// Fill revents in `fds`, waiting until an entry is ready or the timeout
-/// passes; returns how many are ready. Touches no user memory.
-fn pollWait(me: usize, fds: []PollFd, timeout_ns: ?u64) u64 {
+/// passes; returns how many are ready, or null when a signal for the caller
+/// ended the wait. Touches no user memory.
+fn pollWait(me: usize, fds: []PollFd, timeout_ns: ?u64) ?u64 {
     const pcb = &process.procs[me];
     const group: u8 = pcb.tgid;
     const deadline: u64 = if (timeout_ns) |ns| deadlineAfter(ns) else 0;
@@ -444,17 +588,32 @@ fn pollWait(me: usize, fds: []PollFd, timeout_ns: ?u64) u64 {
             }
             const want: u16 = @bitCast(p.events);
             const lead = &process.procs[group];
-            const mask: u16 = if (fd >= lead.fd_table.len or !lead.fd_table[@intCast(fd)].in_use)
+            var mask: u16 = if (fd >= lead.fd_table.len)
                 POLLNVAL
+            else if (fdpoll.resolveFd(group, @intCast(fd))) |h|
+                fdpoll.pollMaskHandle(group, h) & (want | fdpoll.POLLERR | fdpoll.POLLHUP)
             else
-                fdpoll.pollMask(group, @intCast(fd)) & (want | fdpoll.POLLERR | fdpoll.POLLHUP);
+                POLLNVAL;
+            // A terminal may hold keys its pipe no longer does: the rest of
+            // an arrow key's sequence, a line typed ahead.
+            if (want & fdpoll.POLLIN != 0 and mask != POLLNVAL and terminalHasInput(lead, fd)) mask |= fdpoll.POLLIN;
             p.revents = @bitCast(mask);
             if (mask != 0) ready += 1;
         }
         if (ready > 0) return ready;
         if (timeout_ns) |ns| if (ns == 0 or process.tick_count >= deadline) return 0;
+        if (signals.deliverable(pcb) != 0) return null;
         sched.blockOnDeadline(.poll, 0, deadline);
     }
+}
+
+/// True if `fd` of `lead` is the reading end of a terminal with input a
+/// read would get at once.
+fn terminalHasInput(lead: *process.PCB, fd: i32) bool {
+    const tty = @import("../../proc/tty.zig");
+    const f = file.get(lead, @intCast(fd)) orelse return false;
+    defer file.put(f);
+    return f.tty != tty.NONE and f.access == file.READ and tty.readable(f.tty);
 }
 
 /// The tick a wait of `ns` ends at: rounded up, one tick more.
@@ -474,7 +633,8 @@ const Iovec = extern struct { base: u64, len: u64 };
 pub fn processVmReadv(pid: u64, local_va: u64, liovcnt: u64, remote_va: u64, riovcnt: u64, flags: u64) u64 {
     if (flags != 0 or liovcnt > 1024 or riovcnt > 1024) return err(EINVAL);
     const me = smp.currentPid() orelse return err(EFAULT);
-    if (pid != process.procs[me].tgid and pid != me) return err(EPERM);
+    const slot = pid_nr.slotOf(pid) orelse return err(ESRCH);
+    if (process.procs[slot].tgid != process.procs[me].tgid) return err(EPERM);
     if (!common.validateUserPtr(local_va, liovcnt * @sizeOf(Iovec))) return err(EFAULT);
     if (!common.validateUserPtr(remote_va, riovcnt * @sizeOf(Iovec))) return err(EFAULT);
     // Each iovec read once into a local: the caller's other threads may
@@ -551,8 +711,58 @@ pub fn sysinfo(va: u64) u64 {
     return 0;
 }
 
-/// utimensat(dirfd, path, times, flags): accepted; ext2 times aren't kept
-/// to the nanosecond, and nothing here reads them back to decide.
-pub fn utimensat() u64 {
+/// times(buf): the caller's CPU time in clock ticks (100 a second), all of
+/// it booked as user time; its children's is not kept. Returns the ticks
+/// since boot.
+pub fn times(buf_va: u64) u64 {
+    const me = linux_fs.proc() orelse return err(EFAULT);
+    if (buf_va != 0) {
+        const tms = [4]i64{ @intCast(me.ticks_used), 0, 0, 0 };
+        if (!usercopy.copyToUser(buf_va, std.mem.asBytes(&tms))) return err(EFAULT);
+    }
+    return process.tick_count;
+}
+
+/// getrusage(who, usage): zeros but for the user time.
+pub fn getrusage(usage_va: u64) u64 {
+    const me = linux_fs.proc() orelse return err(EFAULT);
+    var ru = [_]i64{0} ** (RUSAGE_BYTES / 8);
+    ru[0] = @intCast(me.ticks_used / 100);
+    ru[1] = @intCast((me.ticks_used % 100) * 10_000);
+    if (!usercopy.copyToUser(usage_va, std.mem.asBytes(&ru))) return err(EFAULT);
+    return 0;
+}
+
+const PR_SET_NAME: u64 = 15;
+const PR_GET_NAME: u64 = 16;
+
+/// prctl(option, arg2, ...): the thread's name; nothing else is kept.
+pub fn prctl(option: u64, arg2: u64) u64 {
+    const me = process.currentPCB() orelse return err(EFAULT);
+    switch (option) {
+        PR_SET_NAME => {
+            var name: [16]u8 = [_]u8{0} ** 16;
+            const len = usercopy.strnlenUser(arg2, 15) orelse return err(EFAULT);
+            if (!usercopy.copyFromUser(name[0..len], arg2)) return err(EFAULT);
+            me.name = name;
+            me.name_len = @intCast(len);
+            return 0;
+        },
+        PR_GET_NAME => {
+            var name: [16]u8 = [_]u8{0} ** 16;
+            @memcpy(name[0..me.name_len], me.name[0..me.name_len]);
+            if (!usercopy.copyToUser(arg2, &name)) return err(EFAULT);
+            return 0;
+        },
+        else => return err(EINVAL),
+    }
+}
+
+/// getresuid and getresgid: three zeros (everything runs as root).
+pub fn getresid(a_va: u64, b_va: u64, c_va: u64) u64 {
+    const zero: u32 = 0;
+    for ([_]u64{ a_va, b_va, c_va }) |va| {
+        if (!usercopy.copyToUser(va, std.mem.asBytes(&zero))) return err(EFAULT);
+    }
     return 0;
 }

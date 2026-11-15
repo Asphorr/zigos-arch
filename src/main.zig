@@ -503,6 +503,10 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
         if (@import("proc/lifecycle.zig").createKernelTask(@intFromPtr(&pgflushdEntry), "pgflushd", 0, .normal, 32 * 1024) == null)
             blog.warn("pgflushd", "spawn failed — MAP_SHARED dirty pages won't auto-persist", .{});
     }
+    // filed — releases the files a dying task's teardown could not (a release
+    // that sleeps: a connection's close, a FAT flush).
+    if (@import("proc/lifecycle.zig").createKernelTask(@intFromPtr(&filedEntry), "filed", 0, .normal, 32 * 1024) == null)
+        blog.warn("filed", "spawn failed — files of killed tasks stay unreleased", .{});
     // Route AML Notify()s to a dispatcher: the PCI-hotplug \_GPE._E01 Notifies
     // the affected slot, and acpid rescans the bus so a hot-added device is
     // detected + registered. Registered before acpid spawns (the only thing that
@@ -937,6 +941,18 @@ fn pgflushdEntry() callconv(.c) noreturn {
         sched.kernelSleepMs(PGFLUSH_INTERVAL_MS);
         _ = vfs.flushAllDirty();
         @import("fs/ext2/ext2.zig").sync();
+    }
+}
+
+/// filed kernel-thread entry: releases the files task teardowns queued
+/// (file.dropAll), from a context that may sleep.
+const FILED_INTERVAL_MS: u32 = 1000;
+fn filedEntry() callconv(.c) noreturn {
+    const file = @import("fs/file.zig");
+    const sched = @import("proc/sched.zig");
+    while (true) {
+        sched.kernelSleepMs(FILED_INTERVAL_MS);
+        if (file.reapPending()) file.reap();
     }
 }
 

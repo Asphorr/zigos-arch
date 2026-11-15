@@ -11,6 +11,7 @@
 #include <poll.h>
 #include <pthread.h>
 #include <sched.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -400,6 +401,82 @@ static void check_fork_beside_writers(void) {
     CHECK(atomic_load(&writer_bad) == 0, "the kernel's writes to their memory all land");
 }
 
+// --- Pages that leave under a syscall -----------------------------------------
+
+#define LEAVING_PAGES 4
+#define LEAVING_LEN (LEAVING_PAGES * 4096)
+#define DROPS 3000
+
+static char *leaving;
+static atomic_int dropping_done;
+static atomic_int leaving_bad;
+
+// Syscalls that write `buf` and read it, as the kernel does both directly.
+static void use_buffer(char *buf, int motd, int scratch, int strict) {
+    long r = clock_gettime(CLOCK_MONOTONIC, (struct timespec *)(buf + 4096 + 512));
+    if (r != 0 && (strict || errno != EFAULT)) atomic_fetch_add(&leaving_bad, 1);
+    r = pread(motd, buf, 4000, 0);
+    if (r <= 0 && (strict || errno != EFAULT)) atomic_fetch_add(&leaving_bad, 1);
+    // The raw call: libc's getcwd reads the buffer back itself.
+    r = syscall(SYS_getcwd, buf + 2 * 4096, 2048);
+    if (r <= 0 && (strict || errno != EFAULT)) atomic_fetch_add(&leaving_bad, 1);
+    r = pwrite(scratch, buf, LEAVING_LEN, 0);
+    if (r != LEAVING_LEN && (strict || errno != EFAULT)) atomic_fetch_add(&leaving_bad, 1);
+}
+
+static void *dropper(void *arg) {
+    (void)arg;
+    for (int i = 0; i < DROPS; i++) {
+        if (madvise(leaving, LEAVING_LEN, MADV_DONTNEED) != 0) atomic_fetch_add(&leaving_bad, 1);
+    }
+    atomic_store(&dropping_done, 1);
+    return NULL;
+}
+
+static void *unmapper(void *arg) {
+    (void)arg;
+    for (int i = 0; i < DROPS; i++) {
+        munmap(leaving, LEAVING_LEN);
+        if (mmap(leaving, LEAVING_LEN, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) != leaving) _exit(4);
+    }
+    atomic_store(&dropping_done, 1);
+    return NULL;
+}
+
+static void check_pages_leaving(void) {
+    leaving = mmap(NULL, LEAVING_LEN, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    int motd = open("/etc/motd", O_RDONLY);
+    int scratch = open("/ltthread.leaving", O_RDWR | O_CREAT | O_TRUNC, 0644);
+    CHECK(leaving != MAP_FAILED && motd >= 0 && scratch >= 0, "a buffer and two files for the leaving pages");
+
+    // Dropped pages come back as zero pages: every call still succeeds.
+    pthread_t t;
+    CHECK(pthread_create(&t, NULL, dropper, NULL) == 0, "pthread_create dropper");
+    while (!atomic_load(&dropping_done)) use_buffer(leaving, motd, scratch, 1);
+    CHECK(pthread_join(t, NULL) == 0, "pthread_join dropper");
+    CHECK(atomic_load(&leaving_bad) == 0, "syscalls on a buffer whose pages are dropped under them");
+
+    // A buffer unmapped under the call: EFAULT, or the process dies of it.
+    // Nothing else may.
+    pid_t c = fork();
+    if (c == 0) {
+        atomic_store(&dropping_done, 0);
+        atomic_store(&leaving_bad, 0);
+        if (pthread_create(&t, NULL, unmapper, NULL) != 0) _exit(5);
+        while (!atomic_load(&dropping_done)) use_buffer(leaving, motd, scratch, 0);
+        pthread_join(t, NULL);
+        _exit(atomic_load(&leaving_bad) == 0 ? 0 : 6);
+    }
+    int st = 0;
+    CHECK(c > 0 && waitpid(c, &st, 0) == c, "the unmapping child is reaped");
+    CHECK((WIFEXITED(st) && WEXITSTATUS(st) == 0) || (WIFSIGNALED(st) && WTERMSIG(st) == SIGSEGV),
+          "a buffer unmapped under a syscall costs at most its own process");
+    close(motd);
+    close(scratch);
+    CHECK(unlink("/ltthread.leaving") == 0, "unlink the scratch file");
+    munmap(leaving, LEAVING_LEN);
+}
+
 // --- exit_group with live peers ---------------------------------------------
 
 static void *sleeper(void *arg) {
@@ -430,6 +507,7 @@ int main(void) {
     check_lifetimes();
     check_crowd();
     check_fork_beside_writers();
+    check_pages_leaving();
 
     // Returning from main is exit_group: these must go with the process.
     pthread_t t;

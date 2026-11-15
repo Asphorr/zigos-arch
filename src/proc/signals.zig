@@ -32,8 +32,13 @@ const smp = @import("../cpu/smp.zig");
 const memmap = @import("../mm/memmap.zig");
 const config = @import("../config.zig");
 const protect = @import("../cpu/arch/protect.zig");
+const SpinLock = @import("spinlock.zig").SpinLock;
+const linux_signal = @import("../cpu/syscall/linux_signal.zig");
 
 pub const NSIG: u32 = config.NSIG;
+
+/// What the native calls take: signals 1..31, the ones a u32 set holds.
+pub const NATIVE_NSIG: u32 = 32;
 
 // Standard POSIX signal numbers (Linux/x86_64 ABI). Keep these literal — the
 // libc-side mirror in lib/signal.zig must match exactly.
@@ -56,10 +61,42 @@ pub const SIGCHLD: u32 = 17;
 pub const SIGCONT: u32 = 18;
 pub const SIGSTOP: u32 = 19;
 pub const SIGTSTP: u32 = 20;
+pub const SIGTTIN: u32 = 21;
+pub const SIGTTOU: u32 = 22;
+pub const SIGURG: u32 = 23;
+pub const SIGXCPU: u32 = 24;
+pub const SIGXFSZ: u32 = 25;
+pub const SIGVTALRM: u32 = 26;
+pub const SIGPROF: u32 = 27;
+pub const SIGWINCH: u32 = 28;
+pub const SIGIO: u32 = 29;
+pub const SIGPWR: u32 = 30;
+pub const SIGSYS: u32 = 31;
+
+/// The bit of signal `signo` (1..64) in a pending set or a mask.
+pub inline fn bit(signo: u32) u64 {
+    return @as(u64, 1) << @intCast(signo - 1);
+}
+
+/// A native call's u32 set (bit N for signal N) as a kernel set, and back.
+pub inline fn fromNativeSet(set: u32) u64 {
+    return set >> 1;
+}
+
+pub inline fn toNativeSet(set: u64) u32 {
+    return @truncate(set << 1);
+}
+
+/// SIGKILL and SIGSTOP: never blocked, caught or ignored.
+pub const UNBLOCKABLE: u64 = bit(SIGKILL) | bit(SIGSTOP);
 
 pub const SIG_DFL: u64 = 0;
 pub const SIG_IGN: u64 = 1;
 
+pub const SA_NOCLDSTOP: u32 = 0x00000001;
+pub const SA_NOCLDWAIT: u32 = 0x00000002;
+pub const SA_RESTORER: u32 = 0x04000000;
+pub const SA_ONSTACK: u32 = 0x08000000;
 pub const SA_RESTART: u32 = 0x10000000;
 pub const SA_NODEFER: u32 = 0x40000000;
 pub const SA_RESETHAND: u32 = 0x80000000;
@@ -104,19 +141,91 @@ pub const default_actions: [NSIG]Action = blk: {
     a[SIGCONT] = .cont;
     a[SIGSTOP] = .stop;
     a[SIGTSTP] = .stop;
+    a[SIGTTIN] = .stop;
+    a[SIGTTOU] = .stop;
+    a[SIGURG] = .ignore;
+    a[SIGXCPU] = .core;
+    a[SIGXFSZ] = .core;
+    a[SIGWINCH] = .ignore;
+    a[SIGSYS] = .core;
     break :blk a;
 };
 
-/// User-installed disposition for a signal. `handler` is SIG_DFL (0),
-/// SIG_IGN (1), or a u64 user-space function pointer. `restorer` is the
-/// libc trampoline that issues sigreturn on handler return — kernel pushes
-/// it as the handler's return address.
+/// A signal's disposition as the native sigaction call passes it: the
+/// native ABI. `handler` is SIG_DFL (0), SIG_IGN (1), or a user function;
+/// `restorer` is the libc trampoline that issues sigreturn on handler
+/// return — the kernel pushes it as the handler's return address. `mask`
+/// has bit N for signal N.
 pub const SigAction = extern struct {
     handler: u64 = SIG_DFL,
     flags: u32 = 0,
     mask: u32 = 0,
     restorer: u64 = 0,
 };
+
+/// A signal's disposition as the kernel keeps it, for either personality.
+pub const Disposition = struct {
+    handler: u64 = SIG_DFL,
+    flags: u32 = 0,
+    restorer: u64 = 0,
+    /// Blocked while the handler runs, on top of the signal itself.
+    mask: u64 = 0,
+
+    pub fn fromNative(sa: SigAction) Disposition {
+        return .{ .handler = sa.handler, .flags = sa.flags, .restorer = sa.restorer, .mask = fromNativeSet(sa.mask) };
+    }
+
+    pub fn toNative(self: Disposition) SigAction {
+        return .{ .handler = self.handler, .flags = self.flags, .mask = toNativeSet(self.mask), .restorer = self.restorer };
+    }
+};
+
+/// What comes with a pending signal.
+pub const Info = extern struct {
+    /// SI_USER, SI_TKILL, SI_KERNEL..., or the signal's own code (CLD_*).
+    code: i32 = SI_KERNEL_CODE,
+    /// The sender's number (kill, tkill) or the child's (SIGCHLD).
+    pid: u32 = 0,
+    /// The child's exit code or ending signal (SIGCHLD); a queued value.
+    value: u64 = 0,
+};
+
+pub const SI_USER_CODE: i32 = 0;
+pub const SI_KERNEL_CODE: i32 = 0x80;
+pub const SI_TKILL_CODE: i32 = -6;
+pub const CLD_EXITED: i32 = 1;
+pub const CLD_KILLED: i32 = 2;
+pub const CLD_DUMPED: i32 = 3;
+pub const CLD_STOPPED: i32 = 5;
+pub const CLD_CONTINUED: i32 = 6;
+
+/// The stack a Linux process set with sigaltstack; size 0 is none.
+pub const AltStack = struct {
+    sp: u64 = 0,
+    size: u64 = 0,
+    /// SS_AUTODISARM: off while a handler runs on it.
+    autodisarm: bool = false,
+
+    pub fn holds(self: AltStack, addr: u64) bool {
+        return self.size != 0 and addr > self.sp and addr <= self.sp + self.size;
+    }
+};
+
+/// The exit status of a Linux process a signal ended: the signal, flagged
+/// (linux_proc.waitStatus turns it into a wait status). No core is dumped,
+/// so none is reported.
+pub const KILLED_BY: u32 = 0x4000_0000;
+
+/// The exit status of process `pcb` ended by `signo`'s default action.
+pub fn fatalStatus(pcb: *const process.PCB, signo: u32) u32 {
+    return if (pcb.personality == .linux) KILLED_BY | signo else 0xDEAD0000 | signo;
+}
+
+/// The dispositions `pcb` goes by: a Linux process's threads share the
+/// lead's; a native task has its own (a thread starts with a copy).
+pub fn dispositions(pcb: *process.PCB) *[NSIG]Disposition {
+    return if (pcb.personality == .linux) &process.leader(pcb).sigactions else &pcb.sigactions;
+}
 
 /// Magic word at the head of every kernel-pushed MContext. The sigreturn
 /// syscall refuses to act on anything else — bogus `mov $62, %eax; syscall`
@@ -183,8 +292,8 @@ pub const MContext = extern struct {
 
 /// Mirror of the syscall-asm trampoline's saved frame at `call doSyscall`.
 /// Field order must match the push sequence in syscall_entry.zig — first
-/// field = lowest address = last push. Alignment: 15 pushes + 520 FXSAVE
-/// = 640, +call = 648 mod 16 = 8.
+/// field = lowest address = last push. Alignment: 15 pushes + the 536 bytes
+/// under the frame = 656, +call = 664 mod 16 = 8.
 pub const SyscallFrame = extern struct {
     r10: u64,
     r9: u64,
@@ -216,12 +325,52 @@ pub const SyscallFrame = extern struct {
     // stack itself, which IS per-thread (kstack_pool[pid]).
     user_rsp: u64,
 
-    /// The caller's FP/SSE state, fxsave'd by the entry stub 520 bytes below
-    /// the frame (512 bytes + 8 of padding).
+    // Under the frame the entry stub keeps three words and, below them, the
+    // caller's FXSAVE image (536 bytes in all):
+    //   -8   r11 for a full restore
+    //   -16  rcx for a full restore
+    //   -24  exit mode: 0 leaves by sysret, which loads rip and rflags from
+    //        the rcx and r11 slots and so can't give those two registers
+    //        back; 1 leaves by iretq with every register restored.
+    const FULL_R11: usize = 8;
+    const FULL_RCX: usize = 16;
+    const EXIT_MODE: usize = 24;
+    const FPU_BELOW: usize = 536;
+
+    /// The caller's FP/SSE state, fxsave'd by the entry stub and loaded
+    /// back on the way out.
     pub fn userFpu(self: *const SyscallFrame) *align(16) const [512]u8 {
-        return @ptrFromInt(@intFromPtr(self) - 520);
+        return @ptrFromInt(@intFromPtr(self) - FPU_BELOW);
+    }
+
+    fn word(self: *const SyscallFrame, below: usize) *u64 {
+        return @ptrFromInt(@intFromPtr(self) - below);
+    }
+
+    /// Leave the syscall with every register as the frame has it, and
+    /// `rcx` and `r11` in those two: rcx and r11 of the frame hold rip and
+    /// rflags.
+    pub fn setFullRestore(self: *SyscallFrame, rcx: u64, r11: u64) void {
+        self.word(FULL_RCX).* = rcx;
+        self.word(FULL_R11).* = r11;
+        self.word(EXIT_MODE).* = 1;
+    }
+
+    pub fn clearFullRestore(self: *SyscallFrame) void {
+        self.word(EXIT_MODE).* = 0;
+    }
+
+    /// The rcx and r11 a full restore is set to load, if one is set.
+    pub fn fullRestore(self: *const SyscallFrame) ?struct { rcx: u64, r11: u64 } {
+        if (self.word(EXIT_MODE).* == 0) return null;
+        return .{ .rcx = self.word(FULL_RCX).*, .r11 = self.word(FULL_R11).* };
     }
 };
+
+/// How far under an IrqFrame and an ExcFrame their stubs keep the FXSAVE
+/// image of the interrupted code (isr_irq0: 512 + padding + its canary).
+pub const IRQ0_FP_BELOW: usize = 528;
+pub const EXC_FP_BELOW: usize = 512;
 
 /// Mirror of isr_irq0's saved frame at `call handleIRQ0`. The leading 15 GPRs
 /// match the push order in idt.zig; the trailing 5 are the iretq frame the
@@ -305,6 +454,29 @@ fn pidIndexOfPcb(pcb: *const process.PCB) usize {
     return off / @sizeOf(process.PCB);
 }
 
+/// Serializes a pending bit with the info that goes with it: a sender writes
+/// the info and sets the bit under it, a taker clears the bit and reads the
+/// info under it. Senders run in interrupt context too.
+var info_lock: SpinLock = .{};
+
+/// Record `info` for `signo` and set its bit in `set`.
+fn post(set: *u64, infos: *[NSIG]Info, signo: u32, info: Info) void {
+    const f = info_lock.acquireIrqSave();
+    defer info_lock.releaseIrqRestore(f);
+    infos[signo] = info;
+    _ = @atomicRmw(u64, set, .Or, bit(signo), .seq_cst);
+}
+
+/// True if `pcb`'s process does nothing with `signo` and so needs neither
+/// the bit nor a wake. A Linux task that blocks the signal keeps it: its
+/// disposition may change before it is unblocked, and sigwait takes it.
+fn dropsAtSend(pcb: *process.PCB, signo: u32) bool {
+    if (!isCatchable(signo)) return false;
+    if (pcb.personality == .linux and pcb.signal_mask & bit(signo) != 0) return false;
+    const d = &dispositions(pcb)[signo];
+    return d.handler == SIG_IGN or (d.handler == SIG_DFL and default_actions[signo] == .ignore);
+}
+
 /// Mark `signo` pending on `target` and wake the target if it's parked. Idempotent
 /// — sending the same signal twice between deliveries collapses to one bit.
 /// Returns false on bad inputs (out-of-range pid, signo >= NSIG, dead target).
@@ -315,6 +487,11 @@ fn pidIndexOfPcb(pcb: *const process.PCB) usize {
 /// target is a live, signalable PCB and false otherwise. No bit is set, no
 /// wake is sent.
 pub fn send(target: u8, signo: u32) bool {
+    return sendInfo(target, signo, .{});
+}
+
+/// send, with what the signal carries.
+pub fn sendInfo(target: u8, signo: u32, info: Info) bool {
     if (target >= process.MAX_PROCS) return false;
     if (signo >= NSIG) return false;
     const pcb = &process.procs[target];
@@ -326,13 +503,97 @@ pub fn send(target: u8, signo: u32) bool {
     // Catchable signals that are explicitly ignored short-circuit — no need
     // to wake the target or set a pending bit. SIGKILL/SIGSTOP can't be
     // ignored, so they always set the bit.
-    if (isCatchable(signo)) {
-        const sa = &pcb.sigactions[signo];
-        if (sa.handler == SIG_IGN) return true;
-        if (sa.handler == SIG_DFL and default_actions[signo] == .ignore) return true;
-    }
+    if (dropsAtSend(pcb, signo)) return true;
 
-    // Set the pending bit FIRST. Besides the wake handshake (see wake() below),
+    post(&pcb.pending_signals, &pcb.sig_info, signo, info);
+    afterPost(pcb, target, signo);
+    return true;
+}
+
+/// A signal for a process as a whole: kill, SIGCHLD, the terminal's. `slot`
+/// is any task of it. A Linux process keeps it on the lead for whichever
+/// thread doesn't block it; a native one's task `slot` gets it, as with
+/// send.
+pub fn sendProcess(slot: u8, signo: u32, info: Info) bool {
+    if (slot >= process.MAX_PROCS) return false;
+    const task = &process.procs[slot];
+    if (task.state == .unused or task.state == .loading) return false;
+    if (task.personality != .linux) return sendInfo(slot, signo, info);
+    if (signo >= NSIG) return false;
+    const lead = process.leader(task);
+    if (lead.state == .unused) return false;
+    if (signo == 0) return true;
+    if (dropsAtSend(lead, signo)) return true;
+
+    post(&lead.shared_pending, &lead.shared_info, signo, info);
+    // The thread to take it: the lead if it doesn't block the signal, else
+    // any thread that doesn't. With none, it waits for an unblock.
+    var taker: u8 = lead.tgid;
+    if (lead.signal_mask & bit(signo) != 0 or lead.state == .zombie) {
+        for (&process.procs, 0..) |*p, i| {
+            if (p.state == .unused or p.state == .zombie or p.state == .loading) continue;
+            if (p.tgid != lead.tgid or p.signal_mask & bit(signo) != 0) continue;
+            taker = @intCast(i);
+            break;
+        }
+    }
+    afterPost(&process.procs[taker], taker, signo);
+    return true;
+}
+
+/// True if `signo` is to end Linux process `lead` and can be taken now: no
+/// handler, a default that ends the process, and `only` (or, without one,
+/// some thread of it) not blocking it. SIGKILL always.
+fn endsNow(lead: *process.PCB, signo: u32, only: ?*const process.PCB) bool {
+    if (signo == SIGKILL) return true;
+    if (lead.sigactions[signo].handler != SIG_DFL) return false;
+    const action = default_actions[signo];
+    if (action != .term and action != .core) return false;
+    if (only) |t| return t.signal_mask & bit(signo) == 0;
+    for (&process.procs) |*t| {
+        if (t.state == .unused or t.state == .loading or t.state == .zombie or t.tgid != lead.tgid) continue;
+        if (t.signal_mask & bit(signo) == 0) return true;
+    }
+    return false;
+}
+
+/// kill(): sendProcess from a task that may end another. A Linux process
+/// the signal is to end is ended here, not at its next return to user
+/// code: it may be asleep in a wait that no signal breaks. Task context
+/// only — when the process is the caller's own, there is no return.
+pub fn killProcess(slot: u8, signo: u32, info: Info) bool {
+    if (slot >= process.MAX_PROCS or signo >= NSIG) return false;
+    const task = &process.procs[slot];
+    if (task.state == .unused or task.state == .loading or task.state == .zombie) return false;
+    if (signo != 0 and task.personality == .linux) {
+        const lead = process.leader(task);
+        if (endsNow(lead, signo, null)) {
+            process.killThreadGroup(lead.tgid, fatalStatus(lead, signo));
+            return true;
+        }
+    }
+    return sendProcess(slot, signo, info);
+}
+
+/// tkill(): killProcess for a signal meant for the one task `slot`.
+pub fn killTask(slot: u8, signo: u32, info: Info) bool {
+    if (slot >= process.MAX_PROCS or signo >= NSIG) return false;
+    const task = &process.procs[slot];
+    if (task.state == .unused or task.state == .loading or task.state == .zombie) return false;
+    if (signo != 0 and task.personality == .linux) {
+        const lead = process.leader(task);
+        if (endsNow(lead, signo, task)) {
+            process.killThreadGroup(lead.tgid, fatalStatus(lead, signo));
+            return true;
+        }
+    }
+    return sendInfo(slot, signo, info);
+}
+
+/// A bit for `signo` was just set where task `target` will find it: what a
+/// stopped or sleeping target needs to see it.
+fn afterPost(pcb: *process.PCB, target: u8, signo: u32) void {
+    // The pending bit is set FIRST. Besides the wake handshake (see wake() below),
     // this ordering is load-bearing for job control: it is the SEND-side write
     // of a seq_cst store-load (Dekker) handshake with stopForJobControl. A
     // target mid-delivering a SIGSTOP on another CPU stores job_stopped=true and
@@ -342,8 +603,7 @@ pub fn send(target: u8, signo: u32) bool {
     // stopping (which would otherwise strand it unkillable, or with a lost
     // continue — a silent, undiagnosable hang, since pickNext skips it forever
     // and the stuck-waiter detector is .sleeping-only).
-    _ = @atomicRmw(u32, &pcb.pending_signals, .Or, @as(u32, 1) << @intCast(signo), .seq_cst);
-
+    //
     // Job-control transitions that must take effect at SEND time, because a
     // stopped target is parked off-CPU (pickNext-skipped) and can't reach a
     // signal-delivery point on its own to act on the bit we just set:
@@ -355,11 +615,21 @@ pub fn send(target: u8, signo: u32) bool {
     // resumeFromStop's seq_cst load of job_stopped is the READ half of the
     // handshake above. No-op when the target wasn't stopped; only a real resume
     // kicks its CPU (which may be idle/tickless and otherwise slow to re-pick).
-    if (default_actions[signo] == .cont) {
-        _ = @atomicRmw(u32, &pcb.pending_signals, .And, ~STOP_SIGMASK, .seq_cst);
-        if (resumeFromStop(pcb)) process.kickReschedule(target);
-    } else if (signo == SIGKILL) {
-        if (resumeFromStop(pcb)) process.kickReschedule(target);
+    // A Linux process stops and continues as a whole: every thread of it.
+    const continues = default_actions[signo] == .cont;
+    if (continues or signo == SIGKILL) {
+        if (pcb.personality == .linux) {
+            const lead = process.leader(pcb);
+            if (continues) _ = @atomicRmw(u64, &lead.shared_pending, .And, ~STOP_SIGMASK, .seq_cst);
+            for (&process.procs, 0..) |*t, i| {
+                if (t.state == .unused or t.state == .loading or t.tgid != lead.tgid) continue;
+                if (continues) _ = @atomicRmw(u64, &t.pending_signals, .And, ~STOP_SIGMASK, .seq_cst);
+                if (resumeFromStop(t)) process.kickReschedule(@intCast(i));
+            }
+        } else {
+            if (continues) _ = @atomicRmw(u64, &pcb.pending_signals, .And, ~STOP_SIGMASK, .seq_cst);
+            if (resumeFromStop(pcb)) process.kickReschedule(target);
+        }
     }
 
     // Make sure parked — or PARKING — processes notice. The old conditional
@@ -376,36 +646,65 @@ pub fn send(target: u8, signo: u32) bool {
     // latched wake_pending costs one spurious early-return at the target's
     // next blockOn — which re-checks its condition by contract.
     process.wake(target);
-    return true;
 }
 
-fn pickSignal(pcb: *const process.PCB) ?u32 {
-    // Atomic load — sender on another CPU could be mid-OR; we want a
-    // coherent snapshot. signal_mask is per-thread (only mutated by this
-    // CPU's syscall paths) so a plain read is fine.
-    const pending = @atomicLoad(u32, &pcb.pending_signals, .acquire);
-    const deliverable = pending & ~pcb.signal_mask;
-    if (deliverable == 0) return null;
-    var s: u32 = 1;
-    while (s < NSIG) : (s += 1) {
-        if ((deliverable & (@as(u32, 1) << @intCast(s))) != 0) return s;
+/// The signals pending for `pcb` — its own and, for a Linux task, its
+/// process's — that it doesn't block.
+pub fn deliverable(pcb: *const process.PCB) u64 {
+    // Atomic loads — a sender on another CPU could be mid-OR. signal_mask is
+    // per-thread (only mutated by this thread's syscall paths) so a plain
+    // read is fine.
+    var pending = @atomicLoad(u64, &pcb.pending_signals, .acquire);
+    if (pcb.personality == .linux) pending |= @atomicLoad(u64, &process.procs[pcb.tgid].shared_pending, .acquire);
+    return pending & ~pcb.signal_mask;
+}
+
+/// A signal taken for delivery.
+pub const Taken = struct { signo: u32, info: Info };
+
+/// Take the lowest-numbered signal `pcb` can be delivered, its own before
+/// its process's: the bit is cleared and the info read as one step, so of
+/// two threads only one takes a process's signal.
+pub fn take(pcb: *process.PCB) ?Taken {
+    return takeFrom(pcb, ~pcb.signal_mask);
+}
+
+/// Take the lowest-numbered pending signal of `set`, whether `pcb` blocks
+/// it or not: what sigwait does. Its own before its process's.
+pub fn takeFrom(pcb: *process.PCB, set: u64) ?Taken {
+    const f = info_lock.acquireIrqSave();
+    defer info_lock.releaseIrqRestore(f);
+    const own = @atomicLoad(u64, &pcb.pending_signals, .acquire) & set;
+    if (own != 0) {
+        const signo: u32 = @ctz(own) + 1;
+        _ = @atomicRmw(u64, &pcb.pending_signals, .And, ~bit(signo), .seq_cst);
+        return .{ .signo = signo, .info = pcb.sig_info[signo] };
     }
-    return null;
+    if (pcb.personality != .linux) return null;
+    const lead = process.leader(pcb);
+    const shared = @atomicLoad(u64, &lead.shared_pending, .acquire) & set;
+    if (shared == 0) return null;
+    const signo: u32 = @ctz(shared) + 1;
+    _ = @atomicRmw(u64, &lead.shared_pending, .And, ~bit(signo), .seq_cst);
+    return .{ .signo = signo, .info = lead.shared_info[signo] };
 }
 
-/// Atomically clear `signo`'s pending bit. Used by the deliver paths
-/// (syscall/IRQ/exception return) after a signal has been picked for
-/// delivery. Pairs with the .Or in send() so concurrent sends/picks
-/// can't race.
-fn clearPending(pcb: *process.PCB, signo: u32) void {
-    _ = @atomicRmw(u32, &pcb.pending_signals, .And, ~(@as(u32, 1) << @intCast(signo)), .seq_cst);
-}
-
-/// Put a picked signal back: its handler frame couldn't be written yet (the
+/// Put a taken signal back: its handler frame couldn't be written yet (the
 /// address-space lock was busy and this path can't sleep for it), so the
-/// next return to user delivers it.
-fn repend(pcb: *process.PCB, signo: u32) void {
-    _ = @atomicRmw(u32, &pcb.pending_signals, .Or, @as(u32, 1) << @intCast(signo), .seq_cst);
+/// next return to user delivers it. It comes back as the task's own.
+pub fn repend(pcb: *process.PCB, t: Taken) void {
+    post(&pcb.pending_signals, &pcb.sig_info, t.signo, t.info);
+}
+
+/// Drop every pending instance of `signo` in `pcb`'s process: what setting
+/// a signal to be ignored does to the ones already sent.
+pub fn discardPending(pcb: *process.PCB, signo: u32) void {
+    const lead = process.leader(pcb);
+    _ = @atomicRmw(u64, &lead.shared_pending, .And, ~bit(signo), .seq_cst);
+    for (&process.procs) |*t| {
+        if (t.state == .unused or t.tgid != lead.tgid) continue;
+        _ = @atomicRmw(u64, &t.pending_signals, .And, ~bit(signo), .seq_cst);
+    }
 }
 
 // =============================================================================
@@ -416,16 +715,23 @@ fn repend(pcb: *process.PCB, signo: u32) void {
 /// (SIGSTOP/SIGTSTP/SIGTTIN/SIGTTOU). Used to annihilate pending stop signals
 /// when a SIGCONT arrives, and vice-versa — POSIX: a stop and a continue posted
 /// to the same target before either is consumed cancel each other.
-const STOP_SIGMASK: u32 = blk: {
-    var m: u32 = 0;
+const STOP_SIGMASK: u64 = blk: {
+    var m: u64 = 0;
     var s: u32 = 1;
     while (s < NSIG) : (s += 1) {
-        if (default_actions[s] == .stop) m |= (@as(u32, 1) << @intCast(s));
+        if (default_actions[s] == .stop) m |= bit(s);
     }
     break :blk m;
 };
-const CONT_BIT: u32 = @as(u32, 1) << @intCast(SIGCONT);
-const KILL_BIT: u32 = @as(u32, 1) << @intCast(SIGKILL);
+const CONT_BIT: u64 = bit(SIGCONT);
+const KILL_BIT: u64 = bit(SIGKILL);
+
+/// The pending signals that undo a stop, wherever `pcb` would find them.
+fn pendingResume(pcb: *const process.PCB) bool {
+    var pending = @atomicLoad(u64, &pcb.pending_signals, .seq_cst);
+    if (pcb.personality == .linux) pending |= @atomicLoad(u64, &process.procs[pcb.tgid].shared_pending, .seq_cst);
+    return pending & (KILL_BIT | CONT_BIT) != 0;
+}
 
 /// Realize a job-control stop on the CURRENT task — the `.stop` arm of
 /// applyDefault, reached when a stop signal is delivered with default
@@ -451,7 +757,7 @@ fn stopForJobControl(pcb: *process.PCB, signo: u32) void {
     // and the stuck-waiter detector is .sleeping-only, so it is a SILENT hang)
     // or stopped-with-a-lost-continue.
     @atomicStore(bool, &pcb.job_stopped, true, .seq_cst);
-    if ((@atomicLoad(u32, &pcb.pending_signals, .seq_cst) & (KILL_BIT | CONT_BIT)) != 0) {
+    if (pendingResume(pcb)) {
         // A resume raced us: undo the stop and let delivery proceed / the task
         // die. The racing SIGKILL/SIGCONT owns the outcome — annihilate nothing.
         pcb.stop_signo = 0;
@@ -461,8 +767,8 @@ fn stopForJobControl(pcb: *process.PCB, signo: u32) void {
     // No concurrent resume: safe to annihilate any stale pending SIGCONT
     // (POSIX stop⊥cont — only NOW, after the recheck, so we can't erase a racing
     // resumer's CONT bit before it's observed) and notify the parent.
-    _ = @atomicRmw(u32, &pcb.pending_signals, .And, ~CONT_BIT, .seq_cst);
-    notifyParentStateChange(pcb);
+    _ = @atomicRmw(u64, &pcb.pending_signals, .And, ~CONT_BIT, .seq_cst);
+    notifyParentStateChange(pcb, CLD_STOPPED, signo);
 }
 
 /// Clear a job-control stop. Returns true iff the task was actually stopped
@@ -476,8 +782,40 @@ fn resumeFromStop(pcb: *process.PCB) bool {
     if (!@atomicLoad(bool, &pcb.job_stopped, .seq_cst)) return false;
     @atomicStore(bool, &pcb.job_stopped, false, .release);
     pcb.stop_signo = 0;
-    notifyParentStateChange(pcb);
+    // One notice for a process: its lead's (every thread of it resumes).
+    if (pcb.personality != .linux or pcb == process.leader(pcb)) notifyParentStateChange(pcb, CLD_CONTINUED, SIGCONT);
     return true;
+}
+
+/// stopForJobControl for a Linux process: the stop is the whole process's,
+/// so every thread of it is marked. The others run on until their next
+/// deschedule and are not picked again.
+fn stopProcess(pcb: *process.PCB, signo: u32) void {
+    const lead = process.leader(pcb);
+    for (&process.procs) |*t| {
+        if (t.state == .unused or t.state == .loading or t.state == .zombie or t.tgid != lead.tgid) continue;
+        t.stop_signo = @intCast(signo);
+        @atomicStore(bool, &t.job_stopped, true, .seq_cst);
+    }
+    // The same store-then-look as stopForJobControl: a SIGKILL or SIGCONT
+    // that passed the marking undoes it.
+    var raced = false;
+    for (&process.procs) |*t| {
+        if (t.state == .unused or t.tgid != lead.tgid) continue;
+        if (pendingResume(t)) raced = true;
+    }
+    for (&process.procs) |*t| {
+        if (t.state == .unused or t.tgid != lead.tgid) continue;
+        if (raced) {
+            t.stop_signo = 0;
+            @atomicStore(bool, &t.job_stopped, false, .seq_cst);
+        } else {
+            _ = @atomicRmw(u64, &t.pending_signals, .And, ~CONT_BIT, .seq_cst);
+        }
+    }
+    if (raced) return;
+    _ = @atomicRmw(u64, &lead.shared_pending, .And, ~CONT_BIT, .seq_cst);
+    notifyParentStateChange(lead, CLD_STOPPED, signo);
 }
 
 /// POSIX: a child stopping or continuing posts SIGCHLD to its parent. Sent
@@ -488,19 +826,21 @@ fn resumeFromStop(pcb: *process.PCB) bool {
 /// follow-up (sysWaitpid has no options arg today). One level of send()
 /// recursion: SIGCHLD is neither `.cont` nor SIGKILL, so it never re-enters the
 /// job-control branch.
-fn notifyParentStateChange(pcb: *process.PCB) void {
+fn notifyParentStateChange(pcb: *process.PCB, code: i32, signo: u32) void {
     const parent = pcb.parent_pid;
     if (parent == 0 or parent >= process.MAX_PROCS) return;
     const ps = &process.procs[parent];
     if (ps.state == .unused or ps.state == .zombie) return;
-    _ = send(parent, SIGCHLD);
+    _ = sendProcess(parent, SIGCHLD, .{ .code = code, .pid = process.leader(pcb).pid_nr, .value = signo });
 }
 
-fn applyDefault(pcb: *process.PCB, signo: u32) void {
+/// What `signo` does to `pcb` with no handler and not ignored. Does not
+/// return when that ends the calling task's process.
+pub fn applyDefault(pcb: *process.PCB, signo: u32) void {
     const action = default_actions[signo];
     switch (action) {
         .ignore => {},
-        .stop => stopForJobControl(pcb, signo),
+        .stop => if (pcb.personality == .linux) stopProcess(pcb, signo) else stopForJobControl(pcb, signo),
         .cont => {
             // Default SIGCONT delivered to a RUNNING task. The prompt resume of
             // a *stopped* task happens at send() time (a stopped task is parked
@@ -519,8 +859,7 @@ fn applyDefault(pcb: *process.PCB, signo: u32) void {
             // For single-threaded processes pcb.tgid == self_pid and the
             // group-walk hits exactly one slot — identical behavior to the
             // pre-tgid path.
-            const status: u32 = 0xDEAD0000 | signo;
-            process.killThreadGroup(pcb.tgid, status);
+            process.killThreadGroup(pcb.tgid, fatalStatus(pcb, signo));
             if (smp.currentPid()) |cur| {
                 if (cur == pidIndexOfPcb(pcb)) {
                     // If pcb wasn't in its own group (shouldn't happen — clone
@@ -534,11 +873,11 @@ fn applyDefault(pcb: *process.PCB, signo: u32) void {
     }
 }
 
-fn applyHandlerMaskUpdate(pcb: *process.PCB, signo: u32, sa: *const SigAction) void {
+fn applyHandlerMaskUpdate(pcb: *process.PCB, signo: u32, sa: *const Disposition) void {
     pcb.saved_signal_mask = pcb.signal_mask;
-    pcb.signal_mask |= sa.mask;
+    pcb.signal_mask |= sa.mask & ~UNBLOCKABLE;
     if ((sa.flags & SA_NODEFER) == 0) {
-        pcb.signal_mask |= (@as(u32, 1) << @intCast(signo));
+        pcb.signal_mask |= bit(signo) & ~UNBLOCKABLE;
     }
     pcb.in_signal_handler = true;
 }
@@ -603,8 +942,8 @@ fn writeSiginfo(layout: HandlerLayout, signo: u32, code: u32, addr: u64) void {
 pub fn deliverFromSyscallFrame(pcb: *process.PCB, frame: *SyscallFrame, retval: u32) u32 {
     if (pcb.in_signal_handler) return retval;
     while (true) {
-        const sig = pickSignal(pcb) orelse return retval;
-        clearPending(pcb, sig);
+        const taken = take(pcb) orelse return retval;
+        const sig = taken.signo;
 
         if (!isCatchable(sig)) {
             applyDefault(pcb, sig);
@@ -646,7 +985,7 @@ pub fn deliverFromSyscallFrame(pcb: *process.PCB, frame: *SyscallFrame, retval: 
         switch (process.ensureSignalFrameWritable(layout.ra_va, old_user_rsp - layout.ra_va)) {
             .ok => {},
             .busy => {
-                repend(pcb, sig);
+                repend(pcb, taken);
                 return retval;
             },
             .fault => {
@@ -658,7 +997,7 @@ pub fn deliverFromSyscallFrame(pcb: *process.PCB, frame: *SyscallFrame, retval: 
         const mctx_ptr: *MContext = @ptrFromInt(layout.mctx_va);
         mctx_ptr.* = .{
             .magic = MCONTEXT_MAGIC,
-            .saved_mask = pcb.signal_mask,
+            .saved_mask = toNativeSet(pcb.signal_mask),
             .signo = sig,
             .rax = retval,
             .rbx = frame.rbx,
@@ -708,10 +1047,11 @@ pub fn deliverFromSyscallFrame(pcb: *process.PCB, frame: *SyscallFrame, retval: 
 /// portion of `frame` plus the rdi/rsi/rdx GPR slots so iretq lands in the
 /// handler.
 pub fn deliverFromIrqFrame(pcb: *process.PCB, frame: *IrqFrame) void {
+    if (pcb.personality == .linux) return linux_signal.irqReturn(pcb, frame);
     if (pcb.in_signal_handler) return;
     while (true) {
-        const sig = pickSignal(pcb) orelse return;
-        clearPending(pcb, sig);
+        const taken = take(pcb) orelse return;
+        const sig = taken.signo;
 
         if (!isCatchable(sig)) {
             applyDefault(pcb, sig);
@@ -737,7 +1077,7 @@ pub fn deliverFromIrqFrame(pcb: *process.PCB, frame: *IrqFrame) void {
         switch (process.ensureSignalFrameWritable(layout.ra_va, old_user_rsp - layout.ra_va)) {
             .ok => {},
             .busy => {
-                repend(pcb, sig);
+                repend(pcb, taken);
                 return;
             },
             .fault => {
@@ -749,7 +1089,7 @@ pub fn deliverFromIrqFrame(pcb: *process.PCB, frame: *IrqFrame) void {
         const mctx_ptr: *MContext = @ptrFromInt(layout.mctx_va);
         mctx_ptr.* = .{
             .magic = MCONTEXT_MAGIC,
-            .saved_mask = pcb.signal_mask,
+            .saved_mask = toNativeSet(pcb.signal_mask),
             .signo = sig,
             .rax = frame.rax,
             .rbx = frame.rbx,
@@ -808,6 +1148,7 @@ pub fn deliverFromIrqFrame(pcb: *process.PCB, frame: *IrqFrame) void {
 /// instruction RIP for #UD/#DE, or 0 when no meaningful address exists.
 /// `si_code` is the per-signal subcode (e.g. SEGV_MAPERR vs SEGV_ACCERR).
 pub fn deliverFromExcFrame(pcb: *process.PCB, frame: *ExcFrame, signo: u32, fault_addr: u64, si_code: u32) bool {
+    if (pcb.personality == .linux) return linux_signal.userFault(pcb, frame, signo, fault_addr, si_code);
     if (signo == 0 or signo >= NSIG) return false;
 
     const sa = &pcb.sigactions[signo];
@@ -836,7 +1177,7 @@ pub fn deliverFromExcFrame(pcb: *process.PCB, frame: *ExcFrame, signo: u32, faul
         // pending to land after the instruction instead. SIGTRAP comes from
         // traps, which resume past the instruction: that one does wait.
         .busy => {
-            if (signo == SIGTRAP) repend(pcb, signo);
+            if (signo == SIGTRAP) repend(pcb, .{ .signo = signo, .info = .{} });
             return true;
         },
         .fault => {
@@ -848,7 +1189,7 @@ pub fn deliverFromExcFrame(pcb: *process.PCB, frame: *ExcFrame, signo: u32, faul
     const mctx_ptr: *MContext = @ptrFromInt(layout.mctx_va);
     mctx_ptr.* = .{
         .magic = MCONTEXT_MAGIC,
-        .saved_mask = pcb.signal_mask,
+        .saved_mask = toNativeSet(pcb.signal_mask),
         .signo = signo,
         .rax = frame.rax,
         .rbx = frame.rbx,
@@ -935,7 +1276,7 @@ pub fn sigreturn(pcb: *process.PCB, frame: *SyscallFrame) u32 {
     const ret_rax = mctx_ptr.rax;
     protect.disallowUserAccess(); // end user-frame access
 
-    pcb.signal_mask = saved_mask;
+    pcb.signal_mask = fromNativeSet(saved_mask) & ~UNBLOCKABLE;
     pcb.in_signal_handler = false;
 
     return @truncate(ret_rax);
@@ -945,5 +1286,5 @@ pub fn sigreturn(pcb: *process.PCB, frame: *SyscallFrame) u32 {
 /// disposition isn't ignore. Used by sigsuspend / pause to decide whether
 /// to park or return immediately.
 pub fn hasDeliverable(pcb: *const process.PCB) bool {
-    return pickSignal(pcb) != null;
+    return deliverable(pcb) != 0;
 }

@@ -956,6 +956,7 @@ pub const Mutex = struct {
             // Fast path: claim the lock atomically.
             if (@cmpxchgStrong(u16, &self.owner_pid, NO_OWNER, my_pid, .acquire, .monotonic) == null) {
                 self.holder_ra = ra;
+                process.sleepLockTaken(my_pid);
                 return;
             }
             // Contended. Compare-and-sleep until released, then retry.
@@ -995,6 +996,7 @@ pub const Mutex = struct {
             if (self.witness_class != UNREGISTERED_CLASS) witness.mutexAcquire(self.witness_class, currentCpuId(), my_pid, ra);
         }
         self.holder_ra = ra;
+        process.sleepLockTaken(my_pid);
         return true;
     }
 
@@ -1022,7 +1024,8 @@ pub const Mutex = struct {
         // waiter in blockOnMutex sets .sleeping (locked CAS) and then reads
         // owner_pid, and the waiter scan reads its state — a plain store can
         // be overtaken by that load (x86 StoreLoad) and both sides miss.
-        _ = @atomicRmw(u16, &self.owner_pid, .Xchg, NO_OWNER, .seq_cst);
+        const holder = @atomicRmw(u16, &self.owner_pid, .Xchg, NO_OWNER, .seq_cst);
+        process.sleepLockDropped(holder);
         process.wakeMutexWaiters(@truncate(@intFromPtr(self)));
     }
 
@@ -1143,6 +1146,7 @@ pub const RwMutex = struct {
             if (self.writer == NO_OWNER and (pass_writers or self.writers_waiting.isEmpty())) {
                 self.readers.set(pid);
                 self.guard.releaseIrqRestore(f);
+                process.sleepLockTaken(pid);
                 return;
             }
             self.sleepers.set(pid);
@@ -1162,6 +1166,7 @@ pub const RwMutex = struct {
         if (self.readers.has(pid) or self.writer == pid) return false;
         if (self.writer != NO_OWNER or !self.writers_waiting.isEmpty()) return false;
         self.readers.set(pid);
+        process.sleepLockTaken(pid);
         return true;
     }
 
@@ -1186,6 +1191,7 @@ pub const RwMutex = struct {
                 self.writers_waiting.clear(pid);
                 self.holder_ra = ra;
                 self.guard.releaseIrqRestore(f);
+                process.sleepLockTaken(pid);
                 return;
             }
             self.writers_waiting.set(pid);
@@ -1220,6 +1226,7 @@ pub const RwMutex = struct {
         }
         const wake = self.bumpLocked();
         self.guard.releaseIrqRestore(f);
+        process.sleepLockDropped(pid);
         if (wake) process.wakeMutexWaiters(self.waitId());
     }
 

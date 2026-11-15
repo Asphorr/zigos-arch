@@ -10,6 +10,7 @@ const std = @import("std");
 const layout = @import("layout.zig");
 const block = @import("block.zig");
 const inode = @import("inode.zig");
+const held = @import("held.zig");
 const path_cache = @import("../path_cache.zig");
 const time = @import("../../time/time.zig");
 const debug = @import("../../debug/debug.zig");
@@ -160,6 +161,9 @@ pub const Handle = struct {
     inum: u32,
     file_size: u64,
     current_offset: u64 = 0,
+    /// Writes go to the end of the file, wherever current_offset points
+    /// (O_APPEND): writeFile takes the size under the mount lock.
+    append: bool = false,
 };
 
 pub fn openFile(path: []const u8) ?Handle {
@@ -169,8 +173,65 @@ pub fn openFile(path: []const u8) ?Handle {
     return .{ .inum = inum, .file_size = inode.fileSize(&ino) };
 }
 
+// --- Opens a file descriptor will refer to ----------------------------------
+//
+// The inode is held (held.zig) from the open to `release`, so an unlink in
+// between leaves it in place. The hold is taken under the mount lock, with
+// the walk: an unlink of the name either sees the hold or is over before
+// the walk starts.
+
+/// openFile, the inode held.
+pub fn openHeld(path: []const u8) ?Handle {
+    const m = block.getMount() orelse return null;
+    block.lockMount(m);
+    defer block.unlockMount(m);
+    const h = openFile(path) orelse return null;
+    if (!held.hold(h.inum)) return null;
+    return h;
+}
+
+/// createFilePath, the new inode held. Out of memory for the hold leaves
+/// the empty file and fails the open.
+pub fn createHeld(path: []const u8) ?Handle {
+    const m = block.getMount() orelse return null;
+    block.lockMount(m);
+    defer block.unlockMount(m);
+    const h = createFilePath(path) orelse return null;
+    if (!held.hold(h.inum)) return null;
+    return h;
+}
+
+/// resolveDirInum, the directory's inode held.
+pub fn openDirHeld(path: []const u8) ?u32 {
+    const m = block.getMount() orelse return null;
+    block.lockMount(m);
+    defer block.unlockMount(m);
+    const inum = resolveDirInum(path) orelse return null;
+    if (!held.hold(inum)) return null;
+    return inum;
+}
+
+/// An open file on `inum` is gone. The last one to go frees an inode that
+/// lost its names while it was open. May sleep.
+pub fn release(inum: u32) void {
+    if (!held.unhold(inum)) return;
+    const m = block.getMount() orelse return;
+    block.lockMount(m);
+    defer block.unlockMount(m);
+    block.beginMetaDefer(m);
+    defer block.endMetaDefer(m);
+    var ino = inode.readInode(inum) orelse return;
+    if (ino.links_count != 0) return;
+    const was_dir = inode.isDir(&ino);
+    inode.freeAllBlocks(m, &ino);
+    var dead: layout.Inode = std.mem.zeroes(layout.Inode);
+    dead.dtime = @truncate(time.now().sec);
+    if (!inode.writeInode(inum, &dead)) return;
+    _ = inode.freeInode(inum, was_dir);
+}
+
 /// Stateless read — caller updates handle.current_offset based on returned
-/// byte count, same as fat32. Lets vfs.zig store the offset in FileDesc.
+/// byte count, same as fat32. Lets vfs.zig keep the offset in the File.
 pub fn readFile(handle: Handle, buf: [*]u8, count: u32) usize {
     return inode.readInodeBytes(handle.inum, handle.current_offset, buf[0..count]);
 }
@@ -210,6 +271,7 @@ pub fn writeFile(handle: *Handle, src: [*]const u8, count: u32) u32 {
     defer block.endMetaDefer(m);
     var ino = inode.readInode(handle.inum) orelse return 0;
     if (!inode.isReg(&ino)) return 0;
+    if (handle.append) handle.current_offset = inode.fileSize(&ino);
 
     // Captured before the loop: writeFile advances handle.current_offset to
     // new_end at the end, so we can't read the write's start offset there.
@@ -499,7 +561,7 @@ fn dirInsert(m: *block.Mount, dir_ino: *layout.Inode, name: []const u8, child_in
                 ne.inode = child_inum;
                 ne.rec_len = slack;
                 ne.name_len = @intCast(name.len);
-                ne.file_type = file_type;
+                ne.file_type = entryType(m, file_type);
                 @memcpy(dir_buf[new_off + 8 .. new_off + 8 + name.len], name);
                 // Resolve the physical block for this logical and write the
                 // whole block back.
@@ -518,11 +580,33 @@ fn dirInsert(m: *block.Mount, dir_ino: *layout.Inode, name: []const u8, child_in
     e.inode = child_inum;
     e.rec_len = @intCast(bs);
     e.name_len = @intCast(name.len);
-    e.file_type = file_type;
+    e.file_type = entryType(m, file_type);
     @memcpy(dir_buf[8 .. 8 + name.len], name);
     if (!block.writeBlock(m, new_phys, dir_buf[0..bs])) return false;
     dir_ino.size = @intCast(total + bs);
     return true;
+}
+
+/// What a new directory entry's type byte holds: the type only on a file
+/// system with the FILETYPE feature. Without it the byte is the high half
+/// of a 16-bit name length and must stay zero.
+fn entryType(m: *const block.Mount, file_type: u8) u8 {
+    const typed = m.sb.rev_level >= layout.REV_DYNAMIC and m.sb.feature_incompat & layout.FEATURE_INCOMPAT_FILETYPE != 0;
+    return if (typed) file_type else 0;
+}
+
+/// The directory-entry type of an inode, from its mode.
+fn typeOfInode(ino: *const layout.Inode) u8 {
+    return switch (ino.mode & layout.S_IFMT) {
+        layout.S_IFREG => layout.FT_REG_FILE,
+        layout.S_IFDIR => layout.FT_DIR,
+        layout.S_IFLNK => layout.FT_SYMLINK,
+        layout.S_IFCHR => layout.FT_CHRDEV,
+        layout.S_IFBLK => layout.FT_BLKDEV,
+        layout.S_IFIFO => layout.FT_FIFO,
+        layout.S_IFSOCK => layout.FT_SOCK,
+        else => layout.FT_UNKNOWN,
+    };
 }
 
 inline fn containsSlash(name: []const u8) bool {
@@ -585,14 +669,14 @@ pub fn mkdirAt(path: []const u8) Error!void {
     dot.inode = new_inum;
     dot.rec_len = dot_rec;
     dot.name_len = 1;
-    dot.file_type = layout.FT_DIR;
+    dot.file_type = entryType(m, layout.FT_DIR);
     blkbuf[8] = '.';
     // ".." entry — points to parent. Stretches to end of block.
     const dotdot = std.mem.bytesAsValue(layout.DirEntry, blkbuf[dot_rec .. dot_rec + 8]);
     dotdot.inode = parent_inum;
     dotdot.rec_len = @intCast(bs - dot_rec);
     dotdot.name_len = 2;
-    dotdot.file_type = layout.FT_DIR;
+    dotdot.file_type = entryType(m, layout.FT_DIR);
     blkbuf[dot_rec + 8] = '.';
     blkbuf[dot_rec + 9] = '.';
     if (!block.writeBlock(m, data_block, blkbuf[0..bs])) {
@@ -716,12 +800,11 @@ pub fn unlinkInDir(parent_inum: u32, name: []const u8, policy: UnlinkPolicy) boo
         .file_only => if (inode.isDir(&child)) return false,
         .dir_only => if (!inode.isDir(&child)) return false,
     }
-    // No open-file reference counting exists in this fs, so unlinking a
-    // running process's text image would free (and let reallocate) the
-    // blocks its lazy page-cache fills still read from. POSIX allows
-    // unlink-of-running-binary only because the inode survives until the
-    // last ref closes — we can't honor that, so refuse like truncate does
-    // (the 2026-06-04 ETXTBSY rule, extended to unlink).
+    // Open files hold their inode (held.zig); a running program's text and
+    // a mapping do not yet. Unlinking a running process's text image would
+    // free (and let reallocate) the blocks its lazy page-cache fills still
+    // read from, so refuse like truncate does (the 2026-06-04 ETXTBSY rule,
+    // extended to unlink).
     if (policy == .file_only and @import("../../proc/process.zig").isTextBusy(child_inum)) return false;
     // For dir_only: caller (rmdir) must have already verified the dir is
     // empty — we don't re-check here.
@@ -739,7 +822,13 @@ pub fn unlinkInDir(parent_inum: u32, name: []const u8, policy: UnlinkPolicy) boo
     // hardlink to a directory (POSIX forbids it).
     const free_inode_now = (policy == .dir_only) or (child.links_count <= 1);
 
-    if (free_inode_now) {
+    if (free_inode_now and held.orphanIfHeld(child_inum)) {
+        // An open file still refers to it: it stays, nameless, until the
+        // last such file goes (release).
+        child.links_count = 0;
+        child.ctime = sec;
+        if (!inode.writeInode(child_inum, &child)) return false;
+    } else if (free_inode_now) {
         inode.freeAllBlocks(m, &child);
         var dead: layout.Inode = std.mem.zeroes(layout.Inode);
         dead.dtime = sec;
@@ -877,12 +966,173 @@ pub fn truncateTo(inum: u32, size: u64) Error!void {
     if (!inode.writeInode(inum, &ino)) return error.Io;
 }
 
+/// Set the access and modification times of `inum`, in seconds (null:
+/// leave as it is). The change time becomes now.
+pub fn setTimes(inum: u32, atime: ?u32, mtime: ?u32) Error!void {
+    const m = block.getMount() orelse return error.Io;
+    block.lockMount(m);
+    defer block.unlockMount(m);
+    var ino = inode.readInode(inum) orelse return error.Io;
+    if (atime) |t| ino.atime = t;
+    if (mtime) |t| ino.mtime = t;
+    ino.ctime = @truncate(time.now().sec);
+    if (!inode.writeInode(inum, &ino)) return error.Io;
+}
+
+/// Blocks and inodes of the file system: in all and free, for statfs.
+pub const Usage = struct { block_size: u32, blocks: u64, blocks_free: u64, inodes: u64, inodes_free: u64 };
+
+pub fn usage() ?Usage {
+    const m = block.getMount() orelse return null;
+    return .{
+        .block_size = m.block_size,
+        .blocks = m.sb.blocks_count,
+        .blocks_free = m.sb.free_blocks_count,
+        .inodes = m.sb.inodes_count,
+        .inodes_free = m.sb.free_inodes_count,
+    };
+}
+
 /// The inode `path` names, or null. "" and "/" are the root.
 pub fn lookupPath(path: []const u8) ?u32 {
     var p = path;
     while (p.len > 0 and p[p.len - 1] == '/') p = p[0 .. p.len - 1];
     if (p.len == 0) return layout.ROOT_INO;
     return cachedWalk(p);
+}
+
+// =============================================================================
+// Links
+//
+// The walks in this file don't follow symbolic links: a link in the middle
+// of a path is a non-directory to them, and at the end it is the link's own
+// inode. vfs.resolvePath replaces links by their targets first (findLink),
+// so every path that reaches a walk here is already free of the ones it
+// should follow.
+// =============================================================================
+
+/// The component at [start, end) of the walked path is a symbolic link to
+/// `target` (in the caller's buffer).
+pub const LinkAt = struct { start: usize, end: usize, target: []const u8 };
+
+/// The first symbolic link on the way down `path`, or null when the walk
+/// meets none — there is none, or it ends first at a name that doesn't exist
+/// or isn't a directory. The last component counts only with `follow_last`.
+pub fn findLink(path: []const u8, follow_last: bool, target_buf: []u8) ?LinkAt {
+    if (!isInitialized()) return null;
+    var p = path;
+    while (p.len > 0 and p[p.len - 1] == '/') p = p[0 .. p.len - 1];
+    // A cached walk passed directories only: at most its leaf is a link.
+    if (path_cache.lookupExt2(p)) |inum| {
+        if (!follow_last) return null;
+        const target = inode.readLink(inum, target_buf) orelse return null;
+        const start = if (std.mem.lastIndexOfScalar(u8, p, '/')) |slash| slash + 1 else 0;
+        return .{ .start = start, .end = p.len, .target = target };
+    }
+    var inum: u32 = layout.ROOT_INO;
+    var it = std.mem.tokenizeScalar(u8, p, '/');
+    while (it.next()) |component| {
+        const end = it.index; // peek moves the index on to the next name
+        const dir = inode.readInode(inum) orelse return null;
+        if (!inode.isDir(&dir)) return null;
+        const child = lookupInDir(&dir, component) orelse return null;
+        if (it.peek() != null or follow_last) {
+            if (inode.readLink(child, target_buf)) |target| {
+                return .{ .start = end - component.len, .end = end, .target = target };
+            }
+        }
+        inum = child;
+    }
+    return null;
+}
+
+/// The target of the symbolic link `path` names (its last component is not
+/// followed), in `out`.
+pub fn readLinkAt(path: []const u8, out: []u8) Error![]const u8 {
+    const inum = lookupPath(path) orelse return error.NotFound;
+    return inode.readLink(inum, out) orelse error.Invalid;
+}
+
+/// Make the symbolic link `path`, pointing at `target`. A short target lies
+/// in the inode itself, a longer one in a data block.
+pub fn symlinkAt(target: []const u8, path: []const u8) Error!void {
+    if (target.len == 0 or target.len > 255) return error.Invalid;
+    const at = try parentDir(path);
+    if (isDotEntry(at.leaf)) return error.Exists;
+    const m = block.getMount() orelse return error.Io;
+    block.lockMount(m);
+    defer block.unlockMount(m);
+    block.beginMetaDefer(m);
+    defer block.endMetaDefer(m);
+    var parent = inode.readInode(at.inum) orelse return error.Io;
+    if (!inode.isDir(&parent)) return error.NotDir;
+    if (lookupInDir(&parent, at.leaf) != null) return error.Exists;
+
+    const new_inum = inode.allocInode(false) orelse return error.NoSpace;
+    var ino: layout.Inode = std.mem.zeroes(layout.Inode);
+    const sec: u32 = @truncate(time.now().sec);
+    ino.mode = layout.S_IFLNK | 0o777;
+    ino.links_count = 1;
+    ino.atime = sec;
+    ino.ctime = sec;
+    ino.mtime = sec;
+    ino.size = @intCast(target.len);
+    if (target.len < inode.FAST_LINK_MAX) {
+        @memcpy(std.mem.asBytes(&ino.block)[0..target.len], target);
+    } else {
+        const bs = m.block_size;
+        const phys = inode.ensurePhysicalBlock(m, &ino, 0);
+        const buf = @import("../../proc/process.zig").currentIoScratch();
+        @memset(buf[0..bs], 0);
+        @memcpy(buf[0..target.len], target);
+        if (phys == null or !block.writeBlock(m, phys.?, buf[0..bs])) {
+            inode.freeAllBlocks(m, &ino);
+            _ = inode.freeInode(new_inum, false);
+            return if (phys == null) error.NoSpace else error.Io;
+        }
+    }
+    if (!inode.writeInode(new_inum, &ino)) {
+        inode.freeAllBlocks(m, &ino);
+        _ = inode.freeInode(new_inum, false);
+        return error.Io;
+    }
+    if (!dirInsert(m, &parent, at.leaf, new_inum, layout.FT_SYMLINK)) {
+        inode.freeAllBlocks(m, &ino);
+        _ = inode.freeInode(new_inum, false);
+        return error.NoSpace;
+    }
+    defer path_cache.invalidateAll();
+    parent.mtime = sec;
+    parent.ctime = sec;
+    if (!inode.writeInode(at.inum, &parent)) return error.Io;
+}
+
+/// Give the file `old_path` names a second name, `new_path` (a hard link).
+/// Not for directories.
+pub fn linkAt(old_path: []const u8, new_path: []const u8) Error!void {
+    const to = try parentDir(new_path);
+    if (isDotEntry(to.leaf)) return error.Exists;
+    const m = block.getMount() orelse return error.Io;
+    block.lockMount(m);
+    defer block.unlockMount(m);
+    block.beginMetaDefer(m);
+    defer block.endMetaDefer(m);
+    const src = lookupPath(old_path) orelse return error.NotFound;
+    var src_ino = inode.readInode(src) orelse return error.Io;
+    if (inode.isDir(&src_ino)) return error.IsDir;
+    if (src_ino.links_count == 0 or src_ino.links_count == std.math.maxInt(u16)) return error.Invalid;
+    var to_dir = inode.readInode(to.inum) orelse return error.Io;
+    if (!inode.isDir(&to_dir)) return error.NotDir;
+    if (lookupInDir(&to_dir, to.leaf) != null) return error.Exists;
+    if (!dirInsert(m, &to_dir, to.leaf, src, typeOfInode(&src_ino))) return error.NoSpace;
+    defer path_cache.invalidateAll();
+    const sec: u32 = @truncate(time.now().sec);
+    to_dir.mtime = sec;
+    to_dir.ctime = sec;
+    if (!inode.writeInode(to.inum, &to_dir)) return error.Io;
+    src_ino.links_count += 1;
+    src_ino.ctime = sec;
+    if (!inode.writeInode(src, &src_ino)) return error.Io;
 }
 
 /// The name directory `dir_ino` gives inode `child` (not "." or ".."),
@@ -1005,8 +1255,7 @@ pub fn rename(old_path: []const u8, new_path: []const u8) Error!void {
     // unlinkInDir may have rewritten either directory: work on fresh copies,
     // one copy when both names are in the same directory.
     var to_dir = inode.readInode(to.inum) orelse return error.Io;
-    const ftype: u8 = if (src_is_dir) layout.FT_DIR else layout.FT_REG_FILE;
-    if (!dirInsert(m, &to_dir, to.leaf, src, ftype)) return error.NoSpace;
+    if (!dirInsert(m, &to_dir, to.leaf, src, typeOfInode(&src_ino))) return error.NoSpace;
     defer path_cache.invalidateAll();
     const sec: u32 = @truncate(time.now().sec);
     to_dir.mtime = sec;

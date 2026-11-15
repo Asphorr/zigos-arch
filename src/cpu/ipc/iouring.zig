@@ -439,7 +439,7 @@ fn executeSyncAsWorker(inst: *Instance, sqe: Sqe) i32 {
         OP_NOP => return 0,
         OP_READ, OP_WRITE => {
             if (sqe.fd >= config.MAX_FDS) return ERES_BADF;
-            if (!owner_pcb.fd_table[sqe.fd].in_use) return ERES_BADF;
+            if (owner_pcb.fd_table[sqe.fd].file == null) return ERES_BADF;
             if (sqe.len == 0) return 0;
 
             const addr: usize = @intCast(sqe.addr);

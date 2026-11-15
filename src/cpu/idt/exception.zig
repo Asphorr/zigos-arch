@@ -258,10 +258,11 @@ export fn handleException(rsp: u64) callconv(.c) void {
         }
     }
 
-    // A syscall body's write to a user page that went copy-on-write after it
-    // was validated (a sibling thread forked): resolved as a ring-3 fault is.
+    // A syscall body's access to a user page that changed after it was
+    // validated (a sibling thread forked, unmapped it, or sent it to swap):
+    // resolved as a ring-3 fault is.
     if (int_no == 14 and (saved_cs & 3) == 0 and
-        process.handleKernelWriteFault(@intCast(readCr2()), error_code, stack[19])) return;
+        process.handleKernelUserFault(@intCast(readCr2()), error_code, stack[19], saved_rip)) return;
 
     // Breadcrumb: vec in high 32, pid in low 32. Stamped before the NMI
     // fast-path return so even NMI-snapshotted CPUs leave a trace.
@@ -743,6 +744,16 @@ export fn handleException(rsp: u64) callconv(.c) void {
         // expectValid trips. schedule()'s acquireIrqSave saves the current
         // (disabled) flags; the new task resumes with its OWN flags via
         // its own schedule call's restore.
+        //
+        // A Linux process ends whole, by the fault's signal: its parent's
+        // wait4 reads that, not a clean exit.
+        if (process.currentPCB()) |p| {
+            if (p.personality == .linux) {
+                process.killThreadGroup(p.tgid, signals.fatalStatus(p, if (sig != 0) sig else signals.SIGSEGV));
+                process.schedule();
+                unreachable;
+            }
+        }
         process.destroyCurrent();
         process.schedule();
         unreachable;

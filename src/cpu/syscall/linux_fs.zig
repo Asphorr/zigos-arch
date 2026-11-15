@@ -16,6 +16,7 @@
 const std = @import("std");
 const process = @import("../../proc/process.zig");
 const vfs = @import("../../fs/vfs.zig");
+const file = @import("../../fs/file.zig");
 const ext2 = @import("../../fs/ext2/ext2.zig");
 const ext2_inode = @import("../../fs/ext2/inode.zig");
 const common = @import("common.zig");
@@ -23,6 +24,7 @@ const native_fs = @import("fs.zig");
 const usercopy = @import("../arch/usercopy.zig");
 
 // Linux errno.
+const EPERM: i64 = 1;
 const ENOENT: i64 = 2;
 const EIO: i64 = 5;
 const EACCES: i64 = 13;
@@ -40,6 +42,7 @@ const ENOSPC: i64 = 28;
 const EROFS: i64 = 30;
 const ENAMETOOLONG: i64 = 36;
 const ENOTEMPTY: i64 = 39;
+const ELOOP: i64 = 40;
 const EOPNOTSUPP: i64 = 95;
 
 inline fn err(e: i64) u64 {
@@ -68,6 +71,8 @@ pub fn proc() ?*process.PCB {
 
 pub const AT_FDCWD: u64 = 0xFFFF_FFFF_FFFF_FF9C; // -100
 pub const AT_REMOVEDIR: u64 = 0x200;
+pub const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+const AT_SYMLINK_FOLLOW: u64 = 0x400;
 const AT_EMPTY_PATH: u64 = 0x1000;
 
 const O_ACCMODE: u64 = 3;
@@ -76,13 +81,16 @@ const O_CREAT: u64 = 0x40;
 const O_EXCL: u64 = 0x80;
 const O_TRUNC: u64 = 0x200;
 const O_APPEND: u64 = 0x400;
+const O_NONBLOCK: u64 = 0x800;
 const O_DIRECTORY: u64 = 0x10000;
+const O_NOFOLLOW: u64 = 0x20000;
 const O_TMPFILE: u64 = 0x410000; // includes O_DIRECTORY
 const O_CLOEXEC: u64 = 0x80000;
 
 const RENAME_NOREPLACE: u64 = 1;
 
 // st_mode format bits (the ext2 on-disk i_mode values).
+const S_IFIFO: u32 = 0o0010000;
 const S_IFCHR: u32 = 0o0020000;
 const S_IFDIR: u32 = 0o0040000;
 const S_IFREG: u32 = 0o0100000;
@@ -190,10 +198,17 @@ pub fn readPath(va: u64, out: *[256]u8, allow_empty: bool) PathRead {
     return .{ .path = out[0..n] };
 }
 
-/// The open fd `fd` of `pcb`, or null.
-pub fn fdEntry(pcb: *process.PCB, fd: u64) ?*process.FileDesc {
-    if (fd >= pcb.fd_table.len or !pcb.fd_table[fd].in_use) return null;
-    return &pcb.fd_table[fd];
+/// The file behind the open fd `fd` of `pcb`, with a reference the caller
+/// puts back (file.put), or null.
+pub fn fdFile(pcb: *process.PCB, fd: u64) ?*file.File {
+    return file.get(pcb, fd);
+}
+
+/// Is `fd` an open descriptor of `pcb`?
+pub fn fdOpen(pcb: *process.PCB, fd: u64) bool {
+    const f = file.get(pcb, fd) orelse return false;
+    file.put(f);
+    return true;
 }
 
 /// `path` as the vfs takes it: as given when absolute or relative to the
@@ -204,8 +219,9 @@ fn atPath(pcb: *process.PCB, dirfd: u64, path: []const u8, out: *[256]u8) PathRe
         if (path.len == 0) return .{ .fail = err(ENOENT) };
         return .{ .path = path };
     }
-    const fe = fdEntry(pcb, dirfd) orelse return .{ .fail = err(EBADF) };
-    if (fe.fs_type != .ext2) return .{ .fail = err(ENOTDIR) };
+    const fe = fdFile(pcb, dirfd) orelse return .{ .fail = err(EBADF) };
+    defer file.put(fe);
+    if (fe.kind != .ext2) return .{ .fail = err(ENOTDIR) };
     const ino = ext2_inode.readInode(fe.inode) orelse return .{ .fail = err(EIO) };
     if (!ext2_inode.isDir(&ino)) return .{ .fail = err(ENOTDIR) };
     const base = ext2.pathOf(fe.inode, out) orelse return .{ .fail = err(ENOENT) };
@@ -233,19 +249,32 @@ fn userAtPath(pcb: *process.PCB, dirfd: u64, va: u64, bufs: *Bufs, allow_empty: 
 /// another mount (whose own open/stat decide).
 const Node = union(enum) { ext2: u32, missing, other };
 
-fn lookupNode(pcb: *process.PCB, path: []const u8) Node {
+/// Whether a symbolic link in a path's last component is followed (the ones
+/// before it always are).
+const Last = enum { follow, nofollow };
+
+fn resolve(pcb: *process.PCB, path: []const u8, buf: *[256]u8, last: Last) ?vfs.ResolvedPath {
+    return if (last == .follow) vfs.resolvePath(pcb, path, buf) else vfs.resolvePathNoFollow(pcb, path, buf);
+}
+
+fn lookupNode(pcb: *process.PCB, path: []const u8, last: Last) Node {
     var buf: [256]u8 = undefined;
-    const r = vfs.resolvePath(pcb, path, &buf) orelse return .missing;
+    const r = resolve(pcb, path, &buf, last) orelse return .missing;
     if (r.fs != .ext2) return .other;
     return if (ext2.lookupPath(r.path)) |inum| .{ .ext2 = inum } else .missing;
 }
 
 /// `path` as a path inside the ext2 root, or the errno for a name that
 /// isn't on it.
-fn ext2Path(pcb: *process.PCB, path: []const u8, buf: *[256]u8) PathRead {
-    const r = vfs.resolvePath(pcb, path, buf) orelse return .{ .fail = err(ENOENT) };
+fn ext2Path(pcb: *process.PCB, path: []const u8, buf: *[256]u8, last: Last) PathRead {
+    const r = resolve(pcb, path, buf, last) orelse return .{ .fail = err(ENOENT) };
     if (r.fs != .ext2) return .{ .fail = err(EROFS) };
     return .{ .path = r.path };
+}
+
+fn isLinkInode(inum: u32) bool {
+    const ino = ext2_inode.readInode(inum) orelse return false;
+    return ext2_inode.isSymlink(&ino);
 }
 
 fn isDirInode(inum: u32) bool {
@@ -256,7 +285,7 @@ fn isDirInode(inum: u32) bool {
 // --- open / close ----------------------------------------------------------
 
 fn freeFds(pcb: *process.PCB) bool {
-    for (pcb.fd_table[3..]) |e| if (!e.in_use) return true;
+    for (pcb.fd_table) |e| if (!e.inUse()) return true;
     return false;
 }
 
@@ -271,11 +300,16 @@ pub fn openat(dirfd: u64, path_va: u64, lflags: u64) u64 {
     };
     if (lflags & O_TMPFILE == O_TMPFILE) return err(EOPNOTSUPP);
     const creat = lflags & O_CREAT != 0;
-    switch (lookupNode(pcb, path)) {
+    // O_EXCL creates the name itself or fails, and O_NOFOLLOW refuses a
+    // link there: both look at the last component as it is.
+    const excl = creat and lflags & O_EXCL != 0;
+    const last: Last = if (excl or lflags & O_NOFOLLOW != 0) .nofollow else .follow;
+    switch (lookupNode(pcb, path, last)) {
         .other => {},
         .missing => if (!creat) return err(ENOENT),
         .ext2 => |inum| {
-            if (creat and lflags & O_EXCL != 0) return err(EEXIST);
+            if (excl) return err(EEXIST);
+            if (last == .nofollow and isLinkInode(inum)) return err(if (lflags & O_DIRECTORY != 0) ENOTDIR else ELOOP);
             if (isDirInode(inum)) {
                 if (lflags & O_ACCMODE != O_RDONLY) return err(EISDIR);
                 if (vfs.openDir(pcb, path)) |fd| return opened(pcb, fd, lflags);
@@ -293,9 +327,15 @@ pub fn openat(dirfd: u64, path_va: u64, lflags: u64) u64 {
     return err(if (freeFds(pcb)) ENOENT else EMFILE);
 }
 
-/// A new fd, its O_CLOEXEC recorded.
+/// A new fd, its O_CLOEXEC and the file's O_NONBLOCK recorded.
 fn opened(pcb: *process.PCB, fd: u32, lflags: u64) u64 {
     pcb.fd_table[fd].cloexec = lflags & O_CLOEXEC != 0;
+    if (lflags & O_NONBLOCK != 0) {
+        if (fdFile(pcb, fd)) |f| {
+            f.nonblock = true;
+            file.put(f);
+        }
+    }
     return fd;
 }
 
@@ -385,10 +425,14 @@ fn pathFacts(pcb: *process.PCB, path: []const u8) ?Facts {
 pub const FactsRead = union(enum) { facts: Facts, fail: u64 };
 
 pub fn fdFacts(pcb: *process.PCB, fd: u64) FactsRead {
-    const fe = fdEntry(pcb, fd) orelse return .{ .fail = err(EBADF) };
-    return switch (fe.fs_type) {
+    const fe = fdFile(pcb, fd) orelse return .{ .fail = err(EBADF) };
+    defer file.put(fe);
+    // A terminal window's pipe ends are a character device to its programs.
+    if (@import("../../proc/tty.zig").get(fe.tty) != null) return .{ .facts = CONSOLE_FACTS };
+    return switch (fe.kind) {
         .console => .{ .facts = CONSOLE_FACTS },
         .ext2 => if (ext2Facts(fe.inode)) |f| .{ .facts = f } else .{ .fail = err(EIO) },
+        .pipe => .{ .facts = .{ .mode = S_IFIFO | 0o600 } },
         else => .{ .facts = .{ .mode = S_IFREG | 0o644 } },
     };
 }
@@ -412,7 +456,8 @@ fn atFacts(pcb: *process.PCB, dirfd: u64, path_va: u64, flags: u64) FactsRead {
         .path => |p| p,
         .fail => |e| return .{ .fail = e },
     };
-    return switch (lookupNode(pcb, path)) {
+    const last: Last = if (flags & AT_SYMLINK_NOFOLLOW != 0) .nofollow else .follow;
+    return switch (lookupNode(pcb, path, last)) {
         .ext2 => |inum| if (ext2Facts(inum)) |f| .{ .facts = f } else .{ .fail = err(EIO) },
         .missing => .{ .fail = err(ENOENT) },
         .other => if (pathFacts(pcb, path)) |f| .{ .facts = f } else .{ .fail = err(ENOENT) },
@@ -528,16 +573,18 @@ const DENTS_CHUNK: usize = 4096;
 /// user buffer is never written while the directory is being read.
 pub fn getdents64(fd: u64, buf_va: u64, count: u64) u64 {
     const pcb = proc() orelse return err(EFAULT);
-    const fe = fdEntry(pcb, fd) orelse return err(EBADF);
-    if (fe.fs_type != .ext2 or !isDirInode(fe.inode)) return err(ENOTDIR);
+    const fe = fdFile(pcb, fd) orelse return err(EBADF);
+    defer file.put(fe);
+    if (fe.kind != .ext2 or !isDirInode(fe.inode)) return err(ENOTDIR);
     const cap: usize = @intCast(@min(count, DENTS_CHUNK));
     if (cap < 24) return err(EINVAL);
+    const at = fe.offset32() orelse return 0; // past any directory's end
     var kbuf: [DENTS_CHUNK]u8 = undefined;
     var sink = DentSink{ .out = &kbuf, .cap = cap };
-    const next = ext2.iterDir(fe.inode, fe.offset, &sink) orelse return err(EIO);
+    const next = ext2.iterDir(fe.inode, at, &sink) orelse return err(EIO);
     if (sink.used == 0 and next < dirSize(fe.inode)) return err(EINVAL); // the next entry doesn't fit
     if (!usercopy.copyToUser(buf_va, kbuf[0..sink.used])) return err(EFAULT);
-    fe.offset = @intCast(next);
+    fe.offset = next;
     return sink.used;
 }
 
@@ -554,34 +601,40 @@ fn dirSize(inum: u32) u64 {
     return ext2_inode.fileSize(&ino);
 }
 
-/// mkdirat(dirfd, path, mode).
-pub fn mkdirat(dirfd: u64, path_va: u64) u64 {
-    const pcb = proc() orelse return err(EFAULT);
+/// The user path (dirfd, path_va) as a path inside the ext2 root, in
+/// `out`: what the calls that change the tree work on. EROFS for a name on
+/// another mount.
+fn userExt2Path(pcb: *process.PCB, dirfd: u64, path_va: u64, out: *[256]u8, last: Last) PathRead {
     var bufs: Bufs = .{};
     const path = switch (userAtPath(pcb, dirfd, path_va, &bufs, false)) {
         .path => |p| p,
-        .fail => |e| return e,
+        .fail => |e| return .{ .fail = e },
     };
+    return ext2Path(pcb, path, out, last);
+}
+
+/// mkdirat(dirfd, path, mode).
+pub fn mkdirat(dirfd: u64, path_va: u64) u64 {
+    const pcb = proc() orelse return err(EFAULT);
     var rbuf: [256]u8 = undefined;
-    const rel = switch (ext2Path(pcb, path, &rbuf)) {
+    const rel = switch (userExt2Path(pcb, dirfd, path_va, &rbuf, .nofollow)) {
         .path => |p| p,
         .fail => |e| return e,
     };
+    // Whatever the name is — the root too, which `mkdir -p` starts from —
+    // one that exists is EEXIST.
+    if (ext2.lookupPath(rel) != null) return err(EEXIST);
     ext2.mkdirAt(rel) catch |e| return errOf(e);
     return 0;
 }
 
-/// unlinkat(dirfd, path, flags): rmdir with AT_REMOVEDIR.
+/// unlinkat(dirfd, path, flags): rmdir with AT_REMOVEDIR. A symbolic link
+/// is removed itself, not what it points at.
 pub fn unlinkat(dirfd: u64, path_va: u64, flags: u64) u64 {
     if (flags & ~AT_REMOVEDIR != 0) return err(EINVAL);
     const pcb = proc() orelse return err(EFAULT);
-    var bufs: Bufs = .{};
-    const path = switch (userAtPath(pcb, dirfd, path_va, &bufs, false)) {
-        .path => |p| p,
-        .fail => |e| return e,
-    };
     var rbuf: [256]u8 = undefined;
-    const rel = switch (ext2Path(pcb, path, &rbuf)) {
+    const rel = switch (userExt2Path(pcb, dirfd, path_va, &rbuf, .nofollow)) {
         .path => |p| p,
         .fail => |e| return e,
     };
@@ -599,28 +652,56 @@ pub fn unlinkat(dirfd: u64, path_va: u64, flags: u64) u64 {
 pub fn renameat2(old_dirfd: u64, old_va: u64, new_dirfd: u64, new_va: u64, flags: u64) u64 {
     if (flags & ~RENAME_NOREPLACE != 0) return err(EINVAL);
     const pcb = proc() orelse return err(EFAULT);
-    var old_bufs: Bufs = .{};
-    var new_bufs: Bufs = .{};
-    const old_path = switch (userAtPath(pcb, old_dirfd, old_va, &old_bufs, false)) {
-        .path => |p| p,
-        .fail => |e| return e,
-    };
-    const new_path = switch (userAtPath(pcb, new_dirfd, new_va, &new_bufs, false)) {
-        .path => |p| p,
-        .fail => |e| return e,
-    };
     var old_rbuf: [256]u8 = undefined;
     var new_rbuf: [256]u8 = undefined;
-    const old_rel = switch (ext2Path(pcb, old_path, &old_rbuf)) {
+    const old_rel = switch (userExt2Path(pcb, old_dirfd, old_va, &old_rbuf, .nofollow)) {
         .path => |p| p,
         .fail => |e| return if (e == err(EROFS)) err(EXDEV) else e,
     };
-    const new_rel = switch (ext2Path(pcb, new_path, &new_rbuf)) {
+    const new_rel = switch (userExt2Path(pcb, new_dirfd, new_va, &new_rbuf, .nofollow)) {
         .path => |p| p,
         .fail => |e| return if (e == err(EROFS)) err(EXDEV) else e,
     };
     if (flags & RENAME_NOREPLACE != 0 and ext2.lookupPath(new_rel) != null) return err(EEXIST);
     ext2.rename(old_rel, new_rel) catch |e| return errOf(e);
+    return 0;
+}
+
+/// symlinkat(target, newdirfd, linkpath); symlink is it with AT_FDCWD. The
+/// target is kept as given: it need not exist.
+pub fn symlinkat(target_va: u64, new_dirfd: u64, link_va: u64) u64 {
+    const pcb = proc() orelse return err(EFAULT);
+    var target_buf: [256]u8 = undefined;
+    const target = switch (readPath(target_va, &target_buf, false)) {
+        .path => |p| p,
+        .fail => |e| return e,
+    };
+    var rbuf: [256]u8 = undefined;
+    const rel = switch (userExt2Path(pcb, new_dirfd, link_va, &rbuf, .nofollow)) {
+        .path => |p| p,
+        .fail => |e| return e,
+    };
+    ext2.symlinkAt(target, rel) catch |e| return errOf(e);
+    return 0;
+}
+
+/// linkat(olddirfd, old, newdirfd, new, flags); link is it with AT_FDCWD
+/// and 0. A link named by `old` is linked itself unless AT_SYMLINK_FOLLOW.
+pub fn linkat(old_dirfd: u64, old_va: u64, new_dirfd: u64, new_va: u64, flags: u64) u64 {
+    if (flags & ~AT_SYMLINK_FOLLOW != 0) return err(EINVAL);
+    const pcb = proc() orelse return err(EFAULT);
+    var old_rbuf: [256]u8 = undefined;
+    var new_rbuf: [256]u8 = undefined;
+    const old_last: Last = if (flags & AT_SYMLINK_FOLLOW != 0) .follow else .nofollow;
+    const old_rel = switch (userExt2Path(pcb, old_dirfd, old_va, &old_rbuf, old_last)) {
+        .path => |p| p,
+        .fail => |e| return if (e == err(EROFS)) err(EXDEV) else e,
+    };
+    const new_rel = switch (userExt2Path(pcb, new_dirfd, new_va, &new_rbuf, .nofollow)) {
+        .path => |p| p,
+        .fail => |e| return if (e == err(EROFS)) err(EXDEV) else e,
+    };
+    ext2.linkAt(old_rel, new_rel) catch |e| return if (e == error.IsDir) err(EPERM) else errOf(e);
     return 0;
 }
 
@@ -633,7 +714,7 @@ pub fn faccessat(dirfd: u64, path_va: u64) u64 {
         .path => |p| p,
         .fail => |e| return e,
     };
-    return switch (lookupNode(pcb, path)) {
+    return switch (lookupNode(pcb, path, .follow)) {
         .ext2 => 0,
         .missing => err(ENOENT),
         .other => if (pathFacts(pcb, path) != null) 0 else err(ENOENT),
@@ -672,6 +753,124 @@ fn chdirTo(pcb: *process.PCB, path: []const u8) u64 {
     return 0;
 }
 
+const UTIME_NOW: i64 = 0x3FFF_FFFF;
+const UTIME_OMIT: i64 = 0x3FFF_FFFE;
+const Timespec = extern struct { sec: i64, nsec: i64 };
+
+/// utimensat(dirfd, path, times, flags): a file's access and modification
+/// times, to the second (ext2 keeps no more). A null `times` is now for
+/// both; a null path is the file `dirfd` has open (futimens). The file has
+/// to be there: touch goes by ENOENT to create it.
+pub fn utimensat(dirfd: u64, path_va: u64, times_va: u64, flags: u64) u64 {
+    const pcb = proc() orelse return err(EFAULT);
+    const now: u32 = @truncate(@import("../../time/time.zig").now().sec);
+    var atime: ?u32 = now;
+    var mtime: ?u32 = now;
+    if (times_va != 0) {
+        var ts: [2]Timespec = undefined;
+        if (!usercopy.copyFromUser(std.mem.asBytes(&ts), times_va)) return err(EFAULT);
+        const picked = [2]?u32{ pickTime(ts[0], now), pickTime(ts[1], now) };
+        atime = picked[0];
+        mtime = picked[1];
+    }
+    const inum: u32 = if (path_va == 0) blk: {
+        const f = fdFile(pcb, dirfd) orelse return err(EBADF);
+        defer file.put(f);
+        if (f.kind != .ext2) return 0;
+        break :blk f.inode;
+    } else blk: {
+        var bufs: Bufs = .{};
+        const path = switch (userAtPath(pcb, dirfd, path_va, &bufs, false)) {
+            .path => |p| p,
+            .fail => |e| return e,
+        };
+        const last: Last = if (flags & AT_SYMLINK_NOFOLLOW != 0) .nofollow else .follow;
+        break :blk switch (lookupNode(pcb, path, last)) {
+            .ext2 => |i| i,
+            .missing => return err(ENOENT),
+            .other => return 0,
+        };
+    };
+    ext2.setTimes(inum, atime, mtime) catch |e| return errOf(e);
+    return 0;
+}
+
+fn pickTime(ts: Timespec, now: u32) ?u32 {
+    if (ts.nsec == UTIME_OMIT) return null;
+    if (ts.nsec == UTIME_NOW or ts.sec < 0) return now;
+    return @truncate(@as(u64, @intCast(ts.sec)));
+}
+
+/// chmod, chown and their kin: there are no owners or permission bits to
+/// change, so a file that is there takes any. `path_va` relative to `dirfd`.
+pub fn setAttr(dirfd: u64, path_va: u64, last_is_link: bool) u64 {
+    const pcb = proc() orelse return err(EFAULT);
+    var bufs: Bufs = .{};
+    const path = switch (userAtPath(pcb, dirfd, path_va, &bufs, false)) {
+        .path => |p| p,
+        .fail => |e| return e,
+    };
+    return switch (lookupNode(pcb, path, if (last_is_link) .nofollow else .follow)) {
+        .ext2 => 0,
+        .missing => err(ENOENT),
+        .other => if (pathFacts(pcb, path) != null) 0 else err(ENOENT),
+    };
+}
+
+/// fchmod, fchown: setAttr for an open file.
+pub fn setAttrFd(fd: u64) u64 {
+    const pcb = proc() orelse return err(EFAULT);
+    return if (fdOpen(pcb, fd)) 0 else err(EBADF);
+}
+
+/// struct statfs.
+const Statfs = extern struct {
+    type: i64,
+    bsize: i64,
+    blocks: u64,
+    bfree: u64,
+    bavail: u64,
+    files: u64,
+    ffree: u64,
+    fsid: [2]i32 = .{ 0, 0 },
+    namelen: i64 = 255,
+    frsize: i64,
+    flags: i64 = 0,
+    spare: [4]i64 = .{ 0, 0, 0, 0 },
+};
+const EXT2_SUPER_MAGIC: i64 = 0xEF53;
+
+fn writeStatfs(buf_va: u64) u64 {
+    const u = ext2.usage() orelse return err(EIO);
+    const st = Statfs{
+        .type = EXT2_SUPER_MAGIC,
+        .bsize = u.block_size,
+        .blocks = u.blocks,
+        .bfree = u.blocks_free,
+        .bavail = u.blocks_free,
+        .files = u.inodes,
+        .ffree = u.inodes_free,
+        .frsize = u.block_size,
+    };
+    if (!usercopy.copyToUser(buf_va, std.mem.asBytes(&st))) return err(EFAULT);
+    return 0;
+}
+
+/// statfs(path, buf): every path answers for the root file system, the one
+/// with blocks to count.
+pub fn statfs(path_va: u64, buf_va: u64) u64 {
+    const there = setAttr(AT_FDCWD, path_va, false);
+    if (there != 0) return there;
+    return writeStatfs(buf_va);
+}
+
+/// fstatfs(fd, buf).
+pub fn fstatfs(fd: u64, buf_va: u64) u64 {
+    const there = setAttrFd(fd);
+    if (there != 0) return there;
+    return writeStatfs(buf_va);
+}
+
 /// The target of the /proc/<pid>/exe-style link `path` names, if it is one:
 /// /proc/self/exe, /proc/thread-self/exe and /proc/<pid>/exe.
 fn exeLink(pcb: *process.PCB, path: []const u8) ?[]const u8 {
@@ -683,18 +882,17 @@ fn exeLink(pcb: *process.PCB, path: []const u8) ?[]const u8 {
     const owner: *process.PCB = if (std.mem.eql(u8, who, "self") or std.mem.eql(u8, who, "thread-self"))
         pcb
     else blk: {
-        const pid = std.fmt.parseInt(u8, who, 10) catch return null;
-        if (pid >= process.MAX_PROCS) return null;
-        const s = process.procs[pid].state;
-        if (s == .unused or s == .zombie) return null;
-        break :blk process.leader(&process.procs[pid]);
+        const nr = std.fmt.parseInt(u32, who, 10) catch return null;
+        const slot = @import("../../proc/pid_nr.zig").slotOf(nr) orelse return null;
+        if (process.procs[slot].state == .zombie) return null;
+        break :blk process.leader(&process.procs[slot]);
     };
     return owner.exe_path[0..owner.exe_path_len];
 }
 
-/// readlinkat(dirfd, path, buf, size); readlink is it with AT_FDCWD. The
-/// only links are /proc's exe links; any other file is EINVAL, as a
-/// non-link is.
+/// readlinkat(dirfd, path, buf, size); readlink is it with AT_FDCWD: the
+/// target of an ext2 symbolic link or of one of /proc's exe links, cut to
+/// `size` with no NUL. EINVAL for a name that is not a link.
 pub fn readlinkat(dirfd: u64, path_va: u64, buf_va: u64, size: u64) u64 {
     const want: i32 = @bitCast(@as(u32, @truncate(size)));
     if (want <= 0) return err(EINVAL);
@@ -704,15 +902,15 @@ pub fn readlinkat(dirfd: u64, path_va: u64, buf_va: u64, size: u64) u64 {
         .path => |p| p,
         .fail => |e| return e,
     };
-    const target = exeLink(pcb, path) orelse return switch (lookupNode(pcb, path)) {
-        .ext2 => err(EINVAL),
-        .missing => err(ENOENT),
-        .other => if (pathFacts(pcb, path) != null) err(EINVAL) else err(ENOENT),
+    var link_buf: [255]u8 = undefined;
+    const target = exeLink(pcb, path) orelse switch (lookupNode(pcb, path, .nofollow)) {
+        .ext2 => |inum| ext2_inode.readLink(inum, &link_buf) orelse return err(EINVAL),
+        .missing => return err(ENOENT),
+        .other => return if (pathFacts(pcb, path) != null) err(EINVAL) else err(ENOENT),
     };
     if (target.len == 0) return err(ENOENT);
     const n = @min(target.len, @as(usize, @intCast(want)));
-    if (!common.validateUserPtrWrite(buf_va, n)) return err(EFAULT);
-    @memcpy(@as([*]u8, @ptrFromInt(buf_va))[0..n], target[0..n]);
+    if (!usercopy.copyToUser(buf_va, target[0..n])) return err(EFAULT);
     return n;
 }
 
@@ -721,9 +919,10 @@ pub fn readlinkat(dirfd: u64, path_va: u64, buf_va: u64, size: u64) u64 {
 /// ftruncate(fd, length).
 pub fn ftruncate(fd: u64, length: u64) u64 {
     const pcb = proc() orelse return err(EFAULT);
-    const fe = fdEntry(pcb, fd) orelse return err(EBADF);
+    const fe = fdFile(pcb, fd) orelse return err(EBADF);
+    defer file.put(fe);
     if (@as(i64, @bitCast(length)) < 0) return err(EINVAL);
-    if (fe.fs_type != .ext2) return err(EINVAL);
+    if (fe.kind != .ext2) return err(EINVAL);
     if (length > ext2.maxFileSize()) return err(EFBIG);
     ext2.truncateTo(fe.inode, length) catch |e| return errOf(e);
     return 0;
@@ -738,7 +937,7 @@ pub fn truncate(path_va: u64, length: u64) u64 {
         .path => |p| p,
         .fail => |e| return e,
     };
-    const inum = switch (lookupNode(pcb, path)) {
+    const inum = switch (lookupNode(pcb, path, .follow)) {
         .ext2 => |inum| inum,
         .missing => return err(ENOENT),
         .other => return err(EROFS),
@@ -758,7 +957,7 @@ const LOCK_UN: u64 = 8;
 /// to come.
 pub fn flock(fd: u64, op: u64) u64 {
     const pcb = proc() orelse return err(EFAULT);
-    _ = fdEntry(pcb, fd) orelse return err(EBADF);
+    if (!fdOpen(pcb, fd)) return err(EBADF);
     const kind = op & ~LOCK_NB;
     if (kind != LOCK_SH and kind != LOCK_EX and kind != LOCK_UN) return err(EINVAL);
     return 0;
@@ -766,10 +965,17 @@ pub fn flock(fd: u64, op: u64) u64 {
 
 /// fsync / fdatasync: what a MAP_SHARED mapping dirtied goes to the block
 /// cache, then the whole cache to the disk (not just this file's blocks).
+/// sync(), syncfs(fd): what the file system holds back goes to the disk.
+pub fn sync() u64 {
+    ext2.sync();
+    return 0;
+}
+
 pub fn fsync(fd: u64) u64 {
     const pcb = proc() orelse return err(EFAULT);
-    const fe = fdEntry(pcb, fd) orelse return err(EBADF);
-    if (fe.fs_type == .ext2) {
+    const fe = fdFile(pcb, fd) orelse return err(EBADF);
+    defer file.put(fe);
+    if (fe.kind == .ext2) {
         _ = vfs.syncCacheFile(fe.inode, false);
         ext2.sync();
     }

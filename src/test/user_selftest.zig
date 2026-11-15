@@ -17,10 +17,15 @@ const nvme = @import("../driver/nvme.zig");
 const boot_phase = @import("../boot/boot_phase.zig");
 const serial = @import("../debug/serial.zig");
 
+const WARMUP_RUNS: u32 = 2;
+const COUNTED_RUNS: u32 = 10;
+
 const Case = struct {
     path: []const u8,
     name: []const u8,
     ok_status: u32,
+    /// Runs after the warm-up ones; fewer for a program that takes long.
+    counted_runs: u32 = COUNTED_RUNS,
 };
 
 // /tar/ keeps the loader on the private elf_buf path (spawnPath maps only
@@ -29,10 +34,13 @@ const Case = struct {
 const CASES = [_]Case{
     .{ .path = "/tar/forktest.elf", .name = "forktest", .ok_status = 0xCAFE0042 },
     .{ .path = "/tar/iouringtest.elf", .name = "iouringtest", .ok_status = 0xCAFE0115 },
+    .{ .path = "/tar/pipetest.elf", .name = "pipetest", .ok_status = 0xCAFE0000, .counted_runs = 4 },
+    // Sessions and groups; signals from raise, kill, the alarm and a fault;
+    // job-control stop and continue.
+    .{ .path = "/tar/daemontest.elf", .name = "daemontest", .ok_status = 0xCAFE0044, .counted_runs = 4 },
+    .{ .path = "/tar/sigtest.elf", .name = "sigtest", .ok_status = 0xCAFE0045, .counted_runs = 2 },
+    .{ .path = "/tar/stoptest.elf", .name = "stoptest", .ok_status = 0xCAFE0043, .counted_runs = 2 },
 };
-
-const WARMUP_RUNS: u32 = 2;
-const COUNTED_RUNS: u32 = 10;
 const RUN_TIMEOUT_MS: u32 = 30_000;
 /// Two CPUs' PMM magazines (2 x CACHE_SIZE) plus slack. One run of forktest
 /// leaks 16 frames if its two file buffers are never released.
@@ -175,18 +183,18 @@ pub fn taskEntry() callconv(.c) noreturn {
     // and io_uring submits through async NVMe I/O.
     boot_phase.markComplete();
     nvme.enableAsync();
-    serial.print("[usertest] {d} program(s), {d} warm-up + {d} counted runs each\n", .{ CASES.len, WARMUP_RUNS, COUNTED_RUNS });
+    serial.print("[usertest] {d} program(s), {d} warm-up runs each, then up to {d} counted ones\n", .{ CASES.len, WARMUP_RUNS, COUNTED_RUNS });
 
     for (CASES) |c| {
         var run: u32 = 0;
         while (run < WARMUP_RUNS) : (run += 1) check(c, run);
         process.kernelSleepMs(50);
         const before = pmm.freeFrameCount();
-        while (run < WARMUP_RUNS + COUNTED_RUNS) : (run += 1) check(c, run);
+        while (run < WARMUP_RUNS + c.counted_runs) : (run += 1) check(c, run);
         process.kernelSleepMs(50);
         const after = pmm.freeFrameCount();
         const drift: u32 = before -| after;
-        serial.print("[usertest] {s}: free frames {d} -> {d} over {d} runs (drift {d}, limit {d})\n", .{ c.path, before, after, COUNTED_RUNS, drift, DRIFT_LIMIT });
+        serial.print("[usertest] {s}: free frames {d} -> {d} over {d} runs (drift {d}, limit {d})\n", .{ c.path, before, after, c.counted_runs, drift, DRIFT_LIMIT });
         if (drift > DRIFT_LIMIT) {
             serial.print("[usertest] FAIL {s}: frames leak across runs\n", .{c.path});
             failures += 1;

@@ -31,7 +31,9 @@
 
 const signals = @import("../../proc/signals.zig");
 const process = @import("../../proc/process.zig");
+const pid_nr = @import("../../proc/pid_nr.zig");
 const vfs = @import("../../fs/vfs.zig");
+const file = @import("../../fs/file.zig");
 const common = @import("common.zig");
 const debug = @import("../../debug/debug.zig");
 const ext2_inode = @import("../../fs/ext2/inode.zig");
@@ -46,6 +48,8 @@ const linux_time = @import("linux_time.zig");
 const linux_thread = @import("linux_thread.zig");
 const linux_fs = @import("linux_fs.zig");
 const linux_proc = @import("linux_proc.zig");
+const linux_signal = @import("linux_signal.zig");
+const linux_tty = @import("linux_tty.zig");
 const native_proc = @import("proc.zig");
 
 // --- Linux x86-64 errno (DISTINCT from zigos common.E_* — different values).
@@ -91,6 +95,14 @@ const SYS_munmap: u32 = 11;
 const SYS_brk: u32 = 12;
 const SYS_rt_sigaction: u32 = 13;
 const SYS_rt_sigprocmask: u32 = 14;
+pub const SYS_rt_sigreturn: u32 = 15;
+const SYS_rt_sigpending: u32 = 127;
+const SYS_rt_sigtimedwait: u32 = 128;
+const SYS_rt_sigsuspend: u32 = 130;
+const SYS_pause: u32 = 34;
+const SYS_getitimer: u32 = 36;
+const SYS_alarm: u32 = 37;
+const SYS_setitimer: u32 = 38;
 const SYS_ioctl: u32 = 16;
 const SYS_pread64: u32 = 17;
 const SYS_pwrite64: u32 = 18;
@@ -113,6 +125,11 @@ const SYS_clock_getres: u32 = 229;
 const SYS_clock_nanosleep: u32 = 230;
 const SYS_clone: u32 = 56;
 const SYS_getppid: u32 = 110;
+const SYS_setpgid: u32 = 109;
+const SYS_getpgrp: u32 = 111;
+const SYS_setsid: u32 = 112;
+const SYS_getpgid: u32 = 121;
+const SYS_getsid: u32 = 124;
 const SYS_futex: u32 = 202;
 const SYS_membarrier: u32 = 324;
 const SYS_access: u32 = 21;
@@ -124,12 +141,16 @@ const SYS_ftruncate: u32 = 77;
 const SYS_rename: u32 = 82;
 const SYS_mkdir: u32 = 83;
 const SYS_rmdir: u32 = 84;
+const SYS_link: u32 = 86;
 const SYS_unlink: u32 = 87;
+const SYS_symlink: u32 = 88;
 const SYS_readlink: u32 = 89;
 const SYS_sigaltstack: u32 = 131;
 const SYS_mkdirat: u32 = 258;
 const SYS_unlinkat: u32 = 263;
 const SYS_renameat: u32 = 264;
+const SYS_linkat: u32 = 265;
+const SYS_symlinkat: u32 = 266;
 const SYS_readlinkat: u32 = 267;
 const SYS_faccessat: u32 = 269;
 const SYS_preadv: u32 = 295;
@@ -170,6 +191,7 @@ const FD_CLOEXEC: u64 = 1;
 const O_RDONLY: u64 = 0;
 const O_WRONLY: u64 = 1;
 const O_RDWR: u64 = 2;
+const O_APPEND: u64 = 0x400;
 const O_NONBLOCK: u64 = 0x800;
 const SYS_stat: u32 = 4;
 const SYS_lstat: u32 = 6;
@@ -177,6 +199,37 @@ const SYS_uname: u32 = 63;
 const SYS_getcwd: u32 = 79;
 const SYS_chdir: u32 = 80;
 const SYS_fchdir: u32 = 81;
+const SYS_sendfile: u32 = 40;
+const SYS_chmod: u32 = 90;
+const SYS_fchmod: u32 = 91;
+const SYS_chown: u32 = 92;
+const SYS_fchown: u32 = 93;
+const SYS_lchown: u32 = 94;
+const SYS_umask: u32 = 95;
+const SYS_getrusage: u32 = 98;
+const SYS_times: u32 = 100;
+const SYS_setreuid: u32 = 113;
+const SYS_setregid: u32 = 114;
+const SYS_getgroups: u32 = 115;
+const SYS_setgroups: u32 = 116;
+const SYS_setresuid: u32 = 117;
+const SYS_getresuid: u32 = 118;
+const SYS_setresgid: u32 = 119;
+const SYS_getresgid: u32 = 120;
+const SYS_setfsuid: u32 = 122;
+const SYS_setfsgid: u32 = 123;
+const SYS_statfs: u32 = 137;
+const SYS_fstatfs: u32 = 138;
+const SYS_getpriority: u32 = 140;
+const SYS_setpriority: u32 = 141;
+const SYS_prctl: u32 = 157;
+const SYS_sync: u32 = 162;
+const SYS_sched_setaffinity: u32 = 203;
+const SYS_fadvise64: u32 = 221;
+const SYS_fchownat: u32 = 260;
+const SYS_fchmodat: u32 = 268;
+const SYS_syncfs: u32 = 306;
+const SYS_fchmodat2: u32 = 452;
 const SYS_getuid: u32 = 102;
 const SYS_getgid: u32 = 104;
 const SYS_setuid: u32 = 105;
@@ -239,13 +292,15 @@ pub fn dispatch(num: u32, frame: *signals.SyscallFrame) u64 {
             return if (at_fd_offset) sysWritev(@truncate(a1), a2, a3) else sysPwritev(@truncate(a1), a2, a3, a4);
         },
         SYS_copy_file_range => return sysCopyFileRange(a1, a2, a3, a4, a5, a6),
+        SYS_sendfile => return sysSendfile(a1, a2, a3, a4),
         // Names, metadata and the tree (linux_fs.zig). The pre-*at calls are
         // their *at forms at the cwd.
         SYS_open => return linux_fs.openat(AT_FDCWD, a1, a2),
         SYS_openat => return linux_fs.openat(a1, a2, a3),
         SYS_close => return linux_fs.close(a1),
         SYS_fstat => return linux_fs.fstat(a1, a2),
-        SYS_stat, SYS_lstat => return linux_fs.newfstatat(AT_FDCWD, a1, a2, 0),
+        SYS_stat => return linux_fs.newfstatat(AT_FDCWD, a1, a2, 0),
+        SYS_lstat => return linux_fs.newfstatat(AT_FDCWD, a1, a2, linux_fs.AT_SYMLINK_NOFOLLOW),
         SYS_newfstatat => return linux_fs.newfstatat(a1, a2, a3, a4),
         SYS_statx => return linux_fs.statx(a1, a2, a3, a4, a5),
         SYS_getdents64 => return linux_fs.getdents64(a1, a2, a3),
@@ -261,12 +316,16 @@ pub fn dispatch(num: u32, frame: *signals.SyscallFrame) u64 {
         SYS_faccessat, SYS_faccessat2 => return linux_fs.faccessat(a1, a2),
         SYS_readlink => return linux_fs.readlinkat(AT_FDCWD, a1, a2, a3),
         SYS_readlinkat => return linux_fs.readlinkat(a1, a2, a3, a4),
+        SYS_symlink => return linux_fs.symlinkat(a1, AT_FDCWD, a2),
+        SYS_symlinkat => return linux_fs.symlinkat(a1, a2, a3),
+        SYS_link => return linux_fs.linkat(AT_FDCWD, a1, AT_FDCWD, a2, 0),
+        SYS_linkat => return linux_fs.linkat(a1, a2, a3, a4, a5),
         SYS_truncate => return linux_fs.truncate(a1, a2),
         SYS_ftruncate => return linux_fs.ftruncate(a1, a2),
         SYS_flock => return linux_fs.flock(a1, a2),
         SYS_fsync, SYS_fdatasync => return linux_fs.fsync(a1),
         SYS_getrandom => return sysGetrandom(a1, a2, a3),
-        SYS_sigaltstack => return sysSigaltstack(a1, a2),
+        SYS_sigaltstack => return linux_signal.sigaltstack(a1, a2, frame.user_rsp),
         SYS_mmap => return linux_mm.mmap(a1, a2, a3, a4, a5, a6),
         SYS_munmap => return linux_mm.munmap(a1, a2),
         SYS_mprotect => return linux_mm.mprotect(a1, a2, a3),
@@ -285,10 +344,9 @@ pub fn dispatch(num: u32, frame: *signals.SyscallFrame) u64 {
         SYS_clock_nanosleep => return linux_time.clockNanosleep(a1, a2, a3, a4),
         SYS_sched_yield => return native_proc.sysYield(),
         SYS_sched_getaffinity => return sysSchedGetaffinity(a1, a2, a3),
-        // isatty / line-buffering probe: musl's first stdio write does
-        // ioctl(fd, TIOCGWINSZ). Reporting "not a tty" (-ENOTTY) makes it pick
-        // full buffering and flush via writev at exit — exactly what we want.
-        SYS_ioctl => return err(ENOTTY),
+        // A terminal's calls, ENOTTY for the rest (linux_tty.zig): isatty,
+        // and musl's first stdio write, ask TIOCGWINSZ to tell.
+        SYS_ioctl => return linux_tty.ioctl(a1, a2, a3),
         // TLS bring-up: musl's __init_tp does arch_prctl(ARCH_SET_FS, tcb).
         SYS_arch_prctl => return sysArchPrctl(a1, a2),
         SYS_clone => return linux_thread.clone(frame, a1, a2, a3, a4, a5),
@@ -306,21 +364,57 @@ pub fn dispatch(num: u32, frame: *signals.SyscallFrame) u64 {
         SYS_dup2 => return linux_proc.dup2(a1, a2),
         SYS_dup3 => return linux_proc.dup3(a1, a2, a3),
         SYS_poll => return linux_proc.poll(a1, a2, a3),
-        SYS_ppoll => return linux_proc.ppoll(a1, a2, a3),
+        SYS_ppoll => return linux_proc.ppoll(a1, a2, a3, a4, a5),
         SYS_process_vm_readv => return linux_proc.processVmReadv(a1, a2, a3, a4, a5, a6),
         SYS_sysinfo => return linux_proc.sysinfo(a1),
-        SYS_utimensat => return linux_proc.utimensat(),
+        SYS_utimensat => return linux_fs.utimensat(a1, a2, a3, a4),
+        // No owners and no permission bits: these take anything a file
+        // that is there is given.
+        SYS_chmod, SYS_chown => return linux_fs.setAttr(AT_FDCWD, a1, false),
+        SYS_lchown => return linux_fs.setAttr(AT_FDCWD, a1, true),
+        SYS_fchmodat, SYS_fchmodat2 => return linux_fs.setAttr(a1, a2, false),
+        SYS_fchownat => return linux_fs.setAttr(a1, a2, a5 & linux_fs.AT_SYMLINK_NOFOLLOW != 0),
+        SYS_fchmod, SYS_fchown => return linux_fs.setAttrFd(a1),
+        SYS_umask => {
+            const p = proc() orelse return err(EFAULT);
+            const old = p.umask;
+            p.umask = @truncate(a1 & 0o777);
+            return old;
+        },
+        SYS_statfs => return linux_fs.statfs(a1, a2),
+        SYS_fstatfs => return linux_fs.fstatfs(a1, a2),
+        SYS_sync, SYS_syncfs => return linux_fs.sync(),
+        SYS_fadvise64 => return 0,
+        SYS_times => return linux_proc.times(a1),
+        SYS_getrusage => return linux_proc.getrusage(a2),
+        SYS_prctl => return linux_proc.prctl(a1, a2),
+        SYS_getpriority => return 20, // nice 0, as the call encodes it
+        SYS_setpriority, SYS_sched_setaffinity => return 0,
         SYS_futex => return linux_thread.futex(a1, a2, a3, a4, a5, a6),
         SYS_set_tid_address => return linux_thread.setTidAddress(a1),
-        // A thread's tid is its pid; the process id is the group lead's.
-        SYS_getpid => return (process.currentPCB() orelse return err(EFAULT)).tgid,
-        SYS_gettid => return process.getCurrentPid(),
-        SYS_getppid => return (proc() orelse return err(EFAULT)).parent_pid,
+        // Pids are numbers (pid_nr.zig), not slots. A thread's tid is its
+        // own; the process id is the group lead's.
+        SYS_getpid => return (proc() orelse return err(EFAULT)).pid_nr,
+        SYS_gettid => return (process.currentPCB() orelse return err(EFAULT)).pid_nr,
+        SYS_getppid => return pid_nr.of((proc() orelse return err(EFAULT)).parent_pid),
+        SYS_getpgrp => return linux_proc.getpgid(0),
+        SYS_getpgid => return linux_proc.getpgid(a1),
+        SYS_setpgid => return linux_proc.setpgid(a1, a2),
+        SYS_getsid => return linux_proc.getsid(a1),
+        SYS_setsid => return linux_proc.setsid(),
         // musl registers at its first pthread_create and does without.
         SYS_membarrier => return err(ENOSYS),
-        // No Linux-signal delivery for these processes yet, so these are moot.
-        SYS_rt_sigprocmask => return 0,
-        SYS_rt_sigaction => return 0,
+        // Signals (linux_signal.zig). rt_sigreturn is taken before the
+        // dispatch (doSyscall): it returns through a frame of its own.
+        SYS_rt_sigaction => return linux_signal.rtSigaction(a1, a2, a3, a4),
+        SYS_rt_sigprocmask => return linux_signal.rtSigprocmask(a1, a2, a3, a4),
+        SYS_rt_sigpending => return linux_signal.rtSigpending(a1, a2),
+        SYS_rt_sigsuspend => return linux_signal.rtSigsuspend(a1, a2),
+        SYS_rt_sigtimedwait => return linux_signal.rtSigtimedwait(a1, a2, a3, a4),
+        SYS_pause => return linux_signal.pause(),
+        SYS_alarm => return linux_signal.alarm(a1),
+        SYS_setitimer => return linux_signal.setitimer(a1, a2, a3),
+        SYS_getitimer => return linux_signal.getitimer(a1, a2),
         SYS_set_robust_list => return 0,
         SYS_uname => return sysUname(a1),
         SYS_getcwd => return sysGetcwd(a1, a2),
@@ -329,7 +423,9 @@ pub fn dispatch(num: u32, frame: *signals.SyscallFrame) u64 {
         // Single-user system: everything runs as root (uid/gid 0). setuid/setgid
         // to any id "succeeds" as a no-op (we are already privileged).
         SYS_getuid, SYS_geteuid, SYS_getgid, SYS_getegid => return 0,
-        SYS_setuid, SYS_setgid => return 0,
+        SYS_setuid, SYS_setgid, SYS_setreuid, SYS_setregid, SYS_setresuid, SYS_setresgid => return 0,
+        SYS_setfsuid, SYS_setfsgid, SYS_getgroups, SYS_setgroups => return 0,
+        SYS_getresuid, SYS_getresgid => return linux_proc.getresid(a1, a2, a3),
         SYS_exit => return linux_thread.exitThread(a1),
         SYS_exit_group => return linux_thread.exitGroup(a1),
         else => {
@@ -360,12 +456,13 @@ const MAX_STREAM_READ: u32 = 1 << 20;
 /// of an ext2 file, MAX_STREAM_READ from anything else.
 fn readLen(pcb: *process.PCB, fd: u32, count: u64) u32 {
     const len = rwLen(count);
-    if (fd >= pcb.fd_table.len or !pcb.fd_table[fd].in_use) return len;
-    const fe = &pcb.fd_table[fd];
-    if (fe.fs_type != .ext2) return @min(len, MAX_STREAM_READ);
+    const fe = file.get(pcb, fd) orelse return len;
+    defer file.put(fe);
+    if (fe.kind != .ext2) return @min(len, MAX_STREAM_READ);
     const size = fdFileSize(fe);
-    if (fe.offset >= size) return 0;
-    return @intCast(@min(len, size - fe.offset));
+    const at = fe.offset;
+    if (at >= size) return 0;
+    return @intCast(@min(len, size - at));
 }
 
 /// A vfs read or write result as a Linux return: the count, or -errno for
@@ -377,7 +474,19 @@ fn vfsResult(n: u32) u64 {
         @intFromEnum(errno.Errno.ETXTBSY) => ETXTBSY,
         @intFromEnum(errno.Errno.ENOSPC) => ENOSPC,
         @intFromEnum(errno.Errno.EAGAIN) => EAGAIN,
-        @intFromEnum(errno.Errno.EPIPE) => EPIPE,
+        // A read or write a signal cut short before a byte moved.
+        @intFromEnum(errno.Errno.EINTR) => linux_signal.ERESTARTSYS,
+        // A write with nobody left to read it: SIGPIPE for the writer, and
+        // EPIPE if that doesn't end it.
+        @intFromEnum(errno.Errno.EPIPE) => blk: {
+            if (process.currentPCB()) |me| {
+                _ = signals.sendInfo(@intCast(process.getCurrentPid()), signals.SIGPIPE, .{
+                    .code = signals.SI_USER_CODE,
+                    .pid = process.leader(me).pid_nr,
+                });
+            }
+            break :blk EPIPE;
+        },
         @intFromEnum(errno.Errno.EFAULT) => EFAULT,
         @intFromEnum(errno.Errno.ENOMEM) => ENOMEM,
         else => EBADF,
@@ -386,8 +495,10 @@ fn vfsResult(n: u32) u64 {
 
 /// Linux read of an ext2 directory fd is -EISDIR.
 fn isDirFd(pcb: *process.PCB, fd: u32) bool {
-    if (fd >= pcb.fd_table.len or !pcb.fd_table[fd].in_use or pcb.fd_table[fd].fs_type != .ext2) return false;
-    const ino = ext2_inode.readInode(pcb.fd_table[fd].inode) orelse return false;
+    const fe = file.get(pcb, fd) orelse return false;
+    defer file.put(fe);
+    if (fe.kind != .ext2) return false;
+    const ino = ext2_inode.readInode(fe.inode) orelse return false;
     return ext2_inode.isDir(&ino);
 }
 
@@ -495,21 +606,26 @@ fn sysReadv(fd: u32, iov_va: u64, iovcnt: u64) u64 {
 /// directly so fcntl spam doesn't look like a missing syscall).
 fn sysFcntl(fd: u32, cmd: u64, arg: u64) u64 {
     const pcb = proc() orelse return err(EFAULT);
-    if (fd >= pcb.fd_table.len or !pcb.fd_table[fd].in_use) return err(EBADF);
-    const fe = &pcb.fd_table[fd];
+    const fe = file.get(pcb, fd) orelse return err(EBADF);
+    defer file.put(fe);
+    // The descriptor's own flag; the status flags below are the file's,
+    // shared with every dup of it.
+    const slot = &pcb.fd_table[fd];
     return switch (cmd) {
         F_DUPFD => linux_proc.dupFrom(fd, arg, false),
         F_DUPFD_CLOEXEC => linux_proc.dupFrom(fd, arg, true),
-        F_GETFD => @intFromBool(fe.cloexec),
+        F_GETFD => @intFromBool(slot.cloexec),
         F_SETFD => blk: {
-            fe.cloexec = arg & FD_CLOEXEC != 0;
+            slot.cloexec = arg & FD_CLOEXEC != 0;
             break :blk 0;
         },
         // The access mode: a pipe's end, else read/write.
-        F_GETFL => @as(u64, if (fe.fs_type != .pipe) O_RDWR else if (fe.flags == 0) O_RDONLY else O_WRONLY) |
-            @as(u64, if (fe.nonblock) O_NONBLOCK else 0),
+        F_GETFL => @as(u64, if (fe.kind != .pipe) O_RDWR else if (fe.access == file.READ) O_RDONLY else O_WRONLY) |
+            @as(u64, if (fe.nonblock) O_NONBLOCK else 0) |
+            @as(u64, if (fe.append) O_APPEND else 0),
         F_SETFL => blk: {
             fe.nonblock = arg & O_NONBLOCK != 0;
+            fe.append = arg & O_APPEND != 0;
             break :blk 0;
         },
         else => err(ENOSYS),
@@ -517,26 +633,30 @@ fn sysFcntl(fd: u32, cmd: u64, arg: u64) u64 {
 }
 
 /// File size behind an fd (ext2 only; 0 otherwise) — for lseek SEEK_END.
-fn fdFileSize(fe: *const process.FileDesc) u64 {
-    if (fe.fs_type != .ext2) return 0;
+fn fdFileSize(fe: *const file.File) u64 {
+    if (fe.kind != .ext2) return 0;
     const ino = ext2_inode.readInode(fe.inode) orelse return 0;
     return ext2_inode.fileSize(&ino);
 }
 
-/// lseek(fd, off, whence). offset is u32 in the fd table; SEEK_SET/CUR/END.
+/// lseek(fd, off, whence): SEEK_SET/CUR/END on the file's offset, which
+/// every descriptor on the file shares.
 fn sysLseek(fd: u32, off: u64, whence: u32) u64 {
     const pcb = proc() orelse return err(EFAULT);
-    if (fd >= pcb.fd_table.len or !pcb.fd_table[fd].in_use) return err(EBADF);
-    const fe = &pcb.fd_table[fd];
-    if (fe.fs_type == .console or fe.fs_type == .pipe) return err(ESPIPE);
+    const fe = file.get(pcb, fd) orelse return err(EBADF);
+    defer file.put(fe);
+    switch (fe.kind) {
+        .console, .pipe, .tcp_sock, .tcp_listener => return err(ESPIPE),
+        else => {},
+    }
     const new: u64 = switch (whence) {
         0 => off, // SEEK_SET
-        1 => @as(u64, fe.offset) +% off, // SEEK_CUR
+        1 => fe.offset +% off, // SEEK_CUR
         2 => fdFileSize(fe) +% off, // SEEK_END
         else => return err(EINVAL),
     };
-    if (new > 0xFFFF_FFFF) return err(EINVAL);
-    fe.offset = @truncate(new);
+    if (@as(i64, @bitCast(new)) < 0) return err(EINVAL);
+    fe.offset = new;
     return new;
 }
 
@@ -564,7 +684,9 @@ fn sysUname(buf_va: u64) u64 {
 /// pointer); -ERANGE if the buffer is too small to hold path + NUL.
 fn sysGetcwd(buf_va: u64, size: u64) u64 {
     const pcb = proc() orelse return err(EFAULT);
-    const cwd = pcb.cwd[0..pcb.cwd_len];
+    // The cwd is kept with a slash at its end; Linux names it without one.
+    var cwd: []const u8 = pcb.cwd[0..pcb.cwd_len];
+    if (cwd.len > 1 and cwd[cwd.len - 1] == '/') cwd = cwd[0 .. cwd.len - 1];
     const needed: u64 = @as(u64, @intCast(cwd.len)) + 1; // path + NUL
     if (size < needed) return err(ERANGE);
     if (buf_va == 0 or !common.validateUserPtrWrite(buf_va, needed)) return err(EFAULT);
@@ -574,14 +696,14 @@ fn sysGetcwd(buf_va: u64, size: u64) u64 {
     return needed;
 }
 
-/// The ext2 file behind `fd` for a positioned read or write: -EBADF for a
-/// closed fd, -ESPIPE for anything without a byte offset of its own.
-fn positionedFile(pcb: *process.PCB, fd: u32, off: u64) union(enum) { file: *process.FileDesc, fail: u64 } {
-    if (fd >= pcb.fd_table.len or !pcb.fd_table[fd].in_use) return .{ .fail = err(EBADF) };
-    if (@as(i64, @bitCast(off)) < 0) return .{ .fail = err(EINVAL) };
-    const fe = &pcb.fd_table[fd];
-    if (fe.fs_type != .ext2) return .{ .fail = err(ESPIPE) };
-    return .{ .file = fe };
+/// The ext2 file behind `fd` for a positioned read or write, with a
+/// reference the caller puts back: -EBADF for a closed fd, -ESPIPE for
+/// anything without a byte offset of its own.
+fn positionedFile(pcb: *process.PCB, fd: u32, off: u64) union(enum) { file: *file.File, fail: u64 } {
+    const fe = file.get(pcb, fd) orelse return .{ .fail = err(EBADF) };
+    const why: i64 = if (@as(i64, @bitCast(off)) < 0) EINVAL else if (fe.kind != .ext2) ESPIPE else return .{ .file = fe };
+    file.put(fe);
+    return .{ .fail = err(why) };
 }
 
 /// pread64(fd, buf, count, off): read at `off`; the fd offset stays put.
@@ -591,6 +713,7 @@ fn sysPread(fd: u32, buf_va: u64, count: u64, off: u64) u64 {
         .file => |f| f,
         .fail => |e| return e,
     };
+    defer file.put(fe);
     if (isDirFd(pcb, fd)) return err(EISDIR);
     const size = fdFileSize(fe);
     if (off >= size) return 0;
@@ -607,6 +730,7 @@ fn sysPwrite(fd: u32, buf_va: u64, count: u64, off: u64) u64 {
         .file => |f| f,
         .fail => |e| return e,
     };
+    defer file.put(fe);
     if (count == 0) return 0;
     const len = rwLen(count);
     if (!common.validateUserPtr(buf_va, len)) return err(EFAULT);
@@ -667,7 +791,7 @@ const MAX_COPY: u64 = 1 << 20;
 
 /// The offset a copy_file_range side starts at: `*off_va` when given (it
 /// gets the end offset back), else the fd's own.
-fn copyOffset(fe: *const process.FileDesc, off_va: u64) ?u64 {
+fn copyOffset(fe: *const file.File, off_va: u64) ?u64 {
     if (off_va == 0) return fe.offset;
     if (!common.validateUserPtrWriteAligned(off_va, 8, 8)) return null;
     const off = @as(*const i64, @ptrFromInt(off_va)).*;
@@ -681,9 +805,11 @@ fn copyOffset(fe: *const process.FileDesc, off_va: u64) ?u64 {
 fn sysCopyFileRange(fd_in: u64, off_in_va: u64, fd_out: u64, off_out_va: u64, len: u64, flags: u64) u64 {
     if (flags != 0) return err(EINVAL);
     const pcb = proc() orelse return err(EFAULT);
-    const in_fe = linux_fs.fdEntry(pcb, fd_in) orelse return err(EBADF);
-    const out_fe = linux_fs.fdEntry(pcb, fd_out) orelse return err(EBADF);
-    if (in_fe.fs_type != .ext2 or out_fe.fs_type != .ext2) return err(EINVAL);
+    const in_fe = file.get(pcb, fd_in) orelse return err(EBADF);
+    defer file.put(in_fe);
+    const out_fe = file.get(pcb, fd_out) orelse return err(EBADF);
+    defer file.put(out_fe);
+    if (in_fe.kind != .ext2 or out_fe.kind != .ext2) return err(EINVAL);
     if (isDirFd(pcb, @intCast(fd_in)) or isDirFd(pcb, @intCast(fd_out))) return err(EISDIR);
     var in_off = copyOffset(in_fe, off_in_va) orelse return err(EFAULT);
     var out_off = copyOffset(out_fe, off_out_va) orelse return err(EFAULT);
@@ -692,9 +818,6 @@ fn sysCopyFileRange(fd_in: u64, off_in_va: u64, fd_out: u64, off_out_va: u64, le
     if (want == 0) return 0;
     if (in_fe.inode == out_fe.inode and in_off < out_off + want and out_off < in_off + want) return err(EINVAL);
     if (out_off +| want > MAX_FILE) return err(EFBIG);
-    if (off_out_va == 0 and out_off + want > 0xFFFF_FFFF) return err(EFBIG); // fd offsets are u32
-
-    if (off_in_va == 0 and in_off + want > 0xFFFF_FFFF) return err(EOVERFLOW); // fd offsets are u32
     const buf = heap.kmallocAligned(4096, 4096) orelse return err(ENOMEM);
     defer heap.kfree(buf);
     var done: u64 = 0;
@@ -712,8 +835,42 @@ fn sysCopyFileRange(fd_in: u64, off_in_va: u64, fd_out: u64, off_out_va: u64, le
         out_off += put;
         if (put < got) break;
     }
-    if (off_in_va != 0) @as(*u64, @ptrFromInt(off_in_va)).* = in_off else in_fe.offset = @intCast(in_off);
-    if (off_out_va != 0) @as(*u64, @ptrFromInt(off_out_va)).* = out_off else out_fe.offset = @intCast(out_off);
+    if (off_in_va != 0) @as(*u64, @ptrFromInt(off_in_va)).* = in_off else in_fe.offset = in_off;
+    if (off_out_va != 0) @as(*u64, @ptrFromInt(off_out_va)).* = out_off else out_fe.offset = out_off;
+    return done;
+}
+
+/// sendfile(out_fd, in_fd, offset, count): bytes of an ext2 file to anything
+/// that can be written, through a kernel page. A null `offset` reads at the
+/// input's own offset, which moves; a given one is read from and updated,
+/// and the input's own stays.
+fn sysSendfile(out_fd: u64, in_fd: u64, off_va: u64, count: u64) u64 {
+    const pcb = proc() orelse return err(EFAULT);
+    const in_fe = file.get(pcb, in_fd) orelse return err(EBADF);
+    defer file.put(in_fe);
+    if (in_fe.kind != .ext2) return err(EINVAL);
+    if (isDirFd(pcb, @intCast(in_fd))) return err(EISDIR);
+    if (!linux_fs.fdOpen(pcb, out_fd)) return err(EBADF);
+    var in_off = copyOffset(in_fe, off_va) orelse return err(EFAULT);
+    const want = @min(count, MAX_COPY, fdFileSize(in_fe) -| in_off);
+    if (want == 0) return 0;
+    const buf = heap.kmallocAligned(4096, 4096) orelse return err(ENOMEM);
+    defer heap.kfree(buf);
+    var done: u64 = 0;
+    while (done < want) {
+        const chunk: u32 = @intCast(@min(want - done, 4096));
+        const got = vfs.readThroughCache(in_fe.inode, in_off, buf, chunk);
+        if (got == 0) break;
+        const put = vfs.write(pcb, @intCast(out_fd), buf, got);
+        if (put >= errno.ERR_SENTINEL_BASE) {
+            if (done > 0) break;
+            return vfsResult(put);
+        }
+        done += put;
+        in_off += put;
+        if (put < got) break;
+    }
+    if (off_va != 0) @as(*u64, @ptrFromInt(off_va)).* = in_off else in_fe.offset = in_off;
     return done;
 }
 
@@ -729,28 +886,6 @@ fn sysGetrandom(buf_va: u64, len: u64, flags: u64) u64 {
     if (!common.validateUserPtrWrite(buf_va, n)) return err(EFAULT);
     _ = random.fillRandom(@as([*]u8, @ptrFromInt(buf_va))[0..n]);
     return n;
-}
-
-/// Linux stack_t.
-const StackT = extern struct { sp: u64, flags: i32, _pad: u32 = 0, size: u64 };
-const SS_DISABLE: i32 = 2;
-const SS_AUTODISARM: i32 = @bitCast(@as(u32, 1 << 31));
-const MINSIGSTKSZ: u64 = 2048;
-
-/// sigaltstack(ss, old): checked and accepted, and reported as none. No
-/// Linux signal handler runs yet, so no alternate stack is ever used.
-fn sysSigaltstack(ss_va: u64, old_va: u64) u64 {
-    if (ss_va != 0) {
-        if (!common.validateUserPtrAligned(ss_va, @sizeOf(StackT), 8)) return err(EFAULT);
-        const ss = @as(*const StackT, @ptrFromInt(ss_va)).*;
-        if (ss.flags & ~(SS_DISABLE | SS_AUTODISARM) != 0) return err(EINVAL);
-        if (ss.flags & SS_DISABLE == 0 and ss.size < MINSIGSTKSZ) return err(ENOMEM);
-    }
-    if (old_va != 0) {
-        if (!common.validateUserPtrWriteAligned(old_va, @sizeOf(StackT), 8)) return err(EFAULT);
-        @as(*StackT, @ptrFromInt(old_va)).* = .{ .sp = 0, .flags = SS_DISABLE, .size = 0 };
-    }
-    return 0;
 }
 
 const RLIMIT_STACK: u64 = 3;
@@ -774,7 +909,10 @@ fn rlimitOf(resource: u64) Rlimit {
 /// effect.
 fn sysPrlimit(pid: u64, resource: u64, new_va: u64, old_va: u64) u64 {
     const me = proc() orelse return err(EFAULT);
-    if (pid != 0 and pid != me.tgid and pid != process.getCurrentPid()) return err(ESRCH);
+    if (pid != 0) {
+        const slot = pid_nr.slotOf(pid) orelse return err(ESRCH);
+        if (process.procs[slot].tgid != me.tgid) return err(ESRCH);
+    }
     if (resource >= RLIMIT_NLIMITS) return err(EINVAL);
     if (new_va != 0) {
         if (!common.validateUserPtr(new_va, @sizeOf(Rlimit))) return err(EFAULT);
@@ -792,9 +930,8 @@ fn sysPrlimit(pid: u64, resource: u64, new_va: u64, old_va: u64) u64 {
 /// bytes written, which is what the syscall returns), for any live task.
 fn sysSchedGetaffinity(pid: u64, len: u64, mask_va: u64) u64 {
     if (pid != 0) {
-        if (pid >= process.MAX_PROCS) return err(ESRCH);
-        const s = process.procs[pid].state;
-        if (s == .unused or s == .zombie) return err(ESRCH);
+        const slot = pid_nr.slotOf(pid) orelse return err(ESRCH);
+        if (process.procs[slot].state == .zombie) return err(ESRCH);
     }
     if (len < 8 or len & 7 != 0) return err(EINVAL);
     if (!common.validateUserPtrWrite(mask_va, 8)) return err(EFAULT);

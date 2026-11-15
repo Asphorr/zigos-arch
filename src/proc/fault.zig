@@ -450,24 +450,34 @@ fn interruptsEnabled() bool {
     return flags & 0x200 != 0;
 }
 
-/// A kernel-mode write-protection fault on a user page: a syscall body
-/// writing to memory it validated earlier, after a sibling thread's fork made
-/// the page copy-on-write again, or a peer's promote left this CPU a stale
-/// read-only entry. Resolved as the ring-3 fault is; the caller then returns
-/// to the faulting instruction. Only where sleeping for the address-space
-/// lock is legal — interrupts were on, user access was open, no spinlock is
-/// held, the lock is not already ours — and only for the address space that
-/// is loaded. Anything else stays a kernel fault. Called with interrupts off.
+/// A kernel-mode fault on a user page: a syscall body touching memory it
+/// validated earlier, after the page changed under it — a sibling thread's
+/// fork made it copy-on-write, an eviction sent it to swap, an munmap or
+/// mprotect took it away. Resolved as the ring-3 fault is; the caller then
+/// returns to the faulting instruction. Only where sleeping for the
+/// address-space lock is legal — interrupts were on, user access was open,
+/// no spinlock is held, the lock is not already ours — and only for the
+/// address space that is loaded. A page that is not present may need the
+/// file system or the swap device, so that case also wants no sleeping lock
+/// held at all. Anything else stays a kernel fault. Called with interrupts
+/// off.
+///
+/// What can't be resolved — no region, a read-only page, no memory — kills
+/// the process, as the signal would have had ring 3 made the access, if it
+/// holds no sleeping lock; the call does not return then.
 ///
 /// The wait for the lock is a sleep like any other and consumes a pending
-/// wake: a waiter must not store to user memory between its last re-check
-/// and its park, or the wake meant for the park can be spent here.
-pub fn handleKernelWriteFault(cr2: usize, error_code: u64, saved_rflags: u64) bool {
+/// wake: a waiter must not touch user memory between its last re-check and
+/// its park, or the wake meant for the park can be spent here.
+pub fn handleKernelUserFault(cr2: usize, error_code: u64, saved_rflags: u64, saved_rip: u64) bool {
     const paging = @import("../mm/paging.zig");
     const RFLAGS_IF: u64 = 1 << 9;
     const RFLAGS_AC: u64 = 1 << 18;
-    // Present, write, supervisor and nothing else (reserved bit, PK, SS).
-    if (error_code & 0xFFFF != 0x3) return false;
+    // A supervisor data access to a page that is absent (read or write) or
+    // write-protected: no reserved bit, fetch, PK or SS.
+    const ec = error_code & 0xFFFF;
+    const absent = ec & ~@as(u64, 0x2) == 0;
+    if (!absent and ec != 0x3) return false;
     if (saved_rflags & RFLAGS_IF == 0) return false;
     if (@import("../cpu/arch/protect.zig").smap_enabled and saved_rflags & RFLAGS_AC == 0) return false;
     if (!@import("../mm/memmap.zig").userDataRangeOk(cr2, 1)) return false;
@@ -482,24 +492,55 @@ pub fn handleKernelWriteFault(cr2: usize, error_code: u64, saved_rflags: u64) bo
     if (cr3 & paging.PAGE_MASK != pd_phys) return false;
     const lead = leader(pcb);
     if (lead.as_lock.heldByCurrent(null)) return false;
+    const lock_free = @atomicLoad(u16, &pcb.sleep_locks, .monotonic) == 0 and
+        @atomicLoad(u16, &pcb.nokill, .monotonic) == 0;
+    if (absent and !lock_free) return false;
 
     asm volatile ("sti");
     const page = cr2 & ~@as(usize, 0xFFF);
     // Past waiting writers: the interrupted code may hold a sleeping lock
     // that a reader ahead of such a writer is waiting for.
     lead.as_lock.acquireReadPassingWriters();
-    const user_rw = paging.PRESENT | paging.READ_WRITE | paging.USER;
-    var writable = false;
-    var attempt: u8 = 0;
-    while (attempt < 2) : (attempt += 1) {
-        breakCow(pd, lead, page);
-        const pte = if (findUserPte(pd, page)) |pte_ptr| pte_ptr.* else 0;
-        writable = pte & user_rw == user_rw;
-        // Still copy-on-write: no frame for the copy. Shed cache pages once.
-        if (writable or pte & paging.COW == 0 or pmm.tryReclaim(1) == 0) break;
+    var resolved = false;
+    var why: []const u8 = "not writable";
+    var status: u32 = 0xDEAD0000 | 11;
+    if (absent) {
+        // As the ring-3 fault of the same access; what it maps read-only
+        // (a private file page) faults again for the write, into the branch
+        // below.
+        switch (resolveFault(cur, pcb, pd, lead, cr2, ec | 0x4)) {
+            .handled => resolved = true,
+            .unhandled => why = "no page",
+            .oom_kill => {
+                why = "out of memory";
+                status = 0xDEAD0000 | 9;
+            },
+        }
+    } else {
+        const user_rw = paging.PRESENT | paging.READ_WRITE | paging.USER;
+        var attempt: u8 = 0;
+        while (attempt < 2) : (attempt += 1) {
+            breakCow(pd, lead, page);
+            const pte = if (findUserPte(pd, page)) |pte_ptr| pte_ptr.* else 0;
+            resolved = pte & user_rw == user_rw;
+            // Still copy-on-write: no frame for the copy. Shed cache pages once.
+            if (resolved or pte & paging.COW == 0 or pmm.tryReclaim(1) == 0) break;
+        }
     }
     lead.as_lock.releaseRead();
-    if (!writable) {
+    if (resolved) {
+        asm volatile ("invlpg (%[addr])"
+            :
+            : [addr] "r" (page),
+            : .{ .memory = true }
+        );
+        const n = @atomicRmw(u64, &kernel_user_faults, .Add, 1, .monotonic) + 1;
+        if (n & (n - 1) == 0) debug.klog("[pf] pid={d} kernel {s} of user 0x{X} resolved in the fault path ({d} so far)\n", .{
+            cur, if (ec & 0x2 != 0) "write" else "read", cr2, n,
+        });
+        return true;
+    }
+    if (!lock_free) {
         // Other faults may have run on this CPU, or the task moved: the
         // caller's report reads the address from CR2.
         asm volatile ("cli; mov %[a], %%cr2"
@@ -508,18 +549,23 @@ pub fn handleKernelWriteFault(cr2: usize, error_code: u64, saved_rflags: u64) bo
         );
         return false;
     }
-    asm volatile ("invlpg (%[addr])"
-        :
-        : [addr] "r" (page),
-        : .{ .memory = true }
-    );
-    const n = @atomicRmw(u64, &kernel_write_faults, .Add, 1, .monotonic) + 1;
-    if (n & (n - 1) == 0) debug.klog("[pf] pid={d} kernel write to 0x{X} resolved in the fault path ({d} so far)\n", .{ cur, cr2, n });
-    return true;
+    debug.klog("[pf] pid={d} '{s}' kernel {s} of user 0x{X} at rip=0x{X} can't be resolved ({s}) — killing the process\n", .{
+        cur,
+        pcb.name[0..@min(pcb.name_len, pcb.name.len)],
+        if (ec & 0x2 != 0) "write" else "read",
+        cr2,
+        saved_rip,
+        why,
+    });
+    process.dumpSyscallRing(@intCast(cur));
+    @import("../cpu/arch/protect.zig").disallowUserAccess();
+    process.killThreadGroup(pcb.tgid, status);
+    process.schedule();
+    unreachable;
 }
 
-/// Kernel-mode write faults handleKernelWriteFault resolved, since boot.
-var kernel_write_faults: u64 = 0;
+/// Kernel-mode faults on user pages handleKernelUserFault resolved, since boot.
+var kernel_user_faults: u64 = 0;
 
 /// Free up to `want` physical frames by evicting cold, present, non-COW pages
 /// of `lead`'s lazy regions out to swap (Phase 2: intra-process only). A

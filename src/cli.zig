@@ -879,27 +879,17 @@ fn cmdDump(pid_str: []const u8) void {
 
     // Open file descriptors
     var open_fds: u32 = 0;
-    for (pcb.fd_table, 0..) |fd, i| {
-        if (fd.in_use) {
-            if (open_fds == 0) {
-                vga.fg = .Yellow;
-                vga.print("  File Descriptors:\n", .{});
-                vga.fg = .LightGray;
-            }
-            const fs_name: []const u8 = switch (fd.fs_type) {
-                .console => "console",
-                .fat32 => "fat32",
-                .tarfs => "tarfs",
-                .pipe => "pipe",
-                .devfs => "devfs",
-                .procfs => "procfs",
-                .ext2 => "ext2",
-                .tcp_sock => "tcp_sock",
-                .tcp_listener => "tcp_listener",
-            };
-            vga.print("    fd={d} {s} offset={d}\n", .{ i, fs_name, fd.offset });
-            open_fds += 1;
+    const file_mod = @import("fs/file.zig");
+    for (0..pcb.fd_table.len) |i| {
+        const f = file_mod.get(pcb, i) orelse continue;
+        defer file_mod.put(f);
+        if (open_fds == 0) {
+            vga.fg = .Yellow;
+            vga.print("  File Descriptors:\n", .{});
+            vga.fg = .LightGray;
         }
+        vga.print("    fd={d} {s} offset={d} refs={d}\n", .{ i, @tagName(f.kind), f.offset, f.refs });
+        open_fds += 1;
     }
 
     // Symbol info

@@ -223,12 +223,21 @@ export fn doSyscall(sys_num: u32, arg1: u32, arg2: u32, arg3: u32, frame_raw: ?*
     if (cur_pcb) |pcb| {
         if (pcb.personality == .linux) {
             const f = frame orelse return @as(u64, E_NOSYS);
+            const linux = @import("syscall/linux.zig");
+            const linux_signal = @import("syscall/linux_signal.zig");
             beginBody(pcb, false);
             const lprof = @import("../debug/linux_prof.zig");
             const t0 = lprof.now();
-            const r = @import("syscall/linux.zig").dispatch(sys_num, f);
+            // rt_sigreturn's result is a register it put back, not a
+            // call's: nothing in it says to run the call again.
+            const back = sys_num == linux.SYS_rt_sigreturn;
+            const done = if (back) linux_signal.rtSigreturn(pcb, f) else linux.dispatch(sys_num, f);
             lprof.syscall(sys_num, t0);
+            // Signals are delivered inside the body, where waiting for the
+            // address-space lock is allowed.
+            const r = linux_signal.syscallExit(pcb, f, sys_num, done, !back);
             endBody(pcb);
+            checkSleepLocks(pcb, sys_num);
             dieIfKilled();
             return r;
         }
@@ -248,13 +257,14 @@ export fn doSyscall(sys_num: u32, arg1: u32, arg2: u32, arg3: u32, frame_raw: ?*
     beginBody(cur_pcb, bodyKeepsIrqOff(sys_num));
     const ret = doSyscallInner(sys_num, arg1, arg2, arg3, frame);
     endBody(cur_pcb);
+    if (cur_pcb) |pcb| checkSleepLocks(pcb, sys_num);
     dieIfKilled();
 
     // Check pending signals on the way out. Skips if the dispatcher already
     // killed the process (currentPCB returns null after destroyCurrent), and
     // is a no-op when the process is mid-handler (in_signal_handler == true).
     if (process.currentPCB()) |pcb| {
-        if (frame) |f| if ((@atomicLoad(u32, &pcb.pending_signals, .acquire) & ~pcb.signal_mask) != 0) {
+        if (frame) |f| if (signals.deliverable(pcb) != 0) {
             return @as(u64, signals.deliverFromSyscallFrame(pcb, f, ret));
         };
     }
@@ -269,6 +279,19 @@ fn dieIfKilled() void {
     if (pcb.is_idle or !process.doomed(pid) or @atomicLoad(bool, &pcb.teardown_marked, .acquire)) return;
     process.destroyCurrentWithStatus(pcb.exit_status);
 }
+
+/// A syscall that ends with a sleeping lock still counted against its task
+/// leaked the lock, or the count drifted (PCB.sleep_locks); kernel-mode
+/// faults on user pages go unserved for such a task. The first few are
+/// logged.
+fn checkSleepLocks(pcb: *const process.PCB, sys_num: u32) void {
+    const held = @atomicLoad(u16, &pcb.sleep_locks, .monotonic);
+    if (held == 0) return;
+    if (@atomicRmw(u32, &sleep_lock_reports, .Add, 1, .monotonic) >= 8) return;
+    debug.klog("[lock] pid={d} leaves sys#{d} with {d} sleeping lock(s) counted\n", .{ process.getCurrentPid(), sys_num, held });
+}
+
+var sleep_lock_reports: u32 = 0;
 
 // ===========================================================================
 // Syscall registry — single source of truth for the system-call ABI.

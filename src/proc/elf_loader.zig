@@ -82,9 +82,11 @@ const PAGE_SIZE: usize = 4096;
 
 // Apps link at USER_VA_FLOOR (app/linker.ld); any ELF segment below that is
 // suspicious — almost always means someone tried to launch kernel.elf or a
-// UEFI binary from the file browser.
-fn isUserVA(addr: usize, size: usize) bool {
-    return memmap.userCodeRangeOk(addr, size);
+// UEFI binary from the file browser. A Linux image has its stack at the top
+// of the window, not under the load base, and may start at the window's
+// bottom: 0x400000 is where ld puts an x86-64 executable that isn't PIE.
+fn isUserVA(addr: usize, size: usize, linux: bool) bool {
+    return if (linux) memmap.userDataRangeOk(addr, size) else memmap.userCodeRangeOk(addr, size);
 }
 
 const ELFOSABI_LINUX: u8 = 3;
@@ -104,19 +106,20 @@ const Layout = struct {
 /// The image is Linux if its EI_OSABI says so or `linux` is set. Null if a
 /// segment is out of range.
 fn layoutFor(header: Header, phdrs: [*]align(1) const ProgramHeader, linux: bool) ?Layout {
+    const is_linux = linux or header.ident[7] == ELFOSABI_LINUX;
     var end: usize = 0;
     for (0..header.phnum) |i| {
         if (phdrs[i].p_type != PT_LOAD_T) continue;
         const p_vaddr: usize = @intCast(phdrs[i].p_vaddr);
         const p_memsz: usize = @intCast(phdrs[i].p_memsz);
-        if (!isUserVA(p_vaddr, p_memsz)) {
+        if (!isUserVA(p_vaddr, p_memsz, is_linux)) {
             debug.klog("[elf] Rejected: segment 0x{X}+{d} outside user VA\n", .{ p_vaddr, p_memsz });
             return null;
         }
         end = @max(end, p_vaddr + p_memsz);
     }
     const image_end = (end + PAGE_SIZE - 1) & ~@as(usize, PAGE_SIZE - 1);
-    if (linux or header.ident[7] == ELFOSABI_LINUX) {
+    if (is_linux) {
         const stack_base: usize = memmap.USER_SPACE_END - memmap.LINUX_STACK_RESERVE;
         if (image_end > stack_base) {
             debug.klog("[elf] Rejected: image ends at 0x{X}, in the stack region\n", .{image_end});
@@ -240,7 +243,8 @@ fn registerSegments(pid: usize, elf_buf: [*]const u8, phoff: usize, phnum: u16, 
         const p_filesz: usize = @intCast(phdrs[i].p_filesz);
         const p_offset: usize = @intCast(phdrs[i].p_offset);
         const p_flags = phdrs[i].p_flags;
-        if (!isUserVA(p_vaddr, p_memsz)) {
+        // layoutFor held each segment to its personality's window already.
+        if (!memmap.userDataRangeOk(p_vaddr, p_memsz)) {
             debug.klog("[elf] segment 0x{X}+{d} outside user VA\n", .{ p_vaddr, p_memsz });
             return null;
         }
@@ -769,7 +773,8 @@ fn startImage(img: Image, header: Header, launch: ?LaunchInfo) ?usize {
     const phdrs: [*]align(1) const ProgramHeader = @ptrCast(img.bytes() + phoff);
 
     const entry_addr: usize = @intCast(header.entry);
-    if (!isUserVA(entry_addr, 1)) {
+    const from_linux = if (launch) |li| li.exec_args != null else false;
+    if (!isUserVA(entry_addr, 1, from_linux or header.ident[7] == ELFOSABI_LINUX)) {
         debug.klog("[elf] Rejected: entry 0x{X} outside user VA range\n", .{entry_addr});
         img.drop();
         return null;

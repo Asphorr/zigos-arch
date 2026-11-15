@@ -49,14 +49,14 @@ export fn handleSegv(signo: u32, info: *anyopaque, uc: *anyopaque) void {
     sigsegv_caught = true;
     libc.print("[sigtest] caught SIGSEGV — exiting\n");
     libc.print("\x1b[32m[sigtest] OK (raise/kill/alarm/segv)\x1b[0m\n");
-    libc.exit();
+    libc.exitWith(0xCAFE0045);
 }
 
 fn fail(step: []const u8) noreturn {
     libc.print("\x1b[31m[sigtest] FAIL: ");
     libc.print(step);
     libc.print("\x1b[0m\n");
-    libc.exit();
+    libc.exitWith(0xDEAD0045);
 }
 
 export fn _start() linksection(".text.entry") callconv(.c) void {

@@ -33,6 +33,13 @@ pub const MAX_PIPES: u8 = config.MAX_PIPES;
 /// vfs.VFS_ERR, so the vfs pipe arms' @intCast passes it straight through.
 pub const PIPE_ERR: usize = 0xFFFF_FFFF;
 
+/// read() and write() cut short by a signal for the caller before any byte
+/// moved: not an end of file, not a full write of nothing.
+pub const PIPE_INTR: usize = 0xFFFF_FFF1;
+
+/// write() with the read side fully closed.
+pub const PIPE_CLOSED: usize = 0xFFFF_FFF2;
+
 pub const Pipe = struct {
     /// Ring contents are contract-undefined while the slot is unclaimed
     /// — slot_table.claim skips resetting them (see claim_skip_reset).
@@ -227,7 +234,7 @@ pub fn read(id: u8, out: []u8) usize {
             if (p.blocked_reader_pid == my_pid) p.blocked_reader_pid = 0xFF;
             p.lock.releaseIrqRestore(f2);
             if (freed_space) fdpoll.wakePollers(.pipe, id);
-            return copied;
+            return if (copied > 0) copied else PIPE_INTR;
         }
         // Loop: re-check for data
     }
@@ -289,10 +296,10 @@ pub fn write(id: u8, data: []const u8) usize {
     while (written < data.len) {
         const flags = p.lock.acquireIrqSave();
         if (p.readers == 0) {
-            // No one to read this. Treat as EPIPE.
+            // No one to read this: EPIPE, whatever went in before.
             p.lock.releaseIrqRestore(flags);
             if (pushed_data) fdpoll.wakePollers(.pipe, id);
-            return PIPE_ERR;
+            return PIPE_CLOSED;
         }
 
         if (p.count < PIPE_BUF_SIZE) {
@@ -361,7 +368,7 @@ pub fn write(id: u8, data: []const u8) usize {
             if (p.blocked_writer_pid == my_pid) p.blocked_writer_pid = 0xFF;
             p.lock.releaseIrqRestore(f2);
             if (pushed_data) fdpoll.wakePollers(.pipe, id);
-            return written;
+            return if (written > 0) written else PIPE_INTR;
         }
     }
     if (pushed_data) fdpoll.wakePollers(.pipe, id);

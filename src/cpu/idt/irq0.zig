@@ -602,7 +602,7 @@ fn reportSoftLockup(pid: usize, pcb: *const process.PCB, rip: u64) void {
 fn deliverPendingToReturnFrame(cpu: *@import("../smp.zig").CpuLocal, new_rsp: u64) void {
     const cur_pid = cpu.current_pid orelse return;
     const pcb = process.getPCB(cur_pid);
-    if ((@atomicLoad(u32, &pcb.pending_signals, .acquire) & ~pcb.signal_mask) == 0) return;
+    if (signals.deliverable(pcb) == 0) return;
     if (pcb.in_signal_handler) return;
     const frame: *signals.IrqFrame = @ptrFromInt(new_rsp);
     if ((frame.cs & 3) == 0) return; // returning to kernel — no handler call

@@ -11,6 +11,7 @@ const pmm = @import("../../mm/pmm.zig");
 const paging = @import("../../mm/paging.zig");
 const bga = @import("../../ui/bga.zig");
 const vfs = @import("../../fs/vfs.zig");
+const file = @import("../../fs/file.zig");
 const desktop = @import("../../ui/desktop.zig");
 const xhci = @import("../../driver/xhci.zig");
 const debug = @import("../../debug/debug.zig");
@@ -20,6 +21,8 @@ const memmap = @import("../../mm/memmap.zig");
 const config = @import("../../config.zig");
 const smp = @import("../smp.zig");
 const signals = @import("../../proc/signals.zig");
+const pid_nr = @import("../../proc/pid_nr.zig");
+const session = @import("../../proc/session.zig");
 const errno = @import("../../proc/errno.zig");
 const sched_asm = @import("../../proc/sched_asm.zig");
 const apic = @import("../../time/apic.zig");
@@ -106,7 +109,7 @@ pub fn sysForkPlaceholder() u32 {
 /// `cpu.syscall.sysFork` and panics as a wild writer. Same gotcha as
 /// cloneCurrent's caller — see memory note `feedback_watch_whitelist_inlining`.
 pub fn sysFork(frame: *signals.SyscallFrame) u32 {
-    if (@call(.never_inline, process.forkCurrent, .{frame})) |child_pid| {
+    if (@call(.never_inline, process.forkCurrent, .{ frame, process.ForkSpec{} })) |child_pid| {
         return @intCast(child_pid);
     }
     return E_AGAIN;
@@ -124,20 +127,18 @@ pub fn sysFork(frame: *signals.SyscallFrame) u32 {
 /// calling setsid in a freshly-forked CHILD, which has its own pid
 /// distinct from any pgid in the system.
 pub fn sysSetsid() u32 {
-    const pcb = process.currentPCB() orelse return E_FAULT;
-    const my_pid: u8 = @intCast(process.getCurrentPid());
-    // Group-leader check: scan for any other live process whose pgid ==
-    // my_pid. If found, refuse — we'd orphan that group otherwise.
-    var i: u8 = 0;
-    while (i < process.MAX_PROCS) : (i += 1) {
-        if (i == my_pid) continue;
-        const st = process.getStateRaw(i);
-        if (st == @intFromEnum(process.State.unused)) continue;
-        if (process.getPCB(i).pgid == my_pid) return E_PERM;
-    }
-    pcb.sid = my_pid;
-    pcb.pgid = my_pid;
-    return my_pid;
+    const lead = process.leader(process.currentPCB() orelse return E_FAULT);
+    _ = session.startSession(lead) catch return E_PERM;
+    return lead.tgid;
+}
+
+/// The process a native call names by `arg_pid` (0: the caller's), or null.
+fn processArg(arg_pid: u32) ?*process.PCB {
+    if (arg_pid == 0) return process.leader(process.currentPCB() orelse return null);
+    if (arg_pid >= process.MAX_PROCS) return null;
+    const s = process.procs[arg_pid].state;
+    if (s == .unused or s == .loading) return null;
+    return process.leader(&process.procs[arg_pid]);
 }
 
 /// setpgid(pid, pgid) — move process `pid` (or self if pid==0) into the
@@ -153,35 +154,16 @@ pub fn sysSetsid() u32 {
 ///   * `pgid`, if nonzero, must already exist as some process's pgid in
 ///     the caller's session, OR equal `pid` (creating a fresh group led
 ///     by the target).
+///
+/// A group or session id is a number (pid_nr.zig); these calls give and
+/// take the slot of its leader while that process lives, so a native
+/// program goes on seeing `getpgrp() == getpid()` in a group it leads.
 pub fn sysSetpgid(arg_pid: u32, arg_pgid: u32) u32 {
-    if (arg_pid >= process.MAX_PROCS) return E_INVAL;
-    if (arg_pgid >= process.MAX_PROCS) return E_INVAL;
-    const caller = process.currentPCB() orelse return E_FAULT;
-    const my_pid: u8 = @intCast(process.getCurrentPid());
-
-    const target_pid: u8 = if (arg_pid == 0) my_pid else @intCast(arg_pid);
-    const target = process.getPCB(target_pid);
-    const tst = process.getStateRaw(target_pid);
-    if (tst == @intFromEnum(process.State.unused)) return E_SRCH;
-    if (target.sid != caller.sid) return E_PERM;
-
-    const new_pgid: u8 = if (arg_pgid == 0) target_pid else @intCast(arg_pgid);
-    if (new_pgid != target_pid) {
-        // Group must exist in caller's session.
-        var found: bool = false;
-        var i: u8 = 0;
-        while (i < process.MAX_PROCS) : (i += 1) {
-            const st = process.getStateRaw(i);
-            if (st == @intFromEnum(process.State.unused)) continue;
-            const p = process.getPCB(i);
-            if (p.pgid == new_pgid and p.sid == caller.sid) {
-                found = true;
-                break;
-            }
-        }
-        if (!found) return E_PERM;
-    }
-    target.pgid = new_pgid;
+    if (arg_pid >= process.MAX_PROCS or arg_pgid >= pid_nr.LIMIT) return E_INVAL;
+    const caller = process.leader(process.currentPCB() orelse return E_FAULT);
+    const target = processArg(arg_pid) orelse return E_SRCH;
+    const pgid = if (arg_pgid == 0) target.pid_nr else pid_nr.fromNativeId(arg_pgid);
+    session.setGroup(caller, target, pgid) catch return E_PERM;
     return 0;
 }
 
@@ -190,31 +172,21 @@ pub fn sysSetpgid(arg_pid: u32, arg_pgid: u32) u32 {
 /// kernel idle PCB would give).
 pub fn sysGetpgrp() u32 {
     const pcb = process.currentPCB() orelse return 0;
-    return pcb.pgid;
+    return pid_nr.nativeId(process.leader(pcb).pgid);
 }
 
 /// getpgid(pid) — return process `pid`'s pgid (or self if pid==0).
 pub fn sysGetpgid(arg_pid: u32) u32 {
     if (arg_pid >= process.MAX_PROCS) return E_INVAL;
-    const target_pid: u8 = if (arg_pid == 0)
-        @intCast(process.getCurrentPid())
-    else
-        @intCast(arg_pid);
-    const st = process.getStateRaw(target_pid);
-    if (st == @intFromEnum(process.State.unused)) return E_SRCH;
-    return process.getPCB(target_pid).pgid;
+    const target = processArg(arg_pid) orelse return E_SRCH;
+    return pid_nr.nativeId(target.pgid);
 }
 
 /// getsid(pid) — return process `pid`'s sid (or self if pid==0).
 pub fn sysGetsid(arg_pid: u32) u32 {
     if (arg_pid >= process.MAX_PROCS) return E_INVAL;
-    const target_pid: u8 = if (arg_pid == 0)
-        @intCast(process.getCurrentPid())
-    else
-        @intCast(arg_pid);
-    const st = process.getStateRaw(target_pid);
-    if (st == @intFromEnum(process.State.unused)) return E_SRCH;
-    return process.getPCB(target_pid).sid;
+    const target = processArg(arg_pid) orelse return E_SRCH;
+    return pid_nr.nativeId(target.sid);
 }
 
 /// Spawn a new thread that shares the calling process's address space.
@@ -428,13 +400,7 @@ fn execCommon(name_ptr: u32, name_len: u32, hold_for_caller: bool) u32 {
                 // so @memcpy doesn't trip on aliasing args.
                 if (parent != child_pcb) {
                     inline for ([_]u32{ 0, 1, 2 }) |fd| {
-                        const psrc = parent.fd_table[fd];
-                        if (psrc.in_use) {
-                            child_pcb.fd_table[fd] = psrc;
-                            if (psrc.fs_type == .pipe) {
-                                if (psrc.flags == 0) pipe.addReader(psrc.pipe_id) else pipe.addWriter(psrc.pipe_id);
-                            }
-                        }
+                        if (file.get(parent, fd)) |f| file.assign(child_pcb, fd, f);
                     }
                     const cwd_n = parent.cwd_len;
                     @memcpy(child_pcb.cwd[0..cwd_n], parent.cwd[0..cwd_n]);
@@ -714,8 +680,9 @@ pub fn sysWaitpid(target_pid: u32, status_ptr: u32) u32 {
 /// way out of THIS syscall via deliverFromSyscallFrame.
 pub fn sysKill(target_pid: u32, sig: u32) u32 {
     if (target_pid == 0 or target_pid >= process.MAX_PROCS) return E_INVAL;
-    if (sig == 0 or sig >= signals.NSIG) return E_INVAL;
-    if (!signals.send(@intCast(target_pid), sig)) return E_INVAL;
+    if (sig == 0 or sig >= signals.NATIVE_NSIG) return E_INVAL;
+    const sender = if (process.currentPCB()) |me| process.leader(me).pid_nr else 0;
+    if (!signals.killProcess(@intCast(target_pid), sig, .{ .code = signals.SI_USER_CODE, .pid = sender })) return E_INVAL;
     return 0;
 }
 
@@ -724,21 +691,21 @@ pub fn sysKill(target_pid: u32, sig: u32) u32 {
 /// SIGSTOP are silently ignored — caller can read the old action but can't
 /// change the disposition.
 pub fn sysSigaction(signum: u32, new_ptr: u32, old_ptr: u32) u32 {
-    if (signum == 0 or signum >= signals.NSIG) return E_INVAL;
+    if (signum == 0 or signum >= signals.NATIVE_NSIG) return E_INVAL;
     const pcb = process.currentPCB() orelse return E_FAULT;
     const slot = &pcb.sigactions[signum];
 
     if (old_ptr != 0) {
         if (!validateUserPtrWriteAligned(old_ptr, @sizeOf(signals.SigAction), @alignOf(signals.SigAction))) return E_INVAL;
         const op: *signals.SigAction = @ptrFromInt(@as(usize, old_ptr));
-        op.* = slot.*;
+        op.* = slot.toNative();
     }
     if (new_ptr != 0) {
         if (!validateUserPtrAligned(new_ptr, @sizeOf(signals.SigAction), @alignOf(signals.SigAction))) return E_INVAL;
         const np: *const signals.SigAction = @ptrFromInt(@as(usize, new_ptr));
         // SIGKILL / SIGSTOP keep their default disposition no matter what.
         if (signum == signals.SIGKILL or signum == signals.SIGSTOP) return 0;
-        slot.* = np.*;
+        slot.* = signals.Disposition.fromNative(np.*);
     }
     return 0;
 }
@@ -751,14 +718,13 @@ pub fn sysSigprocmask(how: u32, set_ptr: u32, old_ptr: u32) u32 {
     if (old_ptr != 0) {
         if (!validateUserPtrWriteAligned(old_ptr, 4, 4)) return E_FAULT;
         const op: *u32 = @ptrFromInt(@as(usize, old_ptr));
-        op.* = pcb.signal_mask;
+        op.* = signals.toNativeSet(pcb.signal_mask);
     }
     if (set_ptr != 0) {
         if (!validateUserPtrAligned(set_ptr, 4, 4)) return E_FAULT;
         const sp: *const u32 = @ptrFromInt(@as(usize, set_ptr));
-        const new_set = sp.*;
-        const filter = ~((@as(u32, 1) << @intCast(signals.SIGKILL)) |
-            (@as(u32, 1) << @intCast(signals.SIGSTOP)));
+        const new_set = signals.fromNativeSet(sp.*);
+        const filter = ~signals.UNBLOCKABLE;
         switch (how) {
             signals.SIG_BLOCK => pcb.signal_mask |= new_set & filter,
             signals.SIG_UNBLOCK => pcb.signal_mask &= ~new_set,
@@ -782,7 +748,7 @@ pub fn sysSigpending(set_ptr: u32) u32 {
     const UserPtr = @import("../../util/user_ptr.zig").UserPtr;
     const up = UserPtr(u32).fromRaw(set_ptr).validateWrite() orelse return E_FAULT;
     const pcb = process.currentPCB() orelse return E_FAULT;
-    const value = @atomicLoad(u32, &pcb.pending_signals, .acquire) & pcb.signal_mask;
+    const value = signals.toNativeSet(@atomicLoad(u64, &pcb.pending_signals, .acquire) & pcb.signal_mask);
     if (!up.copyOut(value)) return E_FAULT;
     return 0;
 }
@@ -799,9 +765,7 @@ pub fn sysSigsuspend(mask_ptr: u32) u32 {
     if (!validateUserPtrAligned(mask_ptr, 4, 4)) return E_FAULT;
     const pcb = process.currentPCB() orelse return E_FAULT;
     const mp: *const u32 = @ptrFromInt(@as(usize, mask_ptr));
-    const filter = ~((@as(u32, 1) << @intCast(signals.SIGKILL)) |
-        (@as(u32, 1) << @intCast(signals.SIGSTOP)));
-    pcb.signal_mask = mp.* & filter;
+    pcb.signal_mask = signals.fromNativeSet(mp.*) & ~signals.UNBLOCKABLE;
 
     // Park until a deliverable signal lands. Same idiom as sysSleep: state =
     // .sleeping + soft yield; signals.send → process.wake → re-check.
@@ -889,6 +853,12 @@ const ProcInfoUser = extern struct {
     _pad3: [4]u8 = .{ 0, 0, 0, 0 }, // pad to 88 bytes (multiple of 8)
 };
 
+/// A group or session id in ProcInfoUser's byte: its leader's slot, or 0xFF
+/// once that process is gone.
+fn leaderSlotByte(nr: u32) u8 {
+    return pid_nr.slotOf(nr) orelse 0xFF;
+}
+
 /// process_list(buf, max) — fill the user buffer with one ProcInfoUser per
 /// active (non-unused) process slot. Returns the count written. The caller
 /// passes max_entries = buf.len / sizeof(ProcInfoUser); we cap at MAX_PROCS
@@ -923,8 +893,8 @@ pub fn sysProcessList(buf_ptr: u32, max_entries: u32) u32 {
             .current_rss_pages = pcb.acct_current_rss,
             .start_tick = pcb.acct_start_tick,
             .tgid = pcb.tgid,
-            .pgid = pcb.pgid,
-            .sid = pcb.sid,
+            .pgid = leaderSlotByte(pcb.pgid),
+            .sid = leaderSlotByte(pcb.sid),
             .nice = pcb.nice,
             .assigned_cpu = pcb.assigned_cpu,
             .pinned_cpu = pcb.pinned_cpu,
@@ -1001,7 +971,7 @@ pub fn sysExecAs(name_ptr: u32, name_len: u32, remap_ptr: u32) u32 {
         const pf = remap[i].parent_fd;
         const cf = remap[i].child_fd;
         if (pf >= parent_pcb.fd_table.len or cf >= parent_pcb.fd_table.len) return E_INVAL;
-        if (!parent_pcb.fd_table[pf].in_use) return E_INVAL;
+        if (parent_pcb.fd_table[pf].file == null) return E_INVAL;
     }
 
     // Run the exec path with the child HELD (.loading) so the remaps below
@@ -1011,25 +981,16 @@ pub fn sysExecAs(name_ptr: u32, name_len: u32, remap_ptr: u32) u32 {
     const child_pid = execCommon(name_ptr, name_len, true);
     if (child_pid == 0xFFFFFFFF) return E_INVAL;
 
-    // Apply remaps + bump pipe refcounts so parent-side closes don't drop the
-    // last reference while the child is still using the inherited fd. sysExec
-    // already inherited fd 0/1/2 from the parent above, so a remap targeting
-    // one of those slots may be replacing an inherited pipe — drop its
-    // refcount before installing the new entry, otherwise we leak.
+    // Apply the remaps: the child's slot shares the parent's file, so a
+    // parent-side close doesn't drop it while the child still uses it.
+    // sysExec already inherited fd 0/1/2 from the parent above; what a remap
+    // displaces there loses the child's reference.
     const child = process.getPCB(@intCast(child_pid));
     child.parent_pid = parent_pid;
     for (0..n_remap) |i| {
-        const pf = remap[i].parent_fd;
-        const cf = remap[i].child_fd;
-        const old = child.fd_table[cf];
-        if (old.in_use and old.fs_type == .pipe) {
-            if (old.flags == 0) pipe.closeReader(old.pipe_id) else pipe.closeWriter(old.pipe_id);
-        }
-        const src = parent_pcb.fd_table[pf];
-        child.fd_table[cf] = src;
-        if (src.fs_type == .pipe) {
-            if (src.flags == 0) pipe.addReader(src.pipe_id) else pipe.addWriter(src.pipe_id);
-        }
+        // Another thread of the parent may have closed it since the check.
+        const f = file.get(parent_pcb, remap[i].parent_fd) orelse continue;
+        file.assign(child, remap[i].child_fd, f);
     }
 
     // Child fully wired — release it. assignInitialCpu BEFORE setState
@@ -1103,7 +1064,7 @@ pub fn sysUsleep(usec: u32) u32 {
     while (!hrtimer.due(perf.rdtsc(), deadline)) {
         // Interruptible: a pending, unmasked signal ends the sleep so it's
         // delivered on syscall return rather than after the full duration.
-        if ((@atomicLoad(u32, &pcb.pending_signals, .acquire) & ~pcb.signal_mask) != 0) break;
+        if (signals.deliverable(pcb) != 0) break;
         // Sub-floor remainder (woken a hair early, or usec barely over the
         // floor): spin it out rather than pay another deschedule round-trip.
         if (hrtimer.due(perf.rdtsc() +% floor_tsc, deadline)) {

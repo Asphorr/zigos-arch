@@ -11,6 +11,7 @@ const pmm = @import("../../mm/pmm.zig");
 const paging = @import("../../mm/paging.zig");
 const bga = @import("../../ui/bga.zig");
 const vfs = @import("../../fs/vfs.zig");
+const file = @import("../../fs/file.zig");
 const desktop = @import("../../ui/desktop.zig");
 const xhci = @import("../../driver/xhci.zig");
 const debug = @import("../../debug/debug.zig");
@@ -103,15 +104,16 @@ pub fn sysClose(fd: u32) u32 {
 /// Returns the new offset on success, or 0xFFFFFFFF on bad fd / overflow.
 pub fn sysSeek(fd: u32, offset: u32, whence: u32) u32 {
     const pcb = process.currentPCB() orelse return E_FAULT;
-    if (fd >= pcb.fd_table.len or !pcb.fd_table[fd].in_use) return 0xFFFFFFFF;
     if (fd < 3) return 0xFFFFFFFF;
-    const fd_entry = &pcb.fd_table[fd];
+    const f = file.get(pcb, fd) orelse return 0xFFFFFFFF;
+    defer file.put(f);
+    // The native ABI counts offsets in 32 bits.
     const new_off: u32 = switch (whence) {
         0 => offset,
-        1 => fd_entry.offset +% offset,
+        1 => @as(u32, @truncate(f.offset)) +% offset,
         else => return 0xFFFFFFFF,
     };
-    fd_entry.offset = new_off;
+    f.offset = new_off;
     return new_off;
 }
 
@@ -347,11 +349,23 @@ pub fn changeDir(pcb: *process.PCB, path: []const u8) ChdirError!void {
         abs_len += path.len;
     }
 
-    // Normalize: strip duplicate slashes, drop "." components, and resolve
-    // ".." by popping the previous component. ".." at or above the first
-    // component is clamped (stays at the mount root) instead of escaping
-    // up to "/", which has no mount and would always fail.
-    abs_len = normalizePath(&abs, abs_len);
+    // A directory on ext2 becomes the cwd under its physical name: symbolic
+    // links and ".." are followed on disk, so ".." from the new cwd leads to
+    // its real parent, and getcwd names no link.
+    const ext2_fs = @import("../../fs/ext2/ext2.zig");
+    const physical: ?usize = blk: {
+        var rb: [256]u8 = undefined;
+        const r = vfs.resolvePath(pcb, abs[0..abs_len], &rb) orelse break :blk null;
+        if (r.fs != .ext2) break :blk null;
+        const inum = ext2_fs.resolveDirInum(r.path) orelse break :blk null;
+        const p = ext2_fs.pathOf(inum, &abs) orelse return error.NotFound;
+        break :blk p.len;
+    };
+
+    // Anything else is normalized as text: strip duplicate slashes, drop "."
+    // components, and resolve ".." by popping the previous component (never
+    // the first one, the mount's).
+    abs_len = physical orelse normalizePath(&abs, abs_len);
     if (abs_len == 0) return error.Invalid;
 
     // Trailing-slash invariant: cwd always ends with '/' so resolvePath's
@@ -368,7 +382,7 @@ pub fn changeDir(pcb: *process.PCB, path: []const u8) ChdirError!void {
     //      these because it requires a non-empty rel under the mount.
     //   2. abs (sans trailing '/') resolves under some mount, AND the
     //      resolved fs confirms the path is an existing directory.
-    if (!vfs.isMountRoot(abs[0..abs_len])) {
+    if (physical == null and !vfs.isMountRoot(abs[0..abs_len])) {
         var rb: [256]u8 = undefined;
         const r = vfs.resolvePath(pcb, abs[0 .. abs_len - 1], &rb) orelse return error.NotFound;
         // Per-fs existence check. tarfs is flat (no real subdirs) so we
@@ -786,38 +800,30 @@ pub fn sysPipe(fds_ptr: u32) u32 {
     const pcb = process.currentPCB() orelse return E_FAULT;
 
     const id = pipe.alloc() orelse return E_INVAL;
-
-    // Find two free fd slots
-    var read_fd: i32 = -1;
-    var write_fd: i32 = -1;
-    for (3..pcb.fd_table.len) |i| {
-        if (pcb.fd_table[i].in_use) continue;
-        if (read_fd < 0) {
-            read_fd = @intCast(i);
-        } else {
-            write_fd = @intCast(i);
-            break;
-        }
-    }
-    if (read_fd < 0 or write_fd < 0) {
-        // Roll back the pipe allocation
+    // Each file owns its end of the pipe from here: putting it closes the end.
+    const rf = vfs.newFile(.{ .kind = .pipe, .pipe_id = id, .access = file.READ }) orelse {
         pipe.closeReader(id);
         pipe.closeWriter(id);
         return E_INVAL;
-    }
-
-    pcb.fd_table[@intCast(read_fd)] = .{
-        .in_use = true,
-        .fs_type = .pipe,
-        .pipe_id = id,
-        .flags = 0, // read end
     };
-    pcb.fd_table[@intCast(write_fd)] = .{
-        .in_use = true,
-        .fs_type = .pipe,
-        .pipe_id = id,
-        .flags = 1, // write end
+    const wf = vfs.newFile(.{ .kind = .pipe, .pipe_id = id, .access = file.WRITE }) orelse {
+        file.put(rf);
+        pipe.closeWriter(id);
+        return E_INVAL;
     };
+    const read_fd = vfs.allocFd(pcb) orelse {
+        file.put(rf);
+        file.put(wf);
+        return E_INVAL;
+    };
+    const write_fd = vfs.allocFd(pcb) orelse {
+        vfs.releaseFd(pcb, read_fd);
+        file.put(rf);
+        file.put(wf);
+        return E_INVAL;
+    };
+    file.install(pcb, read_fd, rf, false);
+    file.install(pcb, write_fd, wf, false);
 
     const out: [*]u32 = @ptrFromInt(@as(usize, fds_ptr));
     out[0] = @intCast(read_fd);

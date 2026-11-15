@@ -11,6 +11,7 @@ const pmm = @import("../../mm/pmm.zig");
 const paging = @import("../../mm/paging.zig");
 const bga = @import("../../ui/bga.zig");
 const vfs = @import("../../fs/vfs.zig");
+const file = @import("../../fs/file.zig");
 const desktop = @import("../../ui/desktop.zig");
 const xhci = @import("../../driver/xhci.zig");
 const debug = @import("../../debug/debug.zig");
@@ -62,9 +63,9 @@ pub fn sysClear() u32 {
 
 pub fn sysRead() u32 {
     const pcb = process.currentPCB() orelse return 0;
-    const fd0 = &pcb.fd_table[0];
-    if (!fd0.in_use) return 0;
-    switch (fd0.fs_type) {
+    const fd0 = file.get(pcb, 0) orelse return 0;
+    defer file.put(fd0);
+    switch (fd0.kind) {
         .console => {
             // Reads from the focused window's per-window event queue
             // (see ui/events.zig). The queue is filled only when this
@@ -98,9 +99,9 @@ pub fn sysRead() u32 {
 /// to the non-blocking sysRead behavior (console apps use poll_event anyway).
 pub fn sysReadBlocking() u32 {
     const pcb = process.currentPCB() orelse return 0;
-    const fd0 = &pcb.fd_table[0];
-    if (!fd0.in_use) return 0;
-    switch (fd0.fs_type) {
+    const fd0 = file.get(pcb, 0) orelse return 0;
+    defer file.put(fd0);
+    switch (fd0.kind) {
         .pipe => {
             var buf: [1]u8 = .{0};
             // Blocks until >=1 byte; returns 0 on EOF (writer closed) or a
@@ -448,7 +449,7 @@ pub fn sysCreateWindow(alloc_width_in: u32, alloc_height: u32, display_wh: u32) 
     // global keyboard ring, which the desktop deliberately leaves alone
     // for non-terminal focus, so the GUI app's readChar() pops it
     // directly. Apps that genuinely want pipe-stdin can re-open fd 0.
-    pcb.fd_table[0] = .{ .in_use = true, .inode = 0, .offset = 0, .flags = 0, .fs_type = .console };
+    file.assign(pcb, 0, &file.console_in);
 
     debug.klog("[syscall] GUI window created: {d}x{d} (alloc {d}x{d}) pid={d}\n", .{ disp_w, disp_h, alloc_width, alloc_height, pid });
     return @intCast(GUI_FB_BASE);

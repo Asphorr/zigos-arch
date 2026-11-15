@@ -47,6 +47,8 @@ const config = @import("../config.zig");
 const pid_set = @import("../util/pid_set.zig");
 const signals = @import("signals.zig");
 const frames = @import("frames.zig");
+const file_mod = @import("../fs/file.zig");
+const pid_nr = @import("pid_nr.zig");
 const dspec = frames.dispatch; // NOT `fd` — this file is full of file-descriptor captures
 
 const process = @import("process.zig");
@@ -145,6 +147,12 @@ fn resetPcbExceptState(pcb: *PCB) void {
         @import("../debug/save_trace.zig").resetPid(@intCast(pid));
         @import("../debug/pid_act.zig").resetPid(pid);
         @import("../debug/yield_loop.zig").resetPid(pid);
+        // A new number for the slot's new occupant. It leads a group and a
+        // session of its own until a parent's are copied in (fork, clone,
+        // sysExec).
+        pcb.pid_nr = pid_nr.assign(pid);
+        pcb.pgid = pcb.pid_nr;
+        pcb.sid = pcb.pid_nr;
     }
 }
 
@@ -194,11 +202,9 @@ pub fn create(entry: usize, user_stack: usize) ?usize {
     @atomicStore(usize, &process.expected_kstack_tops[i], stack_top, .release);
     // state already .loading from allocSlot's CAS — no further write needed.
     process.procs[i].tgid = @intCast(i);
-    // Default session/group = self. sysExec overrides these from the
-    // parent before scheduling so spawned children land in the parent's
-    // session+group (POSIX-equivalent of fork+exec preserving sid/pgid).
-    process.procs[i].pgid = @intCast(i);
-    process.procs[i].sid = @intCast(i);
+    // Session and group are its own (resetPcbExceptState). sysExec copies
+    // the parent's in before scheduling, so spawned children land in the
+    // parent's session and group, as after fork+exec.
     @import("../debug/kdbg.zig").procEvent(.create, @intCast(i), 0, 0);
     @import("../debug/kasan.zig").markPcbAlive(slot_base + KSTACK_GUARD_SIZE, KSTACK_SIZE);
     return i;
@@ -258,6 +264,9 @@ pub fn cloneCurrent(entry: usize, stack_top: usize, arg: usize, fs_base: u64) ?u
         process.setState(i, .unused);
         return null;
     }
+    // Its own table: the lead's files as they are now, each with a
+    // reference this thread's teardown drops.
+    file_mod.copyTable(&process.procs[i], parent_lead);
     process.procs[i].fs_base = fs_base;
 
     // Kernel stack image: same dispatch contract as create() but with
@@ -308,8 +317,9 @@ pub fn cloneCurrent(entry: usize, stack_top: usize, arg: usize, fs_base: u64) ?u
 /// session (a thread is not a process of its own: setpgid/setsid on it act
 /// on the lead), the address space with its PCID, and copies of the
 /// process-level state native thread code reads off its own PCB. The fd
-/// table copy is what a native thread uses; the Linux layer goes to the
-/// lead's table instead, which is how Linux threads share one.
+/// table is the caller's to set: a native thread gets a copy of the lead's,
+/// a Linux thread an empty one (the Linux layer goes to the lead's table,
+/// which is how Linux threads share one).
 fn joinGroup(child: *PCB, parent: *const PCB, parent_lead: *const PCB) void {
     child.tgid = parent_lead.tgid;
     child.pgid = parent_lead.pgid;
@@ -317,7 +327,6 @@ fn joinGroup(child: *PCB, parent: *const PCB, parent_lead: *const PCB) void {
     child.page_directory = parent_lead.page_directory;
     child.page_dir_phys = parent_lead.page_dir_phys;
     child.pcid = parent_lead.pcid;
-    child.fd_table = parent_lead.fd_table;
     child.sigactions = parent_lead.sigactions;
     child.cwd = parent_lead.cwd;
     child.cwd_len = parent_lead.cwd_len;
@@ -353,8 +362,8 @@ pub const LinuxThreadSpec = struct {
 /// clone() for a Linux thread: a task in the caller's group, as with
 /// cloneCurrent, that returns from the caller's syscall with every register
 /// the caller had (musl's __clone keeps the start routine in r9) except
-/// RAX = 0 and RSP = spec.stack. Returns the tid, which is the pid.
-pub fn cloneLinuxThread(frame: *const signals.SyscallFrame, spec: LinuxThreadSpec) ?usize {
+/// RAX = 0 and RSP = spec.stack. Returns the tid: the task's number.
+pub fn cloneLinuxThread(frame: *const signals.SyscallFrame, spec: LinuxThreadSpec) ?u32 {
     const parent = process.currentPCB() orelse return null;
     const parent_lead = process.leader(parent);
 
@@ -369,7 +378,7 @@ pub fn cloneLinuxThread(frame: *const signals.SyscallFrame, spec: LinuxThreadSpe
     // The Linux layer uses the lead's fd table and cwd. Without copies of
     // its own, a path that reached for this thread's would fail rather than
     // act on fds and a cwd as they were at clone time.
-    process.procs[i].fd_table = [_]process.FileDesc{.{}} ** MAX_FDS;
+    process.procs[i].fd_table = [_]process.FdSlot{.{}} ** MAX_FDS;
     process.procs[i].cwd_len = 0;
     process.procs[i].personality = .linux;
     process.procs[i].fs_base = spec.fs_base;
@@ -405,7 +414,7 @@ pub fn cloneLinuxThread(frame: *const signals.SyscallFrame, spec: LinuxThreadSpe
 
     // musl's thread start reads its tid from here (mutex owner ids), so it
     // is in place before the thread is.
-    const tid: u32 = @intCast(i);
+    const tid: u32 = process.procs[i].pid_nr;
     if (spec.parent_tid != 0) @atomicStore(u32, @as(*u32, @ptrFromInt(spec.parent_tid)), tid, .release);
     if (spec.child_tid != 0) @atomicStore(u32, @as(*u32, @ptrFromInt(spec.child_tid)), tid, .release);
 
@@ -413,21 +422,34 @@ pub fn cloneLinuxThread(frame: *const signals.SyscallFrame, spec: LinuxThreadSpe
     process.setState(i, .ready);
     @import("../debug/kdbg.zig").procEvent(.create, @intCast(i), parent_lead.tgid, 0);
     @import("../debug/kasan.zig").markPcbAlive(slot_base + KSTACK_GUARD_SIZE, KSTACK_SIZE);
-    return i;
+    return tid;
 }
 
-/// The fork child's fd table: the parent's, each entry with its own
-/// reference. Under the parent's fd_lock: another of its threads may close
-/// or dup meanwhile (a Linux table is the group's), and a pipe whose last
-/// reference that close dropped could be recycled before the bump. A slot
-/// being opened (reserved) stays the parent's.
-fn copyFdTable(child: *PCB, parent: *PCB) void {
-    parent.fd_lock.acquire();
-    defer parent.fd_lock.release();
-    for (&child.fd_table, &parent.fd_table) |*c, *p| {
-        c.* = if (p.in_use and !p.reserved) p.* else .{};
-        if (c.in_use) _ = @import("../fs/vfs.zig").refEntry(c);
-    }
+/// What a fork is asked for beyond the copy (Linux clone's fork shapes).
+pub const ForkSpec = struct {
+    /// Where the child's number (pid_nr.zig) goes.
+    child_nr: ?*u32 = null,
+    /// The child's user stack pointer; 0 keeps the caller's.
+    stack: usize = 0,
+    /// CLONE_CHILD_SETTID: a u32 in the CHILD's memory that gets its tid.
+    set_tid: usize = 0,
+    /// CLONE_CHILD_CLEARTID word, 0 for none.
+    clear_tid: usize = 0,
+};
+
+/// Store `tid` at `va` in the address space of new process `child`, which
+/// has not run yet. The page is the child's copy: the parent's keeps what
+/// it had. False if the page can't be had (not mapped, no memory).
+fn pokeChildTid(child: *PCB, va: usize, tid: u32) bool {
+    if (va & 3 != 0 or !memmap.userDataRangeOk(va, 4)) return false;
+    child.as_lock.acquireRead();
+    defer child.as_lock.releaseRead();
+    if (!process.ensureUserRangeWritableFor(child, va, 4)) return false;
+    const pml4 = child.page_directory orelse return false;
+    const frame_phys = vmm.resolveUserPhys(pml4, va) orelse return false;
+    const word: *align(1) u32 = @ptrFromInt(frame_phys.toVirt().raw() + (va & 0xFFF));
+    word.* = tid;
+    return true;
 }
 
 /// Spawn a child via fork(). Clones the parent's address space (COW shared),
@@ -437,7 +459,10 @@ fn copyFdTable(child: *PCB, parent: *PCB) void {
 ///
 /// `frame` is the parent's saved syscall frame (passed through doSyscall) —
 /// we read RIP/RFLAGS/RSP/all GPRs from there to seed child's iretq frame.
-pub fn forkCurrent(frame: *signals.SyscallFrame) ?usize {
+/// Returns the child's slot.
+pub fn forkCurrent(frame: *signals.SyscallFrame, spec: ForkSpec) ?usize {
+    const child_nr = spec.child_nr;
+    const child_stack = spec.stack;
     const parent = process.currentPCB() orelse return null;
     // A Linux process's children are the process's, whichever thread forked
     // (any of them may wait4 for them).
@@ -517,15 +542,16 @@ pub fn forkCurrent(frame: *signals.SyscallFrame) ?usize {
     process.procs[i].elf_buf = parent_lead_src.elf_buf;
     process.procs[i].elf_buf_pages = parent_lead_src.elf_buf_pages;
 
-    // FD table — copy entries verbatim, then bump pipe-side refcounts so the
-    // parent closing its end doesn't drop the last reference while child
-    // still holds the inherited fd. fd_table is process-level → lead's.
-    copyFdTable(&process.procs[i], parent_lead_src);
+    // FD table: the parent's files, shared — the child's descriptors refer
+    // to the same open files, offsets and all, each with one more
+    // reference. fd_table is process-level → lead's.
+    file_mod.copyTable(&process.procs[i], parent_lead_src);
 
     // Inherit cwd, name, sigactions, argv (process-level → lead) and
     // priority, fs_base (per-thread → the calling thread).
     process.procs[i].cwd = parent_lead_src.cwd;
     process.procs[i].cwd_len = parent_lead_src.cwd_len;
+    process.procs[i].umask = parent_lead_src.umask;
     process.procs[i].name = parent_lead_src.name;
     process.procs[i].name_len = parent_lead_src.name_len;
     process.procs[i].sigactions = parent_lead_src.sigactions;
@@ -546,8 +572,16 @@ pub fn forkCurrent(frame: *signals.SyscallFrame) ?usize {
     // setpgid mutate them. A daemon's classic double-fork relies on
     // this: the middle child calls setsid AFTER it's been forked off,
     // and the grandchild then naturally inherits the new sid here.
-    process.procs[i].pgid = parent.pgid;
-    process.procs[i].sid = parent.sid;
+    process.procs[i].pgid = parent_lead_src.pgid;
+    process.procs[i].sid = parent_lead_src.sid;
+    // The forking thread's mask and alternate stack are the child's; what
+    // was pending for the parent is not.
+    process.procs[i].signal_mask = parent.signal_mask;
+    process.procs[i].alt_stack = parent.alt_stack;
+    // glibc's fork has the child's tid stored in the child's own thread
+    // block, and that word cleared when it exits.
+    if (spec.set_tid != 0) _ = pokeChildTid(&process.procs[i], spec.set_tid, process.procs[i].pid_nr);
+    process.procs[i].clear_child_tid = spec.clear_tid;
 
     // Build child's kstack image — the same dispatch contract as
     // create()/cloneCurrent(), values seeded from parent's saved syscall
@@ -559,7 +593,7 @@ pub fn forkCurrent(frame: *signals.SyscallFrame) ?usize {
     const f: [*]u64 = @ptrFromInt(kstack_top - dspec.pt_regs_bytes);
     // Iretq frame (top of pt_regs).
     f[dspec.iretq.ss.at()] = 0x1B; // user SS
-    f[dspec.iretq.rsp.at()] = frame.user_rsp;
+    f[dspec.iretq.rsp.at()] = if (child_stack != 0) child_stack else frame.user_rsp;
     f[dspec.iretq.rflags.at()] = frame.r11; // syscall stashes RFLAGS in R11
     f[dspec.iretq.cs.at()] = 0x23; // user CS
     f[dspec.iretq.rip.at()] = frame.rcx; // syscall stashes user RIP in RCX
@@ -586,6 +620,9 @@ pub fn forkCurrent(frame: *signals.SyscallFrame) ?usize {
     process.procs[i].kernel_stack_top = kstack_top;
     process.plantStackCanary(i); // P4: plant base canary BEFORE publishing the slot runnable
     @atomicStore(usize, &process.expected_kstack_tops[i], kstack_top, .release);
+    // Read before the child can run: once it has exited and been reaped,
+    // the slot may hold another task's number.
+    if (child_nr) |nr| nr.* = process.procs[i].pid_nr;
     process.assignInitialCpu(i);
     process.setState(i, .ready);
     @import("../debug/kdbg.zig").procEvent(.create, @intCast(i), parent_pid_u8, 0);
@@ -740,8 +777,6 @@ pub fn createKernelIdle(cpu_id: u8) ?usize {
     process.procs[i].page_dir_phys = 0;
     process.procs[i].last_cpu = cpu_id;
     process.procs[i].tgid = @intCast(i);
-    process.procs[i].pgid = @intCast(i);
-    process.procs[i].sid = @intCast(i);
     process.procs[i].cwd[0] = '/';
     process.procs[i].cwd_len = 1;
     process.procs[i].name[0] = 'i';
@@ -848,11 +883,8 @@ pub fn createKernelTask(
     process.procs[i].page_dir_phys = 0;
     process.procs[i].last_cpu = cpu_id;
     process.procs[i].tgid = @intCast(i);
-    // Boot session — desktop kernel-task is the de-facto session leader,
-    // so its sid+pgid mirror its own pid. Any child it sysExec's will
-    // inherit these (see sysExec's parent→child copy).
-    process.procs[i].pgid = @intCast(i);
-    process.procs[i].sid = @intCast(i);
+    // Boot session — the desktop kernel task leads its own session and
+    // group (resetPcbExceptState); what it sysExec's inherits them.
     process.procs[i].cwd[0] = '/';
     process.procs[i].cwd_len = 1;
     const copy_len = @min(name.len, process.procs[i].name.len);
@@ -927,21 +959,12 @@ pub fn reclaimInflightFrame(pid: usize) void {
     pmm.freeFrame(Phys.of(cur));
 }
 
-/// Walk a dying process's fd_table and close any pipe fds so the pipe pool's
-/// reader/writer counts stay correct. Called from killProcessWithStatus and
-/// destroyCurrentWithStatus before the slot is freed.
-fn closePipeFds(pid: u8) void {
-    const pipe = @import("pipe.zig");
-    for (0..MAX_FDS) |fd| {
-        const desc = &process.procs[pid].fd_table[fd];
-        if (!desc.in_use or desc.fs_type != .pipe) continue;
-        if (desc.flags == 0) {
-            pipe.closeReader(desc.pipe_id);
-        } else {
-            pipe.closeWriter(desc.pipe_id);
-        }
-        desc.in_use = false;
-    }
+/// Give back every file a dying task's own table holds, so a pipe sees its
+/// end close and the last sharer of a file releases it. A lead's table goes
+/// with the last thread of its group (Linux threads work on it to the end);
+/// a native thread's copy with the thread.
+fn dropFds(pid: usize) void {
+    file_mod.dropAll(&process.procs[pid]);
 }
 
 /// Tasks in a Linux wait4, entered before the task first looks for a zombie
@@ -1159,6 +1182,9 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp, persist_shared_dirty: 
     @import("../ui/desktop/event_wait.zig").leave(pid);
     childWaitLeave(pid);
 
+    // A native thread's own copy of the table (a Linux thread's is empty).
+    if (pid != my_tgid) dropFds(pid);
+
     // Resources reachable in any address space (GUI window state, GPU
     // contexts, debug symbols all live in heap / driver structures, not
     // user memory). Safe to free before the CR3 switch below.
@@ -1200,7 +1226,7 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp, persist_shared_dirty: 
                 lead.pcid = 0;
             }
         }
-        closePipeFds(my_tgid);
+        dropFds(my_tgid);
         freeElfBuf(lead);
         const shm = @import("../mm/shm.zig");
         const page_cache = @import("../mm/page_cache.zig");
@@ -1325,7 +1351,7 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp, persist_shared_dirty: 
             // SIGCHLD is default-ignored, so this is a no-op for shells
             // that don't care; shells with a SIGCHLD handler can do
             // non-blocking reaping. Sent regardless of waitpid state per POSIX.
-            _ = signals.send(parent, signals.SIGCHLD);
+            notifyParentOfExit(parent, pid);
         }
     } else {
         process.setState(pid, .unused);
@@ -1344,9 +1370,21 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp, persist_shared_dirty: 
         if (lp_alive) {
             if (parentIsWaiting(my_tgid)) process.wake(lp);
             wakeChildWaiters(lp);
-            _ = signals.send(lp, signals.SIGCHLD);
+            notifyParentOfExit(lp, my_tgid);
         } else {
             reapZombie(my_tgid);
+        }
+    } else if (is_worker_thread and process.procs[my_tgid].state == .zombie) {
+        // Not the last to claim its teardown, but perhaps the last to
+        // finish it: the lead became a zombie meanwhile and woke its
+        // parent, which saw this worker still alive (findZombieChild's
+        // guard) and went back to sleep. Its state is gone now — have the
+        // parent look again. (A lead that turns zombie after this read
+        // wakes the parent itself, and finds this worker gone.)
+        const lp = process.procs[my_tgid].parent_pid;
+        if (lp != 0 and lp < MAX_PROCS and process.procs[lp].state != .unused) {
+            if (parentIsWaiting(my_tgid)) process.wake(lp);
+            wakeChildWaiters(lp);
         }
     }
 
@@ -1676,8 +1714,14 @@ pub fn takeExecImage(img: usize) void {
     p.exe_path_len = t.exe_path_len;
     p.personality = t.personality;
     p.clear_child_tid = 0;
-    p.sigactions = [_]signals.SigAction{.{}} ** config.NSIG;
+    // Handlers were code of the old image: they go back to the default.
+    // What is ignored stays ignored, and the mask and pending signals are
+    // the process's still.
+    for (&p.sigactions) |*d| {
+        d.* = if (d.handler == signals.SIG_IGN) .{ .handler = signals.SIG_IGN } else .{};
+    }
     p.in_signal_handler = false;
+    p.alt_stack = .{};
 
     process.setState(img, .zombie);
     tearDownTask(img, 0, .kill, true);
@@ -1720,6 +1764,18 @@ pub fn exitThreadGroup(status: u32) void {
 // calls waitpid — so the auto-reap-on-orphan path triggers naturally on
 // the next exit, freeing the slot. Worth-it tradeoff: simpler code,
 // slight delay in slot reclamation.
+
+/// SIGCHLD for process `parent`: its child in slot `child` has ended, with
+/// an exit code or by a signal.
+fn notifyParentOfExit(parent: u8, child: usize) void {
+    const st = process.procs[child].exit_status;
+    const by_signal = st > 0xFF;
+    _ = signals.sendProcess(parent, signals.SIGCHLD, .{
+        .code = if (by_signal) signals.CLD_KILLED else signals.CLD_EXITED,
+        .pid = process.procs[child].pid_nr,
+        .value = if (!by_signal) st else if (st & signals.KILLED_BY != 0) st & 0x7F else signals.SIGKILL,
+    });
+}
 
 const INIT_PID: u8 = 1; // desktop, by convention
 

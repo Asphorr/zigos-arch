@@ -96,12 +96,9 @@ pub fn validateUserPtrWriteAligned(ptr: usize, len: usize, comptime align_to: us
 /// slot allocation in that case.
 pub fn allocSocketFd(pcb: *process.PCB, kind: process.FsType, slot: u8) ?u32 {
     const vfs = @import("../../fs/vfs.zig");
+    const file = @import("../../fs/file.zig");
     const fd_idx = vfs.allocFd(pcb) orelse return null;
-    vfs.installFd(pcb, fd_idx, .{
-        .in_use = true,
-        .fs_type = kind,
-        .inode = @as(u32, slot),
-    });
+    if (!vfs.installNew(pcb, fd_idx, .{ .kind = kind, .inode = slot, .access = file.READ_WRITE }, false)) return null;
     return @intCast(fd_idx);
 }
 
@@ -110,9 +107,9 @@ pub fn allocSocketFd(pcb: *process.PCB, kind: process.FsType, slot: u8) ?u32 {
 /// fd or a tcp_listener fd is rejected with EBADF instead of silently
 /// indexing into the wrong table. Returns the u8 slot id on success.
 pub fn resolveSocketFd(pcb: *process.PCB, fd: u32, expected_kind: process.FsType) ?u8 {
-    if (fd >= pcb.fd_table.len) return null;
-    const e = &pcb.fd_table[fd];
-    if (!e.in_use) return null;
-    if (e.fs_type != expected_kind) return null;
-    return @intCast(e.inode);
+    const file = @import("../../fs/file.zig");
+    const f = file.get(pcb, fd) orelse return null;
+    defer file.put(f);
+    if (f.kind != expected_kind) return null;
+    return @intCast(f.inode);
 }

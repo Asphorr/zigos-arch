@@ -2925,7 +2925,16 @@ pub fn deliverDueAlarms() void {
             if (@cmpxchgStrong(u64, &process.procs[i].alarm_tick, at, 0, .acq_rel, .acquire)) |fresh| {
                 if (fresh != 0 and fresh < new_earliest) new_earliest = fresh;
             } else {
-                _ = signals.send(@intCast(i), signals.SIGALRM);
+                _ = signals.sendProcess(@intCast(i), signals.SIGALRM, .{});
+                // An interval timer goes again, unless its owner has set
+                // another alarm since the claim above.
+                const every = @atomicLoad(u64, &process.procs[i].alarm_interval, .acquire);
+                if (every != 0) {
+                    const next = process.tick_count + every;
+                    const rearmed = @cmpxchgStrong(u64, &process.procs[i].alarm_tick, 0, next, .acq_rel, .acquire);
+                    const due = rearmed orelse next;
+                    if (due != 0 and due < new_earliest) new_earliest = due;
+                }
             }
         } else if (at != 0 and at < new_earliest) {
             new_earliest = at;
@@ -2991,8 +3000,7 @@ pub fn kernelSleepMs(ms: u32) void {
 pub const BlockResult = enum { woke, signalled };
 
 inline fn hasPendingDeliverable(pcb: *const PCB) bool {
-    const pending = @atomicLoad(u32, &pcb.pending_signals, .acquire);
-    return (pending & ~pcb.signal_mask) != 0;
+    return signals.deliverable(pcb) != 0;
 }
 
 /// Like `blockOn`, but bails out (without parking, or while parked) when a
