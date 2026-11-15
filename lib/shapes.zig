@@ -249,21 +249,30 @@ pub fn drawCircleAA(t: Target, cx: i32, cy: i32, radius: u32, width: u32, color:
 
     const outer_full: i32 = r_outer * 256 - 128;
     const outer_zero: i32 = r_outer * 256 + 128;
-    const inner_full: i32 = inner_r * 256 + 128;
-    const inner_zero: i32 = inner_r * 256 - 128;
+    // No hole: the band starts below any distance, so the centre is solid.
+    const inner_full: i32 = if (inner_r == 0) -1 else inner_r * 256 + 128;
+    const inner_zero: i32 = if (inner_r == 0) -2 else inner_r * 256 - 128;
+
+    // Squared distances a pixel away from either edge: clear outside
+    // `clear`, solid within `solid`. Only the edges take a square root.
+    const clear_lo: i64 = if (inner_r <= 1) -1 else @as(i64, inner_r - 1) * (inner_r - 1);
+    const clear_hi: i64 = @as(i64, r_outer + 1) * (r_outer + 1);
+    const solid_lo: i64 = if (inner_r == 0) -1 else @as(i64, inner_r + 1) * (inner_r + 1);
+    const solid_hi: i64 = @as(i64, r_outer - 1) * (r_outer - 1);
 
     var py: i32 = by0;
     while (py <= by1) : (py += 1) {
-        const dy = py - cy;
-        const dy_sq: u32 = @intCast(dy * dy);
+        const dy: i64 = py - cy;
         var px: i32 = bx0;
         while (px <= bx1) : (px += 1) {
-            const dx = px - cx;
-            const dx_sq: u32 = @intCast(dx * dx);
-            const d_sq: u32 = dx_sq + dy_sq;
-            const r_outer_u: u32 = @intCast(r_outer + 1);
-            if (d_sq > r_outer_u * r_outer_u) continue;
-            const d_fp: i32 = @intCast(isqrtU(d_sq * 65536));
+            const dx: i64 = px - cx;
+            const d_sq: i64 = dx * dx + dy * dy;
+            if (d_sq > clear_hi or d_sq < clear_lo) continue;
+            if (d_sq >= solid_lo and d_sq <= solid_hi) {
+                putPixelBlend(t, px, py, color, 255);
+                continue;
+            }
+            const d_fp: i32 = @intCast(isqrtU64(@as(u64, @intCast(d_sq)) * 65536));
             const alpha: u32 = aaBandAlpha(d_fp, inner_zero, inner_full, outer_full, outer_zero);
             putPixelBlend(t, px, py, color, alpha);
         }
@@ -287,56 +296,61 @@ pub fn fillEllipse(t: Target, cx: i32, cy: i32, rx: u32, ry: u32, color: u32) vo
     }
 }
 
+fn isqrtU64(n: u64) u64 {
+    if (n == 0) return 0;
+    // Newton from a power of two no smaller than the root: a few steps.
+    var guess: u64 = @as(u64, 1) << @intCast((65 - @as(u32, @clz(n))) / 2);
+    while (true) {
+        const next = (guess + n / guess) / 2;
+        if (next >= guess) return guess;
+        guess = next;
+    }
+}
+
+/// How much of the pixel at (x, y) from the centre, both >= 0, lies inside
+/// the ellipse with radii (a, b): 0..256. The distance to the edge is the
+/// first-order one, F / |grad F| for F = x^2 b^2 + y^2 a^2 - a^2 b^2, which
+/// is exact enough within the pixel the edge crosses.
+fn ellipseCoverage(a: i64, b: i64, x: i64, y: i64) i64 {
+    if (a <= 0 or b <= 0) return 0;
+    const f: i64 = x * x * b * b + y * y * a * a - a * a * b * b;
+    // Half the gradient; its length lies between the larger part and the sum.
+    const gx: u64 = @intCast(x * b * b);
+    const gy: u64 = @intCast(y * a * a);
+    const reach: i64 = @intCast(gx + gy);
+    if (f >= reach) return 0;
+    if (f <= -reach) return 256;
+    // The squares must fit 64 bits.
+    const top = @max(gx, gy);
+    const shift: u6 = if (top >> 31 == 0) 0 else @intCast(33 - @clz(top));
+    const sx = gx >> shift;
+    const sy = gy >> shift;
+    const len: i64 = @intCast(isqrtU64(sx * sx + sy * sy) << shift);
+    if (len == 0) return if (f < 0) 256 else 0;
+    return @max(@min(128 - @divTrunc(f * 128, len), 256), 0);
+}
+
+/// The ring between the ellipse with radii (rx, ry) and the one `width`
+/// inside it; solid where the inner one has no room.
 pub fn drawEllipseAA(t: Target, cx: i32, cy: i32, rx: u32, ry: u32, width: u32, color: u32) void {
     if (rx == 0 or ry == 0 or width == 0) return;
-    const rxi: i32 = @intCast(rx);
-    const ryi: i32 = @intCast(ry);
-    const inner_rx: i32 = if (rxi > @as(i32, @intCast(width))) rxi - @as(i32, @intCast(width)) else 0;
-    const inner_ry: i32 = if (ryi > @as(i32, @intCast(width))) ryi - @as(i32, @intCast(width)) else 0;
-    const margin: i32 = 2;
-    const bx0: i32 = @max(cx - rxi - margin, 0);
-    const by0: i32 = @max(cy - ryi - margin, 0);
-    const bx1: i32 = @min(cx + rxi + margin, @as(i32, @intCast(t.w)) - 1);
-    const by1: i32 = @min(cy + ryi + margin, @as(i32, @intCast(t.h)) - 1);
-
-    var py: i32 = by0;
-    while (py <= by1) : (py += 1) {
-        const dy = py - cy;
-        var px: i32 = bx0;
-        while (px <= bx1) : (px += 1) {
-            const dx = px - cx;
-            const num_o: u64 = @as(u64, @intCast(dx * dx)) * @as(u64, @intCast(ryi * ryi)) +
-                @as(u64, @intCast(dy * dy)) * @as(u64, @intCast(rxi * rxi));
-            const den_o: u64 = @as(u64, @intCast(rxi * ryi)) * @as(u64, @intCast(rxi * ryi));
-            const norm_o_sq_fp: u64 = (num_o * 65536) / den_o;
-            const d_outer_fp: i32 = @intCast(isqrtU(@intCast(norm_o_sq_fp)));
-            if (inner_rx > 0 and inner_ry > 0) {
-                const num_i: u64 = @as(u64, @intCast(dx * dx)) * @as(u64, @intCast(inner_ry * inner_ry)) +
-                    @as(u64, @intCast(dy * dy)) * @as(u64, @intCast(inner_rx * inner_rx));
-                const den_i: u64 = @as(u64, @intCast(inner_rx * inner_ry)) * @as(u64, @intCast(inner_rx * inner_ry));
-                const norm_i_sq_fp: u64 = (num_i * 65536) / den_i;
-                const d_inner_fp: i32 = @intCast(isqrtU(@intCast(norm_i_sq_fp)));
-                if (d_inner_fp <= 256 - 128 and d_outer_fp <= 256 - 128) continue;
-                if (d_outer_fp >= 256 - 128 and d_outer_fp <= 256 + 128) {
-                    const into: i32 = d_outer_fp - (256 - 128);
-                    const a: i32 = @max(@min(255 - @divTrunc(into * 255, 256), 255), 0);
-                    putPixelBlend(t, px, py, color, @intCast(a));
-                } else if (d_inner_fp >= 256 - 128 and d_inner_fp <= 256 + 128) {
-                    const into: i32 = d_inner_fp - (256 - 128);
-                    const a: i32 = @max(@min(@divTrunc(into * 255, 256), 255), 0);
-                    putPixelBlend(t, px, py, color, @intCast(a));
-                } else if (d_outer_fp < 256 - 128 and d_inner_fp > 256 + 128) {
-                    putPixelBlend(t, px, py, color, 255);
-                }
-            } else {
-                if (d_outer_fp >= 256 - 128 and d_outer_fp <= 256 + 128) {
-                    const into: i32 = d_outer_fp - (256 - 128);
-                    const a: i32 = @max(@min(255 - @divTrunc(into * 255, 256), 255), 0);
-                    putPixelBlend(t, px, py, color, @intCast(a));
-                } else if (d_outer_fp < 256 - 128) {
-                    putPixelBlend(t, px, py, color, 255);
-                }
-            }
+    const a: i64 = rx;
+    const b: i64 = ry;
+    const w: i64 = width;
+    // One quadrant is worked out and mirrored into the other three.
+    var y: i64 = 0;
+    while (y <= b + 1) : (y += 1) {
+        var x: i64 = 0;
+        while (x <= a + 1) : (x += 1) {
+            const cover = ellipseCoverage(a, b, x, y) - ellipseCoverage(a - w, b - w, x, y);
+            if (cover <= 0) continue;
+            const alpha: u32 = @intCast(@min(cover, 255));
+            const xi: i32 = @intCast(x);
+            const yi: i32 = @intCast(y);
+            putPixelBlend(t, cx + xi, cy + yi, color, alpha);
+            if (xi != 0) putPixelBlend(t, cx - xi, cy + yi, color, alpha);
+            if (yi != 0) putPixelBlend(t, cx + xi, cy - yi, color, alpha);
+            if (xi != 0 and yi != 0) putPixelBlend(t, cx - xi, cy - yi, color, alpha);
         }
     }
 }
@@ -393,8 +407,10 @@ pub fn drawThickLineAA(t: Target, x0: i32, y0: i32, x1: i32, y1: i32, width: u32
         fillCircle(t, x0, y0, width / 2, color);
         return;
     }
-    const len_fp: i64 = @intCast(isqrtU(@intCast(len_sq * 65536)));
+    const len_fp: i64 = @intCast(isqrtU64(@intCast(len_sq * 65536)));
     const half_w_fp: i32 = @intCast((width * 256) / 2);
+    const inner: i32 = half_w_fp - 128;
+    const outer: i32 = half_w_fp + 128;
     const margin: i32 = @intCast(width / 2 + 2);
     const bx0: i32 = @max(@min(x0, x1) - margin, 0);
     const by0: i32 = @max(@min(y0, y1) - margin, 0);
@@ -410,20 +426,25 @@ pub fn drawThickLineAA(t: Target, x0: i32, y0: i32, x1: i32, y1: i32, width: u32
             const dot: i64 = @as(i64, px0) * dx + @as(i64, py0) * dy;
             var d_fp: i32 = 0;
             if (dot <= 0) {
-                const d_sq: u32 = @intCast(@as(i64, px0) * px0 + @as(i64, py0) * py0);
-                d_fp = @intCast(isqrtU(d_sq * 65536));
+                const d_sq: u64 = @intCast(@as(i64, px0) * px0 + @as(i64, py0) * py0);
+                d_fp = @intCast(@min(isqrtU64(d_sq * 65536), 1 << 30));
             } else if (dot >= len_sq) {
                 const px1 = px - x1;
                 const py1 = py - y1;
-                const d_sq: u32 = @intCast(@as(i64, px1) * px1 + @as(i64, py1) * py1);
-                d_fp = @intCast(isqrtU(d_sq * 65536));
+                const d_sq: u64 = @intCast(@as(i64, px1) * px1 + @as(i64, py1) * py1);
+                d_fp = @intCast(@min(isqrtU64(d_sq * 65536), 1 << 30));
             } else {
                 const cross: i64 = @as(i64, dx) * py0 - @as(i64, dy) * px0;
-                const cross_abs: i64 = if (cross < 0) -cross else cross;
-                d_fp = @intCast(@divTrunc(cross_abs * 65536, len_fp));
+                const scaled: i64 = (if (cross < 0) -cross else cross) * 65536;
+                // Most of the box is clear of the line or well inside it:
+                // those pixels are settled without dividing.
+                if (scaled >= @as(i64, outer) * len_fp) continue;
+                if (scaled <= @as(i64, inner) * len_fp) {
+                    putPixelBlend(t, px, py, color, 255);
+                    continue;
+                }
+                d_fp = @intCast(@divTrunc(scaled, len_fp));
             }
-            const inner: i32 = half_w_fp - 128;
-            const outer: i32 = half_w_fp + 128;
             if (d_fp <= inner) {
                 putPixelBlend(t, px, py, color, 255);
             } else if (d_fp >= outer) {
