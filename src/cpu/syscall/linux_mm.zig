@@ -8,7 +8,7 @@
 //! hint is honored, everything else goes to the highest free gap below
 //! LINUX_MMAP_TOP (above LINUX_MMAP_FLOOR first, then below it).
 //!
-//! Not modeled: mremap (always ENOMEM — musl's realloc falls back to copy),
+//! Not modeled: moving mremap (ENOMEM — musl's realloc falls back to copy),
 //! mlock, MAP_HUGETLB, PROT_NONE on pages already present (they stay
 //! readable; a fresh fault in a PROT_NONE region is refused).
 
@@ -31,6 +31,7 @@ const PAGE: u64 = 0x1000;
 // Linux errno.
 const EBADF: i64 = 9;
 const ENOMEM: i64 = 12;
+const EFAULT: i64 = 14;
 const EACCES: i64 = 13;
 const EEXIST: i64 = 17;
 const ENODEV: i64 = 19;
@@ -389,8 +390,59 @@ pub fn msync(addr: u64, len: u64, flags: u64) u64 {
     return 0;
 }
 
-/// mremap: not modeled. ENOMEM is the "can't do it in place or move it"
-/// answer, and musl's realloc then copies into a fresh mapping.
-pub fn mremap() u64 {
-    return err(ENOMEM);
+const MREMAP_MAYMOVE: u64 = 1;
+const MREMAP_FIXED: u64 = 2;
+const MREMAP_DONTUNMAP: u64 = 4;
+
+/// mremap(old, old_len, new_len, flags, new): shrinks in place, and grows a
+/// private anonymous mapping in place when the pages above it are free.
+/// Moving is not modeled: ENOMEM, and musl's realloc copies instead.
+/// EFAULT when no mapping holds the old range: musl's pthread_getattr_np
+/// walks down the main stack with mremap until it gets that.
+pub fn mremap(old: u64, old_len: u64, new_len: u64, flags: u64) u64 {
+    if (flags & ~(MREMAP_MAYMOVE | MREMAP_FIXED | MREMAP_DONTUNMAP) != 0) return err(EINVAL);
+    if (flags & (MREMAP_FIXED | MREMAP_DONTUNMAP) != 0) {
+        if (flags & MREMAP_MAYMOVE == 0) return err(EINVAL);
+        return err(ENOMEM);
+    }
+    if (old & (PAGE - 1) != 0 or new_len == 0) return err(EINVAL);
+    // old_len 0 duplicates a shared mapping: not modeled.
+    if (old_len == 0) return err(EINVAL);
+    const old_pg = pageUp(old_len) orelse return err(EINVAL);
+    const new_pg = pageUp(new_len) orelse return err(ENOMEM);
+    if (!rangeOk(old, old_pg)) return err(EFAULT);
+    const owner = lead() orelse return err(EINVAL);
+    const old_end = old + old_pg;
+
+    owner.as_lock.acquire();
+    var rel = Release.init(owner, old + @min(old_pg, new_pg));
+    const res = remapLocked(owner, &rel, old, old_end, new_pg);
+    owner.as_lock.release();
+    rel.writeBack();
+    return res catch |e| err(switch (e) {
+        error.Fault => EFAULT,
+        error.NoMemory => ENOMEM,
+        error.Invalid => EINVAL,
+    });
+}
+
+fn remapLocked(owner: *process.PCB, rel: *Release, old: u64, old_end: u64, new_pg: u64) error{ Fault, NoMemory, Invalid }!u64 {
+    // The old range must lie in one mapping.
+    const r = owner.regions.find(old) orelse return error.Fault;
+    if (r.end < old_end) return error.Fault;
+    const old_pg = old_end - old;
+    if (new_pg == old_pg) return old;
+    if (new_pg < old_pg) {
+        unmapLocked(owner, rel, old + new_pg, old_end) catch |e| return switch (e) {
+            error.OutOfMemory => error.NoMemory,
+            error.Unsplittable => error.Invalid,
+        };
+        return old;
+    }
+    // Grow in place: only the end of a private anonymous mapping, into
+    // free pages.
+    const growable = r.end == old_end and !r.unsplittable() and r.source == null and r.cache_inode == 0;
+    if (!growable or !rangeOk(old, new_pg)) return error.NoMemory;
+    if (!owner.regions.resizeEnd(r.start, old + new_pg)) return error.NoMemory;
+    return old;
 }

@@ -4,7 +4,8 @@
 # symbolic links. A name the image already has keeps what it has: ZigOS's
 # own /etc files, the static busybox and its links. dev, proc and sys are
 # left out: the kernel's own file systems answer there. Also writes the
-# checks of that root, linux-tests/alptest.{sh,py}, to /etc.
+# checks of that root, linux-tests/{alptest.sh,alptest.py,nettest.sh,
+# nodetest.sh,nodetest.js}, to /etc.
 #
 #   tools/add_rootfs_to_image.sh ROOT [IMG]
 #     ROOT  the tree, e.g. made with
@@ -42,7 +43,7 @@ fi
             echo "write $ROOT/$p $p"
         fi
     done
-    for f in alptest.sh alptest.py; do
+    for f in alptest.sh alptest.py nettest.sh nodetest.sh nodetest.js; do
         echo "rm etc/$f"
         echo "write linux-tests/$f etc/$f"
     done

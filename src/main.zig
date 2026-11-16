@@ -1000,6 +1000,7 @@ fn dhcpdEntry() callconv(.c) noreturn {
     } else {
         klog("[dhcp] background acquire failed — keeping static SLIRP defaults\n", .{});
     }
+    @import("net/resolv_conf.zig").publish(net.dns_ip);
     while (true) sched.kernelSleepMs(3_600_000); // one-shot; park (lease is 24 h)
 }
 

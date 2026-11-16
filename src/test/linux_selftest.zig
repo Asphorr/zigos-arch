@@ -131,6 +131,24 @@ const CASES = [_]Case{
         .needs = "/usr/bin/python3",
         .once = true,
     },
+    // The same root out on the network: DNS, HTTP, TLS, apk, git clone.
+    .{
+        .path = "/bin/busybox",
+        .args = "sh /etc/nettest.sh",
+        .timeout_ms = 400_000,
+        .optional = true,
+        .needs = "/etc/nettest.sh",
+        .once = true,
+    },
+    // Node.js and npm (V8's JIT, libuv), with npm out on the network.
+    .{
+        .path = "/bin/busybox",
+        .args = "sh /etc/nodetest.sh",
+        .timeout_ms = 600_000,
+        .optional = true,
+        .needs = "/usr/bin/node",
+        .once = true,
+    },
     // The official Zig compiler (static musl, 172 MB), stamped OSABI 3 and
     // written into ext2.img by hand.
     .{ .path = "/bin/zig", .args = "version", .timeout_ms = 120_000, .optional = true },

@@ -1,13 +1,14 @@
 // lt_mm — the Linux memory-management syscalls a real program leans on:
 // mmap (hint, MAP_FIXED, MAP_FIXED_NOREPLACE, file-backed, PROT_NONE),
 // munmap and mprotect on parts of a mapping, madvise(MADV_DONTNEED), brk,
-// thousands of small mappings, and a large reserve touched sparsely.
+// thousands of small mappings, a large reserve touched sparsely, mremap.
 // Run by boot mode 19 (src/test/linux_selftest.zig); exit 0 = every check
 // passed, else the number of the first failed check.
 
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -222,6 +223,35 @@ int main(void) {
         CHECK(pread(sp, &gap, 1, far - 5) == 1 && gap == 0, "the hole beside it reads as zero");
         close(sp);
         CHECK(unlink("/ltmm.sparse") == 0, "remove the sparse file");
+    }
+
+    // mremap: shrink and grow in place, EFAULT where nothing is mapped.
+    {
+        unsigned char *m = map(NULL, 8 * PG, PROT_READ | PROT_WRITE, 0);
+        CHECK(m != MAP_FAILED, "mmap for mremap");
+        fill(m, 8 * PG, 0x33);
+        CHECK(mremap(m, 8 * PG, 4 * PG, 0) == m, "mremap shrinks in place");
+        CHECK(filled(m, 4 * PG, 0x33), "mremap shrink keeps the front");
+        void *again = map(m + 4 * PG, 4 * PG, PROT_READ, MAP_FIXED_NOREPLACE);
+        CHECK(again == m + 4 * PG, "mremap shrink freed the tail");
+        CHECK(munmap(again, 4 * PG) == 0, "unmap the tail again");
+        CHECK(mremap(m, 4 * PG, 6 * PG, 0) == m, "mremap grows in place into free pages");
+        CHECK(filled(m, 4 * PG, 0x33) && filled(m + 4 * PG, 2 * PG, 0), "the grown part reads as zero");
+        void *wall = map(m + 6 * PG, PG, PROT_READ, MAP_FIXED_NOREPLACE);
+        CHECK(wall == m + 6 * PG, "a mapping right above");
+        errno = 0;
+        CHECK(mremap(m, 6 * PG, 8 * PG, 0) == MAP_FAILED && errno == ENOMEM, "no room to grow in place is ENOMEM");
+        CHECK(munmap(m, 7 * PG) == 0, "unmap both");
+        errno = 0;
+        CHECK(mremap(m, PG, 2 * PG, 0) == MAP_FAILED && errno == EFAULT, "mremap of an unmapped page is EFAULT");
+        // musl walks the main thread's stack this way.
+        pthread_attr_t attr;
+        void *stack_addr;
+        size_t stack_size = 0;
+        CHECK(pthread_getattr_np(pthread_self(), &attr) == 0, "pthread_getattr_np of the main thread");
+        CHECK(pthread_attr_getstack(&attr, &stack_addr, &stack_size) == 0 && stack_size >= 64 * 1024 &&
+                  stack_size <= ((size_t)1 << 30), "the main stack has a sane size");
+        pthread_attr_destroy(&attr);
     }
 
     printf("lt_mm: PASS (%d checks)\n", check_no);

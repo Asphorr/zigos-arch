@@ -869,6 +869,45 @@ pub fn prctl(option: u64, arg2: u64) u64 {
     }
 }
 
+const CAP_V1: u32 = 0x19980330;
+const CAP_V2: u32 = 0x20071026;
+const CAP_V3: u32 = 0x20080522;
+/// Every capability through CAP_CHECKPOINT_RESTORE (40), as root has.
+const CAPS_ALL: u64 = (1 << 41) - 1;
+
+/// capget(hdr, data): root's sets — effective and permitted full,
+/// inheritable empty. An unknown version gets V3 written back and EINVAL.
+pub fn capget(hdr_va: u64, data_va: u64) u64 {
+    var hdr: [2]u32 = undefined;
+    if (!usercopy.copyFromUser(std.mem.asBytes(&hdr), hdr_va)) return err(EFAULT);
+    const words: usize = switch (hdr[0]) {
+        CAP_V1 => 1,
+        CAP_V2, CAP_V3 => 2,
+        else => {
+            hdr[0] = CAP_V3;
+            _ = usercopy.copyToUser(hdr_va, std.mem.asBytes(&hdr[0]));
+            return err(EINVAL);
+        },
+    };
+    if (data_va == 0) return 0;
+    // struct __user_cap_data_struct { effective, permitted, inheritable }
+    var data: [2][3]u32 = undefined;
+    for (&data, 0..) |*d, i| {
+        const w: u32 = @truncate(CAPS_ALL >> @intCast(32 * i));
+        d.* = .{ w, w, 0 };
+    }
+    if (!usercopy.copyToUser(data_va, std.mem.sliceAsBytes(data[0..words]))) return err(EFAULT);
+    return 0;
+}
+
+/// capset: root may set what it likes; nothing is enforced.
+pub fn capset(hdr_va: u64) u64 {
+    var version: u32 = undefined;
+    if (!usercopy.copyFromUser(std.mem.asBytes(&version), hdr_va)) return err(EFAULT);
+    if (version != CAP_V1 and version != CAP_V2 and version != CAP_V3) return err(EINVAL);
+    return 0;
+}
+
 /// getresuid and getresgid: three zeros (everything runs as root).
 pub fn getresid(a_va: u64, b_va: u64, c_va: u64) u64 {
     const zero: u32 = 0;

@@ -267,6 +267,8 @@ const SYS_fstatfs: u32 = 138;
 const SYS_getpriority: u32 = 140;
 const SYS_setpriority: u32 = 141;
 const SYS_prctl: u32 = 157;
+const SYS_capget: u32 = 125;
+const SYS_capset: u32 = 126;
 const SYS_sync: u32 = 162;
 const SYS_sched_setaffinity: u32 = 203;
 const SYS_fadvise64: u32 = 221;
@@ -388,7 +390,7 @@ pub fn dispatch(num: u32, frame: *signals.SyscallFrame) u64 {
         SYS_madvise => return linux_mm.madvise(a1, a2, a3),
         SYS_msync => return linux_mm.msync(a1, a2, a3),
         SYS_brk => return linux_mm.brk(a1),
-        SYS_mremap => return linux_mm.mremap(),
+        SYS_mremap => return linux_mm.mremap(a1, a2, a3, a4),
         SYS_getrlimit => return sysPrlimit(0, a1, 0, a2),
         SYS_setrlimit => return sysPrlimit(0, a1, a2, 0),
         SYS_prlimit64 => return sysPrlimit(a1, a2, a3, a4),
@@ -478,6 +480,8 @@ pub fn dispatch(num: u32, frame: *signals.SyscallFrame) u64 {
         SYS_times => return linux_proc.times(a1),
         SYS_getrusage => return linux_proc.getrusage(a2),
         SYS_prctl => return linux_proc.prctl(a1, a2),
+        SYS_capget => return linux_proc.capget(a1, a2),
+        SYS_capset => return linux_proc.capset(a1),
         SYS_getpriority => return 20, // nice 0, as the call encodes it
         SYS_setpriority, SYS_sched_setaffinity => return 0,
         SYS_futex => return linux_thread.futex(a1, a2, a3, a4, a5, a6),
