@@ -6,6 +6,7 @@ const std = @import("std");
 const process = @import("../../proc/process.zig");
 const tty = @import("../../proc/tty.zig");
 const file = @import("../../fs/file.zig");
+const socket = @import("../../net/socket.zig");
 const usercopy = @import("../arch/usercopy.zig");
 const linux_fs = @import("linux_fs.zig");
 
@@ -32,6 +33,7 @@ const TIOCOUTQ: u64 = 0x5411;
 const TIOCGWINSZ: u64 = 0x5413;
 const TIOCSWINSZ: u64 = 0x5414;
 const FIONREAD: u64 = 0x541B;
+const FIONBIO: u64 = 0x5421;
 const TIOCNOTTY: u64 = 0x5422;
 const TIOCGSID: u64 = 0x5429;
 
@@ -46,6 +48,14 @@ pub fn ioctl(fd: u64, request: u64, arg: u64) u64 {
     const pcb = linux_fs.proc() orelse return err(EFAULT);
     const f = linux_fs.fdFile(pcb, fd) orelse return err(EBADF);
     defer file.put(f);
+    // FIONBIO is fcntl's O_NONBLOCK by another name, for any file.
+    if (request & 0xFFFF_FFFF == FIONBIO) {
+        var on: i32 = 0;
+        if (!usercopy.copyFromUser(std.mem.asBytes(&on), arg)) return err(EFAULT);
+        f.nonblock = on != 0;
+        return 0;
+    }
+    if (socket.of(f)) |s| return @import("linux_net.zig").ioctl(s, request, arg);
     const id = f.tty;
     const t = tty.get(id) orelse return err(ENOTTY);
     switch (request & 0xFFFF_FFFF) {

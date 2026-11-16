@@ -59,6 +59,7 @@ const CASES = [_]Case{
     .{ .path = "/bin/lt_fs.elf" },
     .{ .path = "/bin/lt_proc.elf" },
     .{ .path = "/bin/lt_signal.elf" },
+    .{ .path = "/bin/lt_net.elf" },
     // At a terminal: lines typed and edited, then raw keys (the last is the
     // window's code for the up arrow).
     .{
@@ -456,7 +457,8 @@ pub fn taskEntry() callconv(.c) noreturn {
         process.kernelSleepMs(50);
         const after = pmm.freeFrameCount();
         const drift: u32 = before -| after;
-        serial.print("[linuxtest] {s}: free frames {d} -> {d} over {d} runs (drift {d}, limit {d})\n", .{ c.path, before, after, COUNTED_RUNS, drift, DRIFT_LIMIT });
+        const sep: []const u8 = if (c.args.len != 0) " " else "";
+        serial.print("[linuxtest] {s}{s}{s}: free frames {d} -> {d} over {d} runs (drift {d}, limit {d})\n", .{ c.path, sep, c.args, before, after, COUNTED_RUNS, drift, DRIFT_LIMIT });
         if (drift > DRIFT_LIMIT) {
             serial.print("[linuxtest] FAIL {s}: frames leak across runs\n", .{c.path});
             failures += 1;

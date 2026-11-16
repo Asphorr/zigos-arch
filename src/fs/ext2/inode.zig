@@ -389,6 +389,10 @@ pub fn isReg(inode: *const layout.Inode) bool {
     return (inode.mode & layout.S_IFMT) == layout.S_IFREG;
 }
 
+pub fn isSock(inode: *const layout.Inode) bool {
+    return (inode.mode & layout.S_IFMT) == layout.S_IFSOCK;
+}
+
 pub fn isSymlink(inode: *const layout.Inode) bool {
     return (inode.mode & layout.S_IFMT) == layout.S_IFLNK;
 }

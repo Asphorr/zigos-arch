@@ -434,6 +434,8 @@ pub fn opsFor(kind: process.FsType) *const file.Ops {
         .ext2 => &ext2_ops,
         .tcp_sock => &tcp_ops,
         .tcp_listener => &listener_ops,
+        // Made by file.create with the table of their object.
+        .socket, .epoll, .eventfd => unreachable,
     };
 }
 
@@ -519,14 +521,19 @@ fn pipeRead(f: *File, pcb: *process.PCB, buf: [*]u8, count: u32) u32 {
             .again => return errno.err(.EAGAIN),
         }
     }
-    const n = pipe.read(f.pipe_id, buf[0..count]);
+    // O_NONBLOCK is a Linux caller's to set; a native one always waits.
+    const wait = !(f.nonblock and pcb.personality == .linux);
+    const n = pipe.readOpt(f.pipe_id, buf[0..count], wait);
     if (n == pipe.PIPE_INTR) return if (pcb.personality == .linux) errno.err(.EINTR) else 0;
+    if (n == pipe.PIPE_AGAIN) return errno.err(.EAGAIN);
     return @intCast(n);
 }
 
 fn pipeWrite(f: *File, pcb: *process.PCB, buf: [*]const u8, count: u32) u32 {
     if (f.access != file.WRITE) return VFS_ERR;
-    const n = pipe.write(f.pipe_id, buf[0..count]);
+    const wait = !(f.nonblock and pcb.personality == .linux);
+    const n = pipe.writeOpt(f.pipe_id, buf[0..count], wait);
+    if (n == pipe.PIPE_AGAIN) return errno.err(.EAGAIN);
     if (n == pipe.PIPE_INTR) return if (pcb.personality == .linux) errno.err(.EINTR) else 0;
     if (n == pipe.PIPE_CLOSED) return if (pcb.personality == .linux) errno.err(.EPIPE) else VFS_ERR;
     return @intCast(n);

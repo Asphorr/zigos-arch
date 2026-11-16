@@ -30,13 +30,24 @@ const pipe = @import("../../proc/pipe.zig");
 const SpinLock = @import("../../proc/spinlock.zig").SpinLock;
 const pid_set = @import("../../util/pid_set.zig");
 const debug = @import("../../debug/debug.zig");
+const file = @import("../../fs/file.zig");
+const tty = @import("../../proc/tty.zig");
+const signals = @import("../../proc/signals.zig");
+const sched = @import("../../proc/sched.zig");
+const smp = @import("../smp.zig");
 
 // POSIX poll bit values (match Linux). Apps observe these as CQE.res on
 // a satisfied OP_POLL — they should be ABI-stable across libc updates.
 pub const POLLIN: u16 = 0x0001;
+pub const POLLPRI: u16 = 0x0002;
 pub const POLLOUT: u16 = 0x0004;
 pub const POLLERR: u16 = 0x0008;
 pub const POLLHUP: u16 = 0x0010;
+pub const POLLNVAL: u16 = 0x0020;
+pub const POLLRDNORM: u16 = 0x0040;
+pub const POLLWRNORM: u16 = 0x0100;
+/// The peer shut its sending side (a stream socket).
+pub const POLLRDHUP: u16 = 0x2000;
 
 /// Identifier of the underlying fd object, resolved from (pid, fd) at
 /// register-time. The wake side keys by this — never by (pid, fd) —
@@ -110,6 +121,9 @@ pub fn pollMaskHandle(pid: u8, h: FdHandle) u16 {
         .fat32, .tarfs, .ext2, .devfs, .procfs => POLLIN | POLLOUT,
         .tcp_sock => @import("../../net/net.zig").tcpPollMask(@intCast(h.id)),
         .tcp_listener => @import("../../net/net.zig").tcpListenerPollMask(@intCast(h.id)),
+        // Objects answer through their file's own poll (File.ops), which a
+        // handle can't reach.
+        .socket, .epoll, .eventfd => 0,
     };
 }
 
@@ -118,15 +132,56 @@ pub fn pollMaskHandle(pid: u8, h: FdHandle) u16 {
 /// have been closed.
 pub fn resolveFd(pid: u8, fd: u8) ?FdHandle {
     if (pid >= process.MAX_PROCS) return null;
-    const file = @import("../../fs/file.zig");
     const f = file.get(&process.procs[pid], fd) orelse return null;
     defer file.put(f);
+    return handleOf(f);
+}
+
+fn handleOf(f: *const file.File) FdHandle {
     return switch (f.kind) {
         .pipe => .{ .kind = .pipe, .id = f.pipe_id },
         .console => .{ .kind = .console, .id = 0xFFFF }, // focus may change; use 0xFFFF as a "current focus" sentinel
         .tcp_sock, .tcp_listener => .{ .kind = f.kind, .id = @intCast(f.inode) },
         else => .{ .kind = f.kind, .id = 0 },
     };
+}
+
+// --- Readiness by file -------------------------------------------------
+//
+// What File.ops.poll and File.ops.events answer for the kinds that keep no
+// table of their own.
+
+/// The readiness of `f` for `pcb`'s process. A terminal may hold keys its
+/// pipe no longer does: the rest of an arrow key's sequence, a line typed
+/// ahead.
+pub fn maskOfFile(f: *file.File, pcb: *process.PCB) u16 {
+    var mask = pollMaskHandle(pcb.tgid, handleOf(f));
+    if (f.tty != tty.NONE and f.access == file.READ and tty.readable(f.tty)) mask |= POLLIN;
+    return mask;
+}
+
+/// (a) Bumped by every wake for the pipe: what was written, read or closed.
+var pipe_events: [pipe.MAX_PIPES]u32 = [_]u32{0} ** pipe.MAX_PIPES;
+/// (a) Bumped by every console wake.
+var console_events: u32 = 0;
+
+/// `f`'s event count; a constant for the kinds that are always ready.
+pub fn eventsOfFile(f: *const file.File) u32 {
+    return switch (f.kind) {
+        .pipe => if (f.pipe_id < pipe.MAX_PIPES) @atomicLoad(u32, &pipe_events[f.pipe_id], .monotonic) else 0,
+        .console => @atomicLoad(u32, &console_events, .monotonic),
+        else => 0,
+    };
+}
+
+fn countEvent(kind: process.FsType, id: u16) void {
+    switch (kind) {
+        .pipe => if (id < pipe.MAX_PIPES) {
+            _ = @atomicRmw(u32, &pipe_events[id], .Add, 1, .monotonic);
+        },
+        .console => _ = @atomicRmw(u32, &console_events, .Add, 1, .monotonic),
+        else => {},
+    }
 }
 
 // --- Per-kind readiness (stubs filled in by #890 / #892) ---------------
@@ -184,6 +239,34 @@ pub fn sleeperMask() [pid_set.WORDS]u64 {
 fn wakeSleepers() void {
     var it = sleepers.members();
     while (it.next()) |pid| process.wake(@intCast(pid));
+}
+
+/// Something changed on an object no handle names (a socket, an eventfd):
+/// the tasks in poll look again.
+pub fn notify() void {
+    wakeSleepers();
+}
+
+pub const Waited = enum { ready, interrupted, timed_out };
+
+/// Sleep until `ready(ctx)`, a signal the caller can be delivered, or tick
+/// `deadline` (0: none). What makes `ready` true must end in wakePollers or
+/// notify. `ready` is asked without any lock and must not sleep.
+pub fn waitFor(ctx: anytype, comptime ready: fn (@TypeOf(ctx)) bool, deadline: u64) Waited {
+    const me = smp.currentPid() orelse return .interrupted;
+    const pcb = &process.procs[me];
+    // In the set before the first look, so an event after it wakes us.
+    sleeperEnter(me);
+    defer {
+        sleeperLeave(me);
+        @atomicStore(u64, &pcb.wake_tick, 0, .release);
+    }
+    while (true) {
+        if (ready(ctx)) return .ready;
+        if (deadline != 0 and process.tick_count >= deadline) return .timed_out;
+        if (signals.deliverable(pcb) != 0) return .interrupted;
+        sched.blockOnDeadline(.poll, 0, deadline);
+    }
 }
 
 // --- Registry --------------------------------------------------------
@@ -244,6 +327,7 @@ pub fn releaseAllForPid(pid: u8) void {
 /// fine — re-checking pollMaskHandle keeps the result coherent with
 /// the post-wake state.
 pub fn wakePollers(kind: process.FsType, id: u16) void {
+    countEvent(kind, id);
     wakeSleepers();
     const cb = completion_callback orelse return;
     // Snapshot which slots to complete under the lock, then call out

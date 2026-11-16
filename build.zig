@@ -593,7 +593,8 @@ pub fn build(b: *std.Build) void {
     // Linux syscall layer (syscall/linux.zig), and toolchains emit 0, the same
     // as native apps. Installed into zig-out/bin, so they land in /bin.
     const linux_target = b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .musl });
-    const linux_tests = .{ "lt_basic", "lt_mm", "lt_thread", "lt_fs", "lt_proc", "lt_signal", "lt_tty" };
+    const lt_cflags = [_][]const u8{ "-std=gnu11", "-Wall", "-Werror" };
+    const linux_tests = .{ "lt_basic", "lt_mm", "lt_thread", "lt_fs", "lt_proc", "lt_signal", "lt_tty", "lt_net" };
     inline for (linux_tests) |name| {
         const exe = b.addExecutable(.{
             .name = name,
@@ -604,16 +605,9 @@ pub fn build(b: *std.Build) void {
             }),
             .linkage = .static,
         });
-        exe.root_module.addCSourceFile(.{ .file = b.path("linux-tests/" ++ name ++ ".c"), .flags = &.{ "-std=gnu11", "-Wall", "-Werror" } });
+        exe.root_module.addCSourceFile(.{ .file = b.path("linux-tests/" ++ name ++ ".c"), .flags = &lt_cflags });
         exe.pie = false;
-        const stamp = b.addSystemCommand(&.{
-            "sh", "-c",
-            \\cp "$1" "$2" && chmod u+w "$2" && printf '\003' | dd of="$2" bs=1 seek=7 count=1 conv=notrunc status=none
-            , "stamp-osabi",
-        });
-        stamp.addFileArg(exe.getEmittedBin());
-        const stamped = stamp.addOutputFileArg(name ++ ".elf");
-        b.getInstallStep().dependOn(&b.addInstallBinFile(stamped, name ++ ".elf").step);
+        b.getInstallStep().dependOn(&b.addInstallBinFile(stampOsabi(b, exe.getEmittedBin(), name ++ ".elf"), name ++ ".elf").step);
         // Also unstamped, as a binary built inside ZigOS comes out: a Linux
         // process's execve must run it as Linux all the same.
         if (comptime std.mem.eql(u8, name, "lt_proc")) {
@@ -1575,6 +1569,18 @@ pub fn build(b: *std.Build) void {
     debug_cmd.step.dependOn(b.getInstallStep());
     const debug_step = b.step("debug", "Boot under QEMU with gdbstub on :1234 (use -Dhalt=true to pause at boot)");
     debug_step.dependOn(&debug_cmd.step);
+}
+
+/// `bin` as `name`, stamped EI_OSABI=3 (ELFOSABI_LINUX): the loader routes
+/// OSABI 3 to the Linux syscall layer, and toolchains write 0 there.
+fn stampOsabi(b: *std.Build, bin: std.Build.LazyPath, name: []const u8) std.Build.LazyPath {
+    const stamp = b.addSystemCommand(&.{
+        "sh", "-c",
+        \\cp "$1" "$2" && chmod u+w "$2" && printf '\003' | dd of="$2" bs=1 seek=7 count=1 conv=notrunc status=none
+        , "stamp-osabi",
+    });
+    stamp.addFileArg(bin);
+    return stamp.addOutputFileArg(name);
 }
 
 /// Reuse the existing BUILD.ID's value when no source under src/, lib/,

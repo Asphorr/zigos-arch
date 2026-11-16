@@ -32,7 +32,21 @@ pub const Ops = struct {
     /// `release` may sleep. A task's teardown can't, and leaves such a file
     /// to the reaper (dropAll, reap).
     release_sleeps: bool = false,
+    /// What the file is ready for now, as poll bits (fdpoll.POLL*), asked
+    /// by `pcb`'s process. Never sleeps.
+    poll: *const fn (f: *File, pcb: *process.PCB) u16 = pollByKind,
+    /// A count that moves whenever the file may have become ready for
+    /// more: what an edge-triggered watcher compares.
+    events: *const fn (f: *File) u32 = eventsByKind,
 };
+
+fn pollByKind(f: *File, pcb: *process.PCB) u16 {
+    return @import("../cpu/ipc/fdpoll.zig").maskOfFile(f, pcb);
+}
+
+fn eventsByKind(f: *File) u32 {
+    return @import("../cpu/ipc/fdpoll.zig").eventsOfFile(f);
+}
 
 fn denyRead(_: *File, _: *process.PCB, _: [*]u8, _: u32) u32 {
     return ERR;
@@ -72,6 +86,12 @@ pub const File = struct {
     /// The terminal this pipe end belongs to (proc/tty.zig), 0xFF for a
     /// file that is not one.
     tty: u8 = 0xFF,
+    /// (a) An epoll set refers to this file by address (epoll.zig): the
+    /// last reference tells it before the file is freed.
+    watched: bool = false,
+    /// The object of a kind that has one (a socket, an epoll set, an
+    /// eventfd), owned by the file.
+    obj: ?*anyopaque = null,
     /// Byte offset of the next read or write, shared by every descriptor on
     /// the file. Sharers that read or write at once race for it, as on any
     /// system without a position lock; each load and store is whole.
@@ -145,12 +165,27 @@ pub fn put(f: *File) void {
     }
 }
 
-/// True when the caller dropped the last reference.
+/// True when the caller dropped the last reference. No epoll set refers to
+/// the file from then on.
 fn dropRef(f: *File) bool {
     if (f.static) return false;
     const before = @atomicRmw(u32, &f.refs, .Sub, 1, .acq_rel);
     if (before == 0) @panic("file: reference dropped twice");
-    return before == 1;
+    if (before != 1) return false;
+    if (@atomicLoad(bool, &f.watched, .acquire)) @import("../cpu/ipc/epoll.zig").forget(f);
+    return true;
+}
+
+/// A reference for the holder of a bare pointer to `f` (an epoll set),
+/// taken under the lock `forget` takes; false when the last one is already
+/// gone and the file is on its way out.
+pub fn tryRef(f: *File) bool {
+    if (f.static) return true;
+    var n = @atomicLoad(u32, &f.refs, .monotonic);
+    while (n != 0) {
+        n = @cmpxchgWeak(u32, &f.refs, n, n + 1, .acq_rel, .monotonic) orelse return true;
+    }
+    return false;
 }
 
 /// The file behind `fd` of `pcb`'s table with a reference for the caller
@@ -244,28 +279,34 @@ pub fn copyTable(child: *process.PCB, parent: *process.PCB) void {
     }
 }
 
-/// Empty `pcb`'s whole table: a dying task's. Teardown may run where
-/// sleeping isn't allowed, so a file whose release may sleep and that lost
-/// its last reference here is queued for the reaper instead.
-pub fn dropAll(pcb: *process.PCB) void {
-    for (0..pcb.fd_table.len) |fd| {
-        const f = take(pcb, fd) orelse continue;
-        if (!f.ops.release_sleeps) {
-            put(f);
-        } else if (dropRef(f)) {
-            const flags = unreleased_lock.acquireIrqSave();
-            f.next_unreleased = unreleased;
-            unreleased = f;
-            unreleased_lock.releaseIrqRestore(flags);
-        }
+/// put where sleeping isn't allowed (a dying task's teardown, a look taken
+/// from inside a wait): a file whose release may sleep and that lost its
+/// last reference here is queued for the reaper instead.
+pub fn putNoSleep(f: *File) void {
+    if (!dropRef(f)) return;
+    // The last holder: the file's table can't change under us now.
+    if (!f.ops.release_sleeps) {
+        f.ops.release(f);
+        heap.kfree(@ptrCast(f));
+        return;
     }
+    const flags = unreleased_lock.acquireIrqSave();
+    f.next_unreleased = unreleased;
+    unreleased = f;
+    unreleased_lock.releaseIrqRestore(flags);
 }
 
-/// Files dropAll left unreleased, newest first.
+/// Empty `pcb`'s whole table: a dying task's.
+pub fn dropAll(pcb: *process.PCB) void {
+    for (0..pcb.fd_table.len) |fd| putNoSleep(take(pcb, fd) orelse continue);
+}
+
+/// Files putNoSleep left unreleased, newest first.
 var unreleased: ?*File = null; // (p:unreleased_lock)
 var unreleased_lock: SpinLock = .{};
 
-/// Release every file dropAll queued. Task context: the releases may sleep.
+/// Release every file putNoSleep queued. Task context: the releases may
+/// sleep.
 pub fn reap() void {
     while (true) {
         const flags = unreleased_lock.acquireIrqSave();

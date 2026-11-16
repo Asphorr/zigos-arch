@@ -50,6 +50,8 @@ const linux_fs = @import("linux_fs.zig");
 const linux_proc = @import("linux_proc.zig");
 const linux_signal = @import("linux_signal.zig");
 const linux_tty = @import("linux_tty.zig");
+const linux_net = @import("linux_net.zig");
+const linux_event = @import("linux_event.zig");
 const native_proc = @import("proc.zig");
 
 // --- Linux x86-64 errno (DISTINCT from zigos common.E_* — different values).
@@ -175,6 +177,34 @@ const SYS_tkill: u32 = 200;
 const SYS_tgkill: u32 = 234;
 const SYS_sysinfo: u32 = 99;
 const SYS_ppoll: u32 = 271;
+const SYS_select: u32 = 23;
+const SYS_pselect6: u32 = 270;
+const SYS_epoll_create: u32 = 213;
+const SYS_epoll_wait: u32 = 232;
+const SYS_epoll_ctl: u32 = 233;
+const SYS_epoll_pwait: u32 = 281;
+const SYS_epoll_create1: u32 = 291;
+const SYS_epoll_pwait2: u32 = 441;
+const SYS_eventfd: u32 = 284;
+const SYS_eventfd2: u32 = 290;
+const SYS_socket: u32 = 41;
+const SYS_connect: u32 = 42;
+const SYS_accept: u32 = 43;
+const SYS_sendto: u32 = 44;
+const SYS_recvfrom: u32 = 45;
+const SYS_sendmsg: u32 = 46;
+const SYS_recvmsg: u32 = 47;
+const SYS_shutdown: u32 = 48;
+const SYS_bind: u32 = 49;
+const SYS_listen: u32 = 50;
+const SYS_getsockname: u32 = 51;
+const SYS_getpeername: u32 = 52;
+const SYS_socketpair: u32 = 53;
+const SYS_setsockopt: u32 = 54;
+const SYS_getsockopt: u32 = 55;
+const SYS_accept4: u32 = 288;
+const SYS_recvmmsg: u32 = 299;
+const SYS_sendmmsg: u32 = 307;
 const SYS_utimensat: u32 = 280;
 const SYS_dup3: u32 = 292;
 const SYS_pipe2: u32 = 293;
@@ -365,6 +395,36 @@ pub fn dispatch(num: u32, frame: *signals.SyscallFrame) u64 {
         SYS_dup3 => return linux_proc.dup3(a1, a2, a3),
         SYS_poll => return linux_proc.poll(a1, a2, a3),
         SYS_ppoll => return linux_proc.ppoll(a1, a2, a3, a4, a5),
+        // The other ways to wait on many files (linux_event.zig).
+        SYS_select => return linux_event.select(a1, a2, a3, a4, a5),
+        SYS_pselect6 => return linux_event.pselect6(a1, a2, a3, a4, a5, a6),
+        SYS_epoll_create => return if (@as(i32, @bitCast(@as(u32, @truncate(a1)))) <= 0) err(EINVAL) else linux_event.epollCreate(0),
+        SYS_epoll_create1 => return linux_event.epollCreate(a1),
+        SYS_epoll_ctl => return linux_event.epollCtl(a1, a2, a3, a4),
+        SYS_epoll_wait => return linux_event.epollPwait(a1, a2, a3, a4, 0, 0),
+        SYS_epoll_pwait => return linux_event.epollPwait(a1, a2, a3, a4, a5, a6),
+        SYS_epoll_pwait2 => return linux_event.epollPwait2(a1, a2, a3, a4, a5, a6),
+        SYS_eventfd => return linux_event.eventfd2(a1, 0),
+        SYS_eventfd2 => return linux_event.eventfd2(a1, a2),
+        // Sockets (linux_net.zig).
+        SYS_socket => return linux_net.sysSocket(a1, a2, a3),
+        SYS_socketpair => return linux_net.sysSocketpair(a1, a2, a3, a4),
+        SYS_bind => return linux_net.sysBind(a1, a2, a3),
+        SYS_connect => return linux_net.sysConnect(a1, a2, a3),
+        SYS_listen => return linux_net.sysListen(a1),
+        SYS_accept => return linux_net.sysAccept4(a1, a2, a3, 0),
+        SYS_accept4 => return linux_net.sysAccept4(a1, a2, a3, a4),
+        SYS_getsockname => return linux_net.sysGetsockname(a1, a2, a3),
+        SYS_getpeername => return linux_net.sysGetpeername(a1, a2, a3),
+        SYS_shutdown => return linux_net.sysShutdown(a1, a2),
+        SYS_sendto => return linux_net.sysSendto(a1, a2, a3, a4, a5, a6),
+        SYS_recvfrom => return linux_net.sysRecvfrom(a1, a2, a3, a4, a5, a6),
+        SYS_sendmsg => return linux_net.sysSendmsg(a1, a2, a3),
+        SYS_recvmsg => return linux_net.sysRecvmsg(a1, a2, a3),
+        SYS_sendmmsg => return linux_net.sysSendmmsg(a1, a2, a3, a4),
+        SYS_recvmmsg => return linux_net.sysRecvmmsg(a1, a2, a3, a4),
+        SYS_setsockopt => return linux_net.sysSetsockopt(a1, a2, a3, a4, a5),
+        SYS_getsockopt => return linux_net.sysGetsockopt(a1, a2, a3, a4, a5),
         SYS_process_vm_readv => return linux_proc.processVmReadv(a1, a2, a3, a4, a5, a6),
         SYS_sysinfo => return linux_proc.sysinfo(a1),
         SYS_utimensat => return linux_fs.utimensat(a1, a2, a3, a4),
@@ -489,6 +549,28 @@ fn vfsResult(n: u32) u64 {
         },
         @intFromEnum(errno.Errno.EFAULT) => EFAULT,
         @intFromEnum(errno.Errno.ENOMEM) => ENOMEM,
+        // What a socket's read and write end with.
+        @intFromEnum(errno.Errno.ENOTCONN) => 107,
+        @intFromEnum(errno.Errno.ECONNREFUSED) => 111,
+        @intFromEnum(errno.Errno.ECONNRESET) => 104,
+        @intFromEnum(errno.Errno.ETIMEDOUT) => 110,
+        @intFromEnum(errno.Errno.EHOSTUNREACH) => 113,
+        @intFromEnum(errno.Errno.EMSGSIZE) => 90,
+        @intFromEnum(errno.Errno.EDESTADDRREQ) => 89,
+        @intFromEnum(errno.Errno.EOPNOTSUPP) => EOPNOTSUPP,
+        else => EBADF,
+    });
+}
+
+/// vfsResult for a read or write of `fd`. The all-ones code is a bad
+/// descriptor or a file that can't do this (EBADF) from the files of the
+/// file systems, and a bad argument from an object that judges its own.
+fn ioResult(pcb: *process.PCB, fd: u32, n: u32) u64 {
+    if (n != @intFromEnum(errno.Errno.EINVAL)) return vfsResult(n);
+    const fe = file.get(pcb, fd) orelse return err(EBADF);
+    defer file.put(fe);
+    return err(switch (fe.kind) {
+        .socket, .eventfd, .epoll => EINVAL,
         else => EBADF,
     });
 }
@@ -511,7 +593,7 @@ fn sysWrite(fd: u32, buf_va: u64, count: u64) u64 {
     const pcb = proc() orelse return err(EFAULT);
     const buf: [*]const u8 = @ptrFromInt(buf_va);
     if (fd <= 2 and len <= 1024) debug.klog("[linux] write(fd={d}): {s}", .{ fd, buf[0..len] });
-    return vfsResult(vfs.write(pcb, fd, buf, len));
+    return ioResult(pcb, fd, vfs.write(pcb, fd, buf, len));
 }
 
 /// read(fd, buf, count). Delegates to vfs.read, which returns 0 at EOF.
@@ -521,7 +603,7 @@ fn sysRead(fd: u32, buf_va: u64, count: u64) u64 {
     const len = readLen(pcb, fd, count);
     if (len == 0) return 0;
     if (!common.validateUserPtrWrite(buf_va, len)) return err(EFAULT);
-    return vfsResult(vfs.read(pcb, fd, @ptrFromInt(buf_va), len));
+    return ioResult(pcb, fd, vfs.read(pcb, fd, @ptrFromInt(buf_va), len));
 }
 
 /// writev(fd, iov, iovcnt). musl's stdio writes everything through writev (the
@@ -553,7 +635,7 @@ fn sysWritev(fd: u32, iov_va: u64, iovcnt: u64) u64 {
         const w = vfs.write(pcb, fd, buf, l);
         if (w >= errno.ERR_SENTINEL_BASE) {
             if (total > 0) return total;
-            return vfsResult(w);
+            return ioResult(pcb, fd, w);
         }
         total += w;
         if (w < l) break; // short write — stop, report what landed
@@ -590,7 +672,7 @@ fn sysReadv(fd: u32, iov_va: u64, iovcnt: u64) u64 {
         const r = vfs.read(pcb, fd, @ptrFromInt(base), l);
         if (r >= errno.ERR_SENTINEL_BASE) {
             if (total > 0) return total;
-            return vfsResult(r);
+            return ioResult(pcb, fd, r);
         }
         total += r;
         budget -= r;
@@ -646,7 +728,7 @@ fn sysLseek(fd: u32, off: u64, whence: u32) u64 {
     const fe = file.get(pcb, fd) orelse return err(EBADF);
     defer file.put(fe);
     switch (fe.kind) {
-        .console, .pipe, .tcp_sock, .tcp_listener => return err(ESPIPE),
+        .console, .pipe, .tcp_sock, .tcp_listener, .socket, .epoll, .eventfd => return err(ESPIPE),
         else => {},
     }
     const new: u64 = switch (whence) {

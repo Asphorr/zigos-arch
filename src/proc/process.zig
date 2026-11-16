@@ -143,7 +143,9 @@ pub const Priority = enum(u8) {
     interactive = 2,
 };
 
-pub const FsType = enum(u8) { console = 0, fat32 = 1, tarfs = 2, pipe = 3, devfs = 4, procfs = 5, ext2 = 6, tcp_sock = 7, tcp_listener = 8 };
+/// tcp_sock and tcp_listener are the native calls' connection slots; socket,
+/// epoll and eventfd are objects behind `File.obj` with tables of their own.
+pub const FsType = enum(u8) { console = 0, fat32 = 1, tarfs = 2, pipe = 3, devfs = 4, procfs = 5, ext2 = 6, tcp_sock = 7, tcp_listener = 8, socket = 9, epoll = 10, eventfd = 11 };
 
 /// Generic blocking primitive used by waitpid + pipe read/write. The scheduler
 /// treats a PCB with wait_kind != .none as not runnable. Exactly one waiter

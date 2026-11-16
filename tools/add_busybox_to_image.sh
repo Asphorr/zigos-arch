@@ -19,7 +19,7 @@ IMG=${2:-ext2.img}
 
 APPLETS="sh echo tr sort head tail wc sed grep awk cut seq expr basename
 dirname xargs uname rm mkdir cat cp mv ln readlink ls find du touch sleep env
-yes dd date true false kill ps id stat"
+yes dd date true false kill ps id stat wget nc nslookup"
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
@@ -27,6 +27,7 @@ trap 'rm -rf "$TMP"' EXIT
 # loader tells a Linux program by (toolchains leave 0 there).
 cp "$BB" "$TMP/busybox"
 printf '\003' | dd of="$TMP/busybox" bs=1 seek=7 count=1 conv=notrunc status=none
+printf '127.0.0.1 localhost\n' > "$TMP/hosts"
 {
     echo "rm bin/busybox"
     echo "write $TMP/busybox bin/busybox"
@@ -34,6 +35,8 @@ printf '\003' | dd of="$TMP/busybox" bs=1 seek=7 count=1 conv=notrunc status=non
     echo "mkdir tmp"
     echo "rm etc/bbtest.sh"
     echo "write linux-tests/bbtest.sh etc/bbtest.sh"
+    echo "rm etc/hosts"
+    echo "write $TMP/hosts etc/hosts"
     for a in $APPLETS; do
         echo "rm bin/$a"
         echo "symlink bin/$a busybox"

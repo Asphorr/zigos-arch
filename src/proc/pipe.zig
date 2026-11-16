@@ -40,6 +40,10 @@ pub const PIPE_INTR: usize = 0xFFFF_FFF1;
 /// write() with the read side fully closed.
 pub const PIPE_CLOSED: usize = 0xFFFF_FFF2;
 
+/// readOpt() and writeOpt() that would have had to wait, and were told not
+/// to, before any byte moved.
+pub const PIPE_AGAIN: usize = 0xFFFF_FFF3;
+
 pub const Pipe = struct {
     /// Ring contents are contract-undefined while the slot is unclaimed
     /// — slot_table.claim skips resetting them (see claim_skip_reset).
@@ -131,6 +135,12 @@ pub fn setDesktopDrain(id: u8) void {
 /// (POSIX: transferred data wins) and the error surfaces on the next call.
 /// Caller is the current process.
 pub fn read(id: u8, out: []u8) usize {
+    return readOpt(id, out, true);
+}
+
+/// read; with `block` false an empty ring that still has a writer is
+/// PIPE_AGAIN instead of a wait.
+pub fn readOpt(id: u8, out: []u8, block: bool) usize {
     if (id >= MAX_PIPES) return 0;
     const p = &pipes[id];
     if (!p.in_use) return 0;
@@ -202,6 +212,11 @@ pub fn read(id: u8, out: []u8) usize {
             p.lock.releaseIrqRestore(flags);
             fdpoll.wakePollers(.pipe, id);
             return copied;
+        }
+
+        if (!block) {
+            p.lock.releaseIrqRestore(flags);
+            return PIPE_AGAIN;
         }
 
         // Sleep until a writer pushes data (or all writers close). The
@@ -286,6 +301,12 @@ pub fn tryRead(id: u8, out: []u8) usize {
 /// written (EFAULT). A partial count is returned if bytes were already
 /// pushed before the buffer went bad — those bytes are real ring data.
 pub fn write(id: u8, data: []const u8) usize {
+    return writeOpt(id, data, true);
+}
+
+/// write; with `block` false a full ring ends the call with what went in,
+/// PIPE_AGAIN if nothing did.
+pub fn writeOpt(id: u8, data: []const u8, block: bool) usize {
     if (id >= MAX_PIPES) return 0;
     const p = &pipes[id];
     if (!p.in_use) return PIPE_ERR;
@@ -341,6 +362,12 @@ pub fn write(id: u8, data: []const u8) usize {
                 }
             }
             continue;
+        }
+
+        if (!block) {
+            p.lock.releaseIrqRestore(flags);
+            if (pushed_data) fdpoll.wakePollers(.pipe, id);
+            return if (written > 0) written else PIPE_AGAIN;
         }
 
         // Ring full — sleep until reader drains. Bail on pending signal

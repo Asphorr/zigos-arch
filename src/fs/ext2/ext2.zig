@@ -478,6 +478,31 @@ pub fn createFilePath(path: []const u8) ?Handle {
 /// links_count=1, size=0, current epoch timestamps. Updates the path
 /// cache (via invalidateAll — conservative; ext2 mutations are rare).
 pub fn createFile(parent_inum: u32, name: []const u8) ?u32 {
+    return createNode(parent_inum, name, layout.S_IFREG | 0o644, layout.FT_REG_FILE);
+}
+
+/// A socket inode at `path`, held: what binding a Unix socket to a path
+/// makes. It has no data; the socket that holds it is found by its number
+/// (net/unix.zig). Null if the name exists or its directory doesn't.
+pub fn createSocketHeld(path: []const u8) ?u32 {
+    if (path.len == 0 or path.len > 255) return null;
+    const m = block.getMount() orelse return null;
+    block.lockMount(m);
+    defer block.unlockMount(m);
+    const split = splitParentLeaf(path);
+    if (split.leaf.len == 0) return null;
+    const parent_inum = if (split.parent.len == 0) layout.ROOT_INO else (cachedWalk(split.parent) orelse return null);
+    const inum = createNode(parent_inum, split.leaf, layout.S_IFSOCK | 0o755, layout.FT_SOCK) orelse return null;
+    if (!held.hold(inum)) {
+        _ = unlinkInDir(parent_inum, split.leaf, .file_only);
+        return null;
+    }
+    return inum;
+}
+
+/// createFile for an inode of any type that has no data to set up: `mode`
+/// with its type bits, `file_type` the directory entry's.
+fn createNode(parent_inum: u32, name: []const u8, mode: u16, file_type: u8) ?u32 {
     if (name.len == 0 or name.len > 255) return null;
     if (containsSlash(name)) return null;
     const m = block.getMount() orelse return null;
@@ -496,7 +521,7 @@ pub fn createFile(parent_inum: u32, name: []const u8) ?u32 {
     var new_ino: layout.Inode = std.mem.zeroes(layout.Inode);
     const t = time.now();
     const sec: u32 = @truncate(t.sec);
-    new_ino.mode = layout.S_IFREG | 0o644;
+    new_ino.mode = mode;
     new_ino.uid = 0;
     new_ino.gid = 0;
     new_ino.links_count = 1;
@@ -511,7 +536,7 @@ pub fn createFile(parent_inum: u32, name: []const u8) ?u32 {
         return null;
     }
 
-    if (!dirInsert(m, &parent, name, new_inum, layout.FT_REG_FILE)) {
+    if (!dirInsert(m, &parent, name, new_inum, file_type)) {
         // Roll back inode alloc on directory-insert failure.
         _ = inode.freeInode(new_inum, false);
         return null;

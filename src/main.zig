@@ -507,6 +507,10 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     // that sleeps: a connection's close, a FAT flush).
     if (@import("proc/lifecycle.zig").createKernelTask(@intFromPtr(&filedEntry), "filed", 0, .normal, 32 * 1024) == null)
         blog.warn("filed", "spawn failed — files of killed tasks stay unreleased", .{});
+    // netd — the network's clock: TCP's timers run from it, and a NIC
+    // without interrupts is read from it.
+    if (@import("proc/lifecycle.zig").createKernelTask(@intFromPtr(&netdEntry), "netd", 0, .normal, 32 * 1024) == null)
+        blog.warn("netd", "spawn failed — no TCP retransmission, closes never finish", .{});
     // Route AML Notify()s to a dispatcher: the PCI-hotplug \_GPE._E01 Notifies
     // the affected slot, and acpid rescans the bus so a hot-added device is
     // detected + registered. Registered before acpid spawns (the only thing that
@@ -953,6 +957,21 @@ fn filedEntry() callconv(.c) noreturn {
     while (true) {
         sched.kernelSleepMs(FILED_INTERVAL_MS);
         if (file.reapPending()) file.reap();
+    }
+}
+
+/// netd kernel-thread entry: net.poll at a steady pace. That retransmits
+/// what TCP has waited too long for, finishes the closes of connections
+/// whose sockets are gone, and takes frames off a NIC that raises no
+/// interrupt. Slower while no socket is open.
+const NETD_BUSY_MS: u32 = 50;
+const NETD_IDLE_MS: u32 = 500;
+fn netdEntry() callconv(.c) noreturn {
+    const net = @import("net/net.zig");
+    const sched = @import("proc/sched.zig");
+    while (true) {
+        sched.kernelSleepMs(if (net.busy()) NETD_BUSY_MS else NETD_IDLE_MS);
+        net.poll();
     }
 }
 

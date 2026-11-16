@@ -94,6 +94,7 @@ const S_IFIFO: u32 = 0o0010000;
 const S_IFCHR: u32 = 0o0020000;
 const S_IFDIR: u32 = 0o0040000;
 const S_IFREG: u32 = 0o0100000;
+const S_IFSOCK: u32 = 0o0140000;
 
 /// Linux x86-64 `struct stat`, 144 bytes (arch/x86/include/uapi/asm/stat.h).
 pub const LinuxStat = extern struct {
@@ -251,7 +252,7 @@ const Node = union(enum) { ext2: u32, missing, other };
 
 /// Whether a symbolic link in a path's last component is followed (the ones
 /// before it always are).
-const Last = enum { follow, nofollow };
+pub const Last = enum { follow, nofollow };
 
 fn resolve(pcb: *process.PCB, path: []const u8, buf: *[256]u8, last: Last) ?vfs.ResolvedPath {
     return if (last == .follow) vfs.resolvePath(pcb, path, buf) else vfs.resolvePathNoFollow(pcb, path, buf);
@@ -266,7 +267,7 @@ fn lookupNode(pcb: *process.PCB, path: []const u8, last: Last) Node {
 
 /// `path` as a path inside the ext2 root, or the errno for a name that
 /// isn't on it.
-fn ext2Path(pcb: *process.PCB, path: []const u8, buf: *[256]u8, last: Last) PathRead {
+pub fn ext2Path(pcb: *process.PCB, path: []const u8, buf: *[256]u8, last: Last) PathRead {
     const r = resolve(pcb, path, buf, last) orelse return .{ .fail = err(ENOENT) };
     if (r.fs != .ext2) return .{ .fail = err(EROFS) };
     return .{ .path = r.path };
@@ -433,6 +434,9 @@ pub fn fdFacts(pcb: *process.PCB, fd: u64) FactsRead {
         .console => .{ .facts = CONSOLE_FACTS },
         .ext2 => if (ext2Facts(fe.inode)) |f| .{ .facts = f } else .{ .fail = err(EIO) },
         .pipe => .{ .facts = .{ .mode = S_IFIFO | 0o600 } },
+        .socket => .{ .facts = .{ .mode = S_IFSOCK | 0o777 } },
+        // Anonymous inodes, as an epoll set and an eventfd are on Linux.
+        .epoll, .eventfd => .{ .facts = .{ .mode = 0o600 } },
         else => .{ .facts = .{ .mode = S_IFREG | 0o644 } },
     };
 }

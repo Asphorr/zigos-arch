@@ -42,6 +42,10 @@ pub const Errno = enum(u32) {
     ENOTCONN = 0xFFFFFFE3,
     EALREADY = 0xFFFFFFE2,
     ETXTBSY = 0xFFFFFFE1, // Text file busy — write/truncate of a running executable's image
+    ECONNRESET = 0xFFFFFFE0,
+    EDESTADDRREQ = 0xFFFFFFDF,
+    EMSGSIZE = 0xFFFFFFDE,
+    EOPNOTSUPP = 0xFFFFFFDD,
 };
 
 /// Encode an errno as a syscall return value.

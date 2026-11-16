@@ -54,8 +54,8 @@ const TCP_SYN: u8 = 0x02;
 const TCP_RST: u8 = 0x04;
 const TCP_PSH: u8 = 0x08;
 const TCP_ACK: u8 = 0x10;
-const TCP_MAX_CONNS = 16;
-const TCP_MAX_LISTENERS = 4;
+const TCP_MAX_CONNS = 32;
+const TCP_MAX_LISTENERS = 8;
 const TCP_RX_BUF_SIZE = 8192;
 const TCP_SND_BUF_SIZE = 8192; // per-conn ring of unacked+unsent outbound data
 const TCP_OOO_BUF_SIZE = 4096; // per-conn buffer for one out-of-order segment run
@@ -68,7 +68,14 @@ const TCP_MAX_CWND: u32 = 65535; // congestion-window ceiling (bytes)
 const TCP_MAX_RETRIES: u8 = 3;
 const TCP_NO_LISTENER: u8 = 0xFF;
 // Per-listener ring of accepted-but-not-yet-handed-out connection slots.
-const TCP_ACCEPT_RING_SIZE: u8 = 4;
+const TCP_ACCEPT_RING_SIZE: u8 = 16;
+/// The peer hears of a receive window that opened by this much (two full
+/// segments, RFC 1122's rule against silly windows).
+const TCP_WINDOW_UPDATE: u32 = 2 * 1460;
+/// How long a connection whose socket is gone may take to finish its close.
+const TCP_ORPHAN_TICKS: u64 = 1000;
+/// How long a closed connection lingers for stray segments (10 ms ticks).
+const TCP_TIME_WAIT_TICKS: u64 = 200;
 
 // Active network config. Initial values match QEMU SLIRP — the user-mode
 // networking DHCP server offers exactly these — so the stack still works
@@ -161,6 +168,12 @@ pub fn isLoopback(ip: [4]u8) bool {
     return ip[0] == 127;
 }
 
+/// True for an address of this machine — loopback or the interface's own:
+/// what is sent there never touches the wire.
+pub fn isLocal(ip: [4]u8) bool {
+    return isLoopback(ip) or std.mem.eql(u8, &ip, &local_ip);
+}
+
 /// Pick the IP to stamp as src on an outbound packet. For loopback we
 /// mirror the destination so the receive side's conn-tuple match works
 /// in both directions.
@@ -195,15 +208,48 @@ fn buildIPv4Header(buf: []u8, protocol: u8, dst_ip: [4]u8, payload_len: u16) voi
 /// exactly one place. Caller has already built the full Ethernet+IP+L4
 /// frame in `pkt`.
 fn dispatchPacket(dst_ip: [4]u8, pkt: []u8) bool {
-    if (isLoopback(dst_ip)) {
-        const vptr: [*]volatile u8 = @ptrCast(pkt.ptr);
-        // Direct call, NOT handleRxFrame: every dispatchPacket caller already
-        // holds net_lock (public-API discipline) and the ticket lock is not
-        // reentrant — re-acquiring here would self-deadlock loopback sends.
-        processReceivedPacket(vptr[0..pkt.len]);
-        return true;
-    }
+    if (isLocal(dst_ip)) return deliverLocal(pkt);
     return nic.send(pkt);
+}
+
+// Frames for this machine wait here until the holder of net_lock lets go
+// (netUnlock): the sender has finished its own bookkeeping by then — a
+// segment's ACK finds snd_nxt already past it — and a local exchange is a
+// loop at the top of one call, not a recursion a segment deep per segment.
+// Empty whenever the lock is free. (p:net_lock)
+const LOCAL_QUEUE: usize = 32;
+var local_frames: [LOCAL_QUEUE][1514]u8 = undefined;
+var local_lens: [LOCAL_QUEUE]u16 = [_]u16{0} ** LOCAL_QUEUE;
+var local_head: usize = 0;
+var local_count: usize = 0;
+
+/// Queue a frame for this machine's own receive path. False when the queue
+/// is full and the frame is dropped (TCP sends it again).
+fn deliverLocal(pkt: []u8) bool {
+    if (local_count == LOCAL_QUEUE or pkt.len > 1514) return false;
+    const at = (local_head + local_count) % LOCAL_QUEUE;
+    @memcpy(local_frames[at][0..pkt.len], pkt);
+    local_lens[at] = @intCast(pkt.len);
+    local_count += 1;
+    return true;
+}
+
+/// Process the queued local frames, and what their processing queues.
+fn drainLocal() void {
+    while (local_count > 0) {
+        // In place: what this frame's processing queues lands behind it.
+        const frame: [*]volatile u8 = @ptrCast(&local_frames[local_head]);
+        processReceivedPacket(frame[0..local_lens[local_head]]);
+        local_head = (local_head + 1) % LOCAL_QUEUE;
+        local_count -= 1;
+    }
+}
+
+/// Every release of net_lock: the local frames the holder sent go through
+/// the receive path first.
+fn netUnlock(saved: u64) void {
+    drainLocal();
+    net_lock.releaseIrqRestore(saved);
 }
 
 fn tcpChecksum(src_ip: [4]u8, dst_ip: [4]u8, tcp_data: []const u8) u16 {
@@ -238,7 +284,7 @@ var udp_listeners: [4]UdpListener = [_]UdpListener{.{}} ** 4;
 
 pub fn udpListen(port: u16) ?u8 {
     const lk = net_lock.acquireIrqSave();
-    defer net_lock.releaseIrqRestore(lk);
+    defer netUnlock(lk);
     for (&udp_listeners, 0..) |*l, i| {
         if (!l.active) {
             l.port = port;
@@ -252,7 +298,7 @@ pub fn udpListen(port: u16) ?u8 {
 
 pub fn udpUnlisten(slot: u8) void {
     const lk = net_lock.acquireIrqSave();
-    defer net_lock.releaseIrqRestore(lk);
+    defer netUnlock(lk);
     if (slot < 4) udp_listeners[slot].active = false;
 }
 
@@ -283,13 +329,16 @@ pub fn udpConsume(slot: u8) void {
     udp_listeners[slot].has_data = false;
 }
 
+/// The most a datagram carries: one frame, there is no fragmenting.
+pub const UDP_MAX_PAYLOAD: usize = 1500 - IPV4_HDR_SIZE - UDP_HDR_SIZE;
+
 pub fn udpSend(dst_ip: [4]u8, dst_port: u16, src_port: u16, payload: []const u8) bool {
-    if (payload.len > 1400) return false;
-    const loop = isLoopback(dst_ip);
+    if (payload.len > UDP_MAX_PAYLOAD) return false;
+    const loop = isLocal(dst_ip);
     // Blocking ARP resolution OUTSIDE the lock (it polls + sleeps).
     if (!loop and !arpResolveGateway()) return false;
     const lk = net_lock.acquireIrqSave();
-    defer net_lock.releaseIrqRestore(lk);
+    defer netUnlock(lk);
     var pkt: [1514]u8 = undefined;
     const src_mac = nic.getMac();
     const dst_mac = if (loop) src_mac else gateway_mac;
@@ -314,7 +363,7 @@ pub fn udpSend(dst_ip: [4]u8, dst_port: u16, src_port: u16, payload: []const u8)
 pub fn udpSendBroadcast(src_port: u16, dst_port: u16, payload: []const u8) bool {
     if (payload.len > 1400) return false;
     const lk = net_lock.acquireIrqSave();
-    defer net_lock.releaseIrqRestore(lk);
+    defer netUnlock(lk);
     var pkt: [1514]u8 = undefined;
     const src_mac = nic.getMac();
     buildEthHeader(&pkt, BROADCAST_MAC, src_mac, ETHERTYPE_IPV4);
@@ -378,6 +427,212 @@ fn handleUdpPacket(ip_data: []volatile u8, ihl: usize) void {
             return;
         }
     }
+    for (&udp_socks) |*s| {
+        if (!s.active or s.port != dst_port) continue;
+        const src: [*]const u8 = @volatileCast(udp[UDP_HDR_SIZE..].ptr);
+        udpQueue(s, .{ ip_data[12], ip_data[13], ip_data[14], ip_data[15] }, src_port, src[0..data_len]);
+        return;
+    }
+}
+
+// === UDP sockets ===
+//
+// A socket's port and the datagrams waiting on it, each stored in the ring
+// as a header (length, source port, source address) and its payload. The
+// ring is the socket's from udpOpen to udpClose and written by the receive
+// path under net_lock.
+
+const UDP_SOCKS: usize = 16;
+const UDP_RING: u32 = 16 * 1024;
+const UDP_REC_HDR: u32 = 8;
+// Ports handed to sockets that ask for none. The kernel's own resolver
+// counts up from 49152, clear of these.
+const UDP_EPHEMERAL_FIRST: u16 = 32768;
+const UDP_EPHEMERAL_LAST: u16 = 49151;
+
+const UdpSock = struct {
+    active: bool = false,
+    /// 0: not bound yet.
+    port: u16 = 0,
+    ring: [*]u8 = undefined,
+    head: u32 = 0,
+    used: u32 = 0,
+    /// Datagrams queued so far: what an edge-triggered watcher compares.
+    events: u32 = 0,
+    dropped: u32 = 0,
+};
+var udp_socks: [UDP_SOCKS]UdpSock = [_]UdpSock{.{}} ** UDP_SOCKS;
+var udp_next_ephemeral: u16 = UDP_EPHEMERAL_FIRST;
+
+fn udpRingPut(s: *UdpSock, at: u32, bytes: []const u8) void {
+    var pos = at % UDP_RING;
+    for (bytes) |b| {
+        s.ring[pos] = b;
+        pos = (pos + 1) % UDP_RING;
+    }
+}
+
+fn udpRingGet(s: *const UdpSock, at: u32, out: []u8) void {
+    var pos = at % UDP_RING;
+    for (out) |*o| {
+        o.* = s.ring[pos];
+        pos = (pos + 1) % UDP_RING;
+    }
+}
+
+/// Queue a received datagram on `s`; one that doesn't fit is dropped, as
+/// UDP allows. Lock held.
+fn udpQueue(s: *UdpSock, src_ip: [4]u8, src_port: u16, payload: []const u8) void {
+    const need: u32 = UDP_REC_HDR + @as(u32, @intCast(payload.len));
+    if (s.used + need > UDP_RING) {
+        s.dropped +%= 1;
+        return;
+    }
+    var hdr: [UDP_REC_HDR]u8 = undefined;
+    writeU16BE(hdr[0..2], @intCast(payload.len));
+    writeU16BE(hdr[2..4], src_port);
+    @memcpy(hdr[4..8], &src_ip);
+    const at = s.head + s.used;
+    udpRingPut(s, at, &hdr);
+    udpRingPut(s, at + UDP_REC_HDR, payload);
+    s.used += need;
+    s.events +%= 1;
+    @import("../cpu/ipc/fdpoll.zig").notify();
+}
+
+fn udpPortTaken(port: u16) bool {
+    for (&udp_socks) |*s| {
+        if (s.active and s.port == port) return true;
+    }
+    for (&udp_listeners) |*l| {
+        if (l.active and l.port == port) return true;
+    }
+    return false;
+}
+
+/// A new UDP socket, not bound. Null when the table or memory is out.
+pub fn udpOpen() ?u8 {
+    const heap = @import("../mm/heap.zig");
+    const ring = heap.kmalloc(UDP_RING) orelse return null;
+    {
+        const lk = net_lock.acquireIrqSave();
+        defer netUnlock(lk);
+        for (&udp_socks, 0..) |*s, i| {
+            if (s.active) continue;
+            s.* = .{ .active = true, .ring = ring };
+            return @intCast(i);
+        }
+    }
+    heap.kfree(ring);
+    return null;
+}
+
+pub fn udpClose(slot: u8) void {
+    if (slot >= UDP_SOCKS) return;
+    var ring: ?[*]u8 = null;
+    {
+        const lk = net_lock.acquireIrqSave();
+        defer netUnlock(lk);
+        const s = &udp_socks[slot];
+        if (!s.active) return;
+        ring = s.ring;
+        s.* = .{};
+    }
+    if (ring) |r| @import("../mm/heap.zig").kfree(r);
+}
+
+/// Give socket `slot` the port `port`, or with 0 one nobody has. False if
+/// the port is taken or the socket already has one.
+pub fn udpBind(slot: u8, port: u16) bool {
+    if (slot >= UDP_SOCKS) return false;
+    const lk = net_lock.acquireIrqSave();
+    defer netUnlock(lk);
+    const s = &udp_socks[slot];
+    if (!s.active or s.port != 0) return false;
+    if (port != 0) {
+        if (udpPortTaken(port)) return false;
+        s.port = port;
+        return true;
+    }
+    var tries: u32 = 0;
+    while (tries <= UDP_EPHEMERAL_LAST - UDP_EPHEMERAL_FIRST) : (tries += 1) {
+        const candidate = udp_next_ephemeral;
+        udp_next_ephemeral = if (candidate == UDP_EPHEMERAL_LAST) UDP_EPHEMERAL_FIRST else candidate + 1;
+        if (udpPortTaken(candidate)) continue;
+        s.port = candidate;
+        return true;
+    }
+    return false;
+}
+
+/// The socket's port, 0 before it has one.
+pub fn udpPort(slot: u8) u16 {
+    if (slot >= UDP_SOCKS) return 0;
+    return udp_socks[slot].port;
+}
+
+/// Send a datagram from socket `slot`, which gets a port now if it has
+/// none. Task context: finding the gateway may sleep.
+pub fn udpSendFrom(slot: u8, dst_ip: [4]u8, dst_port: u16, payload: []const u8) bool {
+    if (slot >= UDP_SOCKS) return false;
+    if (udp_socks[slot].port == 0 and !udpBind(slot, 0)) return false;
+    return udpSend(dst_ip, dst_port, udp_socks[slot].port, payload);
+}
+
+pub const UdpDatagram = struct {
+    /// The datagram's whole length; more than was asked for was cut off.
+    len: usize,
+    src_ip: [4]u8,
+    src_port: u16,
+};
+
+/// The oldest datagram waiting on `slot` into `out` (kernel memory), taken
+/// off the queue unless `peek`. With `only`, datagrams from anyone else are
+/// dropped on the way (a connected socket). Null when none waits.
+pub fn udpRecv(slot: u8, out: []u8, peek: bool, only: ?Endpoint) ?UdpDatagram {
+    if (slot >= UDP_SOCKS) return null;
+    const lk = net_lock.acquireIrqSave();
+    defer netUnlock(lk);
+    const s = &udp_socks[slot];
+    if (!s.active) return null;
+    while (s.used != 0) {
+        var hdr: [UDP_REC_HDR]u8 = undefined;
+        udpRingGet(s, s.head, &hdr);
+        const len: u32 = readU16BE(hdr[0..2]);
+        const d = UdpDatagram{ .len = len, .src_ip = hdr[4..8].*, .src_port = readU16BE(hdr[2..4]) };
+        const wanted = if (only) |p| std.mem.eql(u8, &p.ip, &d.src_ip) and p.port == d.src_port else true;
+        if (wanted) {
+            udpRingGet(s, s.head + UDP_REC_HDR, out[0..@min(@as(usize, len), out.len)]);
+            if (peek) return d;
+        }
+        s.head = (s.head + UDP_REC_HDR + len) % UDP_RING;
+        s.used -= UDP_REC_HDR + len;
+        if (wanted) return d;
+    }
+    return null;
+}
+
+/// Lock-free: a datagram waits on `slot`.
+pub fn udpReadable(slot: u8) bool {
+    if (slot >= UDP_SOCKS) return false;
+    return udp_socks[slot].used != 0;
+}
+
+pub fn udpEvents(slot: u8) u32 {
+    if (slot >= UDP_SOCKS) return 0;
+    return udp_socks[slot].events;
+}
+
+/// The length of the datagram a read would take next, 0 for none (FIONREAD).
+pub fn udpNextLen(slot: u8) usize {
+    if (slot >= UDP_SOCKS) return 0;
+    const lk = net_lock.acquireIrqSave();
+    defer netUnlock(lk);
+    const s = &udp_socks[slot];
+    if (!s.active or s.used == 0) return 0;
+    var hdr: [UDP_REC_HDR]u8 = undefined;
+    udpRingGet(s, s.head, &hdr);
+    return readU16BE(hdr[0..2]);
 }
 
 // === DNS ===
@@ -564,7 +819,26 @@ const TcpConn = struct {
     /// slot so we know where to enqueue ourselves on the established
     /// transition. TCP_NO_LISTENER for outbound (tcpConnect) connections.
     listener_slot: u8 = TCP_NO_LISTENER,
+    /// The receive window the peer was last told (emitSegment).
+    adv_wnd: u16 = TCP_RX_BUF_SIZE,
+    /// Why error_flag is set, for the socket's SO_ERROR.
+    fail: TcpFail = .none,
+    /// Our side has no more to send: the FIN goes out once the send ring is
+    /// acked empty (maybeSendFin).
+    fin_wanted: bool = false,
+    fin_sent: bool = false,
+    /// Nobody will read: what the peer still sends is acked and dropped.
+    rd_closed: bool = false,
+    /// Its socket is gone (tcpRelease): the slot frees itself when the
+    /// close is done, or at orphan_deadline.
+    orphan: bool = false,
+    orphan_deadline: u64 = 0,
+    /// Counts data, send space, the peer's close and failure: what an
+    /// edge-triggered watcher compares.
+    events: u32 = 0,
 };
+
+pub const TcpFail = enum(u8) { none, refused, reset, timed_out };
 
 const TcpListener = struct {
     active: bool = false,
@@ -575,6 +849,8 @@ const TcpListener = struct {
     accept_ring: [TCP_ACCEPT_RING_SIZE]u8 = [_]u8{0xFF} ** TCP_ACCEPT_RING_SIZE,
     accept_head: u8 = 0,
     accept_tail: u8 = 0,
+    /// Connections queued so far.
+    events: u32 = 0,
 };
 
 var tcp_conns: [TCP_MAX_CONNS]TcpConn = [_]TcpConn{.{}} ** TCP_MAX_CONNS;
@@ -602,7 +878,21 @@ fn enqueueAccepted(lst: *TcpListener, conn_slot: u8) bool {
     if (next == lst.accept_tail) return false; // ring full
     lst.accept_ring[lst.accept_head] = conn_slot;
     lst.accept_head = next;
+    lst.events +%= 1;
     return true;
+}
+
+/// Something a waiter on `c` may care about happened. Lock held.
+fn tcpNotify(c: *TcpConn) void {
+    c.events +%= 1;
+    @import("../cpu/ipc/fdpoll.zig").wakePollers(.tcp_sock, @as(u16, connSlotIndex(c)));
+}
+
+fn tcpFailWith(c: *TcpConn, why: TcpFail) void {
+    c.error_flag = true;
+    c.fail = why;
+    c.state = .closed;
+    tcpNotify(c);
 }
 
 /// Build and transmit a single TCP segment stamped with an explicit sequence
@@ -610,7 +900,7 @@ fn enqueueAccepted(lst: *TcpListener, conn_slot: u8) bool {
 /// data path passes an explicit seq so a retransmission can re-send the oldest
 /// unacked bytes (seq == snd_una) rather than whatever went out last.
 fn emitSegment(conn: *TcpConn, seq: u32, flags: u8, payload: ?[]const u8, include_mss: bool) bool {
-    const loop = isLoopback(conn.remote_ip);
+    const loop = isLocal(conn.remote_ip);
     // Non-blocking gateway check. Blocking resolution (poll + sleep) happens
     // in the task-context prologues (tcpConnect/tcpSend/udpSend); this
     // function also runs in NIC-IRQ context (ACK/SYN-ACK synthesis off the
@@ -643,6 +933,7 @@ fn emitSegment(conn: *TcpConn, seq: u32, flags: u8, payload: ?[]const u8, includ
     // Now: if the app drained from 8 KB→4 KB, the next ACK we send tells the
     // peer the window is 4 KB; if it's full, the peer back-pressures.
     const free_window: u16 = @intCast(TCP_RX_BUF_SIZE - conn.rx_count);
+    conn.adv_wnd = free_window;
     writeU16BE(tcp[14..16], free_window);
     tcp[16] = 0;
     tcp[17] = 0; // checksum placeholder
@@ -693,43 +984,70 @@ fn sendTcpPacket(conn: *TcpConn, flags: u8, payload: ?[]const u8, include_mss: b
     return emitSegment(conn, conn.snd_nxt, flags, payload, include_mss);
 }
 
-pub fn tcpConnect(dst_ip: [4]u8, dst_port: u16) ?u8 {
+/// The next port for an outbound connection or a listener that asked for
+/// none. Lock held.
+fn ephemeralPort() u16 {
+    const port = next_ephemeral;
+    next_ephemeral +%= 1;
+    if (next_ephemeral < 49200) next_ephemeral = 49200;
+    return port;
+}
+
+/// Start a connection to `dst_ip:dst_port` from `local_port` (0: any). The
+/// SYN is out when this returns the slot; tcpView tells how it went. Task
+/// context: finding the gateway may sleep.
+pub fn tcpConnectStart(dst_ip: [4]u8, dst_port: u16, local_port: u16) ?u8 {
+    return connectIn(null, dst_ip, dst_port, local_port);
+}
+
+/// tcpConnectStart in `slot`, a connection of the caller's that failed: a
+/// socket connecting again keeps its slot, so a thread still using the
+/// slot's number reaches the socket's new connection, never someone else's.
+/// False if it can't start; the slot stays the caller's, failed.
+pub fn tcpReconnect(slot: u8, dst_ip: [4]u8, dst_port: u16, local_port: u16) bool {
+    return connectIn(slot, dst_ip, dst_port, local_port) != null;
+}
+
+fn connectIn(reuse: ?u8, dst_ip: [4]u8, dst_port: u16, local_port: u16) ?u8 {
     // Resolve the gateway up front, outside the lock — it blocks (poll +
     // sleep); emitSegment's own gateway check is non-blocking by design.
-    if (!isLoopback(dst_ip) and !arpResolveGateway()) return null;
+    if (!isLocal(dst_ip) and !arpResolveGateway()) return null;
 
-    var slot: u8 = 0;
-    var conn: *TcpConn = undefined;
-    {
-        const lk = net_lock.acquireIrqSave();
-        defer net_lock.releaseIrqRestore(lk);
+    const lk = net_lock.acquireIrqSave();
+    defer netUnlock(lk);
 
-        // Find free connection slot
-        while (slot < TCP_MAX_CONNS) : (slot += 1) {
-            if (!tcp_conns[slot].active) break;
-        }
-        if (slot >= TCP_MAX_CONNS) return null;
+    const slot: u8 = if (reuse) |r| blk: {
+        if (r >= TCP_MAX_CONNS or !tcp_conns[r].active or !tcp_conns[r].error_flag) return null;
+        break :blk r;
+    } else for (0..TCP_MAX_CONNS) |i| {
+        if (!tcp_conns[i].active) break @intCast(i);
+    } else return null;
 
-        conn = &tcp_conns[slot];
-        conn.* = .{};
-        conn.active = true;
-        conn.state = .syn_sent;
-        conn.local_port = next_ephemeral;
-        next_ephemeral +%= 1;
-        if (next_ephemeral < 49200) next_ephemeral = 49200;
-        conn.remote_port = dst_port;
-        conn.remote_ip = dst_ip;
-        conn.snd_iss = @truncate(process.tick_count *% 1103515245 +% 12345);
-        conn.snd_nxt = conn.snd_iss;
-        conn.snd_una = conn.snd_iss;
-
-        // Send SYN
-        if (!sendTcpPacket(conn, TCP_SYN, null, true)) {
-            conn.active = false;
-            return null;
-        }
-        conn.snd_nxt +%= 1; // SYN consumes one seq number
+    const conn = &tcp_conns[slot];
+    // An edge-triggered watcher of a reused slot must see a change.
+    const events = conn.events +% 1;
+    conn.* = .{};
+    conn.events = events;
+    conn.active = true;
+    conn.state = .syn_sent;
+    conn.local_port = if (local_port != 0) local_port else ephemeralPort();
+    conn.remote_port = dst_port;
+    conn.remote_ip = dst_ip;
+    conn.snd_iss = @truncate(process.tick_count *% 1103515245 +% 12345);
+    conn.snd_una = conn.snd_iss;
+    // The SYN takes one sequence number. Counted before it is sent: a local
+    // peer's answer is processed inside the send.
+    conn.snd_nxt = conn.snd_iss +% 1;
+    if (!emitSegment(conn, conn.snd_iss, TCP_SYN, null, true)) {
+        if (reuse == null) conn.active = false else tcpFailWith(conn, .timed_out);
+        return null;
     }
+    return slot;
+}
+
+pub fn tcpConnect(dst_ip: [4]u8, dst_port: u16) ?u8 {
+    const slot = tcpConnectStart(dst_ip, dst_port, 0) orelse return null;
+    const conn = &tcp_conns[slot];
 
     // Wait for SYN-ACK, unlocked — state/error_flag are single-byte reads
     // and the RX path owns the transitions. Tick-based 5s deadline + 10ms
@@ -743,7 +1061,7 @@ pub fn tcpConnect(dst_ip: [4]u8, dst_port: u16) ?u8 {
     }
     const lk = net_lock.acquireIrqSave();
     conn.active = false;
-    net_lock.releaseIrqRestore(lk);
+    netUnlock(lk);
     return null;
 }
 
@@ -752,7 +1070,8 @@ pub fn tcpConnect(dst_ip: [4]u8, dst_port: u16) ?u8 {
 /// our chosen ISS, and immediately replies with SYN+ACK. The slot stays in
 /// SYN-RECEIVED until the peer's ACK promotes it to ESTABLISHED — only then
 /// does it become visible to user-space accept().
-fn tryAcceptIncomingSyn(ip_data: []volatile u8, ihl: usize, local_port: u16, remote_port: u16, peer_seq: u32) void {
+/// False when nobody listens on the port: the caller answers with a reset.
+fn tryAcceptIncomingSyn(ip_data: []volatile u8, ihl: usize, local_port: u16, remote_port: u16, peer_seq: u32) bool {
     var listener: ?*TcpListener = null;
     for (&tcp_listeners) |*l| {
         if (l.active and l.port == local_port) {
@@ -760,13 +1079,13 @@ fn tryAcceptIncomingSyn(ip_data: []volatile u8, ihl: usize, local_port: u16, rem
             break;
         }
     }
-    const lst = listener orelse return; // no one listening on this port
+    const lst = listener orelse return false;
 
     var slot: u8 = 0;
     while (slot < TCP_MAX_CONNS) : (slot += 1) {
         if (!tcp_conns[slot].active) break;
     }
-    if (slot >= TCP_MAX_CONNS) return; // out of slots — drop SYN, peer will retransmit
+    if (slot >= TCP_MAX_CONNS) return true; // out of slots — drop SYN, peer will retransmit
 
     const peer_ip: [4]u8 = .{ ip_data[12], ip_data[13], ip_data[14], ip_data[15] };
 
@@ -777,9 +1096,11 @@ fn tryAcceptIncomingSyn(ip_data: []volatile u8, ihl: usize, local_port: u16, rem
     conn.local_port = local_port;
     conn.remote_port = remote_port;
     conn.remote_ip = peer_ip;
-    conn.snd_iss = @truncate(process.tick_count *% 1103515245 +% 12345);
-    conn.snd_nxt = conn.snd_iss;
+    conn.snd_iss = @truncate(process.tick_count *% 1103515245 +% 12345 +% @as(u64, slot) *% 7919);
     conn.snd_una = conn.snd_iss;
+    // Our SYN takes one sequence number, counted before the SYN-ACK is
+    // sent: a local peer's ACK of it is processed inside the send.
+    conn.snd_nxt = conn.snd_iss +% 1;
     conn.rcv_nxt = peer_seq +% 1; // peer's SYN consumes one seq number
     conn.listener_slot = listenerSlotIndex(lst);
 
@@ -815,11 +1136,52 @@ fn tryAcceptIncomingSyn(ip_data: []volatile u8, ihl: usize, local_port: u16, rem
         }
     }
 
-    if (!sendTcpPacket(conn, TCP_SYN | TCP_ACK, null, true)) {
-        conn.active = false;
-        return;
+    if (!emitSegment(conn, conn.snd_iss, TCP_SYN | TCP_ACK, null, true)) conn.active = false;
+    return true;
+}
+
+/// Answer a segment no connection or listener takes with a reset (RFC 793):
+/// a connect to a port nobody listens on is refused at once instead of
+/// timing out, and a peer still talking to a connection that is gone
+/// learns it. Lock held.
+fn sendReset(ip_data: []volatile u8, ihl: usize) void {
+    const tcp = ip_data[ihl..];
+    const flags = tcp[13];
+    if (flags & TCP_RST != 0) return;
+    const peer_ip: [4]u8 = .{ ip_data[12], ip_data[13], ip_data[14], ip_data[15] };
+    const to_ip: [4]u8 = .{ ip_data[16], ip_data[17], ip_data[18], ip_data[19] };
+    if (!isLocal(to_ip)) return;
+    const local = isLocal(peer_ip);
+    if (!local and !gateway_mac_valid) return;
+
+    const data_offset = @as(usize, tcp[12] >> 4) * 4;
+    const payload_len: u32 = @intCast(tcp.len -| data_offset);
+    var seq: u32 = 0;
+    var ack: u32 = 0;
+    var out_flags: u8 = TCP_RST;
+    if (flags & TCP_ACK != 0) {
+        seq = readU32BE(tcp[8..12]);
+    } else {
+        ack = readU32BE(tcp[4..8]) +% payload_len +% @intFromBool(flags & TCP_SYN != 0) +% @intFromBool(flags & TCP_FIN != 0);
+        out_flags |= TCP_ACK;
     }
-    conn.snd_nxt +%= 1; // our SYN consumes one
+
+    var pkt: [ETH_HDR_SIZE + IPV4_HDR_SIZE + TCP_HDR_SIZE]u8 = undefined;
+    const src_mac = nic.getMac();
+    buildEthHeader(&pkt, if (local) src_mac else gateway_mac, src_mac, ETHERTYPE_IPV4);
+    buildIPv4Header(pkt[ETH_HDR_SIZE..], IPPROTO_TCP, peer_ip, TCP_HDR_SIZE);
+    const out = pkt[ETH_HDR_SIZE + IPV4_HDR_SIZE ..];
+    @memset(out, 0);
+    writeU16BE(out[0..2], readU16BE(tcp[2..4]));
+    writeU16BE(out[2..4], readU16BE(tcp[0..2]));
+    writeU32BE(out[4..8], seq);
+    writeU32BE(out[8..12], ack);
+    out[12] = 5 << 4;
+    out[13] = out_flags;
+    const csum = tcpChecksum(outboundSrcIp(peer_ip), peer_ip, out[0..TCP_HDR_SIZE]);
+    out[16] = @intCast(csum >> 8);
+    out[17] = @intCast(csum & 0xFF);
+    _ = dispatchPacket(peer_ip, &pkt);
 }
 
 /// Bind a server-side TCP socket to `port`. Returns the listener slot id, or
@@ -830,7 +1192,7 @@ fn tryAcceptIncomingSyn(ip_data: []volatile u8, ihl: usize, local_port: u16, rem
 pub fn tcpListen(port: u16) ?u8 {
     if (port == 0) return null;
     const lk = net_lock.acquireIrqSave();
-    defer net_lock.releaseIrqRestore(lk);
+    defer netUnlock(lk);
     // Reject duplicates so accept rings stay sane.
     for (tcp_listeners) |l| {
         if (l.active and l.port == port) return null;
@@ -849,10 +1211,45 @@ pub fn tcpListen(port: u16) ?u8 {
 pub fn tcpUnlisten(listen_slot: u8) void {
     if (listen_slot >= TCP_MAX_LISTENERS) return;
     const lk = net_lock.acquireIrqSave();
-    defer net_lock.releaseIrqRestore(lk);
+    defer netUnlock(lk);
     const l = &tcp_listeners[listen_slot];
     if (!l.active) return;
-    l.* = .{}; // accepted-but-undelivered conns stay live; user can still close them
+    // What nobody accepted has no owner: the queued connections close, the
+    // handshakes in progress are dropped.
+    while (l.accept_head != l.accept_tail) {
+        const slot = l.accept_ring[l.accept_tail];
+        l.accept_tail = (l.accept_tail + 1) % TCP_ACCEPT_RING_SIZE;
+        if (slot < TCP_MAX_CONNS) releaseConn(&tcp_conns[slot]);
+    }
+    for (&tcp_conns) |*c| {
+        if (c.active and c.state == .syn_received and c.listener_slot == listen_slot) c.active = false;
+    }
+    l.* = .{};
+}
+
+/// The port listener `listen_slot` is on.
+pub fn tcpListenerPort(listen_slot: u8) u16 {
+    if (listen_slot >= TCP_MAX_LISTENERS) return 0;
+    return tcp_listeners[listen_slot].port;
+}
+
+pub fn tcpListenerEvents(listen_slot: u8) u32 {
+    if (listen_slot >= TCP_MAX_LISTENERS) return 0;
+    return tcp_listeners[listen_slot].events;
+}
+
+/// Bind a listener to a port nobody listens on, chosen here.
+pub fn tcpListenAny() ?u8 {
+    var tries: u32 = 0;
+    while (tries < 64) : (tries += 1) {
+        const port = blk: {
+            const lk = net_lock.acquireIrqSave();
+            defer netUnlock(lk);
+            break :blk ephemeralPort();
+        };
+        if (tcpListen(port)) |slot| return slot;
+    }
+    return null;
 }
 
 /// Pop one ESTABLISHED conn slot from the listener's accept ring, or null if
@@ -860,7 +1257,7 @@ pub fn tcpUnlisten(listen_slot: u8) void {
 pub fn tcpAccept(listen_slot: u8) ?u8 {
     if (listen_slot >= TCP_MAX_LISTENERS) return null;
     const lk = net_lock.acquireIrqSave();
-    defer net_lock.releaseIrqRestore(lk);
+    defer netUnlock(lk);
     const l = &tcp_listeners[listen_slot];
     if (!l.active) return null;
     if (l.accept_head == l.accept_tail) return null; // ring empty
@@ -991,7 +1388,7 @@ pub fn tcpSend(slot: u8, data: []const u8) bool {
     if (!conn.active or conn.state != .established) return false;
     // Blocking gateway resolution up front, outside the lock — emitSegment
     // itself must never block (it also runs in NIC-IRQ context).
-    if (!isLoopback(conn.remote_ip) and !arpResolveGateway()) return false;
+    if (!isLocal(conn.remote_ip) and !arpResolveGateway()) return false;
 
     var off: usize = 0;
     while (off < data.len) {
@@ -999,7 +1396,7 @@ pub fn tcpSend(slot: u8, data: []const u8) bool {
         // so an IRQ-side ACK between iterations can only GROW it.
         {
             const lk = net_lock.acquireIrqSave();
-            defer net_lock.releaseIrqRestore(lk);
+            defer netUnlock(lk);
             if (conn.error_flag or conn.state != .established) return false;
             const space: usize = TCP_SND_BUF_SIZE - conn.snd_buf_len;
             if (space > 0) {
@@ -1034,7 +1431,7 @@ pub fn tcpRecv(slot: u8, buf: []u8) usize {
     if (slot >= TCP_MAX_CONNS) return 0;
     const conn = &tcp_conns[slot];
     const lk = net_lock.acquireIrqSave();
-    defer net_lock.releaseIrqRestore(lk);
+    defer netUnlock(lk);
     if (!conn.active) return 0;
     if (conn.rx_count == 0) return 0;
 
@@ -1048,13 +1445,16 @@ pub fn tcpRecv(slot: u8, buf: []u8) usize {
     // Freed receive space may let buffered out-of-order data move in.
     oooDrain(conn);
 
-    // If the drain re-opened a meaningful chunk of the receive window,
-    // tell the peer with an empty ACK. Without this, a sender that
-    // throttled against a 0-window advertisement would sit idle until
-    // the next normal ACK we send (which only happens when the peer
-    // sends more data — chicken-and-egg). 25% of the ring is the
-    // threshold; smaller drains piggyback on the next data-driven ACK.
-    if (conn.state == .established and avail >= TCP_RX_BUF_SIZE / 4) {
+    // If the window has opened a meaningful amount past what the peer was
+    // last told, tell it with an empty ACK. Without this, a sender that
+    // throttled against a small or zero window would sit idle until the
+    // next normal ACK we send (which only happens when the peer sends more
+    // data — chicken-and-egg). Measured against the advertised window, not
+    // this one read: a reader taking a little at a time opens it just as
+    // far in the end.
+    const receiving = conn.state == .established or conn.state == .fin_wait_1 or conn.state == .fin_wait_2;
+    const free: u32 = TCP_RX_BUF_SIZE - conn.rx_count;
+    if (receiving and free >= @as(u32, conn.adv_wnd) + TCP_WINDOW_UPDATE) {
         _ = sendTcpPacket(conn, TCP_ACK, null, false);
     }
     return avail;
@@ -1074,7 +1474,7 @@ pub fn tcpClose(slot: u8) void {
         var pending = false;
         {
             const lk = net_lock.acquireIrqSave();
-            defer net_lock.releaseIrqRestore(lk);
+            defer netUnlock(lk);
             if ((conn.state == .established or conn.state == .close_wait) and
                 !conn.error_flag and conn.snd_buf_len > 0)
             {
@@ -1090,7 +1490,7 @@ pub fn tcpClose(slot: u8) void {
     var sent_fin = false;
     {
         const lk = net_lock.acquireIrqSave();
-        defer net_lock.releaseIrqRestore(lk);
+        defer netUnlock(lk);
         if (conn.state == .established or conn.state == .close_wait) {
             _ = sendTcpPacket(conn, TCP_FIN | TCP_ACK, null, false);
             conn.snd_nxt +%= 1;
@@ -1111,7 +1511,170 @@ pub fn tcpClose(slot: u8) void {
     const lk = net_lock.acquireIrqSave();
     conn.active = false;
     conn.state = .closed;
-    net_lock.releaseIrqRestore(lk);
+    netUnlock(lk);
+}
+
+// --- What a socket does with a connection ------------------------------------
+//
+// None of these wait: the socket layer sleeps on the readiness tcpView
+// reports and tries again. A slot a socket holds is freed by tcpRelease
+// alone (at once, or when the close it starts is done); the legacy calls
+// above free theirs in tcpClose.
+
+/// Send our FIN if one is wanted and everything before it is acked. The
+/// state and snd_nxt move first: a local peer's ACK is processed inside the
+/// send. Lock held.
+fn maybeSendFin(c: *TcpConn) void {
+    if (!c.fin_wanted or c.fin_sent) return;
+    if (c.state != .established and c.state != .close_wait) return;
+    if (c.snd_buf_len != 0) return;
+    const seq = c.snd_nxt;
+    c.fin_sent = true;
+    c.snd_nxt +%= 1;
+    c.state = if (c.state == .close_wait) .last_ack else .fin_wait_1;
+    _ = emitSegment(c, seq, TCP_FIN | TCP_ACK, null, false);
+}
+
+/// The owner of `c` is gone. Lock held.
+fn releaseConn(c: *TcpConn) void {
+    if (!c.active) return;
+    c.rd_closed = true;
+    // Nothing to finish: never connected, failed, or closed both ways.
+    if (c.error_flag or c.state == .closed or c.state == .syn_sent or c.state == .syn_received) {
+        c.active = false;
+        c.state = .closed;
+        return;
+    }
+    c.orphan = true;
+    c.orphan_deadline = process.tick_count + TCP_ORPHAN_TICKS;
+    c.fin_wanted = true;
+    maybeSendFin(c);
+}
+
+/// The socket of connection `slot` is gone. What it sent is still
+/// delivered and the close completed, in the background; the slot frees
+/// itself after. Never sleeps.
+pub fn tcpRelease(slot: u8) void {
+    if (slot >= TCP_MAX_CONNS) return;
+    const lk = net_lock.acquireIrqSave();
+    defer netUnlock(lk);
+    releaseConn(&tcp_conns[slot]);
+}
+
+/// No more will be sent on `slot`: the peer reads an end of stream after
+/// what is already queued. Receiving goes on.
+pub fn tcpShutdownWrite(slot: u8) void {
+    if (slot >= TCP_MAX_CONNS) return;
+    const lk = net_lock.acquireIrqSave();
+    defer netUnlock(lk);
+    const c = &tcp_conns[slot];
+    if (!c.active) return;
+    c.fin_wanted = true;
+    maybeSendFin(c);
+}
+
+pub const TcpSent = union(enum) {
+    /// This many bytes went into the send ring.
+    bytes: usize,
+    /// The ring is full: wait for `writable`.
+    full,
+    /// The connection can't send: failed, or our side is shut.
+    closed,
+};
+
+/// Take what fits of `data` (kernel memory) into the send ring and send on.
+pub fn tcpSendSome(slot: u8, data: []const u8) TcpSent {
+    if (slot >= TCP_MAX_CONNS) return .closed;
+    const lk = net_lock.acquireIrqSave();
+    defer netUnlock(lk);
+    const c = &tcp_conns[slot];
+    if (!c.active or c.error_flag or c.fin_wanted) return .closed;
+    if (c.state != .established and c.state != .close_wait) return .closed;
+    const space: usize = TCP_SND_BUF_SIZE - c.snd_buf_len;
+    if (space == 0) return .full;
+    const chunk = @min(data.len, space);
+    appendSnd(c, data[0..chunk]);
+    flushSnd(c);
+    return .{ .bytes = chunk };
+}
+
+/// tcpRecv that leaves the bytes in place (MSG_PEEK).
+pub fn tcpPeek(slot: u8, buf: []u8) usize {
+    if (slot >= TCP_MAX_CONNS) return 0;
+    const c = &tcp_conns[slot];
+    const lk = net_lock.acquireIrqSave();
+    defer netUnlock(lk);
+    if (!c.active) return 0;
+    const avail = @min(c.rx_count, @as(u32, @intCast(buf.len)));
+    const read_pos = (c.rx_write -% c.rx_count) % TCP_RX_BUF_SIZE;
+    var i: u32 = 0;
+    while (i < avail) : (i += 1) buf[i] = c.rx_buf[(read_pos + i) % TCP_RX_BUF_SIZE];
+    return avail;
+}
+
+/// Where a connection stands, read without the lock (each field is one
+/// load; a poll that looks a moment early looks again on the next event).
+pub const TcpView = struct {
+    /// The handshake is still out.
+    connecting: bool = false,
+    /// Reset, refused or timed out; `fail` says which.
+    failed: bool = false,
+    fail: TcpFail = .none,
+    /// Bytes wait to be read.
+    readable: bool = false,
+    /// The peer sent its FIN and everything before it was read.
+    eof: bool = false,
+    /// The send ring has room.
+    writable: bool = false,
+    /// Bytes a read would get now.
+    rx_bytes: u32 = 0,
+    events: u32 = 0,
+};
+
+pub fn tcpView(slot: u8) TcpView {
+    if (slot >= TCP_MAX_CONNS) return .{ .failed = true, .eof = true };
+    const c = &tcp_conns[slot];
+    if (!c.active) return .{ .eof = true };
+    const rx = c.rx_count;
+    const open = c.state == .established or c.state == .close_wait;
+    return .{
+        .connecting = c.state == .syn_sent and !c.error_flag,
+        .failed = c.error_flag,
+        .fail = c.fail,
+        .readable = rx > 0,
+        .eof = rx == 0 and c.peer_closed,
+        .writable = open and !c.error_flag and !c.fin_wanted and c.snd_buf_len < TCP_SND_BUF_SIZE,
+        .rx_bytes = rx,
+        .events = c.events,
+    };
+}
+
+pub const Endpoint = struct { ip: [4]u8, port: u16 };
+
+/// Our end of connection `slot`. A local connection has the peer's address
+/// on both ends (outboundSrcIp).
+pub fn tcpLocal(slot: u8) Endpoint {
+    if (slot >= TCP_MAX_CONNS) return .{ .ip = .{ 0, 0, 0, 0 }, .port = 0 };
+    const c = &tcp_conns[slot];
+    return .{ .ip = outboundSrcIp(c.remote_ip), .port = c.local_port };
+}
+
+pub fn tcpRemote(slot: u8) Endpoint {
+    if (slot >= TCP_MAX_CONNS) return .{ .ip = .{ 0, 0, 0, 0 }, .port = 0 };
+    const c = &tcp_conns[slot];
+    return .{ .ip = c.remote_ip, .port = c.remote_port };
+}
+
+/// True while any connection or datagram socket is in use: the
+/// housekeeping task ticks faster.
+pub fn busy() bool {
+    for (&tcp_conns) |*c| {
+        if (c.active) return true;
+    }
+    for (&udp_socks) |*s| {
+        if (s.active) return true;
+    }
+    return false;
 }
 
 // tcpIsConnected/tcpPeerClosed/tcpPollMask/tcpListenerPollMask are LOCK-FREE
@@ -1188,7 +1751,7 @@ fn rxPush(c: *TcpConn, src: [*]const u8, len: usize) usize {
     }
     c.rx_write +%= @intCast(to_copy);
     c.rx_count += @intCast(to_copy);
-    @import("../cpu/ipc/fdpoll.zig").wakePollers(.tcp_sock, @as(u16, connSlotIndex(c)));
+    tcpNotify(c);
     return to_copy;
 }
 
@@ -1297,9 +1860,8 @@ fn handleTcpPacket(ip_data: []volatile u8, ihl: usize) void {
     // No matching conn. If this is a fresh SYN (no ACK), look for a listener
     // bound to dst_port — that's the inbound-handshake path.
     const c = conn orelse {
-        if ((flags & TCP_SYN) != 0 and (flags & TCP_ACK) == 0) {
-            tryAcceptIncomingSyn(ip_data, ihl, dst_port, src_port, seq);
-        }
+        const fresh_syn = (flags & TCP_SYN) != 0 and (flags & TCP_ACK) == 0;
+        if (!(fresh_syn and tryAcceptIncomingSyn(ip_data, ihl, dst_port, src_port, seq))) sendReset(ip_data, ihl);
         return;
     };
 
@@ -1311,8 +1873,7 @@ fn handleTcpPacket(ip_data: []volatile u8, ihl: usize) void {
             c.* = .{};
             return;
         }
-        c.error_flag = true;
-        c.state = .closed;
+        tcpFailWith(c, if (c.state == .syn_sent) .refused else .reset);
         return;
     }
 
@@ -1386,40 +1947,12 @@ fn handleTcpPacket(ip_data: []volatile u8, ihl: usize) void {
                     c.retransmit_count = 0;
                     initCwnd(c);
                     _ = sendTcpPacket(c, TCP_ACK, null, false);
-                    @import("../cpu/ipc/fdpoll.zig").wakePollers(.tcp_sock, @as(u16, connSlotIndex(c)));
+                    tcpNotify(c);
                 }
             }
         },
         .established => {
-            // ACK processing
-            if (flags & TCP_ACK != 0) {
-                const adv = @as(i32, @bitCast(ack -% c.snd_una));
-                const inflight = c.snd_nxt -% c.snd_una;
-                // Accept only ACKs that advance snd_una without acking data we
-                // never sent. Free the acked bytes from the send ring, restart
-                // the retransmit timer, and let the freed window push more out.
-                if (adv > 0 and @as(u32, @bitCast(adv)) <= inflight) {
-                    const acked: u32 = @bitCast(adv);
-                    c.snd_buf_head = (c.snd_buf_head + acked) % TCP_SND_BUF_SIZE;
-                    c.snd_buf_len -= acked;
-                    c.snd_una = ack;
-                    ackCwnd(c, acked); // grow cwnd / exit fast recovery
-                    c.dup_acks = 0;
-                    // Karn: only sample RTT from a segment that wasn't
-                    // retransmitted (rtt_pending is cleared on retransmit).
-                    if (c.rtt_pending and @as(i32, @bitCast(ack -% c.rtt_seq)) >= 0) {
-                        updateRto(c, process.tick_count -% c.rtt_start);
-                        c.rtt_pending = false;
-                    }
-                    c.retransmit_count = 0;
-                    c.last_send_tick = process.tick_count;
-                    flushSnd(c);
-                } else if (adv == 0 and payload_len == 0 and inflight > 0) {
-                    // Duplicate ACK: three of them trigger fast retransmit.
-                    c.dup_acks += 1;
-                    if (c.dup_acks == 3) fastRetransmit(c);
-                }
-            }
+            if (flags & TCP_ACK != 0) processAck(c, ack, payload_len);
             // Data: in-order, out-of-order (buffered), or duplicate. receiveData
             // always ACKs, so a gap yields the duplicate ACKs fast-retransmit needs.
             receiveData(c, seq, tcp, data_offset, payload_len);
@@ -1434,55 +1967,127 @@ fn handleTcpPacket(ip_data: []volatile u8, ihl: usize) void {
                 c.rcv_nxt +%= 1;
                 c.peer_closed = true;
                 _ = sendTcpPacket(c, TCP_ACK, null, false);
-                c.state = .close_wait;
-                @import("../cpu/ipc/fdpoll.zig").wakePollers(.tcp_sock, @as(u16, connSlotIndex(c)));
+                if (c.state == .established) {
+                    c.state = .close_wait;
+                    maybeSendFin(c);
+                } else {
+                    // processAck above sent our FIN: both sides closed at once.
+                    enterTimeWait(c);
+                }
+                tcpNotify(c);
             }
         },
-        .fin_wait_1 => {
-            // fin_wait_2 needs OUR FIN acked (ack == snd_nxt) — any old ACK
-            // used to advance the state with the FIN still unacknowledged,
-            // after which nothing would ever retransmit it. The FIN-bearing
-            // branch stays lenient (simultaneous close / FIN-without-full-ACK
-            // still tears down; time_wait bounds it). rcv_nxt accounts for
-            // any payload riding along with the peer's FIN — data sent after
-            // our close is discarded, but our final ACK must cover it or the
-            // peer retransmits the FIN until its own timeout.
-            if (flags & TCP_FIN != 0) {
-                c.rcv_nxt = seq +% @as(u32, @intCast(payload_len)) +% 1;
-                _ = sendTcpPacket(c, TCP_ACK, null, false);
-                c.state = .time_wait;
-            } else if (flags & TCP_ACK != 0 and ack == c.snd_nxt) {
-                c.state = .fin_wait_2;
-            }
+        // The peer is done sending; ours still goes out and is acked.
+        .close_wait => {
+            if (flags & TCP_ACK != 0) processAck(c, ack, payload_len);
         },
-        .fin_wait_2 => {
-            if (flags & TCP_FIN != 0) {
-                c.rcv_nxt = seq +% @as(u32, @intCast(payload_len)) +% 1;
-                _ = sendTcpPacket(c, TCP_ACK, null, false);
-                c.state = .time_wait;
+        // Our FIN is out. fin_wait_2 needs it acked (ack == snd_nxt) — any
+        // old ACK used to advance the state with the FIN still
+        // unacknowledged, after which nothing would ever retransmit it.
+        .fin_wait_1, .fin_wait_2 => {
+            if (c.state == .fin_wait_1 and finAcked(c, flags, ack)) c.state = .fin_wait_2;
+            if (c.rd_closed) {
+                // Closed both ways: what the peer still sends is dropped,
+                // but our final ACK must cover it, or the peer sends its
+                // FIN again until its own timeout. Lenient about a FIN that
+                // doesn't ack ours (a simultaneous close); time_wait bounds it.
+                if (flags & TCP_FIN != 0) {
+                    c.rcv_nxt = seq +% @as(u32, @intCast(payload_len)) +% 1;
+                    _ = sendTcpPacket(c, TCP_ACK, null, false);
+                    enterTimeWait(c);
+                }
+            } else {
+                // Only our sending side is shut: the peer's data and its
+                // FIN are taken as on an open connection.
+                receiveData(c, seq, tcp, data_offset, payload_len);
+                if (flags & TCP_FIN != 0 and c.rcv_nxt == seq +% @as(u32, @intCast(payload_len))) {
+                    c.rcv_nxt +%= 1;
+                    c.peer_closed = true;
+                    _ = sendTcpPacket(c, TCP_ACK, null, false);
+                    enterTimeWait(c);
+                    tcpNotify(c);
+                }
             }
         },
         .last_ack => {
-            if (flags & TCP_ACK != 0) {
+            if (finAcked(c, flags, ack)) {
                 c.state = .closed;
-                c.active = false;
+                // A socket that still holds the slot frees it (tcpRelease).
+                if (c.orphan or c.rd_closed) c.active = false;
             }
         },
         else => {},
     }
 }
 
+/// In a state our FIN is out in: the segment acks it, nothing is left in
+/// flight and the retransmit timer stops. The FIN is the octet past the
+/// send ring, which processAck doesn't count. Lock held.
+fn finAcked(c: *TcpConn, flags: u8, ack: u32) bool {
+    if (flags & TCP_ACK == 0 or ack != c.snd_nxt) return false;
+    c.snd_una = ack;
+    c.retransmit_count = 0;
+    return true;
+}
+
+fn enterTimeWait(c: *TcpConn) void {
+    c.state = .time_wait;
+    c.last_send_tick = process.tick_count;
+}
+
+/// An ACK on a connection that may have data out: free what it covers from
+/// the send ring, send what the freed window allows, then a FIN that waited
+/// for the ring to empty. Lock held.
+fn processAck(c: *TcpConn, ack: u32, payload_len: usize) void {
+    const adv = @as(i32, @bitCast(ack -% c.snd_una));
+    const inflight = c.snd_nxt -% c.snd_una;
+    // Accept only ACKs that advance snd_una without acking data we never
+    // sent. Free the acked bytes from the send ring, restart the retransmit
+    // timer, and let the freed window push more out.
+    if (adv > 0 and @as(u32, @bitCast(adv)) <= inflight and @as(u32, @bitCast(adv)) <= c.snd_buf_len) {
+        const acked: u32 = @bitCast(adv);
+        c.snd_buf_head = (c.snd_buf_head + acked) % TCP_SND_BUF_SIZE;
+        c.snd_buf_len -= acked;
+        c.snd_una = ack;
+        ackCwnd(c, acked); // grow cwnd / exit fast recovery
+        c.dup_acks = 0;
+        // Karn: only sample RTT from a segment that wasn't retransmitted
+        // (rtt_pending is cleared on retransmit).
+        if (c.rtt_pending and @as(i32, @bitCast(ack -% c.rtt_seq)) >= 0) {
+            updateRto(c, process.tick_count -% c.rtt_start);
+            c.rtt_pending = false;
+        }
+        c.retransmit_count = 0;
+        c.last_send_tick = process.tick_count;
+        flushSnd(c);
+        maybeSendFin(c);
+        // Room in the send ring: a writer waiting for it goes on.
+        tcpNotify(c);
+    } else if (adv == 0 and payload_len == 0 and inflight > 0) {
+        // Duplicate ACK: three of them trigger fast retransmit.
+        c.dup_acks += 1;
+        if (c.dup_acks == 3) fastRetransmit(c);
+    }
+}
+
 fn tcpTick() void {
     for (&tcp_conns) |*c| {
         if (!c.active) continue;
-        if (c.state == .time_wait) {
-            // Auto-close after brief wait
-            if (process.tick_count -% c.last_send_tick > 200) {
+        // A connection whose socket is gone frees itself: when its close is
+        // done, when it failed, or when the close has taken too long. One a
+        // socket still holds stays, whatever its state (tcpRelease).
+        if (c.orphan) {
+            const lingered = c.state == .time_wait and process.tick_count -% c.last_send_tick > TCP_TIME_WAIT_TICKS;
+            if (lingered or c.error_flag or c.state == .closed or process.tick_count >= c.orphan_deadline) {
                 c.state = .closed;
                 c.active = false;
+                continue;
             }
-            continue;
         }
+        if (c.state == .time_wait) continue;
+        // Data queued with nothing in flight: a send that found no gateway
+        // address yet. Nothing else would start it.
+        if ((c.state == .established or c.state == .close_wait) and c.snd_una == c.snd_nxt and c.snd_buf_len > 0) flushSnd(c);
         // Retransmission: fire when the oldest unacked octet has gone
         // unacknowledged for the timeout.
         if (c.snd_una != c.snd_nxt and
@@ -1496,8 +2101,7 @@ fn tcpTick() void {
                     c.* = .{};
                     continue;
                 }
-                c.error_flag = true;
-                c.state = .closed;
+                tcpFailWith(c, .timed_out);
                 continue;
             }
             if ((c.state == .established or c.state == .close_wait) and c.snd_buf_len > 0) {
@@ -1782,13 +2386,13 @@ pub fn handleRxFrame(data: []volatile u8) void {
     // Typically NIC-IRQ context (IF already 0); IrqSave also covers the
     // polled-mode drivers calling in from task context.
     const lk = net_lock.acquireIrqSave();
-    defer net_lock.releaseIrqRestore(lk);
+    defer netUnlock(lk);
     processReceivedPacket(data);
 }
 
 pub fn poll() void {
     const lk = net_lock.acquireIrqSave();
-    defer net_lock.releaseIrqRestore(lk);
+    defer netUnlock(lk);
     while (nic.recv()) |data| {
         processReceivedPacket(data);
         nic.rxRelease();

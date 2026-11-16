@@ -510,8 +510,8 @@ pub fn dupFrom(old: u64, min: u64, cloexec: bool) u64 {
 
 // --- poll ------------------------------------------------------------------
 
-const PollFd = extern struct { fd: i32, events: i16, revents: i16 };
-const POLLNVAL: u16 = 0x20;
+pub const PollFd = extern struct { fd: i32, events: i16, revents: i16 };
+const POLLNVAL: u16 = fdpoll.POLLNVAL;
 
 /// poll(fds, nfds, timeout_ms); a negative timeout waits for good.
 pub fn poll(fds_va: u64, nfds: u64, timeout_arg: u64) u64 {
@@ -568,7 +568,7 @@ fn pollFor(fds_va: u64, nfds: u64, timeout_ns: ?u64) u64 {
 /// Fill revents in `fds`, waiting until an entry is ready or the timeout
 /// passes; returns how many are ready, or null when a signal for the caller
 /// ended the wait. Touches no user memory.
-fn pollWait(me: usize, fds: []PollFd, timeout_ns: ?u64) ?u64 {
+pub fn pollWait(me: usize, fds: []PollFd, timeout_ns: ?u64) ?u64 {
     const pcb = &process.procs[me];
     const group: u8 = pcb.tgid;
     const deadline: u64 = if (timeout_ns) |ns| deadlineAfter(ns) else 0;
@@ -588,15 +588,13 @@ fn pollWait(me: usize, fds: []PollFd, timeout_ns: ?u64) ?u64 {
             }
             const want: u16 = @bitCast(p.events);
             const lead = &process.procs[group];
-            var mask: u16 = if (fd >= lead.fd_table.len)
-                POLLNVAL
-            else if (fdpoll.resolveFd(group, @intCast(fd))) |h|
-                fdpoll.pollMaskHandle(group, h) & (want | fdpoll.POLLERR | fdpoll.POLLHUP)
-            else
-                POLLNVAL;
-            // A terminal may hold keys its pipe no longer does: the rest of
-            // an arrow key's sequence, a line typed ahead.
-            if (want & fdpoll.POLLIN != 0 and mask != POLLNVAL and terminalHasInput(lead, fd)) mask |= fdpoll.POLLIN;
+            // The file is held while it is asked: a close on another thread
+            // can't take it from under its own answer. If ours is then the
+            // last reference, the release can't sleep here.
+            const mask: u16 = if (file.get(lead, @intCast(fd))) |f| blk: {
+                defer file.putNoSleep(f);
+                break :blk f.ops.poll(f, lead) & (want | fdpoll.POLLERR | fdpoll.POLLHUP);
+            } else POLLNVAL;
             p.revents = @bitCast(mask);
             if (mask != 0) ready += 1;
         }
@@ -605,15 +603,6 @@ fn pollWait(me: usize, fds: []PollFd, timeout_ns: ?u64) ?u64 {
         if (signals.deliverable(pcb) != 0) return null;
         sched.blockOnDeadline(.poll, 0, deadline);
     }
-}
-
-/// True if `fd` of `lead` is the reading end of a terminal with input a
-/// read would get at once.
-fn terminalHasInput(lead: *process.PCB, fd: i32) bool {
-    const tty = @import("../../proc/tty.zig");
-    const f = file.get(lead, @intCast(fd)) orelse return false;
-    defer file.put(f);
-    return f.tty != tty.NONE and f.access == file.READ and tty.readable(f.tty);
 }
 
 /// The tick a wait of `ns` ends at: rounded up, one tick more.

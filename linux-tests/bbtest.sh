@@ -97,6 +97,45 @@ check sigpipe "$(wc -l < "$d/yes" | tr -d ' ')" 3
 check dd "$(dd if=/dev/zero bs=1024 count=4 2>/dev/null | wc -c | tr -d ' ')" 4096
 check date "$([ "$(date +%Y)" -ge 2024 ] && echo yes)" yes
 
+# The network, on this machine alone: a web server and its client over
+# loopback, then a listener and a talker. The server is a shell script nc
+# runs per connection, the socket as its stdin and stdout.
+mkdir -p "$d/www"
+echo "served by busybox" > "$d/www/index.html"
+cat > "$d/serve.sh" <<'EOF'
+cr=$(printf '\r')
+read -r method path proto
+while read -r line; do
+    [ "$line" = "$cr" ] || [ -z "$line" ] && break
+done
+if [ -f "$1$path" ]; then
+    printf 'HTTP/1.0 200 OK\r\n\r\n'
+    cat "$1$path"
+else
+    printf 'HTTP/1.0 404 Not Found\r\n\r\n'
+fi
+EOF
+nc -lk -p 8081 -e sh "$d/serve.sh" "$d/www" &
+web=$!
+got=
+for try in 1 2 3 4 5 6 7 8 9 10; do
+    got=$(wget -q -O - http://127.0.0.1:8081/index.html 2>/dev/null) && break
+    sleep 1
+done
+check http "$got" "served by busybox"
+check http404 "$(wget -q -O - http://127.0.0.1:8081/absent 2>&1 | grep -c 'error: HTTP/1.0 404')" 1
+kill "$web"
+wait "$web"
+check refused "$(wget -q -O - http://127.0.0.1:8081/ 2>&1 | grep -c 'Connection refused')" 1
+nc -l -p 8082 > "$d/heard" &
+listener=$!
+for try in 1 2 3 4 5 6 7 8 9 10; do
+    echo "over tcp" | nc 127.0.0.1 8082 2>/dev/null && break
+    sleep 1
+done
+wait "$listener"
+check nc "$(cat "$d/heard")" "over tcp"
+
 rm -rf "$d"
 check rm "$([ -e "$d" ] || echo gone)" gone
 
