@@ -136,6 +136,25 @@ done
 wait "$listener"
 check nc "$(cat "$d/heard")" "over tcp"
 
+# A dynamically linked busybox, when the image has one
+# (tools/add_musl_to_image.sh): the kernel maps it and musl's dynamic
+# linker, which links it and starts it.
+if [ -f /bin/busybox-dyn ]; then
+    bd=/bin/busybox-dyn
+    check dynamic "$($bd echo linked at run time)" "linked at run time"
+    check dynpipe "$(echo 'b a' | $bd tr ' ' '\n' | $bd sort | $bd tr -d '\n')" ab
+    check dynsh "$($bd sh -c 'x=4; echo $((x * x))')" 16
+    # The dynamic linker run as a program: it maps busybox itself.
+    check ldso "$(/lib/ld-musl-x86_64.so.1 $bd echo by the linker)" "by the linker"
+fi
+
+# A script the kernel starts by its #! line: env runs it with execve, and
+# musl's execvp doesn't fall back to sh.
+printf '#!/bin/sh -e\necho "$0: $1"\n' > "$d/hello.sh"
+check shebang "$(env "$d/hello.sh" world)" "$d/hello.sh: world"
+printf '#!%s\n' "$d/hello.sh" > "$d/nested.sh"
+check shebang2 "$(env "$d/nested.sh" x)" "$d/hello.sh: $d/nested.sh"
+
 rm -rf "$d"
 check rm "$([ -e "$d" ] || echo gone)" gone
 

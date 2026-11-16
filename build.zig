@@ -615,6 +615,36 @@ pub fn build(b: *std.Build) void {
         }
     }
 
+    // A dynamically linked one, position independent: against musl's shared
+    // libc, a library of its own and a plugin it opens with dlopen. The
+    // libraries go to /lib (the image step takes zig-out/bin/*.so there);
+    // musl's dynamic linker comes from tools/add_musl_to_image.sh.
+    const lt_lib = b.addLibrary(.{
+        .name = "ltdyn",
+        .linkage = .dynamic,
+        .root_module = b.createModule(.{ .target = linux_target, .optimize = .ReleaseSafe, .link_libc = true }),
+    });
+    lt_lib.root_module.addCSourceFile(.{ .file = b.path("linux-tests/lt_dynlib.c"), .flags = &lt_cflags });
+    const lt_plug = b.addLibrary(.{
+        .name = "ltplug",
+        .linkage = .dynamic,
+        .root_module = b.createModule(.{ .target = linux_target, .optimize = .ReleaseSafe, .link_libc = true }),
+    });
+    lt_plug.root_module.addCSourceFile(.{ .file = b.path("linux-tests/lt_dynplug.c"), .flags = &lt_cflags });
+    lt_plug.root_module.linkLibrary(lt_lib);
+    const lt_dyn = b.addExecutable(.{
+        .name = "lt_dyn",
+        .root_module = b.createModule(.{ .target = linux_target, .optimize = .ReleaseSafe, .link_libc = true }),
+        .linkage = .dynamic,
+    });
+    lt_dyn.root_module.addCSourceFile(.{ .file = b.path("linux-tests/lt_dyn.c"), .flags = &lt_cflags });
+    lt_dyn.root_module.linkLibrary(lt_lib);
+    lt_dyn.pie = true;
+    b.getInstallStep().dependOn(&b.addInstallBinFile(stampOsabi(b, lt_dyn.getEmittedBin(), "lt_dyn.elf"), "lt_dyn.elf").step);
+    inline for (.{ lt_lib, lt_plug }) |lib| {
+        b.getInstallStep().dependOn(&b.addInstallArtifact(lib, .{ .dest_dir = .{ .override = .bin } }).step);
+    }
+
     // --- DOOM (real engine via doomgeneric) ---
     const doom_real = b.addExecutable(.{
         .name = "doom_real.elf",
@@ -1274,7 +1304,7 @@ pub fn build(b: *std.Build) void {
         \\# Skip rebuild if every input file is older than the image and the
         \\# image has the size asked for.
         \\if [ -f $IMG ] && [ "$(stat -c %s $IMG)" = "$((MB * 1048576))" ]; then
-        \\  newest=$( { ls -t zig-out/bin/*.elf zig-out/bin/KERNEL.SYM zig-out/bin/BUILD.ID zig-out/bin/BOOTX64.efi doom1.wad www/* linux-bin/* 2>/dev/null; find share -type f -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2; } | head -1 || true)
+        \\  newest=$( { ls -t zig-out/bin/*.elf zig-out/bin/*.so zig-out/bin/KERNEL.SYM zig-out/bin/BUILD.ID zig-out/bin/BOOTX64.efi doom1.wad www/* linux-bin/* 2>/dev/null; find share -type f -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2; } | head -1 || true)
         \\  if [ -n "$newest" ] && [ "$newest" -ot $IMG ]; then
         \\    echo "[ext2] up-to-date $(($(date +%s%3N)-T0))ms"
         \\    exit 0
@@ -1282,9 +1312,14 @@ pub fn build(b: *std.Build) void {
         \\fi
         \\
         \\rm -rf $STAGE
-        \\mkdir -p $STAGE/bin $STAGE/etc $STAGE/share $STAGE/var/log
+        \\mkdir -p $STAGE/bin $STAGE/lib $STAGE/etc $STAGE/share $STAGE/var/log
         \\for f in zig-out/bin/*.elf; do
         \\  [ -f "$f" ] && cp "$f" $STAGE/bin/
+        \\done
+        \\# Shared libraries of the Linux test programs, where musl's dynamic
+        \\# linker looks by default.
+        \\for f in zig-out/bin/*.so; do
+        \\  [ -f "$f" ] && cp "$f" $STAGE/lib/
         \\done
         \\# Linux-personality test binaries: hand-built static x86-64 ELFs
         \\# (EI_OSABI=3) staged into /bin next to native apps. The loader routes

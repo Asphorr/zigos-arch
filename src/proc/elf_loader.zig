@@ -12,6 +12,7 @@ const memmap = @import("../mm/memmap.zig");
 const heap = @import("../mm/heap.zig");
 const vfs = @import("../fs/vfs.zig");
 const ext2 = @import("../fs/ext2/ext2.zig");
+const ext2_inode = @import("../fs/ext2/inode.zig");
 const config = @import("../config.zig");
 
 /// Optional launch descriptor handed to loadAndStart so it can set the new
@@ -90,6 +91,45 @@ fn isUserVA(addr: usize, size: usize, linux: bool) bool {
 }
 
 const ELFOSABI_LINUX: u8 = 3;
+const ET_DYN: u16 = 3;
+
+/// Where a Linux program built to run at any address (ET_DYN) goes: above
+/// what a fixed image and its break reach, below where mmap starts placing.
+const PIE_BASE: usize = 0x55_5555_4000;
+/// Most alignment a loadable segment may ask for.
+const MAX_SEG_ALIGN: u64 = 1 << 30;
+
+/// The pages an image's PT_LOADs cover before any move, and the largest
+/// alignment they ask for.
+const Extent = struct { lo: usize, hi: usize, al: usize };
+
+/// Null if there is no PT_LOAD, one ends past the user window, or one asks
+/// for an alignment that isn't a power of two up to MAX_SEG_ALIGN.
+fn extentOf(phdrs: [*]align(1) const ProgramHeader, phnum: u16) ?Extent {
+    var lo: usize = std.math.maxInt(usize);
+    var hi: usize = 0;
+    var al: usize = PAGE_SIZE;
+    for (0..phnum) |i| {
+        const ph = phdrs[i];
+        if (ph.p_type != PT_LOAD_T) continue;
+        if (ph.p_align > MAX_SEG_ALIGN or (ph.p_align > 1 and !std.math.isPowerOfTwo(ph.p_align))) return null;
+        const end = std.math.add(u64, ph.p_vaddr, ph.p_memsz) catch return null;
+        if (end > memmap.USER_SPACE_END) return null;
+        lo = @min(lo, pageDown(@intCast(ph.p_vaddr)));
+        hi = @max(hi, @as(usize, @intCast(end)));
+        al = @max(al, @as(usize, @intCast(ph.p_align)));
+    }
+    if (hi == 0) return null;
+    return .{ .lo = lo, .hi = pageUp(hi), .al = al };
+}
+
+/// How far the program's segments move: nothing for a fixed-address image,
+/// to PIE_BASE for a position-independent Linux one. A multiple of the
+/// largest alignment, so every segment keeps its own.
+fn programBias(header: Header, ext: Extent, linux: bool) usize {
+    if (header.type != ET_DYN or !linux) return 0;
+    return std.mem.alignForward(usize, PIE_BASE, ext.al);
+}
 
 /// Where a new process's break and stack go.
 const Layout = struct {
@@ -103,14 +143,17 @@ const Layout = struct {
 /// around the image. The break starts at the page after the highest segment
 /// (native: not below USER_BRK_INITIAL). A native stack is the reserve under
 /// the load base; a Linux stack is the top LINUX_STACK_RESERVE of the window.
-/// The image is Linux if its EI_OSABI says so or `linux` is set. Null if a
-/// segment is out of range.
-fn layoutFor(header: Header, phdrs: [*]align(1) const ProgramHeader, linux: bool) ?Layout {
+/// The image is Linux if its EI_OSABI says so or `linux` is set; its
+/// segments move by `bias`. Null if a segment is out of range.
+fn layoutFor(header: Header, phdrs: [*]align(1) const ProgramHeader, linux: bool, bias: usize) ?Layout {
     const is_linux = linux or header.ident[7] == ELFOSABI_LINUX;
     var end: usize = 0;
     for (0..header.phnum) |i| {
         if (phdrs[i].p_type != PT_LOAD_T) continue;
-        const p_vaddr: usize = @intCast(phdrs[i].p_vaddr);
+        const p_vaddr: usize = std.math.add(usize, @intCast(phdrs[i].p_vaddr), bias) catch {
+            debug.klog("[elf] Rejected: segment 0x{X} moved by 0x{X} wraps\n", .{ phdrs[i].p_vaddr, bias });
+            return null;
+        };
         const p_memsz: usize = @intCast(phdrs[i].p_memsz);
         if (!isUserVA(p_vaddr, p_memsz, is_linux)) {
             debug.klog("[elf] Rejected: segment 0x{X}+{d} outside user VA\n", .{ p_vaddr, p_memsz });
@@ -230,7 +273,8 @@ fn segProt(p_flags: u32) u8 {
 /// Returns whether ANY segment still needs elf_buf (so the caller knows whether
 /// to retain it or free it after symbol parsing), or null if a region couldn't
 /// be registered or a segment's VA is out of user range (caller kills the proc).
-fn registerSegments(pid: usize, elf_buf: [*]const u8, phoff: usize, phnum: u16, inode: u32) ?bool {
+/// The segments move by `bias` (layoutFor checked the moved ranges).
+fn registerSegments(pid: usize, elf_buf: [*]const u8, phoff: usize, phnum: u16, inode: u32, bias: usize) ?bool {
     const phdrs: [*]align(1) const ProgramHeader = @ptrCast(elf_buf + phoff);
     var needs_elf_buf = false;
     var n_cache: u32 = 0;
@@ -238,7 +282,7 @@ fn registerSegments(pid: usize, elf_buf: [*]const u8, phoff: usize, phnum: u16, 
     var n_priv: u32 = 0;
     for (0..phnum) |i| {
         if (phdrs[i].p_type != 1) continue; // PT_LOAD
-        const p_vaddr: usize = @intCast(phdrs[i].p_vaddr);
+        const p_vaddr: usize = @as(usize, @intCast(phdrs[i].p_vaddr)) + bias;
         const p_memsz: usize = @intCast(phdrs[i].p_memsz);
         const p_filesz: usize = @intCast(phdrs[i].p_filesz);
         const p_offset: usize = @intCast(phdrs[i].p_offset);
@@ -372,15 +416,17 @@ fn registerCachedSegment(pid: usize, inum: u32, ph: ProgramHeader) bool {
     return true;
 }
 
-fn registerCachedSegments(pid: usize, inum: u32, phdrs: [*]align(1) const ProgramHeader, phnum: u16) bool {
+/// The segments move by `bias`; their moved ranges were checked.
+fn registerCachedSegments(pid: usize, inum: u32, phdrs: [*]align(1) const ProgramHeader, phnum: u16, bias: usize) bool {
     var n: u32 = 0;
     for (0..phnum) |i| {
-        const ph = phdrs[i];
+        var ph = phdrs[i];
         if (ph.p_type != PT_LOAD_T) continue;
+        ph.p_vaddr += bias;
         if (!registerCachedSegment(pid, inum, ph)) return false;
         n += 1;
     }
-    debug.klog("[elf] pid={d} inode={d}: {d} segments through the page cache\n", .{ pid, inum, n });
+    debug.klog("[elf] pid={d} inode={d}: {d} segments through the page cache, at +0x{X}\n", .{ pid, inum, n, bias });
     return true;
 }
 
@@ -399,7 +445,12 @@ const AT_PHDR: u64 = 3;
 const AT_PHENT: u64 = 4;
 const AT_PHNUM: u64 = 5;
 const AT_PAGESZ: u64 = 6;
+const AT_BASE: u64 = 7;
+const AT_FLAGS: u64 = 8;
 const AT_ENTRY: u64 = 9;
+const AT_PLATFORM: u64 = 15;
+const AT_HWCAP2: u64 = 26;
+const AT_EXECFN: u64 = 31;
 const AT_UID: u64 = 11;
 const AT_EUID: u64 = 12;
 const AT_GID: u64 = 13;
@@ -410,7 +461,35 @@ const AT_SECURE: u64 = 23;
 const AT_RANDOM: u64 = 25;
 
 const PT_LOAD_T: u32 = 1;
+const PT_INTERP_T: u32 = 3;
 const PT_PHDR_T: u32 = 6;
+
+/// What the auxiliary vector tells a Linux program of its image.
+const Aux = struct {
+    /// Where its program headers lie in its memory.
+    phdr: u64,
+    phnum: u16,
+    /// Its own entry, wherever execution starts.
+    entry: u64,
+    /// How far its interpreter was moved; 0 without one.
+    base: u64 = 0,
+};
+
+/// Where the program headers lie in the image's memory: PT_PHDR says, else
+/// the PT_LOAD whose file bytes hold them; 0 if none does.
+fn phdrAddr(phdrs: [*]align(1) const ProgramHeader, phnum: u16, phoff: u64, bias: usize) u64 {
+    for (0..phnum) |i| {
+        if (phdrs[i].p_type == PT_PHDR_T) return phdrs[i].p_vaddr +% bias;
+    }
+    for (0..phnum) |i| {
+        const ph = phdrs[i];
+        if (ph.p_type == PT_LOAD_T and phoff >= ph.p_offset and phoff - ph.p_offset < ph.p_filesz)
+            return ph.p_vaddr +% (phoff - ph.p_offset) +% bias;
+    }
+    return 0;
+}
+
+const PLATFORM = "x86_64";
 
 /// The environment every Linux process starts with (nothing passes one in
 /// yet). HOME is where programs keep caches and dotfiles.
@@ -461,60 +540,32 @@ const LAUNCH_ARGS_BYTES = blk: {
 
 /// Build the SysV initial stack for a .linux process and point its first-
 /// dispatch RSP at argc. `pd` is the new address space, `stack_top` the
-/// page-aligned top of the user stack region, `elf_buf` the kernel-side
-/// whole-file image (still valid — the caller invokes this before any elf_buf
-/// drop), `exec_args` an execve's argv and envp (null: the launch's). The
-/// block takes as many pages below the top as it needs. Returns false if
-/// they couldn't be mapped (caller kills it).
+/// page-aligned top of the user stack region, `aux` what the auxiliary
+/// vector says of the image, `exec_args` an execve's argv and envp (null:
+/// the launch's). The block takes as many pages below the top as it needs.
+/// Returns false if they couldn't be mapped (caller kills it).
 fn setupLinuxInitialStack(
     pid: usize,
     pd: [*]align(4096) u64,
     stack_top: usize,
-    elf_buf: [*]align(4) const u8,
+    aux: Aux,
     exec_args: ?*const ExecArgs,
 ) bool {
-    const header = @as([*]align(1) const Header, @ptrCast(elf_buf))[0];
-    const phoff: usize = @intCast(header.phoff);
-    const phnum: u16 = header.phnum;
-    const phentsize: u64 = header.phentsize;
-    const entry: u64 = header.entry;
-    const phdrs: [*]align(1) const ProgramHeader = @ptrCast(elf_buf + phoff);
-
-    // AT_PHDR: where the program headers live in the *process's* memory. Prefer
-    // an explicit PT_PHDR; else the first PT_LOAD mapping file offset 0 (it
-    // covers the ELF header, so the phdrs sit at p_vaddr + e_phoff). The page
-    // holding them is demand-paged from the text segment when musl reads it.
-    var phdr_va: u64 = 0;
-    {
-        var found = false;
-        for (0..phnum) |i| {
-            if (phdrs[i].p_type == PT_PHDR_T) {
-                phdr_va = phdrs[i].p_vaddr;
-                found = true;
-                break;
-            }
-        }
-        if (!found) {
-            for (0..phnum) |i| {
-                if (phdrs[i].p_type == PT_LOAD_T and phdrs[i].p_offset == 0) {
-                    phdr_va = phdrs[i].p_vaddr + phoff;
-                    break;
-                }
-            }
-        }
-    }
-
     var own: [LAUNCH_ARGS_BYTES]u8 = undefined;
     const args: ExecArgs = if (exec_args) |a| a.* else launchArgs(pid, &own);
+    // AT_EXECFN: the path the program was started by; argv[0] if none.
+    const pcb = process.getPCB(pid);
+    const execfn = if (pcb.exe_path_len != 0) pcb.exe_path[0..pcb.exe_path_len] else std.mem.sliceTo(args.strings, 0);
 
-    // The block, top down: 16 random bytes, the strings, then
+    // The block, top down: the program's path and the platform name, 16
+    // random bytes, the strings, then
     // argc | argv[0..argc] | NULL | envp | NULL | auxv with &argc 16-aligned.
     // Built in a kernel buffer standing for the pages below stack_top, then
     // copied into fresh frames mapped there RW/NX, as the lazy stack-fault
     // path would map them (protToMapFlags(R|W)).
-    const AUXV_PAIRS = 14;
+    const AUXV_PAIRS = 19;
     const words: usize = 1 + (args.argc + 1) + (args.envc + 1) + AUXV_PAIRS * 2;
-    const total = 16 + args.strings.len + words * 8 + 16;
+    const total = (execfn.len + 1) + (PLATFORM.len + 1) + 16 + args.strings.len + words * 8 + 16;
     if (total > MAX_INITIAL_STACK) {
         debug.klog("[linux] pid={d}: argv and envp take {d} bytes, past {d}\n", .{ pid, total, MAX_INITIAL_STACK });
         return false;
@@ -526,6 +577,13 @@ fn setupLinuxInitialStack(
     @memset(kbuf[0..span], 0);
 
     var off: usize = span;
+
+    off -= execfn.len + 1;
+    @memcpy(kbuf[off..][0..execfn.len], execfn);
+    const execfn_va: u64 = page_base + off;
+    off -= PLATFORM.len + 1;
+    @memcpy(kbuf[off..][0..PLATFORM.len], PLATFORM);
+    const platform_va: u64 = page_base + off;
 
     // 16 random bytes for AT_RANDOM (musl seeds its stack canary from these).
     // rdtsc-derived — not cryptographic, but canary strength isn't an M1 goal;
@@ -549,12 +607,17 @@ fn setupLinuxInitialStack(
 
     // Auxiliary vector — (type,value) pairs, AT_NULL-terminated.
     const auxv = [AUXV_PAIRS][2]u64{
-        .{ AT_PHDR, phdr_va },
-        .{ AT_PHENT, phentsize },
-        .{ AT_PHNUM, @intCast(phnum) },
+        .{ AT_PHDR, aux.phdr },
+        .{ AT_PHENT, @sizeOf(ProgramHeader) },
+        .{ AT_PHNUM, aux.phnum },
         .{ AT_PAGESZ, PAGE_SIZE },
-        .{ AT_ENTRY, entry },
+        .{ AT_BASE, aux.base },
+        .{ AT_FLAGS, 0 },
+        .{ AT_ENTRY, aux.entry },
         .{ AT_RANDOM, rand_va },
+        .{ AT_EXECFN, execfn_va },
+        .{ AT_PLATFORM, platform_va },
+        .{ AT_HWCAP2, 0 },
         .{ AT_UID, 0 },
         .{ AT_EUID, 0 },
         .{ AT_GID, 0 },
@@ -609,8 +672,8 @@ fn setupLinuxInitialStack(
     iretf[fspec.iretq.rsp.at()] = argc_va;
 
     const argv0_log = std.mem.sliceTo(args.strings, 0);
-    debug.klog("[linux] pid={d} SysV stack: rsp=0x{X} argc={d} envc={d} argv0='{s}' phdr=0x{X} phnum={d} entry=0x{X}\n", .{
-        pid, argc_va, args.argc, args.envc, argv0_log, phdr_va, phnum, entry,
+    debug.klog("[linux] pid={d} SysV stack: rsp=0x{X} argc={d} envc={d} argv0='{s}' phdr=0x{X} phnum={d} entry=0x{X} base=0x{X}\n", .{
+        pid, argc_va, args.argc, args.envc, argv0_log, aux.phdr, aux.phnum, aux.entry, aux.base,
     });
     return true;
 }
@@ -686,6 +749,16 @@ const MAX_HEADER_BYTES: usize = 64 * 1024;
 /// touch.
 fn loadCached(inum: u32, size: u64, launch: ?LaunchInfo) ?usize {
     debug.klog("[elf] Loading ELF64 binary from inode {d} ({d} bytes) through the page cache\n", .{ inum, size });
+    const h = readHeaders(inum, size) orelse return null;
+    defer heap.kfree(h.hdr);
+    return startImage(.{ .cached = .{ .inum = inum, .size = size, .hdr = h.hdr } }, h.header, launch);
+}
+
+/// An ext2 image's ELF header, and its first bytes through the program
+/// headers in `hdr`, from the heap: the caller frees it.
+const Headers = struct { header: Header, hdr: [*]align(8) u8 };
+
+fn readHeaders(inum: u32, size: u64) ?Headers {
     var header: Header = undefined;
     const hb = std.mem.asBytes(&header);
     if (size < hb.len or vfs.readThroughCache(inum, 0, hb, hb.len) != hb.len or !headerOk(header, size)) {
@@ -698,12 +771,141 @@ fn loadCached(inum: u32, size: u64, launch: ?LaunchInfo) ?usize {
         return null;
     }
     const raw = heap.kmallocAligned(hdr_len, 8) orelse return null;
-    defer heap.kfree(raw);
     const hdr: [*]align(8) u8 = @alignCast(raw);
-    if (vfs.readThroughCache(inum, 0, hdr, @intCast(hdr_len)) != hdr_len) return null;
+    if (vfs.readThroughCache(inum, 0, hdr, @intCast(hdr_len)) != hdr_len) {
+        heap.kfree(raw);
+        return null;
+    }
     // The header validated above, whatever the file holds now.
     @memcpy(hdr[0..hb.len], hb);
-    return startImage(.{ .cached = .{ .inum = inum, .size = size, .hdr = hdr } }, header, launch);
+    return .{ .header = header, .hdr = hdr };
+}
+
+/// `out.len` bytes of the image from file offset `off`.
+fn readAt(img: Image, off: u64, out: []u8) bool {
+    const size = img.fileSize();
+    if (off > size or out.len > size - off) return false;
+    switch (img) {
+        .buffer => |b| {
+            @memcpy(out, b.buf[@intCast(off)..][0..out.len]);
+            return true;
+        },
+        .cached => |c| return vfs.readThroughCache(c.inum, off, out.ptr, @intCast(out.len)) == out.len,
+    }
+}
+
+// --- The interpreter of a dynamic program ------------------------------------
+//
+// A dynamically linked program names its interpreter, the dynamic linker
+// (/lib/ld-musl-x86_64.so.1 for musl), in PT_INTERP. Both are mapped here and
+// the interpreter starts; it finds the program through the auxiliary vector
+// (AT_PHDR, AT_ENTRY, AT_BASE), maps its libraries with mmap and jumps to it.
+// The interpreter goes where the first mmap would: at the top of the mmap
+// area, below the program if the program is there.
+
+/// Longest path PT_INTERP may give.
+const INTERP_MAX: usize = 255;
+
+const Interp = struct {
+    inum: u32,
+    header: Header,
+    /// Its first bytes through the program headers, from the heap.
+    hdr: [*]align(8) u8,
+    /// How far its segments move: what AT_BASE tells (musl takes its own
+    /// load bias from it).
+    bias: usize,
+
+    fn phdrs(self: *const Interp) [*]align(1) const ProgramHeader {
+        return @ptrCast(self.hdr + @as(usize, @intCast(self.header.phoff)));
+    }
+
+    fn entry(self: *const Interp) usize {
+        return @as(usize, @intCast(self.header.entry)) +% self.bias;
+    }
+
+    fn deinit(self: *const Interp) void {
+        heap.kfree(self.hdr);
+    }
+};
+
+const InterpRead = union(enum) { none, interp: Interp, fail };
+
+fn hasInterp(phdrs: [*]align(1) const ProgramHeader, phnum: u16) bool {
+    for (0..phnum) |i| {
+        if (phdrs[i].p_type == PT_INTERP_T) return true;
+    }
+    return false;
+}
+
+/// The interpreter `img` names, read and placed clear of [prog_lo, prog_hi),
+/// the program's pages. .none if it names none.
+fn openInterp(img: Image, header: Header, linux: bool, prog_lo: usize, prog_hi: usize) InterpRead {
+    const phdrs: [*]align(1) const ProgramHeader = @ptrCast(img.bytes() + @as(usize, @intCast(header.phoff)));
+    const ph = for (0..header.phnum) |i| {
+        if (phdrs[i].p_type == PT_INTERP_T) break phdrs[i];
+    } else return .none;
+    if (!linux) {
+        debug.klog("[elf] Rejected: a native program with an interpreter\n", .{});
+        return .fail;
+    }
+    var path_buf: [INTERP_MAX + 1]u8 = undefined;
+    if (ph.p_filesz < 2 or ph.p_filesz > path_buf.len) {
+        debug.klog("[elf] Rejected: an interpreter path of {d} bytes\n", .{ph.p_filesz});
+        return .fail;
+    }
+    const len: usize = @intCast(ph.p_filesz);
+    if (!readAt(img, ph.p_offset, path_buf[0..len]) or path_buf[len - 1] != 0) {
+        debug.klog("[elf] Rejected: the interpreter path can't be read\n", .{});
+        return .fail;
+    }
+    const path = std.mem.sliceTo(path_buf[0..len], 0);
+    // Relative to nothing: a path of the loading task's would do, but no
+    // toolchain writes one.
+    if (path.len == 0 or path[0] != '/') {
+        debug.klog("[elf] Rejected: interpreter '{s}' is not an absolute path\n", .{path});
+        return .fail;
+    }
+    const pcb = process.currentPCB() orelse process.getPCB(0);
+    var rbuf: [256]u8 = undefined;
+    const r = vfs.resolvePath(pcb, path, &rbuf) orelse return interpMissing(path);
+    if (r.fs != .ext2) return interpMissing(path);
+    const inum = ext2.lookupPath(r.path) orelse return interpMissing(path);
+    const ino = ext2_inode.readInode(inum) orelse return interpMissing(path);
+    if (!ext2_inode.isReg(&ino)) return interpMissing(path);
+    const size = ext2_inode.fileSize(&ino);
+
+    const h = readHeaders(inum, size) orelse return .fail;
+    var it = Interp{ .inum = inum, .header = h.header, .hdr = h.hdr, .bias = 0 };
+    const iph = it.phdrs();
+    const n = h.header.phnum;
+    const usable = h.header.type == ET_DYN and segmentsInFile(iph, n, size) and !hasInterp(iph, n);
+    const ext = (if (usable) extentOf(iph, n) else null) orelse {
+        debug.klog("[elf] Rejected: interpreter '{s}' is not a position-independent image\n", .{path});
+        it.deinit();
+        return .fail;
+    };
+    // Its pages are [bias + lo, bias + hi), the bias a multiple of its
+    // alignment: as high as fits under the mmap top, else under the program.
+    var bias = std.mem.alignBackward(usize, memmap.LINUX_MMAP_TOP -| ext.hi, ext.al);
+    if (bias + ext.lo < prog_hi and prog_lo < bias + ext.hi) bias = std.mem.alignBackward(usize, prog_lo -| ext.hi, ext.al);
+    if (bias + ext.lo < memmap.USER_SPACE_START or (bias + ext.lo < prog_hi and prog_lo < bias + ext.hi)) {
+        debug.klog("[elf] Rejected: no room for interpreter '{s}' ({d} bytes)\n", .{ path, ext.hi - ext.lo });
+        it.deinit();
+        return .fail;
+    }
+    it.bias = bias;
+    if (!isUserVA(it.entry(), 1, true)) {
+        debug.klog("[elf] Rejected: interpreter entry 0x{X} outside user VA\n", .{it.entry()});
+        it.deinit();
+        return .fail;
+    }
+    debug.klog("[elf] interpreter '{s}' (inode {d}) at 0x{X}\n", .{ path, inum, bias + ext.lo });
+    return .{ .interp = it };
+}
+
+fn interpMissing(path: []const u8) InterpRead {
+    debug.klog("[elf] Rejected: interpreter '{s}' is not a file on ext2\n", .{path});
+    return .fail;
 }
 
 /// Where a new process's segments come from.
@@ -771,27 +973,43 @@ fn segmentsInFile(phdrs: [*]align(1) const ProgramHeader, phnum: u16, size: u64)
 fn startImage(img: Image, header: Header, launch: ?LaunchInfo) ?usize {
     const phoff: usize = @intCast(header.phoff);
     const phdrs: [*]align(1) const ProgramHeader = @ptrCast(img.bytes() + phoff);
+    const exec_args = if (launch) |li| li.exec_args else null;
+    const linux = exec_args != null or header.ident[7] == ELFOSABI_LINUX;
 
-    const entry_addr: usize = @intCast(header.entry);
-    const from_linux = if (launch) |li| li.exec_args != null else false;
-    if (!isUserVA(entry_addr, 1, from_linux or header.ident[7] == ELFOSABI_LINUX)) {
-        debug.klog("[elf] Rejected: entry 0x{X} outside user VA range\n", .{entry_addr});
+    if (!segmentsInFile(phdrs, header.phnum, img.fileSize())) {
+        debug.klog("[elf] Rejected: a segment's file bytes lie outside the file\n", .{});
         img.drop();
         return null;
     }
-    if (!segmentsInFile(phdrs, header.phnum, img.fileSize())) {
-        debug.klog("[elf] Rejected: a segment's file bytes lie outside the file\n", .{});
+    const ext = extentOf(phdrs, header.phnum) orelse {
+        debug.klog("[elf] Rejected: no loadable segment, or one out of range or oddly aligned\n", .{});
+        img.drop();
+        return null;
+    };
+    const bias = programBias(header, ext, linux);
+    const entry_addr: usize = @as(usize, @intCast(header.entry)) +% bias;
+    if (!isUserVA(entry_addr, 1, linux)) {
+        debug.klog("[elf] Rejected: entry 0x{X} outside user VA range\n", .{entry_addr});
         img.drop();
         return null;
     }
 
     // Validate every PT_LOAD's VA range fits in user space before doing
     // any per-segment work — bail early without partial state.
-    const exec_args = if (launch) |li| li.exec_args else null;
-    const lay = layoutFor(header, phdrs, exec_args != null) orelse {
+    const lay = layoutFor(header, phdrs, exec_args != null, bias) orelse {
         img.drop();
         return null;
     };
+
+    const interp: ?Interp = switch (openInterp(img, header, linux, ext.lo + bias, ext.hi + bias)) {
+        .none => null,
+        .interp => |it| it,
+        .fail => {
+            img.drop();
+            return null;
+        },
+    };
+    defer if (interp) |*it| it.deinit();
 
     var pd_phys: Phys = Phys.of(0);
     const pd = vmm.createAddressSpace(&pd_phys) orelse {
@@ -801,14 +1019,15 @@ fn startImage(img: Image, header: Header, launch: ?LaunchInfo) ?usize {
 
     // The user stack is a lazy region: pages back on first touch. A native
     // task starts just below its top; a Linux task's RSP is moved to the
-    // SysV block by setupLinuxInitialStack.
-    const entry: usize = @intCast(header.entry);
-    const pid = process.create(entry, lay.stack_top - 8) orelse {
+    // SysV block by setupLinuxInitialStack. A dynamic program starts in its
+    // interpreter.
+    const start: usize = if (interp) |*it| it.entry() else entry_addr;
+    const pid = process.create(start, lay.stack_top - 8) orelse {
         vmm.destroyAddressSpace(pd, pd_phys);
         img.drop();
         return null;
     };
-    debug.klog("[elf] Process created PID={d} entry=0x{X:0>16}\n", .{ pid, header.entry });
+    debug.klog("[elf] Process created PID={d} entry=0x{X:0>16}\n", .{ pid, start });
 
     // From here the PCB owns the address space and the buffer; a failure
     // tears the process down (abortLoading), which frees both.
@@ -859,31 +1078,39 @@ fn startImage(img: Image, header: Header, launch: ?LaunchInfo) ?usize {
         return null;
     }
     const needs_elf_buf: ?bool = switch (img) {
-        .buffer => |b| registerSegments(pid, b.buf, phoff, header.phnum, b.inode),
-        .cached => |c| if (registerCachedSegments(pid, c.inum, phdrs, header.phnum)) false else null,
+        .buffer => |b| registerSegments(pid, b.buf, phoff, header.phnum, b.inode, bias),
+        .cached => |c| if (registerCachedSegments(pid, c.inum, phdrs, header.phnum, bias)) false else null,
     };
-    if (needs_elf_buf == null) {
+    const interp_ok = if (interp) |*it| registerCachedSegments(pid, it.inum, it.phdrs(), it.header.phnum, it.bias) else true;
+    if (needs_elf_buf == null or !interp_ok) {
         debug.klog("[elf] segment registration failed for PID {d}\n", .{pid});
         process.abortLoading(@intCast(pid));
         return null;
     }
 
     // Linux personality: build the SysV initial stack (argc/argv/envp/auxv +
-    // RSP) BEFORE elf_buf can be dropped below — setupLinuxInitialStack reads
-    // the program headers out of it. Native processes get argv via syscalls and
-    // skip this entirely.
+    // RSP). Native processes get argv via syscalls and skip this entirely.
     if (pcb.personality == .linux) {
-        if (!setupLinuxInitialStack(pid, pd, lay.stack_top, img.bytes(), exec_args)) {
+        const aux = Aux{
+            .phdr = phdrAddr(phdrs, header.phnum, header.phoff, bias),
+            .phnum = header.phnum,
+            .entry = entry_addr,
+            .base = if (interp) |*it| it.bias else 0,
+        };
+        if (!setupLinuxInitialStack(pid, pd, lay.stack_top, aux, exec_args)) {
             debug.klog("[linux] initial-stack setup failed for PID {d}\n", .{pid});
             process.abortLoading(@intCast(pid));
             return null;
         }
     }
 
-    // Debug symbols from the ELF section headers.
+    // Debug symbols from the ELF section headers, where the image lies.
     pcb.sym_table = switch (img) {
         .buffer => |b| symbols.parseElfSymbols(b.buf, b.size),
         .cached => |c| symbols.parseElfSymbolsFile(c.inum, c.size, c.hdr[0..@sizeOf(Header)]),
+    };
+    if (bias != 0) if (pcb.sym_table) |st| {
+        for (st.entries[0..st.count]) |*e| e.addr +%= bias;
     };
 
     // Slice 3e: if no segment is demand-paged from elf_buf (all are cache-shared
@@ -929,7 +1156,7 @@ pub fn loadAndExecute(elf_buf: [*]align(4) u8, file_size: usize, elf_buf_pages: 
         return;
     }
 
-    const lay = layoutFor(header, @ptrCast(elf_buf + phoff), false) orelse {
+    const lay = layoutFor(header, @ptrCast(elf_buf + phoff), false, 0) orelse {
         vga.fg = .LightRed;
         vga.print("Error: segment outside user space!\n", .{});
         freePmmRange(@intFromPtr(elf_buf), elf_buf_pages);
@@ -979,7 +1206,7 @@ pub fn loadAndExecute(elf_buf: [*]align(4) u8, file_size: usize, elf_buf_pages: 
         return;
     }
 
-    const needs_elf_buf = registerSegments(pid, elf_buf, phoff, header.phnum, inode) orelse {
+    const needs_elf_buf = registerSegments(pid, elf_buf, phoff, header.phnum, inode, 0) orelse {
         vga.fg = .LightRed;
         vga.print("Error: segment registration failed!\n", .{});
         process.abortLoading(@intCast(pid));
@@ -989,7 +1216,12 @@ pub fn loadAndExecute(elf_buf: [*]align(4) u8, file_size: usize, elf_buf_pages: 
     // Linux personality: build the SysV initial stack before any elf_buf drop
     // (see loadAndStart for the full rationale).
     if (pcb.personality == .linux) {
-        if (!setupLinuxInitialStack(pid, pd, lay.stack_top, elf_buf, null)) {
+        const aux = Aux{
+            .phdr = phdrAddr(@ptrCast(elf_buf + phoff), header.phnum, header.phoff, 0),
+            .phnum = header.phnum,
+            .entry = header.entry,
+        };
+        if (!setupLinuxInitialStack(pid, pd, lay.stack_top, aux, null)) {
             debug.klog("[linux] initial-stack setup failed for PID {d}\n", .{pid});
             process.abortLoading(@intCast(pid));
             return;

@@ -60,6 +60,9 @@ const CASES = [_]Case{
     .{ .path = "/bin/lt_proc.elf" },
     .{ .path = "/bin/lt_signal.elf" },
     .{ .path = "/bin/lt_net.elf" },
+    // Dynamically linked: needs musl's dynamic linker in the image
+    // (tools/add_musl_to_image.sh).
+    .{ .path = "/bin/lt_dyn.elf", .optional = true, .needs = "/lib/ld-musl-x86_64.so.1" },
     // At a terminal: lines typed and edited, then raw keys (the last is the
     // window's code for the up arrow).
     .{

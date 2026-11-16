@@ -49,6 +49,7 @@ const EINVAL: i64 = 22;
 const ENFILE: i64 = 23;
 const EMFILE: i64 = 24;
 const EBUSY: i64 = 16;
+const ELOOP: i64 = 40;
 
 inline fn err(e: i64) u64 {
     return @bitCast(-e);
@@ -90,11 +91,18 @@ pub fn execve(frame: *signals.SyscallFrame, path_va: u64, argv_va: u64, envp_va:
     // first; not done here.
     if (process.procs[me].tgid != me) return err(EINVAL);
 
-    var path_buf: [256]u8 = undefined;
-    const target = switch (linux_fs.execTarget(path_va, &path_buf)) {
+    // Two in turn: a script's interpreter is looked up while the script's
+    // path is still read.
+    var path_bufs: [2][256]u8 = undefined;
+    var target = switch (linux_fs.execTarget(path_va, &path_bufs[0])) {
         .file => |f| f,
         .fail => |e| return e,
     };
+    // The process is named after what was asked for, a script included.
+    var name_buf: [15]u8 = undefined;
+    const asked = std.fs.path.basename(target.path);
+    const name_len = @min(asked.len, name_buf.len);
+    @memcpy(name_buf[0..name_len], asked[0..name_len]);
 
     const strings = heap.kmalloc(MAX_EXEC_STRINGS) orelse return err(ENOMEM);
     defer heap.kfree(strings);
@@ -108,6 +116,27 @@ pub fn execve(frame: *signals.SyscallFrame, path_va: u64, argv_va: u64, envp_va:
         .count => |n| n,
         .fail => |e| return e,
     };
+
+    // A script names the program that runs it on its first line,
+    // `#!interpreter [argument]`: that program runs instead, the script's
+    // path after its own name and argument, the script's argv[1..] after.
+    var depth: u8 = 0;
+    while (true) {
+        var head: [SCRIPT_LINE_MAX]u8 = undefined;
+        const line = scriptLine(target, &head) orelse break;
+        if (depth == MAX_SCRIPT_DEPTH) return err(ELOOP);
+        depth += 1;
+        if (line.interp.len == 0) return err(ENOEXEC);
+        used = switch (scriptArgs(strings[0..MAX_EXEC_STRINGS], used, &args, line, target.path)) {
+            .count => |n| n,
+            .fail => |e| return e,
+        };
+        const pcb = linux_fs.proc() orelse return err(EFAULT);
+        target = switch (linux_fs.execTargetAt(pcb, line.interp, &path_bufs[depth % 2])) {
+            .file => |f| f,
+            .fail => |e| return e,
+        };
+    }
     args.strings = strings[0..used];
 
     // The image is built and the old one dropped with no kill in between:
@@ -115,11 +144,10 @@ pub fn execve(frame: *signals.SyscallFrame, path_va: u64, argv_va: u64, envp_va:
     process.noKillEnter();
     defer process.noKillLeave();
 
-    const name = std.fs.path.basename(target.path);
     const img = elf_loader.loadForExec(target.inum, target.size, .{
-        .name = name[0..@min(name.len, 15)],
-        .raw = name,
-        .fname_len = name.len,
+        .name = name_buf[0..name_len],
+        .raw = name_buf[0..name_len],
+        .fname_len = name_len,
         .exe_path = target.path,
         .exec_args = &args,
     }) orelse return err(ENOEXEC);
@@ -169,6 +197,61 @@ fn closeOnExec() void {
     for (0..pcb.fd_table.len) |fd| {
         if (pcb.fd_table[fd].file != null and pcb.fd_table[fd].cloexec) _ = vfs.closeSlot(pcb, @intCast(fd));
     }
+}
+
+/// Most bytes of a script's first line looked at (Linux's BINPRM_BUF_SIZE).
+const SCRIPT_LINE_MAX: usize = 256;
+/// Scripts run by scripts, at most.
+const MAX_SCRIPT_DEPTH: u8 = 4;
+
+const ScriptLine = struct { interp: []const u8, arg: ?[]const u8 };
+
+/// The `#!` line of `target`, its parts slices of `head`; null if the file
+/// isn't a script. What follows the interpreter is one argument, blanks
+/// inside it kept, as on Linux.
+fn scriptLine(target: linux_fs.ExecTarget, head: *[SCRIPT_LINE_MAX]u8) ?ScriptLine {
+    const want: u32 = @intCast(@min(target.size, head.len));
+    if (want < 2) return null;
+    const n = vfs.readThroughCache(target.inum, 0, head, want);
+    if (n < 2 or head[0] != '#' or head[1] != '!') return null;
+    var line: []const u8 = head[2..n];
+    if (std.mem.indexOfScalar(u8, line, '\n')) |end| line = line[0..end];
+    const blank = " \t";
+    line = std.mem.trim(u8, line, blank);
+    const cut = std.mem.indexOfAny(u8, line, blank) orelse return .{ .interp = line, .arg = null };
+    const arg = std.mem.trim(u8, line[cut..], blank);
+    return .{ .interp = line[0..cut], .arg = if (arg.len == 0) null else arg };
+}
+
+const LenRead = union(enum) { count: usize, fail: u64 };
+
+/// The argv the interpreter of `script` gets: its own name, the line's
+/// argument if any, the script's path, then the script's argv[1..]; the
+/// environment stays. Rewrites the strings `buf[0..used]` in place.
+fn scriptArgs(buf: []u8, used: usize, args: *elf_loader.ExecArgs, line: ScriptLine, script: []const u8) LenRead {
+    // The bytes of argv[0], which the new names replace.
+    const old0: usize = if (args.argc == 0) 0 else (std.mem.indexOfScalar(u8, buf[0..used], 0) orelse return .{ .fail = err(EFAULT) }) + 1;
+    var prefix: [3 * (SCRIPT_LINE_MAX + 1)]u8 = undefined;
+    var p: usize = 0;
+    var names: u32 = 0;
+    for ([_]?[]const u8{ line.interp, line.arg, script }) |part| {
+        const s = part orelse continue;
+        @memcpy(prefix[p..][0..s.len], s);
+        prefix[p + s.len] = 0;
+        p += s.len + 1;
+        names += 1;
+    }
+    const rest = used - old0;
+    if (p + rest > buf.len) return .{ .fail = err(E2BIG) };
+    // The rest moves to just after the new names; the ranges may overlap.
+    if (p > old0) {
+        std.mem.copyBackwards(u8, buf[p..][0..rest], buf[old0..used]);
+    } else {
+        std.mem.copyForwards(u8, buf[p..][0..rest], buf[old0..used]);
+    }
+    @memcpy(buf[0..p], prefix[0..p]);
+    args.argc = args.argc - @intFromBool(args.argc != 0) + names;
+    return .{ .count = p + rest };
 }
 
 const StringsRead = union(enum) { count: u32, fail: u64 };

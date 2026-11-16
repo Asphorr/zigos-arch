@@ -360,6 +360,11 @@ pub fn execTarget(path_va: u64, out: *[256]u8) ExecLookup {
         .path => |p| p,
         .fail => |e| return .{ .fail = e },
     };
+    return execTargetAt(pcb, path, out);
+}
+
+/// execTarget for a path in kernel memory: a script's interpreter.
+pub fn execTargetAt(pcb: *process.PCB, path: []const u8, out: *[256]u8) ExecLookup {
     var rbuf: [256]u8 = undefined;
     const r = vfs.resolvePath(pcb, path, &rbuf) orelse return .{ .fail = err(ENOENT) };
     if (r.fs != .ext2) return .{ .fail = err(EACCES) };
