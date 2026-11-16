@@ -1046,6 +1046,10 @@ fn transition(pid: usize, from: ?State, new_state: State, ra: usize) bool {
 
     if (was_ready and !is_ready) rqLeave(pid);
     if (new_state == .zombie or new_state == .unused) wakelat.drop(pid);
+    // A queued task never keeps a wait: the pickers skip one that has it.
+    // wake() clears it before its CAS, but a stale wake's CAS can land on
+    // a later sleep the task enrolled for since — ready, and never picked.
+    if (from_sleep and is_ready) clearWait(pcb);
     if (!was_ready and is_ready) {
         if (from_sleep and !pcb.is_idle) {
             const target = pcb.assigned_cpu;
@@ -2453,6 +2457,8 @@ pub fn schedule() void {
                 }
             }
         }
+        // The upper YMM halves go with their task (fp.zig); IRQs are off.
+        @import("../cpu/arch/fp.zig").switchExtended(from_pid_a, next);
         @import("sched_asm.zig").switchToCall(prev_save, next_kesp, prev_on_cpu);
         // When we get here, this caller has been re-scheduled.
         @import("../debug/kdbg.zig").schedEvent(.switch_out, from_pid_a, 0, 0, @intCast(next));

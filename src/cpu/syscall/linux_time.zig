@@ -12,6 +12,7 @@ const time = @import("../../time/time.zig");
 const common = @import("common.zig");
 const native_proc = @import("proc.zig");
 const usercopy = @import("../arch/usercopy.zig");
+const linux_signal = @import("linux_signal.zig");
 
 // Linux errno.
 const EINTR: i64 = 4;
@@ -126,19 +127,29 @@ pub fn timeNow(t_va: u64) u64 {
     return sec;
 }
 
-/// Sleep `ns` on the monotonic clock: 0, or -EINTR with the time left
-/// written to `rem_va` (when not null) once a signal is pending.
-fn sleepNanos(ns: u64, rem_va: u64) u64 {
-    const pcb = process.currentPCB() orelse return err(EFAULT);
+/// How a sleep a signal cuts short goes on when no handler runs.
+const Resume = enum {
+    /// restart_syscall sleeps on to the same deadline.
+    rest,
+    /// The call runs again as it was made: an absolute deadline.
+    again,
+};
+
+/// Sleep until monotonic `deadline`: 0, or once a signal is pending the
+/// time left in `rem_va` (when not null) and a restart code — EINTR when a
+/// handler runs, else the sleep goes on (`how`).
+fn sleepUntil(pcb: *process.PCB, deadline: u64, rem_va: u64, how: Resume) u64 {
     var now = time.monotonicNanos();
-    const deadline = now +| ns;
     while (now < deadline) {
         if (@import("../../proc/signals.zig").deliverable(pcb) != 0) {
             if (rem_va != 0) {
                 const rem = toTimespec(deadline - now);
                 _ = usercopy.copyToUser(rem_va, std.mem.asBytes(&rem));
             }
-            return err(EINTR);
+            if (how == .again) return err(linux_signal.ERESTARTNOHAND);
+            pcb.restart_until = deadline;
+            pcb.restart_rem = rem_va;
+            return err(linux_signal.ERESTART_RESTARTBLOCK);
         }
         const us = std.math.divCeil(u64, deadline - now, 1000) catch unreachable;
         _ = native_proc.sysUsleep(@intCast(@min(us, std.math.maxInt(u32))));
@@ -147,6 +158,21 @@ fn sleepNanos(ns: u64, rem_va: u64) u64 {
         now = later;
     }
     return 0;
+}
+
+fn sleepNanos(ns: u64, rem_va: u64) u64 {
+    const pcb = process.currentPCB() orelse return err(EFAULT);
+    return sleepUntil(pcb, time.monotonicNanos() +| ns, rem_va, .rest);
+}
+
+/// restart_syscall(): the rest of the sleep a signal with no handler cut
+/// short; EINTR when there is none.
+pub fn restartSyscall() u64 {
+    const pcb = process.currentPCB() orelse return err(EFAULT);
+    const until = pcb.restart_until;
+    if (until == 0) return err(EINTR);
+    pcb.restart_until = 0;
+    return sleepUntil(pcb, until, pcb.restart_rem, .rest);
 }
 
 /// nanosleep(req, rem).
@@ -167,6 +193,9 @@ pub fn clockNanosleep(clock: u64, flags: u64, req_va: u64, rem_va: u64) u64 {
         .ns => |ns| ns,
         .fail => |e| return e,
     };
-    if (flags & TIMER_ABSTIME != 0) return sleepNanos(ns -| now, 0);
+    if (flags & TIMER_ABSTIME != 0) {
+        const pcb = process.currentPCB() orelse return err(EFAULT);
+        return sleepUntil(pcb, time.monotonicNanos() +| (ns -| now), 0, .again);
+    }
     return sleepNanos(ns, rem_va);
 }

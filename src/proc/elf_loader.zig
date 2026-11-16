@@ -671,6 +671,18 @@ fn setupLinuxInitialStack(
     const iretf: [*]u64 = @ptrFromInt(process.procs[pid].kernel_stack_top - fspec.pt_regs_bytes);
     iretf[fspec.iretq.rsp.at()] = argc_va;
 
+    // For /proc/<pid>/cmdline, environ and auxv.
+    var argv_bytes: usize = 0;
+    for (0..args.argc) |_| {
+        argv_bytes = (std.mem.indexOfScalarPos(u8, args.strings, argv_bytes, 0) orelse args.strings.len - 1) + 1;
+    }
+    const me = &process.procs[pid];
+    me.arg_start = page_base + strings_off;
+    me.arg_end = me.arg_start + argv_bytes;
+    me.env_end = me.arg_start + args.strings.len;
+    me.auxv_start = argc_va + (1 + (args.argc + 1) + (args.envc + 1)) * 8;
+    me.auxv_end = me.auxv_start + AUXV_PAIRS * 16;
+
     const argv0_log = std.mem.sliceTo(args.strings, 0);
     debug.klog("[linux] pid={d} SysV stack: rsp=0x{X} argc={d} envc={d} argv0='{s}' phdr=0x{X} phnum={d} entry=0x{X} base=0x{X}\n", .{
         pid, argc_va, args.argc, args.envc, argv0_log, aux.phdr, aux.phnum, aux.entry, aux.base,

@@ -27,6 +27,7 @@ const fp = @import("../arch/fp.zig");
 const sched = @import("../../proc/sched.zig");
 const linux_time = @import("linux_time.zig");
 const debug = @import("../../debug/debug.zig");
+const perf = @import("../../debug/perf.zig");
 
 const PCB = process.PCB;
 
@@ -50,6 +51,10 @@ pub const ERESTARTSYS: i64 = 512;
 pub const ERESTARTNOINTR: i64 = 513;
 /// Runs again only when no handler ran; else EINTR.
 pub const ERESTARTNOHAND: i64 = 514;
+/// With no handler, restart_syscall goes on with what the call left
+/// (PCB.restart_until); else EINTR.
+pub const ERESTART_RESTARTBLOCK: i64 = 516;
+const SYS_restart_syscall: u64 = 219;
 
 // --- User structures (x86-64) --------------------------------------------------
 
@@ -128,6 +133,25 @@ const USER_CS: u16 = 0x23;
 const USER_SS: u16 = 0x1B;
 const RED_ZONE: u64 = 128;
 const FP_BYTES: u64 = 512;
+
+// With AVX the frame's FP state is laid out as Linux's XSAVE one: the
+// FXSAVE image, whose software bytes (from SW_AT) say what follows, the
+// XSAVE header, the AVX component, and MAGIC2 after the lot.
+const FP_XSTATE_MAGIC1: u32 = 0x46505853;
+const FP_XSTATE_MAGIC2: u32 = 0x46505845;
+/// FXSAVE writes nothing from here on.
+const FX_USED: usize = 416;
+const SW_AT: usize = 464;
+const XHEADER_AT: usize = 512;
+const YMM_AT: usize = 576;
+/// The XSAVE layout's size, legacy region to the end of the AVX component.
+const XSTATE_BYTES: usize = YMM_AT + fp.UPPER_BYTES;
+const XFRAME_BYTES: usize = XSTATE_BYTES + 4;
+/// x87, SSE and AVX: the features in that layout.
+const XFEATURES: u64 = 0b111;
+const XFEATURE_AVX: u64 = 1 << 2;
+/// uc_flags: the FP state has the XSAVE layout.
+const UC_FP_XSTATE: u64 = 1;
 
 /// The flags a program may set: the arithmetic ones, DF, TF, AC, RF, ID.
 /// IF stays on and the rest (IOPL, NT, VM) off.
@@ -423,17 +447,29 @@ const Push = union(enum) { ok: Entry, busy, fault };
 /// The next signal that has a handler to run. Those ignored are dropped and
 /// those with no handler take their default on the way — which may end the
 /// process: no return then.
-fn nextHandler(pcb: *PCB) ?Delivery {
+fn nextHandler(pcb: *PCB, may_park: bool) ?Delivery {
     while (true) {
         const t = signals.take(pcb) orelse return null;
         const d = signals.dispositions(pcb)[t.signo];
         if (!signals.isCatchable(t.signo) or d.handler == signals.SIG_DFL) {
             signals.applyDefault(pcb, t.signo);
+            if (may_park) waitWhileStopped(pcb);
             continue;
         }
         if (d.handler == signals.SIG_IGN) continue;
         return .{ .taken = t, .disp = d };
     }
+}
+
+/// A stopped task runs no more of its code: it stays off the CPU here (the
+/// pickers skip it) until SIGCONT or SIGKILL, and then takes what is pending.
+/// Task context only; an interrupt's way out reschedules on its own.
+fn waitWhileStopped(pcb: *PCB) void {
+    if (!@atomicLoad(bool, &pcb.job_stopped, .acquire)) return;
+    // The stop is not the syscall's time.
+    const t0 = perf.rdtsc();
+    while (@atomicLoad(bool, &pcb.job_stopped, .acquire)) process.schedule();
+    pcb.perf_gap_cyc +%= perf.rdtsc() -% t0;
 }
 
 fn siginfoOf(t: signals.Taken, fault: Fault) Siginfo {
@@ -466,12 +502,13 @@ fn pushFrame(pcb: *PCB, regs: *const Sigcontext, fp_image: *const [512]u8, d: De
     const alt = pcb.alt_stack;
     const switch_stack = d.disp.flags & signals.SA_ONSTACK != 0 and alt.size != 0 and !alt.holds(regs.rsp);
     const top: u64 = if (switch_stack) alt.sp + alt.size else regs.rsp -% RED_ZONE;
-    const fp_va = (top -% FP_BYTES) & ~@as(u64, 63);
+    const fp_len: u64 = if (fp.avx) XFRAME_BYTES else FP_BYTES;
+    const fp_va = (top -% fp_len) & ~@as(u64, 63);
     // The handler is entered as by a call: its rsp + 8 is 16-aligned.
     const frame_va = ((fp_va -% @sizeOf(RtSigframe)) & ~@as(u64, 15)) -% 8;
-    // Under a kilobyte whatever rsp was; the range check takes care of a
-    // stack pointer that points nowhere.
-    const span = (fp_va +% FP_BYTES) -% frame_va;
+    // Under two kilobytes whatever rsp was; the range check takes care of
+    // a stack pointer that points nowhere.
+    const span = (fp_va +% fp_len) -% frame_va;
     if (!memmap.userDataRangeOk(frame_va, span)) return .fault;
     switch (process.ensureSignalFrameWritable(frame_va, span)) {
         .ok => {},
@@ -493,11 +530,16 @@ fn pushFrame(pcb: *PCB, regs: *const Sigcontext, fp_image: *const [512]u8, d: De
     frame.uc.mcontext.cr2 = fault.addr;
     frame.uc.mcontext.oldmask = mask;
     frame.uc.mcontext.fpstate = fp_va;
+    if (fp.avx) frame.uc.flags = UC_FP_XSTATE;
+
+    var fp_buf: [XFRAME_BYTES]u8 = undefined;
+    const fp_state = fpState(&fp_buf, fp_image);
+    std.debug.assert(fp_state.len == fp_len);
 
     // The pages were just made present and writable; one taken away since
     // (a sibling's munmap) cuts the copy short, and the signal can't be
     // delivered.
-    if (usercopy.copyToUserRaw(fp_va, fp_image) != FP_BYTES) return .fault;
+    if (usercopy.copyToUserRaw(fp_va, fp_state) != fp_len) return .fault;
     if (usercopy.copyToUserRaw(frame_va, std.mem.asBytes(&frame)) != @sizeOf(RtSigframe)) return .fault;
 
     if (switch_stack and alt.autodisarm) pcb.alt_stack = .{};
@@ -506,6 +548,32 @@ fn pushFrame(pcb: *PCB, regs: *const Sigcontext, fp_image: *const [512]u8, d: De
         .info = frame_va + @offsetOf(RtSigframe, "info"),
         .uc = frame_va + @offsetOf(RtSigframe, "uc"),
     } };
+}
+
+/// The frame's FP state, built in `buf` from the entry's FXSAVE image and,
+/// with AVX, the live upper YMM halves: the calling task's, as the kernel
+/// leaves them alone.
+fn fpState(buf: *[XFRAME_BYTES]u8, fx: *const [512]u8) []const u8 {
+    // The rest of the image is whatever the kernel stack held.
+    @memcpy(buf[0..FX_USED], fx[0..FX_USED]);
+    @memset(buf[FX_USED..XFRAME_BYTES], 0);
+    if (!fp.avx) return buf[0..FP_BYTES];
+    std.mem.writeInt(u32, buf[SW_AT..][0..4], FP_XSTATE_MAGIC1, .little);
+    std.mem.writeInt(u32, buf[SW_AT + 4 ..][0..4], XFRAME_BYTES, .little);
+    std.mem.writeInt(u64, buf[SW_AT + 8 ..][0..8], XFEATURES, .little);
+    std.mem.writeInt(u32, buf[SW_AT + 16 ..][0..4], XSTATE_BYTES, .little);
+    const in_use = fp.saveUpper(buf[YMM_AT..][0..fp.UPPER_BYTES]);
+    const bv: u64 = if (in_use) XFEATURES else XFEATURES & ~XFEATURE_AVX;
+    std.mem.writeInt(u64, buf[XHEADER_AT..][0..8], bv, .little);
+    std.mem.writeInt(u32, buf[XSTATE_BYTES..][0..4], FP_XSTATE_MAGIC2, .little);
+    return buf;
+}
+
+/// A handler starts with the FP state of a new image, as on Linux; the one
+/// it interrupted is in its frame.
+fn freshFp(image: *[512]u8) void {
+    @memcpy(image, &fp.init_template);
+    fp.loadUpper(null);
 }
 
 /// The handler for `d` is about to run on its frame: its mask goes on, and
@@ -533,7 +601,7 @@ fn frameLost(pcb: *PCB, signo: u32) noreturn {
 
 fn restartable(ret: u64) i64 {
     const e: i64 = -@as(i64, @bitCast(ret));
-    return if (e == ERESTARTSYS or e == ERESTARTNOINTR or e == ERESTARTNOHAND) e else 0;
+    return if (e == ERESTARTSYS or e == ERESTARTNOINTR or e == ERESTARTNOHAND or e == ERESTART_RESTARTBLOCK) e else 0;
 }
 
 /// The length of the `syscall` instruction: what a call that runs again
@@ -561,7 +629,7 @@ pub fn waitUnderMask(pcb: *PCB, mask: u64) void {
 fn runAgain(frame: *signals.SyscallFrame, sys_num: u32, ret: u64, again: i64) u64 {
     if (again == 0) return ret;
     frame.rcx -%= SYSCALL_INSN;
-    return sys_num;
+    return if (again == ERESTART_RESTARTBLOCK) SYS_restart_syscall else sys_num;
 }
 
 /// The way out of Linux syscall `sys_num`, which returned `ret`: deliver a
@@ -570,13 +638,15 @@ fn runAgain(frame: *signals.SyscallFrame, sys_num: u32, ret: u64, again: i64) u6
 /// rt_sigreturn's is a register it put back). Returns what goes to the
 /// caller's rax. Called with interrupts on.
 pub fn syscallExit(pcb: *PCB, frame: *signals.SyscallFrame, sys_num: u32, ret: u64, may_restart: bool) u64 {
+    // Another thread stopped the process while this one was in the call.
+    waitWhileStopped(pcb);
     const again = if (may_restart) restartable(ret) else 0;
     if (again == 0 and signals.deliverable(pcb) == 0) {
         endOwnMask(pcb);
         return ret;
     }
 
-    const d = nextHandler(pcb) orelse {
+    const d = nextHandler(pcb, true) orelse {
         endOwnMask(pcb);
         return runAgain(frame, sys_num, ret, again);
     };
@@ -632,6 +702,7 @@ pub fn syscallExit(pcb: *PCB, frame: *signals.SyscallFrame, sys_num: u32, ret: u
     };
     pcb.restore_mask = false;
     enterHandler(pcb, d);
+    freshFp(@constCast(frame.userFpu()));
     // The handler is entered by sysret: rcx and r11 are its to lose.
     frame.clearFullRestore();
     frame.rcx = d.disp.handler;
@@ -646,7 +717,7 @@ pub fn syscallExit(pcb: *PCB, frame: *signals.SyscallFrame, sys_num: u32, ret: u
 /// A timer interrupt is about to return to user code of `pcb`, which has a
 /// signal to take.
 pub fn irqReturn(pcb: *PCB, frame: *signals.IrqFrame) void {
-    const d = nextHandler(pcb) orelse return;
+    const d = nextHandler(pcb, false) orelse return;
     const regs = Sigcontext{
         .r8 = frame.r8,
         .r9 = frame.r9,
@@ -667,7 +738,7 @@ pub fn irqReturn(pcb: *PCB, frame: *signals.IrqFrame) void {
         .rip = frame.rip,
         .eflags = frame.rflags,
     };
-    const fp_image: *const [512]u8 = @ptrFromInt(@intFromPtr(frame) - signals.IRQ0_FP_BELOW);
+    const fp_image: *[512]u8 = @ptrFromInt(@intFromPtr(frame) - signals.IRQ0_FP_BELOW);
     const entry = switch (pushFrame(pcb, &regs, fp_image, d, .{}, pcb.signal_mask)) {
         .ok => |e| e,
         // Interrupts are off here and the lock is held: the next return to
@@ -676,6 +747,7 @@ pub fn irqReturn(pcb: *PCB, frame: *signals.IrqFrame) void {
         .fault => frameLost(pcb, d.taken.signo),
     };
     enterHandler(pcb, d);
+    freshFp(fp_image);
     frame.rip = d.disp.handler;
     frame.rsp = entry.rsp;
     frame.rflags = userFlags(frame.rflags) & ~@as(u64, 0x500);
@@ -721,7 +793,7 @@ pub fn userFault(pcb: *PCB, frame: *signals.ExcFrame, signo: u32, addr: u64, cod
         .rip = frame.rip,
         .eflags = frame.rflags,
     };
-    const fp_image: *const [512]u8 = @ptrFromInt(@intFromPtr(frame) - signals.EXC_FP_BELOW);
+    const fp_image: *[512]u8 = @ptrFromInt(@intFromPtr(frame) - signals.EXC_FP_BELOW);
     const what = Fault{ .addr = addr, .err = frame.error_code, .trapno = frame.int_no };
     const entry = switch (pushFrame(pcb, &regs, fp_image, d, what, pcb.signal_mask)) {
         .ok => |e| e,
@@ -729,6 +801,7 @@ pub fn userFault(pcb: *PCB, frame: *signals.ExcFrame, signo: u32, addr: u64, cod
         .busy, .fault => return false,
     };
     enterHandler(pcb, d);
+    freshFp(fp_image);
     frame.rip = disp.handler;
     frame.rsp = entry.rsp;
     frame.rflags = userFlags(frame.rflags) & ~@as(u64, 0x500);
@@ -747,6 +820,30 @@ fn mxcsrMask() u32 {
     return if (m == 0) 0xFFBF else m;
 }
 
+/// What a frame's FP state gives the upper YMM halves.
+const Upper = enum { given, init, bad };
+
+/// The upper YMM halves from the frame's FP state at `va`, whose FXSAVE
+/// image is `fx`: into `ymm` (.given), or the init state — an image with
+/// no XSAVE layout after it or no AVX in it, which Linux takes for an
+/// FXSAVE-only one. `.bad`: a part that can't be read.
+fn upperOf(va: u64, fx: *const [512]u8, ymm: *[fp.UPPER_BYTES]u8) Upper {
+    if (std.mem.readInt(u32, fx[SW_AT..][0..4], .little) != FP_XSTATE_MAGIC1) return .init;
+    const extended = std.mem.readInt(u32, fx[SW_AT + 4 ..][0..4], .little);
+    const features = std.mem.readInt(u64, fx[SW_AT + 8 ..][0..8], .little);
+    const size = std.mem.readInt(u32, fx[SW_AT + 16 ..][0..4], .little);
+    if (size < YMM_AT or size > XSTATE_BYTES or size > extended) return .init;
+    var magic2: [4]u8 = undefined;
+    if (!usercopy.copyFromUser(&magic2, va +% size)) return .bad;
+    if (std.mem.readInt(u32, &magic2, .little) != FP_XSTATE_MAGIC2) return .init;
+    if (features & XFEATURE_AVX == 0 or size < XSTATE_BYTES) return .init;
+    var bv: [8]u8 = undefined;
+    if (!usercopy.copyFromUser(&bv, va +% XHEADER_AT)) return .bad;
+    if (std.mem.readInt(u64, &bv, .little) & XFEATURE_AVX == 0) return .init;
+    if (!usercopy.copyFromUser(ymm, va +% YMM_AT)) return .bad;
+    return .given;
+}
+
 /// rt_sigreturn(): the handler is done. Its frame, at the caller's stack
 /// pointer less the return address the handler's `ret` took, says what to
 /// go back to: registers, FP state, mask. Returns the rax to go back with;
@@ -759,15 +856,25 @@ pub fn rtSigreturn(pcb: *PCB, frame: *signals.SyscallFrame) u64 {
     // iretq to a non-canonical address faults in the kernel.
     if (mc.rip >= memmap.USER_SPACE_END or mc.rsp >= memmap.USER_SPACE_END) return badFrame(pcb, frame_va);
 
-    if (mc.fpstate != 0) {
+    const fpu: *[512]u8 = @constCast(frame.userFpu());
+    if (mc.fpstate == 0) {
+        // No FP state to go back to: the init one, as Linux does.
+        freshFp(fpu);
+    } else {
         var image: [512]u8 align(16) = undefined;
         if (!usercopy.copyFromUser(&image, mc.fpstate)) return badFrame(pcb, frame_va);
+        var ymm: [fp.UPPER_BYTES]u8 = undefined;
+        const upper: Upper = if (fp.avx) upperOf(mc.fpstate, &image, &ymm) else .init;
+        if (upper == .bad) return badFrame(pcb, frame_va);
         const mxcsr = std.mem.readInt(u32, image[24..28], .little) & mxcsrMask();
         std.mem.writeInt(u32, image[24..28], mxcsr, .little);
-        @memcpy(@constCast(frame.userFpu()), &image);
+        @memcpy(fpu, &image);
+        fp.loadUpper(if (upper == .given) &ymm else null);
     }
 
     pcb.signal_mask = uc.sigmask & ~signals.UNBLOCKABLE;
+    // A handler ran: a restart_syscall now ends in EINTR, as on Linux.
+    pcb.restart_until = 0;
     // SS_AUTODISARM took the alternate stack away for the handler.
     if (uc.stack.flags & SS_AUTODISARM != 0 and uc.stack.flags & SS_DISABLE == 0 and pcb.alt_stack.size == 0) {
         pcb.alt_stack = .{ .sp = uc.stack.sp, .size = uc.stack.size, .autodisarm = true };

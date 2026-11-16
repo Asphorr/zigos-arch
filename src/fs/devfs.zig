@@ -71,6 +71,12 @@ pub fn openFile(rel: []const u8) ?u32 {
 
 pub fn closeFile(_: u32) void {}
 
+/// The name of an open devfs index, as under /dev.
+pub fn nameOf(idx: u32) ?[]const u8 {
+    if (idx >= DEVICES.len) return null;
+    return DEVICES[idx].name;
+}
+
 /// Device kind for an open devfs index (the value stored in fd.inode), or null
 /// if out of range. Lets syscalls that special-case a device (e.g. mmap_pmem
 /// for /dev/pmem0) recover the kind from a file descriptor.

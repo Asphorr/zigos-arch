@@ -594,7 +594,7 @@ pub fn build(b: *std.Build) void {
     // as native apps. Installed into zig-out/bin, so they land in /bin.
     const linux_target = b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .musl });
     const lt_cflags = [_][]const u8{ "-std=gnu11", "-Wall", "-Werror" };
-    const linux_tests = .{ "lt_basic", "lt_mm", "lt_thread", "lt_fs", "lt_proc", "lt_signal", "lt_tty", "lt_net" };
+    const linux_tests = .{ "lt_basic", "lt_mm", "lt_thread", "lt_fs", "lt_proc", "lt_signal", "lt_tty", "lt_pty", "lt_procfs", "lt_net" };
     inline for (linux_tests) |name| {
         const exe = b.addExecutable(.{
             .name = name,

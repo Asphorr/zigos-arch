@@ -119,6 +119,7 @@ const SYS_setrlimit: u32 = 160;
 const SYS_prlimit64: u32 = 302;
 const SYS_sched_yield: u32 = 24;
 const SYS_nanosleep: u32 = 35;
+const SYS_restart_syscall: u32 = 219;
 const SYS_gettimeofday: u32 = 96;
 const SYS_time: u32 = 201;
 const SYS_sched_getaffinity: u32 = 204;
@@ -163,6 +164,18 @@ const SYS_copy_file_range: u32 = 326;
 const SYS_preadv2: u32 = 327;
 const SYS_pwritev2: u32 = 328;
 const SYS_statx: u32 = 332;
+const SYS_setxattr: u32 = 188;
+const SYS_lsetxattr: u32 = 189;
+const SYS_fsetxattr: u32 = 190;
+const SYS_getxattr: u32 = 191;
+const SYS_lgetxattr: u32 = 192;
+const SYS_fgetxattr: u32 = 193;
+const SYS_listxattr: u32 = 194;
+const SYS_llistxattr: u32 = 195;
+const SYS_flistxattr: u32 = 196;
+const SYS_removexattr: u32 = 197;
+const SYS_lremovexattr: u32 = 198;
+const SYS_fremovexattr: u32 = 199;
 const SYS_faccessat2: u32 = 439;
 const SYS_poll: u32 = 7;
 const SYS_pipe: u32 = 22;
@@ -236,6 +249,7 @@ const SYS_chown: u32 = 92;
 const SYS_fchown: u32 = 93;
 const SYS_lchown: u32 = 94;
 const SYS_umask: u32 = 95;
+const SYS_chroot: u32 = 161;
 const SYS_getrusage: u32 = 98;
 const SYS_times: u32 = 100;
 const SYS_setreuid: u32 = 113;
@@ -325,8 +339,8 @@ pub fn dispatch(num: u32, frame: *signals.SyscallFrame) u64 {
         SYS_sendfile => return sysSendfile(a1, a2, a3, a4),
         // Names, metadata and the tree (linux_fs.zig). The pre-*at calls are
         // their *at forms at the cwd.
-        SYS_open => return linux_fs.openat(AT_FDCWD, a1, a2),
-        SYS_openat => return linux_fs.openat(a1, a2, a3),
+        SYS_open => return linux_fs.openat(AT_FDCWD, a1, a2, a3),
+        SYS_openat => return linux_fs.openat(a1, a2, a3, a4),
         SYS_close => return linux_fs.close(a1),
         SYS_fstat => return linux_fs.fstat(a1, a2),
         SYS_stat => return linux_fs.newfstatat(AT_FDCWD, a1, a2, 0),
@@ -334,8 +348,8 @@ pub fn dispatch(num: u32, frame: *signals.SyscallFrame) u64 {
         SYS_newfstatat => return linux_fs.newfstatat(a1, a2, a3, a4),
         SYS_statx => return linux_fs.statx(a1, a2, a3, a4, a5),
         SYS_getdents64 => return linux_fs.getdents64(a1, a2, a3),
-        SYS_mkdir => return linux_fs.mkdirat(AT_FDCWD, a1),
-        SYS_mkdirat => return linux_fs.mkdirat(a1, a2),
+        SYS_mkdir => return linux_fs.mkdirat(AT_FDCWD, a1, a2),
+        SYS_mkdirat => return linux_fs.mkdirat(a1, a2, a3),
         SYS_unlink => return linux_fs.unlinkat(AT_FDCWD, a1, 0),
         SYS_rmdir => return linux_fs.unlinkat(AT_FDCWD, a1, linux_fs.AT_REMOVEDIR),
         SYS_unlinkat => return linux_fs.unlinkat(a1, a2, a3),
@@ -353,6 +367,18 @@ pub fn dispatch(num: u32, frame: *signals.SyscallFrame) u64 {
         SYS_truncate => return linux_fs.truncate(a1, a2),
         SYS_ftruncate => return linux_fs.ftruncate(a1, a2),
         SYS_flock => return linux_fs.flock(a1, a2),
+        SYS_setxattr => return linux_fs.xattrPath(a1, .follow, .set),
+        SYS_lsetxattr => return linux_fs.xattrPath(a1, .nofollow, .set),
+        SYS_fsetxattr => return linux_fs.xattrFd(a1, .set),
+        SYS_getxattr => return linux_fs.xattrPath(a1, .follow, .get),
+        SYS_lgetxattr => return linux_fs.xattrPath(a1, .nofollow, .get),
+        SYS_fgetxattr => return linux_fs.xattrFd(a1, .get),
+        SYS_listxattr => return linux_fs.xattrPath(a1, .follow, .list),
+        SYS_llistxattr => return linux_fs.xattrPath(a1, .nofollow, .list),
+        SYS_flistxattr => return linux_fs.xattrFd(a1, .list),
+        SYS_removexattr => return linux_fs.xattrPath(a1, .follow, .remove),
+        SYS_lremovexattr => return linux_fs.xattrPath(a1, .nofollow, .remove),
+        SYS_fremovexattr => return linux_fs.xattrFd(a1, .remove),
         SYS_fsync, SYS_fdatasync => return linux_fs.fsync(a1),
         SYS_getrandom => return sysGetrandom(a1, a2, a3),
         SYS_sigaltstack => return linux_signal.sigaltstack(a1, a2, frame.user_rsp),
@@ -371,6 +397,7 @@ pub fn dispatch(num: u32, frame: *signals.SyscallFrame) u64 {
         SYS_gettimeofday => return linux_time.gettimeofday(a1, a2),
         SYS_time => return linux_time.timeNow(a1),
         SYS_nanosleep => return linux_time.nanosleep(a1, a2),
+        SYS_restart_syscall => return linux_time.restartSyscall(),
         SYS_clock_nanosleep => return linux_time.clockNanosleep(a1, a2, a3, a4),
         SYS_sched_yield => return native_proc.sysYield(),
         SYS_sched_getaffinity => return sysSchedGetaffinity(a1, a2, a3),
@@ -428,13 +455,16 @@ pub fn dispatch(num: u32, frame: *signals.SyscallFrame) u64 {
         SYS_process_vm_readv => return linux_proc.processVmReadv(a1, a2, a3, a4, a5, a6),
         SYS_sysinfo => return linux_proc.sysinfo(a1),
         SYS_utimensat => return linux_fs.utimensat(a1, a2, a3, a4),
-        // No owners and no permission bits: these take anything a file
-        // that is there is given.
-        SYS_chmod, SYS_chown => return linux_fs.setAttr(AT_FDCWD, a1, false),
+        // Permission bits are kept (not enforced); owners are not: chown
+        // takes anything a file that is there is given.
+        SYS_chmod => return linux_fs.chmodAt(AT_FDCWD, a1, a2),
+        SYS_fchmodat, SYS_fchmodat2 => return linux_fs.chmodAt(a1, a2, a3),
+        SYS_fchmod => return linux_fs.fchmod(a1, a2),
+        SYS_chown => return linux_fs.setAttr(AT_FDCWD, a1, false),
         SYS_lchown => return linux_fs.setAttr(AT_FDCWD, a1, true),
-        SYS_fchmodat, SYS_fchmodat2 => return linux_fs.setAttr(a1, a2, false),
         SYS_fchownat => return linux_fs.setAttr(a1, a2, a5 & linux_fs.AT_SYMLINK_NOFOLLOW != 0),
-        SYS_fchmod, SYS_fchown => return linux_fs.setAttrFd(a1),
+        SYS_fchown => return linux_fs.setAttrFd(a1),
+        SYS_chroot => return linux_fs.chroot(a1),
         SYS_umask => {
             const p = proc() orelse return err(EFAULT);
             const old = p.umask;
@@ -549,6 +579,10 @@ fn vfsResult(n: u32) u64 {
         },
         @intFromEnum(errno.Errno.EFAULT) => EFAULT,
         @intFromEnum(errno.Errno.ENOMEM) => ENOMEM,
+        @intFromEnum(errno.Errno.EISDIR) => EISDIR,
+        @intFromEnum(errno.Errno.EACCES) => 13,
+        // A background read SIGTTIN can't stop.
+        @intFromEnum(errno.Errno.EIO) => 5,
         // What a socket's read and write end with.
         @intFromEnum(errno.Errno.ENOTCONN) => 107,
         @intFromEnum(errno.Errno.ECONNREFUSED) => 111,
@@ -681,11 +715,8 @@ fn sysReadv(fd: u32, iov_va: u64, iovcnt: u64) u64 {
     return total;
 }
 
-/// fcntl(fd, cmd, arg). musl's open/opendir paths issue F_SETFD(FD_CLOEXEC);
-/// we don't share fds across a Linux exec yet, so cloexec is a no-op. The
-/// flag-query/set commands return benign values. F_DUPFD and anything else is
-/// unimplemented (logged via the default ENOSYS path is avoided — return it
-/// directly so fcntl spam doesn't look like a missing syscall).
+/// fcntl(fd, cmd, arg): dups, the descriptor's and the file's flags, record
+/// locks (linux_fs.fcntlLock). Another command is logged and gets ENOSYS.
 fn sysFcntl(fd: u32, cmd: u64, arg: u64) u64 {
     const pcb = proc() orelse return err(EFAULT);
     const fe = file.get(pcb, fd) orelse return err(EBADF);
@@ -701,8 +732,11 @@ fn sysFcntl(fd: u32, cmd: u64, arg: u64) u64 {
             slot.cloexec = arg & FD_CLOEXEC != 0;
             break :blk 0;
         },
-        // The access mode: a pipe's end, else read/write.
-        F_GETFL => @as(u64, if (fe.kind != .pipe) O_RDWR else if (fe.access == file.READ) O_RDONLY else O_WRONLY) |
+        F_GETFL => @as(u64, switch (fe.access) {
+            file.READ => O_RDONLY,
+            file.WRITE => O_WRONLY,
+            else => O_RDWR,
+        }) |
             @as(u64, if (fe.nonblock) O_NONBLOCK else 0) |
             @as(u64, if (fe.append) O_APPEND else 0),
         F_SETFL => blk: {
@@ -710,7 +744,11 @@ fn sysFcntl(fd: u32, cmd: u64, arg: u64) u64 {
             fe.append = arg & O_APPEND != 0;
             break :blk 0;
         },
-        else => err(ENOSYS),
+        linux_fs.F_GETLK, linux_fs.F_SETLK, linux_fs.F_SETLKW, linux_fs.F_OFD_GETLK, linux_fs.F_OFD_SETLK, linux_fs.F_OFD_SETLKW => linux_fs.fcntlLock(pcb, fd, fe, cmd, arg),
+        else => blk: {
+            debug.klog("[linux] pid={d} unimpl fcntl cmd {d} (fd={d} arg=0x{X})\n", .{ process.getCurrentPid(), cmd, fd, arg });
+            break :blk err(ENOSYS);
+        },
     };
 }
 
@@ -728,7 +766,7 @@ fn sysLseek(fd: u32, off: u64, whence: u32) u64 {
     const fe = file.get(pcb, fd) orelse return err(EBADF);
     defer file.put(fe);
     switch (fe.kind) {
-        .console, .pipe, .tcp_sock, .tcp_listener, .socket, .epoll, .eventfd => return err(ESPIPE),
+        .console, .pipe, .tcp_sock, .tcp_listener, .socket, .epoll, .eventfd, .tty => return err(ESPIPE),
         else => {},
     }
     const new: u64 = switch (whence) {
@@ -797,6 +835,7 @@ fn sysPread(fd: u32, buf_va: u64, count: u64, off: u64) u64 {
     };
     defer file.put(fe);
     if (isDirFd(pcb, fd)) return err(EISDIR);
+    if (!fe.readable()) return err(EBADF);
     const size = fdFileSize(fe);
     if (off >= size) return 0;
     const len: u32 = @intCast(@min(rwLen(count), size - off));
@@ -813,6 +852,7 @@ fn sysPwrite(fd: u32, buf_va: u64, count: u64, off: u64) u64 {
         .fail => |e| return e,
     };
     defer file.put(fe);
+    if (!fe.writable()) return err(EBADF);
     if (count == 0) return 0;
     const len = rwLen(count);
     if (!common.validateUserPtr(buf_va, len)) return err(EFAULT);
@@ -891,6 +931,7 @@ fn sysCopyFileRange(fd_in: u64, off_in_va: u64, fd_out: u64, off_out_va: u64, le
     defer file.put(in_fe);
     const out_fe = file.get(pcb, fd_out) orelse return err(EBADF);
     defer file.put(out_fe);
+    if (!in_fe.readable() or !out_fe.writable() or out_fe.append) return err(EBADF);
     if (in_fe.kind != .ext2 or out_fe.kind != .ext2) return err(EINVAL);
     if (isDirFd(pcb, @intCast(fd_in)) or isDirFd(pcb, @intCast(fd_out))) return err(EISDIR);
     var in_off = copyOffset(in_fe, off_in_va) orelse return err(EFAULT);
@@ -930,6 +971,7 @@ fn sysSendfile(out_fd: u64, in_fd: u64, off_va: u64, count: u64) u64 {
     const pcb = proc() orelse return err(EFAULT);
     const in_fe = file.get(pcb, in_fd) orelse return err(EBADF);
     defer file.put(in_fe);
+    if (!in_fe.readable()) return err(EBADF);
     if (in_fe.kind != .ext2) return err(EINVAL);
     if (isDirFd(pcb, @intCast(in_fd))) return err(EISDIR);
     if (!linux_fs.fdOpen(pcb, out_fd)) return err(EBADF);

@@ -31,6 +31,7 @@ const PAGE: u64 = 0x1000;
 // Linux errno.
 const EBADF: i64 = 9;
 const ENOMEM: i64 = 12;
+const EACCES: i64 = 13;
 const EEXIST: i64 = 17;
 const ENODEV: i64 = 19;
 const EINVAL: i64 = 22;
@@ -42,6 +43,7 @@ inline fn err(e: i64) u64 {
 
 // mmap prot / flags.
 const PROT_MASK: u64 = 0x7; // READ | WRITE | EXEC; the rest (PROT_SEM, GROWS*) ignored
+const PROT_WRITE: u8 = 0x2;
 const MAP_SHARED: u64 = 0x01;
 const MAP_PRIVATE: u64 = 0x02;
 const MAP_SHARED_VALIDATE: u64 = 0x03;
@@ -169,6 +171,8 @@ pub fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, off: u64) u64 {
         // File mappings go through the page cache, which only ext2 has,
         // and only for regular files.
         if (fe.kind != .ext2) return err(ENODEV);
+        // A mapping reads the file; a shared writable one writes it too.
+        if (!fe.readable() or (shared and p & PROT_WRITE != 0 and !fe.writable())) return err(EACCES);
         const ino = ext2_inode.readInode(fe.inode) orelse return err(EBADF);
         if (!ext2_inode.isReg(&ino)) return err(ENODEV);
         // The cache keys pages by file offset; every page's must be one.

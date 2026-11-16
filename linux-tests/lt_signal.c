@@ -3,10 +3,11 @@
 // SA_RESETHAND and SA_NODEFER, ignoring, signals from another process and to
 // one thread or any, a handler that cuts into a busy loop with every
 // register and the FP state put back, the alternate stack, faults caught and
-// not, SIGCHLD, a sleep cut short. Exit 0 = every check passed, else the
-// number of the first failed check.
+// not, SIGCHLD, a sleep cut short, the YMM registers in the frame. Exit 0 =
+// every check passed, else the number of the first failed check.
 
 #define _GNU_SOURCE
+#include <cpuid.h>
 #include <errno.h>
 #include <poll.h>
 #include <pthread.h>
@@ -198,6 +199,139 @@ static int child_status(pid_t p) {
     int st = 0;
     if (waitpid(p, &st, 0) != p) return -1;
     return st;
+}
+
+// --- the YMM registers ----------------------------------------------------------------
+
+static unsigned long long xgetbv0(void) {
+    unsigned lo, hi;
+    __asm__ volatile(".byte 0x0f, 0x01, 0xd0" : "=a"(lo), "=d"(hi) : "c"(0)); // xgetbv
+    return ((unsigned long long)hi << 32) | lo;
+}
+
+static int have_avx(void) {
+    unsigned a, b, c, d;
+    if (!__get_cpuid(1, &a, &b, &c, &d) || !(c & bit_AVX) || !(c & bit_OSXSAVE)) return 0;
+    return (xgetbv0() & 6) == 6;
+}
+
+#define LOAD_YMM(in)                   \
+    "vmovdqu 0(" in "), %%ymm8\n\t"    \
+    "vmovdqu 32(" in "), %%ymm9\n\t"   \
+    "vmovdqu 64(" in "), %%ymm10\n\t"  \
+    "vmovdqu 96(" in "), %%ymm11\n\t"  \
+    "vmovdqu 128(" in "), %%ymm12\n\t" \
+    "vmovdqu 160(" in "), %%ymm13\n\t" \
+    "vmovdqu 192(" in "), %%ymm14\n\t" \
+    "vmovdqu 224(" in "), %%ymm15\n\t"
+#define STORE_YMM(out)                  \
+    "vmovdqu %%ymm8, 0(" out ")\n\t"    \
+    "vmovdqu %%ymm9, 32(" out ")\n\t"   \
+    "vmovdqu %%ymm10, 64(" out ")\n\t"  \
+    "vmovdqu %%ymm11, 96(" out ")\n\t"  \
+    "vmovdqu %%ymm12, 128(" out ")\n\t" \
+    "vmovdqu %%ymm13, 160(" out ")\n\t" \
+    "vmovdqu %%ymm14, 192(" out ")\n\t" \
+    "vmovdqu %%ymm15, 224(" out ")\n\t"
+#define YMM_CLOBBERS "xmm8", "xmm9", "xmm10", "xmm11", "xmm12", "xmm13", "xmm14", "xmm15"
+
+// The FP state of a frame in Linux's XSAVE layout: the magic in the FXSAVE
+// image's software bytes, the XSAVE header, the upper halves of the YMM
+// registers 16 bytes each, the second magic after it all.
+#define FX_SW 464
+#define FX_HEADER 512
+#define FX_YMM 576
+#define FX_MAGIC1 0x46505853u
+#define FX_MAGIC2 0x46505845u
+#define UC_FP_XSTATE 1
+
+static unsigned char ymm_in[256], ymm_junk[256], ymm_fresh[32];
+static volatile sig_atomic_t ymm_frame_ok, ymm_flags_ok, ymm_done;
+
+// Reads ymm8..15 in its frame, uses them for its own values, and flips the
+// upper half of ymm15 in the frame, which is what the return loads.
+__attribute__((target("avx"))) static void ymm_handler(int sig, siginfo_t *info, void *ucv) {
+    (void)sig;
+    (void)info;
+    __asm__ volatile("vmovdqu %%ymm8, %[f]" : [f] "=m"(ymm_fresh) : : "memory");
+    ucontext_t *uc = ucv;
+    unsigned char *fx = (unsigned char *)uc->uc_mcontext.fpregs;
+    unsigned magic1, size, magic2;
+    unsigned long long bv;
+    memcpy(&magic1, fx + FX_SW, 4);
+    memcpy(&size, fx + FX_SW + 16, 4);
+    int ok = magic1 == FX_MAGIC1 && size >= FX_YMM + 256;
+    if (ok) {
+        memcpy(&magic2, fx + size, 4);
+        memcpy(&bv, fx + FX_HEADER, 8);
+        ok = magic2 == FX_MAGIC2 && (bv & 4);
+    }
+    for (int r = 8; ok && r < 16; r++) ok = memcmp(fx + FX_YMM + 16 * r, ymm_in + 32 * (r - 8) + 16, 16) == 0;
+    ymm_frame_ok = ok;
+    ymm_flags_ok = (uc->uc_flags & UC_FP_XSTATE) != 0;
+    __asm__ volatile(LOAD_YMM("%[j]") : : [j] "r"(ymm_junk) : "memory", YMM_CLOBBERS);
+    if (ok)
+        for (int i = 0; i < 16; i++) fx[FX_YMM + 16 * 15 + i] ^= 0xFF;
+    ymm_done = 1;
+}
+
+// ymm8..15 from `in`, a tkill of `tid` as a raw system call, the registers
+// into `out`: the handler runs on the way back from the call.
+__attribute__((target("avx"))) static void ymm_through_signal(const unsigned char *in, unsigned char *out, long tid, long sig) {
+    __asm__ volatile(LOAD_YMM("%[in]") "movl $200, %%eax\n\t" // SYS_tkill
+                                       "syscall\n\t" STORE_YMM("%[out]")
+                     :
+                     : [in] "r"(in), [out] "r"(out), "D"(tid), "S"(sig)
+                     : "rax", "rcx", "r11", "memory", YMM_CLOBBERS);
+}
+
+// ymm8..15 from `in`, a spin in user code until a handler sets ymm_done,
+// the registers into `out`.
+__attribute__((target("avx"))) static void ymm_spin(const unsigned char *in, unsigned char *out) {
+    __asm__ volatile(LOAD_YMM("%[in]") "1: cmpl $0, %[done]\n\t"
+                                       "je 1b\n\t" STORE_YMM("%[out]")
+                     :
+                     : [in] "r"(in), [out] "r"(out), [done] "m"(ymm_done)
+                     : "memory", "cc", YMM_CLOBBERS);
+}
+
+// Where the CPU has AVX: the frame holds the YMM registers as Linux lays
+// them out, the handler starts with them clear, the return loads them from
+// the frame — by way of a system call and of an interrupt.
+static void check_ymm(void) {
+    if (!have_avx()) {
+        printf("lt_signal: no AVX here, YMM checks skipped\n");
+        return;
+    }
+    unsigned char want[256], out[256];
+    static const unsigned char zero[16];
+    for (int i = 0; i < 256; i++) {
+        ymm_in[i] = (unsigned char)(i * 7 + 3);
+        ymm_junk[i] = (unsigned char)(0xA5 ^ i);
+    }
+    memcpy(want, ymm_in, sizeof want);
+    for (int i = 0; i < 16; i++) want[32 * 7 + 16 + i] ^= 0xFF;
+
+    install(SIGUSR1, ymm_handler, 0);
+    memset(out, 0, sizeof out);
+    ymm_through_signal(ymm_in, out, syscall(SYS_gettid), SIGUSR1);
+    CHECK(ymm_done == 1, "a handler between two halves of YMM code");
+    CHECK(ymm_frame_ok && ymm_flags_ok, "its frame holds the YMM registers in the XSAVE layout");
+    CHECK(memcmp(ymm_fresh + 16, zero, 16) == 0, "the handler starts with their upper halves clear");
+    CHECK(memcmp(out, want, sizeof want) == 0, "the return loads them from the frame");
+
+    install(SIGALRM, ymm_handler, 0);
+    ymm_done = 0;
+    ymm_frame_ok = 0;
+    memset(out, 0, sizeof out);
+    struct itimerval it = {{0, 0}, {0, 50000}};
+    CHECK(setitimer(ITIMER_REAL, &it, NULL) == 0, "a timer to cut into a loop that holds YMM registers");
+    long long t0 = now_ms();
+    ymm_spin(ymm_in, out);
+    CHECK(now_ms() - t0 < 2000 && ymm_frame_ok, "its handler cut in, the registers in its frame");
+    CHECK(memcmp(out, want, sizeof want) == 0, "and they came back from it");
+    signal(SIGALRM, SIG_DFL);
+    signal(SIGUSR1, SIG_DFL);
 }
 
 // --- threads ------------------------------------------------------------------------
@@ -674,6 +808,7 @@ int main(void) {
     sigprocmask(SIG_UNBLOCK, &set, NULL);
 
     check_waits_cut_short();
+    check_ymm();
 
     printf("lt_signal: all %d checks passed\n", check_no);
     return 0;

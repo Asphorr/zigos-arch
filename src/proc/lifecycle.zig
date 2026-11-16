@@ -123,15 +123,32 @@ var inherited_fpu: [MAX_PROCS][512]u8 align(16) = undefined;
 fn inheritFpu(child: usize, frame: *const signals.SyscallFrame, sw_base: [*]u64) void {
     @memcpy(&inherited_fpu[child], frame.userFpu());
     sw_base[dspec.switch_frame.index(.rbx)] = @intFromPtr(&inherited_fpu[child]);
+    @import("../cpu/arch/fp.zig").inheritExtended(child);
 }
+
+/// Fields a reused slot keeps: `state` (allocSlot's CAS owns it) and
+/// `as_lock` (a /proc reader of the slot's last process may still hold or
+/// await it; the lock belongs to the slot).
+const KEPT_SPANS = blk: {
+    var spans: [2][2]usize = undefined;
+    for (.{ "state", "as_lock" }, 0..) |name, i| {
+        const off = @offsetOf(PCB, name);
+        spans[i] = .{ off, off + @sizeOf(@FieldType(PCB, name)) };
+    }
+    if (spans[0][0] > spans[1][0]) std.mem.swap([2]usize, &spans[0], &spans[1]);
+    break :blk spans;
+};
 
 fn resetPcbExceptState(pcb: *PCB) void {
     const fresh: PCB = .{};
-    const state_off = comptime @offsetOf(PCB, "state");
     const dst: [*]u8 = @ptrCast(pcb);
     const src: [*]const u8 = @ptrCast(&fresh);
-    @memcpy(dst[0..state_off], src[0..state_off]);
-    @memcpy(dst[state_off + 1 .. @sizeOf(PCB)], src[state_off + 1 .. @sizeOf(PCB)]);
+    var from: usize = 0;
+    inline for (KEPT_SPANS) |s| {
+        @memcpy(dst[from..s[0]], src[from..s[0]]);
+        from = s[1];
+    }
+    @memcpy(dst[from..@sizeOf(PCB)], src[from..@sizeOf(PCB)]);
     // Accounting fields default to 0 from the fresh literal above; the one
     // we want non-zero is start_tick. Stamping it here covers all four
     // constructors (create, createKernelTask, createKernelIdle,
@@ -147,6 +164,7 @@ fn resetPcbExceptState(pcb: *PCB) void {
         @import("../debug/save_trace.zig").resetPid(@intCast(pid));
         @import("../debug/pid_act.zig").resetPid(pid);
         @import("../debug/yield_loop.zig").resetPid(pid);
+        @import("../cpu/arch/fp.zig").resetExtended(pid);
         // A new number for the slot's new occupant. It leads a group and a
         // session of its own until a parent's are copied in (fork, clone,
         // sysExec).
@@ -517,6 +535,11 @@ pub fn forkCurrent(frame: *signals.SyscallFrame, spec: ForkSpec) ?usize {
     process.procs[i].user_brk = parent_lead_src.user_brk;
     process.procs[i].mmap_top = parent_lead_src.mmap_top;
     process.procs[i].stack_base = parent_lead_src.stack_base;
+    process.procs[i].arg_start = parent_lead_src.arg_start;
+    process.procs[i].arg_end = parent_lead_src.arg_end;
+    process.procs[i].env_end = parent_lead_src.env_end;
+    process.procs[i].auxv_start = parent_lead_src.auxv_start;
+    process.procs[i].auxv_end = parent_lead_src.auxv_end;
 
     // Shared-anon regions: bump refcount per inherited LazyRegion. The
     // PT-level COW path covers private anon (each AS gets a fresh frame on
@@ -986,8 +1009,9 @@ pub fn childWaiterMask() [pid_set.WORDS]u64 {
     return child_waiters.snapshot();
 }
 
-/// A child of process `parent` became reapable: wake its wait4 sleepers.
-fn wakeChildWaiters(parent: u8) void {
+/// A child of process `parent` became reapable, stopped or continued: wake
+/// its wait4 sleepers. Interrupt context is fine.
+pub fn wakeChildWaiters(parent: u8) void {
     if (parent >= MAX_PROCS) return;
     const group = process.procs[parent].tgid;
     // The set's locked RMW orders the zombie state store before the read.
@@ -1214,10 +1238,15 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp, persist_shared_dirty: 
 
     if (last_in_group) {
         const lead = &process.procs[my_tgid];
+        // A member that claimed earlier may not have released its io_uring
+        // instances yet; their workers copy on these tables, under the read
+        // side — so before the write side below, which would wait for them.
+        if (lead.page_directory != null) @import("../cpu/ipc/iouring.zig").releaseAllForGroup(my_tgid);
+        // Readers from another group (/proc) hold the read side while they
+        // walk these tables and regions: they finish first.
+        lead.as_lock.acquire();
+        defer lead.as_lock.release();
         if (lead.page_directory) |pd| {
-            // A member that claimed earlier may not have released its
-            // io_uring instances yet; their workers copy on these tables.
-            @import("../cpu/ipc/iouring.zig").releaseAllForGroup(my_tgid);
             vmm.destroyAddressSpace(pd, Phys.of(lead.page_dir_phys));
             lead.page_directory = null;
             lead.page_dir_phys = 0;
@@ -1227,6 +1256,7 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp, persist_shared_dirty: 
             }
         }
         dropFds(my_tgid);
+        @import("../fs/locks.zig").processGone(lead.pid_nr);
         freeElfBuf(lead);
         const shm = @import("../mm/shm.zig");
         const page_cache = @import("../mm/page_cache.zig");
@@ -1679,7 +1709,8 @@ pub fn killOtherThreads() void {
 const IMAGE_FIELDS = .{
     "page_directory", "page_dir_phys", "pcid",      "regions",       "heap_start",
     "user_brk",       "brk_base",      "mmap_top",  "stack_base",    "elf_buf",
-    "elf_buf_pages",  "text_inum",     "sym_table", "swap_clock_va",
+    "elf_buf_pages",  "text_inum",     "sym_table", "swap_clock_va", "arg_start",
+    "arg_end",        "env_end",       "auxv_start", "auxv_end",
 };
 
 fn swapImages(p: *PCB, t: *PCB) void {

@@ -5,6 +5,7 @@
 const std = @import("std");
 const process = @import("../../proc/process.zig");
 const tty = @import("../../proc/tty.zig");
+const pty = @import("../../proc/pty.zig");
 const file = @import("../../fs/file.zig");
 const socket = @import("../../net/socket.zig");
 const usercopy = @import("../arch/usercopy.zig");
@@ -36,6 +37,10 @@ const FIONREAD: u64 = 0x541B;
 const FIONBIO: u64 = 0x5421;
 const TIOCNOTTY: u64 = 0x5422;
 const TIOCGSID: u64 = 0x5429;
+const TIOCGPTN: u64 = 0x80045430;
+const TIOCSPTLCK: u64 = 0x40045431;
+
+const EPERM: i64 = 1;
 
 const Winsize = extern struct { rows: u16, cols: u16, xpixel: u16 = 0, ypixel: u16 = 0 };
 
@@ -86,8 +91,20 @@ pub fn ioctl(fd: u64, request: u64, arg: u64) u64 {
             return 0;
         },
         TIOCGSID => return put(arg, @as(i32, @intCast(t.sid))),
-        // One terminal per window, and its session's from the start.
-        TIOCSCTTY, TIOCNOTTY => return 0,
+        // A session leader takes the terminal for its session (a window's
+        // is its shell's session's from the start).
+        TIOCSCTTY => {
+            if (pcb.pid_nr != pcb.sid) return err(EPERM);
+            return if (tty.takeControl(id, pcb.sid, pcb.pgid)) 0 else err(EPERM);
+        },
+        TIOCNOTTY => return 0,
+        // A pty's number, for ptsname, and unlockpt.
+        TIOCGPTN => return put(arg, @as(u32, pty.number(f) orelse return err(ENOTTY))),
+        TIOCSPTLCK => {
+            var locked: i32 = 0;
+            if (!usercopy.copyFromUser(std.mem.asBytes(&locked), arg)) return err(EFAULT);
+            return if (pty.setLocked(f, locked != 0)) 0 else err(ENOTTY);
+        },
         FIONREAD => return put(arg, @as(i32, @intCast(tty.pending(id)))),
         TCFLSH => {
             tty.discardInput(id);

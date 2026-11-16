@@ -50,6 +50,8 @@ const Step = union(enum) {
     wait_ms: u32,
     /// Ctrl+C.
     interrupt,
+    /// Ctrl+Z.
+    ctrl_z,
 };
 
 const CASES = [_]Case{
@@ -70,6 +72,9 @@ const CASES = [_]Case{
         .terminal = &.{.{ .keys = "abX\x08c\none\ntwo\njunk\x15ok\n\x04part\x04k\x80" }},
         .expect = &.{ "abX\x08 \x08c\n", "one\n", "two\n", "junk\x08 \x08\x08 \x08\x08 \x08\x08 \x08ok\n", "lt_tty: all" },
     },
+    // Pseudo-terminals: /dev/ptmx, a slave as a session's terminal.
+    .{ .path = "/bin/lt_procfs.elf" },
+    .{ .path = "/bin/lt_pty.elf" },
     // A static busybox, its shell running a script of applets, pipes, files
     // and jobs (tools/add_busybox_to_image.sh).
     .{
@@ -81,7 +86,9 @@ const CASES = [_]Case{
         .once = true,
     },
     // The same shell at a terminal, typed at: a command, one interrupted
-    // with Ctrl+C while it sleeps, and the shell's own exit.
+    // with Ctrl+C while it sleeps, one stopped with Ctrl+Z, brought back
+    // with fg and interrupted, one in the background killed, and the
+    // shell's own exit.
     .{
         .path = "/bin/busybox",
         .args = "sh",
@@ -94,10 +101,35 @@ const CASES = [_]Case{
             .{ .wait_ms = 1500 },
             .interrupt,
             .{ .keys = "echo rc=$?\n" },
+            .{ .keys = "sleep 200\n" },
+            .{ .wait_ms = 1500 },
+            .ctrl_z,
+            .{ .wait_ms = 1000 },
+            .{ .keys = "fg\n" },
+            .{ .wait_ms = 1500 },
+            .interrupt,
+            .{ .keys = "echo fg=$?\n" },
+            .{ .keys = "sleep 300\n" },
+            .{ .wait_ms = 1500 },
+            .ctrl_z,
+            .{ .wait_ms = 1000 },
+            .{ .keys = "bg; jobs\n" },
+            .{ .wait_ms = 500 },
+            .{ .keys = "kill %1; wait %1; echo bg=$?\n" },
             .{ .keys = "exit 7\n" },
         },
-        .expect = &.{ "tty-42", "rc=130" },
+        .expect = &.{ "tty-42", "rc=130", "Stopped", "fg=130", "Running", "bg=143" },
         .ok_status = 7,
+    },
+    // Alpine's python3 and git as Alpine ships them, linked at run time
+    // (tools/add_rootfs_to_image.sh).
+    .{
+        .path = "/bin/busybox",
+        .args = "sh /etc/alptest.sh",
+        .timeout_ms = 300_000,
+        .optional = true,
+        .needs = "/usr/bin/python3",
+        .once = true,
     },
     // The official Zig compiler (static musl, 172 MB), stamped OSABI 3 and
     // written into ext2.img by hand.
@@ -272,6 +304,9 @@ const Terminal = struct {
                 .interrupt => if (!tty.interruptKey(self.id)) {
                     _ = pipe.tryWrite(self.keys_pipe, "\x03");
                 },
+                .ctrl_z => if (!tty.jobKey(self.id, 0x1A)) {
+                    _ = pipe.tryWrite(self.keys_pipe, "\x1a");
+                },
             }
             self.step += 1;
         }
@@ -327,6 +362,15 @@ fn dumpTasks(waited: u32) void {
         if (p.state == .unused or p.personality != .linux) continue;
         serial.print("[linuxtest]   pid {d} tgid {d} parent {d} '{s}' {s} wait {s}/0x{X} nokill {d} wake_pending {}\n", .{
             i, p.tgid, p.parent_pid, std.mem.sliceTo(&p.name, 0), @tagName(p.state), @tagName(p.wait_kind), p.wait_target, p.nokill, p.wake_pending,
+        });
+        // A task that is ready yet never runs: whose queue, if any, holds it.
+        const smp = @import("../cpu/smp.zig");
+        var queued: u8 = 0xFF;
+        for (0..smp.cpu_count) |c| {
+            if (smp.cpus[c].runqueue.contains(@intCast(i))) queued = @intCast(c);
+        }
+        serial.print("[linuxtest]     sched: stopped {} on_cpu {} last_cpu {d} pinned {d} queued on {d}\n", .{
+            @atomicLoad(bool, &p.job_stopped, .acquire), @atomicLoad(bool, &p.on_cpu, .acquire), p.last_cpu, p.pinned_cpu, queued,
         });
         if (i != p.tgid) continue;
         const file_mod = @import("../fs/file.zig");

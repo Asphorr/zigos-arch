@@ -465,6 +465,13 @@ pub fn push(ch: u8) void {
             return;
         }
     }
+    // Ctrl+Z and Ctrl+\ stop or quit a Linux job in a terminal from here
+    // too, whether or not it reads the terminal (proc/tty.zig jobKey).
+    if (ch == 0x1A or ch == 0x1C) {
+        const tty = @import("../proc/tty.zig");
+        const term = @import("../ui/desktop.zig").focusedTty();
+        if (term != tty.NONE and tty.jobKey(term, ch)) return;
+    }
     // F1..F12 (0x90..0x9F) are global shortcuts — route to the desktop-only
     // ring so a focused fullscreen app's `while (readChar() != 0) {}` drain
     // doesn't eat them. See desktop.zig F10 handler.

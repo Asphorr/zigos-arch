@@ -224,6 +224,9 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     @import("cpu/arch/protect.zig").detectFeatures();
     @import("cpu/arch/protect.zig").applyEarlyCr4();
     blog.ok("SMEP/UMIP (SMAP deferred to post-PML4[0] drop)");
+    // AVX state for user tasks (CR4.OSXSAVE, XCR0); APs and the S3 resume
+    // repeat it per CPU.
+    @import("cpu/arch/fp.zig").enableExtended();
     // Machine Check Exception: probe MCG_CAP, enable all banks, set
     // CR4.MCE so vector 18 actually delivers. Per-CPU init for APs lives
     // in smp.apEntry. Must run after detectFeatures (shares the cpuid

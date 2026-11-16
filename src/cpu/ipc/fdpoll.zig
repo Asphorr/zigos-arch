@@ -118,12 +118,12 @@ pub fn pollMaskHandle(pid: u8, h: FdHandle) u16 {
         // File kinds (fat32, tarfs, ext2, devfs, procfs) read synchronously
         // — always ready. POLLOUT is meaningless for read-only mounts but
         // returning it is harmless (writes happen via separate paths).
-        .fat32, .tarfs, .ext2, .devfs, .procfs => POLLIN | POLLOUT,
+        .fat32, .tarfs, .ext2, .devfs, .procfs, .lproc => POLLIN | POLLOUT,
         .tcp_sock => @import("../../net/net.zig").tcpPollMask(@intCast(h.id)),
         .tcp_listener => @import("../../net/net.zig").tcpListenerPollMask(@intCast(h.id)),
         // Objects answer through their file's own poll (File.ops), which a
         // handle can't reach.
-        .socket, .epoll, .eventfd => 0,
+        .socket, .epoll, .eventfd, .tty => 0,
     };
 }
 
@@ -164,6 +164,11 @@ pub fn maskOfFile(f: *file.File, pcb: *process.PCB) u16 {
 var pipe_events: [pipe.MAX_PIPES]u32 = [_]u32{0} ** pipe.MAX_PIPES;
 /// (a) Bumped by every console wake.
 var console_events: u32 = 0;
+
+/// Pipe `id`'s event count (a terminal end counts its two pipes').
+pub fn pipeEvents(id: u8) u32 {
+    return if (id < pipe.MAX_PIPES) @atomicLoad(u32, &pipe_events[id], .monotonic) else 0;
+}
 
 /// `f`'s event count; a constant for the kinds that are always ready.
 pub fn eventsOfFile(f: *const file.File) u32 {

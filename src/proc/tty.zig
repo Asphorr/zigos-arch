@@ -101,6 +101,9 @@ pub const Tty = struct {
     ready_len: usize = 0,
     /// Ctrl+D on an empty line: the next read returns 0.
     eof: bool = false,
+    /// A pseudo-terminal (pty.zig): a program is its window, and output
+    /// goes to it as a terminal sends it ("\r\n" for "\n" under ONLCR).
+    pty: bool = false,
     lock: SpinLock = .{},
 };
 
@@ -134,6 +137,49 @@ pub fn open(in_pipe: u8, out_pipe: u8, owner: u8, rows: u16, cols: u16) u8 {
     return NONE;
 }
 
+/// A pseudo-terminal over its two pipes (pty.zig): no window shell, and no
+/// session until one takes it as its controlling terminal.
+pub fn openPty(in_pipe: u8, out_pipe: u8) u8 {
+    table_lock.acquire();
+    defer table_lock.release();
+    for (&ttys, 0..) |*t, i| {
+        if (t.in_use) continue;
+        t.* = .{ .in_use = true, .in_pipe = in_pipe, .out_pipe = out_pipe, .pty = true };
+        return @intCast(i);
+    }
+    return NONE;
+}
+
+/// The terminal session `sid` has for its controlling one (/dev/tty).
+pub fn ofSession(sid: u32) ?u8 {
+    if (sid == 0) return null;
+    for (&ttys, 0..) |*t, i| {
+        if (t.in_use and t.sid == sid) return @intCast(i);
+    }
+    return null;
+}
+
+/// Session `sid` takes terminal `id` as its controlling one, its group
+/// `pgid` in the foreground (TIOCSCTTY, or a session leader's open). A
+/// terminal another session has is refused.
+pub fn takeControl(id: u8, sid: u32, pgid: u32) bool {
+    const t = get(id) orelse return false;
+    t.lock.acquire();
+    defer t.lock.release();
+    if (t.sid != 0 and t.sid != sid) return false;
+    t.sid = sid;
+    @atomicStore(u32, &t.fg_pgid, pgid, .release);
+    return true;
+}
+
+/// The other side of the terminal is gone (a pty's master closed): its
+/// foreground group gets SIGHUP and SIGCONT, as on Linux.
+pub fn hangup(id: u8) void {
+    if (get(id) == null) return;
+    signalForeground(id, signals.SIGHUP);
+    signalForeground(id, signals.SIGCONT);
+}
+
 /// The window is gone. Files that still carry the id read end-of-file from
 /// the closed pipe; the slot is free for another window.
 pub fn close(id: u8) void {
@@ -161,9 +207,14 @@ pub fn signalForeground(id: u8, signo: u32) void {
     if (owner < process.MAX_PROCS and process.procs[owner].state != .unused and process.procs[owner].pgid == pgid) {
         _ = signals.sendProcess(owner, signo, .{});
     }
+    signalLinuxGroup(pgid, signo, owner);
+}
+
+/// `signo` for each Linux process of group `pgid` but `skip`'s slot.
+fn signalLinuxGroup(pgid: u32, signo: u32, skip: ?u8) void {
     for (0..process.MAX_PROCS) |i| {
         const p = &process.procs[i];
-        if (i == owner or !session.isProcess(i) or p.state == .zombie) continue;
+        if ((skip != null and i == skip.?) or !session.isProcess(i) or p.state == .zombie) continue;
         if (p.personality != .linux or p.pgid != pgid) continue;
         _ = signals.sendProcess(@intCast(i), signo, .{});
     }
@@ -176,6 +227,27 @@ pub fn interruptKey(id: u8) bool {
     const t = get(id) orelse return false;
     if (t.termios.lflag & ISIG == 0) return false;
     signalForeground(id, signals.SIGINT);
+    return true;
+}
+
+/// Ctrl+Z or Ctrl+\ pressed in the terminal's window (keyboard interrupt):
+/// SIGTSTP or SIGQUIT for a Linux job in the foreground, sent here so a job
+/// that never reads the terminal stops too. False: the key is a byte like
+/// any other — key signals are off, it is neither key, or the window's own
+/// shell is in front, which knows neither signal.
+pub fn jobKey(id: u8, ch: u8) bool {
+    const t = get(id) orelse return false;
+    if (t.termios.lflag & ISIG == 0 or ch == 0) return false;
+    const signo: u32 = if (ch == t.termios.cc[VSUSP])
+        signals.SIGTSTP
+    else if (ch == t.termios.cc[VQUIT])
+        signals.SIGQUIT
+    else
+        return false;
+    const owner = t.owner;
+    const fg = @atomicLoad(u32, &t.fg_pgid, .acquire);
+    if (owner < process.MAX_PROCS and process.procs[owner].state != .unused and process.procs[owner].pgid == fg) return false;
+    signalForeground(id, signo);
     return true;
 }
 
@@ -209,7 +281,31 @@ pub const ReadResult = union(enum) {
     interrupted,
     /// Nothing to read and the reader won't wait.
     again,
+    /// A reader outside the foreground group that SIGTTIN can't stop.
+    io_error,
 };
+
+/// A read from a process of the terminal's session that is not of its
+/// foreground group: SIGTTIN for the reader's group, which stops it, and
+/// the read runs again once it goes on (`.interrupted`); `.io_error` when
+/// the signal is blocked or ignored, as on Linux. Null: the read may go on.
+fn backgroundRead(t: *Tty) ?ReadResult {
+    const me = process.currentPCB() orelse return null;
+    const lead = process.leader(me);
+    const fg = @atomicLoad(u32, &t.fg_pgid, .acquire);
+    if (lead.sid != t.sid or lead.pgid == fg) return null;
+    // Stopped by the last SIGTTIN, the read running again: off the CPU
+    // until SIGCONT (the picker skips it), then a look again — not another
+    // SIGTTIN for every turn round the restart.
+    if (@atomicLoad(bool, &me.job_stopped, .acquire)) {
+        process.schedule();
+        return .interrupted;
+    }
+    const handler = signals.dispositions(me)[signals.SIGTTIN].handler;
+    if (me.signal_mask & signals.bit(signals.SIGTTIN) != 0 or handler == signals.SIG_IGN) return .io_error;
+    signalLinuxGroup(lead.pgid, signals.SIGTTIN, null);
+    return .interrupted;
+}
 
 /// What a key with no byte of its own sends, as a terminal would.
 fn keySequence(code: u8) ?[]const u8 {
@@ -229,7 +325,91 @@ fn keySequence(code: u8) ?[]const u8 {
 
 fn echo(t: *Tty, bytes: []const u8) void {
     if (t.termios.lflag & ECHO == 0) return;
-    _ = pipe.tryWrite(t.out_pipe, bytes);
+    var rest = bytes;
+    if (crlf(t)) {
+        while (std.mem.indexOfScalar(u8, rest, '\n')) |nl| {
+            _ = pipe.tryWrite(t.out_pipe, rest[0..nl]);
+            _ = pipe.tryWrite(t.out_pipe, "\r\n");
+            rest = rest[nl + 1 ..];
+        }
+    }
+    _ = pipe.tryWrite(t.out_pipe, rest);
+}
+
+/// Output is a terminal's: "\n" goes out as "\r\n". A window takes "\n"
+/// as a new line itself; a pty's master gets what a terminal would send.
+fn crlf(t: *const Tty) bool {
+    return t.pty and t.termios.oflag & (OPOST | ONLCR) == (OPOST | ONLCR);
+}
+
+/// What a program writes to terminal `id`, `chunk` in kernel memory, on to
+/// its window or master. Returns the bytes of `chunk` taken, or a pipe code
+/// (pipe.writeOpt's) when none were.
+pub fn output(id: u8, chunk: []const u8, block: bool) usize {
+    const t = get(id) orelse return pipe.PIPE_CLOSED;
+    if (!crlf(t)) return pipe.writeOpt(t.out_pipe, chunk, block);
+    var done: usize = 0;
+    while (done < chunk.len) {
+        const nl = std.mem.indexOfScalarPos(u8, chunk, done, '\n') orelse chunk.len;
+        if (nl > done) {
+            const n = pipe.writeOpt(t.out_pipe, chunk[done..nl], block);
+            if (n > chunk.len) return if (done > 0) done else n;
+            done += n;
+            if (done < nl) return done;
+        }
+        if (nl == chunk.len) break;
+        const n = pipe.writeOpt(t.out_pipe, "\r\n", block);
+        if (n > 2) return if (done > 0) done else n;
+        if (n < 2) {
+            // Half of the pair went: the rest has to follow.
+            if (n == 1) _ = pipe.writeOpt(t.out_pipe, "\n", true);
+            if (n == 0) return done;
+        }
+        done += 1;
+    }
+    return done;
+}
+
+/// Keys from a pty's master, `chunk` in kernel memory. A key that sends a
+/// signal sends it now, as the window's keyboard does, whether or not the
+/// foreground job reads; the rest wait in the pipe for the reader's line
+/// discipline. Returns the bytes of `chunk` taken, or a pipe code.
+pub fn masterInput(id: u8, chunk: []const u8, block: bool) usize {
+    const t = get(id) orelse return pipe.PIPE_CLOSED;
+    var done: usize = 0;
+    while (done < chunk.len) {
+        var end = done;
+        var signo: u32 = 0;
+        while (end < chunk.len) : (end += 1) {
+            signo = signalOf(t, chunk[end]);
+            if (signo != 0) break;
+        }
+        if (end > done) {
+            const n = pipe.writeOpt(t.in_pipe, chunk[done..end], block);
+            if (n > chunk.len) return if (done > 0) done else n;
+            done += n;
+            if (done < end) return done;
+        }
+        if (signo == 0) break;
+        {
+            t.lock.acquire();
+            defer t.lock.release();
+            echoByte(t, chunk[end]);
+            if (t.termios.lflag & NOFLSH == 0) discardLocked(t);
+        }
+        signalForeground(id, signo);
+        done += 1;
+    }
+    return done;
+}
+
+/// The signal key `b` sends at terminal `t`, 0 for none.
+fn signalOf(t: *const Tty, b: u8) u32 {
+    if (t.termios.lflag & ISIG == 0 or b == 0) return 0;
+    if (b == t.termios.cc[VINTR]) return signals.SIGINT;
+    if (b == t.termios.cc[VQUIT]) return signals.SIGQUIT;
+    if (b == t.termios.cc[VSUSP]) return signals.SIGTSTP;
+    return 0;
 }
 
 /// Echo one typed byte: itself, or ^X for a control character.
@@ -343,6 +523,7 @@ fn takeReady(t: *Tty, out: []u8) usize {
 /// not to (VMIN 0).
 pub fn read(id: u8, out: []u8, nonblock: bool) ReadResult {
     const t = get(id) orelse return .{ .bytes = 0 };
+    if (backgroundRead(t)) |r| return r;
     if (out.len == 0) return .{ .bytes = 0 };
     while (true) {
         var no_wait = nonblock;

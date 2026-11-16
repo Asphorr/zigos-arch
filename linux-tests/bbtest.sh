@@ -97,6 +97,19 @@ check sigpipe "$(wc -l < "$d/yes" | tr -d ' ')" 3
 check dd "$(dd if=/dev/zero bs=1024 count=4 2>/dev/null | wc -c | tr -d ' ')" 4096
 check date "$([ "$(date +%Y)" -ge 2024 ] && echo yes)" yes
 
+# /proc: the applets that read it.
+sleep 30 &
+napper=$!
+check ps "$(ps -o pid,comm | awk -v p="$napper" '$1 == p { print $2 }')" sleep
+check pidof "$(busybox pidof sleep | tr ' ' '\n' | grep -c "^$napper\$")" 1
+check psargs "$(ps -o pid,args | awk -v p="$napper" '$1 == p { print $2, $3 }')" "sleep 30"
+kill "$napper"
+wait "$napper"
+check free "$(busybox free | awk '/^Mem:/ { print ($2 > 0) }')" 1
+check uptime "$(busybox uptime | grep -c 'load average')" 1
+check procfd "$(readlink /proc/self/fd/1 | grep -c -e '^pipe:' -e '^/dev/')" 1
+check mounts "$(grep -c ' / ext2 ' /proc/mounts)" 1
+
 # The network, on this machine alone: a web server and its client over
 # loopback, then a listener and a talker. The server is a shell script nc
 # runs per connection, the socket as its stdin and stdout.

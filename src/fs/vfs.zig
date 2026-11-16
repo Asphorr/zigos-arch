@@ -36,6 +36,7 @@ const usercopy = @import("../cpu/arch/usercopy.zig");
 const errno = @import("../proc/errno.zig");
 const file = @import("file.zig");
 const File = file.File;
+const locks = @import("locks.zig");
 
 pub const O_CREATE: u32 = 0x100;
 pub const O_APPEND: u32 = 0x400; // start the fd's offset at file_size so writes append
@@ -435,7 +436,7 @@ pub fn opsFor(kind: process.FsType) *const file.Ops {
         .tcp_sock => &tcp_ops,
         .tcp_listener => &listener_ops,
         // Made by file.create with the table of their object.
-        .socket, .epoll, .eventfd => unreachable,
+        .socket, .epoll, .eventfd, .tty, .lproc => unreachable,
     };
 }
 
@@ -519,6 +520,7 @@ fn pipeRead(f: *File, pcb: *process.PCB, buf: [*]u8, count: u32) u32 {
             },
             .interrupted => return errno.err(.EINTR),
             .again => return errno.err(.EAGAIN),
+            .io_error => return errno.err(.EIO),
         }
     }
     // O_NONBLOCK is a Linux caller's to set; a native one always waits.
@@ -568,6 +570,7 @@ fn procRead(f: *File, _: *process.PCB, buf: [*]u8, count: u32) u32 {
 }
 
 fn ext2Read(f: *File, _: *process.PCB, buf: [*]u8, count: u32) u32 {
+    if (!f.readable()) return errno.err(.EBADF);
     // Through the unified page cache (Slice 3b): a page read here is the
     // SAME physical frame a later mmap of this file maps, and vice versa.
     // Falls back to a private uncached read only under frame OOM.
@@ -578,6 +581,7 @@ fn ext2Read(f: *File, _: *process.PCB, buf: [*]u8, count: u32) u32 {
 }
 
 fn ext2FileWrite(f: *File, _: *process.PCB, buf: [*]const u8, count: u32) u32 {
+    if (!f.writable()) return errno.err(.EBADF);
     // ETXTBSY: refuse to overwrite the text image of a live process.
     // This is the choke-point the fuzzer hit — fwrite-ing into its own
     // /bin/redteam.elf while running. Inode-keyed, so the //bin//…
@@ -876,8 +880,15 @@ pub fn closeSlot(pcb: *process.PCB, fd: u32) u32 {
     // closing one fd of a shared table, only one gets it to drop. The file
     // itself goes when the last sharer (a dup, a fork, a call in flight) does.
     const f = file.take(pcb, fd) orelse return VFS_ERR;
+    closedBy(pcb, f);
     file.put(f);
     return 0;
+}
+
+/// `pcb`'s process closed a descriptor of `f`: its record locks on the
+/// file go, whichever descriptor took them (POSIX).
+pub fn closedBy(pcb: *const process.PCB, f: *const File) void {
+    if (f.kind == .ext2) locks.closed(pcb.pid_nr, f.inode);
 }
 
 pub fn ls() void {

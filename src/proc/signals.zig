@@ -764,11 +764,16 @@ fn stopForJobControl(pcb: *process.PCB, signo: u32) void {
         @atomicStore(bool, &pcb.job_stopped, false, .seq_cst);
         return;
     }
-    // No concurrent resume: safe to annihilate any stale pending SIGCONT
-    // (POSIX stop⊥cont — only NOW, after the recheck, so we can't erase a racing
-    // resumer's CONT bit before it's observed) and notify the parent.
-    _ = @atomicRmw(u64, &pcb.pending_signals, .And, ~CONT_BIT, .seq_cst);
+    // No CONT was pending at the recheck, so any CONT bit now is a racing
+    // resumer's: it stays, for its handler.
     notifyParentStateChange(pcb, CLD_STOPPED, signo);
+    reportLateResume(pcb);
+}
+
+/// After a CLD_STOPPED notice: a resume that came between the recheck and
+/// the notice reported CONTINUED first; say it again so it is the last word.
+fn reportLateResume(pcb: *process.PCB) void {
+    if (!@atomicLoad(bool, &pcb.job_stopped, .seq_cst)) notifyParentStateChange(pcb, CLD_CONTINUED, SIGCONT);
 }
 
 /// Clear a job-control stop. Returns true iff the task was actually stopped
@@ -804,34 +809,42 @@ fn stopProcess(pcb: *process.PCB, signo: u32) void {
         if (t.state == .unused or t.tgid != lead.tgid) continue;
         if (pendingResume(t)) raced = true;
     }
-    for (&process.procs) |*t| {
-        if (t.state == .unused or t.tgid != lead.tgid) continue;
-        if (raced) {
+    if (raced) {
+        for (&process.procs) |*t| {
+            if (t.state == .unused or t.tgid != lead.tgid) continue;
             t.stop_signo = 0;
             @atomicStore(bool, &t.job_stopped, false, .seq_cst);
-        } else {
-            _ = @atomicRmw(u64, &t.pending_signals, .And, ~CONT_BIT, .seq_cst);
         }
+        return;
     }
-    if (raced) return;
-    _ = @atomicRmw(u64, &lead.shared_pending, .And, ~CONT_BIT, .seq_cst);
     notifyParentStateChange(lead, CLD_STOPPED, signo);
+    // `pcb` is live and was marked; the lead may be a zombie.
+    reportLateResume(pcb);
 }
 
 /// POSIX: a child stopping or continuing posts SIGCHLD to its parent. Sent
 /// regardless of whether the parent is in waitpid — a parent on the default
 /// (ignore) disposition sees no effect; one with a handler is notified, and
-/// send() wakes it if the handler makes the signal deliverable. The
-/// waitpid(WUNTRACED/WCONTINUED) reporting path is a separate, ABI-touching
-/// follow-up (sysWaitpid has no options arg today). One level of send()
-/// recursion: SIGCHLD is neither `.cont` nor SIGKILL, so it never re-enters the
-/// job-control branch.
+/// send() wakes it if the handler makes the signal deliverable. The change
+/// is also kept for a Linux parent's wait4 (WUNTRACED/WCONTINUED), which is
+/// woken to look. One level of send() recursion: SIGCHLD is neither `.cont`
+/// nor SIGKILL, so it never re-enters the job-control branch.
 fn notifyParentStateChange(pcb: *process.PCB, code: i32, signo: u32) void {
+    const lead = process.leader(pcb);
     const parent = pcb.parent_pid;
-    if (parent == 0 or parent >= process.MAX_PROCS) return;
-    const ps = &process.procs[parent];
-    if (ps.state == .unused or ps.state == .zombie) return;
-    _ = sendProcess(parent, SIGCHLD, .{ .code = code, .pid = process.leader(pcb).pid_nr, .value = signo });
+    const has_parent = parent != 0 and parent < process.MAX_PROCS and
+        process.procs[parent].state != .unused and process.procs[parent].state != .zombie;
+    // SIGCHLD first: a wait4 that finds the report below returns with it
+    // pending, so the parent's handler has run when the call is back.
+    if (has_parent) _ = sendProcess(parent, SIGCHLD, .{ .code = code, .pid = lead.pid_nr, .value = signo });
+    if (code == CLD_STOPPED) {
+        @atomicStore(bool, &lead.wait_cont, false, .release);
+        @atomicStore(u8, &lead.wait_stop, @intCast(signo), .release);
+    } else {
+        @atomicStore(u8, &lead.wait_stop, 0, .release);
+        @atomicStore(bool, &lead.wait_cont, true, .release);
+    }
+    if (has_parent) @import("lifecycle.zig").wakeChildWaiters(parent);
 }
 
 /// What `signo` does to `pcb` with no handler and not ignored. Does not

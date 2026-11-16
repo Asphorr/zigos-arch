@@ -98,9 +98,15 @@ pub fn execve(frame: *signals.SyscallFrame, path_va: u64, argv_va: u64, envp_va:
         .file => |f| f,
         .fail => |e| return e,
     };
-    // The process is named after what was asked for, a script included.
+    // The process is named after what was asked for, as given: a link's
+    // name (busybox's applets), a script's.
     var name_buf: [15]u8 = undefined;
-    const asked = std.fs.path.basename(target.path);
+    var given_buf: [256]u8 = undefined;
+    const given = switch (linux_fs.readPath(path_va, &given_buf, false)) {
+        .path => |p| p,
+        .fail => target.path,
+    };
+    const asked = std.fs.path.basename(given);
     const name_len = @min(asked.len, name_buf.len);
     @memcpy(name_buf[0..name_len], asked[0..name_len]);
 
@@ -181,6 +187,7 @@ fn enterImage(frame: *signals.SyscallFrame, e: EntryRsp) void {
     frame.r11 = 0x202; // RFLAGS: IF
     const fpu: *align(16) [512]u8 = @constCast(frame.userFpu());
     fpu.* = @import("../arch/fp.zig").init_template;
+    @import("../arch/fp.zig").resetLiveExtended();
     const pcb = process.currentPCB() orelse return;
     pcb.fs_base = 0;
     asm volatile ("wrmsr"
@@ -283,6 +290,8 @@ fn copyStrings(va: u64, buf: []u8, used: *usize) StringsRead {
 // --- wait4 / kill ----------------------------------------------------------
 
 const WNOHANG: u64 = 1;
+const WUNTRACED: u64 = 2;
+const WCONTINUED: u64 = 8;
 const RUSAGE_BYTES: usize = 144;
 const SIGKILL: u32 = 9;
 
@@ -316,7 +325,9 @@ const ANY_CHILD: u32 = 0xFFFF_FFFF;
 
 /// wait4(pid, status, options, rusage). pid > 0 names a child, -1 is any
 /// child, 0 the children in the caller's process group and below -1 those
-/// in group -pid. Returns the child's pid; rusage comes back zeroed.
+/// in group -pid. Returns the child's pid: one that ended, or with
+/// WUNTRACED / WCONTINUED one that stopped or went on since last told.
+/// rusage comes back zeroed.
 pub fn wait4(pid_arg: u64, status_va: u64, options: u64, rusage_va: u64) u64 {
     const me = smp.currentPid() orelse return err(EFAULT);
     const group: u8 = process.procs[me].tgid;
@@ -341,7 +352,8 @@ pub fn wait4(pid_arg: u64, status_va: u64, options: u64, rusage_va: u64) u64 {
     defer lifecycle.childWaitLeave(me);
     while (true) {
         var st: u32 = 0;
-        if (reapChild(group, awaited, &st)) |child| {
+        const found = reapChild(group, awaited, &st) orelse changedChild(group, awaited, options, &st);
+        if (found) |child| {
             // Faultable copies: the pages were checked before the wait, and
             // a sibling thread's fork since makes them copy-on-write again.
             if (status_va != 0 and !usercopy.copyToUser(status_va, std.mem.asBytes(&st))) return err(EFAULT);
@@ -383,6 +395,30 @@ fn reapChild(group: u8, awaited: Awaited, status: *u32) ?u32 {
     const nr = process.procs[z].pid_nr;
     process.reapZombie(z);
     return nr;
+}
+
+/// A child of `group` among the `awaited` that stopped (WUNTRACED) or went
+/// on (WCONTINUED) and wasn't reported yet; its status as wait4 gives it.
+/// The report is taken: the next wait4 doesn't see it again.
+fn changedChild(group: u8, awaited: Awaited, options: u64, status: *u32) ?u32 {
+    if (options & (WUNTRACED | WCONTINUED) == 0) return null;
+    for (0..process.MAX_PROCS) |i| {
+        const p = &process.procs[i];
+        if (p.state == .unused or p.state == .zombie or p.tgid != i or p.parent_pid != group) continue;
+        if (!awaited.has(i)) continue;
+        if (options & WUNTRACED != 0) {
+            const signo = @atomicRmw(u8, &p.wait_stop, .Xchg, 0, .acq_rel);
+            if (signo != 0) {
+                status.* = (@as(u32, signo) << 8) | 0x7F;
+                return p.pid_nr;
+            }
+        }
+        if (options & WCONTINUED != 0 and @atomicRmw(bool, &p.wait_cont, .Xchg, false, .acq_rel)) {
+            status.* = 0xFFFF;
+            return p.pid_nr;
+        }
+    }
+    return null;
 }
 
 fn hasChild(group: u8, awaited: Awaited) bool {
@@ -573,7 +609,10 @@ fn dupAt(pcb: *process.PCB, old: u64, new: u64, cloexec: bool) u64 {
             file.put(f);
             return err(EBUSY);
         },
-        .was => |victim| if (victim) |v| file.put(v),
+        .was => |victim| if (victim) |v| {
+            vfs.closedBy(pcb, v);
+            file.put(v);
+        },
     }
     return new;
 }

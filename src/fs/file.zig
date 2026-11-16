@@ -16,6 +16,7 @@ const process = @import("../proc/process.zig");
 const heap = @import("../mm/heap.zig");
 const config = @import("../config.zig");
 const SpinLock = @import("../proc/spinlock.zig").SpinLock;
+const locks = @import("locks.zig");
 
 pub const Kind = process.FsType;
 
@@ -108,6 +109,16 @@ pub const File = struct {
     pub fn offset32(self: *const File) ?u32 {
         return std.math.cast(u32, self.offset);
     }
+
+    /// Opened for reading (READ or READ_WRITE).
+    pub fn readable(self: *const File) bool {
+        return self.access != WRITE;
+    }
+
+    /// Opened for writing (WRITE or READ_WRITE).
+    pub fn writable(self: *const File) bool {
+        return self.access != READ;
+    }
 };
 
 /// One entry of a process's descriptor table.
@@ -166,13 +177,14 @@ pub fn put(f: *File) void {
 }
 
 /// True when the caller dropped the last reference. No epoll set refers to
-/// the file from then on.
+/// the file from then on, and the locks it owned (OFD, flock) are gone.
 fn dropRef(f: *File) bool {
     if (f.static) return false;
     const before = @atomicRmw(u32, &f.refs, .Sub, 1, .acq_rel);
     if (before == 0) @panic("file: reference dropped twice");
     if (before != 1) return false;
     if (@atomicLoad(bool, &f.watched, .acquire)) @import("../cpu/ipc/epoll.zig").forget(f);
+    locks.fileGone(@intFromPtr(f));
     return true;
 }
 

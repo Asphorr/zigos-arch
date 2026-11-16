@@ -1004,6 +1004,18 @@ pub fn setTimes(inum: u32, atime: ?u32, mtime: ?u32) Error!void {
     if (!inode.writeInode(inum, &ino)) return error.Io;
 }
 
+/// Set the permission bits of `inum` (rwx for owner, group, others, and
+/// setuid/setgid/sticky); its type stays. The change time becomes now.
+pub fn setMode(inum: u32, perm: u16) Error!void {
+    const m = block.getMount() orelse return error.Io;
+    block.lockMount(m);
+    defer block.unlockMount(m);
+    var ino = inode.readInode(inum) orelse return error.Io;
+    ino.mode = (ino.mode & ~@as(u16, 0o7777)) | (perm & 0o7777);
+    ino.ctime = @truncate(time.now().sec);
+    if (!inode.writeInode(inum, &ino)) return error.Io;
+}
+
 /// Blocks and inodes of the file system: in all and free, for statfs.
 pub const Usage = struct { block_size: u32, blocks: u64, blocks_free: u64, inodes: u64, inodes_free: u64 };
 

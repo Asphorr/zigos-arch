@@ -2,14 +2,18 @@
 // directory fds (openat, mkdirat, fstatat, statx, faccessat, unlinkat,
 // renameat2), getdents64 with long names, ftruncate both ways, rename of
 // files and of directories across parents, preadv/pwritev, copy_file_range,
-// flock and fsync, chdir and fchdir. Works under /ltfs, which it removes
-// first and last.
+// flock and fsync, chdir and fchdir; then files shared and unlinked while
+// open, links, and advisory locks between processes. Works under /ltfs,
+// which it removes first and last.
 // Exit 0 = every check passed, else the number of the first failed check.
 
 #define _GNU_SOURCE
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,6 +22,7 @@
 #include <sys/syscall.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 static int check_no;
@@ -310,6 +315,318 @@ static void check_links(void) {
     CHECK(access("/ltln", F_OK) == -1 && errno == ENOENT, "the tree of links is gone");
 }
 
+static int set_lock(int fd, int cmd, short type, off_t start, off_t len) {
+    struct flock fl = {.l_type = type, .l_whence = SEEK_SET, .l_start = start, .l_len = len};
+    return fcntl(fd, cmd, &fl);
+}
+
+// What F_GETLK (or F_OFD_GETLK) finds in the way of a write lock on the
+// range; l_type -1 when the call failed.
+static struct flock test_lock(int fd, int cmd, off_t start, off_t len) {
+    struct flock fl = {.l_type = F_WRLCK, .l_whence = SEEK_SET, .l_start = start, .l_len = len};
+    if (fcntl(fd, cmd, &fl) != 0) fl.l_type = -1;
+    return fl;
+}
+
+static int exit_status(pid_t c) {
+    int wst;
+    if (c <= 0 || waitpid(c, &wst, 0) != c || !WIFEXITED(wst)) return -1;
+    return WEXITSTATUS(wst);
+}
+
+static long ms_since(const struct timespec *t0) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (t.tv_sec - t0->tv_sec) * 1000 + (t.tv_nsec - t0->tv_nsec) / 1000000;
+}
+
+static void on_usr1(int sig) { (void)sig; }
+
+static int perm_of(const char *name) {
+    struct stat st;
+    return stat(name, &st) == 0 ? (int)(st.st_mode & 07777) : -1;
+}
+
+// Permission bits: what a create asks less the umask, for files and
+// directories; chmod, fchmod and fchmodat change them, and the type stays.
+static void check_modes(void) {
+    const char *f = "/ltmode", *g = "/ltmode2", *dir = "/ltmode.d";
+    unlink(f);
+    unlink(g);
+    rmdir(dir);
+    mode_t was = umask(022);
+    int fd = open(f, O_CREAT | O_RDWR, 0666);
+    CHECK(fd >= 0 && perm_of(f) == 0644, "a new file: 0666 less umask 022 is 0644");
+    CHECK(fchmod(fd, 0600) == 0 && perm_of(f) == 0600, "fchmod 0600");
+    CHECK(chmod(f, 04751) == 0 && perm_of(f) == 04751, "chmod 04751, setuid kept");
+    CHECK(fchmodat(AT_FDCWD, f, 0640, 0) == 0 && perm_of(f) == 0640, "fchmodat 0640");
+    struct stat st;
+    CHECK(stat(f, &st) == 0 && S_ISREG(st.st_mode), "still a regular file");
+    close(fd);
+    umask(077);
+    fd = open(g, O_CREAT | O_WRONLY | O_EXCL, 0666);
+    CHECK(fd >= 0 && perm_of(g) == 0600, "umask 077: a new file is 0600");
+    close(fd);
+    CHECK(mkdir(dir, 0777) == 0 && perm_of(dir) == 0700, "and a new directory 0700");
+    CHECK(stat(dir, &st) == 0 && S_ISDIR(st.st_mode), "a directory still");
+    umask(022);
+    fd = open(f, O_CREAT | O_WRONLY | O_TRUNC, 0600);
+    CHECK(fd >= 0 && perm_of(f) == 0640, "opening a file that is there leaves its permissions");
+    close(fd);
+    errno = 0;
+    CHECK(chmod("/ltmode.none", 0600) == -1 && errno == ENOENT, "chmod of nothing is ENOENT");
+    umask(was);
+    CHECK(unlink(f) == 0 && unlink(g) == 0 && rmdir(dir) == 0, "remove them");
+}
+
+// F_SETLKW on a descriptor another thread closes while it waits.
+struct closed_wait {
+    int fd, result, err;
+};
+static void *wait_on_closed(void *arg) {
+    struct closed_wait *w = arg;
+    w->result = set_lock(w->fd, F_SETLKW, F_WRLCK, 90, 1);
+    w->err = errno;
+    return NULL;
+}
+
+// A child that holds a write lock on byte `at` for `ms`, then exits; the
+// lock is taken by the time this returns.
+static pid_t hold_lock_for(int fd, off_t at, long ms) {
+    int ready[2];
+    char byte;
+    if (pipe(ready) != 0) return -1;
+    pid_t c = fork();
+    if (c == 0) {
+        close(ready[0]);
+        if (set_lock(fd, F_SETLK, F_WRLCK, at, 1) != 0) _exit(1);
+        if (write(ready[1], "x", 1) != 1) _exit(2);
+        usleep(ms * 1000);
+        _exit(0);
+    }
+    close(ready[1]);
+    if (read(ready[0], &byte, 1) != 1) c = -1;
+    close(ready[0]);
+    return c;
+}
+
+// Advisory locks: a process's record locks (POSIX) as another process sees
+// them, what a close and an exit give back, a split, a wait and its end by
+// a signal, ranges to the largest offset, a deadlock, a close during a
+// wait; an open file's record locks (OFD) and flock's.
+static void check_locks(void) {
+    const char *name = "/ltlock";
+    char zeros[100] = {0};
+    unlink(name);
+    int fd = open(name, O_CREAT | O_RDWR, 0644);
+    CHECK(fd >= 0 && write(fd, zeros, sizeof zeros) == (ssize_t)sizeof zeros, "a file to lock");
+    pid_t me = getpid();
+
+    CHECK(set_lock(fd, F_SETLK, F_WRLCK, 10, 10) == 0, "F_SETLK a write lock on bytes 10..19");
+    CHECK(test_lock(fd, F_GETLK, 0, 0).l_type == F_UNLCK, "F_GETLK doesn't see the caller's own lock");
+    pid_t c = fork();
+    if (c == 0) {
+        struct flock fl = test_lock(fd, F_GETLK, 0, 100);
+        if (fl.l_type != F_WRLCK || fl.l_start != 10 || fl.l_len != 10 || fl.l_pid != me) _exit(1);
+        if (set_lock(fd, F_SETLK, F_RDLCK, 15, 1) != -1 || errno != EAGAIN) _exit(2);
+        if (set_lock(fd, F_SETLK, F_WRLCK, 20, 10) != 0) _exit(3);
+        _exit(0);
+    }
+    CHECK(exit_status(c) == 0, "another process sees it and its holder, can't share it, can lock beside it");
+    CHECK(set_lock(fd, F_SETLK, F_WRLCK, 20, 10) == 0, "an exit gives back the process's locks");
+    int other = open(name, O_RDONLY);
+    CHECK(other >= 0 && close(other) == 0, "open and close another descriptor of the file");
+    c = fork();
+    if (c == 0) _exit(test_lock(fd, F_GETLK, 0, 0).l_type == F_UNLCK ? 0 : 1);
+    CHECK(exit_status(c) == 0, "closing any descriptor of the file gives back the process's locks");
+
+    CHECK(set_lock(fd, F_SETLK, F_WRLCK, 0, 100) == 0 && set_lock(fd, F_SETLK, F_UNLCK, 40, 20) == 0, "lock 0..99, unlock 40..59");
+    CHECK(set_lock(fd, F_SETLK, F_RDLCK, 0, 40) == 0, "make 0..39 a read lock");
+    c = fork();
+    if (c == 0) {
+        struct flock a = test_lock(fd, F_GETLK, 30, 20), b = test_lock(fd, F_GETLK, 60, 1);
+        if (a.l_type != F_RDLCK || a.l_start != 0 || a.l_len != 40) _exit(1);
+        if (b.l_type != F_WRLCK || b.l_start != 60 || b.l_len != 40) _exit(2);
+        if (test_lock(fd, F_GETLK, 40, 20).l_type != F_UNLCK) _exit(3);
+        if (set_lock(fd, F_SETLK, F_RDLCK, 0, 10) != 0) _exit(4);
+        if (set_lock(fd, F_SETLK, F_WRLCK, 0, 10) != -1 || errno != EAGAIN) _exit(5);
+        _exit(0);
+    }
+    CHECK(exit_status(c) == 0, "an unlock in the middle splits a lock; a read lock is shared");
+
+    int ready[2];
+    char byte;
+    CHECK(pipe(ready) == 0, "a pipe to start a waiter");
+    c = fork();
+    if (c == 0) {
+        struct timespec t0;
+        close(ready[0]);
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        if (write(ready[1], "x", 1) != 1) _exit(1);
+        if (set_lock(fd, F_SETLKW, F_WRLCK, 70, 1) != 0) _exit(2);
+        _exit(ms_since(&t0) >= 150 ? 0 : 3);
+    }
+    close(ready[1]);
+    CHECK(read(ready[0], &byte, 1) == 1, "the waiter is about to wait");
+    close(ready[0]);
+    usleep(250 * 1000);
+    CHECK(set_lock(fd, F_SETLK, F_UNLCK, 0, 0) == 0, "unlock the whole file");
+    CHECK(exit_status(c) == 0, "F_SETLKW waits until the lock is free, then takes it");
+
+    CHECK(set_lock(fd, F_SETLK, F_WRLCK, 0, 0) == 0, "lock the whole file");
+    CHECK(pipe(ready) == 0, "a pipe to start a waiter");
+    c = fork();
+    if (c == 0) {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof sa);
+        sa.sa_handler = on_usr1; // no SA_RESTART
+        sigaction(SIGUSR1, &sa, NULL);
+        close(ready[0]);
+        if (write(ready[1], "x", 1) != 1) _exit(1);
+        int r = set_lock(fd, F_SETLKW, F_WRLCK, 0, 1);
+        _exit(r == -1 && errno == EINTR ? 0 : 2);
+    }
+    close(ready[1]);
+    CHECK(read(ready[0], &byte, 1) == 1, "the waiter is about to wait");
+    close(ready[0]);
+    // A signal that lands before the wait begins is followed by another.
+    int got = -1;
+    for (int i = 0; i < 60 && got < 0; i++) {
+        kill(c, SIGUSR1);
+        usleep(50 * 1000);
+        int wst;
+        if (waitpid(c, &wst, WNOHANG) == c) got = WIFEXITED(wst) ? WEXITSTATUS(wst) : 99;
+    }
+    if (got < 0) {
+        kill(c, SIGKILL);
+        waitpid(c, NULL, 0);
+    }
+    CHECK(got == 0, "a signal ends the wait with EINTR");
+    CHECK(set_lock(fd, F_SETLK, F_UNLCK, 0, 0) == 0, "unlock");
+
+    // Bounds at the largest offset, and what F_GETLK says of them.
+    CHECK(set_lock(fd, F_SETLK, F_WRLCK, 0, 0) == 0 && set_lock(fd, F_SETLK, F_UNLCK, 1, INT64_MAX) == 0, "lock to EOF, unlock 1..the largest offset");
+    c = fork();
+    if (c == 0) {
+        struct flock fl = test_lock(fd, F_GETLK, 0, 0);
+        _exit(fl.l_type == F_WRLCK && fl.l_start == 0 && fl.l_len == 1 ? 0 : 1);
+    }
+    CHECK(exit_status(c) == 0, "byte 0 is left");
+    CHECK(set_lock(fd, F_SETLK, F_WRLCK, 1, INT64_MAX) == 0, "lock 1..the largest offset: one lock to EOF again");
+    c = fork();
+    if (c == 0) {
+        struct flock fl = test_lock(fd, F_GETLK, 5, 1);
+        _exit(fl.l_type == F_WRLCK && fl.l_start == 0 && fl.l_len == 0 ? 0 : 1);
+    }
+    CHECK(exit_status(c) == 0, "F_GETLK reports it as to EOF");
+    errno = 0;
+    CHECK(set_lock(fd, F_SETLK, F_WRLCK, 2, INT64_MAX) == -1 && errno == EOVERFLOW, "a range past the largest offset is EOVERFLOW");
+    CHECK(set_lock(fd, F_SETLK, F_UNLCK, 0, 0) == 0, "unlock");
+
+    // Two processes each waiting for the other's lock: whichever asks
+    // second gets EDEADLK.
+    CHECK(set_lock(fd, F_SETLK, F_WRLCK, 0, 1) == 0, "lock byte 0");
+    CHECK(pipe(ready) == 0, "a pipe to start a waiter");
+    c = fork();
+    if (c == 0) {
+        close(ready[0]);
+        if (set_lock(fd, F_SETLK, F_WRLCK, 1, 1) != 0) _exit(1);
+        if (write(ready[1], "x", 1) != 1) _exit(2);
+        int r = set_lock(fd, F_SETLKW, F_WRLCK, 0, 1);
+        _exit(r == 0 ? 0 : errno == EDEADLK ? 4 : 3);
+    }
+    close(ready[1]);
+    CHECK(read(ready[0], &byte, 1) == 1, "a child holds byte 1 and is about to wait for byte 0");
+    close(ready[0]);
+    usleep(100 * 1000);
+    errno = 0;
+    int dl = set_lock(fd, F_SETLKW, F_WRLCK, 1, 1), dl_errno = errno;
+    if (dl == -1) set_lock(fd, F_SETLK, F_UNLCK, 0, 1);
+    int dl_child = exit_status(c);
+    CHECK((dl == -1 && dl_errno == EDEADLK && dl_child == 0) || (dl == 0 && dl_child == 4), "one of the two gets EDEADLK, the other its lock");
+    CHECK(set_lock(fd, F_SETLK, F_UNLCK, 0, 0) == 0, "unlock");
+
+    // A descriptor closed while F_SETLKW waits on it: the lock it gets in
+    // the end goes again, and the call says EBADF.
+    c = hold_lock_for(fd, 90, 300);
+    CHECK(c > 0, "a child holds byte 90 for a while");
+    struct closed_wait cw = {.fd = dup(fd)};
+    pthread_t waiter;
+    CHECK(cw.fd >= 0 && pthread_create(&waiter, NULL, wait_on_closed, &cw) == 0, "a thread waits for byte 90");
+    usleep(100 * 1000);
+    CHECK(close(cw.fd) == 0 && pthread_join(waiter, NULL) == 0, "close its descriptor; the wait ends when the child's lock goes");
+    CHECK(cw.result == -1 && cw.err == EBADF, "with EBADF");
+    CHECK(exit_status(c) == 0, "the holder is gone");
+    c = fork();
+    if (c == 0) _exit(test_lock(fd, F_GETLK, 90, 1).l_type == F_UNLCK ? 0 : 1);
+    CHECK(exit_status(c) == 0, "and the process holds no lock there");
+
+    errno = 0;
+    CHECK(set_lock(fd, F_SETLK, 7, 0, 1) == -1 && errno == EINVAL, "an unknown lock type is EINVAL");
+    errno = 0;
+    CHECK(set_lock(fd, F_SETLK, F_WRLCK, -5, 1) == -1 && errno == EINVAL, "a range before the file is EINVAL");
+    int ro = open(name, O_RDONLY);
+    errno = 0;
+    CHECK(ro >= 0 && set_lock(ro, F_SETLK, F_WRLCK, 0, 1) == -1 && errno == EBADF, "a write lock needs a file open for writing");
+    close(ro);
+
+    int a = open(name, O_RDWR), b = open(name, O_RDWR);
+    CHECK(a >= 0 && b >= 0 && set_lock(a, F_OFD_SETLK, F_WRLCK, 0, 10) == 0, "an open file's record lock (OFD)");
+    errno = 0;
+    CHECK(set_lock(b, F_OFD_SETLK, F_WRLCK, 5, 1) == -1 && errno == EAGAIN, "another open file of the same process can't have it");
+    errno = 0;
+    CHECK(set_lock(b, F_SETLK, F_WRLCK, 5, 1) == -1 && errno == EAGAIN, "nor can the process's own POSIX lock");
+    struct flock ofl = test_lock(b, F_OFD_GETLK, 0, 1);
+    CHECK(ofl.l_type == F_WRLCK && ofl.l_pid == -1, "F_OFD_GETLK finds it, with no process to name");
+    int tmp = open(name, O_RDONLY);
+    CHECK(tmp >= 0 && close(tmp) == 0 && set_lock(b, F_OFD_SETLK, F_WRLCK, 5, 1) == -1, "closing another descriptor leaves it");
+    struct flock bad = {.l_type = F_WRLCK, .l_whence = SEEK_SET, .l_start = 50, .l_len = 1, .l_pid = 5};
+    errno = 0;
+    CHECK(fcntl(b, F_OFD_SETLK, &bad) == -1 && errno == EINVAL, "an OFD request with l_pid set is EINVAL");
+    CHECK(close(a) == 0 && set_lock(b, F_OFD_SETLK, F_WRLCK, 5, 1) == 0, "the open file's last close gives it back");
+    close(b);
+
+    int x = open(name, O_RDWR), y = open(name, O_RDWR);
+    CHECK(x >= 0 && y >= 0 && flock(x, LOCK_EX) == 0, "flock LOCK_EX");
+    errno = 0;
+    CHECK(flock(y, LOCK_SH | LOCK_NB) == -1 && errno == EWOULDBLOCK, "another open file can't share it");
+    CHECK(set_lock(y, F_SETLK, F_WRLCK, 0, 0) == 0 && set_lock(y, F_SETLK, F_UNLCK, 0, 0) == 0, "flock and fcntl locks don't meet");
+    c = fork();
+    if (c == 0) _exit(flock(x, LOCK_EX | LOCK_NB) == 0 ? 0 : 1);
+    CHECK(exit_status(c) == 0, "a child holds it through the inherited open file");
+    errno = 0;
+    CHECK(flock(y, LOCK_EX | LOCK_NB) == -1 && errno == EWOULDBLOCK, "the child's exit didn't give it back");
+    CHECK(close(x) == 0 && flock(y, LOCK_EX | LOCK_NB) == 0, "the open file's last close does");
+    close(y);
+
+    // Two holders of a shared flock lock that both want it exclusive: a
+    // conversion drops the old lock first, so neither waits for ever.
+    int s = open(name, O_RDWR);
+    CHECK(s >= 0 && flock(s, LOCK_SH) == 0, "a shared flock lock");
+    CHECK(pipe(ready) == 0, "a pipe to start a waiter");
+    c = fork();
+    if (c == 0) {
+        int mine = open(name, O_RDWR);
+        close(ready[0]);
+        if (mine < 0 || flock(mine, LOCK_SH) != 0) _exit(1);
+        if (write(ready[1], "x", 1) != 1) _exit(2);
+        _exit(flock(mine, LOCK_EX) == 0 ? 0 : 3);
+    }
+    close(ready[1]);
+    CHECK(read(ready[0], &byte, 1) == 1, "a child shares it and asks for it exclusive");
+    close(ready[0]);
+    int converted = 0;
+    for (int i = 0; i < 40 && !converted; i++) {
+        converted = flock(s, LOCK_EX | LOCK_NB) == 0;
+        if (!converted) usleep(25 * 1000);
+    }
+    CHECK(converted, "this one gets it exclusive: the waiter's shared lock went");
+    CHECK(flock(s, LOCK_UN) == 0 && exit_status(c) == 0, "and the waiter gets it after");
+    close(s);
+    close(fd);
+    CHECK(unlink(name) == 0, "unlink the locked file");
+}
+
 int main(void) {
     remove_tree(AT_FDCWD, ROOT);
     CHECK(mkdir(ROOT, 0755) == 0, "mkdir " ROOT);
@@ -469,6 +786,8 @@ int main(void) {
     check_shared_files();
     check_unlinked_open();
     check_links();
+    check_locks();
+    check_modes();
 
     printf("lt_fs: PASS (%d checks)\n", check_no);
     return 0;

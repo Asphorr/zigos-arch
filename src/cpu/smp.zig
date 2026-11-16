@@ -871,6 +871,7 @@ fn apInitPerCpu() u8 {
     // BSP which has to wait for paging.dropLowIdentity.
     @import("arch/protect.zig").applyEarlyCr4();
     @import("arch/protect.zig").enableSmapPerCpu();
+    @import("arch/fp.zig").enableExtended();
     @import("arch/mce.zig").perCpuInit();
     @import("arch/pmu.zig").perCpuInit();
 
@@ -1033,9 +1034,10 @@ pub fn reinitForS3Resume() void {
     @import("../debug/lbr.zig").enable();
     @import("syscall/entry.zig").verifyMsrs("S3-BSP");
 
-    // SMEP/UMIP + SMAP, MCE, PMU — all per-CPU, all reset by S3.
+    // SMEP/UMIP + SMAP, AVX state, MCE, PMU — all per-CPU, all reset by S3.
     @import("arch/protect.zig").applyEarlyCr4();
     @import("arch/protect.zig").enableSmapPerCpu();
+    @import("arch/fp.zig").enableExtended();
     @import("arch/mce.zig").perCpuInit();
     @import("arch/pmu.zig").perCpuInit();
 

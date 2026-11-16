@@ -145,7 +145,7 @@ pub const Priority = enum(u8) {
 
 /// tcp_sock and tcp_listener are the native calls' connection slots; socket,
 /// epoll and eventfd are objects behind `File.obj` with tables of their own.
-pub const FsType = enum(u8) { console = 0, fat32 = 1, tarfs = 2, pipe = 3, devfs = 4, procfs = 5, ext2 = 6, tcp_sock = 7, tcp_listener = 8, socket = 9, epoll = 10, eventfd = 11 };
+pub const FsType = enum(u8) { console = 0, fat32 = 1, tarfs = 2, pipe = 3, devfs = 4, procfs = 5, ext2 = 6, tcp_sock = 7, tcp_listener = 8, socket = 9, epoll = 10, eventfd = 11, tty = 12, lproc = 13 };
 
 /// Generic blocking primitive used by waitpid + pipe read/write. The scheduler
 /// treats a PCB with wait_kind != .none as not runnable. Exactly one waiter
@@ -303,8 +303,8 @@ pub const PCB = struct {
     // spell that path rather than relying on a zero default.
     cwd: [256]u8 = INIT_CWD,
     cwd_len: u8 = INIT_CWD_PATH.len,
-    // Linux umask(): kept and given back, nothing else — files have no
-    // permission bits to mask.
+    // Linux umask(): masks the permissions of the files and directories the
+    // process creates.
     umask: u16 = 0o022,
     // The user address space's regions: VA ranges whose pages are allocated
     // (or read from a file, or shared) on first touch by the page-fault
@@ -345,6 +345,14 @@ pub const PCB = struct {
     // page-fault handler treats faults in [stack_base - GUARD_SIZE, stack_base)
     // as stack overflow rather than a generic segfault.
     stack_base: usize = 0, // (c) set at exec
+    // Where a Linux image's initial stack keeps its argv strings, the
+    // environment's after them, and the auxv: what /proc/<pid>/cmdline,
+    // environ and auxv read. 0 for a native image.
+    arg_start: usize = 0, // (c) set at exec
+    arg_end: usize = 0, // (c)
+    env_end: usize = 0, // (c)
+    auxv_start: usize = 0, // (c)
+    auxv_end: usize = 0, // (c)
     // Cycles spent descheduled inside the current syscall — bumped by blocking
     // primitives (yield/sleep) and subtracted by doSyscall so the syscall
     // counter reflects CPU time, not wall time.
@@ -407,6 +415,10 @@ pub const PCB = struct {
     // Ticks between SIGALRMs once the first has fired (setitimer's
     // it_interval), 0 for a one-shot alarm.
     alarm_interval: u64 = 0, // (a)
+    // A Linux sleep a signal cut short with no handler to run: its monotonic
+    // deadline (0: none) and where the time left goes, for restart_syscall.
+    restart_until: u64 = 0,
+    restart_rem: u64 = 0,
 
     // --- Job control (POSIX stop/cont) ----------------------------------
     // True while job-control-stopped (default action of SIGSTOP/SIGTSTP/
@@ -427,6 +439,10 @@ pub const PCB = struct {
     // the stopping thread / a remote resumer alongside the seq_cst job_stopped
     // store-load that orders them, and read only by the not-yet-wired waitpid.
     stop_signo: u8 = 0,
+    // A stop or continue of the process its parent's wait4 hasn't reported
+    // yet (WUNTRACED: the stop signal; WCONTINUED); kept on the lead.
+    wait_stop: u8 = 0, // (a)
+    wait_cont: bool = false, // (a)
 
     // --- Threads (sysClone) ---------------------------------------------
     // Thread group ID = pid of the lead thread that started the process.

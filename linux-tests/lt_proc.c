@@ -4,11 +4,13 @@
 // argv, envp and close-on-exec (of a stamped image and of one that carries
 // no OSABI stamp), the FP state across fork, process_vm_readv on itself,
 // sysinfo, /dev/null as a child's stdin, tkill, pids that are not reused at
-// once, process groups and sessions. Exit 0 = every check passed, else the
+// once, process groups and sessions, AVX registers kept per process. Exit
+// 0 = every check passed, else the
 // number of the first failed check. Run as
 // `lt_proc exec-child <fd-cloexec> <fd-kept>` it is the execve target instead.
 
 #define _GNU_SOURCE
+#include <cpuid.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <fenv.h>
@@ -20,6 +22,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/syscall.h>
 #include <sys/sysinfo.h>
 #include <sys/uio.h>
@@ -262,6 +265,166 @@ static void check_pids_and_groups(void) {
     close(up[1]);
 }
 
+static unsigned long long xgetbv0(void) {
+    unsigned lo, hi;
+    __asm__ volatile(".byte 0x0f, 0x01, 0xd0" : "=a"(lo), "=d"(hi) : "c"(0)); // xgetbv
+    return ((unsigned long long)hi << 32) | lo;
+}
+
+#define LOAD_YMM(in)                  \
+    "vmovdqu 0(" in "), %%ymm8\n\t"   \
+    "vmovdqu 32(" in "), %%ymm9\n\t"  \
+    "vmovdqu 64(" in "), %%ymm10\n\t" \
+    "vmovdqu 96(" in "), %%ymm11\n\t" \
+    "vmovdqu 128(" in "), %%ymm12\n\t" \
+    "vmovdqu 160(" in "), %%ymm13\n\t" \
+    "vmovdqu 192(" in "), %%ymm14\n\t" \
+    "vmovdqu 224(" in "), %%ymm15\n\t"
+#define STORE_YMM(out)                 \
+    "vmovdqu %%ymm8, 0(" out ")\n\t"   \
+    "vmovdqu %%ymm9, 32(" out ")\n\t"  \
+    "vmovdqu %%ymm10, 64(" out ")\n\t" \
+    "vmovdqu %%ymm11, 96(" out ")\n\t" \
+    "vmovdqu %%ymm12, 128(" out ")\n\t" \
+    "vmovdqu %%ymm13, 160(" out ")\n\t" \
+    "vmovdqu %%ymm14, 192(" out ")\n\t" \
+    "vmovdqu %%ymm15, 224(" out ")\n\t" \
+    "vzeroupper\n\t"
+#define YMM_CLOBBERS "xmm8", "xmm9", "xmm10", "xmm11", "xmm12", "xmm13", "xmm14", "xmm15"
+
+// ymm8..15 from `in`, then `rounds` sched_yields as raw system calls (no
+// function call for the compiler to give the registers up over), then the
+// registers into `out`.
+__attribute__((target("avx"))) static void ymm_through_yields(const unsigned char *in, unsigned char *out, long rounds) {
+    __asm__ volatile(LOAD_YMM("%[in]") "1:\n\t"
+                                       "movl $24, %%eax\n\t" // SYS_sched_yield
+                                       "syscall\n\t"
+                                       "decq %[n]\n\t"
+                                       "jnz 1b\n\t" STORE_YMM("%[out]")
+                     : [n] "+r"(rounds)
+                     : [in] "r"(in), [out] "r"(out)
+                     : "rax", "rcx", "r11", "memory", YMM_CLOBBERS);
+}
+
+// ymm8..15 from `in`, a raw fork, the registers into `out` on both sides.
+__attribute__((target("avx"))) static long ymm_fork(const unsigned char *in, unsigned char *out) {
+    long ret;
+    __asm__ volatile(LOAD_YMM("%[in]") "movl $57, %%eax\n\t" // SYS_fork
+                                       "syscall\n\t" STORE_YMM("%[out]")
+                     : "=a"(ret)
+                     : [in] "r"(in), [out] "r"(out)
+                     : "rcx", "r11", "memory", YMM_CLOBBERS);
+    return ret;
+}
+
+// AVX state, where the CPU has AVX: turned on, the upper halves of the YMM
+// registers kept per process across system calls and switches, and a
+// fork's child starting with its parent's.
+static void check_avx(void) {
+    unsigned a, b, c, d;
+    if (!__get_cpuid(1, &a, &b, &c, &d) || !(c & (1u << 28))) {
+        printf("lt_proc: no AVX on this CPU; its checks skipped\n");
+        return;
+    }
+    CHECK(c & (1u << 27), "the kernel turned OSXSAVE on, the CPU having AVX");
+    CHECK((xgetbv0() & 6) == 6, "XCR0 holds the SSE and AVX state");
+
+    pid_t kids[3];
+    for (int k = 0; k < 3; k++) {
+        kids[k] = fork();
+        if (kids[k] == 0) {
+            unsigned char in[256], out[256];
+            for (int i = 0; i < 256; i++) in[i] = (unsigned char)(k * 89 + i * 7 + 1);
+            for (int r = 0; r < 10; r++) {
+                memset(out, 0, sizeof out);
+                ymm_through_yields(in, out, 300);
+                if (memcmp(in, out, sizeof in) != 0) _exit(1);
+            }
+            _exit(0);
+        }
+        CHECK(kids[k] > 0, "fork a process to keep YMM registers");
+    }
+    int bad = 0;
+    for (int k = 0; k < 3; k++) bad |= wait_exit(kids[k]) != 0;
+    CHECK(!bad, "three processes keep their own YMM registers through 3000 yields each");
+
+    unsigned char in[256], out[256];
+    for (int i = 0; i < 256; i++) in[i] = (unsigned char)(i * 13 + 5);
+    memset(out, 0, sizeof out);
+    long f = ymm_fork(in, out);
+    if (f == 0) _exit(memcmp(in, out, sizeof in) == 0 ? 0 : 1);
+    CHECK(f > 0 && wait_exit((pid_t)f) == 0, "a fork's child starts with its parent's YMM registers");
+    CHECK(memcmp(in, out, sizeof in) == 0, "and the parent keeps them");
+}
+
+static volatile sig_atomic_t chld_code;
+static void on_chld(int sig, siginfo_t *info, void *uc) {
+    (void)sig;
+    (void)uc;
+    chld_code = info->si_code;
+}
+
+// Job control as a parent sees it: a child stopped and continued, each
+// reported once by waitpid with WUNTRACED or WCONTINUED, and SIGCHLD
+// saying which.
+static void check_job_stops(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = on_chld;
+    sa.sa_flags = SA_SIGINFO | SA_RESTART;
+    sigemptyset(&sa.sa_mask);
+    CHECK(sigaction(SIGCHLD, &sa, NULL) == 0, "a SIGCHLD handler");
+    pid_t c = fork();
+    if (c == 0) {
+        for (;;) pause();
+    }
+    int st = 0;
+    CHECK(c > 0 && kill(c, SIGSTOP) == 0, "stop a child");
+    CHECK(waitpid(c, &st, WUNTRACED) == c && WIFSTOPPED(st) && WSTOPSIG(st) == SIGSTOP, "waitpid with WUNTRACED: stopped, by SIGSTOP");
+    CHECK(chld_code == CLD_STOPPED, "SIGCHLD said CLD_STOPPED");
+    CHECK(waitpid(c, &st, WUNTRACED | WNOHANG) == 0, "the stop is reported once");
+    CHECK(waitpid(c, &st, WNOHANG) == 0, "and not at all without WUNTRACED");
+    CHECK(kill(c, SIGCONT) == 0 && waitpid(c, &st, WCONTINUED) == c && WIFCONTINUED(st), "waitpid with WCONTINUED: going on again");
+    CHECK(chld_code == CLD_CONTINUED, "SIGCHLD said CLD_CONTINUED");
+    CHECK(waitpid(c, &st, WUNTRACED | WCONTINUED | WNOHANG) == 0, "nothing more to report");
+    CHECK(kill(c, SIGTSTP) == 0 && waitpid(c, &st, WUNTRACED) == c && WIFSTOPPED(st) && WSTOPSIG(st) == SIGTSTP, "SIGTSTP stops it too");
+    CHECK(kill(c, SIGKILL) == 0 && waitpid(c, &st, 0) == c && WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL, "killed while stopped, it is reaped");
+    signal(SIGCHLD, SIG_DFL);
+
+    // Stopped mid-nanosleep, as by Ctrl+Z at a shell: the sleep neither ends
+    // nor sees EINTR — it goes on once continued (restart_syscall).
+    c = fork();
+    if (c == 0) {
+        struct timespec ts = {.tv_sec = 1, .tv_nsec = 0};
+        int r = nanosleep(&ts, &ts);
+        _exit(r == 0 ? 0 : 100 + errno);
+    }
+    nap_ms(100);
+    CHECK(kill(c, SIGTSTP) == 0 && waitpid(c, &st, WUNTRACED) == c && WIFSTOPPED(st), "stop a sleeping child");
+    nap_ms(1300);
+    CHECK(waitpid(c, &st, WNOHANG) == 0, "stopped past its time, it is still there");
+    CHECK(kill(c, SIGCONT) == 0 && waitpid(c, &st, 0) == c && WIFEXITED(st), "continued, it ends");
+    CHECK(WEXITSTATUS(st) == 0, "its one nanosleep returned 0, no EINTR");
+
+    // Once wait4 has told of the stop, none of the child's code runs.
+    volatile int *ran = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    CHECK(ran != MAP_FAILED, "a shared page");
+    c = fork();
+    if (c == 0) {
+        for (;;) {
+            (*ran)++;
+            getppid();
+        }
+    }
+    nap_ms(50);
+    CHECK(kill(c, SIGSTOP) == 0 && waitpid(c, &st, WUNTRACED) == c && WIFSTOPPED(st), "stop a busy child");
+    int seen = *ran;
+    nap_ms(100);
+    CHECK(seen > 0 && *ran == seen, "stopped, it runs none of its code");
+    CHECK(kill(c, SIGKILL) == 0 && waitpid(c, &st, 0) == c && WIFSIGNALED(st), "and is killed");
+    munmap((void *)ran, 4096);
+}
+
 int main(int argc, char **argv) {
     if (argc >= 2 && strcmp(argv[1], "exec-child") == 0) return exec_child(argc, argv);
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -465,6 +628,8 @@ int main(int argc, char **argv) {
     CHECK(waitpid(p, &st, 0) == p && WIFSIGNALED(st) && WTERMSIG(st) == SIGABRT, "tkill(SIGABRT) status");
 
     check_pids_and_groups();
+    check_avx();
+    check_job_stops();
 
     // churn
     for (int i = 0; i < 20; i++) {
