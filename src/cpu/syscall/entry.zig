@@ -88,8 +88,11 @@ pub fn init() void {
     debug.klog("[syscall] LSTAR(cpu{d}): 0x{X:0>16}\n", .{ my_id, stub_addr });
 
     // SFMASK clears IF: the stub runs on the user RSP until it has switched
-    // stacks. doSyscall enables interrupts for the handler body only.
-    wrmsr(MSR_SFMASK, 0x200); // Clear IF (bit 9)
+    // stacks. doSyscall enables interrupts for the handler body only. It
+    // clears DF too: user code may enter with DF=1 (musl's backward memmove
+    // is `std; rep movsb; cld`), and the kernel's rep-string memcpy/memset
+    // would then run backwards. SYSRET restores the user's DF from R11.
+    wrmsr(MSR_SFMASK, 0x600); // IF (bit 9) | DF (bit 10)
     debug.klog("[syscall] syscall/sysret initialized\n", .{});
 }
 

@@ -110,6 +110,10 @@ var current_pages: u32 = 0;      // (p:shootdown_lock) publisher-fenced before I
 /// ceiling is 33 pages).
 pub const RANGE_MAX_PAGES: usize = 32;
 
+/// Every flush of a user PCID is a CR3 reload on each CPU running it: no
+/// INVPCID, no INVLPG, no hypercall. Tests those paths under nested virt.
+pub const PARANOID_USER_FLUSH = false;
+
 // Telemetry — surfaces in `[slow-tlb]` lines + readable by sysmon. All bumped
 // from multi-CPU senders, so atomic-RMW only (never plain `+=` / `+%=`).
 pub var n_shootdowns_full: u64 = 0;            // (a)
@@ -117,6 +121,8 @@ pub var n_shootdowns_context: u64 = 0;         // (a)
 pub var n_shootdowns_page: u64 = 0;            // (a)
 pub var n_shootdowns_range: u64 = 0;           // (a)
 pub var n_shootdowns_via_hypercall: u64 = 0;   // (a)
+/// (a) Hypercall flushes the host refused; those went out as IPIs.
+pub var n_shootdowns_hypercall_failed: u64 = 0;
 /// (a) Count of skipped peer-CPU slots (NOT shootdown events) due to the
 /// per-mm cpumask narrowing. A 32-CPU host where every shootdown narrows
 /// down to 2 targets would accumulate ~30 per shootdown. High values mean
@@ -266,7 +272,8 @@ pub export fn handleTlbShootdown() callconv(.c) void {
 /// broadcast IPI, wait for acks, do local flush, release lock. Hot path
 /// for both `shootdownAll` (single_context / full) and `shootdownPage`
 /// (single_page).
-fn doShootdown(mode: Mode, affected_pcid: u16, va: u64, pages: u32) void {
+fn doShootdown(mode_in: Mode, affected_pcid: u16, va: u64, pages: u32) void {
+    const mode: Mode = if (PARANOID_USER_FLUSH and affected_pcid != 0) .full else mode_in;
     // Pin against involuntary preemption for the WHOLE shootdown. dynirq's
     // check_and_preempt runs at every device-IRQ epilogue with no from_user
     // gate, and shootdown_lock is a raw atomic (not a SpinLock), so nothing
@@ -349,7 +356,7 @@ fn doShootdown(mode: Mode, affected_pcid: u16, va: u64, pages: u32) void {
     // space hypercall isn't guaranteed to evict GLOBAL translations on every
     // VP. Force the IPI path below, which toggles CR4.PGE explicitly. (Moot on
     // KVM — hasHypercalls() is false — but correct under Hyper-V.)
-    if ((mode == .full or mode == .single_context) and affected_pcid != 0 and hyperv.hasHypercalls()) {
+    if (!PARANOID_USER_FLUSH and (mode == .full or mode == .single_context) and affected_pcid != 0 and hyperv.hasHypercalls()) {
         const cr3 = asm volatile ("movq %%cr3, %[ret]"
             : [ret] "=r" (-> u64),
         );
@@ -361,9 +368,13 @@ fn doShootdown(mode: Mode, affected_pcid: u16, va: u64, pages: u32) void {
         // and then skip the IPI fan-out entirely, leaving live peers' stale
         // entries for the affected AS intact. Fall through to the IPI path in
         // that case. (CR3 bits 11:0 = PCID under CR4.PCIDE.)
-        if ((cr3 & 0xFFF) == affected_pcid and hyperv.flushAllProcessors(cr3)) {
-            via_hypercall = true;
-            _ = @atomicRmw(u64, &n_shootdowns_via_hypercall, .Add, 1, .monotonic);
+        if ((cr3 & 0xFFF) == affected_pcid) {
+            if (hyperv.flushAllProcessors(cr3)) {
+                via_hypercall = true;
+                _ = @atomicRmw(u64, &n_shootdowns_via_hypercall, .Add, 1, .monotonic);
+            } else {
+                _ = @atomicRmw(u64, &n_shootdowns_hypercall_failed, .Add, 1, .monotonic);
+            }
         }
     }
 
@@ -537,7 +548,9 @@ pub fn flushUserPage(affected_pcid: u16, va: u64, me: u8) void {
             return;
         }
     }
-    asm volatile ("invlpg (%[v])"
+    if (PARANOID_USER_FLUSH) {
+        flushLocalTlb();
+    } else asm volatile ("invlpg (%[v])"
         :
         : [v] "r" (va),
         : .{ .memory = true });

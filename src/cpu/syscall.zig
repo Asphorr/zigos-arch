@@ -627,7 +627,9 @@ fn doSyscallInner(sys_num: u32, arg1: u32, arg2: u32, arg3: u32, frame: ?*signal
 }
 
 pub fn isr_syscall() callconv(.naked) void {
+    // cld: see isr_common_exc.
     asm volatile (
+        \\ cld
     // Switch to kernel data segments (preserve RAX = syscall number)
         \\ pushq %%rax
         \\ movw $0x10, %%ax

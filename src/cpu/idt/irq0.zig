@@ -1132,7 +1132,9 @@ fn dumpTickless() void {
 // Alignment math at `call handleIRQ0`:
 //   CPU frame = 40 bytes, 15 GPRs = 120 bytes, FXSAVE = 512 bytes → 672B ≡ 0 ✓
 pub fn isr_irq0() callconv(.naked) void {
+    // cld: see isr_common_exc.
     asm volatile (
+        \\ cld
         \\ pushq %%rax
         \\ pushq %%rcx
         \\ pushq %%rdx

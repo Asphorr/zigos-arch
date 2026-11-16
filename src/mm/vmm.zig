@@ -593,6 +593,7 @@ pub fn unmapUserRange(pml4: [*]align(4096) u64, start: usize, end: usize, rc: *R
             if (pte & PRESENT != 0 and pte & USER != 0) {
                 pt[i] = 0;
                 rc.add(pte & PAGE_MASK);
+                noteUnmap(pte & PAGE_MASK, span + (i << 12), rc.pcid);
                 freed += 1;
             } else {
                 // Non-PRESENT: may be SWAPPED, SWAP_INFLIGHT (mid-eviction on
@@ -691,6 +692,119 @@ pub const Reclaim = struct {
         self.n = 0;
     }
 };
+
+/// The last user pages unmapUserRange took, for the pmm canary's UAF report:
+/// which address of which process a reused frame was.
+const UnmapNote = struct { phys: u64 = 0, va: u64 = 0, pid: u16 = 0, pcid: u16 = 0 };
+const UNMAP_NOTES: u32 = 32768;
+var unmap_notes: [UNMAP_NOTES]UnmapNote = [_]UnmapNote{.{}} ** UNMAP_NOTES;
+var unmap_head: u32 = 0; // (a)
+
+fn noteUnmap(phys: u64, va: u64, pcid: u16) void {
+    const i = @atomicRmw(u32, &unmap_head, .Add, 1, .monotonic) % UNMAP_NOTES;
+    const pid = @import("../cpu/smp.zig").currentPid() orelse 0xFFFF;
+    unmap_notes[i] = .{ .phys = phys, .va = va, .pid = @truncate(pid), .pcid = pcid };
+}
+
+/// Table an entry points to, if it is a present non-huge one inside the
+/// physmap. Never panics: the report below reads live and dying tables.
+fn peekTable(e: u64) ?[*]const u64 {
+    if (e & PRESENT == 0 or e & PAGE_SIZE_FLAG != 0) return null;
+    const p = entryPhys(e);
+    if (p >= paging.PHYSMAP_SIZE) return null;
+    return @ptrFromInt(paging.physToVirt(p));
+}
+
+/// Every user PTE and table entry under `pml4` that points at `phys`.
+fn scanFor(pml4: [*]align(4096) u64, phys: u64, pid: usize) u32 {
+    const serial = @import("../debug/serial.zig");
+    var hits: u32 = 0;
+    if (entryPhys(pml4[0]) == phys and pml4[0] & PRESENT != 0) {
+        serial.print("[uaf]   pid {d}: it is the PDPT\n", .{pid});
+        hits += 1;
+    }
+    const pdpt = peekTable(pml4[0]) orelse return hits;
+    for (0..512) |a| {
+        const e3 = pdpt[a];
+        if (e3 & PRESENT != 0 and entryPhys(e3) == phys) {
+            serial.print("[uaf]   pid {d}: it is the PD of va 0x{X}\n", .{ pid, a << 30 });
+            hits += 1;
+        }
+        const pd = peekTable(e3) orelse continue;
+        for (0..512) |b| {
+            const e2 = pd[b];
+            if (e2 & PRESENT != 0 and entryPhys(e2) == phys) {
+                serial.print("[uaf]   pid {d}: it is the PT of va 0x{X}\n", .{ pid, (a << 30) | (b << 21) });
+                hits += 1;
+            }
+            const pt = peekTable(e2) orelse continue;
+            for (0..512) |c| {
+                const e1 = pt[c];
+                if (e1 & PRESENT == 0 or entryPhys(e1) != phys) continue;
+                serial.print("[uaf]   pid {d}: still mapped at va 0x{X} pte=0x{X}\n", .{ pid, (a << 30) | (b << 21) | (c << 12), e1 });
+                hits += 1;
+            }
+        }
+    }
+    return hits;
+}
+
+/// What `va` maps to under `pml4` now: the PTE, 0 when none.
+fn pteOf(pml4: [*]align(4096) u64, va: u64) u64 {
+    const pdpt = peekTable(pml4[0]) orelse return 0;
+    const pd = peekTable(pdpt[(va >> 30) & 0x1FF]) orelse return 0;
+    const pt = peekTable(pd[(va >> 21) & 0x1FF]) orelse return 0;
+    return pt[(va >> 12) & 0x1FF];
+}
+
+/// A freed frame was written before its reuse (pmm canary): where munmap
+/// took it from, what it holds, and every user PTE that still maps it. No
+/// PTE left means a stale TLB entry or a kernel write.
+pub fn reportUafFrame(phys: u64) void {
+    const serial = @import("../debug/serial.zig");
+    const process = @import("../proc/process.zig");
+    const head = @atomicLoad(u32, &unmap_head, .monotonic);
+    var note: ?UnmapNote = null;
+    var k: u32 = 0;
+    while (k < @min(head, UNMAP_NOTES)) : (k += 1) {
+        const n = unmap_notes[(head -% 1 -% k) % UNMAP_NOTES];
+        if (n.phys != phys) continue;
+        note = n;
+        serial.print("[uaf] was va 0x{X} of pid {d} (pcid {d}), {d} unmapped pages ago\n", .{ n.va, n.pid, n.pcid, k });
+        break;
+    } else serial.print("[uaf] not among the last {d} unmapped user pages\n", .{UNMAP_NOTES});
+
+    const q: [*]const u64 = @ptrFromInt(paging.physToVirt(phys));
+    var nz: u32 = 0;
+    for (0..512) |j| {
+        if (q[j] != 0) nz += 1;
+    }
+    serial.print("[uaf] {d}/512 nonzero qwords; head {X} {X} {X} {X} {X} {X} {X} {X}; tail {X} {X}\n", .{
+        nz, q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7], q[510], q[511],
+    });
+
+    var seen: [process.MAX_PROCS]usize = undefined;
+    var n_seen: usize = 0;
+    var hits: u32 = 0;
+    for (&process.procs, 0..) |*p, pid| {
+        const pd = p.page_directory orelse continue;
+        const key = @intFromPtr(pd);
+        var dup = false;
+        for (seen[0..n_seen]) |s| {
+            if (s == key) dup = true;
+        }
+        if (dup) continue;
+        seen[n_seen] = key;
+        n_seen += 1;
+        hits += scanFor(pd, phys, pid);
+        if (note) |n| {
+            if (p.pcid == n.pcid and n.pcid != 0) {
+                serial.print("[uaf]   pid {d} (pcid {d}) maps va 0x{X} now: pte=0x{X}\n", .{ pid, p.pcid, n.va, pteOf(pd, n.va) });
+            }
+        }
+    }
+    serial.print("[uaf] {d} entr(ies) still point at it, {d} address spaces scanned\n", .{ hits, n_seen });
+}
 
 /// Give every present 4 KB user page in [start, end) the protection `flags`
 /// (protToMapFlags / cacheMapFlags output), keeping its frame, its accessed

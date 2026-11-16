@@ -1460,6 +1460,29 @@ pub fn tcpRecv(slot: u8, buf: []u8) usize {
     return avail;
 }
 
+/// Diagnostics: every live connection, one line each.
+pub fn dumpTcp() void {
+    const serial = @import("../debug/serial.zig");
+    const now = process.tick_count;
+    const lk = net_lock.acquireIrqSave();
+    defer netUnlock(lk);
+    for (&tcp_conns, 0..) |*c, i| {
+        if (!c.active) continue;
+        serial.print("[tcp-dump] slot {d} {s} :{d} -> {d}.{d}.{d}.{d}:{d}; rcv_nxt {d} rx {d} adv {d} ooo {d}+{d}; snd una {d} nxt {d} buf {d} wnd {d} cwnd {d} rto {d} retx {d}; last tx {d} ticks ago; events {d}{s}{s}{s}{s}\n", .{
+            i,                          @tagName(c.state),  c.local_port,
+            c.remote_ip[0],             c.remote_ip[1],     c.remote_ip[2],
+            c.remote_ip[3],             c.remote_port,      c.rcv_nxt,
+            c.rx_count,                 c.adv_wnd,          c.ooo_seq,
+            c.ooo_len,                  c.snd_una,          c.snd_nxt,
+            c.snd_buf_len,              c.snd_wnd,          c.cwnd,
+            c.rto,                      c.retransmit_count, now -| c.last_send_tick,
+            c.events,                   if (c.peer_closed) " peer-closed" else "",
+            if (c.rd_closed) " rd-closed" else "", if (c.orphan) " orphan" else "",
+            if (c.error_flag) " error" else "",
+        });
+    }
+}
+
 pub fn tcpClose(slot: u8) void {
     if (slot >= TCP_MAX_CONNS) return;
     var conn = &tcp_conns[slot];

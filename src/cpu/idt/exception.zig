@@ -215,6 +215,20 @@ export fn handleException(rsp: u64) callconv(.c) void {
         @panic("handleException: noncanonical rsp — TSS.RSP0 corrupted before entry");
     }
 
+    // A kernel fault other than a #PF or #NMI: one plain line before anything
+    // that could itself fail (KASAN, canaries, the dump), so a cascade still
+    // leaves where it began.
+    {
+        const fr: [*]const u64 = @ptrFromInt(rsp);
+        const vec = fr[15];
+        if (fr[18] & 3 == 0 and vec != 14 and vec != 2 and vec != 1 and vec != 3) {
+            const cl = @import("../smp.zig").myCpu();
+            @import("../../debug/serial.zig").emergencyPrint("[exc-early] cpu{d} pid={d} vec={d} err=0x{X} rip=0x{X} rsp=0x{X} rbp=0x{X} frame=0x{X} cr2=0x{X}\n", .{
+                cl.cpu_id, cl.current_pid orelse 0xFF, vec, fr[16], fr[17], fr[20], fr[10], rsp, readCr2(),
+            });
+        }
+    }
+
     // KASAN: the saved-register area + iretq frame above us must be on a
     // *live* kstack. If it's been poisoned (process exited / kstack returned
     // to pool while still in use), KASAN trips here with the writer's
@@ -764,6 +778,13 @@ export fn handleException(rsp: u64) callconv(.c) void {
     // Enter the panic critical section FIRST so this CPU's full register
     // dump + autopsy + ring dumps print sequentially without byte-interleaving
     // with the other CPU's concurrent panic output. Idempotent per-CPU.
+    // One line first, unlocked: a kernel #PF never got [exc-early].
+    {
+        const cl = @import("../smp.zig").myCpu();
+        @import("../../debug/serial.zig").emergencyPrint("[exc-fatal] cpu{d} pid={d} vec={d} err=0x{X} rip=0x{X} rsp=0x{X} cr2=0x{X}\n", .{
+            cl.cpu_id, cl.current_pid orelse 0xFF, int_no, error_code, saved_rip, stack[20], readCr2(),
+        });
+    }
     @import("../../debug/kdbg.zig").enterCritical();
 
     // Halt peer CPUs BEFORE we print anything. Otherwise the exception
@@ -1014,7 +1035,10 @@ fn writeHex64(buf: []u8, pos: usize, n: u64) usize {
 // EVER change the push count above without adjusting padding here, the
 // runtime guard below traps it instantly.
 export fn isr_common_exc() callconv(.naked) void {
+    // cld: delivery keeps the interrupted DF (user code may hold DF=1), and
+    // the handlers' rep-string memcpy/memset assume DF=0; iretq restores it.
     asm volatile (
+        \\ cld
         \\ pushq %%rax
         \\ pushq %%rcx
         \\ pushq %%rdx

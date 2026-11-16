@@ -713,6 +713,59 @@ pub fn readThroughCache(inum: u32, offset: u64, buf: [*]u8, count: u32) u32 {
     return @intCast(done);
 }
 
+/// Diagnostics: each cached page page_cache found changed, beside its disk
+/// copy — what differs, who freed the frame last, who maps it now.
+pub fn reportCacheCorruption() void {
+    const serial = @import("../debug/serial.zig");
+    const symbols = @import("../debug/symbols.zig");
+    while (page_cache.takeCorrupt()) |c| {
+        defer if (c.pinned) pmm.releaseFrame(c.frame);
+        const inum: u32 = @truncate(c.file_id);
+        const fp = c.frame.raw();
+        serial.print("[pc-verify] inode {d} off 0x{X} frame 0x{X}, refs now {d}\n", .{ inum, c.page_off, fp, pmm.frameRefCount(c.frame) });
+        if (!c.pinned) continue;
+        const tmp = pmm.allocFrame() orelse continue;
+        defer pmm.freeFrame(tmp);
+        const d = tmp.toVirt().ptr([*]u8);
+        const n = @min(fillCachePage(inum, c.page_off, d), 0x1000);
+        if (n < 0x1000) @memset(d[n..0x1000], 0);
+        const disk = tmp.toVirt().ptr([*]const u64);
+        const mem = c.frame.toVirt().ptr([*]const u64);
+        var bad: u32 = 0;
+        var first: usize = 512;
+        var last: usize = 0;
+        for (0..512) |j| {
+            if (mem[j] == disk[j]) continue;
+            bad += 1;
+            if (first == 512) first = j;
+            last = j;
+        }
+        serial.print("[pc-verify]   {d}/512 qwords differ from disk ({d} bytes read)", .{ bad, n });
+        if (bad > 0) serial.print(", +0x{X}..+0x{X}", .{ first * 8, last * 8 + 8 });
+        serial.print("\n", .{});
+        var shown: u32 = 0;
+        for (0..512) |j| {
+            if (mem[j] == disk[j]) continue;
+            serial.print("[pc-verify]   +0x{X:0>3}: now {X:0>16} disk {X:0>16}\n", .{ j * 8, mem[j], disk[j] });
+            shown += 1;
+            if (shown == 12) break;
+        }
+        if (bad > 0) {
+            const pat = mem[first] ^ pmm.QUAR_MAGIC;
+            if (pat & 0xFFF == 0 and pat < (1 << 36))
+                serial.print("[pc-verify]   holds the quarantine fill of frame 0x{X}: freed while cached\n", .{pat});
+        }
+        if (@import("../debug/kdbg.zig").pmmFindLastFree(fp)) |ev| {
+            serial.print("[pc-verify]   last freed by ", .{});
+            if (symbols.resolveKernel(ev.caller_ra)) |r| serial.print("{s}+0x{X}", .{ r.name, r.offset }) else serial.print("0x{X}", .{ev.caller_ra});
+            serial.print(" tsc=0x{X}\n", .{ev.tsc});
+        } else {
+            serial.print("[pc-verify]   no free of this frame in the ring\n", .{});
+        }
+        @import("../mm/vmm.zig").reportUafFrame(fp);
+    }
+}
+
 /// Write one pinned dirty page of ext2 inode `inum` back and drop the pin;
 /// `size` is the file's. With `clear`, a page no mapping holds any more
 /// rejoins the evictable pool — or leaves the cache when it lies wholly past

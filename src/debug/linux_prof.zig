@@ -245,6 +245,14 @@ pub noinline fn dumpAndReset(label: []const u8) void {
     out("[lprof]   tlb shootdowns: {d} (peers left to their reload: {d})\n", .{ shoot -% last_shoot, lazy -% last_lazy });
     last_shoot = shoot;
     last_lazy = lazy;
+    out("[lprof]   tlb by mode since boot: full {d}, context {d}, page {d}, range {d}; hypercall {d}, refused {d}\n", .{
+        tlb.n_shootdowns_full,          tlb.n_shootdowns_context,         tlb.n_shootdowns_page,
+        tlb.n_shootdowns_range,         tlb.n_shootdowns_via_hypercall,   tlb.n_shootdowns_hypercall_failed,
+    });
+    const pcs = @import("../mm/page_cache.zig").statsSnapshot();
+    out("[lprof]   page cache since boot: {d} inserts, {d} hits, {d} evictions; {d} checksum checks, {d} pages found changed\n", .{
+        pcs.inserts, pcs.hits, pcs.evictions, pcs.verified, pcs.corrupt_seen,
+    });
     const bc = ext2_block.stats();
     out("[lprof]   ext2 cache: {d} buffers ({d} dirty), {d} hits, {d} misses, {d} blocks read, {d} blocks flushed in {d} commands\n", .{ bc.live, bc.dirty, bc.hits -% last_bc.hits, bc.misses -% last_bc.misses, bc.read_blocks -% last_bc.read_blocks, bc.flushed_blocks -% last_bc.flushed_blocks, bc.flush_cmds -% last_bc.flush_cmds });
     last_bc = bc;

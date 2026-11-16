@@ -199,7 +199,9 @@ pub fn DynIrqStub(comptime vec: u8) type {
     const vec_str = std.fmt.comptimePrint("{d}", .{vec});
     return struct {
         pub fn handler() callconv(.naked) void {
-            asm volatile ("pushq %%rax\n" ++
+            // cld: see isr_common_exc.
+            asm volatile ("cld\n" ++
+                    "pushq %%rax\n" ++
                     "pushq %%rcx\n" ++
                     "pushq %%rdx\n" ++
                     "pushq %%rdi\n" ++

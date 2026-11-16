@@ -314,6 +314,7 @@ inline fn pmmCanaryCheck(phys: usize, callsite: []const u8, alloc_ra: usize) voi
             }
         }
         if (!found) serial.print("[pmm-canary]   no freer event in ring for this phys (rotated out)\n", .{});
+        @import("vmm.zig").reportUafFrame(phys);
     }
 }
 
@@ -984,9 +985,11 @@ pub fn freeFrame(phys: Phys) void {
     @import("../debug/kdbg.zig").pmmFree(phys_addr, ra);
     @import("../debug/kasan.zig").poison(phys_addr, FRAME_SIZE, @import("../debug/kasan.zig").SHADOW_FREED);
     @import("../cpu/mmu/pcid.zig").reportIfLoaded(phys_addr, ra);
+    // Parked; the oldest parked frame is freed in its place.
+    const free_phys = quarantineSwap(phys_addr, ra) orelse return;
     // S5 canary: stamp self-referencing magic at offset 0. If anyone
     // writes to this frame while it's free, the next alloc detects it.
-    pmmCanaryWrite(phys_addr);
+    pmmCanaryWrite(free_phys);
 
     const irq_flags = saveAndDisableIrq();
     defer restoreIrq(irq_flags);
@@ -995,7 +998,7 @@ pub fn freeFrame(phys: Phys) void {
     if (cpu.pmm_cache_count < CACHE_SIZE) {
         // Hot path: just push onto the local cache. Bitmap stays "used" —
         // the frame is logically free but accounted to this CPU's magazine.
-        cpu.pmm_cache[cpu.pmm_cache_count] = phys_addr;
+        cpu.pmm_cache[cpu.pmm_cache_count] = free_phys;
         cpu.pmm_cache_count += 1;
         return;
     }
@@ -1016,8 +1019,65 @@ pub fn freeFrame(phys: Phys) void {
         if (freed > 0) _ = total_frames.fetchAdd(freed, .monotonic);
         h.release();
     }
-    cpu.pmm_cache[cpu.pmm_cache_count] = phys_addr;
+    cpu.pmm_cache[cpu.pmm_cache_count] = free_phys;
     cpu.pmm_cache_count += 1;
+}
+
+/// Freed frames wait here, oldest out first, before the allocator gets
+/// them: a write through a stale pointer or mapping lands in a frame nobody
+/// owns, and the check on the way out sees the whole page.
+const QUARANTINE = false;
+const QUAR_FRAMES: u32 = 8192;
+pub const QUAR_MAGIC: u64 = 0x5155415252414E54; // "QUARRANT"
+const QuarSlot = struct { phys: u64, ra: u64 };
+var quar: [QUAR_FRAMES]QuarSlot = undefined;
+var quar_len: u32 = 0; // (p:quar_lock)
+var quar_next: u32 = 0; // (p:quar_lock) oldest slot once full
+var quar_lock: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+
+/// Park `phys` (filled with its pattern) and return the frame to free in
+/// its place: the oldest parked one, checked, or null while filling up.
+fn quarantineSwap(phys: u64, ra: u64) ?u64 {
+    if (!QUARANTINE) return phys;
+    const page: [*]u64 = @ptrFromInt(@import("paging.zig").physToVirt(phys));
+    const pat = phys ^ QUAR_MAGIC;
+    for (0..512) |j| page[j] = pat;
+    var out: ?QuarSlot = null;
+    const flags = saveAndDisableIrq();
+    while (quar_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+    if (quar_len < QUAR_FRAMES) {
+        quar[quar_len] = .{ .phys = phys, .ra = ra };
+        quar_len += 1;
+    } else {
+        out = quar[quar_next];
+        quar[quar_next] = .{ .phys = phys, .ra = ra };
+        quar_next = (quar_next + 1) % QUAR_FRAMES;
+    }
+    quar_lock.store(0, .release);
+    restoreIrq(flags);
+    const o = out orelse return null;
+    quarantineCheck(o);
+    return o.phys;
+}
+
+fn quarantineCheck(s: QuarSlot) void {
+    const page: [*]const u64 = @ptrFromInt(@import("paging.zig").physToVirt(s.phys));
+    const pat = s.phys ^ QUAR_MAGIC;
+    var bad: u32 = 0;
+    var first: usize = 512;
+    for (0..512) |j| {
+        if (page[j] == pat) continue;
+        bad += 1;
+        if (first == 512) first = j;
+    }
+    if (bad == 0) return;
+    const serial = @import("../debug/serial.zig");
+    const symbols = @import("../debug/symbols.zig");
+    serial.print("[pmm-quar] !!! freed frame 0x{X} written: {d}/512 qwords, first at +0x{X}: {X} {X} {X} {X}; freed by ", .{
+        s.phys, bad, first * 8, page[first], page[@min(first + 1, 511)], page[@min(first + 2, 511)], page[@min(first + 3, 511)],
+    });
+    if (symbols.resolveKernel(s.ra)) |r| serial.print("{s}+0x{X}\n", .{ r.name, r.offset }) else serial.print("0x{X}\n", .{s.ra});
+    @import("vmm.zig").reportUafFrame(s.phys);
 }
 
 /// Free `count` contiguous frames starting at phys_addr. Single lock acquisition,

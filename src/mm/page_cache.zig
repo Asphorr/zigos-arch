@@ -47,7 +47,7 @@ pub const PAGE_SIZE: usize = 4096;
 // Pool size: a quarter of the frames free at boot, within these bounds — the
 // most RAM cached pages can hold. Only a page fault that runs out of frames
 // reclaims them, so the cache must leave room for everything else (large
-// contiguous allocations included). An entry is 40 bytes: about 0.3% of RAM.
+// contiguous allocations included). An entry is 48 bytes: about 0.3% of RAM.
 const MIN_ENTRIES: u32 = 2048;
 const MAX_ENTRIES: u32 = 1 << 20;
 
@@ -92,6 +92,33 @@ const Entry = struct {
     /// the last disk write. Never evicted; cleared by clearDirty* once no
     /// writable mapper remains.
     dirty: bool = false,
+    /// `sum` is the page's content checksum from when it was published;
+    /// cleared once the page may legitimately change (markDirty).
+    summed: bool = false,
+    sum: u64 = 0,
+};
+
+/// Check clean pages against their publish-time checksum: on every hit and
+/// in pgflushd's sweep. A mismatch is a write that bypassed the cache.
+pub const VERIFY = true;
+
+fn pageSum(frame: Phys) u64 {
+    const q = frame.toVirt().ptr([*]const u64);
+    var a: u64 = 0x9E3779B97F4A7C15;
+    var b: u64 = 0;
+    for (0..512) |i| {
+        a = (a ^ q[i]) *% 0xFF51AFD7ED558CCD;
+        b +%= q[i] ^ @as(u64, i);
+    }
+    return a ^ b;
+}
+
+/// A cached page found changed, pinned for vfs.reportCacheCorruption.
+pub const Corrupt = struct {
+    file_id: u64,
+    page_off: u64,
+    frame: Phys,
+    pinned: bool,
 };
 
 fn mix(x: u64) u64 {
@@ -126,6 +153,29 @@ const CacheState = struct {
     evictions: u64 = 0,
     full_skips: u64 = 0, // a page could not be cached: no entry free or evictable
     reclaimed: u64 = 0, // clean cache-only pages dropped under PMM pressure
+    verified: u64 = 0,
+    corrupt_seen: u64 = 0,
+    corrupt: [8]Corrupt = undefined,
+    n_corrupt: u32 = 0,
+
+    /// Report a clean page whose bytes no longer match its checksum, once.
+    fn verify(self: *CacheState, e: *Entry) void {
+        if (!VERIFY or !e.summed or e.dirty) return;
+        self.verified += 1;
+        if (pageSum(e.frame) == e.sum) return;
+        e.summed = false;
+        self.corrupt_seen += 1;
+        const refs = pmm.frameRefCount(e.frame);
+        const pid = @import("../cpu/smp.zig").currentPid() orelse 0;
+        @import("../debug/serial.zig").print("[pc-verify] !!! cached page changed: inode {d} off 0x{X} frame 0x{X} refs {d} (noticed by pid {d})\n", .{
+            e.file_id & 0xFFFF_FFFF, e.page_off, e.frame.raw(), refs, pid,
+        });
+        if (self.n_corrupt >= self.corrupt.len) return;
+        const pinned = refs >= 1 and refs < PIN_SATURATION;
+        if (pinned) pmm.acquireFrame(e.frame);
+        self.corrupt[self.n_corrupt] = .{ .file_id = e.file_id, .page_off = e.page_off, .frame = e.frame, .pinned = pinned };
+        self.n_corrupt += 1;
+    }
 
     fn keyHead(self: *CacheState, file_id: u64, page_off: u64) *u32 {
         const h = mix(file_id *% 0x9E3779B97F4A7C15 +% (page_off >> 12));
@@ -229,6 +279,8 @@ pub const Stats = struct {
     evictions: u64,
     full_skips: u64,
     reclaimed: u64,
+    verified: u64,
+    corrupt_seen: u64,
 };
 
 pub fn statsSnapshot() Stats {
@@ -241,6 +293,8 @@ pub fn statsSnapshot() Stats {
         .evictions = h.ptr.evictions,
         .full_skips = h.ptr.full_skips,
         .reclaimed = h.ptr.reclaimed,
+        .verified = h.ptr.verified,
+        .corrupt_seen = h.ptr.corrupt_seen,
     };
 }
 
@@ -343,6 +397,7 @@ pub fn pin(file_id: u64, page_off: u64) ?Phys {
             h.ptr.misses += 1;
             return null;
         }
+        h.ptr.verify(e);
         pmm.acquireFrame(e.frame); // 1 -> 2 (or N -> N+1); now un-evictable
         h.ptr.hits += 1;
         return e.frame;
@@ -411,6 +466,7 @@ pub fn insertFilled(file_id: u64, page_off: u64, frame: Phys) Inserted {
 
     if (h.ptr.find(file_id, page_off)) |e| {
         if (pmm.frameRefCount(e.frame) < PIN_SATURATION) {
+            h.ptr.verify(e);
             pmm.releaseFrame(frame); // discard our wasted fill (1 -> 0, freed)
             pmm.acquireFrame(e.frame);
             h.ptr.hits += 1;
@@ -420,10 +476,14 @@ pub fn insertFilled(file_id: u64, page_off: u64, frame: Phys) Inserted {
         return .{ .frame = frame, .cached = false, .saturated = true };
     }
 
-    _ = h.ptr.insert(file_id, page_off, frame) orelse {
+    const e = h.ptr.insert(file_id, page_off, frame) orelse {
         h.ptr.full_skips += 1;
         return .{ .frame = frame, .cached = false };
     };
+    if (VERIFY) {
+        e.sum = pageSum(frame);
+        e.summed = true;
+    }
     pmm.acquireFrame(frame); // 1 (cache's ref) -> 2 (+ the caller's)
     return .{ .frame = frame, .cached = true };
 }
@@ -528,7 +588,10 @@ pub fn invalidateFile(file_id: u64) u32 {
 pub fn markDirty(file_id: u64, page_off: u64) void {
     const h = cache.acquire();
     defer h.release();
-    if (h.ptr.find(file_id, page_off)) |e| e.dirty = true;
+    if (h.ptr.find(file_id, page_off)) |e| {
+        e.dirty = true;
+        e.summed = false;
+    }
 }
 
 pub const DirtyPage = struct {
@@ -689,6 +752,35 @@ pub fn clearDirtyRangeCacheOnly(file_id: u64, start_off: u64, len: u64) u32 {
     defer h.release();
     forRange(h.ptr, file_id, span.first, span.end, &clear);
     return clear.cleared;
+}
+
+/// Check every clean resident page against its checksum, SCAN_CHUNK entries
+/// per lock hold. Returns pages found changed so far (since boot).
+pub fn verifyAll() u64 {
+    if (!VERIFY) return 0;
+    var idx: u32 = 0;
+    while (true) {
+        const h = cache.acquire();
+        defer h.release();
+        const s = h.ptr;
+        if (idx >= s.high) return s.corrupt_seen;
+        const stop = @min(s.high, idx +| SCAN_CHUNK);
+        while (idx < stop) : (idx += 1) {
+            const e = &s.entries[idx];
+            if (e.valid) s.verify(e);
+        }
+    }
+}
+
+/// The next changed page verify() queued; its pin, if `pinned`, is the
+/// caller's to release.
+pub fn takeCorrupt() ?Corrupt {
+    const h = cache.acquire();
+    defer h.release();
+    const s = h.ptr;
+    if (s.n_corrupt == 0) return null;
+    s.n_corrupt -= 1;
+    return s.corrupt[s.n_corrupt];
 }
 
 /// Number of currently-resident pages.

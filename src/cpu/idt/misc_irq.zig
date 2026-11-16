@@ -67,7 +67,9 @@ pub fn sendEOI() void {
 // Alignment math at `call handleIRQ1`:
 //   CPU frame = 40, 9 GPRs = 72, FXSAVE = 512 → 624B ≡ 0 mod 16 ✓
 pub fn isr_irq1() callconv(.naked) void {
+    // cld: see isr_common_exc (the same in every stub below that calls Zig).
     asm volatile (
+        \\ cld
         \\ pushq %%rax
         \\ pushq %%rcx
         \\ pushq %%rdx
@@ -101,6 +103,7 @@ pub fn isr_irq1() callconv(.naked) void {
 // Alignment math: 40 + 72 + 512 = 624B ≡ 0 mod 16 ✓
 pub fn isr_irq12() callconv(.naked) void {
     asm volatile (
+        \\ cld
         \\ pushq %%rax
         \\ pushq %%rcx
         \\ pushq %%rdx
@@ -179,6 +182,7 @@ pub fn isr_pic15_spurious() callconv(.naked) void {
 // Alignment: 40 + 72 + 512 = 624B ≡ 0 mod 16 ✓
 pub fn isr_tlb_shootdown() callconv(.naked) void {
     asm volatile (
+        \\ cld
         \\ pushq %%rax
         \\ pushq %%rcx
         \\ pushq %%rdx
@@ -219,6 +223,7 @@ pub export fn isr_tlb_shootdown_align_panic() callconv(.c) noreturn {
 // log output.
 pub fn isr_pmi() callconv(.naked) void {
     asm volatile (
+        \\ cld
         \\ pushq %%rax
         \\ pushq %%rcx
         \\ pushq %%rdx

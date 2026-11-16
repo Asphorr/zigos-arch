@@ -754,6 +754,14 @@ fn bootTaskWithIrqs() callconv(.c) noreturn {
 
 pub fn panic(msg: []const u8, _: ?*std.builtin.StackTrace, ret_addr: ?usize) noreturn {
     asm volatile ("cli");
+    // One plain line first: the dump below can itself go wrong.
+    const cl = @import("cpu/smp.zig").myCpu();
+    serial.emergencyPrint("[panic-early] cpu{d} pid={d} ret=0x{X} rsp=0x{X} msg={s}\n", .{
+        cl.cpu_id, cl.current_pid orelse 0xFF, ret_addr orelse 0,
+        asm volatile ("movq %%rsp, %[ret]"
+            : [ret] "=r" (-> u64),
+        ), msg[0..@min(msg.len, 120)],
+    });
     // Publish crash to Hyper-V crash MSRs FIRST — five wrmsrs, no allocations,
     // no locks. On real Hyper-V the host surfaces these as a BugCheck entry
     // in Event Viewer (source: "Hyper-V-Hypervisor"), so the crash is
@@ -948,6 +956,8 @@ fn pgflushdEntry() callconv(.c) noreturn {
         sched.kernelSleepMs(PGFLUSH_INTERVAL_MS);
         _ = vfs.flushAllDirty();
         @import("fs/ext2/ext2.zig").sync();
+        _ = @import("mm/page_cache.zig").verifyAll();
+        vfs.reportCacheCorruption();
     }
 }
 
@@ -986,6 +996,7 @@ fn netdEntry() callconv(.c) noreturn {
 /// the poll against the desktop/app network paths. One-shot: a 24 h SLIRP lease
 /// needs no near-term renewal for this workload, so after it lands (or fails to)
 /// the task parks. On failure the static SLIRP defaults in net.zig stay in force.
+// ctx: lock-ok — dhcp.acquire takes a lease, not a lock
 fn dhcpdEntry() callconv(.c) noreturn {
     const dhcp = @import("net/dhcp.zig");
     const net = @import("net/net.zig");

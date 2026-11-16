@@ -149,6 +149,25 @@ const CASES = [_]Case{
         .needs = "/usr/bin/node",
         .once = true,
     },
+    // Three node fetches at once, round after round: the load that once
+    // broke the kernel.
+    .{
+        .path = "/bin/busybox",
+        .args = "sh /etc/nodestress.sh 10",
+        .timeout_ms = 900_000,
+        .optional = true,
+        .needs = "/etc/nodestress.sh",
+        .once = true,
+    },
+    // Claude Code from npm, started.
+    .{
+        .path = "/bin/busybox",
+        .args = "sh /etc/cctest.sh",
+        .timeout_ms = 1_000_000,
+        .optional = true,
+        .needs = "/etc/cctest.sh",
+        .once = true,
+    },
     // The official Zig compiler (static musl, 172 MB), stamped OSABI 3 and
     // written into ext2.img by hand.
     .{ .path = "/bin/zig", .args = "version", .timeout_ms = 120_000, .optional = true },
@@ -409,6 +428,7 @@ fn dumpTasks(waited: u32) void {
             id, pp.count, pp.readers, pp.writers, pp.blocked_reader_pid, pp.blocked_writer_pid,
         });
     }
+    @import("../net/net.zig").dumpTcp();
 }
 
 fn check(c: Case, run: u32) void {
