@@ -34,6 +34,7 @@ const process = @import("../../proc/process.zig");
 const pid_nr = @import("../../proc/pid_nr.zig");
 const vfs = @import("../../fs/vfs.zig");
 const file = @import("../../fs/file.zig");
+const lproc = @import("../../fs/lproc.zig");
 const common = @import("common.zig");
 const debug = @import("../../debug/debug.zig");
 const ext2_inode = @import("../../fs/ext2/inode.zig");
@@ -177,6 +178,8 @@ const SYS_removexattr: u32 = 197;
 const SYS_lremovexattr: u32 = 198;
 const SYS_fremovexattr: u32 = 199;
 const SYS_faccessat2: u32 = 439;
+const SYS_close_range: u32 = 436;
+const SYS_io_uring_setup: u32 = 425;
 const SYS_poll: u32 = 7;
 const SYS_pipe: u32 = 22;
 const SYS_dup: u32 = 32;
@@ -230,6 +233,8 @@ const F_SETFD: u64 = 2;
 const F_GETFL: u64 = 3;
 const F_SETFL: u64 = 4;
 const F_DUPFD_CLOEXEC: u64 = 1030;
+const F_SETPIPE_SZ: u64 = 1031;
+const F_GETPIPE_SZ: u64 = 1032;
 const FD_CLOEXEC: u64 = 1;
 const O_RDONLY: u64 = 0;
 const O_WRONLY: u64 = 1;
@@ -305,15 +310,39 @@ const IA32_FS_BASE: u32 = 0xC0000100;
 /// Linux iovec: { void *iov_base; size_t iov_len; } — 16 bytes, native order.
 const Iovec = extern struct { base: u64, len: u64 };
 
+/// The arguments of call `num` that are C ints and reach the kernel with
+/// whatever the caller left above bit 31: descriptors (a directory fd, the
+/// fd of mmap) and the three of socket. Bit N-1 is argument N.
+fn intArgs(num: u32) u8 {
+    return switch (num) {
+        0, 1, 3, 5, 8, 16...20, 32, 42...52, 54, 55, 72...75, 77, 78, 81, 91, 93, 138 => 0b1,
+        187, 190, 193, 196, 199, 217, 221, 232, 257...263, 267...269, 280, 281, 285, 288 => 0b1,
+        295, 296, 299, 306, 307, 327, 328, 332, 437, 439, 441 => 0b1,
+        33, 40, 292 => 0b11,
+        233, 264, 265, 316, 326 => 0b101,
+        266 => 0b10,
+        9 => 0b10000,
+        41, 53 => 0b111,
+        else => 0,
+    };
+}
+
+/// An int argument as Linux takes it: the low 32 bits, sign-extended.
+inline fn intArg(v: u64, is_int: bool) u64 {
+    if (!is_int) return v;
+    return @bitCast(@as(i64, @as(i32, @bitCast(@as(u32, @truncate(v))))));
+}
+
 /// Linux-personality syscall dispatch. `num` is RAX (the Linux syscall number);
 /// the six args are read from the frame in Linux register order
 /// (rdi, rsi, rdx, r10, r8, r9). Returns the Linux-ABI u64 (result or -errno).
 pub fn dispatch(num: u32, frame: *signals.SyscallFrame) u64 {
-    const a1 = frame.rdi;
-    const a2 = frame.rsi;
-    const a3 = frame.rdx;
+    const ints = intArgs(num);
+    const a1 = intArg(frame.rdi, ints & 0b1 != 0);
+    const a2 = intArg(frame.rsi, ints & 0b10 != 0);
+    const a3 = intArg(frame.rdx, ints & 0b100 != 0);
     const a4 = frame.r10;
-    const a5 = frame.r8;
+    const a5 = intArg(frame.r8, ints & 0b10000 != 0);
     const a6 = frame.r9;
 
     switch (num) {
@@ -344,6 +373,7 @@ pub fn dispatch(num: u32, frame: *signals.SyscallFrame) u64 {
         SYS_open => return linux_fs.openat(AT_FDCWD, a1, a2, a3),
         SYS_openat => return linux_fs.openat(a1, a2, a3, a4),
         SYS_close => return linux_fs.close(a1),
+        SYS_close_range => return linux_fs.closeRange(a1 & 0xFFFF_FFFF, a2 & 0xFFFF_FFFF, a3),
         SYS_fstat => return linux_fs.fstat(a1, a2),
         SYS_stat => return linux_fs.newfstatat(AT_FDCWD, a1, a2, 0),
         SYS_lstat => return linux_fs.newfstatat(AT_FDCWD, a1, a2, linux_fs.AT_SYMLINK_NOFOLLOW),
@@ -498,6 +528,8 @@ pub fn dispatch(num: u32, frame: *signals.SyscallFrame) u64 {
         SYS_setsid => return linux_proc.setsid(),
         // musl registers at its first pthread_create and does without.
         SYS_membarrier => return err(ENOSYS),
+        // libuv and Bun ask at every loop they start and fall back to epoll.
+        SYS_io_uring_setup => return err(ENOSYS),
         // Signals (linux_signal.zig). rt_sigreturn is taken before the
         // dispatch (doSyscall): it returns through a frame of its own.
         SYS_rt_sigaction => return linux_signal.rtSigaction(a1, a2, a3, a4),
@@ -531,6 +563,77 @@ pub fn dispatch(num: u32, frame: *signals.SyscallFrame) u64 {
             return err(ENOSYS);
         },
     }
+}
+
+/// The (call, errno) pairs already reported, `fail_count` of them.
+var fail_seen: [256]u32 = [_]u32{0} ** 256;
+var fail_count: u32 = 0;
+
+/// One line the first time a call fails with a given errno: what a program
+/// was refused. The everyday answers (no such file, interrupted, try again,
+/// not implemented, timed out, in progress) and the restart codes stay quiet.
+pub fn noteFailure(num: u32, frame: *const signals.SyscallFrame, done: u64) void {
+    const r: i64 = @bitCast(done);
+    if (r >= 0 or r < -511) return;
+    const e: u32 = @intCast(-r);
+    switch (e) {
+        2, 4, 11, 38, 110, 115 => return,
+        else => {},
+    }
+    const key = (num << 12) | e;
+    const n = @atomicLoad(u32, &fail_count, .monotonic);
+    if (n >= fail_seen.len) return;
+    for (fail_seen[0..n]) |k| {
+        if (k == key) return;
+    }
+    // Lost the slot to another CPU: the pair's next failure reports it.
+    if (@cmpxchgStrong(u32, &fail_count, n, n + 1, .monotonic, .monotonic) != null) return;
+    @atomicStore(u32, &fail_seen[n], key, .monotonic);
+    var buf: [256]u8 = undefined;
+    const path: []const u8 = switch (linux_fs.readPath(pathArg(num, frame), &buf, true)) {
+        .path => |p| p,
+        .fail => "",
+    };
+    debug.klog("[linux] pid={d} syscall {d} failed, errno {d} (a1=0x{X} a2=0x{X} a3=0x{X}){s}{s}{s}; once per call and errno\n", .{
+        process.getCurrentPid(), num, e, frame.rdi, frame.rsi, frame.rdx,
+        if (path.len != 0) " path '" else "", path, if (path.len != 0) "'" else "",
+    });
+}
+
+/// With /proc/sys/zigos/trace_paths on: a line for each call that names a
+/// file — the path, the result, and the text readlink answered with.
+pub fn tracePath(num: u32, frame: *const signals.SyscallFrame, done: u64) void {
+    if (!@atomicLoad(bool, &lproc.trace_paths, .monotonic)) return;
+    const va = pathArg(num, frame);
+    if (va == 0) return;
+    var buf: [256]u8 = undefined;
+    const path: []const u8 = switch (linux_fs.readPath(va, &buf, true)) {
+        .path => |p| p,
+        .fail => "?",
+    };
+    const r: i64 = @bitCast(done);
+    var link: []const u8 = "";
+    if ((num == 89 or num == 267) and r > 0) {
+        const at = if (num == 89) frame.rsi else frame.rdx;
+        const n: usize = @intCast(@min(r, 200));
+        if (common.validateUserPtr(at, n)) link = @as([*]const u8, @ptrFromInt(at))[0..n];
+    }
+    debug.klog("[path] pid={d} syscall {d} '{s}' a2=0x{X} a3=0x{X} = {d}{s}{s}{s}\n", .{
+        process.getCurrentPid(), num, path, frame.rsi, frame.rdx, r,
+        if (link.len != 0) " -> '" else "", link, if (link.len != 0) "'" else "",
+    });
+}
+
+/// The address of the path a call names a file by, 0 for a call that takes
+/// none: the first argument, or the one after a directory fd; for the two
+/// that make a symbolic link, the link's.
+fn pathArg(num: u32, frame: *const signals.SyscallFrame) u64 {
+    return switch (num) {
+        2, 4, 6, 21, 59, 76, 80, 82...87, 89, 90, 92, 94, 133, 137 => frame.rdi,
+        88, 257...260, 262...265, 267...269, 316, 332, 439 => frame.rsi,
+        266 => frame.rdx,
+        else => 0,
+    };
 }
 
 /// Most bytes one read or write moves, as Linux's MAX_RW_COUNT; vfs counts
@@ -622,6 +725,17 @@ fn isDirFd(pcb: *process.PCB, fd: u32) bool {
     return ext2_inode.isDir(&ino);
 }
 
+/// Why read() has nothing to do with ext2 fd `fd`: a directory (-EISDIR),
+/// or a file opened for writing only (-EBADF). Null for any other.
+fn readRefusal(pcb: *process.PCB, fd: u32) ?u64 {
+    const fe = file.get(pcb, fd) orelse return null;
+    defer file.put(fe);
+    if (fe.kind != .ext2) return null;
+    const ino = ext2_inode.readInode(fe.inode) orelse return null;
+    if (ext2_inode.isDir(&ino)) return err(EISDIR);
+    return if (fe.readable()) null else err(EBADF);
+}
+
 /// write(fd, buf, count). Delegates to the same vfs.write the native path
 /// uses. Returns the byte count on success; a faulting buffer is -EFAULT.
 fn sysWrite(fd: u32, buf_va: u64, count: u64) u64 {
@@ -637,7 +751,7 @@ fn sysWrite(fd: u32, buf_va: u64, count: u64) u64 {
 /// read(fd, buf, count). Delegates to vfs.read, which returns 0 at EOF.
 fn sysRead(fd: u32, buf_va: u64, count: u64) u64 {
     const pcb = proc() orelse return err(EFAULT);
-    if (isDirFd(pcb, fd)) return err(EISDIR);
+    if (readRefusal(pcb, fd)) |e| return e;
     const len = readLen(pcb, fd, count);
     if (len == 0) return 0;
     if (!common.validateUserPtrWrite(buf_va, len)) return err(EFAULT);
@@ -692,7 +806,7 @@ fn sysReadv(fd: u32, iov_va: u64, iovcnt: u64) u64 {
     const array_bytes = n * @sizeOf(Iovec);
     if (!common.validateUserPtr(iov_va, array_bytes)) return err(EFAULT);
     const pcb = proc() orelse return err(EFAULT);
-    if (isDirFd(pcb, fd)) return err(EISDIR);
+    if (readRefusal(pcb, fd)) |e| return e;
     const iov: [*]align(1) const Iovec = @ptrFromInt(iov_va);
     // readLen over the whole call; the segments draw on it in turn.
     var budget = readLen(pcb, fd, MAX_RW);
@@ -719,8 +833,8 @@ fn sysReadv(fd: u32, iov_va: u64, iovcnt: u64) u64 {
     return total;
 }
 
-/// fcntl(fd, cmd, arg): dups, the descriptor's and the file's flags, record
-/// locks (linux_fs.fcntlLock). Another command is logged and gets ENOSYS.
+/// fcntl(fd, cmd, arg): dups, the descriptor's and the file's flags, a
+/// pipe's capacity, record locks (linux_fs.fcntlLock). Another command is logged and gets ENOSYS.
 fn sysFcntl(fd: u32, cmd: u64, arg: u64) u64 {
     const pcb = proc() orelse return err(EFAULT);
     const fe = file.get(pcb, fd) orelse return err(EBADF);
@@ -747,6 +861,13 @@ fn sysFcntl(fd: u32, cmd: u64, arg: u64) u64 {
             fe.nonblock = arg & O_NONBLOCK != 0;
             fe.append = arg & O_APPEND != 0;
             break :blk 0;
+        },
+        // Every pipe has the one capacity: a request within it is granted
+        // as it stands, a larger one is over the limit.
+        F_GETPIPE_SZ, F_SETPIPE_SZ => blk: {
+            if (fe.kind != .pipe) break :blk err(EBADF);
+            const cap = @import("../../proc/pipe.zig").PIPE_BUF_SIZE;
+            break :blk if (cmd == F_SETPIPE_SZ and arg > cap) err(EPERM) else cap;
         },
         linux_fs.F_GETLK, linux_fs.F_SETLK, linux_fs.F_SETLKW, linux_fs.F_OFD_GETLK, linux_fs.F_OFD_SETLK, linux_fs.F_OFD_SETLKW => linux_fs.fcntlLock(pcb, fd, fe, cmd, arg),
         else => blk: {
@@ -833,6 +954,18 @@ fn positionedFile(pcb: *process.PCB, fd: u32, off: u64) union(enum) { file: *fil
 /// pread64(fd, buf, count, off): read at `off`; the fd offset stays put.
 fn sysPread(fd: u32, buf_va: u64, count: u64, off: u64) u64 {
     const pcb = proc() orelse return err(EFAULT);
+    // A /proc file has no size to read up to: its text, from any offset.
+    if (file.get(pcb, fd)) |pf| {
+        defer file.put(pf);
+        if (pf.kind == .lproc) {
+            if (@as(i64, @bitCast(off)) < 0) return err(EINVAL);
+            if (!pf.readable()) return err(EBADF);
+            const len = @min(rwLen(count), MAX_STREAM_READ);
+            if (len == 0) return 0;
+            if (!common.validateUserPtrWrite(buf_va, len)) return err(EFAULT);
+            return vfsResult(lproc.readAt(pf, off, @ptrFromInt(buf_va), len));
+        }
+    }
     const fe = switch (positionedFile(pcb, fd, off)) {
         .file => |f| f,
         .fail => |e| return e,

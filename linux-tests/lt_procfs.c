@@ -128,6 +128,18 @@ int main(int argc, char **argv) {
     CHECK(len > 0 && memchr(text, '=', (size_t)len) != NULL, "environ has the environment");
     CHECK(slurp("/proc/self/comm") > 0 && strncmp(text, "lt_procfs", 9) == 0, "comm");
 
+    // A positioned read: the text from any offset, the fd's own left alone.
+    int pfd = open("/proc/self/comm", O_RDONLY | O_CLOEXEC);
+    char at[16] = {0};
+    CHECK(pfd >= 0 && pread(pfd, at, 9, 0) == 9 && memcmp(at, "lt_procfs", 9) == 0, "pread from the start");
+    CHECK(pread(pfd, at, 6, 3) == 6 && memcmp(at, "procfs", 6) == 0, "pread from the middle");
+    CHECK(pread(pfd, at, 4, 4096) == 0, "pread past the end");
+    CHECK(read(pfd, at, 2) == 2 && memcmp(at, "lt", 2) == 0, "read starts at the fd's own offset");
+    int pdir = open("/proc/self", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    CHECK(pdir >= 0 && pread(pdir, at, 4, 0) < 0 && errno == EISDIR, "pread of a directory is EISDIR");
+    close(pdir);
+    close(pfd);
+
     // maps
     CHECK(slurp("/proc/self/maps") > 0, "read maps");
     CHECK(strstr(text, "[stack]") != NULL, "maps: the stack");
@@ -183,6 +195,85 @@ int main(int argc, char **argv) {
     fd = open("/proc/self/oom_score_adj", O_WRONLY);
     CHECK(fd >= 0 && write(fd, "0\n", 2) == 2, "oom_score_adj takes a write");
     close(fd);
+
+    // a name below a descriptor; the names fd/N gives: links replaced, a
+    // rename followed, a /proc file by its path
+    {
+        char dir[64], p2[128], to[128], got[160], five[8];
+        struct stat ls;
+        mkdir("/tmp", 01777);
+        snprintf(dir, sizeof dir, "/tmp/lt_procfs.%d", me);
+        CHECK(mkdir(dir, 0700) == 0, "a directory to work in");
+        int pin = open(dir, O_PATH | O_DIRECTORY | O_CLOEXEC);
+        CHECK(pin >= 0, "open it with O_PATH");
+        snprintf(p2, sizeof p2, "/proc/self/fd/%d/sub", pin);
+        CHECK(mkdir(p2, 0700) == 0, "mkdir below fd/N");
+        CHECK(lstat(p2, &ls) == 0 && S_ISDIR(ls.st_mode), "lstat below fd/N");
+        snprintf(p2, sizeof p2, "%s/sub", dir);
+        CHECK(stat(p2, &ls) == 0 && S_ISDIR(ls.st_mode), "it is in the directory");
+        snprintf(p2, sizeof p2, "/proc/self/fd/%d/sub/real", pin);
+        int wfd = open(p2, O_WRONLY | O_CREAT | O_EXCL, 0600);
+        CHECK(wfd >= 0 && write(wfd, "below", 5) == 5, "create a file below fd/N");
+        close(wfd);
+        snprintf(p2, sizeof p2, "%s/link", dir);
+        CHECK(symlink("sub/real", p2) == 0, "a link to the file");
+        snprintf(p2, sizeof p2, "%s/sub/../link", dir);
+        int rfd = open(p2, O_RDONLY);
+        CHECK(rfd >= 0, "open it through the link and ..");
+        snprintf(path, sizeof path, "/proc/self/fd/%d", rfd);
+        snprintf(to, sizeof to, "%s/sub/real", dir);
+        n = readlink(path, got, sizeof got - 1);
+        CHECK(n > 0 && (got[n] = 0, strcmp(got, to) == 0), "fd/N names what the link leads to");
+        snprintf(p2, sizeof p2, "/proc/self/fd/%d/x", rfd);
+        errno = 0;
+        CHECK(open(p2, O_RDONLY) == -1 && errno == ENOTDIR, "below a file's fd: ENOTDIR");
+        int again2 = open(path, O_RDONLY);
+        CHECK(again2 >= 0 && read(again2, five, sizeof five) == 5 && memcmp(five, "below", 5) == 0, "open fd/N reads the file");
+        close(again2);
+        snprintf(p2, sizeof p2, "%s/sub/real", dir);
+        snprintf(to, sizeof to, "%s/sub/moved", dir);
+        CHECK(rename(p2, to) == 0, "rename the file");
+        n = readlink(path, got, sizeof got - 1);
+        CHECK(n > 0 && (got[n] = 0, strcmp(got, to) == 0), "fd/N follows the rename");
+        CHECK(unlink(to) == 0, "unlink the file");
+        n = readlink(path, got, sizeof got - 1);
+        CHECK(n > 10 && (got[n] = 0, strcmp(got + n - 10, " (deleted)") == 0), "fd/N of a file with no name: (deleted)");
+        close(rfd);
+        snprintf(p2, sizeof p2, "/proc/self/fd/%d/link", pin);
+        CHECK(unlink(p2) == 0, "unlink below fd/N");
+        snprintf(p2, sizeof p2, "/proc/self/fd/%d/sub", pin);
+        CHECK(rmdir(p2) == 0, "rmdir below fd/N");
+        // a directory on the inode a file just had
+        snprintf(p2, sizeof p2, "%s/was", dir);
+        int tfd = open(p2, O_WRONLY | O_CREAT, 0600);
+        close(tfd);
+        CHECK(tfd >= 0 && unlink(p2) == 0, "a file made and removed");
+        snprintf(p2, sizeof p2, "%s/now", dir);
+        CHECK(mkdir(p2, 0700) == 0, "a directory after it");
+        int nfd = open(p2, O_PATH | O_DIRECTORY);
+        snprintf(path, sizeof path, "/proc/self/fd/%d", nfd);
+        n = readlink(path, got, sizeof got - 1);
+        CHECK(nfd >= 0 && n > 0 && (got[n] = 0, strcmp(got, p2) == 0), "fd/N of a new directory is its own path");
+        close(nfd);
+        CHECK(rmdir(p2) == 0, "remove it");
+        close(pin);
+        CHECK(rmdir(dir) == 0, "the directory is empty again");
+
+        int vfd = open("/proc/version", O_RDONLY | O_NOFOLLOW);
+        snprintf(path, sizeof path, "/proc/self/fd/%d", vfd);
+        n = readlink(path, got, sizeof got - 1);
+        CHECK(vfd >= 0 && n > 0 && (got[n] = 0, strcmp(got, "/proc/version") == 0), "fd/N of a /proc file is its path");
+        int v2 = open(path, O_RDONLY);
+        CHECK(v2 >= 0 && read(v2, five, 5) == 5 && memcmp(five, "Linux", 5) == 0, "open fd/N of a /proc file reads it");
+        close(v2);
+        close(vfd);
+        int cfd = open("/proc/self/comm", O_RDONLY);
+        snprintf(path, sizeof path, "/proc/self/fd/%d", cfd);
+        snprintf(want, sizeof want, "/proc/%d/comm", me);
+        n = readlink(path, got, sizeof got - 1);
+        CHECK(cfd >= 0 && n > 0 && (got[n] = 0, strcmp(got, want) == 0), "a process's file: under its number");
+        close(cfd);
+    }
 
     // the root lists this process; the system's files
     snprintf(want, sizeof want, "%d", me);

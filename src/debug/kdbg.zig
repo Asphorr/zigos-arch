@@ -1620,7 +1620,8 @@ fn printFlags(entry: u64) void {
     }
     const f0: u8 = 'P';
     const f1: u8 = if (entry & READ_WRITE != 0) 'W' else 'R';
-    const f2: u8 = if (entry & USER != 0) 'U' else 'k';
+    // 'n': a user page parked by PROT_NONE (paging.PARKED).
+    const f2: u8 = if (entry & USER != 0) 'U' else if (entry & (1 << 52) != 0) 'n' else 'k';
     const f3: u8 = if (entry & PAGE_SIZE_FLAG != 0) 'L' else '-';
     serial.print("{c}{c}{c}{c}", .{ f0, f1, f2, f3 });
 }
@@ -1716,10 +1717,11 @@ inline fn checkAligned(phys: u64) bool {
 /// The crash handler is in kernel mode but the user PD is still active, so
 /// dereferencing user pointers Just Works as long as the page is mapped.
 /// Defensive: bound depth, validate range, and stop on the first deref
-/// outside [USER_LO, USER_HI). Symbol resolution uses pcb.sym_table when
-/// available.
+/// outside [USER_LO, USER_HI) — a native program's stack and image; a Linux
+/// one keeps its stack far above and is not walked. Symbol resolution uses
+/// pcb.sym_table when available.
 pub fn walkUserStack(rbp_in: u64, app_syms: ?*symbols.SymTable) void {
-    const USER_LO: u64 = 0x400000;
+    const USER_LO: u64 = memmap.NATIVE_STACK_BOTTOM;
     const USER_HI: u64 = 0x10000000;
     serial.print("[kdbg] User stack (RBP chain):\n", .{});
     var rbp: u64 = rbp_in;

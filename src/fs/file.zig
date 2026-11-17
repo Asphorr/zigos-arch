@@ -102,6 +102,9 @@ pub const File = struct {
     fat_cluster: u32 = 0,
     fat_cluster_off: u32 = 0,
     fat_dir_cluster: u32 = 0,
+    /// ext2: the directory a Linux program opened the file in, 0 when not
+    /// known. /proc names the open file by it (fd/N).
+    dir_inode: u32 = 0,
     /// (p:unreleased_lock) The next file awaiting its release (reap).
     next_unreleased: ?*File = null,
 

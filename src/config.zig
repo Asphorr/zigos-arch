@@ -26,7 +26,9 @@ pub const KSTACK_SLOT_SIZE: usize = KSTACK_SIZE + KSTACK_GUARD_SIZE;
 
 // --- Pipes ---
 pub const MAX_PIPES: u8 = 64;
-pub const PIPE_BUF_SIZE: u32 = 4096;
+/// Linux's pipe capacity: bash writes a here-document this long into a pipe
+/// nobody reads yet.
+pub const PIPE_BUF_SIZE: u32 = 65536;
 
 // --- Desktop / windowing ---
 pub const MAX_WINDOWS: u32 = 32;

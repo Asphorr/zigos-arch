@@ -627,6 +627,61 @@ static void check_locks(void) {
     CHECK(unlink(name) == 0, "unlink the locked file");
 }
 
+// A directory of several blocks, every name in it replaced by rename, as a
+// package manager lays its files down: each name is there afterwards.
+static void check_wide_directory(void) {
+    enum { N = 300 };
+    char from[128], to[128];
+    remove_tree(AT_FDCWD, "/ltwide");
+    CHECK(mkdir("/ltwide", 0755) == 0, "mkdir /ltwide");
+    int made = 0;
+    for (int i = 0; i < N; i++) {
+        snprintf(from, sizeof from, "/ltwide/.tmp.%048d", i);
+        int fd = open(from, O_CREAT | O_WRONLY | O_EXCL, 0644);
+        if (fd < 0) break;
+        made += write(fd, &i, sizeof i) == sizeof i;
+        close(fd);
+    }
+    CHECK(made == N, "a directory takes 300 long names");
+    int moved = 0;
+    for (int i = 0; i < N; i++) {
+        snprintf(from, sizeof from, "/ltwide/.tmp.%048d", i);
+        snprintf(to, sizeof to, "/ltwide/f%d.h", i);
+        moved += rename(from, to) == 0;
+    }
+    CHECK(moved == N, "each of them renames to a short name");
+    int d = open("/ltwide", O_RDONLY | O_DIRECTORY);
+    CHECK(d >= 0 && count_entries(d) == N + 2, "the directory lists them all");
+    int right = 0;
+    for (int i = 0; i < N; i++) {
+        int got = -1;
+        snprintf(to, sizeof to, "f%d.h", i);
+        int fd = openat(d, to, O_RDONLY);
+        if (fd < 0) continue;
+        right += read(fd, &got, sizeof got) == sizeof got && got == i;
+        close(fd);
+    }
+    CHECK(right == N, "each holds what was written under its first name");
+    // Every other name goes, then as many new ones come: the freed room is used.
+    int gone = 0;
+    for (int i = 0; i < N; i += 2) {
+        snprintf(to, sizeof to, "f%d.h", i);
+        gone += unlinkat(d, to, 0) == 0;
+    }
+    made = 0;
+    for (int i = 0; i < N; i += 2) {
+        snprintf(to, sizeof to, "again_%d.txt", i);
+        int fd = openat(d, to, O_CREAT | O_WRONLY | O_EXCL, 0644);
+        made += fd >= 0;
+        if (fd >= 0) close(fd);
+    }
+    CHECK(gone == N / 2 && made == N / 2 && count_entries(d) == N + 2, "names freed and taken again leave the count right");
+    close(d);
+    remove_tree(AT_FDCWD, "/ltwide");
+    errno = 0;
+    CHECK(access("/ltwide", F_OK) == -1 && errno == ENOENT, "the wide directory is removed whole");
+}
+
 int main(void) {
     remove_tree(AT_FDCWD, ROOT);
     CHECK(mkdir(ROOT, 0755) == 0, "mkdir " ROOT);
@@ -788,6 +843,7 @@ int main(void) {
     check_links();
     check_locks();
     check_modes();
+    check_wide_directory();
 
     printf("lt_fs: PASS (%d checks)\n", check_no);
     return 0;

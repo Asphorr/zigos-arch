@@ -97,14 +97,15 @@ fn mapShmPage(pd: [*]align(4096) u64, r: process.LazyRegion, va_aligned: usize) 
         debug.klog("[shm] frameAt miss id={d} pi={d} on fault — region torn down?\n", .{ r.shm_id, page_idx });
         return false;
     };
-    vmm.mapUserPage(pd, va_aligned, phys, vmm.protToMapFlags(r.prot)) catch |e| {
+    const installed = vmm.installUserPage(pd, va_aligned, phys, vmm.protToMapFlags(r.prot)) catch |e| {
         if (e == error.AlreadyMapped) return true;
         debug.klog("[shm] mapUserPage failed va=0x{X} phys=0x{X} err={s}\n", .{ va_aligned, phys.raw(), @errorName(e) });
         return false;
     };
     // Frame refcount = N attachers + 1 shm-owned: destroyAddressSpace frees
     // present leaves, munmap drops the attacher ref, shm.release the +1.
-    pmm.acquireFrame(phys);
+    // One ref per mapping: a page already there has its own.
+    if (installed) pmm.acquireFrame(phys);
     return true;
 }
 
@@ -338,13 +339,15 @@ fn faultInCachePage(pd: [*]align(4096) u64, r: process.LazyRegion, va_aligned: u
     // diverges into a private copy (the cache's own ref keeps refcount >= 2, so
     // handleCowFault always copies and never steals the shared page).
     const map_flags = if (r.cache_shared) vmm.protToMapFlags(r.prot) else vmm.cacheMapFlags(r.prot);
-    vmm.mapUserPage(pd, va_aligned, phys, map_flags) catch |e| {
+    const installed = vmm.installUserPage(pd, va_aligned, phys, map_flags) catch |e| {
         pmm.freeFrame(phys); // release the mapper ref we took above
         // AlreadyMapped: another CPU faulted this exact page first — it's mapped
         // now, so the fault is resolved (that CPU's fault flagged it dirty if
         // shared). Any other error is a real failure.
         return if (e == error.AlreadyMapped) .mapped else .failed;
     };
+    // The same frame mapped here already holds its mapper ref: ours goes back.
+    if (!installed) pmm.freeFrame(phys);
     // Shared writable page: flag it dirty for writeback. Coarse by design — even a
     // read-faulted page is marked, because with a direct RW mapping a later write
     // won't re-fault to mark it. Cost is re-persisting unchanged pages, never loss.
@@ -374,10 +377,11 @@ fn tryMapCachedPage(pd: [*]align(4096) u64, r: process.LazyRegion, va_aligned: u
     // frame, NOT a COW copy) and flag dirty. Private: RO + COW (caller breaks COW
     // for its write into a private page). See faultInCachePage for the rationale.
     const map_flags = if (r.cache_shared) vmm.protToMapFlags(r.prot) else vmm.cacheMapFlags(r.prot);
-    vmm.mapUserPage(pd, va_aligned, phys, map_flags) catch |e| {
+    const installed = vmm.installUserPage(pd, va_aligned, phys, map_flags) catch |e| {
         pmm.freeFrame(phys);
         return e == error.AlreadyMapped;
     };
+    if (!installed) pmm.freeFrame(phys);
     if (r.cache_shared) page_cache.markDirty(file_id, page_off);
     asm volatile ("invlpg (%[addr])"
         :
@@ -624,7 +628,8 @@ fn reclaimViaSwap(pml4: [*]align(4096) u64, lead: *PCB, skip_va: usize, pcid: u1
         // silently lose writeback tracking. (Private pages were already skipped
         // below via the COW-bit gate; shared pages are RW with no COW bit, so they
         // need this explicit skip.) Page-cache reclaim — not swap — handles these.
-        // A PROT_NONE reserve has no pages at all. Either way, skip the region
+        // A PROT_NONE region has no pages, or parked ones a swap-in could not
+        // bring back (its faults are refused). Either way, skip the region
         // whole: a page-by-page walk of a big one would use up ITER_CAP and
         // report nothing reclaimable.
         if (region_is_cache or r.prot == 0) {
@@ -791,11 +796,9 @@ fn trySwapInPage(pd: [*]align(4096) u64, lead: *PCB, va: usize, prot: u8, pcid: 
 }
 
 pub fn handleUserPageFault(cr2: usize, error_code: u64) bool {
-    // Must be user-mode access (U=1, bit 2). Both non-present (P=0) and
-    // protection violations (P=1) are valid lazy-fault triggers — the
-    // latter happens because createAddressSpace strips USER from inherited
-    // kernel-identity pages, so user access hits "present but no USER" PT
-    // entries until we replace them with a fresh USER-bit mapping below.
+    // Must be user-mode access (U=1, bit 2). Non-present (P=0) is the lazy
+    // fault; a protection violation (P=1) is copy-on-write, a stale entry
+    // or a refusal. A present leaf with no USER is a parked page.
     if ((error_code & 4) == 0) return false;
     // Re-enable IRQs. #PF entered via interrupt gate (IF=0), but cr2 and
     // error_code are already in registers, so we won't lose them on a nested
@@ -848,6 +851,7 @@ const FaultResult = enum { handled, unhandled, oom_kill };
 
 /// handleUserPageFault's body, under the read side of `lead.as_lock`.
 fn resolveFault(cur: usize, pcb: *PCB, pd: [*]align(4096) u64, lead: *PCB, cr2: usize, error_code: u64) FaultResult {
+    const paging = @import("../mm/paging.zig");
     // COW path: write fault on a present user page (P=1, W=1, U=1). Walk the
     // PT and dispatch handleCowFault if the PTE has the COW software bit set.
     // Lazy-region faults are P=0 (non-present); COW faults are P=1 and W=1.
@@ -866,7 +870,6 @@ fn resolveFault(cur: usize, pcb: *PCB, pd: [*]align(4096) u64, lead: *PCB, cr2: 
         // at 255. Returning false routes to the #PF→SIGSEGV path (idt/
         // exception.zig, si_code SEGV_ACCERR) — the correct answer for writing
         // read-only memory.
-        const paging = @import("../mm/paging.zig");
         if (findUserPte(pd, cr2 & ~@as(usize, 0xFFF))) |pte_ptr| {
             const pte = pte_ptr.*;
             if ((pte & paging.PRESENT) != 0 and (pte & paging.READ_WRITE) == 0) return .unhandled;
@@ -897,6 +900,31 @@ fn resolveFault(cur: usize, pcb: *PCB, pd: [*]align(4096) u64, lead: *PCB, cr2: 
     // PROT_NONE reserves the range; no page may appear in it.
     if (r.prot == 0) return .unhandled;
     const va_aligned = cr2 & ~@as(usize, 0xFFF);
+
+    // A protection fault on a present leaf has nothing to bring in: lazy
+    // resolution would call it resolved and take the same fault forever,
+    // pinning a shared frame once more each time. What the PTE allows was a
+    // stale entry on this CPU; the rest is refused (a fetch from an NX page,
+    // a reserved-bit or PK fault).
+    if (error_code & 1 != 0) {
+        if (findUserPte(pd, va_aligned)) |pte_ptr| {
+            const pte = @atomicLoad(u64, pte_ptr, .acquire);
+            if (pte & paging.PRESENT != 0) {
+                const plain = error_code & 0xFFFF & ~@as(u64, 0x17) == 0;
+                const allowed = pte & paging.USER != 0 and
+                    (error_code & 0x2 == 0 or pte & paging.READ_WRITE != 0) and
+                    (error_code & 0x10 == 0 or pte & vmm.NX == 0);
+                if (!plain or !allowed) return .unhandled;
+                asm volatile ("invlpg (%[addr])"
+                    :
+                    : [addr] "r" (cr2),
+                    : .{ .memory = true }
+                );
+                @import("../debug/kdbg.zig").pfEvent(@intCast(cur), cr2, @truncate(error_code), 0, true);
+                return .handled;
+            }
+        }
+    }
 
     // Shared-anon: no swap, no fresh alloc — the shm registry owns the
     // frame; refcounts move in forkCurrent/munmap/tearDown.
@@ -1297,6 +1325,10 @@ fn ensureUserRangeFor(owner_pcb: *process.PCB, va: usize, len: usize, need_write
     const end_excl = va +% len;
     while (p < end_excl) : (p += 0x1000) {
         if (vmm.resolveUserPhys(pd, p) != null) {
+            // Parked by PROT_NONE: not the kernel's to touch for the
+            // program either.
+            const leaf = findUserPte(pd, p) orelse return false;
+            if (leaf.* & paging.USER == 0) return false;
             if (need_write) {
                 breakCow(pd, lead, p);
                 const pte_ptr = findUserPte(pd, p) orelse return false;

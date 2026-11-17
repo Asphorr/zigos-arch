@@ -9,12 +9,15 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <setjmp.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #ifndef MAP_FIXED_NOREPLACE
@@ -46,6 +49,46 @@ static int filled(const unsigned char *p, size_t len, unsigned char v) {
     for (size_t i = 0; i < len; i += PG)
         if (p[i] != v) return 0;
     return 1;
+}
+
+static sigjmp_buf fault_jmp;
+
+static void on_fault(int sig) {
+    (void)sig;
+    siglongjmp(fault_jmp, 1);
+}
+
+// 1 when reading (or, with `wr`, writing) *p raises SIGSEGV.
+static int faults(volatile unsigned char *p, int wr) {
+    struct sigaction sa, old;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_fault;
+    sigaction(SIGSEGV, &sa, &old);
+    int hit = 1;
+    if (sigsetjmp(fault_jmp, 1) == 0) {
+        if (wr)
+            *p = *p;
+        else
+            (void)*p;
+        hit = 0;
+    }
+    sigaction(SIGSEGV, &old, NULL);
+    return hit;
+}
+
+// 1 when calling the code at p raises SIGSEGV.
+static int call_faults(unsigned char *p) {
+    struct sigaction sa, old;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_fault;
+    sigaction(SIGSEGV, &sa, &old);
+    int hit = 1;
+    if (sigsetjmp(fault_jmp, 1) == 0) {
+        ((void (*)(void))p)();
+        hit = 0;
+    }
+    sigaction(SIGSEGV, &old, NULL);
+    return hit;
 }
 
 int main(void) {
@@ -89,8 +132,29 @@ int main(void) {
     fill(a, 16 * PG, 0x77);
     CHECK(madvise(a + 2 * PG, 2 * PG, MADV_DONTNEED) == 0, "madvise DONTNEED");
     CHECK(filled(a + 2 * PG, 2 * PG, 0) && filled(a, 2 * PG, 0x77) && filled(a + 4 * PG, 12 * PG, 0x77), "DONTNEED zeroed only its range");
+    errno = 0;
+    CHECK(madvise(a, PG, 9999) == -1 && errno == EINVAL, "madvise refuses advice it does not know");
 
     CHECK(munmap(a, 16 * PG) == 0, "munmap all");
+
+    // /dev/zero maps as anonymous memory does: private pages of one's own,
+    // shared ones a child's write shows up in.
+    int zfd = open("/dev/zero", O_RDWR);
+    CHECK(zfd >= 0, "open /dev/zero");
+    unsigned char *z = mmap(NULL, 2 * PG, PROT_READ | PROT_WRITE, MAP_PRIVATE, zfd, 0);
+    CHECK(z != MAP_FAILED && filled(z, 2 * PG, 0), "private /dev/zero mapping reads zero");
+    z[0] = 9;
+    CHECK(z[0] == 9 && munmap(z, 2 * PG) == 0, "and takes a write");
+    z = mmap(NULL, PG, PROT_READ | PROT_WRITE, MAP_SHARED, zfd, 0);
+    CHECK(z != MAP_FAILED && z[0] == 0, "shared /dev/zero mapping");
+    pid_t zc = fork();
+    if (zc == 0) {
+        z[0] = 7;
+        _exit(0);
+    }
+    CHECK(zc > 0 && waitpid(zc, NULL, 0) == zc && z[0] == 7, "a child's write to it is seen");
+    munmap(z, PG);
+    close(zfd);
 
     // A free hint is honored.
     unsigned char *probe = map(NULL, 4 * PG, PROT_READ | PROT_WRITE, 0);
@@ -252,6 +316,73 @@ int main(void) {
         CHECK(pthread_attr_getstack(&attr, &stack_addr, &stack_size) == 0 && stack_size >= 64 * 1024 &&
                   stack_size <= ((size_t)1 << 30), "the main stack has a sane size");
         pthread_attr_destroy(&attr);
+    }
+
+    // PROT_NONE over pages already there: no access reaches them, from the
+    // program or through the kernel, and they come back as they were.
+    {
+        unsigned char *n = map(NULL, 4 * PG, PROT_READ | PROT_WRITE, 0);
+        CHECK(n != MAP_FAILED, "mmap for PROT_NONE");
+        fill(n, 4 * PG, 0x6B);
+        CHECK(mprotect(n + PG, 2 * PG, PROT_NONE) == 0, "PROT_NONE over two touched pages");
+        CHECK(faults(n + PG, 0) && faults(n + 2 * PG, 1), "a read and a write of them fault");
+        CHECK(!faults(n, 0) && !faults(n + 3 * PG, 1) && n[3 * PG] == 0x6B, "the neighbors do not");
+        int pp[2];
+        CHECK(pipe(pp) == 0, "pipe");
+        errno = 0;
+        CHECK(write(pp[1], n + PG, 16) == -1 && errno == EFAULT, "write() from them is EFAULT");
+        errno = 0;
+        CHECK(write(pp[1], "x", 1) == 1 && read(pp[0], n + 2 * PG, 1) == -1 && errno == EFAULT, "read() into them is EFAULT");
+        close(pp[0]);
+        close(pp[1]);
+        CHECK(mprotect(n + PG, 2 * PG, PROT_READ) == 0, "back to read-only");
+        CHECK(filled(n, 4 * PG, 0x6B) && faults(n + PG, 1), "the bytes are there, and a write still faults");
+        CHECK(mprotect(n + PG, PG, PROT_NONE) == 0 && munmap(n, 4 * PG) == 0, "unmap with a page held by PROT_NONE");
+    }
+
+    // A page that was read-only (or PROT_NONE) at fork and is made writable
+    // after: each side still has its own.
+    {
+        unsigned char *s = map(NULL, 2 * PG, PROT_READ | PROT_WRITE, 0);
+        CHECK(s != MAP_FAILED, "mmap for fork");
+        fill(s, 2 * PG, 0x41);
+        CHECK(mprotect(s, PG, PROT_READ) == 0 && mprotect(s + PG, PG, PROT_NONE) == 0, "one page read-only, one PROT_NONE");
+        int go[2], done[2];
+        CHECK(pipe(go) == 0 && pipe(done) == 0, "pipes");
+        pid_t kid = fork();
+        CHECK(kid >= 0, "fork");
+        if (kid == 0) {
+            char c;
+            if (read(go[0], &c, 1) != 1) _exit(10);
+            if (mprotect(s, 2 * PG, PROT_READ | PROT_WRITE) != 0) _exit(11);
+            if (s[0] != 0x41 || s[PG] != 0x41) _exit(12); // the parent's 0x42 reached us
+            s[0] = s[PG] = 0x43;
+            if (write(done[1], "k", 1) != 1) _exit(13);
+            if (read(go[0], &c, 1) != 1) _exit(14);
+            _exit(0);
+        }
+        CHECK(mprotect(s, 2 * PG, PROT_READ | PROT_WRITE) == 0, "writable again in the parent");
+        s[0] = s[PG] = 0x42;
+        char c;
+        CHECK(write(go[1], "p", 1) == 1 && read(done[0], &c, 1) == 1, "the child looked and wrote");
+        CHECK(s[0] == 0x42 && s[PG] == 0x42, "the child's writes stayed in the child");
+        int st = -1;
+        CHECK(write(go[1], "p", 1) == 1 && waitpid(kid, &st, 0) == kid && WIFEXITED(st) && WEXITSTATUS(st) == 0,
+              "the child saw its own copy");
+        close(go[0]), close(go[1]), close(done[0]), close(done[1]);
+        CHECK(munmap(s, 2 * PG) == 0, "unmap after the fork");
+    }
+
+    // Code runs only from a page that allows it: a call into a data page,
+    // private or shared, is SIGSEGV, and returns once mprotect allows it.
+    {
+        unsigned char *x = map(NULL, PG, PROT_READ | PROT_WRITE, 0);
+        unsigned char *sh = mmap(NULL, PG, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+        CHECK(x != MAP_FAILED && sh != MAP_FAILED, "mmap for a call");
+        x[0] = sh[0] = 0xC3; // ret
+        CHECK(call_faults(x) && call_faults(sh), "a call into a data page faults");
+        CHECK(mprotect(x, PG, PROT_READ | PROT_EXEC) == 0 && !call_faults(x), "and returns once the page is executable");
+        CHECK(munmap(x, PG) == 0 && munmap(sh, PG) == 0, "unmap after the call");
     }
 
     printf("lt_mm: PASS (%d checks)\n", check_no);

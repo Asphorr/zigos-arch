@@ -370,7 +370,13 @@ pub const PCB = struct {
     // exits, killProcess/destroyCurrent looks for procs[parent_pid] with a
     // matching wait_kind == .waitpid and wakes it.
     parent_pid: u8 = 0, // (c) set at create/fork
-    // Exit status reported via sysWaitpid. Valid only when state == .zombie.
+    // True once the parent ended first: nobody waits for this process, so
+    // it is freed as it ends. parent_pid then names the slot getppid shows.
+    orphan: bool = false, // (a) the dying parent sets it
+    // The teardown is over: exit_status stands and the zombie may be
+    // reaped. A killed task is a zombie from the start of its teardown.
+    exit_done: bool = false, // (a) set before the last .zombie
+    // Exit status reported via sysWaitpid. Valid once exit_done.
     exit_status: u32 = 0,
     // Generic blocking primitive (used by waitpid + pipe.read/write).
     // Scheduler skips PCBs with wait_kind != .none.
@@ -391,6 +397,10 @@ pub const PCB = struct {
     // Currently blocked signals (sigprocmask). Signals marked pending while
     // blocked stay pending until unblocked, then deliver in numeric order.
     signal_mask: u64 = 0,
+    // Signals this thread is in rt_sigtimedwait for, 0 outside one. A
+    // signal of the set sent meanwhile is the wait's to take: its default
+    // does not end the process.
+    sigwait_set: u64 = 0, // (a) the thread writes, senders read
     // Per-signal disposition. Default = all SIG_DFL with empty mask/flags;
     // signals.zig consults default_actions[] to decide what SIG_DFL means
     // for each signal (term, core, ignore, stop, cont). A Linux process's
@@ -491,6 +501,9 @@ pub const PCB = struct {
     // The full user VA a .futex waiter sleeps on (wait_target holds its low
     // 32 bits). Stored before setWait publishes the wait.
     futex_addr: usize = 0, // (a)
+    // What backs the word of that wait when processes share its memory
+    // (futex_addr is then the offset in it); 0 for a word in private memory.
+    futex_obj: u64 = 0, // (a)
     // Per-thread snapshot of `per_cpu_user_rsp[cpu]`. The syscall entry
     // stub stashes the user RSP into the per-CPU slot; if this thread is
     // preempted mid-syscall and another thread on the same CPU enters its
@@ -604,6 +617,12 @@ pub const PCB = struct {
     /// aligned u64 loads are atomic at the ISA level; snapshot may miss
     /// <1 tick — acceptable for human display).
     acct_cpu_ticks: u64 = 0,
+    /// Ticks this task was on a CPU, summed slice by slice as it comes off
+    /// (sched.accountRunningTick): the CPU time Linux clocks report. It
+    /// needs no timer fire, which a CPU with one runnable task has few of.
+    acct_run_ticks: u64 = 0, // (p:rq.lock) the CPU it runs on
+    /// On a lead: acct_run_ticks of the group's threads that ended.
+    ended_run_ticks: u64 = 0, // under sched.zig's cpu_fold_lock
     /// Page faults serviced for this PCB (user-mode). Includes lazy
     /// region fault-ins, NOT supervisor-mode kernel faults.
     acct_pf_count: u32 = 0,
@@ -1173,7 +1192,11 @@ pub const enterFirstTaskAp = @import("sched.zig").enterFirstTaskAp;
 pub const blockOn = @import("sched.zig").blockOn;
 pub const blockOnInterruptible = @import("sched.zig").blockOnInterruptible;
 pub const blockOnFutex = @import("sched.zig").blockOnFutex;
+pub const blockOnFutexAt = @import("sched.zig").blockOnFutexAt;
+pub const cpuTicksOf = @import("sched.zig").cpuTicksOf;
+pub const groupCpuTicks = @import("sched.zig").groupCpuTicks;
 pub const wakeFutex = @import("sched.zig").wakeFutex;
+pub const wakeFutexAt = @import("sched.zig").wakeFutexAt;
 pub const blockOnMutex = @import("sched.zig").blockOnMutex;
 pub const blockOnLockSeq = @import("sched.zig").blockOnLockSeq;
 pub const blockOnSwapEvict = @import("sched.zig").blockOnSwapEvict;
@@ -1218,6 +1241,8 @@ pub const destroyCurrentWithStatus = @import("lifecycle.zig").destroyCurrentWith
 pub const destroyCurrentGraceful = @import("lifecycle.zig").destroyCurrentGraceful;
 pub const destroyCurrent = @import("lifecycle.zig").destroyCurrent;
 pub const reapZombie = @import("lifecycle.zig").reapZombie;
+pub const reapZombieOf = @import("lifecycle.zig").reapZombieOf;
+pub const hasEnded = @import("lifecycle.zig").hasEnded;
 pub const findZombieChild = @import("lifecycle.zig").findZombieChild;
 // Internal-only helpers (allocSlot, resetPcbExceptState, kernelIdle,
 // waitForPidOffCpu, closePipeFds, parentIsWaiting, TerminateOp,

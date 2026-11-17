@@ -21,6 +21,7 @@ const time = @import("../../time/time.zig");
 const common = @import("common.zig");
 const linux_time = @import("linux_time.zig");
 const lprof = @import("../../debug/linux_prof.zig");
+const shm = @import("../../mm/shm.zig");
 
 // Linux errno.
 const EPERM: i64 = 1;
@@ -132,7 +133,10 @@ pub fn exitThread(code: u64) u64 {
         me.clear_child_tid = 0;
         if (tidWordOk(tid_word)) {
             @atomicStore(u32, @as(*u32, @ptrFromInt(tid_word)), 0, .release);
-            _ = process.wakeFutex(me.tgid, tid_word, 1);
+            // A joiner may wait without FUTEX_PRIVATE_FLAG, on a word in
+            // shared memory.
+            const at = futexAt(me, tid_word, false);
+            _ = process.wakeFutexAt(at.obj, me.tgid, at.off, 1);
         }
     }
     process.destroyCurrentGraceful(@truncate(code & 0xFF));
@@ -168,12 +172,35 @@ fn deadlineAfter(ns: u64) u64 {
     return process.tick_count +| ticks +| 1;
 }
 
+/// Where a futex word is, for a wake to find its waiters. `obj` 0: at VA
+/// `off` of the caller's process. Else `off` is its place in what backs
+/// memory that processes share, the same in each of them.
+const FutexAt = struct { obj: u64, off: usize };
+
+const SHARED_ANON: u64 = 1 << 32;
+const SHARED_FILE: u64 = 2 << 32;
+
+/// The word at `uaddr`. Without FUTEX_PRIVATE_FLAG it may lie in a shared
+/// mapping: the region says which, under the read side of the map.
+fn futexAt(me: *process.PCB, uaddr: u64, private: bool) FutexAt {
+    if (private) return .{ .obj = 0, .off = uaddr };
+    const lead = process.leader(me);
+    lead.as_lock.acquireRead();
+    defer lead.as_lock.releaseRead();
+    const r = lead.regions.find(uaddr) orelse return .{ .obj = 0, .off = uaddr };
+    const in = uaddr - r.start;
+    if (r.shm_id != shm.SHM_INVALID) return .{ .obj = SHARED_ANON | r.shm_id, .off = in };
+    if (r.cache_inode != 0 and r.cache_shared) return .{ .obj = SHARED_FILE | r.cache_inode, .off = r.cache_off + in };
+    return .{ .obj = 0, .off = uaddr };
+}
+
 /// futex(uaddr, op, val, timeout | val2, uaddr2, val3).
 pub fn futex(uaddr: u64, op: u64, val: u64, timeout: u64, uaddr2: u64, val3: u64) u64 {
     _ = uaddr2;
     const cmd = op & ~(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
     if (uaddr & 3 != 0) return err(EINVAL);
     const me = process.currentPCB() orelse return err(EFAULT);
+    const at = futexAt(me, uaddr, op & FUTEX_PRIVATE_FLAG != 0);
     switch (cmd) {
         FUTEX_WAIT, FUTEX_WAIT_BITSET => {
             if (cmd == FUTEX_WAIT_BITSET and @as(u32, @truncate(val3)) == 0) return err(EINVAL);
@@ -203,7 +230,7 @@ pub fn futex(uaddr: u64, op: u64, val: u64, timeout: u64, uaddr2: u64, val3: u64
             const end = start +| (rel orelse 0);
             var left = rel;
             while (true) {
-                switch (process.blockOnFutex(uaddr, word, want, if (left) |ns| deadlineAfter(ns) else 0)) {
+                switch (process.blockOnFutexAt(at.obj, at.off, word, want, if (left) |ns| deadlineAfter(ns) else 0)) {
                     .woke => {
                         lprof.futex(.wait_woke);
                         return 0;
@@ -227,7 +254,7 @@ pub fn futex(uaddr: u64, op: u64, val: u64, timeout: u64, uaddr2: u64, val3: u64
         FUTEX_WAKE, FUTEX_WAKE_BITSET => {
             if (cmd == FUTEX_WAKE_BITSET and @as(u32, @truncate(val3)) == 0) return err(EINVAL);
             const n = futexCount(val) orelse return err(EINVAL);
-            const woken = process.wakeFutex(me.tgid, uaddr, n);
+            const woken = process.wakeFutexAt(at.obj, me.tgid, at.off, n);
             lprof.futex(if (woken == 0) .wake_none else .wake_some);
             return woken;
         },
@@ -239,7 +266,7 @@ pub fn futex(uaddr: u64, op: u64, val: u64, timeout: u64, uaddr2: u64, val3: u64
                 const word: *const volatile u32 = @ptrFromInt(uaddr);
                 if (word.* != @as(u32, @truncate(val3))) return err(EAGAIN);
             }
-            return process.wakeFutex(me.tgid, uaddr, wake_n +| move_n);
+            return process.wakeFutexAt(at.obj, me.tgid, at.off, wake_n +| move_n);
         },
         else => {
             debug.klog("[linux] pid={d} futex op {d} unsupported\n", .{ process.getCurrentPid(), op });

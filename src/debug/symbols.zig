@@ -479,8 +479,11 @@ pub fn printBacktrace(initial_rbp: usize, rip: u64, is_kernel: bool, app_table: 
     // Walk RBP chain
     var rbp = initial_rbp;
     var depth: u32 = 0;
-    const range_lo: usize = if (is_kernel) 0x100000 else 0x400000;
-    const range_hi: usize = if (is_kernel) 0x4000000 else 0x600000;
+    // A native program's stack; the kernel's low range is from before it
+    // moved to the high half.
+    const memmap = @import("../mm/memmap.zig");
+    const range_lo: usize = if (is_kernel) 0x100000 else memmap.NATIVE_STACK_BOTTOM;
+    const range_hi: usize = if (is_kernel) 0x4000000 else memmap.USER_VA_FLOOR;
 
     while (rbp > range_lo and rbp < range_hi and depth < 16) : (depth += 1) {
         const frame: [*]const usize = @ptrFromInt(rbp);

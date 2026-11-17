@@ -65,7 +65,8 @@ pub const Present = packed struct(u64) {
     avl10: bool = false, // bit 10 (SWAPPED marker — meaningless while present)
     avl11: bool = false, // bit 11 (INFLIGHT marker — meaningless while present)
     frame_bits: u40 = 0, // bits 12..51 (phys >> 12)
-    avl_high: u11 = 0, // bits 52..62
+    parked: bool = false, // bit 52 (software: PROT_NONE holds the page; user is clear)
+    avl_high: u10 = 0, // bits 53..62
     no_exec: bool = false, // bit 63 (NX; EFER.NXE is required at boot)
 
     pub inline fn fromWord(w: u64) Present {
@@ -124,6 +125,13 @@ pub inline fn cowBreakTo(w: u64, private_frame: Phys) u64 {
     return p.word();
 }
 
+/// A present leaf that holds a frame of its address space: mapped for the
+/// program, or parked by PROT_NONE. Whoever frees, counts or copies user
+/// frames asks this, not the USER bit.
+pub inline fn holdsUserFrame(w: u64) bool {
+    return w & paging.PRESENT != 0 and w & (paging.USER | paging.PARKED) != 0;
+}
+
 pub fn decode(w: u64) View {
     if (w & paging.PRESENT != 0) return .{ .present = Present.fromWord(w) };
     if (w == 0) return .absent;
@@ -154,6 +162,9 @@ comptime {
     a(@as(u64, @bitCast(Present{ .avl10 = true })) == SWAPPED_MARK);
     a(@as(u64, @bitCast(Present{ .avl11 = true })) == INFLIGHT_MARK);
     a(@as(u64, @bitCast(Present{ .no_exec = true })) == paging.NX);
+    a(@as(u64, @bitCast(Present{ .parked = true })) == paging.PARKED);
+    a(holdsUserFrame(paging.PRESENT | paging.USER) and holdsUserFrame(paging.PRESENT | paging.PARKED));
+    a(!holdsUserFrame(paging.PRESENT) and !holdsUserFrame(paging.USER | paging.PARKED));
     a(@as(u64, @bitCast(Present{ .frame_bits = ~@as(u40, 0) })) == paging.PAGE_MASK);
     // The markers never collide with anything the present view names.
     a(SWAPPED_MARK & INFLIGHT_MARK == 0);

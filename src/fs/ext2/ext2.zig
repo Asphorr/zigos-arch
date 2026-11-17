@@ -59,10 +59,12 @@ pub const DirWalk = struct {
         const e = std.mem.bytesAsValue(layout.DirEntry, self.buf[self.off .. self.off + layout.DIR_ENTRY_HDR]);
         const rl: u32 = e.rec_len;
         if (rl < layout.DIR_ENTRY_HDR or self.off + rl > self.buf.len) return null;
-        if (layout.DIR_ENTRY_HDR + @as(u32, e.name_len) > rl) return null;
+        // A dead entry names nothing: its name length is not looked at.
+        const name_len: u32 = if (e.inode == 0) 0 else e.name_len;
+        if (layout.DIR_ENTRY_HDR + name_len > rl) return null;
         const at = self.off;
         self.off += rl;
-        return .{ .e = e, .off = at, .name = self.buf[at + layout.DIR_ENTRY_HDR ..][0..e.name_len] };
+        return .{ .e = e, .off = at, .name = self.buf[at + layout.DIR_ENTRY_HDR ..][0..name_len] };
     }
 };
 
@@ -572,15 +574,14 @@ fn dirInsert(m: *block.Mount, dir_ino: *layout.Inode, name: []const u8, child_in
         if (!inode.readInodeBlock(dir_ino, lblock, dir_buf[0..bs])) return false;
         var w = DirWalk{ .buf = dir_buf[0..bs] };
         while (w.next()) |d| {
-            const tight: u16 = if (d.e.inode == 0)
-                layout.DIR_ENTRY_HDR // empty entry — all of rec_len is slack
-            else
-                layout.dirEntryAlign(d.e.name_len);
+            // A dead entry is taken over whole: a header left in front of
+            // the new one would keep a name length its record can't hold.
+            const tight: u16 = if (d.e.inode == 0) 0 else layout.dirEntryAlign(d.e.name_len);
             if (d.e.rec_len >= tight + needed) {
-                // Split this entry: shrink to tight, append new entry in slack.
+                // A live entry shrinks to its name; the new one gets the rest.
                 const new_off: u32 = d.off + tight;
                 const slack: u16 = d.e.rec_len - tight;
-                d.e.rec_len = tight;
+                if (tight != 0) d.e.rec_len = tight;
                 // Construct new entry in-place.
                 const ne = std.mem.bytesAsValue(layout.DirEntry, dir_buf[new_off .. new_off + 8]);
                 ne.inode = child_inum;
@@ -1221,6 +1222,27 @@ pub fn pathOf(inum: u32, buf: []u8) ?[]const u8 {
     const len = buf.len - end;
     std.mem.copyForwards(u8, buf[0..len], buf[end..]);
     return buf[0..len];
+}
+
+/// The absolute path of `child` as directory `dir_inum` names it now; null
+/// when it has no name there or the path doesn't fit `buf`.
+pub fn pathIn(dir_inum: u32, child: u32, buf: []u8) ?[]const u8 {
+    const dir = inode.readInode(dir_inum) orelse return null;
+    if (!inode.isDir(&dir)) return null;
+    var name_buf: [255]u8 = undefined;
+    const name = nameIn(&dir, child, &name_buf) orelse return null;
+    const base = pathOf(dir_inum, buf) orelse return null;
+    const sep: usize = if (base.len == 1) 0 else 1; // the root is "/" already
+    if (base.len + sep + name.len > buf.len) return null;
+    if (sep == 1) buf[base.len] = '/';
+    @memcpy(buf[base.len + sep ..][0..name.len], name);
+    return buf[0 .. base.len + sep + name.len];
+}
+
+/// The inode of the directory the last name of `path` is in, or null.
+pub fn dirOfPath(path: []const u8) ?u32 {
+    const at = parentDir(path) catch return null;
+    return at.inum;
 }
 
 /// True if directory `dir` is `ancestor` or lies anywhere below it.

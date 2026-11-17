@@ -56,12 +56,20 @@ const TCP_PSH: u8 = 0x08;
 const TCP_ACK: u8 = 0x10;
 const TCP_MAX_CONNS = 32;
 const TCP_MAX_LISTENERS = 8;
-/// Receive rings, powers of two. A connection reads into a large ring from
-/// the pool (rx_pool, filled from vmalloc in task context) when one is
-/// idle, else into its small inline ring.
+/// Receive and send rings, powers of two. A connection takes a block from
+/// the pool (ring_pool, filled from vmalloc in task context) when one is
+/// idle — a large receive ring, then a large send ring — else it uses its
+/// small inline pair.
 const TCP_RX_RING: u32 = 256 * 1024;
 const TCP_RX_SMALL: u32 = 8192;
-const TCP_SND_BUF_SIZE = 8192; // per-conn ring of unacked+unsent outbound data
+const TCP_TX_RING: u32 = 256 * 1024;
+const TCP_SND_SMALL: u32 = 8192;
+/// Segments one flushSnd puts out: the lock and the interrupts are held
+/// meanwhile. Their ACKs start the next run.
+const TCP_FLUSH_BURST: u32 = 32;
+/// In-order segments one ACK may answer inside a receive batch (RFC 1122
+/// §4.2.3.2: at least every second one).
+const TCP_ACK_EVERY: u8 = 2;
 /// Out-of-order data waits in the receive ring at its own place; these are
 /// its runs, which SACK blocks also report.
 const TCP_OOO_RUNS = 4;
@@ -73,7 +81,7 @@ const TCP_INIT_RTO_TICKS: u32 = 100; // 1 s, until the first RTT sample (RFC 629
 const TCP_MIN_RTO_TICKS: u32 = 20; // 200 ms floor (cf. Linux TCP_RTO_MIN)
 const TCP_MAX_RTO_TICKS: u32 = 6000; // 60 s ceiling + exponential-backoff cap
 const TCP_INIT_CWND_SEGS: u32 = 4; // initial congestion window, in MSS-sized segments
-const TCP_MAX_CWND: u32 = 65535; // congestion-window ceiling (bytes)
+const TCP_MAX_CWND: u32 = TCP_TX_RING; // congestion-window ceiling (bytes)
 const TCP_MAX_RETRIES: u8 = 3;
 const TCP_NO_LISTENER: u8 = 0xFF;
 // Per-listener ring of accepted-but-not-yet-handed-out connection slots.
@@ -793,9 +801,24 @@ const TcpConn = struct {
     // snd_buf[snd_buf_head] corresponds to sequence number snd_una; the ring
     // holds snd_buf_len bytes spanning [snd_una, snd_una+snd_buf_len). Of those,
     // [snd_una, snd_nxt) are sent-but-unacked and the rest are buffered-unsent.
-    snd_buf: [TCP_SND_BUF_SIZE]u8 = undefined,
+    snd_small: [TCP_SND_SMALL]u8 = undefined,
+    /// snd_small or the send half of the pooled block (attachRing).
+    snd_buf: [*]u8 = undefined,
+    snd_mask: u32 = TCP_SND_SMALL - 1,
     snd_buf_head: u32 = 0,
     snd_buf_len: u32 = 0,
+    /// One past the highest sequence number sent (sndTop): above snd_nxt
+    /// while a timeout sends again from snd_una.
+    snd_max: u32 = 0,
+    /// Fast recovery lasts until this is acked, and dup ACKs below it start
+    /// none (RFC 6582).
+    recover: u32 = 0,
+    /// The socket went with data still in the send ring: the block returns
+    /// to the pool once the ring is empty.
+    detach_due: bool = false,
+    /// In-order data segments taken and not answered yet (a receive batch
+    /// holds ACKs back; rxBatchEnd and tcpTick send what is left).
+    ack_due: u8 = 0,
     // RTT estimation (Jacobson/Karn) -> adaptive retransmit timeout, in ticks.
     srtt: u32 = 0, // smoothed RTT (0 = no sample yet)
     rttvar: u32 = 0, // RTT variation
@@ -904,12 +927,13 @@ var tcp_conns: [TCP_MAX_CONNS]TcpConn = [_]TcpConn{.{}} ** TCP_MAX_CONNS;
 var tcp_listeners: [TCP_MAX_LISTENERS]TcpListener = [_]TcpListener{.{}} ** TCP_MAX_LISTENERS;
 var next_ephemeral: u16 = 49200;
 
-/// The large receive rings, from vmalloc, never freed. One is taken while
-/// a live connection reads into it (rx_buf); a connection gives it back
-/// when its socket goes (detachRing) or the slot is let go. So the pool
-/// grows to the most sockets open at once, not to the slots that linger.
+/// The large ring blocks (receive ring, then send ring), from vmalloc, never
+/// freed. One is taken while a live connection uses it (its rx_buf is the
+/// block); a connection gives it back when its socket goes and its send
+/// ring is empty (detachRing), or when the slot is let go. So the pool grows
+/// to the most sockets open at once, not to the slots that linger.
 /// (p:net_lock)
-var rx_pool: [TCP_MAX_CONNS]?[*]u8 = [_]?[*]u8{null} ** TCP_MAX_CONNS;
+var ring_pool: [TCP_MAX_CONNS]?[*]u8 = [_]?[*]u8{null} ** TCP_MAX_CONNS;
 
 /// The smallest window shift whose scaled window covers a ring of `size`.
 fn wscaleFor(size: u32) u8 {
@@ -918,9 +942,9 @@ fn wscaleFor(size: u32) u8 {
     return s;
 }
 
-/// A pooled ring no live connection reads into. Lock held, or a guess.
+/// A pooled block no live connection uses. Lock held, or a guess.
 fn idleRing() ?[*]u8 {
-    pool: for (rx_pool) |slot| {
+    pool: for (ring_pool) |slot| {
         const r = slot orelse continue;
         for (&tcp_conns) |*c| {
             if (c.active and c.rx_buf == r) continue :pool;
@@ -930,24 +954,36 @@ fn idleRing() ?[*]u8 {
     return null;
 }
 
-/// Give a connection just taken (active, fields reset) its receive ring
-/// and the window shift its SYN offers. Lock held.
+/// Give a connection just taken (active, fields reset, both rings empty)
+/// its rings and the window shift its SYN offers. Lock held.
 fn attachRing(c: *TcpConn) void {
     // `c` is active already: a stale rx_buf of its own must not count.
     c.rx_buf = &c.rx_small;
+    c.snd_buf = &c.snd_small;
     if (idleRing()) |r| {
         c.rx_buf = r;
         c.rx_mask = TCP_RX_RING - 1;
+        c.snd_buf = r + TCP_RX_RING;
+        c.snd_mask = TCP_TX_RING - 1;
     } else {
         c.rx_mask = TCP_RX_SMALL - 1;
+        c.snd_mask = TCP_SND_SMALL - 1;
     }
     c.rcv_wscale = wscaleFor(c.rx_mask + 1);
 }
 
-/// Nobody will read `c` again: its large ring goes back to the pool, the
-/// unread bytes with it; what still comes lands in the small one. Lock held.
+/// Nobody will read `c` again: its block goes back to the pool, the unread
+/// bytes with it; what still comes lands in the small ring. Bytes still to
+/// send move to the small send ring; more of them than it holds keep the
+/// block until enough are acked (processAck calls again). Lock held.
 fn detachRing(c: *TcpConn) void {
     if (c.rx_buf == @as([*]u8, &c.rx_small)) return;
+    c.detach_due = c.snd_buf_len > TCP_SND_SMALL;
+    if (c.detach_due) return;
+    readSnd(c, c.snd_una, c.snd_small[0..c.snd_buf_len]);
+    c.snd_buf = &c.snd_small;
+    c.snd_mask = TCP_SND_SMALL - 1;
+    c.snd_buf_head = 0;
     c.rx_buf = &c.rx_small;
     c.rx_mask = TCP_RX_SMALL - 1;
     c.rx_count = 0;
@@ -962,19 +998,19 @@ fn freeSlot() ?u8 {
     return null;
 }
 
-/// Before a connection starts: make sure an idle large ring waits for it.
+/// Before a connection starts: make sure an idle ring block waits for it.
 /// Task context with interrupts on, net_lock not held: vmalloc can't run
 /// under it, so this allocates, then places.
 fn provisionRing() void {
     if (!@import("../time/pause.zig").irqsEnabled()) return;
     if (idleRing() != null) return;
     const heap = @import("../mm/heap.zig");
-    const mem = heap.kvmalloc(TCP_RX_RING) orelse return;
+    const mem = heap.kvmalloc(TCP_RX_RING + TCP_TX_RING) orelse return;
     const placed = blk: {
         const lk = net_lock.acquireIrqSave();
         defer netUnlock(lk);
         if (idleRing() != null) break :blk false;
-        for (&rx_pool) |*slot| {
+        for (&ring_pool) |*slot| {
             if (slot.* != null) continue;
             slot.* = mem;
             break :blk true;
@@ -982,6 +1018,36 @@ fn provisionRing() void {
         break :blk false;
     };
     if (!placed) heap.kvfree(mem);
+}
+
+/// Idle blocks netd leaves in the pool for the next connections.
+pub const TCP_RING_SPARE: usize = 2;
+
+/// Give idle ring blocks beyond `spare` back to vmalloc. Task context with
+/// interrupts on, net_lock not held (vmalloc can't run under it): netd, and
+/// whoever counts free memory and wants the pool out of the count.
+pub fn trimRings(spare: usize) void {
+    if (!@import("../time/pause.zig").irqsEnabled()) return;
+    while (true) {
+        const gone: ?[*]u8 = blk: {
+            const lk = net_lock.acquireIrqSave();
+            defer netUnlock(lk);
+            var idle: usize = 0;
+            pool: for (&ring_pool) |*slot| {
+                const r = slot.* orelse continue;
+                for (&tcp_conns) |*c| {
+                    if (c.active and c.rx_buf == r) continue :pool;
+                }
+                idle += 1;
+                if (idle > spare) {
+                    slot.* = null;
+                    break :blk r;
+                }
+            }
+            break :blk null;
+        };
+        @import("../mm/heap.zig").kvfree(gone orelse return);
+    }
 }
 
 const SynOptions = struct { mss: u16 = 536, wscale: ?u8 = null, sack_ok: bool = false };
@@ -1051,6 +1117,20 @@ fn tcpNotify(c: *TcpConn) void {
 }
 
 fn tcpFailWith(c: *TcpConn, why: TcpFail) void {
+    debug.klog("[tcp] fail {s}: port {d} -> {d}.{d}.{d}.{d}:{d} state={s} out={d} queued={d} wnd={d} tries={d}\n", .{
+        @tagName(why),
+        c.local_port,
+        c.remote_ip[0],
+        c.remote_ip[1],
+        c.remote_ip[2],
+        c.remote_ip[3],
+        c.remote_port,
+        @tagName(c.state),
+        sndTop(c) -% c.snd_una,
+        c.snd_buf_len,
+        c.snd_wnd,
+        c.retransmit_count,
+    });
     c.error_flag = true;
     c.fail = why;
     c.state = .closed;
@@ -1191,14 +1271,23 @@ fn emitSegment(conn: *TcpConn, seq: u32, flags: u8, payload: ?[]const u8) bool {
     if ((payload != null and payload.?.len > 0) or flags & (TCP_SYN | TCP_FIN) != 0) {
         conn.last_send_tick = process.tick_count;
     }
+    // Every segment with ACK set answers all that came. Before the send: a
+    // local peer's reply is processed inside it.
+    if (flags & TCP_ACK != 0) conn.ack_due = 0;
 
     return dispatchPacket(conn.remote_ip, pkt[0..total]);
 }
 
-/// Send a segment at the connection's current snd_nxt — the common path for
-/// control segments and bare ACKs.
+/// One past the highest sequence number sent.
+fn sndTop(c: *const TcpConn) u32 {
+    return if (seqLt(c.snd_nxt, c.snd_max)) c.snd_max else c.snd_nxt;
+}
+
+/// Send a segment at the top of what was sent — the common path for control
+/// segments and bare ACKs. (While a timeout resends from below, snd_nxt is
+/// not it, and the peer would drop an ACK stamped there as old.)
 fn sendTcpPacket(conn: *TcpConn, flags: u8, payload: ?[]const u8) bool {
-    return emitSegment(conn, conn.snd_nxt, flags, payload);
+    return emitSegment(conn, sndTop(conn), flags, payload);
 }
 
 /// The next port for an outbound connection or a listener that asked for
@@ -1258,6 +1347,8 @@ fn connectIn(reuse: ?u8, dst_ip: [4]u8, dst_port: u16, local_port: u16) ?u8 {
     // The SYN takes one sequence number. Counted before it is sent: a local
     // peer's answer is processed inside the send.
     conn.snd_nxt = conn.snd_iss +% 1;
+    conn.snd_max = conn.snd_nxt;
+    conn.recover = conn.snd_iss;
     if (!emitSegment(conn, conn.snd_iss, TCP_SYN, null)) {
         if (reuse == null) conn.active = false else tcpFailWith(conn, .timed_out);
         return null;
@@ -1319,6 +1410,8 @@ fn tryAcceptIncomingSyn(ip_data: []volatile u8, ihl: usize, local_port: u16, rem
     // Our SYN takes one sequence number, counted before the SYN-ACK is
     // sent: a local peer's ACK of it is processed inside the send.
     conn.snd_nxt = conn.snd_iss +% 1;
+    conn.snd_max = conn.snd_nxt;
+    conn.recover = conn.snd_iss;
     conn.rcv_nxt = peer_seq +% 1; // peer's SYN consumes one seq number
     conn.listener_slot = listenerSlotIndex(lst);
 
@@ -1430,6 +1523,16 @@ pub fn tcpUnlisten(listen_slot: u8) void {
 }
 
 /// The port listener `listen_slot` is on.
+/// True if a listener has `port`: a bind to it is refused.
+pub fn tcpPortListening(port: u16) bool {
+    const lk = net_lock.acquireIrqSave();
+    defer netUnlock(lk);
+    for (tcp_listeners) |l| {
+        if (l.active and l.port == port) return true;
+    }
+    return false;
+}
+
 pub fn tcpListenerPort(listen_slot: u8) u16 {
     if (listen_slot >= TCP_MAX_LISTENERS) return 0;
     return tcp_listeners[listen_slot].port;
@@ -1472,31 +1575,68 @@ pub fn tcpAccept(listen_slot: u8) ?u8 {
 
 // === send buffer (snd_buf ring) ===
 
-/// Most unacked bytes we may keep in flight: bounded by both the peer's
-/// advertised window and our own ring. (A congestion window joins this later.)
+/// Most unacked bytes we may keep in flight: the peer's advertised window
+/// and the congestion window bound it (the ring bounds what there is to send).
 fn effectiveWindow(conn: *const TcpConn) u32 {
-    return @min(@min(conn.snd_wnd, conn.cwnd), @as(u32, TCP_SND_BUF_SIZE));
+    return @min(conn.snd_wnd, conn.cwnd);
+}
+
+/// Free bytes in the send ring.
+fn sndSpace(conn: *const TcpConn) u32 {
+    // Saturating: a look without the lock may pair a new mask with an old length.
+    return (conn.snd_mask + 1) -| conn.snd_buf_len;
 }
 
 /// Append `bytes` at the ring tail (sequence snd_una+snd_buf_len). The caller
 /// guarantees bytes.len <= free space.
 fn appendSnd(conn: *TcpConn, bytes: []const u8) void {
-    var pos = (conn.snd_buf_head + conn.snd_buf_len) % TCP_SND_BUF_SIZE;
-    for (bytes) |b| {
-        conn.snd_buf[pos] = b;
-        pos = (pos + 1) % TCP_SND_BUF_SIZE;
-    }
+    const pos = (conn.snd_buf_head +% conn.snd_buf_len) & conn.snd_mask;
+    const first = @min(bytes.len, (conn.snd_mask + 1) - pos);
+    @memcpy(conn.snd_buf[pos..][0..first], bytes[0..first]);
+    @memcpy(conn.snd_buf[0 .. bytes.len - first], bytes[first..]);
     conn.snd_buf_len += @intCast(bytes.len);
 }
 
 /// Copy out.len bytes from the ring starting at sequence number `seq`, which
 /// must lie within [snd_una, snd_una+snd_buf_len).
 fn readSnd(conn: *const TcpConn, seq: u32, out: []u8) void {
-    var pos = (conn.snd_buf_head + (seq -% conn.snd_una)) % TCP_SND_BUF_SIZE;
-    for (out) |*o| {
-        o.* = conn.snd_buf[pos];
-        pos = (pos + 1) % TCP_SND_BUF_SIZE;
-    }
+    const pos = (conn.snd_buf_head +% (seq -% conn.snd_una)) & conn.snd_mask;
+    const first = @min(out.len, (conn.snd_mask + 1) - pos);
+    @memcpy(out[0..first], conn.snd_buf[pos..][0..first]);
+    @memcpy(out[first..], conn.snd_buf[0 .. out.len - first]);
+}
+
+/// Send the first unacked segment again, from the ring, whatever the
+/// windows say.
+fn resendFirst(c: *TcpConn) void {
+    const out = sndTop(c) -% c.snd_una;
+    const seg = @min(@min(out, c.snd_buf_len), @as(u32, c.peer_mss));
+    if (seg == 0) return;
+    var tmp: [1460]u8 = undefined;
+    readSnd(c, c.snd_una, tmp[0..seg]);
+    _ = emitSegment(c, c.snd_una, TCP_PSH | TCP_ACK, tmp[0..seg]);
+}
+
+/// All that is out counts as lost: sending starts over at the first unacked
+/// byte. What was out stays known (snd_max): it is not timed as new, and
+/// its duplicate ACKs start no fast retransmit.
+fn goBackN(c: *TcpConn) void {
+    c.snd_max = sndTop(c);
+    c.recover = c.snd_max;
+    c.snd_nxt = c.snd_una;
+    c.dup_acks = 0;
+    c.in_recovery = false;
+}
+
+/// The peer's window is shut with data waiting: one byte past it. The
+/// answer carries the window; the byte counts as sent, so an ACK of it is
+/// taken.
+fn probeWindow(c: *TcpConn) void {
+    var b: [1]u8 = undefined;
+    readSnd(c, c.snd_una, &b);
+    if (!emitSegment(c, c.snd_una, TCP_PSH | TCP_ACK, &b)) return;
+    c.snd_nxt = c.snd_una +% 1;
+    if (seqLt(c.snd_max, c.snd_nxt)) c.snd_max = c.snd_nxt;
 }
 
 /// Fold a new RTT sample into the smoothed estimate and recompute the
@@ -1511,10 +1651,13 @@ fn updateRto(c: *TcpConn, sample: u64) void {
         c.rttvar = c.rttvar - (c.rttvar >> 2) + (err >> 2);
         c.srtt = c.srtt - (c.srtt >> 3) + (r >> 3);
     }
-    var rto = c.srtt + @max(@as(u32, 1), c.rttvar << 2);
-    if (rto < TCP_MIN_RTO_TICKS) rto = TCP_MIN_RTO_TICKS;
-    if (rto > TCP_MAX_RTO_TICKS) rto = TCP_MAX_RTO_TICKS;
-    c.rto = rto;
+    c.rto = estimatedRto(c);
+}
+
+/// The timeout the RTT estimate gives, with no backoff on it.
+fn estimatedRto(c: *const TcpConn) u32 {
+    const rto = c.srtt + @max(@as(u32, 1), c.rttvar << 2);
+    return @min(@max(rto, TCP_MIN_RTO_TICKS), TCP_MAX_RTO_TICKS);
 }
 
 /// Reset the congestion window for a freshly-established connection: a small
@@ -1543,28 +1686,27 @@ fn ackCwnd(c: *TcpConn, acked: u32) void {
 }
 
 /// Three duplicate ACKs: halve ssthresh, drop cwnd to it, and retransmit the
-/// first unacked segment immediately instead of waiting for the RTO.
+/// first unacked segment immediately instead of waiting for the RTO. The
+/// recovery lasts until all that is out now is acked: an ACK short of that
+/// names the next hole (processAck).
 fn fastRetransmit(c: *TcpConn) void {
     const mss: u32 = c.peer_mss;
     c.ssthresh = @max(c.cwnd / 2, 2 * mss);
     c.cwnd = c.ssthresh;
     c.in_recovery = true;
-    if (c.snd_buf_len > 0) {
-        const inflight = c.snd_nxt -% c.snd_una;
-        const seg = @min(inflight, mss);
-        var tmp: [1460]u8 = undefined;
-        readSnd(c, c.snd_una, tmp[0..seg]);
-        _ = emitSegment(c, c.snd_una, TCP_PSH | TCP_ACK, tmp[0..seg]);
-    }
+    c.recover = sndTop(c);
+    resendFirst(c);
     c.rtt_pending = false;
 }
 
-/// Emit as many new MSS-sized segments as the send window allows, advancing
-/// snd_nxt. Sends only buffered-but-unsent bytes: [snd_nxt, snd_una+snd_buf_len).
+/// Emit MSS-sized segments from snd_nxt as the send window allows, at most
+/// TCP_FLUSH_BURST of them, advancing snd_nxt over [snd_nxt,
+/// snd_una+snd_buf_len): bytes never sent, or after a timeout pulled
+/// snd_nxt back, bytes sent before.
 fn flushSnd(conn: *TcpConn) void {
     const wnd = effectiveWindow(conn);
-    var guard: u32 = 0;
-    while (guard < TCP_SND_BUF_SIZE) : (guard += 1) {
+    var burst: u32 = 0;
+    while (burst < TCP_FLUSH_BURST) : (burst += 1) {
         const unsent = (conn.snd_una +% conn.snd_buf_len) -% conn.snd_nxt;
         if (unsent == 0) break;
         const inflight = conn.snd_nxt -% conn.snd_una;
@@ -1575,9 +1717,12 @@ fn flushSnd(conn: *TcpConn) void {
         var tmp: [1460]u8 = undefined;
         readSnd(conn, conn.snd_nxt, tmp[0..seg]);
         if (!emitSegment(conn, conn.snd_nxt, TCP_PSH | TCP_ACK, tmp[0..seg])) break;
+        const first_time = !seqLt(conn.snd_nxt, conn.snd_max);
         conn.snd_nxt +%= seg;
+        if (seqLt(conn.snd_max, conn.snd_nxt)) conn.snd_max = conn.snd_nxt;
         // Begin an RTT sample for this segment if one isn't already timing.
-        if (!conn.rtt_pending) {
+        // Karn: never from bytes sent before.
+        if (first_time and !conn.rtt_pending) {
             conn.rtt_pending = true;
             conn.rtt_start = process.tick_count;
             conn.rtt_seq = conn.snd_nxt;
@@ -1601,7 +1746,7 @@ pub fn tcpSend(slot: u8, data: []const u8) bool {
             const lk = net_lock.acquireIrqSave();
             defer netUnlock(lk);
             if (conn.error_flag or conn.state != .established) return false;
-            const space: usize = TCP_SND_BUF_SIZE - conn.snd_buf_len;
+            const space: usize = sndSpace(conn);
             if (space > 0) {
                 const chunk = @min(data.len - off, space);
                 appendSnd(conn, data[off..][0..chunk]);
@@ -1618,7 +1763,7 @@ pub fn tcpSend(slot: u8, data: []const u8) bool {
         var have_space = false;
         while (process.tick_count < deadline) {
             if (conn.error_flag or conn.state != .established) return false;
-            if (conn.snd_buf_len < TCP_SND_BUF_SIZE) {
+            if (sndSpace(conn) != 0) {
                 have_space = true;
                 break;
             }
@@ -1717,8 +1862,10 @@ pub fn tcpClose(slot: u8) void {
         const lk = net_lock.acquireIrqSave();
         defer netUnlock(lk);
         if (conn.state == .established or conn.state == .close_wait) {
-            _ = sendTcpPacket(conn, TCP_FIN | TCP_ACK, null);
-            conn.snd_nxt +%= 1;
+            // Past all that was sent, acked or not (the drain above gave up).
+            const fin_seq = sndTop(conn);
+            _ = emitSegment(conn, fin_seq, TCP_FIN | TCP_ACK, null);
+            conn.snd_nxt = fin_seq +% 1;
             conn.state = if (conn.state == .close_wait) .last_ack else .fin_wait_1;
             sent_fin = true;
         }
@@ -1775,10 +1922,39 @@ fn reportConn(c: *const TcpConn) void {
     });
 }
 
+/// A socket that goes with its connection unfinished leaves one line: no
+/// handshake, data not acked, or never a byte from the peer. Lock held.
+fn reportUnfinished(c: *const TcpConn) void {
+    if (c.error_flag or c.state == .closed or c.state == .listen) return;
+    const out = sndTop(c) -% c.snd_una;
+    const heard = c.st_bytes != 0 or c.peer_closed;
+    if (c.state != .syn_sent and out == 0 and c.snd_buf_len == 0 and heard) return;
+    debug.klog("[tcp] left {s}: port {d} -> {d}.{d}.{d}.{d}:{d} sent={d} out={d} queued={d} wnd={d} cwnd={d} tries={d} rto={d} got={d} unread={d} idle={d} ticks\n", .{
+        @tagName(c.state),
+        c.local_port,
+        c.remote_ip[0],
+        c.remote_ip[1],
+        c.remote_ip[2],
+        c.remote_ip[3],
+        c.remote_port,
+        c.snd_nxt -% c.snd_iss,
+        out,
+        c.snd_buf_len,
+        c.snd_wnd,
+        c.cwnd,
+        c.retransmit_count,
+        c.rto,
+        c.st_bytes,
+        c.rx_count,
+        process.tick_count -% c.last_send_tick,
+    });
+}
+
 /// The owner of `c` is gone. Lock held.
 fn releaseConn(c: *TcpConn) void {
     if (!c.active) return;
     reportConn(c);
+    reportUnfinished(c);
     detachRing(c);
     c.rd_closed = true;
     // Nothing to finish: never connected, failed, or closed both ways.
@@ -1832,7 +2008,7 @@ pub fn tcpSendSome(slot: u8, data: []const u8) TcpSent {
     const c = &tcp_conns[slot];
     if (!c.active or c.error_flag or c.fin_wanted) return .closed;
     if (c.state != .established and c.state != .close_wait) return .closed;
-    const space: usize = TCP_SND_BUF_SIZE - c.snd_buf_len;
+    const space: usize = sndSpace(c);
     if (space == 0) return .full;
     const chunk = @min(data.len, space);
     appendSnd(c, data[0..chunk]);
@@ -1883,7 +2059,7 @@ pub fn tcpView(slot: u8) TcpView {
         .fail = c.fail,
         .readable = rx > 0,
         .eof = rx == 0 and c.peer_closed,
-        .writable = open and !c.error_flag and !c.fin_wanted and c.snd_buf_len < TCP_SND_BUF_SIZE,
+        .writable = open and !c.error_flag and !c.fin_wanted and sndSpace(c) != 0,
         .rx_bytes = rx,
         .events = c.events,
     };
@@ -2071,10 +2247,18 @@ fn receiveData(c: *TcpConn, seq: u32, tcp: []volatile u8, data_offset: usize, pa
         }
         ringWrite(c, off, data);
         if (off == 0) {
+            const gap = c.n_ooo != 0;
             rxAdvance(c, @intCast(data.len));
             oooMerge(c);
             if ((c.rx_mask + 1) - c.rx_count < 1460) c.st_full +%= 1;
             tcpNotify(c);
+            // Inside a receive batch one ACK answers TCP_ACK_EVERY segments
+            // that came in order with nothing waiting past a gap; the
+            // batch's end sends what is still owed (rxBatchEnd).
+            if (rx_batch and !gap) {
+                c.ack_due +|= 1;
+                if (c.ack_due < TCP_ACK_EVERY) return;
+            }
         } else {
             c.st_ooo +%= 1;
             oooAdd(c, start, start +% @as(u32, @intCast(data.len)));
@@ -2141,15 +2325,22 @@ fn handleTcpPacket(ip_data: []volatile u8, ihl: usize) void {
     // Track the peer's advertised receive window for send-side flow control;
     // a SYN's is never scaled.
     const wnd_field: u32 = readU16BE(tcp[14..16]);
+    const was_shut = c.snd_wnd == 0;
     c.snd_wnd = if (c.ws_ok and flags & TCP_SYN == 0) wnd_field << @intCast(c.snd_wscale) else wnd_field;
     // A window update — including one re-opening from a (near-)zero window — can
     // let buffered-but-unsent data move even when this segment's ACK didn't
     // advance snd_una. Flush here too, not only on the snd_una-advancing path,
     // or a slow reader could wedge the sender until the next data-bearing ACK.
-    if ((c.state == .established or c.state == .close_wait) and
-        (c.snd_una +% c.snd_buf_len) != c.snd_nxt)
-    {
-        flushSnd(c);
+    if ((c.state == .established or c.state == .close_wait) and c.snd_buf_len > 0) {
+        // Opened from shut: what was out, the probe's byte at least, was
+        // dropped at the shut window. It all goes again, at the timeout
+        // the probing had backed off from.
+        if (was_shut and c.snd_wnd != 0 and c.snd_nxt != c.snd_una) {
+            goBackN(c);
+            c.rto = estimatedRto(c);
+            c.retransmit_count = 0;
+        }
+        if ((c.snd_una +% c.snd_buf_len) != c.snd_nxt) flushSnd(c);
     }
 
     switch (c.state) {
@@ -2295,16 +2486,28 @@ fn enterTimeWait(c: *TcpConn) void {
 /// for the ring to empty. Lock held.
 fn processAck(c: *TcpConn, ack: u32, payload_len: usize) void {
     const adv = @as(i32, @bitCast(ack -% c.snd_una));
-    const inflight = c.snd_nxt -% c.snd_una;
+    // Sent at some time and not acked: snd_nxt may be below it (tcpTick).
+    const out = sndTop(c) -% c.snd_una;
     // Accept only ACKs that advance snd_una without acking data we never
     // sent. Free the acked bytes from the send ring, restart the retransmit
     // timer, and let the freed window push more out.
-    if (adv > 0 and @as(u32, @bitCast(adv)) <= inflight and @as(u32, @bitCast(adv)) <= c.snd_buf_len) {
+    if (adv > 0 and @as(u32, @bitCast(adv)) <= out and @as(u32, @bitCast(adv)) <= c.snd_buf_len) {
         const acked: u32 = @bitCast(adv);
-        c.snd_buf_head = (c.snd_buf_head + acked) % TCP_SND_BUF_SIZE;
+        c.snd_buf_head = (c.snd_buf_head +% acked) & c.snd_mask;
         c.snd_buf_len -= acked;
         c.snd_una = ack;
-        ackCwnd(c, acked); // grow cwnd / exit fast recovery
+        // The peer held more than a timeout's resend had reached again.
+        if (seqLt(c.snd_nxt, ack)) c.snd_nxt = ack;
+        if (c.in_recovery and seqLt(ack, c.recover)) {
+            // A partial ACK (RFC 6582): the next hole starts at it. Send
+            // that segment and stay in recovery.
+            resendFirst(c);
+        } else {
+            ackCwnd(c, acked); // grow cwnd / exit fast recovery
+        }
+        // Kept at the edge: left behind, it would wrap past snd_una and
+        // hold fast retransmit off.
+        if (seqLt(c.recover, ack)) c.recover = ack;
         c.dup_acks = 0;
         // Karn: only sample RTT from a segment that wasn't retransmitted
         // (rtt_pending is cleared on retransmit).
@@ -2316,12 +2519,18 @@ fn processAck(c: *TcpConn, ack: u32, payload_len: usize) void {
         c.last_send_tick = process.tick_count;
         flushSnd(c);
         maybeSendFin(c);
+        if (c.detach_due) detachRing(c);
         // Room in the send ring: a writer waiting for it goes on.
         tcpNotify(c);
-    } else if (adv == 0 and payload_len == 0 and inflight > 0) {
-        // Duplicate ACK: three of them trigger fast retransmit.
-        c.dup_acks += 1;
-        if (c.dup_acks == 3) fastRetransmit(c);
+    } else if (adv == 0 and c.snd_wnd == 0) {
+        // Heard from a peer whose window is shut, a probe's answer or its
+        // own data: it is there. Not a loss, and the probing goes on.
+        c.retransmit_count = 0;
+    } else if (adv == 0 and payload_len == 0 and out > 0) {
+        // Duplicate ACK: three of them trigger fast retransmit, unless they
+        // answer what a recovery or a timeout already sent again.
+        c.dup_acks +|= 1;
+        if (c.dup_acks == 3 and seqLe(c.recover, c.snd_una)) fastRetransmit(c);
     }
 }
 
@@ -2340,12 +2549,24 @@ fn tcpTick() void {
             }
         }
         if (c.state == .time_wait) continue;
+        // An ACK a receive batch held back and nothing sent since. Owed
+        // once: one that cannot go (no gateway address) is not retried
+        // every tick, the peer's next segment asks again.
+        if (c.ack_due != 0) {
+            _ = sendTcpPacket(c, TCP_ACK, null);
+            c.ack_due = 0;
+        }
+        const sending = (c.state == .established or c.state == .close_wait) and c.snd_buf_len > 0;
         // Data queued with nothing in flight: a send that found no gateway
         // address yet. Nothing else would start it.
-        if ((c.state == .established or c.state == .close_wait) and c.snd_una == c.snd_nxt and c.snd_buf_len > 0) flushSnd(c);
+        if (sending and c.snd_una == sndTop(c)) flushSnd(c);
+        // The peer's window is shut with data waiting: only a probe hears
+        // of its opening, should the update be lost. Probes go at the
+        // timeout's pace for as long as the peer answers them (processAck).
+        const persist = sending and c.snd_wnd == 0;
         // Retransmission: fire when the oldest unacked octet has gone
         // unacknowledged for the timeout.
-        if (c.snd_una != c.snd_nxt and
+        if ((c.snd_una != sndTop(c) or persist) and
             process.tick_count -% c.last_send_tick >= c.rto)
         {
             if (c.retransmit_count >= TCP_MAX_RETRIES) {
@@ -2359,22 +2580,13 @@ fn tcpTick() void {
                 tcpFailWith(c, .timed_out);
                 continue;
             }
-            if ((c.state == .established or c.state == .close_wait) and c.snd_buf_len > 0) {
-                // Resend the FIRST unacked segment, rebuilt from the send ring —
-                // not whatever happened to go out last.
-                const inflight = c.snd_nxt -% c.snd_una;
-                const seg = @min(inflight, @as(u32, c.peer_mss));
-                var tmp: [1460]u8 = undefined;
-                readSnd(c, c.snd_una, tmp[0..seg]);
-                _ = emitSegment(c, c.snd_una, TCP_PSH | TCP_ACK, tmp[0..seg]);
-            } else if (c.last_tx_len > 0) {
-                // Control segment (SYN / SYN-ACK / FIN) retransmit.
-                _ = dispatchPacket(c.remote_ip, c.last_tx[0..c.last_tx_len]);
-            }
             // Congestion response to a timeout: collapse to one segment and set
-            // ssthresh to half the flight size (RFC 5681).
-            c.ssthresh = @max(c.cwnd / 2, 2 * @as(u32, c.peer_mss));
-            c.cwnd = c.peer_mss;
+            // ssthresh to half the flight size (RFC 5681). A shut window is
+            // no loss.
+            if (!persist) {
+                c.ssthresh = @max(c.cwnd / 2, 2 * @as(u32, c.peer_mss));
+                c.cwnd = c.peer_mss;
+            }
             c.dup_acks = 0;
             c.in_recovery = false;
             // Karn: back off the timeout exponentially and don't sample RTT from
@@ -2383,6 +2595,32 @@ fn tcpTick() void {
             c.rtt_pending = false;
             c.retransmit_count += 1;
             c.last_send_tick = process.tick_count;
+            debug.klog("[tcp] timeout {d}: port {d} -> {d}.{d}.{d}.{d}:{d} state={s} out={d} queued={d} wnd={d} next rto={d}{s}\n", .{
+                c.retransmit_count,
+                c.local_port,
+                c.remote_ip[0],
+                c.remote_ip[1],
+                c.remote_ip[2],
+                c.remote_ip[3],
+                c.remote_port,
+                @tagName(c.state),
+                sndTop(c) -% c.snd_una,
+                c.snd_buf_len,
+                c.snd_wnd,
+                c.rto,
+                if (persist) " (window probe)" else "",
+            });
+            if (sending) {
+                // All that is out counts as lost: back to the first unacked
+                // byte. One segment goes now (cwnd), the rest as its ACKs
+                // open the window; one a segment at a time would cost a
+                // timeout per lost segment.
+                goBackN(c);
+                if (persist) probeWindow(c) else flushSnd(c);
+            } else if (c.last_tx_len > 0) {
+                // Control segment (SYN / SYN-ACK / FIN) retransmit.
+                _ = dispatchPacket(c.remote_ip, c.last_tx[0..c.last_tx_len]);
+            }
         }
     }
 }
@@ -2645,6 +2883,27 @@ pub fn handleRxFrame(data: []volatile u8) void {
     const lk = net_lock.acquireIrqSave();
     defer netUnlock(lk);
     processReceivedPacket(data);
+}
+
+/// A driver is handing over a run of frames and will call rxBatchEnd after
+/// the last: receiveData may hold ACKs back until then. A hint only: one
+/// held back by mistake still goes out at the next tcpTick. (p:net_lock)
+var rx_batch: bool = false;
+
+pub fn rxBatchBegin() void {
+    const lk = net_lock.acquireIrqSave();
+    defer netUnlock(lk);
+    rx_batch = true;
+}
+
+/// The run is over: send the ACKs it held back.
+pub fn rxBatchEnd() void {
+    const lk = net_lock.acquireIrqSave();
+    defer netUnlock(lk);
+    rx_batch = false;
+    for (&tcp_conns) |*c| {
+        if (c.active and c.ack_due != 0) _ = sendTcpPacket(c, TCP_ACK, null);
+    }
 }
 
 pub fn poll() void {

@@ -100,5 +100,8 @@ SECTIONS {
     __bss_phys_start = __bss_start - KERNEL_VIRT_BASE;
     __bss_phys_end = __bss_end - KERNEL_VIRT_BASE;
 
+    /* The image ends below the guest framebuffer (GUEST_FB_BASE). */
+    ASSERT(__bss_phys_end <= 0x1C00000, "kernel image runs into the guest framebuffer")
+
     /DISCARD/ : { *(.eh_frame) *(.comment) *(.note*) }
 }

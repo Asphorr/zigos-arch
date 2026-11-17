@@ -468,10 +468,28 @@ fn consoleRead(f: *File, pcb: *process.PCB, buf: [*]u8, count: u32) u32 {
 
 fn consoleWrite(f: *File, _: *process.PCB, buf: [*]const u8, count: u32) u32 {
     if (f.access == file.READ) return 0;
-    vga.print("{s}", .{buf[0..count]});
-    // Mirror to serial with an [app] prefix so kernel-side traces can
-    // correlate user output with kernel events.
-    @import("../debug/serial.zig").print("[app] {s}", .{buf[0..count]});
+    // Mirrored to serial with an [app] prefix so kernel-side traces can
+    // correlate user output with kernel events. In pieces: the formatters'
+    // buffers are fixed and a write may be any length. serial.write holds
+    // its lock with interrupts off, where a fault on the caller's page is
+    // fatal: user memory goes out as a kernel copy.
+    const serial = @import("../debug/serial.zig");
+    serial.write("[app] ");
+    const src_va = @intFromPtr(buf);
+    const user = memmap.userDataRangeOk(src_va, count);
+    var chunk: [256]u8 = undefined;
+    var done: u32 = 0;
+    while (done < count) {
+        const n: u32 = @min(count - done, chunk.len);
+        var part: []const u8 = buf[done..][0..n];
+        if (user) {
+            if (!usercopy.copyFromUser(chunk[0..n], src_va + done)) break;
+            part = chunk[0..n];
+        }
+        vga.print("{s}", .{part});
+        serial.write(part);
+        done += n;
+    }
     return count;
 }
 

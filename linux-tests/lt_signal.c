@@ -523,6 +523,41 @@ static void check_waits_cut_short(void) {
     close(fds[1]);
 }
 
+static volatile sig_atomic_t traps;
+
+// Counts the trap and ends the stepping the trap flag asked for.
+static void on_trap(int sig, siginfo_t *info, void *ucv) {
+    (void)sig;
+    (void)info;
+    ucontext_t *uc = ucv;
+    traps++;
+    uc->uc_mcontext.gregs[REG_EFL] &= ~0x100L;
+}
+
+// A program's own traps are its SIGTRAP: int3, a single step under the trap
+// flag, and a system call made with the trap flag and NT set, which comes
+// back. The asm steps over the red zone before it pushes.
+static void check_traps(void) {
+    install(SIGTRAP, on_trap, 0);
+    traps = 0;
+    __asm__ volatile("int3");
+    CHECK(traps == 1, "int3 is the program's SIGTRAP");
+
+    traps = 0;
+    __asm__ volatile("lea -128(%%rsp), %%rsp; pushfq; orq $0x100, (%%rsp); popfq; nop; nop; lea 128(%%rsp), %%rsp" : : : "cc", "memory");
+    CHECK(traps == 1, "a single step is the program's SIGTRAP");
+
+    traps = 0;
+    long pid = SYS_getpid;
+    __asm__ volatile("lea -128(%%rsp), %%rsp; pushfq; orq $0x4100, (%%rsp); popfq; syscall; "
+                     "pushfq; andq $~0x4000, (%%rsp); popfq; lea 128(%%rsp), %%rsp"
+                     : "+a"(pid)
+                     :
+                     : "rcx", "r11", "cc", "memory");
+    CHECK(pid == getpid() && traps >= 1, "a system call under the trap flag and NT comes back");
+    signal(SIGTRAP, SIG_DFL);
+}
+
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
     pid_t me = getpid();
@@ -809,6 +844,7 @@ int main(void) {
 
     check_waits_cut_short();
     check_ymm();
+    check_traps();
 
     printf("lt_signal: all %d checks passed\n", check_no);
     return 0;

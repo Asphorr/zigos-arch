@@ -233,6 +233,10 @@ export fn doSyscall(sys_num: u32, arg1: u32, arg2: u32, arg3: u32, frame_raw: ?*
             const back = sys_num == linux.SYS_rt_sigreturn;
             const done = if (back) linux_signal.rtSigreturn(pcb, f) else linux.dispatch(sys_num, f);
             lprof.syscall(sys_num, t0);
+            if (!back) {
+                linux.tracePath(sys_num, f, done);
+                linux.noteFailure(sys_num, f, done);
+            }
             // Signals are delivered inside the body, where waiting for the
             // address-space lock is allowed.
             const r = linux_signal.syscallExit(pcb, f, sys_num, done, !back);

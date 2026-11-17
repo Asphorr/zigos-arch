@@ -1068,6 +1068,43 @@ fn cpuBusy(cpu_id: u8) bool {
     return cur < MAX_PROCS and !process.procs[cur].is_idle;
 }
 
+/// The ticks task `pcb` has been on a CPU: counted as it comes off one and
+/// at each timer tick while it runs, so never more than a tick behind and
+/// never going back.
+pub fn cpuTicksOf(pcb: *const PCB) u64 {
+    return @atomicLoad(u64, &pcb.acct_run_ticks, .monotonic);
+}
+
+/// A dying thread's ticks move to its lead under this, so a sum over the
+/// group counts each tick once.
+var cpu_fold_lock: SpinLock = .{};
+
+/// CPU ticks of the whole group `tgid`: its threads' and those of the
+/// threads that ended.
+pub fn groupCpuTicks(tgid: u8) u64 {
+    const flags = cpu_fold_lock.acquireIrqSave();
+    defer cpu_fold_lock.releaseIrqRestore(flags);
+    var sum = process.procs[tgid].ended_run_ticks;
+    for (&process.procs) |*p| {
+        if (p.state == .unused or p.state == .loading or p.tgid != tgid) continue;
+        sum += cpuTicksOf(p);
+    }
+    return sum;
+}
+
+/// Thread `pid` of group `tgid` ends: its ticks stay in the group's count.
+/// The caller has it off its CPU, or is the thread itself with interrupts
+/// off, so nothing accounts for it meanwhile; the slice start goes out of
+/// reach so the state change still to come adds nothing after the move.
+pub fn foldCpuTicks(pid: usize, tgid: u8) void {
+    const flags = cpu_fold_lock.acquireIrqSave();
+    defer cpu_fold_lock.releaseIrqRestore(flags);
+    const t = &process.procs[pid];
+    t.slice_start_tick = std.math.maxInt(u64);
+    process.procs[tgid].ended_run_ticks += t.acct_run_ticks;
+    @atomicStore(u64, &t.acct_run_ticks, 0, .monotonic);
+}
+
 /// CFS: bump current.vruntime by ticks consumed since slice start, and
 /// raise the per-band min_vruntime floor so a future sleeper bonus or
 /// migration translation reflects this CPU's actual progress. Called
@@ -1089,6 +1126,7 @@ fn accountRunningTick(pid: usize, commit_slice_start: bool) void {
         return;
     }
     const delta = now - start;
+    pcb.acct_run_ticks += delta;
     // Weighted CFS accrual in fixed-point VRUNTIME_SCALE units. The old
     // "TRIAGE: nice scaling temporarily disabled" state wasn't about the
     // multiply/divide being slow — the math itself was broken at tick
@@ -3183,21 +3221,24 @@ pub const FutexResult = enum { woke, signalled, again, timed_out };
 /// `addr` is the futex word's user VA (the wake key, with the tgid);
 /// `deadline` a tick_count at which wakeExpired ends the wait, 0 for none.
 pub fn blockOnFutex(addr: usize, word: *const volatile u32, val: u32, deadline: u64) FutexResult {
+    return blockOnFutexAt(0, addr, word, val, deadline);
+}
+
+/// blockOnFutex on a word in memory that processes share: `obj` names what
+/// backs it and `addr` is the word's offset in that, the same for every
+/// process that maps it. `obj` 0 is a word in private memory at VA `addr`.
+pub fn blockOnFutexAt(obj: u64, addr: usize, word: *const volatile u32, val: u32, deadline: u64) FutexResult {
     const cur = smp.currentPid() orelse return .woke;
     const pcb = &process.procs[cur];
     spinlock.mightSleep(@src());
     if (hasPendingDeliverable(pcb)) return .signalled;
 
-    // H3: test-and-clear instead of unconditional store. A signal arriving
-    // between hasPendingDeliverable and the wake_pending reset would set
-    // wake_pending=true; an unconditional store(false) would stomp it and
-    // Race A below (word != val) can't catch signal-driven wakes since
-    // signals don't change the futex word. Mirrors the 2026-05-19 blockOn
-    // lost-wake fix.
-    if (@atomicRmw(bool, &pcb.wake_pending, .Xchg, false, .acq_rel)) {
-        if (hasPendingDeliverable(pcb)) return .signalled;
-        return .woke;
-    }
+    // Test-and-clear: a signal that arrived since the look above set
+    // wake_pending, and a plain store of false would lose it. Without such
+    // a signal the flag is an earlier wait's leftover: a FUTEX_WAKE finds
+    // only an enrolled waiter, so it is no reason to return.
+    if (@atomicRmw(bool, &pcb.wake_pending, .Xchg, false, .acq_rel) and hasPendingDeliverable(pcb)) return .signalled;
+    @atomicStore(u64, &pcb.futex_obj, obj, .release);
     @atomicStore(usize, &pcb.futex_addr, addr, .release);
     // Stored even when 0, so a deadline left from an earlier wait can't end
     // this one.
@@ -3210,8 +3251,9 @@ pub fn blockOnFutex(addr: usize, word: *const volatile u32, val: u32, deadline: 
     // the waker changes *uaddr, THEN calls FUTEX_WAKE.) Seeing the new value
     // means the wake is already in flight / done — don't park.
     if (word.* != val) return futexBackOut(pcb, cur, deadline, .again);
-    // Race B: a FUTEX_WAKE landed during enrollment — wake() set wake_pending.
-    if (@atomicLoad(bool, &pcb.wake_pending, .acquire)) return futexBackOut(pcb, cur, deadline, .woke);
+    // Race B: a wake landed during enrollment. It set wake_pending — or, a
+    // waker that set it before the clear above, has claimed the wait since.
+    if (@atomicLoad(bool, &pcb.wake_pending, .acquire) or !inFutexWait(pcb)) return futexBackOut(pcb, cur, deadline, .woke);
     // Already due: wakeExpired drops a due deadline whose task was not
     // .sleeping yet.
     if (deadline != 0 and process.tick_count >= deadline) return futexBackOut(pcb, cur, deadline, .timed_out);
@@ -3236,6 +3278,12 @@ inline fn claimFutexWait(pcb: *PCB) bool {
     return claimWait(pcb, .futex);
 }
 
+/// The .futex wait `pcb` enrolled in is still unclaimed.
+inline fn inFutexWait(pcb: *const PCB) bool {
+    const k: *const u8 = @ptrCast(&pcb.wait_kind);
+    return @atomicLoad(u8, k, .acquire) == @intFromEnum(WaitKind.futex);
+}
+
 /// Move wait_kind from `kind` to .none; false when the wait is no longer
 /// of that kind (ended, or the waiter is already in another). wait_target
 /// is left alone: nothing matches it under .none, and a store after the
@@ -3246,15 +3294,16 @@ inline fn claimWait(pcb: *PCB, kind: WaitKind) bool {
 }
 
 /// Leave a wait that was never slept in, reporting `why` if the waiter
-/// claims it — else what the one that did meant: a waker (it set
-/// wake_pending first) woke us, wakeExpired timed us out.
+/// claims it — else what the one that did meant: wakeExpired timed us out
+/// at a deadline that is due, a waker woke us (it set wake_pending first,
+/// though the entry to this wait may have cleared that since).
 fn futexBackOut(pcb: *PCB, cur: usize, deadline: u64, why: FutexResult) FutexResult {
     const mine = claimFutexWait(pcb);
     setState(cur, .running);
     disarmFutexDeadline(pcb, deadline);
     if (mine) return why;
     if (@atomicLoad(bool, &pcb.wake_pending, .acquire)) return .woke;
-    return .timed_out;
+    return if (deadline != 0 and process.tick_count >= deadline) .timed_out else .woke;
 }
 
 /// Drop a futex deadline wakeExpired hasn't consumed.
@@ -3266,6 +3315,12 @@ inline fn disarmFutexDeadline(pcb: *PCB, deadline: u64) void {
 /// returns how many. Futexes are keyed by user VA, which means something
 /// only inside one address space — so by (tgid, VA).
 pub fn wakeFutex(tgid: u8, addr: usize, max: u32) u32 {
+    return wakeFutexAt(0, tgid, addr, max);
+}
+
+/// wakeFutex by what blockOnFutexAt waits on: with `obj` not 0, waiters of
+/// any process on offset `addr` of it.
+pub fn wakeFutexAt(obj: u64, tgid: u8, addr: usize, max: u32) u32 {
     // The caller's store to the futex word must be visible before the scan
     // reads wait_kind: the waiter enrolls, then re-reads the word (Dekker;
     // x86 lets a store pass a later load).
@@ -3276,10 +3331,11 @@ pub fn wakeFutex(tgid: u8, addr: usize, max: u32) u32 {
         const t = &process.procs[i];
         if (!waitsOn(t, .futex, @truncate(addr))) continue;
         if (@atomicLoad(usize, &t.futex_addr, .acquire) != addr) continue;
+        if (@atomicLoad(u64, &t.futex_obj, .acquire) != obj) continue;
         // Without this, process A waking VA X could spend its count on
         // process B's waiter at B's own VA X and leave A's real waiter
-        // parked: a lost wakeup.
-        if (t.tgid != tgid) continue;
+        // parked: a lost wakeup. Shared memory is one place for them all.
+        if (obj == 0 and t.tgid != tgid) continue;
         // Not a slot being torn down or reused with stale wait fields.
         const s = t.state;
         if (s != .sleeping and s != .running and s != .ready) continue;
@@ -3292,7 +3348,7 @@ pub fn wakeFutex(tgid: u8, addr: usize, max: u32) u32 {
             _ = setStateFrom(@intCast(i), .sleeping, .ready);
         // A waiter that left and began a wait on another word since the
         // checks above was just woken spuriously; it isn't one of ours.
-        if (@atomicLoad(usize, &t.futex_addr, .acquire) == addr) woken += 1;
+        if (@atomicLoad(usize, &t.futex_addr, .acquire) == addr and @atomicLoad(u64, &t.futex_obj, .acquire) == obj) woken += 1;
     }
     return woken;
 }

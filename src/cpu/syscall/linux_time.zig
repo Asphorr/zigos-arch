@@ -42,15 +42,7 @@ const CLOCK_TAI: u64 = 11;
 
 const TIMER_ABSTIME: u64 = 1;
 
-/// CPU time of the caller's whole group, in ticks: its live threads' counts.
-fn groupCpuTicks(tgid: u8) u64 {
-    var sum: u64 = 0;
-    for (&process.procs) |*p| {
-        if (p.state == .unused or p.tgid != tgid) continue;
-        sum += p.acct_cpu_ticks;
-    }
-    return sum;
-}
+pub const groupCpuTicks = process.groupCpuTicks;
 
 /// Now on `clock`, in nanoseconds; null for a clock we don't have.
 pub fn clockNanos(clock: u64) ?u64 {
@@ -58,7 +50,7 @@ pub fn clockNanos(clock: u64) ?u64 {
         CLOCK_REALTIME, CLOCK_REALTIME_COARSE, CLOCK_TAI => time.realtimeNanos(),
         CLOCK_MONOTONIC, CLOCK_MONOTONIC_RAW, CLOCK_MONOTONIC_COARSE, CLOCK_BOOTTIME => time.monotonicNanos(),
         CLOCK_PROCESS_CPUTIME_ID => groupCpuTicks((process.currentPCB() orelse return null).tgid) * TICK_NS,
-        CLOCK_THREAD_CPUTIME_ID => (process.currentPCB() orelse return null).acct_cpu_ticks * TICK_NS,
+        CLOCK_THREAD_CPUTIME_ID => process.cpuTicksOf(process.currentPCB() orelse return null) * TICK_NS,
         else => null,
     };
 }

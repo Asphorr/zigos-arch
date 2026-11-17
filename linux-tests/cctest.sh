@@ -30,6 +30,9 @@ echo "cctest: npm install took $(($(date +%s) - t0)) s"
 check installed "$([ -x /usr/local/bin/claude ] && echo yes)" yes
 check version "$(busybox timeout -s KILL 180 claude --version 2>&1 | grep -c 'Claude Code')" 1
 check help "$(busybox timeout -s KILL 180 claude --help 2>&1 | grep -c -i 'usage')" 1
+# The interactive screen: what it draws on a pty, and that it takes keys.
+busybox timeout -s KILL 400 python3 /etc/ccui.py 2>&1
+check screen $? 0
 rm -rf "$HOME"
 
 if [ "$fail" = 0 ]; then

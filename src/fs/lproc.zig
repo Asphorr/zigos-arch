@@ -43,6 +43,7 @@ pub const Kind = enum(u8) {
     sys_fs,
     sys_net,
     sys_net_core,
+    sys_zigos,
 
     self_link,
     thread_self_link,
@@ -76,6 +77,7 @@ pub const Kind = enum(u8) {
     file_max,
     nr_open,
     somaxconn,
+    trace_paths,
 
     p_stat,
     p_statm,
@@ -97,7 +99,7 @@ pub const Class = enum { dir, file, link };
 
 pub fn classOf(k: Kind) Class {
     return switch (k) {
-        .root, .pid_dir, .task_dir, .tid_dir, .fd_dir, .sys, .sys_kernel, .sys_kernel_random, .sys_vm, .sys_fs, .sys_net, .sys_net_core => .dir,
+        .root, .pid_dir, .task_dir, .tid_dir, .fd_dir, .sys, .sys_kernel, .sys_kernel_random, .sys_vm, .sys_fs, .sys_net, .sys_net_core, .sys_zigos => .dir,
         .self_link, .thread_self_link, .mounts_link, .exe_link, .cwd_link, .root_link, .fd_link => .link,
         else => .file,
     };
@@ -162,6 +164,7 @@ const sys_entries = [_]Entry{
     .{ .name = "vm", .kind = .sys_vm },
     .{ .name = "fs", .kind = .sys_fs },
     .{ .name = "net", .kind = .sys_net },
+    .{ .name = "zigos", .kind = .sys_zigos },
 };
 const sys_kernel_entries = [_]Entry{
     .{ .name = "ostype", .kind = .ostype },
@@ -188,6 +191,12 @@ const sys_fs_entries = [_]Entry{
 };
 const sys_net_entries = [_]Entry{.{ .name = "core", .kind = .sys_net_core }};
 const sys_net_core_entries = [_]Entry{.{ .name = "somaxconn", .kind = .somaxconn }};
+/// ZigOS's own switches, not Linux's.
+const sys_zigos_entries = [_]Entry{.{ .name = "trace_paths", .kind = .trace_paths }};
+
+/// (a) /proc/sys/zigos/trace_paths: a line on the kernel log for every
+/// call a Linux program names a file in (linux.tracePath).
+pub var trace_paths: bool = false;
 
 /// The named children a directory always has.
 fn fixedChildren(k: Kind) []const Entry {
@@ -202,6 +211,7 @@ fn fixedChildren(k: Kind) []const Entry {
         .sys_fs => &sys_fs_entries,
         .sys_net => &sys_net_entries,
         .sys_net_core => &sys_net_core_entries,
+        .sys_zigos => &sys_zigos_entries,
         else => &.{},
     };
 }
@@ -250,7 +260,7 @@ fn parentOf(n: Node) Node {
         .task_dir => .{ .kind = .pid_dir, .pid = n.tgid, .tgid = n.tgid },
         .tid_dir => .{ .kind = .task_dir, .pid = n.tgid, .tgid = n.tgid },
         .fd_dir => .{ .kind = if (n.in_task) .tid_dir else .pid_dir, .pid = n.pid, .tgid = n.tgid, .in_task = n.in_task },
-        .sys_kernel, .sys_vm, .sys_fs, .sys_net => .{ .kind = .sys },
+        .sys_kernel, .sys_vm, .sys_fs, .sys_net, .sys_zigos => .{ .kind = .sys },
         .sys_kernel_random => .{ .kind = .sys_kernel },
         .sys_net_core => .{ .kind = .sys_net },
         else => .{ .kind = .root },
@@ -371,7 +381,7 @@ fn fileOf(n: Node, fd: u32) ?*file.File {
 /// kinds that have none.
 pub fn fileName(f: *file.File, out: *[256]u8) ?[]const u8 {
     return switch (f.kind) {
-        .ext2 => nameOf(f.inode, out) orelse std.fmt.bufPrint(out, "/ (inode {d})", .{f.inode}) catch null,
+        .ext2 => ext2Name(f, out),
         .pipe => std.fmt.bufPrint(out, "pipe:[{d}]", .{f.pipe_id}) catch null,
         .socket, .tcp_sock, .tcp_listener => std.fmt.bufPrint(out, "socket:[{d}]", .{@intFromPtr(f) & 0xFFFFFF}) catch null,
         .epoll => copyOut(out, "anon_inode:[eventpoll]"),
@@ -386,6 +396,19 @@ pub fn fileName(f: *file.File, out: *[256]u8) ?[]const u8 {
     };
 }
 
+/// An open ext2 file's path. A file a Linux program opened is named as its
+/// directory names it now, or " (deleted)" as on Linux once it has no name
+/// there; a directory, and a file opened otherwise, by its inode.
+fn ext2Name(f: *file.File, out: *[256]u8) ?[]const u8 {
+    if (f.dir_inode != 0) {
+        if (ext2.pathIn(f.dir_inode, f.inode, out)) |p| return p;
+        var was: [256]u8 = undefined;
+        const old = noted(f.inode, &was) orelse "/";
+        return std.fmt.bufPrint(out, "{s} (deleted)", .{old}) catch null;
+    }
+    return nameOf(f.inode, out) orelse std.fmt.bufPrint(out, "/ (inode {d})", .{f.inode}) catch null;
+}
+
 /// The pts number of terminal `id`, if it is a pty's.
 fn ptsOf(id: u8) ?u32 {
     const t = tty.get(id) orelse return null;
@@ -393,7 +416,25 @@ fn ptsOf(id: u8) ?u32 {
     return pty.ptsOfTty(id);
 }
 
-/// "/proc/..." for a node: what a directory fd stands for in the *at calls.
+/// The directory a file or link is in, and its name there. Null for a
+/// descriptor's link, which has a number for a name.
+fn homeOf(n: Node) ?struct { dir: Node, name: []const u8 } {
+    const dirs = [_]Kind{ .root, .pid_dir, .sys, .sys_kernel, .sys_kernel_random, .sys_vm, .sys_fs, .sys_net, .sys_net_core, .sys_zigos };
+    for (dirs) |d| {
+        for (fixedChildren(d)) |e| {
+            if (e.kind != n.kind) continue;
+            const dir: Node = if (d == .pid_dir)
+                .{ .kind = if (n.in_task) .tid_dir else .pid_dir, .pid = n.pid, .tgid = n.tgid, .in_task = n.in_task }
+            else
+                .{ .kind = d };
+            return .{ .dir = dir, .name = e.name };
+        }
+    }
+    return null;
+}
+
+/// "/proc/..." for a node: what a directory fd stands for in the *at calls,
+/// and the name an open file of /proc goes by.
 pub fn pathOf(n: Node, out: *[256]u8) ?[]const u8 {
     return switch (n.kind) {
         .root => copyOut(out, "/proc"),
@@ -411,7 +452,13 @@ pub fn pathOf(n: Node, out: *[256]u8) ?[]const u8 {
         .sys_fs => copyOut(out, "/proc/sys/fs"),
         .sys_net => copyOut(out, "/proc/sys/net"),
         .sys_net_core => copyOut(out, "/proc/sys/net/core"),
-        else => copyOut(out, "/proc"),
+        .sys_zigos => copyOut(out, "/proc/sys/zigos"),
+        else => {
+            const home = homeOf(n) orelse return copyOut(out, "/proc");
+            var dir_buf: [256]u8 = undefined;
+            const dir = pathOf(home.dir, &dir_buf) orelse return null;
+            return std.fmt.bufPrint(out, "{s}/{s}", .{ dir, home.name }) catch null;
+        },
     };
 }
 
@@ -436,8 +483,13 @@ pub fn noteName(inum: u32, path: []const u8) void {
     @memcpy(e.path[0..path.len], path);
 }
 
+/// A directory's path is found by walking up. A file's is the noted one
+/// while it still names this inode: the number may have been another
+/// file's before.
 fn nameOf(inum: u32, out: *[256]u8) ?[]const u8 {
-    return noted(inum, out) orelse ext2.pathOf(inum, out);
+    if (ext2.pathOf(inum, out)) |p| return p;
+    const p = noted(inum, out) orelse return null;
+    return if (ext2.lookupPath(std.mem.trimLeft(u8, p, "/")) == inum) p else null;
 }
 
 fn noted(inum: u32, out: *[256]u8) ?[]const u8 {
@@ -464,7 +516,7 @@ fn inoOf(n: Node) u64 {
 }
 
 fn writable(k: Kind) bool {
-    return k == .p_oom_score_adj;
+    return k == .p_oom_score_adj or k == .trace_paths;
 }
 
 pub fn facts(n: Node) Facts {
@@ -567,44 +619,61 @@ fn release(f: *file.File) void {
     heap.kfree(@ptrCast(o));
 }
 
-/// Most bytes a file renders to.
-const RENDER_MAX: usize = 128 * 1024;
+/// The scratch buffer a file is first rendered in, and the most bytes one
+/// renders to (maps of an address space with tens of thousands of regions).
+const RENDER_FIRST: usize = 128 * 1024;
+const RENDER_MAX: usize = 8 * 1024 * 1024;
 
 fn read(f: *file.File, pcb: *process.PCB, buf: [*]u8, count: u32) u32 {
     _ = pcb;
+    const n = readAt(f, f.offset, buf, count);
+    if (n < errno.ERR_SENTINEL_BASE) f.offset += n;
+    return n;
+}
+
+/// Up to `count` bytes of the file's text from `off` (pread); the file's
+/// own offset stays put. A read from the start renders the text anew.
+pub fn readAt(f: *file.File, off: u64, buf: [*]u8, count: u32) u32 {
     const o = openOf(f) orelse return errno.err(.EBADF);
+    if (classOf(o.node.kind) == .dir) return errno.err(.EISDIR);
     o.render_lock.acquire();
     defer o.render_lock.release();
-    if (f.offset == 0 or o.snap == null) {
+    if (off == 0 or o.snap == null) {
         const fresh = render(o.node) orelse return errno.err(.ENOMEM);
         if (o.snap) |s| heap.kfree(s.ptr);
         o.snap = fresh;
     }
     const snap = o.snap.?;
-    if (f.offset >= snap.len) return 0;
-    const at: usize = @intCast(f.offset);
+    if (off >= snap.len) return 0;
+    const at: usize = @intCast(off);
     const n = @min(count, snap.len - at);
     if (!usercopy.copyToUser(@intFromPtr(buf), snap[at..][0..n])) return errno.err(.EFAULT);
-    f.offset += n;
     return @intCast(n);
 }
 
-/// What a program writes to oom_score_adj is taken and forgotten.
-fn write(f: *file.File, _: *process.PCB, _: [*]const u8, count: u32) u32 {
+/// What a program writes to oom_score_adj is taken and forgotten;
+/// trace_paths goes on with "1", off with anything else.
+fn write(f: *file.File, _: *process.PCB, buf: [*]const u8, count: u32) u32 {
     const o = openOf(f) orelse return errno.err(.EBADF);
     if (!writable(o.node.kind)) return errno.err(.EACCES);
+    if (o.node.kind == .trace_paths and count > 0) @atomicStore(bool, &trace_paths, buf[0] == '1', .monotonic);
     return count;
 }
 
 /// The node's text in a buffer of its own size. Null when memory is out.
+/// A text that fills the scratch buffer is rendered again in a larger one.
 fn render(n: Node) ?[]u8 {
-    const scratch = heap.kmalloc(RENDER_MAX) orelse return null;
-    defer heap.kfree(scratch);
-    var out = Out{ .buf = scratch[0..RENDER_MAX] };
-    fill(n, &out);
-    const kept = heap.kmalloc(@max(out.len, 1)) orelse return null;
-    @memcpy(kept[0..out.len], out.buf[0..out.len]);
-    return kept[0..out.len];
+    var size: usize = RENDER_FIRST;
+    while (true) : (size *= 4) {
+        const scratch = heap.kmalloc(size) orelse return null;
+        defer heap.kfree(scratch);
+        var out = Out{ .buf = scratch[0..size] };
+        fill(n, &out);
+        if (out.len == size and size < RENDER_MAX) continue;
+        const kept = heap.kmalloc(@max(out.len, 1)) orelse return null;
+        @memcpy(kept[0..out.len], out.buf[0..out.len]);
+        return kept[0..out.len];
+    }
 }
 
 /// A buffer rendering appends to; what doesn't fit is cut.
@@ -658,6 +727,7 @@ fn fill(n: Node, out: *Out) void {
         .file_max => out.print("{d}\n", .{@as(u64, process.MAX_PROCS) * config.MAX_FDS}),
         .nr_open => out.print("{d}\n", .{config.MAX_FDS}),
         .somaxconn => out.put("4096\n"),
+        .trace_paths => out.put(if (@atomicLoad(bool, &trace_paths, .monotonic)) "1\n" else "0\n"),
         .p_mounts => renderMounts(out),
         .p_mountinfo => renderMountinfo(out),
         .p_cgroup => out.put("0::/\n"),
@@ -1035,12 +1105,7 @@ fn threadsOf(lead: *const process.PCB) u32 {
 
 /// The process's CPU time in clock ticks: its threads' together.
 fn cpuTicks(lead: *const process.PCB) u64 {
-    var t: u64 = 0;
-    for (&process.procs) |*p| {
-        if (p.state == .unused or p.state == .loading) continue;
-        if (p.tgid == lead.tgid) t += p.acct_cpu_ticks;
-    }
-    return t;
+    return process.groupCpuTicks(lead.tgid);
 }
 
 fn parentNr(p: *const process.PCB) u32 {
@@ -1115,7 +1180,7 @@ fn renderPidStat(view: *process.PCB, lead: *process.PCB, in_task: bool, out: *Ou
     const t = ttyFacts(lead);
     const vm = vmOf(lead);
     const sets = sigSets(lead);
-    const ticks = if (in_task) view.acct_cpu_ticks else cpuTicks(lead);
+    const ticks = if (in_task) process.cpuTicksOf(view) else cpuTicks(lead);
     const pending = @atomicLoad(u64, &view.pending_signals, .acquire) | @atomicLoad(u64, &lead.shared_pending, .acquire);
     out.print("{d} ({s}) {c} {d} {d} {d} {d} {d} 0 {d} 0 0 0 {d} 0 0 0 {d} {d} {d} 0 {d} {d} {d} 18446744073709551615 ", .{
         view.pid_nr,                  nameOfTask(view),        stateChar(view),

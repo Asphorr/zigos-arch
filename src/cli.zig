@@ -789,7 +789,9 @@ fn cmdStack(pid_str: ?[]const u8) void {
 
             var rbp = saved_rbp;
             var depth: u32 = 0;
-            while (rbp > 0x400000 and rbp < 0x600000 and depth < 10) : (depth += 1) {
+            // Frames on a native program's stack.
+            const memmap = @import("mm/memmap.zig");
+            while (rbp > memmap.NATIVE_STACK_BOTTOM and rbp < memmap.USER_VA_FLOOR and depth < 10) : (depth += 1) {
                 const f: [*]const usize = @ptrFromInt(rbp);
                 const ret_addr: u64 = @intCast(f[1]);
                 vga.print("  [{d}] ", .{depth});

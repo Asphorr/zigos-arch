@@ -1,5 +1,5 @@
-// Static pool of POSIX-style anonymous pipes. Each pipe is a 4KB ring buffer
-// with reader/writer refcounts. Read blocks if the buffer is empty (and there's
+// Static pool of POSIX-style anonymous pipes. Each pipe is a ring buffer of
+// PIPE_BUF_SIZE bytes with reader/writer refcounts. Read blocks if the buffer is empty (and there's
 // still a writer); write blocks if the buffer is full. Blocking is implemented
 // by setting the calling process's wait_kind/wait_target and yielding via
 // `int $0x20`; the other end clears the flag via process.wake when it makes
@@ -23,6 +23,7 @@ const fdpoll = @import("../cpu/ipc/fdpoll.zig");
 const spinlock = @import("spinlock.zig");
 const slot_table = @import("../util/slot_table.zig");
 const usercopy = @import("../cpu/arch/usercopy.zig");
+const PidSet = @import("../util/pid_set.zig").PidSet;
 
 pub const PIPE_BUF_SIZE: u32 = config.PIPE_BUF_SIZE;
 pub const MAX_PIPES: u8 = config.MAX_PIPES;
@@ -56,8 +57,10 @@ pub const Pipe = struct {
     readers: u8 = 0, // refcount of read-side fds
     writers: u8 = 0, // refcount of write-side fds
     in_use: bool = false,
-    blocked_reader_pid: u8 = 0xFF, // 0xFF = none
-    blocked_writer_pid: u8 = 0xFF,
+    /// Tasks about to park, or parked, in read() and in write(). A wake
+    /// takes the whole set: each looks again and parks anew if it must.
+    parked_readers: PidSet = .{},
+    parked_writers: PidSet = .{},
     /// Set on pipes whose read end is drained by the desktop loop's
     /// non-blocking tryRead poll (terminal window out_pipes). When a
     /// write lands on such a pipe, the desktop's event-driven sleep
@@ -80,7 +83,7 @@ pub const Pipe = struct {
     /// the IRQ0 validator on the other CPU could sample a torn (head
     /// bumped, count not yet) intermediate and false-panic. Refcounts and
     /// blocked pids were brought under it 2026-07-16: closeWriter reading
-    /// blocked_reader_pid unlocked could interleave with a parking reader
+    /// the parked reader unlocked could interleave with a parking reader
     /// such that neither the EOF-check nor the wake fired (permanent park
     /// on ordinary `a | b` teardown), and the unlocked `readers -= 1`
     /// RMWs could lose updates under concurrent close/spawn (premature
@@ -99,6 +102,30 @@ pub const Pipe = struct {
 };
 
 pub var pipes: [MAX_PIPES]Pipe = [_]Pipe{.{}} ** MAX_PIPES;
+
+/// The tasks in `set`, taken out of it. Under the pipe lock; wakeAll runs
+/// once the lock is dropped (process.wake must not nest under it).
+fn takeParked(set: *PidSet) PidSet {
+    const out = set.*;
+    set.* = .{};
+    return out;
+}
+
+fn wakeAll(set: *const PidSet) void {
+    for (set.words, 0..) |word, wi| {
+        var left = word;
+        while (left != 0) : (left &= left - 1) {
+            process.wake(@intCast(wi * 64 + @ctz(left)));
+        }
+    }
+}
+
+/// How many tasks `set` holds, for the diagnostics.
+pub fn parkedCount(set: *const PidSet) u32 {
+    var n: u32 = 0;
+    for (set.words) |word| n += @popCount(word);
+    return n;
+}
 
 /// Allocate a new pipe. Returns the pipe id. Both refcounts start at 1 — the
 /// caller is expected to install one read fd and one write fd into the
@@ -172,19 +199,15 @@ pub fn readOpt(id: u8, out: []u8, block: bool) usize {
             copied += done;
             if (done > 0) freed_space = true;
 
-            // Capture the blocked writer, then drop the lock BEFORE waking:
+            // Capture the parked writers, then drop the lock BEFORE waking:
             // process.wake may take sched_lock, which must never nest under
-            // the (cli-held) pipe lock. Steal the registration only when the
-            // copy made progress — clearing it on a zero-progress fault and
-            // then bailing on EFAULT would leave the writer parked with
-            // nobody left to wake it.
-            var w: u8 = 0xFF;
-            if (done > 0 and p.blocked_writer_pid != 0xFF) {
-                w = p.blocked_writer_pid;
-                p.blocked_writer_pid = 0xFF;
-            }
+            // the (cli-held) pipe lock. Take them only when the copy made
+            // progress — clearing the set on a zero-progress fault and then
+            // bailing on EFAULT would leave the writers parked with nobody
+            // left to wake them.
+            const w: PidSet = if (done > 0) takeParked(&p.parked_writers) else .{};
             p.lock.releaseIrqRestore(flags);
-            if (w != 0xFF) process.wake(w);
+            wakeAll(&w);
             if (done < n) {
                 // Copy faulted — resolve outside the lock, or give up.
                 fault_tries += 1;
@@ -223,30 +246,17 @@ pub fn readOpt(id: u8, out: []u8, block: bool) usize {
         // .signalled branch returns the partial count (zero or otherwise)
         // and lets the syscall-return signal-delivery path run; without
         // this we'd loop forever (process.wake flips state but the signal
-        // stays pending until exit-to-user). Set blocked_reader_pid UNDER
+        // stays pending until exit-to-user). Enter parked_readers UNDER
         // the lock (so a racing writer's wake-check observes it), then
         // release before parking — blockOnInterruptible must never run
         // with the pipe lock (or cli) held.
         const my_pid: u8 = @intCast(process.getCurrentPid());
-        const displaced = p.blocked_reader_pid;
-        p.blocked_reader_pid = my_pid;
+        p.parked_readers.set(my_pid);
         p.lock.releaseIrqRestore(flags);
-        // Single-slot waiter registry: a second parked reader displaces the
-        // first, which then sleeps until a signal or writer-close. No
-        // workload parks two readers on one pipe today (pipelines are 1:1;
-        // a shell waits in waitpid while its child owns stdin) — logged
-        // AFTER the lock drop (serial takes its own lock; this one is a
-        // leaf) so it's loud if that ever changes.
-        if (displaced != 0xFF and displaced != my_pid) {
-            debug.klog("[pipe] WARN: reader wait-slot collision pipe={d} displaced pid={d} by pid={d}\n", .{ id, displaced, my_pid });
-        }
         const br = process.blockOnInterruptible(.pipe_read, id);
         if (br == .signalled) {
             const f2 = p.lock.acquireIrqSave();
-            // Clear only OUR registration — a waker may have already
-            // cleared it and a different reader re-registered meanwhile;
-            // stomping that would strand them.
-            if (p.blocked_reader_pid == my_pid) p.blocked_reader_pid = 0xFF;
+            p.parked_readers.clear(my_pid);
             p.lock.releaseIrqRestore(f2);
             if (freed_space) fdpoll.wakePollers(.pipe, id);
             return if (copied > 0) copied else PIPE_INTR;
@@ -272,7 +282,6 @@ pub fn tryRead(id: u8, out: []u8) usize {
     const p = &pipes[id];
     if (!p.in_use) return 0;
     var copied: usize = 0;
-    var wake_w: u8 = 0xFF;
     const flags = p.lock.acquireIrqSave();
     while (copied < out.len and p.count > 0) {
         const wanted = out.len - copied;
@@ -283,13 +292,10 @@ pub fn tryRead(id: u8, out: []u8) usize {
         p.tail = (p.tail + @as(u32, @intCast(n))) % PIPE_BUF_SIZE;
         p.count -= @intCast(n);
         copied += n;
-        if (p.blocked_writer_pid != 0xFF) {
-            wake_w = p.blocked_writer_pid;
-            p.blocked_writer_pid = 0xFF;
-        }
     }
+    const wake_w: PidSet = if (copied > 0) takeParked(&p.parked_writers) else .{};
     p.lock.releaseIrqRestore(flags);
-    if (wake_w != 0xFF) process.wake(wake_w);
+    wakeAll(&wake_w);
     if (copied > 0) fdpoll.wakePollers(.pipe, id);
     return copied;
 }
@@ -341,15 +347,11 @@ pub fn writeOpt(id: u8, data: []const u8, block: bool) usize {
 
             // Capture wake targets, drop the lock, THEN wake — keep
             // process.wake / the compositor wake out of the cli section.
-            // Registration stolen only on progress — see read().
-            var r: u8 = 0xFF;
-            if (done > 0 and p.blocked_reader_pid != 0xFF) {
-                r = p.blocked_reader_pid;
-                p.blocked_reader_pid = 0xFF;
-            }
+            // The parked readers are taken only on progress — see read().
+            const r: PidSet = if (done > 0) takeParked(&p.parked_readers) else .{};
             const wake_desktop = p.wake_desktop_on_write and done > 0;
             p.lock.releaseIrqRestore(flags);
-            if (r != 0xFF) process.wake(r);
+            wakeAll(&r);
             if (wake_desktop) @import("../ui/desktop/wake.zig").requestWake();
             if (done < n) {
                 // Copy faulted — resolve outside the lock, or give up.
@@ -373,15 +375,10 @@ pub fn writeOpt(id: u8, data: []const u8, block: bool) usize {
         // Ring full — sleep until reader drains. Bail on pending signal
         // with whatever partial count we have so the syscall-return
         // delivery path runs. Caller can retry after handler returns.
-        // blocked_writer_pid set under the lock, released before parking.
+        // parked_writers entered under the lock, released before parking.
         const my_pid: u8 = @intCast(process.getCurrentPid());
-        const displaced = p.blocked_writer_pid;
-        p.blocked_writer_pid = my_pid;
+        p.parked_writers.set(my_pid);
         p.lock.releaseIrqRestore(flags);
-        // Same single-slot collision diagnostic as read() — see there.
-        if (displaced != 0xFF and displaced != my_pid) {
-            debug.klog("[pipe] WARN: writer wait-slot collision pipe={d} displaced pid={d} by pid={d}\n", .{ id, displaced, my_pid });
-        }
         // What this write filled the ring with must reach a reader that
         // polls rather than reads, or neither side ever moves.
         if (pushed_data) {
@@ -391,8 +388,7 @@ pub fn writeOpt(id: u8, data: []const u8, block: bool) usize {
         const br = process.blockOnInterruptible(.pipe_write, id);
         if (br == .signalled) {
             const f2 = p.lock.acquireIrqSave();
-            // Clear only OUR registration — see read()'s .signalled path.
-            if (p.blocked_writer_pid == my_pid) p.blocked_writer_pid = 0xFF;
+            p.parked_writers.clear(my_pid);
             p.lock.releaseIrqRestore(f2);
             if (pushed_data) fdpoll.wakePollers(.pipe, id);
             return if (written > 0) written else PIPE_INTR;
@@ -415,7 +411,6 @@ pub fn tryWrite(id: u8, data: []const u8) usize {
     if (!p.in_use) return 0;
     if (p.readers == 0) return 0; // EPIPE-ish — drop the write
     var written: usize = 0;
-    var wake_r: u8 = 0xFF;
     const flags = p.lock.acquireIrqSave();
     while (written < data.len and p.count < PIPE_BUF_SIZE) {
         const free = PIPE_BUF_SIZE - p.count;
@@ -426,14 +421,11 @@ pub fn tryWrite(id: u8, data: []const u8) usize {
         p.head = (p.head + @as(u32, @intCast(n))) % PIPE_BUF_SIZE;
         p.count += @intCast(n);
         written += n;
-        if (p.blocked_reader_pid != 0xFF) {
-            wake_r = p.blocked_reader_pid;
-            p.blocked_reader_pid = 0xFF;
-        }
     }
+    const wake_r: PidSet = if (written > 0) takeParked(&p.parked_readers) else .{};
     const wake_desktop = p.wake_desktop_on_write;
     p.lock.releaseIrqRestore(flags);
-    if (wake_r != 0xFF) process.wake(wake_r);
+    wakeAll(&wake_r);
     if (written > 0) {
         if (wake_desktop) @import("../ui/desktop/wake.zig").requestWake();
         fdpoll.wakePollers(.pipe, id);
@@ -441,12 +433,32 @@ pub fn tryWrite(id: u8, data: []const u8) usize {
     return written;
 }
 
+/// The bytes waiting in pipe `id` (FIONREAD).
+pub fn pending(id: u8) u32 {
+    if (id >= MAX_PIPES) return 0;
+    const p = &pipes[id];
+    const flags = p.lock.acquireIrqSave();
+    defer p.lock.releaseIrqRestore(flags);
+    return if (p.in_use) p.count else 0;
+}
+
+/// Task `pid` is gone, perhaps killed while parked here: it waits on no
+/// pipe, so a later wake can't land on its slot's next task.
+pub fn leave(pid: usize) void {
+    for (&pipes) |*p| {
+        const flags = p.lock.acquireIrqSave();
+        defer p.lock.releaseIrqRestore(flags);
+        p.parked_readers.clear(pid);
+        p.parked_writers.clear(pid);
+    }
+}
+
 /// Decrement the reader refcount. If it hits zero AND no writers remain, free
 /// the pipe slot. Wakes any blocked writer (so it sees readers==0 and returns
 /// EPIPE instead of sleeping forever).
 ///
 /// Runs under the pipe lock (2026-07-16). Unlocked, this raced the writer's
-/// park in write(): the closer could read blocked_writer_pid before the
+/// park in write(): the closer could read the parked writers before the
 /// writer published it, while the writer read readers==1 before the
 /// decrement landed — a plain interleaving where neither the EPIPE-check
 /// nor the wake fires, leaving the writer parked forever. The lock forces
@@ -463,19 +475,16 @@ pub fn closeReader(id: u8) void {
         return;
     }
     if (p.readers > 0) p.readers -= 1;
-    // Capture the wake target under the lock, wake AFTER release —
+    // Capture the wake targets under the lock, wake AFTER release —
     // process.wake may take sched_lock, which must never nest under the
-    // (cli-held) pipe leaf lock. Same pattern as read()/write().
-    var w: u8 = 0xFF;
-    if (p.blocked_writer_pid != 0xFF) {
-        w = p.blocked_writer_pid;
-        p.blocked_writer_pid = 0xFF;
-    }
+    // (cli-held) pipe leaf lock. Same pattern as read()/write(). Every
+    // parked writer is woken: each is to see EPIPE.
+    const w = takeParked(&p.parked_writers);
     if (p.readers == 0 and p.writers == 0) {
         slot_table.recycle(Pipe, p);
     }
     p.lock.releaseIrqRestore(flags);
-    if (w != 0xFF) process.wake(w);
+    wakeAll(&w);
 
     // readers→0 means any POLLOUT poller now has to see POLLERR (next
     // write would EPIPE). Wake regardless of whether refcount actually
@@ -499,16 +508,13 @@ pub fn closeWriter(id: u8) void {
         return;
     }
     if (p.writers > 0) p.writers -= 1;
-    var r: u8 = 0xFF;
-    if (p.blocked_reader_pid != 0xFF) {
-        r = p.blocked_reader_pid;
-        p.blocked_reader_pid = 0xFF;
-    }
+    // Every parked reader is woken: each is to see the end of the data.
+    const r = takeParked(&p.parked_readers);
     if (p.readers == 0 and p.writers == 0) {
         slot_table.recycle(Pipe, p);
     }
     p.lock.releaseIrqRestore(flags);
-    if (r != 0xFF) process.wake(r);
+    wakeAll(&r);
 
     // writers→0 means any POLLIN poller now sees POLLHUP (next read
     // returns 0/EOF). Wake unconditionally — same reasoning as closeReader.

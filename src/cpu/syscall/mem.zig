@@ -587,19 +587,13 @@ pub fn sysMprotect(va: u32, len: u32, prot: u32) u32 {
         vmm.cacheMapFlags(new_prot)
     else
         vmm.protToMapFlags(new_prot);
-    var page = start;
-    while (page < end) : (page += 0x1000) {
-        // changePageProt returns false for not-yet-faulted-in pages — that's
-        // fine, the region's prot field is updated so the eventual fault-in
-        // sees the new bits.
-        _ = vmm.changePageProt(pd, page, new_flags);
-    }
+    // Pages not faulted in yet are left alone: the region's prot is what
+    // their fault-in maps them with.
+    vmm.reprotectUserRange(pd, start, end, new_flags);
 
-    // Cross-CPU TLB shootdown. changePageProt only does a local invlpg per
-    // page; without this, another CPU's TLB still caches the OLD prot bits
-    // and an mprotect(RW→RO) wouldn't actually block writes from that CPU
-    // until its TLB happens to evict the entry. Page by page for small
-    // ranges (see sysMunmap), the whole PCID for large ones.
+    // The walk invalidates nothing: without this every CPU's TLB still holds
+    // the old prot bits. Page by page for small ranges (see sysMunmap), the
+    // whole PCID for large ones.
     @import("../mmu/tlb.zig").shootdownRange(lead.pcid, start, len_pg / 0x1000);
     return 0;
 }

@@ -67,7 +67,7 @@ int main(void) {
     cfmakeraw(&raw);
     CHECK(tcsetattr(s, TCSANOW, &raw) == 0, "raw mode");
     CHECK(write(m, "ab", 2) == 2, "two keys at the master");
-    // A read takes a key at a time here (proc/tty.zig); Linux may give both.
+    // One read may give one key or both.
     char got[16] = {0};
     ssize_t have = 0;
     while (have < 2) {
@@ -78,6 +78,28 @@ int main(void) {
     CHECK(have == 2 && memcmp(got, "ab", 2) == 0, "the slave reads them as they are, no line wanted");
     struct pollfd p = {.fd = m, .events = POLLIN};
     CHECK(poll(&p, 1, 100) == 0, "and nothing was echoed");
+
+    // Many keys: counted while they wait, many to a read, and a byte above
+    // 0x7F (half of a UTF-8 letter) is the byte that was sent.
+    unsigned char keys[200], back[256];
+    for (size_t i = 0; i < sizeof keys; i++) keys[i] = (unsigned char)(0x80 + i % 0x40);
+    CHECK(write(m, keys, sizeof keys) == (ssize_t)sizeof keys, "200 keys at the master");
+    // They reach the slave a moment after the write on Linux.
+    int waiting = 0;
+    for (int i = 0; i < 100 && waiting != (int)sizeof keys; i++) {
+        if (ioctl(s, FIONREAD, &waiting) != 0) break;
+        if (waiting != (int)sizeof keys) usleep(10 * 1000);
+    }
+    CHECK(waiting == (int)sizeof keys, "FIONREAD at the slave counts them");
+    ssize_t first = read(s, back, sizeof back);
+    CHECK(first > 1, "a read takes more than a key");
+    have = first;
+    while (have < (ssize_t)sizeof keys) {
+        ssize_t r = read(s, back + have, sizeof back - (size_t)have);
+        if (r <= 0) break;
+        have += r;
+    }
+    CHECK(have == (ssize_t)sizeof keys && memcmp(back, keys, sizeof keys) == 0, "and they come as they were sent");
     CHECK(write(s, "x\ny", 3) == 3 && master_shows(m, "x\ny", 2000), "raw output: no \\r added");
     CHECK(tcsetattr(s, TCSANOW, &saved) == 0, "back to canonical");
     close(s);
@@ -121,7 +143,33 @@ int main(void) {
     while ((n = read(m, rest, sizeof rest)) > 0) {
     }
     CHECK(n == -1 && errno == EIO, "no slave left: the master reads EIO");
+
+    // The session that had the terminal is gone: another takes it, and the
+    // master's close hangs that one up.
+    CHECK(pipe(ready) == 0, "a pipe to start a second child");
+    c = fork();
+    if (c == 0) {
+        close(ready[0]);
+        close(m); // the parent's is the last
+        signal(SIGHUP, SIG_DFL);
+        if (setsid() < 0) _exit(10);
+        int t = open(name, O_RDWR);
+        if (t < 0) _exit(11);
+        if (tcgetpgrp(t) != getpid()) _exit(13);
+        if (write(ready[1], "x", 1) != 1) _exit(14);
+        for (;;) pause();
+    }
+    close(ready[1]);
+    CHECK(read(ready[0], &byte, 1) == 1, "a new session takes the terminal a dead one had");
+    close(ready[0]);
     CHECK(close(m) == 0, "close the master");
+    pid_t hung = 0;
+    for (int i = 0; i < 60 && (hung = waitpid(c, &st, WNOHANG)) == 0; i++) usleep(50 * 1000);
+    if (hung == 0) {
+        kill(c, SIGKILL);
+        waitpid(c, &st, 0);
+    }
+    CHECK(hung == c && WIFSIGNALED(st) && WTERMSIG(st) == SIGHUP, "which hangs the session up");
 
     errno = 0;
     CHECK(open("/dev/tty", O_RDWR) == -1 && errno == ENXIO, "no terminal for this session: /dev/tty is ENXIO");

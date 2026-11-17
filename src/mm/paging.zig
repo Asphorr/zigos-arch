@@ -31,6 +31,10 @@ pub const PAGE_SIZE_FLAG: u64 = 1 << 7;
 // (alloc + copy + remap R/W on write fault) from genuine read-only pages
 // (segfault on write). Bits 10/11 remain free for future flags.
 pub const COW: u64 = 1 << 9;
+// Software-available bit 52 — a user page its region's PROT_NONE keeps from
+// the program: PRESENT with USER clear, so the CPU refuses every user access
+// while the frame stays where the walkers find it (pte.holdsUserFrame).
+pub const PARKED: u64 = 1 << 52;
 
 // PAT bit positions — different for 4KB vs huge pages. Combined with
 // PCD/PWT, the 3 bits index into IA32_PAT MSR's 8 type slots.

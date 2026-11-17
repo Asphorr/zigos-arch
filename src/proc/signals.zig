@@ -260,6 +260,14 @@ pub const SEGV_ACCERR: u32 = 2; // invalid permissions for mapped object
 pub const ILL_ILLOPC: u32 = 1; // illegal opcode
 pub const FPE_INTDIV: u32 = 1; // integer divide by zero
 pub const TRAP_BRKPT: u32 = 1; // breakpoint
+pub const TRAP_TRACE: u32 = 2; // single step
+
+/// The flags a program may set: the arithmetic ones, DF, TF, AC, RF, ID.
+/// IF stays on and the rest (IOPL, NT, VM) off — sysret and iretq load what
+/// they are given.
+pub fn userFlags(saved: u64) u64 {
+    return (saved & 0x240DD5) | 0x202;
+}
 
 /// Saved user state stored on the user stack at signal delivery and read back
 /// by sigreturn. The handler receives a pointer to this as its 3rd arg
@@ -477,6 +485,14 @@ fn dropsAtSend(pcb: *process.PCB, signo: u32) bool {
     return d.handler == SIG_IGN or (d.handler == SIG_DFL and default_actions[signo] == .ignore);
 }
 
+/// True if `pcb`'s process asked to be left no zombies: SIGCHLD ignored
+/// outright, or SA_NOCLDWAIT on it. Its children are freed as they end.
+pub fn discardsChildren(pcb: *process.PCB) bool {
+    if (pcb.personality != .linux) return false;
+    const d = &dispositions(pcb)[SIGCHLD];
+    return d.handler == SIG_IGN or d.flags & SA_NOCLDWAIT != 0;
+}
+
 /// Mark `signo` pending on `target` and wake the target if it's parked. Idempotent
 /// — sending the same signal twice between deliveries collapses to one bit.
 /// Returns false on bad inputs (out-of-range pid, signo >= NSIG, dead target).
@@ -549,12 +565,23 @@ fn endsNow(lead: *process.PCB, signo: u32, only: ?*const process.PCB) bool {
     if (lead.sigactions[signo].handler != SIG_DFL) return false;
     const action = default_actions[signo];
     if (action != .term and action != .core) return false;
-    if (only) |t| return t.signal_mask & bit(signo) == 0;
+    if (only) |t| return t.signal_mask & bit(signo) == 0 and !awaits(t, signo);
+    // A thread in sigwait for it takes it, whoever else leaves it unblocked.
+    var open = false;
     for (&process.procs) |*t| {
         if (t.state == .unused or t.state == .loading or t.state == .zombie or t.tgid != lead.tgid) continue;
-        if (t.signal_mask & bit(signo) == 0) return true;
+        // The mask before the wait, as in the `only` case: sigtimedwait
+        // raises sigwait_set before it unblocks the signal.
+        const unblocked = @atomicLoad(u64, &t.signal_mask, .acquire) & bit(signo) == 0;
+        if (awaits(t, signo)) return false;
+        if (unblocked) open = true;
     }
-    return false;
+    return open;
+}
+
+/// True while thread `t` is in rt_sigtimedwait for `signo`.
+fn awaits(t: *const process.PCB, signo: u32) bool {
+    return @atomicLoad(u64, &t.sigwait_set, .acquire) & bit(signo) != 0;
 }
 
 /// kill(): sendProcess from a task that may end another. A Linux process
@@ -1041,7 +1068,7 @@ pub fn deliverFromSyscallFrame(pcb: *process.PCB, frame: *SyscallFrame, retval: 
         // Rewrite the saved syscall frame so the asm-side pop sequence loads
         // handler args into user RDI/RSI/RDX and sysret jumps to handler.
         frame.rcx = sa.handler; // sysret RIP
-        frame.r11 = (mctx_ptr.rflags & ~@as(u64, 0x100)) | 0x202; // clear TF, ensure IF
+        frame.r11 = (mctx_ptr.rflags & ~@as(u64, 0x500)) | 0x202; // clear TF and DF (ABI: DF=0 at entry), ensure IF
         frame.rdi = sig;
         frame.rsi = layout.siginfo_va; // 0 when SA_SIGINFO not set
         frame.rdx = layout.mctx_va;
@@ -1129,7 +1156,7 @@ pub fn deliverFromIrqFrame(pcb: *process.PCB, frame: *IrqFrame) void {
 
         frame.rip = sa.handler;
         frame.rsp = layout.ra_va;
-        frame.rflags = (frame.rflags & ~@as(u64, 0x100)) | 0x202;
+        frame.rflags = (frame.rflags & ~@as(u64, 0x500)) | 0x202;
         frame.rdi = sig;
         frame.rsi = layout.siginfo_va;
         frame.rdx = layout.mctx_va;
@@ -1229,7 +1256,7 @@ pub fn deliverFromExcFrame(pcb: *process.PCB, frame: *ExcFrame, signo: u32, faul
 
     frame.rip = sa.handler;
     frame.rsp = layout.ra_va;
-    frame.rflags = (frame.rflags & ~@as(u64, 0x100)) | 0x202;
+    frame.rflags = (frame.rflags & ~@as(u64, 0x500)) | 0x202;
     frame.rdi = signo;
     frame.rsi = layout.siginfo_va;
     frame.rdx = layout.mctx_va;
@@ -1283,7 +1310,7 @@ pub fn sigreturn(pcb: *process.PCB, frame: *SyscallFrame) u32 {
     frame.r14 = mctx_ptr.r14;
     frame.r15 = mctx_ptr.r15;
     frame.rcx = mctx_ptr.rip;
-    frame.r11 = mctx_ptr.rflags;
+    frame.r11 = userFlags(mctx_ptr.rflags);
     frame.user_rsp = mctx_ptr.rsp;
     const saved_mask = mctx_ptr.saved_mask;
     const ret_rax = mctx_ptr.rax;

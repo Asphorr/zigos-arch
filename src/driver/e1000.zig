@@ -274,13 +274,14 @@ pub fn dumpState() void {
 fn armIntx(d: pci.PciDevice) bool {
     const pin: u8 = @truncate(pci.configRead16(d.bus, d.dev, d.func, 0x3C) >> 8);
     if (pin == 0 or pin > 4 or d.bus != 0) return false; // _PRT covers bus 0
-    const gsi = @import("../acpi/aml.zig").gsiForPciPin(d.dev, pin - 1) orelse return false;
+    const intx = @import("../acpi/aml.zig").intxForPciPin(d.dev, pin - 1) orelse return false;
+    const gsi = intx.gsi;
     const dynirq = @import("../cpu/idt/dynirq.zig");
     const vec = dynirq.allocDynVector() orelse return false;
     dynirq.registerIrq(vec, &e1000IrqHandler);
     intx_vec = vec;
     intx_gsi = gsi;
-    if (!@import("../time/apic.zig").routePciIntx(gsi, vec)) {
+    if (!@import("../time/apic.zig").routePciIntx(gsi, vec, intx.low)) {
         intx_gsi = null;
         return false;
     }
@@ -333,12 +334,13 @@ fn e1000IrqHandler() callconv(.c) void {
         intx_foreign_run = 0;
     }
 
-    // At most RX_BATCH frames per run: each costs an ACK out and a wake,
-    // all with interrupts off. Frames that arrive meanwhile raise RXT0
-    // again; reading ICR until it stays clear takes them in this run, so
-    // the line is down at EOI.
+    // At most RX_BATCH frames per run: each costs a wake, and every other
+    // one an ACK out, all with interrupts off. Frames that arrive meanwhile
+    // raise RXT0 again; reading ICR until it stays clear takes them in this
+    // run, so the line is down at EOI.
     var budget: u32 = RX_BATCH;
     while (true) {
+        net.rxBatchBegin();
         while (budget > 0) : (budget -= 1) {
             const next = (rx_tail + 1) % NUM_RX_DESC;
             if ((rx_descs[next].status & RXD_STAT_DD) == 0) break;
@@ -350,6 +352,9 @@ fn e1000IrqHandler() callconv(.c) void {
             rx_tail = next;
         }
         mmioWrite(REG_RDT, rx_tail);
+        // The ACKs held back go out before the look at ICR below: the
+        // frames they bring in are this run's to take, not the EOI's.
+        net.rxBatchEnd();
         if (budget == 0) {
             // The rest in a run of its own, after the EOI.
             if (framesWaiting() != 0) mmioWrite(REG_ICS, ICR_RXT0);

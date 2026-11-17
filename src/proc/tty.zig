@@ -29,6 +29,14 @@ pub const NONE: u8 = 0xFF;
 const MAX: usize = 16;
 const LINE_MAX: usize = 256;
 const READY_MAX: usize = 512;
+/// Keys one turn of a raw-mode pty's read takes from its pipe.
+const KEYS_MAX: usize = 256;
+
+comptime {
+    // A line cut short by the change to raw mode and a turn's keys after
+    // it fit `ready` together.
+    std.debug.assert(LINE_MAX + KEYS_MAX <= READY_MAX);
+}
 
 /// struct termios as TCGETS and TCSETS pass it.
 pub const Termios = extern struct {
@@ -166,16 +174,34 @@ pub fn takeControl(id: u8, sid: u32, pgid: u32) bool {
     const t = get(id) orelse return false;
     t.lock.acquire();
     defer t.lock.release();
-    if (t.sid != 0 and t.sid != sid) return false;
+    // A pty whose session leader is gone is no session's any more.
+    if (t.sid != 0 and t.sid != sid and (!t.pty or leaderOf(t.sid) != null)) return false;
     t.sid = sid;
     @atomicStore(u32, &t.fg_pgid, pgid, .release);
     return true;
 }
 
+/// The slot of session `sid`'s leader, a Linux process, while it lives.
+fn leaderOf(sid: u32) ?u8 {
+    if (sid == 0) return null;
+    for (0..process.MAX_PROCS) |i| {
+        const p = &process.procs[i];
+        if (!session.isProcess(i) or p.state == .zombie or p.personality != .linux) continue;
+        if (p.pid_nr == sid and p.sid == sid) return @intCast(i);
+    }
+    return null;
+}
+
 /// The other side of the terminal is gone (a pty's master closed): its
-/// foreground group gets SIGHUP and SIGCONT, as on Linux.
+/// session's leader gets SIGHUP, its foreground group SIGHUP and SIGCONT,
+/// as on Linux.
 pub fn hangup(id: u8) void {
-    if (get(id) == null) return;
+    const t = get(id) orelse return;
+    if (leaderOf(t.sid)) |lead| {
+        if (process.procs[lead].pgid != @atomicLoad(u32, &t.fg_pgid, .acquire)) {
+            _ = signals.sendProcess(lead, signals.SIGHUP, .{});
+        }
+    }
     signalForeground(id, signals.SIGHUP);
     signalForeground(id, signals.SIGCONT);
 }
@@ -527,6 +553,7 @@ pub fn read(id: u8, out: []u8, nonblock: bool) ReadResult {
     if (out.len == 0) return .{ .bytes = 0 };
     while (true) {
         var no_wait = nonblock;
+        var raw = false;
         {
             t.lock.acquire();
             defer t.lock.release();
@@ -536,29 +563,48 @@ pub fn read(id: u8, out: []u8, nonblock: bool) ReadResult {
                 t.eof = false;
                 return .{ .bytes = 0 };
             }
-            if (t.termios.lflag & ICANON == 0 and t.termios.cc[VMIN] == 0) no_wait = true;
+            raw = t.termios.lflag & ICANON == 0;
+            if (raw and t.termios.cc[VMIN] == 0) no_wait = true;
         }
-        // One more key from the window, with no lock held: this may sleep.
-        var key: [1]u8 = undefined;
-        const got = if (no_wait) pipe.tryRead(t.in_pipe, &key) else pipe.read(t.in_pipe, &key);
+        // More keys, with no lock held: this may sleep. One at a time as a
+        // rule: a window's next key may be its native shell's to read, and
+        // a line's end or Ctrl+D is this read's to return at. A pty in raw
+        // mode takes as many as `ready`, empty here, has room for.
+        var keys: [KEYS_MAX]u8 = undefined;
+        const batch = keys[0..if (t.pty and raw) KEYS_MAX else 1];
+        const got = if (no_wait) pipe.tryRead(t.in_pipe, batch) else pipe.read(t.in_pipe, batch);
         if (got == pipe.PIPE_INTR) return .interrupted;
-        if (got != 1) {
+        if (got == 0 or got > batch.len) {
             // No key: the reader doesn't wait, or the window is gone.
             return if (nonblock and no_wait) .again else .{ .bytes = 0 };
         }
-        var signo: u32 = 0;
-        {
-            t.lock.acquire();
-            defer t.lock.release();
-            if (keySequence(key[0])) |seq| {
-                for (seq) |b| inputByte(t, b, &signo);
-            } else {
-                inputByte(t, key[0], &signo);
+        var at: usize = 0;
+        while (at < got) {
+            var signo: u32 = 0;
+            {
+                t.lock.acquire();
+                defer t.lock.release();
+                while (at < got and signo == 0) : (at += 1) {
+                    var key = batch[at];
+                    if (!t.pty) {
+                        // The window's Enter key is a line feed; a
+                        // terminal's sends a carriage return, which ICRNL
+                        // makes a line feed again and a program in raw mode
+                        // wants as it is. Its other keys are codes: a pty's
+                        // bytes are what they are.
+                        if (key == '\n') key = '\r';
+                        if (keySequence(key)) |seq| {
+                            for (seq) |b| inputByte(t, b, &signo);
+                            continue;
+                        }
+                    }
+                    inputByte(t, key, &signo);
+                }
             }
+            // The reader is of the foreground group as a rule: the signal
+            // ends its read on the next turn (pipe.read sees it pending).
+            if (signo != 0) signalForeground(id, signo);
         }
-        // The reader is of the foreground group as a rule: the signal ends
-        // its read on the next turn (pipe.read sees it pending).
-        if (signo != 0) signalForeground(id, signo);
     }
 }
 
@@ -569,10 +615,16 @@ pub fn readable(id: u8) bool {
     return t.ready_len > t.ready_head or t.eof;
 }
 
-/// Bytes a read could take now (FIONREAD).
+/// Bytes a read could take now (FIONREAD). A pty in raw mode counts what
+/// its master sent and no read has looked at yet: a byte each.
 pub fn pending(id: u8) usize {
     const t = get(id) orelse return 0;
-    return t.ready_len - t.ready_head;
+    // Under the lock: pushReady moves the two counts one after the other.
+    t.lock.acquire();
+    defer t.lock.release();
+    var n = t.ready_len - t.ready_head;
+    if (t.pty and t.termios.lflag & ICANON == 0) n += pipe.pending(t.in_pipe);
+    return n;
 }
 
 /// New modes; `flush` drops what was typed and not yet read (TCSETSF).

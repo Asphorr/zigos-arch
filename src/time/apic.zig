@@ -414,16 +414,17 @@ pub fn routeSci(gsi: u8, vector: u8) void {
     });
 }
 
-/// Route a PCI INTx line's GSI (ACPI _PRT) to `vector`: level triggered,
-/// active low (PCI 3.0 §2.2.6). The line may be shared, so its handler must
-/// tell whether its own device raised it. False if this IOAPIC lacks the GSI.
-pub fn routePciIntx(gsi: u32, vector: u8) bool {
+/// Route a PCI INTx line's GSI to `vector`: level triggered, with the
+/// polarity ACPI _PRT gives (aml.intxForPciPin; active low unless a link
+/// device says otherwise). The line may be shared, so its handler must tell
+/// whether its own device raised it. False if this IOAPIC lacks the GSI.
+pub fn routePciIntx(gsi: u32, vector: u8, polarity_low: bool) bool {
     if (!apic_active or gsi < ioapic_gsi_base) return false;
     const pin = gsi - ioapic_gsi_base;
     const max_entries = (ioapicRead(IOAPIC_VER_REG) >> 16) & 0xFF;
     if (pin > max_entries) return false;
-    ioapicSetEntry(@intCast(pin), vector, false, true, true);
-    debug.klog("[apic] PCI INTx GSI{d} -> vec=0x{X} low level\n", .{ gsi, vector });
+    ioapicSetEntry(@intCast(pin), vector, false, polarity_low, true);
+    debug.klog("[apic] PCI INTx GSI{d} -> vec=0x{X} {s} level\n", .{ gsi, vector, if (polarity_low) "low" else "high" });
     return true;
 }
 

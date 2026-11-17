@@ -275,8 +275,8 @@ fn dumpPipe(target: u32, is_read: bool) void {
     serial.print("  pipe[{d}]: in_use={} head={d} tail={d} count={d} readers={d} writers={d}\n", .{
         target, p.in_use, p.head, p.tail, p.count, p.readers, p.writers,
     });
-    serial.print("    blocked_reader_pid={d} blocked_writer_pid={d}\n", .{
-        p.blocked_reader_pid, p.blocked_writer_pid,
+    serial.print("    parked readers={d} writers={d}\n", .{
+        pipe.parkedCount(&p.parked_readers), pipe.parkedCount(&p.parked_writers),
     });
     if (is_read and p.count == 0 and p.writers == 0) {
         serial.print("    ** reader parked but pipe empty + writers=0 → EOF should have been signaled\n", .{});

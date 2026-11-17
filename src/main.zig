@@ -989,6 +989,7 @@ fn netdEntry() callconv(.c) noreturn {
         // Here alone: its looks must be a period apart.
         @import("driver/nic.zig").watchdog();
         net.poll();
+        net.trimRings(net.TCP_RING_SPARE);
     }
 }
 

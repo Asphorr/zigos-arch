@@ -3,7 +3,8 @@
 # tools/add_rootfs_to_image.sh wrote. python3 runs /etc/alptest.py; git keeps
 # a repository: commits, a branch and its merge, a clone, a repack; apk
 # installs and removes packages; openssl and ssh-keygen make keys, sign and
-# shake hands. Ends with "alptest: OK" and status 0, or names what differed.
+# shake hands; bash runs what a program driving a shell asks of it. Ends
+# with "alptest: OK" and status 0, or names what differed.
 
 PATH=/usr/bin:/bin:/usr/sbin:/sbin
 HOME=/root
@@ -137,6 +138,19 @@ if command -v openssl > /dev/null && command -v ssh-keygen > /dev/null; then
     ssh-keygen -Y verify -f "$s/allowed" -I zigos -n file -s "$s/msg.sig" < "$s/msg" > /dev/null 2>&1
     check sshtamper "$([ $? -ne 0 ] && echo refused)" refused
     rm -rf "$s"
+fi
+
+# bash, when the image has it: what a program that drives a shell asks of
+# one (a pipeline, an array, a here-string, a job and its wait, a subshell).
+if [ -x /bin/bash ]; then
+    check bashver "$(bash -c 'echo ${BASH_VERSINFO[0]}')" 5
+    check bashpipe "$(bash -c 'set -o pipefail; printf "a\nb\nc\n" | grep -c .')" 3
+    check basharr "$(bash -c 'a=(x y z); echo ${#a[@]} ${a[1]}')" "3 y"
+    check bashhere "$(bash -c 'read -r w <<< "one two"; echo $w')" "one two"
+    check bashjob "$(bash -c 'sleep 0 & wait $!; echo $?')" 0
+    check bashsub "$(bash -c 'cd /tmp && (cd / && pwd -P) && pwd -P' | tr '\n' ' ')" "/ /tmp "
+    check bashosrel "$(bash -c '. /etc/os-release; echo $ID')" alpine
+    check bashproc "$(bash -c 'read -r a b _ < /proc/version; echo $a $b')" "Linux version"
 fi
 
 if [ "$fail" = 0 ]; then

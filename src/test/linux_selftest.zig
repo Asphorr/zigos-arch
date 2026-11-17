@@ -252,7 +252,7 @@ fn runOnce(c: Case) Outcome {
     // Done when the lead is a zombie and no thread of the group is left.
     var waited: u32 = 0;
     var timed_out = false;
-    while (process.procs[pid].state != .zombie or process.countThreadsInGroup(@intCast(pid)) != 0) : (waited += 10) {
+    while (!process.hasEnded(pid) or process.countThreadsInGroup(@intCast(pid)) != 0) : (waited += 10) {
         if (term) |*t| t.turn(c.terminal, 10);
         if (waited >= STALL_DUMP_MS and waited % STALL_DUMP_MS == 0) dumpTasks(waited);
         if (!timed_out and waited >= c.timeout_ms) {
@@ -433,8 +433,8 @@ fn dumpTasks(waited: u32) void {
     const pipe = @import("../proc/pipe.zig");
     for (&pipe.pipes, 0..) |*pp, id| {
         if (!pp.in_use) continue;
-        serial.print("[linuxtest]   pipe {d}: {d} bytes, readers {d} writers {d}, blocked reader {d} writer {d}\n", .{
-            id, pp.count, pp.readers, pp.writers, pp.blocked_reader_pid, pp.blocked_writer_pid,
+        serial.print("[linuxtest]   pipe {d}: {d} bytes, readers {d} writers {d}, parked readers {d} writers {d}\n", .{
+            id, pp.count, pp.readers, pp.writers, pipe.parkedCount(&pp.parked_readers), pipe.parkedCount(&pp.parked_writers),
         });
     }
     @import("../net/net.zig").dumpTcp();
@@ -547,11 +547,15 @@ pub fn taskEntry() callconv(.c) noreturn {
             continue;
         }
         var run: u32 = 0;
+        // TCP's idle ring blocks are a cache, not a leak: out of both counts.
+        const net = @import("../net/net.zig");
         while (run < WARMUP_RUNS) : (run += 1) check(c, run);
         process.kernelSleepMs(50);
+        net.trimRings(0);
         const before = pmm.freeFrameCount();
         while (run < WARMUP_RUNS + COUNTED_RUNS) : (run += 1) check(c, run);
         process.kernelSleepMs(50);
+        net.trimRings(0);
         const after = pmm.freeFrameCount();
         const drift: u32 = before -| after;
         const sep: []const u8 = if (c.args.len != 0) " " else "";

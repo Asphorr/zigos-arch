@@ -779,7 +779,7 @@ fn applyHwBreakpoints() void {
     }
 }
 
-fn clearDR6() void {
+pub fn clearDR6() void {
     asm volatile ("movq %[val], %%dr6"
         :
         : [val] "r" (@as(u64, 0)),

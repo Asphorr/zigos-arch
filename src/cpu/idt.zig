@@ -185,9 +185,12 @@ pub fn init() void {
     // watchdog's NMI wedge-profiler bursted NMIs at a CPU mid-syscall.) A
     // dedicated IST makes NMI delivery independent of the interrupted RSP. The
     // IST-vs-switchTo hazard doesn't apply — nmiSnapshot never reschedules.
+    // #BP(3) is a gate ring 3 may call: a program's `int3` is its SIGTRAP,
+    // not a #GP.
     inline for (exception.exceptions) |exc| {
         const ist: u3 = if (exc.num == 8) 1 else if (exc.num == 2) 2 else 0;
-        setGateIst(exc.num, @intFromPtr(&exception.ExcStub(exc).handler), 0x8E, ist);
+        const flags: u8 = if (exc.num == 3) 0xEE else 0x8E;
+        setGateIst(exc.num, @intFromPtr(&exception.ExcStub(exc).handler), flags, ist);
     }
 
     // IRQs

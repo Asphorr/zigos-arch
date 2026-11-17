@@ -434,6 +434,51 @@ static void check_tcp_linger(void) {
     close(l);
 }
 
+// A reader that stops: the writer fills the window and its own buffer and
+// waits. The connection outlives a few timeouts that way (the window is
+// probed, nothing is given up), and the stream goes on whole.
+static void check_tcp_stall(void) {
+    struct sockaddr_in a = {.sin_family = AF_INET};
+    socklen_t alen = sizeof a;
+    static unsigned char buf[4096];
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    int l = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(bind(l, (struct sockaddr *)&a, sizeof a) == 0 && listen(l, 1) == 0 && getsockname(l, (struct sockaddr *)&a, &alen) == 0, "a listener");
+    int w = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(connect(w, (struct sockaddr *)&a, sizeof a) == 0, "a connection");
+    int r = accept(l, NULL, NULL);
+    CHECK(r >= 0 && fcntl(w, F_SETFL, O_NONBLOCK) == 0, "accepted; the writer does not wait");
+
+    size_t sent = 0;
+    while (sent < (8u << 20)) {
+        for (size_t i = 0; i < sizeof buf; i++) buf[i] = pattern(sent + i, 3);
+        ssize_t n = write(w, buf, sizeof buf);
+        if (n <= 0) break;
+        sent += (size_t)n;
+    }
+    CHECK(errno == EAGAIN && sent >= 64 * 1024 && sent < (8u << 20), "the writer fills up against a reader that stopped");
+    struct timespec ts = {.tv_sec = 3};
+    nanosleep(&ts, NULL);
+    struct pollfd p = {.fd = w, .events = POLLOUT};
+    CHECK(poll(&p, 1, 0) == 0 && so_error(w) == 0 && !has_error(w), "and stays so, connected, while it sleeps");
+
+    size_t got = 0;
+    int bad = 0;
+    while (got < sent) {
+        ssize_t n = read(r, buf, sizeof buf);
+        if (n <= 0) break;
+        for (ssize_t i = 0; i < n; i++) bad |= buf[i] != pattern(got + (size_t)i, 3);
+        got += (size_t)n;
+    }
+    CHECK(!bad && got == sent, "the reader wakes and gets all of it in order");
+    CHECK(poll(&p, 1, 2000) == 1 && (p.revents & POLLOUT), "the writer may go on");
+    CHECK(write(w, "tail", 4) == 4 && shutdown(w, SHUT_WR) == 0, "a last write, the end");
+    CHECK(read(r, buf, sizeof buf) == 4 && memcmp(buf, "tail", 4) == 0 && read(r, buf, sizeof buf) == 0, "arrive");
+    close(w);
+    close(r);
+    close(l);
+}
+
 static void check_udp(void) {
     struct sockaddr_in a = {.sin_family = AF_INET}, from, got;
     socklen_t flen = sizeof from, glen = sizeof got;
@@ -576,7 +621,8 @@ static const struct {
 } groups[] = {
     {"eventfd", check_eventfd}, {"pipe", check_pipe_nonblock}, {"pair", check_socketpair},
     {"unix", check_unix_named}, {"tcp", check_tcp},            {"linger", check_tcp_linger},
-    {"udp", check_udp},         {"epoll", check_epoll},        {"select", check_select},
+    {"stall", check_tcp_stall}, {"udp", check_udp},            {"epoll", check_epoll},
+    {"select", check_select},
 };
 
 // With arguments, only the groups they name.

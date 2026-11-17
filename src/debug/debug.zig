@@ -93,9 +93,9 @@ pub fn dumpState(state: *const CpuState) void {
 ///   `cr2`        — faulting address (only meaningful for #PF)
 ///   `rsp`        — saved RSP at fault (used for stack-overflow detection)
 pub fn classifyCrash(int_no: u64, rip: u64, cr2: u64, rsp: u64) []const u8 {
-    // Kernel `.text` heuristic — kernel is loaded around 0x100000–0x4000000.
-    const rip_in_kernel = rip >= 0x100000 and rip < 0x4000000;
-    const rip_in_user = rip >= 0x400000 and rip < 0x500000;
+    const memmap = @import("../mm/memmap.zig");
+    const rip_in_kernel = rip >= memmap.KERNEL_VIRT_BASE;
+    const rip_in_user = memmap.isUserDataAddr(rip);
 
     return switch (int_no) {
         // #UD — invalid opcode

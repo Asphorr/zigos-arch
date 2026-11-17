@@ -68,7 +68,7 @@ fn runOnce(c: Case) Outcome {
     process.setState(pid, .ready);
 
     var waited: u32 = 0;
-    while (process.procs[pid].state != .zombie) : (waited += 10) {
+    while (!process.hasEnded(pid)) : (waited += 10) {
         if (waited >= RUN_TIMEOUT_MS) {
             process.killProcess(@intCast(pid));
             return .timed_out;

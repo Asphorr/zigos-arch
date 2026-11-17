@@ -9,6 +9,7 @@ const heap = @import("heap.zig");
 const memmap = @import("memmap.zig");
 const swap = @import("swap.zig");
 const tlb = @import("../cpu/mmu/tlb.zig");
+const pte_mod = @import("pte.zig");
 const Phys = @import("../util/addr.zig").Phys;
 
 const PRESENT: u64 = paging.PRESENT;
@@ -172,6 +173,13 @@ pub fn createAddressSpace(phys_out: *Phys) ?[*]align(4096) u64 {
 /// invlpg to make sure the flag change is visible. This keeps the contract
 /// idempotent under multi-CPU lazy-fault races.
 pub fn mapUserPage(pml4: [*]align(4096) u64, virt: usize, phys: Phys, flags: u64) MapError!void {
+    _ = try installUserPage(pml4, virt, phys, flags);
+}
+
+/// mapUserPage that tells whether this call made the mapping: false when the
+/// same frame was mapped there already (its flags are brought to `flags`).
+/// A caller that took a frame reference for the mapping gives it back then.
+pub fn installUserPage(pml4: [*]align(4096) u64, virt: usize, phys: Phys, flags: u64) MapError!bool {
     if (!memmap.isUserDataAddr(virt)) return error.BadVA;
     // Historical note: this used to also reject any user VA falling inside
     // [KERNEL_HEAP_BASE, KERNEL_HEAP_BASE+KERNEL_HEAP_SIZE) as a defense
@@ -251,6 +259,7 @@ pub fn mapUserPage(pml4: [*]align(4096) u64, virt: usize, phys: Phys, flags: u64
     // exactly one installer win; the loser re-reads and takes the
     // present-branch policy against the winner's PTE.
     const new_pte: u64 = (paddr & PAGE_MASK) | flags | PRESENT;
+    var installed = true;
     while (true) {
         const old_pte = @atomicLoad(u64, &pt[pt_idx], .acquire);
         if (old_pte & PRESENT != 0) {
@@ -258,9 +267,10 @@ pub fn mapUserPage(pml4: [*]align(4096) u64, virt: usize, phys: Phys, flags: u64
             // mismatch. Same-phys → flag update or no-op; different phys →
             // AlreadyMapped.
             if ((old_pte & PAGE_MASK) != (paddr & PAGE_MASK)) return error.AlreadyMapped;
-            if (old_pte == new_pte) return; // already exactly what we want
+            if (old_pte == new_pte) return false; // already exactly what we want
             if (@cmpxchgStrong(u64, &pt[pt_idx], old_pte, new_pte, .seq_cst, .seq_cst) != null) continue;
             invlpg(virt);
+            installed = false;
             break;
         }
         if (old_pte != 0) {
@@ -283,6 +293,7 @@ pub fn mapUserPage(pml4: [*]align(4096) u64, virt: usize, phys: Phys, flags: u64
     // pollute the ring with would-be-installs that bounced.
     const cur_pid: u8 = if (@import("../cpu/smp.zig").currentPid()) |p| @intCast(p) else 0xFF;
     @import("../debug/kdbg.zig").mmapEvent(cur_pid, virt, paddr & PAGE_MASK, flags);
+    return installed;
 }
 
 /// Resolve an existing table entry or allocate a new one.
@@ -370,9 +381,10 @@ pub const NX: u64 = @as(u64, 1) << 63;
 /// Translate a Linux-style prot bitmask (bit 0 = PROT_READ, bit 1 = PROT_WRITE,
 /// bit 2 = PROT_EXEC) into the PTE-flag bits to OR with `PRESENT` when mapping
 /// a user page. PROT_READ has no representation — pages are readable as soon
-/// as PRESENT is set; PROT_NONE = 0 produces a USER + NX page that traps on
-/// any access. Zero-cost for the common RWX case.
+/// as PRESENT is set; PROT_NONE = 0 gives a parked page (paging.PARKED, no
+/// USER), which no user access reaches. Zero-cost for the common RWX case.
 pub fn protToMapFlags(prot: u8) u64 {
+    if (prot & 0x07 == 0) return paging.PARKED | NX;
     var f: u64 = USER;
     if ((prot & 0x02) != 0) f |= READ_WRITE;
     if ((prot & 0x04) == 0) f |= NX;
@@ -459,41 +471,6 @@ pub fn allocFillAndMapUserPage(pml4: [*]align(4096) u64, virt: usize, flags: u64
         },
     };
     return frame;
-}
-
-/// Update the access-control bits on an already-mapped 4KB user page. The
-/// physical frame is left untouched; only the PTE flags change. Returns false
-/// if the page isn't currently mapped (e.g. a lazy region whose first touch
-/// hasn't faulted yet) — the caller (sysMprotect) handles that by updating
-/// the lazy region's prot field, so subsequent fault-ins pick up the new
-/// flags. Walks read-only — no table allocation.
-pub fn changePageProt(pml4: [*]align(4096) u64, virt: usize, flags: u64) bool {
-    if (virt < USER_SPACE_START or virt >= USER_SPACE_END) return false;
-    const vaddr: u64 = @intCast(virt);
-    const pml4_idx = (vaddr >> 39) & 0x1FF;
-    const pdpt_idx = (vaddr >> 30) & 0x1FF;
-    const pd_idx = (vaddr >> 21) & 0x1FF;
-    const pt_idx = (vaddr >> 12) & 0x1FF;
-
-    if (pml4[pml4_idx] & PRESENT == 0) return false;
-    const pdpt = tableFromEntry(pml4[pml4_idx]);
-    if (pdpt[pdpt_idx] & PRESENT == 0 or pdpt[pdpt_idx] & PAGE_SIZE_FLAG != 0) return false;
-    const pd = tableFromEntry(pdpt[pdpt_idx]);
-    if (pd[pd_idx] & PRESENT == 0 or pd[pd_idx] & PAGE_SIZE_FLAG != 0) return false;
-    const pt = tableFromEntry(pd[pd_idx]);
-    if (pt[pt_idx] & PRESENT == 0) return false;
-
-    const phys = pt[pt_idx] & PAGE_MASK;
-    // Gap #10 (2026-05-20): defensively OR-in USER. The only current caller
-    // (sysMprotect via protToMapFlags) already sets USER, but bit-OR can't
-    // clear bits — adding it here means a future caller forgetting to
-    // include USER can't accidentally turn a user page kernel-only. Cheap
-    // belt-and-suspenders for a function whose contract is "change PROT
-    // bits on an existing USER mapping."
-    pt[pt_idx] = phys | flags | PRESENT | USER;
-
-    invlpg(virt);
-    return true;
 }
 
 /// Unmap a 4KB user page. Returns the previously-mapped physical frame so the
@@ -590,7 +567,7 @@ pub fn unmapUserRange(pml4: [*]align(4096) u64, start: usize, end: usize, rc: *R
         var i: usize = pt_idx_lo;
         while (i < pt_idx_hi_excl) : (i += 1) {
             const pte = pt[i];
-            if (pte & PRESENT != 0 and pte & USER != 0) {
+            if (pte_mod.holdsUserFrame(pte)) {
                 pt[i] = 0;
                 rc.add(pte & PAGE_MASK);
                 noteUnmap(pte & PAGE_MASK, span + (i << 12), rc.pcid);
@@ -806,14 +783,17 @@ pub fn reportUafFrame(phys: u64) void {
     serial.print("[uaf] {d} entr(ies) still point at it, {d} address spaces scanned\n", .{ hits, n_seen });
 }
 
-/// Give every present 4 KB user page in [start, end) the protection `flags`
-/// (protToMapFlags / cacheMapFlags output), keeping its frame, its accessed
-/// and dirty bits, its caching type, and copy-on-write: a COW page stays
-/// read-only, so its first write still copies. Not-present entries (never
-/// faulted, swapped out) are left alone; they come back with their region's
-/// prot. One walk per 2 MB span, like unmapUserRange, and no TLB invalidation
-/// — the caller shoots the range down once. Caller holds the write side of
-/// the owner's as_lock.
+/// Give every 4 KB user page in [start, end) that holds a frame the
+/// protection `flags` (protToMapFlags / cacheMapFlags output), keeping its
+/// frame, its accessed and dirty bits, its caching type, and copy-on-write:
+/// a COW page stays read-only, so its first write still copies. A page that
+/// gains write while another address space maps its frame — it was read-only
+/// when a fork shared it — becomes copy-on-write too. Not-present entries
+/// (never faulted, swapped out) are left alone; they come back with their
+/// region's prot. One walk per 2 MB span, like unmapUserRange, and no TLB
+/// invalidation — the caller shoots the range down once. Caller holds the
+/// write side of the owner's as_lock, which keeps a fork of this address
+/// space from raising a frame's count under the check.
 pub fn reprotectUserRange(pml4: [*]align(4096) u64, start: usize, end: usize, flags: u64) void {
     // Bit 7 of a 4 KB PTE is PAT.
     const KEEP: u64 = PAGE_MASK | paging.COW | paging.ACCESSED | paging.DIRTY |
@@ -843,9 +823,15 @@ pub fn reprotectUserRange(pml4: [*]align(4096) u64, start: usize, end: usize, fl
             // CAS: the hardware sets A/D under us.
             while (true) {
                 const pte = @atomicLoad(u64, &pt[i], .acquire);
-                if (pte & PRESENT == 0 or pte & USER == 0) break;
-                var new = (pte & KEEP) | flags | PRESENT | USER;
-                if (pte & paging.COW != 0) new &= ~READ_WRITE;
+                if (!pte_mod.holdsUserFrame(pte)) break;
+                var new = (pte & KEEP) | flags | PRESENT;
+                if (pte & paging.COW != 0) {
+                    new &= ~READ_WRITE;
+                } else if (flags & READ_WRITE != 0 and pte & READ_WRITE == 0 and
+                    pmm.frameRefCount(Phys.of(pte & PAGE_MASK)) > 1)
+                {
+                    new = (new & ~READ_WRITE) | paging.COW;
+                }
                 if (@cmpxchgStrong(u64, &pt[i], pte, new, .seq_cst, .seq_cst) == null) break;
             }
         }
@@ -882,8 +868,7 @@ pub fn forEachUserPage(
             const pt = tableFromEntry(pde);
             for (0..512) |pt_i| {
                 const pte = pt[pt_i];
-                if (pte & PRESENT == 0) continue;
-                if (pte & USER == 0) continue;
+                if (!pte_mod.holdsUserFrame(pte)) continue;
                 // pml4_i is always 0 for user space (PML4[0]'s subtree).
                 const virt: usize = (pdpt_i << 30) | (pd_i << 21) | (pt_i << 12);
                 callback(ctx, virt, entryPhys(pte), pte & 0xFFF);
@@ -958,7 +943,7 @@ pub fn destroyAddressSpace(pml4: [*]align(4096) u64, pml4_phys: Phys) void {
             // own teardown drops the last reference.
             for (0..512) |pt_i| {
                 const pte = pt[pt_i];
-                if (pte & PRESENT != 0 and pte & USER != 0) {
+                if (pte_mod.holdsUserFrame(pte)) {
                     pmm.releaseFrame(Phys.of(entryPhys(pte)));
                 } else {
                     // Evicted page (SWAPPED) or in-flight eviction
@@ -1118,7 +1103,10 @@ pub fn cloneAddressSpace(parent_pml4: [*]align(4096) u64, parent_pcid: u16, phys
                     // Never-faulted, SWAPPED, or SWAP_INFLIGHT: child skips
                     // (see the SWAPPED PAGES note above).
                     if (parent_pte & PRESENT == 0) break;
-                    if (parent_pte & USER == 0) break; // non-user under PML4[0]: shouldn't appear
+                    // A parked page (PROT_NONE) is copied as one: read-only,
+                    // so it is shared below, and reprotectUserRange makes it
+                    // copy-on-write if either side gets to write it again.
+                    if (!pte_mod.holdsUserFrame(parent_pte)) break; // not a user frame: shouldn't appear
 
                     const phys = Phys.of(entryPhys(parent_pte));
                     // Refuse a frame whose refcount already hit 0 — our PTE

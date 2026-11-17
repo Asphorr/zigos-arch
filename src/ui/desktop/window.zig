@@ -45,7 +45,14 @@ const ATTR_DEFAULT = theme.ATTR_DEFAULT;
 const TITLEBAR_H = layout.TITLEBAR_H;
 const BTN_RADIUS = layout.BTN_RADIUS;
 
-pub const EscState = enum(u8) { idle, esc, csi };
+/// `string`: inside an OSC/DCS/APC string, dropped up to BEL or ESC \
+/// (`string_esc`: its ESC came). `charset`: ESC ( and its kin take one
+/// more byte.
+pub const EscState = enum(u8) { idle, esc, csi, string, string_esc, charset };
+
+/// Arguments one CSI sequence may carry: a bold truecolor foreground with a
+/// truecolor background is eleven.
+pub const CSI_ARGS: usize = 16;
 
 pub const TerminalData = struct {
     text_buf: [TERM_COLS * TERM_ROWS]u8,
@@ -73,13 +80,25 @@ pub const TerminalData = struct {
     // `esc` = saw \x1b, awaiting `[`; `csi` = inside `\x1b[...<final>`,
     // accumulating numeric args separated by `;`.
     esc_state: EscState,
-    // 8 slots so truecolor SGR (`38;2;R;G;B` = 5 args) and 256-color
-    // (`38;5;N` = 3 args) parse cleanly with headroom. 4 silently truncated
-    // truecolor sequences mid-parse — the dropped digits got accumulated
-    // into the previous arg and corrupted it (gray-Z bug, 2026-05-14).
-    csi_args: [8]u16,
+    // Enough slots that no sequence a program sends is cut short: digits
+    // past the last slot would pile into it and corrupt it.
+    csi_args: [CSI_ARGS]u16,
     csi_arg_count: u8,
     csi_has_arg: bool,
+    /// The private marker of the sequence being read ('?', '>', '<', '='),
+    /// 0 for none, and whether intermediate bytes came: such a sequence is
+    /// not one of the plain ones its final byte would name.
+    csi_private: u8 = 0,
+    csi_inter: bool = false,
+    /// UTF-8 in progress: continuation bytes still due, and the code point
+    /// so far.
+    utf_left: u8 = 0,
+    utf_cp: u32 = 0,
+    /// ESC 7 / CSI s.
+    saved_row: u16 = 0,
+    saved_col: u16 = 0,
+    /// CSI ?25l: the program draws its own cursor.
+    cursor_hidden: bool = false,
     cur_attr: u8,
     /// Most-recent truecolor fg, in 0x00RRGGBB. Only meaningful when
     /// `cur_attr & ATTR_RGB_FG` is set; SGR `38;2;...` writes both.
@@ -337,7 +356,7 @@ pub fn allocTerminalData() ?*TerminalData {
         .scroll_count = 0,
         .scroll_view = 0,
         .esc_state = .idle,
-        .csi_args = [_]u16{0} ** 8,
+        .csi_args = [_]u16{0} ** CSI_ARGS,
         .csi_arg_count = 0,
         .csi_has_arg = false,
         .cur_attr = ATTR_DEFAULT,

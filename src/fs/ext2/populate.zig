@@ -378,14 +378,12 @@ fn dirInsertOn(m: *block.Mount, dir_ino: *layout.Inode, name: []const u8, child_
         if (!inode.readInodeBlockOn(m, dir_ino, lblock, blkbuf[0..bs])) return false;
         var w = ext2.DirWalk{ .buf = blkbuf[0..bs] };
         while (w.next()) |d| {
-            const tight: u16 = if (d.e.inode == 0)
-                layout.DIR_ENTRY_HDR
-            else
-                layout.dirEntryAlign(d.e.name_len);
+            // A dead entry is taken over whole, as in ext2.dirInsert.
+            const tight: u16 = if (d.e.inode == 0) 0 else layout.dirEntryAlign(d.e.name_len);
             if (d.e.rec_len >= tight + needed) {
                 const new_off: u32 = d.off + tight;
                 const slack: u16 = d.e.rec_len - tight;
-                d.e.rec_len = tight;
+                if (tight != 0) d.e.rec_len = tight;
                 const ne = std.mem.bytesAsValue(layout.DirEntry, blkbuf[new_off..][0..layout.DIR_ENTRY_HDR]);
                 ne.inode = child_inum;
                 ne.rec_len = slack;

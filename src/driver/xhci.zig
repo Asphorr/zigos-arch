@@ -2668,9 +2668,16 @@ pub fn resetMouseRing() void {
 
 // Boot keyboard report: [modifier, reserved, key1, key2, key3, key4, key5, key6]
 var prev_keys: [6]u8 = [_]u8{0} ** 6;
+var prev_modifiers: u8 = 0;
 
 fn processKeyboardReport(data: [*]volatile const u8) void {
     const modifiers = data[0];
+    // Ctrl, Alt or the GUI key going down or up. One the host never
+    // released shows here: letters then come as control codes.
+    if ((modifiers ^ prev_modifiers) & 0xDD != 0) {
+        debug.klog("[kbd] modifiers 0x{X:0>2} -> 0x{X:0>2}\n", .{ prev_modifiers, modifiers });
+    }
+    prev_modifiers = modifiers;
     // Check modifier changes
     keyboard.shift_held = (modifiers & 0x22) != 0; // Left or Right Shift
     keyboard.ctrl_held = (modifiers & 0x11) != 0; // Left or Right Ctrl

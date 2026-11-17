@@ -62,6 +62,10 @@ pub fn ioctl(fd: u64, request: u64, arg: u64) u64 {
     }
     if (socket.of(f)) |s| return @import("linux_net.zig").ioctl(s, request, arg);
     const id = f.tty;
+    // A pipe that is no terminal's has its bytes to count and nothing else.
+    if (id == 0xFF and f.kind == .pipe and request & 0xFFFF_FFFF == FIONREAD) {
+        return put(arg, @as(i32, @intCast(@import("../../proc/pipe.zig").pending(f.pipe_id))));
+    }
     const t = tty.get(id) orelse return err(ENOTTY);
     switch (request & 0xFFFF_FFFF) {
         TCGETS => return put(arg, t.termios),

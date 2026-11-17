@@ -211,12 +211,177 @@ const aa_font = @import("aa_font.zig");
 /// cell from the three terminal-render paths below.
 inline fn drawTermChar(x: i32, y: i32, ch: u8, fg: u32, bg: u32) void {
     gfx.fillRect(x, y, FONT_W, FONT_H, bg);
+    if (ch >= CELL_BULLET and (ch <= CELL_CHECK or ch >= CELL_BOX)) return drawCellShape(x, y, ch, fg);
     const buf: [1]u8 = .{ch};
     aa_font.drawText(x, y, &buf, fg, aa_font.getDefaultMono());
+}
+
+// Cell bytes past ASCII. 0x80..0x85 are the atlas's own block glyphs, which
+// programs of ours write as bytes; the rest stand for characters the
+// terminal draws itself, so that frames and block art join cell to cell.
+const CELL_BULLET: u8 = 0x86;
+const CELL_MIDDOT: u8 = 0x87;
+const CELL_ELLIPSIS: u8 = 0x88;
+const CELL_CHECK: u8 = 0x89;
+/// Box drawing: + a mask of the arms (BOX_*), light and heavy.
+const CELL_BOX: u8 = 0xA0;
+const CELL_BOX_HEAVY: u8 = 0xB0;
+/// Quadrants: + a mask (upper left 1, upper right 2, lower left 4, lower right 8).
+const CELL_QUAD: u8 = 0xC0;
+/// The lower (n+1)/8 of the cell, and its left (n+1)/8.
+const CELL_LOW8: u8 = 0xD0;
+const CELL_LEFT8: u8 = 0xD8;
+const BOX_L: u8 = 1;
+const BOX_R: u8 = 2;
+const BOX_U: u8 = 4;
+const BOX_D: u8 = 8;
+
+fn drawCellShape(x: i32, y: i32, ch: u8, fg: u32) void {
+    const cx: i32 = x + @as(i32, FONT_W / 2);
+    const cy: i32 = y + @as(i32, FONT_H / 2);
+    switch (ch) {
+        CELL_BOX...CELL_BOX_HEAVY + 0x0F => {
+            const th: u32 = if (ch >= CELL_BOX_HEAVY) 3 else 1;
+            const o: i32 = @intCast(th / 2);
+            // Each arm runs from its edge to just past the middle: corners join.
+            if (ch & BOX_L != 0) gfx.fillRect(x, cy - o, FONT_W / 2 + th - th / 2, th, fg);
+            if (ch & BOX_R != 0) gfx.fillRect(cx - o, cy - o, FONT_W - FONT_W / 2 + th / 2, th, fg);
+            if (ch & BOX_U != 0) gfx.fillRect(cx - o, y, th, FONT_H / 2 + th - th / 2, fg);
+            if (ch & BOX_D != 0) gfx.fillRect(cx - o, cy - o, th, FONT_H - FONT_H / 2 + th / 2, fg);
+        },
+        CELL_QUAD...CELL_QUAD + 0x0F => {
+            const hw: u32 = FONT_W / 2;
+            const hh: u32 = FONT_H / 2;
+            if (ch & 1 != 0) gfx.fillRect(x, y, hw, hh, fg);
+            if (ch & 2 != 0) gfx.fillRect(cx, y, FONT_W - hw, hh, fg);
+            if (ch & 4 != 0) gfx.fillRect(x, cy, hw, FONT_H - hh, fg);
+            if (ch & 8 != 0) gfx.fillRect(cx, cy, FONT_W - hw, FONT_H - hh, fg);
+        },
+        CELL_LOW8...CELL_LOW8 + 7 => {
+            const hgt: u32 = FONT_H * (@as(u32, ch - CELL_LOW8) + 1) / 8;
+            gfx.fillRect(x, y + @as(i32, @intCast(FONT_H - hgt)), FONT_W, hgt, fg);
+        },
+        CELL_LEFT8...CELL_LEFT8 + 7 => gfx.fillRect(x, y, @max(1, FONT_W * (@as(u32, ch - CELL_LEFT8) + 1) / 8), FONT_H, fg),
+        CELL_BULLET => {
+            // A disc of radius 3.
+            const half = [7]u32{ 1, 2, 3, 3, 3, 2, 1 };
+            for (half, 0..) |hw, i| gfx.fillRect(cx - @as(i32, @intCast(hw)), cy - 3 + @as(i32, @intCast(i)), 2 * hw + 1, 1, fg);
+        },
+        CELL_MIDDOT => gfx.fillRect(cx - 1, cy - 1, 2, 2, fg),
+        CELL_ELLIPSIS => {
+            const base: i32 = y + @as(i32, FONT_H * 3 / 4);
+            gfx.fillRect(x + 1, base, 1, 2, fg);
+            gfx.fillRect(cx, base, 1, 2, fg);
+            gfx.fillRect(x + @as(i32, FONT_W) - 2, base, 1, 2, fg);
+        },
+        CELL_CHECK => {
+            // Down three to the right, then up six.
+            var i: i32 = 0;
+            while (i < 3) : (i += 1) gfx.fillRect(x + 1 + i, cy + i, 1, 2, fg);
+            i = 0;
+            while (i < 5) : (i += 1) gfx.fillRect(x + 4 + i, cy + 2 - i, 1, 2, fg);
+        },
+        else => {},
+    }
+}
+
+/// The cell byte that shows code point `cp`: 0 for one that takes no cell.
+fn cellFor(cp: u32) u8 {
+    return switch (cp) {
+        0x20...0x7E => @intCast(cp),
+        0x00A0 => ' ',
+        0x00B7, 0x2219, 0x22C5 => CELL_MIDDOT,
+        0x2022, 0x25CF, 0x23FA, 0x2B24, 0x25C9 => CELL_BULLET,
+        0x25CB, 0x25EF, 0x25E6, 0x25CC => 'o',
+        0x2026 => CELL_ELLIPSIS,
+        0x2010...0x2015, 0x2212 => '-',
+        0x2018, 0x2019 => '\'',
+        0x201C, 0x201D => '"',
+        0x2190, 0x2039, 0x276E, 0x25C0, 0x25C2 => '<',
+        0x2192, 0x203A, 0x276F, 0x25B6, 0x25B8, 0x23F5 => '>',
+        0x2191, 0x25B2, 0x25B4 => '^',
+        0x2193, 0x25BC, 0x25BE => 'v',
+        0x2713, 0x2714 => CELL_CHECK,
+        0x2715...0x2718, 0x00D7 => 'x',
+        0x2722...0x274B, 0x2217 => '*',
+        0x23BF => CELL_BOX | BOX_U | BOX_R,
+        0x2500...0x257F => boxCell(cp),
+        0x2580...0x259F => blockCell(cp),
+        // Zero width: joiners, variation selectors, combining marks.
+        0x200B...0x200F, 0x2060, 0xFE00...0xFE0F, 0x0300...0x036F => 0,
+        else => '?',
+    };
+}
+
+fn boxCell(cp: u32) u8 {
+    const arms: u8 = switch (cp) {
+        0x2500, 0x2501, 0x2504, 0x2505, 0x2508, 0x2509, 0x254C, 0x254D, 0x2550, 0x257C, 0x257E => BOX_L | BOX_R,
+        0x2502, 0x2503, 0x2506, 0x2507, 0x250A, 0x250B, 0x254E, 0x254F, 0x2551, 0x257D, 0x257F => BOX_U | BOX_D,
+        0x250C...0x250F, 0x2552...0x2554, 0x256D => BOX_R | BOX_D,
+        0x2510...0x2513, 0x2555...0x2557, 0x256E => BOX_L | BOX_D,
+        0x2514...0x2517, 0x2558...0x255A, 0x2570 => BOX_U | BOX_R,
+        0x2518...0x251B, 0x255B...0x255D, 0x256F => BOX_U | BOX_L,
+        0x251C...0x2523, 0x255E...0x2560 => BOX_U | BOX_D | BOX_R,
+        0x2524...0x252B, 0x2561...0x2563 => BOX_U | BOX_D | BOX_L,
+        0x252C...0x2533, 0x2564...0x2566 => BOX_L | BOX_R | BOX_D,
+        0x2534...0x253B, 0x2567...0x2569 => BOX_L | BOX_R | BOX_U,
+        0x253C...0x254B, 0x256A...0x256C => BOX_L | BOX_R | BOX_U | BOX_D,
+        0x2574, 0x2578 => BOX_L,
+        0x2575, 0x2579 => BOX_U,
+        0x2576, 0x257A => BOX_R,
+        0x2577, 0x257B => BOX_D,
+        0x2571 => return '/',
+        0x2572 => return '\\',
+        else => return 'X',
+    };
+    // The double lines are drawn heavy too.
+    const heavy = switch (cp) {
+        0x2501, 0x2503, 0x2505, 0x2507, 0x2509, 0x250B, 0x250F, 0x2513, 0x2517, 0x251B, 0x2523, 0x252B, 0x2533, 0x253B, 0x254B, 0x254D, 0x254F, 0x2550...0x256C, 0x2578...0x257B => true,
+        else => false,
+    };
+    return (if (heavy) CELL_BOX_HEAVY else CELL_BOX) | arms;
+}
+
+fn blockCell(cp: u32) u8 {
+    return switch (cp) {
+        0x2580, 0x2594 => CELL_QUAD | 0x3,
+        0x2581...0x2587 => CELL_LOW8 + @as(u8, @intCast(cp - 0x2581)),
+        0x2588 => CELL_QUAD | 0xF,
+        0x2589...0x258F => CELL_LEFT8 + @as(u8, @intCast(0x258F - cp)),
+        0x2590, 0x2595 => CELL_QUAD | 0xA,
+        0x2591 => 0x81,
+        0x2592 => 0x82,
+        0x2593 => 0x83,
+        0x2596 => CELL_QUAD | 0x4,
+        0x2597 => CELL_QUAD | 0x8,
+        0x2598 => CELL_QUAD | 0x1,
+        0x2599 => CELL_QUAD | 0xD,
+        0x259A => CELL_QUAD | 0x9,
+        0x259B => CELL_QUAD | 0x7,
+        0x259C => CELL_QUAD | 0xB,
+        0x259D => CELL_QUAD | 0x2,
+        0x259E => CELL_QUAD | 0x6,
+        else => CELL_QUAD | 0xE,
+    };
+}
+
+/// A color of the 256-color palette: the 16 of the theme, the 6x6x6 cube,
+/// the gray ramp.
+fn color256(n: u16) u32 {
+    if (n < 16) return ANSI_PALETTE[n];
+    if (n < 232) {
+        const lv = [6]u32{ 0, 95, 135, 175, 215, 255 };
+        const i = n - 16;
+        return (lv[i / 36] << 16) | (lv[(i / 6) % 6] << 8) | lv[i % 6];
+    }
+    const g: u32 = 8 + 10 * @as(u32, @min(n, 255) - 232);
+    return (g << 16) | (g << 8) | g;
 }
 const TERM_COLS: u32 = 80;
 const TERM_ROWS: u32 = 25;
 const TERM_PAD: u32 = 4;
+/// Wide enough to show every column between the two paddings.
+const TERM_WIN_W: u32 = TERM_COLS * FONT_W + TERM_PAD * 2;
 
 // --- Terminal escape / coloring (see theme.zig for the constant values) ---
 const ANSI_PALETTE = theme.ANSI_PALETTE;
@@ -440,9 +605,40 @@ fn putCharOnWindow(w: *Window, c: u8) void {
     t.cursor_blink_anchor = process.tick_count;
     switch (t.esc_state) {
         .idle => putCharIdle(w, t, c),
-        .esc => putCharAfterEsc(t, c),
+        .esc => putCharAfterEsc(w, t, c),
         .csi => putCharAfterCsi(w, t, c),
+        // A string (a title, a query, a clipboard write): nothing of it is
+        // ours. BEL or ESC \ ends it.
+        .string => {
+            if (c == '\x07') t.esc_state = .idle;
+            if (c == '\x1b') t.esc_state = .string_esc;
+        },
+        .string_esc => if (c == '\\') {
+            t.esc_state = .idle;
+        } else putCharAfterEsc(w, t, c),
+        .charset => t.esc_state = .idle,
     }
+}
+
+/// A byte of the UTF-8 stream: the cell byte of the character it finishes,
+/// null while one is incomplete or takes no cell. A continuation byte with
+/// no lead before it is a program's own byte-coded glyph and stands as is.
+fn utf8Cell(t: *TerminalData, c: u8) ?u8 {
+    if (c < 0x80) {
+        t.utf_left = 0;
+        return c;
+    }
+    if (c >= 0xC0) {
+        t.utf_left = if (c >= 0xF0) 3 else if (c >= 0xE0) 2 else 1;
+        t.utf_cp = c & (@as(u8, 0x3F) >> @as(u3, @intCast(t.utf_left)));
+        return null;
+    }
+    if (t.utf_left == 0) return c;
+    t.utf_cp = (t.utf_cp << 6) | (c & 0x3F);
+    t.utf_left -= 1;
+    if (t.utf_left != 0) return null;
+    const cell = cellFor(t.utf_cp);
+    return if (cell == 0) null else cell;
 }
 
 fn putCharIdle(w: *Window, t: *TerminalData, c: u8) void {
@@ -477,6 +673,7 @@ fn putCharIdle(w: *Window, t: *TerminalData, c: u8) void {
         else => {
             // Drop unhandled C0 control bytes rather than render garbage.
             if (c < 0x20) return;
+            const cell = utf8Cell(t, c) orelse return;
 
             // Deferred wrap: if the previous printable write landed at the
             // last column with `pending_wrap=true`, commit the wrap NOW
@@ -490,7 +687,7 @@ fn putCharIdle(w: *Window, t: *TerminalData, c: u8) void {
                 t.pending_wrap = false;
             }
 
-            writeCell(t, t.text_row, t.text_col, c, t.cur_attr);
+            writeCell(t, t.text_row, t.text_col, cell, t.cur_attr);
 
             if (t.text_col + 1 >= TERM_COLS) {
                 // Last column: park here, set the flag, don't scroll yet.
@@ -502,15 +699,52 @@ fn putCharIdle(w: *Window, t: *TerminalData, c: u8) void {
     }
 }
 
-fn putCharAfterEsc(t: *TerminalData, c: u8) void {
-    if (c == '[') {
-        t.esc_state = .csi;
-        t.csi_args = [_]u16{0} ** 8;
-        t.csi_arg_count = 0;
-        t.csi_has_arg = false;
-    } else {
-        // Two-char ESC sequences (ESC c, ESC =, etc.) and unknown forms — drop.
-        t.esc_state = .idle;
+fn putCharAfterEsc(w: *Window, t: *TerminalData, c: u8) void {
+    t.esc_state = .idle;
+    switch (c) {
+        '[' => {
+            t.esc_state = .csi;
+            t.csi_args = [_]u16{0} ** wm.CSI_ARGS;
+            t.csi_arg_count = 0;
+            t.csi_has_arg = false;
+            t.csi_private = 0;
+            t.csi_inter = false;
+        },
+        // OSC, DCS, SOS, PM, APC.
+        ']', 'P', 'X', '^', '_' => t.esc_state = .string,
+        '(', ')', '*', '+', '#', '%' => t.esc_state = .charset,
+        '7' => {
+            t.saved_row = t.text_row;
+            t.saved_col = t.text_col;
+        },
+        '8' => {
+            t.text_row = t.saved_row;
+            t.text_col = t.saved_col;
+            t.pending_wrap = false;
+        },
+        // Index, next line, reverse index (the top row stays: no scroll down).
+        'D', 'E' => {
+            if (c == 'E') t.text_col = 0;
+            t.text_row += 1;
+            if (t.text_row >= TERM_ROWS) scrollWindow(w);
+            t.pending_wrap = false;
+        },
+        'M' => {
+            t.text_row -|= 1;
+            t.pending_wrap = false;
+        },
+        // Reset.
+        'c' => {
+            t.cur_attr = ATTR_DEFAULT;
+            t.cur_fg_rgb = 0;
+            t.cursor_hidden = false;
+            t.text_row = 0;
+            t.text_col = 0;
+            t.pending_wrap = false;
+            eraseDisplay(t, 2);
+        },
+        // ESC =, ESC > and the rest: nothing of ours.
+        else => {},
     }
 }
 
@@ -522,8 +756,19 @@ fn putCharAfterCsi(w: *Window, t: *TerminalData, c: u8) void {
         }
         return;
     }
-    if (c == ';') {
+    if (c == ';' or c == ':') {
         if (t.csi_arg_count + 1 < t.csi_args.len) t.csi_arg_count += 1;
+        t.csi_has_arg = true;
+        return;
+    }
+    // Parameter bytes '<' '=' '>' '?' mark a private sequence; 0x20..0x2F
+    // are intermediates. Both belong to the sequence: taken, not printed.
+    if (c >= 0x3C and c <= 0x3F) {
+        t.csi_private = c;
+        return;
+    }
+    if (c >= 0x20 and c <= 0x2F) {
+        t.csi_inter = true;
         return;
     }
     // Final byte must be in 0x40..0x7E per ECMA-48; anything else aborts.
@@ -534,44 +779,151 @@ fn putCharAfterCsi(w: *Window, t: *TerminalData, c: u8) void {
     t.esc_state = .idle;
 }
 
+/// The terminal's own cursor shows unless the Linux program in it turned it
+/// off to draw its own; one that died without turning it back on doesn't
+/// leave the shell without.
+fn cursorShown(w: *const Window, t: *const TerminalData) bool {
+    return !(t.cursor_hidden and @import("../proc/tty.zig").hasLinuxProgram(w.tty));
+}
+
+/// What the terminal answers a program's query with: in through the keys'
+/// pipe, as a terminal's reply comes.
+fn termReply(w: *Window, bytes: []const u8) void {
+    if (w.kb_pipe != 0xFF) _ = @import("../proc/pipe.zig").tryWrite(w.kb_pipe, bytes);
+}
+
+/// Cells [from, from+n) of the screen take what [to...) held; the three
+/// buffers move together.
+fn moveCells(t: *TerminalData, to: usize, from: usize, n: usize) void {
+    if (to < from) {
+        std.mem.copyForwards(u8, t.text_buf[to..][0..n], t.text_buf[from..][0..n]);
+        std.mem.copyForwards(u8, t.attr_buf[to..][0..n], t.attr_buf[from..][0..n]);
+        std.mem.copyForwards(u32, t.fg_rgb_buf[to..][0..n], t.fg_rgb_buf[from..][0..n]);
+    } else {
+        std.mem.copyBackwards(u8, t.text_buf[to..][0..n], t.text_buf[from..][0..n]);
+        std.mem.copyBackwards(u8, t.attr_buf[to..][0..n], t.attr_buf[from..][0..n]);
+        std.mem.copyBackwards(u32, t.fg_rgb_buf[to..][0..n], t.fg_rgb_buf[from..][0..n]);
+    }
+}
+
+fn blankCells(t: *TerminalData, at: usize, n: usize) void {
+    @memset(t.text_buf[at..][0..n], ' ');
+    @memset(t.attr_buf[at..][0..n], t.cur_attr);
+    @memset(t.fg_rgb_buf[at..][0..n], t.cur_fg_rgb);
+}
+
 fn dispatchCsi(w: *Window, t: *TerminalData, final: u8, n_args: u8) void {
+    if (t.csi_inter) return;
+    if (t.csi_private != 0) {
+        // Of the private modes only the cursor's showing is kept (?25);
+        // mouse, paste and key reporting are never turned on.
+        if (t.csi_private == '?' and (final == 'h' or final == 'l')) {
+            for (t.csi_args[0..n_args]) |a| {
+                if (a == 25) t.cursor_hidden = final == 'l';
+            }
+        }
+        return;
+    }
+    const n: u32 = if (n_args >= 1 and t.csi_args[0] > 0) t.csi_args[0] else 1;
+    const row: u32 = t.text_row;
+    const col: u32 = t.text_col;
     switch (final) {
+        'G', '`' => {
+            t.text_col = @intCast(@min(n - 1, TERM_COLS - 1));
+            t.pending_wrap = false;
+        },
+        'd' => {
+            t.text_row = @intCast(@min(n - 1, TERM_ROWS - 1));
+            t.pending_wrap = false;
+        },
+        'E' => {
+            t.text_row = @intCast(@min(row + n, TERM_ROWS - 1));
+            t.text_col = 0;
+            t.pending_wrap = false;
+        },
+        'F' => {
+            t.text_row = @intCast(row -| n);
+            t.text_col = 0;
+            t.pending_wrap = false;
+        },
+        's' => {
+            t.saved_row = t.text_row;
+            t.saved_col = t.text_col;
+        },
+        'u' => {
+            t.text_row = t.saved_row;
+            t.text_col = t.saved_col;
+            t.pending_wrap = false;
+        },
+        // Scroll up: the top rows go to the scrollback, the cursor stays.
+        'S' => {
+            var i: u32 = 0;
+            while (i < @min(n, TERM_ROWS)) : (i += 1) scrollWindow(w);
+            t.text_row = @intCast(row);
+        },
+        // Erase, delete and insert characters in the row.
+        'X' => if (row < TERM_ROWS and col < TERM_COLS) blankCells(t, row * TERM_COLS + col, @min(n, TERM_COLS - col)),
+        'P', '@' => if (row < TERM_ROWS and col < TERM_COLS) {
+            const at = row * TERM_COLS + col;
+            const k = @min(n, TERM_COLS - col);
+            const rest = TERM_COLS - col - k;
+            if (final == 'P') {
+                moveCells(t, at, at + k, rest);
+                blankCells(t, at + rest, k);
+            } else {
+                moveCells(t, at + k, at, rest);
+                blankCells(t, at, k);
+            }
+        },
+        // Insert and delete lines at the cursor's row.
+        'L', 'M' => if (row < TERM_ROWS) {
+            const at = row * TERM_COLS;
+            const k = @min(n, TERM_ROWS - row) * TERM_COLS;
+            const rest = (TERM_ROWS - row) * TERM_COLS - k;
+            if (final == 'M') {
+                moveCells(t, at, at + k, rest);
+                blankCells(t, at + rest, k);
+            } else {
+                moveCells(t, at + k, at, rest);
+                blankCells(t, at, k);
+            }
+            t.text_col = 0;
+            t.pending_wrap = false;
+        },
+        // Device status and attributes: a program that asks waits for it.
+        'n' => if (n_args >= 1 and t.csi_args[0] == 6) {
+            var buf: [16]u8 = undefined;
+            termReply(w, std.fmt.bufPrint(&buf, "\x1b[{d};{d}R", .{ row + 1, col + 1 }) catch return);
+        } else if (n_args >= 1 and t.csi_args[0] == 5) termReply(w, "\x1b[0n"),
+        'c' => termReply(w, "\x1b[?1;2c"),
         'm' => sgr(t, n_args),
         'H', 'f' => {
             // Args are 1-indexed in ANSI; clamp to in-range cells.
-            const r: u32 = if (n_args >= 1 and t.csi_args[0] > 0) t.csi_args[0] - 1 else 0;
-            const col: u32 = if (n_args >= 2 and t.csi_args[1] > 0) t.csi_args[1] - 1 else 0;
-            t.text_row = @intCast(@min(r, TERM_ROWS - 1));
-            t.text_col = @intCast(@min(col, TERM_COLS - 1));
+            const to_col: u32 = if (n_args >= 2 and t.csi_args[1] > 0) t.csi_args[1] else 1;
+            t.text_row = @intCast(@min(n - 1, TERM_ROWS - 1));
+            t.text_col = @intCast(@min(to_col - 1, TERM_COLS - 1));
             t.pending_wrap = false;
         },
         'A' => {
-            const n: u16 = if (n_args >= 1 and t.csi_args[0] > 0) t.csi_args[0] else 1;
-            t.text_row = if (t.text_row >= n) t.text_row - n else 0;
+            t.text_row = @intCast(row -| n);
             t.pending_wrap = false;
         },
         'B' => {
-            const n: u16 = if (n_args >= 1 and t.csi_args[0] > 0) t.csi_args[0] else 1;
-            const new_row: u32 = @as(u32, t.text_row) + n;
-            t.text_row = @intCast(@min(new_row, TERM_ROWS - 1));
+            t.text_row = @intCast(@min(row + n, TERM_ROWS - 1));
             t.pending_wrap = false;
         },
         'C' => {
-            const n: u16 = if (n_args >= 1 and t.csi_args[0] > 0) t.csi_args[0] else 1;
-            const new_col: u32 = @as(u32, t.text_col) + n;
-            t.text_col = @intCast(@min(new_col, TERM_COLS - 1));
+            t.text_col = @intCast(@min(col + n, TERM_COLS - 1));
             t.pending_wrap = false;
         },
         'D' => {
-            const n: u16 = if (n_args >= 1 and t.csi_args[0] > 0) t.csi_args[0] else 1;
-            t.text_col = if (t.text_col >= n) t.text_col - n else 0;
+            t.text_col = @intCast(col -| n);
             t.pending_wrap = false;
         },
         'J' => eraseDisplay(t, if (n_args >= 1) t.csi_args[0] else 0),
         'K' => eraseLine(t, if (n_args >= 1) t.csi_args[0] else 0),
         else => {},
     }
-    _ = w;
 }
 
 fn sgr(t: *TerminalData, n_args: u8) void {
@@ -605,24 +957,28 @@ fn sgr(t: *TerminalData, n_args: u8) void {
                 t.cur_attr = (t.cur_attr & 0xF0 & ~theme.ATTR_RGB_FG) | (ATTR_DEFAULT & 0x0F);
                 t.cur_fg_rgb = 0;
             },
-            // 38;2;R;G;B = 24-bit truecolor fg. Consumes the next 4 args
-            // (the `2` selector + R/G/B). `38;5;N` (256-color) consumes
-            // 2 args; we don't expand the 256-color cube yet, just step
-            // over the selector + index so following args parse cleanly.
-            38 => {
+            // 38;2;R;G;B = 24-bit truecolor fg, 38;5;N = one of the 256.
+            // 48 is the same for the background, which cells don't have:
+            // its arguments are stepped over.
+            38, 48 => {
                 if (i + 1 >= n_args) break;
                 const sub = t.csi_args[i + 1];
                 if (sub == 2) {
                     if (i + 4 >= n_args) break;
-                    const r: u32 = @intCast(t.csi_args[i + 2] & 0xFF);
-                    const g: u32 = @intCast(t.csi_args[i + 3] & 0xFF);
-                    const b: u32 = @intCast(t.csi_args[i + 4] & 0xFF);
-                    t.cur_fg_rgb = (r << 16) | (g << 8) | b;
-                    t.cur_attr |= theme.ATTR_RGB_FG;
+                    if (arg == 38) {
+                        const r: u32 = @intCast(t.csi_args[i + 2] & 0xFF);
+                        const g: u32 = @intCast(t.csi_args[i + 3] & 0xFF);
+                        const b: u32 = @intCast(t.csi_args[i + 4] & 0xFF);
+                        t.cur_fg_rgb = (r << 16) | (g << 8) | b;
+                        t.cur_attr |= theme.ATTR_RGB_FG;
+                    }
                     i += 4;
                 } else if (sub == 5) {
-                    // 256-color: skip the index for now; future-proof.
                     if (i + 2 >= n_args) break;
+                    if (arg == 38) {
+                        t.cur_fg_rgb = color256(t.csi_args[i + 2]);
+                        t.cur_attr |= theme.ATTR_RGB_FG;
+                    }
                     i += 2;
                 }
             },
@@ -1561,7 +1917,7 @@ fn launchShortcut(idx: usize) void {
         // window_count is u8; widen before the multiply or `9 * 30 = 270`
         // overflows u8 arithmetic and Zig's runtime safety panics.
         const off: i32 = @intCast(@as(u32, wm.window_count) * 30);
-        const nw: u32 = TERM_COLS * FONT_W + BORDER * 2;
+        const nw: u32 = TERM_WIN_W;
         const nh: u32 = TERM_ROWS * FONT_H + TITLEBAR_H;
         if (createWindow("Terminal", 80 + off, 40 + off, nw, nh)) |ni| {
             setFocused(ni);
@@ -2131,7 +2487,7 @@ fn renderWindow(idx: u8) void {
             }
 
             // Text cursor — blink unless the user just typed / output just landed.
-            if (is_focused and t.text_col < max_cols and t.text_row < max_rows) {
+            if (is_focused and t.text_col < max_cols and t.text_row < max_rows and cursorShown(w, t)) {
                 const blink_on = ((process.tick_count -% t.cursor_blink_anchor) / CURSOR_BLINK_HALF_TICKS) & 1 == 0;
                 if (blink_on) {
                     gfx.fillRect(
@@ -2234,7 +2590,7 @@ fn renderTerminalRow(idx: u8) void {
     }
 
     // Text cursor — blink unless the user just typed / output just landed.
-    if (idx == wm.focused and t.text_col < max_cols) {
+    if (idx == wm.focused and t.text_col < max_cols and cursorShown(w, t)) {
         const blink_on = ((process.tick_count -% t.cursor_blink_anchor) / CURSOR_BLINK_HALF_TICKS) & 1 == 0;
         if (blink_on) {
             gfx.fillRect(
@@ -2724,7 +3080,7 @@ fn executeMenuItem(idx: i8) void {
             2 => { // Kernel Console: a terminal on the in-kernel CLI, no shell.
                 // window_count is u8: widen before the multiply.
                 const off: i32 = @intCast(@as(u32, wm.window_count) * 30);
-                const nw: u32 = TERM_COLS * FONT_W + BORDER * 2;
+                const nw: u32 = TERM_WIN_W;
                 const nh: u32 = TERM_ROWS * FONT_H + TITLEBAR_H;
                 if (createWindow("Terminal", 80 + off, 40 + off, nw, nh)) |ni| {
                     setFocused(ni);
@@ -3556,7 +3912,7 @@ pub fn run() void {
     // Boot splash
     splash.show(backbuf != null);
 
-    const win_w: u32 = TERM_COLS * FONT_W + BORDER * 2;
+    const win_w: u32 = TERM_WIN_W;
     const win_h: u32 = TERM_ROWS * FONT_H + TITLEBAR_H;
     const win_x: i32 = @intCast((disp_w - win_w) / 2);
     const win_y: i32 = @intCast(MENUBAR_H + (disp_h - MENUBAR_H - TASKBAR_H - win_h) / 2);
@@ -3888,12 +4244,13 @@ pub fn run() void {
                 }
 
                 if (is_terminal) {
-                    if (ch == 0x1B) continue; // ESC: terminals ignore
+                    // ESC: a Linux program's key; our own shell has no use for it.
+                    if (ch == 0x1B and !@import("../proc/tty.zig").hasLinuxProgram(w.tty)) continue;
                     if (ch == 0x14) { // Ctrl+T: spawn new terminal
                         // window_count is u8; widen before the multiply or `9 * 30 = 270`
         // overflows u8 arithmetic and Zig's runtime safety panics.
         const off: i32 = @intCast(@as(u32, wm.window_count) * 30);
-                        const nw: u32 = TERM_COLS * FONT_W + BORDER * 2;
+                        const nw: u32 = TERM_WIN_W;
                         const nh: u32 = TERM_ROWS * FONT_H + TITLEBAR_H;
                         if (createWindow("Terminal", 80 + off, 40 + off, nw, nh)) |ni| {
                             setFocused(ni);

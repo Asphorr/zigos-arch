@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <sys/sysinfo.h>
@@ -425,6 +426,221 @@ static void check_job_stops(void) {
     munmap((void *)ran, 4096);
 }
 
+// A process's state letter in /proc/<pid>/stat; 0 when it is not there.
+static char state_of(pid_t pid) {
+    char path[64], buf[256];
+    snprintf(path, sizeof path, "/proc/%d/stat", (int)pid);
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    ssize_t n = read(fd, buf, sizeof buf - 1);
+    close(fd);
+    if (n <= 0) return 0;
+    buf[n] = 0;
+    char *p = strrchr(buf, ')');
+    return p && p[1] == ' ' ? p[2] : 0;
+}
+
+// True once `pid` is gone from /proc, looked for up to `ms`.
+static int gone_within(pid_t pid, long ms) {
+    long long until = now_ms() + ms;
+    while (state_of(pid) != 0) {
+        if (now_ms() > until) return 0;
+        nap_ms(20);
+    }
+    return 1;
+}
+
+// A child that makes a grandchild and ends without waiting for it. The
+// grandchild ends `after_ms` later (0: before its parent does). Returns the
+// grandchild's pid once the child is reaped.
+static pid_t orphan(long after_ms) {
+    int pp[2];
+    if (pipe(pp) != 0) return -1;
+    pid_t a = fork();
+    if (a == 0) {
+        pid_t b = fork();
+        if (b == 0) {
+            if (after_ms) nap_ms(after_ms);
+            _exit(0);
+        }
+        if (write(pp[1], &b, sizeof b) != sizeof b) _exit(1);
+        if (!after_ms) nap_ms(150); // the grandchild is a zombie by now
+        _exit(0);
+    }
+    pid_t b = -1;
+    close(pp[1]);
+    if (read(pp[0], &b, sizeof b) != sizeof b) b = -1;
+    close(pp[0]);
+    return wait_exit(a) == 0 ? b : -1;
+}
+
+// Nobody waits for an orphan, and nobody is left a zombie it did not ask
+// for; every reader of a pipe sees its last writer go.
+static void check_unwaited(void) {
+    pid_t b = orphan(500);
+    CHECK(b > 0 && state_of(b) != 0, "an orphan lives on after its parent");
+    CHECK(gone_within(b, 2000), "an orphan is gone as it ends");
+    b = orphan(0);
+    CHECK(b > 0 && gone_within(b, 2000), "a zombie is gone when its parent ends");
+
+    signal(SIGCHLD, SIG_IGN);
+    pid_t c = fork();
+    if (c == 0) {
+        nap_ms(100);
+        _exit(3);
+    }
+    int st = 0;
+    errno = 0;
+    CHECK(c > 0 && waitpid(c, &st, 0) == -1 && errno == ECHILD, "SIGCHLD ignored: wait ends with ECHILD");
+    CHECK(state_of(c) == 0, "and the child left no zombie");
+    signal(SIGCHLD, SIG_DFL);
+
+    enum { READERS = 3 };
+    int pp[2];
+    pid_t r[READERS];
+    CHECK(pipe(pp) == 0, "pipe for several readers");
+    for (int i = 0; i < READERS; i++) {
+        r[i] = fork();
+        if (r[i] == 0) {
+            char ch;
+            close(pp[1]);
+            _exit(read(pp[0], &ch, 1) == 0 ? 0 : 1);
+        }
+    }
+    nap_ms(200); // each of them is in read() by now
+    close(pp[1]);
+    int saw_end = 0;
+    long long until = now_ms() + 3000;
+    for (int i = 0; i < READERS; i++) {
+        int got = 0;
+        while ((got = waitpid(r[i], &st, WNOHANG)) == 0 && now_ms() < until) nap_ms(20);
+        if (got == r[i]) {
+            saw_end += WIFEXITED(st) && WEXITSTATUS(st) == 0;
+        } else {
+            kill(r[i], SIGKILL);
+            waitpid(r[i], &st, 0);
+        }
+    }
+    close(pp[0]);
+    CHECK(saw_end == READERS, "the last writer's close ends every reader's read");
+}
+
+// A pipe takes a here-document's worth before anyone reads it, and says how
+// much it holds.
+static void check_pipe_room(void) {
+    enum { DOC = 60000 };
+    static char doc[DOC];
+    int pp[2];
+    CHECK(pipe(pp) == 0, "pipe for a long write");
+    memset(doc, 'h', sizeof doc);
+    fcntl(pp[1], F_SETFL, O_NONBLOCK);
+    CHECK(write(pp[1], doc, sizeof doc) == DOC, "a pipe holds 60000 bytes with no reader yet");
+    CHECK(fcntl(pp[1], F_GETPIPE_SZ) >= DOC, "F_GETPIPE_SZ covers it");
+    int waiting = 0;
+    CHECK(ioctl(pp[0], FIONREAD, &waiting) == 0 && waiting == DOC, "FIONREAD counts what waits in a pipe");
+    close(pp[0]);
+    close(pp[1]);
+}
+
+// A wait another process ends: a futex word in shared memory, and a signal
+// sent to a thread that is in sigwait for it.
+static void check_waits_across(void) {
+    enum { WAIT = 0, WAKE = 1 };
+    int *word = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    CHECK(word != MAP_FAILED, "a shared page for a futex");
+    *word = 0;
+    pid_t c = fork();
+    if (c == 0) {
+        nap_ms(200); // the parent is in its wait by now
+        *word = 1;
+        _exit(syscall(SYS_futex, word, WAKE, 1, NULL, NULL, 0) == 1 ? 0 : 1);
+    }
+    struct timespec limit = {3, 0};
+    long r = syscall(SYS_futex, word, WAIT, 0, &limit, NULL, 0);
+    CHECK(c > 0 && r == 0 && *word == 1, "a futex in shared memory is woken from another process");
+    CHECK(wait_exit(c) == 0, "and the waker counts the one it woke");
+    munmap(word, 4096);
+
+    sigset_t set, old;
+    sigemptyset(&set);
+    sigaddset(&set, SIGUSR2);
+    signal(SIGUSR2, SIG_DFL);
+    sigprocmask(SIG_BLOCK, &set, &old);
+    pid_t me = getpid();
+    c = fork();
+    if (c == 0) {
+        nap_ms(200); // the parent is in sigwait by now
+        kill(me, SIGUSR2);
+        _exit(0);
+    }
+    int sig = 0;
+    CHECK(c > 0 && sigwait(&set, &sig) == 0 && sig == SIGUSR2, "a signal sent during sigwait is the wait's to take");
+    CHECK(wait_exit(c) == 0, "the sender ends");
+    sigprocmask(SIG_SETMASK, &old, NULL);
+}
+
+// A thread that only computes is charged for it, timer fires or not.
+static void check_cpu_time(void) {
+    struct timespec a, b;
+    clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &a);
+    long long until = now_ms() + 300;
+    volatile unsigned long spin = 0;
+    while (now_ms() < until) spin++;
+    clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &b);
+    long long used = (b.tv_sec - a.tv_sec) * 1000LL + (b.tv_nsec - a.tv_nsec) / 1000000;
+    CHECK(used >= 100, "a busy loop is charged its CPU time");
+}
+
+static void *nap_then_end(void *arg) {
+    nap_ms((long)arg);
+    return NULL;
+}
+
+static void *spin_then_end(void *arg) {
+    long long until = now_ms() + (long)arg;
+    volatile unsigned long spin = 0;
+    while (now_ms() < until) spin++;
+    return NULL;
+}
+
+static long long cpu_ms(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &t);
+    return t.tv_sec * 1000LL + t.tv_nsec / 1000000;
+}
+
+// A process with threads: they are not its children, one that ended still
+// counts in its CPU time, and a main thread that ended first leaves nothing
+// behind once the others are gone.
+static void check_threaded(void) {
+    pthread_t th;
+    CHECK(pthread_create(&th, NULL, nap_then_end, (void *)300L) == 0, "a thread that naps");
+    errno = 0;
+    CHECK(waitpid(-1, NULL, 0) == -1 && errno == ECHILD, "ECHILD with a thread and no children");
+    pthread_join(th, NULL);
+
+    long long before = cpu_ms();
+    CHECK(pthread_create(&th, NULL, spin_then_end, (void *)300L) == 0, "a thread that spins");
+    pthread_join(th, NULL);
+    CHECK(cpu_ms() - before >= 100, "a thread that ended stays in the process's CPU time");
+
+    for (int ignored = 0; ignored < 2; ignored++) {
+        if (ignored) signal(SIGCHLD, SIG_IGN);
+        pid_t c = fork();
+        if (c == 0) {
+            pthread_t w;
+            if (pthread_create(&w, NULL, nap_then_end, (void *)200L) != 0) _exit(1);
+            syscall(SYS_exit, 0); // the main thread alone
+        }
+        if (ignored) {
+            CHECK(c > 0 && gone_within(c, 3000), "SIGCHLD ignored: a main thread that ended first leaves no zombie");
+        } else {
+            CHECK(c > 0 && waitpid(c, NULL, 0) == c, "a process whose main thread ended first is waited for");
+        }
+    }
+    signal(SIGCHLD, SIG_DFL);
+}
+
 int main(int argc, char **argv) {
     if (argc >= 2 && strcmp(argv[1], "exec-child") == 0) return exec_child(argc, argv);
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -630,6 +846,11 @@ int main(int argc, char **argv) {
     check_pids_and_groups();
     check_avx();
     check_job_stops();
+    check_unwaited();
+    check_pipe_room();
+    check_waits_across();
+    check_cpu_time();
+    check_threaded();
 
     // churn
     for (int i = 0; i < 20; i++) {

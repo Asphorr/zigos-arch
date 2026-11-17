@@ -7194,6 +7194,9 @@ fn roleForId(id: []const u8) ?[]const u8 {
 pub const DevResources = struct {
     io_base: ?u16 = null,
     irq: ?u8 = null,
+    /// How that IRQ signals; null with no IRQ descriptor.
+    irq_low: ?bool = null,
+    irq_level: ?bool = null,
     mem_base: ?u64 = null,
 };
 
@@ -7220,6 +7223,11 @@ fn extractCrs(buf: []const u8) DevResources {
                             break;
                         }
                     }
+                    // Flags: bit 0 edge, bit 3 active low. Without the byte
+                    // the line is edge-triggered, active high.
+                    const fl: u8 = if (d.len >= 3) d[2] else 0x01;
+                    out.irq_level = fl & 0x01 == 0;
+                    out.irq_low = fl & 0x08 != 0;
                 },
                 0x08 => if (out.io_base == null and d.len >= 7) {
                     out.io_base = leU16(d, 1);
@@ -7244,6 +7252,9 @@ fn extractCrs(buf: []const u8) DevResources {
                 },
                 0x09 => if (out.irq == null and d.len >= 6) {
                     out.irq = @truncate(leU32(d, 2)); // Extended IRQ: first listed line
+                    // Flags: bit 1 edge, bit 2 active low.
+                    out.irq_level = d[0] & 0x02 == 0;
+                    out.irq_low = d[0] & 0x04 != 0;
                 },
                 else => {},
             }
@@ -7356,13 +7367,13 @@ fn crossCheckBindings() void {
 // kernel's PCI/IOAPIC code the GSI for a legacy INTx interrupt — sourced from
 // ACPI instead of guessed. ACPI 6.4 §6.2.13 (_PRT), §6.2.9 (link _PRS/_CRS).
 
-const PrtRoute = struct { dev: u8, pin: u8, gsi: u32 };
+const PrtRoute = struct { dev: u8, pin: u8, gsi: u32, low: bool };
 var prt_routes: [160]PrtRoute = undefined;
 var prt_nroutes: usize = 0;
 
 // seg→GSI map for interrupt-link devices, built once *before* the _PRT package is
 // walked (the per-link _CRS evals reset the value arena the package lives in).
-const LinkGsi = struct { seg: [4]u8, gsi: u32 };
+const LinkGsi = struct { seg: [4]u8, gsi: u32, low: bool };
 var link_map: [64]LinkGsi = undefined;
 var nlink: usize = 0;
 
@@ -7402,7 +7413,7 @@ fn buildLinkMap() void {
             if (v == .buffer) {
                 const rr = extractCrs(v.buffer);
                 if (rr.irq) |q| {
-                    link_map[nlink] = .{ .seg = lastSeg(p), .gsi = q };
+                    link_map[nlink] = .{ .seg = lastSeg(p), .gsi = q, .low = rr.irq_low orelse true };
                     nlink += 1;
                 }
             }
@@ -7410,10 +7421,10 @@ fn buildLinkMap() void {
     }
 }
 
-fn lookupLink(seg: [4]u8) ?u32 {
+fn lookupLink(seg: [4]u8) ?LinkGsi {
     var i: usize = 0;
     while (i < nlink) : (i += 1) {
-        if (std.mem.eql(u8, &link_map[i].seg, &seg)) return link_map[i].gsi;
+        if (std.mem.eql(u8, &link_map[i].seg, &seg)) return link_map[i];
     }
     return null;
 }
@@ -7447,16 +7458,20 @@ pub fn buildPrt() u32 {
         if (e[0] != .integer or e[1] != .integer) continue;
         const dev: u8 = @truncate(e[0].integer >> 16);
         const pin: u8 = @truncate(e[1].integer);
-        var gsi: ?u32 = null;
+        // A link's _CRS gives its line's polarity; a GSI given directly is
+        // active low (§6.2.13).
+        var route: ?PrtRoute = null;
         switch (e[2]) {
-            .name_ref => |s| gsi = lookupLink(s),
+            .name_ref => |s| if (lookupLink(s)) |l| {
+                route = .{ .dev = dev, .pin = pin, .gsi = l.gsi, .low = l.low };
+            },
             .integer => |s| if (s == 0 and e[3] == .integer) {
-                gsi = @truncate(e[3].integer);
+                route = .{ .dev = dev, .pin = pin, .gsi = @truncate(e[3].integer), .low = true };
             },
             else => {},
         }
-        if (gsi) |g| {
-            prt_routes[prt_nroutes] = .{ .dev = dev, .pin = pin, .gsi = g };
+        if (route) |r| {
+            prt_routes[prt_nroutes] = r;
             prt_nroutes += 1;
         }
     }
@@ -7474,9 +7489,18 @@ pub fn buildPrt() u32 {
 /// _PRT (pin 0=INTA..3=INTD), or null if absent. A driver enabling a legacy INTx
 /// interrupt programs its IOAPIC redirection entry for this GSI.
 pub fn gsiForPciPin(dev: u8, pin: u8) ?u32 {
+    return (intxForPciPin(dev, pin) orelse return null).gsi;
+}
+
+/// A PCI INTx pin's interrupt per _PRT: the GSI and its line's polarity,
+/// which the IOAPIC redirection entry must match. Always level triggered.
+pub const PciIntx = struct { gsi: u32, low: bool };
+
+pub fn intxForPciPin(dev: u8, pin: u8) ?PciIntx {
     var i: usize = 0;
     while (i < prt_nroutes) : (i += 1) {
-        if (prt_routes[i].dev == dev and prt_routes[i].pin == pin) return prt_routes[i].gsi;
+        const r = prt_routes[i];
+        if (r.dev == dev and r.pin == pin) return .{ .gsi = r.gsi, .low = r.low };
     }
     return null;
 }

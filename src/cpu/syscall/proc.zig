@@ -649,16 +649,16 @@ pub fn sysWaitpid(target_pid: u32, status_ptr: u32) u32 {
 
     while (true) {
         if (process.findZombieChild(me, target_pid)) |zpid| {
+            // != 0 guards the cast against null; aligned variant also
+            // catches misaligned u32 (Zig safety panics on @ptrFromInt
+            // to *u32 with non-4-byte-aligned int) and unmapped pages.
+            if (status_ptr != 0 and !validateUserPtrWriteAligned(status_ptr, 4, 4)) return E_FAULT;
+            // The number first: the reap is of that occupant, so the
+            // status read in between is its own.
+            const nr = process.procs[zpid].pid_nr;
             const status = process.procs[zpid].exit_status;
-            if (status_ptr != 0) {
-                // != 0 guards the cast against null; aligned variant also
-                // catches misaligned u32 (Zig safety panics on @ptrFromInt
-                // to *u32 with non-4-byte-aligned int) and unmapped pages.
-                if (!validateUserPtrWriteAligned(status_ptr, 4, 4)) return E_FAULT;
-                const sp: *u32 = @ptrFromInt(@as(usize, status_ptr));
-                sp.* = status;
-            }
-            process.reapZombie(zpid);
+            if (!process.reapZombieOf(zpid, nr)) continue;
+            if (status_ptr != 0) @as(*u32, @ptrFromInt(@as(usize, status_ptr))).* = status;
             return zpid;
         }
 

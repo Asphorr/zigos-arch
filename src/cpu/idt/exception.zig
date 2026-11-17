@@ -453,13 +453,17 @@ export fn handleException(rsp: u64) callconv(.c) void {
     else
         "Unknown";
 
-    // GDB stub intercept: exceptions 1 (debug) and 3 (breakpoint)
+    // GDB stub intercept: exceptions 1 (debug) and 3 (breakpoint). A
+    // program's own trap is its SIGTRAP, not a wait for a debugger with
+    // interrupts off — unless one is attached, whose breakpoint it may be.
     const gdb_stub = @import("../../debug/gdb_stub.zig");
     if (int_no == 1 or int_no == 3) {
-        if (gdb_stub.isActive()) {
+        if (gdb_stub.isActive() and (saved_cs & 3 == 0 or gdb_stub.isConnected())) {
             gdb_stub.enterStub(@ptrFromInt(rsp), @intCast(int_no));
             return;
         }
+        // What a single step left in DR6 stays until it is cleared.
+        if (int_no == 1) gdb_stub.clearDR6();
     }
 
     // Check if exception came from Ring 3 (user process)
@@ -516,7 +520,7 @@ export fn handleException(rsp: u64) callconv(.c) void {
                     si_code = signals.FPE_INTDIV;
                 } else if (int_no == 3 or int_no == 1) {
                     fault_addr = saved_rip;
-                    si_code = signals.TRAP_BRKPT;
+                    si_code = if (int_no == 1) signals.TRAP_TRACE else signals.TRAP_BRKPT;
                 }
                 // Interrupts on for the delivery, as on the #PF path: the trap
                 // came from ring 3, so no kernel context is interrupted, and

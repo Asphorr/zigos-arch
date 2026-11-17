@@ -20,8 +20,9 @@
 
 const std = @import("std");
 
-/// Regions one address space may hold (Linux's vm.max_map_count is 65530).
-pub const MAX_REGIONS: u32 = 16384;
+/// Regions one address space may hold: Linux's default vm.max_map_count,
+/// which /proc/sys/vm/max_map_count reports.
+pub const MAX_REGIONS: u32 = 65530;
 const MIN_CAPACITY: u32 = 8;
 
 pub const Error = error{ OutOfMemory, Overlap };

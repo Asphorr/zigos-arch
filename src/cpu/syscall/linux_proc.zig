@@ -380,21 +380,25 @@ var reap_lock: @import("../../proc/spinlock.zig").SpinLock = .{};
 fn reapChild(group: u8, awaited: Awaited, status: *u32) ?u32 {
     reap_lock.acquire();
     defer reap_lock.release();
-    const z: u8 = switch (awaited) {
-        .any => process.findZombieChild(group, ANY_CHILD),
-        .slot => |s| process.findZombieChild(group, s),
-        .group => blk: {
-            for (0..process.MAX_PROCS) |i| {
-                if (!awaited.has(i)) continue;
-                if (process.findZombieChild(group, @intCast(i))) |z| break :blk z;
-            }
-            break :blk null;
-        },
-    } orelse return null;
-    status.* = waitStatus(process.procs[z].exit_status);
-    const nr = process.procs[z].pid_nr;
-    process.reapZombie(z);
-    return nr;
+    while (true) {
+        const z: u8 = switch (awaited) {
+            .any => process.findZombieChild(group, ANY_CHILD),
+            .slot => |s| process.findZombieChild(group, s),
+            .group => blk: {
+                for (0..process.MAX_PROCS) |i| {
+                    if (!awaited.has(i)) continue;
+                    if (process.findZombieChild(group, @intCast(i))) |z| break :blk z;
+                }
+                break :blk null;
+            },
+        } orelse return null;
+        // The number first: the reap is of that occupant, so the status
+        // read in between is its own. Freed by another meanwhile (its
+        // parent set SIGCHLD aside): look again.
+        const nr = process.procs[z].pid_nr;
+        status.* = waitStatus(process.procs[z].exit_status);
+        if (process.reapZombieOf(z, nr)) return nr;
+    }
 }
 
 /// A child of `group` among the `awaited` that stopped (WUNTRACED) or went
@@ -423,7 +427,9 @@ fn changedChild(group: u8, awaited: Awaited, options: u64, status: *u32) ?u32 {
 
 fn hasChild(group: u8, awaited: Awaited) bool {
     for (0..process.MAX_PROCS) |i| {
-        if (process.procs[i].state == .unused or process.procs[i].parent_pid != group) continue;
+        const p = &process.procs[i];
+        // The process's own threads carry its slot as their parent too.
+        if (p.state == .unused or p.parent_pid != group or p.tgid == group) continue;
         if (awaited.has(i)) return true;
     }
     return false;
@@ -828,7 +834,7 @@ pub fn sysinfo(va: u64) u64 {
 pub fn times(buf_va: u64) u64 {
     const me = linux_fs.proc() orelse return err(EFAULT);
     if (buf_va != 0) {
-        const tms = [4]i64{ @intCast(me.ticks_used), 0, 0, 0 };
+        const tms = [4]i64{ @intCast(linux_time.groupCpuTicks(me.tgid)), 0, 0, 0 };
         if (!usercopy.copyToUser(buf_va, std.mem.asBytes(&tms))) return err(EFAULT);
     }
     return process.tick_count;
@@ -838,8 +844,9 @@ pub fn times(buf_va: u64) u64 {
 pub fn getrusage(usage_va: u64) u64 {
     const me = linux_fs.proc() orelse return err(EFAULT);
     var ru = [_]i64{0} ** (RUSAGE_BYTES / 8);
-    ru[0] = @intCast(me.ticks_used / 100);
-    ru[1] = @intCast((me.ticks_used % 100) * 10_000);
+    const ticks = linux_time.groupCpuTicks(me.tgid);
+    ru[0] = @intCast(ticks / 100);
+    ru[1] = @intCast((ticks % 100) * 10_000);
     if (!usercopy.copyToUser(usage_va, std.mem.asBytes(&ru))) return err(EFAULT);
     return 0;
 }

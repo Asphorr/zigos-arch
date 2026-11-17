@@ -1108,6 +1108,9 @@ var teardown_diag_suppressed: u32 = 0; // (a) teardowns hidden since then
 ///     dying CPU is still on the dying kstack until it reschedules).
 fn tearDownTask(pid: usize, status: u32, op: TerminateOp, persist_shared_dirty: bool) void {
     const my_tgid: u8 = process.procs[pid].tgid;
+    // The lead as it is now: once this thread is gone its slot may be
+    // reaped and taken by another.
+    const lead_nr = process.procs[my_tgid].pid_nr;
     // Self-destroy: leave the AS for kernel tables BEFORE the claim. Once
     // marked, this thread no longer keeps the AS alive — a sibling dying on
     // another CPU can be the last claimant and free the page tables (PML4
@@ -1200,11 +1203,12 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp, persist_shared_dirty: 
     // completes, since the OP_POLL pending slots reference them by index
     // and the worker may already have recycled the Instance slot above.
     @import("../cpu/ipc/fdpoll.zig").releaseAllForPid(@intCast(pid));
-    // Killed inside poll, waitEvent or wait4: its bits would wake the slot's
-    // next task.
+    // Killed inside poll, waitEvent, wait4 or a pipe: its bits would wake
+    // the slot's next task.
     @import("../cpu/ipc/fdpoll.zig").sleeperLeave(pid);
     @import("../ui/desktop/event_wait.zig").leave(pid);
     childWaitLeave(pid);
+    @import("pipe.zig").leave(pid);
 
     // A native thread's own copy of the table (a Linux thread's is empty).
     if (pid != my_tgid) dropFds(pid);
@@ -1311,6 +1315,8 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp, persist_shared_dirty: 
         process.procs[pid].pcid = 0;
     }
     process.procs[pid].exit_status = status;
+    // The process's CPU time keeps what this thread used.
+    if (pid != my_tgid) @import("sched.zig").foldCpuTicks(pid, my_tgid);
 
     // Self-destroy: steer this CPU's TSS rsp0 to its own idle kstack
     // BEFORE the slot becomes free / reusable. Without this, there's a
@@ -1347,7 +1353,10 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp, persist_shared_dirty: 
     // user-space TCB futex, never via waitpid, so they auto-reap
     // regardless of parent state.
     const parent = process.procs[pid].parent_pid;
-    const parent_alive = parent < MAX_PROCS and process.procs[parent].state != .unused and parent != 0;
+    const parent_there = hasParent(pid);
+    // A zombie is for a parent that reads exit statuses: not for one that
+    // set SIGCHLD aside.
+    const parent_alive = parent_there and !signals.discardsChildren(&process.procs[parent]);
     const is_worker_thread = pid != my_tgid;
     // A LEAD that dies before its workers must stay pinned as a zombie even
     // with no parent to reap it: every worker derefs procs[tgid] via
@@ -1363,17 +1372,16 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp, persist_shared_dirty: 
     // parent_pid could point at a slot that gets reused by a future
     // create() and the child would think a stranger is its parent.
     // Children are the process's (parent_pid = the lead): they move when
-    // the group empties, here for a lead dying last, below for a worker
-    // that outlived its pinned lead. Until then a worker may wait4 them.
-    if (!is_worker_thread and last_in_group) {
-        reparentChildren(@intCast(pid));
-    }
+    // the group empties, whichever member is the last. Until then a worker
+    // may wait4 them, and the lead's slot is still the group's.
+    if (last_in_group) reparentChildren(my_tgid);
 
     if ((parent_alive and !is_worker_thread) or must_pin_as_lead) {
-        // setState rqLeave's pid if it was somehow .ready (shouldn't be —
-        // the kill path pre-flips .zombie under the exit_requested claim
-        // and the destroy path comes off .running — but defensive).
         process.procs[pid].death_tick = process.tick_count;
+        // Before the state: whoever finds the zombie finds this too. (The
+        // kill path made it a zombie before the teardown; setState's lock
+        // is the fence that puts the flag ahead of what is read below.)
+        @atomicStore(bool, &process.procs[pid].exit_done, true, .release);
         process.setState(pid, .zombie);
         if (parent_alive) {
             if (parentIsWaiting(@intCast(pid))) process.wake(parent);
@@ -1383,38 +1391,40 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp, persist_shared_dirty: 
             // non-blocking reaping. Sent regardless of waitpid state per POSIX.
             notifyParentOfExit(parent, pid);
         }
+        // Nobody will wait for it: the parent keeps no zombies, or ended
+        // since the look at it above — it raised `orphan` and looked for a
+        // zombie, this looks at `orphan` after becoming one, and one of
+        // the two frees it. Refused while workers still pin a lead.
+        if (!parent_alive or @atomicLoad(bool, &process.procs[pid].orphan, .seq_cst)) {
+            dropZombie(@intCast(pid), process.procs[pid].pid_nr);
+        }
     } else {
-        process.setState(pid, .unused);
-        @atomicStore(usize, &process.expected_kstack_tops[pid], 0, .release);
-        @import("../debug/kasan.zig").markPcbDead(@intFromPtr(&process.kstack_pool[pid]) + KSTACK_GUARD_SIZE, KSTACK_SIZE);
+        // A parent that keeps no zombies may be in wait4 all the same: it
+        // looks again and finds this child gone. Read before the slot goes.
+        const tell = parent_there and !is_worker_thread;
+        const waiting = tell and parentIsWaiting(@intCast(pid));
+        freeSlot(pid);
+        if (tell) {
+            if (waiting) process.wake(parent);
+            wakeChildWaiters(parent);
+        }
     }
 
-    // Last dier was a worker and the lead sits pinned as a zombie: the
-    // group is now empty, so unpin it — wake the lead's parent (its
-    // waitpid has been blocking on findZombieChild's group-alive guard)
-    // or, with no parent to reap it, free the slot right here.
-    if (last_in_group and is_worker_thread and process.procs[my_tgid].state == .zombie) {
-        reparentChildren(my_tgid);
+    // A worker that outlived its lead: the lead sits pinned as a zombie
+    // until no member is left, and this one is gone now. The lead's parent
+    // looks again (its wait4 saw this worker alive — findZombieChild's
+    // guard — and went back to sleep), or with nobody to wait for it the
+    // lead is freed here: by whichever member is done last, refused while
+    // another lives. A lead that turns zombie after this look finds this
+    // worker gone and does the same itself.
+    if (is_worker_thread and process.procs[my_tgid].state == .zombie and process.procs[my_tgid].pid_nr == lead_nr) {
         const lp = process.procs[my_tgid].parent_pid;
-        const lp_alive = lp != 0 and lp < MAX_PROCS and process.procs[lp].state != .unused;
-        if (lp_alive) {
+        if (hasParent(my_tgid) and !signals.discardsChildren(&process.procs[lp])) {
             if (parentIsWaiting(my_tgid)) process.wake(lp);
             wakeChildWaiters(lp);
-            notifyParentOfExit(lp, my_tgid);
+            if (last_in_group) notifyParentOfExit(lp, my_tgid);
         } else {
-            reapZombie(my_tgid);
-        }
-    } else if (is_worker_thread and process.procs[my_tgid].state == .zombie) {
-        // Not the last to claim its teardown, but perhaps the last to
-        // finish it: the lead became a zombie meanwhile and woke its
-        // parent, which saw this worker still alive (findZombieChild's
-        // guard) and went back to sleep. Its state is gone now — have the
-        // parent look again. (A lead that turns zombie after this read
-        // wakes the parent itself, and finds this worker gone.)
-        const lp = process.procs[my_tgid].parent_pid;
-        if (lp != 0 and lp < MAX_PROCS and process.procs[lp].state != .unused) {
-            if (parentIsWaiting(my_tgid)) process.wake(lp);
-            wakeChildWaiters(lp);
+            dropZombie(my_tgid, lead_nr);
         }
     }
 
@@ -1790,11 +1800,10 @@ pub fn exitThreadGroup(status: u32) void {
 //    After max_age_ticks the slot is forcibly reclaimed so the PCB table
 //    doesn't fill up with zombies after a long uptime.
 //
-// PID 1 / init: the `desktop` kernel task runs at PID 1 by convention
-// (BSP idle is PID 0). Reparenting points orphans at desktop, which never
-// calls waitpid — so the auto-reap-on-orphan path triggers naturally on
-// the next exit, freeing the slot. Worth-it tradeoff: simpler code,
-// slight delay in slot reclamation.
+// PID 1 / init: slot 1 is a kernel task that never waits (BSP idle is
+// PID 0). An orphan shows it as its parent (getppid) and carries `orphan`:
+// it is freed as it ends, and one that was a zombie already is freed when
+// its parent ends.
 
 /// SIGCHLD for process `parent`: its child in slot `child` has ended, with
 /// an exit code or by a signal.
@@ -1818,11 +1827,49 @@ pub fn reparentChildren(dead_pid: u8) void {
     var i: u8 = 0;
     while (i < MAX_PROCS) : (i += 1) {
         if (i == dead_pid) continue;
-        if (process.procs[i].state == .unused) continue;
-        if (process.procs[i].parent_pid == dead_pid) {
-            process.procs[i].parent_pid = INIT_PID;
+        const p = &process.procs[i];
+        var nr: u32 = 0;
+        {
+            // Under the lock slots are freed under: the child looked at is
+            // the one that gets the new parent.
+            const flags = reap_lock.acquireIrqSave();
+            defer reap_lock.releaseIrqRestore(flags);
+            // A slot being set up is not the dying process's: it forks no
+            // more. Its own threads are not its children.
+            if (p.state == .unused or p.state == .loading) continue;
+            if (p.parent_pid != dead_pid or p.tgid == dead_pid) continue;
+            nr = p.pid_nr;
+            p.parent_pid = INIT_PID;
+            // Nobody waits for it now. `orphan` goes up before the look at
+            // its state; the child looks at `orphan` after it becomes a
+            // zombie.
+            @atomicStore(bool, &p.orphan, true, .seq_cst);
         }
+        if (p.state == .zombie) _ = reapZombieOf(i, nr);
     }
+}
+
+/// Free the zombie numbered `nr` in slot `pid`, which no parent will wait
+/// for. A parent that keeps no zombies may be in wait4 all the same: it
+/// looks again and finds the child gone.
+fn dropZombie(pid: u8, nr: u32) void {
+    const parent = process.procs[pid].parent_pid;
+    const tell = hasParent(pid);
+    const waiting = tell and parentIsWaiting(pid);
+    if (!reapZombieOf(pid, nr)) return;
+    if (tell) {
+        if (waiting) process.wake(parent);
+        wakeChildWaiters(parent);
+    }
+}
+
+/// True when the process in slot `pid` has a parent that may wait for it: a
+/// live one, the child not left behind by it.
+fn hasParent(pid: usize) bool {
+    const p = &process.procs[pid];
+    if (@atomicLoad(bool, &p.orphan, .seq_cst)) return false;
+    const parent = p.parent_pid;
+    return parent != 0 and parent < MAX_PROCS and process.procs[parent].state != .unused;
 }
 
 /// Convenience wrapper for callers that don't want to track timing.
@@ -1852,6 +1899,9 @@ pub fn reapStaleZombies(max_age_ticks: u64) u32 {
     var reaped: u32 = 0;
     var i: u8 = 0;
     while (i < MAX_PROCS) : (i += 1) {
+        // The occupant looked at: a slot freed and taken again meanwhile is
+        // not the one the checks below were made for.
+        const nr = process.procs[i].pid_nr;
         if (process.procs[i].state != .zombie) continue;
         // Parent might be waiting; if so, leave it for the normal path.
         // (parentIsWaiting is the same predicate killProcessWithStatus uses.)
@@ -1869,13 +1919,7 @@ pub fn reapStaleZombies(max_age_ticks: u64) u32 {
         // out of its exit status.
         const age = process.tick_count -% process.procs[i].death_tick;
         if (age < max_age_ticks) continue;
-        // Force-reap: same teardown as the .unused branch in killProcessWithStatus.
-        // setState handles the rq book-keeping (zombie isn't runnable so the
-        // rq should already be empty for this pid; defensive).
-        process.setState(i, .unused);
-        @atomicStore(usize, &process.expected_kstack_tops[i], 0, .release);
-        @import("../debug/kasan.zig").markPcbDead(@intFromPtr(&process.kstack_pool[i]) + KSTACK_GUARD_SIZE, KSTACK_SIZE);
-        reaped += 1;
+        if (reapZombieOf(i, nr)) reaped += 1;
     }
     if (reaped > 0) {
         debug.klog("[reaper] reaped {d} stale zombie(s)\n", .{reaped});
@@ -1949,11 +1993,44 @@ pub fn destroyCurrent() void {
 /// time, so this is just a state flip.
 pub fn reapZombie(pid: u8) void {
     if (pid >= MAX_PROCS) return;
-    if (process.procs[pid].state != .zombie) return;
+    _ = reapZombieOf(pid, process.procs[pid].pid_nr);
+}
+
+/// A slot that held a process is freed under this, one at a time. A zombie
+/// is given up by its parent's wait, by the parent or a worker ending, by
+/// itself with nobody to wait for it, or by the sweep.
+var reap_lock: SpinLock = .{};
+
+/// True once the process in slot `pid` is a zombie whose teardown is over:
+/// its exit status stands and it may be reaped.
+pub fn hasEnded(pid: usize) bool {
+    return process.procs[pid].state == .zombie and @atomicLoad(bool, &process.procs[pid].exit_done, .acquire);
+}
+
+/// reapZombie for the occupant numbered `nr`: a slot freed and taken again
+/// since the caller looked is left alone, and so is a killed task its
+/// killer is still tearing down. True if this call freed it.
+pub fn reapZombieOf(pid: u8, nr: u32) bool {
+    const flags = reap_lock.acquireIrqSave();
+    defer reap_lock.releaseIrqRestore(flags);
+    if (!hasEnded(pid) or process.procs[pid].pid_nr != nr) return false;
     // Pinned lead (exited before its workers): the slot must survive until
     // the last worker's teardown — workers deref procs[tgid] via leader()
     // on every fault, and the group cleanup runs through this PCB.
-    if (groupHasOtherLive(pid)) return;
+    if (groupHasOtherLive(pid)) return false;
+    releaseSlot(pid);
+    return true;
+}
+
+/// The task in slot `pid` is over with nothing left to read: the slot is
+/// free for another.
+fn freeSlot(pid: usize) void {
+    const flags = reap_lock.acquireIrqSave();
+    defer reap_lock.releaseIrqRestore(flags);
+    releaseSlot(pid);
+}
+
+fn releaseSlot(pid: usize) void {
     process.setState(pid, .unused);
     @atomicStore(usize, &process.expected_kstack_tops[pid], 0, .release);
     @import("../debug/kasan.zig").markPcbDead(@intFromPtr(&process.kstack_pool[pid]) + KSTACK_GUARD_SIZE, KSTACK_SIZE);
@@ -1980,7 +2057,8 @@ fn groupHasOtherLive(tgid: u8) bool {
 /// that pid.
 pub fn findZombieChild(parent: u8, target_pid: u32) ?u8 {
     for (0..MAX_PROCS) |i| {
-        if (process.procs[i].state != .zombie) continue;
+        // Not one its killer is still tearing down: no exit status yet.
+        if (!hasEnded(i)) continue;
         if (process.procs[i].parent_pid != parent) continue;
         if (target_pid != 0xFFFFFFFF and i != @as(usize, @intCast(target_pid))) continue;
         // Pinned lead — the process isn't fully dead until its workers exit

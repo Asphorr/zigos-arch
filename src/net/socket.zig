@@ -282,6 +282,8 @@ pub fn bindInet(s: *Socket, ep: net.Endpoint) Error!void {
         if (net.udpPort(s.udp) != 0) return error.Invalid;
         if (!net.udpBind(s.udp, ep.port)) return error.AddrInUse;
     } else {
+        // The port is taken at listen; one a listener has is refused here.
+        if (ep.port != 0 and net.tcpPortListening(ep.port)) return error.AddrInUse;
         s.bound_port = ep.port;
     }
     s.bound = true;

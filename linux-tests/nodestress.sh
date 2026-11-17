@@ -19,7 +19,7 @@ one() {
 fetch('$url').then(async (r) => {
   const n = (await r.arrayBuffer()).byteLength;
   console.log(r.status === 200 && n > 100000 ? 'ok' : 'bad ' + r.status + ' ' + n);
-}).catch((e) => console.log('err ' + e));" 2>&1
+}).catch((e) => console.log('err ' + e + (e.cause ? ' (' + (e.cause.code || e.cause.message || e.cause) + ')' : '')));" 2>&1
 }
 
 i=0

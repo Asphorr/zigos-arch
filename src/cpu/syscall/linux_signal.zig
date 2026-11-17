@@ -153,13 +153,7 @@ const XFEATURE_AVX: u64 = 1 << 2;
 /// uc_flags: the FP state has the XSAVE layout.
 const UC_FP_XSTATE: u64 = 1;
 
-/// The flags a program may set: the arithmetic ones, DF, TF, AC, RF, ID.
-/// IF stays on and the rest (IOPL, NT, VM) off.
-const USER_FLAGS: u64 = 0x240DD5;
-
-fn userFlags(saved: u64) u64 {
-    return (saved & USER_FLAGS) | 0x202;
-}
+const userFlags = signals.userFlags;
 
 // --- rt_sigaction, rt_sigprocmask, rt_sigpending, sigaltstack -----------------
 
@@ -329,10 +323,14 @@ pub fn rtSigtimedwait(set_va: u64, info_va: u64, timeout_va: u64, size: u64) u64
     // of the set is sent its way (signals.sendProcess picks a thread that
     // doesn't block it). No handler runs meanwhile — the mask is back
     // before the call's way out.
+    // sigwait_set goes up first and comes down last: a sender that finds
+    // the signal unblocked here also finds the wait that takes it.
     const mask = pcb.signal_mask;
-    pcb.signal_mask = mask & ~set;
+    @atomicStore(u64, &pcb.sigwait_set, set, .seq_cst);
+    @atomicStore(u64, &pcb.signal_mask, mask & ~set, .release);
     defer {
-        pcb.signal_mask = mask;
+        @atomicStore(u64, &pcb.signal_mask, mask, .release);
+        @atomicStore(u64, &pcb.sigwait_set, 0, .seq_cst);
         @atomicStore(u64, &pcb.wake_tick, 0, .release);
     }
     while (true) {

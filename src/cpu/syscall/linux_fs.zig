@@ -234,6 +234,9 @@ pub fn fdOpen(pcb: *process.PCB, fd: u64) bool {
 fn atPath(pcb: *process.PCB, dirfd: u64, path: []const u8, out: *[256]u8) PathRead {
     if ((path.len > 0 and path[0] == '/') or dirfd == AT_FDCWD) {
         if (path.len == 0) return .{ .fail = err(ENOENT) };
+        // A name below one of the caller's descriptors in /proc is a name
+        // in the directory that descriptor has open.
+        if (belowOwnFd(pcb, path)) |at| return atPath(pcb, at.fd, at.rest, out);
         return .{ .path = path };
     }
     const fe = fdFile(pcb, dirfd) orelse return .{ .fail = err(EBADF) };
@@ -253,6 +256,25 @@ fn atPath(pcb: *process.PCB, dirfd: u64, path: []const u8, out: *[256]u8) PathRe
     if (sep == 1) out[base.len] = '/';
     @memcpy(out[base.len + sep ..][0..path.len], path);
     return .{ .path = out[0 .. base.len + sep + path.len] };
+}
+
+const BelowFd = struct { fd: u64, rest: []const u8 };
+
+/// "/proc/self/fd/N/rest" (thread-self and the caller's own number too),
+/// split at the descriptor, when N is open; null for any other path.
+fn belowOwnFd(pcb: *process.PCB, path: []const u8) ?BelowFd {
+    var it = std.mem.tokenizeScalar(u8, path, '/');
+    if (!std.mem.eql(u8, it.next() orelse return null, "proc")) return null;
+    const who = it.next() orelse return null;
+    if (!std.mem.eql(u8, who, "self") and !std.mem.eql(u8, who, "thread-self")) {
+        const nr = std.fmt.parseInt(u32, who, 10) catch return null;
+        if (nr != process.leader(pcb).pid_nr) return null;
+    }
+    if (!std.mem.eql(u8, it.next() orelse return null, "fd")) return null;
+    const fd = std.fmt.parseInt(u32, it.next() orelse return null, 10) catch return null;
+    const rest = it.rest();
+    if (rest.len == 0 or !fdOpen(pcb, fd)) return null;
+    return .{ .fd = fd, .rest = rest };
 }
 
 /// A user path argument relative to `dirfd`, resolved: `bufs` holds the
@@ -382,26 +404,42 @@ fn openPath(pcb: *process.PCB, path: []const u8, lflags: u64, mode: u64) u64 {
     return err(if (freeFds(pcb)) ENOENT else EMFILE);
 }
 
-/// An ext2 file just opened by `path`: the name /proc gives it (fd/N, maps).
+/// An ext2 file just opened by `path`: what /proc names it by. The open
+/// file keeps the directory it is in (fd/N); its inode, the path (maps).
 fn noteOpened(pcb: *process.PCB, path: []const u8, fd: u32) void {
     const f = fdFile(pcb, fd) orelse return;
     defer file.put(f);
     if (f.kind != .ext2) return;
+    var buf: [256]u8 = undefined;
+    const r = resolve(pcb, path, &buf, .follow) orelse return;
+    if (r.fs != .ext2) return;
+    f.dir_inode = ext2.dirOfPath(r.path) orelse 0;
     var abs: [256]u8 = undefined;
+    lproc.noteName(f.inode, canonical(r.path, &abs));
+}
+
+/// `rel`, a path inside the ext2 root with its links replaced, as an
+/// absolute path: no ".", ".." or doubled slash left in it.
+fn canonical(rel: []const u8, out: *[256]u8) []const u8 {
     var n: usize = 0;
-    if (path.len == 0 or path[0] != '/') {
-        const cwd = pcb.cwd[0..pcb.cwd_len];
-        if (cwd.len + path.len + 1 > abs.len) return;
-        @memcpy(abs[0..cwd.len], cwd);
-        n = cwd.len;
-        if (n == 0 or abs[n - 1] != '/') {
-            abs[n] = '/';
-            n += 1;
+    var it = std.mem.tokenizeScalar(u8, rel, '/');
+    while (it.next()) |name| {
+        if (std.mem.eql(u8, name, ".")) continue;
+        if (std.mem.eql(u8, name, "..")) {
+            while (n > 0 and out[n - 1] != '/') n -= 1;
+            if (n > 0) n -= 1;
+            continue;
         }
+        if (n + 1 + name.len > out.len) break;
+        out[n] = '/';
+        @memcpy(out[n + 1 ..][0..name.len], name);
+        n += 1 + name.len;
     }
-    if (n + path.len > abs.len) return;
-    @memcpy(abs[n..][0..path.len], path);
-    lproc.noteName(f.inode, abs[0 .. n + path.len]);
+    if (n == 0) {
+        out[0] = '/';
+        n = 1;
+    }
+    return out[0..n];
 }
 
 /// A name in /proc: its file; for exe, cwd and root, what they lead to;
@@ -531,6 +569,28 @@ pub fn close(fd: u64) u64 {
     return 0;
 }
 
+const CLOSE_RANGE_UNSHARE: u64 = 2;
+const CLOSE_RANGE_CLOEXEC: u64 = 4;
+
+/// close_range(first, last, flags): close every open fd in the range, or
+/// with CLOEXEC mark it to close at execve. UNSHARE is taken as given: a
+/// table is shared only by a group's threads, and they go on sharing it.
+pub fn closeRange(first: u64, last: u64, flags: u64) u64 {
+    if (flags & ~(CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC) != 0 or first > last) return err(EINVAL);
+    const pcb = proc() orelse return err(EFAULT);
+    var fd: u64 = first;
+    while (fd < pcb.fd_table.len and fd <= last) : (fd += 1) {
+        if (flags & CLOSE_RANGE_CLOEXEC != 0) {
+            const f = file.get(pcb, @intCast(fd)) orelse continue;
+            pcb.fd_table[fd].cloexec = true;
+            file.put(f);
+        } else {
+            _ = vfs.closeSlot(pcb, @intCast(fd));
+        }
+    }
+    return 0;
+}
+
 /// What execve runs: an ext2 file, and its absolute name.
 pub const ExecTarget = struct { inum: u32, size: u64, path: []const u8 };
 pub const ExecLookup = union(enum) { file: ExecTarget, fail: u64 };
@@ -555,12 +615,9 @@ pub fn execTargetAt(pcb: *process.PCB, path: []const u8, out: *[256]u8) ExecLook
     const inum = ext2.lookupPath(r.path) orelse return .{ .fail = err(ENOENT) };
     const ino = ext2_inode.readInode(inum) orelse return .{ .fail = err(EIO) };
     if (ext2_inode.isDir(&ino)) return .{ .fail = err(EACCES) };
-    const rel = std.mem.trimLeft(u8, r.path, "/");
-    if (rel.len + 1 > out.len) return .{ .fail = err(ENAMETOOLONG) };
-    out[0] = '/';
-    @memcpy(out[1..][0..rel.len], rel);
-    lproc.noteName(inum, out[0 .. rel.len + 1]);
-    return .{ .file = .{ .inum = inum, .size = ext2_inode.fileSize(&ino), .path = out[0 .. rel.len + 1] } };
+    const name = canonical(r.path, out);
+    lproc.noteName(inum, name);
+    return .{ .file = .{ .inum = inum, .size = ext2_inode.fileSize(&ino), .path = name } };
 }
 
 // --- stat ------------------------------------------------------------------
@@ -1240,7 +1297,10 @@ pub fn ftruncate(fd: u64, length: u64) u64 {
     const fe = fdFile(pcb, fd) orelse return err(EBADF);
     defer file.put(fe);
     if (@as(i64, @bitCast(length)) < 0) return err(EINVAL);
-    if (fe.kind != .ext2) return err(EINVAL);
+    // A regular file opened for writing; EINVAL for anything else.
+    if (fe.kind != .ext2 or !fe.writable()) return err(EINVAL);
+    const ino = ext2_inode.readInode(fe.inode) orelse return err(EIO);
+    if (!ext2_inode.isReg(&ino)) return err(EINVAL);
     if (length > ext2.maxFileSize()) return err(EFBIG);
     ext2.truncateTo(fe.inode, length) catch |e| return errOf(e);
     return 0;
@@ -1260,6 +1320,9 @@ pub fn truncate(path_va: u64, length: u64) u64 {
         .missing => return err(ENOENT),
         .other, .proc => return err(EROFS),
     };
+    const ino = ext2_inode.readInode(inum) orelse return err(EIO);
+    if (ext2_inode.isDir(&ino)) return err(EISDIR);
+    if (!ext2_inode.isReg(&ino)) return err(EINVAL);
     if (length > ext2.maxFileSize()) return err(EFBIG);
     ext2.truncateTo(inum, length) catch |e| return errOf(e);
     return 0;

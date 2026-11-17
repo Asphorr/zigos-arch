@@ -8,9 +8,11 @@
 //! hint is honored, everything else goes to the highest free gap below
 //! LINUX_MMAP_TOP (above LINUX_MMAP_FLOOR first, then below it).
 //!
+//! PROT_NONE: no page appears in such a region, and the pages already there
+//! are parked (paging.PARKED) — kept, out of the program's reach.
+//!
 //! Not modeled: moving mremap (ENOMEM — musl's realloc falls back to copy),
-//! mlock, MAP_HUGETLB, PROT_NONE on pages already present (they stay
-//! readable; a fresh fault in a PROT_NONE region is refused).
+//! mlock, MAP_HUGETLB.
 
 const process = @import("../../proc/process.zig");
 const vmm = @import("../../mm/vmm.zig");
@@ -19,6 +21,7 @@ const paging = @import("../../mm/paging.zig");
 const memmap = @import("../../mm/memmap.zig");
 const shm = @import("../../mm/shm.zig");
 const vfs = @import("../../fs/vfs.zig");
+const devfs = @import("../../fs/devfs.zig");
 const ext2_inode = @import("../../fs/ext2/inode.zig");
 const tlb = @import("../mmu/tlb.zig");
 const config = @import("../../config.zig");
@@ -161,30 +164,35 @@ pub fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, off: u64) u64 {
     const owner = lead() orelse return err(EINVAL);
 
     var region: LazyRegion = .{ .prot = p };
-    if (anon) {
-        if (!shared) region.flags = process.REGION_MERGEABLE;
-    } else {
+    // Memory no file backs: anonymous, or /dev/zero, which maps the same.
+    var zeroed = anon;
+    if (!anon) {
         // The fd table is the group's: the lead's. The mapping keeps the
         // inode, not the file, so the reference ends with this block.
         const file = @import("../../fs/file.zig");
         const fe = file.get(owner, fd) orelse return err(EBADF);
         defer file.put(fe);
-        // File mappings go through the page cache, which only ext2 has,
-        // and only for regular files.
-        if (fe.kind != .ext2) return err(ENODEV);
-        // A mapping reads the file; a shared writable one writes it too.
-        if (!fe.readable() or (shared and p & PROT_WRITE != 0 and !fe.writable())) return err(EACCES);
-        const ino = ext2_inode.readInode(fe.inode) orelse return err(EBADF);
-        if (!ext2_inode.isReg(&ino)) return err(ENODEV);
-        // The cache keys pages by file offset; every page's must be one.
-        if (@as(i64, @bitCast(off)) < 0 or @addWithOverflow(off, len_pg)[1] != 0) return err(EOVERFLOW);
-        region.cache_inode = fe.inode;
-        region.cache_off = off;
-        region.cache_shared = shared;
+        if (fe.kind == .devfs and devfs.kindOf(fe.inode) == devfs.Kind.zero_dev) {
+            zeroed = true;
+        } else {
+            // File mappings go through the page cache, which only ext2 has,
+            // and only for regular files.
+            if (fe.kind != .ext2) return err(ENODEV);
+            // A mapping reads the file; a shared writable one writes it too.
+            if (!fe.readable() or (shared and p & PROT_WRITE != 0 and !fe.writable())) return err(EACCES);
+            const ino = ext2_inode.readInode(fe.inode) orelse return err(EBADF);
+            if (!ext2_inode.isReg(&ino)) return err(ENODEV);
+            // The cache keys pages by file offset; every page's must be one.
+            if (@as(i64, @bitCast(off)) < 0 or @addWithOverflow(off, len_pg)[1] != 0) return err(EOVERFLOW);
+            region.cache_inode = fe.inode;
+            region.cache_off = off;
+            region.cache_shared = shared;
+        }
     }
+    if (zeroed and !shared) region.flags = process.REGION_MERGEABLE;
     // Before anything is unmapped: MAP_FIXED must not fail after it took
     // the old mapping away for want of an shm object.
-    if (anon and shared) {
+    if (zeroed and shared) {
         region.shm_id = shm.create(@intCast(len_pg / PAGE)) orelse return err(ENOMEM);
     }
 
@@ -292,6 +300,8 @@ pub fn madvise(addr: u64, len: u64, advice: u64) u64 {
     const len_pg = pageUp(len) orelse return err(EINVAL);
     if (len_pg == 0) return 0;
     if (!rangeOk(addr, len_pg)) return err(ENOMEM);
+    // MADV_NORMAL..MADV_COLLAPSE, with the gap Linux has at 5..7.
+    if (advice > 25 or (advice > MADV_DONTNEED and advice < MADV_FREE)) return err(EINVAL);
     if (advice != MADV_DONTNEED and advice != MADV_FREE) return 0; // hints only
     const owner = lead() orelse return err(EINVAL);
 
