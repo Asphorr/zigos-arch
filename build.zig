@@ -60,12 +60,14 @@ pub fn build(b: *std.Build) void {
     // with a keyboard, which makes them unrunnable from a script or over ssh.
     // With this set, a headless QEMU run boots straight into the chosen mode.
     const forced_boot_mode = b.option(u32, "boot-mode", "Force boot_mode, bypassing the UEFI menu (scripted self-test runs)");
+    const linuxtest_only = b.option([]const u8, "linuxtest-only", "Boot mode 19 runs only the cases whose path or arguments contain this") orelse "";
 
     const build_options = b.addOptions();
     build_options.addOption(u64, "build_id", build_id_value);
     build_options.addOption(bool, "kasan_enabled", kasan_enabled);
     build_options.addOption(bool, "kcsan_enabled", kcsan_enabled);
     build_options.addOption(?u32, "forced_boot_mode", forced_boot_mode);
+    build_options.addOption([]const u8, "linuxtest_only", linuxtest_only);
 
     // --- 1. KERNEL ---
     // Forward-declare the shapes module here so the kernel module can

@@ -23,8 +23,8 @@ pub const E_PERM: u32 = errno.err(.EPERM);
 pub const E_CHILD: u32 = errno.err(.ECHILD);
 pub const E_INTR: u32 = errno.err(.EINTR);
 
-// memmap.USER_SPACE_START sits below USER_VA_FLOOR to cover the user
-// stack region (16 pages just under 0x500000). Earlier this was a local
+// memmap.USER_SPACE_START sits below USER_VA_FLOOR to cover the native
+// stack (1 MB just under 0x500000) and Linux images. Earlier this was a local
 // `= memmap.USER_VA_FLOOR` shadow, which silently drifted when memmap
 // added the stack reserve — every syscall taking a stack-buffer arg
 // (e.g. sysGetScreenSize) returned EFAULT, and apps tripped on the

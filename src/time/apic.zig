@@ -205,12 +205,20 @@ pub fn lapicWrite(reg: u32, val: u32) void {
 
 // --- IOAPIC MMIO access ---
 
+/// Each access is a select then a data write: two CPUs must not interleave
+/// them (a stall dump reading an entry while an IRQ masks another).
+var ioapic_lock: @import("../proc/spinlock.zig").SpinLock = .{};
+
 fn ioapicRead(reg: u32) u32 {
+    const lk = ioapic_lock.acquireIrqSave();
+    defer ioapic_lock.releaseIrqRestore(lk);
     @as(*volatile u32, @ptrFromInt(ioapic_base + IOAPIC_REGSEL)).* = reg;
     return @as(*volatile u32, @ptrFromInt(ioapic_base + IOAPIC_WIN)).*;
 }
 
 fn ioapicWrite(reg: u32, val: u32) void {
+    const lk = ioapic_lock.acquireIrqSave();
+    defer ioapic_lock.releaseIrqRestore(lk);
     @as(*volatile u32, @ptrFromInt(ioapic_base + IOAPIC_REGSEL)).* = reg;
     @as(*volatile u32, @ptrFromInt(ioapic_base + IOAPIC_WIN)).* = val;
 }
@@ -404,6 +412,40 @@ pub fn routeSci(gsi: u8, vector: u8) void {
     debug.klog("[apic] SCI GSI{d} -> vec=0x{X} pol={s} level\n", .{
         gsi, vector, if (polarity_low) "low" else "high",
     });
+}
+
+/// Route a PCI INTx line's GSI (ACPI _PRT) to `vector`: level triggered,
+/// active low (PCI 3.0 §2.2.6). The line may be shared, so its handler must
+/// tell whether its own device raised it. False if this IOAPIC lacks the GSI.
+pub fn routePciIntx(gsi: u32, vector: u8) bool {
+    if (!apic_active or gsi < ioapic_gsi_base) return false;
+    const pin = gsi - ioapic_gsi_base;
+    const max_entries = (ioapicRead(IOAPIC_VER_REG) >> 16) & 0xFF;
+    if (pin > max_entries) return false;
+    ioapicSetEntry(@intCast(pin), vector, false, true, true);
+    debug.klog("[apic] PCI INTx GSI{d} -> vec=0x{X} low level\n", .{ gsi, vector });
+    return true;
+}
+
+/// A GSI's redirection entry, decoded, for stall dumps: a level line whose
+/// Remote IRR stays set never fires again.
+pub fn dumpGsi(gsi: u32) void {
+    if (gsi < ioapic_gsi_base) return;
+    const lo = ioapicRead(IOAPIC_REDTBL + (gsi - ioapic_gsi_base) * 2);
+    debug.klog("[apic] GSI{d}: vec=0x{X} {s} {s} {s}, remote IRR {d}, delivery {s}\n", .{
+        gsi,                                                lo & 0xFF,
+        if (lo & IOAPIC_LO_MASKED != 0) "masked" else "unmasked",
+        if (lo & IOAPIC_LO_TRIGGER_LEVEL != 0) "level" else "edge",
+        if (lo & IOAPIC_LO_POLARITY_LOW != 0) "low" else "high",
+        (lo >> 14) & 1,
+        if (lo & (1 << 12) != 0) "pending" else "idle",
+    });
+}
+
+/// Mask a line routePciIntx set up.
+pub fn maskPciIntx(gsi: u32, vector: u8) void {
+    if (gsi < ioapic_gsi_base) return;
+    ioapicSetEntry(@intCast(gsi - ioapic_gsi_base), vector, true, true, true);
 }
 
 fn initIOAPIC() void {

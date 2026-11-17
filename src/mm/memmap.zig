@@ -21,12 +21,14 @@
 // User space (per-process page tables): each process gets its own PML4[0]
 // from createAddressSpace; user-app .text loads at USER_VA_FLOOR (matches
 // app/linker.ld). A native user_brk starts at USER_BRK_INITIAL and grows to
-// NATIVE_SPACE_END. Two distinct floors apply: CODE/RIP validators (kdbg
-// ripIsValidUser, elf_loader segments, sysClone entry) floor at USER_VA_FLOOR
-// because code never lives below the load base; STACK/DATA validators
-// (validateUserPtr, vmm.mapUserPage, signals frame validation) MUST floor at
-// USER_SPACE_START, since the user stack lives in [USER_SPACE_START,
-// USER_VA_FLOOR). Conflating the two is the class of bug that broke Ctrl+C.
+// NATIVE_SPACE_END. Two distinct floors apply: native CODE validators
+// (elf_loader's native segments, sysClone entry) floor at USER_VA_FLOOR
+// because native code never lives below the load base; STACK/DATA validators
+// (validateUserPtr, vmm.mapUserPage, signals frame validation, and kdbg
+// ripIsValidUser, as Linux code may sit lower) MUST floor at USER_SPACE_START,
+// since a native stack lives in [NATIVE_STACK_BOTTOM, USER_VA_FLOOR) and a
+// Linux image may sit lower still. Conflating the two is the class of bug
+// that broke Ctrl+C.
 
 const std = @import("std");
 
@@ -133,8 +135,9 @@ comptime {
 pub const GUI_FB_PER_PID_SIZE: usize = 0xA00000;
 
 // --- User-space layout (per-process) ---
-// USER_SPACE_START sits N pages below USER_VA_FLOOR so the user stack
-// (just under the load base) is mappable. Without this margin,
+// A native stack takes [NATIVE_STACK_BOTTOM, USER_VA_FLOOR), just under the
+// load base, inside the user window (USER_SPACE_START lies lower still, at
+// Linux's mmap_min_addr). Without a mappable reserve there,
 // mapUserPage silently rejects stack faults (virt < USER_SPACE_START), the
 // PF handler thinks the lazy fault-in succeeded (mapUserPage is void), and
 // the app spins re-faulting until OOM kills it (caught 2026-05-20 on
@@ -150,6 +153,7 @@ pub const GUI_FB_PER_PID_SIZE: usize = 0xA00000;
 // the low-VA layout.
 pub const USER_STACK_RESERVE: u64 = layout.USER_STACK_RESERVE; // 256 pages = 1 MB
 pub const USER_SPACE_START: u64 = layout.USER_SPACE_START;
+pub const NATIVE_STACK_BOTTOM: u64 = layout.NATIVE_STACK_BOTTOM;
 pub const USER_SPACE_END: u64 = layout.USER_SPACE_END; // 512 GB
 pub const NATIVE_SPACE_END: u64 = layout.NATIVE_SPACE_END; // 256 MB
 pub const LINUX_MMAP_TOP: u64 = layout.LINUX_MMAP_TOP;

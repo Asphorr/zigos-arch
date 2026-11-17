@@ -754,21 +754,34 @@ pub fn clearDirtyRangeCacheOnly(file_id: u64, start_off: u64, len: u64) u32 {
     return clear.cleared;
 }
 
-/// Check every clean resident page against its checksum, SCAN_CHUNK entries
-/// per lock hold. Returns pages found changed so far (since boot).
-pub fn verifyAll() u64 {
+/// Where the background sweep goes on from. (p:cache)
+var sweep_at: u32 = 0;
+
+/// Check the next `pages` clean resident pages against their checksums,
+/// going round the table from call to call: a sweep the size of the cache
+/// at once costs a CPU's worth of memory reads. Returns pages found changed
+/// so far (since boot).
+pub fn verifySome(pages: u32) u64 {
     if (!VERIFY) return 0;
-    var idx: u32 = 0;
+    var left = pages;
+    var steps: u32 = 0;
     while (true) {
+        // 64 pages per lock hold: each check reads a whole page.
         const h = cache.acquire();
         defer h.release();
         const s = h.ptr;
-        if (idx >= s.high) return s.corrupt_seen;
-        const stop = @min(s.high, idx +| SCAN_CHUNK);
-        while (idx < stop) : (idx += 1) {
-            const e = &s.entries[idx];
-            if (e.valid) s.verify(e);
+        const limit = @min(s.high, SCAN_CHUNK);
+        var batch: u32 = 64;
+        while (left > 0 and batch > 0 and steps < limit) : (steps += 1) {
+            if (sweep_at >= s.high) sweep_at = 0;
+            const e = &s.entries[sweep_at];
+            sweep_at += 1;
+            if (!e.valid or !e.summed or e.dirty) continue;
+            s.verify(e);
+            left -= 1;
+            batch -= 1;
         }
+        if (left == 0 or steps >= limit) return s.corrupt_seen;
     }
 }
 

@@ -178,7 +178,7 @@ fn layoutFor(header: Header, phdrs: [*]align(1) const ProgramHeader, linux: bool
     return .{
         .linux = false,
         .brk = @max(memmap.USER_BRK_INITIAL, image_end),
-        .stack_base = memmap.USER_SPACE_START,
+        .stack_base = memmap.NATIVE_STACK_BOTTOM,
         .stack_top = memmap.USER_VA_FLOOR,
     };
 }

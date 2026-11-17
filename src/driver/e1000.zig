@@ -11,8 +11,9 @@
 // We use only the legacy descriptor format (chapter 3); MSI-X, advanced
 // receive descriptors, and packet-split RX are all skipped.
 //
-// Operating mode: IRQ-driven RX (RXT0 via MSI-X / MSI), with a polled
-// fallback if no message-signalled interrupt capability is available.
+// Operating mode: IRQ-driven RX (RXT0 via MSI-X, MSI, or — QEMU's 82540EM
+// has neither — the legacy INTx line ACPI's _PRT routes), with a polled
+// fallback when there is no interrupt at all.
 // The IRQ handler drains the RX ring and dispatches each frame to
 // net.handleRxFrame — so net.poll() called from a syscall normally
 // finds the ring empty and returns immediately. No checksum offload,
@@ -27,6 +28,7 @@ const pmm = @import("../mm/pmm.zig");
 const paging = @import("../mm/paging.zig");
 const msix = @import("../time/msix.zig");
 const debug = @import("../debug/debug.zig");
+const serial = @import("../debug/serial.zig");
 const net = @import("../net/net.zig");
 const iommu = @import("../cpu/mmu/iommu.zig");
 const Deadline = @import("../util/deadline.zig").Deadline;
@@ -64,7 +66,12 @@ const E1000_E_FAMILY = [_]u16{
 const REG_CTRL: u32 = 0x00000;
 const REG_STATUS: u32 = 0x00008;
 const REG_ICR: u32 = 0x000C0;
+const REG_ICS: u32 = 0x000C8;
 const REG_IMS: u32 = 0x000D0;
+// Statistics, cleared by each read (SDM §13.7).
+const REG_MPC: u32 = 0x04010; // missed: no room in the ring
+const REG_GPRC: u32 = 0x04074; // good packets received
+const REG_RNBC: u32 = 0x040A0; // receive found no free buffer
 const REG_IMC: u32 = 0x000D8;
 const REG_RCTL: u32 = 0x00100;
 const REG_TCTL: u32 = 0x00400;
@@ -110,13 +117,19 @@ const RXD_STAT_DD: u8 = 1 << 0;
 
 // --- Ring sizing ---
 //
-// 32 descriptors of 16 bytes = 512 bytes (fits easily in one 4 KB page,
-// the smallest pmm.allocContiguous unit). Buffers are 2048 bytes apiece;
-// 32 × 2048 = 64 KB = 16 contiguous pages.
-const NUM_RX_DESC: u32 = 32;
-const NUM_TX_DESC: u32 = 32;
+// Each descriptor ring fits one 4 KB page; buffers are 2048 bytes apiece.
+// 256 receive buffers ride out a burst a whole TCP window long.
+const NUM_RX_DESC: u32 = 256;
+const NUM_TX_DESC: u32 = 64;
 const BUF_SIZE: u32 = 2048;
-const BUF_PAGES: u32 = (NUM_RX_DESC * BUF_SIZE) / 4096; // 16
+const RX_BUF_PAGES: u32 = (NUM_RX_DESC * BUF_SIZE) / 4096;
+const TX_BUF_PAGES: u32 = (NUM_TX_DESC * BUF_SIZE) / 4096;
+comptime {
+    // RDLEN/TDLEN: whole 128-byte units, one page per ring (dmaMap below).
+    const a = @import("std").debug.assert;
+    a(NUM_RX_DESC * 16 % 128 == 0 and NUM_RX_DESC * 16 <= 4096);
+    a(NUM_TX_DESC * 16 % 128 == 0 and NUM_TX_DESC * 16 <= 4096);
+}
 
 const RxDesc = extern struct {
     buffer_addr: u64 align(1),
@@ -163,6 +176,120 @@ pub var irq_count: u64 = 0;
 /// becomes a no-op in this mode — the IRQ handler exclusively owns the
 /// RX ring, so a stray syscall-side poll won't race with it.
 var irq_driven: bool = false;
+/// The INTx line, when interrupts come that way: its GSI and vector.
+var intx_gsi: ?u32 = null;
+var intx_vec: u8 = 0;
+/// Interrupts on the INTx line that weren't the NIC's: in all, in a row.
+pub var intx_foreign: u64 = 0;
+var intx_foreign_run: u32 = 0;
+const INTX_STORM: u32 = 100_000;
+
+/// Frames the NIC has put in the ring past rx_tail, not yet taken.
+fn framesWaiting() u32 {
+    var n: u32 = 0;
+    while (n + 1 < NUM_RX_DESC) : (n += 1) {
+        if (rx_descs[(rx_tail + 1 + n) % NUM_RX_DESC].status & RXD_STAT_DD == 0) break;
+    }
+    return n;
+}
+
+var pci_bus: u8 = 0;
+var pci_dev: u8 = 0;
+var pci_func: u8 = 0;
+
+var watch_irqs: u64 = 0;
+var watch_waiting: bool = false;
+/// Times watchdog found frames waiting with no interrupt since its last look.
+pub var missed_irqs: u64 = 0;
+
+/// From netd alone, every NETD_BUSY_MS: frames waiting at two looks in a row
+/// with no interrupt between them means one went missing. Raising RXT0 by
+/// hand (ICS) brings the handler in interrupt context, where the ring is
+/// its alone.
+pub fn watchdog() void {
+    if (!initialized or !irq_driven) return;
+    const irqs = @atomicLoad(u64, &irq_count, .monotonic);
+    const waiting = framesWaiting() != 0;
+    const stuck = waiting and watch_waiting and irqs == watch_irqs;
+    watch_irqs = irqs;
+    watch_waiting = waiting;
+    if (!stuck) {
+        watch_kicked = false;
+        return;
+    }
+    missed_irqs += 1;
+    if (missed_irqs <= 8 or missed_irqs % 1000 == 0) {
+        serial.print("[e1000] frames waiting and no interrupt since the last look (#{d}): {s}\n", .{
+            missed_irqs, if (watch_kicked) "taken here" else "RXT0 raised by hand",
+        });
+        dumpState();
+    }
+    if (!watch_kicked) {
+        watch_kicked = true;
+        mmioWrite(REG_ICS, 1 << 7);
+        return;
+    }
+    // The kick raised nothing either: take the frames here, as the handler
+    // would. Only on the CPU the interrupt goes to (IOAPIC and MSI both
+    // target APIC ID 0), with interrupts off so the handler can't run
+    // meanwhile — and off before the check, or the task could move.
+    var flags: u64 = undefined;
+    asm volatile ("pushfq; pop %[f]; cli"
+        : [f] "=r" (flags),
+        :
+        : .{ .memory = true });
+    defer if (flags & 0x200 != 0) asm volatile ("sti" ::: .{ .memory = true });
+    if (@import("../cpu/smp.zig").myCpu().lapic_id != 0) return;
+    polled_assists += 1;
+    e1000IrqHandler();
+}
+
+var watch_kicked: bool = false;
+/// Times watchdog took the frames itself after a kick raised no interrupt.
+pub var polled_assists: u64 = 0;
+
+/// One line on the receive side, for stall dumps. The statistics registers
+/// count since the previous dump.
+pub fn dumpState() void {
+    if (!initialized) return;
+    serial.print("[e1000] irqs {d} (not ours {d}, missed {d}, taken by watchdog {d}), {s}; rx tail {d}, RDH {d} RDT {d}, {d} frames waiting; since last: {d} packets, {d} missed, {d} without a buffer\n", .{
+        irq_count,                  intx_foreign,           missed_irqs,
+        polled_assists,             if (irq_driven) "irq" else "polled", rx_tail,
+        mmioRead(REG_RDH),          mmioRead(REG_RDT),      framesWaiting(),
+        mmioRead(REG_GPRC),         mmioRead(REG_MPC),      mmioRead(REG_RNBC),
+    });
+    // PCI command bit 10 masks INTx at the device; status bit 3 is the line
+    // the device would drive.
+    serial.print("[e1000] IMS 0x{X}, STATUS 0x{X}; PCI command 0x{X} (INTx {s}), status 0x{X} (INTx {s})\n", .{
+        mmioRead(REG_IMS),          mmioRead(REG_STATUS),
+        pci.configRead16(pci_bus, pci_dev, pci_func, 0x04),
+        if (pci.configRead16(pci_bus, pci_dev, pci_func, 0x04) & 0x400 != 0) "disabled" else "enabled",
+        pci.configRead16(pci_bus, pci_dev, pci_func, 0x06),
+        if (pci.configRead16(pci_bus, pci_dev, pci_func, 0x06) & 0x8 != 0) "asserted" else "quiet",
+    });
+    if (intx_gsi) |g| @import("../time/apic.zig").dumpGsi(g);
+}
+
+/// The legacy INTx pin, routed per ACPI _PRT, for a NIC without MSI.
+fn armIntx(d: pci.PciDevice) bool {
+    const pin: u8 = @truncate(pci.configRead16(d.bus, d.dev, d.func, 0x3C) >> 8);
+    if (pin == 0 or pin > 4 or d.bus != 0) return false; // _PRT covers bus 0
+    const gsi = @import("../acpi/aml.zig").gsiForPciPin(d.dev, pin - 1) orelse return false;
+    const dynirq = @import("../cpu/idt/dynirq.zig");
+    const vec = dynirq.allocDynVector() orelse return false;
+    dynirq.registerIrq(vec, &e1000IrqHandler);
+    intx_vec = vec;
+    intx_gsi = gsi;
+    if (!@import("../time/apic.zig").routePciIntx(gsi, vec)) {
+        intx_gsi = null;
+        return false;
+    }
+    // bindDevice set Interrupt Disable.
+    const cmd = pci.configRead16(d.bus, d.dev, d.func, 0x04);
+    pci.configWrite16(d.bus, d.dev, d.func, 0x04, cmd & ~@as(u16, 0x0400));
+    debug.klog("[e1000] INTx armed: INT{c} -> GSI{d}, IDT vec=0x{x}\n", .{ 'A' + pin - 1, gsi, vec });
+    return true;
+}
 
 /// e1000 MSI-X / MSI handler. ICR is read-to-clear, so the read both
 /// acks all pending causes and tells us which ones fired (we mostly
@@ -178,20 +305,64 @@ var irq_driven: bool = false;
 /// is a brief spin (≤ a TX descriptor copy).
 fn e1000IrqHandler() callconv(.c) void {
     irq_count +%= 1;
-    _ = mmioRead(REG_ICR);
-
-    while (true) {
-        const next = (rx_tail + 1) % NUM_RX_DESC;
-        if ((rx_descs[next].status & RXD_STAT_DD) == 0) break;
-        const len = rx_descs[next].length;
-        const buf_ptr: [*]volatile u8 = @ptrFromInt(paging.physToVirt(@as(u64, rx_descs[next].buffer_addr)));
-        net.handleRxFrame(buf_ptr[0..len]);
-        rx_descs[next].status = 0;
-        rx_descs[next].length = 0;
-        rx_tail = next;
+    // Another device on a shared line before the rings exist.
+    if (!initialized) {
+        _ = mmioRead(REG_ICR);
+        return;
     }
-    mmioWrite(REG_RDT, rx_tail);
+    var icr = mmioRead(REG_ICR);
+    if (intx_gsi) |gsi| {
+        // A shared line and no RXT0 (the only cause IMS lets through; ICR
+        // also latches TXDW and LSC): someone else's interrupt. A long run
+        // of those is a device we don't drive holding the line up; polling
+        // beats a storm.
+        if (icr & ICR_RXT0 == 0) {
+            intx_foreign +%= 1;
+            intx_foreign_run += 1;
+            if (intx_foreign_run >= INTX_STORM) {
+                mmioWrite(REG_IMC, ICR_RXT0);
+                const cmd = pci.configRead16(pci_bus, pci_dev, pci_func, 0x04);
+                pci.configWrite16(pci_bus, pci_dev, pci_func, 0x04, cmd | 0x0400);
+                @import("../time/apic.zig").maskPciIntx(gsi, intx_vec);
+                intx_gsi = null;
+                irq_driven = false;
+                debug.klog("[e1000] INTx GSI{d}: {d} foreign interrupts in a row, masked; polled mode\n", .{ gsi, INTX_STORM });
+            }
+            return;
+        }
+        intx_foreign_run = 0;
+    }
+
+    // At most RX_BATCH frames per run: each costs an ACK out and a wake,
+    // all with interrupts off. Frames that arrive meanwhile raise RXT0
+    // again; reading ICR until it stays clear takes them in this run, so
+    // the line is down at EOI.
+    var budget: u32 = RX_BATCH;
+    while (true) {
+        while (budget > 0) : (budget -= 1) {
+            const next = (rx_tail + 1) % NUM_RX_DESC;
+            if ((rx_descs[next].status & RXD_STAT_DD) == 0) break;
+            const len = rx_descs[next].length;
+            const buf_ptr: [*]volatile u8 = @ptrFromInt(paging.physToVirt(@as(u64, rx_descs[next].buffer_addr)));
+            net.handleRxFrame(buf_ptr[0..len]);
+            rx_descs[next].status = 0;
+            rx_descs[next].length = 0;
+            rx_tail = next;
+        }
+        mmioWrite(REG_RDT, rx_tail);
+        if (budget == 0) {
+            // The rest in a run of its own, after the EOI.
+            if (framesWaiting() != 0) mmioWrite(REG_ICS, ICR_RXT0);
+            return;
+        }
+        icr = mmioRead(REG_ICR);
+        if (icr & ICR_RXT0 == 0) return;
+    }
 }
+
+const ICR_RXT0: u32 = 1 << 7;
+/// Most frames one handler run takes.
+const RX_BATCH: u32 = 64;
 
 var rx_descs: [*]volatile RxDesc = undefined;
 var rx_tail: u32 = 0;
@@ -222,9 +393,9 @@ fn allocTxRing() ?u64 {
     return ring.device().raw();
 }
 
-/// One packet-buffer arena (BUF_PAGES pages, zeroed), device-side base.
-fn allocPacketArena() ?u64 {
-    const bufs = dma.Dma(u8).alloc(BUF_PAGES * 4096) orelse return null;
+/// One packet-buffer arena of `pages` pages, zeroed, device-side base.
+fn allocPacketArena(pages: u32) ?u64 {
+    const bufs = dma.Dma(u8).alloc(pages * 4096) orelse return null;
     return bufs.device().raw();
 }
 
@@ -271,6 +442,9 @@ pub fn init() bool {
         }
     }
     const d = found orelse return false;
+    pci_bus = d.bus;
+    pci_dev = d.dev;
+    pci_func = d.func;
     debug.klog("[e1000] found at {x}:{x}.{x} id=0x{x}{s}\n", .{
         d.bus, d.dev, d.func, d.device_id,
         if (is_e1000e) " (e1000e family — experimental: link bring-up may need PHY tweaks)" else "",
@@ -329,7 +503,8 @@ pub fn init() bool {
                 break :blk true;
             }
         }
-        debug.klog("[e1000] no MSI/MSI-X cap, polled mode\n", .{});
+        if (armIntx(d)) break :blk true;
+        debug.klog("[e1000] no MSI/MSI-X cap or INTx route, polled mode\n", .{});
         break :blk false;
     };
     if (irq_armed) {
@@ -366,12 +541,12 @@ pub fn init() bool {
         debug.klog("[e1000] RX desc alloc failed\n", .{});
         return false;
     };
-    const rx_buffers = allocPacketArena() orelse {
+    const rx_buffers = allocPacketArena(RX_BUF_PAGES) orelse {
         debug.klog("[e1000] RX buf alloc failed\n", .{});
         return false;
     };
     _ = iommu.dmaMap(d.bus, d.dev, d.func, rx_desc_phys, 4096, .{});
-    _ = iommu.dmaMap(d.bus, d.dev, d.func, rx_buffers, BUF_PAGES * 4096, .{});
+    _ = iommu.dmaMap(d.bus, d.dev, d.func, rx_buffers, RX_BUF_PAGES * 4096, .{});
     var di: u32 = 0;
     while (di < NUM_RX_DESC) : (di += 1) {
         rx_descs[di] = .{
@@ -395,9 +570,9 @@ pub fn init() bool {
 
     // === TX ring setup ===
     const tx_desc_phys = allocTxRing() orelse return false;
-    const tx_buffers = allocPacketArena() orelse return false;
+    const tx_buffers = allocPacketArena(TX_BUF_PAGES) orelse return false;
     _ = iommu.dmaMap(d.bus, d.dev, d.func, tx_desc_phys, 4096, .{});
-    _ = iommu.dmaMap(d.bus, d.dev, d.func, tx_buffers, BUF_PAGES * 4096, .{});
+    _ = iommu.dmaMap(d.bus, d.dev, d.func, tx_buffers, TX_BUF_PAGES * 4096, .{});
     di = 0;
     while (di < NUM_TX_DESC) : (di += 1) {
         tx_descs[di] = .{

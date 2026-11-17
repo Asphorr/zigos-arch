@@ -16,9 +16,10 @@
 //!       code never lives below the ELF load base. Used by kdbg.ripIsValidUser
 //!       and elf_loader.isUserVA. → `isValidUserCode` / `userCodeRangeOk`.
 //!   • DATA/STACK/mappable validity → [USER_SPACE_START, USER_SPACE_END)
-//!       the user stack lives in [USER_SPACE_START, USER_VA_FLOOR) — the 1 MB
-//!       reserve just under the load base — so data/stack pointers floor LOWER
-//!       than code. Used by validateUserPtr, vmm.mapUserPage, signals frames.
+//!       a native stack lives in [NATIVE_STACK_BOTTOM, USER_VA_FLOOR) — the
+//!       1 MB reserve just under the load base — and Linux images may sit
+//!       lower still, so data/stack pointers floor LOWER than native code.
+//!       Used by validateUserPtr, vmm.mapUserPage, signals frames.
 //!       → `isUserDataAddr` / `userDataRangeOk`.
 //! `classify()` returns an exhaustive tagged class; every validator routes
 //! through a `switch` over it, so ADDING a region is a compile error until each
@@ -61,10 +62,15 @@ pub const PHYSMAP_SIZE: u64 = 0x8000000000; // 512 GB (one full PML4 slot)
 // terms of their primaries so a single bump stays consistent; verify() below
 // proves ordering / alignment / canonical-form at comptime.
 
-/// Lowest legitimate user-mode VA at all (the data/stack floor). Sits one
-/// USER_STACK_RESERVE below the code load base so the downward-growing user
-/// stack in [USER_SPACE_START, USER_VA_FLOOR) is mappable.
-pub const USER_SPACE_START: u64 = USER_VA_FLOOR - USER_STACK_RESERVE; // 0x400000
+/// Lowest legitimate user-mode VA at all (the data/stack floor): Linux's
+/// default vm.mmap_min_addr. A Linux program linked at 0x200000 (lld's
+/// default base) loads; a null pointer, or a small offset from one, still
+/// faults.
+pub const USER_SPACE_START: u64 = 0x10000;
+
+/// A native process's stack: [NATIVE_STACK_BOTTOM, USER_VA_FLOOR), the
+/// reserve just under its load base.
+pub const NATIVE_STACK_BOTTOM: u64 = USER_VA_FLOOR - USER_STACK_RESERVE; // 0x400000
 
 /// Stack reserve below the ELF load base. MUST be >= elf_loader's
 /// `stack_pages * PAGE_SIZE` (the assert in elf_loader keeps it in sync).
@@ -109,6 +115,7 @@ const Boundary = struct { name: []const u8, va: u64 };
 /// Ordered user-VA boundaries (low→high), each the *start* of a named span.
 const user_boundaries = [_]Boundary{
     .{ .name = "USER_SPACE_START", .va = USER_SPACE_START },
+    .{ .name = "NATIVE_STACK_BOTTOM", .va = NATIVE_STACK_BOTTOM },
     .{ .name = "USER_VA_FLOOR", .va = USER_VA_FLOOR },
     .{ .name = "USER_BRK_INITIAL", .va = USER_BRK_INITIAL },
     .{ .name = "NATIVE_SPACE_END", .va = NATIVE_SPACE_END },
@@ -139,10 +146,11 @@ fn verify() void {
         }
     }
 
-    // The stack reserve must be non-empty (a zero reserve means no mappable
-    // stack region below the load base — the original silent-EFAULT bug).
-    if (USER_SPACE_START >= USER_VA_FLOOR) @compileError("layout: USER_SPACE_START must be below USER_VA_FLOOR (no stack reserve)");
-    if (USER_VA_FLOOR - USER_SPACE_START != USER_STACK_RESERVE) @compileError("layout: USER_STACK_RESERVE inconsistent with USER_VA_FLOOR-USER_SPACE_START");
+    // The stack reserve must be non-empty and mappable (a zero reserve means
+    // no stack region below the load base — the original silent-EFAULT bug).
+    if (NATIVE_STACK_BOTTOM >= USER_VA_FLOOR) @compileError("layout: NATIVE_STACK_BOTTOM must be below USER_VA_FLOOR (no stack reserve)");
+    if (USER_VA_FLOOR - NATIVE_STACK_BOTTOM != USER_STACK_RESERVE) @compileError("layout: USER_STACK_RESERVE inconsistent with USER_VA_FLOOR-NATIVE_STACK_BOTTOM");
+    if (USER_SPACE_START > NATIVE_STACK_BOTTOM) @compileError("layout: the native stack must lie in the user window");
     // A non-null guard: page 0 stays unmapped so a null deref faults.
     if (USER_SPACE_START < PAGE_SIZE) @compileError("layout: USER_SPACE_START must leave page 0 unmapped (null-deref guard)");
     // The user page-table walkers cover PML4[0] only.
@@ -163,7 +171,9 @@ comptime {
 pub const AddrClass = enum {
     /// [0, USER_SPACE_START) — page 0, kernel low-PA numbers; invalid for user.
     below_user,
-    /// [USER_SPACE_START, USER_VA_FLOOR) — the 1 MB stack reserve. DATA ok, CODE no.
+    /// [USER_SPACE_START, USER_VA_FLOOR) — under the native load base: a
+    /// native stack's 1 MB at the top, Linux images and maps. DATA ok, native
+    /// CODE no.
     user_stack,
     /// [USER_VA_FLOOR, USER_BRK_INITIAL) — the native ELF load area.
     user_code,
@@ -324,7 +334,8 @@ pub inline fn ptIndex(va: anytype) usize {
 // ── Native tests (zig test src/mm/layout.zig) ──────────────────────────────
 
 test "constants" {
-    try std.testing.expectEqual(@as(u64, 0x400000), USER_SPACE_START);
+    try std.testing.expectEqual(@as(u64, 0x10000), USER_SPACE_START);
+    try std.testing.expectEqual(@as(u64, 0x400000), NATIVE_STACK_BOTTOM);
     try std.testing.expectEqual(@as(u64, 0x100000), USER_STACK_RESERVE);
     try std.testing.expectEqual(@as(u64, 0x500000), USER_VA_FLOOR);
     try std.testing.expectEqual(@as(u64, 0x2000000), USER_BRK_INITIAL);

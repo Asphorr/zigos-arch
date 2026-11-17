@@ -82,6 +82,17 @@ pub fn recv() ?[]volatile u8 {
     };
 }
 
+/// Called from netd every pass: a driver that takes frames by interrupt
+/// checks none went missing.
+pub fn watchdog() void {
+    if (backend == .e1000) e1000.watchdog();
+}
+
+/// The receive side's state, for stall dumps.
+pub fn dumpState() void {
+    if (backend == .e1000) e1000.dumpState();
+}
+
 pub fn rxRelease() void {
     switch (backend) {
         .none => {},

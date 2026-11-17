@@ -426,7 +426,7 @@ pub const ExcFrame = extern struct {
 };
 
 // Lowest legitimate user VA for signal frames. This MUST be USER_SPACE_START,
-// not USER_VA_FLOOR: the user *stack* lives in [USER_SPACE_START, USER_VA_FLOOR)
+// not USER_VA_FLOOR: a native *stack* lives in [NATIVE_STACK_BOTTOM, USER_VA_FLOOR)
 // (the 1 MB reserve just under the ELF load base — see memmap.zig), and we write
 // the handler frame / read the sigreturn MContext on that stack. Using
 // USER_VA_FLOOR (the code load base) rejected every RSP in the stack region, so

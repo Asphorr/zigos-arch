@@ -19,8 +19,8 @@ check() {
 }
 
 # A hang fails its own check instead of the whole run.
-node() { timeout -s KILL 180 /usr/bin/node "$@"; }
-npm() { timeout -s KILL 300 /usr/bin/npm "$@"; }
+node() { busybox timeout -s KILL 180 /usr/bin/node "$@"; }
+npm() { busybox timeout -s KILL 300 /usr/bin/npm "$@"; }
 
 rm -rf "$HOME"
 mkdir -p "$HOME"

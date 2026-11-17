@@ -159,6 +159,15 @@ const CASES = [_]Case{
         .needs = "/etc/nodestress.sh",
         .once = true,
     },
+    // Download speed, near and far: a measurement, it always passes.
+    .{
+        .path = "/bin/busybox",
+        .args = "sh /etc/netspeed.sh",
+        .timeout_ms = 900_000,
+        .optional = true,
+        .needs = "/etc/netspeed.sh",
+        .once = true,
+    },
     // Claude Code from npm, started.
     .{
         .path = "/bin/busybox",
@@ -429,6 +438,7 @@ fn dumpTasks(waited: u32) void {
         });
     }
     @import("../net/net.zig").dumpTcp();
+    @import("../driver/nic.zig").dumpState();
 }
 
 fn check(c: Case, run: u32) void {
@@ -525,7 +535,9 @@ pub fn taskEntry() callconv(.c) noreturn {
     probeDisk();
     serial.print("[linuxtest] {d} program(s), {d} warm-up + {d} counted runs each\n", .{ CASES.len, WARMUP_RUNS, COUNTED_RUNS });
 
+    const only = @import("build_options").linuxtest_only;
     for (CASES) |c| {
+        if (only.len != 0 and std.mem.indexOf(u8, c.path, only) == null and std.mem.indexOf(u8, c.args, only) == null) continue;
         if (c.optional and (vfs.lookupCached(c.path) == null or (c.needs.len != 0 and vfs.lookupCached(c.needs) == null))) {
             serial.print("[linuxtest] SKIP {s} {s}: not in the image\n", .{ c.path, c.args });
             continue;

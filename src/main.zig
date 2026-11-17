@@ -949,6 +949,8 @@ pub fn panic(msg: []const u8, _: ?*std.builtin.StackTrace, ret_addr: ?usize) nor
 /// Sleeps PGFLUSH_INTERVAL_MS between passes; the flush itself parks on NVMe I/O
 /// (no spinlock held) so it never hogs its CPU.
 const PGFLUSH_INTERVAL_MS: u32 = 2000;
+/// Cached pages each pass checks against their checksums (page_cache.VERIFY).
+const PGFLUSH_VERIFY_PAGES: u32 = 512;
 fn pgflushdEntry() callconv(.c) noreturn {
     const vfs = @import("fs/vfs.zig");
     const sched = @import("proc/sched.zig");
@@ -956,7 +958,7 @@ fn pgflushdEntry() callconv(.c) noreturn {
         sched.kernelSleepMs(PGFLUSH_INTERVAL_MS);
         _ = vfs.flushAllDirty();
         @import("fs/ext2/ext2.zig").sync();
-        _ = @import("mm/page_cache.zig").verifyAll();
+        _ = @import("mm/page_cache.zig").verifySome(PGFLUSH_VERIFY_PAGES);
         vfs.reportCacheCorruption();
     }
 }
@@ -984,6 +986,8 @@ fn netdEntry() callconv(.c) noreturn {
     const sched = @import("proc/sched.zig");
     while (true) {
         sched.kernelSleepMs(if (net.busy()) NETD_BUSY_MS else NETD_IDLE_MS);
+        // Here alone: its looks must be a period apart.
+        @import("driver/nic.zig").watchdog();
         net.poll();
     }
 }

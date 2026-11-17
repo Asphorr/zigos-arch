@@ -19,12 +19,17 @@ check() {
     fi
 }
 
+# npm starts through `#!/usr/bin/env node`. The applet links come with
+# busybox's apk trigger (alptest); run alone, make them as it does.
+[ -e /usr/bin/env ] || /bin/busybox --install -s
 rm -rf "$HOME"
 mkdir -p "$HOME"
-timeout -s KILL 600 npm install -g --no-audit --no-fund @anthropic-ai/claude-code 2>&1 | tail -n 5
+t0=$(date +%s)
+busybox timeout -s KILL 600 npm install -g --no-audit --no-fund @anthropic-ai/claude-code 2>&1 | tail -n 5
+echo "cctest: npm install took $(($(date +%s) - t0)) s"
 check installed "$([ -x /usr/local/bin/claude ] && echo yes)" yes
-check version "$(timeout -s KILL 180 claude --version 2>&1 | grep -c 'Claude Code')" 1
-check help "$(timeout -s KILL 180 claude --help 2>&1 | grep -c -i 'usage')" 1
+check version "$(busybox timeout -s KILL 180 claude --version 2>&1 | grep -c 'Claude Code')" 1
+check help "$(busybox timeout -s KILL 180 claude --help 2>&1 | grep -c -i 'usage')" 1
 rm -rf "$HOME"
 
 if [ "$fail" = 0 ]; then

@@ -56,9 +56,18 @@ const TCP_PSH: u8 = 0x08;
 const TCP_ACK: u8 = 0x10;
 const TCP_MAX_CONNS = 32;
 const TCP_MAX_LISTENERS = 8;
-const TCP_RX_BUF_SIZE = 8192;
+/// Receive rings, powers of two. A connection reads into a large ring from
+/// the pool (rx_pool, filled from vmalloc in task context) when one is
+/// idle, else into its small inline ring.
+const TCP_RX_RING: u32 = 256 * 1024;
+const TCP_RX_SMALL: u32 = 8192;
 const TCP_SND_BUF_SIZE = 8192; // per-conn ring of unacked+unsent outbound data
-const TCP_OOO_BUF_SIZE = 4096; // per-conn buffer for one out-of-order segment run
+/// Out-of-order data waits in the receive ring at its own place; these are
+/// its runs, which SACK blocks also report.
+const TCP_OOO_RUNS = 4;
+/// A serial line per received segment: a trace for hunts. At download
+/// speed it outruns the serial drainer and takes a CPU.
+const TRACE_RX = false;
 // Retransmit timeout, in 10 ms ticks, derived per-conn from RTT (Jacobson/Karn).
 const TCP_INIT_RTO_TICKS: u32 = 100; // 1 s, until the first RTT sample (RFC 6298)
 const TCP_MIN_RTO_TICKS: u32 = 20; // 200 ms floor (cf. Linux TCP_RTO_MIN)
@@ -795,17 +804,22 @@ const TcpConn = struct {
     rtt_seq: u32 = 0, // sample completes once snd_una reaches this seq
     rtt_start: u64 = 0, // tick the timed segment was sent
     rcv_nxt: u32 = 0,
-    // Single out-of-order reassembly region: bytes [ooo_seq, ooo_seq+ooo_len)
-    // held until the preceding gap fills (ooo_len 0 = empty).
-    ooo_buf: [TCP_OOO_BUF_SIZE]u8 = undefined,
-    ooo_seq: u32 = 0,
-    ooo_len: u32 = 0,
+    /// Out-of-order runs already in the receive ring past rcv_nxt: sorted,
+    /// apart from each other.
+    ooo: [TCP_OOO_RUNS]SeqRun = undefined,
+    n_ooo: u8 = 0,
+    /// The run the latest out-of-order segment went to: the first SACK block.
+    ooo_recent: u8 = 0,
     // Congestion control (Reno): cwnd/ssthresh in bytes, dup-ACK counter.
     cwnd: u32 = 2144, // 4*536; refined to 4*peer_mss at established
     ssthresh: u32 = TCP_MAX_CWND,
     dup_acks: u8 = 0,
     in_recovery: bool = false,
-    rx_buf: [TCP_RX_BUF_SIZE]u8 = undefined,
+    rx_small: [TCP_RX_SMALL]u8 = undefined,
+    /// rx_small or the slot's large ring, chosen when the slot is taken
+    /// (attachRing). rx_write is where the byte at rcv_nxt goes.
+    rx_buf: [*]u8 = undefined,
+    rx_mask: u32 = TCP_RX_SMALL - 1,
     rx_write: u32 = 0,
     rx_count: u32 = 0,
     last_send_tick: u64 = 0,
@@ -819,8 +833,30 @@ const TcpConn = struct {
     /// slot so we know where to enqueue ourselves on the established
     /// transition. TCP_NO_LISTENER for outbound (tcpConnect) connections.
     listener_slot: u8 = TCP_NO_LISTENER,
-    /// The receive window the peer was last told (emitSegment).
-    adv_wnd: u16 = TCP_RX_BUF_SIZE,
+    /// The receive window the peer was last told, in bytes, and the
+    /// furthest right edge it was ever told (rcvWindowField).
+    adv_wnd: u32 = 0,
+    adv_edge: u32 = 0,
+    /// Window scaling (RFC 7323), in force once both SYNs carried it: our
+    /// shift and the peer's. SACK blocks (RFC 2018) go out once the peer's
+    /// SYN allowed them.
+    rcv_wscale: u8 = 0,
+    snd_wscale: u8 = 0,
+    ws_ok: bool = false,
+    sack_ok: bool = false,
+    /// What came in, for the dumps and the line a big transfer leaves at
+    /// its close (reportConn): data segments; bytes taken in order; segments
+    /// put past a gap, wholly old, cut at the window's edge, or leaving
+    /// less than a segment free; the most bytes the reader left waiting;
+    /// the tick of the first.
+    st_segs: u32 = 0,
+    st_bytes: u64 = 0,
+    st_ooo: u32 = 0,
+    st_old: u32 = 0,
+    st_cut: u32 = 0,
+    st_full: u32 = 0,
+    st_peak: u32 = 0,
+    st_start: u64 = 0,
     /// Why error_flag is set, for the socket's SO_ERROR.
     fail: TcpFail = .none,
     /// Our side has no more to send: the FIN goes out once the send ring is
@@ -840,6 +876,17 @@ const TcpConn = struct {
 
 pub const TcpFail = enum(u8) { none, refused, reset, timed_out };
 
+/// Sequence numbers [lo, hi).
+const SeqRun = struct { lo: u32, hi: u32 };
+
+fn seqLt(a: u32, b: u32) bool {
+    return @as(i32, @bitCast(a -% b)) < 0;
+}
+
+fn seqLe(a: u32, b: u32) bool {
+    return @as(i32, @bitCast(a -% b)) <= 0;
+}
+
 const TcpListener = struct {
     active: bool = false,
     port: u16 = 0,
@@ -856,6 +903,121 @@ const TcpListener = struct {
 var tcp_conns: [TCP_MAX_CONNS]TcpConn = [_]TcpConn{.{}} ** TCP_MAX_CONNS;
 var tcp_listeners: [TCP_MAX_LISTENERS]TcpListener = [_]TcpListener{.{}} ** TCP_MAX_LISTENERS;
 var next_ephemeral: u16 = 49200;
+
+/// The large receive rings, from vmalloc, never freed. One is taken while
+/// a live connection reads into it (rx_buf); a connection gives it back
+/// when its socket goes (detachRing) or the slot is let go. So the pool
+/// grows to the most sockets open at once, not to the slots that linger.
+/// (p:net_lock)
+var rx_pool: [TCP_MAX_CONNS]?[*]u8 = [_]?[*]u8{null} ** TCP_MAX_CONNS;
+
+/// The smallest window shift whose scaled window covers a ring of `size`.
+fn wscaleFor(size: u32) u8 {
+    var s: u5 = 0;
+    while ((size >> s) > 0xFFFF) s += 1;
+    return s;
+}
+
+/// A pooled ring no live connection reads into. Lock held, or a guess.
+fn idleRing() ?[*]u8 {
+    pool: for (rx_pool) |slot| {
+        const r = slot orelse continue;
+        for (&tcp_conns) |*c| {
+            if (c.active and c.rx_buf == r) continue :pool;
+        }
+        return r;
+    }
+    return null;
+}
+
+/// Give a connection just taken (active, fields reset) its receive ring
+/// and the window shift its SYN offers. Lock held.
+fn attachRing(c: *TcpConn) void {
+    // `c` is active already: a stale rx_buf of its own must not count.
+    c.rx_buf = &c.rx_small;
+    if (idleRing()) |r| {
+        c.rx_buf = r;
+        c.rx_mask = TCP_RX_RING - 1;
+    } else {
+        c.rx_mask = TCP_RX_SMALL - 1;
+    }
+    c.rcv_wscale = wscaleFor(c.rx_mask + 1);
+}
+
+/// Nobody will read `c` again: its large ring goes back to the pool, the
+/// unread bytes with it; what still comes lands in the small one. Lock held.
+fn detachRing(c: *TcpConn) void {
+    if (c.rx_buf == @as([*]u8, &c.rx_small)) return;
+    c.rx_buf = &c.rx_small;
+    c.rx_mask = TCP_RX_SMALL - 1;
+    c.rx_count = 0;
+    c.n_ooo = 0;
+}
+
+/// A slot no connection holds. Lock held.
+fn freeSlot() ?u8 {
+    for (&tcp_conns, 0..) |*c, i| {
+        if (!c.active) return @intCast(i);
+    }
+    return null;
+}
+
+/// Before a connection starts: make sure an idle large ring waits for it.
+/// Task context with interrupts on, net_lock not held: vmalloc can't run
+/// under it, so this allocates, then places.
+fn provisionRing() void {
+    if (!@import("../time/pause.zig").irqsEnabled()) return;
+    if (idleRing() != null) return;
+    const heap = @import("../mm/heap.zig");
+    const mem = heap.kvmalloc(TCP_RX_RING) orelse return;
+    const placed = blk: {
+        const lk = net_lock.acquireIrqSave();
+        defer netUnlock(lk);
+        if (idleRing() != null) break :blk false;
+        for (&rx_pool) |*slot| {
+            if (slot.* != null) continue;
+            slot.* = mem;
+            break :blk true;
+        }
+        break :blk false;
+    };
+    if (!placed) heap.kvfree(mem);
+}
+
+const SynOptions = struct { mss: u16 = 536, wscale: ?u8 = null, sack_ok: bool = false };
+
+/// The options of a SYN or SYN-ACK; the caller checked data_offset against
+/// the segment.
+fn parseSynOptions(tcp: []volatile u8, data_offset: usize) SynOptions {
+    var o: SynOptions = .{};
+    var pos: usize = TCP_HDR_SIZE;
+    while (pos < data_offset) {
+        const kind = tcp[pos];
+        if (kind == 0) break;
+        if (kind == 1) {
+            pos += 1;
+            continue;
+        }
+        if (pos + 1 >= data_offset) break;
+        const len = tcp[pos + 1];
+        if (len < 2 or pos + len > data_offset) break;
+        switch (kind) {
+            2 => if (len == 4) {
+                const mss = readU16BE(tcp[pos + 2 ..][0..2]);
+                o.mss = if (mss > 1460) 1460 else if (mss < 100) 536 else mss;
+            },
+            3 => if (len == 3) {
+                o.wscale = @min(tcp[pos + 2], 14);
+            },
+            4 => if (len == 2) {
+                o.sack_ok = true;
+            },
+            else => {},
+        }
+        pos += len;
+    }
+    return o;
+}
 
 fn connSlotIndex(c: *const TcpConn) u8 {
     const base = @intFromPtr(&tcp_conns[0]);
@@ -895,11 +1057,74 @@ fn tcpFailWith(c: *TcpConn, why: TcpFail) void {
     tcpNotify(c);
 }
 
+/// The window field of our next segment: the ring's free space, scaled,
+/// never pulling back a right edge the peer was already given (RFC 7323
+/// §2.4). Records what it tells. Lock held.
+fn rcvWindowField(c: *TcpConn, syn: bool) u16 {
+    const free = (c.rx_mask + 1) - c.rx_count;
+    // A SYN's window is never scaled.
+    const s: u5 = if (c.ws_ok and !syn) @intCast(c.rcv_wscale) else 0;
+    var field: u32 = @min(free >> s, 0xFFFF);
+    const want = c.adv_edge -% c.rcv_nxt;
+    if (!syn and seqLt(c.rcv_nxt +% (field << s), c.adv_edge) and want <= free + (@as(u32, 1) << s)) {
+        field = @min((want + (@as(u32, 1) << s) - 1) >> s, 0xFFFF);
+    }
+    c.adv_wnd = field << s;
+    const edge = c.rcv_nxt +% c.adv_wnd;
+    if (syn or seqLt(c.adv_edge, edge)) c.adv_edge = edge;
+    return @intCast(field);
+}
+
+/// The window has opened past what the peer was last told by enough to say
+/// so unasked (receiver SWS avoidance, RFC 9293 §3.8.6.2.2). Lock held.
+fn windowOpened(c: *const TcpConn) bool {
+    const size = c.rx_mask + 1;
+    const s: u5 = if (c.ws_ok) @intCast(c.rcv_wscale) else 0;
+    const field: u32 = @min((size - c.rx_count) >> s, 0xFFFF);
+    const grew = (c.rcv_nxt +% (field << s)) -% c.adv_edge;
+    return @as(i32, @bitCast(grew)) >= @as(i32, @intCast(@min(TCP_WINDOW_UPDATE, size / 2)));
+}
+
+/// Our options for a segment: what a SYN or SYN-ACK offers, or the SACK
+/// blocks of a bare ACK. Returns their length, a multiple of 4.
+fn buildOptions(c: *const TcpConn, flags: u8, has_payload: bool, out: *[40]u8) u8 {
+    if (flags & TCP_SYN != 0) {
+        out[0..4].* = .{ 2, 4, 1460 >> 8, 1460 & 0xFF };
+        var n: u8 = 4;
+        // A SYN-ACK answers what the peer's SYN offered; our SYN offers both.
+        const answer = flags & TCP_ACK != 0;
+        if (!answer or c.ws_ok) {
+            out[n..][0..4].* = .{ 1, 3, 3, c.rcv_wscale };
+            n += 4;
+        }
+        if (!answer or c.sack_ok) {
+            out[n..][0..4].* = .{ 1, 1, 4, 2 };
+            n += 4;
+        }
+        return n;
+    }
+    if (!c.sack_ok or c.n_ooo == 0 or has_payload or flags & TCP_ACK == 0) return 0;
+    out[0..4].* = .{ 1, 1, 5, 2 + 8 * c.n_ooo };
+    var n: u8 = 4;
+    // The run the latest segment joined goes first (RFC 2018 §4).
+    const first = @min(c.ooo_recent, c.n_ooo - 1);
+    writeU32BE(out[n..][0..4], c.ooo[first].lo);
+    writeU32BE(out[n + 4 ..][0..4], c.ooo[first].hi);
+    n += 8;
+    for (c.ooo[0..c.n_ooo], 0..) |r, i| {
+        if (i == first) continue;
+        writeU32BE(out[n..][0..4], r.lo);
+        writeU32BE(out[n + 4 ..][0..4], r.hi);
+        n += 8;
+    }
+    return n;
+}
+
 /// Build and transmit a single TCP segment stamped with an explicit sequence
 /// number. `sendTcpPacket` wraps this at conn.snd_nxt for the common case; the
 /// data path passes an explicit seq so a retransmission can re-send the oldest
 /// unacked bytes (seq == snd_una) rather than whatever went out last.
-fn emitSegment(conn: *TcpConn, seq: u32, flags: u8, payload: ?[]const u8, include_mss: bool) bool {
+fn emitSegment(conn: *TcpConn, seq: u32, flags: u8, payload: ?[]const u8) bool {
     const loop = isLocal(conn.remote_ip);
     // Non-blocking gateway check. Blocking resolution (poll + sleep) happens
     // in the task-context prologues (tcpConnect/tcpSend/udpSend); this
@@ -916,8 +1141,10 @@ fn emitSegment(conn: *TcpConn, seq: u32, flags: u8, payload: ?[]const u8, includ
     const dst_mac = if (loop) src_mac else gateway_mac;
     buildEthHeader(&pkt, dst_mac, src_mac, ETHERTYPE_IPV4);
 
-    const tcp_hdr_len: u16 = if (include_mss) 24 else 20;
     const payload_len: u16 = if (payload) |p| @intCast(p.len) else 0;
+    var opts: [40]u8 = undefined;
+    const opt_len = buildOptions(conn, flags, payload_len > 0, &opts);
+    const tcp_hdr_len: u16 = TCP_HDR_SIZE + @as(u16, opt_len);
     buildIPv4Header(pkt[ETH_HDR_SIZE..], IPPROTO_TCP, conn.remote_ip, tcp_hdr_len + payload_len);
 
     const tcp = pkt[ETH_HDR_SIZE + IPV4_HDR_SIZE ..];
@@ -925,26 +1152,16 @@ fn emitSegment(conn: *TcpConn, seq: u32, flags: u8, payload: ?[]const u8, includ
     writeU16BE(tcp[2..4], conn.remote_port);
     writeU32BE(tcp[4..8], seq);
     writeU32BE(tcp[8..12], if (flags & TCP_ACK != 0) conn.rcv_nxt else 0);
-    tcp[12] = if (include_mss) (6 << 4) else (5 << 4); // data offset
+    tcp[12] = @intCast((tcp_hdr_len / 4) << 4); // data offset
     tcp[13] = flags;
-    // Advertise the actual current free space in the receive ring. Static
-    // 4 KB used to silently truncate streams when the app was slow to drain
-    // (peer happily kept sending, packets after the ring fill were dropped).
-    // Now: if the app drained from 8 KB→4 KB, the next ACK we send tells the
-    // peer the window is 4 KB; if it's full, the peer back-pressures.
-    const free_window: u16 = @intCast(TCP_RX_BUF_SIZE - conn.rx_count);
-    conn.adv_wnd = free_window;
-    writeU16BE(tcp[14..16], free_window);
+    // The free space of the receive ring: a reader slow to drain it
+    // throttles the peer instead of losing what it sends.
+    writeU16BE(tcp[14..16], rcvWindowField(conn, flags & TCP_SYN != 0));
     tcp[16] = 0;
     tcp[17] = 0; // checksum placeholder
     tcp[18] = 0;
     tcp[19] = 0; // urgent pointer
-
-    if (include_mss) {
-        tcp[20] = 2; // MSS option kind
-        tcp[21] = 4; // MSS option length
-        writeU16BE(tcp[22..24], 1460); // MSS value
-    }
+    @memcpy(tcp[TCP_HDR_SIZE..][0..opt_len], opts[0..opt_len]);
 
     if (payload) |p| {
         const off: usize = tcp_hdr_len;
@@ -980,8 +1197,8 @@ fn emitSegment(conn: *TcpConn, seq: u32, flags: u8, payload: ?[]const u8, includ
 
 /// Send a segment at the connection's current snd_nxt — the common path for
 /// control segments and bare ACKs.
-fn sendTcpPacket(conn: *TcpConn, flags: u8, payload: ?[]const u8, include_mss: bool) bool {
-    return emitSegment(conn, conn.snd_nxt, flags, payload, include_mss);
+fn sendTcpPacket(conn: *TcpConn, flags: u8, payload: ?[]const u8) bool {
+    return emitSegment(conn, conn.snd_nxt, flags, payload);
 }
 
 /// The next port for an outbound connection or a listener that asked for
@@ -1012,16 +1229,18 @@ fn connectIn(reuse: ?u8, dst_ip: [4]u8, dst_port: u16, local_port: u16) ?u8 {
     // Resolve the gateway up front, outside the lock — it blocks (poll +
     // sleep); emitSegment's own gateway check is non-blocking by design.
     if (!isLocal(dst_ip) and !arpResolveGateway()) return null;
+    if (reuse) |r| {
+        if (r >= TCP_MAX_CONNS) return null;
+    }
+    provisionRing();
 
     const lk = net_lock.acquireIrqSave();
     defer netUnlock(lk);
 
     const slot: u8 = if (reuse) |r| blk: {
-        if (r >= TCP_MAX_CONNS or !tcp_conns[r].active or !tcp_conns[r].error_flag) return null;
+        if (!tcp_conns[r].active or !tcp_conns[r].error_flag) return null;
         break :blk r;
-    } else for (0..TCP_MAX_CONNS) |i| {
-        if (!tcp_conns[i].active) break @intCast(i);
-    } else return null;
+    } else freeSlot() orelse return null;
 
     const conn = &tcp_conns[slot];
     // An edge-triggered watcher of a reused slot must see a change.
@@ -1029,6 +1248,7 @@ fn connectIn(reuse: ?u8, dst_ip: [4]u8, dst_port: u16, local_port: u16) ?u8 {
     conn.* = .{};
     conn.events = events;
     conn.active = true;
+    attachRing(conn);
     conn.state = .syn_sent;
     conn.local_port = if (local_port != 0) local_port else ephemeralPort();
     conn.remote_port = dst_port;
@@ -1038,7 +1258,7 @@ fn connectIn(reuse: ?u8, dst_ip: [4]u8, dst_port: u16, local_port: u16) ?u8 {
     // The SYN takes one sequence number. Counted before it is sent: a local
     // peer's answer is processed inside the send.
     conn.snd_nxt = conn.snd_iss +% 1;
-    if (!emitSegment(conn, conn.snd_iss, TCP_SYN, null, true)) {
+    if (!emitSegment(conn, conn.snd_iss, TCP_SYN, null)) {
         if (reuse == null) conn.active = false else tcpFailWith(conn, .timed_out);
         return null;
     }
@@ -1081,17 +1301,15 @@ fn tryAcceptIncomingSyn(ip_data: []volatile u8, ihl: usize, local_port: u16, rem
     }
     const lst = listener orelse return false;
 
-    var slot: u8 = 0;
-    while (slot < TCP_MAX_CONNS) : (slot += 1) {
-        if (!tcp_conns[slot].active) break;
-    }
-    if (slot >= TCP_MAX_CONNS) return true; // out of slots — drop SYN, peer will retransmit
+    // Out of slots: drop the SYN, the peer sends it again.
+    const slot = freeSlot() orelse return true;
 
     const peer_ip: [4]u8 = .{ ip_data[12], ip_data[13], ip_data[14], ip_data[15] };
 
     var conn = &tcp_conns[slot];
     conn.* = .{};
     conn.active = true;
+    attachRing(conn);
     conn.state = .syn_received;
     conn.local_port = local_port;
     conn.remote_port = remote_port;
@@ -1104,39 +1322,20 @@ fn tryAcceptIncomingSyn(ip_data: []volatile u8, ihl: usize, local_port: u16, rem
     conn.rcv_nxt = peer_seq +% 1; // peer's SYN consumes one seq number
     conn.listener_slot = listenerSlotIndex(lst);
 
-    // Parse the incoming SYN's options for MSS so subsequent server-side
-    // sends respect what the peer advertised. Without this we'd cap our
-    // segment payloads at the default 536 even when the peer (e.g. a
-    // local Linux client) is happy to take 1460. Same option-walk shape
-    // as the client-side parser in the .syn_sent branch of
-    // handleTcpPacket — kept in sync by hand.
-    //
-    // Use the REAL ihl: the old hardcoded [20..] confused TCP options
-    // (which extend data_offset, not ihl) with IP options — a SYN carrying
-    // IP options had its TCP header parsed 4+ bytes early.
+    // What the SYN offers: its MSS bounds our segments; window scaling and
+    // SACK hold if it asks, and the SYN-ACK says so. The real ihl: TCP
+    // options extend data_offset, IP options shift the header itself
+    // (handleTcpPacket checked data_offset).
     const tcp = ip_data[ihl..];
-    if (tcp.len >= TCP_HDR_SIZE) {
-        const data_offset = @as(usize, tcp[12] >> 4) * 4;
-        if (data_offset > 20 and data_offset <= tcp.len) {
-            var opt_pos: usize = 20;
-            while (opt_pos + 1 < data_offset) {
-                const kind = tcp[opt_pos];
-                if (kind == 0) break;
-                if (kind == 1) { opt_pos += 1; continue; }
-                if (opt_pos + 1 >= data_offset) break;
-                const olen = tcp[opt_pos + 1];
-                if (olen < 2) break;
-                if (kind == 2 and olen == 4 and opt_pos + 4 <= data_offset) {
-                    conn.peer_mss = readU16BE(tcp[opt_pos + 2 ..][0..2]);
-                    if (conn.peer_mss > 1460) conn.peer_mss = 1460;
-                    if (conn.peer_mss < 100) conn.peer_mss = 536;
-                }
-                opt_pos += olen;
-            }
-        }
-    }
+    const o = parseSynOptions(tcp, @as(usize, tcp[12] >> 4) * 4);
+    conn.peer_mss = o.mss;
+    if (o.wscale) |s| {
+        conn.ws_ok = true;
+        conn.snd_wscale = s;
+    } else conn.rcv_wscale = 0;
+    conn.sack_ok = o.sack_ok;
 
-    if (!emitSegment(conn, conn.snd_iss, TCP_SYN | TCP_ACK, null, true)) conn.active = false;
+    if (!emitSegment(conn, conn.snd_iss, TCP_SYN | TCP_ACK, null)) conn.active = false;
     return true;
 }
 
@@ -1191,6 +1390,9 @@ fn sendReset(ip_data: []volatile u8, ihl: usize) void {
 /// the listener's accept ring for `tcpAccept` to consume.
 pub fn tcpListen(port: u16) ?u8 {
     if (port == 0) return null;
+    // Connections a listener takes start in NIC-IRQ context, which can't
+    // allocate: a ring waits for the first.
+    provisionRing();
     const lk = net_lock.acquireIrqSave();
     defer netUnlock(lk);
     // Reject duplicates so accept rings stay sane.
@@ -1256,6 +1458,7 @@ pub fn tcpListenAny() ?u8 {
 /// nothing is queued yet. Non-blocking — the caller polls.
 pub fn tcpAccept(listen_slot: u8) ?u8 {
     if (listen_slot >= TCP_MAX_LISTENERS) return null;
+    provisionRing(); // for the connection after this one
     const lk = net_lock.acquireIrqSave();
     defer netUnlock(lk);
     const l = &tcp_listeners[listen_slot];
@@ -1351,7 +1554,7 @@ fn fastRetransmit(c: *TcpConn) void {
         const seg = @min(inflight, mss);
         var tmp: [1460]u8 = undefined;
         readSnd(c, c.snd_una, tmp[0..seg]);
-        _ = emitSegment(c, c.snd_una, TCP_PSH | TCP_ACK, tmp[0..seg], false);
+        _ = emitSegment(c, c.snd_una, TCP_PSH | TCP_ACK, tmp[0..seg]);
     }
     c.rtt_pending = false;
 }
@@ -1371,7 +1574,7 @@ fn flushSnd(conn: *TcpConn) void {
         if (seg == 0) break;
         var tmp: [1460]u8 = undefined;
         readSnd(conn, conn.snd_nxt, tmp[0..seg]);
-        if (!emitSegment(conn, conn.snd_nxt, TCP_PSH | TCP_ACK, tmp[0..seg], false)) break;
+        if (!emitSegment(conn, conn.snd_nxt, TCP_PSH | TCP_ACK, tmp[0..seg])) break;
         conn.snd_nxt +%= seg;
         // Begin an RTT sample for this segment if one isn't already timing.
         if (!conn.rtt_pending) {
@@ -1435,27 +1638,20 @@ pub fn tcpRecv(slot: u8, buf: []u8) usize {
     if (!conn.active) return 0;
     if (conn.rx_count == 0) return 0;
 
-    const avail = @min(conn.rx_count, @as(u32, @intCast(buf.len)));
-    const read_pos = (conn.rx_write -% conn.rx_count) % TCP_RX_BUF_SIZE;
-    var i: u32 = 0;
-    while (i < avail) : (i += 1) {
-        buf[i] = conn.rx_buf[(read_pos + i) % TCP_RX_BUF_SIZE];
-    }
+    const avail = @min(conn.rx_count, @as(u32, @intCast(@min(buf.len, std.math.maxInt(u32)))));
+    ringRead(conn, buf[0..avail]);
     conn.rx_count -= avail;
-    // Freed receive space may let buffered out-of-order data move in.
-    oooDrain(conn);
 
     // If the window has opened a meaningful amount past what the peer was
     // last told, tell it with an empty ACK. Without this, a sender that
     // throttled against a small or zero window would sit idle until the
     // next normal ACK we send (which only happens when the peer sends more
-    // data — chicken-and-egg). Measured against the advertised window, not
+    // data — chicken-and-egg). Measured against the advertised edge, not
     // this one read: a reader taking a little at a time opens it just as
     // far in the end.
     const receiving = conn.state == .established or conn.state == .fin_wait_1 or conn.state == .fin_wait_2;
-    const free: u32 = TCP_RX_BUF_SIZE - conn.rx_count;
-    if (receiving and free >= @as(u32, conn.adv_wnd) + TCP_WINDOW_UPDATE) {
-        _ = sendTcpPacket(conn, TCP_ACK, null, false);
+    if (receiving and windowOpened(conn)) {
+        _ = sendTcpPacket(conn, TCP_ACK, null);
     }
     return avail;
 }
@@ -1466,18 +1662,24 @@ pub fn dumpTcp() void {
     const now = process.tick_count;
     const lk = net_lock.acquireIrqSave();
     defer netUnlock(lk);
+    serial.print("[tcp-dump] frames in {d} ({d} bytes), TCP segments for no connection {d}\n", .{ rx_frame_count, rx_frame_total_bytes, tcp_unmatched });
     for (&tcp_conns, 0..) |*c, i| {
         if (!c.active) continue;
-        serial.print("[tcp-dump] slot {d} {s} :{d} -> {d}.{d}.{d}.{d}:{d}; rcv_nxt {d} rx {d} adv {d} ooo {d}+{d}; snd una {d} nxt {d} buf {d} wnd {d} cwnd {d} rto {d} retx {d}; last tx {d} ticks ago; events {d}{s}{s}{s}{s}\n", .{
-            i,                          @tagName(c.state),  c.local_port,
-            c.remote_ip[0],             c.remote_ip[1],     c.remote_ip[2],
-            c.remote_ip[3],             c.remote_port,      c.rcv_nxt,
-            c.rx_count,                 c.adv_wnd,          c.ooo_seq,
-            c.ooo_len,                  c.snd_una,          c.snd_nxt,
-            c.snd_buf_len,              c.snd_wnd,          c.cwnd,
-            c.rto,                      c.retransmit_count, now -| c.last_send_tick,
-            c.events,                   if (c.peer_closed) " peer-closed" else "",
-            if (c.rd_closed) " rd-closed" else "", if (c.orphan) " orphan" else "",
+        serial.print("[tcp-dump] slot {d} {s} :{d} -> {d}.{d}.{d}.{d}:{d}; rcv_nxt {d} rx {d}/{d} adv {d} ooo runs {d}; ws {s} {d}/{d}, sack {s}; in {d} segs {d} bytes, ooo {d} old {d} cut {d} full {d} peak {d};", .{
+            i,              @tagName(c.state),             c.local_port,
+            c.remote_ip[0], c.remote_ip[1],                c.remote_ip[2],
+            c.remote_ip[3], c.remote_port,                 c.rcv_nxt,
+            c.rx_count,     c.rx_mask + 1,                 c.adv_wnd,
+            c.n_ooo,        if (c.ws_ok) "on" else "off",  c.rcv_wscale,
+            c.snd_wscale,   if (c.sack_ok) "on" else "off", c.st_segs,
+            c.st_bytes,     c.st_ooo,                      c.st_old,
+            c.st_cut,       c.st_full,                     c.st_peak,
+        });
+        serial.print(" snd una {d} nxt {d} buf {d} wnd {d} cwnd {d} rto {d} retx {d}; last tx {d} ticks ago; events {d}{s}{s}{s}{s}\n", .{
+            c.snd_una,                             c.snd_nxt,                        c.snd_buf_len,
+            c.snd_wnd,                             c.cwnd,                           c.rto,
+            c.retransmit_count,                    now -| c.last_send_tick,          c.events,
+            if (c.peer_closed) " peer-closed" else "", if (c.rd_closed) " rd-closed" else "", if (c.orphan) " orphan" else "",
             if (c.error_flag) " error" else "",
         });
     }
@@ -1515,7 +1717,7 @@ pub fn tcpClose(slot: u8) void {
         const lk = net_lock.acquireIrqSave();
         defer netUnlock(lk);
         if (conn.state == .established or conn.state == .close_wait) {
-            _ = sendTcpPacket(conn, TCP_FIN | TCP_ACK, null, false);
+            _ = sendTcpPacket(conn, TCP_FIN | TCP_ACK, null);
             conn.snd_nxt +%= 1;
             conn.state = if (conn.state == .close_wait) .last_ack else .fin_wait_1;
             sent_fin = true;
@@ -1532,6 +1734,7 @@ pub fn tcpClose(slot: u8) void {
         }
     }
     const lk = net_lock.acquireIrqSave();
+    reportConn(conn);
     conn.active = false;
     conn.state = .closed;
     netUnlock(lk);
@@ -1555,12 +1758,28 @@ fn maybeSendFin(c: *TcpConn) void {
     c.fin_sent = true;
     c.snd_nxt +%= 1;
     c.state = if (c.state == .close_wait) .last_ack else .fin_wait_1;
-    _ = emitSegment(c, seq, TCP_FIN | TCP_ACK, null, false);
+    _ = emitSegment(c, seq, TCP_FIN | TCP_ACK, null);
+}
+
+/// A transfer of a megabyte or more leaves one line when its socket goes:
+/// how fast it came and what the receive path saw. Lock held.
+fn reportConn(c: *const TcpConn) void {
+    if (c.st_bytes < 1 << 20) return;
+    const ticks = @max(process.tick_count -% c.st_start, 1);
+    @import("../debug/serial.zig").print("[tcp] slot {d} from {d}.{d}.{d}.{d}:{d}: {d} bytes in {d} segments over {d} ms = {d} KiB/s; ring {d}, reader left at most {d}; out of order {d}, old {d}, cut {d}, window full {d}; scaling {s}, sack {s}\n", .{
+        connSlotIndex(c),      c.remote_ip[0], c.remote_ip[1],         c.remote_ip[2],
+        c.remote_ip[3],        c.remote_port,  c.st_bytes,             c.st_segs,
+        ticks * 10,            c.st_bytes * 100 / ticks / 1024,        c.rx_mask + 1, c.st_peak,
+        c.st_ooo,              c.st_old,       c.st_cut,               c.st_full,
+        if (c.ws_ok) "on" else "off", if (c.sack_ok) "on" else "off",
+    });
 }
 
 /// The owner of `c` is gone. Lock held.
 fn releaseConn(c: *TcpConn) void {
     if (!c.active) return;
+    reportConn(c);
+    detachRing(c);
     c.rd_closed = true;
     // Nothing to finish: never connected, failed, or closed both ways.
     if (c.error_flag or c.state == .closed or c.state == .syn_sent or c.state == .syn_received) {
@@ -1628,10 +1847,8 @@ pub fn tcpPeek(slot: u8, buf: []u8) usize {
     const lk = net_lock.acquireIrqSave();
     defer netUnlock(lk);
     if (!c.active) return 0;
-    const avail = @min(c.rx_count, @as(u32, @intCast(buf.len)));
-    const read_pos = (c.rx_write -% c.rx_count) % TCP_RX_BUF_SIZE;
-    var i: u32 = 0;
-    while (i < avail) : (i += 1) buf[i] = c.rx_buf[(read_pos + i) % TCP_RX_BUF_SIZE];
+    const avail = @min(c.rx_count, @as(u32, @intCast(@min(buf.len, std.math.maxInt(u32)))));
+    ringRead(c, buf[0..avail]);
     return avail;
 }
 
@@ -1750,102 +1967,120 @@ pub fn tcpListenerPollMask(slot: u8) u16 {
     return 0;
 }
 
-/// Bulk-copy TCP payload bytes into the connection's ring buffer.
-/// Returns the number of bytes actually copied (capped by ring free space).
-/// Handles the ring's wrap point with at most two @memcpy calls — replaces
-/// a 1500-byte byte-by-byte loop with two vectorised copies, each ~50 ns
-/// for an MTU-sized segment vs. ~3 µs for the previous loop. The source's
-/// volatile qualifier is shed via @volatileCast: by the time handleRxFrame
-/// runs, the NIC's descriptor IRQ implies the device finished the DMA, so
-/// the payload is stable DRAM (no benefit from per-byte volatile reads).
-/// Copy `len` bytes from a plain source into the receive ring (capped by free
-/// space). Updates counters and wakes pollers. Returns bytes copied.
-fn rxPush(c: *TcpConn, src: [*]const u8, len: usize) usize {
-    const room = TCP_RX_BUF_SIZE - c.rx_count;
-    const to_copy = @min(len, room);
-    if (to_copy == 0) return 0;
-    const w0: u32 = c.rx_write % TCP_RX_BUF_SIZE;
-    const tail: u32 = TCP_RX_BUF_SIZE - w0;
-    if (to_copy <= tail) {
-        @memcpy(c.rx_buf[w0..][0..to_copy], src[0..to_copy]);
-    } else {
-        @memcpy(c.rx_buf[w0..][0..tail], src[0..tail]);
-        @memcpy(c.rx_buf[0..][0 .. to_copy - tail], src[tail..to_copy]);
-    }
-    c.rx_write +%= @intCast(to_copy);
-    c.rx_count += @intCast(to_copy);
-    tcpNotify(c);
-    return to_copy;
+/// Put `data` into the receive ring where the byte `off` past rcv_nxt
+/// belongs: at most two copies around the wrap. The caller keeps it within
+/// the free space.
+fn ringWrite(c: *TcpConn, off: u32, data: []const u8) void {
+    const at = (c.rx_write +% off) & c.rx_mask;
+    const first = @min(data.len, (c.rx_mask + 1) - at);
+    @memcpy(c.rx_buf[at..][0..first], data[0..first]);
+    if (data.len > first) @memcpy(c.rx_buf[0 .. data.len - first], data[first..]);
 }
 
-/// Push the in-order payload of a received segment (volatile NIC buffer) into
-/// the receive ring.
-fn ringPushTcpData(c: *TcpConn, tcp: []volatile u8, data_offset: usize, payload_len: usize) usize {
-    const src: [*]const u8 = @volatileCast(tcp[data_offset..].ptr);
-    return rxPush(c, src, payload_len);
+/// The oldest out.len bytes the reader hasn't taken, copied out.
+fn ringRead(c: *const TcpConn, out: []u8) void {
+    const at = (c.rx_write -% c.rx_count) & c.rx_mask;
+    const first = @min(out.len, (c.rx_mask + 1) - at);
+    @memcpy(out[0..first], c.rx_buf[at..][0..first]);
+    if (out.len > first) @memcpy(out[first..], c.rx_buf[0 .. out.len - first]);
 }
 
-/// Buffer an out-of-order segment in the single OOO region. Stores it if the
-/// region is empty, extends it if the new segment abuts the end, otherwise drops
-/// it (a second disjoint gap — the peer retransmits; single-region by design).
-fn oooStore(c: *TcpConn, seq: u32, tcp: []volatile u8, data_offset: usize, payload_len: usize) void {
-    const src: [*]const u8 = @volatileCast(tcp[data_offset..].ptr);
-    if (c.ooo_len == 0) {
-        const n: u32 = @intCast(@min(payload_len, @as(usize, TCP_OOO_BUF_SIZE)));
-        @memcpy(c.ooo_buf[0..n], src[0..n]);
-        c.ooo_seq = seq;
-        c.ooo_len = n;
-    } else if (seq == c.ooo_seq +% c.ooo_len) {
-        const space = TCP_OOO_BUF_SIZE - c.ooo_len;
-        const n: u32 = @intCast(@min(payload_len, @as(usize, space)));
-        @memcpy(c.ooo_buf[c.ooo_len..][0..n], src[0..n]);
-        c.ooo_len += n;
-    }
+/// `n` bytes at rcv_nxt, already in the ring, become the reader's.
+fn rxAdvance(c: *TcpConn, n: u32) void {
+    c.rx_write +%= n;
+    c.rx_count += n;
+    c.rcv_nxt +%= n;
+    c.st_bytes += n;
+    if (c.rx_count > c.st_peak) c.st_peak = c.rx_count;
 }
 
-/// After rcv_nxt advances, splice any now-contiguous OOO bytes into the receive
-/// ring and advance rcv_nxt over them.
-fn oooDrain(c: *TcpConn) void {
-    if (c.ooo_len == 0) return;
-    // Drop any leading OOO bytes already covered by rcv_nxt.
-    const lead = c.rcv_nxt -% c.ooo_seq;
-    if (@as(i32, @bitCast(lead)) > 0) {
-        const skip = @min(lead, c.ooo_len);
-        var i: u32 = 0;
-        while (i + skip < c.ooo_len) : (i += 1) c.ooo_buf[i] = c.ooo_buf[i + skip];
-        c.ooo_seq +%= skip;
-        c.ooo_len -= skip;
+fn oooRemove(c: *TcpConn, i: u8) void {
+    var j = i;
+    while (j + 1 < c.n_ooo) : (j += 1) c.ooo[j] = c.ooo[j + 1];
+    c.n_ooo -= 1;
+    if (c.ooo_recent > i) c.ooo_recent -= 1 else if (c.ooo_recent == i) c.ooo_recent = 0;
+}
+
+/// Note [lo, hi), just written to the ring past a gap: joined with every
+/// run it touches. With no room for another run it goes unnoted, and the
+/// peer sends it again.
+fn oooAdd(c: *TcpConn, lo: u32, hi: u32) void {
+    var run: SeqRun = .{ .lo = lo, .hi = hi };
+    var i: u8 = 0;
+    while (i < c.n_ooo) {
+        const r = c.ooo[i];
+        if (seqLe(r.lo, run.hi) and seqLe(run.lo, r.hi)) {
+            if (seqLt(r.lo, run.lo)) run.lo = r.lo;
+            if (seqLt(run.hi, r.hi)) run.hi = r.hi;
+            oooRemove(c, i);
+            continue;
+        }
+        i += 1;
     }
-    if (c.ooo_len == 0 or c.ooo_seq != c.rcv_nxt) return; // still a gap
-    const pushed: u32 = @intCast(rxPush(c, c.ooo_buf[0..].ptr, c.ooo_len));
-    c.rcv_nxt +%= pushed;
-    if (pushed >= c.ooo_len) {
-        c.ooo_len = 0;
-    } else {
-        const rem = c.ooo_len - pushed; // rx ring filled first; keep the rest
-        var i: u32 = 0;
-        while (i < rem) : (i += 1) c.ooo_buf[i] = c.ooo_buf[i + pushed];
-        c.ooo_seq +%= pushed;
-        c.ooo_len = rem;
+    if (c.n_ooo == TCP_OOO_RUNS) return;
+    var at: u8 = 0;
+    while (at < c.n_ooo and seqLt(c.ooo[at].lo, run.lo)) at += 1;
+    var j = c.n_ooo;
+    while (j > at) : (j -= 1) c.ooo[j] = c.ooo[j - 1];
+    c.ooo[at] = run;
+    c.n_ooo += 1;
+    c.ooo_recent = at;
+}
+
+/// rcv_nxt has moved: runs it reached join the stream, their bytes already
+/// in place (a byte's spot in the ring follows from its sequence number).
+fn oooMerge(c: *TcpConn) void {
+    while (c.n_ooo > 0) {
+        const r = c.ooo[0];
+        if (seqLt(c.rcv_nxt, r.lo)) return; // a gap is left
+        if (seqLt(c.rcv_nxt, r.hi)) rxAdvance(c, r.hi -% c.rcv_nxt);
+        oooRemove(c, 0);
     }
 }
 
-/// Handle an inbound data segment: in-order delivery (then drain OOO), out-of-
-/// order buffering, or a duplicate. Always ACKs — a non-advancing ACK is the
-/// duplicate ACK the peer's fast-retransmit keys on.
+/// Take a segment's payload: what lies in the window goes into the ring at
+/// its place, in order or not. Always ACKs: a non-advancing ACK is the
+/// duplicate ACK the peer's fast retransmit keys on, and its SACK blocks
+/// say what came past the gap.
 fn receiveData(c: *TcpConn, seq: u32, tcp: []volatile u8, data_offset: usize, payload_len: usize) void {
     if (payload_len == 0) return;
-    if (seq == c.rcv_nxt) {
-        const copied = ringPushTcpData(c, tcp, data_offset, payload_len);
-        c.rcv_nxt +%= @intCast(copied);
-        oooDrain(c);
-        _ = sendTcpPacket(c, TCP_ACK, null, false);
-    } else if (@as(i32, @bitCast(seq -% c.rcv_nxt)) > 0 and (seq -% c.rcv_nxt) < TCP_OOO_BUF_SIZE) {
-        oooStore(c, seq, tcp, data_offset, payload_len);
-        _ = sendTcpPacket(c, TCP_ACK, null, false); // duplicate ACK (gap remains)
-    } else {
-        _ = sendTcpPacket(c, TCP_ACK, null, false); // old/duplicate: re-ACK
+    if (c.st_segs == 0) c.st_start = process.tick_count;
+    c.st_segs +%= 1;
+    // DMA is done by the time the RX path runs: plain memory now.
+    const src: [*]const u8 = @volatileCast(tcp[data_offset..].ptr);
+    var data = src[0..payload_len];
+    var start = seq;
+    // Bytes before rcv_nxt came already.
+    const old = c.rcv_nxt -% start;
+    if (@as(i32, @bitCast(old)) > 0) {
+        if (old >= data.len) {
+            c.st_old +%= 1;
+            _ = sendTcpPacket(c, TCP_ACK, null);
+            return;
+        }
+        data = data[old..];
+        start = c.rcv_nxt;
     }
+    // Bytes past the free space don't fit: the window never offered them.
+    const off = start -% c.rcv_nxt;
+    const room = (c.rx_mask + 1) - c.rx_count;
+    if (off < room) {
+        if (data.len > room - off) {
+            data = data[0 .. room - off];
+            c.st_cut +%= 1;
+        }
+        ringWrite(c, off, data);
+        if (off == 0) {
+            rxAdvance(c, @intCast(data.len));
+            oooMerge(c);
+            if ((c.rx_mask + 1) - c.rx_count < 1460) c.st_full +%= 1;
+            tcpNotify(c);
+        } else {
+            c.st_ooo +%= 1;
+            oooAdd(c, start, start +% @as(u32, @intCast(data.len)));
+        }
+    } else c.st_cut +%= 1;
+    _ = sendTcpPacket(c, TCP_ACK, null);
 }
 
 fn handleTcpPacket(ip_data: []volatile u8, ihl: usize) void {
@@ -1883,6 +2118,7 @@ fn handleTcpPacket(ip_data: []volatile u8, ihl: usize) void {
     // No matching conn. If this is a fresh SYN (no ACK), look for a listener
     // bound to dst_port — that's the inbound-handshake path.
     const c = conn orelse {
+        tcp_unmatched +%= 1;
         const fresh_syn = (flags & TCP_SYN) != 0 and (flags & TCP_ACK) == 0;
         if (!(fresh_syn and tryAcceptIncomingSyn(ip_data, ihl, dst_port, src_port, seq))) sendReset(ip_data, ihl);
         return;
@@ -1900,10 +2136,12 @@ fn handleTcpPacket(ip_data: []volatile u8, ihl: usize) void {
         return;
     }
 
-    debug.klog("[tcp] RX state={d} flags=0x{X:0>2} seq={d} ack={d} payload={d}\n", .{ @intFromEnum(c.state), flags, seq, ack, payload_len });
+    if (TRACE_RX) debug.klog("[tcp] RX state={d} flags=0x{X:0>2} seq={d} ack={d} payload={d}\n", .{ @intFromEnum(c.state), flags, seq, ack, payload_len });
 
-    // Track the peer's advertised receive window for send-side flow control.
-    c.snd_wnd = readU16BE(tcp[14..16]);
+    // Track the peer's advertised receive window for send-side flow control;
+    // a SYN's is never scaled.
+    const wnd_field: u32 = readU16BE(tcp[14..16]);
+    c.snd_wnd = if (c.ws_ok and flags & TCP_SYN == 0) wnd_field << @intCast(c.snd_wscale) else wnd_field;
     // A window update — including one re-opening from a (near-)zero window — can
     // let buffered-but-unsent data move even when this segment's ACK didn't
     // advance snd_una. Flush here too, not only on the snd_una-advancing path,
@@ -1949,27 +2187,21 @@ fn handleTcpPacket(ip_data: []volatile u8, ihl: usize) void {
                     // overflow panic here (remote crash, peer-controlled).
                     c.rcv_nxt = seq +% 1;
                     c.snd_una = ack;
-                    // Parse MSS from options
-                    if (data_offset > 20) {
-                        var opt_pos: usize = 20;
-                        while (opt_pos + 1 < data_offset) {
-                            const kind = tcp[opt_pos];
-                            if (kind == 0) break; // end
-                            if (kind == 1) { opt_pos += 1; continue; } // NOP
-                            if (opt_pos + 1 >= data_offset) break;
-                            const olen = tcp[opt_pos + 1];
-                            if (kind == 2 and olen == 4 and opt_pos + 4 <= data_offset) {
-                                c.peer_mss = readU16BE(tcp[opt_pos + 2 ..][0..2]);
-                                if (c.peer_mss > 1460) c.peer_mss = 1460;
-                                if (c.peer_mss < 100) c.peer_mss = 536;
-                            }
-                            opt_pos += olen;
-                        }
-                    }
+                    // Our SYN offered scaling and SACK; what the answer
+                    // takes up holds.
+                    const o = parseSynOptions(tcp, data_offset);
+                    c.peer_mss = o.mss;
+                    if (o.wscale) |s| {
+                        c.ws_ok = true;
+                        c.snd_wscale = s;
+                    } else c.rcv_wscale = 0;
+                    c.sack_ok = o.sack_ok;
+                    // Our SYN's window, now that its left edge is known.
+                    c.adv_edge = c.rcv_nxt +% c.adv_wnd;
                     c.state = .established;
                     c.retransmit_count = 0;
                     initCwnd(c);
-                    _ = sendTcpPacket(c, TCP_ACK, null, false);
+                    _ = sendTcpPacket(c, TCP_ACK, null);
                     tcpNotify(c);
                 }
             }
@@ -1989,7 +2221,7 @@ fn handleTcpPacket(ip_data: []volatile u8, ihl: usize) void {
             if (flags & TCP_FIN != 0 and c.rcv_nxt == seq +% @as(u32, @intCast(payload_len))) {
                 c.rcv_nxt +%= 1;
                 c.peer_closed = true;
-                _ = sendTcpPacket(c, TCP_ACK, null, false);
+                _ = sendTcpPacket(c, TCP_ACK, null);
                 if (c.state == .established) {
                     c.state = .close_wait;
                     maybeSendFin(c);
@@ -2016,7 +2248,7 @@ fn handleTcpPacket(ip_data: []volatile u8, ihl: usize) void {
                 // doesn't ack ours (a simultaneous close); time_wait bounds it.
                 if (flags & TCP_FIN != 0) {
                     c.rcv_nxt = seq +% @as(u32, @intCast(payload_len)) +% 1;
-                    _ = sendTcpPacket(c, TCP_ACK, null, false);
+                    _ = sendTcpPacket(c, TCP_ACK, null);
                     enterTimeWait(c);
                 }
             } else {
@@ -2026,7 +2258,7 @@ fn handleTcpPacket(ip_data: []volatile u8, ihl: usize) void {
                 if (flags & TCP_FIN != 0 and c.rcv_nxt == seq +% @as(u32, @intCast(payload_len))) {
                     c.rcv_nxt +%= 1;
                     c.peer_closed = true;
-                    _ = sendTcpPacket(c, TCP_ACK, null, false);
+                    _ = sendTcpPacket(c, TCP_ACK, null);
                     enterTimeWait(c);
                     tcpNotify(c);
                 }
@@ -2134,7 +2366,7 @@ fn tcpTick() void {
                 const seg = @min(inflight, @as(u32, c.peer_mss));
                 var tmp: [1460]u8 = undefined;
                 readSnd(c, c.snd_una, tmp[0..seg]);
-                _ = emitSegment(c, c.snd_una, TCP_PSH | TCP_ACK, tmp[0..seg], false);
+                _ = emitSegment(c, c.snd_una, TCP_PSH | TCP_ACK, tmp[0..seg]);
             } else if (c.last_tx_len > 0) {
                 // Control segment (SYN / SYN-ACK / FIN) retransmit.
                 _ = dispatchPacket(c.remote_ip, c.last_tx[0..c.last_tx_len]);
@@ -2404,6 +2636,8 @@ fn processReceivedPacket(data: []volatile u8) void {
 /// dropping them". Lives on BSS so it's safe to read from anywhere.
 pub var rx_frame_count: u64 = 0;
 pub var rx_frame_total_bytes: u64 = 0;
+/// TCP segments that matched no connection (answered with a reset).
+pub var tcp_unmatched: u64 = 0;
 
 pub fn handleRxFrame(data: []volatile u8) void {
     // Typically NIC-IRQ context (IF already 0); IrqSave also covers the

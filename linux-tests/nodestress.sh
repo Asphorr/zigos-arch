@@ -15,7 +15,7 @@ fail=0
 mkdir -p "$HOME"
 
 one() {
-    timeout -s KILL 180 node -e "
+    busybox timeout -s KILL 180 node -e "
 fetch('$url').then(async (r) => {
   const n = (await r.arrayBuffer()).byteLength;
   console.log(r.status === 200 && n > 100000 ? 'ok' : 'bad ' + r.status + ' ' + n);
