@@ -20,6 +20,7 @@ const debug = @import("../../debug/debug.zig");
 const time = @import("../../time/time.zig");
 const common = @import("common.zig");
 const linux_time = @import("linux_time.zig");
+const linux_signal = @import("linux_signal.zig");
 const lprof = @import("../../debug/linux_prof.zig");
 const shm = @import("../../mm/shm.zig");
 
@@ -189,9 +190,59 @@ fn futexAt(me: *process.PCB, uaddr: u64, private: bool) FutexAt {
     defer lead.as_lock.releaseRead();
     const r = lead.regions.find(uaddr) orelse return .{ .obj = 0, .off = uaddr };
     const in = uaddr - r.start;
-    if (r.shm_id != shm.SHM_INVALID) return .{ .obj = SHARED_ANON | r.shm_id, .off = in };
+    if (r.shm_id != shm.SHM_INVALID) return .{ .obj = SHARED_ANON | r.shm_id, .off = @as(usize, r.shm_off) * 0x1000 + in };
     if (r.cache_inode != 0 and r.cache_shared) return .{ .obj = SHARED_FILE | r.cache_inode, .off = r.cache_off + in };
     return .{ .obj = 0, .off = uaddr };
+}
+
+/// Sleep while the word at `uaddr` holds `want`, at most `rel` ns. A signal
+/// with no handler to run does not end the wait: the call is made again, a
+/// timed one to the same end through restart_syscall.
+fn futexWait(me: *process.PCB, at: FutexAt, uaddr: u64, private: bool, want: u32, rel: ?u64) u64 {
+    if (!common.validateUserPtr(uaddr, 4)) return err(EFAULT);
+    const word: *const volatile u32 = @ptrFromInt(uaddr);
+    if (word.* != want) {
+        lprof.futex(.wait_changed);
+        return err(EAGAIN);
+    }
+    if (rel) |ns| if (ns == 0) return err(ETIMEDOUT);
+    // The clock only for a timed wait: reading it costs a VM exit.
+    const start = if (rel != null) time.monotonicNanos() else 0;
+    const end = start +| (rel orelse 0);
+    var left = rel;
+    while (true) {
+        switch (process.blockOnFutexAt(at.obj, at.off, word, want, if (left) |ns| deadlineAfter(ns) else 0)) {
+            .woke => {
+                lprof.futex(.wait_woke);
+                return 0;
+            },
+            .again => {
+                lprof.futex(.wait_changed);
+                return err(EAGAIN);
+            },
+            .signalled => {
+                if (rel == null) return err(linux_signal.ERESTARTSYS);
+                me.restart_until = end;
+                me.restart_futex = uaddr;
+                me.restart_futex_val = want;
+                me.restart_futex_private = private;
+                return err(linux_signal.ERESTART_RESTARTBLOCK);
+            },
+            .timed_out => lprof.futex(.wait_timed_out),
+        }
+        // tick_count can trail the clock (a tickless CPU catches up in
+        // steps), so a tick deadline may come early: wait out the rest by
+        // the monotonic clock.
+        const now = time.monotonicNanos();
+        // now == start: no clock running, the ticks are all there is.
+        if (now >= end or now == start) return err(ETIMEDOUT);
+        left = end - now;
+    }
+}
+
+/// restart_syscall for a timed futex wait: on, to the monotonic `end`.
+pub fn futexWaitAgain(me: *process.PCB, uaddr: u64, private: bool, want: u32, end: u64) u64 {
+    return futexWait(me, futexAt(me, uaddr, private), uaddr, private, want, end -| time.monotonicNanos());
 }
 
 /// futex(uaddr, op, val, timeout | val2, uaddr2, val3).
@@ -217,39 +268,7 @@ pub fn futex(uaddr: u64, op: u64, val: u64, timeout: u64, uaddr2: u64, val3: u64
                     break :blk ns -| (linux_time.clockNanos(clock) orelse 0);
                 };
             }
-            if (!common.validateUserPtr(uaddr, 4)) return err(EFAULT);
-            const word: *const volatile u32 = @ptrFromInt(uaddr);
-            const want: u32 = @truncate(val);
-            if (word.* != want) {
-                lprof.futex(.wait_changed);
-                return err(EAGAIN);
-            }
-            if (rel) |ns| if (ns == 0) return err(ETIMEDOUT);
-            // The clock only for a timed wait: reading it costs a VM exit.
-            const start = if (rel != null) time.monotonicNanos() else 0;
-            const end = start +| (rel orelse 0);
-            var left = rel;
-            while (true) {
-                switch (process.blockOnFutexAt(at.obj, at.off, word, want, if (left) |ns| deadlineAfter(ns) else 0)) {
-                    .woke => {
-                        lprof.futex(.wait_woke);
-                        return 0;
-                    },
-                    .again => {
-                        lprof.futex(.wait_changed);
-                        return err(EAGAIN);
-                    },
-                    .signalled => return err(EINTR),
-                    .timed_out => lprof.futex(.wait_timed_out),
-                }
-                // tick_count can trail the clock (a tickless CPU catches up
-                // in steps), so a tick deadline may come early: wait out the
-                // rest by the monotonic clock.
-                const now = time.monotonicNanos();
-                // now == start: no clock running, the ticks are all there is.
-                if (now >= end or now == start) return err(ETIMEDOUT);
-                left = end - now;
-            }
+            return futexWait(me, at, uaddr, op & FUTEX_PRIVATE_FLAG != 0, @truncate(val), rel);
         },
         FUTEX_WAKE, FUTEX_WAKE_BITSET => {
             if (cmd == FUTEX_WAKE_BITSET and @as(u32, @truncate(val3)) == 0) return err(EINVAL);

@@ -10,7 +10,8 @@
 //   1  hit/miss + fresh-allocation accounting
 //   2  eviction at the resident limit (the oldest unpinned page goes)
 //   3  a refcount-PINNED page survives eviction; an unpinned peer goes instead
-//   4  a cache full of pinned pages refuses a new one (getOrAlloc -> null)
+//   4  at the limit with every page pinned a new one is cached past it, and
+//      the cache comes back down once pages can be evicted
 //   5  no frame leak: invalidate drops the cache's ref and the frame is freed
 //   6  per-file walks: invalidateFile and a long invalidateRange take one
 //      file's pages and leave another's
@@ -58,7 +59,7 @@ pub fn taskEntry() callconv(.c) noreturn {
     test7DirtyBatches();
 
     if (fail_count == 0) {
-        serial.print("[pgcache] PASS — all checks green (hit/miss, eviction frees victim, pin survives eviction, full-cache skip, no leak, per-file walks, dirty batches)\n", .{});
+        serial.print("[pgcache] PASS — all checks green (hit/miss, eviction frees victim, pin survives eviction, pinned pages past the limit, no leak, per-file walks, dirty batches)\n", .{});
     } else {
         serial.print("[pgcache] FAIL — {d} check(s) failed (see [pgcache] FAIL lines above)\n", .{fail_count});
     }
@@ -155,7 +156,7 @@ fn test3PinSurvives() void {
 
 // --- 4: a cache full of pinned pages refuses a new one ----------------------
 fn test4FullyPinned() void {
-    serial.print("[pgcache] test 4: every page pinned -> not cached\n", .{});
+    serial.print("[pgcache] test 4: every page pinned -> cached past the limit\n", .{});
     page_cache.init();
     page_cache.limitForTest(LIMIT);
     const fid: u64 = 0x4000;
@@ -170,14 +171,23 @@ fn test4FullyPinned() void {
         };
     }
 
+    // Mapped pages are their mappers' memory: the limit does not refuse one.
     const skip_before = page_cache.statsSnapshot().full_skips;
     const r = page_cache.getOrAlloc(fid, LIMIT * PG);
-    check(r == null, "test4 getOrAlloc with every page pinned should return null");
-    check(page_cache.statsSnapshot().full_skips == skip_before + 1, "test4 a full cache should record one full_skip");
-    check(page_cache.residentCount() == LIMIT, "test4 the pinned pages should all still be resident");
-
+    check(r != null, "test4 getOrAlloc with every page pinned should cache the page all the same");
+    check(page_cache.statsSnapshot().full_skips == skip_before, "test4 a page past the limit is not a full_skip");
+    check(page_cache.residentCount() == LIMIT + 1, "test4 the cache should hold one page past the limit");
     i = 0;
-    while (i < LIMIT) : (i += 1) pmm.releaseFrame(pins[i]); // unpin all
+    while (i < LIMIT) : (i += 1) check(page_cache.lookup(fid, @as(u64, i) * PG) != null, "test4 the pinned pages should all still be resident");
+
+    // Unpinned, they are evictable: two go for each page that comes in,
+    // once a sweep is due again, until the cache is back at the limit.
+    i = 0;
+    while (i < LIMIT) : (i += 1) pmm.releaseFrame(pins[i]);
+    const other: u64 = 0x4001;
+    var k: u64 = 0;
+    while (k < 200) : (k += 1) _ = page_cache.getOrAlloc(other, k * PG);
+    check(page_cache.residentCount() == LIMIT, "test4 the cache should be back at the limit once pages can go");
     page_cache.init();
 }
 

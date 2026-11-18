@@ -481,18 +481,19 @@ pub fn mightSleep(comptime src: std.builtin.SourceLocation) void {
     // One myCpu() for both checks — this sits on the uncontended
     // Mutex.acquire fast path; cpus[] is LAPIC-indexed so cpu_id is the
     // same number currentCpuId() would return, for free.
-    const cl = smp.myCpu();
-    if (cl.current_pid == null) return; // no task — nothing can park
-    const cpu = cl.cpu_id;
-    if (cpu >= MAX_HOLD_CPUS) return;
-    // cli microwindow: an unpinned caller CAN be preempted between the
-    // CPU-id read and the pin read and land on another CPU — reading a
-    // stranger's non-zero pin would burn this site's one-shot latch on a
-    // false positive. (A true positive can't migrate: the pin it is
-    // about to see is what pins it.) Same bracket pinPreemption uses.
+    //
+    // cli microwindow around the CPU read AND the pin read: an unpinned
+    // caller preempted between the two lands on another CPU and reads a
+    // stranger's pin (and names that CPU's task) — a false positive that
+    // burns this site's one-shot latch. (A true positive can't migrate:
+    // the pin it is about to see is what pins it.)
     const irq_flags = saveAndDisableIrq();
-    const pin = lock_cpu[cpu].pin;
+    const cl = smp.myCpu();
+    const task = cl.current_pid;
+    const cpu = cl.cpu_id;
+    const pin = if (cpu < MAX_HOLD_CPUS) lock_cpu[cpu].pin else 0;
     restoreIrq(irq_flags);
+    if (task == null) return; // no task — nothing can park
     if (pin == 0) return;
     for (&might_sleep_warned) |w| {
         if (w == key) return; // this site already warned once
@@ -503,6 +504,7 @@ pub fn mightSleep(comptime src: std.builtin.SourceLocation) void {
             // Print the SAME pin value the gate saw — a fresh read could
             // disagree (an interleaving IRQ's acquire/release).
             debug.kwarn(src, "mightSleep with preempt pin {d} (SpinLock held or pinned) — parking here can deadlock the CPU", .{pin});
+            mightSleepPath(task.?);
             return;
         }
     }
@@ -511,6 +513,30 @@ pub fn mightSleep(comptime src: std.builtin.SourceLocation) void {
     // → mightSleep), and an unbounded re-entry here would be a stackless
     // triple fault with no message. Sized 16 for ~6 call sites; if it
     // ever fills, grow it.
+}
+
+/// Who reached a mightSleep warning: the task, and the words of its stack
+/// that point into kernel code, nearest first (frame pointers are omitted).
+noinline fn mightSleepPath(pid: usize) void {
+    var fp = @frameAddress();
+    var top = (fp & ~@as(usize, 0xFFF)) + 0x1000;
+    // The task's own stack, when this runs on it, is mapped to its top.
+    const kstack_top = process.procs[pid].kernel_stack_top;
+    if (fp < kstack_top and kstack_top - fp <= @import("../config.zig").KSTACK_SIZE) top = kstack_top;
+    debug.klog("[kwarn]   pid={d} '{s}'\n", .{ pid, std.mem.sliceTo(&process.procs[pid].name, 0) });
+    var scanned: usize = 0;
+    var shown: usize = 0;
+    while (fp + 8 <= top and scanned < 1024 and shown < 12) : (fp += 8) {
+        scanned += 1;
+        const v = @as(*const u64, @ptrFromInt(fp)).*;
+        if (!isKernelTextAddr(v)) continue;
+        if (symbols.resolveKernel(v)) |r| {
+            debug.klog("[kwarn]   path #{d}: {s}+0x{X}\n", .{ shown, r.name, r.offset });
+        } else {
+            debug.klog("[kwarn]   path #{d}: 0x{X}\n", .{ shown, v });
+        }
+        shown += 1;
+    }
 }
 
 /// Warned-site latch table for mightSleep — slots hold the site hash,

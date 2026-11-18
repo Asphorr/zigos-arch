@@ -180,7 +180,8 @@ pub fn openFile(path: []const u8) ?Handle {
 // The inode is held (held.zig) from the open to `release`, so an unlink in
 // between leaves it in place. The hold is taken under the mount lock, with
 // the walk: an unlink of the name either sees the hold or is over before
-// the walk starts.
+// the walk starts. A mapping of the file holds the inode too, for as long
+// as a region names it.
 
 /// openFile, the inode held.
 pub fn openHeld(path: []const u8) ?Handle {
@@ -213,10 +214,44 @@ pub fn openDirHeld(path: []const u8) ?u32 {
     return inum;
 }
 
-/// An open file on `inum` is gone. The last one to go frees an inode that
-/// lost its names while it was open. May sleep.
+/// One more holder of `inum` for one that holds it already: a mapping made
+/// from an open file, or from another mapping (a split, a fork). Takes no
+/// lock that sleeps. False when memory is out.
+pub fn holdAgain(inum: u32) bool {
+    return held.hold(inum);
+}
+
+/// A holder of `inum`, an inode a path lookup gave a while ago: only if it
+/// is still a regular file with a name.
+pub fn holdLinked(inum: u32) bool {
+    const m = block.getMount() orelse return false;
+    block.lockMount(m);
+    defer block.unlockMount(m);
+    const ino = inode.readInode(inum) orelse return false;
+    if (ino.links_count == 0 or !inode.isReg(&ino)) return false;
+    return held.hold(inum);
+}
+
+/// A holder of `inum` is gone: an open file, or a mapping. The last one to
+/// go frees an inode that lost its names while it was held. May sleep.
 pub fn release(inum: u32) void {
-    if (!held.unhold(inum)) return;
+    if (held.unhold(inum)) freeOrphan(inum);
+}
+
+/// release for a holder under an address space's lock, where the mount's
+/// can't be waited for: an inode to free is left for freeQueued.
+pub fn releaseLater(inum: u32) void {
+    held.unholdLater(inum);
+}
+
+/// Free the inodes releaseLater left. May sleep.
+pub fn freeQueued() void {
+    while (held.takeQueued()) |inum| freeOrphan(inum);
+}
+
+/// Free `inum`, which lost its names while it was held and now its last
+/// holder.
+fn freeOrphan(inum: u32) void {
     const m = block.getMount() orelse return;
     block.lockMount(m);
     defer block.unlockMount(m);
@@ -243,6 +278,16 @@ pub fn readFile(handle: Handle, buf: [*]u8, count: u32) usize {
 /// (only regular-file data is cached + invalidated) and to clip at EOF.
 /// is_reg=false (including an unreadable inode) tells the caller to bypass the
 /// cache entirely.
+/// The mount lock, for a caller outside that needs a read and what it does
+/// with the bytes to be one step against writers (a page-cache fill).
+pub fn lockMount() void {
+    if (block.getMount()) |m| block.lockMount(m);
+}
+
+pub fn unlockMount() void {
+    if (block.getMount()) |m| block.unlockMount(m);
+}
+
 pub const CacheReadInfo = struct { is_reg: bool, size: u64 };
 pub fn cacheReadInfo(inum: u32) CacheReadInfo {
     const ino = inode.readInode(inum) orelse return .{ .is_reg = false, .size = 0 };
@@ -351,7 +396,8 @@ pub fn writeFile(handle: *Handle, src: [*]const u8, count: u32) u32 {
     }
 
     const new_end: u64 = handle.current_offset + done;
-    if (new_end > inode.fileSize(&ino)) {
+    const old_size = inode.fileSize(&ino);
+    if (new_end > old_size) {
         // LARGE_FILE: regular files keep the high 32 size bits in dir_acl
         // (fileSize() composes them). @truncate alone silently wrapped the
         // size at 4 GiB — a file grown past it would report size new_end %
@@ -364,14 +410,19 @@ pub fn writeFile(handle: *Handle, src: [*]const u8, count: u32) u32 {
         ino.mtime = sec;
         ino.ctime = sec;
     }
+    // The cache holds the file's pages for reads and mappings alike: the
+    // ones resident take the written bytes, still under the mount lock, so
+    // a dirty page's writeback carries them too. What was cached past the
+    // old end (a mapping reaches past EOF) was never the file's.
+    if (done > 0) {
+        const file_id = page_cache.ext2FileId(handle.inum);
+        if (new_end > old_size) page_cache.cutFrom(file_id, old_size, new_end);
+        page_cache.writeThrough(file_id, start_off, src[0..done]);
+    }
     if (!inode.writeInode(handle.inum, &ino)) return 0;
 
     handle.current_offset = new_end;
     handle.file_size = inode.fileSize(&ino);
-    // Page-cache coherence: drop cached pages overlapping the written range so a
-    // later mmap fault / cached read re-fills from disk rather than serving the
-    // pre-write bytes. No-op (quick misses) for files nothing has mmap'd.
-    if (done > 0) _ = page_cache.invalidateRange(page_cache.ext2FileId(handle.inum), start_off, done);
     return done;
 }
 
@@ -398,9 +449,10 @@ pub fn writebackPage(inum: u32, page_off: u64, frame: Phys, src: [*]const u8) u3
     defer block.unlockMount(m);
     block.beginMetaDefer(m);
     defer block.endMetaDefer(m);
-    // Pinned with no lock held: since then the file may have been truncated,
-    // or unlinked and its inode given to a new file. Both drop the page from
-    // the cache under this lock, so a page still cached is still this file's.
+    // Pinned with no lock held: since then the inode may have been freed and
+    // given to a new file. That drops the page from the cache under this
+    // lock, so a page still cached is still this file's; a truncate since
+    // then shows in the size below.
     if (!page_cache.holds(page_cache.ext2FileId(inum), page_off, frame)) return 0;
     var ino = inode.readInode(inum) orelse return 0;
     if (!inode.isReg(&ino)) return 0;
@@ -426,6 +478,12 @@ pub fn writebackPage(inum: u32, page_off: u64, frame: Phys, src: [*]const u8) u3
         // wrote into) allocates here — correct, and flagged so we persist the
         // updated block map.
         const was_unallocated = (inode.blockMapLookup(&ino, logical) == null);
+        // A hole stays a hole while what the mapping holds for it is zeros:
+        // a sparse file read through a writable mapping takes no blocks.
+        if (was_unallocated and std.mem.allEqual(u8, src[done .. done + take], 0)) {
+            done += take;
+            continue;
+        }
         const phys = inode.ensurePhysicalBlock(m, &ino, logical) orelse break;
         if (was_unallocated) {
             inode_grew = true;
@@ -800,8 +858,19 @@ pub fn unlinkAt(path: []const u8) Error!void {
     const child_inum = lookupInDir(&parent, at.leaf) orelse return error.NotFound;
     const child = inode.readInode(child_inum) orelse return error.Io;
     if (inode.isDir(&child)) return error.IsDir;
-    if (@import("../../proc/process.zig").isTextBusy(child_inum)) return error.Busy;
+    if (nameFenced(child_inum)) return error.Busy;
     if (!unlinkInDir(at.inum, at.leaf, .file_only)) return error.Io;
+}
+
+/// Whether the caller may not take the last name of `inum` away: a native
+/// task, when it is a running program's image (the native ABI's rule; the
+/// fuzzer's own binary stays launchable by it). A Linux task may, as on
+/// Linux: the program's mappings hold the inode (held.zig).
+fn nameFenced(inum: u32) bool {
+    const process = @import("../../proc/process.zig");
+    if (!process.isTextBusy(inum)) return false;
+    const pcb = process.currentPCB() orelse return true;
+    return pcb.personality != .linux;
 }
 
 const UnlinkPolicy = enum { file_only, dir_only };
@@ -826,12 +895,7 @@ pub fn unlinkInDir(parent_inum: u32, name: []const u8, policy: UnlinkPolicy) boo
         .file_only => if (inode.isDir(&child)) return false,
         .dir_only => if (!inode.isDir(&child)) return false,
     }
-    // Open files hold their inode (held.zig); a running program's text and
-    // a mapping do not yet. Unlinking a running process's text image would
-    // free (and let reallocate) the blocks its lazy page-cache fills still
-    // read from, so refuse like truncate does (the 2026-06-04 ETXTBSY rule,
-    // extended to unlink).
-    if (policy == .file_only and @import("../../proc/process.zig").isTextBusy(child_inum)) return false;
+    if (policy == .file_only and nameFenced(child_inum)) return false;
     // For dir_only: caller (rmdir) must have already verified the dir is
     // empty — we don't re-check here.
 
@@ -849,8 +913,8 @@ pub fn unlinkInDir(parent_inum: u32, name: []const u8, policy: UnlinkPolicy) boo
     const free_inode_now = (policy == .dir_only) or (child.links_count <= 1);
 
     if (free_inode_now and held.orphanIfHeld(child_inum)) {
-        // An open file still refers to it: it stays, nameless, until the
-        // last such file goes (release).
+        // An open file or a mapping still refers to it: it stays, nameless,
+        // until the last of them goes (release, freeQueued).
         child.links_count = 0;
         child.ctime = sec;
         if (!inode.writeInode(child_inum, &child)) return false;
@@ -935,9 +999,9 @@ pub fn truncate(inum: u32) bool {
     const sec: u32 = @truncate(time.now().sec);
     ino.mtime = sec;
     ino.ctime = sec;
-    // Page-cache coherence: every data page is gone — drop them all so a later
-    // fault/read doesn't serve pre-truncate bytes.
-    _ = page_cache.invalidateFile(page_cache.ext2FileId(inum));
+    // No cached page is the file's any more; the ones mappings hold stay
+    // theirs and the cache's, zeroed (cutFrom).
+    page_cache.cutFrom(page_cache.ext2FileId(inum), 0, std.math.maxInt(u64));
     return inode.writeInode(inum, &ino);
 }
 
@@ -976,13 +1040,13 @@ pub fn truncateTo(inum: u32, size: u64) Error!void {
                 if (!block.writeBlock(m, phys, buf[0..m.block_size])) return error.Io;
             }
         }
-        const page_from = size & ~@as(u64, 0xFFF);
-        _ = page_cache.invalidateRange(page_cache.ext2FileId(inum), page_from, old - page_from);
+        // A mapping's bytes past the new end must not come back when the
+        // file grows again.
+        page_cache.cutFrom(page_cache.ext2FileId(inum), size, std.math.maxInt(u64));
     } else if (size > old) {
         // What was cached at or past the old end (a mapping reaches past
         // EOF) must not become the new bytes: they read as zeros.
-        const page_from = old & ~@as(u64, 0xFFF);
-        _ = page_cache.invalidateRange(page_cache.ext2FileId(inum), page_from, size - page_from);
+        page_cache.cutFrom(page_cache.ext2FileId(inum), old, size);
     }
     ino.size = @truncate(size);
     ino.dir_acl = @truncate(size >> 32); // size-high bits
@@ -1305,7 +1369,7 @@ pub fn rename(old_path: []const u8, new_path: []const u8) Error!void {
                 if (!dirIsEmpty(&dst_ino)) return error.NotEmpty;
             } else {
                 if (inode.isDir(&dst_ino)) return error.IsDir;
-                if (@import("../../proc/process.zig").isTextBusy(dst)) return error.Busy;
+                if (nameFenced(dst)) return error.Busy;
             }
             if (!unlinkInDir(to.inum, to.leaf, if (src_is_dir) .dir_only else .file_only)) return error.Io;
         }

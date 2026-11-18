@@ -181,12 +181,19 @@ pub fn takeControl(id: u8, sid: u32, pgid: u32) bool {
     return true;
 }
 
+/// True if the process in lead slot `i` has ended: a zombie, unless only
+/// its lead's thread ended and other threads of it live on (a main thread
+/// that exited first, an execve from another thread).
+fn ended(i: usize) bool {
+    return process.procs[i].state == .zombie and !process.pinnedLead(i);
+}
+
 /// The slot of session `sid`'s leader, a Linux process, while it lives.
 fn leaderOf(sid: u32) ?u8 {
     if (sid == 0) return null;
     for (0..process.MAX_PROCS) |i| {
         const p = &process.procs[i];
-        if (!session.isProcess(i) or p.state == .zombie or p.personality != .linux) continue;
+        if (!session.isProcess(i) or ended(i) or p.personality != .linux) continue;
         if (p.pid_nr == sid and p.sid == sid) return @intCast(i);
     }
     return null;
@@ -240,7 +247,7 @@ pub fn signalForeground(id: u8, signo: u32) void {
 fn signalLinuxGroup(pgid: u32, signo: u32, skip: ?u8) void {
     for (0..process.MAX_PROCS) |i| {
         const p = &process.procs[i];
-        if ((skip != null and i == skip.?) or !session.isProcess(i) or p.state == .zombie) continue;
+        if ((skip != null and i == skip.?) or !session.isProcess(i) or ended(i)) continue;
         if (p.personality != .linux or p.pgid != pgid) continue;
         _ = signals.sendProcess(@intCast(i), signo, .{});
     }
@@ -284,7 +291,7 @@ pub fn hasLinuxProgram(id: u8) bool {
     const t = get(id) orelse return false;
     for (0..process.MAX_PROCS) |i| {
         const p = &process.procs[i];
-        if (session.isProcess(i) and p.state != .zombie and p.personality == .linux and p.sid == t.sid) return true;
+        if (session.isProcess(i) and !ended(i) and p.personality == .linux and p.sid == t.sid) return true;
     }
     return false;
 }

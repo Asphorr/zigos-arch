@@ -1,7 +1,9 @@
 // lt_mm — the Linux memory-management syscalls a real program leans on:
 // mmap (hint, MAP_FIXED, MAP_FIXED_NOREPLACE, file-backed, PROT_NONE),
 // munmap and mprotect on parts of a mapping, madvise(MADV_DONTNEED), brk,
-// thousands of small mappings, a large reserve touched sparsely, mremap.
+// thousands of small mappings, a large reserve touched sparsely, mremap,
+// shared anonymous memory whole and in parts, a file cut short or unlinked
+// under its mappings.
 // Run by boot mode 19 (src/test/linux_selftest.zig); exit 0 = every check
 // passed, else the number of the first failed check.
 
@@ -16,7 +18,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/statfs.h>
 #include <sys/syscall.h>
+#include <sys/sysinfo.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -289,6 +294,290 @@ int main(void) {
         CHECK(unlink("/ltmm.sparse") == 0, "remove the sparse file");
     }
 
+    // A file's mappings and its read and write calls are one set of bytes:
+    // what write puts into a page that is mapped shows in the mapping and
+    // in a read, and no writeback of the mapping takes it back.
+    {
+        int fd = open("/ltmm.coh", O_CREAT | O_RDWR | O_TRUNC, 0644);
+        unsigned char page[2 * PG];
+        memset(page, 'x', sizeof page);
+        CHECK(fd >= 0 && write(fd, page, sizeof page) == (ssize_t)sizeof page, "create a two-page file");
+        unsigned char *ro = mmap(NULL, 2 * PG, PROT_READ, MAP_SHARED, fd, 0);
+        CHECK(ro != MAP_FAILED && ro[100] == 'x', "a shared read-only mapping, its first page read");
+        char back[8] = {0};
+        CHECK(pwrite(fd, "NEWDATA", 7, 100) == 7 && pread(fd, back, 7, 100) == 7 && memcmp(back, "NEWDATA", 7) == 0,
+              "a write into a mapped page is what a read returns");
+        CHECK(memcmp(ro + 100, "NEWDATA", 7) == 0, "and what the mapping shows");
+        CHECK(munmap(ro, 2 * PG) == 0, "munmap of the read-only mapping");
+
+        unsigned char *pv = mmap(NULL, 2 * PG, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+        CHECK(pv != MAP_FAILED && pv[PG + 5] == 'x', "a private mapping, its second page read");
+        CHECK(pwrite(fd, "PRIV", 4, PG + 5) == 4 && memcmp(pv + PG + 5, "PRIV", 4) == 0,
+              "a private page not yet written shows a later write to the file");
+        CHECK(munmap(pv, 2 * PG) == 0, "munmap of the private mapping");
+
+        unsigned char *rw = mmap(NULL, 2 * PG, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        CHECK(rw != MAP_FAILED, "a shared writable mapping");
+        memcpy(rw + 10, "MAPPED", 6);
+        CHECK(pwrite(fd, "WRITTEN", 7, 200) == 7, "a write into a page the mapping dirtied");
+        CHECK(msync(rw, 2 * PG, MS_SYNC) == 0 && munmap(rw, 2 * PG) == 0, "msync and munmap");
+        close(fd);
+        fd = open("/ltmm.coh", O_RDWR);
+        char a6[6], b7[7], c7[7];
+        CHECK(fd >= 0 && pread(fd, a6, 6, 10) == 6 && pread(fd, b7, 7, 200) == 7 && pread(fd, c7, 7, 100) == 7,
+              "read the file back");
+        CHECK(memcmp(a6, "MAPPED", 6) == 0 && memcmp(b7, "WRITTEN", 7) == 0 && memcmp(c7, "NEWDATA", 7) == 0,
+              "the file holds what the mapping and the writes put there");
+
+        // Cut short and grown again under a mapping that dirtied a page
+        // past the cut: the file reads as zeros there.
+        CHECK(ftruncate(fd, 16 * PG) == 0, "grow the file to 16 pages");
+        rw = mmap(NULL, 16 * PG, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        CHECK(rw != MAP_FAILED, "map all of it");
+        memset(rw + 8 * PG, 'd', 64);
+        memset(rw + PG / 2, 'e', PG / 2);
+        CHECK(ftruncate(fd, PG / 2 + 100) == 0 && ftruncate(fd, 16 * PG) == 0, "cut it inside the first page and grow it back");
+        unsigned char z[64];
+        CHECK(pread(fd, z, 64, 8 * PG) == 64 && filled(z, 64, 0), "the page past the cut reads as zeros");
+        CHECK(pread(fd, z, 64, PG / 2 + 100) == 64 && filled(z, 64, 0), "and so does the rest of the page the cut fell in");
+        CHECK(pread(fd, z, 64, PG / 2) == 64 && filled(z, 64, 'e'), "what lay before the cut stays");
+        CHECK(munmap(rw, 16 * PG) == 0, "munmap after the cut");
+        CHECK(pread(fd, z, 64, 8 * PG) == 64 && filled(z, 64, 0), "still zeros once the mapping is gone");
+        close(fd);
+        CHECK(unlink("/ltmm.coh") == 0, "remove the file");
+    }
+
+    // A mapping that was there when the file was cut short is the file's
+    // again once the file has grown back; so is another process's when the
+    // file is emptied and written anew.
+    {
+        int fd = open("/ltmm.cut", O_CREAT | O_RDWR | O_TRUNC, 0644);
+        CHECK(fd >= 0 && ftruncate(fd, 16 * PG) == 0, "a 16-page file to cut under a mapping");
+        unsigned char *m = mmap(NULL, 16 * PG, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        CHECK(m != MAP_FAILED, "map it shared");
+        memset(m + 8 * PG, 'a', 64);
+        CHECK(*(volatile unsigned char *)(m + 9 * PG) == 0, "one page written, the next one read");
+        CHECK(ftruncate(fd, PG) == 0 && ftruncate(fd, 16 * PG) == 0, "cut it to one page and grow it back");
+        CHECK(m[8 * PG] == 0 && m[8 * PG + 63] == 0, "the mapping reads zeros where it had written");
+        memcpy(m + 8 * PG + 4, "MAP1", 4);
+        char got[4] = {0};
+        CHECK(pread(fd, got, 4, 8 * PG + 4) == 4 && memcmp(got, "MAP1", 4) == 0, "a store through it is what read returns");
+        CHECK(pwrite(fd, "FILE", 4, 9 * PG + 8) == 4 && memcmp(m + 9 * PG + 8, "FILE", 4) == 0, "a write to the file shows in it");
+        CHECK(msync(m, 16 * PG, MS_SYNC) == 0 && munmap(m, 16 * PG) == 0, "msync and munmap after the cut");
+        CHECK(pread(fd, got, 4, 8 * PG + 4) == 4 && memcmp(got, "MAP1", 4) == 0, "the store stays in the file");
+
+        unsigned char pages[4 * PG];
+        memset(pages, 'A', sizeof pages);
+        CHECK(ftruncate(fd, 0) == 0 && pwrite(fd, pages, sizeof pages, 0) == (ssize_t)sizeof pages, "the file anew, four pages of As");
+        int go[2], ready[2];
+        CHECK(pipe(go) == 0 && pipe(ready) == 0, "two pipes");
+        pid_t c = fork();
+        CHECK(c >= 0, "fork the one that maps it");
+        if (c == 0) {
+            char b;
+            unsigned char *cm = mmap(NULL, 4 * PG, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+            if (cm == MAP_FAILED || !filled(cm, 4 * PG, 'A')) _exit(1);
+            if (write(ready[1], "r", 1) != 1 || read(go[0], &b, 1) != 1) _exit(2);
+            if (!filled(cm, 4 * PG, 'B')) _exit(3);
+            cm[2 * PG + 100] = 'C';
+            _exit(0);
+        }
+        char b = 0;
+        CHECK(read(ready[0], &b, 1) == 1, "it has the file mapped and read");
+        memset(pages, 'B', sizeof pages);
+        CHECK(ftruncate(fd, 0) == 0 && pwrite(fd, pages, sizeof pages, 0) == (ssize_t)sizeof pages, "empty the file and write four pages of Bs");
+        CHECK(write(go[1], "g", 1) == 1, "let it look");
+        int st = 0;
+        CHECK(waitpid(c, &st, 0) == c, "wait for it");
+        if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) printf("lt_mm: the mapper ended with status 0x%x\n", st);
+        CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0, "its mapping shows the new bytes");
+        CHECK(pread(fd, &b, 1, 2 * PG + 100) == 1 && b == 'C', "and what it stored is in the file");
+        close(go[0]);
+        close(go[1]);
+        close(ready[0]);
+        close(ready[1]);
+        close(fd);
+        CHECK(unlink("/ltmm.cut") == 0, "remove the cut file");
+    }
+
+    // A mapping holds its file: with the name removed and the descriptor
+    // closed the file is there under it, whatever new files are made, and
+    // goes when its last mapping does.
+    {
+        int keep = open("/ltmm.fs", O_CREAT | O_RDWR | O_TRUNC, 0644);
+        struct statfs sf;
+        CHECK(keep >= 0 && fstatfs(keep, &sf) == 0, "a file to ask the file system through");
+        long inodes = (long)sf.f_ffree;
+        int fd = open("/ltmm.gone", O_CREAT | O_RDWR | O_TRUNC, 0644);
+        CHECK(fd >= 0 && ftruncate(fd, 64 * PG) == 0, "a 64-page file");
+        unsigned char *m = mmap(NULL, 64 * PG, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        CHECK(m != MAP_FAILED, "map it shared");
+        fill(m, 8 * PG, 0x31);
+        CHECK(close(fd) == 0 && unlink("/ltmm.gone") == 0, "close it and remove its name");
+        CHECK(fstatfs(keep, &sf) == 0 && (long)sf.f_ffree == inodes - 1, "its inode is still taken");
+        // New files get the inode numbers and the blocks that are free.
+        unsigned char junk[PG];
+        memset(junk, 0xEE, PG);
+        char name[32];
+        int made = 1;
+        for (int i = 0; i < 8; i++) {
+            snprintf(name, sizeof name, "/ltmm.new%d", i);
+            int nf = open(name, O_CREAT | O_RDWR | O_TRUNC, 0644);
+            for (int k = 0; k < 16; k++) made &= nf >= 0 && write(nf, junk, PG) == (ssize_t)PG;
+            if (nf >= 0) close(nf);
+        }
+        CHECK(made, "eight new files of 16 pages");
+        CHECK(filled(m, 8 * PG, 0x31), "the pages written before are as they were");
+        CHECK(filled(m + 8 * PG, 56 * PG, 0), "the pages not yet touched are the file's own: zeros");
+        fill(m + 32 * PG, 8 * PG, 0x32);
+        int go[2];
+        CHECK(pipe(go) == 0, "a pipe");
+        pid_t c = fork();
+        CHECK(c >= 0, "fork with the mapping");
+        if (c == 0) {
+            char b;
+            if (read(go[0], &b, 1) != 1) _exit(1);
+            _exit(filled(m + 32 * PG, 8 * PG, 0x32) && filled(m + 40 * PG, 24 * PG, 0) ? 0 : 2);
+        }
+        CHECK(munmap(m, 16 * PG) == 0 && filled(m + 32 * PG, 8 * PG, 0x32), "a part unmapped, the rest is there");
+        CHECK(munmap(m + 16 * PG, 48 * PG) == 0, "munmap the rest");
+        CHECK(fstatfs(keep, &sf) == 0 && (long)sf.f_ffree == inodes - 9, "the child's mapping still holds the file");
+        CHECK(write(go[1], "g", 1) == 1, "let the child look");
+        int st = 0;
+        CHECK(waitpid(c, &st, 0) == c && WIFEXITED(st) && WEXITSTATUS(st) == 0, "the child read the file through its mapping");
+        // The last mapping went with a process: the file goes soon after.
+        int freed = 0;
+        for (int waited = 0; waited < 100 && !freed; waited++) {
+            freed = fstatfs(keep, &sf) == 0 && (long)sf.f_ffree == inodes - 8;
+            if (!freed) usleep(100000);
+        }
+        CHECK(freed, "with the last mapping gone the inode is free again");
+        close(go[0]);
+        close(go[1]);
+
+        // And at once when munmap takes the last mapping away.
+        fd = open("/ltmm.gone", O_CREAT | O_RDWR | O_TRUNC, 0644);
+        CHECK(fd >= 0 && ftruncate(fd, 4 * PG) == 0, "the file again, four pages");
+        m = mmap(NULL, 4 * PG, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        CHECK(m != MAP_FAILED, "map it shared");
+        m[PG] = 7;
+        CHECK(close(fd) == 0 && unlink("/ltmm.gone") == 0 && m[PG] == 7, "closed and unlinked, the mapping reads");
+        CHECK(fstatfs(keep, &sf) == 0 && (long)sf.f_ffree == inodes - 9, "the inode is taken while it is mapped");
+        CHECK(munmap(m, 4 * PG) == 0 && fstatfs(keep, &sf) == 0 && (long)sf.f_ffree == inodes - 8, "and free once it is unmapped");
+
+        int removed = 1;
+        for (int i = 0; i < 8; i++) {
+            snprintf(name, sizeof name, "/ltmm.new%d", i);
+            removed &= unlink(name) == 0;
+        }
+        close(keep);
+        CHECK(removed && unlink("/ltmm.fs") == 0, "remove the new files");
+    }
+
+    // A hole read through shared mappings stays a hole; a store through a
+    // mapping reaches the disk, also one that was read-only when its page
+    // was read and made writable afterwards.
+    {
+        int fd = open("/ltmm.hole", O_CREAT | O_RDWR | O_TRUNC, 0644);
+        CHECK(fd >= 0 && ftruncate(fd, 64 * PG) == 0, "a file that is one 64-page hole");
+        unsigned char *ro = mmap(NULL, 64 * PG, PROT_READ, MAP_SHARED, fd, 0);
+        unsigned char *rw = mmap(NULL, 64 * PG, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        CHECK(ro != MAP_FAILED && rw != MAP_FAILED, "mapped shared twice, read-only and writable");
+        CHECK(filled(ro, 32 * PG, 0) && filled(rw + 32 * PG, 32 * PG, 0), "all of it read through them: zeros");
+        sleep(3); // the background writeback has come round
+        struct stat sb;
+        CHECK(msync(rw, 64 * PG, MS_SYNC) == 0 && fstat(fd, &sb) == 0, "msync, then its size on disk");
+        if (sb.st_blocks != 0) printf("lt_mm: the hole takes %ld sectors after being read\n", (long)sb.st_blocks);
+        CHECK(sb.st_blocks == 0, "reading a hole through mappings takes no blocks");
+        CHECK(mprotect(ro, 64 * PG, PROT_READ | PROT_WRITE) == 0, "the read-only mapping made writable");
+        ro[5 * PG] = 0x77;
+        CHECK(munmap(ro, 64 * PG) == 0 && munmap(rw, 64 * PG) == 0 && fsync(fd) == 0, "a store through it; both unmapped; fsync");
+        CHECK(fstat(fd, &sb) == 0, "its size on disk again");
+        if (sb.st_blocks <= 0 || sb.st_blocks > 64) printf("lt_mm: one stored page takes %ld sectors\n", (long)sb.st_blocks);
+        CHECK(sb.st_blocks > 0 && sb.st_blocks <= 64, "the store took a block and the hole around it none");
+        unsigned char got = 0;
+        CHECK(pread(fd, &got, 1, 5 * PG) == 1 && got == 0x77, "and is in the file");
+        int rfd = open("/ltmm.hole", O_RDONLY);
+        unsigned char *q = mmap(NULL, PG, PROT_READ, MAP_SHARED, rfd, 0);
+        CHECK(rfd >= 0 && q != MAP_FAILED, "a shared mapping of the file opened read-only");
+        CHECK(mprotect(q, PG, PROT_READ | PROT_WRITE) == -1 && errno == EACCES, "cannot be made writable: EACCES");
+        CHECK(munmap(q, PG) == 0 && close(rfd) == 0, "unmap it");
+        close(fd);
+        CHECK(unlink("/ltmm.hole") == 0, "remove the hole file");
+    }
+
+    // A third of memory mapped shared from one file (a hole, so the disk is
+    // not what limits it): every page maps, however many file pages the
+    // system keeps cached of its own accord.
+    {
+        struct sysinfo si;
+        CHECK(sysinfo(&si) == 0 && si.totalram > 0, "sysinfo for the size of memory");
+        size_t big = (size_t)si.totalram * si.mem_unit / 3;
+        if (big > (1UL << 30)) big = 1UL << 30;
+        big &= ~(PG - 1);
+        size_t pages = big / PG;
+        int fd = open("/ltmm.big", O_CREAT | O_RDWR | O_TRUNC, 0644);
+        CHECK(fd >= 0 && ftruncate(fd, (off_t)big) == 0, "a hole a third of memory long");
+        unsigned char *m = mmap(NULL, big, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        CHECK(m != MAP_FAILED, "map all of it shared");
+        int zeros = 1;
+        for (size_t i = 0; i < pages; i++) zeros &= *(volatile unsigned char *)(m + i * PG) == 0;
+        CHECK(zeros, "every page of it read through the mapping");
+        m[0] = 1;
+        m[(pages / 2) * PG] = 2;
+        m[(pages - 1) * PG] = 3;
+        unsigned char b3[3] = {0};
+        CHECK(pread(fd, &b3[0], 1, 0) == 1 && pread(fd, &b3[1], 1, (off_t)((pages / 2) * PG)) == 1 &&
+                  pread(fd, &b3[2], 1, (off_t)((pages - 1) * PG)) == 1 && b3[0] == 1 && b3[1] == 2 && b3[2] == 3,
+              "three stores through it are what read returns");
+        struct stat sb;
+        CHECK(munmap(m, big) == 0 && fsync(fd) == 0 && fstat(fd, &sb) == 0, "munmap, fsync, its size on disk");
+        // A file system may round what it allocates for a store up a good
+        // deal (ext4 does); the hole as a whole stays one.
+        long most = (long)(big / 512 / 8);
+        if (sb.st_blocks <= 0 || sb.st_blocks >= most) printf("lt_mm: three stored pages of %zu take %ld sectors\n", pages, (long)sb.st_blocks);
+        CHECK(sb.st_blocks > 0 && sb.st_blocks < most, "the three stored pages are on disk and the hole is still a hole");
+        close(fd);
+        CHECK(unlink("/ltmm.big") == 0, "remove the big file");
+    }
+
+    // Pages faulted in from the disk while another process keeps writing
+    // the file: every fault ends, with the file's bytes.
+    {
+        enum { BUSY_PAGES = 1024 };
+        int fd = open("/ltmm.busy", O_CREAT | O_RDWR | O_TRUNC, 0644);
+        CHECK(fd >= 0, "create a file to read under a writer");
+        unsigned char page[PG];
+        int wrote = 1;
+        for (int i = 0; i < BUSY_PAGES; i++) {
+            memset(page, i * 7 + 1, PG);
+            if (pwrite(fd, page, PG, (off_t)i * PG) != (ssize_t)PG) wrote = 0;
+        }
+        CHECK(wrote, "four megabytes written");
+        pid_t writer = fork();
+        CHECK(writer >= 0, "fork the writer");
+        if (writer == 0) {
+            // The byte page 0 has there already, over and over.
+            unsigned char one = 1;
+            for (;;) {
+                if (pwrite(fd, &one, 1, 0) != 1) _exit(1);
+            }
+        }
+        unsigned char *m = mmap(NULL, BUSY_PAGES * PG, PROT_READ, MAP_SHARED, fd, 0);
+        CHECK(m != MAP_FAILED, "map it shared");
+        int same = 1;
+        for (int i = 0; i < BUSY_PAGES; i++) {
+            if (*(volatile unsigned char *)(m + (size_t)i * PG + 5) != (unsigned char)(i * 7 + 1)) same = 0;
+        }
+        int st = 0;
+        CHECK(kill(writer, SIGKILL) == 0 && waitpid(writer, &st, 0) == writer && WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL,
+              "the writer wrote until it was killed");
+        CHECK(same, "pages faulted in under a steady writer are the file's");
+        CHECK(munmap(m, BUSY_PAGES * PG) == 0, "munmap it");
+        close(fd);
+        CHECK(unlink("/ltmm.busy") == 0, "remove that file");
+    }
+
     // mremap: shrink and grow in place, EFAULT where nothing is mapped.
     {
         unsigned char *m = map(NULL, 8 * PG, PROT_READ | PROT_WRITE, 0);
@@ -383,6 +672,84 @@ int main(void) {
         CHECK(call_faults(x) && call_faults(sh), "a call into a data page faults");
         CHECK(mprotect(x, PG, PROT_READ | PROT_EXEC) == 0 && !call_faults(x), "and returns once the page is executable");
         CHECK(munmap(x, PG) == 0 && munmap(sh, PG) == 0, "unmap after the call");
+    }
+
+    // Shared anonymous memory: a large mapping touched sparsely, the same
+    // pages in a child, munmap and mprotect on parts of it. Byte 0 of
+    // megabyte k holds k + 1.
+    {
+        const size_t M = 1UL << 20, len = 64 * M;
+        unsigned char *s = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+        CHECK(s != MAP_FAILED, "64 MB shared anon mmap");
+        int zero = 1;
+        for (size_t i = 0; i < len; i += M) {
+            if (s[i] != 0) zero = 0;
+            s[i] = (unsigned char)(i / M + 1);
+        }
+        CHECK(zero, "shared anon zero filled");
+        pid_t kid = fork();
+        CHECK(kid >= 0, "fork with a shared mapping");
+        if (kid == 0) {
+            for (size_t i = 0; i < len; i += M)
+                if (s[i] != (unsigned char)(i / M + 1)) _exit(1);
+            // A page the parent wrote, and two nobody touched yet.
+            s[0] = 0xAA, s[5 * PG] = 0xCC, s[len - PG] = 0xBB;
+            _exit(0);
+        }
+        int st = -1;
+        CHECK(waitpid(kid, &st, 0) == kid && WIFEXITED(st) && WEXITSTATUS(st) == 0, "the child reads the parent's shared pages");
+        CHECK(s[0] == 0xAA && s[5 * PG] == 0xCC && s[len - PG] == 0xBB, "and its writes reach the parent");
+
+        CHECK(munmap(s + 8 * M, 8 * M) == 0, "munmap the middle of a shared mapping");
+        CHECK(s[7 * M] == 8 && s[16 * M] == 17, "the pages on both sides stay");
+        CHECK(faults(s + 8 * M, 0) && faults(s + 16 * M - PG, 0), "the hole faults");
+        CHECK(mprotect(s + 32 * M, 4 * M, PROT_READ) == 0, "mprotect part of a shared mapping");
+        CHECK(s[32 * M] == 33 && faults(s + 32 * M, 1) && !faults(s + 36 * M, 1) && !faults(s + 32 * M - PG, 1),
+              "only that part is read-only");
+        // Dropped and faulted in again, each piece finds its own pages.
+        CHECK(madvise(s + 16 * M, 16 * M, MADV_DONTNEED) == 0 && madvise(s + 32 * M, 4 * M, MADV_DONTNEED) == 0 &&
+                  madvise(s + 36 * M, 28 * M, MADV_DONTNEED) == 0,
+              "MADV_DONTNEED on the pieces");
+        int same = 1;
+        for (size_t i = 16 * M; i < len; i += M)
+            if (s[i] != (unsigned char)(i / M + 1)) same = 0;
+        CHECK(same && s[len - PG] == 0xBB, "a shared page keeps its bytes through MADV_DONTNEED");
+        kid = fork();
+        CHECK(kid >= 0, "fork with the pieces");
+        if (kid == 0) {
+            if (s[16 * M] != 17 || s[40 * M] != 41 || s[len - PG] != 0xBB) _exit(1);
+            s[16 * M] = 0x99, s[40 * M + PG] = 0x22;
+            _exit(0);
+        }
+        CHECK(waitpid(kid, &st, 0) == kid && WIFEXITED(st) && WEXITSTATUS(st) == 0, "a child of the pieces sees the same pages");
+        CHECK(s[16 * M] == 0x99 && s[40 * M + PG] == 0x22, "and they are still shared");
+        CHECK(munmap(s, 4 * M) == 0 && s[4 * M] == 5 && faults(s, 0), "munmap the head of a shared mapping");
+        CHECK(munmap(s + 60 * M, 4 * M) == 0 && s[59 * M] == 60 && faults(s + 60 * M, 0), "and the tail");
+        CHECK(munmap(s, len) == 0 && faults(s + 4 * M, 0) && faults(s + 59 * M, 0), "unmap what is left of it");
+
+        // More shared mappings than a handful, each its own memory.
+        enum { N = 2000 };
+        static unsigned char *m[N];
+        int ok = 1;
+        for (int i = 0; i < N && ok; i++) {
+            m[i] = mmap(NULL, PG, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+            if (m[i] == MAP_FAILED)
+                ok = 0;
+            else
+                m[i][0] = (unsigned char)i, m[i][PG - 1] = (unsigned char)(i >> 8);
+        }
+        CHECK(ok, "2000 shared anon mappings");
+        for (int i = 0; i < N; i++)
+            if (m[i][0] != (unsigned char)i || m[i][PG - 1] != (unsigned char)(i >> 8)) ok = 0;
+        CHECK(ok, "each with its own page");
+        for (int i = 0; i < N; i++)
+            if (munmap(m[i], PG) != 0) ok = 0;
+        CHECK(ok, "and unmapped");
+
+        // Far more than there is memory for: refused.
+        errno = 0;
+        CHECK(mmap(NULL, 1UL << 45, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0) == MAP_FAILED && errno == ENOMEM,
+              "a 32 TB shared mapping is ENOMEM");
     }
 
     printf("lt_mm: PASS (%d checks)\n", check_no);

@@ -306,6 +306,9 @@ pub const PCB = struct {
     // Linux umask(): masks the permissions of the files and directories the
     // process creates.
     umask: u16 = 0o022,
+    // Linux /proc/<pid>/oom_score_adj, the lead's: weighs the process when
+    // memory runs out and one has to end; -1000 keeps it out of the choice.
+    oom_score_adj: i16 = 0, // (a)
     // The user address space's regions: VA ranges whose pages are allocated
     // (or read from a file, or shared) on first touch by the page-fault
     // handler — stack, sbrk heap, ELF segments, mmaps. Per process: threads
@@ -425,10 +428,15 @@ pub const PCB = struct {
     // Ticks between SIGALRMs once the first has fired (setitimer's
     // it_interval), 0 for a one-shot alarm.
     alarm_interval: u64 = 0, // (a)
-    // A Linux sleep a signal cut short with no handler to run: its monotonic
-    // deadline (0: none) and where the time left goes, for restart_syscall.
+    // A Linux wait a signal cut short with no handler to run, for
+    // restart_syscall: its monotonic deadline (0: none). A sleep: where the
+    // time left goes. A timed futex wait (restart_futex != 0): the word, the
+    // value it must hold, whether FUTEX_PRIVATE_FLAG was set.
     restart_until: u64 = 0,
     restart_rem: u64 = 0,
+    restart_futex: u64 = 0,
+    restart_futex_val: u32 = 0,
+    restart_futex_private: bool = false,
 
     // --- Job control (POSIX stop/cont) ----------------------------------
     // True while job-control-stopped (default action of SIGSTOP/SIGTSTP/
@@ -467,6 +475,20 @@ pub const PCB = struct {
     // killThreadGroup), before the pass over its threads: a clone that
     // sees it gives up, so no thread can slip in behind the pass.
     group_exiting: bool = false, // (a)
+    // Set on the lead while one of the group's threads is in execve's
+    // commit (lifecycle.execBegin): a second one waits, and is ended by it.
+    execing: bool = false, // (a)
+    // Set on the lead when the process is ended for its memory (the OOM
+    // policy): its unflushed MAP_SHARED file pages are dropped at teardown.
+    oom_ended: bool = false, // (a)
+    // Set on the lead by an execve from another thread: the lead's thread
+    // is gone and the program's main thread is a worker, whose end gives
+    // the process its exit status.
+    main_is_worker: bool = false, // (a)
+    // Set on the lead as the process's end begins to look at the process
+    // groups it held: of two that end together, each stores this before it
+    // looks, so one of them sees the other gone.
+    leaving: bool = false, // (a)
 
     // The number programs know this task by (pid_nr.zig): the slot for the
     // slot's first occupant, another for every later one. Linux programs
@@ -576,7 +598,20 @@ pub const PCB = struct {
     // the first schedule() after the count drops (see doomed()). Only the
     // task itself changes it, and never while off-CPU.
     nokill: u16 = 0, // (a) own-task writes; killers and pickNext read
-    nokill_seq: u32 = 0, // (a) own-task writes; bumped by each noKillEnter
+    nokill_seq: u32 = 0, // (a) own-task writes; bumped by each noKillEnter and callEnter
+    // Inside a Linux call. A kill waits for the call to return, so what it
+    // holds (file references, kernel buffers) goes back the usual way; the
+    // kill ends a wait the call sleeps in (signals.interrupts). Unlike
+    // nokill it does not stand for a held lock: faults are served.
+    in_call: bool = false, // (a) own-task writes; killers and pickNext read
+    // Seconds a killed task has stayed inside its call (lifecycle.nudgeKilled).
+    kill_nudges: u8 = 0, // the BSP's timer
+    // On a lead: the group ends by exit_group, so whichever member is the
+    // last leaves MAP_SHARED dirty pages for pgflushd.
+    exits_clean: bool = false, // (a)
+    // The status the task ends with once it is killed: the first killer's,
+    // set before exit_requested, with bit 32 on. 0: nobody killed it.
+    kill_status: u64 = 0, // (a)
     // Sleeping locks this task holds: every Mutex, RwMutex side and the ext2
     // mount lock. A kernel-mode fault on a user page that is not present is
     // resolved only at zero (fault.handleKernelUserFault).
@@ -692,12 +727,38 @@ pub inline fn leader(pcb: *PCB) *PCB {
 
 /// `pid` is being killed and may be torn down now: not dispatched again,
 /// and dies at its next schedule(). A killed task inside a no-kill section
-/// (PCB.nokill) runs on until it leaves it; one already in its teardown
-/// (teardown_marked) runs on to finish it, sleeps there included.
+/// (PCB.nokill) or a Linux call (PCB.in_call) runs on until it leaves it;
+/// one already in its teardown (teardown_marked) runs on to finish it,
+/// sleeps there included.
 pub inline fn doomed(pid: usize) bool {
     return @atomicLoad(bool, &procs[pid].exit_requested, .acquire) and
         @atomicLoad(u16, &procs[pid].nokill, .acquire) == 0 and
+        !@atomicLoad(bool, &procs[pid].in_call, .acquire) and
         !@atomicLoad(bool, &procs[pid].teardown_marked, .acquire);
+}
+
+/// Enter / leave a Linux call (PCB.in_call). Entering bumps nokill_seq, as
+/// a no-kill section does.
+pub fn callEnter(pcb: *PCB) void {
+    @atomicStore(bool, &pcb.in_call, true, .release);
+    @atomicStore(u32, &pcb.nokill_seq, pcb.nokill_seq +% 1, .release);
+}
+
+/// The store is a full barrier: the caller looks at exit_requested next,
+/// and a killer that set it looks at in_call. One of the two sees the other.
+pub fn callLeave(pcb: *PCB) void {
+    @atomicStore(bool, &pcb.in_call, false, .seq_cst);
+}
+
+/// A killer's `status` for `pcb`, kept only if it is the first.
+pub fn offerKillStatus(pcb: *PCB, status: u32) void {
+    _ = @cmpxchgStrong(u64, &pcb.kill_status, 0, (1 << 32) | @as(u64, status), .acq_rel, .acquire);
+}
+
+/// The status a killed task ends with: the first killer's.
+pub fn killStatus(pcb: *const PCB) u32 {
+    const k = @atomicLoad(u64, &pcb.kill_status, .acquire);
+    return if (k != 0) @truncate(k) else pcb.exit_status;
 }
 
 /// Enter / leave a section a kill must not cut short (PCB.nokill). Entering
@@ -747,6 +808,10 @@ pub const PROT_RWX: u8 = PROT_READ | PROT_WRITE | PROT_EXEC;
 /// LazyRegion.flags: plain anonymous memory that may join an adjacent region
 /// with the same prot (Linux anonymous mmap). Unset, a region stays its own.
 pub const REGION_MERGEABLE: u8 = 1;
+/// LazyRegion.flags: a shared file mapping made from a descriptor that
+/// was not open for writing. mprotect may not give it PROT_WRITE (EACCES,
+/// as on Linux): its stores would go into the file.
+pub const REGION_NO_WRITE: u8 = 2;
 
 /// PCB.foreign_as_lock: no lock outside the task's own group.
 pub const NO_FOREIGN_LOCK: u8 = 0xFF;
@@ -778,18 +843,21 @@ pub const LazyRegion = struct {
     // mprotect explicitly set tighter prots (PROT_RW = no exec; PROT_READ
     // alone = RO + NX; etc.) and the page-fault handler honors them.
     prot: u8 = PROT_RWX,
-    // Shared-anon region id (POSIX MAP_SHARED|MAP_ANONYMOUS). When not
-    // SHM_INVALID, the page-fault handler maps `shm.frameAt(shm_id, page_idx)`
-    // instead of fresh-allocating a private zero page. fork() bumps the
-    // region's refcount; munmap / teardown decrements.
+    // Shared anonymous memory (mm/shm.zig): when not SHM_INVALID, a page of
+    // the region is page `shm_off + (va - start) / 4096` of that object, and
+    // the region holds one reference to it. fork and a split (tailFrom) take
+    // one more for the new piece; munmap and teardown drop the piece's.
     shm_id: u32 = 0xFFFFFFFF,
+    shm_off: u32 = 0, // pages
     // File-backed-via-page-cache region (currently ext2 file mmap). When
     // cache_inode != 0 the page-fault handler serves each page from the unified
     // page cache (mm/page_cache.zig) keyed on (inode, cache_off + (va - start)),
     // mapped read-only + COW: reads SHARE one physical frame across mappers; a
     // write COW-diverges into a private copy. No eager buffer (buf_owned stays
-    // false), so teardown is the ordinary per-PTE refcount drop. Inherited by
-    // value on fork; cleared on munmap of the region.
+    // false), so teardown is the ordinary per-PTE refcount drop. The region
+    // holds the inode (ext2/held.zig), so an unlink leaves the file in place
+    // under it: addRegion, fork and a split take a hold (holdBacking),
+    // munmap and teardown drop the piece's (dropBacking).
     cache_inode: u32 = 0, // 0 = not cache-backed
     cache_off: u64 = 0, // file byte offset corresponding to `start`
     // MAP_SHARED file mapping (Slice 3c). When cache_inode != 0 AND this is set,
@@ -802,28 +870,53 @@ pub const LazyRegion = struct {
     // copying it. Ignored when cache_inode == 0.
     cache_shared: bool = false,
 
-    /// A region whose pieces can't be split apart: one buffer or shm
-    /// reference backs the whole range, and the pieces would have to share
-    /// it. munmap and mprotect take such a region whole or not at all.
+    /// A region whose pieces can't be split apart: one buffer backs the
+    /// whole range, and the pieces would have to share it. munmap and
+    /// mprotect take such a region whole or not at all.
     pub fn unsplittable(r: LazyRegion) bool {
-        return r.buf_owned or r.shm_id != shm.SHM_INVALID;
+        return r.buf_owned;
     }
 
     /// `r` from `at` on (vma.Set's split). `src_va_base` is an absolute VA,
-    /// so only the start-relative file offset moves.
+    /// so only the start-relative offsets move. The piece comes with what a
+    /// region holds, of its own: a reference to the shm object, a hold on
+    /// the file's inode.
     pub fn tailFrom(r: LazyRegion, at: usize) LazyRegion {
         std.debug.assert(!r.unsplittable() and at > r.start and at < r.end);
         var t = r;
         t.cache_off += at - r.start;
         t.start = at;
+        if (r.shm_id != shm.SHM_INVALID) {
+            t.shm_off += @intCast((at - r.start) / 0x1000);
+            // `r` holds a reference, so the object is live; the count is
+            // 32 bits against at most 128 x 65530 pieces.
+            if (!shm.acquire(r.shm_id)) @panic("shm: a region names no live object");
+        }
+        r.holdBacking();
         return t;
     }
 
+    /// One more region names `r`'s file (a split, a fork): one more hold
+    /// on the inode. `r` holds it, so there is nothing to allocate.
+    pub fn holdBacking(r: LazyRegion) void {
+        if (r.cache_inode == 0) return;
+        if (!@import("../fs/ext2/ext2.zig").holdAgain(r.cache_inode)) @panic("mm: a region's inode was not held");
+    }
+
+    /// `r` is gone from an address space: its hold on the file's inode
+    /// goes. Under the as_lock; an inode this frees waits for
+    /// ext2.freeQueued.
+    pub fn dropBacking(r: LazyRegion) void {
+        if (r.cache_inode != 0) @import("../fs/ext2/ext2.zig").releaseLater(r.cache_inode);
+    }
+
+    /// Two pieces of one shm object stay two: each holds a reference.
     pub fn canMerge(lo: LazyRegion, hi: LazyRegion) bool {
         return lo.flags & REGION_MERGEABLE != 0 and hi.flags & REGION_MERGEABLE != 0 and
             lo.prot == hi.prot and
             lo.source == null and hi.source == null and
             lo.cache_inode == 0 and hi.cache_inode == 0 and
+            lo.shm_id == shm.SHM_INVALID and hi.shm_id == shm.SHM_INVALID and
             !lo.unsplittable() and !hi.unsplittable();
     }
 };
@@ -1098,9 +1191,12 @@ pub fn getPCB(pid: usize) *PCB {
 /// harness scratch-file fence is the belt to this suspenders). (2026-06-04)
 pub fn isTextBusy(inum: u32) bool {
     if (inum == 0) return false;
-    for (&procs) |*p| {
+    for (&procs, 0..) |*p, i| {
         const st = p.state;
-        if (st == .unused or st == .loading or st == .zombie) continue;
+        if (st == .unused or st == .loading) continue;
+        // A lead whose thread ended while other threads of it live (a main
+        // thread that exited first, an execve from a thread) still runs it.
+        if (st == .zombie and !pinnedLead(i)) continue;
         if (p.text_inum == inum) return true;
     }
     return false;
@@ -1234,8 +1330,10 @@ pub const killProcessWithStatus = @import("lifecycle.zig").killProcessWithStatus
 pub const killProcess = @import("lifecycle.zig").killProcess;
 pub const abortLoading = @import("lifecycle.zig").abortLoading;
 pub const killThreadGroup = @import("lifecycle.zig").killThreadGroup;
+pub const pinnedLead = @import("lifecycle.zig").pinnedLead;
 pub const reparentChildren = @import("lifecycle.zig").reparentChildren;
 pub const maybeReapZombies = @import("lifecycle.zig").maybeReapZombies;
+pub const nudgeKilled = @import("lifecycle.zig").nudgeKilled;
 pub const reapStaleZombies = @import("lifecycle.zig").reapStaleZombies;
 pub const destroyCurrentWithStatus = @import("lifecycle.zig").destroyCurrentWithStatus;
 pub const destroyCurrentGraceful = @import("lifecycle.zig").destroyCurrentGraceful;

@@ -273,7 +273,7 @@ pub fn sigaltstack(ss_va: u64, old_va: u64, user_rsp: u64) u64 {
 /// (signals' afterPost): the wait is a poll of nothing.
 fn sleepUntilSignal(pcb: *PCB) void {
     defer @atomicStore(u64, &pcb.wake_tick, 0, .release);
-    while (signals.deliverable(pcb) == 0) sched.blockOnDeadline(.poll, 0, 0);
+    while (!signals.interrupts(pcb)) sched.blockOnDeadline(.poll, 0, 0);
 }
 
 /// pause(): until a handler has run (then EINTR) or a signal ends the
@@ -334,6 +334,8 @@ pub fn rtSigtimedwait(set_va: u64, info_va: u64, timeout_va: u64, size: u64) u64
         @atomicStore(u64, &pcb.wake_tick, 0, .release);
     }
     while (true) {
+        // Killed: it takes no signal of the process with it.
+        if (signals.dying(pcb)) return err(EINTR);
         if (signals.takeFrom(pcb, set)) |t| {
             if (info_va != 0) {
                 const si = siginfoOf(t, .{});

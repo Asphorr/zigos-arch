@@ -3,13 +3,18 @@
 // and mapped by another is the same frame.
 //
 // ============================== STRUCTURE ====================================
-// A pool of entries, sized from RAM at the first init() and taken from PMM,
-// indexed two ways: a chained hash by (file_id, page_off) for lookups, and a
-// chained hash by file_id for the per-file walks (truncate, unlink). A page
-// can always be added while the pool has a free entry or a clean cache-only
-// page to evict, however the keys hash. A MAP_SHARED mapping depends on that:
-// its writes reach the file only through a cached frame, so its fault fails
-// rather than map a frame the cache does not track.
+// A pool of entries, one for every frame free at the first init() and taken
+// from PMM, indexed two ways: a chained hash by (file_id, page_off) for
+// lookups, and a chained hash by file_id for the per-file walks (truncate,
+// unlink). A page that has a frame can always be added, however the keys
+// hash. A MAP_SHARED mapping depends on that: its writes reach the file only
+// through a cached frame, so its fault fails rather than map a frame the
+// cache does not track.
+//
+// The cache keeps `limit` pages of its own accord (a quarter of the pool):
+// at the limit a new page takes the place of an evictable one. Mapped and
+// dirty pages are not evictable; they are their mappers' memory, as much as
+// there is, and go past the limit.
 //
 // ============================ REFCOUNT DISCIPLINE ============================
 // Leans entirely on pmm's per-frame u8 refcount (pmm.acquireFrame/releaseFrame/
@@ -44,18 +49,24 @@ const Guarded = @import("../util/guarded.zig").Guarded;
 
 pub const PAGE_SIZE: usize = 4096;
 
-// Pool size: a quarter of the frames free at boot, within these bounds — the
-// most RAM cached pages can hold. Only a page fault that runs out of frames
-// reclaims them, so the cache must leave room for everything else (large
-// contiguous allocations included). An entry is 48 bytes: about 0.3% of RAM.
+// Pool size: the frames free at boot, within these bounds. An entry is 48
+// bytes: about 1.3% of RAM with the head tables.
 const MIN_ENTRIES: u32 = 2048;
 const MAX_ENTRIES: u32 = 1 << 20;
+/// The share of the pool evictable pages may fill (`limit`). Only a page
+/// fault that runs out of frames reclaims them, so they must leave room for
+/// everything else (large contiguous allocations included).
+const KEEP_DIVISOR: u32 = 4;
+/// Inserts that skip the eviction sweep after one found nothing to evict:
+/// under a mapping larger than the limit every sweep would come up empty.
+const EVICT_HOLDOFF: u32 = 64;
 
 /// Entries one lock hold may walk in a sweep (eviction, dirty scan, reclaim).
 const SCAN_CHUNK: u32 = 4096;
 /// A range of more pages than this is handled by walking the file's pages
 /// instead of probing every offset.
 const PROBE_MAX: u64 = 256;
+const GEN_SLOTS: usize = 256;
 /// Pages one reclaim call frees at least, so memory pressure doesn't come
 /// back to it on every fault.
 const RECLAIM_BATCH: u32 = 256;
@@ -95,6 +106,9 @@ const Entry = struct {
     /// `sum` is the page's content checksum from when it was published;
     /// cleared once the page may legitimately change (markDirty).
     summed: bool = false,
+    /// A dirty page only: `sum` is the checksum of the bytes its last
+    /// writeback wrote (noteFlushed).
+    flushed: bool = false,
     sum: u64 = 0,
 };
 
@@ -103,7 +117,11 @@ const Entry = struct {
 pub const VERIFY = true;
 
 fn pageSum(frame: Phys) u64 {
-    const q = frame.toVirt().ptr([*]const u64);
+    return sumWords(frame.toVirt().ptr([*]const u64));
+}
+
+/// The checksum of the page of 512 words at `q`.
+fn sumWords(q: [*]const u64) u64 {
     var a: u64 = 0x9E3779B97F4A7C15;
     var b: u64 = 0;
     for (0..512) |i| {
@@ -142,8 +160,15 @@ const CacheState = struct {
     /// No entry at or above this index has been used since init().
     high: u32 = 0,
     resident: u32 = 0,
-    /// Most pages resident at once: entries.len, less in the self-test.
+    /// Pages the cache keeps of its own accord (see the header).
     limit: u32 = 0,
+    /// Resident pages that were mapped or dirty at the last count
+    /// (countUnevictable): not the cache's own, so `limit` is on top of them.
+    unevictable: u32 = 0,
+    /// False while a self-test has `limit` lowered: no count then.
+    counting: bool = true,
+    /// Inserts left that skip the eviction sweep (EVICT_HOLDOFF).
+    evict_holdoff: u32 = 0,
     registered: bool = false,
 
     // Diagnostic counters, read out via statsSnapshot.
@@ -157,6 +182,14 @@ const CacheState = struct {
     corrupt_seen: u64 = 0,
     corrupt: [8]Corrupt = undefined,
     n_corrupt: u32 = 0,
+    /// Per file (hashed): moves when the file's bytes on disk change. A
+    /// page read from disk before the move is not published after it
+    /// (fillBegin, insertFilled).
+    gens: [GEN_SLOTS]u32 = [_]u32{0} ** GEN_SLOTS,
+
+    fn gen(self: *CacheState, file_id: u64) *u32 {
+        return &self.gens[mix(file_id) & (GEN_SLOTS - 1)];
+    }
 
     /// Report a clean page whose bytes no longer match its checksum, once.
     fn verify(self: *CacheState, e: *Entry) void {
@@ -195,11 +228,26 @@ const CacheState = struct {
         return null;
     }
 
-    /// A free entry's index: off the free list, or by evicting when `limit`
-    /// pages are resident. Null if nothing in reach can go.
+    /// Whether the cache holds its share of pages, or more.
+    fn full(self: *const CacheState) bool {
+        return self.resident >= self.limit +| self.unevictable;
+    }
+
+    /// A free entry's index. With the cache full an evictable page goes
+    /// first, two while it is over, so it comes back down; with none in
+    /// reach the page is one more over. Null when the pool is spent.
     fn takeFree(self: *CacheState) ?u32 {
-        if (self.resident >= self.limit and !self.evictOne()) return null;
+        if (self.full()) {
+            if (self.evict_holdoff > 0) {
+                self.evict_holdoff -= 1;
+            } else if (!self.evictOne()) {
+                self.evict_holdoff = EVICT_HOLDOFF;
+            } else if (self.full()) {
+                _ = self.evictOne();
+            }
+        }
         const idx = self.free_head;
+        if (idx == NIL) return null;
         self.free_head = self.entries[idx].next;
         if (idx >= self.high) self.high = idx + 1;
         return idx;
@@ -307,7 +355,7 @@ fn ceilPowerOfTwo(n: u32) u32 {
 /// Take the pool and head tables from PMM. Boot-time, before any page is
 /// cached; a smaller pool if RAM is that fragmented.
 fn allocTables(s: *CacheState) void {
-    var want: u32 = @min(@max(pmm.freeFrameCount() / 4, MIN_ENTRIES), MAX_ENTRIES);
+    var want: u32 = @min(@max(pmm.freeFrameCount(), MIN_ENTRIES), MAX_ENTRIES);
     while (true) : (want /= 2) {
         const keys = ceilPowerOfTwo(want);
         const files = @max(keys / 16, 64);
@@ -346,7 +394,10 @@ pub fn init() void {
     s.hand = 0;
     s.high = 0;
     s.resident = 0;
-    s.limit = @intCast(s.entries.len);
+    s.limit = @intCast(@min(@max(s.entries.len / KEEP_DIVISOR, MIN_ENTRIES), s.entries.len));
+    s.unevictable = 0;
+    s.counting = true;
+    s.evict_holdoff = 0;
     s.hits = 0;
     s.misses = 0;
     s.inserts = 0;
@@ -362,12 +413,38 @@ pub fn init() void {
     }
 }
 
-/// SELF-TEST ONLY. Let at most `pages` be resident, so a test reaches
-/// eviction with a handful of pages. The next init() lifts it.
+/// SELF-TEST ONLY. Lower `limit` to `pages`, so a test reaches eviction
+/// with a handful of them. The next init() lifts it.
 pub fn limitForTest(pages: u32) void {
     const h = cache.acquire();
     defer h.release();
     h.ptr.limit = @min(pages, @as(u32, @intCast(h.ptr.entries.len)));
+    h.ptr.unevictable = 0;
+    h.ptr.counting = false;
+}
+
+/// Count the resident pages that are mapped or dirty, which `limit` does
+/// not cover. pgflushd calls it each pass. Between counts a mapping that
+/// grows evicts from the cache's own share, and one that went leaves its
+/// pages over it; the next count sets both right.
+pub fn countUnevictable() void {
+    var idx: u32 = 0;
+    var n: u32 = 0;
+    while (true) {
+        const h = cache.acquire();
+        defer h.release();
+        const s = h.ptr;
+        if (!s.counting) return;
+        const stop = @min(s.high, idx +| SCAN_CHUNK);
+        while (idx < stop) : (idx += 1) {
+            const e = &s.entries[idx];
+            if (e.valid and !CacheState.evictable(e)) n += 1;
+        }
+        if (idx >= s.high) {
+            s.unevictable = n;
+            return;
+        }
+    }
 }
 
 /// SELF-TEST ONLY. Find a resident page WITHOUT pinning it: the frame is
@@ -446,7 +523,18 @@ pub const Inserted = struct {
     /// Not cached because the resident page is at PIN_SATURATION: freeing
     /// memory will not change that.
     saturated: bool = false,
+    /// Not cached because the file changed on disk while the page was
+    /// read: the frame may hold the bytes from before.
+    stale: bool = false,
 };
+
+/// The file's change count, taken before a page of it is read from disk for
+/// insertFilled.
+pub fn fillBegin(file_id: u64) u32 {
+    const h = cache.acquire();
+    defer h.release();
+    return h.ptr.gen(file_id).*;
+}
 
 /// Publish a caller-filled private frame as (file_id, page_off). The caller
 /// allocates the frame, fills it from disk with NO lock held (so nobody can
@@ -457,10 +545,11 @@ pub const Inserted = struct {
 ///   - published — the frame is cached (refcount 2 = cache + caller).
 ///   - lost the race — another CPU cached this page meanwhile; the input
 ///     frame is dropped and the resident one returned, with a reference.
-///   - not cached — no entry could be had, or the resident page is at
-///     PIN_SATURATION; the input frame stays the caller's alone. Fine for a
-///     read or a private mapping, not for a shared one (see the header).
-pub fn insertFilled(file_id: u64, page_off: u64, frame: Phys) Inserted {
+///   - not cached — no entry could be had, the resident page is at
+///     PIN_SATURATION, or the file changed since `gen` (fillBegin) was
+///     taken; the input frame stays the caller's alone. Fine for a read or
+///     a private mapping, not for a shared one (see the header).
+pub fn insertFilled(file_id: u64, page_off: u64, frame: Phys, gen: u32) Inserted {
     const h = cache.acquire();
     defer h.release();
 
@@ -475,6 +564,7 @@ pub fn insertFilled(file_id: u64, page_off: u64, frame: Phys) Inserted {
         h.ptr.full_skips += 1;
         return .{ .frame = frame, .cached = false, .saturated = true };
     }
+    if (h.ptr.gen(file_id).* != gen) return .{ .frame = frame, .cached = false, .stale = true };
 
     const e = h.ptr.insert(file_id, page_off, frame) orelse {
         h.ptr.full_skips += 1;
@@ -493,6 +583,7 @@ pub fn insertFilled(file_id: u64, page_off: u64, frame: Phys) Inserted {
 pub fn invalidate(file_id: u64, page_off: u64) bool {
     const h = cache.acquire();
     defer h.release();
+    h.ptr.gen(file_id).* +%= 1;
     const e = h.ptr.find(file_id, page_off) orelse return false;
     pmm.releaseFrame(e.frame);
     h.ptr.remove(e);
@@ -549,18 +640,115 @@ pub fn invalidateRange(file_id: u64, start_off: u64, len: u64) u32 {
     var drop: Drop = .{};
     const h = cache.acquire();
     defer h.release();
+    h.ptr.gen(file_id).* +%= 1;
     forRange(h.ptr, file_id, span.first, span.end, &drop);
     return drop.dropped;
 }
 
-/// Drop EVERY cached page of `file_id`, dirty ones too: the file is being
-/// truncated or its inode freed. The freed-inode case is a SECURITY boundary:
-/// a reused inode must not serve the deleted file's pages. Returns pages
-/// dropped.
+/// A write put `bytes` on disk at byte `start_off` of `file_id`, and the
+/// caller still holds what orders the file's writes. The resident pages
+/// they overlap take them too: reads and mappings see them, and the
+/// writeback of a dirty page cannot bring the old bytes back. `bytes` is
+/// kernel memory.
+pub fn writeThrough(file_id: u64, start_off: u64, bytes: []const u8) void {
+    var done: usize = 0;
+    while (done < bytes.len) {
+        const cur = start_off + @as(u64, done);
+        const page_off = cur & ~@as(u64, PAGE_SIZE - 1);
+        const in_page: usize = @intCast(cur - page_off);
+        const n = @min(PAGE_SIZE - in_page, bytes.len - done);
+        {
+            // One page per hold: the copy is the long part.
+            const h = cache.acquire();
+            defer h.release();
+            if (done == 0) h.ptr.gen(file_id).* +%= 1;
+            if (h.ptr.find(file_id, page_off)) |e| {
+                @memcpy(e.frame.toVirt().ptr([*]u8)[in_page..][0..n], bytes[done..][0..n]);
+                if (VERIFY and e.summed) e.sum = pageSum(e.frame);
+                // The disk no longer holds what the last writeback of this
+                // page wrote.
+                e.flushed = false;
+            }
+        }
+        done += n;
+    }
+}
+
+/// The file ends at byte `size` now, or grows from there to `end`: what is
+/// cached of [size, end) is not the file's bytes and reads as zeros, as the
+/// blocks on disk do. A page wholly in it that nothing else holds leaves the
+/// cache. One a mapping holds stays, zeroed, dirty flag as it was: the
+/// mapping, read() and write() go on sharing that frame when the file grows
+/// over it again. The page `size` falls in is zeroed from there on.
+///
+/// The caller holds what orders the file's writes and fills (the mount
+/// lock), so no page of the file enters the cache meanwhile: the lock here
+/// is let go between batches of CUT_BATCH pages zeroed, and a walk of many
+/// pages goes over the pool by index, which that does not disturb.
+pub fn cutFrom(file_id: u64, size: u64, end: u64) void {
+    const mask: u64 = PAGE_SIZE - 1;
+    const first = size & ~mask;
+    const last = (end +| mask) & ~mask;
+    {
+        const h = cache.acquire();
+        defer h.release();
+        h.ptr.gen(file_id).* +%= 1;
+    }
+    if ((last - first) / PAGE_SIZE <= PROBE_MAX) {
+        var off = first;
+        while (off < last) {
+            const h = cache.acquire();
+            defer h.release();
+            var zeroed: u32 = 0;
+            while (off < last and zeroed < CUT_BATCH) : (off += PAGE_SIZE) {
+                if (h.ptr.find(file_id, off)) |e| zeroed += @intFromBool(cutPage(h.ptr, e, size));
+            }
+        }
+        return;
+    }
+    var idx: u32 = 0;
+    while (true) {
+        const h = cache.acquire();
+        defer h.release();
+        const s = h.ptr;
+        if (idx >= s.high) return;
+        const stop = @min(s.high, idx +| SCAN_CHUNK);
+        var zeroed: u32 = 0;
+        while (idx < stop and zeroed < CUT_BATCH) : (idx += 1) {
+            const e = &s.entries[idx];
+            if (!e.valid or e.file_id != file_id or e.page_off < first or e.page_off >= last) continue;
+            zeroed += @intFromBool(cutPage(s, e, size));
+        }
+    }
+}
+
+/// Pages cutFrom zeroes in one hold of the cache lock.
+const CUT_BATCH: u32 = 64;
+
+/// cutFrom for one resident page of the range. True if it stays, zeroed.
+fn cutPage(s: *CacheState, e: *Entry, size: u64) bool {
+    const from: usize = if (e.page_off >= size) 0 else @intCast(size - e.page_off);
+    if (from == 0 and pmm.frameRefCount(e.frame) == 1) {
+        pmm.releaseFrame(e.frame);
+        s.remove(e);
+        return false;
+    }
+    @memset(e.frame.toVirt().ptr([*]u8)[from..PAGE_SIZE], 0);
+    if (VERIFY and e.summed) e.sum = pageSum(e.frame);
+    // Its blocks past the cut are gone from the disk, whatever a writeback
+    // had put there.
+    e.flushed = false;
+    return true;
+}
+
+/// Drop EVERY cached page of `file_id`, dirty ones too: its inode is being
+/// freed. A SECURITY boundary: a reused inode must not serve the deleted
+/// file's pages. Returns pages dropped.
 pub fn invalidateFile(file_id: u64) u32 {
     const h = cache.acquire();
     defer h.release();
     const s = h.ptr;
+    s.gen(file_id).* +%= 1;
     var dropped: u32 = 0;
     var i = s.fileHead(file_id).*;
     while (i != NIL) {
@@ -580,8 +768,10 @@ pub fn invalidateFile(file_id: u64) u32 {
 // pages back and, once no writable mapper remains, clear the flag. The cache
 // frame is the single source of truth — every writable mapper writes the SAME
 // frame — so a flush can persist the latest bytes at any time. Marking is
-// coarse (a page faulted writable counts as dirty even if only read): the
-// cost is re-persisting unchanged pages, never data loss.
+// coarse (a page faulted writable counts as dirty even if only read, and
+// stays dirty while it is mapped): never data loss, and the flushes that
+// come round to a page still mapped write it only when its bytes differ
+// from the last ones written (sumOf, flushedAs, noteFlushed).
 
 /// Mark a resident page dirty, right after it was mapped writable for a
 /// shared mapping.
@@ -589,9 +779,77 @@ pub fn markDirty(file_id: u64, page_off: u64) void {
     const h = cache.acquire();
     defer h.release();
     if (h.ptr.find(file_id, page_off)) |e| {
+        if (!e.dirty) e.flushed = false;
         e.dirty = true;
         e.summed = false;
     }
+}
+
+/// markDirty for every resident page of [start_off, start_off+len): a
+/// shared mapping of them was just made writable (mprotect), its pages with
+/// no fault to mark them one by one. Pages of the range that some other
+/// mapping holds are marked too: a writeback more, never a loss.
+pub fn markDirtyRange(file_id: u64, start_off: u64, len: u64) void {
+    if (len == 0) return;
+    const span = pageSpan(start_off, len);
+    const Mark = struct {
+        fn visit(_: *@This(), _: *CacheState, e: *Entry) void {
+            if (!e.dirty) e.flushed = false;
+            e.dirty = true;
+            e.summed = false;
+        }
+    };
+    var mark: Mark = .{};
+    const h = cache.acquire();
+    defer h.release();
+    forRange(h.ptr, file_id, span.first, span.end, &mark);
+}
+
+/// The checksum a flush compares a dirty page's bytes by. The caller holds
+/// a reference on `frame`.
+pub fn sumOf(frame: Phys) u64 {
+    return pageSum(frame);
+}
+
+/// The same checksum, of a copy of a page.
+pub fn sumOfCopy(page: *align(8) const [PAGE_SIZE]u8) u64 {
+    return sumWords(@ptrCast(page));
+}
+
+/// Clear the dirty flag of (file_id, page_off) iff it is still `frame`,
+/// nothing but the cache holds it, and it holds the bytes of checksum `sum`
+/// — the ones a writeback just put on disk. With no mapper left the bytes
+/// cannot change under the comparison, so a store that came after the copy
+/// was taken (from a mapping that is gone since) keeps the page dirty. True
+/// if cleared.
+pub fn clearDirtyIfWritten(file_id: u64, page_off: u64, frame: Phys, sum: u64) bool {
+    const h = cache.acquire();
+    defer h.release();
+    const e = h.ptr.find(file_id, page_off) orelse return false;
+    if (e.frame != frame or !e.dirty or pmm.frameRefCount(e.frame) != 1) return false;
+    if (pageSum(e.frame) != sum) return false;
+    e.dirty = false;
+    e.flushed = false;
+    return true;
+}
+
+/// Whether `frame` is still the dirty page (file_id, page_off) and `sum`,
+/// the checksum of its bytes now, is that of the bytes last written back.
+pub fn flushedAs(file_id: u64, page_off: u64, frame: Phys, sum: u64) bool {
+    const h = cache.acquire();
+    defer h.release();
+    const e = h.ptr.find(file_id, page_off) orelse return false;
+    return e.frame == frame and e.dirty and e.flushed and e.sum == sum;
+}
+
+/// A writeback wrote `frame`'s bytes, of checksum `sum`, to the file.
+pub fn noteFlushed(file_id: u64, page_off: u64, frame: Phys, sum: u64) void {
+    const h = cache.acquire();
+    defer h.release();
+    const e = h.ptr.find(file_id, page_off) orelse return;
+    if (e.frame != frame or !e.dirty) return;
+    e.sum = sum;
+    e.flushed = true;
 }
 
 pub const DirtyPage = struct {
@@ -697,6 +955,7 @@ pub fn clearDirtyIfCacheOnly(file_id: u64, page_off: u64) bool {
     if (h.ptr.find(file_id, page_off)) |e| {
         if (e.dirty and pmm.frameRefCount(e.frame) == 1) {
             e.dirty = false;
+            e.flushed = false;
             return true;
         }
     }
@@ -705,9 +964,8 @@ pub fn clearDirtyIfCacheOnly(file_id: u64, page_off: u64) bool {
 
 /// Whether `frame` is still what the cache holds for (file_id, page_off).
 /// For a writeback that pinned the frame earlier: asked under the
-/// filesystem's lock, yes means the file was neither truncated nor freed
-/// (and its inode handed to another file) in between — both drop the page
-/// under that lock.
+/// filesystem's lock, yes means the inode was not freed (and handed to
+/// another file) in between — that drops the page under that lock.
 pub fn holds(file_id: u64, page_off: u64, frame: Phys) bool {
     const h = cache.acquire();
     defer h.release();
@@ -743,6 +1001,7 @@ pub fn clearDirtyRangeCacheOnly(file_id: u64, start_off: u64, len: u64) u32 {
         fn visit(self: *@This(), _: *CacheState, e: *Entry) void {
             if (e.dirty and pmm.frameRefCount(e.frame) == 1) {
                 e.dirty = false;
+                e.flushed = false;
                 self.cleared += 1;
             }
         }

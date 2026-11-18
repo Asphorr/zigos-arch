@@ -22,6 +22,7 @@ const memmap = @import("../../mm/memmap.zig");
 const shm = @import("../../mm/shm.zig");
 const vfs = @import("../../fs/vfs.zig");
 const devfs = @import("../../fs/devfs.zig");
+const ext2 = @import("../../fs/ext2/ext2.zig");
 const ext2_inode = @import("../../fs/ext2/inode.zig");
 const tlb = @import("../mmu/tlb.zig");
 const config = @import("../../config.zig");
@@ -105,7 +106,7 @@ const Release = struct {
 
     pub fn removed(self: *Release, r: LazyRegion) void {
         _ = vmm.unmapUserRange(self.pd, r.start, r.end, &self.rc);
-        if (r.unsplittable()) {
+        if (r.buf_owned or r.shm_id != shm.SHM_INVALID) {
             // Its buffer or shm pages may go with this reference: no CPU
             // may still reach them, nor anything collected before them.
             tlb.shootdownRange(self.owner.pcid, self.lo, (r.end - self.lo) / PAGE);
@@ -119,16 +120,20 @@ const Release = struct {
             self.flush[self.n_flush] = r.cache_inode;
             self.n_flush += 1;
         }
+        r.dropBacking();
         if (r.start == self.owner.heap_start) self.owner.heap_start = 0;
     }
 
+    /// What the removal left to do once the as_lock is released: the
+    /// shared file pages written back, the inodes it let go of freed.
     fn writeBack(self: *const Release) void {
         for (self.flush[0..self.n_flush]) |inum| _ = vfs.syncCacheFile(inum, true);
+        ext2.freeQueued();
     }
 };
 
-/// A region whose whole range shares one buffer or shm reference can only
-/// be taken whole: false if [start, end) cuts through one.
+/// A region whose whole range shares one buffer can only be taken whole:
+/// true if [start, end) cuts through one.
 fn splitsUnsplittable(owner: *process.PCB, start: u64, end: u64) bool {
     var it = owner.regions.atOrAbove(start);
     while (it) |r| : (it = owner.regions.atOrAbove(r.end)) {
@@ -166,12 +171,13 @@ pub fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, off: u64) u64 {
     var region: LazyRegion = .{ .prot = p };
     // Memory no file backs: anonymous, or /dev/zero, which maps the same.
     var zeroed = anon;
-    if (!anon) {
-        // The fd table is the group's: the lead's. The mapping keeps the
-        // inode, not the file, so the reference ends with this block.
-        const file = @import("../../fs/file.zig");
-        const fe = file.get(owner, fd) orelse return err(EBADF);
-        defer file.put(fe);
+    // The fd table is the group's: the lead's. The mapping keeps the inode,
+    // not the file: the reference lasts until the region holds the inode
+    // (addRegion), and goes after the as_lock (a release may sleep).
+    const file = @import("../../fs/file.zig");
+    const mapped: ?*file.File = if (anon) null else (file.get(owner, fd) orelse return err(EBADF));
+    defer if (mapped) |f| file.put(f);
+    if (mapped) |fe| {
         if (fe.kind == .devfs and devfs.kindOf(fe.inode) == devfs.Kind.zero_dev) {
             zeroed = true;
         } else {
@@ -187,13 +193,15 @@ pub fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, off: u64) u64 {
             region.cache_inode = fe.inode;
             region.cache_off = off;
             region.cache_shared = shared;
+            if (shared and !fe.writable()) region.flags |= process.REGION_NO_WRITE;
         }
     }
     if (zeroed and !shared) region.flags = process.REGION_MERGEABLE;
     // Before anything is unmapped: MAP_FIXED must not fail after it took
     // the old mapping away for want of an shm object.
     if (zeroed and shared) {
-        region.shm_id = shm.create(@intCast(len_pg / PAGE)) orelse return err(ENOMEM);
+        if (len_pg / PAGE > shm.MAX_PAGES_PER_REGION) return err(ENOMEM);
+        region.shm_id = shm.createLazy(@intCast(len_pg / PAGE)) orelse return err(ENOMEM);
     }
 
     owner.as_lock.acquire();
@@ -267,6 +275,12 @@ const Reprotect = struct {
     prot: u8,
 
     pub fn apply(self: Reprotect, r: *LazyRegion) void {
+        // A shared file mapping that may be written from here on: its
+        // present pages turn writable with no fault to mark them dirty.
+        if (r.cache_inode != 0 and r.cache_shared and self.prot & PROT_WRITE != 0 and r.prot & PROT_WRITE == 0) {
+            const page_cache = @import("../../mm/page_cache.zig");
+            page_cache.markDirtyRange(page_cache.ext2FileId(r.cache_inode), r.cache_off, r.end - r.start);
+        }
         r.prot = self.prot;
         // A private file page maps the shared cache frame: keep it read-only
         // and copy-on-write (cacheMapFlags) or a write would land in the cache.
@@ -290,6 +304,14 @@ pub fn mprotect(addr: u64, len: u64, prot: u64) u64 {
     defer owner.as_lock.release();
     if (!owner.regions.covers(addr, end)) return err(ENOMEM);
     if (splitsUnsplittable(owner, addr, end)) return err(EINVAL);
+    if (prot & PROT_WRITE != 0) {
+        // A shared mapping of a file that was not opened for writing.
+        var it = owner.regions.atOrAbove(addr);
+        while (it) |r| : (it = owner.regions.atOrAbove(r.end)) {
+            if (r.start >= end) break;
+            if (r.flags & process.REGION_NO_WRITE != 0) return err(EACCES);
+        }
+    }
     owner.regions.update(addr, end, Reprotect{ .pd = owner.page_directory.?, .prot = @truncate(prot & PROT_MASK) }) catch return err(ENOMEM);
     tlb.shootdownRange(owner.pcid, addr, len_pg / PAGE);
     return 0;
@@ -451,7 +473,8 @@ fn remapLocked(owner: *process.PCB, rel: *Release, old: u64, old_end: u64, new_p
     }
     // Grow in place: only the end of a private anonymous mapping, into
     // free pages.
-    const growable = r.end == old_end and !r.unsplittable() and r.source == null and r.cache_inode == 0;
+    const growable = r.end == old_end and !r.unsplittable() and r.source == null and r.cache_inode == 0 and
+        r.shm_id == shm.SHM_INVALID;
     if (!growable or !rangeOk(old, new_pg)) return error.NoMemory;
     if (!owner.regions.resizeEnd(r.start, old + new_pg)) return error.NoMemory;
     return old;

@@ -42,6 +42,7 @@ var next_alias_tick: u64 = 100;
 var next_perfdump_tick: u64 = 500;
 var next_kesp_tick: u64 = @import("../../debug/watch.zig").KESP_REROTATE_TICKS;
 var next_lb_tick: u64 = 50;
+var next_nudge_tick: u64 = 100;
 
 /// IRQ0 stack-canary magic — pushed below the 15 GPRs at IRQ entry, verified
 /// before iretq. Used by both the isr_irq0 asm (literal embedded for the
@@ -448,6 +449,12 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
             if (process.tick_count >= next_lb_tick) {
                 next_lb_tick = process.tick_count + 50;
                 process.loadBalance();
+            }
+
+            // A killed task still inside a Linux call is woken again.
+            if (process.tick_count >= next_nudge_tick) {
+                next_nudge_tick = process.tick_count + 100;
+                process.nudgeKilled();
             }
         }
     }

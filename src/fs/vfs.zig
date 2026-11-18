@@ -658,6 +658,22 @@ pub fn fillCachePage(inode: u32, offset: u64, buf: [*]u8) u32 {
     return @intCast(ext2.readFile(handle, buf, 0x1000));
 }
 
+/// The page of ext2 file `inum` at `page_off` read into the caller's frame
+/// `pf` (zero past the file's end) and published in the page cache. The
+/// mount lock is held from the read to the publish, so no write to the file
+/// falls between them: a fill under a steady writer is not refused as stale
+/// time after time. May sleep; touches no user memory.
+pub fn fillAndPublishCachePage(inum: u32, page_off: u64, pf: Phys) page_cache.Inserted {
+    const file_id = page_cache.ext2FileId(inum);
+    const dst = pf.toVirt().ptr([*]u8);
+    ext2.lockMount();
+    defer ext2.unlockMount();
+    const gen = page_cache.fillBegin(file_id);
+    const got: usize = @min(fillCachePage(inum, page_off, dst), 0x1000);
+    if (got < 0x1000) @memset(dst[got..0x1000], 0);
+    return page_cache.insertFilled(file_id, page_off, pf, gen);
+}
+
 /// Read up to `count` bytes from ext2 inode `inum` at byte `offset` into user
 /// `buf`, THROUGH the unified page cache — the read() half of the cache
 /// unification (Slice 3b). Each touched page is pinned on a hit, or read into a
@@ -711,10 +727,7 @@ pub fn readThroughCache(inum: u32, offset: u64, buf: [*]u8, count: u32) u32 {
                 const nread: u64 = @intCast(ext2.readFile(.{ .inum = inum, .file_size = 0, .current_offset = cur }, buf + dst_off, @intCast(want - done)));
                 return @intCast(done + nread);
             };
-            const fdst = pf.toVirt().ptr([*]u8);
-            const got: u64 = @min(@as(u64, fillCachePage(inum, page_off, fdst)), 0x1000);
-            if (got < 0x1000) @memset(fdst[@as(usize, @intCast(got))..0x1000], 0); // zero tail past EOF
-            break :blk page_cache.insertFilled(file_id, page_off, pf).frame;
+            break :blk fillAndPublishCachePage(inum, page_off, pf).frame;
         };
 
         // frame -> kstack scratch, under the reference (cannot fault-kill).
@@ -788,18 +801,39 @@ pub fn reportCacheCorruption() void {
 /// `size` is the file's. With `clear`, a page no mapping holds any more
 /// rejoins the evictable pool — or leaves the cache when it lies wholly past
 /// EOF: nothing of it reaches the disk, and its bytes must not come back if
-/// the file later grows over them.
-fn flushDirtyPage(inum: u32, size: u64, page_off: u64, frame: Phys, clear: bool) void {
+/// the file later grows over them. True if the page was written.
+///
+/// A page something still maps stays dirty and comes round again, so it is
+/// written only when its bytes differ from the last ones written, going by
+/// their checksum. A page nothing maps is about to be clean: it is written
+/// whatever the checksum says, so a clean page never rests on it.
+///
+/// What goes to the disk is a copy of the page, and the checksum kept is
+/// the copy's. The page turns clean only if it was written whole and, with
+/// its last mapping gone, still holds those bytes: a store that landed
+/// after the copy was taken keeps it dirty for the next flush.
+fn flushDirtyPage(inum: u32, size: u64, page_off: u64, frame: Phys, clear: bool) bool {
     const file_id = page_cache.ext2FileId(inum);
-    const in_file = page_off < size;
-    if (in_file) _ = ext2.writebackPage(inum, page_off, frame, frame.toVirt().ptr([*]const u8));
-    pmm.releaseFrame(frame); // the writeback pin, before the refcount-gated calls below
-    if (!clear) return;
-    if (in_file) {
-        _ = page_cache.clearDirtyIfCacheOnly(file_id, page_off);
-    } else {
-        _ = page_cache.dropIfCacheOnly(file_id, page_off);
+    if (page_off >= size) {
+        pmm.releaseFrame(frame); // the writeback pin, before the refcount-gated drop
+        if (clear) _ = page_cache.dropIfCacheOnly(file_id, page_off);
+        return false;
     }
+    // More than the cache's reference and this pin: a mapping (or another
+    // flush, which leaves the page to the next pass too).
+    if (pmm.frameRefCount(frame) > 2 and page_cache.flushedAs(file_id, page_off, frame, page_cache.sumOf(frame))) {
+        pmm.releaseFrame(frame);
+        return false;
+    }
+    var copy: [0x1000]u8 align(8) = undefined;
+    @memcpy(&copy, frame.toVirt().ptr([*]const u8)[0..0x1000]);
+    const sum = page_cache.sumOfCopy(&copy);
+    const want: u32 = @intCast(@min(@as(u64, 0x1000), size - page_off));
+    const written = ext2.writebackPage(inum, page_off, frame, &copy) == want;
+    if (written) page_cache.noteFlushed(file_id, page_off, frame, sum);
+    pmm.releaseFrame(frame); // the writeback pin, before the refcount-gated clear
+    if (clear and written) _ = page_cache.clearDirtyIfWritten(file_id, page_off, frame, sum);
+    return written;
 }
 
 /// Write every dirty page of ext2 inode `inum` back to disk — the orchestration
@@ -828,8 +862,7 @@ pub fn syncCacheFile(inum: u32, clear: bool) u32 {
         if (n == 0) break;
         const size = ext2.cacheReadInfo(inum).size;
         for (batch[0..n]) |dp| {
-            flushDirtyPage(inum, size, dp.page_off, dp.frame, clear);
-            written += 1;
+            if (flushDirtyPage(inum, size, dp.page_off, dp.frame, clear)) written += 1;
         }
         off = batch[n - 1].page_off + page_cache.PAGE_SIZE; // advance cursor → guarantees termination
     }
@@ -846,7 +879,8 @@ pub fn syncCacheFile(inum: u32, clear: bool) u32 {
 /// analogue of syncCacheFile. Flushes EVERY dirty cache page to disk: the
 /// pgflushd kernel thread (main.zig) calls this on a timer so MAP_SHARED writes
 /// persist to disk periodically without an explicit msync — a live mapping's
-/// pages are re-flushed every pass (refcount>1 keeps them dirty), bounding
+/// pages are looked at every pass (refcount>1 keeps them dirty) and written
+/// when their bytes changed (flushDirtyPage), bounding
 /// crash / bare-exit data loss to one flush interval instead of all of it — and
 /// so any orphaned refcount==1 dirty page is written back and then made
 /// reclaimable. (Full bare-exit persistence of the final pre-exit window needs
@@ -856,7 +890,7 @@ pub fn syncCacheFile(inum: u32, clear: bool) u32 {
 /// under page_cache.lock, then we drop the lock, do the blocking ext2 writeback,
 /// releaseFrame, and refcount-gate the dirty clear. clearDirtyIfCacheOnly clears
 /// only refcount==1 pages, so a still-live mapper's page stays dirty and is
-/// re-flushed next pass (periodic durability) while an orphaned page is cleaned
+/// looked at again next pass (periodic durability) while an orphaned page is cleaned
 /// and becomes evictable. MUST run with NO spinlock held (writebackPage blocks on
 /// NVMe I/O) — only from the daemon thread, never a syscall under a lock. Returns
 /// the number of pages written back.
@@ -878,12 +912,11 @@ pub fn flushAllDirty() u32 {
                 size = ext2.cacheReadInfo(inum).size;
                 sized_inum = inum;
             }
-            flushDirtyPage(inum, size, dp.page_off, dp.frame, true);
+            if (flushDirtyPage(inum, size, dp.page_off, dp.frame, true)) written += 1;
         } else {
             pmm.releaseFrame(dp.frame);
             _ = page_cache.clearDirtyIfCacheOnly(dp.file_id, dp.page_off);
         }
-        written += 1;
     }
     if (written > 0)
         @import("../debug/serial.zig").print("[3d] pgflushd wrote {d} dirty page(s)\n", .{written});

@@ -54,8 +54,10 @@ const TCP_SYN: u8 = 0x02;
 const TCP_RST: u8 = 0x04;
 const TCP_PSH: u8 = 0x08;
 const TCP_ACK: u8 = 0x10;
-const TCP_MAX_CONNS = 32;
-const TCP_MAX_LISTENERS = 8;
+/// Connections in the whole system, counting the ones that finish their
+/// close after their socket went. A slot number is a byte, 0xFF none.
+const TCP_MAX_CONNS = 250;
+const TCP_MAX_LISTENERS = 64;
 /// Receive and send rings, powers of two. A connection takes a block from
 /// the pool (ring_pool, filled from vmalloc in task context) when one is
 /// idle — a large receive ring, then a large send ring — else it uses its
@@ -64,6 +66,9 @@ const TCP_RX_RING: u32 = 256 * 1024;
 const TCP_RX_SMALL: u32 = 8192;
 const TCP_TX_RING: u32 = 256 * 1024;
 const TCP_SND_SMALL: u32 = 8192;
+/// Blocks the pool holds at most (16 MiB): connections past them run on
+/// their small rings.
+const TCP_RING_POOL = 32;
 /// Segments one flushSnd puts out: the lock and the interrupts are held
 /// meanwhile. Their ACKs start the next run.
 const TCP_FLUSH_BURST: u32 = 32;
@@ -85,7 +90,7 @@ const TCP_MAX_CWND: u32 = TCP_TX_RING; // congestion-window ceiling (bytes)
 const TCP_MAX_RETRIES: u8 = 3;
 const TCP_NO_LISTENER: u8 = 0xFF;
 // Per-listener ring of accepted-but-not-yet-handed-out connection slots.
-const TCP_ACCEPT_RING_SIZE: u8 = 16;
+const TCP_ACCEPT_RING_SIZE: u8 = 64;
 /// The peer hears of a receive window that opened by this much (two full
 /// segments, RFC 1122's rule against silly windows).
 const TCP_WINDOW_UPDATE: u32 = 2 * 1460;
@@ -459,7 +464,7 @@ fn handleUdpPacket(ip_data: []volatile u8, ihl: usize) void {
 // ring is the socket's from udpOpen to udpClose and written by the receive
 // path under net_lock.
 
-const UDP_SOCKS: usize = 16;
+const UDP_SOCKS: usize = 1024;
 const UDP_RING: u32 = 16 * 1024;
 const UDP_REC_HDR: u32 = 8;
 // Ports handed to sockets that ask for none. The kernel's own resolver
@@ -528,7 +533,7 @@ fn udpPortTaken(port: u16) bool {
 }
 
 /// A new UDP socket, not bound. Null when the table or memory is out.
-pub fn udpOpen() ?u8 {
+pub fn udpOpen() ?u16 {
     const heap = @import("../mm/heap.zig");
     const ring = heap.kmalloc(UDP_RING) orelse return null;
     {
@@ -544,7 +549,7 @@ pub fn udpOpen() ?u8 {
     return null;
 }
 
-pub fn udpClose(slot: u8) void {
+pub fn udpClose(slot: u16) void {
     if (slot >= UDP_SOCKS) return;
     var ring: ?[*]u8 = null;
     {
@@ -560,7 +565,7 @@ pub fn udpClose(slot: u8) void {
 
 /// Give socket `slot` the port `port`, or with 0 one nobody has. False if
 /// the port is taken or the socket already has one.
-pub fn udpBind(slot: u8, port: u16) bool {
+pub fn udpBind(slot: u16, port: u16) bool {
     if (slot >= UDP_SOCKS) return false;
     const lk = net_lock.acquireIrqSave();
     defer netUnlock(lk);
@@ -583,14 +588,14 @@ pub fn udpBind(slot: u8, port: u16) bool {
 }
 
 /// The socket's port, 0 before it has one.
-pub fn udpPort(slot: u8) u16 {
+pub fn udpPort(slot: u16) u16 {
     if (slot >= UDP_SOCKS) return 0;
     return udp_socks[slot].port;
 }
 
 /// Send a datagram from socket `slot`, which gets a port now if it has
 /// none. Task context: finding the gateway may sleep.
-pub fn udpSendFrom(slot: u8, dst_ip: [4]u8, dst_port: u16, payload: []const u8) bool {
+pub fn udpSendFrom(slot: u16, dst_ip: [4]u8, dst_port: u16, payload: []const u8) bool {
     if (slot >= UDP_SOCKS) return false;
     if (udp_socks[slot].port == 0 and !udpBind(slot, 0)) return false;
     return udpSend(dst_ip, dst_port, udp_socks[slot].port, payload);
@@ -606,7 +611,7 @@ pub const UdpDatagram = struct {
 /// The oldest datagram waiting on `slot` into `out` (kernel memory), taken
 /// off the queue unless `peek`. With `only`, datagrams from anyone else are
 /// dropped on the way (a connected socket). Null when none waits.
-pub fn udpRecv(slot: u8, out: []u8, peek: bool, only: ?Endpoint) ?UdpDatagram {
+pub fn udpRecv(slot: u16, out: []u8, peek: bool, only: ?Endpoint) ?UdpDatagram {
     if (slot >= UDP_SOCKS) return null;
     const lk = net_lock.acquireIrqSave();
     defer netUnlock(lk);
@@ -630,18 +635,18 @@ pub fn udpRecv(slot: u8, out: []u8, peek: bool, only: ?Endpoint) ?UdpDatagram {
 }
 
 /// Lock-free: a datagram waits on `slot`.
-pub fn udpReadable(slot: u8) bool {
+pub fn udpReadable(slot: u16) bool {
     if (slot >= UDP_SOCKS) return false;
     return udp_socks[slot].used != 0;
 }
 
-pub fn udpEvents(slot: u8) u32 {
+pub fn udpEvents(slot: u16) u32 {
     if (slot >= UDP_SOCKS) return 0;
     return udp_socks[slot].events;
 }
 
 /// The length of the datagram a read would take next, 0 for none (FIONREAD).
-pub fn udpNextLen(slot: u8) usize {
+pub fn udpNextLen(slot: u16) usize {
     if (slot >= UDP_SOCKS) return 0;
     const lk = net_lock.acquireIrqSave();
     defer netUnlock(lk);
@@ -923,9 +928,42 @@ const TcpListener = struct {
     events: u32 = 0,
 };
 
-var tcp_conns: [TCP_MAX_CONNS]TcpConn = [_]TcpConn{.{}} ** TCP_MAX_CONNS;
+/// The connection slots: TCP_MAX_CONNS of them, from vmalloc at the first
+/// listen or connect (ensureConns) and never freed; none until then. A slot
+/// is about 18 KiB. The length is published after the pointer, so a slot
+/// number below it is good to index with, lock or no lock.
+var tcp_conns: []TcpConn = &.{};
 var tcp_listeners: [TCP_MAX_LISTENERS]TcpListener = [_]TcpListener{.{}} ** TCP_MAX_LISTENERS;
 var next_ephemeral: u16 = 49200;
+
+/// The slots, by a length read before the pointer: a walk with no lock held
+/// (netd's busy(), /proc) never sees the length of a table whose pointer is
+/// not there yet (ensureConns stores the pointer first).
+inline fn conns() []TcpConn {
+    const n = @atomicLoad(usize, &tcp_conns.len, .acquire);
+    return tcp_conns.ptr[0..n];
+}
+
+/// Make the connection table if there is none yet. Task context with
+/// interrupts on, net_lock not held (vmalloc can't run under it). False
+/// when it can't be made here.
+fn ensureConns() bool {
+    if (@atomicLoad(usize, &tcp_conns.len, .acquire) != 0) return true;
+    if (!@import("../time/pause.zig").irqsEnabled()) return false;
+    const heap = @import("../mm/heap.zig");
+    const mem = heap.kvmalloc(@sizeOf(TcpConn) * TCP_MAX_CONNS) orelse return false;
+    const table: [*]TcpConn = @ptrCast(@alignCast(mem));
+    for (table[0..TCP_MAX_CONNS]) |*c| c.* = .{};
+    const lk = net_lock.acquireIrqSave();
+    const placed = tcp_conns.len == 0;
+    if (placed) {
+        tcp_conns.ptr = table;
+        @atomicStore(usize, &tcp_conns.len, TCP_MAX_CONNS, .release);
+    }
+    netUnlock(lk);
+    if (!placed) heap.kvfree(mem);
+    return true;
+}
 
 /// The large ring blocks (receive ring, then send ring), from vmalloc, never
 /// freed. One is taken while a live connection uses it (its rx_buf is the
@@ -933,7 +971,7 @@ var next_ephemeral: u16 = 49200;
 /// ring is empty (detachRing), or when the slot is let go. So the pool grows
 /// to the most sockets open at once, not to the slots that linger.
 /// (p:net_lock)
-var ring_pool: [TCP_MAX_CONNS]?[*]u8 = [_]?[*]u8{null} ** TCP_MAX_CONNS;
+var ring_pool: [TCP_RING_POOL]?[*]u8 = [_]?[*]u8{null} ** TCP_RING_POOL;
 
 /// The smallest window shift whose scaled window covers a ring of `size`.
 fn wscaleFor(size: u32) u8 {
@@ -946,7 +984,7 @@ fn wscaleFor(size: u32) u8 {
 fn idleRing() ?[*]u8 {
     pool: for (ring_pool) |slot| {
         const r = slot orelse continue;
-        for (&tcp_conns) |*c| {
+        for (conns()) |*c| {
             if (c.active and c.rx_buf == r) continue :pool;
         }
         return r;
@@ -990,12 +1028,20 @@ fn detachRing(c: *TcpConn) void {
     c.n_ooo = 0;
 }
 
-/// A slot no connection holds. Lock held.
+/// A slot no connection holds; failing that, the slot of the finished
+/// connection that has waited longest for stray segments (its socket gone,
+/// in time_wait): a new connection matters more than they do. Lock held.
 fn freeSlot() ?u8 {
-    for (&tcp_conns, 0..) |*c, i| {
+    var oldest: ?*TcpConn = null;
+    for (conns(), 0..) |*c, i| {
         if (!c.active) return @intCast(i);
+        if (!c.orphan or c.state != .time_wait) continue;
+        if (oldest == null or c.last_send_tick < oldest.?.last_send_tick) oldest = c;
     }
-    return null;
+    const c = oldest orelse return null;
+    c.active = false;
+    c.state = .closed;
+    return connSlotIndex(c);
 }
 
 /// Before a connection starts: make sure an idle ring block waits for it.
@@ -1035,7 +1081,7 @@ pub fn trimRings(spare: usize) void {
             var idle: usize = 0;
             pool: for (&ring_pool) |*slot| {
                 const r = slot.* orelse continue;
-                for (&tcp_conns) |*c| {
+                for (conns()) |*c| {
                     if (c.active and c.rx_buf == r) continue :pool;
                 }
                 idle += 1;
@@ -1086,7 +1132,7 @@ fn parseSynOptions(tcp: []volatile u8, data_offset: usize) SynOptions {
 }
 
 fn connSlotIndex(c: *const TcpConn) u8 {
-    const base = @intFromPtr(&tcp_conns[0]);
+    const base = @intFromPtr(tcp_conns.ptr);
     const off = @intFromPtr(c) - base;
     return @intCast(off / @sizeOf(TcpConn));
 }
@@ -1302,24 +1348,30 @@ fn ephemeralPort() u16 {
 /// Start a connection to `dst_ip:dst_port` from `local_port` (0: any). The
 /// SYN is out when this returns the slot; tcpView tells how it went. Task
 /// context: finding the gateway may sleep.
-pub fn tcpConnectStart(dst_ip: [4]u8, dst_port: u16, local_port: u16) ?u8 {
+pub fn tcpConnectStart(dst_ip: [4]u8, dst_port: u16, local_port: u16) ConnectError!u8 {
     return connectIn(null, dst_ip, dst_port, local_port);
 }
+
+/// Why a connection could not start: no way to the address, or every
+/// connection slot in the system is held.
+pub const ConnectError = error{ Unreachable, NoSlot };
 
 /// tcpConnectStart in `slot`, a connection of the caller's that failed: a
 /// socket connecting again keeps its slot, so a thread still using the
 /// slot's number reaches the socket's new connection, never someone else's.
 /// False if it can't start; the slot stays the caller's, failed.
 pub fn tcpReconnect(slot: u8, dst_ip: [4]u8, dst_port: u16, local_port: u16) bool {
-    return connectIn(slot, dst_ip, dst_port, local_port) != null;
+    _ = connectIn(slot, dst_ip, dst_port, local_port) catch return false;
+    return true;
 }
 
-fn connectIn(reuse: ?u8, dst_ip: [4]u8, dst_port: u16, local_port: u16) ?u8 {
+fn connectIn(reuse: ?u8, dst_ip: [4]u8, dst_port: u16, local_port: u16) ConnectError!u8 {
     // Resolve the gateway up front, outside the lock — it blocks (poll +
     // sleep); emitSegment's own gateway check is non-blocking by design.
-    if (!isLocal(dst_ip) and !arpResolveGateway()) return null;
+    if (!isLocal(dst_ip) and !arpResolveGateway()) return error.Unreachable;
+    if (!ensureConns()) return error.NoSlot;
     if (reuse) |r| {
-        if (r >= TCP_MAX_CONNS) return null;
+        if (r >= tcp_conns.len) return error.Unreachable;
     }
     provisionRing();
 
@@ -1327,9 +1379,9 @@ fn connectIn(reuse: ?u8, dst_ip: [4]u8, dst_port: u16, local_port: u16) ?u8 {
     defer netUnlock(lk);
 
     const slot: u8 = if (reuse) |r| blk: {
-        if (!tcp_conns[r].active or !tcp_conns[r].error_flag) return null;
+        if (!tcp_conns[r].active or !tcp_conns[r].error_flag) return error.Unreachable;
         break :blk r;
-    } else freeSlot() orelse return null;
+    } else freeSlot() orelse return error.NoSlot;
 
     const conn = &tcp_conns[slot];
     // An edge-triggered watcher of a reused slot must see a change.
@@ -1351,13 +1403,13 @@ fn connectIn(reuse: ?u8, dst_ip: [4]u8, dst_port: u16, local_port: u16) ?u8 {
     conn.recover = conn.snd_iss;
     if (!emitSegment(conn, conn.snd_iss, TCP_SYN, null)) {
         if (reuse == null) conn.active = false else tcpFailWith(conn, .timed_out);
-        return null;
+        return error.Unreachable;
     }
     return slot;
 }
 
 pub fn tcpConnect(dst_ip: [4]u8, dst_port: u16) ?u8 {
-    const slot = tcpConnectStart(dst_ip, dst_port, 0) orelse return null;
+    const slot = tcpConnectStart(dst_ip, dst_port, 0) catch return null;
     const conn = &tcp_conns[slot];
 
     // Wait for SYN-ACK, unlocked — state/error_flag are single-byte reads
@@ -1484,12 +1536,14 @@ fn sendReset(ip_data: []volatile u8, ihl: usize) void {
 pub fn tcpListen(port: u16) ?u8 {
     if (port == 0) return null;
     // Connections a listener takes start in NIC-IRQ context, which can't
-    // allocate: a ring waits for the first.
+    // allocate: the table is there, and a ring waits for the first.
+    if (!ensureConns()) return null;
     provisionRing();
     const lk = net_lock.acquireIrqSave();
     defer netUnlock(lk);
-    // Reject duplicates so accept rings stay sane.
-    for (tcp_listeners) |l| {
+    // Reject duplicates so accept rings stay sane. By pointer: by value the
+    // whole table is copied onto the stack.
+    for (&tcp_listeners) |*l| {
         if (l.active and l.port == port) return null;
     }
     for (&tcp_listeners, 0..) |*l, idx| {
@@ -1514,9 +1568,9 @@ pub fn tcpUnlisten(listen_slot: u8) void {
     while (l.accept_head != l.accept_tail) {
         const slot = l.accept_ring[l.accept_tail];
         l.accept_tail = (l.accept_tail + 1) % TCP_ACCEPT_RING_SIZE;
-        if (slot < TCP_MAX_CONNS) releaseConn(&tcp_conns[slot]);
+        if (slot < tcp_conns.len) releaseConn(&tcp_conns[slot]);
     }
-    for (&tcp_conns) |*c| {
+    for (conns()) |*c| {
         if (c.active and c.state == .syn_received and c.listener_slot == listen_slot) c.active = false;
     }
     l.* = .{};
@@ -1527,7 +1581,7 @@ pub fn tcpUnlisten(listen_slot: u8) void {
 pub fn tcpPortListening(port: u16) bool {
     const lk = net_lock.acquireIrqSave();
     defer netUnlock(lk);
-    for (tcp_listeners) |l| {
+    for (&tcp_listeners) |*l| {
         if (l.active and l.port == port) return true;
     }
     return false;
@@ -1541,6 +1595,23 @@ pub fn tcpListenerPort(listen_slot: u8) u16 {
 pub fn tcpListenerEvents(listen_slot: u8) u32 {
     if (listen_slot >= TCP_MAX_LISTENERS) return 0;
     return tcp_listeners[listen_slot].events;
+}
+
+/// A port for a bind that named none: one nobody listens on, 0 if there
+/// is none to be had.
+pub fn tcpPickPort() u16 {
+    var tries: u32 = 0;
+    while (tries < 64) : (tries += 1) {
+        const lk = net_lock.acquireIrqSave();
+        defer netUnlock(lk);
+        const port = ephemeralPort();
+        var taken = false;
+        for (&tcp_listeners) |*l| {
+            if (l.active and l.port == port) taken = true;
+        }
+        if (!taken) return port;
+    }
+    return 0;
 }
 
 /// Bind a listener to a port nobody listens on, chosen here.
@@ -1731,7 +1802,7 @@ fn flushSnd(conn: *TcpConn) void {
 }
 
 pub fn tcpSend(slot: u8, data: []const u8) bool {
-    if (slot >= TCP_MAX_CONNS) return false;
+    if (slot >= tcp_conns.len) return false;
     const conn = &tcp_conns[slot];
     if (!conn.active or conn.state != .established) return false;
     // Blocking gateway resolution up front, outside the lock — emitSegment
@@ -1776,7 +1847,7 @@ pub fn tcpSend(slot: u8, data: []const u8) bool {
 }
 
 pub fn tcpRecv(slot: u8, buf: []u8) usize {
-    if (slot >= TCP_MAX_CONNS) return 0;
+    if (slot >= tcp_conns.len) return 0;
     const conn = &tcp_conns[slot];
     const lk = net_lock.acquireIrqSave();
     defer netUnlock(lk);
@@ -1808,7 +1879,7 @@ pub fn dumpTcp() void {
     const lk = net_lock.acquireIrqSave();
     defer netUnlock(lk);
     serial.print("[tcp-dump] frames in {d} ({d} bytes), TCP segments for no connection {d}\n", .{ rx_frame_count, rx_frame_total_bytes, tcp_unmatched });
-    for (&tcp_conns, 0..) |*c, i| {
+    for (conns(), 0..) |*c, i| {
         if (!c.active) continue;
         serial.print("[tcp-dump] slot {d} {s} :{d} -> {d}.{d}.{d}.{d}:{d}; rcv_nxt {d} rx {d}/{d} adv {d} ooo runs {d}; ws {s} {d}/{d}, sack {s}; in {d} segs {d} bytes, ooo {d} old {d} cut {d} full {d} peak {d};", .{
             i,              @tagName(c.state),             c.local_port,
@@ -1831,7 +1902,7 @@ pub fn dumpTcp() void {
 }
 
 pub fn tcpClose(slot: u8) void {
-    if (slot >= TCP_MAX_CONNS) return;
+    if (slot >= tcp_conns.len) return;
     var conn = &tcp_conns[slot];
     if (!conn.active) return;
 
@@ -1973,7 +2044,7 @@ fn releaseConn(c: *TcpConn) void {
 /// delivered and the close completed, in the background; the slot frees
 /// itself after. Never sleeps.
 pub fn tcpRelease(slot: u8) void {
-    if (slot >= TCP_MAX_CONNS) return;
+    if (slot >= tcp_conns.len) return;
     const lk = net_lock.acquireIrqSave();
     defer netUnlock(lk);
     releaseConn(&tcp_conns[slot]);
@@ -1982,7 +2053,7 @@ pub fn tcpRelease(slot: u8) void {
 /// No more will be sent on `slot`: the peer reads an end of stream after
 /// what is already queued. Receiving goes on.
 pub fn tcpShutdownWrite(slot: u8) void {
-    if (slot >= TCP_MAX_CONNS) return;
+    if (slot >= tcp_conns.len) return;
     const lk = net_lock.acquireIrqSave();
     defer netUnlock(lk);
     const c = &tcp_conns[slot];
@@ -2002,7 +2073,7 @@ pub const TcpSent = union(enum) {
 
 /// Take what fits of `data` (kernel memory) into the send ring and send on.
 pub fn tcpSendSome(slot: u8, data: []const u8) TcpSent {
-    if (slot >= TCP_MAX_CONNS) return .closed;
+    if (slot >= tcp_conns.len) return .closed;
     const lk = net_lock.acquireIrqSave();
     defer netUnlock(lk);
     const c = &tcp_conns[slot];
@@ -2018,7 +2089,7 @@ pub fn tcpSendSome(slot: u8, data: []const u8) TcpSent {
 
 /// tcpRecv that leaves the bytes in place (MSG_PEEK).
 pub fn tcpPeek(slot: u8, buf: []u8) usize {
-    if (slot >= TCP_MAX_CONNS) return 0;
+    if (slot >= tcp_conns.len) return 0;
     const c = &tcp_conns[slot];
     const lk = net_lock.acquireIrqSave();
     defer netUnlock(lk);
@@ -2048,7 +2119,7 @@ pub const TcpView = struct {
 };
 
 pub fn tcpView(slot: u8) TcpView {
-    if (slot >= TCP_MAX_CONNS) return .{ .failed = true, .eof = true };
+    if (slot >= tcp_conns.len) return .{ .failed = true, .eof = true };
     const c = &tcp_conns[slot];
     if (!c.active) return .{ .eof = true };
     const rx = c.rx_count;
@@ -2070,13 +2141,13 @@ pub const Endpoint = struct { ip: [4]u8, port: u16 };
 /// Our end of connection `slot`. A local connection has the peer's address
 /// on both ends (outboundSrcIp).
 pub fn tcpLocal(slot: u8) Endpoint {
-    if (slot >= TCP_MAX_CONNS) return .{ .ip = .{ 0, 0, 0, 0 }, .port = 0 };
+    if (slot >= tcp_conns.len) return .{ .ip = .{ 0, 0, 0, 0 }, .port = 0 };
     const c = &tcp_conns[slot];
     return .{ .ip = outboundSrcIp(c.remote_ip), .port = c.local_port };
 }
 
 pub fn tcpRemote(slot: u8) Endpoint {
-    if (slot >= TCP_MAX_CONNS) return .{ .ip = .{ 0, 0, 0, 0 }, .port = 0 };
+    if (slot >= tcp_conns.len) return .{ .ip = .{ 0, 0, 0, 0 }, .port = 0 };
     const c = &tcp_conns[slot];
     return .{ .ip = c.remote_ip, .port = c.remote_port };
 }
@@ -2084,7 +2155,7 @@ pub fn tcpRemote(slot: u8) Endpoint {
 /// True while any connection or datagram socket is in use: the
 /// housekeeping task ticks faster.
 pub fn busy() bool {
-    for (&tcp_conns) |*c| {
+    for (conns()) |*c| {
         if (c.active) return true;
     }
     for (&udp_socks) |*s| {
@@ -2099,12 +2170,12 @@ pub fn busy() bool {
 // called by fdpoll.wakePollers WHILE the RX path holds net_lock — taking
 // the lock here would self-deadlock.
 pub fn tcpIsConnected(slot: u8) bool {
-    if (slot >= TCP_MAX_CONNS) return false;
+    if (slot >= tcp_conns.len) return false;
     return tcp_conns[slot].active and tcp_conns[slot].state == .established;
 }
 
 pub fn tcpPeerClosed(slot: u8) bool {
-    if (slot >= TCP_MAX_CONNS) return true;
+    if (slot >= tcp_conns.len) return true;
     return !tcp_conns[slot].active or tcp_conns[slot].peer_closed or tcp_conns[slot].error_flag;
 }
 
@@ -2123,7 +2194,7 @@ const POLLHUP_BIT: u16 = 0x0010;
 /// MSS-sized segments internally, so userspace doesn't need to know the
 /// exact byte budget).
 pub fn tcpPollMask(slot: u8) u16 {
-    if (slot >= TCP_MAX_CONNS) return POLLERR_BIT;
+    if (slot >= tcp_conns.len) return POLLERR_BIT;
     const c = &tcp_conns[slot];
     if (!c.active) return POLLERR_BIT;
     var mask: u16 = 0;
@@ -2289,7 +2360,7 @@ fn handleTcpPacket(ip_data: []volatile u8, ihl: usize) void {
 
     // Find matching connection (full 4-tuple match)
     var conn: ?*TcpConn = null;
-    for (&tcp_conns) |*c0| {
+    for (conns()) |*c0| {
         if (c0.active and c0.local_port == dst_port and c0.remote_port == src_port and
             c0.remote_ip[0] == ip_data[12] and c0.remote_ip[1] == ip_data[13] and
             c0.remote_ip[2] == ip_data[14] and c0.remote_ip[3] == ip_data[15])
@@ -2535,7 +2606,7 @@ fn processAck(c: *TcpConn, ack: u32, payload_len: usize) void {
 }
 
 fn tcpTick() void {
-    for (&tcp_conns) |*c| {
+    for (conns()) |*c| {
         if (!c.active) continue;
         // A connection whose socket is gone frees itself: when its close is
         // done, when it failed, or when the close has taken too long. One a
@@ -2901,7 +2972,7 @@ pub fn rxBatchEnd() void {
     const lk = net_lock.acquireIrqSave();
     defer netUnlock(lk);
     rx_batch = false;
-    for (&tcp_conns) |*c| {
+    for (conns()) |*c| {
         if (c.active and c.ack_due != 0) _ = sendTcpPacket(c, TCP_ACK, null);
     }
 }
@@ -3057,7 +3128,7 @@ fn stateName(s: TcpState) []const u8 {
 pub fn renderProcSock(buf: []u8) usize {
     var n: usize = 0;
     fmtBuf(buf, &n, "proto  local           remote               state\n", .{});
-    // By-pointer iteration: `for (tcp_conns) |c|` would copy the entire
+    // By-pointer iteration: `for (conns()) |c|` would copy the entire
     // ~156 KB array onto the kstack, overflowing pid 4 (netstat)'s 64 KB
     // kstack slot into pid 2 (desktop)'s adjacent slot — caught by DR2
     // hwbp on kesp+48 (netstat-desktop crash, 2026-05-19).
@@ -3065,7 +3136,7 @@ pub fn renderProcSock(buf: []u8) usize {
         if (!l.active) continue;
         fmtBuf(buf, &n, "tcp    *:{d:<11}    *:*                  LISTEN\n", .{l.port});
     }
-    for (&tcp_conns) |*c| {
+    for (conns()) |*c| {
         if (!c.active) continue;
         fmtBuf(buf, &n, "tcp    *:{d:<11}    {d}.{d}.{d}.{d}:{d:<5}  {s}\n", .{
             c.local_port,

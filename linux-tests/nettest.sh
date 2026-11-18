@@ -37,6 +37,13 @@ import urllib.request as u
 r = u.urlopen('$mirror/$index', timeout=60)
 print(r.status, len(r.read()) > 100000)" 2>&1)" "200 True"
 
+# wget over https as Alpine has it: the dynamic busybox hands TLS to
+# ssl_client, which checks the certificate (the static busybox in /bin
+# refuses https, having no way to check one).
+if [ -x /bin/busybox-dyn ] && [ -x /usr/bin/ssl_client ]; then
+    check wgethttps "$(/bin/busybox-dyn wget -q -O - "$mirror/$index" 2>&1 | wc -c | awk '{ print ($1 > 100000) }')" 1
+fi
+
 # apk from the mirror, then the program it brought.
 apk add --no-cache -X "$mirror" jq > /tmp/nettest.apk 2>&1 || cat /tmp/nettest.apk
 check apk "$(jq -n '6 * 7' 2>&1)" 42

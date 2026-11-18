@@ -100,6 +100,12 @@ check date "$([ "$(date +%Y)" -ge 2024 ] && echo yes)" yes
 # /proc: the applets that read it.
 sleep 30 &
 napper=$!
+# The child is a copy of this shell until it has exec'd: give it the time.
+tries=0
+while read -r comm < "/proc/$napper/comm" && [ "$comm" != sleep ] && [ "$tries" -lt 50 ]; do
+    tries=$((tries + 1))
+    sleep 0.02
+done
 check ps "$(ps -o pid,comm | awk -v p="$napper" '$1 == p { print $2 }')" sleep
 check pidof "$(busybox pidof sleep | tr ' ' '\n' | grep -c "^$napper\$")" 1
 check psargs "$(ps -o pid,args | awk -v p="$napper" '$1 == p { print $2, $3 }')" "sleep 30"

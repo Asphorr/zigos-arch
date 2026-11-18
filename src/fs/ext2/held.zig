@@ -1,15 +1,16 @@
-//! Inodes that open files hold.
+//! Inodes that open files and mappings hold.
 //!
-//! An unlink that takes the last name of an inode an open file still refers
-//! to must not free it: the file goes on reading and writing, and the inode
-//! number must not go to a new file under it. Such an inode stays in place
-//! with no links, marked an orphan here, and is freed when its last holder
-//! lets go (ext2.release).
+//! An unlink that takes the last name of an inode an open file or a mapping
+//! still refers to must not free it: they go on reading and writing, and the
+//! inode number must not go to a new file under them. Such an inode stays in
+//! place with no links, marked an orphan here, and is freed when its last
+//! holder lets go (ext2.release, or ext2.freeQueued after a releaseLater).
 //!
-//! Holds are taken and orphans made under the mount lock, so an open by
-//! name and the unlink of that name can't pass each other. The table is in
-//! memory only: an orphan whose holders never released it (a crash) keeps
-//! its blocks until a check of the file system frees them.
+//! A hold by name is taken, and an orphan made, under the mount lock, so an
+//! open by name and the unlink of that name can't pass each other; a holder
+//! may take further holds with no lock at all. The table is in memory only:
+//! an orphan whose holders never released it (a crash) keeps its blocks
+//! until a check of the file system frees them.
 
 const SpinLock = @import("../../proc/spinlock.zig").SpinLock;
 const heap = @import("../../mm/heap.zig");
@@ -24,6 +25,8 @@ const Node = struct {
 const BUCKETS: usize = 256;
 
 var buckets: [BUCKETS]?*Node = [_]?*Node{null} ** BUCKETS; // (p:lock)
+/// Orphans nothing holds any more, not yet freed (unholdLater). (p:lock)
+var queued: ?*Node = null;
 var lock: SpinLock = .{};
 
 fn find(inum: u32) ?*Node {
@@ -86,9 +89,50 @@ pub fn unhold(inum: u32) bool {
     return orphan;
 }
 
-/// `inum` lost its last name. True if an open file holds it, and it is now
-/// an orphan the last unhold reports; false if nothing holds it and the
-/// caller frees it at once.
+/// unhold for a holder that can't free an inode where it stands (it holds
+/// an address space's lock, which the mount's is never taken under): an
+/// orphan it was the last to hold waits for takeQueued.
+pub fn unholdLater(inum: u32) void {
+    var gone: ?*Node = null;
+    {
+        const f = lock.acquireIrqSave();
+        defer lock.releaseIrqRestore(f);
+        var link = &buckets[inum % BUCKETS];
+        while (link.*) |node| : (link = &node.next) {
+            if (node.inum != inum) continue;
+            node.holders -= 1;
+            if (node.holders == 0) {
+                link.* = node.next;
+                if (node.orphan) {
+                    node.next = queued;
+                    queued = node;
+                } else {
+                    gone = node;
+                }
+            }
+            break;
+        }
+    }
+    if (gone) |node| heap.kfree(@ptrCast(node));
+}
+
+/// An orphan unholdLater left, now the caller's to free; null when none is.
+pub fn takeQueued() ?u32 {
+    const node = blk: {
+        const f = lock.acquireIrqSave();
+        defer lock.releaseIrqRestore(f);
+        const n = queued orelse return null;
+        queued = n.next;
+        break :blk n;
+    };
+    const inum = node.inum;
+    heap.kfree(@ptrCast(node));
+    return inum;
+}
+
+/// `inum` lost its last name. True if something holds it, and it is now an
+/// orphan the last unhold reports; false if nothing holds it and the caller
+/// frees it at once.
 pub fn orphanIfHeld(inum: u32) bool {
     const f = lock.acquireIrqSave();
     defer lock.releaseIrqRestore(f);

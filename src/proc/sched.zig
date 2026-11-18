@@ -1873,7 +1873,7 @@ pub fn schedule() void {
                 process.doomed(cur_pid) and
                 !@atomicLoad(bool, &process.procs[cur_pid].teardown_marked, .acquire))
             {
-                process.destroyCurrentWithStatus(process.procs[cur_pid].exit_status);
+                process.destroyCurrentWithStatus(process.killStatus(&process.procs[cur_pid]));
                 unreachable;
             }
         }
@@ -3044,7 +3044,7 @@ pub fn kernelSleepMs(ms: u32) void {
 pub const BlockResult = enum { woke, signalled };
 
 inline fn hasPendingDeliverable(pcb: *const PCB) bool {
-    return signals.deliverable(pcb) != 0;
+    return signals.interrupts(pcb);
 }
 
 /// Like `blockOn`, but bails out (without parking, or while parked) when a

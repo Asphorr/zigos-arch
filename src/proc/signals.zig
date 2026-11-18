@@ -591,7 +591,9 @@ fn awaits(t: *const process.PCB, signo: u32) bool {
 pub fn killProcess(slot: u8, signo: u32, info: Info) bool {
     if (slot >= process.MAX_PROCS or signo >= NSIG) return false;
     const task = &process.procs[slot];
-    if (task.state == .unused or task.state == .loading or task.state == .zombie) return false;
+    if (task.state == .unused or task.state == .loading) return false;
+    // A lead that ended before its threads is the process still.
+    if (task.state == .zombie and !process.pinnedLead(slot)) return false;
     if (signo != 0 and task.personality == .linux) {
         const lead = process.leader(task);
         if (endsNow(lead, signo, null)) {
@@ -684,6 +686,17 @@ pub fn deliverable(pcb: *const process.PCB) u64 {
     var pending = @atomicLoad(u64, &pcb.pending_signals, .acquire);
     if (pcb.personality == .linux) pending |= @atomicLoad(u64, &process.procs[pcb.tgid].shared_pending, .acquire);
     return pending & ~pcb.signal_mask;
+}
+
+/// `pcb` is being killed: a call it is in returns as soon as it can, and
+/// the task ends on the way out.
+pub inline fn dying(pcb: *const process.PCB) bool {
+    return @atomicLoad(bool, &pcb.exit_requested, .acquire);
+}
+
+/// What ends a wait of `pcb`'s: a signal it can be delivered, or a kill.
+pub fn interrupts(pcb: *const process.PCB) bool {
+    return deliverable(pcb) != 0 or dying(pcb);
 }
 
 /// A signal taken for delivery.

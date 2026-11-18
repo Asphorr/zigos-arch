@@ -75,6 +75,9 @@ const CASES = [_]Case{
     // Pseudo-terminals: /dev/ptmx, a slave as a session's terminal.
     .{ .path = "/bin/lt_procfs.elf" },
     .{ .path = "/bin/lt_pty.elf" },
+    // All memory taken, twice: once is the whole story, and a repeat only
+    // fills the machine again.
+    .{ .path = "/bin/lt_oom.elf", .timeout_ms = 600_000, .once = true },
     // A static busybox, its shell running a script of applets, pipes, files
     // and jobs (tools/add_busybox_to_image.sh).
     .{

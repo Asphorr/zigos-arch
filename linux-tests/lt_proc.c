@@ -4,10 +4,13 @@
 // argv, envp and close-on-exec (of a stamped image and of one that carries
 // no OSABI stamp), the FP state across fork, process_vm_readv on itself,
 // sysinfo, /dev/null as a child's stdin, tkill, pids that are not reused at
-// once, process groups and sessions, AVX registers kept per process. Exit
+// once, process groups and sessions, AVX registers kept per process, a
+// program whose file is unlinked or replaced while it runs. Exit
 // 0 = every check passed, else the
 // number of the first failed check. Run as
-// `lt_proc exec-child <fd-cloexec> <fd-kept>` it is the execve target instead.
+// `lt_proc exec-child <fd-cloexec> <fd-kept>` it is the execve target
+// instead; as `lt_proc run-on <fd-gate> <fd-up>`, the program that runs on;
+// as `lt_proc hang`, one that waits to be ended.
 
 #define _GNU_SOURCE
 #include <cpuid.h>
@@ -66,6 +69,28 @@ static int exec_child(int argc, char **argv) {
     return 7;
 }
 
+static int cmp_int(const void *a, const void *b) {
+    return *(const int *)a - *(const int *)b;
+}
+
+// A program whose file goes away while it runs: it says it is up, waits
+// for the word to go on, then runs code and reads data it had not touched.
+static int run_on(int argc, char **argv) {
+    if (argc != 4) return 101;
+    int gate = atoi(argv[2]), up = atoi(argv[3]);
+    char b;
+    if (write(up, "U", 1) != 1 || read(gate, &b, 1) != 1) return 102;
+    char text[64];
+    snprintf(text, sizeof text, "%.2f %s", strtod("1234.5", NULL) * 2, strerror(ENOENT));
+    if (strncmp(text, "2469.00 ", 8) != 0) return 103;
+    int v[64];
+    for (int i = 0; i < 64; i++) v[i] = (i * 37) % 64;
+    qsort(v, 64, sizeof v[0], cmp_int);
+    for (int i = 0; i < 64; i++)
+        if (v[i] != i) return 104;
+    return 7;
+}
+
 static int wait_exit(pid_t pid) {
     int st = 0;
     if (waitpid(pid, &st, 0) != pid) return -1;
@@ -87,6 +112,14 @@ static void *sleep_forever(void *arg) {
     (void)arg;
     for (;;) nap_ms(1000);
     return NULL;
+}
+
+// execve of this image with the argv given, from whatever thread runs it.
+static void *exec_in_thread(void *arg) {
+    char *envp[] = {"FOO=bar", NULL};
+    nap_ms(20);
+    execve("/bin/lt_proc.elf", arg, envp);
+    _exit(93);
 }
 
 static int run_exec(const char *image, int gone, int kept) {
@@ -407,6 +440,43 @@ static void check_job_stops(void) {
     CHECK(kill(c, SIGCONT) == 0 && waitpid(c, &st, 0) == c && WIFEXITED(st), "continued, it ends");
     CHECK(WEXITSTATUS(st) == 0, "its one nanosleep returned 0, no EINTR");
 
+    // The same for FUTEX_WAIT: a stop and a continue pass over it, and the
+    // caller's one call still ends with a wake, or at its time.
+    enum { WAIT = 0, WAKE = 1 };
+    volatile int *word = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    CHECK(word != MAP_FAILED, "a shared page for a futex");
+    c = fork();
+    if (c == 0) {
+        long r = syscall(SYS_futex, word, WAIT, 0, NULL, NULL, 0);
+        _exit(r == 0 ? 0 : 100 + errno);
+    }
+    nap_ms(100);
+    CHECK(kill(c, SIGSTOP) == 0 && waitpid(c, &st, WUNTRACED) == c && WIFSTOPPED(st), "stop a child in FUTEX_WAIT");
+    CHECK(kill(c, SIGCONT) == 0 && waitpid(c, &st, WCONTINUED) == c && WIFCONTINUED(st), "continue it");
+    nap_ms(200);
+    CHECK(waitpid(c, &st, WNOHANG) == 0, "it waits on");
+    *word = 1;
+    CHECK(syscall(SYS_futex, word, WAKE, 1, NULL, NULL, 0) == 1, "a wake finds it waiting");
+    CHECK(waitpid(c, &st, 0) == c && WIFEXITED(st) && WEXITSTATUS(st) == 0, "its one FUTEX_WAIT returned 0, no EINTR");
+    *word = 0;
+    c = fork();
+    if (c == 0) {
+        struct timespec limit = {.tv_sec = 0, .tv_nsec = 600 * 1000 * 1000}, t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        long r = syscall(SYS_futex, word, WAIT, 0, &limit, NULL, 0);
+        int e = errno;
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        long ms = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
+        if (r != -1 || e != ETIMEDOUT) _exit(100 + e);
+        _exit(ms >= 590 && ms < 1500 ? 0 : 1);
+    }
+    nap_ms(100);
+    CHECK(kill(c, SIGSTOP) == 0 && waitpid(c, &st, WUNTRACED) == c && WIFSTOPPED(st), "stop a child in a timed FUTEX_WAIT");
+    nap_ms(100);
+    CHECK(kill(c, SIGCONT) == 0 && waitpid(c, &st, 0) == c && WIFEXITED(st), "continued, it ends");
+    CHECK(WEXITSTATUS(st) == 0, "at its time: ETIMEDOUT after 0.6 s, no EINTR");
+    munmap((void *)word, 4096);
+
     // Once wait4 has told of the stop, none of the child's code runs.
     volatile int *ran = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
     CHECK(ran != MAP_FAILED, "a shared page");
@@ -641,8 +711,75 @@ static void check_threaded(void) {
     signal(SIGCHLD, SIG_DFL);
 }
 
+static void *read_forever(void *arg) {
+    char c;
+    read(*(int *)arg, &c, 1);
+    return NULL;
+}
+
+static void *end_group(void *arg) {
+    nap_ms(5); // the main thread is in its read by now
+    syscall(SYS_exit_group, (long)arg);
+    return NULL;
+}
+
+// A task that ends while it sleeps inside a call gives back what the call
+// held. Each child sleeps in a read of its own pipe, and the system has few
+// pipes: were they kept, none could be made before the rounds are over.
+// Round by round: killed in the read; killed with a second thread in it
+// too; the main thread exits past a thread in it; a thread ends the group
+// past the main thread in it.
+static void check_ends_inside_call(void) {
+    int made = 1, ended = 1, status = 1;
+    for (int i = 0; i < 120 && made; i++) {
+        int how = i % 4;
+        int go[2];
+        if (pipe(go) != 0) {
+            made = 0;
+            break;
+        }
+        pid_t p = fork();
+        if (p == 0) {
+            int own[2];
+            char c;
+            pthread_t th;
+            close(go[0]);
+            if (pipe(own) != 0) _exit(90);
+            if (how == 1 || how == 2) pthread_create(&th, NULL, read_forever, &own[0]);
+            if (how == 3) pthread_create(&th, NULL, end_group, (void *)9L);
+            write(go[1], "x", 1);
+            if (how == 2) {
+                nap_ms(5); // the thread is in its read by now
+                _exit(7);
+            }
+            read(own[0], &c, 1);
+            _exit(91);
+        }
+        close(go[1]);
+        char c;
+        if (p < 0 || read(go[0], &c, 1) != 1) ended = 0;
+        close(go[0]);
+        int st = 0;
+        if (how < 2) {
+            nap_ms(3);
+            kill(p, SIGKILL);
+            if (waitpid(p, &st, 0) != p || !WIFSIGNALED(st) || WTERMSIG(st) != SIGKILL) ended = 0;
+        } else {
+            if (waitpid(p, &st, 0) != p || !WIFEXITED(st)) ended = 0;
+            else if (WEXITSTATUS(st) != (how == 2 ? 7 : 9)) status = 0;
+        }
+    }
+    CHECK(made, "pipes are not used up by tasks that ended inside a read");
+    CHECK(ended, "a process killed inside a call, or left by its last thread, is waited for");
+    CHECK(status, "the exit code of a group that ended past a thread inside a call");
+}
+
 int main(int argc, char **argv) {
     if (argc >= 2 && strcmp(argv[1], "exec-child") == 0) return exec_child(argc, argv);
+    if (argc >= 2 && strcmp(argv[1], "run-on") == 0) return run_on(argc, argv);
+    if (argc >= 2 && strcmp(argv[1], "hang") == 0) {
+        for (;;) nap_ms(1000);
+    }
     setvbuf(stdout, NULL, _IONBF, 0);
 
     // fork, exit code, getppid
@@ -784,6 +921,48 @@ int main(int argc, char **argv) {
     }
     CHECK(wait_exit(p) == 7, "execve from a two-thread process");
     CHECK(read(kept[0], buf, 1) == 1 && buf[0] == 'E', "and it ran");
+    // execve from a thread that is not the main one: the main thread and
+    // the third go, and the process is the new program, under its pid
+    p = fork();
+    if (p == 0) {
+        pthread_t sleeper, execer;
+        char a2[16], a3[16];
+        snprintf(a2, sizeof a2, "%d", gone[1]);
+        snprintf(a3, sizeof a3, "%d", kept[1]);
+        char *argv3[] = {"lt_proc", "exec-child", a2, a3, NULL};
+        if (pthread_create(&sleeper, NULL, sleep_forever, NULL) != 0) _exit(90);
+        if (pthread_create(&execer, NULL, exec_in_thread, argv3) != 0) _exit(91);
+        for (;;) nap_ms(1000);
+    }
+    CHECK(wait_exit(p) == 7, "execve from a thread other than the main one");
+    CHECK(read(kept[0], buf, 1) == 1 && buf[0] == 'E', "and it ran");
+    // the same, ended by a signal: the parent reads that, not an exit
+    p = fork();
+    if (p == 0) {
+        pthread_t execer;
+        static char *argv4[] = {"lt_proc", "hang", NULL};
+        if (pthread_create(&execer, NULL, exec_in_thread, argv4) != 0) _exit(91);
+        for (;;) nap_ms(1000);
+    }
+    nap_ms(300);
+    int hst = 0;
+    char maps_path[40], maps_head[32];
+    snprintf(maps_path, sizeof maps_path, "/proc/%d/maps", (int)p);
+    int maps_fd = open(maps_path, O_RDONLY);
+    CHECK(maps_fd >= 0 && read(maps_fd, maps_head, sizeof maps_head) > 0, "its /proc maps can be read");
+    close(maps_fd);
+    CHECK(kill(p, SIGTERM) == 0 && waitpid(p, &hst, 0) == p, "a signal for a process that execve'd from a thread");
+    CHECK(WIFSIGNALED(hst) && WTERMSIG(hst) == SIGTERM, "ends it, and its parent reads the signal");
+    // a process whose main thread has exited is there for kill all the same
+    p = fork();
+    if (p == 0) {
+        pthread_t rest;
+        if (pthread_create(&rest, NULL, sleep_forever, NULL) != 0) _exit(90);
+        pthread_exit(NULL);
+    }
+    nap_ms(100);
+    CHECK(kill(p, 0) == 0, "a process whose main thread exited is still there");
+    CHECK(kill(p, SIGTERM) == 0 && waitpid(p, &hst, 0) == p && WIFSIGNALED(hst) && WTERMSIG(hst) == SIGTERM, "and a signal ends it");
 
     // clone's fork shapes. glibc's fork: the child's tid stored in the
     // child's memory only, the parent told where it asks.
@@ -807,6 +986,81 @@ int main(int argc, char **argv) {
     CHECK(posix_spawn(&sp, "/bin/no-such-file", NULL, NULL, sargv, senvp) == ENOENT, "posix_spawn of a missing file says so");
     char *nav[] = {"nope", NULL};
     CHECK(execve("/bin/no-such-file", nav, nav) == -1 && errno == ENOENT, "execve of a missing file returns");
+
+    // A program whose file is unlinked, or replaced by rename, while it
+    // runs: it runs on from the file it started from, whatever takes the
+    // name, the inode number and the blocks.
+    for (int by_rename = 0; by_rename < 2; by_rename++) {
+        static char blk[65536];
+        int in = open("/bin/lt_proc.elf", O_RDONLY), out = open("/ltproc.run", O_CREAT | O_WRONLY | O_TRUNC, 0755);
+        CHECK(in >= 0 && out >= 0, "open the image and a copy of it");
+        ssize_t n;
+        int copied = 1;
+        while ((n = read(in, blk, sizeof blk)) > 0) copied &= write(out, blk, (size_t)n) == n;
+        close(in);
+        close(out);
+        CHECK(n == 0 && copied, "copy the image");
+        int gate[2], up[2];
+        CHECK(pipe(gate) == 0 && pipe(up) == 0, "two pipes for the copy");
+        p = fork();
+        if (p == 0) {
+            char g[16], u[16];
+            snprintf(g, sizeof g, "%d", gate[0]);
+            snprintf(u, sizeof u, "%d", up[1]);
+            char *rargv[] = {"ltproc.run", "run-on", g, u, NULL};
+            char *renvp[] = {NULL};
+            execve("/ltproc.run", rargv, renvp);
+            _exit(90);
+        }
+        CHECK(p > 0 && read(up[0], buf, 1) == 1 && buf[0] == 'U', "the copy is running");
+        if (!by_rename) CHECK(unlink("/ltproc.run") == 0, "unlink the file of a running program");
+        memset(blk, 0xCC, sizeof blk);
+        out = open("/ltproc.new", O_CREAT | O_WRONLY | O_TRUNC, 0644);
+        copied = out >= 0;
+        for (int i = 0; i < 32 && copied; i++) copied = write(out, blk, sizeof blk) == (ssize_t)sizeof blk;
+        close(out);
+        CHECK(copied, "a new file of two megabytes");
+        CHECK(rename("/ltproc.new", "/ltproc.run") == 0, by_rename ? "rename a new file over a running program's" : "give the new file the old name");
+        CHECK(write(gate[1], "g", 1) == 1 && wait_exit(p) == 7, "the program runs on from the file it started from");
+        close(gate[0]);
+        close(gate[1]);
+        close(up[0]);
+        close(up[1]);
+        CHECK(unlink("/ltproc.run") == 0, "remove the new file");
+    }
+
+    // A stopped process whose process group loses its last tie to the
+    // session (the one member with a parent outside the group ends) is
+    // hung up: SIGHUP, then SIGCONT, and it ends.
+    {
+        int up[2];
+        CHECK(pipe(up) == 0, "a pipe for the stopped one's pid");
+        pid_t mid = fork();
+        CHECK(mid >= 0, "fork the group's lead");
+        if (mid == 0) {
+            if (setpgid(0, 0) != 0) _exit(2);
+            pid_t g = fork();
+            if (g < 0) _exit(3);
+            if (g == 0) {
+                for (;;) pause();
+            }
+            int gst = 0;
+            if (write(up[1], &g, sizeof g) != sizeof g || kill(g, SIGSTOP) != 0) _exit(4);
+            if (waitpid(g, &gst, WUNTRACED) != g || !WIFSTOPPED(gst)) _exit(5);
+            _exit(0);
+        }
+        pid_t g = 0;
+        CHECK(read(up[0], &g, sizeof g) == sizeof g && g > 0 && wait_exit(mid) == 0, "a stopped process, alone in its group once the lead ends");
+        int ended = 0;
+        for (int i = 0; i < 300 && !ended; i++) {
+            ended = kill(g, 0) == -1 && errno == ESRCH;
+            if (!ended) nap_ms(10);
+        }
+        if (!ended) kill(g, SIGKILL);
+        CHECK(ended, "it is hung up, not left stopped for good");
+        close(up[0]);
+        close(up[1]);
+    }
 
     // process_vm_readv on itself
     static const char secret[] = "readv me";
@@ -851,6 +1105,7 @@ int main(int argc, char **argv) {
     check_waits_across();
     check_cpu_time();
     check_threaded();
+    check_ends_inside_call();
 
     // churn
     for (int i = 0; i < 20; i++) {

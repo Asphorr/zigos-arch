@@ -28,7 +28,7 @@
 //!   4. Sleep under spinlock — a body that takes a SpinLock / Guarded
 //!      window (`.acquire()` / `.acquireIrqSave()` on a non-Mutex
 //!      receiver) and, before the matching `.release*()` (a `defer`red
-//!      release holds to the end of the body), calls a function that may
+//!      release holds to the end of its block), calls a function that may
 //!      sleep. Heuristic (textual receiver match) — WARNING, not error;
 //!      spinlock.mightSleep is the runtime check with the last word.
 //!
@@ -696,15 +696,18 @@ const Lint = struct {
     fn checkSleepUnderLock(self: *Lint, fi: u32) !void {
         const f = &self.files.items[fi];
         const tree = f.tree;
-        // Token indices of release calls that sit directly under `defer`.
-        var deferred = std.AutoHashMap(TokenIndex, void).init(self.alloc);
+        // Release calls that sit directly under `defer`, by their first token:
+        // the last token of the block the defer is in, which is where it runs.
+        var deferred = std.AutoHashMap(TokenIndex, TokenIndex).init(self.alloc);
         defer deferred.deinit();
         var i: u32 = 0;
         while (i < tree.nodes.len) : (i += 1) {
             const n: NodeIndex = @enumFromInt(i);
             if (tree.nodeTag(n) != .@"defer") continue;
             const inner = tree.nodeData(n).node;
-            if (isCallTag(tree.nodeTag(inner))) try deferred.put(tree.firstToken(inner), {});
+            if (!isCallTag(tree.nodeTag(inner))) continue;
+            const tok = tree.firstToken(inner);
+            try deferred.put(tok, blockEnd(&tree, tok));
         }
 
         const Window = struct { recv: []const u8, tok: TokenIndex, close: TokenIndex, line: usize };
@@ -712,7 +715,8 @@ const Lint = struct {
             const fnp = &self.fns.items[fx];
             if (fnp.lock_ok) continue;
             var windows: std.ArrayList(Window) = .empty;
-            var releases: std.ArrayList(struct { recv: []const u8, tok: TokenIndex, deferred: bool }) = .empty;
+            // `at`: where the lock goes — the call, or its defer's block end.
+            var releases: std.ArrayList(struct { recv: []const u8, tok: TokenIndex, at: TokenIndex }) = .empty;
             // Gather acquire/release calls inside this body.
             var j: u32 = 0;
             while (j < tree.nodes.len) : (j += 1) {
@@ -730,16 +734,17 @@ const Lint = struct {
                     if (self.receiverIsMutex(fi, fx, pair[0])) continue; // a sleeper, not a window
                     try windows.append(self.alloc, .{ .recv = recv, .tok = tok, .close = fnp.body_last, .line = self.lineOf(fi, tok) });
                 } else if (isOneOf(name, &release_names)) {
-                    try releases.append(self.alloc, .{ .recv = recv, .tok = tok, .deferred = deferred.contains(tok) });
+                    try releases.append(self.alloc, .{ .recv = recv, .tok = tok, .at = deferred.get(tok) orelse tok });
                 }
             }
             if (windows.items.len == 0) continue;
-            // Close each window at the first later non-deferred release on the
-            // same receiver text; a deferred release (or none) holds to the end.
+            // Close each window at the first later release on the same
+            // receiver text: a deferred one holds to the end of its block,
+            // none to the end of the function.
             for (windows.items) |*w| {
                 for (releases.items) |r| {
-                    if (r.tok > w.tok and !r.deferred and std.mem.eql(u8, r.recv, w.recv)) {
-                        if (r.tok < w.close) w.close = r.tok;
+                    if (r.tok > w.tok and std.mem.eql(u8, r.recv, w.recv)) {
+                        if (r.at < w.close) w.close = r.at;
                     }
                 }
             }
@@ -797,6 +802,29 @@ const Lint = struct {
         return best;
     }
 };
+
+/// The last token of the innermost block around `tok`; of the file when no
+/// block is.
+fn blockEnd(tree: *const Ast, tok: TokenIndex) TokenIndex {
+    var best_first: TokenIndex = 0;
+    var best_last: TokenIndex = @intCast(tree.tokens.len - 1);
+    var i: u32 = 0;
+    while (i < tree.nodes.len) : (i += 1) {
+        const n: NodeIndex = @enumFromInt(i);
+        switch (tree.nodeTag(n)) {
+            .block, .block_semicolon, .block_two, .block_two_semicolon => {},
+            else => continue,
+        }
+        const first = tree.firstToken(n);
+        const last = tree.lastToken(n);
+        if (first > tok or last < tok) continue;
+        if (first >= best_first and last <= best_last) {
+            best_first = first;
+            best_last = last;
+        }
+    }
+    return best_last;
+}
 
 fn isCallTag(tag: Ast.Node.Tag) bool {
     return switch (tag) {

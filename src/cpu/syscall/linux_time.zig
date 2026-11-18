@@ -133,7 +133,7 @@ const Resume = enum {
 fn sleepUntil(pcb: *process.PCB, deadline: u64, rem_va: u64, how: Resume) u64 {
     var now = time.monotonicNanos();
     while (now < deadline) {
-        if (@import("../../proc/signals.zig").deliverable(pcb) != 0) {
+        if (@import("../../proc/signals.zig").interrupts(pcb)) {
             if (rem_va != 0) {
                 const rem = toTimespec(deadline - now);
                 _ = usercopy.copyToUser(rem_va, std.mem.asBytes(&rem));
@@ -141,6 +141,7 @@ fn sleepUntil(pcb: *process.PCB, deadline: u64, rem_va: u64, how: Resume) u64 {
             if (how == .again) return err(linux_signal.ERESTARTNOHAND);
             pcb.restart_until = deadline;
             pcb.restart_rem = rem_va;
+            pcb.restart_futex = 0;
             return err(linux_signal.ERESTART_RESTARTBLOCK);
         }
         const us = std.math.divCeil(u64, deadline - now, 1000) catch unreachable;
@@ -157,13 +158,18 @@ fn sleepNanos(ns: u64, rem_va: u64) u64 {
     return sleepUntil(pcb, time.monotonicNanos() +| ns, rem_va, .rest);
 }
 
-/// restart_syscall(): the rest of the sleep a signal with no handler cut
-/// short; EINTR when there is none.
+/// restart_syscall(): the rest of the sleep or timed futex wait a signal
+/// with no handler cut short; EINTR when there is none.
 pub fn restartSyscall() u64 {
     const pcb = process.currentPCB() orelse return err(EFAULT);
     const until = pcb.restart_until;
     if (until == 0) return err(EINTR);
     pcb.restart_until = 0;
+    const word = pcb.restart_futex;
+    if (word != 0) {
+        pcb.restart_futex = 0;
+        return @import("linux_thread.zig").futexWaitAgain(pcb, word, pcb.restart_futex_private, pcb.restart_futex_val, until);
+    }
     return sleepUntil(pcb, until, pcb.restart_rem, .rest);
 }
 

@@ -268,12 +268,11 @@ pub fn sysMmapFileShared(len: u32, fd: u32, offset: u32) u32 {
     // Shared writeback only exists for the ext2 page cache. Other fs types have
     // no cache frame to share, so reject rather than silently giving private
     // semantics under a MAP_SHARED name.
-    const cache_inode: u32 = blk: {
-        const f = file.get(pcb, fd) orelse return E_INVAL;
-        defer file.put(f);
-        if (f.kind != .ext2) return E_INVAL;
-        break :blk f.inode;
-    };
+    // The file held until the region holds its inode (addRegion).
+    const f = file.get(pcb, fd) orelse return E_INVAL;
+    defer file.put(f);
+    if (f.kind != .ext2) return E_INVAL;
+    const cache_inode: u32 = f.inode;
 
     lead.as_lock.acquire();
     defer lead.as_lock.release();
@@ -535,10 +534,13 @@ pub fn sysMunmap(va: u32, len: u32) u32 {
     // ⇒ the page rejoins the evictable pool).
     const shared_inode: ?u32 =
         if (removed.cache_inode != 0 and removed.cache_shared) removed.cache_inode else null;
+    removed.dropBacking();
     lead.as_lock.release();
 
     // Writeback runs OUTSIDE as_lock — writebackPage blocks on NVMe I/O.
+    // So does freeing an inode the mapping was the last to hold.
     if (shared_inode) |inum| _ = vfs.syncCacheFile(inum, true);
+    @import("../../fs/ext2/ext2.zig").freeQueued();
     return 0;
 }
 
@@ -574,6 +576,12 @@ pub fn sysMprotect(va: u32, len: u32, prot: u32) u32 {
 
     // Mask off non-prot bits the user might have passed; we own the encoding.
     const new_prot: u8 = @as(u8, @truncate(prot)) & process.PROT_RWX;
+    // A shared file mapping that may be written from here on: its present
+    // pages turn writable with no fault to mark them dirty.
+    if (lr.cache_inode != 0 and lr.cache_shared and new_prot & process.PROT_WRITE != 0 and lr.prot & process.PROT_WRITE == 0) {
+        const page_cache = @import("../../mm/page_cache.zig");
+        page_cache.markDirtyRange(page_cache.ext2FileId(lr.cache_inode), lr.cache_off, lr.end - lr.start);
+    }
     lr.prot = new_prot;
 
     // A PRIVATE cache-backed region's present pages are mapped read-only + COW

@@ -18,6 +18,7 @@
 #include <sys/sysmacros.h>
 #include <sys/utsname.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 static int check_no;
@@ -194,6 +195,25 @@ int main(int argc, char **argv) {
     CHECK(open("/proc/self/stat", O_WRONLY) == -1 && errno == EACCES, "stat can't be written");
     fd = open("/proc/self/oom_score_adj", O_WRONLY);
     CHECK(fd >= 0 && write(fd, "0\n", 2) == 2, "oom_score_adj takes a write");
+    {
+        // The number is kept, a child starts with it, anything else is refused.
+        CHECK(write(fd, "300\n", 4) == 4 && slurp("/proc/self/oom_score_adj") == 4 && strcmp(text, "300\n") == 0, "and keeps the number");
+        long biased = slurp("/proc/self/oom_score") > 0 ? atol(text) : -1;
+        pid_t kid = fork();
+        if (kid == 0) _exit(slurp("/proc/self/oom_score_adj") == 4 && strcmp(text, "300\n") == 0 ? 0 : 1);
+        int kst = -1;
+        CHECK(kid > 0 && waitpid(kid, &kst, 0) == kid && WIFEXITED(kst) && WEXITSTATUS(kst) == 0, "a child starts with its parent's");
+        errno = 0;
+        CHECK(write(fd, "1001\n", 5) == -1 && errno == EINVAL, "a number out of range: EINVAL");
+        errno = 0;
+        CHECK(write(fd, "soon\n", 5) == -1 && errno == EINVAL, "not a number: EINVAL");
+        CHECK(write(fd, "0\n", 2) == 2 && slurp("/proc/self/oom_score_adj") == 2 && strcmp(text, "0\n") == 0, "and goes back to 0");
+        // oom_score: two thirds of a thousand, of the share of memory held
+        // and of oom_score_adj.
+        long plain = slurp("/proc/self/oom_score") > 0 ? atol(text) : -1;
+        CHECK(plain >= 666 && plain < 1000, "oom_score of a small process: 666 and a little");
+        CHECK(biased >= plain + 190 && biased <= plain + 210, "200 more with oom_score_adj at 300");
+    }
     close(fd);
 
     // a name below a descriptor; the names fd/N gives: links replaced, a
@@ -286,7 +306,30 @@ int main(int argc, char **argv) {
     CHECK(slurp("/proc/stat") > 0 && strncmp(text, "cpu ", 4) == 0 && strstr(text, "\ncpu0 ") && strstr(text, "\nbtime "), "stat: cpu lines, btime");
     double up = 0, idle = 0;
     CHECK(slurp("/proc/uptime") > 0 && sscanf(text, "%lf %lf", &up, &idle) == 2 && up > 0, "uptime");
-    CHECK(slurp("/proc/loadavg") > 0 && strchr(text, '/') != NULL, "loadavg");
+    {
+        // loadavg: three averages, running/all, the newest pid; two busy
+        // processes show in the one-minute average within its 5 s sample.
+        double one = -1, five = -1, fifteen = -1;
+        int running = 0, all = 0, newest = 0;
+        CHECK(slurp("/proc/loadavg") > 0 && sscanf(text, "%lf %lf %lf %d/%d %d", &one, &five, &fifteen, &running, &all, &newest) == 6, "loadavg has its six numbers");
+        CHECK(one >= 0 && five >= 0 && fifteen >= 0 && running >= 1 && all >= running && newest > 0, "and they make sense");
+        pid_t busy[2];
+        for (int i = 0; i < 2; i++) {
+            busy[i] = fork();
+            if (busy[i] == 0) {
+                for (volatile unsigned long n = 0;; n++) {
+                }
+            }
+        }
+        struct timespec nap = {.tv_sec = 6, .tv_nsec = 500 * 1000 * 1000};
+        nanosleep(&nap, NULL);
+        double loaded = -1;
+        CHECK(slurp("/proc/loadavg") > 0 && sscanf(text, "%lf", &loaded) == 1 && loaded >= 0.10, "two busy processes raise the one-minute average");
+        for (int i = 0; i < 2; i++) {
+            kill(busy[i], SIGKILL);
+            waitpid(busy[i], NULL, 0);
+        }
+    }
     struct utsname u;
     CHECK(uname(&u) == 0 && slurp("/proc/sys/kernel/osrelease") > 0 && strncmp(text, u.release, strlen(u.release)) == 0, "osrelease is uname's");
     char id1[40], id2[40];

@@ -269,7 +269,7 @@ pub fn waitFor(ctx: anytype, comptime ready: fn (@TypeOf(ctx)) bool, deadline: u
     while (true) {
         if (ready(ctx)) return .ready;
         if (deadline != 0 and process.tick_count >= deadline) return .timed_out;
-        if (signals.deliverable(pcb) != 0) return .interrupted;
+        if (signals.interrupts(pcb)) return .interrupted;
         sched.blockOnDeadline(.poll, 0, deadline);
     }
 }

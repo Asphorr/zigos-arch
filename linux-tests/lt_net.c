@@ -1,6 +1,7 @@
 // lt_net — sockets and the calls that wait on many files: eventfd, pipes
 // that don't block, Unix sockets by pair and by name, TCP and UDP over
-// loopback, epoll (level, edge, one shot) and select. Everything stays on
+// loopback (TCP also many connections at once and in a row), epoll (level,
+// edge, one shot) and select. Everything stays on
 // this machine, so it runs with no network attached. Exit 0 = every check
 // passed, else the number of the first failed check.
 
@@ -295,8 +296,12 @@ static void check_tcp(void) {
     int l = socket(AF_INET, SOCK_STREAM, 0);
     CHECK(l >= 0, "socket(AF_INET, SOCK_STREAM)");
     CHECK(setsockopt(l, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one) == 0, "SO_REUSEADDR");
-    CHECK(bind(l, (struct sockaddr *)&a, sizeof a) == 0 && listen(l, 8) == 0, "bind to any port, listen");
-    CHECK(getsockname(l, (struct sockaddr *)&got, &glen) == 0 && glen == sizeof got && got.sin_port != 0, "getsockname names the port");
+    CHECK(bind(l, (struct sockaddr *)&a, sizeof a) == 0, "bind to any port");
+    CHECK(getsockname(l, (struct sockaddr *)&got, &glen) == 0 && got.sin_port != 0 && got.sin_addr.s_addr == htonl(INADDR_LOOPBACK),
+          "the port is chosen at bind, and the address is the one bound");
+    uint16_t bound_be = got.sin_port;
+    CHECK(listen(l, 8) == 0, "listen");
+    CHECK(getsockname(l, (struct sockaddr *)&got, &glen) == 0 && glen == sizeof got && got.sin_port == bound_be, "listen keeps that port");
     uint16_t port_be = got.sin_port;
 
     // accept is cut short by a signal with no SA_RESTART.
@@ -479,6 +484,55 @@ static void check_tcp_stall(void) {
     close(l);
 }
 
+// Many connections at once, then many in a row: what a closed connection
+// leaves behind does not stand in the way of the next ones.
+static void check_tcp_many(void) {
+    enum { PAIRS = 26, ROUNDS = 400 };
+    struct sockaddr_in a = {.sin_family = AF_INET};
+    socklen_t alen = sizeof a;
+    char b;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    int l = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(bind(l, (struct sockaddr *)&a, sizeof a) == 0 && listen(l, 64) == 0 && getsockname(l, (struct sockaddr *)&a, &alen) == 0, "a listener");
+    int c[PAIRS], s[PAIRS];
+    int made = 0;
+    for (; made < PAIRS; made++) {
+        c[made] = socket(AF_INET, SOCK_STREAM, 0);
+        if (c[made] < 0 || connect(c[made], (struct sockaddr *)&a, sizeof a) != 0) break;
+        s[made] = accept(l, NULL, NULL);
+        if (s[made] < 0) break;
+    }
+    if (made != PAIRS) printf("lt_net: connection %d of %d failed\n", made + 1, PAIRS);
+    CHECK(made == PAIRS, "26 connections held at once");
+    int ok = 1;
+    for (int i = 0; i < PAIRS; i++) {
+        char x = (char)('a' + i);
+        ok &= write(c[i], &x, 1) == 1 && read(s[i], &b, 1) == 1 && b == x;
+    }
+    CHECK(ok, "each carries its own byte");
+    // Half are closed from the client's end first, half from the server's.
+    for (int i = 0; i < PAIRS; i++) {
+        close(i % 2 ? c[i] : s[i]);
+        close(i % 2 ? s[i] : c[i]);
+    }
+
+    long t0 = now_ms();
+    int done = 0;
+    for (; done < ROUNDS; done++) {
+        int cc = socket(AF_INET, SOCK_STREAM, 0);
+        if (cc < 0 || connect(cc, (struct sockaddr *)&a, sizeof a) != 0) break;
+        int ss = accept(l, NULL, NULL);
+        if (ss < 0 || write(cc, "q", 1) != 1 || read(ss, &b, 1) != 1) break;
+        close(cc);
+        close(ss);
+    }
+    long took = now_ms() - t0;
+    if (done != ROUNDS || took >= 10000) printf("lt_net: %d of %d connections in a row, %ld ms\n", done, ROUNDS, took);
+    CHECK(done == ROUNDS, "400 connections one after another");
+    CHECK(took < 10000, "none of them waits for a closed one to be forgotten");
+    close(l);
+}
+
 static void check_udp(void) {
     struct sockaddr_in a = {.sin_family = AF_INET}, from, got;
     socklen_t flen = sizeof from, glen = sizeof got;
@@ -508,6 +562,12 @@ static void check_udp(void) {
     CHECK(send(cli, big, sizeof big, 0) == -1 && errno == EMSGSIZE, "more than a frame is refused");
     close(srv);
     close(cli);
+
+    // Many at once: as many as the descriptor table has room for.
+    int many[40], n = 0;
+    while (n < 40 && (many[n] = socket(AF_INET, SOCK_DGRAM, 0)) >= 0) n++;
+    CHECK(n == 40, "forty datagram sockets at once");
+    while (n > 0) close(many[--n]);
 }
 
 static void check_epoll(void) {
@@ -621,8 +681,8 @@ static const struct {
 } groups[] = {
     {"eventfd", check_eventfd}, {"pipe", check_pipe_nonblock}, {"pair", check_socketpair},
     {"unix", check_unix_named}, {"tcp", check_tcp},            {"linger", check_tcp_linger},
-    {"stall", check_tcp_stall}, {"udp", check_udp},            {"epoll", check_epoll},
-    {"select", check_select},
+    {"stall", check_tcp_stall}, {"many", check_tcp_many},      {"udp", check_udp},
+    {"epoll", check_epoll},     {"select", check_select},
 };
 
 // With arguments, only the groups they name.

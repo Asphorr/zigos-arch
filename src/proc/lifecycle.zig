@@ -556,6 +556,7 @@ pub fn forkCurrent(frame: *signals.SyscallFrame, spec: ForkSpec) ?usize {
         const shm = @import("../mm/shm.zig");
         for (process.procs[i].regions.slice()) |r| {
             if (r.shm_id != shm.SHM_INVALID) _ = shm.acquire(r.shm_id);
+            r.holdBacking();
             if (r.buf_owned) {
                 if (r.source) |src| pmm.shareContiguous(kbufPhys(src));
             }
@@ -575,6 +576,7 @@ pub fn forkCurrent(frame: *signals.SyscallFrame, spec: ForkSpec) ?usize {
     process.procs[i].cwd = parent_lead_src.cwd;
     process.procs[i].cwd_len = parent_lead_src.cwd_len;
     process.procs[i].umask = parent_lead_src.umask;
+    process.procs[i].oom_score_adj = @atomicLoad(i16, &parent_lead_src.oom_score_adj, .monotonic);
     process.procs[i].name = parent_lead_src.name;
     process.procs[i].name_len = parent_lead_src.name_len;
     process.procs[i].sigactions = parent_lead_src.sigactions;
@@ -1273,28 +1275,34 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp, persist_shared_dirty: 
             // this AS's PTEs, so any of its pages now mapped by no one else sit
             // at refcount==1 (cache-only) with their dirty bit still set.
             //
-            //   * persist_shared_dirty (graceful exit, Slice 3d-2b): LEAVE them
-            //     dirty. pgflushd — guaranteed running, since a cache_shared
+            //   * Any end but one for memory (an exit, a signal, a kill): LEAVE
+            //     them dirty. pgflushd — guaranteed running, since a cache_shared
             //     region can only exist if ext2 init'd, which is what spawns it
             //     — writes them back within ≤1 interval, then its refcount-gated
-            //     clear makes them evictable. So a process that exits WITHOUT
+            //     clear makes them evictable. So a process that ends WITHOUT
             //     msync still durably persists its final window of writes.
-            //   * !persist_shared_dirty (OOM-kill / fatal fault / external kill):
-            //     clear the dirty bit WITHOUT writeback. The OOM path reaches
-            //     here under memory pressure and must free these pages NOW, not
-            //     wait for the daemon; dropping the unflushed writes is the right
-            //     trade when the alternative is staying out of memory. (Else they
+            //   * Ended for its memory (lead.oom_ended, the OOM policy): clear
+            //     the dirty bit WITHOUT writeback. That path reaches here under
+            //     memory pressure and must free these pages NOW, not wait for
+            //     the daemon; dropping the unflushed writes is the right trade
+            //     when the alternative is staying out of memory. (Else they
             //     would linger dirty-and-unevictable — chooseSlot skips dirty.)
             //
             // Either way, pages another AS still maps (refcount>1) are untouched:
             // clearDirtyRangeCacheOnly is refcount-gated, and the surviving peer
             // keeps them dirty (pgflushd re-flushes while it lives). Safe against
             // an inode being freed+reused inside the widened dirty window: ext2
-            // freeInode/truncate → page_cache.invalidateFile drops EVERY entry
-            // (dirty included), so a stale page can't be written to a reused inum.
-            if (r.cache_inode != 0 and r.cache_shared and !persist_shared_dirty) {
+            // freeInode → page_cache.invalidateFile drops EVERY entry (dirty
+            // included), so a stale page can't be written to a reused inum.
+            if (r.cache_inode != 0 and r.cache_shared and !persist_shared_dirty and !@atomicLoad(bool, &lead.exits_clean, .acquire) and
+                @atomicLoad(bool, &lead.oom_ended, .acquire))
+            {
                 _ = page_cache.clearDirtyRangeCacheOnly(page_cache.ext2FileId(r.cache_inode), r.cache_off, r.end - r.start);
             }
+            // The mapping's hold on its inode, last: until here the inode
+            // could not go to another file. One this frees waits for
+            // pgflushd (ext2.freeQueued): teardown does no I/O.
+            r.dropBacking();
             if (!r.buf_owned) continue;
             const src = r.source orelse continue;
             pmm.releaseContiguous(kbufPhys(src), r.buf_pages);
@@ -1374,7 +1382,10 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp, persist_shared_dirty: 
     // Children are the process's (parent_pid = the lead): they move when
     // the group empties, whichever member is the last. Until then a worker
     // may wait4 them, and the lead's slot is still the group's.
-    if (last_in_group) reparentChildren(my_tgid);
+    if (last_in_group) {
+        hangUpOrphanedGroups(my_tgid);
+        reparentChildren(my_tgid);
+    }
 
     if ((parent_alive and !is_worker_thread) or must_pin_as_lead) {
         process.procs[pid].death_tick = process.tick_count;
@@ -1389,7 +1400,9 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp, persist_shared_dirty: 
             // SIGCHLD is default-ignored, so this is a no-op for shells
             // that don't care; shells with a SIGCHLD handler can do
             // non-blocking reaping. Sent regardless of waitpid state per POSIX.
-            notifyParentOfExit(parent, pid);
+            // Not for a lead that stays pinned: its process lives on, and
+            // the last thread out sends the one that counts.
+            if (!must_pin_as_lead) notifyParentOfExit(parent, pid);
         }
         // Nobody will wait for it: the parent keeps no zombies, or ended
         // since the look at it above — it raised `orphan` and looked for a
@@ -1408,6 +1421,17 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp, persist_shared_dirty: 
             if (waiting) process.wake(parent);
             wakeChildWaiters(parent);
         }
+    }
+
+    // After an execve from a thread the program's main thread is a worker:
+    // how the last one ends is how the process ends, as the lead's end is
+    // for any other process. A group that exits or is killed as a whole
+    // has its status on the lead already.
+    if (is_worker_thread and last_in_group and process.procs[my_tgid].pid_nr == lead_nr and
+        @atomicLoad(bool, &process.procs[my_tgid].main_is_worker, .acquire) and
+        !@atomicLoad(bool, &process.procs[my_tgid].group_exiting, .seq_cst))
+    {
+        process.procs[my_tgid].exit_status = status;
     }
 
     // A worker that outlived its lead: the lead sits pinned as a zombie
@@ -1487,7 +1511,9 @@ pub fn killProcessWithStatus(pid: u8, status: u32) void {
             init_state == @intFromEnum(State.zombie)) return;
     }
 
-    process.procs[pid].exit_status = status;
+    // The first killer's status stands, as on Linux, however long the task
+    // takes to end; it is there before exit_requested says to read it.
+    process.offerKillStatus(&process.procs[pid], status);
 
     // Atomic ownership claim — only one killer runs teardown per pid.
     // .Xchg returns the previous value; if it was already true another
@@ -1507,11 +1533,14 @@ pub fn killProcessWithStatus(pid: u8, status: u32) void {
         return;
     }
 
+    // The claim may be ours and the status an earlier killer's.
+    const first_status = process.killStatus(&process.procs[pid]);
+
     // Case 1: self-kill (current CPU is running pid). Escalate to the
     // self-destroy path, which steers TSS rsp0 to idle and never returns.
     if (smp.currentPid()) |cur| {
         if (cur == pid) {
-            destroyCurrentWithStatus(status);
+            destroyCurrentWithStatus(first_status);
             unreachable;
         }
     }
@@ -1529,7 +1558,10 @@ pub fn killProcessWithStatus(pid: u8, status: u32) void {
         // schedule(). The one gap — running when read, then into a section
         // and asleep before the state read — case 3 closes with nokill_seq.
         const seq = @atomicLoad(u32, &process.procs[pid].nokill_seq, .acquire);
-        if (!process.doomed(pid)) return;
+        if (!process.doomed(pid)) {
+            endWaitOfKilled(pid);
+            return;
+        }
         const snap = @atomicLoad(u8, @as(*const u8, @ptrCast(&process.procs[pid].state)), .acquire);
         if (snap == @intFromEnum(State.zombie) or snap == @intFromEnum(State.unused)) return;
 
@@ -1587,7 +1619,8 @@ pub fn killProcessWithStatus(pid: u8, status: u32) void {
             var spin: u32 = 0;
             while (spin < 1_000_000) : (spin += 1) {
                 const s = @atomicLoad(u8, @as(*const u8, @ptrCast(&process.procs[pid].state)), .acquire);
-                if (!stillOnCpu(pid, s)) break;
+                // Into a call or a no-kill section meanwhile: not ours.
+                if (!stillOnCpu(pid, s) or !process.doomed(pid)) break;
                 asm volatile ("pause" ::: .{ .memory = true });
             }
             continue;
@@ -1610,8 +1643,44 @@ pub fn killProcessWithStatus(pid: u8, status: u32) void {
         // shared dirty pages, same as today. A killed process makes no msync
         // guarantee; persisting its final window is deferred (the graceful
         // self-exit path opts in via destroyCurrentGraceful).
-        tearDownTask(pid, status, .kill, false);
+        //
+        // A kill of this task now waits for the teardown: ending here would
+        // leave the victim half gone, its locks held by nobody.
+        process.noKillEnter();
+        tearDownTask(pid, first_status, .kill, false);
+        process.noKillLeave();
         return;
+    }
+}
+
+/// A killed task that is not torn down from outside. Inside a Linux call
+/// it ends as the call returns: a wait it sleeps in ends now, and a
+/// job-control stop no longer holds it. In a no-kill section or its own
+/// teardown it needs nothing.
+fn endWaitOfKilled(pid: u8) void {
+    const p = &process.procs[pid];
+    if (!@atomicLoad(bool, &p.in_call, .acquire)) return;
+    @atomicStore(bool, &p.job_stopped, false, .seq_cst);
+    process.wake(pid);
+    process.kickReschedule(pid);
+}
+
+/// Wake again the killed tasks that are still inside a Linux call: a wake
+/// that came before the call's wait began is not lost for good, and a call
+/// that does not end is named. From the timer, once a second.
+pub fn nudgeKilled() void {
+    for (&process.procs, 0..) |*p, i| {
+        if (!@atomicLoad(bool, &p.exit_requested, .acquire) or !@atomicLoad(bool, &p.in_call, .acquire)) {
+            p.kill_nudges = 0;
+            continue;
+        }
+        if (p.state == .unused or p.state == .zombie or p.state == .loading) continue;
+        p.kill_nudges +|= 1;
+        if (p.kill_nudges == 5) {
+            debug.klog("[kill] pid={d} '{s}' is killed and still inside a call after 5 s\n", .{ i, std.mem.sliceTo(&p.name, 0) });
+            process.dumpSyscallRing(@intCast(i));
+        }
+        endWaitOfKilled(@intCast(i));
     }
 }
 
@@ -1658,6 +1727,12 @@ pub fn killProcess(pid: u8) void {
 pub fn killThreadGroup(tgid: u8, status: u32) void {
     const my_pid_opt = smp.currentPid();
 
+    // A lead whose thread went first sits pinned while the group lives (a
+    // main thread that exited, an execve from another thread): the status
+    // its parent reads is how the group ends.
+    if (tgid < MAX_PROCS and process.procs[tgid].state == .zombie and groupHasOtherLive(tgid)) {
+        process.procs[tgid].exit_status = status;
+    }
     // Phase 1: kill every peer OTHER than the current thread. Defer self so
     // tearDownTask on peers (which reads procs[tgid].regions etc) can
     // finish before we tear our own kstack out from under this call.
@@ -1672,7 +1747,9 @@ pub fn killThreadGroup(tgid: u8, status: u32) void {
         if (cur_pcb.tgid == tgid) {
             const s = cur_pcb.state;
             if (s != .unused and s != .zombie) {
-                destroyCurrentWithStatus(status);
+                // An earlier killer's status stands.
+                process.offerKillStatus(cur_pcb, status);
+                destroyCurrentWithStatus(process.killStatus(cur_pcb));
                 unreachable;
             }
         }
@@ -1696,6 +1773,10 @@ fn killPeers(tgid: u8, except: ?usize, status: u32) void {
 /// gone (a killed thread inside a no-kill section finishes it first). For
 /// execve, which then drops the address space they ran on: it waits for
 /// as long as that takes, as Linux's de_thread does.
+///
+/// The caller need not be the lead: the lead is then one of the threads
+/// that go, and its slot stays pinned with the process's state, as when a
+/// main thread exits before the others.
 pub fn killOtherThreads() void {
     const me = smp.currentPid() orelse return;
     const tgid = process.procs[me].tgid;
@@ -1703,15 +1784,40 @@ pub fn killOtherThreads() void {
     @atomicStore(bool, &process.procs[tgid].group_exiting, true, .seq_cst);
     killPeers(tgid, me, 0);
     var waited_s: u32 = 0;
-    while (groupHasOtherLive(@intCast(me))) {
+    while (groupHasLiveBeside(tgid, me)) {
         var d = @import("../util/deadline.zig").Deadline.ms(5000, "execve: other threads");
-        while (groupHasOtherLive(@intCast(me)) and d.live()) @import("sched_asm.zig").softYield();
-        if (groupHasOtherLive(@intCast(me))) {
+        while (groupHasLiveBeside(tgid, me) and d.live()) @import("sched_asm.zig").softYield();
+        if (groupHasLiveBeside(tgid, me)) {
             waited_s += 5;
             debug.klog("[exec] pid={d}: threads of the group still alive after {d} s\n", .{ me, waited_s });
         }
     }
     @atomicStore(bool, &process.procs[tgid].group_exiting, false, .seq_cst);
+}
+
+/// The caller's is the one execve its process commits now: false while
+/// another thread's is. Two at once would each wait for the other to die.
+pub fn execBegin() bool {
+    const me = smp.currentPid() orelse return false;
+    const lead = process.leader(&process.procs[me]);
+    return @cmpxchgStrong(bool, &lead.execing, false, true, .acq_rel, .acquire) == null;
+}
+
+/// The execve execBegin let in is over, taken or failed.
+pub fn execEnd() void {
+    const me = smp.currentPid() orelse return;
+    @atomicStore(bool, &process.leader(&process.procs[me]).execing, false, .release);
+}
+
+/// True while group `tgid` has a live member other than `me`.
+fn groupHasLiveBeside(tgid: u8, me: usize) bool {
+    for (0..MAX_PROCS) |k| {
+        if (k == me) continue;
+        const s = process.procs[k].state;
+        if (s == .unused or s == .loading or s == .zombie) continue;
+        if (process.procs[k].tgid == tgid) return true;
+    }
+    return false;
 }
 
 /// The per-process image fields execve trades between the caller and the
@@ -1732,35 +1838,48 @@ fn swapImages(p: *PCB, t: *PCB) void {
     inline for (IMAGE_FIELDS) |f| std.mem.swap(@TypeOf(@field(p, f)), &@field(p, f), &@field(t, f));
 }
 
-/// execve's commit, past which there is no going back: the calling lead,
-/// alone in its group (killOtherThreads), takes the address space and image
+/// execve's commit, past which there is no going back: the caller, alone
+/// in its group (killOtherThreads), takes the address space and image
 /// built in `img` (elf_loader.loadForExec, held in .loading); `img` takes
-/// the caller's old ones and is torn down with them, as an exiting process
+/// the process's old ones and is torn down with them, as an exiting process
 /// would be (MAP_SHARED dirty pages stay for pgflushd). Identity, fds,
-/// parent and children stay the caller's.
+/// parent and children stay the process's.
+///
+/// The process's state is on its lead's slot, also when the caller is
+/// another thread and the lead's thread is gone (killOtherThreads): the new
+/// program then runs in the caller's slot, under the process's pid and the
+/// caller's tid.
 pub fn takeExecImage(img: usize) void {
     const me = smp.currentPid() orelse return;
     const p = &process.procs[me];
+    const lead = process.leader(p);
     const t = &process.procs[img];
-    swapImages(p, t);
+    swapImages(lead, t);
+    // A thread runs on its own copies of the lead's three.
+    p.page_directory = lead.page_directory;
+    p.page_dir_phys = lead.page_dir_phys;
+    p.pcid = lead.pcid;
+    if (p != lead) @atomicStore(bool, &lead.main_is_worker, true, .release);
     // Onto the new tables before the old ones go.
     pcid_mod.loadCr3(p.page_dir_phys, p.pcid, smp.myCpu().cpu_id);
 
-    p.name = t.name;
-    p.name_len = t.name_len;
-    p.argv = t.argv;
-    p.arg_lens = t.arg_lens;
-    p.argc = t.argc;
-    p.exe_path = t.exe_path;
-    p.exe_path_len = t.exe_path_len;
-    p.personality = t.personality;
-    p.clear_child_tid = 0;
     // Handlers were code of the old image: they go back to the default.
     // What is ignored stays ignored, and the mask and pending signals are
-    // the process's still.
-    for (&p.sigactions) |*d| {
-        d.* = if (d.handler == signals.SIG_IGN) .{ .handler = signals.SIG_IGN } else .{};
+    // the process's still. On the lead's slot and the caller's alike.
+    for ([_]*PCB{ lead, p }) |q| {
+        q.name = t.name;
+        q.name_len = t.name_len;
+        q.argv = t.argv;
+        q.arg_lens = t.arg_lens;
+        q.argc = t.argc;
+        q.exe_path = t.exe_path;
+        q.exe_path_len = t.exe_path_len;
+        q.personality = t.personality;
+        for (&q.sigactions) |*d| {
+            d.* = if (d.handler == signals.SIG_IGN) .{ .handler = signals.SIG_IGN } else .{};
+        }
     }
+    p.clear_child_tid = 0;
     p.in_signal_handler = false;
     p.alt_stack = .{};
 
@@ -1771,13 +1890,19 @@ pub fn takeExecImage(img: usize) void {
 /// Linux exit_group(): the caller's whole group exits with `status`, the
 /// other threads killed first as in killThreadGroup, the caller last through
 /// the graceful self-exit (a voluntary exit persists shared dirty pages).
-pub fn exitThreadGroup(status: u32) void {
+pub fn exitThreadGroup(exit_code: u32) void {
     const cur = smp.currentPid() orelse return;
     const tgid = process.procs[cur].tgid;
+    // Killed before it got here: the group ends with that status, not this.
+    const me = &process.procs[cur];
+    const status = if (@atomicLoad(bool, &me.exit_requested, .acquire)) process.killStatus(me) else exit_code;
     // A lead that exited first stays pinned until the group empties; the
     // status its parent reads is the group's.
     if (cur != tgid and process.procs[tgid].state == .zombie) process.procs[tgid].exit_status = status;
     @atomicStore(bool, &process.procs[tgid].group_exiting, true, .seq_cst);
+    // A thread inside a call outlives the caller: the last one out ends
+    // the group as the caller would have.
+    @atomicStore(bool, &process.procs[tgid].exits_clean, true, .release);
     killPeers(tgid, cur, status);
     destroyCurrentGraceful(status);
 }
@@ -1818,6 +1943,84 @@ fn notifyParentOfExit(parent: u8, child: usize) void {
 }
 
 const INIT_PID: u8 = 1; // desktop, by convention
+
+/// The process in slot `dying` ends. A process group that is left with no
+/// member whose parent is in another group of its session is orphaned: no
+/// shell is there to continue its stopped members. POSIX has every member
+/// of a group this end orphans, one of them stopped, sent SIGHUP and then
+/// SIGCONT. The groups it can orphan are its own and its children's.
+/// Before the children are given a new parent.
+fn hangUpOrphanedGroups(dying: u8) void {
+    const d = &process.procs[dying];
+    @atomicStore(bool, &d.leaving, true, .seq_cst);
+    // Only a group it held until now: its own through its parent, a
+    // child's through itself.
+    if (hasParent(dying)) {
+        const pt = &process.procs[d.parent_pid];
+        if (pt.state != .loading and pt.tgid < MAX_PROCS) {
+            const pp = process.leader(pt);
+            if (pp.pgid != d.pgid and pp.sid == d.sid) hangUpIfOrphaned(d.pgid, dying);
+        }
+    }
+    for (&process.procs, 0..) |*c, i| {
+        if (i == dying or c.state == .unused or c.state == .loading) continue;
+        if (c.tgid != i or c.parent_pid != dying) continue;
+        if (c.pgid == d.pgid or c.sid != d.sid) continue;
+        hangUpIfOrphaned(c.pgid, dying);
+    }
+}
+
+/// The process in slot `i`, alive: its lead, or threads its ended lead left.
+fn liveProcess(i: usize) bool {
+    const p = &process.procs[i];
+    if (p.state == .unused or p.state == .loading or p.tgid != i) return false;
+    return p.state != .zombie or groupHasOtherLive(@intCast(i));
+}
+
+/// True if the task in `slot` is a lead whose thread has ended while other
+/// threads of its process live (a main thread that exited first, an execve
+/// from another thread): the process is there, under this slot's number.
+pub fn pinnedLead(slot: usize) bool {
+    if (slot >= MAX_PROCS) return false;
+    const p = &process.procs[slot];
+    return p.state == .zombie and p.tgid == slot and groupHasOtherLive(@intCast(slot));
+}
+
+/// Hang up process group `pgid` if, `dying` not counted as a member or as a
+/// parent, it is orphaned and has a stopped member.
+fn hangUpIfOrphaned(pgid: u32, dying: u8) void {
+    if (pgid == 0) return;
+    var stopped = false;
+    for (&process.procs, 0..) |*t, i| {
+        if (t.state == .unused or t.state == .loading or t.state == .zombie) continue;
+        if (t.tgid == dying or t.tgid >= MAX_PROCS) continue;
+        const lead = &process.procs[t.tgid];
+        if (lead.pgid != pgid) continue;
+        // One that is ending too is no member any more.
+        if (@atomicLoad(bool, &lead.leaving, .seq_cst)) continue;
+        if (@atomicLoad(bool, &t.job_stopped, .seq_cst)) stopped = true;
+        if (t.tgid != i and lead.state != .zombie) continue; // the lead answers for the process
+        // A parent in another group of the session holds the group.
+        const par = lead.parent_pid;
+        if (par == dying or par == 0 or par == INIT_PID or par >= MAX_PROCS) continue;
+        if (@atomicLoad(bool, &lead.orphan, .seq_cst)) continue;
+        const pt = &process.procs[par];
+        if (pt.state == .unused or pt.state == .loading or pt.tgid >= MAX_PROCS) continue;
+        // The parent's group and session are its lead's (a native task's
+        // parent may be a thread, whose copies go stale).
+        const pp = process.leader(pt);
+        // Nor does a parent that is ending hold the group.
+        if (@atomicLoad(bool, &pp.leaving, .seq_cst)) continue;
+        if (pp.pgid != pgid and pp.sid == lead.sid) return;
+    }
+    if (!stopped) return;
+    for (0..MAX_PROCS) |i| {
+        if (i == dying or !liveProcess(i) or process.procs[i].pgid != pgid) continue;
+        if (@atomicLoad(bool, &process.procs[i].leaving, .seq_cst)) continue;
+        _ = signals.sendProcess(@intCast(i), signals.SIGHUP, .{});
+        _ = signals.sendProcess(@intCast(i), signals.SIGCONT, .{});
+    }
+}
 
 /// Walk every PCB and reparent any whose parent_pid == dead_pid to INIT_PID.
 /// Called from the destroy paths just before flipping state to .zombie or

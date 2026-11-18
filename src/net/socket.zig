@@ -47,6 +47,7 @@ pub const Error = error{
 };
 
 const NONE: u8 = 0xFF;
+const NO_UDP: u16 = 0xFFFF;
 
 pub const Socket = struct {
     family: Family,
@@ -59,10 +60,12 @@ pub const Socket = struct {
     /// inet stream: the listener, once listen made it one.
     listener: u8 = NONE,
     /// inet datagram: its UDP socket.
-    udp: u8 = NONE,
+    udp: u16 = NO_UDP,
     /// inet: the port bind asked for (a stream uses it at listen or
     /// connect; a datagram socket's is the UDP socket's).
     bound_port: u16 = 0,
+    /// inet: the address bind named, as getsockname reports it.
+    bound_ip: [4]u8 = .{ 0, 0, 0, 0 },
     bound: bool = false,
     /// inet datagram: where connect pointed it.
     peer: ?net.Endpoint = null,
@@ -114,7 +117,7 @@ fn wrap(init: Socket) Error!*Socket {
 pub fn destroy(s: *Socket) void {
     if (s.conn != NONE) net.tcpRelease(s.conn);
     if (s.listener != NONE) net.tcpUnlisten(s.listener);
-    if (s.udp != NONE) net.udpClose(s.udp);
+    if (s.udp != NO_UDP) net.udpClose(s.udp);
     if (s.ux) |u| {
         const inum = unix.destroy(u);
         if (inum != 0) @import("../fs/ext2/ext2.zig").release(inum);
@@ -189,7 +192,7 @@ const OUT_BITS: u16 = fdpoll.POLLOUT | fdpoll.POLLWRNORM;
 
 pub fn pollMask(s: *Socket) u16 {
     if (s.ux) |u| return unix.mask(u);
-    if (s.udp != NONE) {
+    if (s.udp != NO_UDP) {
         return OUT_BITS | (if (net.udpReadable(s.udp) or s.rd_shut) IN_BITS else 0);
     }
     if (s.listener != NONE) {
@@ -211,7 +214,7 @@ pub fn pollMask(s: *Socket) u16 {
 
 pub fn events(s: *Socket) u32 {
     if (s.ux) |u| return unix.events(u);
-    if (s.udp != NONE) return net.udpEvents(s.udp);
+    if (s.udp != NO_UDP) return net.udpEvents(s.udp);
     if (s.listener != NONE) return net.tcpListenerEvents(s.listener);
     if (s.conn != NONE) return net.tcpView(s.conn).events;
     return 0;
@@ -278,14 +281,16 @@ pub fn bindInet(s: *Socket, ep: net.Endpoint) Error!void {
     s.setup.acquire();
     defer s.setup.release();
     if (s.bound or s.conn != NONE or s.listener != NONE) return error.Invalid;
-    if (s.udp != NONE) {
+    if (s.udp != NO_UDP) {
         if (net.udpPort(s.udp) != 0) return error.Invalid;
         if (!net.udpBind(s.udp, ep.port)) return error.AddrInUse;
     } else {
         // The port is taken at listen; one a listener has is refused here.
+        // A bind that names none gets one now: getsockname tells it.
         if (ep.port != 0 and net.tcpPortListening(ep.port)) return error.AddrInUse;
-        s.bound_port = ep.port;
+        s.bound_port = if (ep.port != 0) ep.port else net.tcpPickPort();
     }
+    s.bound_ip = ep.ip;
     s.bound = true;
 }
 
@@ -326,7 +331,7 @@ fn failureOf(why: net.TcpFail) Error {
 pub fn connectInet(s: *Socket, to: net.Endpoint, nonblock: bool) Error!void {
     if (s.family != .inet) return error.Invalid;
     const ep = destination(to);
-    if (s.udp != NONE) {
+    if (s.udp != NO_UDP) {
         s.peer = ep;
         return;
     }
@@ -349,7 +354,11 @@ pub fn connectInet(s: *Socket, to: net.Endpoint, nonblock: bool) Error!void {
                 // A connection that failed: a new attempt, in its slot.
                 if (!net.tcpReconnect(s.conn, ep.ip, ep.port, s.bound_port)) return error.Unreachable;
             } else {
-                s.conn = net.tcpConnectStart(ep.ip, ep.port, s.bound_port) orelse return error.Unreachable;
+                s.conn = net.tcpConnectStart(ep.ip, ep.port, s.bound_port) catch |e| return switch (e) {
+                    error.Unreachable => error.Unreachable,
+                    // Every connection slot in the system is held.
+                    error.NoSlot => error.NoBufs,
+                };
             }
         }
     }
@@ -413,7 +422,7 @@ pub fn accept(s: *Socket, nonblock: bool) Error!*Socket {
 pub fn shutdown(s: *Socket, rd: bool, wr: bool) Error!void {
     if (s.ux) |u| {
         unix.shutdown(u, rd, wr);
-    } else if (s.udp == NONE) {
+    } else if (s.udp == NO_UDP) {
         if (s.conn == NONE) return error.NotConnected;
         if (wr) net.tcpShutdownWrite(s.conn);
     }
@@ -436,9 +445,9 @@ pub fn localAddr(s: *Socket) Addr {
         const n = unix.nameOf(u);
         return if (n.len == 0) .none else .{ .unix = n };
     }
-    if (s.udp != NONE) return .{ .inet = .{ .ip = .{ 0, 0, 0, 0 }, .port = net.udpPort(s.udp) } };
+    if (s.udp != NO_UDP) return .{ .inet = .{ .ip = s.bound_ip, .port = net.udpPort(s.udp) } };
     if (s.conn != NONE) return .{ .inet = net.tcpLocal(s.conn) };
-    return .{ .inet = .{ .ip = .{ 0, 0, 0, 0 }, .port = s.bound_port } };
+    return .{ .inet = .{ .ip = s.bound_ip, .port = s.bound_port } };
 }
 
 pub fn peerAddr(s: *Socket) Error!Addr {
@@ -446,7 +455,7 @@ pub fn peerAddr(s: *Socket) Error!Addr {
         const p = unix.peerOf(u) orelse return error.NotConnected;
         return if (p.name.len == 0) .none else .{ .unix = p.name };
     }
-    if (s.udp != NONE) return .{ .inet = s.peer orelse return error.NotConnected };
+    if (s.udp != NO_UDP) return .{ .inet = s.peer orelse return error.NotConnected };
     if (s.conn == NONE) return error.NotConnected;
     const v = net.tcpView(s.conn);
     if (v.connecting or v.failed) return error.NotConnected;
@@ -476,7 +485,7 @@ pub fn isListening(s: *Socket) bool {
 /// Bytes a read would get now (FIONREAD).
 pub fn pending(s: *Socket) usize {
     if (s.ux) |u| return unix.pending(u);
-    if (s.udp != NONE) return net.udpNextLen(s.udp);
+    if (s.udp != NO_UDP) return net.udpNextLen(s.udp);
     if (s.conn != NONE) return net.tcpView(s.conn).rx_bytes;
     return 0;
 }
@@ -565,7 +574,7 @@ pub fn recv(s: *Socket, spans: []const Span, fl: RecvFlags, from: ?*Addr) Error!
     const io = &cursor;
     const len = io.total();
     if (s.ux) |u| return if (s.type == .stream) recvUnixStream(s, u, io, len, fl) else recvUnixMessage(s, u, io, len, fl, from);
-    if (s.udp != NONE) return recvUdp(s, io, len, fl, from);
+    if (s.udp != NO_UDP) return recvUdp(s, io, len, fl, from);
     return recvTcp(s, io, len, fl);
 }
 
@@ -577,7 +586,7 @@ pub fn send(s: *Socket, spans: []const Span, fl: SendFlags, to: Dest) Error!usiz
     const io = &cursor;
     const len = io.total();
     if (s.ux) |u| return if (s.type == .stream) sendUnixStream(s, u, io, len, fl) else sendUnixMessage(s, u, io, len, fl, to);
-    if (s.udp != NONE) return sendUdp(s, io, len, to);
+    if (s.udp != NO_UDP) return sendUdp(s, io, len, to);
     return sendTcp(s, io, len, fl);
 }
 

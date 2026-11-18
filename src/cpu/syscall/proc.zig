@@ -1064,7 +1064,7 @@ pub fn sysUsleep(usec: u32) u32 {
     while (!hrtimer.due(perf.rdtsc(), deadline)) {
         // Interruptible: a pending, unmasked signal ends the sleep so it's
         // delivered on syscall return rather than after the full duration.
-        if (signals.deliverable(pcb) != 0) break;
+        if (signals.interrupts(pcb)) break;
         // Sub-floor remainder (woken a hair early, or usec barely over the
         // floor): spin it out rather than pay another deschedule round-trip.
         if (hrtimer.due(perf.rdtsc() +% floor_tsc, deadline)) {
@@ -1077,8 +1077,9 @@ pub fn sysUsleep(usec: u32) u32 {
         sched.registerHiresWake(deadline);
         process.setState(cur_pid, .sleeping);
         // Same register-then-recheck as sysSleep: wakeHiresExpired drops a
-        // due deadline whose task is not .sleeping yet.
-        if (hrtimer.due(perf.rdtsc(), deadline)) {
+        // due deadline whose task is not .sleeping yet. And a signal or a
+        // kill that came since the look above woke nobody.
+        if (hrtimer.due(perf.rdtsc(), deadline) or signals.interrupts(pcb)) {
             process.setState(cur_pid, .running);
             continue;
         }

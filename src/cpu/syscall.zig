@@ -231,7 +231,12 @@ export fn doSyscall(sys_num: u32, arg1: u32, arg2: u32, arg3: u32, frame_raw: ?*
             // rt_sigreturn's result is a register it put back, not a
             // call's: nothing in it says to run the call again.
             const back = sys_num == linux.SYS_rt_sigreturn;
+            // A kill waits for the call to return, then lands here: before
+            // a signal is delivered to code the thread no longer owns.
+            process.callEnter(pcb);
             const done = if (back) linux_signal.rtSigreturn(pcb, f) else linux.dispatch(sys_num, f);
+            process.callLeave(pcb);
+            dieIfKilled();
             lprof.syscall(sys_num, t0);
             if (!back) {
                 linux.tracePath(sys_num, f, done);
@@ -281,7 +286,7 @@ fn dieIfKilled() void {
     const pid = @import("smp.zig").currentPid() orelse return;
     const pcb = &process.procs[pid];
     if (pcb.is_idle or !process.doomed(pid) or @atomicLoad(bool, &pcb.teardown_marked, .acquire)) return;
-    process.destroyCurrentWithStatus(pcb.exit_status);
+    process.destroyCurrentWithStatus(process.killStatus(pcb));
 }
 
 /// A syscall that ends with a sleeping lock still counted against its task

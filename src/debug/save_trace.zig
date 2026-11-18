@@ -253,7 +253,9 @@ pub export fn save_trace_record(kesp_ptr: usize) callconv(.c) void {
         // are fine for forensics.
         last_save_kesp[pid] = new_kesp;
         last_save_plus48[pid] = saved_rip;
-        last_save_tsc[pid] = rings[cpu_id].entries[slot].tsc;
+        // Through the pointer: `rings[cpu_id]...` read by value copies the
+        // whole array (41 KB) onto the outgoing task's kernel stack.
+        last_save_tsc[pid] = ring.entries[slot].tsc;
         // HWBP arm: catch any write to kesp+48 whose value ≠ the per-pid
         // save_trace mirror. Uses the mirror_pid_plus1 path in
         // watch.onDebugException, which structurally suppresses:

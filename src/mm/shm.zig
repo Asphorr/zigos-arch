@@ -1,165 +1,190 @@
-//! Shared anonymous memory regions — POSIX MAP_SHARED|MAP_ANONYMOUS.
+//! Shared anonymous memory: Linux mmap(MAP_SHARED|MAP_ANONYMOUS) and a
+//! shared /dev/zero, the native shm call, io_uring's rings.
 //!
-//! A region is a fixed-size, eagerly-allocated set of physical frames that
-//! multiple processes can attach to via their `LazyRegion` table. The page-
-//! fault handler maps the requested page from `frames[]` instead of fresh-
-//! allocating, so all attachers share the same physical pages byte-for-byte.
+//! An object is a run of pages that every address space attached to it maps
+//! to the same frames. A page gets its frame when it is first touched
+//! (frameFor) — or all of them at once for the kernel's own users, which
+//! read the frames without a fault (create). The frames are named by a
+//! two-level table: a directory with a leaf frame for each 512 pages.
 //!
-//! Lifecycle:
-//!   create(size_pages) — alloc frames, zero them, refcount = 1, return id.
-//!   acquire(id)        — fork inheritance: child bumps refcount.
-//!   release(id)        — munmap / exit: decrement; free frames at 0.
-//!   frameAt(id, idx)   — fault handler looks up the phys for a given page.
+//! Every LazyRegion piece that names the object holds one reference
+//! (LazyRegion.tailFrom takes one for a piece split off); the last release
+//! frees the frames. A frame's own count is one for the object and one for
+//! each mapping of it.
 //!
-//! Lock discipline: a single SpinLock serializes the slot table and refcount
-//! transitions. frameAt is safe without the lock because callers hold a
-//! refcount (which keeps in_use=true and the frames[] entries stable).
-//!
-//! Sizing rationale (MAX_SHM_REGIONS=32, MAX_PAGES_PER_REGION=256 = 1 MB):
-//! Phase 1 is fork-inherited only — most usage is "parent allocates N small
-//! buffers, forks workers". 32 regions × 1 MB = 32 MB ceiling on shared anon
-//! memory, well below the system RAM and the per-region cap matches typical
-//! IPC buffer sizes (ring buffers, lock-free queues, command channels).
+//! The spinlock covers the slot table and the counts. Leaves and frames are
+//! published by compare-and-swap and only while a reference is held, so
+//! frameAt and frameFor take no lock.
 
 const std = @import("std");
 const pmm = @import("pmm.zig");
-const paging = @import("paging.zig");
+const heap = @import("heap.zig");
 const debug = @import("../debug/debug.zig");
 const Phys = @import("../util/addr.zig").Phys;
 
-pub const MAX_SHM_REGIONS: u32 = 32;
-pub const MAX_PAGES_PER_REGION: u32 = 256;
+pub const MAX_SHM_REGIONS: u32 = 4096;
+/// 4 GiB an object: a directory of 2048 leaves.
+pub const MAX_PAGES_PER_REGION: u32 = 1 << 20;
 pub const SHM_INVALID: u32 = 0xFFFFFFFF;
+
+/// Pages a leaf names: a frame of 8-byte entries.
+const LEAF_PAGES: u32 = 512;
 
 const ShmRegion = struct {
     in_use: bool = false,
-    size_pages: u16 = 0,
-    refcount: u16 = 0,
-    frames: [MAX_PAGES_PER_REGION]Phys = [_]Phys{Phys.of(0)} ** MAX_PAGES_PER_REGION,
+    /// 0 while the object is being taken apart.
+    size_pages: u32 = 0,
+    refcount: u32 = 0,
+    /// The frame of each leaf, 0 until a page under it is touched. A leaf
+    /// holds its pages' frames the same way.
+    dir: ?[*]u64 = null,
 };
 
 var regions: [MAX_SHM_REGIONS]ShmRegion = [_]ShmRegion{.{}} ** MAX_SHM_REGIONS;
 var lock: @import("../proc/spinlock.zig").SpinLock = .{};
+/// No slot below it is free. Under `lock`.
+var first_free: u32 = 0;
 
-/// Allocate a new shared region of `size_pages` 4 KB pages. Frames are
-/// zeroed (POSIX requires zero-initialized anon memory). Returns the
-/// region id on success, null on full table / OOM / oversize.
-///
-/// Three-phase to keep the cli windows tiny: the old single-lock version
-/// held the cli'd shm lock across up to 256 allocFrameUser calls (each
-/// nesting pmm's region lock) plus 1 MB of memset — the largest avoidable
-/// cli window in the kernel, [cli-hold]-visible past 5 ms. Only the slot
-/// reserve and the publish need the lock; the alloc+zero in between
-/// touches a slot nothing else can reach: the id isn't stored in any
-/// LazyRegion until we return it, acquire() rejects refcount==0, and
-/// size_pages==0 makes frameAt reject every page_idx by construction.
-pub fn create(size_pages: u32) ?u32 {
+fn leafCount(size_pages: u32) u32 {
+    return (size_pages + LEAF_PAGES - 1) / LEAF_PAGES;
+}
+
+/// A new object of `size_pages` pages, none with a frame yet, and one
+/// reference to it: the caller's. Null: no slot, no memory, or too large.
+pub fn createLazy(size_pages: u32) ?u32 {
     if (size_pages == 0 or size_pages > MAX_PAGES_PER_REGION) return null;
+    const n = leafCount(size_pages);
+    const raw = heap.kmallocAligned(n * @sizeOf(u64), @alignOf(u64)) orelse return null;
+    const dir: [*]u64 = @ptrCast(@alignCast(raw));
+    @memset(dir[0..n], 0);
 
-    // Phase 1 — reserve a slot (in_use=true blocks other creators; the
-    // refcount=0 + size_pages=0 combo marks "mid-create, inert").
-    var id: u32 = 0;
-    {
-        const flags = lock.acquireIrqSave();
-        defer lock.releaseIrqRestore(flags);
-        while (id < MAX_SHM_REGIONS) : (id += 1) {
-            if (!regions[id].in_use) break;
-        }
-        if (id == MAX_SHM_REGIONS) return null;
-        regions[id].in_use = true;
-        regions[id].size_pages = 0;
-        regions[id].refcount = 0;
-    }
-
-    // Phase 2 — allocate + zero with interrupts ON.
-    var allocated: u32 = 0;
-    while (allocated < size_pages) : (allocated += 1) {
-        const phys = pmm.allocFrameUser() orelse break;
-        const vptr = phys.toVirt().ptr([*]u8);
-        @memset(vptr[0..4096], 0);
-        regions[id].frames[allocated] = phys;
-    }
-    if (allocated < size_pages) {
-        // OOM unwind: free what we got, un-reserve the slot.
-        while (allocated > 0) {
-            allocated -= 1;
-            pmm.freeFrame(regions[id].frames[allocated]);
-            regions[id].frames[allocated] = Phys.of(0);
-        }
-        const flags = lock.acquireIrqSave();
-        regions[id].in_use = false;
+    const flags = lock.acquireIrqSave();
+    var id = first_free;
+    while (id < MAX_SHM_REGIONS and regions[id].in_use) id += 1;
+    if (id == MAX_SHM_REGIONS) {
+        first_free = id;
         lock.releaseIrqRestore(flags);
+        heap.kfree(raw);
         return null;
     }
-
-    // Phase 3 — publish.
-    const flags = lock.acquireIrqSave();
-    regions[id].size_pages = @intCast(size_pages);
-    regions[id].refcount = 1;
+    first_free = id + 1;
+    regions[id] = .{ .in_use = true, .size_pages = size_pages, .refcount = 1, .dir = dir };
     lock.releaseIrqRestore(flags);
     return id;
 }
 
-/// Bump refcount on an existing region. Called by fork() for each inherited
-/// LazyRegion whose shm_id is set. Returns false if the id is invalid /
-/// the region was already torn down (which would indicate a bug in the
-/// lifecycle bookkeeping).
+/// The same with every frame there from the start: for the kernel's own
+/// users, which read the frames without a fault.
+pub fn create(size_pages: u32) ?u32 {
+    const id = createLazy(size_pages) orelse return null;
+    var i: u32 = 0;
+    while (i < size_pages) : (i += 1) {
+        if (frameFor(id, i) == null) {
+            release(id);
+            return null;
+        }
+    }
+    return id;
+}
+
+/// One more reference: a fork's copy of a region, a piece split off one.
+/// False for an id that names no live object.
 pub fn acquire(id: u32) bool {
     if (id >= MAX_SHM_REGIONS) return false;
     const flags = lock.acquireIrqSave();
     defer lock.releaseIrqRestore(flags);
-    if (!regions[id].in_use) return false;
-    // refcount==0 while in_use means mid-create (phase 2, lock dropped) —
-    // the id was never published, so a caller passing it holds a bogus id.
-    if (regions[id].refcount == 0) return false;
-    // Saturate, don't wrap: an unchecked u16 += at 65535 is an overflow
-    // PANIC in the ReleaseSafe oracle build. Unreachable today (attachers
-    // are bounded by MAX_PROCS), but fail the acquire rather than the box.
-    if (regions[id].refcount == std.math.maxInt(u16)) return false;
-    regions[id].refcount += 1;
+    const r = &regions[id];
+    if (!r.in_use or r.refcount == 0 or r.refcount == std.math.maxInt(u32)) return false;
+    r.refcount += 1;
     return true;
 }
 
-/// Decrement refcount. At zero, free all frames and recycle the slot.
-/// Called by munmap, process teardown, and exec's old-AS reclaim path.
+/// Drop a reference; the last one frees the frames and the slot.
 pub fn release(id: u32) void {
     if (id >= MAX_SHM_REGIONS) return;
+    var dir: [*]u64 = undefined;
+    var n: u32 = 0;
+    {
+        const flags = lock.acquireIrqSave();
+        defer lock.releaseIrqRestore(flags);
+        const r = &regions[id];
+        if (!r.in_use) return;
+        if (r.refcount == 0) {
+            debug.klog("[shm] release on already-zero refcount id={d}\n", .{id});
+            return;
+        }
+        r.refcount -= 1;
+        if (r.refcount > 0) return;
+        // Nobody can reach it now. The slot stays taken (refcount 0: acquire
+        // refuses it) until its memory is back.
+        dir = r.dir.?;
+        n = leafCount(r.size_pages);
+        r.size_pages = 0;
+        r.dir = null;
+    }
+    // Outside the lock: up to a million frames.
+    for (dir[0..n]) |leaf_raw| {
+        if (leaf_raw == 0) continue;
+        const leaf = Phys.of(leaf_raw).toVirt().ptr([*]const u64);
+        for (leaf[0..LEAF_PAGES]) |raw| {
+            if (raw != 0) pmm.freeFrame(Phys.of(raw));
+        }
+        pmm.freeFrame(Phys.of(leaf_raw));
+    }
+    heap.kfree(@ptrCast(dir));
     const flags = lock.acquireIrqSave();
-    defer lock.releaseIrqRestore(flags);
-    if (!regions[id].in_use) return;
-    if (regions[id].refcount == 0) {
-        debug.klog("[shm] release on already-zero refcount id={d}\n", .{id});
-        return;
-    }
-    regions[id].refcount -= 1;
-    if (regions[id].refcount > 0) return;
-
-    var i: u16 = 0;
-    while (i < regions[id].size_pages) : (i += 1) {
-        pmm.freeFrame(regions[id].frames[i]);
-        regions[id].frames[i] = Phys.of(0);
-    }
     regions[id].in_use = false;
-    regions[id].size_pages = 0;
+    if (id < first_free) first_free = id;
+    lock.releaseIrqRestore(flags);
 }
 
-/// Lookup the physical frame backing page `page_idx` of region `id`.
-/// Caller must hold a refcount on the region (otherwise the lookup races
-/// with release). The page-fault handler is the only legitimate caller
-/// and runs in the context of a process whose LazyRegion holds the ref.
-///
-/// Lock-free by design: the held refcount keeps in_use=true and frames[]
-/// stable, and x86-TSO store ordering means a (hypothetical) racing reader
-/// can't see in_use before the frames that were written first. Belt-and-
-/// suspenders: a 0 frame reads as null rather than as "map phys page 0
-/// into userspace" — the failure mode if the refcount invariant is ever
-/// broken and we race a teardown's frames[i]=0.
-pub fn frameAt(id: u32, page_idx: u32) ?Phys {
+/// Where the frame of page `page_idx` is recorded, if its leaf is there.
+/// The caller holds a reference.
+fn entryOf(id: u32, page_idx: u32) ?*u64 {
+    const slot = leafSlot(id, page_idx) orelse return null;
+    const leaf_raw = @atomicLoad(u64, slot, .acquire);
+    if (leaf_raw == 0) return null;
+    return &Phys.of(leaf_raw).toVirt().ptr([*]u64)[page_idx % LEAF_PAGES];
+}
+
+fn leafSlot(id: u32, page_idx: u32) ?*u64 {
     if (id >= MAX_SHM_REGIONS) return null;
-    if (!regions[id].in_use) return null;
-    if (page_idx >= regions[id].size_pages) return null;
-    const f = regions[id].frames[page_idx];
-    return if (f.raw() == 0) null else f;
+    const r = &regions[id];
+    if (!r.in_use or page_idx >= r.size_pages) return null;
+    const dir = r.dir orelse return null;
+    return &dir[page_idx / LEAF_PAGES];
+}
+
+/// A zeroed frame into the empty `slot`, unless another toucher's is there
+/// by then. What the slot holds; null: out of memory.
+fn fill(slot: *u64) ?u64 {
+    const there = @atomicLoad(u64, slot, .acquire);
+    if (there != 0) return there;
+    const fresh = pmm.allocFrameUser() orelse return null;
+    @memset(fresh.toVirt().ptr([*]u8)[0..4096], 0);
+    if (@cmpxchgStrong(u64, slot, 0, fresh.raw(), .acq_rel, .acquire)) |winner| {
+        pmm.freeFrame(fresh);
+        return winner;
+    }
+    return fresh.raw();
+}
+
+/// The frame of page `page_idx`, null if the page has none (yet). The caller
+/// holds a reference.
+pub fn frameAt(id: u32, page_idx: u32) ?Phys {
+    const entry = entryOf(id, page_idx) orelse return null;
+    const raw = @atomicLoad(u64, entry, .acquire);
+    return if (raw == 0) null else Phys.of(raw);
+}
+
+/// The frame of page `page_idx`, made (zeroed) if the page had none. Null:
+/// out of memory, or no such page (sizePages tells which). The caller holds
+/// a reference. Does not block.
+pub fn frameFor(id: u32, page_idx: u32) ?Phys {
+    const slot = leafSlot(id, page_idx) orelse return null;
+    const leaf_raw = fill(slot) orelse return null;
+    const entry = &Phys.of(leaf_raw).toVirt().ptr([*]u64)[page_idx % LEAF_PAGES];
+    return Phys.of(fill(entry) orelse return null);
 }
 
 pub fn sizePages(id: u32) u32 {

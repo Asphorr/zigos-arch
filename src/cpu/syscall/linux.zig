@@ -711,7 +711,7 @@ fn ioResult(pcb: *process.PCB, fd: u32, n: u32) u64 {
     const fe = file.get(pcb, fd) orelse return err(EBADF);
     defer file.put(fe);
     return err(switch (fe.kind) {
-        .socket, .eventfd, .epoll => EINVAL,
+        .socket, .eventfd, .epoll, .lproc => EINVAL,
         else => EBADF,
     });
 }

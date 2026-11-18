@@ -51,6 +51,9 @@ bywget "near, wget" "$near"
 export NODE_TLS_REJECT_UNAUTHORIZED=0
 bynode "near, TLS, node" "$near_tls" 67108864 | grep netspeed
 unset NODE_TLS_REJECT_UNAUTHORIZED
+# busybox's own TLS: a forked child deciphers, a socket pair between them.
+# The static busybox refuses https unless told not to check the certificate.
+bywget "near, TLS, wget" "--no-check-certificate $near_tls"
 bynode "npm registry, node" "$far" 33554432
 # Two at once: one connection's limit, or the machine's?
 bynode "npm registry, first of two" "$far" 16777216 &

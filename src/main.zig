@@ -957,6 +957,9 @@ fn pgflushdEntry() callconv(.c) noreturn {
     while (true) {
         sched.kernelSleepMs(PGFLUSH_INTERVAL_MS);
         _ = vfs.flushAllDirty();
+        @import("mm/page_cache.zig").countUnevictable();
+        // Unlinked files whose last mapping went with a process's teardown.
+        @import("fs/ext2/ext2.zig").freeQueued();
         @import("fs/ext2/ext2.zig").sync();
         _ = @import("mm/page_cache.zig").verifySome(PGFLUSH_VERIFY_PAGES);
         vfs.reportCacheCorruption();
@@ -964,7 +967,8 @@ fn pgflushdEntry() callconv(.c) noreturn {
 }
 
 /// filed kernel-thread entry: releases the files task teardowns queued
-/// (file.dropAll), from a context that may sleep.
+/// (file.dropAll), from a context that may sleep. Its steady pace also
+/// takes the load-average samples.
 const FILED_INTERVAL_MS: u32 = 1000;
 fn filedEntry() callconv(.c) noreturn {
     const file = @import("fs/file.zig");
@@ -972,6 +976,7 @@ fn filedEntry() callconv(.c) noreturn {
     while (true) {
         sched.kernelSleepMs(FILED_INTERVAL_MS);
         if (file.reapPending()) file.reap();
+        @import("proc/loadavg.zig").sample();
     }
 }
 

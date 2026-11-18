@@ -10,7 +10,9 @@
 //! `R` is a struct with `start` and `end` (usize, page aligned, end
 //! exclusive) and:
 //!   fn tailFrom(r: R, at: usize) R    r cut down to [at, r.end), with any
-//!                                     offset counted from `start` advanced
+//!                                     offset counted from `start` advanced;
+//!                                     called once for each piece made, so
+//!                                     it may take what a piece must hold
 //!   fn canMerge(lo: R, hi: R) bool    lo and hi (lo.end == hi.start) may be
 //!                                     one region that keeps lo's fields
 //! `A` has `fn alloc(n: usize) ?[*]R` and `fn free(p: [*]R, n: usize) void`.
@@ -173,12 +175,14 @@ pub fn Set(comptime R: type, comptime A: type) type {
             var j = i;
             while (j < self.len and self.items[j].end <= end) : (j += 1) ctx.removed(self.items[j]);
             if (j < self.len and self.items[j].start < end) {
+                // The tail first: what it takes hold of (tailFrom) must not
+                // go with the head. And in two steps: R.tailFrom may get
+                // items[j] by reference, and a result written straight into
+                // items[j] would clobber it.
+                const tail = R.tailFrom(self.items[j], end);
                 var head = self.items[j];
                 head.end = end;
                 ctx.removed(head);
-                // Two steps: R.tailFrom may get items[j] by reference, and a
-                // result written straight into items[j] would clobber it.
-                const tail = R.tailFrom(self.items[j], end);
                 self.items[j] = tail;
             }
             self.removeAt(i, j - i);

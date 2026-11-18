@@ -835,8 +835,10 @@ const Interp = struct {
         return @as(usize, @intCast(self.header.entry)) +% self.bias;
     }
 
+    /// Lets go of the header bytes and of openInterp's hold on the inode.
     fn deinit(self: *const Interp) void {
         heap.kfree(self.hdr);
+        ext2.release(self.inum);
     }
 };
 
@@ -886,7 +888,12 @@ fn openInterp(img: Image, header: Header, linux: bool, prog_lo: usize, prog_hi: 
     if (!ext2_inode.isReg(&ino)) return interpMissing(path);
     const size = ext2_inode.fileSize(&ino);
 
-    const h = readHeaders(inum, size) orelse return .fail;
+    // Held until its regions are made (Interp.deinit).
+    if (!ext2.holdLinked(inum)) return interpMissing(path);
+    const h = readHeaders(inum, size) orelse {
+        ext2.release(inum);
+        return .fail;
+    };
     var it = Interp{ .inum = inum, .header = h.header, .hdr = h.hdr, .bias = 0 };
     const iph = it.phdrs();
     const n = h.header.phnum;
@@ -987,6 +994,15 @@ fn startImage(img: Image, header: Header, launch: ?LaunchInfo) ?usize {
     const phdrs: [*]align(1) const ProgramHeader = @ptrCast(img.bytes() + phoff);
     const exec_args = if (launch) |li| li.exec_args else null;
     const linux = exec_args != null or header.ident[7] == ELFOSABI_LINUX;
+
+    // Held while the regions are made: each takes its hold from this one.
+    const held_inum = img.inode();
+    if (held_inum != 0 and !ext2.holdLinked(held_inum)) {
+        debug.klog("[elf] Rejected: inode {d} is no longer a file\n", .{held_inum});
+        img.drop();
+        return null;
+    }
+    defer if (held_inum != 0) ext2.release(held_inum);
 
     if (!segmentsInFile(phdrs, header.phnum, img.fileSize())) {
         debug.klog("[elf] Rejected: a segment's file bytes lie outside the file\n", .{});
@@ -1218,7 +1234,11 @@ pub fn loadAndExecute(elf_buf: [*]align(4) u8, file_size: usize, elf_buf_pages: 
         return;
     }
 
-    const needs_elf_buf = registerSegments(pid, elf_buf, phoff, header.phnum, inode, 0) orelse {
+    // The inode held while the regions are made (see startImage).
+    const held = inode != 0 and ext2.holdLinked(inode);
+    const registered = if (inode == 0 or held) registerSegments(pid, elf_buf, phoff, header.phnum, inode, 0) else null;
+    if (held) ext2.release(inode);
+    const needs_elf_buf = registered orelse {
         vga.fg = .LightRed;
         vga.print("Error: segment registration failed!\n", .{});
         process.abortLoading(@intCast(pid));

@@ -91,6 +91,7 @@ pub const Kind = enum(u8) {
     p_limits,
     p_cgroup,
     p_oom_score_adj,
+    p_oom_score,
     p_auxv,
     p_loginuid,
 };
@@ -150,6 +151,7 @@ const proc_entries = [_]Entry{
     .{ .name = "limits", .kind = .p_limits },
     .{ .name = "cgroup", .kind = .p_cgroup },
     .{ .name = "oom_score_adj", .kind = .p_oom_score_adj },
+    .{ .name = "oom_score", .kind = .p_oom_score },
     .{ .name = "auxv", .kind = .p_auxv },
     .{ .name = "loginuid", .kind = .p_loginuid },
     .{ .name = "exe", .kind = .exe_link },
@@ -373,7 +375,8 @@ fn taskOf(n: Node) ?*process.PCB {
 /// File `fd` of the process `n` is of, with a reference to put.
 fn fileOf(n: Node, fd: u32) ?*file.File {
     const lead = leadOf(n) orelse return null;
-    if (lead.state == .zombie) return null;
+    // A lead whose thread ended before the others is the process still.
+    if (lead.state == .zombie and !process.pinnedLead(lead.tgid)) return null;
     return file.get(lead, fd);
 }
 
@@ -651,12 +654,22 @@ pub fn readAt(f: *file.File, off: u64, buf: [*]u8, count: u32) u32 {
     return @intCast(n);
 }
 
-/// What a program writes to oom_score_adj is taken and forgotten;
-/// trace_paths goes on with "1", off with anything else.
+/// oom_score_adj takes a number from -1000 to 1000; trace_paths goes on
+/// with "1", off with anything else.
 fn write(f: *file.File, _: *process.PCB, buf: [*]const u8, count: u32) u32 {
     const o = openOf(f) orelse return errno.err(.EBADF);
     if (!writable(o.node.kind)) return errno.err(.EACCES);
-    if (o.node.kind == .trace_paths and count > 0) @atomicStore(bool, &trace_paths, buf[0] == '1', .monotonic);
+    var text: [16]u8 = undefined;
+    const n = @min(count, text.len);
+    if (!usercopy.copyFromUser(text[0..n], @intFromPtr(buf))) return errno.err(.EFAULT);
+    if (o.node.kind == .trace_paths) {
+        if (n > 0) @atomicStore(bool, &trace_paths, text[0] == '1', .monotonic);
+        return count;
+    }
+    const adj = std.fmt.parseInt(i32, std.mem.trim(u8, text[0..n], " \t\n"), 10) catch return errno.err(.EINVAL);
+    if (count > text.len or adj < -1000 or adj > 1000) return errno.err(.EINVAL);
+    const lead = leadOf(o.node) orelse return errno.err(.ESRCH);
+    @atomicStore(i16, &lead.oom_score_adj, @intCast(adj), .monotonic);
     return count;
 }
 
@@ -731,7 +744,8 @@ fn fill(n: Node, out: *Out) void {
         .p_mounts => renderMounts(out),
         .p_mountinfo => renderMountinfo(out),
         .p_cgroup => out.put("0::/\n"),
-        .p_oom_score_adj => out.put("0\n"),
+        .p_oom_score_adj => out.print("{d}\n", .{if (leadOf(n)) |lead| @atomicLoad(i16, &lead.oom_score_adj, .monotonic) else 0}),
+        .p_oom_score => out.print("{d}\n", .{if (leadOf(n)) |lead| oomScore(lead) else 0}),
         .p_loginuid => out.put("4294967295"),
         .p_limits => renderLimits(out),
         else => {
@@ -961,7 +975,11 @@ fn renderLoadavg(out: *Out) void {
         if (p.state == .running or p.state == .ready) running += 1;
         last = @max(last, p.pid_nr);
     }
-    out.print("0.00 0.00 0.00 {d}/{d} {d}\n", .{ @max(running, 1), total, last });
+    const avg = @import("../proc/loadavg.zig").hundredths();
+    out.print("{d}.{d:0>2} {d}.{d:0>2} {d}.{d:0>2} {d}/{d} {d}\n", .{
+        avg[0] / 100,    avg[0] % 100, avg[1] / 100, avg[1] % 100, avg[2] / 100, avg[2] % 100,
+        @max(running, 1), total,        last,
+    });
 }
 
 fn rdtsc() u64 {
@@ -1124,12 +1142,14 @@ fn ttyFacts(lead: *const process.PCB) struct { dev: u32, fg: i64 } {
     return .{ .dev = (4 << 8) | (@as(u32, id) + 1), .fg = fg };
 }
 
-const Vm = struct { size: u64 = 0, stack: u64 = 0, exe: u64 = 0, data: u64 = 0 };
+/// Sizes in bytes; `rss` in pages, counted in the tables as they are now.
+const Vm = struct { size: u64 = 0, stack: u64 = 0, exe: u64 = 0, data: u64 = 0, rss: u64 = 0 };
 
 fn vmOf(lead: *process.PCB) Vm {
     var vm = Vm{};
     if (!withAs(lead)) return vm;
     defer doneAs(lead);
+    if (lead.page_directory) |pd| vm.rss = vmm.countUserPages(pd);
     for (lead.regions.slice()) |r| {
         const len: u64 = r.end - r.start;
         vm.size += len;
@@ -1144,6 +1164,16 @@ fn vmOf(lead: *process.PCB) Vm {
     return vm;
 }
 
+/// oom_score on Linux's scale: the process's pages and its oom_score_adj
+/// against all memory, 666 for none of either, 0 for one never chosen.
+fn oomScore(lead: *process.PCB) u64 {
+    const adj: i64 = @atomicLoad(i16, &lead.oom_score_adj, .monotonic);
+    if (adj == -1000) return 0;
+    const total: i64 = @intCast(@max(pmm.managedFrameCount(), 1000));
+    const weight = @as(i64, @intCast(vmOf(lead).rss)) + adj * @divTrunc(total, 1000);
+    return @intCast(@max(@divTrunc((1000 + @divTrunc(weight * 1000, total)) * 2, 3), 0));
+}
+
 /// Hold the read side of `lead`'s address-space lock, if the process still
 /// has its image: teardown and execve change the tables and regions under
 /// the write side, so they are read only after this. From another process
@@ -1154,7 +1184,8 @@ fn withAs(lead: *process.PCB) bool {
         if (me.tgid != lead.tgid) me.foreign_as_lock = lead.tgid;
     }
     lead.as_lock.acquireRead();
-    if (lead.pid_nr == nr and lead.page_directory != null and lead.state != .zombie) return true;
+    // A zombie lead keeps the tables while other threads of it live.
+    if (lead.pid_nr == nr and lead.page_directory != null and (lead.state != .zombie or process.pinnedLead(lead.tgid))) return true;
     doneAs(lead);
     return false;
 }
@@ -1188,7 +1219,7 @@ fn renderPidStat(view: *process.PCB, lead: *process.PCB, in_task: bool, out: *Ou
         t.dev,                        t.fg,                    view.acct_pf_count,
         ticks,                        20 + @as(i32, view.nice), view.nice,
         threadsOf(lead),              view.acct_start_tick,    vm.size,
-        lead.acct_current_rss,
+        vm.rss,
     });
     out.print("0 0 {d} 0 0 {d} {d} {d} {d} 0 0 0 17 {d} 0 0 0 0 0 0 0 {d} {d} {d} {d} {d} 0\n", .{
         lead.stack_base +| memmap.LINUX_STACK_RESERVE, pending, view.signal_mask, sets.ign, sets.cgt,
@@ -1198,7 +1229,7 @@ fn renderPidStat(view: *process.PCB, lead: *process.PCB, in_task: bool, out: *Ou
 
 fn renderStatm(lead: *process.PCB, out: *Out) void {
     const vm = vmOf(lead);
-    out.print("{d} {d} 0 {d} 0 {d} 0\n", .{ vm.size / 4096, lead.acct_current_rss, vm.exe / 4096, vm.data / 4096 });
+    out.print("{d} {d} 0 {d} 0 {d} 0\n", .{ vm.size / 4096, vm.rss, vm.exe / 4096, vm.data / 4096 });
 }
 
 fn renderStatus(view: *process.PCB, lead: *process.PCB, in_task: bool, out: *Out) void {
@@ -1212,10 +1243,10 @@ fn renderStatus(view: *process.PCB, lead: *process.PCB, in_task: bool, out: *Out
         config.MAX_FDS, lead.pid_nr, view.pid_nr, lead.pgid, lead.sid,
     });
     out.print("VmPeak:\t{d: >8} kB\nVmSize:\t{d: >8} kB\nVmLck:\t       0 kB\nVmPin:\t       0 kB\nVmHWM:\t{d: >8} kB\nVmRSS:\t{d: >8} kB\n", .{
-        vm.size / 1024, vm.size / 1024, kb(lead.acct_peak_rss), kb(lead.acct_current_rss),
+        vm.size / 1024, vm.size / 1024, kb(@max(lead.acct_peak_rss, vm.rss)), kb(vm.rss),
     });
     out.print("RssAnon:\t{d: >8} kB\nRssFile:\t       0 kB\nRssShmem:\t       0 kB\nVmData:\t{d: >8} kB\nVmStk:\t{d: >8} kB\nVmExe:\t{d: >8} kB\nVmLib:\t       0 kB\nVmPTE:\t       0 kB\nVmSwap:\t       0 kB\n", .{
-        kb(lead.acct_current_rss), vm.data / 1024, vm.stack / 1024, vm.exe / 1024,
+        kb(vm.rss), vm.data / 1024, vm.stack / 1024, vm.exe / 1024,
     });
     const pending = @atomicLoad(u64, &view.pending_signals, .acquire);
     const shared = @atomicLoad(u64, &lead.shared_pending, .acquire);
@@ -1298,6 +1329,7 @@ fn renderMaps(lead: *process.PCB, out: *Out) void {
         } else if (lead.heap_start != 0 and r.start == lead.heap_start) {
             name = "[heap]";
         } else if (r.shm_id != shm.SHM_INVALID) {
+            off = @as(u64, r.shm_off) * 0x1000;
             name = "/dev/zero (deleted)";
         }
         const start = out.len;

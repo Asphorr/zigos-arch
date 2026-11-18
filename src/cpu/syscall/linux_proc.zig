@@ -38,6 +38,7 @@ const debug = @import("../../debug/debug.zig");
 const EPERM: i64 = 1;
 const ENOENT: i64 = 2;
 const ESRCH: i64 = 3;
+const EINTR: i64 = 4;
 const E2BIG: i64 = 7;
 const ENOEXEC: i64 = 8;
 const EBADF: i64 = 9;
@@ -86,10 +87,11 @@ const MAX_EXEC_PTRS: usize = 4096;
 
 /// execve(path, argv, envp).
 pub fn execve(frame: *signals.SyscallFrame, path_va: u64, argv_va: u64, envp_va: u64) u64 {
+    // From a thread that is not the lead, the lead's thread goes with the
+    // others and the new program runs in the caller's slot, under the
+    // process's pid (lifecycle.takeExecImage); Linux gives it the lead's
+    // tid as well.
     const me = smp.currentPid() orelse return err(EFAULT);
-    // From another thread, Linux moves the caller into the lead's place
-    // first; not done here.
-    if (process.procs[me].tgid != me) return err(EINVAL);
 
     // Two in turn: a script's interpreter is looked up while the script's
     // path is still read.
@@ -144,6 +146,14 @@ pub fn execve(frame: *signals.SyscallFrame, path_va: u64, argv_va: u64, envp_va:
         };
     }
     args.strings = strings[0..used];
+
+    // One execve at a time in a process: the thread that is at it ends
+    // the others, this one among them, on its way out of this call.
+    while (!lifecycle.execBegin()) {
+        if (@atomicLoad(bool, &process.procs[me].exit_requested, .acquire)) return err(EINTR);
+        @import("../../proc/sched_asm.zig").softYield();
+    }
+    defer lifecycle.execEnd();
 
     // The image is built and the old one dropped with no kill in between:
     // a kill now would strand the held slot. It lands on the way out.
@@ -367,7 +377,7 @@ pub fn wait4(pid_arg: u64, status_va: u64, options: u64, rusage_va: u64) u64 {
         if (options & WNOHANG != 0) return 0;
         // A signal for the caller ends the wait, after the look above: a
         // child ready with it (SIGCHLD's own) is still reaped by this call.
-        if (signals.deliverable(&process.procs[me]) != 0) return err(linux_signal.ERESTARTSYS);
+        if (signals.interrupts(&process.procs[me])) return err(linux_signal.ERESTARTSYS);
         process.blockOn(.waitpid, wake_on);
     }
 }
@@ -408,7 +418,9 @@ fn changedChild(group: u8, awaited: Awaited, options: u64, status: *u32) ?u32 {
     if (options & (WUNTRACED | WCONTINUED) == 0) return null;
     for (0..process.MAX_PROCS) |i| {
         const p = &process.procs[i];
-        if (p.state == .unused or p.state == .zombie or p.tgid != i or p.parent_pid != group) continue;
+        if (p.state == .unused or p.tgid != i or p.parent_pid != group) continue;
+        // A lead whose thread ended before the others is the process still.
+        if (p.state == .zombie and !process.pinnedLead(i)) continue;
         if (!awaited.has(i)) continue;
         if (options & WUNTRACED != 0) {
             const signo = @atomicRmw(u8, &p.wait_stop, .Xchg, 0, .acq_rel);
@@ -445,7 +457,9 @@ fn fromCaller(code: i32) signals.Info {
 /// checks that it is there.
 fn signalProcess(slot: u8, sig: u32) u64 {
     const t = &process.procs[slot];
-    if (t.state == .unused or t.state == .zombie or t.state == .loading) return err(ESRCH);
+    if (t.state == .unused or t.state == .loading) return err(ESRCH);
+    // A lead whose thread ended before the others is the process still.
+    if (t.state == .zombie and !process.pinnedLead(slot)) return err(ESRCH);
     if (t.is_idle or t.page_dir_phys == 0) return err(EPERM);
     if (!signals.killProcess(slot, sig, fromCaller(signals.SI_USER_CODE))) return err(ESRCH);
     return 0;
@@ -467,7 +481,8 @@ pub fn kill(pid_arg: u64, sig_arg: u64) u64 {
     var self = false;
     for (0..process.MAX_PROCS) |i| {
         const p = &process.procs[i];
-        if (!session.isProcess(i) or p.state == .zombie or p.is_idle or p.page_dir_phys == 0) continue;
+        if (!session.isProcess(i) or p.is_idle or p.page_dir_phys == 0) continue;
+        if (p.state == .zombie and !process.pinnedLead(i)) continue;
         if (everyone) {
             if (p == me or p.personality != .linux) continue;
         } else if (p.pgid != group) continue;
@@ -728,7 +743,7 @@ pub fn pollWait(me: usize, fds: []PollFd, timeout_ns: ?u64) ?u64 {
         }
         if (ready > 0) return ready;
         if (timeout_ns) |ns| if (ns == 0 or process.tick_count >= deadline) return 0;
-        if (signals.deliverable(pcb) != 0) return null;
+        if (signals.interrupts(pcb)) return null;
         sched.blockOnDeadline(.poll, 0, deadline);
     }
 }
