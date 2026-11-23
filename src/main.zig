@@ -579,9 +579,9 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
         // DHCP runs in the BACKGROUND (dhcpdEntry) so boot no longer blocks on
         // the lease. It was ~1007 ms — 32% of a ~3.1 s boot — because QEMU's
         // polled e1000/SLIRP takes ~1 s to answer the first DISCOVER, and
-        // NOTHING at boot needs the IP yet (the boot-time TLS probe right after
-        // already runs/fails on the static defaults). The hardcoded SLIRP
-        // IP/gateway/DNS triple in src/net/net.zig keeps the network usable
+        // NOTHING at boot needs the IP yet (the TLS probe task below runs on the
+        // static defaults). The hardcoded SLIRP IP/gateway/DNS triple in
+        // src/net/net.zig keeps the network usable
         // until (and if) the real lease lands. net.poll() is net_lock-serialized
         // so the task polling concurrently with the desktop/apps is safe.
         if (@import("proc/lifecycle.zig").createKernelTask(@intFromPtr(&dhcpdEntry), "dhcpd", 0, .normal, 32 * 1024)) |_| {
@@ -608,12 +608,13 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     // time. Done once; idempotent if called again.
     @import("crypto/tls/trust_store.zig").init();
 
-    // TLS step-2 probe: send a real ClientHello to 1.1.1.1:443, parse the
-    // ServerHello, derive the X25519 shared secret. Validates our message
-    // construction + parser against a real TLS 1.3 server's response.
-    // Needs networking; gated on NIC presence (DHCP already ran above).
+    // TLS smoke test against the dev server (crypto/tls/probe.zig), in its
+    // own task: with nothing listening it waits out the 5 s TCP connect
+    // deadline, and boot used to wait with it. Full kstack: the handshake's
+    // RSA verification needs it.
     if (nic.isReady()) {
-        @import("crypto/tls/probe.zig").run();
+        if (@import("proc/lifecycle.zig").createKernelTask(@intFromPtr(&tlsProbeEntry), "tlsprobe", 0, .normal, @import("config.zig").KSTACK_SIZE) == null)
+            @import("debug/debug.zig").klog("[tls] probe task spawn failed\n", .{});
     } else {
         @import("debug/debug.zig").klog("[tls] skipping probe — no NIC\n", .{});
     }
@@ -996,6 +997,16 @@ fn netdEntry() callconv(.c) noreturn {
         net.poll();
         net.trimRings(net.TCP_RING_SPARE);
     }
+}
+
+/// One-shot task for the TLS dev-server probe; exits when done. A new
+/// kernel task starts with IRQs off (it leaves schedule() straight into
+/// its entry), and the net stack won't allocate its TCP table that way.
+fn tlsProbeEntry() callconv(.c) noreturn {
+    asm volatile ("sti");
+    @import("crypto/tls/probe.zig").run();
+    @import("proc/lifecycle.zig").destroyCurrent();
+    unreachable;
 }
 
 /// dhcpd kernel-thread entry. Runs the DHCP DISCOVER→OFFER→REQUEST→ACK exchange
