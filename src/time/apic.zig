@@ -123,6 +123,11 @@ pub fn tscToMs(delta: u64) u64 {
     return delta * 10 / tsc_per_quantum;
 }
 
+pub fn tscToUs(delta: u64) u64 {
+    if (tsc_per_quantum == 0) return 0;
+    return delta *| 10_000 / tsc_per_quantum;
+}
+
 /// TSC ticks per 10ms LAPIC quantum, or 0 if calibration hasn't run yet.
 /// Callers building wall-clock TSC deadlines should multiply by the
 /// number of quanta they want and fall back to a conservative baseline

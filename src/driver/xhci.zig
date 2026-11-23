@@ -283,6 +283,8 @@ var event_drain_locked: bool = false;
 /// machinery stays for the two non-IRQ callers: the 10 Hz lost-IRQ backstop
 /// and pollHID's own budget-overflow re-raise.
 fn xhciIrqHandler() callconv(.c) void {
+    const t0 = @import("../debug/perf.zig").rdtsc();
+    defer @import("../debug/ftrace.zig").markSince(.input, t0);
     xhci_irq_count +%= 1;
     // Close the typematic gate BEFORE draining: events are in the ring but
     // key_state is stale until pollHID processes them. With the inline
