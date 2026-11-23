@@ -11,6 +11,8 @@
 //            arm is covered without per-site stamps.
 //   render — the dispatch span minus flush: renderScene + blitToScreen +
 //            cursor bake, i.e. the CPU compositing cost.
+//   wait   — mode 9 only: time stood behind the GPU compositor's frame
+//            before the iteration could draw. Not part of `total`.
 //
 // Iterations that wake and find nothing to draw (dirty == .none) don't
 // pollute the percentiles — they count as idle_wakes, which is itself a
@@ -33,8 +35,8 @@ const perf = @import("../../debug/perf.zig");
 const apic = @import("../../time/apic.zig");
 
 const N_BUCKETS = 26; // bucket k covers [2^(k-1), 2^k) µs; last = everything above
-const N_PHASES = 4; // prep, render, flush, total
-const PHASE_NAMES = [N_PHASES][]const u8{ "prep  ", "render", "flush ", "total " };
+const N_PHASES = 5; // prep, render, flush, total, wait
+const PHASE_NAMES = [N_PHASES][]const u8{ "prep  ", "render", "flush ", "total ", "wait  " };
 const DUMP_INTERVAL_TICKS: u64 = 3000; // ~30 s at 100 Hz
 
 pub const Kind = enum(u3) { none, cursor, text, gui, drag, full, region };
@@ -44,6 +46,7 @@ var in_frame: bool = false;
 var t_frame_start: u64 = 0;
 var t_prep_done: u64 = 0;
 var flush_tsc_accum: u64 = 0;
+var wait_tsc: u64 = 0;
 
 var hist: [N_PHASES][N_BUCKETS]u64 = .{.{0} ** N_BUCKETS} ** N_PHASES;
 var max_us: [N_PHASES]u64 = .{0} ** N_PHASES;
@@ -59,6 +62,12 @@ pub fn frameBegin() void {
     t_prep_done = t_frame_start;
     flush_tsc_accum = 0;
     in_frame = true;
+}
+
+/// Mode 9: how long this iteration stood behind the GPU compositor's frame
+/// before it could draw. Before frameBegin; not part of `total`.
+pub fn sourceWaited(cyc: u64) void {
+    wait_tsc = cyc;
 }
 
 /// All pre-render work done; the dirty dispatch starts now.
@@ -102,6 +111,7 @@ pub fn frameEnd(kind: Kind, now_tick: u64) void {
             record(1, render_us);
             record(2, flush_us);
             record(3, total_us);
+            record(4, tscToUs(wait_tsc, tpq));
             frames += 1;
             kind_counts[@intFromEnum(kind)] += 1;
         }

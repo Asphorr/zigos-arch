@@ -569,8 +569,8 @@ pub fn encodeCreateImageExportable(
     encodeCreateImageImpl(cs, device_id, w, h, format, usage, 0, 0, image_id);
 }
 
-/// Sampled image — LINEAR tiling, USAGE_SAMPLED, exportable. Used for
-/// source textures the compositor wants to read pixels from. LINEAR
+/// Sampled image — LINEAR tiling, USAGE_SAMPLED | TRANSFER_SRC, exportable.
+/// Used for source textures the compositor wants to read pixels from. LINEAR
 /// guarantees deterministic row-major byte layout in the dma-buf
 /// memory, so the kernel can write a known pattern via the SHM BAR
 /// mapping and Lavapipe's sampler will read those bytes back as B8G8R8A8.
@@ -582,10 +582,11 @@ pub fn encodeCreateImageSampledLinear(
     format: u32,
     image_id: u64,
 ) void {
-    // tiling=1 (LINEAR), usage=0x04 (SAMPLED), initial_layout=0 (UNDEFINED).
+    // tiling=1 (LINEAR), initial_layout=0 (UNDEFINED).
     // We transition UNDEFINED→GENERAL once, then the kernel writes the
-    // pattern via the dma-buf mapping. Sampling from GENERAL is allowed.
-    encodeCreateImageImpl(cs, device_id, w, h, format, 0x04, 1, 0, image_id);
+    // pattern via the dma-buf mapping. Sampling and copying from GENERAL
+    // are allowed.
+    encodeCreateImageImpl(cs, device_id, w, h, format, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, 1, 0, image_id);
 }
 
 /// Color attachment image, LINEAR tiling, exportable. Used for a Vulkan
@@ -825,6 +826,52 @@ pub fn encodeCmdCopyImageToBufferRects(
     cs.writeU32(image_layout);
     cs.writeU64(dst_buffer);
     writeBufferImageCopies(cs, row_pixels, rects);
+}
+
+/// `w`×`h` texels at (`src_x`, `src_y`) of an image, bound for
+/// (`dst_x`, `dst_y`) of a buffer that holds a picture row-major.
+pub const CopyRegion = struct {
+    src_x: u32,
+    src_y: u32,
+    dst_x: u32,
+    dst_y: u32,
+    w: u32,
+    h: u32,
+};
+
+/// vkCmdCopyImageToBuffer that moves each region to its own place in the
+/// buffer's picture (`row_pixels` texels per row).
+pub fn encodeCmdCopyImageToBufferAt(
+    cs: *CmdStream,
+    cmd_buf_id: u64,
+    src_image: u64,
+    image_layout: u32,
+    dst_buffer: u64,
+    row_pixels: u32,
+    regions: []const CopyRegion,
+) void {
+    cs.cmdHeader(CMD_vkCmdCopyImageToBuffer, 0);
+    cs.writeU64(cmd_buf_id);
+    cs.writeU64(src_image);
+    cs.writeU32(image_layout);
+    cs.writeU64(dst_buffer);
+    cs.writeU32(@intCast(regions.len)); // regionCount
+    cs.writeU64(regions.len); // pRegions array size
+    for (regions) |r| {
+        cs.writeU64((@as(u64, r.dst_y) * row_pixels + r.dst_x) * 4); // bufferOffset
+        cs.writeU32(row_pixels); // bufferRowLength
+        cs.writeU32(0); // bufferImageHeight (= extent height)
+        cs.writeU32(VK_IMAGE_ASPECT_COLOR_BIT);
+        cs.writeU32(0); // mipLevel
+        cs.writeU32(0); // baseArrayLayer
+        cs.writeU32(1); // layerCount
+        cs.writeU32(r.src_x); // imageOffset
+        cs.writeU32(r.src_y);
+        cs.writeU32(0);
+        cs.writeU32(r.w); // imageExtent
+        cs.writeU32(r.h);
+        cs.writeU32(1);
+    }
 }
 
 /// vkCmdCopyBufferToImage, the upload twin of encodeCmdCopyImageToBufferRects.
@@ -1220,6 +1267,15 @@ pub fn encodeWaitForFences(cs: *CmdStream, device_id: u64, fence_id: u64, timeou
 
 pub fn encodeSeekReplyCommandStream(cs: *CmdStream, position: u64) void {
     cs.cmdHeader(CMD_vkSeekReplyCommandStreamMESA, 0);
+    cs.writeU64(position);
+}
+
+/// The seek with GENERATE_REPLY: the host seeks, then writes the command's
+/// own type at `position`. A reply that proves the stream before it ran and
+/// costs the host nothing — vkEnumerateInstanceVersion sends the Vulkan
+/// loader through its layer manifests on every call.
+pub fn encodeSeekReplyMarker(cs: *CmdStream, position: u64) void {
+    cs.cmdHeader(CMD_vkSeekReplyCommandStreamMESA, CMD_FLAG_GENERATE_REPLY);
     cs.writeU64(position);
 }
 

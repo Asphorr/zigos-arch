@@ -114,6 +114,21 @@ pub const TerminalData = struct {
     /// possibly to col 79) scrolled the screen every time the user held
     /// backspace on a long line — duplicating the line into scrollback.
     pending_wrap: bool,
+    /// The cells and the cursor block as the window's rows show them in the
+    /// back buffer, so that output repaints only the rows it changed.
+    /// Meaningful while `painted_valid`: a whole-window paint of the live
+    /// view sets it, a paint of anything else over the rows drops it.
+    painted_text: [TERM_COLS * TERM_ROWS]u8 = undefined,
+    painted_attr: [TERM_COLS * TERM_ROWS]u8 = undefined,
+    painted_rgb: [TERM_COLS * TERM_ROWS]u32 = undefined,
+    /// Cell index of the cursor block drawn, NO_CURSOR for none.
+    painted_cursor: u16 = NO_CURSOR,
+    painted_scroll_count: u16 = 0,
+    painted_valid: bool = false,
+    /// Output has arrived since the rows were last brought up to date.
+    rows_stale: bool = false,
+
+    pub const NO_CURSOR: u16 = 0xFFFF;
 };
 
 pub const AnimationType = enum(u8) { none, opening, closing, minimizing, restoring, fullscreening, unfullscreening };
@@ -189,12 +204,22 @@ pub const Window = struct {
     /// vulkan demos, sysmon, …) keep working unchanged on F10.
     fb_growable: bool = false,
     gui_present_pending: bool = false,
+    /// Counts the frames of a GUI window the desktop has taken up (a present
+    /// or an auto-refresh tick). The GPU compositor re-reads and redraws a
+    /// slot window when this has moved, not on every frame.
+    content_seq: u32 = 0,
     /// Tick of the last auto-refresh fallback that marked this window
     /// for re-composite. The compositor's auto-refresh path (for apps
     /// that don't call sysPresent — sysmon, settings, etc.) throttles
     /// per-window to ~20 Hz via this field; explicit sysPresent calls
     /// bypass the throttle entirely.
     last_auto_refresh_tick: u64 = 0,
+    /// What the framebuffer hashed to at the last auto-refresh poll: a poll
+    /// that finds the same pixels re-composites nothing.
+    auto_refresh_hash: u64 = 0,
+    /// The poll after one that found new pixels re-composites once more: the
+    /// first read may have caught the app halfway through drawing them.
+    auto_refresh_settle: bool = false,
     /// True iff the owning process called setCursorVisible(false). The main
     /// desktop loop honors this when the window is focused — without this,
     /// the loop's auto-show heuristic for windowed apps stomps on the

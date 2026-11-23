@@ -558,8 +558,8 @@ pub var current_resource_id: u32 = 0;
 //
 // When `scanout_is_blob` is true the per-frame flush path skips
 // TRANSFER_TO_HOST_2D — the host udmabuf-imports the blob memory so
-// RESOURCE_FLUSH presents it directly. Up to 2 blobs for double-buffered
-// page-flip swap (step 8e); single-blob mode (step 8d) uses only index 0.
+// RESOURCE_FLUSH presents it directly. Two or three blobs page-flip (see
+// blob_back); single-blob mode (step 8d) uses only index 0.
 //
 // The blobs themselves are allocated and exported by external code
 // (gpu_compositor.zig allocates them via Venus as HOST3D blobs to bypass
@@ -567,10 +567,25 @@ pub var current_resource_id: u32 = 0;
 // that breaks BLOB_MEM_GUEST). This module just records the resource
 // IDs so flushUnconditional / flushRectUnconditional know what to flip.
 pub var scanout_is_blob: bool = false;
-var blob_virt: [2][*]volatile u32 = .{ undefined, undefined };
-var blob_resource_ids: [2]u32 = .{ 0, 0 };
-pub var blob_count: u32 = 0; // 1 = single blob, 2 = double-buffer swap
+pub const MAX_BLOBS: u32 = 3;
+var blob_virt: [MAX_BLOBS][*]volatile u32 = .{ undefined, undefined, undefined };
+var blob_resource_ids: [MAX_BLOBS]u32 = .{ 0, 0, 0 };
+pub var blob_count: u32 = 0; // 1 = single blob, 2 or 3 = page flip
 pub var blob_front: u32 = 0; // which blob is currently scanned out
+/// Which blob the next present shows; the frame is rendered into it. With
+/// three blobs the host reads it neither now nor while the present before
+/// is still in flight; with two it is the previous front, free only once
+/// that present has been taken.
+pub var blob_back: u32 = 0;
+
+/// The present of blob_back has gone to the host.
+fn blobsFlipped() void {
+    const old_front = blob_front;
+    blob_front = blob_back;
+    blob_back = if (blob_count >= 3) 3 - blob_front - old_front else old_front;
+    framebuffer = blob_virt[blob_back];
+    current_resource_id = blob_resource_ids[blob_back];
+}
 // Saved id of the original 2D scanout resource (the one current_resource_id
 // pointed at before armBlobScanout overwrote it). dropOriginal2DScanout
 // uses this to detach + unref the right host-side resource without
@@ -1230,6 +1245,50 @@ comptime {
     if (@sizeOf(CtrlHdr) > ABATCH_RESP_STRIDE) @compileError("CtrlHdr exceeds resp stride");
 }
 
+/// What became of the async presents since the last takePresentStats: how
+/// many went to the host, how many flush calls found one still in flight
+/// and were folded into the next, and how long the host held each one
+/// (submit to reap; buckets <2, <4, <8, <16, <33 ms and above).
+pub const PresentStats = struct {
+    submits: u32 = 0,
+    folded: u32 = 0,
+    max_us: u32 = 0,
+    total_us: u64 = 0,
+    hist: [6]u32 = .{0} ** 6,
+};
+var present_stats: PresentStats = .{};
+
+pub fn takePresentStats() PresentStats {
+    ctrl_lock.acquire();
+    defer ctrl_lock.release();
+    const s = present_stats;
+    present_stats = .{};
+    return s;
+}
+
+/// Block until the host has taken the present sent last. From then on it
+/// shows the new front and reads the old one no more.
+pub fn waitPresentIdle() void {
+    if (!@atomicLoad(bool, &aflush_in_flight, .acquire)) return;
+    {
+        ctrl_lock.acquire();
+        defer ctrl_lock.release();
+        waitAsyncFlushIdleLocked();
+    }
+    kickPendingFromTask();
+}
+
+/// Caller holds ctrl_lock.
+fn notePresentDone() void {
+    const us = apic.tscToUs(perf.rdtsc() -% aflush_submit_tsc);
+    @import("../debug/ftrace.zig").mark(.present_done, us);
+    const s = &present_stats;
+    s.total_us += us;
+    s.max_us = @max(s.max_us, @as(u32, @intCast(@min(us, 0xFFFF_FFFF))));
+    const b: usize = if (us < 2000) 0 else if (us < 4000) 1 else if (us < 8000) 2 else if (us < 16000) 3 else if (us < 33000) 4 else 5;
+    s.hist[b] += 1;
+}
+
 var aflush_in_flight: bool = false;
 var aflush_target_idx: u16 = 0;
 var aflush_ncmds: u32 = 0; // cmds in the in-flight batch (2 for a blob pair)
@@ -1240,6 +1299,20 @@ var aflush_pending: bool = false;
 // Pending damage list (exclusive max corners). All mutation under ctrl_lock.
 var apend_rects: [ABATCH_MAX_RECTS][4]u32 = undefined;
 var apend_count: u32 = 0;
+
+// A flip's flush names what differs from the frame shown before it, so the
+// host display can repaint that much. Damage of a flip that failed to
+// submit rides the next one. x0, y0, x1, y1; ctrl_lock.
+var flip_carry: ?[4]u32 = null;
+
+fn boxUnion(a: [4]u32, b: [4]u32) [4]u32 {
+    return .{ @min(a[0], b[0]), @min(a[1], b[1]), @max(a[2], b[2]), @max(a[3], b[3]) };
+}
+
+fn flipDamage(box: [4]u32) [4]u32 {
+    const c = flip_carry orelse return box;
+    return boxUnion(box, c);
+}
 
 // --- Staging snapshot buffer (the resource's attached backing) ---
 // Contiguous PMM allocation, IOMMU-mapped, fb_num_pages long. When
@@ -1387,6 +1460,7 @@ fn submitPairAsyncLocked(
     aflush_descs[2] = c1d0_idx;
     aflush_descs[3] = c1d1_idx;
     aflush_submit_tsc = perf.rdtsc();
+    present_stats.submits += 1;
     @atomicStore(bool, &aflush_in_flight, true, .release);
     return true;
 }
@@ -1436,6 +1510,7 @@ fn reapAsyncFlushLocked() bool {
     ctrl_vq.last_used_idx = aflush_target_idx;
     freeAflushDescsLocked();
     @atomicStore(bool, &aflush_in_flight, false, .release);
+    notePresentDone();
 
     const resp_base: usize = paging.physToVirt(resp_phys);
     var ok = true;
@@ -1486,10 +1561,11 @@ fn waitAsyncFlushIdleLocked() void {
 }
 
 /// Double-buffered blob present — fire-and-forget flip. Caller holds
-/// ctrl_lock with nothing outstanding. Rect args are irrelevant: a flip
-/// always presents the whole back buffer.
-fn submitBlobFlipAsyncLocked() bool {
-    const new_front = 1 - blob_front;
+/// ctrl_lock with nothing outstanding. The whole back buffer is shown;
+/// `box` (x0, y0, x1, y1) is what changed in it since the last flip.
+fn submitBlobFlipAsyncLocked(box: [4]u32) bool {
+    const new_front = blob_back;
+    const dmg = flipDamage(box);
     var sb = SetScanoutBlob{
         .hdr = .{ .cmd_type = CMD_SET_SCANOUT_BLOB },
         .r = .{ .x = 0, .y = 0, .width = width, .height = height },
@@ -1502,7 +1578,7 @@ fn submitBlobFlipAsyncLocked() bool {
     };
     var rf = ResourceFlush{
         .hdr = .{ .cmd_type = CMD_RESOURCE_FLUSH },
-        .r = .{ .x = 0, .y = 0, .width = width, .height = height },
+        .r = .{ .x = dmg[0], .y = dmg[1], .width = dmg[2] - dmg[0], .height = dmg[3] - dmg[1] },
         .resource_id = blob_resource_ids[new_front],
         .padding = 0,
     };
@@ -1512,16 +1588,15 @@ fn submitBlobFlipAsyncLocked() bool {
         @as([*]const u8, @ptrCast(&rf)),
         @sizeOf(ResourceFlush),
     )) {
+        flip_carry = dmg;
         _ = noteFlushResult(false);
         return false;
     }
-    // Flip immediately: the compositor draws the next frame into the
-    // old front. Until the host processes SetScanoutBlob it still
-    // scans out from that buffer — a transient tear, bounded by the
-    // one-in-flight rule, traded for never blocking on present.
-    blob_front = new_front;
-    framebuffer = blob_virt[1 - new_front];
-    current_resource_id = blob_resource_ids[1 - new_front];
+    flip_carry = null;
+    // Flip immediately. Until the host processes SetScanoutBlob it still
+    // scans out the old front: a caller that draws into blob_back while
+    // only two blobs exist waits for this present first (waitPresentIdle).
+    blobsFlipped();
     return true;
 }
 
@@ -1634,6 +1709,7 @@ fn submitBatchLocked(rects: []const [4]u32) bool {
     aflush_target_idx = ctrl_vq.last_used_idx +% @as(u16, @intCast(ncmds));
     aflush_ncmds = ncmds;
     aflush_submit_tsc = perf.rdtsc();
+    present_stats.submits += 1;
     @atomicStore(bool, &aflush_in_flight, true, .release);
     return true;
 }
@@ -1645,12 +1721,14 @@ fn kickPendingFlushLocked() void {
     if (aflush_in_flight or apend_count == 0) return;
     if (!asyncFlushEligible()) return;
     if (scanout_is_blob) {
+        var box = apend_rects[0];
+        for (apend_rects[1..apend_count]) |r| box = boxUnion(box, r);
         apend_count = 0;
         @atomicStore(bool, &aflush_pending, false, .release);
         if (blob_count >= 2) {
-            // A flip presents the whole frame — the pending damage (drawn
-            // into the current back buffer) rides it; rect values moot.
-            _ = submitBlobFlipAsyncLocked();
+            // A flip presents the whole back buffer; the pending damage
+            // tells the host how much of it is new.
+            _ = submitBlobFlipAsyncLocked(box);
         }
         // Single-blob: sync path owns presentation; drop (next flush
         // repaints through it).
@@ -1684,7 +1762,7 @@ fn flushRectAsyncSubmit(x0: u32, y0: u32, x1: u32, y1: u32) bool {
     if (!scanout_is_blob and !staging_active) return false; // no snapshot buffer — sync path stays consistent by blocking
     ctrl_lock.acquire();
     defer ctrl_lock.release();
-    _ = reapAsyncFlushLocked();
+    if (!reapAsyncFlushLocked()) present_stats.folded += 1;
     // Queue the damage; kick no-ops while a batch is still in flight (the
     // rects ride the next kick, merged with whatever else lands meanwhile).
     addPendingRectLocked(x0, y0, x1, y1);
@@ -2434,6 +2512,7 @@ pub fn resumeFromS3() bool {
     scanout_is_blob = false;
     blob_count = 0;
     blob_front = 0;
+    blob_back = 0;
     original_2d_resource_id = 0;
     skip_external_flush = false; // the 2D desktop owns flushing again
     if (!setupDisplay(width, height)) {
@@ -2637,7 +2716,7 @@ pub fn dropOriginal2DScanout() void {
 /// frame should render into) and flushUnconditional handles flips.
 pub fn armBlobScanout(res_ids: []const u32, virts: []const [*]volatile u32, n: u32) bool {
     if (!active) return false;
-    if (n < 1 or n > 2) return false;
+    if (n < 1 or n > MAX_BLOBS) return false;
     if (res_ids.len < n or virts.len < n) return false;
     if (scanout_is_blob) return false; // already armed; tear down first via dropBlobScanout
 
@@ -2671,14 +2750,10 @@ pub fn armBlobScanout(res_ids: []const u32, virts: []const [*]volatile u32, n: u
     // back; the first flushUnconditional() page-flips them.
     blob_count = n;
     blob_front = 0;
+    blob_back = if (n >= 2) 1 else 0;
     scanout_is_blob = true;
-    if (n >= 2) {
-        framebuffer = blob_virt[1];
-        current_resource_id = blob_resource_ids[1];
-    } else {
-        framebuffer = blob_virt[0];
-        current_resource_id = blob_resource_ids[0];
-    }
+    framebuffer = blob_virt[blob_back];
+    current_resource_id = blob_resource_ids[blob_back];
 
     // First flush so the host's GL surface picks up the front blob's
     // contents (whatever the compositor pre-painted into it).
@@ -2831,14 +2906,14 @@ pub fn flushUnconditional() void {
     // forced-poll / single-blob fallback.
     if (flushRectAsyncSubmit(0, 0, width, height)) return;
     if (scanout_is_blob and blob_count >= 2) {
-        // Page flip: the compositor just wrote into blob[1-blob_front]
-        // (which framebuffer points at). Display it, then point
-        // framebuffer at the now-back blob (= old front). The two cmds
+        // Page flip: the compositor just wrote into blob_back (which
+        // framebuffer points at). Display it, then point framebuffer at
+        // the next back blob. The two cmds
         // (SetScanoutBlob + ResourceFlush) are batched into one virtqueue
         // submit so the host pipelines them and we pay one round-trip
         // instead of two — the dominant per-frame cost on QEMU's GTK
         // backend (~21 ms saved/frame).
-        const new_front = 1 - blob_front;
+        const new_front = blob_back;
         var sb = SetScanoutBlob{
             .hdr = .{ .cmd_type = CMD_SET_SCANOUT_BLOB },
             .r = .{ .x = 0, .y = 0, .width = width, .height = height },
@@ -2861,9 +2936,7 @@ pub fn flushUnconditional() void {
             @as([*]const u8, @ptrCast(&rf)),
             @sizeOf(ResourceFlush),
         ));
-        blob_front = new_front;
-        framebuffer = blob_virt[1 - new_front];
-        current_resource_id = blob_resource_ids[1 - new_front];
+        blobsFlipped();
     } else if (scanout_is_blob) {
         // Single-buffer blob: host udmabuf-imports our pages, no transfer.
         _ = noteFlushResult(resourceFlushCmd(current_resource_id, 0, 0, width, height));
@@ -2921,7 +2994,7 @@ pub fn flushRectUnconditional(x: u32, y: u32, w: u32, h: u32) void {
         // Page flip: SetScanoutBlob + ResourceFlush batched (see
         // flushUnconditional for rationale). Partial rects can't be
         // flipped — always present the whole back.
-        const new_front = 1 - blob_front;
+        const new_front = blob_back;
         var sb = SetScanoutBlob{
             .hdr = .{ .cmd_type = CMD_SET_SCANOUT_BLOB },
             .r = .{ .x = 0, .y = 0, .width = width, .height = height },
@@ -2944,9 +3017,7 @@ pub fn flushRectUnconditional(x: u32, y: u32, w: u32, h: u32) void {
             @as([*]const u8, @ptrCast(&rf)),
             @sizeOf(ResourceFlush),
         ));
-        blob_front = new_front;
-        framebuffer = blob_virt[1 - new_front];
-        current_resource_id = blob_resource_ids[1 - new_front];
+        blobsFlipped();
     } else if (scanout_is_blob) {
         _ = noteFlushResult(resourceFlushCmd(current_resource_id, x0, y0, x1 - x0, y1 - y0));
     } else {

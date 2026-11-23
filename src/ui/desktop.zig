@@ -2417,6 +2417,7 @@ fn renderWindow(idx: u8) void {
 
         if (t.scroll_view > 0 and t.scroll_count > 0) {
             // Scrolled-back view: show scrollback + text_buf
+            t.painted_valid = false;
             var row: u32 = 0;
             while (row < max_rows) : (row += 1) {
                 const total_lines = @as(u32, t.scroll_count) + @as(u32, t.text_row) + 1;
@@ -2487,31 +2488,26 @@ fn renderWindow(idx: u8) void {
             }
 
             // Text cursor — blink unless the user just typed / output just landed.
-            if (is_focused and t.text_col < max_cols and t.text_row < max_rows and cursorShown(w, t)) {
-                const blink_on = ((process.tick_count -% t.cursor_blink_anchor) / CURSOR_BLINK_HALF_TICKS) & 1 == 0;
-                if (blink_on) {
-                    gfx.fillRect(
-                        w.x + @as(i32, @intCast(TERM_PAD + @as(u32, t.text_col) * FONT_W)),
-                        content_y + @as(i32, @intCast(@as(u32, t.text_row) * FONT_H)),
-                        FONT_W,
-                        FONT_H,
-                        TERM_FG,
-                    );
-                }
+            const cursor = termCursorCell(idx, w, t, max_cols, max_rows);
+            if (cursor != TerminalData.NO_CURSOR) {
+                gfx.fillRect(
+                    w.x + @as(i32, @intCast(TERM_PAD + @as(u32, t.text_col) * FONT_W)),
+                    content_y + @as(i32, @intCast(@as(u32, t.text_row) * FONT_H)),
+                    FONT_W,
+                    FONT_H,
+                    TERM_FG,
+                );
             }
+            // The rows now show exactly these cells.
+            t.painted_text = t.text_buf;
+            t.painted_attr = t.attr_buf;
+            t.painted_rgb = t.fg_rgb_buf;
+            t.painted_cursor = cursor;
+            t.painted_scroll_count = t.scroll_count;
+            t.painted_valid = true;
         }
 
-        // Scrollbar
-        const total_lines = @as(u32, t.scroll_count) + TERM_ROWS;
-        if (t.scroll_count > 0) {
-            const sb_x = w.x + @as(i32, @intCast(w.width)) - 3;
-            gfx.fillRect(sb_x, content_y + 1, 2, content_h -| 1, 0x2A2A2A);
-            const thumb_h = @max(content_h * max_rows / total_lines, 8);
-            const scroll_pos = total_lines - @as(u32, t.scroll_view) -| max_rows;
-            const track_h = content_h -| thumb_h;
-            const thumb_y_off = if (total_lines > max_rows) scroll_pos * track_h / (total_lines - max_rows) else 0;
-            gfx.fillRect(sb_x, content_y + @as(i32, @intCast(thumb_y_off)), 2, thumb_h, 0x555555);
-        }
+        drawTermScrollbar(w, t);
     }
 
     // Animation fade overlay
@@ -2525,6 +2521,7 @@ fn renderWindow(idx: u8) void {
         };
         if (fade_alpha > 0) {
             gfx.fillRectAlpha(w.x, w.y, w.width, w.height, (fade_alpha << 24));
+            if (w.term) |t| t.painted_valid = false;
         }
     }
 
@@ -2543,38 +2540,64 @@ fn borderColor(w: *const Window, is_focused: bool) u32 {
         (if (is_focused) @as(u32, 0xB4B4B4) else @as(u32, 0xC8C8C8));
 }
 
-/// Fast path: re-render only one terminal row + text cursor in the back buffer.
-fn renderTerminalRow(idx: u8) void {
+/// The cell the cursor block of terminal `idx` is drawn in right now, or
+/// NO_CURSOR: unfocused, hidden, off the visible grid, or in the dark half
+/// of its blink.
+fn termCursorCell(idx: u8, w: *const Window, t: *const TerminalData, max_cols: u32, max_rows: u32) u16 {
+    if (idx != wm.focused or t.text_col >= max_cols or t.text_row >= max_rows or !cursorShown(w, t)) return TerminalData.NO_CURSOR;
+    const blink_on = ((process.tick_count -% t.cursor_blink_anchor) / CURSOR_BLINK_HALF_TICKS) & 1 == 0;
+    if (!blink_on) return TerminalData.NO_CURSOR;
+    return @intCast(@as(u32, t.text_row) * TERM_COLS + t.text_col);
+}
+
+/// The scrollback bar along the right edge of a terminal's content area.
+fn drawTermScrollbar(w: *const Window, t: *const TerminalData) void {
+    if (t.scroll_count == 0) return;
+    const content_y = w.y + @as(i32, TITLEBAR_H);
+    const content_h = w.height -| TITLEBAR_H;
+    const max_rows = content_h / FONT_H;
+    const total_lines = @as(u32, t.scroll_count) + TERM_ROWS;
+    const sb_x = w.x + @as(i32, @intCast(w.width)) - 3;
+    gfx.fillRect(sb_x, content_y + 1, 2, content_h -| 1, 0x2A2A2A);
+    const thumb_h = @max(content_h * max_rows / total_lines, 8);
+    const scroll_pos = total_lines - @as(u32, t.scroll_view) -| max_rows;
+    const track_h = content_h -| thumb_h;
+    const thumb_y_off = if (total_lines > max_rows) scroll_pos * track_h / (total_lines - max_rows) else 0;
+    gfx.fillRect(sb_x, content_y + @as(i32, @intCast(thumb_y_off)), 2, thumb_h, 0x555555);
+}
+
+/// Paint one row of terminal `idx` into the back buffer — background,
+/// cells, the cursor block if `cursor` lies on it — and record it as what
+/// the row shows. The scrollbar's stretch of the row is painted over.
+fn paintTermRow(idx: u8, row: u32, cursor: u16) void {
     const w = &windows[idx];
     const t = w.term orelse return;
-    if (!w.visible or w.minimized) return;
-
     const content_y = w.y + @as(i32, TITLEBAR_H);
     const content_h = w.height -| TITLEBAR_H;
     const max_cols = (w.width - TERM_PAD * 2) / FONT_W;
-    const max_rows = content_h / FONT_H;
-    const row: u32 = @as(u32, t.text_row);
-    if (row >= max_rows) return;
+    if (row >= TERM_ROWS or row >= content_h / FONT_H) return;
 
     const py: i32 = content_y + @as(i32, @intCast(row * FONT_H));
 
-    // A row that reaches the bottom corners is painted across them: keep
-    // them round, as renderWindow does.
+    // A row that reaches the bottom corners is painted across them: they
+    // go back as they were.
     const in_corners = py + @as(i32, FONT_H) > w.y + @as(i32, @intCast(w.height)) - @as(i32, CORNER_R);
     const fx = w.x - @as(i32, BORDER);
     const fy = w.y - @as(i32, BORDER);
     if (in_corners) saveCornerPixels(fx, fy, w.width + BORDER * 2, w.height + BORDER * 2, BOTTOM_CORNERS);
-    defer if (in_corners) restoreCornerPixels(fx, fy, w.width + BORDER * 2, w.height + BORDER * 2, borderColor(w, idx == wm.focused), BOTTOM_CORNERS);
+    defer if (in_corners) keepCornerPixels(fx, fy, w.width + BORDER * 2, w.height + BORDER * 2, borderColor(w, idx == wm.focused), BOTTOM_CORNERS);
 
     // Clear the row background
     gfx.fillRect(w.x, py, w.width, FONT_H, WINDOW_BG);
+    if (row == 0) gfx.drawHLine(w.x, content_y, w.width, 0x151515);
 
     // Draw characters on this row, per-cell color from attr_buf.
     // Space cells render too when inverse mode is on, so colored bg shows
     // (used by fastfetch's truecolor bar via fg+inverse swap).
+    const first = row * TERM_COLS;
     var col: u32 = 0;
     while (col < TERM_COLS and col < max_cols) : (col += 1) {
-        const cell_idx = row * TERM_COLS + col;
+        const cell_idx = first + col;
         const ch = t.text_buf[cell_idx];
         const attr = t.attr_buf[cell_idx];
         if (ch != ' ' or (attr & ATTR_INVERSE) != 0) {
@@ -2589,19 +2612,122 @@ fn renderTerminalRow(idx: u8) void {
         }
     }
 
-    // Text cursor — blink unless the user just typed / output just landed.
-    if (idx == wm.focused and t.text_col < max_cols and cursorShown(w, t)) {
-        const blink_on = ((process.tick_count -% t.cursor_blink_anchor) / CURSOR_BLINK_HALF_TICKS) & 1 == 0;
-        if (blink_on) {
-            gfx.fillRect(
-                w.x + @as(i32, @intCast(TERM_PAD + @as(u32, t.text_col) * FONT_W)),
-                py,
-                FONT_W,
-                FONT_H,
-                TERM_FG,
-            );
+    const cursor_here = cursor != TerminalData.NO_CURSOR and cursor / TERM_COLS == row;
+    if (cursor_here) {
+        gfx.fillRect(
+            w.x + @as(i32, @intCast(TERM_PAD + @as(u32, cursor % TERM_COLS) * FONT_W)),
+            py,
+            FONT_W,
+            FONT_H,
+            TERM_FG,
+        );
+    }
+
+    @memcpy(t.painted_text[first..][0..TERM_COLS], t.text_buf[first..][0..TERM_COLS]);
+    @memcpy(t.painted_attr[first..][0..TERM_COLS], t.attr_buf[first..][0..TERM_COLS]);
+    @memcpy(t.painted_rgb[first..][0..TERM_COLS], t.fg_rgb_buf[first..][0..TERM_COLS]);
+    if (cursor_here) {
+        t.painted_cursor = cursor;
+    } else if (t.painted_cursor != TerminalData.NO_CURSOR and t.painted_cursor / TERM_COLS == row) {
+        t.painted_cursor = TerminalData.NO_CURSOR;
+    }
+}
+
+/// Fast path: re-render only the cursor's row of a terminal in the back
+/// buffer.
+fn renderTerminalRow(idx: u8) void {
+    const w = &windows[idx];
+    const t = w.term orelse return;
+    if (!w.visible or w.minimized) return;
+    const max_cols = (w.width - TERM_PAD * 2) / FONT_W;
+    const max_rows = (w.height -| TITLEBAR_H) / FONT_H;
+    paintTermRow(idx, t.text_row, termCursorCell(idx, w, t, max_cols, max_rows));
+    redrawTermScrollbar(idx);
+}
+
+/// The scrollbar again after rows were painted over it, its foot kept out
+/// of the rounded corner.
+fn redrawTermScrollbar(idx: u8) void {
+    const w = &windows[idx];
+    const t = w.term orelse return;
+    if (t.scroll_count == 0) return;
+    const fx = w.x - @as(i32, BORDER);
+    const fy = w.y - @as(i32, BORDER);
+    saveCornerPixels(fx, fy, w.width + BORDER * 2, w.height + BORDER * 2, BOTTOM_CORNERS);
+    drawTermScrollbar(w, t);
+    keepCornerPixels(fx, fy, w.width + BORDER * 2, w.height + BORDER * 2, borderColor(w, idx == wm.focused), BOTTOM_CORNERS);
+}
+
+/// Whether the rows of terminal `idx` (at z_stack[z_pos]) can be painted on
+/// their own: the back buffer shows the live view as recorded, and nothing
+/// is drawn over the content area — no window or its shadow above, no
+/// menubar or dock band. Overlays are the caller's (partialHitsOverlay).
+fn termRowsPaintable(z_pos: usize, idx: u8) bool {
+    const w = &windows[idx];
+    const t = w.term orelse return false;
+    if (!t.painted_valid or t.scroll_view != 0 or w.anim_type != .none) return false;
+    if (!w.visible or w.minimized or backbuf == null) return false;
+    const x0 = w.x;
+    const y0 = w.y + @as(i32, TITLEBAR_H);
+    const x1 = w.x + @as(i32, @intCast(w.width));
+    const y1 = w.y + @as(i32, @intCast(w.height));
+    const dock_y: i32 = dock.dockY();
+    if (y0 < MENUBAR_REACH) return false;
+    if (y0 < dock_y + @as(i32, TASKBAR_H) + DOCK_REACH and y1 > dock_y - DOCK_REACH) return false;
+    for (z_stack[z_pos + 1 .. wm.z_count]) |above| {
+        if (!windows[above].visible or windows[above].minimized) continue;
+        const r = paddedWinRect(above);
+        if (r[0] < x1 and x0 < r[2] and r[1] < y1 and y0 < r[3]) return false;
+    }
+    return true;
+}
+
+/// Bring the rows of terminal `idx` up to date in the back buffer: those
+/// whose cells or cursor block differ from what they show are repainted,
+/// and the bands painted go to the dirty tracker. For a window that
+/// termRowsPaintable accepted. True if anything was painted.
+fn repaintStaleRows(idx: u8) bool {
+    const w = &windows[idx];
+    const t = w.term orelse return false;
+    const content_y = w.y + @as(i32, TITLEBAR_H);
+    const content_h = w.height -| TITLEBAR_H;
+    const max_cols = (w.width - TERM_PAD * 2) / FONT_W;
+    const max_rows = @min(TERM_ROWS, content_h / FONT_H);
+    const cursor = termCursorCell(idx, w, t, max_cols, max_rows);
+    const old_cursor = t.painted_cursor;
+    const wx: u32 = if (w.x < 0) 0 else @intCast(w.x);
+
+    var painted = false;
+    var band: ?u32 = null; // first row of the run being painted
+    var row: u32 = 0;
+    while (row <= max_rows) : (row += 1) {
+        const stale = row < max_rows and blk: {
+            // NO_CURSOR / TERM_COLS is past every row.
+            if (cursor != old_cursor and (cursor / TERM_COLS == row or old_cursor / TERM_COLS == row)) break :blk true;
+            const a = row * TERM_COLS;
+            break :blk !std.mem.eql(u8, t.text_buf[a..][0..TERM_COLS], t.painted_text[a..][0..TERM_COLS]) or
+                !std.mem.eql(u8, t.attr_buf[a..][0..TERM_COLS], t.painted_attr[a..][0..TERM_COLS]) or
+                !std.mem.eql(u32, t.fg_rgb_buf[a..][0..TERM_COLS], t.painted_rgb[a..][0..TERM_COLS]);
+        };
+        if (stale) {
+            paintTermRow(idx, row, cursor);
+            if (band == null) band = row;
+            painted = true;
+        } else if (band) |b| {
+            const y = content_y + @as(i32, @intCast(b * FONT_H));
+            if (y >= 0) addDirtyRect(wx, @intCast(y), w.width, (row - b) * FONT_H);
+            band = null;
         }
     }
+    const bar_moved = t.scroll_count != t.painted_scroll_count;
+    if (painted or bar_moved) redrawTermScrollbar(idx);
+    if (bar_moved) {
+        t.painted_scroll_count = t.scroll_count;
+        const bar_x = w.x + @as(i32, @intCast(w.width)) - 3;
+        if (bar_x >= 0 and content_y >= 0) addDirtyRect(@intCast(bar_x), @intCast(content_y), 3, content_h);
+        painted = true;
+    }
+    return painted;
 }
 
 // --- Rounded corner masking ---
@@ -2749,6 +2875,31 @@ fn restoreCornerPixels(x: i32, y: i32, w: u32, h: u32, border_color: u32, first:
                 const g = (((win >> 8) & 0xFF) * int_a + br_g * ring_a + ((bg_pixel >> 8) & 0xFF) * out_a) / 255;
                 const b = ((win & 0xFF) * int_a + br_b * ring_a + (bg_pixel & 0xFF) * out_a) / 255;
                 gfx.target[off] = (r << 16) | (g << 8) | b;
+            }
+        }
+    }
+}
+
+/// restoreCornerPixels for rows repainted inside a window already on screen:
+/// what was saved is the finished corner, not the background behind it, so
+/// wherever the background shows through, the pixel goes back as it was.
+fn keepCornerPixels(x: i32, y: i32, w: u32, h: u32, border_color: u32, first: usize) void {
+    restoreCornerPixels(x, y, w, h, border_color, first);
+    const right: i32 = x + @as(i32, @intCast(w)) - 1;
+    const bot: i32 = y + @as(i32, @intCast(h)) - 1;
+    const corners = [_][2]i32{ .{ x, y }, .{ right, y }, .{ x, bot }, .{ right, bot } };
+    const x_dirs = [_]i32{ 1, -1, 1, -1 };
+    const y_dirs = [_]i32{ 1, 1, -1, -1 };
+    for (first..4) |c| {
+        const base = c * CORNER_BUF_PER;
+        for (0..CORNER_R) |cy| {
+            for (0..CORNER_R) |cx| {
+                if (corner_mask[cy][cx] == 0) continue;
+                const px = corners[c][0] + @as(i32, @intCast(cx)) * x_dirs[c];
+                const py = corners[c][1] + @as(i32, @intCast(cy)) * y_dirs[c];
+                if (px < 0 or py < 0) continue;
+                if (@as(u32, @intCast(px)) >= gfx.target_w or @as(u32, @intCast(py)) >= gfx.target_h) continue;
+                gfx.target[@as(u32, @intCast(py)) * gfx.target_w + @as(u32, @intCast(px))] = corner_save[base + cy * CORNER_R + cx];
             }
         }
     }
@@ -3988,14 +4139,20 @@ pub fn run() void {
         // a wake requested during that iteration must keep it from parking.
         // Requests made from here on re-arm for the next iteration.
         wake.consume();
-        // Frame clock starts AFTER parkOrYield returns — parked/yielded
-        // time belongs to the scheduler, not to this frame.
-        frameperf.frameBegin();
+        const ftrace = @import("../debug/ftrace.zig");
+        ftrace.mark(.desk_wake, 0);
         // Mode 9: the GPU compositor reads the backbuf (or draws from it in
         // place) between our iterations, never during one.
         const gpu_comp = @import("gpu_compositor.zig");
+        const source_wait_t0 = @import("../debug/perf.zig").rdtsc();
         const source_held = gpu_comp.beginDraw();
         defer if (source_held) gpu_comp.endDraw();
+        frameperf.sourceWaited(@import("../debug/perf.zig").rdtsc() -% source_wait_t0);
+        ftrace.mark(.desk_draw, 0);
+        // Frame clock starts AFTER parkOrYield returns and the compositor
+        // lets us in — parked/yielded time belongs to the scheduler, not to
+        // this frame.
+        frameperf.frameBegin();
         if (source_held) {
             if (gpu_comp.takeOfferedBackBuffer()) |nb| adoptBackBuffer(nb);
         }
@@ -4321,25 +4478,88 @@ pub fn run() void {
         // "TTY-as-two-pipes" architecture: no kernel TTY primitive, just a
         // pair of generic byte streams plus this drain step.
         //
-        // The whole window is repainted (not .text_only) because drained bytes
-        // can span multiple rows — `ls`'s newline-separated output, wc's "N
-        // bytes M lines\n", etc. — and .text_only only redraws the row at
-        // text_row, leaving earlier rows blank until the next full repaint.
-        // Output only touches the terminal's own cells, so a region suffices.
+        // Drained bytes can change any rows (`ls`'s lines, a scroll, a
+        // program addressing the cursor), so the window is only marked here;
+        // the step below repaints whichever rows differ from what they show.
+        //
+        // A program that prints without pause (`yes`, a long build log)
+        // refills the pipe as fast as it is drained here, so each window
+        // gets a time slice per iteration: the frame is drawn and the
+        // keyboard read in between, and the writer waits on the full pipe.
         {
             const pipe = @import("../proc/pipe.zig");
+            const rdtsc = @import("../debug/perf.zig").rdtsc;
+            const slice_cyc = @import("../time/apic.zig").tscPerQuantumSane() * DRAIN_SLICE_MS / 10;
             var drain_buf: [256]u8 = undefined;
+            var more = false;
             for (z_stack[0..wm.z_count]) |wi| {
                 const w = &windows[wi];
                 if (w.out_pipe == 0xFF) continue;
+                const t0 = rdtsc();
+                var taken: usize = 0;
                 while (true) {
                     const got = pipe.tryRead(w.out_pipe, &drain_buf);
                     if (got == 0) break;
                     for (drain_buf[0..got]) |c| putCharOnWindow(w, c);
+                    if (w.term) |t| t.rows_stale = true;
+                    if (got < drain_buf.len) break;
+                    taken += got;
+                    // No calibrated clock yet: a byte count stands in.
+                    const spent = if (slice_cyc != 0) rdtsc() -% t0 >= slice_cyc else taken >= DRAIN_SLICE_BYTES;
+                    if (spent) {
+                        more = true;
+                        break;
+                    }
+                }
+            }
+            if (more) wake.requestWake();
+        }
+
+        // Terminals that got output: repaint the rows it changed. Where
+        // rows cannot be painted on their own — something lies over the
+        // window, it shows its scrollback, or this frame repaints regions
+        // anyway — the whole window is repainted as a region.
+        //
+        // A keystroke or a blink edge in the focused terminal (.text_only)
+        // goes the same way: its rows are compared with what they show, so
+        // a key whose echo has not come yet draws nothing and presents no
+        // frame of its own.
+        {
+            // The focused terminal is looked at for its text row alone.
+            var row_only: u8 = 0xFF;
+            if (dirty == .text_only and slot_used[wm.focused]) {
+                if (windows[wm.focused].term) |t| {
+                    if (!t.rows_stale) row_only = wm.focused;
+                    t.rows_stale = true;
+                }
+            }
+            const rows_alone = dirty == .none or dirty == .cursor_only or dirty == .gui_only or dirty == .text_only;
+            var rows_painted = false;
+            var text_row_done = false;
+            for (z_stack[0..wm.z_count], 0..) |wi, z_pos| {
+                const t = windows[wi].term orelse continue;
+                if (!t.rows_stale) continue;
+                t.rows_stale = false;
+                if (rows_alone and termRowsPaintable(z_pos, wi)) {
+                    if (repaintStaleRows(wi)) rows_painted = true;
+                    if (wi == wm.focused) text_row_done = true;
+                } else if (row_only == wi) {
+                    // Not paintable on its own: the text-row path draws it.
+                } else {
                     seedWindow(wi);
                     wantRegion(&dirty);
-                    if (got < drain_buf.len) break;
                 }
+            }
+            if (rows_painted and dirty == .text_only and !text_row_done) {
+                // The text row is still owed and a rows-only frame would
+                // skip it.
+                seedWindow(wm.focused);
+                wantRegion(&dirty);
+            } else if (rows_painted and (dirty == .none or dirty == .cursor_only or dirty == .text_only)) {
+                dirty = .gui_only;
+            } else if (dirty == .text_only and text_row_done) {
+                // Nothing differed. A software pointer may still have moved.
+                dirty = .cursor_only;
             }
         }
 
@@ -4381,18 +4601,30 @@ pub fn run() void {
                 if (w.gui_fb == null or !w.visible or w.has_presented) continue;
                 gui_autorefresh_active = true;
                 if (process.tick_count -% w.last_auto_refresh_tick >= AUTO_REFRESH_INTERVAL_TICKS) {
-                    w.gui_present_pending = true;
                     w.last_auto_refresh_tick = process.tick_count;
+                    const h = guiContentHash(w);
+                    if (h != w.auto_refresh_hash) {
+                        w.auto_refresh_hash = h;
+                        w.auto_refresh_settle = true;
+                        w.gui_present_pending = true;
+                    } else if (w.auto_refresh_settle) {
+                        w.auto_refresh_settle = false;
+                        w.gui_present_pending = true;
+                    }
                 }
             }
         }
 
         // Re-composite GUI windows that need it
         if (gui_windows_active) {
-            for (z_stack[0..wm.z_count]) |gi| {
+            for (z_stack[0..wm.z_count], 0..) |gi, z_pos| {
                 if (windows[gi].gui_present_pending and windows[gi].visible) {
+                    // Hidden whole behind another window: the frame stays
+                    // pending until some of the window shows.
+                    if (windowCovered(z_pos, gi)) continue;
                     windows[gi].gui_present_pending = false;
                     const w = &windows[gi];
+                    w.content_seq +%= 1;
                     addDirtyRect(
                         if (w.x < 0) 0 else @intCast(w.x),
                         if (w.y < 0) 0 else @intCast(w.y),
@@ -4584,6 +4816,7 @@ pub fn run() void {
         drag_accum_valid = false;
         region_seed_count = 0;
         text_row_pending = false;
+        ftrace.mark(.desk_done, @intFromEnum(dirty));
         frameperf.frameEnd(switch (dirty) {
             .none => .none,
             .cursor_only => .cursor,
@@ -4883,6 +5116,12 @@ pub fn snapshotGuiFb(pid: u8) void {
             const front = w.gui_fb orelse return;
             const n = w.gui_fb_pixels;
             if (n == 0) return;
+            // A slot window's framebuffer is the image the GPU compositor
+            // samples: nothing reads a snapshot of it.
+            if (w.gpu_slot != null) {
+                w.has_presented = true;
+                return;
+            }
             // Race-free triple buffer: write slot (pub+1)%3, then publish
             // it. The compositor is currently reading slot pub; the just-
             // -published slot is a fresh slot it hasn't touched. With 3
@@ -5375,9 +5614,56 @@ fn parkOrYield() void {
 // Desktop update interval: timer returns control every N ticks (~50fps at 100Hz)
 var last_desktop_tick: u64 = 0;
 const DESKTOP_INTERVAL: u64 = 8;
+/// How long one loop iteration reads a terminal's output pipe before it
+/// goes on to draw (see the drain step); the byte count is the same bound
+/// for a boot with no calibrated clock.
+const DRAIN_SLICE_MS: u64 = 4;
+const DRAIN_SLICE_BYTES: usize = 16 * 1024;
 var gui_windows_active: bool = false;
 /// A visible GUI window is being re-composited on the auto-refresh timer.
 var gui_autorefresh_active: bool = false;
+
+/// True if a window above `z_pos` in the stack hides window `wi` whole, so
+/// that a new frame of it changes nothing on screen. The margin keeps clear
+/// of the cover's rounded corners.
+fn windowCovered(z_pos: usize, wi: u8) bool {
+    const COVER_MARGIN: i32 = 12;
+    const w = &windows[wi];
+    const x1 = w.x + @as(i32, @intCast(w.width));
+    const y1 = w.y + @as(i32, @intCast(w.height));
+    for (z_stack[z_pos + 1 .. wm.z_count]) |ui| {
+        const u = &windows[ui];
+        if (!slot_used[ui] or !u.visible or u.minimized or u.anim_type != .none) continue;
+        if (w.x >= u.x + COVER_MARGIN and x1 <= u.x + @as(i32, @intCast(u.width)) - COVER_MARGIN and
+            w.y >= u.y and y1 <= u.y + @as(i32, @intCast(u.height))) return true;
+    }
+    return false;
+}
+
+/// Hash of the pixels a GUI window's live framebuffer shows. An app that
+/// never presents is polled; this tells a poll that found nothing new, so
+/// that a still window costs no frame. Any one changed pixel changes it.
+fn guiContentHash(w: *const Window) u64 {
+    const fb = w.gui_fb orelse return 0;
+    const stride: usize = if (w.gui_alloc_w > 0) w.gui_alloc_w else w.gui_w;
+    const cols: usize = @min(w.gui_w, stride);
+    if (cols == 0) return 0;
+    const rows: usize = @min(
+        if (w.gui_alloc_h > 0) @min(w.gui_h, w.gui_alloc_h) else w.gui_h,
+        w.gui_fb_pixels / stride,
+    );
+    const px: [*]const u32 = @ptrCast(@volatileCast(fb));
+    var h: u64 = 0x9E3779B97F4A7C15;
+    var y: usize = 0;
+    while (y < rows) : (y += 1) {
+        const row = px + y * stride;
+        const pairs: [*]align(4) const u64 = @ptrCast(row);
+        var i: usize = 0;
+        while (i < cols / 2) : (i += 1) h = std.math.rotl(u64, h ^ pairs[i], 29) *% 0x100000001B3;
+        if (cols & 1 != 0) h = std.math.rotl(u64, h ^ row[cols - 1], 29) *% 0x100000001B3;
+    }
+    return h;
+}
 
 fn hasGuiWindows() bool {
     for (z_stack[0..wm.z_count]) |i| {

@@ -131,8 +131,7 @@ fn appendReplyMarker() void {
 fn appendReplyMarkerTo(cs: *venus.CmdStream) void {
     reply_marker_seq +%= 1;
     reply_marker_off = REPLY_MARKER_BASE + (reply_marker_seq % REPLY_MARKER_SLOTS) * REPLY_MARKER_STRIDE;
-    venus.encodeSeekReplyCommandStream(cs, reply_marker_off);
-    venus.encodeEnumerateInstanceVersion(cs);
+    venus.encodeSeekReplyMarker(cs, reply_marker_off);
 }
 
 const SubmitResult = enum {
@@ -197,8 +196,13 @@ fn submitFrame(timeout_ms: u64) SubmitResult {
     // The ring and the virtqueue run on different host threads: what the
     // virtqueue still holds (a new window's descriptor update, say) must
     // land before a frame uses it.
+    const apic = @import("../time/apic.zig");
+    const t0 = apic.readTsc();
+    const drained = virtqueue_pending;
     if (virtqueue_pending and !drainVirtqueue()) return .not_sent;
+    const t1 = apic.readTsc();
     armReplyMarker(ring);
+    ring_notified = false;
     if (!ringWrite(scratch_cs.bytes())) {
         // The host's ring thread failed or stopped draining; the context
         // goes down with it.
@@ -206,8 +210,23 @@ fn submitFrame(timeout_ms: u64) SubmitResult {
         debug.klog("[gpu-comp] ring: fatal or stuck\n", .{});
         return .no_reply;
     }
-    return waitReplyMarker(ring, timeout_ms);
+    const t2 = apic.readTsc();
+    const r = waitReplyMarker(ring, timeout_ms);
+    const total_us = apic.tscToUs(apic.readTsc() -% t0);
+    if (total_us >= SLOW_FRAME_US) {
+        debug.klog("[gpu-comp] slow frame: {d} us = virtqueue drain {d} (pending={d}) + ring write {d} (notify={d}) + reply wait {d}; {d} B\n", .{
+            total_us,                  apic.tscToUs(t1 -% t0),      @intFromBool(drained),
+            apic.tscToUs(t2 -% t1),    @intFromBool(ring_notified), apic.tscToUs(apic.readTsc() -% t2),
+            scratch_cs.bytes().len,
+        });
+    }
+    return r;
 }
+
+/// A frame the host takes this long over gets its parts logged.
+const SLOW_FRAME_US: u64 = 100_000;
+/// ringWrite found the host's ring thread idle and sent it a notify.
+var ring_notified: bool = false;
 
 /// A marker alone on the virtqueue: returns once all it holds has run.
 /// The frame in scratch_cs keeps its own marker slot.
@@ -310,17 +329,19 @@ const COMPOSITOR_SCANOUT_IMAGE_BASE: u64 = 330;
 // rendered pixels into a VkBuffer bound to an SHM blob. The kernel
 // reads from the SHM blob's mapping at memory-bandwidth speed.
 //
-// Step 9.3: doubled to a pair (A, B) for tear-free page-flip. Each
-// frame writes to whichever buffer is currently the BACK
-// (= virtio_gpu.blob_resource_ids[1 - virtio_gpu.blob_front]); the
-// driver's flushUnconditional flips SCANOUT_BLOB to that back, which
-// then becomes the front, and the previous front becomes the back for
-// the next frame. Vulkan never writes into the buffer the host is
-// scanning out, so pixels can't be torn.
+// Step 9.3: several of them for tear-free page-flip. Each frame writes
+// to the BACK one (virtio_gpu.blob_back); the driver's flushUnconditional
+// flips SCANOUT_BLOB to it, and it becomes the front. Vulkan never writes
+// into a buffer the host is scanning out, so pixels can't be torn. With
+// three, a frame is rendered while the host still takes the present
+// before it; with two it waits for that present.
 const COMPOSITOR_READBACK_BUFFER: u64 = 340;
 const COMPOSITOR_READBACK_MEM: u64 = 341;
 const COMPOSITOR_READBACK_BUFFER_2: u64 = 342;
 const COMPOSITOR_READBACK_MEM_2: u64 = 343;
+const COMPOSITOR_READBACK_BUFFER_3: u64 = 344;
+const COMPOSITOR_READBACK_MEM_3: u64 = 345;
+const MAX_READBACK = virtio_gpu.MAX_BLOBS;
 
 // Command ring (vkCreateRingMESA). A 64 KB HOST3D blob laid out as:
 //   [head:u32 @ 0][tail:u32 @ 4][status:u32 @ 8][pad @ 12]
@@ -342,6 +363,7 @@ const RING_EXTRA_SIZE: u64 = RING_TOTAL_SIZE - RING_EXTRA_OFFSET;
 // VkRingStatusFlagBitsMESA
 const RING_STATUS_IDLE: u32 = 0x1;
 const RING_STATUS_FATAL: u32 = 0x2;
+const RING_IDLE_TIMEOUT_NS: u64 = 100_000_000;
 var ring_kvirt: ?[*]volatile u8 = null;
 var ring_res_id: u32 = 0;
 var ring_created: bool = false;
@@ -399,21 +421,67 @@ var focused_pixel_buf: ?[*]volatile u8 = null;
 // vkCmdCopyImageToBuffer's destination IS the host's display source —
 // no kernel-side memcpy from BAR to scanout pages needed.
 //
-// Step 9.3: doubled to a pair for tear-free page flip. Each frame
-// targets the BACK buffer (= 1 - virtio_gpu.blob_front); flushUnconditional
-// flips SCANOUT_BLOB to that buffer once Vulkan finishes writing.
-var readback_res_ids: [2]u32 = .{ 0, 0 };
-var readback_buf_handles: [2]u64 = .{ COMPOSITOR_READBACK_BUFFER, COMPOSITOR_READBACK_BUFFER_2 };
-var readback_mem_handles: [2]u64 = .{ COMPOSITOR_READBACK_MEM, COMPOSITOR_READBACK_MEM_2 };
-var readback_pixel_bufs: [2]?[*]volatile u8 = .{ null, null };
+// Step 9.3: more than one for tear-free page flip. Each frame targets
+// the BACK buffer (virtio_gpu.blob_back); flushUnconditional flips
+// SCANOUT_BLOB to that buffer once Vulkan finishes writing.
+var readback_res_ids: [MAX_READBACK]u32 = .{ 0, 0, 0 };
+var readback_buf_handles: [MAX_READBACK]u64 = .{ COMPOSITOR_READBACK_BUFFER, COMPOSITOR_READBACK_BUFFER_2, COMPOSITOR_READBACK_BUFFER_3 };
+var readback_mem_handles: [MAX_READBACK]u64 = .{ COMPOSITOR_READBACK_MEM, COMPOSITOR_READBACK_MEM_2, COMPOSITOR_READBACK_MEM_3 };
+var readback_pixel_bufs: [MAX_READBACK]?[*]volatile u8 = .{ null, null, null };
 var readback_promoted_to_scanout: bool = false;
-// Readback buffers in use: 2 when the host scans them out as dma-bufs
-// (it samples the front one asynchronously, so frames flip), 1 when it
-// only maps them — the host then copies the flushed rect during
-// RESOURCE_FLUSH itself, so one buffer is tear-free and only damage
-// needs copying.
+// Readback buffers in use: 3 (or 2, if the third cannot be had) when the
+// host scans them out as dma-bufs (it samples the front one
+// asynchronously, so frames flip), 1 when it only maps them — the host
+// then copies the flushed rect during RESOURCE_FLUSH itself, so one
+// buffer is tear-free and only damage needs copying.
 var readback_count: u32 = 0;
 var scanout_flip: bool = false;
+
+/// Screen rects the render image has changed that a flipping readback
+/// buffer has not been given yet. Each frame adds its damage to all of
+/// them, copies the target's whole set and empties it.
+const Stale = struct {
+    full: bool = true,
+    count: u8 = 0,
+    rects: [MAX_STALE][4]u32 = undefined,
+
+    const MAX_STALE = 32;
+
+    fn add(self: *Stale, r: [4]u32) void {
+        if (self.full) return;
+        for (self.rects[0..self.count]) |o| {
+            if (r[0] >= o[0] and r[1] >= o[1] and r[0] + r[2] <= o[0] + o[2] and r[1] + r[3] <= o[1] + o[3]) return;
+        }
+        if (self.count == MAX_STALE) {
+            // Too many to list: their bounding box stands in for them.
+            var b = self.rects[0];
+            for (self.rects[1..self.count]) |o| b = unionRect(b, o);
+            self.rects[0] = b;
+            self.count = 1;
+        }
+        self.rects[self.count] = r;
+        self.count += 1;
+    }
+
+    fn slice(self: *const Stale) []const [4]u32 {
+        return if (self.full) &FULL_SCREEN else self.rects[0..self.count];
+    }
+};
+var readback_stale: [MAX_READBACK]Stale = .{ .{}, .{}, .{} };
+
+fn unionRect(a: [4]u32, b: [4]u32) [4]u32 {
+    const x0 = @min(a[0], b[0]);
+    const y0 = @min(a[1], b[1]);
+    return .{ x0, y0, @max(a[0] + a[2], b[0] + b[2]) - x0, @max(a[1] + a[3], b[1] + b[3]) - y0 };
+}
+
+/// Two damage rects whose bounding box is no larger than both together are
+/// better off as that box: nothing extra is drawn, and what they share is
+/// not drawn twice. Covers a rect inside another.
+fn worthMerging(a: [4]u32, b: [4]u32) bool {
+    const u = unionRect(a, b);
+    return @as(u64, u[2]) * u[3] <= @as(u64, a[2]) * a[3] + @as(u64, b[2]) * b[3];
+}
 
 // Host memory types (vkGetPhysicalDeviceMemoryProperties).
 var mem_props: venus.MemoryProperties = .{};
@@ -475,6 +543,11 @@ pub const WindowSlot = struct {
     phys: Phys = Phys.of(0),         // SHM-BAR phys for user-space mapping
     mem_bytes: u64 = 0,              // total allocation size (page-rounded)
     tex_ids: TextureIds = .{},       // for the per-frame upload (!direct_sources)
+    // The window's content is re-read when the desktop has taken up a new
+    // frame of it (Window.content_seq), not on every frame. source_lock.
+    seen_seq: u32 = 0,
+    fresh: bool = true,              // nothing read yet
+    changed: bool = false,           // this frame re-reads and redraws it
 };
 pub var window_slots: [MAX_WINDOW_SLOTS]WindowSlot = blk: {
     var x: [MAX_WINDOW_SLOTS]WindowSlot = undefined;
@@ -597,7 +670,14 @@ const Damage = struct {
         const x1: u32 = @intCast(std.math.clamp(@as(i64, x) + w, 0, RENDER_W));
         const y1: u32 = @intCast(std.math.clamp(@as(i64, y) + h, 0, RENDER_H));
         if (x1 <= x0 or y1 <= y0) return;
-        self.out[self.out_count] = .{ x0, y0, x1 - x0, y1 - y0 };
+        const r = [4]u32{ x0, y0, x1 - x0, y1 - y0 };
+        for (self.out[0..self.out_count]) |*o| {
+            if (worthMerging(o.*, r)) {
+                o.* = unionRect(o.*, r);
+                return;
+            }
+        }
+        self.out[self.out_count] = r;
         self.out_count += 1;
     }
 };
@@ -629,11 +709,14 @@ fn takeDamage() void {
     }
     pending_full = false;
     pending_rect_count = 0;
-    if (frame_damage.full) return;
 
     // GPU-slot windows: their content area is drawn from the slot image.
-    // A window that moves before the draw is clipped to this frame's
-    // render area; the desktop's repaint of the move brings the next frame.
+    // One is re-read and redrawn whole when the desktop has taken up a new
+    // frame of it; the desktop's own rects cover a window that moved or was
+    // uncovered. A window that moves before the draw is clipped to this
+    // frame's render area; the desktop's repaint of the move brings the
+    // next frame.
+    for (&window_slots) |*sl| sl.changed = false;
     const wm = @import("desktop/window.zig");
     const TITLEBAR_H: u32 = @import("desktop/layout.zig").TITLEBAR_H;
     const flags = wm.lockWindows();
@@ -645,6 +728,11 @@ fn takeDamage() void {
         if (!w_ref.visible or w_ref.minimized) continue;
         const slot_idx = w_ref.gpu_slot orelse continue;
         if (slot_idx >= MAX_WINDOW_SLOTS or !window_slots[slot_idx].in_use) continue;
+        const sl = &window_slots[slot_idx];
+        sl.changed = frame_damage.full or sl.fresh or sl.seen_seq != w_ref.content_seq;
+        if (!sl.changed) continue;
+        sl.fresh = false;
+        sl.seen_seq = w_ref.content_seq;
         frame_damage.addOut(w_ref.x, w_ref.y + @as(i32, @intCast(TITLEBAR_H)), w_ref.width, w_ref.height -| TITLEBAR_H);
     }
 }
@@ -686,21 +774,34 @@ pub fn requestRender() void {
     }
 }
 
+/// Queue a damage rect for the next frame. The desktop may come round
+/// several times before that frame starts: a rect already covered is not
+/// listed again, and past the list's size the rects become their bounding
+/// box rather than the whole screen.
+fn addPendingRect(r: [4]u32) void {
+    if (pending_full) return;
+    for (pending_rects[0..pending_rect_count]) |*o| {
+        if (worthMerging(o.*, r)) {
+            o.* = unionRect(o.*, r);
+            return;
+        }
+    }
+    if (pending_rect_count == MAX_PENDING_RECTS) {
+        var b = pending_rects[0];
+        for (pending_rects[1..pending_rect_count]) |o| b = unionRect(b, o);
+        pending_rects[0] = b;
+        pending_rect_count = 1;
+    }
+    pending_rects[pending_rect_count] = r;
+    pending_rect_count += 1;
+}
+
 /// Wake the compositor and queue a single dirty rect (screen coords).
 /// Used by callers that already know exactly what changed without
 /// going through the desktop's tile-grid tracker (e.g. .text_only's
-/// terminal text row). Coalesces — multiple rects accumulate up to
-/// MAX_PENDING_RECTS, then fall back to full.
+/// terminal text row).
 pub fn requestRenderRect(x: u32, y: u32, w: u32, h: u32) void {
-    if (!pending_full) {
-        if (pending_rect_count >= MAX_PENDING_RECTS) {
-            pending_full = true;
-            pending_rect_count = 0;
-        } else {
-            pending_rects[pending_rect_count] = .{ x, y, w, h };
-            pending_rect_count += 1;
-        }
-    }
+    addPendingRect(.{ x, y, w, h });
     _ = @atomicRmw(u32, &pending_wakes, .Add, 1, .seq_cst);
     if (compositor_pid != 0xFF) {
         @import("../proc/process.zig").wake(compositor_pid);
@@ -726,18 +827,10 @@ pub fn requestRenderFromDirty() void {
     }
     if (dirty.isFull()) {
         pending_full = true;
-    } else if (!pending_full) {
+    } else {
         const n = dirty.rectCount();
         var i: u8 = 0;
-        while (i < n) : (i += 1) {
-            if (pending_rect_count >= MAX_PENDING_RECTS) {
-                pending_full = true;
-                pending_rect_count = 0;
-                break;
-            }
-            pending_rects[pending_rect_count] = dirty.getRect(i);
-            pending_rect_count += 1;
-        }
+        while (i < n) : (i += 1) addPendingRect(dirty.getRect(i));
     }
     _ = @atomicRmw(u32, &pending_wakes, .Add, 1, .seq_cst);
     if (compositor_pid != 0xFF) {
@@ -920,7 +1013,7 @@ fn fillWindowSlots() void {
         const slot_idx = w.gpu_slot orelse continue;
         if (slot_idx >= MAX_WINDOW_SLOTS) continue;
         const sl = &window_slots[slot_idx];
-        if (!sl.in_use) continue;
+        if (!sl.in_use or !sl.changed) continue;
         const dst_raw = sl.kernel_ptr orelse continue;
         const dst: [*]volatile u32 = @ptrCast(@alignCast(dst_raw));
 
@@ -1431,10 +1524,13 @@ fn setupCommandRing() bool {
         res_id,
         0, // region offset within the resource
         RING_TOTAL_SIZE,
-        // idleTimeout (µs): frames of an interaction come faster than this,
-        // so they find the thread polling and need no notify. Its poll
-        // backs off to ~0.3 ms sleeps by then.
-        200_000,
+        // idleTimeout (ns; vkr_ring adds it to a CLOCK_MONOTONIC reading in
+        // ns): frames of an interaction come faster than this, so they find
+        // the thread polling and need no notify — which goes through the
+        // virtqueue, served by the host thread that also presents, and so
+        // would wait out the present in flight. The poll backs off to
+        // ~0.3 ms sleeps by then.
+        RING_IDLE_TIMEOUT_NS,
         RING_HEAD_OFFSET,
         RING_TAIL_OFFSET,
         RING_STATUS_OFFSET,
@@ -1503,6 +1599,7 @@ fn ringWrite(bytes: []const u8) bool {
     if (status & RING_STATUS_FATAL != 0) return false;
     if (status & RING_STATUS_IDLE != 0) {
         // Not submitFireAndForget: a notify orders nothing a frame needs.
+        ring_notified = true;
         side_cs.reset();
         venus.encodeNotifyRing(&side_cs, COMPOSITOR_RING, ring_tail, 0);
         if (!virtio_gpu.submit3D(COMPOSITOR_CTX_ID, side_cs.bytes())) return false;
@@ -1613,7 +1710,14 @@ fn setupVulkanRender() bool {
     const kind0 = setupReadback(0) orelse return false;
     scanout_flip = kind0 == .dma_buf and (setupReadback(1) orelse return false) == .dma_buf;
     readback_count = if (scanout_flip) 2 else 1;
-    debug.klog("[gpu-comp] scanout: {s}\n", .{if (scanout_flip) "dma-buf pair, page flip" else "single mapped buffer, damage flush"});
+    // The third is a gain, not a need: without it a frame waits for the
+    // present before it.
+    if (scanout_flip) {
+        if (setupReadback(2)) |kind2| {
+            if (kind2 == .dma_buf) readback_count = 3;
+        }
+    }
+    debug.klog("[gpu-comp] scanout: {s}, {d} buffer(s)\n", .{ if (scanout_flip) "dma-buf, page flip" else "single mapped buffer, damage flush", readback_count });
     // Legacy alias for the kernel-side rep movsq fallback (only fires
     // when scanout promotion fails). Points at buffer 0.
     render_pixel_buf = readback_pixel_bufs[0];
@@ -1816,6 +1920,7 @@ pub fn allocateWindowImage(image_w: u32, image_h: u32, mem_w: u32, mem_h: u32) ?
     const px_bytes_aligned = pageAlign(@as(u64, mem_w) * mem_h * 4);
 
     sl.tex_ids = ids;
+    sl.fresh = true;
     sl.in_use = true;
     sl.width = image_w;
     sl.height = image_h;
@@ -2104,6 +2209,18 @@ fn validatePerFrameStream(buf: []const u8) bool {
 /// Push constants drive the animation: float t + vec2 image_size = 16 B.
 /// All commands batched into one cs.submit; one virtio-gpu round-trip
 /// per frame.
+/// Where the frames of a statistics window spent their time, in TSC cycles:
+/// waiting for the previous present, for source_lock, recording the command
+/// stream, and from handing it to the host until its reply.
+const FrameCycles = struct {
+    present_wait: u64 = 0,
+    lock: u64 = 0,
+    encode: u64 = 0,
+    host: u64 = 0,
+    host_max: u64 = 0,
+};
+var frame_cyc: FrameCycles = .{};
+
 const FrameResult = enum {
     ok,
     /// Not presented; the GPU path stays usable.
@@ -2128,6 +2245,9 @@ const SlotLayer = struct {
     rect: [4]i32,
     push: [32]u8,
     desc_set: u64,
+    image: u64,
+    /// The content rect shows the slot's pixels one to one.
+    unscaled: bool,
     occ_count: u8,
     occ: [MAX_OCCLUDERS][4]i32,
 };
@@ -2175,6 +2295,8 @@ fn collectSlotLayers() usize {
         const y0 = w_ref.y + @as(i32, @intCast(TITLEBAR_H));
         l.rect = .{ w_ref.x, y0, w_ref.x + @as(i32, @intCast(w_ref.width)), y0 + @as(i32, @intCast(content_h)) };
         l.desc_set = sl.desc_set_id;
+        l.image = sl.tex_ids.image;
+        l.unscaled = w_ref.width == sl.width and content_h == sl.height;
         // The image spans the slot's memory dims; sample only the
         // sl.width × sl.height the app draws.
         const ux: f32 = @as(f32, @floatFromInt(sl.width)) / @as(f32, @floatFromInt(sl.mem_w));
@@ -2196,6 +2318,71 @@ fn collectSlotLayers() usize {
     return draws;
 }
 
+/// A frame whose layers are all opaque and unscaled is its sources' pixels
+/// moved into place. Where the host samples the sources in place (a software
+/// Vulkan), copy them straight into the readback buffer: transfers cost it a
+/// fraction of the same pixels through its rasterizer, and the render image
+/// is left out. The render pass stays for a scaled layer and for a host GPU.
+const COMPOSE_BY_COPY = true;
+/// Regions one copy command may carry (see perFrameCmdArgsLen).
+const MAX_COPY_REGIONS: usize = 64;
+const LAYOUT_GENERAL: u32 = 1;
+/// The render image holds the frame on screen. Not after a frame composed
+/// by copy: the next render pass then redraws everything.
+var render_image_current: bool = false;
+var copy_frames: u32 = 0;
+
+fn layersUnscaled() bool {
+    for (slot_layers[0..slot_layer_count]) |*l| {
+        if (!l.unscaled) return false;
+    }
+    return true;
+}
+
+/// Compose `targets` (screen rects) into readback buffer `dst` by copies:
+/// the backbuf, then each window's content and the backbuf again wherever
+/// something is on top of it. `per_target` is collectSlotLayers' count.
+fn recordCopyFrame(dst: u64, targets_in: []const [4]u32, per_target: usize) void {
+    // Too many regions for the command stream: the targets' bounds instead.
+    var box: [1][4]u32 = undefined;
+    var targets = targets_in;
+    if (targets.len * per_target > MAX_COPY_REGIONS) {
+        box[0] = targets[0];
+        for (targets[1..]) |t| box[0] = unionRect(box[0], t);
+        targets = &box;
+    }
+    venus.encodeCmdCopyImageToBufferRects(&scratch_cs, COMPOSITOR_CMD_BUF, COMPOSITOR_SOURCE_IMAGE, LAYOUT_GENERAL, dst, RENDER_W, targets);
+
+    var regions: [MAX_COPY_REGIONS]venus.CopyRegion = undefined;
+    for (slot_layers[0..slot_layer_count]) |*l| {
+        var n: usize = 0;
+        for (targets) |t| {
+            const vis = clipToScissor(l.rect, t) orelse continue;
+            regions[n] = .{
+                .src_x = @intCast(@as(i32, @intCast(vis[0])) - l.rect[0]),
+                .src_y = @intCast(@as(i32, @intCast(vis[1])) - l.rect[1]),
+                .dst_x = vis[0],
+                .dst_y = vis[1],
+                .w = vis[2],
+                .h = vis[3],
+            };
+            n += 1;
+        }
+        if (n == 0) continue;
+        venus.encodeCmdCopyImageToBufferAt(&scratch_cs, COMPOSITOR_CMD_BUF, l.image, LAYOUT_GENERAL, dst, RENDER_W, regions[0..n]);
+
+        n = 0;
+        for (l.occ[0..l.occ_count]) |o| {
+            for (targets) |t| {
+                const r = clipToScissor(o, t) orelse continue;
+                regions[n] = .{ .src_x = r[0], .src_y = r[1], .dst_x = r[0], .dst_y = r[1], .w = r[2], .h = r[3] };
+                n += 1;
+            }
+        }
+        if (n != 0) venus.encodeCmdCopyImageToBufferAt(&scratch_cs, COMPOSITOR_CMD_BUF, COMPOSITOR_SOURCE_IMAGE, LAYOUT_GENERAL, dst, RENDER_W, regions[0..n]);
+    }
+}
+
 /// The backbuf draw under the current scissor.
 fn recordBackgroundDraw(bg_push: *const [32]u8) void {
     venus.encodeCmdBindDescriptorSets(&scratch_cs, COMPOSITOR_CMD_BUF, COMPOSITOR_PIPELINE_LAYOUT, COMPOSITOR_DESC_SET);
@@ -2204,18 +2391,31 @@ fn recordBackgroundDraw(bg_push: *const [32]u8) void {
 }
 
 fn renderVulkanFrame(_: f32) FrameResult {
+    const apic = @import("../time/apic.zig");
+    const t_encode = apic.readTsc();
     var bg_push: [32]u8 = undefined;
     // Background image (backbuf) is allocated at exact screen size, so
     // uv_scale = (1, 1) — sample full image extent.
     packPush(&bg_push, 0.0, 0.0, @floatFromInt(RENDER_W), @floatFromInt(RENDER_H), 1.0, 1.0);
 
     scratch_cs.reset();
+    const per_scissor = blk: {
+        const wm = @import("desktop/window.zig");
+        const flags = wm.lockWindows();
+        defer wm.unlockWindows(flags);
+        break :blk collectSlotLayers();
+    };
+    const copy_frame = COMPOSE_BY_COPY and direct_sources and layersUnscaled();
+    // The render image missed the frames composed by copy.
+    if (!copy_frame and !render_image_current) frame_damage.full = true;
+    render_image_current = false; // until a render pass completes
+
     venus.encodeBeginCommandBuffer(&scratch_cs, COMPOSITOR_CMD_BUF);
     if (!direct_sources) {
         // Upload what the CPU wrote since the last frame: the backbuf's
-        // damage, and each visible window (apps write those without
-        // reporting damage). The previous frame finished before this one
-        // was recorded, so nothing still samples these images.
+        // damage, and each visible window with a new frame (takeDamage).
+        // The previous frame finished before this one was recorded, so
+        // nothing still samples these images.
         recordUpload(source_tex.ids, source_tex.row_pixels, bgDamage());
         const wm = @import("desktop/window.zig");
         const flags = wm.lockWindows();
@@ -2227,7 +2427,7 @@ fn renderVulkanFrame(_: f32) FrameResult {
             const slot_idx = w_ref.gpu_slot orelse continue;
             if (slot_idx >= MAX_WINDOW_SLOTS) continue;
             const sl = &window_slots[slot_idx];
-            if (!sl.in_use) continue;
+            if (!sl.in_use or !sl.changed) continue;
             const whole = [_][4]u32{.{ 0, 0, sl.width, sl.height }};
             recordUpload(sl.tex_ids, sl.pitch_pixels, &whole);
         }
@@ -2241,13 +2441,108 @@ fn renderVulkanFrame(_: f32) FrameResult {
             0x20, // dstAccess = SHADER_READ
         );
     }
-    const per_scissor = blk: {
-        const wm = @import("desktop/window.zig");
-        const flags = wm.lockWindows();
-        defer wm.unlockWindows(flags);
-        break :blk collectSlotLayers();
-    };
+    // The BACK readback buffer (one the host is not scanning out) takes
+    // the frame; flushUnconditional flips after we finish. A flipped
+    // buffer last held an older frame, so it gets all the damage since;
+    // the single mapped buffer gets only this frame's.
+    const back_idx: u32 = if (readback_promoted_to_scanout and scanout_flip) virtio_gpu.blob_back else 0;
+    if (scanout_flip) {
+        for (&readback_stale) |*s| {
+            if (frame_damage.full) s.full = true else for (outDamage()) |r| s.add(r);
+        }
+    }
+    const targets = if (scanout_flip) readback_stale[back_idx].slice() else outDamage();
 
+    if (copy_frame) {
+        recordCopyFrame(readback_buf_handles[back_idx], targets, per_scissor);
+    } else {
+        recordRenderPass(&bg_push, per_scissor);
+        // Render image -> readback buffer. COLOR_ATTACHMENT_OPTIMAL ->
+        // TRANSFER_SRC_OPTIMAL so the copy can read it: srcStage =
+        // COLOR_ATTACHMENT_OUTPUT (0x400) flushes the render writes,
+        // dstStage = TRANSFER (0x1000) gates the copy on them.
+        venus.encodeCmdPipelineBarrier(
+            &scratch_cs,
+            COMPOSITOR_CMD_BUF,
+            COMPOSITOR_RENDER_IMAGE,
+            2, // COLOR_ATTACHMENT_OPTIMAL
+            venus.VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, // 6
+            0x400, // srcStage = COLOR_ATTACHMENT_OUTPUT
+            0x1000, // dstStage = TRANSFER
+            0x100, // srcAccess = COLOR_ATTACHMENT_WRITE
+            0x800, // dstAccess = TRANSFER_READ
+        );
+        venus.encodeCmdCopyImageToBufferRects(
+            &scratch_cs,
+            COMPOSITOR_CMD_BUF,
+            COMPOSITOR_RENDER_IMAGE,
+            venus.VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            readback_buf_handles[back_idx],
+            RENDER_W,
+            targets,
+        );
+    }
+    venus.encodeCmdMemoryBarrier(
+        &scratch_cs,
+        COMPOSITOR_CMD_BUF,
+        0x1000, // srcStage = TRANSFER
+        0x4000, // dstStage = HOST
+        0x1000, // srcAccess = TRANSFER_WRITE
+        0x2000, // dstAccess = HOST_READ
+    );
+    venus.encodeEndCommandBuffer(&scratch_cs, COMPOSITOR_CMD_BUF);
+    venus.encodeResetFences(&scratch_cs, COMPOSITOR_DEVICE, COMPOSITOR_FENCE);
+    venus.encodeQueueSubmitFence(&scratch_cs, COMPOSITOR_QUEUE, COMPOSITOR_CMD_BUF, COMPOSITOR_FENCE);
+    venus.encodeSeekReplyCommandStream(&scratch_cs, 0);
+    venus.encodeWaitForFences(&scratch_cs, COMPOSITOR_DEVICE, COMPOSITOR_FENCE, FENCE_TIMEOUT_NS);
+    appendReplyMarker();
+    frame_counter += 1;
+    if (scratch_cs.overflowed) {
+        debug.klog("[gpu-comp] frame {d}: command stream overflowed, frame dropped\n", .{frame_counter});
+        return .dropped;
+    }
+    if (!validatePerFrameStream(scratch_cs.bytes())) {
+        debug.klog("[gpu-comp] aborting before submit3D — see trace above. scratch_cs.pos={d}\n", .{scratch_cs.pos});
+        // ud2 → #UD → idt #UD handler → kdbg autopsy (Ring 0 panic path).
+        asm volatile ("ud2");
+        unreachable;
+    }
+    // The flush that follows presents these pixels, so wait for the GPU.
+    const t_host = apic.readTsc();
+    frame_cyc.encode += t_host -% t_encode;
+    const ftrace = @import("../debug/ftrace.zig");
+    ftrace.mark(.comp_sent, 0);
+    const sent = submitFrame(FRAME_TIMEOUT_MS);
+    ftrace.mark(.comp_reply, 0);
+    const host_cyc = apic.readTsc() -% t_host;
+    frame_cyc.host += host_cyc;
+    frame_cyc.host_max = @max(frame_cyc.host_max, host_cyc);
+    switch (sent) {
+        .replied => {},
+        .not_sent => {
+            // Nothing of it runs on the host, or (acceptance lost) it runs
+            // whole before the next frame's stream, own fence wait
+            // included — either way the next frame may reuse the buffers.
+            debug.klog("[gpu-comp] frame {d}: submit failed, frame dropped\n", .{frame_counter});
+            return .dropped;
+        },
+        .no_reply => {
+            debug.klog("[gpu-comp] frame {d}: no reply from the host\n", .{frame_counter});
+            return .failed;
+        },
+    }
+    const ring = reply_ring.?;
+    if (venus.readReplyCmdType(ring) != venus.CMD_vkWaitForFences or venus.readReplyResult(ring) != 0) {
+        debug.klog("[gpu-comp] frame {d}: fence wait cmd={d} VkResult={d}\n", .{ frame_counter, venus.readReplyCmdType(ring), venus.readReplyResult(ring) });
+        return .failed;
+    }
+    if (scanout_flip) readback_stale[back_idx] = .{ .full = false };
+    if (copy_frame) copy_frames += 1 else render_image_current = true;
+    return .ok;
+}
+
+/// The render pass of a frame: the damage drawn into the render image.
+fn recordRenderPass(bg_push: *const [32]u8, per_scissor: usize) void {
     // Render only the damage: the render image keeps the previous frame
     // (LOAD pass), so outside the damage it is already current. A full
     // frame clears instead — the image may not hold a frame yet. Each
@@ -2275,7 +2570,7 @@ fn renderVulkanFrame(_: f32) FrameResult {
     for (scissors) |sc| {
         // The backbuf: chrome, CPU-drawn windows, menubar, dock, overlays.
         venus.encodeCmdSetScissor(&scratch_cs, COMPOSITOR_CMD_BUF, sc);
-        recordBackgroundDraw(&bg_push);
+        recordBackgroundDraw(bg_push);
 
         // GPU-slot windows bottom to top: the content area from the slot
         // image (the chrome stays in the backbuf layer), then the backbuf
@@ -2293,7 +2588,7 @@ fn renderVulkanFrame(_: f32) FrameResult {
                 if (bound) {
                     venus.encodeCmdDraw(&scratch_cs, COMPOSITOR_CMD_BUF, 3, 1);
                 } else {
-                    recordBackgroundDraw(&bg_push);
+                    recordBackgroundDraw(bg_push);
                     bound = true;
                 }
             }
@@ -2301,83 +2596,6 @@ fn renderVulkanFrame(_: f32) FrameResult {
     }
 
     venus.encodeCmdEndRenderPass(&scratch_cs, COMPOSITOR_CMD_BUF);
-    // Step 9.1: render image -> readback buffer.
-    // Transition COLOR_ATTACHMENT_OPTIMAL -> TRANSFER_SRC_OPTIMAL so the
-    // copy can read it. srcStage=COLOR_ATTACHMENT_OUTPUT (0x400) flushes
-    // the render writes; dstStage=TRANSFER (0x1000) gates the copy on
-    // those writes.
-    venus.encodeCmdPipelineBarrier(
-        &scratch_cs,
-        COMPOSITOR_CMD_BUF,
-        COMPOSITOR_RENDER_IMAGE,
-        2, // COLOR_ATTACHMENT_OPTIMAL
-        venus.VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, // 6
-        0x400, // srcStage = COLOR_ATTACHMENT_OUTPUT
-        0x1000, // dstStage = TRANSFER
-        0x100, // srcAccess = COLOR_ATTACHMENT_WRITE
-        0x800, // dstAccess = TRANSFER_READ
-    );
-    // Step 9.3: copy into the BACK readback buffer (the one not currently
-    // being scanned out). flushUnconditional flips after we finish.
-    // virtio_gpu.blob_front is the index currently displayed; back = 1-front.
-    // A flipped buffer last held the frame before the previous one, so it
-    // gets everything; the single mapped buffer gets only the damage.
-    const back_idx: u32 = if (readback_promoted_to_scanout and scanout_flip) (1 - virtio_gpu.blob_front) else 0;
-    venus.encodeCmdCopyImageToBufferRects(
-        &scratch_cs,
-        COMPOSITOR_CMD_BUF,
-        COMPOSITOR_RENDER_IMAGE,
-        venus.VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-        readback_buf_handles[back_idx],
-        RENDER_W,
-        if (scanout_flip) &FULL_SCREEN else outDamage(),
-    );
-    venus.encodeCmdMemoryBarrier(
-        &scratch_cs,
-        COMPOSITOR_CMD_BUF,
-        0x1000, // srcStage = TRANSFER
-        0x4000, // dstStage = HOST
-        0x1000, // srcAccess = TRANSFER_WRITE
-        0x2000, // dstAccess = HOST_READ
-    );
-    venus.encodeEndCommandBuffer(&scratch_cs, COMPOSITOR_CMD_BUF);
-    venus.encodeResetFences(&scratch_cs, COMPOSITOR_DEVICE, COMPOSITOR_FENCE);
-    venus.encodeQueueSubmitFence(&scratch_cs, COMPOSITOR_QUEUE, COMPOSITOR_CMD_BUF, COMPOSITOR_FENCE);
-    venus.encodeSeekReplyCommandStream(&scratch_cs, 0);
-    venus.encodeWaitForFences(&scratch_cs, COMPOSITOR_DEVICE, COMPOSITOR_FENCE, FENCE_TIMEOUT_NS);
-    appendReplyMarker();
-    frame_counter += 1;
-    if (scratch_cs.overflowed) {
-        debug.klog("[gpu-comp] frame {d}: command stream overflowed, frame dropped\n", .{frame_counter});
-        return .dropped;
-    }
-    if (!validatePerFrameStream(scratch_cs.bytes())) {
-        debug.klog("[gpu-comp] aborting before submit3D — see trace above. scratch_cs.pos={d}\n", .{scratch_cs.pos});
-        // ud2 → #UD → idt #UD handler → kdbg autopsy (Ring 0 panic path).
-        asm volatile ("ud2");
-        unreachable;
-    }
-    // The flush that follows presents these pixels, so wait for the GPU.
-    switch (submitFrame(FRAME_TIMEOUT_MS)) {
-        .replied => {},
-        .not_sent => {
-            // Nothing of it runs on the host, or (acceptance lost) it runs
-            // whole before the next frame's stream, own fence wait
-            // included — either way the next frame may reuse the buffers.
-            debug.klog("[gpu-comp] frame {d}: submit failed, frame dropped\n", .{frame_counter});
-            return .dropped;
-        },
-        .no_reply => {
-            debug.klog("[gpu-comp] frame {d}: no reply from the host\n", .{frame_counter});
-            return .failed;
-        },
-    }
-    const ring = reply_ring.?;
-    if (venus.readReplyCmdType(ring) != venus.CMD_vkWaitForFences or venus.readReplyResult(ring) != 0) {
-        debug.klog("[gpu-comp] frame {d}: fence wait cmd={d} VkResult={d}\n", .{ frame_counter, venus.readReplyCmdType(ring), venus.readReplyResult(ring) });
-        return .failed;
-    }
-    return .ok;
 }
 
 pub fn taskEntry() callconv(.c) noreturn {
@@ -2459,8 +2677,8 @@ fn run() noreturn {
                 //
                 // A host that only maps the blob scans it out by copying
                 // the flushed rect (one buffer, readback_count = 1).
-                var res_ids: [2]u32 = undefined;
-                var virts: [2][*]volatile u32 = undefined;
+                var res_ids: [MAX_READBACK]u32 = undefined;
+                var virts: [MAX_READBACK][*]volatile u32 = undefined;
                 var n: u32 = 0;
                 while (n < readback_count) : (n += 1) {
                     res_ids[n] = readback_res_ids[n];
@@ -2556,12 +2774,25 @@ fn run() noreturn {
             interval_hist[bucket] +%= 1;
         }
         prev_frame_tsc = frame_start_tsc;
+        const ftrace = @import("../debug/ftrace.zig");
+        ftrace.mark(.comp_wake, 0);
 
         // Single mapped scanout: flush just the damage (the host copies
         // the flushed rect). Null = flush the whole screen.
         var flush_rect: ?[4]u32 = null;
         var present = true;
+        // Page flip with two buffers: this frame renders into the one that
+        // was the front until the last present, so the host must have
+        // taken that present first. (With three the back buffer is free
+        // already.) The desktop keeps drawing meanwhile; its damage adds
+        // up for this frame.
+        const flipping = scanout_flip and readback_promoted_to_scanout;
+        if (flipping and readback_count < 3) virtio_gpu.waitPresentIdle();
+        const t_lock = apic.readTsc();
+        frame_cyc.present_wait += t_lock -% frame_start_tsc;
         source_lock.acquire();
+        frame_cyc.lock += apic.readTsc() -% t_lock;
+        ftrace.mark(.comp_lock, 0);
         if (vulkan_render_ready) {
             takeDamage();
             if (frame_damage.full) full_damage_frames += 1;
@@ -2607,7 +2838,9 @@ fn run() noreturn {
                 _ = @atomicRmw(u32, &pending_wakes, .Add, 1, .seq_cst);
             } else if (readback_promoted_to_scanout) {
                 @import("desktop/dirty.zig").reset();
-                if (!scanout_flip and !frame_damage.full) flush_rect = damageBounds();
+                // A flip shows the whole buffer; the rect then tells the
+                // host how much of it differs from the frame before.
+                if (!frame_damage.full) flush_rect = damageBounds();
             } else if (render_pixel_buf) |src_b| {
                 const t = perf.enter();
                 defer perf.leave(.comp_sync, t);
@@ -2635,8 +2868,17 @@ fn run() noreturn {
         // returns instantly (instant return = tearing source — page
         // flip happens mid-display-refresh).
         if (virtio_gpu.active and present) {
+            // One present is in flight at a time. Waiting here, rather than
+            // leaving this one to be sent when the other completes, keeps
+            // the next frame out of a buffer that is about to be shown.
+            if (flipping) {
+                const t_wait = apic.readTsc();
+                virtio_gpu.waitPresentIdle();
+                frame_cyc.present_wait += apic.readTsc() -% t_wait;
+            }
             const t = perf.enter();
             defer perf.leave(.comp_flush, t);
+            ftrace.mark(.present, virtio_gpu.blob_back);
             if (flush_rect) |r| {
                 virtio_gpu.flushRectUnconditional(r[0], r[1], r[2], r[3]);
             } else {
@@ -2650,14 +2892,30 @@ fn run() noreturn {
         if (now -% fps_last_tick >= 500) {
             const elapsed_ms: u64 = (now -% fps_last_tick) * 10;
             const fps = if (elapsed_ms > 0) (@as(u64, fps_frames) * 1000) / elapsed_ms else 0;
-            debug.klog("[gpu-comp] frame {d}, ~{d} fps over {d} ms (vulkan={d}, full-damage={d}, avg-area={d}px) | intervals <4ms={d} <8={d} <16={d} <24={d} <33={d} <50={d} <100={d} 100+={d}\n", .{
-                frame_no, fps, elapsed_ms, @intFromBool(vulkan_render_ready), full_damage_frames,
+            debug.klog("[gpu-comp] frame {d}, ~{d} fps over {d} ms (vulkan={d}, by-copy={d}, full-damage={d}, avg-area={d}px) | intervals <4ms={d} <8={d} <16={d} <24={d} <33={d} <50={d} <100={d} 100+={d}\n", .{
+                frame_no, fps, elapsed_ms, @intFromBool(vulkan_render_ready), copy_frames, full_damage_frames,
                 if (fps_frames > 0) damage_px / fps_frames else 0,
                 interval_hist[0], interval_hist[1], interval_hist[2], interval_hist[3],
                 interval_hist[4], interval_hist[5], interval_hist[6], interval_hist[7],
             });
+            const n: u64 = @max(fps_frames, 1);
+            const ps = virtio_gpu.takePresentStats();
+            debug.klog("[gpu-comp] per frame: present-wait {d} us, lock-wait {d} us, encode {d} us, host {d} us (max {d}) | presents: {d} sent, {d} folded, host held avg {d} us max {d} | <2ms={d} <4={d} <8={d} <16={d} <33={d} 33+={d}\n", .{
+                apic.tscToUs(frame_cyc.present_wait / n),
+                apic.tscToUs(frame_cyc.lock / n),      apic.tscToUs(frame_cyc.encode / n),
+                apic.tscToUs(frame_cyc.host / n),      apic.tscToUs(frame_cyc.host_max),
+                ps.submits,                            ps.folded,
+                if (ps.submits > 0) ps.total_us / ps.submits else 0, ps.max_us,
+                ps.hist[0],                            ps.hist[1],
+                ps.hist[2],                            ps.hist[3],
+                ps.hist[4],                            ps.hist[5],
+            });
+            // An interaction was going on: show its last frames point by point.
+            if (fps_frames >= 40) ftrace.dump(160);
+            frame_cyc = .{};
             fps_last_tick = now;
             fps_frames = 0;
+            copy_frames = 0;
             full_damage_frames = 0;
             damage_px = 0;
             interval_hist = .{0} ** 8;
