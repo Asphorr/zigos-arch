@@ -883,7 +883,7 @@ fn setupVulkanContext() bool {
     //    BAR is in the 0..64 GB physmap range, mapped WB by boot.asm — so
     //    physToVirt gives a coherent kernel pointer with no extra mapping
     //    work required (mapWBRange would be a no-op here).
-    const reply_phys = virtio_gpu.resourceMapBlob(reply_ring_res_id, REPLY_RING_SIZE) orelse {
+    const reply_phys = virtio_gpu.resourceMapBlob(reply_ring_res_id, REPLY_RING_SIZE, .kernel) orelse {
         debug.klog("[gpu-comp] reply ring resourceMapBlob FAILED\n", .{});
         return false;
     };
@@ -1382,7 +1382,7 @@ fn mapMemoryBlob(mem_id: u64, size: u64, name: []const u8) ?MappedBlob {
         debug.klog("[gpu-comp] {s}: ctxAttachResource FAILED\n", .{name});
         return null;
     }
-    const phys = virtio_gpu.resourceMapBlob(res_id, @intCast(size)) orelse {
+    const phys = virtio_gpu.resourceMapBlob(res_id, @intCast(size), .kernel) orelse {
         debug.klog("[gpu-comp] {s}: resourceMapBlob FAILED\n", .{name});
         return null;
     };
@@ -1508,7 +1508,7 @@ fn setupCommandRing() bool {
         debug.klog("[gpu-comp] ring: ctxAttachResource FAILED\n", .{});
         return false;
     }
-    const phys = virtio_gpu.resourceMapBlob(res_id, @intCast(RING_TOTAL_SIZE)) orelse {
+    const phys = virtio_gpu.resourceMapBlob(res_id, @intCast(RING_TOTAL_SIZE), .kernel) orelse {
         debug.klog("[gpu-comp] ring: resourceMapBlob FAILED\n", .{});
         return false;
     };
@@ -1996,7 +1996,7 @@ fn setupBlobScanout(n_blobs: u32) bool {
 
         // 2. Map the blob into the SHM BAR so the kernel can write
         //    directly via memcpy.
-        const phys = virtio_gpu.resourceMapBlob(res_id, @intCast(fb_size_bytes)) orelse {
+        const phys = virtio_gpu.resourceMapBlob(res_id, @intCast(fb_size_bytes), .kernel) orelse {
             debug.klog("[gpu-comp] scanout[{d}] resourceMapBlob FAILED\n", .{i});
             return false;
         };
@@ -2072,7 +2072,7 @@ fn renderImageAsScanout() bool {
         debug.klog("[gpu-comp] renderImageAsScanout: ctxAttachResource FAILED\n", .{});
         return false;
     }
-    const phys = virtio_gpu.resourceMapBlob(res_id, @intCast(fb_size_bytes)) orelse {
+    const phys = virtio_gpu.resourceMapBlob(res_id, @intCast(fb_size_bytes), .kernel) orelse {
         debug.klog("[gpu-comp] renderImageAsScanout: resourceMapBlob FAILED\n", .{});
         return false;
     };

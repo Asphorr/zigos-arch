@@ -1228,8 +1228,12 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp, persist_shared_dirty: 
         const lead_res = &process.procs[my_tgid];
         const desktop = @import("../ui/desktop.zig");
         desktop.destroyGuiWindow(my_tgid);
+        const virtio_gpu = @import("../driver.zig").virtio_gpu;
+        // Blobs the group mapped (sysGpuMapBlob): the host unmaps them and
+        // their hostmem ranges go back. No thread is left to touch them.
+        // Not under gpu_has_ctx: they outlive sysGpuCtxDestroy.
+        virtio_gpu.releaseOwnedBlobs(virtio_gpu.BlobOwner.process(my_tgid));
         if (lead_res.gpu_has_ctx) {
-            const virtio_gpu = @import("../driver.zig").virtio_gpu;
             if (!virtio_gpu.ctxDestroy(lead_res.gpu_ctx_id)) {
                 debug.klog("[proc] GPU ctx {d} destroy failed for pid {d}\n", .{ lead_res.gpu_ctx_id, my_tgid });
             }

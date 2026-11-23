@@ -10,10 +10,8 @@ const virtio = @import("../../bus/virtio.zig");
 const proto = @import("protocol.zig");
 const ctrlq = @import("ctrlq.zig");
 const present = @import("present.zig");
-
-// SHM BAR for blob resources (host-visible memory)
-pub var shm_bar_phys: usize = 0;
-pub var shm_bar_size: usize = 0;
+const scanout = @import("scanout.zig");
+const hostmem = @import("hostmem.zig");
 
 // --- GPU commands ---
 
@@ -59,10 +57,9 @@ pub fn detectShmBar(dev_pci: pci.PciDevice) void {
             paging.mapWBRange(bar_base, @intCast(bar_size));
         }
 
-        shm_bar_phys = bar_base + @as(usize, @truncate(offset));
-        shm_bar_size = @truncate(length);
+        hostmem.setWindow(bar_base + @as(usize, @truncate(offset)), length);
         debug.klog("[virtio-gpu] SHM BAR: phys=0x{X} size={d}MB\n", .{
-            shm_bar_phys, shm_bar_size / (1024 * 1024),
+            hostmem.phys, length / (1024 * 1024),
         });
     }
 }
@@ -261,35 +258,31 @@ pub fn resourceCreateMemoryBlob(ctx_id: u32, resource_id: u32, blob_mem: u32, bl
     return null;
 }
 
-// SHM BAR bump allocator — each blob gets a unique page-aligned offset
-pub var shm_next_offset: u64 = 0;
+pub const BlobOwner = hostmem.Owner;
 
-/// Map a blob resource into the SHM BAR. Returns the blob's SHM-BAR physical
-/// address (device memory, never a PMM frame) or null.
-/// The offset is a guest-specified INPUT telling QEMU where in the SHM BAR to place this blob.
-/// The response only contains caching flags (map_info), NOT an offset.
-pub fn resourceMapBlob(resource_id: u32, size: u32) ?Phys {
-    if (shm_bar_phys == 0) {
+/// Map a blob into the hostmem window; returns its physical address there
+/// (device memory, never a PMM frame). The offset is the driver's choice;
+/// the response only carries caching flags. A process's blobs are released
+/// by releaseOwnedBlobs().
+pub fn resourceMapBlob(resource_id: u32, size: u32, owner: BlobOwner) ?Phys {
+    if (hostmem.phys == 0) {
         debug.klog("[virtio-gpu] mapBlob: no SHM BAR\n", .{});
         return null;
     }
-
-    // Allocate a unique page-aligned offset in the SHM BAR
-    const offset = shm_next_offset;
-    const aligned_size = ((@as(u64, size) + 4095) / 4096) * 4096;
-    if (offset + aligned_size > shm_bar_size) {
-        debug.klog("[virtio-gpu] mapBlob: SHM BAR full (offset=0x{X} size={d})\n", .{ offset, size });
+    const offset = hostmem.alloc(size, resource_id, owner) orelse {
+        const s = hostmem.stats();
+        debug.klog("[virtio-gpu] mapBlob: no room for {d} B: {d} of {d} KB used in {d} ranges ({d} orphaned), {d} refused for the reserve\n", .{
+            size, s.used / 1024, s.size / 1024, s.ranges, s.orphaned, s.refused,
+        });
         return null;
-    }
-    shm_next_offset = offset + aligned_size;
+    };
 
     var cmd = proto.ResourceMapBlob{
         .hdr = .{ .cmd_type = proto.CMD_RESOURCE_MAP_BLOB },
         .resource_id = resource_id,
-        .offset = offset, // Guest-specified offset into SHM BAR
+        .offset = offset,
     };
-    var resp: proto.RespMapInfo = undefined;
-    @memset(@as([*]u8, @ptrCast(&resp))[0..@sizeOf(proto.RespMapInfo)], 0);
+    var resp = proto.RespMapInfo{};
 
     debug.klog("[virtio-gpu] mapBlob: sending res={d} offset=0x{X} size={d}\n", .{ resource_id, offset, size });
     if (!ctrlq.sendCmd(
@@ -298,17 +291,58 @@ pub fn resourceMapBlob(resource_id: u32, size: u32) ?Phys {
         @as([*]u8, @ptrCast(&resp)),
         @sizeOf(proto.RespMapInfo),
     )) {
+        // Unanswered: the host may yet map the blob there.
+        hostmem.orphan(offset);
         debug.klog("[virtio-gpu] mapBlob: sendCmd timeout\n", .{});
         return null;
     }
 
     debug.klog("[virtio-gpu] mapBlob: resp_type=0x{X} map_info={d}\n", .{ resp.hdr.cmd_type, resp.map_info });
-    if (resp.hdr.cmd_type != proto.RESP_OK_MAP_INFO) return null;
+    if (resp.hdr.cmd_type != proto.RESP_OK_MAP_INFO) {
+        hostmem.free(offset);
+        return null;
+    }
 
-    const phys = shm_bar_phys + @as(usize, @truncate(offset));
+    const phys = hostmem.phys + @as(usize, @truncate(offset));
     debug.klog("[virtio-gpu] mapBlob: res={d} offset=0x{X} phys=0x{X}\n", .{ resource_id, offset, phys });
     return Phys.of(phys);
 }
+
+/// Undo resourceMapBlob: the host unmaps the blob and its range can be
+/// handed out again. Nothing may still map the range. QEMU answers after
+/// an RCU grace period and runs no other command until then.
+pub fn resourceUnmapBlob(resource_id: u32, owner: BlobOwner) bool {
+    return unmapRange(hostmem.rangeOf(resource_id, owner) orelse return false);
+}
+
+fn unmapRange(r: hostmem.Range) bool {
+    var cmd = proto.ResourceId{
+        .hdr = .{ .cmd_type = proto.CMD_RESOURCE_UNMAP_BLOB },
+        .resource_id = r.resource_id,
+    };
+    if (!ctrlq.sendSimpleCmd(@as([*]const u8, @ptrCast(&cmd)), @sizeOf(proto.ResourceId))) {
+        // Refused or unanswered: the host may still map the blob there.
+        hostmem.orphan(r.offset);
+        debug.klog("[virtio-gpu] unmapBlob: res={d} failed; hostmem+0x{X} ({d} KB) stays out of use\n", .{ r.resource_id, r.offset, r.size / 1024 });
+        return false;
+    }
+    hostmem.free(r.offset);
+    return true;
+}
+
+/// Unmap and unref every blob mapped for a process that is gone: nothing
+/// runs in its address space any more.
+pub fn releaseOwnedBlobs(owner: BlobOwner) void {
+    var n: u32 = 0;
+    // A failed unmap orphans the range, so each pass takes one away.
+    while (hostmem.ownedBy(owner)) |r| : (n += 1) {
+        _ = unmapRange(r);
+        _ = scanout.resourceUnref(r.resource_id);
+    }
+    if (n != 0) debug.klog("[virtio-gpu] released {d} blob(s) of owner {d}\n", .{ n, @intFromEnum(owner) });
+}
+
+pub const hostmemStats = hostmem.stats;
 
 /// Create a 3D resource (texture/buffer) for VirGL rendering.
 pub fn resourceCreate3D(ctx_id: u32, resource_id: u32, target: u32, format: u32, bind: u32, w: u32, h: u32) bool {

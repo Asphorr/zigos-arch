@@ -217,8 +217,10 @@ pub fn sysGpuMapBlob(resource_id: u32, size: u32) u32 {
         return E_INVAL;
     }
 
-    // Map blob in SHM BAR — get physical address
-    const phys = virtio_gpu.resourceMapBlob(resource_id, size) orelse {
+    // Map blob in SHM BAR — get physical address. The process's exit
+    // unmaps it (lifecycle: releaseOwnedBlobs).
+    const owner = virtio_gpu.BlobOwner.process(pcb.tgid);
+    const phys = virtio_gpu.resourceMapBlob(resource_id, size, owner) orelse {
         debug.klog("[gpu] mapBlob: resourceMapBlob failed\n", .{});
         return E_INVAL;
     };
@@ -244,7 +246,9 @@ pub fn sysGpuMapBlob(resource_id: u32, size: u32) u32 {
             debug.klog("[gpu] map_blob mapUserPage failed at page={d} virt=0x{X}: {s}\n", .{ i, virt, @errorName(e) });
             // phys is host-owned SHM BAR memory — no PMM frame to free,
             // just undo the page-table installs and leave user_brk where
-            // it was (we never bumped it).
+            // it was (we never bumped it). The window range stays the
+            // process's until its exit: another thread's TLB may still
+            // reach it (unmapUserPage flushes this CPU only).
             var j: usize = 0;
             while (j < mapped_pages) : (j += 1) {
                 _ = vmm.unmapUserPage(pd, base_virt + j * 0x1000);
