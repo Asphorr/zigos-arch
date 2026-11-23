@@ -241,6 +241,15 @@ pub fn encodeSeekReplyCommandStream(cs: *CmdStream, position: u64) void {
     cs.writeU64(position);
 }
 
+/// The seek with GENERATE_REPLY: the host seeks, then writes the command's
+/// own type at `position`. A reply's type lands before its body, so it
+/// proves nothing about the rest; this marker, after a checked command,
+/// proves that command's reply complete (the host runs a stream in order).
+pub fn encodeSeekReplyMarker(cs: *CmdStream, position: u64) void {
+    cs.cmdHeader(CMD_vkSeekReplyCommandStreamMESA, CMD_FLAG_GENERATE_REPLY);
+    cs.writeU64(position);
+}
+
 // --- High-level Venus command encoders ---
 
 /// Encode vkCreateInstance command (fire-and-forget, no reply)

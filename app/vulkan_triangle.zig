@@ -268,13 +268,22 @@ fn replyCmd() u32 {
     const p: *align(1) const volatile u32 = @ptrCast(reply_buf);
     return p.*;
 }
+/// Where the marker replies: past the largest reply (memory properties).
+const REPLY_MARKER: usize = 2048;
+fn markerCmd() u32 {
+    const p: *align(1) const volatile u32 = @ptrCast(reply_buf + REPLY_MARKER);
+    return p.*;
+}
 // The host decodes commands after the submit returns and writes the reply
-// later; poll for it. Generous timeout: emulated guests are slow.
+// later; poll for it. A reply's type lands before its body: wait for the
+// marker after it instead. Generous timeout: emulated guests are slow.
 fn submitAndWait() bool {
+    for (0..4) |i| reply_buf[REPLY_MARKER + i] = 0xFF;
+    venus.encodeSeekReplyMarker(&cs, REPLY_MARKER);
     if (!cs.submit()) return false;
     var waited_ms: u32 = 0;
-    while (replyCmd() == 0xFFFF_FFFF and waited_ms < 30_000) : (waited_ms += 1) libc.sleep(1);
-    return replyCmd() != 0xFFFF_FFFF;
+    while (markerCmd() == 0xFFFF_FFFF and waited_ms < 30_000) : (waited_ms += 1) libc.sleep(1);
+    return markerCmd() != 0xFFFF_FFFF and replyCmd() != 0xFFFF_FFFF;
 }
 fn setReplyFlag(at: usize) void {
     const p: *align(1) u32 = @ptrCast(cs.buf[at + 4 .. at + 8]);
