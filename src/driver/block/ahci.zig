@@ -15,13 +15,13 @@
 // into "primary" and "secondary" addressing the first two ports with
 // attached disks. block.zig dispatches between this and ata.zig.
 
-const io = @import("../io.zig");
-const pci = @import("bus/pci.zig");
-const pmm = @import("../mm/pmm.zig");
-const paging = @import("../mm/paging.zig");
-const msix = @import("../time/msix.zig");
-const debug = @import("../debug/debug.zig");
-const Deadline = @import("../util/deadline.zig").Deadline;
+const io = @import("../../io.zig");
+const pci = @import("../bus/pci.zig");
+const pmm = @import("../../mm/pmm.zig");
+const paging = @import("../../mm/paging.zig");
+const msix = @import("../../time/msix.zig");
+const debug = @import("../../debug/debug.zig");
+const Deadline = @import("../../util/deadline.zig").Deadline;
 
 // PCI class for "AHCI 1.0 compliant" SATA controller.
 const PCI_CLASS_STORAGE: u8 = 0x01;
@@ -133,7 +133,7 @@ pub var irq_count: u64 = 0;
 // CPUs. Two reads on the same port from different CPUs scrambled each other's
 // command table before the doorbell. Same bug class as ata.readSectors that
 // produced "Invalid ELF64 header" on `cat foo | wc`.
-const SpinLock = @import("../proc/spinlock.zig").SpinLock;
+const SpinLock = @import("../../proc/spinlock.zig").SpinLock;
 var port_locks: [32]SpinLock = [_]SpinLock{.{}} ** 32;
 
 /// AHCI MSI-X handler: ack the HBA-level interrupt status and per-port
@@ -474,7 +474,7 @@ fn issueCommand(port: u8, cmd: u8, lba: u64, sectors: u16, buf_phys: usize, is_w
 // passed a non-kernel pointer to AHCI, which is a real bug.
 
 inline fn vp(p: anytype) usize {
-    return @import("../mm/paging.zig").virtToPhys(@intFromPtr(p)).?;
+    return @import("../../mm/paging.zig").virtToPhys(@intFromPtr(p)).?;
 }
 
 pub fn readSectorPrimary(lba: u32, dest: [*]u8) void {

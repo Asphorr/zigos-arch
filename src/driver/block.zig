@@ -16,9 +16,9 @@
 // using ATA exactly as before — no behavior change without explicitly
 // switching to `-device ahci` in the QEMU args.
 
-const ata = @import("ata.zig");
-const ahci = @import("ahci.zig");
-const nvme = @import("nvme.zig");
+const ata = @import("block/ata.zig");
+const ahci = @import("block/ahci.zig");
+const nvme = @import("block/nvme.zig");
 const debug = @import("../debug/debug.zig");
 
 const Backend = enum { none, ata, ahci, nvme };

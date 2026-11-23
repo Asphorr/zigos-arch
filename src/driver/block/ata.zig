@@ -1,9 +1,9 @@
-const io = @import("../io.zig");
-const pci = @import("bus/pci.zig");
-const pmm = @import("../mm/pmm.zig");
-const debug = @import("../debug/debug.zig");
-const SpinLock = @import("../proc/spinlock.zig").SpinLock;
-const Deadline = @import("../util/deadline.zig").Deadline;
+const io = @import("../../io.zig");
+const pci = @import("../bus/pci.zig");
+const pmm = @import("../../mm/pmm.zig");
+const debug = @import("../../debug/debug.zig");
+const SpinLock = @import("../../proc/spinlock.zig").SpinLock;
+const Deadline = @import("../../util/deadline.zig").Deadline;
 
 var ata_lock: SpinLock = .{};
 
@@ -41,7 +41,7 @@ var readahead_valid: bool = false;
 
 /// Initialize ATA DMA by finding the IDE PCI controller and setting up BMIDE.
 pub fn initDMA() void {
-    const boot_info_mod = @import("../boot/boot_info.zig");
+    const boot_info_mod = @import("../../boot/boot_info.zig");
     const tag: []const u8 = if (boot_info_mod.is_uefi) "uefi" else "mb";
 
     // Try common IDE PCI prog_if values
@@ -89,7 +89,7 @@ pub fn initDMA() void {
     }).raw();
     prdt_phys = @intCast(prdt_page);
     // Kernel access through the physmap; the device sees prdt_phys itself.
-    prdt_ptr = @ptrFromInt(@import("../mm/paging.zig").physToVirt(prdt_page));
+    prdt_ptr = @ptrFromInt(@import("../../mm/paging.zig").physToVirt(prdt_page));
 
     // Reset BMIDE state (OVMF may leave stale bits)
     const bm_pri_status = io.inb(bmide_base + 2);
@@ -320,7 +320,7 @@ fn readSectorsDMA(port: u16, drive_head: u8, lba: u32, count: u8, dest: [*]u8, b
     // kernel: a kernel-BSS pointer (e.g., readahead_cache) comes in as a
     // high VA; translate to LMA before truncating. virtToPhys handles both
     // high-half and low-identity inputs.
-    const dest_phys: u32 = @intCast(@import("../mm/paging.zig").virtToPhys(@intFromPtr(dest)).?);
+    const dest_phys: u32 = @intCast(@import("../../mm/paging.zig").virtToPhys(@intFromPtr(dest)).?);
 
     // Set up PRDT: single entry pointing to dest buffer
     prdt[0] = .{
@@ -329,7 +329,7 @@ fn readSectorsDMA(port: u16, drive_head: u8, lba: u32, count: u8, dest: [*]u8, b
         .flags = 0x8000, // EOT
     };
 
-    const t_start = @import("../debug/perf.zig").rdtsc();
+    const t_start = @import("../../debug/perf.zig").rdtsc();
 
     // 1. Stop any previous DMA + clear status
     io.outb(bm_base, 0x00); // stop
@@ -365,7 +365,7 @@ fn readSectorsDMA(port: u16, drive_head: u8, lba: u32, count: u8, dest: [*]u8, b
             // Error — fall back to PIO
             io.outb(bm_base, 0x00); // stop
             io.outb(bm_base + 2, 0x06); // clear
-            const t_end = @import("../debug/perf.zig").rdtsc();
+            const t_end = @import("../../debug/perf.zig").rdtsc();
             dma_call_count += 1;
             dma_total_cycles +%= t_end -% t_start;
             dma_total_polls += polls;
@@ -384,7 +384,7 @@ fn readSectorsDMA(port: u16, drive_head: u8, lba: u32, count: u8, dest: [*]u8, b
     io.outb(bm_base, 0x00);
     io.outb(bm_base + 2, io.inb(bm_base + 2) | 0x06);
 
-    const t_end = @import("../debug/perf.zig").rdtsc();
+    const t_end = @import("../../debug/perf.zig").rdtsc();
     const dt = t_end -% t_start;
     dma_call_count += 1;
     dma_total_cycles +%= dt;

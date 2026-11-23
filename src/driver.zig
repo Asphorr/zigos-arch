@@ -7,9 +7,9 @@ pub const virtio = @import("driver/bus/virtio.zig");
 
 // Block devices.
 pub const block = @import("driver/block.zig");
-pub const nvme = @import("driver/nvme.zig");
-pub const ahci = @import("driver/ahci.zig");
-pub const ata = @import("driver/ata.zig");
+pub const nvme = @import("driver/block/nvme.zig");
+pub const ahci = @import("driver/block/ahci.zig");
+pub const ata = @import("driver/block/ata.zig");
 
 // Network cards.
 pub const nic = @import("driver/nic.zig");

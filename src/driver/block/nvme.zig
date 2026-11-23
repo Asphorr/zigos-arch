@@ -21,19 +21,19 @@
 // QEMU, swap your `-drive` lines to `-device nvme,drive=...`.
 
 const std = @import("std");
-const endian = @import("../util/endian.zig");
-const io = @import("../io.zig");
-const pci = @import("bus/pci.zig");
-const iommu = @import("../cpu/mmu/iommu.zig");
-const pmm = @import("../mm/pmm.zig");
-const paging = @import("../mm/paging.zig");
-const msix = @import("../time/msix.zig");
-const debug = @import("../debug/debug.zig");
-const Guarded = @import("../util/guarded.zig").Guarded;
-const Deadline = @import("../util/deadline.zig").Deadline;
-const pause = @import("../time/pause.zig");
-const mmio = @import("../util/mmio.zig");
-const addrmod = @import("../util/addr.zig");
+const endian = @import("../../util/endian.zig");
+const io = @import("../../io.zig");
+const pci = @import("../bus/pci.zig");
+const iommu = @import("../../cpu/mmu/iommu.zig");
+const pmm = @import("../../mm/pmm.zig");
+const paging = @import("../../mm/paging.zig");
+const msix = @import("../../time/msix.zig");
+const debug = @import("../../debug/debug.zig");
+const Guarded = @import("../../util/guarded.zig").Guarded;
+const Deadline = @import("../../util/deadline.zig").Deadline;
+const pause = @import("../../time/pause.zig");
+const mmio = @import("../../util/mmio.zig");
+const addrmod = @import("../../util/addr.zig");
 const Phys = addrmod.Phys;
 
 // PCI class for "Mass Storage Controller / NVM Subsystem / NVMe I/O".
@@ -524,7 +524,7 @@ pub var irq_count: u64 = 0;
 /// inline-reap measured ~18 ms/call before deferral fixed the slice penalty).
 fn nvmeIrqHandler() callconv(.c) void {
     irq_count +%= 1;
-    @atomicStore(u64, &last_irq_tsc, @import("../debug/perf.zig").rdtsc(), .monotonic);
+    @atomicStore(u64, &last_irq_tsc, @import("../../debug/perf.zig").rdtsc(), .monotonic);
     if (!ASYNC_BUILD_ENABLED) return;
     // Only kick the bottom-half when there's async work to reap. In sync mode
     // the submit path polls the CQ itself (waitCompletion), and ksoftirqd's
@@ -538,8 +538,8 @@ fn nvmeIrqHandler() callconv(.c) void {
         }
     }
     if (any_async) {
-        _ = @import("../proc/softirq.zig").raise(.nvme);
-        @import("../cpu/smp.zig").myCpu().dynirq_preempt_pending = true;
+        _ = @import("../../proc/softirq.zig").raise(.nvme);
+        @import("../../cpu/smp.zig").myCpu().dynirq_preempt_pending = true;
     }
 }
 
@@ -1283,7 +1283,7 @@ fn ioCommand(c: *Controller, opcode: u8, lba: u32, user_buf: usize, sectors: u32
         const idx_offset = (@intFromPtr(c) - @intFromPtr(&controllers[0])) / @sizeOf(Controller);
         return ioCommandAsync(c, @intCast(idx_offset), opcode, lba, user_buf, sectors);
     }
-    const t_call_start = @import("../debug/perf.zig").rdtsc();
+    const t_call_start = @import("../../debug/perf.zig").rdtsc();
 
     // Serialize across CPUs — bounce_buf, SQ tail, CQ head/phase, and the
     // MSI-X table entry retarget below all assume single-issuer state.
@@ -1334,7 +1334,7 @@ fn ioCommand(c: *Controller, opcode: u8, lba: u32, user_buf: usize, sectors: u32
     sqh.ptr.tail = (sqh.ptr.tail + 1) % Q_DEPTH;
     sqDoorbell(c, 1).* = @as(u32, sqh.ptr.tail);
 
-    const t_wait_start = @import("../debug/perf.zig").rdtsc();
+    const t_wait_start = @import("../../debug/perf.zig").rdtsc();
     // The sync path consumes the CQ itself (async_mode=false keeps the IRQ
     // reaper out of reapCq), so it advances head/phase under the cq token.
     // This is the lock graph's ONLY sq -> cq nesting; reapCq never touches
@@ -1346,7 +1346,7 @@ fn ioCommand(c: *Controller, opcode: u8, lba: u32, user_buf: usize, sectors: u32
         break :blk waitCompletion(c, c.io_cq, &cqh.ptr.head, &cqh.ptr.phase, 1, c.use_msix);
     };
     if (!wc_ok) return false;
-    const t_wait_end = @import("../debug/perf.zig").rdtsc();
+    const t_wait_end = @import("../../debug/perf.zig").rdtsc();
     const wait_dt = t_wait_end -% t_wait_start;
     io_wait_cycles +%= wait_dt;
     if (wait_dt > io_max_wait_cycles) io_max_wait_cycles = wait_dt;
@@ -1358,7 +1358,7 @@ fn ioCommand(c: *Controller, opcode: u8, lba: u32, user_buf: usize, sectors: u32
         const src: [*]const u8 = @ptrFromInt(src_va);
         @memcpy(dst[0..xfer_bytes], src[0..xfer_bytes]);
     }
-    const t_call_end = @import("../debug/perf.zig").rdtsc();
+    const t_call_end = @import("../../debug/perf.zig").rdtsc();
     io_call_count += 1;
     io_total_cycles +%= t_call_end -% t_call_start;
     return true;
@@ -1499,7 +1499,7 @@ fn reapCq(c: *Controller) bool {
             } else if (w.active and w.gen == expected_gen) {
                 w.status_code = sc;
                 w.success = (sc == 0);
-                w.reap_tsc = @import("../debug/perf.zig").rdtsc();
+                w.reap_tsc = @import("../../debug/perf.zig").rdtsc();
                 @atomicStore(bool, &w.completed, true, .release);
                 // Stage — dispatch below, outside cq_lock.
                 pending[pending_count] = .{
@@ -1535,7 +1535,7 @@ fn reapCq(c: *Controller) bool {
     // window. .cb path is io_uring's IRQ callback (same constraints as
     // before minus the cq_lock-held claim).
     if (pending_count > 0) {
-        const proc = @import("../proc/process.zig");
+        const proc = @import("../../proc/process.zig");
         var i: usize = 0;
         while (i < pending_count) : (i += 1) {
             const p = pending[i];
@@ -1641,7 +1641,7 @@ pub fn dumpWaiterForTarget(wait_target: u32) void {
 fn ioCommandAsync(c: *Controller, ctrl_idx: u32, opcode: u8, lba: u32, user_buf: usize, sectors: u32) bool {
     if (!c.initialized) return false;
     if (sectors == 0 or sectors > MAX_SECTORS_PER_CMD) return false;
-    const t_call_start = @import("../debug/perf.zig").rdtsc();
+    const t_call_start = @import("../../debug/perf.zig").rdtsc();
 
     // ---- Submit phase: lockless prep + narrow lock for SQ tail+doorbell ----
     // Step 2 (2026-05-24): allocCid is now lockless (per-slot CAS on
@@ -1652,8 +1652,8 @@ fn ioCommandAsync(c: *Controller, ctrl_idx: u32, opcode: u8, lba: u32, user_buf:
     // retarget, build PRP) is per-slot or per-controller-but-already-
     // synchronized state and runs lock-free in parallel across CPUs.
     const MAX_QUEUE_FULL_RETRIES: u32 = 8;
-    const proc = @import("../proc/process.zig");
-    const smp = @import("../cpu/smp.zig");
+    const proc = @import("../../proc/process.zig");
+    const smp = @import("../../cpu/smp.zig");
     const cid: u16 = blk_alloc: {
         var attempts: u32 = 0;
         while (true) : (attempts += 1) {
@@ -1667,7 +1667,7 @@ fn ioCommandAsync(c: *Controller, ctrl_idx: u32, opcode: u8, lba: u32, user_buf:
             _ = @atomicRmw(u64, &c.queue_full_retries, .Add, 1, .monotonic);
             // Yield so the IRQ reaper (or tickSweep) gets a chance to
             // drain in-flight completions.
-            @import("../proc/sched_asm.zig").softYield();
+            @import("../../proc/sched_asm.zig").softYield();
         }
     };
     // Gap #2: `cid` is now a packed (gen << 4) | slot value. The slot
@@ -1698,11 +1698,11 @@ fn ioCommandAsync(c: *Controller, ctrl_idx: u32, opcode: u8, lba: u32, user_buf:
     // prp_list_phys[slot_idx] is per-slot state owned via the allocCid CAS,
     // so the hold covers only the genuinely shared tail + doorbell.
     const prp = buildPrp(c, slot_idx, xfer_bytes);
-    c.waiters[slot_idx].submit_tsc = @import("../debug/perf.zig").rdtsc();
+    c.waiters[slot_idx].submit_tsc = @import("../../debug/perf.zig").rdtsc();
     submitSqeLocked(c, slot_idx, cid, opcode, prp.prp1, prp.prp2, lba, 0, sectors - 1);
 
     // ---- Wait phase: yield until IRQ reaper wakes us ----
-    const t_wait_start = @import("../debug/perf.zig").rdtsc(); // wall, for the io_wait stats
+    const t_wait_start = @import("../../debug/perf.zig").rdtsc(); // wall, for the io_wait stats
     var wait_ep = pause.Epoch.now(); // guest-run, for the timeout
     const wait_target: u32 = (ctrl_idx << 16) | @as(u32, cid);
     // Gap #2 (2026-05-20): wall-clock timeout. The pre-2026-05-20 loop
@@ -1734,7 +1734,7 @@ fn ioCommandAsync(c: *Controller, ctrl_idx: u32, opcode: u8, lba: u32, user_buf:
         if (smp.currentPid()) |p| break :blk proc.procs[p].is_idle;
         break :blk false;
     };
-    const mwait_mod = @import("../cpu/arch/mwait.zig");
+    const mwait_mod = @import("../../cpu/arch/mwait.zig");
     var timed_out = false;
     while (!@atomicLoad(bool, &c.waiters[slot_idx].completed, .acquire)) {
         if (wait_ep.runElapsed() > TIMEOUT_CYC_ASYNC) {
@@ -1773,7 +1773,7 @@ fn ioCommandAsync(c: *Controller, ctrl_idx: u32, opcode: u8, lba: u32, user_buf:
         // single MMIO + cq_lock acquire when it isn't.
         _ = reapCq(c);
     }
-    const t_wait_end = @import("../debug/perf.zig").rdtsc();
+    const t_wait_end = @import("../../debug/perf.zig").rdtsc();
     const wait_dt = t_wait_end -% t_wait_start;
     io_wait_cycles +%= wait_dt;
     if (wait_dt > io_max_wait_cycles) io_max_wait_cycles = wait_dt;
@@ -1818,7 +1818,7 @@ fn ioCommandAsync(c: *Controller, ctrl_idx: u32, opcode: u8, lba: u32, user_buf:
     // the prior fields cleared.
     @atomicStore(bool, &c.waiters[slot_idx].active, false, .release);
 
-    const t_call_end = @import("../debug/perf.zig").rdtsc();
+    const t_call_end = @import("../../debug/perf.zig").rdtsc();
     io_call_count += 1;
     io_total_cycles +%= t_call_end -% t_call_start;
     return success;
@@ -1857,8 +1857,8 @@ fn submitDatalessAsync(
     }
     if (payload.len > 4096) return false;
 
-    const proc = @import("../proc/process.zig");
-    const smp = @import("../cpu/smp.zig");
+    const proc = @import("../../proc/process.zig");
+    const smp = @import("../../cpu/smp.zig");
 
     // Same queue-full retry pattern as ioCommandAsync (gap #6) — allocCid
     // is lockless since step 2 so the retry loop no longer hangs onto
@@ -1873,7 +1873,7 @@ fn submitDatalessAsync(
                 return false;
             }
             _ = @atomicRmw(u64, &c.queue_full_retries, .Add, 1, .monotonic);
-            @import("../proc/sched_asm.zig").softYield();
+            @import("../../proc/sched_asm.zig").softYield();
         }
     };
     const slot_idx: u16 = cidSlot(cid);
@@ -1902,7 +1902,7 @@ fn submitDatalessAsync(
         if (smp.currentPid()) |p| break :blk proc.procs[p].is_idle;
         break :blk false;
     };
-    const mwait_mod = @import("../cpu/arch/mwait.zig");
+    const mwait_mod = @import("../../cpu/arch/mwait.zig");
     var timed_out = false;
     while (!@atomicLoad(bool, &c.waiters[slot_idx].completed, .acquire)) {
         if (wait_ep.runElapsed() > TIMEOUT_CYC_ASYNC) {
@@ -1967,7 +1967,7 @@ fn flushController(c: *Controller) bool {
 pub fn init() bool {
     scanAndInit();
     if (num_controllers == 0) return false;
-    const spinlock = @import("../proc/spinlock.zig");
+    const spinlock = @import("../../proc/spinlock.zig");
     if (num_controllers >= 1) spinlock.registerLock("nvme0.io_lock", &controllers[0].sq.lock);
     if (num_controllers >= 2) spinlock.registerLock("nvme1.io_lock", &controllers[1].sq.lock);
     debug.klog("[nvme] {d} controller(s) ready (primary={s}, secondary={s})\n", .{
@@ -2372,7 +2372,7 @@ fn submitReadNoWait(ctrl_idx: u32, lba: u32, sectors: u32, out_cid: *u16) bool {
     if (!c.initialized or !@atomicLoad(bool, &c.async_mode, .acquire)) return false;
     if (sectors == 0 or sectors > MAX_SECTORS_PER_CMD) return false;
 
-    const smp = @import("../cpu/smp.zig");
+    const smp = @import("../../cpu/smp.zig");
     const cid = allocCid(c) orelse return false;
     const slot_idx: u16 = cidSlot(cid);
     const xfer_bytes: u32 = sectors * c.block_size;
@@ -2382,7 +2382,7 @@ fn submitReadNoWait(ctrl_idx: u32, lba: u32, sectors: u32, out_cid: *u16) bool {
 
     // Narrow critical section: submitSqeLocked — see ioCommandAsync.
     const prp = buildPrp(c, slot_idx, xfer_bytes);
-    c.waiters[slot_idx].submit_tsc = @import("../debug/perf.zig").rdtsc();
+    c.waiters[slot_idx].submit_tsc = @import("../../debug/perf.zig").rdtsc();
     submitSqeLocked(c, slot_idx, cid, IO_READ, prp.prp1, prp.prp2, lba, 0, sectors - 1);
 
     out_cid.* = cid;
@@ -2395,8 +2395,8 @@ fn submitReadNoWait(ctrl_idx: u32, lba: u32, sectors: u32, out_cid: *u16) bool {
 /// a plain kernel memcpy — no CR3 swap / user-access dance (cf. io_uring's
 /// handleCompletion). Returns false on any chunk error or wave timeout.
 fn readSectorsPipelined(c: *Controller, ctrl_idx: u32, lba: u32, count: u32, dest: usize) bool {
-    const proc = @import("../proc/process.zig");
-    const perf = @import("../debug/perf.zig");
+    const proc = @import("../../proc/process.zig");
+    const perf = @import("../../debug/perf.zig");
     const TIMEOUT_CYC: u64 = 30_000_000_000; // ~30 s at 1 GHz guest-run — matches ioCommandAsync
     const t_call = perf.rdtsc();
 
@@ -2422,7 +2422,7 @@ fn readSectorsPipelined(c: *Controller, ctrl_idx: u32, lba: u32, count: u32, des
         if (wave == 0) {
             // Every slot busy with other tasks' I/O — yield so the reaper can
             // drain, then retry (same shape as ioCommandAsync's queue-full loop).
-            @import("../proc/sched_asm.zig").softYield();
+            @import("../../proc/sched_asm.zig").softYield();
             continue;
         }
 
