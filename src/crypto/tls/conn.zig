@@ -83,8 +83,8 @@ pub var pool: [POOL_SIZE]TlsConn = blk: {
 
 // ---------------------------------------------------------------------
 // Shared handshake scratch buffers. Only one handshake runs at a time
-// (guarded by hs_busy). The post-handshake state moves into the
-// conn's own fields.
+// (guarded by hs_busy, claimed by CAS: callers race in from any CPU).
+// The post-handshake state moves into the conn's own fields.
 
 var hs_busy: bool = false;
 var hs_buf: [512]u8 = undefined;
@@ -159,22 +159,36 @@ pub const Options = struct {
 };
 
 /// Open a TLS conn to (ip, port) with the given SNI. Returns the conn
-/// slot on success, or null on any failure. On failure, no TCP slot is
-/// held.
+/// slot on success, or null on any failure. On failure, neither the
+/// conn slot nor a TCP slot is held.
 pub fn tlsConnect(ip: [4]u8, port: u16, sni: []const u8, opts: Options) ?u8 {
-    if (hs_busy) return null; // another handshake in progress
-    hs_busy = true;
-    defer hs_busy = false;
+    if (@cmpxchgStrong(bool, &hs_busy, false, true, .acquire, .monotonic) != null) {
+        debug.klog("[tls-conn] another handshake in progress\n", .{});
+        return null;
+    }
+    defer @atomicStore(bool, &hs_busy, false, .release);
 
-    const slot = alloc() orelse return null;
-    errdefer free(slot);
+    // Cleanup keys off `ok`, not errdefer: this returns an optional, so
+    // `return null` is not an error return and errdefer would never run.
+    var ok = false;
+    const slot = alloc() orelse {
+        debug.klog("[tls-conn] all {d} conn slots in use\n", .{POOL_SIZE});
+        return null;
+    };
+    defer if (!ok) free(slot);
 
     // 1. Ephemeral key shares (x25519 + P-256) + client_random. We send a
     //    share for both groups so the server picks either in one round trip.
     var x25519_sk: [32]u8 = undefined;
-    if (!random.fillRandom(&x25519_sk)) return null;
+    if (!random.fillRandom(&x25519_sk)) {
+        debug.klog("[tls-conn] no hardware randomness for the key share\n", .{});
+        return null;
+    }
     const x25519_pk = X25519.recoverPublicKey(x25519_sk) catch return null;
-    const p256 = kex.genP256() orelse return null;
+    const p256 = kex.genP256() orelse {
+        debug.klog("[tls-conn] P-256 key share generation failed\n", .{});
+        return null;
+    };
     var client_random: [32]u8 = undefined;
     _ = random.fillRandom(&client_random);
 
@@ -185,20 +199,33 @@ pub fn tlsConnect(ip: [4]u8, port: u16, sni: []const u8, opts: Options) ?u8 {
         .p256_pub = p256.public,
         .server_name = sni,
     });
-    if (hs_len == 0) return null;
+    if (hs_len == 0) {
+        debug.klog("[tls-conn] ClientHello did not fit (SNI {d} B)\n", .{sni.len});
+        return null;
+    }
     const rec_len = messages.wrapRecord(&rec_buf, .handshake, hs_buf[0..hs_len]);
 
     // 3. TCP connect.
-    const tcp_slot = net.tcpConnect(ip, port) orelse return null;
+    const tcp_slot = net.tcpConnect(ip, port) orelse {
+        debug.klog("[tls-conn] TCP connect to {d}.{d}.{d}.{d}:{d} failed\n", .{ ip[0], ip[1], ip[2], ip[3], port });
+        return null;
+    };
     pool[slot].tcp_slot = tcp_slot;
-    errdefer net.tcpClose(tcp_slot);
+    defer if (!ok) net.tcpClose(tcp_slot);
 
     // 4. Send ClientHello.
-    if (!net.tcpSend(tcp_slot, rec_buf[0..rec_len])) return null;
+    if (!net.tcpSend(tcp_slot, rec_buf[0..rec_len])) {
+        debug.klog("[tls-conn] ClientHello send failed\n", .{});
+        return null;
+    }
 
     // 5. Read ServerHello record header + body.
     var hdr: [5]u8 = undefined;
-    if (readAtLeast(tcp_slot, &hdr, 5, process.tick_count + 3000) != 5) return null;
+    const hdr_got = readAtLeast(tcp_slot, &hdr, 5, process.tick_count + 3000);
+    if (hdr_got != 5) {
+        debug.klog("[tls-conn] no ServerHello: {d}/5 header bytes, peer_closed={}\n", .{ hdr_got, net.tcpPeerClosed(tcp_slot) });
+        return null;
+    }
     if (hdr[0] != @intFromEnum(types.ContentType.handshake)) {
         // Most common cause: server replied with a TLS Alert (type 21)
         // instead of a Handshake (type 22). Two-byte alert payload =
@@ -519,6 +546,7 @@ pub fn tlsConnect(ip: [4]u8, port: u16, sni: []const u8, opts: Options) ?u8 {
     pool[slot].client_seq = 0;
     pool[slot].state = .established;
 
+    ok = true;
     return slot;
 }
 
