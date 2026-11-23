@@ -4,8 +4,8 @@
 
 const std = @import("std");
 const process = @import("../proc/process.zig");
-const tty = @import("../proc/tty.zig");
-const pty = @import("../proc/pty.zig");
+const tty = @import("../tty/tty.zig");
+const pty = @import("../tty/pty.zig");
 const file = @import("../fs/file.zig");
 const socket = @import("../net/socket.zig");
 const usercopy = @import("../cpu/arch/usercopy.zig");

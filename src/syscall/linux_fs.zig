@@ -26,8 +26,8 @@ const usercopy = @import("../cpu/arch/usercopy.zig");
 const locks = @import("../fs/locks.zig");
 const linux_signal = @import("linux_signal.zig");
 const debug = @import("../debug/debug.zig");
-const tty = @import("../proc/tty.zig");
-const pty = @import("../proc/pty.zig");
+const tty = @import("../tty/tty.zig");
+const pty = @import("../tty/pty.zig");
 const lproc = @import("../fs/lproc.zig");
 
 // Linux errno.

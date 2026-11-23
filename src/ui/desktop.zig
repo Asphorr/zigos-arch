@@ -783,7 +783,7 @@ fn putCharAfterCsi(w: *Window, t: *TerminalData, c: u8) void {
 /// off to draw its own; one that died without turning it back on doesn't
 /// leave the shell without.
 fn cursorShown(w: *const Window, t: *const TerminalData) bool {
-    return !(t.cursor_hidden and @import("../proc/tty.zig").hasLinuxProgram(w.tty));
+    return !(t.cursor_hidden and @import("../tty/tty.zig").hasLinuxProgram(w.tty));
 }
 
 /// What the terminal answers a program's query with: in through the keys'
@@ -2018,7 +2018,7 @@ fn spawnShellOnWindow(wi: u8) void {
     // program the shell starts inherits them and finds a tty there.
     const file = @import("../fs/file.zig");
     const vfs_mod = @import("../fs/vfs.zig");
-    const tty = @import("../proc/tty.zig");
+    const tty = @import("../tty/tty.zig");
     const term = tty.open(kb_pipe, out_pipe, @intCast(pid), @intCast(TERM_ROWS), @intCast(TERM_COLS));
     if (vfs_mod.newFile(.{ .kind = .pipe, .pipe_id = kb_pipe, .access = file.READ, .tty = term })) |f| file.assign(pcb, 0, f);
     if (vfs_mod.newFile(.{ .kind = .pipe, .pipe_id = out_pipe, .access = file.WRITE, .tty = term })) |f| {
@@ -3031,7 +3031,7 @@ fn handleKeyboard(w: *Window, ch: u8) bool {
             ch == keyboard.KEY_DELETE;
         // A Linux program in the terminal gets every control key (^D, ^Z,
         // ^U...): its line discipline or the program itself knows them.
-        const is_control = ch < 0x20 and @import("../proc/tty.zig").hasLinuxProgram(w.tty);
+        const is_control = ch < 0x20 and @import("../tty/tty.zig").hasLinuxProgram(w.tty);
         if (!is_printable and !is_line_edit and !is_nav and !is_control) return false;
         const buf = [_]u8{ch};
         const written = @import("../proc/pipe.zig").tryWrite(w.kb_pipe, &buf);
@@ -4402,7 +4402,7 @@ pub fn run() void {
 
                 if (is_terminal) {
                     // ESC: a Linux program's key; our own shell has no use for it.
-                    if (ch == 0x1B and !@import("../proc/tty.zig").hasLinuxProgram(w.tty)) continue;
+                    if (ch == 0x1B and !@import("../tty/tty.zig").hasLinuxProgram(w.tty)) continue;
                     if (ch == 0x14) { // Ctrl+T: spawn new terminal
                         // window_count is u8; widen before the multiply or `9 * 30 = 270`
         // overflows u8 arithmetic and Zig's runtime safety panics.
@@ -5002,7 +5002,7 @@ fn removeWindow(slot: u8) ?*TerminalData {
         @import("../proc/pipe.zig").closeReader(windows[slot].out_pipe);
         windows[slot].out_pipe = 0xFF;
     }
-    @import("../proc/tty.zig").close(windows[slot].tty);
+    @import("../tty/tty.zig").close(windows[slot].tty);
     windows[slot].tty = 0xFF;
     if (windows[slot].shell_pid != 0xFF) {
         process.killProcess(windows[slot].shell_pid);

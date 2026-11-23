@@ -289,7 +289,7 @@ const Terminal = struct {
     wait_left: u32 = 0,
 
     const pipe = @import("../proc/pipe.zig");
-    const tty = @import("../proc/tty.zig");
+    const tty = @import("../tty/tty.zig");
     const file = @import("../fs/file.zig");
 
     /// Everything the program wrote, from the start of the run.

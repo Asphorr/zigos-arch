@@ -16,12 +16,12 @@
 //! whether or not anyone is reading.
 
 const std = @import("std");
-const process = @import("process.zig");
-const signals = @import("signals.zig");
-const session = @import("session.zig");
-const pipe = @import("pipe.zig");
+const process = @import("../proc/process.zig");
+const signals = @import("../proc/signals.zig");
+const session = @import("../proc/session.zig");
+const pipe = @import("../proc/pipe.zig");
 const keyboard = @import("../driver.zig").keyboard;
-const SpinLock = @import("spinlock.zig").SpinLock;
+const SpinLock = @import("../proc/spinlock.zig").SpinLock;
 
 /// File.tty of a file that is not a terminal.
 pub const NONE: u8 = 0xFF;

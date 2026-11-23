@@ -454,7 +454,7 @@ pub fn push(ch: u8) void {
     if (ch == 0x03) {
         const desktop = @import("../../ui/desktop.zig");
         const signals = @import("../../proc/signals.zig");
-        const tty = @import("../../proc/tty.zig");
+        const tty = @import("../../tty/tty.zig");
         const term = desktop.focusedTty();
         const as_key = term != tty.NONE and !tty.interruptKey(term);
         if (!as_key) {
@@ -468,7 +468,7 @@ pub fn push(ch: u8) void {
     // Ctrl+Z and Ctrl+\ stop or quit a Linux job in a terminal from here
     // too, whether or not it reads the terminal (proc/tty.zig jobKey).
     if (ch == 0x1A or ch == 0x1C) {
-        const tty = @import("../../proc/tty.zig");
+        const tty = @import("../../tty/tty.zig");
         const term = @import("../../ui/desktop.zig").focusedTty();
         if (term != tty.NONE and tty.jobKey(term, ch)) return;
     }
