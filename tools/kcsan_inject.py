@@ -122,6 +122,11 @@ DENYLIST: set[str] = {
     "iretq_canary.zig",
 }
 
+# Whole directories, matched against the source path (see kasan_inject.py).
+DENY_DIRS: tuple[str, ...] = (
+    "gpu/virtio_gpu/",
+)
+
 
 FUNC_DEFINE_RE = re.compile(
     r"^(define\s+(?:dso_local\s+)?(?:internal\s+)?(?:weak\s+)?(?:linkonce_odr\s+)?[^@]*?@[^(]+\([^)]*\)[^{]*?)(\s*!dbg\s+!(\d+))?(\s*{)\s*$"
@@ -213,7 +218,7 @@ def inject(text: str) -> tuple[str, int, int]:
         if not is_project_path(src["full_path"]):
             out_lines.append(line)
             continue
-        if src["basename"] in DENYLIST:
+        if src["basename"] in DENYLIST or any(d in src["full_path"].replace("\\", "/") for d in DENY_DIRS):
             out_lines.append(line)
             continue
         head, dbg, _dbg_id, tail = m.group(1), m.group(2) or "", m.group(3), m.group(4)

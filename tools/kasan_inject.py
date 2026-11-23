@@ -193,11 +193,18 @@ DENYLIST: set[str] = {
     "swap.zig",
 }
 
+# Whole directories, matched against the source path: a driver split into
+# files with generic names (present.zig, context.zig) can't be listed by
+# basename without catching unrelated files.
+DENY_DIRS: tuple[str, ...] = (
+    "gpu/virtio_gpu/",
+)
+
 
 FUNC_DEFINE_RE = re.compile(
     r"^(define\s+(?:dso_local\s+)?(?:internal\s+)?(?:weak\s+)?(?:linkonce_odr\s+)?[^@]*?@[^(]+\([^)]*\)[^{]*?)(\s*!dbg\s+!(\d+))?(\s*{)\s*$"
 )
-DIFILE_RE = re.compile(r'!DIFile\(filename:\s*"([^"]+)"')
+DIFILE_RE = re.compile(r'!DIFile\(filename:\s*"([^"]+)"(?:.*directory:\s*"([^"]+)")?')
 DISUBPROGRAM_RE = re.compile(r"!DISubprogram\([^)]*?\bfile:\s*!(\d+)")
 
 
@@ -205,7 +212,7 @@ def build_metadata_index(text: str) -> tuple[dict[int, dict], dict[int, str]]:
     """
     Walk all `!N = ...` metadata lines once and build:
       - di_subprograms: map !N -> {'file': !M} for every DISubprogram
-      - di_files:       map !M -> filename basename
+      - di_files:       map !M -> source path (directory/filename, '/')
     """
     di_subs: dict[int, dict] = {}
     di_files: dict[int, str] = {}
@@ -227,13 +234,18 @@ def build_metadata_index(text: str) -> tuple[dict[int, dict], dict[int, str]]:
             node_id = int(m.group(1))
             f = DIFILE_RE.search(line)
             if f:
-                di_files[node_id] = Path(f.group(1)).name
+                path = f"{f.group(2)}/{f.group(1)}" if f.group(2) else f.group(1)
+                di_files[node_id] = path.replace("\\", "/")
 
     return di_subs, di_files
 
 
+def denied(path: str) -> bool:
+    return Path(path).name in DENYLIST or any(d in path for d in DENY_DIRS)
+
+
 def function_source(line: str, di_subs: dict, di_files: dict) -> str | None:
-    """Return the basename of the source file for a `define` line, or None."""
+    """Return the source path of a `define` line's function, or None."""
     m = FUNC_DEFINE_RE.match(line)
     if not m or not m.group(2):
         return None
@@ -272,7 +284,7 @@ def inject(text: str) -> tuple[str, int, int]:
             continue
 
         src = function_source(line.rstrip("\n"), di_subs, di_files)
-        if src is None or src in DENYLIST:
+        if src is None or denied(src):
             out_lines.append(line)
             continue
 
