@@ -15,12 +15,12 @@
 //! waiter, and each looks at its own set again.
 
 const std = @import("std");
-const process = @import("../../proc/process.zig");
-const file = @import("../../fs/file.zig");
-const heap = @import("../../mm/heap.zig");
-const config = @import("../../config.zig");
+const process = @import("../proc/process.zig");
+const file = @import("../fs/file.zig");
+const heap = @import("../mm/heap.zig");
+const config = @import("../config.zig");
 const fdpoll = @import("fdpoll.zig");
-const SpinLock = @import("../../proc/spinlock.zig").SpinLock;
+const SpinLock = @import("../proc/spinlock.zig").SpinLock;
 
 pub const IN: u32 = 0x001;
 pub const OUT: u32 = 0x004;

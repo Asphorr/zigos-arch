@@ -25,7 +25,7 @@ const vfs = @import("../fs/vfs.zig");
 const file = @import("../fs/file.zig");
 const heap = @import("../mm/heap.zig");
 const pmm = @import("../mm/pmm.zig");
-const fdpoll = @import("../cpu/ipc/fdpoll.zig");
+const fdpoll = @import("../ipc/fdpoll.zig");
 const smp = @import("../cpu/smp.zig");
 const usercopy = @import("../cpu/arch/usercopy.zig");
 const common = @import("common.zig");
@@ -170,7 +170,7 @@ pub fn execve(frame: *signals.SyscallFrame, path_va: u64, argv_va: u64, envp_va:
 
     // Past here the call can't fail: it returns into the new image.
     lifecycle.killOtherThreads();
-    @import("../cpu/ipc/iouring.zig").releaseAllForPid(@intCast(me));
+    @import("../ipc/iouring.zig").releaseAllForPid(@intCast(me));
     const entry_rsp = imageEntry(img);
     lifecycle.takeExecImage(img);
     closeOnExec();

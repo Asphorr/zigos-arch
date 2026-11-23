@@ -4352,7 +4352,7 @@ pub fn run() void {
                 // the focus/visibility/owner check), so the broadcast
                 // (.console, 0xFFFF) lets the matcher do its job.
                 if (queued) {
-                    @import("../cpu/ipc/fdpoll.zig").wakePollers(.console, 0xFFFF);
+                    @import("../ipc/fdpoll.zig").wakePollers(.console, 0xFFFF);
                 }
                 if (!queued) {
                     // Queue full, event dropped.

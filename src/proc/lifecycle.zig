@@ -1199,15 +1199,15 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp, persist_shared_dirty: 
     // io_uring instances owned by this pid: free the slot-table entries.
     // The underlying ring memory is freed by the LazyRegion shm.release in
     // the per-AS cleanup below; this just recycles the kernel bookkeeping.
-    @import("../cpu/ipc/iouring.zig").releaseAllForPid(@intCast(pid));
+    @import("../ipc/iouring.zig").releaseAllForPid(@intCast(pid));
 
     // fdpoll waiters tied to this pid — drop them before iouring shutdown
     // completes, since the OP_POLL pending slots reference them by index
     // and the worker may already have recycled the Instance slot above.
-    @import("../cpu/ipc/fdpoll.zig").releaseAllForPid(@intCast(pid));
+    @import("../ipc/fdpoll.zig").releaseAllForPid(@intCast(pid));
     // Killed inside poll, waitEvent, wait4 or a pipe: its bits would wake
     // the slot's next task.
-    @import("../cpu/ipc/fdpoll.zig").sleeperLeave(pid);
+    @import("../ipc/fdpoll.zig").sleeperLeave(pid);
     @import("../ui/desktop/event_wait.zig").leave(pid);
     childWaitLeave(pid);
     @import("pipe.zig").leave(pid);
@@ -1247,7 +1247,7 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp, persist_shared_dirty: 
         // A member that claimed earlier may not have released its io_uring
         // instances yet; their workers copy on these tables, under the read
         // side — so before the write side below, which would wait for them.
-        if (lead.page_directory != null) @import("../cpu/ipc/iouring.zig").releaseAllForGroup(my_tgid);
+        if (lead.page_directory != null) @import("../ipc/iouring.zig").releaseAllForGroup(my_tgid);
         // Readers from another group (/proc) hold the read side while they
         // walk these tables and regions: they finish first.
         lead.as_lock.acquire();

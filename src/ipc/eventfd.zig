@@ -3,13 +3,13 @@
 //! event loops use it to wake each other through poll.
 
 const std = @import("std");
-const process = @import("../../proc/process.zig");
-const file = @import("../../fs/file.zig");
-const heap = @import("../../mm/heap.zig");
-const errno = @import("../../proc/errno.zig");
+const process = @import("../proc/process.zig");
+const file = @import("../fs/file.zig");
+const heap = @import("../mm/heap.zig");
+const errno = @import("../proc/errno.zig");
 const fdpoll = @import("fdpoll.zig");
-const usercopy = @import("../arch/usercopy.zig");
-const SpinLock = @import("../../proc/spinlock.zig").SpinLock;
+const usercopy = @import("../cpu/arch/usercopy.zig");
+const SpinLock = @import("../proc/spinlock.zig").SpinLock;
 
 /// The most the counter holds; a write that would pass it waits.
 const MAX: u64 = std.math.maxInt(u64) - 1;

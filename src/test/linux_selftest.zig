@@ -402,7 +402,7 @@ const STALL_DUMP_MS: u32 = 60_000;
 /// fds and the pipes: for a run that stops making progress.
 fn dumpTasks(waited: u32) void {
     serial.print("[linuxtest] {d} s in; poll sleepers", .{waited / 1000});
-    for (@import("../cpu/ipc/fdpoll.zig").sleeperMask()) |w| serial.print(" 0x{X}", .{w});
+    for (@import("../ipc/fdpoll.zig").sleeperMask()) |w| serial.print(" 0x{X}", .{w});
     serial.print(", wait4 sleepers", .{});
     for (@import("../proc/lifecycle.zig").childWaiterMask()) |w| serial.print(" 0x{X}", .{w});
     serial.print(":\n", .{});

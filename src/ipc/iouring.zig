@@ -32,24 +32,24 @@
 //! ops beyond NVMe + R/W/NOP.
 
 const std = @import("std");
-const process = @import("../../proc/process.zig");
-const shm = @import("../../mm/shm.zig");
-const paging = @import("../../mm/paging.zig");
-const vfs = @import("../../fs/vfs.zig");
-const debug = @import("../../debug/debug.zig");
-const smp = @import("../smp.zig");
-const pcid_mod = @import("../mmu/pcid.zig");
-const fault = @import("../../proc/fault.zig");
-const protect = @import("../arch/protect.zig");
-const lifecycle = @import("../../proc/lifecycle.zig");
-const config = @import("../../config.zig");
-const memmap = @import("../../mm/memmap.zig");
-const heap = @import("../../mm/heap.zig");
-const nvme = @import("../../driver.zig").nvme;
-const spinlock = @import("../../proc/spinlock.zig");
-const pid_set = @import("../../util/pid_set.zig");
+const process = @import("../proc/process.zig");
+const shm = @import("../mm/shm.zig");
+const paging = @import("../mm/paging.zig");
+const vfs = @import("../fs/vfs.zig");
+const debug = @import("../debug/debug.zig");
+const smp = @import("../cpu/smp.zig");
+const pcid_mod = @import("../cpu/mmu/pcid.zig");
+const fault = @import("../proc/fault.zig");
+const protect = @import("../cpu/arch/protect.zig");
+const lifecycle = @import("../proc/lifecycle.zig");
+const config = @import("../config.zig");
+const memmap = @import("../mm/memmap.zig");
+const heap = @import("../mm/heap.zig");
+const nvme = @import("../driver.zig").nvme;
+const spinlock = @import("../proc/spinlock.zig");
+const pid_set = @import("../util/pid_set.zig");
 
-const common = @import("../../syscall/common.zig");
+const common = @import("../syscall/common.zig");
 const E_INVAL = common.E_INVAL;
 const E_NOMEM = common.E_NOMEM;
 const E_FAULT = common.E_FAULT;
@@ -238,7 +238,7 @@ fn wakeCqWaiters(inst_id: usize) void {
 }
 
 var instances: [MAX_INSTANCES_TOTAL]Instance = [_]Instance{.{}} ** MAX_INSTANCES_TOTAL;
-var lock: @import("../../proc/spinlock.zig").SpinLock = .{};
+var lock: @import("../proc/spinlock.zig").SpinLock = .{};
 
 inline fn nextPow2(v: u32) u32 {
     if (v <= 1) return 1;
@@ -1188,7 +1188,7 @@ fn releaseOwnedBy(id: u32, group: bool) void {
             spins += 1;
             // Yield to give the worker a chance to run. softYield() here
             // mirrors nvme.ioCommandAsync's queue-full-retry pattern.
-            @import("../../proc/sched_asm.zig").softYield();
+            @import("../proc/sched_asm.zig").softYield();
             // Diagnostic: if we spin >100k times the worker is wedged.
             // 100k * softYield latency = many seconds at minimum.
             if (spins > 100_000 and spins & 0xFFFF == 0) {

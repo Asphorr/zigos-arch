@@ -11,7 +11,7 @@
 
 const std = @import("std");
 const SpinLock = @import("../proc/spinlock.zig").SpinLock;
-const fdpoll = @import("../cpu/ipc/fdpoll.zig");
+const fdpoll = @import("../ipc/fdpoll.zig");
 const MAX_PROCS = @import("../config.zig").MAX_PROCS;
 
 /// The last byte a range can reach (Linux's OFFSET_MAX): a lock "to the end

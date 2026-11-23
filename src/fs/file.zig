@@ -42,11 +42,11 @@ pub const Ops = struct {
 };
 
 fn pollByKind(f: *File, pcb: *process.PCB) u16 {
-    return @import("../cpu/ipc/fdpoll.zig").maskOfFile(f, pcb);
+    return @import("../ipc/fdpoll.zig").maskOfFile(f, pcb);
 }
 
 fn eventsByKind(f: *File) u32 {
-    return @import("../cpu/ipc/fdpoll.zig").eventsOfFile(f);
+    return @import("../ipc/fdpoll.zig").eventsOfFile(f);
 }
 
 fn denyRead(_: *File, _: *process.PCB, _: [*]u8, _: u32) u32 {
@@ -186,7 +186,7 @@ fn dropRef(f: *File) bool {
     const before = @atomicRmw(u32, &f.refs, .Sub, 1, .acq_rel);
     if (before == 0) @panic("file: reference dropped twice");
     if (before != 1) return false;
-    if (@atomicLoad(bool, &f.watched, .acquire)) @import("../cpu/ipc/epoll.zig").forget(f);
+    if (@atomicLoad(bool, &f.watched, .acquire)) @import("../ipc/epoll.zig").forget(f);
     locks.fileGone(@intFromPtr(f));
     return true;
 }

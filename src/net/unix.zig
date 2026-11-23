@@ -15,7 +15,7 @@
 const std = @import("std");
 const heap = @import("../mm/heap.zig");
 const SpinLock = @import("../proc/spinlock.zig").SpinLock;
-const fdpoll = @import("../cpu/ipc/fdpoll.zig");
+const fdpoll = @import("../ipc/fdpoll.zig");
 
 pub const Kind = enum(u8) { stream, dgram, seqpacket };
 

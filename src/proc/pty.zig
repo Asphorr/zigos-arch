@@ -22,7 +22,7 @@ const tty = @import("tty.zig");
 const pipe = @import("pipe.zig");
 const errno = @import("errno.zig");
 const file = @import("../fs/file.zig");
-const fdpoll = @import("../cpu/ipc/fdpoll.zig");
+const fdpoll = @import("../ipc/fdpoll.zig");
 const usercopy = @import("../cpu/arch/usercopy.zig");
 const SpinLock = @import("spinlock.zig").SpinLock;
 

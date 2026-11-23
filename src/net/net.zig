@@ -519,7 +519,7 @@ fn udpQueue(s: *UdpSock, src_ip: [4]u8, src_port: u16, payload: []const u8) void
     udpRingPut(s, at + UDP_REC_HDR, payload);
     s.used += need;
     s.events +%= 1;
-    @import("../cpu/ipc/fdpoll.zig").notify();
+    @import("../ipc/fdpoll.zig").notify();
 }
 
 fn udpPortTaken(port: u16) bool {
@@ -1159,7 +1159,7 @@ fn enqueueAccepted(lst: *TcpListener, conn_slot: u8) bool {
 /// Something a waiter on `c` may care about happened. Lock held.
 fn tcpNotify(c: *TcpConn) void {
     c.events +%= 1;
-    @import("../cpu/ipc/fdpoll.zig").wakePollers(.tcp_sock, @as(u16, connSlotIndex(c)));
+    @import("../ipc/fdpoll.zig").wakePollers(.tcp_sock, @as(u16, connSlotIndex(c)));
 }
 
 fn tcpFailWith(c: *TcpConn, why: TcpFail) void {
@@ -2435,7 +2435,7 @@ fn handleTcpPacket(ip_data: []volatile u8, ihl: usize) void {
                         c.* = .{};
                         return;
                     }
-                    @import("../cpu/ipc/fdpoll.zig").wakePollers(.tcp_listener, @as(u16, c.listener_slot));
+                    @import("../ipc/fdpoll.zig").wakePollers(.tcp_listener, @as(u16, c.listener_slot));
                 }
                 // Bundled data on the ACK that completes the handshake.
                 receiveData(c, seq, tcp, data_offset, payload_len);

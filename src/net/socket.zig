@@ -16,7 +16,7 @@ const file = @import("../fs/file.zig");
 const process = @import("../proc/process.zig");
 const heap = @import("../mm/heap.zig");
 const errno = @import("../proc/errno.zig");
-const fdpoll = @import("../cpu/ipc/fdpoll.zig");
+const fdpoll = @import("../ipc/fdpoll.zig");
 const usercopy = @import("../cpu/arch/usercopy.zig");
 const Mutex = @import("../proc/spinlock.zig").Mutex;
 
