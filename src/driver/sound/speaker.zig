@@ -1,8 +1,8 @@
 // PC Speaker driver — PIT channel 2 + speaker gate
 // Supports multi-note sequences for richer sounds
 
-const io = @import("../io.zig");
-const SpinLock = @import("../proc/spinlock.zig").SpinLock;
+const io = @import("../../io.zig");
+const SpinLock = @import("../../proc/spinlock.zig").SpinLock;
 
 const Note = struct { freq: u16, ticks: u8 };
 const MAX_NOTES: u8 = 8;

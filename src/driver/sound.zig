@@ -8,10 +8,10 @@
 // ac97.zig and not worth re-implementing for virtio-sound. The streaming
 // path (DOOM, future tone generators / .wav players) is what got modernized.
 
-const virtio_snd = @import("virtio_sound.zig");
-const hda = @import("hda.zig");
-const ac97 = @import("ac97.zig");
-const speaker = @import("speaker.zig");
+const virtio_snd = @import("sound/virtio_sound.zig");
+const hda = @import("sound/hda.zig");
+const ac97 = @import("sound/ac97.zig");
+const speaker = @import("sound/speaker.zig");
 const debug = @import("../debug/debug.zig");
 
 var use_virtio: bool = false;

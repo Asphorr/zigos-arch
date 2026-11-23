@@ -21,14 +21,14 @@
 // Phase 2+ (later): IRQ-driven completion, real PCM streaming via
 // writeSamples(), integration with sound.zig in front of/replacing AC97.
 
-const pci = @import("bus/pci.zig");
-const pmm = @import("../mm/pmm.zig");
-const Phys = @import("../util/addr.zig").Phys;
-const paging = @import("../mm/paging.zig");
-const debug = @import("../debug/debug.zig");
-const Deadline = @import("../util/deadline.zig").Deadline;
-const SpinLock = @import("../proc/spinlock.zig").SpinLock;
-const iommu = @import("../cpu/mmu/iommu.zig");
+const pci = @import("../bus/pci.zig");
+const pmm = @import("../../mm/pmm.zig");
+const Phys = @import("../../util/addr.zig").Phys;
+const paging = @import("../../mm/paging.zig");
+const debug = @import("../../debug/debug.zig");
+const Deadline = @import("../../util/deadline.zig").Deadline;
+const SpinLock = @import("../../proc/spinlock.zig").SpinLock;
+const iommu = @import("../../cpu/mmu/iommu.zig");
 
 var pci_bus: u8 = 0;
 var pci_dev: u8 = 0;

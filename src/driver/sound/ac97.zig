@@ -1,13 +1,13 @@
 // AC97 Audio Driver — Intel ICH-compatible codec via PCI
 // Uses DMA buffer descriptors for PCM playback (16-bit stereo, 22050 Hz)
 
-const io = @import("../io.zig");
-const pci = @import("bus/pci.zig");
-const pmm = @import("../mm/pmm.zig");
-const paging = @import("../mm/paging.zig");
-const debug = @import("../debug/debug.zig");
-const SpinLock = @import("../proc/spinlock.zig").SpinLock;
-const iommu = @import("../cpu/mmu/iommu.zig");
+const io = @import("../../io.zig");
+const pci = @import("../bus/pci.zig");
+const pmm = @import("../../mm/pmm.zig");
+const paging = @import("../../mm/paging.zig");
+const debug = @import("../../debug/debug.zig");
+const SpinLock = @import("../../proc/spinlock.zig").SpinLock;
+const iommu = @import("../../cpu/mmu/iommu.zig");
 
 /// Serializes everything that touches `bdl_phys` / `buf_phys` / the PCM-out
 /// register sequence. Audio entry points are called from syscall context
@@ -167,7 +167,7 @@ pub fn playBuffer(num_samples: u32) void {
     playing = true;
     // Calculate stop time: samples / sample_rate * 100 ticks/sec + small margin
     const duration_ticks = (num_samples * 100 / SAMPLE_RATE) + 5;
-    play_stop_tick = @import("../proc/process.zig").tick_count + duration_ticks;
+    play_stop_tick = @import("../../proc/process.zig").tick_count + duration_ticks;
 }
 
 /// Write 16-bit signed stereo PCM samples to the audio buffer and play.
@@ -196,7 +196,7 @@ pub fn tick() void {
     // to fence against a syscall on another CPU mid-playBuffer setup.
     lock.acquire();
     defer lock.release();
-    if (@import("../proc/process.zig").tick_count >= play_stop_tick) {
+    if (@import("../../proc/process.zig").tick_count >= play_stop_tick) {
         io.outb(nabm_base + PO_CR, 0x00); // stop DMA
         io.outb16(nabm_base + PO_SR, 0x1C); // clear status
         playing = false;

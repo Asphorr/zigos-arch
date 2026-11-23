@@ -15,15 +15,15 @@
 //   - Multi-stream output (we lock onto the first output stream).
 //   - MSI-X (we poll-only — no IRQ handler is registered).
 
-const io = @import("../io.zig");
-const pci = @import("bus/pci.zig");
-const pmm = @import("../mm/pmm.zig");
-const paging = @import("../mm/paging.zig");
-const debug = @import("../debug/debug.zig");
-const process = @import("../proc/process.zig");
-const spinlock = @import("../proc/spinlock.zig");
-const iommu = @import("../cpu/mmu/iommu.zig");
-const Deadline = @import("../util/deadline.zig").Deadline;
+const io = @import("../../io.zig");
+const pci = @import("../bus/pci.zig");
+const pmm = @import("../../mm/pmm.zig");
+const paging = @import("../../mm/paging.zig");
+const debug = @import("../../debug/debug.zig");
+const process = @import("../../proc/process.zig");
+const spinlock = @import("../../proc/spinlock.zig");
+const iommu = @import("../../cpu/mmu/iommu.zig");
+const Deadline = @import("../../util/deadline.zig").Deadline;
 
 // --- Constants ---
 
@@ -158,7 +158,7 @@ const SndConfig = extern struct {
 
 // --- Virtqueue (shared with virtio_gpu via driver/virtio.zig) ---
 
-const virtio = @import("bus/virtio.zig");
+const virtio = @import("../bus/virtio.zig");
 const VirtqDesc = virtio.VirtqDesc;
 const Virtqueue = virtio.Queue;
 

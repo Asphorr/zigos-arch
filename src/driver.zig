@@ -25,10 +25,10 @@ pub const virtio_gpu = @import("driver/gpu/virtio_gpu.zig");
 
 // Sound.
 pub const sound = @import("driver/sound.zig");
-pub const ac97 = @import("driver/ac97.zig");
-pub const hda = @import("driver/hda.zig");
-pub const virtio_sound = @import("driver/virtio_sound.zig");
-pub const speaker = @import("driver/speaker.zig");
+pub const ac97 = @import("driver/sound/ac97.zig");
+pub const hda = @import("driver/sound/hda.zig");
+pub const virtio_sound = @import("driver/sound/virtio_sound.zig");
+pub const speaker = @import("driver/sound/speaker.zig");
 
 // Input.
 pub const keyboard = @import("driver/keyboard.zig");
