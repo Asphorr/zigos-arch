@@ -151,10 +151,17 @@ fn readAtLeast(slot: u8, out: []u8, want: usize, deadline_tick: u64) usize {
     return got;
 }
 
+pub const Options = struct {
+    /// Accept a self-signed server cert that is not in the trust store,
+    /// without hostname or validity checks (what `curl -k` does). Only
+    /// for the kernel's dev-server probe; the syscall never sets it.
+    insecure_self_signed: bool = false,
+};
+
 /// Open a TLS conn to (ip, port) with the given SNI. Returns the conn
 /// slot on success, or null on any failure. On failure, no TCP slot is
 /// held.
-pub fn tlsConnect(ip: [4]u8, port: u16, sni: []const u8) ?u8 {
+pub fn tlsConnect(ip: [4]u8, port: u16, sni: []const u8, opts: Options) ?u8 {
     if (hs_busy) return null; // another handshake in progress
     hs_busy = true;
     defer hs_busy = false;
@@ -414,6 +421,10 @@ pub fn tlsConnect(ip: [4]u8, port: u16, sni: []const u8) ?u8 {
         const der = maybe_der orelse break;
         const c = x509.parse(der) catch return null;
         if (have_prev) {
+            if (!cert_verify.isCa(c)) {
+                debug.klog("[tls-conn] chain cert signs another but is not a CA; refusing\n", .{});
+                return null;
+            }
             cert_verify.verifyCert(prev_cert, c.public_key) catch |e| {
                 debug.klog("[tls-conn] chain link sig failed: {s}\n", .{@errorName(e)});
                 return null;
@@ -433,23 +444,23 @@ pub fn tlsConnect(ip: [4]u8, port: u16, sni: []const u8) ?u8 {
         };
         debug.klog("[tls-conn] trust anchor HIT\n", .{});
         trusted = true;
+    } else if (top_self_signed and opts.insecure_self_signed) {
+        cert_verify.verifyCert(prev_cert, prev_cert.public_key) catch |e| {
+            debug.klog("[tls-conn] self-signed cert sig failed: {s}\n", .{@errorName(e)});
+            return null;
+        };
+        debug.klog("[tls-conn] WARN: untrusted self-signed cert accepted (insecure mode)\n", .{});
     } else if (top_self_signed) {
-        cert_verify.verifyCert(prev_cert, prev_cert.public_key) catch {};
-        // Self-signed but not in store: cryptographically consistent
-        // but NOT trust-anchored. We allow the conn through with a
-        // warning so the test server case still works.
-        debug.klog("[tls-conn] WARN: self-signed cert not in trust store\n", .{});
+        debug.klog("[tls-conn] self-signed cert not in trust store; refusing\n", .{});
+        return null;
     } else {
         debug.klog("[tls-conn] no trust anchor for top cert; refusing\n", .{});
         return null;
     }
 
-    // 9b. SAN / hostname match against the LEAF cert. Only enforced for
-    //     trust-anchored chains — without that, an attacker could pair
-    //     a leaf for `evil.com` (with valid SAN) against any trusted
-    //     intermediate they have access to. Untrusted self-signed certs
-    //     are already flagged UNTRUSTED above; skipping the SAN check
-    //     for them preserves the local-test-server workflow.
+    // 9b. SAN / hostname match against the LEAF cert, then 9c, its
+    //     validity window. Skipped only in insecure mode, where nothing
+    //     vouches for the name anyway.
     if (trusted) {
         if (!cert_verify.matchHostname(leaf, sni)) {
             debug.klog("[tls-conn] hostname mismatch: leaf cert does not cover SNI\n", .{});
@@ -457,12 +468,8 @@ pub fn tlsConnect(ip: [4]u8, port: u16, sni: []const u8) ?u8 {
         }
         debug.klog("[tls-conn] hostname OK — leaf cert SAN covers SNI\n", .{});
 
-        // 9c. Time validity. Only enforced on trust-anchored chains for
-        //     the same reason as SAN matching — self-signed test certs
-        //     might be issued with quirky dates and we don't want to
-        //     break the local-test-server workflow. The RTC supplies
-        //     the time; if the RTC is unset, checkValidity returns true
-        //     and we skip silently.
+        // The RTC supplies the time; with the RTC unset checkValidity
+        // passes.
         if (!cert_verify.checkValidity(leaf)) {
             debug.klog("[tls-conn] leaf cert NOT in validity window — refusing\n", .{});
             return null;

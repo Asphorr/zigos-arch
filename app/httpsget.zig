@@ -1,10 +1,10 @@
 // httpsget — minimal TLS 1.3 + HTTP/1.1 GET demo.
 //
 // Usage:
-//   httpsget <ip> <port> <sni> <path>
+//   httpsget <host> [port] [path]
 //
 // Example:
-//   httpsget 10.0.2.2 4433 zigvm /
+//   httpsget example.com
 //
 // Drives the full handshake through the kernel's TlsConn API
 // (syscalls 107-110): X25519 ECDH, ChaCha20-Poly1305 AEAD, RSA-PSS or
@@ -41,7 +41,6 @@ export fn _start() linksection(".text.entry") callconv(.c) void {
         libc.print("  path: default /\n");
         libc.print("examples:\n");
         libc.print("  httpsget example.com\n");
-        libc.print("  httpsget 10.0.2.2 4433\n");
         libc.exit();
     }
 

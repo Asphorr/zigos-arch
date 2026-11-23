@@ -218,3 +218,6 @@ pub const oid_sha512_with_rsa = [_]u8{ 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01,
 /// 2.5.29.17 — subjectAltName (the X.509 v3 extension that carries
 /// DNS names + IP addresses the cert is valid for).
 pub const oid_subject_alt_name = [_]u8{ 0x55, 0x1D, 0x11 };
+
+/// 2.5.29.19 — basicConstraints (cA flag: may this cert sign certs).
+pub const oid_basic_constraints = [_]u8{ 0x55, 0x1D, 0x13 };

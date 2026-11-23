@@ -171,38 +171,55 @@ fn verifyRsaPss(rk: x509.PublicKey.RsaKey, sig: []const u8, msg: []const u8, com
 /// Wildcard rules: a "*.foo.bar" entry matches "a.foo.bar" but NOT
 /// "a.b.foo.bar" (single-label wildcards only, leftmost only).
 pub fn matchHostname(cert: x509.Certificate, hostname: []const u8) bool {
-    if (cert.extensions_tlv.len == 0) return false;
     if (hostname.len == 0 or hostname.len > 253) return false;
+    const ext_value = findExtension(cert, &asn1.oid_subject_alt_name) orelse return false;
 
-    // Walk the SEQUENCE OF Extension. Each Extension: SEQUENCE { OID,
-    // critical BOOL DEFAULT FALSE, extnValue OCTET STRING }.
-    var ext_seq = asn1.Parser.init(cert.extensions_tlv);
-    var ext_list = ext_seq.takeSequence() catch return false;
-    while (!ext_list.isEmpty()) {
-        var ext = ext_list.takeSequence() catch return false;
-        const ext_oid = ext.takeOid() catch return false;
-        // Optional critical BOOLEAN — peek and skip if present.
-        if (!ext.isEmpty() and (ext.peek() catch 0) == 0x01) {
-            _ = ext.takeTag(0x01) catch return false;
-        }
-        const ext_value = ext.takeOctetString() catch return false;
-        if (!asn1.oidEqual(ext_oid, &asn1.oid_subject_alt_name)) continue;
-
-        // SubjectAltName ::= GeneralNames ::= SEQUENCE OF GeneralName.
-        // We only look at dNSName (context-specific [2] IMPLICIT IA5String,
-        // wire tag 0x82). iPAddress + other variants are skipped.
-        var san_parser = asn1.Parser.init(ext_value);
-        var san_list = san_parser.takeSequence() catch return false;
-        while (!san_list.isEmpty()) {
-            const entry = san_list.takeAny() catch return false;
-            if (entry.tag != 0x82) continue;
-            if (dnsNameMatches(entry.value, hostname)) return true;
-        }
-        // We found the SAN extension and walked all entries; if none
-        // matched, no point checking later extensions.
-        return false;
+    // SubjectAltName ::= GeneralNames ::= SEQUENCE OF GeneralName.
+    // We only look at dNSName (context-specific [2] IMPLICIT IA5String,
+    // wire tag 0x82). iPAddress + other variants are skipped.
+    var san_parser = asn1.Parser.init(ext_value);
+    var san_list = san_parser.takeSequence() catch return false;
+    while (!san_list.isEmpty()) {
+        const entry = san_list.takeAny() catch return false;
+        if (entry.tag != 0x82) continue;
+        if (dnsNameMatches(entry.value, hostname)) return true;
     }
     return false;
+}
+
+/// True if the cert's basicConstraints says cA=TRUE (RFC 5280 §4.2.1.9).
+/// Every cert that signs another one in the chain must pass this, or a
+/// leaf a public CA issued for one domain could sign a leaf for any other.
+pub fn isCa(cert: x509.Certificate) bool {
+    const ext_value = findExtension(cert, &asn1.oid_basic_constraints) orelse return false;
+    // BasicConstraints ::= SEQUENCE { cA BOOLEAN DEFAULT FALSE,
+    //                                 pathLenConstraint INTEGER OPTIONAL }
+    var bc_parser = asn1.Parser.init(ext_value);
+    var bc = bc_parser.takeSequence() catch return false;
+    if (bc.isEmpty()) return false;
+    if ((bc.peek() catch return false) != 0x01) return false;
+    const ca = bc.takeTag(0x01) catch return false;
+    return ca.len == 1 and ca[0] != 0;
+}
+
+/// extnValue contents of the first extension with this OID, or null when
+/// the cert has none or its extensions don't parse.
+fn findExtension(cert: x509.Certificate, oid: []const u8) ?[]const u8 {
+    if (cert.extensions_tlv.len == 0) return null;
+    // Each Extension: SEQUENCE { OID, critical BOOL DEFAULT FALSE,
+    // extnValue OCTET STRING }.
+    var ext_seq = asn1.Parser.init(cert.extensions_tlv);
+    var ext_list = ext_seq.takeSequence() catch return null;
+    while (!ext_list.isEmpty()) {
+        var ext = ext_list.takeSequence() catch return null;
+        const ext_oid = ext.takeOid() catch return null;
+        if (!ext.isEmpty() and (ext.peek() catch 0) == 0x01) {
+            _ = ext.takeTag(0x01) catch return null;
+        }
+        const ext_value = ext.takeOctetString() catch return null;
+        if (asn1.oidEqual(ext_oid, oid)) return ext_value;
+    }
+    return null;
 }
 
 fn dnsNameMatches(cert_name: []const u8, hostname: []const u8) bool {

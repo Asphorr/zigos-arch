@@ -291,7 +291,7 @@ pub fn sysTlsConnect(args_ptr: u32) u32 {
     const sni_src: [*]const u8 = @ptrFromInt(@as(usize, args.sni_ptr));
     @memcpy(sni_buf[0..args.sni_len], sni_src[0..args.sni_len]);
 
-    const slot = tls_conn.tlsConnect(args.ip, args.port, sni_buf[0..args.sni_len]) orelse return E_INVAL;
+    const slot = tls_conn.tlsConnect(args.ip, args.port, sni_buf[0..args.sni_len], .{}) orelse return E_INVAL;
     return @as(u32, slot);
 }
 
