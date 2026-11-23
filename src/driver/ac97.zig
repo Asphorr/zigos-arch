@@ -2,7 +2,7 @@
 // Uses DMA buffer descriptors for PCM playback (16-bit stereo, 22050 Hz)
 
 const io = @import("../io.zig");
-const pci = @import("pci.zig");
+const pci = @import("bus/pci.zig");
 const pmm = @import("../mm/pmm.zig");
 const paging = @import("../mm/paging.zig");
 const debug = @import("../debug/debug.zig");

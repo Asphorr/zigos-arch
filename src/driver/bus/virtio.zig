@@ -17,8 +17,8 @@
 // it stays separate.
 
 const std = @import("std");
-const pmm = @import("../mm/pmm.zig");
-const paging = @import("../mm/paging.zig");
+const pmm = @import("../../mm/pmm.zig");
+const paging = @import("../../mm/paging.zig");
 
 // --- Common-config register offsets ---
 //

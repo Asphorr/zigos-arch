@@ -2,8 +2,8 @@
 //! here, so a driver can move inside the tree without touching its users.
 
 // Buses and transports.
-pub const pci = @import("driver/pci.zig");
-pub const virtio = @import("driver/virtio.zig");
+pub const pci = @import("driver/bus/pci.zig");
+pub const virtio = @import("driver/bus/virtio.zig");
 
 // Block devices.
 pub const block = @import("driver/block.zig");

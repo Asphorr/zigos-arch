@@ -16,7 +16,7 @@
 // attached disks. block.zig dispatches between this and ata.zig.
 
 const io = @import("../io.zig");
-const pci = @import("pci.zig");
+const pci = @import("bus/pci.zig");
 const pmm = @import("../mm/pmm.zig");
 const paging = @import("../mm/paging.zig");
 const msix = @import("../time/msix.zig");

@@ -1,5 +1,5 @@
 const io = @import("../io.zig");
-const pci = @import("pci.zig");
+const pci = @import("bus/pci.zig");
 const pmm = @import("../mm/pmm.zig");
 const Phys = @import("../util/addr.zig").Phys;
 const paging = @import("../mm/paging.zig");
@@ -478,7 +478,7 @@ const BLOB_FLAG_USE_CROSS_DEVICE: u32 = 4;
 
 // --- Virtqueue (shared with virtio_sound via driver/virtio.zig) ---
 
-const virtio = @import("virtio.zig");
+const virtio = @import("bus/virtio.zig");
 const VirtqDesc = virtio.VirtqDesc;
 const Virtqueue = virtio.Queue;
 

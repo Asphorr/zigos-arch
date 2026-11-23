@@ -1,9 +1,9 @@
-const io = @import("../io.zig");
-const acpi = @import("../acpi/acpi.zig");
-const paging = @import("../mm/paging.zig");
-const debug = @import("../debug/debug.zig");
-const time = @import("../time/time.zig");
-const SpinLock = @import("../proc/spinlock.zig").SpinLock;
+const io = @import("../../io.zig");
+const acpi = @import("../../acpi/acpi.zig");
+const paging = @import("../../mm/paging.zig");
+const debug = @import("../../debug/debug.zig");
+const time = @import("../../time/time.zig");
+const SpinLock = @import("../../proc/spinlock.zig").SpinLock;
 
 const CONFIG_ADDR: u16 = 0x0CF8;
 const CONFIG_DATA: u16 = 0x0CFC;

@@ -1,4 +1,4 @@
-const pci = @import("pci.zig");
+const pci = @import("bus/pci.zig");
 const paging = @import("../mm/paging.zig");
 const pmm = @import("../mm/pmm.zig");
 const Phys = @import("../util/addr.zig").Phys;

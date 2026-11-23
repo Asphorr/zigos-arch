@@ -21,7 +21,7 @@
 // Phase 2+ (later): IRQ-driven completion, real PCM streaming via
 // writeSamples(), integration with sound.zig in front of/replacing AC97.
 
-const pci = @import("pci.zig");
+const pci = @import("bus/pci.zig");
 const pmm = @import("../mm/pmm.zig");
 const Phys = @import("../util/addr.zig").Phys;
 const paging = @import("../mm/paging.zig");

@@ -13,11 +13,11 @@
 //! `-serial chardev:X`).
 
 const std = @import("std");
-const pci = @import("pci.zig");
+const pci = @import("bus/pci.zig");
 const pmm = @import("../mm/pmm.zig");
 const paging = @import("../mm/paging.zig");
 const iommu = @import("../cpu/mmu/iommu.zig");
-const virtio = @import("virtio.zig");
+const virtio = @import("bus/virtio.zig");
 const debug = @import("../debug/debug.zig");
 const Deadline = @import("../util/deadline.zig").Deadline;
 

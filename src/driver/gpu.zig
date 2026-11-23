@@ -24,7 +24,7 @@
 //! rather than re-walking config space.
 
 const std = @import("std");
-const pci = @import("pci.zig");
+const pci = @import("bus/pci.zig");
 const debug = @import("../debug/debug.zig");
 
 // BAR sizing uses the standard write-all-ones / read-back / restore probe

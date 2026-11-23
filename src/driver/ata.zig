@@ -1,5 +1,5 @@
 const io = @import("../io.zig");
-const pci = @import("pci.zig");
+const pci = @import("bus/pci.zig");
 const pmm = @import("../mm/pmm.zig");
 const debug = @import("../debug/debug.zig");
 const SpinLock = @import("../proc/spinlock.zig").SpinLock;

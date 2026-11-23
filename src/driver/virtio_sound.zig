@@ -16,7 +16,7 @@
 //   - MSI-X (we poll-only — no IRQ handler is registered).
 
 const io = @import("../io.zig");
-const pci = @import("pci.zig");
+const pci = @import("bus/pci.zig");
 const pmm = @import("../mm/pmm.zig");
 const paging = @import("../mm/paging.zig");
 const debug = @import("../debug/debug.zig");
@@ -158,7 +158,7 @@ const SndConfig = extern struct {
 
 // --- Virtqueue (shared with virtio_gpu via driver/virtio.zig) ---
 
-const virtio = @import("virtio.zig");
+const virtio = @import("bus/virtio.zig");
 const VirtqDesc = virtio.VirtqDesc;
 const Virtqueue = virtio.Queue;
 

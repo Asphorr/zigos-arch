@@ -23,7 +23,7 @@
 // rxRelease/getMac — so nic.zig can switch between the two transparently.
 
 const io = @import("../io.zig");
-const pci = @import("pci.zig");
+const pci = @import("bus/pci.zig");
 const pmm = @import("../mm/pmm.zig");
 const paging = @import("../mm/paging.zig");
 const msix = @import("../time/msix.zig");
