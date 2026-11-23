@@ -1,7 +1,7 @@
-const io = @import("../io.zig");
-const pic = @import("../time/pic.zig");
-const debug = @import("../debug/debug.zig");
-const Deadline = @import("../util/deadline.zig").Deadline;
+const io = @import("../../io.zig");
+const pic = @import("../../time/pic.zig");
+const debug = @import("../../debug/debug.zig");
+const Deadline = @import("../../util/deadline.zig").Deadline;
 
 const DATA_PORT: u16 = 0x60;
 const STATUS_PORT: u16 = 0x64;

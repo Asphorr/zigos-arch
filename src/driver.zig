@@ -31,8 +31,8 @@ pub const virtio_sound = @import("driver/sound/virtio_sound.zig");
 pub const speaker = @import("driver/sound/speaker.zig");
 
 // Input.
-pub const keyboard = @import("driver/keyboard.zig");
-pub const mouse = @import("driver/mouse.zig");
+pub const keyboard = @import("driver/input/keyboard.zig");
+pub const mouse = @import("driver/input/mouse.zig");
 
 // USB.
 pub const xhci = @import("driver/xhci.zig");

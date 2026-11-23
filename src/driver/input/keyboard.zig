@@ -1,7 +1,7 @@
-const io = @import("../io.zig");
-const debug = @import("../debug/debug.zig");
-const smi = @import("../time/smi.zig");
-const Deadline = @import("../util/deadline.zig").Deadline;
+const io = @import("../../io.zig");
+const debug = @import("../../debug/debug.zig");
+const smi = @import("../../time/smi.zig");
+const Deadline = @import("../../util/deadline.zig").Deadline;
 
 /// True after initPS2() succeeds. Read by main.zig at the end of hardware
 /// probe to decide whether to warn about missing input devices.
@@ -170,7 +170,7 @@ pub fn disableIRQ1() void {
     // yield, unconditionally re-setting config bit 0 and soliciting a
     // fresh response byte — our own re-arm loop, not QEMU (removed
     // 2026-05-26; falsified 2026-07-13, see the doc comment above).
-    @import("../time/apic.zig").maskIsaIrq(1, 0x21);
+    @import("../../time/apic.zig").maskIsaIrq(1, 0x21);
 }
 
 /// Re-enable keyboard IRQ after mouse init may have changed the PS/2 config.
@@ -452,9 +452,9 @@ pub fn push(ch: u8) void {
     // — the shell, a Linux program's job — unless its reader has turned key
     // signals off, in which case the byte travels as any other key.
     if (ch == 0x03) {
-        const desktop = @import("../ui/desktop.zig");
-        const signals = @import("../proc/signals.zig");
-        const tty = @import("../proc/tty.zig");
+        const desktop = @import("../../ui/desktop.zig");
+        const signals = @import("../../proc/signals.zig");
+        const tty = @import("../../proc/tty.zig");
         const term = desktop.focusedTty();
         const as_key = term != tty.NONE and !tty.interruptKey(term);
         if (!as_key) {
@@ -468,8 +468,8 @@ pub fn push(ch: u8) void {
     // Ctrl+Z and Ctrl+\ stop or quit a Linux job in a terminal from here
     // too, whether or not it reads the terminal (proc/tty.zig jobKey).
     if (ch == 0x1A or ch == 0x1C) {
-        const tty = @import("../proc/tty.zig");
-        const term = @import("../ui/desktop.zig").focusedTty();
+        const tty = @import("../../proc/tty.zig");
+        const term = @import("../../ui/desktop.zig").focusedTty();
         if (term != tty.NONE and tty.jobKey(term, ch)) return;
     }
     // F1..F12 (0x90..0x9F) are global shortcuts — route to the desktop-only
@@ -559,7 +559,7 @@ pub fn handleScancode(scancode: u8) void {
             };
             if (special) |key| {
                 push(key);
-                beginRepeatTracking(code, key, @import("../proc/process.zig").tick_count);
+                beginRepeatTracking(code, key, @import("../../proc/process.zig").tick_count);
             }
         } else if (code == repeat_scancode) {
             repeat_scancode = 0;
@@ -600,18 +600,18 @@ pub fn handleScancode(scancode: u8) void {
     if (code >= 0x3B and code <= 0x44) {
         const ch = KEY_F1 + (code - 0x3B);
         push(ch);
-        beginRepeatTracking(code, ch, @import("../proc/process.zig").tick_count);
+        beginRepeatTracking(code, ch, @import("../../proc/process.zig").tick_count);
         return;
     }
     // F11=0x57, F12=0x58
     if (code == 0x57) {
         push(KEY_F1 + 10);
-        beginRepeatTracking(code, KEY_F1 + 10, @import("../proc/process.zig").tick_count);
+        beginRepeatTracking(code, KEY_F1 + 10, @import("../../proc/process.zig").tick_count);
         return;
     }
     if (code == 0x58) {
         push(KEY_F1 + 11);
-        beginRepeatTracking(code, KEY_F1 + 11, @import("../proc/process.zig").tick_count);
+        beginRepeatTracking(code, KEY_F1 + 11, @import("../../proc/process.zig").tick_count);
         return;
     }
 
@@ -638,6 +638,6 @@ pub fn handleScancode(scancode: u8) void {
         }
 
         push(ch);
-        beginRepeatTracking(code, ch, @import("../proc/process.zig").tick_count);
+        beginRepeatTracking(code, ch, @import("../../proc/process.zig").tick_count);
     }
 }
