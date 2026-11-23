@@ -1,6 +1,6 @@
 const std = @import("std");
 const io = @import("../io.zig");
-const virtio_console = @import("../driver/virtio_console.zig");
+const virtio_console = @import("../driver.zig").virtio_console;
 
 const PORT: u16 = 0x3F8; // COM1
 

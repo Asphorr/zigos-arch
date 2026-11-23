@@ -16,7 +16,7 @@ const gfx = @import("../gfx.zig");
 const layout = @import("layout.zig");
 const dirty_rects = @import("dirty.zig");
 const process = @import("../../proc/process.zig");
-const keyboard = @import("../../driver/keyboard.zig");
+const keyboard = @import("../../driver.zig").keyboard;
 const pipe = @import("../../proc/pipe.zig");
 const events = @import("../events.zig");
 

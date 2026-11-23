@@ -12,8 +12,8 @@
 
 const io = @import("../../io.zig");
 const apic = @import("../../time/apic.zig");
-const keyboard = @import("../../driver/keyboard.zig");
-const mouse = @import("../../driver/mouse.zig");
+const keyboard = @import("../../driver.zig").keyboard;
+const mouse = @import("../../driver.zig").mouse;
 
 // ctx: irq — PS/2 keyboard, IF=0 (tools/ctx_lint.zig root).
 export fn handleIRQ1() callconv(.c) void {

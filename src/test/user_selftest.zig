@@ -13,7 +13,7 @@ const elf_loader = @import("../proc/elf_loader.zig");
 const pmm = @import("../mm/pmm.zig");
 const heap = @import("../mm/heap.zig");
 const vmalloc = @import("../mm/vmalloc.zig");
-const nvme = @import("../driver/nvme.zig");
+const nvme = @import("../driver.zig").nvme;
 const boot_phase = @import("../boot/boot_phase.zig");
 const serial = @import("../debug/serial.zig");
 

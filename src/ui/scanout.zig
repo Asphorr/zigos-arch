@@ -17,9 +17,9 @@
 const gfx = @import("gfx.zig");
 const bga = @import("bga.zig");
 const debug = @import("../debug/debug.zig");
-const virtio_gpu = @import("../driver/virtio_gpu.zig");
-const gpu_kit = @import("../driver/gpu.zig");
-const gop = @import("../driver/gop_fb.zig");
+const virtio_gpu = @import("../driver.zig").virtio_gpu;
+const gpu_kit = @import("../driver.zig").gpu;
+const gop = @import("../driver.zig").gop_fb;
 
 /// Which device won the probe. Callers branch on this for the handful of
 /// device-specific decisions that survive bring-up — chiefly GOP's blit mode,

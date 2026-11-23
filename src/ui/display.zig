@@ -11,8 +11,8 @@
 // Deliberately NOT a vtable/driver-registry: two backends with a strict
 // preference order is an `if`, and the desktop calls these on every frame.
 
-const virtio_gpu = @import("../driver/virtio_gpu.zig");
-const gop = @import("../driver/gop_fb.zig");
+const virtio_gpu = @import("../driver.zig").virtio_gpu;
+const gop = @import("../driver.zig").gop_fb;
 // Frame-time accounting: flush spans are billed to the desktop's current
 // frame ([frameperf]). flushBegin returns 0 (→ flushEnd no-op) when the
 // desktop isn't mid-frame, so boot/compositor-task flushes aren't counted.

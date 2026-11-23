@@ -23,7 +23,7 @@ const devfs = @import("devfs.zig");
 const procfs = @import("procfs.zig");
 const ext2 = @import("ext2/ext2.zig");
 const process = @import("../proc/process.zig");
-const keyboard = @import("../driver/keyboard.zig");
+const keyboard = @import("../driver.zig").keyboard;
 const vga = @import("../ui/vga.zig");
 const pipe = @import("../proc/pipe.zig");
 const tty = @import("../proc/tty.zig");
@@ -1184,7 +1184,7 @@ pub const FreshFile = struct {
 pub fn loadFileFresh(name: []const u8) ?FreshFile {
     const perf = @import("../debug/perf.zig");
     const serial = @import("../debug/serial.zig");
-    const nvme = @import("../driver/nvme.zig");
+    const nvme = @import("../driver.zig").nvme;
     // Per-syscall latency attribution — sysExec, sysExecAs, sysFsize, etc.
     // all bottom out here. Brackets the disk read so slow-sc shows the
     // disk-vs-other split instead of just total ms.

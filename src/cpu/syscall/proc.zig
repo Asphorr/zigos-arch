@@ -4,7 +4,7 @@
 const std = @import("std");
 const vga = @import("../../ui/vga.zig");
 const elf_loader = @import("../../proc/elf_loader.zig");
-const keyboard = @import("../../driver/keyboard.zig");
+const keyboard = @import("../../driver.zig").keyboard;
 const process = @import("../../proc/process.zig");
 const vmm = @import("../../mm/vmm.zig");
 const pmm = @import("../../mm/pmm.zig");
@@ -13,7 +13,7 @@ const bga = @import("../../ui/bga.zig");
 const vfs = @import("../../fs/vfs.zig");
 const file = @import("../../fs/file.zig");
 const desktop = @import("../../ui/desktop.zig");
-const xhci = @import("../../driver/xhci.zig");
+const xhci = @import("../../driver.zig").xhci;
 const debug = @import("../../debug/debug.zig");
 const perf = @import("../../debug/perf.zig");
 const pipe = @import("../../proc/pipe.zig");

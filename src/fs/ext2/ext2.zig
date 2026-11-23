@@ -126,7 +126,7 @@ pub fn init() bool {
 pub fn initAuto() bool {
     if (block.mount(0)) return true;
 
-    const blkdev = @import("../../driver/block.zig");
+    const blkdev = @import("../../driver.zig").block;
     const gpt = @import("../gpt.zig");
     var idx: usize = 0;
     while (idx < blkdev.controllerCount()) : (idx += 1) {

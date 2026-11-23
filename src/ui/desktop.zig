@@ -3,8 +3,8 @@ const Phys = @import("../util/addr.zig").Phys;
 const gfx = @import("gfx.zig");
 const bga = @import("bga.zig");
 const display = @import("display.zig");
-const mouse = @import("../driver/mouse.zig");
-const keyboard = @import("../driver/keyboard.zig");
+const mouse = @import("../driver.zig").mouse;
+const keyboard = @import("../driver.zig").keyboard;
 const vga = @import("vga.zig");
 const cli = @import("../cli.zig");
 const paging = @import("../mm/paging.zig");
@@ -13,11 +13,11 @@ const debug = @import("../debug/debug.zig");
 const elf_loader = @import("../proc/elf_loader.zig");
 const gdt = @import("../cpu/arch/gdt.zig");
 const vmm = @import("../mm/vmm.zig");
-const xhci = @import("../driver/xhci.zig");
+const xhci = @import("../driver.zig").xhci;
 const tarfs = @import("../fs/tarfs.zig");
 const icons = @import("icons.zig");
 const process = @import("../proc/process.zig");
-const sound = @import("../driver/sound.zig");
+const sound = @import("../driver.zig").sound;
 const events_mod = @import("events.zig");
 pub const Event = events_mod.Event;
 pub const EventKind = events_mod.EventKind;
@@ -3834,7 +3834,7 @@ fn blitWindowBounds(idx: u8) void {
 var display_is_gop: bool = false;
 
 fn changeResolution(new_w: u16, new_h: u16) void {
-    const virtio_gpu = @import("../driver/virtio_gpu.zig");
+    const virtio_gpu = @import("../driver.zig").virtio_gpu;
 
     if (display_is_gop) {
         debug.klog("[desktop] resolution change unavailable on GOP scanout (SetMode died with boot services)\n", .{});
@@ -3916,7 +3916,7 @@ pub fn taskEntry() callconv(.c) noreturn {
     // Boot is over — we're in steady-state preemptive multitasking now.
     // Flip the kernel-wide phase flag (paging's boot-only audit consults it).
     @import("../boot/boot_phase.zig").markComplete();
-    @import("../driver/nvme.zig").enableAsync();
+    @import("../driver.zig").nvme.enableAsync();
     run();
     asm volatile ("ud2");
     unreachable;
@@ -3955,8 +3955,8 @@ pub fn run() void {
     @import("vga.zig").clear();
     @import("vga.zig").available = false;
 
-    const virtio_gpu = @import("../driver/virtio_gpu.zig");
-    const gop = @import("../driver/gop_fb.zig");
+    const virtio_gpu = @import("../driver.zig").virtio_gpu;
+    const gop = @import("../driver.zig").gop_fb;
 
     // Device selection (virtio-gpu → BGA → GOP) lives in ui/scanout.zig so the
     // installer boots onto the same display the desktop would have picked.
@@ -4010,7 +4010,7 @@ pub fn run() void {
     }
     if (force_back_buffer) {
         gfx.skip_blit_to_screen = true;
-        @import("../driver/virtio_gpu.zig").skip_external_flush = true;
+        @import("../driver.zig").virtio_gpu.skip_external_flush = true;
         debug.klog("[desktop] Mode 9: blit-to-screen + flush suppressed; GPU compositor owns screen FB\n", .{});
     }
 
@@ -4030,7 +4030,7 @@ pub fn run() void {
     // ID we don't match, an unfamiliar AHCI vendor, etc. On QEMU this should
     // be silent; on real HW it's the first place to look when a device
     // doesn't work.
-    @import("../driver/pci.zig").logUnbound();
+    @import("../driver.zig").pci.logUnbound();
 
     // Spawn wallpaper.elf as a one-shot — reads /etc/zigos.conf, decodes
     // the configured image via stb_image, pushes pixels to the kernel via
@@ -4089,7 +4089,7 @@ pub fn run() void {
     // }
 
     // Initial render
-    const use_hw_cursor = @import("../driver/virtio_gpu.zig").hw_cursor_active;
+    const use_hw_cursor = @import("../driver.zig").virtio_gpu.hw_cursor_active;
 
     renderScene();
     if (backbuf != null) {
@@ -4097,7 +4097,7 @@ pub fn run() void {
         gfx.blitToScreen();
         if (!use_hw_cursor) unbakeCursorFromBackBuffer();
     }
-    if (@import("../driver/virtio_gpu.zig").active) @import("../driver/virtio_gpu.zig").flush();
+    if (@import("../driver.zig").virtio_gpu.active) @import("../driver.zig").virtio_gpu.flush();
 
     active = true;
 
@@ -4659,7 +4659,7 @@ pub fn run() void {
 
         // Hardware cursor: just move, no framebuffer interaction
         if (use_hw_cursor) {
-            const vgpu_cur = @import("../driver/virtio_gpu.zig");
+            const vgpu_cur = @import("../driver.zig").virtio_gpu;
             // App override (setCursorVisible(false) on the focused window) wins
             // over auto-hide heuristics — keeps DOOM-style FPS apps from
             // re-showing the cursor on every mouse move.
@@ -4974,7 +4974,7 @@ pub fn presentWindow(pid: u8) void {
     // frame stamped the SW cursor sprite into the framebuffer regardless of
     // setCursorVisible(false), so the cursor appeared frozen at the last
     // mouse position even with HW cursor "hidden".
-    const vgpu = @import("../driver/virtio_gpu.zig");
+    const vgpu = @import("../driver.zig").virtio_gpu;
     const app_hides = slot_used[wm.focused] and windows[wm.focused].cursor_hidden_by_app;
     if (!vgpu.hw_cursor_active and !app_hides) {
         drawCursorOnScreen();
@@ -5037,8 +5037,8 @@ pub fn destroyGuiWindow(pid: u8) void {
     const wflags = lockWindows();
     defer unlockWindows(wflags);
     // Restore cursor if this process had it hidden
-    if (@import("../driver/virtio_gpu.zig").cursor_hidden) {
-        @import("../driver/virtio_gpu.zig").showCursor();
+    if (@import("../driver.zig").virtio_gpu.cursor_hidden) {
+        @import("../driver.zig").virtio_gpu.showCursor();
     }
     var any_window_for_pid = false;
     // Iterate slots (not z_stack) since removeWindow mutates z_stack and
@@ -5432,7 +5432,7 @@ pub fn setCursorHidden(pid: u8, hidden: bool) void {
     }
     // Apply immediately if that process happens to own the focused window.
     if (slot_used[wm.focused] and windows[wm.focused].owner_pid == pid) {
-        const vgpu = @import("../driver/virtio_gpu.zig");
+        const vgpu = @import("../driver.zig").virtio_gpu;
         if (hidden) vgpu.hideCursor() else vgpu.showCursor();
     }
 }

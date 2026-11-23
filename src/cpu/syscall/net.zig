@@ -4,7 +4,7 @@
 const std = @import("std");
 const vga = @import("../../ui/vga.zig");
 const elf_loader = @import("../../proc/elf_loader.zig");
-const keyboard = @import("../../driver/keyboard.zig");
+const keyboard = @import("../../driver.zig").keyboard;
 const process = @import("../../proc/process.zig");
 const vmm = @import("../../mm/vmm.zig");
 const pmm = @import("../../mm/pmm.zig");
@@ -12,7 +12,7 @@ const paging = @import("../../mm/paging.zig");
 const bga = @import("../../ui/bga.zig");
 const vfs = @import("../../fs/vfs.zig");
 const desktop = @import("../../ui/desktop.zig");
-const xhci = @import("../../driver/xhci.zig");
+const xhci = @import("../../driver.zig").xhci;
 const debug = @import("../../debug/debug.zig");
 const perf = @import("../../debug/perf.zig");
 const pipe = @import("../../proc/pipe.zig");
@@ -66,7 +66,7 @@ const NetInfo = extern struct {
 pub fn sysNetInfo(buf_ptr: u32) u32 {
     if (!validateUserPtrWriteAligned(buf_ptr, @sizeOf(NetInfo), @alignOf(NetInfo))) return E_FAULT;
     const net = @import("../../net/net.zig");
-    const nic = @import("../../driver/nic.zig");
+    const nic = @import("../../driver.zig").nic;
     const info: *NetInfo = @ptrFromInt(@as(usize, buf_ptr));
     info.* = .{
         .local_ip = net.local_ip,

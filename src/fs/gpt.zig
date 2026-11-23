@@ -32,7 +32,7 @@
 
 const std = @import("std");
 
-const block = @import("../driver/block.zig");
+const block = @import("../driver.zig").block;
 const crc32 = @import("../util/crc32.zig");
 const endian = @import("../util/endian.zig");
 const random = @import("../crypto/random.zig");

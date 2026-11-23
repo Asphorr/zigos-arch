@@ -31,7 +31,7 @@ const Phys = @import("../util/addr.zig").Phys;
 const smp = @import("../cpu/smp.zig");
 const serial = @import("../debug/serial.zig");
 const debug = @import("../debug/debug.zig");
-const virtio_gpu = @import("../driver/virtio_gpu.zig");
+const virtio_gpu = @import("../driver.zig").virtio_gpu;
 
 const WORKERS: u32 = 4;
 const ITERATIONS: u32 = 5000;

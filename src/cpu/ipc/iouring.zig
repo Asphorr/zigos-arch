@@ -45,7 +45,7 @@ const lifecycle = @import("../../proc/lifecycle.zig");
 const config = @import("../../config.zig");
 const memmap = @import("../../mm/memmap.zig");
 const heap = @import("../../mm/heap.zig");
-const nvme = @import("../../driver/nvme.zig");
+const nvme = @import("../../driver.zig").nvme;
 const spinlock = @import("../../proc/spinlock.zig");
 const pid_set = @import("../../util/pid_set.zig");
 

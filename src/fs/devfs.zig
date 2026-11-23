@@ -31,7 +31,7 @@
 // bespoke utilities.
 
 const std = @import("std");
-const xhci = @import("../driver/xhci.zig");
+const xhci = @import("../driver.zig").xhci;
 const pmem = @import("../mm/pmem.zig");
 const serial = @import("../debug/serial.zig");
 const random = @import("../crypto/random.zig");

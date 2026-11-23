@@ -7510,7 +7510,7 @@ pub fn intxForPciPin(dev: u8, pin: u8) ?PciIntx {
 /// load-bearing proof that the routing table maps onto real hardware. Run from the
 /// `acpiprt` CLI (after PCI enumeration has populated the device cache).
 pub fn reportPrtPciJoin() void {
-    const pci = @import("../driver/pci.zig");
+    const pci = @import("../driver.zig").pci;
     debug.klog("[acpi] _PRT join with live PCI config (bus 0):\n", .{});
     var matched: u32 = 0;
     var pinned: u32 = 0;

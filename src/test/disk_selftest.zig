@@ -21,7 +21,7 @@
 
 const serial = @import("../debug/serial.zig");
 
-const block = @import("../driver/block.zig");
+const block = @import("../driver.zig").block;
 const gpt = @import("../fs/gpt.zig");
 const ext2_mkfs = @import("../fs/ext2/mkfs.zig");
 const fat_mkfs = @import("../fs/fat32_mkfs.zig");

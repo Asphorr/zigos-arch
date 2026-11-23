@@ -32,7 +32,7 @@ const acpi = @import("../../acpi/acpi.zig");
 const pmm = @import("../../mm/pmm.zig");
 const paging = @import("../../mm/paging.zig");
 const debug = @import("../../debug/debug.zig");
-const pci = @import("../../driver/pci.zig");
+const pci = @import("../../driver.zig").pci;
 const msix = @import("../../time/msix.zig");
 const process = @import("../../proc/process.zig");
 

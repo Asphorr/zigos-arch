@@ -20,7 +20,7 @@
 // stays correct if mkfs's parameters (spc, reserved count) ever change.
 
 const std = @import("std");
-const block = @import("../driver/block.zig");
+const block = @import("../driver.zig").block;
 const fat32 = @import("fat32.zig");
 const debug = @import("../debug/debug.zig");
 

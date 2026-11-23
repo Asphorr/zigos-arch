@@ -14,7 +14,7 @@ const process = @import("../proc/process.zig");
 const elf_loader = @import("../proc/elf_loader.zig");
 const vfs = @import("../fs/vfs.zig");
 const pmm = @import("../mm/pmm.zig");
-const nvme = @import("../driver/nvme.zig");
+const nvme = @import("../driver.zig").nvme;
 const boot_phase = @import("../boot/boot_phase.zig");
 const serial = @import("../debug/serial.zig");
 const lprof = @import("../debug/linux_prof.zig");
@@ -441,7 +441,7 @@ fn dumpTasks(waited: u32) void {
         });
     }
     @import("../net/net.zig").dumpTcp();
-    @import("../driver/nic.zig").dumpState();
+    @import("../driver.zig").nic.dumpState();
 }
 
 fn check(c: Case, run: u32) void {

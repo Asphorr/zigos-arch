@@ -11,7 +11,7 @@
 // compositor's checked submits).
 
 const std = @import("std");
-const virtio_gpu = @import("../driver/virtio_gpu.zig");
+const virtio_gpu = @import("../driver.zig").virtio_gpu;
 
 // --- VkCommandTypeEXT constants ---
 pub const CMD_vkCreateInstance: u32 = 0;

@@ -30,11 +30,11 @@ const aa = @import("aa_font.zig");
 const scanout = @import("scanout.zig");
 const display = @import("display.zig");
 
-const mouse = @import("../driver/mouse.zig");
-const keyboard = @import("../driver/keyboard.zig");
-const xhci = @import("../driver/xhci.zig");
-const block = @import("../driver/block.zig");
-const nvme = @import("../driver/nvme.zig");
+const mouse = @import("../driver.zig").mouse;
+const keyboard = @import("../driver.zig").keyboard;
+const xhci = @import("../driver.zig").xhci;
+const block = @import("../driver.zig").block;
+const nvme = @import("../driver.zig").nvme;
 
 const gpt = @import("../fs/gpt.zig");
 const geom = @import("../util/geom.zig");

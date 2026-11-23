@@ -9,7 +9,7 @@
 // here; if you re-skin one, mirror the change in uefi/menu.zig.
 
 const gfx = @import("../gfx.zig");
-const sound = @import("../../driver/sound.zig");
+const sound = @import("../../driver.zig").sound;
 
 const SPLASH_BG_TOP: u32 = 0x050811;
 const SPLASH_BG_BOT: u32 = 0x0E1525;

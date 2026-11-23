@@ -20,7 +20,7 @@ const process = @import("process.zig");
 const signals = @import("signals.zig");
 const session = @import("session.zig");
 const pipe = @import("pipe.zig");
-const keyboard = @import("../driver/keyboard.zig");
+const keyboard = @import("../driver.zig").keyboard;
 const SpinLock = @import("spinlock.zig").SpinLock;
 
 /// File.tty of a file that is not a terminal.

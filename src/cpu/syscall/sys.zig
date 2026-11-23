@@ -4,7 +4,7 @@
 const std = @import("std");
 const vga = @import("../../ui/vga.zig");
 const elf_loader = @import("../../proc/elf_loader.zig");
-const keyboard = @import("../../driver/keyboard.zig");
+const keyboard = @import("../../driver.zig").keyboard;
 const process = @import("../../proc/process.zig");
 const vmm = @import("../../mm/vmm.zig");
 const pmm = @import("../../mm/pmm.zig");
@@ -12,7 +12,7 @@ const paging = @import("../../mm/paging.zig");
 const bga = @import("../../ui/bga.zig");
 const vfs = @import("../../fs/vfs.zig");
 const desktop = @import("../../ui/desktop.zig");
-const xhci = @import("../../driver/xhci.zig");
+const xhci = @import("../../driver.zig").xhci;
 const debug = @import("../../debug/debug.zig");
 const perf = @import("../../debug/perf.zig");
 const pipe = @import("../../proc/pipe.zig");
@@ -50,7 +50,7 @@ const E_INTR = common.E_INTR;
 pub fn sysAudioWrite(buf_ptr: u32, num_samples: u32) u32 {
     if (num_samples == 0 or num_samples > 8192) return E_INVAL;
     if (!validateUserPtrAligned(buf_ptr, num_samples * 4, 2)) return E_FAULT; // stereo i16 = 4 bytes/sample, 2-byte aligned
-    const sound = @import("../../driver/sound.zig");
+    const sound = @import("../../driver.zig").sound;
     if (!sound.isReady()) return E_INVAL;
     const src: [*]const i16 = @ptrFromInt(@as(usize, buf_ptr));
     sound.writeSamples(src, num_samples);
@@ -189,7 +189,7 @@ pub fn sysShutdown(mode: u32) u32 {
     // Then commit any in-flight NVMe writes to non-volatile storage —
     // without this, the device write cache can lose recent writes on
     // power-off even after fat32.flushAll has drained the OS-side caches.
-    @import("../../driver/nvme.zig").flushAll();
+    @import("../../driver.zig").nvme.flushAll();
 
     if (mode == 1) {
         // Reboot path, preferred order:

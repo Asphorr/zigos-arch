@@ -27,7 +27,7 @@
 
 const std = @import("std");
 const layout = @import("layout.zig");
-const blkdev = @import("../../driver/block.zig");
+const blkdev = @import("../../driver.zig").block;
 const debug = @import("../../debug/debug.zig");
 const pmm = @import("../../mm/pmm.zig");
 const Phys = @import("../../util/addr.zig").Phys;

@@ -1,6 +1,6 @@
 const std = @import("std");
 const vga = @import("ui/vga.zig");
-const keyboard = @import("driver/keyboard.zig");
+const keyboard = @import("driver.zig").keyboard;
 const vfs = @import("fs/vfs.zig");
 const elf_loader = @import("proc/elf_loader.zig");
 const pmm = @import("mm/pmm.zig");
@@ -255,9 +255,9 @@ pub fn execute(cmd: []const u8) void {
         _ = @import("acpi/aml.zig").buildPrt();
         @import("acpi/aml.zig").reportPrtPciJoin();
     } else if (std.mem.eql(u8, cmd, "gpu")) {
-        @import("driver/gpu.zig").report();
+        @import("driver.zig").gpu.report();
     } else if (std.mem.eql(u8, cmd, "uas")) {
-        @import("driver/xhci.zig").uasReport();
+        @import("driver.zig").xhci.uasReport();
     } else if (std.mem.eql(u8, cmd, "thermal")) {
         cmdThermal();
     } else if (std.mem.eql(u8, cmd, "lsblk")) {
@@ -275,7 +275,7 @@ pub fn execute(cmd: []const u8) void {
 // --- Command implementations ---
 
 fn cmdLs() void {
-    const ata = @import("driver/block.zig");
+    const ata = @import("driver.zig").block;
     const tarfs = @import("fs/tarfs.zig");
 
     printSection("TAR Archive (drive 0)");
@@ -490,7 +490,7 @@ fn cmdNeofetch() void {
     vga.fg = .Yellow;
     vga.print("GPU: ", .{});
     vga.fg = .LightGray;
-    if (@import("driver/virtio_gpu.zig").active) {
+    if (@import("driver.zig").virtio_gpu.active) {
         vga.print("virtio-gpu\n", .{});
     } else {
         vga.print("BGA\n", .{});
@@ -618,7 +618,7 @@ fn cmdKill(pid_str: []const u8) void {
 }
 
 fn cmdLsusb() void {
-    const xhci_mod = @import("driver/xhci.zig");
+    const xhci_mod = @import("driver.zig").xhci;
     if (!xhci_mod.isInitialized()) {
         printErr("No xHCI controller found\n", .{});
         return;
@@ -1033,7 +1033,7 @@ fn cmdThermal() void {
 }
 
 fn cmdIpi() void {
-    const vgpu = @import("driver/virtio_gpu.zig");
+    const vgpu = @import("driver.zig").virtio_gpu;
     const proc = @import("proc/process.zig");
     printSection("Wake-IPI delivery audit");
     vga.print("virtio-gpu MSI-X received per CPU:\n", .{});
@@ -1240,7 +1240,7 @@ fn cmdMkdisk(arg: []const u8) void {
 /// is a smoke test, not a checker — the real oracles are the host's e2fsck and
 /// fsck.fat, which know things we do not. It exists to catch the failure mode
 /// where a format writes to the wrong LBA and reports success.
-fn verifyFormats(dev: @import("driver/block.zig").Device, table: @import("fs/gpt.zig").Table) bool {
+fn verifyFormats(dev: @import("driver.zig").block.Device, table: @import("fs/gpt.zig").Table) bool {
     const ext2_layout = @import("fs/ext2/layout.zig");
 
     printSection("Verify");

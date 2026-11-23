@@ -20,9 +20,9 @@ comptime {
     _ = @import("debug/kernel_builtins.zig");
 }
 const fat32 = @import("fs/fat32.zig");
-const keyboard = @import("driver/keyboard.zig");
-const xhci = @import("driver/xhci.zig");
-const nic = @import("driver/nic.zig");
+const keyboard = @import("driver.zig").keyboard;
+const xhci = @import("driver.zig").xhci;
+const nic = @import("driver.zig").nic;
 
 fn enableSSE() void {
     // In 64-bit long mode, SSE/SSE2 is always enabled by the CPU.
@@ -352,11 +352,11 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     @import("cpu/arch/cpuid_info.zig").dumpCpuInfo();
     @import("cpu/arch/cpuid_info.zig").dumpMtrrs();
     // PCI ECAM — uses MCFG if present.
-    @import("driver/pci.zig").applyAcpi();
+    @import("driver.zig").pci.applyAcpi();
     blog.ok("PCI configuration");
     // One-shot bus walk → device cache. Drivers below use the cache
     // instead of re-walking the bus per init() call.
-    @import("driver/pci.zig").enumerate();
+    @import("driver.zig").pci.enumerate();
     blog.ok("PCI bus enumeration");
     // GPU inventory — name every display controller (vendor/family/kind,
     // BAR apertures, PCIe link) into gpu.zig's boot cache. Runs here, before
@@ -369,7 +369,7 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     // engine's own scanout DMA doesn't go through host-side BAR decode.
     // What it must NOT become is a `gpu`-CLI-time poke at a BAR the running
     // compositor draws into — the CLI reads this cache instead.
-    const gpu_count = @import("driver/gpu.zig").init();
+    const gpu_count = @import("driver.zig").gpu.init();
     blog.okNote("GPU inventory", "{d} found", .{gpu_count});
     // IOMMU (Intel VT-d) — identity-translation phase (the comment used
     // to say "pass-through", which is a different context-entry type the
@@ -487,8 +487,8 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     // ---- Phase 4: Storage & filesystems ----------------------------------
     blog.phase(.storage, "\u{25A4}", "Storage & filesystems"); // ▤
     // The klog drain's cheap way out, when QEMU offers a virtconsole.
-    if (@import("driver/virtio_console.zig").init()) blog.ok("virtio console (klog)");
-    @import("driver/block.zig").init();
+    if (@import("driver.zig").virtio_console.init()) blog.ok("virtio console (klog)");
+    @import("driver.zig").block.init();
     blog.ok("Block layer (NVMe/AHCI/IDE)");
     fat32.init();
     blog.ok("FAT32");
@@ -545,7 +545,7 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     // virtio-gpu's sendCmd can now switch from polling to sti+hlt for
     // MSI-X completions — LAPIC is enabled (apic.init in Phase 3), IDT is
     // installed, and IF is now globally on. See msix_safe_to_use comment.
-    @import("driver/virtio_gpu.zig").msix_safe_to_use = true;
+    @import("driver.zig").virtio_gpu.msix_safe_to_use = true;
     blog.ok("Interrupts enabled");
     @import("debug/abi_check.zig").runBootTests();
     blog.ok("ABI self-tests");
@@ -592,7 +592,7 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     } else {
         blog.skip("Network interface", "no NIC found", .{});
     }
-    @import("driver/sound.zig").init();
+    @import("driver.zig").sound.init();
     blog.ok("Sound");
 
     // TLS step-1 spike: confirm std.crypto.{Sha256, ChaCha20Poly1305, X25519}
@@ -993,7 +993,7 @@ fn netdEntry() callconv(.c) noreturn {
     while (true) {
         sched.kernelSleepMs(if (net.busy()) NETD_BUSY_MS else NETD_IDLE_MS);
         // Here alone: its looks must be a period apart.
-        @import("driver/nic.zig").watchdog();
+        @import("driver.zig").nic.watchdog();
         net.poll();
         net.trimRings(net.TCP_RING_SPARE);
     }
@@ -1120,7 +1120,7 @@ fn acpidEntry() callconv(.c) noreturn {
         // rescan; do it here — once — outside the AML interpreter's call stack.
         if (pci_rescan_requested) {
             pci_rescan_requested = false;
-            const added = @import("driver/pci.zig").rescan();
+            const added = @import("driver.zig").pci.rescan();
             if (added != 0) debug.klog("[acpid] PCI hotplug: {d} new device(s) online\n", .{added});
         }
         // A GPE handler that Notify'd a device-specific change (0x80 status / 0x81

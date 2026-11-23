@@ -1,5 +1,5 @@
 const std = @import("std");
-const ata = @import("../driver/block.zig");
+const ata = @import("../driver.zig").block;
 const vga = @import("../ui/vga.zig");
 const debug = @import("../debug/debug.zig");
 const spinlock = @import("../proc/spinlock.zig");

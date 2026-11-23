@@ -4,7 +4,7 @@
 const std = @import("std");
 const vga = @import("../../ui/vga.zig");
 const elf_loader = @import("../../proc/elf_loader.zig");
-const keyboard = @import("../../driver/keyboard.zig");
+const keyboard = @import("../../driver.zig").keyboard;
 const process = @import("../../proc/process.zig");
 const vmm = @import("../../mm/vmm.zig");
 const pmm = @import("../../mm/pmm.zig");
@@ -12,7 +12,7 @@ const paging = @import("../../mm/paging.zig");
 const bga = @import("../../ui/bga.zig");
 const vfs = @import("../../fs/vfs.zig");
 const desktop = @import("../../ui/desktop.zig");
-const xhci = @import("../../driver/xhci.zig");
+const xhci = @import("../../driver.zig").xhci;
 const debug = @import("../../debug/debug.zig");
 const perf = @import("../../debug/perf.zig");
 const pipe = @import("../../proc/pipe.zig");
@@ -67,7 +67,7 @@ const GPU_BLOB_MAX_SIZE: u32 = 256 * 1024 * 1024;
 const GPU_GUEST_BLOB_MAX_SIZE: u32 = 32 * 1024 * 1024;
 
 pub fn sysGpuCtxCreate(capset_id: u32) u32 {
-    const virtio_gpu = @import("../../driver/virtio_gpu.zig");
+    const virtio_gpu = @import("../../driver.zig").virtio_gpu;
     if (!virtio_gpu.has_virgl) {
         debug.klog("[gpu] ctx_create: no virgl support\n", .{});
         return E_INVAL;
@@ -100,7 +100,7 @@ pub fn sysGpuCtxCreate(capset_id: u32) u32 {
 }
 
 pub fn sysGpuSubmit3D(buf_ptr: u32, buf_len: u32) u32 {
-    const virtio_gpu = @import("../../driver/virtio_gpu.zig");
+    const virtio_gpu = @import("../../driver.zig").virtio_gpu;
     if (buf_len == 0 or buf_len > 15 * 4096) return E_INVAL;
     if (!validateUserPtr(buf_ptr, buf_len)) return E_FAULT;
 
@@ -118,7 +118,7 @@ pub fn sysGpuSubmit3D(buf_ptr: u32, buf_len: u32) u32 {
 }
 
 pub fn sysGpuCtxDestroy() u32 {
-    const virtio_gpu = @import("../../driver/virtio_gpu.zig");
+    const virtio_gpu = @import("../../driver.zig").virtio_gpu;
     const pcb = process.currentPCB() orelse return E_FAULT;
     if (!pcb.gpu_has_ctx) return 0;
 
@@ -134,7 +134,7 @@ pub fn sysGpuGetCapsetInfo(index: u32, buf_ptr: u32) u32 {
         debug.klog("[gpu] capset_info[{d}] FAIL: bad user ptr 0x{X}\n", .{ index, buf_ptr });
         return E_INVAL;
     }
-    const virtio_gpu = @import("../../driver/virtio_gpu.zig");
+    const virtio_gpu = @import("../../driver.zig").virtio_gpu;
     if (!virtio_gpu.has_virgl) {
         debug.klog("[gpu] capset_info[{d}] FAIL: no virgl\n", .{index});
         return E_INVAL;
@@ -172,7 +172,7 @@ pub fn sysGpuGetCapsetInfo(index: u32, buf_ptr: u32) u32 {
 }
 
 pub fn sysGpuCreateBlob(blob_mem: u32, size: u32, blob_id_arg: u32) u32 {
-    const virtio_gpu = @import("../../driver/virtio_gpu.zig");
+    const virtio_gpu = @import("../../driver.zig").virtio_gpu;
     if (!virtio_gpu.has_blob) return E_INVAL;
     // Bound the host allocation — see GPU_BLOB_MAX_SIZE. Without this a 1 GiB
     // request reaches the host renderer and pressures the shared venus pool.
@@ -196,7 +196,7 @@ pub fn sysGpuCreateBlob(blob_mem: u32, size: u32, blob_id_arg: u32) u32 {
 }
 
 pub fn sysGpuMapBlob(resource_id: u32, size: u32) u32 {
-    const virtio_gpu = @import("../../driver/virtio_gpu.zig");
+    const virtio_gpu = @import("../../driver.zig").virtio_gpu;
     debug.klog("[gpu] mapBlob: res={d} size={d}\n", .{ resource_id, size });
     if (!virtio_gpu.has_blob) {
         debug.klog("[gpu] mapBlob: no blob support\n", .{});
@@ -271,7 +271,7 @@ pub fn sysGpuMapBlob(resource_id: u32, size: u32) u32 {
 /// pixels to the guest, unlike BLOB_MEM_HOST3D which gives Lavapipe a
 /// disconnected allocation.
 pub fn sysGpuCreateGuestBlob(size: u32, out_resource_id_ptr: u32) u32 {
-    const virtio_gpu = @import("../../driver/virtio_gpu.zig");
+    const virtio_gpu = @import("../../driver.zig").virtio_gpu;
     if (!virtio_gpu.has_blob) return E_INVAL;
     if (size == 0 or size > GPU_GUEST_BLOB_MAX_SIZE) return E_INVAL;
     if (!validateUserPtrWriteAligned(out_resource_id_ptr, 4, 4)) return E_FAULT;
@@ -359,7 +359,7 @@ pub fn sysGpuCreateGuestBlob(size: u32, out_resource_id_ptr: u32) u32 {
 }
 
 pub fn sysGpuResourceCreate3D(params_ptr: u32) u32 {
-    const virtio_gpu = @import("../../driver/virtio_gpu.zig");
+    const virtio_gpu = @import("../../driver.zig").virtio_gpu;
     if (!virtio_gpu.has_virgl) return E_INVAL;
 
     const pcb = process.currentPCB() orelse return E_FAULT;
@@ -395,7 +395,7 @@ pub fn sysGpuResourceCreate3D(params_ptr: u32) u32 {
 }
 
 pub fn sysGpuTransferToHost3D(resource_id: u32, params_ptr: u32) u32 {
-    const virtio_gpu = @import("../../driver/virtio_gpu.zig");
+    const virtio_gpu = @import("../../driver.zig").virtio_gpu;
     if (!virtio_gpu.has_virgl) return E_INVAL;
 
     const pcb = process.currentPCB() orelse return E_FAULT;
@@ -421,7 +421,7 @@ pub fn sysGpuTransferToHost3D(resource_id: u32, params_ptr: u32) u32 {
 /// dmabuf-sharing isn't engaged and Lavapipe writes don't reach the guest
 /// blob on their own — call after vkDeviceWaitIdle, before reading pixels.
 pub fn sysGpuTransferFromHost3D(resource_id: u32, params_ptr: u32) u32 {
-    const virtio_gpu = @import("../../driver/virtio_gpu.zig");
+    const virtio_gpu = @import("../../driver.zig").virtio_gpu;
     if (!virtio_gpu.has_virgl) return E_INVAL;
 
     const pcb = process.currentPCB() orelse return E_FAULT;
@@ -446,7 +446,7 @@ pub fn sysGpuTransferFromHost3D(resource_id: u32, params_ptr: u32) u32 {
 /// (broken-on-this-stack) blob readback path. params: [scanout_id,
 /// width, height, format, stride].
 pub fn sysGpuSetScanoutBlob(resource_id: u32, params_ptr: u32) u32 {
-    const virtio_gpu = @import("../../driver/virtio_gpu.zig");
+    const virtio_gpu = @import("../../driver.zig").virtio_gpu;
     if (!virtio_gpu.has_virgl) return E_INVAL;
     if (!validateUserPtrAligned(params_ptr, 20, 4)) return E_FAULT;
 
@@ -466,7 +466,7 @@ pub fn sysGpuSetScanoutBlob(resource_id: u32, params_ptr: u32) u32 {
 /// Force a re-display of a scanned-out resource. Pair with
 /// setScanoutBlob — call this after every render to push new contents.
 pub fn sysGpuResourceFlush(resource_id: u32, params_ptr: u32) u32 {
-    const virtio_gpu = @import("../../driver/virtio_gpu.zig");
+    const virtio_gpu = @import("../../driver.zig").virtio_gpu;
     if (!virtio_gpu.has_virgl) return E_INVAL;
     if (!validateUserPtrAligned(params_ptr, 8, 4)) return E_FAULT;
 

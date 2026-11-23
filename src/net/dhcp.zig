@@ -18,7 +18,7 @@
 
 const std = @import("std");
 const debug = @import("../debug/debug.zig");
-const nic = @import("../driver/nic.zig");
+const nic = @import("../driver.zig").nic;
 const process = @import("../proc/process.zig");
 const net = @import("net.zig");
 

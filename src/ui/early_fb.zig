@@ -19,7 +19,7 @@
 // On false, callers fall back to VGA text mode rendering.
 
 const gfx = @import("gfx.zig");
-const virtio_gpu = @import("../driver/virtio_gpu.zig");
+const virtio_gpu = @import("../driver.zig").virtio_gpu;
 const boot_info_mod = @import("../boot/boot_info.zig");
 const paging = @import("../mm/paging.zig");
 const serial = @import("../debug/serial.zig");
@@ -49,7 +49,7 @@ pub fn init(boot_info: *const boot_info_mod.BootInfo) bool {
         // post_blit flush copies rows out with stride/byte-order fixup).
         // This matters because real CSM-less UEFI has NO VGA text mode: the
         // old "decline and stay in text" fallback was a dark machine there.
-        const gop = @import("../driver/gop_fb.zig");
+        const gop = @import("../driver.zig").gop_fb;
         if (!gop.init(fb)) {
             serial.print("[early-fb] UEFI GOP unusable (stride={d} width={d} fmt={d}); VGA text, awaiting tryVirtioGpu\n", .{ fb.stride, fb.width, fb.format });
             return false;

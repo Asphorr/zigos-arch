@@ -35,7 +35,7 @@
 
 const std = @import("std");
 
-const block = @import("../../driver/block.zig");
+const block = @import("../../driver.zig").block;
 const layout = @import("layout.zig");
 const random = @import("../../crypto/random.zig");
 

@@ -22,9 +22,9 @@ const io = @import("../io.zig");
 const serial = @import("../debug/serial.zig");
 const common = @import("../cpu/syscall/common.zig");
 const smp = @import("../cpu/smp.zig");
-const virtio_gpu = @import("../driver/virtio_gpu.zig");
-const xhci = @import("../driver/xhci.zig");
-const nvme = @import("../driver/nvme.zig");
+const virtio_gpu = @import("../driver.zig").virtio_gpu;
+const xhci = @import("../driver.zig").xhci;
+const nvme = @import("../driver.zig").nvme;
 
 // Fixed low phys, < 1 MiB: the FACS 32-bit waking vector and the real-mode entry
 // both require it. RAM is preserved across S3, so the blob + slots survive the

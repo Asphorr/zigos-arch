@@ -68,7 +68,7 @@ pub fn draw(info: PanicInfo) void {
             // still drawn into the framebuffer; on UEFI GOP it's directly
             // visible. On virtio-gpu the user sees the last desktop frame
             // — acceptable, serial has the full autopsy.
-            const vgpu = @import("../driver/virtio_gpu.zig");
+            const vgpu = @import("../driver.zig").virtio_gpu;
             if (!vgpu.ctrlLockBusy()) flush();
         }
     }

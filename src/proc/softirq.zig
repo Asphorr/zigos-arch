@@ -186,9 +186,9 @@ pub fn startAll() void {
     // Built-in handlers — registered before any task can drain so the first
     // raise dispatches correctly. These are the existing driver sweep
     // functions, now run from ksoftirqd instead of the IRQ0 tick.
-    register(.nvme, @import("../driver/nvme.zig").tickSweep);
-    register(.virtio_gpu, @import("../driver/virtio_gpu.zig").tickSweep);
-    register(.hid, @import("../driver/xhci.zig").pollHID);
+    register(.nvme, @import("../driver.zig").nvme.tickSweep);
+    register(.virtio_gpu, @import("../driver.zig").virtio_gpu.tickSweep);
+    register(.hid, @import("../driver.zig").xhci.pollHID);
     register(.klog, serial.drainToPort);
     register(.perf_dump, @import("../cpu/idt/irq0.zig").perfDump);
 

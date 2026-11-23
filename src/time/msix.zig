@@ -19,7 +19,7 @@
 // Reference: PCI Local Bus Spec rev 3.0 §6.8.2.
 
 const std = @import("std");
-const pci = @import("../driver/pci.zig");
+const pci = @import("../driver.zig").pci;
 const idt = @import("../cpu/idt.zig");
 const apic = @import("apic.zig");
 const debug = @import("../debug/debug.zig");

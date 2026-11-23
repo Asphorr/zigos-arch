@@ -19,7 +19,7 @@
 
 const std = @import("std");
 
-const block = @import("../driver/block.zig");
+const block = @import("../driver.zig").block;
 const fat32 = @import("fat32.zig");
 const random = @import("../crypto/random.zig");
 

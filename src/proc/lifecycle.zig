@@ -1175,7 +1175,7 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp, persist_shared_dirty: 
     // CID slots (.wake = .pid). wake() against the .zombie is a no-op, so
     // without an explicit reclaim those slots stay active forever and starve
     // the ring. Safe post-kill: a late CQE hits reapCq's orphan branch.
-    @import("../driver/nvme.zig").reclaimWaitersForPid(@intCast(pid));
+    @import("../driver.zig").nvme.reclaimWaitersForPid(@intCast(pid));
 
     // The per-mount ext2 block-cache lock (sleeping) can likewise be held by a
     // thread killed while blocked on NVMe I/O inside readBlock/writeBlock. Left
@@ -1229,7 +1229,7 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp, persist_shared_dirty: 
         const desktop = @import("../ui/desktop.zig");
         desktop.destroyGuiWindow(my_tgid);
         if (lead_res.gpu_has_ctx) {
-            const virtio_gpu = @import("../driver/virtio_gpu.zig");
+            const virtio_gpu = @import("../driver.zig").virtio_gpu;
             if (!virtio_gpu.ctxDestroy(lead_res.gpu_ctx_id)) {
                 debug.klog("[proc] GPU ctx {d} destroy failed for pid {d}\n", .{ lead_res.gpu_ctx_id, my_tgid });
             }

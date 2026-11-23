@@ -27,15 +27,15 @@ const session = @import("../proc/session.zig");
 const pmm = @import("../mm/pmm.zig");
 const smp = @import("../cpu/smp.zig");
 const vfs = @import("vfs.zig");
-const nvme = @import("../driver/nvme.zig");
-const xhci = @import("../driver/xhci.zig");
-const e1000 = @import("../driver/e1000.zig");
-const virtio_net = @import("../driver/virtio_net.zig");
-const virtio_gpu = @import("../driver/virtio_gpu.zig");
-const ahci = @import("../driver/ahci.zig");
+const nvme = @import("../driver.zig").nvme;
+const xhci = @import("../driver.zig").xhci;
+const e1000 = @import("../driver.zig").e1000;
+const virtio_net = @import("../driver.zig").virtio_net;
+const virtio_gpu = @import("../driver.zig").virtio_gpu;
+const ahci = @import("../driver.zig").ahci;
 // `i225` collides with Zig's `iN` arbitrary-width int type (would parse as
 // the type for 225-bit signed integers). Alias under a non-clashing name.
-const i225_drv = @import("../driver/i225.zig");
+const i225_drv = @import("../driver.zig").i225;
 
 pub const Kind = enum(u8) {
     meminfo,

@@ -16,7 +16,7 @@ const process = @import("../../proc/process.zig");
 const debug = @import("../../debug/debug.zig");
 const serial = @import("../../debug/serial.zig");
 const desktop = @import("../../ui/desktop.zig");
-const xhci = @import("../../driver/xhci.zig");
+const xhci = @import("../../driver.zig").xhci;
 const signals = @import("../../proc/signals.zig");
 const perf = @import("../../debug/perf.zig");
 const hrtimer = @import("../../proc/hrtimer.zig");
@@ -358,7 +358,7 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
             bisectPoint("after wakeExpired", frame_for_validate, irq_snap);
             process.deliverDueAlarms();
             bisectPoint("after deliverDueAlarms", frame_for_validate, irq_snap);
-            @import("../../driver/sound.zig").tick();
+            @import("../../driver.zig").sound.tick();
             bisectPoint("after sound.tick", frame_for_validate, irq_snap);
 
             // Device lost-IRQ backstop sweeps (HID, NVMe, virtio-gpu), deferred
@@ -412,8 +412,8 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
             if (process.tick_count >= next_backstop_tick) {
                 next_backstop_tick = process.tick_count + 10;
                 const softirq = @import("../../proc/softirq.zig");
-                const nvme = @import("../../driver/nvme.zig");
-                const virtio_gpu = @import("../../driver/virtio_gpu.zig");
+                const nvme = @import("../../driver.zig").nvme;
+                const virtio_gpu = @import("../../driver.zig").virtio_gpu;
                 if (xhci.hidSweepWanted() and !softirq.raise(.hid)) xhci.pollHID();
                 if (nvme.sweepWanted() and !softirq.raise(.nvme)) nvme.tickSweep();
                 if (virtio_gpu.sweepWanted() and !softirq.raise(.virtio_gpu)) virtio_gpu.tickSweep();
@@ -821,7 +821,7 @@ fn rearmTimerForCurrent(cpu: *smp.CpuLocal) void {
             bump(&st.clamp_iowait);
         } else if (cpu.cpu_id != 0) {
             quanta = IDLE_STRETCH_QUANTA;
-        } else if (@import("../../driver/sound.zig").needsTick()) {
+        } else if (@import("../../driver.zig").sound.needsTick()) {
             bump(&st.clamp_sound);
         } else {
             const tc = process.tick_count;

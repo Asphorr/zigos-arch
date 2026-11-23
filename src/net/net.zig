@@ -1,6 +1,6 @@
 const std = @import("std");
 const vga = @import("../ui/vga.zig");
-const nic = @import("../driver/nic.zig");
+const nic = @import("../driver.zig").nic;
 const debug = @import("../debug/debug.zig");
 const process = @import("../proc/process.zig");
 const SpinLock = @import("../proc/spinlock.zig").SpinLock;
