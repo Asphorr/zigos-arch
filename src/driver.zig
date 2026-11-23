@@ -13,10 +13,10 @@ pub const ata = @import("driver/block/ata.zig");
 
 // Network cards.
 pub const nic = @import("driver/nic.zig");
-pub const e1000 = @import("driver/e1000.zig");
+pub const e1000 = @import("driver/nic/e1000.zig");
 // @"": i225 is also a primitive type, a 225-bit integer. `.i225` reads it.
-pub const @"i225" = @import("driver/i225.zig");
-pub const virtio_net = @import("driver/virtio_net.zig");
+pub const @"i225" = @import("driver/nic/i225.zig");
+pub const virtio_net = @import("driver/nic/virtio_net.zig");
 
 // Display.
 pub const gpu = @import("driver/gpu.zig");

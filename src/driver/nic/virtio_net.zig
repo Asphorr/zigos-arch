@@ -18,16 +18,16 @@
 // A purely-legacy-only device (no modern caps) is no longer supported — every
 // real-world virtio-net (QEMU, KVM, Hyper-V) has been transitional since 2014.
 
-const pci = @import("bus/pci.zig");
-const pmm = @import("../mm/pmm.zig");
-const paging = @import("../mm/paging.zig");
-const msix = @import("../time/msix.zig");
-const debug = @import("../debug/debug.zig");
-const net = @import("../net/net.zig");
-const virtio = @import("bus/virtio.zig");
-const iommu = @import("../cpu/mmu/iommu.zig");
-const Deadline = @import("../util/deadline.zig").Deadline;
-const SpinLock = @import("../proc/spinlock.zig").SpinLock;
+const pci = @import("../bus/pci.zig");
+const pmm = @import("../../mm/pmm.zig");
+const paging = @import("../../mm/paging.zig");
+const msix = @import("../../time/msix.zig");
+const debug = @import("../../debug/debug.zig");
+const net = @import("../../net/net.zig");
+const virtio = @import("../bus/virtio.zig");
+const iommu = @import("../../cpu/mmu/iommu.zig");
+const Deadline = @import("../../util/deadline.zig").Deadline;
+const SpinLock = @import("../../proc/spinlock.zig").SpinLock;
 
 const VirtqDesc = virtio.VirtqDesc;
 const Virtqueue = virtio.Queue;

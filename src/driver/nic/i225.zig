@@ -28,14 +28,14 @@
 // MSI-X handler, dispatched to net.handleRxFrame. send() spins briefly
 // for a free TX descriptor.
 
-const io = @import("../io.zig");
-const pci = @import("bus/pci.zig");
-const pmm = @import("../mm/pmm.zig");
-const paging = @import("../mm/paging.zig");
-const msix = @import("../time/msix.zig");
-const debug = @import("../debug/debug.zig");
-const net = @import("../net/net.zig");
-const Deadline = @import("../util/deadline.zig").Deadline;
+const io = @import("../../io.zig");
+const pci = @import("../bus/pci.zig");
+const pmm = @import("../../mm/pmm.zig");
+const paging = @import("../../mm/paging.zig");
+const msix = @import("../../time/msix.zig");
+const debug = @import("../../debug/debug.zig");
+const net = @import("../../net/net.zig");
+const Deadline = @import("../../util/deadline.zig").Deadline;
 
 const I225_VENDOR: u16 = 0x8086;
 // Most-common SKUs across I225 + I226 families. The driver doesn't care
@@ -240,7 +240,7 @@ var tx_next: u32 = 0;
 var pending_rx_idx: u32 = 0;
 var pending_rx_active: bool = false;
 
-const SpinLock = @import("../proc/spinlock.zig").SpinLock;
+const SpinLock = @import("../../proc/spinlock.zig").SpinLock;
 var tx_lock: SpinLock = .{};
 var rx_lock: SpinLock = .{};
 

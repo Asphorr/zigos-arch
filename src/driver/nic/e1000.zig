@@ -22,17 +22,17 @@
 // Module surface mirrors virtio_net.zig — init/isReady/send/recv/
 // rxRelease/getMac — so nic.zig can switch between the two transparently.
 
-const io = @import("../io.zig");
-const pci = @import("bus/pci.zig");
-const pmm = @import("../mm/pmm.zig");
-const paging = @import("../mm/paging.zig");
-const msix = @import("../time/msix.zig");
-const debug = @import("../debug/debug.zig");
-const serial = @import("../debug/serial.zig");
-const net = @import("../net/net.zig");
-const iommu = @import("../cpu/mmu/iommu.zig");
-const Deadline = @import("../util/deadline.zig").Deadline;
-const dma = @import("../util/dma.zig");
+const io = @import("../../io.zig");
+const pci = @import("../bus/pci.zig");
+const pmm = @import("../../mm/pmm.zig");
+const paging = @import("../../mm/paging.zig");
+const msix = @import("../../time/msix.zig");
+const debug = @import("../../debug/debug.zig");
+const serial = @import("../../debug/serial.zig");
+const net = @import("../../net/net.zig");
+const iommu = @import("../../cpu/mmu/iommu.zig");
+const Deadline = @import("../../util/deadline.zig").Deadline;
+const dma = @import("../../util/dma.zig");
 
 const E1000_VENDOR: u16 = 0x8086;
 
@@ -239,7 +239,7 @@ pub fn watchdog() void {
         :
         : .{ .memory = true });
     defer if (flags & 0x200 != 0) asm volatile ("sti" ::: .{ .memory = true });
-    if (@import("../cpu/smp.zig").myCpu().lapic_id != 0) return;
+    if (@import("../../cpu/smp.zig").myCpu().lapic_id != 0) return;
     polled_assists += 1;
     e1000IrqHandler();
 }
@@ -267,21 +267,21 @@ pub fn dumpState() void {
         pci.configRead16(pci_bus, pci_dev, pci_func, 0x06),
         if (pci.configRead16(pci_bus, pci_dev, pci_func, 0x06) & 0x8 != 0) "asserted" else "quiet",
     });
-    if (intx_gsi) |g| @import("../time/apic.zig").dumpGsi(g);
+    if (intx_gsi) |g| @import("../../time/apic.zig").dumpGsi(g);
 }
 
 /// The legacy INTx pin, routed per ACPI _PRT, for a NIC without MSI.
 fn armIntx(d: pci.PciDevice) bool {
     const pin: u8 = @truncate(pci.configRead16(d.bus, d.dev, d.func, 0x3C) >> 8);
     if (pin == 0 or pin > 4 or d.bus != 0) return false; // _PRT covers bus 0
-    const intx = @import("../acpi/aml.zig").intxForPciPin(d.dev, pin - 1) orelse return false;
+    const intx = @import("../../acpi/aml.zig").intxForPciPin(d.dev, pin - 1) orelse return false;
     const gsi = intx.gsi;
-    const dynirq = @import("../cpu/idt/dynirq.zig");
+    const dynirq = @import("../../cpu/idt/dynirq.zig");
     const vec = dynirq.allocDynVector() orelse return false;
     dynirq.registerIrq(vec, &e1000IrqHandler);
     intx_vec = vec;
     intx_gsi = gsi;
-    if (!@import("../time/apic.zig").routePciIntx(gsi, vec, intx.low)) {
+    if (!@import("../../time/apic.zig").routePciIntx(gsi, vec, intx.low)) {
         intx_gsi = null;
         return false;
     }
@@ -324,7 +324,7 @@ fn e1000IrqHandler() callconv(.c) void {
                 mmioWrite(REG_IMC, ICR_RXT0);
                 const cmd = pci.configRead16(pci_bus, pci_dev, pci_func, 0x04);
                 pci.configWrite16(pci_bus, pci_dev, pci_func, 0x04, cmd | 0x0400);
-                @import("../time/apic.zig").maskPciIntx(gsi, intx_vec);
+                @import("../../time/apic.zig").maskPciIntx(gsi, intx_vec);
                 intx_gsi = null;
                 irq_driven = false;
                 debug.klog("[e1000] INTx GSI{d}: {d} foreign interrupts in a row, masked; polled mode\n", .{ gsi, INTX_STORM });
@@ -414,7 +414,7 @@ var pending_rx_active: bool = false;
 // sequence. Without these, two CPUs sending concurrently grab the same tx_next
 // slot and clobber each other's descriptor (same bug class as ata.readSectors
 // missing the lock — produced corrupted DMA buffers).
-const SpinLock = @import("../proc/spinlock.zig").SpinLock;
+const SpinLock = @import("../../proc/spinlock.zig").SpinLock;
 var tx_lock: SpinLock = .{};
 var rx_lock: SpinLock = .{};
 

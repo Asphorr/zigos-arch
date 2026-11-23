@@ -6,9 +6,9 @@
 // First driver whose init() returns true wins. Backends added here just
 // need init/isReady/send/recv/rxRelease/getMac.
 
-const virtio_net = @import("virtio_net.zig");
-const igc = @import("i225.zig");
-const e1000 = @import("e1000.zig");
+const virtio_net = @import("nic/virtio_net.zig");
+const igc = @import("nic/i225.zig");
+const e1000 = @import("nic/e1000.zig");
 const debug = @import("../debug/debug.zig");
 
 const Backend = enum { none, virtio, igc, e1000 };
