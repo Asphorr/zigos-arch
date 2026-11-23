@@ -216,6 +216,7 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     blog.ok("LBR enabled");
     @import("syscall/entry.zig").init();
     @import("syscall/entry.zig").verifyMsrs("BSP");
+    @import("ui/gui_window.zig").registerLocks();
     blog.ok("Syscall/sysret MSRs");
     // SMEP/UMIP — safe to enable on BSP now. SMAP is deferred until
     // desktop.taskEntry has dropped the low-half identity map, because

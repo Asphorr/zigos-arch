@@ -1224,15 +1224,17 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp, persist_shared_dirty: 
     // when the last dier is a WORKER (lead exited earlier and sits pinned as
     // a zombie), indexing by pid freed the worker's (empty) fields and
     // leaked the lead's window/ctx/symbols.
+    //
+    // A GUI window goes with the task that made it (ui/gui_window.zig).
+    if (!last_in_group) @import("../ui/gui_window.zig").taskEnded(@intCast(pid));
     if (last_in_group) {
         const lead_res = &process.procs[my_tgid];
         const desktop = @import("../ui/desktop.zig");
-        desktop.destroyGuiWindow(my_tgid);
+        // Every window of the group, one a member ending beside us has yet
+        // to take included. Its framebuffer and GPU slot are released
+        // further down, once the address space is gone.
+        _ = desktop.destroyGuiWindow(.{ .group = my_tgid });
         const virtio_gpu = @import("../driver.zig").virtio_gpu;
-        // Blobs the group mapped (sysGpuMapBlob): the host unmaps them and
-        // their hostmem ranges go back. No thread is left to touch them.
-        // Not under gpu_has_ctx: they outlive sysGpuCtxDestroy.
-        virtio_gpu.releaseOwnedBlobs(virtio_gpu.BlobOwner.process(my_tgid));
         if (lead_res.gpu_has_ctx) {
             if (!virtio_gpu.ctxDestroy(lead_res.gpu_ctx_id)) {
                 debug.klog("[proc] GPU ctx {d} destroy failed for pid {d}\n", .{ lead_res.gpu_ctx_id, my_tgid });
@@ -1313,6 +1315,18 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp, persist_shared_dirty: 
         }
         lead.regions.deinit();
         lead.heap_start = 0;
+    }
+
+    // The group's memory in the GPU's host-memory window: the blobs it
+    // mapped (sysGpuMapBlob; they outlive sysGpuCtxDestroy, so not under
+    // gpu_has_ctx) and its windows' GPU compositor slots. Those pages go to
+    // another process next, so only now, with the address space that mapped
+    // them destroyed: until then a kernel copy made for the group (an
+    // io_uring worker's) could still land in them.
+    if (last_in_group) {
+        const virtio_gpu = @import("../driver.zig").virtio_gpu;
+        virtio_gpu.releaseOwnedBlobs(virtio_gpu.BlobOwner.process(my_tgid));
+        @import("../ui/gpu_compositor.zig").releaseWindowImagesOf(my_tgid);
     }
 
     // Per-thread: drop the borrowed page directory pointer so a future

@@ -382,7 +382,9 @@ var side_cs: venus.CmdStream = .{};
 // which the Venus context samples. Each allocation takes the next
 // WINDOW_SLOT_STRIDE ids from WINDOW_SLOT_ID_BASE: the texture's five
 // (image, view, mem, staging buffer, staging mem), then the descriptor
-// set. Clear of COMPOSITOR_RING (500).
+// set if the slot has none yet. Ids are never reused: one whose object
+// may still exist on the host cannot be created over. Clear of
+// COMPOSITOR_RING (500).
 const WINDOW_SLOT_ID_BASE: u64 = 1000;
 const WINDOW_SLOT_STRIDE: u64 = 8;
 var next_window_ids: u64 = WINDOW_SLOT_ID_BASE;
@@ -503,12 +505,26 @@ const TextureIds = struct {
     staging_mem: u64 = 0,
 };
 
+/// The members of a TextureIds the host is known to hold: set once a reply
+/// has shown the object exists. destroyTexture names only these (an id the
+/// host does not hold is fatal for the context), so an object whose
+/// creation was cut short is left behind rather than guessed at.
+const TextureParts = packed struct {
+    image: bool = false,
+    view: bool = false,
+    mem: bool = false,
+    staging_buf: bool = false,
+    staging_mem: bool = false,
+};
+
 const Texture = struct {
     ids: TextureIds = .{},
+    made: TextureParts = .{},
     w: u32 = 0,
     h: u32 = 0,
     /// Row stride in pixels of the CPU-visible side.
     row_pixels: u32 = 0,
+    /// The blob behind the CPU-visible side; 0 = none.
     res_id: u32 = 0,
     kptr: ?[*]volatile u8 = null,
     phys: Phys = Phys.of(0),
@@ -530,29 +546,64 @@ var focused_tex: Texture = .{};
 // In typical apps mem_w == width (just height differs), so the
 // image's natural rowPitch matches the memory's row stride and apps
 // can write into the dmabuf directly.
-pub const WindowSlot = struct {
-    in_use: bool = false,
+//
+// A slot belongs to the thread group that asked for it, from
+// allocateWindowImage until the group gives it up: releaseWindowImage once
+// the window is gone and the group no longer maps the memory, or
+// releaseWindowImagesOf when the group exits. Giving up only marks the slot;
+// the compositor task then destroys what it holds on the host and frees it
+// (reapRetiredSlots), so no dying or killed task ever talks to the host for
+// it, and the slot's memory is not handed out again before that.
+const SlotState = enum(u8) {
+    free,
+    /// allocateWindowImage is filling it in (venus_lock). A slot stuck here
+    /// had its builder killed; the group's exit retires it.
+    building,
+    live,
+    /// Given up, waiting for the compositor task.
+    retired,
+};
+
+const WindowSlot = struct {
+    /// free → building and retired → free under venus_lock; building → live
+    /// by the builder; live or building → retired by the owner, lock-free.
+    state: SlotState = .free,
+    /// Thread group it was allocated for. Written before `state` leaves free.
+    owner: u8 = 0,
     width: u32 = 0,                  // image extent width (visible / sampled)
     height: u32 = 0,                 // image extent height (visible / sampled)
     mem_w: u32 = 0,                  // memory layout width (16-aligned)
     mem_h: u32 = 0,                  // memory layout height
     pitch_pixels: u32 = 0,           // row stride in pixels — equals mem_w
-    res_id: u32 = 0,                 // virtio-gpu resource id (HOST3D blob)
-    desc_set_id: u64 = 0,            // Venus descriptor set handle
-    kernel_ptr: ?[*]volatile u8 = null,
-    phys: Phys = Phys.of(0),         // SHM-BAR phys for user-space mapping
-    mem_bytes: u64 = 0,              // total allocation size (page-rounded)
-    tex_ids: TextureIds = .{},       // for the per-frame upload (!direct_sources)
+    /// The image and its memory, as far as they got built (Texture.made).
+    tex: Texture = .{},
+    /// Allocated the first time the slot is used and kept for its next
+    /// windows: the pool cannot free single sets. 0 = not yet.
+    desc_set_id: u64 = 0,
+    mem_bytes: u64 = 0,              // what the app maps (page-rounded)
     // The window's content is re-read when the desktop has taken up a new
     // frame of it (Window.content_seq), not on every frame. source_lock.
     seen_seq: u32 = 0,
     fresh: bool = true,              // nothing read yet
     changed: bool = false,           // this frame re-reads and redraws it
+
+    fn live(self: *const WindowSlot) bool {
+        return @atomicLoad(SlotState, &self.state, .acquire) == .live;
+    }
 };
-pub var window_slots: [MAX_WINDOW_SLOTS]WindowSlot = blk: {
-    var x: [MAX_WINDOW_SLOTS]WindowSlot = undefined;
-    for (&x) |*s| s.* = .{};
-    break :blk x;
+var window_slots: [MAX_WINDOW_SLOTS]WindowSlot = @splat(.{});
+/// Slots in `retired`; what wakes the compositor task to reap them.
+var retired_slots: u32 = 0;
+
+/// What sysCreateWindow gets for a window drawn through a slot: the app's
+/// framebuffer is the slot image's memory.
+pub const WindowImage = struct {
+    slot: u8,
+    /// The framebuffer through the kernel's mapping.
+    fb: [*]volatile u32,
+    /// Where the pages are, for the user mapping, and how many bytes of them.
+    phys: Phys,
+    bytes: u64,
 };
 
 // Cached focused-window screen rect (scaled to render image coords)
@@ -727,7 +778,7 @@ fn takeDamage() void {
         const w_ref = &wm.windows[wi];
         if (!w_ref.visible or w_ref.minimized) continue;
         const slot_idx = w_ref.gpu_slot orelse continue;
-        if (slot_idx >= MAX_WINDOW_SLOTS or !window_slots[slot_idx].in_use) continue;
+        if (slot_idx >= MAX_WINDOW_SLOTS or !window_slots[slot_idx].live()) continue;
         const sl = &window_slots[slot_idx];
         sl.changed = frame_damage.full or sl.fresh or sl.seen_seq != w_ref.content_seq;
         if (!sl.changed) continue;
@@ -1013,8 +1064,8 @@ fn fillWindowSlots() void {
         const slot_idx = w.gpu_slot orelse continue;
         if (slot_idx >= MAX_WINDOW_SLOTS) continue;
         const sl = &window_slots[slot_idx];
-        if (!sl.in_use or !sl.changed) continue;
-        const dst_raw = sl.kernel_ptr orelse continue;
+        if (!sl.live() or !sl.changed) continue;
+        const dst_raw = sl.tex.kptr orelse continue;
         const dst: [*]volatile u32 = @ptrCast(@alignCast(dst_raw));
 
         // Phase B.2: when gui_fb IS the slot's kernel mapping (user-
@@ -1380,13 +1431,22 @@ fn mapMemoryBlob(mem_id: u64, size: u64, name: []const u8) ?MappedBlob {
     };
     if (!virtio_gpu.ctxAttachResource(COMPOSITOR_CTX_ID, res_id)) {
         debug.klog("[gpu-comp] {s}: ctxAttachResource FAILED\n", .{name});
+        _ = virtio_gpu.resourceUnref(res_id);
         return null;
     }
     const phys = virtio_gpu.resourceMapBlob(res_id, @intCast(size), .kernel) orelse {
         debug.klog("[gpu-comp] {s}: resourceMapBlob FAILED\n", .{name});
+        _ = virtio_gpu.resourceUnref(res_id);
         return null;
     };
     return .{ .res_id = res_id, .phys = phys, .kind = kind };
+}
+
+/// Take blob `res_id` out of the SHM BAR and drop it on the host (which
+/// detaches it from the context).
+fn releaseBlob(res_id: u32) void {
+    _ = virtio_gpu.resourceUnmapBlob(res_id, .kernel);
+    _ = virtio_gpu.resourceUnref(res_id);
 }
 
 /// One-shot submit on COMPOSITOR_CMD_BUF: UNDEFINED → GENERAL for a source
@@ -1418,12 +1478,16 @@ fn transitionSourceImage(image: u64, name: []const u8) bool {
     return endCheckedResult(name, venus.CMD_vkWaitForFences);
 }
 
-/// Create a w×h B8G8R8A8 source texture with its view, CPU-visible side
-/// mapped in the SHM BAR, and layout GENERAL. See `direct_sources`.
-/// `cpu_reads`: the CPU also reads that side back (the desktop's backbuf).
-fn createTexture(ids: TextureIds, w: u32, h: u32, cpu_reads: bool, name: []const u8) ?Texture {
+/// Build into `tex` (empty) a w×h B8G8R8A8 source texture with its view,
+/// CPU-visible side mapped in the SHM BAR, and layout GENERAL. See
+/// `direct_sources`. `cpu_reads`: the CPU also reads that side back (the
+/// desktop's backbuf). On false, `tex` records what did get built, for
+/// destroyTexture: each part is noted as soon as a reply proves it exists,
+/// so the record also holds if the caller is killed half way.
+fn createTexture(tex: *Texture, ids: TextureIds, w: u32, h: u32, cpu_reads: bool, name: []const u8) bool {
     const cpu_bytes = pageAlign(@as(u64, w) * h * 4);
     const fmt = venus.VK_FORMAT_B8G8R8A8_UNORM;
+    tex.* = .{ .ids = ids, .w = w, .h = h, .row_pixels = w };
 
     scratch_cs.reset();
     if (direct_sources) {
@@ -1431,8 +1495,10 @@ fn createTexture(ids: TextureIds, w: u32, h: u32, cpu_reads: bool, name: []const
     } else {
         venus.encodeCreateImageExportable(&scratch_cs, COMPOSITOR_DEVICE, w, h, fmt, venus.VK_IMAGE_USAGE_SAMPLED_BIT | venus.VK_IMAGE_USAGE_TRANSFER_DST_BIT, ids.image);
     }
-    if (!submitFireAndForget(&scratch_cs)) return null;
-    const image_req = imageRequirements(ids.image, name) orelse return null;
+    if (!submitFireAndForget(&scratch_cs)) return false;
+    // Its reply is what shows the image was created.
+    const image_req = imageRequirements(ids.image, name) orelse return false;
+    tex.made.image = true;
 
     var mapped_mem = ids.mem;
     var mapped_bytes: u64 = undefined;
@@ -1440,49 +1506,99 @@ fn createTexture(ids: TextureIds, w: u32, h: u32, cpu_reads: bool, name: []const
         // The CPU writes rows of `w` texels into the image memory itself
         // (Lavapipe's LINEAR row pitch for 16-aligned widths).
         mapped_bytes = @max(pageAlign(image_req.size), cpu_bytes);
-        if (!allocateMemory(ids.mem, mapped_bytes, image_req, HOST_MAPPED, 0, 0, name)) return null;
+        if (!allocateMemory(ids.mem, mapped_bytes, image_req, HOST_MAPPED, 0, 0, name)) return false;
+        tex.made.mem = true;
     } else {
-        if (!allocateMemory(ids.mem, image_req.size, image_req, 0, venus.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, name)) return null;
+        if (!allocateMemory(ids.mem, image_req.size, image_req, 0, venus.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, name)) return false;
+        tex.made.mem = true;
         scratch_cs.reset();
         venus.encodeCreateBufferExportable(&scratch_cs, COMPOSITOR_DEVICE, cpu_bytes, venus.VK_BUFFER_USAGE_TRANSFER_SRC_BIT, ids.staging_buf);
-        if (!submitFireAndForget(&scratch_cs)) return null;
-        const staging_req = bufferRequirements(ids.staging_buf, name) orelse return null;
+        if (!submitFireAndForget(&scratch_cs)) return false;
+        const staging_req = bufferRequirements(ids.staging_buf, name) orelse return false;
+        tex.made.staging_buf = true;
         // CPU writes, GPU reads once: uncached (write-combined) when
         // offered, unless the CPU reads it too.
         mapped_bytes = @max(pageAlign(staging_req.size), cpu_bytes);
         const cached = venus.VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
-        if (!allocateMemory(ids.staging_mem, mapped_bytes, staging_req, HOST_MAPPED, if (cpu_reads) cached else 0, if (cpu_reads) 0 else cached, name)) return null;
+        if (!allocateMemory(ids.staging_mem, mapped_bytes, staging_req, HOST_MAPPED, if (cpu_reads) cached else 0, if (cpu_reads) 0 else cached, name)) return false;
+        tex.made.staging_mem = true;
         mapped_mem = ids.staging_mem;
     }
 
-    scratch_cs.reset();
+    // The blob before the binds: what is likeliest to fail here (no room in
+    // the SHM BAR, host memory) then leaves only objects already confirmed.
+    const blob = mapMemoryBlob(mapped_mem, mapped_bytes, name) orelse return false;
+    tex.phys = blob.phys;
+    tex.kptr = @ptrFromInt(blob.phys.toVirt().raw());
+    tex.bytes = mapped_bytes;
+    tex.res_id = blob.res_id;
+
+    beginChecked();
     venus.encodeBindImageMemory(&scratch_cs, COMPOSITOR_DEVICE, ids.image, ids.mem, 0);
     if (!direct_sources) venus.encodeBindBufferMemory(&scratch_cs, COMPOSITOR_DEVICE, ids.staging_buf, ids.staging_mem, 0);
+    const view_at = scratch_cs.pos;
     venus.encodeCreateImageView(&scratch_cs, COMPOSITOR_DEVICE, ids.image, fmt, venus.VK_IMAGE_ASPECT_COLOR_BIT, ids.view);
-    if (!submitFireAndForget(&scratch_cs)) return null;
+    markReply(view_at);
+    if (!endCheckedResult(name, venus.CMD_vkCreateImageView)) return false;
+    tex.made.view = true;
 
-    const blob = mapMemoryBlob(mapped_mem, mapped_bytes, name) orelse return null;
-    if (!transitionSourceImage(ids.image, name)) return null;
-    return .{
-        .ids = ids,
-        .w = w,
-        .h = h,
-        .row_pixels = w,
-        .res_id = blob.res_id,
-        .kptr = @ptrFromInt(blob.phys.toVirt().raw()),
-        .phys = blob.phys,
-        .bytes = mapped_bytes,
-    };
+    return transitionSourceImage(ids.image, name);
+}
+
+/// Destroy what `tex` holds on the host — the objects its record names, then
+/// the blob — and leave it empty. Nothing may be using it: no frame in
+/// flight samples it, and nothing maps the blob's pages any more. Caller
+/// holds venus_lock.
+fn destroyTexture(tex: *Texture, name: []const u8) void {
+    const made = tex.made;
+    const any = made.image or made.view or made.mem or made.staging_buf or made.staging_mem;
+    // Out of the guest's address space before the memory behind it is freed.
+    if (tex.res_id != 0) releaseBlob(tex.res_id);
+    // A context that failed a frame may still be running it, or be dead:
+    // its objects go with it.
+    if (any and vulkan_render_ready) {
+        scratch_cs.reset();
+        if (made.view) venus.encodeDestroyImageView(&scratch_cs, COMPOSITOR_DEVICE, tex.ids.view);
+        if (made.image) venus.encodeDestroyImage(&scratch_cs, COMPOSITOR_DEVICE, tex.ids.image);
+        if (made.staging_buf) venus.encodeDestroyBuffer(&scratch_cs, COMPOSITOR_DEVICE, tex.ids.staging_buf);
+        if (made.mem) venus.encodeFreeMemory(&scratch_cs, COMPOSITOR_DEVICE, tex.ids.mem);
+        if (made.staging_mem) venus.encodeFreeMemory(&scratch_cs, COMPOSITOR_DEVICE, tex.ids.staging_mem);
+        appendReplyMarker();
+        switch (submitChecked(REPLY_TIMEOUT_MS)) {
+            .replied => {},
+            // None of it ran, or all of it (acceptance lost): sent again it
+            // could destroy an id the host no longer knows, fatal to the
+            // context. The ids are never handed out again; at worst the
+            // objects stay with the context.
+            .not_sent => debug.klog("[gpu-comp] {s}: destroy not sent, objects left to the context\n", .{name}),
+            // The host did not get through a stream of plain destroys: the
+            // context is gone, and a frame would only wait the same way.
+            .no_reply => {
+                debug.klog("[gpu-comp] {s}: destroy got no reply — GPU path off\n", .{name});
+                vulkan_render_ready = false;
+            },
+        }
+    }
+    tex.* = .{};
+}
+
+/// Allocate descriptor set `set_id` from the pool.
+fn allocateDescriptorSet(set_id: u64, name: []const u8) bool {
+    beginChecked();
+    venus.encodeAllocateDescriptorSet(&scratch_cs, COMPOSITOR_DEVICE, COMPOSITOR_DESC_POOL, COMPOSITOR_DESC_SET_LAYOUT, set_id);
+    return endCheckedResult(name, venus.CMD_vkAllocateDescriptorSets);
+}
+
+/// Point descriptor set `set_id` at `view` (layout GENERAL).
+fn pointDescriptorSet(set_id: u64, view: u64) bool {
+    scratch_cs.reset();
+    venus.encodeUpdateDescriptorSetSampler(&scratch_cs, COMPOSITOR_DEVICE, set_id, COMPOSITOR_SAMPLER, view, 1);
+    return submitFireAndForget(&scratch_cs);
 }
 
 /// Allocate descriptor set `set_id` and point it at `view`.
 fn createDescriptorSet(set_id: u64, view: u64, name: []const u8) bool {
-    beginChecked();
-    venus.encodeAllocateDescriptorSet(&scratch_cs, COMPOSITOR_DEVICE, COMPOSITOR_DESC_POOL, COMPOSITOR_DESC_SET_LAYOUT, set_id);
-    if (!endCheckedResult(name, venus.CMD_vkAllocateDescriptorSets)) return false;
-    scratch_cs.reset();
-    venus.encodeUpdateDescriptorSetSampler(&scratch_cs, COMPOSITOR_DEVICE, set_id, COMPOSITOR_SAMPLER, view, 1); // GENERAL
-    return submitFireAndForget(&scratch_cs);
+    return allocateDescriptorSet(set_id, name) and pointDescriptorSet(set_id, view);
 }
 
 /// Record the staging → image upload of `rects` (no-op for direct sources).
@@ -1772,10 +1888,12 @@ fn setupVulkanRender() bool {
         scratch_cs.reset();
         venus.encodeCreateDescriptorSetLayoutSampler(&scratch_cs, COMPOSITOR_DEVICE, COMPOSITOR_DESC_SET_LAYOUT);
         // Pool sized for: 2 legacy sets (background + focused-overlay,
-        // currently disabled) + MAX_WINDOW_SLOTS for per-window textures
-        // (step 9.4). Each set has 1 combined image sampler, so
+        // currently disabled) + one per window slot, kept for the slot's
+        // life (step 9.4), and as many again to spare: a set whose
+        // allocation was cut short (its task killed before the reply) is
+        // lost to the pool. Each set has 1 combined image sampler, so
         // descriptorCount == max_sets.
-        const pool_size: u32 = 2 + @as(u32, MAX_WINDOW_SLOTS);
+        const pool_size: u32 = 2 + 2 * @as(u32, MAX_WINDOW_SLOTS);
         venus.encodeCreateDescriptorPoolN(&scratch_cs, COMPOSITOR_DEVICE, COMPOSITOR_DESC_POOL, pool_size, pool_size);
         if (!submitFireAndForget(&scratch_cs)) {
             debug.klog("[gpu-comp] batch4 (desc set layout + pool) FAILED\n", .{});
@@ -1784,24 +1902,24 @@ fn setupVulkanRender() bool {
     }
     // Background source: the desktop backbuf, 1:1 (row-major B,G,R,A). The
     // first frame is a full one and fills it.
-    source_tex = createTexture(.{
+    if (!createTexture(&source_tex, .{
         .image = COMPOSITOR_SOURCE_IMAGE,
         .view = COMPOSITOR_SOURCE_VIEW,
         .mem = COMPOSITOR_SOURCE_MEM,
         .staging_buf = COMPOSITOR_SOURCE_STAGING,
         .staging_mem = COMPOSITOR_SOURCE_STAGING_MEM,
-    }, SOURCE_W, SOURCE_H, true, "source") orelse return false;
+    }, SOURCE_W, SOURCE_H, true, "source")) return false;
     source_pixel_buf = source_tex.kptr;
     debug.klog("[gpu-comp] source image res={d} phys=0x{X} {d}x{d}\n", .{ source_tex.res_id, source_tex.phys.raw(), SOURCE_W, SOURCE_H });
     if (!createDescriptorSet(COMPOSITOR_DESC_SET, COMPOSITOR_SOURCE_VIEW, "source descriptor set")) return false;
 
-    focused_tex = createTexture(.{
+    if (!createTexture(&focused_tex, .{
         .image = COMPOSITOR_FOCUSED_IMAGE,
         .view = COMPOSITOR_FOCUSED_VIEW,
         .mem = COMPOSITOR_FOCUSED_MEM,
         .staging_buf = COMPOSITOR_FOCUSED_STAGING,
         .staging_mem = COMPOSITOR_FOCUSED_STAGING_MEM,
-    }, FOCUSED_W, FOCUSED_H, false, "focused") orelse return false;
+    }, FOCUSED_W, FOCUSED_H, false, "focused")) return false;
     focused_pixel_buf = focused_tex.kptr;
     debug.klog("[gpu-comp] focused image res={d} phys=0x{X} {d}x{d}\n", .{ focused_tex.res_id, focused_tex.phys.raw(), FOCUSED_W, FOCUSED_H });
     if (!createDescriptorSet(COMPOSITOR_FOCUSED_DESC_SET, COMPOSITOR_FOCUSED_VIEW, "focused descriptor set")) return false;
@@ -1860,10 +1978,10 @@ pub fn isReady() bool {
 /// rowPitch expectation. `mem_w` IS the row stride; apps writing into
 /// this dmabuf must use that as their pitch.
 ///
-/// Returns the slot index, or null on failure. Caller can read the slot
-/// from `window_slots[idx]` for kernel_ptr (kernel mapping), phys
-/// (for vmm.mapUserPage), and desc_set_id (for compositor draws).
-pub fn allocateWindowImage(image_w: u32, image_h: u32, mem_w: u32, mem_h: u32) ?u8 {
+/// The slot is `owner`'s (a thread group) until it gives it up: see
+/// WindowSlot. Its memory comes back zeroed. Null when there is no slot to
+/// be had; the window then draws through the CPU path.
+pub fn allocateWindowImage(owner: u8, image_w: u32, image_h: u32, mem_w: u32, mem_h: u32) ?WindowImage {
     if (!vulkan_render_ready) return null;
     if (image_w == 0 or image_h == 0 or mem_w == 0 or mem_h == 0) return null;
     if (mem_w < image_w or mem_h < image_h) return null;
@@ -1883,57 +2001,103 @@ pub fn allocateWindowImage(image_w: u32, image_h: u32, mem_w: u32, mem_h: u32) ?
     // A frame may have failed while we waited for the lock.
     if (!vulkan_render_ready) return null;
 
-    // Find a free slot.
-    var slot_idx: u8 = 0;
-    while (slot_idx < MAX_WINDOW_SLOTS) : (slot_idx += 1) {
-        if (!window_slots[slot_idx].in_use) break;
-    }
-    if (slot_idx >= MAX_WINDOW_SLOTS) {
+    const slot_idx: u8 = for (&window_slots, 0..) |*s, i| {
+        if (@atomicLoad(SlotState, &s.state, .acquire) == .free) break @intCast(i);
+    } else {
         debug.klog("[gpu-comp] allocateWindowImage: all {d} slots in use\n", .{MAX_WINDOW_SLOTS});
         return null;
-    }
-
+    };
     const sl = &window_slots[slot_idx];
-    // Fresh ids per attempt: a failed one may leave objects behind on the
-    // host, and creating over a live id is fatal for the context.
-    const base = next_window_ids;
-    next_window_ids += WINDOW_SLOT_STRIDE;
-    const ids: TextureIds = .{
-        .image = base,
-        .view = base + 1,
-        .mem = base + 2,
-        .staging_buf = base + 3,
-        .staging_mem = base + 4,
-    };
-    const desc_set_id = base + 5;
-
-    // Texture at MEM dims so the CPU row stride is mem_w (see above).
-    const tex = createTexture(ids, mem_w, mem_h, false, "window slot") orelse {
-        debug.klog("[gpu-comp] slot[{d}] texture FAILED\n", .{slot_idx});
-        return null;
-    };
-    if (!createDescriptorSet(desc_set_id, ids.view, "window slot descriptor set")) return null;
-    const kvirt = tex.kptr.?;
-    const phys = tex.phys;
-    const res_id = tex.res_id;
-    // What the app maps; the blob behind it may be larger.
-    const px_bytes_aligned = pageAlign(@as(u64, mem_w) * mem_h * 4);
-
-    sl.tex_ids = ids;
-    sl.fresh = true;
-    sl.in_use = true;
+    sl.owner = owner;
     sl.width = image_w;
     sl.height = image_h;
     sl.mem_w = mem_w;
     sl.mem_h = mem_h;
     sl.pitch_pixels = mem_w; // mem_w is aligned and IS the row stride
-    sl.res_id = res_id;
-    sl.desc_set_id = desc_set_id;
-    sl.kernel_ptr = kvirt;
-    sl.phys = phys;
-    sl.mem_bytes = px_bytes_aligned;
-    debug.klog("[gpu-comp] slot[{d}] allocated: image={d}x{d} mem={d}x{d} bytes={d} res={d} kvirt=0x{X} phys=0x{X}\n", .{ slot_idx, image_w, image_h, mem_w, mem_h, px_bytes_aligned, res_id, @intFromPtr(kvirt), phys.raw() });
-    return slot_idx;
+    // What the app maps; the blob behind it may be larger.
+    sl.mem_bytes = pageAlign(@as(u64, mem_w) * mem_h * 4);
+    sl.seen_seq = 0;
+    sl.fresh = true;
+    sl.changed = false;
+    @atomicStore(SlotState, &sl.state, .building, .release);
+
+    if (!buildSlotImage(sl)) {
+        // Left to the compositor task like any slot given up: this task may
+        // be killed before it got through the destroys.
+        debug.klog("[gpu-comp] slot[{d}] {d}x{d} for group {d} FAILED\n", .{ slot_idx, mem_w, mem_h, owner });
+        _ = retire(sl, .building);
+        return null;
+    }
+    const fb = sl.tex.kptr.?;
+    @memset(fb[0..@intCast(sl.mem_bytes)], 0);
+    @atomicStore(SlotState, &sl.state, .live, .release);
+    debug.klog("[gpu-comp] slot[{d}] allocated: image={d}x{d} mem={d}x{d} bytes={d} res={d} phys=0x{X} group={d}\n", .{ slot_idx, image_w, image_h, mem_w, mem_h, sl.mem_bytes, sl.tex.res_id, sl.tex.phys.raw(), owner });
+    return .{ .slot = slot_idx, .fb = @ptrCast(@alignCast(fb)), .phys = sl.tex.phys, .bytes = sl.mem_bytes };
+}
+
+/// The slot's image and memory, and its descriptor set pointed at them.
+/// Fresh ids each time (see WINDOW_SLOT_ID_BASE). Caller holds venus_lock.
+fn buildSlotImage(sl: *WindowSlot) bool {
+    const base = next_window_ids;
+    next_window_ids += WINDOW_SLOT_STRIDE;
+    // Texture at MEM dims so the CPU row stride is mem_w (see above).
+    if (!createTexture(&sl.tex, .{
+        .image = base,
+        .view = base + 1,
+        .mem = base + 2,
+        .staging_buf = base + 3,
+        .staging_mem = base + 4,
+    }, sl.mem_w, sl.mem_h, false, "window slot")) return false;
+    if (sl.desc_set_id == 0) {
+        if (!allocateDescriptorSet(base + 5, "window slot descriptor set")) return false;
+        sl.desc_set_id = base + 5;
+    }
+    return pointDescriptorSet(sl.desc_set_id, sl.tex.ids.view);
+}
+
+fn retire(sl: *WindowSlot, from: SlotState) bool {
+    if (@cmpxchgStrong(SlotState, &sl.state, from, .retired, .acq_rel, .acquire) != null) return false;
+    _ = @atomicRmw(u32, &retired_slots, .Add, 1, .release);
+    const pid = @atomicLoad(u8, &compositor_pid, .acquire);
+    if (pid != 0xFF) process.wake(pid);
+    return true;
+}
+
+/// Give up slot `idx` of thread group `owner`. Its window must be gone and
+/// the group must no longer map the slot's memory: the pages go to another
+/// window next. Any context; the compositor task does the rest.
+pub fn releaseWindowImage(idx: u8, owner: u8) void {
+    if (idx >= MAX_WINDOW_SLOTS) return;
+    const sl = &window_slots[idx];
+    if (sl.live() and sl.owner == owner) _ = retire(sl, .live);
+}
+
+/// Give up every slot thread group `owner` holds, one left half built by a
+/// killed thread included. For when none of them is being built or mapped:
+/// the group's end, or a new window after an ended task's was reclaimed
+/// (gui_window.reclaimLeftFb, under its setup lock).
+pub fn releaseWindowImagesOf(owner: u8) void {
+    for (&window_slots) |*sl| {
+        const st = @atomicLoad(SlotState, &sl.state, .acquire);
+        if ((st == .live or st == .building) and sl.owner == owner) _ = retire(sl, st);
+    }
+}
+
+/// Destroy the slots given up since the last call and free them. Run by
+/// the compositor task between frames: no frame samples a slot then, and
+/// this task is not one that gets killed half way through a destroy.
+fn reapRetiredSlots() void {
+    if (@atomicLoad(u32, &retired_slots, .acquire) == 0) return;
+    venus_lock.acquire();
+    defer venus_lock.release();
+    for (&window_slots, 0..) |*sl, i| {
+        if (@atomicLoad(SlotState, &sl.state, .acquire) != .retired) continue;
+        _ = @atomicRmw(u32, &retired_slots, .Sub, 1, .release);
+        const res_id = sl.tex.res_id;
+        destroyTexture(&sl.tex, "window slot");
+        debug.klog("[gpu-comp] slot[{d}] released (res={d}, group {d})\n", .{ i, res_id, sl.owner });
+        @atomicStore(SlotState, &sl.state, .free, .release);
+    }
 }
 
 /// Step 8d: allocate `n_blobs` 1920×1080 B8G8R8A8 LINEAR images via Venus,
@@ -2286,7 +2450,7 @@ fn collectSlotLayers() usize {
         const slot_idx = w_ref.gpu_slot orelse continue;
         if (slot_idx >= MAX_WINDOW_SLOTS) continue;
         const sl = &window_slots[slot_idx];
-        if (!sl.in_use) continue;
+        if (!sl.live()) continue;
         const content_h: u32 = w_ref.height -| TITLEBAR_H;
         if (w_ref.width == 0 or content_h == 0) continue;
         if (draws == MAX_LAYER_DRAWS) break;
@@ -2295,7 +2459,7 @@ fn collectSlotLayers() usize {
         const y0 = w_ref.y + @as(i32, @intCast(TITLEBAR_H));
         l.rect = .{ w_ref.x, y0, w_ref.x + @as(i32, @intCast(w_ref.width)), y0 + @as(i32, @intCast(content_h)) };
         l.desc_set = sl.desc_set_id;
-        l.image = sl.tex_ids.image;
+        l.image = sl.tex.ids.image;
         l.unscaled = w_ref.width == sl.width and content_h == sl.height;
         // The image spans the slot's memory dims; sample only the
         // sl.width × sl.height the app draws.
@@ -2427,9 +2591,9 @@ fn renderVulkanFrame(_: f32) FrameResult {
             const slot_idx = w_ref.gpu_slot orelse continue;
             if (slot_idx >= MAX_WINDOW_SLOTS) continue;
             const sl = &window_slots[slot_idx];
-            if (!sl.in_use or !sl.changed) continue;
+            if (!sl.live() or !sl.changed) continue;
             const whole = [_][4]u32{.{ 0, 0, sl.width, sl.height }};
-            recordUpload(sl.tex_ids, sl.pitch_pixels, &whole);
+            recordUpload(sl.tex.ids, sl.pitch_pixels, &whole);
         }
         wm.unlockWindows(flags);
         venus.encodeCmdMemoryBarrier(
@@ -2751,7 +2915,11 @@ fn run() noreturn {
         // Xchg, not load-then-store-0: a requestRender landing between the
         // two would lose its increment (harmless today only because every
         // caller publishes its damage before bumping — made structural).
-        while (@atomicRmw(u32, &pending_wakes, .Xchg, 0, .seq_cst) == 0) {
+        // Slots given up are reaped here, between frames; whoever gave one
+        // up woke this task for it, and the same handshake covers that.
+        while (true) {
+            reapRetiredSlots();
+            if (@atomicRmw(u32, &pending_wakes, .Xchg, 0, .seq_cst) != 0) break;
             parkUntilRender();
         }
 

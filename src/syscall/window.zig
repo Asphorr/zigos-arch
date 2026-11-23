@@ -257,7 +257,8 @@ pub fn sysNotify(text_ptr: u32, len: u32) u32 {
     return 0;
 }
 
-const GUI_FB_BASE: usize = 0x08000000; // User GUI FB virtual address
+const gui_window = @import("../ui/gui_window.zig");
+const GUI_FB_BASE: usize = gui_window.FB_BASE;
 const GUI_MAX_SIZE: u32 = 8 * 1024 * 1024;
 const GUI_FB_PER_PID: usize = memmap.GUI_FB_PER_PID_SIZE; // per-window size cap
 
@@ -329,56 +330,55 @@ pub fn sysCreateWindow(alloc_width_in: u32, alloc_height: u32, display_wh: u32) 
     // still get focus as the user expects.
     const auto_focus = !desktop.focusedShellSpawnedPid(pid);
 
+    const gpu_comp = @import("../ui/gpu_compositor.zig");
+    const lead = process.leader(pcb);
+    gui_window.setup_lock.acquire();
+    defer gui_window.setup_lock.release();
+    // One framebuffer per address space, at GUI_FB_BASE: one a window took
+    // with it, unless an ended task left it behind.
+    if (vmm.resolveUserPhys(pd, GUI_FB_BASE) != null and !gui_window.reclaimLeftFb(lead)) {
+        debug.klog("[sysCW] reject: pid {d}'s process already has a window\n", .{pid});
+        return E_INVAL;
+    }
+
     // Step 9.4 Phase B.2: try to allocate a Venus dmabuf slot. If it
     // works, the dmabuf IS gui_fb — user-space maps directly at the
     // BAR-phys, so app writes go straight into the texture the
     // compositor samples. No PMM allocation, no triple-buffer copy.
-    var gpu_slot: ?u8 = null;
     var kern_fb: [*]volatile u32 = undefined;
     const kern_fb_backs: [3]?[*]volatile u32 = .{ null, null, null };
-    {
-        const gpu_comp = @import("../ui/gpu_compositor.zig");
-        if (gpu_comp.isReady()) {
-            gpu_slot = gpu_comp.allocateWindowImage(disp_w, disp_h, alloc_width, alloc_height);
-        }
-    }
+    const gpu_image: ?gpu_comp.WindowImage = if (gpu_comp.isReady())
+        gpu_comp.allocateWindowImage(lead.tgid, disp_w, disp_h, alloc_width, alloc_height)
+    else
+        null;
 
-    if (gpu_slot) |idx| {
-        const gpu_comp = @import("../ui/gpu_compositor.zig");
-        const sl = &gpu_comp.window_slots[idx];
-        const slot_phys = sl.phys;
-        const slot_pages: u32 = @intCast((sl.mem_bytes + 4095) / 4096);
-        // Map the dmabuf into user-space at GUI_FB_BASE. The phys is
-        // in the SHM BAR range — vmm.mapUserPage just sets PTE flags,
-        // any phys works. Rollback on any per-page failure: in normal
-        // flow none of mapUserPage's error variants should fire
-        // (GUI_FB_BASE is empty per process, the phys range is valid,
-        // PMM has room for PT pages), but defensive coverage is the
-        // whole point of gap #1's MapError migration.
-        var mapped_pages: usize = 0;
-        for (0..slot_pages) |i| {
-            vmm.mapUserPage(pd, GUI_FB_BASE + i * 4096, slot_phys.add(i * 4096), paging.READ_WRITE | paging.USER) catch |e| {
-                debug.klog("[sysCW] BLOB mapUserPage failed at page={d} virt=0x{X}: {s}\n", .{ i, GUI_FB_BASE + i * 4096, @errorName(e) });
-                var j: usize = 0;
-                while (j < mapped_pages) : (j += 1) {
-                    _ = vmm.unmapUserPage(pd, GUI_FB_BASE + j * 4096);
-                }
-                return E_INVAL;
-            };
-            mapped_pages += 1;
+    if (gpu_image) |img| {
+        // Map the dmabuf into user-space at GUI_FB_BASE. The phys is in
+        // the SHM BAR range: device memory, which mapUserPage maps like
+        // any other and the PMM leaves alone.
+        const slot_pages: usize = @intCast(img.bytes / 4096);
+        const mapped = blk: {
+            lead.as_lock.acquire();
+            defer lead.as_lock.release();
+            for (0..slot_pages) |i| {
+                vmm.mapUserPage(pd, GUI_FB_BASE + i * 4096, img.phys.add(i * 4096), paging.READ_WRITE | paging.USER) catch |e| {
+                    debug.klog("[sysCW] BLOB mapUserPage failed at page={d} virt=0x{X}: {s}\n", .{ i, GUI_FB_BASE + i * 4096, @errorName(e) });
+                    gui_window.unmapFbLocked(lead, pd, i);
+                    break :blk false;
+                };
+            }
+            break :blk true;
+        };
+        if (!mapped) {
+            gpu_comp.releaseWindowImage(img.slot, lead.tgid);
+            return E_INVAL;
         }
         asm volatile ("movq %%cr3, %%rax\n movq %%rax, %%cr3" ::: .{ .rax = true });
-        // Zero the dmabuf so the compositor's first sample doesn't
-        // read uninitialized pixels.
-        const kfb_u8: [*]volatile u8 = sl.kernel_ptr.?;
-        @memset(kfb_u8[0..@intCast(sl.mem_bytes)], 0);
-        kern_fb = @ptrCast(@alignCast(sl.kernel_ptr.?));
+        kern_fb = img.fb;
         // No PMM allocation, no triple-buffer backs. Apps that call
         // sysPresent on a slot-backed window still bump
         // gui_present_pending — that's fine; sysPresent's snapshot
         // step is a no-op when gui_fb_backs[0] is null.
-        // pmm_phys_base stays 0 — sysDestroyWindow path checks this
-        // and skips PMM unmap for slot-backed windows.
     } else {
         // Legacy PMM path — compositor not ready or slot alloc failed.
         // Allocate ONLY the front buffer (num_pages). Triple back-buffers
@@ -396,34 +396,36 @@ pub fn sysCreateWindow(alloc_width_in: u32, alloc_height: u32, display_wh: u32) 
             debug.klog("[sysCW] reject: pmm.allocContiguous({d} pages = {d} KB) FAILED\n", .{ num_pages, num_pages * 4 });
             return E_INVAL;
         };
-        var mapped_pages: usize = 0;
-        for (0..num_pages) |i| {
-            const phys = phys_base.add(i * 4096);
-            vmm.mapUserPage(pd, GUI_FB_BASE + i * 4096, phys, paging.READ_WRITE | paging.USER) catch |e| {
-                // Rollback: undo dual-owner refs on what we mapped, then
-                // free the whole contiguous block. releaseFrame here pairs
-                // with the (skipped) acquireFrame we never reached on this
-                // iteration; the earlier mapped_pages iterations got their
-                // acquireFrame so we owe them a release apiece.
-                debug.klog("[sysCW] legacy mapUserPage failed at page={d} virt=0x{X}: {s}\n", .{ i, GUI_FB_BASE + i * 4096, @errorName(e) });
-                var j: usize = 0;
-                while (j < mapped_pages) : (j += 1) {
-                    _ = vmm.unmapUserPage(pd, GUI_FB_BASE + j * 4096);
-                    pmm.releaseFrame(phys_base.add(j * 4096));
-                }
-                pmm.freeContiguous(phys_base, num_pages);
-                return E_INVAL;
-            };
-            // Dual-owner refcount bump: front-buffer pages live in BOTH the
-            // user PML4 (released by destroyAddressSpace on process exit) AND
-            // the kernel desktop's gui_fb_phys_base table (released by
-            // unmapGuiFB on window destroy). Without the extra acquire, the
-            // second owner's release underflows. Back-buffer pages stay
-            // single-owner (kernel-only, never mapped to user).
-            pmm.acquireFrame(phys);
-            const ptr = phys.toVirt().ptr([*]u8);
-            @memset(ptr[0..4096], 0);
-            mapped_pages += 1;
+        // Zeroed before any of it shows in the address space.
+        const kbuf = phys_base.toVirt().ptr([*]u8);
+        @memset(kbuf[0 .. @as(usize, num_pages) * 4096], 0);
+        const mapped = blk: {
+            lead.as_lock.acquire();
+            defer lead.as_lock.release();
+            for (0..num_pages) |i| {
+                const phys = phys_base.add(i * 4096);
+                vmm.mapUserPage(pd, GUI_FB_BASE + i * 4096, phys, paging.READ_WRITE | paging.USER) catch |e| {
+                    // The pages mapped so far hold two references each
+                    // (below): the unmap drops the mapping's, and
+                    // freeContiguous the block's own.
+                    debug.klog("[sysCW] legacy mapUserPage failed at page={d} virt=0x{X}: {s}\n", .{ i, GUI_FB_BASE + i * 4096, @errorName(e) });
+                    gui_window.unmapFbLocked(lead, pd, i);
+                    break :blk false;
+                };
+                // Dual-owner refcount bump: front-buffer pages live in BOTH
+                // the user PML4 (released when the mapping goes: window
+                // destroy, or the address space's end) AND the kernel
+                // desktop's gui_fb_phys_base table (released by unmapGuiFB on
+                // window destroy). Without the extra acquire, the second
+                // owner's release underflows. Back-buffer pages stay
+                // single-owner (kernel-only, never mapped to user).
+                pmm.acquireFrame(phys);
+            }
+            break :blk true;
+        };
+        if (!mapped) {
+            pmm.freeContiguous(phys_base, num_pages);
+            return E_INVAL;
         }
         paging.registerGuiFB(pid, phys_base);
         asm volatile ("movq %%cr3, %%rax\n movq %%rax, %%cr3" ::: .{ .rax = true });
@@ -433,8 +435,17 @@ pub fn sysCreateWindow(alloc_width_in: u32, alloc_height: u32, display_wh: u32) 
         // leaving the compositor on the gui_fb fallback path).
     }
 
+    const gpu_slot: ?u8 = if (gpu_image) |img| img.slot else null;
     if (desktop.createGuiWindow(pid, kern_fb, kern_fb_backs, fb_pixels, disp_w, disp_h, alloc_width, alloc_height, auto_focus, gpu_slot) == null) {
+        // No window: give the framebuffer back. Out of the address space
+        // first, then whoever provided it.
         debug.klog("[syscall] Failed to create GUI window\n", .{});
+        gui_window.unmapFb(lead, num_pages);
+        if (gpu_image) |img| {
+            gpu_comp.releaseWindowImage(img.slot, lead.tgid);
+        } else {
+            paging.unmapGuiFB(pid, num_pages);
+        }
         return E_INVAL;
     }
 
@@ -496,7 +507,9 @@ pub fn sysGetMouse(buf_ptr: u32) u32 {
 
 pub fn sysDestroyWindow() u32 {
     const pid: u8 = @intCast(process.getCurrentPid());
-    desktop.destroyGuiWindow(pid);
+    if (gui_window.destroyByTask(pid) == 0) {
+        debug.klog("[fb-diag] sysDestroyWindow pid={d}: no window of its own\n", .{pid});
+    }
     return 0;
 }
 

@@ -526,6 +526,7 @@ pub fn build(b: *std.Build) void {
         .{ "diskbench.elf", "app/diskbench.zig" },
         .{ "threadtest.elf", "app/threadtest.zig" },
         .{ "threadbrot.elf", "app/threadbrot.zig" },
+        .{ "wintest.elf", "app/wintest.zig" },
         .{ "synctest.elf", "app/synctest.zig" },
         .{ "babel.elf", "app/babel.zig" },
         .{ "sigtest.elf", "app/sigtest.zig" },
@@ -1421,7 +1422,7 @@ pub fn build(b: *std.Build) void {
         \\  sysmon.elf calc.elf settings.elf files.elf about.elf fastfetch.elf zigtop.elf sigil.elf tg.elf \
         \\  paint.elf editor.elf doom.elf vn.elf gpu_test.elf vulkan_triangle.elf \
         \\  venus_test.elf vulkan_cube.elf doom_real.elf \
-        \\  mmaptest.elf mapshare.elf flushtest.elf bareexit.elf threadtest.elf threadbrot.elf synctest.elf babel.elf forktest.elf daemontest.elf schedstress.elf logd.elf photo.elf wallpaper.elf \
+        \\  mmaptest.elf mapshare.elf flushtest.elf bareexit.elf threadtest.elf threadbrot.elf wintest.elf synctest.elf babel.elf forktest.elf daemontest.elf schedstress.elf logd.elf photo.elf wallpaper.elf \
         \\  shmtest.elf iouringtest.elf redteam.elf wakelat.elf
         \\echo "[tar] rebuilt $(($(date +%s%3N)-T0))ms"
         ,

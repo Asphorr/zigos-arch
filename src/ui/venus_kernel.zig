@@ -25,6 +25,10 @@ pub const CMD_vkCmdCopyBufferToImage: u32 = 115;
 pub const CMD_vkEnumerateInstanceVersion: u32 = 137;
 pub const CMD_vkQueueSubmit: u32 = 18;
 pub const CMD_vkAllocateMemory: u32 = 21;
+pub const CMD_vkFreeMemory: u32 = 22;
+pub const CMD_vkDestroyBuffer: u32 = 51;
+pub const CMD_vkDestroyImage: u32 = 55;
+pub const CMD_vkDestroyImageView: u32 = 58;
 pub const CMD_vkBindImageMemory: u32 = 29;
 pub const CMD_vkCreateFence: u32 = 35;
 pub const CMD_vkResetFences: u32 = 37;
@@ -790,6 +794,33 @@ pub fn encodeBindBufferMemory(
     cs.writeU64(buffer_id);
     cs.writeU64(memory_id);
     cs.writeU64(offset);
+}
+
+/// vkDestroyImageView / vkDestroyImage / vkDestroyBuffer / vkFreeMemory:
+/// device, the object, a null allocator. The host looks the object up, and
+/// an id it does not hold is fatal for the context: destroy only what a
+/// reply has shown to exist.
+fn encodeDestroy(cs: *CmdStream, cmd: u32, device_id: u64, object_id: u64) void {
+    cs.cmdHeader(cmd, 0);
+    cs.writeU64(device_id);
+    cs.writeU64(object_id);
+    cs.writeNull(); // pAllocator
+}
+
+pub fn encodeDestroyImageView(cs: *CmdStream, device_id: u64, view_id: u64) void {
+    encodeDestroy(cs, CMD_vkDestroyImageView, device_id, view_id);
+}
+
+pub fn encodeDestroyImage(cs: *CmdStream, device_id: u64, image_id: u64) void {
+    encodeDestroy(cs, CMD_vkDestroyImage, device_id, image_id);
+}
+
+pub fn encodeDestroyBuffer(cs: *CmdStream, device_id: u64, buffer_id: u64) void {
+    encodeDestroy(cs, CMD_vkDestroyBuffer, device_id, buffer_id);
+}
+
+pub fn encodeFreeMemory(cs: *CmdStream, device_id: u64, memory_id: u64) void {
+    encodeDestroy(cs, CMD_vkFreeMemory, device_id, memory_id);
 }
 
 /// vkCmdCopyImageToBuffer — used to copy a render image's pixels into

@@ -4896,6 +4896,7 @@ pub fn createGuiWindow(pid: u8, fb: [*]volatile u32, fb_backs: [3]?[*]volatile u
     windows[slot].gui_alloc_w = alloc_w;
     windows[slot].gui_alloc_h = alloc_h;
     windows[slot].owner_pid = pid;
+    windows[slot].owner_group = process.procs[pid].tgid;
     windows[slot].gpu_slot = gpu_slot;
     const pname = process.getName(pid);
     const written: u8 = if (pinned.nameForProcess(pname)) |name| blk: {
@@ -5023,8 +5024,39 @@ fn removeWindow(slot: u8) ?*TerminalData {
     return term;
 }
 
-/// Destroy GUI windows owned by the given process.
-pub fn destroyGuiWindow(pid: u8) void {
+/// What destroyGuiWindow took down, for the owner to finish with: the
+/// windows are gone, the framebuffer's place in its address space and the
+/// GPU slot behind it are not (see gui_window.zig).
+pub const DestroyedGui = struct {
+    windows: u8 = 0,
+    /// Pages the owner has mapped at GUI_FB_USER_BASE.
+    fb_pages: u32 = 0,
+    /// GPU compositor slots the windows drew through, a bit each.
+    gpu_slots: u32 = 0,
+};
+
+/// Whose GUI windows destroyGuiWindow takes down.
+pub const GuiOwner = union(enum) {
+    /// The task that made them: sysDestroyWindow, the task's end.
+    task: u8,
+    /// Every task of a thread group, for the group's end: also a window
+    /// whose task is ending beside the last one and has yet to take it.
+    group: u8,
+};
+
+/// Whether thread group `tgid` has a GUI window.
+pub fn groupHasGuiWindow(tgid: u8) bool {
+    const wflags = lockWindows();
+    defer unlockWindows(wflags);
+    for (0..MAX_WINDOWS) |i| {
+        if (slot_used[i] and windows[i].owner_pid != 0xFF and windows[i].owner_group == tgid) return true;
+    }
+    return false;
+}
+
+/// Destroy the GUI windows of `who`.
+pub fn destroyGuiWindow(who: GuiOwner) DestroyedGui {
+    var gone: DestroyedGui = .{};
     // Declared first so it runs after both locks are released.
     var dead_terms: [MAX_WINDOWS]?*TerminalData = @splat(null);
     defer for (dead_terms) |dt| if (dt) |t| freeTerminalData(t);
@@ -5040,23 +5072,31 @@ pub fn destroyGuiWindow(pid: u8) void {
     if (@import("../driver.zig").virtio_gpu.cursor_hidden) {
         @import("../driver.zig").virtio_gpu.showCursor();
     }
-    var any_window_for_pid = false;
     // Iterate slots (not z_stack) since removeWindow mutates z_stack and
     // we'd skip entries with a live z_stack iteration.
     for (0..MAX_WINDOWS) |k| {
         const i: u8 = @intCast(k);
         if (!slot_used[i]) continue;
-        if (windows[i].owner_pid != pid) continue;
-        any_window_for_pid = true;
+        const pid = windows[i].owner_pid;
+        const match = switch (who) {
+            .task => |p| pid == p,
+            .group => |g| pid != 0xFF and windows[i].owner_group == g,
+        };
+        if (!match) continue;
+        gone.windows += 1;
         debug.klog("[desktop] GUI window destroyed for PID {d}\n", .{pid});
         if (windows[i].gui_fb != null) {
             const aw = if (windows[i].gui_alloc_w > 0) windows[i].gui_alloc_w else windows[i].gui_w;
             const ah = if (windows[i].gui_alloc_h > 0) windows[i].gui_alloc_h else windows[i].gui_h;
             const fb_size = aw * ah * 4;
             const num_pages = (fb_size + 4095) / 4096;
+            gone.fb_pages = @max(gone.fb_pages, num_pages);
+            if (windows[i].gpu_slot) |s| gone.gpu_slots |= @as(u32, 1) << @intCast(s);
             // unmapGuiFB iterates internally over front + any lazily-
-            // allocated back-buffer slots (tracked per-PID in paging.zig).
-            // Each slot was sized num_pages, so we just pass that.
+            // allocated back-buffer slots (tracked per-PID in paging.zig:
+            // sound only because no window outlives its owner's pid, see
+            // gui_window.zig). Each slot was sized num_pages. A GPU
+            // slot window registered none: its framebuffer is the slot's.
             const free_before = pmm.freeFrameCount();
             paging.unmapGuiFB(pid, num_pages);
             const free_after = pmm.freeFrameCount();
@@ -5068,10 +5108,8 @@ pub fn destroyGuiWindow(pid: u8) void {
         dirty_rects_mod.force_full_kind = true;
         markDirtyFull();
     }
-    if (any_window_for_pid) wake.requestWake();
-    if (!any_window_for_pid) {
-        debug.klog("[fb-diag] destroyGuiWindow pid={d}: NO window matched owner_pid\n", .{pid});
-    }
+    if (gone.windows != 0) wake.requestWake();
+    return gone;
 }
 
 /// Write mouse position relative to the window's content area into user buffer.

@@ -227,7 +227,11 @@ pub const Window = struct {
     /// FPS games (DOOM) need this; the cursor would otherwise flicker with
     /// every mouse movement.
     cursor_hidden_by_app: bool = false,
+    /// The task that made the window; it goes when that task ends.
     owner_pid: u8 = 0xFF,
+    /// The thread group of `owner_pid`: the group's end takes the window
+    /// even if its task, ending alongside, has yet to.
+    owner_group: u8 = 0xFF,
     last_mouse_x: i32 = 0,
     last_mouse_y: i32 = 0,
     anim_type: AnimationType = .none,
