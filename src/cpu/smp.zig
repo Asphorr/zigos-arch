@@ -1,6 +1,6 @@
 const debug = @import("../debug/debug.zig");
 const serial = @import("../debug/serial.zig");
-const apic = @import("../time/apic.zig");
+const apic = @import("../irq/apic.zig");
 const acpi = @import("../acpi/acpi.zig");
 const paging = @import("../mm/paging.zig");
 const pmm = @import("../mm/pmm.zig");
@@ -794,7 +794,7 @@ pub fn init() void {
     // `ksoftirqd` per CPU. After this returns, `softirq.raise` from the IRQ0
     // tick (and, later, from device MSI-X top-halves) defers heavy completion
     // work here instead of running it in IF=0 hard-IRQ context.
-    @import("../proc/softirq.zig").startAll();
+    @import("../irq/softirq.zig").startAll();
 }
 
 fn busyWait(ms: u32) void {

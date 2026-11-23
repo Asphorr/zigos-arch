@@ -15,7 +15,7 @@
 const std = @import("std");
 const serial = @import("serial.zig");
 const boot_screen = @import("../ui/boot_screen.zig");
-const apic = @import("../time/apic.zig");
+const apic = @import("../irq/apic.zig");
 
 pub const Phase = boot_screen.Phase;
 

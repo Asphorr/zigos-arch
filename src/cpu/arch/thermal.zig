@@ -31,7 +31,7 @@
 
 const std = @import("std");
 const debug = @import("../../debug/debug.zig");
-const apic = @import("../../time/apic.zig");
+const apic = @import("../../irq/apic.zig");
 const msr = @import("msr.zig");
 
 // --- MSRs ---

@@ -11,7 +11,7 @@
 //! file just owns the asm trampolines + EOI bookkeeping.
 
 const io = @import("../../io.zig");
-const apic = @import("../../time/apic.zig");
+const apic = @import("../../irq/apic.zig");
 const keyboard = @import("../../driver.zig").keyboard;
 const mouse = @import("../../driver.zig").mouse;
 

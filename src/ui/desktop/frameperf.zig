@@ -32,7 +32,7 @@
 
 const debug = @import("../../debug/debug.zig");
 const perf = @import("../../debug/perf.zig");
-const apic = @import("../../time/apic.zig");
+const apic = @import("../../irq/apic.zig");
 
 const N_BUCKETS = 26; // bucket k covers [2^(k-1), 2^k) µs; last = everything above
 const N_PHASES = 5; // prep, render, flush, total, wait

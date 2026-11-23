@@ -4489,7 +4489,7 @@ pub fn run() void {
         {
             const pipe = @import("../proc/pipe.zig");
             const rdtsc = @import("../debug/perf.zig").rdtsc;
-            const slice_cyc = @import("../time/apic.zig").tscPerQuantumSane() * DRAIN_SLICE_MS / 10;
+            const slice_cyc = @import("../irq/apic.zig").tscPerQuantumSane() * DRAIN_SLICE_MS / 10;
             var drain_buf: [256]u8 = undefined;
             var more = false;
             for (z_stack[0..wm.z_count]) |wi| {

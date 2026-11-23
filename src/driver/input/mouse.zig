@@ -1,5 +1,5 @@
 const io = @import("../../io.zig");
-const pic = @import("../../time/pic.zig");
+const pic = @import("../../irq/pic.zig");
 const debug = @import("../../debug/debug.zig");
 const Deadline = @import("../../util/deadline.zig").Deadline;
 

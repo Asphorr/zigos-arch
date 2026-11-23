@@ -40,7 +40,7 @@
 // boot — "[smi] ruler read cost".
 
 const acpi = @import("../acpi/acpi.zig");
-const apic = @import("apic.zig");
+const apic = @import("../irq/apic.zig");
 const debug = @import("../debug/debug.zig");
 const io = @import("../io.zig");
 const exectrail = @import("../debug/exectrail.zig");

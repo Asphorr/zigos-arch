@@ -899,7 +899,7 @@ fn amlStallUs(us: u64) void {
 /// Spin for `us` µs: on the TSC once apic.init has calibrated it, before that
 /// on the PIT count pit.init left running.
 fn busyWaitUs(us: u64) void {
-    const apic = @import("../time/apic.zig");
+    const apic = @import("../irq/apic.zig");
     const tpq = apic.tscPerQuantum(); // TSC ticks per 10ms quantum
     if (tpq == 0) return @import("../time/pit.zig").delayUs(us);
     const ticks = us * tpq / 10_000; // 10_000 µs per quantum
@@ -934,7 +934,7 @@ fn amlGlobalLockRelease() void {
 }
 
 fn amlTimer100ns() u64 {
-    const apic = @import("../time/apic.zig");
+    const apic = @import("../irq/apic.zig");
     const tpq = apic.tscPerQuantum();
     if (tpq == 0) return 0; // aml falls back to its monotonic counter
     // 10ms quantum = 100_000 × 100ns; u128 so the product can't wrap (a u64

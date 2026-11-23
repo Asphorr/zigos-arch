@@ -19,7 +19,7 @@ const io = @import("../../io.zig");
 const pci = @import("../bus/pci.zig");
 const pmm = @import("../../mm/pmm.zig");
 const paging = @import("../../mm/paging.zig");
-const msix = @import("../../time/msix.zig");
+const msix = @import("../../irq/msix.zig");
 const debug = @import("../../debug/debug.zig");
 const Deadline = @import("../../util/deadline.zig").Deadline;
 

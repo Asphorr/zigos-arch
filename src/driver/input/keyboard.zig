@@ -170,7 +170,7 @@ pub fn disableIRQ1() void {
     // yield, unconditionally re-setting config bit 0 and soliciting a
     // fresh response byte — our own re-arm loop, not QEMU (removed
     // 2026-05-26; falsified 2026-07-13, see the doc comment above).
-    @import("../../time/apic.zig").maskIsaIrq(1, 0x21);
+    @import("../../irq/apic.zig").maskIsaIrq(1, 0x21);
 }
 
 /// Re-enable keyboard IRQ after mouse init may have changed the PS/2 config.

@@ -23,7 +23,7 @@
 const std = @import("std");
 const vga = @import("../driver.zig").vga;
 const gfx = @import("gfx.zig");
-const apic = @import("../time/apic.zig");
+const apic = @import("../irq/apic.zig");
 
 pub const Phase = enum(u8) {
     cpu = 0,

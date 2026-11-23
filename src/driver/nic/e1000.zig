@@ -26,7 +26,7 @@ const io = @import("../../io.zig");
 const pci = @import("../bus/pci.zig");
 const pmm = @import("../../mm/pmm.zig");
 const paging = @import("../../mm/paging.zig");
-const msix = @import("../../time/msix.zig");
+const msix = @import("../../irq/msix.zig");
 const debug = @import("../../debug/debug.zig");
 const serial = @import("../../debug/serial.zig");
 const net = @import("../../net/net.zig");
@@ -267,7 +267,7 @@ pub fn dumpState() void {
         pci.configRead16(pci_bus, pci_dev, pci_func, 0x06),
         if (pci.configRead16(pci_bus, pci_dev, pci_func, 0x06) & 0x8 != 0) "asserted" else "quiet",
     });
-    if (intx_gsi) |g| @import("../../time/apic.zig").dumpGsi(g);
+    if (intx_gsi) |g| @import("../../irq/apic.zig").dumpGsi(g);
 }
 
 /// The legacy INTx pin, routed per ACPI _PRT, for a NIC without MSI.
@@ -281,7 +281,7 @@ fn armIntx(d: pci.PciDevice) bool {
     dynirq.registerIrq(vec, &e1000IrqHandler);
     intx_vec = vec;
     intx_gsi = gsi;
-    if (!@import("../../time/apic.zig").routePciIntx(gsi, vec, intx.low)) {
+    if (!@import("../../irq/apic.zig").routePciIntx(gsi, vec, intx.low)) {
         intx_gsi = null;
         return false;
     }
@@ -324,7 +324,7 @@ fn e1000IrqHandler() callconv(.c) void {
                 mmioWrite(REG_IMC, ICR_RXT0);
                 const cmd = pci.configRead16(pci_bus, pci_dev, pci_func, 0x04);
                 pci.configWrite16(pci_bus, pci_dev, pci_func, 0x04, cmd | 0x0400);
-                @import("../../time/apic.zig").maskPciIntx(gsi, intx_vec);
+                @import("../../irq/apic.zig").maskPciIntx(gsi, intx_vec);
                 intx_gsi = null;
                 irq_driven = false;
                 debug.klog("[e1000] INTx GSI{d}: {d} foreign interrupts in a row, masked; polled mode\n", .{ gsi, INTX_STORM });

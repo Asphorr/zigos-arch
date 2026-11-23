@@ -10,7 +10,7 @@ const time = @import("../../time/time.zig");
 const layout = @import("layout.zig");
 const dirty_rects = @import("dirty.zig");
 const smp = @import("../../cpu/smp.zig");
-const apic = @import("../../time/apic.zig");
+const apic = @import("../../irq/apic.zig");
 const pmm = @import("../../mm/pmm.zig");
 const process = @import("../../proc/process.zig");
 

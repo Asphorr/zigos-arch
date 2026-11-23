@@ -10,7 +10,7 @@ const process = @import("proc/process.zig");
 const perf = @import("debug/perf.zig");
 const debug = @import("debug/debug.zig");
 const signals = @import("proc/signals.zig");
-const apic = @import("time/apic.zig");
+const apic = @import("irq/apic.zig");
 
 const common = @import("syscall/common.zig");
 const E_NOSYS: u32 = common.E_NOSYS;

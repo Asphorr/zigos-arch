@@ -28,7 +28,7 @@
 const smp = @import("../cpu/smp.zig");
 const serial = @import("serial.zig");
 const kdbg = @import("kdbg.zig");
-const apic = @import("../time/apic.zig");
+const apic = @import("../irq/apic.zig");
 const kvm = @import("../virt/kvm.zig");
 
 /// Quanta between peer checks: 100 × 10 ms = 1 second of the watcher's TSC.

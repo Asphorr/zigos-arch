@@ -23,7 +23,7 @@ const Guarded = @import("guarded.zig").Guarded;
 
 // Diagnostics-only deps (dumpRecent).
 const serial = @import("../debug/serial.zig");
-const apic = @import("../time/apic.zig");
+const apic = @import("../irq/apic.zig");
 
 /// Generic kernel failure vocabulary, for plumbing that doesn't want its
 /// own set. Subsystems with richer taxonomies keep declaring their own

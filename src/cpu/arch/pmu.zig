@@ -22,7 +22,7 @@
 const std = @import("std");
 const debug = @import("../../debug/debug.zig");
 const serial = @import("../../debug/serial.zig");
-const apic = @import("../../time/apic.zig");
+const apic = @import("../../irq/apic.zig");
 
 const MSR_IA32_PMC0: u32 = 0xC1;
 const MSR_IA32_PERFEVTSEL0: u32 = 0x186;

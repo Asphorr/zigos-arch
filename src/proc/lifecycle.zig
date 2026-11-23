@@ -1545,7 +1545,7 @@ pub fn killProcessWithStatus(pid: u8, status: u32) void {
         }
     }
 
-    const apic = @import("../time/apic.zig");
+    const apic = @import("../irq/apic.zig");
     const my_lapic = apic.getLapicId();
     var ipi_attempts: u32 = 0;
     var loading_waits: u32 = 0;

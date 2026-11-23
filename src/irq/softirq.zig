@@ -33,7 +33,7 @@
 const std = @import("std");
 
 const smp = @import("../cpu/smp.zig");
-const process = @import("process.zig");
+const process = @import("../proc/process.zig");
 const serial = @import("../debug/serial.zig");
 const lprof = @import("../debug/linux_prof.zig");
 

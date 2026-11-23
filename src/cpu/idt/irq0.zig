@@ -11,7 +11,7 @@
 
 const std = @import("std");
 const io = @import("../../io.zig");
-const apic = @import("../../time/apic.zig");
+const apic = @import("../../irq/apic.zig");
 const process = @import("../../proc/process.zig");
 const debug = @import("../../debug/debug.zig");
 const serial = @import("../../debug/serial.zig");
@@ -274,7 +274,7 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
         // !was_soft_yield gate so ksoftirqd's own blockOn soft-yield can
         // never re-raise and spin it (the Inc1 bug-lesson).
         if (serial.pendingToPort() != 0) {
-            _ = @import("../../proc/softirq.zig").raise(.klog);
+            _ = @import("../../irq/softirq.zig").raise(.klog);
         }
     }
 
@@ -411,7 +411,7 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
             // silently starve every periodic job below across idle.
             if (process.tick_count >= next_backstop_tick) {
                 next_backstop_tick = process.tick_count + 10;
-                const softirq = @import("../../proc/softirq.zig");
+                const softirq = @import("../../irq/softirq.zig");
                 const nvme = @import("../../driver.zig").nvme;
                 const virtio_gpu = @import("../../driver.zig").virtio_gpu;
                 if (xhci.hidSweepWanted() and !softirq.raise(.hid)) xhci.pollHID();
@@ -428,7 +428,7 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
             // with interrupts off here.
             if (process.tick_count >= next_perfdump_tick) {
                 next_perfdump_tick = process.tick_count + 500;
-                if (!@import("../../proc/softirq.zig").raise(.perf_dump)) perfDump();
+                if (!@import("../../irq/softirq.zig").raise(.perf_dump)) perfDump();
             }
 
             // Tier C.1: rotate DR0-DR3 across procs[].kernel_esp slots so any

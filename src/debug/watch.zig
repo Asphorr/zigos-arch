@@ -33,7 +33,7 @@ const std = @import("std");
 // File-scope hoist (LLVM Invalid-type roulette: no decl-heavy @import
 // inside the giant handler bodies below).
 const SAVED_RIP_OFF: usize = @import("../proc/frames.zig").dispatch.saved_rip_off;
-const apic = @import("../time/apic.zig");
+const apic = @import("../irq/apic.zig");
 const smp = @import("../cpu/smp.zig");
 const serial = @import("serial.zig");
 const symbols = @import("symbols.zig");

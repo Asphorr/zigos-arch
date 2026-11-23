@@ -427,7 +427,7 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     // when initPerCpuPv just armed and proved it — that is why this sits
     // between initPerCpuPv and apic.init, which starts IRQ0).
     @import("time/smi.zig").benchRulers();
-    if (@import("time/apic.zig").init()) {
+    if (@import("irq/apic.zig").init()) {
         blog.ok("Local APIC + IOAPIC");
     } else {
         blog.warn("Local APIC + IOAPIC", "falling back to legacy PIC+PIT", .{});

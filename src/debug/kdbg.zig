@@ -1001,7 +1001,7 @@ pub fn nmiSnapshot(rsp: u64, saved_rip: u64, saved_cs: u64) void {
     // ahead of and lighter than the LBR/snapshot work below, so the sampled
     // CPU returns to its wedged state fast and can be re-sampled.
     if (@atomicLoad(bool, &prof_active, .acquire)) {
-        const apic_p = @import("../time/apic.zig");
+        const apic_p = @import("../irq/apic.zig");
         if (@as(u32, @intCast(apic_p.getLapicId())) == prof_target_lapic) {
             profileRecord(saved_rip);
             return;
@@ -1026,7 +1026,7 @@ pub fn nmiSnapshot(rsp: u64, saved_rip: u64, saved_cs: u64) void {
     // Each NMI snapshot is short so even interleaved output stays
     // grep-able (the post-`broadcastNMI` 50 ms wait + peers halting
     // gives us mostly-clean output in practice).
-    const apic = @import("../time/apic.zig");
+    const apic = @import("../irq/apic.zig");
     const smp = @import("../cpu/smp.zig");
     const process = @import("../proc/process.zig");
     const cpu_id: u32 = @intCast(apic.getLapicId());
@@ -1093,7 +1093,7 @@ pub fn nmiSnapshot(rsp: u64, saved_rip: u64, saved_cs: u64) void {
 /// nmiSnapshot() and IRETs back. Caller should already be in panic
 /// critical section (or about to enter one).
 pub fn broadcastNMI() void {
-    const apic = @import("../time/apic.zig");
+    const apic = @import("../irq/apic.zig");
     const smp = @import("../cpu/smp.zig");
     const my_id = apic.getLapicId();
     serial.emergencyPrint("[nmi-broadcast] from cpu{d} — soliciting snapshots\n", .{my_id});
@@ -1227,7 +1227,7 @@ fn profileRecord(saved_rip: u64) void {
 /// cannot. Bounded: each sample waits a hard cap for the target's ack, so an
 /// already-halted / host-paused target can't hang the autopsy.
 pub fn profileWedgedCpu(target_lapic: u32, n: u32) void {
-    const apic = @import("../time/apic.zig");
+    const apic = @import("../irq/apic.zig");
 
     // Reset histogram. Plain stores are safe because the two callers serialize
     // this function: watchdog fire() is single-fire CAS-gated, and the other —
@@ -1419,7 +1419,7 @@ pub fn enterCritical() void {
     // deadlock every subsequent banner/dump on this CPU — the 2026-06-04
     // wedge, where the snapshot hung and the log ended at a lone `[`.
     serial.emergency_mode = true;
-    const my_cpu: u32 = @intCast(@import("../time/apic.zig").getLapicId());
+    const my_cpu: u32 = @intCast(@import("../irq/apic.zig").getLapicId());
 
     // Already ours? (e.g., main.panic called from iretq_canary.report)
     if (@atomicLoad(u32, &critical_owner_cpu, .acquire) == my_cpu) return;
@@ -1488,7 +1488,7 @@ fn printPanicCallSite(rip: u64) void {
 pub fn crashSummary(opts: AutopsyOpts) void {
     const build_options = @import("build_options");
     const build_id = build_options.build_id;
-    const cpu_id: u32 = opts.cpu_id orelse @as(u32, @intCast(@import("../time/apic.zig").getLapicId()));
+    const cpu_id: u32 = opts.cpu_id orelse @as(u32, @intCast(@import("../irq/apic.zig").getLapicId()));
 
     serial.print("\n[kdbg] ====== CRASH SUMMARY ======\n", .{});
     serial.print("[kdbg] Build:    0x{X:0>16}\n", .{build_id});
@@ -1576,7 +1576,7 @@ pub fn crashSummary(opts: AutopsyOpts) void {
 pub fn crashAutopsy(opts: AutopsyOpts) void {
     enterCritical();
 
-    const cpu_id: u32 = opts.cpu_id orelse @as(u32, @intCast(@import("../time/apic.zig").getLapicId()));
+    const cpu_id: u32 = opts.cpu_id orelse @as(u32, @intCast(@import("../irq/apic.zig").getLapicId()));
 
     // TL;DR first — the [crash-fp] line gives the host script everything it
     // needs to dedupe and triage without grepping the rest of the autopsy.

@@ -11,7 +11,7 @@
 const std = @import("std");
 const config = @import("../config.zig");
 const smp = @import("../cpu/smp.zig");
-const apic = @import("../time/apic.zig");
+const apic = @import("../irq/apic.zig");
 const perf = @import("perf.zig");
 const serial = @import("serial.zig");
 

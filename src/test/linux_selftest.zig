@@ -476,7 +476,7 @@ fn check(c: Case, run: u32) void {
 /// What a clock read and a VM exit cost on this machine.
 fn probeClock() void {
     const perf = @import("../debug/perf.zig");
-    const per_q = @import("../time/apic.zig").tscPerQuantumSane();
+    const per_q = @import("../irq/apic.zig").tscPerQuantumSane();
     if (per_q == 0) return;
     const reads: u64 = 1000;
     const t0 = perf.rdtsc();
@@ -496,7 +496,7 @@ fn probeClock() void {
 /// What one root-disk read costs on an idle system, by size.
 fn probeDisk() void {
     const perf = @import("../debug/perf.zig");
-    const per_q = @import("../time/apic.zig").tscPerQuantumSane();
+    const per_q = @import("../irq/apic.zig").tscPerQuantumSane();
     if (per_q == 0) return;
     const S = struct {
         var buf: [128 * 1024]u8 align(4096) = undefined;

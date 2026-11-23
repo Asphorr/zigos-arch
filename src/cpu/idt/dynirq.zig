@@ -12,7 +12,7 @@
 const std = @import("std");
 const debug = @import("../../debug/debug.zig");
 const serial = @import("../../debug/serial.zig");
-const apic = @import("../../time/apic.zig");
+const apic = @import("../../irq/apic.zig");
 
 pub const DYN_IRQ_BASE: u8 = 0x40;
 pub const DYN_IRQ_COUNT: u8 = 16;

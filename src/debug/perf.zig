@@ -245,7 +245,7 @@ pub fn leave(phase: Phase, start_tsc: u64) void {
     // Resolve an aged pending sample: 3 quanta past its end, smi has had
     // its post-stall tick (or there was no stall) — verdict is in.
     if (st.pending.valid) {
-        const tpq = @import("../time/apic.zig").tscPerQuantum();
+        const tpq = @import("../irq/apic.zig").tscPerQuantum();
         if (tpq == 0 or end -% st.pending.end > 3 *% tpq) {
             const pd = st.pending;
             st.pending.valid = false;

@@ -6,7 +6,7 @@ const debug = @import("../../debug/debug.zig");
 const process = @import("../../proc/process.zig");
 const keyboard = @import("../input/keyboard.zig");
 const mouse = @import("../input/mouse.zig");
-const msix = @import("../../time/msix.zig");
+const msix = @import("../../irq/msix.zig");
 const Deadline = @import("../../util/deadline.zig").Deadline;
 const iommu = @import("../iommu.zig");
 
@@ -2586,7 +2586,7 @@ pub fn pollHID() void {
     // is typematic spam fuel. Task-context raise: safe (we ARE ksoftirqd's
     // .hid action; the pending bit just re-runs us before it sleeps).
     if (!ring_emptied) {
-        _ = @import("../../proc/softirq.zig").raise(.hid);
+        _ = @import("../../irq/softirq.zig").raise(.hid);
     }
 
     // Reopen the typematic gate only if the ring is actually EMPTY (a

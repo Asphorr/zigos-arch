@@ -5,11 +5,11 @@ const Phys = @import("../../util/addr.zig").Phys;
 const paging = @import("../../mm/paging.zig");
 const debug = @import("../../debug/debug.zig");
 const idt = @import("../../cpu/idt.zig");
-const msix = @import("../../time/msix.zig");
+const msix = @import("../../irq/msix.zig");
 const iommu = @import("../iommu.zig");
 const SpinLock = @import("../../proc/spinlock.zig").SpinLock;
 const Mutex = @import("../../proc/spinlock.zig").Mutex;
-const apic = @import("../../time/apic.zig");
+const apic = @import("../../irq/apic.zig");
 const perf = @import("../../debug/perf.zig");
 const Deadline = @import("../../util/deadline.zig").Deadline;
 
@@ -118,7 +118,7 @@ fn virtioGpuIrqHandler() callconv(.c) void {
     // the coalesced-rect resubmit) to ksoftirqd via the .virtio_gpu softirq,
     // same discipline as the NVMe reap. One atomic load when idle.
     if (@atomicLoad(bool, &aflush_in_flight, .acquire)) {
-        _ = @import("../../proc/softirq.zig").raise(.virtio_gpu);
+        _ = @import("../../irq/softirq.zig").raise(.virtio_gpu);
         smp_mod.myCpu().dynirq_preempt_pending = true;
     }
 
@@ -751,7 +751,7 @@ fn sendCmdViaPhys(cmd_len: u32, resp_len: u32) bool {
     if (msix_entry_addr != 0) {
         const my_cpu = @import("../../cpu/smp.zig").myCpu();
         const my_apic_id: u32 = my_cpu.lapic_id;
-        @import("../../time/msix.zig").retargetEntry(msix_entry_addr, my_apic_id);
+        @import("../../irq/msix.zig").retargetEntry(msix_entry_addr, my_apic_id);
         // One-shot diagnostic: confirm we're actually retargeting with a
         // sane lapic_id (not 0 from uninit). Also dump the post-retarget
         // entry contents so we can see whether QEMU honored the rewrite.
@@ -1069,7 +1069,7 @@ fn sendSimpleCmdPair(
     if (msix_entry_addr != 0) {
         const my_cpu = @import("../../cpu/smp.zig").myCpu();
         const my_apic_id: u32 = my_cpu.lapic_id;
-        @import("../../time/msix.zig").retargetEntry(msix_entry_addr, my_apic_id);
+        @import("../../irq/msix.zig").retargetEntry(msix_entry_addr, my_apic_id);
     }
 
     // EVENT_IDX: ask device to fire IRQ when usedIdx == used_event + 1.
@@ -1779,7 +1779,7 @@ fn kickPendingFromTask() void {
     if (@atomicLoad(bool, &aflush_pending, .acquire) and
         !@atomicLoad(bool, &aflush_in_flight, .acquire))
     {
-        _ = @import("../../proc/softirq.zig").raise(.virtio_gpu);
+        _ = @import("../../irq/softirq.zig").raise(.virtio_gpu);
     }
 }
 

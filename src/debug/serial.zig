@@ -481,7 +481,7 @@ var emerg_bufs: [PRINT_NUM_BUFS][PRINT_BUF_LEN]u8 align(16) = undefined;
 /// emergency_mode is even set; once it IS set, plain `print`/`write` also
 /// route through the lock-free path automatically (no call-site changes).
 pub fn emergencyPrint(comptime format: []const u8, args: anytype) void {
-    const lapic_id = @import("../time/apic.zig").getLapicId();
+    const lapic_id = @import("../irq/apic.zig").getLapicId();
     const idx: usize = if (lapic_id < PRINT_NUM_BUFS) @intCast(lapic_id) else 0;
     const out = std.fmt.bufPrint(&emerg_bufs[idx], format, args) catch "[emerg: buf overflow]\n";
     emergencyWrite(out);

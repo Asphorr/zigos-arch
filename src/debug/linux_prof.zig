@@ -4,7 +4,7 @@
 
 const serial = @import("serial.zig");
 const perf = @import("perf.zig");
-const apic = @import("../time/apic.zig");
+const apic = @import("../irq/apic.zig");
 const nvme = @import("../driver.zig").nvme;
 const smp = @import("../cpu/smp.zig");
 const process = @import("../proc/process.zig");

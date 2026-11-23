@@ -25,7 +25,7 @@ const pid_nr = @import("../proc/pid_nr.zig");
 const session = @import("../proc/session.zig");
 const errno = @import("../proc/errno.zig");
 const sched_asm = @import("../proc/sched_asm.zig");
-const apic = @import("../time/apic.zig");
+const apic = @import("../irq/apic.zig");
 
 const common = @import("common.zig");
 const validateUserPtr = common.validateUserPtr;

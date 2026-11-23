@@ -27,7 +27,7 @@
 const syscall = @import("../syscall.zig");
 const smp = @import("../cpu/smp.zig");
 const gdt = @import("../cpu/arch/gdt.zig");
-const apic = @import("../time/apic.zig");
+const apic = @import("../irq/apic.zig");
 const std = @import("std");
 
 // MSR numbers

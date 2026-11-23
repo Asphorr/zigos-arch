@@ -80,7 +80,7 @@ const std = @import("std");
 
 // Core — what the primitives themselves need to function.
 const smp = @import("../cpu/smp.zig");
-const apic = @import("../time/apic.zig"); // tscPerQuantum; CPU identity is smp.myCpuId()
+const apic = @import("../irq/apic.zig"); // tscPerQuantum; CPU identity is smp.myCpuId()
 const process = @import("process.zig"); // Mutex block/wake integration
 const PidSet = @import("../util/pid_set.zig").PidSet;
 

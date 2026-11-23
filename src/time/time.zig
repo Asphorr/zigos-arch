@@ -18,7 +18,7 @@ const debug = @import("../debug/debug.zig");
 const perf = @import("../debug/perf.zig");
 const rtc = @import("rtc.zig");
 const hpet = @import("hpet.zig");
-const apic = @import("apic.zig");
+const apic = @import("../irq/apic.zig");
 
 var boot_unix_sec: u64 = 0;
 /// HPET reading at clock 0 (moved by restartClock).

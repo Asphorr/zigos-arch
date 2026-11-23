@@ -150,7 +150,7 @@ fn armReplyMarker(ring: [*]volatile u8) void {
 
 /// Wait for the marker of the stream just submitted.
 fn waitReplyMarker(ring: [*]volatile u8, timeout_ms: u64) SubmitResult {
-    const apic = @import("../time/apic.zig");
+    const apic = @import("../irq/apic.zig");
     const hrtimer = @import("../proc/hrtimer.zig");
     const tpq = apic.tscPerQuantum();
     const per_us = hrtimer.tscPerUs(if (tpq == 0) 30_000_000 else tpq);
@@ -196,7 +196,7 @@ fn submitFrame(timeout_ms: u64) SubmitResult {
     // The ring and the virtqueue run on different host threads: what the
     // virtqueue still holds (a new window's descriptor update, say) must
     // land before a frame uses it.
-    const apic = @import("../time/apic.zig");
+    const apic = @import("../irq/apic.zig");
     const t0 = apic.readTsc();
     const drained = virtqueue_pending;
     if (virtqueue_pending and !drainVirtqueue()) return .not_sent;
@@ -1581,7 +1581,7 @@ fn ringWrite(bytes: []const u8) bool {
     if (len > size) return false;
     // Each frame waited for its marker, so the ring is all but empty: the
     // host stores the head after every command.
-    const apic = @import("../time/apic.zig");
+    const apic = @import("../irq/apic.zig");
     const start = apic.readTsc();
     while (ring_tail -% @atomicLoad(u32, ringU32(RING_HEAD_OFFSET), .acquire) > size - len) {
         if (@atomicLoad(u32, ringU32(RING_STATUS_OFFSET), .acquire) & RING_STATUS_FATAL != 0) return false;
@@ -2391,7 +2391,7 @@ fn recordBackgroundDraw(bg_push: *const [32]u8) void {
 }
 
 fn renderVulkanFrame(_: f32) FrameResult {
-    const apic = @import("../time/apic.zig");
+    const apic = @import("../irq/apic.zig");
     const t_encode = apic.readTsc();
     var bg_push: [32]u8 = undefined;
     // Background image (backbuf) is allocated at exact screen size, so
@@ -2759,7 +2759,7 @@ fn run() noreturn {
         // Frame-start timestamp + interval bucketing. Done AFTER the
         // sleep wait so the interval reflects "renderable frame to
         // renderable frame", which is what the user actually perceives.
-        const apic = @import("../time/apic.zig");
+        const apic = @import("../irq/apic.zig");
         const frame_start_tsc = apic.readTsc();
         if (prev_frame_tsc != 0) {
             const interval_ms = apic.tscToMs(frame_start_tsc -% prev_frame_tsc);

@@ -42,7 +42,7 @@
 //     global lock entirely).
 
 const std = @import("std");
-const apic = @import("../../time/apic.zig");
+const apic = @import("../../irq/apic.zig");
 const smp = @import("../smp.zig");
 const debug = @import("../../debug/debug.zig");
 const perf = @import("../../debug/perf.zig");

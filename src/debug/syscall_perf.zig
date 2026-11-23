@@ -28,7 +28,7 @@ const std = @import("std");
 const smp = @import("../cpu/smp.zig");
 const perf = @import("perf.zig");
 const serial = @import("serial.zig");
-const apic = @import("../time/apic.zig");
+const apic = @import("../irq/apic.zig");
 
 pub const Phase = enum(u8) {
     /// validateUserPtr / prefaultUserRange — PT walk for every page.

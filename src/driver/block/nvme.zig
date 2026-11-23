@@ -27,7 +27,7 @@ const pci = @import("../bus/pci.zig");
 const iommu = @import("../iommu.zig");
 const pmm = @import("../../mm/pmm.zig");
 const paging = @import("../../mm/paging.zig");
-const msix = @import("../../time/msix.zig");
+const msix = @import("../../irq/msix.zig");
 const debug = @import("../../debug/debug.zig");
 const Guarded = @import("../../util/guarded.zig").Guarded;
 const Deadline = @import("../../util/deadline.zig").Deadline;
@@ -538,7 +538,7 @@ fn nvmeIrqHandler() callconv(.c) void {
         }
     }
     if (any_async) {
-        _ = @import("../../proc/softirq.zig").raise(.nvme);
+        _ = @import("../../irq/softirq.zig").raise(.nvme);
         @import("../../cpu/smp.zig").myCpu().dynirq_preempt_pending = true;
     }
 }

@@ -33,7 +33,7 @@ const std = @import("std");
 
 // Core deps.
 const perf = @import("../debug/perf.zig");
-const apic = @import("../time/apic.zig");
+const apic = @import("../irq/apic.zig");
 const pause = @import("../time/pause.zig");
 const smi = @import("../time/smi.zig");
 

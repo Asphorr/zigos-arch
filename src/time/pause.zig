@@ -53,7 +53,7 @@
 //! would MASK a genuine wedge. The former is the pre-existing failure, only
 //! rarer; the latter would be new.
 
-const apic = @import("apic.zig");
+const apic = @import("../irq/apic.zig");
 const kvm = @import("../virt/kvm.zig");
 const smp = @import("../cpu/smp.zig");
 const serial = @import("../debug/serial.zig");

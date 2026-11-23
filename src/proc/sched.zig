@@ -456,7 +456,7 @@ pub fn setAffinity(pid: u8, cpu_id: u8) bool {
             if (c.current_pid) |cur| {
                 if (cur == pid) {
                     if (kill_kick_vector) |v| {
-                        const apic = @import("../time/apic.zig");
+                        const apic = @import("../irq/apic.zig");
                         apic.sendIPI(c.lapic_id, v);
                     }
                     break;
@@ -1219,7 +1219,7 @@ fn maybePreemptOnWake(pid: usize) void {
     }
 
     if (kill_kick_vector) |v| {
-        const apic = @import("../time/apic.zig");
+        const apic = @import("../irq/apic.zig");
         wakelat.noteIpiSent(target_cpu_id);
         apic.sendIPI(target_cpu.lapic_id, v);
     }
@@ -1252,7 +1252,7 @@ fn idlePollingSees(cpu_id: u8) bool {
 /// so device completions keep flowing.
 pub fn pollIdle() bool {
     const id = smp.myCpu().cpu_id;
-    const per_q = @import("../time/apic.zig").tscPerQuantumSane();
+    const per_q = @import("../irq/apic.zig").tscPerQuantumSane();
     if (per_q == 0 or id >= smp.MAX_CPUS) return false;
     const budget = per_q * IDLE_POLL_US / 10_000;
     const perf = @import("../debug/perf.zig");
@@ -1373,7 +1373,7 @@ pub fn kickReschedule(pid: usize) void {
     if (!target_cpu.alive) return;
     if (kill_kick_vector) |v| {
         wakelat.noteIpiSent(target_cpu_id);
-        @import("../time/apic.zig").sendIPI(target_cpu.lapic_id, v);
+        @import("../irq/apic.zig").sendIPI(target_cpu.lapic_id, v);
     }
 }
 
@@ -3199,7 +3199,7 @@ fn kickIdleWaiter(cpu: u8) void {
     // wake()'s locked exchange of wake_pending orders it before this load.
     if (!idle_waiting[cpu].load(.seq_cst)) return;
     const v = wakeVector() orelse return;
-    @import("../time/apic.zig").sendIPI(smp.cpus[cpu].lapic_id, v);
+    @import("../irq/apic.zig").sendIPI(smp.cpus[cpu].lapic_id, v);
 }
 
 

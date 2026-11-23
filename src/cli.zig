@@ -948,7 +948,7 @@ fn cmdPerf() void {
 /// blocks the shell (fine for a one-shot diagnostic). Falls back to a
 /// bounded pause loop if the TSC rate isn't known yet.
 fn spinMs(ms: u64) void {
-    const apic = @import("time/apic.zig");
+    const apic = @import("irq/apic.zig");
     const per_quantum = apic.tscPerQuantum(); // TSC ticks per 10ms
     if (per_quantum == 0) {
         var i: u64 = 0;

@@ -226,7 +226,7 @@ fn formatCr2(buf: []u8, cr2: u64) []const u8 {
 }
 
 fn formatMeta(buf: []u8, cpu_id_opt: ?u32) []const u8 {
-    const apic = @import("../time/apic.zig");
+    const apic = @import("../irq/apic.zig");
     const cid = cpu_id_opt orelse @as(u32, @intCast(apic.getLapicId()));
     const build_id = @import("build_options").build_id;
     return std.fmt.bufPrint(buf, "cpu{d}    Build: 0x{X:0>16}", .{ cid, build_id }) catch "(fmt)";

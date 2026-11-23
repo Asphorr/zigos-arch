@@ -1,5 +1,5 @@
 const std = @import("std");
-const pic = @import("../time/pic.zig");
+const pic = @import("../irq/pic.zig");
 const syscall = @import("../syscall.zig");
 const debug = @import("../debug/debug.zig");
 const serial = @import("../debug/serial.zig");

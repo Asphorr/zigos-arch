@@ -5,7 +5,7 @@ const io = @import("../io.zig");
 const paging = @import("../mm/paging.zig");
 const acpi = @import("../acpi/acpi.zig");
 const debug = @import("../debug/debug.zig");
-const pit = @import("pit.zig");
+const pit = @import("../time/pit.zig");
 const pic = @import("pic.zig");
 
 // Local APIC + IOAPIC bases — stored as kernel-pointer VAs through the
@@ -574,7 +574,7 @@ fn calibrateTimerHyperv() bool {
 
 /// HPET-based calibration. Returns true on success.
 fn calibrateTimerHpet() bool {
-    const hpet = @import("hpet.zig");
+    const hpet = @import("../time/hpet.zig");
     if (!hpet.isInitialized()) return false;
 
     // Set APIC timer divider to 16 + start counting down from max

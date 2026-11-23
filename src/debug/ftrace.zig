@@ -5,7 +5,7 @@
 
 const std = @import("std");
 const perf = @import("perf.zig");
-const apic = @import("../time/apic.zig");
+const apic = @import("../irq/apic.zig");
 const debug = @import("debug.zig");
 
 /// The letter is what dump() prints.

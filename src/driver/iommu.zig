@@ -33,7 +33,7 @@ const pmm = @import("../mm/pmm.zig");
 const paging = @import("../mm/paging.zig");
 const debug = @import("../debug/debug.zig");
 const pci = @import("../driver.zig").pci;
-const msix = @import("../time/msix.zig");
+const msix = @import("../irq/msix.zig");
 const process = @import("../proc/process.zig");
 
 // --- VT-d register offsets (relative to each DRHD's `register_base`) ------
