@@ -163,7 +163,8 @@ pub fn build(b: *std.Build) void {
     // build; sleep-under-spinlock is a warning. Host tool; the src/
     // directory is its hashed input, so it re-runs only when a source
     // file changes. `zig run tools/ctx_lint.zig -- src --verbose` lists
-    // roots and sleepers.
+    // roots and sleepers; `--unresolved` lists the calls no callee was
+    // found for (diff the list when that count moves).
     const ctx_lint_exe = b.addExecutable(.{
         .name = "ctx_lint",
         .root_module = b.createModule(.{

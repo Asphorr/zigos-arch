@@ -144,6 +144,9 @@ const Lint = struct {
     lock_tags: u32 = 0,
     guarded_file: u32 = NONE,
     verbose: bool = false,
+    /// Print every call no callee was found for: what an IRQ walk cannot
+    /// see past. Diff the list when the count moves.
+    list_unresolved: bool = false,
 
     fn err(self: *Lint, comptime fmt: []const u8, args: anytype) void {
         self.errors += 1;
@@ -479,6 +482,7 @@ const Lint = struct {
             try self.resolveCallee(fi, owner, call.ast.fn_expr, &targets);
             if (targets.items.len == 0) {
                 self.calls_unresolved += 1;
+                if (self.list_unresolved) std.debug.print("[ctx-lint] unresolved: {s}:{d} {s}\n", .{ f.path, self.lineOf(fi, call_tok), tree.getNodeSource(call.ast.fn_expr) });
                 continue;
             }
             for (targets.items) |t| {
@@ -931,9 +935,12 @@ pub fn main() !void {
     const args = try std.process.argsAlloc(alloc);
     var root: []const u8 = "src";
     var verbose = false;
+    var list_unresolved = false;
     for (args[1..]) |a| {
         if (std.mem.eql(u8, a, "--verbose") or std.mem.eql(u8, a, "-v")) {
             verbose = true;
+        } else if (std.mem.eql(u8, a, "--unresolved")) {
+            list_unresolved = true;
         } else {
             root = a;
         }
@@ -945,6 +952,7 @@ pub fn main() !void {
         .reachable = std.AutoHashMap(u32, void).init(alloc),
         .field_kinds = std.StringHashMap(FieldKind).init(alloc),
         .verbose = verbose,
+        .list_unresolved = list_unresolved,
     };
     try lint.loadTree(root);
     try lint.computeReachable();
