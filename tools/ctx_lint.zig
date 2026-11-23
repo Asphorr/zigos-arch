@@ -15,8 +15,9 @@
 //!      park the caller: the `sched.blockOn*` family, `Mutex.acquire` —
 //!      identified structurally as "calls spinlock.mightSleep(@src())".
 //!      The walk follows the statically resolvable call graph (same-file
-//!      calls, `alias.fn()` through `@import` aliases and `const x =
-//!      mod.fn` re-exports, `Type.method()` through type aliases, method
+//!      calls, `alias.fn()` through `@import` aliases, facade chains
+//!      (`@import("driver.zig").nvme.f()`), `const x = mod.fn` re-exports in
+//!      either file, `Type.method()` through type aliases, method
 //!      calls by name within a file). A path root → … → sleeper is an
 //!      ERROR, printed in full. `// ctx: irq-ok <reason>` on a function
 //!      cuts the walk there — the documented "this branches on context"
@@ -452,10 +453,22 @@ const Lint = struct {
                     for (call.ast.params) |p| {
                         var arg = p;
                         if (tree.nodeTag(arg) == .address_of) arg = tree.nodeData(arg).node;
-                        if (tree.nodeTag(arg) != .identifier) continue;
-                        const aname = tree.tokenSlice(tree.nodeMainToken(arg));
-                        for (f.fns.items) |fx| {
-                            if (std.mem.eql(u8, self.fns.items[fx].name, aname)) self.fns.items[fx].is_root = true;
+                        switch (tree.nodeTag(arg)) {
+                            .identifier => {
+                                const aname = tree.tokenSlice(tree.nodeMainToken(arg));
+                                for (f.fns.items) |fx| {
+                                    if (std.mem.eql(u8, self.fns.items[fx].name, aname)) self.fns.items[fx].is_root = true;
+                                }
+                            },
+                            // A handler in another module: `part.handler`.
+                            .field_access => {
+                                const pair = tree.nodeData(arg).node_and_token;
+                                const target = self.exprFile(fi, pair[0], 0) orelse continue;
+                                var roots: std.ArrayList(u32) = .empty;
+                                try self.fnsNamedIn(target, tree.tokenSlice(pair[1]), NONE, &roots);
+                                for (roots.items) |fx| self.fns.items[fx].is_root = true;
+                            },
+                            else => {},
                         }
                     }
                 }
@@ -500,26 +513,17 @@ const Lint = struct {
                 const pair = tree.nodeData(expr).node_and_token;
                 const lhs = pair[0];
                 const name = tree.tokenSlice(pair[1]);
-                switch (tree.nodeTag(lhs)) {
-                    .identifier => {
-                        const lhs_name = tree.tokenSlice(tree.nodeMainToken(lhs));
-                        if (f.imports.get(lhs_name)) |target| {
-                            try self.fnsNamedIn(target, name, NONE, out);
-                            return;
-                        }
-                        if (f.decl_aliases.get(lhs_name)) |a| {
-                            // Type alias: `Deadline.ms(...)` → fn `ms` in that file.
-                            try self.fnsNamedIn(a.file, name, NONE, out);
-                            return;
-                        }
-                    },
-                    .builtin_call_two, .builtin_call_two_comma => {
-                        if (self.importTarget(fi, lhs)) |target| {
-                            try self.fnsNamedIn(target, name, NONE, out);
-                            return;
-                        }
-                    },
-                    else => {},
+                // `mod.f`, `@import("m.zig").f`, `facade.mod.f`, `alias.f`.
+                if (self.exprFile(fi, lhs, 0)) |target| {
+                    try self.fnsNamedIn(target, name, NONE, out);
+                    return;
+                }
+                if (tree.nodeTag(lhs) == .identifier) {
+                    if (f.decl_aliases.get(tree.tokenSlice(tree.nodeMainToken(lhs)))) |a| {
+                        // Type alias: `Deadline.ms(...)` → fn `ms` in that file.
+                        try self.fnsNamedIn(a.file, name, NONE, out);
+                        return;
+                    }
                 }
                 // Method call on a value. Mutex receivers park the caller:
                 // route `.acquire()` on a Mutex-typed receiver to the
@@ -542,8 +546,14 @@ const Lint = struct {
     }
 
     /// All fns named `name` in `file`; if `prefer_container` is set and it
-    /// declares one, only that one.
+    /// declares one, only that one. A file that only re-exports the name
+    /// (`pub const f = part.f;`) is followed to where `f` is defined.
     fn fnsNamedIn(self: *Lint, file: u32, name: []const u8, prefer_container: u32, out: *std.ArrayList(u32)) !void {
+        return self.fnsNamedInDepth(file, name, prefer_container, out, 0);
+    }
+
+    fn fnsNamedInDepth(self: *Lint, file: u32, name: []const u8, prefer_container: u32, out: *std.ArrayList(u32), depth: u32) !void {
+        const before = out.items.len;
         if (prefer_container != NONE) {
             for (self.files.items[file].fns.items) |fx| {
                 const c = &self.fns.items[fx];
@@ -551,15 +561,52 @@ const Lint = struct {
                     try out.append(self.alloc, fx);
                 }
             }
-            if (out.items.len != 0) return;
+            if (out.items.len != before) return;
         }
         for (self.files.items[file].fns.items) |fx| {
             if (std.mem.eql(u8, self.fns.items[fx].name, name)) try out.append(self.alloc, fx);
         }
+        if (out.items.len != before or depth >= 4) return;
+        if (self.files.items[file].decl_aliases.get(name)) |a| {
+            if (a.name.len != 0) try self.fnsNamedInDepth(a.file, a.name, NONE, out, depth + 1);
+        }
+    }
+
+    /// The file an expression names as a module: `mod`, `@import("m.zig")`,
+    /// `facade.mod`, or a decl alias of one (`const m = @import("f.zig").mod`).
+    fn exprFile(self: *Lint, fi: u32, expr: NodeIndex, depth: u32) ?u32 {
+        if (depth >= 4) return null;
+        const f = &self.files.items[fi];
+        const tree = f.tree;
+        switch (tree.nodeTag(expr)) {
+            .identifier => {
+                const name = tree.tokenSlice(tree.nodeMainToken(expr));
+                if (f.imports.get(name)) |target| return target;
+                if (f.decl_aliases.get(name)) |a| return self.declFile(a.file, a.name, depth + 1);
+                return null;
+            },
+            .builtin_call_two, .builtin_call_two_comma => return self.importTarget(fi, expr),
+            .field_access => {
+                const pair = tree.nodeData(expr).node_and_token;
+                const base = self.exprFile(fi, pair[0], depth + 1) orelse return null;
+                return self.declFile(base, tree.tokenSlice(pair[1]), depth + 1);
+            },
+            else => return null,
+        }
+    }
+
+    /// The file that decl `name` of `file` stands for, if it is a module.
+    fn declFile(self: *Lint, file: u32, name: []const u8, depth: u32) ?u32 {
+        if (depth >= 4 or name.len == 0) return null;
+        const f = &self.files.items[file];
+        if (f.imports.get(name)) |target| return target;
+        if (f.decl_aliases.get(name)) |a| return self.declFile(a.file, a.name, depth + 1);
+        return null;
     }
 
     /// Receiver `x` / `a.b.x` typed `Mutex` (or `spinlock.Mutex`, `*Mutex`)
-    /// by an enclosing-container field or a file-scope var of that name.
+    /// by an enclosing-container field or a file-scope var of that name,
+    /// here or, for `mod.x`, in the module `mod` names.
     fn receiverIsMutex(self: *Lint, fi: u32, owner: u32, lhs: NodeIndex) bool {
         const f = &self.files.items[fi];
         const tree = f.tree;
@@ -568,6 +615,11 @@ const Lint = struct {
             .field_access => tree.tokenSlice(tree.nodeData(lhs).node_and_token[1]),
             else => return false,
         };
+        if (tree.nodeTag(lhs) == .field_access) {
+            if (self.exprFile(fi, tree.nodeData(lhs).node_and_token[0], 0)) |mf| {
+                if (self.files.items[mf].vars.get(var_name)) |t| return typeTextIsMutex(t);
+            }
+        }
         const container = self.fns.items[owner].container;
         if (container != NONE) {
             for (self.containers.items[container].fields.items) |fld| {

@@ -1724,6 +1724,9 @@ pub fn killProcess(pid: u8) void {
 /// (destroyCurrentWithStatus inside killProcessWithStatus's case-1) never
 /// returns. Idempotent re: peers racing into this from concurrent fatal
 /// signals: killProcessWithStatus's exit_requested xchg collapses duplicates.
+/// ctx: irq-ok — from IRQ0 (a signal's default action) the group is the
+/// caller's own: no peer is last_in_group while the caller lives, so the
+/// Mutex-taking teardown runs in its self-destroy, past hardirqReset().
 pub fn killThreadGroup(tgid: u8, status: u32) void {
     const my_pid_opt = smp.currentPid();
 
@@ -2162,6 +2165,9 @@ pub fn destroyCurrentGraceful(status: u32) void {
     destroyCurrentImpl(status, true);
 }
 
+// ctx: irq-ok — a fatal signal can end the task from IRQ0's return path;
+// hardirqReset() below drops that handler frame and the rest runs as the
+// dying task, which may sleep on a Mutex (destroyGuiWindow).
 fn destroyCurrentImpl(status: u32, persist_shared_dirty: bool) void {
     // Interrupts stay off to the final schedule(): a handler landing here
     // would run on a PCB, kstack and address space mid-teardown. Syscall
