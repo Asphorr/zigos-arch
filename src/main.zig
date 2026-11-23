@@ -19,7 +19,7 @@ const kasan = @import("debug/kasan.zig");
 comptime {
     _ = @import("debug/kernel_builtins.zig");
 }
-const fat32 = @import("fs/fat32.zig");
+const fat32 = @import("fs/fat32/fat32.zig");
 const keyboard = @import("driver.zig").keyboard;
 const xhci = @import("driver.zig").xhci;
 const nic = @import("driver.zig").nic;

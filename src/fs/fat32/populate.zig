@@ -20,9 +20,9 @@
 // stays correct if mkfs's parameters (spc, reserved count) ever change.
 
 const std = @import("std");
-const block = @import("../driver.zig").block;
+const block = @import("../../driver.zig").block;
 const fat32 = @import("fat32.zig");
-const debug = @import("../debug/debug.zig");
+const debug = @import("../../debug/debug.zig");
 
 const SECTOR_SIZE: u32 = 512;
 const FAT_EOC: u32 = 0x0FFF_FFFF;

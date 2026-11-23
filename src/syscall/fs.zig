@@ -150,7 +150,7 @@ pub fn sysListDir(buf_ptr: u32, buf_size: u32) u32 {
             break :blk tarfs.listToBuffer(@ptrCast(entries), max_entries);
         },
         .fat32 => blk: {
-            const fat32 = @import("../fs/fat32.zig");
+            const fat32 = @import("../fs/fat32/fat32.zig");
             break :blk listFatDir(fat32.root_cluster, entries, max_entries);
         },
         .ext2 => blk: {
@@ -182,7 +182,7 @@ pub fn sysListDir(buf_ptr: u32, buf_size: u32) u32 {
 ///   bit 2 = from_fat32 (always set here)
 ///   bit 3 = from_ext2
 pub fn listFatDir(dir_cluster: u32, entries: [*]FileEntry, max_entries: u32) u32 {
-    const fat32 = @import("../fs/fat32.zig");
+    const fat32 = @import("../fs/fat32/fat32.zig");
     var count: u32 = 0;
     var lfn_buf: [255]u8 = undefined;
     var lfn_len: usize = 0;
@@ -391,7 +391,7 @@ pub fn changeDir(pcb: *process.PCB, path: []const u8) ChdirError!void {
         switch (r.fs) {
             .tarfs => {},
             .fat32 => {
-                const fat32 = @import("../fs/fat32.zig");
+                const fat32 = @import("../fs/fat32/fat32.zig");
                 if (fat32.resolveDirCluster(r.path) == null) return error.NotDir;
             },
             .devfs => {
@@ -513,7 +513,7 @@ pub fn sysMkdir(path_ptr: u32) u32 {
 
     switch (resolved.fs) {
         .fat32 => {
-            const fat32 = @import("../fs/fat32.zig");
+            const fat32 = @import("../fs/fat32/fat32.zig");
             return if (fat32.createDirectory(resolved.path)) 0 else E_INVAL;
         },
         .ext2 => {
@@ -562,7 +562,7 @@ pub fn sysReaddir(path_ptr: u32, buf_ptr: u32, buf_size: u32) u32 {
             return count;
         },
         .fat32 => {
-            const fat32 = @import("../fs/fat32.zig");
+            const fat32 = @import("../fs/fat32/fat32.zig");
             const dc = fat32.resolveDirCluster(resolved.path) orelse return E_INVAL;
             return listFatDir(dc, entries, max_entries);
         },
@@ -603,7 +603,7 @@ pub fn sysUnlink(path_ptr: u32, path_len: u32) u32 {
             return E_INVAL;
         },
         .fat32 => {
-            const fat32 = @import("../fs/fat32.zig");
+            const fat32 = @import("../fs/fat32/fat32.zig");
             if (fat32.deleteFile(resolved.path)) {
                 return 0;
             }
@@ -655,7 +655,7 @@ pub fn sysStat(path_ptr: u32, path_len: u32, stat_buf_ptr: u32) u32 {
             return E_INVAL;
         },
         .fat32 => {
-            const fat32 = @import("../fs/fat32.zig");
+            const fat32 = @import("../fs/fat32/fat32.zig");
             if (fat32.getFileStat(resolved.path, stat_buf)) {
                 return 0;
             }
@@ -738,7 +738,7 @@ pub fn sysRename(old_path_ptr: u32, old_len: u32, new_path_ptr: u32) u32 {
             return E_INVAL;
         },
         .fat32 => {
-            const fat32 = @import("../fs/fat32.zig");
+            const fat32 = @import("../fs/fat32/fat32.zig");
             if (fat32.renameFile(old_resolved.path, new_resolved.path)) {
                 return 0;
             }
@@ -774,7 +774,7 @@ pub fn sysRmdir(path_ptr: u32, path_len: u32) u32 {
             return E_INVAL;
         },
         .fat32 => {
-            const fat32 = @import("../fs/fat32.zig");
+            const fat32 = @import("../fs/fat32/fat32.zig");
             if (fat32.removeDirectory(resolved.path)) {
                 return 0;
             }

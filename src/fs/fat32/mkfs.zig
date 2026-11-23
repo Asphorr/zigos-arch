@@ -19,11 +19,11 @@
 
 const std = @import("std");
 
-const block = @import("../driver.zig").block;
+const block = @import("../../driver.zig").block;
 const fat32 = @import("fat32.zig");
-const random = @import("../crypto/random.zig");
+const random = @import("../../crypto/random.zig");
 
-const debug = @import("../debug/debug.zig");
+const debug = @import("../../debug/debug.zig");
 
 // =============================================================================
 // Constants

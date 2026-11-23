@@ -5,7 +5,7 @@ const vfs = @import("fs/vfs.zig");
 const elf_loader = @import("proc/elf_loader.zig");
 const pmm = @import("mm/pmm.zig");
 const process = @import("proc/process.zig");
-const fat32 = @import("fs/fat32.zig");
+const fat32 = @import("fs/fat32/fat32.zig");
 const heap = @import("mm/heap.zig");
 const desktop = @import("ui/desktop.zig");
 const symbols = @import("debug/symbols.zig");
@@ -1202,7 +1202,7 @@ fn cmdMkdisk(arg: []const u8) void {
     // and the mistake is visible immediately rather than at first mount.
     printSection("Formatting");
 
-    const fat_mkfs = @import("fs/fat32_mkfs.zig");
+    const fat_mkfs = @import("fs/fat32/mkfs.zig");
     const ext2_mkfs = @import("fs/ext2/mkfs.zig");
 
     for (table.parts[0..table.count]) |part| {

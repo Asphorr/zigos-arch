@@ -741,7 +741,7 @@ export fn handleException(rsp: u64) callconv(.c) void {
         process.dumpSyscallRing(@intCast(pid));
 
         // Write crash to FAT32 crashlog (only if FAT32 is ready)
-        const fat32 = @import("../../fs/fat32.zig");
+        const fat32 = @import("../../fs/fat32/fat32.zig");
         if (fat32.isInitialized()) {
             writeCrashLog(pid, int_no, error_code, saved_rip, name);
         }
@@ -935,7 +935,7 @@ export fn handleException(rsp: u64) callconv(.c) void {
 }
 
 fn writeCrashLog(pid: u32, int_no: u64, error_code: u64, rip: u64, name: []const u8) void {
-    const fat32 = @import("../../fs/fat32.zig");
+    const fat32 = @import("../../fs/fat32/fat32.zig");
     var handle = fat32.openFile("CRASHLOG") orelse fat32.createFile("CRASHLOG") orelse return;
 
     // Seek to end (append)

@@ -1,8 +1,8 @@
 const std = @import("std");
-const ata = @import("../driver.zig").block;
-const debug = @import("../debug/debug.zig");
-const vga = @import("../ui/vga.zig");
-const path_cache = @import("path_cache.zig");
+const ata = @import("../../driver.zig").block;
+const debug = @import("../../debug/debug.zig");
+const vga = @import("../../ui/vga.zig");
+const path_cache = @import("../path_cache.zig");
 
 // FAT32 constants
 const SECTOR_SIZE = 512;

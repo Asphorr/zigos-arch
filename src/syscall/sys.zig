@@ -179,7 +179,7 @@ pub fn sysKlog(buf_ptr: u32, len: u32) u32 {
 /// wrong — and QEMU accepts any SLP_TYP when SLP_EN=1 regardless.
 pub fn sysShutdown(mode: u32) u32 {
     const io = @import("../io.zig");
-    const fat32 = @import("../fs/fat32.zig");
+    const fat32 = @import("../fs/fat32/fat32.zig");
     const acpi = @import("../acpi/acpi.zig");
 
     // Best-effort: flush dirty FS caches before yanking the power.

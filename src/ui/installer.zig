@@ -39,12 +39,12 @@ const nvme = @import("../driver.zig").nvme;
 const gpt = @import("../fs/gpt.zig");
 const geom = @import("../util/geom.zig");
 const ext2_mkfs = @import("../fs/ext2/mkfs.zig");
-const fat_mkfs = @import("../fs/fat32_mkfs.zig");
+const fat_mkfs = @import("../fs/fat32/mkfs.zig");
 const ext2_layout = @import("../fs/ext2/layout.zig");
 const ext2 = @import("../fs/ext2/ext2.zig");
 const ext2_blk = @import("../fs/ext2/block.zig");
 const populate = @import("../fs/ext2/populate.zig");
-const fat_pop = @import("../fs/fat32_populate.zig");
+const fat_pop = @import("../fs/fat32/populate.zig");
 const uefi_nvram = @import("../boot/uefi_nvram.zig");
 
 const paging = @import("../mm/paging.zig");

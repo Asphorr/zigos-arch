@@ -17,7 +17,7 @@
 
 const std = @import("std");
 const Phys = @import("../util/addr.zig").Phys;
-const fat32 = @import("fat32.zig");
+const fat32 = @import("fat32/fat32.zig");
 const tarfs = @import("tarfs.zig");
 const devfs = @import("devfs.zig");
 const procfs = @import("procfs.zig");

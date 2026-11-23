@@ -24,7 +24,7 @@ const serial = @import("../debug/serial.zig");
 const block = @import("../driver.zig").block;
 const gpt = @import("../fs/gpt.zig");
 const ext2_mkfs = @import("../fs/ext2/mkfs.zig");
-const fat_mkfs = @import("../fs/fat32_mkfs.zig");
+const fat_mkfs = @import("../fs/fat32/mkfs.zig");
 const ext2_layout = @import("../fs/ext2/layout.zig");
 
 /// ESP size. 64 MiB is the conventional EFI System Partition size, and it is
