@@ -14,19 +14,19 @@
 //! Not modeled: moving mremap (ENOMEM — musl's realloc falls back to copy),
 //! mlock, MAP_HUGETLB.
 
-const process = @import("../../proc/process.zig");
-const vmm = @import("../../mm/vmm.zig");
-const pmm = @import("../../mm/pmm.zig");
-const paging = @import("../../mm/paging.zig");
-const memmap = @import("../../mm/memmap.zig");
-const shm = @import("../../mm/shm.zig");
-const vfs = @import("../../fs/vfs.zig");
-const devfs = @import("../../fs/devfs.zig");
-const ext2 = @import("../../fs/ext2/ext2.zig");
-const ext2_inode = @import("../../fs/ext2/inode.zig");
-const tlb = @import("../mmu/tlb.zig");
-const config = @import("../../config.zig");
-const Phys = @import("../../util/addr.zig").Phys;
+const process = @import("../proc/process.zig");
+const vmm = @import("../mm/vmm.zig");
+const pmm = @import("../mm/pmm.zig");
+const paging = @import("../mm/paging.zig");
+const memmap = @import("../mm/memmap.zig");
+const shm = @import("../mm/shm.zig");
+const vfs = @import("../fs/vfs.zig");
+const devfs = @import("../fs/devfs.zig");
+const ext2 = @import("../fs/ext2/ext2.zig");
+const ext2_inode = @import("../fs/ext2/inode.zig");
+const tlb = @import("../cpu/mmu/tlb.zig");
+const config = @import("../config.zig");
+const Phys = @import("../util/addr.zig").Phys;
 
 const LazyRegion = process.LazyRegion;
 
@@ -174,7 +174,7 @@ pub fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, off: u64) u64 {
     // The fd table is the group's: the lead's. The mapping keeps the inode,
     // not the file: the reference lasts until the region holds the inode
     // (addRegion), and goes after the as_lock (a release may sleep).
-    const file = @import("../../fs/file.zig");
+    const file = @import("../fs/file.zig");
     const mapped: ?*file.File = if (anon) null else (file.get(owner, fd) orelse return err(EBADF));
     defer if (mapped) |f| file.put(f);
     if (mapped) |fe| {
@@ -278,7 +278,7 @@ const Reprotect = struct {
         // A shared file mapping that may be written from here on: its
         // present pages turn writable with no fault to mark them dirty.
         if (r.cache_inode != 0 and r.cache_shared and self.prot & PROT_WRITE != 0 and r.prot & PROT_WRITE == 0) {
-            const page_cache = @import("../../mm/page_cache.zig");
+            const page_cache = @import("../mm/page_cache.zig");
             page_cache.markDirtyRange(page_cache.ext2FileId(r.cache_inode), r.cache_off, r.end - r.start);
         }
         r.prot = self.prot;

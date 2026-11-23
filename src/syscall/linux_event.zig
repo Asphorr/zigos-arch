@@ -3,14 +3,14 @@
 //! ipc/epoll.zig and ipc/eventfd.zig.
 
 const std = @import("std");
-const process = @import("../../proc/process.zig");
-const file = @import("../../fs/file.zig");
-const vfs = @import("../../fs/vfs.zig");
-const epoll = @import("../ipc/epoll.zig");
-const eventfd = @import("../ipc/eventfd.zig");
-const fdpoll = @import("../ipc/fdpoll.zig");
-const smp = @import("../smp.zig");
-const usercopy = @import("../arch/usercopy.zig");
+const process = @import("../proc/process.zig");
+const file = @import("../fs/file.zig");
+const vfs = @import("../fs/vfs.zig");
+const epoll = @import("../cpu/ipc/epoll.zig");
+const eventfd = @import("../cpu/ipc/eventfd.zig");
+const fdpoll = @import("../cpu/ipc/fdpoll.zig");
+const smp = @import("../cpu/smp.zig");
+const usercopy = @import("../cpu/arch/usercopy.zig");
 const linux_fs = @import("linux_fs.zig");
 const linux_proc = @import("linux_proc.zig");
 const linux_signal = @import("linux_signal.zig");
@@ -198,7 +198,7 @@ fn selectFor(nfds_arg: u64, r_va: u64, w_va: u64, e_va: u64, timeout_ns: ?u64) u
     const lead = linux_fs.proc() orelse return err(EFAULT);
 
     // Every fd named in a set, with what its sets ask of it.
-    var fds: [@import("../../config.zig").MAX_FDS]linux_proc.PollFd = undefined;
+    var fds: [@import("../config.zig").MAX_FDS]linux_proc.PollFd = undefined;
     var count: usize = 0;
     for (0..nfds) |fd| {
         var want: u16 = 0;

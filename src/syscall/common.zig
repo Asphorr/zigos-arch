@@ -4,9 +4,9 @@
 //! file-local `const E_X = common.E_X;` / `const validateUserPtr = ...` aliases
 //! so the moved handler bodies need no edits.
 
-const errno = @import("../../proc/errno.zig");
-const memmap = @import("../../mm/memmap.zig");
-const process = @import("../../proc/process.zig");
+const errno = @import("../proc/errno.zig");
+const memmap = @import("../mm/memmap.zig");
+const process = @import("../proc/process.zig");
 
 pub const E_INVAL: u32 = errno.err(.EINVAL);
 pub const E_NOENT: u32 = errno.err(.ENOENT);
@@ -41,7 +41,7 @@ pub fn validateUserPtr(ptr: usize, len: usize) bool {
     if (!memmap.userDataRangeOk(ptr, len)) return false;
     // Instrument the slow part — prefault + per-page PT walk. Cheap range
     // checks above don't need bracketing; the meaningful cost starts here.
-    const sp = @import("../../debug/syscall_perf.zig").scope(.user_ptr_walk);
+    const sp = @import("../debug/syscall_perf.zig").scope(.user_ptr_walk);
     defer sp.end();
     // prefaultUserRange maps only pages inside registered regions and then
     // checks every page is present: a pointer to scratch user VA would
@@ -52,7 +52,7 @@ pub fn validateUserPtr(ptr: usize, len: usize) bool {
     // Validation succeeded — caller is about to deref. STAC unlocks user
     // memory access for the remainder of this syscall; doSyscall's defer
     // CLACs on exit. Cheap: with SMAP off this is a noop branch.
-    @import("../arch/protect.zig").allowUserAccess();
+    @import("../cpu/arch/protect.zig").allowUserAccess();
     return true;
 }
 
@@ -95,8 +95,8 @@ pub fn validateUserPtrWriteAligned(ptr: usize, len: usize, comptime align_to: us
 /// null if the caller's fd_table is full — caller must roll back the
 /// slot allocation in that case.
 pub fn allocSocketFd(pcb: *process.PCB, kind: process.FsType, slot: u8) ?u32 {
-    const vfs = @import("../../fs/vfs.zig");
-    const file = @import("../../fs/file.zig");
+    const vfs = @import("../fs/vfs.zig");
+    const file = @import("../fs/file.zig");
     const fd_idx = vfs.allocFd(pcb) orelse return null;
     if (!vfs.installNew(pcb, fd_idx, .{ .kind = kind, .inode = slot, .access = file.READ_WRITE }, false)) return null;
     return @intCast(fd_idx);
@@ -107,7 +107,7 @@ pub fn allocSocketFd(pcb: *process.PCB, kind: process.FsType, slot: u8) ?u32 {
 /// fd or a tcp_listener fd is rejected with EBADF instead of silently
 /// indexing into the wrong table. Returns the u8 slot id on success.
 pub fn resolveSocketFd(pcb: *process.PCB, fd: u32, expected_kind: process.FsType) ?u8 {
-    const file = @import("../../fs/file.zig");
+    const file = @import("../fs/file.zig");
     const f = file.get(pcb, fd) orelse return null;
     defer file.put(f);
     if (f.kind != expected_kind) return null;

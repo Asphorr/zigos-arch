@@ -163,7 +163,7 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
     defer if (!irq0_measured) {
         spinlock.hardirqExit();
         perf.leave(.irq0_timer, t);
-        @import("../syscall.zig").chargeInterrupt(t);
+        @import("../../syscall.zig").chargeInterrupt(t);
     };
     const cpu = smp.myCpu();
     @import("../../debug/linux_prof.zig").tick(cpu.current_pid, frame_for_validate[15], frame_for_validate[16]);

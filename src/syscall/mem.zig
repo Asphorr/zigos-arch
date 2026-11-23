@@ -2,29 +2,29 @@
 //! Dispatched from cpu/syscall.zig doSyscallInner; named in SYSCALLS.
 
 const std = @import("std");
-const vga = @import("../../ui/vga.zig");
-const elf_loader = @import("../../proc/elf_loader.zig");
-const keyboard = @import("../../driver.zig").keyboard;
-const process = @import("../../proc/process.zig");
-const vmm = @import("../../mm/vmm.zig");
-const pmm = @import("../../mm/pmm.zig");
-const paging = @import("../../mm/paging.zig");
-const Phys = @import("../../util/addr.zig").Phys;
-const bga = @import("../../ui/bga.zig");
-const vfs = @import("../../fs/vfs.zig");
-const file = @import("../../fs/file.zig");
-const desktop = @import("../../ui/desktop.zig");
-const xhci = @import("../../driver.zig").xhci;
-const debug = @import("../../debug/debug.zig");
-const perf = @import("../../debug/perf.zig");
-const pipe = @import("../../proc/pipe.zig");
-const memmap = @import("../../mm/memmap.zig");
-const config = @import("../../config.zig");
-const smp = @import("../smp.zig");
-const signals = @import("../../proc/signals.zig");
-const errno = @import("../../proc/errno.zig");
-const sched_asm = @import("../../proc/sched_asm.zig");
-const apic = @import("../../time/apic.zig");
+const vga = @import("../ui/vga.zig");
+const elf_loader = @import("../proc/elf_loader.zig");
+const keyboard = @import("../driver.zig").keyboard;
+const process = @import("../proc/process.zig");
+const vmm = @import("../mm/vmm.zig");
+const pmm = @import("../mm/pmm.zig");
+const paging = @import("../mm/paging.zig");
+const Phys = @import("../util/addr.zig").Phys;
+const bga = @import("../ui/bga.zig");
+const vfs = @import("../fs/vfs.zig");
+const file = @import("../fs/file.zig");
+const desktop = @import("../ui/desktop.zig");
+const xhci = @import("../driver.zig").xhci;
+const debug = @import("../debug/debug.zig");
+const perf = @import("../debug/perf.zig");
+const pipe = @import("../proc/pipe.zig");
+const memmap = @import("../mm/memmap.zig");
+const config = @import("../config.zig");
+const smp = @import("../cpu/smp.zig");
+const signals = @import("../proc/signals.zig");
+const errno = @import("../proc/errno.zig");
+const sched_asm = @import("../proc/sched_asm.zig");
+const apic = @import("../time/apic.zig");
 
 const common = @import("common.zig");
 const validateUserPtr = common.validateUserPtr;
@@ -100,7 +100,7 @@ pub fn sysSbrk(increment: u32) u32 {
         _ = vmm.unmapUserRange(pml4, new_brk_shrink, old_brk, &rc);
         const first_page = new_brk_shrink & ~@as(usize, 0xFFF);
         const end_page = (old_brk + 0xFFF) & ~@as(usize, 0xFFF);
-        @import("../mmu/tlb.zig").shootdownRange(lead.pcid, first_page, (end_page - first_page) / 0x1000);
+        @import("../cpu/mmu/tlb.zig").shootdownRange(lead.pcid, first_page, (end_page - first_page) / 0x1000);
         rc.release();
 
         // A heap shrunk to nothing leaves the set; the next grow starts a
@@ -344,7 +344,7 @@ pub fn sysMmapSharedAnon(len: u32) u32 {
     const new_top = lead.mmap_top - len_pg;
     if (new_top < lead.user_brk) return 0;
 
-    const shm = @import("../../mm/shm.zig");
+    const shm = @import("../mm/shm.zig");
     const num_pages: u32 = @intCast(len_pg / 0x1000);
     const shm_id = shm.create(num_pages) orelse return 0;
 
@@ -386,11 +386,11 @@ pub fn sysMmapPmem(len: u32, fd: u32, offset: u32) u32 {
         const f = file.get(pcb, fd) orelse return E_INVAL;
         defer file.put(f);
         if (f.kind != .devfs) return E_INVAL;
-        const devfs = @import("../../fs/devfs.zig");
+        const devfs = @import("../fs/devfs.zig");
         if (devfs.kindOf(f.inode) != .pmem0) return E_INVAL;
     }
 
-    const pmem = @import("../../mm/pmem.zig");
+    const pmem = @import("../mm/pmem.zig");
     if (!pmem.isPresent()) return E_INVAL;
 
     // Page-align: we map whole frames, and the pmem offset must be a frame
@@ -493,7 +493,7 @@ pub fn sysMunmap(va: u32, len: u32) u32 {
     // page (INVPCID type-0 plus the INVLPG backstop that reliably clears
     // this CPU's entry under nested virt), so peers keep the rest of the
     // AS's entries; large ones flush the whole PCID.
-    @import("../mmu/tlb.zig").shootdownRange(lead.pcid, start, (end - start) / 0x1000);
+    @import("../cpu/mmu/tlb.zig").shootdownRange(lead.pcid, start, (end - start) / 0x1000);
     rc.release();
 
     lead.regions.remove(start, end, Discard{}) catch unreachable; // whole region: no split
@@ -523,7 +523,7 @@ pub fn sysMunmap(va: u32, len: u32) u32 {
     // acquireFrame) gets dropped by unmapUserRange above when it freeFrame's
     // present pages — so the only thing remaining here is the shm-side ref.
     {
-        const shm = @import("../../mm/shm.zig");
+        const shm = @import("../mm/shm.zig");
         if (removed.shm_id != shm.SHM_INVALID) shm.release(removed.shm_id);
     }
 
@@ -540,7 +540,7 @@ pub fn sysMunmap(va: u32, len: u32) u32 {
     // Writeback runs OUTSIDE as_lock — writebackPage blocks on NVMe I/O.
     // So does freeing an inode the mapping was the last to hold.
     if (shared_inode) |inum| _ = vfs.syncCacheFile(inum, true);
-    @import("../../fs/ext2/ext2.zig").freeQueued();
+    @import("../fs/ext2/ext2.zig").freeQueued();
     return 0;
 }
 
@@ -579,7 +579,7 @@ pub fn sysMprotect(va: u32, len: u32, prot: u32) u32 {
     // A shared file mapping that may be written from here on: its present
     // pages turn writable with no fault to mark them dirty.
     if (lr.cache_inode != 0 and lr.cache_shared and new_prot & process.PROT_WRITE != 0 and lr.prot & process.PROT_WRITE == 0) {
-        const page_cache = @import("../../mm/page_cache.zig");
+        const page_cache = @import("../mm/page_cache.zig");
         page_cache.markDirtyRange(page_cache.ext2FileId(lr.cache_inode), lr.cache_off, lr.end - lr.start);
     }
     lr.prot = new_prot;
@@ -602,7 +602,7 @@ pub fn sysMprotect(va: u32, len: u32, prot: u32) u32 {
     // The walk invalidates nothing: without this every CPU's TLB still holds
     // the old prot bits. Page by page for small ranges (see sysMunmap), the
     // whole PCID for large ones.
-    @import("../mmu/tlb.zig").shootdownRange(lead.pcid, start, len_pg / 0x1000);
+    @import("../cpu/mmu/tlb.zig").shootdownRange(lead.pcid, start, len_pg / 0x1000);
     return 0;
 }
 

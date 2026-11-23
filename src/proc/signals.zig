@@ -33,7 +33,7 @@ const memmap = @import("../mm/memmap.zig");
 const config = @import("../config.zig");
 const protect = @import("../cpu/arch/protect.zig");
 const SpinLock = @import("spinlock.zig").SpinLock;
-const linux_signal = @import("../cpu/syscall/linux_signal.zig");
+const linux_signal = @import("../syscall/linux_signal.zig");
 
 pub const NSIG: u32 = config.NSIG;
 

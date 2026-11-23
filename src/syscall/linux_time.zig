@@ -7,11 +7,11 @@
 //! count scheduler ticks, so they move in TICK_NS steps.
 
 const std = @import("std");
-const process = @import("../../proc/process.zig");
-const time = @import("../../time/time.zig");
+const process = @import("../proc/process.zig");
+const time = @import("../time/time.zig");
 const common = @import("common.zig");
 const native_proc = @import("proc.zig");
-const usercopy = @import("../arch/usercopy.zig");
+const usercopy = @import("../cpu/arch/usercopy.zig");
 const linux_signal = @import("linux_signal.zig");
 
 // Linux errno.
@@ -133,7 +133,7 @@ const Resume = enum {
 fn sleepUntil(pcb: *process.PCB, deadline: u64, rem_va: u64, how: Resume) u64 {
     var now = time.monotonicNanos();
     while (now < deadline) {
-        if (@import("../../proc/signals.zig").interrupts(pcb)) {
+        if (@import("../proc/signals.zig").interrupts(pcb)) {
             if (rem_va != 0) {
                 const rem = toTimespec(deadline - now);
                 _ = usercopy.copyToUser(rem_va, std.mem.asBytes(&rem));

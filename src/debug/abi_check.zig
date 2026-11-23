@@ -187,7 +187,7 @@ fn rdmsr(msr: u32) u64 {
 fn testTrampolineAlignment() void {
     // The panic targets are exported symbols. If they exist, the guards exist.
     // We can't call them (they're noreturn), but we can take their addresses.
-    const syscall_panic = @import("../cpu/syscall/entry.zig").syscall_align_panic;
+    const syscall_panic = @import("../syscall/entry.zig").syscall_align_panic;
     const exc_panic = @import("../cpu/idt.zig").isr_common_exc_align_panic;
     const irq0_panic = @import("../cpu/idt.zig").isr_irq0_align_panic;
     const irq1_panic = @import("../cpu/idt.zig").isr_irq1_align_panic;

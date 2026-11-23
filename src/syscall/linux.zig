@@ -29,21 +29,21 @@
 //! separate and untouched — the only shared edge is doSyscall's one-line
 //! personality check.
 
-const signals = @import("../../proc/signals.zig");
-const process = @import("../../proc/process.zig");
-const pid_nr = @import("../../proc/pid_nr.zig");
-const vfs = @import("../../fs/vfs.zig");
-const file = @import("../../fs/file.zig");
-const lproc = @import("../../fs/lproc.zig");
+const signals = @import("../proc/signals.zig");
+const process = @import("../proc/process.zig");
+const pid_nr = @import("../proc/pid_nr.zig");
+const vfs = @import("../fs/vfs.zig");
+const file = @import("../fs/file.zig");
+const lproc = @import("../fs/lproc.zig");
 const common = @import("common.zig");
-const debug = @import("../../debug/debug.zig");
-const ext2_inode = @import("../../fs/ext2/inode.zig");
-const heap = @import("../../mm/heap.zig");
-const memmap = @import("../../mm/memmap.zig");
-const config = @import("../../config.zig");
-const errno = @import("../../proc/errno.zig");
-const random = @import("../../crypto/random.zig");
-const smp = @import("../smp.zig");
+const debug = @import("../debug/debug.zig");
+const ext2_inode = @import("../fs/ext2/inode.zig");
+const heap = @import("../mm/heap.zig");
+const memmap = @import("../mm/memmap.zig");
+const config = @import("../config.zig");
+const errno = @import("../proc/errno.zig");
+const random = @import("../crypto/random.zig");
+const smp = @import("../cpu/smp.zig");
 const linux_mm = @import("linux_mm.zig");
 const linux_time = @import("linux_time.zig");
 const linux_thread = @import("linux_thread.zig");
@@ -866,7 +866,7 @@ fn sysFcntl(fd: u32, cmd: u64, arg: u64) u64 {
         // as it stands, a larger one is over the limit.
         F_GETPIPE_SZ, F_SETPIPE_SZ => blk: {
             if (fe.kind != .pipe) break :blk err(EBADF);
-            const cap = @import("../../proc/pipe.zig").PIPE_BUF_SIZE;
+            const cap = @import("../proc/pipe.zig").PIPE_BUF_SIZE;
             break :blk if (cmd == F_SETPIPE_SZ and arg > cap) err(EPERM) else cap;
         },
         linux_fs.F_GETLK, linux_fs.F_SETLK, linux_fs.F_SETLKW, linux_fs.F_OFD_GETLK, linux_fs.F_OFD_SETLK, linux_fs.F_OFD_SETLKW => linux_fs.fcntlLock(pcb, fd, fe, cmd, arg),

@@ -214,8 +214,8 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     blog.ok("IDT installed");
     @import("debug/lbr.zig").enable();
     blog.ok("LBR enabled");
-    @import("cpu/syscall/entry.zig").init();
-    @import("cpu/syscall/entry.zig").verifyMsrs("BSP");
+    @import("syscall/entry.zig").init();
+    @import("syscall/entry.zig").verifyMsrs("BSP");
     blog.ok("Syscall/sysret MSRs");
     // SMEP/UMIP — safe to enable on BSP now. SMAP is deferred until
     // desktop.taskEntry has dropped the low-half identity map, because
@@ -1101,7 +1101,7 @@ fn acpidEntry() callconv(.c) noreturn {
         parkAcpid();
         if (sci.takePowerOffRequest()) {
             debug.klog("[acpid] power-off requested — flushing caches + entering S5\n", .{});
-            _ = @import("cpu/syscall/sys.zig").sysShutdown(0); // never returns
+            _ = @import("syscall/sys.zig").sysShutdown(0); // never returns
         }
         // GPE events recorded by the SCI handler (Slice C): run each fired bit's
         // AML handler here in thread context — the method does field I/O / Notify,

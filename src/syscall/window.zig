@@ -2,28 +2,28 @@
 //! Dispatched from cpu/syscall.zig doSyscallInner; named in SYSCALLS.
 
 const std = @import("std");
-const vga = @import("../../ui/vga.zig");
-const elf_loader = @import("../../proc/elf_loader.zig");
-const keyboard = @import("../../driver.zig").keyboard;
-const process = @import("../../proc/process.zig");
-const vmm = @import("../../mm/vmm.zig");
-const pmm = @import("../../mm/pmm.zig");
-const paging = @import("../../mm/paging.zig");
-const bga = @import("../../ui/bga.zig");
-const vfs = @import("../../fs/vfs.zig");
-const file = @import("../../fs/file.zig");
-const desktop = @import("../../ui/desktop.zig");
-const xhci = @import("../../driver.zig").xhci;
-const debug = @import("../../debug/debug.zig");
-const perf = @import("../../debug/perf.zig");
-const pipe = @import("../../proc/pipe.zig");
-const memmap = @import("../../mm/memmap.zig");
-const config = @import("../../config.zig");
-const smp = @import("../smp.zig");
-const signals = @import("../../proc/signals.zig");
-const errno = @import("../../proc/errno.zig");
-const sched_asm = @import("../../proc/sched_asm.zig");
-const apic = @import("../../time/apic.zig");
+const vga = @import("../ui/vga.zig");
+const elf_loader = @import("../proc/elf_loader.zig");
+const keyboard = @import("../driver.zig").keyboard;
+const process = @import("../proc/process.zig");
+const vmm = @import("../mm/vmm.zig");
+const pmm = @import("../mm/pmm.zig");
+const paging = @import("../mm/paging.zig");
+const bga = @import("../ui/bga.zig");
+const vfs = @import("../fs/vfs.zig");
+const file = @import("../fs/file.zig");
+const desktop = @import("../ui/desktop.zig");
+const xhci = @import("../driver.zig").xhci;
+const debug = @import("../debug/debug.zig");
+const perf = @import("../debug/perf.zig");
+const pipe = @import("../proc/pipe.zig");
+const memmap = @import("../mm/memmap.zig");
+const config = @import("../config.zig");
+const smp = @import("../cpu/smp.zig");
+const signals = @import("../proc/signals.zig");
+const errno = @import("../proc/errno.zig");
+const sched_asm = @import("../proc/sched_asm.zig");
+const apic = @import("../time/apic.zig");
 
 const common = @import("common.zig");
 const validateUserPtr = common.validateUserPtr;
@@ -52,7 +52,7 @@ pub fn sysPrint(arg1: u32, arg2: u32) u32 {
     const ptr: [*]const u8 = @ptrFromInt(@as(usize, arg1));
     const msg = ptr[0..arg2];
     vga.print("{s}", .{msg});
-    @import("../../debug/serial.zig").print("[app] {s}", .{msg});
+    @import("../debug/serial.zig").print("[app] {s}", .{msg});
     return 0;
 }
 
@@ -77,7 +77,7 @@ pub fn sysRead() u32 {
         },
         .pipe => {
             var buf: [1]u8 = .{0};
-            const n = @import("../../proc/pipe.zig").tryRead(fd0.pipe_id, &buf);
+            const n = @import("../proc/pipe.zig").tryRead(fd0.pipe_id, &buf);
             if (n == 0) return 0;
             return buf[0];
         },
@@ -106,7 +106,7 @@ pub fn sysReadBlocking() u32 {
             var buf: [1]u8 = .{0};
             // Blocks until >=1 byte; returns 0 on EOF (writer closed) or a
             // pending signal. Caller treats 0 as "handle signal / retry".
-            const n = @import("../../proc/pipe.zig").read(fd0.pipe_id, &buf);
+            const n = @import("../proc/pipe.zig").read(fd0.pipe_id, &buf);
             if (n == 0) return 0;
             return buf[0];
         },
@@ -146,7 +146,7 @@ pub fn sysPollEvent(buf_ptr: u32) u32 {
 /// Returns the event kind; 0 on timeout or when a signal is pending.
 pub fn sysWaitEvent(buf_ptr: u32, timeout_ms: u32) u32 {
     if (buf_ptr == 0) return 0;
-    const UserPtr = @import("../../util/user_ptr.zig").UserPtr;
+    const UserPtr = @import("../util/user_ptr.zig").UserPtr;
     const out = UserPtr(desktop.Event).fromRaw(buf_ptr).validateWrite() orelse return 0;
     const ev = waitForEvent(timeout_ms) orelse return 0;
     // A faultable copy: the page was proven at entry, a park ago. Done
@@ -157,7 +157,7 @@ pub fn sysWaitEvent(buf_ptr: u32, timeout_ms: u32) u32 {
 
 /// The wait of sysWaitEvent: null on timeout or when a signal is pending.
 fn waitForEvent(timeout_ms: u32) ?desktop.Event {
-    const event_wait = @import("../../ui/desktop/event_wait.zig");
+    const event_wait = @import("../ui/desktop/event_wait.zig");
     const cur: u8 = @intCast(process.getCurrentPid());
     const pcb = &process.procs[cur];
     const untimed = timeout_ms == 0xFFFFFFFF;
@@ -178,7 +178,7 @@ fn waitForEvent(timeout_ms: u32) ?desktop.Event {
         // inside a handler: none is delivered there, and returning would
         // only spin the caller's loop.
         if (!pcb.in_signal_handler and signals.hasDeliverable(pcb)) return null;
-        @import("../../proc/sched.zig").blockOnDeadline(.win_event, 0, deadline);
+        @import("../proc/sched.zig").blockOnDeadline(.win_event, 0, deadline);
     }
 }
 
@@ -200,9 +200,9 @@ pub fn sysCenterMouse() u32 {
 /// on x86 little-endian). Caller is responsible for any decoding +
 /// pixel-format conversion (e.g. RGBA→BGRA from stb_image output).
 pub fn sysSetWallpaper(buf_ptr: u32, w: u32, h: u32) u32 {
-    const background = @import("../../ui/desktop/background.zig");
-    const dirty = @import("../../ui/desktop/dirty.zig");
-    const pmm_diag = @import("../../mm/pmm.zig");
+    const background = @import("../ui/desktop/background.zig");
+    const dirty = @import("../ui/desktop/dirty.zig");
+    const pmm_diag = @import("../mm/pmm.zig");
     const free_entry = pmm_diag.freeFrameCount();
     debug.klog("[sysSetWallpaper] buf=0x{X} w={d} h={d} pmm_free={d}\n", .{ buf_ptr, w, h, free_entry });
     if (w == 0 and h == 0 and buf_ptr == 0) {
@@ -337,14 +337,14 @@ pub fn sysCreateWindow(alloc_width_in: u32, alloc_height: u32, display_wh: u32) 
     var kern_fb: [*]volatile u32 = undefined;
     const kern_fb_backs: [3]?[*]volatile u32 = .{ null, null, null };
     {
-        const gpu_comp = @import("../../ui/gpu_compositor.zig");
+        const gpu_comp = @import("../ui/gpu_compositor.zig");
         if (gpu_comp.isReady()) {
             gpu_slot = gpu_comp.allocateWindowImage(disp_w, disp_h, alloc_width, alloc_height);
         }
     }
 
     if (gpu_slot) |idx| {
-        const gpu_comp = @import("../../ui/gpu_compositor.zig");
+        const gpu_comp = @import("../ui/gpu_compositor.zig");
         const sl = &gpu_comp.window_slots[idx];
         const slot_phys = sl.phys;
         const slot_pages: u32 = @intCast((sl.mem_bytes + 4095) / 4096);
@@ -503,7 +503,7 @@ pub fn sysDestroyWindow() u32 {
 pub fn sysGetScreenSize(buf_ptr: u32) u32 {
     if (!validateUserPtrWriteAligned(buf_ptr, 8, 4)) return E_FAULT;
     const buf: [*]u32 = @ptrFromInt(@as(usize, buf_ptr));
-    const gfx = @import("../../ui/gfx.zig");
+    const gfx = @import("../ui/gfx.zig");
     buf[0] = gfx.screen_w;
     buf[1] = gfx.screen_h;
     return 0;
@@ -533,7 +533,7 @@ pub fn sysGetWindowAlloc(buf_ptr: u32) u32 {
 pub const CLIPBOARD_MAX: u32 = 64 * 1024;
 var clipboard_buf: [CLIPBOARD_MAX]u8 = [_]u8{0} ** CLIPBOARD_MAX;
 var clipboard_len: u32 = 0;
-var clipboard_lock: @import("../../proc/spinlock.zig").SpinLock = .{};
+var clipboard_lock: @import("../proc/spinlock.zig").SpinLock = .{};
 
 pub fn sysSetClipboard(buf_ptr: u32, len: u32) u32 {
     if (len == 0) {

@@ -2,30 +2,30 @@
 //! Dispatched from cpu/syscall.zig doSyscallInner; named in SYSCALLS.
 
 const std = @import("std");
-const vga = @import("../../ui/vga.zig");
-const elf_loader = @import("../../proc/elf_loader.zig");
-const keyboard = @import("../../driver.zig").keyboard;
-const process = @import("../../proc/process.zig");
-const vmm = @import("../../mm/vmm.zig");
-const pmm = @import("../../mm/pmm.zig");
-const paging = @import("../../mm/paging.zig");
-const bga = @import("../../ui/bga.zig");
-const vfs = @import("../../fs/vfs.zig");
-const file = @import("../../fs/file.zig");
-const desktop = @import("../../ui/desktop.zig");
-const xhci = @import("../../driver.zig").xhci;
-const debug = @import("../../debug/debug.zig");
-const perf = @import("../../debug/perf.zig");
-const pipe = @import("../../proc/pipe.zig");
-const memmap = @import("../../mm/memmap.zig");
-const config = @import("../../config.zig");
-const smp = @import("../smp.zig");
-const signals = @import("../../proc/signals.zig");
-const pid_nr = @import("../../proc/pid_nr.zig");
-const session = @import("../../proc/session.zig");
-const errno = @import("../../proc/errno.zig");
-const sched_asm = @import("../../proc/sched_asm.zig");
-const apic = @import("../../time/apic.zig");
+const vga = @import("../ui/vga.zig");
+const elf_loader = @import("../proc/elf_loader.zig");
+const keyboard = @import("../driver.zig").keyboard;
+const process = @import("../proc/process.zig");
+const vmm = @import("../mm/vmm.zig");
+const pmm = @import("../mm/pmm.zig");
+const paging = @import("../mm/paging.zig");
+const bga = @import("../ui/bga.zig");
+const vfs = @import("../fs/vfs.zig");
+const file = @import("../fs/file.zig");
+const desktop = @import("../ui/desktop.zig");
+const xhci = @import("../driver.zig").xhci;
+const debug = @import("../debug/debug.zig");
+const perf = @import("../debug/perf.zig");
+const pipe = @import("../proc/pipe.zig");
+const memmap = @import("../mm/memmap.zig");
+const config = @import("../config.zig");
+const smp = @import("../cpu/smp.zig");
+const signals = @import("../proc/signals.zig");
+const pid_nr = @import("../proc/pid_nr.zig");
+const session = @import("../proc/session.zig");
+const errno = @import("../proc/errno.zig");
+const sched_asm = @import("../proc/sched_asm.zig");
+const apic = @import("../time/apic.zig");
 
 const common = @import("common.zig");
 const validateUserPtr = common.validateUserPtr;
@@ -282,7 +282,7 @@ pub fn sysSleep(ms: u32) u32 {
     const ticks = (@as(u64, ms) + 9) / 10;
     const deadline = process.tick_count +% ticks;
     @atomicStore(u64, &pcb.wake_tick, deadline, .release);
-    @import("../../proc/sched.zig").registerWakeDeadline(deadline);
+    @import("../proc/sched.zig").registerWakeDeadline(deadline);
     process.setState(cur_pid, .sleeping);
     // A tick between the registration and the state flip (this body runs
     // IF=1, and the BSP ticks for any CPU) saw us .running with the
@@ -332,12 +332,12 @@ fn execCommon(name_ptr: u32, name_len: u32, hold_for_caller: bool) u32 {
             hex[k * 2] = hexchars[name_buf[k] >> 4];
             hex[k * 2 + 1] = hexchars[name_buf[k] & 0x0F];
         }
-        @import("../../debug/debug.zig").klog("[sysExec] name='{s}' hex={s}\n", .{ name_buf[0..actual_len], hex[0 .. hexlen * 2] });
+        @import("../debug/debug.zig").klog("[sysExec] name='{s}' hex={s}\n", .{ name_buf[0..actual_len], hex[0 .. hexlen * 2] });
         // PMM diagnostic: free frames at every exec. If this drifts down
         // across runs of the same app, something isn't getting freed on
         // exit (process teardown or kernel-side caches).
-        const pmm_diag = @import("../../mm/pmm.zig");
-        @import("../../debug/debug.zig").klog("[pmm-diag] exec free={d}/{d}\n", .{ pmm_diag.freeFrameCount(), pmm_diag.managedFrameCount() });
+        const pmm_diag = @import("../mm/pmm.zig");
+        @import("../debug/debug.zig").klog("[pmm-diag] exec free={d}/{d}\n", .{ pmm_diag.freeFrameCount(), pmm_diag.managedFrameCount() });
     }
 
     // Split on first space: "editor.elf myfile.txt" -> filename + arg
@@ -357,7 +357,7 @@ fn execCommon(name_ptr: u32, name_len: u32, hold_for_caller: bool) u32 {
     // Switch to kernel PD -- user PD doesn't map all kernel memory
     const caller_pd = if (process.currentPCB()) |pcb| pcb.page_dir_phys else 0;
     const caller_pcid = if (process.currentPCB()) |pcb| pcb.pcid else 0;
-    @import("../mmu/pcid.zig").loadCr3(paging.getKernelPageDirPhys(), 0, @import("../smp.zig").myCpu().cpu_id);
+    @import("../cpu/mmu/pcid.zig").loadCr3(paging.getKernelPageDirPhys(), 0, @import("../cpu/smp.zig").myCpu().cpu_id);
 
     var pid: u32 = 0xFFFFFFFF;
     {
@@ -428,7 +428,7 @@ fn execCommon(name_ptr: u32, name_len: u32, hold_for_caller: bool) u32 {
                     child_pcb.nice = parent.nice;
                     child_pcb.pinned_cpu = parent.pinned_cpu;
                 } else {
-                    @import("../../debug/debug.zig").klog("[sysExec] WARN: child_pid == parent_pid={d} — inheritance skipped\n", .{process.getCurrentPid()});
+                    @import("../debug/debug.zig").klog("[sysExec] WARN: child_pid == parent_pid={d} — inheritance skipped\n", .{process.getCurrentPid()});
                 }
             }
             // (name + real argv were set inside loadAndStart, before the Linux
@@ -446,7 +446,7 @@ fn execCommon(name_ptr: u32, name_len: u32, hold_for_caller: bool) u32 {
 
     // Switch back to caller's PD (PCID-aware so caller's TLB is preserved).
     if (caller_pd != 0) {
-        @import("../mmu/pcid.zig").loadCr3(caller_pd, caller_pcid, @import("../smp.zig").myCpu().cpu_id);
+        @import("../cpu/mmu/pcid.zig").loadCr3(caller_pd, caller_pcid, @import("../cpu/smp.zig").myCpu().cpu_id);
     }
 
     return pid;
@@ -745,7 +745,7 @@ pub fn sysSigprocmask(how: u32, set_ptr: u32, old_ptr: u32) u32 {
 /// handing in a read-only .text VA (0x500000) gets E_FAULT, not a ring-0 #PF.
 pub fn sysSigpending(set_ptr: u32) u32 {
     if (set_ptr == 0) return E_INVAL;
-    const UserPtr = @import("../../util/user_ptr.zig").UserPtr;
+    const UserPtr = @import("../util/user_ptr.zig").UserPtr;
     const up = UserPtr(u32).fromRaw(set_ptr).validateWrite() orelse return E_FAULT;
     const pcb = process.currentPCB() orelse return E_FAULT;
     const value = signals.toNativeSet(@atomicLoad(u64, &pcb.pending_signals, .acquire) & pcb.signal_mask);
@@ -929,7 +929,7 @@ pub fn sysAlarm(seconds: u32) u32 {
     } else {
         const deadline = now + @as(u64, seconds) * 100;
         @atomicStore(u64, &pcb.alarm_tick, deadline, .release);
-        @import("../../proc/sched.zig").registerAlarmDeadline(deadline);
+        @import("../proc/sched.zig").registerAlarmDeadline(deadline);
     }
     return prev_remaining;
 }
@@ -1008,7 +1008,7 @@ pub fn sysExecAs(name_ptr: u32, name_len: u32, remap_ptr: u32) u32 {
 /// Returns 0 on success.
 pub fn sysGettimeofday(buf_ptr: u32) u32 {
     if (!validateUserPtrWrite(buf_ptr, 16)) return E_FAULT;
-    const time = @import("../../time/time.zig");
+    const time = @import("../time/time.zig");
     const t = time.now();
     const out: [*]u8 = @ptrFromInt(@as(usize, buf_ptr));
     const sec_ptr: *align(1) u64 = @ptrCast(out);
@@ -1038,8 +1038,8 @@ pub fn sysGettimeofday(buf_ptr: u32) u32 {
 /// no-TSC-deadline / sub-floor fallbacks drop the VM-exit storm.
 pub fn sysUsleep(usec: u32) u32 {
     if (usec == 0) return 0;
-    const hrtimer = @import("../../proc/hrtimer.zig");
-    const sched = @import("../../proc/sched.zig");
+    const hrtimer = @import("../proc/hrtimer.zig");
+    const sched = @import("../proc/sched.zig");
 
     const tpq = apic.tscPerQuantum();
     const SPIN_FLOOR_US: u32 = 50;

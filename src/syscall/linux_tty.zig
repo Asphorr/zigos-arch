@@ -3,12 +3,12 @@
 //! ENOTTY — which is also how isatty() learns a file is not a terminal.
 
 const std = @import("std");
-const process = @import("../../proc/process.zig");
-const tty = @import("../../proc/tty.zig");
-const pty = @import("../../proc/pty.zig");
-const file = @import("../../fs/file.zig");
-const socket = @import("../../net/socket.zig");
-const usercopy = @import("../arch/usercopy.zig");
+const process = @import("../proc/process.zig");
+const tty = @import("../proc/tty.zig");
+const pty = @import("../proc/pty.zig");
+const file = @import("../fs/file.zig");
+const socket = @import("../net/socket.zig");
+const usercopy = @import("../cpu/arch/usercopy.zig");
 const linux_fs = @import("linux_fs.zig");
 
 const EBADF: i64 = 9;
@@ -64,7 +64,7 @@ pub fn ioctl(fd: u64, request: u64, arg: u64) u64 {
     const id = f.tty;
     // A pipe that is no terminal's has its bytes to count and nothing else.
     if (id == 0xFF and f.kind == .pipe and request & 0xFFFF_FFFF == FIONREAD) {
-        return put(arg, @as(i32, @intCast(@import("../../proc/pipe.zig").pending(f.pipe_id))));
+        return put(arg, @as(i32, @intCast(@import("../proc/pipe.zig").pending(f.pipe_id))));
     }
     const t = tty.get(id) orelse return err(ENOTTY);
     switch (request & 0xFFFF_FFFF) {

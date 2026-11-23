@@ -47,7 +47,7 @@ pub fn UserPtr(comptime T: type) type {
         /// `validateWrite()`, or the store would #PF (err=0x3) in ring 0
         /// after STAC opens.
         pub fn validate(self: Self) ?Validated {
-            const common = @import("../cpu/syscall/common.zig");
+            const common = @import("../syscall/common.zig");
             if (!common.validateUserPtrAligned(@intCast(self.addr), @sizeOf(T), @alignOf(T))) return null;
             return .{ .addr = self.addr };
         }
@@ -58,7 +58,7 @@ pub fn UserPtr(comptime T: type) type {
         /// kernel write-fault panic into a clean errno. The handle carries
         /// both directions — a user page that's writable is also readable.
         pub fn validateWrite(self: Self) ?ValidatedWrite {
-            const common = @import("../cpu/syscall/common.zig");
+            const common = @import("../syscall/common.zig");
             if (!common.validateUserPtrWriteAligned(@intCast(self.addr), @sizeOf(T), @alignOf(T))) return null;
             return .{ .addr = self.addr };
         }

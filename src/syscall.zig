@@ -6,11 +6,11 @@
 //! (dispatch). validateUserPtr + errno constants live in syscall/common.zig.
 
 const std = @import("std");
-const process = @import("../proc/process.zig");
-const perf = @import("../debug/perf.zig");
-const debug = @import("../debug/debug.zig");
-const signals = @import("../proc/signals.zig");
-const apic = @import("../time/apic.zig");
+const process = @import("proc/process.zig");
+const perf = @import("debug/perf.zig");
+const debug = @import("debug/debug.zig");
+const signals = @import("proc/signals.zig");
+const apic = @import("time/apic.zig");
 
 const common = @import("syscall/common.zig");
 const E_NOSYS: u32 = common.E_NOSYS;
@@ -70,8 +70,8 @@ inline fn endBody(pcb: ?*process.PCB) void {
     const p = pcb orelse return;
     if (!p.in_syscall) return;
     p.in_syscall = false;
-    const cpu = @import("smp.zig").myCpu();
-    if (!cpu.dynirq_preempt_pending or @import("../proc/spinlock.zig").preemptionPinned()) return;
+    const cpu = @import("cpu/smp.zig").myCpu();
+    if (!cpu.dynirq_preempt_pending or @import("proc/spinlock.zig").preemptionPinned()) return;
     cpu.dynirq_preempt_pending = false;
     perf.noteDeferredPreempt();
     const t0 = perf.rdtsc();
@@ -94,7 +94,7 @@ pub fn chargeInterrupt(t_start: u64) void {
 export fn doSyscall(sys_num: u32, arg1: u32, arg2: u32, arg3: u32, frame_raw: ?*anyopaque) callconv(.c) u64 {
     // Per-CPU breadcrumb — stamp BEFORE everything else so even if we panic
     // mid-syscall, the autopsy reflects what this CPU was doing.
-    @import("../debug/breadcrumb.zig").stamp(.syscall_entry, sys_num);
+    @import("debug/breadcrumb.zig").stamp(.syscall_entry, sys_num);
     // Unconditional, first-line, no-allocation entry trace — if we ever stop
     // seeing [sc-entry] for a process, doSyscall isn't being reached, so the
     // wedge is in syscall_entry.zig's per-CPU entry stub (RSP swap, RIP-rel
@@ -106,21 +106,21 @@ export fn doSyscall(sys_num: u32, arg1: u32, arg2: u32, arg3: u32, frame_raw: ?*
         };
         if (sys_num < 256 and !enter_state.seen[sys_num]) {
             enter_state.seen[sys_num] = true;
-            @import("../debug/serial.zig").print("[sc-entry] sys#{d}\n", .{sys_num});
+            @import("debug/serial.zig").print("[sc-entry] sys#{d}\n", .{sys_num});
         }
     }
     // Execution trail — record syscall entry into the per-CPU ring so
     // the autopsy can show "the last 32 things this CPU did" instead of
     // just the final stack frame. Encoded as a sentinel RIP, decoded
     // back to a syscall number by the trail dumper.
-    @import("../debug/exectrail.zig").recordSyscall(sys_num);
+    @import("debug/exectrail.zig").recordSyscall(sys_num);
     // Snap-clear: the LSTAR stub just pushed 15 SyscallFrame qwords starting
     // at top-8 down, naturally overwriting the iretq slots at top-40..top.
     // Any iretq_canary snapshot taken at the previous user-mode IRQ entry is
     // now compared against SyscallFrame leftovers and false-positives. Clear
     // it here so subsequent check()s during this syscall return early; the
     // next user-mode IRQ refreshes the snap from a real iretq frame.
-    @import("../debug/iretq_canary.zig").invalidate();
+    @import("debug/iretq_canary.zig").invalidate();
 
     if (process.currentPCB()) |pcb| {
         pcb.perf_gap_cyc = 0;
@@ -152,18 +152,18 @@ export fn doSyscall(sys_num: u32, arg1: u32, arg2: u32, arg3: u32, frame_raw: ?*
     // fuel-bounded — see bpf/kernel.zig's safety story) with {nr, pid} as
     // its context. Deliberately BEFORE perf.enter so interpreter cycles
     // never pollute the [perf] sys# table the perf rounds are tuned on.
-    @import("../bpf/kernel.zig").onSyscallEnter(sys_num);
+    @import("bpf/kernel.zig").onSyscallEnter(sys_num);
 
     const t_enter = perf.enter();
     // Reset per-syscall phase tracker. Instrumented hot paths (validateUserPtr,
     // virtio_gpu wait, vfs read, ...) accumulate cycles into named phases;
     // dumped on slow-sc threshold so the operator sees WHERE the time went.
-    @import("../debug/syscall_perf.zig").reset();
+    @import("debug/syscall_perf.zig").reset();
     // SMAP: ensure AC is cleared on syscall exit even if validateUserPtr
     // already STAC'd. The bracketing is per-syscall, not per-access — once
     // a syscall has unlocked user access for one buffer it stays unlocked
     // until return, but no other kernel path runs with AC=1.
-    defer @import("arch/protect.zig").disallowUserAccess();
+    defer @import("cpu/arch/protect.zig").disallowUserAccess();
     defer {
         // Subtract any descheduled-time gap recorded by blocking primitives
         // (yield/sleep) so the syscall counter reflects CPU time, not wall.
@@ -202,7 +202,7 @@ export fn doSyscall(sys_num: u32, arg1: u32, arg2: u32, arg3: u32, frame_raw: ?*
                 );
                 // Per-phase breakdown — only fires when at least one
                 // instrumented site recorded something.
-                @import("../debug/syscall_perf.zig").dump();
+                @import("debug/syscall_perf.zig").dump();
             } else {
                 _ = @atomicRmw(u32, &slow_sc_suppressed, .Add, 1, .monotonic);
             }
@@ -226,7 +226,7 @@ export fn doSyscall(sys_num: u32, arg1: u32, arg2: u32, arg3: u32, frame_raw: ?*
             const linux = @import("syscall/linux.zig");
             const linux_signal = @import("syscall/linux_signal.zig");
             beginBody(pcb, false);
-            const lprof = @import("../debug/linux_prof.zig");
+            const lprof = @import("debug/linux_prof.zig");
             const t0 = lprof.now();
             // rt_sigreturn's result is a register it put back, not a
             // call's: nothing in it says to run the call again.
@@ -283,7 +283,7 @@ export fn doSyscall(sys_num: u32, arg1: u32, arg2: u32, arg3: u32, frame_raw: ?*
 /// A kill that waited out a no-kill section (PCB.nokill) lands here, before
 /// the caller's thread returns to user code it no longer owns.
 fn dieIfKilled() void {
-    const pid = @import("smp.zig").currentPid() orelse return;
+    const pid = @import("cpu/smp.zig").currentPid() orelse return;
     const pcb = &process.procs[pid];
     if (pcb.is_idle or !process.doomed(pid) or @atomicLoad(bool, &pcb.teardown_marked, .acquire)) return;
     process.destroyCurrentWithStatus(process.killStatus(pcb));
@@ -476,17 +476,17 @@ const SYSCALLS = [_]SyscallSpec{
     .{ .num = 119, .name = "msync",                   .handler = wrap(mem.sysMsync) },
     .{ .num = 120, .name = "getrandom",               .handler = wrap(sys.sysGetRandom) },
     .{ .num = 121, .name = "mmap_pmem",               .handler = wrap(mem.sysMmapPmem) },
-    .{ .num = 122, .name = "bpf",                     .handler = wrap(@import("../bpf/kernel.zig").sysBpf) },
+    .{ .num = 122, .name = "bpf",                     .handler = wrap(@import("bpf/kernel.zig").sysBpf) },
     .{ .num = 123, .name = "wait_event",              .handler = wrap(window.sysWaitEvent) },
 };
 
 // Thin shims so the dispatch table can route into the iouring module
 // without giving SYSCALLS a hard dependency on it.
 fn sys_iouring_setup(entries: u32) u32 {
-    return @import("ipc/iouring.zig").setup(entries);
+    return @import("cpu/ipc/iouring.zig").setup(entries);
 }
 fn sys_iouring_enter(user_va: u32, to_submit: u32, min_complete: u32) u32 {
-    return @import("ipc/iouring.zig").enter(user_va, to_submit, min_complete);
+    return @import("cpu/ipc/iouring.zig").enter(user_va, to_submit, min_complete);
 }
 
 /// Returns the registered name for a syscall number, or null if not registered.
@@ -629,7 +629,7 @@ fn doSyscallInner(sys_num: u32, arg1: u32, arg2: u32, arg3: u32, frame: ?*signal
         109 => net.sysTlsRecv(arg1, arg2, arg3),
         110 => net.sysTlsClose(arg1),
         111 => fs.sysSeek(arg1, arg2, arg3),
-        122 => @import("../bpf/kernel.zig").sysBpf(arg1, arg2, arg3),
+        122 => @import("bpf/kernel.zig").sysBpf(arg1, arg2, arg3),
         123 => window.sysWaitEvent(arg1, arg2),
         else => E_NOSYS,
     };

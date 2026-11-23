@@ -243,7 +243,7 @@ pub export fn handleTlbShootdown() callconv(.c) void {
     spinlock.hardirqEnter();
     defer spinlock.hardirqExit();
     const t = perf.rdtsc();
-    defer @import("../syscall.zig").chargeInterrupt(t);
+    defer @import("../../syscall.zig").chargeInterrupt(t);
     flushLocalForMode();
     // One rdtscp, not a LAPIC register read (a VM exit) — this runs once per
     // shootdown IPI on every target CPU, i.e. on every munmap/COW.

@@ -13,16 +13,16 @@
 //! spurious wake anyway, and moving them only spares the target word a herd.
 
 const std = @import("std");
-const process = @import("../../proc/process.zig");
-const signals = @import("../../proc/signals.zig");
-const memmap = @import("../../mm/memmap.zig");
-const debug = @import("../../debug/debug.zig");
-const time = @import("../../time/time.zig");
+const process = @import("../proc/process.zig");
+const signals = @import("../proc/signals.zig");
+const memmap = @import("../mm/memmap.zig");
+const debug = @import("../debug/debug.zig");
+const time = @import("../time/time.zig");
 const common = @import("common.zig");
 const linux_time = @import("linux_time.zig");
 const linux_signal = @import("linux_signal.zig");
-const lprof = @import("../../debug/linux_prof.zig");
-const shm = @import("../../mm/shm.zig");
+const lprof = @import("../debug/linux_prof.zig");
+const shm = @import("../mm/shm.zig");
 
 // Linux errno.
 const EPERM: i64 = 1;
@@ -90,7 +90,7 @@ pub fn clone(frame: *signals.SyscallFrame, flags: u64, stack: u64, ptid: u64, ct
             });
             if (flags & CLONE_PARENT_SETTID != 0 and @as(i64, @bitCast(child)) > 0) {
                 const tid: u32 = @truncate(child);
-                _ = @import("../arch/usercopy.zig").copyToUser(ptid, std.mem.asBytes(&tid));
+                _ = @import("../cpu/arch/usercopy.zig").copyToUser(ptid, std.mem.asBytes(&tid));
             }
             return child;
         }

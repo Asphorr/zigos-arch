@@ -49,7 +49,7 @@ const nvme = @import("../../driver.zig").nvme;
 const spinlock = @import("../../proc/spinlock.zig");
 const pid_set = @import("../../util/pid_set.zig");
 
-const common = @import("../syscall/common.zig");
+const common = @import("../../syscall/common.zig");
 const E_INVAL = common.E_INVAL;
 const E_NOMEM = common.E_NOMEM;
 const E_FAULT = common.E_FAULT;

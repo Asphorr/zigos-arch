@@ -38,7 +38,7 @@ const jit = @import("jit.zig");
 const process = @import("../proc/process.zig");
 const spinlock = @import("../proc/spinlock.zig");
 const serial = @import("../debug/serial.zig");
-const common = @import("../cpu/syscall/common.zig");
+const common = @import("../syscall/common.zig");
 const pmm = @import("../mm/pmm.zig");
 const paging = @import("../mm/paging.zig");
 

@@ -2,28 +2,28 @@
 //! Dispatched from cpu/syscall.zig doSyscallInner; named in SYSCALLS.
 
 const std = @import("std");
-const vga = @import("../../ui/vga.zig");
-const elf_loader = @import("../../proc/elf_loader.zig");
-const keyboard = @import("../../driver.zig").keyboard;
-const process = @import("../../proc/process.zig");
-const vmm = @import("../../mm/vmm.zig");
-const pmm = @import("../../mm/pmm.zig");
-const paging = @import("../../mm/paging.zig");
-const bga = @import("../../ui/bga.zig");
-const vfs = @import("../../fs/vfs.zig");
-const file = @import("../../fs/file.zig");
-const desktop = @import("../../ui/desktop.zig");
-const xhci = @import("../../driver.zig").xhci;
-const debug = @import("../../debug/debug.zig");
-const perf = @import("../../debug/perf.zig");
-const pipe = @import("../../proc/pipe.zig");
-const memmap = @import("../../mm/memmap.zig");
-const config = @import("../../config.zig");
-const smp = @import("../smp.zig");
-const signals = @import("../../proc/signals.zig");
-const errno = @import("../../proc/errno.zig");
-const sched_asm = @import("../../proc/sched_asm.zig");
-const apic = @import("../../time/apic.zig");
+const vga = @import("../ui/vga.zig");
+const elf_loader = @import("../proc/elf_loader.zig");
+const keyboard = @import("../driver.zig").keyboard;
+const process = @import("../proc/process.zig");
+const vmm = @import("../mm/vmm.zig");
+const pmm = @import("../mm/pmm.zig");
+const paging = @import("../mm/paging.zig");
+const bga = @import("../ui/bga.zig");
+const vfs = @import("../fs/vfs.zig");
+const file = @import("../fs/file.zig");
+const desktop = @import("../ui/desktop.zig");
+const xhci = @import("../driver.zig").xhci;
+const debug = @import("../debug/debug.zig");
+const perf = @import("../debug/perf.zig");
+const pipe = @import("../proc/pipe.zig");
+const memmap = @import("../mm/memmap.zig");
+const config = @import("../config.zig");
+const smp = @import("../cpu/smp.zig");
+const signals = @import("../proc/signals.zig");
+const errno = @import("../proc/errno.zig");
+const sched_asm = @import("../proc/sched_asm.zig");
+const apic = @import("../time/apic.zig");
 
 const common = @import("common.zig");
 const validateUserPtr = common.validateUserPtr;
@@ -146,11 +146,11 @@ pub fn sysListDir(buf_ptr: u32, buf_size: u32) u32 {
     const m = vfs.findMount(cwd) orelse return 0;
     return switch (m.fs) {
         .tarfs => blk: {
-            const tarfs = @import("../../fs/tarfs.zig");
+            const tarfs = @import("../fs/tarfs.zig");
             break :blk tarfs.listToBuffer(@ptrCast(entries), max_entries);
         },
         .fat32 => blk: {
-            const fat32 = @import("../../fs/fat32.zig");
+            const fat32 = @import("../fs/fat32.zig");
             break :blk listFatDir(fat32.root_cluster, entries, max_entries);
         },
         .ext2 => blk: {
@@ -159,8 +159,8 @@ pub fn sysListDir(buf_ptr: u32, buf_size: u32) u32 {
             // extern structs as distinct types). Walk cwd-relative path
             // (cwd[mount_prefix.len..]) to the right directory inode so
             // `cd /bin; ls` actually lists /bin and not the ext2 root.
-            const ext2 = @import("../../fs/ext2/ext2.zig");
-            const layout = @import("../../fs/ext2/layout.zig");
+            const ext2 = @import("../fs/ext2/ext2.zig");
+            const layout = @import("../fs/ext2/layout.zig");
             const rel = cwd[m.prefix.len..];
             const dir_inum = if (rel.len == 0) layout.ROOT_INO else (ext2.resolveDirInum(rel) orelse layout.ROOT_INO);
             break :blk ext2.listDir(dir_inum, @ptrCast(entries), max_entries);
@@ -182,7 +182,7 @@ pub fn sysListDir(buf_ptr: u32, buf_size: u32) u32 {
 ///   bit 2 = from_fat32 (always set here)
 ///   bit 3 = from_ext2
 pub fn listFatDir(dir_cluster: u32, entries: [*]FileEntry, max_entries: u32) u32 {
-    const fat32 = @import("../../fs/fat32.zig");
+    const fat32 = @import("../fs/fat32.zig");
     var count: u32 = 0;
     var lfn_buf: [255]u8 = undefined;
     var lfn_len: usize = 0;
@@ -352,7 +352,7 @@ pub fn changeDir(pcb: *process.PCB, path: []const u8) ChdirError!void {
     // A directory on ext2 becomes the cwd under its physical name: symbolic
     // links and ".." are followed on disk, so ".." from the new cwd leads to
     // its real parent, and getcwd names no link.
-    const ext2_fs = @import("../../fs/ext2/ext2.zig");
+    const ext2_fs = @import("../fs/ext2/ext2.zig");
     const physical: ?usize = blk: {
         var rb: [256]u8 = undefined;
         const r = vfs.resolvePath(pcb, abs[0..abs_len], &rb) orelse break :blk null;
@@ -391,7 +391,7 @@ pub fn changeDir(pcb: *process.PCB, path: []const u8) ChdirError!void {
         switch (r.fs) {
             .tarfs => {},
             .fat32 => {
-                const fat32 = @import("../../fs/fat32.zig");
+                const fat32 = @import("../fs/fat32.zig");
                 if (fat32.resolveDirCluster(r.path) == null) return error.NotDir;
             },
             .devfs => {
@@ -399,11 +399,11 @@ pub fn changeDir(pcb: *process.PCB, path: []const u8) ChdirError!void {
                 return error.NotDir;
             },
             .procfs => {
-                const procfs = @import("../../fs/procfs.zig");
+                const procfs = @import("../fs/procfs.zig");
                 if (!procfs.isDirectory(r.path)) return error.NotDir;
             },
             .ext2 => {
-                const ext2 = @import("../../fs/ext2/ext2.zig");
+                const ext2 = @import("../fs/ext2/ext2.zig");
                 if (ext2.resolveDirInum(r.path) == null) {
                     return if (ext2.lookupPath(r.path) == null) error.NotFound else error.NotDir;
                 }
@@ -513,11 +513,11 @@ pub fn sysMkdir(path_ptr: u32) u32 {
 
     switch (resolved.fs) {
         .fat32 => {
-            const fat32 = @import("../../fs/fat32.zig");
+            const fat32 = @import("../fs/fat32.zig");
             return if (fat32.createDirectory(resolved.path)) 0 else E_INVAL;
         },
         .ext2 => {
-            const ext2 = @import("../../fs/ext2/ext2.zig");
+            const ext2 = @import("../fs/ext2/ext2.zig");
             return if (ext2.mkdirPath(resolved.path)) 0 else E_INVAL;
         },
         else => return E_INVAL,
@@ -557,25 +557,25 @@ pub fn sysReaddir(path_ptr: u32, buf_ptr: u32, buf_size: u32) u32 {
     switch (resolved.fs) {
         .tarfs => {
             // List all files in tarfs index
-            const tarfs = @import("../../fs/tarfs.zig");
+            const tarfs = @import("../fs/tarfs.zig");
             const count = tarfs.listToBuffer(@ptrCast(entries), max_entries);
             return count;
         },
         .fat32 => {
-            const fat32 = @import("../../fs/fat32.zig");
+            const fat32 = @import("../fs/fat32.zig");
             const dc = fat32.resolveDirCluster(resolved.path) orelse return E_INVAL;
             return listFatDir(dc, entries, max_entries);
         },
         .devfs => {
-            const devfs = @import("../../fs/devfs.zig");
+            const devfs = @import("../fs/devfs.zig");
             return devfs.listToBuffer(@ptrCast(@alignCast(entries)), max_entries);
         },
         .procfs => {
-            const procfs = @import("../../fs/procfs.zig");
+            const procfs = @import("../fs/procfs.zig");
             return procfs.listToBuffer(resolved.path, @ptrCast(@alignCast(entries)), max_entries);
         },
         .ext2 => {
-            const ext2 = @import("../../fs/ext2/ext2.zig");
+            const ext2 = @import("../fs/ext2/ext2.zig");
             const dir_inum = ext2.resolveDirInum(resolved.path) orelse return E_INVAL;
             return ext2.listDir(dir_inum, @ptrCast(@alignCast(entries)), max_entries);
         },
@@ -603,7 +603,7 @@ pub fn sysUnlink(path_ptr: u32, path_len: u32) u32 {
             return E_INVAL;
         },
         .fat32 => {
-            const fat32 = @import("../../fs/fat32.zig");
+            const fat32 = @import("../fs/fat32.zig");
             if (fat32.deleteFile(resolved.path)) {
                 return 0;
             }
@@ -615,7 +615,7 @@ pub fn sysUnlink(path_ptr: u32, path_len: u32) u32 {
         },
         .procfs => return 0xFFFFFFFF,
         .ext2 => {
-            const ext2 = @import("../../fs/ext2/ext2.zig");
+            const ext2 = @import("../fs/ext2/ext2.zig");
             return if (ext2.unlinkPath(resolved.path)) 0 else E_INVAL;
         },
     }
@@ -648,21 +648,21 @@ pub fn sysStat(path_ptr: u32, path_len: u32, stat_buf_ptr: u32) u32 {
 
     switch (resolved.fs) {
         .tarfs => {
-            const tarfs = @import("../../fs/tarfs.zig");
+            const tarfs = @import("../fs/tarfs.zig");
             if (tarfs.getFileStat(resolved.path, stat_buf)) {
                 return 0;
             }
             return E_INVAL;
         },
         .fat32 => {
-            const fat32 = @import("../../fs/fat32.zig");
+            const fat32 = @import("../fs/fat32.zig");
             if (fat32.getFileStat(resolved.path, stat_buf)) {
                 return 0;
             }
             return E_INVAL;
         },
         .devfs => {
-            const devfs = @import("../../fs/devfs.zig");
+            const devfs = @import("../fs/devfs.zig");
             const idx = devfs.openFile(resolved.path) orelse return E_INVAL;
             const sz = devfs.deviceSize(idx);
             stat_buf.file_size = if (sz > 0xFFFFFFFF) 0xFFFFFFFF else @intCast(sz);
@@ -672,7 +672,7 @@ pub fn sysStat(path_ptr: u32, path_len: u32, stat_buf_ptr: u32) u32 {
             return 0;
         },
         .procfs => {
-            const procfs = @import("../../fs/procfs.zig");
+            const procfs = @import("../fs/procfs.zig");
             if (procfs.isDirectory(resolved.path)) {
                 stat_buf.file_size = 0;
                 stat_buf.is_directory = 1;
@@ -690,7 +690,7 @@ pub fn sysStat(path_ptr: u32, path_len: u32, stat_buf_ptr: u32) u32 {
             return E_INVAL;
         },
         .ext2 => {
-            const ext2 = @import("../../fs/ext2/ext2.zig");
+            const ext2 = @import("../fs/ext2/ext2.zig");
             if (ext2.getFileStat(resolved.path, stat_buf)) return 0;
             return E_INVAL;
         },
@@ -738,7 +738,7 @@ pub fn sysRename(old_path_ptr: u32, old_len: u32, new_path_ptr: u32) u32 {
             return E_INVAL;
         },
         .fat32 => {
-            const fat32 = @import("../../fs/fat32.zig");
+            const fat32 = @import("../fs/fat32.zig");
             if (fat32.renameFile(old_resolved.path, new_resolved.path)) {
                 return 0;
             }
@@ -774,7 +774,7 @@ pub fn sysRmdir(path_ptr: u32, path_len: u32) u32 {
             return E_INVAL;
         },
         .fat32 => {
-            const fat32 = @import("../../fs/fat32.zig");
+            const fat32 = @import("../fs/fat32.zig");
             if (fat32.removeDirectory(resolved.path)) {
                 return 0;
             }
@@ -786,7 +786,7 @@ pub fn sysRmdir(path_ptr: u32, path_len: u32) u32 {
         },
         .procfs => return 0xFFFFFFFF,
         .ext2 => {
-            const ext2 = @import("../../fs/ext2/ext2.zig");
+            const ext2 = @import("../fs/ext2/ext2.zig");
             return if (ext2.rmdirPath(resolved.path)) 0 else E_INVAL;
         },
     }

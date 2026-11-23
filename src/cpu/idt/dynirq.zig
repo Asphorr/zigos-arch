@@ -72,7 +72,7 @@ export fn handleDynIrq(vec: u32) callconv(.c) void {
     defer @import("../../proc/spinlock.zig").hardirqExit();
     const t = @import("../../debug/perf.zig").enter();
     defer @import("../../debug/perf.zig").leave(.dynirq, t);
-    defer @import("../syscall.zig").chargeInterrupt(t);
+    defer @import("../../syscall.zig").chargeInterrupt(t);
     // Breadcrumb: (vec << 16) | pid. cpu.current_pid read once.
     {
         const pid_now: u64 = if (@import("../smp.zig").currentPid()) |p| @intCast(p) else 0xFF;

@@ -22,7 +22,7 @@ export fn handleIRQ1() callconv(.c) void {
     defer @import("../../proc/spinlock.zig").hardirqExit();
     const t = @import("../../debug/perf.zig").enter();
     defer @import("../../debug/perf.zig").leave(.irq1_kbd, t);
-    defer @import("../syscall.zig").chargeInterrupt(t);
+    defer @import("../../syscall.zig").chargeInterrupt(t);
     // Mirror of mouse.handleIRQ's status gate: bit 0 = a byte is actually
     // there (IRQ1 can fire spuriously), bit 5 clear = it's KEYBOARD data.
     // The i8042 is shared — an unconditional read here could swallow an
@@ -44,7 +44,7 @@ export fn handleIRQ12() callconv(.c) void {
     defer @import("../../proc/spinlock.zig").hardirqExit();
     const t = @import("../../debug/perf.zig").enter();
     defer @import("../../debug/perf.zig").leave(.irq12_mouse, t);
-    defer @import("../syscall.zig").chargeInterrupt(t);
+    defer @import("../../syscall.zig").chargeInterrupt(t);
     mouse.handleIRQ();
     if (!apic.apic_active) {
         io.outb(0xA0, 0x20); // Slave PIC EOI (only needed for legacy PIC)

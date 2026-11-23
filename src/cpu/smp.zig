@@ -856,7 +856,7 @@ fn apInitPerCpu() u8 {
     // from a process that hasn't issued any syscall yet means we have no
     // earlier dispatch to log around. (Spent an evening chasing exactly this
     // bug — see feedback_smp_syscall_msrs.md.)
-    @import("syscall/entry.zig").init();
+    @import("../syscall/entry.zig").init();
     // LBR is per-CPU — enable on each AP too, otherwise crashes on this
     // CPU dump an empty branch ring.
     @import("../debug/lbr.zig").enable();
@@ -864,7 +864,7 @@ fn apInitPerCpu() u8 {
     // code. Catches future "init() got refactored and dropped a wrmsr" too.
     var label_buf: [16]u8 = undefined;
     const label = std.fmt.bufPrint(&label_buf, "AP{d}", .{my_id}) catch "AP?";
-    @import("syscall/entry.zig").verifyMsrs(label);
+    @import("../syscall/entry.zig").verifyMsrs(label);
 
     // SMEP/UMIP + SMAP. AP's kstack is allocated in the physmap (high-VA,
     // U/S=0) from the start, so SMAP enable is safe immediately — unlike
@@ -1030,9 +1030,9 @@ pub fn reinitForS3Resume() void {
 
     // syscall/sysret MSRs (SCE/STAR/LSTAR/SFMASK) + EFER.NXE. Required for the
     // eventual sysret back to userspace, and re-enables NXE for everything after.
-    @import("syscall/entry.zig").init();
+    @import("../syscall/entry.zig").init();
     @import("../debug/lbr.zig").enable();
-    @import("syscall/entry.zig").verifyMsrs("S3-BSP");
+    @import("../syscall/entry.zig").verifyMsrs("S3-BSP");
 
     // SMEP/UMIP + SMAP, AVX state, MCE, PMU — all per-CPU, all reset by S3.
     @import("arch/protect.zig").applyEarlyCr4();

@@ -1,6 +1,6 @@
 const std = @import("std");
 const pic = @import("../time/pic.zig");
-const syscall = @import("syscall.zig");
+const syscall = @import("../syscall.zig");
 const debug = @import("../debug/debug.zig");
 const serial = @import("../debug/serial.zig");
 const symbols = @import("../debug/symbols.zig");

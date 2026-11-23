@@ -19,15 +19,15 @@
 //!   handler interrupts runs again at once.
 
 const std = @import("std");
-const process = @import("../../proc/process.zig");
-const signals = @import("../../proc/signals.zig");
-const memmap = @import("../../mm/memmap.zig");
-const usercopy = @import("../arch/usercopy.zig");
-const fp = @import("../arch/fp.zig");
-const sched = @import("../../proc/sched.zig");
+const process = @import("../proc/process.zig");
+const signals = @import("../proc/signals.zig");
+const memmap = @import("../mm/memmap.zig");
+const usercopy = @import("../cpu/arch/usercopy.zig");
+const fp = @import("../cpu/arch/fp.zig");
+const sched = @import("../proc/sched.zig");
 const linux_time = @import("linux_time.zig");
-const debug = @import("../../debug/debug.zig");
-const perf = @import("../../debug/perf.zig");
+const debug = @import("../debug/debug.zig");
+const perf = @import("../debug/perf.zig");
 
 const PCB = process.PCB;
 
@@ -756,7 +756,7 @@ pub fn irqReturn(pcb: *PCB, frame: *signals.IrqFrame) void {
     frame.rdx = entry.uc;
     frame.rax = 0;
     // The frame the interrupt returns through was rewritten on purpose.
-    @import("../../debug/iretq_canary.zig").refresh();
+    @import("../debug/iretq_canary.zig").refresh();
 }
 
 /// A fault in user code of `pcb` raised `signo`. True if its handler was

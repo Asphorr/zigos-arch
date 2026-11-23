@@ -2,28 +2,28 @@
 //! Dispatched from cpu/syscall.zig doSyscallInner; named in SYSCALLS.
 
 const std = @import("std");
-const vga = @import("../../ui/vga.zig");
-const elf_loader = @import("../../proc/elf_loader.zig");
-const keyboard = @import("../../driver.zig").keyboard;
-const process = @import("../../proc/process.zig");
-const vmm = @import("../../mm/vmm.zig");
-const pmm = @import("../../mm/pmm.zig");
-const paging = @import("../../mm/paging.zig");
-const bga = @import("../../ui/bga.zig");
-const vfs = @import("../../fs/vfs.zig");
-const desktop = @import("../../ui/desktop.zig");
-const xhci = @import("../../driver.zig").xhci;
-const debug = @import("../../debug/debug.zig");
-const perf = @import("../../debug/perf.zig");
-const pipe = @import("../../proc/pipe.zig");
-const memmap = @import("../../mm/memmap.zig");
-const config = @import("../../config.zig");
-const smp = @import("../smp.zig");
-const signals = @import("../../proc/signals.zig");
-const errno = @import("../../proc/errno.zig");
-const sched_asm = @import("../../proc/sched_asm.zig");
-const apic = @import("../../time/apic.zig");
-const random = @import("../../crypto/random.zig");
+const vga = @import("../ui/vga.zig");
+const elf_loader = @import("../proc/elf_loader.zig");
+const keyboard = @import("../driver.zig").keyboard;
+const process = @import("../proc/process.zig");
+const vmm = @import("../mm/vmm.zig");
+const pmm = @import("../mm/pmm.zig");
+const paging = @import("../mm/paging.zig");
+const bga = @import("../ui/bga.zig");
+const vfs = @import("../fs/vfs.zig");
+const desktop = @import("../ui/desktop.zig");
+const xhci = @import("../driver.zig").xhci;
+const debug = @import("../debug/debug.zig");
+const perf = @import("../debug/perf.zig");
+const pipe = @import("../proc/pipe.zig");
+const memmap = @import("../mm/memmap.zig");
+const config = @import("../config.zig");
+const smp = @import("../cpu/smp.zig");
+const signals = @import("../proc/signals.zig");
+const errno = @import("../proc/errno.zig");
+const sched_asm = @import("../proc/sched_asm.zig");
+const apic = @import("../time/apic.zig");
+const random = @import("../crypto/random.zig");
 
 const common = @import("common.zig");
 const validateUserPtr = common.validateUserPtr;
@@ -50,7 +50,7 @@ const E_INTR = common.E_INTR;
 pub fn sysAudioWrite(buf_ptr: u32, num_samples: u32) u32 {
     if (num_samples == 0 or num_samples > 8192) return E_INVAL;
     if (!validateUserPtrAligned(buf_ptr, num_samples * 4, 2)) return E_FAULT; // stereo i16 = 4 bytes/sample, 2-byte aligned
-    const sound = @import("../../driver.zig").sound;
+    const sound = @import("../driver.zig").sound;
     if (!sound.isReady()) return E_INVAL;
     const src: [*]const i16 = @ptrFromInt(@as(usize, buf_ptr));
     sound.writeSamples(src, num_samples);
@@ -94,7 +94,7 @@ pub fn sysSetConfig(key: u32, value: u32) u32 {
             if (value <= 1) desktop.conf.dock_pos = @truncate(value);
         },
         5 => { // UTC offset: signed minutes east, as an i32 bit pattern
-            _ = @import("../../time/time.zig").setUtcOffsetMinutes(@bitCast(value));
+            _ = @import("../time/time.zig").setUtcOffsetMinutes(@bitCast(value));
         },
         255 => { // apply
             desktop.config_changed = true;
@@ -161,7 +161,7 @@ pub fn sysKlog(buf_ptr: u32, len: u32) u32 {
     if (!validateUserPtr(buf_ptr, safe_len)) return E_FAULT;
     const ptr: [*]const u8 = @ptrFromInt(@as(usize, buf_ptr));
     const pid = process.getCurrentPid();
-    @import("../../debug/serial.zig").print("[klog pid={d}] {s}", .{ pid, ptr[0..safe_len] });
+    @import("../debug/serial.zig").print("[klog pid={d}] {s}", .{ pid, ptr[0..safe_len] });
     return 0;
 }
 
@@ -178,18 +178,18 @@ pub fn sysKlog(buf_ptr: u32, len: u32) u32 {
 /// unconditionally, so shutdown survives even firmware whose SLP_TYP we read
 /// wrong — and QEMU accepts any SLP_TYP when SLP_EN=1 regardless.
 pub fn sysShutdown(mode: u32) u32 {
-    const io = @import("../../io.zig");
-    const fat32 = @import("../../fs/fat32.zig");
-    const acpi = @import("../../acpi/acpi.zig");
+    const io = @import("../io.zig");
+    const fat32 = @import("../fs/fat32.zig");
+    const acpi = @import("../acpi/acpi.zig");
 
     // Best-effort: flush dirty FS caches before yanking the power.
     if (fat32.isInitialized()) fat32.flushAll();
     _ = vfs.flushAllDirty();
-    @import("../../fs/ext2/ext2.zig").sync();
+    @import("../fs/ext2/ext2.zig").sync();
     // Then commit any in-flight NVMe writes to non-volatile storage —
     // without this, the device write cache can lose recent writes on
     // power-off even after fat32.flushAll has drained the OS-side caches.
-    @import("../../driver.zig").nvme.flushAll();
+    @import("../driver.zig").nvme.flushAll();
 
     if (mode == 1) {
         // Reboot path, preferred order:
@@ -209,11 +209,11 @@ pub fn sysShutdown(mode: u32) u32 {
         // Each attempt does nothing if the previous already triggered;
         // the kernel just keeps writing reset registers until something
         // takes.
-        const hyperv = @import("../../virt/hyperv.zig");
+        const hyperv = @import("../virt/hyperv.zig");
         _ = hyperv.tryReset();
         acpi.tryReset();
         io.outb(0xCF9, 0x06);
-        var d = @import("../../util/deadline.zig").Deadline.ms(10, "kbd-ctrl reboot drain");
+        var d = @import("../util/deadline.zig").Deadline.ms(10, "kbd-ctrl reboot drain");
         while ((io.inb(0x64) & 0x02) != 0 and d.live()) {}
         io.outb(0x64, 0xFE);
     } else if (mode == 2) {
@@ -223,7 +223,7 @@ pub fn sysShutdown(mode: u32) u32 {
         // request the platform suspends inside this call; on resume (CP2b) it
         // returns 0; if S3 is unavailable or the write was ignored it returns
         // an errno and the caller's shell survives.
-        return @import("../../acpi/s3.zig").suspendToRam();
+        return @import("../acpi/s3.zig").suspendToRam();
     } else {
         // Enter S5 (soft off): write SLP_TYP|SLP_EN to PM1a_CNT (and PM1b_CNT
         // when present). SLP_EN is bit 13; SLP_TYP is bits 12:10. The codes come
@@ -328,7 +328,7 @@ pub fn sysDebugCrash(variant: u32) u32 {
     // When disabled it's indistinguishable from an unimplemented syscall.
     if (!config.ENABLE_DEBUG_CRASH) return E_NOSYS;
 
-    const heap = @import("../../mm/heap.zig");
+    const heap = @import("../mm/heap.zig");
     debug.klog("[crashtest] sysDebugCrash variant={d}\n", .{variant});
 
     switch (variant) {

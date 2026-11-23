@@ -13,26 +13,26 @@
 //! handlers and masks are linux_signal.zig's.
 
 const std = @import("std");
-const process = @import("../../proc/process.zig");
-const lifecycle = @import("../../proc/lifecycle.zig");
-const sched = @import("../../proc/sched.zig");
-const signals = @import("../../proc/signals.zig");
-const pid_nr = @import("../../proc/pid_nr.zig");
-const session = @import("../../proc/session.zig");
-const pipe = @import("../../proc/pipe.zig");
-const elf_loader = @import("../../proc/elf_loader.zig");
-const vfs = @import("../../fs/vfs.zig");
-const file = @import("../../fs/file.zig");
-const heap = @import("../../mm/heap.zig");
-const pmm = @import("../../mm/pmm.zig");
-const fdpoll = @import("../ipc/fdpoll.zig");
-const smp = @import("../smp.zig");
-const usercopy = @import("../arch/usercopy.zig");
+const process = @import("../proc/process.zig");
+const lifecycle = @import("../proc/lifecycle.zig");
+const sched = @import("../proc/sched.zig");
+const signals = @import("../proc/signals.zig");
+const pid_nr = @import("../proc/pid_nr.zig");
+const session = @import("../proc/session.zig");
+const pipe = @import("../proc/pipe.zig");
+const elf_loader = @import("../proc/elf_loader.zig");
+const vfs = @import("../fs/vfs.zig");
+const file = @import("../fs/file.zig");
+const heap = @import("../mm/heap.zig");
+const pmm = @import("../mm/pmm.zig");
+const fdpoll = @import("../cpu/ipc/fdpoll.zig");
+const smp = @import("../cpu/smp.zig");
+const usercopy = @import("../cpu/arch/usercopy.zig");
 const common = @import("common.zig");
 const linux_fs = @import("linux_fs.zig");
 const linux_signal = @import("linux_signal.zig");
 const linux_time = @import("linux_time.zig");
-const debug = @import("../../debug/debug.zig");
+const debug = @import("../debug/debug.zig");
 
 // Linux errno.
 const EPERM: i64 = 1;
@@ -151,7 +151,7 @@ pub fn execve(frame: *signals.SyscallFrame, path_va: u64, argv_va: u64, envp_va:
     // the others, this one among them, on its way out of this call.
     while (!lifecycle.execBegin()) {
         if (@atomicLoad(bool, &process.procs[me].exit_requested, .acquire)) return err(EINTR);
-        @import("../../proc/sched_asm.zig").softYield();
+        @import("../proc/sched_asm.zig").softYield();
     }
     defer lifecycle.execEnd();
 
@@ -170,7 +170,7 @@ pub fn execve(frame: *signals.SyscallFrame, path_va: u64, argv_va: u64, envp_va:
 
     // Past here the call can't fail: it returns into the new image.
     lifecycle.killOtherThreads();
-    @import("../ipc/iouring.zig").releaseAllForPid(@intCast(me));
+    @import("../cpu/ipc/iouring.zig").releaseAllForPid(@intCast(me));
     const entry_rsp = imageEntry(img);
     lifecycle.takeExecImage(img);
     closeOnExec();
@@ -182,7 +182,7 @@ pub fn execve(frame: *signals.SyscallFrame, path_va: u64, argv_va: u64, envp_va:
 const EntryRsp = struct { rip: u64, rsp: u64 };
 
 fn imageEntry(img: usize) EntryRsp {
-    const fspec = @import("../../proc/frames.zig").dispatch;
+    const fspec = @import("../proc/frames.zig").dispatch;
     const f: [*]const u64 = @ptrFromInt(process.procs[img].kernel_stack_top - fspec.pt_regs_bytes);
     return .{ .rip = f[fspec.iretq.rip.at()], .rsp = f[fspec.iretq.rsp.at()] };
 }
@@ -196,8 +196,8 @@ fn enterImage(frame: *signals.SyscallFrame, e: EntryRsp) void {
     frame.user_rsp = e.rsp;
     frame.r11 = 0x202; // RFLAGS: IF
     const fpu: *align(16) [512]u8 = @constCast(frame.userFpu());
-    fpu.* = @import("../arch/fp.zig").init_template;
-    @import("../arch/fp.zig").resetLiveExtended();
+    fpu.* = @import("../cpu/arch/fp.zig").init_template;
+    @import("../cpu/arch/fp.zig").resetLiveExtended();
     const pcb = process.currentPCB() orelse return;
     pcb.fs_base = 0;
     asm volatile ("wrmsr"
@@ -383,7 +383,7 @@ pub fn wait4(pid_arg: u64, status_va: u64, options: u64, rusage_va: u64) u64 {
 }
 
 /// Two threads of a process may wait4 for the same child: one reaps it.
-var reap_lock: @import("../../proc/spinlock.zig").SpinLock = .{};
+var reap_lock: @import("../proc/spinlock.zig").SpinLock = .{};
 
 /// Reap a zombie child of `group` among the `awaited`, its wait status in
 /// `status`. Returns the child's number; null if none is reapable now.

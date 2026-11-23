@@ -15,20 +15,20 @@
 //! The group shares one fd table and cwd, the lead's (proc()).
 
 const std = @import("std");
-const process = @import("../../proc/process.zig");
-const vfs = @import("../../fs/vfs.zig");
-const file = @import("../../fs/file.zig");
-const ext2 = @import("../../fs/ext2/ext2.zig");
-const ext2_inode = @import("../../fs/ext2/inode.zig");
+const process = @import("../proc/process.zig");
+const vfs = @import("../fs/vfs.zig");
+const file = @import("../fs/file.zig");
+const ext2 = @import("../fs/ext2/ext2.zig");
+const ext2_inode = @import("../fs/ext2/inode.zig");
 const common = @import("common.zig");
 const native_fs = @import("fs.zig");
-const usercopy = @import("../arch/usercopy.zig");
-const locks = @import("../../fs/locks.zig");
+const usercopy = @import("../cpu/arch/usercopy.zig");
+const locks = @import("../fs/locks.zig");
 const linux_signal = @import("linux_signal.zig");
-const debug = @import("../../debug/debug.zig");
-const tty = @import("../../proc/tty.zig");
-const pty = @import("../../proc/pty.zig");
-const lproc = @import("../../fs/lproc.zig");
+const debug = @import("../debug/debug.zig");
+const tty = @import("../proc/tty.zig");
+const pty = @import("../proc/pty.zig");
+const lproc = @import("../fs/lproc.zig");
 
 // Linux errno.
 const EPERM: i64 = 1;
@@ -680,7 +680,7 @@ fn devFacts(name: []const u8) ?Facts {
         .{ "kmsg", 0x10B }, .{ "tty", 0x500 },  .{ "console", 0x501 }, .{ "ptmx", 0x502 },
     };
     for (known) |k| if (std.mem.eql(u8, name, k[0])) return charDev(k[1], if (k[1] == 0x500) 0o620 else 0o666);
-    const idx = @import("../../fs/devfs.zig").openFile(name) orelse return null;
+    const idx = @import("../fs/devfs.zig").openFile(name) orelse return null;
     return charDev(0x2000 + @as(u64, idx), 0o660);
 }
 
@@ -708,7 +708,7 @@ pub const FactsRead = union(enum) { facts: Facts, fail: u64 };
 /// What stat says of a name in /proc.
 fn procFacts(n: lproc.Node) Facts {
     const f = lproc.facts(n);
-    const now = @import("../../time/time.zig").realtimeNanos() / std.time.ns_per_s;
+    const now = @import("../time/time.zig").realtimeNanos() / std.time.ns_per_s;
     return .{ .ino = f.ino, .mode = f.mode, .nlink = f.nlink, .atime = now, .mtime = now, .ctime = now };
 }
 
@@ -733,7 +733,7 @@ pub fn fdFacts(pcb: *process.PCB, fd: u64) FactsRead {
         return .{ .facts = CONSOLE_FACTS };
     }
     return switch (fe.kind) {
-        .devfs => .{ .facts = devFacts(@import("../../fs/devfs.zig").nameOf(fe.inode) orelse "null") orelse charDev(0x103, 0o666) },
+        .devfs => .{ .facts = devFacts(@import("../fs/devfs.zig").nameOf(fe.inode) orelse "null") orelse charDev(0x103, 0o666) },
         .console => .{ .facts = CONSOLE_FACTS },
         .ext2 => if (ext2Facts(fe.inode)) |f| .{ .facts = f } else .{ .fail = err(EIO) },
         .pipe => .{ .facts = .{ .mode = S_IFIFO | 0o600 } },
@@ -1125,7 +1125,7 @@ const Timespec = extern struct { sec: i64, nsec: i64 };
 /// to be there: touch goes by ENOENT to create it.
 pub fn utimensat(dirfd: u64, path_va: u64, times_va: u64, flags: u64) u64 {
     const pcb = proc() orelse return err(EFAULT);
-    const now: u32 = @truncate(@import("../../time/time.zig").now().sec);
+    const now: u32 = @truncate(@import("../time/time.zig").now().sec);
     var atime: ?u32 = now;
     var mtime: ?u32 = now;
     if (times_va != 0) {

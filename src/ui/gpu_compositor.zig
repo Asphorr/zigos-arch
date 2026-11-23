@@ -161,7 +161,7 @@ fn waitReplyMarker(ring: [*]volatile u8, timeout_ms: u64) SubmitResult {
         if (waited_us < SPIN_WAIT_US) {
             @import("../proc/sched_asm.zig").softYield();
         } else {
-            _ = @import("../cpu/syscall/proc.zig").sysUsleep(POLL_SLEEP_US);
+            _ = @import("../syscall/proc.zig").sysUsleep(POLL_SLEEP_US);
         }
     }
     const waited = apic.tscToMs(apic.readTsc() -% start);
