@@ -108,13 +108,22 @@ fn hpetNanos() u64 {
     return if (d >> 63 != 0) 0 else d;
 }
 
-// The clock runs on the TSC. An HPET read is an MMIO exit (~20 µs under
-// nested virtualization), so HPET only re-anchors the TSC clock every
-// ANCHOR_NS: the anchor pins (tsc, ns), and the rate is HPET time over TSC
-// ticks since the first anchor, ever more exact. Re-anchoring may step the
-// clock a little either way; clk_last keeps what callers see from going back
-// (and covers TSCs that differ slightly between CPUs).
-const ANCHOR_NS: u64 = 100_000_000;
+// The clock runs on the TSC. An HPET read is an MMIO exit: ~20 µs under
+// nested virtualization, and for as long as the host's display thread holds
+// its lock when a frame is being presented (tens of ms, this CPU stopped
+// meanwhile). So HPET only re-anchors the TSC clock: ANCHOR_MIN_NS after the
+// first anchor, then after as long as the rate has been measured over, up to
+// ANCHOR_MAX_NS. The anchor pins (tsc, ns), and the rate is HPET time over
+// TSC ticks since the first anchor, ever more exact — over an interval no
+// longer than that stretch the clock strays no further than one sample is
+// off. Re-anchoring may step the clock a little either way; clk_last keeps
+// what callers see from going back (and covers TSCs that differ slightly
+// between CPUs).
+const ANCHOR_MIN_NS: u64 = 100_000_000;
+const ANCHOR_MAX_NS: u64 = 10_000_000_000;
+/// A sample this many times wider than the narrowest one sat through a
+/// stall: the running anchor tells the time better.
+const SAMPLE_WIDE: u64 = 8;
 /// TSC skew between CPUs this clock rides out.
 const TSC_BEHIND_MAX_NS: u64 = 1_000_000;
 
@@ -125,8 +134,12 @@ var clk_tsc: u64 = 0;
 var clk_ns: u64 = 0;
 /// ns per TSC tick, 32.32 fixed point. 0 = the TSC clock hasn't started.
 var clk_mult: u64 = 0;
+/// When the next anchor is due; part of the anchor.
+var clk_due_ns: u64 = 0;
 var clk_first_tsc: u64 = 0;
 var clk_first_ns: u64 = 0;
+/// The narrowest HPET sample since the clock started, in TSC ticks.
+var clk_min_width: u64 = 0;
 var clk_busy: bool = false;
 /// The highest value monotonicNanos has handed out.
 var clk_last: u64 = 0;
@@ -138,6 +151,7 @@ fn tscNanos() ?u64 {
     var a_tsc: u64 = undefined;
     var a_ns: u64 = undefined;
     var mult: u64 = undefined;
+    var due: u64 = undefined;
     while (true) {
         const s = @atomicLoad(u32, &clk_seq, .acquire);
         if (s & 1 != 0) {
@@ -147,6 +161,7 @@ fn tscNanos() ?u64 {
         a_tsc = @atomicLoad(u64, &clk_tsc, .acquire);
         a_ns = @atomicLoad(u64, &clk_ns, .acquire);
         mult = @atomicLoad(u64, &clk_mult, .acquire);
+        due = @atomicLoad(u64, &clk_due_ns, .acquire);
         if (@atomicLoad(u32, &clk_seq, .acquire) == s) break;
     }
     if (mult == 0) {
@@ -161,7 +176,7 @@ fn tscNanos() ?u64 {
     if (t < a_tsc and ticksToNs(a_tsc - t, mult) > TSC_BEHIND_MAX_NS) return hpetNanos();
     const dt = if (t > a_tsc) t - a_tsc else 0;
     const ns = a_ns + ticksToNs(dt, mult);
-    if (ns - a_ns >= ANCHOR_NS) anchor(0);
+    if (ns >= due) anchor(0);
     return ns;
 }
 
@@ -180,18 +195,25 @@ fn anchor(first_mult: u64) void {
     var t: u64 = undefined;
     var ns: u64 = undefined;
     // The better of two samples: an IRQ or a host stall inside one widens it.
-    const gap = sampleHpet(&t, &ns);
+    var width = sampleHpet(&t, &ns);
     var t2: u64 = undefined;
     var ns2: u64 = undefined;
-    if (sampleHpet(&t2, &ns2) < gap) {
+    const width2 = sampleHpet(&t2, &ns2);
+    if (width2 < width) {
         t = t2;
         ns = ns2;
+        width = width2;
     }
+    if (!running or width < clk_min_width) clk_min_width = width;
+    // Both samples sat through a stall: keep the anchor, look again soon.
+    const keep = running and width > clk_min_width *| SAMPLE_WIDE;
     var mult = first_mult;
+    var next = ANCHOR_MIN_NS;
     if (running) {
         mult = clk_mult;
-        if (t > clk_first_tsc and ns > clk_first_ns) {
+        if (!keep and t > clk_first_tsc and ns > clk_first_ns) {
             mult = @intCast((@as(u128, ns - clk_first_ns) << 32) / (t - clk_first_tsc));
+            next = std.math.clamp(ns - clk_first_ns, ANCHOR_MIN_NS, ANCHOR_MAX_NS);
         }
     } else {
         clk_first_tsc = t;
@@ -202,9 +224,12 @@ fn anchor(first_mult: u64) void {
     const flags = saveAndDisableIrq();
     defer restoreIrq(flags);
     _ = @atomicRmw(u32, &clk_seq, .Add, 1, .acq_rel);
-    @atomicStore(u64, &clk_tsc, t, .release);
-    @atomicStore(u64, &clk_ns, ns, .release);
-    @atomicStore(u64, &clk_mult, mult, .release);
+    if (!keep) {
+        @atomicStore(u64, &clk_tsc, t, .release);
+        @atomicStore(u64, &clk_ns, ns, .release);
+        @atomicStore(u64, &clk_mult, mult, .release);
+    }
+    @atomicStore(u64, &clk_due_ns, ns + next, .release);
     _ = @atomicRmw(u32, &clk_seq, .Add, 1, .acq_rel);
 }
 
