@@ -1,10 +1,8 @@
-const io = @import("../../io.zig");
 const pci = @import("../bus/pci.zig");
 const pmm = @import("../../mm/pmm.zig");
 const Phys = @import("../../util/addr.zig").Phys;
 const paging = @import("../../mm/paging.zig");
 const debug = @import("../../debug/debug.zig");
-const idt = @import("../../cpu/idt.zig");
 const msix = @import("../../irq/msix.zig");
 const iommu = @import("../iommu.zig");
 const SpinLock = @import("../../proc/spinlock.zig").SpinLock;
@@ -479,7 +477,6 @@ const BLOB_FLAG_USE_CROSS_DEVICE: u32 = 4;
 // --- Virtqueue (shared with virtio_sound via driver/bus/virtio.zig) ---
 
 const virtio = @import("../bus/virtio.zig");
-const VirtqDesc = virtio.VirtqDesc;
 const Virtqueue = virtio.Queue;
 
 const MAX_QUEUE_SIZE: u16 = 64;
@@ -537,8 +534,6 @@ pub var has_blob: bool = false;
 pub var has_context_init: bool = false;
 pub var has_venus: bool = false;
 pub var has_virgl_capset: bool = false;
-var venus_capset_version: u32 = 0;
-var venus_capset_size: u32 = 0;
 
 // Pre-allocated command buffer (4 pages = 16KB for large attach_backing) and response page
 const CMD_PAGES: u32 = 4;
@@ -591,11 +586,6 @@ fn blobsFlipped() void {
 // uses this to detach + unref the right host-side resource without
 // touching the blob we just promoted.
 var original_2d_resource_id: u32 = 0;
-
-// Monotonic counter for VIRTIO_GPU_FLAG_FENCE cmds. Only the FENCE-flagged
-// RESOURCE_FLUSH path consumes this currently — used to gate the response
-// on host display backend's frame-done callback (vblank sync).
-var fence_id_next: u64 = 0;
 
 // --- Cache-coherence helpers (gap #1+#2, 2026-05-20) ---
 //
@@ -673,12 +663,6 @@ fn ccWrite32(off: u32, v: u32) void {
     const ptr: *volatile u32 = @ptrFromInt(common_cfg + off);
     ptr.* = v;
 }
-
-// --- PCI capability parsing ---
-// `pci.findVirtioCap` and `pci.mapBar` are used directly; no per-driver
-// shim needed once we keep the `pci.PciDevice` from the bus cache.
-
-const CapInfo = pci.VirtioCap;
 
 // --- Virtqueue setup ---
 // Backing logic now in virtio.Queue.init; thin wrappers here.
@@ -1858,8 +1842,6 @@ fn queryCapsets() void {
 
         if (resp.capset_id == CAPSET_VENUS) {
             has_venus = true;
-            venus_capset_version = resp.capset_max_version;
-            venus_capset_size = resp.capset_max_size;
             debug.klog("[virtio-gpu] Venus capset found!\n", .{});
         }
         if (resp.capset_id == CAPSET_VIRGL or resp.capset_id == CAPSET_VIRGL2) {
@@ -2529,7 +2511,6 @@ pub fn resumeFromS3() bool {
     // whole screen from the surviving framebuffer. ---
     consecutive_flush_failures = 0;
     wedged = false;
-    markFullDirty();
     flushUnconditional();
 
     bind.commit();
@@ -3049,48 +3030,6 @@ pub fn flushRectUnconditional(x: u32, y: u32, w: u32, h: u32) void {
     }
 }
 
-// Dirty rect accumulator for batched flushing
-var dirty_x_min: u32 = 0xFFFFFFFF;
-var dirty_y_min: u32 = 0xFFFFFFFF;
-var dirty_x_max: u32 = 0;
-var dirty_y_max: u32 = 0;
-
-/// Mark a rectangular region as dirty (accumulated, flushed later with flushDirty).
-pub fn markDirtyRect(x: u32, y: u32, w: u32, h: u32) void {
-    const x1 = @min(x + w, width);
-    const y1 = @min(y + h, height);
-    if (x < dirty_x_min) dirty_x_min = x;
-    if (y < dirty_y_min) dirty_y_min = y;
-    if (x1 > dirty_x_max) dirty_x_max = x1;
-    if (y1 > dirty_y_max) dirty_y_max = y1;
-}
-
-/// Mark a Y-band as dirty (backwards compat).
-pub fn markDirty(y: u32, h: u32) void {
-    markDirtyRect(0, y, width, h);
-}
-
-/// Mark entire screen dirty.
-pub fn markFullDirty() void {
-    dirty_x_min = 0;
-    dirty_y_min = 0;
-    dirty_x_max = width;
-    dirty_y_max = height;
-}
-
-/// Flush all accumulated dirty regions in one transfer+flush.
-pub fn flushDirty() void {
-    if (!active) return;
-    if (dirty_x_min >= dirty_x_max or dirty_y_min >= dirty_y_max) return;
-    if (!scanout_is_blob) copyRectToStaging(dirty_x_min, dirty_y_min, dirty_x_max, dirty_y_max);
-    _ = transferToHost(current_resource_id, dirty_x_min, dirty_y_min, dirty_x_max - dirty_x_min, dirty_y_max - dirty_y_min);
-    _ = resourceFlushCmd(current_resource_id, dirty_x_min, dirty_y_min, dirty_x_max - dirty_x_min, dirty_y_max - dirty_y_min);
-    dirty_x_min = 0xFFFFFFFF;
-    dirty_y_min = 0xFFFFFFFF;
-    dirty_x_max = 0;
-    dirty_y_max = 0;
-}
-
 // --- Hardware cursor ---
 
 // The 12x16 arrow sprite (same as desktop.zig, converted to RGBA at init)
@@ -3160,7 +3099,6 @@ pub fn initCursor() bool {
     // Attach backing (single contiguous 4-page region). Build directly in
     // cmd_phys + sendCmdViaPhys — using sendCmd would self-alias the
     // @memcpy (cmd_buf and cmd_dst both point at cmd_phys via physmap).
-    _ = [1]usize{cursor_img_phys}; // (kept for clarity — single-entry SG)
     const cmd_dst: [*]volatile u8 = @ptrFromInt(paging.physToVirt(cmd_phys));
     @memset(cmd_dst[0..4096], 0);
 
