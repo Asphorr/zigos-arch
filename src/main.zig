@@ -379,7 +379,7 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     // DMA faults; drivers opt into per-device isolation (enableIsolation/
     // dmaMap) on top. No-op when no DMAR table is present (no -device
     // intel-iommu in QEMU, or VT-d disabled in firmware on real hardware).
-    @import("cpu/mmu/iommu.zig").init();
+    @import("driver.zig").iommu.init();
     blog.ok("IOMMU (VT-d pass-through)");
     // SMI / scheduler stall detector. Reads FADT.pm_tmr_blk for sampling.
     // Has to come after acpi.init (FADT cached) but before apic.init starts
@@ -436,7 +436,7 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     // LAPIC wasn't running yet. Now that it is, hardware can deliver
     // fault-event MSIs to our IDT vector instead of accumulating silently
     // in FSTS/FRR.
-    @import("cpu/mmu/iommu.zig").armFaultMsi();
+    @import("driver.zig").iommu.armFaultMsi();
     // Dynamic ACPI: enable ACPI mode and wire the fixed power button to a clean
     // OS shutdown via the SCI. Needs the FADT (acpi.init) and the IOAPIC
     // (apic.init) — both up by here. Best-effort; logs and continues on quirks.

@@ -5,6 +5,9 @@
 pub const pci = @import("driver/bus/pci.zig");
 pub const virtio = @import("driver/bus/virtio.zig");
 
+// DMA remapping.
+pub const iommu = @import("driver/iommu.zig");
+
 // Block devices.
 pub const block = @import("driver/block.zig");
 pub const nvme = @import("driver/block/nvme.zig");

@@ -25,7 +25,7 @@ const msix = @import("../../time/msix.zig");
 const debug = @import("../../debug/debug.zig");
 const net = @import("../../net/net.zig");
 const virtio = @import("../bus/virtio.zig");
-const iommu = @import("../../cpu/mmu/iommu.zig");
+const iommu = @import("../iommu.zig");
 const Deadline = @import("../../util/deadline.zig").Deadline;
 const SpinLock = @import("../../proc/spinlock.zig").SpinLock;
 

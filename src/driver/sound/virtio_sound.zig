@@ -22,7 +22,7 @@ const paging = @import("../../mm/paging.zig");
 const debug = @import("../../debug/debug.zig");
 const process = @import("../../proc/process.zig");
 const spinlock = @import("../../proc/spinlock.zig");
-const iommu = @import("../../cpu/mmu/iommu.zig");
+const iommu = @import("../iommu.zig");
 const Deadline = @import("../../util/deadline.zig").Deadline;
 
 // --- Constants ---

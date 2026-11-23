@@ -28,13 +28,13 @@
 //   §11 — Second-level page table format
 
 const std = @import("std");
-const acpi = @import("../../acpi/acpi.zig");
-const pmm = @import("../../mm/pmm.zig");
-const paging = @import("../../mm/paging.zig");
-const debug = @import("../../debug/debug.zig");
-const pci = @import("../../driver.zig").pci;
-const msix = @import("../../time/msix.zig");
-const process = @import("../../proc/process.zig");
+const acpi = @import("../acpi/acpi.zig");
+const pmm = @import("../mm/pmm.zig");
+const paging = @import("../mm/paging.zig");
+const debug = @import("../debug/debug.zig");
+const pci = @import("../driver.zig").pci;
+const msix = @import("../time/msix.zig");
+const process = @import("../proc/process.zig");
 
 // --- VT-d register offsets (relative to each DRHD's `register_base`) ------
 
