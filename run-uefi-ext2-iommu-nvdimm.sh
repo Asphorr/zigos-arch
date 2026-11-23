@@ -66,8 +66,12 @@ fi
 #                                 ksoftirqd drains it, a doorbell per 4 KiB;
 #                                 the UART (same file) keeps early boot and
 #                                 panics. Each UART byte is a VM exit.
+# ~/sdl-tl: SDL 2.30 patched so SDL_VIDEO_WAYLAND_NO_FRAME_DAMAGE=1 stops it
+# damaging the whole window on every frame (GNOME repaints only what changed).
+# ioeventfd=on: a GPU queue kick (cursor move) doesn't wait out a frame present.
 VKR_DEBUG=udmabuf \
-LD_LIBRARY_PATH=/usr/local/lib/x86_64-linux-gnu \
+LD_LIBRARY_PATH=$HOME/sdl-tl/lib:/usr/local/lib/x86_64-linux-gnu \
+SDL_VIDEO_WAYLAND_NO_FRAME_DAMAGE=1 \
 VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json \
     ~/qemu-master/build/qemu-system-x86_64 \
     -m 256,slots=4,maxmem=4G -accel kvm -cpu host,hv-time,hv-frequencies -smp 2 -no-reboot \
@@ -79,7 +83,7 @@ VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json \
     -vga none \
     -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd \
     -drive if=pflash,format=raw,file=ovmf_vars.fd \
-    -device virtio-vga-gl,blob=true,venus=true,hostmem=256M \
+    -device virtio-vga-gl,blob=true,venus=true,hostmem=256M,ioeventfd=on \
     -display sdl,gl=on,show-cursor=on \
     -device qemu-xhci,id=xhci -device usb-kbd -device usb-tablet \
     -device e1000,netdev=net0 -netdev user,id=net0,hostfwd=tcp::8080-:8080 \
