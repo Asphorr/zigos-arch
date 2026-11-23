@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const SpinLock = @import("../../../proc/spinlock.zig").SpinLock;
+const pmm = @import("../../../mm/pmm.zig");
 
 /// Whose blob a range holds.
 pub const Owner = enum(u32) {
@@ -152,6 +153,9 @@ var orphaned: u32 = 0;
 pub fn setWindow(base: usize, length: u64) void {
     phys = base;
     table.length = length;
+    // Blobs get mapped into user address spaces; their pages are the
+    // host's, not frames an address-space teardown may free.
+    pmm.registerDeviceRange(pmm.Phys.of(base), @intCast(length));
 }
 
 /// A range for `resource_id`. A process's blobs leave a quarter of the

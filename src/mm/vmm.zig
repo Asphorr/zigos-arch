@@ -1109,6 +1109,10 @@ pub fn cloneAddressSpace(parent_pml4: [*]align(4096) u64, parent_pcid: u16, phys
                     if (!pte_mod.holdsUserFrame(parent_pte)) break; // not a user frame: shouldn't appear
 
                     const phys = Phys.of(entryPhys(parent_pte));
+                    // Device memory (a DAX window, a GPU blob) is not
+                    // inherited: it has no refcount to share it by, and the
+                    // driver that mapped it ends the mapping with its owner.
+                    if (!pmm.isManaged(phys)) break;
                     // Refuse a frame whose refcount already hit 0 — our PTE
                     // sample is stale (eviction completed and freed it). The
                     // re-read is guaranteed to see a different PTE: every

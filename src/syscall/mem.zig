@@ -372,9 +372,10 @@ pub fn sysMmapSharedAnon(len: u32) u32 {
 /// as silent no-ops — they are never recycled into the RAM allocator.
 ///
 /// Returns the mapped VA, or E_INVAL / E_NOMEM. (Like sysMmap, VAs grow down
-/// from mmap_top.) NOTE: a DAX region is effectively MAP_SHARED — fork-COW of it
-/// is not modeled (it would try to copy device frames); no current caller forks
-/// across one. Same eager-device-mapping shape as the GPU blob path.
+/// from mmap_top.) NOTE: a DAX region is effectively MAP_SHARED, but fork does
+/// not carry device frames over (vmm.cloneAddressSpace): the child's copy of
+/// the region has no pages, and a touch faults in fresh zero ones. Same
+/// eager-device-mapping shape as the GPU blob path.
 pub fn sysMmapPmem(len: u32, fd: u32, offset: u32) u32 {
     if (len == 0) return E_INVAL;
     const pcb = process.currentPCB() orelse return E_FAULT;

@@ -893,33 +893,56 @@ pub inline fn allocContiguousBelow4G(count: u32) ?Phys {
     return allocContiguous(count);
 }
 
-// Device-memory window (e.g. an NVDIMM's DAX frames) that is NOT PMM-managed
-// and must never be reclaimed. When such frames are mapped into a user address
-// space (DAX mmap) and that AS is torn down, unmapUserRange/destroyAddressSpace
-// call freeFrame on every present leaf — including these. freeFrame consults
-// this window (before its MAX_FRAMES bounds gate) and treats those frees as
-// silent no-ops. Registered once at boot by pmem.init via registerDeviceRange.
-var device_lo: usize = 0;
-var device_hi: usize = 0;
+// Device memory that user address spaces map (an NVDIMM's DAX frames, the
+// virtio-gpu host-memory window): not PMM-managed, never refcounted, never
+// reclaimed. Tearing such a mapping down calls freeFrame on every present
+// leaf like any other; freeFrame consults these ranges before its MAX_FRAMES
+// gate, so one below the RAM ceiling cannot reach the refcounts either.
+// Entries are written once and never change; the count is published after.
+const MAX_DEVICE_RANGES = 4;
+var device_ranges: [MAX_DEVICE_RANGES][2]usize = @splat(.{ 0, 0 }); // [lo, hi)
+var device_range_count: u8 = 0;
 
-/// Register a physical range as device memory that freeFrame must silently
-/// ignore (not warn about). Used for NVDIMM DAX frames mapped into user space.
+/// Register [base, base+len) as device memory. A driver calls it once for
+/// each window it lets user space map (again with the same range is fine).
 pub fn registerDeviceRange(base: Phys, len: usize) void {
-    device_lo = base.raw();
-    device_hi = base.raw() +| len;
+    const lo = base.raw();
+    const hi = lo +| len;
+    if (hi <= lo) return;
+    const n = @atomicLoad(u8, &device_range_count, .acquire);
+    for (device_ranges[0..n]) |r| {
+        if (r[0] == lo and r[1] == hi) return;
+    }
+    if (n == MAX_DEVICE_RANGES) {
+        @import("../debug/serial.zig").print("[pmm] WARNING: no room for device range 0x{X}..0x{X}\n", .{ lo, hi });
+        return;
+    }
+    device_ranges[n] = .{ lo, hi };
+    @atomicStore(u8, &device_range_count, n + 1, .release);
+}
+
+fn inDeviceRange(phys_addr: usize) bool {
+    const n = @atomicLoad(u8, &device_range_count, .acquire);
+    for (device_ranges[0..n]) |r| {
+        if (phys_addr >= r[0] and phys_addr < r[1]) return true;
+    }
+    return false;
+}
+
+/// A frame this allocator owns and refcounts. False for device memory and
+/// for anything past the RAM bitmap: such a frame is only ever mapped.
+pub fn isManaged(phys: Phys) bool {
+    const phys_addr = phys.raw();
+    return phys_addr / FRAME_SIZE < MAX_FRAMES and !inDeviceRange(phys_addr);
 }
 
 pub fn freeFrame(phys: Phys) void {
     const ra = @returnAddress();
     const phys_addr: usize = phys.raw();
     const frame_num = phys_addr / FRAME_SIZE;
-    // Registered device memory (NVDIMM DAX frames, etc.) is never PMM-managed —
-    // ignore frees of it regardless of where the window sits relative to the RAM
-    // bitmap. Checked BEFORE the MAX_FRAMES gate so a device range placed below
-    // the RAM ceiling can't fall through into the normal refcount path and
-    // corrupt the bitmap. The device_hi==0 short-circuit keeps this free when no
-    // device range is registered (the common case).
-    if (device_hi != 0 and phys_addr >= device_lo and phys_addr < device_hi) return;
+    // Device memory is not ours to free, wherever its window sits relative
+    // to the RAM bitmap (see device_ranges).
+    if (inDeviceRange(phys_addr)) return;
     if (frame_num >= MAX_FRAMES) {
         @import("../debug/serial.zig").print("[pmm] WARNING: freeFrame bad addr=0x{X} (frame={X})\n", .{ phys_addr, frame_num });
         return;
