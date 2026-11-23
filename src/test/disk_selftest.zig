@@ -29,7 +29,7 @@ const ext2_layout = @import("../fs/ext2/layout.zig");
 
 /// ESP size. 64 MiB is the conventional EFI System Partition size, and it is
 /// also comfortably above the FAT32 cluster-count floor — see the trap
-/// documented in fs/fat32_mkfs.zig.
+/// documented in fs/fat32/mkfs.zig.
 const ESP_MIB: u64 = 64;
 
 var fail_count: u32 = 0;

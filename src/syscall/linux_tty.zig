@@ -1,4 +1,4 @@
-//! Linux ioctl: the terminal's calls (proc/tty.zig holds the terminal), and
+//! Linux ioctl: the terminal's calls (tty/tty.zig holds the terminal), and
 //! FIONREAD for what else has bytes to count. Every other fd and request is
 //! ENOTTY — which is also how isatty() learns a file is not a terminal.
 

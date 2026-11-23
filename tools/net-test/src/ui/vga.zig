@@ -1,4 +1,4 @@
-// Test stub for ui/vga.zig. net.zig uses vga.print() and the vga.fg color var
+// Test stub for driver/gpu/vga.zig (the stub driver.zig exports it). net.zig uses vga.print() and the vga.fg color var
 // (only reached from the command-line helpers like nslookup/ping/wget, which the
 // harness doesn't drive — but they still have to compile). Silenced by default.
 const std = @import("std");

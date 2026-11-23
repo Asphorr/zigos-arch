@@ -51,7 +51,7 @@ authorial intent at the declaration site at zero runtime cost.
 isn't a normal atomic — it's a *cross-privilege* contract. Both sides
 must agree on which counter is `.release`-written by the producer and
 which is `.acquire`-read by the consumer. The reference implementation
-lives in `src/cpu/iouring.zig`: kernel writes `sq_head` + `cq_tail`
+lives in `src/ipc/iouring.zig`: kernel writes `sq_head` + `cq_tail`
 with `.release`, reads `sq_tail` + `cq_head` with `.acquire`. Userspace
 libc mirrors with the opposite direction. Any new userspace-mapped
 ring should follow this same shape.
@@ -306,7 +306,7 @@ sibling thread's munmap) is re-faulted-in transparently — or surfaces
 as the null/false the caller maps to E_FAULT — instead of a ring-0 #PF
 panic. That's why `copyIn` returns `?T` and `copyOut` returns `bool`.
 
-**Reference exemplar:** `sysSigpending` in `cpu/syscall/proc.zig`.
+**Reference exemplar:** `sysSigpending` in `syscall/proc.zig`.
 Mass-rollout across ~50 syscall sites is incremental — new syscalls
 should use UserPtr; existing ones migrate when touched.
 
@@ -629,13 +629,13 @@ silent self-recovery into observable metric.
 | Pattern             | Canonical exemplar                              |
 | ------------------- | ----------------------------------------------- |
 | `(p:lock)/(a)/(c)`  | `src/proc/process.zig` `PCB`                    |
-| `(u)` user-mmap     | `src/cpu/iouring.zig` `RingHeader`              |
+| `(u)` user-mmap     | `src/ipc/iouring.zig` `RingHeader`              |
 | Wire layout asserts | `src/driver/block/nvme.zig` `SqEntry`           |
 | `LE(T)` / `BE(T)`   | `src/driver/block/nvme.zig` `DsmRange`          |
 | `Guarded(T)`        | `src/util/guarded.zig`; adopters: swap/page_cache/nvme/pmm |
 | `assertHeld()`      | `src/util/guarded.zig` `refHeld`                |
 | `frames.Frame`      | `src/proc/frames.zig` `dispatch`; sched_asm + lifecycle forges |
-| `UserPtr(T)`        | `src/cpu/syscall/proc.zig` `sysSigpending`      |
+| `UserPtr(T)`        | `src/syscall/proc.zig` `sysSigpending`          |
 | `Persistent(T)`     | `src/mm/pmem.zig` `persistenceSelfTest`         |
 | `kwarn(@src(),...)` | `src/debug/debug.zig` `kwarn`                   |
 | `Deadline`          | `src/driver/input/keyboard.zig` `ps2Wait`       |

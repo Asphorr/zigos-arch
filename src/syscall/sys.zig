@@ -1,5 +1,5 @@
 //! Syscall handlers (sys) — split out of syscall.zig (#797).
-//! Dispatched from cpu/syscall.zig doSyscallInner; named in SYSCALLS.
+//! Dispatched from syscall.zig doSyscallInner; named in SYSCALLS.
 
 const std = @import("std");
 const vga = @import("../driver.zig").vga;

@@ -10,7 +10,7 @@
 // boot-16 self-test drives), the system tree copied from the live root onto
 // the new ext2 (fs/ext2/populate.zig — a slice of dirents per frame, so the
 // bar moves because work happened, not because a timer ticked), BOOTX64.EFI
-// and kernel.elf laid into the fresh ESP (fs/fat32_populate.zig, fed from
+// and kernel.elf laid into the fresh ESP (fs/fat32/populate.zig, fed from
 // /boot/ of the root fs — the kernel cannot read its own boot media), and a
 // Boot#### entry pushed through UEFI Runtime Services. The boot-entry step
 // alone is non-fatal: firmware that lost the entry (or a QEMU run whose vars
@@ -1021,7 +1021,7 @@ fn goBack() void {
 fn computeLayout() bool {
     const d = disks[selected];
     // 64 MiB ESP: the conventional size, and comfortably above the FAT32
-    // cluster-count floor — see the trap documented in fs/fat32_mkfs.zig.
+    // cluster-count floor — see the trap documented in fs/fat32/mkfs.zig.
     esp_start = gpt.alignUp(gpt.FIRST_USABLE_LBA).raw();
     esp_end = esp_start + 64 * 2048 - 1;
     root_start = esp_end + 1;

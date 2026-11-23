@@ -33,7 +33,7 @@ const Case = struct {
     /// repeat would redo the work (the kernel build mints a new build id
     /// every time).
     once: bool = false,
-    /// Run it at a terminal of its own (proc/tty.zig), with these steps
+    /// Run it at a terminal of its own (tty/tty.zig), with these steps
     /// typed there; none: its stdio is the console.
     terminal: []const Step = &.{},
     /// What must show up in what it wrote to the terminal, in this order.

@@ -501,7 +501,7 @@ fn reopenFd(pcb: *process.PCB, n: lproc.Node, lflags: u64, mode: u64) u64 {
     return fd;
 }
 
-/// /dev/tty, /dev/ptmx and /dev/pts/N: ends of a terminal (proc/pty.zig).
+/// /dev/tty, /dev/ptmx and /dev/pts/N: ends of a terminal (tty/pty.zig).
 /// Null for any other name.
 fn terminalOpen(pcb: *process.PCB, path: []const u8, lflags: u64) ?u64 {
     var buf: [256]u8 = undefined;

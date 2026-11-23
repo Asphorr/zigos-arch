@@ -422,7 +422,7 @@ pub fn mmapPmem(fd: u32, offset: u32, len: usize) ?[]u8 {
     return ptr[0..aligned];
 }
 
-/// io_uring Sqe / Cqe / RingHeader — must match src/cpu/ipc/iouring.zig byte-for-byte.
+/// io_uring Sqe / Cqe / RingHeader — must match src/ipc/iouring.zig byte-for-byte.
 pub const IoUringSqe = extern struct {
     opcode: u8,
     flags: u8,
@@ -731,7 +731,7 @@ pub fn cpuStats(out: []CpuStat) u32 {
 }
 
 /// Snapshot of the kernel's active L3 config + NIC presence. Layout
-/// mirrors src/cpu/syscall.zig:NetInfo — keep both in sync when adding
+/// mirrors src/syscall.zig:NetInfo — keep both in sync when adding
 /// fields.
 pub const NetInfo = extern struct {
     local_ip: [4]u8,
@@ -1768,10 +1768,10 @@ pub const ProcInfo = extern struct {
     ticks_used: u32,
     user_brk: u32,
     name: [16]u8,
-    // Layout below MUST match cpu/syscall.zig:ProcInfoUser exactly. tgid +
+    // Layout below MUST match syscall.zig:ProcInfoUser exactly. tgid +
     // pgid + sid were appended after start_tick so old readers that stop
     // at start_tick still see correct values for everything before it.
-    // Accounting fields — must match `cpu/syscall.zig:ProcInfoUser` exactly
+    // Accounting fields — must match `syscall.zig:ProcInfoUser` exactly
     // (kernel writes raw bytes via @memcpy). Zero on a not-yet-tracked PCB.
     cpu_ticks: u64 align(1) = 0,
     pf_count: u32 align(1) = 0,
@@ -1782,7 +1782,7 @@ pub const ProcInfo = extern struct {
     tgid: u8 = 0,
     pgid: u8 = 0,
     sid: u8 = 0,
-    // CFS scheduler fields (added 2026-05-10) — see cpu/syscall.zig
+    // CFS scheduler fields (added 2026-05-10) — see syscall.zig
     // ProcInfoUser for the kernel-side mirror this must match.
     nice: i8 = 0,
     assigned_cpu: u8 = 0xFF,

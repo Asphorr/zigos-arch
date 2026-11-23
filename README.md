@@ -82,7 +82,7 @@ Boot mode 19 runs whichever of these checks the image carries.
   control (SIGSTOP/SIGCONT, EINTR, siginfo_t), sessions and ptys, a
   TSC-driven clock, MWAIT idle, MCE bank decode on #MC, PMU sampling on
   PMI.
-- **Linux compatibility (`src/cpu/syscall/linux_*.zig`):** unmodified
+- **Linux compatibility (`src/syscall/linux_*.zig`):** unmodified
   Linux x86-64 binaries, static or dynamically linked against musl, run
   next to native apps: fork/execve, threads (clone + futex), mmap /
   mprotect / brk, signals, ptys with job control, `/proc`, TCP, UDP and
@@ -131,11 +131,15 @@ Boot mode 19 runs whichever of these checks the image carries.
 
 ```
 src/
-  cpu/      idt smp arch (gdt msr mce pmu) mmu (pcid tlb iommu)
-            syscall: native + linux_{fs,mm,net,proc,signal,thread,time,tty}
+  cpu/      idt smp arch (gdt msr mce pmu) mmu (pcid tlb)
+  syscall/  native + linux_{fs,mm,net,proc,signal,thread,time,tty}
+  ipc/      epoll eventfd fdpoll io_uring
+  irq/      apic (LAPIC + IOAPIC) pic msix softirq
   driver/   by class: bus (pci virtio) block (nvme ahci ata) nic (e1000 i225 virtio_net)
-            gpu (virtio_gpu gop_fb) sound (ac97 hda virtio_sound) input usb (xhci) console
-  proc/     process sched runqueue signals pipe pty tty session hrtimer softirq elf_loader
+            gpu (virtio_gpu gop_fb bga vga) sound (ac97 hda virtio_sound) input usb (xhci)
+            console iommu
+  proc/     process sched runqueue signals pipe session hrtimer elf_loader
+  tty/      tty pty
   mm/       pmm vmm vma heap tlsf slab page_cache swap shm pmem
   fs/       vfs ext2 fat32 tarfs devfs procfs lproc gpt
   net/      tcp ip dhcp dns socket unix
@@ -143,7 +147,7 @@ src/
   acpi/     aml s3 ec sci
   bpf/      vm verifier jit
   virt/     kvm hyperv vmx
-  time/     apic hpet pit rtc smi
+  time/     hpet pit rtc smi
   ui/       desktop installer gpu_compositor fonts icons
   debug/    kdbg gdb_stub kasan kcsan witness watchdog perf linux_prof
   util/     typed addresses, lock-guarded data, state graphs, deadlines

@@ -70,4 +70,4 @@ slow start and fast retransmit (#1002).
 | `src/proc/process.zig`  | `tick_count` virtual clock + `kernelSleepMs` that advances it |
 | `src/debug/debug.zig`   | `klog` → silenced (`VERBOSE=true` to trace) |
 | `src/ui/vga.zig`        | `print` + `fg` color enum (only the CLI helpers touch these) |
-| `src/cpu/ipc/fdpoll.zig`| `wakePollers` no-op (no tasks to wake in the harness) |
+| `src/ipc/fdpoll.zig`    | `wakePollers` no-op (no tasks to wake in the harness) |

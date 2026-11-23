@@ -140,7 +140,7 @@ pub fn build(b: *std.Build) void {
     // tools/asm_lint.zig reads src/ as text: stack alignment at every `call`
     // inside an asm template (push-count drift), and the asm output shape
     // Zig 0.15.2 miscompiles. A failure aborts the build. The runtime guards
-    // in cpu/syscall/entry.zig and idt.zig are still the authoritative
+    // in syscall/entry.zig and idt.zig are still the authoritative
     // check; this is a fast-fail. Host tool like ctx_lint below, so the
     // kernel build needs no interpreter.
     const asm_lint_exe = b.addExecutable(.{

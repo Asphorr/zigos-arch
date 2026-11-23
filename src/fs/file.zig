@@ -84,7 +84,7 @@ pub const File = struct {
     /// fat32 directory index, a socket slot.
     inode: u32 = 0,
     pipe_id: u8 = 0xFF,
-    /// The terminal this pipe end belongs to (proc/tty.zig), 0xFF for a
+    /// The terminal this pipe end belongs to (tty/tty.zig), 0xFF for a
     /// file that is not one.
     tty: u8 = 0xFF,
     /// (a) An epoll set refers to this file by address (epoll.zig): the

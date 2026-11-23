@@ -2663,7 +2663,7 @@ fn setupDisplay(w: u32, h: u32) bool {
     return true;
 }
 
-/// pub: the GPU syscall layer (cpu/syscall/gpu.zig) calls this on its
+/// pub: the GPU syscall layer (syscall/gpu.zig) calls this on its
 /// guest-blob error-rollback paths — a created-but-unusable resource must
 /// be unref'd BEFORE its guest backing pages go back to the PMM, or the
 /// host renderer keeps a reference into recycled frames.

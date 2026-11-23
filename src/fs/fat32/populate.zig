@@ -30,7 +30,7 @@ const ATTR_DIRECTORY: u8 = 0x10;
 const ATTR_ARCHIVE: u8 = 0x20;
 const DIRENTS_PER_SECTOR: u32 = SECTOR_SIZE / @sizeOf(fat32.DirEntry);
 
-// FSInfo offsets — mirrors fat32_mkfs.zig.
+// FSInfo offsets — mirrors mkfs.zig.
 const FSINFO_FREE_COUNT_OFFSET: usize = 488;
 const FSINFO_NEXT_FREE_OFFSET: usize = 492;
 

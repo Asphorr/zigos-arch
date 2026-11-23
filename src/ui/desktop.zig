@@ -2014,7 +2014,7 @@ fn spawnShellOnWindow(wi: u8) void {
     // read-side. Refcounts are initialized to 1/1 by pipe.alloc(); each end
     // has exactly one owner, and the shell's go back when its files do.
     //
-    // The two ends are the window's terminal (proc/tty.zig): a Linux
+    // The two ends are the window's terminal (tty/tty.zig): a Linux
     // program the shell starts inherits them and finds a tty there.
     const file = @import("../fs/file.zig");
     const vfs_mod = @import("../fs/vfs.zig");
@@ -3896,7 +3896,7 @@ pub fn taskEntry() callconv(.c) noreturn {
     // kernel-side access from this point on must go through the physmap
     // (PHYSMAP_BASE + phys, via `paging.physToVirt`) or the kernel image
     // window at -2 GB. The migration was completed in src/mm/heap.zig
-    // (heap moved to the physmap), src/ui/vga.zig (VGA buffer), and the
+    // (heap moved to the physmap), src/driver/gpu/vga.zig (VGA buffer), and the
     // driver/walker sweep done in Phase 2. Per-process address spaces own
     // their own PML4[0] independently, so user processes are unaffected.
     @import("../mm/paging.zig").dropLowIdentity();
@@ -5278,7 +5278,7 @@ pub fn focusedSignalTarget() u8 {
     return if (w.term != null) w.shell_pid else w.owner_pid;
 }
 
-/// The terminal (proc/tty.zig) of the focused window, 0xFF if it has none.
+/// The terminal (tty/tty.zig) of the focused window, 0xFF if it has none.
 /// Read at interrupt time, like focusedSignalTarget.
 pub fn focusedTty() u8 {
     if (!slot_used[wm.focused]) return 0xFF;

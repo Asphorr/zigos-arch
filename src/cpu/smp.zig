@@ -299,7 +299,7 @@ pub fn verifyEndCanary() void {
     @panic("CpuLocal end-canary clobbered — wild write into per-CPU slot");
 }
 
-/// Per-CPU storage for cpu/syscall/entry.zig's fast path. Just one slot now:
+/// Per-CPU storage for syscall/entry.zig's fast path. Just one slot now:
 /// the LSTAR stub also needs a transient place to spill the user RSP
 /// before it switches to the kernel stack (cpus[N].tss.rsp0). The
 /// kernel-stack-top itself lives in `cpus[N].tss.rsp0` — the canonical
@@ -608,7 +608,7 @@ fn collectApIds(bsp_id: u8, out: *[MAX_CPUS]u8) usize {
 
 pub fn init() void {
     // Stamp the address of cpus[0] into the exported `cpus_base` slot so
-    // the per-CPU LSTAR syscall stubs (cpu/syscall/entry.zig) can load the
+    // the per-CPU LSTAR syscall stubs (syscall/entry.zig) can load the
     // kernel RSP from `cpus[N].tss.rsp0` via a two-instruction indirect
     // load. Must happen BEFORE any syscall can fire from userspace,
     // which can't happen until after smp.init returns (BSP idle + first

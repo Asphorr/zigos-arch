@@ -16,7 +16,7 @@
 //!      verifies the bitcode.
 //!
 //! The matching is textual and only knows the obvious patterns; the runtime
-//! guards in cpu/syscall/entry.zig and idt.zig have the last word. A run
+//! guards in syscall/entry.zig and idt.zig have the last word. A run
 //! that saw no multi-line template, no `call` or no output fails: a lint
 //! that inspected nothing must not say PASS.
 

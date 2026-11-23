@@ -862,7 +862,7 @@ fn setupVulkanContext() bool {
     // 2. Allocate + attach a HOST3D blob for the Venus reply ring.
     reply_ring_res_id = virtio_gpu.alloc3DResourceId();
     // blob_flags = 1 = MAPPABLE, matches what userspace gpuCreateBlob's
-    // blob_id=0 path uses — see sysGpuCreateBlob in src/cpu/syscall.zig.
+    // blob_id=0 path uses — see sysGpuCreateBlob in src/syscall.zig.
     if (!virtio_gpu.resourceCreateBlob(
         COMPOSITOR_CTX_ID,
         reply_ring_res_id,

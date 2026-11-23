@@ -448,7 +448,7 @@ pub fn push(ch: u8) void {
     // seconds. From IRQ context we can call signals.send straight through —
     // it's pure field writes + an optional process.wake, both lock-free.
     //
-    // A terminal window has a foreground process group for it (proc/tty.zig)
+    // A terminal window has a foreground process group for it (tty/tty.zig)
     // — the shell, a Linux program's job — unless its reader has turned key
     // signals off, in which case the byte travels as any other key.
     if (ch == 0x03) {
@@ -466,7 +466,7 @@ pub fn push(ch: u8) void {
         }
     }
     // Ctrl+Z and Ctrl+\ stop or quit a Linux job in a terminal from here
-    // too, whether or not it reads the terminal (proc/tty.zig jobKey).
+    // too, whether or not it reads the terminal (tty/tty.zig jobKey).
     if (ch == 0x1A or ch == 0x1C) {
         const tty = @import("../../tty/tty.zig");
         const term = @import("../../ui/desktop.zig").focusedTty();

@@ -1529,7 +1529,7 @@ pub fn resolveDirInum(path: []const u8) ?u32 {
 
 /// Anonymous extern struct that exactly matches syscall.FileEntry —
 /// matches the pattern tarfs.listToBuffer uses to avoid an import cycle
-/// with cpu/syscall.zig.
+/// with syscall.zig.
 const FileEntry = extern struct {
     name: [32]u8,
     name_len: u8,
