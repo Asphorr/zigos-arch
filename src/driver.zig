@@ -20,8 +20,8 @@ pub const virtio_net = @import("driver/nic/virtio_net.zig");
 
 // Display.
 pub const gpu = @import("driver/gpu.zig");
-pub const gop_fb = @import("driver/gop_fb.zig");
-pub const virtio_gpu = @import("driver/virtio_gpu.zig");
+pub const gop_fb = @import("driver/gpu/gop_fb.zig");
+pub const virtio_gpu = @import("driver/gpu/virtio_gpu.zig");
 
 // Sound.
 pub const sound = @import("driver/sound.zig");

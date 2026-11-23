@@ -1,17 +1,17 @@
-const io = @import("../io.zig");
-const pci = @import("bus/pci.zig");
-const pmm = @import("../mm/pmm.zig");
-const Phys = @import("../util/addr.zig").Phys;
-const paging = @import("../mm/paging.zig");
-const debug = @import("../debug/debug.zig");
-const idt = @import("../cpu/idt.zig");
-const msix = @import("../time/msix.zig");
-const iommu = @import("../cpu/mmu/iommu.zig");
-const SpinLock = @import("../proc/spinlock.zig").SpinLock;
-const Mutex = @import("../proc/spinlock.zig").Mutex;
-const apic = @import("../time/apic.zig");
-const perf = @import("../debug/perf.zig");
-const Deadline = @import("../util/deadline.zig").Deadline;
+const io = @import("../../io.zig");
+const pci = @import("../bus/pci.zig");
+const pmm = @import("../../mm/pmm.zig");
+const Phys = @import("../../util/addr.zig").Phys;
+const paging = @import("../../mm/paging.zig");
+const debug = @import("../../debug/debug.zig");
+const idt = @import("../../cpu/idt.zig");
+const msix = @import("../../time/msix.zig");
+const iommu = @import("../../cpu/mmu/iommu.zig");
+const SpinLock = @import("../../proc/spinlock.zig").SpinLock;
+const Mutex = @import("../../proc/spinlock.zig").Mutex;
+const apic = @import("../../time/apic.zig");
+const perf = @import("../../debug/perf.zig");
+const Deadline = @import("../../util/deadline.zig").Deadline;
 
 /// Slow-submit threshold for sendCmdViaPhys. When wait exceeds this, log
 /// the cmd_type (first u32 of cmd_phys, per virtio-gpu spec) + lengths
@@ -97,8 +97,8 @@ var msix_entry_addr: usize = 0;
 /// Kept as a counter (not periodic log) so the CLI can sample on demand.
 /// Sized to smp.MAX_CPUS so we don't silently truncate IRQ counts on
 /// CPUs ≥ 4 (was hardcoded [4]u64 — gap #15).
-pub var virtio_gpu_irq_per_cpu: [@import("../cpu/smp.zig").MAX_CPUS]u64 =
-    .{0} ** @import("../cpu/smp.zig").MAX_CPUS;
+pub var virtio_gpu_irq_per_cpu: [@import("../../cpu/smp.zig").MAX_CPUS]u64 =
+    .{0} ** @import("../../cpu/smp.zig").MAX_CPUS;
 /// Waiter wakes issued by the MSI-X handler.
 pub var virtio_gpu_waiter_wakes: u64 = 0;
 
@@ -109,16 +109,16 @@ pub var virtio_gpu_waiter_wakes: u64 = 0;
 var current_gpu_waiter: u8 = 0xFF;
 fn virtioGpuIrqHandler() callconv(.c) void {
     virtio_gpu_irq_count +%= 1;
-    const smp_mod = @import("../cpu/smp.zig");
+    const smp_mod = @import("../../cpu/smp.zig");
     const cpu_id = smp_mod.myCpu().cpu_id;
     if (cpu_id < virtio_gpu_irq_per_cpu.len) virtio_gpu_irq_per_cpu[cpu_id] +%= 1;
-    const process = @import("../proc/process.zig");
+    const process = @import("../../proc/process.zig");
 
     // Async flush completion: nobody is parked for it — hand the reap (and
     // the coalesced-rect resubmit) to ksoftirqd via the .virtio_gpu softirq,
     // same discipline as the NVMe reap. One atomic load when idle.
     if (@atomicLoad(bool, &aflush_in_flight, .acquire)) {
-        _ = @import("../proc/softirq.zig").raise(.virtio_gpu);
+        _ = @import("../../proc/softirq.zig").raise(.virtio_gpu);
         smp_mod.myCpu().dynirq_preempt_pending = true;
     }
 
@@ -133,8 +133,8 @@ fn virtioGpuIrqHandler() callconv(.c) void {
     if (pid == 0xFF) return;
     const kind = @atomicLoad(process.WaitKind, &process.procs[pid].wait_kind, .acquire);
     if (kind != .gpu_io and kind != .none) return;
-    const wakelat = @import("../debug/wakelat.zig");
-    const sched = @import("../proc/sched.zig");
+    const wakelat = @import("../../debug/wakelat.zig");
+    const sched = @import("../../proc/sched.zig");
     wakelat.noteGpuIrq(pid);
     wakelat.hintWake(pid, .gpu_io);
     sched.wake(pid);
@@ -478,7 +478,7 @@ const BLOB_FLAG_USE_CROSS_DEVICE: u32 = 4;
 
 // --- Virtqueue (shared with virtio_sound via driver/virtio.zig) ---
 
-const virtio = @import("bus/virtio.zig");
+const virtio = @import("../bus/virtio.zig");
 const VirtqDesc = virtio.VirtqDesc;
 const Virtqueue = virtio.Queue;
 
@@ -713,7 +713,7 @@ fn notifyQueue(qi: u16, vq: *const Virtqueue) void {
 fn sendCmdViaPhys(cmd_len: u32, resp_len: u32) bool {
     // Bracket the entire submit-and-wait so per-syscall latency attribution
     // can show "sysGpuSubmit3D dt=900ms = 870ms gpu_wait + 30ms misc".
-    const sp = @import("../debug/syscall_perf.zig").scope(.gpu_wait);
+    const sp = @import("../../debug/syscall_perf.zig").scope(.gpu_wait);
     defer sp.end();
     if (ctrl_vq.num_free < 2) return false;
 
@@ -749,9 +749,9 @@ fn sendCmdViaPhys(cmd_len: u32, resp_len: u32) bool {
     // host time. ctrl_lock serializes submitters, so retarget is race-free
     // — whoever holds the lock owns the MSI-X destination for this submit.
     if (msix_entry_addr != 0) {
-        const my_cpu = @import("../cpu/smp.zig").myCpu();
+        const my_cpu = @import("../../cpu/smp.zig").myCpu();
         const my_apic_id: u32 = my_cpu.lapic_id;
-        @import("../time/msix.zig").retargetEntry(msix_entry_addr, my_apic_id);
+        @import("../../time/msix.zig").retargetEntry(msix_entry_addr, my_apic_id);
         // One-shot diagnostic: confirm we're actually retargeting with a
         // sane lapic_id (not 0 from uninit). Also dump the post-retarget
         // entry contents so we can see whether QEMU honored the rewrite.
@@ -837,8 +837,8 @@ fn sendCmdViaPhys(cmd_len: u32, resp_len: u32) bool {
             }
         }
     }
-    const wake_runs_before_cpu0 = @import("../proc/process.zig").wake_handler_runs[0];
-    const wake_runs_before_cpu1 = @import("../proc/process.zig").wake_handler_runs[1];
+    const wake_runs_before_cpu0 = @import("../../proc/process.zig").wake_handler_runs[0];
+    const wake_runs_before_cpu1 = @import("../../proc/process.zig").wake_handler_runs[1];
     const got_response: bool = blk: {
         if (phase_a_done_via_poll) break :blk true;
         if (use_msix and msix_safe_to_use and !force_polled) {
@@ -854,8 +854,8 @@ fn sendCmdViaPhys(cmd_len: u32, resp_len: u32) bool {
             // Timeout: re-check after each yield; bail after 100
             // schedule round-trips (~1 s if waking only via the 10 ms
             // LAPIC tick; far sooner under any real GPU IRQ delivery).
-            const process = @import("../proc/process.zig");
-            const cur_pid_outer = @import("../cpu/smp.zig").currentPid() orelse break :blk false;
+            const process = @import("../../proc/process.zig");
+            const cur_pid_outer = @import("../../cpu/smp.zig").currentPid() orelse break :blk false;
             // Stamp ourselves as THE gpu_io waiter so virtioGpuIrqHandler
             // can wake us directly. Cleared by defer on every exit path
             // (true, false, or panic-unwind).
@@ -885,7 +885,7 @@ fn sendCmdViaPhys(cmd_len: u32, resp_len: u32) bool {
                     process.tick_count +% 1,
                     .release,
                 );
-                @import("../proc/sched.zig").registerWakeDeadline(process.tick_count +% 1);
+                @import("../../proc/sched.zig").registerWakeDeadline(process.tick_count +% 1);
                 process.blockOn(.gpu_io, cmd_type_for_target);
                 hlt_iters += 1;
             }
@@ -927,8 +927,8 @@ fn sendCmdViaPhys(cmd_len: u32, resp_len: u32) bool {
     if (wait_ms >= SLOW_GPU_SUBMIT_THRESHOLD_MS) {
         const cmd_virt: [*]const volatile u32 = @ptrFromInt(paging.physToVirt(cmd_phys));
         const cmd_type = cmd_virt[0];
-        const wake_d_cpu0 = @import("../proc/process.zig").wake_handler_runs[0] -% wake_runs_before_cpu0;
-        const wake_d_cpu1 = @import("../proc/process.zig").wake_handler_runs[1] -% wake_runs_before_cpu1;
+        const wake_d_cpu0 = @import("../../proc/process.zig").wake_handler_runs[0] -% wake_runs_before_cpu0;
+        const wake_d_cpu1 = @import("../../proc/process.zig").wake_handler_runs[1] -% wake_runs_before_cpu1;
         debug.klog(
             "[slow-gpu] cmd_type=0x{X} cmd_len={d} resp_len={d} wait={d}ms hlt_iters={d} poll_iters={d} via_poll={any} wake_during(cpu0={d},cpu1={d}) ok={any}\n",
             .{ cmd_type, cmd_len, resp_len, wait_ms, hlt_iters, phase_a_pause_iters, phase_a_done_via_poll, wake_d_cpu0, wake_d_cpu1, got_response },
@@ -1023,7 +1023,7 @@ fn sendSimpleCmdPair(
     @memset(resp0_dst[0..@sizeOf(CtrlHdr)], 0);
     @memset(resp1_dst[0..@sizeOf(CtrlHdr)], 0);
 
-    const sp = @import("../debug/syscall_perf.zig").scope(.gpu_wait);
+    const sp = @import("../../debug/syscall_perf.zig").scope(.gpu_wait);
     defer sp.end();
 
     // Allocate two chains of two descriptors each: (cmd0→resp0), (cmd1→resp1).
@@ -1067,9 +1067,9 @@ fn sendSimpleCmdPair(
     ctrl_vq.availIdx().* = ai +% 1;
 
     if (msix_entry_addr != 0) {
-        const my_cpu = @import("../cpu/smp.zig").myCpu();
+        const my_cpu = @import("../../cpu/smp.zig").myCpu();
         const my_apic_id: u32 = my_cpu.lapic_id;
-        @import("../time/msix.zig").retargetEntry(msix_entry_addr, my_apic_id);
+        @import("../../time/msix.zig").retargetEntry(msix_entry_addr, my_apic_id);
     }
 
     // EVENT_IDX: ask device to fire IRQ when usedIdx == used_event + 1.
@@ -1118,8 +1118,8 @@ fn sendSimpleCmdPair(
     const got_response: bool = blk: {
         if (phase_a_done_via_poll) break :blk true;
         if (use_msix and msix_safe_to_use and !force_polled) {
-            const process = @import("../proc/process.zig");
-            const cur_pid_outer = @import("../cpu/smp.zig").currentPid() orelse break :blk false;
+            const process = @import("../../proc/process.zig");
+            const cur_pid_outer = @import("../../cpu/smp.zig").currentPid() orelse break :blk false;
             // Single-waiter / targeted-IPI stamp; see sendCmdViaPhys above.
             @atomicStore(u8, &current_gpu_waiter, @intCast(cur_pid_outer), .release);
             defer @atomicStore(u8, &current_gpu_waiter, 0xFF, .release);
@@ -1136,7 +1136,7 @@ fn sendSimpleCmdPair(
                     process.tick_count +% 1,
                     .release,
                 );
-                @import("../proc/sched.zig").registerWakeDeadline(process.tick_count +% 1);
+                @import("../../proc/sched.zig").registerWakeDeadline(process.tick_count +% 1);
                 process.blockOn(.gpu_io, cmd_type_for_target);
                 hlt_iters += 1;
             }
@@ -1281,7 +1281,7 @@ pub fn waitPresentIdle() void {
 /// Caller holds ctrl_lock.
 fn notePresentDone() void {
     const us = apic.tscToUs(perf.rdtsc() -% aflush_submit_tsc);
-    @import("../debug/ftrace.zig").mark(.present_done, us);
+    @import("../../debug/ftrace.zig").mark(.present_done, us);
     const s = &present_stats;
     s.total_us += us;
     s.max_us = @max(s.max_us, @as(u32, @intCast(@min(us, 0xFFFF_FFFF))));
@@ -1334,8 +1334,8 @@ var staging_active: bool = false;
 /// pair that ksoftirqd (dead by then) never reaps.
 fn asyncFlushEligible() bool {
     if (!(use_msix and msix_safe_to_use and !force_polled)) return false;
-    if (@atomicLoad(bool, &@import("../debug/serial.zig").emergency_mode, .acquire)) return false;
-    return @import("../cpu/smp.zig").myCpu().ksoftirqd_pid != null;
+    if (@atomicLoad(bool, &@import("../../debug/serial.zig").emergency_mode, .acquire)) return false;
+    return @import("../../cpu/smp.zig").myCpu().ksoftirqd_pid != null;
 }
 
 /// Append a damage rect to the pending list. Overlapping/touching rects
@@ -1537,13 +1537,13 @@ fn waitAsyncFlushIdleLocked() void {
         // Polled / panic context must never park — pause-spin; the reap's
         // ~2 s abandon bounds the loop even against a dead host.
         if (force_polled or
-            @atomicLoad(bool, &@import("../debug/serial.zig").emergency_mode, .acquire))
+            @atomicLoad(bool, &@import("../../debug/serial.zig").emergency_mode, .acquire))
         {
             asm volatile ("pause");
             continue;
         }
-        const process = @import("../proc/process.zig");
-        const cur = @import("../cpu/smp.zig").currentPid() orelse {
+        const process = @import("../../proc/process.zig");
+        const cur = @import("../../cpu/smp.zig").currentPid() orelse {
             // No task context — asyncFlushEligible() should make this
             // unreachable; bounded wait as a belt.
             var d = Deadline.ms(CTRL_POLL_BUDGET_MS, "virtio-gpu flush reap (no task)");
@@ -1555,7 +1555,7 @@ fn waitAsyncFlushIdleLocked() void {
         @atomicStore(u8, &current_gpu_waiter, @intCast(cur), .release);
         defer @atomicStore(u8, &current_gpu_waiter, 0xFF, .release);
         @atomicStore(u64, &process.procs[cur].wake_tick, process.tick_count +% 1, .release);
-        @import("../proc/sched.zig").registerWakeDeadline(process.tick_count +% 1);
+        @import("../../proc/sched.zig").registerWakeDeadline(process.tick_count +% 1);
         process.blockOn(.gpu_io, CMD_RESOURCE_FLUSH);
     }
 }
@@ -1779,7 +1779,7 @@ fn kickPendingFromTask() void {
     if (@atomicLoad(bool, &aflush_pending, .acquire) and
         !@atomicLoad(bool, &aflush_in_flight, .acquire))
     {
-        _ = @import("../proc/softirq.zig").raise(.virtio_gpu);
+        _ = @import("../../proc/softirq.zig").raise(.virtio_gpu);
     }
 }
 
@@ -2124,8 +2124,8 @@ pub fn init(xres: u32, yres: u32) bool {
     // Name the critical locks so a panic / watchdog dump can identify
     // who holds them when the system wedges. ctrl_lock specifically is
     // the one held across blockOn(.gpu_io) during virtio-gpu submits.
-    @import("../proc/spinlock.zig").registerMutex("virtio_gpu.ctrl_lock", &ctrl_lock);
-    @import("../proc/spinlock.zig").registerLock("virtio_gpu.cursor_lock", &cursor_lock);
+    @import("../../proc/spinlock.zig").registerMutex("virtio_gpu.ctrl_lock", &ctrl_lock);
+    @import("../../proc/spinlock.zig").registerLock("virtio_gpu.cursor_lock", &cursor_lock);
     debug.klog("[virtio-gpu] Scanning for device...\n", .{});
 
     // Find virtio-gpu PCI device via the bus cache.
@@ -2580,7 +2580,7 @@ pub fn tickSweep() void {
     if (ctrl_vq.last_used_idx == hw_used) return;
     // HW advanced past SW — wake any .gpu_io waiter so its loop re-checks
     // (and via gap #1's clflush, observes the new used_idx this time).
-    const process = @import("../proc/process.zig");
+    const process = @import("../../proc/process.zig");
     var pid: u8 = 0;
     var any_woken = false;
     while (pid < process.MAX_PROCS) : (pid += 1) {
@@ -2592,7 +2592,7 @@ pub fn tickSweep() void {
     }
     // Register the deadline once (now) if we set any wake_tick — avoids N
     // cmpxchg loops for N waiters all stamping the same tick.
-    if (any_woken) @import("../proc/sched.zig").registerWakeDeadline(process.tick_count);
+    if (any_woken) @import("../../proc/sched.zig").registerWakeDeadline(process.tick_count);
 }
 
 /// Gap #4 (2026-05-20): diagnostic dump for the yield-loop / stuck-waiter
@@ -2856,7 +2856,7 @@ var last_probe_tick: u64 = 0;
 fn noteFlushResult(ok: bool) bool {
     if (ok) {
         if (wedged) {
-            const span = @import("../proc/process.zig").tick_count -% wedge_first_tick;
+            const span = @import("../../proc/process.zig").tick_count -% wedge_first_tick;
             debug.klog("[gpu] CONTROLLER RECOVERED after {d} ticks wedged\n", .{span});
         }
         consecutive_flush_failures = 0;
@@ -2865,7 +2865,7 @@ fn noteFlushResult(ok: bool) bool {
         consecutive_flush_failures +%= 1;
         if (!wedged and consecutive_flush_failures >= WEDGE_THRESHOLD) {
             wedged = true;
-            wedge_first_tick = @import("../proc/process.zig").tick_count;
+            wedge_first_tick = @import("../../proc/process.zig").tick_count;
             last_probe_tick = wedge_first_tick;
             debug.klog(
                 "[gpu] CONTROLLER WEDGE after {d} consecutive flush timeouts — suppressing flushes (probe every {d} ticks)\n",
@@ -2883,7 +2883,7 @@ fn noteFlushResult(ok: bool) bool {
 /// clears the wedge or re-arms the probe timer.
 fn shouldSkipFlush() bool {
     if (!wedged) return false;
-    const now = @import("../proc/process.zig").tick_count;
+    const now = @import("../../proc/process.zig").tick_count;
     if ((now -% last_probe_tick) >= WEDGE_PROBE_INTERVAL_TICKS) {
         last_probe_tick = now;
         return false; // let one probe through
@@ -2899,8 +2899,8 @@ pub fn flush() void {
 pub fn flushUnconditional() void {
     if (!active) return;
     if (shouldSkipFlush()) return;
-    const t = @import("../debug/perf.zig").enter();
-    defer @import("../debug/perf.zig").leave(.flush_rect, t);
+    const t = @import("../../debug/perf.zig").enter();
+    defer @import("../../debug/perf.zig").leave(.flush_rect, t);
     // Fire-and-forget when the MSI-X→softirq completion path is up: submit
     // (or coalesce) and return. The sync body below is the early-boot /
     // forced-poll / single-blob fallback.
@@ -2986,8 +2986,8 @@ pub fn flushRectUnconditional(x: u32, y: u32, w: u32, h: u32) void {
     const x1 = @min(x + w, width);
     const y1 = @min(y + h, height);
     if (x0 >= x1 or y0 >= y1) return;
-    const t = @import("../debug/perf.zig").enter();
-    defer @import("../debug/perf.zig").leave(.flush_rect, t);
+    const t = @import("../../debug/perf.zig").enter();
+    defer @import("../../debug/perf.zig").leave(.flush_rect, t);
     // Fire-and-forget when eligible — see flushUnconditional.
     if (flushRectAsyncSubmit(x0, y0, x1, y1)) return;
     if (scanout_is_blob and blob_count >= 2) {

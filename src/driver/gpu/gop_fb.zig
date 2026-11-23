@@ -33,10 +33,10 @@
 // (uefi_boot.zig pickBestGopMode) — ≤ 1920x1080, ≤ 8 MB, preferring BGRA
 // with stride == width — so `direct` is the common case even on real metal.
 
-const boot_info_mod = @import("../boot/boot_info.zig");
-const paging = @import("../mm/paging.zig");
-const memmap = @import("../mm/memmap.zig");
-const debug = @import("../debug/debug.zig");
+const boot_info_mod = @import("../../boot/boot_info.zig");
+const paging = @import("../../mm/paging.zig");
+const memmap = @import("../../mm/memmap.zig");
+const debug = @import("../../debug/debug.zig");
 
 pub var active: bool = false;
 /// True when gfx renders into the panel FB itself (flush is then a no-op).
