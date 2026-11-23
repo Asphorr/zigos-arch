@@ -80,12 +80,25 @@ pub var msix_entry_addr: usize = 0;
 /// most one. 0xFF = nobody waiting; otherwise = pid. Updated atomically
 /// because the IRQ handler reads it concurrently from any CPU.
 pub var current_gpu_waiter: u8 = 0xFF;
+
+/// The waiter a completion should wake: ctrl_lock serializes submitters, so
+/// there is at most one. Parked on its command, or about to park (wait_kind
+/// still .none: wake() sets wake_pending for blockOn's handshake). One that
+/// moved on to another wait is left to that wait's waker.
+fn waiterToWake() ?u8 {
+    const pid = @atomicLoad(u8, &current_gpu_waiter, .acquire);
+    if (pid == 0xFF) return null;
+    const process = @import("../../../proc/process.zig");
+    const kind = @atomicLoad(process.WaitKind, &process.procs[pid].wait_kind, .acquire);
+    if (kind != .gpu_io and kind != .none) return null;
+    return pid;
+}
+
 pub fn virtioGpuIrqHandler() callconv(.c) void {
     vg.virtio_gpu_irq_count +%= 1;
     const smp_mod = @import("../../../cpu/smp.zig");
     const cpu_id = smp_mod.myCpu().cpu_id;
     if (cpu_id < vg.virtio_gpu_irq_per_cpu.len) vg.virtio_gpu_irq_per_cpu[cpu_id] +%= 1;
-    const process = @import("../../../proc/process.zig");
 
     // Async flush completion: nobody is parked for it — hand the reap (and
     // the coalesced-rect resubmit) to ksoftirqd via the .virtio_gpu softirq,
@@ -95,17 +108,10 @@ pub fn virtioGpuIrqHandler() callconv(.c) void {
         smp_mod.myCpu().dynirq_preempt_pending = true;
     }
 
-    // Direct waiter lookup (gap #8): ctrl_lock serializes submitters, so
-    // current_gpu_waiter is at most one pid. Parked on its command, or
-    // about to park (wait_kind still .none): wake() readies it now, or
-    // sets wake_pending for blockOn's handshake. A waiter that already
-    // moved on to another wait is left to that wait's waker. The waiter's
-    // own wake_tick stays the backstop for a dropped IRQ (CVE-2024-3446).
-    // wake() is IF=0-safe — softirq.raise calls it from IRQs too.
-    const pid = @atomicLoad(u8, &current_gpu_waiter, .acquire);
-    if (pid == 0xFF) return;
-    const kind = @atomicLoad(process.WaitKind, &process.procs[pid].wait_kind, .acquire);
-    if (kind != .gpu_io and kind != .none) return;
+    // The waiter's own wake_tick stays the backstop for a dropped IRQ
+    // (CVE-2024-3446). wake() is IF=0-safe — softirq.raise calls it from
+    // IRQs too.
+    const pid = waiterToWake() orelse return;
     const wakelat = @import("../../../debug/wakelat.zig");
     const sched = @import("../../../proc/sched.zig");
     wakelat.noteGpuIrq(pid);
@@ -664,15 +670,6 @@ pub fn sendSimpleCmdPair(
     return true;
 }
 
-/// Gap #3 (2026-05-20): per-tick sweeper, called from `handleIRQ0` on
-/// BSP. Catches the case where the GPU device DID complete the command
-/// but the IRQ never reached us (CVE-2024-3446 reentrancy guard silently
-/// dropping virtio_notify, or PCIe posted-write ordering hiding the CQE
-/// from the IRQ-time read). Walks the ctrl queue's coherent used_idx
-/// and pokes all .gpu_io waiters' wake_tick to "now" so wakeExpired()
-/// kicks them on the same tick. Mirrors `nvme.tickSweep`.
-///
-/// Cost when idle: one clflush + one memory read per tick. Sub-microsecond.
 /// Whether irq0's backstop has anything for tickSweep: async-flush
 /// bookkeeping, or a used index the driver hasn't consumed (a lost
 /// completion IRQ). RAM reads only.
@@ -683,6 +680,9 @@ pub fn sweepWanted() bool {
     return usedIdxCoherent(&ctrl_vq) != ctrl_vq.last_used_idx;
 }
 
+/// Lost-IRQ backstop, run by ksoftirqd when irq0 sees sweepWanted(): the
+/// device completed a command but its IRQ never came (CVE-2024-3446's
+/// reentrancy guard drops notifications). Mirrors `nvme.tickSweep`.
 pub fn tickSweep() void {
     if (!vg.active) return;
     if (!use_msix) return;
@@ -703,23 +703,11 @@ pub fn tickSweep() void {
             ctrl_lock.release();
         }
     }
-    const hw_used = usedIdxCoherent(&ctrl_vq);
-    if (ctrl_vq.last_used_idx == hw_used) return;
-    // HW advanced past SW — wake any .gpu_io waiter so its loop re-checks
-    // (and via gap #1's clflush, observes the new used_idx this time).
-    const process = @import("../../../proc/process.zig");
-    var pid: u8 = 0;
-    var any_woken = false;
-    while (pid < process.MAX_PROCS) : (pid += 1) {
-        const wk = @atomicLoad(u8, @as(*const u8, @ptrCast(&process.procs[pid].wait_kind)), .acquire);
-        if (wk == @intFromEnum(process.WaitKind.gpu_io)) {
-            @atomicStore(u64, &process.procs[pid].wake_tick, process.tick_count, .release);
-            any_woken = true;
-        }
-    }
-    // Register the deadline once (now) if we set any wake_tick — avoids N
-    // cmpxchg loops for N waiters all stamping the same tick.
-    if (any_woken) @import("../../../proc/sched.zig").registerWakeDeadline(process.tick_count);
+    if (ctrl_vq.last_used_idx == usedIdxCoherent(&ctrl_vq)) return;
+    // HW advanced past SW: wake the waiter as its IRQ would have.
+    const pid = waiterToWake() orelse return;
+    @import("../../../debug/wakelat.zig").hintWake(pid, .gpu_io);
+    @import("../../../proc/sched.zig").wake(pid);
 }
 
 /// Gap #4 (2026-05-20): diagnostic dump for the yield-loop / stuck-waiter

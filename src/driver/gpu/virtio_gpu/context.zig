@@ -102,12 +102,11 @@ pub fn queryCapsets() void {
 // 3D Context API
 // ============================================================
 
-pub var next_3d_resource_id: u32 = 1000;
+var next_3d_resource_id: u32 = 1000;
 
+/// Callers: syscalls on any CPU and the compositor, so atomic.
 pub fn alloc3DResourceId() u32 {
-    const id = next_3d_resource_id;
-    next_3d_resource_id += 1;
-    return id;
+    return @atomicRmw(u32, &next_3d_resource_id, .Add, 1, .monotonic);
 }
 
 /// Create a 3D rendering context (VirGL or Venus).
