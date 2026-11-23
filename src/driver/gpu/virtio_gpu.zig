@@ -476,7 +476,7 @@ const BLOB_FLAG_USE_MAPPABLE: u32 = 1;
 const BLOB_FLAG_USE_SHAREABLE: u32 = 2;
 const BLOB_FLAG_USE_CROSS_DEVICE: u32 = 4;
 
-// --- Virtqueue (shared with virtio_sound via driver/virtio.zig) ---
+// --- Virtqueue (shared with virtio_sound via driver/bus/virtio.zig) ---
 
 const virtio = @import("../bus/virtio.zig");
 const VirtqDesc = virtio.VirtqDesc;

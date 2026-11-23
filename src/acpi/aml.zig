@@ -5481,7 +5481,7 @@ fn physMapped(phys: u64, len: u64) bool {
 // space only. Config reads are side-effect-free per spec, so the boot liveness
 // probe is safe to run unconditionally.
 
-/// PCI configuration access, registered by acpi.init (driver/pci.zig sized
+/// PCI configuration access, registered by acpi.init (driver/bus/pci.zig sized
 /// accessors). Null: aml drives CF8/CFC itself.
 pub const PciCfgOps = struct {
     read: *const fn (bus: u8, dev: u8, func: u8, offset: u16, width: u8) ?u32,

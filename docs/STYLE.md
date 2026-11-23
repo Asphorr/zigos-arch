@@ -410,7 +410,7 @@ path is NOT exit-bound — there the wall budget must come from the old
 *measured* wall time, and inside a cli window it must stay under the
 5 ms cli-hold threshold (the e1000 tx-DD and waitVSync lessons: a
 "generous" budget in those spots is a 20-60× cli/frame regression).
-**Reference exemplar:** `ps2Wait` in `driver/keyboard.zig`. **How to
+**Reference exemplar:** `ps2Wait` in `driver/input/keyboard.zig`. **How to
 apply:** required for new polled waits; existing iteration-count loops
 were converted in the 2026-08-25 sweep — any stragglers convert when
 touched.
@@ -630,20 +630,20 @@ silent self-recovery into observable metric.
 | ------------------- | ----------------------------------------------- |
 | `(p:lock)/(a)/(c)`  | `src/proc/process.zig` `PCB`                    |
 | `(u)` user-mmap     | `src/cpu/iouring.zig` `RingHeader`              |
-| Wire layout asserts | `src/driver/nvme.zig` `SqEntry`                 |
-| `LE(T)` / `BE(T)`   | `src/driver/nvme.zig` `DsmRange`                |
+| Wire layout asserts | `src/driver/block/nvme.zig` `SqEntry`           |
+| `LE(T)` / `BE(T)`   | `src/driver/block/nvme.zig` `DsmRange`          |
 | `Guarded(T)`        | `src/util/guarded.zig`; adopters: swap/page_cache/nvme/pmm |
 | `assertHeld()`      | `src/util/guarded.zig` `refHeld`                |
 | `frames.Frame`      | `src/proc/frames.zig` `dispatch`; sched_asm + lifecycle forges |
 | `UserPtr(T)`        | `src/cpu/syscall/proc.zig` `sysSigpending`      |
 | `Persistent(T)`     | `src/mm/pmem.zig` `persistenceSelfTest`         |
 | `kwarn(@src(),...)` | `src/debug/debug.zig` `kwarn`                   |
-| `Deadline`          | `src/driver/keyboard.zig` `ps2Wait`             |
-| `pause.Epoch`       | `src/driver/nvme.zig` `waitCompletion`          |
+| `Deadline`          | `src/driver/input/keyboard.zig` `ps2Wait`       |
+| `pause.Epoch`       | `src/driver/block/nvme.zig` `waitCompletion`    |
 | `mightSleep`        | `src/proc/sched.zig` `blockOn`                  |
 | `// ctx: irq`       | `src/cpu/idt/irq0.zig` `handleIRQ0`; lint in `tools/ctx_lint.zig` |
 | `fail()`/`errtrace` | `src/fs/gpt.zig` `readHeader` / `parse`         |
-| `Phys`/`Virt`/`Dma` | `src/driver/e1000.zig` `allocRxRing`            |
-| mmio window         | `src/driver/nvme.zig` `Regs` / `regs()`         |
+| `Phys`/`Virt`/`Dma` | `src/driver/nic/e1000.zig` `allocRxRing`        |
+| mmio window         | `src/driver/block/nvme.zig` `Regs` / `regs()`   |
 | `slot_table.claim`  | `src/proc/pipe.zig` `alloc`                     |
 | `smp.myCpuId()`     | `src/proc/spinlock.zig` `currentCpuId`; arming in `src/cpu/smp.zig` `armTscAux` |

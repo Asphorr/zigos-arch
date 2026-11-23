@@ -156,7 +156,7 @@ const SndConfig = extern struct {
     chmaps: u32 align(1),
 };
 
-// --- Virtqueue (shared with virtio_gpu via driver/virtio.zig) ---
+// --- Virtqueue (shared with virtio_gpu via driver/bus/virtio.zig) ---
 
 const virtio = @import("../bus/virtio.zig");
 const VirtqDesc = virtio.VirtqDesc;

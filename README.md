@@ -133,7 +133,8 @@ Boot mode 19 runs whichever of these checks the image carries.
 src/
   cpu/      idt smp arch (gdt msr mce pmu) mmu (pcid tlb iommu)
             syscall: native + linux_{fs,mm,net,proc,signal,thread,time,tty}
-  driver/   nvme xhci ahci ata e1000 i225 virtio_{net,gpu,sound,console} ac97 hda gop_fb pci
+  driver/   by class: bus (pci virtio) block (nvme ahci ata) nic (e1000 i225 virtio_net)
+            gpu (virtio_gpu gop_fb) sound (ac97 hda virtio_sound) input usb (xhci) console
   proc/     process sched runqueue signals pipe pty tty session hrtimer softirq elf_loader
   mm/       pmm vmm vma heap tlsf slab page_cache swap shm pmem
   fs/       vfs ext2 fat32 tarfs devfs procfs lproc gpt
