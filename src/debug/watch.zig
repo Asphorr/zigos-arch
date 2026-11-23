@@ -903,13 +903,13 @@ pub const KSTACK_DEEP_OFFSET_FROM_TOP: usize = 0x1000;
 fn isLegitDeepKstackWriter(rip: u64, addr: u64) bool {
     const r = symbols.resolveKernel(rip) orelse return false;
     // Category 1: entry stubs.
-    if (std.mem.eql(u8, r.name, "cpu.idt.isr_irq0")) return true;
+    if (std.mem.eql(u8, r.name, "cpu.idt.irq0.isr_irq0")) return true;
     if (std.mem.eql(u8, r.name, "isr_common_exc")) return true;
     if (std.mem.eql(u8, r.name, "handleException")) return true;
     if (std.mem.eql(u8, r.name, "handleIRQ0")) return true;
     if (std.mem.eql(u8, r.name, "handleDynIrq")) return true;
     if (std.mem.startsWith(u8, r.name, "syscall.entry.CpuEntry(")) return true;
-    if (std.mem.startsWith(u8, r.name, "cpu.idt.DynIrqStub(")) return true;
+    if (std.mem.startsWith(u8, r.name, "cpu.idt.dynirq.DynIrqStub(")) return true;
 
     // Category 2: writer's RSP is in the same kstack as the watched
     // address (= "this task is writing to its own stack-local buffer").
