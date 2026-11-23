@@ -4,7 +4,7 @@ const Phys = @import("../util/addr.zig").Phys;
 const heap = @import("../mm/heap.zig");
 const slab = @import("../mm/slab.zig");
 const vfs = @import("../fs/vfs.zig");
-const vga = @import("../ui/vga.zig");
+const vga = @import("../driver.zig").vga;
 
 // Slab cache for the small SymTable header struct. Variable-size entries[]
 // and names[] still go through kmalloc — slab can only handle fixed sizes.

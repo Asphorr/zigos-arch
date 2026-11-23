@@ -53,7 +53,7 @@ const std = @import("std");
 // inline decl-heavy @import rolls the LLVM Invalid-type dice.
 const SAVED_RIP_OFF: usize = @import("frames.zig").dispatch.saved_rip_off;
 
-const vga = @import("../ui/vga.zig");
+const vga = @import("../driver.zig").vga;
 const gdt = @import("../cpu/arch/gdt.zig");
 const debug = @import("../debug/debug.zig");
 const pcid_mod = @import("../cpu/mmu/pcid.zig");

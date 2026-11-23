@@ -1,5 +1,5 @@
 const std = @import("std");
-const vga = @import("../ui/vga.zig");
+const vga = @import("../driver.zig").vga;
 const serial = @import("serial.zig");
 
 /// CPU state pushed by unified ISR stub. Matches stack layout exactly.

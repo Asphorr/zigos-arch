@@ -1,7 +1,7 @@
 const std = @import("std");
 const ata = @import("../../driver.zig").block;
 const debug = @import("../../debug/debug.zig");
-const vga = @import("../../ui/vga.zig");
+const vga = @import("../../driver.zig").vga;
 const path_cache = @import("../path_cache.zig");
 
 // FAT32 constants

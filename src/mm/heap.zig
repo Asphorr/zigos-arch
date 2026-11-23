@@ -29,7 +29,7 @@ const SpinLock = spinlock.SpinLock;
 // Diagnostics:
 const debug = @import("../debug/debug.zig");
 const serial = @import("../debug/serial.zig");
-const vga = @import("../ui/vga.zig");
+const vga = @import("../driver.zig").vga;
 const kasan = @import("../debug/kasan.zig");
 const kdbg = @import("../debug/kdbg.zig");
 const layout = @import("../debug/layout.zig");

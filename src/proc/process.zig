@@ -28,7 +28,7 @@
 //!     `process.X` surface for source-stability.
 
 const std = @import("std");
-const vga = @import("../ui/vga.zig");
+const vga = @import("../driver.zig").vga;
 const debug = @import("../debug/debug.zig");
 const smp = @import("../cpu/smp.zig");
 const memmap = @import("../mm/memmap.zig");

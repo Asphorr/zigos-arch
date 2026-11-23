@@ -1,11 +1,11 @@
 const std = @import("std");
 const Phys = @import("../util/addr.zig").Phys;
 const gfx = @import("gfx.zig");
-const bga = @import("bga.zig");
+const bga = @import("../driver.zig").bga;
 const display = @import("display.zig");
 const mouse = @import("../driver.zig").mouse;
 const keyboard = @import("../driver.zig").keyboard;
-const vga = @import("vga.zig");
+const vga = @import("../driver.zig").vga;
 const cli = @import("../cli.zig");
 const paging = @import("../mm/paging.zig");
 const pmm = @import("../mm/pmm.zig");
@@ -3950,10 +3950,10 @@ pub fn run() void {
     // virtio_gpu.framebuffer below — no explicit teardown needed.
     @import("boot_screen.zig").disable();
     @import("early_fb.zig").release();
-    @import("vga.zig").bg = .Black;
-    @import("vga.zig").fg = .Black;
-    @import("vga.zig").clear();
-    @import("vga.zig").available = false;
+    @import("../driver.zig").vga.bg = .Black;
+    @import("../driver.zig").vga.fg = .Black;
+    @import("../driver.zig").vga.clear();
+    @import("../driver.zig").vga.available = false;
 
     const virtio_gpu = @import("../driver.zig").virtio_gpu;
     const gop = @import("../driver.zig").gop_fb;

@@ -1,5 +1,5 @@
 const std = @import("std");
-const vga = @import("ui/vga.zig");
+const vga = @import("driver.zig").vga;
 const gdt = @import("cpu/arch/gdt.zig");
 const idt = @import("cpu/idt.zig");
 const pmm = @import("mm/pmm.zig");

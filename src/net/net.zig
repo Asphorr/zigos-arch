@@ -1,5 +1,5 @@
 const std = @import("std");
-const vga = @import("../ui/vga.zig");
+const vga = @import("../driver.zig").vga;
 const nic = @import("../driver.zig").nic;
 const debug = @import("../debug/debug.zig");
 const process = @import("../proc/process.zig");

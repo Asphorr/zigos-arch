@@ -1,5 +1,5 @@
 const std = @import("std");
-const vga = @import("../ui/vga.zig");
+const vga = @import("../driver.zig").vga;
 const boot_info = @import("../boot/boot_info.zig");
 const Guarded = @import("../util/guarded.zig").Guarded;
 const memmap = @import("memmap.zig");

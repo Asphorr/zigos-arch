@@ -1,6 +1,6 @@
-const io = @import("../io.zig");
-const paging = @import("../mm/paging.zig");
-const debug = @import("../debug/debug.zig");
+const io = @import("../../io.zig");
+const paging = @import("../../mm/paging.zig");
+const debug = @import("../../debug/debug.zig");
 
 // BGA register ports
 const VBE_DISPI_IOPORT_INDEX: u16 = 0x01CE;

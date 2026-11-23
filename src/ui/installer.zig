@@ -1462,7 +1462,7 @@ fn run() noreturn {
     // about to be scanned out as pixels.
     @import("boot_screen.zig").disable();
     @import("early_fb.zig").release();
-    const vga = @import("vga.zig");
+    const vga = @import("../driver.zig").vga;
     vga.bg = .Black;
     vga.fg = .Black;
     vga.clear();

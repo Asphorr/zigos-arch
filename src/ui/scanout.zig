@@ -15,7 +15,7 @@
 // which is how a shared helper turns into a switch on its callers.
 
 const gfx = @import("gfx.zig");
-const bga = @import("bga.zig");
+const bga = @import("../driver.zig").bga;
 const debug = @import("../debug/debug.zig");
 const virtio_gpu = @import("../driver.zig").virtio_gpu;
 const gpu_kit = @import("../driver.zig").gpu;

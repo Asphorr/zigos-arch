@@ -31,7 +31,7 @@
 
 const std = @import("std");
 
-const vga = @import("../ui/vga.zig");
+const vga = @import("../driver.zig").vga;
 const gdt = @import("../cpu/arch/gdt.zig");
 const debug = @import("../debug/debug.zig");
 const vmm = @import("../mm/vmm.zig");

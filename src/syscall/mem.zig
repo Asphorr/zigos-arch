@@ -2,7 +2,7 @@
 //! Dispatched from cpu/syscall.zig doSyscallInner; named in SYSCALLS.
 
 const std = @import("std");
-const vga = @import("../ui/vga.zig");
+const vga = @import("../driver.zig").vga;
 const elf_loader = @import("../proc/elf_loader.zig");
 const keyboard = @import("../driver.zig").keyboard;
 const process = @import("../proc/process.zig");
@@ -10,7 +10,7 @@ const vmm = @import("../mm/vmm.zig");
 const pmm = @import("../mm/pmm.zig");
 const paging = @import("../mm/paging.zig");
 const Phys = @import("../util/addr.zig").Phys;
-const bga = @import("../ui/bga.zig");
+const bga = @import("../driver.zig").bga;
 const vfs = @import("../fs/vfs.zig");
 const file = @import("../fs/file.zig");
 const desktop = @import("../ui/desktop.zig");

@@ -1,5 +1,5 @@
 const std = @import("std");
-const vga = @import("ui/vga.zig");
+const vga = @import("driver.zig").vga;
 const keyboard = @import("driver.zig").keyboard;
 const vfs = @import("fs/vfs.zig");
 const elf_loader = @import("proc/elf_loader.zig");

@@ -16,7 +16,7 @@
 // user-visible screen.
 
 const std = @import("std");
-const vga = @import("../ui/vga.zig");
+const vga = @import("../driver.zig").vga;
 const gfx = @import("../ui/gfx.zig");
 const aa_font = @import("../ui/aa_font.zig");
 const symbols = @import("symbols.zig");

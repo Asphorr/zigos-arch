@@ -14,7 +14,7 @@ const memmap = @import("../../mm/memmap.zig");
 const apic = @import("../../time/apic.zig");
 const desktop = @import("../../ui/desktop.zig");
 const elf_loader = @import("../../proc/elf_loader.zig");
-const vga = @import("../../ui/vga.zig");
+const vga = @import("../../driver.zig").vga;
 
 // --- Comptime exception stub generation ---
 

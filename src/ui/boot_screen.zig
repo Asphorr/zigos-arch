@@ -21,7 +21,7 @@
 //      before its own virtio-gpu setup; restores vga.redirect_fn.
 
 const std = @import("std");
-const vga = @import("vga.zig");
+const vga = @import("../driver.zig").vga;
 const gfx = @import("gfx.zig");
 const apic = @import("../time/apic.zig");
 
