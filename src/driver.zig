@@ -35,7 +35,7 @@ pub const keyboard = @import("driver/input/keyboard.zig");
 pub const mouse = @import("driver/input/mouse.zig");
 
 // USB.
-pub const xhci = @import("driver/xhci.zig");
+pub const xhci = @import("driver/usb/xhci.zig");
 
 // Consoles.
 pub const virtio_console = @import("driver/virtio_console.zig");

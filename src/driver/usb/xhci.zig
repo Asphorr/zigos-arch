@@ -1,14 +1,14 @@
-const pci = @import("bus/pci.zig");
-const paging = @import("../mm/paging.zig");
-const pmm = @import("../mm/pmm.zig");
-const Phys = @import("../util/addr.zig").Phys;
-const debug = @import("../debug/debug.zig");
-const process = @import("../proc/process.zig");
-const keyboard = @import("input/keyboard.zig");
-const mouse = @import("input/mouse.zig");
-const msix = @import("../time/msix.zig");
-const Deadline = @import("../util/deadline.zig").Deadline;
-const iommu = @import("../cpu/mmu/iommu.zig");
+const pci = @import("../bus/pci.zig");
+const paging = @import("../../mm/paging.zig");
+const pmm = @import("../../mm/pmm.zig");
+const Phys = @import("../../util/addr.zig").Phys;
+const debug = @import("../../debug/debug.zig");
+const process = @import("../../proc/process.zig");
+const keyboard = @import("../input/keyboard.zig");
+const mouse = @import("../input/mouse.zig");
+const msix = @import("../../time/msix.zig");
+const Deadline = @import("../../util/deadline.zig").Deadline;
+const iommu = @import("../../cpu/mmu/iommu.zig");
 
 // PCI BDF captured at init for per-device-attach iommu.dmaMap calls.
 var pci_bus: u8 = 0;
@@ -207,7 +207,7 @@ var uas_lock: SpinLock = .{};
 // AND the global event ring with pollHID — two CPUs reading from a USB MSC
 // disk via syscall would race on all three. pollHID itself is BSP-only so
 // the IRQ producer side is safe; this lock just serializes consumers.
-const SpinLock = @import("../proc/spinlock.zig").SpinLock;
+const SpinLock = @import("../../proc/spinlock.zig").SpinLock;
 var msc_locks: [MAX_DEVICES]SpinLock = [_]SpinLock{.{}} ** MAX_DEVICES;
 var device_count: u8 = 0;
 
@@ -283,8 +283,8 @@ var event_drain_locked: bool = false;
 /// machinery stays for the two non-IRQ callers: the 10 Hz lost-IRQ backstop
 /// and pollHID's own budget-overflow re-raise.
 fn xhciIrqHandler() callconv(.c) void {
-    const t0 = @import("../debug/perf.zig").rdtsc();
-    defer @import("../debug/ftrace.zig").markSince(.input, t0);
+    const t0 = @import("../../debug/perf.zig").rdtsc();
+    defer @import("../../debug/ftrace.zig").markSince(.input, t0);
     xhci_irq_count +%= 1;
     // Close the typematic gate BEFORE draining: events are in the ring but
     // key_state is stale until pollHID processes them. With the inline
@@ -294,7 +294,7 @@ fn xhciIrqHandler() callconv(.c) void {
     // provably drained.
     @atomicStore(bool, &keyboard.ext_events_pending, true, .release);
     pollHID();
-    @import("../cpu/smp.zig").myCpu().dynirq_preempt_pending = true;
+    @import("../../cpu/smp.zig").myCpu().dynirq_preempt_pending = true;
 }
 
 // --- MMIO register helpers ---
@@ -2488,7 +2488,7 @@ pub fn hidSweepWanted() bool {
 }
 
 pub fn pollHID() void {
-    @import("../cpu/smp.zig").assertBSP("xhci.pollHID");
+    @import("../../cpu/smp.zig").assertBSP("xhci.pollHID");
     // Self-serialize via IRQ-disable (Inc 2c). The drain mutates non-atomic
     // ring cursors (evt_dequeue/evt_cycle); with the MSI-X handler now
     // draining INLINE, an xHCI IRQ landing mid-way through a TASK-context
@@ -2508,8 +2508,8 @@ pub fn pollHID() void {
     // it's a prime candidate for wild writes during paint clicks. Check
     // at entry AND exit so we can distinguish "corrupted before pollHID"
     // from "corrupted by pollHID".
-    @import("../debug/iretq_canary.zig").check(@src());
-    defer @import("../debug/iretq_canary.zig").check(@src());
+    @import("../../debug/iretq_canary.zig").check(@src());
+    defer @import("../../debug/iretq_canary.zig").check(@src());
     if (!enumeration_done or device_count == 0) return;
     // sendCommand / mscScsiCommand are mid-flight on some CPU and have
     // claimed the event ring — deferring HID drain by one tick (10 ms)
@@ -2586,7 +2586,7 @@ pub fn pollHID() void {
     // is typematic spam fuel. Task-context raise: safe (we ARE ksoftirqd's
     // .hid action; the pending bit just re-runs us before it sleeps).
     if (!ring_emptied) {
-        _ = @import("../proc/softirq.zig").raise(.hid);
+        _ = @import("../../proc/softirq.zig").raise(.hid);
     }
 
     // Reopen the typematic gate only if the ring is actually EMPTY (a
@@ -2605,7 +2605,7 @@ pub fn pollHID() void {
         // Wake the event-driven compositor so the reset actually runs.
         // Without this, a wedged mouse would never recover because no
         // other input event can fire while the mouse is stuck.
-        @import("../ui/desktop/wake.zig").requestWake();
+        @import("../../ui/desktop/wake.zig").requestWake();
     }
 }
 
@@ -2728,7 +2728,7 @@ fn processKeyboardReport(data: [*]volatile const u8) void {
                 // key the user already released. Convert to PS/2 here.
                 const repeat_sc = hidUsageToScancode(key);
                 if (repeat_sc != 0) {
-                    keyboard.beginRepeatTracking(repeat_sc, ch, @import("../proc/process.zig").tick_count);
+                    keyboard.beginRepeatTracking(repeat_sc, ch, @import("../../proc/process.zig").tick_count);
                 }
             }
         }
