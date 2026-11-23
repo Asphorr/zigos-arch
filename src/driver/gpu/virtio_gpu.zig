@@ -136,10 +136,9 @@ pub fn init(xres: u32, yres: u32) bool {
         debug.klog("[virtio-gpu] init: already active ({d}x{d}), requested {d}x{d} ignored\n", .{ width, height, xres, yres });
         return true;
     }
-    // Name the critical locks so a panic / watchdog dump can identify
-    // who holds them when the system wedges. ctrl_lock specifically is
-    // the one held across blockOn(.gpu_io) during virtio-gpu submits.
-    @import("../../proc/spinlock.zig").registerMutex("virtio_gpu.ctrl_lock", &ctrlq.ctrl_lock);
+    // Name the locks so a panic / watchdog dump can identify who holds
+    // them when the system wedges (the queue's own: ctrlq.init).
+    @import("../../proc/spinlock.zig").registerMutex("virtio_gpu.present", &present.present_lock);
     @import("../../proc/spinlock.zig").registerLock("virtio_gpu.cursor_lock", &cursor.cursor_lock);
     debug.klog("[virtio-gpu] Scanning for device...\n", .{});
 
@@ -279,11 +278,12 @@ pub fn init(xres: u32, yres: u32) bool {
     _ = iommu.dmaMap(pci_bus, pci_dev, pci_func, ctrlq.ctrl_vq.desc_phys, 4096, .{});
     _ = iommu.dmaMap(pci_bus, pci_dev, pci_func, ctrlq.ctrl_vq.used_phys, 4096, .{});
 
-    // Allocate command buffer (4 contiguous pages for large scatter-gather lists)
-    ctrlq.cmd_phys = (pmm.allocContiguous(ctrlq.CMD_PAGES) orelse return false).raw();
-    ctrlq.resp_phys = (pmm.allocFrame() orelse return false).raw();
-    _ = iommu.dmaMap(pci_bus, pci_dev, pci_func, ctrlq.cmd_phys, ctrlq.CMD_PAGES * 4096, .{});
-    _ = iommu.dmaMap(pci_bus, pci_dev, pci_func, ctrlq.resp_phys, 4096, .{});
+    // The queue's slots and its large buffer.
+    if (!ctrlq.init()) {
+        debug.klog("[virtio-gpu] Failed to set up the control queue's buffers\n", .{});
+        ccWrite8(virtio.CC_DEVICE_STATUS, 0x80);
+        return false;
+    }
 
     // Driver OK
     ccWrite8(virtio.CC_DEVICE_STATUS, virtio.STATUS_ACKNOWLEDGE | virtio.STATUS_DRIVER | virtio.STATUS_FEATURES_OK | virtio.STATUS_DRIVER_OK);
@@ -454,14 +454,6 @@ pub fn resumeFromS3() bool {
     ctrlq.force_polled = true;
     defer ctrlq.force_polled = saved_force_polled;
 
-    // Any pre-suspend async flush died with the controller, and the rings
-    // are about to be re-programmed — forget it rather than ever reaping
-    // stale descriptor indices into the rebuilt free list.
-    @atomicStore(bool, &present.aflush_in_flight, false, .release);
-    @atomicStore(bool, &present.aflush_pending, false, .release);
-    present.aflush_ncmds = 0;
-    present.apend_count = 0;
-
     // --- Re-drive the device handshake (per virtio §3.1.1) ---
     // Unlike init (which runs against an already-reset device at boot), here the
     // device is live in DRIVER_OK, so the reset is NOT instant: we MUST wait for a
@@ -500,10 +492,13 @@ pub fn resumeFromS3() bool {
     ccWrite16(virtio.CC_MSIX_CONFIG, 0xFFFF);
 
     // --- Re-program the control virtqueue onto its EXISTING rings (leak-free) ---
-    if (!ctrlq.ctrl_vq.reprogram(common_cfg, 0)) {
+    // Everything in flight died with the controller: the queue forgets it
+    // (under its lock), then the present engine its batch.
+    if (!ctrlq.reprogramAfterDeviceReset(common_cfg)) {
         debug.klog("[virtio-gpu] S3 resume: ctrl queue reprogram failed\n", .{});
         return false;
     }
+    present.resetAfterDeviceReset();
 
     // DRIVER_OK — device is live again.
     ccWrite8(virtio.CC_DEVICE_STATUS, virtio.STATUS_ACKNOWLEDGE | virtio.STATUS_DRIVER | virtio.STATUS_FEATURES_OK | virtio.STATUS_DRIVER_OK);
@@ -562,7 +557,8 @@ pub var cursor_hidden: bool = false;
 
 // --- API of the parts ---
 
-pub const ctrlLockBusy = ctrlq.ctrlLockBusy;
+pub const queueBusy = ctrlq.busy;
+pub const releaseTask = ctrlq.releaseTask;
 pub const CMD_RESOURCE_CREATE_3D = proto.CMD_RESOURCE_CREATE_3D;
 pub const GetCapsetInfo = proto.GetCapsetInfo;
 pub const RespCapsetInfo = proto.RespCapsetInfo;

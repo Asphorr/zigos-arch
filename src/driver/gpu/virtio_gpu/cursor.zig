@@ -100,35 +100,10 @@ pub fn initCursor() bool {
         return false;
     }
 
-    // Attach backing (single contiguous 4-page region). Build directly in
-    // cmd_phys + sendCmdViaPhys — using sendCmd would self-alias the
-    // @memcpy (cmd_buf and cmd_dst both point at cmd_phys via physmap).
-    const cmd_dst: [*]volatile u8 = @ptrFromInt(paging.physToVirt(ctrlq.cmd_phys));
-    @memset(cmd_dst[0..4096], 0);
-
-    const attach: *volatile proto.AttachBacking = @ptrFromInt(paging.physToVirt(ctrlq.cmd_phys));
-    attach.hdr.cmd_type = proto.CMD_RESOURCE_ATTACH_BACKING;
-    attach.resource_id = CURSOR_RESOURCE_ID;
-    attach.nr_entries = 1;
-    const entries: [*]volatile proto.MemEntry = @ptrFromInt(paging.physToVirt(ctrlq.cmd_phys + @sizeOf(proto.AttachBacking)));
-    entries[0] = .{ .addr = cursor_img_phys, .length = 64 * 64 * 4, .padding = 0 };
-
-    const total_len: u32 = @sizeOf(proto.AttachBacking) + @sizeOf(proto.MemEntry);
-    {
-        const resp_dst: [*]volatile u8 = @ptrFromInt(paging.physToVirt(ctrlq.resp_phys));
-        @memset(resp_dst[0..@sizeOf(proto.CtrlHdr)], 0);
-        ctrlq.ctrl_lock.acquire();
-        defer ctrlq.ctrl_lock.release();
-        if (!ctrlq.sendCmdViaPhys(total_len, @sizeOf(proto.CtrlHdr))) {
-            debug.klog("[virtio-gpu] Cursor backing attach failed\n", .{});
-            return false;
-        }
-        ctrlq.clflushRange(paging.physToVirt(ctrlq.resp_phys), @sizeOf(proto.CtrlHdr)); // gap #2
-        const resp: *const proto.CtrlHdr = @ptrFromInt(paging.physToVirt(ctrlq.resp_phys));
-        if (resp.cmd_type != proto.RESP_OK_NODATA) {
-            debug.klog("[virtio-gpu] Cursor ATTACH_BACKING resp 0x{X}\n", .{resp.cmd_type});
-            return false;
-        }
+    // Attach backing: the single contiguous 4-page image.
+    if (!scanout.attachBackingContiguous(CURSOR_RESOURCE_ID, cursor_img_phys, 4)) {
+        debug.klog("[virtio-gpu] Cursor backing attach failed\n", .{});
+        return false;
     }
 
     // Transfer cursor image to host

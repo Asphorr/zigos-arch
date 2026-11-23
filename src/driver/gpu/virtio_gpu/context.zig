@@ -1,5 +1,6 @@
 //! 3D: capsets, contexts, SUBMIT_3D, blob resources and the hostmem BAR.
 
+const std = @import("std");
 const pci = @import("../../bus/pci.zig");
 const Phys = @import("../../../util/addr.zig").Phys;
 const paging = @import("../../../mm/paging.zig");
@@ -9,7 +10,6 @@ const vg = @import("../virtio_gpu.zig");
 const virtio = @import("../../bus/virtio.zig");
 const proto = @import("protocol.zig");
 const ctrlq = @import("ctrlq.zig");
-const present = @import("present.zig");
 const scanout = @import("scanout.zig");
 const hostmem = @import("hostmem.zig");
 
@@ -175,38 +175,31 @@ pub fn ctxAttachResource(ctx_id: u32, resource_id: u32) bool {
 pub fn submit3D(ctx_id: u32, cmd_data: []const u8) bool {
     const hdr_size = @sizeOf(proto.CmdSubmit3D);
     const total = hdr_size + cmd_data.len;
-    if (total > ctrlq.CMD_PAGES * 4096) {
-        debug.klog("[virtio-gpu] submit3D too large: {d}\n", .{cmd_data.len});
-        return false;
-    }
-
-    // Serialize against sendCmd — both touch ctrl_vq + cmd_phys/resp_phys.
-    // Without this, BSP rendering racing with AP syscalls corrupts the ring.
-    defer present.kickPendingFromTask(); // see sendCmd — runs after the release
-    ctrlq.ctrl_lock.acquire();
-    defer ctrlq.ctrl_lock.release();
-    // As in sendCmd: an outstanding async flush pair owns cmd/resp slots,
-    // and its completion would pass for ours in sendCmdViaPhys.
-    present.waitAsyncFlushIdleLocked();
-
-    // Write header + command data directly to cmd_phys.
-    const dst: [*]volatile u8 = @ptrFromInt(paging.physToVirt(ctrlq.cmd_phys));
-    var hdr = proto.CmdSubmit3D{
+    const hdr = proto.CmdSubmit3D{
         .hdr = .{ .cmd_type = proto.CMD_SUBMIT_3D, .ctx_id = ctx_id },
         .size = @intCast(cmd_data.len),
     };
-    const hdr_bytes: [*]const u8 = @ptrCast(&hdr);
-    @memcpy(@as([*]volatile u8, dst)[0..hdr_size], hdr_bytes[0..hdr_size]);
-    @memcpy(@as([*]volatile u8, dst + hdr_size)[0..cmd_data.len], cmd_data);
-
-    const resp_dst: [*]volatile u8 = @ptrFromInt(paging.physToVirt(ctrlq.resp_phys));
-    @memset(resp_dst[0..@sizeOf(proto.CtrlHdr)], 0);
-
-    if (!ctrlq.sendCmdViaPhys(@intCast(total), @sizeOf(proto.CtrlHdr))) return false;
-
-    ctrlq.clflushRange(paging.physToVirt(ctrlq.resp_phys), @sizeOf(proto.CtrlHdr)); // gap #2
-    const resp: *volatile proto.CtrlHdr = @ptrFromInt(paging.physToVirt(ctrlq.resp_phys));
-    return resp.cmd_type == proto.RESP_OK_NODATA;
+    var resp: proto.CtrlHdr = .{};
+    if (total <= ctrlq.SLOT_CMD_MAX) {
+        // Venus sends many short ones (ring notifications): a slot.
+        var buf: [ctrlq.SLOT_CMD_MAX]u8 = undefined;
+        @memcpy(buf[0..hdr_size], std.mem.asBytes(&hdr));
+        @memcpy(buf[hdr_size..total], cmd_data);
+        if (!ctrlq.send(buf[0..total], std.mem.asBytes(&resp))) return false;
+        return resp.cmd_type == proto.RESP_OK_NODATA;
+    }
+    if (total > ctrlq.LARGE_CMD_MAX) {
+        debug.klog("[virtio-gpu] submit3D too large: {d}\n", .{cmd_data.len});
+        return false;
+    }
+    // Built in the large buffer: no copy of the stream through the stack.
+    const big = ctrlq.largeAcquire() orelse return false;
+    defer big.release();
+    const dst = big.cmd();
+    @memcpy(dst[0..hdr_size], std.mem.asBytes(&hdr));
+    @memcpy(dst[hdr_size..total], cmd_data);
+    if (!big.run(total, @sizeOf(proto.CtrlHdr))) return false;
+    return big.respHdr().cmd_type == proto.RESP_OK_NODATA;
 }
 
 /// Create a blob resource (for shared memory with host GPU).
@@ -413,39 +406,22 @@ pub fn resourceCreateGuestBlob(ctx_id: u32, resource_id: u32, blob_flags: u32, p
     // range so one dmaMap call covers it.
     _ = iommu.dmaMap(vg.pci_bus, vg.pci_dev, vg.pci_func, phys_base, size, .{});
 
-    // cmd_phys/resp_phys belong to whoever holds ctrl_lock: build under it.
-    defer present.kickPendingFromTask(); // see sendCmd — runs after the release
-    ctrlq.ctrl_lock.acquire();
-    defer ctrlq.ctrl_lock.release();
-    present.waitAsyncFlushIdleLocked();
-
-    const cmd_dst: [*]volatile u8 = @ptrFromInt(paging.physToVirt(ctrlq.cmd_phys));
-    @memset(cmd_dst[0..4096], 0);
-
-    const cmd: *volatile proto.ResourceCreateBlob = @ptrFromInt(paging.physToVirt(ctrlq.cmd_phys));
-    cmd.hdr = .{ .cmd_type = proto.CMD_RESOURCE_CREATE_BLOB, .ctx_id = ctx_id };
-    cmd.resource_id = resource_id;
-    cmd.blob_mem = proto.BLOB_MEM_GUEST;
-    cmd.blob_flags = blob_flags;
-    cmd.nr_entries = 1;
-    cmd.blob_id = 0;
-    cmd.size = size;
-
-    const entry: *volatile proto.MemEntry = @ptrFromInt(paging.physToVirt(ctrlq.cmd_phys + @sizeOf(proto.ResourceCreateBlob)));
-    entry.* = .{ .addr = phys_base, .length = @truncate(size), .padding = 0 };
-
-    const total_len: u32 = @intCast(@sizeOf(proto.ResourceCreateBlob) + @sizeOf(proto.MemEntry));
-
-    const resp_dst: [*]volatile u8 = @ptrFromInt(paging.physToVirt(ctrlq.resp_phys));
-    @memset(resp_dst[0..48], 0);
-
-    if (!ctrlq.sendCmdViaPhys(total_len, 48)) {
+    const cmd = proto.ResourceCreateBlobOne{
+        .blob = .{
+            .hdr = .{ .cmd_type = proto.CMD_RESOURCE_CREATE_BLOB, .ctx_id = ctx_id },
+            .resource_id = resource_id,
+            .blob_mem = proto.BLOB_MEM_GUEST,
+            .blob_flags = blob_flags,
+            .nr_entries = 1,
+            .size = size,
+        },
+        .entry = .{ .addr = phys_base, .length = @truncate(size), .padding = 0 },
+    };
+    var resp: proto.CtrlHdr = .{};
+    if (!ctrlq.send(std.mem.asBytes(&cmd), std.mem.asBytes(&resp))) {
         debug.klog("[virtio-gpu] createGuestBlob timeout\n", .{});
         return false;
     }
-
-    ctrlq.clflushRange(paging.physToVirt(ctrlq.resp_phys), 48); // gap #2
-    const resp: *const proto.CtrlHdr = @ptrFromInt(paging.physToVirt(ctrlq.resp_phys));
     if (resp.cmd_type != proto.RESP_OK_NODATA) {
         debug.klog("[virtio-gpu] createGuestBlob failed: 0x{X}\n", .{resp.cmd_type});
         return false;

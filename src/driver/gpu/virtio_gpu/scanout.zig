@@ -1,6 +1,7 @@
 //! The guest framebuffer and scanout 0: 2D resources, blob scanout and
 //! mode changes.
 
+const std = @import("std");
 const paging = @import("../../../mm/paging.zig");
 const debug = @import("../../../debug/debug.zig");
 const iommu = @import("../../iommu.zig");
@@ -71,97 +72,55 @@ pub fn resourceCreate2D(resource_id: u32, w: u32, h: u32) bool {
     return ctrlq.sendSimpleCmd(@as([*]const u8, @ptrCast(&cmd)), @sizeOf(proto.ResourceCreate2D));
 }
 
-// Module-scope to keep attachBacking's frame small. 1000 entries × 16 bytes
-// = 16000 bytes. Previously a stack local — Zig ReleaseSafe `undefined`-fills
-// it with 0xAA on entry, and the resulting 16KB memset on desktop's kstack
-// (a) consumed huge frame depth and (b) tripped the kstack_deep watchpoint
-// at 2026-05-17. Guarded by ctrl_lock, which attachBacking holds throughout
-// (setupDisplay reaches it at init and from changeMode at runtime).
-pub var attach_backing_merged: [1000]proto.MemEntry = undefined;
+/// Most scatter-gather entries one ATTACH_BACKING carries: what fits the
+/// large buffer.
+const ATTACH_MAX_ENTRIES: usize = (ctrlq.LARGE_CMD_MAX - @sizeOf(proto.AttachBacking)) / @sizeOf(proto.MemEntry);
 
 pub fn attachBacking(resource_id: u32, pages: []const usize, page_count: u32) bool {
-    // cmd_phys/resp_phys belong to whoever holds ctrl_lock, so build the
-    // command under it.
-    defer present.kickPendingFromTask(); // see sendCmd — runs after the release
-    ctrlq.ctrl_lock.acquire();
-    defer ctrlq.ctrl_lock.release();
-    present.waitAsyncFlushIdleLocked();
-
-    // Merge contiguous physical pages into fewer scatter-gather entries
-    // This keeps the command small enough to fit in one page
-    const merged = &attach_backing_merged;
-    var nr_merged: u32 = 0;
+    const big = ctrlq.largeAcquire() orelse return false;
+    defer big.release();
+    // The entries go straight into the large buffer, contiguous pages
+    // merged into one.
+    const entries: [*]volatile proto.MemEntry = @ptrFromInt(@intFromPtr(big.cmd()) + @sizeOf(proto.AttachBacking));
+    var nr: u32 = 0;
     var i: u32 = 0;
-    while (i < page_count and nr_merged < 1000) {
+    while (i < page_count and nr < ATTACH_MAX_ENTRIES) {
         const start = pages[i];
         var length: usize = 4096;
         i += 1;
         while (i < page_count and pages[i] == start + length) : (i += 1) {
             length += 4096;
         }
-        merged[nr_merged] = .{ .addr = start, .length = @truncate(length), .padding = 0 };
-        nr_merged += 1;
+        entries[nr] = .{ .addr = start, .length = @truncate(length), .padding = 0 };
+        nr += 1;
     }
-    debug.klog("[virtio-gpu] Merged {d} pages into {d} entries\n", .{ page_count, nr_merged });
-
-    // Build command in cmd_phys buffer
-    const cmd_dst: [*]volatile u8 = @ptrFromInt(paging.physToVirt(ctrlq.cmd_phys));
-    @memset(cmd_dst[0..4096], 0);
-
-    const attach: *volatile proto.AttachBacking = @ptrFromInt(paging.physToVirt(ctrlq.cmd_phys));
-    attach.hdr.cmd_type = proto.CMD_RESOURCE_ATTACH_BACKING;
-    attach.resource_id = resource_id;
-    attach.nr_entries = nr_merged;
-
-    const entries: [*]volatile proto.MemEntry = @ptrFromInt(paging.physToVirt(ctrlq.cmd_phys + @sizeOf(proto.AttachBacking)));
-    for (0..nr_merged) |j| {
-        entries[j] = .{ .addr = merged[j].addr, .length = merged[j].length, .padding = 0 };
+    if (i < page_count) {
+        debug.klog("[virtio-gpu] ATTACH_BACKING: {d} pages need more than {d} entries\n", .{ page_count, ATTACH_MAX_ENTRIES });
+        return false;
     }
-
-    const total_len: u32 = @intCast(@sizeOf(proto.AttachBacking) + nr_merged * @sizeOf(proto.MemEntry));
-
-    // Cmd is already built in cmd_phys; zero the response slot then run the
-    // shared descriptor-chain helper.
-    const resp_dst: [*]volatile u8 = @ptrFromInt(paging.physToVirt(ctrlq.resp_phys));
-    @memset(resp_dst[0..@sizeOf(proto.CtrlHdr)], 0);
-    if (!ctrlq.sendCmdViaPhys(total_len, @sizeOf(proto.CtrlHdr))) return false;
-
-    ctrlq.clflushRange(paging.physToVirt(ctrlq.resp_phys), @sizeOf(proto.CtrlHdr)); // gap #2
-    const resp: *const proto.CtrlHdr = @ptrFromInt(paging.physToVirt(ctrlq.resp_phys));
-    if (resp.cmd_type != proto.RESP_OK_NODATA) {
-        debug.klog("[virtio-gpu] ATTACH_BACKING failed: 0x{X}\n", .{resp.cmd_type});
+    debug.klog("[virtio-gpu] Merged {d} pages into {d} entries\n", .{ page_count, nr });
+    const attach: *volatile proto.AttachBacking = @ptrCast(@alignCast(big.cmd()));
+    attach.* = .{ .hdr = .{ .cmd_type = proto.CMD_RESOURCE_ATTACH_BACKING }, .resource_id = resource_id, .nr_entries = nr };
+    const total_len = @sizeOf(proto.AttachBacking) + @as(usize, nr) * @sizeOf(proto.MemEntry);
+    if (!big.run(total_len, @sizeOf(proto.CtrlHdr))) return false;
+    const resp = big.respHdr().cmd_type;
+    if (resp != proto.RESP_OK_NODATA) {
+        debug.klog("[virtio-gpu] ATTACH_BACKING failed: 0x{X}\n", .{resp});
         return false;
     }
     return true;
 }
 
-/// attachBacking for the contiguous staging allocation — one MemEntry, no
-/// per-page array. Unlike the boot-only attachBacking, this quiesces any
-/// in-flight async batch BEFORE staging into cmd_phys (mode changes can
-/// run with async live).
+/// ATTACH_BACKING of one contiguous range (the staging buffer, the cursor).
 pub fn attachBackingContiguous(resource_id: u32, base_phys: usize, npages: u32) bool {
-    ctrlq.ctrl_lock.acquire();
-    defer ctrlq.ctrl_lock.release();
-    present.waitAsyncFlushIdleLocked();
-
-    const cmd_dst: [*]volatile u8 = @ptrFromInt(paging.physToVirt(ctrlq.cmd_phys));
-    @memset(cmd_dst[0..4096], 0);
-    const attach: *volatile proto.AttachBacking = @ptrFromInt(paging.physToVirt(ctrlq.cmd_phys));
-    attach.hdr.cmd_type = proto.CMD_RESOURCE_ATTACH_BACKING;
-    attach.resource_id = resource_id;
-    attach.nr_entries = 1;
-    const entries: [*]volatile proto.MemEntry = @ptrFromInt(paging.physToVirt(ctrlq.cmd_phys + @sizeOf(proto.AttachBacking)));
-    entries[0] = .{ .addr = base_phys, .length = @intCast(@as(usize, npages) * 4096), .padding = 0 };
-    const total_len: u32 = @sizeOf(proto.AttachBacking) + @sizeOf(proto.MemEntry);
-
-    const resp_dst: [*]volatile u8 = @ptrFromInt(paging.physToVirt(ctrlq.resp_phys));
-    @memset(resp_dst[0..@sizeOf(proto.CtrlHdr)], 0);
-    if (!ctrlq.sendCmdViaPhys(total_len, @sizeOf(proto.CtrlHdr))) return false;
-
-    ctrlq.clflushRange(paging.physToVirt(ctrlq.resp_phys), @sizeOf(proto.CtrlHdr)); // gap #2
-    const resp: *const proto.CtrlHdr = @ptrFromInt(paging.physToVirt(ctrlq.resp_phys));
+    const cmd = proto.AttachBackingOne{
+        .attach = .{ .hdr = .{ .cmd_type = proto.CMD_RESOURCE_ATTACH_BACKING }, .resource_id = resource_id, .nr_entries = 1 },
+        .entry = .{ .addr = base_phys, .length = @intCast(@as(usize, npages) * 4096), .padding = 0 },
+    };
+    var resp: proto.CtrlHdr = .{};
+    if (!ctrlq.send(std.mem.asBytes(&cmd), std.mem.asBytes(&resp))) return false;
     if (resp.cmd_type != proto.RESP_OK_NODATA) {
-        debug.klog("[virtio-gpu] staging ATTACH_BACKING failed: 0x{X}\n", .{resp.cmd_type});
+        debug.klog("[virtio-gpu] ATTACH_BACKING of res {d} failed: 0x{X}\n", .{ resource_id, resp.cmd_type });
         return false;
     }
     return true;

@@ -1151,10 +1151,16 @@ fn tearDownTask(pid: usize, status: u32, op: TerminateOp, persist_shared_dirty: 
 
     // Force-release any registered Mutex held by the dying pid. Done
     // BEFORE the cleanup steps below because some of them
-    // (virtio_gpu.ctxDestroy → sendCmd → ctrl_lock.acquire) would
+    // (virtio_gpu.ctxDestroy → the queue's large buffer) would
     // recursively try to acquire a lock the dying pid still owns,
     // deadlocking the entire GPU pipeline. Each released lock logs a
     // [lock-dump] line so the autopsy shows what was stranded.
+    //
+    // First the GPU command slots of a thread killed while waiting on one,
+    // which nobody would ever free: before its locks go, so the large
+    // buffer's next user finds slot 0 freed (or given up, while the device
+    // still holds it).
+    @import("../driver.zig").virtio_gpu.releaseTask(@intCast(pid));
     @import("spinlock.zig").releaseMutexesOwnedBy(@intCast(pid));
 
     // If this thread was parked in blockOn(.nvme_io) inside swap.evictFrame's

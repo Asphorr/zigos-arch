@@ -272,6 +272,18 @@ pub const ResourceCreate3D = extern struct {
     padding: u32 = 0,
 };
 
+/// ATTACH_BACKING of one contiguous range.
+pub const AttachBackingOne = extern struct {
+    attach: AttachBacking,
+    entry: MemEntry,
+};
+
+/// RESOURCE_CREATE_BLOB of one contiguous range of guest memory.
+pub const ResourceCreateBlobOne = extern struct {
+    blob: ResourceCreateBlob,
+    entry: MemEntry,
+};
+
 pub const TransferHost3D = extern struct {
     hdr: CtrlHdr = .{},
     box_x: u32 = 0,
@@ -296,7 +308,8 @@ comptime {
         .{ GetCapsetInfo, 32 },     .{ RespCapsetInfo, 40 },    .{ GetCapset, 32 },
         .{ RespResourceUuid, 40 },  .{ CtxCreate, 96 },         .{ CtxResource, 32 },
         .{ CmdSubmit3D, 32 },       .{ ResourceCreateBlob, 56 }, .{ ResourceMapBlob, 40 },
-        .{ ResourceCreate3D, 72 },  .{ TransferHost3D, 72 },
+        .{ ResourceCreate3D, 72 },  .{ TransferHost3D, 72 },    .{ AttachBackingOne, 48 },
+        .{ ResourceCreateBlobOne, 72 },
     };
     for (sizes) |s| {
         @setEvalBranchQuota(10_000);

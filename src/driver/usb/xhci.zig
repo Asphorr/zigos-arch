@@ -975,7 +975,7 @@ fn waitForEvent(event_type: u8, max_polls: u32) ?TRB {
         // arriving between the cycle-bit check and the sti;hlt is consumed
         // by the dummy xhciIrqHandler and we sleep until the next 10ms
         // LAPIC tick, inflating per-USB-op latency by 10×. Same pattern
-        // as nvme.waitCompletion / virtio_gpu.sendCmdViaPhys.
+        // as nvme.waitCompletion.
         var hlt_count: u32 = 0;
         while (hlt_count < 200) {
             asm volatile ("cli" ::: .{ .memory = true });

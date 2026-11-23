@@ -434,7 +434,7 @@ fn issueCommand(port: u8, cmd: u8, lba: u64, sectors: u16, buf_phys: usize, is_w
     // cli-around-check + atomic sti;hlt — without the cli, an IRQ arriving
     // between the ci-bit check and the sti;hlt is consumed by the dummy
     // ahciIrqHandler and we sleep until the next 10ms LAPIC tick. Same
-    // pattern as nvme.waitCompletion / virtio_gpu.sendCmdViaPhys.
+    // pattern as nvme.waitCompletion.
     spin = 0;
     while (true) {
         if (use_msix) asm volatile ("cli" ::: .{ .memory = true });

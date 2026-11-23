@@ -18,7 +18,7 @@
 //        vfs.loadFileFresh(file_i) → free pages → repeat.
 //      Cycles through a short file list so allocCid sees varied cids.
 //   2. Main task issues a dirty-rect virtio_gpu flush every iter,
-//      driving sendSimpleCmdPair under ctrl_lock pressure.
+//      driving the present path under queue pressure.
 //   3. Main task yields ~5 ms between iters so workers run.
 //   4. Progress is logged every 256 iters; final summary at end.
 
@@ -107,7 +107,7 @@ pub fn taskEntry() callconv(.c) noreturn {
     var flushes_attempted: u64 = 0;
     while (iter < ITERATIONS) : (iter += 1) {
         // GPU pressure — flush a small dirty rect every iter. Drives
-        // sendSimpleCmdPair under contention with worker NVMe loads.
+        // the present path under contention with worker NVMe loads.
         // Even when nothing changed visually the cmds still go out;
         // that's exactly the contention we want.
         if (virtio_gpu.active) {
