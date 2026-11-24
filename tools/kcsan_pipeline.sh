@@ -79,7 +79,7 @@ llc-20 \
 
 echo "[kcsan] stage 6/6: ld → kernel.elf"
 nasm -f elf64 src/boot/boot.asm -o "$WORK/boot.o"
-nasm -f elf64 src/boot/ap_trampoline.asm -o "$WORK/ap_trampoline.o"
+nasm -f elf64 -i src/boot src/boot/ap_trampoline.asm -o "$WORK/ap_trampoline.o"
 
 ld -T src/linker.ld -nostdlib \
     "$WORK/boot.o" \

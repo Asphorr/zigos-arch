@@ -4,8 +4,8 @@
 // Resume (CP2b) is the hard half: on S3 wake the CPU comes back in 16-bit real
 // mode with GDT/IDT/TR/MSRs/control-regs all reset, so the kernel cannot simply
 // "return" from the SLP_EN write. The FACS firmware_waking_vector points at a
-// real->long-mode trampoline (src/boot/wake_trampoline.asm, a near-copy of the
-// proven AP bring-up trampoline) which re-enters 64-bit kernel code here.
+// real->long-mode trampoline (src/boot/wake_trampoline.asm, the same climb as
+// the AP startup trampoline) which re-enters 64-bit kernel code here.
 //
 // CP2b-2 (this step): full restore -> usable resume. s3ResumeEntry re-establishes
 // the BSP CPU state (smp.reinitForS3Resume, mirroring apEntry) and longjmps back
@@ -26,17 +26,10 @@ const virtio_gpu = @import("../driver.zig").virtio_gpu;
 const xhci = @import("../driver.zig").xhci;
 const nvme = @import("../driver.zig").nvme;
 
-// Fixed low phys, < 1 MiB: the FACS 32-bit waking vector and the real-mode entry
-// both require it. RAM is preserved across S3, so the blob + slots survive the
-// suspend. Its own page is distinct from the AP trampoline's 0x8000 so SMP
-// re-bring-up on resume never clobbers it. KEEP IN SYNC with wake_trampoline.asm.
-const WAKE_TRAMP_BASE = 0x9000;
-const WAKE_ENTRY_SLOT = 0x9FE8;
-const WAKE_PML4_SLOT = 0x9FF0;
-const WAKE_STACK_SLOT = 0x9FF8;
-
-extern const wake_trampoline_start: u8;
-extern const wake_trampoline_end: u8;
+// `.wake`: the firmware enters it in real mode, so it lives in low memory,
+// which S3 preserves. Its page is not the AP trampoline's: AP re-online on
+// resume rewrites that one.
+const trampoline = @import("../boot/trampoline.zig");
 
 // Stack the trampoline hands to s3ResumeEntry. Kernel BSS (high VA), mapped by
 // the resume CR3's shared kernel half.
@@ -48,7 +41,7 @@ var resume_stack: [16384]u8 align(16) = undefined;
 // suspendToRam's resume branch as if s3_save_context had returned 1. Only
 // callee-saved regs + rsp/rip/rflags survive the round trip — the resume branch
 // must not rely on any caller-saved value computed before the suspend (it
-// doesn't). Field order/offsets MUST match the asm in wake_trampoline.asm.
+// doesn't). Layout == JMPBUF_* in wake_trampoline.asm.
 const JmpBuf = extern struct {
     rbx: u64 = 0,
     rbp: u64 = 0,
@@ -203,22 +196,9 @@ fn installLowIdentity() ?u64 {
     return cr3 & paging.PAGE_MASK;
 }
 
-/// Copy the wake trampoline blob to WAKE_TRAMP_BASE (through the physmap) and
-/// populate its data slots.
 fn installWakeTrampoline(resume_cr3: u64) void {
-    const blob: [*]const u8 = @ptrCast(&wake_trampoline_start);
-    const size = @intFromPtr(&wake_trampoline_end) - @intFromPtr(&wake_trampoline_start);
-    if (size > WAKE_ENTRY_SLOT - WAKE_TRAMP_BASE)
-        @panic("s3: wake trampoline blob overran its data slots (0x9000..0x9FE8)");
-    const dest: [*]u8 = @ptrFromInt(paging.physToVirt(WAKE_TRAMP_BASE));
-    @memcpy(dest[0..size], blob[0..size]);
-
-    const entry: *volatile u64 = @ptrFromInt(paging.physToVirt(WAKE_ENTRY_SLOT));
-    entry.* = @intCast(@intFromPtr(&s3ResumeEntry));
-    const pml4: *volatile u64 = @ptrFromInt(paging.physToVirt(WAKE_PML4_SLOT));
-    pml4.* = resume_cr3;
-    const stack: *volatile u64 = @ptrFromInt(paging.physToVirt(WAKE_STACK_SLOT));
-    stack.* = @intCast(@intFromPtr(&resume_stack) + resume_stack.len);
+    trampoline.install(.wake);
+    trampoline.arm(.wake, &s3ResumeEntry, resume_cr3, @intFromPtr(&resume_stack) + resume_stack.len);
 }
 
 /// Kernel side of `shutdown -s` (sysShutdown mode 2). Stages the resume path,
@@ -274,7 +254,7 @@ pub fn suspendToRam() u32 {
         return common.E_NOSYS;
     }
     installWakeTrampoline(resume_cr3);
-    facs.firmware_waking_vector = WAKE_TRAMP_BASE;
+    facs.firmware_waking_vector = trampoline.phys(.wake);
     facs.x_firmware_waking_vector = 0; // force the 32-bit real-mode entry
 
     // Pre-suspend AP quiesce (CP2b-2c): park every AP at a lock-free safe point so
@@ -298,7 +278,7 @@ pub fn suspendToRam() u32 {
     if (s3_save_context(&s3_ctx) == 0) {
         const word_a = sleepWord(s3.a);
         const word_b = sleepWord(s3.b);
-        serial.print("[s3] suspending: wake_vector=0x{x} resume_cr3=0x{x}; PM1a_CNT port=0x{x} <- 0x{x}\n", .{ @as(u64, WAKE_TRAMP_BASE), resume_cr3, @as(u16, @truncate(f.pm1a_cnt_blk)), word_a });
+        serial.print("[s3] suspending: wake_vector=0x{x} resume_cr3=0x{x}; PM1a_CNT port=0x{x} <- 0x{x}\n", .{ trampoline.phys(.wake), resume_cr3, @as(u16, @truncate(f.pm1a_cnt_blk)), word_a });
         // Last marker that reliably lands before the CPU halts (raw, see rawDbg).
         rawDbg("[s3] SLP_EN -> platform suspends\r\n");
 

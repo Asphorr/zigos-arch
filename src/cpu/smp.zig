@@ -43,22 +43,9 @@ pub const PathCacheEntry = struct {
     epoch: u64 = 0,
 };
 
-/// Phys address the AP trampoline blob is copied to before SIPI. Must
-/// match `AP_TRAMP_BASE` in src/boot/ap_trampoline.asm.
-const TRAMPOLINE_ADDR: usize = 0x8000;
-
-/// AP trampoline data slots — populated by BSP, read by trampoline. Each
-/// is a u64 at a fixed phys offset within the 0x8000-page that holds the
-/// blob; the trampoline itself is well under 0xFE8 bytes so the slots sit
-/// past its tail. KEEP IN SYNC with the `%define`s in ap_trampoline.asm —
-/// drift here = AP loads CR3 from the apEntry slot or vice versa, which
-/// presents as a wedged AP at SIPI time.
-const AP_ENTRY_SLOT: usize = 0x8FE8; // u64: &apEntry (kernel VA)
-const AP_PML4_SLOT: usize = 0x8FF0; // u64: kernel PML4 phys addr
-const AP_STACK_SLOT: usize = 0x8FF8; // u64: kstack top (16-aligned)
-/// Real-mode SIPI vector. Encodes the trampoline page number: physical
-/// load address = vector << 12. Matches TRAMPOLINE_ADDR.
-const AP_SIPI_VECTOR: u8 = TRAMPOLINE_ADDR >> 12;
+/// `.ap`: an AP enters it from INIT-SIPI-SIPI and leaves it in long mode, in
+/// the entry `arm` gave it.
+const trampoline = @import("../boot/trampoline.zig");
 
 pub const CpuLocal = struct {
     cpu_id: u8 = 0,
@@ -686,30 +673,11 @@ pub fn init() void {
     smp_initialized = true;
     benchCpuIdRead();
 
-    // Copy trampoline to phys 0x8000. The AP boots in 16-bit real mode
-    // and starts execution at this physical address; the kernel writes
-    // through the physmap so the copy works without the legacy low identity.
-    const trampoline: [*]const u8 = @ptrCast(&ap_trampoline_start);
-    const trampoline_size = @intFromPtr(&ap_trampoline_end) - @intFromPtr(&ap_trampoline_start);
-    // The blob must not grow into the BSP-populated data slots that share its
-    // 0x8000 page (AP_ENTRY_SLOT, the lowest, sits at 0x8FE8). If it did, the
-    // memcpy below would overwrite the entry pointer the instant after we write
-    // it, and the AP would `call` a garbage address. NASM's preprocessor can't
-    // compare label offsets, so the guard lives here — it fires at boot, before
-    // any SIPI, with a clear panic instead of a wild AP jump.
-    if (trampoline_size > AP_ENTRY_SLOT - TRAMPOLINE_ADDR)
-        @panic("smp: AP trampoline blob overran its data slots (0x8000..0x8FE8)");
-    const dest: [*]u8 = @ptrFromInt(paging.physToVirt(TRAMPOLINE_ADDR));
-    @memcpy(dest[0..trampoline_size], trampoline[0..trampoline_size]);
+    trampoline.install(.ap);
 
-    // Write data area for trampoline (0x8FE0-0x8FFF)
     const pml4_phys = paging.getKernelPML4Phys();
-    // The trampoline loads CR3 with a 32-bit `mov eax, [AP_PML4_SLOT]` (it's in
-    // 32-bit protected mode at that point), so the kernel PML4 phys MUST fit in
-    // 32 bits or the AP loads a truncated CR3 and triple-faults. Holds for the
-    // Multiboot path (pml4 ~1 MB) and normally for UEFI, but the UEFI allocator
-    // isn't architecturally bound to < 4 GB — assert it rather than risk a
-    // silent triple-fault on some firmware.
+    // The AP loads CR3 in 32-bit mode. Holds for Multiboot (pml4 ~1 MiB) and
+    // normally for UEFI, but the UEFI allocator does not promise < 4 GiB.
     if (pml4_phys >= 0x1_0000_0000)
         @panic("smp: kernel PML4 phys >= 4GB — AP 32-bit CR3 load would truncate");
 
@@ -725,35 +693,10 @@ pub fn init() void {
     while (ap_idx < ap_count) : (ap_idx += 1) {
         const ap_id: u8 = ap_ids[ap_idx];
 
-        // Allocate AP kernel stack
+        // The AP runs on its isr_stack until apEntry dispatches into its idle.
         const stack_top = @intFromPtr(&cpus[ap_id].isr_stack) + cpus[ap_id].isr_stack.len;
-
-        // Write trampoline data area (volatile u64 writes at fixed addresses).
-        // The 0x8FE0 slot used to hold the kernel GDT pointer for the long-mode
-        // far jump, but the trampoline now uses its own embedded ap_gdt for
-        // that — a 32-bit `lgdt` couldn't load the higher-half kernel GDT
-        // base anyway, since it truncates to 32 bits. apEntry installs the
-        // per-CPU GDT later via initPerCpuGdt.
-        // Slots are written through the physmap; the trampoline reads them
-        // directly via their phys addresses from inside its 32-bit / 64-bit
-        // bring-up path.
-        const ap_entry_ptr: *volatile u64 = @ptrFromInt(paging.physToVirt(AP_ENTRY_SLOT));
-        ap_entry_ptr.* = @intFromPtr(&apEntry);
-        const pml4_ptr: *volatile u64 = @ptrFromInt(paging.physToVirt(AP_PML4_SLOT));
-        pml4_ptr.* = pml4_phys;
-        const stack_ptr: *volatile u64 = @ptrFromInt(paging.physToVirt(AP_STACK_SLOT));
-        stack_ptr.* = stack_top;
-
-        // Send INIT IPI
-        apic.sendInitIPI(ap_id);
-
-        // Wait ~10ms (spin on tick count — interrupts are enabled)
-        busyWait(10);
-
-        // Send SIPI twice (vector encodes phys page of trampoline)
-        apic.sendSIPI(ap_id, AP_SIPI_VECTOR);
-        busyWait(1);
-        apic.sendSIPI(ap_id, AP_SIPI_VECTOR);
+        trampoline.arm(.ap, &apEntry, pml4_phys, stack_top);
+        sendInitSipiSipi(ap_id);
 
         // Wait for AP to ACK the SIPI (apEntry start) — short window, then
         // for alive (apEntry full init done) — longer window. Splitting
@@ -780,10 +723,10 @@ pub fn init() void {
             debug.klog("[smp] AP {d} STARTED BUT HUNG (LAPIC ID={d}, ack={d}ms, no alive in {d}ms) — likely init crash\n", .{ ap_idx, ap_id, ack_ms, alive_ms });
             if (acpi.getMadt() == null) break;
         } else {
-            // Never reached apEntry at all. SIPI was lost or AP didn't
-            // start. On real HW: BIOS/MADT inconsistency, INIT-SIPI delay
-            // too short for the chipset, or wrong vector decoding.
-            debug.klog("[smp] AP {d} NO SIPI ACK (LAPIC ID={d}, {d}ms timeout) — never entered apEntry\n", .{ ap_idx, ap_id, ack_ms });
+            // The trampoline's progress tells a lost SIPI (BIOS/MADT
+            // mismatch, INIT-SIPI delay too short for the chipset) from an
+            // AP that ran it but never got as far as the ack in apEntry.
+            debug.klog("[smp] AP {d} NO SIPI ACK (LAPIC ID={d}, {d}ms timeout; trampoline {s})\n", .{ ap_idx, ap_id, ack_ms, trampoline.describeProgress(.ap) });
             if (acpi.getMadt() == null) break;
         }
     }
@@ -795,6 +738,16 @@ pub fn init() void {
     // tick (and, later, from device MSI-X top-halves) defers heavy completion
     // work here instead of running it in IF=0 hard-IRQ context.
     @import("../irq/softirq.zig").startAll();
+}
+
+/// Starts `lapic_id` in the armed AP trampoline.
+fn sendInitSipiSipi(lapic_id: u8) void {
+    const vector: u8 = @intCast(trampoline.phys(.ap) >> 12);
+    apic.sendInitIPI(lapic_id);
+    busyWait(10);
+    apic.sendSIPI(lapic_id, vector);
+    busyWait(1);
+    apic.sendSIPI(lapic_id, vector);
 }
 
 fn busyWait(ms: u32) void {
@@ -929,7 +882,7 @@ export fn apEntry() callconv(.c) noreturn {
 
 /// AP entry point for the S3-resume re-online path (CP2b-2b) — called from the
 /// SAME trampoline blob at 0x8000, but reached via `reonlineApsForS3Resume`
-/// pointing AP_ENTRY_SLOT here instead of at `apEntry`. Identical per-CPU
+/// arming it with this entry instead of `apEntry`. Identical per-CPU
 /// bring-up, but REUSES this CPU's idle PCB (which survived S3 in RAM) instead
 /// of creating a new one — `createKernelIdle` would allocate a fresh PCB slot
 /// every resume and leak the old one. The surviving PCB's saved context is stale
@@ -1105,15 +1058,9 @@ pub fn reonlineApsForS3Resume(resume_cr3: u64) void {
         return;
     }
 
-    // Re-copy the trampoline blob to 0x8000. Low memory [0,1 MiB) is PMM-reserved
-    // so it almost certainly survived S3, but re-copy for determinism (and to
-    // re-run the overrun guard) — mirrors init().
-    const trampoline: [*]const u8 = @ptrCast(&ap_trampoline_start);
-    const trampoline_size = @intFromPtr(&ap_trampoline_end) - @intFromPtr(&ap_trampoline_start);
-    if (trampoline_size > AP_ENTRY_SLOT - TRAMPOLINE_ADDR)
-        @panic("smp: AP trampoline blob overran its data slots (0x8000..0x8FE8)");
-    const dest: [*]u8 = @ptrFromInt(paging.physToVirt(TRAMPOLINE_ADDR));
-    @memcpy(dest[0..trampoline_size], trampoline[0..trampoline_size]);
+    // Low memory is PMM-reserved and almost certainly survived S3; re-copy
+    // anyway, so resume never depends on what the firmware left there.
+    trampoline.install(.ap);
 
     const bsp_id: u8 = @truncate(apic.getLapicId());
     var ap_ids: [MAX_CPUS]u8 = undefined;
@@ -1130,23 +1077,11 @@ pub fn reonlineApsForS3Resume(resume_cr3: u64) void {
         @atomicStore(bool, &cpus[ap_id].sipi_acked, false, .release);
         @atomicStore(bool, &cpus[ap_id].alive, false, .release);
 
-        // Trampoline data slots: re-enter via apEntryS3Resume, load the live
-        // resume CR3 (NOT the kernel master PML4 — its low identity was dropped
-        // at boot; resume_cr3 still maps 0x8000), reuse the AP's isr_stack for
-        // bring-up (abandoned once it dispatches into idle, same as boot).
+        // resume_cr3, not the kernel master PML4: the master lost its low
+        // identity at boot, resume_cr3 still maps the trampoline page.
         const stack_top = @intFromPtr(&cpus[ap_id].isr_stack) + cpus[ap_id].isr_stack.len;
-        const ap_entry_ptr: *volatile u64 = @ptrFromInt(paging.physToVirt(AP_ENTRY_SLOT));
-        ap_entry_ptr.* = @intFromPtr(&apEntryS3Resume);
-        const pml4_ptr: *volatile u64 = @ptrFromInt(paging.physToVirt(AP_PML4_SLOT));
-        pml4_ptr.* = resume_cr3;
-        const stack_ptr: *volatile u64 = @ptrFromInt(paging.physToVirt(AP_STACK_SLOT));
-        stack_ptr.* = stack_top;
-
-        apic.sendInitIPI(ap_id);
-        busyWait(10);
-        apic.sendSIPI(ap_id, AP_SIPI_VECTOR);
-        busyWait(1);
-        apic.sendSIPI(ap_id, AP_SIPI_VECTOR);
+        trampoline.arm(.ap, &apEntryS3Resume, resume_cr3, stack_top);
+        sendInitSipiSipi(ap_id);
 
         // Wait for the AP to come back alive (apEntryS3Resume reached its end).
         var ms: u32 = 0;
@@ -1158,7 +1093,7 @@ pub fn reonlineApsForS3Resume(resume_cr3: u64) void {
             brought += 1;
             debug.klog("[smp] S3 re-online: AP {d} back ({d}ms)\n", .{ ap_id, ms });
         } else {
-            debug.klog("[smp] S3 re-online: AP {d} did NOT come back ({d}ms timeout)\n", .{ ap_id, ms });
+            debug.klog("[smp] S3 re-online: AP {d} did NOT come back ({d}ms timeout; trampoline {s})\n", .{ ap_id, ms, trampoline.describeProgress(.ap) });
         }
     }
     debug.klog("[smp] S3 re-online: {d}/{d} AP(s) back, {d} CPU(s) online\n", .{ brought, ap_count, cpu_count });
@@ -1616,7 +1551,3 @@ pub fn apProcessLoadQueue() void {
     // appears delayed by up to the next wakeup.
     @import("../ui/desktop/wake.zig").requestWake();
 }
-
-// External symbols from ap_trampoline.asm
-extern const ap_trampoline_start: u8;
-extern const ap_trampoline_end: u8;

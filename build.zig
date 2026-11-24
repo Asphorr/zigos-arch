@@ -188,16 +188,19 @@ pub fn build(b: *std.Build) void {
     const boot_obj = nasm.addOutputFileArg("boot.o");
     kernel.root_module.addObjectFile(boot_obj);
 
-    // AP trampoline for SMP
+    // AP startup and S3 wake trampolines: one body, src/boot/trampoline.inc.
+    // The .inc is an input of its own, for the same cache reason as above.
     const nasm_ap = b.addSystemCommand(&.{ "nasm", "-f", "elf64" });
+    nasm_ap.addPrefixedDirectoryArg("-i", b.path("src/boot"));
+    nasm_ap.addFileInput(b.path("src/boot/trampoline.inc"));
     nasm_ap.addFileArg(b.path("src/boot/ap_trampoline.asm"));
     nasm_ap.addArg("-o");
     const ap_obj = nasm_ap.addOutputFileArg("ap_trampoline.o");
     kernel.root_module.addObjectFile(ap_obj);
 
-    // S3 (suspend-to-RAM) wake trampoline — same real->long-mode bring-up as the
-    // AP trampoline, installed as the FACS firmware_waking_vector on resume.
     const nasm_wake = b.addSystemCommand(&.{ "nasm", "-f", "elf64" });
+    nasm_wake.addPrefixedDirectoryArg("-i", b.path("src/boot"));
+    nasm_wake.addFileInput(b.path("src/boot/trampoline.inc"));
     nasm_wake.addFileArg(b.path("src/boot/wake_trampoline.asm"));
     nasm_wake.addArg("-o");
     const wake_obj = nasm_wake.addOutputFileArg("wake_trampoline.o");

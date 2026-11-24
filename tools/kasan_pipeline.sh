@@ -88,7 +88,7 @@ echo "[kasan] stage 6/6: ld → kernel.elf"
 # boot.o and ap_trampoline.o come from nasm; build.zig still drives those.
 # We expect them under .zig-cache somewhere — find them or rebuild here.
 nasm -f elf64 src/boot/boot.asm -o "$WORK/boot.o"
-nasm -f elf64 src/boot/ap_trampoline.asm -o "$WORK/ap_trampoline.o"
+nasm -f elf64 -i src/boot src/boot/ap_trampoline.asm -o "$WORK/ap_trampoline.o"
 
 ld -T src/linker.ld -nostdlib \
     "$WORK/boot.o" \
