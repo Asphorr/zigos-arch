@@ -298,9 +298,9 @@ export fn handleException(rsp: u64) callconv(.c) void {
         serial.print("[mce] FATAL: PCC set on at least one bank — kernel state corrupt\n", .{});
     }
 
-    // Wild-RIP hunt (task #224). Same idea as handleIRQ0: validate the saved
-    // RIP just before iretq returns to user mode.
-    defer @import("../../debug/kdbg.zig").validateUserReturnIretq(words, rip_index, rip_index + 1);
+    // Wild-RIP hunt (task #224). Same idea as handleIRQ0: a RIP set during
+    // the handler is checked just before iretq returns to user mode.
+    defer @import("../../debug/kdbg.zig").validateUserReturnIretq(words, rip_index, rip_index + 1, saved_rip);
 
     // iretq-frame tripwire (task #230) — exception version. See handleIRQ0
     // for design notes.

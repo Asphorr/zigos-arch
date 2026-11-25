@@ -962,8 +962,8 @@ const HandlerLayout = struct {
 /// the task gave sigaction. Past the window's end the return to it faults
 /// in the kernel — sysret to a non-canonical RIP in ring 0 on the user's
 /// RSP, iretq to one before it leaves; under its start nothing is ever
-/// mapped, and the interrupt-return checks (SAFE_IRETQ,
-/// kdbg.validateUserReturnIretq) take such a RIP for a corrupted frame.
+/// mapped, and kdbg.validateUserReturnIretq takes a RIP the kernel set
+/// outside the window for a corrupted frame.
 fn layoutHandlerFrame(handler: u64, user_rsp: u64, want_siginfo: bool) ?HandlerLayout {
     if (!memmap.isUserDataAddr(handler)) return null;
     const sinfo_size: u64 = if (want_siginfo) @sizeOf(Siginfo) else 0;

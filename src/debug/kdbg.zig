@@ -425,24 +425,32 @@ inline fn ripIsValidUser(rip: u64) bool {
 }
 
 /// Call from `defer` at the end of every handleIRQ0 / handleException path
-/// that may iretq back to user. CS=0x23 means user-mode return; if RIP is
-/// outside the user VA window, dump everything and panic right HERE — that
-/// freezes the kernel stack with the writer's call path still on it.
+/// that may iretq back to user. CS=0x23 means user-mode return; if RIP was
+/// set outside the user VA window, dump everything and panic right HERE —
+/// that freezes the kernel stack with the writer's call path still on it.
+///
+/// `entry_rip` is the RIP the frame came in with, and that one is the
+/// task's own, wherever it points: a jump or a return to an address outside
+/// the window succeeds, and the fetch there faults. That fault, and any
+/// interrupt taken before it, has the address in its frame. What is checked
+/// is a RIP the handler leaves changed — the kernel sets one for a signal
+/// handler, and checks it against the window before it does.
 ///
 /// `rip_index` and `cs_index` are the offsets of saved RIP/CS in
 /// frame_base (handleIRQ0 uses 15/16; handleException uses 17/18 because
 /// the ISR stub also pushed int_no and error_code).
-pub fn validateUserReturnIretq(frame_base: [*]const u64, comptime rip_index: usize, comptime cs_index: usize) void {
+pub fn validateUserReturnIretq(frame_base: [*]const u64, comptime rip_index: usize, comptime cs_index: usize, entry_rip: u64) void {
     const cs = frame_base[cs_index];
     if (cs != 0x23) return; // returning to kernel, nothing to check
     const rip = frame_base[rip_index];
-    if (ripIsValidUser(rip)) return;
+    if (rip == entry_rip or ripIsValidUser(rip)) return;
 
     const lbr_snap = @import("lbr.zig").snapshot();
     const id = currentCpuId();
 
     serial.print("\n!!! WILD RIP about to iretq to user-mode (cpu={d}) !!!\n", .{id});
     serial.print("  frame_addr   = 0x{X:0>16}\n", .{@intFromPtr(&frame_base[rip_index])});
+    serial.print("  RIP at entry = 0x{X:0>16}\n", .{entry_rip});
     serial.print("  saved RIP    = 0x{X:0>16} ", .{rip});
     safeSymbolPrint(rip);
     serial.print("  <-- not in user range [0x{X}, 0x{X})\n", .{ memmap.USER_SPACE_START, memmap.USER_SPACE_END });

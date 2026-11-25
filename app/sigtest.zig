@@ -12,6 +12,13 @@
 // ring 0, so the kernel has to refuse it: the child that asks must die, and
 // the kernel must live to say so.
 //
+// Then the way a task gets outside the user window with no help: it jumps
+// there. The jump succeeds and the fetch faults, and until it does that
+// address is the task's RIP — in the fault's frame, and in the frame of any
+// interrupt that comes first. The kernel must take neither for a frame it
+// corrupted: the child jumps, catches the SIGSEGV, returns to the same
+// address, and does so until timer ticks have landed on it.
+//
 // Each handler prints a line and bumps a global counter. The driver checks
 // the counter after each step and aborts on mismatch. Final result line is
 // `[sigtest] OK` (green) or `[sigtest] FAIL: <step>` (red).
@@ -69,6 +76,55 @@ fn childMustDie(step: []const u8, comptime ask: fn () void) void {
     if (status == 0) fail(step);
 }
 
+/// Canonical addresses no task runs at: under the user window, past its
+/// end, in the kernel's half.
+const OUTSIDE = [_]u64{ 0x800, 0x0000_7FFF_FFFF_0000, 0xFFFF_FFFF_8010_0000 };
+/// Faults taken at each: some hundred milliseconds of them.
+const OUTSIDE_ROUNDS: u32 = 100_000;
+
+export var outside_where: u64 = 0;
+var outside_left: u32 = 0;
+
+fn jumpAgain() callconv(.naked) noreturn {
+    asm volatile (
+        \\ movq outside_where(%%rip), %%rax
+        \\ jmp *%%rax
+    );
+}
+
+/// The fault's frame has the jump's target for its rip. Under the window
+/// sigreturn goes back there, and the fetch faults again. Past the window's
+/// end sigreturn refuses the address, so the frame is pointed at the jump.
+export fn handleOutside(signo: u32, info: *anyopaque, uc: *MContext) void {
+    _ = info;
+    _ = signo;
+    outside_left -= 1;
+    if (outside_left == 0) libc.exitWith(0);
+    if (uc.rip != outside_where) libc.exitWith(3);
+    if (outside_where >= 0x1_0000) uc.rip = @intFromPtr(&jumpAgain);
+}
+
+/// A child jumps to `where` and must live through OUTSIDE_ROUNDS faults
+/// there.
+fn jumpOutside(where: u64) void {
+    const pid = libc.fork();
+    if (pid == 0) {
+        outside_where = where;
+        outside_left = OUTSIDE_ROUNDS;
+        const act: libc.SigAction = .{ .handler = @intFromPtr(&handleOutside) };
+        if (libc.sigaction(libc.SIGSEGV, &act, null) != 0) libc.exitWith(1);
+        asm volatile ("jmp *%[again]"
+            :
+            : [again] "r" (@intFromPtr(&jumpAgain)),
+        );
+        libc.exitWith(2);
+    }
+    if (pid > 0x7FFF_FFFF) fail("step 6 (fork)");
+    var status: u32 = 1;
+    if (libc.waitpid(pid, &status) != pid) fail("step 6 (waitpid)");
+    if (status != 0) fail("step 6 (the child that jumped outside the user window did not live)");
+}
+
 var sigusr1_count: u32 = 0;
 var sigint_count: u32 = 0;
 var sigsegv_caught: bool = false;
@@ -105,7 +161,7 @@ export fn handleSegv(signo: u32, info: *anyopaque, uc: *anyopaque) void {
     _ = signo;
     sigsegv_caught = true;
     libc.print("[sigtest] caught SIGSEGV — exiting\n");
-    libc.print("\x1b[32m[sigtest] OK (raise/kill/alarm/refused returns/segv)\x1b[0m\n");
+    libc.print("\x1b[32m[sigtest] OK (raise/kill/alarm/refused returns/jumps outside/segv)\x1b[0m\n");
     libc.exitWith(0xCAFE0045);
 }
 
@@ -160,12 +216,16 @@ export fn _start() linksection(".text.entry") callconv(.c) void {
     libc.print("[sigtest] step 5: sigreturn to a non-canonical address\n");
     childMustDie("step 5 (the child that sigreturned nowhere lived)", sigreturnNowhere);
 
-    // 6. NULL deref — kernel raises SIGSEGV from the page-fault handler;
+    // 6. A RIP outside the user window that is the task's own doing.
+    libc.print("[sigtest] step 6: jumps outside the user window\n");
+    for (OUTSIDE) |where| jumpOutside(where);
+
+    // 7. NULL deref — kernel raises SIGSEGV from the page-fault handler;
     //    our handler exits with the OK message. If we reach the line below,
     //    the SIGSEGV signal didn't fire OR the handler returned without
     //    exiting (which would re-fault forever — kernel should kill us).
-    libc.print("[sigtest] step 6: NULL deref → SIGSEGV\n");
+    libc.print("[sigtest] step 7: NULL deref → SIGSEGV\n");
     const p: *allowzero volatile u8 = @ptrFromInt(0x0);
     p.* = 0;
-    fail("step 6 (NULL deref didn't trap)");
+    fail("step 7 (NULL deref didn't trap)");
 }

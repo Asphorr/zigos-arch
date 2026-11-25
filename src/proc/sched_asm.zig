@@ -203,11 +203,14 @@ fn softYieldRaw() void {
 ///
 /// Asserts that the iretq frame at the top of the kernel stack is
 /// well-formed before letting the CPU consume it:
-///   - RIP (RSP+0) >= 0x1000 — wild values like 0x3, 0x40, 0x37F
-///     fail this. (CS=0x08 alone is insufficient — the wild-iretq-frame
-///     bug hit with valid CS but RIP=0x3.)
 ///   - CS (RSP+8) is 0x08 (kernel) or 0x23 (user) — anything else is
 ///     a corrupt frame.
+///   - a kernel frame's RIP (RSP+0) >= 0x1000 — wild values like 0x3,
+///     0x40, 0x37F fail this. (CS=0x08 alone is insufficient — the
+///     wild-iretq-frame bug hit with valid CS but RIP=0x3.) A user
+///     frame's RIP is the task's: it may have jumped anywhere, a page it
+///     can never map included, and been interrupted before the fetch
+///     faulted.
 ///
 /// On match: `iretq`. On mismatch: `jmp isr_iretq_corrupt_panic` with the
 /// frame's address — the panic cannot find it by its own RSP, which its
@@ -215,12 +218,12 @@ fn softYieldRaw() void {
 /// volatile` block, so concatenating this constant into multiple stubs
 /// doesn't cause symbol clashes.
 pub const SAFE_IRETQ = "\n" ++
-    \\ cmpq $0x1000, 0(%%rsp)
-    \\ jb 2f
-    \\ cmpq $0x08, 8(%%rsp)
-    \\ je 1f
     \\ cmpq $0x23, 8(%%rsp)
     \\ je 1f
+    \\ cmpq $0x08, 8(%%rsp)
+    \\ jne 2f
+    \\ cmpq $0x1000, 0(%%rsp)
+    \\ jae 1f
     \\ 2:
     \\ movq %%rsp, %%rdi
     \\ jmp isr_iretq_corrupt_panic

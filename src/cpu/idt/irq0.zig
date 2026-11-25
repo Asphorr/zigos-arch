@@ -129,13 +129,12 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
     const words: [*]const u64 = @ptrFromInt(rsp);
     const rip_index = comptime tick.iretqIndex(.rip);
 
-    // Wild-RIP hunt (task #224). Validate the saved RIP is in the user VA
-    // range whenever we're about to iretq back to user mode. If something
-    // wrote 0x80000C (or any non-user value) into frame.rip during this IRQ,
-    // we panic HERE with the kernel stack still loaded — instead of letting
-    // the bad RIP cause a #GP after iretq, by which point the kernel call
-    // path that wrote it is gone.
-    defer @import("../../debug/kdbg.zig").validateUserReturnIretq(words, rip_index, rip_index + 1);
+    // Wild-RIP hunt (task #224). If something wrote 0x80000C (or any
+    // non-user value) into frame.rip during this IRQ and we're about to
+    // iretq back to user mode, we panic HERE with the kernel stack still
+    // loaded — instead of letting the bad RIP cause a #GP after iretq, by
+    // which point the kernel call path that wrote it is gone.
+    defer @import("../../debug/kdbg.zig").validateUserReturnIretq(words, rip_index, rip_index + 1, irq_snap.rip);
 
     // iretq-frame tripwire (task #230). Snapshot the iretq frame into the
     // current PCB so any kernel function calling
