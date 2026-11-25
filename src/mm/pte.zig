@@ -25,7 +25,7 @@
 //!
 //! What stays outside:
 //!   - The slot+gen packing inside a SWAPPED word is swap.zig's PRIVATE
-//!     codec (geometry derives from NUM_SLOTS; the gen tag is consumed only
+//!     codec (geometry is swap's SLOT_BITS; the gen tag is consumed only
 //!     by CAS bit-equality). decode() names the state; swap decodes the
 //!     payload. Nobody else has any business in those bits.
 //!   - CAS loops keep comparing raw u64 snapshots. The type covers reads
@@ -84,7 +84,7 @@ pub const Present = packed struct(u64) {
 };
 
 /// A SWAPPED word, payload undecoded — the slot/gen codec belongs to
-/// swap.zig (its geometry derives from NUM_SLOTS, and the gen tag is only
+/// swap.zig (its geometry is swap's SLOT_BITS, and the gen tag is only
 /// ever consumed by CAS bit-equality, never read back).
 pub const Swapped = struct { word: u64 };
 

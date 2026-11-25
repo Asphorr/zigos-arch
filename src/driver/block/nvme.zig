@@ -464,11 +464,9 @@ const Controller = struct {
     nsid: u32 = 0, // (c) first active namespace ID
     block_size: u32 = SECTOR_SIZE, // (c)
     /// (c) Namespace size in `block_size` units — Identify Namespace NSZE.
-    /// Every existing caller addresses a namespace whose extent it already
-    /// knows from outside (ext2's superblock, swap's compile-time slot
-    /// count), so this stayed unread until mkfs/GPT needed to lay out a
-    /// table across a disk whose size is not known a priori.
     ns_sectors: u64 = 0,
+    /// (c) Identify Controller SN: ASCII, space-padded.
+    serial: [20]u8 = @splat(' '),
 
     initialized: bool = false, // (c) flipped true at end of initController, RO after
 
@@ -731,10 +729,30 @@ fn initController(c: *Controller, dev: pci.PciDevice, idx: usize) bool {
         _ = iommu.dmaMap(dev.bus, dev.dev, dev.func, list_pg, 4096, .{});
     }
 
-    // Step 1: list active namespaces. NSID 0 is "no specific NS" for the
-    // CNS=2 query. Result is a u32[1024] table of NSIDs (zero-terminated).
     const ns_list_phys = init_state.trackAlloc() orelse return false;
     _ = iommu.dmaMap(dev.bus, dev.dev, dev.func, ns_list_phys, 4096, .{});
+    @memset(@as([*]u8, @ptrFromInt(paging.physToVirt(ns_list_phys)))[0..4096], 0);
+
+    // Step 0: the controller's serial number (Identify Controller bytes
+    // 4..23, ASCII, space-padded): how a disk is told from its neighbours
+    // by something other than the slot it sits in. Not fatal: a controller
+    // that will not say stays nameless — not named as whichever controller
+    // failed to come up in this slot before it.
+    c.serial = @splat(' ');
+    if (adminCommand(c, .{
+        .opcode = ADMIN_IDENTIFY,
+        .nsid = 0,
+        .prp1 = ns_list_phys,
+        .cdw10 = CNS_CONTROLLER,
+    })) {
+        const id_ctrl: [*]const u8 = @ptrFromInt(paging.physToVirt(ns_list_phys));
+        @memcpy(&c.serial, id_ctrl[4..24]);
+    } else {
+        debug.klog("[nvme] ctrl#{d} identify controller failed — no serial\n", .{idx});
+    }
+
+    // Step 1: list active namespaces. NSID 0 is "no specific NS" for the
+    // CNS=2 query. Result is a u32[1024] table of NSIDs (zero-terminated).
     @memset(@as([*]u8, @ptrFromInt(paging.physToVirt(ns_list_phys)))[0..4096], 0);
     if (!adminCommand(c, .{
         .opcode = ADMIN_IDENTIFY,
@@ -2217,7 +2235,7 @@ pub fn readSectorsSecondary(lba: u32, count: u16, dest: [*]u8) bool {
 }
 
 /// Generic indexed sector I/O for callers that aren't the FS primary/secondary
-/// — currently the swap subsystem on controller #2. Chunks by
+/// — currently the swap subsystem on its own disk. Chunks by
 /// MAX_SECTORS_PER_CMD. Returns false if `idx` isn't an initialized controller.
 /// `dest`/`src` is a kernel VA; a physmap VA is fine (ioCommand does the DMA
 /// translation), which is how swap passes physToVirt(frame).
@@ -2564,6 +2582,13 @@ pub fn controllerCount() usize {
 pub fn namespaceSectors(ctrl_idx: usize) u64 {
     if (ctrl_idx >= num_controllers) return 0;
     return controllers[ctrl_idx].ns_sectors;
+}
+
+/// The serial number `ctrl_idx` reports, padding trimmed; empty if that
+/// controller was never initialized or would not say.
+pub fn serialNumber(ctrl_idx: usize) []const u8 {
+    if (ctrl_idx >= num_controllers) return "";
+    return std.mem.trim(u8, &controllers[ctrl_idx].serial, " \x00");
 }
 
 /// Commit any in-flight writes to non-volatile storage on the primary

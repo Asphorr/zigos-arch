@@ -1,19 +1,19 @@
-// src/mm/swap.zig — swap backing store + page-slot allocator.
+// src/mm/swap.zig — swap: the backing store, the page-slot allocator, and
+// the evict / swap-in / discard transitions of a user PTE (fault.zig picks
+// the victims and calls in).
 //
-// Phase 1 of the swap subsystem: own a dedicated raw NVMe disk (controller
-// #2, the `swap.img` device) and provide page-granular read/write to it plus
-// a free-slot allocator. There is NO eviction or swap-in yet — that is Phase
-// 2/3, which hook into the page-fault / OOM path. This file is self-contained
-// and proves the backing store works via a boot-time round-trip self-test.
+// The device is a whole NVMe disk that says it is swap: its serial number
+// is SWAP_SERIAL, which the run scripts give swap.img. A disk is never
+// taken for its position among the controllers — whatever sits third on a
+// real machine is somebody's data.
 //
-// Layout: the swap device is a flat array of 4 KiB slots. Slot N occupies
-// LBAs [N*8, N*8+8) (8 × 512-byte sectors per page). A bitmap tracks which
-// slots currently hold a live evicted page.
+// Layout: the device is a flat array of 4 KiB slots, as many as it holds.
+// Slot N occupies LBAs [N*8, N*8+8) (8 × 512-byte sectors per page). A
+// bitmap tracks which slots currently hold a live evicted page. Nothing on
+// the device outlives a boot.
 //
 // Backing-store choice: a dedicated disk (not a swap file on ext2) so there's
-// zero filesystem-corruption risk and no FS dependency — the swap device is
-// entirely ours. It's the 3rd `-device nvme` in run-uefi-ext2.sh and
-// enumerates as NVMe controller index SWAP_CTRL_IDX.
+// zero filesystem-corruption risk and no FS dependency.
 
 const std = @import("std");
 const debug = @import("../debug/debug.zig");
@@ -28,19 +28,18 @@ const Guarded = @import("../util/guarded.zig").Guarded;
 const Phys = @import("../util/addr.zig").Phys;
 const pte_mod = @import("pte.zig");
 
-// The swap device is the 3rd NVMe controller (0 = tarfs, 1 = ext2, 2 = swap).
-const SWAP_CTRL_IDX: usize = 2;
+/// The serial number of a disk that is swap (`-device nvme,serial=…` in the
+/// run scripts).
+const SWAP_SERIAL = "zigos-swap";
 const PAGE_SIZE: usize = 4096;
-const SECTORS_PER_PAGE: u32 = 8; // 4096 / 512
+const SECTORS_PER_PAGE: u32 = 8; // 4096 / 512; nvme.zig takes no other sector size
 
-// Swap capacity. MUST be <= the swap.img size in run-uefi-ext2.sh (currently
-// 128 MiB). It's a constant because the NVMe Controller doesn't yet expose
-// namespace capacity; a later phase can read Identify-Namespace and drop this
-// assumption. 128 MiB / 4 KiB = 32768 slots.
-const SWAP_BYTES: usize = 128 * 1024 * 1024;
-const NUM_SLOTS: usize = SWAP_BYTES / PAGE_SIZE; // 32768
+/// What the SWAPPED PTE's slot field and nvme's 32-bit LBA both hold.
+const MAX_SLOTS: usize = std.math.maxInt(u32) / SECTORS_PER_PAGE;
 
-pub var available: bool = false; // (c) set in init() on swap-NVMe present; RO afterwards
+pub var available: bool = false; // (c) set in init() once a swap device is found; RO afterwards
+var ctrl_idx: usize = 0; // (c) the device's NVMe controller
+var num_slots: usize = 0; // (c) slots on the device
 var used_count: usize = 0; // (a) bumped by alloc/freeSlot; consumers may read outside slots.lock
 // Per-slot generation tag, embedded in every SWAPPED PTE (see makeSwapPte) and
 // bumped on every freeSlot. Kills the slot-reuse ABA in swapInFrame: it loads
@@ -55,8 +54,9 @@ var used_count: usize = 0; // (a) bumped by alloc/freeSlot; consumers may read o
 // Writes are atomic RMW under slots.lock; makeSwapPte reads with @atomicLoad
 // monotonic (the slot's owner allocSlot'd it through the lock, which publishes
 // every prior bump; nobody can bump an owned slot's gen). Stays OUTSIDE the
-// Guarded blob: its readers are deliberately lock-free.
-var slot_gen: [NUM_SLOTS]u8 = [_]u8{0} ** NUM_SLOTS;
+// Guarded blob: its readers are deliberately lock-free. One byte per slot,
+// sized in init().
+var slot_gen: []u8 = &.{};
 
 /// Everything the slot lock protects, behind the lock (util/guarded.zig):
 /// the free-slot bitmap + the round-robin scan hint. Evict / swap-in run in
@@ -65,17 +65,41 @@ var slot_gen: [NUM_SLOTS]u8 = [_]u8{0} ** NUM_SLOTS;
 /// The bit helpers are methods here: reaching them needs the token's
 /// `*SlotMap`, which is the compile-time form of the old assertHeld calls.
 const SlotMap = struct {
-    used: [NUM_SLOTS / 8]u8 = [_]u8{0} ** (NUM_SLOTS / 8), // free-slot bitmap
+    /// Bit set = slot in use. Sized in init(); the bits past the device's
+    /// last slot are set for good.
+    used: []u64 = &.{},
     next_scan: usize = 0, // round-robin hint for allocSlot
 
+    inline fn bit(slot: usize) u64 {
+        return @as(u64, 1) << @intCast(slot & 63);
+    }
     inline fn bitGet(self: *const SlotMap, slot: usize) bool {
-        return (self.used[slot >> 3] & (@as(u8, 1) << @as(u3, @intCast(slot & 7)))) != 0;
+        return self.used[slot >> 6] & bit(slot) != 0;
     }
     inline fn bitSet(self: *SlotMap, slot: usize) void {
-        self.used[slot >> 3] |= (@as(u8, 1) << @as(u3, @intCast(slot & 7)));
+        self.used[slot >> 6] |= bit(slot);
     }
     inline fn bitClear(self: *SlotMap, slot: usize) void {
-        self.used[slot >> 3] &= ~(@as(u8, 1) << @as(u3, @intCast(slot & 7)));
+        self.used[slot >> 6] &= ~bit(slot);
+    }
+
+    /// The first free slot at or after `next_scan`, wrapping; a word at a
+    /// time. The word `next_scan` is in is visited twice: from `next_scan`
+    /// up at the start, below it at the end.
+    fn firstFree(self: *const SlotMap) ?usize {
+        const words = self.used.len;
+        if (words == 0) return null;
+        const start = self.next_scan >> 6;
+        const below: u64 = bit(self.next_scan) - 1;
+        var step: usize = 0;
+        while (step <= words) : (step += 1) {
+            const w = (start + step) % words;
+            var free = ~self.used[w];
+            if (step == 0) free &= ~below;
+            if (step == words) free &= below;
+            if (free != 0) return w * 64 + @ctz(free);
+        }
+        return null;
     }
 };
 
@@ -95,19 +119,11 @@ pub fn allocSlot() ?u32 {
     if (!available) return null;
     const h = slots.acquire();
     defer h.release();
-    if (@atomicLoad(usize, &used_count, .monotonic) >= NUM_SLOTS) return null;
-    var scanned: usize = 0;
-    var s = h.ptr.next_scan;
-    while (scanned < NUM_SLOTS) : (scanned += 1) {
-        if (!h.ptr.bitGet(s)) {
-            h.ptr.bitSet(s);
-            _ = @atomicRmw(usize, &used_count, .Add, 1, .monotonic);
-            h.ptr.next_scan = (s + 1) % NUM_SLOTS;
-            return @intCast(s);
-        }
-        s = (s + 1) % NUM_SLOTS;
-    }
-    return null;
+    const s = h.ptr.firstFree() orelse return null;
+    h.ptr.bitSet(s);
+    _ = @atomicRmw(usize, &used_count, .Add, 1, .monotonic);
+    h.ptr.next_scan = (s + 1) % num_slots;
+    return @intCast(s);
 }
 
 /// Release a swap slot (after its page was read back in, or its owner died).
@@ -115,8 +131,8 @@ pub fn allocSlot() ?u32 {
 /// paths warn via `kwarn` so a caller's bookkeeping bug is observable rather
 /// than silently absorbed (mtswap-style stress would otherwise hide drift).
 pub fn freeSlot(slot: u32) void {
-    if (slot >= NUM_SLOTS) {
-        debug.kwarn(@src(), "freeSlot out-of-range slot={d} NUM_SLOTS={d}", .{ slot, NUM_SLOTS });
+    if (slot >= num_slots) {
+        debug.kwarn(@src(), "freeSlot out-of-range slot={d} of {d}", .{ slot, num_slots });
         return;
     }
     const h = slots.acquire();
@@ -136,33 +152,72 @@ pub fn freeSlot(slot: u32) void {
 /// NVMe write reports failure. Locking: holds no kernel lock; may block on
 /// async NVMe completion.
 pub fn writePage(slot: u32, frame_phys: Phys) bool {
-    if (!available or slot >= NUM_SLOTS) return false;
+    if (!available or slot >= num_slots) return false;
     const va = frame_phys.toVirt().raw();
-    return nvme.writeSectorsOn(SWAP_CTRL_IDX, slot * SECTORS_PER_PAGE, SECTORS_PER_PAGE, @ptrFromInt(va));
+    return nvme.writeSectorsOn(ctrl_idx, slot * SECTORS_PER_PAGE, SECTORS_PER_PAGE, @ptrFromInt(va));
 }
 
 /// Read swap slot `slot` back into a 4 KiB physical frame. Locking: same as
 /// `writePage`.
 pub fn readPage(slot: u32, frame_phys: Phys) bool {
-    if (!available or slot >= NUM_SLOTS) return false;
+    if (!available or slot >= num_slots) return false;
     const va = frame_phys.toVirt().raw();
-    return nvme.readSectorsOn(SWAP_CTRL_IDX, slot * SECTORS_PER_PAGE, SECTORS_PER_PAGE, @ptrFromInt(va));
+    return nvme.readSectorsOn(ctrl_idx, slot * SECTORS_PER_PAGE, SECTORS_PER_PAGE, @ptrFromInt(va));
 }
 
 pub fn slotsUsed() usize {
     return @atomicLoad(usize, &used_count, .monotonic);
 }
 pub fn slotsTotal() usize {
-    return NUM_SLOTS;
+    return num_slots;
 }
 
-/// One-shot init. Call after nvme.init(). No-op (available stays false) if the
-/// dedicated swap controller isn't present. Runs a round-trip self-test.
+/// The NVMe controller whose disk says it is swap.
+fn findDevice() ?usize {
+    for (0..nvme.controllerCount()) |i| {
+        if (std.mem.eql(u8, nvme.serialNumber(i), SWAP_SERIAL)) return i;
+    }
+    return null;
+}
+
+/// `n` zeroed items of `T` in frames of their own, for a table whose size
+/// follows the device's.
+fn allocTable(comptime T: type, n: usize) ?[]T {
+    const frames = (n * @sizeOf(T) + PAGE_SIZE - 1) / PAGE_SIZE;
+    const phys = pmm.allocContiguous(@intCast(frames)) orelse return null;
+    const table = phys.toVirt().ptr([*]T)[0..n];
+    @memset(table, 0);
+    return table;
+}
+
+/// One-shot init. Call after nvme.init(). No-op (available stays false) if no
+/// disk says it is swap. Runs a round-trip self-test.
 pub fn init() void {
-    if (nvme.controllerCount() <= SWAP_CTRL_IDX) {
-        debug.klog("[swap] no swap device (need NVMe controller #{d}; found {d}) — swap disabled\n", .{ SWAP_CTRL_IDX, nvme.controllerCount() });
+    const idx = findDevice() orelse {
+        debug.klog("[swap] no disk with serial \"{s}\" among {d} NVMe controller(s) — swap disabled\n", .{ SWAP_SERIAL, nvme.controllerCount() });
+        return;
+    };
+    const n: usize = @intCast(@min(nvme.namespaceSectors(idx) / SECTORS_PER_PAGE, MAX_SLOTS));
+    if (n == 0) {
+        debug.klog("[swap] nvme{d} is smaller than a page — swap disabled\n", .{idx});
         return;
     }
+    const gens = allocTable(u8, n);
+    const words = allocTable(u64, (n + 63) / 64);
+    if (gens == null or words == null) {
+        debug.klog("[swap] no memory for the tables of {d} slots — swap disabled\n", .{n});
+        return;
+    }
+    {
+        const h = slots.acquire();
+        defer h.release();
+        h.ptr.used = words.?;
+        var past = n;
+        while (past < words.?.len * 64) : (past += 1) h.ptr.bitSet(past);
+    }
+    slot_gen = gens.?;
+    ctrl_idx = idx;
+    num_slots = n;
     available = true;
     // WITNESS: track the slot-allocator lock (taken in the page-fault evict /
     // swap-in path) vs other subsystem locks. Registered only when swap is
@@ -187,14 +242,14 @@ pub fn init() void {
     // that was re-evicted between prefault and access — is bounded by the
     // refcount==1 guard in evictFrame (won't touch shared pages) and the fact
     // that syscall handlers don't hold spinlocks across user copies. Reviewed.
-    debug.klog("[swap] swap device = NVMe ctrl #{d}, {d} slots ({d} MiB), async I/O\n", .{ SWAP_CTRL_IDX, NUM_SLOTS, SWAP_BYTES / (1024 * 1024) });
+    debug.klog("[swap] swap device = nvme{d} (serial \"{s}\"), {d} slots ({d} MiB), async I/O\n", .{ idx, SWAP_SERIAL, n, n * PAGE_SIZE / (1024 * 1024) });
     selfTest();
 }
 
-/// Phase 1 proof: alloc a slot, write a known pattern from one frame, read it
-/// back into a second frame, verify byte-for-byte, then free everything. This
-/// confirms the whole NVMe-backed page path before Phase 2 relies on it under
-/// memory pressure.
+/// Alloc a slot, write a known pattern from one frame, read it back into a
+/// second frame, verify byte-for-byte, then free everything: the whole
+/// NVMe-backed page path, before eviction relies on it under memory
+/// pressure.
 fn selfTest() void {
     const src = pmm.allocFrame() orelse {
         debug.klog("[swap] self-test skipped — no frame for src\n", .{});
@@ -237,7 +292,7 @@ fn selfTest() void {
     debug.klog("[swap] self-test PASSED — 4 KiB round-trip through slot {d} verified\n", .{slot});
 }
 
-// --- Phase 2: swapped-PTE encoding + evict / swap-in mechanism ---------
+// --- Swapped-PTE encoding + evict / swap-in mechanism --------------------
 //
 // PTE state machine for a swap-eligible user page:
 //
@@ -256,7 +311,7 @@ fn selfTest() void {
 // CPU ignores all bits when PRESENT=0, so the markers are software-only.
 // The marker bits and the state DISCRIMINATION live in mm/pte.zig (typed
 // decode, partition-proved at comptime); the slot+gen PAYLOAD codec below
-// stays private to this file — its geometry derives from NUM_SLOTS and the
+// stays private to this file — its geometry is SLOT_BITS below and the
 // gen tag is only ever consumed by CAS bit-equality.
 //
 // CAS-on-every-PTE-rewrite (added 2026-05-23 for MT hardening): every state
@@ -267,18 +322,17 @@ const SWAPPED: u64 = pte_mod.SWAPPED_MARK;
 const SWAP_INFLIGHT: u64 = pte_mod.INFLIGHT_MARK;
 const SLOT_SHIFT: u6 = 12;
 
-// Bits needed to encode every slot index, derived from NUM_SLOTS so the mask
-// can't silently lag a future capacity bump (would lop off high slot bits and
-// silently corrupt swap-in). Asserted to stay inside the architectural 52-bit
-// physical-address field, since the SWAPPED PTE encoding lives there.
-const SLOT_BITS: u6 = @intCast(@bitSizeOf(usize) - @clz(@as(usize, NUM_SLOTS - 1)));
+// The slot index takes 32 bits, which holds any slot of any device (MAX_SLOTS);
+// with the tag above it the encoding stays inside the architectural 52-bit
+// physical-address field, where the SWAPPED PTE encoding lives.
+const SLOT_BITS: u6 = 32;
 const SLOT_MASK: u64 = (@as(u64, 1) << SLOT_BITS) - 1;
 // The slot's generation tag sits directly above the slot field (see slot_gen).
 // Only PTE bit-equality consumes it — nothing ever decodes it back out.
 const GEN_SHIFT: u6 = SLOT_SHIFT + SLOT_BITS;
 comptime {
     std.debug.assert(GEN_SHIFT + 8 <= 52); // gen tag inside the 52-bit phys field
-    std.debug.assert((@as(usize, 1) << SLOT_BITS) >= NUM_SLOTS);
+    std.debug.assert((@as(u64, 1) << SLOT_BITS) >= MAX_SLOTS);
 }
 
 inline fn makeSwapPte(slot: u32) u64 {
@@ -529,7 +583,7 @@ pub fn evictFrame(pte_ptr: *u64, va: usize, pcid: u16) bool {
             @atomicLoad(u64, &pages_second_chance, .monotonic),
             @atomicLoad(u64, &pages_discarded, .monotonic),
             @atomicLoad(usize, &used_count, .monotonic),
-            NUM_SLOTS,
+            num_slots,
         });
     return true;
 }
@@ -587,7 +641,7 @@ pub fn discardFrame(pte_ptr: *u64, va: usize, pcid: u16) bool {
             @atomicLoad(u64, &pages_second_chance, .monotonic),
             dc,
             @atomicLoad(usize, &used_count, .monotonic),
-            NUM_SLOTS,
+            num_slots,
         });
     return true;
 }
@@ -703,7 +757,7 @@ pub fn swapInFrame(pte_ptr: *u64, va: usize, flags: u64, pcid: u16) bool {
             @atomicLoad(u64, &pages_second_chance, .monotonic),
             @atomicLoad(u64, &pages_discarded, .monotonic),
             @atomicLoad(usize, &used_count, .monotonic),
-            NUM_SLOTS,
+            num_slots,
         });
     return true;
 }
