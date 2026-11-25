@@ -612,22 +612,23 @@ UART anyway. Everything else goes through smp.
 **Traps:** nothing may call `myCpu()` on a CPU out of reset (an AP at
 boot, any CPU after S3) before `armTscAux` ran there: its aux holds
 whatever the reset, or the firmware, left, aliasing it to another slot.
-So `identity` is the second entry of the per-CPU list. On an AP
-`claimSlot` takes the id from `getLapicId()`, stores `sipi_acked`, the
-two id fields and the syscall scratch slot, and only then arms (the
-BSP's paths know they are CPU 0); nothing in that gap asks who it is —
-do not "tidy" a call into it. The one entry ahead of it, `lapic_mode`,
-is an MSR write that asks nothing, and has to be first: a refused aux is
-reported, the klog reaches `serial.print`'s `getLapicId()`, and with the
-flag saying x2APIC on a CPU still in xAPIC that read is a #GP with no
-IDT loaded. The flag is global and sticky by design: a per-CPU answer
-would let two CPUs index the same table two different ways. The round
-trip proves the aux at arm time only, so the IRQ0 tick re-checks it
-against the LAPIC register once a second per CPU
-(`smp.auditCpuIdTick`) and demotes on disagreement with a `kwarn`. The
-BSP is LAPIC 0 by invariant (`cpus[0]` is hardcoded as the BSP in
-`bspCpu`, `isBSP`, the S3 path and the flag) — `smp.init` panics
-otherwise instead of splitting the BSP across two slots.
+So `identity` stands in the per-CPU list ahead of every entry that could
+ask. On an AP `claimSlot` takes the id from `getLapicId()`, stores
+`sipi_acked`, the two id fields and the syscall scratch slot, and only
+then arms (the BSP's paths know they are CPU 0); nothing in that gap
+asks who it is — do not "tidy" a call into it. The two entries ahead of
+it ask nothing: `time_stamp` moves a counter, and `lapic_mode` is one
+MSR write — which has to be there: a refused aux is reported, the klog
+reaches `serial.print`'s `getLapicId()`, and with the flag saying x2APIC
+on a CPU still in xAPIC that read is a #GP with no IDT loaded. The flag
+is global and sticky by design: a per-CPU answer would let two CPUs
+index the same table two different ways. The round trip proves the aux
+at arm time only, so the IRQ0 tick re-checks it against the LAPIC
+register once a second per CPU (`smp.auditCpuIdTick`) and demotes on
+disagreement with a `kwarn`. The BSP is LAPIC 0 by invariant (`cpus[0]`
+is hardcoded as the BSP in `bspCpu`, `isBSP`, the S3 path and the flag)
+— `smp.init` panics otherwise instead of splitting the BSP across two
+slots.
 
 ## `cpu_state` — what a reset takes from a CPU, as one list
 
@@ -638,7 +639,7 @@ at boot, the BSP after S3, an AP after S3 — and all four take them from
 one list, `cpu/cpu_state.zig`:
 
 ```zig
-pub const Step = enum { lapic_mode, identity, descriptor_tables, syscall, ... timer };
+pub const Step = enum { time_stamp, lapic_mode, identity, descriptor_tables, syscall, ... timer };
 
 cpu_state.restore(.ap_boot);   // a CPU out of reset into a running kernel: all of it
 cpu_state.apply(.syscall);     // the boot CPU: one entry, when what it needs is up
@@ -654,9 +655,10 @@ set.
 **Why:** the four paths used to be four hand-kept copies, and they
 drifted without anything noticing: the BSP never got its PMU entry at
 boot, `MCG_CTL` was written on the BSP only, the debug-register re-arm
-after S3 lived in two callers outside the copies. A missing entry shows
-as nothing at all until the one CPU that lacks it faults differently
-from the others.
+after S3 lived in two callers outside the copies, and after S3 the BSP
+alone moved its TSC forward again — every AP came back a whole uptime
+behind it. A missing entry shows as nothing at all until the one CPU
+that lacks it faults differently from the others.
 
 **How to apply:** per-CPU processor state that a reset clears gets an
 entry — a `Step`, its line in `run`, an `apply` on the boot path — and

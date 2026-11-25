@@ -1892,7 +1892,6 @@ pub fn schedule() void {
     var sched_measured = false;
     defer if (!sched_measured) @import("../debug/perf.zig").leave(.schedule, t);
     const cpu = smp.myCpu();
-    const paging = @import("../mm/paging.zig");
 
     // Acquire scheduler lock + disable interrupts for the bookkeeping
     // section. We MUST release before calling switchTo (the lock can't be
@@ -2139,15 +2138,7 @@ pub fn schedule() void {
         // asm tail when next is later switched OUT and its save landed.
         @atomicStore(bool, &process.procs[next].on_cpu, true, .release);
         gdt.setTssRsp0(next, process.procs[next].kernel_stack_top);
-        // A task in its teardown no longer holds its address space up (the
-        // last member to claim frees it), and it may sleep on the way: it
-        // resumes on the kernel tables, never back on its own.
-        if (process.procs[next].page_dir_phys != 0 and !@atomicLoad(bool, &process.procs[next].teardown_marked, .acquire)) {
-            pcid_mod.loadCr3(process.procs[next].page_dir_phys, process.procs[next].pcid, cpu.cpu_id);
-        } else {
-            pcid_mod.loadCr3(paging.getKernelPageDirPhys(), 0, cpu.cpu_id);
-        }
-        writeFsBase(process.procs[next].fs_base);
+        loadTaskRegisters(next, cpu.cpu_id);
 
         // First-occurrence-per-(CPU,PID) trace — confirms which CPU
         // eventually dispatches each PID. Helps catch "PID never
@@ -2530,6 +2521,32 @@ pub fn schedule() void {
 /// wrmsr); safe to call with value 0 (means "no TLS configured").
 inline fn writeFsBase(val: u64) void {
     msr.write(msr.FS_BASE, val);
+}
+
+/// What a dispatch puts into the CPU's registers for a task, beyond what is
+/// on its stack: its address space under its PCID, its TLS base. (Its upper
+/// YMM halves are switchExtended's.) Interrupts off.
+inline fn loadTaskRegisters(pid: usize, cpu_id: u8) void {
+    const pcb = &process.procs[pid];
+    // A task in its teardown no longer holds its address space up (the
+    // last member to claim frees it), and it may sleep on the way: it
+    // resumes on the kernel tables, never back on its own.
+    if (pcb.page_dir_phys != 0 and !@atomicLoad(bool, &pcb.teardown_marked, .acquire)) {
+        pcid_mod.loadCr3(pcb.page_dir_phys, pcb.pcid, cpu_id);
+    } else {
+        pcid_mod.loadCr3(@import("../mm/paging.zig").getKernelPageDirPhys(), 0, cpu_id);
+    }
+    writeFsBase(pcb.fs_base);
+}
+
+/// The same, with no dispatch, for the task this CPU is in. The BSP after S3
+/// goes straight back into the task that suspended, on a CPU the reset left
+/// with CR3 untagged — while the shootdown bookkeeping still names the
+/// task's PCID — and FS_BASE zero. Interrupts off.
+pub fn reloadCurrentTaskRegisters() void {
+    const cpu = smp.myCpu();
+    const pid = cpu.current_pid orelse return;
+    loadTaskRegisters(pid, cpu.cpu_id);
 }
 
 /// Lazy min-deadline caches for `wakeExpired` / `deliverDueAlarms`. Setters

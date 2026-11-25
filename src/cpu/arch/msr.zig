@@ -43,6 +43,8 @@
 const debug = @import("../../debug/debug.zig");
 
 pub const TSC: u32 = 0x10;
+/// What is added to it is added to the TSC, exactly.
+pub const TSC_ADJUST: u32 = 0x3B;
 
 pub const APIC_BASE: u32 = 0x1B;
 pub const ApicBase = struct {

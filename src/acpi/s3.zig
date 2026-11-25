@@ -22,6 +22,10 @@ const common = @import("../syscall/common.zig");
 const smp = @import("../cpu/smp.zig");
 const msr = @import("../cpu/arch/msr.zig");
 const cr = @import("../cpu/arch/cr.zig");
+const cpu_state = @import("../cpu/cpu_state.zig");
+const protect = @import("../cpu/arch/protect.zig");
+const fp = @import("../cpu/arch/fp.zig");
+const sched = @import("../proc/sched.zig");
 const virtio_gpu = @import("../driver.zig").virtio_gpu;
 const xhci = @import("../driver.zig").xhci;
 const nvme = @import("../driver.zig").nvme;
@@ -57,13 +61,48 @@ extern fn s3_save_context(ctx: *JmpBuf) callconv(.c) usize;
 extern fn s3_longjmp(ctx: *JmpBuf) callconv(.c) noreturn;
 var s3_ctx: JmpBuf = .{};
 
-// TSC value captured just before the SLP_EN write, restored first thing on
-// resume. S3 powers the CPU down and the TSC comes back at ~0; the whole kernel
-// measures elapsed time as `now -% start` deltas, so a backward TSC makes the
-// very next delta enormous (the suspending syscall's own exit accounting ->
-// apic.tscToMs(delta*10) overflows; the scheduler tick and the host-pause/SMI
-// detector also break). Restoring continuity keeps every delta small + positive.
-var saved_tsc: u64 = 0;
+// The counter across the sleep. S3 powers every CPU down and their TSCs
+// restart, together, near zero. The whole kernel measures time as `now -%
+// start`, so a counter that went back makes the next such delta enormous (the
+// suspending syscall's exit accounting overflows, the scheduler tick and the
+// host-pause detector break); and deadlines and clock readings pass from CPU
+// to CPU as raw counter values. So every CPU moves its counter forward again,
+// and all by the same amount: what the BSP found missing when it woke.
+var tsc_before_sleep: u64 = 0;
+/// How far the BSP moved its counter on the last wake; the APs follow it.
+/// Zero when no sleep took anything (the platform refused to suspend).
+var tsc_lost: u64 = 0;
+
+/// cpu_state's `time_stamp`. Nothing at boot: the counters are the
+/// firmware's then, and already one.
+pub fn restoreTsc(path: cpu_state.Path) void {
+    switch (path) {
+        .bsp_boot, .ap_boot => return,
+        .bsp_resume => tsc_lost = tsc_before_sleep -% readTsc(),
+        .ap_resume => {},
+    }
+    if (tsc_lost == 0) return;
+    if (hasTscAdjust()) {
+        // Moves the counter by exactly what is added here, however long the
+        // write takes — the same on each CPU, which a write of the counter
+        // itself cannot promise.
+        msr.write(msr.TSC_ADJUST, msr.read(msr.TSC_ADJUST) +% tsc_lost);
+    } else {
+        msr.write(msr.TSC, readTsc() +% tsc_lost);
+    }
+}
+
+/// CPUID.(EAX=7,ECX=0):EBX[1].
+fn hasTscAdjust() bool {
+    return protect.cpuidLeaf(0, 0).eax >= 7 and protect.cpuidLeaf(7, 0).ebx & (1 << 1) != 0;
+}
+
+// The suspending task's upper YMM halves. Its XMM registers are in the FXSAVE
+// image its syscall entry took; the upper halves live only in the registers
+// from one context switch to the next (cpu/arch/fp.zig), and the registers do
+// not survive the sleep.
+var ymm_before_sleep: [fp.UPPER_BYTES]u8 = undefined;
+var ymm_before_sleep_live: bool = false;
 
 /// SLP_EN (bit 13) | SLP_TYP (bits 12:10), masked to the 3-bit field so a stray
 /// parse can't disturb adjacent PM1_CNT bits.
@@ -79,12 +118,6 @@ fn readTsc() u64 {
           [hi] "={edx}" (hi),
     );
     return (@as(u64, hi) << 32) | @as(u64, lo);
-}
-
-/// Under KVM this adjusts the guest TSC offset; on real hardware it sets the
-/// counter directly.
-fn writeTsc(val: u64) void {
-    msr.write(msr.TSC, val);
 }
 
 /// Write a string straight to COM1 (0x3F8), bypassing serial.print's deferred-mode
@@ -109,16 +142,9 @@ export fn s3ResumeEntry() callconv(.c) noreturn {
     // its backend regardless of line config. IF is 0 here (the trampoline cli'd).
     for ("\r\nS3WAKE\r\n") |c| io.outb(0x3F8, c);
 
-    // Restore the TSC to its pre-suspend value FIRST: S3 reset it to ~0, and the
-    // whole kernel measures elapsed time as `now -% start` deltas. A backward TSC
-    // makes the next such delta enormous — the suspending syscall's own exit
-    // accounting (apic.tscToMs(delta*10)) overflows, the scheduler tick freezes,
-    // and the host-pause detector mis-fires. Must precede reinitForS3Resume (its
-    // timer arm reads the TSC) and any scheduler/perf path.
-    writeTsc(saved_tsc);
-
-    // The BSP's processor state, by the same list an AP runs. After this the
-    // CPU is whole again: it knows which CPU it is, and NX pages are safe.
+    // The BSP's processor state, by the same list an AP runs — its counter
+    // first (restoreTsc), before anything reads the clock. After this the CPU
+    // is whole again: it knows which CPU it is, and NX pages are safe.
     smp.reinitForS3Resume();
     serial.print("[s3] RESUME: BSP CPU state re-established; longjmp -> suspendToRam\n", .{});
 
@@ -268,9 +294,12 @@ pub fn suspendToRam() u32 {
         // Last marker that reliably lands before the CPU halts (raw, see rawDbg).
         rawDbg("[s3] SLP_EN -> platform suspends\r\n");
 
-        // Continuous-time baseline restored on resume (writeTsc in s3ResumeEntry).
-        // Capture as late as possible so the restored TSC is closest to real time.
-        saved_tsc = readTsc();
+        ymm_before_sleep_live = fp.saveUpper(&ymm_before_sleep);
+
+        // Where the counter goes on from after the wake (restoreTsc). Taken as
+        // late as possible, so that it resumes closest to real time.
+        tsc_lost = 0;
+        tsc_before_sleep = readTsc();
         asm volatile ("wbinvd");
         io.outw(@truncate(f.pm1a_cnt_blk), word_a);
         if (f.pm1b_cnt_blk != 0) io.outw(@truncate(f.pm1b_cnt_blk), word_b);
@@ -289,9 +318,21 @@ pub fn suspendToRam() u32 {
     }
 
     // ---- RESUME path (s3_longjmp landed here from s3ResumeEntry; IF=0) ----
-    serial.print("[s3] resumed: back in suspendToRam via longjmp\n", .{});
-    // While the BSP still runs alone (restartClock writes without a lock).
+    serial.print("[s3] resumed: back in suspendToRam via longjmp; TSC set forward {d} ms ({s})\n", .{
+        @import("../irq/apic.zig").tscToUs(tsc_lost) / 1000,
+        if (hasTscAdjust()) "IA32_TSC_ADJUST, each CPU" else "a write of the counter, each CPU",
+    });
+    // What the reset took from the task this CPU is in. No dispatch brought
+    // the task back, so nothing loaded what a dispatch loads: its address
+    // space under its PCID, its TLS base, its upper YMM halves.
+    sched.reloadCurrentTaskRegisters();
+    if (ymm_before_sleep_live) fp.loadUpper(&ymm_before_sleep);
+    serial.print("[s3] resumed: the suspending task has PCID {d} and FS base 0x{x} again\n", .{ cr.cr3.read() & cr.cr3.PCID_MASK, msr.read(msr.FS_BASE) });
+    // What the reset took from the machine, as opposed to this CPU, while the
+    // BSP still runs alone: restartClock writes without a lock, and no TLB
+    // shootdown may find the hypercall page without its overlay.
     @import("../time/time.zig").restartClock();
+    @import("../virt/hyperv.zig").restoreAfterS3();
     // S3 powered the APs down — only the BSP woke. Mark them offline first (a
     // clean single-CPU baseline that clears the stale `alive` flags), then
     // re-online them (CP2b-2b) so the machine comes back full-SMP. The re-online

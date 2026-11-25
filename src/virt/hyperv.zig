@@ -55,6 +55,16 @@ const HV_MSR_CRASH_P4 = 0x40000104;
 const HV_MSR_CRASH_CTL = 0x40000105;
 const HV_CRASH_CTL_NOTIFY: u64 = 1 << 63;
 
+/// HV_MSR_HYPERCALL: bit 0 enables the overlay, bits 11:1 are not address.
+const HYPERCALL_ENABLE: u64 = 1 << 0;
+const HYPERCALL_GPA_MASK: u64 = ~@as(u64, 0xFFF);
+
+/// What this kernel calls itself in GUEST_OS_ID: Vendor[63:48] |
+/// OSType[47:40] | OSVer[39:0]. Vendor 1 is the Microsoft-OS sentinel
+/// (QEMU+KVM accepts it); the OSType is ours, so a host's Event Viewer
+/// tells this guest from Linux and Windows ones.
+const GUEST_OS_ID: u64 = (@as(u64, 1) << 48) | (@as(u64, 0x5A) << 40) | 0x1;
+
 // Partition-privilege bits in CPUID 0x40000003.EAX (TLFS § 7.4).
 const HV_FEATURE_HYPERCALL_MSR: u32 = 1 << 5;
 const HV_FEATURE_RESET_MSR: u32 = 1 << 7;
@@ -82,6 +92,7 @@ var has_crash_msrs: bool = false;
 // RCX/RDX/R8 ABI. `flush_input_*` is a per-shootdown input struct;
 // serialized externally by tlb.shootdown_lock so one shared page works.
 var hypercall_page: usize = 0;
+var hypercall_page_pa: u64 = 0;
 var flush_input_va: usize = 0;
 var flush_input_pa: u64 = 0;
 
@@ -229,11 +240,7 @@ pub fn enableHypercalls() void {
     const pmm = @import("../mm/pmm.zig");
 
     // GUEST_OS_ID — required write before HYPERCALL MSR (TLFS § 3.6).
-    // Format: Vendor[63:48] | OSType[47:40] | OSVer[39:0]. We claim vendor=1
-    // (Microsoft-OS sentinel — works on QEMU+KVM) + a unique OSType so the
-    // host's Event Viewer can tell us apart from Linux/Windows guests.
-    const guest_id: u64 = (@as(u64, 1) << 48) | (@as(u64, 0x5A) << 40) | 0x1;
-    msr.write(HV_MSR_GUEST_OS_ID, guest_id);
+    msr.write(HV_MSR_GUEST_OS_ID, GUEST_OS_ID);
 
     // Allocate the thunk page. Physmap pages are mapped with NX clear
     // (boot.asm uses 0x183 = G|RW|PS|P, no bit 63) so calling into it
@@ -247,7 +254,8 @@ pub fn enableHypercalls() void {
 
     // Enable: write phys | bit 0. Host overlays the VMCALL/VMMCALL thunk
     // into the page; subsequent calls into call_va issue the hypercall.
-    msr.write(HV_MSR_HYPERCALL, phys_call.raw() | 1);
+    msr.write(HV_MSR_HYPERCALL, phys_call.raw() | HYPERCALL_ENABLE);
+    hypercall_page_pa = phys_call.raw();
     hypercall_page = call_va;
 
     // Pre-allocate the flush input struct page (24-byte struct lives in
@@ -267,6 +275,31 @@ pub fn enableHypercalls() void {
 
 pub fn hasHypercalls() bool {
     return hypercall_page != 0;
+}
+
+/// After S3. The wake is a reset of the partition with its RAM kept:
+/// GUEST_OS_ID and HYPERCALL are zero again and the overlay is off the
+/// page, while `hypercall_page` still says it is there — a call into it
+/// then runs what lies under the overlay, not a hypercall. Same frame, same
+/// order as enableHypercalls.
+///
+/// On the BSP, while it is the only CPU up: before anything can shoot down
+/// a TLB through the page.
+pub fn restoreAfterS3() void {
+    if (hypercall_page == 0) return;
+    const want = hypercall_page_pa | HYPERCALL_ENABLE;
+    const found = msr.read(HV_MSR_HYPERCALL);
+    if (found & (HYPERCALL_GPA_MASK | HYPERCALL_ENABLE) == want) return;
+    msr.write(HV_MSR_GUEST_OS_ID, GUEST_OS_ID);
+    msr.write(HV_MSR_HYPERCALL, want);
+    if (msr.read(HV_MSR_HYPERCALL) & HYPERCALL_ENABLE == 0) {
+        // No overlay, no hypercalls: flushAllProcessors answers false from
+        // here on and the shootdown goes by IPI.
+        hypercall_page = 0;
+        debug.kwarn(@src(), "hyperv: the hypercall page did not come back after S3 (HYPERCALL was 0x{X}) — hypercalls off", .{found});
+        return;
+    }
+    debug.klog("[hyperv] hypercall page re-enabled after S3 (HYPERCALL was 0x{X})\n", .{found});
 }
 
 /// Invoke a slow hypercall. RCX = call_code, RDX = input GPA, R8 = output

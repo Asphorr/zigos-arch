@@ -682,6 +682,7 @@ pub fn init() void {
         // The AP runs on its isr_stack until apEntry dispatches into its idle.
         const stack_top = @intFromPtr(&cpus[ap_id].isr_stack) + cpus[ap_id].isr_stack.len;
         trampoline.arm(.ap, &apEntry, pml4_phys, stack_top);
+        const sent = rdtsc();
         sendInitSipiSipi(ap_id);
 
         // Wait for AP to ACK the SIPI (apEntry start) — short window, then
@@ -701,6 +702,7 @@ pub fn init() void {
         if (@atomicLoad(bool, &cpus[ap_id].alive, .acquire)) {
             cpu_count += 1;
             debug.klog("[smp] AP {d} alive (LAPIC ID={d}, ack={d}ms init={d}ms)\n", .{ cpu_count - 1, ap_id, ack_ms, alive_ms - ack_ms });
+            checkApCounter(ap_id, sent);
         } else if (@atomicLoad(bool, &cpus[ap_id].sipi_acked, .acquire)) {
             // Started but never reached end of apEntry. Init crashed or
             // hung — page-fault, MSR fault, kasan-shadow OOM, or stuck in
@@ -755,10 +757,27 @@ fn busyWait(ms: u32) void {
 fn apBringUp(comptime path: cpu_state.Path) u8 {
     cpu_state.restore(path);
     const my_id = myCpu().cpu_id;
+    bringup_tsc[my_id] = rdtsc();
     // .release publishes everything above; the BSP reads `alive` with
     // .acquire before it counts this CPU online.
     @atomicStore(bool, &cpus[my_id].alive, true, .release);
     return my_id;
+}
+
+/// Each AP's counter at the end of its bring-up, for checkApCounter.
+var bringup_tsc: [MAX_CPUS]u64 = [_]u64{0} ** MAX_CPUS;
+
+/// Deadlines and clock readings pass between CPUs as raw TSC values, so a
+/// CPU whose counter runs in another epoch — a reset the BSP did not share,
+/// a sleep only one of them made up for — gets every one of them wrong, and
+/// quietly. An AP's stamp from the end of its bring-up has to fall inside
+/// the BSP's wait for it; `sent` is the BSP's counter before the INIT.
+fn checkApCounter(ap_id: u8, sent: u64) void {
+    const seen = rdtsc();
+    const at = bringup_tsc[ap_id];
+    if (at >= sent and at <= seen) return;
+    const off = if (at < sent) sent - at else at - seen;
+    debug.kwarn(@src(), "cpu{d}'s TSC is not the BSP's: {d} at bring-up, outside the BSP's wait [{d}, {d}] by {d} ms", .{ ap_id, at, sent, seen, apic.tscToUs(off) / 1000 });
 }
 
 /// cpu_state's `identity`: this CPU takes its cpus[] slot and stores its id
@@ -958,6 +977,7 @@ pub fn reonlineApsForS3Resume(resume_cr3: u64) void {
         // identity at boot, resume_cr3 still maps the trampoline page.
         const stack_top = @intFromPtr(&cpus[ap_id].isr_stack) + cpus[ap_id].isr_stack.len;
         trampoline.arm(.ap, &apEntryS3Resume, resume_cr3, stack_top);
+        const sent = rdtsc();
         sendInitSipiSipi(ap_id);
 
         // Wait for the AP to come back alive (apEntryS3Resume reached its end).
@@ -969,6 +989,7 @@ pub fn reonlineApsForS3Resume(resume_cr3: u64) void {
             cpu_count += 1;
             brought += 1;
             debug.klog("[smp] S3 re-online: AP {d} back ({d}ms)\n", .{ ap_id, ms });
+            checkApCounter(ap_id, sent);
         } else {
             debug.klog("[smp] S3 re-online: AP {d} did NOT come back ({d}ms timeout; trampoline {s})\n", .{ ap_id, ms, trampoline.describeProgress(.ap) });
         }

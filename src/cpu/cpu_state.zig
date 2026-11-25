@@ -18,6 +18,7 @@
 const std = @import("std");
 const serial = @import("../debug/serial.zig");
 const apic = @import("../irq/apic.zig");
+const s3 = @import("../acpi/s3.zig");
 const smp = @import("smp.zig");
 const protect = @import("arch/protect.zig");
 const fp = @import("arch/fp.zig");
@@ -44,9 +45,14 @@ pub const Path = enum {
 
 /// In the order `restore` runs them.
 pub const Step = enum {
+    /// The time-stamp counter, moved forward by what a sleep took from it:
+    /// the same amount on every CPU, for deadlines pass between them as raw
+    /// counter values. Nothing at boot. First: whatever reads the clock
+    /// below must not see it gone back.
+    time_stamp,
     /// IA32_APIC_BASE: the LAPIC on, in the mode the BSP chose (xAPIC or
-    /// x2APIC). First, because `identity` reads the LAPIC ID, and in the
-    /// wrong mode that read is a #GP with no IDT to take it.
+    /// x2APIC). Ahead of `identity`, which reads the LAPIC ID: in the wrong
+    /// mode that read is a #GP with no IDT to take it.
     lapic_mode,
     /// Which CPU this is: its cpus[] slot, and IA32_TSC_AUX, where myCpuId()
     /// reads it. Nothing before this may ask — klog does.
@@ -90,6 +96,7 @@ pub const Step = enum {
 
 fn run(comptime step: Step, path: Path) void {
     switch (step) {
+        .time_stamp => s3.restoreTsc(path),
         .lapic_mode => apic.setMode(path.isBsp()),
         .identity => smp.claimSlot(path),
         .descriptor_tables => smp.loadDescriptorTables(path),
@@ -136,9 +143,13 @@ var boot_applied: StepSet = StepSet.initEmpty();
 /// included: an entry applied ahead of its `detect` does nothing, and still
 /// counts as applied.
 pub fn apply(comptime step: Step) void {
+    comptime std.debug.assert(!resume_only.contains(step));
     run(step, .bsp_boot);
     boot_applied.insert(step);
 }
+
+/// Entries that only undo a sleep: a booting CPU has nothing to put back.
+const resume_only = StepSet.initOne(.time_stamp);
 
 /// The boot CPU is on a task's stack and about to take interrupts: the last
 /// entry, then the check that none was left out.
@@ -158,7 +169,7 @@ pub fn completeBootWithoutSmap() void {
 const needs_lapic = StepSet.initMany(&.{ .lapic_mode, .identity, .descriptor_tables, .lapic, .pmu, .timer });
 
 fn assertBootApplied(left_off: StepSet) void {
-    var excused = left_off;
+    var excused = left_off.unionWith(resume_only);
     if (!apic.apic_active) excused.setUnion(needs_lapic);
     const missing = boot_applied.unionWith(excused).complement();
     if (missing.count() == 0) return;
