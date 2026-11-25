@@ -56,6 +56,7 @@ pub fn build(b: *std.Build) void {
     // With this set, a headless QEMU run boots straight into the chosen mode.
     const forced_boot_mode = b.option(u32, "boot-mode", "Force boot_mode, bypassing the UEFI menu (scripted self-test runs)");
     const linuxtest_only = b.option([]const u8, "linuxtest-only", "Boot mode 19 runs only the cases whose path or arguments contain this") orelse "";
+    const swap_trace = b.option(bool, "swap-trace", "Log every step of swap eviction and swap-in ([mtswap-trace]; a dozen lines per page)") orelse false;
 
     const build_options = b.addOptions();
     build_options.addOption(u64, "build_id", build_id_value);
@@ -63,6 +64,7 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "kcsan_enabled", kcsan_enabled);
     build_options.addOption(?u32, "forced_boot_mode", forced_boot_mode);
     build_options.addOption([]const u8, "linuxtest_only", linuxtest_only);
+    build_options.addOption(bool, "swap_trace", swap_trace);
 
     // --- 1. KERNEL ---
     // Forward-declare the shapes module here so the kernel module can
