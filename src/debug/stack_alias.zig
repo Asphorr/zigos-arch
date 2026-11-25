@@ -65,18 +65,11 @@ pub fn checkOwnRsp(rsp: u64) void {
 
     var rsp_to_check = rsp;
     if (on_ist1) {
-        // isr_irq0 hands the handler a `rsp` pointing at GPR_start (bottom of
-        // the 15 GPRs). The iretq frame lives ABOVE the GPRs at offsets
-        // 120..160 from `rsp`. With IST=1 the CPU pushes the full 5-qword
-        // frame even on kernel→kernel transitions.
-        //   rsp[15] = RIP
-        //   rsp[16] = CS
-        //   rsp[17] = RFLAGS
-        //   rsp[18] = saved RSP  (always populated under IST)
-        //   rsp[19] = SS
-        const frame: [*]const u64 = @ptrFromInt(rsp);
-        const saved_cs = frame[16];
-        const saved_rsp = frame[18];
+        // `rsp` is the frame isr_irq0 hands its handler; the CPU's record
+        // is its tail, all five words of it even kernel→kernel.
+        const frame: *const @import("../proc/signals.zig").IrqFrame = @ptrFromInt(rsp);
+        const saved_cs = frame.cs;
+        const saved_rsp = frame.rsp;
         // CS bits 0..1 = RPL; RPL=3 means user. Skip kstack check then.
         if ((saved_cs & 0x3) == 3) return;
         rsp_to_check = saved_rsp;

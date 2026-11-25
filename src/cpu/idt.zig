@@ -24,17 +24,10 @@ pub const allocDynVector = dynirq.allocDynVector;
 pub const registerIrq = dynirq.registerIrq;
 pub const IRQ0_CANARY = irq0.IRQ0_CANARY;
 
-// Re-exports of align-panic targets. abi_check takes their addresses to
-// prove the build-time asm-alignment-linter targets exist at runtime;
-// that takeAddr requires the decl to be visible at idt module scope,
-// hence these one-liners.
-pub const isr_irq0_align_panic = irq0.isr_irq0_align_panic;
+// Where the entry stubs go when a check of theirs fails. abi_check takes
+// the addresses to see the targets exist.
+pub const isr_align_panic = @import("idt/stub.zig").isr_align_panic;
 pub const isr_irq0_canary_panic = irq0.isr_irq0_canary_panic;
-pub const isr_irq1_align_panic = misc_irq.isr_irq1_align_panic;
-pub const isr_irq12_align_panic = misc_irq.isr_irq12_align_panic;
-pub const isr_tlb_shootdown_align_panic = misc_irq.isr_tlb_shootdown_align_panic;
-pub const isr_pmi_align_panic = misc_irq.isr_pmi_align_panic;
-pub const isr_common_exc_align_panic = exception.isr_common_exc_align_panic;
 
 // MMU write-watch state (RETIRED — see project_mmu_watch_obsolete). Re-
 // exported so legacy `armWriteWatch` callers compile if any reappear; the
@@ -273,13 +266,11 @@ pub fn loadIdtForAP() void {
 /// would iretq to garbage and the next #UD/#GP would be in a context
 /// detached from the actual writer.
 ///
-/// Stack layout at jump time: %rsp points at the iretq frame's RIP slot.
-/// slots[0]=RIP, slots[1]=CS, slots[2]=RFLAGS, slots[3]=RSP, slots[4]=SS.
-pub export fn isr_iretq_corrupt_panic() callconv(.c) noreturn {
+/// `rsp_now` is RSP at the jump (sched_asm.SAFE_IRETQ passes it): the iretq
+/// frame's RIP slot. slots[0]=RIP, slots[1]=CS, slots[2]=RFLAGS,
+/// slots[3]=RSP, slots[4]=SS.
+pub export fn isr_iretq_corrupt_panic(rsp_now: u64) callconv(.c) noreturn {
     const sym = @import("../debug/symbols.zig");
-    const rsp_now: u64 = asm volatile ("mov %%rsp, %[r]"
-        : [r] "=r" (-> u64),
-    );
     const slots: [*]const u64 = @ptrFromInt(rsp_now);
 
     serial.print("\n!!! IRETQ FRAME CORRUPTED — caught BEFORE iretq fired !!!\n", .{});

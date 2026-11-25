@@ -11,6 +11,8 @@ const serial = @import("../../debug/serial.zig");
 const symbols = @import("../../debug/symbols.zig");
 const process = @import("../../proc/process.zig");
 const signals = @import("../../proc/signals.zig");
+const frames = @import("../../proc/frames.zig");
+const stub = @import("stub.zig");
 const memmap = @import("../../mm/memmap.zig");
 const apic = @import("../../irq/apic.zig");
 const desktop = @import("../../ui/desktop.zig");
@@ -130,13 +132,6 @@ fn printKernelBacktrace(start_rbp: u64, max_depth: u32) void {
         rbp = next;
     }
 }
-// Unified exception handler — called from isr_common_exc
-// Stack layout (RSP points to):
-//   [0]  r15  [1]  r14  [2]  r13  [3]  r12
-//   [4]  r11  [5]  r10  [6]  r9   [7]  r8
-//   [8]  rdi  [9]  rsi  [10] rbp  [11] rbx
-//   [12] rdx  [13] rcx  [14] rax
-//   [15] int_no  [16] error_code
 
 
 // --- MMU write-watch state (RETIRED) -----------------------------------------
@@ -186,7 +181,8 @@ pub fn armWriteWatch(addr: u64, whitelist_sym: []const u8, max_offset: u32) void
     }
     serial.print("[ww] all 4 watch slots full — cannot arm 0x{X}\n", .{addr});
 }
-//   [17] rip  [18] cs  [19] rflags  [20] rsp  [21] ss  (pushed by CPU)
+/// Every exception, from isr_common_exc. `rsp` is its frame: a
+/// signals.ExcFrame, which frames.entry.exception holds to the stub.
 export fn handleException(rsp: u64) callconv(.c) void {
     const perf = @import("../../debug/perf.zig");
     const t = perf.enter();
@@ -217,34 +213,31 @@ export fn handleException(rsp: u64) callconv(.c) void {
     // A kernel fault other than a #PF or #NMI: one plain line before anything
     // that could itself fail (KASAN, canaries, the dump), so a cascade still
     // leaves where it began.
-    {
-        const fr: [*]const u64 = @ptrFromInt(rsp);
-        const vec = fr[15];
-        if (fr[18] & 3 == 0 and vec != 14 and vec != 2 and vec != 1 and vec != 3) {
-            const cl = @import("../smp.zig").myCpu();
-            @import("../../debug/serial.zig").emergencyPrint("[exc-early] cpu{d} pid={d} vec={d} err=0x{X} rip=0x{X} rsp=0x{X} rbp=0x{X} frame=0x{X} cr2=0x{X}\n", .{
-                cl.cpu_id, cl.current_pid orelse 0xFF, vec, fr[16], fr[17], fr[20], fr[10], rsp, readCr2(),
-            });
-        }
+    const frame: *signals.ExcFrame = @ptrFromInt(rsp);
+    if (frame.cs & 3 == 0 and frame.int_no != 14 and frame.int_no != 2 and frame.int_no != 1 and frame.int_no != 3) {
+        const cl = @import("../smp.zig").myCpu();
+        @import("../../debug/serial.zig").emergencyPrint("[exc-early] cpu{d} pid={d} vec={d} err=0x{X} rip=0x{X} rsp=0x{X} rbp=0x{X} frame=0x{X} cr2=0x{X}\n", .{
+            cl.cpu_id, cl.current_pid orelse 0xFF, frame.int_no, frame.error_code, frame.rip, frame.rsp, frame.rbp, rsp, readCr2(),
+        });
     }
 
-    // KASAN: the saved-register area + iretq frame above us must be on a
-    // *live* kstack. If it's been poisoned (process exited / kstack returned
-    // to pool while still in use), KASAN trips here with the writer's
-    // backtrace ahead of the eventual ret-to-garbage crash. 176 = 15 GPRs
-    // (120) + int_no/error_code (16) + the 5-qword iretq frame (40) — in
-    // 64-bit mode the CPU pushes SS:RSP unconditionally, so the frame is
-    // always the full 40 bytes.
-    @import("../../debug/kasan.zig").expectValid(rsp, 176);
+    // KASAN: the frame must be on a *live* kstack. If it's been poisoned
+    // (process exited / kstack returned to pool while still in use), KASAN
+    // trips here with the writer's backtrace ahead of the eventual
+    // ret-to-garbage crash. The whole frame: in 64-bit mode the CPU pushes
+    // SS:RSP unconditionally.
+    @import("../../debug/kasan.zig").expectValid(rsp, @sizeOf(signals.ExcFrame));
 
     // CpuLocal end-canary check (task #229).
     @import("../smp.zig").verifyEndCanary();
 
-    const stack: [*]const u64 = @ptrFromInt(rsp);
-    const int_no = stack[15];
-    const error_code = stack[16];
-    const saved_cs = stack[18];
-    const saved_rip = stack[17];
+    // The frame as qwords, for the checks that take a base and an index.
+    const words: [*]const u64 = @ptrFromInt(rsp);
+    const rip_index = comptime frames.entry.exception.iretqIndex(.rip);
+    const int_no = frame.int_no;
+    const error_code = frame.error_code;
+    const saved_cs = frame.cs;
+    const saved_rip = frame.rip;
 
     // Kernel exception-table fixup (extable.zig). A #GP (13) or #PF (14)
     // in kernel mode at a registered fault site — an MSR probe
@@ -265,8 +258,7 @@ export fn handleException(rsp: u64) callconv(.c) void {
     // their path (lazy/COW service, signal delivery).
     if ((int_no == 13 or int_no == 14) and (saved_cs & 3) == 0) {
         if (@import("../arch/extable.zig").fixupRip(saved_rip)) |fixup| {
-            const wframe: [*]u64 = @ptrFromInt(rsp);
-            wframe[17] = fixup;
+            frame.rip = fixup;
             return;
         }
     }
@@ -275,7 +267,7 @@ export fn handleException(rsp: u64) callconv(.c) void {
     // validated (a sibling thread forked, unmapped it, or sent it to swap):
     // resolved as a ring-3 fault is.
     if (int_no == 14 and (saved_cs & 3) == 0 and
-        process.handleKernelUserFault(@intCast(readCr2()), error_code, stack[19], saved_rip)) return;
+        process.handleKernelUserFault(@intCast(readCr2()), error_code, frame.rflags, saved_rip)) return;
 
     // Breadcrumb: vec in high 32, pid in low 32. Stamped before the NMI
     // fast-path return so even NMI-snapshotted CPUs leave a trace.
@@ -307,14 +299,12 @@ export fn handleException(rsp: u64) callconv(.c) void {
     }
 
     // Wild-RIP hunt (task #224). Same idea as handleIRQ0: validate the saved
-    // RIP just before iretq returns to user mode. Exception frame has RIP at
-    // index 17 (vs 15 for IRQs) because the ISR stub pushed int_no and
-    // error_code onto the kernel stack first.
-    defer @import("../../debug/kdbg.zig").validateUserReturnIretq(stack, 17, 18);
+    // RIP just before iretq returns to user mode.
+    defer @import("../../debug/kdbg.zig").validateUserReturnIretq(words, rip_index, rip_index + 1);
 
-    // iretq-frame tripwire (task #230) — exception version. RIP slot at 17
-    // (after int_no + error_code pushes). See handleIRQ0 for design notes.
-    @import("../../debug/iretq_canary.zig").capture(stack, 17);
+    // iretq-frame tripwire (task #230) — exception version. See handleIRQ0
+    // for design notes.
+    @import("../../debug/iretq_canary.zig").capture(words, rip_index);
     defer @import("../../debug/iretq_canary.zig").invalidate();
 
     // ---- DR0-DR3 watchpoint dispatch --------------------------------------
@@ -336,8 +326,7 @@ export fn handleException(rsp: u64) callconv(.c) void {
         if ((dr6 & (1 << 14)) != 0 and ww_pending_reprotect_page != 0) {
             @import("../../mm/paging.zig").setWriteWatchRW(@intCast(ww_pending_reprotect_page), false);
             ww_pending_reprotect_page = 0;
-            const stack_w: [*]volatile u64 = @ptrFromInt(rsp);
-            stack_w[19] &= ~@as(u64, 1 << 8); // clear TF
+            frame.rflags &= ~@as(u64, 1 << 8); // clear TF
             asm volatile ("mov $0, %%rax\n mov %%rax, %%dr6\n"
                 ::: .{ .rax = true });
             return;
@@ -366,13 +355,11 @@ export fn handleException(rsp: u64) callconv(.c) void {
                 };
                 if (is_legit) {
                     @import("../../mm/paging.zig").setWriteWatchRW(@intCast(e.page), true);
-                    const stack_w: [*]volatile u64 = @ptrFromInt(rsp);
-                    stack_w[19] |= (1 << 8); // set TF — single-step the inc
+                    frame.rflags |= (1 << 8); // set TF — single-step the inc
                     ww_pending_reprotect_page = e.page;
                     return;
                 }
                 // Wild writer caught at the scene.
-                const r15 = stack[0];
                 serial.print("\n!!! WILD WRITER (MMU) CAUGHT !!!\n", .{});
                 serial.print("  CR2 = 0x{X:0>16}  (in watched page 0x{X:0>16})\n", .{ cr2, e.page });
                 serial.print("  RIP = 0x{X:0>16}\n", .{saved_rip});
@@ -380,14 +367,14 @@ export fn handleException(rsp: u64) callconv(.c) void {
                     serial.print("  Site: {s}+0x{X}\n", .{ r.name, r.offset });
                 }
                 serial.print("  ERR=0x{X:0>2} (write from supervisor)\n", .{error_code});
-                serial.print("  RAX=0x{X:0>16} RCX=0x{X:0>16}\n", .{ stack[14], stack[13] });
-                serial.print("  RDX=0x{X:0>16} RBX=0x{X:0>16}\n", .{ stack[12], stack[11] });
-                serial.print("  RSI=0x{X:0>16} RDI=0x{X:0>16}\n", .{ stack[9], stack[8] });
-                serial.print("  RBP=0x{X:0>16} R15=0x{X:0>16}\n", .{ stack[10], r15 });
-                serial.print("  R8 =0x{X:0>16} R9 =0x{X:0>16}\n", .{ stack[7], stack[6] });
-                serial.print("  R10=0x{X:0>16} R11=0x{X:0>16}\n", .{ stack[5], stack[4] });
-                serial.print("  R12=0x{X:0>16} R13=0x{X:0>16}\n", .{ stack[3], stack[2] });
-                serial.print("  R14=0x{X:0>16}\n", .{stack[1]});
+                serial.print("  RAX=0x{X:0>16} RCX=0x{X:0>16}\n", .{ frame.rax, frame.rcx });
+                serial.print("  RDX=0x{X:0>16} RBX=0x{X:0>16}\n", .{ frame.rdx, frame.rbx });
+                serial.print("  RSI=0x{X:0>16} RDI=0x{X:0>16}\n", .{ frame.rsi, frame.rdi });
+                serial.print("  RBP=0x{X:0>16} R15=0x{X:0>16}\n", .{ frame.rbp, frame.r15 });
+                serial.print("  R8 =0x{X:0>16} R9 =0x{X:0>16}\n", .{ frame.r8, frame.r9 });
+                serial.print("  R10=0x{X:0>16} R11=0x{X:0>16}\n", .{ frame.r10, frame.r11 });
+                serial.print("  R12=0x{X:0>16} R13=0x{X:0>16}\n", .{ frame.r12, frame.r13 });
+                serial.print("  R14=0x{X:0>16}\n", .{frame.r14});
                 const rip_page_end = (saved_rip & ~@as(u64, 0xFFF)) + 0x1000;
                 const safe_len: u64 = @min(16, rip_page_end - saved_rip);
                 const code: [*]const u8 = @ptrFromInt(saved_rip);
@@ -395,7 +382,7 @@ export fn handleException(rsp: u64) callconv(.c) void {
                 for (0..@intCast(safe_len)) |i| serial.print(" {X:0>2}", .{code[i]});
                 serial.print("\n", .{});
                 serial.print("  Backtrace:\n", .{});
-                printKernelBacktrace(stack[10], 16);
+                printKernelBacktrace(frame.rbp, 16);
                 // Disarm all watches so panic's own writes don't recurse.
                 for (&ww_entries) |*entry| {
                     if (entry.page != 0) @import("../../mm/paging.zig").setWriteWatchRW(@intCast(entry.page), true);
@@ -499,9 +486,6 @@ export fn handleException(rsp: u64) callconv(.c) void {
         };
         if (sig != 0) {
             if (process.currentPCB()) |pcb| {
-                // ExcFrame layout matches the GPR_start handed to handleException
-                // — see the layout comment a few hundred lines up.
-                const exc_frame: *signals.ExcFrame = @ptrFromInt(rsp);
                 // For SIGSEGV from #PF, surface cr2 as si_addr and pick a
                 // si_code based on error-code bit 0 (P=1 means present-page
                 // permission violation, 0 means missing mapping). Other
@@ -530,7 +514,7 @@ export fn handleException(rsp: u64) callconv(.c) void {
                     : [f] "=r" (flags),
                 );
                 asm volatile ("sti");
-                if (signals.deliverFromExcFrame(pcb, exc_frame, sig, fault_addr, si_code)) return;
+                if (signals.deliverFromExcFrame(pcb, frame, sig, fault_addr, si_code)) return;
                 if (flags & 0x200 == 0) asm volatile ("cli");
             }
         }
@@ -549,7 +533,7 @@ export fn handleException(rsp: u64) callconv(.c) void {
                     cr2 + guard_size >= pcb.stack_base)
                 {
                     is_stack_overflow = true;
-                    serial.print("\n[STACK OVERFLOW] PID={d} CR2={X:0>16} stack_base={X:0>16} RSP={X:0>16}\n", .{ pid, cr2, pcb.stack_base, stack[20] });
+                    serial.print("\n[STACK OVERFLOW] PID={d} CR2={X:0>16} stack_base={X:0>16} RSP={X:0>16}\n", .{ pid, cr2, pcb.stack_base, frame.rsp });
                 }
             }
         }
@@ -562,8 +546,8 @@ export fn handleException(rsp: u64) callconv(.c) void {
         // dispatches go through switchTo which uses kernel-to-kernel ret.)
 
         const app_syms = if (process.currentPCB()) |pcb| pcb.sym_table else null;
-        const saved_rbp = stack[10];
-        const saved_rsp = stack[20];
+        const saved_rbp = frame.rbp;
+        const saved_rsp = frame.rsp;
 
         // RIP + symbol on the same line. saved_rip is the faulting instruction
         // address; the resolver may legitimately return null for inlined or
@@ -587,14 +571,10 @@ export fn handleException(rsp: u64) callconv(.c) void {
             serial.print("  ERR=0x{X:0>16}\n", .{error_code});
         }
 
-        // Register dump. Indices match the layout comment at the top of the
-        // function: stack[14]=rax, [13]=rcx, [12]=rdx, [11]=rbx, [9]=rsi,
-        // [8]=rdi, [10]=rbp, [7]=r8, [6]=r9, [5]=r10, [4]=r11, [3]=r12,
-        // [2]=r13, [1]=r14, [0]=r15.
-        serial.print("  RAX=0x{X:0>16} RBX=0x{X:0>16} RCX=0x{X:0>16} RDX=0x{X:0>16}\n", .{ stack[14], stack[11], stack[13], stack[12] });
-        serial.print("  RSI=0x{X:0>16} RDI=0x{X:0>16} R8 =0x{X:0>16} R9 =0x{X:0>16}\n", .{ stack[9], stack[8], stack[7], stack[6] });
-        serial.print("  R10=0x{X:0>16} R11=0x{X:0>16} R12=0x{X:0>16} R13=0x{X:0>16}\n", .{ stack[5], stack[4], stack[3], stack[2] });
-        serial.print("  R14=0x{X:0>16} R15=0x{X:0>16}\n", .{ stack[1], stack[0] });
+        serial.print("  RAX=0x{X:0>16} RBX=0x{X:0>16} RCX=0x{X:0>16} RDX=0x{X:0>16}\n", .{ frame.rax, frame.rbx, frame.rcx, frame.rdx });
+        serial.print("  RSI=0x{X:0>16} RDI=0x{X:0>16} R8 =0x{X:0>16} R9 =0x{X:0>16}\n", .{ frame.rsi, frame.rdi, frame.r8, frame.r9 });
+        serial.print("  R10=0x{X:0>16} R11=0x{X:0>16} R12=0x{X:0>16} R13=0x{X:0>16}\n", .{ frame.r10, frame.r11, frame.r12, frame.r13 });
+        serial.print("  R14=0x{X:0>16} R15=0x{X:0>16}\n", .{ frame.r14, frame.r15 });
 
         // Code bytes at RIP (up to next page boundary, capped at 16). For
         // most exceptions RIP is mapped (we got here by executing it), but
@@ -640,20 +620,20 @@ export fn handleException(rsp: u64) callconv(.c) void {
                 // SECONDARY #PF reading through it would escalate a survivable
                 // user fault into a kernel panic. Stop the walk instead. (Same
                 // isMapped guard the Code-bytes dump above already uses.) We
-                // read frame[0] (at rbp) AND frame[1] (at rbp+8), so a corrupt
+                // read link[0] (at rbp) AND link[1] (at rbp+8), so a corrupt
                 // rbp 8 bytes shy of a page edge could straddle into the next,
                 // non-present page — gate both. (rbp < 0x600000 here, so rbp+8
                 // can't overflow.)
                 if (!@import("../../mm/paging.zig").isMapped(rbp) or
                     !@import("../../mm/paging.zig").isMapped(rbp + 8)) break;
-                const frame: [*]const usize = @ptrFromInt(rbp);
-                const ret_addr: u64 = @intCast(frame[1]);
+                const link: [*]const usize = @ptrFromInt(rbp);
+                const ret_addr: u64 = @intCast(link[1]);
                 if (ret_addr == 0) break;
                 serial.print("    [{d}] 0x{X:0>16}  ", .{ depth, ret_addr });
                 printSym(ret_addr, app_syms);
                 serial.print("\n", .{});
                 bt_frames += 1;
-                const next_rbp: usize = @intCast(frame[0]);
+                const next_rbp: usize = @intCast(link[0]);
                 if (next_rbp <= rbp or next_rbp >= 0x600000) break; // sanity: must climb
                 rbp = next_rbp;
             }
@@ -785,7 +765,7 @@ export fn handleException(rsp: u64) callconv(.c) void {
     {
         const cl = @import("../smp.zig").myCpu();
         @import("../../debug/serial.zig").emergencyPrint("[exc-fatal] cpu{d} pid={d} vec={d} err=0x{X} rip=0x{X} rsp=0x{X} cr2=0x{X}\n", .{
-            cl.cpu_id, cl.current_pid orelse 0xFF, int_no, error_code, saved_rip, stack[20], readCr2(),
+            cl.cpu_id, cl.current_pid orelse 0xFF, int_no, error_code, saved_rip, frame.rsp, readCr2(),
         });
     }
     @import("../../debug/kdbg.zig").enterCritical();
@@ -800,7 +780,7 @@ export fn handleException(rsp: u64) callconv(.c) void {
 
     serial.print("\n!!! EXCEPTION {d}: {s} !!!\n", .{ int_no, name });
     serial.print("  RIP={X:0>16} CS={X:0>4} ERR={X:0>16}\n", .{ saved_rip, saved_cs, error_code });
-    serial.print("  RSP={X:0>16} SS={X:0>4} RFLAGS={X:0>16}\n", .{ stack[20], stack[21], stack[19] });
+    serial.print("  RSP={X:0>16} SS={X:0>4} RFLAGS={X:0>16}\n", .{ frame.rsp, frame.ss, frame.rflags });
 
     // Control registers (read early for crash classifier)
     const cr2 = readCr2();
@@ -808,14 +788,14 @@ export fn handleException(rsp: u64) callconv(.c) void {
 
     // Crash classifier hint — helps narrow down the likely cause before diving
     // into register dumps. For #PF, pass CR2; for others it's ignored.
-    const hint = debug.classifyCrash(int_no, saved_rip, cr2, stack[20]);
+    const hint = debug.classifyCrash(int_no, saved_rip, cr2, frame.rsp);
     serial.print("  {s}\n", .{hint});
 
     // Dump all saved GPRs
-    serial.print("  RAX={X:0>16} RBX={X:0>16} RCX={X:0>16} RDX={X:0>16}\n", .{ stack[14], stack[11], stack[13], stack[12] });
-    serial.print("  RSI={X:0>16} RDI={X:0>16} RBP={X:0>16}\n", .{ stack[9], stack[8], stack[10] });
-    serial.print("  R8 ={X:0>16} R9 ={X:0>16} R10={X:0>16} R11={X:0>16}\n", .{ stack[7], stack[6], stack[5], stack[4] });
-    serial.print("  R12={X:0>16} R13={X:0>16} R14={X:0>16} R15={X:0>16}\n", .{ stack[3], stack[2], stack[1], stack[0] });
+    serial.print("  RAX={X:0>16} RBX={X:0>16} RCX={X:0>16} RDX={X:0>16}\n", .{ frame.rax, frame.rbx, frame.rcx, frame.rdx });
+    serial.print("  RSI={X:0>16} RDI={X:0>16} RBP={X:0>16}\n", .{ frame.rsi, frame.rdi, frame.rbp });
+    serial.print("  R8 ={X:0>16} R9 ={X:0>16} R10={X:0>16} R11={X:0>16}\n", .{ frame.r8, frame.r9, frame.r10, frame.r11 });
+    serial.print("  R12={X:0>16} R13={X:0>16} R14={X:0>16} R15={X:0>16}\n", .{ frame.r12, frame.r13, frame.r14, frame.r15 });
 
     serial.print("  CR2={X:0>16} CR3={X:0>16}\n", .{ cr2, cr3 });
 
@@ -865,7 +845,7 @@ export fn handleException(rsp: u64) callconv(.c) void {
     if (int_no == 8 and process.kstack_pool_phys_base != 0) {
         const cfg = @import("../../config.zig");
         const pool_base = @intFromPtr(process.kstack_pool);
-        const fault_rsp = stack[20];
+        const fault_rsp = frame.rsp;
         if (fault_rsp >= pool_base and fault_rsp < pool_base + process.KSTACK_POOL_BYTES) {
             const slot = (fault_rsp - pool_base) / cfg.KSTACK_SLOT_SIZE;
             const off = (fault_rsp - pool_base) % cfg.KSTACK_SLOT_SIZE;
@@ -883,7 +863,7 @@ export fn handleException(rsp: u64) callconv(.c) void {
     if (symbols.resolveKernel(saved_rip)) |r| {
         serial.print("  Crash in: {s}+0x{X}\n", .{ r.name, r.offset });
     }
-    printKernelBacktrace(stack[10], 16);
+    printKernelBacktrace(frame.rbp, 16);
 
     // Full kdbg autopsy: cross-CPU snapshot, all-PCB state, ring dumps,
     // hex dump near the kernel RSP, optional PT walk for #PF. Newly added
@@ -891,7 +871,7 @@ export fn handleException(rsp: u64) callconv(.c) void {
     // recent iretq=0x{8410,7410} #GP gave us no usable diagnostic data.
     @import("../../debug/kdbg.zig").crashAutopsy(.{
         .cr2 = if (int_no == 14) cr2 else null,
-        .kernel_rsp = stack[20],
+        .kernel_rsp = frame.rsp,
         .int_no = int_no,
         .crash_rip = saved_rip,
     });
@@ -1009,87 +989,10 @@ fn writeHex64(buf: []u8, pos: usize, n: u64) usize {
 }
 
 
-// === ISR stubs (assembly) ===
-
-// Common exception stub: push 15 GPRs, set kernel data segments, call handleException
-// handleException returns for Ring 3 faults (after killing the process)
-// or halts for Ring 0 faults (kernel panic)
-//
-// Stack on entry (after exception stub pushq $int_no / pushq $0):
-//   SS, RSP, RFLAGS, CS, RIP  (pushed by CPU)
-//   error_code                 (pushed by CPU or stub)
-//   int_no                     (pushed by stub)
-//   <-- RSP here, we push 15 GPRs below -->
-//
-// Layout we hand to handleException (pointed at GPR_start, *above* the FXSAVE
-// block): the handler's stack[15..] indexing is unchanged. The FXSAVE block
-// sits 512 bytes below the handler's view of RSP — recovered on exit via
-// `fxrstor (%rsp); add $512, %rsp` before popping GPRs.
-//
-// Alignment math at `call handleException`:
-//   CPU frame  =  5 qwords = 40 bytes
-//   stub-pushed (err + intno) = 16 bytes
-//   15 GPR pushes = 120 bytes
-//   FXSAVE block (sub $512)  = 512 bytes
-//   Total = 688 bytes ≡ 0 mod 16 — call enters callee with RSP%16==8 ✓
-// 16-alignment of the FXSAVE dest at (%rsp) holds (688 ≡ 0 mod 16). If you
-// EVER change the push count above without adjusting padding here, the
-// runtime guard below traps it instantly.
+// The stub every ExcStub thunk jumps to, with the vector number and an
+// error code (the CPU's, or the thunk's zero) pushed under the CPU's record:
+// frames.entry.exception. handleException gets the frame; it returns for a
+// fault it handled or charged to the task, and halts for a kernel one.
 export fn isr_common_exc() callconv(.naked) void {
-    // cld: delivery keeps the interrupted DF (user code may hold DF=1), and
-    // the handlers' rep-string memcpy/memset assume DF=0; iretq restores it.
-    asm volatile (
-        \\ cld
-        \\ pushq %%rax
-        \\ pushq %%rcx
-        \\ pushq %%rdx
-        \\ pushq %%rbx
-        \\ pushq %%rbp
-        \\ pushq %%rsi
-        \\ pushq %%rdi
-        \\ pushq %%r8
-        \\ pushq %%r9
-        \\ pushq %%r10
-        \\ pushq %%r11
-        \\ pushq %%r12
-        \\ pushq %%r13
-        \\ pushq %%r14
-        \\ pushq %%r15
-        \\ movw $0x10, %%ax
-        \\ movw %%ax, %%ds
-        \\ movw %%ax, %%es
-        \\ subq $512, %%rsp
-        \\ fxsaveq (%%rsp)
-        \\ leaq 512(%%rsp), %%rdi    // hand handler the GPR_start (skip FXSAVE)
-        \\ test $0xF, %%rsp
-        \\ jnz isr_common_exc_align_panic
-        \\ call handleException
-        \\ fxrstorq (%%rsp)
-        \\ addq $512, %%rsp
-        \\ popq %%r15
-        \\ popq %%r14
-        \\ popq %%r13
-        \\ popq %%r12
-        \\ popq %%r11
-        \\ popq %%r10
-        \\ popq %%r9
-        \\ popq %%r8
-        \\ popq %%rdi
-        \\ popq %%rsi
-        \\ popq %%rbp
-        \\ popq %%rbx
-        \\ popq %%rdx
-        \\ popq %%rcx
-        \\ popq %%rax
-        \\ addq $16, %%rsp
-        // Pre-iretq sanity check — see sched_asm.SAFE_IRETQ for the
-        // shared logic (also used by isr_irq0, retToUserStub, DynIrqStub).
-        ++ @import("../../proc/sched_asm.zig").SAFE_IRETQ);
-}
-
-// Alignment-violation panic target for isr_common_exc. Reaching here means
-// the push count in the exception stub got out of sync with the SysV 16-byte
-// stack-alignment requirement for `call`.
-pub export fn isr_common_exc_align_panic() callconv(.c) noreturn {
-    @panic("isr_common_exc: RSP misaligned at call handleException — recount pushes");
+    asm volatile (stub.handler(frames.entry.exception, "handleException", .frame));
 }

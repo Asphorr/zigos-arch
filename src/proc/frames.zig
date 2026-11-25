@@ -27,18 +27,14 @@
 //! publish points — stays hand-written; the spec owns only the frame
 //! geometry, which is exactly the part humans get wrong.
 //!
-//! Customers today: the first-dispatch contract below (sched_asm.zig's
+//! Customers: the first-dispatch contract below (sched_asm.zig's
 //! switchTo/retToUserStub + lifecycle.zig's SIX forges — the user trio
 //! create/clone/fork and the kthread trio idle/S3-replant/kernel-task)
-//! plus the six saved-RIP diagnostics addressing [kesp+saved_rip_off].
-//! The syscall and IRQ entry frames (their own push orders, their own
-//! hand-checked alignment comments — misc_irq.zig line 60) are future
-//! customers; convert them one at a time, each against its live
-//! disassembly. ⚠ Until then: signals.IrqFrame/ExcFrame and the
-//! IRQ-side push stubs are byte-identical to `dispatch.gprs` TODAY by
-//! shared convention, NOT by derivation — reordering dispatch.gprs
-//! "because it's derived now" would silently diverge four IRQ-side
-//! consumers. Convert them first, reorder after.
+//! plus the six saved-RIP diagnostics addressing [kesp+saved_rip_off];
+//! and the entry contract after it — what the interrupt and exception
+//! stubs (cpu/idt/stub.zig) leave on the stack, which their handlers and
+//! signals.IrqFrame/ExcFrame read. The syscall entry (syscall/entry.zig,
+//! signals.SyscallFrame) still counts by hand.
 
 const std = @import("std");
 
@@ -193,5 +189,120 @@ pub const dispatch = struct {
         // that one pushq %rsi lands the callq on ≡ 0.
         std.debug.assert(switch_frame.rspModAfter(8) == 8);
         std.debug.assert(Frame(&.{.rsi}).rspModAfter(switch_frame.rspModAfter(8)) == 0);
+    }
+};
+
+// ---------------- the entry contract -----------------------------------------
+//
+// What an interrupt or exception stub leaves on the kernel stack, low → high:
+//
+//   RSP at the call → [ FXSAVE image ][ padding ][ canary ]
+//   the frame       → [ saved registers ][ vector words ][ rip cs rflags rsp ss ]
+//
+// A handler that looks at what it interrupted is handed the frame. The CPU
+// pushes its record on an RSP it has first aligned to 16, so the padding
+// that makes the stub's call ABI-clean follows from the lists below; each
+// stub used to count it in a comment.
+
+/// The record the CPU pushes on an interrupt and iretq pops, by qword.
+pub const Iretq = enum(usize) { rip = 0, cs = 1, rflags = 2, rsp = 3, ss = 4 };
+
+pub const FXSAVE_BYTES: usize = 512;
+
+/// A word a stub pushes under its saved registers and compares on the way
+/// out: a write that climbs into the frame from below goes through it.
+/// The stub jumps to `panic` with the word's address; the frame is above.
+pub const Canary = struct { value: u31, panic: []const u8 };
+
+pub fn Entry(comptime spec: struct {
+    /// The registers the stub saves, as a Frame.
+    saved: type,
+    /// What the vector's thunk pushes under the CPU's record before the
+    /// stub proper, by name, lowest address first.
+    vector_words: []const []const u8 = &.{},
+    canary: ?Canary = null,
+}) type {
+    return struct {
+        pub const saved = spec.saved;
+        pub const vector_words = spec.vector_words;
+        pub const canary = spec.canary;
+
+        pub const vector_bytes = vector_words.len * 8;
+        const canary_bytes: usize = if (canary != null) 8 else 0;
+
+        /// The stub's `sub`: the FXSAVE image and, above it, the padding
+        /// that leaves RSP 16-aligned for the image and for the call.
+        pub const fp_bytes = FXSAVE_BYTES +
+            (dispatch.iretq_words * 8 + vector_bytes + saved.bytes + canary_bytes) % 16;
+
+        /// From the frame down to RSP at the call, where the image is.
+        pub const fp_below = fp_bytes + canary_bytes;
+
+        pub const qwords = saved.count + vector_words.len + dispatch.iretq_words;
+
+        /// Qword index within the frame of one of the CPU's words.
+        pub fn iretqIndex(comptime w: Iretq) usize {
+            return saved.count + vector_words.len + @intFromEnum(w);
+        }
+
+        /// The same word as a byte offset from RSP at the call.
+        pub fn iretqOffset(comptime w: Iretq) usize {
+            return fp_below + iretqIndex(w) * 8;
+        }
+
+        /// Refuse to compile unless extern struct `T` is this frame, field
+        /// for field: the handlers read the frame through such a struct.
+        pub fn assertMirror(comptime T: type) void {
+            const info = @typeInfo(T).@"struct";
+            if (info.layout != .@"extern" or info.fields.len != qwords) {
+                @compileError(@typeName(T) ++ " is not the frame its stub builds: wrong layout or field count");
+            }
+            for (saved.regs, 0..) |r, k| expectField(T, k, @tagName(r));
+            for (vector_words, 0..) |w, k| expectField(T, saved.count + k, w);
+            for (@typeInfo(Iretq).@"enum".fields) |w| {
+                expectField(T, saved.count + vector_words.len + w.value, w.name);
+            }
+        }
+    };
+}
+
+fn expectField(comptime T: type, comptime k: usize, comptime name: []const u8) void {
+    const f = @typeInfo(T).@"struct".fields[k];
+    if (!std.mem.eql(u8, f.name, name) or f.type != u64 or @offsetOf(T, f.name) != k * 8) {
+        @compileError(@typeName(T) ++ ": the stub puts '" ++ name ++ "' where the struct has '" ++ f.name ++ "'");
+    }
+}
+
+pub const entry = struct {
+    /// What a C handler may clobber: all a stub saves when its handler
+    /// never looks at what it interrupted.
+    pub const scratch = Frame(&.{ .r11, .r10, .r9, .r8, .rsi, .rdi, .rdx, .rcx, .rax });
+
+    /// A device interrupt or an IPI: keyboard, mouse, the TLB shootdown,
+    /// the PMI, the MSI-X vectors.
+    pub const device = Entry(.{ .saved = scratch });
+
+    /// The timer tick, which switches tasks and delivers signals: every
+    /// register, in the order a first dispatch pops them, and a canary.
+    pub const tick = Entry(.{
+        .saved = dispatch.gprs,
+        .canary = .{ .value = 0x7B0FF1CE, .panic = "isr_irq0_canary_panic" },
+    });
+
+    /// An exception. Its thunk pushes the vector number over the error
+    /// code, and a zero for the error code where the CPU pushes none.
+    pub const exception = Entry(.{
+        .saved = dispatch.gprs,
+        .vector_words = &.{ "int_no", "error_code" },
+    });
+
+    comptime {
+        // The numbers the stubs and their handlers carried by hand.
+        std.debug.assert(device.fp_bytes == 512 and device.fp_below == 512);
+        std.debug.assert(device.iretqOffset(.rip) == 584 and device.iretqOffset(.cs) == 592);
+        std.debug.assert(tick.fp_bytes == 520 and tick.fp_below == 528);
+        std.debug.assert(tick.iretqIndex(.rip) == 15 and tick.iretqIndex(.cs) == 16);
+        std.debug.assert(exception.fp_bytes == 512 and exception.fp_below == 512);
+        std.debug.assert(exception.iretqIndex(.rip) == 17 and exception.iretqIndex(.ss) == 21);
     }
 };

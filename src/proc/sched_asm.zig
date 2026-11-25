@@ -209,10 +209,11 @@ fn softYieldRaw() void {
 ///   - CS (RSP+8) is 0x08 (kernel) or 0x23 (user) — anything else is
 ///     a corrupt frame.
 ///
-/// On match: `iretq`. On mismatch: `jmp isr_iretq_corrupt_panic`, which
-/// dumps the bad frame and halts. Numeric labels 1f/2f are local to each
-/// `asm volatile` block, so concatenating this constant into multiple
-/// stubs doesn't cause symbol clashes.
+/// On match: `iretq`. On mismatch: `jmp isr_iretq_corrupt_panic` with the
+/// frame's address — the panic cannot find it by its own RSP, which its
+/// prologue has moved. Numeric labels 1f/2f are local to each `asm
+/// volatile` block, so concatenating this constant into multiple stubs
+/// doesn't cause symbol clashes.
 pub const SAFE_IRETQ = "\n" ++
     \\ cmpq $0x1000, 0(%%rsp)
     \\ jb 2f
@@ -221,6 +222,7 @@ pub const SAFE_IRETQ = "\n" ++
     \\ cmpq $0x23, 8(%%rsp)
     \\ je 1f
     \\ 2:
+    \\ movq %%rsp, %%rdi
     \\ jmp isr_iretq_corrupt_panic
     \\ 1:
     \\ iretq

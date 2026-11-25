@@ -260,13 +260,15 @@ pub const IretqSnap = struct {
     rip: u64,
 };
 
+const IrqFrame = @import("../proc/signals.zig").IrqFrame;
+
 /// Take a snapshot of CS/SS/RIP from the iretq frame. Caller stores the
 /// returned struct in a local and passes it to iretqValidate later.
-pub fn iretqSnapshot(frame_base: [*]const u64) IretqSnap {
+pub fn iretqSnapshot(frame: *const IrqFrame) IretqSnap {
     return .{
-        .cs = frame_base[16],
-        .ss = frame_base[19],
-        .rip = frame_base[15],
+        .cs = frame.cs,
+        .ss = frame.ss,
+        .rip = frame.rip,
     };
 }
 
@@ -290,18 +292,18 @@ pub fn iretqSnapshot(frame_base: [*]const u64) IretqSnap {
 /// happened, not who did it), but for narrowing down "did the corruption
 /// happen during THIS IRQ?" it's reliable.
 ///
-/// Address derivation: rsp_arg is the pointer handleIRQ0 receives, set
-/// by isr_irq0's `lea 0x200(%rsp), %rdi` BEFORE the `call`. So:
-///   pre_call_RSP    = rsp_arg - 0x200
-///   saved_ret_slot  = pre_call_RSP - 8 = rsp_arg - 0x208 = rsp_arg - 520
+/// The slot: handleIRQ0 is handed its frame, isr_irq0's RSP at the call is
+/// `fp_below` under that, and the call pushes the return address under it.
+const IRQ0_RET_BELOW: u64 = @import("../proc/frames.zig").entry.tick.fp_below + 8;
+
 pub fn snapshotHandleIRQ0RetAddr(rsp_arg: u64) u64 {
-    const slot_va = rsp_arg - 520;
+    const slot_va = rsp_arg - IRQ0_RET_BELOW;
     const ptr: *const u64 = @ptrFromInt(slot_va);
     return ptr.*;
 }
 
 pub fn validateHandleIRQ0RetAddr(rsp_arg: u64, snap: u64) void {
-    const slot_va = rsp_arg - 520;
+    const slot_va = rsp_arg - IRQ0_RET_BELOW;
     const ptr: *const u64 = @ptrFromInt(slot_va);
     const now = ptr.*;
     if (now == snap) return;
@@ -355,9 +357,9 @@ fn safeSymbolPrint(addr: u64) void {
     }
 }
 
-pub fn iretqValidate(frame_base: [*]const u64, snap: IretqSnap) void {
-    const cs_now = frame_base[16];
-    const ss_now = frame_base[19];
+pub fn iretqValidate(frame: *const IrqFrame, snap: IretqSnap) void {
+    const cs_now = frame.cs;
+    const ss_now = frame.ss;
     const cs_ok = cs_now == snap.cs;
     const ss_ok = ss_now == snap.ss;
     if (cs_ok and ss_ok) return;
@@ -373,17 +375,17 @@ pub fn iretqValidate(frame_base: [*]const u64, snap: IretqSnap) void {
     // Bad frame — print snapshot vs current. The diff tells us EXACTLY which
     // slot changed during the IRQ handler.
     serial.print("\n!!! iretq frame corruption detected before iretq (cpu={d}) !!!\n", .{id});
-    serial.print("  frame_addr=0x{X:0>16}\n", .{@intFromPtr(&frame_base[15])});
+    serial.print("  frame_addr=0x{X:0>16}\n", .{@intFromPtr(&frame.rip)});
     serial.print("  RIP at entry: 0x{X:0>16} ", .{snap.rip});
     safeSymbolPrint(snap.rip);
-    serial.print("\n  RIP now:      0x{X:0>16} ", .{frame_base[15]});
-    safeSymbolPrint(frame_base[15]);
+    serial.print("\n  RIP now:      0x{X:0>16} ", .{frame.rip});
+    safeSymbolPrint(frame.rip);
     serial.print("\n", .{});
     serial.print("  CS at entry:  0x{X:0>16}\n", .{snap.cs});
     serial.print("  CS now:       0x{X:0>16}", .{cs_now});
     if (!cs_ok) serial.print("  <-- CHANGED during IRQ", .{});
-    serial.print("\n  RFLAGS now:   0x{X:0>16}\n", .{frame_base[17]});
-    serial.print("  RSP now:      0x{X:0>16}\n", .{frame_base[18]});
+    serial.print("\n  RFLAGS now:   0x{X:0>16}\n", .{frame.rflags});
+    serial.print("  RSP now:      0x{X:0>16}\n", .{frame.rsp});
     serial.print("  SS at entry:  0x{X:0>16}\n", .{snap.ss});
     serial.print("  SS now:       0x{X:0>16}", .{ss_now});
     if (!ss_ok) serial.print("  <-- CHANGED during IRQ", .{});

@@ -1,11 +1,11 @@
 //! LAPIC timer IRQ (vector 0x20) — the hot path:
-//!   - isr_irq0          : naked asm trampoline (push GPRs + FXSAVE + call)
+//!   - isr_irq0          : the entry stub, frames.entry.tick
 //!   - handleIRQ0        : the Zig body — wallclock advance, watchdog peer
 //!                         check, schedule + preempt decision, signal
 //!                         delivery
 //!   - deliverPendingToReturnFrame, rearmTimerForCurrent : helpers
 //!   - hb_state_count_page : 4KB-isolated BSP heartbeat counter
-//!   - isr_irq0_align_panic, isr_irq0_canary_panic       : exported targets
+//!   - isr_irq0_canary_panic : where the stub goes when its canary changed
 //!
 //! See cpu/idt.zig for the IDT entry-table layout and the init() wiring.
 
@@ -21,6 +21,8 @@ const signals = @import("../../proc/signals.zig");
 const perf = @import("../../debug/perf.zig");
 const hrtimer = @import("../../proc/hrtimer.zig");
 const spinlock = @import("../../proc/spinlock.zig");
+const stub = @import("stub.zig");
+const tick = @import("../../proc/frames.zig").entry.tick;
 
 // TSC watermark for the elapsed-time wallclock advance (#1006). BSP-only,
 // mutated solely inside handleIRQ0's `!was_soft_yield` block with IRQs off — no
@@ -44,13 +46,9 @@ var next_kesp_tick: u64 = @import("../../debug/watch.zig").KESP_REROTATE_TICKS;
 var next_lb_tick: u64 = 50;
 var next_nudge_tick: u64 = 100;
 
-/// IRQ0 stack-canary magic — pushed below the 15 GPRs at IRQ entry, verified
-/// before iretq. Used by both the isr_irq0 asm (literal embedded for the
-/// pushq immediate / cmpq immediate via comptimePrint) AND
-/// isr_irq0_canary_panic's printed banner. Single named source.
-pub const IRQ0_CANARY: u64 = 0x7B0FF1CE;
-
-const IRQ0_CANARY_STR = std.fmt.comptimePrint("0x{X}", .{IRQ0_CANARY});
+/// The word isr_irq0 pushes under the saved registers and compares before
+/// it returns (frames.entry.tick).
+pub const IRQ0_CANARY: u64 = tick.canary.?.value;
 
 /// 4KB-isolated heartbeat counter. Lives in its own page so the MMU
 /// write-watch (paging.installWriteWatch) catches ANY writer to the page —
@@ -76,9 +74,9 @@ pub var hb_state_count_page: HbCountPage align(4096) = .{};
 /// builds. Was load-bearing during the 2026-05-17 iretq-corruption hunt;
 /// structurally fixed by the IST=1 / per-CPU isr_stack rework (Shape D).
 const BISECT_ENABLED = false;
-inline fn bisectPoint(comptime label: []const u8, frame: [*]const u64, snap: @import("../../debug/kdbg.zig").IretqSnap) void {
+inline fn bisectPoint(comptime label: []const u8, frame: *const signals.IrqFrame, snap: @import("../../debug/kdbg.zig").IretqSnap) void {
     if (comptime !BISECT_ENABLED) return;
-    if (frame[16] == snap.cs and frame[19] == snap.ss) return;
+    if (frame.cs == snap.cs and frame.ss == snap.ss) return;
     serial.print("[bisect] CORRUPTED AT: {s}\n", .{label});
     @import("../../debug/kdbg.zig").iretqValidate(frame, snap);
 }
@@ -105,7 +103,7 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
     // must be on a live kstack. If we entered IRQ0 on a kstack whose owner
     // already exited, the body has been poisoned by markPcbDead and we trip
     // here with backtrace pointing at handleIRQ0's caller.
-    @import("../../debug/kasan.zig").expectValid(rsp, 160);
+    @import("../../debug/kasan.zig").expectValid(rsp, @sizeOf(signals.IrqFrame));
 
     // Tier B.3: stack-alias live detector. Verifies our IRQ-entry RSP is
     // inside cpu.current_pid's expected kstack slot. Catches the cross-
@@ -123,17 +121,21 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
     // tasks migrate between CPUs across schedule(), so a per-CPU global
     // would compare against the wrong IRQ when the task wakes up on a
     // different CPU. Stack-local travels with the task.
-    const frame_for_validate: [*]const u64 = @ptrFromInt(rsp);
-    const irq_snap = @import("../../debug/kdbg.zig").iretqSnapshot(frame_for_validate);
-    defer @import("../../debug/kdbg.zig").iretqValidate(frame_for_validate, irq_snap);
+    const frame: *const signals.IrqFrame = @ptrFromInt(rsp);
+    const irq_snap = @import("../../debug/kdbg.zig").iretqSnapshot(frame);
+    defer @import("../../debug/kdbg.zig").iretqValidate(frame, irq_snap);
+
+    // The frame as qwords, for the checks that take a base and an index.
+    const words: [*]const u64 = @ptrFromInt(rsp);
+    const rip_index = comptime tick.iretqIndex(.rip);
 
     // Wild-RIP hunt (task #224). Validate the saved RIP is in the user VA
     // range whenever we're about to iretq back to user mode. If something
-    // wrote 0x80000C (or any non-user value) into frame[15] during this IRQ,
+    // wrote 0x80000C (or any non-user value) into frame.rip during this IRQ,
     // we panic HERE with the kernel stack still loaded — instead of letting
     // the bad RIP cause a #GP after iretq, by which point the kernel call
     // path that wrote it is gone.
-    defer @import("../../debug/kdbg.zig").validateUserReturnIretq(frame_for_validate, 15, 16);
+    defer @import("../../debug/kdbg.zig").validateUserReturnIretq(words, rip_index, rip_index + 1);
 
     // iretq-frame tripwire (task #230). Snapshot the iretq frame into the
     // current PCB so any kernel function calling
@@ -142,7 +144,7 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
     // slot (write-only, panic_dump) so the writer's instruction is caught
     // SYNCHRONOUSLY via #DB. invalidate() disarms DR0 and clears the
     // snapshot just before the iretq instruction.
-    @import("../../debug/iretq_canary.zig").capture(frame_for_validate, 15);
+    @import("../../debug/iretq_canary.zig").capture(words, rip_index);
     defer @import("../../debug/iretq_canary.zig").invalidate();
 
     // Software snap+validate for the `call handleIRQ0` saved-return-address
@@ -166,19 +168,19 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
         @import("../../syscall.zig").chargeInterrupt(t);
     };
     const cpu = smp.myCpu();
-    @import("../../debug/linux_prof.zig").tick(cpu.current_pid, frame_for_validate[15], frame_for_validate[16]);
+    @import("../../debug/linux_prof.zig").tick(cpu.current_pid, frame.rip, frame.cs);
     // Once a second: TSC_AUX (what myCpu() just trusted) still equals the
     // LAPIC ID register, or demote everyone. See smp.auditCpuIdTick.
     smp.auditCpuIdTick();
 
-    bisectPoint("entry", frame_for_validate, irq_snap);
+    bisectPoint("entry", frame, irq_snap);
 
     // Record this IRQ entry into the kdbg ring so post-mortem (if we DON'T
     // catch corruption via the validate above) shows what was running on
     // each CPU at each tick.
     {
         const pid_now: u8 = if (cpu.current_pid) |p| @intCast(p) else 0xFF;
-        @import("../../debug/kdbg.zig").irqEvent(0, pid_now, frame_for_validate[15], @truncate(frame_for_validate[16]));
+        @import("../../debug/kdbg.zig").irqEvent(0, pid_now, frame.rip, @truncate(frame.cs));
         // Breadcrumb: stamp BEFORE invariant scan so if the scan panics
         // the autopsy reflects we were in the IRQ0 path on this CPU.
         @import("../../debug/breadcrumb.zig").stamp(.irq0_timer, pid_now);
@@ -223,14 +225,14 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
     // the soft-yield path would re-wake ksoftirqd through its OWN blockOn-driven
     // int $0x20 and spin it solid — caught in boot-verify as ~1600 drains/tick
     // with tick_count frozen.
-    bisectPoint("after irqEvent", frame_for_validate, irq_snap);
+    bisectPoint("after irqEvent", frame, irq_snap);
 
     // Sync this CPU's DR0-DR3+DR7 from the watch manager's canonical state.
     // Cheap (5 mov-to-DRn) and gives us "global" semantics without a
     // dedicated IPI vector: arm/disarm on any CPU, every other CPU picks
     // it up within one timer tick (~10ms).
     @import("../../debug/watch.zig").applyLocal();
-    bisectPoint("after applyLocal", frame_for_validate, irq_snap);
+    bisectPoint("after applyLocal", frame, irq_snap);
 
     // Read+clear the soft-yield flag set by the int $0x20 issuer (sysYield,
     // sysSleep, sysWaitpid, pipe block). We use this to distinguish a real
@@ -291,14 +293,11 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
     // Per-CPU execution trail — record where this CPU was interrupted.
     // Dumped from panic / watchdog autopsy so we can see recent execution
     // history even when stack walking is impossible (corrupt rbp, leaf
-    // function freeze, NMI-handler-never-returned). saved_rip is at
-    // stack[15] (15 GPRs pushed before RIP). 128-entry per-CPU ring,
+    // function freeze, NMI-handler-never-returned). 128-entry per-CPU ring,
     // ~1.3s of history at 100 Hz.
-    @import("../../debug/exectrail.zig").recordIrq(frame_for_validate[15]);
+    @import("../../debug/exectrail.zig").recordIrq(frame.rip);
 
-    const stack: [*]const u64 = @ptrFromInt(rsp);
-    const saved_cs = stack[16]; // 15 GPRs [0..14] + RIP [15] + CS [16]
-    const from_user = (saved_cs & 3) != 0;
+    const from_user = (frame.cs & 3) != 0;
 
     // BSP-only wallclock work: tick_count advance, expired-sleep wake-ups,
     // HID polling, sound mixer pump, GDB break check. Gated on hardware IRQ
@@ -336,7 +335,7 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
         }
         if (n_ticks > 0) {
             process.tick_count += n_ticks;
-            bisectPoint("after tick++", frame_for_validate, irq_snap);
+            bisectPoint("after tick++", frame, irq_snap);
             // Parked-desktop due-check, BEFORE wakeExpired so the wake
             // lands THIS fire (not 10ms later): input/self-wake sources
             // that don't call sched.wake() (keyboard ring, mouse.moved,
@@ -355,11 +354,11 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
                 }
             }
             process.wakeExpired();
-            bisectPoint("after wakeExpired", frame_for_validate, irq_snap);
+            bisectPoint("after wakeExpired", frame, irq_snap);
             process.deliverDueAlarms();
-            bisectPoint("after deliverDueAlarms", frame_for_validate, irq_snap);
+            bisectPoint("after deliverDueAlarms", frame, irq_snap);
             @import("../../driver.zig").sound.tick();
-            bisectPoint("after sound.tick", frame_for_validate, irq_snap);
+            bisectPoint("after sound.tick", frame, irq_snap);
 
             // Device lost-IRQ backstop sweeps (HID, NVMe, virtio-gpu), deferred
             // to ksoftirqd (bottom-half, IF=1) instead of run inline here at
@@ -420,7 +419,7 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
             }
 
             @import("../../debug/gdb_stub.zig").checkForBreak();
-            bisectPoint("after gdb checkForBreak", frame_for_validate, irq_snap);
+            bisectPoint("after gdb checkForBreak", frame, irq_snap);
             // Auto-dump perf counters every ~5 seconds (500 ticks at 100Hz). The
             // counters survive the dump (no implicit reset) so the next dump shows
             // accumulated cost since boot. Use `perf reset` from the CLI to zero.
@@ -458,7 +457,7 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
             }
         }
     }
-    bisectPoint("after BSP wallclock", frame_for_validate, irq_snap);
+    bisectPoint("after BSP wallclock", frame, irq_snap);
 
     // CFS preemption check — re-enabled 2026-05-10 after the wake-race
     // fixes (project_wake_race_fixes.md) resolved the shell-freeze. The
@@ -469,7 +468,7 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
     // preempt boundaries (via setState's .running→non-running path) which
     // works but is less timely.
     if (!was_soft_yield) process.checkPreempt();
-    bisectPoint("after checkPreempt", frame_for_validate, irq_snap);
+    bisectPoint("after checkPreempt", frame, irq_snap);
     const wake_preempt = cpu.cpu_id == 0 and !was_soft_yield and
         @import("../../proc/sched.zig").takeLocalWakePreempt();
 
@@ -495,7 +494,7 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
                 pcb.acct_cpu_ticks += 1;
                 cpu.dynirq_preempt_pending = true;
                 pcb.body_ticks +%= 1;
-                if (pcb.body_ticks % SOFT_LOCKUP_TICKS == 0) reportSoftLockup(pid, pcb, frame_for_validate[15]);
+                if (pcb.body_ticks % SOFT_LOCKUP_TICKS == 0) reportSoftLockup(pid, pcb, frame.rip);
             } else if (pcb.in_syscall and wake_preempt) {
                 cpu.dynirq_preempt_pending = true;
             }
@@ -518,9 +517,9 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
         // Hardware IRQ needs an EOI; software int $0x20 doesn't (LAPIC ISR
         // bit was never set), but EOI on a non-asserted vector is harmless.
         if (!was_soft_yield) sendEOI();
-        bisectPoint("after sendEOI", frame_for_validate, irq_snap);
+        bisectPoint("after sendEOI", frame, irq_snap);
         if (!was_soft_yield) rearmTimerForCurrent(cpu);
-        bisectPoint("after rearmTimer", frame_for_validate, irq_snap);
+        bisectPoint("after rearmTimer", frame, irq_snap);
 
         // Desktop force-yield only on BSP and only when preempting user
         // code. desktop is now a normal interactive-priority kernel task,
@@ -532,18 +531,18 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
             if (desktop.active and (desktop.shouldResumeDesktop() or force_yield)) {
                 if (cpu.current_pid) |pid| process.getPCB(pid).ticks_used = 0;
                 deliverPendingToReturnFrame(cpu, rsp);
-                bisectPoint("after force_yield deliverSignals", frame_for_validate, irq_snap);
+                bisectPoint("after force_yield deliverSignals", frame, irq_snap);
                 spinlock.hardirqExit();
                 perf.leave(.irq0_timer, t);
                 irq0_measured = true;
                 process.schedule();
-                bisectPoint("after force_yield schedule RESUME", frame_for_validate, irq_snap);
+                bisectPoint("after force_yield schedule RESUME", frame, irq_snap);
                 // When this task is later re-dispatched, schedule returns.
                 // Fall through to normal exit below.
                 return;
             }
         }
-        bisectPoint("after force_yield branch", frame_for_validate, irq_snap);
+        bisectPoint("after force_yield branch", frame, irq_snap);
 
         // Deliver pending signals on the way back to user. We deliver here
         // (before schedule) so that the signal-frame mutation targets THIS
@@ -551,7 +550,7 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
         // isr_irq0 will pop after handleIRQ0 returns. Skip when returning
         // to kernel mode or for tasks already in a handler.
         deliverPendingToReturnFrame(cpu, rsp);
-        bisectPoint("after deliverPendingToReturnFrame", frame_for_validate, irq_snap);
+        bisectPoint("after deliverPendingToReturnFrame", frame, irq_snap);
 
         // Run the scheduler. schedule() may switch to another task via
         // switchTo (kernel-to-kernel ret) and eventually return here when
@@ -566,16 +565,16 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
         } else {
             process.schedule();
         }
-        bisectPoint("after schedule RESUME", frame_for_validate, irq_snap);
+        bisectPoint("after schedule RESUME", frame, irq_snap);
         return;
     }
 
     sendEOI();
-    bisectPoint("kernel-mode after sendEOI", frame_for_validate, irq_snap);
+    bisectPoint("kernel-mode after sendEOI", frame, irq_snap);
     rearmTimerForCurrent(cpu);
-    bisectPoint("kernel-mode after rearmTimer", frame_for_validate, irq_snap);
+    bisectPoint("kernel-mode after rearmTimer", frame, irq_snap);
     deliverPendingToReturnFrame(cpu, rsp);
-    bisectPoint("kernel-mode after deliverPending", frame_for_validate, irq_snap);
+    bisectPoint("kernel-mode after deliverPending", frame, irq_snap);
 }
 
 /// Ticks inside one syscall body before [soft-lockup] (5 s of its CPU time
@@ -1119,124 +1118,49 @@ fn dumpTickless() void {
     serial.print("[tickless] earliest wake +{d} t: no pid carries it (registered, not yet parked, or stale — next scan heals)\n", .{in_ticks});
 }
 
-// Timer IRQ stub — push 15 GPRs, call handleIRQ0 (context switch),
-// In the new (Linux-style) model, isr_irq0 does NOT swap rsp mid-function.
-// Context switching is handled inside handleIRQ0 → schedule() → switchTo,
-// which uses kernel-to-kernel `ret` to land THIS isr_irq0 instance back on
-// the same kstack it started on (just paused while another task ran).
-// When isr_irq0 resumes, it pops fxsave+GPRs from the SAME kstack that the
-// pt_regs were saved on (i.e., the caller task's kstack), and iretq exits
-// to wherever that task was running.
+// The timer's entry stub: every register, a canary under them, and
+// handleIRQ0 with the frame (frames.entry.tick).
 //
-// KASAN frame canary: IRQ0_CANARY is pushed BEFORE the GPRs at IRQ entry
-// and verified BEFORE iretq on exit. If a wild writer scribbles within
-// ~528 bytes of the iretq frame between entry and exit, the canary slot
-// is overwritten and isr_irq0_canary_panic fires with kdbg autopsy. The
-// 8B canary push forces an 8B alignment compensation in the FXSAVE
-// scratch (520 instead of 512) to keep `call handleIRQ0` 16-byte aligned
-// per SysV ABI.
+// It never moves RSP off the interrupted task's kernel stack. A switch
+// happens inside handleIRQ0 → schedule() → switchTo, whose kernel-to-kernel
+// `ret` later lands this same instance back on the stack it started on; it
+// then restores from the frame it saved there and returns to wherever that
+// task was.
 //
-// Alignment math at `call handleIRQ0`:
-//   CPU frame = 40 bytes, 15 GPRs = 120 bytes, FXSAVE = 512 bytes → 672B ≡ 0 ✓
+// The canary: a wild write that climbs into the frame from below — the
+// FXSAVE image is 512 bytes of it — goes through the word first, and
+// isr_irq0_canary_panic fires before the iretq that would use the frame.
 pub fn isr_irq0() callconv(.naked) void {
-    // cld: see isr_common_exc.
-    asm volatile (
-        \\ cld
-        \\ pushq %%rax
-        \\ pushq %%rcx
-        \\ pushq %%rdx
-        \\ pushq %%rbx
-        \\ pushq %%rbp
-        \\ pushq %%rsi
-        \\ pushq %%rdi
-        \\ pushq %%r8
-        \\ pushq %%r9
-        \\ pushq %%r10
-        \\ pushq %%r11
-        \\ pushq %%r12
-        \\ pushq %%r13
-        \\ pushq %%r14
-        \\ pushq %%r15
-        // KASAN canary, sits BELOW the 15 GPRs so iretq-frame indices in iretqValidate stay unchanged
-        ++ "\npushq $" ++ IRQ0_CANARY_STR ++ "\n" ++
-        \\ movw $0x10, %%ax
-        \\ movw %%ax, %%ds
-        \\ movw %%ax, %%es
-        \\ subq $520, %%rsp          // FXSAVE 512 + 8 padding to keep `call` 16-byte aligned (canary push added 8B)
-        \\ fxsaveq (%%rsp)
-        \\ leaq 528(%%rsp), %%rdi    // GPR_start = skip FXSAVE (520) + canary slot (8)
-        \\ test $0xF, %%rsp
-        \\ jnz isr_irq0_align_panic
-        \\ call handleIRQ0
-        \\ fxrstorq (%%rsp)
-        \\ addq $520, %%rsp          // back to canary slot
-        // canary must be intact — slot still holds IRQ0_CANARY
-        ++ "\ncmpq $" ++ IRQ0_CANARY_STR ++ ", (%%rsp)\n" ++
-        \\ jne isr_irq0_canary_panic
-        \\ addq $8, %%rsp            // pop canary
-        \\ popq %%r15
-        \\ popq %%r14
-        \\ popq %%r13
-        \\ popq %%r12
-        \\ popq %%r11
-        \\ popq %%r10
-        \\ popq %%r9
-        \\ popq %%r8
-        \\ popq %%rdi
-        \\ popq %%rsi
-        \\ popq %%rbp
-        \\ popq %%rbx
-        \\ popq %%rdx
-        \\ popq %%rcx
-        \\ popq %%rax
-        // Pre-iretq sanity check — wild-iretq-frame bug hits with valid
-        // CS=0x08 but wild RIP=0x3, so checking CS alone is insufficient.
-        // sched_asm.SAFE_IRETQ asserts RIP >= 0x1000 AND CS in {0x08, 0x23}.
-        ++ @import("../../proc/sched_asm.zig").SAFE_IRETQ);
+    asm volatile (stub.handler(tick, "handleIRQ0", .frame));
 }
 
-pub export fn isr_irq0_align_panic() callconv(.c) noreturn {
-    @panic("isr_irq0: RSP misaligned at call handleIRQ0 — recount pushes");
-}
-
-/// Reached via `jne` from isr_irq0 epilogue when the canary slot just below
-/// the iretq frame doesn't match the magic we pushed at entry. Stack layout
-/// at jump time: %rsp points at the corrupted canary slot; iretq frame
-/// (RIP, CS, RFLAGS, RSP, SS) sits at %rsp+8..%rsp+48. The function reads
-/// both and reports them; if the iretq RIP itself looks bad too, the writer
-/// hit a wider span than just the canary.
-pub export fn isr_irq0_canary_panic() callconv(.c) noreturn {
+/// Where isr_irq0 jumps when its canary changed. `rsp_now` is the canary's
+/// address, handed over by the stub; the frame is above it. If the frame's
+/// RIP looks bad too, the writer covered more than the one word.
+pub export fn isr_irq0_canary_panic(rsp_now: u64) callconv(.c) noreturn {
     const sym = @import("../../debug/symbols.zig");
 
-    const rsp_now: u64 = asm volatile ("mov %%rsp, %[r]"
-        : [r] "=r" (-> u64),
-    );
-    // Layout from rsp_now (canary slot) going UP toward kstack top:
-    //   slots[0]      = canary slot
-    //   slots[1..16]  = 15 saved GPRs in push order: r15, r14, r13, r12, r11,
-    //                   r10, r9, r8, rdi, rsi, rbp, rbx, rdx, rcx, rax
-    //   slots[16..21] = iretq frame: RIP, CS, RFLAGS, RSP, SS
-    const slots: [*]const u64 = @ptrFromInt(rsp_now);
-    const got_canary = slots[0];
+    const got_canary = @as(*const u64, @ptrFromInt(rsp_now)).*;
+    const frame: *const signals.IrqFrame = @ptrFromInt(rsp_now + 8);
+    const words: [*]const u64 = @ptrCast(frame);
 
     serial.print("\n!!! isr_irq0 CANARY CLOBBERED — wild writer scribbled IRQ frame !!!\n", .{});
     serial.print("  canary slot 0x{X:0>16}: expected 0x{X:0>16}, got 0x{X:0>16}\n", .{ rsp_now, IRQ0_CANARY, got_canary });
 
-    serial.print("  saved GPRs (push order, bottom→top):\n", .{});
-    const gpr_names = [_][]const u8{ "r15", "r14", "r13", "r12", "r11", "r10", "r9 ", "r8 ", "rdi", "rsi", "rbp", "rbx", "rdx", "rcx", "rax" };
-    for (gpr_names, 0..) |name, i| {
-        serial.print("    {s} = 0x{X:0>16}\n", .{ name, slots[1 + i] });
+    serial.print("  saved GPRs (bottom→top):\n", .{});
+    inline for (tick.saved.regs, 0..) |reg, i| {
+        serial.print("    {s: <3} = 0x{X:0>16}\n", .{ @tagName(reg), words[i] });
     }
 
     serial.print("  iretq frame:\n", .{});
-    serial.print("    RIP   =0x{X:0>16}", .{slots[16]});
-    if (sym.resolveKernel(slots[16])) |r| {
+    serial.print("    RIP   =0x{X:0>16}", .{frame.rip});
+    if (sym.resolveKernel(frame.rip)) |r| {
         serial.print("  ({s}+0x{X})", .{ r.name, r.offset });
     }
-    serial.print("\n    CS    =0x{X:0>4}\n", .{slots[17]});
-    serial.print("    RFLAGS=0x{X:0>16}\n", .{slots[18]});
-    serial.print("    RSP   =0x{X:0>16}\n", .{slots[19]});
-    serial.print("    SS    =0x{X:0>4}\n", .{slots[20]});
+    serial.print("\n    CS    =0x{X:0>4}\n", .{frame.cs});
+    serial.print("    RFLAGS=0x{X:0>16}\n", .{frame.rflags});
+    serial.print("    RSP   =0x{X:0>16}\n", .{frame.rsp});
+    serial.print("    SS    =0x{X:0>4}\n", .{frame.ss});
 
     @import("../../debug/kdbg.zig").crashAutopsy(.{ .kernel_rsp = rsp_now });
     @panic("isr_irq0 canary clobbered — wild writer caught");

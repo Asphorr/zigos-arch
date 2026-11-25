@@ -33,6 +33,7 @@ const std = @import("std");
 // File-scope hoist (LLVM Invalid-type roulette: no decl-heavy @import
 // inside the giant handler bodies below).
 const SAVED_RIP_OFF: usize = @import("../proc/frames.zig").dispatch.saved_rip_off;
+const ExcFrame = @import("../proc/signals.zig").ExcFrame;
 const apic = @import("../irq/apic.zig");
 const smp = @import("../cpu/smp.zig");
 const serial = @import("serial.zig");
@@ -652,8 +653,8 @@ pub fn onDebugException(rsp: u64, saved_rip: u64) bool {
         // trap-type and don't need this; panic_dump never returns, so only
         // the continue policies reach here.
         if (e.kind == .exec) {
-            const stk: [*]volatile u64 = @ptrFromInt(rsp);
-            stk[19] |= @as(u64, 1) << 16;
+            const frame: *ExcFrame = @ptrFromInt(rsp);
+            frame.rflags |= @as(u64, 1) << 16;
         }
     }
     // Clear ONLY the sticky B0..B3 latches; preserve BS/BD for the legacy
@@ -687,20 +688,14 @@ fn printHit(slot: u8, e: *const WatchEntry, rsp: u64, saved_rip: u64, full: bool
     serial.print("  RIP=0x{X:0>16} -> {s}\n", .{ saved_rip, addrinfo.describe(saved_rip) });
     if (!full) return;
 
-    // Stack layout matches idt.zig's handleException (see comment there):
-    //   [0]  r15  [1]  r14  [2]  r13  [3]  r12
-    //   [4]  r11  [5]  r10  [6]  r9   [7]  r8
-    //   [8]  rdi  [9]  rsi  [10] rbp  [11] rbx
-    //   [12] rdx  [13] rcx  [14] rax
-    //   [15] int_no  [16] error_code
-    //   [17] rip  [18] cs  [19] rflags  [20] rsp  [21] ss
-    const stack: [*]const u64 = @ptrFromInt(rsp);
-    serial.print("  RAX=0x{X:0>16} RBX=0x{X:0>16} RCX=0x{X:0>16} RDX=0x{X:0>16}\n", .{ stack[14], stack[11], stack[13], stack[12] });
-    serial.print("  RSI=0x{X:0>16} RDI=0x{X:0>16} R8 =0x{X:0>16} R9 =0x{X:0>16}\n", .{ stack[9], stack[8], stack[7], stack[6] });
-    serial.print("  R10=0x{X:0>16} R11=0x{X:0>16} R12=0x{X:0>16} R13=0x{X:0>16}\n", .{ stack[5], stack[4], stack[3], stack[2] });
-    serial.print("  R14=0x{X:0>16} R15=0x{X:0>16}\n", .{ stack[1], stack[0] });
-    serial.print("  RBP=0x{X:0>16} RSP=0x{X:0>16} RFLAGS=0x{X:0>16}\n", .{ stack[10], stack[20], stack[19] });
-    serial.print("  CS =0x{X:0>4}             SS =0x{X:0>4}\n", .{ stack[18], stack[21] });
+    // `rsp` is the frame handleException was handed.
+    const frame: *const ExcFrame = @ptrFromInt(rsp);
+    serial.print("  RAX=0x{X:0>16} RBX=0x{X:0>16} RCX=0x{X:0>16} RDX=0x{X:0>16}\n", .{ frame.rax, frame.rbx, frame.rcx, frame.rdx });
+    serial.print("  RSI=0x{X:0>16} RDI=0x{X:0>16} R8 =0x{X:0>16} R9 =0x{X:0>16}\n", .{ frame.rsi, frame.rdi, frame.r8, frame.r9 });
+    serial.print("  R10=0x{X:0>16} R11=0x{X:0>16} R12=0x{X:0>16} R13=0x{X:0>16}\n", .{ frame.r10, frame.r11, frame.r12, frame.r13 });
+    serial.print("  R14=0x{X:0>16} R15=0x{X:0>16}\n", .{ frame.r14, frame.r15 });
+    serial.print("  RBP=0x{X:0>16} RSP=0x{X:0>16} RFLAGS=0x{X:0>16}\n", .{ frame.rbp, frame.rsp, frame.rflags });
+    serial.print("  CS =0x{X:0>4}             SS =0x{X:0>4}\n", .{ frame.cs, frame.ss });
 
     // Code bytes at writer RIP. Cap at the next page so we don't fault on
     // an unmapped following page.
@@ -720,7 +715,7 @@ fn printHit(slot: u8, e: *const WatchEntry, rsp: u64, saved_rip: u64, full: bool
     // hitting this would be CS==0x23 (and we'd usually want a different
     // walker), but we don't bail because watch hits in user mode are still
     // informative.
-    const saved_rbp = stack[10];
+    const saved_rbp = frame.rbp;
     // Kernel rbp is either the legacy boot stack (low phys, only alive
     // pre-enterFirstTask) or a high-half kstack (kstack_pool in kernel
     // BSS, or heap-allocated via the physmap). Anything else is junk —
@@ -739,15 +734,15 @@ fn printHit(slot: u8, e: *const WatchEntry, rsp: u64, saved_rip: u64, full: bool
             // Reject non-canonical pointers (the gap between low and high half).
             if (rbp >= 0x0000_8000_0000_0000 and rbp < 0xFFFF_8000_0000_0000) break;
             if ((rbp & 7) != 0) break; // misaligned — corrupt rbp
-            const frame: [*]const u64 = @ptrFromInt(rbp);
-            const ret_addr = frame[1];
+            const link: [*]const u64 = @ptrFromInt(rbp);
+            const ret_addr = link[1];
             if (ret_addr == 0) break;
             serial.print("    [{d}] 0x{X:0>16}", .{ depth, ret_addr });
             if (symbols.resolveKernel(ret_addr)) |r| {
                 serial.print("  {s}+0x{X}", .{ r.name, r.offset });
             }
             serial.print("\n", .{});
-            const next = frame[0];
+            const next = link[0];
             if (next <= rbp) break;
             rbp = next;
         }
@@ -759,7 +754,7 @@ fn printHit(slot: u8, e: *const WatchEntry, rsp: u64, saved_rip: u64, full: bool
     // stack that decodes to a plausible kernel-text return site instead.
     // Noisy by design (stale values included); read it as "the set of
     // functions recently live on this stack", newest first.
-    const int_rsp = stack[20];
+    const int_rsp = frame.rsp;
     if (int_rsp >= 0xFFFF_8000_0000_0000 and (int_rsp & 7) == 0) {
         serial.print("  RA scan (raw, from interrupted RSP):\n", .{});
         const sp: [*]const u64 = @ptrFromInt(int_rsp);

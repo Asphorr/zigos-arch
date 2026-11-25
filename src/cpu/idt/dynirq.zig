@@ -13,6 +13,11 @@ const std = @import("std");
 const debug = @import("../../debug/debug.zig");
 const serial = @import("../../debug/serial.zig");
 const apic = @import("../../irq/apic.zig");
+const stub = @import("stub.zig");
+const device = @import("../../proc/frames.zig").entry.device;
+
+/// Where the stub finds the interrupted CS, from RSP at the FXSAVE image.
+const CS_OFFSET_STR = std.fmt.comptimePrint("{d}", .{device.iretqOffset(.cs)});
 
 pub const DYN_IRQ_BASE: u8 = 0x40;
 pub const DYN_IRQ_COUNT: u8 = 16;
@@ -185,33 +190,13 @@ pub export fn dynirqIrqStackTop() callconv(.c) usize {
     return @intFromPtr(&cpu.isr_stack) + cpu.isr_stack.len;
 }
 
-// Per-vector naked stub. Each instantiation hardcodes its own vector # into
-// the `mov $N, %edi` immediately before `call handleDynIrq` — that's how
-// the dispatcher knows which IRQ fired without scanning ISR bits.
-//
-// Alignment math at `call handleDynIrq`:
-//   CPU frame = 40 bytes, 9 GPRs = 72 bytes, FXSAVE = 512 bytes → 624B ≡ 0 mod 16 ✓
-/// Interrupted CS on the task kstack once DynIrqStub is back from isr_stack:
-/// FXSAVE area + 9 GPRs + the pushed RIP.
-const STUB_CS_OFF_STR = std.fmt.comptimePrint("{d}", .{512 + 9 * 8 + 8});
-
+// Per-vector stub, on frames.entry.device. Each instantiation carries its
+// own vector number to handleDynIrq — that's how the dispatcher knows which
+// IRQ fired without scanning ISR bits.
 pub fn DynIrqStub(comptime vec: u8) type {
-    const vec_str = std.fmt.comptimePrint("{d}", .{vec});
     return struct {
         pub fn handler() callconv(.naked) void {
-            // cld: see isr_common_exc.
-            asm volatile ("cld\n" ++
-                    "pushq %%rax\n" ++
-                    "pushq %%rcx\n" ++
-                    "pushq %%rdx\n" ++
-                    "pushq %%rdi\n" ++
-                    "pushq %%rsi\n" ++
-                    "pushq %%r8\n" ++
-                    "pushq %%r9\n" ++
-                    "pushq %%r10\n" ++
-                    "pushq %%r11\n" ++
-                    "subq $512, %%rsp\n" ++
-                    "fxsaveq (%%rsp)\n" ++
+            asm volatile (stub.save(device) ++
                     // Shape D — run handleDynIrq on the per-CPU isr_stack
                     // instead of the interrupted task's kstack. This ends the
                     // cross-stack-aliasing class structurally: the handler
@@ -231,65 +216,44 @@ pub fn DynIrqStub(comptime vec: u8) type {
                     "movq %%rcx, 8(%%rsp)\n" ++ // stash task RSP for the return switch
                     "movabsq $" ++ DYNIRQ_CANARY_STR ++ ", %%rax\n" ++
                     "movq %%rax, 0(%%rsp)\n" ++ // canary
-                    "movl $" ++ vec_str ++ ", %%edi\n" ++ // arg (edi was clobbered by the call above)
-                    "test $0xF, %%rsp\n" ++
-                    "jnz isr_dynirq_align_panic\n" ++
-                    "call handleDynIrq\n" ++
+                    stub.call(device, "handleDynIrq", .{ .value = vec }) ++
                     "movabsq $" ++ DYNIRQ_CANARY_STR ++ ", %%rax\n" ++
                     "cmpq %%rax, 0(%%rsp)\n" ++
-                    "jne isr_dynirq_canary_panic\n" ++
+                    "je 4f\n" ++
+                    "movq %%rsp, %%rdi\n" ++ // the canary's address
+                    "call isr_dynirq_canary_panic\n" ++ // call: RSP is 16-aligned here
+                    "4:\n" ++
                     "movq 8(%%rsp), %%rcx\n" ++ // reload saved task RSP
                     "movq %%rcx, %%rsp\n" ++ // back on the task kstack (discard IRQ-stack frame)
                     // Shape C: deferred-preempt check. If a handler called
                     // proc.wake() and set cpu.dynirq_preempt_pending, run
                     // schedule() from here (stub frame, sound RSP discipline)
-                    // instead of from inside the handler. RSP is currently
-                    // 16-aligned at top of FXSAVE area, so the call is ABI-
-                    // clean. After return, fall through to fxrstor + GPR
-                    // pops + iretq as if no preempt happened.
-                    "movq " ++ STUB_CS_OFF_STR ++ "(%%rsp), %%rdi\n" ++
+                    // instead of from inside the handler. RSP is back at
+                    // the FXSAVE image, 16-aligned, so the call is ABI-
+                    // clean; it gets the interrupted CS. After return,
+                    // `restore` as if no preempt happened.
+                    "movq " ++ CS_OFFSET_STR ++ "(%%rsp), %%rdi\n" ++
                     "call check_and_preempt_dynirq\n" ++
-                    "fxrstorq (%%rsp)\n" ++
-                    "addq $512, %%rsp\n" ++
-                    "popq %%r11\n" ++
-                    "popq %%r10\n" ++
-                    "popq %%r9\n" ++
-                    "popq %%r8\n" ++
-                    "popq %%rsi\n" ++
-                    "popq %%rdi\n" ++
-                    "popq %%rdx\n" ++
-                    "popq %%rcx\n" ++
-                    "popq %%rax\n" ++
-                    // Pre-iretq sanity check — shared with isr_irq0,
-                    // isr_common_exc, retToUserStub. See SAFE_IRETQ.
-                    @import("../../proc/sched_asm.zig").SAFE_IRETQ);
+                    stub.restore(device));
         }
     };
 }
 
-pub export fn isr_dynirq_align_panic() callconv(.c) noreturn {
-    @panic("dynirq stub: RSP misaligned at call handleDynIrq — recount pushes");
-}
-
-/// Stack canary around `call handleDynIrq` got clobbered. The slot at
-/// %rsp+8 was 0xC0FFEE0BA0BEDA0 before the call and is something else
-/// now, meaning the IPI handler (or its callees) wrote past their stack
-/// frame and into ours. Captures kstack snapshot for autopsy — most
-/// useful: which value did the slot get overwritten with? That hints at
-/// the source (a misaligned write, a return-frame computation, etc).
-pub export fn isr_dynirq_canary_panic() callconv(.c) noreturn {
+/// The canary under `call handleDynIrq` changed: the handler, or something
+/// it called, wrote past its own stack frame into the stub's. `canary_at`
+/// is the word's address on this CPU's isr_stack, handed over by the stub;
+/// the saved task RSP is the word above it. What the word holds now hints
+/// at the writer (a misaligned write, a return-frame computation, etc).
+pub export fn isr_dynirq_canary_panic(canary_at: u64) callconv(.c) noreturn {
     const sym = @import("../../debug/symbols.zig");
-    const rsp_now: u64 = asm volatile ("mov %%rsp, %[r]"
-        : [r] "=r" (-> u64),
-    );
-    const slots: [*]const u64 = @ptrFromInt(rsp_now);
+    const got = @as(*const u64, @ptrFromInt(canary_at)).*;
     serial.print("\n!!! DYNIRQ STACK CANARY CLOBBERED — IPI handler smashed stack !!!\n", .{});
-    serial.print("  expected canary 0x{X:0>16} at 0x{X:0>16}+8\n", .{ DYNIRQ_CANARY, rsp_now });
-    serial.print("  got 0x{X:0>16}", .{slots[1]});
-    if (sym.resolveKernel(slots[1])) |r| {
+    serial.print("  expected canary 0x{X:0>16} at 0x{X:0>16}\n", .{ DYNIRQ_CANARY, canary_at });
+    serial.print("  got 0x{X:0>16}", .{got});
+    if (sym.resolveKernel(got)) |r| {
         serial.print("  // {s}+0x{X}", .{ r.name, r.offset });
     }
     serial.print("\n  surrounding stack (32 qwords):\n", .{});
-    @import("../../debug/kdbg.zig").crashAutopsy(.{ .kernel_rsp = rsp_now });
+    @import("../../debug/kdbg.zig").crashAutopsy(.{ .kernel_rsp = canary_at });
     @panic("dynirq canary clobbered — IPI handler corrupted stack");
 }

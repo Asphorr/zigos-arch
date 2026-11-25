@@ -15,8 +15,11 @@
 //!      output, or no memory outputs, is fine. tools/asm_ret_check.py
 //!      verifies the bitcode.
 //!
-//! The matching is textual and only knows the obvious patterns; the runtime
-//! guards in syscall/entry.zig and idt.zig have the last word. A run
+//! The matching is textual and only knows the obvious patterns: a template
+//! written out as `\\` lines. The interrupt and exception stubs are not —
+//! their text is generated (src/cpu/idt/stub.zig) from frames whose
+//! alignment is a comptime result (src/proc/frames.zig, `Entry`) — and
+//! every entry stub tests RSP before its `call` at run time besides. A run
 //! that saw no multi-line template, no `call` or no output fails: a lint
 //! that inspected nothing must not say PASS.
 
@@ -53,17 +56,23 @@ fn asmOpen(text: []const u8, at: usize) ?usize {
 }
 
 /// The multiline-string template right after the `(` at `open`: its `\\`
-/// lines, newlines included. Null when the asm starts with something else.
+/// lines, newlines included, and the `//` comment lines between them (a
+/// comment does not end the literal). Null when the asm starts with
+/// something else.
 fn asmTemplate(text: []const u8, open: usize) ?[]const u8 {
     var start = open;
     while (start < text.len and isSpace(text[start])) start += 1;
-    var end = start;
+    var end = start; // just past the last `\\` line
+    var next = start;
     while (true) {
-        var q = end;
+        var q = next;
         while (q < text.len and (text[q] == ' ' or text[q] == '\t')) q += 1;
-        if (!std.mem.startsWith(u8, text[q..], "\\\\")) break;
+        const string_line = std.mem.startsWith(u8, text[q..], "\\\\");
+        const comment_line = end > start and std.mem.startsWith(u8, text[q..], "//");
+        if (!string_line and !comment_line) break;
         const nl = std.mem.indexOfScalarPos(u8, text, q, '\n') orelse break;
-        end = nl + 1;
+        next = nl + 1;
+        if (string_line) end = next;
     }
     return if (end > start) text[start..end] else null;
 }

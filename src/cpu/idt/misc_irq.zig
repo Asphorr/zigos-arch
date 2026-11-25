@@ -5,15 +5,17 @@
 //!   - TLB-shootdown IPI (vec from mmu/tlb.zig)
 //!   - PMI (vec from arch/pmu.zig)
 //!
-//! All share the same caller-saved + FXSAVE shape as the keyboard stub —
-//! 9 GPRs + 512 FXSAVE = 624B ≡ 0 mod 16 at `call`. The body Zig handlers
-//! are tiny — most of the work is in keyboard/mouse/tlb/pmu modules; this
-//! file just owns the asm trampolines + EOI bookkeeping.
+//! The four that call a handler share one frame, `frames.entry.device`: the
+//! registers a C handler may clobber and the FXSAVE image. The handlers are
+//! tiny — the work is in the keyboard/mouse/tlb/pmu modules; this file owns
+//! the stubs and the EOI bookkeeping.
 
 const io = @import("../../io.zig");
 const apic = @import("../../irq/apic.zig");
 const keyboard = @import("../../driver.zig").keyboard;
 const mouse = @import("../../driver.zig").mouse;
+const stub = @import("stub.zig");
+const device = @import("../../proc/frames.zig").entry.device;
 
 // ctx: irq — PS/2 keyboard, IF=0 (tools/ctx_lint.zig root).
 export fn handleIRQ1() callconv(.c) void {
@@ -63,74 +65,12 @@ pub fn sendEOI() void {
     }
 }
 
-// Keyboard IRQ stub — push 9 caller-saved GPRs + FXSAVE.
-// Alignment math at `call handleIRQ1`:
-//   CPU frame = 40, 9 GPRs = 72, FXSAVE = 512 → 624B ≡ 0 mod 16 ✓
 pub fn isr_irq1() callconv(.naked) void {
-    // cld: see isr_common_exc (the same in every stub below that calls Zig).
-    asm volatile (
-        \\ cld
-        \\ pushq %%rax
-        \\ pushq %%rcx
-        \\ pushq %%rdx
-        \\ pushq %%rdi
-        \\ pushq %%rsi
-        \\ pushq %%r8
-        \\ pushq %%r9
-        \\ pushq %%r10
-        \\ pushq %%r11
-        \\ subq $512, %%rsp
-        \\ fxsaveq (%%rsp)
-        \\ test $0xF, %%rsp
-        \\ jnz isr_irq1_align_panic
-        \\ call handleIRQ1
-        \\ fxrstorq (%%rsp)
-        \\ addq $512, %%rsp
-        \\ popq %%r11
-        \\ popq %%r10
-        \\ popq %%r9
-        \\ popq %%r8
-        \\ popq %%rsi
-        \\ popq %%rdi
-        \\ popq %%rdx
-        \\ popq %%rcx
-        \\ popq %%rax
-        \\ iretq
-    );
+    asm volatile (stub.handler(device, "handleIRQ1", .none));
 }
 
-// Mouse IRQ stub — same pattern as keyboard.
-// Alignment math: 40 + 72 + 512 = 624B ≡ 0 mod 16 ✓
 pub fn isr_irq12() callconv(.naked) void {
-    asm volatile (
-        \\ cld
-        \\ pushq %%rax
-        \\ pushq %%rcx
-        \\ pushq %%rdx
-        \\ pushq %%rdi
-        \\ pushq %%rsi
-        \\ pushq %%r8
-        \\ pushq %%r9
-        \\ pushq %%r10
-        \\ pushq %%r11
-        \\ subq $512, %%rsp
-        \\ fxsaveq (%%rsp)
-        \\ test $0xF, %%rsp
-        \\ jnz isr_irq12_align_panic
-        \\ call handleIRQ12
-        \\ fxrstorq (%%rsp)
-        \\ addq $512, %%rsp
-        \\ popq %%r11
-        \\ popq %%r10
-        \\ popq %%r9
-        \\ popq %%r8
-        \\ popq %%rsi
-        \\ popq %%rdi
-        \\ popq %%rdx
-        \\ popq %%rcx
-        \\ popq %%rax
-        \\ iretq
-    );
+    asm volatile (stub.handler(device, "handleIRQ12", .none));
 }
 
 pub fn isr_spurious() callconv(.naked) void {
@@ -177,95 +117,19 @@ pub fn isr_pic15_spurious() callconv(.naked) void {
     );
 }
 
-// TLB-shootdown IPI stub (vector from mmu/tlb.zig). Same caller-saved
-// pattern as isr_irq1; handler does cr3 reload + ack decrement + eoi.
-// Alignment: 40 + 72 + 512 = 624B ≡ 0 mod 16 ✓
+// TLB-shootdown IPI (vector from mmu/tlb.zig): the handler reloads CR3,
+// acks and EOIs.
 pub fn isr_tlb_shootdown() callconv(.naked) void {
-    asm volatile (
-        \\ cld
-        \\ pushq %%rax
-        \\ pushq %%rcx
-        \\ pushq %%rdx
-        \\ pushq %%rdi
-        \\ pushq %%rsi
-        \\ pushq %%r8
-        \\ pushq %%r9
-        \\ pushq %%r10
-        \\ pushq %%r11
-        \\ subq $512, %%rsp
-        \\ fxsaveq (%%rsp)
-        \\ test $0xF, %%rsp
-        \\ jnz isr_tlb_shootdown_align_panic
-        \\ call handleTlbShootdown
-        \\ fxrstorq (%%rsp)
-        \\ addq $512, %%rsp
-        \\ popq %%r11
-        \\ popq %%r10
-        \\ popq %%r9
-        \\ popq %%r8
-        \\ popq %%rsi
-        \\ popq %%rdi
-        \\ popq %%rdx
-        \\ popq %%rcx
-        \\ popq %%rax
-        \\ iretq
-    );
+    asm volatile (stub.handler(device, "handleTlbShootdown", .none));
 }
 
-pub export fn isr_tlb_shootdown_align_panic() callconv(.c) noreturn {
-    @panic("isr_tlb_shootdown: RSP misaligned at call handleTlbShootdown");
-}
-
-// PMI (Performance Monitoring Interrupt) stub — vector from arch/pmu.zig.
-// LAPIC's LVT.PMI delivers here when PMC0 overflows. Same caller-saved +
-// fxsave shape as isr_tlb_shootdown. Reads the saved RIP off the iretq
-// frame to hand to pmu.onSample for one-line "where did the sample land"
-// log output.
+// PMI (vector from arch/pmu.zig): LVT.PMI delivers here when PMC0
+// overflows. The handler gets the RIP the sample landed on.
 pub fn isr_pmi() callconv(.naked) void {
-    asm volatile (
-        \\ cld
-        \\ pushq %%rax
-        \\ pushq %%rcx
-        \\ pushq %%rdx
-        \\ pushq %%rdi
-        \\ pushq %%rsi
-        \\ pushq %%r8
-        \\ pushq %%r9
-        \\ pushq %%r10
-        \\ pushq %%r11
-        \\ subq $512, %%rsp
-        \\ fxsaveq (%%rsp)
-        \\ test $0xF, %%rsp
-        \\ jnz isr_pmi_align_panic
-        \\ movq 584(%%rsp), %%rdi
-        \\ call handlePmi
-        \\ fxrstorq (%%rsp)
-        \\ addq $512, %%rsp
-        \\ popq %%r11
-        \\ popq %%r10
-        \\ popq %%r9
-        \\ popq %%r8
-        \\ popq %%rsi
-        \\ popq %%rdi
-        \\ popq %%rdx
-        \\ popq %%rcx
-        \\ popq %%rax
-        \\ iretq
-    );
-}
-
-pub export fn isr_pmi_align_panic() callconv(.c) noreturn {
-    @panic("isr_pmi: RSP misaligned at call handlePmi");
+    asm volatile (stub.handler(device, "handlePmi", .rip));
 }
 
 // ctx: irq — LVT.PMI overflow, IF=0 (tools/ctx_lint.zig root).
 export fn handlePmi(rip: u64) callconv(.c) void {
     @import("../arch/pmu.zig").onSample(rip);
-}
-
-pub export fn isr_irq1_align_panic() callconv(.c) noreturn {
-    @panic("isr_irq1: RSP misaligned at call handleIRQ1 — recount pushes");
-}
-pub export fn isr_irq12_align_panic() callconv(.c) noreturn {
-    @panic("isr_irq12: RSP misaligned at call handleIRQ12 — recount pushes");
 }

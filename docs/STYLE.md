@@ -207,11 +207,30 @@ user trio create/clone/fork and the kthread trio idle/S3-replant/
 kernel-task via `kthread_bytes`/`kthread_ret_pad`), elf_loader's
 Linux-ABI RSP override, and the six saved-RIP diagnostics via
 `saved_rip_off` (save_trace, watch, pcb_invariants, sched's
-pre-dispatch guard). **Future customers:** SyscallFrame/IrqFrame/
-ExcFrame push sides and the FXSAVE offset arithmetic (misc_irq.zig
-still carries a hand-checked "624B ≡ 0 mod 16 ✓"). ⚠ IrqFrame/ExcFrame
-match `dispatch.gprs` by convention, not derivation — convert before
-any reorder of `gprs`.
+pre-dispatch guard).
+
+**Entry stubs.** What an interrupt or exception stub leaves on the stack
+is one more such value, `frames.Entry`: the saved registers (a `Frame`),
+the words the vector's thunk pushes, an optional canary. From it come
+the stub's text (`cpu/idt/stub.zig`), the FXSAVE `sub` with its padding
+(the CPU aligns RSP before it pushes, so mod 16 is computed, not
+counted), and where the frame and the interrupted RIP are:
+
+```zig
+pub const tick = Entry(.{ .saved = dispatch.gprs, .canary = .{ ... } });   // frames.entry
+
+asm volatile (stub.handler(tick, "handleIRQ0", .frame));                   // the whole stub
+comptime { frames.entry.tick.assertMirror(IrqFrame); }                     // the handler's view
+const frame: *const signals.IrqFrame = @ptrFromInt(rsp);                   // frame.rip, not stack[15]
+```
+
+A stub with a middle of its own (`DynIrqStub`: another stack, a preempt
+check) is `stub.save(E) ++ … ++ stub.restore(E)` and takes its offsets
+from `E`. A handler reads its frame through the mirrored struct, never
+by index. A panic target a stub jumps to is handed the address it needs
+in `rdi`: its own RSP is below its prologue by then (three such targets
+dumped their own locals as "the frame" until 2026-11). **Still by
+hand:** the SYSCALL entry and `signals.SyscallFrame`.
 
 ## `lock.assertHeld()` runtime checks
 

@@ -27,6 +27,7 @@
 
 const std = @import("std");
 const process = @import("process.zig");
+const frames = @import("frames.zig");
 const debug = @import("../debug/debug.zig");
 const smp = @import("../cpu/smp.zig");
 const memmap = @import("../mm/memmap.zig");
@@ -376,13 +377,19 @@ pub const SyscallFrame = extern struct {
 };
 
 /// How far under an IrqFrame and an ExcFrame their stubs keep the FXSAVE
-/// image of the interrupted code (isr_irq0: 512 + padding + its canary).
-pub const IRQ0_FP_BELOW: usize = 528;
-pub const EXC_FP_BELOW: usize = 512;
+/// image of the interrupted code.
+pub const IRQ0_FP_BELOW: usize = frames.entry.tick.fp_below;
+pub const EXC_FP_BELOW: usize = frames.entry.exception.fp_below;
 
-/// Mirror of isr_irq0's saved frame at `call handleIRQ0`. The leading 15 GPRs
-/// match the push order in idt.zig; the trailing 5 are the iretq frame the
-/// CPU pushed on entry. Used for IRQ-return-to-user signal delivery.
+comptime {
+    @setEvalBranchQuota(10_000); // some forty field names, compared by character
+    frames.entry.tick.assertMirror(IrqFrame);
+    frames.entry.exception.assertMirror(ExcFrame);
+}
+
+/// The frame isr_irq0 hands handleIRQ0 (frames.entry.tick): every register,
+/// then the record the CPU pushed. Used for IRQ-return-to-user signal
+/// delivery.
 pub const IrqFrame = extern struct {
     r15: u64,
     r14: u64,
@@ -406,8 +413,9 @@ pub const IrqFrame = extern struct {
     ss: u64,
 };
 
-/// Mirror of isr_common_exc's saved frame. Same as IrqFrame but with the
-/// stub-pushed (int_no, error_code) sandwiched between GPRs and iretq.
+/// The frame isr_common_exc hands handleException (frames.entry.exception):
+/// an IrqFrame with the vector's two words between the registers and the
+/// CPU's record.
 pub const ExcFrame = extern struct {
     r15: u64,
     r14: u64,

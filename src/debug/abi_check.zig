@@ -161,31 +161,20 @@ fn testSyscallMsrs() void {
 }
 
 // --- Test 6: Trampoline alignment ---
-// Scans the inline asm in syscall/entry.zig and idt.zig for the alignment
-// guards we just added. If the guard instructions are missing, someone
-// removed them without updating this test. This is a compile-time-ish check
-// done at runtime by reading the .text bytes at known entry points.
-//
-// We can't easily parse the asm from Zig, so instead we verify that the
-// panic targets exist and are reachable. If the linker didn't include them,
-// the build would have failed. This test is mostly a placeholder — the real
-// guards are the `test $0xF, %rsp; jnz panic` instructions themselves.
+// The entry stubs test RSP before their `call` and jump to a panic target
+// when it is not 16-aligned: one for the syscall entry, one for every
+// interrupt and exception stub (cpu/idt/stub.zig, whose frames make the
+// alignment a comptime result). This only checks the targets exist — the
+// guards themselves run on every entry.
 fn testTrampolineAlignment() void {
-    // The panic targets are exported symbols. If they exist, the guards exist.
     // We can't call them (they're noreturn), but we can take their addresses.
     const syscall_panic = @import("../syscall/entry.zig").syscall_align_panic;
-    const exc_panic = @import("../cpu/idt.zig").isr_common_exc_align_panic;
-    const irq0_panic = @import("../cpu/idt.zig").isr_irq0_align_panic;
-    const irq1_panic = @import("../cpu/idt.zig").isr_irq1_align_panic;
-    const irq12_panic = @import("../cpu/idt.zig").isr_irq12_align_panic;
+    const isr_panic = @import("../cpu/idt.zig").isr_align_panic;
 
     // If any of these are null or point outside .text, the build is broken.
     const addrs = [_]usize{
         @intFromPtr(&syscall_panic),
-        @intFromPtr(&exc_panic),
-        @intFromPtr(&irq0_panic),
-        @intFromPtr(&irq1_panic),
-        @intFromPtr(&irq12_panic),
+        @intFromPtr(&isr_panic),
     };
 
     for (addrs) |addr| {
