@@ -62,6 +62,8 @@ pub const TerminalData = struct {
     /// via `ANSI_PALETTE[attr & 0x0F]`. Costs 8 KB per terminal at the
     /// default 80×25 grid — worth it for actually-orange logos.
     fg_rgb_buf: [TERM_COLS * TERM_ROWS]u32,
+    /// Per-cell background, consulted when `attr_buf[i] & ATTR_BG` is set.
+    bg_rgb_buf: [TERM_COLS * TERM_ROWS]u32,
     text_row: u16,
     text_col: u16,
     cmd_buf: [128]u8,
@@ -73,6 +75,7 @@ pub const TerminalData = struct {
     scroll_buf: [SCROLL_LINES * TERM_COLS]u8,
     scroll_attr_buf: [SCROLL_LINES * TERM_COLS]u8,
     scroll_fg_rgb_buf: [SCROLL_LINES * TERM_COLS]u32,
+    scroll_bg_rgb_buf: [SCROLL_LINES * TERM_COLS]u32,
     scroll_write: u16,
     scroll_count: u16,
     scroll_view: u16,
@@ -103,6 +106,8 @@ pub const TerminalData = struct {
     /// Most-recent truecolor fg, in 0x00RRGGBB. Only meaningful when
     /// `cur_attr & ATTR_RGB_FG` is set; SGR `38;2;...` writes both.
     cur_fg_rgb: u32,
+    /// The background in force, meaningful when `cur_attr & ATTR_BG` is set.
+    cur_bg_rgb: u32 = 0,
     bell_phase: u8,
     cursor_blink_anchor: u64,
     /// Deferred-wrap flag (xterm-style auto-margin). When a printable char
@@ -121,6 +126,7 @@ pub const TerminalData = struct {
     painted_text: [TERM_COLS * TERM_ROWS]u8 = undefined,
     painted_attr: [TERM_COLS * TERM_ROWS]u8 = undefined,
     painted_rgb: [TERM_COLS * TERM_ROWS]u32 = undefined,
+    painted_bg: [TERM_COLS * TERM_ROWS]u32 = undefined,
     /// Cell index of the cursor block drawn, NO_CURSOR for none.
     painted_cursor: u16 = NO_CURSOR,
     painted_scroll_count: u16 = 0,
@@ -362,7 +368,7 @@ pub fn topSlot() ?u8 {
 }
 
 pub fn allocTerminalData() ?*TerminalData {
-    // ~36 KB — above the kvmalloc threshold, so it comes from vmalloc and
+    // Far above the kvmalloc threshold, so it comes from vmalloc and
     // opening a few terminals doesn't fragment the heap.
     const ptr = heap.kalloc(@sizeOf(TerminalData)) orelse return null;
     const td: *TerminalData = @ptrCast(@alignCast(ptr));
@@ -370,6 +376,7 @@ pub fn allocTerminalData() ?*TerminalData {
         .text_buf = [_]u8{' '} ** (TERM_COLS * TERM_ROWS),
         .attr_buf = [_]u8{ATTR_DEFAULT} ** (TERM_COLS * TERM_ROWS),
         .fg_rgb_buf = [_]u32{0} ** (TERM_COLS * TERM_ROWS),
+        .bg_rgb_buf = [_]u32{0} ** (TERM_COLS * TERM_ROWS),
         .text_row = 0,
         .text_col = 0,
         .cmd_buf = [_]u8{0} ** 128,
@@ -381,6 +388,7 @@ pub fn allocTerminalData() ?*TerminalData {
         .scroll_buf = [_]u8{' '} ** (SCROLL_LINES * TERM_COLS),
         .scroll_attr_buf = [_]u8{ATTR_DEFAULT} ** (SCROLL_LINES * TERM_COLS),
         .scroll_fg_rgb_buf = [_]u32{0} ** (SCROLL_LINES * TERM_COLS),
+        .scroll_bg_rgb_buf = [_]u32{0} ** (SCROLL_LINES * TERM_COLS),
         .scroll_write = 0,
         .scroll_count = 0,
         .scroll_view = 0,

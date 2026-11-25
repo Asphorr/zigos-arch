@@ -49,6 +49,10 @@ pub const ATTR_INVERSE: u8 = 0x20;
 /// `fg_rgb_buf` rather than `ANSI_PALETTE[attr & 0x0F]`. Set by the
 /// SGR `38;2;r;g;b` (truecolor) parser; cleared by `39` (default fg).
 pub const ATTR_RGB_FG: u8 = 0x40;
+/// The cell has a background of its own, the 24-bit value in `bg_rgb_buf`;
+/// without the flag it shows WINDOW_BG. Set by SGR 40..47, 100..107 and 48,
+/// cleared by 49.
+pub const ATTR_BG: u8 = 0x80;
 
 // --- Terminal behavior tunables ---
 pub const TAB_WIDTH: u8 = 8;

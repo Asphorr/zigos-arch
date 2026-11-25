@@ -211,9 +211,23 @@ const aa_font = @import("aa_font.zig");
 /// cell from the three terminal-render paths below.
 inline fn drawTermChar(x: i32, y: i32, ch: u8, fg: u32, bg: u32) void {
     gfx.fillRect(x, y, FONT_W, FONT_H, bg);
-    if (ch >= CELL_BULLET and (ch <= CELL_CHECK or ch >= CELL_BOX)) return drawCellShape(x, y, ch, fg);
+    if (ch >= CELL_BULLET and (ch <= CELL_DEGREE or ch >= CELL_BOX)) return drawCellShape(x, y, ch, fg);
     const buf: [1]u8 = .{ch};
     aa_font.drawText(x, y, &buf, fg, aa_font.getDefaultMono());
+}
+
+/// One row of terminal cells of the window at `win_x`, its top at `y`: every
+/// cell that shows a glyph or a background of its own. The row's WINDOW_BG
+/// is the caller's.
+fn drawTermCells(win_x: i32, y: i32, text: []const u8, attrs: []const u8, fgs: []const u32, bgs: []const u32, max_cols: u32) void {
+    var col: u32 = 0;
+    while (col < TERM_COLS and col < max_cols) : (col += 1) {
+        const ch = text[col];
+        const attr = attrs[col];
+        if (ch == ' ' and (attr & ATTR_PAINTS_BG) == 0) continue;
+        const colors = cellColors(attr, fgs[col], bgs[col]);
+        drawTermChar(win_x + @as(i32, @intCast(TERM_PAD + col * FONT_W)), y, ch, colors.fg, colors.bg);
+    }
 }
 
 // Cell bytes past ASCII. 0x80..0x85 are the atlas's own block glyphs, which
@@ -223,6 +237,7 @@ const CELL_BULLET: u8 = 0x86;
 const CELL_MIDDOT: u8 = 0x87;
 const CELL_ELLIPSIS: u8 = 0x88;
 const CELL_CHECK: u8 = 0x89;
+const CELL_DEGREE: u8 = 0x8A;
 /// Box drawing: + a mask of the arms (BOX_*), light and heavy.
 const CELL_BOX: u8 = 0xA0;
 const CELL_BOX_HEAVY: u8 = 0xB0;
@@ -281,6 +296,13 @@ fn drawCellShape(x: i32, y: i32, ch: u8, fg: u32) void {
             i = 0;
             while (i < 5) : (i += 1) gfx.fillRect(x + 4 + i, cy + 2 - i, 1, 2, fg);
         },
+        CELL_DEGREE => {
+            // A ring of 4 at the height of a capital's top.
+            gfx.fillRect(x + 3, y + 3, 2, 1, fg);
+            gfx.fillRect(x + 3, y + 6, 2, 1, fg);
+            gfx.fillRect(x + 2, y + 4, 1, 2, fg);
+            gfx.fillRect(x + 5, y + 4, 1, 2, fg);
+        },
         else => {},
     }
 }
@@ -290,6 +312,7 @@ fn cellFor(cp: u32) u8 {
     return switch (cp) {
         0x20...0x7E => @intCast(cp),
         0x00A0 => ' ',
+        0x00B0, 0x02DA => CELL_DEGREE,
         0x00B7, 0x2219, 0x22C5 => CELL_MIDDOT,
         0x2022, 0x25CF, 0x23FA, 0x2B24, 0x25C9 => CELL_BULLET,
         0x25CB, 0x25EF, 0x25E6, 0x25CC => 'o',
@@ -388,6 +411,9 @@ const ANSI_PALETTE = theme.ANSI_PALETTE;
 const ATTR_DEFAULT = theme.ATTR_DEFAULT;
 const ATTR_BOLD = theme.ATTR_BOLD;
 const ATTR_INVERSE = theme.ATTR_INVERSE;
+const ATTR_BG = theme.ATTR_BG;
+/// A cell with either shows more than its glyph: a space of it is painted too.
+const ATTR_PAINTS_BG = ATTR_INVERSE | ATTR_BG;
 const TAB_WIDTH = theme.TAB_WIDTH;
 const BELL_FLASH_FRAMES = theme.BELL_FLASH_FRAMES;
 const CURSOR_BLINK_HALF_TICKS = theme.CURSOR_BLINK_HALF_TICKS;
@@ -395,7 +421,7 @@ const BELL_FLASH_COLOR = theme.BELL_FLASH_COLOR;
 
 const CellColors = struct { fg: u32, bg: u32 };
 
-inline fn cellColors(attr: u8, fg_rgb: u32) CellColors {
+inline fn cellColors(attr: u8, fg_rgb: u32, bg_rgb: u32) CellColors {
     var fg: u32 = undefined;
     if ((attr & theme.ATTR_RGB_FG) != 0) {
         fg = fg_rgb;
@@ -404,7 +430,7 @@ inline fn cellColors(attr: u8, fg_rgb: u32) CellColors {
         const palette_idx: u8 = if ((attr & ATTR_BOLD) != 0) (idx | 0x08) else idx;
         fg = ANSI_PALETTE[palette_idx];
     }
-    var bg: u32 = WINDOW_BG;
+    var bg: u32 = if ((attr & ATTR_BG) != 0) bg_rgb else WINDOW_BG;
     if ((attr & ATTR_INVERSE) != 0) {
         const swap = fg;
         fg = bg;
@@ -590,7 +616,7 @@ fn desktopPutChar(c: u8) void {
 ///   - \x08       backspace (cursor left, write space at new pos with cur_attr)
 ///   - \t         tab (cursor advances to next 8-column boundary)
 ///   - \x07       bell (sets bell_phase; main loop renders a red border flash)
-///   - \x1b[...m  SGR — foreground color, bold, inverse (16-color ANSI palette)
+///   - \x1b[...m  SGR — foreground and background color (16, 256, 24-bit), bold, inverse
 ///   - \x1b[r;cH  cursor position (1-indexed row;col)
 ///   - \x1b[nA/B/C/D   cursor up/down/right/left by n (default 1)
 ///   - \x1b[nJ    erase display (0 = below, 1 = above, 2 = all)
@@ -737,6 +763,7 @@ fn putCharAfterEsc(w: *Window, t: *TerminalData, c: u8) void {
         'c' => {
             t.cur_attr = ATTR_DEFAULT;
             t.cur_fg_rgb = 0;
+            t.cur_bg_rgb = 0;
             t.cursor_hidden = false;
             t.text_row = 0;
             t.text_col = 0;
@@ -792,24 +819,29 @@ fn termReply(w: *Window, bytes: []const u8) void {
     if (w.kb_pipe != 0xFF) _ = @import("../proc/pipe.zig").tryWrite(w.kb_pipe, bytes);
 }
 
-/// Cells [from, from+n) of the screen take what [to...) held; the three
+/// Cells [to, to+n) of the screen take what [from...) held; the four
 /// buffers move together.
 fn moveCells(t: *TerminalData, to: usize, from: usize, n: usize) void {
     if (to < from) {
         std.mem.copyForwards(u8, t.text_buf[to..][0..n], t.text_buf[from..][0..n]);
         std.mem.copyForwards(u8, t.attr_buf[to..][0..n], t.attr_buf[from..][0..n]);
         std.mem.copyForwards(u32, t.fg_rgb_buf[to..][0..n], t.fg_rgb_buf[from..][0..n]);
+        std.mem.copyForwards(u32, t.bg_rgb_buf[to..][0..n], t.bg_rgb_buf[from..][0..n]);
     } else {
         std.mem.copyBackwards(u8, t.text_buf[to..][0..n], t.text_buf[from..][0..n]);
         std.mem.copyBackwards(u8, t.attr_buf[to..][0..n], t.attr_buf[from..][0..n]);
         std.mem.copyBackwards(u32, t.fg_rgb_buf[to..][0..n], t.fg_rgb_buf[from..][0..n]);
+        std.mem.copyBackwards(u32, t.bg_rgb_buf[to..][0..n], t.bg_rgb_buf[from..][0..n]);
     }
 }
 
+/// Cells [at, at+n) become spaces in the colors in force: an erased
+/// stretch takes the current background.
 fn blankCells(t: *TerminalData, at: usize, n: usize) void {
     @memset(t.text_buf[at..][0..n], ' ');
     @memset(t.attr_buf[at..][0..n], t.cur_attr);
     @memset(t.fg_rgb_buf[at..][0..n], t.cur_fg_rgb);
+    @memset(t.bg_rgb_buf[at..][0..n], t.cur_bg_rgb);
 }
 
 fn dispatchCsi(w: *Window, t: *TerminalData, final: u8, n_args: u8) void {
@@ -930,6 +962,7 @@ fn sgr(t: *TerminalData, n_args: u8) void {
     if (n_args == 0) {
         t.cur_attr = ATTR_DEFAULT;
         t.cur_fg_rgb = 0;
+        t.cur_bg_rgb = 0;
         return;
     }
     var i: u8 = 0;
@@ -939,6 +972,7 @@ fn sgr(t: *TerminalData, n_args: u8) void {
             0 => {
                 t.cur_attr = ATTR_DEFAULT;
                 t.cur_fg_rgb = 0;
+                t.cur_bg_rgb = 0;
             },
             1 => t.cur_attr |= ATTR_BOLD,
             7 => t.cur_attr |= ATTR_INVERSE,
@@ -957,89 +991,65 @@ fn sgr(t: *TerminalData, n_args: u8) void {
                 t.cur_attr = (t.cur_attr & 0xF0 & ~theme.ATTR_RGB_FG) | (ATTR_DEFAULT & 0x0F);
                 t.cur_fg_rgb = 0;
             },
-            // 38;2;R;G;B = 24-bit truecolor fg, 38;5;N = one of the 256.
-            // 48 is the same for the background, which cells don't have:
-            // its arguments are stepped over.
+            // Background: the 8 colors, their bright ones, the default.
+            40...47 => setBg(t, ANSI_PALETTE[arg - 40]),
+            100...107 => setBg(t, ANSI_PALETTE[arg - 100 + 8]),
+            49 => {
+                t.cur_attr &= ~ATTR_BG;
+                t.cur_bg_rgb = 0;
+            },
+            // 38;2;R;G;B = 24-bit truecolor fg, 38;5;N = one of the 256;
+            // 48 is the same for the background.
             38, 48 => {
                 if (i + 1 >= n_args) break;
                 const sub = t.csi_args[i + 1];
+                var color: u32 = undefined;
                 if (sub == 2) {
                     if (i + 4 >= n_args) break;
-                    if (arg == 38) {
-                        const r: u32 = @intCast(t.csi_args[i + 2] & 0xFF);
-                        const g: u32 = @intCast(t.csi_args[i + 3] & 0xFF);
-                        const b: u32 = @intCast(t.csi_args[i + 4] & 0xFF);
-                        t.cur_fg_rgb = (r << 16) | (g << 8) | b;
-                        t.cur_attr |= theme.ATTR_RGB_FG;
-                    }
+                    const r: u32 = @intCast(t.csi_args[i + 2] & 0xFF);
+                    const g: u32 = @intCast(t.csi_args[i + 3] & 0xFF);
+                    const b: u32 = @intCast(t.csi_args[i + 4] & 0xFF);
+                    color = (r << 16) | (g << 8) | b;
                     i += 4;
                 } else if (sub == 5) {
                     if (i + 2 >= n_args) break;
-                    if (arg == 38) {
-                        t.cur_fg_rgb = color256(t.csi_args[i + 2]);
-                        t.cur_attr |= theme.ATTR_RGB_FG;
-                    }
+                    color = color256(t.csi_args[i + 2]);
                     i += 2;
-                }
+                } else continue;
+                if (arg == 38) {
+                    t.cur_fg_rgb = color;
+                    t.cur_attr |= theme.ATTR_RGB_FG;
+                } else setBg(t, color);
             },
             else => {},
         }
     }
 }
 
+fn setBg(t: *TerminalData, color: u32) void {
+    t.cur_bg_rgb = color;
+    t.cur_attr |= ATTR_BG;
+}
+
 fn eraseDisplay(t: *TerminalData, mode: u16) void {
-    const cur_idx: u32 = @as(u32, t.text_row) * TERM_COLS + t.text_col;
+    const cells: usize = TERM_COLS * TERM_ROWS;
+    const cur_idx: usize = @min(@as(usize, t.text_row) * TERM_COLS + t.text_col, cells - 1);
     switch (mode) {
-        0 => {
-            for (cur_idx..TERM_COLS * TERM_ROWS) |i| {
-                t.text_buf[i] = ' ';
-                t.attr_buf[i] = t.cur_attr;
-                t.fg_rgb_buf[i] = t.cur_fg_rgb;
-            }
-        },
-        1 => {
-            const end = @min(cur_idx + 1, TERM_COLS * TERM_ROWS);
-            for (0..end) |i| {
-                t.text_buf[i] = ' ';
-                t.attr_buf[i] = t.cur_attr;
-                t.fg_rgb_buf[i] = t.cur_fg_rgb;
-            }
-        },
-        2, 3 => {
-            @memset(&t.text_buf, ' ');
-            @memset(&t.attr_buf, t.cur_attr);
-            @memset(&t.fg_rgb_buf, t.cur_fg_rgb);
-        },
+        0 => blankCells(t, cur_idx, cells - cur_idx),
+        1 => blankCells(t, 0, cur_idx + 1),
+        2, 3 => blankCells(t, 0, cells),
         else => {},
     }
 }
 
 fn eraseLine(t: *TerminalData, mode: u16) void {
     if (t.text_row >= TERM_ROWS) return;
-    const row_start: u32 = @as(u32, t.text_row) * TERM_COLS;
+    const row_start: usize = @as(usize, t.text_row) * TERM_COLS;
+    const col: usize = @min(t.text_col, TERM_COLS - 1);
     switch (mode) {
-        0 => {
-            for (t.text_col..TERM_COLS) |c| {
-                t.text_buf[row_start + c] = ' ';
-                t.attr_buf[row_start + c] = t.cur_attr;
-                t.fg_rgb_buf[row_start + c] = t.cur_fg_rgb;
-            }
-        },
-        1 => {
-            const end = @as(u32, t.text_col) + 1;
-            for (0..@min(end, TERM_COLS)) |c| {
-                t.text_buf[row_start + c] = ' ';
-                t.attr_buf[row_start + c] = t.cur_attr;
-                t.fg_rgb_buf[row_start + c] = t.cur_fg_rgb;
-            }
-        },
-        2 => {
-            for (0..TERM_COLS) |c| {
-                t.text_buf[row_start + c] = ' ';
-                t.attr_buf[row_start + c] = t.cur_attr;
-                t.fg_rgb_buf[row_start + c] = t.cur_fg_rgb;
-            }
-        },
+        0 => blankCells(t, row_start + col, TERM_COLS - col),
+        1 => blankCells(t, row_start, col + 1),
+        2 => blankCells(t, row_start, TERM_COLS),
         else => {},
     }
 }
@@ -1048,11 +1058,10 @@ inline fn writeCell(t: *TerminalData, row: u16, col: u16, ch: u8, attr: u8) void
     if (textIdx(row, col)) |idx| {
         t.text_buf[idx] = ch;
         t.attr_buf[idx] = attr;
-        // Mirror cur_fg_rgb so renderers can pull per-cell RGB when the
-        // truecolor flag is set. Cheap (one u32 store) and means the
-        // erase/scroll memcpy paths don't need parallel "rgb propagation"
-        // for the common case where a cell is just rewritten in place.
+        // The colors in force go with the attribute that says whether
+        // they count.
         t.fg_rgb_buf[idx] = t.cur_fg_rgb;
+        t.bg_rgb_buf[idx] = t.cur_bg_rgb;
     }
 }
 
@@ -1069,33 +1078,24 @@ fn putStringOnWindow(window_idx: u8, data: []const u8) void {
 fn scrollWindow(w: *Window) void {
     const t = w.term orelse return;
     // Save top row (and its attrs) to the scrollback ring so colored output
-    // remains colored when the user scrolls up later. fg_rgb_buf travels
-    // alongside attr_buf so truecolor-set cells preserve their hue in
-    // scrollback view.
+    // remains colored when the user scrolls up later: the colors travel
+    // alongside attr_buf.
     if (t.scroll_write >= SCROLL_LINES) t.scroll_write = 0;
     const sb_off = @as(u32, t.scroll_write) * TERM_COLS;
     @memcpy(t.scroll_buf[sb_off..][0..TERM_COLS], t.text_buf[0..TERM_COLS]);
     @memcpy(t.scroll_attr_buf[sb_off..][0..TERM_COLS], t.attr_buf[0..TERM_COLS]);
     @memcpy(t.scroll_fg_rgb_buf[sb_off..][0..TERM_COLS], t.fg_rgb_buf[0..TERM_COLS]);
+    @memcpy(t.scroll_bg_rgb_buf[sb_off..][0..TERM_COLS], t.bg_rgb_buf[0..TERM_COLS]);
     t.scroll_write = @intCast((@as(u32, t.scroll_write) + 1) % SCROLL_LINES);
     if (t.scroll_count < SCROLL_LINES) t.scroll_count += 1;
     // Auto-scroll to live on new output
     t.scroll_view = 0;
 
-    // Shift all rows up by one (text + attrs + fg_rgb).
-    var row: u32 = 0;
-    while (row < TERM_ROWS - 1) : (row += 1) {
-        const dst = row * TERM_COLS;
-        const src = (row + 1) * TERM_COLS;
-        @memcpy(t.text_buf[dst..][0..TERM_COLS], t.text_buf[src..][0..TERM_COLS]);
-        @memcpy(t.attr_buf[dst..][0..TERM_COLS], t.attr_buf[src..][0..TERM_COLS]);
-        @memcpy(t.fg_rgb_buf[dst..][0..TERM_COLS], t.fg_rgb_buf[src..][0..TERM_COLS]);
-    }
-    // Clear last row's chars + reset its attrs to current SGR state, so newly
-    // written cells inherit any in-flight SGR (e.g. mid-color block).
-    @memset(t.text_buf[(TERM_ROWS - 1) * TERM_COLS ..][0..TERM_COLS], ' ');
-    @memset(t.attr_buf[(TERM_ROWS - 1) * TERM_COLS ..][0..TERM_COLS], t.cur_attr);
-    @memset(t.fg_rgb_buf[(TERM_ROWS - 1) * TERM_COLS ..][0..TERM_COLS], t.cur_fg_rgb);
+    // The rows move up by one; the last comes in blank, in the colors in
+    // force.
+    const last: usize = (TERM_ROWS - 1) * TERM_COLS;
+    moveCells(t, 0, TERM_COLS, last);
+    blankCells(t, last, TERM_COLS);
     t.text_row = @intCast(TERM_ROWS - 1);
 }
 
@@ -2426,65 +2426,24 @@ fn renderWindow(idx: u8) void {
                 const line_idx = view_top + row;
                 if (line_idx >= total_lines) break;
 
-                var line_ptr: []const u8 = undefined;
-                var attr_ptr: []const u8 = undefined;
-                var rgb_ptr: []const u32 = undefined;
+                const y = content_y + @as(i32, @intCast(row * FONT_H));
                 if (line_idx < t.scroll_count) {
-                    const ring_idx = (@as(u32, t.scroll_write) + SCROLL_LINES - t.scroll_count + line_idx) % SCROLL_LINES;
-                    line_ptr = t.scroll_buf[ring_idx * TERM_COLS ..][0..TERM_COLS];
-                    attr_ptr = t.scroll_attr_buf[ring_idx * TERM_COLS ..][0..TERM_COLS];
-                    rgb_ptr = t.scroll_fg_rgb_buf[ring_idx * TERM_COLS ..][0..TERM_COLS];
+                    const at = (@as(u32, t.scroll_write) + SCROLL_LINES - t.scroll_count + line_idx) % SCROLL_LINES * TERM_COLS;
+                    drawTermCells(w.x, y, t.scroll_buf[at..], t.scroll_attr_buf[at..], t.scroll_fg_rgb_buf[at..], t.scroll_bg_rgb_buf[at..], max_cols);
                 } else {
                     const tb_row = line_idx - @as(u32, t.scroll_count);
-                    if (tb_row < TERM_ROWS) {
-                        line_ptr = t.text_buf[tb_row * TERM_COLS ..][0..TERM_COLS];
-                        attr_ptr = t.attr_buf[tb_row * TERM_COLS ..][0..TERM_COLS];
-                        rgb_ptr = t.fg_rgb_buf[tb_row * TERM_COLS ..][0..TERM_COLS];
-                    } else {
-                        continue;
-                    }
-                }
-
-                var col: u32 = 0;
-                while (col < TERM_COLS and col < max_cols) : (col += 1) {
-                    const ch = line_ptr[col];
-                    const attr = attr_ptr[col];
-                    // Render anything that has a glyph OR a non-default bg
-                    // (inverse mode paints the bg even on a space — fastfetch's
-                    // memory bar and color swatches rely on this).
-                    if (ch != ' ' or (attr & ATTR_INVERSE) != 0) {
-                        const colors = cellColors(attr, rgb_ptr[col]);
-                        drawTermChar(
-                            w.x + @as(i32, @intCast(TERM_PAD + col * FONT_W)),
-                            content_y + @as(i32, @intCast(row * FONT_H)),
-                            ch,
-                            colors.fg,
-                            colors.bg,
-                        );
-                    }
+                    if (tb_row >= TERM_ROWS) continue;
+                    const at = tb_row * TERM_COLS;
+                    drawTermCells(w.x, y, t.text_buf[at..], t.attr_buf[at..], t.fg_rgb_buf[at..], t.bg_rgb_buf[at..], max_cols);
                 }
             }
             gfx.drawString(w.x + @as(i32, @intCast(w.width)) - 80, content_y + 2, "[PgDn]", 0x666688, WINDOW_BG);
         } else {
-            // Live view (normal rendering): per-cell color from attr_buf.
+            // Live view.
             var row: u32 = 0;
             while (row < TERM_ROWS and row < max_rows) : (row += 1) {
-                var col: u32 = 0;
-                while (col < TERM_COLS and col < max_cols) : (col += 1) {
-                    const cell_idx = row * TERM_COLS + col;
-                    const ch = t.text_buf[cell_idx];
-                    const attr = t.attr_buf[cell_idx];
-                    if (ch != ' ' or (attr & ATTR_INVERSE) != 0) {
-                        const colors = cellColors(attr, t.fg_rgb_buf[cell_idx]);
-                        drawTermChar(
-                            w.x + @as(i32, @intCast(TERM_PAD + col * FONT_W)),
-                            content_y + @as(i32, @intCast(row * FONT_H)),
-                            ch,
-                            colors.fg,
-                            colors.bg,
-                        );
-                    }
-                }
+                const at = row * TERM_COLS;
+                drawTermCells(w.x, content_y + @as(i32, @intCast(row * FONT_H)), t.text_buf[at..], t.attr_buf[at..], t.fg_rgb_buf[at..], t.bg_rgb_buf[at..], max_cols);
             }
 
             // Text cursor — blink unless the user just typed / output just landed.
@@ -2502,6 +2461,7 @@ fn renderWindow(idx: u8) void {
             t.painted_text = t.text_buf;
             t.painted_attr = t.attr_buf;
             t.painted_rgb = t.fg_rgb_buf;
+            t.painted_bg = t.bg_rgb_buf;
             t.painted_cursor = cursor;
             t.painted_scroll_count = t.scroll_count;
             t.painted_valid = true;
@@ -2591,26 +2551,8 @@ fn paintTermRow(idx: u8, row: u32, cursor: u16) void {
     gfx.fillRect(w.x, py, w.width, FONT_H, WINDOW_BG);
     if (row == 0) gfx.drawHLine(w.x, content_y, w.width, 0x151515);
 
-    // Draw characters on this row, per-cell color from attr_buf.
-    // Space cells render too when inverse mode is on, so colored bg shows
-    // (used by fastfetch's truecolor bar via fg+inverse swap).
     const first = row * TERM_COLS;
-    var col: u32 = 0;
-    while (col < TERM_COLS and col < max_cols) : (col += 1) {
-        const cell_idx = first + col;
-        const ch = t.text_buf[cell_idx];
-        const attr = t.attr_buf[cell_idx];
-        if (ch != ' ' or (attr & ATTR_INVERSE) != 0) {
-            const colors = cellColors(attr, t.fg_rgb_buf[cell_idx]);
-            drawTermChar(
-                w.x + @as(i32, @intCast(TERM_PAD + col * FONT_W)),
-                py,
-                ch,
-                colors.fg,
-                colors.bg,
-            );
-        }
-    }
+    drawTermCells(w.x, py, t.text_buf[first..], t.attr_buf[first..], t.fg_rgb_buf[first..], t.bg_rgb_buf[first..], max_cols);
 
     const cursor_here = cursor != TerminalData.NO_CURSOR and cursor / TERM_COLS == row;
     if (cursor_here) {
@@ -2626,6 +2568,7 @@ fn paintTermRow(idx: u8, row: u32, cursor: u16) void {
     @memcpy(t.painted_text[first..][0..TERM_COLS], t.text_buf[first..][0..TERM_COLS]);
     @memcpy(t.painted_attr[first..][0..TERM_COLS], t.attr_buf[first..][0..TERM_COLS]);
     @memcpy(t.painted_rgb[first..][0..TERM_COLS], t.fg_rgb_buf[first..][0..TERM_COLS]);
+    @memcpy(t.painted_bg[first..][0..TERM_COLS], t.bg_rgb_buf[first..][0..TERM_COLS]);
     if (cursor_here) {
         t.painted_cursor = cursor;
     } else if (t.painted_cursor != TerminalData.NO_CURSOR and t.painted_cursor / TERM_COLS == row) {
@@ -2707,7 +2650,8 @@ fn repaintStaleRows(idx: u8) bool {
             const a = row * TERM_COLS;
             break :blk !std.mem.eql(u8, t.text_buf[a..][0..TERM_COLS], t.painted_text[a..][0..TERM_COLS]) or
                 !std.mem.eql(u8, t.attr_buf[a..][0..TERM_COLS], t.painted_attr[a..][0..TERM_COLS]) or
-                !std.mem.eql(u32, t.fg_rgb_buf[a..][0..TERM_COLS], t.painted_rgb[a..][0..TERM_COLS]);
+                !std.mem.eql(u32, t.fg_rgb_buf[a..][0..TERM_COLS], t.painted_rgb[a..][0..TERM_COLS]) or
+                !std.mem.eql(u32, t.bg_rgb_buf[a..][0..TERM_COLS], t.painted_bg[a..][0..TERM_COLS]);
         };
         if (stale) {
             paintTermRow(idx, row, cursor);
