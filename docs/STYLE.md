@@ -537,6 +537,23 @@ that passes, and rule 11 wanted named phases anyway).
 **How to apply:** new DMA rings/buffers go through `Dma(T)`; existing
 loose phys/virt pairs convert when touched.
 
+**How wide an address the device takes** is for the driver to say, where
+it allocates. The PMM hands out frames above 4 GiB first, so memory
+nobody asked to be low is not:
+
+- the protocol's address fields are 64 bits and nothing narrower exists
+  (NVMe, virtio, e1000 descriptors): `pmm.allocContiguous` / `Dma(T)`;
+- the width is a capability bit (xHCI AC64, AHCI S64A, HDA 64OK): read
+  the bit once, `pmm.allocForDevice(n, addr64)`;
+- 32-bit fields only (AC97, BMDMA): `pmm.allocFrameBelow4G` /
+  `allocContiguousBelow4G`.
+
+A physical address is narrowed with `@truncate` only as the low half of
+a lo/hi pair. A caller's buffer is never handed to a device: the driver
+moves the data through memory it allocated by the rule above and copies
+(nvme, ahci, ata), so the caller's pointer may be a stack, vmalloc or
+user address, contiguous or not.
+
 The pmm public API speaks `Phys` since 2026-08-25 (the UserPtr-style
 chokepoint seizure): every allocator returns `?Phys`, every
 free/acquire/release/refcount takes `Phys`. What that means at a call
@@ -780,6 +797,7 @@ silent self-recovery into observable metric.
 | `kwarn(@src(),...)` | `src/debug/debug.zig` `kwarn`                   |
 | `Deadline`          | `src/driver/input/keyboard.zig` `ps2Wait`       |
 | `delay`             | `src/time/delay.zig`; `smp.sendInitSipiSipi`, `pci` power-state and FLR waits |
+| device address width | `pmm.allocForDevice` in `xhci.dmaFrames`, `ahci` (S64A); `ac97` (below 4 GiB); `ahci.read` / `ata.readSectorsDMA` copy through their own buffer |
 | `pause.Epoch`       | `src/driver/block/nvme.zig` `waitCompletion`    |
 | `mightSleep`        | `src/proc/sched.zig` `blockOn`                  |
 | `// ctx: irq`       | `src/cpu/idt/irq0.zig` `handleIRQ0`; lint in `tools/ctx_lint.zig` |

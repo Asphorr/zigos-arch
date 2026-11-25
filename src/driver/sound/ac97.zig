@@ -105,13 +105,13 @@ pub fn init() bool {
     // Set sample rate
     io.outb16(nam_base + NAM_SAMPLE_RATE, @intCast(SAMPLE_RATE));
 
-    // Allocate BDL page (physically contiguous)
-    bdl_phys = (pmm.allocFrame() orelse return false).raw();
+    // The BDL and the buffers it lists: AC97 has 32-bit address registers.
+    bdl_phys = (pmm.allocFrameBelow4G() orelse return false).raw();
     @memset(@as([*]u8, @ptrFromInt(paging.physToVirt(bdl_phys)))[0..4096], 0);
     _ = iommu.dmaMap(dev.bus, dev.dev, dev.func, bdl_phys, 4096, .{});
 
     // Allocate audio buffer (4 contiguous pages = 16KB)
-    buf_phys = (pmm.allocContiguous(BUF_PAGES) orelse return false).raw();
+    buf_phys = (pmm.allocContiguousBelow4G(BUF_PAGES) orelse return false).raw();
     @memset(@as([*]u8, @ptrFromInt(paging.physToVirt(buf_phys)))[0 .. BUF_PAGES * 4096], 0);
     _ = iommu.dmaMap(dev.bus, dev.dev, dev.func, buf_phys, BUF_PAGES * 4096, .{});
 

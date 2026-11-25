@@ -99,13 +99,7 @@ fn render(addr: usize) ![]const u8 {
     }
 
     // 5. Physical memory the kernel holds (memmap.zig), as a low address.
-    const held = [_]struct { name: []const u8, range: memmap.Range }{
-        .{ .name = "guest_fb", .range = memmap.guestFb() },
-        .{ .name = "back_buffer", .range = memmap.backBuffer() },
-        .{ .name = "boot_data", .range = memmap.bootData() },
-        .{ .name = "kernel-image-phys", .range = memmap.kernelImagePhys() },
-    };
-    for (held) |h| {
+    for (memmap.held()) |h| {
         if (h.range.contains(addr)) {
             return std.fmt.bufPrint(&buf, "{s} +0x{x}", .{ h.name, addr - h.range.base });
         }

@@ -27,10 +27,22 @@ const PRDT = extern struct {
     byte_count: u16, // 0 = 64KB
     flags: u16, // bit 15 = EOT
 };
+const PRD_EOT: u16 = 0x8000;
+
+/// A PRD's byte count, for 1..64 KiB.
+inline fn prdCount(bytes: u32) u16 {
+    return @truncate(bytes); // 0x10000 encodes as 0
+}
 
 var bmide_base: u16 = 0; // BAR4 I/O port base
 var prdt_phys: u32 = 0; // Physical address of PRDT page
 var prdt_ptr: ?[*]volatile PRDT = null;
+/// Where a DMA read lands: the driver's own 64 KB, right after the PRDT
+/// page and below 4 GiB like it — a PRD holds a 32-bit address. The caller
+/// gets a copy, so its buffer may be any memory a kernel store reaches.
+/// Behind ata_lock, like the PRDT.
+var bounce_phys: u32 = 0;
+const BOUNCE_FRAMES: u32 = MAX_SECTORS_PER_DMA * 512 / 4096;
 var dma_available: bool = false;
 
 // === Read-ahead cache ===
@@ -82,12 +94,13 @@ pub fn initDMA() void {
         pci.configWrite(ide_dev.bus, ide_dev.dev, ide_dev.func, 0x3C, (irq_reg & 0xFFFFFF00) | 14);
     }
 
-    // Allocate a page for PRDT (must be below 4GB, physically contiguous)
-    const prdt_page = (pmm.allocContiguousBelow4G(1) orelse {
-        debug.klog("[ata/{s}] Failed to allocate PRDT page\n", .{tag});
+    // The PRDT page and the data buffer after it: below 4 GiB, contiguous.
+    const prdt_page = (pmm.allocContiguousBelow4G(1 + BOUNCE_FRAMES) orelse {
+        debug.klog("[ata/{s}] Failed to allocate the PRDT page and data buffer\n", .{tag});
         return;
     }).raw();
     prdt_phys = @intCast(prdt_page);
+    bounce_phys = prdt_phys + 4096;
     // Kernel access through the physmap; the device sees prdt_phys itself.
     prdt_ptr = @ptrFromInt(@import("../../mm/paging.zig").physToVirt(prdt_page));
 
@@ -314,19 +327,26 @@ fn readSectorsDMA(port: u16, drive_head: u8, lba: u32, count: u8, dest: [*]u8, b
         return;
     };
     const n: u32 = if (count == 0) 256 else @as(u32, count);
+    if (n > MAX_SECTORS_PER_DMA) {
+        readSectorsPort(port, drive_head, lba, count, dest);
+        return;
+    }
     const byte_count: u32 = n * 512;
 
-    // Dest must be a 32-bit physical address for the BMIDE PRDT. Higher-half
-    // kernel: a kernel-BSS pointer (e.g., readahead_cache) comes in as a
-    // high VA; translate to LMA before truncating. virtToPhys handles both
-    // high-half and low-identity inputs.
-    const dest_phys: u32 = @intCast(@import("../../mm/paging.zig").virtToPhys(@intFromPtr(dest)).?);
-
-    // Set up PRDT: single entry pointing to dest buffer
+    // The PRDT points at the driver's data buffer. One entry's memory may
+    // not cross a 64 KiB line (SFF-8038i: the controller's address counter
+    // is 16 bits wide and wraps inside the segment), so the buffer is cut
+    // at the one it straddles.
+    const head: u32 = @min(byte_count, 0x10000 - (bounce_phys & 0xFFFF));
     prdt[0] = .{
-        .phys_addr = dest_phys,
-        .byte_count = if (byte_count >= 0x10000) 0 else @intCast(byte_count),
-        .flags = 0x8000, // EOT
+        .phys_addr = bounce_phys,
+        .byte_count = prdCount(head),
+        .flags = if (head == byte_count) PRD_EOT else 0,
+    };
+    if (head < byte_count) prdt[1] = .{
+        .phys_addr = bounce_phys + head,
+        .byte_count = prdCount(byte_count - head),
+        .flags = PRD_EOT,
     };
 
     const t_start = @import("../../debug/perf.zig").rdtsc();
@@ -397,7 +417,10 @@ fn readSectorsDMA(port: u16, drive_head: u8, lba: u32, count: u8, dest: [*]u8, b
     if (!dma_done) {
         dma_timeouts += 1;
         readSectorsPort(port, drive_head, lba, count, dest);
+        return;
     }
+    const data: [*]const u8 = @ptrFromInt(@import("../../mm/paging.zig").physToVirt(bounce_phys));
+    @memcpy(dest[0..byte_count], data[0..byte_count]);
 }
 
 // === PIO operations (kept as fallback) ===

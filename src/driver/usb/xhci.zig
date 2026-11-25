@@ -351,11 +351,20 @@ fn portscAddr(port: u8) usize {
     return op_base + PORTSC_BASE + @as(usize, port) * 0x10;
 }
 
+/// HCCPARAMS1.AC64: the controller's pointers are 64 bits wide. Without it
+/// every frame it is told about has to sit below 4 GiB.
+var addr64: bool = false;
+
+/// Frames the controller will be given the address of.
+fn dmaFrames(count: u32) ?pmm.Phys {
+    return pmm.allocForDevice(count, addr64);
+}
+
 // --- Ring buffer management ---
 
 fn initRing() ?Ring {
     // Allocate one page for command/event rings
-    const phys = (pmm.allocFrame() orelse return null).raw();
+    const phys = (dmaFrames(1) orelse return null).raw();
     const ptr: [*]u8 = @ptrFromInt(paging.physToVirt(phys));
     @memset(ptr[0..4096], 0);
 
@@ -369,7 +378,7 @@ fn initRing() ?Ring {
 
 fn initTransferRing() ?Ring {
     // 1 page = 256 TRBs (255 usable + Link TRB) — guaranteed contiguous physical memory
-    const phys = (pmm.allocFrame() orelse return null).raw();
+    const phys = (dmaFrames(1) orelse return null).raw();
     const trbs: [*]volatile TRB = @ptrFromInt(paging.physToVirt(phys));
     @memset(@as([*]u8, @ptrFromInt(paging.physToVirt(phys)))[0..4096], 0);
 
@@ -491,6 +500,7 @@ pub fn init() bool {
     db_base = mmio_base + dboff;
 
     const ac64 = (hccparams1 & 1) != 0;
+    addr64 = ac64;
     const csz = (hccparams1 & (1 << 2)) != 0;
 
     debug.klog("[xhci] Version {d}.{d}, MaxPorts={d}, MaxSlots={d}, MaxIntrs={d}\n", .{
@@ -600,7 +610,7 @@ pub fn init() bool {
 
     // --- Allocate DCBAA ---
     // (max_slots + 1) * 8 bytes, must be 64-byte aligned. One page is fine.
-    const dcbaa_page = (pmm.allocFrame() orelse {
+    const dcbaa_page = (dmaFrames(1) orelse {
         debug.klog("[xhci] Failed to allocate DCBAA\n", .{});
         return false;
     }).raw();
@@ -622,7 +632,7 @@ pub fn init() bool {
     debug.klog("[xhci] Command ring at 0x{x}\n", .{cmd_ring.phys});
 
     // --- Allocate Event Ring (4 contiguous pages = 1024 TRBs) ---
-    const evt_phys = (pmm.allocContiguous(4) orelse return false).raw();
+    const evt_phys = (dmaFrames(4) orelse return false).raw();
     @memset(@as([*]u8, @ptrFromInt(paging.physToVirt(evt_phys)))[0..4096 * 4], 0);
     _ = iommu.dmaMap(pci_bus, pci_dev, pci_func, evt_phys, 4096 * 4, .{});
     evt_ring = .{
@@ -635,7 +645,7 @@ pub fn init() bool {
 
     // --- Set up Event Ring Segment Table ---
     // ERST: one entry = {base_addr_lo, base_addr_hi, ring_size, reserved}
-    const erst_page = (pmm.allocFrame() orelse {
+    const erst_page = (dmaFrames(1) orelse {
         debug.klog("[xhci] Failed to allocate ERST\n", .{});
         return false;
     }).raw();
@@ -879,7 +889,7 @@ pub fn resumeFromS3() bool {
 
 fn scanAndEnumerate() void {
     // Allocate scratch buffer for control transfers
-    scratch_phys = (pmm.allocFrame() orelse {
+    scratch_phys = (dmaFrames(1) orelse {
         debug.klog("[xhci] Failed to allocate scratch buffer\n", .{});
         return;
     }).raw();
@@ -1056,9 +1066,9 @@ fn enumerateDevice(port: u8, speed: u8) void {
     debug.klog("[xhci] Slot {d} enabled for port {d}\n", .{ slot_id, port + 1 });
 
     // Step 2: Allocate Input Context + Device Context
-    const input_ctx_phys = (pmm.allocFrame() orelse return).raw();
-    const dev_ctx_phys = (pmm.allocFrame() orelse return).raw();
-    const tr_phys = (pmm.allocFrame() orelse return).raw();
+    const input_ctx_phys = (dmaFrames(1) orelse return).raw();
+    const dev_ctx_phys = (dmaFrames(1) orelse return).raw();
+    const tr_phys = (dmaFrames(1) orelse return).raw();
     // Map per-device DMA targets before the controller touches them.
     // input_ctx is read by ADDRESS_DEVICE / CONFIGURE_ENDPOINT; dev_ctx
     // and tr (transfer ring) are read/written on every URB.
@@ -1415,7 +1425,7 @@ fn enumerateDevice(port: u8, speed: u8) void {
         debug.klog("[xhci] Endpoint configured, DCI={d}\n", .{dci});
 
         // Allocate per-device data buffer page
-        const dev_data_phys = (pmm.allocFrame() orelse return).raw();
+        const dev_data_phys = (dmaFrames(1) orelse return).raw();
         @memset(@as([*]u8, @ptrFromInt(paging.physToVirt(dev_data_phys)))[0..4096], 0);
         _ = iommu.dmaMap(pci_bus, pci_dev, pci_func, dev_data_phys, 4096, .{});
 
@@ -1507,7 +1517,7 @@ fn enumerateDevice(port: u8, speed: u8) void {
         debug.klog("[xhci] MSC endpoints configured: IN DCI={d} OUT DCI={d}\n", .{ in_dci, out_dci });
 
         // Allocate data buffer page for MSC
-        const msc_data_phys = (pmm.allocFrame() orelse return).raw();
+        const msc_data_phys = (dmaFrames(1) orelse return).raw();
         @memset(@as([*]u8, @ptrFromInt(paging.physToVirt(msc_data_phys)))[0..4096], 0);
         _ = iommu.dmaMap(pci_bus, pci_dev, pci_func, msc_data_phys, 4096, .{});
 
@@ -1763,7 +1773,7 @@ fn setupUasStreams(slot_id: u8, input_ctx_phys: usize, speed_val: u32) bool {
     // One page holds the three Primary Stream Context Arrays (the command
     // pipe has no streams). Each array is 4 entries x 16 B = 64 B; spaced
     // 256 B apart for clarity (all are 16-byte aligned within the page).
-    const sca_page = (pmm.allocFrame() orelse return false).raw();
+    const sca_page = (dmaFrames(1) orelse return false).raw();
     @memset(@as([*]u8, @ptrFromInt(paging.physToVirt(sca_page)))[0..4096], 0);
     _ = iommu.dmaMap(pci_bus, pci_dev, pci_func, sca_page, 4096, .{});
     const status_sca = sca_page + 0;
@@ -1811,7 +1821,7 @@ fn setupUasStreams(slot_id: u8, input_ctx_phys: usize, speed_val: u32) bool {
     }
 
     // IU + data DMA staging buffer (enlarged in U3 for multi-sector reads).
-    const data_phys = (pmm.allocFrame() orelse return false).raw();
+    const data_phys = (dmaFrames(1) orelse return false).raw();
     @memset(@as([*]u8, @ptrFromInt(paging.physToVirt(data_phys)))[0..4096], 0);
     _ = iommu.dmaMap(pci_bus, pci_dev, pci_func, data_phys, 4096, .{});
 
@@ -2404,13 +2414,15 @@ fn handleHidTransferEvent(evt_trb: TRB) ?u8 {
     }
     const dev_i = di orelse return null;
 
-    const trb_ptr = evt_trb.param_lo;
-    if (trb_ptr == 0) return null;
-    // trb_ptr points at the data-stage TRB we issued — its phys was
-    // written into the transfer ring; we read it back here. Map through
-    // the physmap so kernel deref works without the legacy low identity.
-    const completed_words: [*]volatile u32 = @ptrFromInt(paging.physToVirt(trb_ptr));
-    const data_addr = completed_words[0];
+    const trb_phys: u64 = @as(u64, evt_trb.param_hi) << 32 | evt_trb.param_lo;
+    if (trb_phys == 0) return null;
+    // The event names the transfer TRB we issued, by its physical address
+    // in the transfer ring; its parameter is the report buffer's. Both are
+    // 64 bits wide: the ring and the buffer can sit above 4 GiB.
+    const completed_words: [*]volatile u32 = @ptrFromInt(paging.physToVirt(trb_phys));
+    const data_lo = completed_words[0];
+    const data_hi = completed_words[1];
+    const data_addr: u64 = @as(u64, data_hi) << 32 | data_lo;
     if (data_addr == 0) return null;
 
     // Only process data on success/short packet
@@ -2433,8 +2445,8 @@ fn handleHidTransferEvent(evt_trb: TRB) ?u8 {
     const ring = &hid_rings[dev_i];
     if (ring.enqueue < RING_SIZE - 1) {
         const idx = ring.enqueue;
-        ring.trbs[idx].param_lo = data_addr;
-        ring.trbs[idx].param_hi = 0;
+        ring.trbs[idx].param_lo = data_lo;
+        ring.trbs[idx].param_hi = data_hi;
         ring.trbs[idx].status = 8; // Always 8 bytes (prevents Babble Error)
         asm volatile ("sfence" ::: .{ .memory = true });
         ring.trbs[idx].control = (TRB_NORMAL << 10) | (1 << 5) |

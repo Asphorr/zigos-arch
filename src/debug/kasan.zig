@@ -182,7 +182,9 @@ inline fn memToShadow(addr: usize) ?[*]u8 {
 pub fn poison(addr: usize, len: usize, tag: u8) void {
     if (!initialized) return;
     const ptr = memToShadow(addr) orelse return;
-    const shadow_len = (len + 7) >> SHADOW_SCALE_SHIFT;
+    // A run that starts under REGION_HI may end above it; the shadow does not.
+    const covered = @min(len, REGION_HI - addr);
+    const shadow_len = (covered + 7) >> SHADOW_SCALE_SHIFT;
     @memset(ptr[0..shadow_len], tag);
 }
 

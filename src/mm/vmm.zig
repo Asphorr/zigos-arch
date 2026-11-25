@@ -98,7 +98,16 @@ inline fn tableFromEntry(entry: u64) [*]u64 {
 const TableAlloc = struct { ptr: [*]u64, phys: Phys };
 
 fn allocZeroedTable() ?TableAlloc {
-    const phys = pmm.allocFrame() orelse return null;
+    return zeroed(pmm.allocFrame() orelse return null);
+}
+
+/// A PML4. Below 4 GiB: resuming from S3 loads the suspending task's CR3 in
+/// the real-mode trampoline, before the register is 64 bits wide.
+fn allocZeroedRoot() ?TableAlloc {
+    return zeroed(pmm.allocFrameBelow4G() orelse return null);
+}
+
+fn zeroed(phys: Phys) TableAlloc {
     const ptr = phys.toVirt().ptr([*]u64);
     @memset(ptr[0..512], 0);
     return .{ .ptr = ptr, .phys = phys };
@@ -123,7 +132,7 @@ inline fn makeEntry(phys: Phys, flags: u64) u64 {
 ///   PML4[511]  inherited from kernel master — kernel image at -2 GB.
 ///              LSTAR / IDT / .text live here, so syscall/IRQ entry needs it.
 pub fn createAddressSpace(phys_out: *Phys) ?[*]align(4096) u64 {
-    const alloc = allocZeroedTable() orelse return null;
+    const alloc = allocZeroedRoot() orelse return null;
     const pml4: [*]align(4096) u64 = @alignCast(alloc.ptr);
 
     // PML4[0]: fresh empty PDPT. User-owned; mapUserPage will populate as
@@ -1033,7 +1042,7 @@ pub fn destroyAddressSpace(pml4: [*]align(4096) u64, pml4_phys: Phys) void {
 /// exec, which tears down PML4[0]); a complete fix would swap the parent's
 /// pages in before cloning. Tracked as a swap follow-up.
 pub fn cloneAddressSpace(parent_pml4: [*]align(4096) u64, parent_pcid: u16, phys_out: *Phys) ?[*]align(4096) u64 {
-    const pml4_alloc = allocZeroedTable() orelse return null;
+    const pml4_alloc = allocZeroedRoot() orelse return null;
     const child_pml4: [*]align(4096) u64 = @alignCast(pml4_alloc.ptr);
     phys_out.* = pml4_alloc.phys;
 

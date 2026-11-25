@@ -192,8 +192,12 @@ inline fn sdOff(idx: u8, off: u32) u32 {
     return SD_BASE + @as(u32, idx) * SD_STRIDE + off;
 }
 
+/// GCAP.64OK: the controller's base registers and BDL entries take 64-bit
+/// addresses. Without it its memory has to sit below 4 GiB.
+var addr64: bool = false;
+
 fn allocPage() ?usize {
-    const p = pmm.allocFrame() orelse return null;
+    const p = pmm.allocForDevice(1, addr64) orelse return null;
     const v = p.toVirt().ptr([*]u8);
     @memset(v[0..4096], 0);
     return p.raw();
@@ -314,6 +318,7 @@ pub fn init() bool {
 
     // Decode capabilities.
     const gcap = r16(REG_GCAP);
+    addr64 = gcap & 1 != 0;
     iss = @intCast((gcap >> 8) & 0x0F);
     oss = @intCast((gcap >> 12) & 0x0F);
     const bss: u8 = @intCast((gcap >> 3) & 0x1F);
@@ -365,7 +370,7 @@ pub fn init() bool {
 // 48 kHz × 2 ch × 16-bit. From here, writeSamples() just refills the
 // buffer and toggles RUN; no need to re-program format or pin every call.
 fn streamSetup() bool {
-    stream_buf_phys = (pmm.allocContiguous(STREAM_PAGES) orelse return false).raw();
+    stream_buf_phys = (pmm.allocForDevice(STREAM_PAGES, addr64) orelse return false).raw();
     stream_buf_virt = @ptrFromInt(paging.physToVirt(stream_buf_phys));
     _ = iommu.dmaMap(pci_bus, pci_dev, pci_func, stream_buf_phys, STREAM_PAGES * 4096, .{});
     stream_buf_size = STREAM_PAGES * 4096;

@@ -118,8 +118,21 @@ const Port = struct {
     cmd_list_phys: usize, // 1 KB (32 entries × 32 bytes)
     fis_phys: usize, // 256 bytes
     cmd_table_phys: usize, // 256 bytes (CFIS + ATAPI + rsv + 1 PRDT)
+    /// Where every command's data goes: BOUNCE_SECTORS of the port's own
+    /// memory. Behind the port's lock, like the command table.
+    bounce_phys: usize = 0,
     active: bool = false,
 };
+
+/// CAP.S64A: the HBA takes 64-bit addresses. Without it the memory it is
+/// told about has to sit below 4 GiB.
+var addr64: bool = false;
+const CAP_S64A: u32 = 1 << 31;
+
+/// Sectors one command moves: 128 KB, what one fill of ext2's cache asks
+/// for. A longer request is several commands.
+const BOUNCE_SECTORS: u32 = 256;
+const BOUNCE_FRAMES: u32 = BOUNCE_SECTORS * 512 / 4096;
 
 var hba_base: usize = 0;
 var ports: [32]Port = undefined;
@@ -250,6 +263,8 @@ pub fn init() bool {
         return false;
     }
     hbaWrite(HBA_GHC, GHC_AE); // re-enable after reset
+    addr64 = hbaRead(HBA_CAP) & CAP_S64A != 0;
+    if (!addr64) debug.klog("[ahci] no 64-bit addressing (CAP.S64A=0): its memory stays below 4 GiB\n", .{});
 
     // MSI-X probe — single vector for the whole HBA, so each issued
     // command's polling loop can sleep on `hlt` instead of busy-spinning.
@@ -291,6 +306,10 @@ pub fn init() bool {
             debug.klog("[ahci] port {d}: non-ATA device sig=0x{x} skipped\n", .{ p, sig });
             continue;
         }
+        ports[p].bounce_phys = (pmm.allocForDevice(BOUNCE_FRAMES, addr64) orelse {
+            debug.klog("[ahci] port {d}: no memory for its data buffer\n", .{p});
+            continue;
+        }).raw();
         ports[p].active = true;
         debug.klog("[ahci] port {d}: SATA disk ready\n", .{p});
 
@@ -324,7 +343,7 @@ fn setupPort(p: u8) bool {
     //   0x400-0x4FF: FIS receive area
     //   0x500-0x5FF: command table 0 (we only use slot 0)
     //   0x600-0xFFF: scratch / unused
-    const phys = (pmm.allocContiguous(1) orelse return false).raw();
+    const phys = (pmm.allocForDevice(1, addr64) orelse return false).raw();
     @memset(@as([*]u8, @ptrFromInt(paging.physToVirt(phys)))[0..4096], 0);
     ports[p].cmd_list_phys = phys;
     ports[p].fis_phys = phys + 0x400;
@@ -353,17 +372,18 @@ fn setupPort(p: u8) bool {
     return true;
 }
 
-/// Issue one ATA command and poll to completion. `cmd` is the ATA opcode
-/// (READ DMA EXT / WRITE DMA EXT). Buffer `buf_phys` must be a physical
-/// address; size in bytes = sectors × 512. `is_write` controls the FIS
-/// write bit. Returns true on success.
-fn issueCommand(port: u8, cmd: u8, lba: u64, sectors: u16, buf_phys: usize, is_write: bool) bool {
-    if (!ports[port].active) return false;
-    // Per-port lock: CFIS + PRDT + command-list slot 0 + the doorbell are
-    // SHARED per port. Without this, two CPUs reading the same port race
-    // on the command table and produce garbage in their buffers.
-    port_locks[port].acquire();
-    defer port_locks[port].release();
+/// Issue one ATA command over the port's data buffer and poll to completion.
+/// `cmd` is the ATA opcode (READ DMA EXT / WRITE DMA EXT); `sectors` is at
+/// most BOUNCE_SECTORS. `is_write` controls the FIS write bit. Returns true
+/// on success.
+///
+/// The caller holds the port's lock: CFIS + PRDT + command-list slot 0 + the
+/// doorbell + the data buffer are SHARED per port. Without it, two CPUs
+/// reading the same port race on the command table and produce garbage in
+/// their buffers.
+fn issueCommand(port: u8, cmd: u8, lba: u64, sectors: u16, is_write: bool) bool {
+    port_locks[port].assertHeld();
+    const buf_phys = ports[port].bounce_phys;
     const tab_addr = ports[port].cmd_table_phys;
     const cmd_list_addr = ports[port].cmd_list_phys;
 
@@ -466,44 +486,60 @@ fn issueCommand(port: u8, cmd: u8, lba: u64, sectors: u16, buf_phys: usize, is_w
 }
 
 // === Public sector API (mirrors ata.zig) ===
-// `issueCommand` takes a *physical* address — it goes straight into the
-// PRDT (`prdt.dba`/`dbau`). After the higher-half kernel migration a kernel
-// buffer like a FAT32 cache page is at a high VA, so we route every dest/src
-// pointer through paging.virtToPhys before truncating. virtToPhys returns
-// null on out-of-window VAs; we unwrap (.?) — a panic here means a caller
-// passed a non-kernel pointer to AHCI, which is a real bug.
+// The HBA is never given a caller's address: data moves through the port's
+// own buffer and is copied. So `dest`/`src` need be neither physically
+// contiguous nor within the HBA's address width — the stack and vmalloc
+// are fine. The copy runs under the port lock, so the memory must not
+// fault: a user buffer has to be present and stay so.
 
-inline fn vp(p: anytype) usize {
-    return @import("../../mm/paging.zig").virtToPhys(@intFromPtr(p)).?;
+fn portBuffer(port: u8) [*]u8 {
+    return @ptrFromInt(paging.physToVirt(ports[port].bounce_phys));
+}
+
+fn read(port: u8, lba: u64, count: u32, dest: [*]u8) void {
+    if (port == 0xFF or !ports[port].active) return;
+    var done: u32 = 0;
+    while (done < count) {
+        const n: u32 = @min(count - done, BOUNCE_SECTORS);
+        port_locks[port].acquire();
+        defer port_locks[port].release();
+        if (!issueCommand(port, ATA_CMD_READ_DMA_EXT, lba + done, @intCast(n), false)) return;
+        @memcpy(dest[@as(usize, done) * 512 ..][0 .. n * 512], portBuffer(port)[0 .. n * 512]);
+        done += n;
+    }
+}
+
+fn write(port: u8, lba: u64, count: u32, src: [*]const u8) void {
+    if (port == 0xFF or !ports[port].active) return;
+    var done: u32 = 0;
+    while (done < count) {
+        const n: u32 = @min(count - done, BOUNCE_SECTORS);
+        port_locks[port].acquire();
+        defer port_locks[port].release();
+        @memcpy(portBuffer(port)[0 .. n * 512], src[@as(usize, done) * 512 ..][0 .. n * 512]);
+        if (!issueCommand(port, ATA_CMD_WRITE_DMA_EXT, lba + done, @intCast(n), true)) return;
+        done += n;
+    }
 }
 
 pub fn readSectorPrimary(lba: u32, dest: [*]u8) void {
-    if (primary_port == 0xFF) return;
-    _ = issueCommand(primary_port, ATA_CMD_READ_DMA_EXT, lba, 1, vp(dest), false);
+    read(primary_port, lba, 1, dest);
 }
 
-// count is u16 (ext2's cache fill can now be up to 256 sectors for QD4). No
-// chunk loop needed: issueCommand's CFIS count is 16-bit (LBA48) and its single
-// PRDT entry's dbc is 22-bit, so one command covers up to 4 MiB / 8192 sectors
-// in one contiguous transfer — far past anything the FS cache asks for.
 pub fn readSectorsPrimary(lba: u32, count: u16, dest: [*]u8) void {
-    if (primary_port == 0xFF) return;
-    _ = issueCommand(primary_port, ATA_CMD_READ_DMA_EXT, lba, count, vp(dest), false);
+    read(primary_port, lba, count, dest);
 }
 
 pub fn readSectorSecondary(lba: u32, dest: [*]u8) void {
-    if (secondary_port == 0xFF) return;
-    _ = issueCommand(secondary_port, ATA_CMD_READ_DMA_EXT, lba, 1, vp(dest), false);
+    read(secondary_port, lba, 1, dest);
 }
 
 pub fn readSectorsSecondary(lba: u32, count: u16, dest: [*]u8) void {
-    if (secondary_port == 0xFF) return;
-    _ = issueCommand(secondary_port, ATA_CMD_READ_DMA_EXT, lba, count, vp(dest), false);
+    read(secondary_port, lba, count, dest);
 }
 
 pub fn writeSectorSecondary(lba: u32, src: [*]const u8) void {
-    if (secondary_port == 0xFF) return;
-    _ = issueCommand(secondary_port, ATA_CMD_WRITE_DMA_EXT, lba, 1, vp(src), true);
+    write(secondary_port, lba, 1, src);
 }
 
 pub fn isReady() bool {

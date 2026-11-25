@@ -313,7 +313,7 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
 
     // ---- Phase 2: Memory & paging ----------------------------------------
     blog.phase(.memory, "\u{25A3}", "Memory & paging"); // ▣
-    pmm.init(boot_info);
+    pmm.init();
     blog.okNote("Physical memory manager", "{d} MB free", .{pmm.freeFrameCount() * 4 / 1024});
     paging.init(boot_info);
     blog.ok("4-level paging");

@@ -135,7 +135,7 @@ inline fn acquireFrameRaw(p: usize) void {
 inline fn releaseFrameRaw(p: usize) void {
     pmm.releaseFrame(Phys.of(p));
 }
-inline fn frameRefCountRaw(p: usize) u8 {
+inline fn frameRefCountRaw(p: usize) pmm.RefCount {
     return pmm.frameRefCount(Phys.of(p));
 }
 
@@ -664,18 +664,21 @@ fn phase10_magazineDrain() void {
 // ===========================================================================
 
 fn phase11_refcountChurn() void {
-    note("p11", "acquireFrame 100× then releaseFrame 100×, validate final free", .{});
+    // More owners than a byte counts: the count was one once, and the 255th
+    // owner of a frame was a kernel panic.
+    const owners: u32 = 1000;
+    note("p11", "acquireFrame {d}× then releaseFrame {d}×, validate final free", .{ owners, owners });
     const x = allocFrameRaw() orelse {
         fail("p11", "initial alloc failed", .{});
         return;
     };
     var i: u32 = 0;
-    while (i < 100) : (i += 1) acquireFrameRaw(x);
-    if (frameRefCountRaw(x) != 101) {
-        fail("p11", "expected refcount 101 after acquires, got {d}", .{frameRefCountRaw(x)});
+    while (i < owners) : (i += 1) acquireFrameRaw(x);
+    if (frameRefCountRaw(x) != owners + 1) {
+        fail("p11", "expected refcount {d} after acquires, got {d}", .{ owners + 1, frameRefCountRaw(x) });
     }
     i = 0;
-    while (i < 100) : (i += 1) releaseFrameRaw(x);
+    while (i < owners) : (i += 1) releaseFrameRaw(x);
     if (frameRefCountRaw(x) != 1) {
         fail("p11", "expected refcount 1 after releases, got {d}", .{frameRefCountRaw(x)});
     }
@@ -998,11 +1001,11 @@ fn phase14_mixedLongRun() void {
 
 pub fn taskEntry() callconv(.c) noreturn {
     serial.print("\n", .{});
-    serial.print("[pmmstress] === HEAVY PMM STRESS — {d} phases, {d} regions × {d} frames ===\n", .{
-        14, pmm.PUB_REGIONS_COUNT, pmm.PUB_REGION_FRAMES,
+    serial.print("[pmmstress] === HEAVY PMM STRESS — {d} phases, {d} regions × {d} frames, {d} of them below 4 GiB ===\n", .{
+        14, pmm.pmmRegionsLive(), pmm.PUB_REGION_FRAMES, pmm.pmmRegionsLow(),
     });
-    serial.print("[pmmstress] managed={d} free={d} reserve={d} regions_live={d}\n", .{
-        pmm.managedFrameCount(), pmm.freeFrameCount(), pmm.userReserveFrames(), pmm.pmmRegionsLive(),
+    serial.print("[pmmstress] managed={d} free={d} reserve={d}\n", .{
+        pmm.managedFrameCount(), pmm.freeFrameCount(), pmm.userReserveFrames(),
     });
 
     const t_start = perf.rdtsc();

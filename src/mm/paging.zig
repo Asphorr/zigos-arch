@@ -125,7 +125,7 @@ comptime {
 // Three kernel windows (boot.asm sets them up; src/linker.ld places the
 // kernel image at the high one):
 //
-//   PHYSMAP_BASE   = 0xFFFF800000000000  PML4[256], 64 GB → phys 0..64 GB.
+//   PHYSMAP_BASE   = 0xFFFF800000000000  PML4[256], phys 0..PHYSMAP_SIZE.
 //                                        Kernel-only. The canonical "kernel
 //                                        can reach any phys frame" view.
 //   KERNEL_VIRT_BASE = 0xFFFFFFFF80000000 PML4[511]+PDPT[510]. The kernel
@@ -191,9 +191,8 @@ pub inline fn physPtr(comptime T: type, phys: u64) T {
 ///
 /// Caveats:
 ///   - Reads intermediate page-table addresses through the kernel physmap
-///     (PHYSMAP_BASE + phys). PMM only hands out frames below 64 GB, so the
-///     physmap covers every valid PT page. If PMM ever allocates above 64 GB
-///     this needs revisiting.
+///     (PHYSMAP_BASE + phys). PMM hands out no frame the physmap does not
+///     reach, so it covers every valid PT page.
 ///   - Doesn't validate canonical-form. Caller should do that first.
 pub fn isMapped(addr: u64) bool {
     // Reject non-canonical VAs up front. On real HW, a non-canonical

@@ -1,6 +1,5 @@
 const std = @import("std");
 const vga = @import("../driver.zig").vga;
-const boot_info = @import("../boot/boot_info.zig");
 const Guarded = @import("../util/guarded.zig").Guarded;
 const memmap = @import("memmap.zig");
 const smp = @import("../cpu/smp.zig");
@@ -10,22 +9,17 @@ const smp = @import("../cpu/smp.zig");
 pub const Phys = @import("../util/addr.zig").Phys;
 
 const FRAME_SIZE: u32 = 4096;
-// 4 GB cap: bitmap = 128 KB, frame_refs = 1 MB of BSS. Frames above it in
-// the memory map are skipped
-// at init time with a warning. 4 GB is as far as it goes without more
-// work: see the Below4G note in the comptime block below. A kernel build
-// inside ZigOS peaks at 1.5 GB in the compiler alone.
-const MAX_FRAMES: u32 = 1024 * 1024;
-const BITMAP_SIZE = MAX_FRAMES / 32;
 
 // === Region-bucketed bitmap with per-CPU affinity + a per-region index ===
 //
 // The bitmap is the ground truth (canary/kasan/refcount/kstack tripwires
 // all key off it). Around it:
 //
-//   1. REGIONS — physical memory split into REGIONS_COUNT regions of
-//      REGION_FRAMES frames each, each behind its own lock. SMP allocs and
-//      frees on different regions proceed in parallel.
+//   1. REGIONS — physical memory, from address 0 to the end of the highest
+//      usable RAM, split into regions of REGION_FRAMES frames, each behind
+//      its own lock. SMP allocs and frees on different regions proceed in
+//      parallel. A region over a hole in the memory map simply has no free
+//      frame, ever.
 //
 //   2. INDEX — per region, two masks over its bitmap words (nonfull,
 //      allfree) plus the free count, all derived from the words and kept
@@ -34,29 +28,41 @@ const BITMAP_SIZE = MAX_FRAMES / 32;
 //      the index cannot go stale against the bitmap the way the old
 //      run-list layer could (orphaned or overlapping runs).
 //
-//   3. PER-CPU PREFERRED REGION — derived from cpu_id, not stored. Magazine
-//      refill and contiguous alloc start at the preferred region and walk
-//      outward over the regions that hold RAM, skipping full ones by hint.
+//   3. ZONES — the regions below 4 GiB (`low`) and the rest (`high`). A
+//      request that does not care is served from `high` while it has
+//      frames, so the frames a 32-bit DMA address reaches last for the
+//      callers that ask for them (the Below4G entry points).
+//
+//   4. PER-CPU PREFERRED REGION — derived from cpu_id, not stored. Magazine
+//      refill and contiguous alloc start at the preferred region of a zone
+//      and walk outward over it, skipping full regions by hint.
+//
+// Nothing here is sized at build time: init() reads the top of RAM from the
+// memory map and has memmap place one block for all the tables below.
 const REGION_FRAMES: u32 = 1024; // 4 MB per region
-const REGIONS_COUNT: u32 = MAX_FRAMES / REGION_FRAMES; // 1024
 const REGION_WORDS: u32 = REGION_FRAMES / 32; // bitmap words per region
+
+/// The physmap is how the kernel reaches a frame; RAM past it is not used.
+const MAX_PHYS: u64 = memmap.PHYSMAP_SIZE;
+/// First region of the `high` zone, when RAM reaches that far.
+const LOW_END_REGION: u32 = @intCast(memmap.LOW_LIMIT / FRAME_SIZE / REGION_FRAMES);
 
 const fi = @import("frame_index.zig");
 
 comptime {
-    if (MAX_FRAMES % REGION_FRAMES != 0) {
-        @compileError("MAX_FRAMES must be a multiple of REGION_FRAMES");
-    }
     if (REGION_WORDS != fi.WORDS or REGION_FRAMES != fi.FRAMES) {
         @compileError("a pmm region must be exactly one frame_index region");
     }
-    // Every managed frame is a 32-bit DMA address, so the Below4G entry
-    // points are plain allocations. Growing MAX_FRAMES past 4 GiB needs
-    // them to filter again.
-    if (@as(u64, MAX_FRAMES) * FRAME_SIZE > 1 << 32) {
-        @compileError("MAX_FRAMES past 4 GiB: allocFrameBelow4G must filter");
+    if (memmap.LOW_LIMIT % (@as(u64, REGION_FRAMES) * FRAME_SIZE) != 0) {
+        @compileError("the zones split on a region boundary");
     }
+    // Frame numbers are u32.
+    if (MAX_PHYS / FRAME_SIZE > std.math.maxInt(u32)) @compileError("frame numbers are u32");
 }
+
+/// One past the last frame the tables describe; a multiple of REGION_FRAMES.
+/// 0 before init().
+var frames_end: u32 = 0;
 
 /// Per-region index, behind its lock as Guarded(fi.Summary)
 /// (util/guarded.zig): reaching it takes a token, so "caller must hold the
@@ -66,12 +72,7 @@ comptime {
 /// (`regionWords`). The slice is touched only under this region's lock,
 /// exactly like the summary, but it cannot move into the blob: one array,
 /// region-striped.
-var regions: [REGIONS_COUNT]Guarded(fi.Summary) = blk: {
-    @setEvalBranchQuota(REGIONS_COUNT * 8);
-    var arr: [REGIONS_COUNT]Guarded(fi.Summary) = undefined;
-    for (&arr) |*r| r.* = .init(.{});
-    break :blk arr;
-};
+var regions: []Guarded(fi.Summary) = &.{};
 
 inline fn regionWords(region_idx: u32) *[REGION_WORDS]u32 {
     return bitmap[region_idx * REGION_WORDS ..][0..REGION_WORDS];
@@ -80,7 +81,7 @@ inline fn regionWords(region_idx: u32) *[REGION_WORDS]u32 {
 /// Free frames per region, stored under the region lock and read without
 /// it: the allocation walks skip a region whose hint says it cannot help.
 /// Only a hint — every walk that comes up empty repeats with the locks.
-var free_hint: [REGIONS_COUNT]u16 = [_]u16{0} ** REGIONS_COUNT;
+var free_hint: []u16 = &.{};
 
 comptime {
     if (REGION_FRAMES > std.math.maxInt(u16)) @compileError("free_hint is u16");
@@ -94,9 +95,7 @@ inline fn hintFree(region_idx: u32) u32 {
     return @atomicLoad(u16, &free_hint[region_idx], .monotonic);
 }
 
-/// Regions that hold managed RAM: [0, regions_live). Set at the end of
-/// init(); the walks never visit the phantom regions above it (with
-/// `-m 256`, 192 of the 256).
+/// The regions: [0, regions_live). Set in init().
 var regions_live: u32 = 0;
 
 inline fn regionForFrame(frame: u32) u32 {
@@ -107,12 +106,55 @@ inline fn regionStartFrame(region_idx: u32) u32 {
     return region_idx * REGION_FRAMES;
 }
 
-/// Map a CPU id to its preferred region: CPUs spread at stride
-/// REGIONS_COUNT / MAX_CPUS (cpu 1 → region 8), folded into the regions
-/// that hold RAM. The walks go outward from there and wrap.
-inline fn preferredRegion(cpu_id: u8) u32 {
-    const stride: u32 = REGIONS_COUNT / @import("../cpu/smp.zig").MAX_CPUS;
-    return (@as(u32, cpu_id) * stride) % regions_live;
+/// Regions [first, end).
+const Zone = struct {
+    first: u32,
+    end: u32,
+
+    inline fn len(self: Zone) u32 {
+        return self.end - self.first;
+    }
+};
+
+/// Below 4 GiB.
+inline fn lowZone() Zone {
+    return .{ .first = 0, .end = @min(regions_live, LOW_END_REGION) };
+}
+
+/// From 4 GiB up; empty on a machine whose RAM ends below.
+inline fn highZone() Zone {
+    return .{ .first = @min(regions_live, LOW_END_REGION), .end = regions_live };
+}
+
+inline fn allZones() Zone {
+    return .{ .first = 0, .end = regions_live };
+}
+
+/// Which frames a request may be given.
+const Reach = enum {
+    /// Any frame; `high` first.
+    any,
+    /// Below 4 GiB only: the address goes into a 32-bit register or
+    /// descriptor field.
+    low,
+
+    /// The zones to try, in order.
+    inline fn zones(self: Reach) [2]Zone {
+        return switch (self) {
+            .any => .{ highZone(), lowZone() },
+            .low => .{ lowZone(), .{ .first = 0, .end = 0 } },
+        };
+    }
+};
+
+/// Regions between the preferred regions of two neighbouring CPUs: 128 MB.
+const CPU_STRIDE: u32 = 32;
+
+/// A CPU's preferred region in a zone: CPUs spread CPU_STRIDE apart, folded
+/// into the zone. The walks go outward from there and wrap. `zone` is not
+/// empty.
+inline fn preferredRegion(cpu_id: u8, zone: Zone) u32 {
+    return zone.first + (@as(u32, cpu_id) * CPU_STRIDE) % zone.len();
 }
 
 /// Per-CPU magazine cache parameters (Bonwick magazine layer).
@@ -164,8 +206,8 @@ var canary_mismatch_count: u64 = 0;
 // or not — the next free→alloc cycle writes a fresh canary). Without
 // this side-table the check fired on every first-use of high-PA frames
 // that were FREE from boot but never freed (765 spam hits in the
-// 2026-05-24 mtswap run). 1 bit per FRAME_SIZE PA = 32 KB BSS.
-var canary_present: [BITMAP_SIZE]u32 = [_]u32{0} ** BITMAP_SIZE;
+// 2026-05-24 mtswap run). 1 bit per frame.
+var canary_present: []u32 = &.{};
 
 // Atomic RmW so concurrent free / alloc on different CPUs don't lose
 // canary marks. A torn set or clear would produce false-negative UAF
@@ -208,21 +250,24 @@ pub fn pmmCanaryMismatches() u64 {
 /// Exposed region geometry so stress tests can compute the per-CPU
 /// affinity score (frame → region → expected-region match).
 pub const PUB_REGION_FRAMES: u32 = REGION_FRAMES;
-pub const PUB_REGIONS_COUNT: u32 = REGIONS_COUNT;
-pub const PUB_MAX_FRAMES: u32 = MAX_FRAMES;
 pub const PUB_FRAME_SIZE: u32 = FRAME_SIZE;
 
 /// Best-effort snapshot of a region's free count (the lock-free hint), for
 /// "did this region get most of CPU N's allocs" affinity scoring. Returns
 /// 0 for out-of-range region_idx.
 pub fn pmmRegionFreeCount(region_idx: u32) u32 {
-    if (region_idx >= REGIONS_COUNT) return 0;
+    if (region_idx >= regions_live) return 0;
     return hintFree(region_idx);
 }
 
-/// Regions [0, n) hold managed RAM; the rest are never walked.
+/// The regions are [0, n).
 pub fn pmmRegionsLive() u32 {
     return regions_live;
+}
+
+/// Of them, [0, n) are below 4 GiB.
+pub fn pmmRegionsLow() u32 {
+    return lowZone().end;
 }
 
 /// Free frames by the region hints. Equals freeFrameCount() whenever no
@@ -334,7 +379,7 @@ inline fn restoreIrq(flags: u64) void {
 }
 
 // Bitmap: 1 bit per 4KB frame. Initialized to all-used in init().
-var bitmap: [BITMAP_SIZE]u32 = undefined;
+var bitmap: []u32 = &.{};
 /// Misnamed for historical reasons — this is the *currently free* frame
 /// count, decremented on alloc and incremented on free. The post-init
 /// snapshot is held in `managed_frames` so /proc/meminfo can report a
@@ -373,14 +418,17 @@ var managed_frames: u32 = 0;
 /// the reserve; user-faulting paths use allocFrameUser() which does.
 var pmm_user_reserve: u32 = 0;
 
-// Per-frame reference count for COW. Lockstep invariant: frame_refs[i] == 0 ⟺
+// Per-frame reference count. Lockstep invariant: frame_refs[i] == 0 ⟺
 // bitmap-says-free OR sitting in some CPU's magazine cache; frame_refs[i] >= 1 ⟺
-// allocated to at least one address space. 1 byte/frame = 1 MB BSS for 4 GB
-// coverage. Saturation at 255 panics (a fork bomb 256 levels deep would be the
-// only way to hit it). Atomic ops on the byte handle SMP without a lock —
-// alloc paths set non-atomically (single owner during alloc), but acquireFrame
-// from COW clone runs in parallel with potential frees on other CPUs.
-var frame_refs: [MAX_FRAMES]u8 = undefined;
+// allocated, with that many owners (address spaces mapping it, the page
+// cache, a reader's pin). Atomic ops handle SMP without a lock — alloc paths
+// set non-atomically (single owner during alloc), but acquireFrame from COW
+// clone runs in parallel with potential frees on other CPUs.
+//
+// 32 bits so that no workload can run it out: every mapping of a frame is a
+// VMA page, and all the VMAs of all the processes are far fewer than 2^32.
+pub const RefCount = u32;
+var frame_refs: []RefCount = &.{};
 
 extern var _kernel_end: u8;
 
@@ -395,9 +443,8 @@ extern var _kernel_end: u8;
 // "fetch_um" bytes from a Zig binary's .strtab).
 var kernel_image: memmap.Range = .{};
 
-// Highest usable-RAM end address consumed by init(), clamped to what the
-// bitmap covers (MAX_FRAMES), so it is also the ceiling on any frame
-// allocFrame can ever return.
+// End of the highest usable RAM init() took, so also the ceiling on any
+// frame allocFrame can ever return.
 // The IOMMU sizes its DMA identity-map span from this — a device must be
 // able to reach every frame a driver can hand it.
 var highest_usable_phys: usize = 0;
@@ -429,8 +476,8 @@ pub fn markRegionFree(base: Phys, length: usize) void {
 /// boot memory map (raw firmware addresses; keeping the giant init body
 /// free of Phys.of injections — LLVM Invalid-type round 7).
 fn markRegionFreeRaw(base: usize, length: usize) void {
-    var frame: u32 = @intCast(@min(base / FRAME_SIZE, MAX_FRAMES));
-    const end_frame: u32 = @intCast(@min((base + length) / FRAME_SIZE, MAX_FRAMES));
+    var frame: u32 = @intCast(@min(base / FRAME_SIZE, frames_end));
+    const end_frame: u32 = @intCast(@min((base + length) / FRAME_SIZE, frames_end));
     while (frame < end_frame) {
         const region_idx = regionForFrame(frame);
         const reg_start = regionStartFrame(region_idx);
@@ -453,8 +500,8 @@ pub fn markRegionUsed(base: Phys, length: usize) void {
 
 /// Raw-address body of markRegionUsed — see markRegionFreeRaw.
 fn markRegionUsedRaw(base: usize, length: usize) void {
-    var frame: u32 = @intCast(@min(base / FRAME_SIZE, MAX_FRAMES));
-    const end_frame: u32 = @intCast(@min((base + length + FRAME_SIZE - 1) / FRAME_SIZE, MAX_FRAMES));
+    var frame: u32 = @intCast(@min(base / FRAME_SIZE, frames_end));
+    const end_frame: u32 = @intCast(@min((base + length + FRAME_SIZE - 1) / FRAME_SIZE, frames_end));
     while (frame < end_frame) {
         const region_idx = regionForFrame(frame);
         const reg_start = regionStartFrame(region_idx);
@@ -468,81 +515,113 @@ fn markRegionUsedRaw(base: usize, length: usize) void {
     }
 }
 
-pub fn init(info: *const boot_info.BootInfo) void {
+/// Where each table sits in the one block init() has memmap place.
+const TableLayout = struct {
+    words: usize, // of the bitmap, and of canary_present
+    region_count: usize,
+    canary_off: usize,
+    refs_off: usize,
+    regions_off: usize,
+    hints_off: usize,
+    bytes: usize,
+
+    fn of(frames: u32) TableLayout {
+        const Region = Guarded(fi.Summary);
+        const words: usize = frames / 32;
+        const region_count: usize = frames / REGION_FRAMES;
+        const canary_off = words * @sizeOf(u32); // the bitmap is first
+        const refs_off = canary_off + words * @sizeOf(u32);
+        const regions_off = std.mem.alignForward(usize, refs_off + @as(usize, frames) * @sizeOf(RefCount), @alignOf(Region));
+        const hints_off = regions_off + region_count * @sizeOf(Region);
+        return .{
+            .words = words,
+            .region_count = region_count,
+            .canary_off = canary_off,
+            .refs_off = refs_off,
+            .regions_off = regions_off,
+            .hints_off = hints_off,
+            .bytes = std.mem.alignForward(usize, hints_off + region_count * @sizeOf(u16), FRAME_SIZE),
+        };
+    }
+};
+
+/// After memmap.init: the memory map and what the kernel already holds come
+/// from there.
+pub fn init() void {
+    const serial = @import("../debug/serial.zig");
+    const map = memmap.bootMap();
+    if (map.len == 0) @panic("No memory map!");
+
+    // The top of usable RAM is how far the tables go.
+    var top: u64 = 0;
+    var usable_regions: u32 = 0;
+    var high_bytes: u64 = 0;
+    var unreachable_bytes: u64 = 0;
+    for (map) |region| {
+        if (region.kind != .usable) continue;
+        usable_regions += 1;
+        // Wholly above the physmap: not ours, and not the top of anything.
+        if (region.base >= MAX_PHYS) {
+            unreachable_bytes += region.length;
+            continue;
+        }
+        const end: u64 = region.base +| region.length;
+        if (end > MAX_PHYS) unreachable_bytes += end - MAX_PHYS;
+        const reach: u64 = @min(end, MAX_PHYS);
+        if (reach > memmap.LOW_LIMIT) high_bytes += reach - @max(region.base, memmap.LOW_LIMIT);
+        top = @max(top, reach);
+    }
+    if (top <= memmap.LOW_MEMORY_END) @panic("pmm: no usable RAM");
+    highest_usable_phys = @intCast(top);
+    regions_live = @intCast((top / FRAME_SIZE + REGION_FRAMES - 1) / REGION_FRAMES);
+    frames_end = regions_live * REGION_FRAMES;
+
+    const layout = TableLayout.of(frames_end);
+    const block = memmap.claim("pmm-tables", layout.bytes, .high) orelse @panic("pmm: no usable RAM for the frame tables");
+    const tables = @import("paging.zig").physToVirt(block.base);
+    bitmap = @as([*]u32, @ptrFromInt(tables))[0..layout.words];
+    canary_present = @as([*]u32, @ptrFromInt(tables + layout.canary_off))[0..layout.words];
+    frame_refs = @as([*]RefCount, @ptrFromInt(tables + layout.refs_off))[0..frames_end];
+    regions = @as([*]Guarded(fi.Summary), @ptrFromInt(tables + layout.regions_off))[0..layout.region_count];
+    free_hint = @as([*]u16, @ptrFromInt(tables + layout.hints_off))[0..layout.region_count];
+
+    // Every frame used until the map says otherwise.
+    @memset(bitmap, 0xFFFF_FFFF);
+    @memset(canary_present, 0);
+    @memset(frame_refs, 0);
+    for (regions) |*r| r.* = .init(.{});
+    @memset(free_hint, 0);
+    total_frames.store(0, .monotonic);
+
     // Register one representative region lock so the spinlock holder dump
-    // can name it in a deadlock report. The 256 region locks are
-    // intentionally anonymous — naming each one would clutter the
-    // registry, and the lock-diag falls back to printing the pointer for
-    // unregistered locks anyway.
+    // can name it in a deadlock report. The region locks are intentionally
+    // anonymous — naming each one would clutter the registry, and the
+    // lock-diag falls back to printing the pointer for unregistered locks
+    // anyway.
     const spinlock = @import("../proc/spinlock.zig");
     spinlock.registerLock("pmm.r0", &regions[0].lock); // the Guarded's inner lock
 
-    // Mark all frames as used initially
-    for (&bitmap) |*word| {
-        word.* = 0xFFFFFFFF;
+    for (map) |region| {
+        if (region.kind != .usable) continue;
+        // Whole frames only: a map entry need not start or end on one.
+        const first: u64 = std.mem.alignForward(u64, region.base, FRAME_SIZE);
+        const last: u64 = @min(region.base +| region.length, MAX_PHYS);
+        if (last > first) markRegionFreeRaw(@intCast(first), @intCast(last - first));
     }
-    @memset(&frame_refs, 0);
-    total_frames.store(0, .monotonic);
-
-    if (info.memory_map_count == 0) {
-        @panic("No memory map!");
+    serial.print("[pmm] init: {d} usable regions up to 0x{X}, {d} MB of them above 4 GiB; {d} regions ({d} low), tables {d} KB at 0x{X}\n", .{
+        usable_regions, top, high_bytes >> 20, regions_live, lowZone().end, layout.bytes >> 10, block.base,
+    });
+    if (unreachable_bytes > 0) {
+        serial.print("[pmm] WARNING: {d} MB above the physmap's {d} GB not used\n", .{ unreachable_bytes >> 20, MAX_PHYS >> 30 });
     }
-
-    // Parse memory map — mark usable regions as free.
-    // Diagnostic counters logged at end. Real HW with >4GB RAM emits regions
-    // above 4GB that we currently skip (PMM bitmap caps at 4GB); the count
-    // tells you how much you're leaving on the table without re-flashing.
-    var consumed: u32 = 0;
-    var skipped_high: u32 = 0;
-    var skipped_kind: u32 = 0;
-    var lost_pages_high: u64 = 0;
-    var lost_pages_cap: u64 = 0;
-    const cap_bytes: u64 = @as(u64, MAX_FRAMES) * FRAME_SIZE;
-    for (0..info.memory_map_count) |i| {
-        const region = info.memory_map[i];
-        if (region.kind != .usable) {
-            skipped_kind += 1;
-            continue;
-        }
-        if (region.base >= 0x100000000) {
-            skipped_high += 1;
-            lost_pages_high += region.length / 4096;
-            continue;
-        }
-        const base: usize = @intCast(region.base);
-        const length: usize = @intCast(@min(region.length, 0x100000000 - region.base));
-        markRegionFreeRaw(base, length);
-        // Only what the bitmap covers is usable: the IOMMU sizes its
-        // identity span from this, and regions_live bounds every walk.
-        const end: u64 = @min(@as(u64, base) + length, cap_bytes);
-        if (end > @as(u64, base) and end > highest_usable_phys) highest_usable_phys = @intCast(end);
-        if (@as(u64, base) + length > cap_bytes) lost_pages_cap += (@as(u64, base) + length - @max(@as(u64, base), cap_bytes)) / 4096;
-        consumed += 1;
-        if (region.base + region.length > 0x100000000) {
-            // Region straddles 4GB — count the truncated tail
-            lost_pages_high += (region.base + region.length - 0x100000000) / 4096;
-        }
-    }
-    regions_live = @intCast(@min((highest_usable_phys / FRAME_SIZE + REGION_FRAMES - 1) / REGION_FRAMES, REGIONS_COUNT));
-    const serial = @import("../debug/serial.zig");
-    serial.print("[pmm] init: {d} regions consumed, {d} non-usable, {d} above 4GB; {d}/{d} pmm regions hold RAM\n", .{ consumed, skipped_kind, skipped_high, regions_live, REGIONS_COUNT });
-    if (lost_pages_high > 0) {
-        serial.print("[pmm] WARNING: {d} MB above 4GB not used (bitmap capped at 4GB)\n", .{lost_pages_high * 4 / 1024});
-    }
-    if (lost_pages_cap > 0) {
-        serial.print("[pmm] WARNING: {d} MB above the {d} MB MAX_FRAMES cap not used\n", .{ lost_pages_cap * 4 / 1024, cap_bytes >> 20 });
-    }
-    if (regions_live == 0) @panic("pmm: no usable RAM below the MAX_FRAMES cap");
 
     // What the map calls usable but the kernel holds for its whole life
-    // (memmap.zig). Only singletons here; per-process GUI FBs are allocated.
+    // (memmap.zig): the image, the loader's page tables (a kasan shadow
+    // allocated over them is a wild CR3 with no panic), the graphics
+    // buffers, these tables. Per-process GUI FBs are allocated.
     markRegionUsedRaw(0x0, memmap.LOW_MEMORY_END);
     kernel_image = memmap.kernelImagePhys(); // arms checkPhysSafety
-    // The live page tables are in the loader's boot data: a kasan shadow
-    // allocated over them is a wild CR3 with no panic.
-    for ([_]memmap.Range{ kernel_image, memmap.bootData(), memmap.guestFb(), memmap.backBuffer() }) |held| {
-        markRegionUsedRaw(held.base, held.size);
-    }
+    for (memmap.held()) |h| markRegionUsedRaw(h.range.base, h.range.size);
 
     // Lock in the post-markings free-frame count as the static "total" we
     // hand back from meminfo. Reservations done after this point (e.g.
@@ -582,27 +661,57 @@ fn allocAndRefillFromRegion(region_idx: u32, cpu: *smp.CpuLocal) ?usize {
     return base + @as(usize, first) * FRAME_SIZE;
 }
 
-/// Walk the regions that hold RAM from `start`, wrapping, and return the
-/// first non-null `try_region` result. The first pass skips regions whose
-/// free hint is below `need`; if it finds nothing, a second pass tries
-/// every region under its lock, so a stale hint costs time, never a
-/// spurious failure.
-fn walkRegions(start: u32, need: u32, ctx: anytype, comptime try_region: fn (u32, @TypeOf(ctx)) ?usize) ?usize {
-    const n = regions_live;
+/// One frame from one region, nothing for the magazine.
+fn allocOneFromRegion(region_idx: u32, _: void) ?usize {
+    const h = regions[region_idx].acquireIrqSave();
+    defer h.release();
+    const f = fi.allocOne(regionWords(region_idx), h.ptr) orelse return null;
+    publishHint(region_idx, h.ptr);
+    satSubTotal(1);
+    return (@as(usize, regionStartFrame(region_idx)) + f) * FRAME_SIZE;
+}
+
+/// Walk a zone from this CPU's preferred region, wrapping, and return the
+/// first non-null `try_region` result. `by_hint` skips the regions whose
+/// free hint is below `need`, without taking their locks.
+fn walkZone(zone: Zone, need: u32, by_hint: bool, ctx: anytype, comptime try_region: fn (u32, @TypeOf(ctx)) ?usize) ?usize {
+    const n = zone.len();
     if (n == 0) return null;
-    for ([_]bool{ true, false }) |use_hint| {
-        var off: u32 = 0;
-        while (off < n) : (off += 1) {
-            const ri = (start + off) % n;
-            if (use_hint and hintFree(ri) < need) continue;
-            if (try_region(ri, ctx)) |p| return p;
+    const start = preferredRegion(smp.myCpu().cpu_id, zone) - zone.first;
+    var off: u32 = 0;
+    while (off < n) : (off += 1) {
+        const ri = zone.first + (start + off) % n;
+        if (by_hint and hintFree(ri) < need) continue;
+        if (try_region(ri, ctx)) |p| return p;
+    }
+    return null;
+}
+
+/// walkZone over the zones `reach` allows, in its order: by hint over all
+/// of them, and only if that finds nothing, every region under its lock —
+/// a stale hint costs time, never a spurious failure. A full zone ahead of
+/// one with room is thus passed at the price of reading its hints.
+fn walkReach(reach: Reach, need: u32, ctx: anytype, comptime try_region: fn (u32, @TypeOf(ctx)) ?usize) ?usize {
+    for ([_]bool{ true, false }) |by_hint| {
+        for (reach.zones()) |zone| {
+            if (walkZone(zone, need, by_hint, ctx, try_region)) |p| return p;
         }
     }
     return null;
 }
 
-pub fn allocFrame() ?Phys {
-    const ra = @returnAddress();
+/// The checks and bookkeeping every single frame gets on its way out.
+inline fn handOut(phys: usize, comptime site: []const u8, ra: usize) Phys {
+    checkPhysSafety(phys, site);
+    checkKstackOverlap(phys, 1, site, ra);
+    pmmCanaryCheck(phys, site, ra);
+    @import("../debug/kdbg.zig").pmmAlloc(phys, 1, ra);
+    @import("../debug/kasan.zig").unpoison(phys, FRAME_SIZE);
+    frame_refs[phys / FRAME_SIZE] = 1;
+    return Phys.of(phys);
+}
+
+fn allocOne(reach: Reach, ra: usize) ?Phys {
     // IF off across cache access — guarantees no preemption / IRQ runs an
     // allocFrame on the same CPU's cache mid-pop. With per-CPU storage and
     // IF=0, no extra synchronisation is required. Per-region locks below
@@ -611,40 +720,33 @@ pub fn allocFrame() ?Phys {
     const irq_flags = saveAndDisableIrq();
     defer restoreIrq(irq_flags);
 
-    const cpu = @import("../cpu/smp.zig").myCpu();
+    // The magazine holds frames from anywhere, so a `low` request passes it
+    // by on a machine that has a `high` zone. Rare: a driver's rings, once.
+    if (reach == .low and highZone().len() != 0) {
+        const phys = walkReach(.low, 1, {}, allocOneFromRegion) orelse return null;
+        return handOut(phys, "allocFrame(low)", ra);
+    }
+
+    const cpu = smp.myCpu();
     if (cpu.pmm_cache_count > 0) {
         cpu.pmm_cache_count -= 1;
-        const phys = cpu.pmm_cache[cpu.pmm_cache_count];
-        checkPhysSafety(phys, "allocFrame(cache)");
-        checkKstackOverlap(phys, 1, "allocFrame(cache)", ra);
-        pmmCanaryCheck(phys, "allocFrame(cache)", ra);
-        @import("../debug/kdbg.zig").pmmAlloc(phys, 1, ra);
-        @import("../debug/kasan.zig").unpoison(phys, FRAME_SIZE);
-        frame_refs[phys / FRAME_SIZE] = 1;
-        return Phys.of(phys);
+        return handOut(cpu.pmm_cache[cpu.pmm_cache_count], "allocFrame(cache)", ra);
     }
 
     // Cache miss: preferred region first (per-CPU affinity = cache locality
-    // on the bitmap line), then outward over the regions holding RAM.
-    if (regions_live == 0) return null;
-    const first = walkRegions(preferredRegion(cpu.cpu_id), 1, cpu, allocAndRefillFromRegion) orelse return null;
-
-    checkPhysSafety(first, "allocFrame");
-    checkKstackOverlap(first, 1, "allocFrame", ra);
-    pmmCanaryCheck(first, "allocFrame(bitmap)", ra);
-    @import("../debug/kdbg.zig").pmmAlloc(first, 1, ra);
-    @import("../debug/kasan.zig").unpoison(first, FRAME_SIZE);
-    frame_refs[first / FRAME_SIZE] = 1;
-    return Phys.of(first);
+    // on the bitmap line), then outward over the zone, then the next zone.
+    const first = walkReach(.any, 1, cpu, allocAndRefillFromRegion) orelse return null;
+    return handOut(first, "allocFrame(bitmap)", ra);
 }
 
-/// Allocate a frame below 4GB (for DMA buffers that require 32-bit
-/// addresses). Every managed frame is (comptime-checked above), so this is
-/// allocFrame — with its canary/kstack/kdbg hooks, which the old
-/// region-0-upward walk here skipped.
-pub inline fn allocFrameBelow4G() ?Phys {
-    // inline: allocFrame's @returnAddress keeps naming the real caller.
-    return allocFrame();
+pub fn allocFrame() ?Phys {
+    return allocOne(.any, @returnAddress());
+}
+
+/// A frame below 4 GiB: its address goes into a 32-bit register or
+/// descriptor field of a device.
+pub fn allocFrameBelow4G() ?Phys {
+    return allocOne(.low, @returnAddress());
 }
 
 /// Tripwire: does this phys range overlap kstack_pool? Used on the FREE
@@ -795,45 +897,61 @@ fn claimHeld(start: u32, count: u32) bool {
     return true;
 }
 
-/// Contiguous allocation across region boundaries: every request larger
-/// than a region, and smaller ones no single region could hold. Chains
-/// per-region edge snapshots (one lock at a time) into a lowest-address
-/// candidate, then claims just the regions it spans. A candidate lost to a
-/// racing allocation restarts the scan. An empty scan or a third loss falls
-/// back to scanning and claiming with every region held, so null means no
-/// boundary-spanning run existed in one consistent state — per-CPU refills
-/// that keep taking a candidate's head frames cannot fail the call.
-fn allocContiguousCrossRegion(count: u32, max_frame: u32) ?usize {
-    const end_region = @min(regions_live, (max_frame + REGION_FRAMES - 1) / REGION_FRAMES);
-    if (end_region == 0) return null;
+/// Regions the fallback of allocContiguousCrossRegion holds at once: 1 GB.
+const HELD_WINDOW: u32 = 256;
+
+/// Contiguous allocation across region boundaries inside `zone`: every
+/// request larger than a region, and smaller ones no single region could
+/// hold. Chains per-region edge snapshots (one lock at a time) into a
+/// lowest-address candidate, then claims just the regions it spans. A
+/// candidate lost to a racing allocation restarts the scan. An empty scan
+/// or a third loss falls back to scanning and claiming with the regions
+/// held, a window of them at a time, so null means no window held such a
+/// run in one consistent state — per-CPU refills that keep taking a
+/// candidate's head frames cannot fail the call.
+fn allocContiguousCrossRegion(count: u32, zone: Zone) ?usize {
+    if (zone.len() == 0) return null;
     // Near exhaustion most calls end here, before any lock.
     if (total_frames.load(.monotonic) < count) return null;
     var losses: u32 = 0;
     while (losses < 3) : (losses += 1) {
-        const cand = findCrossRun(count, end_region, max_frame, .hinted) orelse break;
+        const cand = findCrossRun(count, zone, .hinted) orelse break;
         if (claimSpan(cand, count)) return @as(usize, cand) * FRAME_SIZE;
     }
     _ = cross_held_scans.fetchAdd(1, .monotonic);
-    const flags = lockSpan(0, end_region - 1);
-    defer unlockSpan(0, end_region - 1, flags);
-    const cand = findCrossRun(count, end_region, max_frame, .held) orelse return null;
-    const claimed = claimHeld(cand, count);
-    std.debug.assert(claimed); // edges and words come from one held state
-    return @as(usize, cand) * FRAME_SIZE;
+    // A run of `count` frames touches at most `span` regions. Windows
+    // overlap by that much, so every run lies whole in one of them.
+    const span: u32 = (count - 1) / REGION_FRAMES + 2;
+    const window: u32 = @max(HELD_WINDOW, 2 * span);
+    var next = zone.first;
+    while (true) {
+        const held: Zone = .{ .first = next, .end = @min(zone.end, next +| window) };
+        const flags = lockSpan(held.first, held.end - 1);
+        defer unlockSpan(held.first, held.end - 1, flags);
+        if (findCrossRun(count, held, .held)) |cand| {
+            const claimed = claimHeld(cand, count);
+            std.debug.assert(claimed); // edges and words come from one held state
+            return @as(usize, cand) * FRAME_SIZE;
+        }
+        if (held.end == zone.end) return null;
+        next = held.end - span;
+    }
 }
 
 var cross_held_scans = std.atomic.Value(u32).init(0);
 
-/// Cross-region allocations that needed the all-regions-held scan.
+/// Cross-region allocations that needed the regions-held scan.
 pub fn pmmCrossHeldScans() u32 {
     return cross_held_scans.load(.monotonic);
 }
 
-fn findCrossRun(count: u32, end_region: u32, max_frame: u32, how: EdgeRead) ?u32 {
+/// Lowest run of `count` free frames made of whole regions of `zone` and the
+/// free edges of the two around them.
+fn findCrossRun(count: u32, zone: Zone, how: EdgeRead) ?u32 {
     var run_start: u32 = 0;
     var run_len: u32 = 0;
-    var ri: u32 = 0;
-    while (ri < end_region) : (ri += 1) {
+    var ri: u32 = zone.first;
+    while (ri < zone.end) : (ri += 1) {
         const e = regionEdges(ri, how);
         const rs = regionStartFrame(ri);
         if (e.lead == REGION_FRAMES) {
@@ -847,22 +965,20 @@ fn findCrossRun(count: u32, end_region: u32, max_frame: u32, how: EdgeRead) ?u32
         }
         if (run_len >= count) break;
     } else return null;
-    if (run_start + count > max_frame) return null;
     return run_start;
 }
 
-pub fn allocContiguous(count: u32) ?Phys {
+fn allocRun(count: u32, reach: Reach, ra: usize) ?Phys {
     if (count == 0) return null;
-    if (count == 1) return allocFrame();
-    const ra = @returnAddress();
+    if (count == 1) return allocOne(reach, ra);
 
     var base_opt: ?usize = null;
-    if (count <= REGION_FRAMES and regions_live != 0) {
-        const pref = preferredRegion(smp.myCpu().cpu_id);
-        base_opt = walkRegions(pref, count, count, allocContiguousFromRegion);
-    }
+    if (count <= REGION_FRAMES) base_opt = walkReach(reach, count, count, allocContiguousFromRegion);
     if (base_opt == null) {
-        base_opt = allocContiguousCrossRegion(count, MAX_FRAMES);
+        // `high` alone first, then everything `reach` allows: a run may
+        // straddle the two zones.
+        if (reach == .any) base_opt = allocContiguousCrossRegion(count, highZone());
+        if (base_opt == null) base_opt = allocContiguousCrossRegion(count, if (reach == .any) allZones() else lowZone());
     }
     const base = base_opt orelse return null;
 
@@ -876,16 +992,27 @@ pub fn allocContiguous(count: u32) ?Phys {
     return Phys.of(base);
 }
 
-/// Allocate `count` contiguous frames below 4GB (for DMA).
-pub inline fn allocContiguousBelow4G(count: u32) ?Phys {
-    // Every managed frame is below 4 GiB — see allocFrameBelow4G.
-    return allocContiguous(count);
+pub fn allocContiguous(count: u32) ?Phys {
+    return allocRun(count, .any, @returnAddress());
+}
+
+/// `count` contiguous frames below 4 GiB — see allocFrameBelow4G.
+pub fn allocContiguousBelow4G(count: u32) ?Phys {
+    return allocRun(count, .low, @returnAddress());
+}
+
+/// `count` contiguous frames a device will be given the address of.
+/// `addr64`: the device takes a 64-bit address there — the driver read the
+/// controller's capability bit. Where the protocol has only one width, call
+/// allocContiguous or allocContiguousBelow4G.
+pub fn allocForDevice(count: u32, addr64: bool) ?Phys {
+    return allocRun(count, if (addr64) .any else .low, @returnAddress());
 }
 
 // Device memory that user address spaces map (an NVDIMM's DAX frames, the
 // virtio-gpu host-memory window): not PMM-managed, never refcounted, never
 // reclaimed. Tearing such a mapping down calls freeFrame on every present
-// leaf like any other; freeFrame consults these ranges before its MAX_FRAMES
+// leaf like any other; freeFrame consults these ranges before its frames_end
 // gate, so one below the RAM ceiling cannot reach the refcounts either.
 // Entries are written once and never change; the count is published after.
 const MAX_DEVICE_RANGES = 4;
@@ -922,7 +1049,7 @@ fn inDeviceRange(phys_addr: usize) bool {
 /// for anything past the RAM bitmap: such a frame is only ever mapped.
 pub fn isManaged(phys: Phys) bool {
     const phys_addr = phys.raw();
-    return phys_addr / FRAME_SIZE < MAX_FRAMES and !inDeviceRange(phys_addr);
+    return phys_addr / FRAME_SIZE < frames_end and !inDeviceRange(phys_addr);
 }
 
 pub fn freeFrame(phys: Phys) void {
@@ -932,7 +1059,7 @@ pub fn freeFrame(phys: Phys) void {
     // Device memory is not ours to free, wherever its window sits relative
     // to the RAM bitmap (see device_ranges).
     if (inDeviceRange(phys_addr)) return;
-    if (frame_num >= MAX_FRAMES) {
+    if (frame_num >= frames_end) {
         @import("../debug/serial.zig").print("[pmm] WARNING: freeFrame bad addr=0x{X} (frame={X})\n", .{ phys_addr, frame_num });
         return;
     }
@@ -942,7 +1069,7 @@ pub fn freeFrame(phys: Phys) void {
     // a reference, so we just decrement and return — frame stays mapped there.
     // Only when this was the LAST reference (old==1) do we proceed to bitmap-
     // level reclamation and the magazine cache push.
-    const old_ref = @atomicRmw(u8, &frame_refs[frame_num], .Sub, 1, .acq_rel);
+    const old_ref = @atomicRmw(RefCount, &frame_refs[frame_num], .Sub, 1, .acq_rel);
     if (old_ref > 1) return;
     if (old_ref == 0) {
         // Underflow — caller released a frame that was already free. Pin
@@ -952,7 +1079,7 @@ pub fn freeFrame(phys: Phys) void {
         // accumulating leak rate is the visible signal that something's
         // still wrong; fix the root cause when it surfaces, not by
         // re-panicking here.
-        @atomicStore(u8, &frame_refs[frame_num], 0, .release);
+        @atomicStore(RefCount, &frame_refs[frame_num], 0, .release);
         const symbols = @import("../debug/symbols.zig");
         const serial = @import("../debug/serial.zig");
         const kdbg = @import("../debug/kdbg.zig");
@@ -1023,7 +1150,7 @@ pub fn freeFrame(phys: Phys) void {
         cpu.pmm_cache_count -= 1;
         const drain_phys = cpu.pmm_cache[cpu.pmm_cache_count];
         const drain_frame: u32 = @intCast(drain_phys / FRAME_SIZE);
-        if (drain_frame >= MAX_FRAMES) continue;
+        if (drain_frame >= frames_end) continue;
         const region_idx = regionForFrame(drain_frame);
         const h = regions[region_idx].acquire();
         const freed = fi.markFree(regionWords(region_idx), h.ptr, drain_frame - regionStartFrame(region_idx), 1);
@@ -1105,7 +1232,7 @@ pub fn freeContiguous(phys: Phys, count: u32) void {
     const ra = @returnAddress();
     const phys_addr: usize = phys.raw();
     const start_frame = phys_addr / FRAME_SIZE;
-    if (start_frame + count > MAX_FRAMES) {
+    if (start_frame + count > frames_end) {
         @import("../debug/serial.zig").print("[pmm] WARNING: freeContiguous bad range start=0x{X} count={d}\n", .{ phys_addr, count });
         return;
     }
@@ -1118,9 +1245,9 @@ pub fn freeContiguous(phys: Phys, count: u32) void {
     var rf: u32 = @intCast(start_frame);
     const rf_end: u32 = @intCast(start_frame + count);
     while (rf < rf_end) : (rf += 1) {
-        const old = @atomicRmw(u8, &frame_refs[rf], .Sub, 1, .acq_rel);
+        const old = @atomicRmw(RefCount, &frame_refs[rf], .Sub, 1, .acq_rel);
         if (old != 1) {
-            @atomicStore(u8, &frame_refs[rf], 0, .release);
+            @atomicStore(RefCount, &frame_refs[rf], 0, .release);
             @import("../debug/serial.zig").print("[pmm] PANIC: freeContiguous on multi-owned frame phys=0x{X} idx={d} old_ref={d}\n", .{ phys_addr, rf, old });
             @panic("pmm: freeContiguous on multi-owned frame");
         }
@@ -1178,11 +1305,11 @@ pub fn shareContiguous(phys: Phys) void {
 /// real caller.
 pub inline fn releaseContiguous(phys: Phys, count: u32) void {
     const head = phys.raw() / FRAME_SIZE;
-    if (count > 1 and head < MAX_FRAMES) {
+    if (count > 1 and head < frames_end) {
         while (true) {
-            const cur = @atomicLoad(u8, &frame_refs[head], .acquire);
+            const cur = @atomicLoad(RefCount, &frame_refs[head], .acquire);
             if (cur <= 1) break;
-            if (@cmpxchgWeak(u8, &frame_refs[head], cur, cur - 1, .acq_rel, .acquire) == null) return;
+            if (@cmpxchgWeak(RefCount, &frame_refs[head], cur, cur - 1, .acq_rel, .acquire) == null) return;
         }
     }
     freeContiguous(phys, count);
@@ -1230,27 +1357,27 @@ pub fn managedFrameCount() u32 {
 
 /// Add a reference to a frame currently in use. Used by COW: cloneAddressSpace
 /// shares parent's data frames with child by bumping refcount instead of copying.
-/// CMPXCHG loop catches saturation explicitly (255 references = fork bomb depth
-/// 256, well past anything realistic; panic instead of wrapping silently).
+/// The count cannot run out (see RefCount); the CMPXCHG loop panics rather
+/// than wrap if it somehow does.
 pub fn acquireFrame(phys: Phys) void {
     const phys_addr: usize = phys.raw();
     const frame_num_us = phys_addr / FRAME_SIZE;
-    if (frame_num_us >= MAX_FRAMES) {
+    if (frame_num_us >= frames_end) {
         @import("../debug/serial.zig").print("[pmm] WARNING: acquireFrame bad addr=0x{X}\n", .{phys_addr});
         return;
     }
     const frame_num: u32 = @intCast(frame_num_us);
     while (true) {
-        const cur = @atomicLoad(u8, &frame_refs[frame_num], .acquire);
+        const cur = @atomicLoad(RefCount, &frame_refs[frame_num], .acquire);
         if (cur == 0) {
             @import("../debug/serial.zig").print("[pmm] PANIC: acquireFrame on free frame phys=0x{X}\n", .{phys_addr});
             @panic("pmm: acquireFrame on free frame (refcount=0)");
         }
-        if (cur == 0xFF) {
+        if (cur == std.math.maxInt(RefCount)) {
             @import("../debug/serial.zig").print("[pmm] PANIC: acquireFrame saturation phys=0x{X}\n", .{phys_addr});
-            @panic("pmm: acquireFrame refcount saturation (>255)");
+            @panic("pmm: acquireFrame refcount saturation");
         }
-        if (@cmpxchgWeak(u8, &frame_refs[frame_num], cur, cur + 1, .acq_rel, .acquire) == null) break;
+        if (@cmpxchgWeak(RefCount, &frame_refs[frame_num], cur, cur + 1, .acq_rel, .acquire) == null) break;
     }
 }
 
@@ -1267,16 +1394,16 @@ pub fn acquireFrame(phys: Phys) void {
 pub fn acquireFrameIfLive(phys: Phys) bool {
     const phys_addr: usize = phys.raw();
     const frame_num_us = phys_addr / FRAME_SIZE;
-    if (frame_num_us >= MAX_FRAMES) return false;
+    if (frame_num_us >= frames_end) return false;
     const frame_num: u32 = @intCast(frame_num_us);
     while (true) {
-        const cur = @atomicLoad(u8, &frame_refs[frame_num], .acquire);
+        const cur = @atomicLoad(RefCount, &frame_refs[frame_num], .acquire);
         if (cur == 0) return false;
-        if (cur == 0xFF) {
+        if (cur == std.math.maxInt(RefCount)) {
             @import("../debug/serial.zig").print("[pmm] PANIC: acquireFrameIfLive saturation phys=0x{X}\n", .{phys_addr});
-            @panic("pmm: acquireFrame refcount saturation (>255)");
+            @panic("pmm: acquireFrame refcount saturation");
         }
-        if (@cmpxchgWeak(u8, &frame_refs[frame_num], cur, cur + 1, .acq_rel, .acquire) == null) return true;
+        if (@cmpxchgWeak(RefCount, &frame_refs[frame_num], cur, cur + 1, .acq_rel, .acquire) == null) return true;
     }
 }
 
@@ -1290,11 +1417,11 @@ pub inline fn releaseFrame(phys: Phys) void {
 
 /// Read current refcount for a frame. Diagnostic only — racy under SMP. Useful
 /// for /proc/meminfo, kdbg autopsy, and unit tests.
-pub fn frameRefCount(phys: Phys) u8 {
+pub fn frameRefCount(phys: Phys) RefCount {
     const phys_addr: usize = phys.raw();
     const frame_num = phys_addr / FRAME_SIZE;
-    if (frame_num >= MAX_FRAMES) return 0;
-    return @atomicLoad(u8, &frame_refs[frame_num], .acquire);
+    if (frame_num >= frames_end) return 0;
+    return @atomicLoad(RefCount, &frame_refs[frame_num], .acquire);
 }
 
 pub fn printStats() void {
@@ -1358,21 +1485,30 @@ pub fn tryReclaim(needed: u32) u32 {
     return freed;
 }
 
-/// Every region's index against its bitmap words: the summary recomputed
-/// from the words must equal the stored one (frame_index.verify), and the
+/// Regions one validateIndex call checks: 4 GB worth.
+const VALIDATE_BATCH: u32 = 1024;
+var validate_cursor = std.atomic.Value(u32).init(0);
+
+/// A region's index against its bitmap words: the summary recomputed from
+/// the words must equal the stored one (frame_index.verify), and the
 /// lock-free hint must equal the stored free count. Exact, unlike the
 /// run-list validator this replaces, which could only spot-check run
 /// endpoints and never saw overlapping or orphaned runs. One region lock
-/// at a time, briefly; regions without RAM must stay all-used and empty
-/// (checked without the rebuild — pcb_invariants runs this every second).
+/// at a time, briefly. pcb_invariants runs this every second: a call
+/// checks the next VALIDATE_BATCH regions, so every region on a machine
+/// that has no more, and all of them in turn on a bigger one.
 pub fn validateIndex() bool {
     const serial = @import("../debug/serial.zig");
     var ok = true;
-    var ri: u32 = 0;
-    while (ri < REGIONS_COUNT) : (ri += 1) {
+    const batch = @min(VALIDATE_BATCH, regions_live);
+    if (batch == 0) return true;
+    const from = validate_cursor.fetchAdd(batch, .monotonic);
+    var step: u32 = 0;
+    while (step < batch) : (step += 1) {
+        const ri = (from +% step) % regions_live;
         const h = regions[ri].acquireIrqSave();
         const stored = h.ptr.*;
-        const want: fi.Summary = if (ri < regions_live) fi.rebuild(regionWords(ri)) else .{};
+        const want = fi.rebuild(regionWords(ri));
         const hint = hintFree(ri);
         h.release();
         if (want.nonfull != stored.nonfull or want.allfree != stored.allfree or want.free_count != stored.free_count) {
@@ -1383,10 +1519,6 @@ pub fn validateIndex() bool {
         }
         if (hint != stored.free_count) {
             serial.print("[pmm] index-inv: region {d} hint={d} but free={d}\n", .{ ri, hint, stored.free_count });
-            ok = false;
-        }
-        if (ri >= regions_live and stored.free_count != 0) {
-            serial.print("[pmm] index-inv: region {d} beyond RAM has {d} free frames\n", .{ ri, stored.free_count });
             ok = false;
         }
     }

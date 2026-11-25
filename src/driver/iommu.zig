@@ -148,15 +148,13 @@ const SL_PS: u64 = 1 << 7; // large-page leaf (2 MiB at the PD level)
 
 // --- Identity-map sizing ----------------------------------------------------
 //
-// The span is computed at init() from the highest usable RAM address PMM
-// manages — PMM itself is hard-capped at 4 GiB (see pmm.init), so every
-// DMA-able frame a driver can ever hand a device lies below that. A fixed
-// 1 GiB (the old constant) silently uncovered frames on any >1 GiB machine:
-// the first driver DMA buffer allocated above the span would fault at the
-// IOMMU with no kernel-side warning. 1 GiB floor keeps the QEMU 128 MB
-// layout building the exact table set it always has.
+// The span is computed at init() from the end of the highest RAM the PMM
+// manages: every frame a driver can ever hand a device lies below that. A
+// fixed 1 GiB (the old constant) silently uncovered frames on any >1 GiB
+// machine: the first driver DMA buffer allocated above the span would fault
+// at the IOMMU with no kernel-side warning. 1 GiB floor keeps the QEMU
+// 128 MB layout building the exact table set it always has.
 const IDENTITY_SPAN_FLOOR: u64 = 1 << 30; // 1 GiB
-const IDENTITY_SPAN_CEIL: u64 = 1 << 32; // 4 GiB — PMM's own allocation cap
 var identity_span: u64 = IDENTITY_SPAN_FLOOR;
 
 /// Leaf size for the shared identity tree: 2 MiB pages when EVERY DRHD
@@ -706,14 +704,20 @@ pub fn init() void {
         return;
     }
 
-    // Identity span: cover everything PMM can ever hand a driver (PMM is
-    // hard-capped at 4 GiB), rounded up to a 1 GiB multiple with a 1 GiB
-    // floor (keeps QEMU's 128 MB layout byte-identical to the old fixed
-    // span). A fixed 1 GiB on a bigger machine meant the first DMA buffer
-    // allocated above it faulted at the IOMMU with no kernel-side hint.
+    // Identity span: cover everything PMM can ever hand a driver, rounded
+    // up to a 1 GiB multiple with a 1 GiB floor (keeps QEMU's 128 MB layout
+    // byte-identical to the old fixed span). A fixed 1 GiB on a bigger
+    // machine meant the first DMA buffer allocated above it faulted at the
+    // IOMMU with no kernel-side hint. The tree's own reach bounds it: RAM
+    // past that cannot be given to a device, and translation stays off.
     const top = @max(@as(u64, pmm.highestUsablePhys()), IDENTITY_SPAN_FLOOR);
     const rounded = (top + IDENTITY_SPAN_FLOOR - 1) & ~(IDENTITY_SPAN_FLOOR - 1);
-    identity_span = @min(rounded, IDENTITY_SPAN_CEIL);
+    const tree_reach: u64 = @as(u64, 1) << @intCast(12 + 9 * @as(u32, sl_levels));
+    if (rounded > tree_reach) {
+        debug.klog("[iommu] RAM ends at 0x{x}, past the {d}-level tree's reach — leaving translation off\n", .{ top, sl_levels });
+        return;
+    }
+    identity_span = rounded;
 
     if (!tables_coherent)
         debug.klog("[iommu] non-coherent page walks (ECAP.C=0) — CLFLUSHing table writes\n", .{});

@@ -4,14 +4,17 @@
 //
 // Physical memory is not laid out at build time: the firmware's memory map
 // decides. The loader says where it put the image and what it keeps
-// (BootInfo); `init` places the two graphics buffers in what is left. The
-// PMM keeps off all of these:
+// (BootInfo); `init` places the two graphics buffers in what is left, and
+// `claim` places whatever else must exist before there is an allocator (the
+// PMM's own tables). The PMM keeps off all of these:
 //
 //   below LOW_MEMORY_END  firmware data, the real-mode trampolines
-//   kernelImagePhys()     the image (.text, .rodata, .data, .bss)
-//   bootData()            the loader's page tables, BootInfo, memory map
-//   guestFb()             guest GPU framebuffer (GUEST_FB_SIZE)
-//   backBuffer()          CPU back buffer for compositing (BACK_BUFFER_SIZE)
+//   held()                every range below, by name:
+//     kernelImagePhys()   the image (.text, .rodata, .data, .bss)
+//     bootData()          the loader's page tables, BootInfo, memory map
+//     guestFb()           guest GPU framebuffer (GUEST_FB_SIZE)
+//     backBuffer()        CPU back buffer for compositing (BACK_BUFFER_SIZE)
+//     claim()ed blocks
 //
 // User space (per-process page tables): each process gets its own PML4[0]
 // from createAddressSpace; user-app .text loads at USER_VA_FLOOR (matches
@@ -130,10 +133,32 @@ var back_buffer: Range = .{};
 /// The firmware's memory map as the loader handed it over. Empty before `init`.
 var boot_map: []const protocol.MemoryRegion = &.{};
 
+/// A range the kernel holds for its whole life, and what it is.
+pub const Held = struct { name: []const u8, range: Range };
+
+var held_table: [8]Held = undefined;
+var held_count: usize = 0;
+
+/// Every held range. Grows during single-threaded boot only.
+pub fn held() []const Held {
+    return held_table[0..held_count];
+}
+
+fn hold(name: []const u8, range: Range) void {
+    if (range.size == 0) return;
+    held_table[held_count] = .{ .name = name, .range = range };
+    held_count += 1;
+}
+
 /// The loader's page tables, BootInfo and memory map. The kernel runs on
 /// these tables for good; empty on Multiboot, where they are in the image.
 pub fn bootData() Range {
     return boot_data;
+}
+
+/// The memory map the loader handed over. Empty before `init`.
+pub fn bootMap() []const protocol.MemoryRegion {
+    return boot_map;
 }
 
 /// Empty before `init`.
@@ -158,9 +183,11 @@ pub fn init(info: *const protocol.BootInfo) void {
 
     boot_data = .{ .base = @intCast(info.boot_data_base), .size = @intCast(info.boot_data_size) };
     const image = kernelImagePhys();
-    guest_fb = place(GUEST_FB_SIZE, &.{ image, boot_data }) orelse
+    hold("kernel-image-phys", image);
+    hold("boot_data", boot_data);
+    guest_fb = claim("guest_fb", GUEST_FB_SIZE, .low) orelse
         @panic("memmap: no usable RAM for the guest framebuffer");
-    back_buffer = place(BACK_BUFFER_SIZE, &.{ image, boot_data, guest_fb }) orelse
+    back_buffer = claim("back_buffer", BACK_BUFFER_SIZE, .low) orelse
         @panic("memmap: no usable RAM for the back buffer");
     @import("../debug/serial.zig").print(
         "[memmap] image 0x{X}..0x{X} (link +0x{X}), boot data 0x{X}..0x{X}, guest fb 0x{X}, back buffer 0x{X}\n",
@@ -169,8 +196,28 @@ pub fn init(info: *const protocol.BootInfo) void {
 }
 
 const PLACEMENT_ALIGN: usize = 0x200000;
-/// The PMM's bitmap ends here, and so does what a 32-bit DMA address reaches.
-const PLACEMENT_LIMIT: u64 = 0x1_0000_0000;
+/// What a 32-bit DMA address reaches.
+pub const LOW_LIMIT: u64 = 0x1_0000_0000;
+
+/// Where `claim` looks.
+pub const Where = enum {
+    /// Below LOW_LIMIT, lowest address first.
+    low,
+    /// Anywhere the physmap reaches, highest address first: out of the way
+    /// of what must be low.
+    high,
+};
+
+/// `size` bytes of usable RAM, clear of everything held so far, held from
+/// now on. For what has to exist before the PMM does; boot only.
+pub fn claim(name: []const u8, size: usize, where: Where) ?Range {
+    const range = switch (where) {
+        .low => placeLow(size),
+        .high => placeHigh(size),
+    } orelse return null;
+    hold(name, range);
+    return range;
+}
 
 /// Whether the firmware's map calls all of [base, base + size) usable RAM.
 /// For what must sit at an address fixed in advance, such as a real-mode
@@ -183,17 +230,17 @@ pub fn isUsableRam(base: usize, size: usize) bool {
 }
 
 /// First fit, lowest region first: `size` bytes of usable RAM between
-/// LOW_MEMORY_END and PLACEMENT_LIMIT that touch none of `taken`.
-fn place(size: usize, taken: []const Range) ?Range {
+/// LOW_MEMORY_END and LOW_LIMIT that touch nothing held.
+fn placeLow(size: usize) ?Range {
     for (boot_map) |region| {
-        if (region.kind != .usable or region.base >= PLACEMENT_LIMIT) continue;
-        const region_end: u64 = @min(region.base +| region.length, PLACEMENT_LIMIT);
+        if (region.kind != .usable or region.base >= LOW_LIMIT) continue;
+        const region_end: u64 = @min(region.base +| region.length, LOW_LIMIT);
         var base: u64 = std.mem.alignForward(u64, @max(region.base, LOW_MEMORY_END), PLACEMENT_ALIGN);
         search: while (base +| size <= region_end) {
             const candidate: Range = .{ .base = @intCast(base), .size = size };
-            for (taken) |t| {
-                if (candidate.overlaps(t)) {
-                    base = std.mem.alignForward(u64, t.end(), PLACEMENT_ALIGN);
+            for (held()) |h| {
+                if (candidate.overlaps(h.range)) {
+                    base = std.mem.alignForward(u64, h.range.end(), PLACEMENT_ALIGN);
                     continue :search;
                 }
             }
@@ -201,6 +248,32 @@ fn place(size: usize, taken: []const Range) ?Range {
         }
     }
     return null;
+}
+
+/// The highest `size` bytes of usable RAM above LOW_MEMORY_END, below the
+/// physmap's end, that touch nothing held.
+fn placeHigh(size: usize) ?Range {
+    var best: ?Range = null;
+    for (boot_map) |region| {
+        if (region.kind != .usable) continue;
+        const floor: u64 = std.mem.alignForward(u64, @max(region.base, LOW_MEMORY_END), PLACEMENT_ALIGN);
+        const region_end: u64 = @min(region.base +| region.length, PHYSMAP_SIZE);
+        if (region_end < floor +| size) continue;
+        var base: u64 = std.mem.alignBackward(u64, region_end - size, PLACEMENT_ALIGN);
+        search: while (base >= floor) {
+            const candidate: Range = .{ .base = @intCast(base), .size = size };
+            for (held()) |h| {
+                if (candidate.overlaps(h.range)) {
+                    if (h.range.base < floor +| size) break :search;
+                    base = std.mem.alignBackward(u64, h.range.base - size, PLACEMENT_ALIGN);
+                    continue :search;
+                }
+            }
+            if (best == null or candidate.base > best.?.base) best = candidate;
+            break;
+        }
+    }
+    return best;
 }
 
 // GUI framebuffers are PMM-allocated per window now (sysCreateWindow).
