@@ -229,8 +229,26 @@ check) is `stub.save(E) ++ … ++ stub.restore(E)` and takes its offsets
 from `E`. A handler reads its frame through the mirrored struct, never
 by index. A panic target a stub jumps to is handed the address it needs
 in `rdi`: its own RSP is below its prologue by then (three such targets
-dumped their own locals as "the frame" until 2026-11). **Still by
-hand:** the SYSCALL entry and `signals.SyscallFrame`.
+dumped their own locals as "the frame" until 2026-11).
+
+The SYSCALL entry (`syscall/entry.zig`) is `frames.syscall` the same
+way: the pushes, the three words and the FXSAVE image under the frame,
+every offset of the iretq exit, and `signals.SyscallFrame` held to it by
+`assertMirror`. Only the first instructions differ per CPU — a head that
+finds its CPU's `tss.rsp0` by where it stands, LSTAR being the one
+per-CPU thing SYSCALL leaves free — and all heads jump to one body.
+**Still by hand:** the `int 0x80` stub (`syscall.isr_syscall`), which
+nothing in the tree calls.
+
+**A return address the task chose is checked before it is used.** A
+signal handler's address, a sigreturn frame's rip, a new image's entry
+all end up where sysret or iretq will resume the task, and a
+non-canonical one faults in the kernel, not in the task: sysret in ring
+0 on the user's RSP. Delivery refuses a handler outside the user window
+(`layoutHandlerFrame`, linux `pushFrame`), sigreturn refuses such a rip,
+`doSyscall` kills a task whose frame would return there
+(`checkReturnAddress`), and the entry compares once more before either
+exit. `sigtest` steps 4 and 5 ask for it both ways.
 
 ## `lock.assertHeld()` runtime checks
 
@@ -729,6 +747,7 @@ silent self-recovery into observable metric.
 | `Guarded(T)`        | `src/util/guarded.zig`; adopters: swap/page_cache/nvme/pmm |
 | `assertHeld()`      | `src/util/guarded.zig` `refHeld`                |
 | `frames.Frame`      | `src/proc/frames.zig` `dispatch`; sched_asm + lifecycle forges |
+| `frames.Entry`      | `src/proc/frames.zig` `entry` / `syscall`; `src/cpu/idt/stub.zig`; `isr_irq0`, `DynIrqStub`, `syscall_entry_common` |
 | `UserPtr(T)`        | `src/syscall/proc.zig` `sysSigpending`          |
 | `Persistent(T)`     | `src/mm/pmem.zig` `persistenceSelfTest`         |
 | `kwarn(@src(),...)` | `src/debug/debug.zig` `kwarn`                   |

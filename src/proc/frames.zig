@@ -31,10 +31,10 @@
 //! switchTo/retToUserStub + lifecycle.zig's SIX forges — the user trio
 //! create/clone/fork and the kthread trio idle/S3-replant/kernel-task)
 //! plus the six saved-RIP diagnostics addressing [kesp+saved_rip_off];
-//! and the entry contract after it — what the interrupt and exception
-//! stubs (cpu/idt/stub.zig) leave on the stack, which their handlers and
-//! signals.IrqFrame/ExcFrame read. The syscall entry (syscall/entry.zig,
-//! signals.SyscallFrame) still counts by hand.
+//! and the two entry contracts after it — what the interrupt and exception
+//! stubs (cpu/idt/stub.zig) and the SYSCALL entry (syscall/entry.zig)
+//! leave on the stack, which their handlers read through
+//! signals.IrqFrame, ExcFrame and SyscallFrame.
 
 const std = @import("std");
 

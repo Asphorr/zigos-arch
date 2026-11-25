@@ -88,10 +88,32 @@ pub fn chargeInterrupt(t_start: u64) void {
     perf.noteIrqInSyscall();
 }
 
-/// `frame_raw` is null on the int 0x80 path, which has no SyscallFrame:
-/// fork, sigreturn, Linux-personality calls and return-path signal delivery
-/// need one and are refused or skipped there.
+/// What the entry stubs call. `frame_raw` is null on the int 0x80 path,
+/// which has no SyscallFrame: fork, sigreturn, Linux-personality calls and
+/// return-path signal delivery need one and are refused or skipped there.
 export fn doSyscall(sys_num: u32, arg1: u32, arg2: u32, arg3: u32, frame_raw: ?*anyopaque) callconv(.c) u64 {
+    const ret = runSyscall(sys_num, arg1, arg2, arg3, frame_raw);
+    if (frame_raw) |f| checkReturnAddress(@ptrCast(@alignCast(f)));
+    return ret;
+}
+
+/// The last word before the entry goes back to ring 3. The frame's rcx is
+/// where sysret, or the iretq exit, resumes the task — and by now it may be
+/// the task's own choice: a signal handler's address, the rip of a sigreturn
+/// frame, the entry of a new image. Outside the user window it is nowhere
+/// the task can run, and a non-canonical one makes the return itself fault:
+/// sysret in ring 0, on the user's RSP. Whoever set it, such a task ends
+/// here the way one that jumped there would, by SIGSEGV.
+fn checkReturnAddress(frame: *const signals.SyscallFrame) void {
+    if (@import("mm/memmap.zig").isUserDataAddr(frame.rcx)) return;
+    const pcb = process.currentPCB() orelse return;
+    debug.klog("[syscall] pid={d} would return to 0x{X}, which is not a user address — killing the process\n", .{ process.getCurrentPid(), frame.rcx });
+    process.killThreadGroup(pcb.tgid, signals.fatalStatus(pcb, signals.SIGSEGV));
+    process.schedule();
+    unreachable;
+}
+
+fn runSyscall(sys_num: u32, arg1: u32, arg2: u32, arg3: u32, frame_raw: ?*anyopaque) u64 {
     // Per-CPU breadcrumb — stamp BEFORE everything else so even if we panic
     // mid-syscall, the autopsy reflects what this CPU was doing.
     @import("debug/breadcrumb.zig").stamp(.syscall_entry, sys_num);

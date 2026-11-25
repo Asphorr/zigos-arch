@@ -24,6 +24,7 @@ const std = @import("std");
 const msr = @import("../cpu/arch/msr.zig");
 const rflags = @import("../cpu/arch/cr.zig").rflags;
 const frames = @import("../proc/frames.zig");
+const memmap = @import("../mm/memmap.zig");
 
 const sc = frames.syscall;
 const dec = frames.decimal;
@@ -202,6 +203,11 @@ export fn syscall_entry_common() callconv(.naked) noreturn {
             // interrupt may land.
             "cli\n" ++
             "fxrstorq (%%rsp)\n" ++
+            // The address either exit resumes at, by its high half: under
+            // the end of the user window, or not at all. doSyscall has
+            // checked it already; this is the entry not taking its word.
+            "cmpl $" ++ dec(user_end_high) ++ ", " ++ dec(sc.offset(.rcx) + 4) ++ "(%%rsp)\n" ++
+            "jae 8f\n" ++
             "cmpq $0, " ++ dec(sc.exit_mode_offset) ++ "(%%rsp)\n" ++
             "jne 7f\n" ++
             "addq $" ++ dec(sc.fp_below) ++ ", %%rsp\n" ++
@@ -212,7 +218,31 @@ export fn syscall_entry_common() callconv(.naked) noreturn {
             "popq %%rsp\n" ++
             "sysretq\n" ++
             "7:\n" ++
-            full_restore);
+            full_restore ++
+            // RSP is still the kernel's, 16-aligned at the image: a call.
+            "8:\n" ++
+            "movq " ++ dec(sc.offset(.rcx)) ++ "(%%rsp), %%rdi\n" ++
+            "call syscall_return_panic\n");
+}
+
+/// The user window's end, as the high half of an address: the exits
+/// compare 32 bits.
+const user_end_high: u32 = @intCast(memmap.USER_SPACE_END >> 32);
+
+comptime {
+    std.debug.assert(memmap.USER_SPACE_END == @as(u64, user_end_high) << 32);
+    // Below it every address is canonical.
+    std.debug.assert(memmap.USER_SPACE_END <= 0x0000_8000_0000_0000);
+}
+
+/// The entry was about to resume a task at an address outside the user
+/// window: sysret to a non-canonical one faults in ring 0 on the user's
+/// RSP, and none of them is the task's to run. doSyscall refuses such a
+/// frame (checkReturnAddress), so the frame changed after it looked or it
+/// never looked.
+pub export fn syscall_return_panic(rip: u64) callconv(.c) noreturn {
+    @import("../debug/serial.zig").print("\n[syscall] the entry was about to return to 0x{X:0>16}, outside user space\n", .{rip});
+    @panic("syscall entry: a return address outside user space reached the exit");
 }
 
 /// The entry found RSP off a 16-byte boundary at `call doSyscall`: the

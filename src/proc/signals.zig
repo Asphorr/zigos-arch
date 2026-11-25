@@ -957,7 +957,13 @@ const HandlerLayout = struct {
     siginfo_va: u64, // 0 when SA_SIGINFO not set
 };
 
-fn layoutHandlerFrame(user_rsp: u64, want_siginfo: bool) ?HandlerLayout {
+/// Null when the handler cannot be entered: no stack to put its frame on,
+/// or a handler address that is not user code's. The address is whatever
+/// the task gave sigaction, and a return to one outside the user window
+/// does not fault in the task — sysret to a non-canonical RIP faults in
+/// ring 0 on the user's RSP, iretq to one before it leaves the kernel.
+fn layoutHandlerFrame(handler: u64, user_rsp: u64, want_siginfo: bool) ?HandlerLayout {
+    if (!memmap.isUserDataAddr(handler)) return null;
     const sinfo_size: u64 = if (want_siginfo) @sizeOf(Siginfo) else 0;
     const sinfo_va = (user_rsp -% sinfo_size) & ~@as(u64, 0xF);
     const mctx_va = (sinfo_va -% @sizeOf(MContext)) & ~@as(u64, 0xF);
@@ -1025,9 +1031,10 @@ pub fn deliverFromSyscallFrame(pcb: *process.PCB, frame: *SyscallFrame, retval: 
         // sysret lands on the handler's freshly-prepared frame.
         const old_user_rsp = frame.user_rsp;
         const want_si = (sa.flags & SA_SIGINFO) != 0;
-        const layout = layoutHandlerFrame(old_user_rsp, want_si) orelse {
-            // User stack is hosed (recursive overflow into guard, e.g.) —
-            // can't deliver. Force terminate with a recognizable status.
+        const layout = layoutHandlerFrame(sa.handler, old_user_rsp, want_si) orelse {
+            // User stack is hosed (recursive overflow into guard, e.g.), or
+            // the handler is no user address — can't deliver. Force
+            // terminate with a recognizable status.
             process.destroyCurrentWithStatus(0xDEAD0000 | sig);
             return retval;
         };
@@ -1126,7 +1133,7 @@ pub fn deliverFromIrqFrame(pcb: *process.PCB, frame: *IrqFrame) void {
 
         const old_user_rsp = frame.rsp;
         const want_si = (sa.flags & SA_SIGINFO) != 0;
-        const layout = layoutHandlerFrame(old_user_rsp, want_si) orelse {
+        const layout = layoutHandlerFrame(sa.handler, old_user_rsp, want_si) orelse {
             process.destroyCurrentWithStatus(0xDEAD0000 | sig);
             return;
         };
@@ -1225,7 +1232,7 @@ pub fn deliverFromExcFrame(pcb: *process.PCB, frame: *ExcFrame, signo: u32, faul
 
     const old_user_rsp = frame.rsp;
     const want_si = (sa.flags & SA_SIGINFO) != 0;
-    const layout = layoutHandlerFrame(old_user_rsp, want_si) orelse return false;
+    const layout = layoutHandlerFrame(sa.handler, old_user_rsp, want_si) orelse return false;
 
     // SMAP: pre-resolve frame pages (no-fault lazy/COW) + bracket the direct
     // user-stack frame writes. See deliverFromSyscallFrame.
@@ -1311,6 +1318,15 @@ pub fn sigreturn(pcb: *process.PCB, frame: *SyscallFrame) u32 {
         process.destroyCurrentWithStatus(0xDEAD000B);
         return 0;
     }
+    // The frame is on the task's stack and so the task's to write: its rip
+    // is no more trusted than a handler's address (layoutHandlerFrame).
+    const back_to = mctx_ptr.rip;
+    if (!memmap.isUserDataAddr(back_to)) {
+        protect.disallowUserAccess();
+        debug.klog("[sig] sigreturn: rip 0x{X} in the MContext at 0x{X} is not a user address\n", .{ back_to, user_rsp });
+        process.destroyCurrentWithStatus(0xDEAD000B);
+        return 0;
+    }
 
     // Rewrite the saved syscall frame so sysret restores the pre-signal
     // user state. RAX is the syscall return value, which the asm path takes
@@ -1328,7 +1344,7 @@ pub fn sigreturn(pcb: *process.PCB, frame: *SyscallFrame) u32 {
     frame.r13 = mctx_ptr.r13;
     frame.r14 = mctx_ptr.r14;
     frame.r15 = mctx_ptr.r15;
-    frame.rcx = mctx_ptr.rip;
+    frame.rcx = back_to; // the value checked: the page is user-writable still
     frame.r11 = userFlags(mctx_ptr.rflags);
     frame.user_rsp = mctx_ptr.rsp;
     const saved_mask = mctx_ptr.saved_mask;
