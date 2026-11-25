@@ -485,6 +485,29 @@ and the tick paid two per 10 ms — most of the BSP tick's cost until
 2026-09-16. Not the raw TSC, because `tsc_per_quantum` is a calibrated
 figure a stall can corrupt; both rulers are absolute-frequency clocks.
 
+## `delay` — a spin for a real amount of time
+
+Where a `Deadline` bounds a wait for something, `time/delay.zig` is the
+wait for nothing: a reset line that must stay asserted 10 ms, the gap
+between INIT and SIPI, a frame of the splash.
+
+```zig
+delay.ms(10);    // spins; needs no tick, no task, no interrupts
+delay.us(200);
+```
+
+It runs on the TSC once `apic.init` has calibrated it, on the PIT's
+count before that, and on port 0x80 writes if neither is there.
+
+**Why:** there were six private ones, and four of them counted
+iterations: `pause` is ten cycles on one CPU and 140 on another, a
+port-0x80 write a microsecond on hardware and a VM exit under a
+hypervisor, so "1 ms" meant anything from 30 µs to 10 ms — the splash's
+1.4 s of frames took half a minute on a machine with a slow `pause`.
+**How to apply:** no loop that counts to a number in place of a time.
+A task that can sleep sleeps; a wait for a condition is a `Deadline`
+loop; the rest is `delay`.
+
 ## `Phys` / `Virt` + `Dma(T)` — typed addresses and device memory
 
 A `u64` can't say which address space it lives in. `util/addr.zig`
@@ -756,6 +779,7 @@ silent self-recovery into observable metric.
 | `Persistent(T)`     | `src/mm/pmem.zig` `persistenceSelfTest`         |
 | `kwarn(@src(),...)` | `src/debug/debug.zig` `kwarn`                   |
 | `Deadline`          | `src/driver/input/keyboard.zig` `ps2Wait`       |
+| `delay`             | `src/time/delay.zig`; `smp.sendInitSipiSipi`, `pci` power-state and FLR waits |
 | `pause.Epoch`       | `src/driver/block/nvme.zig` `waitCompletion`    |
 | `mightSleep`        | `src/proc/sched.zig` `blockOn`                  |
 | `// ctx: irq`       | `src/cpu/idt/irq0.zig` `handleIRQ0`; lint in `tools/ctx_lint.zig` |

@@ -10,6 +10,7 @@
 
 const gfx = @import("../gfx.zig");
 const sound = @import("../../driver.zig").sound;
+const delay = @import("../../time/delay.zig");
 
 const SPLASH_BG_TOP: u32 = 0x050811;
 const SPLASH_BG_BOT: u32 = 0x0E1525;
@@ -33,16 +34,6 @@ inline fn lerpColor(top: u32, bot: u32, num: u32, den: u32) u32 {
     const g: u32 = @intCast(tg + @divTrunc((bg - tg) * n, d));
     const b: u32 = @intCast(tb + @divTrunc((bb - tb) * n, d));
     return (r << 16) | (g << 8) | b;
-}
-
-fn busyWaitMs(ms: u32) void {
-    // Rough spin delay — ~1 ms per 200 000 iterations on WHPX/pentium4.
-    // Fine for the splash, which doesn't depend on precise timing.
-    var i: u32 = 0;
-    const iters = ms * 200000;
-    while (i < iters) : (i += 1) {
-        asm volatile ("pause");
-    }
 }
 
 fn paintBg() void {
@@ -91,7 +82,7 @@ pub fn show(has_backbuf: bool) void {
     //   accent sweep:   10..26  (sweeps left & right from centre)
     //   subtitle:       16..30
     //   version:        22..34
-    //   hold full:      34..36 + extra busyWaitMs(250) post-loop
+    //   hold full:      34..36 + 250 ms more after the loop
     const FRAMES: u32 = 36;
     var frame: u32 = 0;
     while (frame < FRAMES) : (frame += 1) {
@@ -138,12 +129,12 @@ pub fn show(has_backbuf: bool) void {
 
         if (has_backbuf) gfx.blitToScreen();
         display.flush();
-        busyWaitMs(25);
+        delay.ms(25);
 
         if (frame == 14) sound.startup();
     }
 
-    busyWaitMs(250);
+    delay.ms(250);
 
     // Fade-out: 12 frames × 20 ms ≈ 240 ms. Crossfade to bg.
     var fade: u32 = 0;
@@ -163,7 +154,7 @@ pub fn show(has_backbuf: bool) void {
 
         if (has_backbuf) gfx.blitToScreen();
         display.flush();
-        busyWaitMs(20);
+        delay.ms(20);
     }
 
     // Clear before desktop chrome paints over.

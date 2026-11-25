@@ -2,7 +2,7 @@ const io = @import("../../io.zig");
 const acpi = @import("../../acpi/acpi.zig");
 const paging = @import("../../mm/paging.zig");
 const debug = @import("../../debug/debug.zig");
-const time = @import("../../time/time.zig");
+const delay = @import("../../time/delay.zig");
 const SpinLock = @import("../../proc/spinlock.zig").SpinLock;
 
 const CONFIG_ADDR: u16 = 0x0CF8;
@@ -1040,8 +1040,9 @@ pub fn pmSetState(dev: PciDevice, state: PowerState) bool {
     // Per spec: D3hot→D0 requires Trestore >= 10 ms before any other config
     // access. We don't know the previous state-pair precisely (the device
     // may stale-cache), so always wait. Reads after this should hit a
-    // responsive device.
-    busyWaitMillis(10);
+    // responsive device. A spin: this runs on the boot CPU before
+    // interrupts are fully live, where a sleep that yields would not return.
+    delay.ms(10);
     return true;
 }
 
@@ -1141,14 +1142,14 @@ pub fn flr(dev: PciDevice) bool {
     while (quiesce < 1000) : (quiesce += 1) {
         const sta = configRead16(dev.bus, dev.dev, dev.func, off + PCIE_DEVSTA_OFF);
         if (sta & PCIE_DEVSTA_TRANS_PENDING == 0) break;
-        busyWaitMillis(1);
+        delay.ms(1);
     }
 
     var ctl = configRead16(dev.bus, dev.dev, dev.func, off + PCIE_DEVCTL_OFF);
     ctl |= PCIE_DEVCTL_INITIATE_FLR;
     configWrite16(dev.bus, dev.dev, dev.func, off + PCIE_DEVCTL_OFF, ctl);
     // Spec mandates ≥100 ms recovery before subsequent config access.
-    busyWaitMillis(100);
+    delay.ms(100);
     return true;
 }
 
@@ -1162,33 +1163,6 @@ fn speedString(s: u4) []const u8 {
         6 => "64GT",
         else => "?GT",
     };
-}
-
-/// Millisecond busy-wait used by PM/FLR helpers — they run on the boot
-/// CPU before IRQs are fully live, so any sleep that yields would deadlock
-/// the kernel timer init. Uses HPET via `time.monotonicNanos()`; before
-/// the time module is initialized (theoretically possible if a driver
-/// calls bindDevice that early), falls back to a port-80 spin which is
-/// rough but always available.
-fn busyWaitMillis(ms: u32) void {
-    if (ms == 0) return;
-    const start = time.monotonicNanos();
-    if (start != 0) {
-        const target: u64 = start + @as(u64, ms) * 1_000_000;
-        while (time.monotonicNanos() < target) {
-            asm volatile ("pause");
-        }
-        return;
-    }
-    // Pre-HPET fallback: 1µs ≈ 1 inb(0x80) on most chipsets, much faster
-    // on QEMU. Conservative — over-waiting here is harmless.
-    var i: u32 = 0;
-    while (i < ms) : (i += 1) {
-        var j: u32 = 0;
-        while (j < 1000) : (j += 1) {
-            _ = io.inb(0x80);
-        }
-    }
 }
 
 // --- Forensic config-space dump --------------------------------------------

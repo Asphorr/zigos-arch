@@ -7,6 +7,7 @@ const pmm = @import("../mm/pmm.zig");
 const gdt = @import("arch/gdt.zig");
 const msr = @import("arch/msr.zig");
 const cpu_state = @import("cpu_state.zig");
+const delay = @import("../time/delay.zig");
 const vfs = @import("../fs/vfs.zig");
 const elf_loader = @import("../proc/elf_loader.zig");
 const process = @import("../proc/process.zig");
@@ -69,7 +70,7 @@ pub const CpuLocal = struct {
     /// @atomicStore(.release); the BSP bring-up spin loop and aliveCpuCount()
     /// observe them with @atomicLoad(.acquire). The atomics matter in the BSP
     /// spin loop — a plain load there is legally hoistable (it only worked
-    /// because busyWait() is an opaque, non-inlined call that forced a reload),
+    /// while the wait in the loop was an opaque call that forced a reload),
     /// and the release/acquire pair makes this AP's per-CPU init visible before
     /// the BSP counts it online. Both are write-once-then-stable, so the many
     /// steady-state `if (!cpu.alive)` readers elsewhere stay plain reads.
@@ -692,11 +693,11 @@ pub fn init() void {
         // but hung in init. Without the split, both look identical.
         var ack_ms: u32 = 0;
         while (!@atomicLoad(bool, &cpus[ap_id].sipi_acked, .acquire) and ack_ms < 100) : (ack_ms += 1) {
-            busyWait(1);
+            delay.ms(1);
         }
         var alive_ms: u32 = ack_ms;
         while (!@atomicLoad(bool, &cpus[ap_id].alive, .acquire) and alive_ms < 500) : (alive_ms += 1) {
-            busyWait(1);
+            delay.ms(1);
         }
 
         if (@atomicLoad(bool, &cpus[ap_id].alive, .acquire)) {
@@ -732,20 +733,10 @@ pub fn init() void {
 fn sendInitSipiSipi(lapic_id: u8) void {
     const vector: u8 = @intCast(trampoline.phys(.ap) >> 12);
     apic.sendInitIPI(lapic_id);
-    busyWait(10);
+    delay.ms(10);
     apic.sendSIPI(lapic_id, vector);
-    busyWait(1);
+    delay.ms(1);
     apic.sendSIPI(lapic_id, vector);
-}
-
-fn busyWait(ms: u32) void {
-    // Simple busy wait using port 0x80 (each I/O takes ~1µs)
-    for (0..ms * 1000) |_| {
-        asm volatile ("outb %%al, $0x80"
-            :
-            : [al] "{al}" (@as(u8, 0))
-        );
-    }
 }
 
 /// What the two AP entries share: the whole per-CPU list (cpu_state.zig),
@@ -983,7 +974,7 @@ pub fn reonlineApsForS3Resume(resume_cr3: u64) void {
         // Wait for the AP to come back alive (apEntryS3Resume reached its end).
         var ms: u32 = 0;
         while (!@atomicLoad(bool, &cpus[ap_id].alive, .acquire) and ms < 500) : (ms += 1) {
-            busyWait(1);
+            delay.ms(1);
         }
         if (@atomicLoad(bool, &cpus[ap_id].alive, .acquire)) {
             cpu_count += 1;
@@ -1094,7 +1085,7 @@ pub fn quiesceApsForS3(timeout_ms: u32) u32 {
             }
         }
         if (all_parked) break;
-        busyWait(1); // ~1 ms via port-0x80 I/O — IF=0 safe (no tick dependency)
+        delay.ms(1); // a spin on the TSC: needs no tick, so safe with IF off
     }
 
     var not_parked: u32 = 0;

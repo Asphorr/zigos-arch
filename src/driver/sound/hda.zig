@@ -27,6 +27,7 @@ const Phys = @import("../../util/addr.zig").Phys;
 const paging = @import("../../mm/paging.zig");
 const debug = @import("../../debug/debug.zig");
 const Deadline = @import("../../util/deadline.zig").Deadline;
+const delay = @import("../../time/delay.zig");
 const SpinLock = @import("../../proc/spinlock.zig").SpinLock;
 const iommu = @import("../iommu.zig");
 
@@ -191,17 +192,6 @@ inline fn sdOff(idx: u8, off: u32) u32 {
     return SD_BASE + @as(u32, idx) * SD_STRIDE + off;
 }
 
-fn busyWaitMs(ms: u32) void {
-    // Approximate. ~10 cycles per pause iter; 3 GHz = 300K pauses/ms. We
-    // use 250K to be conservative. Real timing tolerance handled in the
-    // self-test by widening the LPIB advance acceptance band.
-    var i: u32 = 0;
-    const target = ms * 250_000;
-    while (i < target) : (i += 1) {
-        asm volatile ("pause" ::: .{ .memory = true });
-    }
-}
-
 fn allocPage() ?usize {
     const p = pmm.allocFrame() orelse return null;
     const v = p.toVirt().ptr([*]u8);
@@ -310,7 +300,7 @@ pub fn init() bool {
         debug.klog("[hda] reset clear timeout\n", .{});
         return false;
     }
-    busyWaitMs(1);
+    delay.ms(1);
     w32(REG_GCTL, GCTL_CRST);
     spins = 0;
     while (r32(REG_GCTL) & GCTL_CRST == 0 and spins < 100_000) : (spins += 1) {
@@ -320,7 +310,7 @@ pub fn init() bool {
         debug.klog("[hda] reset assert timeout\n", .{});
         return false;
     }
-    busyWaitMs(2); // codec detect window
+    delay.ms(2); // codec detect window
 
     // Decode capabilities.
     const gcap = r16(REG_GCAP);
@@ -533,7 +523,7 @@ fn setupCorbRirb() bool {
     w32(REG_RIRBLBASE, @truncate(rirb_phys));
     w32(REG_RIRBUBASE, @truncate(rirb_phys >> 32));
     w16(REG_RIRBWP, RIRBWP_RST);
-    busyWaitMs(1);
+    delay.ms(1);
     rirb_rp = 0;
     // Interrupt every response — only matters once we wire MSI-X.
     w16(REG_RINTCNT, 1);

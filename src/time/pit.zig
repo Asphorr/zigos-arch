@@ -22,10 +22,11 @@ pub fn init() void {
 
 /// Busy-wait `us` µs on channel 0's countdown — the only clock before
 /// apic.init calibrates the TSC (acpi.init runs firmware methods, whose
-/// Stall/Sleep must really wait). Gives up if the count stops moving, as it
-/// does once stop() has run.
-pub fn delayUs(us: u64) void {
-    var left = us * PIT_HZ / 1_000_000;
+/// Stall/Sleep must really wait). For time/delay.zig, which is what to call.
+/// False if the count is not moving, as once stop() has run: nothing was
+/// waited then.
+pub fn delayUs(us: u64) bool {
+    var left = us *| PIT_HZ / 1_000_000;
     var prev = count();
     var still: u32 = 0;
     while (left > 0) {
@@ -34,13 +35,14 @@ pub fn delayUs(us: u64) void {
         const step = if (cur <= prev) prev - cur else prev + DIVISOR - cur;
         if (step == 0) {
             still += 1;
-            if (still > 10_000) return;
+            if (still > 10_000) return false;
             continue;
         }
         still = 0;
         left -|= step;
         prev = cur;
     }
+    return true;
 }
 
 fn count() u64 {

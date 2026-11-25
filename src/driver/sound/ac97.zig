@@ -7,6 +7,7 @@ const pmm = @import("../../mm/pmm.zig");
 const paging = @import("../../mm/paging.zig");
 const debug = @import("../../debug/debug.zig");
 const SpinLock = @import("../../proc/spinlock.zig").SpinLock;
+const delay = @import("../../time/delay.zig");
 const iommu = @import("../iommu.zig");
 
 /// Serializes everything that touches `bdl_phys` / `buf_phys` / the PCM-out
@@ -76,20 +77,20 @@ pub fn init() bool {
 
     // Cold reset via Global Control
     io.outl(nabm_base + GLOB_CNT, 0x02); // cold reset
-    busyWait(10);
+    delay.ms(10);
     io.outl(nabm_base + GLOB_CNT, 0x00); // clear reset
-    busyWait(10);
+    delay.ms(10);
 
     // Wait for codec ready
     for (0..100) |_| {
         const sta = io.inl(nabm_base + GLOB_STA);
         if (sta & 0x100 != 0) break; // primary codec ready
-        busyWait(1);
+        delay.ms(1);
     }
 
     // Reset codec via NAM
     io.outb16(nam_base + NAM_RESET, 0);
-    busyWait(5);
+    delay.ms(5);
 
     // Set volumes (0 = max for master, lower values for PCM)
     io.outb16(nam_base + NAM_MASTER_VOL, 0x0000);
@@ -99,7 +100,7 @@ pub fn init() bool {
     var ext = io.inw(nam_base + NAM_EXT_AUDIO_CTRL);
     ext |= 1;
     io.outb16(nam_base + NAM_EXT_AUDIO_CTRL, ext);
-    busyWait(2);
+    delay.ms(2);
 
     // Set sample rate
     io.outb16(nam_base + NAM_SAMPLE_RATE, @intCast(SAMPLE_RATE));
@@ -116,7 +117,7 @@ pub fn init() bool {
 
     // Reset PCM out channel
     io.outb(nabm_base + PO_CR, 0x02); // reset
-    busyWait(1);
+    delay.ms(1);
     io.outb(nabm_base + PO_CR, 0x00); // clear reset
 
     // Set BDL base address
@@ -126,13 +127,6 @@ pub fn init() bool {
     debug.klog("[ac97] Initialized (sample rate: {d} Hz)\n", .{SAMPLE_RATE});
     bind.commit();
     return true;
-}
-
-fn busyWait(ticks: u32) void {
-    // Simple delay using PIT counter reads
-    for (0..@as(usize, ticks) * 10000) |_| {
-        asm volatile ("pause");
-    }
 }
 
 /// Play PCM buffer via DMA. num_samples = per-channel sample count.

@@ -888,23 +888,12 @@ fn amlSleepMs(ms: u64) void {
     // Per-call clamp; aml.zig additionally enforces a per-method Sleep budget.
     const capped = @min(ms, 1_000);
     // No task to put to sleep yet — _INI runs from acpi.init — so wait in place.
-    if (@import("../cpu/smp.zig").currentPid() == null) return busyWaitUs(capped * 1_000);
+    if (@import("../cpu/smp.zig").currentPid() == null) return @import("../time/delay.zig").ms(capped);
     @import("../proc/sched.zig").kernelSleepMs(@intCast(capped));
 }
 
 fn amlStallUs(us: u64) void {
-    busyWaitUs(@min(us, 1_000));
-}
-
-/// Spin for `us` µs: on the TSC once apic.init has calibrated it, before that
-/// on the PIT count pit.init left running.
-fn busyWaitUs(us: u64) void {
-    const apic = @import("../irq/apic.zig");
-    const tpq = apic.tscPerQuantum(); // TSC ticks per 10ms quantum
-    if (tpq == 0) return @import("../time/pit.zig").delayUs(us);
-    const ticks = us * tpq / 10_000; // 10_000 µs per quantum
-    const start = apic.readTsc();
-    while (apic.readTsc() -% start < ticks) std.atomic.spinLoopHint();
+    @import("../time/delay.zig").us(@min(us, 1_000));
 }
 
 /// The FACS GlobalLock dword, aligned for atomics; null when there is no lock
