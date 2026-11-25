@@ -175,9 +175,9 @@ pub fn hasClocksource2() bool {
 //   per interrupt. Level-triggered IRQs (e.g. ACPI SCI) never get the
 //   bit, so they still take the real EOI path by construction.
 //
-// S3 clears both MSRs with the rest of CPU state; re-arming rides the
-// shared resume paths (apInitPerCpu for APs, reinitForS3Resume for the
-// BSP). Until a CPU re-arms, its flag byte stays 0 and eoi() falls
+// A reset (INIT, S3) clears both MSRs with the rest of the CPU's state;
+// arming is cpu_state's `paravirt` entry, so every bring-up and resume
+// path has it. Until a CPU arms, its flag byte stays 0 and eoi() falls
 // through to the real write — degraded, never wrong.
 
 const MSR_KVM_SYSTEM_TIME_NEW: u32 = 0x4B564D01;
@@ -225,25 +225,25 @@ var pv_page_pa: u64 = 0;
 /// CPUs that haven't armed yet just see a permanently-zero flag byte.
 var pv_eoi_armed: bool = false;
 
-/// BSP-once: allocate the shared PV frame and arm the calling CPU.
-/// Quiet no-op when KVM (or both features) is absent.
-pub fn initPerCpuPv() void {
+/// BSP-once: the frame every CPU's PV areas live in. Each CPU then arms
+/// its own (enablePerCpuPv). Quiet no-op when KVM (or both features) is
+/// absent.
+pub fn allocPvAreas() void {
     if (base == 0 or pv_page_pa != 0) return;
     if (!hasStealTime() and !hasPvEoi()) return;
     const pmm = @import("../mm/pmm.zig");
     const phys = pmm.allocFrame() orelse {
-        debug.klog("[kvm] initPerCpuPv: PMM exhausted, PV areas disabled\n", .{});
+        debug.klog("[kvm] allocPvAreas: PMM exhausted, PV areas disabled\n", .{});
         return;
     };
     pv_page_va = phys.toVirt().raw();
     @memset(@as([*]u8, @ptrFromInt(pv_page_va))[0..4096], 0);
     pv_page_pa = phys.raw();
-    enablePerCpuPv(@import("../cpu/smp.zig").myCpu().cpu_id);
 }
 
-/// Arm steal time + PV EOI for THIS CPU (caller passes its own cpu_id;
-/// the MSRs are per-CPU). Also the S3-resume re-arm path — S3 resets
-/// both MSRs. Idempotent.
+/// cpu_state's `paravirt`: arm steal time, PV EOI and kvmclock for THIS
+/// CPU (the caller passes its own cpu_id; the MSRs are per-CPU and a reset
+/// clears them). Idempotent; a no-op without the frame.
 pub fn enablePerCpuPv(cpu_id: u32) void {
     if (pv_page_pa == 0 or cpu_id >= PV_MAX_CPUS) return;
     const stride_pa = pv_page_pa + cpu_id * PV_STRIDE;

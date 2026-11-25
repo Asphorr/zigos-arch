@@ -102,9 +102,8 @@ var areas: [MAX_PROCS]Area = [_]Area{.{ .bytes = [_]u8{0} ** @sizeOf(Area) }} **
 /// The AVX init state: zero upper halves, header zero, MXCSR clean.
 var init_area: Area = .{ .bytes = [_]u8{0} ** @sizeOf(Area) };
 
-/// Set once by the BSP, before any task or AP exists.
+/// Set once by the BSP (detect), before any task or AP exists.
 pub var avx: bool = false;
-var probed: bool = false;
 
 /// Whether the CPU can give user tasks AVX state as laid out here.
 fn probeAvx() bool {
@@ -118,14 +117,15 @@ fn probeAvx() bool {
     return d2.eax == AVX_SIZE and d2.ebx == AVX_OFFSET;
 }
 
-/// Per CPU, at bring-up and after S3: CR4.OSXSAVE and XCR0 for AVX state.
-/// The BSP's first call decides for all.
+/// Decide, once and for every CPU, whether user tasks get AVX state. On the
+/// BSP; it enables nothing — that is per CPU (enableExtended).
+pub fn detect() void {
+    avx = probeAvx();
+    serial.print("[fp] AVX state for user tasks: {s}\n", .{if (avx) "on (XSAVE, XCR0=x87|SSE|AVX)" else "off"});
+}
+
+/// cpu_state's `extended_state`: CR4.OSXSAVE and XCR0 for AVX state.
 pub fn enableExtended() void {
-    if (!probed) {
-        probed = true;
-        avx = probeAvx();
-        serial.print("[fp] AVX state for user tasks: {s}\n", .{if (avx) "on (XSAVE, XCR0=x87|SSE|AVX)" else "off"});
-    }
     if (!avx) return;
     cr.cr4.set(cr.cr4.OSXSAVE);
     // xsetbv, as bytes: the kernel's target has no XSAVE feature to

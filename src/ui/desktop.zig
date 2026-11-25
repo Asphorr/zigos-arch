@@ -3901,8 +3901,9 @@ pub fn taskEntry() callconv(.c) noreturn {
     // their own PML4[0] independently, so user processes are unaffected.
     @import("../mm/paging.zig").dropLowIdentity();
     // BSP is now off the boot stack (low-half on Multiboot); safe to enable SMAP
-    // (kstack is high-VA / U/S=0, so the next push won't #PF).
-    @import("../cpu/arch/protect.zig").enableSmapPerCpu();
+    // (kstack is high-VA / U/S=0, so the next push won't #PF). It is the last
+    // entry of the BSP's per-CPU list; this also checks none was skipped.
+    @import("../cpu/cpu_state.zig").completeBoot();
     // enterFirstTask cli'd before swapping us onto desktop's kstack —
     // re-enable IRQs now that RSP is on the high-VA kstack and the
     // legacy low identity is gone.

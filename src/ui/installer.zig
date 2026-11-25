@@ -1442,8 +1442,9 @@ pub fn taskEntry() callconv(.c) noreturn {
     // map, the boot-entry step calls SetVariable at the very end of the
     // install, and uefi_nvram.rsCallable() gates on exactly this mapping —
     // dropping it would turn the NVRAM write into a silent no-op. SMAP still
-    // goes on; the EFI calls wrap themselves in beginNonSmepCall.
-    @import("../cpu/arch/protect.zig").enableSmapPerCpu();
+    // goes on (the last entry of the BSP's per-CPU list); the EFI calls wrap
+    // themselves in beginNonSmepCall.
+    @import("../cpu/cpu_state.zig").completeBoot();
     asm volatile ("sti");
     @import("../boot/boot_phase.zig").markComplete();
     // Deliberately NOT nvme.enableAsync(). Submit-and-yield wants a scheduler

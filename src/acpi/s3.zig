@@ -7,13 +7,11 @@
 // real->long-mode trampoline (src/boot/wake_trampoline.asm, the same climb as
 // the AP startup trampoline) which re-enters 64-bit kernel code here.
 //
-// CP2b-2 (this step): full restore -> usable resume. s3ResumeEntry re-establishes
-// the BSP CPU state (smp.reinitForS3Resume, mirroring apEntry) and longjmps back
-// into suspendToRam, which returns 0 to the syscall so sysret lands the shutdown
-// app back in userspace with the scheduler ticking again. Only the BSP comes
-// back online (the APs are powered down by S3 and marked offline on resume —
-// re-bringing them up, and any device/GPU re-init the display needs, are later
-// steps).
+// s3ResumeEntry puts the BSP's processor state back (smp.reinitForS3Resume:
+// the per-CPU list of cpu/cpu_state.zig) and longjmps into suspendToRam. That
+// brings the APs back through INIT/SIPI, re-initializes the devices S3 powered
+// down (NVMe, virtio-gpu, xHCI) and returns 0 to the syscall, so sysret lands
+// the shutdown app in userspace with the scheduler ticking again.
 
 const std = @import("std");
 const acpi = @import("acpi.zig");
@@ -119,9 +117,8 @@ export fn s3ResumeEntry() callconv(.c) noreturn {
     // timer arm reads the TSC) and any scheduler/perf path.
     writeTsc(saved_tsc);
 
-    // Re-establish the BSP's CPU state (GDT/IDT/TR, syscall MSRs, EFER.NXE,
-    // CR0.WP, CR4, PAT, LAPIC + timer), mirroring AP bring-up. After this the
-    // CPU is whole again and per-CPU / NX-page access are safe.
+    // The BSP's processor state, by the same list an AP runs. After this the
+    // CPU is whole again: it knows which CPU it is, and NX pages are safe.
     smp.reinitForS3Resume();
     serial.print("[s3] RESUME: BSP CPU state re-established; longjmp -> suspendToRam\n", .{});
 
@@ -346,13 +343,6 @@ pub fn suspendToRam() u32 {
     } else {
         serial.print("[s3] resumed: xhci re-init failed — USB input stays dead\n", .{});
     }
-
-    // The BSP's DR0-DR3/DR7 were reset by S3 like everything else, but
-    // watch.zig's per-CPU applied-cache survived in RAM — without an explicit
-    // invalidate+reapply every later applyLocal() cache-hits against the
-    // pre-suspend value and the hardware watchpoints (kesp watchdog) stay
-    // silently disarmed. The re-onlined APs do the same in apEntryS3Resume.
-    @import("../debug/watch.zig").reapplyAfterDrReset();
 
     serial.print("[s3] resumed: APs re-onlined, devices + low identity restored — returning to userspace\n", .{});
     // return 0 -> sysShutdown -> syscall dispatcher -> sysret restores the app's

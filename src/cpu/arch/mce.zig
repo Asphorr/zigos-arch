@@ -51,6 +51,8 @@ const MCG_STATUS_EIPV: u64 = 1 << 1;
 const MCG_STATUS_MCIP: u64 = 1 << 2;
 
 pub var bank_count: u32 = 0;
+/// MCG_CAP.MCG_CTL_P: the global control register exists.
+var has_global_ctl: bool = false;
 pub var initialized: bool = false;
 
 const CpuidRegs = struct { eax: u32, ebx: u32, ecx: u32, edx: u32 };
@@ -71,8 +73,9 @@ inline fn cpuid(leaf: u32, sub: u32) CpuidRegs {
     return .{ .eax = eax, .ebx = ebx, .ecx = ecx, .edx = edx };
 }
 
-/// Probe CPU for Machine Check support (CPUID.01H:EDX.MCE = bit 7;
-/// .MCA = bit 14) and enable all banks. Call once on the BSP.
+/// Probe the CPU for Machine Check support (CPUID.01H:EDX.MCE = bit 7,
+/// .MCA = bit 14) and count the banks. Once, on the BSP; it enables
+/// nothing — that is per CPU (`perCpuInit`).
 pub fn detect() void {
     const r = cpuid(1, 0);
     const mce_supported = (r.edx & (1 << 7)) != 0;
@@ -86,26 +89,24 @@ pub fn detect() void {
     }
     const cap = msr.read(MSR_IA32_MCG_CAP);
     bank_count = @intCast(cap & 0xFF);
-    const ctl_p: bool = (cap & (1 << 8)) != 0;
+    has_global_ctl = (cap & (1 << 8)) != 0;
     debug.klog("[mce] MCG_CAP banks={d} ctl_p={s}\n", .{
         bank_count,
-        if (ctl_p) "y" else "n",
+        if (has_global_ctl) "y" else "n",
     });
-    // Globally enable all error reporting (if MCG_CTL exists, write all-1s).
-    if (ctl_p) msr.write(MSR_IA32_MCG_CTL, ~@as(u64, 0));
-    // Enable all banks and start with cleared status.
-    initBanks();
-    // So that #MC actually delivers as vector 18.
-    cr.cr4.set(cr.cr4.MCE);
     initialized = true;
 }
 
-/// Per-CPU init. APs call this after entering long mode so each CPU's
-/// own MCi_CTL gets enabled (banks are largely per-thread for the
-/// shared-resource ones, per-core for L1/L2).
+/// cpu_state's `machine_check`: every CPU has its own MCG_CTL and bank
+/// controls (banks are per thread for shared resources, per core for
+/// L1/L2), and its own CR4.
 pub fn perCpuInit() void {
     if (!initialized) return;
+    // All error reporting on, where the register exists.
+    if (has_global_ctl) msr.write(MSR_IA32_MCG_CTL, ~@as(u64, 0));
+    // Every bank on, with a clean status.
     initBanks();
+    // So that #MC actually delivers as vector 18.
     cr.cr4.set(cr.cr4.MCE);
 }
 

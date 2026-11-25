@@ -111,8 +111,8 @@ pub fn applyEarlyCr4() void {
 
 /// Per-CPU: flip CR4.SMAP and OR RFLAGS.AC into IA32_FMASK so SYSCALL
 /// clears AC on entry. Call only after the active rsp is in a U/S=0 page
-/// (BSP: after `paging.dropLowIdentity`, off the boot stack;
-/// AP: any time after entry, since the AP stack is already physmap-VA).
+/// (BSP: off the boot stack, on its first task's; AP: any time, its stack
+/// is the isr_stack in the kernel image). cpu_state's `smap` entry.
 pub fn enableSmapPerCpu() void {
     if (!smap_enabled) return;
     cr.cr4.set(cr.cr4.SMAP);

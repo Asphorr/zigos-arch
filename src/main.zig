@@ -11,6 +11,7 @@ const multiboot = @import("boot/multiboot.zig");
 const boot_info_mod = @import("boot/boot_info.zig");
 const boot_protocol = @import("boot_protocol");
 const cr = @import("cpu/arch/cr.zig");
+const cpu_state = @import("cpu/cpu_state.zig");
 const serial = @import("debug/serial.zig");
 const debug = @import("debug/debug.zig");
 const kasan = @import("debug/kasan.zig");
@@ -247,10 +248,12 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     }
     idt.init();
     blog.ok("IDT installed");
-    @import("debug/lbr.zig").enable();
+    // From here to the first task the boot CPU collects its entries of the
+    // per-CPU list (cpu/cpu_state.zig) one by one, each as soon as what it
+    // needs is up. APs and the S3 resume run the same list in one go.
+    cpu_state.apply(.branch_record);
     blog.ok("LBR enabled");
-    @import("syscall/entry.zig").init();
-    @import("syscall/entry.zig").verifyMsrs("BSP");
+    cpu_state.apply(.syscall);
     @import("ui/gui_window.zig").registerLocks();
     blog.ok("Syscall/sysret MSRs");
     // SMEP/UMIP — safe to enable on BSP now. SMAP is deferred until
@@ -258,25 +261,28 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     // carry the USER bit, boot still reads firmware tables through it, and
     // on Multiboot the boot stack is there too.
     @import("cpu/arch/protect.zig").detectFeatures();
-    @import("cpu/arch/protect.zig").applyEarlyCr4();
+    cpu_state.apply(.cr4_protection);
     blog.ok("SMEP/UMIP (SMAP deferred to post-PML4[0] drop)");
-    // AVX state for user tasks (CR4.OSXSAVE, XCR0); APs and the S3 resume
-    // repeat it per CPU.
-    @import("cpu/arch/fp.zig").enableExtended();
-    // Machine Check Exception: probe MCG_CAP, enable all banks, set
-    // CR4.MCE so vector 18 actually delivers. Per-CPU init for APs lives
-    // in smp.apEntry. Must run after detectFeatures (shares the cpuid
-    // helper) and before any code that could fault on an MC bank state.
+    // AVX state for user tasks: whether there is any, then CR4.OSXSAVE and
+    // XCR0 on this CPU.
+    @import("cpu/arch/fp.zig").detect();
+    cpu_state.apply(.extended_state);
+    // Machine Check Exception: probe MCG_CAP for the banks, then enable
+    // them and set CR4.MCE so vector 18 actually delivers. Must run after
+    // detectFeatures (shares the cpuid helper) and before any code that
+    // could fault on an MC bank state.
     @import("cpu/arch/mce.zig").detect();
+    cpu_state.apply(.machine_check);
     blog.ok("MCE banks enabled");
     // MWAIT/MONITOR: detect support so kernelIdle can swap `sti; hlt`
     // for `sti; monitor; mwait` (faster IPI wake + deeper C-states).
     // No CR bits to flip — the instructions are gated purely on CPUID.
     @import("cpu/arch/mwait.zig").detect();
     blog.ok("MWAIT/MONITOR detected");
-    // PMU (Performance Monitoring Unit) — sets up PMC0 for cycles, PMI
-    // routed via LAPIC LVT.PMI to vector 0xFE. Sampling profiler can be
-    // armed from the kernel via pmu.start(...) at any later point.
+    // PMU (Performance Monitoring Unit) — PMC0 for cycles, PMI routed via
+    // LAPIC LVT.PMI to vector 0xFE. Detection only: the per-CPU part masks
+    // an LVT entry and waits for the LAPIC (smp.init). The sampling
+    // profiler can be armed via pmu.start(...) at any later point.
     @import("cpu/arch/pmu.zig").detect();
     blog.ok("PMU detected");
     // Fault-tolerant MSR access: self-test the #GP fixup (reserved-MSR read
@@ -315,7 +321,7 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     // PAT slot 4 = WC. Required on real HW so the GOP framebuffer doesn't
     // get UC-mapped (which drops desktop draws to ~10 fps). No-op on QEMU+KVM
     // where MTRR coercion already gives us a sensible memory type.
-    paging.setupPat();
+    cpu_state.apply(.pat);
     blog.ok("PAT (PA4=WC)");
     if (boot_info.has_framebuffer != 0 and boot_info.framebuffer.base != 0) {
         const fb = boot_info.framebuffer;
@@ -451,15 +457,16 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     @import("virt/hyperv.zig").detect();
     @import("virt/hyperv.zig").enableHypercalls();
     // KVM PV leaf probe (relocated to 0x40000100 when hv-* flags are on),
-    // then arm the per-CPU PV areas for the BSP: steal time (ground-truth
-    // host-preemption for perf's stall quarantine) + PV EOI (elides the
-    // EOI vmexit on every edge interrupt). APs arm in apInitPerCpu.
+    // then the frame for the per-CPU PV areas, and the BSP arms its own:
+    // steal time (ground-truth host-preemption for perf's stall
+    // quarantine) + PV EOI (elides the EOI vmexit on every edge interrupt).
     @import("virt/kvm.zig").detect();
-    @import("virt/kvm.zig").initPerCpuPv();
+    @import("virt/kvm.zig").allocPvAreas();
+    cpu_state.apply(.paravirt);
     // Stall detector's wall ruler, measured: PM_TMR port read vs kvmclock
     // record read, and which one the first BSP tick will latch (kvmclock
-    // when initPerCpuPv just armed and proved it — that is why this sits
-    // between initPerCpuPv and apic.init, which starts IRQ0).
+    // when the BSP just armed and proved it — that is why this sits
+    // between that and apic.init, which starts IRQ0).
     @import("time/smi.zig").benchRulers();
     if (@import("irq/apic.zig").init()) {
         blog.ok("Local APIC + IOAPIC");
@@ -497,6 +504,7 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     // DR-watchpoint cross-CPU sync via IPI — must come AFTER smp.init()
     // (so cpu.alive[] is populated) and BEFORE any arm() that needs cross-CPU
     // semantics. See project_iretq_race_ipi_fix.md.
+    cpu_state.apply(.debug_registers);
     @import("debug/watch.zig").initIpi();
     blog.ok("DR-sync IPI vector");
     @import("proc/process.zig").initKillKickIpi();
@@ -571,7 +579,7 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
 
     // ---- Phase 5: Lockdown -----------------------------------------------
     blog.phase(.lockdown, "\u{2295}", "Lockdown"); // ⊕
-    paging.enableCR0WriteProtect();
+    cpu_state.apply(.write_protect);
     blog.ok("CR0.WP (RO supervisor)");
     paging.protectKdataInit();
     blog.ok(".kdata_protected R/O");
@@ -778,6 +786,7 @@ var boot_task_body: usize = 0;
 /// First task of a selftest/stress boot mode: interrupts on, then the mode's
 /// entry. Without it the whole run kept the BSP's timer masked.
 fn bootTaskWithIrqs() callconv(.c) noreturn {
+    cpu_state.completeBootWithoutSmap();
     asm volatile ("sti");
     const body: *const fn () callconv(.c) noreturn = @ptrFromInt(boot_task_body);
     body();

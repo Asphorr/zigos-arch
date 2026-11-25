@@ -282,10 +282,13 @@ pub var dr_foreign_owner: bool = false;
 /// Forget this CPU's last-applied cache so the next applyLocal()
 /// unconditionally rewrites the hardware. MUST be called after anything
 /// outside applyLocal touches the debug registers raw:
-///   - S3 resume (BSP + each re-onlined AP): the CPU comes back with
-///     power-on DR state while this BSS cache survived in RAM — without
-///     invalidation every post-resume applyLocal cache-hits against the
-///     pre-suspend value and the kesp watchdog stays silently disarmed.
+///   - a CPU reset (cpu_state's `debug_registers` entry: every bring-up
+///     and S3 resume path): the CPU comes back with power-on DR state
+///     while this BSS cache survived in RAM — without invalidation every
+///     later applyLocal cache-hits against the pre-reset value and the
+///     kesp watchdog stays silently disarmed. The CPU's next tick then
+///     writes the registers (irq0 calls applyLocal); not sooner, so that
+///     an AP re-planting its idle frame after S3 does it unwatched.
 ///   - gdb_stub's applyHwBreakpoints handback (see dr_foreign_owner).
 ///   - disarmAll's raw writeDr7(0).
 pub fn invalidateLocalCache() void {

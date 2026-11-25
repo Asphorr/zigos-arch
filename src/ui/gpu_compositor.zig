@@ -2763,12 +2763,8 @@ fn recordRenderPass(bg_push: *const [32]u8, per_scissor: usize) void {
 }
 
 pub fn taskEntry() callconv(.c) noreturn {
-    // Same Phase-3 ritual as desktop.taskEntry: BSP is now on its high-VA
-    // kernel task stack, drop the legacy low identity then re-enable IRQs.
-    paging.dropLowIdentity();
-    // BSP off the boot stack (low-half on Multiboot) — enable SMAP now (mirror of
-    // desktop.taskEntry; boot_mode=9 takes this path instead).
-    @import("../cpu/arch/protect.zig").enableSmapPerCpu();
+    // A kernel task the desktop spawns (boot mode 9), on whichever CPU picks
+    // it up; kernel tasks start with interrupts off.
     asm volatile ("sti");
     run();
     asm volatile ("ud2");

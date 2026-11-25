@@ -21,19 +21,18 @@
 // instruction. That bug class is now structurally impossible.
 //
 // LSTAR is naturally per-CPU (it's an MSR), and `init()` is invoked on each
-// CPU separately (BSP from main, APs from `apEntry`). At init() time we read
-// the calling CPU's LAPIC ID and write LSTAR to point at that CPU's stub.
+// CPU separately (the `syscall` entry of cpu/cpu_state.zig). init() asks
+// smp.myCpuId() which CPU it is on and points LSTAR at that CPU's stub.
 
 const syscall = @import("../syscall.zig");
 const smp = @import("../cpu/smp.zig");
 const gdt = @import("../cpu/arch/gdt.zig");
-const apic = @import("../irq/apic.zig");
 const std = @import("std");
 const msr = @import("../cpu/arch/msr.zig");
 const rflags = @import("../cpu/arch/cr.zig").rflags;
 
 /// Initialize syscall/sysret support on the calling CPU. Picks this CPU's
-/// dedicated entry stub via LAPIC ID and writes it to LSTAR.
+/// dedicated entry stub and writes it to LSTAR.
 pub fn init() void {
     const debug = @import("../debug/debug.zig");
 
@@ -67,18 +66,10 @@ pub fn init() void {
     msr.write(msr.STAR, star);
     debug.klog("[syscall] STAR: 0x{X:0>16}\n", .{star});
 
-    // LSTAR: this CPU's dedicated entry stub. Picking by LAPIC ID matches
-    // how `myCpu()` indexes `cpus[]` in smp.zig. x2APIC hardware can hand
-    // us LAPIC IDs > 255 — silently truncating to u8 would alias a high-ID
-    // CPU onto cpu0's stub and race on per_cpu_user_rsp[0]; bounds-check
-    // first and panic with a clear hint rather than letting the array
-    // OOB-panic with a generic message.
-    const id_full = apic.getLapicId();
-    if (id_full >= smp.MAX_CPUS) {
-        debug.klog("[syscall] LAPIC ID {d} exceeds MAX_CPUS {d}\n", .{ id_full, smp.MAX_CPUS });
-        @panic("syscall init: LAPIC ID exceeds MAX_CPUS — bump smp.MAX_CPUS");
-    }
-    const my_id: u8 = @intCast(id_full);
+    // LSTAR: this CPU's own entry stub, by the id myCpu() indexes cpus[]
+    // with. Not by the LAPIC ID register: the boot CPU gets here before its
+    // LAPIC mode is set, and is CPU 0 whatever that register would say.
+    const my_id = smp.myCpuId();
     const stub_addr = @intFromPtr(cpu_entries[my_id]);
     msr.write(msr.LSTAR, stub_addr);
     debug.klog("[syscall] LSTAR(cpu{d}): 0x{X:0>16}\n", .{ my_id, stub_addr });
@@ -113,13 +104,7 @@ pub fn verifyMsrs(cpu_label: []const u8) void {
         debug.klog("[syscall-verify] FAIL {s}: STAR=0x{X:0>16} expected 0x{X:0>16}\n", .{ cpu_label, star, expected_star });
         @panic("syscall MSR verify: STAR mismatch");
     }
-    // Same x2APIC bounds rationale as init(): never silently truncate.
-    const id_full = apic.getLapicId();
-    if (id_full >= smp.MAX_CPUS) {
-        debug.klog("[syscall-verify] FAIL {s}: LAPIC ID {d} exceeds MAX_CPUS {d}\n", .{ cpu_label, id_full, smp.MAX_CPUS });
-        @panic("syscall MSR verify: LAPIC ID exceeds MAX_CPUS");
-    }
-    const my_id: u8 = @intCast(id_full);
+    const my_id = smp.myCpuId();
     const expected_lstar: u64 = @intFromPtr(cpu_entries[my_id]);
     if (lstar != expected_lstar) {
         debug.klog("[syscall-verify] FAIL {s}: LSTAR=0x{X:0>16} expected 0x{X:0>16}\n", .{ cpu_label, lstar, expected_lstar });

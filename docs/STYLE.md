@@ -588,7 +588,8 @@ when touched.
 "Which CPU am I" is `smp.myCpuId()` (the LAPIC id, which is also the
 `cpus[]` index) or `smp.myCpu()` for the per-CPU struct. Both are one
 `rdtscp`: every CPU parks its id in `IA32_TSC_AUX` during per-CPU init
-(`initPerCpuAsm` → `armTscAux`) and proves the round trip; a CPU whose
+(the `identity` entry of `cpu_state`: `smp.claimSlot` → `armTscAux`) and
+proves the round trip; a CPU whose
 round trip fails demotes the whole kernel to the LAPIC ID register,
 loudly, so the answer is the same on every CPU either way.
 
@@ -604,25 +605,70 @@ hottest paths in the kernel.
 
 **Where `apic.getLapicId()` still belongs:** hardware identity, not
 "who am I" — MSI-X destination ids (nvme), IPI targets and the bring-up
-itself (`smp.init`, `apInitPerCpu`, before TSC_AUX is armed), and
+itself (`smp.init`, `smp.claimSlot`, before TSC_AUX is armed), and
 `serial.print`, which cannot import smp (cycle) and is bounded by the
 UART anyway. Everything else goes through smp.
 
-**Traps:** nothing may call `myCpu()` on an AP before `armTscAux` ran
-there (a fresh AP's aux holds whatever reset left, aliasing it to another
-slot) — `apInitPerCpu` arms inside `initPerCpuAsm`, after `getLapicId`,
-the `sipi_acked` store and the two id-field stores, and nothing in that
-gap asks who it is; do not "tidy" a store into it. S3 resume re-arms the
-BSP first thing in `reinitForS3Resume`, with the QUIET variant: a klog
-there would reach `serial.print`'s `getLapicId()` down the stale x2APIC
-path with no IDT loaded. The flag is global and sticky by design: a
-per-CPU answer would let two CPUs index the same table two different
-ways. The round trip proves the aux at arm time only, so the IRQ0 tick
-re-checks it against the LAPIC register once a second per CPU
+**Traps:** nothing may call `myCpu()` on a CPU out of reset (an AP at
+boot, any CPU after S3) before `armTscAux` ran there: its aux holds
+whatever the reset, or the firmware, left, aliasing it to another slot.
+So `identity` is the second entry of the per-CPU list. On an AP
+`claimSlot` takes the id from `getLapicId()`, stores `sipi_acked`, the
+two id fields and the syscall scratch slot, and only then arms (the
+BSP's paths know they are CPU 0); nothing in that gap asks who it is —
+do not "tidy" a call into it. The one entry ahead of it, `lapic_mode`,
+is an MSR write that asks nothing, and has to be first: a refused aux is
+reported, the klog reaches `serial.print`'s `getLapicId()`, and with the
+flag saying x2APIC on a CPU still in xAPIC that read is a #GP with no
+IDT loaded. The flag is global and sticky by design: a per-CPU answer
+would let two CPUs index the same table two different ways. The round
+trip proves the aux at arm time only, so the IRQ0 tick re-checks it
+against the LAPIC register once a second per CPU
 (`smp.auditCpuIdTick`) and demotes on disagreement with a `kwarn`. The
 BSP is LAPIC 0 by invariant (`cpus[0]` is hardcoded as the BSP in
 `bspCpu`, `isBSP`, the S3 path and the flag) — `smp.init` panics
 otherwise instead of splitting the BSP across two slots.
+
+## `cpu_state` — what a reset takes from a CPU, as one list
+
+A reset takes a CPU's MSRs, control-register bits, descriptor-table
+registers, LAPIC and debug registers: all of them at power-on and across
+S3, most of them at INIT. Four paths put them back — the boot CPU, an AP
+at boot, the BSP after S3, an AP after S3 — and all four take them from
+one list, `cpu/cpu_state.zig`:
+
+```zig
+pub const Step = enum { lapic_mode, identity, descriptor_tables, syscall, ... timer };
+
+cpu_state.restore(.ap_boot);   // a CPU out of reset into a running kernel: all of it
+cpu_state.apply(.syscall);     // the boot CPU: one entry, when what it needs is up
+cpu_state.completeBoot();      // first task: SMAP, then panic if an entry was skipped
+```
+
+The enum's order is the order `restore` runs, and each entry's doc
+comment says what it depends on. The boot CPU cannot run the list in one
+go (the LAPIC waits for ACPI, SMAP for the BSP to leave its boot stack),
+so it calls `apply` along the boot path and `completeBoot` checks the
+set.
+
+**Why:** the four paths used to be four hand-kept copies, and they
+drifted without anything noticing: the BSP never got its PMU entry at
+boot, `MCG_CTL` was written on the BSP only, the debug-register re-arm
+after S3 lived in two callers outside the copies. A missing entry shows
+as nothing at all until the one CPU that lacks it faults differently
+from the others.
+
+**How to apply:** per-CPU processor state that a reset clears gets an
+entry — a `Step`, its line in `run`, an `apply` on the boot path — and
+is written nowhere else. The function behind an entry does the per-CPU
+part only; probing and allocation stay in a BSP-once `detect` (see
+`mce.detect` / `mce.perCpuInit`, `fp.detect` / `fp.enableExtended`,
+`kvm.allocPvAreas` / `kvm.enablePerCpuPv`), and the `apply` goes after
+it — an entry applied ahead of its probe does nothing and still counts.
+Not in the list: what gets a CPU into 64-bit Zig code (paging, long
+mode and SSE: the trampolines, the loader, the boot entry), and state
+that belongs to the machine, not to a CPU (IOAPIC routing, device
+registers).
 
 ## `kwarn` — recoverable warnings
 
@@ -675,3 +721,4 @@ silent self-recovery into observable metric.
 | `msr` / `cr`        | `src/syscall/entry.zig` `init`; `src/cpu/arch/protect.zig` `applyEarlyCr4`; probing in `src/cpu/arch/thermal.zig` |
 | `slot_table.claim`  | `src/proc/pipe.zig` `alloc`                     |
 | `smp.myCpuId()`     | `src/proc/spinlock.zig` `currentCpuId`; arming in `src/cpu/smp.zig` `armTscAux` |
+| `cpu_state`         | `src/cpu/cpu_state.zig` `Step` / `run`; callers `smp.apBringUp`, `smp.reinitForS3Resume` |

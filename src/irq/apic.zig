@@ -6,6 +6,7 @@ const paging = @import("../mm/paging.zig");
 const acpi = @import("../acpi/acpi.zig");
 const debug = @import("../debug/debug.zig");
 const msr = @import("../cpu/arch/msr.zig");
+const cpu_state = @import("../cpu/cpu_state.zig");
 const pit = @import("../time/pit.zig");
 const pic = @import("pic.zig");
 
@@ -465,35 +466,43 @@ fn initIOAPIC() void {
 
 // --- LAPIC initialization ---
 
-fn initLAPIC() void {
-    // Enable APIC via MSR. We opt INTO x2APIC when the CPU offers it
-    // (CPUID.01H ECX bit 21): MSR access replaces the MMIO decode on
-    // every LAPIC register touch, and the ICR becomes a single 64-bit
-    // write with no delivery-status poll — under a hypervisor that's one
-    // cheap wrmsr exit per IPI instead of 2 MMIO exits plus poll reads.
-    // xAPIC→x2APIC (EN=1,EXTD=0 → EN=1,EXTD=1) is a legal transition in
-    // one write; the reverse needs a CPU reset, which is also why we
-    // preserve bit 10 if firmware already set it. After the write we
-    // re-read to see what stuck and pick the access mode from that.
-    var base = msr.read(msr.APIC_BASE) | msr.ApicBase.ENABLE;
-    if (detectX2Apic()) base |= msr.ApicBase.X2APIC; // opt-in
-    msr.write(msr.APIC_BASE, base);
+/// cpu_state's `lapic_mode`. IA32_APIC_BASE: the LAPIC on, in xAPIC or
+/// x2APIC mode. The mode is one for all CPUs (`x2apic_active` is one flag),
+/// so the BSP chooses and the others take what it chose. It chooses x2APIC
+/// where the CPU has it: an MSR access instead of an MMIO decode on every
+/// register, and the ICR as one 64-bit write with no delivery-status poll —
+/// under a hypervisor one cheap exit per IPI instead of two plus the polls.
+///
+/// An MSR write and nothing else: no LAPIC register, no print. A CPU out of
+/// reset is in xAPIC mode whatever the flag says, so until this has run a
+/// LAPIC access on it takes the wrong path — with x2APIC chosen, a #GP, and
+/// this early there is no IDT. (That killed the first x2APIC boot,
+/// 2026-06-12.)
+pub fn setMode(bsp: bool) void {
+    // Bits are only ever added: firmware may have entered x2APIC already,
+    // and leaving it takes a reset. From disabled the one way is through
+    // xAPIC — enable and x2APIC in a single write is a #GP.
+    var base = msr.read(msr.APIC_BASE);
+    if (base & msr.ApicBase.ENABLE == 0) {
+        base |= msr.ApicBase.ENABLE;
+        msr.write(msr.APIC_BASE, base);
+    }
+    const want_x2apic = if (bsp) detectX2Apic() else x2apic_active;
+    if (want_x2apic and base & msr.ApicBase.X2APIC == 0) {
+        msr.write(msr.APIC_BASE, base | msr.ApicBase.X2APIC);
+    }
+    // What stuck decides, not what was asked for.
+    if (bsp) x2apic_active = msr.read(msr.APIC_BASE) & msr.ApicBase.X2APIC != 0;
+}
 
-    // Re-read; if X2APIC stuck we're in x2APIC mode. lapicRead/lapicWrite
-    // start using MSR access from this point on.
-    x2apic_active = msr.read(msr.APIC_BASE) & msr.ApicBase.X2APIC != 0;
-    if (x2apic_active) debug.klog("[apic] x2APIC mode active\n", .{});
-
-    // Set Spurious Interrupt Vector Register: vector 0xFF + software enable (bit 8)
+/// cpu_state's `lapic`: software-enable with spurious vector 0xFF, and
+/// accept every priority. Touches neither the IOAPIC nor the timer.
+pub fn enableLocal(bsp: bool) void {
     lapicWrite(LAPIC_SVR, 0x1FF);
-
-    // Task Priority = 0 (accept all interrupts)
     lapicWrite(LAPIC_TPR, 0);
-
-    const id_raw = lapicRead(LAPIC_ID);
-    const id = if (x2apic_active) id_raw else (id_raw >> 24);
-    const ver_reg = lapicRead(LAPIC_VER);
-    debug.klog("[apic] LAPIC ID={d} version=0x{X:0>2}\n", .{ id, ver_reg & 0xFF });
+    if (!bsp) return;
+    if (x2apic_active) debug.klog("[apic] x2APIC mode active\n", .{});
+    debug.klog("[apic] LAPIC ID={d} version=0x{X:0>2}\n", .{ getLapicId(), lapicRead(LAPIC_VER) & 0xFF });
 }
 
 // --- APIC timer calibration ---
@@ -699,7 +708,9 @@ fn calibrateTimerPit() bool {
     return true;
 }
 
-fn startTimer() void {
+/// cpu_state's `timer`: the first tick, one quantum out, from the BSP's
+/// calibration. handleIRQ0 re-arms after each (armOneShot).
+pub fn startTimer() void {
     if (tsc_deadline_active) {
         // TSC-deadline: vector 32 with mode bits 17:18 = 10. The MSR
         // value is an absolute TSC value at which the IRQ fires; arm
@@ -777,8 +788,9 @@ pub fn init() bool {
     // Disable legacy PIC
     disablePIC();
 
-    // Initialize Local APIC
-    initLAPIC();
+    // The boot CPU's LAPIC: its entries of the per-CPU list.
+    cpu_state.apply(.lapic_mode);
+    cpu_state.apply(.lapic);
 
     // Initialize IOAPIC
     initIOAPIC();
@@ -794,8 +806,8 @@ pub fn init() bool {
         debug.klog("[apic] WARNING: calibration seems wrong, falling back to PIC\n", .{});
         // The takeover above must be UNWOUND or the fallback banner is a
         // lie: disablePIC() left the 8259 remapped to 0xF0/0xF8 with every
-        // line masked, and initLAPIC() software-enabled the LAPIC — whose
-        // LVT LINT0 is reset-masked, so even an unmasked PIC's INTR dies
+        // line masked, and the LAPIC is software-enabled by now, with its
+        // LVT LINT0 reset-masked, so even an unmasked PIC's INTR dies
         // at the LAPIC. Net effect was NO tick + NO keyboard: scheduler
         // frozen at the first sleep, input dead — a wedge, not a fallback.
         // Repair: re-mask the two IOAPIC pins we unmasked (the i8042 lines
@@ -820,7 +832,7 @@ pub fn init() bool {
         tsc_deadline_active = false;
     }
 
-    startTimer();
+    cpu_state.apply(.timer);
 
     apic_active = true;
 
@@ -875,56 +887,6 @@ pub fn sendIPI(target_id: u32, vector: u8) void {
 pub fn sendNMI(target_id: u32) void {
     // Delivery mode = NMI (100b in bits 8-10) + Level = assert (bit 14).
     icrSend(target_id, 0x00004400);
-}
-
-/// Switch THIS CPU into x2APIC mode iff the BSP runs in it. Pure
-/// IA32_APIC_BASE MSR write — touches no LAPIC register — so it is safe
-/// as the very FIRST thing an AP does out of SIPI, before its IDT exists.
-/// APs wake in xAPIC mode, but `x2apic_active` is a global flag: any
-/// lapicRead before this (e.g. the getLapicId an AP uses to find its
-/// per-CPU slot) takes the MSR path and #GPs → no-IDT triple fault →
-/// QEMU exits under -no-reboot with serial cut mid-bringup. (Exactly
-/// that killed the first x2APIC boot, 2026-06-12.)
-pub fn enterX2ApicEarlyAp() void {
-    if (!x2apic_active) return;
-    msr.write(msr.APIC_BASE, msr.read(msr.APIC_BASE) | msr.ApicBase.ENABLE | msr.ApicBase.X2APIC);
-}
-
-/// Initialize LAPIC for an AP (does NOT touch IOAPIC or PIC)
-pub fn initLAPICForAP() void {
-    // Enable APIC via MSR. MUST mirror the BSP's APIC mode: x2apic_active
-    // is a single global flag, so the lapicWrite(SVR) below already takes
-    // the MSR path when the BSP went x2APIC — an AP still in xAPIC mode
-    // at that point would #GP on the 0x80F wrmsr. X2APIC goes in the same
-    // write as ENABLE (EN=1,EXTD=1 from disabled is a legal transition).
-    var base = msr.read(msr.APIC_BASE) | msr.ApicBase.ENABLE;
-    if (x2apic_active) base |= msr.ApicBase.X2APIC;
-    msr.write(msr.APIC_BASE, base);
-    lapicWrite(LAPIC_SVR, 0x1FF);
-    lapicWrite(LAPIC_TPR, 0);
-}
-
-/// Re-enable the LAPIC after an S3 resume. Unlike initLAPICForAP this runs the
-/// full initLAPIC() so `x2apic_active` is re-derived from the (S3-reset)
-/// IA32_APIC_BASE: S3 clears the x2APIC-enable bit, and a stale RAM flag would
-/// otherwise route every subsequent lapicRead/Write down the wrong (MSR vs MMIO)
-/// path and #GP. Call this BEFORE any getLapicId()/myCpu() on the resume path.
-/// Does NOT re-arm the timer (the caller does, mirroring apEntry's ordering) and
-/// does NOT touch the IOAPIC — device-IRQ routing re-init is a later S3 step.
-pub fn reinitLapicForS3Resume() void {
-    initLAPIC();
-}
-
-/// Start LAPIC timer for an AP (uses BSP's calibrated count)
-pub fn startTimerForAP() void {
-    if (tsc_deadline_active) {
-        lapicWrite(LAPIC_LVT_TIMER, 32 | LVT_TIMER_MODE_TSC_DEADLINE);
-        msr.write(MSR_TSC_DEADLINE, rdtsc() + tsc_per_quantum);
-    } else {
-        lapicWrite(LAPIC_LVT_TIMER, 32); // vector 32, one-shot
-        lapicWrite(LAPIC_TIMER_DCR, 0x03); // divide by 16
-        lapicWrite(LAPIC_TIMER_ICR, apic_timer_count);
-    }
 }
 
 /// Re-arm the timer to fire one `timerQuantum()`-equivalent unit (or a

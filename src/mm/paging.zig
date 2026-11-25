@@ -384,8 +384,8 @@ pub fn mapAPIC() void {
 // 1080p desktop draws drop to ~10 fps. WC coalesces them into burst
 // transactions; the OS sees full memory bandwidth on the FB.
 //
-// PAT is per-CPU. setupPat() must be called on the BSP and on every AP
-// (apEntry calls it) so the PA4=WC slot is consistent everywhere.
+// PAT is per-CPU: setupPat() is the `pat` entry of cpu/cpu_state.zig, so
+// every CPU runs it, after every reset, and PA4=WC holds everywhere.
 //
 // PAT was added in Pentium III (2000); CPUID.01H:EDX[16] reports support.
 // Every x86_64 CPU has it, but we probe defensively.

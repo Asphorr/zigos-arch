@@ -206,7 +206,7 @@ pub fn getEntries() *const [7]u64 {
     return &entries;
 }
 
-/// Load the shared IDT (for AP use)
+/// Point this CPU's IDTR at the shared IDT.
 pub fn loadIdt() void {
     const idt_mod = @import("../idt.zig");
     idt_mod.loadIdtForAP();

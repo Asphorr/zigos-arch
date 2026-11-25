@@ -33,7 +33,7 @@
 // count through host pauses, which is exactly what a gap detector needs;
 // the TSC alone is not, because tsc_per_quantum is a CALIBRATED figure a
 // stall can corrupt (apic.tscPerQuantumSane). The ruler is latched once,
-// at the first BSP tick (kvm.initPerCpuPv runs before apic.init starts
+// at the first BSP tick (the BSP arms its PV areas before apic.init starts
 // IRQ0), and never switches: tickOverdue() reads the baseline cross-CPU,
 // and a ruler that changes under it would pair a baseline from one clock
 // with a reading from the other. benchRulers() prints both read costs at
@@ -191,8 +191,8 @@ pub fn tick() void {
 }
 
 /// First BSP tick only: pick the ruler for the life of the boot. kvmclock
-/// when KVM has armed and proven the BSP's record (kvm.initPerCpuPv runs
-/// before apic.init starts IRQ0, so by the first tick the answer is
+/// when KVM has armed and proven the BSP's record (the BSP arms its PV
+/// areas before apic.init starts IRQ0, so by the first tick the answer is
 /// final); PM_TMR otherwise. Logged once — the line pairs with
 /// "[smi] ruler read cost" from benchRulers().
 fn latchRuler() void {
@@ -249,8 +249,8 @@ fn rulerToTsc(delta: u64, per_q: u64) u64 {
     return (whole_q *| per_q) +| (rem * per_q / ruler_per_quantum);
 }
 
-/// Boot diagnostic, BSP, IF=1, after kvm.initPerCpuPv: the read cost of
-/// both rulers in wall TSC cycles, and which one the tick will latch.
+/// Boot diagnostic, BSP, IF=1, after the BSP armed its PV areas: the read
+/// cost of both rulers in wall TSC cycles, and which one the tick will latch.
 /// Under nested Hyper-V the PM_TMR figure IS the price the tick used to
 /// pay twice per 10 ms; on bare metal it is a ~1 µs chipset read and
 /// kvmclock reads "absent". 128 port reads ≈ 10 ms once at boot.

@@ -6,6 +6,7 @@ const paging = @import("../mm/paging.zig");
 const pmm = @import("../mm/pmm.zig");
 const gdt = @import("arch/gdt.zig");
 const msr = @import("arch/msr.zig");
+const cpu_state = @import("cpu_state.zig");
 const vfs = @import("../fs/vfs.zig");
 const elf_loader = @import("../proc/elf_loader.zig");
 const process = @import("../proc/process.zig");
@@ -333,7 +334,7 @@ pub var cpu_count: u8 = 1;
 var smp_initialized: bool = false;
 
 // IA32_TSC_AUX (msr.TSC_AUX) — `rdtscp` returns it in ECX with no VM exit.
-// Each CPU stores its LAPIC id there (armTscAux, from initPerCpuAsm) and
+// Each CPU stores its LAPIC id there (armTscAux, from claimSlot) and
 // myCpuId() reads it back with rdtscp instead of the LAPIC ID register.
 // Measured on zigvm (nested Hyper-V → KVM, x2APIC; benchCpuIdRead prints it
 // every boot): 14–31k cycles per LAPIC ID read — `rdmsr 0x802` is an exit —
@@ -623,54 +624,34 @@ pub fn init() void {
         return;
     }
 
-    // Safe-mode boot (mode 2) skips AP startup so a single CPU runs the
-    // whole system. Useful for reproducing CPU-affinity bugs and as a
-    // recovery option when SMP races make the system unstable. BSP-only
-    // init still runs below (per-CPU GDT/TSS, syscall MSRs).
+    // cpus[0] IS the BSP everywhere — bspCpu(), isBSP(), claimSlot on the
+    // BSP's paths, the TSC_AUX flag raised only by "cpu 0". A board whose
+    // BSP carries another LAPIC id would split the BSP across two slots;
+    // assertBSP would panic on the first BSP-only call anyway, so say it
+    // here, once, with the reason.
+    if (apic.getLapicId() != 0) @panic("smp: BSP LAPIC id != 0 — cpus[0] is the BSP by invariant (bspCpu/isBSP/S3/TSC_AUX)");
+
+    // The BSP's entries of the per-CPU list that had to wait for the LAPIC.
+    cpu_state.apply(.identity);
+    @atomicStore(bool, &cpus[0].alive, true, .release);
+    // From the boot GDT/TSS of gdt.init() to its own. On the shared one
+    // every CPU's setTssRsp0 would write the same `tss`: an AP dispatching
+    // a task would silently move the BSP's RSP0 onto that task's kstack,
+    // and the BSP's next IRQ from user mode would land there (seen as a
+    // wild RIP on `cat`, with RSP in idle1's slot).
+    cpu_state.apply(.descriptor_tables);
+    smp_initialized = true;
+    cpu_state.apply(.pmu);
+
+    // Safe-mode boot (mode 2) starts no AP: a single CPU runs the whole
+    // system. Useful for reproducing CPU-affinity bugs and as a recovery
+    // option when SMP races make the system unstable.
     if (@import("../boot/boot_info.zig").boot_mode == 2) {
         debug.klog("[smp] BOOT MODE: SAFE — skipping AP startup, BSP-only\n", .{});
-        const bsp_id: u8 = @truncate(apic.getLapicId());
-        if (bsp_id != 0) @panic("smp: BSP LAPIC id != 0 — cpus[0] is the BSP by invariant (bspCpu/isBSP/S3/TSC_AUX)");
-        cpus[bsp_id].cpu_id = 0;
-        cpus[bsp_id].lapic_id = bsp_id;
-        @atomicStore(bool, &cpus[bsp_id].alive, true, .release);
-        initPerCpuAsm(bsp_id);
-        initPerCpuGdt(&cpus[bsp_id]);
-        smp_initialized = true;
         debug.klog("[smp] 1 CPU online (safe mode)\n", .{});
         return;
     }
 
-    // Set up BSP (CPU 0) per-CPU data
-    const bsp_id: u8 = @truncate(apic.getLapicId());
-    // cpus[0] IS the BSP everywhere — bspCpu(), isBSP(), reinitForS3Resume's
-    // armTscAuxQuiet(0)/initPerCpuAsm(0), the TSC_AUX flag raised only by
-    // "cpu 0". A board whose BSP carries another LAPIC id would split the
-    // BSP across two slots; assertBSP would panic on the first BSP-only call
-    // anyway, so say it here, once, with the reason.
-    if (bsp_id != 0) @panic("smp: BSP LAPIC id != 0 — cpus[0] is the BSP by invariant (bspCpu/isBSP/S3/TSC_AUX)");
-    cpus[bsp_id].cpu_id = 0;
-    cpus[bsp_id].lapic_id = bsp_id;
-    @atomicStore(bool, &cpus[bsp_id].alive, true, .release);
-
-    // Zero this CPU's per-CPU syscall scratch slot (user_rsp_save). The
-    // kstack pointer itself lives in cpus[bsp_id].tss.rsp0 — written by
-    // setTssRsp0 on the first per-process dispatch. The LSTAR stub reads
-    // both via RIP-relative loads, no GS_BASE involvement.
-    initPerCpuAsm(bsp_id);
-
-    // Migrate BSP from the legacy shared GDT/TSS (set up by gdt.init()) to
-    // its own per-CPU GDT/TSS. Without this, BSP keeps using the global
-    // `tss` in gdt.zig, which every CPU's setTssRsp0 stomps on — so when
-    // an AP's setTssRsp0 writes a value for ITS dispatched task, BSP's
-    // TSS.RSP0 silently becomes that value too. The result is BSP loading
-    // RSP from another CPU's kstack on the next user-mode IRQ — i.e. the
-    // wild-RIP cross-stack-aliasing bug we've been hunting (B.3 caught it
-    // on cat: BSP took IRQ from cat in user mode and landed RSP in idle1's
-    // slot because cpu1 had just called setTssRsp0(0, idle1_top)).
-    initPerCpuGdt(&cpus[bsp_id]);
-
-    smp_initialized = true;
     benchCpuIdRead();
 
     const have_trampoline = trampoline.pageIsUsable(.ap);
@@ -692,7 +673,7 @@ pub fn init() void {
     // hyperthreading or socket layout). Without MADT we fall back to
     // the historical 1..MAX_CPUS-1 probe loop.
     var ap_ids: [MAX_CPUS]u8 = undefined;
-    const ap_count = if (have_trampoline) collectApIds(bsp_id, &ap_ids) else 0;
+    const ap_count = if (have_trampoline) collectApIds(0, &ap_ids) else 0;
 
     var ap_idx: usize = 0;
     while (ap_idx < ap_count) : (ap_idx += 1) {
@@ -765,105 +746,64 @@ fn busyWait(ms: u32) void {
     }
 }
 
-/// Per-CPU bring-up shared by the boot AP entry (`apEntry`) and the S3-resume
-/// re-online entry (`apEntryS3Resume`). Stamps sipi_acked, then re-establishes
-/// every piece of per-CPU CPU state (GDT/TSS, IDT, syscall MSRs, EFER.NXE,
-/// SMEP/SMAP, MCE/PMU, LAPIC + timer, CR0.WP, PAT) and marks the CPU alive.
-/// Returns this CPU's LAPIC id. The ONLY thing the two callers do differently is
-/// what they dispatch into afterwards (a fresh idle PCB vs. the surviving one).
+/// What the two AP entries share: the whole per-CPU list (cpu_state.zig),
+/// then `alive`. They differ only in what they dispatch into afterwards: a
+/// fresh idle PCB, or the one that survived S3. Returns this CPU's id.
 ///
-/// INVARIANT: EFER.NXE is still 0 on this AP until syscall_entry.init() (called
-/// below) turns it on. Until then nothing here may walk a PTE with bit 63 (NX)
-/// set, or the CPU takes a reserved-bit #PF → #DF → triple-fault with no IDT
-/// installed yet. Safe today because the only memory touched pre-NXE is the
-/// kernel image (.text/.bss, mapped NX-clear), including this AP's isr_stack —
-/// keep any vmm-allocated / NX-mapped access *after* syscall_entry.init(). Same
-/// deferral as boot.asm's BSP path.
-fn apInitPerCpu() u8 {
-    // MUST run before getLapicId below: we wake from SIPI in xAPIC mode,
-    // and with the BSP in x2APIC the global flag routes lapicRead through
-    // rdmsr — a #GP (no IDT yet → triple fault) until EXTD is set on THIS
-    // CPU. Pure IA32_APIC_BASE write; no LAPIC register access.
-    apic.enterX2ApicEarlyAp();
-
-    // Figure out our LAPIC ID
-    const my_id: u8 = @truncate(apic.getLapicId());
-
-    // Stamp sipi_acked FIRST — before any work that could fault or hang.
-    // BSP-side wait loop uses this to discriminate startup vs init failure.
-    // .release pairs with the BSP's .acquire load in the bring-up spin loop.
-    @atomicStore(bool, &cpus[my_id].sipi_acked, true, .release);
-
-    // Set up per-CPU data
-    cpus[my_id].cpu_id = my_id;
-    cpus[my_id].lapic_id = my_id;
-
-    // Initialize per-CPU asm storage + GS_BASE for syscalls landing on this AP
-    initPerCpuAsm(my_id);
-
-    // Initialize per-CPU GDT with our own TSS
-    initPerCpuGdt(&cpus[my_id]);
-
-    // Load shared IDT
-    gdt.loadIdt();
-
-    // Program syscall/sysret MSRs on this AP. EFER.SCE, STAR, LSTAR, SFMASK
-    // are *per-CPU* — without this, any user process scheduled on the AP
-    // raises #UD on the `syscall` instruction (because SCE=0). Symptom is
-    // very mute: the user just hangs / disappears with no trace, since #UD
-    // from a process that hasn't issued any syscall yet means we have no
-    // earlier dispatch to log around. (Spent an evening chasing exactly this
-    // bug — see feedback_smp_syscall_msrs.md.)
-    @import("../syscall/entry.zig").init();
-    // LBR is per-CPU — enable on each AP too, otherwise crashes on this
-    // CPU dump an empty branch ring.
-    @import("../debug/lbr.zig").enable();
-    // Tripwire: assert MSRs landed correctly before we let the AP hit user
-    // code. Catches future "init() got refactored and dropped a wrmsr" too.
-    var label_buf: [16]u8 = undefined;
-    const label = std.fmt.bufPrint(&label_buf, "AP{d}", .{my_id}) catch "AP?";
-    @import("../syscall/entry.zig").verifyMsrs(label);
-
-    // SMEP/UMIP + SMAP. AP's kstack is allocated in the physmap (high-VA,
-    // U/S=0) from the start, so SMAP enable is safe immediately — unlike
-    // BSP which has to wait for paging.dropLowIdentity.
-    @import("arch/protect.zig").applyEarlyCr4();
-    @import("arch/protect.zig").enableSmapPerCpu();
-    @import("arch/fp.zig").enableExtended();
-    @import("arch/mce.zig").perCpuInit();
-    @import("arch/pmu.zig").perCpuInit();
-
-    // Enable our LAPIC
-    apic.initLAPICForAP();
-
-    // Arm KVM PV MSRs (steal time + PV EOI) for this CPU — they're
-    // per-CPU, and on the S3 path this doubles as the RE-arm (S3 reset
-    // them). No-op without KVM.
-    @import("../virt/kvm.zig").enablePerCpuPv(my_id);
-
-    // CR0.WP is per-CPU. Without this on APs, kernel-mode writes ignore
-    // R/W=0 PTEs, so the MMU write-watch (idt.zig ww_page) only catches
-    // BSP-side wild writes. Make it symmetric.
-    @import("../mm/paging.zig").enableCR0WriteProtect();
-
-    // PAT is per-CPU. BSP set PA4=WC at boot; APs need their own write
-    // or they'll interpret PAT-bit pages as WB and the FB writes won't
-    // coalesce on this CPU.
-    @import("../mm/paging.zig").setupPat();
-
-    // Start our LAPIC timer at 100Hz
-    apic.startTimerForAP();
-
-    // Mark alive — .release publishes all the per-CPU init above; the BSP
-    // observes `alive` with an .acquire load before counting us online.
+/// The AP's stack is its isr_stack, in the kernel image and so not a user
+/// page: SMAP goes on with the rest, where the BSP has to wait.
+fn apBringUp(comptime path: cpu_state.Path) u8 {
+    cpu_state.restore(path);
+    const my_id = myCpu().cpu_id;
+    // .release publishes everything above; the BSP reads `alive` with
+    // .acquire before it counts this CPU online.
     @atomicStore(bool, &cpus[my_id].alive, true, .release);
-
     return my_id;
+}
+
+/// cpu_state's `identity`: this CPU takes its cpus[] slot and stores its id
+/// in IA32_TSC_AUX, where myCpuId() reads it. The BSP is CPU 0 by invariant
+/// (init checks); an AP is the LAPIC id it woke with — readable because
+/// `lapic_mode` ran first. Until here a CPU out of reset cannot say who it
+/// is: its aux holds whatever the reset, or the firmware, left there.
+///
+/// The syscall scratch slot is zeroed with it. The kernel stack a syscall
+/// lands on is tss.rsp0, stamped by setTssRsp0 at each dispatch.
+pub fn claimSlot(path: cpu_state.Path) void {
+    const id: u8 = if (path.isBsp()) 0 else blk: {
+        // Never truncated: an x2APIC id of 256 would take the BSP's slot.
+        // collectApIds starts no such CPU, so this is a kernel bug.
+        const lapic_id = apic.getLapicId();
+        if (lapic_id >= MAX_CPUS) @panic("smp: a CPU came up with a LAPIC id cpus[] has no slot for");
+        break :blk @intCast(lapic_id);
+    };
+    const cpu = &cpus[id];
+    // An AP acks before anything that could fault or hang: by this flag
+    // the BSP's wait tells "never started" from "started and died".
+    if (!path.isBsp()) @atomicStore(bool, &cpu.sipi_acked, true, .release);
+    cpu.cpu_id = id;
+    cpu.lapic_id = id;
+    per_cpu_user_rsp[id] = 0;
+    armTscAux(id);
+}
+
+/// cpu_state's `descriptor_tables`: this CPU's own GDT and TSS, the shared
+/// IDT.
+pub fn loadDescriptorTables(path: cpu_state.Path) void {
+    const cpu = myCpu();
+    // initPerCpuGdt points rsp0 at the isr_stack, which is right for a CPU
+    // about to be dispatched anew: setTssRsp0 replaces it. The BSP after S3
+    // is not — it goes back into the task that suspended, whose next
+    // syscall has to land on that task's kernel stack.
+    const rsp0 = cpu.tss.rsp0;
+    initPerCpuGdt(cpu);
+    if (path == .bsp_resume) cpu.tss.rsp0 = rsp0;
+    gdt.loadIdt();
 }
 
 /// AP entry point — called from trampoline after entering 64-bit mode (boot).
 export fn apEntry() callconv(.c) noreturn {
-    const my_id = apInitPerCpu();
+    const my_id = apBringUp(.ap_boot);
 
     // Per-CPU kernel-mode idle (task #235). Each AP gets its own idle PCB
     // with its own kstack — no more stack-aliasing failure mode where
@@ -895,14 +835,14 @@ export fn apEntry() callconv(.c) noreturn {
 /// `kernelIdle` switch frame before dispatching. Falls back to a fresh idle only
 /// if this CPU somehow has no idle_pid (came up on resume but not at boot).
 export fn apEntryS3Resume() callconv(.c) noreturn {
-    const my_id = apInitPerCpu();
+    const my_id = apBringUp(.ap_resume);
 
-    // apInitPerCpu ran on the resume CR3 — the suspending PROCESS's page tables,
+    // The bring-up ran on the resume CR3 — the suspending PROCESS's page tables,
     // which carry the 0x8000 low-identity the trampoline needed to enable paging.
     // Switch to the kernel master PML4 now, the stable table boot APs run their
     // idle on (page_dir_phys=0 idles resolve to getKernelPageDirPhys in schedule).
     // A process CR3 could be freed underneath us if that process later exits;
-    // apInitPerCpu touched only kernel-high memory, so nothing here depended on
+    // the bring-up touched only kernel-high memory, so nothing here depended on
     // the process low mappings. Use the same loadCr3 helper schedule() uses so
     // the per-CPU PCID bookkeeping stays consistent.
     {
@@ -921,91 +861,20 @@ export fn apEntryS3Resume() callconv(.c) noreturn {
 
     serial.print("[smp] AP {d} re-online after S3\n", .{my_id});
 
-    // S3 reset this AP's debug registers to power-on state while watch.zig's
-    // per-CPU applied-cache survived in RAM. Force a fresh apply, otherwise
-    // the cache compares equal against the pre-suspend value, every rewrite
-    // is skipped, and the kesp watchdog stays silently dead on this CPU.
-    @import("../debug/watch.zig").reapplyAfterDrReset();
-
     process.enterFirstTaskAp(idle_pid);
 }
 
-/// Re-establish the BSP's per-CPU CPU state after an S3 (suspend-to-RAM) resume.
-/// On S3 wake the CPU comes back with GDTR/IDTR/TR, the syscall MSRs, EFER.NXE,
-/// CR0.WP, CR4, PAT, and the LAPIC all reset. This mirrors the per-CPU bring-up
-/// `apEntry` runs on an AP, but for the BSP (CPU 0) and WITHOUT creating an idle
-/// task: the caller (src/acpi/s3.zig) longjmps back into the suspending syscall
-/// afterwards, so the BSP resumes its existing kernel context rather than
-/// starting a new one.
-///
-/// NXE invariant (identical to apEntry): runs with EFER.NXE still 0 until
-/// `syscall/entry.zig.init()` below re-enables it, so nothing here may touch an
-/// NX-mapped page before that. Only the kernel image + cpus[]/GDT/IDT (all
-/// mapped NX-clear) are touched pre-NXE, exactly as on the AP path.
+/// The BSP after an S3 wake: the whole per-CPU list (cpu_state.zig), as on an
+/// AP, but with no task to start. The caller (src/acpi/s3.zig) longjmps back
+/// into the syscall that suspended, so the BSP goes on in the context it had.
+/// Interrupts are off (the wake trampoline cleared IF) and stay off until
+/// that syscall returns; the timer armed at the end ticks from then.
 pub fn reinitForS3Resume() void {
-    const bsp = &cpus[0];
-
-    // BEFORE ANYTHING: S3 reset IA32_TSC_AUX (firmware may even have parked
-    // its own value there) while myCpuId() still trusts it — re-arm before
-    // any code that could ask who it is. Needs no APIC. The QUIET variant:
-    // a report here would klog → serial.print, and a refused aux sends
-    // myCpuId() to getLapicId() down the stale x2APIC path with no IDT
-    // loaded = triple fault. initPerCpuAsm(0) below
-    // repeats the (idempotent) arm once the LAPIC is back and reports then.
-    _ = armTscAuxQuiet(0);
-
-    // FIRST: re-enable the LAPIC and re-derive `x2apic_active` from the reset
-    // IA32_APIC_BASE. Must precede any getLapicId()/myCpu() below — the stale
-    // RAM flag would otherwise route LAPIC access down the wrong MMIO/MSR path
-    // and #GP. Enabling the LAPIC this early is safe: IF is still 0 (the wake
-    // trampoline cli'd and never sti'd) and the timer isn't armed until the end.
-    apic.reinitLapicForS3Resume();
-    // The timer is re-armed one quantum out of band below, so the pre-suspend
-    // tickless bookkeeping (stretch flags, the BSP's published fire) is stale
-    // until the first fire — reset it so registrars don't compare against a
-    // fire tick that is now in the past.
+    // The timer is about to be armed one quantum out, outside the tick's own
+    // bookkeeping: what that recorded before the suspend (stretch flags, the
+    // BSP's published fire) names a fire that is now in the past.
     @import("idt/irq0.zig").clearTicklessState();
-
-    // Re-arm the BSP's KVM PV MSRs (steal time + PV EOI) — S3 reset them
-    // along with the rest of CPU state. Until this runs, the PV EOI flag
-    // byte just stays 0 and eoi() takes the real-write path (safe). APs
-    // re-arm via the shared apInitPerCpu.
-    @import("../virt/kvm.zig").enablePerCpuPv(0);
-
-    // Per-CPU syscall scratch + per-CPU GDT/TSS. Preserve tss.rsp0 (the CURRENT
-    // process's kernel stack, set by the last setTssRsp0) across initPerCpuGdt,
-    // which would otherwise reset it to the isr_stack — the suspending app must
-    // land its next syscall on its own kstack, not the IST/ISR stack (the
-    // cross-stack-aliasing hazard). ist1 is process-independent, so letting
-    // initPerCpuGdt re-set it to the isr_stack top is correct.
-    initPerCpuAsm(0);
-    const saved_rsp0 = bsp.tss.rsp0;
-    initPerCpuGdt(bsp);
-    bsp.tss.rsp0 = saved_rsp0;
-
-    // Shared IDT.
-    gdt.loadIdt();
-
-    // syscall/sysret MSRs (SCE/STAR/LSTAR/SFMASK) + EFER.NXE. Required for the
-    // eventual sysret back to userspace, and re-enables NXE for everything after.
-    @import("../syscall/entry.zig").init();
-    @import("../debug/lbr.zig").enable();
-    @import("../syscall/entry.zig").verifyMsrs("S3-BSP");
-
-    // SMEP/UMIP + SMAP, AVX state, MCE, PMU — all per-CPU, all reset by S3.
-    @import("arch/protect.zig").applyEarlyCr4();
-    @import("arch/protect.zig").enableSmapPerCpu();
-    @import("arch/fp.zig").enableExtended();
-    @import("arch/mce.zig").perCpuInit();
-    @import("arch/pmu.zig").perCpuInit();
-
-    // CR0.WP + PAT (per-CPU, reset by S3).
-    @import("../mm/paging.zig").enableCR0WriteProtect();
-    @import("../mm/paging.zig").setupPat();
-
-    // Timer last (mirrors apEntry) — arms IRQ0 at 100 Hz so the scheduler ticks
-    // again the moment we return to userspace with IF=1.
-    apic.startTimerForAP();
+    cpu_state.restore(.bsp_resume);
 }
 
 /// After an S3 resume only the BSP is running: S3 powered the APs down and the
@@ -1229,18 +1098,6 @@ pub fn endQuiesceAps() void {
     @atomicStore(bool, &quiesce_requested, false, .release);
 }
 
-/// Initialize this CPU's per-CPU register state and syscall scratch slot:
-/// IA32_TSC_AUX takes the LAPIC id for myCpuId(), user_rsp_save is zeroed.
-/// The kstack pointer itself lives in cpus[cpu_id].tss.rsp0 and is stamped
-/// by setTssRsp0 on the first per-process dispatch; until then no syscall
-/// can fire on this CPU (BSP enters user via desktop.yieldToScheduler which
-/// calls setTssRsp0 first; APs never enter user mode in this kernel).
-/// Runs on the BSP at boot and S3 resume and on every AP in apInitPerCpu.
-fn initPerCpuAsm(cpu_id: u8) void {
-    per_cpu_user_rsp[cpu_id] = 0;
-    armTscAux(cpu_id);
-}
-
 /// Store this CPU's id in IA32_TSC_AUX and prove the round trip. Runs
 /// before the IDT is loaded on this CPU (AP bring-up, S3 resume), so the
 /// write is the plain wrmsr gated on CPUID — RDTSCP present implies the
@@ -1248,37 +1105,24 @@ fn initPerCpuAsm(cpu_id: u8) void {
 /// swallows the write, an aux that reads back wrong) demotes EVERY CPU to
 /// the LAPIC ID register for the rest of the boot: global because
 /// myCpuId() must answer the same way on all of them, sticky because the
-/// BSP re-arms on S3 resume and would otherwise flip it back. Nothing on
-/// the AP path calls myCpu() before this runs (apInitPerCpu: x2APIC
-/// enable, getLapicId, sipi_acked, the two id fields, then here inside
-/// initPerCpuAsm); until then a fresh AP's aux holds whatever reset left
-/// there, which would alias it to another slot. Prints nothing (see
-/// armTscAux); false = this CPU, or an earlier one, was refused.
-fn armTscAuxQuiet(cpu_id: u8) bool {
-    if (@atomicLoad(bool, &tsc_aux_refused, .monotonic)) return false;
-    if (hasRdtscp()) {
+/// BSP re-arms on S3 resume and would otherwise flip it back.
+///
+/// A refusal is reported, and klog asks myCpuId(), which by then reads the
+/// LAPIC ID register: this CPU's `lapic_mode` has to have run (it is the
+/// entry before `identity`), or that read takes the wrong path.
+fn armTscAux(cpu_id: u8) void {
+    const refused_before = @atomicLoad(bool, &tsc_aux_refused, .monotonic);
+    if (!refused_before and hasRdtscp()) {
         msr.write(msr.TSC_AUX, cpu_id);
         if (rdtscpAux() == cpu_id) {
             if (cpu_id == 0) @atomicStore(bool, &cpu_id_via_aux, true, .release);
-            return true;
+            return;
         }
         // Don't leave a lying aux behind for a future direct rdtscp reader.
         msr.write(msr.TSC_AUX, 0);
     }
     @atomicStore(bool, &tsc_aux_refused, true, .monotonic);
     @atomicStore(bool, &cpu_id_via_aux, false, .monotonic);
-    return false;
-}
-
-/// armTscAuxQuiet plus the report. Only where this CPU can already print:
-/// after a refusal klog's myCpuId() reads the LAPIC ID register, which needs
-/// the x2APIC flag to be right and an IDT to catch a #GP — true on the boot
-/// paths and on APs (x2APIC is enabled first thing), NOT at the top of the
-/// S3 BSP path. A CPU arriving after an earlier refusal reports that too,
-/// which is how the quiet S3 arm gets its line from initPerCpuAsm(0).
-fn armTscAux(cpu_id: u8) void {
-    const refused_before = @atomicLoad(bool, &tsc_aux_refused, .monotonic);
-    if (armTscAuxQuiet(cpu_id)) return;
     debug.klog("[smp] cpu{d}: TSC_AUX {s} — myCpu() on the LAPIC ID register\n", .{
         cpu_id, if (refused_before) "refused earlier" else if (hasRdtscp()) "round trip failed" else "absent (no RDTSCP)",
     });
