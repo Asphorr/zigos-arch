@@ -297,6 +297,8 @@ pub fn writeSectorSecondary(lba: u32, src: [*]const u8) void {
     ata_lock.acquire();
     defer ata_lock.release();
     writeSectorPort(SECONDARY_PORT, 0xE0, lba, src);
+    // The read-ahead window may hold this sector as it was.
+    if (lba >= readahead_start_lba and lba - readahead_start_lba < READAHEAD_SECTORS) readahead_valid = false;
 }
 
 // === DMA read ===
