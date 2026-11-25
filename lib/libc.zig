@@ -1154,6 +1154,9 @@ pub const CRASH_UNMAPPED: u32 = 4;
 pub const CRASH_NONC: u32 = 5;
 pub const CRASH_PANIC: u32 = 6;
 pub const CRASH_SLABLOCK: u32 = 7;
+pub const CRASH_UAF: u32 = 8;
+/// Does not crash: see app/crashtest.zig.
+pub const CRASH_RACE: u32 = 9;
 pub fn debugCrash(variant: u32) u32 {
     return syscall(117, variant, 0);
 }

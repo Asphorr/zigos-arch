@@ -9,10 +9,16 @@
 //   nonc      write to non-canonical    (#GP vec 13, not #PF)
 //   panic     direct @panic              (no specific corruption — baseline)
 //   slablock  @panic under a slab cache lock (the panic path takes no lock)
+//   uaf       read of a freed heap block  (a -Dkasan kernel reports it)
+//   race      unlocked writes from two processes (a -Dkcsan kernel reports it)
 //
-// EVERY variant halts the system. Reboot to recover. There is no recovery
-// from a kernel panic and that's the entire point — this is the test that
-// validates the panic path is itself reliable.
+// Every variant but `race` halts the system. Reboot to recover. There is no
+// recovery from a kernel panic and that's the entire point — this is the
+// test that validates the panic path is itself reliable.
+//
+// `uaf` and `race` are how a sanitizer build is shown to be alive: a run
+// under one that reports nothing proves nothing until these have been
+// reported.
 //
 // The kernel answers only if built with -Ddebug-crash.
 //
@@ -36,7 +42,29 @@ const variants = [_]Variant{
     .{ .name = "nonc", .code = libc.CRASH_NONC },
     .{ .name = "panic", .code = libc.CRASH_PANIC },
     .{ .name = "slablock", .code = libc.CRASH_SLABLOCK },
+    .{ .name = "uaf", .code = libc.CRASH_UAF },
+    .{ .name = "race", .code = libc.CRASH_RACE },
 };
+
+/// Two processes in the same call at once; nothing halts.
+fn race() noreturn {
+    libc.print("[crashtest] two processes write one kernel word with no lock...\n");
+    const child = libc.fork();
+    if (child == 0xFFFFFFFF) {
+        libc.print("[crashtest] fork failed: one writer is no race\n");
+        libc.exitWith(1);
+    }
+    const rv = libc.debugCrash(libc.CRASH_RACE);
+    if (child == 0) libc.exitWith(rv);
+    _ = libc.waitpid(child, null);
+    if (rv != 0) {
+        libc.print("[crashtest] the kernel did not answer (built without -Ddebug-crash?)\n");
+        libc.exitWith(1);
+    }
+    libc.print("[crashtest] race: done; a -Dkcsan kernel has reported it in its log\n");
+    libc.klog("[crashtest] race: done\n");
+    libc.exitWith(0);
+}
 
 fn usage() noreturn {
     libc.print("usage: crashtest <");
@@ -64,6 +92,7 @@ export fn _start() linksection(".text.entry") callconv(.c) void {
 
     for (variants) |v| {
         if (argsEq(requested, v.name)) {
+            if (v.code == libc.CRASH_RACE) race();
             libc.print("[crashtest] triggering kernel '");
             libc.print(v.name);
             libc.print("' — system will panic + halt; reboot to recover.\n");

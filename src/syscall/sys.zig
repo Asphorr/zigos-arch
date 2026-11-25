@@ -321,9 +321,15 @@ pub fn sysUsbWriteSector(lba: u32, buf_ptr: u32) u32 {
 ///   6 = panic     — direct @panic("crashtest: user-requested")
 ///   7 = slablock  — @panic with a slab cache's lock held, as slab.alloc
 ///                   and slab.free do on a corrupted slab
+///   8 = uaf       — read of a freed heap block (-Dkasan reports it)
+///   9 = race      — unlocked writes to one word; two callers at once are
+///                   a race (-Dkcsan reports it). Returns 0.
 ///
-/// Returns 0xFFFFFFFF for unknown variant (the others never return —
-/// they trigger panic which halts the system).
+/// The two last are how a sanitizer build is shown to be alive: a run with
+/// no report proves nothing until one of these has drawn a report.
+///
+/// Returns 0xFFFFFFFF for unknown variant (the others, 9 aside, never
+/// return — they trigger panic which halts the system).
 pub fn sysDebugCrash(variant: u32) u32 {
     // Crashes the kernel from ring 3 on request: in a kernel built without
     // `-Ddebug-crash` it is an unimplemented syscall, or any process — a
@@ -380,7 +386,36 @@ pub fn sysDebugCrash(variant: u32) u32 {
             @panic("crashtest panic: user-requested deliberate panic");
         },
         7 => @import("../mm/slab.zig").panicLocked(),
+        8 => {
+            // uaf: a read through a pointer to a freed block. KASAN reports
+            // the load; a kernel without it notices nothing, and says so.
+            const p = heap.kalloc(64) orelse @panic("crashtest uaf: kalloc returned null");
+            heap.kfree(p);
+            const stale: *const volatile u8 = @ptrCast(p);
+            debug.klog("[crashtest] uaf: reading freed {*}...\n", .{p});
+            const read = stale.*;
+            debug.klog("[crashtest] uaf: read 0x{X:0>2}\n", .{read});
+            @panic("crashtest uaf: a read of freed memory went unnoticed (kernel built without -Dkasan?)");
+        },
+        9 => {
+            raceOnAWord();
+            return 0;
+        },
         else => return 0xFFFFFFFF,
+    }
+}
+
+/// What `crashtest race` writes, from every CPU a caller is on, with no lock.
+var raced_word: u64 = 0;
+
+/// Long enough for two callers started together to overlap. KCSAN reports
+/// the writes; nothing crashes.
+fn raceOnAWord() void {
+    var i: u32 = 0;
+    while (i < 1_000_000) : (i += 1) {
+        raced_word +%= 1;
+        // Clobbers memory: each pass is a load and a store of its own.
+        asm volatile ("pause" ::: .{ .memory = true });
     }
 }
 
