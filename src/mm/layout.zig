@@ -57,8 +57,8 @@ pub const KERNEL_VIRT_BASE: u64 = 0xFFFFFFFF80000000;
 pub var image_phys_offset: u64 = 0;
 
 /// Physmap base (PML4[256], 512 GB window mapping phys 0..PHYSMAP_SIZE). The
-/// canonical "kernel reaches any phys frame" view. Must match `pdpt_physmap`
-/// in src/boot/boot.asm and uefi/uefi_boot.zig.
+/// canonical "kernel reaches any phys frame" view. The loaders build it from
+/// lib/boot_protocol.zig; memmap.zig checks the two files agree.
 pub const PHYSMAP_BASE: u64 = 0xFFFF800000000000;
 pub const PHYSMAP_SIZE: u64 = 0x8000000000; // 512 GB (one full PML4 slot)
 
@@ -132,10 +132,11 @@ const user_boundaries = [_]Boundary{
 
 fn verify() void {
     // Kernel VA constants pinned to their known-good literals (drift guard:
-    // these MUST match linker.ld / boot.asm, which can't be cross-checked from
-    // here — so at least pin the value).
+    // KERNEL_VIRT_BASE MUST match linker.ld, which can't be cross-checked
+    // from here — so at least pin the value. The loaders' side is checked in
+    // memmap.zig, against lib/boot_protocol.zig).
     if (KERNEL_VIRT_BASE != 0xFFFFFFFF80000000) @compileError("layout: KERNEL_VIRT_BASE drifted from linker.ld value");
-    if (PHYSMAP_BASE != 0xFFFF800000000000) @compileError("layout: PHYSMAP_BASE drifted from boot.asm value");
+    if (PHYSMAP_BASE != 0xFFFF800000000000) @compileError("layout: PHYSMAP_BASE drifted from its pinned value");
     if (PHYSMAP_BASE & (PHYSMAP_SIZE - 1) != 0) @compileError("layout: PHYSMAP_BASE not aligned to PHYSMAP_SIZE");
     if (PHYSMAP_BASE < USER_CANONICAL_MAX) @compileError("layout: PHYSMAP_BASE must be in the high half");
     if (KERNEL_VIRT_BASE < USER_CANONICAL_MAX) @compileError("layout: KERNEL_VIRT_BASE must be in the high half");

@@ -1,4 +1,5 @@
 const std = @import("std");
+const boot_protocol = @import("lib/boot_protocol.zig");
 
 pub fn build(b: *std.Build) void {
     const target = b.resolveTargetQuery(.{
@@ -188,17 +189,29 @@ pub fn build(b: *std.Build) void {
     // argv tuple looks fine but means Zig never sees the file as an input —
     // the cache then keeps a stale boot.o forever, even after the asm changes.
     // (Found out the hard way switching the boot identity map to 1 GB pages.)
+    //
+    // The Multiboot entry. It builds the address space the UEFI loader
+    // builds, so the windows come from the file both loaders answer to.
     const nasm = b.addSystemCommand(&.{ "nasm", "-f", "elf64" });
+    nasm.addPrefixedDirectoryArg("-i", b.path("src/boot"));
+    nasm.addFileInput(b.path("src/boot/cpu.inc"));
+    nasm.addArgs(&.{
+        b.fmt("-DIDENTITY_GIB={d}", .{boot_protocol.IDENTITY_SIZE >> 30}),
+        b.fmt("-DPHYSMAP_GIB={d}", .{boot_protocol.PHYSMAP_SIZE >> 30}),
+        b.fmt("-DPHYSMAP_BASE=0x{X}", .{boot_protocol.PHYSMAP_BASE}),
+        b.fmt("-DKERNEL_VIRT_BASE=0x{X}", .{boot_protocol.KERNEL_VIRT_BASE}),
+    });
     nasm.addFileArg(b.path("src/boot/boot.asm"));
     nasm.addArg("-o");
     const boot_obj = nasm.addOutputFileArg("boot.o");
     kernel.root_module.addObjectFile(boot_obj);
 
     // AP startup and S3 wake trampolines: one body, src/boot/trampoline.inc.
-    // The .inc is an input of its own, for the same cache reason as above.
+    // The .inc files are inputs of their own, for the same cache reason.
     const nasm_ap = b.addSystemCommand(&.{ "nasm", "-f", "elf64" });
     nasm_ap.addPrefixedDirectoryArg("-i", b.path("src/boot"));
     nasm_ap.addFileInput(b.path("src/boot/trampoline.inc"));
+    nasm_ap.addFileInput(b.path("src/boot/cpu.inc"));
     nasm_ap.addFileArg(b.path("src/boot/ap_trampoline.asm"));
     nasm_ap.addArg("-o");
     const ap_obj = nasm_ap.addOutputFileArg("ap_trampoline.o");
@@ -207,6 +220,7 @@ pub fn build(b: *std.Build) void {
     const nasm_wake = b.addSystemCommand(&.{ "nasm", "-f", "elf64" });
     nasm_wake.addPrefixedDirectoryArg("-i", b.path("src/boot"));
     nasm_wake.addFileInput(b.path("src/boot/trampoline.inc"));
+    nasm_wake.addFileInput(b.path("src/boot/cpu.inc"));
     nasm_wake.addFileArg(b.path("src/boot/wake_trampoline.asm"));
     nasm_wake.addArg("-o");
     const wake_obj = nasm_wake.addOutputFileArg("wake_trampoline.o");

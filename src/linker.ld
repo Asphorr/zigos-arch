@@ -1,24 +1,13 @@
 /* x86_64 higher-half kernel — linker script.
  *
- * Phase 1 of the higher-half migration:
- *   - .boot/.boot.bss/.boot.rodata sections live at LOW phys = LOW VA.
- *     They contain the 32-bit/early-64-bit trampoline (boot.asm), the
- *     multiboot header, the bootstrap stack, and the boot-time page tables.
- *     boot.asm runs from here in 32-bit mode where high VAs aren't reachable.
- *   - The rest of the kernel (.text/.rodata/.data/.kdata_protected/.bss)
- *     links at the canonical kernel VA `KERNEL_VIRT_BASE = 0xFFFFFFFF80000000`
- *     while still LOADING (LMA) at low phys, contiguous with .boot.
- *
- * boot.asm sets up PML4[0]->low-PDPT (existing 64×1GB identity) AND
- * PML4[511]->high-PDPT (kernel image at -2GB), then far-jumps to the high
- * VA of long_mode_entry's tail, where it can `call kmain` (which now lives
- * at high VA). Symbols __bss_phys_{start,end} below give boot.asm low-phys
- * aliases for the kernel-proper BSS so the BSS-zero loop can still run from
- * 32-bit code.
- *
- * Phase 2 will add a real physmap and start migrating phys-direct accesses
- * through paging.physToVirt; once those are gone we can drop PML4[0]
- * entirely. Until then, the low identity map stays.
+ * Two parts, loaded back to back:
+ *   - .boot.text / .boot.data: the Multiboot entry (src/boot/boot.asm) with
+ *     its header, page tables and GDT. Linked where it is loaded, at low
+ *     addresses: it runs in 32-bit mode with paging off. Dead weight under
+ *     UEFI, whose loader builds its own tables.
+ *   - the kernel proper (.text .. .bss): linked at KERNEL_VIRT_BASE, loaded
+ *     right behind the boot part. A loader maps it there: boot.asm, or
+ *     uefi/handoff.zig at whatever physical address the firmware had room.
  */
 
 OUTPUT_FORMAT(elf64-x86-64)
@@ -32,13 +21,12 @@ KERNEL_VIRT_BASE = 0xFFFFFFFF80000000;
 SECTIONS {
     . = KERNEL_PHYS_BASE;
 
-    /* ===== Boot trampoline — runs at LOW phys = LOW VA =====
-     * Three separate output sections so each gets the right flags:
-     *   .boot.text   AX  (multiboot header + 32-bit/early-64 boot code)
-     *   .boot.rodata A   (boot-only GDT + GDTR)
-     *   .boot.bss    AW  (boot-only BSS — page tables + boot stack)
-     * Merging them into one section made LLD strip the X flag from the
-     * combined segment, so _start would be loaded RO and execution faulted.
+    /* ===== The Multiboot entry — linked where it is loaded =====
+     * Two output sections, so each gets its flags: merged into one, LLD
+     * dropped the X flag and _start was loaded non-executable.
+     *   .boot.text   AX  the Multiboot header (a loader looks for it in the
+     *                    file's first 8 KiB) and the code
+     *   .boot.data   AW  page tables, GDT, messages
      */
     .boot.text ALIGN(4K) : {
         __boot_start = .;
@@ -46,17 +34,10 @@ SECTIONS {
         *(.text.boot)
         *(.text.boot.*)
     }
-    .boot.rodata ALIGN(4K) : {
-        *(.rodata.boot)
-        *(.rodata.boot.*)
-    }
-    .boot.bss ALIGN(4K) : {
-        __boot_bss_start = .;
-        *(.bss.boot)
-        *(.bss.boot.*)
+    .boot.data ALIGN(4K) : {
+        *(.data.boot)
+        *(.data.boot.*)
         . = ALIGN(4K);
-        __boot_bss_end = .;
-        __boot_end = .;
     }
 
     /* ===== Kernel proper — VMA at high half, LMA continues at low phys ===== */
@@ -99,12 +80,13 @@ SECTIONS {
     /* The image's first byte as the image window shows it (memmap.zig). */
     __kernel_image_start = __boot_start + KERNEL_VIRT_BASE;
 
-    /* Phys-address aliases for boot.asm. boot.asm runs in 32-bit mode and
-     * cannot dereference high VAs; it uses these to zero high-half BSS
-     * via the low identity map (phys = virt - KERNEL_VIRT_BASE). Multiboot
-     * loads the image at its link addresses, so there the two agree. */
+    /* For boot.asm, which runs with paging off and cannot name a kernel
+     * address: the same places as Multiboot loads them, at the image's
+     * link addresses. It zeroes .bss and maps the image by these. */
     __bss_phys_start = __bss_start - KERNEL_VIRT_BASE;
     __bss_phys_end = __bss_end - KERNEL_VIRT_BASE;
+    __image_phys_start = __boot_start;
+    __image_phys_end = _kernel_end - KERNEL_VIRT_BASE;
 
     /* A loader maps the image through one page directory: 1 GiB of window. */
     ASSERT(__bss_phys_end <= 1024M, "kernel image outgrew its 1 GiB window")

@@ -63,7 +63,7 @@ pub const Range = struct {
 /// there; `paging.virtToPhys` turns one into a physical address.
 pub const KERNEL_VIRT_BASE: usize = layout.KERNEL_VIRT_BASE;
 
-/// Physmap base — must match `pdpt_physmap` slot in boot.asm. Maps phys
+/// Physmap base. Maps phys
 /// 0..PHYSMAP_SIZE at VA `PHYSMAP_BASE..PHYSMAP_BASE+PHYSMAP_SIZE`. The
 /// canonical "kernel can read/write any phys frame" view in Phase 2+. Use
 /// `paging.physToVirt(p)` rather than the bare constant whenever possible.
@@ -72,8 +72,8 @@ pub const KERNEL_VIRT_BASE: usize = layout.KERNEL_VIRT_BASE;
 /// 4 KB PDPT page = 512 × 1 GB entries). Smaller windows leave high-phys
 /// MMIO BARs unmapped (e.g. xHCI BAR at ~481 GB under `-cpu host` with
 /// 39-bit maxphyaddr) and the bare physToVirt() result page-faults.
-/// `pdpt_physmap` in src/boot/boot.asm and uefi/uefi_boot.zig must fill
-/// all 512 entries to match.
+/// Both loaders (src/boot/boot.asm, uefi/handoff.zig) build the window
+/// from lib/boot_protocol.zig; the comptime block below holds these to it.
 pub const PHYSMAP_BASE: usize = layout.PHYSMAP_BASE;
 pub const PHYSMAP_SIZE: usize = layout.PHYSMAP_SIZE; // 512 GB (full PML4 slot)
 

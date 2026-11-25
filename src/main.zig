@@ -82,16 +82,42 @@ export fn kmain(magic: u64, info: *multiboot.MultibootInfo) noreturn {
     kernelMain(&boot_info);
 }
 
-/// The BSP's stack from the UEFI entry on. Ours: the loader's is firmware
-/// memory, which the PMM is about to hand out.
-const UEFI_BOOT_STACK_SIZE = 64 * 1024;
-export var uefi_boot_stack: [UEFI_BOOT_STACK_SIZE]u8 align(16) = undefined;
+/// The BSP's stack from either loader's handoff until its first task
+/// (sched.enterFirstTask). Ours: the UEFI loader's is firmware memory, which
+/// the PMM is about to hand out, and boot.asm hands over none. In .bss, so
+/// it starts zeroed, which bootStackUsed counts on. Nothing guards the low
+/// end, so kernelMain reports how deep boot got before it leaves the stack.
+const BOOT_STACK_SIZE = 64 * 1024;
+export var boot_stack: [BOOT_STACK_SIZE]u8 align(16) = undefined;
+
+/// An entry's first two instructions: onto the boot stack, no frame above.
+const ENTER_BOOT_STACK = "leaq boot_stack+" ++ std.fmt.comptimePrint("{d}", .{BOOT_STACK_SIZE}) ++ "(%%rip), %%rsp\n" ++
+    "xorl %%ebp, %%ebp\n";
+
+/// The boot stack's bytes that were ever written, counted from its low end
+/// up to the first one that is not zero. Through a pointer and out of line:
+/// indexing the array itself, inlined, left a copy of all of it in the
+/// caller's frame — on the very stack it measures.
+noinline fn bootStackUsed() usize {
+    const bytes: [*]const volatile u8 = @ptrCast(&boot_stack);
+    var untouched: usize = 0;
+    while (untouched < BOOT_STACK_SIZE and bytes[untouched] == 0) untouched += 1;
+    return BOOT_STACK_SIZE - untouched;
+}
+
+/// Multiboot entry point: boot.asm jumps here in long mode, the loader's
+/// magic in edi and its info structure in esi.
+export fn multiboot_entry() callconv(.naked) noreturn {
+    asm volatile (ENTER_BOOT_STACK ++
+            \\ call kmain
+            \\ ud2
+        );
+}
 
 /// UEFI entry point: the loader jumps here after ExitBootServices with
 /// BootInfo in rdi (lib/boot_protocol.zig).
 fn uefiEntry() callconv(.naked) noreturn {
-    asm volatile ("leaq uefi_boot_stack+" ++ std.fmt.comptimePrint("{d}", .{UEFI_BOOT_STACK_SIZE}) ++ "(%%rip), %%rsp\n" ++
-            \\ xorl %%ebp, %%ebp
+    asm volatile (ENTER_BOOT_STACK ++
             \\ call uefiMain
             \\ ud2
         );
@@ -105,8 +131,7 @@ comptime {
 /// it such a loader jumps to the ELF entry point, which is the 32-bit
 /// Multiboot code; with it the mismatch ends here, in one line on serial.
 export fn kmain_uefi() callconv(.naked) noreturn {
-    asm volatile ("leaq uefi_boot_stack+" ++ std.fmt.comptimePrint("{d}", .{UEFI_BOOT_STACK_SIZE}) ++ "(%%rip), %%rsp\n" ++
-            \\ xorl %%ebp, %%ebp
+    asm volatile (ENTER_BOOT_STACK ++
             \\ call refuseUnversionedLoader
             \\ ud2
         );
@@ -771,6 +796,14 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
         else => @intFromPtr(&desktop_mod.taskEntry),
     };
     debug.klog("[boot] boot_mode={d} (param={d}) entry=0x{X:0>16}\n", .{ live_mode, boot_info.boot_mode, entry });
+    // The boot stack's whole life is behind it here. Used to the last page
+    // means boot ran past its end, over whatever .bss lies below.
+    {
+        const used = bootStackUsed();
+        debug.klog("[boot] boot stack: {d} of {d} KiB used\n", .{ (used + 1023) / 1024, BOOT_STACK_SIZE / 1024 });
+        if (BOOT_STACK_SIZE - used < 4096) @panic("boot overran its stack: raise BOOT_STACK_SIZE");
+        if (used > BOOT_STACK_SIZE / 4 * 3) debug.kwarn(@src(), "boot stack three quarters used ({d} KiB): raise BOOT_STACK_SIZE", .{used / 1024});
+    }
     // enterFirstTask switches stacks with interrupts off; the desktop and the
     // installer turn them back on themselves, the selftest/stress entries go
     // through bootTaskWithIrqs.

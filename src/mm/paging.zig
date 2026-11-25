@@ -227,7 +227,7 @@ pub fn isMapped(addr: u64) bool {
 }
 
 // --- PML4 address ---
-// Set during boot from either Multiboot (boot.asm's extern symbol) or UEFI (BootInfo).
+// The loader's tables: BootInfo.pml4_phys.
 var pml4_addr: usize = 0;
 
 /// Return the physical address of the kernel PML4.
@@ -831,12 +831,11 @@ fn shootdownIfPostBoot(comptime site: []const u8) void {
 /// window at -2 GB.
 ///
 /// Caller contract:
-///   - Must run on a kstack at HIGH VA (kstack_pool in kernel BSS, or a
-///     heap-allocated kstack which sits in the physmap window). The boot
-///     stack lives in `.bss.boot` at low phys = low VA — running this from
-///     the boot stack would unmap the very stack we're standing on. The
-///     intended call site is the desktop kernel task's entry, which gets
-///     dispatched onto a high-VA kstack by `enterFirstTask`.
+///   - Nothing the caller still uses may be reached through a low address.
+///     Stacks never are: the boot stack is in the kernel's .bss (main.zig),
+///     task stacks in the pool or the physmap. What boot does reach that
+///     way is the loader's — BootInfo, the Multiboot info, the first GDT —
+///     so the call belongs where boot is over: the first task's entry.
 ///   - Per-process page tables are unaffected (each process owns its own
 ///     PML4[0]). Kernel tasks share the kernel master CR3, so they see
 ///     this change immediately on TLB flush. APs are already running on
