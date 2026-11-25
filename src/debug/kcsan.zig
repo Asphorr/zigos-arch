@@ -20,6 +20,11 @@
 //!         overlaps any OTHER cpu's active watchpoint, atomically clear
 //!         that slot and report (instrumented-vs-instrumented race).
 //!
+//!    A watchpoint sits on kernel data only (`watchable`), and interrupts
+//!    are off for its window: what changes the value is another CPU, not a
+//!    handler on this one. A volatile access sets none up — the code says
+//!    the memory changes under it — but is checked against the others'.
+//!
 //! Cost of full instrumentation: ~5–10× slowdown when active. For bug
 //! hunts only — never ship with this on by default.
 //!
@@ -32,11 +37,17 @@
 //!     log and continue (good for soak).
 
 const std = @import("std");
+const build_options = @import("build_options");
 const debug = @import("debug.zig");
 const serial = @import("serial.zig");
+const symbols = @import("symbols.zig");
 const smp = @import("../cpu/smp.zig");
+const memmap = @import("../mm/memmap.zig");
+const vmalloc = @import("../mm/vmalloc.zig");
 
-pub const ENABLE: bool = true;
+/// Both layers are a -Dkcsan build's. The manual checks pause too, and they
+/// sit on the dispatch path.
+pub const ENABLE: bool = build_options.kcsan_enabled;
 
 /// Set true once the watchpoint table + per-CPU storage are wired and
 /// safe to call. Until then the compiler-emitted __tsan_* hooks no-op.
@@ -71,21 +82,99 @@ inline fn currentCpuId() u8 {
     return smp.myCpuId();
 }
 
+inline fn irqSave() u64 {
+    var flags: u64 = undefined;
+    asm volatile ("pushfq; pop %[f]; cli"
+        : [f] "=r" (flags),
+    );
+    return flags;
+}
+
+inline fn irqRestore(flags: u64) void {
+    if (flags & 0x200 != 0) asm volatile ("sti");
+}
+
+// =============================================================================
+// What may be watched
+// =============================================================================
+
+const Span = struct {
+    lo: u64 = 0,
+    hi: u64 = 0,
+
+    inline fn has(span: Span, addr: u64) bool {
+        return addr >= span.lo and addr < span.hi;
+    }
+};
+
+/// The loader's usable regions as the physmap shows them. A map with more
+/// runs than this leaves the rest unwatched.
+const MAX_RAM_SPANS = 32;
+var ram_spans: [MAX_RAM_SPANS]Span = undefined;
+var ram_span_count: usize = 0;
+/// The scanout and the back buffer: drawn into and read at once, by design.
+var pixel_spans: [2]Span = .{ .{}, .{} };
+var image_span: Span = .{};
+
+fn physmapSpan(base: u64, end: u64) Span {
+    return .{ .lo = memmap.PHYSMAP_BASE + base, .hi = memmap.PHYSMAP_BASE + end };
+}
+
+fn learnMemory() void {
+    image_span = .{ .lo = memmap.KERNEL_VIRT_BASE, .hi = memmap.kernelEnd() };
+
+    const fb = memmap.guestFb();
+    const back = memmap.backBuffer();
+    pixel_spans = .{ physmapSpan(fb.base, fb.end()), physmapSpan(back.base, back.end()) };
+
+    ram_span_count = 0;
+    for (memmap.bootMap()) |region| {
+        if (region.kind != .usable or region.base >= memmap.PHYSMAP_SIZE) continue;
+        const span = physmapSpan(region.base, @min(region.base +| region.length, memmap.PHYSMAP_SIZE));
+        if (ram_span_count != 0 and ram_spans[ram_span_count - 1].hi == span.lo) {
+            ram_spans[ram_span_count - 1].hi = span.hi;
+            continue;
+        }
+        if (ram_span_count == MAX_RAM_SPANS) break;
+        ram_spans[ram_span_count] = span;
+        ram_span_count += 1;
+    }
+}
+
+/// Whether a watchpoint may sit on `addr`: kernel data — the image, RAM
+/// through the physmap, the vmalloc arena. Not a process's memory, which
+/// its threads write whenever they like; not device memory, which the
+/// resample would read twice more than the code does; not the pixels.
+fn watchable(addr: u64) bool {
+    if (addr < memmap.PHYSMAP_BASE) return false;
+    // Nothing lies above the image window.
+    if (addr >= image_span.lo) return addr < image_span.hi;
+    if (addr -% vmalloc.VMALLOC_BASE < vmalloc.VMALLOC_SIZE) return true;
+    for (pixel_spans) |span| {
+        if (span.has(addr)) return false;
+    }
+    for (ram_spans[0..ram_span_count]) |span| {
+        if (span.has(addr)) return true;
+    }
+    return false;
+}
+
 // =============================================================================
 // Watchpoint table
 // =============================================================================
 //
 // Encoded form (single u64 for atomic CAS):
-//   bits  0..47 = addr (canonical lower-half VAs only — kernel data lives below
-//                 0x0000_8000_0000_0000)
+//   bits  0..47 = the address's low 48 bits; a canonical address is their
+//                 sign extension
 //   bits 48..62 = size (15 bits, plenty for 16-byte max access)
 //   bit       63 = is_write
 //
 // Empty slot = 0. Encoding 0 is impossible for a real address since size>0.
 
-const ENC_SIZE_SHIFT: u6 = 48;
+const ENC_ADDR_BITS: u6 = 48;
+const ENC_SIZE_SHIFT: u6 = ENC_ADDR_BITS;
 const ENC_WRITE_BIT: u64 = 1 << 63;
-const ENC_ADDR_MASK: u64 = (1 << 48) - 1;
+const ENC_ADDR_MASK: u64 = (1 << ENC_ADDR_BITS) - 1;
 const ENC_SIZE_MASK: u64 = 0x7FFF << ENC_SIZE_SHIFT;
 
 inline fn encodeWp(addr: u64, size: u8, is_write: bool) u64 {
@@ -96,7 +185,8 @@ inline fn encodeWp(addr: u64, size: u8, is_write: bool) u64 {
 }
 
 inline fn wpAddr(enc: u64) u64 {
-    return enc & ENC_ADDR_MASK;
+    const dropped: u6 = 63 - ENC_ADDR_BITS + 1;
+    return @bitCast(@as(i64, @bitCast(enc << dropped)) >> dropped);
 }
 inline fn wpSize(enc: u64) u8 {
     return @intCast((enc & ENC_SIZE_MASK) >> ENC_SIZE_SHIFT);
@@ -108,7 +198,10 @@ inline fn wpIsWrite(enc: u64) bool {
 /// Per-CPU single-slot watchpoint. Cache-padded to avoid false sharing.
 const WatchSlot = extern struct {
     encoded: u64 align(64) = 0,
-    _pad: [56]u8 = [_]u8{0} ** 56,
+    /// Where the watching access is, for the report of whoever trips it.
+    /// Written before `encoded`, so a set slot has its own.
+    site: u64 = 0,
+    _pad: [48]u8 = [_]u8{0} ** 48,
 };
 
 var watchpoints: [MAX_CPUS]WatchSlot = [_]WatchSlot{.{}} ** MAX_CPUS;
@@ -136,106 +229,147 @@ inline fn shouldSample() bool {
 // Race report
 // =============================================================================
 
-// Low-stack hex emitters. Formatted serial.print pulls in std.fmt + bufPrint,
-// which (a) burns 600+ bytes of kstack per call, and (b) goes through
-// llvm.memcpy → __tsan_memcpy → checkAccess → could re-enter the runtime.
-// These write directly via serial.write([]const u8), no allocator, no fmt.
+/// A report is one line built on the stack and written in one call: whole
+/// under serial's lock, and without std.fmt, whose 600+ bytes of kstack and
+/// memcpy calls an access hook has no room for.
+const Line = struct {
+    buf: [320]u8 = undefined,
+    len: usize = 0,
 
-inline fn emitHex(v: u64) void {
-    const hexchars = "0123456789ABCDEF";
-    var buf: [18]u8 = undefined;
-    buf[0] = '0';
-    buf[1] = 'x';
-    var i: usize = 16;
-    var x = v;
-    while (i > 0) {
-        i -= 1;
-        buf[2 + i] = hexchars[x & 0xF];
-        x >>= 4;
+    fn str(line: *Line, text: []const u8) void {
+        for (text) |c| {
+            if (line.len == line.buf.len) return;
+            line.buf[line.len] = c;
+            line.len += 1;
+        }
     }
-    serial.write(&buf);
-}
 
-inline fn emitDec(v: u64) void {
-    if (v == 0) {
-        serial.write("0");
-        return;
+    /// At least `min_digits` of them.
+    fn hex(line: *Line, v: u64, min_digits: u6) void {
+        const digits = "0123456789ABCDEF";
+        line.str("0x");
+        var i: u6 = 16;
+        while (i > 0) {
+            i -= 1;
+            const nibble: usize = @intCast((v >> (i * 4)) & 0xF);
+            if (nibble == 0 and i >= min_digits and (v >> (i * 4)) == 0) continue;
+            line.str(digits[nibble..][0..1]);
+        }
     }
-    var buf: [20]u8 = undefined;
-    var i: usize = 20;
-    var x = v;
-    while (x > 0) {
-        i -= 1;
-        buf[i] = @intCast(@as(u64, '0') + (x % 10));
-        x /= 10;
+
+    fn dec(line: *Line, v: u64) void {
+        var digits: [20]u8 = undefined;
+        var i: usize = digits.len;
+        var rest = v;
+        while (true) {
+            i -= 1;
+            digits[i] = @intCast('0' + rest % 10);
+            rest /= 10;
+            if (rest == 0) break;
+        }
+        line.str(digits[i..]);
     }
-    serial.write(buf[i..]);
+
+    /// "W sz=8 addr=0x… at function+0x…": the function once the symbol
+    /// table is loaded, the bare address until then.
+    fn access(line: *Line, is_write: bool, size: u8, addr: u64, site: u64) void {
+        line.str(if (is_write) "W sz=" else "R sz=");
+        line.dec(size);
+        line.str(" addr=");
+        line.hex(addr, 16);
+        if (site == 0) return;
+        line.str(" at ");
+        if (symbols.resolveKernel(site)) |hit| {
+            line.str(hit.name);
+            line.str("+");
+            line.hex(hit.offset, 1);
+        } else {
+            line.hex(site, 16);
+        }
+    }
+
+    fn write(line: *Line) void {
+        serial.write(line.buf[0..line.len]);
+    }
+};
+
+/// A pair of places is reported once: a race on a hot path would bury the
+/// log under its own repeats.
+const SEEN_SLOTS = 256;
+var seen: [SEEN_SLOTS]u64 = [_]u64{0} ** SEEN_SLOTS;
+var seen_full_said: bool = false;
+
+/// Whether this pair of sites is new, taking its slot if so. Lock-free: a
+/// report comes from any context on any CPU.
+fn firstSight(site_a: u64, site_b: u64) bool {
+    const lo = @min(site_a, site_b);
+    const hi = @max(site_a, site_b);
+    // Odd, so never the empty slot's 0.
+    const key: u64 = ((lo *% 0x9E3779B97F4A7C15) ^ hi) | 1;
+    const start: usize = @intCast((key >> 32) % SEEN_SLOTS);
+    for (0..SEEN_SLOTS) |probe| {
+        const slot = &seen[(start + probe) % SEEN_SLOTS];
+        const there = @cmpxchgStrong(u64, slot, 0, key, .acq_rel, .acquire) orelse return true;
+        if (there == key) return false;
+    }
+    if (@cmpxchgStrong(bool, &seen_full_said, false, true, .acq_rel, .acquire) == null) {
+        serial.write("[kcsan] " ++ std.fmt.comptimePrint("{d}", .{SEEN_SLOTS}) ++ " distinct races reported; no more will be\n");
+    }
+    return false;
 }
 
-inline fn emitWR(is_write: bool) void {
-    serial.write(if (is_write) "W" else "R");
+fn afterReport(comptime what: []const u8) void {
+    if (!PANIC_ON_HIT) return;
+    // The panic path is instrumented code.
+    shutdown();
+    @panic("kcsan: " ++ what);
 }
 
-fn reportResample(addr: u64, size: u8, is_write: bool, before: u64, after: u64) void {
-    // Disable runtime first — in case PANIC_ON_HIT triggers further code on
-    // an instrumented path, we don't want recursion. Also covers the case
-    // where serial.write itself contains an instrumented memcpy.
-    RUNTIME_ACTIVE = false;
-    serial.write("\n!!! KCSAN race (resample) cpu=");
-    emitDec(currentCpuId());
-    serial.write(" ");
-    emitWR(is_write);
-    serial.write(" sz=");
-    emitDec(size);
-    serial.write(" addr=");
-    emitHex(addr);
-    serial.write(" before=");
-    emitHex(before);
-    serial.write(" after=");
-    emitHex(after);
-    serial.write("\n");
-    if (PANIC_ON_HIT) @panic("kcsan: concurrent access detected (resample)");
-    RUNTIME_ACTIVE = true;
+fn reportResample(addr: u64, size: u8, is_write: bool, site: u64, before: u64, after: u64) void {
+    if (!firstSight(site, 0)) return;
+    var line: Line = .{};
+    line.str("\n!!! KCSAN race (resample) cpu=");
+    line.dec(currentCpuId());
+    line.str(" ");
+    line.access(is_write, size, addr, site);
+    line.str(" before=");
+    line.hex(before, 1);
+    line.str(" after=");
+    line.hex(after, 1);
+    line.str("\n");
+    line.write();
+    afterReport("concurrent access detected (resample)");
 }
 
-fn reportCrossCpu(my_addr: u64, my_size: u8, my_write: bool, other_cpu: u8, other_enc: u64) void {
-    RUNTIME_ACTIVE = false;
-    serial.write("\n!!! KCSAN race (cross-cpu) cpu=");
-    emitDec(currentCpuId());
-    serial.write(" ");
-    emitWR(my_write);
-    serial.write(" sz=");
-    emitDec(my_size);
-    serial.write(" addr=");
-    emitHex(my_addr);
-    serial.write("  VS cpu=");
-    emitDec(other_cpu);
-    serial.write(" ");
-    emitWR(wpIsWrite(other_enc));
-    serial.write(" sz=");
-    emitDec(wpSize(other_enc));
-    serial.write(" addr=");
-    emitHex(wpAddr(other_enc));
-    serial.write("\n");
-    if (PANIC_ON_HIT) @panic("kcsan: concurrent access detected (cross-cpu)");
-    RUNTIME_ACTIVE = true;
+fn reportCrossCpu(my_addr: u64, my_size: u8, my_write: bool, my_site: u64, other_cpu: u8, other_enc: u64, other_site: u64) void {
+    if (!firstSight(my_site, other_site)) return;
+    var line: Line = .{};
+    line.str("\n!!! KCSAN race (cross-cpu) cpu=");
+    line.dec(currentCpuId());
+    line.str(" ");
+    line.access(my_write, my_size, my_addr, my_site);
+    line.str("  VS cpu=");
+    line.dec(other_cpu);
+    line.str(" ");
+    line.access(wpIsWrite(other_enc), wpSize(other_enc), wpAddr(other_enc), other_site);
+    line.str("\n");
+    line.write();
+    afterReport("concurrent access detected (cross-cpu)");
 }
 
-fn report(comptime name: []const u8, addr_val: u64, before: u64, after: u64) void {
-    RUNTIME_ACTIVE = false;
-    serial.write("[kcsan] manual RACE on '");
-    serial.write(name);
-    serial.write("' addr=");
-    emitHex(addr_val);
-    serial.write(" cpu=");
-    emitDec(currentCpuId());
-    serial.write(" before=");
-    emitHex(before);
-    serial.write(" after=");
-    emitHex(after);
-    serial.write("\n");
-    if (PANIC_ON_HIT) @panic("kcsan: concurrent-write race detected");
-    RUNTIME_ACTIVE = true;
+fn reportManual(comptime name: []const u8, addr_val: u64, before: u64, after: u64) void {
+    var line: Line = .{};
+    line.str("[kcsan] manual RACE on '" ++ name ++ "' addr=");
+    line.hex(addr_val, 16);
+    line.str(" cpu=");
+    line.dec(currentCpuId());
+    line.str(" before=");
+    line.hex(before, 1);
+    line.str(" after=");
+    line.hex(after, 1);
+    line.str("\n");
+    line.write();
+    afterReport("concurrent-write race detected");
 }
 
 // =============================================================================
@@ -250,52 +384,53 @@ inline fn rangesOverlap(a_addr: u64, a_size: u8, b_addr: u64, b_size: u8) bool {
 /// active watchpoint, atomically clear it and report a cross-CPU race.
 /// Cold path — guarded by armed_count > 0 in checkAccess. Out-of-line so
 /// the hot path is just a global load + branch, not a 32-iteration loop.
-fn checkAgainstWatchpointsCold(addr: u64, size: u8, is_write: bool) void {
+fn checkAgainstWatchpointsCold(addr: u64, size: u8, is_write: bool, site: u64) void {
     const my_cpu = currentCpuId();
     for (0..MAX_CPUS) |cpu_idx| {
         if (cpu_idx == my_cpu) continue;
-        const slot = &watchpoints[cpu_idx].encoded;
-        const enc = @atomicLoad(u64, slot, .acquire);
+        const slot = &watchpoints[cpu_idx];
+        const enc = @atomicLoad(u64, &slot.encoded, .acquire);
         if (enc == 0) continue;
-        const other_addr = wpAddr(enc);
-        const other_size = wpSize(enc);
-        const other_write = wpIsWrite(enc);
-        if (!rangesOverlap(addr, size, other_addr, other_size)) continue;
-        if (!is_write and !other_write) continue;
-        if (@cmpxchgStrong(u64, slot, enc, 0, .acq_rel, .acquire) == null) {
+        if (!rangesOverlap(addr, size, wpAddr(enc), wpSize(enc))) continue;
+        if (!is_write and !wpIsWrite(enc)) continue;
+        const other_site = @atomicLoad(u64, &slot.site, .monotonic);
+        if (@cmpxchgStrong(u64, &slot.encoded, enc, 0, .acq_rel, .acquire) == null) {
             _ = @atomicRmw(u32, &armed_count, .Sub, 1, .acq_rel);
-            reportCrossCpu(addr, size, is_write, @intCast(cpu_idx), enc);
+            reportCrossCpu(addr, size, is_write, site, @intCast(cpu_idx), enc, other_site);
         }
     }
 }
 
 /// Set our slot, read `before`, pause, read `after`. If our slot is still
 /// occupied (no one cleared it) and the value changed, report.
-fn setupWatchpointAndResampleCold(addr: u64, size: u8, is_write: bool) void {
-    const cpu = currentCpuId();
-    const slot = &watchpoints[cpu].encoded;
+fn setupWatchpointAndResampleCold(addr: u64, size: u8, is_write: bool, site: u64) void {
+    // Off for the window: a handler on this CPU would change the value
+    // itself, or sample and take the slot from under this one.
+    const flags = irqSave();
+    const slot = &watchpoints[currentCpuId()];
     const enc = encodeWp(addr, size, is_write);
-    @atomicStore(u64, slot, enc, .release);
+    @atomicStore(u64, &slot.site, site, .monotonic);
+    @atomicStore(u64, &slot.encoded, enc, .release);
     _ = @atomicRmw(u32, &armed_count, .Add, 1, .acq_rel);
 
+    // The hook runs before its access: a write's old value is still there,
+    // and another CPU's write over it shows the same way a read's does.
     var before: u64 = 0;
     var after: u64 = 0;
-    var did_resample = false;
-    if (!is_write and size <= 8) {
+    if (size <= 8) {
         before = readUpTo8(addr, size);
         pauseSpin(PAUSE_LOOPS);
         after = readUpTo8(addr, size);
-        did_resample = true;
     } else {
         pauseSpin(PAUSE_LOOPS);
     }
 
-    const cleared = @cmpxchgStrong(u64, slot, enc, 0, .acq_rel, .acquire);
-    if (cleared != null) return; // someone caught us, they reported (and decremented armed_count)
-    _ = @atomicRmw(u32, &armed_count, .Sub, 1, .acq_rel);
-    if (did_resample and before != after) {
-        reportResample(addr, size, is_write, before, after);
-    }
+    // A slot someone else cleared is a race they caught: they reported it
+    // and took armed_count down.
+    const ours = @cmpxchgStrong(u64, &slot.encoded, enc, 0, .acq_rel, .acquire) == null;
+    if (ours) _ = @atomicRmw(u32, &armed_count, .Sub, 1, .acq_rel);
+    irqRestore(flags);
+    if (ours and before != after) reportResample(addr, size, is_write, site, before, after);
 }
 
 inline fn readUpTo8(addr: u64, size: u8) u64 {
@@ -305,34 +440,23 @@ inline fn readUpTo8(addr: u64, size: u8) u64 {
     return (p.* >> off) & mask;
 }
 
-/// Range filter — only watch addresses inside the kernel data ranges we
-/// expect to actually share. Skip MMIO, user VAs, anything obviously out
-/// of bounds. Cuts noise and avoids touching unmapped pages.
-inline fn addrInteresting(addr: u64) bool {
-    // Kernel image + heap + stacks live in the low identity-mapped region.
-    // 0x100000 (1 MB) up to 0x1000_0000 (256 MB) covers them; same range
-    // KASAN's REGION_LO/HI uses.
-    return addr >= 0x100000 and addr < 0x1000_0000;
-}
-
 /// The hot path called from every __tsan_readN / __tsan_writeN. Goal:
 /// stay under ~5 cycles in the no-watchpoints-armed case (which is >99% of
-/// calls). All cold work is out-of-line.
-inline fn checkAccess(addr: u64, size: u8, is_write: bool) void {
+/// calls). All cold work is out-of-line. `site` is the access's own code.
+inline fn checkAccess(addr: u64, size: u8, is_write: bool, comptime may_watch: bool, site: u64) void {
     if (!RUNTIME_ACTIVE) return;
     // Global short-circuit: if NO cpu has a watchpoint armed, the cross-CPU
     // walk is guaranteed to find nothing. Skip it. Atomic-relaxed load is a
     // single mov on x86 — no fences. The bump/decrement in the cold paths
-    // uses .acq_rel so updates are eventually visible.
-    if (@atomicLoad(u32, &armed_count, .monotonic) != 0) {
-        if (addrInteresting(addr)) {
-            @call(.never_inline, checkAgainstWatchpointsCold, .{ addr, size, is_write });
-        }
+    // uses .acq_rel so updates are eventually visible. A watchpoint is on
+    // kernel data, so an address below the kernel's half overlaps none.
+    if (@atomicLoad(u32, &armed_count, .monotonic) != 0 and addr >= memmap.PHYSMAP_BASE) {
+        @call(.never_inline, checkAgainstWatchpointsCold, .{ addr, size, is_write, site });
     }
     // Sampling: atomic counter % SAMPLE_DENOM. Locked xadd is ~25 cycles
     // but only the rare branch reaches the cold setup path with the pause.
-    if (shouldSample() and addrInteresting(addr)) {
-        @call(.never_inline, setupWatchpointAndResampleCold, .{ addr, size, is_write });
+    if (may_watch and shouldSample() and watchable(addr)) {
+        @call(.never_inline, setupWatchpointAndResampleCold, .{ addr, size, is_write, site });
     }
 }
 
@@ -348,43 +472,48 @@ comptime {
     for (sizes) |sz| {
         const Hooks = struct {
             fn read(addr: usize) callconv(.c) void {
-                checkAccess(addr, sz, false);
+                checkAccess(addr, sz, false, true, @returnAddress());
             }
             fn write(addr: usize) callconv(.c) void {
-                checkAccess(addr, sz, true);
+                checkAccess(addr, sz, true, true, @returnAddress());
+            }
+            // Emitted under --tsan-distinguish-volatile=true.
+            fn volatileRead(addr: usize) callconv(.c) void {
+                checkAccess(addr, sz, false, false, @returnAddress());
+            }
+            fn volatileWrite(addr: usize) callconv(.c) void {
+                checkAccess(addr, sz, true, false, @returnAddress());
             }
         };
         @export(&Hooks.read, .{ .name = std.fmt.comptimePrint("__tsan_read{d}", .{sz}) });
         @export(&Hooks.write, .{ .name = std.fmt.comptimePrint("__tsan_write{d}", .{sz}) });
         @export(&Hooks.read, .{ .name = std.fmt.comptimePrint("__tsan_unaligned_read{d}", .{sz}) });
         @export(&Hooks.write, .{ .name = std.fmt.comptimePrint("__tsan_unaligned_write{d}", .{sz}) });
-        // Volatile variants — emitted when --tsan-distinguish-volatile=true.
-        // Same semantics for us; volatile doesn't change race detection.
-        @export(&Hooks.read, .{ .name = std.fmt.comptimePrint("__tsan_volatile_read{d}", .{sz}) });
-        @export(&Hooks.write, .{ .name = std.fmt.comptimePrint("__tsan_volatile_write{d}", .{sz}) });
-        @export(&Hooks.read, .{ .name = std.fmt.comptimePrint("__tsan_unaligned_volatile_read{d}", .{sz}) });
-        @export(&Hooks.write, .{ .name = std.fmt.comptimePrint("__tsan_unaligned_volatile_write{d}", .{sz}) });
+        @export(&Hooks.volatileRead, .{ .name = std.fmt.comptimePrint("__tsan_volatile_read{d}", .{sz}) });
+        @export(&Hooks.volatileWrite, .{ .name = std.fmt.comptimePrint("__tsan_volatile_write{d}", .{sz}) });
+        @export(&Hooks.volatileRead, .{ .name = std.fmt.comptimePrint("__tsan_unaligned_volatile_read{d}", .{sz}) });
+        @export(&Hooks.volatileWrite, .{ .name = std.fmt.comptimePrint("__tsan_unaligned_volatile_write{d}", .{sz}) });
     }
 }
 
 /// Memory-intrinsic instrumentation (memcpy/memmove/memset). Walk in
 /// chunks of 16 bytes; cheap because we only sample 1/SAMPLE_DENOM anyway.
-export fn __tsan_read_range(addr: usize, size: usize) callconv(.c) void {
-    if (!RUNTIME_ACTIVE) return;
+fn checkRange(addr: usize, size: usize, is_write: bool, site: u64) void {
     var off: usize = 0;
     while (off < size) : (off += 16) {
         const chunk: u8 = if (size - off >= 16) 16 else @intCast(size - off);
-        checkAccess(addr + off, chunk, false);
+        checkAccess(addr + off, chunk, is_write, true, site);
     }
+}
+
+export fn __tsan_read_range(addr: usize, size: usize) callconv(.c) void {
+    if (!RUNTIME_ACTIVE) return;
+    checkRange(addr, size, false, @returnAddress());
 }
 
 export fn __tsan_write_range(addr: usize, size: usize) callconv(.c) void {
     if (!RUNTIME_ACTIVE) return;
-    var off: usize = 0;
-    while (off < size) : (off += 16) {
-        const chunk: u8 = if (size - off >= 16) 16 else @intCast(size - off);
-        checkAccess(addr + off, chunk, true);
-    }
+    checkRange(addr, size, true, @returnAddress());
 }
 
 // memcpy/memmove/memset — the tsan pass replaces `llvm.memcpy.*` /
@@ -393,12 +522,6 @@ export fn __tsan_write_range(addr: usize, size: usize) callconv(.c) void {
 //   2. Perform the actual copy/set.
 // Must return the destination pointer (matches libc ABI).
 //
-// Implementation: byte-loop. Slow, but: (a) instrumented builds are slow
-// anyway, (b) calling the in-tree memcpy/memset would itself be on a
-// denylisted path (kernel_builtins.zig) so no recursion through tsan, but
-// they're not exposed as Zig functions here. Inline byte loop is simpler
-// and stays self-contained.
-
 // memcpy/memset/memmove use `rep movsb` / `rep stosb` — modern x86 (ERMSB
 // since Ivy Bridge) makes these as fast as SSE-unrolled loops. A naive
 // byte-for-loop here was making KCSAN unusably slow because EVERY framebuffer
@@ -406,8 +529,8 @@ export fn __tsan_write_range(addr: usize, size: usize) callconv(.c) void {
 
 export fn __tsan_memcpy(dst: usize, src: usize, n: usize) callconv(.c) usize {
     if (RUNTIME_ACTIVE) {
-        __tsan_write_range(dst, n);
-        __tsan_read_range(src, n);
+        checkRange(dst, n, true, @returnAddress());
+        checkRange(src, n, false, @returnAddress());
     }
     asm volatile ("rep movsb"
         :
@@ -421,8 +544,8 @@ export fn __tsan_memcpy(dst: usize, src: usize, n: usize) callconv(.c) usize {
 
 export fn __tsan_memmove(dst: usize, src: usize, n: usize) callconv(.c) usize {
     if (RUNTIME_ACTIVE) {
-        __tsan_write_range(dst, n);
-        __tsan_read_range(src, n);
+        checkRange(dst, n, true, @returnAddress());
+        checkRange(src, n, false, @returnAddress());
     }
     if (dst < src or n == 0) {
         asm volatile ("rep movsb"
@@ -450,7 +573,7 @@ export fn __tsan_memmove(dst: usize, src: usize, n: usize) callconv(.c) usize {
 
 export fn __tsan_memset(dst: usize, c: c_int, n: usize) callconv(.c) usize {
     if (RUNTIME_ACTIVE) {
-        __tsan_write_range(dst, n);
+        checkRange(dst, n, true, @returnAddress());
     }
     const byte: u8 = @intCast(@as(c_uint, @bitCast(c)) & 0xFF);
     asm volatile ("rep stosb"
@@ -482,16 +605,16 @@ export fn __tsan_func_exit() callconv(.c) void {}
 // Init / public API
 // =============================================================================
 
+/// After memmap.init: what may be watched is read off the loader's map.
 pub fn init() void {
     if (!ENABLE) return;
-    for (0..MAX_CPUS) |i| {
-        watchpoints[i].encoded = 0;
-    }
+    learnMemory();
+    for (&watchpoints) |*slot| slot.* = .{};
     sample_tick = 0;
     armed_count = 0;
     RUNTIME_ACTIVE = true;
-    debug.klog("[kcsan] runtime active — {d} cpus, sample 1/{d}, pause {d}\n", .{
-        MAX_CPUS, SAMPLE_DENOM, PAUSE_LOOPS,
+    debug.klog("[kcsan] runtime active — sample 1/{d}, pause {d}; watching the image, vmalloc and {d} run(s) of RAM\n", .{
+        SAMPLE_DENOM, PAUSE_LOOPS, ram_span_count,
     });
 }
 
@@ -515,7 +638,7 @@ pub inline fn checkU64(comptime name: []const u8, addr: *align(1) const u64) voi
     const before = v.*;
     pauseSpin(PAUSE_LOOPS);
     const after = v.*;
-    if (before != after) report(name, @intFromPtr(addr), before, after);
+    if (before != after) reportManual(name, @intFromPtr(addr), before, after);
 }
 
 pub inline fn checkU8(comptime name: []const u8, addr: *const u8) void {
@@ -523,5 +646,5 @@ pub inline fn checkU8(comptime name: []const u8, addr: *const u8) void {
     const before = @atomicLoad(u8, addr, .acquire);
     pauseSpin(PAUSE_LOOPS);
     const after = @atomicLoad(u8, addr, .acquire);
-    if (before != after) report(name, @intFromPtr(addr), before, after);
+    if (before != after) reportManual(name, @intFromPtr(addr), before, after);
 }

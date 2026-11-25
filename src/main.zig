@@ -344,8 +344,9 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     @import("mm/page_cache.zig").init();
     blog.ok("Page cache");
     @import("debug/symbols.zig").init();
-    @import("debug/kcsan.zig").init();
-    blog.ok("KCSAN runtime");
+    const kcsan = @import("debug/kcsan.zig");
+    kcsan.init();
+    if (kcsan.ENABLE) blog.ok("KCSAN runtime");
     @import("proc/process.zig").initKstackGuards();
     blog.ok("Kstack guard pages");
     {
