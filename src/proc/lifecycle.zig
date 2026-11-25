@@ -102,6 +102,9 @@ fn allocSlot() ?usize {
             .acquire,
             .monotonic,
         ) == null) {
+            // releaseSlot left the stack marked freed. Here, not where the
+            // task is made ready: by then another CPU may be running it.
+            @import("../debug/kasan.zig").markPcbAlive(@intFromPtr(&process.kstack_pool[i]) + KSTACK_GUARD_SIZE, KSTACK_SIZE);
             return i;
         }
     }
@@ -224,7 +227,6 @@ pub fn create(entry: usize, user_stack: usize) ?usize {
     // the parent's in before scheduling, so spawned children land in the
     // parent's session and group, as after fork+exec.
     @import("../debug/kdbg.zig").procEvent(.create, @intCast(i), 0, 0);
-    @import("../debug/kasan.zig").markPcbAlive(slot_base + KSTACK_GUARD_SIZE, KSTACK_SIZE);
     return i;
 }
 
@@ -327,7 +329,6 @@ pub fn cloneCurrent(entry: usize, stack_top: usize, arg: usize, fs_base: u64) ?u
     // so setState's rqEnter lands on the right per-CPU runqueue.
     process.assignInitialCpu(i);
     process.setState(i, .ready);
-    @import("../debug/kasan.zig").markPcbAlive(slot_base + KSTACK_GUARD_SIZE, KSTACK_SIZE);
     return i;
 }
 
@@ -439,7 +440,6 @@ pub fn cloneLinuxThread(frame: *const signals.SyscallFrame, spec: LinuxThreadSpe
     process.assignInitialCpu(i);
     process.setState(i, .ready);
     @import("../debug/kdbg.zig").procEvent(.create, @intCast(i), parent_lead.tgid, 0);
-    @import("../debug/kasan.zig").markPcbAlive(slot_base + KSTACK_GUARD_SIZE, KSTACK_SIZE);
     return tid;
 }
 
@@ -651,7 +651,6 @@ pub fn forkCurrent(frame: *signals.SyscallFrame, spec: ForkSpec) ?usize {
     process.assignInitialCpu(i);
     process.setState(i, .ready);
     @import("../debug/kdbg.zig").procEvent(.create, @intCast(i), parent_pid_u8, 0);
-    @import("../debug/kasan.zig").markPcbAlive(slot_base + KSTACK_GUARD_SIZE, KSTACK_SIZE);
     return i;
 }
 

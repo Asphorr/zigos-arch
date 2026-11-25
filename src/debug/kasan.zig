@@ -1,55 +1,33 @@
-// KASAN-style address sanitizer skeleton for ZigOS.
+// KASAN: an address sanitizer for the kernel.
 //
-// Scope of this file (deliberately): a runtime that *would* receive calls
-// from compiler-emitted instrumentation if we ever taught Zig 0.15.x to
-// pass `-fsanitize=kernel-address` through to LLVM. Today it serves as:
+// `-Dkasan` runs LLVM's `asan<kernel>` pass over the kernel (build.zig,
+// instrumentedObject): every memory access in an instrumented function
+// calls `__asan_load{1,2,4,8,16}` / `__asan_store*` here, which look the
+// address up in shadow memory — one byte to 8 of memory, as in Linux's
+// generic KASAN. The allocators mark what they free and the gaps they leave
+// around what they hand out; an access to either is reported.
 //
-//   1) a manual-instrumentation library — `kasan.checkWrite(@sizeOf(T), addr)`
-//      at chosen sites in the kernel, no compiler help required;
-//   2) a proof of concept that the runtime side fits cleanly in idiomatic
-//      Zig: comptime-generated `__asan_load{1,2,4,8,16}` and `__asan_store*`
-//      thunks (one source line per family vs Linux/Rust's hand-rolled 20+);
-//   3) a shadow-memory translation that exists at compile time — the math
-//      to find a shadow byte for any address inside the covered region is
-//      a pure comptime arithmetic, no runtime tables.
+// Tracked: RAM as the physmap shows it, and the vmalloc arena — where the
+// heap, the slabs, the kernel stacks and vmalloc's blocks are. The image is
+// not: nothing in it is poisoned (--asan-stack=false, --asan-globals=false).
 //
-// Coverage region: [REGION_LO, REGION_HI). Shadow is one byte per 8 bytes
-// of memory (1:8 scale, same as Linux KASAN's classic mode).
-//
-// Not yet wired: stack red zones around iretq frames, allocator hooks
-// (PMM mark-free → poison), heap red zones. Those are the next 500-LOC
-// pass once the runtime is proven.
+// Without the flag there is no shadow and every call here returns at once.
 
 const std = @import("std");
 const memmap = @import("../mm/memmap.zig");
+const vmalloc = @import("../mm/vmalloc.zig");
 
 // ---- Configuration ----
 
-/// Lowest address covered by the shadow. The compiler-emitted inline check
-/// has no bounds test — every memory access in an instrumented function
-/// computes `shadow = (addr >> 3) + dyn_addr` unconditionally. So the
-/// shadow region must cover every address those functions might touch.
-/// `0` covers IVT/EBDA/VGA-text (0xB8000) too, costing only an extra 128 KB
-/// of shadow memory (the size delta for shifting REGION_LO from 0x100000).
-pub const REGION_LO: usize = 0x0;
-
-/// Highest address covered by the shadow. 256 MB ceiling — covers kernel
-/// image, heap, guest FB, back buffer, kstack pool, per-CPU TSS, and the
-/// bulk of PMM-allocated kernel pages including GUI framebuffers and
-/// per-process page tables. Shadow size = 32 MB. Anything above this
-/// (LAPIC, HPET, PCI BARs ≥ 4 GB) MUST be handled in denylisted code, or
-/// the inline check will read garbage from above shadow_base + 32 MB.
-pub const REGION_HI: usize = 0x10000000;
-
-pub const REGION_SIZE: usize = REGION_HI - REGION_LO;
 pub const SHADOW_SCALE_SHIFT: u6 = 3; // 1 byte of shadow per (1<<3) = 8 bytes
-pub const SHADOW_SIZE: usize = REGION_SIZE >> SHADOW_SCALE_SHIFT;
 
-// Sanity: shadow must be a whole number of pages.
-comptime {
-    if (SHADOW_SIZE & 0xFFF != 0) @compileError("kasan: SHADOW_SIZE not page-aligned");
-    if (REGION_LO & 7 != 0) @compileError("kasan: REGION_LO must be 8-byte aligned");
-}
+/// No more RAM than this is tracked; its shadow is an eighth of it.
+const PHYS_COVER_MAX: usize = 4 << 30;
+/// Less than this and KASAN stays off: the heap would not be in it.
+const PHYS_COVER_MIN: usize = 64 << 20;
+/// The shadow of this much, and of its halves down to the minimum, is a
+/// whole number of pages.
+const COVER_ALIGN: usize = 0x200000;
 
 // ---- Shadow byte taxonomy ----
 //
@@ -70,17 +48,21 @@ pub const SHADOW_GENERIC: u8 = 0xFF;
 
 // ---- Runtime state ----
 
+/// The shadow: RAM's (`phys_covered` >> 3 bytes), then the vmalloc arena's.
 var shadow_base: usize = 0;
+var shadow_bytes: usize = 0;
+/// RAM below this physical address is tracked.
+var phys_covered: usize = 0;
+var vmalloc_shadow: usize = 0;
 var initialized: bool = false;
 
 /// True iff `addr` lands inside the kasan shadow window. Used by
 /// debug.addrinfo to label otherwise-nondescript addresses.
 pub fn isShadowAddr(addr: usize) bool {
-    return initialized and addr >= shadow_base and addr < shadow_base + SHADOW_SIZE;
+    return initialized and addr >= shadow_base and addr < shadow_base + shadow_bytes;
 }
 
-/// Allocate a contiguous physical block for the shadow region and zero it.
-/// Below 4 GB is fine — kernel VA is identity-mapped to PA there.
+/// Takes the shadow from the PMM as one run and marks all of it valid.
 pub fn init() void {
     const pmm = @import("../mm/pmm.zig");
     const debug = @import("debug.zig");
@@ -97,82 +79,93 @@ pub fn init() void {
         return;
     }
 
-    const num_pages: u32 = @intCast(SHADOW_SIZE >> 12);
-    debug.klog("[kasan] init: requesting {d} contiguous pages ({d} KB)\n", .{ num_pages, SHADOW_SIZE >> 10 });
-    const phys = pmm.allocContiguous(num_pages) orelse {
-        debug.klog("[kasan] init: pmm.allocContiguous({d}) failed — disabling\n", .{num_pages});
+    var ram_end: u64 = 0;
+    for (memmap.bootMap()) |region| {
+        if (region.kind == .usable) ram_end = @max(ram_end, region.base +| region.length);
+    }
+    var cover: usize = @intCast(@min(std.mem.alignForward(u64, ram_end, COVER_ALIGN), PHYS_COVER_MAX));
+    const arena_shadow = vmalloc.VMALLOC_SIZE >> SHADOW_SCALE_SHIFT;
+    // RAM with no free run this long tracks its lower half, and so on down.
+    const run = while (cover >= PHYS_COVER_MIN) : (cover /= 2) {
+        const pages: u32 = @intCast(((cover >> SHADOW_SCALE_SHIFT) + arena_shadow) >> 12);
+        if (pmm.allocContiguous(pages)) |found| break found;
+    } else {
+        debug.klog("[kasan] init: no run of RAM for a shadow — disabled\n", .{});
         return;
     };
-    debug.klog("[kasan] init: got phys=0x{X} — zeroing\n", .{phys.raw()});
-    // Phase 3: store the physmap-translated VA so the shadow stays
-    // dereferenceable after PML4[0] is dropped. The compiler-emitted
-    // inline check below uses (addr >> 3) + dyn_addr; dyn_addr is
-    // computed from `shadow_base`, so it inherits the same translation.
-    shadow_base = phys.toVirt().raw();
+    shadow_base = run.toVirt().raw();
+    shadow_bytes = (cover >> SHADOW_SCALE_SHIFT) + arena_shadow;
+    phys_covered = cover;
+    vmalloc_shadow = shadow_base + (cover >> SHADOW_SCALE_SHIFT);
 
-    // Mark everything valid by default. Callers later poison specific
-    // regions (red zones, freed allocations) via poison().
+    // All of it valid: the allocators poison what they free and fence.
     const buf: [*]u8 = @ptrFromInt(shadow_base);
-    @memset(buf[0..SHADOW_SIZE], SHADOW_VALID);
-    debug.klog("[kasan] init: zeroed\n", .{});
-
-    // Wire up the dynamic shadow address for compiler-injected inline checks.
-    // Pass emits `shadow_byte = *((addr >> 3) + dyn_addr)`, so:
-    //   dyn_addr = shadow_base - (REGION_LO >> 3)
-    // makes the lookup land at `shadow_base + ((addr - REGION_LO) >> 3)`.
-    // Until this line runs, the global is 0 — every instrumented function
-    // load would compute a bogus shadow VA. The early-boot denylist in
-    // `tools/kasan_inject.py` covers all callers that may execute before
-    // we get here.
-    __asan_shadow_memory_dynamic_address = @intCast(shadow_base -% (REGION_LO >> SHADOW_SCALE_SHIFT));
-
+    @memset(buf[0..shadow_bytes], SHADOW_VALID);
     initialized = true;
 
-    debug.klog("[kasan] shadow @ 0x{X:0>16}, {d} KB covers [0x{X}..0x{X})\n", .{
-        shadow_base, SHADOW_SIZE >> 10, REGION_LO, REGION_HI,
+    debug.klog("[kasan] shadow @ 0x{X:0>16}, {d} KB: RAM below 0x{X} (it ends at 0x{X}) and the vmalloc arena\n", .{
+        shadow_base, shadow_bytes >> 10, cover, ram_end,
     });
 
     selfTest();
 }
 
-/// Boot-time roundtrip exercise. Picks an address inside the tracked
-/// region but unlikely to be in active use, poisons it, verifies the
-/// shadow byte changed, unpoisons, restores. If anything fails, log and
-/// disable KASAN — better silent than crashing the kernel during init.
+/// A round trip through both pieces of the shadow. A failure turns KASAN
+/// off: a kernel that boots says more than one that reports its own shadow.
 fn selfTest() void {
     const debug = @import("debug.zig");
-    if (!initialized) return;
-
-    const test_addr: usize = REGION_LO + (REGION_SIZE / 2);
-    const sh_ptr = memToShadow(test_addr) orelse {
-        debug.klog("[kasan] selfTest: memToShadow returned null\n", .{});
-        initialized = false;
-        return;
+    const probes = [_]usize{
+        memmap.PHYSMAP_BASE + phys_covered / 2,
+        vmalloc.VMALLOC_BASE + vmalloc.VMALLOC_SIZE / 2,
     };
-    const saved = sh_ptr[0];
-
-    poison(test_addr, 64, SHADOW_FREED);
-    if (sh_ptr[0] != SHADOW_FREED) {
-        debug.klog("[kasan] selfTest: poison did not stick (got 0x{X:0>2})\n", .{sh_ptr[0]});
-        initialized = false;
-        return;
+    for (probes) |addr| {
+        const at = locate(addr) orelse {
+            debug.klog("[kasan] selfTest: 0x{X} is not tracked\n", .{addr});
+            initialized = false;
+            return;
+        };
+        const saved = at.shadow[0];
+        poison(addr, 8, SHADOW_FREED);
+        const poisoned = at.shadow[0];
+        unpoison(addr, 8);
+        const cleared = at.shadow[0];
+        at.shadow[0] = saved;
+        if (poisoned != SHADOW_FREED or cleared != SHADOW_VALID) {
+            debug.klog("[kasan] selfTest: 0x{X} read 0x{X:0>2} poisoned, 0x{X:0>2} cleared\n", .{ addr, poisoned, cleared });
+            initialized = false;
+            return;
+        }
     }
-    unpoison(test_addr, 64);
-    if (sh_ptr[0] != SHADOW_VALID) {
-        debug.klog("[kasan] selfTest: unpoison did not stick (got 0x{X:0>2})\n", .{sh_ptr[0]});
-        initialized = false;
-        return;
-    }
-    sh_ptr[0] = saved;
     debug.klog("[kasan] selfTest: poison/unpoison roundtrip OK\n", .{});
 }
 
-/// Translate an address inside the covered region to its shadow byte.
-/// Returns null for addresses outside [REGION_LO, REGION_HI).
-inline fn memToShadow(addr: usize) ?[*]u8 {
-    if (addr < REGION_LO or addr >= REGION_HI) return null;
-    const off = (addr - REGION_LO) >> SHADOW_SCALE_SHIFT;
-    return @ptrFromInt(shadow_base + off);
+const Tracked = struct {
+    /// The shadow byte of the address's granule.
+    shadow: [*]u8,
+    /// Bytes from the address to the end of what is tracked with it.
+    room: usize,
+};
+
+/// Where `addr`'s shadow is; null for memory KASAN does not track.
+inline fn locate(addr: usize) ?Tracked {
+    const phys = addr -% memmap.PHYSMAP_BASE;
+    if (phys < phys_covered) return .{
+        .shadow = @ptrFromInt(shadow_base + (phys >> SHADOW_SCALE_SHIFT)),
+        .room = phys_covered - phys,
+    };
+    const in_arena = addr -% vmalloc.VMALLOC_BASE;
+    if (in_arena < vmalloc.VMALLOC_SIZE) return .{
+        .shadow = @ptrFromInt(vmalloc_shadow + (in_arena >> SHADOW_SCALE_SHIFT)),
+        .room = vmalloc.VMALLOC_SIZE - in_arena,
+    };
+    return null;
+}
+
+/// Whether an access at `byte_addr` is one the tag of its granule forbids.
+/// 1..7: that many bytes of the granule are valid, from its start.
+inline fn forbidden(tag: u8, byte_addr: usize, size: usize) bool {
+    if (tag == SHADOW_VALID) return false;
+    return !(tag <= 7 and (byte_addr & 7) + size <= tag);
 }
 
 // ---- Poison / unpoison API ----
@@ -181,11 +174,11 @@ inline fn memToShadow(addr: usize) ?[*]u8 {
 /// `len` is rounded up to the 8-byte shadow granule.
 pub fn poison(addr: usize, len: usize, tag: u8) void {
     if (!initialized) return;
-    const ptr = memToShadow(addr) orelse return;
-    // A run that starts under REGION_HI may end above it; the shadow does not.
-    const covered = @min(len, REGION_HI - addr);
+    const at = locate(addr) orelse return;
+    // A run that starts in what is tracked may end past it; the shadow does not.
+    const covered = @min(len, at.room);
     const shadow_len = (covered + 7) >> SHADOW_SCALE_SHIFT;
-    @memset(ptr[0..shadow_len], tag);
+    @memset(at.shadow[0..shadow_len], tag);
 }
 
 pub fn unpoison(addr: usize, len: usize) void {
@@ -198,18 +191,16 @@ pub fn unpoison(addr: usize, len: usize) void {
 /// call site, so the hot path is a single shadow-byte load + branch.
 pub inline fn check(comptime size: usize, comptime is_write: bool, addr: usize) void {
     if (!initialized) return;
-    if (addr < REGION_LO or addr + size > REGION_HI) return;
+    const at = locate(addr) orelse return;
+    // One that runs off the end of what is tracked has no shadow to its end.
+    if (at.room < size) return;
 
     // Fast path: 8-byte-aligned access of size <= 8. One shadow byte, one
     // compare. Linux's "outline" mode does this same dance; we get there
     // for free from comptime.
     if (size <= 8 and (addr & 7) == 0) {
-        const sh: [*]u8 = @ptrFromInt(shadow_base + ((addr - REGION_LO) >> SHADOW_SCALE_SHIFT));
-        const tag = sh[0];
-        if (tag == SHADOW_VALID) return;
-        // Sub-8B partial validity: tag = N means first N bytes ok.
-        if (tag >= 1 and tag <= 7 and size <= tag) return;
-        @call(.never_inline, report, .{ addr, size, is_write, tag });
+        const tag = at.shadow[0];
+        if (forbidden(tag, addr, size)) @call(.never_inline, report, .{ addr, size, is_write, tag });
         return;
     }
 
@@ -217,16 +208,27 @@ pub inline fn check(comptime size: usize, comptime is_write: bool, addr: usize) 
     var off: usize = 0;
     while (off < size) {
         const byte_addr = addr + off;
-        const sh: [*]u8 = @ptrFromInt(shadow_base + ((byte_addr - REGION_LO) >> SHADOW_SCALE_SHIFT));
-        const tag = sh[0];
-        if (tag != SHADOW_VALID) {
-            const last_byte_in_group = byte_addr & 7;
-            if (!(tag >= 1 and tag <= 7 and last_byte_in_group < tag)) {
-                @call(.never_inline, report, .{ byte_addr, size, is_write, tag });
-                return;
-            }
+        const in_granule = @min(8 - (byte_addr & 7), size - off);
+        const tag = at.shadow[((addr & 7) + off) >> SHADOW_SCALE_SHIFT];
+        if (forbidden(tag, byte_addr, in_granule)) {
+            @call(.never_inline, report, .{ byte_addr, size, is_write, tag });
+            return;
         }
-        off += 8 - (byte_addr & 7);
+        off += in_granule;
+    }
+}
+
+/// An access whose size is known only at run time, byte by byte.
+fn checkRun(addr: usize, size: usize, is_write: bool) void {
+    if (!initialized) return;
+    var off: usize = 0;
+    while (off < size) : (off += 1) {
+        const at = locate(addr + off) orelse continue;
+        const tag = at.shadow[0];
+        if (forbidden(tag, addr + off, 1)) {
+            @call(.never_inline, report, .{ addr + off, 1, is_write, tag });
+            return;
+        }
     }
 }
 
@@ -305,8 +307,8 @@ fn report(addr: usize, size: usize, is_write: bool, tag: u8) void {
     // Shadow bytes around the trip address: 8 before, 16 around the byte
     // for `addr`, 8 after. Helps distinguish a single corrupted byte
     // (write-through-of-bound from a neighbor) from a wider stomp.
-    if (memToShadow(addr)) |sh_center| {
-        const sh_addr = @intFromPtr(sh_center);
+    if (locate(addr)) |at| {
+        const sh_addr = @intFromPtr(at.shadow);
         const sh_dump_start = sh_addr & ~@as(usize, 0xF);
         serial.print("  Shadow @ 0x{X:0>16} (center byte for addr): \n", .{sh_dump_start});
         const sh_dump_ptr: [*]const u8 = @ptrFromInt(sh_dump_start);
@@ -317,9 +319,7 @@ fn report(addr: usize, size: usize, is_write: bool, tag: u8) void {
             }
             serial.print("\n", .{});
         }
-        serial.print("  Shadow base 0x{X:0>16}, dyn_addr 0x{X:0>16}\n", .{
-            shadow_base, __asan_shadow_memory_dynamic_address,
-        });
+        serial.print("  Shadow base 0x{X:0>16}, {d} KB\n", .{ shadow_base, shadow_bytes >> 10 });
     }
 
     // Symbol-resolved RBP-chain backtrace. Bounded depth to prevent runaway.
@@ -330,8 +330,8 @@ fn report(addr: usize, size: usize, is_write: bool, tag: u8) void {
     var rbp: u64 = rbp_now;
     var depth: u32 = 0;
     while (depth < 12) : (depth += 1) {
-        if (rbp == 0 or rbp < REGION_LO) break;
-        if (rbp >= 0x0000_8000_0000_0000 and rbp < 0xFFFF_8000_0000_0000) break;
+        // A kernel stack is in the kernel's half.
+        if (rbp < memmap.PHYSMAP_BASE) break;
         const frame: [*]const u64 = @ptrFromInt(rbp);
         const ret_addr = frame[1];
         if (ret_addr == 0) break;
@@ -483,56 +483,32 @@ pub inline fn markAlive(addr: usize, len: usize) void {
 /// Assert every byte in [addr, addr+len) is currently SHADOW_VALID. Use at
 /// known invariants (e.g. "the iretq frame slot must be valid right now").
 pub fn expectValid(addr: usize, len: usize) void {
-    if (!initialized) return;
-    if (addr < REGION_LO or addr + len > REGION_HI) return;
-    var off: usize = 0;
-    while (off < len) : (off += 1) {
-        const sh = memToShadow(addr + off) orelse continue;
-        const tag = sh[0];
-        if (tag == SHADOW_VALID) continue;
-        if (tag >= 1 and tag <= 7 and ((addr + off) & 7) < tag) continue;
-        @call(.never_inline, report, .{ addr + off, 1, false, tag });
-        return;
-    }
+    checkRun(addr, len, false);
 }
 
 // =============================================================================
 // Compiler-emitted entry points
 // =============================================================================
 //
-// When the kernel is built via the LLVM `asan<kernel>` IR pass (`-Dkasan`:
-// build.zig, instrumentedObject), the pass injects
-// inline shadow checks at every memory access in instrumented functions and
-// emits CALLS to the symbols below for the slow paths:
+// The `asan<kernel>` pass (`-Dkasan`: build.zig, instrumentedObject) is run
+// with --asan-instrumentation-with-call-threshold=0: every access in an
+// instrumented function is a CALL to one of the symbols below, none is a
+// shadow lookup inlined at the site. It has to be so: the shadow is in two
+// pieces, and an inlined lookup knows one offset.
 //
-//   • `__asan_report_loadN(addr)` / `__asan_report_storeN(addr)` — invoked
-//     when the inline shadow check trips. Followed by `unreachable`, so these
-//     MUST NOT return; they panic.
+//   • `__asan_loadN(addr)` / `__asan_storeN(addr)` — the access checks.
+//     These return; each is a `check()`.
 //
-//   • `__asan_report_load_n(addr, size)` / `__asan_report_store_n(...)` —
-//     same for accesses with a runtime-variable size (vectorized stores).
-//
-//   • `__asan_loadN(addr)` / `__asan_storeN(addr)` — out-of-line variants for
-//     when the pass disables inlining. These DO return; equivalent to a
-//     manual `check()` call.
+//   • `__asan_report_loadN(addr)` / `__asan_report_storeN(addr)`, and the
+//     `_n` pair with a size — what an inlined check would call. Followed by
+//     `unreachable`, so they MUST NOT return; they panic.
 //
 //   • `__asan_handle_no_return()` — called before any noreturn function.
 //
 //   • `__asan_register_globals(...)` and friends — module-ctor stubs.
-//
-//   • `__asan_shadow_memory_dynamic_address` — i64 global the pass loads at
-//     each instrumented function's prologue. We set it from `kasan.init()`
-//     to `shadow_base - (REGION_LO >> 3)`, so the inline check
-//     `shadow_byte = *((addr >> 3) + dyn_addr)` lands inside our shadow.
-//
-// Until kasan.init() runs, the global is 0. Functions that may run before
-// init MUST be on the no_sanitize denylist in `tools/kasan_inject.py` —
-// otherwise they'd dereference a bogus shadow address and trip a phantom
-// report on entry.
 
-/// Set by kasan.init() to `shadow_base - (REGION_LO >> 3)`. Read by every
-/// instrumented function as part of its inline shadow check. Must be a real
-/// `var` (not `const`) — the LLVM pass emits a load from this symbol.
+/// What an inlined check would add to `addr >> 3`. The pass wants the
+/// symbol (--asan-force-dynamic-shadow) and loads it; nothing uses the value.
 export var __asan_shadow_memory_dynamic_address: u64 = 0;
 
 fn reportInline(addr: usize, size: usize, is_write: bool) callconv(.c) noreturn {
@@ -540,7 +516,7 @@ fn reportInline(addr: usize, size: usize, is_write: bool) callconv(.c) noreturn 
     // not return. Look up the actual shadow byte ourselves so the report
     // shows what tripped (RED_ZONE vs FREED vs misalign) rather than a bogus
     // SHADOW_GENERIC placeholder.
-    const tag: u8 = if (memToShadow(addr)) |sh| sh[0] else SHADOW_GENERIC;
+    const tag: u8 = if (locate(addr)) |at| at.shadow[0] else SHADOW_GENERIC;
     @call(.never_inline, report, .{ addr, size, is_write, tag });
     unreachable;
 }
@@ -574,27 +550,11 @@ comptime {
 // Variable-size variants. The pass calls these for vector / memcpy-like ops.
 
 export fn __asan_loadN(addr: usize, size: usize) callconv(.c) void {
-    if (!initialized) return;
-    if (addr < REGION_LO or addr + size > REGION_HI) return;
-    var off: usize = 0;
-    while (off < size) : (off += 1) {
-        const sh = memToShadow(addr + off) orelse continue;
-        if (sh[0] == SHADOW_VALID) continue;
-        @call(.never_inline, report, .{ addr + off, 1, false, sh[0] });
-        return;
-    }
+    checkRun(addr, size, false);
 }
 
 export fn __asan_storeN(addr: usize, size: usize) callconv(.c) void {
-    if (!initialized) return;
-    if (addr < REGION_LO or addr + size > REGION_HI) return;
-    var off: usize = 0;
-    while (off < size) : (off += 1) {
-        const sh = memToShadow(addr + off) orelse continue;
-        if (sh[0] == SHADOW_VALID) continue;
-        @call(.never_inline, report, .{ addr + off, 1, true, sh[0] });
-        return;
-    }
+    checkRun(addr, size, true);
 }
 
 export fn __asan_report_load_n(addr: usize, size: usize) callconv(.c) noreturn {

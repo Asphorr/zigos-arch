@@ -296,17 +296,11 @@ pub fn alloc(size: usize) ?[*]u8 {
     }
 
     const base_va = VMALLOC_BASE + start * 4096;
+    // Whole pages, before the header is written: a region freed earlier may
+    // have spanned these, and its poison is over all of it.
+    kasan.unpoison(base_va, pages * 4096);
     const hdr: *Header = @ptrFromInt(base_va);
     hdr.* = .{ .magic = MAGIC, .pages = @intCast(pages) };
-
-    // KASAN: unpoison only the user-visible bytes (skip header pad). Header
-    // itself stays implicitly unpoisoned via vmalloc-arena exclusion in
-    // kasan.zig REGION_LO/HI check (shadow only covers low 256 MB; vmalloc
-    // arena is at 0xFFFF810000000000, so kasan.poison/unpoison is a no-op
-    // here today — but we call it anyway so the moment the kasan shadow
-    // extends to cover kernel VAs, vmalloc gets free UAF detection without
-    // a code change.)
-    kasan.unpoison(base_va + HEADER_PAD, size);
 
     const new_pages = pages_in_use.fetchAdd(@intCast(pages), .monotonic) + @as(u32, @intCast(pages));
     _ = live_regions.fetchAdd(1, .monotonic);

@@ -52,6 +52,9 @@ DENYLIST: set[str] = {
     # poisoned RED_ZONE. Instrumenting heap.zig itself trips on every
     # alloc/free traversal; clients of heap remain instrumented.
     "heap.zig",
+    # The allocator proper since it left heap.zig: block headers and free
+    # blocks are its own to read, red zone or freed.
+    "tlsf.zig",
     # APIC — serial.print uses getLapicId()
     "apic.zig",
     # Top-level kernel entry — runs before kasan.init()

@@ -156,6 +156,8 @@ fn takeSurplusPool(pi: u32) tlsf.Corrupt!?tlsf.Pool {
 /// Return a pool taken out by takeSurplusPool. Without the heap lock.
 fn givePoolBack(p: tlsf.Pool) void {
     const pages: u32 = @intCast(p.size / 4096);
+    // The frames' next owner knows nothing of the freed blocks they held.
+    kasan.unpoison(p.start, p.size);
     pmm.freeContiguous(Phys.of(paging.virtToPhys(p.start).?), pages);
     debug.klog("[tlsf] returned: {d} KB pool at 0x{X:0>16} to PMM\n", .{ p.size / 1024, p.start });
 }

@@ -454,6 +454,8 @@ fn releaseSlabToPmm(cache: *Cache, s: *Slab) void {
     // Wipe magic so any stale pointer that finds its way back to free()
     // panics distinctly ("non-slab ptr") instead of silently freeing.
     s.magic = 0xDEADDEAD;
+    // The frame's next owner knows nothing of the freed objects it held.
+    kasan.unpoison(@intFromPtr(s), SLAB_BYTES);
     // The slab sits behind the physmap — translate back to phys before
     // handing it to the PMM. (The old code passed the VA straight through;
     // freeFrame's MAX_FRAMES gate rejected it with a "bad addr" warning and
