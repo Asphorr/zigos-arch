@@ -6,7 +6,7 @@
 //!    hand at suspect points. Sample → pause → resample. See `checkU64`.
 //!
 //! 2) **Compiler-emitted instrumentation** via the LLVM `tsan` IR pass
-//!    (driven by `tools/kcsan_pipeline.sh` + `-Dkcsan=true`). Every memory
+//!    (`-Dkcsan`: build.zig, instrumentedObject). Every memory
 //!    access in instrumented (allowlisted) functions becomes a call to
 //!    `__tsan_read{1,2,4,8,16}` or `__tsan_write{1,2,4,8,16}`. Our runtime
 //!    implements those with the watchpoint protocol:

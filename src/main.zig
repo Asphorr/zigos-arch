@@ -15,10 +15,9 @@ const cpu_state = @import("cpu/cpu_state.zig");
 const serial = @import("debug/serial.zig");
 const debug = @import("debug/debug.zig");
 const kasan = @import("debug/kasan.zig");
-// memcpy/memset/memmove/__zig_probe_stack — needed by the LLVM IR-pass
-// KASAN pipeline (tools/kasan_pipeline.sh) which links manually with `ld`
-// instead of going through `zig build-exe`. Regular `zig build` ignores
-// these (compiler-rt provides the same symbols).
+// memcpy/memset/memmove/__zig_probe_stack of the kernel's own: what the
+// object of a sanitizer build (-Dkasan / -Dkcsan, through opt and llc)
+// binds its lowered fills and copies to. See the file's header.
 comptime {
     _ = @import("debug/kernel_builtins.zig");
 }

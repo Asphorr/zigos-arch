@@ -314,6 +314,10 @@ def main() -> int:
 
     print(f"[kasan_inject] {inst}/{total} functions tagged sanitize_address")
     print(f"[kasan_inject] denylist active: {len(DENYLIST)} files")
+    # A build that marks nothing would pass for one that found no bad access.
+    if inst == 0:
+        print("[kasan_inject] no function was tagged", file=sys.stderr)
+        return 1
     return 0
 
 

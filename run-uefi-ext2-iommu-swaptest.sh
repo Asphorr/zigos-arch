@@ -16,7 +16,7 @@ fi
 
 # Set KASAN=1 to build through the LLVM IR-pass KASAN pipeline. Without
 # it, regular ReleaseSafe build (~5 MB kernel). With it, instrumented
-# build (~17 MB) routes through tools/kasan_pipeline.sh and catches
+# build (~17 MB) goes through the asan IR pass (build.zig) and catches
 # wild writes / use-after-free at every instrumented memory access.
 KASAN_FLAG=""
 if [ -n "${KASAN:-}" ]; then

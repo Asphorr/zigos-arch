@@ -9,32 +9,27 @@ pub fn build(b: *std.Build) void {
 
     const optimize = b.standardOptimizeOption(.{});
 
-    // --- KASAN (LLVM IR-pass pipeline) ---
-    // When `-Dkasan=true`, replace the normal `b.addExecutable` kernel build
-    // with the IR-pass pipeline in tools/kasan_pipeline.sh: emit LLVM IR via
-    // `zig build-obj`, sed-add `sanitize_address` to allowlisted functions,
-    // run `opt-20 -passes='asan<kernel>' --asan-force-dynamic-shadow`, then
-    // `llc-20` and `ld`. The resulting kernel.elf has compile-time KASAN
-    // instrumentation on every memory access in instrumented functions —
-    // wild writes blow up at the writer, not at a downstream iretq.
-    const kasan_enabled = b.option(bool, "kasan", "Build kernel with LLVM IR-pass KASAN (slower, slow-spots wild writes)") orelse false;
-
-    // --- KCSAN (LLVM IR-pass pipeline) ---
-    // When `-Dkcsan=true`, replace the normal kernel build with the IR-pass
-    // pipeline in tools/kcsan_pipeline.sh: emit LLVM IR via `zig build-obj`,
-    // tag allowlisted functions `sanitize_thread`, run `opt-20 -passes='tsan'`
-    // with kernel-friendly options, then `llc-20` and `ld`. Resulting kernel
-    // has compiler-emitted calls to __tsan_read*/__tsan_write* at every
-    // memory access in instrumented functions; runtime in src/debug/kcsan.zig
-    // implements the watchpoint protocol (sample → pause → resample +
-    // cross-CPU watchpoint table for race detection).
+    // --- Sanitizer builds (LLVM IR passes) ---
+    // -Dkasan and -Dkcsan build the very kernel module a plain build does —
+    // same options, same imports — but by way of LLVM IR: a script marks
+    // the functions to instrument, `opt` runs the sanitizer pass over them,
+    // `llc` makes the object, and that object is linked where the plain
+    // build links its Zig code (instrumentedObject below).
     //
-    // Mutually exclusive with -Dkasan: only one of the two ASan/TSan IR
-    // passes can be applied to a single build.
+    // KASAN (`asan<kernel>`, dynamic shadow): a shadow check at every memory
+    // access in instrumented functions, so a wild write reports at the
+    // writer and not at a later iretq. KCSAN (`tsan`): a call to
+    // __tsan_read*/__tsan_write* at every access; src/debug/kcsan.zig
+    // implements the watchpoint protocol behind them (sample, pause,
+    // resample, and a cross-CPU watchpoint table).
+    //
+    // One pass per build: the two are mutually exclusive.
+    const kasan_enabled = b.option(bool, "kasan", "Build kernel with LLVM IR-pass KASAN (slower, slow-spots wild writes)") orelse false;
     const kcsan_enabled = b.option(bool, "kcsan", "Build kernel with LLVM IR-pass KCSAN (~10x slower, finds concurrent-access races)") orelse false;
     if (kasan_enabled and kcsan_enabled) {
         @panic("-Dkasan and -Dkcsan are mutually exclusive");
     }
+    const sanitizer: ?Sanitizer = if (kasan_enabled) .kasan else if (kcsan_enabled) .kcsan else null;
 
     // --- BUILD ID ---
     // Each `zig build` invocation gets a unique 64-bit ID. The kernel embeds
@@ -97,32 +92,42 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // The kernel's Zig code: one module, whichever way it is compiled.
+    const kernel_code = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        // Higher-half kernel — default code-model "small" assumes
+        // symbols fit in the low 2 GB. We link the kernel at -2 GB
+        // (0xFFFFFFFF80000000), so LLVM needs the "kernel" code model
+        // to emit sign-extended 32-bit relocations (`R_X86_64_32S`)
+        // instead of unsigned `R_X86_64_32`. Without this every
+        // .rodata reference panics ld.lld with "relocation out of
+        // range: 18446744071… is not in [0, 4294967295]".
+        .code_model = .kernel,
+        // Error-return traces regardless of optimize mode: ReleaseSafe
+        // leaves them off by default, but util/errtrace.zig turns them
+        // into symbolized birth-to-boundary error paths — the cost is
+        // a per-frame trace buffer on functions that can error, paid
+        // only on error returns (cold by definition). See STYLE.md
+        // "fail() + errtrace".
+        .error_tracing = true,
+        .imports = &.{
+            .{ .name = "shapes", .module = kernel_shapes_mod },
+            .{ .name = "font_blobs", .module = font_blobs_mod },
+            .{ .name = "boot_protocol", .module = boot_protocol_mod },
+        },
+    });
+    kernel_code.addOptions("build_options", build_options);
+
+    // A plain build links that module itself. A sanitizer build links the
+    // object the pass made of it, under a root module with no source.
     const kernel = b.addExecutable(.{
         .name = "kernel.elf",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
+        .root_module = if (sanitizer == null) kernel_code else b.createModule(.{
             .target = target,
             .optimize = optimize,
-            // Higher-half kernel — default code-model "small" assumes
-            // symbols fit in the low 2 GB. We link the kernel at -2 GB
-            // (0xFFFFFFFF80000000), so LLVM needs the "kernel" code model
-            // to emit sign-extended 32-bit relocations (`R_X86_64_32S`)
-            // instead of unsigned `R_X86_64_32`. Without this every
-            // .rodata reference panics ld.lld with "relocation out of
-            // range: 18446744071… is not in [0, 4294967295]".
             .code_model = .kernel,
-            // Error-return traces regardless of optimize mode: ReleaseSafe
-            // leaves them off by default, but util/errtrace.zig turns them
-            // into symbolized birth-to-boundary error paths — the cost is
-            // a per-frame trace buffer on functions that can error, paid
-            // only on error returns (cold by definition). See STYLE.md
-            // "fail() + errtrace".
-            .error_tracing = true,
-            .imports = &.{
-                .{ .name = "shapes", .module = kernel_shapes_mod },
-                .{ .name = "font_blobs", .module = font_blobs_mod },
-                .{ .name = "boot_protocol", .module = boot_protocol_mod },
-            },
         }),
         // Zig 0.16's self-hosted x86 backend can't yet encode some of our
         // inline-asm forms (moffs r64, indirect via [%[addr]]). Force LLVM
@@ -131,15 +136,15 @@ pub fn build(b: *std.Build) void {
         .use_llvm = true,
     });
     kernel.setLinkerScript(b.path("src/linker.ld"));
-    kernel.root_module.addOptions("build_options", build_options);
+    if (sanitizer) |pass| kernel.root_module.addObjectFile(instrumentedObject(b, kernel_code, pass));
 
     // --- ASM LINTER ---
     // tools/asm_lint.zig reads src/ as text: stack alignment at every `call`
-    // inside an asm template (push-count drift), and the asm output shape
-    // Zig 0.15.2 miscompiles. A failure aborts the build. The runtime guards
-    // in syscall/entry.zig and idt.zig are still the authoritative
-    // check; this is a fast-fail. Host tool like ctx_lint below, so the
-    // kernel build needs no interpreter.
+    // inside a hand-written asm template, and the asm output shape Zig
+    // 0.15.2 miscompiles. A failure aborts the build. (The entry stubs are
+    // generated, with alignment a comptime result and a run-time test
+    // besides — see the tool's header.) Host tool like ctx_lint below, so
+    // the kernel build needs no interpreter.
     const asm_lint_exe = b.addExecutable(.{
         .name = "asm_lint",
         .root_module = b.createModule(.{
@@ -203,9 +208,7 @@ pub fn build(b: *std.Build) void {
     const wake_obj = nasm_wake.addOutputFileArg("wake_trampoline.o");
     kernel.root_module.addObjectFile(wake_obj);
 
-    if (!kasan_enabled and !kcsan_enabled) {
-        b.installArtifact(kernel);
-    }
+    b.installArtifact(kernel);
 
     // `zig build kernel` — kernel.elf alone, no apps and no images. This is
     // the step a build inside ZigOS runs: besides the compiler it needs only
@@ -220,53 +223,7 @@ pub fn build(b: *std.Build) void {
     objcopy.addArtifactArg(kernel);
     const kernel32 = objcopy.addOutputFileArg("kernel32.elf");
     const install32 = b.addInstallBinFile(kernel32, "kernel32.elf");
-    if (!kasan_enabled and !kcsan_enabled) {
-        b.getInstallStep().dependOn(&install32.step);
-    }
-
-    // KASAN build path: drives tools/kasan_pipeline.sh which produces both
-    // kernel.elf and kernel32.elf in zig-out/bin directly. We still let Zig
-    // run the asm linter + nasm steps above so they catch errors early; the
-    // linker output gets overwritten by the pipeline.
-    if (kasan_enabled) {
-        const opt_str = switch (optimize) {
-            .Debug => "Debug",
-            .ReleaseSafe => "ReleaseSafe",
-            .ReleaseFast => "ReleaseFast",
-            .ReleaseSmall => "ReleaseSmall",
-        };
-        const kasan_build = b.addSystemCommand(&.{
-            "bash",
-            "tools/kasan_pipeline.sh",
-            "/opt/zig-x86_64-linux-0.15.2/zig",
-            opt_str,
-            "zig-out/bin",
-        });
-        // Run after the asm linter — pipeline runs nasm itself, but if the
-        // linter rejects asm we'd rather know up-front than after the IR
-        // transform.
-        kasan_build.step.dependOn(&asm_lint.step);
-        b.getInstallStep().dependOn(&kasan_build.step);
-    }
-
-    // KCSAN build path — mirror of KASAN's, drives tools/kcsan_pipeline.sh.
-    if (kcsan_enabled) {
-        const opt_str = switch (optimize) {
-            .Debug => "Debug",
-            .ReleaseSafe => "ReleaseSafe",
-            .ReleaseFast => "ReleaseFast",
-            .ReleaseSmall => "ReleaseSmall",
-        };
-        const kcsan_build = b.addSystemCommand(&.{
-            "bash",
-            "tools/kcsan_pipeline.sh",
-            "/opt/zig-x86_64-linux-0.15.2/zig",
-            opt_str,
-            "zig-out/bin",
-        });
-        kcsan_build.step.dependOn(&asm_lint.step);
-        b.getInstallStep().dependOn(&kcsan_build.step);
-    }
+    b.getInstallStep().dependOn(&install32.step);
 
     // --- Shared library modules ---
     //
@@ -1612,6 +1569,77 @@ pub fn build(b: *std.Build) void {
     debug_cmd.step.dependOn(b.getInstallStep());
     const debug_step = b.step("debug", "Boot under QEMU with gdbstub on :1234 (use -Dhalt=true to pause at boot)");
     debug_step.dependOn(&debug_cmd.step);
+}
+
+const Sanitizer = enum { kasan, kcsan };
+
+/// The LLVM whose tools read what this compiler writes: Zig 0.15 emits IR
+/// for LLVM 20.
+const LLVM_TOOLS = "20";
+
+/// The kernel's Zig code as an object with one sanitizer pass run over it:
+/// LLVM IR out of the compiler, the functions to instrument marked by
+/// tools/<pass>_inject.py, the pass, code generation. Every stage is a step
+/// with its file as input, so the build's cache covers the chain, and the
+/// module is the one a plain build compiles — there is no second list of
+/// options or imports to keep up with it.
+fn instrumentedObject(b: *std.Build, kernel_code: *std.Build.Module, pass: Sanitizer) std.Build.LazyPath {
+    const to_ir = b.addObject(.{
+        .name = "kernel-ir",
+        .root_module = kernel_code,
+        .use_llvm = true,
+    });
+
+    // The path filter in kcsan_inject.py is by where the tree is: what the
+    // kernel pulls in from the standard library stays as it was.
+    const mark = b.addSystemCommand(&.{"python3"});
+    mark.addFileArg(b.path(switch (pass) {
+        .kasan => "tools/kasan_inject.py",
+        .kcsan => "tools/kcsan_inject.py",
+    }));
+    mark.addFileArg(to_ir.getEmittedLlvmIr());
+    const marked_ll = mark.addOutputFileArg("kernel-marked.ll");
+    if (pass == .kcsan) mark.addArg(b.build_root.path orelse ".");
+
+    const assemble = b.addSystemCommand(&.{"llvm-as-" ++ LLVM_TOOLS});
+    assemble.addFileArg(marked_ll);
+    assemble.addArg("-o");
+    const marked_bc = assemble.addOutputFileArg("kernel-marked.bc");
+
+    // What each runtime (src/debug/kasan.zig, kcsan.zig) was written
+    // against: its callbacks and its shadow follow from these.
+    const flags: []const []const u8 = switch (pass) {
+        .kasan => &.{
+            "-passes=asan<kernel>",
+            "--asan-force-dynamic-shadow",
+            "--asan-stack=false",
+            "--asan-globals=false",
+            "--asan-instrumentation-with-call-threshold=0",
+        },
+        .kcsan => &.{
+            "-passes=tsan-module,function(tsan)",
+            "--tsan-instrument-func-entry-exit=false",
+            // The kernel's atomics are its own, not the pass's shims.
+            "--tsan-instrument-atomics=false",
+            "--tsan-instrument-memintrinsics=true",
+            "--tsan-distinguish-volatile=true",
+        },
+    };
+    const instrument = b.addSystemCommand(&.{"opt-" ++ LLVM_TOOLS});
+    instrument.addArgs(flags);
+    instrument.addFileArg(marked_bc);
+    instrument.addArg("-o");
+    const instrumented_bc = instrument.addOutputFileArg("kernel-instrumented.bc");
+
+    const codegen = b.addSystemCommand(&.{
+        "llc-" ++ LLVM_TOOLS,
+        "-filetype=obj",
+        "-relocation-model=static",
+        "-code-model=kernel",
+    });
+    codegen.addFileArg(instrumented_bc);
+    codegen.addArg("-o");
+    return codegen.addOutputFileArg("kernel-instrumented.o");
 }
 
 /// `bin` as `name`, stamped EI_OSABI=3 (ELFOSABI_LINUX): the loader routes

@@ -122,7 +122,7 @@ pub fn init() void {
     // makes the lookup land at `shadow_base + ((addr - REGION_LO) >> 3)`.
     // Until this line runs, the global is 0 — every instrumented function
     // load would compute a bogus shadow VA. The early-boot denylist in
-    // `tools/kasan_pipeline.sh` covers all callers that may execute before
+    // `tools/kasan_inject.py` covers all callers that may execute before
     // we get here.
     __asan_shadow_memory_dynamic_address = @intCast(shadow_base -% (REGION_LO >> SHADOW_SCALE_SHIFT));
 
@@ -498,8 +498,8 @@ pub fn expectValid(addr: usize, len: usize) void {
 // Compiler-emitted entry points
 // =============================================================================
 //
-// When the kernel is built via the LLVM `asan<kernel>` IR-pass pipeline (see
-// `tools/kasan_pipeline.sh` + `-Dkasan=true` in build.zig), the pass injects
+// When the kernel is built via the LLVM `asan<kernel>` IR pass (`-Dkasan`:
+// build.zig, instrumentedObject), the pass injects
 // inline shadow checks at every memory access in instrumented functions and
 // emits CALLS to the symbols below for the slow paths:
 //
@@ -524,7 +524,7 @@ pub fn expectValid(addr: usize, len: usize) void {
 //     `shadow_byte = *((addr >> 3) + dyn_addr)` lands inside our shadow.
 //
 // Until kasan.init() runs, the global is 0. Functions that may run before
-// init MUST be on the no_sanitize denylist in `tools/kasan_pipeline.sh` —
+// init MUST be on the no_sanitize denylist in `tools/kasan_inject.py` —
 // otherwise they'd dereference a bogus shadow address and trip a phantom
 // report on entry.
 

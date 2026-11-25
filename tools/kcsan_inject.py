@@ -19,7 +19,7 @@ Compared to KASAN, the denylist must additionally exclude:
   - Atomic-heavy modules where we want our own atomic primitives, not the
     compiler's tsan_atomic* shims.
 
-Usage:  kcsan_inject.py <input.ll> <output.ll>
+Usage:  kcsan_inject.py <input.ll> <output.ll> <tree root>
 """
 
 from __future__ import annotations
@@ -135,17 +135,14 @@ DIFILE_RE = re.compile(r'!DIFile\(filename:\s*"([^"]+)"(?:.*directory:\s*"([^"]+
 DISUBPROGRAM_RE = re.compile(r"!DISubprogram\([^)]*?\bfile:\s*!(\d+)")
 
 
-# Only instrument files whose path contains one of these substrings. This
-# excludes Zig's stdlib (which lives under /opt/zig-*/lib/std/) — instrumenting
+# Only instrument files under the tree's own src/ and lib/. This excludes
+# Zig's stdlib (which lives under /opt/zig-*/lib/std/) — instrumenting
 # fmt.zig + Writer.zig + ArrayList.zig etc. inflates the kernel by 100s of KB
 # of __tsan_* calls and pushes it past USER_LOAD_BASE. Project-only
 # instrumentation is what matters for race hunting; stdlib is well-tested.
-PATH_ALLOWLIST: tuple[str, ...] = (
-    "zigos-arch/src/",
-    "zigos-arch/lib/",
-    "zigos-arch\\src\\",
-    "zigos-arch\\lib\\",
-)
+# The tree is wherever the build runs: its root is the third argument, and
+# main() fills this in from it.
+PATH_ALLOWLIST: tuple[str, ...] = ()
 
 
 def build_metadata_index(text: str) -> tuple[dict[int, dict], dict[int, dict]]:
@@ -188,7 +185,7 @@ def function_source(line: str, di_subs: dict, di_files: dict) -> dict | None:
 
 
 def is_project_path(full_path: str) -> bool:
-    return any(allow in full_path for allow in PATH_ALLOWLIST)
+    return full_path.replace("\\", "/").startswith(PATH_ALLOWLIST)
 
 
 def inject(text: str) -> tuple[str, int, int]:
@@ -229,16 +226,23 @@ def inject(text: str) -> tuple[str, int, int]:
 
 
 def main() -> int:
-    if len(sys.argv) != 3:
-        print("usage: kcsan_inject.py <input.ll> <output.ll>", file=sys.stderr)
+    global PATH_ALLOWLIST
+    if len(sys.argv) != 4:
+        print("usage: kcsan_inject.py <input.ll> <output.ll> <tree root>", file=sys.stderr)
         return 2
     inp = Path(sys.argv[1])
     outp = Path(sys.argv[2])
+    root = str(Path(sys.argv[3]).resolve()).replace("\\", "/").rstrip("/")
+    PATH_ALLOWLIST = (root + "/src/", root + "/lib/")
     text = inp.read_text()
     new_text, total, inst = inject(text)
     outp.write_text(new_text)
     print(f"[kcsan_inject] {inst}/{total} functions tagged sanitize_thread")
     print(f"[kcsan_inject] denylist active: {len(DENYLIST)} files")
+    # A build that marks nothing would pass for one that found no races.
+    if inst == 0:
+        print(f"[kcsan_inject] nothing under {root}/src or {root}/lib was tagged", file=sys.stderr)
+        return 1
     return 0
 
 

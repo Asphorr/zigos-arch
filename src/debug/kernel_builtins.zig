@@ -2,10 +2,10 @@
 //
 // `zig build-exe` automatically links compiler-rt, supplying symbols like
 // `memcpy` / `memset` / `memmove` that LLVM emits for `@memcpy`, struct
-// copies, and large @memset calls. The KASAN IR-pass build pipeline takes
-// the kernel's bitcode through `opt → llc → ld` directly, bypassing Zig's
-// compiler-rt linking. Without these exports, the final `ld` step fails
-// with "undefined reference to memset" everywhere `@memset` got lowered.
+// copies, and large @memset calls. A sanitizer build (-Dkasan / -Dkcsan)
+// takes the kernel's IR through `opt → llc` and links the object that
+// comes out (build.zig, instrumentedObject); these exports are what that
+// object's lowered fills and copies bind to.
 //
 // The fill/copy cores are `rep stosb` / `rep movsb` INLINE ASM, not Zig
 // loops — and that is load-bearing, not a style choice: LLVM's loop-idiom
