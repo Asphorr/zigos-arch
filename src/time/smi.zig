@@ -39,10 +39,9 @@
 // with a reading from the other. benchRulers() prints both read costs at
 // boot — "[smi] ruler read cost".
 
-const acpi = @import("../acpi/acpi.zig");
+const acpi_pm = @import("acpi_pm.zig");
 const apic = @import("../irq/apic.zig");
 const debug = @import("../debug/debug.zig");
-const io = @import("../io.zig");
 const exectrail = @import("../debug/exectrail.zig");
 const symbols = @import("../debug/symbols.zig");
 const spinlock = @import("../proc/spinlock.zig");
@@ -50,7 +49,7 @@ const kvm = @import("../virt/kvm.zig");
 const pause = @import("pause.zig");
 const smp = @import("../cpu/smp.zig");
 
-const PM_TMR_HZ: u64 = 3_579_545;
+const PM_TMR_HZ: u64 = acpi_pm.HZ;
 const QUANTUM_MS: u64 = 10;
 // Threshold: anything above 15 ms between BSP IRQ0 ticks counts as a
 // stall. 5 ms slop above the expected 10 ms — KVM scheduling jitter alone
@@ -71,8 +70,6 @@ pub fn noteArmed(quanta: u32) void {
     if (quanta > @atomicLoad(u32, &armed_quanta_max, .monotonic)) @atomicStore(u32, &armed_quanta_max, quanta, .monotonic);
 }
 
-var pm_tmr_port: u16 = 0;
-var pm_tmr_mask: u32 = 0;
 var initialized: bool = false;
 
 /// Which wall clock the detector measures IRQ0 gaps on. `pm_tmr` = the
@@ -139,16 +136,12 @@ pub var max_stall_us: u64 = 0;
 var last_log_tick: u64 = 0;
 
 pub fn init() void {
-    const f = acpi.getFadt() orelse return;
-    if (f.pm_tmr_blk == 0 or f.pm_tmr_len == 0) return;
-    pm_tmr_port = @truncate(f.pm_tmr_blk);
-    // FADT.flags bit 8 = TMR_VAL_EXT. When set, PM_TMR is 32-bit; otherwise
-    // 24-bit (and bits [31:24] read zero). Wraparound is at 1.2 hr in 32-bit
-    // mode and 4.6 sec in 24-bit mode — both fine for our 10 ms windows.
-    const ext_32 = (f.flags & (1 << 8)) != 0;
-    pm_tmr_mask = if (ext_32) 0xFFFFFFFF else 0xFFFFFF;
+    // Either width of the counter wraps far outside a 10 ms window.
+    if (!acpi_pm.init()) return;
     initialized = true;
-    debug.klog("[smi] PM_TMR detector ready: port=0x{x} {s}-bit\n", .{ pm_tmr_port, if (ext_32) "32" else "24" });
+    debug.klog("[smi] PM_TMR detector ready: port=0x{x} {s}-bit\n", .{
+        acpi_pm.ioPort(), if (acpi_pm.counterMask() == 0xFFFF_FFFF) "32" else "24",
+    });
 }
 
 /// True once the PM_TMR detector is armed. spinlock.cliHoldCheck uses this
@@ -215,7 +208,7 @@ fn latchRuler() void {
 /// stayed torn for the whole seqlock bound (kvm.clockNs).
 inline fn rulerNow() ?u64 {
     return switch (ruler) {
-        .pm_tmr => @as(u64, io.inl(pm_tmr_port) & pm_tmr_mask),
+        .pm_tmr => @as(u64, acpi_pm.read()),
         .kvmclock => kvm.clockNs(0),
     };
 }
@@ -225,7 +218,7 @@ inline fn rulerNow() ?u64 {
 /// few cycles behind the BSP's must not wrap into 2^64).
 fn rulerDelta(prev: u64, now: u64) u64 {
     return switch (ruler) {
-        .pm_tmr => pmDelta(@truncate(prev), @truncate(now)),
+        .pm_tmr => acpi_pm.delta(@truncate(prev), @truncate(now)),
         .kvmclock => now -| prev,
     };
 }
@@ -262,7 +255,7 @@ pub fn benchRulers() void {
     var i: u32 = 0;
     const kvmclock_ready = kvm.clockReady();
     const t0 = rdtsc();
-    while (i < pm_reads) : (i += 1) sink +%= io.inl(pm_tmr_port);
+    while (i < pm_reads) : (i += 1) sink +%= acpi_pm.read();
     const t1 = rdtsc();
     if (kvmclock_ready) {
         i = 0;
@@ -450,15 +443,6 @@ inline fn rdtsc() u64 {
         \\ orq %%rdx, %%rax
         : [r] "={rax}" (-> u64),
         :: .{ .rdx = true });
-}
-
-/// Wraparound-safe delta on the masked PM_TMR counter. Returns the number
-/// of PM ticks elapsed from `prev` to `now`. Caller already masked both
-/// with `pm_tmr_mask`. PM_TMR ruler only — rulerDelta dispatches here.
-fn pmDelta(prev: u32, now: u32) u64 {
-    if (now >= prev) return now - prev;
-    // Wrapped: distance is (mask - prev) + now + 1.
-    return (@as(u64, pm_tmr_mask) - prev) + now + 1;
 }
 
 // ---------------------------------------------------------------------------

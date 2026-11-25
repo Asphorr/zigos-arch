@@ -481,7 +481,8 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     // OS shutdown via the SCI. Needs the FADT (acpi.init) and the IOAPIC
     // (apic.init) — both up by here. Best-effort; logs and continues on quirks.
     @import("acpi/sci.zig").init();
-    // Wall-clock time: latch boot epoch from RTC + HPET.
+    // The clocks: the reference for the TSC clock is picked here, the wall
+    // clock set from the RTC.
     @import("time/time.zig").init();
     blog.ok("Wall-clock epoch");
     // SMP: boot additional CPUs

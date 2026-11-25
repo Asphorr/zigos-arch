@@ -48,7 +48,8 @@ pub const groupCpuTicks = process.groupCpuTicks;
 pub fn clockNanos(clock: u64) ?u64 {
     return switch (clock) {
         CLOCK_REALTIME, CLOCK_REALTIME_COARSE, CLOCK_TAI => time.realtimeNanos(),
-        CLOCK_MONOTONIC, CLOCK_MONOTONIC_RAW, CLOCK_MONOTONIC_COARSE, CLOCK_BOOTTIME => time.monotonicNanos(),
+        CLOCK_MONOTONIC, CLOCK_MONOTONIC_RAW, CLOCK_MONOTONIC_COARSE => time.monotonicNanos(),
+        CLOCK_BOOTTIME => time.boottimeNanos(),
         CLOCK_PROCESS_CPUTIME_ID => groupCpuTicks((process.currentPCB() orelse return null).tgid) * TICK_NS,
         CLOCK_THREAD_CPUTIME_ID => process.cpuTicksOf(process.currentPCB() orelse return null) * TICK_NS,
         else => null,

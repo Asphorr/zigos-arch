@@ -312,6 +312,7 @@ export fn handleIRQ0(rsp: u64) callconv(.c) void {
     // task its wakeHiresExpired just readied here.
     var quantum_fire = !was_soft_yield;
     if (cpu.cpu_id == 0 and !was_soft_yield) {
+        @import("../../time/time.zig").tick();
         // Advance the 100 Hz wallclock by ELAPSED TSC, not one tick per fire:
         // the hires one-shot (#1006) fires the timer EARLY for sub-quantum
         // usleep deadlines, and those early fires must add 0 ticks — else every

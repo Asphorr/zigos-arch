@@ -946,16 +946,12 @@ fn renderStat(out: *Out) void {
         if (p.state == .running or p.state == .ready) running += 1;
     }
     out.print("intr {d}\nctxt {d}\nbtime {d}\nprocesses {d}\nprocs_running {d}\nprocs_blocked 0\nsoftirq 0 0 0 0 0 0 0 0 0 0 0\n", .{
-        ticks, ticks, bootEpoch(), total, @max(running, 1),
+        ticks, ticks, time.bootEpochSeconds(), total, @max(running, 1),
     });
 }
 
-fn bootEpoch() u64 {
-    return (time.realtimeNanos() -| time.monotonicNanos()) / std.time.ns_per_s;
-}
-
 fn renderUptime(out: *Out) void {
-    const up_cs = time.monotonicNanos() / (10 * std.time.ns_per_ms);
+    const up_cs = time.boottimeNanos() / (10 * std.time.ns_per_ms);
     const now = rdtsc();
     var idle: u64 = 0;
     for (0..smp.MAX_CPUS) |c| {

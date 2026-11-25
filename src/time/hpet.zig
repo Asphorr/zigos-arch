@@ -1,14 +1,14 @@
 // HPET (High Precision Event Timer) — main-counter driver.
 //
-// Provides a high-resolution monotonic clock that's machine-wide (no per-CPU
-// drift like the LAPIC timer) and far more accurate than the 100Hz
-// `tick_count` increment in handleIRQ0. Comparators (one-shot timers) are
-// not used yet — that's a follow-up if we ever go fully tickless on BSP.
+// A machine-wide counter at a frequency the device states itself: the first
+// choice of reference for the kernel clock (refclock.zig) and for the LAPIC
+// timer calibration. Not every machine has one — a firmware switch or a
+// hypervisor's default can leave it out; `isInitialized` says. Comparators
+// (one-shot timers) are not used.
 //
-// QEMU's i440fx/q35 emulation always exposes HPET at 0xFED00000 (the default
-// for x86 platforms when no ACPI override is parsed). Period is read from
-// the device, so we don't have to assume a frequency.
+// The base is the ACPI HPET table's, or 0xFED00000 where there is no table.
 
+const std = @import("std");
 const debug = @import("../debug/debug.zig");
 const paging = @import("../mm/paging.zig");
 const acpi = @import("../acpi/acpi.zig");
@@ -42,10 +42,10 @@ var period_fs: u64 = 0; // counter period in femtoseconds (10^-15 s)
 var initialized: bool = false;
 var counter_is_64bit: bool = true;
 
-// Software wrap-extension state for the 32-bit-counter case. Updated
-// inside readNanos via a TAS spinlock — readNanos isn't a hot enough
-// path to warrant lockless games (sysUsleep + gettimeofday are the
-// only callers). On 64-bit hardware this state is dead.
+// Software wrap-extension state for the 32-bit-counter case, behind a TAS
+// lock: readNanos is called with interrupts off there (refclock.nanos), so
+// no handler on the holder's CPU can come for it. On 64-bit hardware this
+// state is dead.
 var wrap_state_lock: u32 = 0;
 var wraps: u32 = 0;
 var last_seen32: u32 = 0;
@@ -107,22 +107,31 @@ pub fn isInitialized() bool {
     return initialized;
 }
 
-/// Raw counter value. On 32-bit hardware the upper 32 bits read as zero
-/// per HPET spec; readNanos handles that, but callers of readCounter
-/// directly will see a counter that wraps every ~5 minutes (worst case
-/// at 14.318 MHz). Use readNanos for monotonic timing instead.
-pub fn readCounter() u64 {
-    if (!initialized) return 0;
-    return read64(REG_MAIN_COUNTER);
+/// After S3: the platform may hand the counter back stopped, and at any
+/// value. Start it; what it then reads against what it read before the
+/// sleep is the caller's to take out (time.restartClock). BSP alone.
+pub fn afterS3() void {
+    if (!initialized) return;
+    write64(REG_GENERAL_CFG, read64(REG_GENERAL_CFG) | CFG_ENABLE);
+    // A lock an AP held when the power went is nobody's now.
+    @atomicStore(u32, &wrap_state_lock, 0, .release);
+    if (!counter_is_64bit) last_seen32 = @truncate(read64(REG_MAIN_COUNTER));
+}
+
+/// The longest the counter may go unread and still count right: a quarter
+/// of a 32-bit counter's wrap, whose wraps are told by the reads.
+pub fn maxGapNs() u64 {
+    if (counter_is_64bit) return std.math.maxInt(u64);
+    return @truncate((@as(u128, 1) << 30) * period_fs / 1_000_000);
 }
 
 /// Nanoseconds since hpet.init(). u64 holds ~584 years at ns precision.
 ///
 /// On 32-bit-counter HPETs the hardware counter wraps every ~5 min worst
 /// case. We extend it to 64 bits in software via a TAS-locked
-/// (wraps, last_seen32) pair updated on every read. Adds ~50 ns to
-/// readNanos on the legacy path; modern 64-bit hardware skips it
-/// entirely.
+/// (wraps, last_seen32) pair updated on every read — which has to come at
+/// least once a wrap; the clock's re-anchoring (time.zig) keeps inside
+/// maxGapNs.
 pub fn readNanos() u64 {
     if (!initialized) return 0;
     var ctr: u64 = undefined;
@@ -141,50 +150,12 @@ pub fn readNanos() u64 {
         }
         const cur32: u32 = @truncate(read64(REG_MAIN_COUNTER));
         // Wrap detect: a backwards cur32 means the hardware counter
-        // rolled over once. (Multiple wraps would only matter if no one
-        // called readNanos for ~5 min — implausible with usleep,
-        // gettimeofday, and the perf-stall logger calling us continuously.)
+        // rolled over once.
         if (cur32 < last_seen32) wraps +%= 1;
         last_seen32 = cur32;
         ctr = (@as(u64, wraps) << 32) | @as(u64, cur32);
         @atomicStore(u32, &wrap_state_lock, 0, .release);
     }
-    // ctr * period_fs / 1_000_000, but in u64 to avoid pulling __udivti3
-    // (compiler-rt 128-bit divide isn't linked by the KASAN pipeline's
-    // manual `ld` step). Split: whole-ns per tick + sub-ns remainder.
-    // For HPET 100MHz period_fs = 10_000_000 → period_ns_whole = 10,
-    // remainder = 0 — the second term is a no-op.
-    const period_ns_whole = period_fs / 1_000_000;
-    const period_ns_rem = period_fs % 1_000_000;
-    if (period_ns_rem == 0) return ctr *% period_ns_whole;
-    // ctr * rem would wrap past 2^64 / rem ticks (~17.7 days at
-    // 14.318 MHz); splitting ctr by 10^6 keeps it exact and in range.
-    const hi = ctr / 1_000_000;
-    const lo = ctr % 1_000_000;
-    return ctr *% period_ns_whole +% hi *% period_ns_rem +% (lo * period_ns_rem) / 1_000_000;
-}
-
-/// Microseconds since init. Convenient for short-duration timing.
-pub fn readMicros() u64 {
-    return readNanos() / 1_000;
-}
-
-/// Period of one HPET tick, in femtoseconds (10^-15 s). Returns 0 before
-/// init / when HPET is unavailable.
-pub fn periodFs() u64 {
-    return period_fs;
-}
-
-/// HPET tick frequency in Hz (typically 14.318 MHz on i440fx, 100 MHz on
-/// q35, hardware-specific elsewhere). Returns 0 if HPET is unavailable.
-pub fn frequencyHz() u64 {
-    if (period_fs == 0) return 0;
-    return 1_000_000_000_000_000 / period_fs;
-}
-
-/// True iff the HPET hardware exposes a full 64-bit main counter (the
-/// modern norm). 32-bit counters are software-extended in readNanos but
-/// readCounter sees the raw narrow value.
-pub fn isCounter64Bit() bool {
-    return counter_is_64bit;
+    // Femtoseconds per tick to nanoseconds: exact, in 128 bits.
+    return @truncate(@as(u128, ctr) * period_fs / 1_000_000);
 }

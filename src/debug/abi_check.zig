@@ -234,9 +234,9 @@ fn testPipeRoundtrip() void {
 // --- Test 8: Wall-clock + monotonicity ---
 // Two consecutive time.now() reads must be monotonic (later >= earlier). If
 // the clock ever goes backward we corrupt timestamps in user code (file mtimes,
-// scheduling deadlines). Also asserts the boot epoch is plausible (post-2020)
-// when HPET is present, since a wildly wrong RTC read would make all returned
-// timestamps useless.
+// scheduling deadlines). Also asserts the wall clock is plausible (2000 or
+// later), since a wildly wrong RTC read would make all returned timestamps
+// useless.
 fn testTimeMonotonic() void {
     const time = @import("../time/time.zig");
     const t1 = time.now();
@@ -248,18 +248,14 @@ fn testTimeMonotonic() void {
         @panic("ABI self-test failed");
     }
 
-    // Sanity: if HPET is up, the boot-epoch baseline should be after 2020-01-01
-    // (1577836800 unix seconds). QEMU's emulated RTC defaults to host time, so
-    // this catches "RTC was zeroed" bugs (BCD/binary mode confusion, etc.). On
-    // real hardware with a dead CMOS battery the RTC may report 2000 — accept
-    // anything >= 2000-01-01 (946684800).
-    const hpet = @import("../time/hpet.zig");
-    if (hpet.isInitialized()) {
-        const min_epoch: u64 = 946_684_800; // 2000-01-01
-        if (t1.sec < min_epoch) {
-            serial.print("[abi-test] FAIL TimeMonotonic: implausible epoch {d}s — RTC read failed?\n", .{t1.sec});
-            @panic("ABI self-test failed");
-        }
+    // Sanity: the wall clock should be after 2000-01-01 (946684800). QEMU's
+    // emulated RTC defaults to host time, so this catches "RTC was zeroed"
+    // bugs (BCD/binary mode confusion, etc.); on real hardware a dead CMOS
+    // battery reads as 2000 or a little later, which passes.
+    const min_epoch: u64 = 946_684_800; // 2000-01-01
+    if (t1.sec < min_epoch) {
+        serial.print("[abi-test] FAIL TimeMonotonic: implausible epoch {d}s — RTC read failed?\n", .{t1.sec});
+        @panic("ABI self-test failed");
     }
 }
 

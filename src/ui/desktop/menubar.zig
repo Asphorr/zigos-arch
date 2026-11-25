@@ -87,13 +87,12 @@ const STAT_REFRESH_TICKS: u64 = 500;
 
 /// True when the clock's minute has moved since the last render(), or a
 /// stat bar's fill has and the bar is STAT_REFRESH_TICKS old; the desktop
-/// then repaints the bar. Checks at most once a second (the clock read is
-/// port I/O).
+/// then repaints the bar. Checks at most once a second.
 pub fn stale() bool {
     const now = process.tick_count;
     if (now -% last_stale_check < 100) return false;
     last_stale_check = now;
-    if (rtc.readTime().minute != shown_minute) return true;
+    if (time.localNow().minute != shown_minute) return true;
     if (now -% shown_tick < STAT_REFRESH_TICKS) return false;
     sampleCpu();
     return statFill(cpu_pct) != shown_cpu_fill or statFill(memPct()) != shown_mem_fill;
@@ -132,26 +131,23 @@ fn weekday(year: u32, month: u32, day: u32) u32 {
 /// "Sun 15 Nov  11:33" into `buf`; returns the length written.
 fn formatClock(buf: *[20]u8, dt: rtc.DateTime) usize {
     var n: usize = 0;
-    // A clock that was never set can read month 0 or day 0: show the time alone.
-    if (dt.month >= 1 and dt.month <= 12 and dt.day >= 1 and dt.day <= 31 and dt.year >= 1) {
-        @memcpy(buf[n..][0..3], weekdays[weekday(dt.year, dt.month, dt.day)]);
-        n += 3;
-        buf[n] = ' ';
+    @memcpy(buf[n..][0..3], weekdays[weekday(dt.year, dt.month, dt.day)]);
+    n += 3;
+    buf[n] = ' ';
+    n += 1;
+    if (dt.day >= 10) {
+        buf[n] = '0' + dt.day / 10;
         n += 1;
-        if (dt.day >= 10) {
-            buf[n] = '0' + dt.day / 10;
-            n += 1;
-        }
-        buf[n] = '0' + dt.day % 10;
-        n += 1;
-        buf[n] = ' ';
-        n += 1;
-        @memcpy(buf[n..][0..3], months[dt.month - 1]);
-        n += 3;
-        buf[n] = ' ';
-        buf[n + 1] = ' ';
-        n += 2;
     }
+    buf[n] = '0' + dt.day % 10;
+    n += 1;
+    buf[n] = ' ';
+    n += 1;
+    @memcpy(buf[n..][0..3], months[dt.month - 1]);
+    n += 3;
+    buf[n] = ' ';
+    buf[n + 1] = ' ';
+    n += 2;
     buf[n] = '0' + dt.hour / 10;
     buf[n + 1] = '0' + dt.hour % 10;
     buf[n + 2] = ':';
@@ -183,8 +179,7 @@ pub fn render(focused_title: ?[]const u8) void {
     }
 
     // Right-side widgets, laid out right-to-left: [MEM] [CPU] [date + clock].
-    const utc = rtc.readDateTime();
-    const dt = time.toLocal(utc);
+    const dt = time.localNow();
     var clock_buf: [20]u8 = undefined;
     const clock = clock_buf[0..formatClock(&clock_buf, dt)];
     const clock_x: i32 = @as(i32, @intCast(gfx.screen_w)) - @as(i32, @intCast(atlas.measure(clock))) - 14;
@@ -192,8 +187,7 @@ pub fn render(focused_title: ?[]const u8) void {
 
     sampleCpu();
     const mp = memPct();
-    // The RTC's minute, which is what stale() compares against.
-    shown_minute = utc.minute;
+    shown_minute = dt.minute;
     shown_cpu_fill = statFill(cpu_pct);
     shown_mem_fill = statFill(mp);
     shown_tick = process.tick_count;
