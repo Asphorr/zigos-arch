@@ -907,6 +907,7 @@ fn isLegitDeepKstackWriter(rip: u64, addr: u64) bool {
     if (std.mem.eql(u8, r.name, "handleIRQ0")) return true;
     if (std.mem.eql(u8, r.name, "handleDynIrq")) return true;
     if (std.mem.startsWith(u8, r.name, "syscall.entry.CpuEntry(")) return true;
+    if (std.mem.eql(u8, r.name, "syscall_entry_common")) return true;
     if (std.mem.startsWith(u8, r.name, "cpu.idt.dynirq.DynIrqStub(")) return true;
 
     // Category 2: writer's RSP is in the same kstack as the watched

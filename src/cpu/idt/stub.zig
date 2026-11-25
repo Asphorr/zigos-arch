@@ -10,13 +10,7 @@
 const serial = @import("../../debug/serial.zig");
 const symbols = @import("../../debug/symbols.zig");
 const sched_asm = @import("../../proc/sched_asm.zig");
-
-/// `n` in decimal. Not std.fmt.comptimePrint: a stub's text takes several
-/// numbers, and that costs a few hundred of the 1000 comptime branches each.
-fn dec(comptime n: usize) []const u8 {
-    const digit = [_]u8{'0' + @as(u8, n % 10)};
-    return if (n < 10) &digit else dec(n / 10) ++ &digit;
-}
+const dec = @import("../../proc/frames.zig").decimal;
 
 /// Save what a handler may clobber: the frame's registers and the FP/SSE
 /// state, which kernel code uses freely.

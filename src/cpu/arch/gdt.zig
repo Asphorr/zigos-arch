@@ -29,7 +29,18 @@ comptime {
     // Anyone migrating to a struct must keep `@sizeOf(GdtEntry) == 8`.
 }
 
-// 7 GDT entries: null, kcode, kdata, ucode, udata, tss_low, tss_high
+/// The selectors, as `init` and smp's per-CPU copies lay the GDT out. User
+/// data sits under user code: SYSRET takes SS and CS from one base, in that
+/// order (STAR[63:48] + 8 and + 16).
+pub const sel = struct {
+    pub const kernel_code: u16 = 0x08;
+    pub const kernel_data: u16 = 0x10;
+    pub const user_data: u16 = 0x18 | 3;
+    pub const user_code: u16 = 0x20 | 3;
+    pub const tss: u16 = 0x28;
+};
+
+// 7 GDT entries: null, kcode, kdata, udata, ucode, tss_low, tss_high
 var entries: [7]u64 = undefined;
 
 /// Raw byte view of the GDT entries — for src/debug/cpu_struct_hash.zig

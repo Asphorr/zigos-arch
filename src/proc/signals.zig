@@ -299,10 +299,9 @@ pub const MContext = extern struct {
     rflags: u64,
 };
 
-/// Mirror of the syscall-asm trampoline's saved frame at `call doSyscall`.
-/// Field order must match the push sequence in syscall_entry.zig — first
-/// field = lowest address = last push. Alignment: 15 pushes + the 536 bytes
-/// under the frame = 656, +call = 664 mod 16 = 8.
+/// The frame the syscall entry hands doSyscall (frames.syscall, which
+/// holds this struct to the entry's pushes): first field = lowest address
+/// = last push.
 pub const SyscallFrame = extern struct {
     r10: u64,
     r9: u64,
@@ -334,17 +333,15 @@ pub const SyscallFrame = extern struct {
     // stack itself, which IS per-thread (kstack_pool[pid]).
     user_rsp: u64,
 
-    // Under the frame the entry stub keeps three words and, below them, the
-    // caller's FXSAVE image (536 bytes in all):
-    //   -8   r11 for a full restore
-    //   -16  rcx for a full restore
-    //   -24  exit mode: 0 leaves by sysret, which loads rip and rflags from
-    //        the rcx and r11 slots and so can't give those two registers
-    //        back; 1 leaves by iretq with every register restored.
-    const FULL_R11: usize = 8;
-    const FULL_RCX: usize = 16;
-    const EXIT_MODE: usize = 24;
-    const FPU_BELOW: usize = 536;
+    // Under the frame the entry keeps three words — r11 and rcx for a full
+    // restore, and the exit mode: 0 leaves by sysret, which loads rip and
+    // rflags from the rcx and r11 slots and so can't give those two
+    // registers back; 1 leaves by iretq with every register restored —
+    // and, below them, the caller's FXSAVE image.
+    const FULL_R11: usize = frames.syscall.full_r11_below;
+    const FULL_RCX: usize = frames.syscall.full_rcx_below;
+    const EXIT_MODE: usize = frames.syscall.exit_mode_below;
+    const FPU_BELOW: usize = frames.syscall.fp_below;
 
     /// The caller's FP/SSE state, fxsave'd by the entry stub and loaded
     /// back on the way out.
@@ -382,7 +379,8 @@ pub const IRQ0_FP_BELOW: usize = frames.entry.tick.fp_below;
 pub const EXC_FP_BELOW: usize = frames.entry.exception.fp_below;
 
 comptime {
-    @setEvalBranchQuota(10_000); // some forty field names, compared by character
+    @setEvalBranchQuota(10_000); // some sixty field names, compared by character
+    frames.syscall.assertMirror(SyscallFrame);
     frames.entry.tick.assertMirror(IrqFrame);
     frames.entry.exception.assertMirror(ExcFrame);
 }

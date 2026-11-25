@@ -38,6 +38,14 @@
 
 const std = @import("std");
 
+/// `n` in decimal, for an offset spliced into asm text. Not
+/// std.fmt.comptimePrint: a stub takes many numbers, and that costs a few
+/// hundred of the default 1000 comptime branches for each.
+pub fn decimal(comptime n: usize) []const u8 {
+    const digit = [_]u8{'0' + @as(u8, n % 10)};
+    return if (n < 10) &digit else decimal(n / 10) ++ &digit;
+}
+
 /// The 15 general-purpose registers a frame can carry (RSP is the frame).
 /// @tagName doubles as the AT&T spelling, so the enum IS the asm text.
 pub const Reg = enum {
@@ -304,5 +312,79 @@ pub const entry = struct {
         std.debug.assert(tick.iretqIndex(.rip) == 15 and tick.iretqIndex(.cs) == 16);
         std.debug.assert(exception.fp_bytes == 512 and exception.fp_below == 512);
         std.debug.assert(exception.iretqIndex(.rip) == 17 and exception.iretqIndex(.ss) == 21);
+    }
+};
+
+// ---------------- the syscall contract ---------------------------------------
+//
+// What the SYSCALL entry (syscall/entry.zig) leaves on the kernel stack,
+// low → high:
+//
+//   RSP at the call → [ FXSAVE image ][ exit mode ][ full rcx ][ full r11 ]
+//   the frame       → [ saved registers ][ user rsp ]            ← tss.rsp0
+//
+// SYSCALL pushes nothing and switches no stack: the entry loads RSP from
+// tss.rsp0 — 16-aligned, the top of the task's kernel stack — and pushes
+// the user's RSP itself. doSyscall is handed the frame, a
+// signals.SyscallFrame.
+
+pub const syscall = struct {
+    /// In pop order. rcx and r11 hold what SYSCALL put there, the user's
+    /// RIP and RFLAGS, and SYSRET takes them back from those two.
+    pub const saved = Frame(&.{
+        .r10, .r9,  .r8,  .rdx, .rsi, .rdi, .r15,
+        .r14, .r13, .r12, .rbp, .rbx, .rcx, .r11,
+    });
+
+    /// The frame's last word, above the registers.
+    pub const user_rsp_index = saved.count;
+    pub const qwords = saved.count + 1;
+
+    /// The three words under the frame, by distance below it. Exit mode 0
+    /// leaves by sysret; nonzero leaves by iretq with every register as
+    /// the frame has it and rcx and r11 from the two words here — sysret
+    /// cannot give those two back.
+    pub const full_r11_below: usize = 8;
+    pub const full_rcx_below: usize = 16;
+    pub const exit_mode_below: usize = 24;
+
+    /// From the frame down to RSP at the call, where the image is.
+    pub const fp_below = FXSAVE_BYTES + exit_mode_below;
+
+    /// Byte offsets from RSP at the call.
+    pub fn offset(comptime r: Reg) usize {
+        return fp_below + saved.index(r) * 8;
+    }
+    pub const user_rsp_offset = fp_below + user_rsp_index * 8;
+    pub const exit_mode_offset = fp_below - exit_mode_below;
+    pub const full_rcx_offset = fp_below - full_rcx_below;
+    pub const full_r11_offset = fp_below - full_r11_below;
+
+    /// Where the iretq exit builds its record: the top of the image, which
+    /// the fxrstor before it has finished with.
+    pub const iretq_offset = FXSAVE_BYTES - dispatch.iretq_words * 8;
+    pub fn iretqOffset(comptime w: Iretq) usize {
+        return iretq_offset + @intFromEnum(w) * 8;
+    }
+
+    /// Refuse to compile unless extern struct `T` is this frame.
+    pub fn assertMirror(comptime T: type) void {
+        const info = @typeInfo(T).@"struct";
+        if (info.layout != .@"extern" or info.fields.len != qwords) {
+            @compileError(@typeName(T) ++ " is not the frame the syscall entry builds: wrong layout or field count");
+        }
+        for (saved.regs, 0..) |r, k| expectField(T, k, @tagName(r));
+        expectField(T, user_rsp_index, "user_rsp");
+    }
+
+    comptime {
+        // The numbers the entry carried by hand.
+        std.debug.assert(fp_below == 536);
+        std.debug.assert(offset(.r10) == 536 and offset(.rcx) == 632 and offset(.r11) == 640);
+        std.debug.assert(user_rsp_offset == 648);
+        std.debug.assert(exit_mode_offset == 512 and full_rcx_offset == 520 and full_r11_offset == 528);
+        std.debug.assert(iretq_offset == 472);
+        // From a 16-aligned tss.rsp0 the call is ABI-clean.
+        std.debug.assert((qwords * 8 + fp_below) % 16 == 0);
     }
 };

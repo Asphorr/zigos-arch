@@ -1,38 +1,47 @@
-// Fast syscall/sysret implementation for x86_64
-// Replaces int 0x80 with native syscall instruction (40% faster).
+// The SYSCALL entry: the MSRs that arm it on a CPU, and the code LSTAR
+// points at.
 //
-// Per-CPU dispatch without GS_BASE: each CPU has its own LSTAR target — a
-// dedicated naked entry stub that loads the kernel stack pointer from
-// `cpus[N].tss.rsp0`, the same TSS field the CPU hardware reads on every
-// IDT-gate entry. The stub does a two-instruction indirect load:
+// SYSCALL switches no stack and leaves every register spoken for — rcx and
+// r11 hold the user's RIP and RFLAGS, rax the call's number, the rest its
+// arguments or the caller's own. What is free, and already per-CPU, is RIP:
+// LSTAR is an MSR. So each CPU enters at a head of its own, a few
+// instructions that know their CPU by where they stand; they put RSP on the
+// task's kernel stack and jump to the one body all CPUs share.
 //
-//   movq cpus_base(%rip), %r11   ; base = &cpus[0], stamped in smp.init()
-//   movq <off>(%r11), %rsp       ; off = N*sizeOf(CpuLocal)+offsetOf(tss)+4
+// The kernel stack is `cpus[N].tss.rsp0` — the field the hardware itself
+// reads on an interrupt from ring 3, so the two ways in land on one stack
+// by construction and there is no second copy to drift.
 //
-// Indirect (not RIP-relative direct) because CpuLocal isn't extern-
-// compatible — see smp.zig cpus_base comment. One extra cycle on the
-// syscall hot path, negligible. Both the syscall path and the IDT-gate
-// path now land on the same kstack by construction — no `per_cpu_asm`
-// mirror to drift.
+// No GS base and no swapgs: nothing to pair up on every kernel↔user edge,
+// and no window in which an NMI finds the kernel on the user's GS.
 //
-// The previous design read `%gs:0` / `%gs:8` and depended on `swapgs` having
-// been issued correctly on every kernel↔user CPL transition (8 sites across
-// 4 files). Missing any one of them triple-faulted on the trampoline's first
-// instruction. That bug class is now structurally impossible.
-//
-// LSTAR is naturally per-CPU (it's an MSR), and `init()` is invoked on each
-// CPU separately (the `syscall` entry of cpu/cpu_state.zig). init() asks
-// smp.myCpuId() which CPU it is on and points LSTAR at that CPU's stub.
+// `init()` runs on each CPU (the `syscall` entry of cpu/cpu_state.zig) and
+// points that CPU's LSTAR at that CPU's head.
 
-const syscall = @import("../syscall.zig");
 const smp = @import("../cpu/smp.zig");
 const gdt = @import("../cpu/arch/gdt.zig");
 const std = @import("std");
 const msr = @import("../cpu/arch/msr.zig");
 const rflags = @import("../cpu/arch/cr.zig").rflags;
+const frames = @import("../proc/frames.zig");
+
+const sc = frames.syscall;
+const dec = frames.decimal;
+
+/// SYSCALL loads CS from STAR[47:32] and SS from that + 8. SYSRET to 64-bit
+/// code loads SS from STAR[63:48] + 8 and CS from STAR[63:48] + 16, both
+/// with RPL 3 — which is why the GDT has user data under user code.
+const sysret_base: u16 = (gdt.sel.user_data & ~@as(u16, 3)) - 8;
+const STAR_VALUE: u64 = (@as(u64, gdt.sel.kernel_code) << 32) | (@as(u64, sysret_base) << 48);
+
+comptime {
+    std.debug.assert(gdt.sel.kernel_data == gdt.sel.kernel_code + 8);
+    std.debug.assert(gdt.sel.user_code == (sysret_base + 16) | 3);
+    std.debug.assert(STAR_VALUE == (@as(u64, 0x08) << 32) | (@as(u64, 0x10) << 48));
+}
 
 /// Initialize syscall/sysret support on the calling CPU. Picks this CPU's
-/// dedicated entry stub and writes it to LSTAR.
+/// dedicated entry head and writes it to LSTAR.
 pub fn init() void {
     const debug = @import("../debug/debug.zig");
 
@@ -47,39 +56,23 @@ pub fn init() void {
     efer = msr.read(msr.EFER);
     debug.klog("[syscall] EFER after: 0x{X:0>16}\n", .{efer});
 
-    // STAR: Segment selectors for syscall/sysret
-    // Bits 32-47: Kernel CS/SS base (syscall loads CS from here, SS from +8)
-    // Bits 48-63: User CS/SS base (sysret loads CS from here+16, SS from +8)
-    //
-    // Our GDT (reordered for syscall/sysret compatibility):
-    // 0x00: null, 0x08: kcode, 0x10: kdata, 0x18: udata, 0x20: ucode
-    //
-    // syscall: CS = STAR[32:47], SS = STAR[32:47]+8
-    //   Want: CS=0x08 (kcode), SS=0x10 (kdata)
-    //   So: STAR[32:47] = 0x08 ✓
-    //
-    // sysret: CS = STAR[48:63]+16 | 3, SS = STAR[48:63]+8 | 3
-    //   Want: CS=0x23 (0x20|3, ucode), SS=0x1B (0x18|3, udata)
-    //   So: STAR[48:63]+16 = 0x20 → STAR[48:63] = 0x10 ✓
-    //       STAR[48:63]+8 = 0x18 → STAR[48:63] = 0x10 ✓
-    const star: u64 = (@as(u64, 0x08) << 32) | (@as(u64, 0x10) << 48);
-    msr.write(msr.STAR, star);
-    debug.klog("[syscall] STAR: 0x{X:0>16}\n", .{star});
+    msr.write(msr.STAR, STAR_VALUE);
+    debug.klog("[syscall] STAR: 0x{X:0>16}\n", .{STAR_VALUE});
 
-    // LSTAR: this CPU's own entry stub, by the id myCpu() indexes cpus[]
-    // with. Not by the LAPIC ID register: the boot CPU gets here before its
-    // LAPIC mode is set, and is CPU 0 whatever that register would say.
+    // LSTAR: this CPU's own head, by the id myCpu() indexes cpus[] with.
+    // Not by the LAPIC ID register: the boot CPU gets here before its LAPIC
+    // mode is set, and is CPU 0 whatever that register would say.
     const my_id = smp.myCpuId();
-    const stub_addr = @intFromPtr(cpu_entries[my_id]);
-    msr.write(msr.LSTAR, stub_addr);
-    debug.klog("[syscall] LSTAR(cpu{d}): 0x{X:0>16}\n", .{ my_id, stub_addr });
+    const head_addr = @intFromPtr(cpu_entries[my_id]);
+    msr.write(msr.LSTAR, head_addr);
+    debug.klog("[syscall] LSTAR(cpu{d}): 0x{X:0>16}\n", .{ my_id, head_addr });
 
-    // SFMASK clears IF: the stub runs on the user RSP until it has switched
+    // SFMASK clears IF: the entry runs on the user RSP until it has switched
     // stacks. doSyscall enables interrupts for the handler body only. It
     // clears DF too: user code may enter with DF=1 (musl's backward memmove
     // is `std; rep movsb; cld`), and the kernel's rep-string memcpy/memset
     // would then run backwards. TF too: a single step would trap at the
-    // stub's first instruction, in ring 0 on the user's RSP. And NT: an
+    // head's first instruction, in ring 0 on the user's RSP. And NT: an
     // iretq with it set faults. SYSRET restores the user's own from R11.
     msr.write(msr.SFMASK, rflags.TF | rflags.IF | rflags.DF | rflags.IOPL | rflags.NT);
     debug.klog("[syscall] syscall/sysret initialized\n", .{});
@@ -99,9 +92,8 @@ pub fn verifyMsrs(cpu_label: []const u8) void {
         debug.klog("[syscall-verify] FAIL {s}: EFER.SCE=0 (efer=0x{X})\n", .{ cpu_label, efer });
         @panic("syscall MSR verify: EFER.SCE not set");
     }
-    const expected_star: u64 = (@as(u64, 0x08) << 32) | (@as(u64, 0x10) << 48);
-    if (star != expected_star) {
-        debug.klog("[syscall-verify] FAIL {s}: STAR=0x{X:0>16} expected 0x{X:0>16}\n", .{ cpu_label, star, expected_star });
+    if (star != STAR_VALUE) {
+        debug.klog("[syscall-verify] FAIL {s}: STAR=0x{X:0>16} expected 0x{X:0>16}\n", .{ cpu_label, star, STAR_VALUE });
         @panic("syscall MSR verify: STAR mismatch");
     }
     const my_id = smp.myCpuId();
@@ -113,164 +105,42 @@ pub fn verifyMsrs(cpu_label: []const u8) void {
     debug.klog("[syscall-verify] OK {s}: EFER.SCE=1 STAR ok LSTAR(cpu{d})=0x{X}\n", .{ cpu_label, my_id, lstar });
 }
 
-// --- Per-CPU syscall entry stubs ---
-//
-// Each stub is an independent naked function. The CPU's per-CPU slots
-// are addressed as RIP-relative references to `per_cpu_user_rsp` (hot,
-// unprotected) and `cpus[N].tss.rsp0` (the canonical TSS field the CPU
-// hardware reads on every IDT-gate entry). No GS_BASE, no swapgs, no
-// MSR reads, no duplicated state to keep in sync.
-//
-// Reading directly from the TSS field that the hardware itself reads
-// eliminates the "two fields out of sync" desync class (cpu-alias FAIL
-// on tss.rsp0 vs per_cpu_asm.syscall_stack_top, 2026-05-17): the syscall
-// path and the IDT-gate path land on the *same* kstack by construction.
-//
-// Layout invariants (enforced in smp.zig comptime):
-//   per_cpu_user_rsp[N]    = per_cpu_user_rsp + N*8
-//   cpus[N].tss.rsp0       = cpus + N*sizeof(CpuLocal) + offsetOf(tss) + 4
-// The smp.zig assert guarantees the 8-byte read doesn't straddle a cache
-// line, so a same-CPU setTssRsp0 update is observed atomically here.
-
 extern fn doSyscall(num: u32, arg1: u32, arg2: u32, arg3: u32, frame: ?*anyopaque) callconv(.c) u64;
 
+/// One CPU's way in: all of the entry that depends on which CPU it is.
+///
+/// Layout the two operands rest on (asserted in smp.zig):
+///   per_cpu_user_rsp[N] = per_cpu_user_rsp + N*8
+///   cpus[N].tss.rsp0    = cpus + N*sizeOf(CpuLocal) + offsetOf(tss) + offsetOf(rsp0)
+/// and the 8-byte read of rsp0 does not straddle a cache line, so this CPU
+/// sees its own setTssRsp0 whole.
 fn CpuEntry(comptime cpu_id: u8) type {
-    const off_user_rsp_str = std.fmt.comptimePrint("{d}", .{@as(usize, cpu_id) * 8});
-    const tss_rsp0_off = @as(usize, cpu_id) * @sizeOf(smp.CpuLocal)
-        + @offsetOf(smp.CpuLocal, "tss")
-        + @offsetOf(gdt.Tss64, "rsp0");
-    const off_tss_rsp0_str = std.fmt.comptimePrint("{d}", .{tss_rsp0_off});
+    const user_rsp_slot = std.fmt.comptimePrint("per_cpu_user_rsp+{d}(%%rip)", .{@as(usize, cpu_id) * 8});
+    const rsp0_off = std.fmt.comptimePrint("{d}", .{
+        @as(usize, cpu_id) * @sizeOf(smp.CpuLocal) + @offsetOf(smp.CpuLocal, "tss") + @offsetOf(gdt.Tss64, "rsp0"),
+    });
     return struct {
         pub fn entry() callconv(.naked) noreturn {
             asm volatile (
-            // Save user RSP into this CPU's user_rsp slot — TRANSIENT bridge
-            // only. The persistent copy goes onto the kernel stack two lines
-            // below.
-                "movq %%rsp, per_cpu_user_rsp+" ++ off_user_rsp_str ++ "(%%rip)\n" ++
-                    // Two-step indirect load to cpus[N].tss.rsp0. We can't
-                    // safely scratch any GPR — rcx/r11 hold user RIP/RFLAGS
-                    // for sysret, rax holds syscall_num, rdi/rsi/rdx/r10
-                    // hold user args, callee-saves are user-owned. So we
-                    // use RSP itself as the scratch: SYSCALL/SFMASK cleared
-                    // IF, no IRQ can land between the two loads, and step 2
-                    // overwrites RSP with the real kernel stack top before
-                    // any push happens.
-                    "movq cpus_base(%%rip), %%rsp\n" ++          // rsp = &cpus[0]
-                    "movq " ++ off_tss_rsp0_str ++ "(%%rsp), %%rsp\n" ++ // rsp = cpus[N].tss.rsp0
-                    // PUSH user RSP FIRST — ends up at the highest address among the
-                    // 15 pushes, matching SyscallFrame.user_rsp's trailing position.
-                    // Lifetime is now tied to the kernel stack (per-thread), so it
-                    // survives int $0x20 reschedules from sysFutex/sysSleep/etc.
-                    "pushq per_cpu_user_rsp+" ++ off_user_rsp_str ++ "(%%rip)\n" ++
-                    // Save callee-saved + user state. Save r8/r9/r10 across the C
-                    // call too — SysV-volatile, but user expects only rcx/r11 plus
-                    // rdi/rsi/rdx (the shuffle below) to change.
-                    "push %%r11\n" ++
-                    "push %%rcx\n" ++
-                    "push %%rbx\n" ++
-                    "push %%rbp\n" ++
-                    "push %%r12\n" ++
-                    "push %%r13\n" ++
-                    "push %%r14\n" ++
-                    "push %%r15\n" ++
-                    // Save user's syscall args (rdi/rsi/rdx) BEFORE the shuffle.
-                    // Required so signal delivery on syscall return can rewrite
-                    // these slots with handler args (signo/siginfo/ucontext) and
-                    // sigreturn can restore the user's pre-syscall values.
-                    "push %%rdi\n" ++
-                    "push %%rsi\n" ++
-                    "push %%rdx\n" ++
-                    // Shuffle syscall ABI → SysV ABI. RAX=num, RDI=a1, RSI=a2,
-                    // RDX=a3 → RDI=num, RSI=a1, RDX=a2, RCX=a3.
-                    "mov %%rdx, %%rcx\n" ++
-                    "mov %%rsi, %%rdx\n" ++
-                    "mov %%rdi, %%rsi\n" ++
-                    "mov %%rax, %%rdi\n" ++
-                    "push %%r8\n" ++
-                    "push %%r9\n" ++
-                    "push %%r10\n" ++
-                    // 536 = 512 FXSAVE + the three words under the frame
-                    // (signals.SyscallFrame: exit mode, then the rcx and r11
-                    // a full restore loads). 15 prior pushes (120B) + 536 =
-                    // 656, 656%16==0; CALL pushes 8 → callee at %16==8.
-                    "sub $536, %%rsp\n" ++
-                    "movq $0, 512(%%rsp)\n" ++ // exit mode: sysret
-                    "fxsaveq (%%rsp)\n" ++
-                    // 5th arg to doSyscall = pointer to the saved frame (start of
-                    // the GPR area, just above the 536 bytes). Layout
-                    // matches signals.SyscallFrame — 14 u64 GPRs starting at r10,
-                    // followed by user_rsp at offset 112.
-                    "leaq 536(%%rsp), %%r8\n" ++
-                    "test $0xF, %%rsp\n" ++
-                    "jnz syscall_align_panic\n" ++
-                    "call doSyscall\n" ++
-                    // doSyscall returns with IF=0 already; this makes it
-                    // structural. From `pop %rsp` to sysretq RSP is the user
-                    // stack in ring 0, where an interrupt must not land.
-                    "cli\n" ++
-                    "fxrstorq (%%rsp)\n" ++
-                    "cmpq $0, 512(%%rsp)\n" ++
-                    "jne 7f\n" ++
-                    "add $536, %%rsp\n" ++
-                    "pop %%r10\n" ++
-                    "pop %%r9\n" ++
-                    "pop %%r8\n" ++
-                    "pop %%rdx\n" ++
-                    "pop %%rsi\n" ++
-                    "pop %%rdi\n" ++
-                    "pop %%r15\n" ++
-                    "pop %%r14\n" ++
-                    "pop %%r13\n" ++
-                    "pop %%r12\n" ++
-                    "pop %%rbp\n" ++
-                    "pop %%rbx\n" ++
-                    "pop %%rcx\n" ++
-                    "pop %%r11\n" ++
-                    // pop %rsp loads from [%rsp] into %rsp — gives user_rsp directly.
-                    // The post-pop RSP increment is overwritten by the load, so the
-                    // 8 bytes of "leak" on the kernel stack don't matter (next
-                    // syscall resets RSP from cpus[N].tss.rsp0).
-                    "pop %%rsp\n" ++
-                    "sysretq\n" ++
-                    // Full restore (rt_sigreturn): every register comes back,
-                    // rcx and r11 too, so the exit is iretq. Its frame is
-                    // built in the FXSAVE block, free now, from the slots
-                    // sysret would have used; rax is the call's result.
-                    "7:\n" ++
-                    "movq 632(%%rsp), %%rcx\n" ++ // frame.rcx: rip
-                    "movq %%rcx, 472(%%rsp)\n" ++
-                    "movq $0x23, 480(%%rsp)\n" ++ // user cs
-                    "movq 640(%%rsp), %%rcx\n" ++ // frame.r11: rflags
-                    "movq %%rcx, 488(%%rsp)\n" ++
-                    "movq 648(%%rsp), %%rcx\n" ++ // frame.user_rsp
-                    "movq %%rcx, 496(%%rsp)\n" ++
-                    "movq $0x1B, 504(%%rsp)\n" ++ // user ss
-                    "movq 520(%%rsp), %%rcx\n" ++
-                    "movq 528(%%rsp), %%r11\n" ++
-                    "movq 536(%%rsp), %%r10\n" ++
-                    "movq 544(%%rsp), %%r9\n" ++
-                    "movq 552(%%rsp), %%r8\n" ++
-                    "movq 560(%%rsp), %%rdx\n" ++
-                    "movq 568(%%rsp), %%rsi\n" ++
-                    "movq 576(%%rsp), %%rdi\n" ++
-                    "movq 584(%%rsp), %%r15\n" ++
-                    "movq 592(%%rsp), %%r14\n" ++
-                    "movq 600(%%rsp), %%r13\n" ++
-                    "movq 608(%%rsp), %%r12\n" ++
-                    "movq 616(%%rsp), %%rbp\n" ++
-                    "movq 624(%%rsp), %%rbx\n" ++
-                    "addq $472, %%rsp\n" ++
-                    "iretq\n");
+            // The slot is a bridge. The copy that lasts is the push below,
+            // on the task's own stack: a task that blocks in its call leaves
+            // this CPU, and the slot, to the next one.
+                "movq %%rsp, " ++ user_rsp_slot ++ "\n" ++
+                    // RSP is the one register free to compute with, and
+                    // nothing can push while it holds &cpus[0]: IF is off
+                    // (SFMASK) and an NMI has a stack of its own (IST2).
+                    // Through cpus_base because CpuLocal is not extern-
+                    // compatible (see smp.zig).
+                    "movq cpus_base(%%rip), %%rsp\n" ++
+                    "movq " ++ rsp0_off ++ "(%%rsp), %%rsp\n" ++
+                    "pushq " ++ user_rsp_slot ++ "\n" ++
+                    "jmp syscall_entry_common\n");
         }
     };
 }
 
-// Materialize one entry function per CPU. Each `CpuEntry(i)` is a distinct
-// type → distinct function instance, so the linker emits one stub per CPU.
-// Comptime loop instantiates one slot per MAX_CPUS, so bumping the
-// constant in smp.zig automatically grows the table. The eval-branch
-// quota has to climb in lockstep — each CpuEntry runs comptimePrint twice
-// internally and that burns ~1500 branches per CPU.
+// One head per possible CPU. Each CpuEntry(i) is a distinct type, hence a
+// distinct function. The quota: comptimePrint, twice per head.
 const cpu_entries = blk: {
     @setEvalBranchQuota(@as(u32, smp.MAX_CPUS) * 2000 + 5000);
     var arr: [smp.MAX_CPUS]*const fn () callconv(.naked) noreturn = undefined;
@@ -280,10 +150,73 @@ const cpu_entries = blk: {
     break :blk arr;
 };
 
-/// Reached when the inline-asm trampoline pushes a count that breaks the
-/// 16-byte stack alignment expected at `call doSyscall`. If this fires,
-/// re-count the pushes and adjust the `sub $N, %rsp` so push_count*8 + N ≡ 0
-/// (mod 16).
+/// The exit that gives every register back (rt_sigreturn): rcx and r11
+/// too, which sysret needs for itself, so it leaves by iretq. The record
+/// is built in the FXSAVE image, free once fxrstor has read it, from the
+/// frame's slots sysret would have used; rax is the call's result.
+const full_restore: []const u8 = blk: {
+    var text: []const u8 =
+        "movq " ++ dec(sc.offset(.rcx)) ++ "(%%rsp), %%rcx\n" ++ // the frame's rcx: rip
+        "movq %%rcx, " ++ dec(sc.iretqOffset(.rip)) ++ "(%%rsp)\n" ++
+        "movq $" ++ dec(gdt.sel.user_code) ++ ", " ++ dec(sc.iretqOffset(.cs)) ++ "(%%rsp)\n" ++
+        "movq " ++ dec(sc.offset(.r11)) ++ "(%%rsp), %%rcx\n" ++ // the frame's r11: rflags
+        "movq %%rcx, " ++ dec(sc.iretqOffset(.rflags)) ++ "(%%rsp)\n" ++
+        "movq " ++ dec(sc.user_rsp_offset) ++ "(%%rsp), %%rcx\n" ++
+        "movq %%rcx, " ++ dec(sc.iretqOffset(.rsp)) ++ "(%%rsp)\n" ++
+        "movq $" ++ dec(gdt.sel.user_data) ++ ", " ++ dec(sc.iretqOffset(.ss)) ++ "(%%rsp)\n" ++
+        "movq " ++ dec(sc.full_rcx_offset) ++ "(%%rsp), %%rcx\n" ++
+        "movq " ++ dec(sc.full_r11_offset) ++ "(%%rsp), %%r11\n";
+    for (sc.saved.regs) |r| {
+        if (r == .rcx or r == .r11) continue;
+        text = text ++ "movq " ++ dec(sc.offset(r)) ++ "(%%rsp), %%" ++ @tagName(r) ++ "\n";
+    }
+    break :blk text ++
+        "addq $" ++ dec(sc.iretq_offset) ++ ", %%rsp\n" ++
+        "iretq\n";
+};
+
+/// Where every head jumps: RSP on the task's kernel stack, the user's RSP
+/// pushed, every other register still the user's. Builds frames.syscall,
+/// calls doSyscall with the frame, and leaves the way the frame's exit
+/// mode says.
+export fn syscall_entry_common() callconv(.naked) noreturn {
+    asm volatile (sc.saved.push_asm ++
+            // The call's ABI to SysV's: rax = number and rdi, rsi, rdx =
+            // arguments become rdi, rsi, rdx, rcx. The user's own values
+            // are in the frame by now, where signal delivery rewrites them
+            // and sigreturn puts them back.
+            "movq %%rdx, %%rcx\n" ++
+            "movq %%rsi, %%rdx\n" ++
+            "movq %%rdi, %%rsi\n" ++
+            "movq %%rax, %%rdi\n" ++
+            "subq $" ++ dec(sc.fp_below) ++ ", %%rsp\n" ++
+            "movq $0, " ++ dec(sc.exit_mode_offset) ++ "(%%rsp)\n" ++ // leave by sysret
+            "fxsaveq (%%rsp)\n" ++
+            "leaq " ++ dec(sc.fp_below) ++ "(%%rsp), %%r8\n" ++ // 5th argument: the frame
+            // tss.rsp0 is the one thing the layout cannot vouch for.
+            "testq $0xF, %%rsp\n" ++
+            "jnz syscall_align_panic\n" ++
+            "call doSyscall\n" ++
+            // doSyscall returns with IF off; this makes it structural. From
+            // `popq %rsp` to sysretq RSP is the user's, in ring 0, where no
+            // interrupt may land.
+            "cli\n" ++
+            "fxrstorq (%%rsp)\n" ++
+            "cmpq $0, " ++ dec(sc.exit_mode_offset) ++ "(%%rsp)\n" ++
+            "jne 7f\n" ++
+            "addq $" ++ dec(sc.fp_below) ++ ", %%rsp\n" ++
+            sc.saved.pop_asm ++
+            // The frame's last word is the user's RSP. What popq would add
+            // to RSP is lost in the load, and need not be kept: the next
+            // entry starts from tss.rsp0 again.
+            "popq %%rsp\n" ++
+            "sysretq\n" ++
+            "7:\n" ++
+            full_restore);
+}
+
+/// The entry found RSP off a 16-byte boundary at `call doSyscall`: the
+/// tss.rsp0 it started from was not 16-aligned.
 pub export fn syscall_align_panic() callconv(.c) noreturn {
-    @panic("syscall_entry: RSP misaligned at call doSyscall — count pushes vs sub");
+    @panic("syscall entry: RSP misaligned at call doSyscall — tss.rsp0 is not 16-aligned");
 }
