@@ -32,8 +32,12 @@ pub const Conditions = struct {
     latitude: f64,
     longitude: f64,
     temp_c: f64,
+    /// What the air feels like, wind and humidity counted in.
+    feels_c: f64,
     humidity: u8,
     wind_kmh: f64,
+    /// Where the wind blows from, degrees clockwise from north.
+    wind_from_deg: u16,
 
     /// WMO weather code. 0=clear, 1-3=partial/overcast, 45/48=fog,
     /// 51-57=drizzle, 61-67=rain, 71-77=snow, 80-86=showers, 95-99=storm.
@@ -123,7 +127,7 @@ fn geocode(city: []const u8, out: *Conditions, lat_out: *f64, lon_out: *f64) Err
 }
 
 fn forecast(lat: f64, lon: f64, out: *Conditions) Error!void {
-    // URL: api.open-meteo.com/v1/forecast?latitude=X&longitude=Y&current=temperature_2m,relative_humidity_2m,is_day,weather_code,wind_speed_10m
+    // URL: api.open-meteo.com/v1/forecast?latitude=X&longitude=Y&current=<fields>
     var url_buf: [400]u8 = undefined;
     var pos: usize = 0;
     const p1 = "api.open-meteo.com/v1/forecast?latitude=";
@@ -134,7 +138,7 @@ fn forecast(lat: f64, lon: f64, out: *Conditions) Error!void {
     @memcpy(url_buf[pos..][0..p2.len], p2);
     pos += p2.len;
     pos += writeFloat(url_buf[pos..], lon);
-    const p3 = "&current=temperature_2m,relative_humidity_2m,is_day,weather_code,wind_speed_10m";
+    const p3 = "&current=temperature_2m,apparent_temperature,relative_humidity_2m,is_day,weather_code,wind_speed_10m,wind_direction_10m";
     @memcpy(url_buf[pos..][0..p3.len], p3);
     pos += p3.len;
 
@@ -147,6 +151,10 @@ fn forecast(lat: f64, lon: f64, out: *Conditions) Error!void {
     out.temp_c = (current.get("temperature_2m") orelse return Error.BadResponse).asNumber() orelse 0;
     out.humidity = @intCast((current.get("relative_humidity_2m") orelse return Error.BadResponse).asInt() orelse 0);
     out.wind_kmh = (current.get("wind_speed_10m") orelse return Error.BadResponse).asNumber() orelse 0;
+    // The two below are extras: a reply without them is still a reply.
+    out.feels_c = if (current.get("apparent_temperature")) |v| v.asNumber() orelse out.temp_c else out.temp_c;
+    const from: i64 = if (current.get("wind_direction_10m")) |v| v.asInt() orelse 0 else 0;
+    out.wind_from_deg = @intCast(@mod(from, 360));
     out.code = @intCast((current.get("weather_code") orelse return Error.BadResponse).asInt() orelse 0);
     const is_day_i: i64 = (current.get("is_day") orelse return Error.BadResponse).asInt() orelse 1;
     out.is_day = is_day_i != 0;
