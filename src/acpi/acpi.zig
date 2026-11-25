@@ -669,6 +669,15 @@ fn validateRsdp(addr: u64) ?*align(1) const Rsdp {
     return r;
 }
 
+/// The scan's own test. validateRsdp says why an address it was GIVEN is
+/// not an RSDP; asked about each of the scan's eight thousand candidates,
+/// it filled the log for two minutes.
+fn hasRsdpSignature(addr: u64) bool {
+    if (!physRangeMapped(addr, 8)) return false;
+    const signature: *const [8]u8 = @ptrFromInt(paging.physToVirt(addr));
+    return std.mem.eql(u8, signature, "RSD PTR ");
+}
+
 /// Scan the BIOS-era RSDP windows. EBDA is pointed to by the BDA word at
 /// 0x40E (segment, multiply by 16 for linear). The high BIOS area
 /// 0xE0000..0xFFFFF is always scanned. RSDP is paragraph-aligned.
@@ -682,11 +691,13 @@ fn scanBiosRsdp() ?*align(1) const Rsdp {
         var addr: u64 = ebda_base;
         const ebda_end = @min(ebda_base + 1024, 0xA0000);
         while (addr + 20 <= ebda_end) : (addr += 16) {
+            if (!hasRsdpSignature(addr)) continue;
             if (validateRsdp(addr)) |r| return r;
         }
     }
     var addr: u64 = 0xE0000;
     while (addr + 20 <= 0x100000) : (addr += 16) {
+        if (!hasRsdpSignature(addr)) continue;
         if (validateRsdp(addr)) |r| return r;
     }
     return null;
