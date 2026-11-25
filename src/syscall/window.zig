@@ -115,8 +115,11 @@ pub fn sysReadBlocking() u32 {
 }
 
 pub fn sysGetKeyState(arg1: u32) u32 {
-    if (arg1 < 256) return @intFromBool(keyboard.key_state[arg1]);
-    return 0;
+    if (arg1 >= 256) return 0;
+    // The key table is the whole keyboard, whoever is typed to: only the
+    // program the user is typing into reads it.
+    if (!desktop.actsFor(@intCast(process.getCurrentPid()), .focused)) return 0;
+    return @intFromBool(keyboard.key_state[arg1]);
 }
 
 /// poll_event(buf_ptr): drain one event from the focused window's queue
@@ -190,8 +193,7 @@ pub fn sysSetCursorVisible(arg1: u32) u32 {
 
 pub fn sysCenterMouse() u32 {
     const pid: u8 = @intCast(process.getCurrentPid());
-    desktop.centerMouse(pid);
-    return 0;
+    return if (desktop.centerMouse(pid)) 0 else E_PERM;
 }
 
 /// Push an RGBA8 wallpaper image into the desktop's background module.
@@ -205,6 +207,12 @@ pub fn sysSetWallpaper(buf_ptr: u32, w: u32, h: u32) u32 {
     const pmm_diag = @import("../mm/pmm.zig");
     const free_entry = pmm_diag.freeFrameCount();
     debug.klog("[sysSetWallpaper] buf=0x{X} w={d} h={d} pmm_free={d}\n", .{ buf_ptr, w, h, free_entry });
+    // Not a background program's: the picture is up to 64 MB of kernel
+    // memory nobody is charged for.
+    if (!desktop.maySetWallpaper(@intCast(process.getCurrentPid()))) {
+        debug.klog("[sysSetWallpaper] EPERM: pid {d} has no window on screen\n", .{process.getCurrentPid()});
+        return E_PERM;
+    }
     if (w == 0 and h == 0 and buf_ptr == 0) {
         background.clearWallpaper();
         dirty.force_full_kind = true;
@@ -221,31 +229,18 @@ pub fn sysSetWallpaper(buf_ptr: u32, w: u32, h: u32) u32 {
         debug.klog("[sysSetWallpaper] EFAULT validateUserPtr({d} bytes)\n", .{total});
         return E_FAULT;
     }
-    const free_before_clear = pmm_diag.freeFrameCount();
-    // allocateWallpaper internally calls clearWallpaper() first; we want
-    // to see frees + allocs broken apart, so do clear here explicitly.
-    background.clearWallpaper();
-    const free_after_clear = pmm_diag.freeFrameCount();
-    if (!background.allocateWallpaper(w, h)) {
-        debug.klog("[sysSetWallpaper] ENOMEM allocateWallpaper({d}x{d})\n", .{ w, h });
+    // Release, allocation and copy are one step in there: a second caller
+    // with another size cannot get between them.
+    if (!background.install(@ptrFromInt(@as(usize, buf_ptr)), w, h)) {
+        // The old picture went first; the gradient shows.
+        dirty.force_full_kind = true;
+        desktop.wake.requestWake();
+        debug.klog("[sysSetWallpaper] ENOMEM install({d}x{d})\n", .{ w, h });
         return E_NOMEM;
     }
-    const free_after_alloc = pmm_diag.freeFrameCount();
-    debug.klog("[wallpaper-diag] before_clear={d} after_clear={d} (freed={d}) after_alloc={d} (consumed={d})\n", .{
-        free_before_clear, free_after_clear, free_after_clear -% free_before_clear,
-        free_after_alloc, free_after_clear -% free_after_alloc,
-    });
-    background.lockForWrite();
-    defer background.unlockAfterWrite();
-    const dst = background.wallpaperSlice() orelse {
-        debug.klog("[sysSetWallpaper] wallpaperSlice() null after alloc\n", .{});
-        return E_INVAL;
-    };
-    const src: [*]const u32 = @ptrFromInt(@as(usize, buf_ptr));
-    @memcpy(dst, src[0..dst.len]);
     dirty.force_full_kind = true;
     desktop.wake.requestWake();
-    debug.klog("[sysSetWallpaper] OK installed {d}x{d}, force_full=true\n", .{ w, h });
+    debug.klog("[sysSetWallpaper] OK installed {d}x{d}, force_full=true pmm_free={d} (was {d})\n", .{ w, h, pmm_diag.freeFrameCount(), free_entry });
     return 0;
 }
 
@@ -253,7 +248,7 @@ pub fn sysNotify(text_ptr: u32, len: u32) u32 {
     const actual_len = @min(len, 64);
     if (!validateUserPtr(text_ptr, actual_len)) return E_FAULT;
     const src: [*]const u8 = @ptrFromInt(@as(usize, text_ptr));
-    desktop.showNotification(src[0..actual_len]);
+    desktop.showNotificationFrom(@intCast(process.getCurrentPid()), src[0..actual_len]);
     return 0;
 }
 
@@ -548,7 +543,14 @@ var clipboard_buf: [CLIPBOARD_MAX]u8 = [_]u8{0} ** CLIPBOARD_MAX;
 var clipboard_len: u32 = 0;
 var clipboard_lock: @import("../proc/spinlock.zig").SpinLock = .{};
 
+/// A copy or a paste is the user's act in the program they are working in;
+/// a background program neither reads the clipboard nor replaces it.
+fn mayUseClipboard() bool {
+    return desktop.actsFor(@intCast(process.getCurrentPid()), .focused);
+}
+
 pub fn sysSetClipboard(buf_ptr: u32, len: u32) u32 {
+    if (!mayUseClipboard()) return E_PERM;
     if (len == 0) {
         clipboard_lock.acquire();
         defer clipboard_lock.release();
@@ -567,6 +569,8 @@ pub fn sysSetClipboard(buf_ptr: u32, len: u32) u32 {
 
 pub fn sysGetClipboard(buf_ptr: u32, max_len: u32) u32 {
     if (max_len == 0) return 0;
+    // Empty to anyone else: the return is a length, which callers index by.
+    if (!mayUseClipboard()) return 0;
     // validateUserPtr MUST run BEFORE clipboard_lock.acquire — it calls
     // prefaultUserRange which now blocks (.nvme_io) if the buffer's pages
     // were swapped out. Acquiring first → SpinLock-held-across-blockOn

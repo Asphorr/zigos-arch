@@ -496,6 +496,7 @@ pub fn build(b: *std.Build) void {
         .{ "stoptest.elf", "app/stoptest.zig" },
         .{ "forktest.elf", "app/forktest.zig" },
         .{ "daemontest.elf", "app/daemontest.zig" },
+        .{ "doortest.elf", "app/doortest.zig" },
         .{ "schedstress.elf", "app/schedstress.zig" },
         .{ "wakelat.elf", "app/wakelat.zig" },
         .{ "logd.elf", "app/logd.zig" },
@@ -1386,7 +1387,7 @@ pub fn build(b: *std.Build) void {
         \\  paint.elf editor.elf doom.elf vn.elf gpu_test.elf vulkan_triangle.elf \
         \\  venus_test.elf vulkan_cube.elf doom_real.elf \
         \\  mmaptest.elf mapshare.elf flushtest.elf bareexit.elf threadtest.elf threadbrot.elf wintest.elf synctest.elf babel.elf forktest.elf daemontest.elf schedstress.elf logd.elf photo.elf wallpaper.elf \
-        \\  shmtest.elf iouringtest.elf redteam.elf wakelat.elf
+        \\  shmtest.elf iouringtest.elf redteam.elf wakelat.elf doortest.elf
         \\echo "[tar] rebuilt $(($(date +%s%3N)-T0))ms"
         ,
     });

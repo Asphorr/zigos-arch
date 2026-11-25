@@ -163,6 +163,21 @@ pub fn showNotification(text: []const u8) void {
     sound.notify();
 }
 
+/// A program's notification. The pill names the sender, so none passes for
+/// the kernel's own, which alone come unnamed (showNotification).
+pub fn showNotificationFrom(pid: u8, text: []const u8) void {
+    var name: [32]u8 = undefined;
+    const pname = process.getName(pid);
+    const n: usize = if (pinned.nameForProcess(pname)) |known| blk: {
+        const k = @min(known.len, name.len);
+        @memcpy(name[0..k], known[0..k]);
+        break :blk k;
+    } else win_title.pretty(&name, pname);
+    toast.showFrom(if (n > 0) name[0..n] else "App", text);
+    wake.requestWake();
+    sound.notify();
+}
+
 // Wallpaper presets + render moved to desktop/background.zig.
 const background = @import("desktop/background.zig");
 
@@ -3984,6 +3999,7 @@ pub fn run() void {
     // forget: we don't await it so a slow decode doesn't block boot.
     if (@import("../fs/vfs.zig").loadFileFresh("wallpaper.elf")) |fresh| {
         if (elf_loader.loadAndStart(fresh.buf, fresh.size, fresh.pages, fresh.inode, null)) |wpid| {
+            @atomicStore(u8, &wallpaper_helper, @intCast(wpid), .monotonic);
             process.setName(@intCast(wpid), "wallpaper");
             debug.klog("[desktop] wallpaper.elf spawned pid={d}\n", .{wpid});
         }
@@ -4904,6 +4920,55 @@ pub fn focusedShellSpawnedPid(pid: u8) bool {
     return false;
 }
 
+/// Which window a caller has to stand behind: the focused one, or any the
+/// user can see.
+pub const Standing = enum { focused, on_screen };
+
+/// True iff task `pid` belongs to a program the user has in front of them:
+/// its group owns such a window, or it descends from that group or from the
+/// window's shell — a tool run in the terminal, a helper the app started.
+/// Gates what is the user's rather than any program's: the key table, the
+/// clipboard, the pointer, the wallpaper. An orphan is init's child and
+/// stands behind nothing.
+pub fn actsFor(pid: u8, standing: Standing) bool {
+    // No desktop: one console, nobody to take from.
+    if (!active) return true;
+    var cur = pid;
+    var hops: u8 = 0;
+    while (hops < 16 and cur < process.MAX_PROCS) : (hops += 1) {
+        const pcb = process.getPCB(cur);
+        switch (standing) {
+            .focused => if (wm.focused < MAX_WINDOWS and slot_used[wm.focused] and
+                windowIsOf(&windows[wm.focused], cur, pcb.tgid)) return true,
+            .on_screen => for (z_stack[0..wm.z_count]) |i| {
+                if (windowIsOf(&windows[i], cur, pcb.tgid)) return true;
+            },
+        }
+        const parent = pcb.parent_pid;
+        if (parent == 0 or parent == cur) return false;
+        cur = parent;
+    }
+    return false;
+}
+
+fn windowIsOf(w: *const wm.Window, pid: u8, tgid: u8) bool {
+    if (!w.visible or w.minimized) return false;
+    if (w.owner_group != 0xFF and w.owner_group == tgid) return true;
+    return w.shell_pid != 0xFF and (w.shell_pid == pid or w.shell_pid == tgid);
+}
+
+/// The wallpaper helper the desktop starts at boot, 0xFF once its process
+/// has ended. It has no window to stand behind.
+var wallpaper_helper: u8 = 0xFF;
+
+/// set_wallpaper: a program on screen (the settings app applying a picture
+/// may have lost focus by the time its helper has decoded it), or the boot
+/// helper.
+pub fn maySetWallpaper(pid: u8) bool {
+    const helper = @atomicLoad(u8, &wallpaper_helper, .monotonic);
+    return (helper != 0xFF and process.procs[pid].tgid == helper) or actsFor(pid, .on_screen);
+}
+
 /// Composite and display all windows (called from sys_present).
 pub fn presentWindow(pid: u8) void {
     _ = pid;
@@ -5013,6 +5078,12 @@ pub fn destroyGuiWindow(who: GuiOwner) DestroyedGui {
     defer gui_fb_realloc_lock.release();
     const wflags = lockWindows();
     defer unlockWindows(wflags);
+    // The group's end is the boot helper's too: its pid passes to another
+    // process next.
+    switch (who) {
+        .group => |g| if (g == @atomicLoad(u8, &wallpaper_helper, .monotonic)) @atomicStore(u8, &wallpaper_helper, 0xFF, .monotonic),
+        .task => {},
+    }
     // Restore cursor if this process had it hidden
     if (@import("../driver.zig").virtio_gpu.cursor_hidden) {
         @import("../driver.zig").virtio_gpu.showCursor();
@@ -5420,17 +5491,20 @@ pub fn setCursorHidden(pid: u8, hidden: bool) void {
     }
 }
 
-/// Warp mouse cursor to the center of a process's window (for FPS-style mouse look)
-pub fn centerMouse(pid: u8) void {
+/// Warp the pointer to the centre of `pid`'s window, for mouse look. Only
+/// while that window has the focus: the pointer is not a background
+/// window's to pull under itself. False when it was left alone.
+pub fn centerMouse(pid: u8) bool {
     for (z_stack[0..wm.z_count]) |i| {
-        if (windows[i].owner_pid == pid and windows[i].visible) {
+        if (i == wm.focused and windows[i].owner_pid == pid and windows[i].visible) {
             const cx = windows[i].x + @as(i32, @intCast(windows[i].width / 2));
             const cy = windows[i].y + @as(i32, TITLEBAR_H) + @as(i32, @intCast((windows[i].height -| TITLEBAR_H) / 2));
             mouse.x = cx;
             mouse.y = cy;
-            return;
+            return true;
         }
     }
+    return false;
 }
 
 pub fn getWindowContentSize(pid: u8, buf: [*]u32) void {

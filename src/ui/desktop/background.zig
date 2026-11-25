@@ -61,10 +61,11 @@ var wp_pixels: ?[*]u32 = null;
 var wp_w: u32 = 0;
 var wp_h: u32 = 0;
 
-/// Replace the current wallpaper with a freshly-allocated buffer of the
-/// given dimensions. Caller is responsible for filling `wp_pixels[0..w*h]`
-/// after this returns true (typically via @memcpy from a user-space slice
-/// in the syscall handler).
+/// Replace the wallpaper with the `w`×`h` pixels at `src` (the caller has
+/// checked that many are readable). One hold of the lock from the old
+/// buffer's release to the last pixel copied: the size the copy runs to is
+/// the size allocated, whatever another caller is installing, and the
+/// renderer never draws a buffer not yet filled.
 ///
 /// We free the previous buffer BEFORE the new alloc so peak memory stays
 /// at one wallpaper, not two. The naive "alloc-then-free" version doubled
@@ -72,10 +73,11 @@ var wp_h: u32 = 0;
 /// failure mode at 8 MB / 2025 pages on a 128 MB QEMU. Downside: if the
 /// new alloc fails, the old wallpaper is also gone — gradient takes over.
 /// Acceptable since the failure path is rare and the user sees the gap.
-pub fn allocateWallpaper(w: u32, h: u32) bool {
+pub fn install(src: [*]const u32, w: u32, h: u32) bool {
     if (w == 0 or h == 0 or w > 4096 or h > 4096) return false;
 
-    const bytes: usize = @as(usize, w) * @as(usize, h) * 4;
+    const pixels: usize = @as(usize, w) * @as(usize, h);
+    const bytes: usize = pixels * 4;
     wp_lock.acquire();
     defer wp_lock.release();
     clearWallpaperLocked();
@@ -91,7 +93,9 @@ pub fn allocateWallpaper(w: u32, h: u32) bool {
         });
         return false;
     };
-    wp_pixels = @ptrCast(@alignCast(new_buf));
+    const dst: [*]u32 = @ptrCast(@alignCast(new_buf));
+    @memcpy(dst[0..pixels], src[0..pixels]);
+    wp_pixels = dst;
     wp_w = w;
     wp_h = h;
     debug.klog("[wallpaper] installed {d}x{d}, {d} MB at 0x{X}\n", .{
@@ -115,23 +119,6 @@ fn clearWallpaperLocked() void {
     wp_pixels = null;
     wp_w = 0;
     wp_h = 0;
-}
-
-/// Direct write access for the syscall handler — copies user pixels into
-/// the wallpaper buffer. Returns the slice if valid, null otherwise.
-/// Caller must hold `wp_lock` for the duration of the write to keep the
-/// returned slice from being unmapped underneath them.
-pub fn wallpaperSlice() ?[]u32 {
-    const p = wp_pixels orelse return null;
-    return p[0 .. @as(usize, wp_w) * @as(usize, wp_h)];
-}
-
-pub fn lockForWrite() void {
-    wp_lock.acquire();
-}
-
-pub fn unlockAfterWrite() void {
-    wp_lock.release();
 }
 
 pub fn hasWallpaper() bool {

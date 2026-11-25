@@ -13,7 +13,11 @@ const aa_font = @import("../aa_font.zig");
 const layout = @import("layout.zig");
 const dirty_rects = @import("dirty.zig");
 
-var text_buf: [64]u8 = [_]u8{0} ** 64;
+/// The longest text, and the longest sender name in front of it.
+const TEXT_MAX: usize = 64;
+const SENDER_MAX: usize = 32;
+
+var text_buf: [SENDER_MAX + 2 + TEXT_MAX]u8 = @splat(0);
 var text_len: u8 = 0;
 
 /// Timer ticks (10 ms) on screen, both slides included, and per slide.
@@ -35,9 +39,24 @@ const MARGIN: i32 = 10;
 /// Show `text` for LIFE_TICKS. A new call replaces the toast on screen.
 pub fn show(text: []const u8) void {
     if (text.len == 0) return;
-    const copy_len = @min(text.len, text_buf.len);
-    for (0..copy_len) |i| text_buf[i] = text[i];
-    text_len = @intCast(copy_len);
+    put(0, text);
+}
+
+/// show() for a program's text: "sender: text".
+pub fn showFrom(sender: []const u8, text: []const u8) void {
+    if (text.len == 0) return;
+    const n = @min(sender.len, SENDER_MAX);
+    for (0..n) |i| text_buf[i] = sender[i];
+    text_buf[n] = ':';
+    text_buf[n + 1] = ' ';
+    put(n + 2, text);
+}
+
+/// The text, from `at` on, and the pill's start.
+fn put(at: usize, text: []const u8) void {
+    const copy_len = @min(text.len, TEXT_MAX);
+    for (0..copy_len) |i| text_buf[at + i] = text[i];
+    text_len = @intCast(at + copy_len);
     active = true;
     fresh = true;
     age = 0;
