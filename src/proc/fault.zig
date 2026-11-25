@@ -514,7 +514,7 @@ fn faultInCachePage(pd: [*]align(4096) u64, r: process.LazyRegion, va_aligned: u
             phys = p; // cache hit: a mapper ref was taken atomically under the cache lock
             break;
         }
-        // Miss (or refcount-saturated): read the page into a PRIVATE frame with
+        // Miss: read the page into a PRIVATE frame with
         // NO cache lock held, THEN publish it. Filling before publishing means
         // no other CPU can ever observe a half-filled cache page.
         const pf = pmm.allocFrameUser() orelse return .no_frame;
@@ -531,9 +531,9 @@ fn faultInCachePage(pd: [*]align(4096) u64, r: process.LazyRegion, va_aligned: u
         // retries) rather than map a frame whose writes would be lost.
         if (r.cache_shared and !ins.cached) {
             pmm.freeFrame(ins.frame);
-            // Reclaim frees entries: it helps neither a page mapped too
-            // many times over nor one that keeps changing.
-            return if (ins.saturated or ins.stale) .failed else .no_frame;
+            // Reclaim frees entries: it does not help a page that keeps
+            // changing.
+            return if (ins.stale) .failed else .no_frame;
         }
         phys = ins.frame;
         break;

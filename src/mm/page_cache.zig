@@ -17,7 +17,7 @@
 // there is, and go past the limit.
 //
 // ============================ REFCOUNT DISCIPLINE ============================
-// Leans entirely on pmm's per-frame u8 refcount (pmm.acquireFrame/releaseFrame/
+// Leans entirely on pmm's per-frame refcount (pmm.acquireFrame/releaseFrame/
 // frameRefCount), the same mechanism COW and shared-anon already use:
 //
 //   insertFilled      -> the caller's frame: 1 = the CACHE's ref, +1 the mapper's
@@ -72,14 +72,6 @@ const GEN_SLOTS: usize = 256;
 const RECLAIM_BATCH: u32 = 256;
 
 const NIL: u32 = 0xFFFF_FFFF;
-
-// pmm's per-frame refcount is a u8 and acquireFrame PANICS at 255. The pin /
-// insert paths refuse a new mapper reference once a frame reaches this and
-// serve the caller an UNCACHED private copy instead. The margin covers the
-// window between the under-lock refcount check and acquireFrame:
-// cloneAddressSpace's acquireFrame (vmm.zig) is lock-free, so up to
-// MAX_CPUS-1 concurrent forks of the same frame can bump it meanwhile.
-pub const PIN_SATURATION: u8 = 223;
 
 // File-identity namespace tags occupy the high bits of a cache key's file_id,
 // so one filesystem's inode keyspace can't collide with another's.
@@ -204,7 +196,7 @@ const CacheState = struct {
             e.file_id & 0xFFFF_FFFF, e.page_off, e.frame.raw(), refs, pid,
         });
         if (self.n_corrupt >= self.corrupt.len) return;
-        const pinned = refs >= 1 and refs < PIN_SATURATION;
+        const pinned = refs >= 1;
         if (pinned) pmm.acquireFrame(e.frame);
         self.corrupt[self.n_corrupt] = .{ .file_id = e.file_id, .page_off = e.page_off, .frame = e.frame, .pinned = pinned };
         self.n_corrupt += 1;
@@ -464,16 +456,11 @@ pub fn lookup(file_id: u64, page_off: u64) ?Phys {
 /// refcount so eviction cannot free it. The caller MUST pmm.releaseFrame when
 /// the mapping is torn down (vmm.unmapUserRange already does this). Null on a
 /// miss — the caller then reads the page into a private frame and publishes
-/// it with `insertFilled` — and also when the resident frame is at
-/// PIN_SATURATION.
+/// it with `insertFilled`.
 pub fn pin(file_id: u64, page_off: u64) ?Phys {
     const h = cache.acquire();
     defer h.release();
     if (h.ptr.find(file_id, page_off)) |e| {
-        if (pmm.frameRefCount(e.frame) >= PIN_SATURATION) {
-            h.ptr.misses += 1;
-            return null;
-        }
         h.ptr.verify(e);
         pmm.acquireFrame(e.frame); // 1 -> 2 (or N -> N+1); now un-evictable
         h.ptr.hits += 1;
@@ -520,9 +507,6 @@ pub const Inserted = struct {
     frame: Phys,
     /// False: `frame` is the caller's own, unknown to the cache.
     cached: bool,
-    /// Not cached because the resident page is at PIN_SATURATION: freeing
-    /// memory will not change that.
-    saturated: bool = false,
     /// Not cached because the file changed on disk while the page was
     /// read: the frame may hold the bytes from before.
     stale: bool = false,
@@ -545,24 +529,20 @@ pub fn fillBegin(file_id: u64) u32 {
 ///   - published — the frame is cached (refcount 2 = cache + caller).
 ///   - lost the race — another CPU cached this page meanwhile; the input
 ///     frame is dropped and the resident one returned, with a reference.
-///   - not cached — no entry could be had, the resident page is at
-///     PIN_SATURATION, or the file changed since `gen` (fillBegin) was
-///     taken; the input frame stays the caller's alone. Fine for a read or
-///     a private mapping, not for a shared one (see the header).
+///   - not cached — no entry could be had, or the file changed since `gen`
+///     (fillBegin) was taken; the input frame stays the caller's alone.
+///     Fine for a read or a private mapping, not for a shared one (see the
+///     header).
 pub fn insertFilled(file_id: u64, page_off: u64, frame: Phys, gen: u32) Inserted {
     const h = cache.acquire();
     defer h.release();
 
     if (h.ptr.find(file_id, page_off)) |e| {
-        if (pmm.frameRefCount(e.frame) < PIN_SATURATION) {
-            h.ptr.verify(e);
-            pmm.releaseFrame(frame); // discard our wasted fill (1 -> 0, freed)
-            pmm.acquireFrame(e.frame);
-            h.ptr.hits += 1;
-            return .{ .frame = e.frame, .cached = true };
-        }
-        h.ptr.full_skips += 1;
-        return .{ .frame = frame, .cached = false, .saturated = true };
+        h.ptr.verify(e);
+        pmm.releaseFrame(frame); // discard our wasted fill (1 -> 0, freed)
+        pmm.acquireFrame(e.frame);
+        h.ptr.hits += 1;
+        return .{ .frame = e.frame, .cached = true };
     }
     if (h.ptr.gen(file_id).* != gen) return .{ .frame = frame, .cached = false, .stale = true };
 
@@ -860,11 +840,6 @@ pub const DirtyPage = struct {
 /// Pages one takeDirtyBatch call is asked for.
 pub const DIRTY_BATCH: usize = 32;
 
-/// Dirty and short of PIN_SATURATION: a flush can pin it.
-fn flushable(e: *const Entry) bool {
-    return e.dirty and pmm.frameRefCount(e.frame) < PIN_SATURATION;
-}
-
 /// The lowest dirty pages of `file_id` at or after `from_off`, ascending, up
 /// to out.len of them: each PINNED (so the writeback I/O can't race eviction
 /// or an unmap freeing the frame) and with its dirty flag left set. Returns
@@ -873,7 +848,7 @@ fn flushable(e: *const Entry) bool {
 /// The caller (vfs.syncCacheFile) goes on from the last page_off + PAGE, so
 /// the cursor strictly increases. The flag stays because msync must keep it:
 /// the still-writable PTE means later writes won't fault to re-mark the
-/// page. A page at PIN_SATURATION is skipped, left for a later flush.
+/// page.
 ///
 /// The offsets right after `from_off` are probed first, so a run of dirty
 /// pages never walks the list; the file's list then gives the lowest of the
@@ -892,7 +867,7 @@ pub fn takeDirtyBatch(file_id: u64, from_off: u64, out: []DirtyPage) usize {
         off +|= PAGE_SIZE;
     }) {
         const e = s.find(file_id, off) orelse continue;
-        if (!flushable(e)) continue;
+        if (!e.dirty) continue;
         out[n] = .{ .page_off = off, .frame = e.frame };
         n += 1;
     }
@@ -904,7 +879,7 @@ pub fn takeDirtyBatch(file_id: u64, from_off: u64, out: []DirtyPage) usize {
         var i = s.fileHead(file_id).*;
         while (i != NIL) : (i = s.entries[i].file_next) {
             const e = &s.entries[i];
-            if (e.file_id != file_id or e.page_off < off or !flushable(e)) continue;
+            if (e.file_id != file_id or e.page_off < off or !e.dirty) continue;
             if (n == out.len and e.page_off > out[n - 1].page_off) continue;
             if (n < out.len) n += 1; // else the highest falls off the end
             var j = n - 1;
@@ -927,7 +902,7 @@ pub const GlobalDirtyPage = struct {
 /// The first dirty page at or after pool index `from_idx`, for the flush
 /// daemon: PINNED, flag left set, with the index to resume from. Null once
 /// the pass is complete. Order is arbitrary; the strictly advancing cursor
-/// ends the daemon's loop. A page at PIN_SATURATION is skipped.
+/// ends the daemon's loop.
 pub fn takeNextDirtyGlobal(from_idx: u32) ?GlobalDirtyPage {
     var idx = from_idx;
     while (true) {
@@ -938,7 +913,6 @@ pub fn takeNextDirtyGlobal(from_idx: u32) ?GlobalDirtyPage {
         while (idx < stop) : (idx += 1) {
             const e = &h.ptr.entries[idx];
             if (!e.valid or !e.dirty) continue;
-            if (pmm.frameRefCount(e.frame) >= PIN_SATURATION) continue;
             pmm.acquireFrame(e.frame);
             return .{ .file_id = e.file_id, .page_off = e.page_off, .frame = e.frame, .next_idx = idx + 1 };
         }

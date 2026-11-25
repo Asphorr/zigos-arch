@@ -719,8 +719,8 @@ pub fn readThroughCache(inum: u32, offset: u64, buf: [*]u8, count: u32) u32 {
         const dst_off: usize = @intCast(done);
 
         const frame = page_cache.pin(file_id, page_off) orelse blk: {
-            // Miss (or the resident page is at PIN_SATURATION): fill a PRIVATE
-            // frame with NO cache lock held, then publish it atomically.
+            // Miss: fill a PRIVATE frame with NO cache lock held, then
+            // publish it atomically.
             const pf = pmm.allocFrameUser() orelse {
                 // Out of frames: finish the remainder with a direct uncached
                 // read so the call still makes forward progress, then stop.
