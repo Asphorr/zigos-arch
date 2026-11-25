@@ -57,6 +57,7 @@ pub fn build(b: *std.Build) void {
     const forced_boot_mode = b.option(u32, "boot-mode", "Force boot_mode, bypassing the UEFI menu (scripted self-test runs)");
     const linuxtest_only = b.option([]const u8, "linuxtest-only", "Boot mode 19 runs only the cases whose path or arguments contain this") orelse "";
     const swap_trace = b.option(bool, "swap-trace", "Log every step of swap eviction and swap-in ([mtswap-trace]; a dozen lines per page)") orelse false;
+    const debug_crash = b.option(bool, "debug-crash", "Answer crashtest.elf (sys 117): crash the kernel on request, to test the panic path") orelse false;
 
     const build_options = b.addOptions();
     build_options.addOption(u64, "build_id", build_id_value);
@@ -65,6 +66,7 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(?u32, "forced_boot_mode", forced_boot_mode);
     build_options.addOption([]const u8, "linuxtest_only", linuxtest_only);
     build_options.addOption(bool, "swap_trace", swap_trace);
+    build_options.addOption(bool, "debug_crash", debug_crash);
 
     // --- 1. KERNEL ---
     // Forward-declare the shapes module here so the kernel module can

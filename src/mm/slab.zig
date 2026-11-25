@@ -28,7 +28,8 @@
 const std = @import("std");
 const pmm = @import("pmm.zig");
 const paging = @import("paging.zig");
-const SpinLock = @import("../proc/spinlock.zig").SpinLock;
+const spinlock = @import("../proc/spinlock.zig");
+const SpinLock = spinlock.SpinLock;
 const Phys = @import("../util/addr.zig").Phys;
 const debug = @import("../debug/debug.zig");
 const heap = @import("heap.zig");
@@ -341,6 +342,11 @@ pub const Stats = struct {
 pub fn snapshot(cache: *Cache) Stats {
     const flags = cache.lock.acquireIrqSave();
     defer cache.lock.releaseIrqRestore(flags);
+    return statsOf(cache);
+}
+
+/// The figures as they stand: under cache.lock, or from the panic path.
+fn statsOf(cache: *const Cache) Stats {
     return .{
         .name = cacheName(cache),
         .obj_size = cache.obj_size,
@@ -366,21 +372,36 @@ pub fn iterCaches(prev: ?*Cache) ?*Cache {
     return cache_list_head;
 }
 
-/// Print a one-line summary for every cache. Cheap; suitable for an
-/// occasional dmesg dump, panic forensics, or sysmon panel. No-op if no
-/// caches have been created (panic-time call before slab is wired).
+/// Print a one-line summary for every cache: the panic's forensics. No-op
+/// if no caches have been created (a panic before slab is wired).
+///
+/// Takes no lock. alloc and free panic on corruption with cache.lock held,
+/// and the panic halts the other CPUs wherever they are, under a cache.lock
+/// too: to wait for one here is to never finish the panic. A cache whose
+/// lock is held is marked — its figures may be half-updated.
 pub fn printAllCaches() void {
     if (cache_list_head == null) return;
     const serial = @import("../debug/serial.zig");
     serial.print("[slab] caches:\n", .{});
     var c = iterCaches(null);
     while (c) |cache| : (c = iterCaches(cache)) {
-        const s = snapshot(cache);
+        const s = statsOf(cache);
+        const holder = @atomicLoad(u8, &cache.lock.holder_cpu, .acquire);
         serial.print(
-            "  {s:<16} obj={d:>5}B/slab={d:>3} live={d:>5}/peak={d:>5} slabs={d:>3}/hi={d:>3} alloc={d} free={d} bytes_used={d}/committed={d}\n",
+            "  {s:<16} obj={d:>5}B/slab={d:>3} live={d:>5}/peak={d:>5} slabs={d:>3}/hi={d:>3} alloc={d} free={d} bytes_used={d}/committed={d}",
             .{ s.name, s.obj_size, s.objs_per_slab, s.live_objs, s.peak_live_objs, s.slab_count, s.slab_high_water, s.total_allocs, s.total_frees, s.bytes_in_use, s.bytes_committed },
         );
+        if (holder != spinlock.NO_HOLDER_CPU) serial.print("  (locked by cpu{d})", .{holder});
+        serial.print("\n", .{});
     }
+}
+
+/// crashtest: panic the way alloc and free do on a corrupted slab — under a
+/// cache's lock. The panic has to get through all the same.
+pub fn panicLocked() noreturn {
+    const cache = cache_list_head orelse @panic("crashtest slablock: no slab cache yet");
+    _ = cache.lock.acquireIrqSave();
+    @panic("crashtest slablock: panic with a slab cache lock held");
 }
 
 // ----- Internals -----

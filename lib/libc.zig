@@ -1153,6 +1153,7 @@ pub const CRASH_ASSERT: u32 = 3;
 pub const CRASH_UNMAPPED: u32 = 4;
 pub const CRASH_NONC: u32 = 5;
 pub const CRASH_PANIC: u32 = 6;
+pub const CRASH_SLABLOCK: u32 = 7;
 pub fn debugCrash(variant: u32) u32 {
     return syscall(117, variant, 0);
 }

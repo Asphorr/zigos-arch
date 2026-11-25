@@ -8,10 +8,13 @@
 //   unmapped  write to unmapped kVA     (kernel-mode #PF)
 //   nonc      write to non-canonical    (#GP vec 13, not #PF)
 //   panic     direct @panic              (no specific corruption — baseline)
+//   slablock  @panic under a slab cache lock (the panic path takes no lock)
 //
 // EVERY variant halts the system. Reboot to recover. There is no recovery
 // from a kernel panic and that's the entire point — this is the test that
 // validates the panic path is itself reliable.
+//
+// The kernel answers only if built with -Ddebug-crash.
 //
 // Modeled on style9's `cmd_crash` (BSD-style sibling kernel). They run it
 // from an in-kernel shell; we route through a debug syscall because our
@@ -32,6 +35,7 @@ const variants = [_]Variant{
     .{ .name = "unmapped", .code = libc.CRASH_UNMAPPED },
     .{ .name = "nonc", .code = libc.CRASH_NONC },
     .{ .name = "panic", .code = libc.CRASH_PANIC },
+    .{ .name = "slablock", .code = libc.CRASH_SLABLOCK },
 };
 
 fn usage() noreturn {

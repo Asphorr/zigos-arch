@@ -319,14 +319,16 @@ pub fn sysUsbWriteSector(lba: u32, buf_ptr: u32) u32 {
 ///   4 = unmapped  — write to canonical-unmapped kernel VA (#PF in ring 0)
 ///   5 = nonc      — write to non-canonical VA (#GP, vec 13)
 ///   6 = panic     — direct @panic("crashtest: user-requested")
+///   7 = slablock  — @panic with a slab cache's lock held, as slab.alloc
+///                   and slab.free do on a corrupted slab
 ///
 /// Returns 0xFFFFFFFF for unknown variant (the others never return —
 /// they trigger panic which halts the system).
 pub fn sysDebugCrash(variant: u32) u32 {
-    // Deliberate kernel-crash backdoor — compile-gated off so a normal app (or
-    // a syscall fuzzer) can't panic the OS at will. See config.ENABLE_DEBUG_CRASH.
-    // When disabled it's indistinguishable from an unimplemented syscall.
-    if (!config.ENABLE_DEBUG_CRASH) return E_NOSYS;
+    // Crashes the kernel from ring 3 on request: in a kernel built without
+    // `-Ddebug-crash` it is an unimplemented syscall, or any process — a
+    // syscall fuzzer too — could take the OS down by calling it.
+    if (!@import("build_options").debug_crash) return E_NOSYS;
 
     const heap = @import("../mm/heap.zig");
     debug.klog("[crashtest] sysDebugCrash variant={d}\n", .{variant});
@@ -377,6 +379,7 @@ pub fn sysDebugCrash(variant: u32) u32 {
         6 => {
             @panic("crashtest panic: user-requested deliberate panic");
         },
+        7 => @import("../mm/slab.zig").panicLocked(),
         else => return 0xFFFFFFFF,
     }
 }
