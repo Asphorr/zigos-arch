@@ -101,9 +101,18 @@ var total_written: u32 = 0; // monotonic byte counter (stream position)
 pub var deferred: bool = false;
 
 /// Stream position (same coordinate as total_written) of the next byte to
-/// send to the UART. Single consumer: only the BSP ksoftirqd drainer (or
-/// the one-shot emergency flush) advances it.
+/// send to the UART. One consumer at a time: the BSP ksoftirqd drainer, or
+/// the one-shot emergency flush once the drainer has let go (see
+/// `drainer_sending`).
 var drain_pos: u32 = 0;
+/// The drainer holds a chunk it took from the ring and is sending it. The
+/// emergency flush waits this out: two senders on one cursor put the lines
+/// before a crash on the wire shuffled into each other, a character each.
+var drainer_sending: bool = false;
+/// How long the emergency flush waits for it, in `pause`s (tens of ms; a
+/// chunk takes under ten). Bounded: the drainer's CPU may be the one that
+/// crashed, or frozen there by the panic's NMI.
+const EMERG_DRAINER_WAIT: u32 = 1_000_000;
 /// Bytes drainToPort has sent, for profiling (single writer: the drainer).
 pub var drained_bytes: u64 = 0;
 /// drainToPort's staging; the drainer is the only user.
@@ -227,6 +236,11 @@ pub fn drainToPort() void {
     const uart_budget: u32 = 4096;
     var budget: u32 = if (console) RING_LEN else uart_budget;
     while (budget > 0) {
+        // Said before `deferred` is looked at: the emergency flush clears
+        // that and then looks at this, so one of the two sees the other.
+        @atomicStore(bool, &drainer_sending, true, .seq_cst);
+        defer @atomicStore(bool, &drainer_sending, false, .seq_cst);
+        if (!@atomicLoad(bool, &deferred, .seq_cst)) break;
         const behind = @atomicLoad(u32, &total_written, .monotonic) -% drain_pos;
         if (behind == 0) break;
         if (behind > RING_LEN) {
@@ -339,8 +353,12 @@ pub fn emergencyWrite(msg: []const u8) void {
     // subsequent output synchronous (we may be about to halt — ksoftirqd
     // will never drain again). Racy vs a concurrent normal write's loaded
     // `deferred` — worst case its bytes reach only the ring, not the port.
-    if (@atomicLoad(bool, &deferred, .monotonic)) {
-        @atomicStore(bool, &deferred, false, .release);
+    // One CPU flushes: a peer's NMI snapshot gets here too.
+    if (@cmpxchgStrong(bool, &deferred, true, false, .seq_cst, .seq_cst) == null) {
+        var waited: u32 = 0;
+        while (@atomicLoad(bool, &drainer_sending, .seq_cst) and waited < EMERG_DRAINER_WAIT) : (waited += 1) {
+            asm volatile ("pause");
+        }
         var chunk: [256]u8 = undefined;
         var guard: u32 = RING_LEN;
         while (guard > 0) {
