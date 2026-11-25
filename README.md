@@ -1,6 +1,6 @@
 # ZigOS
 
-![ZigOS desktop](docs/screenshots/screenshot5.png)
+![ZigOS desktop](docs/screenshots/screenshot6.png)
 
 x86_64 hobby OS in Zig (~208 KLoC) — SMP + hybrid-CFS scheduler, demand
 paging with swap, IOMMU isolation, NVMe with async Q_DEPTH=16, in-kernel
