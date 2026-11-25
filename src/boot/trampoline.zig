@@ -4,6 +4,7 @@
 //! its params inside, so `install` + `arm` write one page and nothing else.
 
 const paging = @import("../mm/paging.zig");
+const memmap = @import("../mm/memmap.zig");
 
 pub const Blob = enum {
     /// ap_trampoline.asm: INIT-SIPI-SIPI starts an AP in it (cpu/smp.zig).
@@ -59,6 +60,13 @@ fn linkedParams(comptime blob: Blob) *const Params {
 /// the SIPI vector.
 pub fn phys(comptime blob: Blob) u32 {
     return linkedParams(blob).base;
+}
+
+/// The blob's address is fixed, so the firmware's map has to agree that the
+/// bytes `install` writes are ordinary RAM. Ask first: where they are not,
+/// they are the firmware's and there is no trampoline on this machine.
+pub fn pageIsUsable(comptime blob: Blob) bool {
+    return memmap.isUsableRam(phys(blob), blobEnd(blob) - blobStart(blob));
 }
 
 pub fn install(comptime blob: Blob) void {

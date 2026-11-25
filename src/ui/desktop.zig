@@ -3900,7 +3900,7 @@ pub fn taskEntry() callconv(.c) noreturn {
     // driver/walker sweep done in Phase 2. Per-process address spaces own
     // their own PML4[0] independently, so user processes are unaffected.
     @import("../mm/paging.zig").dropLowIdentity();
-    // BSP is now off the UEFI low-half boot stack; safe to enable SMAP
+    // BSP is now off the boot stack (low-half on Multiboot); safe to enable SMAP
     // (kstack is high-VA / U/S=0, so the next push won't #PF).
     @import("../cpu/arch/protect.zig").enableSmapPerCpu();
     // enterFirstTask cli'd before swapping us onto desktop's kstack —

@@ -10,8 +10,8 @@ const smp = @import("../cpu/smp.zig");
 pub const Phys = @import("../util/addr.zig").Phys;
 
 const FRAME_SIZE: u32 = 4096;
-// 4 GB cap: bitmap = 128 KB, frame_refs = 1 MB of BSS (_kernel_end must
-// stay below GUEST_FB_BASE). Frames above it in the memory map are skipped
+// 4 GB cap: bitmap = 128 KB, frame_refs = 1 MB of BSS. Frames above it in
+// the memory map are skipped
 // at init time with a warning. 4 GB is as far as it goes without more
 // work: see the Below4G note in the comptime block below. A kernel build
 // inside ZigOS peaks at 1.5 GB in the compiler alone.
@@ -386,14 +386,14 @@ extern var _kernel_end: u8;
 
 // Cached kernel-image physical range. Set in init(). Used by the wild-writer
 // tripwire (checkPhysSafety) — if any alloc returns or any free targets a
-// frame inside [0x100000, kernel_phys_end), the bitmap has been corrupted or
+// frame inside it, the bitmap has been corrupted or
 // a caller is freeing a frame that backs kernel .text/.rodata/.data/.bss.
 // Either way, that's the PMM-poisoning bug we're hunting: a buggy free-path
 // hands kernel BSS frames back to the free list, then a later allocContiguous
 // for an ELF/sector buffer copies file contents over kernel memory and the
 // result is a "wild writer" with file-content-shaped payload (e.g. the
 // "fetch_um" bytes from a Zig binary's .strtab).
-var kernel_phys_end: usize = 0;
+var kernel_image: memmap.Range = .{};
 
 // Highest usable-RAM end address consumed by init(), clamped to what the
 // bitmap covers (MAX_FRAMES), so it is also the ceiling on any frame
@@ -408,13 +408,11 @@ pub fn highestUsablePhys() usize {
     return highest_usable_phys;
 }
 
-const KERNEL_PHYS_START: usize = 0x100000;
-
 fn checkPhysSafety(phys: usize, op: []const u8) void {
-    if (kernel_phys_end == 0) return; // pre-init; nothing to compare against
-    if (phys >= KERNEL_PHYS_START and phys < kernel_phys_end) {
+    // Empty before init: contains nothing.
+    if (kernel_image.contains(phys)) {
         const serial = @import("../debug/serial.zig");
-        serial.print("\n!!! PMM POISON: {s} phys=0x{X} INSIDE kernel image [0x{X}..0x{X})\n", .{ op, phys, KERNEL_PHYS_START, kernel_phys_end });
+        serial.print("\n!!! PMM POISON: {s} phys=0x{X} INSIDE kernel image [0x{X}..0x{X})\n", .{ op, phys, kernel_image.base, kernel_image.end() });
         @panic("pmm poison: kernel-image physical frame touched by alloc/free");
     }
 }
@@ -502,7 +500,7 @@ pub fn init(info: *const boot_info.BootInfo) void {
     const cap_bytes: u64 = @as(u64, MAX_FRAMES) * FRAME_SIZE;
     for (0..info.memory_map_count) |i| {
         const region = info.memory_map[i];
-        if (region.kind != 1) {
+        if (region.kind != .usable) {
             skipped_kind += 1;
             continue;
         }
@@ -536,23 +534,14 @@ pub fn init(info: *const boot_info.BootInfo) void {
     }
     if (regions_live == 0) @panic("pmm: no usable RAM below the MAX_FRAMES cap");
 
-    // Mark reserved regions as used (see memmap.zig for the layout).
-    // Clean-rule pass: only SINGLETON kernel infrastructure here; per-process
-    // GUI FBs go through PMM allocation.
-    markRegionUsedRaw(0x0, memmap.KERNEL_PHYS_START); // Low memory, BIOS, VGA
-    // Kernel image: linker-defined low PA → kernelEndPhys. Runtime-derived
-    // so kernel growth (more code, bigger BSS) is automatic; no manual memmap
-    // bumps. PMM only protects the bytes the kernel actually uses.
-    const kernel_end = memmap.kernelEndPhys();
-    markRegionUsedRaw(memmap.KERNEL_PHYS_START, kernel_end - memmap.KERNEL_PHYS_START);
-    kernel_phys_end = kernel_end; // arm tripwire — see checkPhysSafety
-    markRegionUsedRaw(memmap.GUEST_FB_BASE, memmap.GUEST_FB_SIZE); // Guest FB (8 MB)
-    markRegionUsedRaw(memmap.BACK_BUFFER_BASE, memmap.BACK_BUFFER_SIZE); // Back buffer (8 MB)
-    if (@import("../boot/boot_info.zig").is_uefi) {
-        // UEFI page tables at UEFI_PT_BASE (256 KB). See memmap.zig for the
-        // rationale — kasan.init's 32 MB shadow alloc otherwise overwrites
-        // them and kernel halts on wild CR3.
-        markRegionUsedRaw(memmap.UEFI_PT_BASE, memmap.UEFI_PT_SIZE);
+    // What the map calls usable but the kernel holds for its whole life
+    // (memmap.zig). Only singletons here; per-process GUI FBs are allocated.
+    markRegionUsedRaw(0x0, memmap.LOW_MEMORY_END);
+    kernel_image = memmap.kernelImagePhys(); // arms checkPhysSafety
+    // The live page tables are in the loader's boot data: a kasan shadow
+    // allocated over them is a wild CR3 with no panic.
+    for ([_]memmap.Range{ kernel_image, memmap.bootData(), memmap.guestFb(), memmap.backBuffer() }) |held| {
+        markRegionUsedRaw(held.base, held.size);
     }
 
     // Lock in the post-markings free-frame count as the static "total" we

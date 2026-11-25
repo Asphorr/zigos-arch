@@ -9,6 +9,7 @@ const pit = @import("time/pit.zig");
 const cli = @import("cli.zig");
 const multiboot = @import("boot/multiboot.zig");
 const boot_info_mod = @import("boot/boot_info.zig");
+const boot_protocol = @import("boot_protocol");
 const serial = @import("debug/serial.zig");
 const debug = @import("debug/debug.zig");
 const kasan = @import("debug/kasan.zig");
@@ -99,8 +100,54 @@ export fn kmain(magic: u64, info: *multiboot.MultibootInfo) noreturn {
     kernelMain(&boot_info);
 }
 
-/// UEFI entry point — called by the UEFI bootloader after ExitBootServices.
-export fn kmain_uefi(boot_info: *const boot_info_mod.BootInfo) callconv(.c) noreturn {
+/// The BSP's stack from the UEFI entry on. Ours: the loader's is firmware
+/// memory, which the PMM is about to hand out.
+const UEFI_BOOT_STACK_SIZE = 64 * 1024;
+export var uefi_boot_stack: [UEFI_BOOT_STACK_SIZE]u8 align(16) = undefined;
+
+/// UEFI entry point: the loader jumps here after ExitBootServices with
+/// BootInfo in rdi (lib/boot_protocol.zig).
+fn uefiEntry() callconv(.naked) noreturn {
+    asm volatile ("leaq uefi_boot_stack+" ++ std.fmt.comptimePrint("{d}", .{UEFI_BOOT_STACK_SIZE}) ++ "(%%rip), %%rsp\n" ++
+            \\ xorl %%ebp, %%ebp
+            \\ call uefiMain
+            \\ ud2
+        );
+}
+
+comptime {
+    @export(&uefiEntry, .{ .name = boot_protocol.ENTRY_SYMBOL });
+}
+
+/// What a loader from before the protocol had a version looks for. Without
+/// it such a loader jumps to the ELF entry point, which is the 32-bit
+/// Multiboot code; with it the mismatch ends here, in one line on serial.
+export fn kmain_uefi() callconv(.naked) noreturn {
+    asm volatile ("leaq uefi_boot_stack+" ++ std.fmt.comptimePrint("{d}", .{UEFI_BOOT_STACK_SIZE}) ++ "(%%rip), %%rsp\n" ++
+            \\ xorl %%ebp, %%ebp
+            \\ call refuseUnversionedLoader
+            \\ ud2
+        );
+}
+
+export fn refuseUnversionedLoader() callconv(.c) noreturn {
+    serial.init();
+    serial.print("[boot] FATAL: this BOOTX64.efi is older than kernel.elf and speaks no boot protocol version (kernel wants {d}). Copy both from one build.\n", .{boot_protocol.VERSION});
+    while (true) asm volatile ("cli; hlt");
+}
+
+export fn uefiMain(boot_info: *const boot_info_mod.BootInfo) callconv(.c) noreturn {
+    // Before anything is taken from it: a loader built from another
+    // boot_protocol.zig laid this struct out its own way.
+    if (boot_info.magic != boot_protocol.MAGIC or boot_info.version != boot_protocol.VERSION) {
+        serial.init();
+        serial.print("[boot] FATAL: the loader's boot protocol is not this kernel's: magic 0x{X} version {d}, want 0x{X} version {d}. Rebuild BOOTX64.efi and kernel.elf together.\n", .{
+            boot_info.magic, boot_info.version, boot_protocol.MAGIC, boot_protocol.VERSION,
+        });
+        while (true) asm volatile ("cli; hlt");
+    }
+    // Next: every image address -> physical translation depends on it.
+    @import("mm/memmap.zig").adoptImagePlacement(boot_info);
     serial.init();
     serial.print("[boot] UEFI entry\n", .{});
     boot_info_mod.is_uefi = true;
@@ -154,19 +201,25 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
             boot_info.framebuffer.width,
             boot_info.framebuffer.height,
             boot_info.framebuffer.stride,
-            boot_info.framebuffer.format,
+            @intFromEnum(boot_info.framebuffer.format),
         });
         serial.print("[boot/verbose]   pml4_phys = 0x{x}\n", .{boot_info.pml4_phys});
         serial.print("[boot/verbose]   rsdp_addr = 0x{x}\n", .{boot_info.rsdp_addr});
+        serial.print("[boot/verbose]   kernel_phys_offset = 0x{x}\n", .{boot_info.kernel_phys_offset});
+        serial.print("[boot/verbose]   boot_data = 0x{x} +0x{x}\n", .{ boot_info.boot_data_base, boot_info.boot_data_size });
         var i: u32 = 0;
         while (i < boot_info.memory_map_count and i < 16) : (i += 1) {
             const r = boot_info.memory_map[i];
-            serial.print("[boot/verbose]   mmap[{d}] base=0x{x} len=0x{x} kind={d}\n", .{ i, r.base, r.length, r.kind });
+            serial.print("[boot/verbose]   mmap[{d}] base=0x{x} len=0x{x} kind={d}\n", .{ i, r.base, r.length, @intFromEnum(r.kind) });
         }
         if (boot_info.memory_map_count > 16) {
             serial.print("[boot/verbose]   ... ({d} more entries)\n", .{boot_info.memory_map_count - 16});
         }
     }
+
+    // Physical memory the kernel holds for good. Before early_fb: a GOP
+    // console that blits draws into the guest framebuffer placed here.
+    @import("mm/memmap.zig").init(boot_info);
 
     // Bring up an early framebuffer FIRST so the boot screen can render
     // graphically from Phase 1 onwards. Two paths inside early_fb.init:
@@ -219,9 +272,9 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     @import("ui/gui_window.zig").registerLocks();
     blog.ok("Syscall/sysret MSRs");
     // SMEP/UMIP — safe to enable on BSP now. SMAP is deferred until
-    // desktop.taskEntry has dropped the low-half identity map, because
-    // the UEFI boot stack lives at low-VA with the USER bit set and
-    // enabling SMAP here #PFs on the next push.
+    // desktop.taskEntry has dropped the low-half identity map: its pages
+    // carry the USER bit, boot still reads firmware tables through it, and
+    // on Multiboot the boot stack is there too.
     @import("cpu/arch/protect.zig").detectFeatures();
     @import("cpu/arch/protect.zig").applyEarlyCr4();
     blog.ok("SMEP/UMIP (SMAP deferred to post-PML4[0] drop)");
@@ -270,8 +323,6 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     // GDB stub on COM2 (remote debug via QEMU TCP serial)
     @import("debug/gdb_stub.zig").init();
     blog.ok("GDB stub on COM2");
-    // Verify runtime kernel image doesn't intrude into static region map.
-    @import("mm/memmap.zig").assertKernelImageFits();
 
     // ---- Phase 2: Memory & paging ----------------------------------------
     blog.phase(.memory, "\u{25A3}", "Memory & paging"); // ▣
@@ -684,12 +735,8 @@ fn kernelMain(boot_info: *const boot_info_mod.BootInfo) noreturn {
     //            — the in-kernel mirror of tools/bpf-test/verify_test.zig; see
     //            src/test/bpf_verifier_selftest.zig)
     const desktop_mod = @import("ui/desktop.zig");
-    // Read from the module global (set in line 118) rather than the
-    // function-parameter pointer. The boot_info struct lives in a
-    // UEFI-allocated frame whose ownership transfers to PMM at init; later
-    // allocations clobber it, which is why `boot_info.boot_mode` reads as
-    // 0 here despite the early-kmain log showing the right value. Closes
-    // project_mode5_dispatch_mystery.md.
+    // From the module global (set at the top of kernelMain), not through
+    // `boot_info`: that is a low-identity pointer, and the window goes.
     // -Dboot-mode=N overrides the menu selection. Absent (the normal build),
     // the menu's choice stands — so this cannot change a user-facing boot,
     // only a build someone deliberately asked to be scripted.
@@ -869,6 +916,12 @@ pub fn panic(msg: []const u8, _: ?*std.builtin.StackTrace, ret_addr: ?usize) nor
         if (!in_low_boot and !in_kernel_half) break;
         if ((rbp & 7) != 0) {
             serial.print("    [{d}] (stop: rbp=0x{X:0>16} misaligned)\n", .{ depth, rbp });
+            break;
+        }
+        // A wild rbp can point into the kernel half and still at nothing:
+        // the image window is mapped no further than the image.
+        if (!paging.isMapped(rbp) or !paging.isMapped(rbp +| 15)) {
+            serial.print("    [{d}] (stop: rbp=0x{X:0>16} not mapped)\n", .{ depth, rbp });
             break;
         }
         const frame: [*]const usize = @ptrFromInt(rbp);

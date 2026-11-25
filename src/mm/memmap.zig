@@ -1,22 +1,17 @@
-// Single source of truth for ZigOS's static memory map. Every fixed virtual
-// address the kernel hands out — kernel image, heap, framebuffer, GUI windows
-// — comes from here. Pairwise comptime overlap asserts at the bottom catch a
-// future hand-picked VA that lands inside an existing region: it becomes a
-// build error rather than the kind of cross-region triple fault we hunted in
-// the early days.
+// The kernel's memory map: the fixed virtual addresses (re-exported from
+// layout.zig, which proves them disjoint at comptime) and the physical
+// memory the kernel holds for its whole life.
 //
-// Layout (low to high, all phys-identity below 4 GB / kernel-physmap above):
+// Physical memory is not laid out at build time: the firmware's memory map
+// decides. The loader says where it put the image and what it keeps
+// (BootInfo); `init` places the two graphics buffers in what is left. The
+// PMM keeps off all of these:
 //
-//   0x000000..0x0FFFFF   reserved (BIOS, IVT, Multiboot data)
-//   0x100000..kernel_end kernel image (.text, .rodata, .data, .bss).
-//                        kernel_end is runtime-derived from `_kernel_end` —
-//                        the linker sets it; nothing in the static map cares
-//                        where exactly it lands as long as it's < GUEST_FB_BASE.
-//   kernel_end..0x1BFFFFF free RAM (PMM hands these frames out on demand; the
-//                        kernel heap's pools come from PMM too).
-//   0x1C00000..0x23FFFFF guest GPU framebuffer (GUEST_FB, 8 MB)
-//   0x2400000..0x2BFFFFF CPU back buffer for compositing (BACK_BUFFER, 8 MB)
-//   0x2C00000..0x2C3FFFF UEFI page tables (reserved on UEFI builds only)
+//   below LOW_MEMORY_END  firmware data, the real-mode trampolines
+//   kernelImagePhys()     the image (.text, .rodata, .data, .bss)
+//   bootData()            the loader's page tables, BootInfo, memory map
+//   guestFb()             guest GPU framebuffer (GUEST_FB_SIZE)
+//   backBuffer()          CPU back buffer for compositing (BACK_BUFFER_SIZE)
 //
 // User space (per-process page tables): each process gets its own PML4[0]
 // from createAddressSpace; user-app .text loads at USER_VA_FLOOR (matches
@@ -36,14 +31,33 @@ const std = @import("std");
 /// The VA constants below are *re-exported* from here (single source of truth);
 /// see layout.zig for the two-floor rationale and the invariant proofs.
 const layout = @import("layout.zig");
+const protocol = @import("boot_protocol");
 
-// --- Kernel image (linker-defined; runtime values) ---
-pub const KERNEL_PHYS_START: usize = 0x100000;
+/// The first megabyte: firmware data and the real-mode trampolines. Never
+/// the PMM's.
+pub const LOW_MEMORY_END: usize = 0x100000;
+
+/// A stretch of physical memory. The empty range overlaps and contains nothing.
+pub const Range = struct {
+    base: usize = 0,
+    size: usize = 0,
+
+    pub fn end(self: Range) usize {
+        return self.base + self.size;
+    }
+
+    pub fn contains(self: Range, addr: usize) bool {
+        return addr >= self.base and addr < self.end();
+    }
+
+    pub fn overlaps(self: Range, other: Range) bool {
+        return self.size != 0 and other.size != 0 and self.base < other.end() and other.base < self.end();
+    }
+};
 
 /// Higher-half kernel base — must match `KERNEL_VIRT_BASE` in src/linker.ld.
 /// Kernel symbols (kmain, _kernel_end, &__kdata_protected_start, etc.) link
-/// at `phys + KERNEL_VIRT_BASE`, so any check that compares a kernel VA
-/// against a low-half constant has to translate first.
+/// there; `paging.virtToPhys` turns one into a physical address.
 pub const KERNEL_VIRT_BASE: usize = layout.KERNEL_VIRT_BASE;
 
 /// Physmap base — must match `pdpt_physmap` slot in boot.asm. Maps phys
@@ -60,6 +74,8 @@ pub const KERNEL_VIRT_BASE: usize = layout.KERNEL_VIRT_BASE;
 pub const PHYSMAP_BASE: usize = layout.PHYSMAP_BASE;
 pub const PHYSMAP_SIZE: usize = layout.PHYSMAP_SIZE; // 512 GB (full PML4 slot)
 
+// linker.ld: the image's first byte seen through the image window, and its end.
+extern var __kernel_image_start: u8;
 extern var _kernel_end: u8;
 
 /// Virtual end of the kernel image (high half, what Zig sees).
@@ -67,11 +83,24 @@ pub fn kernelEnd() usize {
     return @intFromPtr(&_kernel_end);
 }
 
-/// Physical end of the kernel image — what Multiboot loaded the last byte
-/// into. Used by PMM to reserve the kernel image's frames. Runtime-derived,
-/// so kernel growth (more code, bigger BSS) is automatic; no manual bumps.
-pub fn kernelEndPhys() usize {
-    return kernelEnd() - KERNEL_VIRT_BASE;
+/// physical = image address - KERNEL_VIRT_BASE + this.
+pub inline fn imagePhysOffset() u64 {
+    return layout.image_phys_offset;
+}
+
+/// The image in physical memory, low boot sections included.
+pub fn kernelImagePhys() Range {
+    const start = @intFromPtr(&__kernel_image_start);
+    return .{
+        .base = start - KERNEL_VIRT_BASE +% @as(usize, @intCast(imagePhysOffset())),
+        .size = kernelEnd() - start,
+    };
+}
+
+/// Where the loader put the image. Call first at entry: until then an image
+/// address turns into the physical address it was linked for.
+pub fn adoptImagePlacement(info: *const protocol.BootInfo) void {
+    layout.image_phys_offset = info.kernel_phys_offset;
 }
 
 // --- Validator constant (matches user-app linker convention) ---
@@ -81,49 +110,97 @@ pub fn kernelEndPhys() usize {
 // (syscall.zig). USER_SPACE_START sits 64 KB lower to make room for the
 // downward-growing user stack.
 //
-// Independent of kernel image size — the kernel image lives at high-half
-// VAs; the only thing that has to fit at low PAs is "kernel image must
-// end before GUEST_FB_BASE" (assertKernelImageFits). Bumping this
-// constant requires re-linking all user apps and is rarely the right move.
+// Independent of the kernel image: user addresses are per-process VAs, the
+// image is wherever the loader put it. Bumping this constant requires
+// re-linking all user apps and is rarely the right move.
 pub const USER_VA_FLOOR: usize = layout.USER_VA_FLOOR;
 
-// --- Static kernel-side regions (low PA, post-kernel-image) ---
-//
-// The kernel image may grow up to GUEST_FB_BASE; the RAM in between is
-// PMM's. Cross-unit layout constants live in lib/uefi_layout.zig — both
-// kernel and UEFI bootloader import from there. The comptime block at the
-// bottom of this file enforces agreement; if the values diverge, build
-// fails loudly (see lib/uefi_layout.zig header for the bug-class history).
-const uefi_layout = @import("uefi_layout");
+// --- Physical memory the kernel holds for its whole life ---
 
-pub const GUEST_FB_BASE: usize = uefi_layout.GUEST_FB_BASE;
-pub const GUEST_FB_SIZE: usize = uefi_layout.GUEST_FB_SIZE;
+/// The scanout a virtio-gpu resource is backed by, and the buffer a GOP
+/// console without a directly usable panel draws into. Contiguous: the
+/// device takes it as one run of frames.
+pub const GUEST_FB_SIZE: usize = protocol.MAX_FRAMEBUFFER_BYTES;
+/// The compositor's CPU back buffer.
+pub const BACK_BUFFER_SIZE: usize = protocol.MAX_FRAMEBUFFER_BYTES;
 
-pub const BACK_BUFFER_BASE: usize = uefi_layout.BACK_BUFFER_BASE;
-pub const BACK_BUFFER_SIZE: usize = uefi_layout.BACK_BUFFER_SIZE;
+var boot_data: Range = .{};
+var guest_fb: Range = .{};
+var back_buffer: Range = .{};
+/// The firmware's memory map as the loader handed it over. Empty before `init`.
+var boot_map: []const protocol.MemoryRegion = &.{};
 
-// UEFI page tables (PML4/PDPT/PDs that map our 64 GB identity range with
-// 1 GB pages). Set up by uefi/uefi_boot.zig before kmain_uefi runs and
-// kept live for the whole boot — kernel CR3 points at this PML4. PMM
-// reserves it under UEFI ONLY; under Multiboot the page tables live in
-// the kernel image (boot.asm's BSS) so this region is plain free RAM.
-// Without the reservation, kasan.init's 32 MB shadow allocContiguous
-// happily lands here, the @memset overwrites the page tables, the next
-// memory access hits a wild CR3, and the kernel halts silently.
-pub const UEFI_PT_BASE: usize = uefi_layout.UEFI_PT_BASE;
-pub const UEFI_PT_SIZE: usize = uefi_layout.UEFI_PT_SIZE;
+/// The loader's page tables, BootInfo and memory map. The kernel runs on
+/// these tables for good; empty on Multiboot, where they are in the image.
+pub fn bootData() Range {
+    return boot_data;
+}
 
-// Defense-in-depth: re-verify the bootloader's fixed addresses fit in
-// UEFI_PT_BASE..+UEFI_PT_SIZE from THIS side too. uefi_layout.zig already
-// asserts the same, but a future refactor could split the module — keep
-// the check here so memmap is self-defending.
-comptime {
-    if (uefi_layout.PAGE_TABLES_ADDR != UEFI_PT_BASE) {
-        @compileError("uefi_layout.PAGE_TABLES_ADDR drifted from memmap.UEFI_PT_BASE — both must update in lockstep");
+/// Empty before `init`.
+pub fn guestFb() Range {
+    return guest_fb;
+}
+
+/// Empty before `init`.
+pub fn backBuffer() Range {
+    return back_buffer;
+}
+
+/// Records what the loader keeps and places the graphics buffers. Before
+/// early_fb: a blitting GOP console draws into the guest framebuffer, long
+/// before there is a PMM to ask.
+pub fn init(info: *const protocol.BootInfo) void {
+    // A loader may give the map as a low-identity pointer, and that window
+    // goes (paging.dropLowIdentity); the physmap stays.
+    const map_address = @intFromPtr(info.memory_map);
+    const map: [*]const protocol.MemoryRegion = @ptrFromInt(if (map_address < PHYSMAP_BASE) PHYSMAP_BASE + map_address else map_address);
+    boot_map = map[0..info.memory_map_count];
+
+    boot_data = .{ .base = @intCast(info.boot_data_base), .size = @intCast(info.boot_data_size) };
+    const image = kernelImagePhys();
+    guest_fb = place(GUEST_FB_SIZE, &.{ image, boot_data }) orelse
+        @panic("memmap: no usable RAM for the guest framebuffer");
+    back_buffer = place(BACK_BUFFER_SIZE, &.{ image, boot_data, guest_fb }) orelse
+        @panic("memmap: no usable RAM for the back buffer");
+    @import("../debug/serial.zig").print(
+        "[memmap] image 0x{X}..0x{X} (link +0x{X}), boot data 0x{X}..0x{X}, guest fb 0x{X}, back buffer 0x{X}\n",
+        .{ image.base, image.end(), imagePhysOffset(), boot_data.base, boot_data.end(), guest_fb.base, back_buffer.base },
+    );
+}
+
+const PLACEMENT_ALIGN: usize = 0x200000;
+/// The PMM's bitmap ends here, and so does what a 32-bit DMA address reaches.
+const PLACEMENT_LIMIT: u64 = 0x1_0000_0000;
+
+/// Whether the firmware's map calls all of [base, base + size) usable RAM.
+/// For what must sit at an address fixed in advance, such as a real-mode
+/// trampoline: a page the firmware keeps for itself is not ours to write.
+pub fn isUsableRam(base: usize, size: usize) bool {
+    for (boot_map) |region| {
+        if (region.kind == .usable and region.base <= base and base + size <= region.base +| region.length) return true;
     }
-    if (uefi_layout.BOOT_STACK_TOP > UEFI_PT_BASE + UEFI_PT_SIZE) {
-        @compileError("UEFI bootloader fixed addresses overflow UEFI_PT region");
+    return false;
+}
+
+/// First fit, lowest region first: `size` bytes of usable RAM between
+/// LOW_MEMORY_END and PLACEMENT_LIMIT that touch none of `taken`.
+fn place(size: usize, taken: []const Range) ?Range {
+    for (boot_map) |region| {
+        if (region.kind != .usable or region.base >= PLACEMENT_LIMIT) continue;
+        const region_end: u64 = @min(region.base +| region.length, PLACEMENT_LIMIT);
+        var base: u64 = std.mem.alignForward(u64, @max(region.base, LOW_MEMORY_END), PLACEMENT_ALIGN);
+        search: while (base +| size <= region_end) {
+            const candidate: Range = .{ .base = @intCast(base), .size = size };
+            for (taken) |t| {
+                if (candidate.overlaps(t)) {
+                    base = std.mem.alignForward(u64, t.end(), PLACEMENT_ALIGN);
+                    continue :search;
+                }
+            }
+            return candidate;
+        }
     }
+    return null;
 }
 
 // GUI framebuffers are PMM-allocated per window now (sysCreateWindow).
@@ -183,36 +260,12 @@ pub const Phys = layout.Phys;
 pub const KVa = layout.KVa;
 pub const UVa = layout.UVa;
 
-// --- Comptime overlap asserts ---
-//
-// Pairwise check that the kernel-side static regions don't overlap. If a
-// future change makes two regions collide (e.g. doubling GUEST_FB_SIZE
-// without bumping BACK_BUFFER_BASE), this fails at build time. The kernel
-// image's runtime extent is checked separately in `assertKernelImageFits`.
 comptime {
-    const Region = struct { name: []const u8, base: usize, size: usize };
-    const regions = [_]Region{
-        .{ .name = "guest_fb", .base = GUEST_FB_BASE, .size = GUEST_FB_SIZE },
-        .{ .name = "back_buffer", .base = BACK_BUFFER_BASE, .size = BACK_BUFFER_SIZE },
-    };
-    var i: usize = 0;
-    while (i < regions.len) : (i += 1) {
-        var j: usize = i + 1;
-        while (j < regions.len) : (j += 1) {
-            const a = regions[i];
-            const b = regions[j];
-            const a_end = a.base + a.size;
-            const b_end = b.base + b.size;
-            if (a.base < b_end and b.base < a_end) {
-                @compileError("memmap: regions overlap — " ++ a.name ++ " vs " ++ b.name);
-            }
-        }
-    }
-
-    // USER_VA_FLOOR sanity (matches app/linker.ld; comptime catch if someone
-    // moves it below the kernel-image base).
-    if (USER_VA_FLOOR <= KERNEL_PHYS_START) {
-        @compileError("USER_VA_FLOOR must be above KERNEL_PHYS_START");
+    // The loader builds the windows from boot_protocol.zig.
+    if (layout.KERNEL_VIRT_BASE != protocol.KERNEL_VIRT_BASE or layout.PHYSMAP_BASE != protocol.PHYSMAP_BASE or
+        layout.PHYSMAP_SIZE != protocol.PHYSMAP_SIZE)
+    {
+        @compileError("memmap: layout.zig and lib/boot_protocol.zig disagree on the kernel windows");
     }
 
     // User-space sanity.
@@ -221,25 +274,5 @@ comptime {
     }
     if (USER_BRK_INITIAL < USER_VA_FLOOR) {
         @compileError("USER_BRK_INITIAL must be at or above USER_VA_FLOOR");
-    }
-}
-
-/// Runtime check that the kernel image fits below GUEST_FB_BASE. Call once
-/// during boot. If this fires, the kernel grew into the guest framebuffer —
-/// FB writes would corrupt kernel BSS / .data. Either trim the kernel or
-/// move GUEST_FB_BASE (and the regions stacked above it) in
-/// lib/uefi_layout.zig.
-///
-/// Note: this is the ONLY runtime constraint on kernel image size — user-app
-/// load VA is a separate concept (USER_VA_FLOOR, fixed by app/linker.ld) and
-/// has no relationship to kernel growth.
-pub fn assertKernelImageFits() void {
-    const end = kernelEndPhys();
-    if (end > GUEST_FB_BASE) {
-        @import("../debug/debug.zig").klog(
-            "[memmap] FATAL: kernel image extends to 0x{X}, past GUEST_FB_BASE 0x{X}\n",
-            .{ end, GUEST_FB_BASE },
-        );
-        @panic("kernel image grew into the guest framebuffer");
     }
 }

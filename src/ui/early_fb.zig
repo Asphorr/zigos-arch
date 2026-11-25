@@ -44,14 +44,14 @@ pub fn init(boot_info: *const boot_info_mod.BootInfo) bool {
         // framebuffer. The GOP scanout driver bridges both real-firmware gaps:
         // direct mode for BGRA-with-stride==width (QEMU/OVMF — gfx draws
         // straight to the panel, byte-identical to the old path here), blit
-        // mode for padded strides / RGBA (gfx draws into the fixed GUEST_FB
-        // region — no PMM needed, it's a reserved layout region — and every
+        // mode for padded strides / RGBA (gfx draws into the guest FB region
+        // — no PMM needed, memmap.init placed it — and every
         // post_blit flush copies rows out with stride/byte-order fixup).
         // This matters because real CSM-less UEFI has NO VGA text mode: the
         // old "decline and stay in text" fallback was a dark machine there.
         const gop = @import("../driver.zig").gop_fb;
         if (!gop.init(fb)) {
-            serial.print("[early-fb] UEFI GOP unusable (stride={d} width={d} fmt={d}); VGA text, awaiting tryVirtioGpu\n", .{ fb.stride, fb.width, fb.format });
+            serial.print("[early-fb] UEFI GOP unusable (stride={d} width={d} fmt={d}); VGA text, awaiting tryVirtioGpu\n", .{ fb.stride, fb.width, @intFromEnum(fb.format) });
             return false;
         }
         gfx.setScreen(gop.framebuffer, gop.width, gop.height);

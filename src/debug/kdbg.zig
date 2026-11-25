@@ -341,18 +341,16 @@ pub fn validateHandleIRQ0RetAddr(rsp_arg: u64, snap: u64) void {
 /// Without this, dumping a wild-write report tries to format a corrupt
 /// `name.ptr` slice from `resolveKernel(bogus_rip)` and #GPs in the printer.
 ///
-/// Phase 3 layout: kernel image is mapped at PML4[511]+PDPT[510], a 1 GB
-/// window starting at 0xFFFFFFFF80000000. Anything below that (or in the
-/// non-canonical hole) is not kernel text. The legacy [0x100000, 0x4000000)
-/// range stays accepted so backtraces taken before enterFirstTask (where
-/// some boot code still has low-phys aliases via the dropped low identity)
-/// still resolve symbols correctly.
+/// The image starts at KERNEL_VIRT_BASE and ends at kernelEnd(): the rest of
+/// its 1 GiB window need not be mapped (the UEFI loader maps the image and
+/// no more), so the bound is the image, not the window. The legacy
+/// [0x100000, 0x4000000) range stays accepted so backtraces taken before
+/// enterFirstTask (where some boot code still has low-phys aliases via the
+/// dropped low identity) still resolve symbols correctly.
 inline fn looksLikeKernelText(addr: u64) bool {
     // Legacy low-phys window — only valid pre-PML4[0]-drop.
     if (addr >= 0x100000 and addr < 0x4000000) return true;
-    // Kernel high-half image (1 GB at -2 GB).
-    if (addr >= 0xFFFFFFFF80000000 and addr < 0xFFFFFFFFC0000000) return true;
-    return false;
+    return addr >= memmap.KERNEL_VIRT_BASE and addr < memmap.kernelEnd();
 }
 
 fn safeSymbolPrint(addr: u64) void {
@@ -1460,8 +1458,11 @@ pub fn enterCritical() void {
 /// — e.g. an alignment panic at +0xfe1 hides that the actual `call
 /// integerOverflow` was at +0xfdc and a different safety check at +0xfe1.
 fn printPanicCallSite(rip: u64) void {
-    if (rip < 0xFFFFFFFF80000000 + 5) return;
+    if (rip < memmap.KERNEL_VIRT_BASE + 5) return;
     if (!looksLikeKernelText(rip - 5)) return;
+    // The five bytes below are read on the crash path: no second fault.
+    const paging = @import("../mm/paging.zig");
+    if (!paging.isMapped(rip - 5) or !paging.isMapped(rip - 1)) return;
 
     const ip_call: [*]const u8 = @ptrFromInt(rip - 5);
     // Only handle the most common form: E8 disp32 (near relative call,
@@ -1545,8 +1546,8 @@ pub fn crashSummary(opts: AutopsyOpts) void {
             "low 4KB — null deref?"
         else if (cr2 >= 0x0000_8000_0000_0000 and cr2 < 0xFFFF_8000_0000_0000)
             "non-canonical — wild pointer!"
-        else if (cr2 < memmap.KERNEL_PHYS_START)
-            "below kernel image"
+        else if (cr2 < memmap.LOW_MEMORY_END)
+            "below 1 MiB"
         else if (cr2 >= memmap.USER_VA_FLOOR and cr2 < memmap.USER_SPACE_END)
             "user range"
         else

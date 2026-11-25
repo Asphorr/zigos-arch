@@ -1008,8 +1008,8 @@ fn record(kind: NodeKind, path: *const PathBuf, ns: NameString, depth: u8) void 
 const PATH_MAX = 64;
 // Real firmware declares thousands of namespace nodes: an AMI B250 desktop DSDT
 // alone holds ~4200, a laptop's EC/battery/thermal trees add more. Each
-// StoredNode is ~170 B, so 8192 ≈ 1.4 MB of BSS — well inside the image's room
-// below GUEST_FB_BASE. store_overflow still guards the cap.
+// StoredNode is ~170 B, so 8192 ≈ 1.4 MB of BSS. store_overflow still guards
+// the cap.
 const MAX_NODES = 8192;
 
 /// A region whose offset/length were not literals is resolved on first access.

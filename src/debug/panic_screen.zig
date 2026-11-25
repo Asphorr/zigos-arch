@@ -214,8 +214,8 @@ fn formatCr2(buf: []u8, cr2: u64) []const u8 {
         "low 4KB - null deref?"
     else if (cr2 >= 0x0000_8000_0000_0000 and cr2 < 0xFFFF_8000_0000_0000)
         "non-canonical - wild pointer"
-    else if (cr2 < memmap.KERNEL_PHYS_START)
-        "below kernel image"
+    else if (cr2 < memmap.LOW_MEMORY_END)
+        "below 1 MiB"
     else if (cr2 >= memmap.USER_VA_FLOOR and cr2 < memmap.USER_SPACE_END)
         "user range"
     else

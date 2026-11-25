@@ -1,68 +1,16 @@
-// Boot-protocol-agnostic boot information.
-// Shared layout between UEFI bootloader and kernel.
-// All structs are extern for C ABI compatibility.
+//! The kernel's view of the boot handoff. The struct itself is
+//! lib/boot_protocol.zig, shared with the UEFI loader; this file adds the
+//! Multiboot conversion and what the kernel remembers of the handoff.
 
 const multiboot = @import("multiboot.zig");
+const protocol = @import("boot_protocol");
 
-pub const MemoryRegion = extern struct {
-    base: u64,
-    length: u64,
-    kind: u32, // Kind enum value
-
-    pub const Kind = enum(u32) {
-        usable = 1,
-        reserved = 2,
-        acpi_reclaimable = 3,
-        acpi_nvs = 4,
-        bad_memory = 5,
-        uefi_runtime = 6,
-    };
-};
-
-pub const FramebufferInfo = extern struct {
-    base: u64,
-    width: u32,
-    height: u32,
-    stride: u32,
-    format: u32, // 0=bgra, 1=rgba, 2=unknown
-};
-
-pub const BootInfo = extern struct {
-    memory_map: [*]const MemoryRegion,
-    memory_map_count: u32,
-    has_framebuffer: u32,
-    framebuffer: FramebufferInfo,
-    pml4_phys: u64,
-    rsdp_addr: u64,
-    /// 0 = normal, 1 = verbose, 2 = safe (no SMP). Set by the UEFI menu;
-    /// always 0 on the Multiboot path (no menu there).
-    boot_mode: u32,
-    _reserved: u32 = 0,
-    /// Address of the UEFI RuntimeServices table, or 0 on Multiboot path.
-    /// The kernel uses this to call SetVariable post-handoff for things
-    /// like writing LastBootStatus = success / crashed back to NVRAM.
-    /// Stored as u64 to avoid pulling std.os.uefi types into the kernel
-    /// freestanding target (the kernel-side wrapper at
-    /// `boot/uefi_nvram.zig` casts it to its own minimal mirror struct).
-    runtime_services_addr: u64 = 0,
-    /// Bootloader's compile-time build_id. UEFI path: filled from
-    /// bootloader's `build_options.build_id`. Multiboot path: 0.
-    /// Kernel compares to its own compile-time build_id at startup and
-    /// klogs a loud warning if they diverge — catches "rebuilt kernel
-    /// but old BOOTX64.efi on ESP" (or vice versa) without needing the
-    /// klog pattern recognition that would otherwise reveal it minutes later.
-    bootloader_build_id: u64 = 0,
-    /// Kernel cmdline string (ASCII). Bootloader populates from NVRAM
-    /// var `ZigOSCmdline`; Multiboot path leaves it empty. Cap is 256 B
-    /// because UEFI variables incur metadata overhead per byte and 256
-    /// is plenty for `init=foo klog=verbose nosmp` style flags.
-    cmdline: [256]u8 = [_]u8{0} ** 256,
-    cmdline_len: u32 = 0,
-    _reserved2: u32 = 0,
-};
+pub const MemoryRegion = protocol.MemoryRegion;
+pub const FramebufferInfo = protocol.FramebufferInfo;
+pub const BootInfo = protocol.BootInfo;
 
 /// True if the kernel was entered via the UEFI bootloader, false for Multiboot.
-/// Set by `kmain_uefi` before `kernelMain`. Use sparingly — prefer one code path
+/// Set by `uefiMain` before `kernelMain`. Use sparingly — prefer one code path
 /// that handles both. Mostly useful for diagnostic prefixes and BAR fixup hints.
 pub var is_uefi: bool = false;
 
@@ -88,11 +36,11 @@ pub fn fromMultiboot(info: *multiboot.MultibootInfo) BootInfo {
                 .base = @as(u64, entry.addr_high) << 32 | entry.addr_low,
                 .length = @as(u64, entry.len_high) << 32 | entry.len_low,
                 .kind = switch (entry.type) {
-                    1 => 1, // usable
-                    3 => 3, // acpi_reclaimable
-                    4 => 4, // acpi_nvs
-                    5 => 5, // bad_memory
-                    else => 2, // reserved
+                    1 => .usable,
+                    3 => .acpi_reclaimable,
+                    4 => .acpi_nvs,
+                    5 => .bad_memory,
+                    else => .reserved,
                 },
             };
             count += 1;
@@ -121,7 +69,7 @@ pub fn fromMultiboot(info: *multiboot.MultibootInfo) BootInfo {
         .memory_map = &regions,
         .memory_map_count = count,
         .has_framebuffer = 0,
-        .framebuffer = .{ .base = 0, .width = 0, .height = 0, .stride = 0, .format = 2 },
+        .framebuffer = .{ .base = 0, .width = 0, .height = 0, .stride = 0, .format = .unknown },
         .pml4_phys = cr3 & 0xFFFFFFFFF000,
         .rsdp_addr = 0,
         .boot_mode = parsed_mode,

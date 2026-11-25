@@ -96,12 +96,12 @@ pub fn detectFeatures() void {
 }
 
 /// Per-CPU: enable SMEP + UMIP only. Safe to call from BSP early-init even
-/// though the kernel boot stack lives in the low-half identity map under
-/// UEFI — SMEP checks only instruction fetches against U/S=1 pages and
-/// the kernel runs from -2 GB which has U/S=0. UMIP only affects CPL=3.
+/// though the Multiboot boot stack (boot.asm's) lives in the low-half
+/// identity map — SMEP checks only instruction fetches against U/S=1 pages
+/// and the kernel runs from -2 GB which has U/S=0. UMIP only affects CPL=3.
 ///
-/// SMAP is NOT touched here because the boot stack (low-half identity, USER
-/// bit set) is currently the active rsp: enabling SMAP here triple-faults
+/// SMAP is NOT touched here because that boot stack (low-half identity, USER
+/// bit set) may be the active rsp: enabling SMAP here triple-faults
 /// on the next push. See `enableSmapPerCpu` for the late-stage enable that
 /// runs after `paging.dropLowIdentity`.
 pub fn applyEarlyCr4() void {
@@ -137,7 +137,7 @@ pub fn applyEarlyCr4() void {
 
 /// Per-CPU: flip CR4.SMAP and OR RFLAGS.AC into IA32_FMASK so SYSCALL
 /// clears AC on entry. Call only after the active rsp is in a U/S=0 page
-/// (BSP: after `paging.dropLowIdentity` swaps off the UEFI boot stack;
+/// (BSP: after `paging.dropLowIdentity`, off the boot stack;
 /// AP: any time after entry, since the AP stack is already physmap-VA).
 pub fn enableSmapPerCpu() void {
     if (!smap_enabled) return;

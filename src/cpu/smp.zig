@@ -673,11 +673,16 @@ pub fn init() void {
     smp_initialized = true;
     benchCpuIdRead();
 
-    trampoline.install(.ap);
+    const have_trampoline = trampoline.pageIsUsable(.ap);
+    if (have_trampoline) {
+        trampoline.install(.ap);
+    } else {
+        debug.klog("[smp] AP trampoline page 0x{X} is not usable RAM on this machine: staying single-CPU\n", .{trampoline.phys(.ap)});
+    }
 
     const pml4_phys = paging.getKernelPML4Phys();
-    // The AP loads CR3 in 32-bit mode. Holds for Multiboot (pml4 ~1 MiB) and
-    // normally for UEFI, but the UEFI allocator does not promise < 4 GiB.
+    // The AP loads CR3 in 32-bit mode. Both loaders keep the tables below
+    // 4 GiB (boot_protocol.zig); a truncated CR3 would be a silent reset.
     if (pml4_phys >= 0x1_0000_0000)
         @panic("smp: kernel PML4 phys >= 4GB — AP 32-bit CR3 load would truncate");
 
@@ -687,7 +692,7 @@ pub fn init() void {
     // hyperthreading or socket layout). Without MADT we fall back to
     // the historical 1..MAX_CPUS-1 probe loop.
     var ap_ids: [MAX_CPUS]u8 = undefined;
-    const ap_count = collectApIds(bsp_id, &ap_ids);
+    const ap_count = if (have_trampoline) collectApIds(bsp_id, &ap_ids) else 0;
 
     var ap_idx: usize = 0;
     while (ap_idx < ap_count) : (ap_idx += 1) {
@@ -1057,6 +1062,9 @@ pub fn reonlineApsForS3Resume(resume_cr3: u64) void {
         debug.klog("[smp] S3 re-online: resume CR3 0x{x} >= 4 GiB — skipped, staying single-CPU\n", .{resume_cr3});
         return;
     }
+
+    // No trampoline, so no AP was started at boot either.
+    if (!trampoline.pageIsUsable(.ap)) return;
 
     // Low memory is PMM-reserved and almost certainly survived S3; re-copy
     // anyway, so resume never depends on what the firmware left there.

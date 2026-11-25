@@ -90,12 +90,9 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // Cross-unit memory-layout source of truth. Both kernel (memmap.zig
-    // comptime-asserts it agrees) and UEFI bootloader (consumes the fixed
-    // addresses directly) import this. Bumping any region size requires
-    // updating the values here — build refuses on drift.
-    const uefi_layout_mod = b.createModule(.{
-        .root_source_file = b.path("lib/uefi_layout.zig"),
+    // The boot handoff: one definition for the kernel and the UEFI loader.
+    const boot_protocol_mod = b.createModule(.{
+        .root_source_file = b.path("lib/boot_protocol.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -124,7 +121,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "shapes", .module = kernel_shapes_mod },
                 .{ .name = "font_blobs", .module = font_blobs_mod },
-                .{ .name = "uefi_layout", .module = uefi_layout_mod },
+                .{ .name = "boot_protocol", .module = boot_protocol_mod },
             },
         }),
         // Zig 0.16's self-hosted x86 backend can't yet encode some of our
@@ -1454,11 +1451,10 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseSafe,
     });
 
-    // Re-create uefi_layout for the bootloader with the right target — it's
-    // the same source file (single source of truth), but Zig needs a module
+    // The same file as the kernel's boot_protocol: Zig wants a module
     // instance per target.
-    const bootloader_uefi_layout_mod = b.createModule(.{
-        .root_source_file = b.path("lib/uefi_layout.zig"),
+    const bootloader_boot_protocol_mod = b.createModule(.{
+        .root_source_file = b.path("lib/boot_protocol.zig"),
         .target = uefi_target,
         .optimize = .ReleaseSafe,
     });
@@ -1471,7 +1467,7 @@ pub fn build(b: *std.Build) void {
             .optimize = .ReleaseSafe,
             .imports = &.{
                 .{ .name = "aa_font", .module = bootloader_aa_font_mod },
-                .{ .name = "uefi_layout", .module = bootloader_uefi_layout_mod },
+                .{ .name = "boot_protocol", .module = bootloader_boot_protocol_mod },
             },
         }),
     });
@@ -1481,6 +1477,10 @@ pub fn build(b: *std.Build) void {
     // and BOOTX64.efi came from different builds (one stale on disk).
     bootloader.root_module.addOptions("build_options", build_options);
     b.installArtifact(bootloader);
+
+    // `zig build bootloader` — BOOTX64.efi alone, the loader's `zig build kernel`.
+    const bootloader_step = b.step("bootloader", "Build BOOTX64.efi alone (no kernel, no apps, no images)");
+    bootloader_step.dependOn(&b.addInstallArtifact(bootloader, .{}).step);
 
     // --- Create ESP (EFI System Partition) FAT32 image with MBR ---
     // Uses fdisk + losetup for proper partition table (required by OVMF)

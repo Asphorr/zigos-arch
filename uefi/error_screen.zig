@@ -30,7 +30,10 @@ pub const Step = enum {
     read_elf_header,
     invalid_elf_magic,
     invalid_elf_class,
+    kernel_segments,
+    read_kernel_file,
     no_kmain_symbol,
+    out_of_memory,
     memory_map,
     exit_boot_services,
 };
@@ -67,7 +70,7 @@ fn drawBorder(fb: aa.Fb, x: u32, y: u32, w: u32, h: u32, color: u32) void {
     if (w >= 2) fillRect(fb, x + w - 1, y, 1, h, color);
 }
 
-fn stepLabel(step: Step) []const u8 {
+pub fn stepLabel(step: Step) []const u8 {
     return switch (step) {
         .no_filesystem => "no UEFI SimpleFileSystem on the boot device",
         .open_volume => "could not openVolume() on the ESP",
@@ -75,7 +78,10 @@ fn stepLabel(step: Step) []const u8 {
         .read_elf_header => "could not read /kernel.elf header (truncated file?)",
         .invalid_elf_magic => "/kernel.elf doesn't have a valid ELF magic (0x7F 'E' 'L' 'F')",
         .invalid_elf_class => "/kernel.elf is the wrong ELF class (must be ELF64 little-endian, x86_64)",
-        .no_kmain_symbol => "kernel ELF has no `kmain_uefi` symbol — bootloader can't pick an entry point",
+        .kernel_segments => "/kernel.elf has no loadable segments, or ones the loader cannot place",
+        .read_kernel_file => "/kernel.elf ended early or the boot device failed mid-read",
+        .no_kmain_symbol => "/kernel.elf has no entry for this loader — the two were built from different versions",
+        .out_of_memory => "the firmware has no memory below 4 GiB for the kernel",
         .memory_map => "UEFI getMemoryMap() failed — firmware is in a bad state",
         .exit_boot_services => "ExitBootServices() failed — firmware refused the handoff",
     };
@@ -93,15 +99,19 @@ fn stepHints(step: Step) []const []const u8 {
             "Verify /EFI/BOOT/BOOTX64.EFI and /kernel.elf are both present.",
             "OVMF caches the FAT root — try `cp .../OVMF_VARS_4M.fd ovmf_vars.fd`.",
         },
-        .read_elf_header, .invalid_elf_magic, .invalid_elf_class => &.{
+        .out_of_memory => &.{
+            "The image and its page tables need about 32 MB of free RAM below 4 GiB.",
+            "In QEMU, give the guest more memory (-m 256).",
+        },
+        .read_elf_header, .invalid_elf_magic, .invalid_elf_class, .kernel_segments, .read_kernel_file => &.{
             "The on-disk kernel.elf is corrupt or wrong-arch.",
             "Did `objcopy` strip too aggressively? (we only generate kernel32.elf for Multiboot.)",
             "`file zig-out/bin/kernel.elf` should report ELF 64-bit LSB executable, x86-64.",
         },
         .no_kmain_symbol => &.{
-            "The kernel was built without `pub fn kmain_uefi(...)` exported.",
-            "Check src/main.zig wasn't compiled with --strip or symbol-stripping.",
-            "Try `zig build clean && zig build` to force a full rebuild.",
+            "The loader looks for the entry symbol of its own boot protocol version (lib/boot_protocol.zig).",
+            "BOOTX64.EFI and kernel.elf on this volume come from different builds: copy both from one `zig build`.",
+            "A stripped kernel.elf has no symbol table either: the loader needs it.",
         },
         .memory_map, .exit_boot_services => &.{
             "Try a warm reset (Esc → resetSystem). Some OVMF builds leak memory descriptors.",

@@ -16,9 +16,9 @@
 //           flush()/flushRect() are no-ops (the panel scans the live buffer).
 //
 //   blit:   padded stride (1366-wide panels pad scanlines to 1376 px) and/or
-//           RGBA byte order. gfx renders into the fixed GUEST_FB region —
-//           8 MB reserved in the kernel memory layout (uefi_layout.zig),
-//           mapped from the first instruction, PMM-reserved at init, and
+//           RGBA byte order. gfx renders into the guest FB region —
+//           8 MB placed at boot (memmap.guestFb), reachable through the
+//           physmap from the first instruction, PMM-reserved at init, and
 //           otherwise idle when virtio-gpu isn't present — and flush copies
 //           rows into the panel FB honoring pixels-per-scanline, swapping
 //           R/B for RGBA. The same TRANSFER+FLUSH shape as virtio-gpu, so
@@ -56,19 +56,19 @@ var rgba: bool = false; // panel wants R/B swapped relative to gfx's BGRA
 /// blit-mode resolution too big for the GUEST_FB back buffer (the bootloader
 /// mode picker prevents that; this is the belt to its suspenders).
 ///
-/// Safe to call before PMM/heap exist: both the panel FB and GUEST_FB are
-/// reached through the boot page tables' physmap, and GUEST_FB is a fixed
-/// layout region (never PMM-allocated) that pmm.init reserves wholesale.
+/// Safe to call before PMM/heap exist, after memmap.init: both the panel FB
+/// and the guest FB are reached through the boot page tables' physmap, and
+/// the guest FB is placed by memmap, not allocated; pmm.init reserves it.
 pub fn init(fb: boot_info_mod.FramebufferInfo) bool {
     if (active) return true;
     if (fb.base == 0 or fb.width == 0 or fb.height == 0) return false;
-    if (fb.format != 0 and fb.format != 1) return false; // 0=BGRA 1=RGBA
+    if (fb.format != .bgra and fb.format != .rgba) return false;
     if (fb.stride < fb.width) return false;
 
     width = fb.width;
     height = fb.height;
     stride_px = fb.stride;
-    rgba = fb.format == 1;
+    rgba = fb.format == .rgba;
     panel = @ptrFromInt(paging.physToVirt(@as(usize, @intCast(fb.base))));
     direct = !rgba and stride_px == width;
 
@@ -76,11 +76,12 @@ pub fn init(fb: boot_info_mod.FramebufferInfo) bool {
         framebuffer = panel;
     } else {
         const need: u64 = @as(u64, width) * @as(u64, height) * 4;
-        if (need > memmap.GUEST_FB_SIZE) {
-            debug.klog("[gop] {d}x{d} needs {d} KB > GUEST_FB ({d} KB) — cannot back-buffer\n", .{ width, height, need / 1024, memmap.GUEST_FB_SIZE / 1024 });
+        const guest_fb = memmap.guestFb();
+        if (need > guest_fb.size) {
+            debug.klog("[gop] {d}x{d} needs {d} KB > GUEST_FB ({d} KB) — cannot back-buffer\n", .{ width, height, need / 1024, guest_fb.size / 1024 });
             return false;
         }
-        framebuffer = @ptrFromInt(paging.physToVirt(memmap.GUEST_FB_BASE));
+        framebuffer = @ptrFromInt(paging.physToVirt(guest_fb.base));
         // The region is never bulk-zeroed; clear our slice of it once so the
         // first partial flush doesn't push stale memory to the panel.
         const words: usize = @as(usize, width) * @as(usize, height);

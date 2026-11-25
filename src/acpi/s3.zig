@@ -233,6 +233,10 @@ pub fn suspendToRam() u32 {
         serial.print("[s3] no FACS — cannot set wake vector; S3 unavailable\n", .{});
         return common.E_NOSYS;
     };
+    if (!trampoline.pageIsUsable(.wake)) {
+        serial.print("[s3] wake trampoline page 0x{x} is not usable RAM on this machine — S3 unavailable\n", .{trampoline.phys(.wake)});
+        return common.E_NOSYS;
+    }
 
     // From here we mutate the resume staging (trampoline page + FACS wake vector)
     // and arm the setjmp. Disable interrupts so nothing runs between arming and

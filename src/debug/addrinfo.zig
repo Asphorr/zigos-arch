@@ -98,18 +98,17 @@ fn render(addr: usize) ![]const u8 {
         return std.fmt.bufPrint(&buf, "user-stack-reserve @0x{x}", .{addr});
     }
 
-    // 5. Static low-VA memmap regions.
-    if (addr >= memmap.GUEST_FB_BASE and addr < memmap.GUEST_FB_BASE + memmap.GUEST_FB_SIZE) {
-        return std.fmt.bufPrint(&buf, "guest_fb +0x{x}", .{addr - memmap.GUEST_FB_BASE});
-    }
-    if (addr >= memmap.BACK_BUFFER_BASE and addr < memmap.BACK_BUFFER_BASE + memmap.BACK_BUFFER_SIZE) {
-        return std.fmt.bufPrint(&buf, "back_buffer +0x{x}", .{addr - memmap.BACK_BUFFER_BASE});
-    }
-    if (addr >= memmap.UEFI_PT_BASE and addr < memmap.UEFI_PT_BASE + memmap.UEFI_PT_SIZE) {
-        return std.fmt.bufPrint(&buf, "uefi_pt +0x{x}", .{addr - memmap.UEFI_PT_BASE});
-    }
-    if (addr >= memmap.KERNEL_PHYS_START and addr < memmap.kernelEndPhys()) {
-        return std.fmt.bufPrint(&buf, "kernel-image-phys @0x{x}", .{addr});
+    // 5. Physical memory the kernel holds (memmap.zig), as a low address.
+    const held = [_]struct { name: []const u8, range: memmap.Range }{
+        .{ .name = "guest_fb", .range = memmap.guestFb() },
+        .{ .name = "back_buffer", .range = memmap.backBuffer() },
+        .{ .name = "boot_data", .range = memmap.bootData() },
+        .{ .name = "kernel-image-phys", .range = memmap.kernelImagePhys() },
+    };
+    for (held) |h| {
+        if (h.range.contains(addr)) {
+            return std.fmt.bufPrint(&buf, "{s} +0x{x}", .{ h.name, addr - h.range.base });
+        }
     }
 
     return std.fmt.bufPrint(&buf, "unmapped/unknown 0x{x}", .{addr});

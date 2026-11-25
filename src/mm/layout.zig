@@ -47,9 +47,14 @@ pub const USER_CANONICAL_MAX: u64 = 0x0000_8000_0000_0000;
 // comptime block below so an edit here that diverges from linker.ld / boot.asm
 // trips the build instead of triple-faulting at boot.
 
-/// Higher-half kernel image base (PML4[511]+PDPT[510], maps phys 0..1 GB).
+/// Higher-half kernel image base (PML4[511]+PDPT[510]). An image address `v`
+/// is the physical address `v - KERNEL_VIRT_BASE + image_phys_offset`.
 /// Must match `KERNEL_VIRT_BASE` in src/linker.ld.
 pub const KERNEL_VIRT_BASE: u64 = 0xFFFFFFFF80000000;
+
+/// How far above its link addresses the loader put the image
+/// (BootInfo.kernel_phys_offset). Written once, first thing at entry.
+pub var image_phys_offset: u64 = 0;
 
 /// Physmap base (PML4[256], 512 GB window mapping phys 0..PHYSMAP_SIZE). The
 /// canonical "kernel reaches any phys frame" view. Must match `pdpt_physmap`
@@ -285,7 +290,7 @@ pub const KVa = enum(u64) {
     /// in none of them (a wild kernel pointer). Mirrors paging.virtToPhys.
     pub inline fn toPhys(self: KVa) ?Phys {
         const v = self.raw();
-        if (v >= KERNEL_VIRT_BASE) return Phys.from(v - KERNEL_VIRT_BASE);
+        if (v >= KERNEL_VIRT_BASE) return Phys.from(v - KERNEL_VIRT_BASE +% image_phys_offset);
         if (v >= PHYSMAP_BASE and v < PHYSMAP_BASE + PHYSMAP_SIZE) return Phys.from(v - PHYSMAP_BASE);
         if (v < 0x100000000) return Phys.from(v); // boot low-identity (<4 GB)
         return null;

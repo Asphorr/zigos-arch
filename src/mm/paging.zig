@@ -126,9 +126,10 @@ comptime {
 //   PHYSMAP_BASE   = 0xFFFF800000000000  PML4[256], 64 GB → phys 0..64 GB.
 //                                        Kernel-only. The canonical "kernel
 //                                        can reach any phys frame" view.
-//   KERNEL_VIRT_BASE = 0xFFFFFFFF80000000 PML4[511]+PDPT[510], 1 GB →
-//                                        phys 0..1 GB. Kernel image (.text,
-//                                        .rodata, .data, .bss) lives here.
+//   KERNEL_VIRT_BASE = 0xFFFFFFFF80000000 PML4[511]+PDPT[510]. The kernel
+//                                        image (.text, .rodata, .data, .bss),
+//                                        wherever the loader put it: phys =
+//                                        virt - base + image_phys_offset.
 //
 // During Phase 2 the legacy low identity (PML4[0]) is *also* live so callers
 // that haven't migrated keep working. Phase 2d drops it.
@@ -149,6 +150,7 @@ pub inline fn physToVirt(phys: u64) u64 {
 
 /// Translate a kernel VA to its physical address. Recognized windows:
 ///   - kernel image (-2 GB, KERNEL_VIRT_BASE..)        → virt - KERNEL_VIRT_BASE
+///                                                        + image_phys_offset
 ///   - physmap (PHYSMAP_BASE..+PHYSMAP_SIZE)            → virt - PHYSMAP_BASE
 ///   - low identity (virt < 4 GB)                       → virt (boot 1 GB
 ///     pages identity-map 0..64 GB; under Phase 3 only PML4[0] is dropped,
@@ -160,7 +162,7 @@ pub inline fn physToVirt(phys: u64) u64 {
 /// resulting panic message localizes the bug instantly.
 pub inline fn virtToPhys(virt: u64) ?u64 {
     if (virt >= KERNEL_VIRT_BASE) {
-        return virt - KERNEL_VIRT_BASE;
+        return virt - KERNEL_VIRT_BASE +% memmap.imagePhysOffset();
     }
     if (virt >= PHYSMAP_BASE and virt < PHYSMAP_BASE + PHYSMAP_SIZE) {
         return virt - PHYSMAP_BASE;
@@ -683,25 +685,27 @@ pub fn unmapGuiFB(pid: u8, num_pages_per_buf: u32) void {
 }
 
 // --- Back buffer ---
-// Fixed contiguous region after the guest framebuffer. The kernel pointer
-// goes through the physmap; the BB_BASE constant itself is the *physical*
-// address (typed Phys — allocBackBuffer marks the region used in PMM).
-//   kernel_heap → guest_fb → back_buffer → gui_fb_reserve.
-const BB_BASE: Phys = Phys.of(memmap.BACK_BUFFER_BASE);
+// One contiguous region for the kernel's whole life, placed at boot
+// (memmap.backBuffer) and reserved by pmm.init. The kernel pointer goes
+// through the physmap.
+fn backBufferBase() ?Phys {
+    const region = memmap.backBuffer();
+    return if (region.size == 0) null else Phys.of(region.base);
+}
 
 pub fn allocBackBuffer(num_pages: u32) ?[*]u32 {
-    pmm.markRegionUsed(BB_BASE, @as(usize, num_pages) * 4096);
-    return @ptrFromInt(BB_BASE.toVirt().raw());
+    const base = backBufferBase() orelse return null;
+    if (@as(usize, num_pages) * 4096 > memmap.BACK_BUFFER_SIZE) return null;
+    return @ptrFromInt(base.toVirt().raw());
 }
 
 pub fn getBackBufferAddr() usize {
-    return BB_BASE.raw();
+    return memmap.backBuffer().base;
 }
 
 pub fn freeBackBuffer(num_pages: u32) void {
-    // NO-OP BY DESIGN. BACK_BUFFER is a FIXED region reserved once at boot
-    // (pmm.init: markRegionUsed(BACK_BUFFER_BASE, BACK_BUFFER_SIZE)) and
-    // allocBackBuffer always hands back the SAME physToVirt(BB_BASE) — the
+    // NO-OP BY DESIGN. The back buffer is one region reserved once at boot
+    // (pmm.init) and allocBackBuffer always hands back the same pointer — the
     // frames never move. Calling pmm.markRegionFree here returns the singleton
     // region to the GENERAL allocator, so between this free and the next
     // allocBackBuffer (e.g. across a resolution change) pmm.allocFrame can hand
@@ -715,28 +719,29 @@ pub fn freeBackBuffer(num_pages: u32) void {
 }
 
 // --- Guest FB (virtio-gpu) ---
-// Fixed contiguous region. Needs contiguous physical memory for DMA. Kernel
-// writes go through the physmap; the device sees the entries in `phys_out`
-// (still the raw phys addresses, what virtio-gpu's resource_create expects).
-const GFB_BASE: Phys = Phys.of(memmap.GUEST_FB_BASE);
-
+// One contiguous region for the kernel's whole life, placed at boot
+// (memmap.guestFb) and reserved by pmm.init: the device needs contiguous
+// physical memory. Kernel writes go through the physmap; the device sees the
+// entries in `phys_out` (raw phys addresses, what resource_create expects).
 pub fn allocGuestFB(num_pages: u32, phys_out: [*]usize) ?[*]volatile u32 {
-    pmm.markRegionUsed(GFB_BASE, @as(usize, num_pages) * 4096);
+    const region = memmap.guestFb();
+    if (@as(usize, num_pages) * 4096 > region.size) return null;
+    const base = Phys.of(region.base);
     for (0..num_pages) |i| {
-        phys_out[i] = GFB_BASE.add(i * 4096).raw();
+        phys_out[i] = base.add(i * 4096).raw();
     }
-    return @ptrFromInt(GFB_BASE.toVirt().raw());
+    return @ptrFromInt(base.toVirt().raw());
 }
 
 pub fn getGuestFBAddr() usize {
-    return GFB_BASE.raw();
+    return memmap.guestFb().base;
 }
 
 pub fn freeGuestFB(num_pages: u32) void {
-    // NO-OP BY DESIGN — see the freeBackBuffer note above. GUEST_FB is a FIXED
-    // 8 MB region reserved once at boot (pmm.init); allocGuestFB always returns
-    // the SAME physToVirt(GFB_BASE) and the device always scans out of GFB_BASE,
-    // so the physical frames never change across a mode change. The old code
+    // NO-OP BY DESIGN — see the freeBackBuffer note above. The guest FB is one
+    // region reserved once at boot (pmm.init); allocGuestFB always returns the
+    // same pointer and the device always scans out of the same frames, so
+    // they never change across a mode change. The old code
     // pmm.markRegionFree'd the region on every virtio_gpu.changeMode (resolution
     // toggle), donating the singleton FB frames to the general PMM pool. A
     // vmalloc wallpaper allocated in that window grabbed a GFB frame for its

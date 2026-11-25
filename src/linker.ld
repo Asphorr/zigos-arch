@@ -24,6 +24,8 @@
 OUTPUT_FORMAT(elf64-x86-64)
 ENTRY(_start)
 
+/* Where Multiboot loads the image. The UEFI loader puts it wherever the
+ * firmware has room and maps it at the same virtual addresses. */
 KERNEL_PHYS_BASE = 1M;
 KERNEL_VIRT_BASE = 0xFFFFFFFF80000000;
 
@@ -94,14 +96,18 @@ SECTIONS {
     }
     _kernel_end = .;
 
+    /* The image's first byte as the image window shows it (memmap.zig). */
+    __kernel_image_start = __boot_start + KERNEL_VIRT_BASE;
+
     /* Phys-address aliases for boot.asm. boot.asm runs in 32-bit mode and
      * cannot dereference high VAs; it uses these to zero high-half BSS
-     * via the low identity map (phys = virt - KERNEL_VIRT_BASE). */
+     * via the low identity map (phys = virt - KERNEL_VIRT_BASE). Multiboot
+     * loads the image at its link addresses, so there the two agree. */
     __bss_phys_start = __bss_start - KERNEL_VIRT_BASE;
     __bss_phys_end = __bss_end - KERNEL_VIRT_BASE;
 
-    /* The image ends below the guest framebuffer (GUEST_FB_BASE). */
-    ASSERT(__bss_phys_end <= 0x1C00000, "kernel image runs into the guest framebuffer")
+    /* A loader maps the image through one page directory: 1 GiB of window. */
+    ASSERT(__bss_phys_end <= 1024M, "kernel image outgrew its 1 GiB window")
 
     /DISCARD/ : { *(.eh_frame) *(.comment) *(.note*) }
 }
