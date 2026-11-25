@@ -452,39 +452,16 @@ pub fn validateUserReturnIretq(frame_base: [*]const u64, comptime rip_index: usi
     serial.print("  saved SS     = 0x{X:0>16}\n", .{frame_base[rip_index + 4]});
 
     // Dump the SAVED GPRs from the IRQ frame too — useful to see if any
-    // register held the bad RIP value.
-    const reg_names = [_][]const u8{
-        "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp",
-        "r8 ", "r9 ", "r10", "r11", "r12", "r13", "r14", "r15",
-    };
+    // register held the bad RIP value. Both frames this is called on begin
+    // with the same registers, in the order a first dispatch pops them.
     serial.print("  GPRs at frame entry:\n", .{});
-    for (reg_names, 0..) |name, i| {
-        serial.print("    {s} = 0x{X:0>16}\n", .{ name, frame_base[i] });
+    inline for (@import("../proc/frames.zig").dispatch.gprs.regs, 0..) |reg, i| {
+        serial.print("    {s: <3} = 0x{X:0>16}\n", .{ @tagName(reg), frame_base[i] });
     }
 
     dumpAll();
     @import("lbr.zig").dump(&lbr_snap);
     @panic("wild RIP at iretq to user (kdbg.validateUserReturnIretq)");
-}
-
-/// Call from `doSyscall` JUST BEFORE returning. Inspects the saved user RIP
-/// in the SyscallFrame (RCX field — syscall instruction stashes user RIP
-/// there). Same intent as validateUserReturnIretq but for the sysretq path.
-pub fn validateUserReturnSysret(saved_rcx: u64, saved_r11: u64) void {
-    if (ripIsValidUser(saved_rcx)) return;
-
-    const lbr_snap = @import("lbr.zig").snapshot();
-    const id = currentCpuId();
-
-    serial.print("\n!!! WILD RIP about to sysretq to user-mode (cpu={d}) !!!\n", .{id});
-    serial.print("  saved user RIP (RCX) = 0x{X:0>16} ", .{saved_rcx});
-    safeSymbolPrint(saved_rcx);
-    serial.print("  <-- not in user range [0x{X}, 0x{X})\n", .{ memmap.USER_SPACE_START, memmap.USER_SPACE_END });
-    serial.print("  saved RFLAGS (R11)   = 0x{X:0>16}\n", .{saved_r11});
-
-    dumpAll();
-    @import("lbr.zig").dump(&lbr_snap);
-    @panic("wild RIP at sysretq to user (kdbg.validateUserReturnSysret)");
 }
 
 // === Symbol formatting helper ==============================================

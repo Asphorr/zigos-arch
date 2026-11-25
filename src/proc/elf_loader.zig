@@ -1190,6 +1190,16 @@ pub fn loadAndExecute(elf_buf: [*]align(4) u8, file_size: usize, elf_buf_pages: 
         freePmmRange(@intFromPtr(elf_buf), elf_buf_pages);
         return;
     };
+    // The first dispatch iretqs to the entry: one that is no user address
+    // faults there, in the kernel.
+    const entry: usize = @intCast(header.entry);
+    if (!isUserVA(entry, 1, false)) {
+        vga.fg = .LightRed;
+        vga.print("Error: entry point outside user space!\n", .{});
+        debug.klog("[elf] Rejected: entry 0x{X} outside user VA range\n", .{entry});
+        freePmmRange(@intFromPtr(elf_buf), elf_buf_pages);
+        return;
+    }
 
     // Create per-process address space
     var pd_phys: Phys = Phys.of(0);
@@ -1202,7 +1212,6 @@ pub fn loadAndExecute(elf_buf: [*]align(4) u8, file_size: usize, elf_buf_pages: 
     };
 
     // Create process with fake interrupt frame
-    const entry: usize = @intCast(header.entry);
     const pid = process.create(entry, lay.stack_top - 8) orelse {
         vga.fg = .LightRed;
         vga.print("Error: process table full!\n", .{});

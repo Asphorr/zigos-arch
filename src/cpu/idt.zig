@@ -255,10 +255,6 @@ pub fn loadIdtForAP() void {
     );
 }
 
-
-//   [17] rip  [18] cs  [19] rflags  [20] rsp  [21] ss  (pushed by CPU)
-
-
 /// Pre-iretq sanity panic. Reached when an iretq site is about to pop a
 /// frame whose CS slot isn't 0x08 (kernel) or 0x23 (user). Catches the
 /// "wild iretq frame" class of corruption BEFORE iretq fires, so the

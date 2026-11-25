@@ -1194,8 +1194,8 @@ fn initPerCpuGdt(cpu: *CpuLocal) void {
     cpu.gdt_entries[0] = bsp_entries[0]; // null
     cpu.gdt_entries[1] = bsp_entries[1]; // kernel code
     cpu.gdt_entries[2] = bsp_entries[2]; // kernel data
-    cpu.gdt_entries[3] = bsp_entries[3]; // user code
-    cpu.gdt_entries[4] = bsp_entries[4]; // user data
+    cpu.gdt_entries[3] = bsp_entries[3]; // user data
+    cpu.gdt_entries[4] = bsp_entries[4]; // user code
 
     // Set up TSS with our ISR stack. RSP0 is the legacy slot used by IDT
     // gates with IST=0 on user→kernel transitions. setTssRsp0 overrides

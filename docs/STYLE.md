@@ -236,19 +236,23 @@ way: the pushes, the three words and the FXSAVE image under the frame,
 every offset of the iretq exit, and `signals.SyscallFrame` held to it by
 `assertMirror`. Only the first instructions differ per CPU — a head that
 finds its CPU's `tss.rsp0` by where it stands, LSTAR being the one
-per-CPU thing SYSCALL leaves free — and all heads jump to one body.
-**Still by hand:** the `int 0x80` stub (`syscall.isr_syscall`), which
-nothing in the tree calls.
+per-CPU thing SYSCALL leaves free — and all heads jump to one body. The
+`int 0x80` gate (`syscall.isr_syscall`) is `frames.entry.int80` with a
+middle of its own; `entrytest` enters through it, since nothing else in
+the tree does.
 
 **A return address the task chose is checked before it is used.** A
 signal handler's address, a sigreturn frame's rip, a new image's entry
-all end up where sysret or iretq will resume the task, and a
-non-canonical one faults in the kernel, not in the task: sysret in ring
-0 on the user's RSP. Delivery refuses a handler outside the user window
-(`layoutHandlerFrame`, linux `pushFrame`), sigreturn refuses such a rip,
+all end up where sysret or iretq will resume the task, and at or past
+the end of the user window that return faults in the kernel, not in the
+task: sysret to a non-canonical RIP in ring 0, on the user's RSP.
 `doSyscall` kills a task whose frame would return there
-(`checkReturnAddress`), and the entry compares once more before either
-exit. `sigtest` steps 4 and 5 ask for it both ways.
+(`checkReturnAddress`), the entry compares once more before either
+exit, both sigreturns refuse such a rip, the loaders refuse such an
+entry. A handler has to be inside the window whole (`layoutHandlerFrame`,
+linux `pushFrame`): on an interrupt's way out the frame checks take a
+RIP under the window for corruption. `sigtest` steps 4 and 5 ask for a
+return to nowhere both ways.
 
 ## `lock.assertHeld()` runtime checks
 

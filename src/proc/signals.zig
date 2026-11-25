@@ -958,10 +958,12 @@ const HandlerLayout = struct {
 };
 
 /// Null when the handler cannot be entered: no stack to put its frame on,
-/// or a handler address that is not user code's. The address is whatever
-/// the task gave sigaction, and a return to one outside the user window
-/// does not fault in the task — sysret to a non-canonical RIP faults in
-/// ring 0 on the user's RSP, iretq to one before it leaves the kernel.
+/// or a handler address outside the user window. The address is whatever
+/// the task gave sigaction. Past the window's end the return to it faults
+/// in the kernel — sysret to a non-canonical RIP in ring 0 on the user's
+/// RSP, iretq to one before it leaves; under its start nothing is ever
+/// mapped, and the interrupt-return checks (SAFE_IRETQ,
+/// kdbg.validateUserReturnIretq) take such a RIP for a corrupted frame.
 fn layoutHandlerFrame(handler: u64, user_rsp: u64, want_siginfo: bool) ?HandlerLayout {
     if (!memmap.isUserDataAddr(handler)) return null;
     const sinfo_size: u64 = if (want_siginfo) @sizeOf(Siginfo) else 0;
@@ -1318,10 +1320,12 @@ pub fn sigreturn(pcb: *process.PCB, frame: *SyscallFrame) u32 {
         process.destroyCurrentWithStatus(0xDEAD000B);
         return 0;
     }
-    // The frame is on the task's stack and so the task's to write: its rip
-    // is no more trusted than a handler's address (layoutHandlerFrame).
+    // The frame is on the task's stack and so the task's to write. A rip at
+    // or past the end of the user window is one sysret cannot return to
+    // (syscall.checkReturnAddress); it is refused here, where the log can
+    // say whose it was.
     const back_to = mctx_ptr.rip;
-    if (!memmap.isUserDataAddr(back_to)) {
+    if (back_to >= memmap.USER_SPACE_END) {
         protect.disallowUserAccess();
         debug.klog("[sig] sigreturn: rip 0x{X} in the MContext at 0x{X} is not a user address\n", .{ back_to, user_rsp });
         process.destroyCurrentWithStatus(0xDEAD000B);

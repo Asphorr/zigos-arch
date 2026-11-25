@@ -246,12 +246,13 @@ fn checkSlow(comptime where: std.builtin.SourceLocation) void {
     report(where, combined, snap, top);
 }
 
-// ISR stub pushes RAX..R15 in order (RAX first, R15 last). Push lowers
-// RSP, so R15 ends up at the LOWEST address = frame_base[0]. RAX at
-// the highest GPR address = frame_base[14], just below the iretq frame.
-const GPR_NAMES: [15][]const u8 = .{
-    "r15", "r14", "r13", "r12", "r11", "r10", "r9",  "r8",
-    "rdi", "rsi", "rbp", "rbx", "rdx", "rcx", "rax",
+// The saved registers by name, lowest address first: the order the timer
+// and exception stubs leave them in (frames.entry).
+const GPR_NAMES: [15][]const u8 = blk: {
+    const regs = @import("../proc/frames.zig").dispatch.gprs.regs;
+    var names: [regs.len][]const u8 = undefined;
+    for (regs, 0..) |r, i| names[i] = @tagName(r);
+    break :blk names;
 };
 
 fn report(

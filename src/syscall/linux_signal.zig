@@ -499,10 +499,8 @@ fn siginfoOf(t: signals.Taken, fault: Fault) Siginfo {
 /// handler's return puts back. `.busy`: the address-space lock couldn't be
 /// had in this context; nothing is written.
 fn pushFrame(pcb: *PCB, regs: *const Sigcontext, fp_image: *const [512]u8, d: Delivery, fault: Fault, mask: u64) Push {
-    // A handler that is not user code's address is as lost as one with no
-    // stack: the return to it would fault in the kernel, not in the task
-    // (sysret to a non-canonical RIP in ring 0 on the user's RSP, iretq to
-    // one before it leaves).
+    // A handler outside the user window is as lost as one with no stack
+    // (see signals.layoutHandlerFrame for what a return to it would do).
     if (!memmap.isUserDataAddr(d.disp.handler)) return .fault;
     const alt = pcb.alt_stack;
     const switch_stack = d.disp.flags & signals.SA_ONSTACK != 0 and alt.size != 0 and !alt.holds(regs.rsp);

@@ -16,12 +16,13 @@
 //!      verifies the bitcode.
 //!
 //! The matching is textual and only knows the obvious patterns: a template
-//! written out as `\\` lines. The interrupt and exception stubs are not —
-//! their text is generated (src/cpu/idt/stub.zig) from frames whose
-//! alignment is a comptime result (src/proc/frames.zig, `Entry`) — and
-//! every entry stub tests RSP before its `call` at run time besides. A run
-//! that saw no multi-line template, no `call` or no output fails: a lint
-//! that inspected nothing must not say PASS.
+//! written out as `\\` lines. The entry stubs are not — their text is
+//! generated (src/cpu/idt/stub.zig, src/syscall/entry.zig) from frames
+//! whose alignment is a comptime result (src/proc/frames.zig) — and each
+//! tests RSP before its `call` at run time besides; so the first check may
+//! find no `call` to look at, and says how many it did. A run that saw no
+//! multi-line template or no output fails: a lint that inspected nothing
+//! must not say PASS.
 
 const std = @import("std");
 
@@ -245,8 +246,8 @@ pub fn main() !void {
     std.debug.print("[asm-lint] {d} files, {d} asm templates ({d} multi-line), {d} calls, {d} outputs, {d} error(s)\n", .{
         files, lint.blocks, lint.multiline_blocks, lint.calls, lint.asm_outputs, lint.errors,
     });
-    if (lint.multiline_blocks == 0 or lint.calls == 0 or lint.asm_outputs == 0) {
-        std.debug.print("[asm-lint] FAIL: vacuous run, the matching saw no trampolines or no asm outputs\n", .{});
+    if (lint.multiline_blocks == 0 or lint.asm_outputs == 0) {
+        std.debug.print("[asm-lint] FAIL: vacuous run, the matching saw no multi-line templates or no asm outputs\n", .{});
         std.process.exit(1);
     }
     if (lint.errors != 0) {

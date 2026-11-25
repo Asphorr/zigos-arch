@@ -10,6 +10,9 @@ const process = @import("proc/process.zig");
 const perf = @import("debug/perf.zig");
 const debug = @import("debug/debug.zig");
 const signals = @import("proc/signals.zig");
+const frames = @import("proc/frames.zig");
+const stub = @import("cpu/idt/stub.zig");
+const int80 = frames.entry.int80;
 const apic = @import("irq/apic.zig");
 
 const common = @import("syscall/common.zig");
@@ -100,12 +103,14 @@ export fn doSyscall(sys_num: u32, arg1: u32, arg2: u32, arg3: u32, frame_raw: ?*
 /// The last word before the entry goes back to ring 3. The frame's rcx is
 /// where sysret, or the iretq exit, resumes the task — and by now it may be
 /// the task's own choice: a signal handler's address, the rip of a sigreturn
-/// frame, the entry of a new image. Outside the user window it is nowhere
-/// the task can run, and a non-canonical one makes the return itself fault:
-/// sysret in ring 0, on the user's RSP. Whoever set it, such a task ends
-/// here the way one that jumped there would, by SIGSEGV.
+/// frame, the entry of a new image. At or past the end of the user window
+/// the return cannot be made: a non-canonical address makes it fault in the
+/// kernel — sysret in ring 0, on the user's RSP — and a kernel one is not
+/// the task's. Whoever set it, such a task ends here the way one that
+/// jumped there would, by SIGSEGV. Under the window's start is the task's
+/// own fault to take, in ring 3, like any wild jump.
 fn checkReturnAddress(frame: *const signals.SyscallFrame) void {
-    if (@import("mm/memmap.zig").isUserDataAddr(frame.rcx)) return;
+    if (frame.rcx < @import("mm/memmap.zig").USER_SPACE_END) return;
     const pcb = process.currentPCB() orelse return;
     debug.klog("[syscall] pid={d} would return to 0x{X}, which is not a user address — killing the process\n", .{ process.getCurrentPid(), frame.rcx });
     process.killThreadGroup(pcb.tgid, signals.fatalStatus(pcb, signals.SIGSEGV));
@@ -657,64 +662,22 @@ fn doSyscallInner(sys_num: u32, arg1: u32, arg2: u32, arg3: u32, frame: ?*signal
     };
 }
 
+/// `int 0x80`, the legacy way in: rax is the call's number and rbx, rcx,
+/// rdx its arguments; rax comes back as the result and every other
+/// register, the FP/SSE state included, as it was (frames.entry.int80).
+/// Nothing in the tree enters this way any more, but ring 3 can.
 pub fn isr_syscall() callconv(.naked) void {
-    // cld: see isr_common_exc.
-    asm volatile (
-        \\ cld
-    // Switch to kernel data segments (preserve RAX = syscall number)
-        \\ pushq %%rax
-        \\ movw $0x10, %%ax
-        \\ movw %%ax, %%ds
-        \\ movw %%ax, %%es
-        \\ popq %%rax
-        // Save all GPRs
-        \\ pushq %%r15
-        \\ pushq %%r14
-        \\ pushq %%r13
-        \\ pushq %%r12
-        \\ pushq %%r11
-        \\ pushq %%r10
-        \\ pushq %%r9
-        \\ pushq %%r8
-        \\ pushq %%rbp
-        \\ pushq %%rdi
-        \\ pushq %%rsi
-        \\ pushq %%rbx
-        \\ pushq %%rdx
-        \\ pushq %%rcx
-        \\ pushq %%rax
-        // Set up doSyscall args (SysV: RDI=num, RSI=arg1, RDX=arg2, RCX=arg3)
-        \\ movl %%eax, %%edi
-        \\ movl %%ebx, %%esi
-        \\ movl %%ecx, %%r8d
-        \\ movl %%edx, %%ecx
-        \\ movl %%r8d, %%edx
-        // No SyscallFrame on this path: frame = null.
-        \\ xorl %%r8d, %%r8d
-        \\ call doSyscall
-        \\ movq %%rax, (%%rsp)
-        // Restore all GPRs
-        \\ popq %%rax
-        \\ popq %%rcx
-        \\ popq %%rdx
-        \\ popq %%rbx
-        \\ popq %%rsi
-        \\ popq %%rdi
-        \\ popq %%rbp
-        \\ popq %%r8
-        \\ popq %%r9
-        \\ popq %%r10
-        \\ popq %%r11
-        \\ popq %%r12
-        \\ popq %%r13
-        \\ popq %%r14
-        \\ popq %%r15
-        // Restore user data segments (preserve RAX = return value)
-        \\ pushq %%rax
-        \\ movw $0x23, %%ax
-        \\ movw %%ax, %%ds
-        \\ movw %%ax, %%es
-        \\ popq %%rax
-        \\ iretq
-    );
+    asm volatile (stub.save(int80) ++
+            // To SysV's rdi, rsi, rdx, rcx. The fifth argument, the frame,
+            // is null: this path has no SyscallFrame.
+            "movl %%eax, %%edi\n" ++
+            "movl %%ebx, %%esi\n" ++
+            "movl %%ecx, %%r8d\n" ++
+            "movl %%edx, %%ecx\n" ++
+            "movl %%r8d, %%edx\n" ++
+            "xorl %%r8d, %%r8d\n" ++
+            stub.call(int80, "doSyscall", .none) ++
+            // The result leaves in the saved rax.
+            "movq %%rax, " ++ frames.decimal(int80.regOffset(.rax)) ++ "(%%rsp)\n" ++
+            stub.restore(int80));
 }

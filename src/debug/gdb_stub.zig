@@ -4,6 +4,7 @@ const process = @import("../proc/process.zig");
 const elf_loader = @import("../proc/elf_loader.zig");
 const debug = @import("debug.zig");
 const Deadline = @import("../util/deadline.zig").Deadline;
+const ExcFrame = @import("../proc/signals.zig").ExcFrame;
 
 // --- COM2 serial port (0x2F8) for GDB communication ---
 
@@ -55,21 +56,22 @@ const HwBreakpoint = struct {
 };
 var hw_breakpoints: [4]HwBreakpoint = [_]HwBreakpoint{.{}} ** 4;
 
-// GDB register index → exception frame offset
-// Frame: [0]=R15 [1]=R14 [2]=R13 [3]=R12 [4]=R11 [5]=R10 [6]=R9 [7]=R8
-//        [8]=RDI [9]=RSI [10]=RBP [11]=RBX [12]=RDX [13]=RCX [14]=RAX
-//        [15]=int_no [16]=error_code
-//        [17]=RIP [18]=CS [19]=RFLAGS [20]=RSP [21]=SS
+// GDB register index → qword of the exception frame the stub is entered
+// with (signals.ExcFrame), in GDB's order for x86-64.
 // NO_FRAME = "fixed value, not in the frame". A plain u8 table with a
 // sentinel, not [24]?u8: an array of optionals is an array of anonymous
 // {i8, i1} literal structs — the array-element pool of the LLVM "Invalid
 // type" bitcode bug (round 2 drained it treewide; this one was missed).
 const NO_FRAME: u8 = 0xFF;
-const gdb_to_frame = [24]u8{
-    14, 11, 13, 12, 9, 8, 10, 20, // rax rbx rcx rdx rsi rdi rbp rsp
-    7, 6, 5, 4, 3, 2, 1, 0, // r8-r15
-    17, 19, 18, 21, // rip eflags cs ss
-    NO_FRAME, NO_FRAME, NO_FRAME, NO_FRAME, // ds es fs gs (fixed values)
+const gdb_to_frame = blk: {
+    const in_frame = [_][]const u8{
+        "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
+        "r8",  "r9",  "r10", "r11", "r12", "r13", "r14", "r15",
+        "rip", "rflags", "cs", "ss",
+    };
+    var table = [_]u8{NO_FRAME} ** 24; // ds es fs gs: fixed values
+    for (in_frame, 0..) |name, i| table[i] = @offsetOf(ExcFrame, name) / 8;
+    break :blk table;
 };
 
 // --- Public API ---

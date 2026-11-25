@@ -258,12 +258,19 @@ pub fn Entry(comptime spec: struct {
             return fp_below + iretqIndex(w) * 8;
         }
 
+        /// A saved register as a byte offset from RSP at the call.
+        pub fn regOffset(comptime r: Reg) usize {
+            return fp_below + saved.index(r) * 8;
+        }
+
         /// Refuse to compile unless extern struct `T` is this frame, field
         /// for field: the handlers read the frame through such a struct.
         pub fn assertMirror(comptime T: type) void {
             const info = @typeInfo(T).@"struct";
-            if (info.layout != .@"extern" or info.fields.len != qwords) {
-                @compileError(@typeName(T) ++ " is not the frame its stub builds: wrong layout or field count");
+            if (info.layout != .@"extern" or info.fields.len != qwords or
+                @sizeOf(T) != qwords * 8 or @alignOf(T) != 8)
+            {
+                @compileError(@typeName(T) ++ " is not the frame its stub builds: wrong layout, size or field count");
             }
             for (saved.regs, 0..) |r, k| expectField(T, k, @tagName(r));
             for (vector_words, 0..) |w, k| expectField(T, saved.count + k, w);
@@ -303,6 +310,10 @@ pub const entry = struct {
         .saved = dispatch.gprs,
         .vector_words = &.{ "int_no", "error_code" },
     });
+
+    /// `int 0x80`, the legacy way in to a syscall: every register, since
+    /// all but rax go back as they came.
+    pub const int80 = Entry(.{ .saved = dispatch.gprs });
 
     comptime {
         // The numbers the stubs and their handlers carried by hand.
@@ -370,8 +381,10 @@ pub const syscall = struct {
     /// Refuse to compile unless extern struct `T` is this frame.
     pub fn assertMirror(comptime T: type) void {
         const info = @typeInfo(T).@"struct";
-        if (info.layout != .@"extern" or info.fields.len != qwords) {
-            @compileError(@typeName(T) ++ " is not the frame the syscall entry builds: wrong layout or field count");
+        if (info.layout != .@"extern" or info.fields.len != qwords or
+            @sizeOf(T) != qwords * 8 or @alignOf(T) != 8)
+        {
+            @compileError(@typeName(T) ++ " is not the frame the syscall entry builds: wrong layout, size or field count");
         }
         for (saved.regs, 0..) |r, k| expectField(T, k, @tagName(r));
         expectField(T, user_rsp_index, "user_rsp");
