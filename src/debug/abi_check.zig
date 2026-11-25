@@ -10,6 +10,7 @@ const serial = @import("serial.zig");
 const debug = @import("debug.zig");
 const heap = @import("../mm/heap.zig");
 const memmap = @import("../mm/memmap.zig");
+const msr = @import("../cpu/arch/msr.zig");
 const smp = @import("../cpu/smp.zig");
 const pipe = @import("../proc/pipe.zig");
 
@@ -130,16 +131,12 @@ fn testIdtLoaded() void {
 // and the entry point is sane. If this fails, syscall_entry.init() didn't run
 // or the MSRs were clobbered.
 fn testSyscallMsrs() void {
-    const MSR_EFER: u32 = 0xC0000080;
-    const MSR_STAR: u32 = 0xC0000081;
-    const MSR_LSTAR: u32 = 0xC0000082;
+    const efer = msr.read(msr.EFER);
+    const star = msr.read(msr.STAR);
+    const lstar = msr.read(msr.LSTAR);
 
-    const efer = rdmsr(MSR_EFER);
-    const star = rdmsr(MSR_STAR);
-    const lstar = rdmsr(MSR_LSTAR);
-
-    // EFER.SCE (bit 0) must be set to enable syscall/sysret
-    if ((efer & 1) == 0) {
+    // EFER.SCE must be set to enable syscall/sysret
+    if (efer & msr.Efer.SCE == 0) {
         serial.print("[abi-test] FAIL SyscallMsrs: EFER.SCE not set (EFER=0x{X})\n", .{efer});
         @panic("ABI self-test failed");
     }
@@ -161,17 +158,6 @@ fn testSyscallMsrs() void {
         serial.print("[abi-test] FAIL SyscallMsrs: LSTAR=0x{X}, expected kernel range\n", .{lstar});
         @panic("ABI self-test failed");
     }
-}
-
-fn rdmsr(msr: u32) u64 {
-    var low: u32 = undefined;
-    var high: u32 = undefined;
-    asm volatile ("rdmsr"
-        : [low] "={eax}" (low),
-          [high] "={edx}" (high),
-        : [msr] "{ecx}" (msr),
-    );
-    return (@as(u64, high) << 32) | low;
 }
 
 // --- Test 6: Trampoline alignment ---

@@ -27,6 +27,7 @@
 
 const std = @import("std");
 const protect = @import("../arch/protect.zig");
+const cr = @import("../arch/cr.zig");
 const smp = @import("../smp.zig");
 const debug = @import("../../debug/debug.zig");
 const spinlock = @import("../../proc/spinlock.zig");
@@ -196,13 +197,6 @@ pub fn free(p: u16) void {
     _ = free_count.fetchAdd(1, .monotonic);
 }
 
-inline fn writeCr3(value: u64) void {
-    asm volatile ("movq %[v], %%cr3"
-        :
-        : [v] "r" (value),
-        : .{ .memory = true });
-}
-
 /// Write CR3 with PCID tagging + preserve-TLB hint.
 /// `pml4_phys` should be 4 KiB aligned; the low 12 bits are forced to
 /// `pcid` and bit 63 is set when the per-CPU generation says this PCID's
@@ -216,9 +210,9 @@ pub fn loadCr3(pml4_phys: u64, pcid: u16, _: u8) void {
     asm volatile ("pushfq; pop %[f]; cli"
         : [f] "=r" (flags),
     );
-    defer if (flags & 0x200 != 0) asm volatile ("sti");
+    defer if (flags & cr.rflags.IF != 0) asm volatile ("sti");
     const cpu_id = smp.myCpuId();
-    const aligned = pml4_phys & ~@as(u64, 0xFFF);
+    const aligned = pml4_phys & ~cr.cr3.PCID_MASK;
     const tracked = cpu_id < smp.MAX_CPUS;
     // After the CR3 write (deferred): until then the old PML4 is still in use.
     defer if (tracked) {
@@ -232,12 +226,12 @@ pub fn loadCr3(pml4_phys: u64, pcid: u16, _: u8) void {
         // CPU, and the generation they bump flushes them if it comes back.
         // CR3 first: until it has left the user tables a sender must still
         // count this CPU (they may be freeing them).
-        writeCr3(aligned);
+        cr.cr3.write(aligned);
         if (tracked) cpu_tlb[cpu_id].loaded.store(0, .seq_cst);
         return;
     }
     if (!tracked) {
-        writeCr3(aligned | @as(u64, pcid));
+        cr.cr3.write(aligned | @as(u64, pcid));
         return;
     }
     const bit = @as(u32, 1) << @as(u5, @intCast(cpu_id));
@@ -252,7 +246,7 @@ pub fn loadCr3(pml4_phys: u64, pcid: u16, _: u8) void {
     // before reading `loaded`. Either it sees us and IPIs, or we see its
     // bump and flush here.
     cpu_tlb[cpu_id].loaded.store(pcid, .seq_cst);
-    var preserve: u64 = (@as(u64, 1) << 63);
+    var preserve: u64 = cr.cr3.NOFLUSH;
     const g = global_gen[pcid].load(.seq_cst);
     if (local_gen[cpu_id][pcid] != g) {
         local_gen[cpu_id][pcid] = g;
@@ -261,7 +255,7 @@ pub fn loadCr3(pml4_phys: u64, pcid: u16, _: u8) void {
     } else {
         _ = preserve_hits.fetchAdd(1, .monotonic);
     }
-    writeCr3(aligned | @as(u64, pcid) | preserve);
+    cr.cr3.write(aligned | @as(u64, pcid) | preserve);
 
     // Eager clear of the previous user PCID, now that a different one is
     // in: INVPCID-flush its entries and drop our cpumask bit, so its
@@ -283,8 +277,8 @@ pub fn loadCr3(pml4_phys: u64, pcid: u16, _: u8) void {
 /// already encodes PCID in bits[11:0]; we re-derive bit 63 from the
 /// per-CPU generation tracker since CR3 reads don't return bit 63.
 pub fn restoreSaved(saved_cr3: u64, cpu_id: u8) void {
-    const pml4_phys = saved_cr3 & ~@as(u64, 0xFFF);
-    const pcid: u16 = @truncate(saved_cr3 & 0xFFF);
+    const pml4_phys = saved_cr3 & ~cr.cr3.PCID_MASK;
+    const pcid: u16 = @truncate(saved_cr3 & cr.cr3.PCID_MASK);
     loadCr3(pml4_phys, pcid, cpu_id);
 }
 

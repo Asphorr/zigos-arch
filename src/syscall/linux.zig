@@ -44,6 +44,7 @@ const config = @import("../config.zig");
 const errno = @import("../proc/errno.zig");
 const random = @import("../crypto/random.zig");
 const smp = @import("../cpu/smp.zig");
+const msr = @import("../cpu/arch/msr.zig");
 const linux_mm = @import("linux_mm.zig");
 const linux_time = @import("linux_time.zig");
 const linux_thread = @import("linux_thread.zig");
@@ -304,8 +305,6 @@ const ARCH_SET_GS: u64 = 0x1001;
 const ARCH_SET_FS: u64 = 0x1002;
 const ARCH_GET_FS: u64 = 0x1003;
 const ARCH_GET_GS: u64 = 0x1004;
-
-const IA32_FS_BASE: u32 = 0xC0000100;
 
 /// Linux iovec: { void *iov_base; size_t iov_len; } — 16 bytes, native order.
 const Iovec = extern struct { base: u64, len: u64 };
@@ -1217,14 +1216,7 @@ fn sysArchPrctl(code: u64, addr: u64) u64 {
             // past the user window the same way.
             if (addr >= memmap.USER_SPACE_END) return err(EPERM);
             pcb.fs_base = addr;
-            const lo: u32 = @truncate(addr);
-            const hi: u32 = @truncate(addr >> 32);
-            asm volatile ("wrmsr"
-                :
-                : [msr] "{ecx}" (IA32_FS_BASE),
-                  [lo] "{eax}" (lo),
-                  [hi] "{edx}" (hi),
-            );
+            msr.write(msr.FS_BASE, addr);
             return 0;
         },
         ARCH_GET_FS => {

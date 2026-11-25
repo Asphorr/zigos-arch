@@ -48,6 +48,7 @@ const debug = @import("../../debug/debug.zig");
 const perf = @import("../../debug/perf.zig");
 const pcid = @import("pcid.zig");
 const protect = @import("../arch/protect.zig");
+const cr = @import("../arch/cr.zig");
 const hyperv = @import("../../virt/hyperv.zig");
 const spinlock = @import("../../proc/spinlock.zig");
 
@@ -134,29 +135,6 @@ pub var n_shootdowns_cpumask_skipped: u64 = 0; // (a)
 /// (not in CR3 at the time); the generation bump covers them.
 pub var n_shootdowns_lazy_skipped: u64 = 0; // (a)
 
-inline fn flushLocalTlb() void {
-    asm volatile (
-        \\ movq %%cr3, %%rax
-        \\ movq %%rax, %%cr3
-        ::: .{ .rax = true, .memory = true });
-}
-
-/// Full local flush INCLUDING global (PGE) entries — toggles CR4.PGE off
-/// then on. A plain `mov cr3,cr3` (flushLocalTlb) PRESERVES global entries,
-/// so it cannot evict a stale kernel-master / physmap translation. Required
-/// on peers (and the sender) for a `.full` shootdown whose target is a
-/// kernel-global mapping (signalled by current_pcid == 0). Mirrors
-/// paging.flushTLBGlobal(); kept inline here to avoid a paging<->tlb import.
-inline fn flushLocalTlbIncludingGlobal() void {
-    asm volatile (
-        \\ movq %%cr4, %%rcx
-        \\ movq %%rcx, %%rax
-        \\ btrq $7, %%rax
-        \\ movq %%rax, %%cr4
-        \\ movq %%rcx, %%cr4
-        ::: .{ .rax = true, .rcx = true, .memory = true });
-}
-
 inline fn pause() void {
     asm volatile ("pause");
 }
@@ -183,14 +161,14 @@ inline fn flushLocalForMode() void {
         // (PGE); a CR3 reload preserves global entries, so toggle CR4.PGE to
         // actually evict them. pcid != 0 (user AS, INVPCID absent) keeps
         // globals — the cheaper CR3 reload is correct there.
-        .full => if (current_pcid == 0) flushLocalTlbIncludingGlobal() else flushLocalTlb(),
+        .full => if (current_pcid == 0) cr.flushTlbGlobal() else cr.flushTlb(),
         .single_context => {
             // INVPCID type 1: flush all entries for `current_pcid` on this
             // CPU, even if it's not the loaded one. Other PCIDs survive.
             if (protect.invpcid_supported and current_pcid != 0) {
                 pcid.invpcid(.single_context, current_pcid, 0);
             } else {
-                flushLocalTlb();
+                cr.flushTlb();
             }
         },
         .single_page => {
@@ -199,7 +177,7 @@ inline fn flushLocalForMode() void {
             if (protect.invpcid_supported and current_pcid != 0) {
                 pcid.invpcid(.address, current_pcid, current_va);
             } else {
-                flushLocalTlb();
+                cr.flushTlb();
             }
             // INVLPG backstop for the CURRENTLY-LOADED PCID. INVPCID type-0 has
             // been observed to under-invalidate under nested virt, leaving a
@@ -357,9 +335,7 @@ fn doShootdown(mode_in: Mode, affected_pcid: u16, va: u64, pages: u32) void {
     // VP. Force the IPI path below, which toggles CR4.PGE explicitly. (Moot on
     // KVM — hasHypercalls() is false — but correct under Hyper-V.)
     if (!PARANOID_USER_FLUSH and (mode == .full or mode == .single_context) and affected_pcid != 0 and hyperv.hasHypercalls()) {
-        const cr3 = asm volatile ("movq %%cr3, %[ret]"
-            : [ret] "=r" (-> u64),
-        );
+        const cr3 = cr.cr3.read();
         // The hypercall flushes the address space OF THE CR3 WE PASS — the
         // currently-loaded one. That is the affected AS only when this CPU is
         // actually running it (CR3's PCID field == affected_pcid). A shootdown
@@ -549,7 +525,7 @@ pub fn flushUserPage(affected_pcid: u16, va: u64, me: u8) void {
         }
     }
     if (PARANOID_USER_FLUSH) {
-        flushLocalTlb();
+        cr.flushTlb();
     } else asm volatile ("invlpg (%[v])"
         :
         : [v] "r" (va),

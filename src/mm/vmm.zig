@@ -979,12 +979,7 @@ pub fn destroyAddressSpace(pml4: [*]align(4096) u64, pml4_phys: Phys) void {
     // `pml4` itself must be in no CPU's CR3, this one's included: the
     // free-frame canary lands on its kernel-half entries, and a TLB miss
     // in the kernel then walks them (pmm.freeFrame reports such a free).
-    asm volatile (
-        \\movq %%cr3, %%rax
-        \\movq %%rax, %%cr3
-        :
-        :
-        : .{ .rax = true, .memory = true });
+    paging.flushTLB();
 
     // Free the PML4 itself
     pmm.freeFrame(pml4_phys);

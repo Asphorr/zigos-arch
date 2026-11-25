@@ -53,14 +53,6 @@ inline fn currentCpuId() u8 {
     return smp.myCpu().cpu_id;
 }
 
-inline fn readCr3() u64 {
-    var v: u64 = undefined;
-    asm volatile ("movq %%cr3, %[out]"
-        : [out] "=r" (v),
-    );
-    return v;
-}
-
 // === Event types ============================================================
 
 pub const PmmAllocEvent = struct {
@@ -1587,7 +1579,7 @@ pub fn crashAutopsy(opts: AutopsyOpts) void {
     dumpCpuSnapshot();
     dumpProcSnapshot();
     if (opts.cr2) |cr2| {
-        const cr3 = readCr3();
+        const cr3 = @import("../cpu/arch/cr.zig").cr3.read();
         walkUserPT(cr3, cr2);
         findFrame(cr2 & ~@as(u64, 0xFFF));
     }

@@ -4,6 +4,8 @@
 
 const multiboot = @import("multiboot.zig");
 const protocol = @import("boot_protocol");
+const paging = @import("../mm/paging.zig");
+const cr = @import("../cpu/arch/cr.zig");
 
 pub const MemoryRegion = protocol.MemoryRegion;
 pub const FramebufferInfo = protocol.FramebufferInfo;
@@ -30,7 +32,6 @@ pub fn fromMultiboot(info: *multiboot.MultibootInfo) BootInfo {
     if (info.flags & (1 << 6) != 0) {
         var offset: u32 = 0;
         while (offset < info.mmap_length and count < regions.len) {
-            const paging = @import("../mm/paging.zig");
             const entry: *const multiboot.MultibootMmapEntry = @ptrFromInt(paging.physToVirt(@as(u64, info.mmap_addr) + offset));
             regions[count] = .{
                 .base = @as(u64, entry.addr_high) << 32 | entry.addr_low,
@@ -48,10 +49,8 @@ pub fn fromMultiboot(info: *multiboot.MultibootInfo) BootInfo {
         }
     }
 
-    // Get current PML4 from CR3
-    const cr3 = asm volatile ("movq %%cr3, %[ret]"
-        : [ret] "=r" (-> u64),
-    );
+    // boot.asm's tables: the address in CR3, without its low flag bits.
+    const pml4_phys = cr.cr3.read() & paging.PAGE_MASK;
 
     // Multiboot1 cmdline: bit 2 of flags set => info.cmdline is the
     // physical address of a NUL-terminated string. We honour
@@ -60,7 +59,6 @@ pub fn fromMultiboot(info: *multiboot.MultibootInfo) BootInfo {
     // default 0 (normal desktop).
     var parsed_mode: u32 = 0;
     if ((info.flags & (1 << 2)) != 0 and info.cmdline != 0) {
-        const paging = @import("../mm/paging.zig");
         const cmdline_va: [*]const u8 = @ptrFromInt(paging.physToVirt(@as(u64, info.cmdline)));
         parsed_mode = parseBootModeArg(cmdline_va);
     }
@@ -70,7 +68,7 @@ pub fn fromMultiboot(info: *multiboot.MultibootInfo) BootInfo {
         .memory_map_count = count,
         .has_framebuffer = 0,
         .framebuffer = .{ .base = 0, .width = 0, .height = 0, .stride = 0, .format = .unknown },
-        .pml4_phys = cr3 & 0xFFFFFFFFF000,
+        .pml4_phys = pml4_phys,
         .rsdp_addr = 0,
         .boot_mode = parsed_mode,
     };

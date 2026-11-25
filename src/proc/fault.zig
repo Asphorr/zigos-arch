@@ -11,6 +11,7 @@
 const std = @import("std");
 
 const debug = @import("../debug/debug.zig");
+const cr = @import("../cpu/arch/cr.zig");
 const vmm = @import("../mm/vmm.zig");
 const pmm = @import("../mm/pmm.zig");
 const swap = @import("../mm/swap.zig");
@@ -682,25 +683,20 @@ fn interruptsEnabled() bool {
 /// its park, or the wake meant for the park can be spent here.
 pub fn handleKernelUserFault(cr2: usize, error_code: u64, saved_rflags: u64, saved_rip: u64) bool {
     const paging = @import("../mm/paging.zig");
-    const RFLAGS_IF: u64 = 1 << 9;
-    const RFLAGS_AC: u64 = 1 << 18;
     // A supervisor data access to a page that is absent (read or write) or
     // write-protected: no reserved bit, fetch, PK or SS.
     const ec = error_code & 0xFFFF;
     const absent = ec & ~@as(u64, 0x2) == 0;
     if (!absent and ec != 0x3) return false;
-    if (saved_rflags & RFLAGS_IF == 0) return false;
-    if (@import("../cpu/arch/protect.zig").smap_enabled and saved_rflags & RFLAGS_AC == 0) return false;
+    if (saved_rflags & cr.rflags.IF == 0) return false;
+    if (@import("../cpu/arch/protect.zig").smap_enabled and saved_rflags & cr.rflags.AC == 0) return false;
     if (!@import("../mm/memmap.zig").userDataRangeOk(cr2, 1)) return false;
     if (@import("spinlock.zig").preemptionPinned()) return false;
     const cur = smp.currentPid() orelse return false;
     const pcb = &process.procs[cur];
     const pd = pcb.page_directory orelse return false;
     const pd_phys = paging.virtToPhys(@intFromPtr(pd)) orelse return false;
-    const cr3 = asm volatile ("mov %%cr3, %[r]"
-        : [r] "=r" (-> u64),
-    );
-    if (cr3 & paging.PAGE_MASK != pd_phys) return false;
+    if (cr.cr3.read() & paging.PAGE_MASK != pd_phys) return false;
     const lead = leader(pcb);
     if (lead.as_lock.heldByCurrent(null)) return false;
     const lock_free = @atomicLoad(u16, &pcb.sleep_locks, .monotonic) == 0 and
@@ -778,10 +774,8 @@ pub fn handleKernelUserFault(cr2: usize, error_code: u64, saved_rflags: u64, sav
     if (!lock_free) {
         // Other faults may have run on this CPU, or the task moved: the
         // caller's report reads the address from CR2.
-        asm volatile ("cli; mov %[a], %%cr2"
-            :
-            : [a] "r" (cr2),
-        );
+        asm volatile ("cli");
+        cr.cr2.write(cr2);
         return false;
     }
     debug.klog("[pf] pid={d} '{s}' kernel {s} of user 0x{X} at rip=0x{X} can't be resolved ({s}) — killing the process\n", .{

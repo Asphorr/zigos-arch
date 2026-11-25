@@ -219,12 +219,8 @@ pub fn sysSetTls(fs_base: u32) u32 {
     // We accept a 32-bit value because syscall args are u32; user TLS
     // VAs are below 4 GiB in our user-space layout, so this is fine.
     pcb.fs_base = @intCast(fs_base);
-    const IA32_FS_BASE: u32 = 0xC0000100;
-    asm volatile ("wrmsr"
-        :
-        : [msr] "{ecx}" (IA32_FS_BASE),
-          [lo] "{eax}" (fs_base),
-          [hi] "{edx}" (@as(u32, 0)));
+    const msr = @import("../cpu/arch/msr.zig");
+    msr.write(msr.FS_BASE, fs_base);
     return 0;
 }
 

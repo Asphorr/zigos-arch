@@ -16,6 +16,7 @@
 
 const std = @import("std");
 const debug = @import("../debug/debug.zig");
+const msr = @import("../cpu/arch/msr.zig");
 
 // KVM_CPUID_FEATURES (base+1) EAX bits we care about.
 const KVM_FEATURE_CLOCKSOURCE: u32 = 1 << 0; // MSR_KVM_SYSTEM_TIME (legacy)
@@ -224,15 +225,6 @@ var pv_page_pa: u64 = 0;
 /// CPUs that haven't armed yet just see a permanently-zero flag byte.
 var pv_eoi_armed: bool = false;
 
-inline fn wrmsr(msr: u32, value: u64) void {
-    asm volatile ("wrmsr"
-        :
-        : [_] "{ecx}" (msr),
-          [_] "{eax}" (@as(u32, @truncate(value))),
-          [_] "{edx}" (@as(u32, @truncate(value >> 32))),
-    );
-}
-
 /// BSP-once: allocate the shared PV frame and arm the calling CPU.
 /// Quiet no-op when KVM (or both features) is absent.
 pub fn initPerCpuPv() void {
@@ -255,9 +247,9 @@ pub fn initPerCpuPv() void {
 pub fn enablePerCpuPv(cpu_id: u32) void {
     if (pv_page_pa == 0 or cpu_id >= PV_MAX_CPUS) return;
     const stride_pa = pv_page_pa + cpu_id * PV_STRIDE;
-    if (hasStealTime()) wrmsr(MSR_KVM_STEAL_TIME, stride_pa | 1);
+    if (hasStealTime()) msr.write(MSR_KVM_STEAL_TIME, stride_pa | 1);
     if (hasPvEoi()) {
-        wrmsr(MSR_KVM_PV_EOI_EN, (stride_pa + PV_EOI_OFF) | 1);
+        msr.write(MSR_KVM_PV_EOI_EN, (stride_pa + PV_EOI_OFF) | 1);
         @atomicStore(bool, &pv_eoi_armed, true, .release);
     }
     // kvmclock: KVM fills the record before it re-enters the guest after
@@ -268,7 +260,7 @@ pub fn enablePerCpuPv(cpu_id: u32) void {
     // smi.tick then stays on PM_TMR instead of reading a dead clock.
     var clock_ok = false;
     if (hasClocksource2()) {
-        wrmsr(MSR_KVM_SYSTEM_TIME_NEW, (stride_pa + PV_CLOCK_OFF) | 1);
+        msr.write(MSR_KVM_SYSTEM_TIME_NEW, (stride_pa + PV_CLOCK_OFF) | 1);
         clock_ok = clockNs(cpu_id) != null;
         if (cpu_id == 0) @atomicStore(bool, &pvclock_bsp_ready, clock_ok, .release);
     }

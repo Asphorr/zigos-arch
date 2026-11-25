@@ -17,8 +17,9 @@
 //!      The walk follows the statically resolvable call graph (same-file
 //!      calls, `alias.fn()` through `@import` aliases, facade chains
 //!      (`@import("driver.zig").nvme.f()`), `const x = mod.fn` re-exports in
-//!      either file, `Type.method()` through type aliases, method
-//!      calls by name within a file). A path root → … → sleeper is an
+//!      either file, `Type.method()` through type aliases, `Namespace.f()`
+//!      and `mod.Namespace.f()` into a container declared under that name,
+//!      method calls by name within a file). A path root → … → sleeper is an
 //!      ERROR, printed in full. `// ctx: irq-ok <reason>` on a function
 //!      cuts the walk there — the documented "this branches on context"
 //!      exemption; the reason is mandatory prose for the reviewer.
@@ -116,6 +117,16 @@ const FileInfo = struct {
     fns: std.ArrayList(u32) = .empty,
     /// Indices into `containers` declared in this file.
     containers: std.ArrayList(u32) = .empty,
+    /// `const Name = struct { ... }` (union, enum): the containers that have
+    /// a name a call can go through.
+    namespaces: std.ArrayList(Namespace) = .empty,
+};
+
+const Namespace = struct {
+    name: []const u8,
+    name_tok: TokenIndex,
+    /// `ContainerInfo.first` of the container it names.
+    first: TokenIndex,
 };
 
 /// What every container field of a given name is declared as, tree-wide.
@@ -370,6 +381,10 @@ const Lint = struct {
             try f.vars.put(name, type_text);
         }
         const init = vd.ast.init_node.unwrap() orelse return;
+        if (isContainerTag(tree.nodeTag(init))) {
+            try f.namespaces.append(self.alloc, .{ .name = name, .name_tok = name_tok, .first = tree.firstToken(init) });
+            return;
+        }
         switch (tree.nodeTag(init)) {
             .builtin_call_two, .builtin_call_two_comma => {
                 if (self.importTarget(fi, init)) |target| try f.imports.put(name, target);
@@ -529,6 +544,9 @@ const Lint = struct {
                         return;
                     }
                 }
+                // `Namespace.f`, `mod.Namespace.f`: a fn of the container
+                // declared under that name, and of no other.
+                if (try self.resolveInNamespace(fi, lhs, name, out)) return;
                 // Method call on a value. Mutex receivers park the caller:
                 // route `.acquire()` on a Mutex-typed receiver to the
                 // mightSleep-bearing acquire in spinlock.zig.
@@ -547,6 +565,46 @@ const Lint = struct {
             },
             else => {},
         }
+    }
+
+    /// `lhs` names a container at the top of this file (`Ns`) or of a module
+    /// (`mod.Ns`): the fns called `name` in it. False when it names none or
+    /// the container has no such fn.
+    fn resolveInNamespace(self: *Lint, fi: u32, lhs: NodeIndex, name: []const u8, out: *std.ArrayList(u32)) !bool {
+        const tree = self.files.items[fi].tree;
+        var file = fi;
+        var ns_tok: TokenIndex = undefined;
+        switch (tree.nodeTag(lhs)) {
+            .identifier => ns_tok = tree.nodeMainToken(lhs),
+            .field_access => {
+                const pair = tree.nodeData(lhs).node_and_token;
+                file = self.exprFile(fi, pair[0], 0) orelse return false;
+                ns_tok = pair[1];
+            },
+            else => return false,
+        }
+        const container = self.namedContainer(file, tree.tokenSlice(ns_tok));
+        if (container == NONE) return false;
+        const before = out.items.len;
+        for (self.files.items[file].fns.items) |fx| {
+            const c = &self.fns.items[fx];
+            if (c.container == container and std.mem.eql(u8, c.name, name)) try out.append(self.alloc, fx);
+        }
+        return out.items.len != before;
+    }
+
+    /// The container a file-scope `const name = struct { ... }` of `file`
+    /// declares, or NONE.
+    fn namedContainer(self: *Lint, file: u32, name: []const u8) u32 {
+        const f = &self.files.items[file];
+        for (f.namespaces.items) |ns| {
+            if (!std.mem.eql(u8, ns.name, name)) continue;
+            if (self.innermostFnByToken(file, ns.name_tok) != NONE or self.innermostContainer(file, ns.name_tok) != NONE) continue;
+            for (f.containers.items) |ci| {
+                if (self.containers.items[ci].first == ns.first) return ci;
+            }
+        }
+        return NONE;
     }
 
     /// All fns named `name` in `file`; if `prefer_container` is set and it
@@ -880,6 +938,25 @@ fn blockEnd(tree: *const Ast, tok: TokenIndex) TokenIndex {
         }
     }
     return best_last;
+}
+
+fn isContainerTag(tag: Ast.Node.Tag) bool {
+    return switch (tag) {
+        .container_decl,
+        .container_decl_trailing,
+        .container_decl_two,
+        .container_decl_two_trailing,
+        .container_decl_arg,
+        .container_decl_arg_trailing,
+        .tagged_union,
+        .tagged_union_trailing,
+        .tagged_union_two,
+        .tagged_union_two_trailing,
+        .tagged_union_enum_tag,
+        .tagged_union_enum_tag_trailing,
+        => true,
+        else => false,
+    };
 }
 
 fn isCallTag(tag: Ast.Node.Tag) bool {

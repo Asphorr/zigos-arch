@@ -10,6 +10,7 @@ const cli = @import("cli.zig");
 const multiboot = @import("boot/multiboot.zig");
 const boot_info_mod = @import("boot/boot_info.zig");
 const boot_protocol = @import("boot_protocol");
+const cr = @import("cpu/arch/cr.zig");
 const serial = @import("debug/serial.zig");
 const debug = @import("debug/debug.zig");
 const kasan = @import("debug/kasan.zig");
@@ -29,23 +30,8 @@ fn enableSSE() void {
     // In 64-bit long mode, SSE/SSE2 is always enabled by the CPU.
     // boot.asm already sets CR0/CR4 appropriately.
     // Verify the settings are correct.
-    var cr0 = asm volatile ("mov %%cr0, %[ret]"
-        : [ret] "=r" (-> u64),
-    );
-    cr0 &= ~@as(u64, 1 << 2); // clear EM
-    cr0 |= 1 << 1; // set MP
-    asm volatile ("mov %[val], %%cr0"
-        :
-        : [val] "r" (cr0),
-    );
-    var cr4 = asm volatile ("mov %%cr4, %[ret]"
-        : [ret] "=r" (-> u64),
-    );
-    cr4 |= (1 << 9) | (1 << 10); // OSFXSR + OSXMMEXCPT
-    asm volatile ("mov %[val], %%cr4"
-        :
-        : [val] "r" (cr4),
-    );
+    cr.cr0.write((cr.cr0.read() & ~cr.cr0.EM) | cr.cr0.MP);
+    cr.cr4.set(cr.cr4.OSFXSR | cr.cr4.OSXMMEXCPT);
 }
 
 fn testSSE2() void {
@@ -62,16 +48,12 @@ fn testSSE2() void {
         return;
     }
     // Check CR0/CR4 state
-    const cr0_val = asm volatile ("mov %%cr0, %[ret]"
-        : [ret] "=r" (-> u64),
-    );
-    const cr4_val = asm volatile ("mov %%cr4, %[ret]"
-        : [ret] "=r" (-> u64),
-    );
+    const cr0_val = cr.cr0.read();
+    const cr4_val = cr.cr4.read();
     serial.print("[sse2] CR0={X:0>16} CR4={X:0>16}\n", .{ cr0_val, cr4_val });
     serial.print("[sse2] CR0.EM={d} CR0.MP={d} CR4.OSFXSR={d} CR4.OSXMMEXCPT={d}\n", .{
-        (cr0_val >> 2) & 1, (cr0_val >> 1) & 1,
-        (cr4_val >> 9) & 1, (cr4_val >> 10) & 1,
+        @intFromBool(cr0_val & cr.cr0.EM != 0),     @intFromBool(cr0_val & cr.cr0.MP != 0),
+        @intFromBool(cr4_val & cr.cr4.OSFXSR != 0), @intFromBool(cr4_val & cr.cr4.OSXMMEXCPT != 0),
     });
     // Try a simple SSE2 instruction
     asm volatile (
@@ -888,10 +870,7 @@ pub fn panic(msg: []const u8, _: ?*std.builtin.StackTrace, ret_addr: ?usize) nor
     const sym = @import("debug/symbols.zig");
 
     // Control registers
-    const cr3 = asm volatile ("movq %%cr3, %[ret]"
-        : [ret] "=r" (-> u64),
-    );
-    serial.print("  CR3=0x{X:0>16}\n", .{cr3});
+    serial.print("  CR3=0x{X:0>16}\n", .{cr.cr3.read()});
 
     // Full backtrace with symbol resolution. Stop on any sign of stack
     // corruption: misaligned rbp, out-of-range, non-monotonic. Without

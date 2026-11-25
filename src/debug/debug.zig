@@ -1,6 +1,7 @@
 const std = @import("std");
 const vga = @import("../driver.zig").vga;
 const serial = @import("serial.zig");
+const cr = @import("../cpu/arch/cr.zig");
 
 /// CPU state pushed by unified ISR stub. Matches stack layout exactly.
 /// In x86_64 long mode, the CPU always pushes SS:RSP (even for same-privilege).
@@ -73,10 +74,7 @@ pub fn dumpState(state: *const CpuState) void {
     klog("  CS={X:0>4} SS={X:0>4}\n", .{ state.cs, state.ss });
 
     if (state.int_no == 14) {
-        const cr2 = asm volatile ("mov %%cr2, %[ret]"
-            : [ret] "=r" (-> u64),
-        );
-        klog("  CR2={X:0>16} (faulting address)\n", .{cr2});
+        klog("  CR2={X:0>16} (faulting address)\n", .{cr.cr2.read()});
     }
 }
 
@@ -165,9 +163,6 @@ pub fn dumpStateSerial(state: *const CpuState) void {
     serial.print("  RIP={X:0>16} RFLAGS={X:0>16} ERR={X:0>16}\n", .{ state.rip, state.rflags, state.error_code });
     serial.print("  CS={X:0>4} SS={X:0>4}\n", .{ state.cs, state.ss });
     if (state.int_no == 14) {
-        const cr2 = asm volatile ("mov %%cr2, %[ret]"
-            : [ret] "=r" (-> u64),
-        );
-        serial.print("  CR2={X:0>16}\n", .{cr2});
+        serial.print("  CR2={X:0>16}\n", .{cr.cr2.read()});
     }
 }

@@ -527,6 +527,33 @@ constants died with the conversion. **How to apply:** new drivers
 describe their register file this way; existing drivers (ahci, e1000,
 i225, xhci, hda) convert when touched.
 
+## `msr` / `cr` — model-specific and control registers by name
+
+`rdmsr`, `wrmsr` and the moves to and from CR0–CR4 are written once, in
+`cpu/arch/msr.zig` and `cpu/arch/cr.zig`. Everything else calls them and
+names what it touches:
+
+```zig
+msr.write(msr.EFER, msr.read(msr.EFER) | msr.Efer.NXE);
+cr.cr4.set(cr.cr4.SMEP | cr.cr4.UMIP);
+if (msr.readSafe(MSR_RAPL_POWER_UNIT)) |unit| ... // may be absent: probe it
+```
+
+`msr.read`/`write` are the bare instructions. `readSafe`/`writeSafe`
+take the #GP of a register the CPU does not have and report it;
+`present` is the probe. `cr.crN.set`/`clear` write only when a bit
+changes — a CR0 or CR4 write serializes and, under a hypervisor, exits.
+
+**Where a register is named:** the CPU's own architectural state (EFER,
+STAR/LSTAR/SFMASK, the FS/GS bases, TSC_AUX, APIC_BASE, PAT, DEBUGCTL)
+in `msr.zig`, its bits in a namespace beside it (`msr.Efer.NXE`). A
+family that belongs to one feature — machine-check banks, PMU counters,
+VMX capabilities, a hypervisor's own — is named by the module that
+programs it. CR and RFLAGS bits are all in `cr.zig`.
+
+**Rules:** no `rdmsr`/`wrmsr`/`mov %crN` in Zig outside those two files;
+no bare MSR number or `1 << n` where the register is used.
+
 ## `slot_table.claim` — the fixed-pool claim protocol, once
 
 Every `in_use`-flagged fixed array (26 subsystems) needs the same
@@ -645,5 +672,6 @@ silent self-recovery into observable metric.
 | `fail()`/`errtrace` | `src/fs/gpt.zig` `readHeader` / `parse`         |
 | `Phys`/`Virt`/`Dma` | `src/driver/nic/e1000.zig` `allocRxRing`        |
 | mmio window         | `src/driver/block/nvme.zig` `Regs` / `regs()`   |
+| `msr` / `cr`        | `src/syscall/entry.zig` `init`; `src/cpu/arch/protect.zig` `applyEarlyCr4`; probing in `src/cpu/arch/thermal.zig` |
 | `slot_table.claim`  | `src/proc/pipe.zig` `alloc`                     |
 | `smp.myCpuId()`     | `src/proc/spinlock.zig` `currentCpuId`; arming in `src/cpu/smp.zig` `armTscAux` |

@@ -23,12 +23,12 @@ const std = @import("std");
 const debug = @import("../../debug/debug.zig");
 const serial = @import("../../debug/serial.zig");
 const apic = @import("../../irq/apic.zig");
+const msr = @import("msr.zig");
 
 const MSR_IA32_PMC0: u32 = 0xC1;
 const MSR_IA32_PERFEVTSEL0: u32 = 0x186;
 const MSR_IA32_PERF_GLOBAL_CTRL: u32 = 0x38F;
 const MSR_IA32_PERF_GLOBAL_OVF_CTRL: u32 = 0x390;
-const MSR_IA32_DEBUGCTL: u32 = 0x1D9;
 
 // PERFEVTSEL fields.
 const SEL_USR: u64 = 1 << 16;
@@ -48,26 +48,6 @@ pub var supported: bool = false;
 pub var sampling_active: bool = false;
 pub var sample_period: u64 = 1_000_000; // 1M instructions/sample
 pub var samples_taken: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
-
-inline fn rdmsr(msr: u32) u64 {
-    var lo: u32 = undefined;
-    var hi: u32 = undefined;
-    asm volatile ("rdmsr"
-        : [_] "={eax}" (lo),
-          [_] "={edx}" (hi),
-        : [_] "{ecx}" (msr),
-    );
-    return (@as(u64, hi) << 32) | lo;
-}
-
-inline fn wrmsr(msr: u32, value: u64) void {
-    asm volatile ("wrmsr"
-        :
-        : [_] "{ecx}" (msr),
-          [_] "{eax}" (@as(u32, @truncate(value))),
-          [_] "{edx}" (@as(u32, @truncate(value >> 32))),
-    );
-}
 
 const CpuidRegs = struct { eax: u32, ebx: u32, ecx: u32, edx: u32 };
 
@@ -113,8 +93,8 @@ pub fn detect() void {
 /// is explicitly started via `start()`.
 pub fn perCpuInit() void {
     if (!supported) return;
-    wrmsr(MSR_IA32_PERFEVTSEL0, 0);
-    wrmsr(MSR_IA32_PMC0, 0);
+    msr.write(MSR_IA32_PERFEVTSEL0, 0);
+    msr.write(MSR_IA32_PMC0, 0);
     // Mask the LAPIC LVT.PMI entry initially; `start` unmasks.
     apic.maskLvtPmi();
 }
@@ -130,18 +110,18 @@ pub fn start(period_instructions: u64) void {
     // PMC0 counts up from `init`; an overflow fires PMI when bit
     // [counter_width-1] transitions past the sign. Preset = -period.
     const init_val: u64 = (~@as(u64, 0)) - period_instructions + 1;
-    wrmsr(MSR_IA32_PMC0, init_val);
+    msr.write(MSR_IA32_PMC0, init_val);
     // Route PMI to our vector before enabling counter.
     apic.programLvtPmi(PMI_VECTOR);
-    wrmsr(MSR_IA32_PERFEVTSEL0, EVT_INST_RETIRED | SEL_OS | SEL_USR | SEL_INT | SEL_EN);
-    if (version >= 2) wrmsr(MSR_IA32_PERF_GLOBAL_CTRL, 1);
+    msr.write(MSR_IA32_PERFEVTSEL0, EVT_INST_RETIRED | SEL_OS | SEL_USR | SEL_INT | SEL_EN);
+    if (version >= 2) msr.write(MSR_IA32_PERF_GLOBAL_CTRL, 1);
 }
 
 pub fn stop() void {
     if (!supported) return;
     sampling_active = false;
-    wrmsr(MSR_IA32_PERFEVTSEL0, 0);
-    if (version >= 2) wrmsr(MSR_IA32_PERF_GLOBAL_CTRL, 0);
+    msr.write(MSR_IA32_PERFEVTSEL0, 0);
+    if (version >= 2) msr.write(MSR_IA32_PERF_GLOBAL_CTRL, 0);
     apic.maskLvtPmi();
 }
 
@@ -167,7 +147,7 @@ pub fn onSample(rip: u64) void {
     // Re-arm: preset PMC0 to overflow again after `sample_period` events,
     // clear OVF status, EOI the LAPIC.
     const init_val: u64 = (~@as(u64, 0)) - sample_period + 1;
-    wrmsr(MSR_IA32_PMC0, init_val);
-    if (version >= 2) wrmsr(MSR_IA32_PERF_GLOBAL_OVF_CTRL, 1);
+    msr.write(MSR_IA32_PMC0, init_val);
+    if (version >= 2) msr.write(MSR_IA32_PERF_GLOBAL_OVF_CTRL, 1);
     apic.eoi();
 }

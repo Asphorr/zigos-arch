@@ -24,6 +24,8 @@
 
 const std = @import("std");
 const serial = @import("../../debug/serial.zig");
+const msr = @import("msr.zig");
+const cr = @import("cr.zig");
 
 pub var smep_enabled: bool = false;
 pub var smap_enabled: bool = false;
@@ -47,26 +49,6 @@ pub inline fn cpuidLeaf(leaf: u32, subleaf: u32) CpuidRegs {
           [_] "{ecx}" (subleaf),
     );
     return .{ .eax = eax, .ebx = ebx, .ecx = ecx, .edx = edx };
-}
-
-inline fn rdmsr(msr: u32) u64 {
-    var lo: u32 = undefined;
-    var hi: u32 = undefined;
-    asm volatile ("rdmsr"
-        : [_] "={eax}" (lo),
-          [_] "={edx}" (hi),
-        : [_] "{ecx}" (msr),
-    );
-    return (@as(u64, hi) << 32) | lo;
-}
-
-inline fn wrmsr(msr: u32, value: u64) void {
-    asm volatile ("wrmsr"
-        :
-        : [_] "{ecx}" (msr),
-          [_] "{eax}" (@as(u32, @truncate(value))),
-          [_] "{edx}" (@as(u32, @truncate(value >> 32))),
-    );
 }
 
 /// Probe CPUID.07H for SMEP/SMAP/UMIP support. Call once on the BSP before
@@ -106,33 +88,25 @@ pub fn detectFeatures() void {
 /// runs after `paging.dropLowIdentity`.
 pub fn applyEarlyCr4() void {
     if (!smep_enabled and !umip_enabled and !pcid_supported) return;
-    var cr4 = asm volatile ("mov %%cr4, %[ret]"
-        : [ret] "=r" (-> u64),
-    );
-    const before = cr4;
-    if (smep_enabled) cr4 |= (1 << 20);
-    if (umip_enabled) cr4 |= (1 << 11);
-    // CR4.PCIDE (bit 17). Phase-1: just enable the feature; current CR3
+    var bits: u64 = 0;
+    if (smep_enabled) bits |= cr.cr4.SMEP;
+    if (umip_enabled) bits |= cr.cr4.UMIP;
+    // CR4.PCIDE. Phase-1: just enable the feature; current CR3
     // writes leave bits[11:0]=0 so every TLB entry is tagged PCID=0,
     // which is functionally identical to PCIDE=off. Phase 2+ will
     // allocate per-process PCIDs and embed them in CR3 + use
     // INVPCID-by-PCID in the shootdown handler. Order: must enable
     // BEFORE any CR3 write with PCID!=0 (current code uses PCID=0
     // always, so this is safe to flip at boot).
-    if (pcid_supported) cr4 |= (1 << 17);
-    // CR4.PGE (bit 7) — Page Global Enable. Honors PTE.G=1 on leaf
+    if (pcid_supported) bits |= cr.cr4.PCIDE;
+    // CR4.PGE — Page Global Enable. Honors PTE.G=1 on leaf
     // entries; those entries survive CR3 reloads. Kernel mappings
     // (PML4[256] physmap + PML4[511] image) get G=1 at boot so kernel
     // TLB working set persists across user-process context switches.
     // Prerequisite for PCID giving any perf win — without PGE, the
     // kernel runs cold-TLB on every CR3 reload regardless of PCID.
-    cr4 |= (1 << 7);
-    if (cr4 != before) {
-        asm volatile ("mov %[val], %%cr4"
-            :
-            : [val] "r" (cr4),
-        );
-    }
+    bits |= cr.cr4.PGE;
+    cr.cr4.set(bits);
 }
 
 /// Per-CPU: flip CR4.SMAP and OR RFLAGS.AC into IA32_FMASK so SYSCALL
@@ -141,20 +115,10 @@ pub fn applyEarlyCr4() void {
 /// AP: any time after entry, since the AP stack is already physmap-VA).
 pub fn enableSmapPerCpu() void {
     if (!smap_enabled) return;
-    var cr4 = asm volatile ("mov %%cr4, %[ret]"
-        : [ret] "=r" (-> u64),
-    );
-    if (cr4 & (1 << 21) == 0) {
-        cr4 |= (1 << 21);
-        asm volatile ("mov %[val], %%cr4"
-            :
-            : [val] "r" (cr4),
-        );
-    }
-    const MSR_SFMASK: u32 = 0xC0000084;
-    const cur = rdmsr(MSR_SFMASK);
-    const want = cur | (1 << 18); // AC
-    if (cur != want) wrmsr(MSR_SFMASK, want);
+    cr.cr4.set(cr.cr4.SMAP);
+    const cur = msr.read(msr.SFMASK);
+    const want = cur | cr.rflags.AC;
+    if (cur != want) msr.write(msr.SFMASK, want);
 }
 
 /// Save CR4 and temporarily clear SMEP **and** SMAP. Used to bracket
@@ -169,28 +133,23 @@ pub fn enableSmapPerCpu() void {
 /// from "no-op". Caller treats the returned value as opaque.
 pub fn beginNonSmepCall() u64 {
     if (!smep_enabled and !smap_enabled) return 0;
-    const cr4 = asm volatile ("mov %%cr4, %[ret]"
-        : [ret] "=r" (-> u64),
-    );
+    const cr4 = cr.cr4.read();
     var cleared = cr4;
-    if (smep_enabled) cleared &= ~(@as(u64, 1) << 20);
-    if (smap_enabled) cleared &= ~(@as(u64, 1) << 21);
-    asm volatile ("mov %[val], %%cr4"
-        :
-        : [val] "r" (cleared),
-    );
-    return cr4 | (@as(u64, 1) << 63);
+    if (smep_enabled) cleared &= ~cr.cr4.SMEP;
+    if (smap_enabled) cleared &= ~cr.cr4.SMAP;
+    cr.cr4.write(cleared);
+    return cr4 | SAVED_CR4_VALID;
 }
 
 /// Restore CR4 after `beginNonSmepCall`. No-op if neither was on.
 pub fn endNonSmepCall(saved: u64) void {
     if (saved == 0) return;
-    const real = saved & ~(@as(u64, 1) << 63);
-    asm volatile ("mov %[val], %%cr4"
-        :
-        : [val] "r" (real),
-    );
+    cr.cr4.write(saved & ~SAVED_CR4_VALID);
 }
+
+/// CR4 has no bit 63: set in what beginNonSmepCall returns, it tells a
+/// saved CR4 from "nothing to restore".
+const SAVED_CR4_VALID: u64 = 1 << 63;
 
 /// Allow kernel access to user pages. Pair with `disallowUserAccess()`.
 /// Idempotent — re-stac on already-AC=1 is a no-op.
@@ -210,5 +169,5 @@ pub inline fn readAC() bool {
     const rflags = asm volatile ("pushfq\npopq %[r]"
         : [r] "=r" (-> u64),
     );
-    return (rflags & (1 << 18)) != 0;
+    return rflags & cr.rflags.AC != 0;
 }

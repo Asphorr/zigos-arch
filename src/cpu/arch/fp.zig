@@ -24,6 +24,7 @@
 const std = @import("std");
 const serial = @import("../../debug/serial.zig");
 const protect = @import("protect.zig");
+const cr = @import("cr.zig");
 const MAX_PROCS = @import("../../config.zig").MAX_PROCS;
 
 /// Canonical "init" FXSAVE state, captured at boot from a clean FPU. Loaded
@@ -126,14 +127,7 @@ pub fn enableExtended() void {
         serial.print("[fp] AVX state for user tasks: {s}\n", .{if (avx) "on (XSAVE, XCR0=x87|SSE|AVX)" else "off"});
     }
     if (!avx) return;
-    var cr4 = asm volatile ("mov %%cr4, %[ret]"
-        : [ret] "=r" (-> u64),
-    );
-    cr4 |= 1 << 18; // OSXSAVE
-    asm volatile ("mov %[val], %%cr4"
-        :
-        : [val] "r" (cr4),
-    );
+    cr.cr4.set(cr.cr4.OSXSAVE);
     // xsetbv, as bytes: the kernel's target has no XSAVE feature to
     // assemble it with.
     asm volatile (".byte 0x0f, 0x01, 0xd1"

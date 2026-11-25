@@ -5,6 +5,7 @@ const io = @import("../io.zig");
 const paging = @import("../mm/paging.zig");
 const acpi = @import("../acpi/acpi.zig");
 const debug = @import("../debug/debug.zig");
+const msr = @import("../cpu/arch/msr.zig");
 const pit = @import("../time/pit.zig");
 const pic = @import("pic.zig");
 
@@ -59,9 +60,11 @@ const IOAPIC_LO_POLARITY_LOW: u32 = 1 << 13;
 const IOAPIC_LO_TRIGGER_LEVEL: u32 = 1 << 15;
 const IOAPIC_LO_MASKED: u32 = 1 << 16;
 
-// APIC Base MSR
-const IA32_APIC_BASE_MSR: u32 = 0x1B;
-const IA32_TSC_DEADLINE_MSR: u32 = 0x6E0;
+/// An absolute TSC value at which the LAPIC timer fires; 0 disarms.
+const MSR_TSC_DEADLINE: u32 = 0x6E0;
+/// The x2APIC register block: the MMIO register at offset `reg` is MSR
+/// `MSR_X2APIC_BASE + reg / 16`.
+const MSR_X2APIC_BASE: u32 = 0x800;
 
 // LVT Timer mode bits (17:18). One-shot=00, Periodic=01, TSC-Deadline=10.
 const LVT_TIMER_MODE_TSC_DEADLINE: u32 = 2 << 17;
@@ -86,24 +89,15 @@ var tsc_per_quantum: u64 = 0;
 pub var x2apic_active: bool = false;
 
 inline fn lapicMsr(reg: u32) u32 {
-    return 0x800 + reg / 16;
+    return MSR_X2APIC_BASE + reg / 16;
 }
 
 inline fn x2apicRead(reg: u32) u32 {
-    var lo: u32 = undefined;
-    asm volatile ("rdmsr"
-        : [lo] "={eax}" (lo)
-        : [msr] "{ecx}" (lapicMsr(reg))
-        : .{ .edx = true });
-    return lo;
+    return @truncate(msr.read(lapicMsr(reg)));
 }
 
 inline fn x2apicWrite(reg: u32, val: u32) void {
-    asm volatile ("wrmsr"
-        :
-        : [msr] "{ecx}" (lapicMsr(reg)),
-          [lo] "{eax}" (val),
-          [hi] "{edx}" (@as(u32, 0)));
+    msr.write(lapicMsr(reg), val);
 }
 
 pub inline fn readTsc() u64 {
@@ -161,15 +155,6 @@ inline fn rdtsc() u64 {
           [hi] "={edx}" (hi),
     );
     return (@as(u64, hi) << 32) | lo;
-}
-
-inline fn wrmsr(msr: u32, val: u64) void {
-    asm volatile ("wrmsr"
-        :
-        : [msr] "{ecx}" (msr),
-          [lo] "{eax}" (@as(u32, @truncate(val))),
-          [hi] "{edx}" (@as(u32, @truncate(val >> 32))),
-    );
 }
 
 fn detectTscDeadline() bool {
@@ -490,25 +475,13 @@ fn initLAPIC() void {
     // one write; the reverse needs a CPU reset, which is also why we
     // preserve bit 10 if firmware already set it. After the write we
     // re-read to see what stuck and pick the access mode from that.
-    var lo: u32 = undefined;
-    var hi: u32 = undefined;
-    asm volatile ("rdmsr"
-        : [lo] "={eax}" (lo), [hi] "={edx}" (hi)
-        : [msr] "{ecx}" (IA32_APIC_BASE_MSR));
-    lo |= (1 << 11); // Global enable
-    if (detectX2Apic()) lo |= (1 << 10); // x2APIC enable (opt-in)
-    asm volatile ("wrmsr"
-        :
-        : [msr] "{ecx}" (IA32_APIC_BASE_MSR),
-          [lo] "{eax}" (lo),
-          [hi] "{edx}" (hi));
+    var base = msr.read(msr.APIC_BASE) | msr.ApicBase.ENABLE;
+    if (detectX2Apic()) base |= msr.ApicBase.X2APIC; // opt-in
+    msr.write(msr.APIC_BASE, base);
 
-    // Re-read; if bit 10 is set we're in x2APIC mode. lapicRead/lapicWrite
+    // Re-read; if X2APIC stuck we're in x2APIC mode. lapicRead/lapicWrite
     // start using MSR access from this point on.
-    asm volatile ("rdmsr"
-        : [lo] "={eax}" (lo), [hi] "={edx}" (hi)
-        : [msr] "{ecx}" (IA32_APIC_BASE_MSR));
-    x2apic_active = (lo & (1 << 10)) != 0;
+    x2apic_active = msr.read(msr.APIC_BASE) & msr.ApicBase.X2APIC != 0;
     if (x2apic_active) debug.klog("[apic] x2APIC mode active\n", .{});
 
     // Set Spurious Interrupt Vector Register: vector 0xFF + software enable (bit 8)
@@ -732,7 +705,7 @@ fn startTimer() void {
         // value is an absolute TSC value at which the IRQ fires; arm
         // the first one a quantum out.
         lapicWrite(LAPIC_LVT_TIMER, 32 | LVT_TIMER_MODE_TSC_DEADLINE);
-        wrmsr(IA32_TSC_DEADLINE_MSR, rdtsc() + tsc_per_quantum);
+        msr.write(MSR_TSC_DEADLINE, rdtsc() + tsc_per_quantum);
     } else {
         // LVT Timer: vector 32, ONE-SHOT mode. handleIRQ0 re-arms after each
         // tick — see armOneShot. Periodic mode is fine but burns the CPU 100x/sec
@@ -875,7 +848,7 @@ pub fn getLapicId() u32 {
 /// status bit because the write completes synchronously.
 fn icrSend(target_id: u32, command: u32) void {
     if (x2apic_active) {
-        wrmsr(0x830, (@as(u64, target_id) << 32) | @as(u64, command));
+        msr.write(lapicMsr(LAPIC_ICR_LO), (@as(u64, target_id) << 32) | @as(u64, command));
         return;
     }
     lapicWrite(LAPIC_ICR_HI, target_id << 24);
@@ -914,17 +887,7 @@ pub fn sendNMI(target_id: u32) void {
 /// that killed the first x2APIC boot, 2026-06-12.)
 pub fn enterX2ApicEarlyAp() void {
     if (!x2apic_active) return;
-    var lo: u32 = undefined;
-    var hi: u32 = undefined;
-    asm volatile ("rdmsr"
-        : [lo] "={eax}" (lo), [hi] "={edx}" (hi)
-        : [msr] "{ecx}" (IA32_APIC_BASE_MSR));
-    lo |= (1 << 11) | (1 << 10);
-    asm volatile ("wrmsr"
-        :
-        : [msr] "{ecx}" (IA32_APIC_BASE_MSR),
-          [lo] "{eax}" (lo),
-          [hi] "{edx}" (hi));
+    msr.write(msr.APIC_BASE, msr.read(msr.APIC_BASE) | msr.ApicBase.ENABLE | msr.ApicBase.X2APIC);
 }
 
 /// Initialize LAPIC for an AP (does NOT touch IOAPIC or PIC)
@@ -932,22 +895,11 @@ pub fn initLAPICForAP() void {
     // Enable APIC via MSR. MUST mirror the BSP's APIC mode: x2apic_active
     // is a single global flag, so the lapicWrite(SVR) below already takes
     // the MSR path when the BSP went x2APIC — an AP still in xAPIC mode
-    // at that point would #GP on the 0x80F wrmsr. Bit 10 goes in the same
-    // write as bit 11 (EN=1,EXTD=1 from disabled is a legal transition).
-    var lo: u32 = undefined;
-    var hi: u32 = undefined;
-    asm volatile ("rdmsr"
-        : [lo] "={eax}" (lo), [hi] "={edx}" (hi)
-        : [msr] "{ecx}" (IA32_APIC_BASE_MSR)
-    );
-    lo |= (1 << 11);
-    if (x2apic_active) lo |= (1 << 10);
-    asm volatile ("wrmsr"
-        :
-        : [msr] "{ecx}" (IA32_APIC_BASE_MSR),
-          [lo] "{eax}" (lo),
-          [hi] "{edx}" (hi)
-    );
+    // at that point would #GP on the 0x80F wrmsr. X2APIC goes in the same
+    // write as ENABLE (EN=1,EXTD=1 from disabled is a legal transition).
+    var base = msr.read(msr.APIC_BASE) | msr.ApicBase.ENABLE;
+    if (x2apic_active) base |= msr.ApicBase.X2APIC;
+    msr.write(msr.APIC_BASE, base);
     lapicWrite(LAPIC_SVR, 0x1FF);
     lapicWrite(LAPIC_TPR, 0);
 }
@@ -967,7 +919,7 @@ pub fn reinitLapicForS3Resume() void {
 pub fn startTimerForAP() void {
     if (tsc_deadline_active) {
         lapicWrite(LAPIC_LVT_TIMER, 32 | LVT_TIMER_MODE_TSC_DEADLINE);
-        wrmsr(IA32_TSC_DEADLINE_MSR, rdtsc() + tsc_per_quantum);
+        msr.write(MSR_TSC_DEADLINE, rdtsc() + tsc_per_quantum);
     } else {
         lapicWrite(LAPIC_LVT_TIMER, 32); // vector 32, one-shot
         lapicWrite(LAPIC_TIMER_DCR, 0x03); // divide by 16
@@ -981,7 +933,7 @@ pub fn startTimerForAP() void {
 /// can just multiply.
 pub fn armOneShot(ticks: u32) void {
     if (tsc_deadline_active) {
-        wrmsr(IA32_TSC_DEADLINE_MSR, rdtsc() + ticks);
+        msr.write(MSR_TSC_DEADLINE, rdtsc() + ticks);
     } else {
         lapicWrite(LAPIC_TIMER_ICR, ticks);
     }

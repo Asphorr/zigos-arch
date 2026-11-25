@@ -36,6 +36,7 @@
 
 const std = @import("std");
 const debug = @import("../debug/debug.zig");
+const msr = @import("../cpu/arch/msr.zig");
 
 const HV_CPUID_VENDOR_AND_MAX = 0x40000000;
 const HV_CPUID_FEATURES = 0x40000003;
@@ -109,28 +110,6 @@ inline fn cpuid(leaf: u32, sub: u32) CpuidRegs {
     return .{ .eax = eax, .ebx = ebx, .ecx = ecx, .edx = edx };
 }
 
-inline fn rdmsr(msr: u32) u64 {
-    var lo: u32 = undefined;
-    var hi: u32 = undefined;
-    asm volatile ("rdmsr"
-        : [_] "={eax}" (lo),
-          [_] "={edx}" (hi),
-        : [_] "{ecx}" (msr),
-    );
-    return (@as(u64, hi) << 32) | @as(u64, lo);
-}
-
-inline fn wrmsr(msr: u32, value: u64) void {
-    const lo: u32 = @truncate(value);
-    const hi: u32 = @truncate(value >> 32);
-    asm volatile ("wrmsr"
-        :
-        : [_] "{ecx}" (msr),
-          [_] "{eax}" (lo),
-          [_] "{edx}" (hi),
-    );
-}
-
 /// Check the standard hypervisor-present bit (CPUID 1.ECX[31]). When this
 /// is clear, the hypervisor leaves at 0x40000000+ are not architecturally
 /// guaranteed to be readable — some real CPUs return junk for unknown
@@ -198,13 +177,13 @@ pub fn hasFrequencyMsrs() bool {
 /// Guest TSC frequency in Hz. Only valid when `hasFrequencyMsrs()` is true.
 /// Reading it on a host that lacks the MSR will #GP.
 pub fn tscFrequencyHz() u64 {
-    return rdmsr(HV_MSR_TSC_FREQUENCY);
+    return msr.read(HV_MSR_TSC_FREQUENCY);
 }
 
 /// LAPIC bus frequency in Hz (the rate the LAPIC counter decrements at,
 /// before the divide-by-N stage in LAPIC_TIMER_DCR).
 pub fn apicFrequencyHz() u64 {
-    return rdmsr(HV_MSR_APIC_FREQUENCY);
+    return msr.read(HV_MSR_APIC_FREQUENCY);
 }
 
 // --- Crash MSRs (TLFS § 12.7) ----------------------------------------
@@ -217,12 +196,12 @@ pub fn apicFrequencyHz() u64 {
 /// no allocations, no locks, just five wrmsrs.
 pub fn writeCrash(p0: u64, p1: u64, p2: u64, p3: u64, p4: u64) void {
     if (!has_crash_msrs) return;
-    wrmsr(HV_MSR_CRASH_P0, p0);
-    wrmsr(HV_MSR_CRASH_P1, p1);
-    wrmsr(HV_MSR_CRASH_P2, p2);
-    wrmsr(HV_MSR_CRASH_P3, p3);
-    wrmsr(HV_MSR_CRASH_P4, p4);
-    wrmsr(HV_MSR_CRASH_CTL, HV_CRASH_CTL_NOTIFY);
+    msr.write(HV_MSR_CRASH_P0, p0);
+    msr.write(HV_MSR_CRASH_P1, p1);
+    msr.write(HV_MSR_CRASH_P2, p2);
+    msr.write(HV_MSR_CRASH_P3, p3);
+    msr.write(HV_MSR_CRASH_P4, p4);
+    msr.write(HV_MSR_CRASH_CTL, HV_CRASH_CTL_NOTIFY);
 }
 
 // --- Hypercall page + flush hypercall --------------------------------
@@ -254,7 +233,7 @@ pub fn enableHypercalls() void {
     // (Microsoft-OS sentinel — works on QEMU+KVM) + a unique OSType so the
     // host's Event Viewer can tell us apart from Linux/Windows guests.
     const guest_id: u64 = (@as(u64, 1) << 48) | (@as(u64, 0x5A) << 40) | 0x1;
-    wrmsr(HV_MSR_GUEST_OS_ID, guest_id);
+    msr.write(HV_MSR_GUEST_OS_ID, guest_id);
 
     // Allocate the thunk page. Physmap pages are mapped with NX clear
     // (boot.asm uses 0x183 = G|RW|PS|P, no bit 63) so calling into it
@@ -268,7 +247,7 @@ pub fn enableHypercalls() void {
 
     // Enable: write phys | bit 0. Host overlays the VMCALL/VMMCALL thunk
     // into the page; subsequent calls into call_va issue the hypercall.
-    wrmsr(HV_MSR_HYPERCALL, phys_call.raw() | 1);
+    msr.write(HV_MSR_HYPERCALL, phys_call.raw() | 1);
     hypercall_page = call_va;
 
     // Pre-allocate the flush input struct page (24-byte struct lives in
@@ -346,7 +325,7 @@ pub fn flushAllProcessors(address_space_cr3: u64) bool {
 /// PCI 0xCF9 / 8042 KBD pulse.
 pub fn tryReset() bool {
     if (!has_reset_msr) return false;
-    wrmsr(HV_MSR_RESET, 1);
+    msr.write(HV_MSR_RESET, 1);
     // Reaching this line at all means the host ignored the write (an
     // honored reset never returns) — report failure so the caller's
     // fallback chain (ACPI / 0xCF9 / 8042) keeps going.

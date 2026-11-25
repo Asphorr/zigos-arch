@@ -28,6 +28,8 @@
 // capability-MSR map decoded below).
 
 const debug = @import("../debug/debug.zig");
+const msr = @import("../cpu/arch/msr.zig");
+const cr = @import("../cpu/arch/cr.zig");
 const pmm = @import("../mm/pmm.zig");
 const paging = @import("../mm/paging.zig");
 const Phys = @import("../util/addr.zig").Phys;
@@ -55,7 +57,6 @@ const MSR_IA32_VMX_CR0_FIXED0: u32 = 0x486;
 const MSR_IA32_VMX_CR0_FIXED1: u32 = 0x487;
 const MSR_IA32_VMX_CR4_FIXED0: u32 = 0x488;
 const MSR_IA32_VMX_CR4_FIXED1: u32 = 0x489;
-const CR4_VMXE: u64 = 1 << 13;
 
 // IA32_VMX_BASIC bit 55: the "true" control MSRs (0x48D..0x490) are present.
 const BASIC_TRUE_CTLS_BIT: u6 = 55;
@@ -106,17 +107,6 @@ inline fn cpuid(leaf: u32, sub: u32) CpuidRegs {
     return .{ .eax = eax, .ebx = ebx, .ecx = ecx, .edx = edx };
 }
 
-inline fn rdmsr(msr: u32) u64 {
-    var lo: u32 = undefined;
-    var hi: u32 = undefined;
-    asm volatile ("rdmsr"
-        : [_] "={eax}" (lo),
-          [_] "={edx}" (hi),
-        : [_] "{ecx}" (msr),
-    );
-    return (@as(u64, hi) << 32) | @as(u64, lo);
-}
-
 inline fn yn(b: bool) []const u8 {
     return if (b) "yes" else "no";
 }
@@ -141,13 +131,13 @@ pub fn detect() void {
     //      locked + VMXON-outside-SMX set -> good, use as-is.
     //      unlocked                       -> Phase 1 sets+locks it itself.
     //      locked WITHOUT that bit         -> VMX disabled below us, dead end.
-    const fc = rdmsr(MSR_IA32_FEATURE_CONTROL);
+    const fc = msr.read(MSR_IA32_FEATURE_CONTROL);
     feature_control_locked = (fc & FC_LOCK) != 0;
     const vmxon_allowed = (fc & FC_VMXON_OUTSIDE_SMX) != 0;
 
     // 3. VMCS geometry (revision id + region byte size) — Phase 1 stamps the
     //    revision into the VMXON region and every VMCS, and sizes them here.
-    const basic = rdmsr(MSR_IA32_VMX_BASIC);
+    const basic = msr.read(MSR_IA32_VMX_BASIC);
     vmcs_revision = @truncate(basic & 0x7FFF_FFFF);
     vmcs_region_size = @truncate((basic >> 32) & 0x1FFF);
     has_true_ctls = (basic & (@as(u64, 1) << BASIC_TRUE_CTLS_BIT)) != 0;
@@ -156,9 +146,9 @@ pub fn detect() void {
     //    proc-based controls -> EPT + unrestricted guest. Probe safely: only
     //    read PROCBASED_CTLS2 if the primary controls allow activating
     //    secondary controls, else that MSR can #GP.
-    const procbased = rdmsr(MSR_IA32_VMX_PROCBASED_CTLS);
+    const procbased = msr.read(MSR_IA32_VMX_PROCBASED_CTLS);
     if ((procbased & (@as(u64, 1) << PROC_SECONDARY_BIT)) != 0) {
-        const proc2 = rdmsr(MSR_IA32_VMX_PROCBASED_CTLS2);
+        const proc2 = msr.read(MSR_IA32_VMX_PROCBASED_CTLS2);
         has_ept = (proc2 & (@as(u64, 1) << PROC2_EPT_BIT)) != 0;
         has_unrestricted_guest = (proc2 & (@as(u64, 1) << PROC2_UNRESTRICTED_BIT)) != 0;
     }
@@ -189,29 +179,6 @@ pub fn isUsable() bool {
 }
 
 // --- Phase 1: enter/exit VMX root operation (VMXON / VMXOFF) ----------
-
-inline fn readCr0() u64 {
-    return asm volatile ("mov %%cr0, %[ret]"
-        : [ret] "=r" (-> u64),
-    );
-}
-inline fn writeCr0(v: u64) void {
-    asm volatile ("mov %[val], %%cr0"
-        :
-        : [val] "r" (v),
-    );
-}
-inline fn readCr4() u64 {
-    return asm volatile ("mov %%cr4, %[ret]"
-        : [ret] "=r" (-> u64),
-    );
-}
-inline fn writeCr4(v: u64) void {
-    asm volatile ("mov %[val], %%cr4"
-        :
-        : [val] "r" (v),
-    );
-}
 
 // --- Phase 2: VMCS instruction wrappers ------------------------------
 //
@@ -370,17 +337,11 @@ fn vmcsRoundtrip() bool {
 // bit) — the most robust possible "the guest actually executed" signal.
 // Exit reason 10 (EXIT_REASON_CPUID) == success.
 
-inline fn readCr3() u64 {
-    return asm volatile ("mov %%cr3, %[ret]"
-        : [ret] "=r" (-> u64),
-    );
-}
-
 // VMX control-MSR adjustment: a bit set in the low dword (allowed-0) must be 1;
 // a bit clear in the high dword (allowed-1) must be 0. So the legal value for a
 // desired control word is `(desired | low) & high`.
-inline fn adjustCtl(desired: u32, msr: u32) u32 {
-    const v = rdmsr(msr);
+inline fn adjustCtl(desired: u32, capability: u32) u32 {
+    const v = msr.read(capability);
     const lo: u32 = @truncate(v);
     const hi: u32 = @truncate(v >> 32);
     return (desired | lo) & hi;
@@ -392,9 +353,6 @@ const MSR_IA32_VMX_TRUE_PROCBASED_CTLS: u32 = 0x48E;
 const MSR_IA32_VMX_TRUE_EXIT_CTLS: u32 = 0x48F;
 const MSR_IA32_VMX_TRUE_ENTRY_CTLS: u32 = 0x490;
 
-const MSR_IA32_EFER: u32 = 0xC000_0080;
-const MSR_FS_BASE: u32 = 0xC000_0100;
-const MSR_GS_BASE: u32 = 0xC000_0101;
 const MSR_IA32_SYSENTER_CS: u32 = 0x174;
 const MSR_IA32_SYSENTER_ESP: u32 = 0x175;
 const MSR_IA32_SYSENTER_EIP: u32 = 0x176;
@@ -569,10 +527,10 @@ const HostState = struct {
 
 fn captureHostState() HostState {
     var hs: HostState = undefined;
-    hs.cr0 = readCr0();
-    hs.cr3 = readCr3();
-    hs.cr4 = readCr4();
-    hs.efer = rdmsr(MSR_IA32_EFER);
+    hs.cr0 = cr.cr0.read();
+    hs.cr3 = cr.cr3.read();
+    hs.cr4 = cr.cr4.read();
+    hs.efer = msr.read(msr.EFER);
     hs.cs = readSeg("cs") & 0xFFF8;
     hs.ss = readSeg("ss") & 0xFFF8;
     hs.ds = readSeg("ds") & 0xFFF8;
@@ -599,11 +557,11 @@ fn captureHostState() HostState {
     const dlo = @as(*const u64, @ptrFromInt(tdesc)).*;
     const dhi = @as(*const u64, @ptrFromInt(tdesc + 8)).*;
     hs.tr_base = ((dlo >> 16) & 0xFFFFFF) | (((dlo >> 56) & 0xFF) << 24) | ((dhi & 0xFFFF_FFFF) << 32);
-    hs.se_cs = rdmsr(MSR_IA32_SYSENTER_CS);
-    hs.se_esp = rdmsr(MSR_IA32_SYSENTER_ESP);
-    hs.se_eip = rdmsr(MSR_IA32_SYSENTER_EIP);
-    hs.fs_base = rdmsr(MSR_FS_BASE);
-    hs.gs_base = rdmsr(MSR_GS_BASE);
+    hs.se_cs = msr.read(MSR_IA32_SYSENTER_CS);
+    hs.se_esp = msr.read(MSR_IA32_SYSENTER_ESP);
+    hs.se_eip = msr.read(MSR_IA32_SYSENTER_EIP);
+    hs.fs_base = msr.read(msr.FS_BASE);
+    hs.gs_base = msr.read(msr.GS_BASE);
     return hs;
 }
 
@@ -618,12 +576,11 @@ const Ctls = struct { pin: u32, proc: u32, proc2: u32, exit: u32, entry: u32 };
 fn populateVmcs(hs: *const HostState, ctls: Ctls, eptp: u64, guest_rsp: u64) u32 {
     // Guest CR0/CR4 (real mode: PE=0, PG=0; unrestricted guest exempts both
     // from the fixed-bit requirement).
-    const cr0_f0 = rdmsr(MSR_IA32_VMX_CR0_FIXED0);
-    const cr0_f1 = rdmsr(MSR_IA32_VMX_CR0_FIXED1);
-    const cr4_f0 = rdmsr(MSR_IA32_VMX_CR4_FIXED0);
-    const cr4_f1 = rdmsr(MSR_IA32_VMX_CR4_FIXED1);
-    const PE_PG: u64 = 1 | (@as(u64, 1) << 31);
-    const guest_cr0 = (cr0_f0 & cr0_f1) & ~PE_PG;
+    const cr0_f0 = msr.read(MSR_IA32_VMX_CR0_FIXED0);
+    const cr0_f1 = msr.read(MSR_IA32_VMX_CR0_FIXED1);
+    const cr4_f0 = msr.read(MSR_IA32_VMX_CR4_FIXED0);
+    const cr4_f1 = msr.read(MSR_IA32_VMX_CR4_FIXED1);
+    const guest_cr0 = (cr0_f0 & cr0_f1) & ~(cr.cr0.PE | cr.cr0.PG);
     const guest_cr4 = cr4_f0 & cr4_f1;
 
     const W = struct { f: u64, v: u64 };
@@ -1279,18 +1236,18 @@ pub fn enableBsp() void {
     if (vmxon_region_phys != 0) return; // already done
 
     // 1. Force CR0/CR4 to VMX-legal values and set CR4.VMXE.
-    const cr0_f0 = rdmsr(MSR_IA32_VMX_CR0_FIXED0);
-    const cr0_f1 = rdmsr(MSR_IA32_VMX_CR0_FIXED1);
-    const cr4_f0 = rdmsr(MSR_IA32_VMX_CR4_FIXED0);
-    const cr4_f1 = rdmsr(MSR_IA32_VMX_CR4_FIXED1);
+    const cr0_f0 = msr.read(MSR_IA32_VMX_CR0_FIXED0);
+    const cr0_f1 = msr.read(MSR_IA32_VMX_CR0_FIXED1);
+    const cr4_f0 = msr.read(MSR_IA32_VMX_CR4_FIXED0);
+    const cr4_f1 = msr.read(MSR_IA32_VMX_CR4_FIXED1);
 
-    const orig_cr0 = readCr0();
+    const orig_cr0 = cr.cr0.read();
     const new_cr0 = (orig_cr0 | cr0_f0) & cr0_f1;
-    if (new_cr0 != orig_cr0) writeCr0(new_cr0);
+    if (new_cr0 != orig_cr0) cr.cr0.write(new_cr0);
 
-    const orig_cr4 = readCr4();
-    const new_cr4 = ((orig_cr4 | cr4_f0) & cr4_f1) | CR4_VMXE;
-    writeCr4(new_cr4);
+    const orig_cr4 = cr.cr4.read();
+    const new_cr4 = ((orig_cr4 | cr4_f0) & cr4_f1) | cr.cr4.VMXE;
+    cr.cr4.write(new_cr4);
     // Diagnostic: if the FIXED1 mask cleared any CR4 bit the kernel relies on
     // (SMEP/SMAP/PCIDE/PGE/...), it shows up as a dropped bit here.
     debug.klog("[vmx] CR0 0x{X}->0x{X}  CR4 0x{X}->0x{X} (VMXE set)\n", .{
@@ -1303,8 +1260,8 @@ pub fn enableBsp() void {
     //    (Phase 0 logged 4096). Phase 2 must apply the same bound to the VMCS.
     const phys = (pmm.allocFrame() orelse {
         debug.klog("[vmx] enableBsp: PMM exhausted — cannot allocate VMXON region\n", .{});
-        writeCr4(orig_cr4);
-        if (new_cr0 != orig_cr0) writeCr0(orig_cr0);
+        cr.cr4.write(orig_cr4);
+        if (new_cr0 != orig_cr0) cr.cr0.write(orig_cr0);
         return;
     }).raw();
     const va = paging.physToVirt(phys);
@@ -1325,13 +1282,13 @@ pub fn enableBsp() void {
     // cr4_now re-reads CR4 to confirm VMXE truly stuck (KVM could refuse it).
     // maxphyaddr: if `phys >> maxphyaddr != 0`, KVM's page_address_valid
     // VMfails — here 0x..00 is ~44MB so any sane width passes, but log it.
-    const basic_raw = rdmsr(MSR_IA32_VMX_BASIC);
-    const cr4_now = readCr4();
+    const basic_raw = msr.read(MSR_IA32_VMX_BASIC);
+    const cr4_now = cr.cr4.read();
     const region_rev = @as(*volatile u32, @ptrFromInt(va)).*;
     const maxphyaddr: u8 = @truncate(cpuid(0x8000_0008, 0).eax & 0xFF);
     debug.klog("[vmx] pre-VMXON: region_rev=0x{X} (want 0x{X}) cr4=0x{X} vmxe={s} " ++
         "maxphyaddr={d}b basic=0x{X} region_pa=0x{X}\n", .{
-        region_rev, vmcs_revision, cr4_now, yn((cr4_now & CR4_VMXE) != 0),
+        region_rev, vmcs_revision, cr4_now, yn((cr4_now & cr.cr4.VMXE) != 0),
         maxphyaddr, basic_raw,     phys,
     });
 
@@ -1363,8 +1320,8 @@ pub fn enableBsp() void {
             if (cf != 0) "VMfailInvalid" else "VMfailValid", phys, new_cr4, cf, zf,
         });
         pmm.freeFrame(Phys.of(phys));
-        writeCr4(orig_cr4);
-        if (new_cr0 != orig_cr0) writeCr0(orig_cr0);
+        cr.cr4.write(orig_cr4);
+        if (new_cr0 != orig_cr0) cr.cr0.write(orig_cr0);
         return;
     }
     in_vmx_operation = true;

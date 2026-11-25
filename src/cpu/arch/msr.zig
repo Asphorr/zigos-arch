@@ -1,5 +1,15 @@
-// Fault-tolerant MSR access — rdmsrSafe / wrmsrSafe.
+// Model-specific registers: the one place that executes rdmsr/wrmsr.
 //
+// `read`/`write` are the bare instructions. `readSafe`/`writeSafe` take the
+// #GP of a register the CPU does not have and report it, for registers whose
+// presence can only be probed.
+//
+// The registers of the CPU's own architectural state are named here, with
+// their bits. A family that belongs to one feature (machine-check banks, PMU
+// counters, the x2APIC block, VMX capabilities, a hypervisor's own) is named
+// by the module that programs it.
+//
+// ── Fault-tolerant access ───────────────────────────────────────────────
 // rdmsr/wrmsr raise #GP when the MSR isn't implemented on the platform (a
 // model-specific register absent on this stepping, or a hypervisor that
 // injects #GP for MSRs it doesn't emulate). In kernel context that #GP is
@@ -31,6 +41,70 @@
 // targets in data rather than a linker section.
 
 const debug = @import("../../debug/debug.zig");
+
+pub const TSC: u32 = 0x10;
+
+pub const APIC_BASE: u32 = 0x1B;
+pub const ApicBase = struct {
+    pub const X2APIC: u64 = 1 << 10;
+    pub const ENABLE: u64 = 1 << 11;
+};
+
+pub const DEBUGCTL: u32 = 0x1D9;
+pub const Debugctl = struct {
+    pub const LBR: u64 = 1 << 0;
+};
+
+pub const PAT: u32 = 0x277;
+
+pub const EFER: u32 = 0xC000_0080;
+pub const Efer = struct {
+    /// SYSCALL/SYSRET.
+    pub const SCE: u64 = 1 << 0;
+    pub const LME: u64 = 1 << 8;
+    pub const LMA: u64 = 1 << 10;
+    /// Bit 63 of a PTE means no-execute; with NXE clear it is a reserved
+    /// bit, and touching such a page faults.
+    pub const NXE: u64 = 1 << 11;
+};
+
+/// SYSCALL: CS = STAR[47:32], SS = that + 8. SYSRET to 64-bit code:
+/// CS = STAR[63:48] + 16, SS = STAR[63:48] + 8, both with RPL 3.
+pub const STAR: u32 = 0xC000_0081;
+/// RIP of the SYSCALL entry.
+pub const LSTAR: u32 = 0xC000_0082;
+/// RFLAGS bits SYSCALL clears.
+pub const SFMASK: u32 = 0xC000_0084;
+
+pub const FS_BASE: u32 = 0xC000_0100;
+pub const GS_BASE: u32 = 0xC000_0101;
+/// What SWAPGS exchanges GS_BASE with.
+pub const KERNEL_GS_BASE: u32 = 0xC000_0102;
+/// What RDTSCP and RDPID return in ECX.
+pub const TSC_AUX: u32 = 0xC000_0103;
+
+/// RDMSR. A register this CPU does not have is a #GP: `readSafe` to probe.
+pub inline fn read(msr: u32) u64 {
+    var low: u32 = undefined;
+    var high: u32 = undefined;
+    asm volatile ("rdmsr"
+        : [_] "={eax}" (low),
+          [_] "={edx}" (high),
+        : [_] "{ecx}" (msr),
+    );
+    return (@as(u64, high) << 32) | low;
+}
+
+/// WRMSR. A missing register or a reserved bit is a #GP: `writeSafe` to
+/// probe.
+pub inline fn write(msr: u32, value: u64) void {
+    asm volatile ("wrmsr"
+        :
+        : [_] "{ecx}" (msr),
+          [_] "{eax}" (@as(u32, @truncate(value))),
+          [_] "{edx}" (@as(u32, @truncate(value >> 32))),
+    );
+}
 
 // Published fault/fixup instruction addresses. Zero until the corresponding
 // accessor runs once; each accessor republishes (idempotently) on entry, so
@@ -71,7 +145,7 @@ pub fn fixupRip(rip: u64) ?u64 {
 /// racing on different CPUs leave one of them unmatched at fault time
 /// (= unrecovered #GP panic). One pinned copy keeps the site link-time
 /// invariant for real. Same rule in usercopy.zig / extable.zig.
-pub noinline fn rdmsrSafe(msr: u32) ?u64 {
+pub noinline fn readSafe(msr: u32) ?u64 {
     var value: u64 = undefined;
     var ok: u64 = undefined;
     asm volatile (
@@ -100,8 +174,8 @@ pub noinline fn rdmsrSafe(msr: u32) ?u64 {
 
 /// Write `value` to `msr`, returning false if the access raised #GP (MSR
 /// not present / reserved-bit violation / not emulated). Never panics.
-/// noinline: see rdmsrSafe.
-pub noinline fn wrmsrSafe(msr: u32, value: u64) bool {
+/// noinline: see readSafe.
+pub noinline fn writeSafe(msr: u32, value: u64) bool {
     var ok: u64 = undefined;
     const lo: u32 = @truncate(value);
     const hi: u32 = @truncate(value >> 32);
@@ -127,8 +201,8 @@ pub noinline fn wrmsrSafe(msr: u32, value: u64) bool {
 }
 
 /// Present-check helper: true iff `msr` reads back without faulting.
-pub fn msrPresent(msr: u32) bool {
-    return rdmsrSafe(msr) != null;
+pub fn present(msr: u32) bool {
+    return readSafe(msr) != null;
 }
 
 /// Boot self-test: prove the #GP fixup actually recovers a faulting MSR
@@ -141,15 +215,15 @@ pub fn msrPresent(msr: u32) bool {
 /// Requires the IDT (with the exception fixup hook) to be live.
 pub fn selfTest() void {
     const RESERVED: u32 = 0xFFFF_FFFF;
-    if (rdmsrSafe(RESERVED)) |v| {
+    if (readSafe(RESERVED)) |v| {
         debug.klog("[msr] fixup present but NOT exercised — host tolerated rdmsr(0x{X})=0x{X}\n", .{ RESERVED, v });
     } else {
         debug.klog("[msr] safe-MSR fixup VERIFIED — rdmsr(0x{X}) #GP recovered to null\n", .{RESERVED});
     }
-    // Over-fire guard: a valid architectural MSR (IA32_TSC, 0x10) must still
+    // Over-fire guard: a valid architectural MSR (IA32_TSC) must still
     // read back non-null. A null here would mean the fixup is redirecting
     // every rdmsr, not just the faulting one.
-    if (rdmsrSafe(0x10) == null) {
-        debug.klog("[msr] WARNING: rdmsrSafe(IA32_TSC) returned null — fixup OVER-FIRING\n", .{});
+    if (readSafe(TSC) == null) {
+        debug.klog("[msr] WARNING: readSafe(IA32_TSC) returned null — fixup OVER-FIRING\n", .{});
     }
 }

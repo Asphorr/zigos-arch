@@ -55,6 +55,7 @@ const SAVED_RIP_OFF: usize = @import("frames.zig").dispatch.saved_rip_off;
 
 const vga = @import("../driver.zig").vga;
 const gdt = @import("../cpu/arch/gdt.zig");
+const msr = @import("../cpu/arch/msr.zig");
 const debug = @import("../debug/debug.zig");
 const pcid_mod = @import("../cpu/mmu/pcid.zig");
 const smp = @import("../cpu/smp.zig");
@@ -2528,12 +2529,7 @@ pub fn schedule() void {
 /// dispatch so each thread keeps its own TLS pointer. Cheap (a single
 /// wrmsr); safe to call with value 0 (means "no TLS configured").
 inline fn writeFsBase(val: u64) void {
-    const IA32_FS_BASE: u32 = 0xC0000100;
-    asm volatile ("wrmsr"
-        :
-        : [msr] "{ecx}" (IA32_FS_BASE),
-          [lo] "{eax}" (@as(u32, @truncate(val))),
-          [hi] "{edx}" (@as(u32, @truncate(val >> 32))));
+    msr.write(msr.FS_BASE, val);
 }
 
 /// Lazy min-deadline caches for `wakeExpired` / `deliverDueAlarms`. Setters

@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const debug = @import("../../debug/debug.zig");
+const cr = @import("../arch/cr.zig");
 const serial = @import("../../debug/serial.zig");
 const symbols = @import("../../debug/symbols.zig");
 const process = @import("../../proc/process.zig");
@@ -92,9 +93,7 @@ fn printSym(addr: u64, app_syms: ?*const symbols.SymTable) void {
 // handler: every deref the dump paths perform is isMapped-gated, so nothing
 // in here can re-fault and overwrite it before the last reader.
 inline fn readCr2() u64 {
-    return asm volatile ("movq %%cr2, %[ret]"
-        : [ret] "=r" (-> u64),
-    );
+    return cr.cr2.read();
 }
 
 // Walk a kernel RBP chain and print symbolized frames. Per-frame validity:
@@ -249,7 +248,7 @@ export fn handleException(rsp: u64) callconv(.c) void {
 
     // Kernel exception-table fixup (extable.zig). A #GP (13) or #PF (14)
     // in kernel mode at a registered fault site — an MSR probe
-    // (rdmsrSafe/wrmsrSafe) or a faultable user copy (usercopy.zig) — is
+    // (msr.readSafe/writeSafe) or a faultable user copy (usercopy.zig) — is
     // recovered by redirecting the saved RIP to the site's fixup landing
     // pad, which reports "failed/partial" to the caller instead of
     // panicking. Sites are link-time invariants, so this needs no per-CPU
@@ -805,9 +804,7 @@ export fn handleException(rsp: u64) callconv(.c) void {
 
     // Control registers (read early for crash classifier)
     const cr2 = readCr2();
-    const cr3 = asm volatile ("movq %%cr3, %[ret]"
-        : [ret] "=r" (-> u64),
-    );
+    const cr3 = cr.cr3.read();
 
     // Crash classifier hint — helps narrow down the likely cause before diving
     // into register dumps. For #PF, pass CR2; for others it's ignored.

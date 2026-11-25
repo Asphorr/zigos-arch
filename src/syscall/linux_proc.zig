@@ -200,12 +200,8 @@ fn enterImage(frame: *signals.SyscallFrame, e: EntryRsp) void {
     @import("../cpu/arch/fp.zig").resetLiveExtended();
     const pcb = process.currentPCB() orelse return;
     pcb.fs_base = 0;
-    asm volatile ("wrmsr"
-        :
-        : [msr] "{ecx}" (@as(u32, 0xC000_0100)),
-          [lo] "{eax}" (@as(u32, 0)),
-          [hi] "{edx}" (@as(u32, 0)),
-    );
+    const msr = @import("../cpu/arch/msr.zig");
+    msr.write(msr.FS_BASE, 0);
 }
 
 /// Close the caller's FD_CLOEXEC fds.

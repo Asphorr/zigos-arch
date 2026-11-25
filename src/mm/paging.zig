@@ -9,6 +9,8 @@
 const pmm = @import("pmm.zig");
 const memmap = @import("memmap.zig");
 const layout = @import("layout.zig");
+const msr = @import("../cpu/arch/msr.zig");
+const cr = @import("../cpu/arch/cr.zig");
 const Phys = @import("../util/addr.zig").Phys;
 
 // Page table entry flags (same bit positions in x86_64)
@@ -205,10 +207,7 @@ pub fn isMapped(addr: u64) bool {
     const high = addr >> 47;
     if (high != 0 and high != 0x1FFFF) return false;
 
-    const cr3 = asm volatile ("movq %%cr3, %[ret]"
-        : [ret] "=r" (-> u64),
-    );
-    const pml4 = layout.Phys.from(cr3 & PAGE_MASK).toKVa().ptr([*]const u64);
+    const pml4 = layout.Phys.from(cr.cr3.read() & PAGE_MASK).toKVa().ptr([*]const u64);
     const pml4e = Pte.of(pml4[layout.pml4Index(addr)]);
     if (!pml4e.present) return false;
     if (pml4e.huge_or_pat) return true; // unusual: 512GB huge
@@ -391,7 +390,6 @@ pub fn mapAPIC() void {
 // PAT was added in Pentium III (2000); CPUID.01H:EDX[16] reports support.
 // Every x86_64 CPU has it, but we probe defensively.
 
-const PAT_MSR: u32 = 0x277;
 // PA0=WB(0x06)  PA1=WT(0x04)  PA2=UC-(0x07)  PA3=UC(0x00)
 // PA4=WC(0x01)  PA5=WT(0x04)  PA6=UC-(0x07)  PA7=UC(0x00)
 //
@@ -416,17 +414,6 @@ comptime {
     }
 }
 
-fn writeMsr(msr: u32, value: u64) void {
-    const lo: u32 = @truncate(value);
-    const hi: u32 = @truncate(value >> 32);
-    asm volatile ("wrmsr"
-        :
-        : [_] "{ecx}" (msr),
-          [_] "{eax}" (lo),
-          [_] "{edx}" (hi),
-    );
-}
-
 /// Configure PAT slot 4 = WC on the calling CPU. Idempotent. Per-CPU —
 /// caller must invoke from BSP startup AND from every AP entry.
 pub fn setupPat() void {
@@ -437,7 +424,7 @@ pub fn setupPat() void {
         : [_] "{eax}" (@as(u32, 1)),
         : .{ .ebx = true, .ecx = true });
     if (edx & (1 << 16) == 0) return;
-    writeMsr(PAT_MSR, PAT_VALUE_WITH_WC4);
+    msr.write(msr.PAT, PAT_VALUE_WITH_WC4);
     // PAT changes how every PTE's PCD/PWT/PAT bits resolve to a memory
     // type. Existing TLB entries cache the OLD type — must blow them all
     // away, globals included, or kernel pages keep their pre-PAT caching.
@@ -767,10 +754,7 @@ pub fn freeGuestFB(num_pages: u32) void {
 ///   - Per-process address-space changes (user pages are G=0)
 ///   - Clearing PML4[0] in `dropLowIdentity` — see note there
 pub fn flushTLB() void {
-    asm volatile (
-        \\ movq %%cr3, %%rax
-        \\ movq %%rax, %%cr3
-        ::: .{ .rax = true });
+    cr.flushTlb();
 }
 
 /// Flush ALL TLB entries on the calling CPU, including global pages.
@@ -787,13 +771,7 @@ pub fn flushTLB() void {
 /// Per-CPU. Post-boot kernel-master mutations need a cross-CPU shootdown
 /// (see `tlb.shootdownAll(0)`) in addition — this only flushes locally.
 pub fn flushTLBGlobal() void {
-    asm volatile (
-        \\ movq %%cr4, %%rcx
-        \\ movq %%rcx, %%rax
-        \\ btrq $7, %%rax
-        \\ movq %%rax, %%cr4
-        \\ movq %%rcx, %%cr4
-        ::: .{ .rax = true, .rcx = true });
+    cr.flushTlbGlobal();
 }
 
 /// Boot-phase audit for the two kernel-master mutators that are expected to
@@ -1149,31 +1127,16 @@ pub fn protectKdataInit() void {
 /// Cost: ~30 cycles for the cr0 round-trip vs ~140 for PTE+invlpg.
 /// Must be paired with `lockKdata` immediately after the store.
 pub fn unlockKdata() void {
-    asm volatile (
-        \\ movq %%cr0, %%rax
-        \\ btrq $16, %%rax
-        \\ movq %%rax, %%cr0
-        ::: .{ .rax = true });
+    cr.cr0.clear(cr.cr0.WP);
 }
 
 /// Re-set CR0.WP on the CALLING CPU. Pair with `unlockKdata`.
 pub fn lockKdata() void {
-    asm volatile (
-        \\ movq %%cr0, %%rax
-        \\ btsq $16, %%rax
-        \\ movq %%rax, %%cr0
-        ::: .{ .rax = true });
+    cr.cr0.set(cr.cr0.WP);
 }
 
 /// Set CR0.WP=1 so kernel-mode writes respect R/W=0 PTEs. Without this,
 /// supervisor writes ignore the R/W bit and the watch never trips.
 pub fn enableCR0WriteProtect() void {
-    var cr0 = asm volatile ("mov %%cr0, %[ret]"
-        : [ret] "=r" (-> u64),
-    );
-    cr0 |= 1 << 16;
-    asm volatile ("mov %[v], %%cr0"
-        :
-        : [v] "r" (cr0),
-    );
+    cr.cr0.set(cr.cr0.WP);
 }

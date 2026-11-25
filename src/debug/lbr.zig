@@ -17,9 +17,8 @@
 const std = @import("std");
 const serial = @import("serial.zig");
 const symbols = @import("symbols.zig");
+const msr = @import("../cpu/arch/msr.zig");
 
-const MSR_DEBUGCTL: u32 = 0x1D9;
-const DEBUGCTL_LBR_BIT: u64 = 1 << 0;
 const MSR_LBR_TOS: u32 = 0x1C9;
 const MSR_LBR_FROM_0: u32 = 0x680;
 const MSR_LBR_TO_0: u32 = 0x6C0;
@@ -28,17 +27,17 @@ const LBR_DEPTH: usize = 32;
 var enabled: bool = false;
 
 pub fn enable() void {
-    var debugctl = readMsr(MSR_DEBUGCTL);
-    debugctl |= DEBUGCTL_LBR_BIT;
-    writeMsr(MSR_DEBUGCTL, debugctl);
+    var debugctl = msr.read(msr.DEBUGCTL);
+    debugctl |= msr.Debugctl.LBR;
+    msr.write(msr.DEBUGCTL, debugctl);
 
     // Verify the bit stuck — KVM/Hyper-V may accept the WRMSR silently
     // without actually enabling LBR recording (and reads of LBR_FROM_N
     // may then #GP on us, which would triple-fault from inside any
     // exception handler that snapshots LBR). If verify fails we leave
     // `enabled` false so callers fall through to a zeroed snapshot.
-    const verify = readMsr(MSR_DEBUGCTL);
-    if ((verify & DEBUGCTL_LBR_BIT) == 0) {
+    const verify = msr.read(msr.DEBUGCTL);
+    if ((verify & msr.Debugctl.LBR) == 0) {
         serial.print("[lbr] DEBUGCTL.LBR did not retain — hypervisor masked it; LBR disabled\n", .{});
         return;
     }
@@ -63,10 +62,10 @@ pub fn snapshot() LbrSnap {
     // frozen contents and stay readable. Every caller is on a terminal panic
     // / halt path, so leaving recording off afterwards is harmless.
     freezeRecording();
-    snap.tos = readMsr(MSR_LBR_TOS);
+    snap.tos = msr.read(MSR_LBR_TOS);
     for (0..LBR_DEPTH) |i| {
-        snap.from[i] = readMsr(MSR_LBR_FROM_0 + @as(u32, @intCast(i)));
-        snap.to[i] = readMsr(MSR_LBR_TO_0 + @as(u32, @intCast(i)));
+        snap.from[i] = msr.read(MSR_LBR_FROM_0 + @as(u32, @intCast(i)));
+        snap.to[i] = msr.read(MSR_LBR_TO_0 + @as(u32, @intCast(i)));
     }
     return snap;
 }
@@ -76,9 +75,9 @@ pub fn snapshot() LbrSnap {
 /// pollute the ring. No-op if LBR was never enabled.
 fn freezeRecording() void {
     if (!enabled) return;
-    var debugctl = readMsr(MSR_DEBUGCTL);
-    debugctl &= ~DEBUGCTL_LBR_BIT;
-    writeMsr(MSR_DEBUGCTL, debugctl);
+    var debugctl = msr.read(msr.DEBUGCTL);
+    debugctl &= ~msr.Debugctl.LBR;
+    msr.write(msr.DEBUGCTL, debugctl);
 }
 
 /// Print the ring most-recent-first. `tos` is the index of the most
@@ -140,26 +139,4 @@ fn printSym(addr: u64, comptime emergency: bool) void {
     } else {
         emit(emergency, "0x{X:0>16}", .{addr});
     }
-}
-
-fn readMsr(msr: u32) u64 {
-    var lo: u32 = undefined;
-    var hi: u32 = undefined;
-    asm volatile ("rdmsr"
-        : [lo] "={eax}" (lo),
-          [hi] "={edx}" (hi),
-        : [msr] "{ecx}" (msr),
-    );
-    return @as(u64, lo) | (@as(u64, hi) << 32);
-}
-
-fn writeMsr(msr: u32, value: u64) void {
-    const lo: u32 = @truncate(value);
-    const hi: u32 = @truncate(value >> 32);
-    asm volatile ("wrmsr"
-        :
-        : [msr] "{ecx}" (msr),
-          [lo] "{eax}" (lo),
-          [hi] "{edx}" (hi),
-    );
 }

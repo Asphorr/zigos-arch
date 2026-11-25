@@ -22,6 +22,8 @@ const io = @import("../io.zig");
 const serial = @import("../debug/serial.zig");
 const common = @import("../syscall/common.zig");
 const smp = @import("../cpu/smp.zig");
+const msr = @import("../cpu/arch/msr.zig");
+const cr = @import("../cpu/arch/cr.zig");
 const virtio_gpu = @import("../driver.zig").virtio_gpu;
 const xhci = @import("../driver.zig").xhci;
 const nvme = @import("../driver.zig").nvme;
@@ -71,12 +73,6 @@ inline fn sleepWord(slp_typ: u8) u16 {
     return (@as(u16, slp_typ & 0x7) << 10) | (1 << 13);
 }
 
-fn readCr3() u64 {
-    return asm volatile ("mov %%cr3, %[ret]"
-        : [ret] "=r" (-> u64),
-    );
-}
-
 fn readTsc() u64 {
     var hi: u32 = undefined;
     var lo: u32 = undefined;
@@ -87,15 +83,10 @@ fn readTsc() u64 {
     return (@as(u64, hi) << 32) | @as(u64, lo);
 }
 
-/// Write IA32_TIME_STAMP_COUNTER (MSR 0x10). Under KVM this adjusts the guest
-/// TSC offset; on real hardware it sets the counter directly.
+/// Under KVM this adjusts the guest TSC offset; on real hardware it sets the
+/// counter directly.
 fn writeTsc(val: u64) void {
-    asm volatile ("wrmsr"
-        :
-        : [msr] "{ecx}" (@as(u32, 0x10)),
-          [lo] "{eax}" (@as(u32, @truncate(val))),
-          [hi] "{edx}" (@as(u32, @truncate(val >> 32))),
-    );
+    msr.write(msr.TSC, val);
 }
 
 /// Write a string straight to COM1 (0x3F8), bypassing serial.print's deferred-mode
@@ -144,7 +135,7 @@ export fn s3ResumeEntry() callconv(.c) noreturn {
 /// the live CR3 rather than trusting a saved value. No-op if the tables aren't
 /// shaped as installLowIdentity left them.
 fn removeLowIdentity() void {
-    const cr3 = readCr3();
+    const cr3 = cr.cr3.read();
     const pml4: [*]volatile u64 = @ptrFromInt(paging.physToVirt(cr3 & paging.PAGE_MASK));
     const pml4e = pml4[0];
     if (pml4e & paging.PRESENT == 0) return;
@@ -154,15 +145,9 @@ fn removeLowIdentity() void {
     if (pdpte & paging.PAGE_SIZE_FLAG != 0) return;
     const pd: [*]volatile u64 = @ptrFromInt(paging.physToVirt(pdpte & paging.PAGE_MASK));
     pd[0] = 0;
-    // Flush the stale VA-0 translation: reload CR3 (the 2 MiB entry wasn't
-    // GLOBAL, so a plain CR3 reload evicts it). Value-based reload so the
-    // compiler picks the scratch reg; memory clobber pins it after the pd[0]
-    // store.
-    const cur = readCr3();
-    asm volatile ("mov %[v], %%cr3"
-        :
-        : [v] "r" (cur),
-        : .{ .memory = true });
+    // Flush the stale VA-0 translation: the 2 MiB entry wasn't GLOBAL, so a
+    // plain CR3 reload evicts it.
+    cr.flushTlb();
 }
 
 /// Install a temporary 2 MiB identity page at VA 0 in the current (suspending)
@@ -173,7 +158,7 @@ fn removeLowIdentity() void {
 /// the CR3 to load on resume (PML4 phys with the low 12 bits stripped), or null
 /// if the tables aren't shaped as expected.
 fn installLowIdentity() ?u64 {
-    const cr3 = readCr3();
+    const cr3 = cr.cr3.read();
     const pml4: [*]volatile u64 = @ptrFromInt(paging.physToVirt(cr3 & paging.PAGE_MASK));
     const pml4e = pml4[0];
     if (pml4e & paging.PRESENT == 0) return null;
@@ -324,7 +309,7 @@ pub fn suspendToRam() u32 {
     // the request were still set they'd immediately re-park instead of idling.
     smp.endQuiesceAps();
     smp.offlineApsForS3Resume();
-    smp.reonlineApsForS3Resume(readCr3() & paging.PAGE_MASK);
+    smp.reonlineApsForS3Resume(cr.cr3.read() & paging.PAGE_MASK);
 
     // Restore the 0..2 MiB null guard the suspend path borrowed for the
     // trampoline page (now that AP re-online is done with it).

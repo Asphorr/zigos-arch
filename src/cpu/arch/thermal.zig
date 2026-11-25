@@ -15,7 +15,7 @@
 //     base clock. SDM Vol 3B §15.2 "Hardware-Controlled Performance States".
 //
 // ── Probing, not guessing ───────────────────────────────────────────────
-// Every MSR here goes through msr.rdmsrSafe, which recovers from the #GP a
+// Every MSR here goes through msr.readSafe, which recovers from the #GP a
 // platform raises for an unimplemented register (see cpu/arch/msr.zig). So
 // capability is learned by *attempting* the read: CPUID leaf 6 tells us a
 // sensor is architecturally advertised, and a non-faulting read confirms
@@ -96,7 +96,7 @@ pub fn detect() void {
     // DTS: architecturally advertised by CPUID.06H:EAX[0], but confirm the
     // status MSR actually responds (a hypervisor can advertise the bit and
     // still #GP the register).
-    if (l6.eax & (1 << 0) != 0) has_dts = msr.msrPresent(IA32_THERM_STATUS);
+    if (l6.eax & (1 << 0) != 0) has_dts = msr.present(IA32_THERM_STATUS);
 
     // Base clock for the effective-frequency scale (leaf 0x16 EAX, MHz).
     if (max_leaf >= 0x16) base_mhz = cpuid(0x16, 0).eax & 0xFFFF;
@@ -104,14 +104,14 @@ pub fn detect() void {
     // Tj_max from MSR_TEMPERATURE_TARGET[23:16] (no CPUID gate; probe it).
     // Keep the 100 °C default if absent or out of a sane window.
     if (has_dts) {
-        if (msr.rdmsrSafe(MSR_TEMPERATURE_TARGET)) |tt| {
+        if (msr.readSafe(MSR_TEMPERATURE_TARGET)) |tt| {
             const t: u32 = @truncate((tt >> 16) & 0xFF);
             if (t >= 50 and t <= 125) tj_max = t;
         }
     }
 
     // RAPL has no CPUID presence bit — detect it by probing the unit MSR.
-    if (msr.rdmsrSafe(MSR_RAPL_POWER_UNIT)) |unit| {
+    if (msr.readSafe(MSR_RAPL_POWER_UNIT)) |unit| {
         has_rapl = true;
         const esu: u6 = @truncate((unit >> 8) & 0x1F); // energy-status unit exponent
         energy_nj_per_unit = 1_000_000_000 / (@as(u64, 1) << esu);
@@ -185,7 +185,7 @@ pub fn readTemps() Temps {
     };
 
     if (has_dts) {
-        if (msr.rdmsrSafe(IA32_THERM_STATUS)) |s| {
+        if (msr.readSafe(IA32_THERM_STATUS)) |s| {
             // Bit 31 = reading valid; bits [22:16] = °C below Tj_max.
             if (s & (1 << 31) != 0) {
                 const below: i32 = @intCast((s >> 16) & 0x7F);
@@ -195,7 +195,7 @@ pub fn readTemps() Temps {
         }
     }
     if (has_pkg_therm) {
-        if (msr.rdmsrSafe(IA32_PACKAGE_THERM_STATUS)) |s| {
+        if (msr.readSafe(IA32_PACKAGE_THERM_STATUS)) |s| {
             const below: i32 = @intCast((s >> 16) & 0x7F);
             out.pkg_c = @as(i32, @intCast(tj_max)) - below;
             out.pkg_throttle = decodeThrottle(s);
@@ -232,12 +232,12 @@ pub const Rates = struct {
 fn readSample() Sample {
     var s = Sample{ .tsc = apic.readTsc(), .mperf = 0, .aperf = 0, .pkg_energy = 0, .pp0_energy = 0, .valid = true };
     if (has_aperf) {
-        s.mperf = msr.rdmsrSafe(IA32_MPERF) orelse 0;
-        s.aperf = msr.rdmsrSafe(IA32_APERF) orelse 0;
+        s.mperf = msr.readSafe(IA32_MPERF) orelse 0;
+        s.aperf = msr.readSafe(IA32_APERF) orelse 0;
     }
     if (has_rapl) {
-        s.pkg_energy = @truncate(msr.rdmsrSafe(MSR_PKG_ENERGY_STATUS) orelse 0);
-        s.pp0_energy = @truncate(msr.rdmsrSafe(MSR_PP0_ENERGY_STATUS) orelse 0);
+        s.pkg_energy = @truncate(msr.readSafe(MSR_PKG_ENERGY_STATUS) orelse 0);
+        s.pp0_energy = @truncate(msr.readSafe(MSR_PP0_ENERGY_STATUS) orelse 0);
     }
     return s;
 }

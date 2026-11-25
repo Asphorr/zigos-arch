@@ -29,27 +29,23 @@ const smp = @import("../cpu/smp.zig");
 const gdt = @import("../cpu/arch/gdt.zig");
 const apic = @import("../irq/apic.zig");
 const std = @import("std");
-
-// MSR numbers
-const MSR_STAR: u32 = 0xC0000081;
-const MSR_LSTAR: u32 = 0xC0000082;
-const MSR_SFMASK: u32 = 0xC0000084;
-const MSR_EFER: u32 = 0xC0000080;
+const msr = @import("../cpu/arch/msr.zig");
+const rflags = @import("../cpu/arch/cr.zig").rflags;
 
 /// Initialize syscall/sysret support on the calling CPU. Picks this CPU's
 /// dedicated entry stub via LAPIC ID and writes it to LSTAR.
 pub fn init() void {
     const debug = @import("../debug/debug.zig");
 
-    // Enable syscall/sysret in EFER (bit 0 = SCE) and NX execution control
-    // (bit 11 = NXE). NXE makes the CPU honor PTE bit 63 (NX) — without it
-    // mprotect's NX flag would be silently ignored. Both are per-CPU MSRs so
-    // every AP runs through this path.
-    var efer = rdmsr(MSR_EFER);
+    // Enable syscall/sysret in EFER (SCE) and NX execution control (NXE).
+    // NXE makes the CPU honor PTE bit 63 (NX) — without it mprotect's NX
+    // flag would be silently ignored. Both are per-CPU MSRs so every AP runs
+    // through this path.
+    var efer = msr.read(msr.EFER);
     debug.klog("[syscall] EFER before: 0x{X:0>16}\n", .{efer});
-    efer |= 1 | (1 << 11);
-    wrmsr(MSR_EFER, efer);
-    efer = rdmsr(MSR_EFER);
+    efer |= msr.Efer.SCE | msr.Efer.NXE;
+    msr.write(msr.EFER, efer);
+    efer = msr.read(msr.EFER);
     debug.klog("[syscall] EFER after: 0x{X:0>16}\n", .{efer});
 
     // STAR: Segment selectors for syscall/sysret
@@ -68,7 +64,7 @@ pub fn init() void {
     //   So: STAR[48:63]+16 = 0x20 → STAR[48:63] = 0x10 ✓
     //       STAR[48:63]+8 = 0x18 → STAR[48:63] = 0x10 ✓
     const star: u64 = (@as(u64, 0x08) << 32) | (@as(u64, 0x10) << 48);
-    wrmsr(MSR_STAR, star);
+    msr.write(msr.STAR, star);
     debug.klog("[syscall] STAR: 0x{X:0>16}\n", .{star});
 
     // LSTAR: this CPU's dedicated entry stub. Picking by LAPIC ID matches
@@ -84,7 +80,7 @@ pub fn init() void {
     }
     const my_id: u8 = @intCast(id_full);
     const stub_addr = @intFromPtr(cpu_entries[my_id]);
-    wrmsr(MSR_LSTAR, stub_addr);
+    msr.write(msr.LSTAR, stub_addr);
     debug.klog("[syscall] LSTAR(cpu{d}): 0x{X:0>16}\n", .{ my_id, stub_addr });
 
     // SFMASK clears IF: the stub runs on the user RSP until it has switched
@@ -94,7 +90,7 @@ pub fn init() void {
     // would then run backwards. TF too: a single step would trap at the
     // stub's first instruction, in ring 0 on the user's RSP. And NT: an
     // iretq with it set faults. SYSRET restores the user's own from R11.
-    wrmsr(MSR_SFMASK, 0x7700); // TF (8) | IF (9) | DF (10) | IOPL (12-13) | NT (14)
+    msr.write(msr.SFMASK, rflags.TF | rflags.IF | rflags.DF | rflags.IOPL | rflags.NT);
     debug.klog("[syscall] syscall/sysret initialized\n", .{});
 }
 
@@ -104,11 +100,11 @@ pub fn init() void {
 /// no allocations); call after init() on every CPU.
 pub fn verifyMsrs(cpu_label: []const u8) void {
     const debug = @import("../debug/debug.zig");
-    const efer = rdmsr(MSR_EFER);
-    const star = rdmsr(MSR_STAR);
-    const lstar = rdmsr(MSR_LSTAR);
+    const efer = msr.read(msr.EFER);
+    const star = msr.read(msr.STAR);
+    const lstar = msr.read(msr.LSTAR);
 
-    if ((efer & 1) == 0) {
+    if (efer & msr.Efer.SCE == 0) {
         debug.klog("[syscall-verify] FAIL {s}: EFER.SCE=0 (efer=0x{X})\n", .{ cpu_label, efer });
         @panic("syscall MSR verify: EFER.SCE not set");
     }
@@ -130,28 +126,6 @@ pub fn verifyMsrs(cpu_label: []const u8) void {
         @panic("syscall MSR verify: LSTAR mismatch");
     }
     debug.klog("[syscall-verify] OK {s}: EFER.SCE=1 STAR ok LSTAR(cpu{d})=0x{X}\n", .{ cpu_label, my_id, lstar });
-}
-
-fn rdmsr(msr: u32) u64 {
-    var low: u32 = undefined;
-    var high: u32 = undefined;
-    asm volatile ("rdmsr"
-        : [low] "={eax}" (low),
-          [high] "={edx}" (high),
-        : [msr] "{ecx}" (msr),
-    );
-    return (@as(u64, high) << 32) | low;
-}
-
-fn wrmsr(msr: u32, value: u64) void {
-    const low: u32 = @truncate(value);
-    const high: u32 = @truncate(value >> 32);
-    asm volatile ("wrmsr"
-        :
-        : [msr] "{ecx}" (msr),
-          [low] "{eax}" (low),
-          [high] "{edx}" (high),
-    );
 }
 
 // --- Per-CPU syscall entry stubs ---

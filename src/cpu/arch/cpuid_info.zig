@@ -19,6 +19,7 @@
 
 const serial = @import("../../debug/serial.zig");
 const acpi = @import("../../acpi/acpi.zig");
+const msr = @import("msr.zig");
 
 const CpuidRegs = struct { eax: u32, ebx: u32, ecx: u32, edx: u32 };
 
@@ -38,25 +39,12 @@ inline fn cpuid(leaf: u32, subleaf: u32) CpuidRegs {
     return .{ .eax = eax, .ebx = ebx, .ecx = ecx, .edx = edx };
 }
 
-inline fn rdmsr(msr: u32) u64 {
-    var lo: u32 = undefined;
-    var hi: u32 = undefined;
-    asm volatile ("rdmsr"
-        : [_] "={eax}" (lo),
-          [_] "={edx}" (hi),
-        : [_] "{ecx}" (msr),
-    );
-    return (@as(u64, hi) << 32) | lo;
-}
-
-inline fn wrmsr(msr: u32, value: u64) void {
-    asm volatile ("wrmsr"
-        :
-        : [_] "{ecx}" (msr),
-          [_] "{eax}" (@as(u32, @truncate(value))),
-          [_] "{edx}" (@as(u32, @truncate(value >> 32))),
-    );
-}
+/// Microcode revision: Intel's IA32_BIOS_SIGN_ID, AMD's PATCH_LEVEL.
+const MSR_MICROCODE_REV: u32 = 0x8B;
+const MSR_MTRR_CAP: u32 = 0xFE;
+/// PHYSBASE_n at +2n, PHYSMASK_n at +2n+1.
+const MSR_MTRR_PHYS_BASE0: u32 = 0x200;
+const MSR_MTRR_DEF_TYPE: u32 = 0x2FF;
 
 /// Verify required CPU features are present. Refuses to boot with a
 /// clear message if any are missing — better than the default behavior
@@ -184,8 +172,8 @@ pub fn dumpMtrrs() void {
         mtrr_en: bool,
         _r2: u52,
     };
-    const cap: MtrrCap = @bitCast(rdmsr(0xFE));
-    const def: MtrrDef = @bitCast(rdmsr(0x2FF));
+    const cap: MtrrCap = @bitCast(msr.read(MSR_MTRR_CAP));
+    const def: MtrrDef = @bitCast(msr.read(MSR_MTRR_DEF_TYPE));
 
     serial.print("[mtrr] cap: vcnt={d} fixed={s} wc={s}\n", .{
         cap.vcnt,
@@ -200,13 +188,13 @@ pub fn dumpMtrrs() void {
 
     if (!def.mtrr_en) return;
 
-    // Variable MTRRs: pairs at 0x200 (PHYSBASE_n) / 0x201 (PHYSMASK_n).
+    // Variable MTRRs, in PHYSBASE_n / PHYSMASK_n pairs.
     // PHYSBASE: bits 7:0 = type, 12+ = base phys.
     // PHYSMASK: bit 11 = valid, 12+ = mask. Length = ~mask + 1 (in pages).
     var i: u8 = 0;
     while (i < cap.vcnt and i < 16) : (i += 1) {
-        const base = rdmsr(0x200 + @as(u32, i) * 2);
-        const mask = rdmsr(0x201 + @as(u32, i) * 2);
+        const base = msr.read(MSR_MTRR_PHYS_BASE0 + @as(u32, i) * 2);
+        const mask = msr.read(MSR_MTRR_PHYS_BASE0 + @as(u32, i) * 2 + 1);
         if (mask & (1 << 11) == 0) continue; // not valid → skip
         const t: u8 = @truncate(base & 0xFF);
         const phys_base = base & addr_mask;
@@ -337,19 +325,19 @@ pub fn dumpCpuInfo() void {
     }
 
     // --- Microcode revision ---
-    // Intel (IA32_BIOS_SIGN_ID): write 0 to MSR 0x8B, execute CPUID(1),
-    // then read MSR 0x8B; loaded revision is in bits 63:32.
+    // Intel (IA32_BIOS_SIGN_ID): write 0 to the MSR, execute CPUID(1),
+    // then read it; loaded revision is in bits 63:32.
     // AMD (MSR_AMD64_PATCH_LEVEL): same MSR number, but read directly
     // with the patch level in bits 31:0 — no zero+cpuid dance required.
     // Doing the Intel dance on AMD then reading bits 63:32 returns 0,
     // which is what the previous version of this code reported (wrong).
     const is_amd = v.ebx == 0x68747541; // "Auth" (AuthenticAMD)
     const ucode_rev: u32 = if (is_amd) blk: {
-        break :blk @truncate(rdmsr(0x8B));
+        break :blk @truncate(msr.read(MSR_MICROCODE_REV));
     } else blk: {
-        wrmsr(0x8B, 0);
+        msr.write(MSR_MICROCODE_REV, 0);
         _ = cpuid(1, 0);
-        break :blk @truncate(rdmsr(0x8B) >> 32);
+        break :blk @truncate(msr.read(MSR_MICROCODE_REV) >> 32);
     };
     serial.print("[cpu] microcode rev=0x{X}\n", .{ucode_rev});
 

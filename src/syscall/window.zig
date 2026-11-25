@@ -373,7 +373,7 @@ pub fn sysCreateWindow(alloc_width_in: u32, alloc_height: u32, display_wh: u32) 
             gpu_comp.releaseWindowImage(img.slot, lead.tgid);
             return E_INVAL;
         }
-        asm volatile ("movq %%cr3, %%rax\n movq %%rax, %%cr3" ::: .{ .rax = true });
+        paging.flushTLB();
         kern_fb = img.fb;
         // No PMM allocation, no triple-buffer backs. Apps that call
         // sysPresent on a slot-backed window still bump
@@ -428,7 +428,7 @@ pub fn sysCreateWindow(alloc_width_in: u32, alloc_height: u32, display_wh: u32) 
             return E_INVAL;
         }
         paging.registerGuiFB(pid, phys_base);
-        asm volatile ("movq %%cr3, %%rax\n movq %%rax, %%cr3" ::: .{ .rax = true });
+        paging.flushTLB();
         kern_fb = @ptrFromInt(phys_base.toVirt().raw());
         // kern_fb_backs stays { null, null, null } — snapshotGuiFb will
         // populate on first present (or skip cleanly on alloc failure,

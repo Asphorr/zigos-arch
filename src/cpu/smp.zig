@@ -5,6 +5,7 @@ const acpi = @import("../acpi/acpi.zig");
 const paging = @import("../mm/paging.zig");
 const pmm = @import("../mm/pmm.zig");
 const gdt = @import("arch/gdt.zig");
+const msr = @import("arch/msr.zig");
 const vfs = @import("../fs/vfs.zig");
 const elf_loader = @import("../proc/elf_loader.zig");
 const process = @import("../proc/process.zig");
@@ -331,14 +332,13 @@ comptime {
 pub var cpu_count: u8 = 1;
 var smp_initialized: bool = false;
 
-/// IA32_TSC_AUX — `rdtscp` returns it in ECX with no VM exit. Each CPU
-/// stores its LAPIC id there (armTscAux, from initPerCpuAsm) and myCpuId()
-/// reads it back with rdtscp instead of the LAPIC ID register. Measured on
-/// zigvm (nested Hyper-V → KVM, x2APIC; benchCpuIdRead prints it every
-/// boot): 14–31k cycles per LAPIC ID read — `rdmsr 0x802` is an exit —
-/// against a few dozen per rdtscp, and a plain SpinLock.acquire, the Mutex
-/// fast path, every IRQ0 tick and every Deadline each pay one read.
-const IA32_TSC_AUX: u32 = 0xC000_0103;
+// IA32_TSC_AUX (msr.TSC_AUX) — `rdtscp` returns it in ECX with no VM exit.
+// Each CPU stores its LAPIC id there (armTscAux, from initPerCpuAsm) and
+// myCpuId() reads it back with rdtscp instead of the LAPIC ID register.
+// Measured on zigvm (nested Hyper-V → KVM, x2APIC; benchCpuIdRead prints it
+// every boot): 14–31k cycles per LAPIC ID read — `rdmsr 0x802` is an exit —
+// against a few dozen per rdtscp, and a plain SpinLock.acquire, the Mutex
+// fast path, every IRQ0 tick and every Deadline each pay one read.
 
 /// True while every online CPU identifies itself through TSC_AUX. The BSP
 /// sets it once its own round trip (wrmsr, rdtscp, compare) passed; a CPU
@@ -1241,15 +1241,6 @@ fn initPerCpuAsm(cpu_id: u8) void {
     armTscAux(cpu_id);
 }
 
-inline fn wrmsr(msr: u32, val: u64) void {
-    asm volatile ("wrmsr"
-        :
-        : [msr] "{ecx}" (msr),
-          [lo] "{eax}" (@as(u32, @truncate(val))),
-          [hi] "{edx}" (@as(u32, @truncate(val >> 32))),
-    );
-}
-
 /// Store this CPU's id in IA32_TSC_AUX and prove the round trip. Runs
 /// before the IDT is loaded on this CPU (AP bring-up, S3 resume), so the
 /// write is the plain wrmsr gated on CPUID — RDTSCP present implies the
@@ -1266,13 +1257,13 @@ inline fn wrmsr(msr: u32, val: u64) void {
 fn armTscAuxQuiet(cpu_id: u8) bool {
     if (@atomicLoad(bool, &tsc_aux_refused, .monotonic)) return false;
     if (hasRdtscp()) {
-        wrmsr(IA32_TSC_AUX, cpu_id);
+        msr.write(msr.TSC_AUX, cpu_id);
         if (rdtscpAux() == cpu_id) {
             if (cpu_id == 0) @atomicStore(bool, &cpu_id_via_aux, true, .release);
             return true;
         }
         // Don't leave a lying aux behind for a future direct rdtscp reader.
-        wrmsr(IA32_TSC_AUX, 0);
+        msr.write(msr.TSC_AUX, 0);
     }
     @atomicStore(bool, &tsc_aux_refused, true, .monotonic);
     @atomicStore(bool, &cpu_id_via_aux, false, .monotonic);
@@ -1505,9 +1496,7 @@ pub fn apProcessLoadQueue() void {
     // for I/O, restore at end via pcid.restoreSaved so the caller's TLB
     // is preserved if it had a tagged address space loaded.
     const pcid_mod = @import("mmu/pcid.zig");
-    const caller_pd: u64 = asm volatile ("mov %%cr3, %[r]"
-        : [r] "=r" (-> u64),
-    );
+    const caller_pd: u64 = @import("arch/cr.zig").cr3.read();
     pcid_mod.loadCr3(paging.getKernelPML4Phys(), 0, myCpu().cpu_id);
     const t_after_cr3 = perf.rdtsc();
 
