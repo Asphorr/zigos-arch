@@ -4,6 +4,8 @@
 // once.
 
 const gfx = @import("../gfx.zig");
+const display = @import("../display.zig");
+const frameperf = @import("frameperf.zig");
 const cells = @import("term/cells.zig");
 const FONT_H = cells.FONT_H;
 const term_view = @import("term/view.zig");
@@ -14,6 +16,7 @@ const slot_used = &wm.slot_used;
 const z_stack = &wm.z_stack;
 const dirty_rects_mod = @import("dirty.zig");
 const addDirtyRect = dirty_rects_mod.add;
+const resetDirtyRects = dirty_rects_mod.reset;
 const toast = @import("toast.zig");
 const menubar = @import("menubar.zig");
 const dock = @import("dock.zig");
@@ -28,6 +31,13 @@ const TITLEBAR_H = layout.TITLEBAR_H;
 const BORDER = layout.BORDER;
 const MAX_WINDOWS: u32 = @import("../../config.zig").MAX_WINDOWS;
 const manage = @import("manage.zig");
+const screen = @import("screen.zig");
+const swCursorActive = screen.swCursorActive;
+const eraseCursor = screen.eraseCursor;
+const drawCursorOnScreen = screen.drawCursorOnScreen;
+const bakeCursorToBackBuffer = screen.bakeCursorToBackBuffer;
+const unbakeCursorFromBackBuffer = screen.unbakeCursorFromBackBuffer;
+const blitWindowBounds = screen.blitWindowBounds;
 
 const chrome = @import("chrome.zig");
 const damage = @import("damage.zig");
@@ -240,6 +250,17 @@ pub fn occludersAbove(i: u8, out: [][4]i32) usize {
     }
     return n;
 }
+
+// ─── Region repaint ─────────────────────────────────────────────────────────
+// Frames that change a few known spots — terminal output, a window drag, an
+// overlay appearing or moving — repaint only those spots instead of the whole
+// scene, and hand only those rects to the flush and the GPU compositor. Each
+// seed rect grows to the closure of every alpha layer it touches (window
+// shadows, icon cells, glass bands and overlays all blend over or read the
+// pixels beneath them, so each must lie wholly on freshly restored wallpaper
+// or its blend accumulates: the shadow-darkening bug class). Intersecting
+// closures merge; each disjoint region is then painted in renderScene's
+// order, pixel-identical to renderScene inside it, untouched outside.
 
 // Glass reach: the menubar's blurRegion radius 6 (+saturate), the dock's
 // fillGlass radius 8 + pill soft shadow +2, and the overlays' fillGlass
@@ -467,4 +488,176 @@ pub fn renderRegions(use_hw_cursor: bool) bool {
     // buttons) may have landed outside every region.
     return sameRect(dock.tooltip_painted, ov.tip) and sameRect(toast.painted, ov.toast) and
         sameRect(context_menu.painted, ov.menu) and sameRect(launcher.painted, ov.launcher);
+}
+
+/// Stamp the new frames of GUI windows into the back buffer: each window
+/// with a frame pending (a present, or an auto-refresh look that found new
+/// pixels) and some of itself showing. Returns the frame's kind, raised to
+/// .gui_only when a window was stamped and nothing more was due.
+pub fn recomposite(kind: DirtyKind) DirtyKind {
+    var dirty = kind;
+    for (z_stack[0..wm.z_count], 0..) |gi, z_pos| {
+        if (windows[gi].gui_present_pending and windows[gi].visible) {
+            // Hidden whole behind another window: the frame stays
+            // pending until some of the window shows.
+            if (windowCovered(z_pos, gi)) continue;
+            windows[gi].gui_present_pending = false;
+            const w = &windows[gi];
+            w.content_seq +%= 1;
+            addDirtyRect(
+                if (w.x < 0) 0 else @intCast(w.x),
+                if (w.y < 0) 0 else @intCast(w.y),
+                w.width + BORDER * 2 + 4,
+                w.height + TITLEBAR_H + BORDER * 2 + 4,
+            );
+            if (screen.backbuf != null) {
+                renderWindow(gi);
+                // Re-paint any visible windows z-above `gi` that overlap
+                // its rect. renderWindow stamps pixels into the back
+                // buffer at the window's screen position regardless of
+                // z-order — without this loop, a background-spawned GUI
+                // updating its FB clobbers the focused terminal above
+                // it in the overlap area (visible as flicker on each
+                // cursor blink). renderScene's bottom→top iteration
+                // handles this correctly; `.gui_only` was the partial-
+                // render path that skipped it.
+                repaintZAboveOverlapping(gi);
+            }
+            if (dirty == .none or dirty == .cursor_only) dirty = .gui_only;
+        }
+    }
+    return dirty;
+}
+
+/// Bring the frame to the display: paint into the back buffer what its kind
+/// calls for, copy the changed part to the screen, flush it, and tell the
+/// GPU compositor (mode 9). The software pointer is stamped over the copy on
+/// its way out and never left in the back buffer.
+pub fn present(dirty: DirtyKind, use_hw_cursor: bool) void {
+    if (screen.backbuf != null) {
+        switch (dirty) {
+            .full => {
+                renderScene();
+                // Reverted partial-blit optimization here while
+                // diagnosing a stale-pixel ghost on the cube window —
+                // full blit is the safe path. Re-enable once the
+                // ghost cause is found.
+                if (!use_hw_cursor) bakeCursorToBackBuffer();
+                gfx.blitToScreen();
+                if (!use_hw_cursor) unbakeCursorFromBackBuffer();
+                display.flush();
+                resetDirtyRects();
+            },
+            .drag, .region => {
+                // Tight path (hw cursor only): repaint just the closed
+                // regions and flush their rects. Falls back to the full-
+                // scene path when renderRegions' preconditions don't hold.
+                if (renderRegions(use_hw_cursor)) {
+                    const dr_count = dirty_rects_mod.rectCount(); // can flip to full on cap overflow
+                    if (dirty_rects_mod.isFull()) {
+                        gfx.blitToScreen();
+                        display.flush();
+                    } else {
+                        var bi: u8 = 0;
+                        while (bi < dr_count) : (bi += 1) {
+                            const r = dirty_rects_mod.getRect(bi);
+                            gfx.blitRectToScreen(r[0], r[1], r[2], r[3]);
+                        }
+                        var fi: u8 = 0;
+                        while (fi < dr_count) : (fi += 1) {
+                            const r = dirty_rects_mod.getRect(fi);
+                            display.flushRect(r[0], r[1], r[2], r[3]);
+                        }
+                    }
+                    // Mode 9: rect snapshot → GPU compositor (no-op otherwise).
+                    @import("../gpu_compositor.zig").requestRenderFromDirty();
+                    resetDirtyRects();
+                } else {
+                    frameperf.regionFallback();
+                    renderScene();
+                    if (!use_hw_cursor) bakeCursorToBackBuffer();
+                    gfx.blitToScreen();
+                    if (!use_hw_cursor) unbakeCursorFromBackBuffer();
+                    display.flush();
+                    resetDirtyRects();
+                }
+            },
+            .gui_only => {
+                // GUI app content update — only blit the window's dirty rect
+                if (!use_hw_cursor) bakeCursorToBackBuffer();
+                const dr_count = dirty_rects_mod.rectCount();
+                if (dr_count > 0) {
+                    var di: u8 = 0;
+                    while (di < dr_count) : (di += 1) {
+                        const r = dirty_rects_mod.getRect(di);
+                        gfx.blitRectToScreen(r[0], r[1], r[2], r[3]);
+                    }
+                } else {
+                    gfx.blitToScreen();
+                }
+                if (!use_hw_cursor) unbakeCursorFromBackBuffer();
+                if (dr_count > 0) {
+                    var di: u8 = 0;
+                    while (di < dr_count) : (di += 1) {
+                        const r = dirty_rects_mod.getRect(di);
+                        display.flushRect(r[0], r[1], r[2], r[3]);
+                    }
+                } else {
+                    display.flush();
+                }
+                // Mode 9: hand the rect snapshot to the GPU compositor
+                // before the reset clears them. requestRenderFromDirty
+                // is a no-op when not in mode 9 (compositor task isn't up).
+                @import("../gpu_compositor.zig").requestRenderFromDirty();
+                resetDirtyRects();
+            },
+            .text_only => {
+                const cw = &windows[wm.focused];
+                if (cw.term != null and cw.visible and !cw.minimized) {
+                    renderTerminalRow(wm.focused);
+                    const ct = cw.term.?;
+                    const content_y = cw.y + @as(i32, TITLEBAR_H);
+                    const ry = content_y + @as(i32, @intCast(@as(u32, ct.text_row) * FONT_H));
+                    if (ry >= 0) {
+                        const uy: u32 = @intCast(ry);
+                        if (!use_hw_cursor) eraseCursor();
+                        gfx.blitRectToScreen(if (cw.x < 0) 0 else @intCast(cw.x), uy, cw.width, FONT_H);
+                        if (swCursorActive(use_hw_cursor)) drawCursorOnScreen();
+                        // Partial flush: just the text row band
+                        display.flushRect(0, uy, gfx.screen_w, FONT_H);
+                        // Mode 9: terminal row → compositor.
+                        const cwx: u32 = if (cw.x < 0) 0 else @intCast(cw.x);
+                        @import("../gpu_compositor.zig").requestRenderRect(cwx, uy, cw.width, FONT_H);
+                    }
+                } else {
+                    renderWindow(wm.focused);
+                    if (!use_hw_cursor) eraseCursor();
+                    blitWindowBounds(wm.focused);
+                    if (swCursorActive(use_hw_cursor)) drawCursorOnScreen();
+                    // Flush window region
+                    {
+                        const fy: u32 = if (cw.y < 0) 0 else @intCast(cw.y);
+                        display.flushRect(0, fy, gfx.screen_w, cw.height + TITLEBAR_H + 8);
+                    }
+                    // Mode 9: window region → compositor.
+                    const wy: u32 = if (cw.y < 0) 0 else @intCast(cw.y);
+                    @import("../gpu_compositor.zig").requestRenderRect(0, wy, gfx.screen_w, cw.height + TITLEBAR_H + 8);
+                }
+            },
+            .cursor_only => {
+                if (!use_hw_cursor) {
+                    eraseCursor();
+                    if (swCursorActive(use_hw_cursor)) drawCursorOnScreen();
+                    // Software cursor: flush cursor bands
+                    display.flush();
+                }
+                // Hardware cursor: nothing to flush (moveCursor already sent)
+            },
+            .none => {},
+        }
+    } else if (dirty != .none) {
+        renderScene();
+        if (swCursorActive(use_hw_cursor)) drawCursorOnScreen();
+        display.flush();
+    }
 }

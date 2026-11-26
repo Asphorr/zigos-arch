@@ -4,7 +4,9 @@
 // window's content.
 
 const mouse = @import("../../driver.zig").mouse;
+const keyboard = @import("../../driver.zig").keyboard;
 const process = @import("../../proc/process.zig");
+const debug = @import("../../debug/debug.zig");
 const events_mod = @import("../events.zig");
 const EventKind = events_mod.EventKind;
 const wm = @import("window.zig");
@@ -13,11 +15,34 @@ const slot_used = &wm.slot_used;
 const windowAt = wm.windowAt;
 const isInTitlebar = wm.isInTitlebar;
 const isOnResizeEdge = wm.isOnResizeEdge;
+const setFocused = wm.setFocused;
+const cycleFocus = wm.cycleFocus;
 const context_menu = @import("context_menu.zig");
 const launcher = @import("launcher.zig");
+const dock = @import("dock.zig");
 const wake = @import("wake.zig");
 const layout = @import("layout.zig");
 const TITLEBAR_H = layout.TITLEBAR_H;
+
+const damage = @import("damage.zig");
+const DirtyKind = damage.DirtyKind;
+const seedRect = damage.seedRect;
+const wantRegion = damage.wantRegion;
+const wantTextRow = damage.wantTextRow;
+const manage = @import("manage.zig");
+const toggleFullscreen = manage.toggleFullscreen;
+const runLauncherResult = manage.runLauncherResult;
+const handleMouseEvents = manage.handleMouseEvents;
+const client = @import("client.zig");
+const createWindow = client.createWindow;
+const emulator = @import("term/emulator.zig");
+const TERM_ROWS = emulator.TERM_ROWS;
+const cells = @import("term/cells.zig");
+const FONT_H = cells.FONT_H;
+const TERM_WIN_W = cells.TERM_WIN_W;
+const session = @import("term/session.zig");
+const termPrompt = session.termPrompt;
+const handleKeyboard = session.handleKeyboard;
 
 pub var prev_buttons: u8 = 0;
 
@@ -168,4 +193,261 @@ pub fn publishMouseToFocused(prev_btns: u8, cur_btns: u8, moved: bool, wheel: i3
             .c = cur_y,
         });
     }
+}
+
+// DBG: input-pipeline diagnostic counters. Bumped from desktop's drain
+// loop when chars get dropped. Read by manual klog dumps when input
+// behavior is unexpected. Rate-limited so we don't flood the log.
+pub var dbg_focus_drop_count: u64 = 0;
+pub var dbg_event_queue_full: u64 = 0;
+pub var dbg_last_focus_drop_log: u64 = 0;
+pub var dbg_last_qfull_log: u64 = 0;
+
+/// The keyboard's part of a pass of the loop. The chords the desktop keeps
+/// for itself come first (F10, Ctrl+C, Alt+Tab, the launcher's), then the
+/// launcher while it is open, then the focused window: every key becomes an
+/// event in its queue, and a terminal's goes on to its shell or its console.
+/// Returns the frame's kind raised by what the keys changed.
+pub fn keys(frame_kind: DirtyKind) DirtyKind {
+    var dirty = frame_kind;
+    // Keyboard — route to focused window
+    // When a GUI app is focused, leave keys in the buffer for the app's readChar
+    // Global keyboard intercepts (work regardless of focused window type).
+    // F-keys live in a separate desktop-only ring so a fullscreen GUI app
+    // (DOOM) can't drain them in its readChar polling loop before this
+    // intercept runs.
+    if (keyboard.peekGlobal()) |pk| {
+        if (pk == 0x99) { // F10 — toggle fullscreen
+            _ = keyboard.popGlobal();
+            if (slot_used[wm.focused] and windows[wm.focused].visible) {
+                toggleFullscreen(wm.focused);
+                dirty = .full;
+            }
+        } else if (pk == keyboard.KEY_SIGINT) {
+            // Ctrl+C — post SIGINT to the focused window's process. Default
+            // action terminates; apps that want to handle (shell forwarding
+            // to a child, editor cancelling a search, etc.) install a
+            // sigaction(SIGINT, ...) handler.
+            _ = keyboard.popGlobal();
+            if (slot_used[wm.focused] and windows[wm.focused].visible) {
+                // Terminal windows use shell_pid; GUI windows use owner_pid.
+                // Reading the wrong one earlier silently dropped Ctrl+C in
+                // every terminal because owner_pid stays 0xFF for them.
+                const fw = &windows[wm.focused];
+                const target: u8 = if (fw.term != null) fw.shell_pid else fw.owner_pid;
+                if (target != 0xFF) _ = @import("../../proc/signals.zig").send(target, @import("../../proc/signals.zig").SIGINT);
+            }
+        } else {
+            // Drain unrecognized F-keys so the ring doesn't fill.
+            _ = keyboard.popGlobal();
+        }
+    }
+    if (keyboard.alt_held) {
+        if (keyboard.peek()) |pk| {
+            if (pk == 0x09) { // Alt+Tab
+                _ = keyboard.pop();
+                cycleFocus();
+                dirty = .full;
+            }
+        }
+    }
+    // Ctrl+Space or Alt+Space opens the launcher; open, it takes every
+    // key until it closes.
+    if (!launcher.active and (keyboard.ctrl_held or keyboard.alt_held)) {
+        if (keyboard.peek()) |pk| {
+            if (pk == ' ') {
+                _ = keyboard.pop();
+                context_menu.close();
+                launcher.open();
+                wantRegion(&dirty);
+            }
+        }
+    }
+    while (launcher.active) {
+        const ch = keyboard.pop() orelse break;
+        const res = launcher.key(ch);
+        switch (res) {
+            .none => {},
+            // The selection or the query changed inside the same rect.
+            .changed => {
+                if (launcher.rect()) |r| seedRect(r);
+                wantRegion(&dirty);
+            },
+            .closed => wantRegion(&dirty),
+            .launch => dirty = .full,
+        }
+        runLauncherResult(res);
+    }
+
+    // Desktop is the sole drainer of `keyboard.buffer`. For every
+    // popped key:
+    //   - publish an event into the focused window's events queue
+    //     (consumed by app via `sysPollEvent` / legacy `sysRead`);
+    //   - if focused window is a terminal, also run the existing
+    //     handleKeyboard path that writes the char into kb_pipe so
+    //     the user-space shell keeps reading from fd 0 unchanged.
+    // No focus → drop keystrokes silently. (Used to be: drop for
+    // GUI focus, terminal-focus path drains via legacy.)
+    const focus_ok = slot_used[wm.focused] and windows[wm.focused].visible and !windows[wm.focused].minimized;
+    // DBG: when focus check fails AND there are pending keys, log so
+    // we know chars are being dropped at the desktop drain. Rate-limit
+    // to once per 100 ticks.
+    if (!focus_ok and keyboard.hasData()) {
+        dbg_focus_drop_count +%= 1;
+        if (process.tick_count -% dbg_last_focus_drop_log >= 100) {
+            dbg_last_focus_drop_log = process.tick_count;
+            debug.klog("[kbd-drop] focus invalid (focused={d} slot_used={any} visible={any} minimized={any}) — drop_count={d}\n", .{
+                wm.focused,
+                slot_used[wm.focused],
+                if (slot_used[wm.focused]) windows[wm.focused].visible else false,
+                if (slot_used[wm.focused]) windows[wm.focused].minimized else false,
+                dbg_focus_drop_count,
+            });
+        }
+    }
+    if (focus_ok) {
+        const w = &windows[wm.focused];
+        const is_terminal = w.term != null;
+        while (keyboard.pop()) |ch| {
+            // Publish the event. Special key codes (KEY_UP, KEY_F1, ...)
+            // are 0x80..0x9F per keyboard.zig; everything else is a
+            // post-translation char.
+            const kind: u8 = if (ch >= 0x80 and ch <= 0x9F)
+                @intFromEnum(EventKind.key_special)
+            else
+                @intFromEnum(EventKind.key_char);
+            const mods: u32 =
+                (@as(u32, @intFromBool(keyboard.shift_held)) << 0) |
+                (@as(u32, @intFromBool(keyboard.ctrl_held)) << 1) |
+                (@as(u32, @intFromBool(keyboard.alt_held)) << 2) |
+                (@as(u32, @intFromBool(keyboard.caps_lock)) << 3);
+            const queued = w.events.tryPush(.{ .kind = kind, .a = ch, .b = mods });
+            // Wake any io_uring OP_POLL waiters on a console fd. We
+            // can't filter by which pid owns the focused window here
+            // (fdpoll's wake walk does pollMaskConsole, which re-runs
+            // the focus/visibility/owner check), so the broadcast
+            // (.console, 0xFFFF) lets the matcher do its job.
+            if (queued) {
+                @import("../../ipc/fdpoll.zig").wakePollers(.console, 0xFFFF);
+            }
+            if (!queued) {
+                // Queue full, event dropped.
+                dbg_event_queue_full +%= 1;
+                if (process.tick_count -% dbg_last_qfull_log >= 100) {
+                    dbg_last_qfull_log = process.tick_count;
+                    const target_pid = if (is_terminal) w.shell_pid else w.owner_pid;
+                    var t_state: u8 = 0xFF;
+                    var t_assigned: u8 = 0xFF;
+                    var t_vruntime: u64 = 0;
+                    var t_wait: u8 = 0xFF;
+                    if (target_pid < process.MAX_PROCS) {
+                        const tp = &process.procs[target_pid];
+                        t_state = @intFromEnum(tp.state);
+                        t_assigned = tp.assigned_cpu;
+                        t_vruntime = tp.vruntime;
+                        t_wait = @intFromEnum(tp.wait_kind);
+                    }
+                    debug.klog("[kbd-drop] events FULL pid={d} term={any} drops={d} kb_drop={d} state={d} cpu={d} wait={d} vruntime={d}\n", .{
+                        target_pid,
+                        is_terminal,
+                        dbg_event_queue_full,
+                        @atomicLoad(u64, &keyboard.dbg_push_dropped, .monotonic),
+                        t_state,
+                        t_assigned,
+                        t_wait,
+                        t_vruntime,
+                    });
+                    // Per-CPU rq snapshot — see if shell is even in the rq
+                    // and if any band has a stuck-huge floor (would explain
+                    // CFS picker passing it over every time).
+                    const smp_mod = @import("../../cpu/smp.zig");
+                    var ci: u8 = 0;
+                    while (ci < smp_mod.MAX_CPUS) : (ci += 1) {
+                        if (!smp_mod.cpus[ci].alive) continue;
+                        const rq = &smp_mod.cpus[ci].runqueue;
+                        debug.klog("[kbd-drop]  cpu{d}: nr_run={d} (i={d} n={d} bg={d}) min_vr i={d} n={d} bg={d} sched={d}\n", .{
+                            ci,
+                            rq.nr_runnable,
+                            rq.interactive.count, rq.normal.count, rq.background.count,
+                            rq.min_vruntime[2], rq.min_vruntime[1], rq.min_vruntime[0],
+                            @atomicLoad(u64, &smp_mod.cpus[ci].schedule_count, .monotonic),
+                        });
+                    }
+                }
+            }
+
+            if (is_terminal) {
+                // ESC: a Linux program's key; our own shell has no use for it.
+                if (ch == 0x1B and !@import("../../tty/tty.zig").hasLinuxProgram(w.tty)) continue;
+                if (ch == 0x14) { // Ctrl+T: spawn new terminal
+                    // window_count is u8; widen before the multiply or `9 * 30 = 270`
+    // overflows u8 arithmetic and Zig's runtime safety panics.
+    const off: i32 = @intCast(@as(u32, wm.window_count) * 30);
+                    const nw: u32 = TERM_WIN_W;
+                    const nh: u32 = TERM_ROWS * FONT_H + TITLEBAR_H;
+                    if (createWindow("Terminal", 80 + off, 40 + off, nw, nh)) |ni| {
+                        setFocused(ni);
+                        termPrompt(&windows[ni]);
+                        dirty = .full;
+                    }
+                } else {
+                    const needs_full = handleKeyboard(w, ch);
+                    if (needs_full) dirty = .full else wantTextRow(&dirty);
+                }
+            }
+        }
+    }
+    return dirty;
+}
+
+/// The pointer's part of a pass: the buttons as played back, what the desktop
+/// makes of them (manage.handleMouseEvents), what the focused program is
+/// told, and the dock's hover. `cursor_moved`: mouse.moved as the pass found
+/// it; it is cleared here, once it has been published. Returns the frame's
+/// kind raised by what the pointer changed.
+pub fn pointer(kind: DirtyKind, cursor_moved: bool) DirtyKind {
+    var dirty = kind;
+    if (cursor_moved or mouse.buttons != prev_buttons or pressReplayPending() or mouse.wheel != 0) {
+        const btn = frameButtons();
+        const prev = prev_buttons;
+        const moved = mouse.moved;
+        mouse.moved = false;
+        // handleMouseEvents drains the wheel; the focused app gets the
+        // same notches.
+        const wheel = mouse.wheel;
+        const press_target = pressTarget();
+        const mr = handleMouseEvents(btn);
+        // After the desktop has acted: focus has settled, so the click
+        // that focused a window reaches that window.
+        publishMouseToFocused(prev, btn, moved, wheel, press_target);
+        switch (mr) {
+            .full => dirty = .full,
+            .drag => switch (dirty) {
+                .full => {},
+                // A pending row (keypress / cursor blink) rides along with
+                // the drag's regions.
+                .text_only => {
+                    damage.text_row_pending = true;
+                    dirty = .drag;
+                },
+                else => dirty = .drag,
+            },
+            .region => wantRegion(&dirty),
+            else => {},
+        }
+        if (cursor_moved and dirty == .none) dirty = .cursor_only;
+    }
+
+    // Dock hover tracking for tooltips. A tooltip that appears, moves or
+    // vanishes is repainted by renderRegions.
+    if (cursor_moved) switch (dock.updateHover(mouse.x, mouse.y, !context_menu.active)) {
+        .none => {},
+        .tooltip => wantRegion(&dirty),
+        .item => {
+            // The hover highlight is painted in the pill.
+            if (dock.pillRect()) |r| seedRect(r);
+            wantRegion(&dirty);
+        },
+    };
+    return dirty;
 }

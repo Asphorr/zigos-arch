@@ -9,6 +9,7 @@ const paging = @import("../../mm/paging.zig");
 const pmm = @import("../../mm/pmm.zig");
 const debug = @import("../../debug/debug.zig");
 const process = @import("../../proc/process.zig");
+const elf_loader = @import("../../proc/elf_loader.zig");
 const sound = @import("../../driver.zig").sound;
 const events_mod = @import("../events.zig");
 const Event = events_mod.Event;
@@ -47,7 +48,6 @@ const input = @import("input.zig");
 const manage = @import("manage.zig");
 
 const surface = @import("surface.zig");
-const desktop = @import("../desktop.zig");
 
 pub fn createWindow(title: []const u8, x: i32, y: i32, w: u32, h: u32) ?u8 {
     // Terminal data is vmalloc'd: allocate and free it outside windows_lock
@@ -372,10 +372,9 @@ pub const Standing = enum { focused, on_screen };
 /// window's shell — a tool run in the terminal, a helper the app started.
 /// Gates what is the user's rather than any program's: the key table, the
 /// clipboard, the pointer, the wallpaper. An orphan is init's child and
-/// stands behind nothing.
+/// stands behind nothing. Asked only while there is a desktop: with none
+/// there is one console and nobody to take from (desktop.actsFor).
 pub fn actsFor(pid: u8, standing: Standing) bool {
-    // No desktop: one console, nobody to take from.
-    if (!desktop.active) return true;
     var cur = pid;
     var hops: u8 = 0;
     while (hops < 16 and cur < process.MAX_PROCS) : (hops += 1) {
@@ -644,4 +643,18 @@ pub fn getWindowAllocSize(pid: u8, buf: [*]u32) void {
     }
     buf[0] = 0;
     buf[1] = 0;
+}
+
+/// Start wallpaper.elf, the helper that reads /etc/zigos.conf, decodes the
+/// picture it names and hands the pixels over with sysSetWallpaper. With no
+/// picture configured, or no such file, the gradient stays. Not waited for:
+/// a slow decode does not hold the boot.
+pub fn startWallpaperHelper() void {
+    if (@import("../../fs/vfs.zig").loadFileFresh("wallpaper.elf")) |fresh| {
+        if (elf_loader.loadAndStart(fresh.buf, fresh.size, fresh.pages, fresh.inode, null)) |wpid| {
+            @atomicStore(u8, &wallpaper_helper, @intCast(wpid), .monotonic);
+            process.setName(@intCast(wpid), "wallpaper");
+            debug.klog("[desktop] wallpaper.elf spawned pid={d}\n", .{wpid});
+        }
+    }
 }

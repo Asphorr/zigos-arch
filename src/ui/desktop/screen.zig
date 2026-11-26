@@ -5,6 +5,7 @@
 
 const gfx = @import("../gfx.zig");
 const bga = @import("../../driver.zig").bga;
+const vga = @import("../../driver.zig").vga;
 const display = @import("../display.zig");
 const mouse = @import("../../driver.zig").mouse;
 const paging = @import("../../mm/paging.zig");
@@ -212,6 +213,97 @@ pub fn unbakeCursorFromBackBuffer() void {
                 const off = @as(u32, @intCast(sy)) * gfx.target_w + @as(u32, @intCast(sx));
                 gfx.target[off] = cursor_save_buf[row * CURSOR_W + col];
             }
+        }
+    }
+}
+
+/// Pick the display (scanout.zig) and the surface the desktop draws into.
+/// Null, with a line on the text console, when there is no display.
+pub fn bringUp() ?@import("../scanout.zig").Scanout {
+    const virtio_gpu = @import("../../driver.zig").virtio_gpu;
+    const gop = @import("../../driver.zig").gop_fb;
+
+    // Device selection (virtio-gpu → BGA → GOP) lives in ui/scanout.zig so the
+    // installer boots onto the same display the desktop would have picked.
+    const so = @import("../scanout.zig").bringUp() orelse {
+        vga.fg = .LightRed;
+        vga.print("No display available!\n", .{});
+        vga.fg = .LightGray;
+        return null;
+    };
+    const disp_w = so.width;
+    const disp_h = so.height;
+    display_is_gop = (so.kind == .gop);
+
+    // Back-buffer policy:
+    //   * virtio-gpu mode: composite directly into the device resource backing.
+    //     The host doesn't see writes until TRANSFER_TO_HOST_2D + RESOURCE_FLUSH,
+    //     so the backing IS already a back buffer — no separate alloc, no SSE
+    //     memcpy of the full frame on every redraw. Saves ~8MB per .full /
+    //     .drag re-render at 1920×1080.
+    //   * BGA mode: live framebuffer, host scans out continuously, so we still
+    //     need a separate back buffer to avoid tearing.
+    // Mode 9 (GPU compositor) forces back-buffer mode even on virtio-gpu
+    // so the compositor can sample the desktop's fully rendered scene
+    // (windows + chrome + menubar + dock + cursor) without racing the
+    // CPU compositor's writes against the GPU compositor's screen-FB
+    // writes. Together with `gfx.skip_blit_to_screen = true` below, this
+    // makes the compositor the sole writer of virtio-gpu's framebuffer.
+    const force_back_buffer = (@import("../../boot/boot_info.zig").boot_mode == 9);
+    if (virtio_gpu.active and !force_back_buffer) {
+        backbuf = @as([*]volatile u32, @ptrCast(virtio_gpu.framebuffer));
+        bb_pages = 0;
+        gfx.useFramebuffer(); // target := screen (= virtio-gpu resource backing)
+        debug.klog("[desktop] Compositor: direct-to-resource (no back buffer)\n", .{});
+    } else if (display_is_gop and !gop.direct and !force_back_buffer) {
+        // GOP blit mode: GUEST_FB only reaches the panel on flush — it IS a
+        // back buffer already, the same shape as virtio's direct-to-resource.
+        backbuf = @as([*]volatile u32, @ptrCast(gop.framebuffer));
+        bb_pages = 0;
+        gfx.useFramebuffer(); // target := screen (= GUEST_FB blit source)
+        debug.klog("[desktop] Compositor: direct-to-GUEST_FB (no extra back buffer)\n", .{});
+    } else {
+        bb_pages = (disp_w * disp_h * 4 + 4095) / 4096;
+        if (paging.allocBackBuffer(bb_pages)) |buf| {
+            backbuf = buf;
+            gfx.setTarget(buf, disp_w, disp_h);
+            debug.klog("[desktop] Back buffer: {d} pages (mode={d})\n", .{ bb_pages, @import("../../boot/boot_info.zig").boot_mode });
+        } else {
+            gfx.useFramebuffer();
+            debug.klog("[desktop] WARNING: no back buffer\n", .{});
+        }
+    }
+    if (force_back_buffer) {
+        gfx.skip_blit_to_screen = true;
+        @import("../../driver.zig").virtio_gpu.skip_external_flush = true;
+        debug.klog("[desktop] Mode 9: blit-to-screen + flush suppressed; GPU compositor owns screen FB\n", .{});
+    }
+    return so;
+}
+
+/// The device's own pointer (virtio-gpu's cursor plane): it follows the
+/// mouse, and hides while the focused program asks for that. Nothing in the
+/// framebuffer is touched.
+pub fn placePointer(use_hw_cursor: bool, cursor_moved: bool) void {
+    if (use_hw_cursor) {
+        const vgpu_cur = @import("../../driver.zig").virtio_gpu;
+        // App override (setCursorVisible(false) on the focused window) wins
+        // over auto-hide heuristics — keeps DOOM-style FPS apps from
+        // re-showing the cursor on every mouse move.
+        if (slot_used[wm.focused]) {
+            const fw = &windows[wm.focused];
+            if (fw.cursor_hidden_by_app) {
+                // Explicit app override — Doom etc. set this and they
+                // want the cursor gone regardless of window state.
+                if (!vgpu_cur.cursor_hidden) vgpu_cur.hideCursor();
+            } else if (fw.gui_fb == null and vgpu_cur.cursor_hidden) {
+                vgpu_cur.showCursor();
+                vgpu_cur.moveCursor(mouse.x, mouse.y);
+            } else if (cursor_moved) {
+                vgpu_cur.moveCursor(mouse.x, mouse.y);
+            }
+        } else if (cursor_moved) {
+            vgpu_cur.moveCursor(mouse.x, mouse.y);
         }
     }
 }

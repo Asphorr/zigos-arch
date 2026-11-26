@@ -505,3 +505,32 @@ pub fn paintContent(w: *const Window, content_y: i32, content_h: u32) bool {
     }
     return true;
 }
+
+/// Auto-refresh: a GUI window whose app never calls sysPresent is read
+/// from the app's live framebuffer, so it is re-composited on a timer, at
+/// most every 5 ticks (~20 Hz) however often the loop wakes. A window that
+/// presents is read from the snapshot sysPresent took and is marked by it
+/// (markGuiPresent): nothing to pick up here. True while such a window is
+/// on screen: the desktop then keeps waking to look at it.
+pub fn pollUnpresented() bool {
+    var gui_autorefresh_active = false;
+    const AUTO_REFRESH_INTERVAL_TICKS: u64 = 5;
+    for (z_stack[0..wm.z_count]) |gi| {
+        const w = &windows[gi];
+        if (w.gui_fb == null or !w.visible or w.has_presented) continue;
+        gui_autorefresh_active = true;
+        if (process.tick_count -% w.last_auto_refresh_tick >= AUTO_REFRESH_INTERVAL_TICKS) {
+            w.last_auto_refresh_tick = process.tick_count;
+            const h = guiContentHash(w);
+            if (h != w.auto_refresh_hash) {
+                w.auto_refresh_hash = h;
+                w.auto_refresh_settle = true;
+                w.gui_present_pending = true;
+            } else if (w.auto_refresh_settle) {
+                w.auto_refresh_settle = false;
+                w.gui_present_pending = true;
+            }
+        }
+    }
+    return gui_autorefresh_active;
+}

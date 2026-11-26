@@ -13,6 +13,8 @@ const process = @import("../../../proc/process.zig");
 const wm = @import("../window.zig");
 const Window = wm.Window;
 const windows = &wm.windows;
+const z_stack = &wm.z_stack;
+const wake = @import("../wake.zig");
 const layout = @import("../layout.zig");
 const TITLEBAR_H = layout.TITLEBAR_H;
 const KEY_UP = keyboard.KEY_UP;
@@ -330,4 +332,54 @@ pub fn termPrompt(w: *Window) void {
         if (textIdx(t.text_row, t.text_col)) |idx| t.text_buf[idx] = ch;
         t.text_col += 1;
     }
+}
+
+/// How long one loop iteration reads a terminal's output pipe before it
+/// goes on to draw (see the drain step); the byte count is the same bound
+/// for a boot with no calibrated clock.
+pub const DRAIN_SLICE_MS: u64 = 4;
+pub const DRAIN_SLICE_BYTES: usize = 16 * 1024;
+
+/// Drain stdout pipes for every shell-attached terminal window. The
+/// shell process writes via libc.print → fwrite(1) → pipe.write into
+/// out_pipe; we pull bytes back here non-blocking and feed them into
+/// the window's text buffer. This is the desktop's side of the
+/// "TTY-as-two-pipes" architecture: no kernel TTY primitive, just a
+/// pair of generic byte streams plus this drain step.
+///
+/// Drained bytes can change any rows (`ls`'s lines, a scroll, a
+/// program addressing the cursor), so the window is only marked here;
+/// term_view.repaintStale repaints whichever rows differ from what they show.
+///
+/// A program that prints without pause (`yes`, a long build log)
+/// refills the pipe as fast as it is drained here, so each window
+/// gets a time slice per pass: the frame is drawn and the keyboard
+/// read in between, and the writer waits on the full pipe.
+pub fn drainOutput() void {
+    const pipe = @import("../../../proc/pipe.zig");
+    const rdtsc = @import("../../../debug/perf.zig").rdtsc;
+    const slice_cyc = @import("../../../irq/apic.zig").tscPerQuantumSane() * DRAIN_SLICE_MS / 10;
+    var drain_buf: [256]u8 = undefined;
+    var more = false;
+    for (z_stack[0..wm.z_count]) |wi| {
+        const w = &windows[wi];
+        if (w.out_pipe == 0xFF) continue;
+        const t0 = rdtsc();
+        var taken: usize = 0;
+        while (true) {
+            const got = pipe.tryRead(w.out_pipe, &drain_buf);
+            if (got == 0) break;
+            for (drain_buf[0..got]) |c| putCharOnWindow(w, c);
+            if (w.term) |t| t.rows_stale = true;
+            if (got < drain_buf.len) break;
+            taken += got;
+            // No calibrated clock yet: a byte count stands in.
+            const spent = if (slice_cyc != 0) rdtsc() -% t0 >= slice_cyc else taken >= DRAIN_SLICE_BYTES;
+            if (spent) {
+                more = true;
+                break;
+            }
+        }
+    }
+    if (more) wake.requestWake();
 }

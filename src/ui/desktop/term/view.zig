@@ -8,9 +8,16 @@ const process = @import("../../../proc/process.zig");
 const wm = @import("../window.zig");
 const Window = wm.Window;
 const windows = &wm.windows;
+const slot_used = &wm.slot_used;
 const z_stack = &wm.z_stack;
 const dirty_rects_mod = @import("../dirty.zig");
 const addDirtyRect = dirty_rects_mod.add;
+const damage = @import("../damage.zig");
+const DirtyKind = damage.DirtyKind;
+const seedWindow = damage.seedWindow;
+const wantRegion = damage.wantRegion;
+const wantTextRow = damage.wantTextRow;
+const wake = @import("../wake.zig");
 const dock = @import("../dock.zig");
 const theme = @import("../../theme.zig");
 const WINDOW_BG = theme.WINDOW_BG;
@@ -283,4 +290,103 @@ pub fn paintContent(idx: u8, w: *const Window, t: *TerminalData, content_y: i32,
     }
 
     drawTermScrollbar(w, t);
+}
+
+/// Last cursor blink phase (`tick_count / CURSOR_BLINK_HALF_TICKS`) we
+/// marked dirty for. Used to avoid spamming dirty=.text_only every loop iter
+/// when the phase hasn't actually flipped.
+pub var last_blink_phase: u64 = 0;
+
+/// What time does to terminals: the focused one's cursor blinks, and a bell
+/// flashes a terminal's border for a few frames. Each asks here for its
+/// repaint and for the wake that brings its next step. Returns the frame's
+/// kind raised by them.
+pub fn blinkAndBell(kind: DirtyKind) DirtyKind {
+    var dirty = kind;
+    // Cursor blink edge: when tick_count crosses a blink half-period
+    // boundary and the focused window is a terminal, mark dirty so the
+    // cursor cell repaints. Driven by ticks (real time) rather than
+    // frame_count so the blink rate is independent of how often the
+    // desktop loop wakes (~12.5Hz idle vs higher when busy).
+    if (slot_used[wm.focused] and windows[wm.focused].term != null and !windows[wm.focused].minimized) {
+        const curr_phase = process.tick_count / CURSOR_BLINK_HALF_TICKS;
+        if (curr_phase != last_blink_phase) {
+            last_blink_phase = curr_phase;
+            wantTextRow(&dirty);
+        }
+        // Self-wake at the start of the next half-period so the blink
+        // toggle fires on time even with no other compositor activity.
+        const next_phase_tick = (curr_phase + 1) * CURSOR_BLINK_HALF_TICKS;
+        wake.requestSelfWake(next_phase_tick);
+    }
+
+    // Bell flash: each terminal with a non-zero bell_phase counts down
+    // one frame; while active, repaint the window so the red border
+    // re-renders.
+    var any_bell_active = false;
+    for (z_stack[0..wm.z_count]) |wi| {
+        if (windows[wi].term) |tt| {
+            if (tt.bell_phase > 0) {
+                tt.bell_phase -= 1;
+                seedWindow(wi);
+                wantRegion(&dirty);
+                if (tt.bell_phase > 0) any_bell_active = true;
+            }
+        }
+    }
+    // Bell needs to count down on subsequent ticks even with no other
+    // wake source. Pace at ~50 Hz (every 2 ticks) — the flash totals
+    // only BELL_FLASH_FRAMES so this drains within ~10 wakeups.
+    if (any_bell_active) wake.requestSelfWake(process.tick_count + 2);
+    return dirty;
+}
+
+/// Terminals that got output: repaint the rows it changed. Where rows
+/// cannot be painted on their own — something lies over the window, it
+/// shows its scrollback, or this frame repaints regions anyway — the whole
+/// window is repainted as a region.
+///
+/// A keystroke or a blink edge in the focused terminal (.text_only) goes
+/// the same way: its rows are compared with what they show, so a key whose
+/// echo has not come yet draws nothing and presents no frame of its own.
+/// Returns the frame's kind as that leaves it.
+pub fn repaintStale(kind: DirtyKind) DirtyKind {
+    var dirty = kind;
+    // The focused terminal is looked at for its text row alone.
+    var row_only: u8 = 0xFF;
+    if (dirty == .text_only and slot_used[wm.focused]) {
+        if (windows[wm.focused].term) |t| {
+            if (!t.rows_stale) row_only = wm.focused;
+            t.rows_stale = true;
+        }
+    }
+    const rows_alone = dirty == .none or dirty == .cursor_only or dirty == .gui_only or dirty == .text_only;
+    var rows_painted = false;
+    var text_row_done = false;
+    for (z_stack[0..wm.z_count], 0..) |wi, z_pos| {
+        const t = windows[wi].term orelse continue;
+        if (!t.rows_stale) continue;
+        t.rows_stale = false;
+        if (rows_alone and termRowsPaintable(z_pos, wi)) {
+            if (repaintStaleRows(wi)) rows_painted = true;
+            if (wi == wm.focused) text_row_done = true;
+        } else if (row_only == wi) {
+            // Not paintable on its own: the text-row path draws it.
+        } else {
+            seedWindow(wi);
+            wantRegion(&dirty);
+        }
+    }
+    if (rows_painted and dirty == .text_only and !text_row_done) {
+        // The text row is still owed and a rows-only frame would
+        // skip it.
+        seedWindow(wm.focused);
+        wantRegion(&dirty);
+    } else if (rows_painted and (dirty == .none or dirty == .cursor_only or dirty == .text_only)) {
+        dirty = .gui_only;
+    } else if (dirty == .text_only and text_row_done) {
+        // Nothing differed. A software pointer may still have moved.
+        dirty = .cursor_only;
+    }
+    return dirty;
 }

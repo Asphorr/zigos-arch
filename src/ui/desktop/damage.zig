@@ -133,3 +133,12 @@ pub fn accumVacated(x: i32, y: i32, w_px: u32, h_px: u32) void {
         drag_accum_y1 = @max(drag_accum_y1, y1);
     }
 }
+
+/// The frame is on the display. A region frame consumed the seeds and what
+/// the drag vacated, a full frame superseded them; either way they come
+/// with .drag, .region or .full, so no repaint is lost by clearing.
+pub fn endFrame() void {
+    drag_accum_valid = false;
+    region_seed_count = 0;
+    text_row_pending = false;
+}
