@@ -4537,7 +4537,7 @@ pub fn run() void {
 
         // Advance window animations
         if (hasActiveAnimations()) {
-            advanceAnimations();
+            advanceAnimations(finishClose);
             dirty = .full;
             markDirtyFull();
             // Animations want a follow-up frame as long as any is still
@@ -4992,6 +4992,51 @@ pub fn presentWindow(pid: u8) void {
     }
 }
 
+/// The closing animation of window `slot` has run out. A program's window
+/// goes with its process, whose end takes down every window it owns; a
+/// terminal's goes here, with its shell.
+fn finishClose(slot: u8) void {
+    const w = &windows[slot];
+    const pid = w.owner_pid;
+    if (w.gui_fb != null and pid != 0) {
+        process.killProcess(pid);
+        while (keyboard.pop()) |_| {}
+        return;
+    }
+    // Before windows_lock: the shell's end takes that lock itself
+    // (destroyGuiWindow), and closing a pipe's end wakes whoever waits on
+    // the other.
+    detachShell(w);
+    const term = blk: {
+        const flags = lockWindows();
+        defer unlockWindows(flags);
+        break :blk removeWindow(slot);
+    };
+    // vmalloc'd: freed with the lock dropped (see createWindow).
+    if (term) |t| freeTerminalData(t);
+    debug.klog("[desktop] Terminal window closed (slot {d}), {d} left\n", .{ slot, wm.z_count });
+}
+
+/// End the shell of a terminal window and close the desktop's ends of its
+/// two pipes, so that a read or write blocked on the other end sees EOF or
+/// EPIPE. Nothing to do for a window that has no shell.
+fn detachShell(w: *Window) void {
+    if (w.shell_pid != 0xFF) {
+        process.killProcess(w.shell_pid);
+        w.shell_pid = 0xFF;
+    }
+    if (w.kb_pipe != 0xFF) {
+        @import("../proc/pipe.zig").closeWriter(w.kb_pipe);
+        w.kb_pipe = 0xFF;
+    }
+    if (w.out_pipe != 0xFF) {
+        @import("../proc/pipe.zig").closeReader(w.out_pipe);
+        w.out_pipe = 0xFF;
+    }
+    @import("../tty/tty.zig").close(w.tty);
+    w.tty = 0xFF;
+}
+
 /// Remove a window. Tears down per-window resources, frees the slot, and
 /// splices it out of z_stack. With stable slot IDs, no other slot's data
 /// is touched — outside references to other slots stay valid. Refs that
@@ -5002,23 +5047,7 @@ fn removeWindow(slot: u8) ?*TerminalData {
     if (slot >= MAX_WINDOWS or !slot_used[slot]) return null;
     const term = windows[slot].term;
     windows[slot].term = null;
-    // Tear down shell pipes if this window had a user-space shell. Closing
-    // the desktop's end drops the refcount; once the shell also closes
-    // its end the pipe slot is freed by pipe.closeReader/Writer.
-    if (windows[slot].kb_pipe != 0xFF) {
-        @import("../proc/pipe.zig").closeWriter(windows[slot].kb_pipe);
-        windows[slot].kb_pipe = 0xFF;
-    }
-    if (windows[slot].out_pipe != 0xFF) {
-        @import("../proc/pipe.zig").closeReader(windows[slot].out_pipe);
-        windows[slot].out_pipe = 0xFF;
-    }
-    @import("../tty/tty.zig").close(windows[slot].tty);
-    windows[slot].tty = 0xFF;
-    if (windows[slot].shell_pid != 0xFF) {
-        process.killProcess(windows[slot].shell_pid);
-        windows[slot].shell_pid = 0xFF;
-    }
+    detachShell(&windows[slot]);
 
     removeFromZ(slot);
     freeSlot(slot);

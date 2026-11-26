@@ -5,19 +5,14 @@
 // frame; we mutate those directly so no separate "rendered geometry"
 // channel is needed.
 //
-// Closing animations also drive process teardown: when the close shrink
-// reaches its final frame we kill the owner process / shell, drop the
-// terminal pipes, and request a full-screen repaint. That's intentional —
-// keeping all "what happens when window dies" logic in one place beats
-// scattering it across closeWindow + the compositor.
+// A closing animation that has run out hands its window to the caller of
+// advance(): what goes with a window (its process, a terminal's shell, the
+// slot) is the desktop's to know.
 
 const wm = @import("window.zig");
 const gfx = @import("../gfx.zig");
 const layout = @import("layout.zig");
 const dirty_rects = @import("dirty.zig");
-const process = @import("../../proc/process.zig");
-const keyboard = @import("../../driver.zig").keyboard;
-const pipe = @import("../../proc/pipe.zig");
 const events = @import("../events.zig");
 
 const Window = wm.Window;
@@ -123,9 +118,12 @@ pub fn start(idx: u8, atype: AnimationType) void {
     }
 }
 
-pub fn advance() void {
+/// One frame of every running animation. `closed` is called for a window
+/// whose closing animation has run out, and takes it down.
+pub fn advance(comptime closed: fn (slot: u8) void) void {
     // Iterate slots, NOT z_stack. A closing window's final frame calls
-    // process.killProcess → desktop.destroyGuiWindow → removeWindow, which
+    // `closed`, which ends in removeWindow (for a program's window through
+    // process.killProcess → desktop.destroyGuiWindow) and
     // splices the closing window (and any same-PID siblings) out of z_stack
     // mid-iteration. Walking z_stack here would then skip whatever shifted
     // into the freed z-position and read a stale trailing entry on the final
@@ -165,32 +163,8 @@ pub fn advance() void {
             w.anim_type = .none;
 
             if (atype == .closing) {
-                const pid = w.owner_pid;
-                if (w.gui_fb != null and pid != 0) {
-                    process.killProcess(pid);
-                    while (keyboard.pop()) |_| {}
-                } else {
-                    // Terminal window close: tear down shell + pipes if attached.
-                    // killProcess is enough — the shell's fd close in
-                    // process.killProcess will drop the shell's pipe ends; we
-                    // still drop the desktop's ends so blocked reads/writes
-                    // see EOF/EPIPE and unblock.
-                    if (w.shell_pid != 0xFF) {
-                        process.killProcess(w.shell_pid);
-                        w.shell_pid = 0xFF;
-                    }
-                    if (w.kb_pipe != 0xFF) {
-                        pipe.closeWriter(w.kb_pipe);
-                        w.kb_pipe = 0xFF;
-                    }
-                    if (w.out_pipe != 0xFF) {
-                        pipe.closeReader(w.out_pipe);
-                        w.out_pipe = 0xFF;
-                    }
-                    @import("../../tty/tty.zig").close(w.tty);
-                    w.tty = 0xFF;
-                    w.visible = false;
-                }
+                // The slot may be free from here on: `w` is not to be read.
+                closed(i);
                 dirty_rects.force_full_kind = true;
                 dirty_rects.markFull();
             } else if (atype == .minimizing) {
