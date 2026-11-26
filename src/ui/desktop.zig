@@ -82,28 +82,16 @@ const cycleFocus = wm.cycleFocus;
 // without learning the new path.
 pub const conf = @import("desktop/config.zig");
 pub var config_changed: bool = false;
-// dirty_rects_mod.force_full_kind moved to dirty.zig as dirty_rects_mod.force_full_kind
-var gui_composite_counter: u8 = 0;
 
 // Dirty-region tracker for partial GPU flush — see desktop/dirty.zig.
-// Adapter helpers below preserve the historical names so call sites
-// don't all need rewriting; the underlying state is owned by the
-// extracted module. Aliased as `dirty_rects_mod` to avoid clashing
-// with the local `dirty: DirtyKind` variable inside `run()`.
+// Aliased as `dirty_rects_mod` to avoid clashing with the local
+// `dirty: DirtyKind` variable inside `run()`.
 const dirty_rects_mod = @import("desktop/dirty.zig");
-
-inline fn addDirtyRect(x: u32, y: u32, w: u32, h: u32) void { dirty_rects_mod.add(x, y, w, h); }
-inline fn markDirtyFull() void { dirty_rects_mod.markFull(); }
-inline fn resetDirtyRects() void {
-    // Mode 9: the dispatch's wake fan-out calls requestRenderFromDirty
-    // which snapshots the rects into the compositor's own pending list
-    // BEFORE this reset. So unconditional reset is fine — the compositor
-    // already has its copy. (Earlier we deferred reset entirely in mode
-    // 9 hoping the compositor would consume rects directly, but that
-    // had a race against the next desktop tick adding new rects mid-
-    // consume.)
-    dirty_rects_mod.reset();
-}
+const addDirtyRect = dirty_rects_mod.add;
+const markDirtyFull = dirty_rects_mod.markFull;
+// Mode 9: requestRenderFromDirty has copied the rects into the compositor's
+// own list before a frame resets them, so the reset needs no condition.
+const resetDirtyRects = dirty_rects_mod.reset;
 
 // --- Notification system ---
 // Top-right toast notification — show()/tick()/render() in desktop/toast.zig.
@@ -415,8 +403,8 @@ fn color256(n: u16) u32 {
     const g: u32 = 8 + 10 * @as(u32, @min(n, 255) - 232);
     return (g << 16) | (g << 8) | g;
 }
-const TERM_COLS: u32 = 80;
-const TERM_ROWS: u32 = 25;
+const TERM_COLS = wm.TERM_COLS;
+const TERM_ROWS = wm.TERM_ROWS;
 const TERM_PAD: u32 = 4;
 /// Wide enough to show every column between the two paddings.
 const TERM_WIN_W: u32 = TERM_COLS * FONT_W + TERM_PAD * 2;
@@ -523,18 +511,13 @@ fn accumVacated(x: i32, y: i32, w_px: u32, h_px: u32) void {
     }
 }
 var prev_buttons: u8 = 0;
-/// Double-click detection on the titlebar — when the same window's
-/// Titlebar double-click → maximize was removed: too many drags
-/// triggered it inadvertently. Maximize is reachable via the window's
-/// maximize button and F10.
 
 // Resize state
 var resizing: bool = false;
 var resize_win: u8 = 0;
 var resize_edge: ResizeEdge = .right;
-const MIN_WIN_W: u32 = 200;
-const MIN_WIN_H: u32 = 100;
-const RESIZE_ZONE: i32 = 5;
+const MIN_WIN_W = wm.MIN_WIN_W;
+const MIN_WIN_H = wm.MIN_WIN_H;
 
 // Context menu state moved to desktop/context_menu.zig.
 
@@ -2059,34 +2042,6 @@ fn spawnShellOnWindow(wi: u8) void {
 // loop is unrelated to anything else here.
 const splash = @import("desktop/splash.zig");
 
-fn fmtNum(buf: []u8, n: u32) void {
-    var v = n;
-    var i: usize = buf.len;
-    while (i > 0) {
-        i -= 1;
-        buf[i] = '0' + @as(u8, @truncate(v % 10));
-        v /= 10;
-    }
-}
-
-fn roundSmallCorners(x: i32, y: i32, w: u32, h: u32, bg: u32) void {
-    const bot: i32 = y + @as(i32, @intCast(h)) - 1;
-    const right: i32 = x + @as(i32, @intCast(w)) - 1;
-    // 2px radius: just knock off single corner pixels
-    gfx.putPixel(x, y, bg);
-    gfx.putPixel(x + 1, y, bg);
-    gfx.putPixel(x, y + 1, bg);
-    gfx.putPixel(right, y, bg);
-    gfx.putPixel(right - 1, y, bg);
-    gfx.putPixel(right, y + 1, bg);
-    gfx.putPixel(x, bot, bg);
-    gfx.putPixel(x + 1, bot, bg);
-    gfx.putPixel(x, bot - 1, bg);
-    gfx.putPixel(right, bot, bg);
-    gfx.putPixel(right - 1, bot, bg);
-    gfx.putPixel(right, bot - 1, bg);
-}
-
 // ─── Window drop-shadow geometry ────────────────────────────────────────────
 // A soft "elevation" shadow on ALL FOUR sides, biased downward so the bottom
 // reads heavier than the top (key light from above) — the macOS/material look,
@@ -2757,15 +2712,6 @@ const corner_ring: [CORNER_R][CORNER_R]u8 = blk: {
     }
     break :blk mask;
 };
-
-fn bgColorAt(y: i32) u32 {
-    const start_y: i32 = if (conf.dock_pos == 1) @as(i32, TASKBAR_H) else 0;
-    const rel_y = y - start_y;
-    if (rel_y < 0) return background.bgTop();
-    const h = gfx.screen_h - TASKBAR_H;
-    if (@as(u32, @intCast(rel_y)) >= h) return background.bgBot();
-    return background.lerpColor(background.bgTop(), background.bgBot(), @intCast(rel_y), h);
-}
 
 // Save the full CORNER_R × CORNER_R square at each of the 4 corners
 // before drawing the window; restore via the alpha mask afterwards so
@@ -4967,29 +4913,6 @@ var wallpaper_helper: u8 = 0xFF;
 pub fn maySetWallpaper(pid: u8) bool {
     const helper = @atomicLoad(u8, &wallpaper_helper, .monotonic);
     return (helper != 0xFF and process.procs[pid].tgid == helper) or actsFor(pid, .on_screen);
-}
-
-/// Composite and display all windows (called from sys_present).
-pub fn presentWindow(pid: u8) void {
-    _ = pid;
-    if (mouse.moved) mouse.moved = false;
-    renderScene();
-    if (backbuf != null) {
-        gfx.waitVSync();
-        gfx.blitToScreen();
-    }
-    // Cursor is only drawn here in software-cursor mode AND when the focused
-    // window hasn't asked for it to be hidden. With HW cursor (the default),
-    // virtio-gpu handles drawing — we just toggle visibility via hide/showCursor
-    // and the firmware composites the sprite. Without this gate, every DOOM
-    // frame stamped the SW cursor sprite into the framebuffer regardless of
-    // setCursorVisible(false), so the cursor appeared frozen at the last
-    // mouse position even with HW cursor "hidden".
-    const vgpu = @import("../driver.zig").virtio_gpu;
-    const app_hides = slot_used[wm.focused] and windows[wm.focused].cursor_hidden_by_app;
-    if (!vgpu.hw_cursor_active and !app_hides) {
-        drawCursorOnScreen();
-    }
 }
 
 /// The closing animation of window `slot` has run out. A program's window
