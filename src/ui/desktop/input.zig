@@ -198,6 +198,7 @@ pub fn publishMouseToFocused(prev_btns: u8, cur_btns: u8, moved: bool, wheel: i3
 // DBG: input-pipeline diagnostic counters. Bumped from desktop's drain
 // loop when chars get dropped. Read by manual klog dumps when input
 // behavior is unexpected. Rate-limited so we don't flood the log.
+/// Keys dropped because no window had the focus.
 pub var dbg_focus_drop_count: u64 = 0;
 pub var dbg_event_queue_full: u64 = 0;
 pub var dbg_last_focus_drop_log: u64 = 0;
@@ -207,6 +208,8 @@ pub var dbg_last_qfull_log: u64 = 0;
 /// for itself come first (F10, Ctrl+C, Alt+Tab, the launcher's), then the
 /// launcher while it is open, then the focused window: every key becomes an
 /// event in its queue, and a terminal's goes on to its shell or its console.
+/// Whatever the case, the ring is left empty: a key that stayed in it would
+/// keep the desktop from parking.
 /// Returns the frame's kind raised by what the keys changed.
 pub fn keys(frame_kind: DirtyKind) DirtyKind {
     var dirty = frame_kind;
@@ -286,15 +289,17 @@ pub fn keys(frame_kind: DirtyKind) DirtyKind {
     //   - if focused window is a terminal, also run the existing
     //     handleKeyboard path that writes the char into kb_pipe so
     //     the user-space shell keeps reading from fd 0 unchanged.
-    // No focus → drop keystrokes silently. (Used to be: drop for
-    // GUI focus, terminal-focus path drains via legacy.)
+    // No focused window: the keys are dropped. Left in the ring they would
+    // keep the desktop from parking (shouldResumeDesktop sees them), hide
+    // the chords above behind the oldest of them, and land in the next
+    // window to take the focus.
     const focus_ok = slot_used[wm.focused] and windows[wm.focused].visible and !windows[wm.focused].minimized;
-    // DBG: when focus check fails AND there are pending keys, log so
-    // we know chars are being dropped at the desktop drain. Rate-limit
-    // to once per 100 ticks.
-    if (!focus_ok and keyboard.hasData()) {
-        dbg_focus_drop_count +%= 1;
-        if (process.tick_count -% dbg_last_focus_drop_log >= 100) {
+    if (!focus_ok) {
+        var dropped: u64 = 0;
+        while (keyboard.pop()) |_| dropped += 1;
+        dbg_focus_drop_count +%= dropped;
+        // One line a second at most.
+        if (dropped != 0 and process.tick_count -% dbg_last_focus_drop_log >= 100) {
             dbg_last_focus_drop_log = process.tick_count;
             debug.klog("[kbd-drop] focus invalid (focused={d} slot_used={any} visible={any} minimized={any}) — drop_count={d}\n", .{
                 wm.focused,
