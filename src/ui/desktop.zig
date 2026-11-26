@@ -5278,8 +5278,9 @@ pub fn reclaimBackBuffers(needed_frames: u32) u32 {
     // their phys. Doing all the NULL writes first means by the time we
     // start the spin-wait, no new snapshotGuiFb call can latch a
     // pointer that we then free.
+    // Each block with its own size: windows differ in theirs.
     var pending_phys: [MAX_WINDOWS * 3]Phys = undefined;
-    var pending_pages: u32 = 0;
+    var pending_pages: [MAX_WINDOWS * 3]u32 = undefined;
     var pending_count: usize = 0;
     for (0..MAX_WINDOWS) |k| {
         const i: u8 = @intCast(k);
@@ -5299,8 +5300,8 @@ pub fn reclaimBackBuffers(needed_frames: u32) u32 {
             w.gui_fb_backs[slot] = null;
             if (paging.takeGuiFbBackPhys(w.owner_pid, slot)) |phys| {
                 pending_phys[pending_count] = phys;
+                pending_pages[pending_count] = npages_this;
                 pending_count += 1;
-                pending_pages = npages_this;
                 freed_frames += npages_this;
             }
         }
@@ -5333,7 +5334,7 @@ pub fn reclaimBackBuffers(needed_frames: u32) u32 {
     // Phase 3: now safe — actually return the frames to PMM.
     var i: usize = 0;
     while (i < pending_count) : (i += 1) {
-        pmm.freeContiguous(pending_phys[i], pending_pages);
+        pmm.freeContiguous(pending_phys[i], pending_pages[i]);
     }
     return freed_frames;
 }
