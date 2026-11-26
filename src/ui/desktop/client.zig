@@ -43,6 +43,8 @@ const TITLEBAR_H = layout.TITLEBAR_H;
 const BORDER = layout.BORDER;
 const MAX_WINDOWS: u32 = @import("../../config.zig").MAX_WINDOWS;
 const win_title = @import("title.zig");
+const input = @import("input.zig");
+const manage = @import("manage.zig");
 
 const surface = @import("surface.zig");
 const desktop = @import("../desktop.zig");
@@ -240,8 +242,8 @@ fn removeWindow(slot: u8) ?*TerminalData {
         if (topSlot()) |t| setFocused(t) else setFocused(0);
     }
     // Active drag/resize on the dying slot is cancelled.
-    if (desktop.dragging and desktop.drag_win == slot) desktop.dragging = false;
-    if (desktop.resizing and desktop.resize_win == slot) desktop.resizing = false;
+    if (manage.dragging and manage.drag_win == slot) manage.dragging = false;
+    if (manage.resizing and manage.resize_win == slot) manage.resizing = false;
     return term;
 }
 
@@ -548,7 +550,7 @@ pub fn getMouseRelative(pid: u8, buf: [*]u32) void {
                 buf[0] = @bitCast(rel_x);
                 buf[1] = @bitCast(rel_y);
                 // Only the presses that landed on this window's content.
-                buf[2] = if (desktop.app_btns_win == i) @as(u32, desktop.app_btns) else 0;
+                buf[2] = if (input.app_btns_win == i) @as(u32, input.app_btns) else 0;
                 // Store accumulated deltas in buf[3..4] for FPS apps
                 buf[3] = @bitCast(mouse.accum_dx);
                 buf[4] = @bitCast(mouse.accum_dy);

@@ -27,10 +27,10 @@ const TASKBAR_H = layout.TASKBAR_H;
 const TITLEBAR_H = layout.TITLEBAR_H;
 const BORDER = layout.BORDER;
 const MAX_WINDOWS: u32 = @import("../../config.zig").MAX_WINDOWS;
+const manage = @import("manage.zig");
 
 const chrome = @import("chrome.zig");
 const damage = @import("damage.zig");
-const desktop = @import("../desktop.zig");
 const paddedWinRect = chrome.paddedWinRect;
 const SHADOW_SPAD = chrome.SHADOW_SPAD;
 const renderWindow = chrome.renderWindow;
@@ -408,9 +408,9 @@ pub fn renderRegions(use_hw_cursor: bool) bool {
         const r = dirty_rects_mod.getRect(ri);
         seedRegion(@intCast(r[0]), @intCast(r[1]), @intCast(r[0] + r[2]), @intCast(r[1] + r[3]));
     }
-    if (desktop.dragging and damage.drag_accum_valid) {
+    if (manage.dragging and damage.drag_accum_valid) {
         seedRegion(damage.drag_accum_x0, damage.drag_accum_y0, damage.drag_accum_x1, damage.drag_accum_y1);
-        seedWindow(desktop.drag_win);
+        seedWindow(manage.drag_win);
     }
     const ov = OverlayRects{ .tip = dock.tooltipRect(), .toast = toast.rect(), .menu = context_menu.rect(), .launcher = launcher.rect() };
     seedOverlayMove(dock.tooltip_painted, ov.tip);

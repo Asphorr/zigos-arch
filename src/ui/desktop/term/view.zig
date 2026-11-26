@@ -23,11 +23,11 @@ const CURSOR_BLINK_HALF_TICKS = theme.CURSOR_BLINK_HALF_TICKS;
 const SCROLL_LINES: u32 = @import("../../../config.zig").SCROLL_LINES;
 const chrome = @import("../chrome.zig");
 const scene = @import("../scene.zig");
+const screen = @import("../screen.zig");
 
 const emulator = @import("emulator.zig");
 const cells = @import("cells.zig");
 const corners = @import("../corners.zig");
-const desktop = @import("../../desktop.zig");
 const TerminalData = emulator.TerminalData;
 const TERM_COLS = emulator.TERM_COLS;
 const TERM_ROWS = emulator.TERM_ROWS;
@@ -154,7 +154,7 @@ pub fn termRowsPaintable(z_pos: usize, idx: u8) bool {
     const w = &windows[idx];
     const t = w.term orelse return false;
     if (!t.painted_valid or t.scroll_view != 0 or w.anim_type != .none) return false;
-    if (!w.visible or w.minimized or desktop.backbuf == null) return false;
+    if (!w.visible or w.minimized or screen.backbuf == null) return false;
     const x0 = w.x;
     const y0 = w.y + @as(i32, TITLEBAR_H);
     const x1 = w.x + @as(i32, @intCast(w.width));

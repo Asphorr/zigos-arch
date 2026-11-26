@@ -1,4 +1,3 @@
-const std = @import("std");
 const gfx = @import("gfx.zig");
 const bga = @import("../driver.zig").bga;
 const display = @import("display.zig");
@@ -11,10 +10,31 @@ const debug = @import("../debug/debug.zig");
 const elf_loader = @import("../proc/elf_loader.zig");
 const xhci = @import("../driver.zig").xhci;
 const process = @import("../proc/process.zig");
-const sound = @import("../driver.zig").sound;
 const events_mod = @import("events.zig");
 pub const Event = events_mod.Event;
 pub const EventKind = events_mod.EventKind;
+
+const screen = @import("desktop/screen.zig");
+pub const getBackBuffer = screen.getBackBuffer;
+const adoptBackBuffer = screen.adoptBackBuffer;
+const swCursorActive = screen.swCursorActive;
+const eraseCursor = screen.eraseCursor;
+const drawCursorOnScreen = screen.drawCursorOnScreen;
+const bakeCursorToBackBuffer = screen.bakeCursorToBackBuffer;
+const unbakeCursorFromBackBuffer = screen.unbakeCursorFromBackBuffer;
+const blitWindowBounds = screen.blitWindowBounds;
+const changeResolution = screen.changeResolution;
+
+const input = @import("desktop/input.zig");
+const frameButtons = input.frameButtons;
+const pressReplayPending = input.pressReplayPending;
+const pressTarget = input.pressTarget;
+const publishMouseToFocused = input.publishMouseToFocused;
+
+const manage = @import("desktop/manage.zig");
+const toggleFullscreen = manage.toggleFullscreen;
+const runLauncherResult = manage.runLauncherResult;
+const handleMouseEvents = manage.handleMouseEvents;
 
 const chrome = @import("desktop/chrome.zig");
 pub const paddedWinRect = chrome.paddedWinRect;
@@ -32,7 +52,6 @@ const repaintZAboveOverlapping = scene.repaintZAboveOverlapping;
 const windowCovered = scene.windowCovered;
 
 const damage = @import("desktop/damage.zig");
-const accumVacated = damage.accumVacated;
 const seedRegion = damage.seedRegion;
 const seedRect = damage.seedRect;
 const seedWindow = damage.seedWindow;
@@ -42,7 +61,6 @@ const DirtyKind = damage.DirtyKind;
 
 const client = @import("desktop/client.zig");
 const createWindow = client.createWindow;
-const closeWindow = client.closeWindow;
 pub const createGuiWindow = client.createGuiWindow;
 pub const focusedShellSpawnedPid = client.focusedShellSpawnedPid;
 pub const Standing = client.Standing;
@@ -67,7 +85,6 @@ pub const getWindowContentSize = client.getWindowContentSize;
 pub const getWindowAllocSize = client.getWindowAllocSize;
 
 const surface = @import("desktop/surface.zig");
-const growGuiFb = surface.growGuiFb;
 pub const markGuiPresent = surface.markGuiPresent;
 pub const snapshotGuiFb = surface.snapshotGuiFb;
 pub const reclaimBackBuffers = surface.reclaimBackBuffers;
@@ -105,21 +122,10 @@ var dbg_last_qfull_log: u64 = 0;
 
 // --- Window management (storage, z-stack, focus, hit-testing) ---
 const wm = @import("desktop/window.zig");
-const Window = wm.Window;
-const ResizeEdge = wm.ResizeEdge;
 const windows = &wm.windows;
 const slot_used = &wm.slot_used;
 const z_stack = &wm.z_stack;
-const pushZTop = wm.pushZTop;
-const topSlot = wm.topSlot;
 const setFocused = wm.setFocused;
-const windowAt = wm.windowAt;
-const isInTitlebar = wm.isInTitlebar;
-const isOnCloseBtn = wm.isOnCloseBtn;
-const isOnMinimizeBtn = wm.isOnMinimizeBtn;
-const isOnMaximizeBtn = wm.isOnMaximizeBtn;
-const isOnResizeEdge = wm.isOnResizeEdge;
-const focusNextVisible = wm.focusNextVisible;
 const cycleFocus = wm.cycleFocus;
 
 // Persisted UI config (background, theme, dock position, …) — see
@@ -148,18 +154,11 @@ const menubar = @import("desktop/menubar.zig");
 
 // Window animations (open/close/minimize/restore/fullscreen) — desktop/animations.zig.
 const animations = @import("desktop/animations.zig");
-const startAnimation = animations.start;
 const advanceAnimations = animations.advance;
 const hasActiveAnimations = animations.hasActive;
 
-// Pinned-app manifest shared by the dock + desktop icons — desktop/pinned.zig.
-const pinned = @import("desktop/pinned.zig");
-
 // Bottom-centre dock pill, hover tooltip, click dispatch — desktop/dock.zig.
 const dock = @import("desktop/dock.zig");
-
-// Desktop icon column (left side) — render + click/double-click — desktop/shortcuts.zig.
-const shortcuts = @import("desktop/shortcuts.zig");
 
 // Right-click context menu (state + render + hit-test) — desktop/context_menu.zig.
 // Action dispatch (executeMenuItem) stays here because it reaches into
@@ -208,90 +207,6 @@ const TERM_ROWS = emulator.TERM_ROWS;
 // --- Terminal escape / coloring (see theme.zig for the constant values) ---
 const CURSOR_BLINK_HALF_TICKS = theme.CURSOR_BLINK_HALF_TICKS;
 
-// --- Window ---
-const MAX_WINDOWS: u32 = @import("../config.zig").MAX_WINDOWS;
-
-// --- Drag state ---
-pub var dragging: bool = false;
-pub var drag_win: u8 = 0;
-var drag_ox: i32 = 0;
-var drag_oy: i32 = 0;
-/// Where the dragged window stood before the drag: what a snap at the end
-/// of it saves as the place to restore to.
-var drag_from_x: i32 = 0;
-var drag_from_y: i32 = 0;
-/// The drag began on a zoomed window, pressed at (drag_press_x/y), and has
-/// not yet moved UNZOOM_DRAG_PX away: the window is still zoomed.
-var drag_unzoom: bool = false;
-var drag_press_x: i32 = 0;
-var drag_press_y: i32 = 0;
-const UNZOOM_DRAG_PX: u32 = 8;
-var drag_old_x: i32 = 0;
-var drag_old_y: i32 = 0;
-
-var prev_buttons: u8 = 0;
-
-// Resize state
-pub var resizing: bool = false;
-pub var resize_win: u8 = 0;
-var resize_edge: ResizeEdge = .right;
-const MIN_WIN_W = wm.MIN_WIN_W;
-const MIN_WIN_H = wm.MIN_WIN_H;
-
-// --- Back buffer ---
-pub var backbuf: ?[*]volatile u32 = null;
-var bb_pages: u32 = 0;
-
-/// Read-only access for the GPU compositor (mode 9). Returns null until
-/// desktop.run() has finished allocating the back buffer; the compositor
-/// polls until non-null before sampling.
-pub fn getBackBuffer() ?[*]volatile u32 {
-    return backbuf;
-}
-
-/// Mode 9: draw into `nb`, the GPU compositor's background source, from
-/// now on. Caller holds the compositor's source lock. The old buffer is
-/// the boot-reserved region; freeBackBuffer would be a no-op anyway.
-fn adoptBackBuffer(nb: [*]volatile u32) void {
-    const old = backbuf orelse return;
-    const qwords: usize = @as(usize, gfx.target_w) * gfx.target_h / 2;
-    asm volatile ("cld; rep movsq"
-        :
-        : [dst] "{rdi}" (@intFromPtr(nb)),
-          [src] "{rsi}" (@intFromPtr(old)),
-          [cnt] "{rcx}" (qwords),
-        : .{ .rdi = true, .rsi = true, .rcx = true, .memory = true });
-    backbuf = nb;
-    bb_pages = 0;
-    gfx.setTarget(nb, gfx.target_w, gfx.target_h);
-    @import("gpu_compositor.zig").backBufferAdopted();
-    debug.klog("[desktop] Back buffer: drawing into the GPU compositor's source\n", .{});
-}
-
-// --- Cursor ---
-const CURSOR_W: u32 = 12;
-const CURSOR_H: u32 = 16;
-const cursor_sprite = [CURSOR_H][CURSOR_W]u8{
-    .{ 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
-    .{ 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
-    .{ 1, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
-    .{ 1, 2, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0 },
-    .{ 1, 2, 2, 2, 1, 0, 0, 0, 0, 0, 0, 0 },
-    .{ 1, 2, 2, 2, 2, 1, 0, 0, 0, 0, 0, 0 },
-    .{ 1, 2, 2, 2, 2, 2, 1, 0, 0, 0, 0, 0 },
-    .{ 1, 2, 2, 2, 2, 2, 2, 1, 0, 0, 0, 0 },
-    .{ 1, 2, 2, 2, 2, 2, 2, 2, 1, 0, 0, 0 },
-    .{ 1, 2, 2, 2, 2, 2, 2, 2, 2, 1, 0, 0 },
-    .{ 1, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 0 },
-    .{ 1, 2, 2, 1, 2, 2, 1, 0, 0, 0, 0, 0 },
-    .{ 1, 2, 1, 0, 1, 2, 2, 1, 0, 0, 0, 0 },
-    .{ 1, 1, 0, 0, 1, 2, 2, 1, 0, 0, 0, 0 },
-    .{ 0, 0, 0, 0, 0, 1, 2, 2, 1, 0, 0, 0 },
-    .{ 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0 },
-};
-var last_cursor_x: i32 = 0;
-var last_cursor_y: i32 = 0;
-
 /// Free-running per-frame counter, incremented once per desktop main-loop
 /// iteration. Used for any "every N frames" scheduling that doesn't need
 /// to track real time. Wraps around silently — only relative differences
@@ -303,118 +218,6 @@ var frame_count: u32 = 0;
 /// marked dirty for. Used to avoid spamming dirty=.text_only every loop iter
 /// when the phase hasn't actually flipped.
 var last_blink_phase: u64 = 0;
-
-fn toggleFullscreen(idx: u8) void {
-    if (idx >= MAX_WINDOWS or !slot_used[idx]) return;
-    const w = &windows[idx];
-    if (w.anim_type != .none) return; // Already animating
-
-    if (w.fullscreen) {
-        // Exit maximize — animate back to saved geometry.
-        w.fullscreen = false;
-        startAnimation(idx, .unfullscreening);
-        w.anim_end_x = w.saved_x;
-        w.anim_end_y = w.saved_y;
-        w.anim_end_w = w.saved_w;
-        w.anim_end_h = w.saved_h;
-        // Mirror drag-resize: update gui_w/gui_h so the renderWindow
-        // blit doesn't crop content. Without this, vis_w/vis_h stay
-        // stuck at the maximized size after un-fullscreen, but w.width
-        // is now back to saved, so the blit overruns and reads past
-        // the live region (or just shows stale max-size content).
-        if (w.gui_fb != null) {
-            w.gui_w = w.saved_w;
-            w.gui_h = w.saved_h -| TITLEBAR_H;
-        }
-        // Notify the app of the restored size. It keeps the grown FB (we don't
-        // shrink it for now) and renders a sub-region at the same stride.
-        pushResize(w, w.saved_w, w.saved_h);
-    } else {
-        // Enter maximize — fill the entire area between menubar and
-        // dock. Keep window chrome (titlebar + traffic-light buttons)
-        // visible so the user can un-maximize, close, minimize.
-        const usable_h: u32 = @as(u32, @intCast(gfx.screen_h)) -| MENUBAR_H -| TASKBAR_H;
-        zoomWindow(idx, 0, @intCast(MENUBAR_H), gfx.screen_w, usable_h);
-    }
-}
-
-/// Animate `idx` to the given rect and mark it zoomed, remembering the
-/// geometry it had: toggleFullscreen (F10, the green button, a titlebar
-/// drag) puts that back. Maximize is this over the whole work area.
-fn zoomWindow(idx: u8, target_x: i32, target_y: i32, target_w: u32, target_h: u32) void {
-    const w = &windows[idx];
-    // For GUI apps with a fixed FB allocation (gui_alloc_w/h)
-    // smaller than the content area: the GPU compositor scales
-    // the FB via uv_scale push constant (gpu_compositor.zig:1819)
-    // so the window draws filled. The 2D blit fallback caps
-    // vis_w/vis_h to gui_alloc to avoid reading past the FB —
-    // unused chrome-region pixels show whatever the background
-    // pass painted, which is fine for the rare fallback case.
-    w.saved_x = w.x;
-    w.saved_y = w.y;
-    w.saved_w = w.width;
-    w.saved_h = w.height;
-    w.fullscreen = true;
-    startAnimation(idx, .fullscreening);
-
-    w.anim_end_x = target_x;
-    w.anim_end_y = target_y;
-    w.anim_end_w = target_w;
-    w.anim_end_h = target_h;
-    // Mirror drag-resize (desktop.zig:2227,2259): bump gui_w/gui_h
-    // to the new target so renderWindow's `vis_w = min(gui_w,
-    // w.width)` doesn't crop the blit. Without this, w.width grows
-    // to target_w but gui_w stays at the original (e.g. 480), and
-    // the compositor only blits the upper-left 480-wide column of
-    // an 864-wide window — the right strip + lower rows show
-    // wallpaper through. The app discovers the new size by polling
-    // getWindowSize() (already returns w.width/height) and repaints
-    // to fill the expanded gui_fb region within its alloc cap.
-    if (w.gui_fb != null) {
-        // Grow the app's framebuffer to the zoomed content size so it
-        // can repaint crisply (falls back to upscaling if the bigger
-        // contiguous block can't be allocated). Sets gui_w/gui_h.
-        _ = growGuiFb(idx, target_w, target_h -| TITLEBAR_H);
-    }
-    // Notify the app: it re-fetches the (grown) alloc via getWindowAlloc and
-    // repaints at the new size.
-    pushResize(w, target_w, target_h);
-}
-
-/// Tell the app its window is now win_w x win_h. The event carries the
-/// content size, as the one sent at creation does: apps lay out to it.
-fn pushResize(w: *Window, win_w: u32, win_h: u32) void {
-    w.events.push(.{ .kind = @intFromEnum(EventKind.resize), .a = win_w, .b = win_h -| TITLEBAR_H });
-}
-
-const SnapRect = struct { x: i32, y: i32, w: u32, h: u32 };
-
-/// Where a window dropped with the cursor at (mx, my) snaps to: a half of
-/// the work area at a side edge of the screen, all of it at the top.
-fn snapRect(mx: i32, my: i32) ?SnapRect {
-    const sw: u32 = gfx.screen_w;
-    const top: i32 = @intCast(MENUBAR_H);
-    const usable_h: u32 = @as(u32, @intCast(gfx.screen_h)) -| MENUBAR_H -| TASKBAR_H;
-    if (my <= 1) return .{ .x = 0, .y = top, .w = sw, .h = usable_h };
-    if (mx <= 1) return .{ .x = 0, .y = top, .w = sw / 2, .h = usable_h };
-    if (mx >= @as(i32, @intCast(sw)) - 2) return .{ .x = @intCast(sw / 2), .y = top, .w = sw - sw / 2, .h = usable_h };
-    return null;
-}
-
-/// Raise `slot` to the top of z_stack and focus it. Stable-slot ID model:
-/// the windows[] array is unchanged, so drag_win / resize_win / focused /
-/// dock_btn indices NEVER need fix-up after this call. (Pre-2026-05-03 we
-/// shifted the array on every reorder and patched up every reference;
-/// every off-by-one in that fix-up was a UX bug.)
-fn bringToFront(slot: u8) void {
-    if (slot >= MAX_WINDOWS or !slot_used[slot]) return;
-    if (topSlot()) |t| if (t == slot) {
-        setFocused(slot);
-        return;
-    };
-    pushZTop(slot);
-    setFocused(slot);
-}
 
 // --- Scene rendering (to back buffer) ---
 
@@ -429,837 +232,19 @@ fn bringToFront(slot: u8) void {
 // closures merge; each disjoint region is then painted in renderScene's
 // order, pixel-identical to renderScene inside it, untouched outside.
 
-fn launchShortcut(idx: usize) void {
-    const sc = &pinned.list[idx];
-    debug.klog("[launch] shortcut idx={d} name='{s}' cmd='{s}'\n", .{ idx, sc.name, sc.cmd });
-    if (sc.cmd.len == 0) {
-        // Terminal shortcut: create a window, allocate kb_pipe + out_pipe,
-        // spawn app.elf (Ring 3) with stdin/stdout/stderr wired to those
-        // pipes. The shell is now a real user process — the desktop just
-        // forwards keystrokes and drains stdout each frame.
-        // window_count is u8; widen before the multiply or `9 * 30 = 270`
-        // overflows u8 arithmetic and Zig's runtime safety panics.
-        const off: i32 = @intCast(@as(u32, wm.window_count) * 30);
-        const nw: u32 = TERM_WIN_W;
-        const nh: u32 = TERM_ROWS * FONT_H + TITLEBAR_H;
-        if (createWindow("Terminal", 80 + off, 40 + off, nw, nh)) |ni| {
-            setFocused(ni);
-            spawnShellOnWindow(ni);
-        }
-        sound.open();
-    } else {
-        launchPath(sc.cmd);
-    }
-}
-
-/// Start the ELF at `path` as an interactive app.
-fn launchPath(path: []const u8) void {
-    // Try the async load on an AP first.
-    const smp = @import("../cpu/smp.zig");
-    if (smp.cpu_count > 1) {
-        if (smp.requestAppLoad(path)) {
-            debug.klog("[launch] requestAppLoad accepted '{s}'\n", .{path});
-            showNotification("Loading...");
-        } else {
-            // AP mid-flight on a previous load — can't fall back to a
-            // BSP-side sync read (both paths share NVMe bounce_buf w/o
-            // serialization). Queue instead so the click isn't lost;
-            // launch_queue.drain in the main loop will submit it once
-            // the AP goes idle.
-            if (launch_queue.push(path)) {
-                debug.klog("[launch] queued '{s}' (depth: {d})\n", .{ path, launch_queue.depth() });
-                showNotification("Queued...");
-            } else {
-                debug.klog("[launch] queue full, dropped '{s}'\n", .{path});
-                showNotification("Launch queue full");
-            }
-        }
-    } else {
-        // Single-core only — sync fallback is safe (no concurrent
-        // reader to race against).
-        if (@import("../fs/vfs.zig").loadFileFresh(path)) |fresh| {
-            if (elf_loader.loadAndStart(fresh.buf, fresh.size, fresh.pages, fresh.inode, null)) |pid| {
-                var nlen = path.len;
-                if (nlen >= 4 and path[nlen - 4] == '.') nlen -= 4;
-                process.setName(@intCast(pid), path[0..nlen]);
-                process.getPCB(pid).priority = .interactive;
-            }
-        }
-    }
-    sound.open();
-}
-
 // Boot splash extracted to desktop/splash.zig — the long animation
 // loop is unrelated to anything else here.
 const splash = @import("desktop/splash.zig");
 
 // --- Cursor ---
 
-/// Software-cursor visibility gate. The SW cursor is stamped into the
-/// framebuffer only when there's no HW cursor AND the focused app hasn't
-/// requested cursor-hide (DOOM/Quake fullscreen call setCursorVisible(false)).
-/// Mirrors the gate in renderFrame (search: `app_hides`) so the main-loop fast
-/// paths can't drift from it and re-stamp a frozen cursor over a fullscreen
-/// game. Erase sites stay gated on `!use_hw_cursor` alone so a cursor drawn
-/// before the hide still gets cleaned up.
-fn swCursorActive(use_hw_cursor: bool) bool {
-    return !use_hw_cursor and !(slot_used[wm.focused] and windows[wm.focused].cursor_hidden_by_app);
-}
-
-var cursor_save_buf: [CURSOR_W * CURSOR_H]u32 = [_]u32{0} ** (CURSOR_W * CURSOR_H);
-
-fn eraseCursor() void {
-    // Restore from back buffer at old cursor position
-    const cx: u32 = if (last_cursor_x < 0) 0 else @intCast(last_cursor_x);
-    const cy: u32 = if (last_cursor_y < 0) 0 else @intCast(last_cursor_y);
-    gfx.blitRectToScreen(cx, cy, CURSOR_W, CURSOR_H);
-    // Flush erased region to the scanout (virtio rect / GOP blit; no-op on
-    // a live framebuffer like BGA or GOP-direct).
-    display.flushRect(cx, cy, CURSOR_W, CURSOR_H);
-}
-
-fn drawCursorOnScreen() void {
-    const mx = mouse.x;
-    const my = mouse.y;
-    for (0..CURSOR_H) |row| {
-        for (0..CURSOR_W) |col| {
-            const pixel = cursor_sprite[row][col];
-            if (pixel != 0) {
-                const color: u32 = if (pixel == 1) 0x000000 else 0xFFFFFF;
-                gfx.putPixelDirect(mx + @as(i32, @intCast(col)), my + @as(i32, @intCast(row)), color);
-            }
-        }
-    }
-    last_cursor_x = mx;
-    last_cursor_y = my;
-    // Flush cursor region (direct screen writes need an explicit flush on
-    // flush-based scanouts — virtio resource or GOP blit).
-    {
-        const cx: u32 = if (mx < 0) 0 else @intCast(mx);
-        const cy: u32 = if (my < 0) 0 else @intCast(my);
-        display.flushRect(cx, cy, CURSOR_W, CURSOR_H);
-    }
-}
-
-/// Draw cursor into back buffer (save pixels underneath first).
-/// Call before blitToScreen so cursor is included in the blit — no flicker.
-fn bakeCursorToBackBuffer() void {
-    const mx = mouse.x;
-    const my = mouse.y;
-    for (0..CURSOR_H) |row| {
-        for (0..CURSOR_W) |col| {
-            const sx = mx + @as(i32, @intCast(col));
-            const sy = my + @as(i32, @intCast(row));
-            if (sx >= 0 and sy >= 0 and @as(u32, @intCast(sx)) < gfx.target_w and @as(u32, @intCast(sy)) < gfx.target_h) {
-                const off = @as(u32, @intCast(sy)) * gfx.target_w + @as(u32, @intCast(sx));
-                cursor_save_buf[row * CURSOR_W + col] = gfx.target[off];
-                if (cursor_sprite[row][col] != 0) {
-                    gfx.target[off] = if (cursor_sprite[row][col] == 1) 0x000000 else 0xFFFFFF;
-                }
-            }
-        }
-    }
-    last_cursor_x = mx;
-    last_cursor_y = my;
-}
-
-/// Restore back buffer pixels that were overwritten by bakeCursorToBackBuffer.
-fn unbakeCursorFromBackBuffer() void {
-    for (0..CURSOR_H) |row| {
-        for (0..CURSOR_W) |col| {
-            const sx = last_cursor_x + @as(i32, @intCast(col));
-            const sy = last_cursor_y + @as(i32, @intCast(row));
-            if (sx >= 0 and sy >= 0 and @as(u32, @intCast(sx)) < gfx.target_w and @as(u32, @intCast(sy)) < gfx.target_h) {
-                const off = @as(u32, @intCast(sy)) * gfx.target_w + @as(u32, @intCast(sx));
-                gfx.target[off] = cursor_save_buf[row * CURSOR_W + col];
-            }
-        }
-    }
-}
-
 // --- Event handling ---
 
 // --- Launcher ---
 
-/// Act on what the launcher answered to a key or a click.
-fn runLauncherResult(res: launcher.Result) void {
-    const pick = switch (res) {
-        .launch => |c| c,
-        else => return,
-    };
-    switch (pick) {
-        .app => |i| launchShortcut(i),
-        .command => |name| {
-            var path: [32]u8 = undefined;
-            const p = std.fmt.bufPrint(&path, "/bin/{s}.elf", .{name}) catch return;
-            launchPath(p);
-        },
-    }
-}
-
 // --- Context menu ---
 
-fn executeMenuItem(idx: i8) void {
-    if (idx < 0) return;
-    switch (context_menu.ctx) {
-        .desktop_bg => switch (@as(u8, @intCast(idx))) {
-            // New Terminal: the same shell window the Terminal icon opens.
-            0 => launchShortcut(0),
-            1 => launcher.open(), // Open App...
-            2 => { // Kernel Console: a terminal on the in-kernel CLI, no shell.
-                // window_count is u8: widen before the multiply.
-                const off: i32 = @intCast(@as(u32, wm.window_count) * 30);
-                const nw: u32 = TERM_WIN_W;
-                const nh: u32 = TERM_ROWS * FONT_H + TITLEBAR_H;
-                if (createWindow("Terminal", 80 + off, 40 + off, nw, nh)) |ni| {
-                    setFocused(ni);
-                    termPrompt(&windows[ni]);
-                }
-            },
-            3 => { // Arrange Icons — snap any displaced shortcut back to grid
-                shortcuts.resetPositions();
-                markDirtyFull();
-            },
-            4 => launchPath("/bin/about.elf"),
-            else => {},
-        },
-        // New Window: another instance of the pinned app.
-        .dock_app => if (idx == 0 and context_menu.target_win < pinned.list.len) launchShortcut(context_menu.target_win),
-        .titlebar => switch (@as(u8, @intCast(idx))) {
-            0 => { // Close
-                if (slot_used[context_menu.target_win]) closeWindow(context_menu.target_win);
-            },
-            1 => { // Minimize
-                if (slot_used[context_menu.target_win]) {
-                    startAnimation(context_menu.target_win, .minimizing);
-                    focusNextVisible();
-                }
-            },
-            else => {},
-        },
-        .none => {},
-    }
-}
-
-/// Publish mouse_move / mouse_button / mouse_wheel events to the focused
-/// window's queue. Called once per frame before `handleMouseEvents` so
-/// the app sees the same input the desktop is about to act on.
-///
-/// We intentionally publish even when the cursor is over a different
-/// window — focus + queue ownership decide who gets events, not hover.
-/// This matches the keyboard model and avoids the "mouse silently does
-/// nothing while a different app's titlebar is hovered" UX trap.
-/// Presses drained from the driver that the desktop hasn't acted on yet.
-var press_backlog: [3]u8 = .{ 0, 0, 0 };
-const PRESS_BACKLOG_MAX: u8 = 4;
-/// Tick of each button's last edge shown to the desktop.
-var edge_tick: [3]u64 = .{ 0, 0, 0 };
-/// Ticks between two shown edges of one button. A click played back from
-/// the counters is thus down long enough for an app that polls the button
-/// level every 10 ms to see it.
-const EDGE_GAP_TICKS: u64 = 3;
-
-/// The button level the desktop acts on this frame: mouse.buttons, with
-/// presses the level never showed played back from the driver's counters.
-/// While presses are owed, each call flips the button (a release, then the
-/// owed press), at most one edge per EDGE_GAP_TICKS; with nothing owed the
-/// level stands.
-///
-/// The level is read before the counters are drained: a press landing
-/// between the two is played back now and agrees with the level next
-/// frame; the other order would show it twice.
-fn frameButtons() u8 {
-    const level = mouse.buttons;
-    const now = process.tick_count;
-    var btn: u8 = 0;
-    inline for (0..3) |b| {
-        const mask: u8 = @as(u8, 1) << b;
-        const n = @atomicRmw(u8, &mouse.press_count[b], .Xchg, 0, .acq_rel);
-        press_backlog[b] = @min(PRESS_BACKLOG_MAX, press_backlog[b] +| n);
-        const was_down = (prev_buttons & mask) != 0;
-        const level_down = (level & mask) != 0;
-        var down = if (press_backlog[b] > 0) !was_down else level_down;
-        if (down != was_down) {
-            if (now -% edge_tick[b] < EDGE_GAP_TICKS) {
-                // Too soon after the last edge: show it once the gap is over.
-                down = was_down;
-                wake.requestSelfWake(edge_tick[b] + EDGE_GAP_TICKS);
-            } else {
-                edge_tick[b] = now;
-                if (down and press_backlog[b] > 0) press_backlog[b] -= 1;
-            }
-        }
-        if (down) btn |= mask;
-        // More edges are owed: come back for the next one.
-        if (press_backlog[b] > 0 or down != level_down) wake.requestSelfWake(edge_tick[b] + EDGE_GAP_TICKS);
-    }
-    return btn;
-}
-
-fn pressReplayPending() bool {
-    return mouse.pressPending() or (press_backlog[0] | press_backlog[1] | press_backlog[2]) != 0;
-}
-
-/// Buttons whose press went to the window `app_btns_win`: the ones pressed
-/// over its content area. A press on the desktop, the dock, another window
-/// or a titlebar is the desktop's own business; the focused app is told of
-/// neither it nor its release.
-pub var app_btns: u8 = 0;
-pub var app_btns_win: u8 = 0xFF;
-
-/// The window whose content area the cursor is over, as the stack stands
-/// before the desktop acts on this frame's input: the one a press now
-/// belongs to. A window that hid the cursor has grabbed the pointer and
-/// takes every press.
-fn pressTarget() ?u8 {
-    // An open menu or launcher takes the press, whatever is under it.
-    if (context_menu.active or launcher.active) return null;
-    if (slot_used[wm.focused] and windows[wm.focused].cursor_hidden_by_app) return wm.focused;
-    const idx = windowAt(mouse.x, mouse.y) orelse return null;
-    if (isInTitlebar(idx, mouse.x, mouse.y)) return null;
-    if (isOnResizeEdge(idx, mouse.x, mouse.y) != null) return null;
-    return idx;
-}
-
-/// Publish this frame's mouse input to the focused window. `press_target`
-/// is pressTarget() from before the desktop handled the frame: a press is
-/// delivered only if the window it landed on is the focused one now, so a
-/// click that focuses a window also reaches it, and one that closed the
-/// window above doesn't fall through to the one beneath.
-fn publishMouseToFocused(prev_btns: u8, cur_btns: u8, moved: bool, wheel: i32, press_target: ?u8) void {
-    if (app_btns_win != wm.focused) {
-        app_btns = 0;
-        app_btns_win = wm.focused;
-    }
-    const owned_before = app_btns;
-    app_btns &= cur_btns;
-    if (press_target) |t| {
-        if (t == wm.focused) app_btns |= cur_btns & ~prev_btns;
-    }
-
-    if (!slot_used[wm.focused]) return;
-    const w = &windows[wm.focused];
-    if (!w.visible or w.minimized) return;
-
-    // Translate to window-local coordinates: x relative to window left,
-    // y relative to content-area top (i.e. below the titlebar). Matches
-    // `getMouseRelative` so apps that mix `pollEvent` with the legacy
-    // `getMouse` syscall see consistent values.
-    const rel_x: i32 = mouse.x - w.x;
-    const rel_y: i32 = mouse.y - (w.y + @as(i32, TITLEBAR_H));
-    const cur_x: u32 = @bitCast(rel_x);
-    const cur_y: u32 = @bitCast(rel_y);
-
-    if (moved) {
-        w.events.push(.{
-            .kind = @intFromEnum(EventKind.mouse_move),
-            .a = cur_x,
-            .b = cur_y,
-            .c = app_btns,
-        });
-    }
-
-    // Per-button transitions of the buttons the window owns. Three
-    // buttons, low 3 bits.
-    const changed: u8 = app_btns ^ owned_before;
-    inline for ([_]u8{ 0, 1, 2 }) |btn_idx| {
-        const mask: u8 = @as(u8, 1) << btn_idx;
-        if ((changed & mask) != 0) {
-            const pressed: u8 = if ((app_btns & mask) != 0) 1 else 0;
-            const a: u32 =
-                @as(u32, btn_idx) |
-                (@as(u32, pressed) << 8) |
-                (@as(u32, app_btns) << 16);
-            w.events.push(.{
-                .kind = @intFromEnum(EventKind.mouse_button),
-                .a = a,
-                .b = cur_x,
-                .c = cur_y,
-            });
-        }
-    }
-
-    if (wheel != 0) {
-        const delta_u32: u32 = @bitCast(wheel);
-        w.events.push(.{
-            .kind = @intFromEnum(EventKind.mouse_wheel),
-            .a = delta_u32,
-            .b = cur_x,
-            .c = cur_y,
-        });
-    }
-}
-
-fn handleMouseEvents(btn: u8) DirtyKind {
-    const mx = mouse.x;
-    const my = mouse.y;
-    const left_down = (btn & 1) != 0;
-    const was_down = (prev_buttons & 1) != 0;
-    const right_down = (btn & 2) != 0;
-    const right_was = (prev_buttons & 2) != 0;
-    var result: DirtyKind = .none;
-
-    // Mouse-wheel scroll: route to terminal window under cursor (or focused
-    // terminal if not directly hovered). 3 lines per notch.
-    if (mouse.wheel != 0) {
-        // Atomic drain: producers run in IRQ context (xHCI inline drain
-        // since Inc2c, PS/2 IRQ12) — a plain read-then-clear loses notches
-        // added in between. Producers are BSP-only, so Xchg vs a same-CPU
-        // IRQ `+=` is a complete fix, not just a narrower window.
-        const w_delta = @atomicRmw(i32, &mouse.wheel, .Xchg, 0, .acq_rel);
-        const target_idx: ?u8 = if (windowAt(mx, my)) |hi|
-            (if (windows[hi].term != null) hi else null)
-        else if (slot_used[wm.focused] and windows[wm.focused].term != null)
-            wm.focused
-        else
-            null;
-        if (target_idx) |ti| {
-            const w = &windows[ti];
-            if (w.term) |tt| {
-                const lines_per_notch: i32 = 3;
-                const step: i32 = w_delta * lines_per_notch;
-                if (step > 0) {
-                    const ustep: u16 = @intCast(@min(step, 0xFFFF));
-                    tt.scroll_view = @min(tt.scroll_view + ustep, tt.scroll_count);
-                } else {
-                    const ustep: u16 = @intCast(@min(-step, 0xFFFF));
-                    tt.scroll_view -|= ustep;
-                }
-                seedWindow(ti);
-                result = .region;
-            }
-        }
-    }
-
-    // Launcher: modal for the mouse. Opening, closing and resizing are
-    // repainted by renderRegions; a selection change keeps the rect, so it
-    // is seeded here.
-    if (launcher.active) {
-        if (launcher.hover(mx, my)) {
-            if (launcher.rect()) |r| seedRect(r);
-            result = .region;
-        }
-        if (left_down and !was_down) {
-            runLauncherResult(launcher.click(mx, my));
-            result = .region;
-        } else if (right_down and !right_was) {
-            launcher.close();
-            result = .region;
-        }
-        prev_buttons = btn;
-        return result;
-    }
-
-    // Context menu: dismiss on left-click, track hover. A menu that opens,
-    // closes or moves is repainted by renderRegions; a hover change keeps
-    // the rect, so it is seeded here.
-    if (context_menu.active) {
-        if (context_menu.updateHover(mx, my)) {
-            if (context_menu.rect()) |r| seedRect(r);
-            result = .region;
-        }
-        if (left_down and !was_down) {
-            executeMenuItem(context_menu.itemAt(mx, my));
-            context_menu.close();
-            result = .full;
-            prev_buttons = btn;
-            return result;
-        }
-        if (right_down and !right_was) {
-            context_menu.close();
-            result = .region;
-            // Fall through to open new menu below
-        } else {
-            prev_buttons = btn;
-            return result;
-        }
-    }
-
-    // Right-click: open context menu
-    if (right_down and !right_was) {
-        if (windowAt(mx, my) == null and dock.inDockZone(my)) {
-            // A pinned app offers a new window; a lone window, what its
-            // titlebar does.
-            if (dock.menuAt(mx, my)) |m| {
-                switch (m.target) {
-                    .app => |pi| context_menu.openAbove(.dock_app, m.x, m.y, pi),
-                    .window => |slot| context_menu.openAbove(.titlebar, m.x, m.y, slot),
-                }
-                // The menu sits where the tooltip would.
-                dock.hideTooltip();
-                result = .region;
-            }
-        } else if (windowAt(mx, my)) |idx| {
-            if (isInTitlebar(idx, mx, my)) {
-                context_menu.open(.titlebar, mx, my, idx);
-                result = .region;
-            }
-        } else {
-            context_menu.open(.desktop_bg, mx, my, 0);
-            result = .region;
-        }
-    }
-
-    if (left_down and !was_down) {
-        // A window covering the click position takes priority over the
-        // dock — fullscreen apps (e.g. doom at 640×400 dragged over the
-        // dock strip) would otherwise have their clicks eaten by dock
-        // shortcut hit-testing, silently launching pinned apps.
-        const window_hit = windowAt(mx, my);
-        if (window_hit == null and dock.inDockZone(my)) {
-            if (dock.clickAt(mx, my)) |action| {
-                switch (action) {
-                    .launch => |si| launchShortcut(si),
-                    .window => |di| {
-                        if (windows[di].minimized) {
-                            startAnimation(di, .restoring);
-                        }
-                        // bringToFront is no-op when di is already on top, so we
-                        // can call it unconditionally; setFocused is folded in.
-                        bringToFront(di);
-                    },
-                }
-                result = .full;
-            }
-        } else if (window_hit) |clicked_idx| {
-            // Stable slot ID — bringToFront only mutates z_stack, so the
-            // slot we got from windowAt stays valid for the rest of this
-            // click handler regardless of z-order shuffles.
-            const idx = clicked_idx;
-            const was_top = if (topSlot()) |t| t == idx else false;
-            if (!was_top) {
-                bringToFront(idx);
-                result = .full;
-            }
-            if (idx != wm.focused) {
-                setFocused(idx);
-                result = .full;
-            }
-            if (isOnCloseBtn(idx, mx, my)) {
-                closeWindow(idx);
-                result = .full;
-            } else if (isOnMinimizeBtn(idx, mx, my)) {
-                startAnimation(idx, .minimizing);
-                focusNextVisible();
-                result = .full;
-            } else if (isOnMaximizeBtn(idx, mx, my)) {
-                toggleFullscreen(idx);
-                result = .full;
-            } else if (isOnResizeEdge(idx, mx, my)) |edge| {
-                resizing = true;
-                resize_win = idx;
-                resize_edge = edge;
-            } else if (isInTitlebar(idx, mx, my)) {
-                // Titlebar press = start drag. Maximize is reachable via the
-                // window's maximize button and F10 — the prior double-click
-                // maximize fired too eagerly on regular drags and was removed.
-                // Drag-on-zoomed = restore + drag, like macOS/Win; the
-                // restore waits for the cursor to really move, so a click
-                // on the titlebar leaves the window zoomed.
-                if (windows[idx].fullscreen) {
-                    drag_unzoom = true;
-                    drag_press_x = mx;
-                    drag_press_y = my;
-                } else {
-                    drag_unzoom = false;
-                    drag_ox = mx - windows[idx].x;
-                    drag_oy = my - windows[idx].y;
-                    drag_from_x = windows[idx].x;
-                    drag_from_y = windows[idx].y;
-                }
-                dragging = true;
-                drag_win = idx;
-            }
-        } else {
-            // Mouse-down on desktop background: capture press for the
-            // shortcut module. Click/launch/drop fires on mouse-up;
-            // drag-start fires on mouse-move past threshold.
-            if (shortcuts.handleMouseDown(mx, my)) {
-                result = .full;
-            }
-            // Check resize edge top-down through z_stack so the topmost
-            // window's edge wins.
-            var k: u8 = wm.z_count;
-            while (k > 0) {
-                k -= 1;
-                const wi = z_stack[k];
-                if (!windows[wi].visible or windows[wi].minimized) continue;
-                if (isOnResizeEdge(wi, mx, my)) |edge| {
-                    resizing = true;
-                    resize_win = wi;
-                    resize_edge = edge;
-                    if (wi != wm.focused) {
-                        setFocused(wi);
-                        result = .full;
-                    }
-                    break;
-                }
-            }
-        }
-    } else if (!left_down and was_down) {
-        // A window dropped with the cursor at a screen edge snaps there.
-        // Not one on a GPU slot: its image keeps the size it was created
-        // with, so it would be stretched rather than laid out anew.
-        if (dragging and drag_win < MAX_WINDOWS and slot_used[drag_win]) {
-            const dw = &windows[drag_win];
-            if (dw.anim_type == .none and !dw.fullscreen and dw.gpu_slot == null) {
-                if (snapRect(mx, my)) |r| {
-                    zoomWindow(drag_win, r.x, r.y, r.w, r.h);
-                    // Restore to where the drag began, not to the edge.
-                    dw.saved_x = drag_from_x;
-                    dw.saved_y = drag_from_y;
-                    result = .full;
-                }
-            }
-        }
-        dragging = false;
-        // If a resize was in progress, publish a resize event with the
-        // final dimensions before clearing state. Apps that do
-        // resolution-dependent layout work see the new size and can
-        // reflow without polling getWindowSize every frame.
-        if (resizing and resize_win < MAX_WINDOWS and slot_used[resize_win]) {
-            const rw = &windows[resize_win];
-            pushResize(rw, rw.width, rw.height);
-        }
-        resizing = false;
-
-        // Mouse-up routing for the shortcut icon module. An active
-        // drag wins unconditionally (drop anywhere — including over a
-        // window — so the user can park icons next to the focused app
-        // even when it's taking up most of the screen). A static
-        // press only counts when the release lands back over the
-        // desktop, matching the macOS "press-then-drag-off cancels".
-        const dragging_icon = shortcuts.isDragging();
-        if (dragging_icon or windowAt(mx, my) == null) {
-            const now: u32 = @truncate(process.tick_count);
-            const r = shortcuts.handleMouseUp(mx, my, now);
-            switch (r.result) {
-                .launch => {
-                    launchShortcut(r.launch_idx);
-                    result = .full;
-                },
-                .selected, .drop => result = .full,
-                .miss => {},
-            }
-        } else {
-            // Released over a window with no active drag — drop any
-            // pending press so it doesn't latch.
-            shortcuts.cancelDrag();
-        }
-    }
-
-    if (dragging and left_down and drag_unzoom) {
-        const dw = &windows[drag_win];
-        if (!dw.fullscreen) {
-            // Unzoomed some other way meanwhile: an ordinary drag from here.
-            drag_unzoom = false;
-            drag_ox = mx - dw.x;
-            drag_oy = my - dw.y;
-            drag_from_x = dw.x;
-            drag_from_y = dw.y;
-        } else if (@abs(mx - drag_press_x) + @abs(my - drag_press_y) >= UNZOOM_DRAG_PX and dw.anim_type == .none) {
-            drag_unzoom = false;
-            toggleFullscreen(drag_win);
-            // Straight to the restored size: the animation would steer the
-            // window back to where it stood while the cursor carries it.
-            dw.anim_type = .none;
-            dw.width = dw.saved_w;
-            dw.height = dw.saved_h;
-            // Under the cursor by the middle of its titlebar.
-            drag_ox = @intCast(dw.saved_w / 2);
-            drag_oy = @intCast(TITLEBAR_H / 2);
-            drag_from_x = dw.saved_x;
-            drag_from_y = dw.saved_y;
-            dw.x = mx - drag_ox;
-            dw.y = my - drag_oy;
-            result = .full;
-        }
-    }
-
-    if (dragging and left_down and !drag_unzoom) {
-        const new_x = mx - drag_ox;
-        var new_y = my - drag_oy;
-        // Clamp: keep title bar accessible (don't let window hide under dock or go off-screen)
-        const max_y: i32 = @intCast(gfx.screen_h - TASKBAR_H - TITLEBAR_H);
-        const min_y: i32 = @as(i32, MENUBAR_H);
-        if (new_y > max_y) new_y = max_y;
-        if (new_y < min_y) new_y = min_y;
-        if (new_x != windows[drag_win].x or new_y != windows[drag_win].y) {
-            drag_old_x = windows[drag_win].x;
-            drag_old_y = windows[drag_win].y;
-            // Record the vacated region for the tight drag repaint instead of
-            // the old markDirtyFull() — renderRegions restores exactly this
-            // (plus the closure) rather than re-rendering the whole scene.
-            accumVacated(drag_old_x, drag_old_y, windows[drag_win].width, windows[drag_win].height);
-            windows[drag_win].x = new_x;
-            windows[drag_win].y = new_y;
-            if (result != .full) result = .drag;
-        }
-    }
-
-    // Shortcut icon drag: track cursor + promote press → drag once
-    // motion exceeds threshold. Mark .drag so the ghost trail is
-    // repainted each frame. Skipped while a window-drag is in flight
-    // so the two can't fight over the cursor.
-    if (!dragging and !resizing) {
-        if (shortcuts.handleMouseMove(mx, my, left_down)) {
-            if (result != .full) result = .drag;
-            markDirtyFull();
-        }
-    }
-
-    if (resizing and left_down) {
-        const w = &windows[resize_win];
-        const right_anchor = w.x + @as(i32, @intCast(w.width));
-        const bot_anchor = w.y + @as(i32, @intCast(w.height));
-
-        const grows_right = (resize_edge == .right or resize_edge == .bottom_right or resize_edge == .top_right);
-        const grows_bottom = (resize_edge == .bottom or resize_edge == .bottom_right or resize_edge == .bottom_left);
-        const grows_left = (resize_edge == .left or resize_edge == .top_left or resize_edge == .bottom_left);
-        const grows_top = (resize_edge == .top or resize_edge == .top_left or resize_edge == .top_right);
-
-        var changed = false;
-
-        if (grows_right) {
-            var new_w: u32 = @max(MIN_WIN_W, @as(u32, @intCast(@max(mx + 2 - w.x, @as(i32, MIN_WIN_W)))));
-            if (w.gui_alloc_w > 0) new_w = @min(new_w, w.gui_alloc_w);
-            if (new_w != w.width) {
-                w.width = new_w;
-                if (w.gui_fb != null) w.gui_w = new_w;
-                changed = true;
-            }
-        } else if (grows_left) {
-            // Resizing from left: cursor x = new left edge. Width grows
-            // by (right_anchor - mx); x moves to mx. Clamp to MIN_WIN_W
-            // so we don't let x overrun the right anchor.
-            const new_x_raw = mx;
-            const new_x_max = right_anchor - @as(i32, MIN_WIN_W);
-            const new_x_clamped: i32 = if (new_x_raw > new_x_max) new_x_max else new_x_raw;
-            const min_y_for_left: i32 = MENUBAR_H;
-            _ = min_y_for_left;
-            var new_w: u32 = @intCast(right_anchor - new_x_clamped);
-            if (w.gui_alloc_w > 0 and new_w > w.gui_alloc_w) {
-                // Allocation-capped: stop at the alloc ceiling, with x
-                // adjusted so the right edge stays put.
-                new_w = w.gui_alloc_w;
-            }
-            const new_x_final: i32 = right_anchor - @as(i32, @intCast(new_w));
-            if (new_x_final != w.x or new_w != w.width) {
-                w.x = new_x_final;
-                w.width = new_w;
-                if (w.gui_fb != null) w.gui_w = new_w;
-                changed = true;
-            }
-        }
-
-        if (grows_bottom) {
-            var new_h: u32 = @max(MIN_WIN_H, @as(u32, @intCast(@max(my + 2 - w.y, @as(i32, MIN_WIN_H)))));
-            if (w.gui_alloc_h > 0) new_h = @min(new_h, w.gui_alloc_h + TITLEBAR_H);
-            if (new_h != w.height) {
-                w.height = new_h;
-                if (w.gui_fb != null) w.gui_h = new_h -| TITLEBAR_H;
-                changed = true;
-            }
-        } else if (grows_top) {
-            // Resizing from top: never let the titlebar slide under the
-            // menubar — clamp new y to MENUBAR_H.
-            var new_y_raw = my;
-            if (new_y_raw < @as(i32, MENUBAR_H)) new_y_raw = @as(i32, MENUBAR_H);
-            const new_y_max = bot_anchor - @as(i32, MIN_WIN_H);
-            const new_y_clamped: i32 = if (new_y_raw > new_y_max) new_y_max else new_y_raw;
-            var new_h: u32 = @intCast(bot_anchor - new_y_clamped);
-            if (w.gui_alloc_h > 0 and new_h > w.gui_alloc_h + TITLEBAR_H) {
-                new_h = w.gui_alloc_h + TITLEBAR_H;
-            }
-            const new_y_final: i32 = bot_anchor - @as(i32, @intCast(new_h));
-            if (new_y_final != w.y or new_h != w.height) {
-                w.y = new_y_final;
-                w.height = new_h;
-                if (w.gui_fb != null) w.gui_h = new_h -| TITLEBAR_H;
-                changed = true;
-            }
-        }
-
-        if (changed) {
-            // De-maximize on user-driven resize so the maximize toggle
-            // reflects reality (clicking maximize again should re-snap
-            // to usable area, not restore to some stale saved geometry).
-            if (w.fullscreen) w.fullscreen = false;
-            result = .full;
-            markDirtyFull();
-        }
-    }
-
-    prev_buttons = btn;
-    return result;
-}
-
 // --- Dirty region helpers ---
-
-fn blitWindowBounds(idx: u8) void {
-    const w = &windows[idx];
-    const bx: u32 = if (w.x < @as(i32, BORDER)) 0 else @intCast(w.x - @as(i32, BORDER));
-    const by: u32 = if (w.y < @as(i32, BORDER)) 0 else @intCast(w.y - @as(i32, BORDER));
-    // Include shadow tail (24 px right + down) plus borders. Without this,
-    // partial flushes during drag leave shadow ghosts at the old position.
-    gfx.blitRectToScreen(bx, by, w.width + BORDER * 2 + 26, w.height + BORDER * 2 + 26);
-}
-
-/// True when run() picked the GOP scanout as the desktop's display (real
-/// hardware: no virtio, no BGA). Resolution is then immutable — GOP SetMode
-/// is a boot service, gone after ExitBootServices — and the back-buffer
-/// policy treats GUEST_FB as the compositing surface in blit mode.
-var display_is_gop: bool = false;
-
-fn changeResolution(new_w: u16, new_h: u16) void {
-    const virtio_gpu = @import("../driver.zig").virtio_gpu;
-
-    if (display_is_gop) {
-        debug.klog("[desktop] resolution change unavailable on GOP scanout (SetMode died with boot services)\n", .{});
-        return;
-    }
-
-    // Free old back buffer (only allocated in BGA mode — virtio-gpu shares
-    // the resource backing). bb_pages == 0 signals the no-alloc path.
-    if (bb_pages != 0) paging.freeBackBuffer(bb_pages);
-    backbuf = null;
-
-    if (virtio_gpu.active) {
-        // Virtio-GPU mode change
-        if (!virtio_gpu.changeMode(new_w, new_h)) {
-            debug.klog("[desktop] virtio-gpu mode change failed\n", .{});
-            return;
-        }
-        gfx.setScreen(virtio_gpu.framebuffer, virtio_gpu.width, virtio_gpu.height);
-    } else {
-        // BGA mode change
-        _ = bga.init(new_w, new_h);
-        gfx.setScreen(bga.framebuffer, bga.width, bga.height);
-    }
-
-    if (virtio_gpu.active) {
-        backbuf = @as([*]volatile u32, @ptrCast(virtio_gpu.framebuffer));
-        bb_pages = 0;
-        gfx.useFramebuffer();
-        debug.klog("[desktop] Resolution: {d}x{d} (direct-to-resource)\n", .{ gfx.screen_w, gfx.screen_h });
-    } else {
-        bb_pages = (gfx.screen_w * gfx.screen_h * 4 + 4095) / 4096;
-        if (paging.allocBackBuffer(bb_pages)) |buf| {
-            backbuf = buf;
-            gfx.setTarget(buf, gfx.screen_w, gfx.screen_h);
-            debug.klog("[desktop] Resolution: {d}x{d} ({d} pages)\n", .{ gfx.screen_w, gfx.screen_h, bb_pages });
-        } else {
-            gfx.useFramebuffer();
-            debug.klog("[desktop] WARNING: no back buffer at new res\n", .{});
-        }
-    }
-
-    // Update mouse bounds
-    mouse.screen_w = @intCast(gfx.screen_w);
-    mouse.screen_h = @intCast(gfx.screen_h);
-    if (mouse.x >= mouse.screen_w) mouse.x = mouse.screen_w - 1;
-    if (mouse.y >= mouse.screen_h) mouse.y = mouse.screen_h - 1;
-}
 
 // --- Main entry point ---
 
@@ -1347,7 +332,7 @@ pub fn run() void {
     };
     const disp_w = so.width;
     const disp_h = so.height;
-    display_is_gop = (so.kind == .gop);
+    screen.display_is_gop = (so.kind == .gop);
 
     // Back-buffer policy:
     //   * virtio-gpu mode: composite directly into the device resource backing.
@@ -1365,23 +350,23 @@ pub fn run() void {
     // makes the compositor the sole writer of virtio-gpu's framebuffer.
     const force_back_buffer = (@import("../boot/boot_info.zig").boot_mode == 9);
     if (virtio_gpu.active and !force_back_buffer) {
-        backbuf = @as([*]volatile u32, @ptrCast(virtio_gpu.framebuffer));
-        bb_pages = 0;
+        screen.backbuf = @as([*]volatile u32, @ptrCast(virtio_gpu.framebuffer));
+        screen.bb_pages = 0;
         gfx.useFramebuffer(); // target := screen (= virtio-gpu resource backing)
         debug.klog("[desktop] Compositor: direct-to-resource (no back buffer)\n", .{});
-    } else if (display_is_gop and !gop.direct and !force_back_buffer) {
+    } else if (screen.display_is_gop and !gop.direct and !force_back_buffer) {
         // GOP blit mode: GUEST_FB only reaches the panel on flush — it IS a
         // back buffer already, the same shape as virtio's direct-to-resource.
-        backbuf = @as([*]volatile u32, @ptrCast(gop.framebuffer));
-        bb_pages = 0;
+        screen.backbuf = @as([*]volatile u32, @ptrCast(gop.framebuffer));
+        screen.bb_pages = 0;
         gfx.useFramebuffer(); // target := screen (= GUEST_FB blit source)
         debug.klog("[desktop] Compositor: direct-to-GUEST_FB (no extra back buffer)\n", .{});
     } else {
-        bb_pages = (disp_w * disp_h * 4 + 4095) / 4096;
-        if (paging.allocBackBuffer(bb_pages)) |buf| {
-            backbuf = buf;
+        screen.bb_pages = (disp_w * disp_h * 4 + 4095) / 4096;
+        if (paging.allocBackBuffer(screen.bb_pages)) |buf| {
+            screen.backbuf = buf;
             gfx.setTarget(buf, disp_w, disp_h);
-            debug.klog("[desktop] Back buffer: {d} pages (mode={d})\n", .{ bb_pages, @import("../boot/boot_info.zig").boot_mode });
+            debug.klog("[desktop] Back buffer: {d} pages (mode={d})\n", .{ screen.bb_pages, @import("../boot/boot_info.zig").boot_mode });
         } else {
             gfx.useFramebuffer();
             debug.klog("[desktop] WARNING: no back buffer\n", .{});
@@ -1429,11 +414,11 @@ pub fn run() void {
     wm.window_count = 0;
     @memset(slot_used, false);
     setFocused(0);
-    dragging = false;
-    prev_buttons = 0;
+    manage.dragging = false;
+    input.prev_buttons = 0;
     // Clicks made before the desktop existed are not for it.
     for (&mouse.press_count) |*c| _ = @atomicRmw(u8, c, .Xchg, 0, .monotonic);
-    press_backlog = .{ 0, 0, 0 };
+    input.press_backlog = .{ 0, 0, 0 };
 
     // Apply persisted UI config from /etc/zigos.conf (theme, dock, etc.).
     // Done before splash so the splash colors / theme reflect the user's
@@ -1441,7 +426,7 @@ pub fn run() void {
     conf.load();
 
     // Boot splash
-    splash.show(backbuf != null);
+    splash.show(screen.backbuf != null);
 
     const win_w: u32 = TERM_WIN_W;
     const win_h: u32 = TERM_ROWS * FONT_H + TITLEBAR_H;
@@ -1472,7 +457,7 @@ pub fn run() void {
     const use_hw_cursor = @import("../driver.zig").virtio_gpu.hw_cursor_active;
 
     renderScene();
-    if (backbuf != null) {
+    if (screen.backbuf != null) {
         if (!use_hw_cursor) bakeCursorToBackBuffer();
         gfx.blitToScreen();
         if (!use_hw_cursor) unbakeCursorFromBackBuffer();
@@ -1808,9 +793,9 @@ pub fn run() void {
             // reads it. handleMouseEvents clears it implicitly by acting
             // on cur position. Reset after we've published.
         }
-        if (cursor_moved or mouse.buttons != prev_buttons or pressReplayPending() or mouse.wheel != 0) {
+        if (cursor_moved or mouse.buttons != input.prev_buttons or pressReplayPending() or mouse.wheel != 0) {
             const btn = frameButtons();
-            const prev = prev_buttons;
+            const prev = input.prev_buttons;
             const moved = mouse.moved;
             mouse.moved = false;
             // handleMouseEvents drains the wheel; the focused app gets the
@@ -2011,7 +996,7 @@ pub fn run() void {
                         w.width + BORDER * 2 + 4,
                         w.height + TITLEBAR_H + BORDER * 2 + 4,
                     );
-                    if (backbuf != null) {
+                    if (screen.backbuf != null) {
                         renderWindow(gi);
                         // Re-paint any visible windows z-above `gi` that overlap
                         // its rect. renderWindow stamps pixels into the back
@@ -2064,7 +1049,7 @@ pub fn run() void {
 
         // Render based on what changed
         frameperf.prepDone();
-        if (backbuf != null) {
+        if (screen.backbuf != null) {
             switch (dirty) {
                 .full => {
                     renderScene();
@@ -2212,9 +1197,9 @@ pub fn run() void {
 
     vga.redirect_fn = null;
     session.redirect_win = null;
-    if (backbuf != null) {
-        paging.freeBackBuffer(bb_pages);
-        backbuf = null;
+    if (screen.backbuf != null) {
+        paging.freeBackBuffer(screen.bb_pages);
+        screen.backbuf = null;
     }
     bga.disable();
     debug.klog("[desktop] Returned to text mode\n", .{});
