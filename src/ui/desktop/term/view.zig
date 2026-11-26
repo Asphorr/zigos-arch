@@ -20,6 +20,8 @@ const TASKBAR_H = layout.TASKBAR_H;
 const TITLEBAR_H = layout.TITLEBAR_H;
 const BORDER = layout.BORDER;
 const CURSOR_BLINK_HALF_TICKS = theme.CURSOR_BLINK_HALF_TICKS;
+const chrome = @import("../chrome.zig");
+const scene = @import("../scene.zig");
 
 const emulator = @import("emulator.zig");
 const cells = @import("cells.zig");
@@ -37,10 +39,10 @@ const CORNER_R = corners.CORNER_R;
 const BOTTOM_CORNERS = corners.BOTTOM_CORNERS;
 const saveCornerPixels = corners.saveCornerPixels;
 const keepCornerPixels = corners.keepCornerPixels;
-const paddedWinRect = desktop.paddedWinRect;
-const MENUBAR_REACH = desktop.MENUBAR_REACH;
-const DOCK_REACH = desktop.DOCK_REACH;
-const borderColor = desktop.borderColor;
+const paddedWinRect = chrome.paddedWinRect;
+const MENUBAR_REACH = scene.MENUBAR_REACH;
+const DOCK_REACH = scene.DOCK_REACH;
+const borderColor = chrome.borderColor;
 
 /// The cell the cursor block of terminal `idx` is drawn in right now, or
 /// NO_CURSOR: unfocused, hidden, off the visible grid, or in the dark half

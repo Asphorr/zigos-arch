@@ -16,6 +16,30 @@ const events_mod = @import("events.zig");
 pub const Event = events_mod.Event;
 pub const EventKind = events_mod.EventKind;
 
+const chrome = @import("desktop/chrome.zig");
+pub const paddedWinRect = chrome.paddedWinRect;
+const renderWindow = chrome.renderWindow;
+pub const borderColor = chrome.borderColor;
+
+const scene = @import("desktop/scene.zig");
+const renderScene = scene.renderScene;
+pub const occludersAbove = scene.occludersAbove;
+pub const MENUBAR_REACH = scene.MENUBAR_REACH;
+pub const DOCK_REACH = scene.DOCK_REACH;
+const partialHitsOverlay = scene.partialHitsOverlay;
+const renderRegions = scene.renderRegions;
+const repaintZAboveOverlapping = scene.repaintZAboveOverlapping;
+const windowCovered = scene.windowCovered;
+
+const damage = @import("desktop/damage.zig");
+const accumVacated = damage.accumVacated;
+const seedRegion = damage.seedRegion;
+const seedRect = damage.seedRect;
+const seedWindow = damage.seedWindow;
+const wantRegion = damage.wantRegion;
+const wantTextRow = damage.wantTextRow;
+const DirtyKind = damage.DirtyKind;
+
 const client = @import("desktop/client.zig");
 const createWindow = client.createWindow;
 const closeWindow = client.closeWindow;
@@ -54,15 +78,10 @@ const emulator = @import("desktop/term/emulator.zig");
 const putCharOnWindow = emulator.putCharOnWindow;
 
 const cells = @import("desktop/term/cells.zig");
-const FONT_W = cells.FONT_W;
 const FONT_H = cells.FONT_H;
-const drawTermCells = cells.drawTermCells;
-const TERM_PAD = cells.TERM_PAD;
 const TERM_WIN_W = cells.TERM_WIN_W;
 
 const term_view = @import("desktop/term/view.zig");
-const termCursorCell = term_view.termCursorCell;
-const drawTermScrollbar = term_view.drawTermScrollbar;
 const renderTerminalRow = term_view.renderTerminalRow;
 const termRowsPaintable = term_view.termRowsPaintable;
 const repaintStaleRows = term_view.repaintStaleRows;
@@ -71,12 +90,6 @@ const session = @import("desktop/term/session.zig");
 const termPrompt = session.termPrompt;
 const spawnShellOnWindow = session.spawnShellOnWindow;
 const handleKeyboard = session.handleKeyboard;
-
-const corners = @import("desktop/corners.zig");
-const CORNER_R = corners.CORNER_R;
-const ALL_CORNERS = corners.ALL_CORNERS;
-const saveCornerPixels = corners.saveCornerPixels;
-const restoreCornerPixels = corners.restoreCornerPixels;
 
 const notify = @import("desktop/notify.zig");
 pub const showNotification = notify.showNotification;
@@ -93,7 +106,6 @@ var dbg_last_qfull_log: u64 = 0;
 // --- Window management (storage, z-stack, focus, hit-testing) ---
 const wm = @import("desktop/window.zig");
 const Window = wm.Window;
-const TerminalData = emulator.TerminalData;
 const ResizeEdge = wm.ResizeEdge;
 const windows = &wm.windows;
 const slot_used = &wm.slot_used;
@@ -178,18 +190,8 @@ const event_wait = @import("desktop/event_wait.zig");
 // display.flush/flushRect.
 const frameperf = @import("desktop/frameperf.zig");
 
-// Wallpaper presets + render moved to desktop/background.zig.
-const background = @import("desktop/background.zig");
-
 // --- Colors / palette / terminal tunables (see theme.zig) ---
 const theme = @import("theme.zig");
-const TITLEBAR_TEXT_F = theme.TITLEBAR_TEXT_F;
-const TITLEBAR_TEXT_U = theme.TITLEBAR_TEXT_U;
-const WINDOW_BG = theme.WINDOW_BG;
-const TERM_FG = theme.TERM_FG;
-const BTN_CLOSE = theme.BTN_CLOSE;
-const BTN_MINIMIZE = theme.BTN_MINIMIZE;
-const BTN_MAXIMIZE = theme.BTN_MAXIMIZE;
 
 // --- Layout ---
 // Spatial constants live in desktop/layout.zig so other extracted
@@ -200,19 +202,14 @@ const MENUBAR_H = layout.MENUBAR_H;
 const TASKBAR_H = layout.TASKBAR_H;
 const TITLEBAR_H = layout.TITLEBAR_H;
 const BORDER = layout.BORDER;
-const BTN_RADIUS = layout.BTN_RADIUS;
-const aa_font = @import("aa_font.zig");
 
-const TERM_COLS = emulator.TERM_COLS;
 const TERM_ROWS = emulator.TERM_ROWS;
 
 // --- Terminal escape / coloring (see theme.zig for the constant values) ---
 const CURSOR_BLINK_HALF_TICKS = theme.CURSOR_BLINK_HALF_TICKS;
-const BELL_FLASH_COLOR = theme.BELL_FLASH_COLOR;
 
 // --- Window ---
 const MAX_WINDOWS: u32 = @import("../config.zig").MAX_WINDOWS;
-const SCROLL_LINES: u32 = @import("../config.zig").SCROLL_LINES;
 
 // --- Drag state ---
 pub var dragging: bool = false;
@@ -232,38 +229,6 @@ const UNZOOM_DRAG_PX: u32 = 8;
 var drag_old_x: i32 = 0;
 var drag_old_y: i32 = 0;
 
-// Vacated-region accumulator for the tight drag repaint (renderRegions).
-// Each move event unions the dragged window's OLD padded rect in here.
-// Today handleMouseEvents runs once per frame so this sees one rect per
-// frame; the union is defensive so every vacated strip is restored even if
-// that ever changes. Screen-unclamped signed coords; consumed and
-// invalidated once per rendered frame.
-var drag_accum_valid: bool = false;
-var drag_accum_x0: i32 = 0;
-var drag_accum_y0: i32 = 0;
-var drag_accum_x1: i32 = 0;
-var drag_accum_y1: i32 = 0;
-
-/// Union the shadow-padded rect of a (about to be vacated) window position
-/// into the drag accumulator.
-fn accumVacated(x: i32, y: i32, w_px: u32, h_px: u32) void {
-    const x0 = x - SHADOW_SPAD;
-    const y0 = y - SHADOW_SPAD;
-    const x1 = x + @as(i32, @intCast(w_px)) + SHADOW_SPAD;
-    const y1 = y + @as(i32, @intCast(h_px)) + SHADOW_SPAD;
-    if (!drag_accum_valid) {
-        drag_accum_x0 = x0;
-        drag_accum_y0 = y0;
-        drag_accum_x1 = x1;
-        drag_accum_y1 = y1;
-        drag_accum_valid = true;
-    } else {
-        drag_accum_x0 = @min(drag_accum_x0, x0);
-        drag_accum_y0 = @min(drag_accum_y0, y0);
-        drag_accum_x1 = @max(drag_accum_x1, x1);
-        drag_accum_y1 = @max(drag_accum_y1, y1);
-    }
-}
 var prev_buttons: u8 = 0;
 
 // Resize state
@@ -302,12 +267,6 @@ fn adoptBackBuffer(nb: [*]volatile u32) void {
     @import("gpu_compositor.zig").backBufferAdopted();
     debug.klog("[desktop] Back buffer: drawing into the GPU compositor's source\n", .{});
 }
-
-/// Incremented at the start of every renderScene call. The mode-9 GPU
-/// compositor caches the last value it saw; if unchanged since the last
-/// frame, the desktop hasn't redrawn, so the compositor can skip its
-/// full-screen blit + flush. Saves ~12 ms/frame when idle.
-pub var render_tick: u32 = 0;
 
 // --- Cursor ---
 const CURSOR_W: u32 = 12;
@@ -459,98 +418,6 @@ fn bringToFront(slot: u8) void {
 
 // --- Scene rendering (to back buffer) ---
 
-/// True iff some window above z_stack[z_pos] in z-order fully contains
-/// `idx`'s rect. Used by renderScene to skip painting hidden lower
-/// windows. Conservative — only checks single-window containment, not
-/// multi-window region unions, so it under-skips rather than over-skips.
-fn isCoveredByUpper(z_pos: u8, idx: u8) bool {
-    const w = &windows[idx];
-    if (w.fullscreen) return false; // fullscreen self never gets skipped
-    const w_left: i32 = w.x;
-    const w_top: i32 = w.y;
-    const w_right: i32 = w.x + @as(i32, @intCast(w.width));
-    const w_bot: i32 = w.y + @as(i32, @intCast(w.height));
-
-    var k: u8 = z_pos + 1;
-    while (k < wm.z_count) : (k += 1) {
-        const u = &windows[z_stack[k]];
-        // One mid-animation is see-through and not yet at its rect.
-        if (!u.visible or u.minimized or u.anim_type != .none) continue;
-        // Strict containment of `w`'s rect inside `u`'s rect. Doesn't
-        // account for shadow extents or rounded-corner alpha — tiny
-        // visible slivers of the lower window would survive, but the
-        // back buffer keeps the previous frame's shadow pixels valid
-        // until something forces a repaint.
-        const u_left: i32 = u.x;
-        const u_top: i32 = u.y;
-        const u_right: i32 = u.x + @as(i32, @intCast(u.width));
-        const u_bot: i32 = u.y + @as(i32, @intCast(u.height));
-        if (u_left <= w_left and u_top <= w_top and
-            u_right >= w_right and u_bot >= w_bot)
-        {
-            return true;
-        }
-    }
-    return false;
-}
-
-fn renderScene() void {
-    render_tick +%= 1;
-    // Maximized windows now keep menubar + dock visible (they only fill
-    // the usable area between them), so the background + shortcuts paint
-    // unconditionally — they're never fully occluded by a single window.
-    background.render();
-    shortcuts.render();
-    // Full scene re-render — background.render() above wiped the entire
-    // back buffer to wallpaper, so each visible window must re-blend its
-    // drop shadow. Setting shadow_dirty=true here covers .full and .drag
-    // paths (both call renderScene); content-only updates (.gui_only /
-    // .text_only) call renderWindow directly *without* clearing first,
-    // so they correctly leave the existing back-buffer shadow alone.
-    {
-        var si: u8 = 0;
-        while (si < wm.z_count) : (si += 1) {
-            const idx = z_stack[si];
-            if (windows[idx].visible) windows[idx].shadow_dirty = true;
-        }
-    }
-    // Render in z-order, bottom→top, so the topmost window paints last
-    // and any focus highlight / cursor lands above its neighbors.
-    // Skip a window if any opaque window above fully contains it — its
-    // pixels would be entirely overpainted, so paint + dirty-rect work
-    // is wasted. Catches the common "fullscreen on top" + "alt-tab to
-    // a maximized app" cases for free; conservative single-window
-    // containment test, doesn't try to compute multi-window union.
-    var k: u8 = 0;
-    while (k < wm.z_count) : (k += 1) {
-        const i = z_stack[k];
-        if (!windows[i].visible) continue;
-        if (isCoveredByUpper(k, i)) continue;
-        renderWindow(i);
-    }
-    const focused_title: ?[]const u8 = if (slot_used[wm.focused] and windows[wm.focused].visible)
-        windows[wm.focused].title[0..windows[wm.focused].title_len]
-    else
-        null;
-    menubar.render(focused_title);
-    dock.render();
-    dock.renderTooltip();
-    toast.render();
-    context_menu.render();
-    launcher.render();
-    // Drag ghost (semi-transparent icon following the cursor) renders
-    // last so it floats above windows, menubar, dock, toast, and any
-    // context menu. The cursor itself paints after renderScene returns
-    // and stays on top of the ghost.
-    shortcuts.renderDragGhost();
-    // Damage signal for the GPU compositor (mode 9). MUST be at the end
-    // of renderScene so the compositor's wake reads a fully-painted
-    // backbuf. Calling it at the top would race: compositor wakes,
-    // samples bb mid-paint or empty-on-first-frame, then idles forever
-    // → pitch-black screen. No-op when the compositor task isn't up.
-    @import("gpu_compositor.zig").requestRender();
-}
-
 // ─── Region repaint ─────────────────────────────────────────────────────────
 // Frames that change a few known spots — terminal output, a window drag, an
 // overlay appearing or moving — repaint only those spots instead of the whole
@@ -561,372 +428,6 @@ fn renderScene() void {
 // or its blend accumulates: the shadow-darkening bug class). Intersecting
 // closures merge; each disjoint region is then painted in renderScene's
 // order, pixel-identical to renderScene inside it, untouched outside.
-
-/// Expandable bbox for a region closure. growOver unions a rect in only
-/// when it intersects and isn't already contained, and records growth so
-/// the fixpoint loop knows when to stop.
-const Bbox = struct {
-    x0: i32,
-    y0: i32,
-    x1: i32,
-    y1: i32,
-    grew: bool = false,
-
-    fn intersects(self: Bbox, o: Bbox) bool {
-        return self.x0 < o.x1 and o.x0 < self.x1 and self.y0 < o.y1 and o.y0 < self.y1;
-    }
-
-    fn growOver(self: *Bbox, bx0: i32, by0: i32, bx1: i32, by1: i32) void {
-        if (!self.intersects(.{ .x0 = bx0, .y0 = by0, .x1 = bx1, .y1 = by1 })) return;
-        const contained = bx0 >= self.x0 and by0 >= self.y0 and bx1 <= self.x1 and by1 <= self.y1;
-        if (contained) return;
-        self.x0 = @min(self.x0, bx0);
-        self.y0 = @min(self.y0, by0);
-        self.x1 = @max(self.x1, bx1);
-        self.y1 = @max(self.y1, by1);
-        self.grew = true;
-    }
-};
-
-/// Shadow-padded outer rect [x0, y0, x1, y1) of a window — the full extent
-/// renderWindow can paint (shadow band ⊂ SHADOW_SPAD pad, see SHADOW_*).
-pub fn paddedWinRect(i: u8) [4]i32 {
-    const w = &windows[i];
-    return .{
-        w.x - SHADOW_SPAD,
-        w.y - SHADOW_SPAD,
-        w.x + @as(i32, @intCast(w.width)) + SHADOW_SPAD,
-        w.y + @as(i32, @intCast(w.height)) + SHADOW_SPAD,
-    };
-}
-
-/// Mode 9: what the backbuf shows on top of window `i`, as rects
-/// [x0, y0, x1, y1) — the windows above it (bordered, without their
-/// shadow: the backbuf holds no content under a GPU-slot window's
-/// shadow), the menubar, the dock and the overlays — up to out.len of
-/// them. The GPU compositor draws a GPU-slot window's content and then
-/// the backbuf again over these. Caller holds the windows lock and the
-/// compositor's source lock, so this matches the last finished desktop
-/// iteration.
-pub fn occludersAbove(i: u8, out: [][4]i32) usize {
-    var n: usize = 0;
-    var above = false;
-    for (z_stack[0..wm.z_count]) |j| {
-        const w = &windows[j];
-        if (above and n < out.len and w.visible and !w.minimized) {
-            out[n] = .{
-                w.x - @as(i32, BORDER),
-                w.y - @as(i32, BORDER),
-                w.x + @as(i32, @intCast(w.width + BORDER)),
-                w.y + @as(i32, @intCast(w.height + BORDER)),
-            };
-            n += 1;
-        }
-        if (j == i) above = true;
-    }
-    const bands = [_]?[4]i32{
-        .{ 0, 0, @intCast(gfx.screen_w), @as(i32, MENUBAR_H) },
-        dock.pillRect(),
-        dock.tooltip_painted,
-        toast.painted,
-        context_menu.painted,
-        launcher.painted,
-    };
-    for (bands) |b| {
-        const r = b orelse continue;
-        if (n == out.len) break;
-        out[n] = r;
-        n += 1;
-    }
-    return n;
-}
-
-// Glass reach: the menubar's blurRegion radius 6 (+saturate), the dock's
-// fillGlass radius 8 + pill soft shadow +2, and the overlays' fillGlass
-// radius ≤ 6. Each joins a closure padded by its reach so the blur never
-// samples stale pixels.
-pub const MENUBAR_REACH: i32 = @as(i32, MENUBAR_H) + 8;
-pub const DOCK_REACH: i32 = 12;
-const OVERLAY_REACH: i32 = 8;
-
-const MAX_REGION_SEEDS = 16;
-var region_seeds: [MAX_REGION_SEEDS]Bbox = undefined;
-var region_seed_count: u8 = 0;
-/// The focused terminal's text row changed during a .region/.drag frame.
-/// Painted on its own, like .text_only, unless its window is repainted
-/// in a region anyway.
-var text_row_pending: bool = false;
-
-/// Queue [x0, y0, x1, y1) for this frame's region repaint. Past the cap,
-/// seeds merge into the last one.
-fn seedRegion(x0: i32, y0: i32, x1: i32, y1: i32) void {
-    if (x1 <= x0 or y1 <= y0) return;
-    if (region_seed_count == MAX_REGION_SEEDS) {
-        const b = &region_seeds[MAX_REGION_SEEDS - 1];
-        b.x0 = @min(b.x0, x0);
-        b.y0 = @min(b.y0, y0);
-        b.x1 = @max(b.x1, x1);
-        b.y1 = @max(b.y1, y1);
-        return;
-    }
-    region_seeds[region_seed_count] = .{ .x0 = x0, .y0 = y0, .x1 = x1, .y1 = y1 };
-    region_seed_count += 1;
-}
-
-fn seedRect(r: [4]i32) void {
-    seedRegion(r[0], r[1], r[2], r[3]);
-}
-
-fn seedWindow(i: u8) void {
-    if (i >= MAX_WINDOWS or !slot_used[i]) return;
-    if (!windows[i].visible or windows[i].minimized) return;
-    seedRect(paddedWinRect(i));
-}
-
-fn sameRect(a: ?[4]i32, b: ?[4]i32) bool {
-    const ra = a orelse return b == null;
-    const rb = b orelse return false;
-    return ra[0] == rb[0] and ra[1] == rb[1] and ra[2] == rb[2] and ra[3] == rb[3];
-}
-
-/// An overlay that appeared, vanished or moved since it was last painted
-/// needs both its old and its new rect repainted.
-fn seedOverlayMove(painted: ?[4]i32, now: ?[4]i32) void {
-    if (sameRect(painted, now)) return;
-    if (painted) |r| seedRect(r);
-    if (now) |r| seedRect(r);
-}
-
-/// True if an overlay on screen, or about to be, overlaps `r`.
-fn overlayOver(r: [4]i32) bool {
-    const area = Bbox{ .x0 = r[0], .y0 = r[1], .x1 = r[2], .y1 = r[3] };
-    const overlays = [_]?[4]i32{
-        dock.tooltip_painted, toast.painted, context_menu.painted, launcher.painted,
-        dock.tooltipRect(),   toast.rect(),  context_menu.rect(),  launcher.rect(),
-    };
-    for (overlays) |o| {
-        const q = o orelse continue;
-        if (area.intersects(.{ .x0 = q[0], .y0 = q[1], .x1 = q[2], .y1 = q[3] })) return true;
-    }
-    return false;
-}
-
-/// True if this frame's partial window repaint — .gui_only's tracker rects,
-/// .text_only's focused terminal — overlaps an overlay, which it would
-/// paint over.
-fn partialHitsOverlay(dirty: DirtyKind) bool {
-    if (dock.tooltip_painted == null and toast.painted == null and context_menu.painted == null and
-        launcher.painted == null and
-        !dock.isTooltipVisible() and !toast.isActive() and !context_menu.active and !launcher.active) return false;
-    if (dirty == .text_only) return slot_used[wm.focused] and overlayOver(paddedWinRect(wm.focused));
-    if (dirty_rects_mod.isFull()) return true;
-    const n = dirty_rects_mod.rectCount(); // can flip to full on cap overflow
-    if (dirty_rects_mod.isFull()) return true;
-    var i: u8 = 0;
-    while (i < n) : (i += 1) {
-        const r = dirty_rects_mod.getRect(i);
-        if (overlayOver(.{ @intCast(r[0]), @intCast(r[1]), @intCast(r[0] + r[2]), @intCast(r[1] + r[3]) })) return true;
-    }
-    return false;
-}
-
-/// Make this frame a region repaint of what has been seeded.
-fn wantRegion(dirty: *DirtyKind) void {
-    switch (dirty.*) {
-        .full, .drag, .region => {},
-        .text_only => {
-            text_row_pending = true;
-            dirty.* = .region;
-        },
-        .none, .cursor_only, .gui_only => dirty.* = .region,
-    }
-}
-
-/// The focused terminal's text row changed (keystroke echo, cursor blink).
-fn wantTextRow(dirty: *DirtyKind) void {
-    switch (dirty.*) {
-        .none, .cursor_only => dirty.* = .text_only,
-        .text_only, .full => {},
-        .region, .drag => text_row_pending = true,
-        .gui_only => {
-            text_row_pending = true;
-            dirty.* = .region;
-        },
-    }
-}
-
-/// The focused terminal's text row {x, y, w, h} as .text_only paints and
-/// flushes it, null when there is none on screen.
-fn textRowRect() ?[4]u32 {
-    if (!slot_used[wm.focused]) return null;
-    const cw = &windows[wm.focused];
-    const ct = cw.term orelse return null;
-    if (!cw.visible or cw.minimized) return null;
-    const ry = cw.y + @as(i32, TITLEBAR_H) + @as(i32, @intCast(@as(u32, ct.text_row) * FONT_H));
-    if (ry < 0) return null;
-    return .{ if (cw.x < 0) 0 else @intCast(cw.x), @intCast(ry), cw.width, FONT_H };
-}
-
-fn focusedTitle() ?[]const u8 {
-    return if (slot_used[wm.focused] and windows[wm.focused].visible)
-        windows[wm.focused].title[0..windows[wm.focused].title_len]
-    else
-        null;
-}
-
-const OverlayRects = struct { tip: ?[4]i32, toast: ?[4]i32, menu: ?[4]i32, launcher: ?[4]i32 };
-
-/// Grow `u` until every layer it touches lies wholly inside it. Each pass
-/// only grows over a fixed item set, so the fixpoint takes ≤ items passes
-/// (1–2 in practice).
-fn closeRegion(u: *Bbox, ov: OverlayRects) void {
-    const dock_y: i32 = dock.dockY();
-    const sw_i: i32 = @intCast(gfx.screen_w);
-    u.grew = true;
-    while (u.grew) {
-        u.grew = false;
-        var k: u8 = 0;
-        while (k < wm.z_count) : (k += 1) {
-            const i = z_stack[k];
-            if (!windows[i].visible or windows[i].minimized) continue;
-            const r = paddedWinRect(i);
-            u.growOver(r[0], r[1], r[2], r[3]);
-        }
-        var si: usize = 0;
-        while (si < shortcuts.cellCount()) : (si += 1) {
-            const c = shortcuts.cellRect(si);
-            u.growOver(c[0], c[1], c[0] + c[2], c[1] + c[3]);
-        }
-        u.growOver(0, 0, sw_i, MENUBAR_REACH);
-        u.growOver(0, dock_y - DOCK_REACH, sw_i, dock_y + @as(i32, TASKBAR_H) + DOCK_REACH);
-        for ([_]?[4]i32{ ov.tip, ov.toast, ov.menu, ov.launcher }) |o| {
-            const r = o orelse continue;
-            u.growOver(r[0] - OVERLAY_REACH, r[1] - OVERLAY_REACH, r[2] + OVERLAY_REACH, r[3] + OVERLAY_REACH);
-        }
-    }
-}
-
-/// Whether a closed region holds an overlay's paint. With nothing to draw
-/// the overlay's render() only records that, so let it run.
-fn overlayIn(u: Bbox, r: ?[4]i32) bool {
-    const o = r orelse return true;
-    return u.intersects(.{ .x0 = o[0], .y0 = o[1], .x1 = o[2], .y1 = o[3] });
-}
-
-/// Paint one closed region in renderScene's order.
-fn paintRegion(u: Bbox, ov: OverlayRects) void {
-    const ux: u32 = if (u.x0 < 0) 0 else @intCast(u.x0);
-    const uy: u32 = if (u.y0 < 0) 0 else @intCast(u.y0);
-    const ux1: u32 = if (u.x1 < 0) 0 else @min(@as(u32, @intCast(u.x1)), gfx.screen_w);
-    const uy1: u32 = if (u.y1 < 0) 0 else @min(@as(u32, @intCast(u.y1)), gfx.screen_h);
-    if (ux1 <= ux or uy1 <= uy) return;
-
-    background.renderRect(ux, uy, ux1 - ux, uy1 - uy);
-    shortcuts.renderRect(u.x0, u.y0, u.x1, u.y1);
-    var k: u8 = 0;
-    while (k < wm.z_count) : (k += 1) {
-        const i = z_stack[k];
-        if (!windows[i].visible or windows[i].minimized) continue;
-        const r = paddedWinRect(i);
-        const inter = r[0] < u.x1 and u.x0 < r[2] and r[1] < u.y1 and u.y0 < r[3];
-        if (!inter) continue;
-        // Mirror renderScene's containment skip — a fully-covered window's
-        // shadow is never painted there, and painting it here would show a
-        // shadow sliver poking past the coverer that pops away on release.
-        if (isCoveredByUpper(k, i)) continue;
-        // The closure put this window's whole padded rect on freshly restored
-        // wallpaper, so the shadow re-blend can't accumulate frame-over-frame.
-        // (Two overlapping non-containing shadows double-blend exactly like
-        // renderScene does — same pixels, not a divergence.)
-        windows[i].shadow_dirty = true;
-        renderWindow(i);
-    }
-    // A band the region reaches lies wholly inside it (closure).
-    if (u.y0 < MENUBAR_REACH) menubar.render(focusedTitle());
-    if (u.y1 > dock.dockY() - DOCK_REACH) dock.render();
-    if (overlayIn(u, ov.tip)) dock.renderTooltip();
-    if (overlayIn(u, ov.toast)) toast.render();
-    if (overlayIn(u, ov.menu)) context_menu.render();
-    if (overlayIn(u, ov.launcher)) launcher.render();
-    addDirtyRect(ux, uy, ux1 - ux, uy1 - uy);
-}
-
-/// Repaint this frame's seeds — plus the window-drag union, the windows the
-/// GUI recomposite already stamped, and any overlay that moved — as closed
-/// regions. Returns false, and the caller repaints the full scene, under the
-/// software cursor (its previous position isn't modeled), during an icon drag
-/// (nor is the ghost), or when the frame is already forced full.
-fn renderRegions(use_hw_cursor: bool) bool {
-    if (!use_hw_cursor or shortcuts.isDragging()) return false;
-    if (dirty_rects_mod.isFull()) return false;
-    const n = dirty_rects_mod.rectCount(); // can flip to full on cap overflow
-    if (dirty_rects_mod.isFull()) return false;
-
-    var ri: u8 = 0;
-    while (ri < n) : (ri += 1) {
-        const r = dirty_rects_mod.getRect(ri);
-        seedRegion(@intCast(r[0]), @intCast(r[1]), @intCast(r[0] + r[2]), @intCast(r[1] + r[3]));
-    }
-    if (dragging and drag_accum_valid) {
-        seedRegion(drag_accum_x0, drag_accum_y0, drag_accum_x1, drag_accum_y1);
-        seedWindow(drag_win);
-    }
-    const ov = OverlayRects{ .tip = dock.tooltipRect(), .toast = toast.rect(), .menu = context_menu.rect(), .launcher = launcher.rect() };
-    seedOverlayMove(dock.tooltip_painted, ov.tip);
-    seedOverlayMove(toast.painted, ov.toast);
-    seedOverlayMove(context_menu.painted, ov.menu);
-    seedOverlayMove(launcher.painted, ov.launcher);
-    // A pending text row is painted alone unless an overlay lies over its
-    // window (the row paint would cover it) or the window lands in a region.
-    var row = if (text_row_pending) textRowRect() else null;
-    if (row != null and overlayOver(paddedWinRect(wm.focused))) {
-        seedWindow(wm.focused);
-        row = null;
-    }
-
-    var regions = region_seeds;
-    var count = region_seed_count;
-    region_seed_count = 0;
-    for (regions[0..count]) |*u| closeRegion(u, ov);
-    // Merge until disjoint: then every layer lies in exactly one region and
-    // the regions paint independently.
-    var merged = true;
-    while (merged) {
-        merged = false;
-        var i: u8 = 0;
-        scan: while (i < count) : (i += 1) {
-            var j: u8 = i + 1;
-            while (j < count) : (j += 1) {
-                const a = regions[i];
-                const b = regions[j];
-                if (!a.intersects(b)) continue;
-                regions[i] = .{ .x0 = @min(a.x0, b.x0), .y0 = @min(a.y0, b.y0), .x1 = @max(a.x1, b.x1), .y1 = @max(a.y1, b.y1) };
-                closeRegion(&regions[i], ov);
-                count -= 1;
-                regions[j] = regions[count];
-                merged = true;
-                break :scan;
-            }
-        }
-    }
-    for (regions[0..count]) |u| paintRegion(u, ov);
-    if (row) |r| {
-        // A window touching a region lies wholly inside it (closure), so
-        // the row is either repainted already or clear of every region.
-        const fw = paddedWinRect(wm.focused);
-        const win = Bbox{ .x0 = fw[0], .y0 = fw[1], .x1 = fw[2], .y1 = fw[3] };
-        var in_region = false;
-        for (regions[0..count]) |u| in_region = in_region or u.intersects(win);
-        if (!in_region) {
-            renderTerminalRow(wm.focused);
-            addDirtyRect(r[0], r[1], r[2], r[3]);
-        }
-    }
-    // An overlay that moved while painting (the dock re-laid out its
-    // buttons) may have landed outside every region.
-    return sameRect(dock.tooltip_painted, ov.tip) and sameRect(toast.painted, ov.toast) and
-        sameRect(context_menu.painted, ov.menu) and sameRect(launcher.painted, ov.launcher);
-}
 
 fn launchShortcut(idx: usize) void {
     const sc = &pinned.list[idx];
@@ -991,434 +492,6 @@ fn launchPath(path: []const u8) void {
 // Boot splash extracted to desktop/splash.zig — the long animation
 // loop is unrelated to anything else here.
 const splash = @import("desktop/splash.zig");
-
-// ─── Window drop-shadow geometry ────────────────────────────────────────────
-// A soft "elevation" shadow on ALL FOUR sides, biased downward so the bottom
-// reads heavier than the top (key light from above) — the macOS/material look,
-// not the old right+bottom-only drop shadow. Shared by renderWindow (the blend),
-// the dirty-rect, and the z-occlusion test so all three agree on the extent.
-//
-//   SHADOW_R    — reach in px beyond the window border (corners included)
-//   SHADOW_OFFY — downward offset of the shadow caster; the bottom gains +OFFY
-//                 of reach, the top loses OFFY of contact strength
-//   SHADOW_PEAK — max alpha byte at contact (~19%) under the focused window;
-//                 the others cast SHADOW_UNFOCUSED_NUM/16 of it, so the active
-//                 window reads as the one nearest the viewer
-const SHADOW_R = 26;
-const SHADOW_OFFY = 8;
-const SHADOW_PEAK = 0x30;
-const SHADOW_UNFOCUSED_NUM = 9;
-// One symmetric pad that over-covers the (asymmetric) shadow on every side —
-// used by the dirty-rect and the occlusion test. Over-covering is harmless
-// (a few extra wallpaper px get repainted/flushed); under-covering smears.
-const SHADOW_SPAD: i32 = SHADOW_R + SHADOW_OFFY + @as(i32, BORDER) + 2;
-
-// Precomputed at COMPILE time: shadow_lut[dy][dx] = alpha byte for a pixel that
-// is (dx, dy) px from the (offset) window rect. Euclidean distance → naturally
-// round corners; (1 − smoothstep) falloff → soft shoulder near the window and a
-// clean vanish at the rim (no hard cut line). Building it at comptime keeps the
-// runtime hot path free of sqrt/float, both slow-or-broken on the freestanding-
-// baseline target (see the @floatFromInt / @floor freestanding gotchas).
-const shadow_lut: [SHADOW_R + 1][SHADOW_R + 1]u8 = blk: {
-    @setEvalBranchQuota(20000);
-    var lut: [SHADOW_R + 1][SHADOW_R + 1]u8 = [_][SHADOW_R + 1]u8{[_]u8{0} ** (SHADOW_R + 1)} ** (SHADOW_R + 1);
-    const r: f64 = SHADOW_R;
-    for (0..SHADOW_R + 1) |dy| {
-        for (0..SHADOW_R + 1) |dx| {
-            const fx: f64 = @floatFromInt(dx);
-            const fy: f64 = @floatFromInt(dy);
-            const dist = @sqrt(fx * fx + fy * fy);
-            if (dist < r) {
-                const t = dist / r; // 0 at contact … 1 at the rim
-                const fall = 1.0 - (3.0 * t * t - 2.0 * t * t * t); // 1 − smoothstep
-                lut[dy][dx] = @intFromFloat(fall * @as(f64, SHADOW_PEAK));
-            }
-        }
-    }
-    break :blk lut;
-};
-
-/// Re-render every visible window above `target` in z-order whose outer
-/// rect (including shadow) overlaps `target`. Called from partial-render
-/// paths (`.gui_only`) after the target window has been stamped into the
-/// back buffer — without this, the target's paint clobbers z-higher
-/// neighbors in the overlap region because renderWindow doesn't itself
-/// know about stacking order.
-///
-/// The shadow is now all-around (see SHADOW_* above), so the overlap test is
-/// widened by SHADOW_SPAD on EVERY side, not just lower+right.
-fn repaintZAboveOverlapping(target: u8) void {
-    if (target >= MAX_WINDOWS or !slot_used[target]) return;
-    const t = &windows[target];
-    const t_left: i32 = t.x - SHADOW_SPAD;
-    const t_top: i32 = t.y - SHADOW_SPAD;
-    const t_right: i32 = t.x + @as(i32, @intCast(t.width)) + SHADOW_SPAD;
-    const t_bot: i32 = t.y + @as(i32, @intCast(t.height)) + SHADOW_SPAD;
-
-    var zi: u8 = 0;
-    while (zi < wm.z_count and z_stack[zi] != target) : (zi += 1) {}
-    if (zi >= wm.z_count) return;
-    zi += 1;
-    while (zi < wm.z_count) : (zi += 1) {
-        const ai = z_stack[zi];
-        const aw = &windows[ai];
-        if (!aw.visible or aw.minimized) continue;
-        const a_left: i32 = aw.x - SHADOW_SPAD;
-        const a_top: i32 = aw.y - SHADOW_SPAD;
-        const a_right: i32 = aw.x + @as(i32, @intCast(aw.width)) + SHADOW_SPAD;
-        const a_bot: i32 = aw.y + @as(i32, @intCast(aw.height)) + SHADOW_SPAD;
-        const overlaps = a_right > t_left and a_left < t_right and a_bot > t_top and a_top < t_bot;
-        if (!overlaps) continue;
-        // Do NOT set shadow_dirty here. Re-blending the 7.8% alpha shadow
-        // over its previous frame on every .gui_only tick accumulates to
-        // black (see [[project_shadow_dirty_flag]] / window-shadow-
-        // accumulation-fix). The chrome+content repaint below covers the
-        // overlap clobber; the existing shadow pixels from the last full
-        // render stay in the back buffer wherever the target didn't write,
-        // which is the common case for "focused terminal above an updating
-        // GUI app". A stale-shadow strip only appears in the (rarer) case
-        // where the target's rect actually intersects this window's shadow
-        // band, and gets fully refreshed on the next renderScene pass.
-        renderWindow(ai);
-    }
-}
-
-fn renderWindow(idx: u8) void {
-    const w = &windows[idx];
-    if (!w.visible or w.minimized) return;
-    const is_focused = (idx == wm.focused);
-    const dark = conf.theme == 1;
-
-    // Maximized windows render through the same chrome path as normal
-    // windows — they're just laid out in the usable area. The old
-    // fullscreen-scaling shortcut here was the source of the "ruins
-    // UI for non-Doom apps" complaint: scaling a 480-px window to
-    // 1920 px gave blurry pixel slop. Now the app's framebuffer renders
-    // at its own resolution (centered if alloc-capped) inside the
-    // maximized window frame.
-
-    // Mark this window's region (incl. the all-around soft shadow) dirty for
-    // partial GPU flush. SHADOW_SPAD pads every side; clamp the origin to the
-    // screen and let addDirtyRect clip the far edges.
-    const sx0: i32 = w.x - SHADOW_SPAD;
-    const sy0: i32 = w.y - SHADOW_SPAD;
-    const ddx: u32 = if (sx0 < 0) 0 else @intCast(sx0);
-    const ddy: u32 = if (sy0 < 0) 0 else @intCast(sy0);
-    const span: u32 = @intCast(2 * SHADOW_SPAD);
-    addDirtyRect(ddx, ddy, w.width + span, w.height + span);
-
-    // Soft "elevation" drop shadow on ALL FOUR sides, biased downward so the
-    // bottom reads heavier than the top (key light from above). The shadow is
-    // cast by the window+border rect shifted down by SHADOW_OFFY; per-pixel
-    // alpha comes from the comptime shadow_lut keyed by the (dx,dy) distance to
-    // that rect — Euclidean, so the corners round off naturally. See SHADOW_*.
-    //
-    // Gated on `w.shadow_dirty` so content-only redraws don't re-blend over the
-    // previous frame's shadow (which would accumulate to black after ~30 frames
-    // on a 60fps app like sysmon). Redrawn on every shadow_dirty frame (incl.
-    // each drag step); the scalar per-pixel blend is bounded by the shadow-band
-    // area and runs only here, never on content-only ticks.
-    if (w.shadow_dirty) {
-        const ol = w.x - @as(i32, BORDER);
-        const ot = w.y - @as(i32, BORDER);
-        const orr = w.x + @as(i32, @intCast(w.width)) + @as(i32, BORDER);
-        const ob = w.y + @as(i32, @intCast(w.height)) + @as(i32, BORDER);
-        const ct = ot + SHADOW_OFFY; // caster top/bottom (left/right unshifted)
-        const cb = ob + SHADOW_OFFY;
-        const tw: i32 = @intCast(gfx.target_w);
-        const th: i32 = @intCast(gfx.target_h);
-
-        var py: i32 = ct - SHADOW_R;
-        while (py < cb + SHADOW_R) : (py += 1) {
-            if (py < 0 or py >= th) continue;
-            // vertical distance from the (offset) caster rect, 0 inside its span
-            const dy_i: i32 = if (py < ct) ct - py else if (py >= cb) py - cb + 1 else 0;
-            if (dy_i > SHADOW_R) continue;
-            const row: u32 = @as(u32, @intCast(py)) * gfx.target_w;
-            var px: i32 = ol - SHADOW_R;
-            while (px < orr + SHADOW_R) : (px += 1) {
-                if (px < 0 or px >= tw) continue;
-                // Skip the window's own footprint — chrome paints over it
-                // below. Its corner squares are not skipped: what shows past
-                // the rounded corners lies in the shadow like its surroundings.
-                if (px >= ol and px < orr and py >= ot and py < ob) {
-                    const cr: i32 = CORNER_R;
-                    const in_x = px < ol + cr or px >= orr - cr;
-                    const in_y = py < ot + cr or py >= ob - cr;
-                    if (!(in_x and in_y)) continue;
-                }
-                const dx_i: i32 = if (px < ol) ol - px else if (px >= orr) px - orr + 1 else 0;
-                if (dx_i > SHADOW_R) continue;
-                var a: u32 = shadow_lut[@intCast(dy_i)][@intCast(dx_i)];
-                if (!is_focused) a = a * SHADOW_UNFOCUSED_NUM / 16;
-                if (a == 0) continue;
-                const off: u32 = row + @as(u32, @intCast(px));
-                gfx.target[off] = gfx.blendPixel(gfx.target[off], a << 24);
-            }
-        }
-        w.shadow_dirty = false;
-    }
-
-    // What lies behind the rounded corners, shadow included, before the
-    // chrome is drawn over it.
-    saveCornerPixels(w.x - @as(i32, BORDER), w.y - @as(i32, BORDER), w.width + BORDER * 2, w.height + BORDER * 2, ALL_CORNERS);
-
-    const border_color = borderColor(w, is_focused);
-    gfx.drawRect(w.x - @as(i32, BORDER), w.y - @as(i32, BORDER), w.width + BORDER * 2, w.height + BORDER * 2, border_color);
-
-    // Title bar: a shallow gradient. The focused window's is a step brighter
-    // and carries a 1px highlight on its top edge; the others sit flatter so
-    // the eye goes to the active one.
-    const tb_top: u32 = if (dark)
-        (if (is_focused) @as(u32, 0x3B3B3E) else @as(u32, 0x2B2B2D))
-    else
-        (if (is_focused) @as(u32, 0xF6F6F6) else @as(u32, 0xECECEC));
-    const tb_bot: u32 = if (dark)
-        (if (is_focused) @as(u32, 0x303033) else @as(u32, 0x28282A))
-    else
-        (if (is_focused) @as(u32, 0xE6E6E6) else @as(u32, 0xE4E4E4));
-    {
-        var row: u32 = 0;
-        while (row < TITLEBAR_H) : (row += 1) {
-            const c = background.lerpColor(tb_top, tb_bot, row, TITLEBAR_H);
-            gfx.fillRect(w.x, w.y + @as(i32, @intCast(row)), w.width, 1, c);
-        }
-    }
-    // Focus highlight — 1px bright bevel along the top edge of the active
-    // window's titlebar. Subtle (white at ~20% alpha for dark theme, slightly
-    // less for light), reads as "this window is alive".
-    if (is_focused) {
-        const hi_a: u32 = if (dark) @as(u32, 0x26000000) else @as(u32, 0x40000000);
-        gfx.fillRectAlpha(w.x, w.y, w.width, 1, hi_a | 0x00FFFFFF);
-    }
-    // Separator under the titlebar: darker than the bar in either theme.
-    const sep_color: u32 = if (dark)
-        (if (is_focused) @as(u32, 0x1A1A1C) else @as(u32, 0x202022))
-    else
-        (if (is_focused) @as(u32, 0xC2C2C2) else @as(u32, 0xD2D2D2));
-    gfx.drawHLine(w.x, w.y + @as(i32, TITLEBAR_H) - 1, w.width, sep_color);
-
-    // Traffic lights (left side): a flat disc inside a 1px darker rim. An
-    // unfocused window's turn a uniform gray, so the red/amber/green marks
-    // the window that takes input.
-    const idle_fill: u32 = if (dark) 0x55555A else 0xCDCDCD;
-    const lights = [3][2]u32{
-        .{ BTN_CLOSE, 0xDF4840 },
-        .{ BTN_MINIMIZE, 0xDCA025 },
-        .{ BTN_MAXIMIZE, 0x1FA82F },
-    };
-    for (lights, 0..) |l, n| {
-        const c = wm.trafficLightCenter(w.x, w.y, @intCast(n));
-        if (is_focused) {
-            gfx.drawFilledCircle(c[0], c[1], BTN_RADIUS, l[1]);
-            gfx.drawFilledCircle(c[0], c[1], BTN_RADIUS - 1, l[0]);
-        } else {
-            gfx.drawFilledCircle(c[0], c[1], BTN_RADIUS, idle_fill);
-        }
-    }
-
-    // Centered title, SF Pro Text 13 semibold. It yields to the traffic
-    // lights: a title too wide to center clear of them is left-aligned
-    // after them, and one too wide for that is not drawn.
-    const text_color = if (dark)
-        (if (is_focused) @as(u32, 0xE4E4E6) else @as(u32, 0x77777C))
-    else
-        (if (is_focused) TITLEBAR_TEXT_F else TITLEBAR_TEXT_U);
-    {
-        const title_atlas = aa_font.getDefault13Semibold();
-        const title_text = w.title[0..w.title_len];
-        const title_px_w: u32 = title_atlas.measure(title_text);
-        const lights_end: u32 = @intCast(layout.BTN_FIRST_X + 2 * layout.BTN_PITCH + @as(i32, BTN_RADIUS) + 10);
-        const title_y = w.y + @divTrunc(@as(i32, TITLEBAR_H) - @as(i32, @intCast(title_atlas.line_height)), 2);
-        if (title_px_w + lights_end * 2 <= w.width) {
-            const title_x = w.x + @as(i32, @intCast((w.width - title_px_w) / 2));
-            aa_font.drawText(title_x, title_y, title_text, text_color, title_atlas);
-        } else if (title_px_w + lights_end + 8 <= w.width) {
-            aa_font.drawText(w.x + @as(i32, @intCast(lights_end)), title_y, title_text, text_color, title_atlas);
-        }
-    }
-
-    // Content area
-    const content_y = w.y + @as(i32, TITLEBAR_H);
-    const content_h = w.height -| TITLEBAR_H;
-
-    // Read the published back buffer if the app has presented at least
-    // once. Until then, read gui_fb directly so apps that never call
-    // libc.present() still render. Apps that do present (cube) get
-    // tear-free reads via the triple-buffer rotation.
-    const pub_idx = w.gui_fb_pub.load(.acquire);
-    const active_back: ?[*]volatile u32 = if (w.has_presented) w.gui_fb_backs[pub_idx] else w.gui_fb;
-    if (w.gpu_slot != null) {
-        // Phase 8: slot-backed window. The GPU compositor's per-window
-        // draw samples the dmabuf directly and overlays it on top of
-        // the backbuf in the same render pass that consumes the
-        // backbuf for the background — so the CPU blit below would
-        // just write pixels the GPU overdraws. Chrome (titlebar/
-        // borders/shadow drawn earlier in this fn) stays in the
-        // backbuf and shows via the background pass.
-    } else if (active_back orelse w.gui_fb) |fb| {
-        // GUI app window — blit the active kernel back buffer to the desktop
-        // back buffer. Falls back to gui_fb only on legacy windows that
-        // pre-date the triple-buffer change (none should exist post-
-        // sysCreateWindow change; defensive fallback).
-
-        // Source = the app's rendered content extent, capped to its FB
-        // allocation (reading past it would walk into the next row through
-        // the smaller stride).
-        const src_w: u32 = if (w.gui_alloc_w > 0) @min(w.gui_w, w.gui_alloc_w) else w.gui_w;
-        const src_h: u32 = if (w.gui_alloc_h > 0) @min(w.gui_h, w.gui_alloc_h) else w.gui_h;
-        const stride = if (w.gui_alloc_w > 0) w.gui_alloc_w else w.gui_w;
-        // Destination = the FULL window content area. When it equals the source
-        // (normal/dragged window — drag is capped at the alloc) we blit 1:1:
-        // crisp + fast (rep movsl). When it's larger (F10 maximize past the FB
-        // alloc) we nearest-neighbor UPSCALE so the content fills the window
-        // instead of sitting alloc-sized in the corner with wallpaper around it.
-        // (cpu-comp path; the GPU compositor does the equivalent via uv_scale.)
-        const dst_w: u32 = w.width;
-        const dst_h: u32 = content_h;
-        if (src_w != 0 and src_h != 0 and dst_w != 0 and dst_h != 0) {
-            if (src_w == dst_w and src_h == dst_h) {
-                var row: u32 = 0;
-                while (row < dst_h) : (row += 1) {
-                    const py = content_y + @as(i32, @intCast(row));
-                    if (py < 0) continue;
-                    if (py >= @as(i32, @intCast(gfx.target_h))) break;
-                    if (w.x >= @as(i32, @intCast(gfx.target_w))) continue;
-                    const dst_x: u32 = if (w.x < 0) 0 else @intCast(w.x);
-                    const src_skip: u32 = if (w.x < 0) @intCast(-w.x) else 0;
-                    const avail = gfx.target_w - dst_x;
-                    const count = @min(dst_w -| src_skip, avail);
-                    if (count == 0) continue;
-                    const dst_off = @as(u32, @intCast(py)) * gfx.target_w + dst_x;
-                    const src_off = row * stride + src_skip;
-                    const dest = @intFromPtr(gfx.target) + dst_off * 4;
-                    const src = @intFromPtr(fb) + src_off * 4;
-                    asm volatile ("cld; rep movsl"
-                        :
-                        : [dst] "{rdi}" (dest),
-                          [src] "{rsi}" (src),
-                          [cnt] "{rcx}" (count),
-                        : .{ .rdi = true, .rsi = true, .rcx = true, .memory = true }
-                    );
-                }
-            } else {
-                // Nearest-neighbor scale src→dst. 16.16 fixed-point sampled per
-                // pixel (stateless, so the screen-edge `continue`/`break` clips
-                // can't desync the source index) — no per-pixel divide and no
-                // large stack buffer, keeping pid 2's kstack lean.
-                const x_step: u32 = (src_w << 16) / dst_w;
-                const y_step: u32 = (src_h << 16) / dst_h;
-                var row: u32 = 0;
-                while (row < dst_h) : (row += 1) {
-                    const py = content_y + @as(i32, @intCast(row));
-                    if (py < 0) continue;
-                    if (py >= @as(i32, @intCast(gfx.target_h))) break;
-                    const sy: u32 = @min((row * y_step) >> 16, src_h - 1);
-                    const src_row: [*]volatile u32 = @ptrFromInt(@intFromPtr(fb) + @as(usize, sy) * stride * 4);
-                    const dst_row_base = @as(u32, @intCast(py)) * gfx.target_w;
-                    var col: u32 = 0;
-                    while (col < dst_w) : (col += 1) {
-                        const dx = w.x + @as(i32, @intCast(col));
-                        if (dx < 0) continue;
-                        if (dx >= @as(i32, @intCast(gfx.target_w))) break;
-                        const sx: u32 = @min((col * x_step) >> 16, src_w - 1);
-                        gfx.target[dst_row_base + @as(u32, @intCast(dx))] = src_row[sx];
-                    }
-                }
-            }
-        }
-    } else if (w.term) |t| {
-        // Terminal window — draw text buffer (with scrollback support)
-        gfx.fillRect(w.x, content_y, w.width, content_h, WINDOW_BG);
-        gfx.drawHLine(w.x, content_y, w.width, 0x151515);
-
-        const max_rows = content_h / FONT_H;
-        const max_cols = (w.width - TERM_PAD * 2) / FONT_W;
-
-        if (t.scroll_view > 0 and t.scroll_count > 0) {
-            // Scrolled-back view: show scrollback + text_buf
-            t.painted_valid = false;
-            var row: u32 = 0;
-            while (row < max_rows) : (row += 1) {
-                const total_lines = @as(u32, t.scroll_count) + @as(u32, t.text_row) + 1;
-                const view_bottom = total_lines -| @as(u32, t.scroll_view);
-                const view_top = view_bottom -| max_rows;
-                const line_idx = view_top + row;
-                if (line_idx >= total_lines) break;
-
-                const y = content_y + @as(i32, @intCast(row * FONT_H));
-                if (line_idx < t.scroll_count) {
-                    const at = (@as(u32, t.scroll_write) + SCROLL_LINES - t.scroll_count + line_idx) % SCROLL_LINES * TERM_COLS;
-                    drawTermCells(w.x, y, t.scroll_buf[at..], t.scroll_attr_buf[at..], t.scroll_fg_rgb_buf[at..], t.scroll_bg_rgb_buf[at..], max_cols);
-                } else {
-                    const tb_row = line_idx - @as(u32, t.scroll_count);
-                    if (tb_row >= TERM_ROWS) continue;
-                    const at = tb_row * TERM_COLS;
-                    drawTermCells(w.x, y, t.text_buf[at..], t.attr_buf[at..], t.fg_rgb_buf[at..], t.bg_rgb_buf[at..], max_cols);
-                }
-            }
-            gfx.drawString(w.x + @as(i32, @intCast(w.width)) - 80, content_y + 2, "[PgDn]", 0x666688, WINDOW_BG);
-        } else {
-            // Live view.
-            var row: u32 = 0;
-            while (row < TERM_ROWS and row < max_rows) : (row += 1) {
-                const at = row * TERM_COLS;
-                drawTermCells(w.x, content_y + @as(i32, @intCast(row * FONT_H)), t.text_buf[at..], t.attr_buf[at..], t.fg_rgb_buf[at..], t.bg_rgb_buf[at..], max_cols);
-            }
-
-            // Text cursor — blink unless the user just typed / output just landed.
-            const cursor = termCursorCell(idx, w, t, max_cols, max_rows);
-            if (cursor != TerminalData.NO_CURSOR) {
-                gfx.fillRect(
-                    w.x + @as(i32, @intCast(TERM_PAD + @as(u32, t.text_col) * FONT_W)),
-                    content_y + @as(i32, @intCast(@as(u32, t.text_row) * FONT_H)),
-                    FONT_W,
-                    FONT_H,
-                    TERM_FG,
-                );
-            }
-            // The rows now show exactly these cells.
-            t.painted_text = t.text_buf;
-            t.painted_attr = t.attr_buf;
-            t.painted_rgb = t.fg_rgb_buf;
-            t.painted_bg = t.bg_rgb_buf;
-            t.painted_cursor = cursor;
-            t.painted_scroll_count = t.scroll_count;
-            t.painted_valid = true;
-        }
-
-        drawTermScrollbar(w, t);
-    }
-
-    // Animation fade overlay
-    if (w.anim_type != .none) {
-        const frame: u32 = w.anim_frame;
-        const total: u32 = w.anim_total;
-        const fade_alpha: u32 = switch (w.anim_type) {
-            .opening, .restoring, .unfullscreening => 255 -| (frame * 255 / (total + 1)),
-            .closing, .minimizing, .fullscreening => frame * 255 / (total + 1),
-            .none => 0,
-        };
-        if (fade_alpha > 0) {
-            gfx.fillRectAlpha(w.x, w.y, w.width, w.height, (fade_alpha << 24));
-            if (w.term) |t| t.painted_valid = false;
-        }
-    }
-
-    // Round the corners last: the content fills the window's rect down to
-    // its bottom corners. The border color traces the arcs.
-    restoreCornerPixels(w.x - @as(i32, BORDER), w.y - @as(i32, BORDER), w.width + BORDER * 2, w.height + BORDER * 2, border_color, ALL_CORNERS);
-}
-
-/// The 1px window border, a hairline a touch off the body. Flashes while a
-/// terminal's bell_phase counts down.
-pub fn borderColor(w: *const Window, is_focused: bool) u32 {
-    if (w.term) |t| if (t.bell_phase > 0) return BELL_FLASH_COLOR;
-    return if (conf.theme == 1)
-        (if (is_focused) @as(u32, 0x4A4A4E) else @as(u32, 0x38383B))
-    else
-        (if (is_focused) @as(u32, 0xB4B4B4) else @as(u32, 0xC8C8C8));
-}
 
 // --- Cursor ---
 
@@ -1505,10 +578,6 @@ fn unbakeCursorFromBackBuffer() void {
 }
 
 // --- Event handling ---
-
-/// What this frame repaints. .region repaints the queued seeds (see
-/// renderRegions); .drag is the same path driven by a window drag.
-const DirtyKind = enum { none, cursor_only, text_only, drag, full, gui_only, region };
 
 // --- Launcher ---
 
@@ -2759,7 +1828,7 @@ pub fn run() void {
                     // A pending row (keypress / cursor blink) rides along with
                     // the drag's regions.
                     .text_only => {
-                        text_row_pending = true;
+                        damage.text_row_pending = true;
                         dirty = .drag;
                     },
                     else => dirty = .drag,
@@ -3124,9 +2193,9 @@ pub fn run() void {
         // Any rendered frame consumed (region path) or superseded (full paths)
         // the vacated-region accumulator and the region seeds; both come with
         // dirty ∈ {.drag, .region, .full}, so no repaint is lost by clearing.
-        drag_accum_valid = false;
-        region_seed_count = 0;
-        text_row_pending = false;
+        damage.drag_accum_valid = false;
+        damage.region_seed_count = 0;
+        damage.text_row_pending = false;
         ftrace.mark(.desk_done, @intFromEnum(dirty));
         frameperf.frameEnd(switch (dirty) {
             .none => .none,
@@ -3289,23 +2358,6 @@ const DRAIN_SLICE_BYTES: usize = 16 * 1024;
 var gui_windows_active: bool = false;
 /// A visible GUI window is being re-composited on the auto-refresh timer.
 var gui_autorefresh_active: bool = false;
-
-/// True if a window above `z_pos` in the stack hides window `wi` whole, so
-/// that a new frame of it changes nothing on screen. The margin keeps clear
-/// of the cover's rounded corners.
-fn windowCovered(z_pos: usize, wi: u8) bool {
-    const COVER_MARGIN: i32 = 12;
-    const w = &windows[wi];
-    const x1 = w.x + @as(i32, @intCast(w.width));
-    const y1 = w.y + @as(i32, @intCast(w.height));
-    for (z_stack[z_pos + 1 .. wm.z_count]) |ui| {
-        const u = &windows[ui];
-        if (!slot_used[ui] or !u.visible or u.minimized or u.anim_type != .none) continue;
-        if (w.x >= u.x + COVER_MARGIN and x1 <= u.x + @as(i32, @intCast(u.width)) - COVER_MARGIN and
-            w.y >= u.y and y1 <= u.y + @as(i32, @intCast(u.height))) return true;
-    }
-    return false;
-}
 
 /// Called by timer IRQ handler to decide when to return control to the desktop.
 /// In event-driven mode, the floor wakeups (DESKTOP_INTERVAL + GUI 3-tick) are
