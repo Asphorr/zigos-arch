@@ -20,6 +20,7 @@ const TASKBAR_H = layout.TASKBAR_H;
 const TITLEBAR_H = layout.TITLEBAR_H;
 const BORDER = layout.BORDER;
 const CURSOR_BLINK_HALF_TICKS = theme.CURSOR_BLINK_HALF_TICKS;
+const SCROLL_LINES: u32 = @import("../../../config.zig").SCROLL_LINES;
 const chrome = @import("../chrome.zig");
 const scene = @import("../scene.zig");
 
@@ -216,4 +217,70 @@ pub fn repaintStaleRows(idx: u8) bool {
         painted = true;
     }
     return painted;
+}
+
+/// Paint a terminal window's content area: the rows of the live grid, or of
+/// the scrollback it is scrolled to, the cursor block and the scrollback
+/// bar. A paint of the live view records what the rows now show.
+pub fn paintContent(idx: u8, w: *const Window, t: *TerminalData, content_y: i32, content_h: u32) void {
+    // Terminal window — draw text buffer (with scrollback support)
+    gfx.fillRect(w.x, content_y, w.width, content_h, WINDOW_BG);
+    gfx.drawHLine(w.x, content_y, w.width, 0x151515);
+
+    const max_rows = content_h / FONT_H;
+    const max_cols = (w.width - TERM_PAD * 2) / FONT_W;
+
+    if (t.scroll_view > 0 and t.scroll_count > 0) {
+        // Scrolled-back view: show scrollback + text_buf
+        t.painted_valid = false;
+        var row: u32 = 0;
+        while (row < max_rows) : (row += 1) {
+            const total_lines = @as(u32, t.scroll_count) + @as(u32, t.text_row) + 1;
+            const view_bottom = total_lines -| @as(u32, t.scroll_view);
+            const view_top = view_bottom -| max_rows;
+            const line_idx = view_top + row;
+            if (line_idx >= total_lines) break;
+
+            const y = content_y + @as(i32, @intCast(row * FONT_H));
+            if (line_idx < t.scroll_count) {
+                const at = (@as(u32, t.scroll_write) + SCROLL_LINES - t.scroll_count + line_idx) % SCROLL_LINES * TERM_COLS;
+                drawTermCells(w.x, y, t.scroll_buf[at..], t.scroll_attr_buf[at..], t.scroll_fg_rgb_buf[at..], t.scroll_bg_rgb_buf[at..], max_cols);
+            } else {
+                const tb_row = line_idx - @as(u32, t.scroll_count);
+                if (tb_row >= TERM_ROWS) continue;
+                const at = tb_row * TERM_COLS;
+                drawTermCells(w.x, y, t.text_buf[at..], t.attr_buf[at..], t.fg_rgb_buf[at..], t.bg_rgb_buf[at..], max_cols);
+            }
+        }
+        gfx.drawString(w.x + @as(i32, @intCast(w.width)) - 80, content_y + 2, "[PgDn]", 0x666688, WINDOW_BG);
+    } else {
+        // Live view.
+        var row: u32 = 0;
+        while (row < TERM_ROWS and row < max_rows) : (row += 1) {
+            const at = row * TERM_COLS;
+            drawTermCells(w.x, content_y + @as(i32, @intCast(row * FONT_H)), t.text_buf[at..], t.attr_buf[at..], t.fg_rgb_buf[at..], t.bg_rgb_buf[at..], max_cols);
+        }
+
+        // Text cursor — blink unless the user just typed / output just landed.
+        const cursor = termCursorCell(idx, w, t, max_cols, max_rows);
+        if (cursor != TerminalData.NO_CURSOR) {
+            gfx.fillRect(
+                w.x + @as(i32, @intCast(TERM_PAD + @as(u32, t.text_col) * FONT_W)),
+                content_y + @as(i32, @intCast(@as(u32, t.text_row) * FONT_H)),
+                FONT_W,
+                FONT_H,
+                TERM_FG,
+            );
+        }
+        // The rows now show exactly these cells.
+        t.painted_text = t.text_buf;
+        t.painted_attr = t.attr_buf;
+        t.painted_rgb = t.fg_rgb_buf;
+        t.painted_bg = t.bg_rgb_buf;
+        t.painted_cursor = cursor;
+        t.painted_scroll_count = t.scroll_count;
+        t.painted_valid = true;
+    }
+
+    drawTermScrollbar(w, t);
 }

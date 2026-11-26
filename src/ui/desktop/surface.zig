@@ -4,6 +4,7 @@
 // short.
 
 const std = @import("std");
+const gfx = @import("../gfx.zig");
 const Phys = @import("../../util/addr.zig").Phys;
 const paging = @import("../../mm/paging.zig");
 const pmm = @import("../../mm/pmm.zig");
@@ -415,4 +416,92 @@ pub fn hasGuiWindows() bool {
         if (windows[i].gui_fb != null and windows[i].visible) return true;
     }
     return false;
+}
+
+/// Paint the content of a program's window into the back buffer, below its
+/// titlebar. False for a window that has no framebuffer (a terminal).
+pub fn paintContent(w: *const Window, content_y: i32, content_h: u32) bool {
+    // Read the published back buffer if the app has presented at least
+    // once. Until then, read gui_fb directly so apps that never call
+    // libc.present() still render. Apps that do present (cube) get
+    // tear-free reads via the triple-buffer rotation.
+    const pub_idx = w.gui_fb_pub.load(.acquire);
+    const active_back: ?[*]volatile u32 = if (w.has_presented) w.gui_fb_backs[pub_idx] else w.gui_fb;
+    // A slot window: the GPU compositor's per-window draw samples the
+    // dmabuf itself and lays it over the back buffer in the pass that takes
+    // the back buffer for the background, so a blit here would only write
+    // pixels the GPU overdraws. The frame around it stays in the back buffer.
+    if (w.gpu_slot != null) return true;
+    const fb = active_back orelse w.gui_fb orelse return false;
+    // GUI app window — blit the active kernel back buffer to the desktop
+    // back buffer. Falls back to gui_fb only on legacy windows that
+    // pre-date the triple-buffer change (none should exist post-
+    // sysCreateWindow change; defensive fallback).
+
+    // Source = the app's rendered content extent, capped to its FB
+    // allocation (reading past it would walk into the next row through
+    // the smaller stride).
+    const src_w: u32 = if (w.gui_alloc_w > 0) @min(w.gui_w, w.gui_alloc_w) else w.gui_w;
+    const src_h: u32 = if (w.gui_alloc_h > 0) @min(w.gui_h, w.gui_alloc_h) else w.gui_h;
+    const stride = if (w.gui_alloc_w > 0) w.gui_alloc_w else w.gui_w;
+    // Destination = the FULL window content area. When it equals the source
+    // (normal/dragged window — drag is capped at the alloc) we blit 1:1:
+    // crisp + fast (rep movsl). When it's larger (F10 maximize past the FB
+    // alloc) we nearest-neighbor UPSCALE so the content fills the window
+    // instead of sitting alloc-sized in the corner with wallpaper around it.
+    // (cpu-comp path; the GPU compositor does the equivalent via uv_scale.)
+    const dst_w: u32 = w.width;
+    const dst_h: u32 = content_h;
+    if (src_w != 0 and src_h != 0 and dst_w != 0 and dst_h != 0) {
+        if (src_w == dst_w and src_h == dst_h) {
+            var row: u32 = 0;
+            while (row < dst_h) : (row += 1) {
+                const py = content_y + @as(i32, @intCast(row));
+                if (py < 0) continue;
+                if (py >= @as(i32, @intCast(gfx.target_h))) break;
+                if (w.x >= @as(i32, @intCast(gfx.target_w))) continue;
+                const dst_x: u32 = if (w.x < 0) 0 else @intCast(w.x);
+                const src_skip: u32 = if (w.x < 0) @intCast(-w.x) else 0;
+                const avail = gfx.target_w - dst_x;
+                const count = @min(dst_w -| src_skip, avail);
+                if (count == 0) continue;
+                const dst_off = @as(u32, @intCast(py)) * gfx.target_w + dst_x;
+                const src_off = row * stride + src_skip;
+                const dest = @intFromPtr(gfx.target) + dst_off * 4;
+                const src = @intFromPtr(fb) + src_off * 4;
+                asm volatile ("cld; rep movsl"
+                    :
+                    : [dst] "{rdi}" (dest),
+                      [src] "{rsi}" (src),
+                      [cnt] "{rcx}" (count),
+                    : .{ .rdi = true, .rsi = true, .rcx = true, .memory = true }
+                );
+            }
+        } else {
+            // Nearest-neighbor scale src→dst. 16.16 fixed-point sampled per
+            // pixel (stateless, so the screen-edge `continue`/`break` clips
+            // can't desync the source index) — no per-pixel divide and no
+            // large stack buffer, keeping pid 2's kstack lean.
+            const x_step: u32 = (src_w << 16) / dst_w;
+            const y_step: u32 = (src_h << 16) / dst_h;
+            var row: u32 = 0;
+            while (row < dst_h) : (row += 1) {
+                const py = content_y + @as(i32, @intCast(row));
+                if (py < 0) continue;
+                if (py >= @as(i32, @intCast(gfx.target_h))) break;
+                const sy: u32 = @min((row * y_step) >> 16, src_h - 1);
+                const src_row: [*]volatile u32 = @ptrFromInt(@intFromPtr(fb) + @as(usize, sy) * stride * 4);
+                const dst_row_base = @as(u32, @intCast(py)) * gfx.target_w;
+                var col: u32 = 0;
+                while (col < dst_w) : (col += 1) {
+                    const dx = w.x + @as(i32, @intCast(col));
+                    if (dx < 0) continue;
+                    if (dx >= @as(i32, @intCast(gfx.target_w))) break;
+                    const sx: u32 = @min((col * x_step) >> 16, src_w - 1);
+                    gfx.target[dst_row_base + @as(u32, @intCast(dx))] = src_row[sx];
+                }
+            }
+        }
+    }
+    return true;
 }

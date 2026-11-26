@@ -3,15 +3,8 @@
 // animation, the rounded corners.
 
 const gfx = @import("../gfx.zig");
-const emulator = @import("term/emulator.zig");
-const cells = @import("term/cells.zig");
-const FONT_W = cells.FONT_W;
-const FONT_H = cells.FONT_H;
-const drawTermCells = cells.drawTermCells;
-const TERM_PAD = cells.TERM_PAD;
 const term_view = @import("term/view.zig");
-const termCursorCell = term_view.termCursorCell;
-const drawTermScrollbar = term_view.drawTermScrollbar;
+const surface = @import("surface.zig");
 const corners = @import("corners.zig");
 const CORNER_R = corners.CORNER_R;
 const ALL_CORNERS = corners.ALL_CORNERS;
@@ -19,7 +12,6 @@ const saveCornerPixels = corners.saveCornerPixels;
 const restoreCornerPixels = corners.restoreCornerPixels;
 const wm = @import("window.zig");
 const Window = wm.Window;
-const TerminalData = emulator.TerminalData;
 const windows = &wm.windows;
 const conf = @import("config.zig");
 const dirty_rects_mod = @import("dirty.zig");
@@ -28,8 +20,6 @@ const background = @import("background.zig");
 const theme = @import("../theme.zig");
 const TITLEBAR_TEXT_F = theme.TITLEBAR_TEXT_F;
 const TITLEBAR_TEXT_U = theme.TITLEBAR_TEXT_U;
-const WINDOW_BG = theme.WINDOW_BG;
-const TERM_FG = theme.TERM_FG;
 const BTN_CLOSE = theme.BTN_CLOSE;
 const BTN_MINIMIZE = theme.BTN_MINIMIZE;
 const BTN_MAXIMIZE = theme.BTN_MAXIMIZE;
@@ -38,10 +28,7 @@ const TITLEBAR_H = layout.TITLEBAR_H;
 const BORDER = layout.BORDER;
 const BTN_RADIUS = layout.BTN_RADIUS;
 const aa_font = @import("../aa_font.zig");
-const TERM_COLS = emulator.TERM_COLS;
-const TERM_ROWS = emulator.TERM_ROWS;
 const BELL_FLASH_COLOR = theme.BELL_FLASH_COLOR;
-const SCROLL_LINES: u32 = @import("../../config.zig").SCROLL_LINES;
 
 // ─── Window drop-shadow geometry ────────────────────────────────────────────
 // A soft "elevation" shadow on ALL FOUR sides, biased downward so the bottom
@@ -256,156 +243,12 @@ pub fn renderWindow(idx: u8) void {
         }
     }
 
-    // Content area
+    // Content area: a program's window shows its framebuffer, a terminal
+    // its cells.
     const content_y = w.y + @as(i32, TITLEBAR_H);
     const content_h = w.height -| TITLEBAR_H;
-
-    // Read the published back buffer if the app has presented at least
-    // once. Until then, read gui_fb directly so apps that never call
-    // libc.present() still render. Apps that do present (cube) get
-    // tear-free reads via the triple-buffer rotation.
-    const pub_idx = w.gui_fb_pub.load(.acquire);
-    const active_back: ?[*]volatile u32 = if (w.has_presented) w.gui_fb_backs[pub_idx] else w.gui_fb;
-    if (w.gpu_slot != null) {
-        // Phase 8: slot-backed window. The GPU compositor's per-window
-        // draw samples the dmabuf directly and overlays it on top of
-        // the backbuf in the same render pass that consumes the
-        // backbuf for the background — so the CPU blit below would
-        // just write pixels the GPU overdraws. Chrome (titlebar/
-        // borders/shadow drawn earlier in this fn) stays in the
-        // backbuf and shows via the background pass.
-    } else if (active_back orelse w.gui_fb) |fb| {
-        // GUI app window — blit the active kernel back buffer to the desktop
-        // back buffer. Falls back to gui_fb only on legacy windows that
-        // pre-date the triple-buffer change (none should exist post-
-        // sysCreateWindow change; defensive fallback).
-
-        // Source = the app's rendered content extent, capped to its FB
-        // allocation (reading past it would walk into the next row through
-        // the smaller stride).
-        const src_w: u32 = if (w.gui_alloc_w > 0) @min(w.gui_w, w.gui_alloc_w) else w.gui_w;
-        const src_h: u32 = if (w.gui_alloc_h > 0) @min(w.gui_h, w.gui_alloc_h) else w.gui_h;
-        const stride = if (w.gui_alloc_w > 0) w.gui_alloc_w else w.gui_w;
-        // Destination = the FULL window content area. When it equals the source
-        // (normal/dragged window — drag is capped at the alloc) we blit 1:1:
-        // crisp + fast (rep movsl). When it's larger (F10 maximize past the FB
-        // alloc) we nearest-neighbor UPSCALE so the content fills the window
-        // instead of sitting alloc-sized in the corner with wallpaper around it.
-        // (cpu-comp path; the GPU compositor does the equivalent via uv_scale.)
-        const dst_w: u32 = w.width;
-        const dst_h: u32 = content_h;
-        if (src_w != 0 and src_h != 0 and dst_w != 0 and dst_h != 0) {
-            if (src_w == dst_w and src_h == dst_h) {
-                var row: u32 = 0;
-                while (row < dst_h) : (row += 1) {
-                    const py = content_y + @as(i32, @intCast(row));
-                    if (py < 0) continue;
-                    if (py >= @as(i32, @intCast(gfx.target_h))) break;
-                    if (w.x >= @as(i32, @intCast(gfx.target_w))) continue;
-                    const dst_x: u32 = if (w.x < 0) 0 else @intCast(w.x);
-                    const src_skip: u32 = if (w.x < 0) @intCast(-w.x) else 0;
-                    const avail = gfx.target_w - dst_x;
-                    const count = @min(dst_w -| src_skip, avail);
-                    if (count == 0) continue;
-                    const dst_off = @as(u32, @intCast(py)) * gfx.target_w + dst_x;
-                    const src_off = row * stride + src_skip;
-                    const dest = @intFromPtr(gfx.target) + dst_off * 4;
-                    const src = @intFromPtr(fb) + src_off * 4;
-                    asm volatile ("cld; rep movsl"
-                        :
-                        : [dst] "{rdi}" (dest),
-                          [src] "{rsi}" (src),
-                          [cnt] "{rcx}" (count),
-                        : .{ .rdi = true, .rsi = true, .rcx = true, .memory = true }
-                    );
-                }
-            } else {
-                // Nearest-neighbor scale src→dst. 16.16 fixed-point sampled per
-                // pixel (stateless, so the screen-edge `continue`/`break` clips
-                // can't desync the source index) — no per-pixel divide and no
-                // large stack buffer, keeping pid 2's kstack lean.
-                const x_step: u32 = (src_w << 16) / dst_w;
-                const y_step: u32 = (src_h << 16) / dst_h;
-                var row: u32 = 0;
-                while (row < dst_h) : (row += 1) {
-                    const py = content_y + @as(i32, @intCast(row));
-                    if (py < 0) continue;
-                    if (py >= @as(i32, @intCast(gfx.target_h))) break;
-                    const sy: u32 = @min((row * y_step) >> 16, src_h - 1);
-                    const src_row: [*]volatile u32 = @ptrFromInt(@intFromPtr(fb) + @as(usize, sy) * stride * 4);
-                    const dst_row_base = @as(u32, @intCast(py)) * gfx.target_w;
-                    var col: u32 = 0;
-                    while (col < dst_w) : (col += 1) {
-                        const dx = w.x + @as(i32, @intCast(col));
-                        if (dx < 0) continue;
-                        if (dx >= @as(i32, @intCast(gfx.target_w))) break;
-                        const sx: u32 = @min((col * x_step) >> 16, src_w - 1);
-                        gfx.target[dst_row_base + @as(u32, @intCast(dx))] = src_row[sx];
-                    }
-                }
-            }
-        }
-    } else if (w.term) |t| {
-        // Terminal window — draw text buffer (with scrollback support)
-        gfx.fillRect(w.x, content_y, w.width, content_h, WINDOW_BG);
-        gfx.drawHLine(w.x, content_y, w.width, 0x151515);
-
-        const max_rows = content_h / FONT_H;
-        const max_cols = (w.width - TERM_PAD * 2) / FONT_W;
-
-        if (t.scroll_view > 0 and t.scroll_count > 0) {
-            // Scrolled-back view: show scrollback + text_buf
-            t.painted_valid = false;
-            var row: u32 = 0;
-            while (row < max_rows) : (row += 1) {
-                const total_lines = @as(u32, t.scroll_count) + @as(u32, t.text_row) + 1;
-                const view_bottom = total_lines -| @as(u32, t.scroll_view);
-                const view_top = view_bottom -| max_rows;
-                const line_idx = view_top + row;
-                if (line_idx >= total_lines) break;
-
-                const y = content_y + @as(i32, @intCast(row * FONT_H));
-                if (line_idx < t.scroll_count) {
-                    const at = (@as(u32, t.scroll_write) + SCROLL_LINES - t.scroll_count + line_idx) % SCROLL_LINES * TERM_COLS;
-                    drawTermCells(w.x, y, t.scroll_buf[at..], t.scroll_attr_buf[at..], t.scroll_fg_rgb_buf[at..], t.scroll_bg_rgb_buf[at..], max_cols);
-                } else {
-                    const tb_row = line_idx - @as(u32, t.scroll_count);
-                    if (tb_row >= TERM_ROWS) continue;
-                    const at = tb_row * TERM_COLS;
-                    drawTermCells(w.x, y, t.text_buf[at..], t.attr_buf[at..], t.fg_rgb_buf[at..], t.bg_rgb_buf[at..], max_cols);
-                }
-            }
-            gfx.drawString(w.x + @as(i32, @intCast(w.width)) - 80, content_y + 2, "[PgDn]", 0x666688, WINDOW_BG);
-        } else {
-            // Live view.
-            var row: u32 = 0;
-            while (row < TERM_ROWS and row < max_rows) : (row += 1) {
-                const at = row * TERM_COLS;
-                drawTermCells(w.x, content_y + @as(i32, @intCast(row * FONT_H)), t.text_buf[at..], t.attr_buf[at..], t.fg_rgb_buf[at..], t.bg_rgb_buf[at..], max_cols);
-            }
-
-            // Text cursor — blink unless the user just typed / output just landed.
-            const cursor = termCursorCell(idx, w, t, max_cols, max_rows);
-            if (cursor != TerminalData.NO_CURSOR) {
-                gfx.fillRect(
-                    w.x + @as(i32, @intCast(TERM_PAD + @as(u32, t.text_col) * FONT_W)),
-                    content_y + @as(i32, @intCast(@as(u32, t.text_row) * FONT_H)),
-                    FONT_W,
-                    FONT_H,
-                    TERM_FG,
-                );
-            }
-            // The rows now show exactly these cells.
-            t.painted_text = t.text_buf;
-            t.painted_attr = t.attr_buf;
-            t.painted_rgb = t.fg_rgb_buf;
-            t.painted_bg = t.bg_rgb_buf;
-            t.painted_cursor = cursor;
-            t.painted_scroll_count = t.scroll_count;
-            t.painted_valid = true;
-        }
-
-        drawTermScrollbar(w, t);
+    if (!surface.paintContent(w, content_y, content_h)) {
+        if (w.term) |t| term_view.paintContent(idx, w, t, content_y, content_h);
     }
 
     // Animation fade overlay
