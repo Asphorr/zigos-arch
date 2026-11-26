@@ -6,22 +6,50 @@ const display = @import("display.zig");
 const mouse = @import("../driver.zig").mouse;
 const keyboard = @import("../driver.zig").keyboard;
 const vga = @import("../driver.zig").vga;
-const cli = @import("../cli.zig");
 const paging = @import("../mm/paging.zig");
 const pmm = @import("../mm/pmm.zig");
 const debug = @import("../debug/debug.zig");
 const elf_loader = @import("../proc/elf_loader.zig");
-const gdt = @import("../cpu/arch/gdt.zig");
 const vmm = @import("../mm/vmm.zig");
 const xhci = @import("../driver.zig").xhci;
-const tarfs = @import("../fs/tarfs.zig");
-const icons = @import("icons.zig");
 const process = @import("../proc/process.zig");
 const sound = @import("../driver.zig").sound;
 const events_mod = @import("events.zig");
 pub const Event = events_mod.Event;
 pub const EventKind = events_mod.EventKind;
 const Mutex = @import("../proc/spinlock.zig").Mutex;
+
+const emulator = @import("desktop/term/emulator.zig");
+const putCharOnWindow = emulator.putCharOnWindow;
+
+const cells = @import("desktop/term/cells.zig");
+const FONT_W = cells.FONT_W;
+const FONT_H = cells.FONT_H;
+const drawTermCells = cells.drawTermCells;
+const TERM_PAD = cells.TERM_PAD;
+const TERM_WIN_W = cells.TERM_WIN_W;
+
+const term_view = @import("desktop/term/view.zig");
+const termCursorCell = term_view.termCursorCell;
+const drawTermScrollbar = term_view.drawTermScrollbar;
+const renderTerminalRow = term_view.renderTerminalRow;
+const termRowsPaintable = term_view.termRowsPaintable;
+const repaintStaleRows = term_view.repaintStaleRows;
+
+const session = @import("desktop/term/session.zig");
+const termPrompt = session.termPrompt;
+const spawnShellOnWindow = session.spawnShellOnWindow;
+const handleKeyboard = session.handleKeyboard;
+
+const corners = @import("desktop/corners.zig");
+const CORNER_R = corners.CORNER_R;
+const ALL_CORNERS = corners.ALL_CORNERS;
+const saveCornerPixels = corners.saveCornerPixels;
+const restoreCornerPixels = corners.restoreCornerPixels;
+
+const notify = @import("desktop/notify.zig");
+pub const showNotification = notify.showNotification;
+pub const showNotificationFrom = notify.showNotificationFrom;
 
 // Serializes growGuiFb's FB-mutation sequence against destroyGuiWindow's
 // FB teardown. Without it, an F10-grown FB whose owner process exits in
@@ -40,22 +68,17 @@ var gui_fb_realloc_lock: Mutex = .{};
 // behavior is unexpected. Rate-limited so we don't flood the log.
 var dbg_focus_drop_count: u64 = 0;
 var dbg_event_queue_full: u64 = 0;
-var dbg_kbpipe_drop: u64 = 0;
 var dbg_last_focus_drop_log: u64 = 0;
 var dbg_last_qfull_log: u64 = 0;
-var dbg_last_kbpipe_log: u64 = 0;
 
 // --- Window management (storage, z-stack, focus, hit-testing) ---
 const wm = @import("desktop/window.zig");
 const Window = wm.Window;
-const TerminalData = wm.TerminalData;
-const AnimationType = wm.AnimationType;
+const TerminalData = emulator.TerminalData;
 const ResizeEdge = wm.ResizeEdge;
-const EscState = wm.EscState;
 const windows = &wm.windows;
 const slot_used = &wm.slot_used;
 const z_stack = &wm.z_stack;
-const windowCount = wm.windowCount;
 const lockWindows = wm.lockWindows;
 const unlockWindows = wm.unlockWindows;
 const allocSlot = wm.allocSlot;
@@ -64,9 +87,8 @@ const pushZTop = wm.pushZTop;
 const removeFromZ = wm.removeFromZ;
 const topSlot = wm.topSlot;
 const setFocused = wm.setFocused;
-const allocTerminalData = wm.allocTerminalData;
-const freeTerminalData = wm.freeTerminalData;
-const defaultWindow = wm.defaultWindow;
+const allocTerminalData = emulator.allocTerminalData;
+const freeTerminalData = emulator.freeTerminalData;
 const windowAt = wm.windowAt;
 const isInTitlebar = wm.isInTitlebar;
 const isOnCloseBtn = wm.isOnCloseBtn;
@@ -144,50 +166,18 @@ const event_wait = @import("desktop/event_wait.zig");
 // display.flush/flushRect.
 const frameperf = @import("desktop/frameperf.zig");
 
-pub fn showNotification(text: []const u8) void {
-    toast.show(text);
-    // The next tick() starts the slide-in, which repaints the pill.
-    wake.requestWake();
-    sound.notify();
-}
-
-/// A program's notification. The pill names the sender, so none passes for
-/// the kernel's own, which alone come unnamed (showNotification).
-pub fn showNotificationFrom(pid: u8, text: []const u8) void {
-    var name: [32]u8 = undefined;
-    const pname = process.getName(pid);
-    const n: usize = if (pinned.nameForProcess(pname)) |known| blk: {
-        const k = @min(known.len, name.len);
-        @memcpy(name[0..k], known[0..k]);
-        break :blk k;
-    } else win_title.pretty(&name, pname);
-    toast.showFrom(if (n > 0) name[0..n] else "App", text);
-    wake.requestWake();
-    sound.notify();
-}
-
 // Wallpaper presets + render moved to desktop/background.zig.
 const background = @import("desktop/background.zig");
 
 // --- Colors / palette / terminal tunables (see theme.zig) ---
 const theme = @import("theme.zig");
-const BG_TOP_DEFAULT = theme.BG_TOP_DEFAULT;
-const BG_BOTTOM_DEFAULT = theme.BG_BOTTOM_DEFAULT;
-const TITLEBAR_FOCUSED = theme.TITLEBAR_FOCUSED;
-const TITLEBAR_UNFOCUSED = theme.TITLEBAR_UNFOCUSED;
 const TITLEBAR_TEXT_F = theme.TITLEBAR_TEXT_F;
 const TITLEBAR_TEXT_U = theme.TITLEBAR_TEXT_U;
 const WINDOW_BG = theme.WINDOW_BG;
-const WINDOW_BORDER = theme.WINDOW_BORDER;
-const WINDOW_SHADOW = theme.WINDOW_SHADOW;
 const TERM_FG = theme.TERM_FG;
 const BTN_CLOSE = theme.BTN_CLOSE;
 const BTN_MINIMIZE = theme.BTN_MINIMIZE;
 const BTN_MAXIMIZE = theme.BTN_MAXIMIZE;
-const DOCK_BG = theme.DOCK_BG;
-const DOCK_BORDER = theme.DOCK_BORDER;
-const DOCK_TEXT = theme.DOCK_TEXT;
-const DOCK_ACTIVE = theme.DOCK_ACTIVE;
 
 // --- Layout ---
 // Spatial constants live in desktop/layout.zig so other extracted
@@ -196,269 +186,21 @@ const DOCK_ACTIVE = theme.DOCK_ACTIVE;
 const layout = @import("desktop/layout.zig");
 const MENUBAR_H = layout.MENUBAR_H;
 const TASKBAR_H = layout.TASKBAR_H;
-const DOCK_ICON_SIZE = layout.DOCK_ICON_SIZE;
-const DOCK_ICON_PAD = layout.DOCK_ICON_PAD;
-const DOCK_PILL_PAD = layout.DOCK_PILL_PAD;
-const DOCK_MARGIN_BOTTOM = layout.DOCK_MARGIN_BOTTOM;
 const TITLEBAR_H = layout.TITLEBAR_H;
 const BORDER = layout.BORDER;
 const BTN_RADIUS = layout.BTN_RADIUS;
-// Terminal cell size — sized to fit the SF Mono 14px glyph (advance=9, line_height=18).
-// Update both constants together if a different mono atlas size is chosen.
-const FONT_W: u32 = 9;
-const FONT_H: u32 = 18;
 const aa_font = @import("aa_font.zig");
 
-/// Render one terminal cell at top-left (x, y): fills the cell rect with `bg`,
-/// then blits the SF Mono glyph for `ch` in `fg`. Called once per non-space
-/// cell from the three terminal-render paths below.
-inline fn drawTermChar(x: i32, y: i32, ch: u8, fg: u32, bg: u32) void {
-    gfx.fillRect(x, y, FONT_W, FONT_H, bg);
-    if (ch >= CELL_BULLET and (ch <= CELL_DEGREE or ch >= CELL_BOX)) return drawCellShape(x, y, ch, fg);
-    const buf: [1]u8 = .{ch};
-    aa_font.drawText(x, y, &buf, fg, aa_font.getDefaultMono());
-}
-
-/// One row of terminal cells of the window at `win_x`, its top at `y`: every
-/// cell that shows a glyph or a background of its own. The row's WINDOW_BG
-/// is the caller's.
-fn drawTermCells(win_x: i32, y: i32, text: []const u8, attrs: []const u8, fgs: []const u32, bgs: []const u32, max_cols: u32) void {
-    var col: u32 = 0;
-    while (col < TERM_COLS and col < max_cols) : (col += 1) {
-        const ch = text[col];
-        const attr = attrs[col];
-        if (ch == ' ' and (attr & ATTR_PAINTS_BG) == 0) continue;
-        const colors = cellColors(attr, fgs[col], bgs[col]);
-        drawTermChar(win_x + @as(i32, @intCast(TERM_PAD + col * FONT_W)), y, ch, colors.fg, colors.bg);
-    }
-}
-
-// Cell bytes past ASCII. 0x80..0x85 are the atlas's own block glyphs, which
-// programs of ours write as bytes; the rest stand for characters the
-// terminal draws itself, so that frames and block art join cell to cell.
-const CELL_BULLET: u8 = 0x86;
-const CELL_MIDDOT: u8 = 0x87;
-const CELL_ELLIPSIS: u8 = 0x88;
-const CELL_CHECK: u8 = 0x89;
-const CELL_DEGREE: u8 = 0x8A;
-/// Box drawing: + a mask of the arms (BOX_*), light and heavy.
-const CELL_BOX: u8 = 0xA0;
-const CELL_BOX_HEAVY: u8 = 0xB0;
-/// Quadrants: + a mask (upper left 1, upper right 2, lower left 4, lower right 8).
-const CELL_QUAD: u8 = 0xC0;
-/// The lower (n+1)/8 of the cell, and its left (n+1)/8.
-const CELL_LOW8: u8 = 0xD0;
-const CELL_LEFT8: u8 = 0xD8;
-const BOX_L: u8 = 1;
-const BOX_R: u8 = 2;
-const BOX_U: u8 = 4;
-const BOX_D: u8 = 8;
-
-fn drawCellShape(x: i32, y: i32, ch: u8, fg: u32) void {
-    const cx: i32 = x + @as(i32, FONT_W / 2);
-    const cy: i32 = y + @as(i32, FONT_H / 2);
-    switch (ch) {
-        CELL_BOX...CELL_BOX_HEAVY + 0x0F => {
-            const th: u32 = if (ch >= CELL_BOX_HEAVY) 3 else 1;
-            const o: i32 = @intCast(th / 2);
-            // Each arm runs from its edge to just past the middle: corners join.
-            if (ch & BOX_L != 0) gfx.fillRect(x, cy - o, FONT_W / 2 + th - th / 2, th, fg);
-            if (ch & BOX_R != 0) gfx.fillRect(cx - o, cy - o, FONT_W - FONT_W / 2 + th / 2, th, fg);
-            if (ch & BOX_U != 0) gfx.fillRect(cx - o, y, th, FONT_H / 2 + th - th / 2, fg);
-            if (ch & BOX_D != 0) gfx.fillRect(cx - o, cy - o, th, FONT_H - FONT_H / 2 + th / 2, fg);
-        },
-        CELL_QUAD...CELL_QUAD + 0x0F => {
-            const hw: u32 = FONT_W / 2;
-            const hh: u32 = FONT_H / 2;
-            if (ch & 1 != 0) gfx.fillRect(x, y, hw, hh, fg);
-            if (ch & 2 != 0) gfx.fillRect(cx, y, FONT_W - hw, hh, fg);
-            if (ch & 4 != 0) gfx.fillRect(x, cy, hw, FONT_H - hh, fg);
-            if (ch & 8 != 0) gfx.fillRect(cx, cy, FONT_W - hw, FONT_H - hh, fg);
-        },
-        CELL_LOW8...CELL_LOW8 + 7 => {
-            const hgt: u32 = FONT_H * (@as(u32, ch - CELL_LOW8) + 1) / 8;
-            gfx.fillRect(x, y + @as(i32, @intCast(FONT_H - hgt)), FONT_W, hgt, fg);
-        },
-        CELL_LEFT8...CELL_LEFT8 + 7 => gfx.fillRect(x, y, @max(1, FONT_W * (@as(u32, ch - CELL_LEFT8) + 1) / 8), FONT_H, fg),
-        CELL_BULLET => {
-            // A disc of radius 3.
-            const half = [7]u32{ 1, 2, 3, 3, 3, 2, 1 };
-            for (half, 0..) |hw, i| gfx.fillRect(cx - @as(i32, @intCast(hw)), cy - 3 + @as(i32, @intCast(i)), 2 * hw + 1, 1, fg);
-        },
-        CELL_MIDDOT => gfx.fillRect(cx - 1, cy - 1, 2, 2, fg),
-        CELL_ELLIPSIS => {
-            const base: i32 = y + @as(i32, FONT_H * 3 / 4);
-            gfx.fillRect(x + 1, base, 1, 2, fg);
-            gfx.fillRect(cx, base, 1, 2, fg);
-            gfx.fillRect(x + @as(i32, FONT_W) - 2, base, 1, 2, fg);
-        },
-        CELL_CHECK => {
-            // Down three to the right, then up six.
-            var i: i32 = 0;
-            while (i < 3) : (i += 1) gfx.fillRect(x + 1 + i, cy + i, 1, 2, fg);
-            i = 0;
-            while (i < 5) : (i += 1) gfx.fillRect(x + 4 + i, cy + 2 - i, 1, 2, fg);
-        },
-        CELL_DEGREE => {
-            // A ring of 4 at the height of a capital's top.
-            gfx.fillRect(x + 3, y + 3, 2, 1, fg);
-            gfx.fillRect(x + 3, y + 6, 2, 1, fg);
-            gfx.fillRect(x + 2, y + 4, 1, 2, fg);
-            gfx.fillRect(x + 5, y + 4, 1, 2, fg);
-        },
-        else => {},
-    }
-}
-
-/// The cell byte that shows code point `cp`: 0 for one that takes no cell.
-fn cellFor(cp: u32) u8 {
-    return switch (cp) {
-        0x20...0x7E => @intCast(cp),
-        0x00A0 => ' ',
-        0x00B0, 0x02DA => CELL_DEGREE,
-        0x00B7, 0x2219, 0x22C5 => CELL_MIDDOT,
-        0x2022, 0x25CF, 0x23FA, 0x2B24, 0x25C9 => CELL_BULLET,
-        0x25CB, 0x25EF, 0x25E6, 0x25CC => 'o',
-        0x2026 => CELL_ELLIPSIS,
-        0x2010...0x2015, 0x2212 => '-',
-        0x2018, 0x2019 => '\'',
-        0x201C, 0x201D => '"',
-        0x2190, 0x2039, 0x276E, 0x25C0, 0x25C2 => '<',
-        0x2192, 0x203A, 0x276F, 0x25B6, 0x25B8, 0x23F5 => '>',
-        0x2191, 0x25B2, 0x25B4 => '^',
-        0x2193, 0x25BC, 0x25BE => 'v',
-        0x2713, 0x2714 => CELL_CHECK,
-        0x2715...0x2718, 0x00D7 => 'x',
-        0x2722...0x274B, 0x2217 => '*',
-        0x23BF => CELL_BOX | BOX_U | BOX_R,
-        0x2500...0x257F => boxCell(cp),
-        0x2580...0x259F => blockCell(cp),
-        // Zero width: joiners, variation selectors, combining marks.
-        0x200B...0x200F, 0x2060, 0xFE00...0xFE0F, 0x0300...0x036F => 0,
-        else => '?',
-    };
-}
-
-fn boxCell(cp: u32) u8 {
-    const arms: u8 = switch (cp) {
-        0x2500, 0x2501, 0x2504, 0x2505, 0x2508, 0x2509, 0x254C, 0x254D, 0x2550, 0x257C, 0x257E => BOX_L | BOX_R,
-        0x2502, 0x2503, 0x2506, 0x2507, 0x250A, 0x250B, 0x254E, 0x254F, 0x2551, 0x257D, 0x257F => BOX_U | BOX_D,
-        0x250C...0x250F, 0x2552...0x2554, 0x256D => BOX_R | BOX_D,
-        0x2510...0x2513, 0x2555...0x2557, 0x256E => BOX_L | BOX_D,
-        0x2514...0x2517, 0x2558...0x255A, 0x2570 => BOX_U | BOX_R,
-        0x2518...0x251B, 0x255B...0x255D, 0x256F => BOX_U | BOX_L,
-        0x251C...0x2523, 0x255E...0x2560 => BOX_U | BOX_D | BOX_R,
-        0x2524...0x252B, 0x2561...0x2563 => BOX_U | BOX_D | BOX_L,
-        0x252C...0x2533, 0x2564...0x2566 => BOX_L | BOX_R | BOX_D,
-        0x2534...0x253B, 0x2567...0x2569 => BOX_L | BOX_R | BOX_U,
-        0x253C...0x254B, 0x256A...0x256C => BOX_L | BOX_R | BOX_U | BOX_D,
-        0x2574, 0x2578 => BOX_L,
-        0x2575, 0x2579 => BOX_U,
-        0x2576, 0x257A => BOX_R,
-        0x2577, 0x257B => BOX_D,
-        0x2571 => return '/',
-        0x2572 => return '\\',
-        else => return 'X',
-    };
-    // The double lines are drawn heavy too.
-    const heavy = switch (cp) {
-        0x2501, 0x2503, 0x2505, 0x2507, 0x2509, 0x250B, 0x250F, 0x2513, 0x2517, 0x251B, 0x2523, 0x252B, 0x2533, 0x253B, 0x254B, 0x254D, 0x254F, 0x2550...0x256C, 0x2578...0x257B => true,
-        else => false,
-    };
-    return (if (heavy) CELL_BOX_HEAVY else CELL_BOX) | arms;
-}
-
-fn blockCell(cp: u32) u8 {
-    return switch (cp) {
-        0x2580, 0x2594 => CELL_QUAD | 0x3,
-        0x2581...0x2587 => CELL_LOW8 + @as(u8, @intCast(cp - 0x2581)),
-        0x2588 => CELL_QUAD | 0xF,
-        0x2589...0x258F => CELL_LEFT8 + @as(u8, @intCast(0x258F - cp)),
-        0x2590, 0x2595 => CELL_QUAD | 0xA,
-        0x2591 => 0x81,
-        0x2592 => 0x82,
-        0x2593 => 0x83,
-        0x2596 => CELL_QUAD | 0x4,
-        0x2597 => CELL_QUAD | 0x8,
-        0x2598 => CELL_QUAD | 0x1,
-        0x2599 => CELL_QUAD | 0xD,
-        0x259A => CELL_QUAD | 0x9,
-        0x259B => CELL_QUAD | 0x7,
-        0x259C => CELL_QUAD | 0xB,
-        0x259D => CELL_QUAD | 0x2,
-        0x259E => CELL_QUAD | 0x6,
-        else => CELL_QUAD | 0xE,
-    };
-}
-
-/// A color of the 256-color palette: the 16 of the theme, the 6x6x6 cube,
-/// the gray ramp.
-fn color256(n: u16) u32 {
-    if (n < 16) return ANSI_PALETTE[n];
-    if (n < 232) {
-        const lv = [6]u32{ 0, 95, 135, 175, 215, 255 };
-        const i = n - 16;
-        return (lv[i / 36] << 16) | (lv[(i / 6) % 6] << 8) | lv[i % 6];
-    }
-    const g: u32 = 8 + 10 * @as(u32, @min(n, 255) - 232);
-    return (g << 16) | (g << 8) | g;
-}
-const TERM_COLS = wm.TERM_COLS;
-const TERM_ROWS = wm.TERM_ROWS;
-const TERM_PAD: u32 = 4;
-/// Wide enough to show every column between the two paddings.
-const TERM_WIN_W: u32 = TERM_COLS * FONT_W + TERM_PAD * 2;
+const TERM_COLS = emulator.TERM_COLS;
+const TERM_ROWS = emulator.TERM_ROWS;
 
 // --- Terminal escape / coloring (see theme.zig for the constant values) ---
-const ANSI_PALETTE = theme.ANSI_PALETTE;
-const ATTR_DEFAULT = theme.ATTR_DEFAULT;
-const ATTR_BOLD = theme.ATTR_BOLD;
-const ATTR_INVERSE = theme.ATTR_INVERSE;
-const ATTR_BG = theme.ATTR_BG;
-/// A cell with either shows more than its glyph: a space of it is painted too.
-const ATTR_PAINTS_BG = ATTR_INVERSE | ATTR_BG;
-const TAB_WIDTH = theme.TAB_WIDTH;
-const BELL_FLASH_FRAMES = theme.BELL_FLASH_FRAMES;
 const CURSOR_BLINK_HALF_TICKS = theme.CURSOR_BLINK_HALF_TICKS;
 const BELL_FLASH_COLOR = theme.BELL_FLASH_COLOR;
-
-const CellColors = struct { fg: u32, bg: u32 };
-
-inline fn cellColors(attr: u8, fg_rgb: u32, bg_rgb: u32) CellColors {
-    var fg: u32 = undefined;
-    if ((attr & theme.ATTR_RGB_FG) != 0) {
-        fg = fg_rgb;
-    } else {
-        const idx: u8 = attr & 0x0F;
-        const palette_idx: u8 = if ((attr & ATTR_BOLD) != 0) (idx | 0x08) else idx;
-        fg = ANSI_PALETTE[palette_idx];
-    }
-    var bg: u32 = if ((attr & ATTR_BG) != 0) bg_rgb else WINDOW_BG;
-    if ((attr & ATTR_INVERSE) != 0) {
-        const swap = fg;
-        fg = bg;
-        bg = swap;
-    }
-    return .{ .fg = fg, .bg = bg };
-}
 
 // --- Window ---
 const MAX_WINDOWS: u32 = @import("../config.zig").MAX_WINDOWS;
 const SCROLL_LINES: u32 = @import("../config.zig").SCROLL_LINES;
-const heap = @import("../mm/heap.zig");
-
-
-/// Bounds-checked text buffer index. Returns null if out of range.
-inline fn textIdx(row: u16, col: u16) ?usize {
-    if (row >= TERM_ROWS or col >= TERM_COLS) return null;
-    return @as(usize, row) * TERM_COLS + @as(usize, col);
-}
-
-/// Safe text buffer write.
-inline fn textPut(w: *Window, row: u16, col: u16, ch: u8) void {
-    const t = w.term orelse return;
-    if (textIdx(row, col)) |idx| t.text_buf[idx] = ch;
-}
 
 // --- Drag state ---
 var dragging: bool = false;
@@ -519,13 +261,8 @@ var resize_edge: ResizeEdge = .right;
 const MIN_WIN_W = wm.MIN_WIN_W;
 const MIN_WIN_H = wm.MIN_WIN_H;
 
-// Context menu state moved to desktop/context_menu.zig.
-
-// Pinned-app manifest moved to desktop/pinned.zig.
-// Desktop icon constants and selection state moved to desktop/shortcuts.zig.
-
 // --- Back buffer ---
-var backbuf: ?[*]volatile u32 = null;
+pub var backbuf: ?[*]volatile u32 = null;
 var bb_pages: u32 = 0;
 
 /// Read-only access for the GPU compositor (mode 9). Returns null until
@@ -584,9 +321,6 @@ const cursor_sprite = [CURSOR_H][CURSOR_W]u8{
 var last_cursor_x: i32 = 0;
 var last_cursor_y: i32 = 0;
 
-// --- Redirect ---
-var redirect_win: ?*Window = null;
-
 /// Free-running per-frame counter, incremented once per desktop main-loop
 /// iteration. Used for any "every N frames" scheduling that doesn't need
 /// to track real time. Wraps around silently — only relative differences
@@ -598,518 +332,6 @@ var frame_count: u32 = 0;
 /// marked dirty for. Used to avoid spamming dirty=.text_only every loop iter
 /// when the phase hasn't actually flipped.
 var last_blink_phase: u64 = 0;
-
-fn desktopPutChar(c: u8) void {
-    const w = redirect_win orelse return;
-    putCharOnWindow(w, c);
-}
-
-/// Append a char to the given terminal window's text buffer, advancing the
-/// cursor and applying any in-flight escape sequence. Shared by:
-///   - desktopPutChar (kernel CLI output, fallback path)
-///   - the per-frame stdout-pipe drain step (user-space shell output)
-///
-/// Recognized control bytes:
-///   - \n         newline (CR+LF; cursor → col 0, row+1, scroll if needed)
-///   - \x08       backspace (cursor left, write space at new pos with cur_attr)
-///   - \t         tab (cursor advances to next 8-column boundary)
-///   - \x07       bell (sets bell_phase; main loop renders a red border flash)
-///   - \x1b[...m  SGR — foreground and background color (16, 256, 24-bit), bold, inverse
-///   - \x1b[r;cH  cursor position (1-indexed row;col)
-///   - \x1b[nA/B/C/D   cursor up/down/right/left by n (default 1)
-///   - \x1b[nJ    erase display (0 = below, 1 = above, 2 = all)
-///   - \x1b[nK    erase line (0 = right, 1 = left, 2 = all)
-/// Anything else (control bytes < 0x20, malformed escapes) is dropped silently.
-/// Plain printable bytes are stored alongside `cur_attr` in `attr_buf` so the
-/// render path can color each cell independently.
-fn putCharOnWindow(w: *Window, c: u8) void {
-    const t = w.term orelse return;
-    // Any output activity restarts the cursor "on" half of the blink cycle —
-    // looks dead otherwise when text scrolls past the cursor.
-    t.cursor_blink_anchor = process.tick_count;
-    switch (t.esc_state) {
-        .idle => putCharIdle(w, t, c),
-        .esc => putCharAfterEsc(w, t, c),
-        .csi => putCharAfterCsi(w, t, c),
-        // A string (a title, a query, a clipboard write): nothing of it is
-        // ours. BEL or ESC \ ends it.
-        .string => {
-            if (c == '\x07') t.esc_state = .idle;
-            if (c == '\x1b') t.esc_state = .string_esc;
-        },
-        .string_esc => if (c == '\\') {
-            t.esc_state = .idle;
-        } else putCharAfterEsc(w, t, c),
-        .charset => t.esc_state = .idle,
-    }
-}
-
-/// A byte of the UTF-8 stream: the cell byte of the character it finishes,
-/// null while one is incomplete or takes no cell. A continuation byte with
-/// no lead before it is a program's own byte-coded glyph and stands as is.
-fn utf8Cell(t: *TerminalData, c: u8) ?u8 {
-    if (c < 0x80) {
-        t.utf_left = 0;
-        return c;
-    }
-    if (c >= 0xC0) {
-        t.utf_left = if (c >= 0xF0) 3 else if (c >= 0xE0) 2 else 1;
-        t.utf_cp = c & (@as(u8, 0x3F) >> @as(u3, @intCast(t.utf_left)));
-        return null;
-    }
-    if (t.utf_left == 0) return c;
-    t.utf_cp = (t.utf_cp << 6) | (c & 0x3F);
-    t.utf_left -= 1;
-    if (t.utf_left != 0) return null;
-    const cell = cellFor(t.utf_cp);
-    return if (cell == 0) null else cell;
-}
-
-fn putCharIdle(w: *Window, t: *TerminalData, c: u8) void {
-    switch (c) {
-        '\x1b' => t.esc_state = .esc,
-        '\x07' => {
-            t.bell_phase = BELL_FLASH_FRAMES;
-            wake.requestWake();
-        },
-        '\t' => {
-            const next = (@as(u32, t.text_col) / TAB_WIDTH + 1) * TAB_WIDTH;
-            t.text_col = @intCast(@min(next, TERM_COLS - 1));
-            t.pending_wrap = false;
-        },
-        '\n' => {
-            t.text_col = 0;
-            t.text_row += 1;
-            if (t.text_row >= TERM_ROWS) scrollWindow(w);
-            t.pending_wrap = false;
-        },
-        '\r' => {
-            t.text_col = 0;
-            t.pending_wrap = false;
-        },
-        '\x08' => {
-            if (t.text_col > 0) {
-                t.text_col -= 1;
-                writeCell(t, t.text_row, t.text_col, ' ', t.cur_attr);
-            }
-            t.pending_wrap = false;
-        },
-        else => {
-            // Drop unhandled C0 control bytes rather than render garbage.
-            if (c < 0x20) return;
-            const cell = utf8Cell(t, c) orelse return;
-
-            // Deferred wrap: if the previous printable write landed at the
-            // last column with `pending_wrap=true`, commit the wrap NOW
-            // (before this char). \r / \n / \x08 / CSI cursor moves clear
-            // the flag, so a clean redraw that starts with `\r` never
-            // triggers a scroll regardless of the previous line's length.
-            if (t.pending_wrap) {
-                t.text_col = 0;
-                t.text_row += 1;
-                if (t.text_row >= TERM_ROWS) scrollWindow(w);
-                t.pending_wrap = false;
-            }
-
-            writeCell(t, t.text_row, t.text_col, cell, t.cur_attr);
-
-            if (t.text_col + 1 >= TERM_COLS) {
-                // Last column: park here, set the flag, don't scroll yet.
-                t.pending_wrap = true;
-            } else {
-                t.text_col += 1;
-            }
-        },
-    }
-}
-
-fn putCharAfterEsc(w: *Window, t: *TerminalData, c: u8) void {
-    t.esc_state = .idle;
-    switch (c) {
-        '[' => {
-            t.esc_state = .csi;
-            t.csi_args = [_]u16{0} ** wm.CSI_ARGS;
-            t.csi_arg_count = 0;
-            t.csi_has_arg = false;
-            t.csi_private = 0;
-            t.csi_inter = false;
-        },
-        // OSC, DCS, SOS, PM, APC.
-        ']', 'P', 'X', '^', '_' => t.esc_state = .string,
-        '(', ')', '*', '+', '#', '%' => t.esc_state = .charset,
-        '7' => {
-            t.saved_row = t.text_row;
-            t.saved_col = t.text_col;
-        },
-        '8' => {
-            t.text_row = t.saved_row;
-            t.text_col = t.saved_col;
-            t.pending_wrap = false;
-        },
-        // Index, next line, reverse index (the top row stays: no scroll down).
-        'D', 'E' => {
-            if (c == 'E') t.text_col = 0;
-            t.text_row += 1;
-            if (t.text_row >= TERM_ROWS) scrollWindow(w);
-            t.pending_wrap = false;
-        },
-        'M' => {
-            t.text_row -|= 1;
-            t.pending_wrap = false;
-        },
-        // Reset.
-        'c' => {
-            t.cur_attr = ATTR_DEFAULT;
-            t.cur_fg_rgb = 0;
-            t.cur_bg_rgb = 0;
-            t.cursor_hidden = false;
-            t.text_row = 0;
-            t.text_col = 0;
-            t.pending_wrap = false;
-            eraseDisplay(t, 2);
-        },
-        // ESC =, ESC > and the rest: nothing of ours.
-        else => {},
-    }
-}
-
-fn putCharAfterCsi(w: *Window, t: *TerminalData, c: u8) void {
-    if (c >= '0' and c <= '9') {
-        if (t.csi_arg_count < t.csi_args.len) {
-            t.csi_args[t.csi_arg_count] = t.csi_args[t.csi_arg_count] *% 10 +% (c - '0');
-            t.csi_has_arg = true;
-        }
-        return;
-    }
-    if (c == ';' or c == ':') {
-        if (t.csi_arg_count + 1 < t.csi_args.len) t.csi_arg_count += 1;
-        t.csi_has_arg = true;
-        return;
-    }
-    // Parameter bytes '<' '=' '>' '?' mark a private sequence; 0x20..0x2F
-    // are intermediates. Both belong to the sequence: taken, not printed.
-    if (c >= 0x3C and c <= 0x3F) {
-        t.csi_private = c;
-        return;
-    }
-    if (c >= 0x20 and c <= 0x2F) {
-        t.csi_inter = true;
-        return;
-    }
-    // Final byte must be in 0x40..0x7E per ECMA-48; anything else aborts.
-    if (c >= 0x40 and c <= 0x7E) {
-        const n_args: u8 = if (t.csi_has_arg) (t.csi_arg_count + 1) else 0;
-        dispatchCsi(w, t, c, n_args);
-    }
-    t.esc_state = .idle;
-}
-
-/// The terminal's own cursor shows unless the Linux program in it turned it
-/// off to draw its own; one that died without turning it back on doesn't
-/// leave the shell without.
-fn cursorShown(w: *const Window, t: *const TerminalData) bool {
-    return !(t.cursor_hidden and @import("../tty/tty.zig").hasLinuxProgram(w.tty));
-}
-
-/// What the terminal answers a program's query with: in through the keys'
-/// pipe, as a terminal's reply comes.
-fn termReply(w: *Window, bytes: []const u8) void {
-    if (w.kb_pipe != 0xFF) _ = @import("../proc/pipe.zig").tryWrite(w.kb_pipe, bytes);
-}
-
-/// Cells [to, to+n) of the screen take what [from...) held; the four
-/// buffers move together.
-fn moveCells(t: *TerminalData, to: usize, from: usize, n: usize) void {
-    if (to < from) {
-        std.mem.copyForwards(u8, t.text_buf[to..][0..n], t.text_buf[from..][0..n]);
-        std.mem.copyForwards(u8, t.attr_buf[to..][0..n], t.attr_buf[from..][0..n]);
-        std.mem.copyForwards(u32, t.fg_rgb_buf[to..][0..n], t.fg_rgb_buf[from..][0..n]);
-        std.mem.copyForwards(u32, t.bg_rgb_buf[to..][0..n], t.bg_rgb_buf[from..][0..n]);
-    } else {
-        std.mem.copyBackwards(u8, t.text_buf[to..][0..n], t.text_buf[from..][0..n]);
-        std.mem.copyBackwards(u8, t.attr_buf[to..][0..n], t.attr_buf[from..][0..n]);
-        std.mem.copyBackwards(u32, t.fg_rgb_buf[to..][0..n], t.fg_rgb_buf[from..][0..n]);
-        std.mem.copyBackwards(u32, t.bg_rgb_buf[to..][0..n], t.bg_rgb_buf[from..][0..n]);
-    }
-}
-
-/// Cells [at, at+n) become spaces in the colors in force: an erased
-/// stretch takes the current background.
-fn blankCells(t: *TerminalData, at: usize, n: usize) void {
-    @memset(t.text_buf[at..][0..n], ' ');
-    @memset(t.attr_buf[at..][0..n], t.cur_attr);
-    @memset(t.fg_rgb_buf[at..][0..n], t.cur_fg_rgb);
-    @memset(t.bg_rgb_buf[at..][0..n], t.cur_bg_rgb);
-}
-
-fn dispatchCsi(w: *Window, t: *TerminalData, final: u8, n_args: u8) void {
-    if (t.csi_inter) return;
-    if (t.csi_private != 0) {
-        // Of the private modes only the cursor's showing is kept (?25);
-        // mouse, paste and key reporting are never turned on.
-        if (t.csi_private == '?' and (final == 'h' or final == 'l')) {
-            for (t.csi_args[0..n_args]) |a| {
-                if (a == 25) t.cursor_hidden = final == 'l';
-            }
-        }
-        return;
-    }
-    const n: u32 = if (n_args >= 1 and t.csi_args[0] > 0) t.csi_args[0] else 1;
-    const row: u32 = t.text_row;
-    const col: u32 = t.text_col;
-    switch (final) {
-        'G', '`' => {
-            t.text_col = @intCast(@min(n - 1, TERM_COLS - 1));
-            t.pending_wrap = false;
-        },
-        'd' => {
-            t.text_row = @intCast(@min(n - 1, TERM_ROWS - 1));
-            t.pending_wrap = false;
-        },
-        'E' => {
-            t.text_row = @intCast(@min(row + n, TERM_ROWS - 1));
-            t.text_col = 0;
-            t.pending_wrap = false;
-        },
-        'F' => {
-            t.text_row = @intCast(row -| n);
-            t.text_col = 0;
-            t.pending_wrap = false;
-        },
-        's' => {
-            t.saved_row = t.text_row;
-            t.saved_col = t.text_col;
-        },
-        'u' => {
-            t.text_row = t.saved_row;
-            t.text_col = t.saved_col;
-            t.pending_wrap = false;
-        },
-        // Scroll up: the top rows go to the scrollback, the cursor stays.
-        'S' => {
-            var i: u32 = 0;
-            while (i < @min(n, TERM_ROWS)) : (i += 1) scrollWindow(w);
-            t.text_row = @intCast(row);
-        },
-        // Erase, delete and insert characters in the row.
-        'X' => if (row < TERM_ROWS and col < TERM_COLS) blankCells(t, row * TERM_COLS + col, @min(n, TERM_COLS - col)),
-        'P', '@' => if (row < TERM_ROWS and col < TERM_COLS) {
-            const at = row * TERM_COLS + col;
-            const k = @min(n, TERM_COLS - col);
-            const rest = TERM_COLS - col - k;
-            if (final == 'P') {
-                moveCells(t, at, at + k, rest);
-                blankCells(t, at + rest, k);
-            } else {
-                moveCells(t, at + k, at, rest);
-                blankCells(t, at, k);
-            }
-        },
-        // Insert and delete lines at the cursor's row.
-        'L', 'M' => if (row < TERM_ROWS) {
-            const at = row * TERM_COLS;
-            const k = @min(n, TERM_ROWS - row) * TERM_COLS;
-            const rest = (TERM_ROWS - row) * TERM_COLS - k;
-            if (final == 'M') {
-                moveCells(t, at, at + k, rest);
-                blankCells(t, at + rest, k);
-            } else {
-                moveCells(t, at + k, at, rest);
-                blankCells(t, at, k);
-            }
-            t.text_col = 0;
-            t.pending_wrap = false;
-        },
-        // Device status and attributes: a program that asks waits for it.
-        'n' => if (n_args >= 1 and t.csi_args[0] == 6) {
-            var buf: [16]u8 = undefined;
-            termReply(w, std.fmt.bufPrint(&buf, "\x1b[{d};{d}R", .{ row + 1, col + 1 }) catch return);
-        } else if (n_args >= 1 and t.csi_args[0] == 5) termReply(w, "\x1b[0n"),
-        'c' => termReply(w, "\x1b[?1;2c"),
-        'm' => sgr(t, n_args),
-        'H', 'f' => {
-            // Args are 1-indexed in ANSI; clamp to in-range cells.
-            const to_col: u32 = if (n_args >= 2 and t.csi_args[1] > 0) t.csi_args[1] else 1;
-            t.text_row = @intCast(@min(n - 1, TERM_ROWS - 1));
-            t.text_col = @intCast(@min(to_col - 1, TERM_COLS - 1));
-            t.pending_wrap = false;
-        },
-        'A' => {
-            t.text_row = @intCast(row -| n);
-            t.pending_wrap = false;
-        },
-        'B' => {
-            t.text_row = @intCast(@min(row + n, TERM_ROWS - 1));
-            t.pending_wrap = false;
-        },
-        'C' => {
-            t.text_col = @intCast(@min(col + n, TERM_COLS - 1));
-            t.pending_wrap = false;
-        },
-        'D' => {
-            t.text_col = @intCast(col -| n);
-            t.pending_wrap = false;
-        },
-        'J' => eraseDisplay(t, if (n_args >= 1) t.csi_args[0] else 0),
-        'K' => eraseLine(t, if (n_args >= 1) t.csi_args[0] else 0),
-        else => {},
-    }
-}
-
-fn sgr(t: *TerminalData, n_args: u8) void {
-    if (n_args == 0) {
-        t.cur_attr = ATTR_DEFAULT;
-        t.cur_fg_rgb = 0;
-        t.cur_bg_rgb = 0;
-        return;
-    }
-    var i: u8 = 0;
-    while (i < n_args) : (i += 1) {
-        const arg = t.csi_args[i];
-        switch (arg) {
-            0 => {
-                t.cur_attr = ATTR_DEFAULT;
-                t.cur_fg_rgb = 0;
-                t.cur_bg_rgb = 0;
-            },
-            1 => t.cur_attr |= ATTR_BOLD,
-            7 => t.cur_attr |= ATTR_INVERSE,
-            22 => t.cur_attr &= ~ATTR_BOLD,
-            27 => t.cur_attr &= ~ATTR_INVERSE,
-            30...37 => {
-                // Palette index — clear the truecolor flag so the cell
-                // renders via ANSI_PALETTE again.
-                t.cur_attr = (t.cur_attr & 0xF0 & ~theme.ATTR_RGB_FG) | @as(u8, @intCast(arg - 30));
-            },
-            // Bright fg (90..97) maps to bold + base color, mirroring how most
-            // terminals render the "bright" series.
-            90...97 => t.cur_attr = ((t.cur_attr & 0xF0 & ~theme.ATTR_RGB_FG) | @as(u8, @intCast(arg - 90))) | ATTR_BOLD,
-            // 39 = default fg.
-            39 => {
-                t.cur_attr = (t.cur_attr & 0xF0 & ~theme.ATTR_RGB_FG) | (ATTR_DEFAULT & 0x0F);
-                t.cur_fg_rgb = 0;
-            },
-            // Background: the 8 colors, their bright ones, the default.
-            40...47 => setBg(t, ANSI_PALETTE[arg - 40]),
-            100...107 => setBg(t, ANSI_PALETTE[arg - 100 + 8]),
-            49 => {
-                t.cur_attr &= ~ATTR_BG;
-                t.cur_bg_rgb = 0;
-            },
-            // 38;2;R;G;B = 24-bit truecolor fg, 38;5;N = one of the 256;
-            // 48 is the same for the background.
-            38, 48 => {
-                if (i + 1 >= n_args) break;
-                const sub = t.csi_args[i + 1];
-                var color: u32 = undefined;
-                if (sub == 2) {
-                    if (i + 4 >= n_args) break;
-                    const r: u32 = @intCast(t.csi_args[i + 2] & 0xFF);
-                    const g: u32 = @intCast(t.csi_args[i + 3] & 0xFF);
-                    const b: u32 = @intCast(t.csi_args[i + 4] & 0xFF);
-                    color = (r << 16) | (g << 8) | b;
-                    i += 4;
-                } else if (sub == 5) {
-                    if (i + 2 >= n_args) break;
-                    color = color256(t.csi_args[i + 2]);
-                    i += 2;
-                } else continue;
-                if (arg == 38) {
-                    t.cur_fg_rgb = color;
-                    t.cur_attr |= theme.ATTR_RGB_FG;
-                } else setBg(t, color);
-            },
-            else => {},
-        }
-    }
-}
-
-fn setBg(t: *TerminalData, color: u32) void {
-    t.cur_bg_rgb = color;
-    t.cur_attr |= ATTR_BG;
-}
-
-fn eraseDisplay(t: *TerminalData, mode: u16) void {
-    const cells: usize = TERM_COLS * TERM_ROWS;
-    const cur_idx: usize = @min(@as(usize, t.text_row) * TERM_COLS + t.text_col, cells - 1);
-    switch (mode) {
-        0 => blankCells(t, cur_idx, cells - cur_idx),
-        1 => blankCells(t, 0, cur_idx + 1),
-        2, 3 => blankCells(t, 0, cells),
-        else => {},
-    }
-}
-
-fn eraseLine(t: *TerminalData, mode: u16) void {
-    if (t.text_row >= TERM_ROWS) return;
-    const row_start: usize = @as(usize, t.text_row) * TERM_COLS;
-    const col: usize = @min(t.text_col, TERM_COLS - 1);
-    switch (mode) {
-        0 => blankCells(t, row_start + col, TERM_COLS - col),
-        1 => blankCells(t, row_start, col + 1),
-        2 => blankCells(t, row_start, TERM_COLS),
-        else => {},
-    }
-}
-
-inline fn writeCell(t: *TerminalData, row: u16, col: u16, ch: u8, attr: u8) void {
-    if (textIdx(row, col)) |idx| {
-        t.text_buf[idx] = ch;
-        t.attr_buf[idx] = attr;
-        // The colors in force go with the attribute that says whether
-        // they count.
-        t.fg_rgb_buf[idx] = t.cur_fg_rgb;
-        t.bg_rgb_buf[idx] = t.cur_bg_rgb;
-    }
-}
-
-/// Append a string to the given window's text buffer. Used for boot/error
-/// messages that the desktop writes directly into a Terminal window.
-fn putStringOnWindow(window_idx: u8, data: []const u8) void {
-    if (window_idx >= MAX_WINDOWS or !slot_used[window_idx]) return;
-    const w = &windows[window_idx];
-    if (!w.visible) return;
-    for (data) |ch| putCharOnWindow(w, ch);
-}
-
-
-fn scrollWindow(w: *Window) void {
-    const t = w.term orelse return;
-    // Save top row (and its attrs) to the scrollback ring so colored output
-    // remains colored when the user scrolls up later: the colors travel
-    // alongside attr_buf.
-    if (t.scroll_write >= SCROLL_LINES) t.scroll_write = 0;
-    const sb_off = @as(u32, t.scroll_write) * TERM_COLS;
-    @memcpy(t.scroll_buf[sb_off..][0..TERM_COLS], t.text_buf[0..TERM_COLS]);
-    @memcpy(t.scroll_attr_buf[sb_off..][0..TERM_COLS], t.attr_buf[0..TERM_COLS]);
-    @memcpy(t.scroll_fg_rgb_buf[sb_off..][0..TERM_COLS], t.fg_rgb_buf[0..TERM_COLS]);
-    @memcpy(t.scroll_bg_rgb_buf[sb_off..][0..TERM_COLS], t.bg_rgb_buf[0..TERM_COLS]);
-    t.scroll_write = @intCast((@as(u32, t.scroll_write) + 1) % SCROLL_LINES);
-    if (t.scroll_count < SCROLL_LINES) t.scroll_count += 1;
-    // Auto-scroll to live on new output
-    t.scroll_view = 0;
-
-    // The rows move up by one; the last comes in blank, in the colors in
-    // force.
-    const last: usize = (TERM_ROWS - 1) * TERM_COLS;
-    moveCells(t, 0, TERM_COLS, last);
-    blankCells(t, last, TERM_COLS);
-    t.text_row = @intCast(TERM_ROWS - 1);
-}
-
-fn termPrompt(w: *Window) void {
-    const t = w.term orelse return;
-    const prompt_str = "root@zigos> ";
-    for (prompt_str) |ch| {
-        if (t.text_col >= TERM_COLS) {
-            t.text_col = 0;
-            t.text_row += 1;
-            if (t.text_row >= TERM_ROWS) scrollWindow(w);
-        }
-        if (textIdx(t.text_row, t.text_col)) |idx| t.text_buf[idx] = ch;
-        t.text_col += 1;
-    }
-}
 
 fn createWindow(title: []const u8, x: i32, y: i32, w: u32, h: u32) ?u8 {
     // Terminal data is vmalloc'd: allocate and free it outside windows_lock
@@ -1431,8 +653,6 @@ fn bringToFront(slot: u8) void {
     setFocused(slot);
 }
 
-const rtc = @import("../time/rtc.zig");
-
 // --- Scene rendering (to back buffer) ---
 
 /// True iff some window above z_stack[z_pos] in z-order fully contains
@@ -1566,7 +786,7 @@ const Bbox = struct {
 
 /// Shadow-padded outer rect [x0, y0, x1, y1) of a window — the full extent
 /// renderWindow can paint (shadow band ⊂ SHADOW_SPAD pad, see SHADOW_*).
-fn paddedWinRect(i: u8) [4]i32 {
+pub fn paddedWinRect(i: u8) [4]i32 {
     const w = &windows[i];
     return .{
         w.x - SHADOW_SPAD,
@@ -1621,8 +841,8 @@ pub fn occludersAbove(i: u8, out: [][4]i32) usize {
 // fillGlass radius 8 + pill soft shadow +2, and the overlays' fillGlass
 // radius ≤ 6. Each joins a closure padded by its reach so the blur never
 // samples stale pixels.
-const MENUBAR_REACH: i32 = @as(i32, MENUBAR_H) + 8;
-const DOCK_REACH: i32 = 12;
+pub const MENUBAR_REACH: i32 = @as(i32, MENUBAR_H) + 8;
+pub const DOCK_REACH: i32 = 12;
 const OVERLAY_REACH: i32 = 8;
 
 const MAX_REGION_SEEDS = 16;
@@ -1963,80 +1183,6 @@ fn launchPath(path: []const u8) void {
     }
     sound.open();
 }
-
-/// Wire a Terminal window to a freshly-spawned user-space shell:
-///   - kb_pipe: desktop → shell stdin   (shell holds read-side, desktop holds write-side)
-///   - out_pipe: shell → desktop stdout (shell holds write-side, desktop holds read-side)
-/// The desktop's main loop drains `out_pipe` non-blocking each frame and feeds
-/// it into the window's text buffer via `putCharOnWindow`. Keyboard handler
-/// pushes keystrokes into `kb_pipe`. No new kernel primitive is needed — pipes
-/// already do everything a TTY did, and the back-channel into the desktop
-/// (out_pipe drain step) is a desktop concern, not a kernel one.
-fn spawnShellOnWindow(wi: u8) void {
-    const pipe = @import("../proc/pipe.zig");
-    const kb_pipe = pipe.alloc() orelse {
-        showNotification("Pipe pool full");
-        return;
-    };
-    const out_pipe = pipe.alloc() orelse {
-        pipe.closeReader(kb_pipe);
-        pipe.closeWriter(kb_pipe);
-        showNotification("Pipe pool full");
-        return;
-    };
-
-    const fresh = @import("../fs/vfs.zig").loadFileFresh("app.elf") orelse {
-        putStringOnWindow(wi, "shell: app.elf not found\n");
-        pipe.closeReader(kb_pipe);
-        pipe.closeWriter(kb_pipe);
-        pipe.closeReader(out_pipe);
-        pipe.closeWriter(out_pipe);
-        return;
-    };
-    const pid_or_null = elf_loader.loadAndStart(fresh.buf, fresh.size, fresh.pages, fresh.inode, null);
-    const pid = pid_or_null orelse {
-        putStringOnWindow(wi, "shell: load failed\n");
-        pipe.closeReader(kb_pipe);
-        pipe.closeWriter(kb_pipe);
-        pipe.closeReader(out_pipe);
-        pipe.closeWriter(out_pipe);
-        return;
-    };
-
-    process.setName(@intCast(pid), "shell");
-    const pcb = process.getPCB(pid);
-    pcb.priority = .interactive;
-
-    // The shell owns: kb_pipe read-side (fd 0), out_pipe write-side (one file
-    // behind fd 1 and fd 2). The desktop owns: kb_pipe write-side, out_pipe
-    // read-side. Refcounts are initialized to 1/1 by pipe.alloc(); each end
-    // has exactly one owner, and the shell's go back when its files do.
-    //
-    // The two ends are the window's terminal (tty/tty.zig): a Linux
-    // program the shell starts inherits them and finds a tty there.
-    const file = @import("../fs/file.zig");
-    const vfs_mod = @import("../fs/vfs.zig");
-    const tty = @import("../tty/tty.zig");
-    const term = tty.open(kb_pipe, out_pipe, @intCast(pid), @intCast(TERM_ROWS), @intCast(TERM_COLS));
-    if (vfs_mod.newFile(.{ .kind = .pipe, .pipe_id = kb_pipe, .access = file.READ, .tty = term })) |f| file.assign(pcb, 0, f);
-    if (vfs_mod.newFile(.{ .kind = .pipe, .pipe_id = out_pipe, .access = file.WRITE, .tty = term })) |f| {
-        file.ref(f);
-        file.assign(pcb, 1, f);
-        file.assign(pcb, 2, f);
-    }
-
-    windows[wi].kb_pipe = kb_pipe;
-    windows[wi].out_pipe = out_pipe;
-    windows[wi].tty = term;
-    windows[wi].shell_pid = @intCast(pid);
-    // Event-driven compositor: out_pipe is drained by the desktop loop's
-    // tryRead poll, not by a blocking read. Tell pipe.write to wake the
-    // compositor when the shell writes to it; otherwise the desktop
-    // sleeps through stdout bytes until something else (input, animation)
-    // wakes it.
-    pipe.setDesktopDrain(out_pipe);
-}
-
 
 // Boot splash extracted to desktop/splash.zig — the long animation
 // loop is unrelated to anything else here.
@@ -2462,352 +1608,12 @@ fn renderWindow(idx: u8) void {
 
 /// The 1px window border, a hairline a touch off the body. Flashes while a
 /// terminal's bell_phase counts down.
-fn borderColor(w: *const Window, is_focused: bool) u32 {
+pub fn borderColor(w: *const Window, is_focused: bool) u32 {
     if (w.term) |t| if (t.bell_phase > 0) return BELL_FLASH_COLOR;
     return if (conf.theme == 1)
         (if (is_focused) @as(u32, 0x4A4A4E) else @as(u32, 0x38383B))
     else
         (if (is_focused) @as(u32, 0xB4B4B4) else @as(u32, 0xC8C8C8));
-}
-
-/// The cell the cursor block of terminal `idx` is drawn in right now, or
-/// NO_CURSOR: unfocused, hidden, off the visible grid, or in the dark half
-/// of its blink.
-fn termCursorCell(idx: u8, w: *const Window, t: *const TerminalData, max_cols: u32, max_rows: u32) u16 {
-    if (idx != wm.focused or t.text_col >= max_cols or t.text_row >= max_rows or !cursorShown(w, t)) return TerminalData.NO_CURSOR;
-    const blink_on = ((process.tick_count -% t.cursor_blink_anchor) / CURSOR_BLINK_HALF_TICKS) & 1 == 0;
-    if (!blink_on) return TerminalData.NO_CURSOR;
-    return @intCast(@as(u32, t.text_row) * TERM_COLS + t.text_col);
-}
-
-/// The scrollback bar along the right edge of a terminal's content area.
-fn drawTermScrollbar(w: *const Window, t: *const TerminalData) void {
-    if (t.scroll_count == 0) return;
-    const content_y = w.y + @as(i32, TITLEBAR_H);
-    const content_h = w.height -| TITLEBAR_H;
-    const max_rows = content_h / FONT_H;
-    const total_lines = @as(u32, t.scroll_count) + TERM_ROWS;
-    const sb_x = w.x + @as(i32, @intCast(w.width)) - 3;
-    gfx.fillRect(sb_x, content_y + 1, 2, content_h -| 1, 0x2A2A2A);
-    const thumb_h = @max(content_h * max_rows / total_lines, 8);
-    const scroll_pos = total_lines - @as(u32, t.scroll_view) -| max_rows;
-    const track_h = content_h -| thumb_h;
-    const thumb_y_off = if (total_lines > max_rows) scroll_pos * track_h / (total_lines - max_rows) else 0;
-    gfx.fillRect(sb_x, content_y + @as(i32, @intCast(thumb_y_off)), 2, thumb_h, 0x555555);
-}
-
-/// Paint one row of terminal `idx` into the back buffer — background,
-/// cells, the cursor block if `cursor` lies on it — and record it as what
-/// the row shows. The scrollbar's stretch of the row is painted over.
-fn paintTermRow(idx: u8, row: u32, cursor: u16) void {
-    const w = &windows[idx];
-    const t = w.term orelse return;
-    const content_y = w.y + @as(i32, TITLEBAR_H);
-    const content_h = w.height -| TITLEBAR_H;
-    const max_cols = (w.width - TERM_PAD * 2) / FONT_W;
-    if (row >= TERM_ROWS or row >= content_h / FONT_H) return;
-
-    const py: i32 = content_y + @as(i32, @intCast(row * FONT_H));
-
-    // A row that reaches the bottom corners is painted across them: they
-    // go back as they were.
-    const in_corners = py + @as(i32, FONT_H) > w.y + @as(i32, @intCast(w.height)) - @as(i32, CORNER_R);
-    const fx = w.x - @as(i32, BORDER);
-    const fy = w.y - @as(i32, BORDER);
-    if (in_corners) saveCornerPixels(fx, fy, w.width + BORDER * 2, w.height + BORDER * 2, BOTTOM_CORNERS);
-    defer if (in_corners) keepCornerPixels(fx, fy, w.width + BORDER * 2, w.height + BORDER * 2, borderColor(w, idx == wm.focused), BOTTOM_CORNERS);
-
-    // Clear the row background
-    gfx.fillRect(w.x, py, w.width, FONT_H, WINDOW_BG);
-    if (row == 0) gfx.drawHLine(w.x, content_y, w.width, 0x151515);
-
-    const first = row * TERM_COLS;
-    drawTermCells(w.x, py, t.text_buf[first..], t.attr_buf[first..], t.fg_rgb_buf[first..], t.bg_rgb_buf[first..], max_cols);
-
-    const cursor_here = cursor != TerminalData.NO_CURSOR and cursor / TERM_COLS == row;
-    if (cursor_here) {
-        gfx.fillRect(
-            w.x + @as(i32, @intCast(TERM_PAD + @as(u32, cursor % TERM_COLS) * FONT_W)),
-            py,
-            FONT_W,
-            FONT_H,
-            TERM_FG,
-        );
-    }
-
-    @memcpy(t.painted_text[first..][0..TERM_COLS], t.text_buf[first..][0..TERM_COLS]);
-    @memcpy(t.painted_attr[first..][0..TERM_COLS], t.attr_buf[first..][0..TERM_COLS]);
-    @memcpy(t.painted_rgb[first..][0..TERM_COLS], t.fg_rgb_buf[first..][0..TERM_COLS]);
-    @memcpy(t.painted_bg[first..][0..TERM_COLS], t.bg_rgb_buf[first..][0..TERM_COLS]);
-    if (cursor_here) {
-        t.painted_cursor = cursor;
-    } else if (t.painted_cursor != TerminalData.NO_CURSOR and t.painted_cursor / TERM_COLS == row) {
-        t.painted_cursor = TerminalData.NO_CURSOR;
-    }
-}
-
-/// Fast path: re-render only the cursor's row of a terminal in the back
-/// buffer.
-fn renderTerminalRow(idx: u8) void {
-    const w = &windows[idx];
-    const t = w.term orelse return;
-    if (!w.visible or w.minimized) return;
-    const max_cols = (w.width - TERM_PAD * 2) / FONT_W;
-    const max_rows = (w.height -| TITLEBAR_H) / FONT_H;
-    paintTermRow(idx, t.text_row, termCursorCell(idx, w, t, max_cols, max_rows));
-    redrawTermScrollbar(idx);
-}
-
-/// The scrollbar again after rows were painted over it, its foot kept out
-/// of the rounded corner.
-fn redrawTermScrollbar(idx: u8) void {
-    const w = &windows[idx];
-    const t = w.term orelse return;
-    if (t.scroll_count == 0) return;
-    const fx = w.x - @as(i32, BORDER);
-    const fy = w.y - @as(i32, BORDER);
-    saveCornerPixels(fx, fy, w.width + BORDER * 2, w.height + BORDER * 2, BOTTOM_CORNERS);
-    drawTermScrollbar(w, t);
-    keepCornerPixels(fx, fy, w.width + BORDER * 2, w.height + BORDER * 2, borderColor(w, idx == wm.focused), BOTTOM_CORNERS);
-}
-
-/// Whether the rows of terminal `idx` (at z_stack[z_pos]) can be painted on
-/// their own: the back buffer shows the live view as recorded, and nothing
-/// is drawn over the content area — no window or its shadow above, no
-/// menubar or dock band. Overlays are the caller's (partialHitsOverlay).
-fn termRowsPaintable(z_pos: usize, idx: u8) bool {
-    const w = &windows[idx];
-    const t = w.term orelse return false;
-    if (!t.painted_valid or t.scroll_view != 0 or w.anim_type != .none) return false;
-    if (!w.visible or w.minimized or backbuf == null) return false;
-    const x0 = w.x;
-    const y0 = w.y + @as(i32, TITLEBAR_H);
-    const x1 = w.x + @as(i32, @intCast(w.width));
-    const y1 = w.y + @as(i32, @intCast(w.height));
-    const dock_y: i32 = dock.dockY();
-    if (y0 < MENUBAR_REACH) return false;
-    if (y0 < dock_y + @as(i32, TASKBAR_H) + DOCK_REACH and y1 > dock_y - DOCK_REACH) return false;
-    for (z_stack[z_pos + 1 .. wm.z_count]) |above| {
-        if (!windows[above].visible or windows[above].minimized) continue;
-        const r = paddedWinRect(above);
-        if (r[0] < x1 and x0 < r[2] and r[1] < y1 and y0 < r[3]) return false;
-    }
-    return true;
-}
-
-/// Bring the rows of terminal `idx` up to date in the back buffer: those
-/// whose cells or cursor block differ from what they show are repainted,
-/// and the bands painted go to the dirty tracker. For a window that
-/// termRowsPaintable accepted. True if anything was painted.
-fn repaintStaleRows(idx: u8) bool {
-    const w = &windows[idx];
-    const t = w.term orelse return false;
-    const content_y = w.y + @as(i32, TITLEBAR_H);
-    const content_h = w.height -| TITLEBAR_H;
-    const max_cols = (w.width - TERM_PAD * 2) / FONT_W;
-    const max_rows = @min(TERM_ROWS, content_h / FONT_H);
-    const cursor = termCursorCell(idx, w, t, max_cols, max_rows);
-    const old_cursor = t.painted_cursor;
-    const wx: u32 = if (w.x < 0) 0 else @intCast(w.x);
-
-    var painted = false;
-    var band: ?u32 = null; // first row of the run being painted
-    var row: u32 = 0;
-    while (row <= max_rows) : (row += 1) {
-        const stale = row < max_rows and blk: {
-            // NO_CURSOR / TERM_COLS is past every row.
-            if (cursor != old_cursor and (cursor / TERM_COLS == row or old_cursor / TERM_COLS == row)) break :blk true;
-            const a = row * TERM_COLS;
-            break :blk !std.mem.eql(u8, t.text_buf[a..][0..TERM_COLS], t.painted_text[a..][0..TERM_COLS]) or
-                !std.mem.eql(u8, t.attr_buf[a..][0..TERM_COLS], t.painted_attr[a..][0..TERM_COLS]) or
-                !std.mem.eql(u32, t.fg_rgb_buf[a..][0..TERM_COLS], t.painted_rgb[a..][0..TERM_COLS]) or
-                !std.mem.eql(u32, t.bg_rgb_buf[a..][0..TERM_COLS], t.painted_bg[a..][0..TERM_COLS]);
-        };
-        if (stale) {
-            paintTermRow(idx, row, cursor);
-            if (band == null) band = row;
-            painted = true;
-        } else if (band) |b| {
-            const y = content_y + @as(i32, @intCast(b * FONT_H));
-            if (y >= 0) addDirtyRect(wx, @intCast(y), w.width, (row - b) * FONT_H);
-            band = null;
-        }
-    }
-    const bar_moved = t.scroll_count != t.painted_scroll_count;
-    if (painted or bar_moved) redrawTermScrollbar(idx);
-    if (bar_moved) {
-        t.painted_scroll_count = t.scroll_count;
-        const bar_x = w.x + @as(i32, @intCast(w.width)) - 3;
-        if (bar_x >= 0 and content_y >= 0) addDirtyRect(@intCast(bar_x), @intCast(content_y), 3, content_h);
-        painted = true;
-    }
-    return painted;
-}
-
-// --- Rounded corner masking ---
-// Per-pixel alpha-coverage mask for a CORNER_R-radius rounded corner. (0,0)
-// is the outer corner (alpha=255 → fully bg). Pivot of the quarter-circle is
-// at (R, R) — the deepest inner point. Supersampled 4×4 at comptime so
-// edges fade smoothly instead of stair-stepping like the old corner_insets
-// table did.
-const CORNER_R: u32 = 10;
-const corner_mask: [CORNER_R][CORNER_R]u8 = blk: {
-    @setEvalBranchQuota(50_000);
-    var mask: [CORNER_R][CORNER_R]u8 = undefined;
-    const R: f32 = @floatFromInt(CORNER_R);
-    const SAMPLES: u32 = 4;
-    const SAMPLES_F: f32 = @floatFromInt(SAMPLES);
-    const TOTAL: u32 = SAMPLES * SAMPLES;
-    for (0..CORNER_R) |y_| {
-        for (0..CORNER_R) |x_| {
-            var outside: u32 = 0;
-            const fx: f32 = @floatFromInt(x_);
-            const fy: f32 = @floatFromInt(y_);
-            for (0..SAMPLES) |sy| {
-                for (0..SAMPLES) |sx| {
-                    const sub_x = fx + (@as(f32, @floatFromInt(sx)) + 0.5) / SAMPLES_F;
-                    const sub_y = fy + (@as(f32, @floatFromInt(sy)) + 0.5) / SAMPLES_F;
-                    const dx = R - sub_x;
-                    const dy = R - sub_y;
-                    if (dx * dx + dy * dy > R * R) outside += 1;
-                }
-            }
-            mask[y_][x_] = @intCast((outside * 255) / TOTAL);
-        }
-    }
-    break :blk mask;
-};
-
-// White border-ring coverage hugging the rounded corner's OUTER arc — distance
-// (R−CORNER_RING_T, R] from the pivot. Lets the white chrome border continue
-// smoothly around the curve instead of the corner dropping straight to bg.
-// Same 4×4 supersample as corner_mask; together they partition each corner
-// pixel into {outside→bg, ring→border, inside→window}.
-const CORNER_RING_T: f32 = 1.6;
-const corner_ring: [CORNER_R][CORNER_R]u8 = blk: {
-    @setEvalBranchQuota(50_000);
-    var mask: [CORNER_R][CORNER_R]u8 = undefined;
-    const R: f32 = @floatFromInt(CORNER_R);
-    const inner: f32 = R - CORNER_RING_T;
-    const SAMPLES: u32 = 4;
-    const SAMPLES_F: f32 = @floatFromInt(SAMPLES);
-    const TOTAL: u32 = SAMPLES * SAMPLES;
-    for (0..CORNER_R) |y_| {
-        for (0..CORNER_R) |x_| {
-            var inring: u32 = 0;
-            const fx: f32 = @floatFromInt(x_);
-            const fy: f32 = @floatFromInt(y_);
-            for (0..SAMPLES) |sy| {
-                for (0..SAMPLES) |sx| {
-                    const sub_x = fx + (@as(f32, @floatFromInt(sx)) + 0.5) / SAMPLES_F;
-                    const sub_y = fy + (@as(f32, @floatFromInt(sy)) + 0.5) / SAMPLES_F;
-                    const dx = R - sub_x;
-                    const dy = R - sub_y;
-                    const d2 = dx * dx + dy * dy;
-                    if (d2 <= R * R and d2 > inner * inner) inring += 1;
-                }
-            }
-            mask[y_][x_] = @intCast((inring * 255) / TOTAL);
-        }
-    }
-    break :blk mask;
-};
-
-// Save the full CORNER_R × CORNER_R square at each of the 4 corners
-// before drawing the window; restore via the alpha mask afterwards so
-// edges blend smoothly with whatever is behind.
-const CORNER_BUF_PER: u32 = CORNER_R * CORNER_R;
-var corner_save: [4 * CORNER_BUF_PER]u32 = undefined;
-
-/// First corner save/restore works on: all four, or the bottom pair only.
-const ALL_CORNERS: usize = 0;
-const BOTTOM_CORNERS: usize = 2;
-
-fn saveCornerPixels(x: i32, y: i32, w: u32, h: u32, first: usize) void {
-    const right: i32 = x + @as(i32, @intCast(w)) - 1;
-    const bot: i32 = y + @as(i32, @intCast(h)) - 1;
-    const corners = [_][2]i32{ .{ x, y }, .{ right, y }, .{ x, bot }, .{ right, bot } };
-    const x_dirs = [_]i32{ 1, -1, 1, -1 };
-    const y_dirs = [_]i32{ 1, 1, -1, -1 };
-    for (first..4) |c| {
-        const base = c * CORNER_BUF_PER;
-        for (0..CORNER_R) |cy| {
-            for (0..CORNER_R) |cx| {
-                if (corner_mask[cy][cx] == 0) continue;
-                const px = corners[c][0] + @as(i32, @intCast(cx)) * x_dirs[c];
-                const py = corners[c][1] + @as(i32, @intCast(cy)) * y_dirs[c];
-                const idx = base + cy * CORNER_R + cx;
-                if (px >= 0 and py >= 0 and @as(u32, @intCast(px)) < gfx.target_w and @as(u32, @intCast(py)) < gfx.target_h) {
-                    corner_save[idx] = gfx.target[@as(u32, @intCast(py)) * gfx.target_w + @as(u32, @intCast(px))];
-                }
-            }
-        }
-    }
-}
-
-fn restoreCornerPixels(x: i32, y: i32, w: u32, h: u32, border_color: u32, first: usize) void {
-    const right: i32 = x + @as(i32, @intCast(w)) - 1;
-    const bot: i32 = y + @as(i32, @intCast(h)) - 1;
-    const corners = [_][2]i32{ .{ x, y }, .{ right, y }, .{ x, bot }, .{ right, bot } };
-    const x_dirs = [_]i32{ 1, -1, 1, -1 };
-    const y_dirs = [_]i32{ 1, 1, -1, -1 };
-    const br_r = (border_color >> 16) & 0xFF;
-    const br_g = (border_color >> 8) & 0xFF;
-    const br_b = border_color & 0xFF;
-    for (first..4) |c| {
-        const base = c * CORNER_BUF_PER;
-        for (0..CORNER_R) |cy| {
-            for (0..CORNER_R) |cx| {
-                const out_a: u32 = corner_mask[cy][cx]; // outside the arc → background
-                const ring_a: u32 = corner_ring[cy][cx]; // on the arc → white border
-                if (out_a == 0 and ring_a == 0) continue; // fully interior — keep window pixel
-                const px = corners[c][0] + @as(i32, @intCast(cx)) * x_dirs[c];
-                const py = corners[c][1] + @as(i32, @intCast(cy)) * y_dirs[c];
-                if (px < 0 or py < 0) continue;
-                if (@as(u32, @intCast(px)) >= gfx.target_w or @as(u32, @intCast(py)) >= gfx.target_h) continue;
-                const off = @as(u32, @intCast(py)) * gfx.target_w + @as(u32, @intCast(px));
-                const bg_pixel = corner_save[base + cy * CORNER_R + cx];
-                if (out_a >= 254) {
-                    gfx.target[off] = bg_pixel; // fully outside the rounded rect
-                    continue;
-                }
-                // 3-way composite: window interior · white border ring · bg outside.
-                // The three coverages partition the pixel (sum == 255), so the
-                // white chrome border traces the corner arc instead of vanishing.
-                const win = gfx.target[off];
-                const int_a: u32 = 255 - out_a - ring_a;
-                const r = (((win >> 16) & 0xFF) * int_a + br_r * ring_a + ((bg_pixel >> 16) & 0xFF) * out_a) / 255;
-                const g = (((win >> 8) & 0xFF) * int_a + br_g * ring_a + ((bg_pixel >> 8) & 0xFF) * out_a) / 255;
-                const b = ((win & 0xFF) * int_a + br_b * ring_a + (bg_pixel & 0xFF) * out_a) / 255;
-                gfx.target[off] = (r << 16) | (g << 8) | b;
-            }
-        }
-    }
-}
-
-/// restoreCornerPixels for rows repainted inside a window already on screen:
-/// what was saved is the finished corner, not the background behind it, so
-/// wherever the background shows through, the pixel goes back as it was.
-fn keepCornerPixels(x: i32, y: i32, w: u32, h: u32, border_color: u32, first: usize) void {
-    restoreCornerPixels(x, y, w, h, border_color, first);
-    const right: i32 = x + @as(i32, @intCast(w)) - 1;
-    const bot: i32 = y + @as(i32, @intCast(h)) - 1;
-    const corners = [_][2]i32{ .{ x, y }, .{ right, y }, .{ x, bot }, .{ right, bot } };
-    const x_dirs = [_]i32{ 1, -1, 1, -1 };
-    const y_dirs = [_]i32{ 1, 1, -1, -1 };
-    for (first..4) |c| {
-        const base = c * CORNER_BUF_PER;
-        for (0..CORNER_R) |cy| {
-            for (0..CORNER_R) |cx| {
-                if (corner_mask[cy][cx] == 0) continue;
-                const px = corners[c][0] + @as(i32, @intCast(cx)) * x_dirs[c];
-                const py = corners[c][1] + @as(i32, @intCast(cy)) * y_dirs[c];
-                if (px < 0 or py < 0) continue;
-                if (@as(u32, @intCast(px)) >= gfx.target_w or @as(u32, @intCast(py)) >= gfx.target_h) continue;
-                gfx.target[@as(u32, @intCast(py)) * gfx.target_w + @as(u32, @intCast(px))] = corner_save[base + cy * CORNER_R + cx];
-            }
-        }
-    }
 }
 
 // --- Cursor ---
@@ -2895,212 +1701,6 @@ fn unbakeCursorFromBackBuffer() void {
 }
 
 // --- Event handling ---
-
-const KEY_UP = keyboard.KEY_UP;
-const KEY_DOWN = keyboard.KEY_DOWN;
-
-/// Returns true if full re-render needed (Enter/scroll/history), false for row-only.
-fn handleKeyboard(w: *Window, ch: u8) bool {
-    // Reset blink so the cursor stays visible right after a keystroke.
-    if (w.term) |tt| tt.cursor_blink_anchor = process.tick_count;
-    // Shell-attached terminal: keypresses go straight to the user-space shell
-    // via its stdin pipe. The shell does its own echo, line editing, history,
-    // prompt. PgUp/PgDn still scroll the kernel-side scrollback buffer (a
-    // desktop affordance, not part of the shell's stdin contract).
-    if (w.kb_pipe != 0xFF) {
-        if (ch == keyboard.KEY_PGUP) {
-            const content_h = w.height -| TITLEBAR_H;
-            const max_rows: u16 = @intCast(content_h / FONT_H);
-            const step = if (max_rows > 2) max_rows - 2 else 1;
-            if (w.term) |tt| tt.scroll_view = @min(tt.scroll_view + step, tt.scroll_count);
-            return true;
-        } else if (ch == keyboard.KEY_PGDN) {
-            const content_h = w.height -| TITLEBAR_H;
-            const max_rows: u16 = @intCast(content_h / FONT_H);
-            const step = if (max_rows > 2) max_rows - 2 else 1;
-            if (w.term) |tt| tt.scroll_view -|= step;
-            return true;
-        }
-        // Reset scroll on any other input — feels right for a shell.
-        if (w.term) |tt| tt.scroll_view = 0;
-        // Forward typeable bytes + line-editing keys to the shell's stdin.
-        // The shell does its own readline (cursor moves, history, tab
-        // completion), so arrows / Home / End / Delete must reach it.
-        // Function keys (0x90+) stay desktop-only — they're global shortcuts.
-        // PgUp / PgDn already returned above (kernel-side scrollback).
-        const is_printable = ch >= 0x20 and ch <= 0x7E;
-        const is_line_edit = ch == '\n' or ch == '\r' or ch == '\t' or ch == '\x08' or ch == 0x03 or ch == 0x1B;
-        const is_nav = ch == keyboard.KEY_UP or ch == keyboard.KEY_DOWN or
-            ch == keyboard.KEY_LEFT or ch == keyboard.KEY_RIGHT or
-            ch == keyboard.KEY_HOME or ch == keyboard.KEY_END or
-            ch == keyboard.KEY_DELETE;
-        // A Linux program in the terminal gets every control key (^D, ^Z,
-        // ^U...): its line discipline or the program itself knows them.
-        const is_control = ch < 0x20 and @import("../tty/tty.zig").hasLinuxProgram(w.tty);
-        if (!is_printable and !is_line_edit and !is_nav and !is_control) return false;
-        const buf = [_]u8{ch};
-        const written = @import("../proc/pipe.zig").tryWrite(w.kb_pipe, &buf);
-        if (written == 0) {
-            // pipe full / closed — char dropped before reaching shell
-            dbg_kbpipe_drop +%= 1;
-            if (process.tick_count -% dbg_last_kbpipe_log >= 100) {
-                dbg_last_kbpipe_log = process.tick_count;
-                debug.klog("[kbd-drop] kb_pipe write dropped pid={d} pipe_id={d} ch=0x{X} drops={d}\n", .{
-                    w.shell_pid, w.kb_pipe, ch, dbg_kbpipe_drop,
-                });
-            }
-        }
-        return false;
-    }
-
-    const t = w.term orelse return false;
-    if (ch == '\n') {
-        t.scroll_view = 0;
-        t.text_col = 0;
-        t.text_row += 1;
-        if (t.text_row >= TERM_ROWS) scrollWindow(w);
-        if (t.cmd_len > 0) {
-            const hi = t.history_count % 8;
-            const safe_len = @min(t.cmd_len, 127);
-            @memcpy(t.history[hi][0..safe_len], t.cmd_buf[0..safe_len]);
-            t.history_len[hi] = safe_len;
-            t.history_count +%= 1;
-            t.history_idx = t.history_count;
-            redirect_win = w;
-            vga.redirect_fn = &desktopPutChar;
-            cli.execute(t.cmd_buf[0..t.cmd_len]);
-            vga.redirect_fn = null;
-            redirect_win = null;
-        }
-        t.cmd_len = 0;
-        termPrompt(w);
-        return true;
-    } else if (ch == '\x08') {
-        if (t.cmd_len > 0) {
-            t.cmd_len -= 1;
-            if (t.text_col > 0) {
-                t.text_col -= 1;
-                if (textIdx(t.text_row, t.text_col)) |idx| t.text_buf[idx] = ' ';
-            }
-        }
-        return false;
-    } else if (ch == KEY_UP) {
-        if (t.history_count > 0 and t.history_idx > 0) {
-            t.history_idx -= 1;
-            const hi = t.history_idx % 8;
-            recallHistory(w, hi);
-        }
-        return true;
-    } else if (ch == KEY_DOWN) {
-        if (t.history_idx < t.history_count) {
-            t.history_idx += 1;
-            if (t.history_idx < t.history_count) {
-                const hi = t.history_idx % 8;
-                recallHistory(w, hi);
-            } else {
-                clearCurrentLine(w);
-                t.cmd_len = 0;
-            }
-        }
-        return true;
-    } else if (ch == 0x09) {
-        if (t.cmd_len >= 4 and std.mem.eql(u8, t.cmd_buf[0..4], "run ")) {
-            const prefix = t.cmd_buf[4..t.cmd_len];
-            var names: [8][32]u8 = undefined;
-            var name_lens: [8]u8 = undefined;
-            const count = tarfs.matchPrefix(prefix, &names, &name_lens);
-            if (count == 1) {
-                const name = names[0][0..name_lens[0]];
-                if (name.len > prefix.len) {
-                    const remaining = name[prefix.len..];
-                    for (remaining) |c| {
-                        if (t.cmd_len < 127 and t.text_col < TERM_COLS) {
-                            t.cmd_buf[t.cmd_len] = c;
-                            t.cmd_len += 1;
-                            if (textIdx(t.text_row, t.text_col)) |ti| t.text_buf[ti] = c;
-                            t.text_col += 1;
-                        }
-                    }
-                }
-            } else if (count > 1) {
-                t.text_col = 0;
-                t.text_row += 1;
-                if (t.text_row >= TERM_ROWS) scrollWindow(w);
-                var mi: u8 = 0;
-                while (mi < count) : (mi += 1) {
-                    for (names[mi][0..name_lens[mi]]) |c| {
-                        if (t.text_col < TERM_COLS) {
-                            if (textIdx(t.text_row, t.text_col)) |ti| t.text_buf[ti] = c;
-                            t.text_col += 1;
-                        }
-                    }
-                    if (t.text_col + 1 < TERM_COLS) {
-                        if (textIdx(t.text_row, t.text_col)) |ti| t.text_buf[ti] = ' ';
-                        t.text_col += 1;
-                    }
-                }
-                t.text_col = 0;
-                t.text_row += 1;
-                if (t.text_row >= TERM_ROWS) scrollWindow(w);
-                termPrompt(w);
-                for (t.cmd_buf[0..t.cmd_len]) |c| {
-                    if (t.text_col < TERM_COLS) {
-                        if (textIdx(t.text_row, t.text_col)) |ti| t.text_buf[ti] = c;
-                        t.text_col += 1;
-                    }
-                }
-            }
-        }
-        return true;
-    } else if (ch == keyboard.KEY_PGUP) {
-        const content_h = w.height -| TITLEBAR_H;
-        const max_rows: u16 = @intCast(content_h / FONT_H);
-        const step = if (max_rows > 2) max_rows - 2 else 1;
-        t.scroll_view = @min(t.scroll_view + step, t.scroll_count);
-        return true;
-    } else if (ch == keyboard.KEY_PGDN) {
-        const content_h = w.height -| TITLEBAR_H;
-        const max_rows: u16 = @intCast(content_h / FONT_H);
-        const step = if (max_rows > 2) max_rows - 2 else 1;
-        t.scroll_view -|= step;
-        return true;
-    } else if (ch >= 0x20 and ch < 0x7F) {
-        t.scroll_view = 0;
-        if (t.cmd_len < 127 and t.text_col < TERM_COLS) {
-            t.cmd_buf[t.cmd_len] = ch;
-            t.cmd_len += 1;
-            if (textIdx(t.text_row, t.text_col)) |idx| t.text_buf[idx] = ch;
-            t.text_col += 1;
-        }
-        return false;
-    }
-    return false;
-}
-
-fn recallHistory(w: *Window, hi: u8) void {
-    const t = w.term orelse return;
-    clearCurrentLine(w);
-    const len = t.history_len[hi];
-    t.cmd_len = len;
-    @memcpy(t.cmd_buf[0..len], t.history[hi][0..len]);
-    const prompt_len: u16 = 12;
-    var col: u16 = 0;
-    while (col < len) : (col += 1) {
-        if (textIdx(t.text_row, prompt_len + col)) |idx| t.text_buf[idx] = t.cmd_buf[col];
-    }
-    t.text_col = prompt_len + @as(u16, len);
-}
-
-fn clearCurrentLine(w: *Window) void {
-    const t = w.term orelse return;
-    const prompt_len: u16 = 12;
-    var col: u16 = prompt_len;
-    while (col < TERM_COLS) : (col += 1) {
-        if (textIdx(t.text_row, col)) |idx| t.text_buf[idx] = ' ';
-    }
-    t.text_col = prompt_len;
-    t.cmd_len = 0;
-}
 
 /// What this frame repaints. .region repaints the queued seeds (see
 /// renderRegions); .drag is the same path driven by a window drag.
@@ -4738,7 +3338,7 @@ pub fn run() void {
     active = false;
 
     vga.redirect_fn = null;
-    redirect_win = null;
+    session.redirect_win = null;
     if (backbuf != null) {
         paging.freeBackBuffer(bb_pages);
         backbuf = null;

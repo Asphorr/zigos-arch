@@ -1,4 +1,4 @@
-// Window module — owns the window table, the Window/TerminalData structs,
+// Window module — owns the window table, the Window struct,
 // the z-stack, focus tracking, slot allocation, and hit-testing helpers.
 // Aliased as `wm` from desktop.zig.
 //
@@ -23,119 +23,23 @@
 
 const std = @import("std");
 const events_mod = @import("../events.zig");
-const heap = @import("../../mm/heap.zig");
 const mouse = @import("../../driver.zig").mouse;
 const virtio_gpu = @import("../../driver.zig").virtio_gpu;
-const theme = @import("../theme.zig");
 const layout = @import("layout.zig");
 const cfg = @import("../../config.zig");
 const spinlock = @import("../../proc/spinlock.zig");
 
+const TerminalData = @import("term/emulator.zig").TerminalData;
+
 pub const MAX_WINDOWS: u32 = cfg.MAX_WINDOWS;
 pub const SCROLL_LINES: u32 = cfg.SCROLL_LINES;
-
-pub const TERM_COLS: u32 = 80;
-pub const TERM_ROWS: u32 = 25;
 
 pub const MIN_WIN_W: u32 = 200;
 pub const MIN_WIN_H: u32 = 100;
 pub const RESIZE_ZONE: i32 = 5;
 
-const ATTR_DEFAULT = theme.ATTR_DEFAULT;
 const TITLEBAR_H = layout.TITLEBAR_H;
 const BTN_RADIUS = layout.BTN_RADIUS;
-
-/// `string`: inside an OSC/DCS/APC string, dropped up to BEL or ESC \
-/// (`string_esc`: its ESC came). `charset`: ESC ( and its kin take one
-/// more byte.
-pub const EscState = enum(u8) { idle, esc, csi, string, string_esc, charset };
-
-/// Arguments one CSI sequence may carry: a bold truecolor foreground with a
-/// truecolor background is eleven.
-pub const CSI_ARGS: usize = 16;
-
-pub const TerminalData = struct {
-    text_buf: [TERM_COLS * TERM_ROWS]u8,
-    attr_buf: [TERM_COLS * TERM_ROWS]u8,
-    /// Per-cell 24-bit foreground RGB. Only consulted when the matching
-    /// `attr_buf[i] & ATTR_RGB_FG` flag is set; otherwise the cell renders
-    /// via `ANSI_PALETTE[attr & 0x0F]`. Costs 8 KB per terminal at the
-    /// default 80×25 grid — worth it for actually-orange logos.
-    fg_rgb_buf: [TERM_COLS * TERM_ROWS]u32,
-    /// Per-cell background, consulted when `attr_buf[i] & ATTR_BG` is set.
-    bg_rgb_buf: [TERM_COLS * TERM_ROWS]u32,
-    text_row: u16,
-    text_col: u16,
-    cmd_buf: [128]u8,
-    cmd_len: u8,
-    history: [8][128]u8,
-    history_len: [8]u8,
-    history_count: u8,
-    history_idx: u8,
-    scroll_buf: [SCROLL_LINES * TERM_COLS]u8,
-    scroll_attr_buf: [SCROLL_LINES * TERM_COLS]u8,
-    scroll_fg_rgb_buf: [SCROLL_LINES * TERM_COLS]u32,
-    scroll_bg_rgb_buf: [SCROLL_LINES * TERM_COLS]u32,
-    scroll_write: u16,
-    scroll_count: u16,
-    scroll_view: u16,
-    // Escape-sequence parser state. `idle` = consume chars normally;
-    // `esc` = saw \x1b, awaiting `[`; `csi` = inside `\x1b[...<final>`,
-    // accumulating numeric args separated by `;`.
-    esc_state: EscState,
-    // Enough slots that no sequence a program sends is cut short: digits
-    // past the last slot would pile into it and corrupt it.
-    csi_args: [CSI_ARGS]u16,
-    csi_arg_count: u8,
-    csi_has_arg: bool,
-    /// The private marker of the sequence being read ('?', '>', '<', '='),
-    /// 0 for none, and whether intermediate bytes came: such a sequence is
-    /// not one of the plain ones its final byte would name.
-    csi_private: u8 = 0,
-    csi_inter: bool = false,
-    /// UTF-8 in progress: continuation bytes still due, and the code point
-    /// so far.
-    utf_left: u8 = 0,
-    utf_cp: u32 = 0,
-    /// ESC 7 / CSI s.
-    saved_row: u16 = 0,
-    saved_col: u16 = 0,
-    /// CSI ?25l: the program draws its own cursor.
-    cursor_hidden: bool = false,
-    cur_attr: u8,
-    /// Most-recent truecolor fg, in 0x00RRGGBB. Only meaningful when
-    /// `cur_attr & ATTR_RGB_FG` is set; SGR `38;2;...` writes both.
-    cur_fg_rgb: u32,
-    /// The background in force, meaningful when `cur_attr & ATTR_BG` is set.
-    cur_bg_rgb: u32 = 0,
-    bell_phase: u8,
-    cursor_blink_anchor: u64,
-    /// Deferred-wrap flag (xterm-style auto-margin). When a printable char
-    /// lands in the last column we leave the cursor *at* that column with
-    /// `pending_wrap=true` instead of immediately advancing+scrolling. The
-    /// wrap commits only on the *next* printable write, and any cursor-
-    /// moving control (\r, \n, \x08, CSI cursor moves) clears it. Without
-    /// this, the shell's `redrawInputLine` (which writes prompt+content,
-    /// possibly to col 79) scrolled the screen every time the user held
-    /// backspace on a long line — duplicating the line into scrollback.
-    pending_wrap: bool,
-    /// The cells and the cursor block as the window's rows show them in the
-    /// back buffer, so that output repaints only the rows it changed.
-    /// Meaningful while `painted_valid`: a whole-window paint of the live
-    /// view sets it, a paint of anything else over the rows drops it.
-    painted_text: [TERM_COLS * TERM_ROWS]u8 = undefined,
-    painted_attr: [TERM_COLS * TERM_ROWS]u8 = undefined,
-    painted_rgb: [TERM_COLS * TERM_ROWS]u32 = undefined,
-    painted_bg: [TERM_COLS * TERM_ROWS]u32 = undefined,
-    /// Cell index of the cursor block drawn, NO_CURSOR for none.
-    painted_cursor: u16 = NO_CURSOR,
-    painted_scroll_count: u16 = 0,
-    painted_valid: bool = false,
-    /// Output has arrived since the rows were last brought up to date.
-    rows_stale: bool = false,
-
-    pub const NO_CURSOR: u16 = 0xFFFF;
-};
 
 pub const AnimationType = enum(u8) { none, opening, closing, minimizing, restoring, fullscreening, unfullscreening };
 
@@ -365,48 +269,6 @@ pub fn removeFromZ(slot: u8) void {
 pub fn topSlot() ?u8 {
     if (z_count == 0) return null;
     return z_stack[z_count - 1];
-}
-
-pub fn allocTerminalData() ?*TerminalData {
-    // Far above the kvmalloc threshold, so it comes from vmalloc and
-    // opening a few terminals doesn't fragment the heap.
-    const ptr = heap.kalloc(@sizeOf(TerminalData)) orelse return null;
-    const td: *TerminalData = @ptrCast(@alignCast(ptr));
-    td.* = .{
-        .text_buf = [_]u8{' '} ** (TERM_COLS * TERM_ROWS),
-        .attr_buf = [_]u8{ATTR_DEFAULT} ** (TERM_COLS * TERM_ROWS),
-        .fg_rgb_buf = [_]u32{0} ** (TERM_COLS * TERM_ROWS),
-        .bg_rgb_buf = [_]u32{0} ** (TERM_COLS * TERM_ROWS),
-        .text_row = 0,
-        .text_col = 0,
-        .cmd_buf = [_]u8{0} ** 128,
-        .cmd_len = 0,
-        .history = [_][128]u8{[_]u8{0} ** 128} ** 8,
-        .history_len = [_]u8{0} ** 8,
-        .history_count = 0,
-        .history_idx = 0,
-        .scroll_buf = [_]u8{' '} ** (SCROLL_LINES * TERM_COLS),
-        .scroll_attr_buf = [_]u8{ATTR_DEFAULT} ** (SCROLL_LINES * TERM_COLS),
-        .scroll_fg_rgb_buf = [_]u32{0} ** (SCROLL_LINES * TERM_COLS),
-        .scroll_bg_rgb_buf = [_]u32{0} ** (SCROLL_LINES * TERM_COLS),
-        .scroll_write = 0,
-        .scroll_count = 0,
-        .scroll_view = 0,
-        .esc_state = .idle,
-        .csi_args = [_]u16{0} ** CSI_ARGS,
-        .csi_arg_count = 0,
-        .csi_has_arg = false,
-        .cur_attr = ATTR_DEFAULT,
-        .cur_fg_rgb = 0,
-        .bell_phase = 0,
-        .cursor_blink_anchor = 0,
-        .pending_wrap = false,
-    };
-    return td;
-}
-
-pub fn freeTerminalData(td: *TerminalData) void {
-    heap.kfreeAuto(@ptrCast(td));
 }
 
 /// Set focused window and restore cursor visibility (apps that need hidden
