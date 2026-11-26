@@ -1624,7 +1624,7 @@ pub fn killProcessWithStatus(pid: u8, status: u32) void {
             for (&smp.cpus) |*c| {
                 if (!c.alive) continue;
                 if (c.lapic_id == my_lapic) continue;
-                if (c.current_pid) |cp| {
+                if (smp.peekCurrentPid(c.cpu_id)) |cp| {
                     if (cp == pid) {
                         target_lapic = c.lapic_id;
                         break;

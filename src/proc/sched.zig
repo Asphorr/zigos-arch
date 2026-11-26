@@ -232,11 +232,16 @@ var sched_audit_counter: u32 = 0;
 /// not 1) so we don't preferentially place new tasks on a cpu that's
 /// already pinned saturating something — desktop on cpu0 with empty rq
 /// has effective load 1, not 0.
+///
+/// Any CPU's, read with no lock from the idle loop's steal and the
+/// balancer: both figures are single atomic loads, a hint that may be one
+/// switch behind. Whoever moves a task on it checks again under the
+/// runqueue locks (pickMigrationCandidate, migrate).
 fn effectiveLoad(cpu_idx: usize) u16 {
     if (cpu_idx >= smp.MAX_CPUS) return std.math.maxInt(u16);
     if (!smp.cpus[cpu_idx].alive) return std.math.maxInt(u16);
-    var load: u16 = smp.cpus[cpu_idx].runqueue.nr_runnable;
-    if (smp.cpus[cpu_idx].current_pid) |cur| {
+    var load: u16 = @atomicLoad(u16, &smp.cpus[cpu_idx].runqueue.nr_runnable, .monotonic);
+    if (smp.peekCurrentPid(cpu_idx)) |cur| {
         if (cur < MAX_PROCS and !process.procs[cur].is_idle) load +%= 1;
     }
     return load;
@@ -334,7 +339,7 @@ pub fn migrate(pid: u8, new_cpu: u8) bool {
     // stack corruption. Caller (loadBalance) retries next tick.
     for (0..smp.MAX_CPUS) |i| {
         if (i > 0 and !smp.cpus[i].alive) continue;
-        if (smp.cpus[i].current_pid) |cur| {
+        if (smp.peekCurrentPid(i)) |cur| {
             if (cur == pid) return false;
         }
     }
@@ -454,7 +459,7 @@ pub fn setAffinity(pid: u8, cpu_id: u8) bool {
         for (&smp.cpus) |*c| {
             if (!c.alive) continue;
             if (c.cpu_id == cpu_id) continue;
-            if (c.current_pid) |cur| {
+            if (smp.peekCurrentPid(c.cpu_id)) |cur| {
                 if (cur == pid) {
                     if (kill_kick_vector) |v| {
                         const apic = @import("../irq/apic.zig");
@@ -1065,7 +1070,7 @@ fn transition(pid: usize, from: ?State, new_state: State, ra: usize) bool {
 /// `cpu_id` is running something other than its idle task. Unlocked peek.
 fn cpuBusy(cpu_id: u8) bool {
     if (cpu_id >= smp.MAX_CPUS) return false;
-    const cur = smp.cpus[cpu_id].current_pid orelse return false;
+    const cur = smp.peekCurrentPid(cpu_id) orelse return false;
     return cur < MAX_PROCS and !process.procs[cur].is_idle;
 }
 
@@ -1207,7 +1212,7 @@ fn maybePreemptOnWake(pid: usize) void {
     if (!target_cpu.alive) return;
 
     const should_preempt = blk: {
-        const target_cur = target_cpu.current_pid orelse break :blk true;
+        const target_cur = smp.peekCurrentPid(target_cpu_id) orelse break :blk true;
         break :blk wakeupPreempts(pid, target_cur);
     };
     if (!should_preempt) {
@@ -1242,7 +1247,7 @@ fn idlePollingSees(cpu_id: u8) bool {
     // Orders rqEnter's nr_runnable bump before the flag read (Dekker).
     asm volatile ("mfence" ::: .{ .memory = true });
     if (!idle_polling[cpu_id].load(.seq_cst)) return false;
-    const cur = smp.cpus[cpu_id].current_pid orelse return false;
+    const cur = smp.peekCurrentPid(cpu_id) orelse return false;
     return cur < MAX_PROCS and process.procs[cur].is_idle;
 }
 

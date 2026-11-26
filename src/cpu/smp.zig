@@ -246,6 +246,13 @@ pub const CpuLocal = struct {
     /// this pid; while null, the tick falls back to inline device sweeps.
     ksoftirqd_pid: ?usize = null,
 
+    /// `current_pid` in one word, for ANOTHER CPU to read while this one
+    /// switches: the optional is a number and a flag, two stores, and a
+    /// reader between them pairs one task's number with the other's flag.
+    /// NO_TASK for none. Written by pid_trace.setCurrentPid together with
+    /// current_pid, by nothing else; read through peekCurrentPid.
+    current_peek: std.atomic.Value(u32) = std.atomic.Value(u32).init(NO_TASK),
+
     // Tripwire (task #226 lite). LAST field of CpuLocal. If anything writes
     // past the end of cpus[N] — overflow from neighboring data, wild
     // pointer that lands here, sched_lock-state-write that overran — the
@@ -257,6 +264,9 @@ pub const CpuLocal = struct {
 };
 
 pub const MAGIC_END: u64 = 0xDEAD_C0FF_EEFA_CADE;
+
+/// `CpuLocal.current_peek` when the CPU runs no task.
+pub const NO_TASK: u32 = 0xFFFF_FFFF;
 
 /// Verify the trailing canary on the calling CPU's CpuLocal slot. Call from
 /// the entry of any function that runs on a fresh kernel context boundary
@@ -383,6 +393,16 @@ pub fn currentPid() ?usize {
     const pid = myCpu().current_pid;
     if (flags & 0x200 != 0) asm volatile ("sti" ::: .{ .memory = true });
     return pid;
+}
+
+/// The pid CPU `cpu_idx` is running, for a caller on another CPU: one
+/// atomic word, never half of a switch. A hint all the same — that CPU may
+/// have switched by the time the caller acts on it; what must hold is
+/// checked again under the runqueue's lock.
+pub fn peekCurrentPid(cpu_idx: usize) ?usize {
+    const v = cpus[cpu_idx].current_peek.load(.acquire);
+    if (v == NO_TASK) return null;
+    return v;
 }
 
 /// Get BSP CPU data (always CPU 0)

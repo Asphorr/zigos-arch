@@ -159,9 +159,11 @@ pub fn peerCheck(self: *smp.CpuLocal) void {
     // and PID 3's event queue overflowing; OS kept running on cpu0
     // and watchdog never saw it as a wedge because the old guard
     // matched on idle_pid alone. Now we require an empty rq too.
-    if (peer.current_pid != null and peer.idle_pid != null and
-        peer.current_pid.? == peer.idle_pid.? and
-        peer.runqueue.nr_runnable == 0)
+    // The peer's, read from here with no lock: one atomic load each.
+    const peer_cur = smp.peekCurrentPid(peer.cpu_id);
+    if (peer_cur != null and peer.idle_pid != null and
+        peer_cur.? == peer.idle_pid.? and
+        @atomicLoad(u16, &peer.runqueue.nr_runnable, .monotonic) == 0)
     {
         self.watchdog_peer_last_tick = peer.irq_tick_count;
         self.watchdog_peer_strikes = 0;

@@ -103,6 +103,9 @@ pub inline fn setCurrentPid(cpu: *smp.CpuLocal, new: ?usize) void {
     }
     smp.noteIdleSwitch(cpu, isIdle(old), isIdle(new));
     cpu.current_pid = new;
+    // The same in one word, for the other CPUs (smp.peekCurrentPid).
+    const peek: u32 = if (new) |np| @intCast(np) else smp.NO_TASK;
+    cpu.current_peek.store(peek, .release);
     // Release the inbound-dispatch bracket: from here on, cpu.current_pid
     // matches the running-state pid (or null for outbound-only paths),
     // so pcb_invariants' "state==.running but no owner" check is safe.
